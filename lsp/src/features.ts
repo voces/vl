@@ -39,6 +39,7 @@ import {
   builtinCompletionsFromWasm,
   type Completion,
   displayableType,
+  type DocRefResolver,
   docMarkdown,
   type DocumentHighlightSpan,
   documentHighlightsFromRefs,
@@ -62,6 +63,7 @@ import {
   type StdExportCandidate,
   type TypeInlayHint,
   typeCompletionsFromWasm,
+  typeLabelDetail,
   ufcsCompletions,
   type UfcsProbeModule,
   ufcsProbeSource,
@@ -149,7 +151,14 @@ const lineAt = (text: string, line: number): string =>
  * The identifier `[A-Za-z_][A-Za-z0-9_]*` straddling `character` on `line`, or null
  * when the cursor is on no word or on a numeric literal.
  */
-export const wordAt = (line: string, character: number): string | null => {
+export const wordAt = (line: string, character: number): string | null =>
+  wordSpan(line, character)?.word ?? null;
+
+// `wordAt`'s word with its start and end columns on the line.
+const wordSpan = (
+  line: string,
+  character: number,
+): { word: string; start: number; end: number } | null => {
   const isWordChar = (c: string) => /[A-Za-z0-9_]/.test(c);
   let start = character;
   let end = character;
@@ -157,7 +166,16 @@ export const wordAt = (line: string, character: number): string | null => {
   while (end < line.length && isWordChar(line[end])) end++;
   if (start === end) return null;
   const word = line.slice(start, end);
-  return /^[A-Za-z_]/.test(word) ? word : null;
+  return /^[A-Za-z_]/.test(word) ? { word, start, end } : null;
+};
+
+/** The range of the identifier `wordAt` finds at `pos` in `text`, or null. */
+export const wordRangeAt = (text: string, pos: FeaturePosition): LspRange | null => {
+  const span = wordSpan(lineAt(text, pos.line), pos.character);
+  return span === null ? null : {
+    start: { line: pos.line, character: span.start },
+    end: { line: pos.line, character: span.end },
+  };
 };
 
 // ---- go-to-definition (D2) --------------------------------------------------
@@ -662,6 +680,24 @@ export const completionsAt = async (
     ...keywordCompletions(false),
     ...snippetCompletions(false),
   ];
+};
+
+/**
+ * Where a completion shows its type: once inline (`labelDetail`, a compact
+ * `: <type>`) and once as markdown, the `///` prose above a fenced block
+ * (`documentation`). An item with neither a type nor a doc gets neither. `resolve`
+ * turns `[Name]` spans in the doc into links.
+ */
+export const completionPresentation = (
+  c: Completion,
+  resolve?: DocRefResolver,
+): { labelDetail?: string; documentation?: string } => {
+  const out: { labelDetail?: string; documentation?: string } = {};
+  if (c.detail !== undefined) out.labelDetail = c.labelDetail ?? typeLabelDetail(c.detail);
+  if (c.detail !== undefined || (c.doc && c.doc.trim() !== "")) {
+    out.documentation = docMarkdown(c.detail ?? "", VL_LANGUAGE_ID, c.doc, resolve);
+  }
+  return out;
 };
 
 // The UFCS functions the receiver before the cursor's `.` dispatches to, over the

@@ -1,0 +1,585 @@
+// Literal comparisons and the `match` desugar: the literal type a compare or a `const`
+// operand tests for, the arm conditions and payload bindings, and the in-place lowering
+// of a checked `match` to an if/else chain.
+// Does not import the checker.
+import {
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  Call,
+  CharLit,
+  FieldInit,
+  Ident,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  NullLit,
+  NumLit,
+  ObjLit,
+  P,
+  Paren,
+  StrLit,
+  arenaReplaceNode,
+  mkBinary,
+  mkBlock,
+  mkIf,
+} from "./ast"
+import { noteMatchScrut } from "./check_match_heads"
+import { lbiInlinedName } from "./check_num_lit_state"
+import { matchNegPatNum, matchPatIntNumOf } from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import { constDeclOf, lookup, lookupFnDeclNode } from "./check_scopes"
+import { isLitBearing, tyHasTyVar } from "./check_ty_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_NULL,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  mkLitTy,
+  tyIsHole,
+  tyToStr,
+} from "./check_types"
+import { numLexIsFloat } from "./emit_bignum"
+import { strListHas } from "./listutil"
+
+// The type the write at assignment `atIx` stores, for re-narrowing: a literal's own type when the
+// declaration is a literal union, whose members are literals, else `rt`.
+export function asgLitRhsTy(atIx: i32, dcl: i32, rt: i32): i32 {
+  if !isLitBearing(dcl) { return rt }
+  const an = P.nodes[atIx]
+  if an is BinExpr {
+    if an.binOp == "=" {
+      const lt = litTyOfExpr(an.binRight)
+      if lt >= 0 { return lt }
+    }
+  }
+  rt
+}
+
+// ── missing-return totality (soundness) ──────────────────────────────────────
+// The condition node under any `Paren` wrappers (`((x is T))` → `x is T`). The condition-shape
+// matchers (chain discrimination, exhaustiveness) peel through this so a parenthesized guard
+// classifies exactly like the bare spelling, keeping them in step with the narrowing collectors.
+export function condUnderParens(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Paren { return condUnderParens(n.parInner) }
+  ix
+}
+
+// True if the `if`-condition at `ifCondIx` opens a discriminating chain — `x is T`, or a
+// `place == <literal>` over a literal-union-bearing place. Such an else-less chain may be
+// exhaustive, which the dedicated exhaustiveness check adjudicates; the general missing-return
+// rule defers to it rather than double-flagging.
+export function ifCondIsDiscriminating(ifCondIx: i32) {
+  const fc = P.nodes[condUnderParens(ifCondIx)]
+  if fc is IsExpr { return true }
+  if fc is BinExpr {
+    if fc.binOp == "==" {
+      let eqPlace = -1
+      if cmpLitTyOf(fc.binRight) >= 0 { eqPlace = fc.binLeft }
+      else if cmpLitTyOf(fc.binLeft) >= 0 { eqPlace = fc.binRight }
+      if eqPlace >= 0 {
+        const eqObj = P.nodes[eqPlace]
+        if eqObj is Ident {
+          if isLitBearing(lookup(eqObj.identName)) { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// A `const` arm pattern (D3271): the pattern node, rewritten to a read of the constant, to the
+// literal node of that constant's initializer, where its value is read (`matchConstPatLitAt`).
+export let matchConstPatLit: {[i32]: i32} = Map()
+// Per comparison operand naming a `const` with a literal value, that literal's node (Q10).
+export let cmpConstLit: {[i32]: i32} = Map()
+
+// The struct member of `store` whose field names are exactly the object literal's, or -1 when
+// none or several are.
+function objLitMemberOf(e: ObjLit, store: i32): i32 {
+  if store < 0 { return -1 }
+  let ms: i32[] = [store]
+  const st = T.tys[store]
+  if st is TyUnion { ms = st.uMembers }
+  if st is TyNullable {
+    if st.nInner < 0 { return -1 }
+    const it = T.tys[st.nInner]
+    if it is TyUnion { ms = it.uMembers } else { ms = [st.nInner] }
+  }
+  let hit = -1
+  let i = 0
+  while i < ms.length {
+    const m = ms[i]
+    const mt = T.tys[m]
+    if mt is TyObj {
+      if objLitNamesAre(e, mt.objFieldNames) {
+        if hit >= 0 { return -1 }
+        hit = m
+      }
+    }
+    i = i + 1
+  }
+  hit
+}
+
+// Whether the object literal's fields are plain `name: value` inits naming exactly `names`.
+function objLitNamesAre(e: ObjLit, names: string[]): boolean {
+  if e.objFields.length != names.length { return false }
+  let k = 0
+  while k < e.objFields.length {
+    const f = P.nodes[e.objFields[k]]
+    if !(f is FieldInit) { return false }
+    if f is FieldInit {
+      if !strListHas(names, f.fiName) { return false }
+    }
+    k = k + 1
+  }
+  true
+}
+
+// The type of a value known without checking it: a literal, a name, a call of a function whose
+// declared return type is settled, or an object literal whose field names are exactly those of
+// one struct member of `store`; -1 otherwise.
+export function loopWritePeekTy(ix: i32, store: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return loopWritePeekTy(e.parInner, store) }
+  if e is ObjLit { return objLitMemberOf(e, store) }
+  if e is NullLit { return TY_NULL }
+  if e is BoolLit { return TY_BOOL }
+  if e is StrLit { return litTyOfExpr(ix) }
+  if e is NumLit {
+    if numLexIsFloat(e.numText) { return TY_F64 }
+    return litTyOfExpr(ix)
+  }
+  if e is Ident { return lookup(e.identName) }
+  if e is AsExpr { return asNumericPeekTy(e) }
+  // Anything else needs checking, but a call of a declared function has its return type.
+  loopWriteCallTy(ix)
+}
+
+// The numeric primitive a plain `as` casts to (`0.5 as f32`), or -1.
+function asNumericPeekTy(e: AsExpr): i32 {
+  if e.asMode != "prop" { return -1 }
+  const nums = [TY_I32, TY_I64, TY_F32, TY_F64]
+  let i = 0
+  while i < nums.length {
+    if tyToStr(nums[i]) == e.asTy { return nums[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// The settled declared return type of the function a call at `ix` names, or -1.
+function loopWriteCallTy(ix: i32): i32 {
+  const e = P.nodes[ix]
+  if e is Call {
+    const cf = P.nodes[e.callFn]
+    if cf is Ident {
+      const ft = lookup(cf.identName)
+      if ft >= 0 {
+        const f = T.tys[ft]
+        if f is TyFunc {
+          if f.fnRet >= 0 && !tyIsHole(f.fnRet) && !tyHasTyVar(f.fnRet) {
+            return f.fnRet
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The place a narrowing test at `ix` narrows: `ix` itself, or the bare name an assignment it
+// tests stores into (`(x = e) != null` narrows `x`, which holds the tested value, D2602).
+export function asgTestedPlace(ix: i32): i32 {
+  if ix < 0 { return ix }
+  const u = condUnderParens(ix)
+  if u < 0 { return ix }
+  const n = P.nodes[u]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const t = condUnderParens(n.binLeft)
+      if t >= 0 && P.nodes[t] is Ident { return t }
+    }
+  }
+  ix
+}
+
+// The literal type of a literal expression, or -1 when the expression is not a bare literal. Peels
+// parens. The string text is the raw lexeme between the quotes — the same characters a literal-type
+// annotation keeps — so membership compares consistently. The quote peel here is deliberately not
+// `tyname.groupInnerOf`: that is the type-name grammar's cut, and this lexeme is an expression's.
+export function litTyOfExpr(ix: i32) {
+  if ix < 0 { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return litTyOfExpr(e.parInner) }
+  if e is StrLit {
+    const raw = e.strText
+    return mkLitTy("str", raw.slice(1, raw.length - 1))
+  }
+  // A float literal has no literal type; it is an `f64` value (`floatLitTypeMsg`).
+  if e is NumLit {
+    if numLexIsFloat(e.numText) { return -1 }
+    return mkLitTy("int", e.numText)
+  }
+  -1
+}
+
+// The literal node comparison operand `ix` tests for: the literal itself, or the initializer
+// literal of the unannotated `const` it names, as a `match` arm reads one. -1 otherwise.
+export function cmpLitNodeOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const k = parenPeelIx(ix)
+  if litTyOfExpr(k) >= 0 { return k }
+  cmpConstLit[k] ?? -1
+}
+
+// The literal type comparison operand `ix` tests for, through a literal `const` (`cmpLitNodeOf`).
+export function cmpLitTyOf(ix: i32): i32 { litTyOfExpr(cmpLitNodeOf(ix)) }
+
+// Bank the literal a `const` named by comparison operand `ix` holds, read where the name resolves.
+export function noteCmpConstLit(ix: i32) {
+  const k = parenPeelIx(ix)
+  if k < 0 || k >= P.nodes.length { return 0 }
+  const e = P.nodes[k]
+  if !(e is Ident) { return 0 }
+  const d = constDeclOf(e.identName)
+  if d < 0 { return 0 }
+  const dn = P.nodes[d]
+  // An annotation declares the values the const may take, so only an unannotated one is its literal.
+  if dn is LetDecl {
+    if dn.letType >= 0 { return 0 }
+    const lit = matchConstLitOf(dn.letInit)
+    if lit >= 0 && litTyOfExpr(lit) >= 0 { cmpConstLit[k] = lit }
+  }
+  0
+}
+
+// The place side of a `<place> == <literal>` comparison, either operand order, or -1 when the
+// condition is not one. The literal side must be a syntactic literal: a comparison against a
+// variable that merely happens to hold `"circle"` proves nothing about the place. `litTyOfExpr` is
+// the reader both sides use, and it owns the quote strip, so the two cannot disagree.
+export function litCmpPlace(condIx: i32) {
+  const c = P.nodes[condIx]
+  if !(c is BinExpr) { return -1 }
+  if cmpLitTyOf(c.binRight) >= 0 { return condUnderParens(c.binLeft) }
+  if cmpLitTyOf(c.binLeft) >= 0 { return condUnderParens(c.binRight) }
+  -1
+}
+
+// The literal type a `<place> == <literal>` comparison tests for, or -1. Numeric literals come
+// through as well as string ones and are load-bearing: a numeric tag is constructible, so
+// `if s.kind == 0` over `{kind: 0, …} | {kind: 1, …}` discriminates exactly as the string form
+// does. A plain `i32` field stays unrefined — every integer literal fits, so every arm survives.
+export function litCmpTy(condIx: i32) {
+  const c = P.nodes[condIx]
+  if !(c is BinExpr) { return -1 }
+  const r = cmpLitTyOf(c.binRight)
+  if r >= 0 { return r }
+  cmpLitTyOf(c.binLeft)
+}
+
+// The type an equality's deferred constraint records for operand `opIx` of type `ty`: a
+// literal's own literal type, which a literal-union pin compares against as the direct spelling
+// does (`eqLitMemberOk`), else `ty`.
+export function eqCstrOperandTy(op: string, opIx: i32, ty: i32): i32 {
+  if op != "==" && op != "!=" { return ty }
+  const lit = cmpLitTyOf(opIx)
+  if lit < 0 { return ty }
+  lit
+}
+
+// Wraps a match arm body as a `Block` (a bare-expression body becomes a one-statement block).
+function matchBlockOf(bodyIx: i32) {
+  const b = P.nodes[bodyIx]
+  if b is Block { return bodyIx }
+  const one: i32[] = []
+  one.push(bodyIx)
+  mkBlock(one, -1)
+}
+
+// The arm's block with its payload bindings (phase 2b): `matchBlockOf` plus the clause's
+// `const x = scrut.x` decls prepended — node-for-node the hand-written `if scrut is Move {
+// const x = cmd.x; … }` twin. A `Block` body is rewritten in place rather than replaced by a
+// fresh index, since the body already carries a checked `nodeTyIx` row a new node would lose.
+function matchArmBlockOf(bodyIx: i32, bindIx: i32) {
+  if bindIx < 0 { return matchBlockOf(bodyIx) }
+  const stmts: i32[] = []
+  const bn = P.nodes[bindIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      stmts.push(bn.blkStmts[i])
+      i = i + 1
+    }
+  }
+  const b = P.nodes[bodyIx]
+  if b is Block {
+    let j = 0
+    while j < b.blkStmts.length {
+      stmts.push(b.blkStmts[j])
+      j = j + 1
+    }
+    const spliced = mkBlock(stmts, b.pos)
+    arenaReplaceNode(bodyIx, spliced)
+    return bodyIx
+  }
+  stmts.push(bodyIx)
+  mkBlock(stmts, -1)
+}
+
+// `scrut == p0 [|| scrut == p1 …]` over match arm `k`'s or-patterns. A type pattern is
+// already the test: the parser minted it as an `IsExpr` over this scrutinee, so the arm's
+// condition is the pattern node itself — the chain built is byte-for-byte what a hand-written
+// `if scrut is A {…} else if scrut is B {…}` guard chain would produce, so every arm narrows.
+function matchArmCond(
+  scrut: i32,
+  pats: i32[],
+  armStart: i32[],
+  armCount: i32[],
+  k: i32,
+  pos: i32,
+) {
+  let cond = -1
+  let pj = 0
+  while pj < armCount[k] {
+    const pat = pats[armStart[k] + pj]
+    let term = -1
+    const pn = P.nodes[pat]
+    if pn is IsExpr {
+      term = pat
+    } else {
+      term = mkBinary("==", scrut, pat, pos)
+    }
+    if cond < 0 { cond = term } else { cond = mkBinary("||", cond, term, pos) }
+    pj = pj + 1
+  }
+  cond
+}
+
+// Arm `k`'s payload-binding clause (phase 2b) — the `Block` of `const x = scrut.x` decls the
+// parser banked on the arm's pattern — or -1 when it binds nothing. Only a single-pattern arm
+// may carry a clause (a multi-pattern arm gets no then-narrowing, so the field read would not
+// type); reading -1 there avoids stacking a second, misleading diagnostic on the or-pattern reject.
+export function matchArmBindsOf(n: MatchExpr, k: i32) {
+  if n.matchArmCount[k] != 1 { return -1 }
+  n.matchBinds[n.matchArmStart[k]]
+}
+
+// The arm that becomes the desugared chain's bare `else`: the `_` wildcard arm when there is
+// one, otherwise the last arm (the match is exhaustive, so it is the only case left). Taken
+// from the pattern columns rather than the node, so the checker can ask the same question
+// before the desugar runs and never drifts from it (`checkMatchTypeArms`).
+export function matchElseArmOf(pats: i32[], armStart: i32[], armCount: i32[]) {
+  const nArms = armStart.length
+  let wildArm = -1
+  let ai = 0
+  while ai < nArms {
+    let pj = 0
+    while pj < armCount[ai] {
+      if matchPatIsWild(pats[armStart[ai] + pj]) { wildArm = ai }
+      pj = pj + 1
+    }
+    ai = ai + 1
+  }
+  if wildArm >= 0 { return wildArm }
+  nArms - 1
+}
+
+// Lowers the checked, exhaustive `MatchExpr` at `ix` to an if/else chain, overwriting the
+// arena slot in place, so lint and emit see only if-chains. The wildcard arm (or the last arm)
+// becomes the bare `else`. A zero-arm `match` has no body for that else — `elseArm == -1` traps
+// the compiler on an unbounded read — but the checker has already reported it non-exhaustive, so a type-erroring program never reaches this, where a surviving `MatchExpr` would matter.
+export function desugarMatchAt(ix: i32) {
+  const n = P.nodes[ix]
+  if n is MatchExpr {
+    const scrut = n.matchScrut
+    if scrut >= 0 { noteMatchScrut(scrut) }
+    const pats = n.matchPats
+    const armStart = n.matchArmStart
+    const armCount = n.matchArmCount
+    const bodies = n.matchBodies
+    const mpos = n.pos
+    const nArms = armStart.length
+    if nArms > 0 {
+      const elseArm = matchElseArmOf(pats, armStart, armCount)
+      let chain = matchArmBlockOf(bodies[elseArm], matchArmBindsOf(n, elseArm))
+      let k = nArms - 1
+      while k >= 0 {
+        if k != elseArm {
+          const cond = matchArmCond(scrut, pats, armStart, armCount, k, mpos)
+          const thenB = matchArmBlockOf(bodies[k], matchArmBindsOf(n, k))
+          chain = mkIf(cond, thenB, chain, mpos)
+        }
+        k = k - 1
+      }
+      arenaReplaceNode(ix, chain)
+    }
+  }
+  0
+}
+
+// The string-literal set operand `x` (typed `ty`) is confined to — a bare literal, a `const`
+// literal, or a declared literal type — or -1 when it may hold any string, null, or a member
+// that is not a string literal (a nullable side is refused by the compare's own rule).
+export function strLitViewOf(x: i32, ty: i32): i32 {
+  const lit = litTyOfExpr(x)
+  if lit >= 0 {
+    const lt = T.tys[lit]
+    if lt is TyLit {
+      if lt.litKind == "str" { return lit }
+    }
+    return -1
+  }
+  if !allStrLitMembers(ty) { return -1 }
+  ty
+}
+
+// Whether `ty` is a string literal or a union made only of them.
+export function allStrLitMembers(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      return t.litKind == "str"
+    }
+    TyUnion => {
+      if t.uMembers.length == 0 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        if !allStrLitMembers(t.uMembers[i]) { return false }
+        i = i + 1
+      }
+      return true
+    }
+    TyNullable | TyPrim | TyObj | TyFunc | TyArray | TyMap | TyErr | TyVar | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether every pattern reads as an integer literal or the `_` wildcard, with at least one
+// literal — the question a hole scrutinee is dispatched on: an un-annotated parameter's type
+// is a `TyVar` no vocabulary can be chosen from, so the arms choose and each defers a `==`
+// constraint the call adjudicates.
+export function matchArmsAreIntLits(n: MatchExpr) {
+  let lits = 0
+  let i = 0
+  while i < n.matchPats.length {
+    const patIx = n.matchPats[i]
+    const num = matchPatIntNumOf(matchPatValNode(patIx))
+    if num >= 0 { lits = lits + 1 }
+    else if !matchPatIsWild(patIx) { return false }
+    i = i + 1
+  }
+  lits > 0
+}
+
+// Where arm pattern `patIx` reads its value: a `const` arm's literal, else the pattern itself.
+export function matchPatValNode(patIx: i32) {
+  const lit = matchConstPatLitAt(patIx)
+  if lit >= 0 { return lit }
+  patIx
+}
+
+// The literal a constant's initializer `init` is, through parentheses: a number, `-` over one,
+// or a string. -1 for anything else, which is computed rather than written.
+function matchConstLitOf(init: i32) {
+  if init < 0 || init >= P.nodes.length { return -1 }
+  const k = parenPeelIx(init)
+  if k < 0 || k >= P.nodes.length { return -1 }
+  const e = P.nodes[k]
+  if e is NumLit || e is StrLit { return k }
+  matchNegConstLit(k)
+}
+
+// `k` when it is `-` directly over a number, the negative literal arm's own shape, else -1.
+function matchNegConstLit(k: i32) {
+  if matchNegPatNum(k) >= 0 { return k }
+  -1
+}
+
+// Whether initializer `init` is a literal no arm vocabulary takes: a character or a boolean.
+function matchConstIsOtherLit(init: i32) {
+  if init < 0 || init >= P.nodes.length { return false }
+  const e = P.nodes[parenPeelIx(init)]
+  e is CharLit || e is BoolLit
+}
+
+// Why the name `nm` at `patIx` cannot be an arm, or "" when it is a constant with a literal
+// value, whose literal `matchConstPatLit` then holds.
+export function matchConstPatWhy(nm: string, patIx: i32) {
+  const lead = "a match arm needs a literal or a constant; `" + nm + "` "
+  if lookup(nm) < 0 {
+    return "unknown name `"
+      + nm
+      + "` in match pattern — an arm is a literal, a `const` with a literal value, or the `_` wildcard"
+  }
+  const d = constDeclOf(nm)
+  if d < 0 {
+    if lookupFnDeclNode(nm) >= 0 { return lead + "is a function" }
+    return lead + "is a variable, not a `const`"
+  }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    const lit = matchConstLitOf(dn.letInit)
+    if lit < 0 && matchConstIsOtherLit(dn.letInit) {
+      return lead + "is not a number or string constant"
+    }
+    if lit < 0 {
+      return lead
+        + "has no literal value — declare it with a number or string literal, or test it with `==`"
+    }
+    matchConstPatLit[patIx] = lit
+    return ""
+  }
+  lead + "is not a `const`"
+}
+
+// The literal node a `const` arm pattern reads its value from, or -1 when `patIx` is not one.
+export function matchConstPatLitAt(patIx: i32) {
+  if patIx < 0 { return -1 }
+  matchConstPatLit[patIx] ?? -1
+}
+
+// Whether match pattern `patIx` is the `_` wildcard. A `const` arm is an `Ident` too (D3271).
+export function matchPatIsWild(patIx: i32) {
+  const p = P.nodes[patIx]
+  if p is Ident { return matchConstPatLitAt(patIx) < 0 }
+  false
+}
+
+// How a diagnostic quotes arm pattern `patIx`, whose literal reads `lexeme`: a constant by its
+// name and value, anything else by the lexeme. Closes the backtick the caller opened.
+export function matchPatLabel(patIx: i32, lexeme: string) {
+  if matchConstPatLitAt(patIx) >= 0 {
+    const p = P.nodes[patIx]
+    let nm = lbiInlinedName[patIx] ?? ""
+    if p is Ident { nm = p.identName }
+    if nm != "" { return nm + "` (" + lexeme + ")" }
+  }
+  lexeme + "`"
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function matchDesugarReset() {
+  matchConstPatLit = Map()
+  cmpConstLit = Map()
+}

@@ -1,0 +1,265 @@
+// Record adoption: the solve that gives each binding the record its demands share, the
+// refusal when two disagree, and the note a refusal of an adopted value carries.
+// Does not import the checker.
+import { LetDecl, P, i32ToStr } from "./ast"
+import { nodeLineOf } from "./check_capture_loss"
+import { nodeTyIxOf } from "./check_node_tys"
+import {
+  recAdAt,
+  recAdBound,
+  recAdDecl,
+  recAdDst,
+  recAdElem,
+  recAdErrAt,
+  recAdErrMsg,
+  recAdOrigFn,
+  recAdOrigName,
+  recAdOrigTy,
+  recAdPinDecl,
+  recAdPinSpell,
+  recAdPinTy,
+  recAdRaising,
+} from "./check_rec_adopt_rows"
+import {
+  REC_STORE_DEPTH,
+  fieldStorageEq,
+  recNumMergeField,
+} from "./check_ty_relate"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  objFieldType,
+  tyNomNameCycled,
+  tyToNominalName,
+  tyToStr,
+} from "./check_types"
+import { i32ListHas } from "./listutil"
+
+// Decide each binding's type: the one record every demand shares a storage with, or a refusal
+// naming two that disagree. A binding delivered both whole and by element takes one list type.
+export function recAdSolve() {
+  let i = 0
+  while i < recAdDecl.length {
+    const decl = recAdDecl[i]
+    if !i32ListHas(recAdPinDecl, decl) && !recAdHasErr(decl) {
+      let bad = -1
+      let j = i + 1
+      while j < recAdDecl.length && bad < 0 {
+        if recAdDecl[j] == decl {
+          if !fieldStorageEq(recAdDst[i], recAdDst[j], REC_STORE_DEPTH) {
+            bad = j
+          }
+        }
+        j = j + 1
+      }
+      if bad >= 0 {
+        if P.nodes[decl] is LetDecl { recAdConflict(decl, i, bad) }
+      } else {
+        let ann = tyToStr(recAdDst[i])
+        let spell = recAdSpell(recAdDst[i], ann)
+        if recAdElem[i] {
+          ann = ann + "[]"
+          spell = spell + "[]"
+        }
+        recAdPinDecl.push(decl)
+        recAdPinTy.push(ann)
+        recAdPinSpell.push(spell)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A binding whose adoption a re-check undid is built at `dst` and keeps its own type. Where
+// `dst` keeps two of a union field's numbers as one, no read at that type can tell which it
+// held, so the delivery is refused (D3011).
+export function recAdMergeRefuse(
+  decl: i32,
+  own: i32,
+  dst: i32,
+  elem: boolean,
+  at: i32,
+) {
+  const f = recNumMergeField(own, dst, REC_STORE_DEPTH)
+  if f == "" || recAdHasErr(decl) { return 0 }
+  const n = P.nodes[decl]
+  if !(n is LetDecl) { return 0 }
+  const so = T.tys[own]
+  const sd = T.tys[dst]
+  if !(so is TyObj) || !(sd is TyObj) { return 0 }
+  let what = "`" + n.letName + "` is"
+  let src = n.letName
+  let them = "it"
+  if elem {
+    what = "the records in `" + n.letName + "` are"
+    src = "r"
+    them = "each record"
+  }
+  let copy = "{ "
+  let i = 0
+  while i < sd.objFieldNames.length {
+    if i > 0 { copy = copy + ", " }
+    copy = copy + sd.objFieldNames[i] + ": " + src + "." + sd.objFieldNames[i]
+    i = i + 1
+  }
+  copy = copy + " }"
+  let fix = " there with an object literal, `" + copy + "`"
+  if elem {
+    fix = " there, `"
+      + n.letName
+      + ".map((r): "
+      + tyToStr(dst)
+      + " => "
+      + copy
+      + ")`"
+  }
+  recAdErrMsg.push(
+    what
+      + " built as "
+      + tyToStr(dst)
+      + " where line "
+      + i32ToStr(nodeLineOf(at))
+      + " delivers "
+      + them
+      + ", which stores field `"
+      + f
+      + "` (`"
+      + tyToStr(objFieldType(so, f))
+      + "`) as `"
+      + tyToStr(objFieldType(sd, f))
+      + "`, keeping two of its numbers as one, so "
+      + them
+      + " cannot also keep its own type. Copy "
+      + them
+      + fix,
+  )
+  recAdErrAt.push(decl)
+  0
+}
+
+// Has `decl` already a refusal this solve?
+export function recAdHasErr(decl: i32): boolean {
+  let i = 0
+  while i < recAdErrAt.length {
+    if recAdErrAt[i] == decl { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The refusal for a binding delivered as two records that store a field differently.
+function recAdConflict(decl: i32, a: i32, b: i32) {
+  const n = P.nodes[decl]
+  let nm = "this binding"
+  if n is LetDecl { nm = "`" + n.letName + "`" }
+  let what = nm
+  if recAdElem[a] { what = "the records in " + nm }
+  recAdErrMsg.push(
+    nm
+      + " holds only a literal, so it is built at the type it is delivered to, but it is "
+      + "delivered as "
+      + tyToStr(recAdDst[a])
+      + " (line "
+      + i32ToStr(nodeLineOf(recAdAt[a]))
+      + ") and as "
+      + tyToStr(recAdDst[b])
+      + " (line "
+      + i32ToStr(nodeLineOf(recAdAt[b]))
+      + "), which store a field differently, and a record is shared, not copied. Annotate "
+      + what
+      + " with one of them, and copy it with an object literal for the other",
+  )
+  recAdErrAt.push(decl)
+  0
+}
+
+// The annotation spelling of the adopted record `ty` (rendered `shown`): the parser's own form,
+// which the annotation resolver reads for every field type, or `shown` when it has none.
+function recAdSpell(ty: i32, shown: string): string {
+  const nm = tyToNominalName(ty)
+  if nm == "" || tyNomNameCycled() { return shown }
+  nm
+}
+
+// Is the refusal at `at` about an adopted value handed on whole: raised by this rule, or at a
+// node holding a record stored as an adopted binding's record is (or a list of them)?
+export function recAdWholeErr(at: i32): boolean {
+  if recAdRaising { return true }
+  if at < 0 || at >= P.nodes.length { return false }
+  const t = recAdRecOf(nodeTyIxOf(at))
+  if t < 0 { return false }
+  let i = 0
+  while i < recAdBound.length {
+    const b = recAdRecOf(recAdBound[i])
+    if b >= 0 && fieldStorageEq(t, b, REC_STORE_DEPTH) { return true }
+    i = i + 1
+  }
+  const ts = tyToStr(t)
+  let k = 0
+  while k < recAdOrigTy.length {
+    if recAdOrigFn[k] && recAdOrigTy[k] == ts { return true }
+    k = k + 1
+  }
+  false
+}
+
+// The record `ty` is, or a list of, through `| null`; -1 for anything else.
+export function recAdRecOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return recAdRecOf(t.nInner)
+    }
+    TyArray => {
+      return recAdRecOf(t.aElem)
+    }
+    TyObj => {
+      return ty
+    }
+    // No other type is a record or a list of one.
+    TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// The note a refusal of an adopted value carries: which binding or function took which type.
+export function recAdNoteFor(at: i32): string {
+  const t = recAdRecOf(nodeTyIxOf(at))
+  const want = if t >= 0 { tyToStr(t) } else { "" }
+  let pick = -1
+  let i = 0
+  while i < recAdOrigTy.length {
+    let base = recAdOrigTy[i]
+    while base.length > 2 && base.slice(base.length - 2, base.length) == "[]" {
+      base = base.slice(0, base.length - 2)
+    }
+    if pick < 0 || base == want { pick = i }
+    i = i + 1
+  }
+  if pick < 0 { return "" }
+  if recAdOrigFn[pick] {
+    return " (`"
+      + recAdOrigName[pick]
+      + "` returns only literals, so its result is built as the `"
+      + recAdOrigTy[pick]
+      + "` it is delivered to)"
+  }
+  " (`"
+    + recAdOrigName[pick]
+    + "` holds only a literal, so it is built as the `"
+    + recAdOrigTy[pick]
+    + "` it is delivered to; annotate it to keep its own type, and copy it for the other use)"
+}

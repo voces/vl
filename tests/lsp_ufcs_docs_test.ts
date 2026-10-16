@@ -20,6 +20,7 @@ import {
 } from "../lsp/src/typeFeatures.ts";
 import { completion, initLsp } from "../playground/src/lspAdapter.ts";
 import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
+import { wrapStdReader } from "../lsp/src/editorText.ts";
 
 const SEED = filePath(new URL("../build/vl-compiler.wasm", import.meta.url));
 const seedExists = (() => {
@@ -224,11 +225,8 @@ Deno.test({ name: "ufcs docs: an `import` does not silence the panel (D1863)", i
 });
 
 // ── the playground, end to end ───────────────────────────────────────────────
-// This was a PIN until the adapter's member path called `ufcsCandidatesAt` at all: it ran
-// `memberCompletionsFromWasm` alone, so the playground offered no UFCS method and had no
-// panel to carry a doc. `playground_lsp_parity_test.ts` could not see that — it grades one
-// marker per FEATURE and UFCS is a behaviour inside "completion" — so the parity table now
-// carries a second marker for it too.
+// The playground's completion is the server's `completionsAt`, so the method and its doc
+// must arrive there too.
 
 const module = seedExists
   ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
@@ -237,7 +235,8 @@ const module = seedExists
 Deno.test({ name: "ufcs docs: the playground offers the method, with its prose", ignore }, async () => {
   if (!module) throw new Error(`no seed at ${SEED}`);
   const instance = new WebAssembly.Instance(module, {});
-  initLsp(createWasmChecker(() => instance.exports as unknown as Exports));
+  // The browser's own reader wrapper: the UFCS probe imports std modules.
+  initLsp(createWasmChecker(() => instance.exports as unknown as Exports, wrapStdReader));
   // `p.` — the member-completion cursor, one past the dot.
   const src = SRC.replace("print(p.x)", "print(p.)");
   const cs = await completion(src, { line: 18, character: 8 }, ".");

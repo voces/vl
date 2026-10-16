@@ -2,38 +2,37 @@
 //
 // WHY THIS EXISTS
 // ---------------
-// VL's language-feature LOGIC lives in pure, framework-free helpers
-// (`compiler/*` + `lsp/src/*`). Two thin adapters consume them:
+// Every language feature is one function in `lsp/src/features.ts`. Two thin
+// transports call them:
 //   - `lsp/src/server.ts`        — the VS Code LSP (registers `onHover`,
 //     `onCodeAction`, … and declares server capabilities).
 //   - `playground/src/lspAdapter.ts` (+ `main.ts`) — the browser playground
-//     (one pure binding per feature + a matching Monaco provider).
+//     (one binding per feature + a matching Monaco provider).
 //
-// The DRIFT RISK is the WIRING: `main.ts` independently decides which Monaco
-// providers to register, and that list can silently fall behind `server.ts`.
-// This is exactly what left the playground's "Auto Fix" quietly missing: the
-// LSP gained `onCodeAction` (and the adapter gained a `codeActions` binding),
-// but `main.ts` never registered a Monaco `CodeActionProvider`.
+// Two drifts are possible. The WIRING one: `main.ts` independently decides which
+// Monaco providers to register, which is what once left the playground's "Auto
+// Fix" missing while the LSP had it. And the LOGIC one: a host composing a
+// feature itself instead of calling the shared function, which is how the
+// playground went months without UFCS completions under a green "completion" row.
 //
 // WHAT THIS TEST ASSERTS
 // ----------------------
-// For every language feature the LSP exposes (enumerated FROM `server.ts` — the
-// `serverMarker` of each row is verified to actually be present in `server.ts`,
-// so the table can't drift away from the real LSP surface):
-//   (a) `playground/src/lspAdapter.ts` exports the corresponding pure binding
-//       (imported here; checked with `typeof === "function"`), AND
-//   (b) `playground/src/main.ts` wires the corresponding Monaco provider /
-//       capability (its `mainMarker` string is present in `main.ts`'s source).
+// For every language feature the LSP exposes (enumerated FROM `server.ts` — each
+// row's `serverMarker` is verified present, so the table cannot drift away from
+// the real LSP surface):
+//   (a) `playground/src/lspAdapter.ts` exports the corresponding binding
+//       (imported here; checked with `typeof === "function"`),
+//   (b) `playground/src/main.ts` wires the corresponding Monaco provider (its
+//       `mainMarker` string is present in `main.ts`'s source), and
+//   (c) both `server.ts` and `lspAdapter.ts` CALL the row's `shared` function from
+//       `features.ts`, so the two hosts compute the feature the same way.
 //
-// ADDING AN LSP FEATURE ⇒ ADDING PLAYGROUND WIRING. If you add a handler to
-// `server.ts`, add a row below, AND wire both the `lspAdapter.ts` export and the
-// `main.ts` Monaco provider — otherwise this test fails and names the gap. The
-// value is the forced awareness: a maintained table that breaks the build on
-// drift.
+// ADDING AN LSP FEATURE ⇒ ADDING PLAYGROUND WIRING. Put the logic in
+// `features.ts`, call it from both hosts, and add a row below.
 //
 // `main.ts` is NOT imported (it imports `monaco-editor`, which can't be loaded
-// in Deno); we assert against its SOURCE TEXT instead. `lspAdapter.ts` is pure
-// (no Monaco) and IS imported for real `typeof` checks. `server.ts` lives under
+// in Deno); we assert against its SOURCE TEXT instead. `lspAdapter.ts` is
+// Monaco-free and IS imported for real `typeof` checks. `server.ts` lives under
 // the deno-excluded `lsp/` tree, so it too is read as source text.
 //
 // Run with:
@@ -46,276 +45,172 @@ const assert = (cond: boolean, msg: string): void => {
   if (!cond) throw new Error(msg);
 };
 
-// --- read the LSP + playground sources as text ------------------------------
-//
 // Paths are relative to this test file's directory so the test is CWD-agnostic.
 const here = new URL(".", import.meta.url);
-const read = (rel: string): string =>
-  Deno.readTextFileSync(new URL(rel, here));
+const read = (rel: string): string => Deno.readTextFileSync(new URL(rel, here));
 
-// The LSP side is the transport (`server.ts`) plus the features it calls
-// (`features.ts`), where the helpers `subBehaviours` names are composed.
-const serverSrc = read("../lsp/src/server.ts") + read("../lsp/src/features.ts");
+const serverSrc = read("../lsp/src/server.ts");
+const featuresSrc = read("../lsp/src/features.ts");
 const adapterSrc = read("../playground/src/lspAdapter.ts");
 const mainSrc = read("../playground/src/main.ts");
 
 // --- the feature parity table -----------------------------------------------
 //
-// One row per language feature the LSP exposes. Each row carries:
+// One row per language feature the LSP exposes:
 //   - `feature`       human name (used in failure messages).
-//   - `serverMarker`  a substring that MUST appear in `server.ts` — proves the
-//                     LSP really exposes this feature (the table self-validates
-//                     against the live LSP surface; a renamed/removed handler
-//                     surfaces here).
-//   - `adapterExport` the `lspAdapter.ts` export expected for this feature, or
-//                     `null` when the playground wires it WITHOUT a dedicated
-//                     adapter binding (e.g. formatting drives the seed's
-//                     `formatSrc` straight from a toolbar button).
+//   - `serverMarker`  a substring that MUST appear in `server.ts`.
+//   - `adapterExport` the `lspAdapter.ts` export expected for this feature.
 //   - `mainMarker`    a substring that MUST appear in `main.ts` — the Monaco
 //                     `register…Provider` / capability call that wires it.
-//   - `knownGap`      OPTIONAL. When set, this feature is a DOCUMENTED parity
-//                     gap: the LSP exposes it but the playground does not yet
-//                     wire it. The test then asserts the gap STILL EXISTS — so
-//                     when someone closes the gap (adds the export / provider)
-//                     this row fails and forces them to delete the TODO and turn
-//                     the row into a real parity assertion. The string is the
-//                     reason, surfaced in output.
+//   - `shared`        the `features.ts` export both hosts call, or null when the
+//                     feature has none (diagnostics: each host runs the checker).
+//   - `knownGap`      OPTIONAL. The LSP exposes the feature and the playground
+//                     does not wire it; the test asserts the gap STILL HOLDS, so
+//                     closing it reds this row until it is promoted.
 type Parity = {
   feature: string;
   serverMarker: string;
-  adapterExport: string | null;
-  mainMarker: string | null;
+  adapterExport: string;
+  mainMarker: string;
+  shared: string | null;
   knownGap?: string;
-  /**
-   * A feature LABEL can hide more than one behaviour, and a row that grades the label alone
-   * cannot see one of them go missing: the playground offered no UFCS method for months
-   * while this table read green, because UFCS is a behaviour inside "completion". Each entry
-   * names one such behaviour and the symbol each side composes it from — both must be
-   * present, so a host that drops one reds here.
-   */
-  subBehaviours?: { name: string; symbol: string }[];
 };
 
 const FEATURES: Parity[] = [
-  // ---- IN PARITY (LSP + adapter export + Monaco provider all present) -------
   {
     feature: "diagnostics",
     serverMarker: "documents.onDidChangeContent",
     adapterExport: "diagnostics",
     // Diagnostics are pushed as Monaco markers, not a register…Provider call.
     mainMarker: "monaco.editor.setModelMarkers",
+    shared: null,
   },
   {
     feature: "semantic tokens",
     serverMarker: "connection.languages.semanticTokens.on",
     adapterExport: "semanticTokens",
     mainMarker: "registerDocumentSemanticTokensProvider",
+    shared: "semanticTokensAt",
   },
   {
     feature: "hover",
     serverMarker: "connection.onHover",
     adapterExport: "hover",
     mainMarker: "registerHoverProvider",
+    shared: "hoverAt",
   },
   {
     feature: "inlay hints",
     serverMarker: "connection.languages.inlayHint.on",
     adapterExport: "inlayHints",
     mainMarker: "registerInlayHintsProvider",
+    shared: "inlayHintsAt",
   },
   {
     feature: "go-to-definition",
     serverMarker: "connection.onDefinition",
     adapterExport: "definition",
     mainMarker: "registerDefinitionProvider",
+    shared: "definitionAt",
   },
   {
+    feature: "find references",
+    serverMarker: "connection.onReferences",
+    adapterExport: "references",
+    mainMarker: "registerReferenceProvider",
+    shared: "referencesAt",
+  },
+  {
+    feature: "document highlights",
+    serverMarker: "connection.onDocumentHighlight",
+    adapterExport: "documentHighlights",
+    mainMarker: "registerDocumentHighlightProvider",
+    shared: "documentHighlightsAt",
+  },
+  {
+    feature: "document symbols (outline)",
+    serverMarker: "connection.onDocumentSymbol",
+    adapterExport: "documentSymbols",
+    mainMarker: "registerDocumentSymbolProvider",
+    shared: "documentSymbolsAt",
+  },
+  {
+    // `resolveRenameLocation` is the prepare half, which is why
+    // `connection.onPrepareRename` sits in NON_FEATURE below.
+    feature: "rename symbol",
+    serverMarker: "connection.onRenameRequest",
+    adapterExport: "rename",
+    mainMarker: "registerRenameProvider",
+    shared: "renameAt",
+  },
+  {
+    // The playground formats from its toolbar button, not a Monaco provider.
     feature: "document formatting",
     serverMarker: "connection.onDocumentFormatting",
-    // The playground wires formatting WITHOUT an `lspAdapter` binding: the
-    // Format toolbar button drives the seed's `formatSrc` straight from
-    // `main.ts`, the same whole-document formatter the LSP's
-    // `onDocumentFormatting` uses. Recognized as provider-less wiring.
-    adapterExport: null,
+    adapterExport: "format",
     mainMarker: "format(model.getValue())",
+    shared: "formattingEditsAt",
   },
   {
-    feature: "code actions (quick-fix / Auto Fix)",
+    feature: "code actions (quick-fix / organize imports)",
     serverMarker: "connection.onCodeAction",
     adapterExport: "codeActions",
     mainMarker: "registerCodeActionProvider",
-    // Both were SUB_GAPS the playground did not compose; promoted 2026-09-08 when
-    // the adapter's code-action + organize paths gained them (ROADMAP row 32).
-    subBehaviours: [
-      { name: "missing-UFCS-import quick-fix", symbol: "ufcsImportFixes" },
-      { name: "organize imports", symbol: "organizeImportEdits" },
-    ],
+    shared: "codeActionsAt",
   },
   {
-    // Completion (D3): scope-aware identifiers + structural member completion
-    // after `.` + keyword/snippet items. The playground mirrors it via the
-    // `completion` adapter export and a Monaco `CompletionItemProvider`
-    // (`.`-triggered), matching the server's `completionProvider.triggerCharacters`.
     feature: "completion",
-    // Measured 2026-09-08 by grepping both files for the composing symbol. `builtins`,
-    // `scope bindings`, `keywords` and `snippets` are present on both sides and covered by
-    // the export marker; these are the ones a label alone would hide. `stdAutoImportCompletions`
-    // was a SUB_GAPS row, promoted when the adapter's completion path gained it (row 32).
-    subBehaviours: [
-      { name: "UFCS method candidates", symbol: "ufcsCompletions" },
-      { name: "std auto-import items", symbol: "stdAutoImportCompletions" },
-    ],
     serverMarker: "connection.onCompletion",
     adapterExport: "completion",
     mainMarker: "registerCompletionItemProvider",
+    shared: "completionsAt",
   },
   {
-    // Folding ranges (D9.9): blocks, multi-line paren/bracket groups, `//`
-    // comment runs, the leading import block. In parity from the day it
-    // landed and cheaply so — this is the one feature with NO checker in it
-    // (a token scan over `lsp/src/folding.ts`), so the playground needed no
-    // seed plumbing, just the Monaco line-base shift.
     feature: "folding ranges",
     serverMarker: "connection.onFoldingRanges",
     adapterExport: "foldingRanges",
     mainMarker: "registerFoldingRangeProvider",
+    shared: "foldingRangesAt",
   },
   {
-    // Signature help (D9.10): the callee's parameters while typing a call, with
-    // the argument under the cursor highlighted. In parity from the day it
-    // landed, like folding — the lexical half (`lsp/src/signatureHelp.ts`:
-    // which call, which argument) is shared verbatim, and the playground
-    // already drives the seed the parameter table comes from (`sigAt`), so the
-    // wiring is one adapter binding and one Monaco provider.
     feature: "signature help",
     serverMarker: "connection.onSignatureHelp",
     adapterExport: "signatureHelp",
     mainMarker: "registerSignatureHelpProvider",
+    shared: "signatureHelpAt",
   },
 
   // ---- KNOWN PARITY GAPS (LSP exposes it; playground does NOT wire it) -------
-  //
-  // These rows DOCUMENT the current drift. They are asserted as known gaps:
-  // the test confirms the playground still lacks the wiring. CLOSING a gap
-  // (adding the adapter export + Monaco provider) will FAIL the matching
-  // assertion below, prompting you to delete the TODO and convert the row into
-  // a real in-parity row above.
   {
-    // TODO parity: the LSP exposes find-all-references (`onReferences`,
-    // cross-file aware), but the playground has neither an `lspAdapter`
-    // `references` binding nor a Monaco `ReferenceProvider`. Add both, then
-    // move this row up and drop `knownGap`.
-    feature: "find references",
-    serverMarker: "connection.onReferences",
-    adapterExport: "references", // ← missing in lspAdapter.ts
-    mainMarker: "registerReferenceProvider", // ← missing in main.ts
-    knownGap: "no references adapter export and no registerReferenceProvider",
-  },
-  {
-    // TODO parity (D9.1): same-file occurrence highlights ship in the LSP
-    // (`referencesAt` + `definitionAt` → read/write kinds); Monaco has a
-    // matching `DocumentHighlightProvider`. Add the adapter binding + provider,
-    // then move this row up and drop `knownGap`.
-    feature: "document highlights",
-    serverMarker: "connection.onDocumentHighlight",
-    adapterExport: "documentHighlights", // ← missing in lspAdapter.ts
-    mainMarker: "registerDocumentHighlightProvider", // ← missing in main.ts
-    knownGap:
-      "no documentHighlights adapter export and no registerDocumentHighlightProvider",
-  },
-  {
-    // TODO parity (D9.3): the flat outline ships in the LSP
-    // (`flatDocumentSymbols` over `tokensAt` + `moduleSurface`); Monaco has a
-    // matching `DocumentSymbolProvider` (outline + breadcrumbs). Add the
-    // adapter binding + provider, then move this row up and drop `knownGap`.
-    feature: "document symbols (outline)",
-    serverMarker: "connection.onDocumentSymbol",
-    adapterExport: "documentSymbols", // ← missing in lspAdapter.ts
-    mainMarker: "registerDocumentSymbolProvider", // ← missing in main.ts
-    knownGap:
-      "no documentSymbols adapter export and no registerDocumentSymbolProvider",
-  },
-  {
-    // Parity gap by DESIGN, not just backlog (D9.4): the export
-    // reference-count lens reads the workspace-wide use-map the unused-export
-    // save pass maintains, and the single-file playground has no workspace to
-    // crawl — a playground lens would always read "0 refs". Revisit only if
-    // the playground ever grows a multi-file model.
+    // A gap by design: the lens counts read the workspace-wide use-map the
+    // server's save pass maintains, and the playground keeps no such map.
     feature: "code lens (export reference counts)",
     serverMarker: "connection.onCodeLens",
-    adapterExport: "codeLenses", // ← missing in lspAdapter.ts
-    mainMarker: "registerCodeLensProvider", // ← missing in main.ts
-    knownGap:
-      "workspace-scoped (lastUseMap); the single-file playground has no use-map",
-  },
-  {
-    // TODO parity (D9.7): rename symbol ships in the LSP (`planRenameAt` +
-    // `renameEdits` in `lsp/src/rename.ts` — alias/import-edge aware, std
-    // refusals); Monaco has a matching `RenameProvider` (`provideRenameEdits`
-    // + `resolveRenameLocation` covering the prepare half, which is why
-    // `connection.onPrepareRename` sits in NON_FEATURE below rather than in a
-    // second row). A single-file playground rename is meaningful for local
-    // bindings; add the adapter binding + provider, then move this row up and
-    // drop `knownGap`.
-    feature: "rename symbol",
-    serverMarker: "connection.onRenameRequest",
-    adapterExport: "rename", // ← missing in lspAdapter.ts
-    mainMarker: "registerRenameProvider", // ← missing in main.ts
-    knownGap: "no rename adapter export and no registerRenameProvider",
+    adapterExport: "codeLenses",
+    mainMarker: "registerCodeLensProvider",
+    shared: "codeLensesAt",
+    knownGap: "workspace-scoped (lastUseMap); the playground keeps no use-map",
   },
 ];
 
 // --- 0. the table self-validates against server.ts --------------------------
-//
-// Every row's `serverMarker` must really be in `server.ts`. This is what makes
-// the table track the LIVE LSP surface: a handler that's renamed/removed in
-// `server.ts` breaks here, and a row whose marker was a typo can't masquerade
-// as a real feature.
-// A behaviour named by `subBehaviours` must be composed by BOTH hosts. This is the check
-// the table could not make while every row graded one marker: the label said "completion"
-// and both sides had a `completion` export, so the playground's missing UFCS half was
-// invisible to it.
-Deno.test("every named sub-behaviour is composed by both hosts", () => {
-  for (const f of FEATURES) {
-    for (const b of f.subBehaviours ?? []) {
-      assert(
-        serverSrc.includes(b.symbol),
-        `feature "${f.feature}" / "${b.name}": server.ts no longer composes ` +
-          `"${b.symbol}" — update the row, or remove it if the LSP dropped the behaviour.`,
-      );
-      assert(
-        adapterSrc.includes(b.symbol),
-        `feature "${f.feature}" / "${b.name}": the playground adapter does not compose ` +
-          `"${b.symbol}", so the feature label is green while this behaviour is missing. ` +
-          `Wire it in playground/src/lspAdapter.ts, or move it to a knownGap row.`,
-      );
-    }
-  }
-});
 
 Deno.test("parity table matches the live LSP surface (server.ts)", () => {
   for (const f of FEATURES) {
     assert(
       serverSrc.includes(f.serverMarker),
       `feature "${f.feature}": server.ts no longer contains "${f.serverMarker}" — ` +
-        `the LSP handler was renamed/removed, or the parity row is stale. ` +
-        `Update the row (or remove it if the LSP dropped the feature).`,
+        `the LSP handler was renamed/removed, or the parity row is stale.`,
     );
   }
 });
 
-// --- 0b. guard: no LSP handler is missing from the table --------------------
-//
-// Catch a NEW `server.ts` handler that nobody added a parity row for (the
-// reverse-drift the playground "Auto Fix" gap was). We scan for the standard
-// `connection.onX(` registrations and the `connection.languages.Y.on(`
-// providers and require each to be represented by some row's `serverMarker`.
+// A new `server.ts` handler nobody added a row for is the reverse drift.
 Deno.test("every server.ts handler has a parity-table row", () => {
   const handlerRe =
     /connection\.(?:on[A-Z]\w*|languages\.\w+\.on)|documents\.onDidChangeContent/g;
   const found = new Set(serverSrc.match(handlerRe) ?? []);
-  // Handlers that are NOT user-facing language features (lifecycle / workspace
-  // bookkeeping), intentionally excluded from playground parity.
+  // Handlers that are NOT user-facing language features.
   const NON_FEATURE = new Set([
     "connection.onInitialize",
     "connection.onInitialized", // lifecycle: flushes the cached seed-origin notification
@@ -325,9 +220,8 @@ Deno.test("every server.ts handler has a parity-table row", () => {
   ]);
   for (const handler of found) {
     if (NON_FEATURE.has(handler)) continue;
-    const covered = FEATURES.some((f) => f.serverMarker.startsWith(handler));
     assert(
-      covered,
+      FEATURES.some((f) => f.serverMarker.startsWith(handler)),
       `server.ts registers "${handler}" but no parity-table row covers it. ` +
         `Add a row to FEATURES (and wire the playground), or add it to ` +
         `NON_FEATURE if it isn't a user-facing language feature.`,
@@ -335,138 +229,77 @@ Deno.test("every server.ts handler has a parity-table row", () => {
   }
 });
 
-// --- 1. adapter export present (real import + typeof) -----------------------
-//
-// For each feature with an `adapterExport`, the `lspAdapter.ts` module must
-// export a function of that name. We imported the module for real, so this is a
-// genuine runtime check (not a text grep) — a renamed/removed export is caught.
+// --- 1. both hosts call the same shared feature -------------------------------
+
+Deno.test("both hosts call the row's shared features.ts function", () => {
+  for (const f of FEATURES) {
+    if (f.shared === null) continue;
+    const call = `${f.shared}(`;
+    assert(
+      featuresSrc.includes(`export const ${f.shared} =`),
+      `feature "${f.feature}": features.ts no longer exports "${f.shared}".`,
+    );
+    assert(
+      serverSrc.includes(call),
+      `feature "${f.feature}": server.ts does not call "${f.shared}".`,
+    );
+    if (f.knownGap) continue;
+    assert(
+      adapterSrc.includes(call),
+      `feature "${f.feature}": the playground adapter does not call "${f.shared}", ` +
+        `so it computes the feature its own way. Call the shared function from ` +
+        `playground/src/lspAdapter.ts.`,
+    );
+  }
+});
+
+// --- 2. adapter export present (real import + typeof) -----------------------
+
 Deno.test("lspAdapter.ts exports a binding for each in-parity feature", () => {
   const exports = adapter as unknown as Record<string, unknown>;
   for (const f of FEATURES) {
-    if (f.adapterExport === null) continue; // provider-less feature (formatting)
     const present = typeof exports[f.adapterExport] === "function";
     if (f.knownGap) {
-      // Known gap: the export is EXPECTED to be absent (or the row would be in
-      // parity). If it's now present, the gap may be half-closed — only fail
-      // when BOTH the export and the main.ts wiring exist (i.e. fully wired),
-      // since `codeActions` legitimately exists already while main.ts is unwired.
-      const mainWired = f.mainMarker !== null && mainSrc.includes(f.mainMarker);
       assert(
-        !(present && mainWired),
+        !(present && mainSrc.includes(f.mainMarker)),
         `KNOWN GAP CLOSED: "${f.feature}" is now fully wired (adapter export ` +
-          `"${f.adapterExport}" + main.ts "${f.mainMarker}"). Move this row to ` +
-          `the in-parity section and delete its \`knownGap\`.`,
+          `"${f.adapterExport}" + main.ts "${f.mainMarker}"). Delete its \`knownGap\`.`,
       );
       continue;
     }
     assert(
       present,
       `MISSING ADAPTER BINDING: lspAdapter.ts must export a "${f.adapterExport}" ` +
-        `function for feature "${f.feature}" (the LSP exposes it via ` +
-        `"${f.serverMarker}"). Add the pure binding to playground/src/lspAdapter.ts.`,
+        `function for feature "${f.feature}".`,
     );
   }
 });
 
-// --- 2. main.ts wires the Monaco provider for each in-parity feature ---------
-//
-// For each feature with a `mainMarker`, `main.ts`'s source must contain the
-// Monaco `register…Provider` / capability call. Source-text presence (not a
-// brittle full-line match) keeps this robust to formatting.
+// --- 3. main.ts wires the Monaco provider for each in-parity feature ---------
+
 Deno.test("main.ts registers a Monaco provider for each in-parity feature", () => {
   for (const f of FEATURES) {
-    if (f.mainMarker === null) continue;
     const present = mainSrc.includes(f.mainMarker);
     if (f.knownGap) {
-      // Known gap: main.ts is EXPECTED to lack this wiring. If it's now present,
-      // the gap is closed — fail so the row gets promoted out of the TODO set.
       assert(
         !present,
         `KNOWN GAP CLOSED: main.ts now contains "${f.mainMarker}" for ` +
-          `"${f.feature}". Ensure the adapter export "${f.adapterExport}" exists ` +
-          `too, then move this row to the in-parity section and delete \`knownGap\`.`,
+          `"${f.feature}". Delete its \`knownGap\`.`,
       );
       continue;
     }
     assert(
       present,
       `MISSING PLAYGROUND WIRING: main.ts must wire "${f.mainMarker}" for ` +
-        `feature "${f.feature}" (the LSP exposes it via "${f.serverMarker}"). ` +
-        `A language feature was added to the LSP without wiring the playground ` +
-        `Monaco provider. Register it in playground/src/main.ts.`,
+        `feature "${f.feature}". Register it in playground/src/main.ts.`,
     );
   }
 });
 
-// --- 3. surface the known gaps loudly (informational, always passes) --------
-//
-// Not a failure — a single test that prints the current documented gaps so they
-// stay visible in CI output and don't quietly accumulate.
+// --- 4. surface the known gaps (informational) ------------------------------
+
 Deno.test("DOCUMENTED parity gaps (informational)", () => {
-  const gaps = FEATURES.filter((f) => f.knownGap);
-  for (const g of gaps) {
+  for (const g of FEATURES.filter((f) => f.knownGap)) {
     console.log(`  parity gap — ${g.feature}: ${g.knownGap}`);
-  }
-  // Sanity: every `knownGap` row's promised gap must actually hold right now
-  // (the main.ts wiring is the common missing piece for all three).
-  assert(
-    gaps.every((g) => g.mainMarker !== null && !mainSrc.includes(g.mainMarker)),
-    "a row marked knownGap is actually wired in main.ts — promote it.",
-  );
-});
-
-// --- 4. gaps a FEATURE LABEL hides ------------------------------------------
-//
-// A `knownGap` row keys on `mainMarker`, so it can only describe a feature the
-// playground does not register AT ALL. It is blind to the other shape: the
-// Monaco provider IS registered and the adapter composes only PART of what the
-// LSP's own handler composes.
-//
-// `SUB_GAPS` is that instrument's NEGATIVE half — a behaviour the adapter does
-// not compose yet, asserted to STILL HOLD so closing one reds this test and
-// forces a promotion. It is empty today: the three that stood (`stdAutoImport-
-// Completions`, `ufcsImportFixes`, `organizeImportEdits`) were composed by the
-// adapter (ROADMAP row 32) and PROMOTED into the `subBehaviours` of their
-// "completion" / "code actions" rows, where the positive both-hosts assertion
-// above now grades them. The type and the two tests stay as the standing home
-// for the next label-hidden gap. (`adapterSrc` is read once at the top of the
-// file.)
-type SubGap = {
-  under: string; // the in-parity FEATURES row whose label hides this
-  symbol: string; // the `lsp/src/*` helper server.ts composes
-  why: string;
-};
-
-// EMPTY IS CORRECT — the three that stood were composed and promoted to
-// `subBehaviours` (ROADMAP row 32). Add a row here when a REGISTERED provider's
-// adapter composes only PART of what its `server.ts` handler does: it reds until
-// the row is promoted, which is how the three that were here got caught.
-const SUB_GAPS: SubGap[] = [];
-
-Deno.test("every sub-behaviour gap names a live LSP helper", () => {
-  for (const g of SUB_GAPS) {
-    assert(
-      serverSrc.includes(g.symbol),
-      `sub-gap "${g.symbol}": server.ts no longer composes it — the LSP side ` +
-        `was renamed or removed, so this row is stale. Update or delete it.`,
-    );
-    assert(
-      FEATURES.some((f) => f.feature === g.under && !f.knownGap),
-      `sub-gap "${g.symbol}": no in-parity FEATURES row named "${g.under}". ` +
-        `A sub-behaviour gap only means something under a row this file ` +
-        `otherwise reports as in parity.`,
-    );
-  }
-});
-
-Deno.test("DOCUMENTED sub-behaviour gaps still hold", () => {
-  for (const g of SUB_GAPS) {
-    console.log(`  sub-behaviour gap — ${g.under} / ${g.symbol}: ${g.why}`);
-    assert(
-      !adapterSrc.includes(g.symbol),
-      `SUB-GAP CLOSED: lspAdapter.ts now composes "${g.symbol}" under ` +
-        `"${g.under}". Delete this row from SUB_GAPS — and if the behaviour is ` +
-        `now graded end to end, say so where the feature row is asserted.`,
-    );
   }
 });
