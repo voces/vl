@@ -193,7 +193,7 @@ never-written struct's fields into its parent or flattens an array of structs. T
 fields, `--type-merging`/`--unsubtyping`/`--type-ssa` change the type graph but not field
 layout. A stored `V3` escapes into its container, so `--heap2local` leaves it. Binaryen does
 re-run after the rewrite: the host runs the step first and the `-O` rung after
-(`main.rs`, `opt.multivalue_step` then `opt.rung`), so it sees the inlined fields.
+(`main.rs`, `opt.pipeline` then `opt.rung`), so it sees the inlined fields.
 
 **Recommendation: the host, for both (a) and (b).** The emitter's part is the explain line
 and, later, a hint. The emitter route is worth it only if the owner wants the guarantee at
