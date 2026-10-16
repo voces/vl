@@ -682,19 +682,30 @@ function mapsOfPath(path: string): Set<string> {
   out
 }
 
-// The locals one `{ a, b as c }` specifier list binds to a member of `maps`.
-function mapLocals(list: string, maps: Set<string>, out: Set<string>) {
+// One `{ a, b as c }` specifier: the name the other module exports and the local it binds.
+type Spec = { name: string, local: string }
+
+function specs(list: string): Spec[] {
+  const out: Spec[] = []
   for part in split(list, ",") {
     const s = strip(part)
     const e = identEnd(s, 0)
-    if e == 0 || !maps.has(s.slice(0, e)) { continue }
+    if e == 0 { continue }
     let local = s.slice(0, e)
     const k = skipSp(s, e)
     if startsAt(s, k, "as") && !wordAt(s, k + 2) {
       const a = skipSp(s, k + 2)
       local = s.slice(a, identEnd(s, a))
     }
-    if local != "" { out.add(local) }
+    if local != "" { out.push({ name: s.slice(0, e), local: local }) }
+  }
+  out
+}
+
+// The locals one specifier list binds to a member of `maps`.
+function mapLocals(list: string, maps: Set<string>, out: Set<string>) {
+  for sp in specs(list) {
+    if maps.has(sp.name) { out.add(sp.local) }
   }
   0
 }
@@ -761,6 +772,64 @@ function graphHoles(roots: string[]): Set<string> {
     for im in relImports(src, dirOf(path)) { todo.push(normPath(im.path)) }
   }
   out
+}
+
+// One module of the graph, read once for the reader fixpoint.
+type Mod = { path: string, lines: string[], fns: Fn[], imps: RelImport[] }
+
+// Per module path, the import locals naming a reader of the module they come from, closed
+// over every module `roots` reach as the driver closes it: a module's readers are re-read
+// until no module's imported set grows.
+function graphReaders(roots: string[]): Map<string, Set<string>> {
+  const mods: Mod[] = []
+  const seen: Set<string> = Set()
+  const todo: string[] = []
+  for r in roots { todo.push(normPath(r)) }
+  let k = 0
+  while k < todo.length {
+    const path = todo[k]
+    k = k + 1
+    if seen.has(path) { continue }
+    seen.add(path)
+    const b = readFile(path)
+    if b is IoError { continue }
+    const src = decodeUtf8Lossy(b)
+    const lines = strippedLines(src)
+    const imps = relImports(src, dirOf(path))
+    mods.push({ path: path, lines: lines, fns: functions(lines), imps: imps })
+    for im in imps { todo.push(normPath(im.path)) }
+  }
+  const own: Map<string, Set<string>> = Map()
+  const imp: Map<string, Set<string>> = Map()
+  for md in mods {
+    own[md.path] = Set()
+    imp[md.path] = Set()
+  }
+  let again = true
+  while again {
+    again = false
+    for md in mods {
+      own[md.path] = moduleReaders(md.lines, md.fns, imp[md.path] ?? Set())
+    }
+    for md in mods {
+      const mine = imp[md.path] ?? Set()
+      for im in md.imps {
+        const to = normPath(im.path)
+        const there = own[to] ?? Set()
+        const thereImp = imp[to] ?? Set()
+        for sp in specs(im.list) {
+          if (
+            (there.has(sp.name) || thereImp.has(sp.name))
+            && !mine.has(sp.local)
+          ) {
+            mine.add(sp.local)
+            again = true
+          }
+        }
+      }
+    }
+  }
+  imp
 }
 
 // `path` with each `/./` step dropped and each `dir/../` folded, so one module has one key.
@@ -842,12 +911,40 @@ function answersInBand(lines: string[], lo: i32, hi: i32): boolean {
   false
 }
 
-// The module's readers: a literal -1 answer, closed under "returns a reader's result" for
-// at most four rounds. Decides only whether a parameter read counts, never a producer.
-function moduleReaders(lines: string[], fns: Fn[]): Set<string> {
+// Whether a line of `f` hands back the answer of `imported`, a reader another module owns.
+function forwardsImported(
+  lines: string[],
+  f: Fn,
+  local: Set<string>,
+  imported: Set<string>,
+): boolean {
+  let i = f.lo
+  while i <= f.hi {
+    const c = forwardedCall(lines[i])
+    if c != "" && !local.has(c) && imported.has(c) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The module's readers: a literal -1 answer or an imported reader's answer handed back,
+// closed under "returns a reader's result" for at most four rounds. Decides only whether
+// a parameter read counts, never a producer.
+function moduleReaders(
+  lines: string[],
+  fns: Fn[],
+  imported: Set<string>,
+): Set<string> {
   const out: Set<string> = Set()
+  const local: Set<string> = Set()
+  for f in fns { local.add(f.name) }
   for f in fns {
-    if answersInBand(lines, f.lo, f.hi) { out.add(f.name) }
+    if (
+      answersInBand(lines, f.lo, f.hi)
+      || forwardsImported(lines, f, local, imported)
+    ) {
+      out.add(f.name)
+    }
   }
   let round = 0
   while round < 4 {
@@ -873,16 +970,20 @@ function moduleReaders(lines: string[], fns: Fn[]): Set<string> {
 
 // Every hit in one module, one linear pass per function: a guard counts only where it
 // precedes the read, and a re-binding forgets what the name was bound to. `graph` is the
-// hole fields of the modules graded beside it (`graphHoles`).
-function hitsIn(rel: string, path: string, graph: Set<string>): Hit[] {
+// hole fields and imported readers of the modules graded beside it (`graphOf`).
+function hitsIn(rel: string, path: string, graph: Graph): Hit[] {
   const src = readSource(path)
   const lines = strippedLines(src)
   const holes = holeFields(lines)
-  for f in graph { holes.add(f) }
+  for f in graph.holes { holes.add(f) }
   const maps = moduleMaps(lines)
   for m in importedMaps(src, dirOf(path)) { maps.add(m) }
   const fns = functions(lines)
-  const readersHere = moduleReaders(lines, fns)
+  const readersHere = moduleReaders(
+    lines,
+    fns,
+    graph.readers[normPath(path)] ?? Set(),
+  )
   const out: Hit[] = []
   for f in fns {
     const local = declaredIn(lines, f.lo, f.hi)
@@ -961,16 +1062,23 @@ function hitsIn(rel: string, path: string, graph: Set<string>): Hit[] {
   out
 }
 
-// The hole fields of the whole tree under `root`, which is the compiler's module graph.
-function treeHoles(root: string): Set<string> {
+// What a module's grade reads from the modules beside it.
+type Graph = { holes: Set<string>, readers: Map<string, Set<string>> }
+
+function graphOf(roots: string[]): Graph {
+  { holes: graphHoles(roots), readers: graphReaders(roots) }
+}
+
+// The graph of the whole tree under `root`, which is the compiler's module graph.
+function treeGraph(root: string): Graph {
   const paths: string[] = []
   for src in sources(root) { paths.push(src.path) }
-  graphHoles(paths)
+  graphOf(paths)
 }
 
 function allHits(root: string): Hit[] {
   const out: Hit[] = []
-  const graph = treeHoles(root)
+  const graph = treeGraph(root)
   for src in sources(root) {
     for h in hitsIn(src.rel, src.path, graph) { out.push(h) }
   }
@@ -1068,7 +1176,7 @@ function cmdHoles(root: string): i32 {
 }
 
 function cmdTables(root: string): i32 {
-  const graph = treeHoles(root)
+  const graph = treeGraph(root)
   for src in sources(root) {
     const seen: Map<string, i32> = Map()
     const order: string[] = []
@@ -1102,7 +1210,7 @@ function cmdTable(root: string, limit: i32, code: string): i32 {
 function cmdGrade(path: string): i32 {
   const rows: Map<string, string[]> = Map()
   for c in CODES { rows[c] = [] }
-  for h in hitsIn(path, path, graphHoles([path])) {
+  for h in hitsIn(path, path, graphOf([path])) {
     const r = rows[h.code] ?? []
     r.push(
       "[\{toString(h.line)}, \{toString(h.col)}, \{jsonStr(h.table)}, \{jsonStr(h.idx)}]",

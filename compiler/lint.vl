@@ -227,6 +227,7 @@ export function lint(progRoot: i32) {
     sentinelIndexLint()
     lintSetImportedMaps(Map())
     lintSetImportedFns(Map())
+    lintSetImportedReaders(Map(), -1)
     stdCommentAudience()
     commentBudget()
   }
@@ -6105,13 +6106,61 @@ export function lintMapGlobalsOf(src: string): {[string]: i32} {
 // "-1 where nothing answers" is called with values that may not answer.
 let siFnReader: i32[] = []
 
-// The forwarding edges, flat and already resolved: `siEdgeFrom[k]` hands its answer to
-// function `siEdgeTo[k]`. Resolved once through a name index rather than re-scanned
-// per round — the fixpoint below runs four times, and a name scan inside it would be
-// O(edges × functions), which is the shape this file's arena-scan rule refuses.
-let siEdgeFrom: i32[] = []
-let siEdgeTo: i32[] = []
-let siFnIx: {[string]: i32} = Map()
+// Module reader scans, one slot each, read once from a source: the source, its function
+// names, whether each answers -1 itself, the forwarding edges resolved to its own functions
+// (`siScFrom` hands its answer to `siScTo`), and the tail calls naming no function there
+// (`siScOpenFn` hands its answer to the name `siScOpenName`). Closing never re-walks.
+let siScSrc: string[] = []
+let siScNames: string[][] = []
+let siScDirect: i32[][] = []
+let siScFrom: i32[][] = []
+let siScTo: i32[][] = []
+let siScOpenFn: i32[][] = []
+let siScOpenName: string[][] = []
+// The slot a run with no staged scan walks into, so `lint()` alone never grows the table.
+let siScratchSlot = -1
+
+// The import locals naming a reader of another module, so handing an answer to one makes
+// a reader here as much as a function of this module would. Staged by the driver from the
+// graph's fixpoint (`lintReadersOf`); without it a module carve hides every such read.
+let siImportedReaders: {[string]: i32} = Map()
+// The driver's scan slot for the module about to be linted, or -1.
+let siStagedSlot = -1
+
+// Stage the next module's imported readers and its scan slot (-1 for none); that module's
+// `lint()` consumes them.
+export function lintSetImportedReaders(names: {[string]: i32}, slot: i32) {
+  siImportedReaders = names
+  siStagedSlot = slot
+  0
+}
+
+// Scan `src` into `slot`, or into a new slot when `slot` is not one; answers the slot,
+// which `lintReadersOf` closes while the caller's `src` stands.
+export function lintReaderScanOf(src: string, slot: i32): i32 {
+  klEnsureIndex(src)
+  siScanLines(src, slot)
+}
+
+// The readers slot `slot`'s module declares when `imported` names the import locals that
+// are readers, the step the driver iterates over the graph until no module's set grows.
+export function lintReadersOf(
+  slot: i32,
+  imported: {[string]: i32},
+): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  if slot < 0 || slot >= siScNames.length { return out }
+  siImportedReaders = imported
+  siCloseReaders(slot)
+  const names = siScNames[slot]
+  let f = 0
+  while f < names.length && f < siFnReader.length {
+    if siFnReader[f] == 1 { siAdd(out, names[f]) }
+    f = f + 1
+  }
+  siImportedReaders = Map()
+  out
+}
 
 // Per-function state, reset by `siGradeFn`. Module globals rather than locals threaded
 // through: the read grader wants seven of them, and a parameter list that long is how a
@@ -6415,51 +6464,117 @@ function siLineReturns(s: string, a: i32, e: i32) {
   siWalkLine(s, a, e, siWorkReturn) >= 0
 }
 
-// Mark every function answering -1 directly, record the forwarding edges, then close
-// under them four rounds deep: a function handing back a reader's answer is one too.
+// Mark every function answering -1 directly or handing back an imported reader's answer,
+// then close under the forwarding edges four rounds deep: a function handing back a
+// reader's answer is one too. The driver's staged slot stands in for the walk when it
+// holds this source.
 function siScanReaders(s: string) {
-  siFnReader = []
-  siEdgeFrom = []
-  siEdgeTo = []
-  siFnIx = Map()
+  const slot = siStagedSlot
+  const staged = slot >= 0
+    && slot < siScSrc.length
+    && slot < siScNames.length
+    && siScNames[slot].length == klFnName.length
+  if staged && siScSrc[slot] == s {
+    siCloseReaders(slot)
+  } else {
+    siScratchSlot = siScanLines(s, siScratchSlot)
+    siCloseReaders(siScratchSlot)
+  }
+}
+
+// The one walk over the module's lines `siCloseReaders` needs, against the module index,
+// into `slot` (a new one when `slot` is not a slot). Answers the slot.
+function siScanLines(s: string, slot: i32): i32 {
+  const names = klFnName
+  const direct: i32[] = []
+  const from: i32[] = []
+  const to: i32[] = []
+  const openFn: i32[] = []
+  const openName: string[] = []
+  const ix: {[string]: i32} = Map()
   let g = 0
-  while g < klFnName.length {
-    siFnIx[klFnName[g]] = g
+  while g < names.length {
+    ix[names[g]] = g
     g = g + 1
   }
   let f = 0
-  while f < klFnName.length {
-    siFnReader.push(0)
+  while f < names.length {
+    direct.push(0)
     let n = klFnLo[f]
     while n <= klFnHi[f] {
       const a = klLnStart[n]
       const e = klCodeEnd(s, a, klLnEnd[n])
-      if siNegAnswerLine(s, a, e) { siFnReader[f] = 1 }
+      if siNegAnswerLine(s, a, e) { direct[f] = 1 }
       const t = siRetCallOf(s, a, e)
       if t.length > 0 {
-        const to = siFnIx[t]
-        if to != null {
-          siEdgeFrom.push(f)
-          siEdgeTo.push(to)
+        const at = ix[t]
+        if at != null {
+          from.push(f)
+          to.push(at)
+        } else {
+          openFn.push(f)
+          openName.push(t)
         }
       }
       n = n + 1
     }
     f = f + 1
   }
+  if slot >= 0 && slot < siScSrc.length {
+    siScSrc[slot] = s
+    siScNames[slot] = names
+    siScDirect[slot] = direct
+    siScFrom[slot] = from
+    siScTo[slot] = to
+    siScOpenFn[slot] = openFn
+    siScOpenName[slot] = openName
+    return slot
+  }
+  siScSrc.push(s)
+  siScNames.push(names)
+  siScDirect.push(direct)
+  siScFrom.push(from)
+  siScTo.push(to)
+  siScOpenFn.push(openFn)
+  siScOpenName.push(openName)
+  siScSrc.length - 1
+}
+
+// `siFnReader` from slot `slot` under the staged imported readers. The edges are resolved,
+// so each round is linear in them rather than a name search per edge.
+function siCloseReaders(slot: i32) {
+  siFnReader = []
+  if slot < 0 || slot >= siScDirect.length { return 0 }
+  const direct = siScDirect[slot]
+  const openFn = siScOpenFn[slot]
+  const openName = siScOpenName[slot]
+  const from = siScFrom[slot]
+  const to = siScTo[slot]
+  let f = 0
+  while f < direct.length {
+    siFnReader.push(direct[f])
+    f = f + 1
+  }
+  let k = 0
+  while k < openFn.length && k < openName.length {
+    const at = openFn[k]
+    if (
+      at >= 0
+      && at < siFnReader.length
+      && siHas(siImportedReaders, openName[k])
+    ) {
+      siFnReader[at] = 1
+    }
+    k = k + 1
+  }
   let round = 0
   while round < 4 {
-    let k = 0
-    while k < siEdgeFrom.length {
-      const from = siEdgeFrom[k]
-      const to = siEdgeTo[k]
-      if (
-        from >= 0
-        && from < siFnReader.length
-        && to >= 0
-        && to < siFnReader.length
-      ) {
-        if siFnReader[from] == 0 && siFnReader[to] == 1 { siFnReader[from] = 1 }
+    k = 0
+    while k < from.length && k < to.length {
+      const a = from[k]
+      const b = to[k]
+      if a >= 0 && a < siFnReader.length && b >= 0 && b < siFnReader.length {
+        if siFnReader[a] == 0 && siFnReader[b] == 1 { siFnReader[a] = 1 }
       }
       k = k + 1
     }
