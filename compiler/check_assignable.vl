@@ -972,114 +972,14 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
         }
         const d = T.tys[dtix]
         if d is TyObj {
-          const dnames = d.objFieldNames
-          const dtys = d.objFieldTypes
-          let i = 0
-          let ok = true
-          while i < dnames.length {
-            const sft = objFieldType(s, dnames[i])
-            if sft < 0 {
-              // Completion coercion: an object literal may omit a field whose declared type admits
-              // null — the field is materialized as `null` at construction. A non-nullable omitted
-              // field is still required. Scoped to this expression-aware path, not to general
-              // structural assignability, so it never widens through a container or variance.
-              if !tyAdmitsNull(dtys[i]) { ok = false }
-            } else {
-              // The field's value expression, for the literal-aware recursion.
-              let fexpr = -1
-              const fl = e.objFields
-              let fi = 0
-              while fi < fl.length {
-                const fn = P.nodes[fl[fi]]
-                if fn is FieldInit {
-                  if fn.fiName == dnames[i] { fexpr = fn.fiValue }
-                }
-                fi = fi + 1
-              }
-              if !assignableExpr(fexpr, sft, dtys[i]) { ok = false }
-            }
-            i = i + 1
-          }
-          // Rep sidecar: a field-wise-adopted ObjLit builds the destination struct rep (a boxed
-          // union field, an i64/f32 field, an omitted nullable field), so record it on the literal
-          // node and the emitter's row resolver keys the shape it builds, not the self-inference.
-          if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
-          // A field the record does not declare is refused where the literal is written, as at
-          // a destination `assignable` accepts by width (#1460). Reported and answered true.
-          if (
-            ok
-            && bareBraceSpec == 0
-            && !inferQuiet
-            && srcExpr != argLitAt
-            && objLitSetsUndeclared(e, dtix)
-          ) {
-            if !objLitHasDupKey(srcExpr) {
-              objLitUndeclaredErr(srcExpr, srcTy, dtix, "")
-            }
-          }
-          return ok
+          return assignableObjLitFields(srcExpr, srcTy, dstTy, e, s, dtix, d)
         }
         // A struct literal flowing into a union adopts the first struct arm it adapts into
         // field-wise (`{f: 97.5}` into `{f: f32} | {w: i32}`). The emitter already boxes a struct
         // literal into a union slot at a direct binding; this is the checker seam that lets a
         // widening field reach that same rep. The concrete arm is recorded on the literal node.
         if d is TyUnion {
-          // Flattened, because a union member may itself be a union: `type Shape = Circle | Rect`
-          // used as an arm of `Shape | ParseError` leaves a `TyUnion` in `uMembers`, which the
-          // `mt is TyObj` test skips. Each candidate is still gated by `unionArmBoxSafe` and still
-          // recorded as the concrete arm; canon's union-alias flatten covers both spellings.
-          const members: i32[] = []
-          flattenVariantsInto(dstTy, members)
-          // An arm declaring every field the literal sets is preferred; an arm that would drop
-          // one is taken only when no other accepts, and then refused as at a record (#1460).
-          let mi = 0
-          let pass = 0
-          while pass < 2 {
-            mi = 0
-            while mi < members.length {
-              const mt = T.tys[members[mi]]
-              if (
-                mt is TyObj
-                && unionArmBoxSafe(members[mi])
-                && objLitSetsUndeclared(e, members[mi]) == (pass == 1)
-              ) {
-                bareBraceSpecSet(bareBraceSpec + 1)
-                const armOk = assignableExpr(srcExpr, srcTy, members[mi])
-                bareBraceSpecSet(bareBraceSpec - 1)
-                if armOk && pass == 1 {
-                  if (
-                    !inferQuiet
-                    && bareBraceSpec == 0
-                    && !objLitHasDupKey(srcExpr)
-                  ) {
-                    objLitUndeclaredErr(
-                      srcExpr,
-                      srcTy,
-                      members[mi],
-                      " (reached through "
-                        + tyToStr(srcTy)
-                        + " into "
-                        + tyToStr(dstTy)
-                        + ")",
-                    )
-                  }
-                  return true
-                }
-                if armOk {
-                  if !inferQuiet {
-                    while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-                    nodeTySet(srcExpr, members[mi])
-                    // Rep sidecar: the struct literal builds the concrete arm struct's rep — record
-                    // it, recursing into fields, for the row resolver.
-                    recordRepTyAdopt(srcExpr, members[mi], 6)
-                  }
-                  return true
-                }
-              }
-              mi = mi + 1
-            }
-            pass = pass + 1
-          }
+          return assignableObjLitUnion(srcExpr, srcTy, dstTy, e)
         }
       }
     }
@@ -1099,86 +999,225 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       }
       const d = T.tys[dtix]
       if d is TyArray {
-        let i = 0
-        let ok = true
-        const cexWas = cexConverted
-        cexConverted = false
-        while i < e.arrElems.length {
-          const sp = P.nodes[e.arrElems[i]]
-          if sp is Spread {
-            // A spread hands over its list's elements, each delivered as one element (D3253).
-            let spe = tyArrayElemIx(nodeTyIxOf(sp.spdArg))
-            if spe >= 0 && tyHasHole(spe) && litPinN.length > 0 {
-              spe = substTyDeep(spe, litPinN, litPinT)
-            }
-            if spe >= 0 && !assignable(spe, d.aElem) { ok = false }
-          } else if (
-            !assignableExpr(
-              e.arrElems[i],
-              litElemSrcTy(e.arrElems[i], srcTy),
-              d.aElem,
-            )
-          ) {
-            ok = false
-          }
-          i = i + 1
-        }
-        // A whole float constant an element became is an integer, so the list is built at the
-        // destination's element type.
-        const cexElem = cexConverted
-        cexConverted = cexWas || cexElem
-        // Context adoption (atom lists): a literal array accepted by a literal-union element target
-        // is that atom list (`const ks: VK[] = ["aa", "bb"]`), so the destination array type is
-        // recorded on the literal node and the emitter classifies it as the i32 atom-id list. The
-        // niche-nullable scalar elements record the same way — `[null]` carries no other signal.
-        if (
-          ok
-          && !inferQuiet
-          && (tyIsLitUnion(d.aElem)
-            || tyIsNicheNulScalarElem(d.aElem)
-            || arrLitJoinUnionElem(srcExpr, dtix)
-            || cexElem
-            || f32ElemsAdoptedOver(srcExpr, d.aElem))
-        ) {
-          if srcExpr < nodeTyIx.length { nodeTySet(srcExpr, dtix) }
-        }
-        // Rep sidecar: a literal array adopted element-wise (a struct-element list widened, an
-        // i64/f32 element) builds the destination element rep — recurse into the elements so each
-        // element ObjLit resolves the shape the emitter builds.
-        if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
-        return ok
+        return assignableArrLitElems(srcExpr, srcTy, dstTy, e, dtix, d)
       }
       // An array literal flowing into a union adopts the first array arm it adapts into
       // element-wise (`["a"]` into `K0[] | {w: i32}`, `[1.5]` into `f32[] | i64`) — the array dual
       // of the ObjLit union-arm adoption above. The concrete arm is recorded on the literal node so
       // the emitter classifies the list with the arm's element rep, not the literal's softened one.
-      if d is TyUnion {
-        const members = d.uMembers
-        let mi = 0
-        while mi < members.length {
-          const mt = T.tys[members[mi]]
-          if mt is TyArray {
-            // An `f32[]` arm adopts like any other list arm: the f32-list value atom
-            // (kind 12) gives the box a real rep, and the emitter's coerce re-encodes
-            // the literal's f64-classified elements at f32 (`coerceListKind` 7).
-            bareBraceSpecSet(bareBraceSpec + 1)
-            const armOk = assignableExpr(srcExpr, srcTy, members[mi])
-            bareBraceSpecSet(bareBraceSpec - 1)
-            if armOk {
-              if !inferQuiet {
-                while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-                nodeTySet(srcExpr, members[mi])
-                // Rep sidecar: record the concrete array arm, recursing into elements, so the row
-                // resolver keys the arm the checker picked.
-                recordRepTyAdopt(srcExpr, members[mi], 6)
-              }
-              return true
-            }
+      if d is TyUnion { return assignableArrLitUnion(srcExpr, srcTy, d) }
+    }
+  }
+  false
+}
+
+// An object literal `e` of shape `s` delivered field-wise into the record `d` (`dtix`, `dstTy`
+// with its nullable wrappers peeled): an omitted field must admit null, a written one adapts
+// literal-aware. A field the record does not declare is refused at the literal, answered true.
+function assignableObjLitFields(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+  e: ObjLit,
+  s: TyObj,
+  dtix: i32,
+  d: TyObj,
+): boolean {
+  const dnames = d.objFieldNames
+  const dtys = d.objFieldTypes
+  let i = 0
+  let ok = true
+  while i < dnames.length {
+    const sft = objFieldType(s, dnames[i])
+    if sft < 0 {
+      // Completion coercion: an object literal may omit a field whose declared type admits
+      // null — the field is materialized as `null` at construction. A non-nullable omitted
+      // field is still required. Scoped to this expression-aware path, not to general
+      // structural assignability, so it never widens through a container or variance.
+      if !tyAdmitsNull(dtys[i]) { ok = false }
+    } else {
+      // The field's value expression, for the literal-aware recursion.
+      let fexpr = -1
+      const fl = e.objFields
+      let fi = 0
+      while fi < fl.length {
+        const fn = P.nodes[fl[fi]]
+        if fn is FieldInit {
+          if fn.fiName == dnames[i] { fexpr = fn.fiValue }
+        }
+        fi = fi + 1
+      }
+      if !assignableExpr(fexpr, sft, dtys[i]) { ok = false }
+    }
+    i = i + 1
+  }
+  // Rep sidecar: a field-wise-adopted ObjLit builds the destination struct rep (a boxed
+  // union field, an i64/f32 field, an omitted nullable field), so record it on the literal
+  // node and the emitter's row resolver keys the shape it builds, not the self-inference.
+  if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+  // A field the record does not declare is refused where the literal is written, as at
+  // a destination `assignable` accepts by width (#1460). Reported and answered true.
+  if (
+    ok
+    && bareBraceSpec == 0
+    && !inferQuiet
+    && srcExpr != argLitAt
+    && objLitSetsUndeclared(e, dtix)
+  ) {
+    if !objLitHasDupKey(srcExpr) {
+      objLitUndeclaredErr(srcExpr, srcTy, dtix, "")
+    }
+  }
+  return ok
+}
+
+// An object literal `e` delivered into the union `dstTy`: the first struct arm it adapts into
+// field-wise, preferring one that declares every field it sets, is recorded on the literal.
+// False when no arm adapts.
+function assignableObjLitUnion(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+  e: ObjLit,
+): boolean {
+  // Flattened, because a union member may itself be a union: `type Shape = Circle | Rect`
+  // used as an arm of `Shape | ParseError` leaves a `TyUnion` in `uMembers`, which the
+  // `mt is TyObj` test skips. Each candidate is still gated by `unionArmBoxSafe` and still
+  // recorded as the concrete arm; canon's union-alias flatten covers both spellings.
+  const members: i32[] = []
+  flattenVariantsInto(dstTy, members)
+  // An arm declaring every field the literal sets is preferred; an arm that would drop
+  // one is taken only when no other accepts, and then refused as at a record (#1460).
+  let mi = 0
+  let pass = 0
+  while pass < 2 {
+    mi = 0
+    while mi < members.length {
+      const mt = T.tys[members[mi]]
+      if (
+        mt is TyObj
+        && unionArmBoxSafe(members[mi])
+        && objLitSetsUndeclared(e, members[mi]) == (pass == 1)
+      ) {
+        bareBraceSpecSet(bareBraceSpec + 1)
+        const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+        bareBraceSpecSet(bareBraceSpec - 1)
+        if armOk && pass == 1 {
+          if (!inferQuiet && bareBraceSpec == 0 && !objLitHasDupKey(srcExpr)) {
+            objLitUndeclaredErr(
+              srcExpr,
+              srcTy,
+              members[mi],
+              " (reached through "
+                + tyToStr(srcTy)
+                + " into "
+                + tyToStr(dstTy)
+                + ")",
+            )
           }
-          mi = mi + 1
+          return true
+        }
+        if armOk {
+          if !inferQuiet {
+            while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+            nodeTySet(srcExpr, members[mi])
+            // Rep sidecar: the struct literal builds the concrete arm struct's rep — record
+            // it, recursing into fields, for the row resolver.
+            recordRepTyAdopt(srcExpr, members[mi], 6)
+          }
+          return true
         }
       }
+      mi = mi + 1
     }
+    pass = pass + 1
+  }
+  false
+}
+
+// An array literal `e` delivered element-wise into the list `d` (`dtix`, `dstTy` with its
+// nullable wrappers peeled); an atom, niche-nullable, joined or converted element list takes
+// `dtix` as the literal's own type.
+function assignableArrLitElems(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+  e: ArrayLit,
+  dtix: i32,
+  d: TyArray,
+): boolean {
+  let i = 0
+  let ok = true
+  const cexWas = cexConverted
+  cexConverted = false
+  while i < e.arrElems.length {
+    const sp = P.nodes[e.arrElems[i]]
+    if sp is Spread {
+      // A spread hands over its list's elements, each delivered as one element (D3253).
+      let spe = tyArrayElemIx(nodeTyIxOf(sp.spdArg))
+      if spe >= 0 && tyHasHole(spe) && litPinN.length > 0 {
+        spe = substTyDeep(spe, litPinN, litPinT)
+      }
+      if spe >= 0 && !assignable(spe, d.aElem) { ok = false }
+    } else if (
+      !assignableExpr(e.arrElems[i], litElemSrcTy(e.arrElems[i], srcTy), d.aElem)
+    ) {
+      ok = false
+    }
+    i = i + 1
+  }
+  // A whole float constant an element became is an integer, so the list is built at the
+  // destination's element type.
+  const cexElem = cexConverted
+  cexConverted = cexWas || cexElem
+  // Context adoption (atom lists): a literal array accepted by a literal-union element target
+  // is that atom list (`const ks: VK[] = ["aa", "bb"]`), so the destination array type is
+  // recorded on the literal node and the emitter classifies it as the i32 atom-id list. The
+  // niche-nullable scalar elements record the same way — `[null]` carries no other signal.
+  if (
+    ok
+    && !inferQuiet
+    && (tyIsLitUnion(d.aElem)
+      || tyIsNicheNulScalarElem(d.aElem)
+      || arrLitJoinUnionElem(srcExpr, dtix)
+      || cexElem
+      || f32ElemsAdoptedOver(srcExpr, d.aElem))
+  ) {
+    if srcExpr < nodeTyIx.length { nodeTySet(srcExpr, dtix) }
+  }
+  // Rep sidecar: a literal array adopted element-wise (a struct-element list widened, an
+  // i64/f32 element) builds the destination element rep — recurse into the elements so each
+  // element ObjLit resolves the shape the emitter builds.
+  if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+  return ok
+}
+
+// An array literal delivered into the union `d`: the first list arm it adapts into
+// element-wise is recorded on the literal. False when no arm adapts.
+function assignableArrLitUnion(srcExpr: i32, srcTy: i32, d: TyUnion): boolean {
+  const members = d.uMembers
+  let mi = 0
+  while mi < members.length {
+    const mt = T.tys[members[mi]]
+    if mt is TyArray {
+      // An `f32[]` arm adopts like any other list arm: the f32-list value atom
+      // (kind 12) gives the box a real rep, and the emitter's coerce re-encodes
+      // the literal's f64-classified elements at f32 (`coerceListKind` 7).
+      bareBraceSpecSet(bareBraceSpec + 1)
+      const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+      bareBraceSpecSet(bareBraceSpec - 1)
+      if armOk {
+        if !inferQuiet {
+          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+          nodeTySet(srcExpr, members[mi])
+          // Rep sidecar: record the concrete array arm, recursing into elements, so the row
+          // resolver keys the arm the checker picked.
+          recordRepTyAdopt(srcExpr, members[mi], 6)
+        }
+        return true
+      }
+    }
+    mi = mi + 1
   }
   false
 }

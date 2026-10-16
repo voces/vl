@@ -918,78 +918,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   // range [`fnRequiredArity`, `params.length`]. A call through a function value has no
   // declaration to read defaults from and keeps its exact-arity gate.
   const dParams = calleeDeclParams(n.callFn)
-  // A rest parameter is the one thing that makes the accepted arity unbounded above, and the
-  // pack below is what puts it back: after it the argument list is index-parallel with the
-  // parameter list again, which is the invariant everything from here down is written around.
-  let restIx = -1
-  if dParams.length == params.length { restIx = restParamIndex(dParams) }
-  if restIx >= 0 {
-    if !callIsRestPacked(ix) {
-      const lo = restRequiredArity(dParams, restIx)
-      if args.length < lo {
-        tErr(
-          "wrong number of arguments: expected at least "
-            + i32ToStr(lo)
-            + ", got "
-            + i32ToStr(args.length),
-          ix,
-        )
-        return retTy
-      }
-      if !restCallPack(n, ix, restIx) { return retTy }
-    }
-    args = n.callArgs
-    // Written type arguments already say what the element is, which is the refusal's remedy.
-    if restIx < args.length && !callHasTyArgs(ix) {
-      if restHoleUnionErr(params[restIx], args[restIx], ix) { return retTy }
-    }
-  } else if hasSpreadItem(args) {
-    tErr(spreadNoRestMsg(calleeIdentName(cfn)), ix)
-    return retTy
-  }
-  let required = params.length
-  if dParams.length == params.length { required = fnRequiredArity(dParams) }
-  if args.length < required || args.length > params.length {
-    tErr(
-      "wrong number of arguments: expected "
-        + arityWantText(required, params.length)
-        + ", got "
-        + i32ToStr(args.length)
-        + tyArgReadHintIfAny(args)
-        + ovPlainHint(ix),
-      ix,
-    )
-    return retTy
-  }
-  // Named arguments bind to parameters by name, then positionally — source order is
-  // irrelevant for named args. `TyFunc` carries no parameter names, so the names resolve
-  // against the declaration the scope chain gives this callee; a closure-valued binding has
-  // none and cannot take named arguments, whatever a same-named declaration says (D1604).
-  if hasNamedArgs(n.callArgNames) {
-    const cNames = paramNamesOfNodes(dParams)
-    if cNames.length != params.length {
-      tErr(
-        "named arguments work only on declared functions, not on a function value",
-        ix,
-      )
-      return retTy
-    }
-    args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
-    if args.length != params.length { return retTy }
-  } else if args.length < params.length {
-    // Trailing positional omission: check the defaults against their
-    // parameters alongside the supplied arguments, so one loop below covers
-    // the whole parameter list. (`args` is rebound to a COPY — `n.callArgs`
-    // stays the source list; the emit-side normalization is `emit_rewrite`'s.)
-    const padded: i32[] = []
-    let pj = 0
-    while pj < params.length {
-      if pj < args.length { padded.push(args[pj]) } else { padded.push(-1) }
-      pj = pj + 1
-    }
-    if fillArgDefaults(padded, dParams, ix) >= 0 { return retTy }
-    args = padded
-  }
+  const naOk: boolean[] = [false]
+  args = callFtyNormArgs(n, ix, cfn, params, dParams, args, naOk)
+  if !naOk[0] { return retTy }
   // Generic call-site inference: a `TyVar` param (or `T[]`) binds its type-param to
   // the argument's type (first use wins; later uses must agree), and the return
   // type substitutes through the binding — so `id("s")` is `string`, and
@@ -1014,153 +945,21 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   while argExp.length < args.length { argExp.push(-1) }
   let oi = 0
   while oi < argOrder.length {
-    const i = argOrder[oi]
-    // Contextual param inference for a function-value argument: propagates the expected
-    // param type into it so an un-annotated literal param infers from the signature
-    // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
-    // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
-    seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
-    if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
-    const at = checkNodeHook(args[i])
-    // A template hole meeting its injected renderer. This line is the first
-    // moment the hole's type exists, which is why the type-directed half of
-    // the template lowering lives here and not in the parser's desugar.
-    if nodeIsTplHole(args[i]) {
-      if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
-    }
-    // A void argument would bind a type parameter to `void`, which no instance can carry; a
-    // concrete parameter already refuses it through `assignable`, with its own message.
-    if tyHasTyVar(params[i]) || tyIsHole(params[i]) {
-      if isVoidTy(at) && !voidSlotExemptExpr(args[i]) {
-        tErr(
-          "argument " + i32ToStr(i + 1) + " expects a value, got void",
-          args[i],
-        )
-        return TY_ERR
-      }
-    }
-    // Bind every TyVar reachable in the expected param position from the
-    // argument's shape (first use wins), then check the argument against the
-    // SUBSTITUTED expected type — a later disagreeing use errors here.
-    bindGenWalk(params[i], at, bNames, bTys)
-    bindGenUnionArm(params[i], at, uNames, uTys)
-    const expected = substTyDeep(params[i], bNames, bTys)
-    argExp[i] = expected
-    // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
-    // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
-    // `assignable` answers true vacuously — needing its own message here, or the
-    // monomorphizer builds i32-list machinery over a one-byte backing. `u8[]` is not an instantiation of `T[]`, since `T` ranges over value types and `u8` is storage.
-    if !inferQuiet {
-      if tyIsU8ArrayTy(at) && tyReachesHole(expected, 8) {
-        tErr(
-          "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
-          args[i],
-        )
-      }
-    }
-    // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
-    // recorded here and re-validated at the generic call site that pins it under the
-    // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
-    // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
-    let atCstr = inferRetTyOf(args[i], at)
-    if coalDefHole.length > 0 { atCstr = coalPinTy(args[i], atCstr) }
-    if (
-      tyIsHole(atCstr)
-      || tyIsDeferredJoin(atCstr)
-      || (atCstr >= 0
-        && atCstr < T.tys.length
-        && T.tys[atCstr] is TyUnion
-        && tpGradualView(atCstr) != atCstr)
-    ) {
-      if !tyIsHole(expected) {
-        let ccWho = ""
-        if cfn is Ident { ccWho = cfn.identName }
-        let acForm = ACF_PLAIN
-        if nodeIsTplHole(args[i]) { acForm = ACF_TPL }
-        noteArgCstr(atCstr, expected, ccWho, acForm, -1)
-      }
-    } else if compArgCstrOk(atCstr, expected) {
-      let cpWho = ""
-      if cfn is Ident { cpWho = cfn.identName }
-      noteArgCstr(atCstr, expected, cpWho, ACF_COMP, args[i])
-    }
-    // A hole param whose body DEMANDED fields (member access on the hole)
-    // checks the argument against the demanded shape, so `getx(5)` rejects
-    // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
-    const pHole = T.tys[params[i]]
-    if pHole is TyVar {
-      noteHoleArgNullRead(pHole.tvName, at, args[i])
-      if !holeDemandOk(pHole.tvName, args[i], at) {
-        holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
-      }
-      // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
-      // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
-      if rowIsArrayDemanded(params[i]) {
-        if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
-        // An enclosing type parameter passed in takes the demand to its own pin.
-        if at >= 0 && T.tys[at] is TyVar { noteArrayDemand(arrayDemandKey(at)) }
-      }
-      if holeIsArrayWriteDemanded(calleeIdentName(cfn), pHole.tvName) {
-        if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
-      }
-      // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
-      holeCastPinCheck(
-        pHole.tvName,
-        at,
-        holeCastParamName(n.callFn, dParams, i, pHole.tvName),
-      )
-    }
-    // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
-    // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
-    // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
-    if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
-    // Passing an empty-collection argument into a concrete `T[]` / map param pins
-    // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
-    // clearing its uninferred floor — pure downstream-usage inference, no push.
-    constrainEmptyExpr(args[i], at, expected)
-    const savedGenArg = widenRetagGenArg
-    widenRetagGenArgSet(tyWideUnionMinted && tyHasTyVar(params[i]))
-    const savedLbiGen = lbiNoDest
-    lbiNoDest = tyHasTyVar(params[i])
-    // A wider record into a declared record parameter: a parameter already made generic is
-    // still held to its declared type, and a new one is made generic after this pass (D3992).
-    const wsOrig = wsOrigTyOf(n, i)
-    if wsOrig >= 0 && i < args.length && args[i] >= 0 && !tyHasTyVar(at) {
-      wsSuppress = true
-      const savedOrigLit = argLitAt
-      argLitAt = peelParenIx(args[i])
-      const wsOk = assignableExpr(args[i], at, wsOrig)
-      argLitAt = savedOrigLit
-      wsSuppress = false
-      if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
-    }
-    const wsNew = wsOrig < 0
-      && !inferQuiet
-      && i < args.length
-      && wsCandidate(n, i, args[i], at, expected)
-    if wsNew { wsNotePending(n, i) }
-    wsSuppress = wsNew
-    const savedArgLit = argLitAt
-    argLitAt = peelParenIx(args[i])
-    const argOk = assignableExpr(args[i], at, expected)
-    argLitAt = savedArgLit
-    wsSuppress = false
-    lbiNoDest = savedLbiGen
-    widenRetagGenArgSet(savedGenArg)
-    if !argOk {
-      // Anchored at the offending argument (or its offending return site),
-      // never at the call node — see `argMismatchErr`.
-      argMismatchErr(i + 1, expected, at, args[i])
-    } else if !tyIsHole(params[i]) {
-      // It passed, and for a hole-bearing argument that means nothing: a hole is assignable
-      // to anything, so a concrete parameter's comparison is answered before the deciding
-      // type exists. Parked here and re-asked as the hole takes a pin (D1821).
-      if tyHasTyVar(at) && tyIsFuncArena(expected) {
-        if !argIsOwnGenericFnValue(args[i]) {
-          argPinPark(expected, at, args[i], i + 1)
-        }
-      }
-    }
+    const aRet = callFtyCheckArg(
+      n,
+      ix,
+      cfn,
+      params,
+      dParams,
+      args,
+      argOrder[oi],
+      bNames,
+      bTys,
+      uNames,
+      uTys,
+      argExp,
+    )
+    if aRet >= 0 { return aRet }
     oi = oi + 1
   }
   // A list or record literal holding a generic function, met before a later argument bound the
@@ -1201,136 +1000,19 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   const vTys: i32[] = []
   withUnionArmBinds(bNames, bTys, uNames, uTys, vNames, vTys)
   if vNames.length > 0 {
-    const dBeforeC = T.diags.length
-    let cstrCallee = CSTR_NODECL
-    let cstrWho = ""
-    if cfn is Ident {
-      cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
-      // A local bound to a declared generic names that declaration — without this rung the
-      // call falls to `CSTR_NODECL` and adjudicates every generic in the program, since
-      // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
-      // otherwise report a sibling's refusal.
-      if cstrCallee == CSTR_NODECL {
-        const aliasIx = lookupFnAliasNode(cfn.identName)
-        if aliasIx >= 0 { cstrCallee = aliasIx }
-      }
-      cstrWho = cfn.identName
-    }
-    // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
-    // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
-    const dhNames: string[] = []
-    const dhArgNo: i32[] = []
-    const dhArgNode: i32[] = []
-    holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
-    const modeWas = substNestMode
-    const declWas = substNestDecl
-    let nestCallee = -1
-    if cfn is Ident {
-      // The declaration the callee names, directly or through an alias.
-      nestCallee = lookupFnDeclNode(cfn.identName)
-      if nestCallee < 0 { nestCallee = lookupFnAliasNode(cfn.identName) }
-      if !nestParentOf.has(nestCallee) { nestCallee = -1 }
-    }
-    if nestCallee >= 0 {
-      // A nested generic, named directly or through an alias, owns no constraint: they are its
-      // enclosing function's, and a top-level function of the same name is another declaration.
-      cstrCallee = CSTR_NODECL
-      substNestModeSet(SUBST_NESTED)
-      substNestDeclSet(nestCallee)
-    } else if cstrCallee >= 0 {
-      substNestModeSet(SUBST_DECLARED)
-    } else if namesAllHoles(vNames) && tysHoldVar(vTys) {
-      substNestModeSet(SUBST_HOLES)
-    } else {
-      substNestModeSet(SUBST_ALL)
-    }
-    const wsVd = T.diags.length
-    instGenFnHolePins(vNames, vTys, cstrCallee, dhNames, dhArgNode)
-    callBindNote(ix, vNames, vTys)
-    pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
-    if fsbName.length > 0 {
-      fsbNoteCall(
-        ix,
-        fsbDeclAtNode(n.callFn),
-        cstrCallee,
-        cstrWho,
-        dhNames,
-        dhArgNo,
-        dhArgNode,
-        fsbArgTysOf(ft, vNames, vTys),
-      )
-    }
-    validateBinCstrs(
+    retTy = callFtyPinCstrs(
+      n,
+      ix,
+      cfn,
+      ft,
+      params,
+      args,
+      bNames,
+      bTys,
       vNames,
       vTys,
-      ix,
-      cstrCallee,
-      cstrWho,
-      dhNames,
-      dhArgNo,
-      dhArgNode,
+      retTy,
     )
-    validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
-    // The declared return rides the same pin: the body's mismatch check is vacuous under
-    // a hole, and this is the first position that knows the instance (D551).
-    validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    // The destination seam, for the same reason: a value landing in a hole-typed local /
-    // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
-    validateLetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    // A builtin collection method's argument inside the body, for the same reason at a
-    // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
-    validateBmCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
-    if !inferQuiet {
-      let oa = 0
-      while oa < args.length {
-        refuseOpenNullHoleArg(args[oa], cstrWho)
-        oa = oa + 1
-      }
-    }
-    // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
-    // the operation on a type variable correctly (a `T` pinned to a collection has it), and
-    // this is the first position that knows which rep `T` became (D651 / D691).
-    validateMemCstrs(
-      vNames,
-      vTys,
-      ix,
-      cstrCallee,
-      cstrWho,
-      dhNames,
-      dhArgNo,
-      dhArgNode,
-    )
-    validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
-    validateRcwPins(vNames, vTys, cstrCallee)
-    if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
-    substNestModeSet(modeWas)
-    substNestDeclSet(declWas)
-    // Not a validation: the `??` result holes are substituted here for their BANK, which is
-    // the only route the emitter has to the type this call gave the expression (D1702).
-    if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
-    // The bounds the callee declared, judged here in this site's own scope against the
-    // types this site bound — not deferred, since a bound is written at the declaration:
-    // there is nothing to record on the way in, only something to check on the way out.
-    checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
-    // The escaped-join reject is a fallback, not an additional voice: when this site
-    // already reported a precise operand/argument-flow diagnostic, a join report would only repeat it in vaguer words.
-    if T.diags.length == dBeforeC && bNames.length > 0 {
-      validateEscJoins(bNames, bTys, cstrCallee)
-    }
-    retTy = substTyDeep(retTy, vNames, vTys)
-    if tpIfFn.length > 0 || tpIfReFn.length > 0 {
-      const pinTys: i32[] = []
-      let pp = 0
-      while pp < params.length {
-        pinTys.push(substTyDeep(params[pp], vNames, vTys))
-        pp = pp + 1
-      }
-      validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
-    }
   }
   // A deferred join this site cannot decide has no rep, so it collapses to one arm, parked
   // whole for a `return h(w)` relay (`inferRetTyOf`); in a body the gate does not hold, one of
@@ -1349,6 +1031,413 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     if kept < 0 { noteEscJoin(retTy, ix, ejWho) }
   }
   return cRetTy
+}
+
+// The arguments of an ordinary call made index-parallel with `params`: a rest tail packed,
+// named arguments reordered, omitted trailing ones padded with their declared defaults.
+// `ok[0]` turns true only when they line up; otherwise the arity or spelling is refused
+// here and the caller answers its pending return.
+function callFtyNormArgs(
+  n: Call,
+  ix: i32,
+  cfn: Node,
+  params: i32[],
+  dParams: i32[],
+  args0: i32[],
+  ok: boolean[],
+): i32[] {
+  let args = args0
+  // A rest parameter is the one thing that makes the accepted arity unbounded above, and the
+  // pack below is what puts it back: after it the argument list is index-parallel with the
+  // parameter list again, which is the invariant everything from here down is written around.
+  let restIx = -1
+  if dParams.length == params.length { restIx = restParamIndex(dParams) }
+  if restIx >= 0 {
+    if !callIsRestPacked(ix) {
+      const lo = restRequiredArity(dParams, restIx)
+      if args.length < lo {
+        tErr(
+          "wrong number of arguments: expected at least "
+            + i32ToStr(lo)
+            + ", got "
+            + i32ToStr(args.length),
+          ix,
+        )
+        return args
+      }
+      if !restCallPack(n, ix, restIx) { return args }
+    }
+    args = n.callArgs
+    // Written type arguments already say what the element is, which is the refusal's remedy.
+    if restIx < args.length && !callHasTyArgs(ix) {
+      if restHoleUnionErr(params[restIx], args[restIx], ix) { return args }
+    }
+  } else if hasSpreadItem(args) {
+    tErr(spreadNoRestMsg(calleeIdentName(cfn)), ix)
+    return args
+  }
+  let required = params.length
+  if dParams.length == params.length { required = fnRequiredArity(dParams) }
+  if args.length < required || args.length > params.length {
+    tErr(
+      "wrong number of arguments: expected "
+        + arityWantText(required, params.length)
+        + ", got "
+        + i32ToStr(args.length)
+        + tyArgReadHintIfAny(args)
+        + ovPlainHint(ix),
+      ix,
+    )
+    return args
+  }
+  // Named arguments bind to parameters by name, then positionally — source order is
+  // irrelevant for named args. `TyFunc` carries no parameter names, so the names resolve
+  // against the declaration the scope chain gives this callee; a closure-valued binding has
+  // none and cannot take named arguments, whatever a same-named declaration says (D1604).
+  if hasNamedArgs(n.callArgNames) {
+    const cNames = paramNamesOfNodes(dParams)
+    if cNames.length != params.length {
+      tErr(
+        "named arguments work only on declared functions, not on a function value",
+        ix,
+      )
+      return args
+    }
+    args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
+    if args.length != params.length { return args }
+  } else if args.length < params.length {
+    // Trailing positional omission: check the defaults against their
+    // parameters alongside the supplied arguments, so one loop below covers
+    // the whole parameter list. (`args` is rebound to a COPY — `n.callArgs`
+    // stays the source list; the emit-side normalization is `emit_rewrite`'s.)
+    const padded: i32[] = []
+    let pj = 0
+    while pj < params.length {
+      if pj < args.length { padded.push(args[pj]) } else { padded.push(-1) }
+      pj = pj + 1
+    }
+    if fillArgDefaults(padded, dParams, ix) >= 0 { return args }
+    args = padded
+  }
+  ok[0] = true
+  args
+}
+
+// Argument `i` of an ordinary call: seeded from its parameter under the bindings so far,
+// checked, and bound into `bNames`/`bTys` and `uNames`/`uTys`, its expected type kept in
+// `argExp[i]`. -1 to go on; otherwise the call's own answer (a handled template hole, or
+// `TY_ERR` for a void argument at a generic parameter).
+function callFtyCheckArg(
+  n: Call,
+  ix: i32,
+  cfn: Node,
+  params: i32[],
+  dParams: i32[],
+  args: i32[],
+  i: i32,
+  bNames: string[],
+  bTys: i32[],
+  uNames: string[],
+  uTys: i32[],
+  argExp: i32[],
+): i32 {
+  // Contextual param inference for a function-value argument: propagates the expected
+  // param type into it so an un-annotated literal param infers from the signature
+  // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
+  // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
+  seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
+  if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
+  const at = checkNodeHook(args[i])
+  // A template hole meeting its injected renderer. This line is the first
+  // moment the hole's type exists, which is why the type-directed half of
+  // the template lowering lives here and not in the parser's desugar.
+  if nodeIsTplHole(args[i]) {
+    if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
+  }
+  // A void argument would bind a type parameter to `void`, which no instance can carry; a
+  // concrete parameter already refuses it through `assignable`, with its own message.
+  if tyHasTyVar(params[i]) || tyIsHole(params[i]) {
+    if isVoidTy(at) && !voidSlotExemptExpr(args[i]) {
+      tErr(
+        "argument " + i32ToStr(i + 1) + " expects a value, got void",
+        args[i],
+      )
+      return TY_ERR
+    }
+  }
+  // Bind every TyVar reachable in the expected param position from the
+  // argument's shape (first use wins), then check the argument against the
+  // SUBSTITUTED expected type — a later disagreeing use errors here.
+  bindGenWalk(params[i], at, bNames, bTys)
+  bindGenUnionArm(params[i], at, uNames, uTys)
+  const expected = substTyDeep(params[i], bNames, bTys)
+  argExp[i] = expected
+  // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
+  // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
+  // `assignable` answers true vacuously — needing its own message here, or the
+  // monomorphizer builds i32-list machinery over a one-byte backing. `u8[]` is not an instantiation of `T[]`, since `T` ranges over value types and `u8` is storage.
+  if !inferQuiet {
+    if tyIsU8ArrayTy(at) && tyReachesHole(expected, 8) {
+      tErr(
+        "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
+        args[i],
+      )
+    }
+  }
+  // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
+  // recorded here and re-validated at the generic call site that pins it under the
+  // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
+  // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
+  let atCstr = inferRetTyOf(args[i], at)
+  if coalDefHole.length > 0 { atCstr = coalPinTy(args[i], atCstr) }
+  if (
+    tyIsHole(atCstr)
+    || tyIsDeferredJoin(atCstr)
+    || (atCstr >= 0
+      && atCstr < T.tys.length
+      && T.tys[atCstr] is TyUnion
+      && tpGradualView(atCstr) != atCstr)
+  ) {
+    if !tyIsHole(expected) {
+      let ccWho = ""
+      if cfn is Ident { ccWho = cfn.identName }
+      let acForm = ACF_PLAIN
+      if nodeIsTplHole(args[i]) { acForm = ACF_TPL }
+      noteArgCstr(atCstr, expected, ccWho, acForm, -1)
+    }
+  } else if compArgCstrOk(atCstr, expected) {
+    let cpWho = ""
+    if cfn is Ident { cpWho = cfn.identName }
+    noteArgCstr(atCstr, expected, cpWho, ACF_COMP, args[i])
+  }
+  // A hole param whose body DEMANDED fields (member access on the hole)
+  // checks the argument against the demanded shape, so `getx(5)` rejects
+  // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
+  const pHole = T.tys[params[i]]
+  if pHole is TyVar {
+    noteHoleArgNullRead(pHole.tvName, at, args[i])
+    if !holeDemandOk(pHole.tvName, args[i], at) {
+      holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
+    }
+    // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
+    // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
+    if rowIsArrayDemanded(params[i]) {
+      if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+      // An enclosing type parameter passed in takes the demand to its own pin.
+      if at >= 0 && T.tys[at] is TyVar { noteArrayDemand(arrayDemandKey(at)) }
+    }
+    if holeIsArrayWriteDemanded(calleeIdentName(cfn), pHole.tvName) {
+      if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
+    }
+    // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+    holeCastPinCheck(
+      pHole.tvName,
+      at,
+      holeCastParamName(n.callFn, dParams, i, pHole.tvName),
+    )
+  }
+  // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
+  // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
+  // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
+  if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
+  // Passing an empty-collection argument into a concrete `T[]` / map param pins
+  // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
+  // clearing its uninferred floor — pure downstream-usage inference, no push.
+  constrainEmptyExpr(args[i], at, expected)
+  const savedGenArg = widenRetagGenArg
+  widenRetagGenArgSet(tyWideUnionMinted && tyHasTyVar(params[i]))
+  const savedLbiGen = lbiNoDest
+  lbiNoDest = tyHasTyVar(params[i])
+  // A wider record into a declared record parameter: a parameter already made generic is
+  // still held to its declared type, and a new one is made generic after this pass (D3992).
+  const wsOrig = wsOrigTyOf(n, i)
+  if wsOrig >= 0 && i < args.length && args[i] >= 0 && !tyHasTyVar(at) {
+    wsSuppress = true
+    const savedOrigLit = argLitAt
+    argLitAt = peelParenIx(args[i])
+    const wsOk = assignableExpr(args[i], at, wsOrig)
+    argLitAt = savedOrigLit
+    wsSuppress = false
+    if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
+  }
+  const wsNew = wsOrig < 0
+    && !inferQuiet
+    && i < args.length
+    && wsCandidate(n, i, args[i], at, expected)
+  if wsNew { wsNotePending(n, i) }
+  wsSuppress = wsNew
+  const savedArgLit = argLitAt
+  argLitAt = peelParenIx(args[i])
+  const argOk = assignableExpr(args[i], at, expected)
+  argLitAt = savedArgLit
+  wsSuppress = false
+  lbiNoDest = savedLbiGen
+  widenRetagGenArgSet(savedGenArg)
+  if !argOk {
+    // Anchored at the offending argument (or its offending return site),
+    // never at the call node — see `argMismatchErr`.
+    argMismatchErr(i + 1, expected, at, args[i])
+  } else if !tyIsHole(params[i]) {
+    // It passed, and for a hole-bearing argument that means nothing: a hole is assignable
+    // to anything, so a concrete parameter's comparison is answered before the deciding
+    // type exists. Parked here and re-asked as the hole takes a pin (D1821).
+    if tyHasTyVar(at) && tyIsFuncArena(expected) {
+      if !argIsOwnGenericFnValue(args[i]) {
+        argPinPark(expected, at, args[i], i + 1)
+      }
+    }
+  }
+  -1
+}
+
+// The pins an ordinary call's type-parameter bindings `vNames`/`vTys` give its callee: every
+// constraint the body deferred is validated under them, the declared bounds are judged, and
+// the substituted return is answered (`retTy0` with the bindings applied).
+function callFtyPinCstrs(
+  n: Call,
+  ix: i32,
+  cfn: Node,
+  ft: TyFunc,
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+  vNames: string[],
+  vTys: i32[],
+  retTy0: i32,
+): i32 {
+  let retTy = retTy0
+  const dBeforeC = T.diags.length
+  let cstrCallee = CSTR_NODECL
+  let cstrWho = ""
+  if cfn is Ident {
+    cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+    // A local bound to a declared generic names that declaration — without this rung the
+    // call falls to `CSTR_NODECL` and adjudicates every generic in the program, since
+    // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
+    // otherwise report a sibling's refusal.
+    if cstrCallee == CSTR_NODECL {
+      const aliasIx = lookupFnAliasNode(cfn.identName)
+      if aliasIx >= 0 { cstrCallee = aliasIx }
+    }
+    cstrWho = cfn.identName
+  }
+  // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
+  // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
+  const dhNames: string[] = []
+  const dhArgNo: i32[] = []
+  const dhArgNode: i32[] = []
+  holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
+  const modeWas = substNestMode
+  const declWas = substNestDecl
+  let nestCallee = -1
+  if cfn is Ident {
+    // The declaration the callee names, directly or through an alias.
+    nestCallee = lookupFnDeclNode(cfn.identName)
+    if nestCallee < 0 { nestCallee = lookupFnAliasNode(cfn.identName) }
+    if !nestParentOf.has(nestCallee) { nestCallee = -1 }
+  }
+  if nestCallee >= 0 {
+    // A nested generic, named directly or through an alias, owns no constraint: they are its
+    // enclosing function's, and a top-level function of the same name is another declaration.
+    cstrCallee = CSTR_NODECL
+    substNestModeSet(SUBST_NESTED)
+    substNestDeclSet(nestCallee)
+  } else if cstrCallee >= 0 {
+    substNestModeSet(SUBST_DECLARED)
+  } else if namesAllHoles(vNames) && tysHoldVar(vTys) {
+    substNestModeSet(SUBST_HOLES)
+  } else {
+    substNestModeSet(SUBST_ALL)
+  }
+  const wsVd = T.diags.length
+  instGenFnHolePins(vNames, vTys, cstrCallee, dhNames, dhArgNode)
+  callBindNote(ix, vNames, vTys)
+  pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
+  if fsbName.length > 0 {
+    fsbNoteCall(
+      ix,
+      fsbDeclAtNode(n.callFn),
+      cstrCallee,
+      cstrWho,
+      dhNames,
+      dhArgNo,
+      dhArgNode,
+      fsbArgTysOf(ft, vNames, vTys),
+    )
+  }
+  validateBinCstrs(
+    vNames,
+    vTys,
+    ix,
+    cstrCallee,
+    cstrWho,
+    dhNames,
+    dhArgNo,
+    dhArgNode,
+  )
+  validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
+  // The declared return rides the same pin: the body's mismatch check is vacuous under
+  // a hole, and this is the first position that knows the instance (D551).
+  validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  // The destination seam, for the same reason: a value landing in a hole-typed local /
+  // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
+  validateLetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  // A builtin collection method's argument inside the body, for the same reason at a
+  // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
+  validateBmCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
+  if !inferQuiet {
+    let oa = 0
+    while oa < args.length {
+      refuseOpenNullHoleArg(args[oa], cstrWho)
+      oa = oa + 1
+    }
+  }
+  // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
+  // the operation on a type variable correctly (a `T` pinned to a collection has it), and
+  // this is the first position that knows which rep `T` became (D651 / D691).
+  validateMemCstrs(
+    vNames,
+    vTys,
+    ix,
+    cstrCallee,
+    cstrWho,
+    dhNames,
+    dhArgNo,
+    dhArgNode,
+  )
+  validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  validateRcwPins(vNames, vTys, cstrCallee)
+  if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
+  substNestModeSet(modeWas)
+  substNestDeclSet(declWas)
+  // Not a validation: the `??` result holes are substituted here for their BANK, which is
+  // the only route the emitter has to the type this call gave the expression (D1702).
+  if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
+  // The bounds the callee declared, judged here in this site's own scope against the
+  // types this site bound — not deferred, since a bound is written at the declaration:
+  // there is nothing to record on the way in, only something to check on the way out.
+  checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
+  // The escaped-join reject is a fallback, not an additional voice: when this site
+  // already reported a precise operand/argument-flow diagnostic, a join report would only repeat it in vaguer words.
+  if T.diags.length == dBeforeC && bNames.length > 0 {
+    validateEscJoins(bNames, bTys, cstrCallee)
+  }
+  retTy = substTyDeep(retTy, vNames, vTys)
+  if tpIfFn.length > 0 || tpIfReFn.length > 0 {
+    const pinTys: i32[] = []
+    let pp = 0
+    while pp < params.length {
+      pinTys.push(substTyDeep(params[pp], vNames, vTys))
+      pp = pp + 1
+    }
+    validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
+  }
+  retTy
 }
 
 // `p?.f(args)` — one guard over the receiver covers the whole call, so the callee and the
