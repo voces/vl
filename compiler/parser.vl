@@ -2680,37 +2680,20 @@ function parseTypeDecl(flatAt: i32) {
     const vroots: i32[] = []
     variants.push(parseVariantName())
     vroots.push(lastTyTsRoot)
-    // A multiline union puts each `|` on its own line, so newlines are skipped before
-    // testing for the pipe. `endTok` pins the cursor just past the last variant so the
-    // trailing skip does not stretch the declaration's end token onto a following blank or
-    // comment line, which would make the formatter's verbatim slice swallow it.
-    let endTok = P.pos
-    skipNewlines()
-    let more = peekKind() == "PIPE"
-    while more {
-      advance()      // "|"
-      skipNewlines() // and after it, before the variant name
-      variants.push(parseVariantName())
-      vroots.push(lastTyTsRoot)
-      endTok = P.pos
-      skipNewlines()
-      more = peekKind() == "PIPE"
-    }
-    P.pos = endTok
-    if isFlat { flatNeedsRecord(name, nameTok) }
-    const uix = mkUnionDecl(name, variants, p0, isNew)
-    setUdTs(uix, vroots)
-    if gpBase != "" { setDeclGp(uix, gpBase, gpNames) }
-    mkDeclNameTok(uix, nameTok)
-    btNoteDecl(uix)
-    return uix
+    return parseTypeDeclUnionTail(
+      name,
+      nameTok,
+      p0,
+      isNew,
+      isFlat,
+      gpBase,
+      gpNames,
+      variants,
+      vroots,
+    )
   }
   expect("LBRACE")
   const fields: i32[] = []
-  // `synth` mirrors the field list as the inline-object synthetic name
-  // (`{a:i32,b:i32}`), so a `{ … } & …` / `{ … } | …` continuation can
-  // re-encode the whole RHS as a UnionDecl alias without re-parsing.
-  let synth = ""
   // The field names and their type spelling roots, kept for the `{ … } & … | …` re-encode
   // below: that path's first union member is the synthetic `{…}` text, assembled from this
   // list rather than returned by a type producer, so its spelling tree is assembled the same
@@ -2724,7 +2707,94 @@ function parseTypeDecl(flatAt: i32) {
   const mNames: string[] = []
   const mRoots: i32[] = []
   const mIsMethod: boolean[] = []
-  let sawMethod = false
+  // `synth` mirrors the field list as the inline-object synthetic name
+  // (`{a:i32,b:i32}`), so a `{ … } & …` / `{ … } | …` continuation can
+  // re-encode the whole RHS as a UnionDecl alias without re-parsing.
+  const synth = parseTypeDeclMembers(
+    fields,
+    fNames,
+    fRoots,
+    mNames,
+    mRoots,
+    mIsMethod,
+  )
+  // A method member joins the member columns and not the field ones.
+  const sawMethod = mNames.length != fNames.length
+  expectClose("RBRACE")
+  // A bound alias — `type Showable = { toString(): string }`. A body with a method member
+  // declares a call contract, not a layout, so it exits here rather than continuing into the
+  // struct, `&` and `|` machinery, none of which composes with it. What is minted is an
+  // empty-field `TypeDecl` plus the whole body as one object annotation on `declBound*`.
+  if sawMethod {
+    return parseTypeDeclBound(
+      name,
+      nameTok,
+      p0,
+      isNew,
+      isFlat,
+      gpBase,
+      gpNames,
+      synth,
+      mNames,
+      mRoots,
+      mIsMethod,
+    )
+  }
+  // D188 — an array suffix on a `{ … }` body: `type L = {n: i32}[]` reaches here with `[`
+  // `]` still on the stream and, unclaimed, would complete as the plain struct `{n: i32}`.
+  // It is consumed here rather than in a continuation arm because it binds tighter than `&`
+  // and `|`, and no newline is skipped ahead of it — a `[` on the next line is a statement.
+  let arrSuffix = 0
+  let asGoing = atTypeCont("LBRACK")
+  while asGoing {
+    advance()             // "["
+    expectClose("RBRACK") // "]"
+    arrSuffix = arrSuffix + 1
+    asGoing = atTypeCont("LBRACK")
+  }
+  // Object-type structural intersection `type AB = { … } & { … }`, or a union whose first
+  // variant is an inline object: the struct body is only the first operand. The right side
+  // re-encodes as a `UnionDecl` over synthetic names, which `nameToTy` folds. Newlines are
+  // skipped before testing for the continuation and the cursor restored when none follows.
+  const afterBrace = P.pos
+  skipNewlines()
+  if arrSuffix > 0 || peekKind() == "AMPERSAND" || peekKind() == "PIPE" {
+    return parseTypeDeclObjUnion(
+      name,
+      nameTok,
+      p0,
+      isNew,
+      isFlat,
+      gpBase,
+      gpNames,
+      synth,
+      fNames,
+      fRoots,
+      arrSuffix,
+    )
+  }
+  P.pos = afterBrace
+  let flatMark = 0
+  if isFlat { flatMark = 1 }
+  const tdix = mkTypeDecl(name, fields, p0, isNew, flatMark)
+  if gpBase != "" { setDeclGp(tdix, gpBase, gpNames) }
+  mkDeclNameTok(tdix, nameTok)
+  btNoteDecl(tdix)
+  tdix
+}
+
+// `parseTypeDecl`'s struct body, from after the `{` up to the `}`: each field mints a `FieldDef`
+// into `fields` and joins `fNames`/`fRoots`; every member, field or method, joins the `m*`
+// columns in source order. Returns the body as the inline-object synthetic name's inside.
+function parseTypeDeclMembers(
+  fields: i32[],
+  fNames: string[],
+  fRoots: i32[],
+  mNames: string[],
+  mRoots: i32[],
+  mIsMethod: boolean[],
+): string {
+  let synth = ""
   const seenNames: string[] = []
   const seenStarts: i32[] = []
   skipNewlines() // a multiline `{` puts the first field on the next line
@@ -2747,7 +2817,6 @@ function parseTypeDecl(flatAt: i32) {
       mNames.push(fname)
       mRoots.push(tsPop())
       mIsMethod.push(true)
-      sawMethod = true
       skipNewlines()
       if peekKind() == "COMMA" {
         advance()
@@ -2781,139 +2850,170 @@ function parseTypeDecl(flatAt: i32) {
       going = false
     }
   }
-  expectClose("RBRACE")
-  // A bound alias — `type Showable = { toString(): string }`. A body with a method member
-  // declares a call contract, not a layout, so it exits here rather than continuing into the
-  // struct, `&` and `|` machinery, none of which composes with it. What is minted is an
-  // empty-field `TypeDecl` plus the whole body as one object annotation on `declBound*`.
-  if sawMethod {
-    if (
-      atTypeCont("LBRACK")
-      || peekKind() == "AMPERSAND"
-      || peekKind() == "PIPE"
-    ) {
-      P.diags.push(
-        {
-          msg: "a bound (a type with method members) cannot be combined with `&`, `|` or `[]` — it constrains a type parameter and has no values of its own",
-          at: P.pos,
-        },
-      )
-    }
-    const bKids: i32[] = []
-    let bk = 0
-    while bk < mRoots.length {
-      if mIsMethod[bk] {
-        bKids.push(mRoots[bk])
-      } else {
-        const oneKid: i32[] = []
-        oneKid.push(mRoots[bk])
-        bKids.push(tsMkKids(TS_FIELD, mNames[bk], oneKid))
-      }
-      bk = bk + 1
-    }
-    const bRoot = tsMkKids(TS_OBJ, "", bKids)
-    const bAnn = mkTypeRef("{" + synth + "}", p0)
-    setAnnTs(bAnn, bRoot)
-    const noFields: i32[] = []
-    if isFlat { flatNeedsRecord(name, nameTok) }
-    const bix = mkTypeDecl(name, noFields, p0, isNew, 0)
-    setDeclBound(bix, bAnn)
-    if gpBase != "" { setDeclGp(bix, gpBase, gpNames) }
-    mkDeclNameTok(bix, nameTok)
-    btNoteDecl(bix)
-    return bix
+  synth
+}
+
+// `parseTypeDecl`'s `{ … }[] & … | …` exit: the struct body read so far (`synth`, `fNames`,
+// `fRoots`, and `arrSuffix` trailing `[]`s) becomes the first member, joined with any `&`
+// operands, and the union tail follows. Mints and returns the `UnionDecl`.
+function parseTypeDeclObjUnion(
+  name: string,
+  nameTok: i32,
+  p0: i32,
+  isNew: i32,
+  isFlat: boolean,
+  gpBase: string,
+  gpNames: string[],
+  synth: string,
+  fNames: string[],
+  fRoots: i32[],
+  arrSuffix: i32,
+): i32 {
+  let first = "{" + synth + "}"
+  // The same object, as a spelling: a `TS_FIELD` per field over the type root the field
+  // already recorded, under one `TS_OBJ`. `tsToName` renders it back to exactly
+  // `"{" + synth + "}"`, the same concatenations `synth` is built by.
+  const fkids: i32[] = []
+  let fk = 0
+  while fk < fNames.length {
+    const oneKid: i32[] = []
+    oneKid.push(fRoots[fk])
+    fkids.push(tsMkKids(TS_FIELD, fNames[fk], oneKid))
+    fk = fk + 1
   }
-  // D188 — an array suffix on a `{ … }` body: `type L = {n: i32}[]` reaches here with `[`
-  // `]` still on the stream and, unclaimed, would complete as the plain struct `{n: i32}`.
-  // It is consumed here rather than in a continuation arm because it binds tighter than `&`
-  // and `|`, and no newline is skipped ahead of it — a `[` on the next line is a statement.
-  let arrSuffix = 0
-  let asGoing = atTypeCont("LBRACK")
-  while asGoing {
-    advance()             // "["
-    expectClose("RBRACK") // "]"
-    arrSuffix = arrSuffix + 1
-    asGoing = atTypeCont("LBRACK")
+  let firstRoot = tsMkKids(TS_OBJ, "", fkids)
+  // …and the `[]`s the suffix loop counted, appended to the synthetic name and wrapped
+  // around the spelling root in the same order `parseTypeAtom` uses, so `tsToName` renders
+  // this member back to exactly the characters `first` holds. Off-stack, because the root
+  // is already popped.
+  let asLeft = arrSuffix
+  while asLeft > 0 {
+    first = first + "[]"
+    const arrKid: i32[] = []
+    arrKid.push(firstRoot)
+    firstRoot = tsMkKids(TS_ARR, "", arrKid)
+    asLeft = asLeft - 1
   }
-  // Object-type structural intersection `type AB = { … } & { … }`, or a union whose first
-  // variant is an inline object: the struct body is only the first operand. The right side
-  // re-encodes as a `UnionDecl` over synthetic names, which `nameToTy` folds. Newlines are
-  // skipped before testing for the continuation and the cursor restored when none follows.
-  const afterBrace = P.pos
+  let igoing = peekKind() == "AMPERSAND"
+  // The `&` operands join the object under a `TS_ISECT`, mirroring the `"&"`
+  // the name is built with.
+  const iKids: i32[] = []
+  iKids.push(firstRoot)
+  while igoing {
+    advance() // "&"
+    first = first + "&" + parseVariantAtom()
+    iKids.push(lastTyTsRoot)
+    igoing = peekKind() == "AMPERSAND"
+  }
+  if iKids.length > 1 { firstRoot = tsMkKids(TS_ISECT, "", iKids) }
+  const variants: string[] = []
+  const vroots2: i32[] = []
+  variants.push(first)
+  vroots2.push(firstRoot)
+  return parseTypeDeclUnionTail(
+    name,
+    nameTok,
+    p0,
+    isNew,
+    isFlat,
+    gpBase,
+    gpNames,
+    variants,
+    vroots2,
+  )
+}
+
+// `parseTypeDecl`'s union exit: `variants`/`vroots` hold the members read so far, and the
+// `| member` run after them is read here, the cursor left just past the last member so the
+// declaration's span stops there. Mints and returns the `UnionDecl`.
+function parseTypeDeclUnionTail(
+  name: string,
+  nameTok: i32,
+  p0: i32,
+  isNew: i32,
+  isFlat: boolean,
+  gpBase: string,
+  gpNames: string[],
+  variants: string[],
+  vroots: i32[],
+): i32 {
+  // A multiline union puts each `|` on its own line, so newlines are skipped before
+  // testing for the pipe. `endTok` pins the cursor just past the last variant so the
+  // trailing skip does not stretch the declaration's end token onto a following blank or
+  // comment line, which would make the formatter's verbatim slice swallow it.
+  let endTok = P.pos
   skipNewlines()
-  if arrSuffix > 0 || peekKind() == "AMPERSAND" || peekKind() == "PIPE" {
-    let first = "{" + synth + "}"
-    // The same object, as a spelling: a `TS_FIELD` per field over the type root the field
-    // already recorded, under one `TS_OBJ`. `tsToName` renders it back to exactly
-    // `"{" + synth + "}"`, the same concatenations `synth` is built by.
-    const fkids: i32[] = []
-    let fk = 0
-    while fk < fNames.length {
-      const oneKid: i32[] = []
-      oneKid.push(fRoots[fk])
-      fkids.push(tsMkKids(TS_FIELD, fNames[fk], oneKid))
-      fk = fk + 1
-    }
-    let firstRoot = tsMkKids(TS_OBJ, "", fkids)
-    // …and the `[]`s the suffix loop counted, appended to the synthetic name and wrapped
-    // around the spelling root in the same order `parseTypeAtom` uses, so `tsToName` renders
-    // this member back to exactly the characters `first` holds. Off-stack, because the root
-    // is already popped.
-    let asLeft = arrSuffix
-    while asLeft > 0 {
-      first = first + "[]"
-      const arrKid: i32[] = []
-      arrKid.push(firstRoot)
-      firstRoot = tsMkKids(TS_ARR, "", arrKid)
-      asLeft = asLeft - 1
-    }
-    let igoing = peekKind() == "AMPERSAND"
-    // The `&` operands join the object under a `TS_ISECT`, mirroring the `"&"`
-    // the name is built with.
-    const iKids: i32[] = []
-    iKids.push(firstRoot)
-    while igoing {
-      advance() // "&"
-      first = first + "&" + parseVariantAtom()
-      iKids.push(lastTyTsRoot)
-      igoing = peekKind() == "AMPERSAND"
-    }
-    if iKids.length > 1 { firstRoot = tsMkKids(TS_ISECT, "", iKids) }
-    const variants: string[] = []
-    const vroots2: i32[] = []
-    variants.push(first)
-    vroots2.push(firstRoot)
-    // Pin the end-token past the last variant (see the sibling union path) so a
-    // trailing newline-skip cannot stretch the decl span onto a following line.
-    let endTok2 = P.pos
+  let more = peekKind() == "PIPE"
+  while more {
+    advance()      // "|"
+    skipNewlines() // and after it, before the variant name
+    variants.push(parseVariantName())
+    vroots.push(lastTyTsRoot)
+    endTok = P.pos
     skipNewlines()
-    let umore = peekKind() == "PIPE"
-    while umore {
-      advance() // "|"
-      skipNewlines()
-      variants.push(parseVariantName())
-      vroots2.push(lastTyTsRoot)
-      endTok2 = P.pos
-      skipNewlines()
-      umore = peekKind() == "PIPE"
-    }
-    P.pos = endTok2
-    if isFlat { flatNeedsRecord(name, nameTok) }
-    const u2ix = mkUnionDecl(name, variants, p0, isNew)
-    setUdTs(u2ix, vroots2)
-    if gpBase != "" { setDeclGp(u2ix, gpBase, gpNames) }
-    mkDeclNameTok(u2ix, nameTok)
-    btNoteDecl(u2ix)
-    return u2ix
+    more = peekKind() == "PIPE"
   }
-  P.pos = afterBrace
-  let flatMark = 0
-  if isFlat { flatMark = 1 }
-  const tdix = mkTypeDecl(name, fields, p0, isNew, flatMark)
-  if gpBase != "" { setDeclGp(tdix, gpBase, gpNames) }
-  mkDeclNameTok(tdix, nameTok)
-  btNoteDecl(tdix)
-  tdix
+  P.pos = endTok
+  if isFlat { flatNeedsRecord(name, nameTok) }
+  const uix = mkUnionDecl(name, variants, p0, isNew)
+  setUdTs(uix, vroots)
+  if gpBase != "" { setDeclGp(uix, gpBase, gpNames) }
+  mkDeclNameTok(uix, nameTok)
+  btNoteDecl(uix)
+  uix
+}
+
+// `parseTypeDecl`'s bound exit, for a body with a method member: an empty-field `TypeDecl`
+// carrying the whole body (`synth`, and the `m*` member columns) as one object annotation.
+// Reports a following `&`, `|` or `[]`, which a bound cannot take.
+function parseTypeDeclBound(
+  name: string,
+  nameTok: i32,
+  p0: i32,
+  isNew: i32,
+  isFlat: boolean,
+  gpBase: string,
+  gpNames: string[],
+  synth: string,
+  mNames: string[],
+  mRoots: i32[],
+  mIsMethod: boolean[],
+): i32 {
+  if (
+    atTypeCont("LBRACK")
+    || peekKind() == "AMPERSAND"
+    || peekKind() == "PIPE"
+  ) {
+    P.diags.push(
+      {
+        msg: "a bound (a type with method members) cannot be combined with `&`, `|` or `[]` — it constrains a type parameter and has no values of its own",
+        at: P.pos,
+      },
+    )
+  }
+  const bKids: i32[] = []
+  let bk = 0
+  while bk < mRoots.length {
+    if mIsMethod[bk] {
+      bKids.push(mRoots[bk])
+    } else {
+      const oneKid: i32[] = []
+      oneKid.push(mRoots[bk])
+      bKids.push(tsMkKids(TS_FIELD, mNames[bk], oneKid))
+    }
+    bk = bk + 1
+  }
+  const bRoot = tsMkKids(TS_OBJ, "", bKids)
+  const bAnn = mkTypeRef("{" + synth + "}", p0)
+  setAnnTs(bAnn, bRoot)
+  const noFields: i32[] = []
+  if isFlat { flatNeedsRecord(name, nameTok) }
+  const bix = mkTypeDecl(name, noFields, p0, isNew, 0)
+  setDeclBound(bix, bAnn)
+  if gpBase != "" { setDeclGp(bix, gpBase, gpNames) }
+  mkDeclNameTok(bix, nameTok)
+  btNoteDecl(bix)
+  bix
 }
 
 // Note field `fname`, whose name token (just read) starts at `start`, in a record type's list.

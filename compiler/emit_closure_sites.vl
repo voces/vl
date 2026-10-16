@@ -502,80 +502,7 @@ export function criClassify(rx0: i32, i: i32) {
   ) {
     criSetRetKind(i, "str")
   }
-  if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
-    // Record the element type-name so the inferred functype result can resolve its ref-list
-    // slot: the annotated path fills `fRetRArrElem` from the annotation, but an un-annotated
-    // return must read it off the return expression.
-    if criSetRetKind(i, "reflist") {
-      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-        fRetRArrElem[i] = criRetRefListElemName(rx, fnStmts[i])
-      }
-    }
-  } else if fRetKind[i] == "reflist" && i < fRetRArrElem.length {
-    // The element can be unnamed on the pass that set the kind, when it is a callback's
-    // result that return inference has not reached yet; a later pass of the fixpoint names it.
-    if fRetRArrElem[i] == "" && exprRefArray(rx, fnStmts[i]) {
-      const lateNm = criRetRefListElemName(rx, fnStmts[i])
-      if lateNm != "" {
-        fRetRArrElem[i] = lateNm
-        criChanged = true
-      }
-    }
-  }
-  if !retKindIsList(fRetKind[i]) && exprStringArray(rx, fnStmts[i]) {
-    criSetRetKind(i, "strlist")
-  }
-  // The returned list local whose element spelling only the arena knows — the list twin of
-  // the `retIsMapLocal` rung, for the same reason: a returned local's collected kind does not
-  // exist during this global pass. Asked here and not in `tyKindOf`, because widening that
-  // mapping makes `exprArray` claim a `K[]` at every position, not just the result valtype.
-  if !retKindIsList(fRetKind[i]) {
-    const rlk = tyScalarBackedListKind(nodeTyIxOf(rx))
-    if rlk != null { criSetRetKind(i, rlk) }
-  }
-  if !retKindIsList(fRetKind[i]) && exprF64Array(rx, fnStmts[i]) {
-    criSetRetKind(i, "f64list")
-  }
-  // The i64 and f32 siblings of the f64-list arm, checked before the generic `exprArray` arm
-  // below, which would otherwise claim a wide-magnitude return as a plain i32 list and
-  // declare the i32-list wrapper over a body building the wide one.
-  if !retKindIsList(fRetKind[i]) && exprI64Array(rx, fnStmts[i]) {
-    criSetRetKind(i, "i64list")
-  }
-  if !retKindIsList(fRetKind[i]) && exprF32Array(rx, fnStmts[i]) {
-    criSetRetKind(i, "f32list")
-  }
-  // A `u8[]` return expression — the packed byte list. `u8` is a storage type and not a value
-  // kind (`array.get_u` widens at every value seam), so no `expr*Array` classifier speaks it
-  // and the result would declare an i32 scalar over a body pushing the wrapper. Narrow by
-  // construction: only the `u8` answer is taken, the other leaves being decided above.
-  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
-    if tyPrimLeafListKind(nodeTyIxOf(rx)) == "u8list" {
-      criSetRetKind(i, "u8list")
-    }
-  }
-  // The empty `[]` return — the element hole, and the result-valtype half of D16. Every arm
-  // above classifies from the literal's own elements, so a hole whose element is a struct,
-  // closure or nested list falls to the i32-list default. Read off the type the checker
-  // unified the hole with, the same node `emitReturnValue`'s build seed reads.
-  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
-    // The hole's node, not the return's (D626): `return cc` over `const cc = []` reads `cc`'s
-    // initializer, where the checker recorded the element it unified the hole with.
-    // `criRetHoleNode` is `rx` itself in every other case.
-    const hn = criRetHoleNode(rx, i)
-    const hk = emptyArrHoleKind(hn)
-    if hk != null {
-      if criSetRetKind(i, hk) {
-        // The ref-list payload column the result valtype needs beside the kind — the same
-        // `fRetRArrElem` slot the `exprRefArray` arm above fills, from the same renderer.
-        if hk == "reflist" {
-          if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-            fRetRArrElem[i] = emptyArrHoleElemName(hn)
-          }
-        }
-      }
-    }
-  }
+  criClassifyList(rx, i)
   if fRetKind[i] != "map" {
     // `exprMap` classifies a returned map param and a `Map()` or map-returning call. A
     // returned map local needs `retIsMapLocal`: its kind is not collected during this global
@@ -689,6 +616,126 @@ export function criClassify(rx0: i32, i: i32) {
       if criSetRetKind(i, "nulstruct") { fRetStructIdx[i] = rnf }
     }
   }
+  criClassifyLocalLet(rx, i)
+  // The nullable-closure niche, decided by the arena rather than a rendered name: a
+  // `TyNullable` over a `TyFunc`. The non-null closure never reaches this column — its
+  // channel is `fnReturnsClosure`, a boolean read ahead of the inferred kind — so this arm
+  // and that one cannot both claim one return (D1622).
+  if fRetKind[i] != "nulclosure" && nodeTyIsNulFunc(rx) {
+    criSetRetKind(i, "nulclosure")
+  }
+  if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
+    fRetBool[i] = 1
+    criChanged = true
+  }
+  // Scalar f64, f32 and i64 returns detected from the return expression, for a function the
+  // checker recorded no inferred-return name for — a monomorphized instance, whose body the
+  // checker only saw with a type variable. A `?? d` qualifies unless its result is a union box,
+  // which reads as its unboxed atom and is classified separately (D3692).
+  let scalarOk = fRetKind[i] == "i32" && fRetBool[i] == 0
+  const rxn = P.nodes[rx]
+  if rxn is BinExpr {
+    if rxn.binOp == "??" { scalarOk = scalarOk && !exprUnion(rx, fnStmts[i]) }
+  }
+  if scalarOk {
+    if exprIsV128(rx, fnStmts[i]) { criSetRetKind(i, "v128") }
+    else if exprIsF64(rx, fnStmts[i]) { criSetRetKind(i, "f64") }
+    else if exprIsF32(rx, fnStmts[i]) { criSetRetKind(i, "f32") }
+    else if exprIsI64(rx, fnStmts[i]) { criSetRetKind(i, "i64") }
+  }
+  // Last resort: a returned local typed from its own declaration. Both the typed-IR fast path
+  // and `declaredKind` can be blind at once — the latter reads a table `buildLocals` fills much
+  // later, and a monomorphized instance's body is a clone whose leaves carry no recorded type.
+  // The payload-free kinds only, gated on the slot still being the default, so it fills holes.
+  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
+    const lk = retLocalCellKind(rx, i)
+    if lk != null { criSetRetKind(i, lk) }
+  }
+  0
+}
+
+// `criClassify`'s list rungs for the return expression `rx` of function `i`: the ref, string,
+// scalar-backed, f64, i64, f32 and `u8` lists, then the empty `[]` hole, each filling the
+// kind (and a ref list's element name) only while no list kind is set yet.
+function criClassifyList(rx: i32, i: i32) {
+  if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
+    // Record the element type-name so the inferred functype result can resolve its ref-list
+    // slot: the annotated path fills `fRetRArrElem` from the annotation, but an un-annotated
+    // return must read it off the return expression.
+    if criSetRetKind(i, "reflist") {
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = criRetRefListElemName(rx, fnStmts[i])
+      }
+    }
+  } else if fRetKind[i] == "reflist" && i < fRetRArrElem.length {
+    // The element can be unnamed on the pass that set the kind, when it is a callback's
+    // result that return inference has not reached yet; a later pass of the fixpoint names it.
+    if fRetRArrElem[i] == "" && exprRefArray(rx, fnStmts[i]) {
+      const lateNm = criRetRefListElemName(rx, fnStmts[i])
+      if lateNm != "" {
+        fRetRArrElem[i] = lateNm
+        criChanged = true
+      }
+    }
+  }
+  if !retKindIsList(fRetKind[i]) && exprStringArray(rx, fnStmts[i]) {
+    criSetRetKind(i, "strlist")
+  }
+  // The returned list local whose element spelling only the arena knows — the list twin of
+  // the `retIsMapLocal` rung, for the same reason: a returned local's collected kind does not
+  // exist during this global pass. Asked here and not in `tyKindOf`, because widening that
+  // mapping makes `exprArray` claim a `K[]` at every position, not just the result valtype.
+  if !retKindIsList(fRetKind[i]) {
+    const rlk = tyScalarBackedListKind(nodeTyIxOf(rx))
+    if rlk != null { criSetRetKind(i, rlk) }
+  }
+  if !retKindIsList(fRetKind[i]) && exprF64Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "f64list")
+  }
+  // The i64 and f32 siblings of the f64-list arm, checked before the generic `exprArray` arm
+  // below, which would otherwise claim a wide-magnitude return as a plain i32 list and
+  // declare the i32-list wrapper over a body building the wide one.
+  if !retKindIsList(fRetKind[i]) && exprI64Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "i64list")
+  }
+  if !retKindIsList(fRetKind[i]) && exprF32Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "f32list")
+  }
+  // A `u8[]` return expression — the packed byte list. `u8` is a storage type and not a value
+  // kind (`array.get_u` widens at every value seam), so no `expr*Array` classifier speaks it
+  // and the result would declare an i32 scalar over a body pushing the wrapper. Narrow by
+  // construction: only the `u8` answer is taken, the other leaves being decided above.
+  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
+    if tyPrimLeafListKind(nodeTyIxOf(rx)) == "u8list" {
+      criSetRetKind(i, "u8list")
+    }
+  }
+  // The empty `[]` return — the element hole, and the result-valtype half of D16. Every arm
+  // above classifies from the literal's own elements, so a hole whose element is a struct,
+  // closure or nested list falls to the i32-list default. Read off the type the checker
+  // unified the hole with, the same node `emitReturnValue`'s build seed reads.
+  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
+    // The hole's node, not the return's (D626): `return cc` over `const cc = []` reads `cc`'s
+    // initializer, where the checker recorded the element it unified the hole with.
+    // `criRetHoleNode` is `rx` itself in every other case.
+    const hn = criRetHoleNode(rx, i)
+    const hk = emptyArrHoleKind(hn)
+    if hk != null {
+      if criSetRetKind(i, hk) {
+        // The ref-list payload column the result valtype needs beside the kind — the same
+        // `fRetRArrElem` slot the `exprRefArray` arm above fills, from the same renderer.
+        if hk == "reflist" {
+          if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+            fRetRArrElem[i] = emptyArrHoleElemName(hn)
+          }
+        }
+      }
+    }
+  }
+}
+
+// `criClassify`'s returned-local rungs, for the return expression `rx` of function `i`.
+function criClassifyLocalLet(rx: i32, i: i32) {
   // A returned local `let` of a ref kind: during this global pass the function's locals are
   // not collected, so the `expr*` Ident cases above miss it and the result would default to
   // i32 over a body yielding a ref. Classify through the declaration, annotation first, as
@@ -762,41 +809,6 @@ export function criClassify(rx0: i32, i: i32) {
       }
     }
   }
-  // The nullable-closure niche, decided by the arena rather than a rendered name: a
-  // `TyNullable` over a `TyFunc`. The non-null closure never reaches this column — its
-  // channel is `fnReturnsClosure`, a boolean read ahead of the inferred kind — so this arm
-  // and that one cannot both claim one return (D1622).
-  if fRetKind[i] != "nulclosure" && nodeTyIsNulFunc(rx) {
-    criSetRetKind(i, "nulclosure")
-  }
-  if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
-    fRetBool[i] = 1
-    criChanged = true
-  }
-  // Scalar f64, f32 and i64 returns detected from the return expression, for a function the
-  // checker recorded no inferred-return name for — a monomorphized instance, whose body the
-  // checker only saw with a type variable. A `?? d` qualifies unless its result is a union box,
-  // which reads as its unboxed atom and is classified separately (D3692).
-  let scalarOk = fRetKind[i] == "i32" && fRetBool[i] == 0
-  const rxn = P.nodes[rx]
-  if rxn is BinExpr {
-    if rxn.binOp == "??" { scalarOk = scalarOk && !exprUnion(rx, fnStmts[i]) }
-  }
-  if scalarOk {
-    if exprIsV128(rx, fnStmts[i]) { criSetRetKind(i, "v128") }
-    else if exprIsF64(rx, fnStmts[i]) { criSetRetKind(i, "f64") }
-    else if exprIsF32(rx, fnStmts[i]) { criSetRetKind(i, "f32") }
-    else if exprIsI64(rx, fnStmts[i]) { criSetRetKind(i, "i64") }
-  }
-  // Last resort: a returned local typed from its own declaration. Both the typed-IR fast path
-  // and `declaredKind` can be blind at once — the latter reads a table `buildLocals` fills much
-  // later, and a monomorphized instance's body is a clone whose leaves carry no recorded type.
-  // The payload-free kinds only, gated on the slot still being the default, so it fills holes.
-  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
-    const lk = retLocalCellKind(rx, i)
-    if lk != null { criSetRetKind(i, lk) }
-  }
-  0
 }
 
 // The payload-free cell kind of a returned local of function `i`, or `null` — the declaration

@@ -1331,106 +1331,9 @@ function drwWalk(ix: i32, ctx: i32) {
       n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
       arenaNoteRefWrite()
     }
-    let optRecv = -1
     const callee = P.nodes[n.callFn]
     if callee is Member {
-      callee.memObj = drwWalk(callee.memObj, ctx)
-      if optWasOpt {
-        // A receiver that cannot be null needs no guard; one the lowering cannot read twice
-        // keeps the `?.` callee, which `emitCall` refuses by name rather than silently
-        // calling through a null.
-        if !nodeTyExcludesNull(callee.memObj) {
-          if exprReReadable(callee.memObj) {
-            optRecv = callee.memObj
-          } else {
-            n.callFn = mkOptMember(
-              callee.memObj,
-              callee.memProp,
-              false,
-              callee.pos,
-            )
-            arenaNoteRefWrite()
-            return ix
-          }
-        }
-      }
-      // D1522 — a map `m.get(k)` is the read `m[k]`, rewritten here so every consumer
-      // classifier reads the Index node (it carries the checked type) rather than claiming a
-      // box the read never left. Only where the checker took the built-in: a set's is a function.
-      if callee.memProp == "get" && memberCallRungOf(ix) != MC_RUNG_SELF_FN {
-        if args.length == 1 && nodeTyIsMap(callee.memObj) {
-          const mgIx = mkIndex(callee.memObj, args[0], n.pos)
-          nodeTyCarry(mgIx, ix)
-          return drwOptGuard(mgIx, ix, optRecv, n.pos, atStmt)
-        }
-      }
-      // UFCS: `o.f(args)`, where `f` is a free function whose first parameter is named
-      // `self`, lowers to `f(o, args)` — the receiver's type does not gate it. D1120 — a
-      // module merge mangles a free `self`-function (`shout` → `shout$m1`) but leaves the
-      // call's property plain, so `ufcsAliasAtSite` maps it per call site, not by name alone.
-      const uName = ufcsAliasAtSite(ix, callee.memProp)
-      // Precedence, mirroring the host: a real struct field wins as a value access, a
-      // callable field wins as a `call_ref` member-call, and only then is UFCS tried.
-      // D1070 — asks the receiver's checked type (`tyFieldTyOf`) rather than the emit-side
-      // struct row, which answers -1 inside a function body; this can only turn UFCS off.
-      const recvFieldTy = tyFieldTyOf(nodeTyIxOf(callee.memObj), callee.memProp)
-      const recvHasField = recvFieldTy >= 0
-      const si = structIndexOfExpr(callee.memObj, ctx)
-      let ufcs = false
-      // A call the checker resolved to a built-in method stays one: that is the rung a
-      // `self`-function of the same name loses to on this receiver (D2476).
-      const builtinRung = memberCallRungOf(ix) == MC_RUNG_BUILTIN
-      // And one it resolved to a `self`-function stays one where the struct row has the field
-      // but the checked type does not: a `P | null` receiver's row is `P`'s.
-      const selfFnRung = memberCallRungOf(ix) == MC_RUNG_SELF_FN
-      if si >= 0 && !recvHasField && !builtinRung {
-        if sFieldIndex(si, callee.memProp) < 0 || selfFnRung {
-          if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
-        }
-      }
-      if si < 0 && !recvHasField && !builtinRung {
-        if !exprIsClosure(n.callFn, ctx) {
-          if drwSelfFnOf(uName, args.length + 1) >= 0 {
-            // A type-parameter receiver has no struct row yet, so `si < 0` alone cannot
-            // mean "no field, so UFCS": each instance answers for itself.
-            if drwRecvIsTyParam(callee.memObj, ctx) {
-              memberCallRungAdd(ix, MC_RUNG_PER_INSTANCE)
-            } else {
-              ufcs = true
-            }
-          }
-        }
-      }
-      if ufcs {
-        const recvIx = callee.memObj
-        args.push(-1)
-        let j = args.length - 1
-        while j > 0 {
-          args[j] = args[j - 1]
-          j = j - 1
-        }
-        args[0] = recvIx
-        // Named-arg parity: the injected receiver is an unnamed slot-0 positional.
-        // Only when the call already carries names does the name list need a leading
-        // "" — an all-positional call keeps its empty list, so `hasNamedArgs` stays
-        // false downstream.
-        if hasNamedArgs(n.callArgNames) {
-          const nm = n.callArgNames
-          nm.push("")
-          let k = nm.length - 1
-          while k > 0 {
-            nm[k] = nm[k - 1]
-            k = k - 1
-          }
-          nm[0] = ""
-        }
-        const ufcsFn = drwFnRef(uName)
-        noteCallOrigin(ufcsFn, ix)
-        n.callFn = ufcsFn
-        arenaNoteRefWrite()
-      }
-      drwFillDefaults(ix, ctx)
-      return drwOptGuard(ix, ix, optRecv, n.pos, atStmt)
+      return drwWalkMemberCall(ix, n, callee, optWasOpt, ctx, atStmt)
     }
     const nfn = drwWalk(n.callFn, ctx)
     if nfn != n.callFn { arenaNoteRefWrite() }
@@ -1520,139 +1423,7 @@ function drwWalk(ix: i32, ctx: i32) {
     n.retArg = drwWalk(n.retArg, ctx)
     return ix
   }
-  if n is BinExpr {
-    // The index write-trap form `o[k] = v` is handled before the general child walk,
-    // so the assignment-target Index is not first rewritten into a read trap.
-    if n.binOp == "=" {
-      const tgt = P.nodes[n.binLeft]
-      if tgt is Index {
-        tgt.idxArr = drwWalk(tgt.idxArr, ctx)
-        tgt.idxIndex = drwWalk(tgt.idxIndex, ctx)
-        n.binRight = drwWalk(n.binRight, ctx)
-        // A free `"[]="` operator function: the checker resolved it by the receiver's
-        // type and banked it on this assignment node, so the rewrite never re-derives
-        // the choice.
-        const wOp = opIdxFnAtNode(ix)
-        if wOp != "" {
-          const woargs: i32[] = []
-          woargs.push(tgt.idxArr)
-          woargs.push(tgt.idxIndex)
-          woargs.push(n.binRight)
-          return mkCall(drwFnRef(wOp), woargs, -1)
-        }
-        const wsi = structIndexOfExpr(tgt.idxArr, ctx)
-        if drwFieldClosure(wsi, "[]=") {
-          const wargs: i32[] = []
-          wargs.push(tgt.idxIndex)
-          wargs.push(n.binRight)
-          return mkCall(mkMember(tgt.idxArr, "[]=", -1), wargs, -1)
-        }
-        return ix
-      }
-    }
-    n.binLeft = drwWalk(n.binLeft, ctx)
-    n.binRight = drwWalk(n.binRight, ctx)
-    // `x ?? d` over a provably non-nullable lhs is `x`: the default can never be
-    // selected, so the coalesce folds away here rather than in `emitCoalesce` — every
-    // consumer classifier dispatches on the `??` node and only handles a nullable left
-    // operand, so lowering the identity there keeps the wrong type on a non-nullable lhs.
-    if n.binOp == "??" {
-      // Peeled because parens must not change `??` semantics: a `Paren` banks a copy of
-      // its inner's checked type, but a type the checker re-records later (`as?`'s pin)
-      // lands on the inner node only. D1371 — without peeling, `(a as? i32) ?? 0` read the
-      // stale parenthesized type while the un-parenthesised spelling ran correctly.
-      const coalLhs = unwrapParen(n.binLeft)
-      if (nodeTyExcludesNull(coalLhs)) {
-        capMemoNoteEdit()
-        return n.binLeft
-      }
-      // `x ?? null` is `x` for every `x`: a null left selects a null default. Folded so the
-      // read lowers at its own nullable rep instead of through a coalesce whose arms assume
-      // the default is the non-null half (D2247).
-      if P.nodes[unwrapParen(n.binRight)] is NullLit {
-        capMemoNoteEdit()
-        return n.binLeft
-      }
-      // `null ?? d` is `d`, the type the checker gave it (D2261).
-      if coalLhs >= 0 && P.nodes[coalLhs] is NullLit {
-        capMemoNoteEdit()
-        return n.binRight
-      }
-      // A read of a `{[K]: V}` map with a nullable default is `V | null`, a rep the fused
-      // get-with-default builds only for some values, so a re-readable one desugars to the
-      // null test, whose join every value rep lowers (D2248).
-      if coalLhs >= 0 && drwIsMapRead(n.binLeft) && exprReReadable(coalLhs) {
-        const mdRead = P.nodes[coalLhs]
-        if (
-          mdRead is Index
-          && nodeTyMapValExcludesNull(mdRead.idxArr)
-          && nodeTyIsNullable(unwrapParen(n.binRight))
-        ) {
-          const mdThen: i32[] = []
-          mdThen.push(n.binLeft)
-          const mdElse: i32[] = []
-          mdElse.push(n.binRight)
-          const mdIf = mkIf(
-            mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
-            mkBlock(mdThen, n.pos),
-            mkBlock(mdElse, n.pos),
-            n.pos,
-          )
-          nodeTyCarry(mdIf, ix)
-          return mdIf
-        }
-      }
-      // D962 — `x ?? d` over a nullable value-union box desugars here rather than in an
-      // emit arm, since the lowering names the operand twice and only a re-readable left
-      // operand is safe (a call operand keeps the `??`, refused at emit). Not over a map
-      // read: a map miss is a bare `ref.null`, not a null-tagged box — `emitMapGetOr` owns that.
-      if exprReReadable(coalLhs) && !drwIsMapRead(n.binLeft) {
-        if tyIsNulValueUnionBox(nodeTyIxOf(coalLhs)) {
-          const dsThen: i32[] = []
-          dsThen.push(n.binLeft)
-          const dsElse: i32[] = []
-          dsElse.push(n.binRight)
-          const dsIf = mkIf(
-            mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
-            mkBlock(dsThen, n.pos),
-            mkBlock(dsElse, n.pos),
-            n.pos,
-          )
-          // D969 — hands the `??`'s checked type to the synthesized `if`. Without it an
-          // un-annotated destination has nothing left to ask (the erased `??` node carried
-          // the type), so the binding takes a scalar cell while the box goes into it —
-          // check-clean invalid wasm. The desugaring is meaning-preserving either way.
-          nodeTyCarry(dsIf, ix)
-          return dsIf
-        }
-      }
-    }
-    if drwDispatchOp(n.binOp) {
-      const osi = structIndexOfExpr(n.binLeft, ctx)
-      // The checker banked the receiver-keyed operator it resolved (`+@Vec3`); name that
-      // declaration directly — the `a op b` twin of the `"[]"` arm's `opIdxFnAtNode` read.
-      // Empty unless the left operand is a dispatched object, in which case an operator
-      // closure field dispatches member-call style below (D1934).
-      const opFn = opBinFnAtNode(ix)
-      if opFn != "" {
-        const oargs: i32[] = []
-        oargs.push(n.binLeft)
-        oargs.push(n.binRight)
-        return drwOpCall(mkCall(drwFnRef(opFn), oargs, -1), ix)
-      }
-      if osi >= 0 {
-        if drwFieldClosure(osi, n.binOp) {
-          const fargs: i32[] = []
-          fargs.push(n.binRight)
-          return drwOpCall(
-            mkCall(mkMember(n.binLeft, n.binOp, -1), fargs, -1),
-            ix,
-          )
-        }
-      }
-    }
-    return ix
-  }
+  if n is BinExpr { return drwWalkBin(ix, n, ctx) }
   if n is Unary {
     n.unArg = drwWalk(n.unArg, ctx)
     return ix
@@ -1733,6 +1504,249 @@ function drwWalk(ix: i32, ctx: i32) {
     return ix
   }
   ix
+}
+
+// `drwWalk`'s method-call arm: `n` is the call at `ix` whose callee `callee` is a member read,
+// already un-`?.`'d when `optWasOpt`. Walks the receiver, then rewrites a map `get`, a UFCS
+// call or the `?.` guard; returns the node that replaces `ix`.
+function drwWalkMemberCall(
+  ix: i32,
+  n: Call,
+  callee: Member,
+  optWasOpt: boolean,
+  ctx: i32,
+  atStmt: boolean,
+): i32 {
+  const args = n.callArgs
+  let optRecv = -1
+  callee.memObj = drwWalk(callee.memObj, ctx)
+  if optWasOpt {
+    // A receiver that cannot be null needs no guard; one the lowering cannot read twice
+    // keeps the `?.` callee, which `emitCall` refuses by name rather than silently
+    // calling through a null.
+    if !nodeTyExcludesNull(callee.memObj) {
+      if exprReReadable(callee.memObj) {
+        optRecv = callee.memObj
+      } else {
+        n.callFn = mkOptMember(callee.memObj, callee.memProp, false, callee.pos)
+        arenaNoteRefWrite()
+        return ix
+      }
+    }
+  }
+  // D1522 — a map `m.get(k)` is the read `m[k]`, rewritten here so every consumer
+  // classifier reads the Index node (it carries the checked type) rather than claiming a
+  // box the read never left. Only where the checker took the built-in: a set's is a function.
+  if callee.memProp == "get" && memberCallRungOf(ix) != MC_RUNG_SELF_FN {
+    if args.length == 1 && nodeTyIsMap(callee.memObj) {
+      const mgIx = mkIndex(callee.memObj, args[0], n.pos)
+      nodeTyCarry(mgIx, ix)
+      return drwOptGuard(mgIx, ix, optRecv, n.pos, atStmt)
+    }
+  }
+  // UFCS: `o.f(args)`, where `f` is a free function whose first parameter is named
+  // `self`, lowers to `f(o, args)` — the receiver's type does not gate it. D1120 — a
+  // module merge mangles a free `self`-function (`shout` → `shout$m1`) but leaves the
+  // call's property plain, so `ufcsAliasAtSite` maps it per call site, not by name alone.
+  const uName = ufcsAliasAtSite(ix, callee.memProp)
+  // Precedence, mirroring the host: a real struct field wins as a value access, a
+  // callable field wins as a `call_ref` member-call, and only then is UFCS tried.
+  // D1070 — asks the receiver's checked type (`tyFieldTyOf`) rather than the emit-side
+  // struct row, which answers -1 inside a function body; this can only turn UFCS off.
+  const recvFieldTy = tyFieldTyOf(nodeTyIxOf(callee.memObj), callee.memProp)
+  const recvHasField = recvFieldTy >= 0
+  const si = structIndexOfExpr(callee.memObj, ctx)
+  let ufcs = false
+  // A call the checker resolved to a built-in method stays one: that is the rung a
+  // `self`-function of the same name loses to on this receiver (D2476).
+  const builtinRung = memberCallRungOf(ix) == MC_RUNG_BUILTIN
+  // And one it resolved to a `self`-function stays one where the struct row has the field
+  // but the checked type does not: a `P | null` receiver's row is `P`'s.
+  const selfFnRung = memberCallRungOf(ix) == MC_RUNG_SELF_FN
+  if si >= 0 && !recvHasField && !builtinRung {
+    if sFieldIndex(si, callee.memProp) < 0 || selfFnRung {
+      if drwSelfFnOf(uName, args.length + 1) >= 0 { ufcs = true }
+    }
+  }
+  if si < 0 && !recvHasField && !builtinRung {
+    if !exprIsClosure(n.callFn, ctx) {
+      if drwSelfFnOf(uName, args.length + 1) >= 0 {
+        // A type-parameter receiver has no struct row yet, so `si < 0` alone cannot
+        // mean "no field, so UFCS": each instance answers for itself.
+        if drwRecvIsTyParam(callee.memObj, ctx) {
+          memberCallRungAdd(ix, MC_RUNG_PER_INSTANCE)
+        } else {
+          ufcs = true
+        }
+      }
+    }
+  }
+  if ufcs {
+    const recvIx = callee.memObj
+    args.push(-1)
+    let j = args.length - 1
+    while j > 0 {
+      args[j] = args[j - 1]
+      j = j - 1
+    }
+    args[0] = recvIx
+    // Named-arg parity: the injected receiver is an unnamed slot-0 positional.
+    // Only when the call already carries names does the name list need a leading
+    // "" — an all-positional call keeps its empty list, so `hasNamedArgs` stays
+    // false downstream.
+    if hasNamedArgs(n.callArgNames) {
+      const nm = n.callArgNames
+      nm.push("")
+      let k = nm.length - 1
+      while k > 0 {
+        nm[k] = nm[k - 1]
+        k = k - 1
+      }
+      nm[0] = ""
+    }
+    const ufcsFn = drwFnRef(uName)
+    noteCallOrigin(ufcsFn, ix)
+    n.callFn = ufcsFn
+    arenaNoteRefWrite()
+  }
+  drwFillDefaults(ix, ctx)
+  return drwOptGuard(ix, ix, optRecv, n.pos, atStmt)
+}
+
+// `drwWalk`'s binary arm: an index write through a `[]=` operator or closure field, the `??`
+// folds and desugarings, and a dispatched user operator. Returns the node that replaces `ix`.
+function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
+  // The index write-trap form `o[k] = v` is handled before the general child walk,
+  // so the assignment-target Index is not first rewritten into a read trap.
+  if n.binOp == "=" {
+    const tgt = P.nodes[n.binLeft]
+    if tgt is Index {
+      tgt.idxArr = drwWalk(tgt.idxArr, ctx)
+      tgt.idxIndex = drwWalk(tgt.idxIndex, ctx)
+      n.binRight = drwWalk(n.binRight, ctx)
+      // A free `"[]="` operator function: the checker resolved it by the receiver's
+      // type and banked it on this assignment node, so the rewrite never re-derives
+      // the choice.
+      const wOp = opIdxFnAtNode(ix)
+      if wOp != "" {
+        const woargs: i32[] = []
+        woargs.push(tgt.idxArr)
+        woargs.push(tgt.idxIndex)
+        woargs.push(n.binRight)
+        return mkCall(drwFnRef(wOp), woargs, -1)
+      }
+      const wsi = structIndexOfExpr(tgt.idxArr, ctx)
+      if drwFieldClosure(wsi, "[]=") {
+        const wargs: i32[] = []
+        wargs.push(tgt.idxIndex)
+        wargs.push(n.binRight)
+        return mkCall(mkMember(tgt.idxArr, "[]=", -1), wargs, -1)
+      }
+      return ix
+    }
+  }
+  n.binLeft = drwWalk(n.binLeft, ctx)
+  n.binRight = drwWalk(n.binRight, ctx)
+  // `x ?? d` over a provably non-nullable lhs is `x`: the default can never be
+  // selected, so the coalesce folds away here rather than in `emitCoalesce` — every
+  // consumer classifier dispatches on the `??` node and only handles a nullable left
+  // operand, so lowering the identity there keeps the wrong type on a non-nullable lhs.
+  if n.binOp == "??" {
+    // Peeled because parens must not change `??` semantics: a `Paren` banks a copy of
+    // its inner's checked type, but a type the checker re-records later (`as?`'s pin)
+    // lands on the inner node only. D1371 — without peeling, `(a as? i32) ?? 0` read the
+    // stale parenthesized type while the un-parenthesised spelling ran correctly.
+    const coalLhs = unwrapParen(n.binLeft)
+    if (nodeTyExcludesNull(coalLhs)) {
+      capMemoNoteEdit()
+      return n.binLeft
+    }
+    // `x ?? null` is `x` for every `x`: a null left selects a null default. Folded so the
+    // read lowers at its own nullable rep instead of through a coalesce whose arms assume
+    // the default is the non-null half (D2247).
+    if P.nodes[unwrapParen(n.binRight)] is NullLit {
+      capMemoNoteEdit()
+      return n.binLeft
+    }
+    // `null ?? d` is `d`, the type the checker gave it (D2261).
+    if coalLhs >= 0 && P.nodes[coalLhs] is NullLit {
+      capMemoNoteEdit()
+      return n.binRight
+    }
+    // A read of a `{[K]: V}` map with a nullable default is `V | null`, a rep the fused
+    // get-with-default builds only for some values, so a re-readable one desugars to the
+    // null test, whose join every value rep lowers (D2248).
+    if coalLhs >= 0 && drwIsMapRead(n.binLeft) && exprReReadable(coalLhs) {
+      const mdRead = P.nodes[coalLhs]
+      if (
+        mdRead is Index
+        && nodeTyMapValExcludesNull(mdRead.idxArr)
+        && nodeTyIsNullable(unwrapParen(n.binRight))
+      ) {
+        const mdThen: i32[] = []
+        mdThen.push(n.binLeft)
+        const mdElse: i32[] = []
+        mdElse.push(n.binRight)
+        const mdIf = mkIf(
+          mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
+          mkBlock(mdThen, n.pos),
+          mkBlock(mdElse, n.pos),
+          n.pos,
+        )
+        nodeTyCarry(mdIf, ix)
+        return mdIf
+      }
+    }
+    // D962 — `x ?? d` over a nullable value-union box desugars here rather than in an
+    // emit arm, since the lowering names the operand twice and only a re-readable left
+    // operand is safe (a call operand keeps the `??`, refused at emit). Not over a map
+    // read: a map miss is a bare `ref.null`, not a null-tagged box — `emitMapGetOr` owns that.
+    if exprReReadable(coalLhs) && !drwIsMapRead(n.binLeft) {
+      if tyIsNulValueUnionBox(nodeTyIxOf(coalLhs)) {
+        const dsThen: i32[] = []
+        dsThen.push(n.binLeft)
+        const dsElse: i32[] = []
+        dsElse.push(n.binRight)
+        const dsIf = mkIf(
+          mkBinary("!=", n.binLeft, mkNull("null", n.pos), n.pos),
+          mkBlock(dsThen, n.pos),
+          mkBlock(dsElse, n.pos),
+          n.pos,
+        )
+        // D969 — hands the `??`'s checked type to the synthesized `if`. Without it an
+        // un-annotated destination has nothing left to ask (the erased `??` node carried
+        // the type), so the binding takes a scalar cell while the box goes into it —
+        // check-clean invalid wasm. The desugaring is meaning-preserving either way.
+        nodeTyCarry(dsIf, ix)
+        return dsIf
+      }
+    }
+  }
+  if drwDispatchOp(n.binOp) {
+    const osi = structIndexOfExpr(n.binLeft, ctx)
+    // The checker banked the receiver-keyed operator it resolved (`+@Vec3`); name that
+    // declaration directly — the `a op b` twin of the `"[]"` arm's `opIdxFnAtNode` read.
+    // Empty unless the left operand is a dispatched object, in which case an operator
+    // closure field dispatches member-call style below (D1934).
+    const opFn = opBinFnAtNode(ix)
+    if opFn != "" {
+      const oargs: i32[] = []
+      oargs.push(n.binLeft)
+      oargs.push(n.binRight)
+      return drwOpCall(mkCall(drwFnRef(opFn), oargs, -1), ix)
+    }
+    if osi >= 0 {
+      if drwFieldClosure(osi, n.binOp) {
+        const fargs: i32[] = []
+        fargs.push(n.binRight)
+        return drwOpCall(
+          mkCall(mkMember(n.binLeft, n.binOp, -1), fargs, -1),
+          ix,
+        )
+      }
+    }
+  }
+  return ix
 }
 
 // D1253 — a bare `{ … }` statement becomes `if true { … }`, as a rewrite rather than an
