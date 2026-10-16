@@ -1,0 +1,374 @@
+// Capture-rows walk: the sole references, widened declarations and open statements of the
+// body being checked, and the frame and handle a nested function's capture resolves to.
+// Does not import the checker.
+import { lookup, lookupDepth } from "./check_scopes"
+import {
+  ForIn,
+  ForRange,
+  FuncDecl,
+  LetDecl,
+  P,
+  Param,
+  elseIfLink,
+  i32ToStr,
+  nodeSpineChildren,
+} from "./ast"
+import { strListHas } from "./listutil"
+import { T, tyIsHole } from "./check_types"
+import {
+  crCondDropBank,
+  crCondDropN,
+  crDeclMemo,
+  crEscNames,
+  crFnBases,
+  crFnIxs,
+  crPendNames,
+  crProgRoot,
+  crRdIx,
+  crRdRet,
+  crRetCalls,
+  crRetLoops,
+  crRetNames,
+  crRetNarTys,
+  crRetRoots,
+  crRetWideTys,
+  crRhsBys,
+  crRhsNames,
+  crRhsOps,
+  crRhsRetired,
+  crSoleDepths,
+  crSoleNames,
+  crStmtFns,
+  crStmtIxs,
+  crStmtPend,
+  crStmtRd,
+  crStmtScopes,
+  crWideDepths,
+  crWideNames,
+} from "./check_capture_rows"
+import {
+  crEscWalk,
+  crMemoDone,
+  crwAddName,
+  crwBindOf,
+  crwEnsure,
+  weSplit,
+} from "./check_capture_walks"
+import { asgDeclDepths, asgDeclKeys } from "./check_nar_bank"
+import { crCurRoot, crFnBase, crWidenedAt } from "./check_capture_widen"
+
+// Drop the records of the scope being left, at depth `d` and deeper.
+export function crPopSoleTo(d: i32) {
+  while crSoleDepths.length > 0 && crSoleDepths[crSoleDepths.length - 1] >= d {
+    crSoleNames.pop()
+    crSoleDepths.pop()
+  }
+  0
+}
+
+// Whether `name`, resolved at this point, names a binding `crNoteSoleRef` recorded.
+export function crSoleRefBinding(name: string): boolean {
+  if name == "" || crSoleNames.length == 0 { return false }
+  const d = lookupDepth(name)
+  if d < 0 { return false }
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d { return true }
+    i = i - 1
+  }
+  false
+}
+
+// Whether the body being checked belongs to a function with an un-annotated parameter still
+// typed as a hole. Its body is checked again at each call's argument types, which decide; a
+// declared-type read settled here would be carried into that check against types it never saw.
+export function crInHoleTemplate(): boolean {
+  let f = 0
+  while f < crFnIxs.length {
+    const fd = P.nodes[crFnIxs[f]]
+    if fd is FuncDecl {
+      let i = 0
+      while i < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[i]]
+        if pn is Param {
+          if tyIsHole(lookup(pn.parName)) { return true }
+        }
+        i = i + 1
+      }
+    }
+    f = f + 1
+  }
+  false
+}
+
+// Enter and leave one statement of a block. Leaving drops the statement's pending names — the
+// emitter has retired them by then — and its read rows.
+export function crStmtEnter(stmtIx: i32) {
+  crStmtIxs.push(stmtIx)
+  crStmtFns.push(crFnBases.length)
+  crStmtPend.push(crPendNames.length)
+  crStmtRd.push(crRdRet.length)
+  crStmtScopes.push(T.scopes.length)
+  0
+}
+
+// The bare names narrowed in the current function, each once.
+export function crLiveNames(): string[] {
+  const out: string[] = []
+  const base = crFnBase()
+  let i = 0
+  while i < asgDeclKeys.length {
+    if asgDeclDepths[i] >= base {
+      if !strListHas(out, asgDeclKeys[i]) { out.push(asgDeclKeys[i]) }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The innermost open statement that holds the scope at depth `d`, or -1.
+export function crStmtHolding(d: i32): i32 {
+  let i = crStmtIxs.length - 1
+  while i >= 0 {
+    if crStmtFns[i] != crFnBases.length { return -1 }
+    if crStmtScopes[i] <= d { return crStmtIxs[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether `name` is bound in the innermost scope only by `crDeclareWidened`.
+export function crWidenedInTop(name: string): boolean {
+  crWidenedAt(name, T.scopes.length - 1)
+}
+
+// A declaration of `name` in the innermost scope replaces its `crDeclareWidened` binding.
+export function crUnwidenTop(name: string) {
+  const d = T.scopes.length - 1
+  let i = crWideNames.length - 1
+  while i >= 0 && crWideDepths[i] >= d {
+    if crWideDepths[i] == d && crWideNames[i] == name { crWideNames[i] = "" }
+    i = i - 1
+  }
+  0
+}
+
+// The innermost function around the one being checked that declares `name`, or the program.
+// An outer frame than the true one only makes `crCaptureByRef` answer true more often.
+export function crDeclFrameOf(name: string): i32 {
+  let k = crFnIxs.length - 2
+  while k >= 0 {
+    if crFrameDeclares(crFnIxs[k], name) { return crFnIxs[k] }
+    k = k - 1
+  }
+  crProgRoot
+}
+
+function crFrameDeclares(fnIx: i32, name: string): boolean {
+  const pre = i32ToStr(fnIx) + "#"
+  if !crMemoDone.has(pre + "d") {
+    crMemoDone[pre + "d"] = true
+    const fd = P.nodes[fnIx]
+    if fd is FuncDecl {
+      let p = 0
+      while p < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[p]]
+        if pn is Param { crDeclMemo[pre + pn.parName] = true }
+        p = p + 1
+      }
+      crDeclWalk(fd.fnBody, pre)
+    }
+  }
+  crDeclMemo[pre + name] ?? false
+}
+
+function crDeclWalk(ix: i32, pre: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is LetDecl {
+    crDeclMemo[pre + n.letName] = true
+  } else if n is ForRange {
+    crDeclMemo[pre + n.frVar] = true
+  } else if n is ForIn {
+    crDeclMemo[pre + n.fiVar] = true
+    if n.fiVar2 != "" { crDeclMemo[pre + n.fiVar2] = true }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crDeclWalk(kids[k], pre)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// The name a nested function is only ever called by: its own, or the one binding it; "".
+export function crLambdaHandle(fnIx: i32): string {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    if fd.fnName != "" { return fd.fnName }
+  }
+  crwEnsure(crCurRoot())
+  crwBindOf[fnIx] ?? ""
+}
+
+// 1 when the nested function `fnIx` may run anywhere but at a call by its handle in the body of
+// the function that makes it: it has no handle, or the handle is used other than as that
+// body's own callee — stored, passed, returned, reassigned, or called from a nested function.
+export function crLambdaEscapes(fnIx: i32): i32 {
+  const h = crLambdaHandle(fnIx)
+  if h == "" { return 1 }
+  let body = crProgRoot
+  if crFnIxs.length >= 2 {
+    const pf = P.nodes[crFnIxs[crFnIxs.length - 2]]
+    if pf is FuncDecl { body = pf.fnBody }
+  }
+  let esc = crEscNames[body] ?? ""
+  if esc == "" {
+    esc = crEscWalk(body, false, ",")
+    crEscNames[body] = esc
+  }
+  if esc.indexOf("," + h + ",") >= 0 { return 1 }
+  0
+}
+
+// Whether `name` is used in the body being checked other than as its own callee.
+export function crNameEscapesHere(name: string): boolean {
+  let body = crProgRoot
+  if crFnIxs.length >= 1 {
+    const pf = P.nodes[crFnIxs[crFnIxs.length - 1]]
+    if pf is FuncDecl { body = pf.fnBody }
+  }
+  let esc = crEscNames[body] ?? ""
+  if esc == "" {
+    esc = crEscWalk(body, false, ",")
+    crEscNames[body] = esc
+  }
+  esc.indexOf("," + name + ",") >= 0
+}
+
+// The node that retired `name` in the right operand of the `&&`/`||` at `opIx`, or -1.
+function crRhsRetiredBy(opIx: i32, name: string): i32 {
+  let i = crRhsOps.length - 1
+  while i >= 0 {
+    if crRhsOps[i] == opIx && crRhsNames[i] == name { return crRhsBys[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether a `&&`/`||` in the condition at `condIx` had its right operand retire `name`: the
+// condition's arms then hold no fact about it, and no join below the `if` may install one.
+export function crCondRetired(condIx: i32, name: string): boolean {
+  if crRhsRetired.length == 0 || condIx < 0 || condIx >= P.nodes.length {
+    return false
+  }
+  const r = crRhsRetired[condIx] ?? ""
+  if r != "" && r.indexOf("," + name + ",") >= 0 { return true }
+  let cur = condIx
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crCondRetired(kids[k], name) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Drop the facts collected since `mark` that the right operand of the `&&`/`||` at `opIx` retired.
+// The emitter retires the same pushes at the same node (`condRhsRetiredOf`), so a re-test in the
+// right operand narrows again in both halves.
+export function crFilterRhsRetired(
+  opIx: i32,
+  names: string[],
+  tys: i32[],
+  mark: i32,
+) {
+  if crRhsRetired.length == 0 { return 0 }
+  const gone = crRhsRetired[opIx] ?? ""
+  if gone == "" { return 0 }
+  let w = mark
+  let i = mark
+  while i < names.length {
+    if gone.indexOf("," + names[i] + ",") >= 0 {
+      const by = crRhsRetiredBy(opIx, names[i])
+      if by >= 0 {
+        crRetNames.push(names[i])
+        crRetCalls.push(by)
+        crRetNarTys.push(tys[i])
+        crRetWideTys.push(lookup(names[i]))
+        crRetRoots.push(crCurRoot())
+        crRetLoops.push(false)
+      }
+    } else {
+      names[w] = names[i]
+      tys[w] = tys[i]
+      w = w + 1
+    }
+    i = i + 1
+  }
+  while names.length > w {
+    names.pop()
+    tys.pop()
+  }
+  0
+}
+
+// The path twin of `crReadHook`'s note half: a read of `key` with no narrowing left, after a
+// condition dropped a fact about it, is remembered so a diagnostic spanning it names the cause.
+export function crPathDropRead(key: string, ix: i32) {
+  if crRetNames.length == 0 || crStmtIxs.length == 0 { return 0 }
+  const root = crCurRoot()
+  let r = crRetNames.length - 1
+  while r >= 0 {
+    if crRetNames[r] == key && crRetRoots[r] == root {
+      if crRetWideTys[r] < 0 {
+        crRdRet.push(r)
+        crRdIx.push(ix)
+      }
+      return 0
+    }
+    r = r - 1
+  }
+  0
+}
+
+// The names a condition's narrowing drops, over the whole condition subtree: a sub-condition
+// that dropped a name implies the call is in the whole, whose own row may then hold nothing.
+export function condNarrowDropOf(condIx: i32): string {
+  if crCondDropN == 0 { return "" }
+  crCondDropWalk(condIx, ",")
+}
+
+function crCondDropWalk(ix: i32, acc: string): string {
+  if ix < 0 || ix >= P.nodes.length { return acc }
+  let out = acc
+  const s = crCondDropBank[ix]
+  if s is string {
+    const parts = weSplit(s)
+    let i = 0
+    while i < parts.length {
+      out = crwAddName(out, parts[i])
+      i = i + 1
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      out = crCondDropWalk(kids[k], out)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  out
+}

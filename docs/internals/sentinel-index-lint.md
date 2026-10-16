@@ -47,8 +47,9 @@ line before the next):
 > * **a call result** — a local or parameter last bound by `let x = f(…)`, `const x: T = f(…)`
 >   or `x = f(…)`, where the annotation, if any, is a single word; or
 > * **a hole field** — the subscript is a bare path `<x>.<f>`, or a local last bound by
->   `let x = <y>.<f>`, where `<f>` is a **HOLE FIELD** of this module: a field the module
->   itself compares `< 0` or `>= 0`, or compares against a negative literal with any operator; or
+>   `let x = <y>.<f>`, where `<f>` is a **HOLE FIELD** of the module graph: a field some
+>   module in it compares `< 0` or `>= 0`, or compares against a negative literal with any
+>   operator; or
 > * **a fall-through parameter** — one of the enclosing function's own `i32` parameters, read
 >   **after** that function's first `return`, in a function that is a **READER**: one that
 >   answers a literal `-1` on some path, or hands its answer to one that does (a fixpoint four
@@ -63,12 +64,19 @@ line before the next):
 > reader's `-1` is its *documented* answer rather than a clamp that happens to be in range, so
 > it still has to be tested, but it is the weaker finding and gets its own code.
 
-Both derivations — hole fields and map globals — are read **per module**, from the module's own
-text, so `compiler/lint.vl` (which sees one module) and `sentinel-census.vl` (which sees the
-tree) cannot disagree. Nothing is hard-coded: there is no list of tables, no list of readers, no
-list of hole fields.
+Map globals are read **per module**, from the module's own text. Nothing is hard-coded: there is
+no list of tables, no list of readers, no list of hole fields.
 
-The one derivation that crosses a module is an IMPORTED map global. A module's text cannot tell
+**Hole fields are the union over the module graph.** A field is absent wherever it is read, not
+only in the module that happens to test it, and a per-module set made the count depend on where
+a function lives: carving `typecheck.vl` moved three reads (`P.nodes[n.fnBody]`,
+`T.tys[t.nInner]` twice) into modules that never test those fields, and they left the count with
+no change to the code. The driver unions `lintHoleFieldsOf` over every module the graph read and
+stages it with `lintSetGraphHoles`; the census does the same over the relative imports its roots
+reach (`graphHoles`). Unioning raised the count from 300 to 457; 201 of the 457 are reads through
+`callFn`, which `emit_classify.vl`, `lint.vl` and `driver.vl` test against 0.
+
+The other derivation that crosses a module is an IMPORTED map global. A module's text cannot tell
 `import { fnDeclIx }` from an imported list, so the driver resolves each import against the
 module it names and stages the locals that bind a column-0 `{[…]}` global there
 (`lintSetImportedMaps`), and the census reads the named sibling file. Without it, moving a map

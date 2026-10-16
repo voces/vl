@@ -1,0 +1,876 @@
+// Type-shape queries with no state of their own: numeric coverage, zero-capable elements,
+// place-key steps, the type a write to a hole field lands at, null-narrowed parts and the
+// list fields an equality reaches. Does not import the checker.
+import {
+  BoolLit,
+  FuncDecl,
+  Ident,
+  NumLit,
+  ObjLit,
+  P,
+  Paren,
+  RetStmt,
+  StrLit,
+  Unary,
+  nodeChildren,
+} from "./ast"
+import { nameIsBraceSpanEnds, nameIsQuotedLeaf, tyTopIndexOf } from "./tyname"
+import { strListHas, strListIndexOf } from "./listutil"
+import { tailValueLeaves } from "./check_unconsumed"
+import {
+  PrimName,
+  T,
+  TY_ERR,
+  TY_NULL,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  listArmFitAcrossReps,
+  litBaseTy,
+  mkObjTy,
+  nomNameOfTy,
+  nwNames,
+  objFieldType,
+  oneListUnionRender,
+  tyArrayElemIx,
+  tyFieldTyOf,
+  tyHasHole,
+  tyIsHole,
+  tyLitMemberTexts,
+  tyMutEpoch,
+  tyParamNamesPart,
+  tyPrimNameOf,
+  tySame,
+} from "./check_types"
+import {
+  arrElemTyOrNone,
+  flattenVariantsInto,
+  isNullTy,
+  isNumericPrimTy,
+  litSetBaseTy,
+  nonNullTy,
+  nullableInnerOrNone,
+  primNameOf,
+  tyAdmitsNull,
+  tyParamBesideConcrete,
+} from "./check_ty_shape"
+import {
+  HD_FLD,
+  HD_GNOT,
+  HD_HWR,
+  HD_TVW,
+  hdBase,
+  hdInner,
+  hdKind,
+  hdReadNullAsked,
+  hdRowOf,
+  tyIsNonNullHoleRead,
+} from "./check_hole_pins"
+import {
+  holeParamBesideConcrete,
+  tyParamOfInnermostBody,
+} from "./check_tp_join"
+import { holeShapeNames, holeShapeOf, holeShapeTys } from "./check_hole_rows"
+import {
+  asgDeclEpochs,
+  asgDeclKeys,
+  asgDeclTys,
+  narFnEpoch,
+} from "./check_nar_bank"
+import { recOriginExpr } from "./check_rec_fresh"
+import { isStmtNode } from "./check_bind_rows"
+import { mkDerivedHole } from "./check_coal"
+import { tpBoundOfName } from "./check_tp_bound"
+
+// Whether `a` has a numeric primitive variant that no variant of `b` is.
+export function numericVariantUncovered(a: i32, b: i32): boolean {
+  const av: i32[] = []
+  flattenVariantsInto(a, av)
+  const bv: i32[] = []
+  flattenVariantsInto(b, bv)
+  let i = 0
+  while i < av.length {
+    if isNumericPrimTy(av[i]) {
+      let hit = false
+      let j = 0
+      while j < bv.length {
+        if tySame(av[i], bv[j]) { hit = true }
+        j = j + 1
+      }
+      if !hit { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// D1470 — does the element type `el` have a zero, a default value that is itself a member of
+// `el`? The scalars do (`0` / `0.0` / `false`) and nothing else in the language does: `string`
+// has no empty default the language recognises, and a struct / variant / closure / map / nested
+// list / union / nullable element would get a null or a niche outside its own type.
+export function elemHasZero(el: i32) {
+  const p = primNameOf(el)
+  if p == "i32" { return true }
+  if p == "boolean" { return true }
+  if p == "u8" { return true }
+  if p == "f64" { return true }
+  if p == "i64" { return true }
+  if p == "f32" { return true }
+  if p == "string" { return false }
+  // `void` / `null` / `never` cannot be an element type at all, so they arrive here the way
+  // a struct or a closure element does — through the `null` a non-primitive answers.
+  if p == "void" { return false }
+  if p == "null" { return false }
+  if p == "never" { return false }
+  if p == "v128" {
+    return false // not an element type in S1-S2 (no v128[])
+  }
+  false
+}
+
+// Set while a return set joins: there a type parameter's list stays apart from a concrete list
+// (D2783); a join inside a body keeps the collapse its own reads are checked under.
+export let tpApartConcrete = false
+export function tpApartConcreteSet(v: boolean) { tpApartConcrete = v }
+
+// The steps of a place key below its root, in order: `.f` for a field, `[k]` for a subscript.
+export function keySteps(key: string): string[] {
+  const out: string[] = []
+  let i = 0
+  while i < key.length && key[i] != '.' && key[i] != '[' { i = i + 1 }
+  while i < key.length {
+    let j = i + 1
+    if key[i] == '.' {
+      while j < key.length && key[j] != '.' && key[j] != '[' { j = j + 1 }
+      out.push(key.slice(i, j))
+    } else {
+      // a subscript's text is a digit run or a quoted literal
+      if j < key.length && key[j] == '"' {
+        j = j + 1
+        while j < key.length && key[j] != '"' {
+          if key[j] == '\\' { j = j + 1 }
+          j = j + 1
+        }
+      }
+      while j < key.length && key[j] != ']' { j = j + 1 }
+      j = j + 1
+      out.push(key.slice(i, j))
+    }
+    i = j
+  }
+  out
+}
+
+// What a hole's field `hst` reads after a write of `rt`, or -1 for no narrowing: a hole value is
+// read as itself, since the pin re-asks its member reads and calls (`hdReadNullAsked`), and a
+// value non-null at the template reads the field's non-null face. A hole whose reads the pin
+// does not re-ask, or a union carrying one, does not narrow (D3287).
+export function holeFieldWriteTy(hst: i32, rt: i32): i32 {
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  if tyIsHole(rt) {
+    const row = hdRowOf(rt)
+    if row < 0 || tyIsNonNullHoleRead(rt) || hdReadNullAsked(row) { return rt }
+    return -1
+  }
+  if tyAdmitsNull(rt) || isNullTy(rt) { return -1 }
+  if tyHasHole(rt) {
+    const t = T.tys[rt]
+    if !(t is TyObj || t is TyArray || t is TyFunc || t is TyMap) { return -1 }
+  }
+  const hn = nonNullNarrowTy(hst)
+  if hn == hst { return -1 }
+  hn
+}
+
+// What a nested function reads a place a write left at `ty` as: the template's non-null face
+// for a read the pin decides (`HD_TVW`, `HD_HWR`), since the nested body is lowered once for every
+// instance and its reads carry no pin; `ty` otherwise.
+export function writeLandNestedTy(ty: i32): i32 {
+  const row = hdRowOf(ty)
+  if row < 0 { return ty }
+  if hdKind[row] == HD_TVW { return nonNullTy(hdInner[row]) }
+  if hdKind[row] == HD_HWR { return nonNullNarrowTy(hdBase[row]) }
+  ty
+}
+
+// The field a member read off a hole already derived, as `checkMemberNode` types it, so a null
+// test on `z.f` narrows the hole's field the way it narrows a declared record's (D3197). -1 when
+// the read has not been typed, or the hole reads its members from a bound.
+export function holePlaceFieldTy(hole: i32, ht: TyVar, prop: string): i32 {
+  if ht.tvName.length == 0 { return -1 }
+  if ht.tvName[0] == '?' {
+    const shape = holeShapeOf(ht.tvName)
+    if shape < 0 { return -1 }
+    const st = T.tys[shape]
+    if st is TyObj { return objFieldType(st, prop) }
+    return -1
+  }
+  if tpBoundOfName(ht.tvName) >= 0 { return -1 }
+  mkDerivedHole(HD_FLD, prop, -1, -1, hole)
+}
+
+// A prose description of a type's underlying shape, for explaining why two intersection operands
+// cannot overlap (`A & B` → "an object and a string literal"). A single-member union (a
+// `type B = "foo"` alias) peels to its member, so it reads "a string literal", not "a union".
+export function operandKind(ix: i32) {
+  if ix < 0 { return "a type" }
+  const t = T.tys[ix]
+  if t is TyUnion {
+    if t.uMembers.length == 1 { return operandKind(t.uMembers[0]) }
+    return "a union"
+  }
+  if t is TyLit {
+    if t.litKind == "str" { return "a string literal" }
+    return "a number literal"
+  }
+  if t is TyObj { return "an object" }
+  if t is TyFunc { return "a function" }
+  if t is TyPrim { return "the type `" + t.primName + "`" }
+  if t is TyArray { return "an array" }
+  if t is TyMap { return "a map" }
+  "a type"
+}
+
+// The non-null face of a place at a narrowing: `nonNullTy` for a type that has one, and a
+// deferred subtraction of `null` for a hole, which is not a `TyNullable` and would otherwise come
+// straight back un-narrowed. Every fact collector reads this one, so the null-test spellings agree
+// about what a guarded read sees and the pin re-asks its floors against the narrowed type (D1693).
+export function nonNullNarrowTy(cur: i32) {
+  const inner = nonNullTy(cur)
+  if inner != cur { return inner }
+  if tyIsHole(cur) { return mkDerivedHole(HD_GNOT, "", -1, TY_NULL, cur) }
+  inner
+}
+
+// `ty` with one `| null` removed, or `ty` itself when it is not nullable.
+function eqNonNullPart(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const inner = nullableInnerOrNone(ty)
+  if inner >= 0 { return inner }
+  ty
+}
+
+// The dotted path to the first list field a `==` over record `ty` walks, or "" when `ty` is
+// not a record (a nullable one counts) or holds no list.
+export function eqListFieldPath(ty: i32, seen: i32[]): string {
+  const rt = eqNonNullPart(ty)
+  if rt < 0 || rt >= T.tys.length { return "" }
+  let si = 0
+  while si < seen.length {
+    if seen[si] == rt { return "" }
+    si = si + 1
+  }
+  const t = T.tys[rt]
+  let out = ""
+  if t is TyObj {
+    seen.push(rt)
+    let i = 0
+    while i < t.objFieldTypes.length && out == "" {
+      const ft = eqNonNullPart(t.objFieldTypes[i])
+      if ft >= 0 && ft < T.tys.length && arrElemTyOrNone(ft) >= 0 {
+        out = t.objFieldNames[i]
+      } else {
+        const sub = eqListFieldPath(ft, seen)
+        if sub != "" { out = t.objFieldNames[i] + "." + sub }
+      }
+      i = i + 1
+    }
+    seen.pop()
+  }
+  out
+}
+
+// ── `is <literal>` over a collapsed operand (D1048) ──────────────────────────
+
+// Is the expression at `ix` a bare scalar literal — a number, a string, a boolean, or one of those
+// behind parens or a unary sign? These are the expressions a nominal newtype destination adopts
+// without an explicit conversion: a literal carries no prior identity, so it is not a candidate for
+// the brand confusion the type exists to prevent. Deliberately syntactic, unlike `litTyOfExpr`.
+export function exprIsBrandAdoptingLiteral(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Paren { return exprIsBrandAdoptingLiteral(e.parInner) }
+  if e is Unary {
+    if e.unOp == "-" { return exprIsBrandAdoptingLiteral(e.unArg) }
+    return false
+  }
+  if e is NumLit { return true }
+  if e is StrLit { return true }
+  if e is BoolLit { return true }
+  false
+}
+
+// Whether `a` and `b` hold two differently named declared type parameters at one position,
+// bare or under a list element or nullable wrapper; a hole (`?…`) is inference, not a type,
+// except a parameter's own hole beside a concrete type under a constructor.
+export function tyParamsPart(a: i32, b: i32, depth: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length || depth > 8 {
+    return false
+  }
+  // Under a constructor, in a return set, a declared parameter is apart from a concrete type
+  // too: `T[]` beside `i32[]` is `string[] | i32[]` at `T := string` (D2783).
+  if depth > 0 && tpApartConcrete {
+    if tyParamBesideConcrete(a, b) || tyParamBesideConcrete(b, a) {
+      return true
+    }
+    // A parameter's hole is an implicit type parameter, so `[t]` beside `[1]` parts too (D4889).
+    if holeParamBesideConcrete(a, b) || holeParamBesideConcrete(b, a) {
+      return true
+    }
+  }
+  const ta = T.tys[a]
+  match ta {
+    TyVar => {
+      // Two bare parameters part as well, in the body declaring them: collapsed, an instance
+      // binding them apart stored both arms in the first one's cell (D3268).
+      if depth == 0 && !tyParamOfInnermostBody(a) { return false }
+      // A hole's resolution (a lambda's deferred return) re-joins as it always has (D3358).
+      if depth == 0 && (tyIsHole(a) || tyIsHole(b)) { return false }
+      return tyParamNamesPart(ta.tvName, b)
+    }
+    TyArray => {
+      const eb = arrElemTyOrNone(b)
+      if eb < 0 { return false }
+      return tyParamsPart(ta.aElem, eb, depth + 1)
+    }
+    TyNullable => {
+      const ib = nullableInnerOrNone(b)
+      if ib < 0 { return false }
+      return tyParamsPart(ta.nInner, ib, depth + 1)
+    }
+    TyPrim | TyErr | TyFunc | TyObj | TyUnion | TyLit | TyNeg | TyMap => {
+      // Read no further: a join through these keeps the answer `assignable` gives it.
+      return false
+    }
+  }
+}
+
+// True if `dstTy` has a `prim` position a literal can re-encode into: the bare prim, a nullable
+// one (its inner), or any such member of a union, recursively. One walk for both float grants, so
+// the f32 and f64 destinations cannot drift apart.
+function dstAdmitsPrim(dstTy: i32, prim: PrimName) {
+  if dstTy < 0 { return false }
+  if primNameOf(dstTy) == prim { return true }
+  const t = T.tys[dstTy]
+  if t is TyNullable { return dstAdmitsPrim(t.nInner, prim) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if dstAdmitsPrim(t.uMembers[i], prim) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+export function dstAdmitsF32(dstTy: i32) { dstAdmitsPrim(dstTy, "f32") }
+
+export function dstAdmitsF64(dstTy: i32) { dstAdmitsPrim(dstTy, "f64") }
+
+// Does function type `tyIx` carry an inference hole — a `TyVar` param or return? Such a type is a
+// generic, capability-bounded function value (`(a, b) => a + b`), not a concrete signature.
+export function fnTyHasHole(tyIx: i32) {
+  const t = T.tys[tyIx]
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let i = 0
+    while i < ps.length {
+      if tyIsHole(ps[i]) { return true }
+      i = i + 1
+    }
+    return tyIsHole(t.fnRet)
+  }
+  false
+}
+
+// Is record arm `y` laid out under a different box tag from `x` — same field names, and some
+// field whose base type differs, a literal set read as the scalar it softens to. The checker's
+// conservative reading of the emitter's `variantTagKey`.
+export function recArmsTagApart(x: i32, y: i32): boolean {
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if !(tx is TyObj) || !(ty is TyObj) { return false }
+  let i = 0
+  while i < tx.objFieldNames.length {
+    const fy = objFieldType(ty, tx.objFieldNames[i])
+    if fy < 0 { return false }
+    if !tySame(recFieldBaseTy(tx.objFieldTypes[i]), recFieldBaseTy(fy)) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The type a record field is tagged by: a literal set's base scalar, else the field's own type.
+function recFieldBaseTy(f: i32): i32 {
+  const b = litSetBaseTy(f)
+  if b >= 0 { b } else { f }
+}
+
+// Does some list arm of `cur` other than `chk` keep its elements in another rep and still hold
+// values that fit `chk`? Then the then arm keeps `cur`, as `recIsFitsAcrossTags` (D4779).
+export function listIsFitsAcrossReps(cur: i32, chk: i32): boolean {
+  if cur < 0 || chk < 0 || tyArrayElemIx(chk) < 0 { return false }
+  const ms: i32[] = []
+  flattenVariantsInto(cur, ms)
+  for m in ms {
+    if m >= 0 && m != chk && listArmFitAcrossReps(m, chk) != 0 { return true }
+  }
+  false
+}
+
+// The resolved arena type of field `fi` of the record registered at `declTyIx`. The
+// declaration pass pushed field types in declaration order into the same arrays the
+// placeholder holds, so the index lines up with `tdFields`.
+export function flatFieldTyOf(declTyIx: i32, fi: i32) {
+  if declTyIx < 0 { return -1 }
+  const pt = T.tys[declTyIx]
+  if pt is TyObj {
+    const ftys = pt.objFieldTypes
+    if fi < ftys.length { return ftys[fi] }
+  }
+  -1
+}
+
+// The branded arena index for newtype `name` over base `base` — minted once per (name, base)
+// pair and reused, so `assignable`'s `src == dst` fast path still fires. A second index over
+// the same `Ty` value, not a deep copy: a forward reference through the newtype name sees the
+// finished shape once pass 0b fills it. Nominal sidecars are mirrored onto it for the same reason.
+export function nameIsNewtypeBrand(nm: string): boolean {
+  if nm == "" { return false }
+  let i = 0
+  while i < nwNames.length {
+    if nwNames[i] == nm { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if any top-level member of a `|`-split union spelling is the bare `null` arm. The
+// string side's only way to ask what `TyNullable` answers structurally: canon splits
+// `A|B|null` into three flat siblings, so nullability must be read off a sibling. Feeds the
+// sticky `RC_NULLABLE` bit so members carry the same position the structural renderer gives them.
+export function partsHaveNull(parts: string[]) {
+  let i = 0
+  while i < parts.length {
+    if parts[i] == "null" { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The object pair the last `objShapeAdapterless` walk stopped on. Entered with the pair the
+// author wrote (`Cat[]` into `Animal[]`) while the reason lives at a nested pair (`Cat` into
+// `Animal`); the diagnostic names both, so the container is never mistaken for the unsupported thing.
+export let shapeAdaptSrcTy = -1
+export function shapeAdaptSrcTySet(v: i32) { shapeAdaptSrcTy = v }
+
+export let shapeAdaptDstTy = -1
+export function shapeAdaptDstTySet(v: i32) { shapeAdaptDstTy = v }
+
+// The source expression of that same stopped-on pair, `(…)`-peeled — banked beside the two
+// types since the walk is entered on the expression the author wrote while the pair lives
+// one or more containers in. `{ pet: aCat }` into `{pet: Animal}` has a claimed pair that is
+// a pinned `Cat` field value; reading the outer expression would get it backwards.
+export let shapeAdaptSrcExpr = -1
+export function shapeAdaptSrcExprSet(v: i32) { shapeAdaptSrcExpr = v }
+
+// Which rule claimed the stopped-on pair: the object-shape one (false) or the
+// container-element storage-class one (true). They need different wordings, and the pair
+// banked above does not say which on its own.
+export let shapeAdaptElemPair = false
+export function shapeAdaptElemPairSet(v: boolean) { shapeAdaptElemPair = v }
+
+// The claimed pair is a nested width pair (agreeing field names, differing inside a field)
+// — selects the design-refusal wording instead of a capability concession (D938).
+export let shapeAdaptWidthField = false
+export function shapeAdaptWidthFieldSet(v: boolean) { shapeAdaptWidthField = v }
+
+// Claim `src` -> `dst` as the refused list pair, the way `objShapeAdapterless` claims one.
+export function listWidenClaim(x: i32, src: i32, dst: i32): boolean {
+  shapeAdaptSrcTy = src
+  shapeAdaptDstTy = dst
+  shapeAdaptSrcExpr = x
+  shapeAdaptElemPair = true
+  shapeAdaptWidthField = false
+  true
+}
+
+// —— the record storage rule (DECISIONS.md "Record covariance: only a fresh value widens") ——
+// A record is shared, never rebuilt, so only a fresh one (an object literal, or a binding or
+// function holding only one) may be delivered where a record of its field names stores a field
+// differently; it is built there. Any other record is refused at the delivery.
+
+// The value expressions function `fd` returns, by `return` or as a tail value. A nested
+// function's returns are its own.
+export function recFnValueLeaves(fd: i32): i32[] {
+  const out: i32[] = []
+  const f = P.nodes[fd]
+  if f is FuncDecl {
+    const leaves: i32[] = []
+    tailValueLeaves(f.fnBody, leaves)
+    const stack: i32[] = [f.fnBody]
+    while stack.length > 0 {
+      const ix = stack.pop() ?? -1
+      const rn = P.nodes[ix]
+      if rn is RetStmt {
+        if rn.retArg >= 0 { leaves.push(rn.retArg) }
+      }
+      if !(rn is FuncDecl) {
+        for c in nodeChildren(ix) {
+          if c >= 0 && c < P.nodes.length { stack.push(c) }
+        }
+      }
+    }
+    for lf in leaves {
+      if !isStmtNode(lf) { out.push(lf) }
+    }
+  }
+  out
+}
+
+// Does the function declared at `fd` return an object literal written in its own body?
+export function recHasLitLeaf(fd: i32): boolean {
+  for lf in recFnValueLeaves(fd) {
+    const o = recOriginExpr(lf)
+    if o >= 0 && P.nodes[o] is ObjLit { return true }
+  }
+  false
+}
+
+// Can a list of a NARROWER element be shared as a view of `de`: a union or nullable element,
+// which a list of one of its members reaches without a copy?
+export function elemAdmitsNarrowerShare(de: i32): boolean {
+  if de < 0 || de >= T.tys.length { return false }
+  const t = T.tys[de]
+  match t {
+    TyNullable | TyUnion => {
+      return true
+    }
+    // No other element has a narrower type a list of it shares storage with.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// A callable field `prop` of `recv` called with `argc` arguments: its parameter types into
+// `out`, its return returned; -1 where the field is not a function of that arity.
+export function fieldSigOf(
+  recv: i32,
+  prop: string,
+  argc: i32,
+  out: i32[],
+): i32 {
+  const ft = tyFieldTyOf(recv, prop)
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const f = T.tys[ft]
+  if f is TyFunc {
+    if f.fnParamTypes.length != argc { return -1 }
+    let i = 0
+    while i < argc {
+      out.push(f.fnParamTypes[i])
+      i = i + 1
+    }
+    return f.fnRet
+  }
+  -1
+}
+
+// Member access on an inference hole: records the field on the hole's demanded shape and
+// returns the field's derived hole. Takes both `holeIx` and `holeName` since the caller has
+// already narrowed the receiver — do not collapse to one parameter: re-deriving from the name
+// alone miscompiles a field bound through a negated `is` + early return into a `const`.
+export function holeMemberTy(holeIx: i32, holeName: string, prop: string) {
+  if holeIx < 0 { return TY_ERR }
+  let shape = holeShapeOf(holeName)
+  if shape < 0 {
+    const fnames: string[] = []
+    const ftys: i32[] = []
+    shape = mkObjTy(fnames, ftys)
+    holeShapeNames.push(holeName)
+    holeShapeTys.push(shape)
+  }
+  const st = T.tys[shape]
+  if st is TyObj {
+    const f = objFieldType(st, prop)
+    if f >= 0 { return f }
+    const d = mkDerivedHole(HD_FLD, prop, -1, -1, holeIx)
+    if d < 0 { return TY_ERR }
+    st.objFieldNames.push(prop)
+    st.objFieldTypes.push(d)
+    tyMutEpoch = tyMutEpoch + 1 // hole shape gained a field in place
+    return d
+  }
+  TY_ERR
+}
+
+// The numeric kinds `ty` holds, through lists, nullables and unions: 1 for an integer, 2 for a
+// float, 0 for none.
+export function numKindMask(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyArray { return numKindMask(t.aElem, depth - 1) }
+  if t is TyNullable { return numKindMask(t.nInner, depth - 1) }
+  if t is TyLit { return numKindMask(litBaseTy(t), depth - 1) }
+  if t is TyUnion {
+    let m = 0
+    for u in t.uMembers { m = m | numKindMask(u, depth - 1) }
+    return m
+  }
+  const pn = primNameOf(ty)
+  if pn == "f64" || pn == "f32" { return 2 }
+  if isNumericPrimTy(ty) { return 1 }
+  0
+}
+
+// True when every member spelling of a `UnionDecl` is a quoted string literal and there are
+// at least two — the shape `litUnionAliasTyOfMembers` can adopt. The pre-fill in pass 0b is
+// scoped to exactly that set: a numeric literal union is not adoptable by member set, and a
+// union with any other member kind gains nothing from filling early.
+export function udVariantsAllStrLit(vs: string[]): boolean {
+  if vs.length < 2 { return false }
+  let i = 0
+  while i < vs.length {
+    if !nameIsQuotedLeaf(vs[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Whether a rendered type name is a single object shape (`{meow: i32}`) — `tyToStr` of a
+// `TyObj`. The emitter resolves it to a concrete union variant by field-set match. A nullable
+// `{...}?` / union `{...} | {...}` is not a single shape.
+export function isObjShapeName(nm: string) {
+  // Stays wide (`nameIsBraceSpanEnds`, not the tighter `nameIsShapeOpen`): a `TyMap` also
+  // renders `{[string]:i32}`, and this function accepts that shape too.
+  if !nameIsBraceSpanEnds(nm) { return false }
+  // Uses `tyTopIndexOf` (quote-aware, escape-aware) rather than a naive brace-depth counter:
+  // a literal member like `{a:"}|{"}` can hide a `}` inside a string and mis-close early.
+  tyTopIndexOf(nm, '|', 0, 0) < 0
+}
+
+// —— the rung predicates ——————————————————————————————————————————————————
+// One predicate per converted arm, exported so the rung numbering stays this file's business.
+// Safe against named rows only because `#` cannot open an identifier — `synthRetAnnots` keys
+// by node (`"#" + nodeIx`) while the named loop keys by function name, disjoint by construction.
+
+// The literal set `x is T` asks every element of a list `x` to fit (D4771): `T` is `L[]…[]`
+// over a set `L` of one literal kind, and `recvTy` is a list (or a `oneListUnionRender` union)
+// nested as deep, or -1 when unknown. Pushes the receiver's array at each depth, then its leaf
+// element (-1 each when unknown), and returns `L`; -1 for any other shape, pushing nothing.
+export function listFitLitLeafOf(testTy: i32, recvTy: i32, layers: i32[]): i32 {
+  const known = recvTy >= 0
+  let tt = testTy
+  let rt = recvTy
+  const got: i32[] = []
+  while tt >= 0 && T.tys[tt] is TyArray {
+    if known {
+      if rt >= 0 && oneListUnionRender(rt) != "" {
+        const ru = T.tys[rt]
+        if ru is TyUnion { rt = ru.uMembers[0] }
+      }
+      if rt < 0 { return -1 }
+      const ra = T.tys[rt]
+      if !(ra is TyArray) { return -1 }
+      got.push(rt)
+      rt = ra.aElem
+    } else {
+      got.push(-1)
+    }
+    const ta = T.tys[tt]
+    if ta is TyArray { tt = ta.aElem }
+  }
+  if got.length == 0 || tt < 0 || (known && rt < 0) { return -1 }
+  const members: i32[] = []
+  const lt = T.tys[tt]
+  if lt is TyUnion {
+    for m in lt.uMembers { members.push(m) }
+  } else {
+    members.push(tt)
+  }
+  let kind = ""
+  for m in members {
+    if m < 0 { return -1 }
+    const ml = T.tys[m]
+    if !(ml is TyLit) { return -1 }
+    const mk = if ml.litKind == "str" { "str" } else { "num" }
+    if kind != "" && kind != mk { return -1 }
+    kind = mk
+  }
+  for g in got { layers.push(g) }
+  layers.push(rt)
+  tt
+}
+
+// The number of list layers `recvTy` and `testTy` share before their element types can never
+// meet: two distinct primitives, or a list against a primitive (D4910). -1 when they may meet,
+// or when either is not a list.
+export function listDisjointDepth(recvTy: i32, testTy: i32): i32 {
+  let r = recvTy
+  let t = testTy
+  let d = 0
+  while r >= 0 && t >= 0 {
+    const ra = T.tys[r]
+    const ta = T.tys[t]
+    if !(ra is TyArray) || !(ta is TyArray) { break }
+    r = ra.aElem
+    t = ta.aElem
+    d = d + 1
+  }
+  if d == 0 || r < 0 || t < 0 { return -1 }
+  // The loop left at most one side a list, so a primitive against a list is the other case.
+  const rp = tyPrimNameOf(r)
+  const tp = tyPrimNameOf(t)
+  if rp != null && tp != null && rp != tp { return d }
+  if (
+    (rp != null && T.tys[t] is TyArray)
+    || (tp != null && T.tys[r] is TyArray)
+  ) {
+    return d
+  }
+  // A record lacking a field the tested record names can never fit it (D4962).
+  const ro = T.tys[r]
+  const to = T.tys[t]
+  if ro is TyObj && to is TyObj {
+    for f in to.objFieldNames {
+      if !strListHas(ro.objFieldNames, f) { return d }
+    }
+  }
+  -1
+}
+
+// Whether a binary operator's two operands carry incompatible nominal brands (P1.5). Equal
+// brands — including two un-branded operands, the overwhelming case — are compatible. A
+// syntactic literal on the un-branded side adopts, so only a branded operand meeting a
+// base-typed or differently-branded value reports.
+export function nomBinMixes(lt: i32, rt: i32, lx: i32, rx: i32) {
+  // A HOLE operand carries no brand YET, so deciding here refuses a body whose annotated
+  // spelling runs. The pin re-asks under the substituted types on the same precondition
+  // `binOpDefinedFor` opens with, which is where the answer exists (D1747).
+  if tyHasHole(lt) || tyHasHole(rt) { return false }
+  // A `null` operand against nullable storage is not a brand mix (a newtype over a nullable
+  // admits it). Gated on `tyAdmitsNull` — load-bearing, since this predicate is read twice.
+  if isNullTy(lt) && tyAdmitsNull(rt) { return false }
+  if isNullTy(rt) && tyAdmitsNull(lt) { return false }
+  const ln = nomNameOfTy(lt)
+  const rn = nomNameOfTy(rt)
+  if ln == rn { return false }
+  if ln == "" {
+    if exprIsBrandAdoptingLiteral(lx) { return false }
+  }
+  if rn == "" {
+    if exprIsBrandAdoptingLiteral(rx) { return false }
+  }
+  true
+}
+
+// Whether every type in `ms` is a string literal. A union naming an alias beside `null` stays a
+// box, which its readers under a type parameter depend on (D3198).
+export function allStrLitArms(ms: i32[]): boolean {
+  let i = 0
+  while i < ms.length {
+    if ms[i] < 0 || ms[i] >= T.tys.length { return false }
+    const m = T.tys[ms[i]]
+    if !(m is TyLit) { return false }
+    if m.litKind != "str" { return false }
+    i = i + 1
+  }
+  ms.length > 0
+}
+
+// Whether type `t` is a record type naming some field twice (D3537).
+export function objTyHasDupField(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const o = T.tys[t]
+  if o is TyObj {
+    const ns = o.objFieldNames
+    let i = 1
+    while i < ns.length {
+      let j = 0
+      while j < i {
+        if ns[j] == ns[i] { return true }
+        j = j + 1
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// `x is T` over a JSON-shaped union where `T` is not one of its arms: 1 when the site is an
+// admitted deep walk, -1 when it is not a deep site (the ordinary arm-membership gate runs),
+// 0 when it IS a deep site with no JSON shape — diagnosed here. Uses the receiver's declared
+// union, not the guard's narrowed view, since the emitter only holds the declared one.
+export function jsonReceiverDeclTy(objIx: i32, objTy: i32): i32 {
+  if objIx < 0 { return objTy }
+  let cur = objIx
+  let g = 0
+  while g < 4 {
+    const n = P.nodes[cur]
+    if n is Paren { cur = n.parInner }
+    else if n is Ident { return jsonWidestDeclTy(n.identName, objTy) }
+    else { return objTy }
+    g = g + 1
+  }
+  objTy
+}
+
+// The outermost live shadow banked for `name`, or `objTy`. Not `narDeclaredTy` (which answers
+// the innermost, possibly already-narrowed shadow), and not "the one with the most members" —
+// a complement narrowing is the flattened union, so a most-members rule picks it every time,
+// which is backwards. `popScope`/the epoch keep every row this walks live.
+function jsonWidestDeclTy(name: string, objTy: i32): i32 {
+  let i = 0
+  while i < asgDeclKeys.length {
+    if asgDeclKeys[i] == name {
+      if asgDeclEpochs[i] == narFnEpoch {
+        if asgDeclTys[i] >= 0 { return asgDeclTys[i] }
+      }
+    }
+    i = i + 1
+  }
+  objTy
+}
+
+// Whether no value of `m` can fit the record `ct`: a scalar, literal, list, map or function, or
+// a record missing a field `ct` declares non-nullable.
+export function recNeverFits(m: i32, ct: TyObj): boolean {
+  const mt = T.tys[m]
+  match mt {
+    TyPrim | TyLit | TyArray | TyMap | TyFunc => true
+    TyObj => {
+      let i = 0
+      while i < ct.objFieldNames.length {
+        if (
+          strListIndexOf(mt.objFieldNames, ct.objFieldNames[i]) < 0
+          && !(T.tys[ct.objFieldTypes[i]] is TyNullable)
+        ) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TyNullable | TyUnion | TyErr | TyVar | TyNeg => false
+  }
+}
+
+// Whether narrowing a list `cur` to `chk` keeps its storage: a string list tested against a
+// string literal set holds strings where `chk` holds atoms, so it stays `cur` (D4771).
+export function listFitNarrowKeepsRep(cur: i32, chk: i32): boolean {
+  const layers: i32[] = []
+  const lit = listFitLitLeafOf(chk, nonNullTy(cur), layers)
+  if lit < 0 || tyLitMemberTexts(lit).length == 0 { return true }
+  tyLitMemberTexts(layers[layers.length - 1]).length > 0
+}

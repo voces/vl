@@ -1,0 +1,378 @@
+// `??` and hole casts: the casts on a hole that a later fill must re-ask, the coalesce holes
+// refilled once their inner type resolves, and the dead-coalesce finding.
+// Emptied by `coalReset` and `rcoalReset`. Does not import the checker.
+import { BinExpr, Call, Ident, Index, Member, P, Paren, i32ToStr } from "./ast"
+import {
+  rcoalCode,
+  rcoalCol,
+  rcoalEnd,
+  rcoalLine,
+  rcoalMsg,
+  rcoalTok,
+  rcoalType,
+  rcoalWhy,
+} from "./check_state"
+import {
+  T,
+  TY_ERR,
+  TyNullable,
+  TyVar,
+  tyHasHole,
+  tyIsHole,
+  tyToStrUser,
+} from "./check_types"
+import { parenPeelIx } from "./check_places"
+import { crUnParen, nePopKeyOf } from "./check_narrow_ends"
+import { isNullTy } from "./check_ty_shape"
+import {
+  HD_BINOP,
+  HD_COAL,
+  HD_COALD,
+  HD_ELEM,
+  HD_ELEMV,
+  HD_FLD,
+  HD_GNOT,
+  HD_HWR,
+  HD_PARAM,
+  HD_RET,
+  HD_TVW,
+  hdAlt,
+  hdBase,
+  hdDepth,
+  hdDepthOf,
+  hdField,
+  hdInner,
+  hdKind,
+  hdKindIs,
+  hdRowOfTy,
+  tyVarOwnerOf,
+} from "./check_hole_pins"
+import { narDeclaredTy } from "./check_nar_bank"
+import { jwTokIsGenerated } from "./check_sym_occ"
+import { findingEndCol, findingStartTok } from "./check_bind_rows"
+import { mkTyVarOwned } from "./check_subst"
+
+// The cast's mode ("prop" / "trap" / "null"), its target arena row and spelling, the node,
+// and `T.curRet` as seen at the cast — the enclosing return the propagation must fit, which
+// by the time the call is checked may have been inferred into something the cast never saw.
+export let holeCastMode: string[] = []
+export function holeCastModePush(v: string) { holeCastMode.push(v) }
+
+// The operand's own ident, which must be the parameter's name at the call site: a hole read
+// through anything else (`const b = a ?? 0`) carries a type the pin does not describe.
+export let holeCastVar: string[] = []
+export function holeCastVarPush(v: string) { holeCastVar.push(v) }
+
+// `<holeName>.<ident>` for every hole binding the body assigns to — a write replaces the
+// value the call site's pin describes, so a cast on it afterwards has no adjudicable operand.
+export let holeCastClob: string[] = []
+
+export let holeCastTgtTy: i32[] = []
+export function holeCastTgtTyPush(v: i32) { holeCastTgtTy.push(v) }
+
+export let holeCastTgtName: string[] = []
+export function holeCastTgtNamePush(v: string) { holeCastTgtName.push(v) }
+
+export let holeCastIx: i32[] = []
+export function holeCastIxPush(v: i32) { holeCastIx.push(v) }
+
+export let holeCastRet: i32[] = []
+export function holeCastRetPush(v: i32) { holeCastRet.push(v) }
+
+// D1371 — the parked cast's argument destination: the parameter position and the concrete
+// type the body handed the cast's value to, or -1 when it went somewhere else. The body
+// validated that hand-over at the pre-pin type, so the pin is the first moment the
+// operand's type exists and is where the compare has to be asked again.
+export let holeCastArgN: i32[] = []
+export function holeCastArgNPush(v: i32) { holeCastArgN.push(v) }
+
+export let holeCastArgExp: i32[] = []
+export function holeCastArgExpPush(v: i32) { holeCastArgExp.push(v) }
+
+export let holeCastArgIx: i32[] = []
+export function holeCastArgIxPush(v: i32) { holeCastArgIx.push(v) }
+
+// D3252 — per `??` node whose default is a hole that fit its left's face vacuously, the
+// derived hole (`HD_COALD`) a destination's deferred constraint records in its place; -1 else.
+export let coalDefHole: i32[] = []
+
+// D1589 — a `??` typed against an open hole is a promise, not an answer: `x ?? d` read before
+// the fill takes `nonNullTy` of a `nInner == -1` nullable, which is the hole itself. These
+// arrays hold the `??` node, the hole's arena index and the answer handed back at the read;
+// `fillCoalHoleNodes` re-derives each against the resolved inner and refuses a fill that differs.
+export let chPendNodes: i32[] = []
+
+export let chPendTys: i32[] = []
+
+export let chPendGiven: i32[] = []
+
+// True when `ix` names a place whose current non-nullable type came from a narrowing rather than
+// from its declaration — the exemption the dead-`??` finding needs, so a defensive `??` inside a
+// guard is never reported. A bare name answers from the narrowing bank (either kind); a member or
+// index place answers true unconditionally, over-exempting being the safe direction here.
+export function coalNarrowedPlace(ix: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Paren { return coalNarrowedPlace(n.parInner) }
+  if n is Ident { return narDeclaredTy(n.identName, -1) >= 0 }
+  if n is Member { return true }
+  if n is Index { return true }
+  false
+}
+
+// May a `??` over an open hole answer with its default's type (D1589)? Only for a default that
+// is itself a settled non-null type: a nullable default keeps the whole `??` nullable, and a
+// hole-bearing or error default has no answer to borrow. Everything else falls through to the
+// pre-existing `nonNullTy` path unchanged.
+export function coalHoleDeferOk(rt: i32) {
+  if rt < 0 { return false }
+  if rt == TY_ERR { return false }
+  if isNullTy(rt) { return false }
+  if tyHasHole(rt) { return false }
+  const r = T.tys[rt]
+  if r is TyNullable { return false }
+  true
+}
+
+// Record a `??` whose left operand is still an open A-infer-null hole at typing time, with
+// the answer it received (D1589).
+export function noteCoalHole(at: i32, ty: i32, given: i32) {
+  chPendNodes.push(at)
+  chPendTys.push(ty)
+  chPendGiven.push(given)
+  0
+}
+
+export function rcoalReset() {
+  rcoalLine = []
+  rcoalCol = []
+  rcoalEnd = []
+  rcoalTok = []
+  rcoalType = []
+  rcoalMsg = []
+  rcoalWhy = []
+  rcoalCode = []
+  0
+}
+
+// Record `x ?? d` whose left operand's type admits no `null`: the default is dead.
+// Spans the `??` NODE, exactly where every other diagnostic on that node lands.
+export function recordDeadCoalesce(ix: i32, lt: i32) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
+  const t = P.toks[tk]
+  // An exact repeat (same anchor) is the re-check of one node, not a second finding — the same
+  // de-duplication `tErrCoded` applies to the error tier.
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
+  rcoalTok.push(tk)
+  // User-facing (the finding's message quotes it) — the user render, not the raw one.
+  rcoalType.push(tyToStrUser(lt))
+  rcoalMsg.push("")
+  rcoalWhy.push(coalNonNullWhy(ix))
+  rcoalCode.push("dead-coalesce-default")
+  0
+}
+
+// The narrowing fact that makes `??` node `ix`'s left operand non-null, as a clause, or "" when
+// its declared type does: a first `.pop()` under a non-empty `.length` test (D3558).
+function coalNonNullWhy(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is BinExpr) { return "" }
+  const left = crUnParen(n.binLeft)
+  const key = nePopKeyOf(left)
+  if key == "" { return "" }
+  "the `"
+    + key
+    + ".length` test guarantees this first `"
+    + key
+    + ".pop()` returns a value"
+}
+
+// Whether a `??` whose left operand is `lhs` may join its default apart: a field, an index or a
+// method call's result keeps master's widening, since the emitter reads those at the operand's
+// own rep (D3451).
+export function coalLhsParts(lhs: i32): boolean {
+  const x = parenPeelIx(lhs)
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = P.nodes[x]
+  if n is BinExpr {
+    if n.binOp == "??" { return coalLhsParts(n.binLeft) }
+  }
+  !(P.nodes[x] is Member) && !(P.nodes[x] is Index) && !isMethodCallIx(x)
+}
+
+// Whether node `x` is a call whose callee is a member read (`m.get("k")`).
+function isMethodCallIx(x: i32): boolean {
+  const c = P.nodes[x]
+  if c is Call { return P.nodes[c.callFn] is Member }
+  false
+}
+
+// The type a destination's deferred constraint records for source `ix` typed `ty`: a `??` whose
+// default is a hole types as its left's face in the body, and the pin re-asks it as the concrete
+// `??` types it (`HD_COALD`), so a default the face does not hold is refused there (D3252).
+export function coalPinTy(ix: i32, ty: i32): i32 {
+  if coalDefHole.length == 0 || ix < 0 || ty < 0 { return ty }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= coalDefHole.length { return ty }
+  const d = coalDefHole[p]
+  if d < 0 || !hdKindIs(d, HD_COALD) || tyHasHole(ty) { return ty }
+  d
+}
+
+// Mark the `??` at `ix` as one whose hole default `rt` fit its left's face `face` vacuously.
+export function coalDefNote(ix: i32, face: i32, rt: i32) {
+  const d = mkDerivedHole(HD_COALD, "", face, -1, rt)
+  if d < 0 { return 0 }
+  while coalDefHole.length <= ix { coalDefHole.push(-1) }
+  coalDefHole[ix] = d
+  0
+}
+
+// The hole NAME a derivation renders to. This is the one direction that stays
+// stringly: the name is the hole's IDENTITY — generic bindings, demanded shapes,
+// array demands and alternative rows are all keyed by it — and rendering a type is
+// allowed. Nothing parses it back.
+function hdRenderName(
+  kind: i32,
+  field: string,
+  inner: i32,
+  alt: i32,
+  baseName: string,
+) {
+  if kind == HD_FLD { return "?fld." + field + "." + baseName }
+  if kind == HD_RET { return "?ret." + baseName }
+  if kind == HD_ELEM { return "?elem." + baseName }
+  if kind == HD_ELEMV { return "?elemv." + baseName }
+  if kind == HD_PARAM { return "?arg." + field + "." + baseName }
+  // The fallback type rides the name, like the guarded form's two arena indices: two sites
+  // over the same hole reaching different no-dispatch answers are different holes.
+  if kind == HD_BINOP {
+    return "?binop." + field + "." + i32ToStr(inner) + "." + baseName
+  }
+  // The tested type rides the name because it is the derivation: two `else` arms over one
+  // hole testing different types are different remainders.
+  if kind == HD_GNOT { return "?gnot." + i32ToStr(alt) + "." + baseName }
+  // The default's type rides the name for the same reason: two `??` sites over one hole with
+  // different defaults reach different answers and are different holes.
+  if kind == HD_COAL { return "?coal." + i32ToStr(inner) + "." + baseName }
+  if kind == HD_COALD { return "?coald." + i32ToStr(inner) + "." + baseName }
+  if kind == HD_TVW { return "?tvw." + i32ToStr(inner) + "." + baseName }
+  if kind == HD_HWR { return "?hwr." + i32ToStr(inner) + "." + baseName }
+  "?galt." + i32ToStr(inner) + "." + i32ToStr(alt) + "." + baseName
+}
+
+// MINT a derived hole: a fresh `TyVar` plus the derivation row that says what it
+// derives. `base` must be a hole (every derivation reads off one); -1 when it is
+// not, which every caller treats as "no derived hole here".
+export function mkDerivedHole(
+  kind: i32,
+  field: string,
+  inner: i32,
+  alt: i32,
+  base: i32,
+) {
+  if base < 0 { return -1 }
+  const bt = T.tys[base]
+  if !(bt is TyVar) { return -1 }
+  const ix = mkTyVarOwned(
+    hdRenderName(kind, field, inner, alt, bt.tvName),
+    tyVarOwnerOf(base),
+  )
+  const row = hdKind.length
+  hdKind.push(kind)
+  hdField.push(field)
+  hdInner.push(inner)
+  hdAlt.push(alt)
+  hdBase.push(base)
+  hdDepth.push(hdDepthOf(base) + 1)
+  while hdRowOfTy.length <= ix { hdRowOfTy.push(-1) }
+  hdRowOfTy[ix] = row
+  ix
+}
+
+// The argument the body delivered a parked cast to, recorded so the pin can re-ask the compare
+// the body already passed. `argIx` is the argument node — the cast itself, through parens — so
+// the re-ask anchors exactly where the annotated twin's `argument N:` does. Last write wins.
+export function noteCastArgDest(argIx: i32, argN: i32, exp: i32) {
+  // Free when nothing is parked, which is every call in almost every program — this runs once
+  // per argument of every call, so the peel must sit behind the emptiness test, not in front.
+  if holeCastIx.length < 1 { return 0 }
+  if exp < 0 { return 0 }
+  if tyIsHole(exp) { return 0 }
+  let cix = argIx
+  let peeled = false
+  while !peeled {
+    const cn = P.nodes[cix]
+    if cn is Paren { cix = cn.parInner } else { peeled = true }
+  }
+  let i = 0
+  while i < holeCastIx.length {
+    if holeCastIx[i] == cix {
+      holeCastArgN[i] = argN
+      holeCastArgExp[i] = exp
+      holeCastArgIx[i] = argIx
+    }
+    i = i + 1
+  }
+  0
+}
+
+// True when `ix` is (through parens) an `as` cast this body parked on a hole — a cast whose
+// result type the pin can still widen to `T | null`, so no reader may treat it as settled.
+export function coalParkedHoleCast(ix: i32): boolean {
+  if holeCastIx.length < 1 { return false }
+  let cix = ix
+  let peeled = false
+  while !peeled {
+    const cn = P.nodes[cix]
+    if cn is Paren { cix = cn.parInner } else { peeled = true }
+  }
+  let i = 0
+  while i < holeCastIx.length {
+    if holeCastIx[i] == cix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Record / read a hole binding the body wrote to, by `<holeName>.<ident>`. Idempotent.
+export function noteCastClobber(key: string) {
+  if castClobbered(key) { return 0 }
+  holeCastClob.push(key)
+  0
+}
+
+export function castClobbered(key: string): boolean {
+  let i = 0
+  while i < holeCastClob.length {
+    if holeCastClob[i] == key { return true }
+    i = i + 1
+  }
+  false
+}
+
+export function coalReset() {
+  holeCastMode = []
+  holeCastVar = []
+  holeCastClob = []
+  holeCastTgtTy = []
+  holeCastTgtName = []
+  holeCastIx = []
+  holeCastRet = []
+  holeCastArgN = []
+  holeCastArgExp = []
+  holeCastArgIx = []
+  coalDefHole = []
+  chPendNodes = []
+  chPendTys = []
+  chPendGiven = []
+}

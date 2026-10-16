@@ -1,0 +1,217 @@
+// The getter contract: the rules a getter body keeps, the walk that finds a broken one, and
+// the getter call graph a cycle check reads. Does not import the checker.
+import { BinExpr, Member, P, externLinkOf, getDeclPropOf } from "./ast"
+import { T, TyNullable, TyPrim, tyToStr } from "./check_types"
+import { getSiteFnOf, placeKeyOf } from "./check_places"
+import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { nomErasedTyIx } from "./check_ty_rep"
+import { ES_UNBOUNDED } from "./check_effect_rows"
+import {
+  getFns,
+  getterIntrinsicName,
+  moduleGlobals,
+} from "./check_getter_effects"
+
+// When member node `ix` reads through a nullable getter result, the sentence that says why a
+// null test did not help: a getter read is a call, never a narrowed place.
+export function getterNarrowNote(objTy: i32, ix: i32): string {
+  if objTy < 0 || ix < 0 || ix >= P.nodes.length { return "" }
+  if !(T.tys[objTy] is TyNullable) { return "" }
+  const n = P.nodes[ix]
+  if n is Member {
+    const g = getSiteFnOf(n.memObj)
+    if g == "" { return "" }
+    const p = getDeclPropOf(g)
+    let read = "v." + p
+    const gm = P.nodes[n.memObj]
+    if gm is Member {
+      const base = placeKeyOf(gm.memObj)
+      if base != "" { read = base + "." + p }
+    }
+    return " — `."
+      + p
+      + "` is a getter, and a null test does not narrow a getter read; bind it to a local first: `const "
+      + p
+      + " = "
+      + read
+      + "`, then test `"
+      + p
+      + " != null`"
+  }
+  ""
+}
+
+// The locals of the getter body being walked, and the getter-to-getter reads each body makes
+// (`getEdgeFrom[k]` reads `getEdgeTo[k]`, both registry rows) for the cycle check.
+export let gwLocals: string[] = []
+export function gwLocalsPop(): string | null { gwLocals.pop() }
+export function gwLocalsPush(v: string) { gwLocals.push(v) }
+export function gwLocalsSet(v: string[]) { gwLocals = v }
+
+// The boxed types already refused in the getter being walked, by spelling, so one boxed type
+// is one error however many nodes carry it.
+export let gwBoxedSeen: string[] = []
+export function gwBoxedSeenSet(v: string[]) { gwBoxedSeen = v }
+
+// The callees already refused in the getter being walked: every call to one callee has the
+// same fix, so a callee called three times is one error.
+export let gwSaid: string[] = []
+export function gwSaidPush(v: string) { gwSaid.push(v) }
+export function gwSaidSet(v: string[]) { gwSaid = v }
+
+// The `+` nodes nested inside a concatenation already refused, so `a + b + c` is one error at
+// its outermost `+` while a separate concatenation elsewhere in the body is its own.
+export let gwConcatInner: i32[] = []
+export function gwConcatInnerSet(v: i32[]) { gwConcatInner = v }
+
+// The nodes of the walked getter whose value is discarded — a non-final block statement, and
+// the arms of a statement-position `if` or `match`. Their type is never materialised, so the
+// non-boxing rule does not apply to it.
+export let gwDiscard: i32[] = []
+export function gwDiscardPush(v: i32) { gwDiscard.push(v) }
+export function gwDiscardSet(v: i32[]) { gwDiscard = v }
+
+export let gwRow = -1
+export function gwRowSet(v: i32) { gwRow = v }
+
+export let getEdgeFrom: i32[] = []
+export function getEdgeFromPush(v: i32) { getEdgeFrom.push(v) }
+export function getEdgeFromSet(v: i32[]) { getEdgeFrom = v }
+
+export let getEdgeTo: i32[] = []
+export function getEdgeToPush(v: i32) { getEdgeTo.push(v) }
+export function getEdgeToSet(v: i32[]) { getEdgeTo = v }
+
+// The rules a getter body keeps, one sentence each, for `getterContractErr`'s `rule`.
+export const GW_ALLOC = "a getter must not allocate"
+
+export const GW_LOOP = "a getter must not loop"
+
+export const GW_RECUR = "a getter must not recurse"
+
+export const GW_EFFECT = "a getter must not have side effects"
+
+export const GW_STATE = "a getter must not read mutable state"
+
+export const GW_CALL = "a getter may call only other getters, the single-instruction numeric, load and SIMD intrinsics, and functions that write, allocate and print nothing within the step budget"
+
+export const GW_OTHER = "a getter body may only compute a value from its receiver"
+
+// The most abstract steps one getter read may cost (§D3a-contract, D2061): a getter read is 1
+// plus the read getter's cost, a string-literal compare its literal's length, a branch its
+// dearest arm, and arithmetic, field reads and single-instruction intrinsics 0.
+export const GETTER_STEP_BUDGET = 16
+
+// Whether callee name `nm` is one of those intrinsics and nothing else: no local, module
+// binding, function or extern of the program carries the name.
+export function getterIntrinsicOk(nm: string): boolean {
+  if gwIsLocal(nm) { return false }
+  if moduleGlobals[nm] ?? false { return false }
+  if fnDeclIx.has(nm) { return false }
+  if externLinkOf(nm) >= 0 { return false }
+  getterIntrinsicName(nm)
+}
+
+// Whether `name` is one of the walked getter's own locals (`self` or a `let`/`const` it declared).
+export function gwIsLocal(name: string): boolean {
+  let i = 0
+  while i < gwLocals.length {
+    if gwLocals[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+export function gwDiscarded(ix: i32): boolean {
+  let i = 0
+  while i < gwDiscard.length {
+    if gwDiscard[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True the first time boxed type `ty` is refused in the walked getter, marking it refused.
+export function gwBoxedFirst(ty: i32): boolean {
+  const key = tyToStr(ty)
+  let i = 0
+  while i < gwBoxedSeen.length {
+    if gwBoxedSeen[i] == key { return false }
+    i = i + 1
+  }
+  gwBoxedSeen.push(key)
+  true
+}
+
+export function gwConcatMarkInner(ix: i32) {
+  const u = cwPeel(ix)
+  if u < 0 || u >= P.nodes.length { return 0 }
+  const m = P.nodes[u]
+  if m is BinExpr {
+    if m.binOp == "+" { gwConcatInner.push(u) }
+  }
+  0
+}
+
+export function gwIsCompare(op: string): boolean {
+  op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+// Whether `ty` erases to `f32` or `f64`, whose `%` lowers to the looping `__f64_rem__`.
+export function gwIsFloat(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[nomErasedTyIx(ty)]
+  if t is TyPrim { return t.primName == "f64" || t.primName == "f32" }
+  false
+}
+
+// Each getter registry row's cost, read off its summary row by `getterBudgetCheck`.
+export let gcCost: i32[] = []
+export function gcCostPush(v: i32) { gcCost.push(v) }
+export function gcCostSet(v: i32[]) { gcCost = v }
+
+// Whether a getter cost is over the budget and still a number.
+export function gcIsOver(c: i32): boolean {
+  c > GETTER_STEP_BUDGET && c < ES_UNBOUNDED
+}
+
+// Whether a getter over the step budget reads row `r`.
+export function gcReadByOver(r: i32): boolean {
+  let k = 0
+  while k < getEdgeFrom.length {
+    const from = getEdgeFrom[k]
+    if getEdgeTo[k] == r && from != r && gcIsOver(gcCost[from]) { return true }
+    k = k + 1
+  }
+  false
+}
+
+// Whether registry row `from` reaches row `goal` through getter reads, `from` excluded.
+export function getterReaches(from: i32, goal: i32): boolean {
+  const seen: boolean[] = []
+  let i = 0
+  while i < getFns.length {
+    seen.push(false)
+    i = i + 1
+  }
+  const work: i32[] = []
+  work.push(from)
+  let q = 0
+  while q < work.length {
+    const cur = work[q]
+    q = q + 1
+    let k = 0
+    while k < getEdgeFrom.length {
+      if getEdgeFrom[k] == cur {
+        const nx = getEdgeTo[k]
+        if nx == goal { return true }
+        if !seen[nx] {
+          seen[nx] = true
+          work.push(nx)
+        }
+      }
+      k = k + 1
+    }
+  }
+  false
+}

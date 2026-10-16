@@ -1,0 +1,1332 @@
+// Narrowed paths: the narrowing slot of each place key with its epoch and invalidation, the
+// writes that clobber a narrowing, and the capture rows a nested function reads through.
+// Emptied by `narPathsReset`. Does not import the checker.
+import {
+  constScopes,
+  fnAliasScopes,
+  fnDeclScopes,
+  isConstName,
+  lookup,
+  lookupDepth,
+  scopeDepthsOf,
+} from "./check_scopes"
+import {
+  BinExpr,
+  Block,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  Index,
+  Member,
+  P,
+  elseIfLink,
+  i32ToStr,
+  nodeSpineChildren,
+  nodeToks,
+  opDeclOpOf,
+} from "./ast"
+import { symEnabled } from "./check_state"
+import { i32ListHas } from "./listutil"
+import { T, TyObj, tyIsHole, tyReachesEmptyHole } from "./check_types"
+import { LIST_EVERY_STEP, keyHasPrefix, placeKeyOf } from "./check_places"
+import { crLostPopTo, crLostPush } from "./check_capture_loss"
+import {
+  crAfterBank,
+  crAliasNestDepths,
+  crAliasNestSlots,
+  crAliasWr,
+  crBeforeBank,
+  crCapLossAny,
+  crCapLossBank,
+  crCapRecCount,
+  crCapRecDepths,
+  crCapRecFns,
+  crCapRecHandles,
+  crCapRecNames,
+  crCapRecTys,
+  crFnBases,
+  crFnIxs,
+  crFnNpBases,
+  crFnReBases,
+  crFnRoots,
+  crHandleMemo,
+  crInfoMemo,
+  crNestCallRet,
+  crOpCall,
+  crPendCalls,
+  crPendDepths,
+  crPendNames,
+  crPendNarTys,
+  crProgRoot,
+  crRdIx,
+  crRdRet,
+  crRetCalls,
+  crRetLoops,
+  crRetNames,
+  crRetNarTys,
+  crRetRoots,
+  crRetWideTys,
+  crStmtFns,
+  crStmtIxs,
+  npKillSure,
+} from "./check_capture_rows"
+import {
+  crOpOf,
+  crwAddName,
+  crwEnsure,
+  crwFnHandle,
+  crwFnMentions,
+  crwFnWrites,
+  crwFns,
+  crwMentionsAny,
+  crwUseKinds,
+  crwUseNames,
+  weSplit,
+} from "./check_capture_walks"
+import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { placeRootOf, weUnresDrop } from "./check_write_effects"
+import { hdReadNullAsked, hdRowOf } from "./check_hole_pins"
+import { curFnDeclIx, inferQuiet } from "./check_cursor"
+import { noteMemCstr } from "./check_cstr_rows"
+import { holeShapeOf } from "./check_hole_rows"
+import {
+  NAR_KIND_GUARD,
+  NAR_KIND_POSTGUARD,
+  asgDeclDepths,
+  asgDeclKeys,
+  asgDeclKinds,
+  asgDeclOver,
+  asgDeclTys,
+  narBankPushFrame,
+  narDeclaredTy,
+  narFnEpoch,
+} from "./check_nar_bank"
+import { SCOPE_EOF, symScopePush, symSpanPush } from "./check_sym_occ"
+import { calleeNameOf } from "./check_callee"
+import {
+  crCallBenign,
+  crCurRoot,
+  crFirstBank,
+  crFnBase,
+  crInfoKey,
+  crNameAssignedInRoot,
+  crWidenedAt,
+  crWriteKey,
+} from "./check_capture_widen"
+
+// Flow-narrowed property paths: a stack of `key → type-arena index` entries (`"o.v" → i32`)
+// overlaid while a branch body is checked, with per-scope frame marks so `popScope` unwinds what
+// that scope pushed; bare-name narrowings ride the scope chain instead. `npInvBy` is the
+// invalidation slot, written in place, since a shadowing push would resurrect the narrowing.
+export let npKeys: string[] = []
+export function npKeysPop(): string | null { npKeys.pop() }
+export function npKeysPush(v: string) { npKeys.push(v) }
+
+export let npTys: i32[] = []
+export function npTysPop(): i32 | null { npTys.pop() }
+export function npTysPush(v: i32) { npTys.push(v) }
+
+export let npInvBy: i32[] = []
+export function npInvByPop(): i32 | null { npInvBy.pop() }
+export function npInvByPush(v: i32) { npInvBy.push(v) }
+
+export let npEpochs: i32[] = []
+export function npEpochsPop(): i32 | null { npEpochs.pop() }
+export function npEpochsPush(v: i32) { npEpochs.push(v) }
+
+// Where the emitter retires a slot a CALL invalidated: the statement it retires after, -1 before
+// the loop holding the call, -2 not at all, which keeps every later read refused (D2405).
+export let npSettle: i32[] = []
+export function npSettlePop(): i32 | null { npSettle.pop() }
+export function npSettlePush(v: i32) { npSettle.push(v) }
+export function npSettleSetAt(k: i32, v: i32) { npSettle[k] = v }
+
+// The nested function that first read a slot's narrowing, or -1 (D2402).
+export let npCapBy: i32[] = []
+export function npCapByPop(): i32 | null { npCapBy.pop() }
+export function npCapByPush(v: i32) { npCapBy.push(v) }
+export function npCapBySetAt(k: i32, v: i32) { npCapBy[k] = v }
+
+// 1 when the slot is an assignment's strip of `null` (D1848) rather than a guard's: a nested
+// function reads the place at its declared type, and a write after one is checked against it.
+export let npAsg: i32[] = []
+export function npAsgPop(): i32 | null { npAsg.pop() }
+export function npAsgPush(v: i32) { npAsg.push(v) }
+
+export let npFrames: i32[] = []
+export function npFramesPop(): i32 | null { npFrames.pop() }
+
+// Bare names a write re-narrowed AWAY from the narrowing that covered them. A post-guard
+// residual claims the fall-through path holds the else narrowing, and an arm that wrote a
+// different member falsifies exactly that claim — which under the reads-only rule no type
+// check on the write itself can catch (D1736).
+export let narClobKeys: string[] = []
+export function narClobKeysPush(v: string) { narClobKeys.push(v) }
+export function narClobKeysSet(v: string[]) { narClobKeys = v }
+
+// What each clobbering write left the name at, the type it held just before, and the scope depth
+// it ran at. `checkIfStmtNode` folds them per arm and joins: a write at the arm's OWN depth runs
+// whenever the arm does and decides alone, a deeper one is conditional (D1846).
+export let narClobTys: i32[] = []
+export function narClobTysPush(v: i32) { narClobTys.push(v) }
+export function narClobTysSet(v: i32[]) { narClobTys = v }
+
+export let narClobPrev: i32[] = []
+export function narClobPrevPush(v: i32) { narClobPrev.push(v) }
+export function narClobPrevSet(v: i32[]) { narClobPrev = v }
+
+export let narClobDepths: i32[] = []
+export function narClobDepthsPush(v: i32) { narClobDepths.push(v) }
+export function narClobDepthsSet(v: i32[]) { narClobDepths = v }
+
+// Whether the write RETIRED the narrowing, as against writing a member it already allowed. Only
+// a retiring write can falsify a post-guard residual; the arm join reads every row (D1846).
+export let narClobRetired: i32[] = []
+export function narClobRetiredPush(v: i32) { narClobRetired.push(v) }
+export function narClobRetiredSet(v: i32[]) { narClobRetired = v }
+
+// The scope depth of the binding each row is about, or -1 for whatever the name resolves to. A
+// call under a shadowing declaration retires a binding the name does not reach there (D3020).
+export let narClobBind: i32[] = []
+export function narClobBindPush(v: i32) { narClobBind.push(v) }
+export function narClobBindSet(v: i32[]) { narClobBind = v }
+
+// The binding (`narBindDepthOf`) a write row's key resolved to, or -1 for a row about any.
+export let narClobDecl: i32[] = []
+export function narClobDeclPush(v: i32) { narClobDecl.push(v) }
+export function narClobDeclSet(v: i32[]) { narClobDecl = v }
+
+// Did a write at or after `mark` re-narrow `name` away from its narrowing? `checkIfStmtNode`
+// asks it of its own subtree before handing a residual down (D1736).
+export function narClobberedSince(mark: i32, name: string) {
+  let i = mark
+  while i < narClobKeys.length {
+    if narClobHits(i, name) {
+      if narClobRetired[i] == 1 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The scope depth of the binding `name` resolves to here: the innermost layer that declares it,
+// skipping the layers that only narrow an outer binding (`asgDeclOver`). -1 when undeclared.
+function narBindDepthOf(name: string): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return -1 }
+  let j = ds.length - 1
+  while j > 0 {
+    const e = crFirstBank(name, ds[j])
+    if e < 0 || asgDeclOver[e] { return ds[j] }
+    j = j - 1
+  }
+  ds[0]
+}
+
+// The binding a place key's root resolves to here (`narBindDepthOf`).
+export function narKeyBind(key: string): i32 {
+  narBindDepthOf(placeRootOf(key))
+}
+
+// Whether ledger row `i` is about `name` as it resolves here: a row naming a binding counts only
+// where the name reaches that binding.
+export function narClobHits(i: i32, name: string): boolean {
+  if narClobKeys[i] != name { return false }
+  // A row about a same-named binding of an inner block is not about this one.
+  if narClobDecl[i] >= 0 && narClobDecl[i] != narKeyBind(name) { return false }
+  narClobBind[i] < 0 || narClobBind[i] == crBindDepthOf(name)
+}
+
+// The in-place writes a join has to see past: a scope binding retired in place (`atScope`, at
+// depth `narIpAt`) or a path slot's invalidation (`npInvBy[narIpAt]`), with both values.
+export let narIpScope: boolean[] = []
+
+export let narIpAt: i32[] = []
+
+export let narIpName: string[] = []
+
+export let narIpOld: i32[] = []
+
+export let narIpNew: i32[] = []
+
+// Rebinds `name` at scope depth `d` in place, journalled for `narHeadTy`.
+export function narSetScope(d: i32, name: string, ty: i32) {
+  narIpScope.push(true)
+  narIpAt.push(d)
+  narIpName.push(name)
+  narIpOld.push(T.scopes[d][name] ?? -1)
+  narIpNew.push(ty)
+  T.scopes[d][name] = ty
+  0
+}
+
+// Sets path slot `i`'s invalidation in place, journalled for `narHeadTy`.
+export function narSetInv(i: i32, by: i32) {
+  narIpScope.push(false)
+  narIpAt.push(i)
+  narIpName.push("")
+  narIpOld.push(npInvBy[i])
+  narIpNew.push(by)
+  npInvBy[i] = by
+  0
+}
+
+// Applies journal row `j`'s old value (`undo`) or its new one, when it touches a scope or slot
+// that existed at `f`'s head.
+export function narIpApply(f: IfChk, j: i32, undo: boolean) {
+  let v = narIpNew[j]
+  if undo { v = narIpOld[j] }
+  const at = narIpAt[j]
+  if narIpScope[j] {
+    if at < f.headDepth && v >= 0 { T.scopes[at][narIpName[j]] = v }
+  } else if at < f.headNp {
+    npInvBy[at] = v
+  }
+  0
+}
+
+// A declaration `at` of `name` in an inner block: every live path narrowing rooted at the outer
+// binding stops answering until the block ends, which an invalidated overlay entry says (D3285).
+export function narShadowPaths(name: string, at: i32) {
+  const n0 = npKeys.length
+  const nl = name.length
+  let i = 0
+  while i < n0 {
+    const k = npKeys[i]
+    if (
+      k.length > nl
+      && (k[nl] == '.' || k[nl] == '[')
+      && k.slice(0, nl) == name
+      && narrowedPathIx(k) == i
+    ) {
+      npKeys.push(k)
+      npTys.push(npTys[i])
+      npInvBy.push(at)
+      npEpochs.push(narFnEpoch)
+      npSettle.push(-2)
+      npCapBy.push(-1)
+      npAsg.push(0)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Replace the rows of each key the `if` whose rows start at `mark` joined by its summary row, at
+// the `if`'s own statement depth. An enclosing join then folds one row per key per `if`, which
+// keeps the ledger linear in the function however deep the nesting.
+export function narCompactIf(
+  mark: i32,
+  sumKeys: string[],
+  sumTys: i32[],
+  sumPrev: i32[],
+  sumRet: i32[],
+) {
+  if sumKeys.length == 0 { return 0 }
+  const joined: {[string]: boolean} = Map()
+  let s = 0
+  while s < sumKeys.length {
+    joined[sumKeys[s]] = true
+    s = s + 1
+  }
+  let w = mark
+  let i = mark
+  while i < narClobKeys.length {
+    const nm = narClobKeys[i]
+    if !((joined[nm] ?? false) && narClobHits(i, nm)) {
+      narClobKeys[w] = nm
+      narClobTys[w] = narClobTys[i]
+      narClobPrev[w] = narClobPrev[i]
+      narClobDepths[w] = narClobDepths[i]
+      narClobRetired[w] = narClobRetired[i]
+      narClobBind[w] = narClobBind[i]
+      narClobDecl[w] = narClobDecl[i]
+      w = w + 1
+    }
+    i = i + 1
+  }
+  while narClobKeys.length > w {
+    narClobKeys.pop()
+    narClobTys.pop()
+    narClobPrev.pop()
+    narClobDepths.pop()
+    narClobRetired.pop()
+    narClobBind.pop()
+    narClobDecl.pop()
+  }
+  s = 0
+  while s < sumKeys.length {
+    narClobKeys.push(sumKeys[s])
+    narClobTys.push(sumTys[s])
+    narClobPrev.push(sumPrev[s])
+    narClobDepths.push(T.scopes.length)
+    narClobRetired.push(sumRet[s])
+    narClobBind.push(-1)
+    narClobDecl.push(narKeyBind(sumKeys[s]))
+    s = s + 1
+  }
+  0
+}
+
+// The bank slot of the live guard or post-guard narrowing of `name`, or -1: the narrowings under
+// which a write the declaration admits is accepted and re-narrows the name.
+export function narGuardSlot(name: string) {
+  const d = lookupDepth(name)
+  if d < 0 { return -1 }
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclKeys[i] == name && asgDeclDepths[i] == d {
+      const k = asgDeclKinds[i]
+      if k == NAR_KIND_GUARD || k == NAR_KIND_POSTGUARD { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+// The type a write to the guard-narrowed name `name` is checked against: the widest layer of its
+// narrowing chain in the current function. A loop barrier caps it at the type the name had when
+// the loop began, since the reads before the write run again; -1 when every layer is outside it.
+export function narWriteStorage(name: string): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return -1 }
+  const base = crFnBase()
+  let bar = 0
+  if reScopeBases.length > 0 { bar = reScopeBases[reScopeBases.length - 1] }
+  let widest = -1
+  let j = ds.length - 1
+  while j >= 0 {
+    const d = ds[j]
+    if d < base { return widest }
+    const e = crFirstBank(name, d)
+    if e < 0 { return widest }
+    if d < bar {
+      if widest < 0 { return -1 }
+      return T.scopes[d][name] ?? -1
+    }
+    widest = asgDeclTys[e]
+    j = j - 1
+  }
+  widest
+}
+
+// The overlay slot of the innermost narrowing of `key`, or -1 when no live scope narrowed it. The
+// single walk the three overlay questions share — the type, the invalidator, and how the slot
+// sits relative to a loop barrier.
+export function narrowedPathIx(key: string) {
+  let i = npKeys.length - 1
+  while i >= 0 {
+    if npKeys[i] == key { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// `narrowedPathTy` without the capture question, for reading a prefix's type while a call's
+// write summary is being matched — which that question itself asks.
+export function narrowedPathTyRaw(key: string) {
+  const i = narrowedPathIx(key)
+  if i < 0 { return -1 }
+  if npInvBy[i] >= 0 { return -1 }
+  npTys[i]
+}
+
+// Re-execution barriers: the scope depth and overlay height at entry to each open loop body and
+// nested-function body, innermost last. A narrowing retires at a falsifying write because the
+// statements after the write run with it gone — a statement-order fact a loop body breaks, since
+// the reads textually before the write run again after it. Below the mark a write keeps its reject.
+export let reScopeBases: i32[] = []
+
+export let reNpBases: i32[] = []
+
+// Per barrier, where `crLoopRdSlots` stood when its loop began: the path reads the loop may re-run.
+export let reRdMarks: i32[] = []
+
+// The operand of the `is` test being checked, whose read is a test rather than a use.
+export let crIsObj = -1
+export function crIsObjSet(v: i32) { crIsObj = v }
+
+export let crLoopRdSlots: i32[] = []
+
+export let crLoopRdNodes: i32[] = []
+
+// Enter or leave a re-execution barrier. Call before the body's narrowing scope is pushed, so a
+// narrowing the loop's own condition contributes counts as inside.
+// `rdMark` is where the loop's re-run reads begin: before a `while` condition, which runs again.
+export function pushReBarrier(rdMark: i32) {
+  reScopeBases.push(T.scopes.length)
+  reNpBases.push(npKeys.length)
+  reRdMarks.push(rdMark)
+  0
+}
+
+export function popReBarrier() {
+  if reScopeBases.length > 0 {
+    reScopeBases.pop()
+    reNpBases.pop()
+    // An inner loop's reads run again with every iteration of the loops around it, so they
+    // stay logged until the function's outermost loop closes.
+    const m = reRdMarks[reRdMarks.length - 1]
+    reRdMarks.pop()
+    if reRdMarks.length <= crFnReBase() {
+      while crLoopRdSlots.length > m {
+        crLoopRdSlots.pop()
+        crLoopRdNodes.pop()
+      }
+    }
+  }
+  0
+}
+
+// Whether a bare-name narrowing shadowing at scope depth `depth` sits inside the innermost open
+// barrier — i.e. is re-established every time the write runs.
+function narInsideBarrier(depth: i32) {
+  if reScopeBases.length == 0 { return true }
+  depth >= reScopeBases[reScopeBases.length - 1]
+}
+
+// The same question for a property-path narrowing, by overlay slot.
+export function npInsideBarrier(npIx: i32) {
+  if reNpBases.length == 0 { return true }
+  npIx >= reNpBases[reNpBases.length - 1]
+}
+
+// Whether a live narrowing does overlay the write target but sits below the innermost re-execution
+// barrier — the one reason `writeStorageTy` answers -1 for a place a narrowing covers. Asked only
+// to choose the diagnostic: the write is refused either way, but "cannot assign null to i32" says
+// nothing about why the same write one block out is fine.
+export function writeBarredByLoop(ix: i32) {
+  const n = P.nodes[ix]
+  if n is Ident {
+    if narGuardSlot(n.identName) < 0 { return false }
+    if !narInsideBarrier(lookupDepth(n.identName)) { return true }
+    // A layer inside the loop over one outside it: the loop's entry type is what refused.
+    const w = narWriteStorage(n.identName)
+    const depths: i32[] = []
+    return w >= 0 && w != crChainWidest(n.identName, depths)
+  }
+  if n is Member || n is Index {
+    const key = placeKeyOf(ix)
+    if key == "" { return false }
+    const slot = narrowedPathIx(key)
+    if slot < 0 || npInvBy[slot] >= 0 { return false }
+    return !npInsideBarrier(slot)
+  }
+  false
+}
+
+// Per `key|hole`, the type `T` whose `is T` else arm left the hole as the path's fact.
+export let holeElseTested: {[string]: i32} = Map()
+export function holeElseTestedSetAt(k: string, v: i32) { holeElseTested[k] = v }
+
+// Whether a read of the path in overlay slot `slot`, whose narrowing a call ends, reads the
+// declared type: the emitter retires it before the loop, or after a statement that has closed.
+function npSettledAt(slot: i32): boolean {
+  const st = npSettle[slot]
+  if st == -1 { return true }
+  if st < 0 { return false }
+  !i32ListHas(crStmtIxs, st)
+}
+
+// The overlay slot a read of `key` resolves through when a call has ended its narrowing and the
+// read may proceed at the declared type, or -1 when the read is refused or not so ended.
+function pathCallSettledSlot(key: string): i32 {
+  const i = narrowedPathIx(key)
+  if i < 0 { return -1 }
+  const by = npInvBy[i]
+  if by < 0 || pathRetiredByAssign(by) { return -1 }
+  if npSettledAt(i) { return i }
+  -1
+}
+
+// Whether the read at `ix` of `key`, whose narrowing the node `by` ended, reads the declared
+// type. A read a call's retirement let through is remembered for the misuse note.
+export function pathReadsDeclared(key: string, by: i32, ix: i32): boolean {
+  if pathRetiredByAssign(by) { return true }
+  // A hole's field reads its own hole after the narrowing ends, which the pin then re-asks (D3197).
+  const hs = narrowedPathIx(key)
+  if hs >= 0 && tyIsHole(npTys[hs]) { return true }
+  const slot = pathCallSettledSlot(key)
+  if slot < 0 { return false }
+  let r = crRetNames.length - 1
+  while r >= 0 && crStmtIxs.length > 0 {
+    if crRetNames[r] == key && crRetCalls[r] == by {
+      crRdRet.push(r)
+      crRdIx.push(ix)
+      return true
+    }
+    r = r - 1
+  }
+  true
+}
+
+// A path read under a narrowing made outside an enclosing loop, logged while inside the loop so a
+// call later in the loop that may write the path can find the reads it would falsify on the next
+// iteration.
+export function crNoteLoopRead(key: string, ix: i32) {
+  if reScopeBases.length <= crFnReBase() { return 0 }
+  if ix == crIsObj { return 0 }
+  const slot = narrowedPathIx(key)
+  if slot < 0 { return 0 }
+  if slot >= reNpBases[reNpBases.length - 1] { return 0 }
+  crLoopRdSlots.push(slot)
+  crLoopRdNodes.push(ix)
+  0
+}
+
+// A read of a bare name whose captured narrowing `crCaptureLosesNarrowing` dropped (D2529).
+export function crNoteLostName(name: string, ix: i32) {
+  if !crCapLossAny || crFnIxs.length == 0 { return 0 }
+  const fnIx = crFnIxs[crFnIxs.length - 1]
+  const lost = crCapLossBank[fnIx] ?? ""
+  if lost == "" || lost.indexOf("," + name + ",") < 0 { return 0 }
+  // Only a captured binding: a local of the same name is the function's own.
+  const bd = narBindDepthOf(name)
+  if bd >= crFnBase() && !crWidenedAt(name, bd) { return 0 }
+  crLostPush(name, ix, fnIx, crFnBases.length, true)
+  0
+}
+
+// Enter a function body, before its scope is pushed. A registered top-level function is its own
+// root; a nested function or a lambda reads the closures of the root it sits in.
+export function crFnEnter(fnIx: i32) {
+  weUnresDrop()
+  crFnIxs.push(fnIx)
+  crFnBases.push(T.scopes.length)
+  crFnNpBases.push(npKeys.length)
+  crFnReBases.push(reScopeBases.length)
+  let root = crProgRoot
+  if crFnRoots.length > 0 { root = crFnRoots[crFnRoots.length - 1] }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    if fd.fnName != "" && (fnDeclIx[fd.fnName] ?? -1) == fnIx { root = fnIx }
+  }
+  crFnRoots.push(root)
+  0
+}
+
+export function crFnLeave() {
+  weUnresDrop()
+  if crFnBases.length > 0 {
+    crFnIxs.pop()
+    crFnBases.pop()
+    crFnRoots.pop()
+    crFnNpBases.pop()
+    crFnReBases.pop()
+  }
+  while (
+    crAliasNestDepths.length > 0
+    && crAliasNestDepths[crAliasNestDepths.length - 1] > crFnBases.length
+  ) {
+    const ns = crAliasNestSlots[crAliasNestSlots.length - 1]
+    if ns >= 0 && ns < npInvBy.length {
+      const nb = npInvBy[ns]
+      if (crAliasWr[nb] ?? false) || (crNestCallRet[nb] ?? false) {
+        narSetInv(ns, -1)
+      }
+    }
+    crAliasNestSlots.pop()
+    crAliasNestDepths.pop()
+  }
+  while (
+    crCapRecDepths.length > 0
+    && crCapRecDepths[crCapRecDepths.length - 1] > crFnBases.length
+  ) {
+    const ph = crCapRecHandles[crCapRecHandles.length - 1]
+    crCapRecCount[ph] = (crCapRecCount[ph] ?? 1) - 1
+    crCapRecDepths.pop()
+    crCapRecHandles.pop()
+    crCapRecNames.pop()
+    crCapRecTys.pop()
+    crCapRecFns.pop()
+  }
+  crLostPopTo(crFnBases.length)
+  0
+}
+
+export function crFnNpBase(): i32 {
+  if crFnNpBases.length == 0 { return 0 }
+  crFnNpBases[crFnNpBases.length - 1]
+}
+
+export function crFnReBase(): i32 {
+  if crFnReBases.length == 0 { return 0 }
+  crFnReBases[crFnReBases.length - 1]
+}
+
+// Whether a closure of the current root writes `name`, and whether one that can reach such a
+// writer escaped: 0 / 1 / 2 as `crInfoMemo` documents. A reacher is a function that writes the
+// name or mentions a reacher's name; it escapes when it is unbound, or its name is used other
+// than as a callee or an assignment target, inside another reacher or not.
+function crInfoOf(name: string): i32 {
+  const root = crCurRoot()
+  const wk = crWriteKey(name)
+  const key = i32ToStr(root) + "#" + wk
+  const hit = crInfoMemo[key]
+  if hit is i32 { return hit }
+  crwEnsure(root)
+  let info = 0
+  let handles = ","
+  const reach: boolean[] = []
+  let any = false
+  let j = 0
+  while j < crwFns.length {
+    const fw = crwFnWrites[j]
+    // A binding local to a nested function is written also by writes resolving there.
+    const w = fw.has(name) || fw.has(wk)
+    reach.push(w)
+    if w {
+      any = true
+      if crwFnHandle[j] != "" { handles = crwAddName(handles, crwFnHandle[j]) }
+    }
+    j = j + 1
+  }
+  if any {
+    info = 1
+    let changed = true
+    while changed {
+      changed = false
+      let q = 0
+      while q < crwFns.length {
+        if !reach[q] && crwMentionsAny(crwFnMentions[q], handles) {
+          reach[q] = true
+          changed = true
+          if crwFnHandle[q] != "" {
+            handles = crwAddName(handles, crwFnHandle[q])
+          }
+        }
+        q = q + 1
+      }
+    }
+    let e = 0
+    while e < crwFns.length && info == 1 {
+      if reach[e] && crwFnHandle[e] == "" { info = 2 }
+      e = e + 1
+    }
+    let u = 0
+    while u < crwUseNames.length && info == 1 {
+      if handles.indexOf("," + crwUseNames[u] + ",") >= 0 {
+        if crwUseKinds[u] == 0 { info = 2 }
+      }
+      u = u + 1
+    }
+  }
+  crInfoMemo[key] = info
+  crHandleMemo[key] = handles
+  info
+}
+
+// The bare-name half of `callMayWrite`: the call names a function that can reach a writer of
+// `name`, or a writer escaped and the call is not one that provably runs none of it. An operator
+// that dispatched to a declaration is a call naming no function, so only an escape reaches.
+export function crCallReaches(callIx: i32, name: string): boolean {
+  if crCallReachesInRoot(callIx, name) { return true }
+  crGlobalReaches(callIx, name)
+}
+
+// A module binding narrowed inside a function can be written by any function of the program,
+// so the reachability rule is asked again with the whole module as the root (D2401).
+function crGlobalReaches(callIx: i32, name: string): boolean {
+  if !crNameIsGlobal(name) { return false }
+  crFnRoots.push(crProgRoot)
+  const r = crCallReachesInRoot(callIx, name)
+  crFnRoots.pop()
+  r
+}
+
+// Whether the binding `name` reads, under its narrowing layers, is declared outside every
+// function body being checked — a module binding, while the root is a function.
+function crNameIsGlobal(name: string): boolean {
+  if crFnBases.length == 0 || crCurRoot() == crProgRoot { return false }
+  const ds = scopeDepthsOf[name]
+  if ds == null { return false }
+  // A narrowing layer, or the declared-type layer `crDeclareWidened` binds, is not a binding.
+  let j = ds.length - 1
+  while j >= 0 {
+    if ds[j] < crFnBases[0] { return true }
+    if crFirstBank(name, ds[j]) < 0 && !crWidenedAt(name, ds[j]) {
+      return false
+    }
+    j = j - 1
+  }
+  false
+}
+
+// Whether any function may write `key`: for a bare name, a closure of the root, or any function
+// of the module for a module binding; a path's writers are anywhere, so the per-call question
+// alone decides (D2401, D2404).
+export function crMayBeWritten(key: string): boolean {
+  if isPathKey(key) { return true }
+  if isConstName(key) { return false }
+  if crInfoOf(key) > 0 { return true }
+  if !crNameIsGlobal(key) { return false }
+  crFnRoots.push(crProgRoot)
+  const info = crInfoOf(key)
+  crFnRoots.pop()
+  info > 0
+}
+
+function crCallReachesInRoot(callIx: i32, name: string): boolean {
+  if callIx < 0 || callIx >= P.nodes.length { return false }
+  const cn = P.nodes[callIx]
+  if cn is Call { return crCallNodeReaches(cn, callIx, name) }
+  const info = crInfoOf(name)
+  if info == 0 { return false }
+  if info == 2 { return true }
+  crOpIsReacher(crOpOf(callIx), name)
+}
+
+// Is a declaration of operator `op` (`+`, or a receiver-keyed `+@P`) a reacher of `name`?
+// Asked of every declaration of `op`, since which one dispatched is the receiver's business.
+function crOpIsReacher(op: string, name: string): boolean {
+  if op == "" { return true }
+  const hs = weSplit(crHandleMemo[crInfoKey(name)] ?? ",")
+  let i = 0
+  while i < hs.length {
+    if hs[i] == op || opDeclOpOf(hs[i]) == op { return true }
+    i = i + 1
+  }
+  false
+}
+
+// `crCallReaches` for a `Call`: its callee named by a reacher's name (bare or as a method), a
+// function written in place and called at once, or an escape the call does not rule out.
+function crCallNodeReaches(cn: Call, callIx: i32, name: string): boolean {
+  const info = crInfoOf(name)
+  if info == 0 { return false }
+  const hs = crHandleMemo[crInfoKey(name)] ?? ","
+  const cname = calleeNameOf(callIx)
+  if cname != "?" && hs.indexOf("," + cname + ",") >= 0 { return true }
+  if P.nodes[cn.callFn] is FuncDecl { return true }
+  info == 2 && !crCallBenign(cn, callIx, name)
+}
+
+// The type `name` reads at once every narrowing layer of the current function is gone, or -1
+// when the innermost binding is not a narrowing. Fills `depths` with the layers to rewrite.
+export function crChainWidest(name: string, depths: i32[]): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return -1 }
+  const base = crFnBase()
+  let widest = -1
+  let j = ds.length - 1
+  while j >= 0 {
+    const d = ds[j]
+    if d < base { return widest }
+    const e = crFirstBank(name, d)
+    if e < 0 { return widest }
+    widest = asgDeclTys[e]
+    depths.push(d)
+    j = j - 1
+  }
+  widest
+}
+
+// End the narrowing of `name` because of the call at `callIx`, in place, as a falsifying write
+// does. `atLoop` false banks it for the emitter after the statement being checked and refuses a
+// read later in that statement; true banks it before the loop `stmtIx`, which has not begun.
+export function crRetire(
+  name: string,
+  callIx: i32,
+  atLoop: boolean,
+  stmtIx: i32,
+) {
+  crRetireAt(name, callIx, atLoop, stmtIx, !atLoop, -1)
+}
+
+// `crRetire`, with the emitter's bank at `stmtIx` after it (`atLoop` false) or before it, a later
+// read in the statement being checked refused only when `pend`, and the arm-join row about the
+// binding at scope depth `bind`, or -1 for the one the name reaches (`narClobBind`).
+export function crRetireAt(
+  name: string,
+  callIx: i32,
+  atLoop: boolean,
+  stmtIx: i32,
+  pend: boolean,
+  bind: i32,
+) {
+  const depths: i32[] = []
+  const wide = crChainWidest(name, depths)
+  if wide < 0 { return 0 }
+  const cur = lookup(name)
+  if cur < 0 { return 0 }
+  if cur == wide {
+    // Already wide here, typically because a sibling arm retired it in place; the path this
+    // call is on still ends wide, and the join has to see that (D3285).
+    narClobKeys.push(name)
+    narClobTys.push(wide)
+    narClobPrev.push(wide)
+    narClobDepths.push(T.scopes.length)
+    narClobRetired.push(0)
+    narClobBind.push(bind)
+    narClobDecl.push(-1)
+    return 0
+  }
+  let k = 0
+  while k < depths.length {
+    narSetScope(depths[k], name, wide)
+    k = k + 1
+  }
+  // The arm join and the post-guard residual read this row exactly as a retiring write's. Its
+  // entry type is the widest, not `cur`: a call in a condition retires a narrowing that only
+  // part of the condition held, which is no type the `if` itself begins at.
+  narClobKeys.push(name)
+  narClobTys.push(wide)
+  narClobPrev.push(wide)
+  narClobDepths.push(T.scopes.length)
+  narClobRetired.push(1)
+  narClobBind.push(bind)
+  narClobDecl.push(-1)
+  crRetNames.push(name)
+  crRetCalls.push(callIx)
+  crRetNarTys.push(cur)
+  crRetWideTys.push(wide)
+  crRetRoots.push(crCurRoot())
+  crRetLoops.push(atLoop)
+  if atLoop {
+    crBeforeBank[stmtIx] = crwAddName(crBeforeBank[stmtIx] ?? ",", name)
+  } else {
+    if pend {
+      crPendNames.push(name)
+      crPendCalls.push(callIx)
+      crPendNarTys.push(cur)
+      crPendDepths.push(crStmtIxs.length)
+    }
+    crAfterBank[stmtIx] = crwAddName(crAfterBank[stmtIx] ?? ",", name)
+  }
+  0
+}
+
+// Overlay slots holding a field of a bare name narrowed to a record, with that name: the
+// narrowing holds only while the field does, so a write that ends the path ends the name.
+export let nfSlots: i32[] = []
+export function nfSlotsPop(): i32 | null { nfSlots.pop() }
+export function nfSlotsPush(v: i32) { nfSlots.push(v) }
+
+export let nfNames: string[] = []
+export function nfNamesPop(): string | null { nfNames.pop() }
+export function nfNamesPush(v: string) { nfNames.push(v) }
+
+// Whether overlay slot `slot` is a field entry of a narrowed name: the place stores what the
+// name's declared type does, which its narrowed type does not say.
+export function narFitSlot(slot: i32): boolean { narFitNameOf(slot) != "" }
+
+// Whether the overlay key `k` is a companion entry of the bare name `name`: a field or an element.
+function narFitKeyOf(k: string, name: string): boolean {
+  keyHasPrefix(k, name + ".") || keyHasPrefix(k, name + LIST_EVERY_STEP)
+}
+
+// The bare name whose field entry overlay slot `slot` is, or "" when it is a written path.
+export function narFitNameOf(slot: i32): string {
+  let j = nfSlots.length - 1
+  while j >= 0 {
+    if (
+      nfSlots[j] == slot
+      && slot < npKeys.length
+      && narFitKeyOf(npKeys[slot], nfNames[j])
+    ) {
+      return nfNames[j]
+    }
+    j = j - 1
+  }
+  ""
+}
+
+// End the bare name a field entry in overlay slot `slot` stands for, as the write or call at
+// `atIx` ended the entry: before the loop `loopIx` when it is not -1, else after the open statement.
+export function narFitRetire(slot: i32, atIx: i32, loopIx: i32) {
+  let j = nfSlots.length - 1
+  while j >= 0 {
+    if (
+      nfSlots[j] == slot
+      && slot < npKeys.length
+      && narFitKeyOf(npKeys[slot], nfNames[j])
+    ) {
+      if loopIx >= 0 {
+        crRetire(nfNames[j], atIx, true, loopIx)
+      } else if (
+        crStmtIxs.length > 0
+        && crStmtFns[crStmtFns.length - 1] == crFnBases.length
+      ) {
+        crRetire(nfNames[j], atIx, false, crStmtIxs[crStmtIxs.length - 1])
+      }
+    }
+    j = j - 1
+  }
+  0
+}
+
+// Whether the scope layer `d` of `name` is a narrowing rather than a declaration.
+function crIsNarrowLayer(name: string, d: i32): boolean {
+  crFirstBank(name, d) >= 0 || crWidenedAt(name, d)
+}
+
+// The height of the scope-depth list of `name` down to its innermost binding declared in the
+// current function that an inner declaration shadows and that is itself narrowed, or -1. The
+// layers above that height are the shadowing declarations and their own narrowings (D3020).
+export function crShadowedHeight(name: string, from: i32): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return -1 }
+  const base = crFnBase()
+  let j = from - 1
+  while j >= 0 && ds[j] >= base && crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  if j < 0 || ds[j] < base { return -1 }
+  while j >= 0 && ds[j] >= base && !crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  if j < 0 || ds[j] < base { return -1 }
+  j + 1
+}
+
+// The scope depth of the binding `name` reads through its narrowing layers; the outermost layer
+// when every one is banked, since the declaration's own scope may bank a narrowing too.
+export function crBindDepthOf(name: string): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return -1 }
+  let j = ds.length - 1
+  while j > 0 && crIsNarrowLayer(name, ds[j]) { j = j - 1 }
+  ds[j]
+}
+
+// Whether `name` is the target of an assignment anywhere in the current root, or anywhere in the
+// program for a module binding.
+export function crNameAssigned(name: string): boolean {
+  if crNameAssignedInRoot(name) { return true }
+  if !crNameIsGlobal(name) { return false }
+  crFnRoots.push(crProgRoot)
+  const r = crNameAssignedInRoot(name)
+  crFnRoots.pop()
+  r
+}
+
+// Whether the subtree at `ix` assigns the place keyed `key` or a place it lies below.
+export function crSubtreeAssigns(ix: i32, key: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const tk = placeKeyOf(n.binLeft)
+      if tk == "" && isPathKey(key) { return true }
+      if tk != "" {
+        if (
+          key == tk
+          || keyHasPrefix(key, tk + ".")
+          || keyHasPrefix(key, tk + "[")
+        ) {
+          return true
+        }
+      }
+    }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crSubtreeAssigns(kids[k], key) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// Did an assignment, rather than a call, retire this narrowing? Both causes write the same
+// `npInvBy` column and need different answers, so the question has one home. A direct `w.f = e` is
+// a statement the emit walk passes over exactly as it passes `f = e`, and the emit half retires
+// it, so the call cause keeps the refusal and the assignment cause reads at the declared type.
+export function pathRetiredByAssign(byIx: i32) {
+  if byIx < 0 { return false }
+  // An operator that dispatched to a declaration is a call, whatever node spells it (D2400), and
+  // so is a write through an alias, which the emitter retires as it retires a call's (D2584).
+  if crOpCall[byIx] ?? false { return false }
+  if crAliasWr[byIx] ?? false { return false }
+  !(P.nodes[byIx] is Call)
+}
+
+// Whether the path at `placeIx` is already held at `inner` by a live overlay: the else arm of a
+// null test restates it as its own fact, so a then arm that retires the overlay in place does not
+// leave the else arm reading at storage while the emitter's else push still narrows (D3318).
+export function narPathHeldNonNull(placeIx: i32, inner: i32): boolean {
+  const key = placeKeyOf(placeIx)
+  if key == "" || !isPathKey(key) { return false }
+  narrowedPathTyRaw(key) == inner
+}
+
+// Whether a narrowing key is a path (`o.v`, `xs[0]`, `o.xs[1].v`) rather than a bare name — which
+// is what decides overlay entry against scope shadow in `applyNarrows`. `[` counts: with only `.`
+// tested, a fact keyed `xs[0]` installs as a bare-name scope shadow under the name `"xs[0]"`, a
+// binding no reader looks up, since every reader of an index place asks the `npKeys` overlay.
+export function isPathKey(s: string) {
+  let i = 0
+  while i < s.length {
+    if s[i] == 46 {
+      return true // '.'
+    }
+    if s[i] == 91 {
+      return true // '['
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The start char offset of a scope-owning node (the `{`/`for` token), or `-1`. Only the node kinds
+// that open a lexical scope are handled — block bodies and the two `for` forms; another owner
+// falls back to "no start", i.e. a full-file sentinel.
+function scopeStartOff(owner: i32) {
+  if owner < 0 || owner >= P.nodes.length { return -1 }
+  const n = P.nodes[owner]
+  if n is Block { return n.pos }
+  if n is ForRange { return n.pos }
+  if n is ForIn { return n.pos }
+  if n is FuncDecl { return n.pos }
+  -1
+}
+
+// The token index whose start offset is exactly `off`, or `-1`. A scope owner's `pos` is a token
+// boundary (`{`/`for`), so this recovers its line and column.
+function tokIxAtStart(off: i32) {
+  if off < 0 { return -1 }
+  // The lexer appends tokens in scan order, so `start` offsets are strictly
+  // increasing — binary search (this runs per scope push in LSP mode, and a
+  // linear scan over all tokens made scope collection quadratic).
+  let lo = 0
+  let hi = P.toks.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const s = P.toks[mid].start
+    if s == off { return mid }
+    if s < off { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  -1
+}
+
+// Push the open-scope span for `owner`, the scope-owning node, in lockstep with the decl-scope
+// map. The end is the owner's anchor (last) token — the closing `}` for a block — and the start
+// its first token. `owner < 0`, a narrowing-only scope that never holds a binding, pushes a
+// full-file sentinel.
+function pushScopeSpan(owner: i32) {
+  let startL = 1
+  let startC = 0
+  let endL = SCOPE_EOF
+  let endC = 0
+  if owner >= 0 {
+    const so = scopeStartOff(owner)
+    const stk = tokIxAtStart(so)
+    if stk >= 0 {
+      const st = P.toks[stk]
+      startL = st.line
+      startC = st.col
+    }
+    if owner < nodeToks.length {
+      const etk = nodeToks[owner]
+      if etk >= 0 && etk < P.toks.length {
+        const et = P.toks[etk]
+        endL = et.line
+        endC = et.col + et.text.length
+      }
+    }
+  }
+  symSpanPush(startL, startC, endL, endC)
+}
+
+// Enter a new lexical scope (push a fresh name→type map). Marks the current
+// narrowed-path overlay depth so `popScope` unwinds entries pushed inside.
+// `owner` is the scope-owning node (its source span bounds visibility for the
+// LSP scope query); `-1` for a narrowing-only overlay that holds no binding.
+export function pushScope(owner: i32) {
+  T.scopes.push(Map())
+  constScopes.push(Map())
+  fnDeclScopes.push(Map())
+  fnAliasScopes.push(Map())
+  npFrames.push(npKeys.length)
+  narBankPushFrame()
+  symScopePush()
+  if symEnabled != 0 { pushScopeSpan(owner) }
+  0
+}
+
+// Does the return value `ix`, of natural type `t`, have the annotated type only by something the
+// un-annotated spelling builds differently: an open collection hole the annotation pins, a read
+// through a narrowing, a call of the function itself, or a call through a binding the body
+// reassigns (D3800)?
+export function retSiteTypedByAnnot(ix: i32, t: i32): boolean {
+  if t >= 0 && tyReachesEmptyHole(t, 8) { return true }
+  const p = cwPeel(ix)
+  if p < 0 || p >= P.nodes.length || curFnDeclIx < 0 { return false }
+  if narDeclaredTy(identNameAt(p), -1) >= 0 { return true }
+  const f = P.nodes[curFnDeclIx]
+  const callee = callIdentName(p)
+  if callee == "" || !(f is FuncDecl) { return false }
+  if callee == f.fnName { return true }
+  lookupDepth(callee) >= 0 && crSubtreeAssigns(f.fnBody, callee)
+}
+
+// The name a bare identifier at `ix` reads, or "".
+export function identNameAt(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName }
+  ""
+}
+
+// The name a call at `ix` calls when its callee is a bare identifier, or "".
+function callIdentName(ix: i32): string {
+  const n = P.nodes[ix]
+  if n is Call { return identNameAt(n.callFn) }
+  ""
+}
+
+// The `memCstr.prop` of a member read off a derived hole (`hdReadNullAsked`), before the
+// member's name. The pin asks only whether the receiver admits `null`; any other floor stays
+// unasked, since an `is` test on such a hole does not narrow it in the body (D3216).
+export const MC_NULL_READ_MARK = "?."
+
+// Records a member read off a derived hole a `null` could reach, so the pin refuses `.v` on
+// `H | null` as the direct spelling does (D3287). A null test narrows the read to the hole's
+// non-null face (`HD_GNOT`), which is not recorded, so a guarded read still runs.
+export function noteNullReadCstr(recv: i32, prop: string, ix: i32, place: i32) {
+  if inferQuiet || !killedNarrowingSure(place) { return 0 }
+  if hdReadNullAsked(hdRowOf(recv)) {
+    noteMemCstr(recv, MC_NULL_READ_MARK + prop, ix, false)
+  }
+  0
+}
+
+// A hole's field, element or result passed to a parameter whose body reads its members: the
+// pin asks the argument about `null`, as `holeDemandOk` asks a concrete one (D3300).
+export function noteHoleArgNullRead(name: string, at: i32, ix: i32) {
+  const shape = holeShapeOf(name)
+  if shape < 0 { return 0 }
+  const st = T.tys[shape]
+  if st is TyObj {
+    if st.objFieldNames.length > 0 {
+      noteNullReadCstr(at, st.objFieldNames[0], ix, ix)
+    }
+  }
+  0
+}
+
+// Whether the place at node `place` is not a narrowing this function ended by a verdict a pin
+// could overturn. A place never narrowed, or narrowed and still live, answers true.
+function killedNarrowingSure(place: i32): boolean {
+  if place < 0 || place >= P.nodes.length { return true }
+  const key = placeKeyOf(place)
+  if key == "" { return true }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key {
+      if npInvBy[s] < 0 { return true }
+      return npKillSure[i32ToStr(npInvBy[s]) + "|" + key] ?? false
+    }
+    s = s - 1
+  }
+  true
+}
+
+// Whether a write or a call ended the innermost narrowing of the place `place` in this
+// function; false when none covers it.
+export function narrowingEndedAt(place: i32): boolean {
+  const key = placeKeyOf(place)
+  if key == "" { return false }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key { return npInvBy[s] >= 0 }
+    s = s - 1
+  }
+  false
+}
+
+// Whether the innermost narrowing of the place `place` in this function is the remainder of an
+// `is` test on a hole (`holeElseTested`) that a write, a call `callKillSure` settles, or a write
+// through an alias ended; false when none covers it.
+export function holeRemainderEndedSure(place: i32): boolean {
+  const key = placeKeyOf(place)
+  if key == "" { return false }
+  let s = npKeys.length - 1
+  let base = crFnNpBase()
+  if base < 0 { base = 0 }
+  while s >= base {
+    if npKeys[s] == key {
+      const by = npInvBy[s]
+      if by < 0 { return false }
+      if (holeElseTested[key + "|" + i32ToStr(npTys[s])] ?? -1) < 0 {
+        return false
+      }
+      if crAliasWr[by] ?? false { return true }
+      return npKillSure[i32ToStr(by) + "|" + key] ?? false
+    }
+    s = s - 1
+  }
+  false
+}
+
+// One `if` link's checker state, carried from its head (condition, narrowing, then arm) to its
+// tail (else arm join, definite assignment, post-guard legs) across the links below it.
+export type IfChk = {
+  ifIx: i32,
+  isElseArm: boolean,
+  pgUpMark: i32,
+  clobMark: i32,
+  ipMark: i32,
+  headDepth: i32,
+  headNp: i32,
+  ifTail: boolean,
+  ifInRetArg: boolean,
+  seedLogMark: i32,
+  seedObsMark: i32,
+  seedObsLit: boolean,
+  thenExits: boolean,
+  tnNames: string[],
+  tnTys: i32[],
+  tnEnt: i32[],
+  enNames: string[],
+  enTys: i32[],
+  enEnt: i32[],
+  altRows: i32[],
+  thenOwnDepth: i32,
+  thenLo: i32,
+  thenHi: i32,
+  thenTy: i32,
+  daFork: i32,
+  daThenAdds: i32[],
+  daThenRems: i32[],
+  daHasElse: boolean,
+  elseOwnDepth: i32,
+  elseLo: i32,
+  exits: boolean, // `stmtAlwaysExits` of this link, set by its tail
+}
+
+export function narPathsReset() {
+  holeElseTested = Map()
+  npKeys = []
+  npTys = []
+  npInvBy = []
+  narIpScope = []
+  narIpAt = []
+  narIpName = []
+  narIpOld = []
+  narIpNew = []
+  npEpochs = []
+  npSettle = []
+  npCapBy = []
+  npAsg = []
+  nfSlots = []
+  nfNames = []
+  npFrames = []
+  narClobKeys = []
+  narClobTys = []
+  narClobPrev = []
+  narClobDepths = []
+  narClobRetired = []
+  narClobBind = []
+  narClobDecl = []
+  reScopeBases = []
+  reNpBases = []
+  reRdMarks = []
+  crLoopRdSlots = []
+  crLoopRdNodes = []
+}

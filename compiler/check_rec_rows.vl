@@ -1,0 +1,265 @@
+// Record delivery rows: the deliveries queued for the record-adoption solve, the values that
+// may be built at another storage, and the deliveries an adopted pin keeps.
+// Does not import the checker.
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Node,
+  P,
+  i32ToStr,
+  mkTypeRef,
+} from "./ast"
+import {
+  recAdAt,
+  recAdDecl,
+  recAdDst,
+  recAdElem,
+  recAdLoose,
+  recAdNoAdopt,
+  recAdOrigDecl,
+  recAdOrigFn,
+  recAdOrigName,
+  recAdOrigNode,
+  recAdOrigTy,
+  recAdOwn,
+  recAdPinDecl,
+  recAdPinSpell,
+  recAdPinTy,
+  recAdPinned,
+  recAdWidth,
+} from "./check_rec_adopt_rows"
+import { T, TyArray, TyObj, TyUnion, tyHoldsObj } from "./check_types"
+import { cwPeelValue } from "./check_write_scan"
+import { nonNulTyOf, tyReachesHole } from "./check_ty_shape"
+import {
+  REC_STORE_DEPTH,
+  fieldStorageEq,
+  objFieldNameSetsEq,
+  recAdLanding,
+  recNamesDeepEq,
+  recNumChanges,
+} from "./check_ty_relate"
+import { recAdMergeRefuse } from "./check_rec_adopt"
+
+// The deliveries this pass has queued for the record storage rule: the value, its type, the
+// type it is delivered as, and where a refusal is reported. Walked once the pass is over, when
+// the occurrence index is complete and built once.
+export let recPendSrc: i32[] = []
+export function recPendSrcSet(v: i32[]) { recPendSrc = v }
+
+export let recPendSrcTy: i32[] = []
+export function recPendSrcTySet(v: i32[]) { recPendSrcTy = v }
+
+export let recPendDstTy: i32[] = []
+export function recPendDstTySet(v: i32[]) { recPendDstTy = v }
+
+export let recPendAt: i32[] = []
+export function recPendAtSet(v: i32[]) { recPendAt = v }
+
+export let recPendSeen: {[string]: boolean} = Map()
+export function recPendSeenSet(v: {[string]: boolean}) { recPendSeen = v }
+
+// Queue one delivery, when both types hold a record.
+export function recPend(srcExpr: i32, srcTy: i32, dstTy: i32, at: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 || srcTy == dstTy { return 0 }
+  if !tyHoldsObj(srcTy, 8) || !tyHoldsObj(dstTy, 8) { return 0 }
+  const key = i32ToStr(srcExpr) + "#" + i32ToStr(dstTy)
+  if recPendSeen.has(key) { return 0 }
+  recPendSeen[key] = true
+  recPendSrc.push(srcExpr)
+  recPendSrcTy.push(srcTy)
+  recPendDstTy.push(dstTy)
+  recPendAt.push(at)
+  0
+}
+
+// Deliveries of a binding, call or element at a record its own storage matches, kept to be
+// asked, once the pass is over, whether the value is also built elsewhere at another storage.
+export let recOwnSrc: i32[] = []
+export function recOwnSrcSet(v: i32[]) { recOwnSrc = v }
+
+// Queue `srcExpr` (a `srcTy`) when it holds a record and could name a fresh binding or call.
+export function recOwnPend(srcExpr: i32, srcTy: i32) {
+  if srcExpr < 0 || srcTy < 0 { return 0 }
+  if !tyHoldsObj(srcTy, 8) { return 0 }
+  const p = cwPeelValue(srcExpr)
+  if p < 0 || p >= P.nodes.length { return 0 }
+  const e = P.nodes[p]
+  if e is Ident || e is Call || e is Index { recOwnSrc.push(p) }
+  0
+}
+
+// Fresh bindings and functions not adopted (a function's result, or a width change into a
+// record that drops a nested field): each delivery the emitter builds at the destination's row.
+export let recKeptDecl: i32[] = []
+export function recKeptDeclSet(v: i32[]) { recKeptDecl = v }
+
+export let recKeptDst: i32[] = []
+export function recKeptDstSet(v: i32[]) { recKeptDst = v }
+
+export let recKeptAt: i32[] = []
+export function recKeptAtSet(v: i32[]) { recKeptAt = v }
+
+// Push one demand on the declaration `decl`: a binding, or a function with no declared result.
+export function recAdPushDecl(
+  decl: i32,
+  own: i32,
+  dstIn: i32,
+  elem: boolean,
+  at: i32,
+) {
+  if own < 0 || dstIn < 0 || own >= T.tys.length || dstIn >= T.tys.length {
+    return 0
+  }
+  if !(T.tys[own] is TyObj) { return 0 }
+  const dst = recAdLanding(own, dstIn)
+  if dst < 0 || dst >= T.tys.length || !(T.tys[dst] is TyObj) { return 0 }
+  if tyReachesHole(own, 8) || tyReachesHole(dst, 8) { return 0 }
+  if !objFieldNameSetsEq(own, dst) { return 0 }
+  if fieldStorageEq(own, dst, REC_STORE_DEPTH) { return 0 }
+  if decl < 0 { return 0 }
+  const wide = recNumChanges(own, dst, REC_STORE_DEPTH)
+  if (
+    P.nodes[decl] is FuncDecl
+    || (wide && !recNamesDeepEq(own, dst, REC_STORE_DEPTH))
+  ) {
+    recKeptDecl.push(decl)
+    recKeptDst.push(dst)
+    recKeptAt.push(at)
+    return 0
+  }
+  if recAdNoAdopt.has(decl) {
+    recAdMergeRefuse(decl, own, dst, elem, at)
+    return 0
+  }
+  if wide { recAdWidth[decl] = true }
+  recAdDecl.push(decl)
+  recAdOwn.push(own)
+  recAdDst.push(dst)
+  recAdElem.push(elem)
+  recAdAt.push(at)
+  0
+}
+
+// The list member of the union `dst` a list literal lands on: its one list of records.
+// Otherwise `dst`.
+export function recAdLandingList(dst: i32): i32 {
+  if dst < 0 { return dst }
+  const d = T.tys[dst]
+  if !(d is TyUnion) { return dst }
+  let hit = -1
+  for m in d.uMembers {
+    const mm = nonNulTyOf(m)
+    if mm >= 0 && T.tys[mm] is TyArray && tyHoldsObj(mm, 8) {
+      if hit >= 0 { return dst }
+      hit = mm
+    }
+  }
+  if hit < 0 { return dst }
+  hit
+}
+
+// Write each adopted type as its declaration's annotation, keeping the node it replaces.
+export function recAdApplyPins() {
+  let i = 0
+  while i < recAdPinDecl.length {
+    recAdPinLet(recAdPinDecl[i], recAdPinTy[i], recAdPinSpell[i])
+    recAdPinFn(recAdPinDecl[i], recAdPinTy[i], recAdPinSpell[i])
+    i = i + 1
+  }
+  0
+}
+
+// Remember the declaration `d` an adoption rewrites, with its name, kind and new type.
+function recAdKeep(d: i32, n: Node, name: string, isFn: boolean, ty: string) {
+  recAdOrigDecl.push(d)
+  recAdOrigNode.push(n)
+  recAdOrigName.push(name)
+  recAdOrigFn.push(isFn)
+  recAdOrigTy.push(ty)
+  0
+}
+
+// Write `ty`, spelled `spell`, as the annotation of the binding declared at `d`, when it is one.
+function recAdPinLet(d: i32, ty: string, spell: string) {
+  const n = P.nodes[d]
+  if n is LetDecl {
+    recAdKeep(d, n, n.letName, false, ty)
+    recAdPinned[d] = true
+    const ann = mkTypeRef(spell, n.pos)
+    P.nodes[d] = {
+      letKw: n.letKw,
+      letName: n.letName,
+      letType: ann,
+      letInit: n.letInit,
+      pos: n.pos,
+    }
+  }
+  0
+}
+
+// Write `ty`, spelled `spell`, as the declared result of the function declared at `d`.
+function recAdPinFn(d: i32, ty: string, spell: string) {
+  const n = P.nodes[d]
+  if n is FuncDecl {
+    recAdKeep(d, n, n.fnName, true, ty)
+    const ann = mkTypeRef(spell, n.pos)
+    P.nodes[d] = {
+      fnName: n.fnName,
+      fnTyParams: n.fnTyParams,
+      fnParams: n.fnParams,
+      fnRet: ann,
+      fnBody: n.fnBody,
+      pos: n.pos,
+    }
+  }
+  0
+}
+
+// Whether the last solve found a declaration to adopt a wider type.
+export function recAdPending(): boolean { recAdPinDecl.length > 0 }
+
+// How many adoptions stand, a mark for `recAdLoosened` and `recAdUndo`.
+export function recAdMark(): i32 { recAdOrigDecl.length }
+
+// Whether an adoption since `mark` stands while the re-check refused something other than an
+// adopted value handed on whole.
+export function recAdLoosened(mark: i32): boolean {
+  recAdOrigDecl.length > mark && recAdLoose > 0
+}
+
+// Restore every declaration an adoption rewrote since `mark`, except one adopted across a
+// numeric width (`recAdWidth`), and never adopt them again. True when it restored any.
+export function recAdUndo(mark: i32): boolean {
+  let any = false
+  let i = mark
+  let k = mark
+  while i < recAdOrigDecl.length {
+    const d = recAdOrigDecl[i]
+    if recAdWidth.has(d) {
+      recAdOrigDecl[k] = d
+      recAdOrigNode[k] = recAdOrigNode[i]
+      recAdOrigName[k] = recAdOrigName[i]
+      recAdOrigFn[k] = recAdOrigFn[i]
+      recAdOrigTy[k] = recAdOrigTy[i]
+      k = k + 1
+    } else {
+      P.nodes[d] = recAdOrigNode[i]
+      recAdNoAdopt[d] = true
+      recAdPinned[d] = false
+      any = true
+    }
+    i = i + 1
+  }
+  while recAdOrigDecl.length > k {
+    recAdOrigDecl.pop()
+    recAdOrigNode.pop()
+    recAdOrigName.pop()
+    recAdOrigFn.pop()
+    recAdOrigTy.pop()
+  }
+  any
+}
