@@ -444,7 +444,7 @@ testOpt("-O3: each chain input misses; -o without --source-map does not", async 
   }
 });
 
-testOpt("-O3: the seed is a chain input, since its optRungScan reads the rung's input", async () => {
+testOpt("-O3: the seed is a chain input, since its optPipeStart reads the rung's input", async () => {
   const { tmp, p } = await setup();
   try {
     // The same compiler with one empty custom section appended: every emitted byte is the
