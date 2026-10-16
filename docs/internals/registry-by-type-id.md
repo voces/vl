@@ -871,6 +871,50 @@ caller with no type (`ty < 0`), and at the five binding and return seams when th
 not a union. The second goes away once a softened literal union and a collapsed same-shape union
 carry a key of their own.
 
+### Step 5 — the sixth switch: an annotation answers by its own key
+
+**The five binding seams take the annotation node, not a spelling and a type.** Sites 2, 5, 6, 27
+and 28 call `isUNameAnnAB(site, annIx)`. It reads the type from `annRowOfNode(annIx)` as before.
+Where that type carries no union key, the node's own key answers: `annKeyRow` is the row
+carrying `canonUnionKeyOfAnnName` of the spelling canon left on the node. The cases are a softened
+literal union, same-shape records collapsed into one record, and a node with no recorded type.
+`unSiteWideHit` no longer takes a name, and `unSiteWideAsks` is a boolean over the same twelve
+sites.
+
+**Measured before the switch.** A scratch seed recorded every `unSiteWideHit` whose spelling
+named a row, over `tests/cases` and both halves of the distilled corpus. The spelling leg
+answered in three programs and in no corpus cell:
+
+| program | annotation | arena type | seams |
+| --- | --- | --- | --- |
+| `unions/same-shape-inline-union-is` | `A \| B` | the record `A` | 2 (65), 6 (6) |
+| `soundness/call-result-union-binding` | `A \| B` | the record `A` | 2 (36), 6 (1) |
+| `literal-unions/union-of-litunions-flatten` | `K \| K` | `string` | 27, 28, 6 (1 each) |
+
+With the new leg forced to answer false, `same-shape-inline-union-is` fails to build (`` `is` receiver
+is not a union value ``), so the leg is live.
+
+**A one-member spelling is not a union key.** The first candidate keyed any spelling, and four
+modules changed: `literal-unions/single-literal-type`,
+`literal-unions/narrowed-single-literal-rep-consumption`,
+`literal-unions/eq-litunion-atom-against-string-operand` and `getters/getter-step-budget-allows`.
+In each, `const lx: "world"` keyed to the one-member row of `type WStr = "world"`, so the
+binding took the union box and the build failed (`print of a union value whose arms the tag
+dispatch cannot classify`). `canonUnionKeyOfAnnName` returns -1 for a spelling whose key
+text has fewer than two members, and the four modules match master again.
+
+**Proof.** The fixpoint holds at 5,850,372 bytes (master's seed 5,850,265; `seed-size --check`
++1.0%). `difftree.sh --identity` reads `15263 files · 10308 built · 0 differ · 0 uncompared`,
+with fixpoint identity against master. rep-fuzz is exact (0 unsound, 0 reject), and
+`vl_union_key_licence_test.ts` passes. `regress.vl` loses no runs and moves nothing to
+silent, with the same three `rv3310` trap_loads→trap_loads cells. `check-filed-witnesses
+--strict` reads 2,841 graded, 0 MOVED. Render-parse stays at 99 / 378.
+
+**What remains.** The spelling now answers only where a caller has neither a type nor an
+annotation node (`isUNameAB` with `ty < 0`), and at the sites that ask about the spelling itself,
+such as site 9. The `|| isUName(name)` disjunctions beside sites 1, 24 and 46 are their callers' own
+reads, not the seams'.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
