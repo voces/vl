@@ -1,26 +1,27 @@
 // THE HOST FLOOR AGREEMENT. The imports beneath `std:fs`, `std:args`, `std:process` and
-// `std:env` are spelled by five sources, and each one can drift from the others:
+// `std:env` are spelled by three sources, and each one can drift from the others:
 //
+//   - `FS_FLOOR` in compiler/check_intrinsics.vl: the slot order and signature of each import,
+//     from which the emitter's per-slot predicates, the checker's declarations and the builtin
+//     list are all derived;
 //   - `HOST_FLOOR` in scripts/vl-host/src/main.rs: the native host's name, signature and
 //     handler for each import;
-//   - `fsIntrinsicNameAt` in compiler/check_intrinsics.vl: the slot order the emitter writes;
-//   - the `declare(...)` rows in compiler/check_core_state.vl: the types the checker gives them;
-//   - the `blPush(...)` rows in compiler/driver.vl: the builtin list the editor shows;
 //   - tests/support/runWasm.ts: the Deno harness's stubs.
 //
-// This file holds all five to one set of names, and the three that state a signature to
-// one signature per name. It reads source text and runs nothing.
+// This file holds all three to one set of names, and the two that state a signature to one
+// signature per name. It also refuses a floor name spelled by hand in the checker or the
+// builtin list, which read the table instead. It reads source text and runs nothing.
 
 import { ROOT } from "./support/tree.ts";
 
 const MAIN_RS = Deno.readTextFileSync(`${ROOT}/scripts/vl-host/src/main.rs`);
-const CHECK_STATE = Deno.readTextFileSync(
-  `${ROOT}/compiler/check_core_state.vl`,
-);
 const INTRINSICS = Deno.readTextFileSync(
   `${ROOT}/compiler/check_intrinsics.vl`,
 );
-const DRIVER = Deno.readTextFileSync(`${ROOT}/compiler/driver.vl`);
+const DERIVED = ["check_core_state.vl", "driver.vl"].map((f) => ({
+  f,
+  src: Deno.readTextFileSync(`${ROOT}/compiler/${f}`),
+}));
 const RUN_WASM = Deno.readTextFileSync(`${ROOT}/tests/support/runWasm.ts`);
 
 // A floor import's name, in every source.
@@ -32,12 +33,12 @@ function same(what: string, want: string[], got: string[]) {
   if (w !== g) throw new Error(`${what}\n  want: ${w}\n  got:  ${g}`);
 }
 
-// The text from `head` to the next line that is a lone `}` or `];` at column 0.
+// The text from `head` to the next line that is a lone `}`, `]` or `];` at column 0.
 function block(src: string, head: string, what: string): string {
   const at = src.indexOf(head);
   if (at < 0) throw new Error(`${what}: \`${head}\` not found`);
   const rest = src.slice(at);
-  const end = rest.search(/\n(}|];)\n/);
+  const end = rest.search(/\n(}|];?)\n/);
   if (end < 0) throw new Error(`${what}: no end after \`${head}\``);
   return rest.slice(0, end);
 }
@@ -59,71 +60,23 @@ function hostRows(): Map<string, string> {
   return rows;
 }
 
-// `fsIntrinsicNameAt`'s names, in slot order, checked against `fsIntrinsicCount`.
-function slotNames(): string[] {
-  const body = block(
-    INTRINSICS,
-    "export function fsIntrinsicNameAt(",
-    "check_intrinsics.vl",
-  );
-  const names: string[] = [];
-  for (const m of body.matchAll(/if k == (\d+) \{ return "([^"]+)" \}/g)) {
-    if (Number(m[1]) !== names.length) {
-      throw new Error(
-        `check_intrinsics.vl fsIntrinsicNameAt: want slot ${names.length}, got ${
-          m[1]
-        }`,
-      );
+// `FS_FLOOR`'s rows, in slot order: name -> signature. Every quoted line must be a row.
+function slotRows(): Map<string, string> {
+  const body = block(INTRINSICS, "const FS_FLOOR:", "check_intrinsics.vl");
+  const rows = new Map<string, string>();
+  for (
+    const m of body.matchAll(/^ {2}"([^"]+)", "([^"]+)", "(|memory)",$/gm)
+  ) {
+    if (rows.has(m[1])) {
+      throw new Error(`check_intrinsics.vl FS_FLOOR: ${m[1]} listed twice`);
     }
-    names.push(m[2]);
+    rows.set(m[1], m[2]);
   }
-  const count = /export function fsIntrinsicCount\(\): i32 \{ (\d+) \}/.exec(
-    INTRINSICS,
-  );
-  if (!count) {
-    throw new Error("check_intrinsics.vl: `fsIntrinsicCount` not found");
-  }
-  if (Number(count[1]) !== names.length) {
+  const lines = body.split("\n").filter((l) => /^ {2}"/.test(l)).length;
+  if (lines !== rows.size) {
     throw new Error(
-      `check_intrinsics.vl: fsIntrinsicCount says ${
-        count[1]
-      }, fsIntrinsicNameAt names ${names.length}`,
+      `check_intrinsics.vl FS_FLOOR: ${lines} row lines, ${rows.size} parsed — a row is \`"name", "sig", "" | "memory",\``,
     );
-  }
-  return names;
-}
-
-// The checker's `declare("<floor name>", mkFuncTy([...], R))` rows, as signatures.
-function declaredRows(): Map<string, string> {
-  const ty: Record<string, string> = {
-    u8Arr: "u8[]",
-    TY_I32: "i32",
-    TY_I64: "i64",
-    TY_NEVER: "void",
-  };
-  const spell = (t: string) => {
-    const s = ty[t.trim()];
-    if (s === undefined) {
-      throw new Error(`check_core_state.vl: no spelling for \`${t.trim()}\``);
-    }
-    return s;
-  };
-  const rows = new Map<string, string>();
-  const re =
-    /declare\(\s*"([^"]+)",\s*mkFuncTy\(\s*(noParams|\[([^\]]*)\]),\s*(\w+)\s*\),?\s*\)/g;
-  for (const m of CHECK_STATE.matchAll(re)) {
-    if (!FLOOR_NAME.test(m[1])) continue;
-    const params = m[2] === "noParams" ? [] : m[3].split(",").map(spell);
-    rows.set(m[1], `(${params.join(", ")}) => ${spell(m[4])}`);
-  }
-  return rows;
-}
-
-// The builtin list's floor rows: name -> signature.
-function builtinRows(): Map<string, string> {
-  const rows = new Map<string, string>();
-  for (const m of DRIVER.matchAll(/blPush\("([^"]+)", \d+, "([^"]+)"\)/g)) {
-    if (FLOOR_NAME.test(m[1])) rows.set(m[1], m[2]);
   }
   return rows;
 }
@@ -139,51 +92,42 @@ function harnessNames(): string[] {
   ];
 }
 
-function bySignature(
-  what: string,
-  want: Map<string, string>,
-  got: Map<string, string>,
-) {
-  const bad: string[] = [];
-  for (const [name, sig] of want) {
-    if (got.get(name) !== sig) {
-      bad.push(`${name}: want ${sig}, got ${got.get(name)}`);
-    }
-  }
-  if (bad.length > 0) throw new Error(`${what}\n  ${bad.join("\n  ")}`);
-}
-
 Deno.test("host floor: every source names the same imports", () => {
-  const slots = slotNames();
+  const slots = [...slotRows().keys()];
   if (slots.length < 10) {
     throw new Error(`parsed too little: want >=10 slots, got ${slots.length}`);
   }
-  same("main.rs HOST_FLOOR against fsIntrinsicNameAt", slots, [
-    ...hostRows().keys(),
-  ]);
-  same("check_core_state.vl declare rows against fsIntrinsicNameAt", slots, [
-    ...declaredRows().keys(),
-  ]);
-  same("driver.vl blPush rows against fsIntrinsicNameAt", slots, [
-    ...builtinRows().keys(),
-  ]);
-  same(
-    "tests/support/runWasm.ts against fsIntrinsicNameAt",
-    slots,
-    harnessNames(),
-  );
+  same("main.rs HOST_FLOOR against FS_FLOOR", slots, [...hostRows().keys()]);
+  same("tests/support/runWasm.ts against FS_FLOOR", slots, harnessNames());
 });
 
-Deno.test("host floor: the host, the checker and the builtin list state one signature", () => {
+Deno.test("host floor: the host and the compiler's table state one signature", () => {
   const host = hostRows();
-  bySignature(
-    "check_core_state.vl declare rows against main.rs HOST_FLOOR",
-    host,
-    declaredRows(),
-  );
-  bySignature(
-    "driver.vl blPush rows against main.rs HOST_FLOOR",
-    host,
-    builtinRows(),
-  );
+  const bad: string[] = [];
+  for (const [name, sig] of slotRows()) {
+    if (host.get(name) !== sig) {
+      bad.push(`${name}: FS_FLOOR ${sig}, HOST_FLOOR ${host.get(name)}`);
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(
+      `main.rs HOST_FLOOR against FS_FLOOR\n  ${bad.join("\n  ")}`,
+    );
+  }
+});
+
+Deno.test("host floor: the checker and the builtin list read the table", () => {
+  const bad: string[] = [];
+  for (const { f, src } of DERIVED) {
+    for (const m of src.matchAll(/"(__[a-z_]+__)"/g)) {
+      if (FLOOR_NAME.test(m[1])) bad.push(`compiler/${f}: "${m[1]}"`);
+    }
+  }
+  if (bad.length > 0) {
+    throw new Error(
+      `a floor name spelled by hand, not read from FS_FLOOR:\n  ${
+        bad.join("\n  ")
+      }`,
+    );
+  }
 });

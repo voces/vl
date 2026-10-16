@@ -4699,8 +4699,8 @@ type FloorFn = fn(&Floor, &mut Caller<'_, ()>, &[Val], &mut [Val]) -> Result<()>
 
 /// The host floor: every `imports` function beneath `std:fs`, `std:args`, `std:process` and
 /// `std:env`, one row each: the import name, its signature in the compiler's own spelling
-/// (`builtinList` in `compiler/driver.vl`), and its handler. `tests/vl_host_floor_test.ts`
-/// holds the names and signatures to the compiler's slot table and builtin list.
+/// (`FS_FLOOR` in `compiler/check_intrinsics.vl`), and its handler.
+/// `tests/vl_host_floor_test.ts` holds the names and signatures to that table.
 const HOST_FLOOR: &[(&str, &str, FloorFn)] = &[
     ("__fs_errno__", "() => i32", floor_fs_errno),
     ("__args_count__", "() => i32", floor_args_count),
