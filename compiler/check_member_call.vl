@@ -1,0 +1,1276 @@
+// The type of a method call `recv.f(args)`: a built-in method, a struct field holding a
+// function, or a free function reached by UFCS, with overload and hole-typed callees.
+
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  MC_RUNG_BUILTIN,
+  MC_RUNG_SELF_FN,
+  Member,
+  P,
+  callHasTyArgs,
+  callIsRestPacked,
+  fillArgDefaults,
+  fnRequiredArity,
+  hasNamedArgs,
+  hasSpreadItem,
+  i32ToStr,
+  memberCallRungAdd,
+  ovSetCands,
+  ovSetMod,
+  ovSiteSetOf,
+  restParamIndex,
+  spreadArgOf,
+  ufcsAliasAtSite,
+  ufcsExportedScopeIn,
+  ufcsSiteAdd,
+} from "./ast"
+import {
+  assignableExpr,
+  bmArgPred,
+  dstBindLitTyParams,
+  fvaAdapt,
+  validateArgCstrs,
+  validateBmCstrs,
+  validateLetCstrs,
+  validateRetCstrs,
+} from "./check_assignable"
+import { callBindNote } from "./check_bind_rows"
+import { listBuiltResultTy, strLitRecvTy } from "./check_builtin_methods"
+import {
+  ovCbElemSetAt,
+  ovHoleSites,
+  ovHoleSitesPush,
+  ufcsSitePinnable,
+  ufcsUnpinnedSites,
+  ufcsUnpinnedSitesPush,
+} from "./check_call_resolve"
+import { builtinMethodClaims } from "./check_callee"
+import { mkDerivedHole } from "./check_coal"
+import { spreadElemTy } from "./check_container_lits"
+import { checkNodeHook, efLeaf } from "./check_core_state"
+import { cstrOwnerTop, noteBmCstr, noteMemCstr } from "./check_cstr_rows"
+import { curFnDeclIx, inferQuiet } from "./check_cursor"
+import {
+  boundMemberTy,
+  cnhPinTy,
+  dstRetypeLitArgs,
+  holeArgArrayErr,
+  holeArgDemandErr,
+  holeArgViewErr,
+  holeCastPinCheck,
+  holeDemandOk,
+  methodDidYouMean,
+  noteUfcsNotMethod,
+  orderNamedCallArgs,
+  ovPickFor,
+  pinBmCstrElems,
+  refuseOpenNullHoleArg,
+  restCallPack,
+  ufcsMissRaise,
+  ufcsMissingImportSpecs,
+  ufcsSelfAccepts,
+  validateBinCstrs,
+  validateIsCstrs,
+  validateMemCstrs,
+  validateNestCstrs,
+  validatePrintCstrs,
+  validateUfcsCstrs,
+} from "./check_demands"
+import {
+  bmArgMsg,
+  bmPushMsg,
+  boundMemberUnknownMsg,
+  noteUfcsMiss,
+  spreadNoRestMsg,
+} from "./check_diag_text"
+import { expObsFn, expObsPin } from "./check_exp_obs"
+import { callDstTyOf, recordCbExpected, seedExpected } from "./check_expected"
+import {
+  boundMemberFloorMsg,
+  constrainEmptyExpr,
+  rcwPend,
+} from "./check_fit_rules"
+import { CSTR_NODECL, lambdaLastOrder } from "./check_generic_args"
+import { homeModuleOf } from "./check_getter_effects"
+import { declParamNameAt } from "./check_hole_links"
+import { HD_ELEM, tyIsWriteLandRead } from "./check_hole_pins"
+import {
+  arrayDemandKey,
+  holeIsArrayWriteDemanded,
+  holeMapDemandTy,
+  isHoleMapDemandTy,
+  noteArrayDemand,
+  rowIsArrayDemanded,
+} from "./check_hole_rows"
+import { onInferStack } from "./check_infer_rows"
+import {
+  BOUND_UNRESOLVED,
+  MC_METHOD_MARK,
+  holeArgOrigins,
+  holeArrMethod,
+  holeMapMethod,
+  holeMethodIsSelfFn,
+  listMethodMutates,
+  noteUfcsCstr,
+  paramsAfterFirstTy,
+  pushHoleFnToConcrete,
+} from "./check_leaf_steps"
+import {
+  BM_ADDKEY,
+  BM_BOUNDMUST,
+  BM_BOUNDS0,
+  BM_BOUNDS1,
+  BM_BYTEOFF,
+  BM_EXPECTSA,
+  BM_IDXPHRASE,
+  BM_INDEXMUST,
+  BM_KEYMUST,
+  BM_PUSH,
+  BM_SETKEY,
+  BM_SETVAL,
+} from "./check_messages"
+import { letAssignMsg } from "./check_mismatch_notes"
+import { nePopTakes } from "./check_narrow_ends"
+import { calleeWritePrePin, cbElemNarrowFor } from "./check_narrow_flow"
+import { MC_NULL_READ_MARK } from "./check_narrow_paths"
+import { checkInferredMapKey, checkRetTyParamBound } from "./check_node_rules"
+import {
+  ovChooseMsg,
+  ovRecvOpen,
+  ovRefuseMsg,
+  ovSelfCount,
+  paramNamesOfNodes,
+  paramsAfterFirst,
+  roWriteMsg,
+  ufcsRecvExpr,
+  ufcsScopeStepsAside,
+} from "./check_overload"
+import {
+  argMismatchErr,
+  assignable,
+  bindGenWalk,
+  cnhFill,
+  substSelfTy,
+  substTyDeep,
+  tErr,
+  tErrWant,
+  widenLitTy,
+} from "./check_relate_core"
+import { declParamsInScope, lookup } from "./check_scopes"
+import { noteArrayWriteDemand } from "./check_subst"
+import { symMemMethod } from "./check_sym_occ"
+import { tpGradualView } from "./check_tp_join"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_I32,
+  TY_STR,
+  TY_U8,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyMap,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  mkArrayTy,
+  mkNullableTy,
+  tyEq,
+  tyFieldTyOf,
+  tyHasHole,
+  tyIsPrimNamed,
+  tyIxIsView,
+  tyMutEpoch,
+  tyRefusesArrayDemand,
+  tyToStr,
+} from "./check_types"
+import { argLitAt } from "./check_width"
+import { peelParenIx } from "./check_write_effects"
+import {
+  declFirstParamIsSelf,
+  fnDeclIx,
+  fnDeclParamsOf,
+} from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+import {
+  arrElemValueTy,
+  tyHasTyVar,
+  tyIsU8ArrayTy,
+  tyReachesHole,
+} from "./tyquery"
+
+// The one gate every builtin argument arm asks. True when the position is accepted or
+// deferred; false when it is a reject the arm reports with `bmArgMsg`. Deferring returns
+// true since a body that already reported its own mismatch has a loud diagnostic, and a
+// second one at every call site would repeat it in vaguer words.
+function bmArgOk(
+  form: i32,
+  label: string,
+  got: i32,
+  want: i32,
+  ctx: i32,
+  argIx: i32,
+) {
+  if tyHasHole(got) || tyHasHole(want) {
+    // A generic function stored as the value is instantiated there (D3112).
+    if fvaAdapt(argIx, got, want) { return true }
+    noteBmCstr(form, label, got, want, ctx, argIx)
+    return true
+  }
+  bmArgPred(form, got, want, argIx)
+}
+
+// Runs the pending return inference of the function `name` binds, so its type is complete
+// before a UFCS call reads it. False when `fnTy` is not a function at all.
+function ufcsInferCallee(name: string, fnTy: i32): boolean {
+  if fnTy < 0 { return false }
+  const preFt = T.tys[fnTy]
+  if preFt is TyFunc {
+    if preFt.fnRet == -2 {
+      if !onInferStack(name) {
+        const dIx = fnDeclIx[name] ?? -1
+        if dIx >= 0 { checkNodeHook(dIx) }
+      }
+    }
+    return true
+  }
+  false
+}
+
+// A member call whose receiver each instance supplies (an un-annotated or type-parameter
+// receiver): the body types it by the one return type every candidate shares, and each pin
+// picks and checks its own candidate (`ovPinCheck`), the choice the emitter makes per instance.
+function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
+  let ret = -1
+  let why = ""
+  if !ufcsSitePinnable(ix, cstrOwnerTop()) {
+    why = "the receiver is not a parameter of the function the call sits in"
+  }
+  const argc = n.callArgs.length
+  for c in ovSetCands[row] {
+    if why == "" && declFirstParamIsSelf(c) {
+      const fty = lookup(c)
+      if ufcsInferCallee(c, fty) {
+        const ft = T.tys[fty]
+        if ft is TyFunc {
+          const req = fnRequiredArity(fnDeclParamsOf(c))
+          if argc + 1 > ft.fnParamTypes.length || argc + 1 < req {
+            why = "the candidates take different numbers of arguments"
+          } else if (
+            ft.fnRet < 0
+            || tyHasHole(ft.fnRet)
+            || tyHasTyVar(ft.fnRet)
+          ) {
+            why = "a candidate's return type depends on its receiver"
+          } else if ret >= 0 && !tyEq(ret, ft.fnRet) {
+            why = "the candidates return different types"
+          } else {
+            ret = ft.fnRet
+          }
+        }
+      }
+    }
+  }
+  if ret < 0 && why == "" { why = "no candidate takes a receiver" }
+  if why != "" {
+    tErr(
+      ovChooseMsg(
+        row,
+        prop,
+        " for a receiver each call supplies, because "
+          + why
+          + " — annotate the receiver",
+      ),
+      ix,
+    )
+    return TY_ERR
+  }
+  for a in n.callArgs { checkNodeHook(a) }
+  noteUfcsCstr(recvTy, prop, ix, -1)
+  if !i32ListHas(ovHoleSites, ix) { ovHoleSitesPush(ix) }
+  ret
+}
+
+function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
+  // Receiver overloading: a member call the merge left to the receiver's head class picks its
+  // candidate here, banking it on the site for every later reader (`ufcsAliasAtSite`).
+  const ovRow = ovSiteSetOf(ix)
+  if ovRow >= 0 {
+    if recvTy < 0 || T.tys[recvTy] is TyErr { return TY_ERR }
+    // The merge banks a lone `self`-function candidate itself; several choose here.
+    if ovSelfCount(ovRow) > 1 {
+      if T.tys[recvTy] is TyVar {
+        return ovHoleCallTy(ovRow, plainName, recvTy, n, ix)
+      }
+      const pick = ovPickFor(ovRow, recvTy)
+      if pick == "" || pick == "*" {
+        tErr(ovRefuseMsg(ovRow, plainName, recvTy, pick), ix)
+        return TY_ERR
+      }
+      ufcsSiteAdd(ix, pick)
+    }
+    // A receiver whose element is still open would take it from the callee the name picked.
+    if ovRecvOpen(recvTy) {
+      tErr(
+        ovChooseMsg(
+          ovRow,
+          plainName,
+          ", because the receiver's element type is not known yet — annotate it (`const xs: string[] = []`)",
+        ),
+        ix,
+      )
+      return TY_ERR
+    }
+  }
+  // Maps the callee's plain source name to its merge-mangled function, after field precedence
+  // has already been checked — resolved at this call's own site (D1120), since two merged
+  // modules may each export the same-named `self`-function.
+  let name = ufcsAliasAtSite(ix, plainName)
+  let fnTy = lookup(name)
+  if fnTy < 0 || ufcsScopeStepsAside(name, fnTy, recvTy) {
+    // Type-bound fallback (§C, docs/internals/type-bound-ufcs-design.md): the caller's scope
+    // binds no such `self`-function, or binds one declared for another type while the receiver
+    // is a newtype (§F, D1984), so ask the receiver type's declaring module. Banked on the site
+    // for the emitter.
+    const hm = homeModuleOf(recvTy)
+    if hm >= 0 {
+      const tbName = ufcsExportedScopeIn(hm, plainName)
+      if tbName != "" && tbName != name {
+        const tbFn = lookup(tbName)
+        if tbFn >= 0 {
+          if fnTy < 0 || ufcsSelfAccepts(tbName, tbFn, recvTy) {
+            name = tbName
+            fnTy = tbFn
+            ufcsSiteAdd(ix, tbName)
+          }
+        }
+      }
+    }
+  }
+  if fnTy < 0 { return -1 }
+  if !ufcsInferCallee(name, fnTy) { return -1 }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    let retTy = ft.fnRet
+    if retTy == -2 { retTy = TY_ERR }
+    const params = ft.fnParamTypes
+    let args = n.callArgs
+    // The `self`-NAME rule, asked here because the REWRITE asks it and the two
+    // must not disagree about what dispatches (see `declFirstParamIsSelf`).
+    if !declFirstParamIsSelf(name) { return -1 }
+    // The arity range the direct spelling takes: the receiver fills `self` and the defaults fill
+    // the tail of the declaration the scope chain gives this callee, empty for a binding (D1604).
+    const uDecl = paramsAfterFirst(declParamsInScope(name))
+    let uRequired = params.length - 1
+    // `fnRequiredArity` over the TAIL alone: `self` is never defaulted (it is
+    // the receiver), so the tail's own required count IS the answer.
+    if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    // A rest parameter packs here too: the receiver has already filled slot 0, so the pack
+    // starts one slot earlier in the member call's own argument list than in the
+    // declaration. Packing before the gate is what puts the two back in step.
+    const uRest = restParamIndex(uDecl)
+    if uRest >= 0 {
+      if !callIsRestPacked(ix) {
+        let uLo = uRequired
+        if uLo > uRest { uLo = uRest }
+        if args.length < uLo { return -1 }
+        if !restCallPack(n, ix, uRest) { return TY_ERR }
+      }
+      args = n.callArgs
+    } else if hasSpreadItem(args) {
+      tErr(spreadNoRestMsg(plainName), ix)
+      return TY_ERR
+    }
+    if args.length < uRequired || args.length + 1 > params.length { return -1 }
+    if !assignable(recvTy, params[0]) { return -1 }
+    // D2060 — the receiver is delivered to `self` like an argument, so a wider `self` field
+    // the body writes is refused here as it is at the argument seam.
+    const rcwRecv = P.nodes[n.callFn]
+    if rcwRecv is Member {
+      if !inferQuiet { rcwPend(rcwRecv.memObj, recvTy, params[0]) }
+    }
+    // The vacuous half of that gate, deferred: `assignable` answers true for a `TyVar` on
+    // either side, so this row makes a hole receiver's pass mean something once resolved (see `ufcsCstr.ty`'s header).
+    noteUfcsCstr(recvTy, plainName, ix, params[0])
+    if tyHasHole(recvTy) && !ufcsSitePinnable(ix, cstrOwnerTop()) {
+      if !i32ListHas(ufcsUnpinnedSites, ix) { ufcsUnpinnedSitesPush(ix) }
+    }
+    // Named arguments bind against the parameter names after `self` (the receiver is an
+    // unnamed slot-0 positional), in parameter order — the full list with the receiver unnamed.
+    if hasNamedArgs(n.callArgNames) {
+      const uNames = paramNamesOfNodes(declParamsInScope(name))
+      if uNames.length != params.length {
+        tErr(
+          "named arguments work only on declared functions, not on a function value",
+          ix,
+        )
+        return TY_ERR
+      }
+      const restNames: string[] = []
+      let rn = 1
+      while rn < uNames.length {
+        restNames.push(uNames[rn])
+        rn = rn + 1
+      }
+      args = orderNamedCallArgs(restNames, args, n.callArgNames, ix, uDecl)
+      if args.length != restNames.length { return TY_ERR }
+    } else if args.length + 1 < params.length {
+      // Pads trailing positional omissions with the declaration's defaults into a copy, so
+      // the loop below covers the whole parameter list; `n.callArgs` stays untouched since `emit_rewrite` re-derives its own fill after the receiver is injected.
+      const uPadded: i32[] = []
+      let up = 0
+      while up + 1 < params.length {
+        if up < args.length { uPadded.push(args[up]) } else { uPadded.push(-1) }
+        up = up + 1
+      }
+      if fillArgDefaults(uPadded, uDecl, ix) >= 0 { return TY_ERR }
+      args = uPadded
+    }
+    // Generic dispatch binds the receiver into the `self` param's holes first — a receiver
+    // missing a field the body demanded is not this method and falls through — then binds and checks the explicit arguments and substitutes the return.
+    const bNames: string[] = []
+    const bTys: i32[] = []
+    const p0 = T.tys[params[0]]
+    if p0 is TyVar {
+      if !holeDemandOk(p0.tvName, -1, recvTy) { return -1 }
+      // The receiver pins `self` as an argument pins its parameter, casts parked on it included.
+      holeCastPinCheck(
+        p0.tvName,
+        recvTy,
+        declParamNameAt(declParamsInScope(name), 0),
+      )
+    }
+    // The receiver is the first argument a literal can be, for the destination's binding.
+    const uDst: string[] = []
+    const uArgs: i32[] = []
+    if callDstTyOf(ix) >= 0 && !callHasTyArgs(ix) {
+      uArgs.push(ufcsRecvExpr(n))
+      for a in args { uArgs.push(a) }
+      dstBindLitTyParams(ix, retTy, params, uArgs, bNames, bTys, uDst)
+    }
+    bindGenWalk(params[0], recvTy, bNames, bTys)
+    // The receiver's half of the `u8[]`-meets-a-generic rule the direct-call spelling already
+    // enforces: `bindGenWalk` above declined to bind `T` to storage type `u8`, so the
+    // substituted `self` param still carries the unsolved hole the arity gate's `assignable`
+    // passed vacuously — needed here because `self` arrives ahead of the argument loop that rule normally sits in.
+    if !inferQuiet {
+      if tyIsU8ArrayTy(recvTy) {
+        if tyReachesHole(substTyDeep(params[0], bNames, bTys), 8) {
+          tErr(
+            "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
+            ix,
+          )
+          return TY_ERR
+        }
+      }
+    }
+    // The receiver is `self`'s argument, so it takes the argument seam's verdict too: the
+    // dispatch gate above asks bare `assignable`, which misses the refusals the seam holds,
+    // such as a container widened into a differently stored element (D2165). `self` is asked
+    // under the receiver's own binding; a receiver that is still a hole is re-asked at the pin.
+    const recvX = ufcsRecvExpr(n)
+    const selfTy = substSelfTy(params[0], bNames, bTys)
+    // A receiver that is an observed parameter is delivered to `self` here, not at the seam.
+    if expObsFn >= 0 { expObsPin(recvTy, selfTy, recvX) }
+    if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(selfTy) {
+      if !assignableExpr(recvX, recvTy, selfTy) {
+        tErr(
+          "receiver: expected " + tyToStr(selfTy) + ", got " + tyToStr(recvTy),
+          recvX,
+        )
+      }
+    }
+    // The direct call's order and seed (`checkCallNode`): a lambda whose parameter meets a hole
+    // is checked after the other arguments, against its parameter under the receiver's binding
+    // and theirs, so `xs.sort((a, b) => …)` types `a` as `sort(xs, (a, b) => …)` does.
+    const uOrder = lambdaLastOrder(paramsAfterFirstTy(params), args)
+    let oi = 0
+    while oi < uOrder.length {
+      const i = uOrder[oi]
+      seedExpected(args[i], substTyDeep(params[i + 1], bNames, bTys))
+      const at = checkNodeHook(args[i])
+      bindGenWalk(params[i + 1], at, bNames, bTys)
+      const expected = substTyDeep(params[i + 1], bNames, bTys)
+      const pHole = T.tys[params[i + 1]]
+      if pHole is TyVar {
+        if !holeDemandOk(pHole.tvName, args[i], at) {
+          holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
+        }
+        if rowIsArrayDemanded(params[i + 1]) {
+          if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+        }
+        if holeIsArrayWriteDemanded(name, pHole.tvName) {
+          if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
+        }
+        // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+        holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
+      }
+      constrainEmptyExpr(args[i], at, expected)
+      const savedArgLit = argLitAt
+      argLitAt = peelParenIx(args[i])
+      const argOk = assignableExpr(args[i], at, expected)
+      argLitAt = savedArgLit
+      if !argOk {
+        // Anchored at the offending argument (or its offending return site),
+        // never at the call node — see `argMismatchErr`.
+        argMismatchErr(i + 1, expected, at, args[i])
+      }
+      oi = oi + 1
+    }
+    if uDst.length > 0 && !inferQuiet {
+      dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)
+    }
+    // The uninferable-return gate reads the declaration, so `xs.f()` and `f(xs)` answer alike;
+    // the receiver is `self`, a parameter like any other for the purpose of binding.
+    checkRetTyParamBound(fnDeclIx[name] ?? CSTR_NODECL, plainName, ix, retTy)
+    // The UFCS half of the deferred-constraint re-validation, which lived in the direct-call
+    // path alone: `xs.indexOf(nd)` and `indexOf(xs, nd)` are the same call and must answer the
+    // same way, so the UFCS spelling needs its own re-validation of the callee's recorded
+    // constraints too — the same self-arrives-ahead-of-the-argument-loop asymmetry as above.
+    if !inferQuiet {
+      if bNames.length > 0 {
+        callBindNote(ix, bNames, bTys)
+        // `params[0]` is the RECEIVER here, so the origins skip it (`selfOff` 1) and the
+        // remaining parameters number from 1 — `xs.plus(y)` blames `argument 1`, not 2.
+        const uhNames: string[] = []
+        const uhArgNo: i32[] = []
+        const uhArgNode: i32[] = []
+        holeArgOrigins(params, args, 1, uhNames, uhArgNo, uhArgNode)
+        const pinArgs: i32[] = [ufcsRecvExpr(n)]
+        for a in args { pinArgs.push(a) }
+        pinBmCstrElems(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, pinArgs)
+        validateBinCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+          uhNames,
+          uhArgNo,
+          uhArgNode,
+        )
+        // The print capability rides the same pin and the same UFCS/direct symmetry as
+        // above — `xs.show()` and `show(xs)` must answer the same way (D401).
+        validatePrintCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        validateNestCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        validateIsCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        // A call argument inside the body, at the UFCS half for the same symmetry: `"s".inc()`
+        // and `inc("s")` must answer the same way (D2425).
+        validateArgCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          uhNames,
+          uhArgNode,
+        )
+        // The declared return, at the UFCS half for the same symmetry: `p.g()` and `g(p)`
+        // must answer the same way, or the method spelling of D551's family stays silent beside a loud direct one.
+        validateRetCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        // Every other destination inside the body — a local, a re-assignment, a field or
+        // element write — at the UFCS half for the same symmetry (D572).
+        validateLetCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        // Every builtin-collection-method argument inside the body, at the UFCS half for the
+        // same symmetry (D582).
+        validateBmCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+        // After the pins above, as the direct spelling does; the receiver is an argument too.
+        const rcvN = P.nodes[n.callFn]
+        if rcvN is Member { refuseOpenNullHoleArg(rcvN.memObj, plainName) }
+        let oua = 0
+        while oua < args.length {
+          refuseOpenNullHoleArg(args[oua], plainName)
+          oua = oua + 1
+        }
+        // The receiver classification of a `.length` / `x[i]` inside the body, at the UFCS
+        // half for the same symmetry (D651 / D691).
+        validateMemCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+          uhNames,
+          uhArgNo,
+          uhArgNode,
+        )
+        // The receiver of a UFCS `self`-method resolved inside the body, at the UFCS half
+        // for the same symmetry (D1005).
+        validateUfcsCstrs(
+          bNames,
+          bTys,
+          ix,
+          fnDeclIx[name] ?? CSTR_NODECL,
+          plainName,
+        )
+      }
+    }
+    if bNames.length > 0 { retTy = substTyDeep(retTy, bNames, bTys) }
+    return retTy
+  }
+  -1
+}
+
+// Method call on a member callee (`xs.push(e)`, `m.get(k)`, `s.slice(a)`): types the
+// builtin receiver kinds directly, never as a struct field read. Returns the call type,
+// or `-1` when no builtin arm claims it and the caller falls through to the field/UFCS
+// path — the same "no answer" spelling `ufcsCallTy` and `arrayUnionCallTy` already use.
+export function checkMemberCallNode(
+  n: Call,
+  ix: i32,
+  recvIx: i32,
+  prop: string,
+  recvPre: i32,
+): i32 {
+  // A member-access callee is always function-typed for semantic tokens; the builtin arms
+  // below type it directly and never revisit the member-read arm, so its name is recorded here (a struct field holding a function falls through to `checkNode` and overwrites it for hover).
+  symMemMethod(n.callFn)
+  // An optional call hands the receiver's type in already non-null: `p?.f(…)` resolves the
+  // callee against the value its guard admits, not against the `| null` the guard strips.
+  let recvTy = recvPre
+  if recvPre < 0 { recvTy = checkNodeHook(recvIx) }
+  if recvTy >= 0 { recvTy = strLitRecvTy(recvTy) }
+  // A gradual union's built-in method is its concrete member's; the pin re-asks the whole union.
+  if recvTy >= 0 && recvTy < T.tys.length && T.tys[recvTy] is TyUnion {
+    const gv = tpGradualView(recvTy)
+    if gv != recvTy && gv >= 0 && builtinMethodClaims(gv, prop) {
+      noteMemCstr(recvTy, MC_METHOD_MARK + prop, ix, false)
+      recvTy = gv
+    }
+  }
+  let rt = T.tys[recvTy]
+  // An un-annotated hole receiving an array method (`self.map`/`.push`/…) is constrained to
+  // an array — synthesizing one over a derived element hole and falling into the array-method
+  // arm below, which pins the concrete element per call shape. Without this the hole would
+  // grow a `{map: any}` struct shape no array argument could satisfy.
+  if rt is TyVar && !holeMethodIsSelfFn(prop, ix) {
+    if holeArrMethod(prop) {
+      noteArrayDemand(arrayDemandKey(recvTy))
+      // The synthesized receiver below is a MUTABLE list, and nothing re-checks the
+      // argument against it — so a write through the hole is filed here, and the pin
+      // refuses a view for it.
+      if listMethodMutates(prop) { noteArrayWriteDemand(rt.tvName) }
+      const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, recvTy)
+      recvTy = mkArrayTy(elemHole)
+    } else if holeMapMethod(prop) {
+      // A place a type-parameter write left nullable at some pins is asked at each, unless
+      // the call is optional (D3445).
+      if recvPre < 0 && tyIsWriteLandRead(recvTy) {
+        noteMemCstr(recvTy, MC_NULL_READ_MARK + prop, ix, false)
+      }
+      // The dual for a hole receiving a map/set method: becomes the hole's demanded map
+      // (`{[?]: ?}`) and falls into the map-method arm below, which pins the open key/value
+      // from the method's own arguments — `.add` mints the Set flavor. Without this the hole
+      // would grow a `{set: any}` struct shape no map argument could satisfy.
+      recvTy = holeMapDemandTy(rt.tvName, prop == "add")
+    }
+  }
+  rt = T.tys[recvTy]
+  // Banked for the emitter's rewrite, which must take the rung this call took (D2476).
+  if builtinMethodClaims(recvTy, prop) {
+    memberCallRungAdd(ix, MC_RUNG_BUILTIN)
+  }
+  if rt is TyArray {
+    // The view's whole contract: a `readonly T[]` receiver refuses every method that
+    // changes the list's own shape. An element's fields are untouched by it — the marker
+    // is on the list, not on what the list holds. Reported and then fallen through, so the
+    // call still types as its own method and no cascade follows the one real diagnostic.
+    if rt.aRead == 1 {
+      if listMethodMutates(prop) {
+        tErr(roWriteMsg("`." + prop + "()`", recvTy), ix)
+      }
+    }
+    const margs = n.callArgs
+    if prop == "push" {
+      if margs.length < 1 {
+        tErr("push expects at least 1 argument, got 0", ix)
+      } else {
+        // `push` is variadic — every argument appends, and a spread argument appends every
+        // element of its source. One loop covers both, so `xs.push(...ys)` needs no case of
+        // its own; the appends happen in argument order.
+        let mi = 0
+        while mi < margs.length {
+          const spd = spreadArgOf(margs[mi])
+          if spd >= 0 {
+            const set = spreadElemTy(margs[mi])
+            if rt.aElem < 0 {
+              if set >= 0 {
+                rt.aElem = set
+                tyMutEpoch = tyMutEpoch + 1 // a spread pinned the element in place
+              }
+            } else if set >= 0 {
+              if !bmArgOk(BM_PUSH, "push", set, rt.aElem, recvTy, spd) {
+                tErr(bmArgMsg(BM_PUSH, "push", set, rt.aElem, recvTy), ix)
+              }
+            }
+          } else {
+            // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
+            // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
+            // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
+            // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
+            if rt.aElem >= 0 { seedExpected(margs[mi], rt.aElem) }
+            const pat = checkNodeHook(margs[mi])
+            // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
+            // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
+            if rt.aElem < 0 { calleeWritePrePin(recvTy, pat) }
+            if rt.aElem < 0 {
+              rt.aElem = cnhPinTy(pat, ix, recvIx, false, false)
+              tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
+            } else {
+              cnhFill(rt.aElem, pat)
+              // The pushed value's own open holes pin from the element slot — the same rule
+              // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
+              constrainEmptyExpr(margs[mi], pat, rt.aElem)
+              // A float literal re-encodes into an `f32` element as at a binding (D582); a hole
+              // lambda takes a concrete function element's type as an element store does, so a
+              // body that cannot is refused here, not lowered at the hole's default (D3867).
+              if pushHoleFnToConcrete(pat, rt.aElem) {
+                if !assignableExpr(margs[mi], pat, rt.aElem) {
+                  tErrWant(
+                    letAssignMsg(margs[mi], pat, rt.aElem, "", -1),
+                    margs[mi],
+                    rt.aElem,
+                  )
+                }
+              } else if (
+                !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi])
+              ) {
+                tErr(bmPushMsg("push", pat, rt.aElem, recvTy, margs[mi]), ix)
+              }
+            }
+          }
+          mi = mi + 1
+        }
+      }
+      return TY_I32
+    }
+    // `.map(fn)` / `.filter(pred)`: the callback is a 1-arg function over the
+    // element type; map yields an array of the callback's return, filter the
+    // same array type (its predicate must yield bool).
+    if prop == "map" || prop == "filter" {
+      const cargs = n.callArgs
+      if cargs.length != 1 {
+        tErr(prop + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
+        return TY_ERR
+      }
+      // Seeds the callback's expected param type from the receiver's element type, so an
+      // un-annotated function-literal argument infers its param instead of erroring — only
+      // when the arg is an anonymous literal and the element type is known, else cleared below.
+      const cbArg = P.nodes[cargs[0]]
+      // A named callback is typed by the element, which a refused function value names.
+      if cbArg is Ident && ovSetMod.length > 0 {
+        ovCbElemSetAt(cargs[0], rt.aElem)
+      }
+      if cbArg is FuncDecl {
+        if cbArg.fnName == "" && rt.aElem >= 0 {
+          recordCbExpected(cargs[0], [rt.aElem])
+        }
+        if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
+      }
+      const cbTy = checkNodeHook(cargs[0])
+      const cb = T.tys[cbTy]
+      if cb is TyFunc {
+        const cbParams = cb.fnParamTypes
+        if cbParams.length != 1 {
+          tErr(
+            prop
+              + " callback expects 1 parameter, got "
+              + i32ToStr(cbParams.length),
+            ix,
+          )
+        } else if !assignable(rt.aElem, cbParams[0]) {
+          tErr(
+            prop
+              + " callback: parameter expects "
+              + tyToStr(cbParams[0])
+              + ", got "
+              + tyToStr(rt.aElem),
+            ix,
+          )
+        }
+        if prop == "filter" {
+          if !assignable(cb.fnRet, TY_BOOL) {
+            tErr(
+              "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
+              ix,
+            )
+          }
+          return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+        }
+        return mkArrayTy(cb.fnRet)
+      }
+      tErr(prop + " expects a function, got " + tyToStr(cbTy), ix)
+      return TY_ERR
+    }
+    // `.pop()` / `.get(i)` yield `T | null` (an empty pop / out-of-range get is
+    // normal absence); `.clear()` empties in place and yields nothing. The element is
+    // its VALUE type (`arrElemValueTy`), so a `u8[]` answers `i32 | null` — the same
+    // widening `xs[i]` takes, and the rep `emitPopNulBox` already builds (D1211).
+    if prop == "pop" {
+      if margs.length != 0 {
+        tErr("pop expects 0 arguments, got " + i32ToStr(margs.length), ix)
+      }
+      // The first pop under a `.length` test of this same list yields the element (D3558); an
+      // element type over a type variable or hole lowers per instance, so it stays nullable.
+      const popEl = arrElemValueTy(rt.aElem)
+      if (
+        margs.length == 0
+        && !tyHasHole(popEl)
+        && nePopTakes(ix, recvIx, curFnDeclIx)
+      ) {
+        return popEl
+      }
+      return mkNullableTy(popEl)
+    }
+    if prop == "get" {
+      if margs.length != 1 {
+        tErr("get expects 1 argument, got " + i32ToStr(margs.length), ix)
+      } else {
+        const gat = checkNodeHook(margs[0])
+        if !bmArgOk(BM_INDEXMUST, "get", gat, TY_I32, -1, margs[0]) {
+          tErr(bmArgMsg(BM_INDEXMUST, "get", gat, TY_I32, -1), ix)
+        }
+      }
+      return mkNullableTy(arrElemValueTy(rt.aElem))
+    }
+    if prop == "clear" {
+      if margs.length != 0 {
+        tErr("clear expects 0 arguments, got " + i32ToStr(margs.length), ix)
+      }
+      return TY_VOID
+    }
+    // `.slice(start, end?)` yields a NEW array of the SAME element type — the bounds
+    // are i32 (a missing `end` defaults to the length; negatives count from the end).
+    if prop == "slice" {
+      if margs.length != 1 && margs.length != 2 {
+        tErr(
+          "slice expects 1 or 2 arguments, got " + i32ToStr(margs.length),
+          ix,
+        )
+      } else {
+        let si = 0
+        while si < margs.length {
+          const sat = checkNodeHook(margs[si])
+          if !bmArgOk(BM_BOUNDMUST, "slice", sat, TY_I32, -1, margs[si]) {
+            tErr(bmArgMsg(BM_BOUNDMUST, "slice", sat, TY_I32, -1), ix)
+          }
+          si = si + 1
+        }
+      }
+      return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+    }
+    // UFCS `self`-method on an array receiver (`parts.join(sep)`): an array
+    // carries no user FIELD, so a matching free `self`-function resolves
+    // directly — the array dual of the string/struct/union UFCS paths.
+    const au = ufcsCallTy(prop, recvTy, n, ix)
+    if au >= 0 {
+      memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+      return au
+    }
+    if ufcsMissRaise(prop, recvTy, n.callArgs.length, ix, n.callFn) {
+      return TY_ERR
+    }
+    tErr(
+      "no method '."
+        + prop
+        + "' on array "
+        + tyToStr(recvTy)
+        + methodDidYouMean(recvTy, prop),
+      n.callFn,
+    )
+    return TY_ERR
+  }
+  // Map/Set methods over the `{[K]: V}` rep, gated by flavor: a map exposes `.set`/`.get`/
+  // `.has`/`.delete`/`.keys`/`.values`; a set exposes `.add`/`.has`/`.delete`/`.keys`/`.values`.
+  // `.add` alone gates on the value's TYPE rather than the flavor bit (see its own arm). The
+  // first `.set`/`.add` on a bare `Map()`/`Set()` pins its key/value holes in place.
+  if rt is TyMap {
+    const mp = prop
+    const margs2 = n.callArgs
+    if mp == "set" && rt.mSet == 0 {
+      if margs2.length != 2 {
+        tErr("set expects 2 arguments, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const k0 = checkNodeHook(margs2[0])
+        // The value argument is a store into the map's value slot, taking the same
+        // contextual steps `xs.push(v)` and `m[k] = v` take: `seedExpected` first, then the
+        // expression-aware `assignableExpr` — the one home the assignment path also calls, so `.set` and `m[k] = v` cannot drift apart.
+        if rt.mVal >= 0 { seedExpected(margs2[1], rt.mVal) }
+        const v0 = checkNodeHook(margs2[1])
+        if rt.mKey < 0 {
+          rt.mKey = widenLitTy(k0)
+          tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the key in place
+          checkInferredMapKey(rt.mKey, rt.mSet, ix)
+        } else if !bmArgOk(BM_SETKEY, "set", k0, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_SETKEY, "set", k0, rt.mKey, -1), ix)
+        }
+        if rt.mVal < 0 {
+          rt.mVal = cnhPinTy(v0, ix, recvIx, true, isHoleMapDemandTy(recvTy))
+          tyMutEpoch = tyMutEpoch + 1 // `.set` pinned the value in place
+        } else {
+          cnhFill(rt.mVal, v0)
+          // The value argument's own open holes pin from the slot, the third step
+          // this store shares with `m[k] = v` (which pins in `checkBinExprNode`'s
+          // `=` arm) — without it, `m.set("a", fq())` over a `{[string]: f64[]}` reaches the emitter with an unpinned `[]`.
+          constrainEmptyExpr(margs2[1], v0, rt.mVal)
+          // `assignableExpr` already covers the newtype literal-adoption case (`m.set("k",
+          // 1)` over `{[string]: EntityId}` fires), deferring to the pin under a hole (D582).
+          // A hole lambda takes a concrete function value type as `m[k] = v` and `push` do, so
+          // a body that cannot is refused here (D3881).
+          if pushHoleFnToConcrete(v0, rt.mVal) {
+            if !assignableExpr(margs2[1], v0, rt.mVal) {
+              tErrWant(
+                letAssignMsg(margs2[1], v0, rt.mVal, "", -1),
+                margs2[1],
+                rt.mVal,
+              )
+            }
+          } else if !bmArgOk(BM_SETVAL, "set", v0, rt.mVal, -1, margs2[1]) {
+            tErr(bmArgMsg(BM_SETVAL, "set", v0, rt.mVal, -1), ix)
+          }
+        }
+      }
+      return TY_VOID
+    }
+    if mp == "get" && rt.mSet == 0 {
+      if margs2.length != 1 {
+        tErr("get expects 1 argument, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const k1 = checkNodeHook(margs2[0])
+        if !bmArgOk(BM_KEYMUST, "get", k1, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_KEYMUST, "get", k1, rt.mKey, -1), ix)
+        }
+      }
+      return mkNullableTy(rt.mVal)
+    }
+    // `.add(x)` is a Set method only: a boolean-valued map is a map, and its insert is
+    // `m[k] = true` (DECISIONS.md, "`{[K]: V}` and `T[]` are concrete types").
+    if mp == "add" && rt.mSet == 0 && tyIsPrimNamed(rt.mVal, "boolean") {
+      // The hint yields to a `self`-function named `add`: a map has no such member (D2477).
+      const ma = ufcsCallTy(mp, recvTy, n, ix)
+      if ma >= 0 {
+        memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+        return ma
+      }
+      tErr(
+        "`.add` is a `Set` method — use `m[k] = true`, or make it a `Set<"
+          + tyToStr(rt.mKey)
+          + ">`",
+        ix,
+      )
+      return TY_ERR
+    }
+    if mp == "add" && rt.mSet == 1 {
+      if margs2.length != 1 {
+        tErr("add expects 1 argument, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const ka = checkNodeHook(margs2[0])
+        if rt.mKey < 0 {
+          rt.mKey = widenLitTy(ka)
+          tyMutEpoch = tyMutEpoch + 1 // `.add` pinned the Set key in place
+          checkInferredMapKey(rt.mKey, rt.mSet, ix)
+        } else if !bmArgOk(BM_ADDKEY, "add", ka, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_ADDKEY, "add", ka, rt.mKey, -1), ix)
+        }
+      }
+      return TY_VOID
+    }
+    if mp == "has" || mp == "delete" {
+      if margs2.length != 1 {
+        tErr(mp + " expects 1 argument, got " + i32ToStr(margs2.length), ix)
+      } else {
+        const k2 = checkNodeHook(margs2[0])
+        if !bmArgOk(BM_KEYMUST, mp, k2, rt.mKey, -1, margs2[0]) {
+          tErr(bmArgMsg(BM_KEYMUST, mp, k2, rt.mKey, -1), ix)
+        }
+      }
+      return TY_BOOL
+    }
+    if mp == "clear" {
+      if margs2.length != 0 {
+        tErr("clear expects 0 arguments, got " + i32ToStr(margs2.length), ix)
+      }
+      return TY_VOID
+    }
+    if mp == "keys" {
+      if margs2.length != 0 { tErr("keys expects no arguments", ix) }
+      return mkArrayTy(rt.mKey)
+    }
+    if mp == "values" {
+      if margs2.length != 0 { tErr("values expects no arguments", ix) }
+      // A set's `.values()` yields its ELEMENTS (the keys); a map's its values.
+      if rt.mSet == 1 { return mkArrayTy(rt.mKey) }
+      return mkArrayTy(rt.mVal)
+    }
+    // A name no map arm claims is a `self`-function call, as on every other receiver (D2477).
+    const mu = ufcsCallTy(mp, recvTy, n, ix)
+    if mu >= 0 {
+      memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+      return mu
+    }
+    tErr(
+      "unknown property `"
+        + mp
+        + "` on "
+        + tyToStr(recvTy)
+        + methodDidYouMean(recvTy, mp),
+      ix,
+    )
+    return TY_ERR
+  }
+  // String methods: `.slice`/`.indexOf`/`.includes`/`.charCodeAt`, and the stage 2c trio
+  // `.cpAt`/`.cpLen`/`.isCharBoundary` (`.length` is a `Member`, `s[i]` an `Index`). The trio
+  // lives in the core rather than `std:str` (OQ-3) because each needs the UTF-8 storage directly
+  // — a byte-offset decode, a continuation-byte scan, a lead-bit test — which the surface exposes no other way to reach.
+  if rt is TyPrim {
+    if rt.primName == "string" {
+      const sp = prop
+      const sargs = n.callArgs
+      if sp == "slice" {
+        if sargs.length != 2 {
+          tErr("slice expects 2 arguments, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const s0 = checkNodeHook(sargs[0])
+          const s1 = checkNodeHook(sargs[1])
+          // Two constraints, one sentence: each bound defers on its own (either can be the
+          // hole), but the message names both types, so each form carries the other bound as its `ctx` and renders the identical sentence whichever side failed.
+          const sb0 = bmArgOk(BM_BOUNDS0, "slice", s0, TY_I32, s1, sargs[0])
+          const sb1 = bmArgOk(BM_BOUNDS1, "slice", s1, TY_I32, s0, sargs[1])
+          if !sb0 {
+            tErr(bmArgMsg(BM_BOUNDS0, "slice", s0, TY_I32, s1), ix)
+          } else if !sb1 {
+            tErr(bmArgMsg(BM_BOUNDS1, "slice", s1, TY_I32, s0), ix)
+          }
+        }
+        return TY_STR
+      }
+      if sp == "indexOf" {
+        if sargs.length != 1 {
+          tErr("indexOf expects 1 argument, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const a0 = checkNodeHook(sargs[0])
+          if !bmArgOk(BM_EXPECTSA, "indexOf", a0, TY_STR, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_EXPECTSA, "indexOf", a0, TY_STR, -1), ix)
+          }
+        }
+        return TY_I32
+      }
+      if sp == "includes" {
+        if sargs.length != 1 {
+          tErr("includes expects 1 argument, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const a0 = checkNodeHook(sargs[0])
+          if !bmArgOk(BM_EXPECTSA, "includes", a0, TY_STR, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_EXPECTSA, "includes", a0, TY_STR, -1), ix)
+          }
+        }
+        return TY_BOOL
+      }
+      if sp == "charCodeAt" {
+        if sargs.length != 1 {
+          tErr(
+            "charCodeAt expects 1 argument, got " + i32ToStr(sargs.length),
+            ix,
+          )
+        } else {
+          const a0 = checkNodeHook(sargs[0])
+          if !bmArgOk(BM_IDXPHRASE, "charCodeAt", a0, TY_I32, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_IDXPHRASE, "charCodeAt", a0, TY_I32, -1), ix)
+          }
+        }
+        return TY_I32
+      }
+      // `s.cpAt(i)` — the code point whose UTF-8 sequence begins at byte offset `i`,
+      // O(1) (§Codepoints). Not "the i-th code point": the argument is in the one
+      // coordinate system `slice`, `indexOf` and `.length` share.
+      if sp == "cpAt" {
+        if sargs.length != 1 {
+          tErr("cpAt expects 1 argument, got " + i32ToStr(sargs.length), ix)
+        } else {
+          const a0 = checkNodeHook(sargs[0])
+          if !bmArgOk(BM_BYTEOFF, "cpAt", a0, TY_I32, -1, sargs[0]) {
+            tErr(bmArgMsg(BM_BYTEOFF, "cpAt", a0, TY_I32, -1), ix)
+          }
+        }
+        return TY_I32
+      }
+      // `s.cpLen()` — the code-point count, O(n) and NAMED so the cost is visible at the
+      // call site rather than hidden in a `.length` that is O(1) on some data and O(n)
+      // on other data (§Codepoints: "a subscript should mean O(1), always").
+      if sp == "cpLen" {
+        if sargs.length != 0 {
+          tErr("cpLen expects no arguments, got " + i32ToStr(sargs.length), ix)
+        }
+        return TY_I32
+      }
+      // `s.isCharBoundary(i)` — Rust's primitive, O(1): a single lead/continuation bit
+      // test. Slicing off a boundary is LEGAL under Go-lean validity (§Validity), so this
+      // is the tool for code that wants to check rather than a guard the language imposes.
+      if sp == "isCharBoundary" {
+        if sargs.length != 1 {
+          tErr(
+            "isCharBoundary expects 1 argument, got " + i32ToStr(sargs.length),
+            ix,
+          )
+        } else {
+          const a0 = checkNodeHook(sargs[0])
+          if (
+            !bmArgOk(BM_BYTEOFF, "isCharBoundary", a0, TY_I32, -1, sargs[0])
+          ) {
+            tErr(bmArgMsg(BM_BYTEOFF, "isCharBoundary", a0, TY_I32, -1), ix)
+          }
+        }
+        return TY_BOOL
+      }
+      // `s.bytes()` — the string's UTF-8 storage as a `u8[]`. A COPY, not a view:
+      // see `emitStrBytesFnCode` for why a `u8[]` cannot express a non-zero `start`,
+      // and `strings-design.md` §Byte view for the withdrawn zero-copy claim.
+      if sp == "bytes" {
+        if sargs.length != 0 {
+          tErr("bytes expects no arguments, got " + i32ToStr(sargs.length), ix)
+        }
+        return mkArrayTy(TY_U8)
+      }
+      // UFCS `self`-method on a string receiver (`"hello".first()`).
+      const su = ufcsCallTy(sp, recvTy, n, ix)
+      if su >= 0 {
+        memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+        return su
+      }
+      if ufcsMissRaise(sp, recvTy, n.callArgs.length, ix, n.callFn) {
+        return TY_ERR
+      }
+      tErr(
+        "no method '." + sp + "' on string" + methodDidYouMean(recvTy, sp),
+        n.callFn,
+      )
+      return TY_ERR
+    }
+  }
+  // UFCS `self`-method on any other receiver: `o.f(args)` lowers to `f(o, args)` when the
+  // receiver has no such field (a callable field keeps precedence) and a matching free
+  // function exists. The field-first test is `tyFieldTyOf`, the same predicate the emitter's
+  // `drwWalk` calls on the receiver's recorded type, so the two cannot disagree (D1070).
+  const ufcsHasField = tyFieldTyOf(recvTy, prop) >= 0
+  const urt = T.tys[recvTy]
+  // A bounded type parameter as the receiver (OQ-5, strict bodies): the bound answers, and
+  // only the bound — arguments check against its declared members and the result is what it
+  // promised. No dispatch happens here; the witness is chosen per instantiation site
+  // (`checkBoundsAtCall`) and baked by the monomorphizer.
+  if urt is TyVar {
+    const bcTy = boundMemberTy(urt.tvName, prop, true)
+    if bcTy == BOUND_UNRESOLVED {
+      tErr(boundMemberUnknownMsg(urt.tvName, prop), ix)
+      return TY_ERR
+    }
+    if bcTy >= 0 {
+      const bcT = T.tys[bcTy]
+      if bcT is TyFunc {
+        const bcArgs = n.callArgs
+        if bcArgs.length != bcT.fnParamTypes.length {
+          tErr(
+            "`"
+              + prop
+              + "` on `"
+              + urt.tvName
+              + "` expects "
+              + i32ToStr(bcT.fnParamTypes.length)
+              + " arguments, got "
+              + i32ToStr(bcArgs.length),
+            ix,
+          )
+          return TY_ERR
+        }
+        let bca = 0
+        while bca < bcArgs.length {
+          const bcat = checkNodeHook(bcArgs[bca])
+          const bcWant = bcT.fnParamTypes[bca]
+          // An UNRESOLVED member type (`-1`) is a bound whose own annotation
+          // named something this scope has no answer for. Reported once, at the
+          // call, rather than fed to `assignable` — which reads a negative side
+          // as "accept anything" and would silently pass every argument.
+          if bcWant < 0 {
+            tErr(boundMemberUnknownMsg(urt.tvName, prop), ix)
+            return TY_ERR
+          }
+          if !assignableExpr(bcArgs[bca], bcat, bcWant) {
+            argMismatchErr(bca + 1, bcWant, bcat, bcArgs[bca])
+          }
+          bca = bca + 1
+        }
+        if bcT.fnRet < 0 {
+          tErr(boundMemberUnknownMsg(urt.tvName, prop), ix)
+          return TY_ERR
+        }
+        return bcT.fnRet
+      }
+    }
+    const bcMsg = boundMemberFloorMsg(urt.tvName, prop)
+    if bcMsg != "" {
+      tErr(bcMsg, ix)
+      return TY_ERR
+    }
+  }
+  if !ufcsHasField {
+    const uu = ufcsCallTy(prop, recvTy, n, ix)
+    if uu >= 0 {
+      memberCallRungAdd(ix, MC_RUNG_SELF_FN)
+      return uu
+    }
+    // The name is a self-function, just not one in scope (D1230) — asked here since only
+    // the call knows the argument count, banked on the callee member node where the sentence is raised (`memberFloorErr`).
+    noteUfcsMiss(
+      n.callFn,
+      ufcsMissingImportSpecs(prop, recvTy, n.callArgs.length, ix),
+    )
+    // When the name is already in scope, which gate declined (D1570) — banked beside
+    // D1230's answer and read after it, since `argc` is known here and raised there.
+    noteUfcsNotMethod(
+      n.callFn,
+      prop,
+      ufcsAliasAtSite(ix, prop),
+      recvTy,
+      n.callArgs.length,
+    )
+  }
+  -1
+}

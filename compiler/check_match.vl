@@ -1,0 +1,818 @@
+// A `match` expression: integer and literal arms, type arms with their bindings, and the
+// type the arms join to.
+
+import { Block, IsExpr, LetDecl, MatchExpr, P, StrLit, i32ToStr } from "./ast"
+import { resolveMatchConstPats } from "./check_annot_resolve"
+import {
+  checkNodeHook,
+  matchArmExits,
+  matchOnSpine,
+  matchOnSpineSet,
+  matchPatWasRefused,
+  matchTailNode,
+  nestedExitFirstAt,
+  valueArmAt,
+  valueArmAtSet,
+} from "./check_core_state"
+import { noteBinCstr } from "./check_cstr_rows"
+import { inferQuiet, tpEnvNames } from "./check_cursor"
+import { matchUnknownTypeMsg } from "./check_diag_text"
+import {
+  isTypeTy,
+  litJoinOf,
+  matchArmTally,
+  matchF32Join,
+  tpApartJoinOf,
+} from "./check_fit_rules"
+import {
+  f32ArmPlainTy,
+  matchTallyBegin,
+  matchTallyEnd,
+  tpIfOkAt,
+  valDiscarded,
+} from "./check_if_value"
+import {
+  blockTailTy,
+  intArmRejectMsg,
+  matchArmHasBinds,
+  matchInRetTail,
+  matchInRetTailSet,
+  matchIntPatLexeme,
+  matchIntPatValue,
+  matchNulPatHint,
+  matchScrutRejectMsg,
+  matchStrPatLabel,
+  matchValued,
+  matchValuedSet,
+  retTailPos,
+  retTailPosSet,
+  spineAt,
+  spineAtSet,
+} from "./check_leaf_steps"
+import {
+  isVarTyIx,
+  isVarTyIxCap,
+  isVarTyIxPush,
+  isVarTyIxSetAt,
+  noteTpJoinRow,
+  tpMatchOk,
+  tpMatchOkSet,
+} from "./check_list_union"
+import {
+  desugarMatchAt,
+  matchArmBindsOf,
+  matchArmsAreIntLits,
+  matchConstPatLitAt,
+  matchElseArmOf,
+  matchPatIsWild,
+  matchPatLabel,
+  matchPatValNode,
+} from "./check_match_desugar"
+import { noteIntMatchHead } from "./check_match_heads"
+import {
+  applyNarrows,
+  collectElseNarrows,
+  collectThenNarrows,
+  markUnionCover,
+  popScope,
+} from "./check_narrow_flow"
+import { pushScope } from "./check_narrow_paths"
+import { armLit } from "./check_nj_join"
+import { checkMatchBindNames, refuseNestedExitFirst } from "./check_node_rules"
+import { nodeTyIx, nodeTySet } from "./check_node_tys"
+import { lpColAt } from "./check_null_holes"
+import { matchPatIntNumOf } from "./check_num_lits"
+import { assignable, joinArmLit, tErr } from "./check_relate_core"
+import { mapTwinTestMsg } from "./check_ty_relate"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_VOID,
+  TyErr,
+  TyLit,
+  TyNullable,
+  TyUnion,
+  tyIsCompositePat,
+  tyIsHole,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+  tyToStr,
+} from "./check_types"
+import {
+  flattenVariantsInto,
+  tyIsIntMatchScrut,
+  unionHasLitMember,
+} from "./tyquery"
+
+// ── match ──────────────────────────────────────────────────────────────────
+
+// One integer-literal arm pattern: type-checks it against the scrutinee and claims its value,
+// reporting a mismatch or a duplicate at the pattern. `claimed` holds the values already
+// claimed, keyed `hi:lo` so a match of any arm count stays linear (D1990). Answers false only
+// for a type mismatch — the one refusal that makes the pattern cover nothing.
+function checkIntArmLit(
+  patIx: i32,
+  numIx: i32,
+  neg: boolean,
+  st: i32,
+  claimed: {[string]: boolean},
+) {
+  // Checked as the expression it is, so `nodeTyIx` is filled for the `==` the desugar builds
+  // over it — an `i32` literal reaches an `i64` scrutinee by the widening lattice, never the reverse.
+  const pt = checkNodeHook(patIx)
+  if !assignable(pt, st) {
+    tErr(
+      "match pattern type mismatch: expected "
+        + tyToStr(st)
+        + ", found "
+        + tyToStr(pt),
+      patIx,
+    )
+    return false
+  }
+  // A hole scrutinee can't decide the compare's form here — record the deferred `==` the
+  // desugared chain emits, so the call that pins the parameter adjudicates it later.
+  noteBinCstr(st, "==", pt)
+  if numIx < 0 { return true }
+  const key = matchIntPatValue(numIx, neg)
+  if key.length != 2 { return true }
+  const k = i32ToStr(key[0]) + ":" + i32ToStr(key[1])
+  if claimed.has(k) {
+    tErr(
+      "redundant match arm: `"
+        + matchPatLabel(patIx, matchIntPatLexeme(numIx, neg))
+        + " is already covered",
+      patIx,
+    )
+    return true
+  }
+  claimed.set(k, true)
+  true
+}
+
+// `match` over an integer scrutinee (D1572, VL-020): arms are integer literals of the
+// scrutinee's type plus a mandatory `_`, since 2^32 cases is not a member set to be complete
+// over. Duplicate arms and an arm after the `_` are errors. No emitter path of its own —
+// `desugarMatchAt` already turns a non-`IsExpr` pattern into `scrut == pat`.
+function checkMatchIntArms(n: MatchExpr, ix: i32, st: i32) {
+  // The literal values already claimed, keyed by the 64-bit value's `hi:lo` halves.
+  const claimed: {[string]: boolean} = Map()
+  let hasWild = false
+  let wildArm = -1
+  // A pattern that is not an integer literal covers nothing — report it at the pattern and
+  // suppress the missing-`_` report below, which would mis-blame coverage for it.
+  let sawBadPat = false
+  // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
+  // sentinel would poison the join, so never seed with it.
+  let matchTy = -1
+  const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
+  let matchValAcc = matchTallyBegin(ix)
+  let mArmsLit = true
+  const nArms = n.matchArmStart.length
+  let ai = 0
+  while ai < nArms {
+    let pj = 0
+    while pj < n.matchArmCount[ai] {
+      const patIx = n.matchPats[n.matchArmStart[ai] + pj]
+      const valIx = matchPatValNode(patIx)
+      if matchPatIsWild(patIx) {
+        hasWild = true
+        if wildArm < 0 { wildArm = ai }
+      } else if matchPatWasRefused(patIx) {
+        sawBadPat = true
+      } else {
+        const numIx = matchPatIntNumOf(valIx)
+        if valIx != patIx && numIx < 0 {
+          // A constant whose literal is no integer: its read is checked for the mismatch.
+          sawBadPat = true
+          checkIntArmLit(patIx, -1, false, st, claimed)
+        } else if numIx < 0 {
+          // Any other pattern is another vocabulary's arm (a type pattern, a member string,
+          // or a parse-recovery node) — named here rather than read as a missing member.
+          sawBadPat = true
+          tErr(intArmRejectMsg(st), patIx)
+        } else if (!checkIntArmLit(patIx, numIx, numIx != valIx, st, claimed)) {
+          sawBadPat = true
+        }
+      }
+      pj = pj + 1
+    }
+    // An arm after the `_` is dead, and silently reordered if allowed: the wildcard
+    // becomes the chain's bare `else`, so a later arm would test first — rejected, not reordered.
+    if wildArm >= 0 && ai > wildArm {
+      tErr(
+        "unreachable match arm — the `_` wildcard must be the last arm",
+        n.matchPats[n.matchArmStart[ai]],
+      )
+    }
+    const body = n.matchBodies[ai]
+    const svArm = valueArmAt
+    if matchValued { valueArmAtSet(body) }
+    if matchOnSpine { spineAtSet(body) }
+    const bt = checkNodeHook(body)
+    valueArmAtSet(svArm)
+    let armTy = bt
+    const bn = P.nodes[body]
+    if bn is Block {
+      armTy = blockTailTy
+      // A statement-tail block has `blockTailTy == -1` ("no value") — that is void, not the
+      // sentinel TY_ERR (both are -1), so a void-arm `match` must not be read as an error.
+      if armTy < 0 { armTy = TY_VOID }
+    }
+    if !matchArmExits(ix, body, armTy) {
+      const bodyLit = armLit(armTy, body)
+      matchTy = joinArmLit(
+        matchTy,
+        mArmsLit,
+        f32ArmPlainTy(body, armTy),
+        bodyLit,
+      )
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
+      matchValAcc = matchArmTally(
+        ix,
+        body,
+        armTy,
+        matchValAcc,
+        mArmsLit,
+        bodyLit,
+      )
+      mArmsLit = mArmsLit && bodyLit
+    }
+    ai = ai + 1
+  }
+  if matchTy < 0 { matchTy = TY_VOID }
+  const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
+  if mf32 >= 0 {
+    matchTy = mf32
+    matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
+  } else {
+    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
+  }
+  matchTallyEnd(ix, matchValAcc)
+  // Exhaustiveness is the wildcard, and it is required — an integer has no closed member set,
+  // so there is no arm list that could stand in for one.
+  if !hasWild && !sawBadPat {
+    tErr("non-exhaustive match — an integer `match` needs a `_` arm", ix)
+  }
+  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+  if !inferQuiet {
+    desugarMatchAt(ix)
+    if !sawBadPat { noteIntMatchHead(ix) }
+  }
+  matchTy
+}
+
+// Checks a clause's `const` decls inside the arm's narrowing scope, so `const x = scrut.x`
+// reads the field off the narrowed member and the name is visible to the following body.
+// A duplicate binding is skipped rather than checked — `checkMatchBindNames` already reported
+// it, and declaring it twice would stack a terse `redeclared x` on the explanatory message.
+function checkMatchBindDecls(bIx: i32) {
+  if bIx < 0 { return 0 }
+  const bn = P.nodes[bIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      let dup = false
+      const st = P.nodes[bn.blkStmts[i]]
+      if st is LetDecl {
+        let j = 0
+        while j < i {
+          const pv = P.nodes[bn.blkStmts[j]]
+          if pv is LetDecl {
+            if pv.letName == st.letName { dup = true }
+          }
+          j = j + 1
+        }
+      }
+      if !dup { checkNodeHook(bn.blkStmts[i]) }
+      i = i + 1
+    }
+  }
+  0
+}
+
+function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
+  // `uMems` is the scrutinee's variant list (a nullable contributes its inner variants plus
+  // `null`) — a data structure, never a re-split of a rendered spelling. `covered` is parallel.
+  const covered: i32[] = []
+  let ci = 0
+  while ci < uMems.length {
+    covered.push(0)
+    ci = ci + 1
+  }
+  let hasWild = false
+  // A pattern that names no member covers nothing — report it at the pattern and suppress the
+  // exhaustiveness report below (the bad pattern is the root cause; don't cascade).
+  let sawBadPat = false
+  const nArms = n.matchArmStart.length
+  // ── pass 1 (SOURCE order): resolve + validate every pattern, bank its check type, mark cover.
+  let ai = 0
+  while ai < nArms {
+    let pj = 0
+    while pj < n.matchArmCount[ai] {
+      const patIx = n.matchPats[n.matchArmStart[ai] + pj]
+      const pn = P.nodes[patIx]
+      if matchPatIsWild(patIx) {
+        hasWild = true
+      } else if pn is IsExpr {
+        const pt = isTypeTy(pn.isVariant, patIx)
+        if pt < 0 {
+          sawBadPat = true
+          tErr(matchUnknownTypeMsg(pn.isVariant, st), patIx)
+        } else if tyIsCompositePat(pt) {
+          sawBadPat = true
+          tErr(
+            "match pattern `"
+              + pn.isVariant
+              + "` names a union — list its members as separate arms (`A | B => …`)",
+            patIx,
+          )
+        } else {
+          // Banks the resolved check type on the pattern node (the `isVarTyIx` row the emitter's
+          // narrowing stack reads) instead of re-checking, which would duplicate the scrutinee's diagnostics.
+          if patIx < isVarTyIxCap {
+            while isVarTyIx.length <= patIx { isVarTyIxPush(-1) }
+            isVarTyIxSetAt(patIx, pt)
+          }
+          if patIx < nodeTyIx.length { nodeTySet(patIx, TY_BOOL) }
+          const hit = markUnionCover(uMems, covered, pt)
+          if hit == 0 {
+            tErr(
+              "match pattern `"
+                + pn.isVariant
+                + "` is not a member of "
+                + tyToStr(st),
+              patIx,
+            )
+          } else if hit < 0 {
+            tErr(
+              "redundant match arm: `" + pn.isVariant + "` is already covered",
+              patIx,
+            )
+          }
+          const twin = mapTwinTestMsg(uMems, pt, "a `match` arm")
+          if twin != "" { tErr(twin, patIx) }
+        }
+      } else if pn is StrLit {
+        // A string-literal pattern discriminates a litunion's member text; over a value union
+        // the arms discriminate types, so name the difference instead of a phantom missing member.
+        sawBadPat = true
+        tErr(
+          "invalid match pattern "
+            + pn.strText
+            + " — a pattern over a value union is a member type or the `_` wildcard",
+          patIx,
+        )
+      } else {
+        sawBadPat = true
+        tErr(
+          "invalid match pattern — a pattern over a value union is a member type or the `_` wildcard",
+          patIx,
+        )
+      }
+      pj = pj + 1
+    }
+    // An or-pattern arm may not carry a payload binding: it gets no then-narrowing
+    // (`collectThenNarrows` reports none for the `||` condition), so `scrut.x` would not type.
+    if n.matchArmCount[ai] > 1 {
+      if matchArmHasBinds(n, ai) {
+        tErr(
+          "payload binding is not allowed on an or-pattern arm — give each type its own arm",
+          n.matchPats[n.matchArmStart[ai]],
+        )
+      }
+    } else {
+      checkMatchBindNames(matchArmBindsOf(n, ai), n.matchBodies[ai])
+    }
+    ai = ai + 1
+  }
+  // Whether every member is named (or a `_` stands in for the rest) — settled by pass 1, and
+  // read by pass 3 as well as by the exhaustiveness report at the end.
+  let exhaustive = hasWild
+  if !hasWild {
+    let ec = 0
+    let allCov = true
+    while ec < covered.length {
+      if covered[ec] == 0 { allCov = false }
+      ec = ec + 1
+    }
+    exhaustive = allCov
+  }
+  // Pass 2 (chain order): the progressive else narrowings. `armAcc[k]` is how much of the
+  // accumulator holds when the chain enters arm `k` — `collectElseNarrows`' fold, same order.
+  const elseArm = matchElseArmOf(n.matchPats, n.matchArmStart, n.matchArmCount)
+  const accNames: string[] = []
+  const accTys: i32[] = []
+  const armAcc: i32[] = []
+  let z = 0
+  while z < nArms {
+    armAcc.push(0)
+    z = z + 1
+  }
+  let ck = 0
+  while ck < nArms {
+    if ck != elseArm {
+      armAcc[ck] = accNames.length
+      let pj = 0
+      while pj < n.matchArmCount[ck] {
+        collectElseNarrows(
+          n.matchPats[n.matchArmStart[ck] + pj],
+          accNames,
+          accTys,
+        )
+        pj = pj + 1
+      }
+    }
+    ck = ck + 1
+  }
+  if elseArm >= 0 { armAcc[elseArm] = accNames.length }
+  // Pass 3 (source order): check each arm body under its branch's narrowing, joining arm value
+  // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
+  let matchTy = -1
+  const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
+  let matchValAcc = matchTallyBegin(ix)
+  let mArmsLit = true
+  let bi = 0
+  while bi < nArms {
+    const nmz: string[] = []
+    const tyz: i32[] = []
+    let q = 0
+    while q < armAcc[bi] {
+      nmz.push(accNames[q])
+      tyz.push(accTys[q])
+      q = q + 1
+    }
+    // The arm's own then-fact, pushed after the accumulated complement (order matters —
+    // `applyNarrows` binds in order, so the arm's own type wins over the complement).
+    if bi != elseArm || !exhaustive {
+      if n.matchArmCount[bi] == 1 {
+        collectThenNarrows(n.matchPats[n.matchArmStart[bi]], nmz, tyz)
+      }
+    }
+    // The scope is pushed for the payload clause too, not just the narrowing — an arm can
+    // bind without narrowing, and its `const`s must still be arm-local.
+    const bindIx = matchArmBindsOf(n, bi)
+    const scoped = nmz.length > 0 || bindIx >= 0
+    if scoped {
+      pushScope(-1)
+      applyNarrows(nmz, tyz)
+      checkMatchBindDecls(bindIx)
+    }
+    const body = n.matchBodies[bi]
+    const svArm = valueArmAt
+    if matchValued { valueArmAtSet(body) }
+    if matchOnSpine { spineAtSet(body) }
+    const bt = checkNodeHook(body)
+    valueArmAtSet(svArm)
+    let armTy = bt
+    const bn = P.nodes[body]
+    if bn is Block {
+      armTy = blockTailTy
+      // A statement-tail block has `blockTailTy == -1` ("no value") — that is void, not the
+      // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
+      if armTy < 0 { armTy = TY_VOID }
+    }
+    if scoped { popScope() }
+    if !matchArmExits(ix, body, armTy) {
+      const bodyLit = armLit(armTy, body)
+      matchTy = joinArmLit(
+        matchTy,
+        mArmsLit,
+        f32ArmPlainTy(body, armTy),
+        bodyLit,
+      )
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
+      matchValAcc = matchArmTally(
+        ix,
+        body,
+        armTy,
+        matchValAcc,
+        mArmsLit,
+        bodyLit,
+      )
+      mArmsLit = mArmsLit && bodyLit
+    }
+    bi = bi + 1
+  }
+  if matchTy < 0 { matchTy = TY_VOID }
+  const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
+  if mf32 >= 0 {
+    matchTy = mf32
+    matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
+  } else {
+    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
+  }
+  matchTallyEnd(ix, matchValAcc)
+  // Exhaustiveness: `_` is allowed but never required — a match naming every member is
+  // complete without one. Missing members render from the arena types, not a re-split spelling.
+  if !hasWild && !sawBadPat {
+    let missing = ""
+    let mk = 0
+    while mk < uMems.length {
+      if covered[mk] == 0 {
+        if missing != "" { missing = missing + ", " }
+        missing = missing + tyToStr(uMems[mk])
+      }
+      mk = mk + 1
+    }
+    if missing != "" {
+      tErr(
+        "non-exhaustive match — missing " + missing + " (add the arm or a `_`)",
+        ix,
+      )
+    }
+  }
+  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+  if !inferQuiet { desugarMatchAt(ix) }
+  matchTy
+}
+
+// ── a `const` as a match arm (D3271) ─────────────────────────────────────────
+// A bare name in pattern position that names no type is a constant, compared by value: the
+// pattern node becomes a read of it, so the desugared test is the hand-written `scrut == K`,
+// and its literal is where the arm's value is read for duplicates, members and the jump table.
+
+// Extracted from `checkNodeReal`'s `MatchExpr` arm (C3: thin the dispatcher).
+export function checkMatchExprNode(n: MatchExpr, ix: i32) {
+  // A discarded `match` lowers its arms as statements, as a spine one does, and so do the
+  // blocks, `if`s and `match`es at their tails.
+  const savedOnSpine = matchOnSpine
+  const savedValued = matchValued
+  const savedSpine = spineAt
+  matchValuedSet(!valDiscarded(ix))
+  matchOnSpineSet(spineAt == ix || !matchValued)
+  const r = checkMatchExprNodeIn(n, ix)
+  if lpColAt(nestedExitFirstAt, ix) == 1 { refuseNestedExitFirst(ix, r) }
+  matchOnSpineSet(savedOnSpine)
+  matchValuedSet(savedValued)
+  spineAtSet(savedSpine)
+  r
+}
+
+function checkMatchExprNodeIn(n: MatchExpr, ix: i32) {
+  // Three arm vocabularies, decided by the scrutinee: an integer dispatches on literals
+  // (D1572), a litunion on member strings, any other union on member types.
+  const mTail = retTailPos
+  const savedMatchTail = matchInRetTail
+  matchInRetTailSet(matchTailNode == ix)
+  retTailPosSet(false)
+  const st = checkNodeHook(n.matchScrut)
+  tpMatchOkSet(mTail || tpIfOkAt.has(ix))
+  // The scrutinee and arm bodies are NOT in return-tail position — restore the flag on every
+  // exit so a `match` subexpression stays transparent to a sibling in the same statement.
+  const nulLit = tyIsNullableLitUnion(st)
+  if tyIsIntMatchScrut(st) || tyIsLitUnion(st) || nulLit {
+    resolveMatchConstPats(n, false)
+  } else if tyIsHole(st) {
+    resolveMatchConstPats(n, true)
+  }
+  if tyIsIntMatchScrut(st) || (tyIsHole(st) && matchArmsAreIntLits(n)) {
+    const ri = checkMatchIntArms(n, ix, st)
+    matchInRetTailSet(savedMatchTail)
+    retTailPosSet(mTail)
+    return ri
+  }
+  // D1898 — a NULLABLE literal union takes the member-string vocabulary too, with `null` as
+  // one more member: it is the same interned i32 atom as the bare set, `null` riding the spare
+  // `-1`, so the desugared `k is null` / `k == "a"` chain is what already lowers.
+  if !tyIsLitUnion(st) && !nulLit {
+    // A third arm vocabulary (D1572): an integer scrutinee dispatches on literals, asked before
+    // the union tests (which have no member set for one). A hole takes it too when arms are int literals.
+    const uMems: i32[] = []
+    flattenVariantsInto(st, uMems)
+    if uMems.length > 1 && !unionHasLitMember(uMems) {
+      const r = checkMatchTypeArms(n, ix, st, uMems)
+      matchInRetTailSet(savedMatchTail)
+      retTailPosSet(mTail)
+      return r
+    }
+    // An error-typed scrutinee's own diagnostic is already raised; refusing it again is a cascade.
+    if st < 0 || !(T.tys[st] is TyErr) {
+      tErr(matchScrutRejectMsg(st, uMems), ix)
+    }
+    matchInRetTailSet(savedMatchTail)
+    retTailPosSet(mTail)
+    return TY_ERR
+  }
+  // The member texts (inner, no quotes), and a parallel covered-flag. `K | null` interns as a
+  // `TyNullable` over the set while the expanded `"a" | "b" | null` interns as a `TyUnion` with
+  // a null member, so both forms are read here and the `null` member rides `nulCovered`.
+  const members: string[] = []
+  let styIx = st
+  const styN = T.tys[st]
+  if styN is TyNullable { styIx = styN.nInner }
+  const sty = T.tys[styIx]
+  if sty is TyUnion {
+    let mi = 0
+    while mi < sty.uMembers.length {
+      const mm = T.tys[sty.uMembers[mi]]
+      if mm is TyLit { members.push(mm.litText) }
+      mi = mi + 1
+    }
+  }
+  const covered: i32[] = []
+  let ci = 0
+  while ci < members.length {
+    covered.push(0)
+    ci = ci + 1
+  }
+  let nulCovered = false
+  let hasWild = false
+  // A pattern that is neither a member string literal nor the `_` wildcard covers nothing —
+  // report it at the pattern and suppress the exhaustiveness error below (don't cascade).
+  let sawBadPat = false
+  // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
+  // sentinel would poison the join (every arm joins back to error), so never seed with it.
+  let matchTy = -1
+  const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
+  let matchValAcc = matchTallyBegin(ix)
+  let mArmsLit = true
+  let ai = 0
+  while ai < n.matchArmStart.length {
+    // Patterns of arm `ai`.
+    let pj = 0
+    while pj < n.matchArmCount[ai] {
+      const patIx = n.matchPats[n.matchArmStart[ai] + pj]
+      const pn = P.nodes[matchPatValNode(patIx)]
+      if matchPatIsWild(patIx) {
+        hasWild = true
+      } else if matchPatWasRefused(patIx) {
+        sawBadPat = true
+      } else if pn is IsExpr {
+        // D1898 — `null` is the one type pattern this vocabulary takes, and only where the
+        // scrutinee carries it; on a bare set it is not a member and keeps the wording below.
+        if nulLit && pn.isVariant == "null" {
+          if nulCovered {
+            tErr("redundant match arm: `null` is already covered", patIx)
+          } else {
+            nulCovered = true
+          }
+        } else {
+          // A type pattern over a literal union: an identifier naming no type reaches this same
+          // arm too, so the wording must not silently claim to cover every member.
+          sawBadPat = true
+          tErr(
+            "invalid match pattern `"
+              + pn.isVariant
+              + "` — a pattern is a member string literal, a `const` with a literal value"
+              + matchNulPatHint(nulLit)
+              + " or the `_` wildcard",
+            patIx,
+          )
+        }
+      } else if pn is StrLit {
+        // A constant's read is checked so the desugared `==` has its operand's type.
+        if matchConstPatLitAt(patIx) >= 0 { checkNodeHook(patIx) }
+        // The member name is the pattern's inner text (quotes stripped) — an expression
+        // lexeme, not `tyname.groupInnerOf`'s home (a degenerate lexeme stays whole here).
+        const raw = pn.strText
+        let inner = raw
+        if raw.length >= 2 { inner = raw.slice(1, raw.length - 1) }
+        let found = -1
+        let fi = 0
+        while fi < members.length {
+          if members[fi] == inner { found = fi }
+          fi = fi + 1
+        }
+        if found < 0 {
+          tErr(
+            "match pattern "
+              + matchStrPatLabel(patIx, inner)
+              + " is not a member of "
+              + tyToStr(st),
+            patIx,
+          )
+        } else if covered[found] == 1 {
+          tErr(
+            "redundant match arm: "
+              + matchStrPatLabel(patIx, inner)
+              + " is already covered",
+            patIx,
+          )
+        } else {
+          covered[found] = 1
+        }
+      } else if matchConstPatLitAt(patIx) >= 0 {
+        // A constant holding a number: the read is checked for the mismatch it is.
+        sawBadPat = true
+        tErr(
+          "match pattern type mismatch: expected "
+            + tyToStr(st)
+            + ", found "
+            + tyToStr(checkNodeHook(patIx)),
+          patIx,
+        )
+      } else {
+        // Any other node kind (a parse-recovered pattern, a future literal form):
+        // same story — it covers nothing, so name it rather than mis-blame coverage.
+        sawBadPat = true
+        tErr(
+          "invalid match pattern — a pattern is a member string literal, a `const` with a literal value or the `_` wildcard",
+          patIx,
+        )
+      }
+      pj = pj + 1
+    }
+    // Body value type. (Arm bodies are not checked in return-tail position; the match's joined
+    // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
+    const body = n.matchBodies[ai]
+    const svArm = valueArmAt
+    if matchValued { valueArmAtSet(body) }
+    if matchOnSpine { spineAtSet(body) }
+    const bt = checkNodeHook(body)
+    valueArmAtSet(svArm)
+    let armTy = bt
+    const bn = P.nodes[body]
+    if bn is Block {
+      armTy = blockTailTy
+      // A statement-tail block has `blockTailTy == -1` ("no value") — that is void, not the
+      // sentinel TY_ERR (both are -1), so a void-arm `match` must not be mistaken for an error.
+      if armTy < 0 { armTy = TY_VOID }
+    }
+    if !matchArmExits(ix, body, armTy) {
+      const bodyLit = armLit(armTy, body)
+      matchTy = joinArmLit(
+        matchTy,
+        mArmsLit,
+        f32ArmPlainTy(body, armTy),
+        bodyLit,
+      )
+      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+      mValArms.push(body)
+      mValTys.push(f32ArmPlainTy(body, armTy))
+      matchValAcc = matchArmTally(
+        ix,
+        body,
+        armTy,
+        matchValAcc,
+        mArmsLit,
+        bodyLit,
+      )
+      mArmsLit = mArmsLit && bodyLit
+    }
+    ai = ai + 1
+  }
+  // A void-armed match leaves the join unset (-1) or void; normalize to void so the function-
+  // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
+  if matchTy < 0 { matchTy = TY_VOID }
+  const mf32 = matchF32Join(ix, matchTy)
+  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
+  if mf32 >= 0 {
+    matchTy = mf32
+    matchValAcc = mf32
+  } else if mlj >= 0 {
+    matchTy = mlj
+    matchValAcc = mlj
+  } else {
+    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
+  }
+  matchTallyEnd(ix, matchValAcc)
+  // Exhaustiveness: every member covered, or a wildcard. Skipped after an invalid pattern —
+  // that arm covers nothing, so a missing-member report would mis-blame what the pattern already explained.
+  if !hasWild && !sawBadPat {
+    let missing = ""
+    let mk = 0
+    while mk < members.length {
+      if covered[mk] == 0 {
+        if missing != "" { missing = missing + ", " }
+        missing = missing + "\"" + members[mk] + "\""
+      }
+      mk = mk + 1
+    }
+    // The `null` member is named last, so the sentence reads in the order the spelling does.
+    if nulLit && !nulCovered {
+      if missing != "" { missing = missing + ", " }
+      missing = missing + "null"
+    }
+    if missing != "" {
+      tErr(
+        "non-exhaustive match — missing " + missing + " (add the arm or a `_`)",
+        ix,
+      )
+    }
+  }
+  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+  if !inferQuiet { desugarMatchAt(ix) }
+  matchInRetTailSet(savedMatchTail)
+  retTailPosSet(mTail)
+  return matchTy
+}

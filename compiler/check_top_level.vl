@@ -1,0 +1,809 @@
+// A module's top level: the pre-passes that infer returns and global initialisers before
+// any body is checked, the generic-constraint probe, then each declaration in order.
+
+import {
+  BoolLit,
+  CharLit,
+  FuncDecl,
+  LetDecl,
+  NumLit,
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  P,
+  Param,
+  Program,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  UnionDecl,
+  declBoundOf,
+  declGpBaseOf,
+  declGpParamsOf,
+  getDeclLabel,
+  getDeclPropOf,
+  i32ToStr,
+  isBinOpDecl,
+  isBodyTyDecl,
+  opDeclLabel,
+  opDeclLabelBin,
+  opDeclOpOf,
+  udTsRootAt,
+} from "./ast"
+import { cPlainAliasNames } from "./check_alias_transparent"
+import {
+  resolveAnnotAt,
+  resolveFlatLayouts,
+  resolveRetAnnotAt,
+} from "./check_annot_resolve"
+import {
+  collapsedTy,
+  fsbIsHoleLambda,
+  markCollapsedRet,
+  markFnLitBinding,
+  markObjLitBinding,
+} from "./check_bind_rows"
+import {
+  opBinHoleDeclAnnPush,
+  opBinHoleDeclNamePush,
+  opBinHoleDeclNodePush,
+  opIdxArityTail,
+  opIdxDeadRecv,
+} from "./check_call_resolve"
+import { opIdxFns, opIdxOps } from "./check_callee"
+import {
+  cFillActiveSet,
+  checkNodeHook,
+  cstrProbeSet,
+  gaParamCount,
+  gaParamNames,
+  gaParamStart,
+  moduleBeforeDecl,
+  topUnannotFns,
+  unresolvedFns,
+  unresolvedFnsSet,
+} from "./check_core_state"
+import { crStmtEnter } from "./check_cr_walk"
+import {
+  cstrCandAny,
+  cstrCandIx,
+  cstrCandState,
+  cstrPrePass,
+  cstrProbeVisit,
+  cstrProbeWalk,
+} from "./check_cstr_probe"
+import { markCtnLitBinding } from "./check_ctn_lit_bind"
+import { inferQuiet } from "./check_cursor"
+import {
+  cBoundDeclsSetAt,
+  lbiScanModLits,
+  moduleConstIntInitSetAt,
+  nwBodyScopedNamesSetAt,
+} from "./check_decl_scan"
+import { daAdd, daEnterFrame, daLeaveFrame } from "./check_definite"
+import { bareBraceUndelivered } from "./check_demands"
+import { constStrLitBound, inferNoBasisErr } from "./check_fit_rules"
+import { checkFuncDeclNode, solveUnannotParams } from "./check_fn_decl"
+import { gaDeclIxs, gaNames } from "./check_gen_alias_anns"
+import {
+  getDecls,
+  getFns,
+  getProps,
+  getSelfTys,
+  moduleGlobals,
+} from "./check_getter_effects"
+import { markValDiscard } from "./check_if_value"
+import { inferTentative, inferTentativeTake } from "./check_infer_rows"
+import {
+  annCommitVariantMembers,
+  cFillStmtIx,
+  cTyIxSetAdd,
+} from "./check_inline_lit_union"
+import {
+  aliasRefIsPlainRoot,
+  binOpDeadSelf,
+  cstrRowCount,
+  globalInitFnAlias,
+  letDeclIsUnannotCtnLit,
+  letDeclIsUnannotObjLit,
+  modClashNames,
+  modClashNamesSet,
+} from "./check_leaf_steps"
+import { crStmtLeave } from "./check_narrow_flow"
+import { checkUnionSetMapClash } from "./check_node_rules"
+import {
+  lbiInitLit,
+  lbiMark,
+  markNumLitBinding,
+  numLitNotesDropFrom,
+} from "./check_num_lit_state"
+import { lbiLitDefault } from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import {
+  fillTypeDeclAt,
+  nameToTyAt,
+  tErr,
+  tErrBuiltinTyDecl,
+} from "./check_relate_core"
+import {
+  RB_CSTR_PROBE,
+  RB_GLOBAL_INIT,
+  RB_LINT,
+  RB_RETURNS,
+  checkMark,
+  checkRollback,
+  prbArmed,
+  prbEnter,
+  prbLeave,
+  prbSkip,
+} from "./check_rollback"
+import {
+  declare,
+  declareFnDeclNode,
+  fnAliasScopes,
+  lookup,
+  moduleConstDecl,
+} from "./check_scopes"
+import { cFillDoneAtSet, resetReturnPending } from "./check_side_rows"
+import { symEnabled } from "./check_state"
+import { unannotParamTy } from "./check_subst"
+import { isBuiltinTyName } from "./check_suggest"
+import { scopeSL, symStampVis } from "./check_sym_occ"
+import { paramHoleName } from "./check_tp_join"
+import { udVariantsAllStrLit } from "./check_type_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_STR,
+  TY_VOID,
+  TyFunc,
+  cStructPush,
+  cUnionNames,
+  cUnionTyIxSet,
+  cUnionTyIxs,
+  cUserTypes,
+  cUserTypesVer,
+  mkFuncTy,
+  mkObjTy,
+  nwDeclNames,
+  tyHasHole,
+  tyToStr,
+} from "./check_types"
+import { fnResultUnconsumed } from "./check_unconsumed"
+import { mkUnionTy } from "./check_union_mint"
+import { mkWideStrLitTy } from "./check_wide_lits"
+import { fnDeclIx } from "./check_write_scan"
+import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
+import { isNeverTy, isNullTy, isVoidTy } from "./tyquery"
+
+// Demand-infer one top-level function's return, but only if still pending (the
+// memoization guard already short-circuits a resolved one; the fixpoint resets to
+// pending first to force a fresh re-inference once neighbours have settled).
+function preInferOne(dIx: i32) {
+  const dn = P.nodes[dIx]
+  if dn is FuncDecl {
+    const h = lookup(dn.fnName)
+    let pending = true
+    if h >= 0 {
+      const ht = T.tys[h]
+      if ht is TyFunc {
+        if ht.fnRet != -2 { pending = false }
+      }
+    }
+    if pending { checkFuncDeclNode(dn, dIx) }
+  }
+  0
+}
+
+// The return-inference pre-pass: resolves every un-annotated return with diagnostics, symbol
+// recording and the redundant-type stream suppressed, so the real check pass runs against
+// final return types. Non-cycle functions resolve in the first demand sweep; cycle-poisoned
+// ones iterate to a fixpoint until the tentative set stops shrinking, and what remains is genuinely base-case-less.
+function inferReturnsPrePass() {
+  if topUnannotFns.length == 0 { return 0 }
+  if prbArmed { prbEnter() }
+  inferQuiet = true
+  const m = checkMark()
+  const savedSym = symEnabled
+  symEnabled = 0
+  let i = 0
+  while i < topUnannotFns.length {
+    preInferOne(topUnannotFns[i])
+    i = i + 1
+  }
+  let shrinking = true
+  let rounds = 0
+  while shrinking && rounds < 2000 {
+    rounds = rounds + 1
+    const work = inferTentativeTake()
+    let r = 0
+    while r < work.length {
+      resetReturnPending(work[r])
+      r = r + 1
+    }
+    let q = 0
+    while q < work.length {
+      const dIx = fnDeclIx[work[q]] ?? -1
+      if dIx >= 0 { preInferOne(dIx) }
+      q = q + 1
+    }
+    if inferTentative.length >= work.length { shrinking = false }
+  }
+  unresolvedFnsSet([])
+  let u = 0
+  while u < inferTentative.length {
+    unresolvedFns.push(inferTentative[u])
+    u = u + 1
+  }
+  symEnabled = savedSym
+  if prbSkip == 1 {
+    checkRollback(m, RB_LINT)
+  } else {
+    checkRollback(m, RB_RETURNS)
+  }
+  inferQuiet = false
+  if prbArmed { prbLeave("inferReturnsPrePass") }
+  0
+}
+
+// Pass 1.65: types each un-annotated module global the hoist left a placeholder, by quietly
+// checking its initializer at module scope, so a body checked before pass 2 reaches the
+// declaration reads the global's real type (D3078). A lambda, or an initializer that raises a
+// diagnostic or yields a hole, `null`, `void` or `never`, keeps the placeholder for pass 2.
+function globalInitPrePass(lets: i32[]) {
+  if lets.length == 0 { return 0 }
+  if prbArmed { prbEnter() }
+  const savedQuiet = inferQuiet
+  const savedSym = symEnabled
+  const m = checkMark()
+  inferQuiet = true
+  symEnabled = 0
+  for li in lets {
+    const ln = P.nodes[li]
+    // A lambda with an un-annotated parameter is typed where it is written: checking one early
+    // would fix those parameters before pass 2 marks them as inference holes.
+    let lambdaInit = false
+    if ln is LetDecl { lambdaInit = fsbIsHoleLambda(parenPeelIx(ln.letInit)) }
+    if ln is LetDecl && !lambdaInit {
+      const savedDiag = T.diags.length
+      // Its own flow frame, so a read of a global still in the dead zone is neither reported
+      // nor marked assigned here; pass 2 reports it where it is written.
+      const daSaved = daEnterFrame()
+      const it = checkNodeHook(ln.letInit)
+      daLeaveFrame(daSaved)
+      const clean = T.diags.length == savedDiag
+      while T.diags.length > savedDiag { T.diags.pop() }
+      numLitNotesDropFrom(savedDiag)
+      // A bare name of a top-level function is that function's own type, its type parameters
+      // included, and the alias is recorded as pass 2 would record it (D3899).
+      const aDecl = globalInitFnAlias(ln.letInit)
+      if clean && it >= 0 && it != TY_ERR && !isVoidTy(it) && !isNullTy(it) {
+        if !isNeverTy(it) && (aDecl >= 0 || !tyHasHole(it)) {
+          declare(ln.letName, constStrLitBound(ln, it))
+          if aDecl >= 0 && fnAliasScopes.length > 0 {
+            fnAliasScopes[0][ln.letName] = aDecl
+          }
+        }
+      }
+    }
+  }
+  inferQuiet = savedQuiet
+  symEnabled = savedSym
+  checkRollback(m, RB_GLOBAL_INIT)
+  if prbArmed { prbLeave("globalInitPrePass") }
+  0
+}
+
+// Before pass 2 checks top-level statement `stmt`, quietly records the deferred constraints of
+// every generic it reaches that no earlier statement did, callee before caller, so a call
+// adjudicates its callee whatever the source order (D3062). Run per statement so a body sees the
+// module values the statement sees; a cycle iterates while a table grows.
+function cstrProbeBefore(stmt: i32) {
+  if !cstrCandAny { return 0 }
+  const order: i32[] = []
+  let cyc = false
+  const sn = P.nodes[stmt]
+  if sn is FuncDecl {
+    if (cstrCandIx[sn.fnName] ?? -1) == stmt {
+      if (cstrCandState[sn.fnName] ?? 0) == 0 {
+        cyc = cstrProbeVisit(stmt, order)
+      }
+    } else {
+      cyc = cstrProbeWalk(sn.fnBody, order)
+    }
+  } else {
+    cyc = cstrProbeWalk(stmt, order)
+  }
+  // The statement itself is checked for real next, so outside a cycle it needs no probe.
+  if !cyc && order.length > 0 && order[order.length - 1] == stmt { order.pop() }
+  if order.length == 0 { return 0 }
+  if prbArmed { prbEnter() }
+  const m = checkMark()
+  const savedSym = symEnabled
+  const savedQuiet = inferQuiet
+  symEnabled = 0
+  inferQuiet = true
+  cstrProbeSet(true)
+  let rounds = 0
+  let growing = true
+  while growing && rounds < 4 {
+    rounds = rounds + 1
+    const before = cstrRowCount()
+    for oi in order {
+      const fd = P.nodes[oi]
+      if fd is FuncDecl { checkFuncDeclNode(fd, oi) }
+    }
+    growing = cyc && cstrRowCount() > before
+  }
+  cstrProbeSet(false)
+  inferQuiet = savedQuiet
+  symEnabled = savedSym
+  checkRollback(m, RB_CSTR_PROBE)
+  if prbArmed { prbLeave("cstrProbeBefore") }
+  0
+}
+
+// The program root: pass 0 registers `type` declarations (structs, then unions over
+// them), pass 1 hoists function signatures (call-before-decl + mutual recursion),
+// pass 2 checks every top-level statement.
+export function checkProgramNode(n: Program) {
+  const stmts = n.progStmts
+  // Pass 0: registers top-level struct `type` declarations before anything else, so a struct
+  // name in a param/return/let annotation or a later struct's field resolves via `nameToTy`.
+  // Pass 0a pre-registers every top-level `type` name with an empty placeholder (struct or
+  // union) so self- and forward-references inside field annotations and union variants resolve, filled in pass 0b.
+  let t0 = 0
+  while t0 < stmts.length {
+    const sd0 = P.nodes[stmts[t0]]
+    // A `type` declaration may not take a built-in type name: the checker resolves a bare
+    // name through `tsLeafTy`, which asks `primTyOfName` first, so `f64` in an annotation is
+    // the primitive while nothing screened the declaration side — a reject, not a resolution
+    // change, since making one side win would silently redefine a keyword inside one file (D1585).
+    if sd0 is TypeDecl {
+      if isBuiltinTyName(sd0.tdName) {
+        tErrBuiltinTyDecl(sd0.tdName, stmts[t0])
+      }
+    }
+    if sd0 is UnionDecl {
+      if isBuiltinTyName(sd0.udName) {
+        tErrBuiltinTyDecl(sd0.udName, stmts[t0])
+      }
+    }
+    if sd0 is TypeDecl {
+      // A bound alias (`type Showable = { toString(): string }`) registers in
+      // `cBoundDecls`, not `cUserTypes` — it constrains a type parameter and has no
+      // values, so a type-arena entry would make it spellable in value position, which
+      // the trait-object design rules out. `declaredTyOfName` turns such a use into a sentence instead.
+      const bAnn0 = declBoundOf(stmts[t0])
+      if bAnn0 >= 0 {
+        cBoundDeclsSetAt(sd0.tdName, bAnn0)
+        t0 = t0 + 1
+        continue
+      }
+      // A generic alias (`type Box<T> = …`) registers in the generic-alias registry, not
+      // `cUserTypes`, since it has no concrete type until applied — pass 0b skips it, and each
+      // application resolves its fields under the param→argument bindings (`applyGenAlias`).
+      // The nominal-newtype declaration fact is recorded now regardless, honoured only on the concrete arm below.
+      const gBase = declGpBaseOf(stmts[t0])
+      if gBase != "" {
+        gaNames.push(gBase)
+        gaDeclIxs.push(stmts[t0])
+        // D-GAPARAM: the parameter list is banked ONCE, here, into the flat
+        // column. Master re-split the joined string inside `applyGenAliasArgs`,
+        // i.e. once per APPLICATION of the alias; the list is a property of the
+        // DECLARATION and cannot change between applications.
+        const gps = declGpParamsOf(stmts[t0])
+        gaParamStart.push(gaParamNames.length)
+        gaParamCount.push(gps.length)
+        let gpi = 0
+        while gpi < gps.length {
+          gaParamNames.push(gps[gpi])
+          gpi = gpi + 1
+        }
+      } else {
+        // A bodyless alias (parser sentinel `tdFields == [-1]`) registers as the error type,
+        // since the parser already reported it; a real body builds an object placeholder pass
+        // 0b fills. Banked in the fill registry so a forward reference can demand its shape
+        // early — absent for a generic alias, which resolves under its own bindings instead.
+        cFillStmtIx[sd0.tdName] = stmts[t0]
+        const df0 = sd0.tdFields
+        const bodyless0 = df0.length == 1 && df0[0] == (-1)
+        if bodyless0 {
+          cUserTypes[sd0.tdName] = TY_ERR
+          cUserTypesVer = cUserTypesVer + 1
+        } else {
+          const fnames0: string[] = []
+          const ftys0: i32[] = []
+          const sIx0 = mkObjTy(fnames0, ftys0)
+          cUserTypes[sd0.tdName] = sIx0
+          cUserTypesVer = cUserTypesVer + 1
+          cStructPush(sIx0, sd0.tdName)
+          if sd0.tdNew == 1 {
+            nwDeclNames.push(sd0.tdName)
+            if isBodyTyDecl(stmts[t0]) { nwBodyScopedNamesSetAt(sd0.tdName, 1) }
+          }
+        }
+      }
+    } else if sd0 is UnionDecl {
+      // A one-member alias whose body is a plain type reference is transparent — decided
+      // here in pass 0a since the question is syntactic (the arena cannot tell it from a
+      // canonicalized intersection) and both readers run later. A self-cycle (`type D = D`)
+      // is excluded: it is the degenerate never-type pass 0b reports, and resolving it transparently would chase its own placeholder.
+      const uvs0 = sd0.udVariants
+      if uvs0.length == 1 && uvs0[0] != sd0.udName {
+        if aliasRefIsPlainRoot(udTsRootAt(stmts[t0], 0)) {
+          cPlainAliasNames.push(sd0.udName)
+        }
+      }
+      cFillStmtIx[sd0.udName] = stmts[t0]
+      const members0: i32[] = []
+      const uIx0 = mkUnionTy(members0)
+      cUserTypes[sd0.udName] = uIx0
+      cUserTypesVer = cUserTypesVer + 1
+      cTyIxSetAdd(cUnionTyIxs, cUnionTyIxSet, uIx0)
+      cUnionNames.push(sd0.udName)
+      if sd0.udNew == 1 {
+        nwDeclNames.push(sd0.udName)
+        if isBodyTyDecl(stmts[t0]) { nwBodyScopedNamesSetAt(sd0.udName, 1) }
+      }
+    }
+    t0 = t0 + 1
+  }
+  // Pass 0b: resolves each declaration's fields/variants into the placeholder, in demand
+  // order rather than source order — `fillTypeDeclAt` re-enters from `declaredTyOfName`
+  // whenever a body names a declaration the walk has not reached, so a forward reference
+  // resolves against the filled shape regardless of which declaration came first.
+  cFillDoneAtSet([])
+  cFillActiveSet(true)
+  // A pure string-literal union alias fills ahead of the driver, because the reference to it
+  // is by member set, not by name (D1151): an inline `{ k: "a" | "b" }` reaches for the alias
+  // through `litUnionAliasTyOfMembers`, which scans for a filled litunion with exactly these
+  // members — so an un-filled placeholder would mint a second, unregistered union for the same spelling.
+  let li = 0
+  while li < stmts.length {
+    const ls = P.nodes[stmts[li]]
+    if ls is UnionDecl {
+      if udVariantsAllStrLit(ls.udVariants) { fillTypeDeclAt(stmts[li]) }
+    }
+    li = li + 1
+  }
+  let ti = 0
+  while ti < stmts.length {
+    fillTypeDeclAt(stmts[ti])
+    ti = ti + 1
+  }
+  cFillActiveSet(false)
+  // Pass 0c: MEASURE every `flat type` (webcraft P1.2). Runs here because it needs
+  // pass 0b's resolved field types (a scalar's width is read off the arena, which
+  // is what makes a newtype over a scalar work for free) and must precede any
+  // expression checking, since `N.size` / `N.field` fold against this sidecar.
+  resolveFlatLayouts(stmts)
+  // Pass 0d: refuse a declared union whose set and map arms clash. Runs after 0b has filled
+  // every arm, since a declaration cycle can leave a member a placeholder inside the fill.
+  checkUnionSetMapClash(stmts)
+  // Pass 1: hoist top-level function signatures so call-before-decl and mutual
+  // recursion type-check.
+  let hi = 0
+  while hi < stmts.length {
+    const s = P.nodes[stmts[hi]]
+    // D1645 — a nameless `FuncDecl` is an arrow lambda at statement position, an
+    // expression whose value is discarded: it binds no name, so nothing hoists it.
+    // `declare("")` files every one of them under one key, which reports the second as
+    // `redeclared` with a blank name and banks a pending return nothing patches.
+    if s is FuncDecl && s.fnName.length > 0 {
+      // A SECOND top-level `function` of the same name is a redeclaration error,
+      // exactly like a duplicate `let`/`const` (B16). Without this the later
+      // hoist silently overwrites the earlier one and the last body wins.
+      if (fnDeclIx[s.fnName] ?? -1) >= 0 {
+        // `opDeclLabel` is the identity on an ordinary name; an index operator
+        // reads back as `"[]" for F32View` rather than as its minted spelling.
+        tErr("redeclared " + getDeclLabel(opDeclLabel(s.fnName)), stmts[hi])
+      }
+      const hp = s.fnParams
+      const hpt: i32[] = []
+      let k = 0
+      while k < hp.length {
+        const hpn = P.nodes[hp[k]]
+        let t = TY_ERR
+        if hpn is Param {
+          if hpn.parType >= 0 {
+            const hptn = P.nodes[hpn.parType]
+            if hptn is TypeRef {
+              const r = resolveAnnotAt(
+                hptn.tyName,
+                s.fnTyParams,
+                hpn.parType,
+                s.fnName,
+              )
+              if r >= 0 { t = r }
+            }
+          } else {
+            // An un-annotated param hoists as its inference hole (the same declaration+
+            // position name `checkFuncDeclNode` mints, so a forward call binds the identical
+            // hole by name) — or as the type pass 1.8's solve pinned it to, via
+            // `unannotParamTy`, which keeps this hoist and the body from disagreeing.
+            t = unannotParamTy(paramHoleName(s.fnName, stmts[hi], k))
+          }
+        }
+        hpt.push(t)
+        k = k + 1
+      }
+      // An UN-ANNOTATED return hoists as the PENDING sentinel (-2): the real type
+      // is inferred from the body in pass 2 (or on demand at a forward call site),
+      // then PATCHED into this same TyFunc in place.
+      let hret = -2
+      if s.fnRet >= 0 {
+        const hrtn = P.nodes[s.fnRet]
+        if hrtn is TypeRef {
+          const r = resolveRetAnnotAt(
+            hrtn.tyName,
+            s.fnTyParams,
+            s.fnRet,
+            s.fnName,
+          )
+          // D1048's second hint, recorded order-independently: this hoist is the only pass
+          // that resolves every top-level return before any body runs, so a `const r = f(…)`
+          // written above `function f(): R` still inherits the provenance.
+          if r >= 0 && r == collapsedTy { markCollapsedRet(stmts[hi]) }
+          if r >= 0 { hret = r } else { hret = TY_VOID }
+        }
+      }
+      // A result no caller reads is not returned: hoisted as the `: void` it is checked as.
+      if hret == (-2) && fnResultUnconsumed(stmts[hi]) { hret = TY_VOID }
+      declare(s.fnName, mkFuncTy(hpt, hret))
+      fnDeclIx[s.fnName] = stmts[hi]
+      declareFnDeclNode(s.fnName, stmts[hi])
+      // A getter registers under its receiver type, the only route by which a read finds it.
+      const gProp = getDeclPropOf(s.fnName)
+      if gProp != "" && hpt.length == 1 {
+        getFns.push(s.fnName)
+        getProps.push(gProp)
+        getDecls.push(stmts[hi])
+        getSelfTys.push(hpt[0])
+      }
+      // REGISTER a free index operator (B14). Its ARITY is fixed by the operator
+      // — `"[]"` is (self, index), `"[]="` is (self, index, value) — and checking
+      // it here means a malformed declaration is reported once, at itself, rather
+      // than at every use site that fails to resolve.
+      const opk = opDeclOpOf(s.fnName)
+      if opk == OP_INDEX_GET || opk == OP_INDEX_SET {
+        let want = 2
+        if opk == OP_INDEX_SET { want = 3 }
+        if hp.length != want {
+          tErr(
+            "operator "
+              + opDeclLabel(s.fnName)
+              + " takes "
+              + i32ToStr(want)
+              + " parameters (self, index"
+              + opIdxArityTail(opk)
+              + "), got "
+              + i32ToStr(hp.length),
+            stmts[hi],
+          )
+        } else if opIdxDeadRecv(hpt[0]) {
+          // The swallow, said out loud (D445): indexing an array, a map or a string is the
+          // language's, never a user operator's, so a declaration over one of them is not a
+          // dispatch that fails to happen — it is one the language already decided will never
+          // happen, named here at the declaration rather than silently at every use site.
+          tErr(
+            "operator "
+              + opDeclLabel(s.fnName)
+              + " can never dispatch: indexing "
+              + tyToStr(hpt[0])
+              + " is the language's own, never a user operator's",
+            stmts[hi],
+          )
+        } else {
+          opIdxOps.push(opk)
+          opIdxFns.push(s.fnName)
+        }
+      } else if isBinOpDecl(s.fnName) {
+        // A BINARY operator: register it under its SYMBOL in the operator table `opSelfFnTy`'s
+        // receiver scan reads, so several receiver types can each define the symbol and
+        // dispatch resolves by the left operand's type (B14 generalized). Both a receiver-keyed
+        // `+@Vec3` and a bare `+` (unannotated/hole `self`) register under `+` (D1934).
+        let binSym = s.fnName
+        if opk != "" { binSym = opk }
+        opIdxOps.push(binSym)
+        opIdxFns.push(s.fnName)
+      }
+      // The swallow at the binary operators, said out loud (D425) — the twin of the index
+      // gate above: `checkBinary` reaches `opSelfFnTy` only when the left operand is an
+      // object, so a declaration whose `self` is not one is not a dispatch that fails, it is
+      // one the language already decided will never happen. Disjoint from D471's first-parameter-name gate (checked in the parser), so a declaration failing both gets the name diagnostic only.
+      if isBinOpDecl(s.fnName) {
+        if hp.length == 2 {
+          let selfNamed = false
+          // Whether `self` carries an ANNOTATION at all (D491) — read inside the `is
+          // Param` narrowing, which is the only place the field exists.
+          let selfAnn = false
+          const bp0 = P.nodes[hp[0]]
+          if bp0 is Param {
+            if bp0.parName == "self" { selfNamed = true }
+            if bp0.parType >= 0 { selfAnn = true }
+          }
+          if selfNamed {
+            if binOpDeadSelf(hpt[0]) {
+              tErr(
+                "operator `"
+                  + opDeclLabelBin(s.fnName)
+                  + "` can never dispatch: `self` is the LEFT OPERAND and dispatch needs an object, but "
+                  + tyToStr(hpt[0])
+                  + " is not one",
+                stmts[hi],
+              )
+            } else {
+              // The hole this gate subtracts (D491) is banked, not judged — whether this
+              // declaration fires is decided at the sites (`checkProgramEndOpDecls`). Both hole
+              // spellings are banked as one population: `function "+"(self, other)` hoists its
+              // parameter as a fresh type variable, so `tyHasHole` is true of it exactly as of `self: T` (D521).
+              if hpt[0] >= 0 {
+                if tyHasHole(hpt[0]) {
+                  // Banked under the bare SYMBOL, not the receiver-keyed decl name: D491 is a
+                  // whole-program question ("does this operator ever dispatch"), and the site
+                  // side (`opBinSiteTook`) records the symbol, so both halves must key alike. A
+                  // `self: T` op mints `+@T` but the question it answers is about `+`.
+                  const holeSym = opDeclOpOf(s.fnName)
+                  let holeKey = s.fnName
+                  if holeSym != "" { holeKey = holeSym }
+                  opBinHoleDeclNamePush(holeKey)
+                  opBinHoleDeclNodePush(stmts[hi])
+                  opBinHoleDeclAnnPush(selfAnn)
+                }
+              }
+            }
+          }
+        }
+      }
+      // Collect un-annotated returns (hoisted as the `-2` pending sentinel) for the
+      // return-inference pre-pass.
+      if hret == (-2) { topUnannotFns.push(stmts[hi]) }
+      // Completion visibility: a top-level function is global. Stamped here (only
+      // the global scope is open) so it wins over any later demand-inference
+      // re-entry, which would run the body from a deeper stack (see `symStampVis`).
+      if symEnabled != 0 {
+        symStampVis(s.fnName, stmts[hi], 2, scopeSL.length - 1)
+      }
+    }
+    hi = hi + 1
+  }
+  // Pass 1.5 hoists top-level value bindings (names + types) so a function body sees every
+  // module-level value regardless of source order, making the module scope order-independent.
+  // Initialization order still matters for straight-line top-level code — each global joins
+  // the definite-assignment dead-zone here — but a function body runs at call time, so a deferred read from inside one is correctly not flagged.
+  lbiScanModLits(stmts)
+  modClashNamesSet(Map())
+  let mi = 0
+  const phLets: i32[] = []
+  while mi < stmts.length {
+    const sm = P.nodes[stmts[mi]]
+    if sm is LetDecl {
+      // A top-level `function` and a top-level value binding share one scope and one
+      // namespace, so the pair is the redeclaration the two same-kind rules already refuse
+      // and a module merge refuses at parse. Anchored at the LATER declaration, since the
+      // two hoists run in kind order and not in source order (D1661).
+      const xfn = fnDeclIx[sm.letName] ?? -1
+      if xfn >= 0 && !(moduleGlobals[sm.letName] ?? false) {
+        let at = stmts[mi]
+        if xfn > at { at = xfn }
+        tErr("redeclared " + sm.letName, at)
+        modClashNames[sm.letName] = true
+      }
+      if moduleGlobals[sm.letName] ?? false {
+        // A genuine top-level redeclaration — reported here (pass 2 skips its own
+        // redeclare check for module globals, since the hoist owns the declaration).
+        tErr("redeclared " + sm.letName, stmts[mi])
+      } else {
+        let mty = TY_ERR
+        if sm.letType >= 0 {
+          const mtn = P.nodes[sm.letType]
+          if mtn is TypeRef {
+            const r = nameToTyAt(mtn.tyName, sm.letType)
+            if r >= 0 { mty = r }
+          }
+        } else if sm.letInit >= 0 {
+          // Un-annotated: peeks only at a literal initializer (side-effect free). A `checkNode`
+          // here would prematurely demand-infer callees and patch their hoisted return types,
+          // corrupting the real pass-2 result, so a non-literal init stays an error placeholder
+          // that pass 2 overwrites with its real type.
+          const initN = P.nodes[sm.letInit]
+          if initN is NumLit {
+            if numLexIsFloat(initN.numText) { mty = TY_F64 }
+            else if numLexFitsI32(initN.numText) { mty = TY_I32 }
+            else { mty = TY_I64 }
+          } else if initN is StrLit {
+            mty = TY_STR
+            if sm.letKw == "const" {
+              mty = mkWideStrLitTy(initN.strText, TY_STR)
+            }
+          } else if initN is CharLit {
+            mty = TY_I32
+          } else if initN is BoolLit {
+            mty = TY_BOOL
+          }
+        }
+        declare(sm.letName, mty)
+        if sm.letKw == "const" { moduleConstDecl[sm.letName] = stmts[mi] }
+        if mty == TY_ERR && sm.letType < 0 && sm.letInit >= 0 {
+          phLets.push(stmts[mi])
+        }
+        if letDeclIsUnannotObjLit(stmts[mi]) {
+          markObjLitBinding(sm.letName, 0)
+        }
+        if letDeclIsUnannotCtnLit(stmts[mi]) {
+          markCtnLitBinding(sm.letName, 0, sm.letInit)
+        }
+        markNumLitBinding(sm.letName, 0, stmts[mi])
+        let lbiTy0 = mty
+        if sm.letType < 0 && sm.letInit >= 0 {
+          const lit0 = lbiInitLit(sm.letInit)
+          if lit0 >= 0 { lbiTy0 = lbiLitDefault(lit0) }
+        }
+        lbiMark(sm.letName, 0, stmts[mi], lbiTy0)
+        markFnLitBinding(sm.letName, 0, stmts[mi])
+        moduleGlobals[sm.letName] = true
+        if sm.letKw == "const" && sm.letInit >= 0 {
+          const cin = P.nodes[parenPeelIx(sm.letInit)]
+          if cin is NumLit {
+            if !numLexIsFloat(cin.numText) {
+              moduleConstIntInitSetAt(sm.letName, parenPeelIx(sm.letInit))
+            }
+          }
+        }
+        // TDZ: in the dead-zone until pass 2 reaches the initializer.
+        daAdd(sm.letName)
+        moduleBeforeDecl[sm.letName] = stmts[mi]
+      }
+    }
+    mi = mi + 1
+  }
+  // Pass 1.6: solve every un-annotated PARAMETER from its body's usage, BEFORE any
+  // expression is checked — so a call site binds the solved parameter type whatever
+  // the source order, and before pass 1.7 infers returns against it. See
+  // `solvedParamTys`.
+  let sp = 0
+  while sp < stmts.length {
+    const sps = P.nodes[stmts[sp]]
+    if sps is FuncDecl { solveUnannotParams(stmts[sp]) }
+    sp = sp + 1
+  }
+  globalInitPrePass(phLets)
+  // Pass 1.7: return-inference pre-pass — resolve every un-annotated return (cycles
+  // included, via the binding-group fixpoint) BEFORE checking bodies, so pass 2 sees
+  // final return types and a recursive function needs no return annotation.
+  inferReturnsPrePass()
+  // Pass 1.9: the generic bodies pass 2 walks for their constraints (`cstrProbeBefore`).
+  cstrPrePass(stmts)
+  // Pass 2: check every top-level statement (bodies included).
+  let j = 0
+  while j < stmts.length {
+    cstrProbeBefore(stmts[j])
+    markValDiscard(stmts[j])
+    crStmtEnter(stmts[j])
+    checkNodeHook(stmts[j])
+    crStmtLeave()
+    j = j + 1
+  }
+  // A function whose return never resolved (a genuinely base-case-less recursive
+  // cycle) — the fixpoint found no concrete basis. Reported here, after the real
+  // pass (the pre-pass suppressed it).
+  let uf = 0
+  while uf < unresolvedFns.length {
+    const ufIx = fnDeclIx[unresolvedFns[uf]] ?? -1
+    if ufIx >= 0 {
+      const ufn = P.nodes[ufIx]
+      if ufn is FuncDecl {
+        inferNoBasisErr(unresolvedFns[uf], ufIx, ufn.fnBody)
+      }
+    }
+    uf = uf + 1
+  }
+  bareBraceUndelivered()
+  // LAST, because both of its filters read state this pass fills — see its header.
+  annCommitVariantMembers()
+  TY_VOID
+}

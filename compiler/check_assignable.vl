@@ -1,0 +1,1937 @@
+// Whether an expression can be delivered to a type (`assignableExpr`), and the constraint
+// re-validation that rides a delivery: a generic function value's inherited constraints, a
+// call's argument, return, binding and method constraints, and the `if` joins a type
+// parameter pinned. The per-kind checkers reach `checkNode` through `checkNodeHook`.
+
+import {
+  ArrayLit,
+  Block,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  Node,
+  NumLit,
+  ObjLit,
+  P,
+  Param,
+  Paren,
+  Spread,
+  Unary,
+  addNode,
+  adoptNodeTok,
+  arenaSetNode,
+  i32ToStr,
+  mkCall,
+  mkParam,
+  spreadArgOf,
+} from "./ast"
+import {
+  fvaAnnot,
+  fvaRefuse,
+  fvaRefuseNested,
+  fvaUnionArm,
+} from "./check_annot_resolve"
+import {
+  fsbCallArgTys,
+  fsbCallArgTysPush,
+  fsbCallDecl,
+  fsbCallDeclPush,
+  fsbCallHNames,
+  fsbCallHNamesPush,
+  fsbCallHNo,
+  fsbCallHNoPush,
+  fsbCallHNode,
+  fsbCallHNodePush,
+  fsbCallIx,
+  fsbCallIxPush,
+  fsbCallOwnN,
+  fsbCallOwnNPush,
+  fsbCallOwnNSetAt,
+  fsbCallUsed,
+  fsbCallUsedPush,
+  fsbCallWho,
+  fsbCallWhoPush,
+  fsbDeclAtNode,
+  fsbName,
+  fsbOwnDecl,
+  fsbOwnFn,
+  fsbOwnTy,
+  nolNoteDelivery,
+} from "./check_bind_rows"
+import {
+  bareBraceSpec,
+  bareBraceSpecSet,
+  cbSeedUsed,
+  cbSeedUsedSet,
+  checkNodeHook,
+  cstrProbe,
+  fvaDone,
+  fvaNamesGeneric,
+  fvaNoteNameDecl,
+  fvaStableName,
+  genFnCstrBusy,
+  genFnCstrBusySet,
+  retNatural,
+  retNaturalErr,
+  retNaturalErrSet,
+  retNaturalSet,
+} from "./check_core_state"
+import { rcwPinProbe } from "./check_covar_pins"
+import { covarWriteThrough } from "./check_covar_write"
+import { cstrCandAny } from "./check_cstr_probe"
+import {
+  CV_ARG,
+  CV_BM,
+  CV_LET,
+  CV_RET,
+  argCstr,
+  bmCstr,
+  cstrOwnerTop,
+  cvNow,
+  cvPick,
+  letCstr,
+  noteArgCstr,
+  noteBmCstr,
+  noteLetCstr,
+  noteRetCstr,
+  retCstr,
+} from "./check_cstr_rows"
+import {
+  cstrOwnerStack,
+  curFnDeclIx,
+  inferQuiet,
+  njFnStack,
+  tpEnvNames,
+  tpEnvTys,
+} from "./check_cursor"
+import { wrUnreachedBy } from "./check_decl_scan"
+import {
+  argCstrErr,
+  argFlowErr,
+  bareBraceDeliver,
+  monoRecheckEnd,
+  pinBmCstrElems,
+  validateBinCstrs,
+  validateIsCstrs,
+  validateMemCstrs,
+  validateNestCstrs,
+  validatePrintCstrs,
+  validateUfcsCstrs,
+} from "./check_demands"
+import { bmArgMsg, tpMembersListText } from "./check_diag_text"
+import { callDstTyOf, setCallDstTy } from "./check_expected"
+import {
+  cexDeliver,
+  covarTwoUnionsErr,
+  covarWriteThroughErr,
+  litElemSrcTy,
+  nomLitAdopts,
+  objLitUndeclaredErr,
+  objShapeAdapterlessAt,
+  objShapeAdapterlessErr,
+  radixLitAdoptDst,
+  rcwPend,
+  recAdForce,
+  recordListFieldWidenAdopt,
+  recordMapUnbox,
+  recordRepTyAdopt,
+} from "./check_fit_rules"
+import {
+  CSTR_NODECL,
+  fsbOwnerCallee,
+  genericBodyClosed,
+} from "./check_generic_args"
+import { HD_PARAM, hdKindIs } from "./check_hole_pins"
+import { lbiNoteDelivery } from "./check_lbi_notes"
+import {
+  ACF_COMP,
+  SUBST_DECLARED,
+  arrLitJoinUnionElem,
+  bindOf,
+  callGenericDeclIx,
+  dstForArgs,
+  dstTyOpen,
+  f32ElemsAdoptedOver,
+  f32ListUnder,
+  fvaLambda,
+  holeArgOriginNode,
+  lwStoreDst,
+  lwStoreVal,
+  noteHoleFlow,
+  objLitHasDupKey,
+  objLitSetsUndeclared,
+} from "./check_leaf_steps"
+import {
+  luAt,
+  luGrow,
+  luRef,
+  monoRecheckDepth,
+  monoRecheckDepthSet,
+  tpIfCmpBad,
+  tpIfCmpBadSet,
+  tpIfCmpNamesSet,
+  tpIfCmpOnSet,
+  tpIfCmpTysSet,
+  tpIfRowBuilt,
+} from "./check_list_union"
+import {
+  litPinN,
+  litPinNSet,
+  litPinT,
+  litPinTSet,
+  litUnionOneBase,
+  recordElemRepArrayLit,
+  u8LexValue,
+} from "./check_literals"
+import { litTyOfExpr } from "./check_match_desugar"
+import {
+  BM_ADDKEY,
+  BM_KEYMUST,
+  BM_PUSH,
+  BM_SETKEY,
+  BM_SETVAL,
+} from "./check_messages"
+import { boolForNumberNote, letAssignMsg } from "./check_mismatch_notes"
+import { narListDeliveryErr } from "./check_narrow_flow"
+import { crFnEnter, pushScope } from "./check_narrow_paths"
+import {
+  collectRetValues,
+  njExprHeld,
+  njFnIx,
+  njFnIxSet,
+} from "./check_nj_join"
+import { fsbArgsFit, fsbBindParams } from "./check_node_rules"
+import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
+import {
+  f32LitTailsAdopt,
+  litTreeAdoptDst,
+  mapDeliveryMayRecord,
+} from "./check_num_adopt"
+import {
+  anyArgIsLitOnly,
+  argIsLitOnly,
+  argIsNullLit,
+  cexConverted,
+  cexFloatUse,
+  nlAsgTgt,
+} from "./check_num_lit_state"
+import { isExactF64IntLitExpr, isF32AdoptingLitExpr } from "./check_num_lits"
+import { recordNullHoleObjAdopt } from "./check_obj_shape"
+import { parenPeelIx } from "./check_places"
+import { recOwnPend, recPend } from "./check_rec_rows"
+import { noteRefListView } from "./check_ref_list_view"
+import {
+  argCstrFits,
+  assignable,
+  bindGenWalk,
+  fnValVoidCoerce,
+  joinLitsFitAt,
+  substTyDeep,
+  tErr,
+  widenLitTy,
+} from "./check_relate_core"
+import { recordListWidenRetag } from "./check_retag_rows"
+import {
+  MonoSave,
+  RB_PINNED,
+  checkMark,
+  checkRollback,
+  prbArmed,
+  prbEnter,
+  prbLeave,
+} from "./check_rollback"
+import { declare, lookup, lookupFnDeclNode } from "./check_scopes"
+import { symEnabled } from "./check_state"
+import {
+  CSTR_ANYFN,
+  SUBST_ALL,
+  SUBST_HOLES,
+  SUBST_NESTED,
+  cstrOwnedBy,
+  cstrOwnedStrict,
+  cstrOwnedStrictSet,
+  nestCstrOutside,
+  nestParentOf,
+  substNestDecl,
+  substNestDeclSet,
+  substNestMode,
+  substNestModeSet,
+  tyVarsOfEnclosingGeneric,
+} from "./check_subst"
+import {
+  noteTpIfRe,
+  tpIfFn,
+  tpIfFnHasRow,
+  tpIfJoin,
+  tpIfReCount,
+  tpIfReFn,
+  tpIfReNames,
+  tpIfReOwner,
+  tpIfReParams,
+  tpIfReStart,
+  tpIfReTys,
+  tyIsDeferredJoin,
+} from "./check_tp_join"
+import {
+  fvaFnMayDiffer,
+  fvaNestedFnDiffers,
+  litNumUnionConverts,
+  scalarPrimPair,
+} from "./check_ty_relate"
+import { nomBaseTyIx, unionArmBoxSafe } from "./check_ty_rep"
+import {
+  dstAdmitsF32,
+  dstAdmitsF64,
+  fnTyHasHole,
+  numKindMask,
+} from "./check_type_shape"
+import {
+  T,
+  TY_ERR,
+  TY_I32,
+  TY_NEVER,
+  TY_NULL,
+  TY_VOID,
+  TyArray,
+  TyFunc,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  nwTyIxs,
+  objFieldType,
+  tyArrayElemIx,
+  tyHasHole,
+  tyIsHole,
+  tyIsLitUnion,
+  tyIsNewtypeBrand,
+  tyIsNicheNulScalarElem,
+  tyMayHoldFn,
+  tyMentionsTyVarNamed,
+  tyReachesBrand,
+  tyReachesEmptyHole,
+  tyReachesUnion,
+  tySame,
+  tyToStr,
+  tyUnionAllLists,
+  tyWideUnionMinted,
+} from "./check_types"
+import { numUnionConverts, numUnionMinted } from "./check_union_mint"
+import { wideLitByNode } from "./check_wide_lits"
+import { argLitAt, wsSuppress } from "./check_width"
+import { fnDeclIx } from "./check_write_scan"
+import { numLexIsFloat } from "./emit_bignum"
+import { nodePos } from "./fmt_util"
+import {
+  flattenVariantsInto,
+  isVoidTy,
+  nonNullTy,
+  primNameOf,
+  tyAdmitsNull,
+  tyHasTyVar,
+  tyIsLitUnionLike,
+  tyReachesHole,
+  tysHaveTyVarIn,
+  unionMemberCountOf,
+} from "./tyquery"
+
+// Record call `ix` through the marked binding `decl`, which re-asked the constraints `used` owns,
+// with what it bound; `fsbRecheckCalls` re-asks those of every other function written to it.
+export function fsbNoteCall(
+  ix: i32,
+  decl: i32,
+  used: i32,
+  who: string,
+  hNames: string[],
+  hNo: i32[],
+  hNode: i32[],
+  argTys: i32[],
+) {
+  if decl < 0 || inferQuiet { return 0 }
+  fsbCallArgTysPush(argTys)
+  fsbCallIxPush(ix)
+  fsbCallDeclPush(decl)
+  fsbCallUsedPush(used)
+  fsbCallWhoPush(who)
+  fsbCallHNamesPush(hNames)
+  fsbCallHNoPush(hNo)
+  fsbCallHNodePush(hNode)
+  fsbCallOwnNPush(0)
+  // The writes already seen are re-asked here, inside the body the call stands in, so a pair
+  // naming that body's type parameter is deferred to its instances as a direct call's is.
+  fsbRecheckFrom(fsbCallIx.length - 1)
+}
+
+// Re-ask, at call `c`, each owner row recorded since it last asked.
+export function fsbRecheckFrom(c: i32) {
+  if c < 0 || c >= fsbCallOwnN.length { return 0 }
+  let w = fsbCallOwnN[c]
+  while w < fsbOwnDecl.length {
+    if fsbOwnDecl[w] == fsbCallDecl[c] {
+      fsbRecheckOne(c, fsbOwnFn[w], fsbOwnTy[w])
+    }
+    w = w + 1
+  }
+  fsbCallOwnNSetAt(c, fsbOwnDecl.length)
+  0
+}
+
+// One call `c` re-asks owner `o`'s constraints with each type-variable parameter of the written
+// function type `rt` bound, by position, to the argument the call passes there. Only the written
+// function's own parameters are bound: the seed's type variables name another declaration's.
+function fsbRecheckOne(c: i32, o: i32, rt: i32) {
+  const nm: string[] = []
+  const ty: i32[] = []
+  const added = fsbBindParams(rt, fsbCallArgTys[c], nm, ty)
+  if added == 0 || o == fsbCallUsed[c] { return 0 }
+  if !fsbArgsFit(c, rt, nm, ty) { return 0 }
+  const modeWas = substNestMode
+  const declWas = substNestDecl
+  substNestModeSet(SUBST_ALL)
+  if o >= 0 { substNestModeSet(SUBST_DECLARED) }
+  const ix = fsbCallIx[c]
+  const who = fsbCallWho[c]
+  const callee = fsbOwnerCallee(o)
+  cstrOwnedStrictSet(o >= 0)
+  validateBinCstrs(
+    nm,
+    ty,
+    ix,
+    callee,
+    who,
+    fsbCallHNames[c],
+    fsbCallHNo[c],
+    fsbCallHNode[c],
+  )
+  validatePrintCstrs(nm, ty, ix, callee, who)
+  validateIsCstrs(nm, ty, ix, callee, who)
+  validateArgCstrs(nm, ty, ix, callee, fsbCallHNames[c], fsbCallHNode[c])
+  validateRetCstrs(nm, ty, ix, callee, who)
+  validateLetCstrs(nm, ty, ix, callee, who)
+  validateBmCstrs(nm, ty, ix, callee, who)
+  validateMemCstrs(
+    nm,
+    ty,
+    ix,
+    callee,
+    who,
+    fsbCallHNames[c],
+    fsbCallHNo[c],
+    fsbCallHNode[c],
+  )
+  cstrOwnedStrictSet(false)
+  substNestModeSet(modeWas)
+  substNestDeclSet(declWas)
+  0
+}
+
+// A delivery of the marked binding `src` to the concrete function type `dst` is a call at `dst`'s
+// parameters for every function written to it (D3968).
+function fsbNoteFnDelivery(src: i32, dst: i32) {
+  if dst < 0 || dst >= T.tys.length || src < 0 { return 0 }
+  const f = T.tys[dst]
+  // An element of an array literal, or a field of an object literal, is delivered to the
+  // destination's element or field type.
+  const sn = P.nodes[parenPeelIx(src)]
+  if f is TyNullable { return fsbNoteFnDelivery(src, f.nInner) }
+  if sn is ArrayLit {
+    if f is TyArray {
+      for e in sn.arrElems { fsbNoteFnDelivery(e, f.aElem) }
+    }
+    return 0
+  }
+  if sn is ObjLit {
+    if f is TyObj {
+      for fi in sn.objFields {
+        const fn = P.nodes[fi]
+        if fn is FieldInit {
+          fsbNoteFnDelivery(fn.fiValue, objFieldType(f, fn.fiName))
+        }
+      }
+    }
+    return 0
+  }
+  if !(f is TyFunc) || tyHasTyVar(dst) { return 0 }
+  const d = fsbDeclAtNode(src)
+  if d < 0 { return 0 }
+  const args: i32[] = []
+  for p in f.fnParamTypes { args.push(p) }
+  const none: string[] = []
+  const noIx: i32[] = []
+  const noNode: i32[] = []
+  fsbNoteCall(src, d, CSTR_ANYFN, "", none, noIx, noNode, args)
+}
+
+// The if-joins of `calleeFn` a call re-asks at its bindings: a join that stays apart there
+// re-checks the callee's body at the pinned parameter types `pTys`, and one still open (a
+// generic caller) is parked until the caller's own pin (D2832).
+export function validateTpIfJoins(
+  bNames: string[],
+  bTys: i32[],
+  pTys: i32[],
+  retTy: i32,
+  ix: i32,
+  calleeFn: i32,
+) {
+  if calleeFn < 0 || monoRecheckDepth > 0 || inferQuiet { return 0 }
+  const owner = cstrOwnerTop()
+  if tysHaveTyVarIn(bTys) {
+    if owner >= 0 && tpIfFnHasRow(calleeFn) {
+      noteTpIfRe(calleeFn, owner, bNames, bTys, pTys)
+    }
+  } else {
+    tpIfPinCheck(calleeFn, pTys, bNames, bTys, retTy, ix)
+  }
+  // The joins a generic callee of this body left open, now pinned in this body's terms.
+  const n0 = tpIfReFn.length
+  let r = 0
+  while r < n0 {
+    if tpIfReOwner[r] == calleeFn {
+      const rNames: string[] = []
+      const rTys: i32[] = []
+      let q = 0
+      while q < tpIfReCount[r] {
+        rNames.push(tpIfReNames[tpIfReStart[r] + q])
+        rTys.push(substTyDeep(tpIfReTys[tpIfReStart[r] + q], bNames, bTys))
+        q = q + 1
+      }
+      const rParams: i32[] = []
+      const ps = tpIfReParams[r]
+      let pi = 0
+      while pi < ps.length {
+        rParams.push(substTyDeep(ps[pi], bNames, bTys))
+        pi = pi + 1
+      }
+      if tysHaveTyVarIn(rTys) {
+        if owner >= 0 { noteTpIfRe(tpIfReFn[r], owner, rNames, rTys, rParams) }
+      } else {
+        tpIfPinCheck(tpIfReFn[r], rParams, rNames, rTys, -1, ix)
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The joins of `fn` at the concrete bindings `bNames`/`bTys`: one that stays apart where it is
+// not built as a union refuses the call, and otherwise the body is re-checked there.
+function tpIfPinCheck(
+  fn: i32,
+  pTys: i32[],
+  bNames: string[],
+  bTys: i32[],
+  retTy: i32,
+  ix: i32,
+) {
+  let apartJ = -1
+  let unbuilt = -1
+  let k = 0
+  while k < tpIfFn.length {
+    if tpIfFn[k] == fn {
+      const sj = substTyDeep(tpIfJoin[k], bNames, bTys)
+      if sj >= 0 && !tyHasTyVar(sj) && tyUnionAllLists(sj) {
+        // The widest names the whole chain of an `else if`, whose links are rows too.
+        if apartJ < 0 || unionMemberCountOf(sj) > unionMemberCountOf(apartJ) {
+          apartJ = sj
+        }
+        if unbuilt < 0 && !tpIfRowBuilt(k) { unbuilt = sj }
+      }
+    }
+    k = k + 1
+  }
+  if apartJ < 0 { return 0 }
+  let msg = ""
+  if unbuilt >= 0 {
+    apartJ = unbuilt
+    msg = "no one list holds it where its value goes — bind it to a `const`, or deliver it where its union is declared"
+  } else {
+    msg = tpIfRecheck(fn, pTys, bNames, bTys, retTy)
+  }
+  if msg == "" { return 0 }
+  let fWho = "the callee's body"
+  const fd = P.nodes[fn]
+  if fd is FuncDecl {
+    if fd.fnName != "" { fWho = "the body of `" + fd.fnName + "`" }
+  }
+  tErr(
+    "at the call's argument types, the branches of an `if` or `match` in "
+      + fWho
+      + " join "
+      + tpMembersListText(apartJ)
+      + ": "
+      + msg,
+    ix,
+  )
+  0
+}
+
+// Re-checks the body of `fn` at the pinned parameter types `pTys`, where a join of its is a
+// union of lists, and answers the first sentence that body earns there ("" for none). A value
+// the body hands back is held to the call's type `retTy` (-1: not asked), and a list or record
+// the instance would build of the join at the template's one-list type is refused.
+function tpIfRecheck(
+  fn: i32,
+  pTys: i32[],
+  bNames: string[],
+  bTys: i32[],
+  retTy: i32,
+): string {
+  const dn = P.nodes[fn]
+  if !(dn is FuncDecl) { return "" }
+  let i = 0
+  while i < pTys.length {
+    if pTys[i] < 0 || tyHasTyVar(pTys[i]) { return "" }
+    i = i + 1
+  }
+  let want = retTy
+  if want >= 0 && (tyHasTyVar(want) || want == TY_ERR || isVoidTy(want)) {
+    want = -1
+  }
+  if prbArmed { prbEnter() }
+  const cs = checkMark()
+  const savedRet = T.curRet
+  const savedFn = curFnDeclIx
+  const savedNat = retNatural
+  const savedNatErr = retNaturalErr
+  // An unasked return is `TY_ERR`, which every value passes: `-2` would bank the returns as
+  // witnesses of whatever function is being inferred around this call.
+  if want >= 0 { T.curRet = want } else { T.curRet = TY_ERR }
+  curFnDeclIx = fn
+  const savedNjFn = njFnIx
+  njFnIxSet(fn)
+  cstrOwnerStack.push(fn)
+  tpIfCmpNamesSet(bNames)
+  tpIfCmpTysSet(bTys)
+  tpIfCmpBadSet("")
+  tpIfCmpOnSet(true)
+  const d0 = T.diags.length
+  let msg = ""
+  const sv = monoRecheckBegin(fn, pTys, bNames, bTys)
+  if sv != null {
+    if T.diags.length > d0 { msg = T.diags[d0].tmsg }
+    if msg == "" && want >= 0 {
+      const rets: i32[] = []
+      collectRetValues(dn.fnBody, rets)
+      let r = 0
+      while r < rets.length && msg == "" {
+        const rt = checkNodeHook(rets[r])
+        if rt >= 0 && rt != TY_ERR && rt != TY_VOID && rt != TY_NEVER {
+          if !assignable(rt, want) {
+            msg = "it returns "
+              + tyToStr(rt)
+              + ", which the call reads as "
+              + tyToStr(want)
+          }
+        }
+        r = r + 1
+      }
+    }
+    monoRecheckEnd(sv)
+  }
+  tpIfCmpOnSet(false)
+  if msg == "" { msg = tpIfCmpBad }
+  cstrOwnerStack.pop()
+  curFnDeclIx = savedFn
+  njFnIxSet(savedNjFn)
+  T.curRet = savedRet
+  retNaturalSet(savedNat)
+  retNaturalErrSet(savedNatErr)
+  checkRollback(cs, RB_PINNED)
+  if prbArmed { prbLeave("tpIfRecheck") }
+  msg
+}
+
+// A declared generic function delivered by name as a value to the concrete function type
+// `dstTy` is instantiated there, so the constraints its body deferred are adjudicated at the
+// bindings that type gives its parameters, as a direct call's are (D3080).
+export function genFnValueCstrs(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  // A validator re-delivers a recorded value through `assignableExpr`, which must not re-enter.
+  // With no generic declared, or no function type in the destination, there is nothing to bind.
+  if genFnCstrBusy || !cstrCandAny || !tyMayHoldFn(dstTy, 0) { return 0 }
+  genFnCstrBusySet(true)
+  genFnValueCstrsAt(srcExpr, srcTy, dstTy, 0)
+  genFnCstrBusySet(false)
+  0
+}
+
+// `genFnValueCstrs` at `srcExpr`, reaching through the fields of an object literal and the
+// elements of a list literal delivered to a record or list type, `depth` levels down.
+function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
+  if srcExpr < 0 || dstTy < 0 || depth > 8 { return 0 }
+  const lit = P.nodes[parenPeelIx(srcExpr)]
+  if lit is ObjLit {
+    const dobj = T.tys[dstTy]
+    if dobj is TyObj {
+      for fi in lit.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const ft = objFieldType(dobj, f.fiName)
+          if ft >= 0 {
+            genFnValueCstrsAt(f.fiValue, nodeTyOf(f.fiValue), ft, depth + 1)
+          }
+        }
+      }
+    }
+    return 0
+  }
+  if lit is ArrayLit {
+    const darr = T.tys[dstTy]
+    if darr is TyArray {
+      for el in lit.arrElems {
+        genFnValueCstrsAt(el, nodeTyOf(el), darr.aElem, depth + 1)
+      }
+    }
+    return 0
+  }
+  const e = lit
+  if !(e is Ident) { return 0 }
+  let st = srcTy
+  if st < 0 { st = lookup(e.identName) }
+  if st < 0 { return 0 }
+  let decl = fnDeclIx[e.identName] ?? CSTR_NODECL
+  // A generic nested in the enclosing function, delivered where that function's own type
+  // parameters type the destination (`return b` at `(T) => void`): its demands are re-recorded
+  // at those parameters, as a call of it in the enclosing body is (D3896).
+  let nested = false
+  if decl < 0 {
+    const nd = lookupFnDeclNode(e.identName)
+    if nestParentOf.has(nd) {
+      decl = nd
+      nested = true
+    }
+  }
+  if decl < 0 || decl >= P.nodes.length { return 0 }
+  const fd = P.nodes[decl]
+  if !(fd is FuncDecl) { return 0 }
+  if fd.fnTyParams.length == 0 { return 0 }
+  let dt = dstTy
+  const dn = T.tys[dt]
+  if dn is TyNullable { dt = dn.nInner }
+  // At a concrete destination a nested generic is the function-value adapter's to check, which
+  // reports the same demand as its reason.
+  const open = tyHasTyVar(dt)
+  if dt < 0 || (nested && !open) { return 0 }
+  // A generic declared elsewhere is deferred only to the generic whose body is being checked,
+  // so every type variable of the destination must be that generic's.
+  if !nested && open && !tyVarsOfEnclosingGeneric(dt) { return 0 }
+  const s = T.tys[st]
+  const d = T.tys[dt]
+  if !(s is TyFunc) || !(d is TyFunc) { return 0 }
+  if s.fnParamTypes.length != d.fnParamTypes.length { return 0 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < s.fnParamTypes.length {
+    bindGenWalk(s.fnParamTypes[i], d.fnParamTypes[i], bNames, bTys)
+    i = i + 1
+  }
+  if bNames.length == 0 { return 0 }
+  const noN: string[] = []
+  const noNo: i32[] = []
+  const noNode: i32[] = []
+  const who = e.identName
+  const noArgs: i32[] = []
+  const modeWas = substNestMode
+  const declWas = substNestDecl
+  const strictWas = cstrOwnedStrict
+  const cvWas = cvNow
+  let owner = decl
+  if nested {
+    owner = CSTR_NODECL
+    substNestModeSet(SUBST_NESTED)
+    substNestDeclSet(decl)
+  } else if open {
+    // A destination typed by the enclosing generic's parameters defers what it cannot decide to
+    // that generic, as a direct call in its body does; only the delivered function's own
+    // constraints are re-asked (D3923).
+    substNestModeSet(SUBST_DECLARED)
+    cstrOwnedStrictSet(true)
+    // What is deferred carries this delivery, which the refusal at the pin names.
+    cvNow = srcExpr
+  }
+  pinBmCstrElems(bNames, bTys, srcExpr, owner, noArgs)
+  validateBinCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
+  validatePrintCstrs(bNames, bTys, srcExpr, owner, who)
+  validateNestCstrs(bNames, bTys, srcExpr, owner, who)
+  validateArgCstrs(bNames, bTys, srcExpr, owner, noN, noNode)
+  validateRetCstrs(bNames, bTys, srcExpr, owner, who)
+  validateLetCstrs(bNames, bTys, srcExpr, owner, who)
+  validateBmCstrs(bNames, bTys, srcExpr, owner, who)
+  validateMemCstrs(bNames, bTys, srcExpr, owner, who, noN, noNo, noNode)
+  validateUfcsCstrs(bNames, bTys, srcExpr, owner, who)
+  cstrOwnedStrictSet(strictWas)
+  cvNow = cvWas
+  substNestModeSet(modeWas)
+  substNestDeclSet(declWas)
+  0
+}
+
+export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  lbiNoteDelivery(srcExpr, dstTy, nlAsgTgt)
+  nolNoteDelivery(srcExpr, dstTy)
+  if fsbName.length > 0 && !inferQuiet && srcExpr >= 0 {
+    fsbNoteFnDelivery(srcExpr, dstTy)
+  }
+  if numUnionMinted && numUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
+    return true
+  }
+  if litNumUnionConverts(srcTy, dstTy) && !njExprHeld(srcExpr) {
+    numUnionMinted = true
+    return true
+  }
+  if srcExpr >= 0 && dstTy >= 0 {
+    const cse = P.nodes[srcExpr]
+    if cse is NumLit || cse is Unary || cse is Paren {
+      if cexDeliver(srcExpr, dstTy) { return true }
+    }
+  }
+  // A bare `{}` completes against a record destination; a required field it omits is refused
+  // here, in words, instead of as the site's generic mismatch (D2223).
+  if bareBraceDeliver(srcExpr, dstTy, 8, true) { return true }
+  // A generic function value meeting a concrete function type is decided by instantiation inside
+  // `assignable`'s `TyFunc` case (`genericFnAssignable`), so it governs nested positions like an
+  // array element too, not just this expression-level entry.
+  recordElemRepArrayLit(srcExpr, dstTy, 6)
+  recordNullHoleObjAdopt(srcExpr, dstTy, 6)
+  recordListFieldWidenAdopt(srcExpr, dstTy)
+  // A hex / binary / octal literal is a bit pattern of the destination's width, and this seam is
+  // where every binding / argument / return / field / element / store position delivers one.
+  if srcTy == TY_I32 && litTreeAdoptDst(parenPeelIx(srcExpr), dstTy) >= 0 {
+    return true
+  }
+  if radixLitAdoptDst(srcExpr, dstTy) == 2 { return true }
+  // Rep sidecar: an ObjLit/ArrayLit whose source type reaches an unresolved empty-collection hole
+  // (`{nodes: []}`, `{m: Map()}`) is plainly `assignable` to its concrete destination, so the
+  // short-circuit below returns before the adoption block. Record the destination here so the
+  // emitter's row resolver keys the element-resolved shape. Writes only `nodeRepTyIx`.
+  if !inferQuiet && srcExpr >= 0 && tyReachesEmptyHole(srcTy, 8) {
+    recordRepTyAdopt(srcExpr, dstTy, 6)
+  } else if !inferQuiet && srcExpr >= 0 && tyReachesUnion(dstTy, 8) {
+    // Union-softening adoption (see `tyReachesUnion`): an ObjLit/ArrayLit whose field value
+    // narrowed a destination union field leaves the recorded rep type softened, mis-resolving a
+    // same-fieldset twin. Re-stamp the destination rep so the emitter's structural row resolver
+    // keys the union-bearing shape. Writes only `nodeRepTyIx`.
+    recordRepTyAdopt(srcExpr, dstTy, 6)
+  }
+  // The flow hook for the un-annotated-parameter solve. It sits above the `assignable`
+  // short-circuit because a hole source always returns there, so this is the only point in the
+  // function a hole reaches — and every binding / argument / return / field / element / store
+  // position flows through here. Inert unless the parameter-solve probe is running.
+  noteHoleFlow(srcTy, dstTy, srcExpr)
+  if !inferQuiet && narListDeliveryErr(srcExpr, srcTy, dstTy) { return true }
+  if assignable(srcTy, dstTy) {
+    if !inferQuiet && srcExpr >= 0 { genFnValueCstrs(srcExpr, srcTy, dstTy) }
+    if fvaAdapt(srcExpr, srcTy, dstTy) { return true }
+    // The constraint probe records a hole delivery's pin as well, so a caller whose body is
+    // checked before this one still re-asks it at its own pins.
+    if cstrProbe && srcExpr >= 0 { rcwPinProbe(srcExpr, srcTy, dstTy) }
+    // The object-shape floor. `assignable` accepts structural subtyping between two object shapes
+    // and the emitter has no adapter for it (`objShapeAdapterless`), so the pair would reach codegen
+    // and fail there on a file `vl check` reports clean. It belongs at this seam, the one every
+    // delivery flows through. Reported here and answered true, the program being type-valid.
+    if !inferQuiet && srcExpr >= 0 {
+      // The `Writable` floor (D793). A covariant list assignment whose value is written through
+      // cannot be lowered by either answer the language has — an alias admits a type-confused read,
+      // and a converting copy gives one handle a private list. The assignment itself is illegal,
+      // reported at this seam and answered true, the program being type-valid.
+      const cwCode = covarWriteThrough(srcExpr, srcTy, dstTy)
+      if cwCode == 1 {
+        covarWriteThroughErr(srcExpr, srcTy, dstTy)
+        return true
+      }
+      // D853 — the second arm is a different unsoundness and says so. Two declared unions over one
+      // written-through list share one box, so nothing is copied and "the two element storages
+      // differ" would be false. The message names the arms rather than the storages.
+      if cwCode == 2 {
+        covarTwoUnionsErr(srcExpr, srcTy, dstTy)
+        return true
+      }
+      noteRefListView(srcExpr, srcTy, dstTy)
+      // D2060 — the record twin: a field widened by this delivery is shared with the source,
+      // so it is legal only where nothing the delivery reaches writes it.
+      rcwPend(srcExpr, srcTy, dstTy)
+      if mapDeliveryMayRecord(srcExpr, srcTy, dstTy) {
+        recordMapUnbox(srcExpr, srcTy, dstTy, 8)
+      } else if tyWideUnionMinted {
+        recordListWidenRetag(srcExpr, srcTy, dstTy)
+      }
+      if !wsSuppress && objShapeAdapterlessAt(srcExpr, srcTy, dstTy) {
+        objShapeAdapterlessErr(srcExpr, srcTy, dstTy)
+      } else if srcTy != dstTy {
+        let recDst = dstTy
+        if dstTy == lwStoreDst && lwStoreVal >= 0 { recDst = lwStoreVal }
+        recPend(srcExpr, srcTy, recDst, srcExpr)
+      } else if T.tys[srcTy] is TyObj || T.tys[srcTy] is TyArray {
+        recOwnPend(srcExpr, srcTy)
+      }
+    }
+    return true
+  }
+  if !inferQuiet && srcExpr >= 0 && recAdForce(srcExpr, srcTy, dstTy) {
+    return true
+  }
+  // Nominal newtype: a syntactic literal is brand-polymorphic and adopts the destination's brand
+  // (`const e: EntityId = 1`). A literal has no prior identity, so it cannot be the confusion a
+  // newtype exists to catch. Only the destination's own brand is waived, by retrying against the
+  // base index; an object literal needs no arm, its field-wise block re-applying the rule per field.
+  if nomLitAdopts(srcExpr, srcTy, dstTy) { return true }
+  // Function value into a void slot: a `(P…) => T` value is assignable where `(P…) => void` is
+  // expected — the coercion that keeps "extract the inline lambda to a named function" from breaking
+  // the call that worked. Keyed on the expected type's return being void, and granted only for the
+  // set `synthVoidTwins` can mint a capture-free void twin for; other values keep the mismatch.
+  if fnValVoidCoerce(srcExpr, srcTy, dstTy) { return true }
+  // A `u8` storage slot — an array element, the only position `u8` is legal in — accepts any `i32`
+  // value: the storage is one byte, `array.set` truncating to the low 8 bits and `array.get_u`
+  // widening back into 0..255. The one error is an out-of-range non-negative integer literal. This
+  // lives at the expression seam, `assignable(i32, u8)` staying false so an `i32[]` cannot flow in.
+  if primNameOf(dstTy) == "u8" {
+    if srcExpr >= 0 {
+      const u8e = P.nodes[srcExpr]
+      if u8e is Paren { return assignableExpr(u8e.parInner, srcTy, dstTy) }
+      if u8e is NumLit {
+        if numLexIsFloat(u8e.numText) { return false }
+        if u8LexValue(u8e.numText) > 255 {
+          if !inferQuiet {
+            tErr(
+              "the literal "
+                + u8e.numText
+                + " does not fit a `u8` element (0..255) — a computed value truncates to its low 8 bits, but a literal this size is a mistake the compiler can see",
+              srcExpr,
+            )
+          }
+          // Reported here and answered true, the same discipline `objShapeAdapterlessErr` follows:
+          // the position is otherwise well-typed, so a second "cannot assign" from the caller
+          // would contradict this message.
+          return true
+        }
+        return true
+      }
+    }
+    const u8s = primNameOf(srcTy)
+    return u8s == "i32" || u8s == "u8"
+  }
+  // A literal re-encodes exactly at f32, so it flows into any destination whose f32 position it
+  // fits: a bare `f32`, a nullable `f32?`, or an f32 member of a union. An arbitrary f64 or i32
+  // value is not covered. Destination first, and that order is load-bearing for compile time: the
+  // integer half folds the lexeme into a bignum, while `dstAdmitsF32` is a short arena walk.
+  if dstAdmitsF32(dstTy) {
+    if isF32AdoptingLitExpr(srcExpr) {
+      cexFloatUse(srcExpr)
+      return true
+    }
+    if f32LitTailsAdopt(srcExpr, dstTy) { return true }
+  }
+  // The same grant one width up, and only its integer half: an i32-typed literal already rides
+  // the `i32 -> f64` lattice edge, so what this admits is the literals between 2^31 and 2^53 that
+  // type `i64` and would otherwise meet the lossy `i64 -> f64` refusal. D1890.
+  if dstAdmitsF64(dstTy) {
+    if isExactF64IntLitExpr(srcExpr) {
+      cexFloatUse(srcExpr)
+      return true
+    }
+  }
+  // A `const` literal, or a join of them, read as `string`: a literal-typed destination takes it at
+  // the literal type it is, in a list or object literal exactly as at an argument (D2157).
+  if srcExpr >= 0 && srcExpr < wideLitByNode.length {
+    const uw = wideLitByNode[srcExpr]
+    if uw >= 0 && uw != srcTy {
+      if assignable(uw, dstTy) { return true }
+    }
+  }
+  // A literal-typed destination: a bare literal flows wherever its literal type is a member (`"a"`
+  // into `"a" | "b"`), even though its softened base (`string`) does not.
+  if srcExpr >= 0 {
+    const lTy = litTyOfExpr(srcExpr)
+    if lTy >= 0 {
+      if assignable(lTy, dstTy) { return true }
+    }
+    // An object literal checks field-wise against a literal-bearing object target, so a field's
+    // bare literal can match a literal-union field (`{tag: "circle", r: 5}` against
+    // `{tag: "circle" | "square", r: i32}`).
+    const e = P.nodes[srcExpr]
+    if e is Paren {
+      const pok = assignableExpr(e.parInner, srcTy, dstTy)
+      // A wrapping paren takes the f32 list its literal adopted, so both nodes read alike.
+      if pok && !inferQuiet && f32ListUnder(srcExpr, e.parInner) {
+        nodeTySet(srcExpr, nodeTyIxOf(e.parInner))
+      }
+      return pok
+    }
+    if e is ObjLit {
+      const s = T.tys[srcTy]
+      if s is TyObj {
+        // A nullable struct target (`S | null`, or a `V?` map value) peels its wrapper so an object
+        // literal still adapts field-wise into the inner struct — the ObjLit dual of the ArrayLit
+        // peel below. The peel iterates: a nullable-value map slot stacks two wrappers, and a
+        // single unwrap leaves the literal against `S | null`.
+        let dtix = dstTy
+        let dPeel = true
+        while dPeel {
+          const dNW = T.tys[dtix]
+          if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
+        }
+        const d = T.tys[dtix]
+        if d is TyObj {
+          const dnames = d.objFieldNames
+          const dtys = d.objFieldTypes
+          let i = 0
+          let ok = true
+          while i < dnames.length {
+            const sft = objFieldType(s, dnames[i])
+            if sft < 0 {
+              // Completion coercion: an object literal may omit a field whose declared type admits
+              // null — the field is materialized as `null` at construction. A non-nullable omitted
+              // field is still required. Scoped to this expression-aware path, not to general
+              // structural assignability, so it never widens through a container or variance.
+              if !tyAdmitsNull(dtys[i]) { ok = false }
+            } else {
+              // The field's value expression, for the literal-aware recursion.
+              let fexpr = -1
+              const fl = e.objFields
+              let fi = 0
+              while fi < fl.length {
+                const fn = P.nodes[fl[fi]]
+                if fn is FieldInit {
+                  if fn.fiName == dnames[i] { fexpr = fn.fiValue }
+                }
+                fi = fi + 1
+              }
+              if !assignableExpr(fexpr, sft, dtys[i]) { ok = false }
+            }
+            i = i + 1
+          }
+          // Rep sidecar: a field-wise-adopted ObjLit builds the destination struct rep (a boxed
+          // union field, an i64/f32 field, an omitted nullable field), so record it on the literal
+          // node and the emitter's row resolver keys the shape it builds, not the self-inference.
+          if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+          // A field the record does not declare is refused where the literal is written, as at
+          // a destination `assignable` accepts by width (#1460). Reported and answered true.
+          if (
+            ok
+            && bareBraceSpec == 0
+            && !inferQuiet
+            && srcExpr != argLitAt
+            && objLitSetsUndeclared(e, dtix)
+          ) {
+            if !objLitHasDupKey(srcExpr) {
+              objLitUndeclaredErr(srcExpr, srcTy, dtix, "")
+            }
+          }
+          return ok
+        }
+        // A struct literal flowing into a union adopts the first struct arm it adapts into
+        // field-wise (`{f: 97.5}` into `{f: f32} | {w: i32}`). The emitter already boxes a struct
+        // literal into a union slot at a direct binding; this is the checker seam that lets a
+        // widening field reach that same rep. The concrete arm is recorded on the literal node.
+        if d is TyUnion {
+          // Flattened, because a union member may itself be a union: `type Shape = Circle | Rect`
+          // used as an arm of `Shape | ParseError` leaves a `TyUnion` in `uMembers`, which the
+          // `mt is TyObj` test skips. Each candidate is still gated by `unionArmBoxSafe` and still
+          // recorded as the concrete arm; canon's union-alias flatten covers both spellings.
+          const members: i32[] = []
+          flattenVariantsInto(dstTy, members)
+          // An arm declaring every field the literal sets is preferred; an arm that would drop
+          // one is taken only when no other accepts, and then refused as at a record (#1460).
+          let mi = 0
+          let pass = 0
+          while pass < 2 {
+            mi = 0
+            while mi < members.length {
+              const mt = T.tys[members[mi]]
+              if (
+                mt is TyObj
+                && unionArmBoxSafe(members[mi])
+                && objLitSetsUndeclared(e, members[mi]) == (pass == 1)
+              ) {
+                bareBraceSpecSet(bareBraceSpec + 1)
+                const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+                bareBraceSpecSet(bareBraceSpec - 1)
+                if armOk && pass == 1 {
+                  if (
+                    !inferQuiet
+                    && bareBraceSpec == 0
+                    && !objLitHasDupKey(srcExpr)
+                  ) {
+                    objLitUndeclaredErr(
+                      srcExpr,
+                      srcTy,
+                      members[mi],
+                      " (reached through "
+                        + tyToStr(srcTy)
+                        + " into "
+                        + tyToStr(dstTy)
+                        + ")",
+                    )
+                  }
+                  return true
+                }
+                if armOk {
+                  if !inferQuiet {
+                    while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+                    nodeTySet(srcExpr, members[mi])
+                    // Rep sidecar: the struct literal builds the concrete arm struct's rep — record
+                    // it, recursing into fields, for the row resolver.
+                    recordRepTyAdopt(srcExpr, members[mi], 6)
+                  }
+                  return true
+                }
+              }
+              mi = mi + 1
+            }
+            pass = pass + 1
+          }
+        }
+      }
+    }
+    // An array literal checks element-wise against the target's element type, so a bare element
+    // adapts exactly as it would at a binding — the array analogue of the ObjLit recursion above.
+    // This subsumes the scalar float-literal into `f32[]` rule at any element type and nesting
+    // depth. An empty `[]` fits any element; a non-literal element still rejects a lossy demote.
+    if e is ArrayLit {
+      // A map value or niche slot is `V?` (`{[string]: f32[]}` seeds `f32[]?`) — peel the nullable
+      // wrappers so a literal array still adapts into the inner element type; a nullable-value map
+      // slot stacks two, so the peel iterates like the ObjLit one above.
+      let dtix = dstTy
+      let dPeel = true
+      while dPeel {
+        const dNW = T.tys[dtix]
+        if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
+      }
+      const d = T.tys[dtix]
+      if d is TyArray {
+        let i = 0
+        let ok = true
+        const cexWas = cexConverted
+        cexConverted = false
+        while i < e.arrElems.length {
+          const sp = P.nodes[e.arrElems[i]]
+          if sp is Spread {
+            // A spread hands over its list's elements, each delivered as one element (D3253).
+            let spe = tyArrayElemIx(nodeTyIxOf(sp.spdArg))
+            if spe >= 0 && tyHasHole(spe) && litPinN.length > 0 {
+              spe = substTyDeep(spe, litPinN, litPinT)
+            }
+            if spe >= 0 && !assignable(spe, d.aElem) { ok = false }
+          } else if (
+            !assignableExpr(
+              e.arrElems[i],
+              litElemSrcTy(e.arrElems[i], srcTy),
+              d.aElem,
+            )
+          ) {
+            ok = false
+          }
+          i = i + 1
+        }
+        // A whole float constant an element became is an integer, so the list is built at the
+        // destination's element type.
+        const cexElem = cexConverted
+        cexConverted = cexWas || cexElem
+        // Context adoption (atom lists): a literal array accepted by a literal-union element target
+        // is that atom list (`const ks: VK[] = ["aa", "bb"]`), so the destination array type is
+        // recorded on the literal node and the emitter classifies it as the i32 atom-id list. The
+        // niche-nullable scalar elements record the same way — `[null]` carries no other signal.
+        if (
+          ok
+          && !inferQuiet
+          && (tyIsLitUnion(d.aElem)
+            || tyIsNicheNulScalarElem(d.aElem)
+            || arrLitJoinUnionElem(srcExpr, dtix)
+            || cexElem
+            || f32ElemsAdoptedOver(srcExpr, d.aElem))
+        ) {
+          if srcExpr < nodeTyIx.length { nodeTySet(srcExpr, dtix) }
+        }
+        // Rep sidecar: a literal array adopted element-wise (a struct-element list widened, an
+        // i64/f32 element) builds the destination element rep — recurse into the elements so each
+        // element ObjLit resolves the shape the emitter builds.
+        if ok { recordRepTyAdopt(srcExpr, dstTy, 6) }
+        return ok
+      }
+      // An array literal flowing into a union adopts the first array arm it adapts into
+      // element-wise (`["a"]` into `K0[] | {w: i32}`, `[1.5]` into `f32[] | i64`) — the array dual
+      // of the ObjLit union-arm adoption above. The concrete arm is recorded on the literal node so
+      // the emitter classifies the list with the arm's element rep, not the literal's softened one.
+      if d is TyUnion {
+        const members = d.uMembers
+        let mi = 0
+        while mi < members.length {
+          const mt = T.tys[members[mi]]
+          if mt is TyArray {
+            // An `f32[]` arm adopts like any other list arm: the f32-list value atom
+            // (kind 12) gives the box a real rep, and the emitter's coerce re-encodes
+            // the literal's f64-classified elements at f32 (`coerceListKind` 7).
+            bareBraceSpecSet(bareBraceSpec + 1)
+            const armOk = assignableExpr(srcExpr, srcTy, members[mi])
+            bareBraceSpecSet(bareBraceSpec - 1)
+            if armOk {
+              if !inferQuiet {
+                while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+                nodeTySet(srcExpr, members[mi])
+                // Rep sidecar: record the concrete array arm, recursing into elements, so the row
+                // resolver keys the arm the checker picked.
+                recordRepTyAdopt(srcExpr, members[mi], 6)
+              }
+              return true
+            }
+          }
+          mi = mi + 1
+        }
+      }
+    }
+  }
+  false
+}
+
+// ── the top-level split lives in `tyname.tyTopLevelSplit` ───────────────────
+// It cannot live in `emit_base.vl`, which imports this file — a call from here would cycle the
+// module graph. `tyname.vl` is the zero-import leaf that already holds `tyTopIndexOf`.
+
+// The expression-aware retry for a slot checked with the bare structural `assignable` — the
+// map `.set` key. `assignableExpr` covers both scalar-literal brand adoption and object-literal
+// field-wise adaptation, which `nomLitAdopts` alone cannot supply. Gated on the destination
+// actually carrying a brand, so a brand-free program keeps its bare structural check unchanged.
+function nomSlotAccepts(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if nwTyIxs.length == 0 { return false }
+  if srcExpr < 0 { return false }
+  if !tyReachesBrand(dstTy, 6) { return false }
+  assignableExpr(srcExpr, srcTy, dstTy)
+}
+
+// —— the mixed-union literal-run regroup, canon's side ——
+// `tyToNameGo`'s union arm regroups the flattened string-literal members of a mixed
+// union back into their registered alias (`K0 | f64` renders `K0|f64`); canon must spell the
+// same union the same way, so this classifies member spellings by the same three-way rule the renderer applies to arena members.
+
+// —— the subsumed-arm collapse, canon's side ——
+// The arena drops a union arm that adds no values; canon must drop the same arm or the two
+// producers agree about the type and disagree about the rep — the arena saying `string`
+// while canon spells `Kind|string` reserves a union box for a plain-string binding (D1048).
+
+// The predicate that arm asks, in one home with a sharper consequence: the pin has to ask
+// exactly what the body asked or it disagrees with the direct spelling in one of two ways.
+// Asking the plain predicate where the arm asks the expression invents a false reject — the
+// float-literal-into-f32 rule lives at the expression seam (D551).
+export function bmArgPred(form: i32, got: i32, want: i32, argIx: i32) {
+  if form == BM_PUSH || form == BM_SETVAL || form == BM_KEYMUST {
+    return assignableExpr(argIx, got, want)
+  }
+  if form == BM_SETKEY || form == BM_ADDKEY {
+    // The expression form first: a MEMBER literal is a legal key of a literal-union-keyed
+    // map or set, and its own type is the member, not the `string` `checkNode` hands back (D1748).
+    if assignableExpr(argIx, got, want) { return true }
+    return nomSlotAccepts(argIx, got, want)
+  }
+  assignable(got, want)
+}
+
+// `argCstrFits` for demand `ci` at a pin that knows its argument nodes: a hole callee's scalar
+// argument whose origin node is known is asked the direct call's own question of that node, so
+// a literal adopts the parameter's width and a `boolean` literal is refused as it is directly.
+function argCstrFitsAt(
+  rat: i32,
+  rexp: i32,
+  ci: i32,
+  hNames: string[],
+  hArgNode: i32[],
+) {
+  const form = argCstr.form[ci]
+  if form <= 0 { return argCstrFits(rat, rexp, form) }
+  const org = holeArgOriginNode(ci, hNames, hArgNode)
+  if org < 0 || !scalarPrimPair(rat, rexp) {
+    return argCstrFits(rat, rexp, form)
+  }
+  const savedQuiet = inferQuiet
+  if prbArmed { prbEnter() }
+  inferQuiet = true
+  const ok = assignableExpr(org, rat, rexp)
+  inferQuiet = savedQuiet
+  if prbArmed { prbLeave("argCstrFitsAt") }
+  ok
+}
+
+// A composite argument demand at the pin that closes it: its node is asked the direct call's
+// question under the pin's bindings. One still open is left, not moved out to every caller,
+// so a generic chain pays for it once per pin rather than once per hop.
+function validateCompArgCstr(
+  ci: i32,
+  rat: i32,
+  rexp: i32,
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+) {
+  if tyHasHole(rexp) || tyHasHole(rat) { return 0 }
+  const savedQuiet = inferQuiet
+  if prbArmed { prbEnter() }
+  inferQuiet = true
+  const ok = litPinAssignable(argCstr.node[ci], rat, rexp, bNames, bTys)
+  inferQuiet = savedQuiet
+  if prbArmed { prbLeave("validateCompArgCstr") }
+  if ok { return 0 }
+  argFlowErr(rat, rexp, ci, ix)
+}
+
+// Re-validates every deferred call-argument constraint this call's callee owns
+// (`cstrOwnedBy`), substituting the hole to the call's argument type. A hole that substitutes
+// to another hole is re-recorded under it for the outer call that pins it, and only where the
+// callee is named, as `validateBinCstrs` does.
+export function validateArgCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  hNames: string[],
+  hArgNode: i32[],
+) {
+  const nOrig = argCstr.at.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrig {
+    if !cstrOwnedBy(argCstr.fn[ci], calleeFn) {
+      ci = ci + 1
+      continue
+    }
+    cvNow = cvPick(CV_ARG, ci, cvWas)
+    const rat = substTyDeep(argCstr.at[ci], bNames, bTys)
+    const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+    if argCstr.form[ci] == ACF_COMP {
+      validateCompArgCstr(ci, rat, rexp, bNames, bTys, ix)
+      ci = ci + 1
+      continue
+    }
+    if rat != argCstr.at[ci] && calleeFn >= 0 {
+      if tyIsHole(rat) || tyIsDeferredJoin(rat) {
+        if !tyIsHole(rexp) {
+          noteArgCstr(rat, rexp, argCstr.who[ci], argCstr.form[ci], -1)
+        }
+      }
+    }
+    // A hole callee's parameter still unpinned here moves out to the caller's hole with its
+    // argument, whichever side this call resolved.
+    if calleeFn >= 0 && argCstr.form[ci] > 0 && hdKindIs(rexp, HD_PARAM) {
+      if rat != argCstr.at[ci] || rexp != argCstr.exp[ci] {
+        let mvNode = -1
+        if !tyIsHole(rat) { mvNode = holeArgOriginNode(ci, hNames, hArgNode) }
+        noteArgCstr(rat, rexp, argCstr.who[ci], argCstr.form[ci], mvNode)
+      }
+    }
+    // A side still carrying a hole — bare, or as a deferred-join arm — is undecided at this
+    // site and defers to the call that pins it.
+    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
+      if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
+        if !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode) {
+          argCstrErr(rat, rexp, ci, ix)
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Whether a return-type mismatch is nominal-only, at a destination the author has no syntax
+// to spell: the hole sits on the declared side alone (`wOnly`), the destination is a newtype
+// brand, and the body type already fits the brand's unbranded base — the repair would be `x
+// as A`, which the language has no form for (`wOnly` is what keeps a body-side hole under a concrete declaration a loud reject, D551).
+function retNomOnlyAtHole(wOnly: i32, ix: i32, rg: i32, rw: i32) {
+  if wOnly != 1 { return false }
+  if !tyIsNewtypeBrand(rw) { return false }
+  const b = nomBaseTyIx(rw)
+  if b < 0 { return false }
+  if b == rw { return false }
+  assignableExpr(ix, rg, b)
+}
+
+// `assignableExpr` with the pin's bindings staged for a literal's elements (`litElemSrcTy`).
+function litPinAssignable(
+  ix: i32,
+  src: i32,
+  dst: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  const sN = litPinN
+  const sT = litPinT
+  litPinNSet(bNames)
+  litPinTSet(bTys)
+  const ok = assignableExpr(ix, src, dst) || joinLitsFitAt(ix, dst)
+  litPinNSet(sN)
+  litPinTSet(sT)
+  ok
+}
+
+// Re-validates every deferred return-type constraint this call resolves: substitutes the
+// call's bindings into the body's returned type and the declared return type, and asks the
+// mismatch question the body could only answer vacuously. Re-defers like `validateArgCstrs`
+// when a hole substitutes to another hole; the message is the direct spelling's, verbatim.
+export function validateRetCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigR = retCstr.got.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigR {
+    if (
+      cstrOwnedBy(retCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(retCstr.ix[ci])
+    ) {
+      cvNow = cvPick(CV_RET, ci, cvWas)
+      const rg = substTyDeep(retCstr.got[ci], bNames, bTys)
+      const rw = substTyDeep(retCstr.want[ci], bNames, bTys)
+      // Re-records only when the callee is named — an unnamed call cannot reassign ownership
+      // — and gates on either side still holding a hole, not just the body side.
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if rg != retCstr.got[ci] || rw != retCstr.want[ci] {
+          if tyHasHole(rg) || tyHasHole(rw) {
+            noteRetCstr(rg, rw, retCstr.ix[ci])
+          }
+        }
+      }
+      if !tyHasHole(rg) {
+        if (
+          !tyHasHole(rw)
+          && !retNomOnlyAtHole(retCstr.wOnly[ci], retCstr.ix[ci], rg, rw)
+        ) {
+          if !litPinAssignable(retCstr.ix[ci], rg, rw, bNames, bTys) {
+            let rWho = "the callee's return"
+            if who != "" { rWho = "the return of `" + who + "`" }
+            tErr(
+              "return type mismatch: expected "
+                + tyToStr(rw)
+                + ", got "
+                + tyToStr(rg)
+                + boolForNumberNote(rg, rw)
+                + " ("
+                + rWho
+                + " at the call's argument types)",
+              ix,
+            )
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Whether the deferred destination constraints this binding resolves hold — the twin of
+// `validateRetCstrs` for a `let`/`const` binding rather than a return (D572 is why the two
+// need separate tables). Same re-deferral rule; the message is `letAssignMsg`'s, verbatim,
+// with the attribution appended since the reader wrote no assignment.
+export function validateLetCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigL = letCstr.got.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigL {
+    if (
+      cstrOwnedBy(letCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(letCstr.ix[ci])
+      && !wrUnreachedBy(ci, ix, calleeFn)
+    ) {
+      cvNow = cvPick(CV_LET, ci, cvWas)
+      const lg = substTyDeep(letCstr.got[ci], bNames, bTys)
+      const lw = substTyDeep(letCstr.want[ci], bNames, bTys)
+      // Re-records only when the callee is named, for the same ownership reason
+      // `validateRetCstrs` gates on; also gated on either side holding a hole.
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if lg != letCstr.got[ci] || lw != letCstr.want[ci] {
+          if tyHasHole(lg) || tyHasHole(lw) {
+            noteLetCstr(lg, lw, letCstr.ix[ci], letCstr.name[ci])
+          }
+        }
+      }
+      if !tyHasHole(lg) {
+        if !tyHasHole(lw) {
+          if !litPinAssignable(letCstr.ix[ci], lg, lw, bNames, bTys) {
+            let lWho = "the callee's body"
+            if who != "" { lWho = "the body of `" + who + "`" }
+            tErr(
+              letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
+                + " ("
+                + lWho
+                + " at the call's argument types)",
+              ix,
+            )
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Whether the deferred builtin-method-argument constraints this binding resolves hold — the
+// twin of `validateLetCstrs` for a `.push`/`.set`/`.add` argument rather than an assignment
+// (D582 is why `argCstr*` cannot serve this position). Same re-deferral rule, gated on either
+// side; the message is the arm's own (`bmArgMsg`), verbatim, with the attribution appended.
+export function validateBmCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigB = bmCstr.got.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigB {
+    if cstrOwnedBy(bmCstr.fn[ci], calleeFn) && !nestCstrOutside(bmCstr.ix[ci]) {
+      cvNow = cvPick(CV_BM, ci, cvWas)
+      const bg = substTyDeep(bmCstr.got[ci], bNames, bTys)
+      const bw = substTyDeep(bmCstr.want[ci], bNames, bTys)
+      let bc = bmCstr.ctx[ci]
+      if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
+      // Re-records only when the callee is named — an unnamed call cannot reassign
+      // ownership of the constraint.
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if bg != bmCstr.got[ci] || bw != bmCstr.want[ci] {
+          if tyHasHole(bg) || tyHasHole(bw) {
+            noteBmCstr(
+              bmCstr.form[ci],
+              bmCstr.label[ci],
+              bg,
+              bw,
+              bc,
+              bmCstr.ix[ci],
+            )
+          }
+        }
+      }
+      if !tyHasHole(bg) {
+        if !tyHasHole(bw) {
+          if !bmArgPred(bmCstr.form[ci], bg, bw, bmCstr.ix[ci]) {
+            let bWho = "the callee's body"
+            if who != "" { bWho = "the body of `" + who + "`" }
+            tErr(
+              bmArgMsg(bmCstr.form[ci], bmCstr.label[ci], bg, bw, bc)
+                + " ("
+                + bWho
+                + " at the call's argument types)",
+              ix,
+            )
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Binds each type parameter of the generic return `ret` from the type the call's destination
+// expects, when every argument that would bind it is a literal adapting to that type, so
+// `const hs: f32[] = filled(4, 0.0)` is `filled<f32>` as an annotated literal is an `f32` (D3539).
+export function dstBindLitTyParams(
+  ix: i32,
+  ret: i32,
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+  outNames: string[],
+) {
+  const dst = dstForArgs(callDstTyOf(ix), args, ret)
+  if dst < 0 || ret < 0 || !anyArgIsLitOnly(args) || !tyHasTyVar(ret) {
+    return 0
+  }
+  const dN: string[] = []
+  const dT: i32[] = []
+  bindGenWalk(ret, dst, dN, dT)
+  let k = 0
+  while k < dN.length {
+    if bindOf(bNames, bTys, dN[k]) < 0 {
+      if prbArmed { prbEnter() }
+      const adapts = dstTyParamAdapts(dN[k], dT[k], params, args, ix, ret, dst)
+      if prbArmed { prbLeave("dstTyParamAdapts") }
+      if adapts {
+        bNames.push(dN[k])
+        bTys.push(dT[k])
+        outNames.push(dN[k])
+        // The annotation chose the instance, so it is not redundant (D1442).
+        cbSeedUsedSet(cbSeedUsed + 1)
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether the destination's `cand` for type parameter `name` replaces the arguments' binding at
+// call `ix`: always for a bare `null` beside arguments `cand` holds; for a literal union only
+// when every argument is a literal member of it; otherwise when every argument is a
+// literal `cand` holds in its kind and the arguments' own instance cannot reach `dst` (D4024).
+function dstTyParamAdapts(
+  name: string,
+  cand: i32,
+  params: i32[],
+  args: i32[],
+  ix: i32,
+  ret: i32,
+  dst: i32,
+): boolean {
+  if (
+    cand < 0
+    || cand == TY_ERR
+    || isVoidTy(cand)
+    || tyHasTyVar(cand)
+    || dstTyOpen(cand)
+  ) {
+    return false
+  }
+  // A body computing on `T` can leave a literal union (D3602), so only literal members of it
+  // choose one.
+  const litU = tyIsLitUnionLike(cand, 4)
+  if litU {
+    if litUnionOneBase(cand, 4) < 0 { return false }
+    const cn = P.nodes[ix]
+    if cn is Call {
+      if !genericBodyClosed(callGenericDeclIx(cn), 0) { return false }
+    } else {
+      return false
+    }
+  }
+  const one: string[] = [name]
+  const oneT: i32[] = [cand]
+  let seen = 0
+  let own = -1
+  let nulls = 0
+  const others: i32[] = []
+  let i = 0
+  while i < params.length {
+    if tyMentionsTyVarNamed(params[i], name, 8) {
+      if i >= args.length || args[i] < 0 { return false }
+      const want = substTyDeep(params[i], one, oneT)
+      if argIsNullLit(args[i]) {
+        // A bare `null` binds `T` to the null type (DV-402).
+        if !assignable(TY_NULL, want) { return false }
+        nulls = nulls + 1
+        seen = seen + 1
+        if own < 0 { own = TY_NULL }
+        i = i + 1
+        continue
+      }
+      if litU {
+        const lt = litTyOfExpr(parenPeelIx(args[i]))
+        if lt < 0 || !assignable(lt, want) { return false }
+        seen = seen + 1
+        if own < 0 { own = widenLitTy(lt) }
+        i = i + 1
+        continue
+      }
+      if !argIsLitOnly(args[i], 4) {
+        others.push(i)
+        i = i + 1
+        continue
+      }
+      const x = parenPeelIx(args[i])
+      if x < 0 || x >= P.nodes.length { return false }
+      const isCall = P.nodes[x] is Call
+      const savedQ = inferQuiet
+      let at = -1
+      if isCall {
+        // A nested call is asked twice, speculatively: what it binds on its own, and whether the
+        // destination's type, delivered to it in turn, is what it then answers.
+        inferQuiet = true
+        setCallDstTy(x, -1)
+        at = checkNodeHook(args[i])
+        setCallDstTy(x, want)
+        inferQuiet = savedQ
+      } else {
+        at = checkNodeHook(args[i])
+      }
+      const aN: string[] = []
+      const aT: i32[] = []
+      bindGenWalk(params[i], at, aN, aT)
+      if own < 0 { own = bindOf(aN, aT, name) }
+      // Within the literal's kind only: an integer literal never makes `T` a float (B′).
+      const wk = numKindMask(want, 8)
+      if wk == 0 || (wk & ~numKindMask(at, 8)) != 0 { return false }
+      inferQuiet = true
+      if isCall { at = checkNodeHook(args[i]) }
+      const ok = at >= 0 && assignableExpr(args[i], at, want)
+      inferQuiet = savedQ
+      if !ok { return false }
+      seen = seen + 1
+    }
+    i = i + 1
+  }
+  // A non-literal argument goes along only beside a `null`, and only one the binding holds.
+  if others.length > 0 {
+    if nulls == 0 { return false }
+    for oi in others {
+      const want = substTyDeep(params[oi], one, oneT)
+      const savedQ = inferQuiet
+      inferQuiet = true
+      let at = nodeTyIxOf(args[oi])
+      if at < 0 { at = checkNodeHook(args[oi]) }
+      const ok = at >= 0 && assignable(at, want)
+      inferQuiet = savedQ
+      if !ok { return false }
+    }
+    return true
+  }
+  if seen == 0 || own < 0 || tySame(own, cand) { return false }
+  if nulls > 0 || litU { return true }
+  // Only where the arguments' own instance cannot be delivered: anywhere it can, that instance
+  // is the program's, and a body doing arithmetic on `T` must keep computing at it.
+  const savedQ2 = inferQuiet
+  inferQuiet = true
+  const one2: string[] = [name]
+  const own2: i32[] = [own]
+  const ownRet = substTyDeep(ret, one2, own2)
+  // `assignable` alone admits a list into a wider-element list; the delivery refuses that.
+  const deliverable = assignable(ownRet, dst)
+    && !objShapeAdapterlessAt(ix, ownRet, dst)
+  inferQuiet = savedQ2
+  !deliverable
+}
+
+// The pinned re-check itself, in one home, opened and closed around the caller's read.
+// `monoInferListElem`, `monoInferLocalScalar` and `monoInferRetExprTy` ask the same question,
+// differing only in what they read back. Split into begin/end rather than a result selector
+// because the read must happen inside the isolation, scope and suppression flags still active.
+export function monoRecheckBegin(
+  declIx: i32,
+  paramTyIxs: i32[],
+  tpNames: string[],
+  tpTys: i32[],
+): MonoSave | null {
+  if declIx < 0 { return null }
+  const dn = P.nodes[declIx]
+  if !(dn is FuncDecl) { return null }
+  const body = P.nodes[dn.fnBody]
+  if !(body is Block) { return null }
+  if prbArmed { prbEnter() }
+  monoRecheckDepthSet(monoRecheckDepth + 1)
+  const sv: MonoSave = { quiet: inferQuiet, sym: symEnabled, mark: checkMark() }
+  inferQuiet = true
+  symEnabled = 0
+  njFnStack.push(njFnIx)
+  njFnIxSet(declIx)
+  // Binds the type parameters too, not only the value ones: `checkFuncDecl` keeps them in
+  // scope as an opaque hole, so a body annotation naming one would otherwise stay a hole forever.
+  let tpb = 0
+  while tpb < tpNames.length {
+    if tpb < tpTys.length {
+      if tpTys[tpb] >= 0 {
+        tpEnvNames.push(tpNames[tpb])
+        tpEnvTys.push(tpTys[tpb])
+      }
+    }
+    tpb = tpb + 1
+  }
+  // Checks the body statements directly in the pushed scope (not via `checkNode` on the
+  // block), which would push/pop its own scope and drop the local before it can be read back.
+  crFnEnter(declIx)
+  pushScope(dn.fnBody)
+  const params = dn.fnParams
+  let pi = 0
+  while pi < params.length {
+    const p = P.nodes[params[pi]]
+    if p is Param {
+      let pty = TY_ERR
+      if pi < paramTyIxs.length {
+        if paramTyIxs[pi] >= 0 { pty = paramTyIxs[pi] }
+      }
+      declare(p.parName, pty)
+    }
+    pi = pi + 1
+  }
+  const stmts = body.blkStmts
+  let s = 0
+  while s < stmts.length {
+    checkNodeHook(stmts[s])
+    s = s + 1
+  }
+  sv
+}
+
+// ── a function value at another function type (D3073) ──────────────────────
+// A function value keeps the `$fnsig` it carries, so a call through a function type of another
+// rep traps. The delivery is rewritten in place into `(p…): R => f(p…)` at the destination's
+// type and checked as written code; a conversion that code cannot make is refused there.
+
+// Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
+// function type, when the two may differ in rep. True when the delivery is settled here,
+// rewritten or refused; false leaves it to the caller unchanged.
+export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  fvaNoteNameDecl(srcExpr)
+  if srcTy == dstTy || inferQuiet || monoRecheckDepth > 0 { return false }
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
+  if !tyMayHoldFn(dstTy, 0) { return false }
+  // A literal delivers each element or field at the destination's own type, one seam down.
+  const lit = P.nodes[parenPeelIx(srcExpr)]
+  if lit is ArrayLit {
+    const da = T.tys[nonNullTy(dstTy)]
+    if da is TyArray {
+      for el in lit.arrElems {
+        if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), da.aElem) }
+      }
+    }
+    return false
+  }
+  if lit is ObjLit {
+    const dob = T.tys[nonNullTy(dstTy)]
+    if dob is TyObj {
+      for fi in lit.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const ft = objFieldType(dob, f.fiName)
+          if ft >= 0 { fvaAdapt(f.fiValue, nodeTyIxOf(f.fiValue), ft) }
+        }
+      }
+    }
+    return false
+  }
+  const dt = nonNullTy(dstTy)
+  if dt < 0 { return false }
+  const d = T.tys[dt]
+  const s = T.tys[srcTy]
+  if s is TyFunc && d is TyUnion {
+    // A function delivered into a union lands in the one function arm it converts to.
+    const arm = fvaUnionArm(d, srcTy)
+    if arm >= 0 { return fvaAdapt(srcExpr, srcTy, arm) }
+    if arm == -2 {
+      fvaRefuse(
+        srcExpr,
+        srcTy,
+        dt,
+        "it converts into more than one function arm of the union",
+      )
+      return true
+    }
+  }
+  if !(s is TyFunc) || !(d is TyFunc) {
+    // A function inside a container is not rewritten on the way, so a call through the
+    // destination's function type would reach it at another signature.
+    if fvaNestedFnDiffers(srcTy, dstTy, 0, 8) {
+      fvaRefuseNested(srcExpr, srcTy, dstTy)
+      return true
+    }
+    return false
+  }
+  if s.fnRet < 0 || d.fnRet < 0 { return false }
+  if tyHasTyVar(dt) || s.fnParamTypes.length != d.fnParamTypes.length {
+    return false
+  }
+  const site = srcExpr
+  const pe = P.nodes[parenPeelIx(site)]
+  // A generic function named as a value is instantiated by the adapter's direct call, whatever
+  // type the checker gave the name (D3112); any other type parameter in the source is an
+  // enclosing generic's, pinned per instance.
+  if fvaDone[site] ?? false { return false }
+  if tyReachesHole(dt, 8) { return false }
+  if !fvaNamesGeneric(pe, parenPeelIx(site)) {
+    // A hole is pinned later, where the value's use decides it.
+    if fnTyHasHole(srcTy) || tyHasTyVar(srcTy) || tyReachesHole(srcTy, 8) {
+      return false
+    }
+    if !fvaFnMayDiffer(srcTy, dt, 8) { return false }
+  }
+  const pos = nodePos(site)
+  const params: i32[] = []
+  const args: i32[] = []
+  let i = 0
+  while i < d.fnParamTypes.length {
+    const pt = fvaAnnot(d.fnParamTypes[i], site, pos)
+    if pt < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return true
+    }
+    const pn = "$fp" + i32ToStr(i)
+    params.push(luAt(mkParam(pn, pt, -1, 0, 0, pos), site))
+    args.push(luRef(pn, site, pos))
+    i = i + 1
+  }
+  const rt = fvaAnnot(d.fnRet, site, pos)
+  if rt < 0 {
+    fvaRefuse(srcExpr, srcTy, dt, "")
+    return true
+  }
+  // A function declaration or a `const` is stable; any other value is read once, as the
+  // argument of an enclosing lambda called in place, so the adapter calls the delivered value
+  // rather than what a `let` later holds.
+  const stable = fvaStableName(pe, parenPeelIx(site))
+  let callee = -1
+  let fvParam = -1
+  if stable {
+    if pe is Ident { callee = luRef(pe.identName, site, pos) }
+  } else {
+    const st = fvaAnnot(srcTy, site, pos)
+    if st < 0 {
+      fvaRefuse(srcExpr, srcTy, dt, "")
+      return true
+    }
+    const fv = "$fv" + i32ToStr(site)
+    fvParam = luAt(mkParam(fv, st, -1, 0, 0, pos), site)
+    callee = luRef(fv, site, pos)
+  }
+  const lam = fvaLambda(
+    params,
+    rt,
+    luAt(mkCall(callee, args, pos), site),
+    site,
+    pos,
+  )
+  fvaDone.set(site, true)
+  const mark = T.diags.length
+  if stable {
+    arenaSetNode(site, lam)
+  } else {
+    const moved = addNode(P.nodes[site])
+    adoptNodeTok(moved, site)
+    const li = luAt(addNode(lam), site)
+    const outerPs: i32[] = []
+    outerPs.push(fvParam)
+    const outer = luAt(addNode(fvaLambda(outerPs, -1, li, site, pos)), site)
+    const outerArgs: i32[] = []
+    outerArgs.push(moved)
+    const names: string[] = []
+    const c: Node = {
+      callFn: outer,
+      callArgs: outerArgs,
+      callArgNames: names,
+      pos: pos,
+    }
+    arenaSetNode(site, c)
+  }
+  luGrow()
+  const t = checkNodeHook(site)
+  if T.diags.length > mark || !assignable(t, dstTy) {
+    let why = ""
+    if T.diags.length > mark { why = T.diags[mark].tmsg }
+    while T.diags.length > mark { T.diags.pop() }
+    fvaRefuse(site, srcTy, dt, why)
+  }
+  true
+}
