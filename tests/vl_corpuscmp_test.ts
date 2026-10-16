@@ -55,6 +55,18 @@ Deno.test({
       await Deno.symlink(VL, `${dir}/scripts/vl-host/target/release/vl`);
       await Deno.mkdir(`${dir}/build`);
       await Deno.symlink(COMPILER, `${dir}/build/vl-compiler.wasm`);
+      // The host looks for the seed's `.cwasm` sidecars beside the PATH it is given, so the
+      // linked seed takes its sidecars with it; without them every run re-JITs the seed.
+      const seedDir = COMPILER.slice(0, COMPILER.lastIndexOf("/"));
+      const seedBase = COMPILER.slice(COMPILER.lastIndexOf("/") + 1);
+      for (const e of Deno.readDirSync(seedDir)) {
+        if (e.name.startsWith(`${seedBase}.`) && e.name.endsWith(".cwasm")) {
+          await Deno.symlink(
+            `${seedDir}/${e.name}`,
+            `${dir}/build/vl-compiler.wasm${e.name.slice(seedBase.length)}`,
+          );
+        }
+      }
       await write(`${dir}/tests/cases/a/ok.vl`, "print(1 + 2)\n");
       await write(
         `${dir}/tests/cases/bad.vl`,

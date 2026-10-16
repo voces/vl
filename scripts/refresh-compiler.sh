@@ -65,7 +65,10 @@ for arg in "$@"; do
 done
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+# A background warm (the fixpoint ladder's, below) is WAITED for, never killed: killing the
+# shell would orphan the `vl` it launched, still writing into $WORK.
+EARLY_WARM=""
+trap '[ -z "$EARLY_WARM" ] || wait "$EARLY_WARM" 2>/dev/null; rm -rf "$WORK"' EXIT
 
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
 # Missing seed: fetch the rolling `seed-latest` release, then fall through to the
@@ -149,11 +152,23 @@ if [ "$PROVE" = 1 ]; then
     echo "compile(seed) == seed — the seed IS the fixpoint (1 compile)"
     SHIP="$SEED"
   else
+    # The likely ship is `next` (the two-compile rung), so its other engine tags are warmed
+    # NOW, at low priority, while it compiles the compiler: the build is single-threaded
+    # after its own JIT, which leaves the remaining cores to the warm. A wasted warm (the
+    # ladder climbs past `next`) costs CPU, never a wrong sidecar: each is keyed on its seed.
+    # shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
+    VL="$VL" nice -n 10 scripts/warm-seed.sh $WARM_FUEL "$WORK/next.wasm" &
+    EARLY_WARM=$!
     echo "== next compiles the compiler =="
     "$VL" build compiler/entry.vl -o "$WORK/next2.wasm" --compiler "$WORK/next.wasm"
     if cmp -s "$WORK/next2.wasm" "$WORK/next.wasm"; then
       echo "compile(next) == next — next is the fixpoint (2 compiles)"
     else
+      # The ship is now `next2` at best, so its tags are warmed beside the third compile.
+      wait "$EARLY_WARM" || true
+      # shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
+      VL="$VL" nice -n 10 scripts/warm-seed.sh $WARM_FUEL "$WORK/next2.wasm" &
+      EARLY_WARM=$!
       echo "== next2 compiles the compiler =="
       "$VL" build compiler/entry.vl -o "$WORK/next3.wasm" --compiler "$WORK/next2.wasm"
       if ! cmp "$WORK/next3.wasm" "$WORK/next2.wasm"; then
@@ -166,6 +181,10 @@ if [ "$PROVE" = 1 ]; then
       echo "compile(next2) == next2 — next2 is the fixpoint (3 compiles)"
       SHIP="$WORK/next2.wasm"
     fi
+  fi
+  if [ -n "$EARLY_WARM" ]; then
+    wait "$EARLY_WARM" || true
+    EARLY_WARM=""
   fi
   echo "NATIVE FIXPOINT HOLDS: compile(fixpoint) == fixpoint byte-for-byte ($(wc -c < "$SHIP") bytes)"
 fi
