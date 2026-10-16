@@ -53,7 +53,7 @@ line before the next):
 > * **a fall-through parameter** — one of the enclosing function's own `i32` parameters, read
 >   **after** that function's first `return`, in a function that is a **READER**: one that
 >   answers a literal `-1` on some path, or hands its answer to one that does (a fixpoint four
->   rounds deep over `return f(…)` and bare two-space tail calls, within the module).
+>   rounds deep over `return f(…)` and bare two-space tail calls, closed over the module graph).
 >
 > A **GUARD** for `<idx>` is any comparison of it — either way round — against `0`, `-1`, or
 > any `.length`, on a line at or before the read. Re-binding the name clears its guard.
@@ -83,6 +83,21 @@ module it names and stages the locals that bind a column-0 `{[…]}` global ther
 to another module turns every key read of it into a hit: #3788 moved `fnDeclIx` out of
 `typecheck.vl` and that file's count rose by 13, and `msAtomIds`, `msSetByText` and
 `monoGradualAsScalar` (exported from `emit_state.vl`) carried five more.
+
+**Readers are closed over the module graph too.** A function that hands back an imported
+reader's answer is a reader, so the parameter arm cannot depend on which module the answerer
+lives in. The per-module fixpoint resolved a tail call only to the module's own functions:
+#3896's split of `emit_classify.vl` moved `mapMonoShapeOfKey`, `mvShapeOfMapName` and their
+forwarders apart, and six reads (`mvRlSlot[slot]`, `rlElemName[slot]` three times,
+`mvValName[slot]` twice) left the count, 461 to 455, with no change to the code. Thirteen more
+had been hidden the same way since before the split, by forwarding that already crossed a
+module (`emit_collect.vl`, `emit_map_value_slots.vl`, `emit_mono.vl`, `wasmEmit.vl` and
+`emit_classify.vl` itself). The driver walks each module once into a scan slot
+(`lintReaderScanOf`, kept per module key while its source stands), closes it under the
+readers its imports name (`lintReadersOf`), and repeats over the import edges until no
+module's set grows; `lintSetImportedReaders` stages the result and the slot, so `lint()`
+reuses the walk. The census does the same (`graphReaders`). Closing raised the count from 455
+to 474, and the same 474 come out of the pre-split tree.
 
 ### What the guard model approximates
 

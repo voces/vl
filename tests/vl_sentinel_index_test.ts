@@ -330,6 +330,47 @@ function bad(t: Row): i32 {
     strict: [],
     says: { code: UNGUARDED, text: "a field its module graph tests against 0 elsewhere" },
   },
+  {
+    // A reader is one wherever it lives: `fallthrough.vl` with its answerer two modules
+    // away, through a forwarder and an `as` alias. In one module it is reported; the
+    // emit_classify.vl split (#3896) hid six such reads, since the fixpoint stopped at the
+    // module's own functions.
+    name: "graphreader.vl",
+    deps: [{
+      name: "graphreader_name.vl",
+      src: `export function nameSlot(nm: i32): i32 {
+  if nm > 0 { return nm }
+  -1
+}
+`,
+    }, {
+      name: "graphreader_fwd.vl",
+      src: `import { nameSlot } from "./graphreader_name"
+
+export function fwdSlot(nm: i32): i32 {
+  nameSlot(nm)
+}
+`,
+    }],
+    src: `import { fwdSlot as viaSlot } from "./graphreader_fwd"
+
+let elemName: i32[] = []
+
+function arenaSlot(slot: i32): i32 {
+  if slot > 100 { return slot }
+  -1
+}
+
+function innerSlot(slot: i32): i32 {
+  const ar = arenaSlot(slot)
+  if ar >= 0 { return ar }
+  viaSlot(elemName[slot])
+}
+`,
+    unguarded: ["13:11"],
+    strict: [],
+    says: { code: UNGUARDED, text: "the parameter `slot` on a fall-through path" },
+  },
 ];
 
 type Hits = { at: Record<string, string[]>; msgs: Record<string, string[]> };
