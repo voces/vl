@@ -260,6 +260,82 @@ Deno.test({ name: "playground-lsp: format reprints via the self-hosted formatter
   }
 });
 
+// The features below reached the playground when its adapter became a transport
+// over `lsp/src/features.ts`; each is the server's answer, in project-key form.
+const THREE_X = "let x = 41\nprint(x)\nprint(x + 1)\n";
+const X_SPANS = [[0, 4], [1, 6], [2, 6]].map(([line, character]) => ({
+  start: { line, character },
+  end: { line, character: character + 1 },
+}));
+
+Deno.test({ name: "playground-lsp: references list every occurrence, by file", ignore }, async () => {
+  initFromSeed();
+  const refs = await lsp.references(THREE_X, { line: 0, character: 4 }, true);
+  assertEquals(refs, X_SPANS.map((range) => ({ file: "main.vl", range })));
+});
+
+Deno.test({ name: "playground-lsp: document highlights mark the declaration as a write", ignore }, async () => {
+  initFromSeed();
+  const spans = await lsp.documentHighlights(THREE_X, { line: 1, character: 6 });
+  assertEquals(spans?.map((s) => s.kind), ["write", "read", "read"]);
+  assertEquals(spans?.map((s) => s.range), X_SPANS);
+});
+
+Deno.test({ name: "playground-lsp: document symbols outline each declaration with its extent", ignore }, async () => {
+  initFromSeed();
+  const src = "function f(): i32 {\n  return 1\n}\nconst k = 2\nprint(f() + k)\n";
+  const outline = await lsp.documentSymbols(src);
+  assertEquals(outline?.map((n) => [n.name, n.kind, n.range.start.line, n.range.end.line]), [
+    ["f", "function", 0, 2],
+    ["k", "constant", 3, 3],
+  ]);
+});
+
+Deno.test({ name: "playground-lsp: rename edits every occurrence, across project files", ignore }, async () => {
+  initFromSeed();
+  assertEquals(await lsp.prepareRename(THREE_X, { line: 1, character: 6 }), {
+    range: X_SPANS[1],
+    placeholder: "x",
+  });
+  assertEquals(
+    await lsp.rename(THREE_X, { line: 1, character: 6 }, "y"),
+    { changes: { "main.vl": X_SPANS.map((range) => ({ range, newText: "y" })) } },
+  );
+  const main = `import { add } from "./mathx"\nlet r = add(1, 4)\nprint(r)\n`;
+  const mathx = `export function add(a: i32, b: i32): i32 {\n  return a + b\n}\n`;
+  lsp.setWorkspace(() => ({ "main.vl": main, "mathx.vl": mathx }));
+  try {
+    const answer = await lsp.rename(main, { line: 1, character: 8 }, "plus", "main.vl");
+    if (answer === null || "error" in answer) throw new Error(`rename: ${JSON.stringify(answer)}`);
+    assertEquals(Object.keys(answer.changes).sort(), ["main.vl", "mathx.vl"], "files edited");
+    assertEquals(answer.changes["mathx.vl"].map((e) => e.range.start), [{ line: 0, character: 16 }]);
+  } finally {
+    lsp.setWorkspace(() => ({}));
+  }
+});
+
+Deno.test({ name: "playground-lsp: hover carries the callee's effect summary", ignore }, async () => {
+  initFromSeed();
+  const src = "let a: i32[] = [1]\nfunction push1(xs: i32[]) {\n  xs.push(1)\n}\npush1(a)\n";
+  const result = await lsp.hover(src, { line: 4, character: 1 });
+  if (!result?.contents.includes("writes: `xs`")) {
+    throw new Error(`want the effect line, got ${JSON.stringify(result)}`);
+  }
+});
+
+Deno.test({ name: "playground-lsp: a code action's kind filter is the protocol's", ignore }, async () => {
+  initFromSeed();
+  const src = 'import { trim, join } from "std:str"\nprint(trim(" x "))\n';
+  const range = { start: { line: 0, character: 15 }, end: { line: 0, character: 19 } };
+  await lsp.diagnostics(src);
+  const kinds = async (only?: string[]) =>
+    (await lsp.codeActions(src, range, [], "main.vl", only)).map((a) => a.kind);
+  assertEquals(await kinds(), ["quickfix", "source.organizeImports"], "no filter");
+  assertEquals(await kinds(["source.organizeImports"]), ["source.organizeImports"], "organize only");
+  assertEquals(await kinds(["source"]), ["source.organizeImports"], "a parent kind");
+  assertEquals(await kinds(["quickfix"]), ["quickfix"], "quick fixes only");
+});
+
 Deno.test("playground-lsp: features degrade to empty before a seed is wired", async () => {
   lsp.initLsp(undefined);
   assertEquals(await lsp.semanticTokens("let x = 1\n"), []);
@@ -274,6 +350,12 @@ Deno.test("playground-lsp: features degrade to empty before a seed is wired", as
     [],
   );
   assertEquals(lsp.format("let x=1\n"), undefined);
+  assertEquals(await lsp.references("let x = 1\n", { line: 0, character: 4 }, true), null);
+  assertEquals(await lsp.documentHighlights("let x = 1\n", { line: 0, character: 4 }), null);
+  assertEquals(await lsp.documentSymbols("let x = 1\n"), null);
+  assertEquals(await lsp.rename("let x = 1\n", { line: 0, character: 4 }, "y"), null);
+  // Folding needs no seed: the lexical scan still answers.
+  assertEquals(lsp.foldingRanges("function f() {\n  return\n}\n"), [{ startLine: 0, endLine: 1 }]);
 });
 
 // ── THE HOST↔SEED ABI GATE (webcraft A2, the LSP half) ──────────────────────

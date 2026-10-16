@@ -9,9 +9,8 @@
 //
 // The two filters are exercised against the same lint stream the handler reads, through the
 // same helper it calls, and the handler's own `codeActionsAt` (`lsp/src/features.ts`) is
-// run on the duplicate at the end. The playground adapter has NO organize-imports path at all
-// (`organizeImports`: server 1 use, adapter 0) — that gap is a `subBehaviours` row in
-// `playground_lsp_parity_test.ts`, not something this file can grade.
+// run on the duplicate at the end. The playground adapter calls the same `codeActionsAt`,
+// which `playground_lsp_parity_test.ts` asserts.
 
 import { filePath } from "./support/filePath.ts";
 import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
