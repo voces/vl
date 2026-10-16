@@ -94,6 +94,7 @@ import {
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
   primNameStr,
+  structNameOfTy,
   tyArrayElemPrim,
   tyFieldTyOf,
   tyHoldsObj,
@@ -4592,6 +4593,7 @@ export function collectRefPushSlots(blockIx: i32, fnIx: i32) {
           const callee = P.nodes[s.callFn]
           if callee is Member {
             recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+            recordFitPushSlot(callee.memObj)
           }
         }
       }
@@ -4604,6 +4606,18 @@ export function collectRefPushSlots(blockIx: i32, fnIx: i32) {
     }
   }
   0
+}
+
+// Also reserves the frame of the `K[]` an `is K[]` arm pushes onto in place of its receiver,
+// whose own list holds another element (D4962): its row is the receiver's checked type's.
+function recordFitPushSlot(recv: i32) {
+  const o = P.nodes[unwrapParen(recv)]
+  if !(o is Ident) || !strListHas(listIsIdentNames, o.identName) { return 0 }
+  const t = nodeTyIxOf(recv)
+  if t < 0 || t >= T.tys.length { return 0 }
+  const a = T.tys[t]
+  if !(a is TyArray) { return 0 }
+  recordRefPushSlot(rlSlotOfTy(a.aElem))
 }
 
 // Collect ref-push receiver slots from every arm of the `if` / `else if` chain at `ifIx` — the
@@ -4660,6 +4674,7 @@ export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
       const callee = P.nodes[e.callFn]
       if callee is Member {
         recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+        recordFitPushSlot(callee.memObj)
       }
     }
     const args = e.callArgs
@@ -5999,6 +6014,15 @@ function forceListLeafRepsOfTy(kTy: i32): i32 {
   const k = T.tys[kTy]
   if !(k is TyArray) || k.aElem < 0 || k.aElem >= T.tys.length { return 0 }
   const e = T.tys[k.aElem]
+  // A record element's list is a ref-list row of its own (D4962).
+  if e is TyObj {
+    const sn = structNameOfTy(k.aElem)
+    if sn == "" { return 0 }
+    ensureRefElemTy(sn, k.aElem)
+    rlUsed = true
+    raUsed = true
+    return 0
+  }
   if !(e is TyPrim) { return 0 }
   match e.primName {
     "string" => {
