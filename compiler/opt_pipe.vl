@@ -1,0 +1,851 @@
+// The whole `-O` chain on one instance (docs/internals/optimizer-in-vl.md, "One call"): the
+// inline-record and list-flattening steps, the multi-value step, the escape step and the
+// rung's argv, in that order. The host stages the emitted module with `optInLoad`, calls
+// `optPipeStart`, and answers each request until DONE, doing only what a guest cannot:
+// validating a module, printing, writing a file and running `wasm-opt`.
+
+import { copyBytes, wnPutLeb } from "./wasm_names"
+import { WasmCursor, wcByte, wcNew, wcU32 } from "./wasm_read"
+import {
+  optInBytes,
+  optInSet,
+  optOutBytes,
+  optOutSet,
+  optRoundTrip,
+  optRungArgv,
+} from "./opt_scan"
+import { optEscapeChoose, optEscapeRestore } from "./opt_escape"
+import { optInline } from "./opt_inline"
+import {
+  optInlineExplain,
+  optInlineFlatRelied,
+  optInlineFlatScan,
+  optInlineFlatStep,
+  optInlineFlatUnfree,
+  optInlineMoves,
+  optInlineRewrite,
+  optInlineSummary,
+} from "./opt_inline_scan"
+import {
+  MV_RECORD_MAX_FIELDS,
+  optMultivalue,
+  optMultivalueExplain,
+  optMultivalueMoves,
+  optMultivalueScalarized,
+} from "./opt_multivalue"
+
+// Requests, with `optOut` holding what each carries. The host answers VALIDATE (1, or 0 with
+// the error staged in `optIn`), VALIDATE_INPUT (whether the pipeline's input validates) and
+// WASM_OPT (1 with the result staged); every other request is answered 0.
+const RQ_DONE = 0
+const RQ_PRINT = 1
+const RQ_VALIDATE = 2
+const RQ_VALIDATE_INPUT = 3
+const RQ_MOVES = 4
+const RQ_DUMP_INLINE = 5
+const RQ_DUMP_FLAT = 6
+const RQ_DUMP_MV = 7
+const RQ_DUMP_ESCAPE = 8
+const RQ_WASM_OPT = 9
+const RQ_ERROR = 10
+
+// `optPipeStart`'s option bits, one per flag or variable the host reads.
+const O_NO_INLINE = 1
+const O_INLINE_EXPLAIN = 2
+const O_REBOX = 4
+const O_SPILL = 8
+const O_NO_FLAT = 16
+const O_NO_MV = 32
+const O_MV_EXPLAIN = 64
+const O_MV_FAULT = 128
+const O_ROUNDTRIP = 256
+const O_ROUNDTRIP_FAULT = 512
+const O_MAP = 1024
+const O_NAMES = 2048
+const O_STABLE = 4096
+const O_DUMP_INLINE = 8192
+const O_DUMP_FLAT = 16384
+const O_DUMP_MV = 32768
+const O_DUMP_ESCAPE = 65536
+
+// The escape step's `wasm-opt` run: inline exactly the functions not named `L4n.*`; `-g`
+// keeps the name section, which carries each function's original index back out.
+const ESCAPE_INLINE_PASSES = [
+  "-g", "--no-inline=L4n.*", "--always-inline-max-function-size", "100000",
+  "--inlining",
+]
+
+// Where the pipeline is, by the step it runs next.
+const P_START = 0
+const P_CENSUS = 1
+const P_REWRITE = 2
+const P_REWRITE_CHECKED = 3
+const P_FLAT = 4
+const P_FLAT_STEP = 5
+const P_FLAT_CHECKED = 6
+const P_FLAT_MV_CHECKED = 7
+const P_APPLY = 8
+const P_MV = 9
+const P_MV_GOT = 10
+const P_MV_RUN = 11
+const P_MV_CHECKED = 12
+const P_ESCAPE = 13
+const P_ESCAPE_RESTORE = 14
+const P_ARGV = 15
+const P_END = 16
+
+let pc = P_END
+let rung = 1
+let lowMemory = 0
+let opts = 0
+let fault = 0
+let cur: u8[] = []
+let argvOut: u8[] = []
+let inputValid = -1
+let mvValid = false
+
+// The requests not yet handed over, oldest first.
+let qCode: i32[] = []
+let qData: u8[][] = []
+let qHead = 0
+
+// The record-field step's answer, and the list-flattening step's.
+let fChanged = false
+let fOut: u8[] = []
+let fMoves: u8[] = []
+let fLog: u8[] = []
+let fSum: u8[] = []
+let flOut: u8[] = []
+let flLog: u8[] = []
+let flHeld: i32[] = []
+let flParams: i32[] = []
+let mvOut: u8[] = []
+let mvMoves: u8[] = []
+let mvLog: u8[] = []
+let stepMoves: u8[] = []
+let stepFields = false
+let stepFlat = false
+
+// Starts the chain on the staged module. `rung` is 1 for `-O` and 3 for `-O3`, `low` the
+// `--low-memory-unused` bytes (0 for none), `options` the `O_*` bits and `inlineFault` the
+// `$VL_INLINE_FAULT` number. Answers the first request.
+export function optPipeStart(
+  r: i32,
+  low: i32,
+  options: i32,
+  inlineFault: i32,
+): i32 {
+  rung = r
+  lowMemory = low
+  opts = options
+  fault = inlineFault
+  cur = optInBytes()
+  argvOut = []
+  inputValid = -1
+  fChanged = false
+  stepFields = false
+  stepFlat = false
+  pc = P_START
+  qCode = []
+  qData = []
+  qHead = 0
+  advance(0)
+  next()
+}
+
+// The answer to the last request (see `RQ_*`); answers the next one.
+export function optPipeResume(answer: i32): i32 {
+  if qHead < qCode.length { return next() }
+  qCode = []
+  qData = []
+  qHead = 0
+  advance(answer)
+  next()
+}
+
+// The `wasm-opt` argv of the last WASM_OPT or DONE, one `\n`-terminated argument each.
+export function optPipeArgv(): i32 {
+  optOutSet(argvOut)
+  0
+}
+
+function next(): i32 {
+  if qHead >= qCode.length {
+    optOutSet([])
+    return RQ_ERROR
+  }
+  const code = qCode[qHead]
+  optOutSet(qData[qHead])
+  qHead = qHead + 1
+  code
+}
+
+function ask(code: i32, data: u8[]) {
+  qCode.push(code)
+  qData.push(data)
+}
+
+function on(bit: i32): boolean { (opts & bit) != 0 }
+
+function flagText(out: u8[]) {
+  putText(out, if rung == 3 { "-O3" } else { "-O" })
+}
+
+function fail(msg: u8[]) {
+  ask(RQ_ERROR, msg)
+  pc = P_END
+}
+
+function print(log: u8[]) {
+  if log.length > 0 { ask(RQ_PRINT, log) }
+}
+
+// Runs steps from `pc` until one waits for an answer or the chain ends.
+function advance(answer: i32) {
+  let a = answer
+  let waiting = false
+  while !waiting && pc != P_END {
+    waiting = runStep(a)
+    a = 0
+  }
+}
+
+// One step; true when it left a request that needs an answer, or ended the chain.
+function runStep(a: i32): boolean {
+  if pc == P_START { return start() }
+  if pc == P_CENSUS { return census() }
+  if pc == P_REWRITE { return rewrite(a) }
+  if pc == P_REWRITE_CHECKED { return rewriteChecked(a) }
+  if pc == P_FLAT { return flat() }
+  if pc == P_FLAT_STEP { return flatStep() }
+  if pc == P_FLAT_CHECKED { return flatChecked(a) }
+  if pc == P_FLAT_MV_CHECKED { return flatMvChecked(a) }
+  if pc == P_APPLY { return apply() }
+  if pc == P_MV { return mv() }
+  if pc == P_MV_GOT {
+    inputValid = a
+    mvValid = a == 1
+    pc = P_MV_RUN
+    return false
+  }
+  if pc == P_MV_RUN { return mvRun() }
+  if pc == P_MV_CHECKED { return mvChecked(a) }
+  if pc == P_ESCAPE { return escape() }
+  if pc == P_ESCAPE_RESTORE { return escapeRestore() }
+  if pc == P_ARGV { return argv() }
+  const msg: u8[] = []
+  putText(msg, "the compiler's -O pipeline reached an unknown step")
+  fail(msg)
+  true
+}
+
+function start(): boolean {
+  if !roundTrip(cur, "the emitted module") { return true }
+  pc = if on(O_NO_INLINE) { P_MV } else { P_CENSUS }
+  false
+}
+
+// The inline-record step's census; a module it rules out goes straight to the multi-value step.
+function census(): boolean {
+  optInSet(cur)
+  const explain = on(O_INLINE_EXPLAIN)
+  if (
+    optInline(if explain { 1 } else { 0 }, if fault == 1 { 1 } else { 0 })
+    != 1
+  ) {
+    if explain { print(optOutBytes()) }
+    pc = P_MV
+    return false
+  }
+  ask(RQ_VALIDATE_INPUT, [])
+  pc = P_REWRITE
+  true
+}
+
+// The record-field step, on an input that validates.
+function rewrite(valid: i32): boolean {
+  inputValid = valid
+  fChanged = false
+  fLog = []
+  pc = P_FLAT
+  if valid != 1 { return false }
+  optInSet(cur)
+  const changed = optInlineRewrite(
+    if on(O_STABLE) { 1 } else { 0 },
+    if on(O_REBOX) { 1 } else { 0 },
+    if on(O_SPILL) { 1 } else { 0 },
+    1,
+    fault,
+  )
+  fOut = optOutBytes()
+  optInlineMoves()
+  fMoves = optOutBytes()
+  optInlineExplain()
+  fLog = copyOf(optOutBytes())
+  optInlineSummary()
+  fSum = optOutBytes()
+  if changed != 1 { return false }
+  ask(RQ_VALIDATE, fOut)
+  pc = P_REWRITE_CHECKED
+  true
+}
+
+function rewriteChecked(valid: i32): boolean {
+  if valid == 1 {
+    copyBytes(fLog, fSum, 0, fSum.length)
+    fChanged = true
+  } else {
+    putText(
+      fLog,
+      "inline-explain: step abandoned: its output does not validate: ",
+    )
+    appendError(fLog)
+  }
+  pc = P_FLAT
+  false
+}
+
+// The list-flattening step's scan, on the record-field step's input and then its output.
+function flat(): boolean {
+  const explain = on(O_INLINE_EXPLAIN)
+  if explain { print(fLog) }
+  const silent = fLog.length == 0 && !fChanged
+  const stable = if on(O_STABLE) { 1 } else { 0 }
+  const valid = fChanged || inputValid == 1
+  optInSet(cur)
+  const gate = optInlineFlatScan(
+    stable,
+    if valid { 1 } else { 0 },
+    if fChanged { 0 } else { 1 },
+  )
+  if gate <= 1 {
+    if explain && silent {
+      const line: u8[] = []
+      putText(line, "inline-explain: step skipped: ")
+      if gate == 0 {
+        const why = optOutBytes()
+        copyBytes(line, why, 0, why.length)
+      } else {
+        putText(
+          line,
+          "no struct field or array element holds a leaf record (1 to ",
+        )
+        putDec(line, MV_RECORD_MAX_FIELDS)
+        putText(line, " numeric fields)")
+      }
+      line.push(10)
+      print(line)
+    }
+    return fieldsOnly()
+  }
+  if gate == 2 || on(O_NO_FLAT) { return fieldsOnly() }
+  if fChanged {
+    optInSet(fOut)
+    if optInlineFlatScan(stable, 1, 1) != 3 { return fieldsOnly() }
+  }
+  pc = P_FLAT_STEP
+  false
+}
+
+// The record-field step's answer alone, when no list is flattened.
+function fieldsOnly(): boolean {
+  if fChanged {
+    cur = fOut
+    stepMoves = fMoves
+    stepFields = true
+    stepFlat = false
+    pc = P_APPLY
+  } else {
+    pc = P_MV
+  }
+  false
+}
+
+function flatStep(): boolean {
+  const changed = optInlineFlatStep(
+    if on(O_REBOX) { 1 } else { 0 },
+    if on(O_SPILL) { 1 } else { 0 },
+    if fault == 4 { 4 } else { 0 },
+  )
+  flOut = optOutBytes()
+  optInlineExplain()
+  flLog = optOutBytes()
+  if changed != 1 {
+    if on(O_INLINE_EXPLAIN) { print(flLog) }
+    return fieldsOnly()
+  }
+  ask(RQ_VALIDATE, flOut)
+  pc = P_FLAT_CHECKED
+  true
+}
+
+// A flattening that validates, checked against what the multi-value step takes apart.
+function flatChecked(valid: i32): boolean {
+  if valid != 1 {
+    if on(O_INLINE_EXPLAIN) {
+      const log = copyOf(flLog)
+      putText(
+        log,
+        "inline-explain: flattening abandoned: its output does not validate: ",
+      )
+      appendError(log)
+      print(log)
+    }
+    return fieldsOnly()
+  }
+  optInlineFlatRelied()
+  const s = optOutBytes()
+  const c = wcNew(s, 0, s.length)
+  flHeld = readTriples(c)
+  flParams = readTriples(c)
+  if c.failed || c.pos != s.length {
+    const msg: u8[] = []
+    putText(
+      msg,
+      "the compiler's optInlineFlatRelied wrote a stream it cannot read",
+    )
+    fail(msg)
+    return true
+  }
+  if flHeld.length == 0 && flParams.length == 0 { return flatDone() }
+  optInSet(flOut)
+  if optMultivalue(0, 1) != 1 { return flatUnfree(false) }
+  let out = optOutBytes()
+  if on(O_MV_FAULT) {
+    out = copyOf(out)
+    out.push(0xff)
+  }
+  ask(RQ_VALIDATE, out)
+  pc = P_FLAT_MV_CHECKED
+  true
+}
+
+function flatMvChecked(valid: i32): boolean { flatUnfree(valid == 1) }
+
+// Counts whole every flattened array whose free reads the multi-value step leaves boxed, and
+// plans the step again; `took` false when that step would leave the module alone.
+function flatUnfree(took: boolean): boolean {
+  const locals: i32[][] = []
+  const pairs: i32[] = []
+  if took {
+    optMultivalueScalarized()
+    const s = optOutBytes()
+    const c = wcNew(s, 0, s.length)
+    const nb = wcU32(c)
+    let b = 0
+    while b < nb && !c.failed {
+      const ls: i32[] = []
+      const n = wcU32(c)
+      let k = 0
+      while k < n && !c.failed {
+        ls.push(wcU32(c))
+        k = k + 1
+      }
+      locals.push(ls)
+      b = b + 1
+    }
+    const np = wcU32(c)
+    let k = 0
+    while k < np && !c.failed {
+      pairs.push(wcU32(c))
+      pairs.push(wcU32(c))
+      k = k + 1
+    }
+    if c.failed || c.pos != s.length {
+      const msg: u8[] = []
+      putText(
+        msg,
+        "the compiler's optMultivalueScalarized wrote a stream it cannot read",
+      )
+      fail(msg)
+      return true
+    }
+  }
+  let any = false
+  let i = 0
+  while i + 2 < flHeld.length {
+    const bi = flHeld[i + 1]
+    if (
+      !(took && bi >= 0 && bi < locals.length && hasI(locals[bi], flHeld[i + 2]))
+    ) {
+      optInlineFlatUnfree(flHeld[i])
+      any = true
+    }
+    i = i + 3
+  }
+  i = 0
+  while i + 2 < flParams.length {
+    if !(took && hasPair(pairs, flParams[i + 1], flParams[i + 2])) {
+      optInlineFlatUnfree(flParams[i])
+      any = true
+    }
+    i = i + 3
+  }
+  if any {
+    pc = P_FLAT_STEP
+    return false
+  }
+  flatDone()
+}
+
+function flatDone(): boolean {
+  optInlineSummary()
+  const sum = optOutBytes()
+  if on(O_INLINE_EXPLAIN) {
+    const log = copyOf(flLog)
+    copyBytes(log, sum, 0, sum.length)
+    print(log)
+  }
+  optInlineMoves()
+  const second = optOutBytes()
+  if fChanged {
+    const both = composeMoves(fMoves, second)
+    if both.length == 0 {
+      const msg: u8[] = []
+      putText(
+        msg,
+        "the compiler's optInlineMoves wrote a stream it cannot read",
+      )
+      fail(msg)
+      return true
+    }
+    stepMoves = both
+  } else {
+    stepMoves = second
+  }
+  cur = flOut
+  stepFields = fChanged
+  stepFlat = true
+  pc = P_APPLY
+  false
+}
+
+// The inline-record step's module goes on: its moves for a source map, and its dumps.
+function apply(): boolean {
+  if on(O_MAP) { ask(RQ_MOVES, stepMoves) }
+  if stepFields && on(O_DUMP_INLINE) { ask(RQ_DUMP_INLINE, cur) }
+  if stepFlat && on(O_DUMP_FLAT) { ask(RQ_DUMP_FLAT, cur) }
+  pc = P_MV
+  false
+}
+
+// The multi-value step, told whether its input validates: an inline-record step's output
+// did, and the pipeline's input is the host's to say.
+function mv(): boolean {
+  if on(O_NO_MV) {
+    pc = P_ESCAPE
+    return false
+  }
+  if stepFields || stepFlat || inputValid >= 0 {
+    mvValid = stepFields || stepFlat || inputValid == 1
+    pc = P_MV_RUN
+    return false
+  }
+  ask(RQ_VALIDATE_INPUT, [])
+  pc = P_MV_GOT
+  true
+}
+
+function mvRun(): boolean {
+  optInSet(cur)
+  const explain = on(O_MV_EXPLAIN)
+  const changed = optMultivalue(
+    if explain { 1 } else { 0 },
+    if mvValid { 1 } else { 0 },
+  )
+  mvOut = optOutBytes()
+  optMultivalueMoves()
+  mvMoves = optOutBytes()
+  optMultivalueExplain()
+  mvLog = copyOf(optOutBytes())
+  if changed != 1 {
+    print(mvLog)
+    pc = P_ESCAPE
+    return false
+  }
+  if on(O_MV_FAULT) {
+    mvOut = copyOf(mvOut)
+    mvOut.push(0xff)
+  }
+  ask(RQ_VALIDATE, mvOut)
+  pc = P_MV_CHECKED
+  true
+}
+
+function mvChecked(valid: i32): boolean {
+  if valid != 1 {
+    if on(O_MV_EXPLAIN) {
+      putText(
+        mvLog,
+        "mv-explain: step abandoned: its output does not validate: ",
+      )
+      appendError(mvLog)
+    }
+    print(mvLog)
+    pc = P_ESCAPE
+    return false
+  }
+  print(mvLog)
+  cur = mvOut
+  if on(O_MAP) { ask(RQ_MOVES, mvMoves) }
+  if on(O_DUMP_MV) { ask(RQ_DUMP_MV, cur) }
+  pc = P_ESCAPE
+  false
+}
+
+// The escape step: the chosen callees named apart, one `wasm-opt` run inlining them.
+function escape(): boolean {
+  optInSet(cur)
+  if optEscapeChoose() != 1 {
+    pc = P_ARGV
+    return false
+  }
+  argvOut = []
+  for p in ESCAPE_INLINE_PASSES {
+    putText(argvOut, p)
+    argvOut.push(10)
+  }
+  ask(RQ_WASM_OPT, optOutBytes())
+  pc = P_ESCAPE_RESTORE
+  true
+}
+
+// Every function's name back, on the module `wasm-opt` wrote (staged by the host).
+function escapeRestore(): boolean {
+  const stepped = optInBytes()
+  const rc = optEscapeRestore()
+  if rc != 1 {
+    const msg: u8[] = []
+    flagText(msg)
+    if rc == 0 {
+      putText(
+        msg,
+        ": the escape step's module lost the function names it was given",
+      )
+    } else if rc == -1 {
+      putText(msg, ": the escape step wrote a module it cannot read")
+    } else {
+      putText(msg, ": the compiler's optEscapeRestore answered ")
+      if rc < 0 {
+        msg.push(45)
+        putDec(msg, 0 - rc)
+      } else {
+        putDec(msg, rc)
+      }
+    }
+    fail(msg)
+    return true
+  }
+  const restored = optOutBytes()
+  if on(O_MAP) && codeStart(stepped) != codeStart(restored) {
+    const msg: u8[] = []
+    flagText(msg)
+    putText(
+      msg,
+      ": restoring the escape step's names moved the code its source map describes",
+    )
+    fail(msg)
+    return true
+  }
+  cur = restored
+  if on(O_DUMP_ESCAPE) { ask(RQ_DUMP_ESCAPE, cur) }
+  pc = P_ARGV
+  false
+}
+
+// The rung's argv over the module the chain ends with, which DONE carries.
+function argv(): boolean {
+  if !roundTrip(cur, "the rung's input") { return true }
+  optInSet(cur)
+  const names = if on(O_NAMES) { 1 } else { 0 }
+  if optRungArgv(rung, names, lowMemory) != 1 {
+    const msg: u8[] = []
+    putText(msg, "the compiler's optRungArgv refused the rung ")
+    flagText(msg)
+    fail(msg)
+    return true
+  }
+  argvOut = optOutBytes()
+  ask(RQ_DONE, cur)
+  pc = P_END
+  true
+}
+
+// `$VL_OPT_ROUNDTRIP`: the module writer must write `b` back unchanged, or the chain fails
+// naming `what`; its fault flips a bit of the answer first. False when it failed.
+function roundTrip(b: u8[], what: string): boolean {
+  if !on(O_ROUNDTRIP) { return true }
+  optInSet(b)
+  if optRoundTrip() != 1 {
+    const msg: u8[] = []
+    putText(
+      msg,
+      "$VL_OPT_ROUNDTRIP: the compiler's module writer does not decode ",
+    )
+    putText(msg, what)
+    fail(msg)
+    return false
+  }
+  const out = optOutBytes()
+  const flip = on(O_ROUNDTRIP_FAULT) && out.length > 0
+  const last = out.length - 1
+  let at = 0
+  while at < out.length && at < b.length {
+    const o = if flip && at == last { out[at] ^ 1 } else { out[at] }
+    if o != b[at] { break }
+    at = at + 1
+  }
+  if at == out.length && at == b.length { return true }
+  const msg: u8[] = []
+  putText(msg, "$VL_OPT_ROUNDTRIP: the compiler's module writer changes ")
+  putText(msg, what)
+  putText(msg, ": ")
+  putDec(msg, b.length)
+  putText(msg, " bytes in, ")
+  putDec(msg, out.length)
+  putText(msg, " out, the first difference at offset ")
+  putDec(msg, at)
+  fail(msg)
+  false
+}
+
+// Appends the validator's error the host staged, and a newline.
+function appendError(log: u8[]) {
+  const e = optInBytes()
+  copyBytes(log, e, 0, e.length)
+  log.push(10)
+}
+
+// A count, then that many triples, flat; the cursor fails on a short stream.
+function readTriples(c: WasmCursor): i32[] {
+  const out: i32[] = []
+  const n = wcU32(c)
+  let k = 0
+  while k < n && !c.failed {
+    out.push(wcU32(c))
+    out.push(wcU32(c))
+    out.push(wcU32(c))
+    k = k + 1
+  }
+  out
+}
+
+function hasI(xs: i32[], v: i32): boolean {
+  for x in xs {
+    if x == v { return true }
+  }
+  false
+}
+
+function hasPair(xs: i32[], f: i32, j: i32): boolean {
+  let i = 0
+  while i + 1 < xs.length {
+    if xs[i] == f && xs[i + 1] == j { return true }
+    i = i + 2
+  }
+  false
+}
+
+// The record-field step's body moves carried through the list-flattening step's: each op's
+// output offset placed again by the second step's moves of the same body. Empty when either
+// stream does not read.
+function composeMoves(first: u8[], second: u8[]): u8[] {
+  const none: u8[] = []
+  const a = wcNew(first, 0, first.length)
+  const b = wcNew(second, 0, second.length)
+  const na = wcU32(a)
+  const nb = wcU32(b)
+  const bodies: u8[][] = []
+  let k = 0
+  while k < na && !a.failed {
+    const body: u8[] = []
+    wnPutLeb(body, wcU32(a))
+    wnPutLeb(body, wcU32(a))
+    const pairs = wcU32(a)
+    const olds: i32[] = []
+    const news: i32[] = []
+    let p = 0
+    while p < pairs && !a.failed {
+      olds.push(wcU32(a))
+      news.push(wcU32(a))
+      p = p + 1
+    }
+    const bOld: i32[] = []
+    const bNew: i32[] = []
+    if k < nb {
+      wcU32(b)
+      wcU32(b)
+      const bp = wcU32(b)
+      p = 0
+      while p < bp && !b.failed {
+        bOld.push(wcU32(b))
+        bNew.push(wcU32(b))
+        p = p + 1
+      }
+    }
+    wnPutLeb(body, olds.length)
+    let i = 0
+    while i < olds.length {
+      wnPutLeb(body, olds[i])
+      wnPutLeb(body, place(bOld, bNew, news[i]))
+      i = i + 1
+    }
+    bodies.push(body)
+    k = k + 1
+  }
+  if a.failed || b.failed || a.pos != first.length || b.pos != second.length {
+    return none
+  }
+  const out: u8[] = []
+  const n = if na < nb { na } else { nb }
+  wnPutLeb(out, n)
+  let i = 0
+  while i < n && i < bodies.length {
+    copyBytes(out, bodies[i], 0, bodies[i].length)
+    i = i + 1
+  }
+  out
+}
+
+// An input offset as the body's output offset: the op it falls in moved as a whole.
+function place(olds: i32[], news: i32[], off: i32): i32 {
+  if olds.length == 0 || news.length != olds.length { return off }
+  let lo = 0
+  let hi = olds.length
+  while lo < hi {
+    const mid = (lo + hi) / 2
+    if olds[mid] <= off { lo = mid + 1 } else { hi = mid }
+  }
+  const i = if lo < 1 { 0 } else { lo - 1 }
+  const d = off - olds[i]
+  news[i] + (if d > 0 { d } else { 0 })
+}
+
+// Where the code section's payload starts, or -1 when the module has none or does not read.
+function codeStart(b: u8[]): i32 {
+  if b.length < 8 { return -1 }
+  const c = wcNew(b, 8, b.length)
+  while c.pos < c.end {
+    const id = wcByte(c)
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { return -1 }
+    if id == 10 { return c.pos }
+    c.pos = c.pos + size
+  }
+  -1
+}
+
+function copyOf(b: u8[]): u8[] {
+  const out: u8[] = []
+  copyBytes(out, b, 0, b.length)
+  out
+}
+
+function putText(out: u8[], s: string) {
+  for cp in s { out.push(cp) }
+}
+
+function putDec(out: u8[], v: i32) {
+  if v >= 10 { putDec(out, v / 10) }
+  out.push(48 + v % 10)
+}
