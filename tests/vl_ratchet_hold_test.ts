@@ -77,19 +77,21 @@ Deno.test({
   },
 });
 
-// The control for the graph staging above: typecheck.vl reads map globals it imports
-// (`fnDeclIx` from check_write_scan.vl), which one file's text cannot tell from a list, and
-// hands ladder defaults to functions it imports (`zeroBytesBindScan` to `rcwModOf`), which
-// one file's text cannot tell from an undeclared call. Without the graph both are hits the
-// CLI's graph lint, and so the baseline, never counts.
+// The control for the graph staging above: check_relate_core.vl (carved out of typecheck.vl)
+// reads map globals it imports (`fnDeclIx` from check_write_scan.vl), which one file's text
+// cannot tell from a list, and hands ladder defaults to functions it imports, which one
+// file's text cannot tell from an undeclared call. Without the graph both are hits the CLI's
+// graph lint, and so the baseline, never counts.
+const CONTROL_REL = "compiler/check_relate_core.vl";
+const CONTROL = `${ROOT}/${CONTROL_REL}`;
 Deno.test({
   name: "ratchet-hold: the editor reads an imported map global and function the way the CLI does",
   ignore: !ENABLED,
   fn: async () => {
-    const src = Deno.readTextFileSync(TARGET);
+    const src = Deno.readTextFileSync(CONTROL);
     const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
-    const aloneDs = checker.lint(src, REL);
-    const graphDs = await lintFindings(src);
+    const aloneDs = checker.lint(src, CONTROL_REL);
+    const graphDs = await checker.lintInGraph(src, CONTROL_REL, CONTROL, diskReader);
     for (const code of ["sentinel-index-unguarded", "kind-ladder-incomplete"]) {
       const count = (ds: { code?: unknown }[]) => ds.filter((d) => d.code === code).length;
       const alone = count(aloneDs);
@@ -228,9 +230,10 @@ Deno.test({
     const src = Deno.readTextFileSync(TARGET);
     const diags = checker.lint(src); // no second argument — the pre-fix call shape
     const found = diags.filter((d) => d.code === "prefer-interpolation").length;
-    if (found < 100) {
+    // Non-vacuity only: the typecheck.vl carves move findings out, so no size floor.
+    if (found === 0) {
       throw new Error(
-        `the scoping fix's premise is that typecheck.vl carries a large unscoped ` +
+        `the scoping fix's premise is that typecheck.vl carries an unscoped ` +
           `prefer-interpolation count when no path is staged; got only ${found}`,
       );
     }

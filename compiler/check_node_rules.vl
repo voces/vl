@@ -1,0 +1,1544 @@
+// Per-node rules the core checker applies after typing a node: intrinsic and nesting
+// refusals, `if`-tail and `break` checks, duplicate keys, map-key and bound checks, and the
+// function-slot bookkeeping (`fsb*`) a stored function value is checked against.
+
+import {
+  BinExpr,
+  Block,
+  BreakStmt,
+  CALLSITE_NAME,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  IsExpr,
+  LetDecl,
+  MC_RUNG_FIELD,
+  Member,
+  NumLit,
+  P,
+  Param,
+  UnionDecl,
+  annTsOf,
+  declNameTokOf,
+  externGlobalLinkOfNode,
+  externLinkOf,
+  i32ToStr,
+  isBareBlockIf,
+  isBinOpDecl,
+  markCallNever,
+  opDeclLabelBin,
+  stmtAlwaysExits,
+  tsMentionsAnyName,
+  ufcsModOfNode,
+} from "./ast"
+import { mapKeyUnsupportedErr, v128NestCheck } from "./check_annot_resolve"
+import {
+  fsbCallArgTys,
+  fsbCallIx,
+  fsbDeclAtNode,
+  fsbDeclIsList,
+  fsbDepth,
+  fsbIsGeneric,
+  fsbIsGenericList,
+  fsbName,
+  fsbNoteOwner,
+  fsbPendIx,
+  fsbPendIxPush,
+  fsbPendName,
+  fsbPendNamePush,
+  fsbPendTy,
+  fsbPendTyPush,
+  fsbRowDeclPush,
+  lpOn,
+} from "./check_bind_rows"
+import { memberRungOnTy, selfFnRecvSpelling } from "./check_builtin_methods"
+import {
+  atValueArmTail,
+  brkPrevTy,
+  getWriteTarget,
+  inferRetSeeding,
+  inferRetSeedingSet,
+  inferSawErrSet,
+  pgPreIx,
+  pgPreIxSet,
+  pgPreKeys,
+  pgPreKeysSet,
+  pgPreTys,
+  pgPreTysSet,
+  pgUpArmIxSet,
+  pgUpKeys,
+  pgUpTys,
+} from "./check_core_state"
+import { noteNestCstr } from "./check_cstr_rows"
+import { inferQuiet, tpEnvNames } from "./check_cursor"
+import { boundObjRootOf, v128Seen } from "./check_decl_scan"
+import {
+  daJoinArms,
+  daRelease,
+  daRollbackTo,
+  daSplitDelta,
+  daTouchedSince,
+} from "./check_definite"
+import { boundText, rangeNeverRunsMsg } from "./check_diag_text"
+import {
+  boundMemberList,
+  boundMembersOf,
+  inferRetJoin,
+  litJoinOf,
+  tpIfCmpNode,
+} from "./check_fit_rules"
+import {
+  anyParamMentionsTyParam,
+  bodyFnLetName,
+  bodyFnParamNaming,
+  bodyFnRetNaming,
+} from "./check_fn_lit_sites"
+import {
+  holeAltNames,
+  holeAltTailN,
+  holeShapeFieldCount,
+} from "./check_hole_rows"
+import {
+  discardValTyAtSetAt,
+  f32ArmPlainTy,
+  f32JoinAdoptCount,
+  f32JoinRevert,
+  ifArmGivesNoValue,
+  ifArmValTy,
+  ifNoValueAtSetAt,
+  ifNoValueClear,
+  ifValTyAtSetAt,
+  ifYieldsNoValue,
+  lpBareSetAt,
+  lpJoin,
+  lpJoinSetAt,
+  lpTargetOf,
+  tpIfOkAt,
+  valDiscarded,
+} from "./check_if_value"
+import {
+  inferRetLogLit,
+  inferRetLogSeed,
+  inferRetLogTy,
+} from "./check_infer_rows"
+import { noteInferJoin } from "./check_inline_lit_union"
+import {
+  SIMD_SIG_SHUF16,
+  SIMD_SIG_SHUF4,
+  intrinsicNameRefusal,
+  nameIsUnimplementedIntrinsic,
+  simdRow,
+  simdRowLaneMax,
+  simdRowSig,
+} from "./check_intrinsics"
+import {
+  armTailUndecided,
+  blockTailIx,
+  blockTailTy,
+  chainMissing,
+  f32JoinRetypesRunning,
+  forToKwTok,
+  ifChainOnFnTail,
+  inferRetNextLit,
+  inferRetNextLitSet,
+  joinMayAdoptF32,
+  matchBodyDeclares,
+  mkGuardedRetTy,
+  noteInferRetValue,
+  noteInferRetWitness,
+  objLitEarlierKey,
+  retTailPosSet,
+  voidSlotExemptExpr,
+} from "./check_leaf_steps"
+import {
+  monoRecheckDepth,
+  noteTpJoinRow,
+  tpIfCmpOn,
+  tpIfJoinAt,
+} from "./check_list_union"
+import { constIntExprIs, constIntExprVal, u8LexValue } from "./check_literals"
+import { cmpLitTyOf, condUnderParens } from "./check_match_desugar"
+import {
+  CODE_GENERIC_BINDING_CONCRETE_WRITE,
+  CODE_MISSING_IMPORT,
+  CODE_RANGE_NEVER_RUNS,
+  CODE_SELF_FN_SHADOWED,
+} from "./check_messages"
+import { NAR_KIND_POSTGUARD, narFnEpoch, noteNarShadow } from "./check_nar_bank"
+import {
+  applyArmJoins,
+  discardedIfValTy,
+  dropTailIfSeeds,
+  ifChainExhausts,
+  narFitCompanions,
+  popScope,
+} from "./check_narrow_flow"
+import {
+  IfChk,
+  isPathKey,
+  narClobKeys,
+  narClobberedSince,
+  narCompactIf,
+  npAsgPush,
+  npCapByPush,
+  npEpochsPush,
+  npInvByPush,
+  npKeysPush,
+  npSettlePush,
+  npTysPush,
+} from "./check_narrow_paths"
+import { njFnReached } from "./check_nj_gate"
+import { armLit, isTopLevelStmt, njFnIx, valueIsLitOnly } from "./check_nj_join"
+import { nodeTyIx, nodeTyIxOf, nodeTySet } from "./check_node_tys"
+import { noteExitArm, noteExitFirst } from "./check_null_holes"
+import { bindMarkPush } from "./check_num_lit_state"
+import { diagDataField } from "./check_overload"
+import { parenPeelIx } from "./check_places"
+import { rcwModOf } from "./check_record_writes"
+import {
+  assignable,
+  bindGenWalk,
+  dupNameErr,
+  joinArmLit,
+  joinF32LitTails,
+  joinTys,
+  sameVariantTy,
+  substTyDeep,
+  tErr,
+  tErrCoded,
+  tErrCodedData,
+  tErrOncePerMsg,
+  tErrPushTok,
+  tErrUnsupported,
+  tyParamArmAbsorbs,
+  widenLitTy,
+} from "./check_relate_core"
+import { declare, lookup, lookupDepth } from "./check_scopes"
+import { recordPgResidualVoid } from "./check_side_rows"
+import { joinClashMsg, joinClashMsgSet } from "./check_subst"
+import { tpBoundOfName } from "./check_tp_bound"
+import { mapKeyTySupported } from "./check_ty_rep"
+import {
+  tpApartConcrete,
+  tpApartConcreteSet,
+  tyParamsPart,
+} from "./check_type_shape"
+import {
+  T,
+  TY_ERR,
+  TY_NEVER,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyNullable,
+  TyPrim,
+  TyVar,
+  cUserTypes,
+  demangleMsg,
+  mkNullableTy,
+  tyBearsNull,
+  tyMentionsTyVarNamed,
+  tyToStr,
+} from "./check_types"
+import { setMapUnionClashMsg } from "./check_union_arm_msgs"
+import { noteWideLitNode } from "./check_wide_lits"
+import { fnDeclIx } from "./check_write_scan"
+import { numLexIsFloat } from "./emit_bignum"
+import {
+  mimpAnyProgramSpec,
+  mimpExportedByNote,
+  mimpNoteMiss,
+  mimpSpecsFor,
+} from "./missing_import"
+import {
+  flattenVariantsInto,
+  isLitBearing,
+  isNullTy,
+  isVoidTy,
+  nonNullTy,
+  tyHasTyVar,
+  tyMentionsVoid,
+} from "./tyquery"
+
+// The shared rejection for a definition that binds an emitter-intrinsic name. The reason half of
+// the message is per-family, because the two families fail the same way for different reasons:
+// the memory tier lowers to instructions, the filesystem tier to a `call` of a host import. Both
+// discard the user's body, which is the part the author needs, but only one lowers inline.
+export function checkNotEmitterIntrinsic(name: string, at: i32) {
+  // An extern name is a host import name: `emitCall` routes the call to the import, so a
+  // definition of that name would never run — the same reason the fs floor is reserved. An
+  // `extern let` of the name is refused once, by `checkExternGlobals`.
+  if (
+    name != CALLSITE_NAME
+    && externLinkOf(name) >= 0
+    && externGlobalLinkOfNode(at) < 0
+  ) {
+    tErr(
+      "'"
+        + name
+        + "' is declared `extern` — every call to it lowers to a host import, so this definition would never run",
+      at,
+    )
+    return 0
+  }
+  checkNotIntrinsicName(name, at)
+}
+
+// The name-only half of `checkNotEmitterIntrinsic`: refuses a definition spelled as a compiler
+// intrinsic. Exported for the module merge, which renames every top-level declaration before
+// the checker sees it and so must screen the spelling first (D2263).
+export function checkNotIntrinsicName(name: string, at: i32) {
+  const msg = intrinsicNameRefusal(name)
+  if msg != "" { tErr(msg, at) }
+  0
+}
+
+// D541 — a binary operator declared below module scope can never dispatch, the twin of the check
+// directly above: a definition that would never run, refused at the definition rather than
+// silently meaning something else at the site. `opSelfFnTy` resolves through `lookup(op)` and a
+// nested `function "+"` binds in a node table, so this is a position rule, not a type rule.
+export function checkNotNestedBinOpDecl(name: string, at: i32) {
+  if !isBinOpDecl(name) { return 0 }
+  if isTopLevelStmt(at) { return 0 }
+  tErr(
+    "operator `"
+      + opDeclLabelBin(name)
+      + "` can never dispatch: a binary operator must be declared at MODULE SCOPE, and "
+      + "this one is nested inside a function body or block — move it to the top level",
+    at,
+  )
+  0
+}
+
+// A `never` value cannot be stored: the expression never returns, so a slot typed by it would
+// take a type no value has. Reports and answers true when `ty` is `never` (D1972).
+export function neverValueSlotErr(ty: i32, slot: string, at: i32) {
+  if ty < 0 || ty != TY_NEVER { return false }
+  tErr(
+    slot
+      + " would hold a `never` value, and none exists: the expression never returns",
+    at,
+  )
+  true
+}
+
+// A `void` expression has no value, so a slot that demands one is a type error. This is the one
+// home for that verdict on the positions whose demanded type comes from inference: with no written
+// type there is nothing for `assignable` to compare against. `slot` names the demanding position,
+// and the answer says whether the slot is refused, so the caller can substitute `TY_ERR`.
+export function voidValueSlotErr(ty: i32, exprIx: i32, slot: string, at: i32) {
+  if !tyMentionsVoid(ty, 8) { return false }
+  // The provisional-void exemption covers a wholly void if/match only: a union that mentions void
+  // is a mixed arm join (`if c { f() } else { 1 }`), where the void is one arm's real type and no
+  // position resolves it away.
+  if isVoidTy(ty) {
+    if voidSlotExemptExpr(exprIx) { return false }
+  }
+  tErr(slot + " expects a value, got " + tyToStr(ty), at)
+  true
+}
+
+// Mark the binding `decl` just declared at `depth` with type `bound` when it is an un-annotated
+// `let` of a generic function value, and refuse the writes to it seen above its declaration.
+export function fsbMark(name: string, depth: i32, decl: i32, bound: i32) {
+  const n = P.nodes[decl]
+  if n is LetDecl {
+    if n.letType >= 0 || n.letInit < 0 || inferQuiet { return 0 }
+    if bound < 0 || bound >= T.tys.length { return 0 }
+    // A list's elements are written whatever its keyword; its writes are re-asked, not refused.
+    if fsbIsGenericList(n.letInit, bound) {
+      bindMarkPush(fsbDepth, fsbName, name, depth)
+      fsbRowDeclPush(decl)
+      return 0
+    }
+    if n.letKw != "let" { return 0 }
+    const bt = T.tys[bound]
+    if !(bt is TyFunc) || !fsbIsGeneric(n.letInit, bound) { return 0 }
+    bindMarkPush(fsbDepth, fsbName, name, depth)
+    fsbRowDeclPush(decl)
+    if depth == 0 {
+      let i = 0
+      while i < fsbPendName.length {
+        if fsbPendName[i] == name {
+          fsbRefuse(decl, fsbPendTy[i], fsbPendIx[i])
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// A write of `rhs`, of type `rt`, into the binding `tgt` names: refused when the binding is
+// marked and the value is a concrete function. A write to a module binding not declared yet waits.
+export function fsbNoteStore(tgt: i32, rhs: i32, rt: i32, ix: i32) {
+  if inferQuiet || rt < 0 || rt >= T.tys.length { return 0 }
+  const t = T.tys[rt]
+  if !(t is TyFunc) { return 0 }
+  if fsbIsGeneric(rhs, rt) { return fsbNoteOwner(fsbDeclAtNode(tgt), rhs, rt) }
+  const d = fsbDeclAtNode(tgt)
+  if d >= 0 && fsbDeclIsList(d) { return 0 }
+  if d >= 0 { return fsbRefuse(d, rt, ix) }
+  const g = P.nodes[parenPeelIx(tgt)]
+  if g is Ident {
+    if lookupDepth(g.identName) == 0 {
+      fsbPendNamePush(g.identName)
+      fsbPendIxPush(ix)
+      fsbPendTyPush(rt)
+    }
+  }
+  0
+}
+
+// The parameter types of the called type `ft` under the call's bindings.
+export function fsbArgTysOf(ft: TyFunc, vNames: string[], vTys: i32[]): i32[] {
+  const out: i32[] = []
+  for p in ft.fnParamTypes { out.push(substTyDeep(p, vNames, vTys)) }
+  out
+}
+
+// Bind the type variables of each parameter of function type `rt` against the argument type at
+// its position, structurally (`A[]`, `A | null`, `Box<A>`, `() => A` all bind `A`), appending to
+// `nm`/`ty`; answers how many it bound.
+export function fsbBindParams(
+  rt: i32,
+  args: i32[],
+  nm: string[],
+  ty: i32[],
+): i32 {
+  if rt < 0 || rt >= T.tys.length { return 0 }
+  const f = T.tys[rt]
+  const was = nm.length
+  if f is TyFunc {
+    let i = 0
+    while i < f.fnParamTypes.length && i < args.length {
+      const p = f.fnParamTypes[i]
+      if p >= 0 && p < T.tys.length && args[i] >= 0 && args[i] < T.tys.length {
+        bindGenWalk(p, args[i], nm, ty)
+      }
+      i = i + 1
+    }
+  }
+  nm.length - was
+}
+
+// Whether each argument of call `c` is assignable to the parameter of `rt` at its position under
+// the bindings `nm`/`ty`; the first that is not is refused at the call, as a direct call would be.
+export function fsbArgsFit(c: i32, rt: i32, nm: string[], ty: i32[]): boolean {
+  const f = T.tys[rt]
+  if !(f is TyFunc) { return true }
+  const args = fsbCallArgTys[c]
+  let i = 0
+  while i < f.fnParamTypes.length && i < args.length {
+    const want = substTyDeep(f.fnParamTypes[i], nm, ty)
+    if (
+      want >= 0
+      && args[i] >= 0
+      && !tyHasTyVar(want)
+      && !assignable(args[i], want)
+    ) {
+      tErr(
+        "argument "
+          + i32ToStr(i + 1)
+          + ": expected "
+          + tyToStr(want)
+          + ", got "
+          + tyToStr(args[i])
+          + " (a function written to this binding takes `"
+          + tyToStr(want)
+          + "` there)",
+        fsbCallIx[c],
+      )
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Refuse at `ix` the concrete function type `rt` written to the binding declared by `decl`, with
+// the annotation `check --fix` inserts after the binding's name when both are in one module.
+function fsbRefuse(decl: i32, rt: i32, ix: i32) {
+  const n = P.nodes[decl]
+  if !(n is LetDecl) { return 0 }
+  const annot = tyToStr(rt)
+  const head = "cannot assign "
+    + annot
+    + " to `"
+    + n.letName
+    + "`: it keeps the generic type of its initializer, so a function written to it must be "
+    + "generic too"
+  // The annotation is a fix only when the initializer fits it too.
+  const it = nodeTyIxOf(n.letInit)
+  if it >= 0 && !assignable(it, rt) {
+    return tErrCoded(
+      head
+        + " — no annotation holds both, since the initializer, "
+        + tyToStr(it)
+        + ", is not "
+        + annot
+        + "; bind this function to a `let` of its own",
+      ix,
+      CODE_GENERIC_BINDING_CONCRETE_WRITE,
+    )
+  }
+  let data = ""
+  const tk = declNameTokOf(decl)
+  if tk >= 0 && tk < P.toks.length && rcwModOf(decl) == rcwModOf(ix) {
+    const t = P.toks[tk]
+    data = diagDataField("annot", annot)
+      + diagDataField("line", i32ToStr(t.line))
+      + diagDataField("col", i32ToStr(t.col + t.text.length))
+  }
+  tErrCodedData(
+    head
+      + " — to hold this one, annotate it, `let "
+      + n.letName
+      + ": "
+      + annot
+      + " = …`",
+    ix,
+    CODE_GENERIC_BINDING_CONCRETE_WRITE,
+    data,
+  )
+}
+
+// Records the if-join `ix` of `a` and `b`, collapsed to `j`, when the return-set rule would
+// keep a type parameter's list apart in it; a pin that re-joins it apart re-checks the body.
+// `ok` says the join is delivered where an instance can build it as a union (`tpIfMarkOk`).
+function noteTpIfJoin(ix: i32, a: i32, b: i32, j: i32, ok: boolean) {
+  if tpEnvNames.length == 0 || monoRecheckDepth > 0 { return 0 }
+  if ix < 0 || a < 0 || b < 0 || j < 0 { return 0 }
+  if !tyHasTyVar(a) && !tyHasTyVar(b) { return 0 }
+  const saved = tpApartConcrete
+  tpApartConcreteSet(true)
+  let aj = -1
+  if (
+    tyParamsPart(a, b, 0)
+    || tyParamArmAbsorbs(a, b)
+    || tyParamArmAbsorbs(b, a)
+  ) {
+    aj = joinTys(a, b)
+  }
+  tpApartConcreteSet(saved)
+  noteTpJoinRow(ix, aj, j, ok)
+}
+
+// A `self`-function the member-call order can never reach is refused at its declaration
+// (DECISIONS.md, D2475): the receiver type already defines `name`, and that member is
+// what `recv.name(…)` calls. Coded, with `member`, `recv` and `rung` (`method`/`field`) as data.
+export function checkSelfFnReachable(name: string, selfTy: i32, fnIx: i32) {
+  const rung = memberRungOnTy(selfTy, name)
+  if rung == 0 { return 0 }
+  let what = "method"
+  if rung == MC_RUNG_FIELD { what = "field" }
+  const recv = demangleMsg(tyToStr(selfTy))
+  tErrCodedData(
+    "`"
+      + name
+      + "` is already a "
+      + what
+      + " of `"
+      + recv
+      + "`, so `"
+      + selfFnRecvSpelling(selfTy)
+      + "."
+      + name
+      + "(…)` would never call this function — rename it",
+    fnIx,
+    CODE_SELF_FN_SHADOWED,
+    diagDataField("member", name)
+      + diagDataField("recv", recv)
+      + diagDataField("rung", what),
+  )
+  0
+}
+
+// Adjudicates the key a usage-driven pin (`m.set(k, v)`, `s.add(k)`, `m[k] = v`) just
+// wrote into an open `mKey` hole — a bare `Map()` has no annotation for the checker's
+// static gate to read, so without this an inferred unsupported key checks clean and dies
+// in codegen instead. A hole key is still unsolved and left to call-site re-validation.
+export function checkInferredMapKey(k: i32, isSet: i32, at: i32) {
+  if k < 0 { return 0 }
+  if mapKeyTySupported(k) { return 0 }
+  const kt = T.tys[k]
+  if kt is TyVar { return 0 }
+  if kt is TyErr { return 0 }
+  let ctor = "Map"
+  if isSet == 1 { ctor = "Set" }
+  mapKeyUnsupportedErr(tyToStr(k), ctor, at)
+  0
+}
+
+// ── emit-name canonicalization ──
+// The emitter classifies annotations by synthetic name, and the literal/intersection
+// algebra above is checker-only — a same-base literal union is its base scalar at runtime.
+// `canonEmitTypeNames` rewrites every annotation name into that vocabulary at the end of `checkProgram`.
+
+// ── flat record layouts ──
+// The whole feature is these functions plus one interception at the top of
+// `checkMemberNode`. Nothing in `emit_*.vl` changes: layout constants are folded into
+// `NumLit` nodes in the arena before the emitter runs (`flat-records-design.md`).
+
+export function checkUnionSetMapClash(stmts: i32[]) {
+  let si = 0
+  while si < stmts.length {
+    const sd = P.nodes[stmts[si]]
+    if sd is UnionDecl {
+      const declIx = cUserTypes[sd.udName] ?? -1
+      if declIx >= 0 {
+        const flat: i32[] = []
+        flattenVariantsInto(declIx, flat)
+        const sm = setMapUnionClashMsg(flat, false)
+        if sm != "" { tErrOncePerMsg(sm, stmts[si]) }
+      }
+    }
+    si = si + 1
+  }
+  0
+}
+// Measures every `flat type` in the program, after the declaration passes have filled each
+// record's field types. Two phases, kept separate so an invalid declaration is never also
+// reported as a recursive one: (A) validate and stage each declaration's fields, deferring a
+// nested flat record; (B) a fixpoint, reporting anything still unresolved as a cycle by name.
+
+// Raises the undeclared-name error at `ix` naming the modules that export `name`, under
+// `missing-import`; false, raising nothing, when no module of the program or of std does.
+export function undeclaredImportRaise(name: string, ix: i32): boolean {
+  const from = ufcsModOfNode(ix)
+  const specs = mimpSpecsFor(name, from, -1)
+  // No program module answered: a file the program does not import yet may, beside std.
+  if !mimpAnyProgramSpec(specs) { mimpNoteMiss(name) }
+  if specs.length == 0 { return false }
+  let data = diagDataField("member", name)
+  for s in specs { data = data + diagDataField("modules", s) }
+  tErrCodedData(
+    "undeclared identifier '" + name + "'" + mimpExportedByNote(name, specs, from),
+    ix,
+    CODE_MISSING_IMPORT,
+    data,
+  )
+  true
+}
+
+// Whether every non-null member of the join `inner` is a member of one of the values `tys`: a
+// value whose node type does not show what it yields leaves the join without a return set.
+export function retValuesCover(inner: i32, tys: i32[]): boolean {
+  const want: i32[] = []
+  flattenVariantsInto(inner, want)
+  const have: i32[] = []
+  for t in tys { flattenVariantsInto(t, have) }
+  for w in want {
+    if !isNullTy(w) {
+      let found = false
+      for h in have {
+        if h == w || sameVariantTy(h, w) { found = true }
+      }
+      if !found { return false }
+    }
+  }
+  true
+}
+
+// Subsumption: does the bound on `srcTp` grant everything the callee's bound `dstAnn`
+// demands? Every member of the callee's bound must appear in the caller's with an assignable
+// type and the same kind — a colon member is a layout demand, a method a callability demand,
+// and a method does not satisfy a field. A caller parameter with no bound grants nothing.
+export function checkBoundSubsumes(
+  srcTp: string,
+  dstTp: string,
+  dstAnn: i32,
+  who: string,
+  ix: i32,
+) {
+  const dstRoot = boundObjRootOf(dstAnn)
+  if dstRoot < 0 { return 0 }
+  const dn: string[] = []
+  const dt: i32[] = []
+  const dm: boolean[] = []
+  boundMembersOf(dstRoot, dn, dt, dm)
+  const srcAnn = tpBoundOfName(srcTp)
+  const srcRoot = boundObjRootOf(srcAnn)
+  const sn: string[] = []
+  const st: i32[] = []
+  const sm: boolean[] = []
+  boundMembersOf(srcRoot, sn, st, sm)
+  let d = 0
+  while d < dn.length {
+    let ok = false
+    let s = 0
+    while s < sn.length {
+      if sn[s] == dn[d] && sm[s] == dm[d] {
+        if st[s] >= 0 && dt[d] >= 0 {
+          if assignable(st[s], dt[d]) { ok = true }
+        }
+      }
+      s = s + 1
+    }
+    if !ok {
+      let has = "`" + srcTp + "` is unbounded"
+      if srcAnn >= 0 {
+        has = "`"
+          + srcTp
+          + "`'s bound `"
+          + boundText(srcAnn)
+          + "` grants `"
+          + boundMemberList(srcRoot)
+          + "`"
+      }
+      let want = dn[d]
+      if dm[d] { want = dn[d] + "()" }
+      tErr(
+        "`"
+          + who
+          + "` needs `"
+          + dstTp
+          + ": "
+          + boundText(dstAnn)
+          + "`, which demands `"
+          + want
+          + "` — but "
+          + has
+          + ". Add it to `"
+          + srcTp
+          + "`'s bound",
+        ix,
+      )
+      return 0
+    }
+    d = d + 1
+  }
+  0
+}
+
+// A type parameter the callee's RETURN, or the signature of a function its body declares and
+// uses, names and none of its PARAMETER annotations does: no argument can bind it. Callers skip
+// a call with explicit type arguments. A DECLARED return is asked by its written spelling, an
+// INFERRED one by `retTy`, the settled result the call site already holds (D1819).
+export function checkRetTyParamBound(
+  declIx: i32,
+  who: string,
+  ix: i32,
+  retTy: i32,
+) {
+  if inferQuiet { return 0 }
+  if declIx < 0 { return 0 }
+  const dn = P.nodes[declIx]
+  if dn is FuncDecl {
+    if dn.fnTyParams.length == 0 { return 0 }
+    let rTs = -1
+    if dn.fnRet >= 0 { rTs = annTsOf(dn.fnRet) }
+    let k = 0
+    while k < dn.fnTyParams.length {
+      const one: string[] = [dn.fnTyParams[k]]
+      let named = false
+      if dn.fnRet >= 0 {
+        if rTs >= 0 { named = tsMentionsAnyName(rTs, one) }
+      } else {
+        named = tyMentionsTyVarNamed(retTy, dn.fnTyParams[k], 8)
+      }
+      if named {
+        if !anyParamMentionsTyParam(dn.fnParams, one) {
+          let w = "the callee"
+          if who != "" { w = "`" + who + "`" }
+          let what = "'s return type names it"
+          if dn.fnRet < 0 {
+            what = "'s return type is inferred as `"
+              + tyToStr(retTy)
+              + "`, which names it,"
+          }
+          tErr(
+            "cannot infer type parameter `"
+              + dn.fnTyParams[k]
+              + "`: "
+              + w
+              + what
+              + " and no parameter does, so a call has nothing to bind it from — give `"
+              + dn.fnTyParams[k]
+              + "` a parameter position, or make the return type concrete",
+            ix,
+          )
+          return 0
+        }
+      } else if !anyParamMentionsTyParam(dn.fnParams, one) {
+        const inner = bodyFnParamNaming(dn.fnBody, dn.fnBody, one)
+        if inner >= 0 {
+          let w = "the callee"
+          if who != "" { w = "`" + who + "`" }
+          let what = "a function literal in its body takes it"
+          const fdn = P.nodes[inner]
+          if fdn is FuncDecl {
+            if fdn.fnName != "" {
+              what = "its body's function `" + fdn.fnName + "` takes it"
+            }
+          }
+          const lname = bodyFnLetName(dn.fnBody, inner)
+          if lname != "" {
+            what = "its body's function `" + lname + "` takes it"
+          }
+          tErr(
+            "cannot infer type parameter `"
+              + dn.fnTyParams[k]
+              + "`: no parameter of "
+              + w
+              + " names it, but "
+              + what
+              + " as a parameter type, so a call has nothing to bind it from — give `"
+              + dn.fnTyParams[k]
+              + "` a parameter position, or pass the type arguments explicitly",
+            ix,
+          )
+          return 0
+        }
+        const retIx = bodyFnRetNaming(dn.fnBody, dn.fnBody, one)
+        if retIx >= 0 {
+          let w = "the callee"
+          if who != "" { w = "`" + who + "`" }
+          let what = "a function literal in its body returns it"
+          const rdn = P.nodes[retIx]
+          if rdn is FuncDecl {
+            if rdn.fnName != "" {
+              what = "its body's function `" + rdn.fnName + "` returns it"
+            }
+          }
+          const rname = bodyFnLetName(dn.fnBody, retIx)
+          if rname != "" {
+            what = "its body's function `" + rname + "` returns it"
+          }
+          tErr(
+            "cannot infer type parameter `"
+              + dn.fnTyParams[k]
+              + "`: no parameter of "
+              + w
+              + " names it, but "
+              + what
+              + ", so a call has nothing to bind it from — give `"
+              + dn.fnTyParams[k]
+              + "` a parameter position, or pass the type arguments explicitly",
+            ix,
+          )
+          return 0
+        }
+      }
+      k = k + 1
+    }
+  }
+  0
+}
+
+// A memory intrinsic declared in the default scope but with no emitter arm
+// (`nameIsUnimplementedIntrinsic`) is reported here rather than as the emitter's generic "call
+// to unknown function", which would misread a missing implementation as a typo. Gated on the
+// callee still denoting that binding, so a shadowing declaration or parameter keeps it (D1604).
+export function checkUnimplementedIntrinsicCall(cfn: Ident, ix: i32) {
+  if (
+    nameIsUnimplementedIntrinsic(cfn.identName)
+    && (fnDeclIx[cfn.identName] ?? -1) < 0
+    && lookupDepth(cfn.identName) == 0
+  ) {
+    tErrUnsupported(
+      "'"
+        + cfn.identName
+        + "' is declared but has no implementation yet — it type-checks and then has nothing to lower (see `docs/internals/memory-gc-design.md` §1.2)",
+      ix,
+    )
+  }
+}
+
+// A SIMD lane argument is a wasm instruction IMMEDIATE, not a stack operand, so it MUST be a
+// compile-time integer literal in `0..max` — a non-literal (a `-` prefix parses as `Unary`, not
+// `NumLit`) or out-of-range lane is a loud check error (O3, `simd-design.md` §F). A lane row's
+// index is its second argument; a shuffle's are every argument after its two vectors.
+export function checkSimdLaneArg(n: Call, cfn: Ident) {
+  const nm = cfn.identName
+  const row = simdRow(nm)
+  if row < 0 { return 0 }
+  const sig = simdRowSig(row)
+  const max = simdRowLaneMax(row)
+  if sig == SIMD_SIG_SHUF4 || sig == SIMD_SIG_SHUF16 {
+    let k = 2
+    while k < n.callArgs.length {
+      simdLaneLitCheck(nm, n.callArgs[k], max)
+      k = k + 1
+    }
+    return 0
+  }
+  if max >= 0 && n.callArgs.length >= 2 {
+    simdLaneLitCheck(nm, n.callArgs[1], max)
+  }
+  0
+}
+
+// Reports unless `argIx` is an integer literal in `0..max`; the message names the intrinsic.
+function simdLaneLitCheck(nm: string, argIx: i32, max: i32) {
+  const laneIx = parenPeelIx(argIx)
+  if laneIx < 0 || laneIx >= P.nodes.length { return 0 }
+  const le = P.nodes[laneIx]
+  if le is NumLit {
+    if !numLexIsFloat(le.numText) {
+      if u8LexValue(le.numText) <= max { return 0 }
+    }
+  }
+  tErr(
+    nm
+      + " requires a compile-time lane index literal in 0.."
+      + i32ToStr(max)
+      + " — the wasm lane immediate is not a runtime operand",
+    argIx,
+  )
+  0
+}
+
+// Record a type a PENDING body produced (a `return e` or the trailing expression):
+// the first CONCRETE type wins; an error type only notes that something err-ish
+// flowed back (an in-cycle call), which distinguishes "void body" from "no basis".
+export function noteInferredRet(t: i32) {
+  if t < 0 { return 0 }
+  const tt = T.tys[t]
+  if tt is TyErr {
+    inferSawErrSet(true)
+    return 0
+  }
+  if tt is TyPrim {
+    if tt.primName == "void" { return 0 }
+    // A call that never returns is not a return witness: an un-annotated function that only
+    // traps infers `void`, and `never` is a type a function must declare (D1972).
+    if tt.primName == "never" { return 0 }
+  }
+  // Joins every non-void return, not just the first: a function whose returns disagree
+  // (`return 5` … `return null`) infers the flattened union/nullable of them, so the caller
+  // sees the true type — first-wins alone silently dropped later branches. A return reached
+  // only through an `is`-guard over a hole param contributes a guarded member instead (`mkGuardedRetTy`).
+  const g = mkGuardedRetTy(t)
+  const lit = inferRetNextLit
+  inferRetNextLitSet(false)
+  inferRetLogTy.push(g)
+  inferRetLogSeed.push(inferRetSeeding)
+  inferRetLogLit.push(lit)
+  inferRetJoin(g, lit)
+  0
+}
+
+// A tail `if` arm's value, noted as a seed so `dropTailIfSeeds` can take it back.
+export function noteInferredSeed(t: i32, lit: boolean) {
+  inferRetSeedingSet(true)
+  inferRetNextLitSet(lit)
+  noteInferredRet(t)
+  inferRetSeedingSet(false)
+  0
+}
+
+// Refuse a trailing else-less `is`-chain that does not cover every variant when the function
+// returns a value: the uncovered path falls off the end and the emitter writes `unreachable`
+// there. `retTy` is the annotated return or the inferred one, so inference is checked the same as
+// an annotation; skipped for a void, error, or nullable return that legitimately falls (D1902).
+export function checkTrailingChainTotal(stmtIx: i32, retTy: i32) {
+  if retTy < 0 { return }
+  const lastN = P.nodes[stmtIx]
+  if lastN is IfStmt {
+    const firstCond = P.nodes[condUnderParens(lastN.ifCond)]
+    let isChain = false
+    if firstCond is IsExpr {
+      isChain = true
+    } else if firstCond is BinExpr {
+      if firstCond.binOp == "==" {
+        let eqPlace = -1
+        if cmpLitTyOf(firstCond.binRight) >= 0 {
+          eqPlace = firstCond.binLeft
+        } else if cmpLitTyOf(firstCond.binLeft) >= 0 {
+          eqPlace = firstCond.binRight
+        }
+        if eqPlace >= 0 {
+          const eqObj = P.nodes[eqPlace]
+          if eqObj is Ident {
+            if isLitBearing(lookup(eqObj.identName)) { isChain = true }
+          }
+        }
+      }
+    }
+    const retT = T.tys[retTy]
+    let retNullable = false
+    if retT is TyNullable { retNullable = true }
+    if isChain && !isVoidTy(retTy) && retTy != TY_ERR && !retNullable {
+      if !ifChainExhausts(stmtIx) {
+        let chainFix = "add the missing variant(s) or an `else` (expected "
+          + tyToStr(retTy)
+          + ")"
+        if chainMissing != "" {
+          chainFix = "missing "
+            + chainMissing
+            + " (add the arm(s) or an `else`; expected "
+            + tyToStr(retTy)
+            + ")"
+        }
+        tErr(
+          "non-exhaustive `is`-chain falls through with no `else` — " + chainFix,
+          stmtIx,
+        )
+      }
+    }
+  }
+}
+
+// `checkFuncDeclNode`'s body, counted by it inside a lambda.
+// A function declared directly in a body that has a parameter of its name binds that name twice
+// in one scope, as a `const` of it would: the owner's ruling (D3945). A function in a deeper block,
+// an inner function or a lambda body may still shadow the parameter.
+export function checkParamNestedFnClash(n: FuncDecl, params: i32[]) {
+  if inferQuiet || monoRecheckDepth > 0 || n.fnBody < 0 { return 0 }
+  const body = P.nodes[n.fnBody]
+  if !(body is Block) { return 0 }
+  for st in body.blkStmts {
+    const sn = P.nodes[st]
+    if sn is FuncDecl {
+      for pi in params {
+        const pn = P.nodes[pi]
+        if pn is Param {
+          if sn.fnName != "" && pn.parName == sn.fnName {
+            tErr(
+              "redeclared "
+                + sn.fnName
+                + ": the parameter `"
+                + pn.parName
+                + "` and the function `"
+                + sn.fnName
+                + "` declared in the same body are one scope; rename one, or declare the "
+                + "function in an inner block",
+              st,
+            )
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// `checkNode`'s exit bookkeeping, shared with `checkIfStmtNode`'s walk of an `else if` chain.
+export function checkNodeDone(ix: i32, t: i32, savedTail: boolean) {
+  retTailPosSet(savedTail)
+  if joinClashMsg != "" {
+    if !inferQuiet && ix >= 0 { tErr(joinClashMsg, ix) }
+    joinClashMsgSet("")
+  }
+  // A call typed `never` ends its path; marked on every pass, since narrowing asks during inference too.
+  if t == TY_NEVER && t >= 0 {
+    if P.nodes[ix] is Call { markCallNever(ix) }
+  }
+  if !inferQuiet {
+    if ix >= 0 {
+      // A widening literal is recorded as its base: the emitter lowers the value as the
+      // `string` it is stored as, and asks `nodeWideStrLitText` where the literal matters.
+      const wt = widenLitTy(t)
+      if ix < nodeTyIx.length { nodeTySet(ix, wt) }
+      if wt != t { noteWideLitNode(ix, t) }
+      noteInferJoin(ix, wt)
+    }
+    if v128Seen { v128NestCheck(ix, t) }
+    noteNestCstr(t, ix)
+  }
+  if tpIfCmpOn { tpIfCmpNode(ix, t) }
+  0
+}
+
+// The two clause-level rejects that exist because the desugar splices rather than wraps: a name
+// bound twice by one clause, and a name the arm body redeclares. Both would be accepted here and
+// decided by the emitter's local allocator; both are reported at the binding.
+export function checkMatchBindNames(bIx: i32, bodyIx: i32) {
+  if bIx < 0 { return 0 }
+  const bn = P.nodes[bIx]
+  if bn is Block {
+    let i = 0
+    while i < bn.blkStmts.length {
+      const st = P.nodes[bn.blkStmts[i]]
+      if st is LetDecl {
+        let j = 0
+        while j < i {
+          const pv = P.nodes[bn.blkStmts[j]]
+          if pv is LetDecl {
+            if pv.letName == st.letName {
+              tErr(
+                "duplicate payload binding `" + st.letName + "`",
+                bn.blkStmts[i],
+              )
+            }
+          }
+          j = j + 1
+        }
+        if matchBodyDeclares(bodyIx, st.letName) {
+          tErr(
+            "payload binding `"
+              + st.letName
+              + "` is redeclared in the arm body — rename one",
+            bn.blkStmts[i],
+          )
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// The tail of one link, given its else arm's type and, for an `else if` link, whether that
+// link always exits (the chain's own `stmtAlwaysExits`, read bottom-up).
+export function checkIfTailAt(
+  f: IfChk,
+  elseRes: i32,
+  innerExits: boolean,
+): i32 {
+  const n0 = P.nodes[f.ifIx]
+  if n0 is IfStmt { return checkIfTail(n0, f, elseRes, innerExits) }
+  TY_ERR
+}
+
+function checkIfTail(
+  n: IfStmt,
+  f: IfChk,
+  elseRes: i32,
+  innerExits: boolean,
+): i32 {
+  // Any else arm but an `else if` link is asked here, once it is checked, so a `never` call in it
+  // is already marked; a link's answer is its own tail's, read bottom-up.
+  let elseExits = innerExits
+  if n.ifElse >= 0 {
+    if !(P.nodes[n.ifElse] is IfStmt) || isBareBlockIf(n.ifElse) {
+      elseExits = stmtAlwaysExits(n.ifElse)
+    }
+  }
+  const ix = f.ifIx
+  const isElseArm = f.isElseArm
+  const pgUpMark = f.pgUpMark
+  const clobMark = f.clobMark
+  const ifTail = f.ifTail
+  const ifInRetArg = f.ifInRetArg
+  const seedLogMark = f.seedLogMark
+  const seedObsMark = f.seedObsMark
+  const seedObsLit = f.seedObsLit
+  const thenExits = f.thenExits
+  const enNames = f.enNames
+  const enTys = f.enTys
+  const altRows = f.altRows
+  const thenLo = f.thenLo
+  const thenTy = f.thenTy
+  const daFork = f.daFork
+  const daThenAdds = f.daThenAdds
+  const daThenRems = f.daThenRems
+  const daHasElse = f.daHasElse
+  const daThenDiverges = thenExits
+  let daElseDiverges = false
+  const daElseAdds: i32[] = []
+  const daElseRems: i32[] = []
+  let elseTy = TY_VOID
+  let elseIsLink = false
+  let elseHi = 0
+  if daHasElse {
+    const enElse = P.nodes[n.ifElse]
+    elseHi = narClobKeys.length
+    daElseDiverges = elseExits
+    pgUpArmIxSet(-1)
+    retTailPosSet(false)
+    elseTy = blockTailTy
+    let elseIx = blockTailIx
+    // A chain link's value is the whole inner `if`'s join, and `blockTailIx` then names the
+    // innermost block's tail — a node the join did not come from, so it names none (D1591).
+    if enElse is IfStmt {
+      elseTy = elseRes
+      elseIx = -1
+      elseIsLink = true
+    }
+    if enNames.length > 0 { popScope() }
+    if ifTail {
+      if elseTy != TY_VOID && elseTy != TY_ERR {
+        // A chain link's value is the inner `if` itself.
+        if elseIsLink { noteInferRetValue(n.ifElse, elseTy) }
+        noteInferRetWitness(elseIx, elseTy)
+        const seedElse = ifArmValTy(n.ifElse, elseTy)
+        noteInferredSeed(seedElse, armLit(seedElse, n.ifElse))
+      }
+    }
+    const daElseSid: i32[] = []
+    const daElseWas: i32[] = []
+    daTouchedSince(daFork, daElseSid, daElseWas)
+    daRollbackTo(daFork)
+    daSplitDelta(daElseSid, daElseWas, daElseAdds, daElseRems)
+  }
+  // Closes each `is`-guard alternative: a diverging then-branch leaves the code after this
+  // `if` unreachable for that argument (nothing required); otherwise record where the reached suffix starts.
+  if !daThenDiverges {
+    let ac = 0
+    while ac < altRows.length {
+      const row = altRows[ac]
+      holeAltTailN[row] = holeShapeFieldCount(holeAltNames[row])
+      ac = ac + 1
+    }
+  }
+  // Joins the surviving paths from the fork point: unassigned on some surviving path. The
+  // else path (or the entry fall-through with no else) always counts unless it diverges.
+  daRelease(daFork)
+  daJoinArms(
+    daThenDiverges,
+    daThenAdds,
+    daThenRems,
+    daHasElse,
+    daElseDiverges,
+    daElseAdds,
+    daElseRems,
+  )
+  // The narrowing column's own join, `daJoinArms`'s shape one table over: a name an arm wrote
+  // reads below the `if` at the join of what the surviving arms left it at, not at its
+  // declaration. Banked at this node so the emitter pushes the same member (D1846).
+  const sumKeys: string[] = []
+  const sumTys: i32[] = []
+  const sumPrev: i32[] = []
+  const sumRet: i32[] = []
+  if narClobKeys.length > clobMark {
+    applyArmJoins(
+      f,
+      elseHi,
+      daThenDiverges,
+      daElseDiverges,
+      n.ifCond,
+      sumKeys,
+      sumTys,
+      sumPrev,
+      sumRet,
+    )
+  }
+  // Guard clause: a then that always exits applies the false narrowings to the rest of the
+  // block. Subtractions accumulate over a sequence of guards; restricted to bare names only.
+  if thenExits {
+    let gi2 = 0
+    while gi2 < enNames.length {
+      const gKey = enNames[gi2]
+      const gTy = enTys[gi2]
+      // From the arms on, not the condition: a write in the condition that follows a fact's
+      // test already dropped that fact (D2589), and one before it is what the test tested.
+      if narClobberedSince(thenLo, gKey) {
+        // An arm on the fall-through path wrote a different member into `gKey`, so the
+        // residual would describe a value the place does not hold. Both halves drop it: the
+        // emitter reads `pgResidualVoidOf` at the same node (D1736).
+        recordPgResidualVoid(ix)
+      } else if isPathKey(gKey) {
+        // Paths keep the no-`else` gate, and an else arm never hands one up either — an
+        // `npKeys` entry is retired in place by a call/write inside the arm.
+        if !daHasElse && !isElseArm {
+          npKeysPush(gKey)
+          npTysPush(gTy)
+          npInvByPush(-1)
+          npEpochsPush(narFnEpoch)
+          npSettlePush(-2)
+          npCapByPush(-1)
+          npAsgPush(0)
+        }
+      } else if isElseArm {
+        pgUpKeys.push(gKey)
+        pgUpTys.push(gTy)
+      } else {
+        // Banks what the place held before this subtraction, for the exhaustiveness check
+        // after a trailing chain — the one line that makes `lookup` stop answering that question.
+        if pgPreIx != ix {
+          pgPreIxSet(ix)
+          pgPreKeysSet([])
+          pgPreTysSet([])
+        }
+        pgPreKeys.push(gKey)
+        pgPreTys.push(lookup(gKey))
+        // ...and bank the shadowed declaration under the post-guard kind, so a consumer
+        // needing the emitter's union can find it (D1035) — idempotent, banking the widest first.
+        const gDecl = lookup(gKey)
+        noteNarShadow(gKey, gDecl, NAR_KIND_POSTGUARD)
+        // One leg for both kinds: a null strip and a union subtraction are the same shadowing
+        // `declare` — split only so the strip could skip the subtraction bank, now gone.
+        declare(gKey, gTy)
+        if gDecl >= 0 && gDecl != gTy { narFitCompanions(gKey, gDecl, gTy) }
+      }
+      gi2 = gi2 + 1
+    }
+    // The chain below this `if`, banked by every `else if` arm whose own then diverged —
+    // applied in reverse push order, since the deepest arm's residual must win.
+    if !isElseArm {
+      let pu = pgUpKeys.length
+      while pu > pgUpMark {
+        pu = pu - 1
+        if narClobberedSince(thenLo, pgUpKeys[pu]) {
+          recordPgResidualVoid(ix)
+        } else {
+          const upDecl = lookup(pgUpKeys[pu])
+          noteNarShadow(pgUpKeys[pu], upDecl, NAR_KIND_POSTGUARD)
+          declare(pgUpKeys[pu], pgUpTys[pu])
+          if upDecl >= 0 && upDecl != pgUpTys[pu] {
+            narFitCompanions(pgUpKeys[pu], upDecl, pgUpTys[pu])
+          }
+        }
+      }
+    }
+  }
+  // Retires this subtree's hand-ups, unless THIS `if` is a chain link whose then diverged —
+  // then its entry rides up to the parent, which asks the same question.
+  if !isElseArm || !thenExits {
+    while pgUpKeys.length > pgUpMark {
+      pgUpKeys.pop()
+      pgUpTys.pop()
+    }
+  }
+  narCompactIf(clobMark, sumKeys, sumTys, sumPrev, sumRet)
+  f.exits = thenExits && daHasElse && daElseDiverges
+  retTailPosSet(ifTail)
+  // An `if` with a completing arm that yields no value is a statement: it is `void` as the
+  // function's tail, so the arm values it seeded leave the inferred return.
+  // An arm ending in a bare `{ … }` leaves the `if` undecided: whether that block yields its
+  // tail is the open bare-block-as-expression ruling, and D1903 pins what runs today.
+  let bareArm = armTailUndecided(n.ifThen)
+  if daHasElse && !elseIsLink && armTailUndecided(n.ifElse) { bareArm = true }
+  let noValue = !bareArm && !thenExits && ifArmGivesNoValue(n.ifThen, thenTy)
+  if !bareArm && daHasElse && !daElseDiverges {
+    // An `else if` link answers its own verdict: an else-less link's fall-through is its `null`.
+    if elseIsLink {
+      if ifYieldsNoValue(n.ifElse) { noValue = true }
+    } else if ifArmGivesNoValue(n.ifElse, elseTy) {
+      noValue = true
+    }
+  }
+  // Written both ways: a later pass re-decides with the callees' final types.
+  if ix >= 0 {
+    if noValue { ifNoValueAtSetAt(ix, true) } else { ifNoValueClear(ix) }
+  }
+  if noValue && ifTail && !ifInRetArg && daHasElse {
+    dropTailIfSeeds(seedLogMark, seedObsMark, seedObsLit)
+  }
+  // An f32 arm beside literal arms types the join f32, as it does an operator (PL-049). A return
+  // tail's arms seed the inferred return one by one, which keeps its reading (D2774).
+  let f32Join = -1
+  if (
+    daHasElse
+    && !bareArm
+    && (!ifTail || f32JoinRetypesRunning())
+    && !valDiscarded(ix)
+  ) {
+    if joinMayAdoptF32(thenTy, elseTy) { f32Join = joinF32LitTails(ix) }
+  }
+  // Two runtime arms join apart, so an arm an inner join typed `f32` keeps that type rather
+  // than the `f64` a widening sibling would read it at.
+  const f32Keep = daHasElse
+    && f32JoinAdoptCount > 0
+    && !valueIsLitOnly(n.ifThen)
+    && !valueIsLitOnly(n.ifElse)
+    && !njFnReached(njFnIx)
+  if daHasElse && ix >= 0 {
+    let valTy = TY_VOID
+    if !thenExits {
+      valTy = ifArmValTy(n.ifThen, thenTy)
+      if !f32Keep { valTy = f32ArmPlainTy(n.ifThen, valTy) }
+    }
+    if !daElseDiverges {
+      // A `void` here is an else-less link's value-less fall-through, which adds nothing.
+      let ev = ifArmValTy(n.ifElse, elseTy)
+      if !f32Keep { ev = f32ArmPlainTy(n.ifElse, ev) }
+      if thenExits || valTy == TY_VOID {
+        valTy = ev
+      } else if ev != TY_VOID {
+        valTy = joinArmLit(
+          valTy,
+          armLit(valTy, n.ifThen),
+          ev,
+          armLit(ev, n.ifElse),
+        )
+      }
+    }
+    if f32Join >= 0 { valTy = f32Join }
+    if bareArm { ifValTyAtSetAt(ix, -1) } else { ifValTyAtSetAt(ix, valTy) }
+  }
+  // A discarded `if` is a statement, whatever its arms hold.
+  if valDiscarded(ix) {
+    if ix >= 0 {
+      discardValTyAtSetAt(ix, discardedIfValTy(daHasElse, thenTy, elseTy))
+    }
+    return TY_VOID
+  }
+  // The `if`-expression's value type: with an `else`, the join of the two branch tail
+  // values.
+  if f32Join >= 0 { return f32Join }
+  if daHasElse {
+    let thenPlain = thenTy
+    let elsePlain = elseTy
+    if !f32Keep {
+      thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
+      elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
+    }
+    // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
+    // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
+    let plainJoin = joinArmLit(
+      thenPlain,
+      armLit(thenPlain, n.ifThen),
+      elsePlain,
+      armLit(elsePlain, n.ifElse),
+    )
+    // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
+    if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
+      if atValueArmTail(ix) { refuseNestedExitFirst(ix, elsePlain) }
+      plainJoin = elsePlain
+      if !ifChainOnFnTail {
+        noteExitArm(n.ifThen)
+        noteExitFirst(ix)
+      }
+    }
+    const elseBlk = n.ifElse >= 0 && P.nodes[n.ifElse] is Block
+    if daElseDiverges && !thenExits && elseBlk {
+      plainJoin = thenPlain
+      if !ifChainOnFnTail { noteExitArm(n.ifElse) }
+    }
+    if !f32Keep { f32JoinRevert(ix) }
+    // A string literal arm joins to `string`; beside an arm whose type holds that literal it
+    // takes that type instead, and a destination that holds each arm's value types the `if`, so
+    // `if ok { a.look } else { "none" }` is a `Look` (DV-1207).
+    if !thenExits && !daElseDiverges {
+      const lj = litJoinOf(
+        ix,
+        plainJoin,
+        [n.ifThen, n.ifElse],
+        [thenPlain, elsePlain],
+      )
+      if lj >= 0 { plainJoin = lj }
+    }
+    if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
+      let elseApart = elsePlain
+      if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
+      noteTpIfJoin(
+        ix,
+        thenPlain,
+        elseApart,
+        plainJoin,
+        ifTail || tpIfOkAt.has(ix),
+      )
+    }
+    return plainJoin
+  }
+  // An else-less `if` used as a value is `T | null` in every position — the false fall-through
+  // yields `null`. One rule asked once, replacing the old per-position gates (DECISIONS.md).
+  if thenTy != TY_VOID && thenTy != TY_ERR { return mkNullableTy(thenTy) }
+  return TY_VOID
+}
+// ── explicit numeric cast `x as T` ──────────────────────────────────────────
+
+// Refuses a write to the built-in `.length` of a list, map, set or string at member node `ix`
+// (D3586): it is read-only, and the emitter has no store for it. `kind` 0 is a list, 1 a map
+// or set, 2 a string. Returns true when it refused; a record's own `length` field never asks.
+export function lengthWriteRefused(n: Member, ix: i32, kind: i32): boolean {
+  if ix != getWriteTarget || n.memProp != "length" { return false }
+  let recv = "xs"
+  const o = P.nodes[n.memObj]
+  if o is Ident { recv = o.identName }
+  let msg = "`length` is read-only"
+  if kind == 0 {
+    msg = msg
+      + "; to empty a list use `"
+      + recv
+      + ".clear()` or `"
+      + recv
+      + " = []`"
+  } else if kind == 1 {
+    msg = msg + "; to empty a map or set use `" + recv + ".clear()`"
+  }
+  tErr(msg, ix)
+  true
+}
+
+// A key given twice in one object literal is refused, shorthand and quoted keys alike: the
+// diagnostic spans the repeated key and names where the first one is (owner ruling, D3484).
+export function objLitDupKeyErrs(fields: i32[]) {
+  let i = 1
+  while i < fields.length {
+    const first = objLitEarlierKey(fields, i)
+    if first >= 0 {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit { objLitDupKeyErr(f.fiName, fields[i], first) }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Raise the duplicate-key refusal over the key token of `dupIx`, citing `firstIx`'s key.
+function objLitDupKeyErr(name: string, dupIx: i32, firstIx: i32) {
+  dupNameErr(
+    "key `" + name + "` is given twice in this object literal",
+    dupIx,
+    firstIx,
+  )
+}
+
+// `break [:label] [v]`: joins the value's type into the target's, or marks a value-less exit.
+export function checkBreakNode(n: BreakStmt, ix: i32) {
+  if !lpOn { return TY_VOID }
+  const t = lpTargetOf(n.brkLabel)
+  if t < 0 { return TY_VOID }
+  if n.brkHasVal != 1 {
+    lpBareSetAt(t, true)
+    return TY_VOID
+  }
+  const vt = brkPrevTy
+  if vt < 0 || vt == TY_ERR { return TY_VOID }
+  if isVoidTy(vt) {
+    tErr("a `break` value must be a value, and this one has type void", ix)
+    return TY_VOID
+  }
+  lpJoinSetAt(t, joinTys(lpJoin[t], widenLitTy(vt)))
+  TY_VOID
+}
+
+// The one spelling of an exiting first arm the emitter cannot lower yet: a nullable-list value of
+// a construct that is itself another's arm value, whose rep is read through this first arm (D3222).
+export function refuseNestedExitFirst(ix: i32, ty: i32) {
+  if ty < 0 || !tyBearsNull(ty) { return 0 }
+  const nn = nonNullTy(ty)
+  if nn < 0 || !(T.tys[nn] is TyArray) { return 0 }
+  tErr(
+    "an `if` or `match` whose first arm always exits cannot yet hold a nullable list as the value of another's arm; bind it to a name first, or put the exiting arm last",
+    ix,
+  )
+  0
+}
+
+// The direction rule (D1588, VL-038). A constant range whose step contradicts its direction
+// can never iterate; so can `step 0` — one category, a descriptor that cannot complete as
+// written. `excl` (the `until` form) accepts an empty `from == to` as a legal zero-trip range,
+// so its refusal predicate is identical to `to`'s; only the message spells the keyword.
+export function checkRangeNeverRuns(
+  fromIx: i32,
+  toIx: i32,
+  stepIx: i32,
+  excl: boolean,
+) {
+  let stepK = 1
+  const stepWritten = stepIx >= 0
+  if stepWritten {
+    if !constIntExprIs(stepIx) { return 0 }
+    stepK = constIntExprVal(stepIx)
+  }
+  // Anchored at the step, not the `to`: this sentence names `step 0`, so the caret
+  // belongs on the token the reader has to change. Fires whatever the bounds are.
+  if stepK == 0 {
+    return tErrCodedData(
+      "a range with `step 0` never advances",
+      stepIx,
+      CODE_RANGE_NEVER_RUNS,
+      diagDataField("step", "0"),
+    )
+  }
+  if !constIntExprIs(fromIx) || !constIntExprIs(toIx) { return 0 }
+  const from = constIntExprVal(fromIx)
+  const to = constIntExprVal(toIx)
+  if stepK > 0 && from <= to { return 0 }
+  if stepK < 0 && from >= to { return 0 }
+  const msg = rangeNeverRunsMsg(from, to, stepK, stepWritten, excl)
+  const data = diagDataField("from", i32ToStr(from))
+    + diagDataField("to", i32ToStr(to))
+    + diagDataField("step", i32ToStr(stepK))
+  const tk = forToKwTok(toIx)
+  if tk >= 0 { return tErrPushTok(msg, toIx, tk, CODE_RANGE_NEVER_RUNS, data) }
+  tErrCodedData(msg, toIx, CODE_RANGE_NEVER_RUNS, data)
+}

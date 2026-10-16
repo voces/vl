@@ -1531,7 +1531,7 @@ axis(
 axis(
   "generic chain depth",
   22.2,
-  "A call re-validates its callee's inherited constraints (`validate*Cstrs`, compiler/typecheck.vl); see D3101.",
+  "A call re-validates its callee's inherited constraints (`validate*Cstrs`, compiler/check_demands.vl and typecheck.vl); see D3101.",
   (d) => twoFiles(d, genGenericChain(60, false), genGenericChain(15, false)),
 );
 
@@ -1552,7 +1552,7 @@ const genCompArgChain = (depth: number): string => {
 axis(
   "generic chain with list-literal arguments",
   9.3,
-  "A composite argument's demand (`ACF_COMP`, compiler/typecheck.vl) is being moved out to every caller instead of resolved at its pin.",
+  "A composite argument's demand (`ACF_COMP`, compiler/check_leaf_steps.vl) is being moved out to every caller instead of resolved at its pin.",
   (d) => twoFiles(d, genCompArgChain(160), genCompArgChain(40)),
 );
 
@@ -1614,21 +1614,21 @@ const genNestedJoins = (n: number): string => {
 axis(
   "literal binding store chain",
   5.0,
-  "The literal-binding solve (`lbiSettleEdges`, compiler/typecheck.vl) is re-solving every binding per link.",
+  "The literal-binding solve (`lbiSettleEdges`, compiler/check_num_lit_state.vl) is re-solving every binding per link.",
   (d) => twoFiles(d, genLiteralChain(400), genLiteralChain(100)),
 );
 
 axis(
   "sequential if joins of one name",
   5.0,
-  "An `if`'s arm join (`applyArmJoins`, compiler/typecheck.vl) is folding ledger rows outside its own subtree.",
+  "An `if`'s arm join (`applyArmJoins`, compiler/check_narrow_flow.vl) is folding ledger rows outside its own subtree.",
   (d) => twoFiles(d, genSeqJoins(1200), genSeqJoins(300)),
 );
 
 axis(
   "if joins nested deep",
   6.6,
-  "An enclosing `if`'s join re-folds its inner joins' rows (`narCompactIf`, compiler/typecheck.vl).",
+  "An enclosing `if`'s join re-folds its inner joins' rows (`narCompactIf`, compiler/check_narrow_paths.vl).",
   (d) => twoFiles(d, genNestedJoins(120), genNestedJoins(30)),
 );
 
@@ -1659,14 +1659,14 @@ const genElseIfChains = (shape: "return" | "value", nf: number, n: number): stri
 axis(
   "else-if chain length, returning arms",
   2.0,
-  "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/typecheck.vl).",
+  "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/check_program.vl or check_nj_join.vl).",
   (d) => twoFiles(d, genElseIfChains("return", 1, 2000), genElseIfChains("return", 20, 2000)),
 );
 
 axis(
   "else-if chain length, an if expression",
   2.0,
-  "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/typecheck.vl).",
+  "A link of an `else if` chain is walking every link below it (`listJoinWidenCheck` or `valueLitState`, compiler/check_program.vl or check_nj_join.vl).",
   (d) => twoFiles(d, genElseIfChains("value", 1, 2000), genElseIfChains("value", 20, 2000)),
 );
 
@@ -1685,7 +1685,7 @@ const genGenericPlusChains = (nf: number, n: number): string => {
 axis(
   "generic-body operator chain length",
   2.5,
-  "A link of a `+` chain over a type parameter is resolving the link below it more than once at a pin (`substHoleTyReal`'s `HD_BINOP` arm or the `shMemo` answers, compiler/typecheck.vl).",
+  "A link of a `+` chain over a type parameter is resolving the link below it more than once at a pin (`substHoleTyReal`'s `HD_BINOP` arm or the `shMemo` answers, compiler/check_relate_core.vl).",
   (d) => twoFiles(d, genGenericPlusChains(1, 20), genGenericPlusChains(4, 20)),
 );
 
@@ -2046,7 +2046,7 @@ const genGenericClique = (n: number, clique: boolean): string => {
 axis(
   "generics calling each other in a complete graph",
   2.5,
-  "A call to a generic is re-recording its callee's deferred constraints per copy (`noteBinCstr`, compiler/typecheck.vl; D2757).",
+  "A call to a generic is re-recording its callee's deferred constraints per copy (`noteBinCstr`, compiler/check_cstr_rows.vl; D2757).",
   (d) => twoFiles(d, genGenericClique(16, true), genGenericClique(16, false)),
 );
 
@@ -2196,7 +2196,7 @@ const genTopFreshConsts = (n: number): string => {
 allocAxis(
   "allocation: top-level fresh consts between functions",
   4.5,
-  "The program-wide sole-reference walk (`crValUseEnter`, compiler/typecheck.vl) is walking the program per `const`.",
+  "The program-wide sole-reference walk (`crValUseEnter`, compiler/check_getter_effects.vl) is walking the program per `const`.",
   (d) => twoFiles(d, genTopFreshConsts(2000), genTopFreshConsts(500)),
 );
 

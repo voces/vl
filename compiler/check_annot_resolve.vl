@@ -1,0 +1,757 @@
+// Resolving what the source wrote into the type arena: annotation trees and their holes,
+// flat-layout records, literal-union spellings (`lu*`) and function-value annotations (`fva*`).
+// Built on the relation core; it reads annotations and answers type indices, and does not
+// check expressions.
+
+import {
+  FieldDef,
+  Ident,
+  IsExpr,
+  MatchExpr,
+  Member,
+  Node,
+  P,
+  TS_NAME,
+  TypeDecl,
+  annTsOf,
+  arenaReplaceNode,
+  arenaSetNode,
+  callTyArgsOf,
+  declGpBaseOf,
+  i32ToStr,
+  matchPatValueName,
+  mkBlock,
+  mkCall,
+  mkIf,
+  mkIndex,
+  mkIsExpr,
+  mkLet,
+  mkMember,
+  mkNum,
+  mkTypeRef,
+  tsKind,
+} from "./ast"
+import {
+  annotCollapsed,
+  annotCollapsedSetAt,
+  collapsedTy,
+  collapsedTySet,
+} from "./check_bind_rows"
+import {
+  annotClash,
+  annotClashOf,
+  annotNameMemo,
+  annotNameMemoNegVer,
+  annotPart,
+  annotPartOf,
+  flDeclNodes,
+  matchPatRefused,
+  v128NestReported,
+} from "./check_core_state"
+import { noteNestCstr } from "./check_cstr_rows"
+import { inferQuiet, tpEnvNames, tpEnvTyOfName, tpEnvTys } from "./check_cursor"
+import { matchPatNamesType } from "./check_decl_scan"
+import { flatWhyNot } from "./check_diag_text"
+import {
+  FL_INVALID,
+  FL_UNRESOLVED,
+  flFCount,
+  flFNames,
+  flFNest,
+  flFOff,
+  flFStart,
+  flFWidth,
+  flNames,
+  flSizes,
+  flatConstOf,
+  flatIndexOf,
+  flatTrySize,
+} from "./check_flat_layout"
+import { holeLinkA, holeLinkB } from "./check_hole_links"
+import {
+  annotDiagAt,
+  annotDiagAtSet,
+  collTyArgCountMsg,
+  flatFieldTyName,
+  flatStorageSpellWidth,
+  flatTyAlreadyErrored,
+  holeLinkPinFrom,
+  mapKeyUnsupportedMsg,
+  recAnnObjs,
+  v128NestMsg,
+} from "./check_leaf_steps"
+import {
+  luAnnTy,
+  luAnnTyPut,
+  luArrowTight,
+  luAt,
+  luPipeTight,
+  luRef,
+} from "./check_list_union"
+import { matchConstPatWhy } from "./check_match_desugar"
+import {
+  unkTyClash,
+  unkTyClashSet,
+  unkTyPart,
+  unkTyPartSet,
+} from "./check_messages"
+import {
+  annotResolve,
+  assignable,
+  joinVariantTys,
+  nameToTy,
+  resolveCallTyArgs,
+  tErr,
+  tErrUnsupported,
+} from "./check_relate_core"
+import { constDeclOf, lookup } from "./check_scopes"
+import { joinClashMsgSet, mkTyVarOwned } from "./check_subst"
+import { fvaFnMayDiffer } from "./check_ty_relate"
+import { flatScalarWidth, mapKeyTySupported } from "./check_ty_rep"
+import { flatFieldTyOf } from "./check_type_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_NEVER,
+  TyArray,
+  TyFunc,
+  TyNullable,
+  TyUnion,
+  cUserTypes,
+  cUserTypesVer,
+  mkMapTy,
+  tyEq,
+  tySame,
+  tyToEmitName,
+  tyToStr,
+} from "./check_types"
+import { sidNoteNodeName } from "./symbols"
+import {
+  arrElemValueTy,
+  isVoidTy,
+  litPeekBaseTy,
+  luAnyTyVar,
+  tyHasTyVar,
+  tyNestsV128,
+} from "./tyquery"
+
+// D1565 — every link pair, to a fixpoint: a resolved row hands its element to its open partner
+// and the sweep repeats until no row moves. A one-hop consult reads a partner that has not
+// resolved yet and takes `i32` while the rest of the chain lands on `f64`. A component nothing
+// pins is untouched; the bound is structural, since a sweep that changes anything pins a row.
+export function resolveHoleLinks() {
+  if holeLinkA.length == 0 { return 0 }
+  const bound = holeLinkA.length * 2 + 1
+  let sweeps = 0
+  let changed = true
+  while changed {
+    changed = false
+    sweeps = sweeps + 1
+    if sweeps > bound {
+      // Unreachable by the bound above, and stated rather than assumed: a sweep only ever turns
+      // an open element into a resolved one, never back. A named failure beats a `while` that
+      // spins, since a hang is the one outcome a checker must never have.
+      tErr("internal: __array_new_default__ hole links did not converge", -1)
+      return 0
+    }
+    let i = 0
+    while i < holeLinkA.length {
+      if holeLinkPinFrom(holeLinkA[i], holeLinkB[i]) { changed = true }
+      if holeLinkPinFrom(holeLinkB[i], holeLinkA[i]) { changed = true }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// The one wording for a key the map rep cannot hash (`mapKeyTySupported` has exactly three
+// hashes). Both the annotation gate (`checkLetDeclNode`) and the usage-driven pin
+// (`checkInferredMapKey`) raise it, so the annotated and inferred spellings of one
+// program reject in the same channel with the same words.
+export function mapKeyUnsupportedErr(keyText: string, ctor: string, at: i32) {
+  tErrUnsupported(mapKeyUnsupportedMsg(keyText, ctor), at)
+}
+
+export function resolveFlatLayouts(stmts: i32[]) {
+  // ── phase A: validate and stage ──
+  // Two sweeps, since a flat record may nest one declared later in the source: register
+  // every flat name first, then validate fields against the full set.
+  let ri = 0
+  while ri < stmts.length {
+    const sd = P.nodes[stmts[ri]]
+    if sd is TypeDecl {
+      if sd.tdFlat == 1 {
+        // A generic flat type has no layout: a type parameter has no width, and there is no
+        // instantiation to measure at a declaration. Rejected here rather than staged, so it
+        // never enters the sidecar and `Box<T>.size` stays an undeclared-identifier error.
+        if declGpBaseOf(stmts[ri]) != "" {
+          tErr(
+            "a `flat` type cannot be generic — `"
+              + sd.tdName
+              + "` has type parameters, which have no byte width",
+            stmts[ri],
+          )
+        } else if flatIndexOf(sd.tdName) < 0 {
+          flNames.push(sd.tdName)
+          flSizes.push(FL_UNRESOLVED)
+          flFStart.push(0)
+          flFCount.push(0)
+          flDeclNodes.push(stmts[ri])
+        }
+      }
+    }
+    ri = ri + 1
+  }
+  let si = 0
+  while si < stmts.length {
+    const sd2 = P.nodes[stmts[si]]
+    if sd2 is TypeDecl {
+      if sd2.tdFlat == 1 {
+        const d = flatIndexOf(sd2.tdName)
+        if d >= 0 && flFCount[d] == 0 { flatStageDecl(d, sd2) }
+      }
+    }
+    si = si + 1
+  }
+  // ── phase B: size the nest, by fixpoint ──
+  let progress = true
+  while progress {
+    progress = false
+    let d2 = 0
+    while d2 < flNames.length {
+      if flSizes[d2] == FL_UNRESOLVED {
+        if flatTrySize(d2) { progress = true }
+      }
+      d2 = d2 + 1
+    }
+  }
+  // Whatever is still unresolved cannot be sized at any depth: every remaining
+  // declaration is waiting on another remaining declaration, which is a cycle.
+  let d3 = 0
+  while d3 < flNames.length {
+    if flSizes[d3] == FL_UNRESOLVED {
+      tErr(
+        "`flat type "
+          + flNames[d3]
+          + "` is recursive — a flat record is stored INLINE, so a cycle has no "
+          + "finite size",
+        flDeclNodes[d3],
+      )
+      flSizes[d3] = FL_INVALID
+    }
+    d3 = d3 + 1
+  }
+  0
+}
+
+// Validate one flat declaration's fields and stage their widths. Every rejected field marks
+// the whole declaration invalid, so a later `N.size` reports nothing (the field error is the
+// actionable one) and phase B never reports a cycle for it.
+function flatStageDecl(d: i32, sd: TypeDecl) {
+  const declTyIx = cUserTypes[sd.tdName] ?? -1
+  const dfields = sd.tdFields
+  flFStart[d] = flFNames.length
+  let bad = false
+  let fi = 0
+  while fi < dfields.length {
+    const fd = P.nodes[dfields[fi]]
+    if fd is FieldDef {
+      const fname = fd.fdName
+      // `N.size` is the record's total size, so a field of that name makes the spelling
+      // ambiguous. Rejected rather than resolved either way: "field wins" hides the size,
+      // "size wins" hides the field's offset, both silent wrong answers in address arithmetic.
+      if fname == "size" {
+        tErr(
+          "a `flat` type cannot have a field named 'size' — that spelling is "
+            + "the record's total byte size (`"
+            + sd.tdName
+            + ".size`); rename the field",
+          dfields[fi],
+        )
+        bad = true
+      }
+      const spellW = flatStorageSpellWidth(flatFieldTyName(dfields[fi]))
+      const fty = flatFieldTyOf(declTyIx, fi)
+      const w = flatScalarWidth(fty)
+      if spellW > 0 {
+        // A sub-word storage width read off the FIELD spelling — `u8`/`i8` one byte, `u16`/`i16`
+        // two. `fillTypeDeclAt` resolved all four to the `u8` placeholder, so the width cannot
+        // come from the arena type; the spelling is what distinguishes 1 from 2.
+        flFNames.push(fname)
+        flFWidth.push(spellW)
+        flFNest.push(-1)
+        flFOff.push(0)
+      } else if w > 0 {
+        flFNames.push(fname)
+        flFWidth.push(w)
+        flFNest.push(-1)
+        flFOff.push(0)
+      } else {
+        const nest = flatIndexOf(flatFieldTyName(dfields[fi]))
+        if nest >= 0 {
+          // A nested flat record inlines: its bytes sit at the offset the running sum has
+          // reached, and reaching one of its fields is `Outer.k + Inner.a` — which is why
+          // the constant surface needs only one level of access.
+          flFNames.push(fname)
+          flFWidth.push(-1)
+          flFNest.push(nest)
+          flFOff.push(0)
+        } else {
+          // A field whose type failed to resolve at all is already reported by
+          // the declaration pass; do not cascade a second message onto it.
+          if !flatTyAlreadyErrored(fty) {
+            tErr(
+              "field '"
+                + fname
+                + "' cannot be in a `flat` type: "
+                + flatWhyNot(fty, flatFieldTyName(dfields[fi]))
+                + " — a flat field must be i32/i64/f32/f64, a sub-word storage width "
+                + "(u8/i8/u16/i16), a newtype over one of those, or another `flat` type",
+              dfields[fi],
+            )
+          }
+          bad = true
+        }
+      }
+    }
+    fi = fi + 1
+  }
+  flFCount[d] = flFNames.length - flFStart[d]
+  if bad { flSizes[d] = FL_INVALID }
+  0
+}
+
+// The `N.size`/`N.field` interception at the top of `checkMemberNode`, the only place the
+// layout sidecar is read. Answers 0 for an ordinary field access, 1 when folded to its
+// constant, 2 when it reported an error, 3 when the receiver is a live type parameter whose
+// fold belongs to the monomorphizer. The fold is an idempotent in-place arena rewrite to a `NumLit`.
+export function flatMemberFold(n: Member, ix: i32) {
+  const obj = P.nodes[n.memObj]
+  if obj is Ident {
+    const nm = obj.identName
+    if lookup(nm) >= 0 { return 0 }
+    // A live type parameter (`T.size`): the layout isn't knowable here, since `T` is
+    // abstract for the checker's one pass over a generic body, so the fold defers to the
+    // monomorphizer, which rewrites this node once per instance. The member's type is `i32`
+    // under every binding; whether the binding names a usable `flat` type is checked there instead.
+    if tpEnvTyOfName(nm) >= 0 { return 3 }
+    const d = flatIndexOf(nm)
+    if d < 0 {
+      if (cUserTypes[nm] ?? -1) >= 0 {
+        tErr(
+          "`"
+            + nm
+            + "` is not a `flat` type, so it has no byte layout — only a "
+            + "`flat type "
+            + nm
+            + " = { … }` has `.size` and per-field offsets",
+          ix,
+        )
+        return 2
+      }
+      return 0
+    }
+    // A declaration rejected, or part of a cycle, has its error already on
+    // the page — fail quietly rather than cascade onto every use site.
+    if flSizes[d] < 0 { return 2 }
+    const v = flatConstOf(d, n.memProp)
+    if v < 0 {
+      tErr(
+        "`flat type "
+          + nm
+          + "` has no field '"
+          + n.memProp
+          + "' — its layout members are `.size` and one offset per declared field",
+        ix,
+      )
+      return 2
+    }
+    arenaReplaceNode(ix, mkNum(i32ToStr(v), n.pos))
+    return 1
+  }
+  0
+}
+
+// ── nominal newtypes ──
+// The whole feature is these five functions plus one test each in `assignableGo`, `tyEqGo`
+// and `checkBinExprNode`. Nothing in `emit_*.vl` changes: `canonEmitTypeNames` rewrites
+// every newtype annotation to its base's spelling before the emitter runs (`newtype-design.md` §3).
+
+// `Map<K, V>()` / `Set<T>()`: the constructor at the collection type its arguments name.
+export function collCtorTyArgsTy(ctor: string, ix: i32) {
+  const tys: i32[] = []
+  if !resolveCallTyArgs(ix, tys) { return TY_ERR }
+  let want = 2
+  if ctor == "Set" { want = 1 }
+  if tys.length != want {
+    tErr(collTyArgCountMsg(ctor, want, tys.length), ix)
+    return TY_ERR
+  }
+  if !mapKeyTySupported(tys[0]) {
+    mapKeyUnsupportedErr(tyToStr(tys[0]), ctor, callTyArgsOf(ix)[0])
+    return TY_ERR
+  }
+  if ctor == "Set" { return mkMapTy(tys[0], TY_BOOL, 1) }
+  mkMapTy(tys[0], tys[1], 0)
+}
+
+export function resolveAnnot(name: string, typarams: string[]) {
+  resolveAnnotTs(name, typarams, -1, "")
+}
+
+// `resolveAnnot`, with the annotation's spelling root threaded to the three legs that
+// actually resolve. `root < 0` is the name route — what the exported entry point (and its
+// `emit_rep.vl` callers) get, since a post-canon emit-time name has no live tree. The memo
+// stays keyed on the name regardless: a hit returns the same index whichever route minted it, and only a miss re-reads the tree.
+function resolveAnnotTs(
+  name: string,
+  typarams: string[],
+  root: i32,
+  owner: string,
+) {
+  if typarams.length == 0 {
+    if tpEnvNames.length == 0 {
+      const hit = annotNameMemo[name] ?? -2
+      if hit != -2 {
+        // Restores the collapse bank (D1048), for the same reason the negative leg restores
+        // `unkTyPart`: a memo hit never re-enters the resolver, so a spelling whose first
+        // resolution collapsed would answer "no collapse" at every later site.
+        collapsedTySet(annotCollapsed[name] ?? -1)
+        return hit
+      }
+      const negVer = annotNameMemoNegVer[name] ?? -1
+      if negVer == cUserTypesVer {
+        // Restore the component this name banked when it actually resolved, so the
+        // caller's `unknownTyText` reads THIS name's leaf and not the last one anywhere.
+        unkTyPartSet(annotPartOf(name))
+        unkTyClashSet(annotClashOf(name))
+        return -1
+      }
+      const diagsBefore = T.diags.length
+      const r = annotResolve(name, root)
+      if r >= 0 {
+        // A resolution that raised a diagnostic is not banked: a quiet pass rolls the
+        // diagnostic back, and a memo hit never raises it again (D2294).
+        if T.diags.length == diagsBefore {
+          annotNameMemo[name] = r
+          // Banks the collapse alongside the index, only when there is one — the read
+          // above defaults to -1, so the absent key means "this spelling collapses nothing".
+          if collapsedTy >= 0 { annotCollapsedSetAt(name, collapsedTy) }
+        }
+      } else {
+        annotNameMemoNegVer[name] = cUserTypesVer
+        annotPart[name] = unkTyPart
+        annotClash[name] = unkTyClash
+      }
+      return r
+    }
+    return annotResolve(name, root)
+  }
+  let i = 0
+  while i < typarams.length {
+    tpEnvNames.push(typarams[i])
+    tpEnvTys.push(mkTyVarOwned(typarams[i], owner))
+    i = i + 1
+  }
+  const r = annotResolve(name, root)
+  let j = 0
+  while j < typarams.length {
+    tpEnvNames.pop()
+    tpEnvTys.pop()
+    j = j + 1
+  }
+  r
+}
+
+// A function's declared return type. `never` resolves only here: it says the function cannot
+// return, which no other position can mean, so everywhere else it stays an unknown type (D1972).
+export function resolveRetAnnotAt(
+  name: string,
+  typarams: string[],
+  at: i32,
+  owner: string,
+) {
+  if name == "never" { return TY_NEVER }
+  resolveAnnotAt(name, typarams, at, owner)
+}
+
+// `resolveAnnot` with resolution diagnostics anchored at node `at` (the
+// annotation's TypeRef) — see `annotDiagAt`.
+export function resolveAnnotAt(
+  name: string,
+  typarams: string[],
+  at: i32,
+  owner: string,
+) {
+  const minted = luAnnTy[at] ?? -1
+  if minted >= 0 { return minted }
+  const saved = annotDiagAt
+  annotDiagAtSet(at)
+  const r = resolveAnnotTs(name, typarams, annTsOf(at), owner)
+  annotDiagAtSet(saved)
+  if name.length > 0 && name.slice(0, 1) == "{" { recAnnObjs.push(r) }
+  // A container of vectors named by an annotation alone (a param, a field of a struct only
+  // ever passed around, `v?: F32x4`) reaches no expression node, so it is refused here.
+  if !inferQuiet {
+    v128NestCheck(at, r)
+    noteNestCstr(r, at)
+  }
+  r
+}
+
+// A v128 vector lives in locals, parameters, returns and globals, and boxed as a nullable or
+// union member; a container holding one bare — an array element, a struct field, a map key or
+// value — has no lowering yet, so the first node typed with one is refused here, before emission.
+export function v128NestCheck(ix: i32, t: i32) {
+  if ix < 0 || t < 0 { return 0 }
+  if !tyNestsV128(t, 8) { return 0 }
+  let i = 0
+  while i < v128NestReported.length {
+    if v128NestReported[i] == t { return 0 }
+    i = i + 1
+  }
+  v128NestReported.push(t)
+  tErrUnsupported(v128NestMsg(t), ix)
+  0
+}
+
+// Rewrites each arm pattern naming a constant into a read of it, and refuses every other bare
+// name. Asked of the value vocabularies, where no type but `null` is a pattern, so a constant the
+// name reaches wins over a type of that name. A `hole` scrutinee's arms still choose between the
+// two, so there a type stays a type and a refusal is left to the scrutinee's own error.
+export function resolveMatchConstPats(n: MatchExpr, hole: boolean) {
+  let i = 0
+  while i < n.matchPats.length {
+    const patIx = n.matchPats[i]
+    const pn = P.nodes[patIx]
+    if pn is IsExpr {
+      const root = annTsOf(patIx)
+      if root >= 0 && tsKind[root] == TS_NAME && pn.isVariant != "null" {
+        const nm = matchPatValueName(patIx, pn.isVariant)
+        let isConst = false
+        if !hole { isConst = constDeclOf(nm) >= 0 }
+        if isConst || !matchPatNamesType(pn.isVariant) {
+          const why = matchConstPatWhy(nm, patIx)
+          if why == "" {
+            const rd: Node = { identName: nm, pos: pn.pos }
+            arenaSetNode(patIx, rd)
+            sidNoteNodeName(patIx, -1)
+          } else if !hole {
+            matchPatRefused[patIx] = true
+            tErr(why, patIx)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The union of the members' element types, each read at its value type, kept apart rather
+// than widened (`f64[] | i32[]` reads `f64 | i32`). -1 when the elements have no union.
+export function luElemTy(ms: i32[]): i32 {
+  let e = -1
+  let i = 0
+  while i < ms.length {
+    const a = T.tys[ms[i]]
+    if a is TyArray {
+      const v = arrElemValueTy(a.aElem)
+      if v < 0 { return -1 }
+      if e < 0 { e = v } else { e = joinVariantTys(e, v) }
+    }
+    i = i + 1
+  }
+  if e == TY_ERR {
+    joinClashMsgSet("")
+    return -1
+  }
+  e
+}
+
+// The spelling the rewrite names `ty` by in an `is` test or an annotation: the first of its
+// display name and its emit name that resolves back to `ty`, or "" when neither does. A failed
+// resolution's diagnostics are dropped, since the answer is the whole point of asking.
+export function luSpell(ty: i32): string {
+  const dn = luPipeTight(tyToStr(ty))
+  if luSpellsAs(dn, ty) { return dn }
+  const en = tyToEmitName(ty)
+  if en != "" && luSpellsAs(en, ty) { return en }
+  // A function type's display name spaces its arrow, which no annotation name does; its emit
+  // name spells a literal-union parameter by its old base scalar.
+  const an = luArrowTight(dn)
+  if an != dn && luSpellsAs(an, ty) { return an }
+  // A union naming a type parameter, whose written form resolves to one member when its lists
+  // meet: spelled for the pin to substitute, and typed through `luAnnTy`.
+  if luUnionSpellsByMember(ty) { return dn }
+  ""
+}
+
+// Whether `ty` is a union naming a type parameter each of whose members has a spelling.
+function luUnionSpellsByMember(ty: i32): boolean {
+  if ty < 0 || !tyHasTyVar(ty) { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if luSpell(t.uMembers[i]) == "" { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+function luSpellsAs(name: string, ty: i32): boolean {
+  const mark = T.diags.length
+  const back = nameToTy(name)
+  while T.diags.length > mark { T.diags.pop() }
+  back >= 0 && (tySame(back, ty) || tyEq(back, ty))
+}
+
+// Whether the union `u` and each of its members `ms` have a spelling. The receiver's `const`
+// is annotated at `u` itself, since an un-annotated copy of a null-narrowed union reads its
+// complement arm at the wrong rep (D2875).
+export function luAllSpell(u: i32, ms: i32[]): boolean {
+  if luSpell(u) == "" { return false }
+  let i = 0
+  while i < ms.length {
+    if luSpell(ms[i]) == "" { return false }
+    i = i + 1
+  }
+  true
+}
+
+// `kw name[: ann] = init`, where `ann` is a type rendered to its spelling (-1: none).
+export function luDecl(
+  kw: string,
+  name: string,
+  ann: i32,
+  init: i32,
+  site: i32,
+  pos: i32,
+): i32 {
+  let tr = -1
+  if ann >= 0 {
+    tr = luAt(mkTypeRef(luSpell(ann), pos), site)
+    luAnnTyPut(tr, ann)
+  }
+  luAt(mkLet(kw, name, tr, init, pos), site)
+}
+
+// One arm's value over list `recv`: its `.length`, or with an index its element, delivered
+// through a `const` at the element union so each arm boxes into the same rep.
+function luArm(recv: string, idx: string, elem: i32, site: i32, pos: i32): i32 {
+  const stmts: i32[] = []
+  if idx == "" {
+    stmts.push(luAt(mkMember(luRef(recv, site, pos), "length", pos), site))
+  } else {
+    const rd = luAt(
+      mkIndex(luRef(recv, site, pos), luRef(idx, site, pos), pos),
+      site,
+    )
+    const tmp = "$le" + i32ToStr(site)
+    stmts.push(luDecl("const", tmp, elem, rd, site, pos))
+    stmts.push(luRef(tmp, site, pos))
+  }
+  luAt(mkBlock(stmts, pos), site)
+}
+
+// The `is` chain over `recv`'s members from `k` on, the last member being the bare `else`.
+export function luChain(
+  ms: i32[],
+  k: i32,
+  recv: string,
+  idx: string,
+  elem: i32,
+  site: i32,
+  pos: i32,
+): i32 {
+  const arm = luArm(recv, idx, elem, site, pos)
+  // A union with a type parameter's list tests its last member too: a complement cannot
+  // narrow it, since the parameter may be the same list at the pin.
+  const open = luAnyTyVar(ms)
+  if k >= ms.length - 1 && !open { return arm }
+  const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
+  if k >= ms.length - 1 {
+    const tl: i32[] = []
+    tl.push(luAt(mkCall(luRef("__trap__", site, pos), [], pos), site))
+    return luAt(mkIf(test, arm, luAt(mkBlock(tl, pos), site), pos), site)
+  }
+  const rest = luChain(ms, k + 1, recv, idx, elem, site, pos)
+  luAt(mkIf(test, arm, rest, pos), site)
+}
+
+// The annotation node naming `ty` for the adapter, or -1 when it has no spelling. The checker
+// reads the type itself; the spelling is the display name, which the emitter reads as the
+// author's own annotation, since the emit spelling renders a named record structurally.
+export function fvaAnnot(ty: i32, site: i32, pos: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  let sp = ""
+  // A single literal type is spelled by its base scalar, which it is stored as; the checker
+  // reads the literal itself from `luAnnTy`.
+  const sty = litPeekBaseTy(ty)
+  if isVoidTy(sty) { sp = "void" } else { sp = luPipeTight(tyToStr(sty)) }
+  if sp == "" || luSpell(sty) == "" { return -1 }
+  // The display name leaves a nullable function type's arrow unparenthesised.
+  const t = T.tys[ty]
+  if t is TyNullable && t.nInner >= 0 {
+    if T.tys[t.nInner] is TyFunc {
+      sp = "(" + luPipeTight(tyToStr(t.nInner)) + ")|null"
+    }
+  }
+  const tr = luAt(mkTypeRef(sp, pos), site)
+  luAnnTyPut(tr, ty)
+  tr
+}
+
+// The function arm of union `u` that a value of function type `src` converts into; -1 when no
+// arm needs a conversion to take it, -2 when more than one converting arm would.
+export function fvaUnionArm(u: TyUnion, src: i32): i32 {
+  let found = -1
+  for m in u.uMembers {
+    if m == src || tyEq(m, src) { return -1 }
+    if T.tys[m] is TyFunc && assignable(src, m) {
+      if !fvaFnMayDiffer(src, m, 8) { return -1 }
+      if found >= 0 { return -2 }
+      found = m
+    }
+  }
+  found
+}
+
+// The refusal for a container whose functions would need an adapter each.
+export function fvaRefuseNested(at: i32, srcTy: i32, dstTy: i32) {
+  tErr(
+    "a `"
+      + tyToStr(srcTy)
+      + "` cannot be used as `"
+      + tyToStr(dstTy)
+      + "` here: a call through that type would reach a function it holds at a signature "
+      + "the function does not have, and the functions inside a value are not converted on the way. Build the "
+      + "value at `"
+      + tyToStr(dstTy)
+      + "`, or wrap each function in a lambda of the wider type where it is stored",
+    at,
+  )
+  0
+}
+
+// The refusal for a function value whose adapter cannot be built: `why` is the checker's
+// reason for refusing the adapter's own call or result, "" when a slot type has no spelling.
+export function fvaRefuse(at: i32, srcTy: i32, dstTy: i32, why: string) {
+  let msg = "a function of type `"
+    + tyToStr(srcTy)
+    + "` cannot be used as `"
+    + tyToStr(dstTy)
+    + "` here: calling it through that type needs its arguments or result converted, and "
+  if why == "" {
+    msg = msg + "a parameter or result type has no spelling to convert through"
+  } else {
+    msg = msg + "that conversion is refused (" + why + ")"
+  }
+  tErr(msg, at)
+  0
+}
+// ── member `o.field` ───────────────────────────────────────────────────────
