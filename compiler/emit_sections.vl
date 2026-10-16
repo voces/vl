@@ -576,6 +576,7 @@ import {
   fbRefNullStruct,
   fbRetExtra,
   fbReturn,
+  fbReturnCall,
   fbSelect,
   fbStrBack,
   fbStrHash,
@@ -648,6 +649,7 @@ import {
   exprHasStrOp,
   exprPopBits,
   fnEnvIdxOf,
+  fnHasEnvParam,
   fnHasGlobalMapOp,
   fnHasMap,
   fnHasStrOp,
@@ -5842,10 +5844,7 @@ function emitModule(_stmts: i32[]) {
 
   emitGlobalSection()
 
-  // The export ABI wrappers (#1265) sit after EVERY other function — user functions, the
-  // start fn, the `__log__` decoder and the shared helpers — so adding them shifts no
-  // existing function index. Wrapper k belongs to export entry k.
-  emitExportSection(n, helpBase + nHelpers)
+  emitExportSection(n)
 
   // Start section (id 8): names the function the runtime invokes once at instantiation, before
   // any export is callable — here the synthetic start fn that runs the non-const global
@@ -5871,12 +5870,15 @@ function emitModule(_stmts: i32[]) {
   if buildCodePayload(codePayload, n, hasStart, memFn, nHelpers) < 0 {
     return -1
   }
+  // The global section is framed first: it sits after the function section in the rope, so
+  // placing it does not move the chunk the function section is placed before.
   frameGlobalSection()
+  frameFunctionSection()
 
   // Element section (id 9): one active segment per run of address-taken functions, filling
-  // entry `gImports + i` with user function `i` — the index a closure id already holds, so
-  // `call_indirect` needs no translation. Every other entry stays null and traps a call no
-  // expression can produce, since `markFnAddrTaken` records the one site that mints an id.
+  // entry `gImports + i` with function `i`, or its thunk when `i` has no env param, so
+  // `call_indirect` needs no translation. Other entries stay null: `markFnAddrTaken`
+  // records the one site that mints an id, so no expression can call them.
   if fnValUsed {
     const elemRuns = fnAddrTakenRuns(n)
     if elemRuns > 0 {
@@ -5892,7 +5894,7 @@ function emitModule(_stmts: i32[]) {
         wU8(11)        // 0x0b end
         wULEB(de - di) // count of table entries this run writes
         while di < de {
-          wULEB(gImports + di) // func index (imports occupy 0..gImports-1)
+          wULEB(tableEntryFnIdx(di)) // func index (imports occupy 0..gImports-1)
           di = di + 1
         }
         di = elemNextTaken(di, n)
@@ -6703,6 +6705,9 @@ export function emitProgram(rootIx: i32) {
   gNeedsAsFail = false
   gNeedsStrFromBytes = false
   gMapDeletes = false
+  gFuncFixedN = 0
+  gFuncEntries = []
+  gFuncRopeAt = 0
   // The hole instances' bindings are read by passes that run before `monomorphize` refills
   // them, so an earlier program's rows would name another arena's types (D2921).
   monoHoleSubRow = Map()
@@ -7139,8 +7144,9 @@ function emitSynthCloSig(key: string) {
 // Type section (id 1): all WasmGC types in one recursion group, followed by the standalone
 // print/log functypes — the rec-group count excludes those. One function's `0x60` functype,
 // written to the type payload: `withEnv` decides the hidden leading `structref`, every other
-// byte the same either way. Called twice per exported function (#1265) — internal env-leading and published clean-ABI — so they are one function, not a copy, to keep them from drifting.
-function emitOneFuncType(ti: i32, withEnv: boolean) {
+// byte the same either way.
+function emitOneFuncType(ti: i32) {
+  const withEnv = fnHasEnvParam(ti)
   const fn = P.nodes[fnStmts[ti]]
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -7149,10 +7155,8 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
     let liftCaps: string[] = []
     let nRetCaps = 0
     wU8(96) // 0x60 func
-    // When a function value exists module-wide, EVERY function carries a hidden
-    // leading `structref env` param (local 0). The declared params follow at 1..p.
-    // A non-capturing function ignores its env; a capturing one `ref.cast`s + reads
-    // it. Gated on `fnValUsed` so a no-lambda module's functypes are unchanged.
+    // A function carrying the env param takes a leading `structref` (local 0), which a
+    // capturing one `ref.cast`s and reads; its declared params follow.
     if withEnv {
       // A lifted function's captures follow the env, in capture order (SP-037).
       if cloLifted(ti) {
@@ -7179,6 +7183,14 @@ function emitOneFuncType(ti: i32, withEnv: boolean) {
     }
     if fRetVoid[ti] == 1 {
       wU8(nRetCaps) // no result of its own — a VOID function (`()->()`)
+    } else if fnValUsed && !cloLifted(ti) && fnSigIsClosure(ti) {
+      // A value-eligible function's result is its `$fnsig`'s, so its body, its direct callers
+      // and the table thunk around it all agree on one valtype.
+      wU8(1)
+      const crk = cloRetValKind(ti)
+      let crkCode: VKind = "i32"
+      if crk != null { crkCode = crk }
+      fbValtype(crkCode, cloRetValSlot(ti))
     } else if fn.fnRet < 0 && fnReturnsClosure(ti) {
       // A function VALUE return (un-annotated; its tail is a function value) — kind 14.
       wU8(1 + nRetCaps)
@@ -7765,14 +7777,13 @@ function emitTypeSection(
   // raw framing bytes, `pushFieldStorage`, and `fbValtype` all stream to `curBuf ==
   // typePayload` identically. Restored just before `wSection` frames it (below).
   const tyPrev = wTarget(typePayload)
-  const nWrapT = exportWrapSlots().length
   // The rec group holds the heap types and the closure-signature pool. Each user function's
   // own functype and the start functype follow it standalone, because under iso-recursive
   // identity a rec-group member never equals another module's import (D1999); they name only
-  // lower-indexed types. With closures in use, exports get standalone types via their wrappers.
+  // lower-indexed types.
   let nGroup = 0
   if typeOffset > 0 { nGroup = 1 }
-  wULEB(nGroup + n + hasStart + nPrintTypes + memFn + nHelpers + nWrapT)
+  wULEB(nGroup + n + hasStart + nPrintTypes + memFn + nHelpers)
   if typeOffset > 0 {
     wU8(78)           // 0x4e rec group
     wULEB(typeOffset) // the heap types and the closure-signature pool
@@ -7797,7 +7808,7 @@ function emitTypeSection(
   }
   let ti = 0
   while ti < n {
-    emitOneFuncType(ti, fnValUsed)
+    emitOneFuncType(ti)
     ti = ti + 1
   }
   // ── the tail functypes, in emit order ──
@@ -7978,15 +7989,6 @@ function emitTypeSection(
   }
   if gHelpStrFromBytes >= 0 {
     helpFuncType("yii", "s") // __str_from_bytes__: (u8[], at, count) -> (ref str)
-  }
-  // The export-wrapper functypes last (#1265), one per export entry, each the target's own
-  // signature emitted with `withEnv` false — the clean ABI shape, produced by the same
-  // `emitOneFuncType` the main loop uses, so a wrapper's published type cannot drift from the function it forwards to. Empty unless `fnValUsed`.
-  const wrapT = exportWrapSlots()
-  let wti = 0
-  while wti < wrapT.length {
-    emitOneFuncType(wrapT[wti], false)
-    wti = wti + 1
   }
   wTarget(tyPrev)
   wSection(1, typePayload)
@@ -8211,17 +8213,16 @@ function emitFunctionSection(
   // Function section (id 3): N functions; func i uses functype `typeOffset + i`. The
   // synthetic start function (if any) is the LAST entry — function index `n` — using
   // the `()->()` functype at index `typeOffset + n`.
+  // Framed by `frameFunctionSection` once the bodies have decided the thunks it ends with.
   const funcPayload: u8[] = []
   const fnPrev = wTarget(funcPayload)
-  const wrapF = exportWrapSlots()
-  wULEB(n + hasStart + memFn + nHelpers + wrapF.length)
+  gFuncFixedN = n + hasStart + memFn + nHelpers
   let fi = 0
   while fi < n {
-    // A function whose env-leading signature matches an interned `$fnsig` is declared
-    // with that `$fnsig` functype, so a `call_indirect $fnsig` reaching it passes the
-    // engine's signature check (its ACTUAL type IS `$fnsig`). Others keep their own
-    // functype. Only when `fnValUsed`. (Lambdas.)
-    if fnValUsed && fnSigIsClosure(fi) && !cloLifted(fi) {
+    // A function carrying the env param whose signature matches an interned `$fnsig` is
+    // declared with that `$fnsig` functype, so a `call_indirect $fnsig` reaching it passes
+    // the engine's signature check. Others keep their own functype.
+    if fnHasEnvParam(fi) && fnSigIsClosure(fi) && !cloLifted(fi) {
       wULEB(fnSigIdxOfFn(fi))
     } else {
       wULEB(typeOffset + fi) // functype index
@@ -8245,17 +8246,90 @@ function emitFunctionSection(
     wULEB(helpTyBase + hi)
     hi = hi + 1
   }
-  // The export wrappers LAST — after every other function, so no existing function index
-  // shifts — each on its own functype, emitted in this same order at the tail of the type
-  // section (`helpTyBase + nHelpers + k`).
-  let wfi = 0
-  while wfi < wrapF.length {
-    wULEB(helpTyBase + nHelpers + wfi)
-    wfi = wfi + 1
-  }
   wTarget(fnPrev)
-  wSection(3, funcPayload)
+  gFuncEntries = funcPayload
+  gFuncRopeAt = W.chunks.length
   0
+}
+
+// What `emitFunctionSection` leaves for `frameFunctionSection`: the count and entries of every
+// function but the thunks, and the module rope chunk the section is framed before.
+let gFuncFixedN = 0
+let gFuncEntries: u8[] = []
+let gFuncRopeAt = 0
+
+// The thunks, after every other function so no index shifts: one per address-taken function
+// without the env param, in `fnStmts` order. Thunk k is function `thunkBase + k` and is
+// declared with its target's `$fnsig`, so it is what the table holds at the target's id.
+let cloThunkFes: i32[] = []
+// Parallel to `fnStmts`: the function index of each one's thunk, or -1.
+let cloThunkOf: i32[] = []
+
+// Collect the thunks from the address-taken set the bodies recorded. `base` is the function
+// index after every other function.
+function collectCloThunks(n: i32, base: i32) {
+  cloThunkFes = []
+  cloThunkOf = []
+  let fe = 0
+  while fe < n {
+    if fnValUsed && fnAddrTakenAt(fe) && !fnHasEnvParam(fe) {
+      if fnSigIdxOfFn(fe) < 0 {
+        emitFail(
+          "emitProgram: a function taken as a value has no `$fnsig` for its table thunk",
+        )
+      }
+      cloThunkOf.push(base + cloThunkFes.length)
+      cloThunkFes.push(fe)
+    } else {
+      cloThunkOf.push(-1)
+    }
+    fe = fe + 1
+  }
+  0
+}
+
+// The function a table entry for function `fe` holds: its thunk when it has one, else itself.
+function tableEntryFnIdx(fe: i32): i32 {
+  if fe >= 0 && fe < cloThunkOf.length && cloThunkOf[fe] >= 0 {
+    return cloThunkOf[fe]
+  }
+  gImports + fe
+}
+
+// Function section (id 3), placed before the table section it precedes in the module.
+function frameFunctionSection() {
+  const countBuf: u8[] = []
+  const thunkBuf: u8[] = []
+  const prev = wTarget(countBuf)
+  wULEB(gFuncFixedN + cloThunkFes.length)
+  wTarget(thunkBuf)
+  let k = 0
+  while k < cloThunkFes.length {
+    wULEB(fnSigIdxOfFn(cloThunkFes[k]))
+    k = k + 1
+  }
+  wTarget(prev)
+  wSectionPartsAt(gFuncRopeAt, 3, [countBuf, gFuncEntries, thunkBuf])
+}
+
+// A thunk body: drop the env, forward the declared params, tail-call the target, so a
+// recursion through a function value stays in constant stack.
+function emitCloThunkCode(out: u8[], fe: i32) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(0) // no local runs
+  const tfn = P.nodes[fnStmts[fe]]
+  if tfn is FuncDecl {
+    let pi = 0
+    while pi < tfn.fnParams.length {
+      fbLocalGet(1 + pi)
+      pi = pi + 1
+    }
+  }
+  fbReturnCall(gImports + fe)
+  fbEnd()
+  wTarget(prev)
+  helpFrameBody(out, body)
 }
 
 // What `emitGlobalSection` leaves for `frameGlobalSection`: its entry count and bytes, and the
@@ -8663,40 +8737,7 @@ function exportTargetSlots(): i32[] {
   slots
 }
 
-// #1265 — the export entries that need an ABI wrapper, parallel to `exportPublicNames`,
-// empty unless the module uses a function value. When `fnValUsed`, every function carries a
-// hidden leading `structref env` param — an internal calling convention that the export
-// section otherwise leaks, giving an importer calling `f(1)` a boundary TypeError. Each export entry gets its own thin forwarding wrapper, since two public names may alias one function.
-function exportWrapSlots(): i32[] {
-  const none: i32[] = []
-  if !fnValUsed { return none }
-  exportTargetSlots()
-}
-
-// A wrapper body: supply the env the internal convention wants, forward the declared params,
-// tail into the real function. A top-level export cannot capture anything, so `ref.null
-// struct` is the correct env, exactly as the direct-call path passes for a non-capturing
-// callee. No locals: the wrapper's own params are locals 0..p-1, un-shifted — the one function in the module with no env param.
-function emitExportWrapperCode(out: u8[], slot: i32) {
-  const body: u8[] = []
-  const prev = wTarget(body)
-  wULEB(0) // no local runs
-  fbRefNullStruct()
-  const wfn = P.nodes[fnStmts[slot]]
-  if wfn is FuncDecl {
-    let pi = 0
-    while pi < wfn.fnParams.length {
-      fbLocalGet(pi)
-      pi = pi + 1
-    }
-  }
-  fbCall(gImports + slot)
-  fbEnd()
-  wTarget(prev)
-  helpFrameBody(out, body)
-}
-
-function emitExportSection(_n: i32, wrapBase: i32) {
+function emitExportSection(_n: i32) {
   // Export section (id 7): the module's ABI is exactly the alias tables the driver staged —
   // re-export entries plus the root module's plain `export`-marked functions. Nothing else is
   // exported: an internal function stays private, since a program runs by instantiation and a
@@ -8749,18 +8790,19 @@ function emitExportSection(_n: i32, wrapBase: i32) {
   const exportPayload: u8[] = []
   const exPrev = wTarget(exportPayload)
   wULEB(nExports)
-  // Each entry: the bare public name pointing at the target's func index — or, when the module
-  // has an env-leading calling convention to hide, at entry `rei`'s ABI wrapper (#1265).
-  // `exportWrapSlots` is parallel to `reExpNm`, and the wrappers are appended in that same order after every other function, so entry `rei`'s wrapper is `wrapBase + rei`.
+  // Each entry: the bare public name pointing at the target's func index. A top-level function
+  // captures nothing, so it carries no env param and its signature is already the clean ABI.
   let rei = 0
   while rei < reExpNm.length {
+    if fnHasEnvParam(reExpEi[rei]) {
+      wTarget(exPrev)
+      return emitFail(
+        "emitProgram: an exported function carries the closure env param — only a nested function can, and none is exported",
+      )
+    }
     wName(reExpNm[rei])
     wU8(0) // export kind: func
-    if fnValUsed {
-      wULEB(wrapBase + rei)
-    } else {
-      wULEB(gImports + reExpEi[rei])
-    }
+    wULEB(gImports + reExpEi[rei])
     rei = rei + 1
   }
   let gxe = 0
@@ -8853,12 +8895,15 @@ function buildCodePayload(
   memFn: i32,
   nHelpers: i32,
 ) {
-  const wrapC = exportWrapSlots()
+  // The count is written once the bodies have decided the thunks, into the head chunk pushed
+  // here; `rowsAt` marks the span rows its width change moves.
+  const fixedN = n + hasStart + memFn + nHelpers
   const countHead: u8[] = []
   const codePrev = wTarget(countHead)
-  wULEB(n + hasStart + memFn + nHelpers + wrapC.length)
+  wULEB(fixedN)
   wTarget(codePrev)
   ropePush(codePayload, countHead)
+  const rowsAt = emitFnSpanStart.length
   // Each entry renders into a buffer of its own and joins the payload as one chunk, so no
   // buffer holds more than one function (D1976). `rows` marks the span rows the entry is
   // about to bank, entry-relative until `placeCodeEntry` moves them onto the payload.
@@ -8990,24 +9035,48 @@ function buildCodePayload(
     if emitStrFromBytesFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_from_bytes__")
   }
-  // The export-wrapper bodies LAST, in the same order the function section declared them.
-  // A wrapper's row carries the WRAPPED function's slot and node, so its name and the
-  // `file:line:col` of its declaration fall out of the same readers a user body uses.
-  let wci = 0
-  while wci < wrapC.length {
+  // The thunk bodies last, in the order the function section declares them. A thunk's row
+  // carries its target's slot and node, so its name and position are the target's.
+  collectCloThunks(n, gImports + fixedN)
+  let tci = 0
+  while tci < cloThunkFes.length {
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    emitExportWrapperCode(entry, wrapC[wci])
+    emitCloThunkCode(entry, cloThunkFes[tci])
     placeCodeEntry(
       codePayload,
       entry,
       rows,
-      fnStmts[wrapC[wci]],
-      wrapC[wci],
-      2,
+      fnStmts[cloThunkFes[tci]],
+      cloThunkFes[tci],
+      0,
       "",
     )
-    wci = wci + 1
+    tci = tci + 1
+  }
+  if cloThunkFes.length > 0 {
+    rewriteCodeCount(codePayload, fixedN + cloThunkFes.length, rowsAt)
+  }
+  0
+}
+
+// Replace the code payload's count head (its first chunk) with `count`, moving the span rows
+// banked from `rowsAt` on by the change in its width.
+function rewriteCodeCount(codePayload: ByteRope, count: i32, rowsAt: i32) {
+  // A failed emit pushes no chunk, and its module is discarded.
+  if emitFailed || codePayload.chunks.length == 0 { return 0 }
+  const head: u8[] = []
+  const prev = wTarget(head)
+  wULEB(count)
+  wTarget(prev)
+  const delta = head.length - codePayload.chunks[0].b.length
+  codePayload.chunks[0] = { b: head }
+  codePayload.len = codePayload.len + delta
+  let r = rowsAt
+  while r < emitFnSpanStart.length {
+    emitFnSpanStart[r] = emitFnSpanStart[r] + delta
+    emitFnSpanEnd[r] = emitFnSpanEnd[r] + delta
+    r = r + 1
   }
   0
 }
