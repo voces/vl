@@ -306,410 +306,334 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   false
 }
 
-// The un-annotated return, decided after the body is checked and its scope popped: the
-// observed returns join into one type, a contextual expected return may adopt it, and the
-// hoisted `TyFunc` is patched so existing references see the result. Restores the
-// inference accumulators its caller saved, and hands back the return type to finalize.
-export function finishInferredReturn(
-  n: FuncDecl,
-  fnIx: i32,
-  paramTys: i32[],
-  causeReported: boolean,
-  cbBefore: i32,
-  savedObserved: i32,
-  savedSawErr: boolean,
-  savedValueRet: boolean,
-  bodyTotalForRet: boolean,
-): i32 {
-  let ret = -2
-  inferStack.pop()
-  let inferred = TY_VOID
-  // Set when the object-shaped contextual adoption fires (`objRetWidenAdopt` below):
-  // gates the plain-struct canonical record — a lambda whose self-inference already
-  // matches its context keeps the established un-pinned route (pinning every
-  // plain-struct lambda regresses `.map`-collapse / factory / generic-HOF cases).
-  let objRetAdopted = false
-  const sawCycle = cycleBreakCount > cbBefore
-  if inferObserved >= 0 {
-    inferred = inferObserved
-    noteRetJoinValues(inferred, n.fnBody)
-  } else if sawCycle && fnSawValueRet {
-    // A value return position resolved to `void` only because a recursive-cycle member
-    // is still pending: defer, so the binding-group fixpoint re-infers this once the
-    // cycle's resolvable members settle. Genuine void recursion has no value return
-    // position (`fnSawValueRet` is false), so it is never deferred this way.
-    if !strListHas(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
-    inferred = TY_VOID
-  } else if inferSawErr {
-    // Only err-ish types flowed back: no basis. An uninferable param or a bare `{}` in the
-    // body already reported the root cause, so suppress the redundant message.
-    if !causeReported { inferNoBasisErr(n.fnName, fnIx, n.fnBody) }
-    inferred = TY_ERR
+// The niche rungs of an anonymous lambda's contextual return adoption: a bare `{}` body,
+// a litunion member, and the nullable string/boolean/list/closure/struct/litunion niches.
+// Hands back `inferred`, replaced by `expRet` where a rung adopts it.
+function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
+  let inferred = inferred0
+  // A bare `{}` body completes the expected record, as it would at any delivery (D2223).
+  // Only marked when it cannot: the argument's own mismatch is then the one report.
+  if inferred != expRet && bareBraceNode(lambdaBodyTail(n.fnBody)) {
+    bareBraceSpecSet(bareBraceSpec + 1)
+    bareBraceDeliver(lambdaBodyTail(n.fnBody), expRet, 8, true)
+    bareBraceSpecSet(bareBraceSpec - 1)
+    if bareBraceRecordOf(expRet) >= 0 { inferred = expRet }
   }
-  // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
-  // than the contextual expected return takes the expected return as its own, so the
-  // widening lands at the lambda's return seam (`emitReturnValue`). Numeric widening through
-  // function-type variance is rejected instead (`fnSlotAssignable`), since a function value's rep is fixed.
-  if n.fnName == "" && inferred >= 0 {
-    // A contextual adoption below means the seed changed what this lambda infers, so an
-    // annotation that supplied it is load-bearing and cannot be judged redundant by
-    // comparing the two (D1442). Snapshot/compare rather than marking each arm, since there are twenty of them and a new one must not have to remember.
-    const preAdopt = inferred
-    const expRet = cbExpectedRetFor(fnIx)
-    if expRet >= 0 {
-      if numWidens(inferred, expRet) { inferred = expRet }
-      // The f32 dual of the numeric widen: a literal-bodied lambda whose contextual return
-      // is f32 infers f64/i32 by default, but the literal re-encodes exactly at f32 — the
-      // same grant a direct `const v: f32 = 5.5` binding makes. Adopts f32 so the functype
-      // result is f32 and `emitReturnValue` encodes the literal at f32 in the body.
-      if inferred != expRet && primNameOf(expRet) == "f32" {
-        if isF32AdoptingLitExpr(lambdaBodyTail(n.fnBody)) { inferred = expRet }
-      }
-      // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
-      // expected shape when every widening field is a re-encodable literal
-      // (`objRetWidenAdopt` also records the field types for the emitter's interner).
-      if objRetWidenAdopt(n.fnBody, inferred, expRet) {
-        inferred = expRet
-        objRetAdopted = true
-      }
-      // A bare `{}` body completes the expected record, as it would at any delivery (D2223).
-      // Only marked when it cannot: the argument's own mismatch is then the one report.
-      if inferred != expRet && bareBraceNode(lambdaBodyTail(n.fnBody)) {
-        bareBraceSpecSet(bareBraceSpec + 1)
-        bareBraceDeliver(lambdaBodyTail(n.fnBody), expRet, 8, true)
-        bareBraceSpecSet(bareBraceSpec - 1)
-        if bareBraceRecordOf(expRet) >= 0 { inferred = expRet }
-      }
-      // The litunion dual: a bare string-literal body that is a member of the expected
-      // literal-union adopts it. Its inferred type is the softened `string`; the direct
-      // `const k: K = "b"` binding grants the member flow via `assignableExpr`, but the
-      // lambda-return path only had the numeric/object arms until this one.
-      if inferred != expRet && tyIsLitUnion(expRet) {
-        const luTail = lambdaBodyTail(n.fnBody)
-        if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
+  // The litunion dual: a bare string-literal body that is a member of the expected
+  // literal-union adopts it. Its inferred type is the softened `string`; the direct
+  // `const k: K = "b"` binding grants the member flow via `assignableExpr`, but the
+  // lambda-return path only had the numeric/object arms until this one.
+  if inferred != expRet && tyIsLitUnion(expRet) {
+    const luTail = lambdaBodyTail(n.fnBody)
+    if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // A nullable-string result: a lambda body inferring a bare `string` member of an
+  // expected `string | null` closure result adopts the nullable — its functype result is
+  // the string-ref `ref.null` niche, and `emitReturnValue` niches the value exactly as
+  // the named-function value spelling lowers. Covers the string/boolean niches only; a nullable numeric scalar boxes through `valueUnionRetName` instead.
+  if inferred != expRet {
+    const etU = T.tys[expRet]
+    if etU is TyNullable {
+      // The boolean-niche dual of the string niche: a lambda body inferring a bare
+      // `boolean`/`null` member of an expected `boolean | null` adopts the niche — its
+      // functype result is the i32 sentinel (2 = null), exactly as the annotated
+      // `: boolean | null` return and the named-function value lower.
+      if (
+        tyIsPrimNamed(etU.nInner, "string")
+        || tyIsPrimNamed(etU.nInner, "boolean")
+      ) {
+        const nsTail = lambdaBodyTail(n.fnBody)
+        if nsTail >= 0 && assignableExpr(nsTail, inferred, expRet) {
           inferred = expRet
         }
       }
-      // A nullable-string result: a lambda body inferring a bare `string` member of an
-      // expected `string | null` closure result adopts the nullable — its functype result is
-      // the string-ref `ref.null` niche, and `emitReturnValue` niches the value exactly as
-      // the named-function value spelling lowers. Covers the string/boolean niches only; a nullable numeric scalar boxes through `valueUnionRetName` instead.
-      if inferred != expRet {
-        const etU = T.tys[expRet]
-        if etU is TyNullable {
-          // The boolean-niche dual of the string niche: a lambda body inferring a bare
-          // `boolean`/`null` member of an expected `boolean | null` adopts the niche — its
-          // functype result is the i32 sentinel (2 = null), exactly as the annotated
-          // `: boolean | null` return and the named-function value lower.
-          if (
-            tyIsPrimNamed(etU.nInner, "string")
-            || tyIsPrimNamed(etU.nInner, "boolean")
-          ) {
-            const nsTail = lambdaBodyTail(n.fnBody)
-            if nsTail >= 0 && assignableExpr(nsTail, inferred, expRet) {
-              inferred = expRet
-            }
-          }
-          // The nullable-list dual: a lambda body inferring the bare i32-backed list member
-          // of an expected `T[] | null` adopts the niche — its functype result is the
-          // nullable i32-list wrapper, exactly as the annotated form lowers. Distinct-backing
-          // leaves (`i64[] | null`, …) are not adopted and stay loud checker rejects.
-          if inferred != expRet && tyIsNulI32BackedListInner(etU.nInner) {
-            const nlTail = lambdaBodyTail(n.fnBody)
-            if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
-              inferred = expRet
-            }
-          }
-          // The nullable-closure dual: a lambda body inferring `null` (or a closure) against
-          // an expected nullable-closure result adopts the niche — its functype result is
-          // `(ref null $cloStruct)`, and `emitReturnValue`'s `retNulClosure` arm niches a
-          // `return null` exactly as the annotated form already lowers.
-          const etInnerTy = T.tys[etU.nInner]
-          if etInnerTy is TyFunc {
-            const ncTail = lambdaBodyTail(n.fnBody)
-            if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
-              inferred = expRet
-            }
-          }
-          // The nullable-struct dual: a lambda body inferring the bare struct member (or
-          // `null`) of an expected `S | null` closure result adopts the nullable — its
-          // functype result is the `(ref null $S)` niche, exactly as the annotated
-          // named-function value spelling already lowers.
-          if etInnerTy is TyObj {
-            const nsoTail = lambdaBodyTail(n.fnBody)
-            if nsoTail >= 0 && assignableExpr(nsoTail, inferred, expRet) {
-              inferred = expRet
-            }
-          }
-          // The nullable-litunion dual: a lambda body inferring a bare `string` member of
-          // the expected `K | null` litunion adopts the niche — its functype result is the
-          // i32 atom (`-1` = null), and `emitReturnValue`'s `retNulLitUnion` arm encodes it
-          // exactly as the annotated `: () => K | null` form already does.
-          if tyIsLitUnion(etU.nInner) {
-            const nluTail = lambdaBodyTail(n.fnBody)
-            if nluTail >= 0 && assignableExpr(nluTail, inferred, expRet) {
-              inferred = expRet
-            }
-          }
-        }
-      }
-      // A value-union result: a lambda body inferring a bare scalar arm of the expected
-      // value-union box result adopts the union, so the widening lands at the return seam —
-      // `emitReturnValue` boxes the scalar and the functype result is the box itself
-      // (`synthRetAnnots` pins `fnRet`). Checked after the niche arms, so a `T | null` niche is never swallowed as a value union.
-      if inferred != expRet && valueUnionRetName(expRet) != "" {
-        const vuTail = lambdaBodyTail(n.fnBody)
-        if vuTail >= 0 && assignableExpr(vuTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The litunion-array dual of the value-union result: a lambda body inferring the bare
-      // scalar arm of the expected `litunion-array | scalar` box adopts the union, boxing at
-      // the return seam. `valueUnionRetName` declines this union (its render flattens the
-      // litunion-array atom), so it needs its own alias-preserving arm.
-      if inferred != expRet && litUnionArrayValueUnionRetName(expRet) != "" {
-        const laTail = lambdaBodyTail(n.fnBody)
-        // Gates on strict `assignable` of the body's inferred type, not the expression-level
-        // `assignableExpr` the other arms use: the litunion-array arm reps as the kind-7
-        // i32-atom list, but a bare array literal self-infers the softened `string[]`, whose
-        // element re-typing would box the wrong tag. Only a body already at the union's own rep is adopted.
-        if laTail >= 0 && assignable(inferred, expRet) { inferred = expRet }
-      }
-      // The closure-arm dual of the value-union result: a lambda body inferring one arm (a
-      // closure or a scalar) of the expected closure-arm value union adopts it, boxing at
-      // the return seam — a closure member is the kind-11 ref atom riding the box's anyref
-      // value, and the functype result is the box (`synthRetAnnots` pins `fnRet`).
-      if inferred != expRet && cloArmValueUnionRetName(expRet) != "" {
-        const cvTail = lambdaBodyTail(n.fnBody)
-        if cvTail >= 0 && assignableExpr(cvTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The map-member-union dual: a lambda body inferring one struct arm of the expected
-      // map-member-union box result adopts the union, boxing the struct/map arm into the
-      // #865/#868 map-union box at the return seam, exactly as the annotated form exposes
-      // this rep already.
-      if inferred != expRet && mapUnionRetName(expRet) != "" {
-        const muTail = lambdaBodyTail(n.fnBody)
-        if muTail >= 0 && assignableExpr(muTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The ref-arm dual: a lambda body inferring one arm (a ref list or a struct) of the
-      // expected ref-arm union adopts it, boxing at the return seam so the functype result is
-      // the box rather than the raw reflist a narrowed call site would then cast — a
-      // guaranteed runtime trap or invalid wasm otherwise. Nominal-gated (`refArmUnionRetName` declines an anonymous-element array arm), so those shapes stay loud.
-      if inferred != expRet && refArmUnionRetName(expRet, gRootStmts) != "" {
-        const raTail = lambdaBodyTail(n.fnBody)
-        if raTail >= 0 && assignableExpr(raTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The variant-box dual with an inline-struct arm: a lambda body inferring one arm of
-      // the expected union adopts the whole union, boxing at the return seam so the
-      // functype result is the box, matching the value call's `annSigKey`. Checked after
-      // `refArmUnionRetName`, whose ref-array arms carry a slot render this arm declines.
-      if inferred != expRet && variantBoxUnionRetName(expRet) != "" {
-        const vbTail = lambdaBodyTail(n.fnBody)
-        if vbTail >= 0 && assignableExpr(vbTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-nullable-list result: a lambda body array literal assignable to the
-      // expected value-union-box list adopts it, so `emitReturnValue` seeds each nullable
-      // element through the same rep the annotated `(f64|null)[]` form already lowers
-      // (`synthRetAnnots` pins `fnRet`).
-      if inferred != expRet && nulElemListRetName(expRet) != "" {
-        const elTail = lambdaBodyTail(n.fnBody)
-        if elTail >= 0 && assignableExpr(elTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-nullable-struct-list dual: a lambda body array literal (non-null
-      // structs, or `null`) assignable to the expected nullable-struct-element list adopts
-      // it, building each element through the kind-1 struct niche the annotated form already
-      // lowers. Un-pinned, the body's structs would self-classify onto a different reflist slot than the annotation side.
-      if inferred != expRet && nulStructElemListRetName(expRet) != "" {
-        const nseTail = lambdaBodyTail(n.fnBody)
-        if nseTail >= 0 && assignableExpr(nseTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-nullable-map-list dual: a lambda body array literal (non-null maps, or
-      // `null`) assignable to the expected nullable-map-element list adopts it, building each
-      // element through the kind-3 map niche the annotated form already lowers. Un-pinned,
-      // the body's maps would self-classify onto a different reflist slot than the annotation side.
-      if inferred != expRet && nulMapElemListRetName(expRet) != "" {
-        const nmeTail = lambdaBodyTail(n.fnBody)
-        if nmeTail >= 0 && assignableExpr(nmeTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-nullable-scalar-list dual: a lambda body array literal (non-null inner
-      // lists, or `null`) assignable to the expected nullable-list-element list adopts it,
-      // building each element through the nullable inner-wrapper niche the annotated form
-      // already lowers. Un-pinned, the body's lists would self-classify onto a different reflist slot than the annotation side.
-      if inferred != expRet && nulListElemListRetName(expRet) != "" {
-        const nleTail = lambdaBodyTail(n.fnBody)
-        if nleTail >= 0 && assignableExpr(nleTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-value-union-list dual: a lambda body array literal assignable to the
-      // expected value-union-box list adopts it, boxing each element through the same
-      // element-kind-2 rep the annotated form already lowers.
-      if inferred != expRet && elemValueUnionListRetName(expRet) != "" {
-        const evTail = lambdaBodyTail(n.fnBody)
-        if evTail >= 0 && assignableExpr(evTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-variant-box-union-list dual: a lambda body array literal assignable to
-      // the expected variant-box-element list adopts it, boxing each element through the
-      // same element-kind-2 rep the annotated named-function value form already lowers.
-      if inferred != expRet && elemVariantBoxListRetName(expRet) != "" {
-        const vbeTail = lambdaBodyTail(n.fnBody)
-        if vbeTail >= 0 && assignableExpr(vbeTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-map-union-list dual: a lambda body array literal assignable to the
-      // expected map-union-element list adopts it, boxing each element through the same
-      // element-kind-2 map-union box rep the annotated form already lowers. Un-pinned, the
-      // body's array would self-classify onto a different reflist slot than the annotation side.
-      if inferred != expRet && elemMapUnionListRetName(expRet) != "" {
-        const meTail = lambdaBodyTail(n.fnBody)
-        if meTail >= 0 && assignableExpr(meTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The element-refarm-value-union-list dual: a lambda body array literal assignable to
-      // the expected list of (union-element-array | scalar) boxes adopts it, boxing each
-      // element through the same element-kind-2 box the annotated form already lowers.
-      // Un-pinned, the body's array would key onto a different `$fnsig` slot than the annotation side.
-      if inferred != expRet && elemRefArmValueUnionListRetName(expRet) != "" {
-        const raeTail = lambdaBodyTail(n.fnBody)
-        if raeTail >= 0 && assignableExpr(raeTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The nested (2-D+) union-element array dual: a lambda body nested array literal
-      // assignable to the expected 2-D+ box-element list adopts it, building the nested
-      // lists through the same element-kind-2 box the annotated form already lowers
-      // (`synthRetAnnots` pins `fnRet` off this producer's rung, `IR_RUNG_NESTED_ELEM_UNION_LIST`).
-      if inferred != expRet && nestedElemUnionListRetName(expRet) != "" {
-        const nueTail = lambdaBodyTail(n.fnBody)
-        if nueTail >= 0 && assignableExpr(nueTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The union-field-struct-element-list dual: a lambda body array literal assignable to
-      // the expected list of boxed-field structs adopts it, building each element's boxed
-      // field slot exactly as the annotated form lowers (`synthRetAnnots` pins `fnRet` via
-      // `nameIsStructWithUnionField`).
-      if inferred != expRet && structFieldBoxElemListRetName(expRet) != "" {
-        const sfeTail = lambdaBodyTail(n.fnBody)
-        if sfeTail >= 0 && assignableExpr(sfeTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The nullable-closure-element-list dual: a lambda body array literal assignable to
-      // the expected kind-5 niche list adopts it, seeding each element (a `null` to
-      // `ref.null $cloStruct`) through the same rep the annotated form already lowers.
-      if inferred != expRet && nulClosureElemListRetName(expRet) != "" {
-        const nceTail = lambdaBodyTail(n.fnBody)
-        if nceTail >= 0 && assignableExpr(nceTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
-      // The nested-list result: a lambda body array literal assignable to the expected
-      // nested scalar-leaf array adopts it, building under the pinned return's threading
-      // (`synthRetAnnots` pins `fnRet`); the `$fnsig` result keys the reflist slot on both
-      // producers, unlike the 1-D scalar-list arm below (R4).
-      if inferred != expRet && nestedLeafListRetName(expRet) != "" {
+      // The nullable-list dual: a lambda body inferring the bare i32-backed list member
+      // of an expected `T[] | null` adopts the niche — its functype result is the
+      // nullable i32-list wrapper, exactly as the annotated form lowers. Distinct-backing
+      // leaves (`i64[] | null`, …) are not adopted and stay loud checker rejects.
+      if inferred != expRet && tyIsNulI32BackedListInner(etU.nInner) {
         const nlTail = lambdaBodyTail(n.fnBody)
         if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
           inferred = expRet
         }
       }
-      // The scalar-leaf-list result: a lambda body array literal assignable to the expected
-      // distinct-backing scalar-leaf list adopts it — elements re-encode at the leaf
-      // (`assignableExpr`'s `ArrayLit` arm, the grant a direct `const xs: f32[] = [1.5]`
-      // binding makes), and `synthRetAnnots` pins `fnRet` to the adopted name (`isScalarListRetName`).
-      if inferred != expRet && scalarLeafListRetName(expRet) != "" {
-        const slTail = lambdaBodyTail(n.fnBody)
-        if slTail >= 0 && assignableExpr(slTail, inferred, expRet) {
+      // The nullable-closure dual: a lambda body inferring `null` (or a closure) against
+      // an expected nullable-closure result adopts the niche — its functype result is
+      // `(ref null $cloStruct)`, and `emitReturnValue`'s `retNulClosure` arm niches a
+      // `return null` exactly as the annotated form already lowers.
+      const etInnerTy = T.tys[etU.nInner]
+      if etInnerTy is TyFunc {
+        const ncTail = lambdaBodyTail(n.fnBody)
+        if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
           inferred = expRet
         }
       }
-      // The litunion-element-list result: a lambda body array literal whose elements are
-      // members of the expected litunion-element list adopts it — `assignableExpr`'s
-      // `ArrayLit` arm records the destination array type, so the body builds the i32 atom
-      // list; the `>a` result token already byte-matches the annotation side, so no pin is needed.
-      if inferred != expRet && litUnionElemListRetName(expRet) != "" {
-        const lulTail = lambdaBodyTail(n.fnBody)
-        if lulTail >= 0 && assignableExpr(lulTail, inferred, expRet) {
+      // The nullable-struct dual: a lambda body inferring the bare struct member (or
+      // `null`) of an expected `S | null` closure result adopts the nullable — its
+      // functype result is the `(ref null $S)` niche, exactly as the annotated
+      // named-function value spelling already lowers.
+      if etInnerTy is TyObj {
+        const nsoTail = lambdaBodyTail(n.fnBody)
+        if nsoTail >= 0 && assignableExpr(nsoTail, inferred, expRet) {
           inferred = expRet
         }
       }
-      // The struct-element-list result: a lambda body array literal's element structs
-      // coerce field-wise into the expected shape and adopt it — `assignableExpr`'s
-      // per-element `ObjLit` coercion records the coerced field types for the emitter's
-      // interner. Gated on plainly-lowerable element fields, so a map/union/nullable field stays a loud reject.
-      if inferred != expRet && structElemListRetName(expRet) != "" {
-        const seTail = lambdaBodyTail(n.fnBody)
-        if seTail >= 0 && assignableExpr(seTail, inferred, expRet) {
+      // The nullable-litunion dual: a lambda body inferring a bare `string` member of
+      // the expected `K | null` litunion adopts the niche — its functype result is the
+      // i32 atom (`-1` = null), and `emitReturnValue`'s `retNulLitUnion` arm encodes it
+      // exactly as the annotated `: () => K | null` form already does.
+      if tyIsLitUnion(etU.nInner) {
+        const nluTail = lambdaBodyTail(n.fnBody)
+        if nluTail >= 0 && assignableExpr(nluTail, inferred, expRet) {
           inferred = expRet
-          objRetAdopted = true
-        }
-      }
-      // The loud floor, last rung of this ladder: an empty-`[]` result no arm above adopted
-      // is the absence of a rep, not a narrower version of one — leaving `fnRet` a hole would
-      // cast-trap the value call or disagree with the body's list at emit. Exempt only the
-      // i32-backed elements (`i32`/`boolean`), which share the one i32-list backing with the annotation and so are already correct un-adopted.
-      if inferred != expRet && unresolvedHole(inferred) {
-        const ehT = T.tys[expRet]
-        if ehT is TyArray {
-          if (
-            !tyIsPrimNamed(ehT.aElem, "i32")
-            && !tyIsPrimNamed(ehT.aElem, "boolean")
-          ) {
-            tErrUnsupported(
-              "a lambda returning an empty `[]` cannot build the "
-                + tyToStr(expRet)
-                + " result its annotation asks for — type-valid, but the element type has no"
-                + " rep to build from; return the literal from a named function"
-                + " (`function f(): "
-                + tyToStr(expRet)
-                + " { return [] }`), which lowers this",
-              n.fnBody,
-            )
-          }
         }
       }
     }
-    if inferred != preAdopt { cbSeedUsedSet(cbSeedUsed + 1) }
   }
-  // A `const` literal returned is the `string` it is stored as, so a join with `null`, a number
-  // or a record meets the return floors below exactly as that string does (D2157).
-  inferred = widenLitTy(inferred)
-  // Permissive fall-through (totality): an un-annotated function that can fall off the end
-  // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
-  // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
-  // too but stays floored below until A20 carries the niche seed. A void/error return is exempt.
-  if (
-    !bodyTotalForRet
-    && inferred >= 0
-    && !isVoidTy(inferred)
-    && inferred != TY_ERR
-  ) {
-    const inT = T.tys[inferred]
-    if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
+  inferred
+}
+
+// The boxed rungs of an anonymous lambda's contextual return adoption: the value-union,
+// closure-arm, map-union, ref-arm and variant-box results, then the element-list duals.
+// Hands back `inferred`, replaced by `expRet` where a rung adopts it.
+function inferRetAdoptBoxed(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
+  let inferred = inferred0
+  // A value-union result: a lambda body inferring a bare scalar arm of the expected
+  // value-union box result adopts the union, so the widening lands at the return seam —
+  // `emitReturnValue` boxes the scalar and the functype result is the box itself
+  // (`synthRetAnnots` pins `fnRet`). Checked after the niche arms, so a `T | null` niche is never swallowed as a value union.
+  if inferred != expRet && valueUnionRetName(expRet) != "" {
+    const vuTail = lambdaBodyTail(n.fnBody)
+    if vuTail >= 0 && assignableExpr(vuTail, inferred, expRet) {
+      inferred = expRet
+    }
   }
-  // Robustness floor: an un-annotated function whose returns join to a union/nullable now
-  // infers the correct type, but must still be annotated when the emitter cannot yet lower
-  // it un-annotated — a value union/nullable already lowers via the `uBoxIdx` box and does
-  // not floor; a deferred join (a per-call-site placeholder) is not a shape to floor either, since it collapses to one arm at each call site.
+  // The litunion-array dual of the value-union result: a lambda body inferring the bare
+  // scalar arm of the expected `litunion-array | scalar` box adopts the union, boxing at
+  // the return seam. `valueUnionRetName` declines this union (its render flattens the
+  // litunion-array atom), so it needs its own alias-preserving arm.
+  if inferred != expRet && litUnionArrayValueUnionRetName(expRet) != "" {
+    const laTail = lambdaBodyTail(n.fnBody)
+    // Gates on strict `assignable` of the body's inferred type, not the expression-level
+    // `assignableExpr` the other arms use: the litunion-array arm reps as the kind-7
+    // i32-atom list, but a bare array literal self-infers the softened `string[]`, whose
+    // element re-typing would box the wrong tag. Only a body already at the union's own rep is adopted.
+    if laTail >= 0 && assignable(inferred, expRet) { inferred = expRet }
+  }
+  // The closure-arm dual of the value-union result: a lambda body inferring one arm (a
+  // closure or a scalar) of the expected closure-arm value union adopts it, boxing at
+  // the return seam — a closure member is the kind-11 ref atom riding the box's anyref
+  // value, and the functype result is the box (`synthRetAnnots` pins `fnRet`).
+  if inferred != expRet && cloArmValueUnionRetName(expRet) != "" {
+    const cvTail = lambdaBodyTail(n.fnBody)
+    if cvTail >= 0 && assignableExpr(cvTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The map-member-union dual: a lambda body inferring one struct arm of the expected
+  // map-member-union box result adopts the union, boxing the struct/map arm into the
+  // #865/#868 map-union box at the return seam, exactly as the annotated form exposes
+  // this rep already.
+  if inferred != expRet && mapUnionRetName(expRet) != "" {
+    const muTail = lambdaBodyTail(n.fnBody)
+    if muTail >= 0 && assignableExpr(muTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The ref-arm dual: a lambda body inferring one arm (a ref list or a struct) of the
+  // expected ref-arm union adopts it, boxing at the return seam so the functype result is
+  // the box rather than the raw reflist a narrowed call site would then cast — a
+  // guaranteed runtime trap or invalid wasm otherwise. Nominal-gated (`refArmUnionRetName` declines an anonymous-element array arm), so those shapes stay loud.
+  if inferred != expRet && refArmUnionRetName(expRet, gRootStmts) != "" {
+    const raTail = lambdaBodyTail(n.fnBody)
+    if raTail >= 0 && assignableExpr(raTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The variant-box dual with an inline-struct arm: a lambda body inferring one arm of
+  // the expected union adopts the whole union, boxing at the return seam so the
+  // functype result is the box, matching the value call's `annSigKey`. Checked after
+  // `refArmUnionRetName`, whose ref-array arms carry a slot render this arm declines.
+  if inferred != expRet && variantBoxUnionRetName(expRet) != "" {
+    const vbTail = lambdaBodyTail(n.fnBody)
+    if vbTail >= 0 && assignableExpr(vbTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-nullable-list result: a lambda body array literal assignable to the
+  // expected value-union-box list adopts it, so `emitReturnValue` seeds each nullable
+  // element through the same rep the annotated `(f64|null)[]` form already lowers
+  // (`synthRetAnnots` pins `fnRet`).
+  if inferred != expRet && nulElemListRetName(expRet) != "" {
+    const elTail = lambdaBodyTail(n.fnBody)
+    if elTail >= 0 && assignableExpr(elTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-nullable-struct-list dual: a lambda body array literal (non-null
+  // structs, or `null`) assignable to the expected nullable-struct-element list adopts
+  // it, building each element through the kind-1 struct niche the annotated form already
+  // lowers. Un-pinned, the body's structs would self-classify onto a different reflist slot than the annotation side.
+  if inferred != expRet && nulStructElemListRetName(expRet) != "" {
+    const nseTail = lambdaBodyTail(n.fnBody)
+    if nseTail >= 0 && assignableExpr(nseTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-nullable-map-list dual: a lambda body array literal (non-null maps, or
+  // `null`) assignable to the expected nullable-map-element list adopts it, building each
+  // element through the kind-3 map niche the annotated form already lowers. Un-pinned,
+  // the body's maps would self-classify onto a different reflist slot than the annotation side.
+  if inferred != expRet && nulMapElemListRetName(expRet) != "" {
+    const nmeTail = lambdaBodyTail(n.fnBody)
+    if nmeTail >= 0 && assignableExpr(nmeTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-nullable-scalar-list dual: a lambda body array literal (non-null inner
+  // lists, or `null`) assignable to the expected nullable-list-element list adopts it,
+  // building each element through the nullable inner-wrapper niche the annotated form
+  // already lowers. Un-pinned, the body's lists would self-classify onto a different reflist slot than the annotation side.
+  if inferred != expRet && nulListElemListRetName(expRet) != "" {
+    const nleTail = lambdaBodyTail(n.fnBody)
+    if nleTail >= 0 && assignableExpr(nleTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-value-union-list dual: a lambda body array literal assignable to the
+  // expected value-union-box list adopts it, boxing each element through the same
+  // element-kind-2 rep the annotated form already lowers.
+  if inferred != expRet && elemValueUnionListRetName(expRet) != "" {
+    const evTail = lambdaBodyTail(n.fnBody)
+    if evTail >= 0 && assignableExpr(evTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-variant-box-union-list dual: a lambda body array literal assignable to
+  // the expected variant-box-element list adopts it, boxing each element through the
+  // same element-kind-2 rep the annotated named-function value form already lowers.
+  if inferred != expRet && elemVariantBoxListRetName(expRet) != "" {
+    const vbeTail = lambdaBodyTail(n.fnBody)
+    if vbeTail >= 0 && assignableExpr(vbeTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-map-union-list dual: a lambda body array literal assignable to the
+  // expected map-union-element list adopts it, boxing each element through the same
+  // element-kind-2 map-union box rep the annotated form already lowers. Un-pinned, the
+  // body's array would self-classify onto a different reflist slot than the annotation side.
+  if inferred != expRet && elemMapUnionListRetName(expRet) != "" {
+    const meTail = lambdaBodyTail(n.fnBody)
+    if meTail >= 0 && assignableExpr(meTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The element-refarm-value-union-list dual: a lambda body array literal assignable to
+  // the expected list of (union-element-array | scalar) boxes adopts it, boxing each
+  // element through the same element-kind-2 box the annotated form already lowers.
+  // Un-pinned, the body's array would key onto a different `$fnsig` slot than the annotation side.
+  if inferred != expRet && elemRefArmValueUnionListRetName(expRet) != "" {
+    const raeTail = lambdaBodyTail(n.fnBody)
+    if raeTail >= 0 && assignableExpr(raeTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The nested (2-D+) union-element array dual: a lambda body nested array literal
+  // assignable to the expected 2-D+ box-element list adopts it, building the nested
+  // lists through the same element-kind-2 box the annotated form already lowers
+  // (`synthRetAnnots` pins `fnRet` off this producer's rung, `IR_RUNG_NESTED_ELEM_UNION_LIST`).
+  if inferred != expRet && nestedElemUnionListRetName(expRet) != "" {
+    const nueTail = lambdaBodyTail(n.fnBody)
+    if nueTail >= 0 && assignableExpr(nueTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The union-field-struct-element-list dual: a lambda body array literal assignable to
+  // the expected list of boxed-field structs adopts it, building each element's boxed
+  // field slot exactly as the annotated form lowers (`synthRetAnnots` pins `fnRet` via
+  // `nameIsStructWithUnionField`).
+  if inferred != expRet && structFieldBoxElemListRetName(expRet) != "" {
+    const sfeTail = lambdaBodyTail(n.fnBody)
+    if sfeTail >= 0 && assignableExpr(sfeTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The nullable-closure-element-list dual: a lambda body array literal assignable to
+  // the expected kind-5 niche list adopts it, seeding each element (a `null` to
+  // `ref.null $cloStruct`) through the same rep the annotated form already lowers.
+  if inferred != expRet && nulClosureElemListRetName(expRet) != "" {
+    const nceTail = lambdaBodyTail(n.fnBody)
+    if nceTail >= 0 && assignableExpr(nceTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The nested-list result: a lambda body array literal assignable to the expected
+  // nested scalar-leaf array adopts it, building under the pinned return's threading
+  // (`synthRetAnnots` pins `fnRet`); the `$fnsig` result keys the reflist slot on both
+  // producers, unlike the 1-D scalar-list arm below (R4).
+  if inferred != expRet && nestedLeafListRetName(expRet) != "" {
+    const nlTail = lambdaBodyTail(n.fnBody)
+    if nlTail >= 0 && assignableExpr(nlTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The scalar-leaf-list result: a lambda body array literal assignable to the expected
+  // distinct-backing scalar-leaf list adopts it — elements re-encode at the leaf
+  // (`assignableExpr`'s `ArrayLit` arm, the grant a direct `const xs: f32[] = [1.5]`
+  // binding makes), and `synthRetAnnots` pins `fnRet` to the adopted name (`isScalarListRetName`).
+  if inferred != expRet && scalarLeafListRetName(expRet) != "" {
+    const slTail = lambdaBodyTail(n.fnBody)
+    if slTail >= 0 && assignableExpr(slTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  // The litunion-element-list result: a lambda body array literal whose elements are
+  // members of the expected litunion-element list adopts it — `assignableExpr`'s
+  // `ArrayLit` arm records the destination array type, so the body builds the i32 atom
+  // list; the `>a` result token already byte-matches the annotation side, so no pin is needed.
+  if inferred != expRet && litUnionElemListRetName(expRet) != "" {
+    const lulTail = lambdaBodyTail(n.fnBody)
+    if lulTail >= 0 && assignableExpr(lulTail, inferred, expRet) {
+      inferred = expRet
+    }
+  }
+  inferred
+}
+
+// Reports an empty-`[]` lambda result no adoption rung reached, where `inferred` is still
+// a hole against the list `expRet` asks for.
+function inferRetEmptyListFloor(n: FuncDecl, inferred: i32, expRet: i32) {
+  // The loud floor, last rung of this ladder: an empty-`[]` result no arm above adopted
+  // is the absence of a rep, not a narrower version of one — leaving `fnRet` a hole would
+  // cast-trap the value call or disagree with the body's list at emit. Exempt only the
+  // i32-backed elements (`i32`/`boolean`), which share the one i32-list backing with the annotation and so are already correct un-adopted.
+  if inferred != expRet && unresolvedHole(inferred) {
+    const ehT = T.tys[expRet]
+    if ehT is TyArray {
+      if (
+        !tyIsPrimNamed(ehT.aElem, "i32")
+        && !tyIsPrimNamed(ehT.aElem, "boolean")
+      ) {
+        tErrUnsupported(
+          "a lambda returning an empty `[]` cannot build the "
+            + tyToStr(expRet)
+            + " result its annotation asks for — type-valid, but the element type has no"
+            + " rep to build from; return the literal from a named function"
+            + " (`function f(): "
+            + tyToStr(expRet)
+            + " { return [] }`), which lowers this",
+          n.fnBody,
+        )
+      }
+    }
+  }
+}
+
+// Reports a named function's inferred union or nullable return that the emitter cannot
+// lower un-annotated; every shape the emitter registers passes silently.
+function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
   if (
     !inferQuiet
     && n.fnName != ""
@@ -788,18 +712,203 @@ export function finishInferredReturn(
       }
     }
   }
-  // A lambda's join of its enclosing body's type parameters is that body's kept-apart join, so
-  // the lambda's instance and every caller re-join it at the pin alike (D3520, D3521). A call's
-  // join it relays is the callee's, which a gated callee widens.
-  if (
-    n.fnName == ""
-    && tyIsDeferredJoin(inferred)
-    && !(dJoinRelayed.get(inferred) ?? false)
-    && deferredJoinOverOpenParams(inferred)
-  ) {
-    inferred = openParamJoinOf(inferred)
+}
+
+// The emitter-format name an anonymous lambda's union, nullable or list return records
+// under its node sentinel: the first rung of the cascade to answer, "" when none does.
+// Each rung writes `inferRetNameAtoms`/`inferRetNameRung`; the caller clears them first.
+function inferRetCascadeName(
+  inferred: i32,
+  sfbNm: string,
+  smfNm: string,
+  spfNm: string,
+  objRetAdopted: boolean,
+): string {
+  let unm = irRung(IR_RUNG_SFB, sfbNm)
+  if unm == "" { unm = irRung(IR_RUNG_STRUCT_MAP_FIELD, smfNm) }
+  if unm == "" { unm = irRung(IR_RUNG_STRUCT_PLAIN, spfNm) }
+  if unm == "" {
+    unm = irRung(IR_RUNG_VALUE_UNION, valueUnionRetName(inferred))
   }
-  ret = inferred
+  // The litunion-array value-union dual (adopted above): records its alias-preserving
+  // emit name so `collectU` registers the union and `synthRetAnnots`'s `isValueUnionName`
+  // arm pins `fnRet` to it, keying the `$fnsig` result `>u` to match the value call.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_LITUNION_ARR_VU,
+      litUnionArrayValueUnionRetName(inferred),
+    )
+  }
+  if unm == "" {
+    unm = irRung(IR_RUNG_STRUCT_UNION, structUnionRetName(inferred, gRootStmts))
+  }
+  // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
+  // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
+  // independently (the nullable dual of the union pin).
+  if unm == "" {
+    unm = irRung(IR_RUNG_NULLABLE, nullableRetName(inferred, gRootStmts))
+  }
+  // The nullable-litunion contextual return (adopted above): records the alias name so
+  // `synthRetAnnots` pins the lambda's `fnRet` as the nullable litunion (an i32 atom with
+  // `-1` = null), whose member-encoding `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(IR_RUNG_NUL_LITUNION, nulLitUnionRetName(inferred))
+  }
+  // The element-nullable-list contextual return (adopted above): records its emitter
+  // name so `synthRetAnnots` pins the lambda's `fnRet` as the value-union-box list, whose
+  // `[null]` element seeding `emitReturnValue` already performs for the annotated form.
+  if unm == "" { unm = nulElemListRetName(inferred) }
+  // The element-nullable-struct-list contextual return (adopted above): records its
+  // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-struct-element
+  // list, whose kind-1 struct-niche element seeding `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_NUL_STRUCT_ELEM_LIST,
+      nulStructElemListRetName(inferred),
+    )
+  }
+  // The element-nullable-map-list contextual return (adopted above): records its
+  // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-map-element
+  // list, whose kind-3 map-niche element seeding `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(IR_RUNG_NUL_MAP_ELEM_LIST, nulMapElemListRetName(inferred))
+  }
+  // The element-nullable-scalar-list contextual return (adopted above): records its
+  // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-list-element
+  // list, whose inner-wrapper element seeding `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(IR_RUNG_NUL_LIST_ELEM_LIST, nulListElemListRetName(inferred))
+  }
+  // The element-value-union-list contextual return (adopted above): records its emitter
+  // name so `synthRetAnnots` pins `fnRet` as the value-union-box list, whose element
+  // boxing `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(IR_RUNG_ELEM_VU_LIST, elemValueUnionListRetName(inferred))
+  }
+  // The element-variant-box-union-list contextual return (adopted above): records its
+  // emitter name so `synthRetAnnots` pins `fnRet` as the variant-box-element list, whose
+  // element boxing `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_ELEM_VARIANT_BOX_LIST,
+      elemVariantBoxListRetName(inferred),
+    )
+  }
+  // The element-map-union-list contextual return (adopted above): records its emitter
+  // name so `synthRetAnnots` pins `fnRet` as the map-union-box element list, whose
+  // element boxing `emitReturnValue` already performs.
+  if unm == "" {
+    unm = irRung(IR_RUNG_ELEM_MAP_UNION_LIST, elemMapUnionListRetName(inferred))
+  }
+  // The element-refarm-value-union-list contextual return (adopted above): records its
+  // emitter name so `synthRetAnnots` pins `fnRet` as the box-list, whose element boxing
+  // `emitReturnValue` already performs for the annotated form.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_ELEM_REFARM_VU_LIST,
+      elemRefArmValueUnionListRetName(inferred),
+    )
+  }
+  // The nested (2-D+) union-element array contextual return (adopted above): records its
+  // emitter name so `synthRetAnnots` pins `fnRet` as the nested box-element array, whose
+  // return-position threading + `$fnsig` reflist-slot keying already performs.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_NESTED_ELEM_UNION_LIST,
+      nestedElemUnionListRetName(inferred),
+    )
+  }
+  // The union-field-struct-element-list contextual return (adopted above): records its
+  // emitter name so `synthRetAnnots` pins `fnRet` as the boxed-field-element list, whose
+  // element boxing the annotated spelling already performs.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_STRUCT_FIELD_BOX_ELEM_LIST,
+      structFieldBoxElemListRetName(inferred),
+    )
+  }
+  // The plain-struct-element-list return: records its canonical name so
+  // `synthRetAnnots` pins the lambda and the element literals build under the annotated
+  // threading instead of fieldset-matching a wrong same-fieldset twin. Adoption-gated
+  // like the plain-struct record above, since un-gating regressed the closure-value ref-list ABI suite.
+  if unm == "" && objRetAdopted {
+    unm = irRung(IR_RUNG_STRUCT_ELEM_LIST, structElemListRetName(inferred))
+  }
+
+  // The nullable-closure-element-list contextual return (adopted above): records its
+  // emitter name so `synthRetAnnots` pins `fnRet` (`parenUnionArrElemName`), whose kind-5
+  // ref-list slot and `[null]` seeding `emitReturnValue` already threads.
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_NUL_CLOSURE_ELEM_LIST,
+      nulClosureElemListRetName(inferred),
+    )
+  }
+  // The closure-arm value-union contextual return (adopted above): records its emitter
+  // name so `collectU` registers the union and `synthRetAnnots` pins `fnRet` to it; the
+  // `$fnsig` result then keys `>u`, matching the value call.
+  if unm == "" {
+    unm = irRung(IR_RUNG_CLO_ARM_VU, cloArmValueUnionRetName(inferred))
+  }
+  // The map-member-union contextual return (adopted above): records its emitter name so
+  // `synthRetAnnots` pins `fnRet` as the map-union box (#865/#868), whose arm boxing
+  // `emitReturnValue` already performs for the annotated form.
+  if unm == "" { unm = irRung(IR_RUNG_MAP_UNION, mapUnionRetName(inferred)) }
+  // The ref-arm value-union contextual return (adopted above; repOf item (d)): records
+  // its nominal render so `collectU` registers the union and `synthRetAnnots`'s `isUName`
+  // arm pins `fnRet` to the same spelling the emitter's binding resolution uses.
+  if unm == "" {
+    unm = irRung(IR_RUNG_REFARM_UNION, refArmUnionRetName(inferred, gRootStmts))
+  }
+  // The variant-box union contextual return with an inline-struct arm (adopted above):
+  // records its emitter name so `collectU` registers the union and `synthRetAnnots`'s
+  // `isUName` arm pins `fnRet` to it; the `$fnsig` result keys `>u`.
+  if unm == "" {
+    unm = irRung(IR_RUNG_VARIANT_BOX, variantBoxUnionRetName(inferred))
+  }
+  // The nested-list contextual return (adopted above): records its emitter name so
+  // `synthRetAnnots` pins `fnRet` as the nested array, whose return-position threading
+  // and `$fnsig` reflist-slot keying already performs (R4).
+  if unm == "" {
+    unm = irRung(IR_RUNG_NESTED_LEAF_LIST, nestedLeafListRetName(inferred))
+  }
+  // The map-element-list contextual return: records its emitter name so
+  // `synthRetAnnots` pins `fnRet` as the map-element array, whose kind-3 slot keying the
+  // annotated named-function form already performs.
+  if unm == "" {
+    unm = irRung(IR_RUNG_MAP_ELEM_LIST, mapElemListRetName(inferred))
+  }
+  // The litunion-alias-element-list contextual return (adopted above): records the
+  // name so `synthRetAnnots` pins `fnRet` and the body member literals build the i32
+  // atom list the annotated return does.
+  if unm == "" {
+    unm = irRung(IR_RUNG_LITUNION_ELEM_LIST, litUnionElemListRetName(inferred))
+  }
+  // The literal-union contextual return (adopted above): records the alias name so
+  // `synthRetAnnots` pins `fnRet` as the litunion, whose functype result reps as an i32
+  // atom — the `$fnsig` result keys `>i` and `emitReturnValue` encodes the member literal
+  // as its atom id (`retLitUnion`, #1115).
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_LITUNION_ALIAS,
+      irAtoms(litUnionAliasNameOfTy(inferred), 1),
+    )
+  }
+  // A nullable list at an element type the nullable rung does not name (`string[] |
+  // null`): `synthRetAnnots` pins it as `synthNulListRetAnns` pins a named function (D2399).
+  if unm == "" { unm = irRung(IR_RUNG_NUL_LIST_RET, nulListRetName(inferred)) }
+  unm
+}
+
+// Publishes the decided return `inferred`: a named function patches its hoisted `TyFunc`
+// (or declares a nested one), an anonymous lambda records its emit name under `#<fnIx>`.
+function inferRetPublish(
+  n: FuncDecl,
+  fnIx: i32,
+  paramTys: i32[],
+  inferred: i32,
+  objRetAdopted: boolean,
+) {
   // Patches the hoisted `TyFunc` in place so existing references see the result; a nested
   // (un-hoisted) named function declares fresh, and an anonymous lambda just carries its
   // type as the expression value. The parameter-solve probe observes this body and must not
@@ -874,198 +983,7 @@ export function finishInferredReturn(
     // global's lifetime is exactly one cascade run: cleared here, written once, read once.
     irRungClear()
     if !recordable {
-      unm = irRung(IR_RUNG_SFB, sfbNm)
-      if unm == "" { unm = irRung(IR_RUNG_STRUCT_MAP_FIELD, smfNm) }
-      if unm == "" { unm = irRung(IR_RUNG_STRUCT_PLAIN, spfNm) }
-      if unm == "" {
-        unm = irRung(IR_RUNG_VALUE_UNION, valueUnionRetName(inferred))
-      }
-      // The litunion-array value-union dual (adopted above): records its alias-preserving
-      // emit name so `collectU` registers the union and `synthRetAnnots`'s `isValueUnionName`
-      // arm pins `fnRet` to it, keying the `$fnsig` result `>u` to match the value call.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_LITUNION_ARR_VU,
-          litUnionArrayValueUnionRetName(inferred),
-        )
-      }
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_STRUCT_UNION,
-          structUnionRetName(inferred, gRootStmts),
-        )
-      }
-      // A NULLABLE-ref contextual return (`P | null`, `string | null`) — recorded under the same
-      // node sentinel so `synthRetAnnots` pins a nullable-returning closure value position-
-      // independently (the nullable dual of the union pin).
-      if unm == "" {
-        unm = irRung(IR_RUNG_NULLABLE, nullableRetName(inferred, gRootStmts))
-      }
-      // The nullable-litunion contextual return (adopted above): records the alias name so
-      // `synthRetAnnots` pins the lambda's `fnRet` as the nullable litunion (an i32 atom with
-      // `-1` = null), whose member-encoding `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(IR_RUNG_NUL_LITUNION, nulLitUnionRetName(inferred))
-      }
-      // The element-nullable-list contextual return (adopted above): records its emitter
-      // name so `synthRetAnnots` pins the lambda's `fnRet` as the value-union-box list, whose
-      // `[null]` element seeding `emitReturnValue` already performs for the annotated form.
-      if unm == "" { unm = nulElemListRetName(inferred) }
-      // The element-nullable-struct-list contextual return (adopted above): records its
-      // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-struct-element
-      // list, whose kind-1 struct-niche element seeding `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_NUL_STRUCT_ELEM_LIST,
-          nulStructElemListRetName(inferred),
-        )
-      }
-      // The element-nullable-map-list contextual return (adopted above): records its
-      // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-map-element
-      // list, whose kind-3 map-niche element seeding `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(IR_RUNG_NUL_MAP_ELEM_LIST, nulMapElemListRetName(inferred))
-      }
-      // The element-nullable-scalar-list contextual return (adopted above): records its
-      // canonical emit name so `synthRetAnnots` pins `fnRet` as the nullable-list-element
-      // list, whose inner-wrapper element seeding `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_NUL_LIST_ELEM_LIST,
-          nulListElemListRetName(inferred),
-        )
-      }
-      // The element-value-union-list contextual return (adopted above): records its emitter
-      // name so `synthRetAnnots` pins `fnRet` as the value-union-box list, whose element
-      // boxing `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(IR_RUNG_ELEM_VU_LIST, elemValueUnionListRetName(inferred))
-      }
-      // The element-variant-box-union-list contextual return (adopted above): records its
-      // emitter name so `synthRetAnnots` pins `fnRet` as the variant-box-element list, whose
-      // element boxing `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_ELEM_VARIANT_BOX_LIST,
-          elemVariantBoxListRetName(inferred),
-        )
-      }
-      // The element-map-union-list contextual return (adopted above): records its emitter
-      // name so `synthRetAnnots` pins `fnRet` as the map-union-box element list, whose
-      // element boxing `emitReturnValue` already performs.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_ELEM_MAP_UNION_LIST,
-          elemMapUnionListRetName(inferred),
-        )
-      }
-      // The element-refarm-value-union-list contextual return (adopted above): records its
-      // emitter name so `synthRetAnnots` pins `fnRet` as the box-list, whose element boxing
-      // `emitReturnValue` already performs for the annotated form.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_ELEM_REFARM_VU_LIST,
-          elemRefArmValueUnionListRetName(inferred),
-        )
-      }
-      // The nested (2-D+) union-element array contextual return (adopted above): records its
-      // emitter name so `synthRetAnnots` pins `fnRet` as the nested box-element array, whose
-      // return-position threading + `$fnsig` reflist-slot keying already performs.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_NESTED_ELEM_UNION_LIST,
-          nestedElemUnionListRetName(inferred),
-        )
-      }
-      // The union-field-struct-element-list contextual return (adopted above): records its
-      // emitter name so `synthRetAnnots` pins `fnRet` as the boxed-field-element list, whose
-      // element boxing the annotated spelling already performs.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_STRUCT_FIELD_BOX_ELEM_LIST,
-          structFieldBoxElemListRetName(inferred),
-        )
-      }
-      // The plain-struct-element-list return: records its canonical name so
-      // `synthRetAnnots` pins the lambda and the element literals build under the annotated
-      // threading instead of fieldset-matching a wrong same-fieldset twin. Adoption-gated
-      // like the plain-struct record above, since un-gating regressed the closure-value ref-list ABI suite.
-      if unm == "" && objRetAdopted {
-        unm = irRung(IR_RUNG_STRUCT_ELEM_LIST, structElemListRetName(inferred))
-      }
-
-      // The nullable-closure-element-list contextual return (adopted above): records its
-      // emitter name so `synthRetAnnots` pins `fnRet` (`parenUnionArrElemName`), whose kind-5
-      // ref-list slot and `[null]` seeding `emitReturnValue` already threads.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_NUL_CLOSURE_ELEM_LIST,
-          nulClosureElemListRetName(inferred),
-        )
-      }
-      // The closure-arm value-union contextual return (adopted above): records its emitter
-      // name so `collectU` registers the union and `synthRetAnnots` pins `fnRet` to it; the
-      // `$fnsig` result then keys `>u`, matching the value call.
-      if unm == "" {
-        unm = irRung(IR_RUNG_CLO_ARM_VU, cloArmValueUnionRetName(inferred))
-      }
-      // The map-member-union contextual return (adopted above): records its emitter name so
-      // `synthRetAnnots` pins `fnRet` as the map-union box (#865/#868), whose arm boxing
-      // `emitReturnValue` already performs for the annotated form.
-      if unm == "" {
-        unm = irRung(IR_RUNG_MAP_UNION, mapUnionRetName(inferred))
-      }
-      // The ref-arm value-union contextual return (adopted above; repOf item (d)): records
-      // its nominal render so `collectU` registers the union and `synthRetAnnots`'s `isUName`
-      // arm pins `fnRet` to the same spelling the emitter's binding resolution uses.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_REFARM_UNION,
-          refArmUnionRetName(inferred, gRootStmts),
-        )
-      }
-      // The variant-box union contextual return with an inline-struct arm (adopted above):
-      // records its emitter name so `collectU` registers the union and `synthRetAnnots`'s
-      // `isUName` arm pins `fnRet` to it; the `$fnsig` result keys `>u`.
-      if unm == "" {
-        unm = irRung(IR_RUNG_VARIANT_BOX, variantBoxUnionRetName(inferred))
-      }
-      // The nested-list contextual return (adopted above): records its emitter name so
-      // `synthRetAnnots` pins `fnRet` as the nested array, whose return-position threading
-      // and `$fnsig` reflist-slot keying already performs (R4).
-      if unm == "" {
-        unm = irRung(IR_RUNG_NESTED_LEAF_LIST, nestedLeafListRetName(inferred))
-      }
-      // The map-element-list contextual return: records its emitter name so
-      // `synthRetAnnots` pins `fnRet` as the map-element array, whose kind-3 slot keying the
-      // annotated named-function form already performs.
-      if unm == "" {
-        unm = irRung(IR_RUNG_MAP_ELEM_LIST, mapElemListRetName(inferred))
-      }
-      // The litunion-alias-element-list contextual return (adopted above): records the
-      // name so `synthRetAnnots` pins `fnRet` and the body member literals build the i32
-      // atom list the annotated return does.
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_LITUNION_ELEM_LIST,
-          litUnionElemListRetName(inferred),
-        )
-      }
-      // The literal-union contextual return (adopted above): records the alias name so
-      // `synthRetAnnots` pins `fnRet` as the litunion, whose functype result reps as an i32
-      // atom — the `$fnsig` result keys `>i` and `emitReturnValue` encodes the member literal
-      // as its atom id (`retLitUnion`, #1115).
-      if unm == "" {
-        unm = irRung(
-          IR_RUNG_LITUNION_ALIAS,
-          irAtoms(litUnionAliasNameOfTy(inferred), 1),
-        )
-      }
-      // A nullable list at an element type the nullable rung does not name (`string[] |
-      // null`): `synthRetAnnots` pins it as `synthNulListRetAnns` pins a named function (D2399).
-      if unm == "" {
-        unm = irRung(IR_RUNG_NUL_LIST_RET, nulListRetName(inferred))
-      }
+      unm = inferRetCascadeName(inferred, sfbNm, smfNm, spfNm, objRetAdopted)
     }
     // The width of the name this ladder settled on, handed over by the producer that
     // joined it rather than re-derived by splitting it (#1115). The rungs short-circuit, so
@@ -1092,6 +1010,125 @@ export function finishInferredReturn(
       }
     }
   }
+}
+
+// The un-annotated return, decided after the body is checked and its scope popped: the
+// observed returns join into one type, a contextual expected return may adopt it, and the
+// hoisted `TyFunc` is patched so existing references see the result. Restores the
+// inference accumulators its caller saved, and hands back the return type to finalize.
+export function finishInferredReturn(
+  n: FuncDecl,
+  fnIx: i32,
+  paramTys: i32[],
+  causeReported: boolean,
+  cbBefore: i32,
+  savedObserved: i32,
+  savedSawErr: boolean,
+  savedValueRet: boolean,
+  bodyTotalForRet: boolean,
+): i32 {
+  let ret = -2
+  inferStack.pop()
+  let inferred = TY_VOID
+  // Set when the object-shaped contextual adoption fires (`objRetWidenAdopt` below):
+  // gates the plain-struct canonical record — a lambda whose self-inference already
+  // matches its context keeps the established un-pinned route (pinning every
+  // plain-struct lambda regresses `.map`-collapse / factory / generic-HOF cases).
+  let objRetAdopted = false
+  const sawCycle = cycleBreakCount > cbBefore
+  if inferObserved >= 0 {
+    inferred = inferObserved
+    noteRetJoinValues(inferred, n.fnBody)
+  } else if sawCycle && fnSawValueRet {
+    // A value return position resolved to `void` only because a recursive-cycle member
+    // is still pending: defer, so the binding-group fixpoint re-infers this once the
+    // cycle's resolvable members settle. Genuine void recursion has no value return
+    // position (`fnSawValueRet` is false), so it is never deferred this way.
+    if !strListHas(inferTentative, n.fnName) { inferTentative.push(n.fnName) }
+    inferred = TY_VOID
+  } else if inferSawErr {
+    // Only err-ish types flowed back: no basis. An uninferable param or a bare `{}` in the
+    // body already reported the root cause, so suppress the redundant message.
+    if !causeReported { inferNoBasisErr(n.fnName, fnIx, n.fnBody) }
+    inferred = TY_ERR
+  }
+  // Contextual return adoption: an anonymous lambda whose body infers a narrower numeric
+  // than the contextual expected return takes the expected return as its own, so the
+  // widening lands at the lambda's return seam (`emitReturnValue`). Numeric widening through
+  // function-type variance is rejected instead (`fnSlotAssignable`), since a function value's rep is fixed.
+  if n.fnName == "" && inferred >= 0 {
+    // A contextual adoption below means the seed changed what this lambda infers, so an
+    // annotation that supplied it is load-bearing and cannot be judged redundant by
+    // comparing the two (D1442). Snapshot/compare rather than marking each arm, since there are twenty of them and a new one must not have to remember.
+    const preAdopt = inferred
+    const expRet = cbExpectedRetFor(fnIx)
+    if expRet >= 0 {
+      if numWidens(inferred, expRet) { inferred = expRet }
+      // The f32 dual of the numeric widen: a literal-bodied lambda whose contextual return
+      // is f32 infers f64/i32 by default, but the literal re-encodes exactly at f32 — the
+      // same grant a direct `const v: f32 = 5.5` binding makes. Adopts f32 so the functype
+      // result is f32 and `emitReturnValue` encodes the literal at f32 in the body.
+      if inferred != expRet && primNameOf(expRet) == "f32" {
+        if isF32AdoptingLitExpr(lambdaBodyTail(n.fnBody)) { inferred = expRet }
+      }
+      // Object-shaped dual: `() => ({f: 5})` against `() => {f: i64}` — adopt the
+      // expected shape when every widening field is a re-encodable literal
+      // (`objRetWidenAdopt` also records the field types for the emitter's interner).
+      if objRetWidenAdopt(n.fnBody, inferred, expRet) {
+        inferred = expRet
+        objRetAdopted = true
+      }
+      inferred = inferRetAdoptNiche(n, inferred, expRet)
+      inferred = inferRetAdoptBoxed(n, inferred, expRet)
+      // The struct-element-list result: a lambda body array literal's element structs
+      // coerce field-wise into the expected shape and adopt it — `assignableExpr`'s
+      // per-element `ObjLit` coercion records the coerced field types for the emitter's
+      // interner. Gated on plainly-lowerable element fields, so a map/union/nullable field stays a loud reject.
+      if inferred != expRet && structElemListRetName(expRet) != "" {
+        const seTail = lambdaBodyTail(n.fnBody)
+        if seTail >= 0 && assignableExpr(seTail, inferred, expRet) {
+          inferred = expRet
+          objRetAdopted = true
+        }
+      }
+      inferRetEmptyListFloor(n, inferred, expRet)
+    }
+    if inferred != preAdopt { cbSeedUsedSet(cbSeedUsed + 1) }
+  }
+  // A `const` literal returned is the `string` it is stored as, so a join with `null`, a number
+  // or a record meets the return floors below exactly as that string does (D2157).
+  inferred = widenLitTy(inferred)
+  // Permissive fall-through (totality): an un-annotated function that can fall off the end
+  // implicitly yields `null` there, so its inferred return widens to `T | null`. A box-able
+  // value type lowers un-annotated via the `uBoxIdx` box; a niche (`boolean`/`string`) widens
+  // too but stays floored below until A20 carries the niche seed. A void/error return is exempt.
+  if (
+    !bodyTotalForRet
+    && inferred >= 0
+    && !isVoidTy(inferred)
+    && inferred != TY_ERR
+  ) {
+    const inT = T.tys[inferred]
+    if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
+  }
+  // Robustness floor: an un-annotated function whose returns join to a union/nullable now
+  // infers the correct type, but must still be annotated when the emitter cannot yet lower
+  // it un-annotated — a value union/nullable already lowers via the `uBoxIdx` box and does
+  // not floor; a deferred join (a per-call-site placeholder) is not a shape to floor either, since it collapses to one arm at each call site.
+  inferRetFloorUnsupported(n, inferred)
+  // A lambda's join of its enclosing body's type parameters is that body's kept-apart join, so
+  // the lambda's instance and every caller re-join it at the pin alike (D3520, D3521). A call's
+  // join it relays is the callee's, which a gated callee widens.
+  if (
+    n.fnName == ""
+    && tyIsDeferredJoin(inferred)
+    && !(dJoinRelayed.get(inferred) ?? false)
+    && deferredJoinOverOpenParams(inferred)
+  ) {
+    inferred = openParamJoinOf(inferred)
+  }
+  ret = inferred
+  inferRetPublish(n, fnIx, paramTys, inferred, objRetAdopted)
   inferObservedSet(savedObserved)
   inferSawErrSet(savedSawErr)
   fnSawValueRetSet(savedValueRet)

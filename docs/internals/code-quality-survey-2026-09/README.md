@@ -258,14 +258,17 @@ Measure:
     tol: 4
     dir: at-least
 
-### row 15 — the two largest checker functions
+### row 15 — the longest checker function
+
+The longest top-level function body, in lines, over every checker module. It used to time the
+17-line `checkFuncDeclNode` wrapper, which no split could move.
 
 Measure:
 
     kind: shell
-    cmd: cat compiler/typecheck.vl compiler/check_*.vl | awk '/^(export )?function checkFuncDeclNode\(/{f=1} f{n++} f&&/^\}/{print n; exit}'
-    filed: 549
-    tol: 60
+    cmd: awk 'FNR==1{f=0} /^(export )?function /{f=1;n=0} f{n++} f&&/^\}/{if(n>m)m=n; f=0} END{print m}' compiler/typecheck.vl compiler/check_*.vl
+    filed: 293
+    tol: 25
     dir: at-most
 
 ### row 16 — one nominal/emit name renderer

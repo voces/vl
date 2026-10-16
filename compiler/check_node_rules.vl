@@ -1211,71 +1211,15 @@ function checkIfTail(
   // Guard clause: a then that always exits applies the false narrowings to the rest of the
   // block. Subtractions accumulate over a sequence of guards; restricted to bare names only.
   if thenExits {
-    let gi2 = 0
-    while gi2 < enNames.length {
-      const gKey = enNames[gi2]
-      const gTy = enTys[gi2]
-      // From the arms on, not the condition: a write in the condition that follows a fact's
-      // test already dropped that fact (D2589), and one before it is what the test tested.
-      if narClobberedSince(thenLo, gKey) {
-        // An arm on the fall-through path wrote a different member into `gKey`, so the
-        // residual would describe a value the place does not hold. Both halves drop it: the
-        // emitter reads `pgResidualVoidOf` at the same node (D1736).
-        recordPgResidualVoid(ix)
-      } else if isPathKey(gKey) {
-        // Paths keep the no-`else` gate, and an else arm never hands one up either — an
-        // `npKeys` entry is retired in place by a call/write inside the arm.
-        if !daHasElse && !isElseArm {
-          npKeysPush(gKey)
-          npTysPush(gTy)
-          npInvByPush(-1)
-          npEpochsPush(narFnEpoch)
-          npSettlePush(-2)
-          npCapByPush(-1)
-          npAsgPush(0)
-        }
-      } else if isElseArm {
-        pgUpKeys.push(gKey)
-        pgUpTys.push(gTy)
-      } else {
-        // Banks what the place held before this subtraction, for the exhaustiveness check
-        // after a trailing chain — the one line that makes `lookup` stop answering that question.
-        if pgPreIx != ix {
-          pgPreIxSet(ix)
-          pgPreKeysSet([])
-          pgPreTysSet([])
-        }
-        pgPreKeys.push(gKey)
-        pgPreTys.push(lookup(gKey))
-        // ...and bank the shadowed declaration under the post-guard kind, so a consumer
-        // needing the emitter's union can find it (D1035) — idempotent, banking the widest first.
-        const gDecl = lookup(gKey)
-        noteNarShadow(gKey, gDecl, NAR_KIND_POSTGUARD)
-        // One leg for both kinds: a null strip and a union subtraction are the same shadowing
-        // `declare` — split only so the strip could skip the subtraction bank, now gone.
-        declare(gKey, gTy)
-        if gDecl >= 0 && gDecl != gTy { narFitCompanions(gKey, gDecl, gTy) }
-      }
-      gi2 = gi2 + 1
-    }
-    // The chain below this `if`, banked by every `else if` arm whose own then diverged —
-    // applied in reverse push order, since the deepest arm's residual must win.
-    if !isElseArm {
-      let pu = pgUpKeys.length
-      while pu > pgUpMark {
-        pu = pu - 1
-        if narClobberedSince(thenLo, pgUpKeys[pu]) {
-          recordPgResidualVoid(ix)
-        } else {
-          const upDecl = lookup(pgUpKeys[pu])
-          noteNarShadow(pgUpKeys[pu], upDecl, NAR_KIND_POSTGUARD)
-          declare(pgUpKeys[pu], pgUpTys[pu])
-          if upDecl >= 0 && upDecl != pgUpTys[pu] {
-            narFitCompanions(pgUpKeys[pu], upDecl, pgUpTys[pu])
-          }
-        }
-      }
-    }
+    ifTailApplyGuards(
+      ix,
+      enNames,
+      enTys,
+      thenLo,
+      daHasElse,
+      isElseArm,
+      pgUpMark,
+    )
   }
   // Retires this subtree's hand-ups, unless THIS `if` is a chain link whose then diverged —
   // then its entry rides up to the parent, which asks the same question.
@@ -1363,64 +1307,169 @@ function checkIfTail(
   // values.
   if f32Join >= 0 { return f32Join }
   if daHasElse {
-    let thenPlain = thenTy
-    let elsePlain = elseTy
-    if !f32Keep {
-      thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
-      elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
-    }
-    // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
-    // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
-    let plainJoin = joinArmLit(
-      thenPlain,
-      armLit(thenPlain, n.ifThen),
-      elsePlain,
-      armLit(elsePlain, n.ifElse),
+    return ifTailElseJoin(
+      n,
+      ix,
+      thenTy,
+      elseTy,
+      thenExits,
+      daElseDiverges,
+      elseIsLink,
+      f32Keep,
+      ifTail,
     )
-    // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
-    if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
-      if atValueArmTail(ix) { refuseNestedExitFirst(ix, elsePlain) }
-      plainJoin = elsePlain
-      if !ifChainOnFnTail {
-        noteExitArm(n.ifThen)
-        noteExitFirst(ix)
-      }
-    }
-    const elseBlk = n.ifElse >= 0 && P.nodes[n.ifElse] is Block
-    if daElseDiverges && !thenExits && elseBlk {
-      plainJoin = thenPlain
-      if !ifChainOnFnTail { noteExitArm(n.ifElse) }
-    }
-    if !f32Keep { f32JoinRevert(ix) }
-    // A string literal arm joins to `string`; beside an arm whose type holds that literal it
-    // takes that type instead, and a destination that holds each arm's value types the `if`, so
-    // `if ok { a.look } else { "none" }` is a `Look` (DV-1207).
-    if !thenExits && !daElseDiverges {
-      const lj = litJoinOf(
-        ix,
-        plainJoin,
-        [n.ifThen, n.ifElse],
-        [thenPlain, elsePlain],
-      )
-      if lj >= 0 { plainJoin = lj }
-    }
-    if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
-      let elseApart = elsePlain
-      if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
-      noteTpIfJoin(
-        ix,
-        thenPlain,
-        elseApart,
-        plainJoin,
-        ifTail || tpIfOkAt.has(ix),
-      )
-    }
-    return plainJoin
   }
   // An else-less `if` used as a value is `T | null` in every position — the false fall-through
   // yields `null`. One rule asked once, replacing the old per-position gates (DECISIONS.md).
   if thenTy != TY_VOID && thenTy != TY_ERR { return mkNullableTy(thenTy) }
   return TY_VOID
+}
+
+// The guard clause of `checkIfTail` at `if` node `ix`, whose then always exits: the false
+// narrowings `enNames`/`enTys` apply to the rest of the block, a chain link hands its own up,
+// and the hand-ups banked above `pgUpMark` apply in reverse. Answers nothing.
+function ifTailApplyGuards(
+  ix: i32,
+  enNames: string[],
+  enTys: i32[],
+  thenLo: i32,
+  daHasElse: boolean,
+  isElseArm: boolean,
+  pgUpMark: i32,
+) {
+  let gi2 = 0
+  while gi2 < enNames.length {
+    const gKey = enNames[gi2]
+    const gTy = enTys[gi2]
+    // From the arms on, not the condition: a write in the condition that follows a fact's
+    // test already dropped that fact (D2589), and one before it is what the test tested.
+    if narClobberedSince(thenLo, gKey) {
+      // An arm on the fall-through path wrote a different member into `gKey`, so the
+      // residual would describe a value the place does not hold. Both halves drop it: the
+      // emitter reads `pgResidualVoidOf` at the same node (D1736).
+      recordPgResidualVoid(ix)
+    } else if isPathKey(gKey) {
+      // Paths keep the no-`else` gate, and an else arm never hands one up either — an
+      // `npKeys` entry is retired in place by a call/write inside the arm.
+      if !daHasElse && !isElseArm {
+        npKeysPush(gKey)
+        npTysPush(gTy)
+        npInvByPush(-1)
+        npEpochsPush(narFnEpoch)
+        npSettlePush(-2)
+        npCapByPush(-1)
+        npAsgPush(0)
+      }
+    } else if isElseArm {
+      pgUpKeys.push(gKey)
+      pgUpTys.push(gTy)
+    } else {
+      // Banks what the place held before this subtraction, for the exhaustiveness check
+      // after a trailing chain — the one line that makes `lookup` stop answering that question.
+      if pgPreIx != ix {
+        pgPreIxSet(ix)
+        pgPreKeysSet([])
+        pgPreTysSet([])
+      }
+      pgPreKeys.push(gKey)
+      pgPreTys.push(lookup(gKey))
+      // ...and bank the shadowed declaration under the post-guard kind, so a consumer
+      // needing the emitter's union can find it (D1035) — idempotent, banking the widest first.
+      const gDecl = lookup(gKey)
+      noteNarShadow(gKey, gDecl, NAR_KIND_POSTGUARD)
+      // One leg for both kinds: a null strip and a union subtraction are the same shadowing
+      // `declare` — split only so the strip could skip the subtraction bank, now gone.
+      declare(gKey, gTy)
+      if gDecl >= 0 && gDecl != gTy { narFitCompanions(gKey, gDecl, gTy) }
+    }
+    gi2 = gi2 + 1
+  }
+  // The chain below this `if`, banked by every `else if` arm whose own then diverged —
+  // applied in reverse push order, since the deepest arm's residual must win.
+  if !isElseArm {
+    let pu = pgUpKeys.length
+    while pu > pgUpMark {
+      pu = pu - 1
+      if narClobberedSince(thenLo, pgUpKeys[pu]) {
+        recordPgResidualVoid(ix)
+      } else {
+        const upDecl = lookup(pgUpKeys[pu])
+        noteNarShadow(pgUpKeys[pu], upDecl, NAR_KIND_POSTGUARD)
+        declare(pgUpKeys[pu], pgUpTys[pu])
+        if upDecl >= 0 && upDecl != pgUpTys[pu] {
+          narFitCompanions(pgUpKeys[pu], upDecl, pgUpTys[pu])
+        }
+      }
+    }
+  }
+}
+
+// The value type of `checkIfTail`'s `if` node `ix` with an `else`: the join of the two arm
+// tails, an exiting arm handing none; `f32Keep` keeps an arm an inner join typed `f32`.
+function ifTailElseJoin(
+  n: IfStmt,
+  ix: i32,
+  thenTy: i32,
+  elseTy: i32,
+  thenExits: boolean,
+  daElseDiverges: boolean,
+  elseIsLink: boolean,
+  f32Keep: boolean,
+  ifTail: boolean,
+): i32 {
+  let thenPlain = thenTy
+  let elsePlain = elseTy
+  if !f32Keep {
+    thenPlain = f32ArmPlainTy(n.ifThen, thenTy)
+    elsePlain = f32ArmPlainTy(n.ifElse, elseTy)
+  }
+  // An arm block that always exits (`return`, `break`, `continue`) hands no value to the
+  // join; the emitter ends it with a `never` value (`exitArmBlockAt`) so every rep lowers it.
+  let plainJoin = joinArmLit(
+    thenPlain,
+    armLit(thenPlain, n.ifThen),
+    elsePlain,
+    armLit(elsePlain, n.ifElse),
+  )
+  // A function's tail `if` already lowers an exiting arm as a return, so it needs no tail.
+  if thenExits && !daElseDiverges && P.nodes[n.ifThen] is Block {
+    if atValueArmTail(ix) { refuseNestedExitFirst(ix, elsePlain) }
+    plainJoin = elsePlain
+    if !ifChainOnFnTail {
+      noteExitArm(n.ifThen)
+      noteExitFirst(ix)
+    }
+  }
+  const elseBlk = n.ifElse >= 0 && P.nodes[n.ifElse] is Block
+  if daElseDiverges && !thenExits && elseBlk {
+    plainJoin = thenPlain
+    if !ifChainOnFnTail { noteExitArm(n.ifElse) }
+  }
+  if !f32Keep { f32JoinRevert(ix) }
+  // A string literal arm joins to `string`; beside an arm whose type holds that literal it
+  // takes that type instead, and a destination that holds each arm's value types the `if`, so
+  // `if ok { a.look } else { "none" }` is a `Look` (DV-1207).
+  if !thenExits && !daElseDiverges {
+    const lj = litJoinOf(
+      ix,
+      plainJoin,
+      [n.ifThen, n.ifElse],
+      [thenPlain, elsePlain],
+    )
+    if lj >= 0 { plainJoin = lj }
+  }
+  if tpEnvNames.length > 0 && !thenExits && !daElseDiverges {
+    let elseApart = elsePlain
+    if elseIsLink { elseApart = tpIfJoinAt.get(n.ifElse) ?? elsePlain }
+    noteTpIfJoin(
+      ix,
+      thenPlain,
+      elseApart,
+      plainJoin,
+      ifTail || tpIfOkAt.has(ix),
+    )
+  }
+  return plainJoin
 }
 // ── explicit numeric cast `x as T` ──────────────────────────────────────────
 
