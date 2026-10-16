@@ -1,0 +1,3483 @@
+// The demands a call or a hole leaves for later: argument and member constraint validation
+// (`validate*`), hole pins and their defaults (`hole*`, `cnh*`), receiver-call (`ufcs*`) and
+// overload resolution, cast pins, bare-brace delivery and the inferred-return notes. Each
+// reads what the core checker recorded and reports through the relation core.
+
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  MC_RUNG_BUILTIN,
+  MC_RUNG_FIELD,
+  MatchExpr,
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  ObjLit,
+  P,
+  Param,
+  Paren,
+  TypeRef,
+  adoptNodeTok,
+  arenaNoteEdit,
+  arenaReplaceNode,
+  declHasExportKw,
+  fillArgDefaults,
+  fnRequiredArity,
+  hasNamedArgs,
+  i32ToStr,
+  markCallRestPacked,
+  mkArrayLit,
+  mkParen,
+  opDeclLabel,
+  orderArgsByParamNames,
+  ovCandText,
+  ovFnHead,
+  ovInstPick,
+  ovInstRecv,
+  ovInstSite,
+  ovSetCands,
+  ovSiteSetOf,
+  restParamIndex,
+  stmtBraceNodes,
+  stmtBraceTails,
+  ufcsImpMangled,
+  ufcsImpName,
+  ufcsImpSpec,
+} from "./ast"
+import { resolveAnnot, resolveHoleLinks } from "./check_annot_resolve"
+import {
+  bareBraceHoleDst,
+  bareBraceMembers,
+  bareBraceRecordOf,
+  bareBraceRequiredMsg,
+} from "./check_bare_brace"
+import {
+  builtinMethodNote,
+  builtinSigOf,
+  memberRungOnTy,
+} from "./check_builtin_methods"
+import {
+  opIdxBank,
+  ufcsMissSpecsAt,
+  ufcsUnpinnedSites,
+  ufcsWhyData,
+  ufcsWhyMsg,
+  ufcsWhyRow,
+} from "./check_call_resolve"
+import {
+  builtinMethodClaims,
+  mapMethodNames,
+  opIdxDeclared,
+  opIdxFns,
+  opIdxOps,
+} from "./check_callee"
+import {
+  crAliasNestDepths,
+  crAliasNestSlots,
+  crFnBases,
+  crNestCallRet,
+  crOpCall,
+} from "./check_capture_rows"
+import { numCastDomainName } from "./check_cast_bound"
+import {
+  castClobbered,
+  holeCastArgExp,
+  holeCastArgExpPush,
+  holeCastArgIx,
+  holeCastArgIxPush,
+  holeCastArgN,
+  holeCastArgNPush,
+  holeCastIx,
+  holeCastIxPush,
+  holeCastMode,
+  holeCastModePush,
+  holeCastRet,
+  holeCastRetPush,
+  holeCastTgtName,
+  holeCastTgtNamePush,
+  holeCastTgtTy,
+  holeCastTgtTyPush,
+  holeCastVar,
+  holeCastVarPush,
+} from "./check_coal"
+import {
+  bareBraceCount,
+  bareBraceCountSet,
+  bareBraceLits,
+  bareBraceMark,
+  bareBraceSpec,
+  bareBraceSpecSet,
+  callSiteOpenListRows,
+  checkerForceFn,
+  cnhAts,
+  cnhDemand,
+  cnhIsOpen,
+  cnhIsVal,
+  cnhNames,
+  cnhTys,
+  cstrProbe,
+  inferVoidRetBlks,
+  inferVoidRetSites,
+  retNatural,
+  retNaturalErrSet,
+  retNaturalSet,
+  voidRetRwBlk,
+  voidRetRwRet,
+} from "./check_core_state"
+import {
+  rcwPinDstTy,
+  rcwPinFn,
+  rcwPinNote,
+  rcwPinSrc,
+  rcwPinSrcTy,
+} from "./check_covar_pins"
+import { covarWriteThrough } from "./check_covar_write"
+import {
+  CV_BIN,
+  CV_MEM,
+  CV_PRINT,
+  CV_UFCS,
+  argCstr,
+  binCstr,
+  bmCstr,
+  cstrOwnerTop,
+  cvNow,
+  cvPick,
+  isCstr,
+  letCstr,
+  memCstr,
+  nestCstr,
+  noteArgCstr,
+  noteBinCstr,
+  noteIsCstr,
+  noteMemCstr,
+  noteNestCstr,
+  notePrintCstr,
+  printCstr,
+  ufcsCstr,
+} from "./check_cstr_rows"
+import { curFnDeclIx, inferQuiet, njFnStack } from "./check_cursor"
+import {
+  boundObjRootOf,
+  callKillSure,
+  localNomEscapeAt,
+  stdRecvLeafTy,
+} from "./check_decl_scan"
+import {
+  asPinRefusal,
+  printRefRefusal,
+  stdFmtMovedNote,
+  unkeyedSubscriptNote,
+} from "./check_diag_text"
+import {
+  boundMembersOf,
+  constrainEmptyExpr,
+  covarWriteThroughErrAt,
+  objShapeAdapterlessAt,
+  objShapeAdapterlessErr,
+  rcwPend,
+  recordRepTyAdopt,
+  sharedUnionFieldTy,
+  tpMemberFloorMsg,
+} from "./check_fit_rules"
+import { argIsOwnGenericFnValue } from "./check_generic_args"
+import { getterDemandNote } from "./check_getter_effects"
+import { getterNarrowNote } from "./check_getter_walk"
+import { arrDefRowServed, holeCastNames } from "./check_hole_links"
+import { HD_ELEM, hdBase, hdKind, hdRowOf } from "./check_hole_pins"
+import {
+  calleeWriteAt,
+  calleeWriteGot,
+  calleeWriteRow,
+  coalHoleFn,
+  coalHoleTy,
+  holeAltNames,
+  holeAltResidualTy,
+  holeAltTys,
+  holeDemandStr,
+  holeDemandTy,
+  holeHasIsAlt,
+  holeMapOf,
+  holeShapeOf,
+} from "./check_hole_rows"
+import { onInferStack } from "./check_infer_rows"
+import {
+  jsonExactMemberOf,
+  jsonSelfRef,
+  jsonShapeBad,
+  jsonUnionMembers,
+  jsonUnionRootIn,
+} from "./check_json_shape"
+import {
+  ACF_INDEX,
+  ACF_TPL,
+  AS_WRAP_BOOL_MSG,
+  BOUND_UNRESOLVED,
+  MC_METHOD_MARK,
+  OP_AS,
+  OP_BNOT,
+  OP_CALL_GUARDED_PIN,
+  OP_CALL_PIN,
+  OP_LITFIT,
+  OP_NEG,
+  callFloorMsg,
+  castConstModeTail,
+  castConstSettle,
+  castOperandIdent,
+  castPinNullResult,
+  castWrapNote,
+  cstrArgCountOf,
+  cstrArgNoOf,
+  cstrArgNodeOf,
+  holeArgNodeOf,
+  holeMapDemandOpen,
+  irhConcrete,
+  irhExprs,
+  irhMarks,
+  irhTys,
+  jsonSpellHas,
+  jwBadMsgSet,
+  lengthSpellNote,
+  listLitFresh,
+  namedOrderSlotOwner,
+  noteKillSure,
+  noteUfcsCstr,
+  noteUfcsWhy,
+  printUnionRefusal,
+  softenBareLitTy,
+  stdRecvIsList,
+  stdRecvSplit,
+  tyIsGradualUnion,
+  unresolvedHole,
+  v128NestMsg,
+} from "./check_leaf_steps"
+import {
+  monoRecheckDepth,
+  monoRecheckDepthSet,
+  tpIfCmpOn,
+  tpRetJoinFixed,
+  tpRetJoinTys,
+} from "./check_list_union"
+import {
+  CODE_NAMED_ARG_OUT_OF_POSITION,
+  CODE_REDUNDANT_CAST,
+  CODE_UFCS_NOT_IMPORTED,
+  CODE_UFCS_NOT_METHOD,
+} from "./check_messages"
+import { boolForNumberNote } from "./check_mismatch_notes"
+import { neKeys, neKill } from "./check_narrow_ends"
+import {
+  callMayWrite,
+  crCapRecCheck,
+  crCaptureCallCheck,
+  crLoopReadCheck,
+  crNoteCallBare,
+  crPathCallRetire,
+  narrowedPathTy,
+  popScope,
+} from "./check_narrow_flow"
+import {
+  MC_NULL_READ_MARK,
+  crFnLeave,
+  crFnNpBase,
+  narClobBindPush,
+  narClobDeclPush,
+  narClobDepthsPush,
+  narClobKeysPush,
+  narClobPrevPush,
+  narClobRetiredPush,
+  narClobTysPush,
+  narFitRetire,
+  narSetInv,
+  nfSlots,
+  npInvBy,
+  npKeys,
+  npTys,
+} from "./check_narrow_paths"
+import { a20RetWalk } from "./check_nj_gate"
+import { collectRetValues, njFnIxSet } from "./check_nj_join"
+import { retValuesCover } from "./check_node_rules"
+import { nodeTyIx, nodeTyIxOf, nodeTyRecord, nodeTySet } from "./check_node_tys"
+import { cexEvalAt, cexTreeShape } from "./check_num_lit_state"
+import {
+  castConstMisfit,
+  numCastCanFail,
+  numUnionAsConverts,
+} from "./check_num_lits"
+import {
+  callArgNameAt,
+  declParamsAfterSelf,
+  diagDataField,
+  namedOrderFixData,
+  ovRecvHeads,
+  ovRefuseMsg,
+  paramIndexOfName,
+  ufcsImportAliasAt,
+  ufcsNotImportedData,
+  ufcsNotImportedMsg,
+  ufcsNotMethodData,
+  ufcsNotMethodMsg,
+  ufcsRecvExpr,
+  ufcsRegistryHas,
+  ufcsSiteFn,
+} from "./check_overload"
+import { keyHasPrefix, parenPeelIx, placeKeyOf } from "./check_places"
+import { recOwnPend, recPend } from "./check_rec_rows"
+import {
+  argMismatchErr,
+  assignable,
+  binOpDefinedFor,
+  bindGenWalk,
+  cnhFill,
+  constrainEmpty,
+  eqLitMemberOk,
+  eqLitNonMember,
+  genFnHoleInstance,
+  joinTys,
+  substHoleTy,
+  substTyDeep,
+  subtractTy,
+  tErr,
+  tErrCodedData,
+  tErrUnsupported,
+  widenLitTy,
+} from "./check_relate_core"
+import {
+  MonoSave,
+  RB_MONO,
+  checkRollback,
+  prbArmed,
+  prbLeave,
+} from "./check_rollback"
+import { lookup, mergedDeclKeyOf } from "./check_scopes"
+import { jwRecordSite, noteRetJoin } from "./check_side_rows"
+import { symEnabled } from "./check_state"
+import {
+  SUBST_HOLES,
+  SUBST_NESTED,
+  cstrOwnedBy,
+  curFnEscName,
+  nestCstrOutside,
+  substNestMode,
+  tpDemandTy,
+} from "./check_subst"
+import {
+  demangleName,
+  listMethodNames,
+  listMethodSpellFrom,
+  listMethodSpellTo,
+  mapMethodSpellFrom,
+  mapMethodSpellTo,
+  strMethodNames,
+  strMethodSpellFrom,
+  strMethodSpellTo,
+  tyEditDist,
+  tyFoldedEq,
+  tySuggestBudget,
+} from "./check_suggest"
+import { tpBoundOfName } from "./check_tp_bound"
+import {
+  escJoinFn,
+  escJoinIx,
+  escJoinTy,
+  escJoinWho,
+  tpGradualView,
+  tpJoinUnions,
+  tyIsDeferredJoin,
+} from "./check_tp_join"
+import { eqRefusals, isWidenNotVariant } from "./check_ty_relate"
+import { nomErasedTyIx, tyBoxesV128 } from "./check_ty_rep"
+import { fieldSigOf, jsonReceiverDeclTy } from "./check_type_shape"
+import {
+  T,
+  TY_ERR,
+  TY_I32,
+  TY_I64,
+  TY_NEVER,
+  TY_NULL,
+  TY_U8,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  mkMapTy,
+  mkNullableTy,
+  objFieldType,
+  primNameStr,
+  softenLitTy,
+  tyBuiltinIndexable,
+  tyEq,
+  tyHasHole,
+  tyIsHole,
+  tyIsLitUnion,
+  tyMentionsErr,
+  tyMentionsTyVarNamed,
+  tyMutEpoch,
+  tyPrintsAsRef,
+  tyRefusesArrayDemand,
+  tySame,
+  tyToStr,
+  tyToStrUser,
+} from "./check_types"
+import { unionFieldGapNote } from "./check_union_arm_msgs"
+import { mkUnionTy } from "./check_union_mint"
+import {
+  wsAnnMentions,
+  wsCalleeDecl,
+  wsDecl,
+  wsInferredRetPrim,
+  wsIsIdent,
+  wsNoDecl,
+  wsOrigAnn,
+  wsRowOf,
+} from "./check_width"
+import { declFirstParamIsSelf, fnDeclIx } from "./check_write_scan"
+import { cexFitsSigned, cexOk } from "./const_exact"
+import { nodeLastTok, nodeStartTok } from "./fmt_util"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import {
+  stdRecvLoad,
+  stdRecvMax,
+  stdRecvMin,
+  stdRecvName,
+  stdRecvSelf,
+  stdRecvSpec,
+  stdRecvTparams,
+} from "./std_receivers"
+import { nameIsBareIdent } from "./tyname"
+import {
+  isNullTy,
+  isNumeric,
+  isStringTy,
+  isVoidTy,
+  nhOpen,
+  primNameOf,
+  tyAdmitsNull,
+  tyHasObjMember,
+  tyHasTyVar,
+  tyHoldsOpenNullHole,
+  tyIsOrNestsV128,
+  tyIsU8ArrayTy,
+  tyNestsV128,
+  tyReachesHole,
+  unionCoversTy,
+} from "./tyquery"
+
+// The type an open container slot takes from its first write `vt`: the literal-widened value,
+// or for a bare `null` a fresh open `_ | null` recorded against the write `at` (D2506).
+export function cnhPinTy(
+  vt: i32,
+  at: i32,
+  recv: i32,
+  isVal: boolean,
+  demand: boolean,
+): i32 {
+  if !isNullTy(vt) { return widenLitTy(vt) }
+  const h = mkNullableTy(-1)
+  cnhTys.push(h)
+  cnhAts.push(at)
+  let nm = ""
+  if recv >= 0 { nm = placeKeyOf(recv) }
+  cnhNames.push(nm)
+  cnhIsVal.push(isVal)
+  cnhDemand.push(demand)
+  h
+}
+
+// Refuse a call to a generic or hole-parameter function that passes a container whose element
+// or value is still an open `_ | null`: the instance is chosen here, before `T` exists, and a
+// later fill cannot reach it (D2506).
+export function refuseOpenNullHoleArg(argIx: i32, who: string) {
+  if argIx < 0 { return 0 }
+  const seen: i32[] = []
+  if !tyHoldsOpenNullHole(nodeTyIxOf(argIx), seen) { return 0 }
+  let nm = placeKeyOf(argIx)
+  if nm == "" { nm = "this argument" } else { nm = "`" + nm + "`" }
+  let what = "the element type of "
+  const at = T.tys[nodeTyIxOf(argIx)]
+  if at is TyMap { what = "the value type of " }
+  let callee = "this call"
+  if who != "" { callee = "`" + who + "`" }
+  tErr(
+    what
+      + nm
+      + " is still open here — fill or annotate it before passing it to "
+      + callee,
+    argIx,
+  )
+  0
+}
+
+// Pin every delivery this body recorded against the shape a concrete return witness named, and
+// retire the frame. With no such witness nothing is pinned — the program never said what the
+// element type is, so the binding keeps its own `cannot infer a type` floor (D1591).
+export function flushInferRetHoles() {
+  if irhMarks.length == 0 { return 0 }
+  const top = irhMarks.length - 1
+  const mark = irhMarks[top]
+  const dst = irhConcrete[top]
+  irhMarks.pop()
+  irhConcrete.pop()
+  let i = mark
+  while i < irhTys.length {
+    if dst >= 0 { constrainEmptyExpr(irhExprs[i], irhTys[i], dst) }
+    i = i + 1
+  }
+  while irhTys.length > mark {
+    irhExprs.pop()
+    irhTys.pop()
+  }
+  0
+}
+
+// D1566 — an operator operand cannot wait for the flush, so it peeks the default rather than
+// taking it. Every other position tolerates the in-band `-1` an unpinned element reads back as,
+// but the operator arms index `T.tys` with the operand type and `T.tys[-1]` traps the compiler.
+// Peeking leaves the row open, so a later store can still decide the element.
+export function arrDefOperandElemPeek(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  let cur = exprIx
+  let hops = 0
+  while hops < 4 {
+    const p = P.nodes[cur]
+    if p is Paren {
+      cur = p.parInner
+      hops = hops + 1
+    } else {
+      hops = 4
+    }
+  }
+  const e = P.nodes[cur]
+  if e is Index {
+    const at = nodeTyIxOf(e.idxArr)
+    if at < 0 { return -1 }
+    const t = T.tys[at]
+    if t is TyArray {
+      if t.aElem < 0 {
+        if arrDefRowServed(at) {
+          // The element `arrDefPinHoleElem` would write, read without writing this row: the
+          // same link fixpoint it runs (`resolveHoleLinks` propagates only an element some pin
+          // already decided, never a default), then `i32` if nothing reached the row.
+          resolveHoleLinks()
+          const t2 = T.tys[at]
+          let el = TY_I32
+          if t2 is TyArray {
+            if t2.aElem >= 0 { el = t2.aElem }
+          }
+          // The read's own recorded type, not the row's: `checkNode` banked the `-1` this read
+          // answered a moment ago and the emitter reads that, so a stale entry makes
+          // `print(a[0] ?? 1)` refuse at emit. The row stays open, so a later store re-decides
+          // it.
+          if !inferQuiet {
+            if cur < nodeTyIx.length { nodeTySet(cur, el) }
+          }
+          return el
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Mark every live narrowing the call at `callIx` invalidates. Runs after the call's own arguments
+// are checked, so `f(o.v.length, o)` still reads `o.v` under the narrowing in force as that
+// argument is evaluated.
+export function noteCallInvalidations(callIx: i32) {
+  if neKeys.length > 0 { neKill("", curFnDeclIx) }
+  if !(P.nodes[callIx] is Call) { crOpCall[callIx] = true }
+  crCapRecCheck(callIx)
+  crNoteCallBare(callIx)
+  if npKeys.length == 0 { return 0 }
+  let i = 0
+  while i < npKeys.length {
+    if callMayWrite(callIx, npKeys[i]) {
+      let cprev = -1
+      if npInvBy[i] < 0 { cprev = npTys[i] }
+      // The mark is first-cause-wins — a write's attribution outranks a call's, which is what
+      // the diagnostic reads. The LEDGER row is unconditional, because the arm JOIN reads the
+      // two arms separately and a write in one must not hide a call in the other (D1849).
+      if npInvBy[i] < 0 {
+        narSetInv(i, callIx)
+        if nfSlots.length > 0 && i >= crFnNpBase() {
+          narFitRetire(i, callIx, -1)
+        }
+        if callKillSure(callIx, npKeys[i]) { noteKillSure(callIx, npKeys[i]) }
+        crPathCallRetire(i, callIx)
+        // Inside a nested body a call ends an enclosing narrowing for the rest of that body
+        // only: the enclosing function's own call of the body ends it there, in both halves.
+        if i < crFnNpBase() {
+          crNestCallRet[callIx] = true
+          crAliasNestSlots.push(i)
+          crAliasNestDepths.push(crFnBases.length)
+        }
+      } else if i >= crFnNpBase() {
+        // Already ended, but a nested function that read it under the narrowing, or a read
+        // earlier in an enclosing loop, still sees what this writer does.
+        crLoopReadCheck(i, callIx)
+        crCaptureCallCheck(i, callIx)
+      }
+      narClobKeysPush(npKeys[i])
+      narClobTysPush(-1)
+      narClobPrevPush(cprev)
+      narClobDepthsPush(T.scopes.length)
+      narClobRetiredPush(2)
+      narClobBindPush(-1)
+      narClobDeclPush(-1)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether argument `i` of call `n`, of type `at`, is a wider record the parameter's declared
+// record type `expected` would refuse only for its extra fields, and the function can take a
+// generic parameter there: not exported, the type named in no other annotation of its signature.
+// A function read as a value is declined when the rewrite is applied.
+export function wsCandidate(
+  n: Call,
+  i: i32,
+  arg: i32,
+  at: i32,
+  expected: i32,
+): boolean {
+  if arg < 0 || at < 0 || expected < 0 || expected >= T.tys.length {
+    return false
+  }
+  if at == expected || !(T.tys[expected] is TyObj) { return false }
+  // Asked of every argument: only a record with more fields, or a parameter this rewrite made
+  // generic, goes on to the declaration and the field-by-field comparison.
+  const pre = T.tys[at]
+  if pre is TyObj {
+    const ew = T.tys[expected]
+    if ew is TyObj {
+      if pre.objFieldNames.length <= ew.objFieldNames.length { return false }
+    }
+  } else if !(pre is TyVar) {
+    return false
+  }
+  const d = wsCalleeDecl(n)
+  if d < 0 || i32ListHas(wsNoDecl, d) { return false }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) || i >= fd.fnParams.length || declHasExportKw(d) {
+    return false
+  }
+  const pn = P.nodes[fd.fnParams[i]]
+  if (
+    !(pn is Param)
+    || pn.parType < 0
+    || pn.parRest == 1
+    || pn.parName == "self"
+  ) {
+    return false
+  }
+  const ann = P.nodes[pn.parType]
+  if !(ann is TypeRef) || !wsIsIdent(ann.tyName) { return false }
+  const et = T.tys[expected]
+  const st = T.tys[at]
+  if !(et is TyObj) { return false }
+  // A parameter this rewrite already made generic, passed on whole, makes this one generic too:
+  // each of its instances is one of the wider records its own calls are held to.
+  if st is TyVar {
+    if st.tvName.length < 3 || st.tvName.slice(0, 3) != "__W" { return false }
+  } else if st is TyObj {
+    let f = 0
+    while f < et.objFieldNames.length {
+      const sf = objFieldType(st, et.objFieldNames[f])
+      if sf < 0 || !tySame(sf, et.objFieldTypes[f]) { return false }
+      f = f + 1
+    }
+    if !objShapeAdapterlessAt(arg, at, expected) { return false }
+  } else {
+    return false
+  }
+  let j = 0
+  while j < fd.fnParams.length {
+    const oj = P.nodes[fd.fnParams[j]]
+    if j != i && oj is Param {
+      if wsAnnMentions(oj.parType, ann.tyName) { return false }
+    }
+    j = j + 1
+  }
+  if fd.fnRet < 0 { return wsInferredRetPrim(fd.fnName) }
+  !wsAnnMentions(fd.fnRet, ann.tyName)
+}
+
+// The declared record type a rewritten parameter `i` of the declaration call `n` names had, or -1
+// when it is no rewritten one.
+export function wsOrigTyOf(n: Call, i: i32): i32 {
+  if wsDecl.length == 0 { return -1 }
+  const d = wsCalleeDecl(n)
+  if d < 0 { return -1 }
+  const r = wsRowOf(d, i)
+  if r < 0 { return -1 }
+  const a = P.nodes[wsOrigAnn[r]]
+  if a is TypeRef { return resolveAnnot(a.tyName, []) }
+  -1
+}
+
+// Free `self`-functions dispatchable on `recvTy` — the in-scope half of the edit-distance
+// pool, mirroring `ufcsCallTy`'s own lookup without its arity gate: a name search asks
+// whether the function exists, not how many arguments it takes.
+function selfFnNamesFor(recvTy: i32) {
+  const out: string[] = []
+  for name in fnDeclIx.keys() {
+    if declFirstParamIsSelf(name) {
+      const fnTy = lookup(name)
+      if fnTy >= 0 {
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          if ft.fnParamTypes.length > 0 {
+            if assignable(recvTy, ft.fnParamTypes[0]) {
+              const un = demangleName(name)
+              if un.length >= 2 && nameIsBareIdent(un) { out.push(un) }
+            }
+          }
+        }
+      }
+    }
+  }
+  out
+}
+
+// One receiver kind's two-source lookup: the newcomer map above (exact, case-folded)
+// first, then an edit distance (`tyEditDist`, D1590's budget) over `names` plus every
+// in-scope self-function `recvTy` could dispatch to.
+function methodSuggestFrom(
+  spellFrom: string[],
+  spellTo: string[],
+  names: string[],
+  recvTy: i32,
+  prop: string,
+) {
+  let si = 0
+  while si < spellFrom.length {
+    if tyFoldedEq(prop, spellFrom[si]) { return spellTo[si] }
+    si = si + 1
+  }
+  const budget = tySuggestBudget(prop.length)
+  let best = ""
+  let bestD = budget + 1
+  let ni = 0
+  while ni < names.length {
+    const nd = tyEditDist(prop, names[ni])
+    if nd < bestD {
+      bestD = nd
+      best = names[ni]
+    }
+    ni = ni + 1
+  }
+  const cand = selfFnNamesFor(recvTy)
+  let ci = 0
+  while ci < cand.length {
+    if cand[ci].length >= 2 && cand[ci] != prop {
+      const ud = tyEditDist(prop, cand[ci])
+      if ud < bestD {
+        bestD = ud
+        best = cand[ci]
+      }
+    }
+    ci = ci + 1
+  }
+  best
+}
+
+// The name to offer for a missed method call `prop` on `recvTy`, or "" for none —
+// dispatched by receiver kind (string / array / map). A kind with no table (struct,
+// union, an unresolved generic) still gets the edit distance over its self-functions.
+function methodSuggestFor(recvTy: i32, prop: string) {
+  if recvTy < 0 { return "" }
+  if prop.length < 2 { return "" }
+  if !nameIsBareIdent(prop) { return "" }
+  const rt = T.tys[recvTy]
+  if rt is TyPrim {
+    if rt.primName == "string" {
+      return methodSuggestFrom(
+        strMethodSpellFrom,
+        strMethodSpellTo,
+        strMethodNames,
+        recvTy,
+        prop,
+      )
+    }
+  }
+  if rt is TyArray {
+    return methodSuggestFrom(
+      listMethodSpellFrom,
+      listMethodSpellTo,
+      listMethodNames,
+      recvTy,
+      prop,
+    )
+  }
+  if rt is TyMap {
+    // `put`/`containsKey` name the MAP surface — offering them on a set would suggest a
+    // call `checkCallNode`'s own arm refuses, so a set gets the edit distance alone.
+    if rt.mSet == 1 {
+      return methodSuggestFrom([], [], mapMethodNames(recvTy), recvTy, prop)
+    }
+    return methodSuggestFrom(
+      mapMethodSpellFrom,
+      mapMethodSpellTo,
+      mapMethodNames(recvTy),
+      recvTy,
+      prop,
+    )
+  }
+  methodSuggestFrom([], [], [], recvTy, prop)
+}
+
+// The `; did you mean '.<name>'?` clause for a missed method call, or "" when nothing is
+// near enough — the method twin of `tyDidYouMean`, a SUFFIX so `no method '.<prop>' on
+// <type>` stays the prefix every consumer matches on (glean VL-045, D1599).
+export function methodDidYouMean(recvTy: i32, prop: string) {
+  const s = methodSuggestFor(recvTy, prop)
+  if s.length == 0 { return "" }
+  "; did you mean '." + s + "'?"
+}
+
+// The argument seam's container refusals for a generic body's receiver, re-asked once the
+// pin at `at` has bound it to `recvTy`. `callIx` is the member call inside the body (D2165).
+function ufcsRecvPinSeam(callIx: i32, recvTy: i32, selfTy: i32, at: i32) {
+  if callIx < 0 || callIx >= P.nodes.length { return 0 }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const rx = ufcsRecvExpr(c)
+    if rx < 0 { return 0 }
+    if covarWriteThrough(rx, recvTy, selfTy) == 1 {
+      covarWriteThroughErrAt(rx, recvTy, selfTy, at)
+      return 0
+    }
+    if objShapeAdapterlessAt(rx, recvTy, selfTy) {
+      objShapeAdapterlessErr(at, recvTy, selfTy)
+    } else if recvTy != selfTy {
+      recPend(rx, recvTy, selfTy, at)
+    } else {
+      recOwnPend(rx, recvTy)
+    }
+  }
+  0
+}
+
+// The deliveries `calleeFn`'s body recorded at a hole, at this call's bindings: a source the pin
+// makes concrete is asked the direct spelling's record rules, and one still open is recorded
+// for the caller's pins.
+export function validateRcwPins(bNames: string[], bTys: i32[], calleeFn: i32) {
+  if inferQuiet && !cstrProbe { return 0 }
+  const n = rcwPinSrc.length
+  let i = 0
+  while i < n {
+    if cstrOwnedBy(rcwPinFn[i], calleeFn) {
+      const sub = substTyDeep(rcwPinSrcTy[i], bNames, bTys)
+      if sub >= 0 && sub != rcwPinSrcTy[i] {
+        if tyHasHole(sub) {
+          if T.tys[sub] is TyVar && cstrOwnerTop() >= 0 {
+            rcwPinNote(rcwPinSrc[i], sub, rcwPinDstTy[i])
+          }
+        } else if !inferQuiet && assignable(sub, rcwPinDstTy[i]) {
+          // The delivery seam's two record rules, in its order: a shape stored differently,
+          // then a widened field something writes.
+          if objShapeAdapterlessAt(rcwPinSrc[i], sub, rcwPinDstTy[i]) {
+            objShapeAdapterlessErr(rcwPinSrc[i], sub, rcwPinDstTy[i])
+          } else {
+            rcwPend(rcwPinSrc[i], sub, rcwPinDstTy[i])
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// `srcExpr < 0` (a dispatch probe with no argument node — a UFCS receiver, an operator
+// operand) checks the type alone, so the literal-aware / rep-sidecar recording in
+// `assignableExpr` is not driven by a node index it does not have.
+function holeAssignOk(srcExpr: i32, at: i32, dst: i32) {
+  if srcExpr < 0 { return assignable(at, dst) }
+  checkerForceFn(1, srcExpr, at, dst) != 0
+}
+
+// The map demand `hm` as call argument `at` meets it: a value the body only ever wrote `null`
+// to takes the argument's own nullable value type, so each call site fills `T` (D2506).
+function holeMapNullValAt(hm: i32, at: i32): i32 {
+  if at < 0 { return hm }
+  const d = T.tys[hm]
+  const a = T.tys[at]
+  if d is TyMap {
+    if !cnhIsOpen(d.mVal) { return hm }
+    if a is TyMap {
+      if a.mVal >= 0 && assignable(TY_NULL, a.mVal) {
+        return mkMapTy(d.mKey, a.mVal, d.mSet)
+      }
+    }
+  }
+  hm
+}
+
+// An open map argument `at` delivered to a demand whose value the body only wrote `null` to
+// takes an open `_ | null` of its own, which the caller's writes fill (D2506).
+function holeMapArgNullPin(hm: i32, at: i32, srcExpr: i32) {
+  if at < 0 { return 0 }
+  const d = T.tys[hm]
+  const a = T.tys[at]
+  if d is TyMap {
+    if !cnhIsOpen(d.mVal) { return 0 }
+    if a is TyMap {
+      if a.mVal < 0 {
+        a.mVal = cnhPinTy(TY_NULL, srcExpr, srcExpr, true, false)
+        tyMutEpoch = tyMutEpoch + 1 // the argument's value pinned in place
+      }
+    }
+  }
+  0
+}
+
+// Does `at` (the argument expression `srcExpr`) satisfy hole `name`'s demand? The
+// accumulated shape satisfies it, and so does any `is`-guard alternative whose still-
+// reachable demanded fields (`holeAltResidualTy`) are satisfied too. True when the hole demands nothing.
+export function holeDemandOk(name: string, srcExpr: i32, at: i32) {
+  // A map demand is checked first, and it is a hard requirement, not one arm of a
+  // disjunction: a hole the body used the map surface on is a map. Both pins run on the way
+  // through: `constrainEmpty(at, hm)` pins an argument still open at the call; the reverse
+  // pins a demand the callee left open from a concrete argument.
+  let hm = holeMapOf(name)
+  if hm >= 0 {
+    holeMapArgNullPin(hm, at, srcExpr)
+    hm = holeMapNullValAt(hm, at)
+    if !holeAssignOk(srcExpr, at, hm) { return false }
+    constrainEmpty(at, hm)
+    // A demand the callee's own operations left open is not satisfiable here, and the
+    // reason is order, not assignability: the body has already been checked against the
+    // open type, so its recorded node types are stale, and pinning the demand now would
+    // emit against those. Bidirectional inference (roadmap), not a pin — refuse instead.
+    if holeMapDemandOpen(hm) { return false }
+  }
+  const shape = holeShapeOf(name)
+  if shape < 0 { return true }
+  if holeAssignOk(srcExpr, at, shape) { return true }
+  // A `new`-branded argument satisfies a shape SYNTHESISED from its own field reads: the demand
+  // is structural (member reads only build it), and a brand is erased at run time, so the
+  // underlying structure is what the body actually reads. Retry against the erased base so the
+  // nominal barrier does not refuse the very type that induced the demand (D1894).
+  const atBase = nomErasedTyIx(at)
+  if atBase != at {
+    if holeAssignOk(srcExpr, atBase, shape) { return true }
+  }
+  let k = 0
+  while k < holeAltNames.length {
+    if holeAltNames[k] == name {
+      if holeAssignOk(srcExpr, at, holeAltTys[k]) {
+        const resid = holeAltResidualTy(shape, k)
+        if resid < 0 { return true }
+        if holeAssignOk(srcExpr, at, resid) { return true }
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The pin's own refusal: an un-annotated type parameter whose body writes the list cannot
+// bind a view, and nothing downstream would say so — the body checked its write against a
+// synthesized mutable list, never against this argument.
+export function holeArgViewErr(argN: i32, at: i32, ix: i32) {
+  tErr(
+    "argument "
+      + i32ToStr(argN)
+      + ": the body writes this list, and "
+      + tyToStrUser(at)
+      + " is a read-only view — pass the mutable list, or spell the parameter "
+      + "`readonly T[]` so the body may only read it",
+    ix,
+  )
+  0
+}
+
+// Reports a failed hole-argument demand — one home for the wording, shared by the general
+// call path and the UFCS one. An open map demand gets its own sentence, since the generic
+// `expected …, got …` would render the unpinned demand and read as a mismatch.
+export function holeArgDemandErr(name: string, argN: i32, at: i32, ix: i32) {
+  const hmE = holeMapOf(name)
+  if hmE >= 0 {
+    if holeMapDemandOpen(hmE) {
+      tErr(
+        "argument "
+          + i32ToStr(argN)
+          + ": parameter is used as a map but nothing in the body pins its key or value"
+          + " — add a type annotation",
+        ix,
+      )
+      return 0
+    }
+  }
+  tErr(
+    "argument "
+      + i32ToStr(argN)
+      + ": expected "
+      + holeDemandStr(name)
+      + ", got "
+      + tyToStr(at)
+      + getterDemandNote(holeDemandTy(name), at),
+    ix,
+  )
+  0
+}
+
+// Reports an argument an indexed hole cannot take — one home for the wording, shared by the
+// general call path and the UFCS one. A map argument gets its own sentence: `q[i]` with an
+// i32 index is ambiguous between an array and an i32-keyed map, so "expected an array"
+// alone would send the reader to change the argument when the fix is to annotate the parameter.
+export function holeArgArrayErr(argN: i32, at: i32, ix: i32) {
+  if at >= 0 {
+    const t = T.tys[at]
+    if t is TyMap {
+      tErr(
+        "argument "
+          + i32ToStr(argN)
+          + ": parameter is indexed with an i32, which is ambiguous between an array and"
+          + " an i32-keyed map — add a type annotation",
+        ix,
+      )
+      return 0
+    }
+  }
+  tErr(
+    "argument " + i32ToStr(argN) + ": expected an array, got " + tyToStr(at),
+    ix,
+  )
+  0
+}
+
+// A template hole's delivery, decided by the hole's type. True when the call is finished
+// with (the caller yields `string`), false to let the ordinary argument check run. `string`
+// is delivered directly — the render call becomes a `Paren` around the hole, since the
+// renderer doesn't take a string. Otherwise a hole-shaped refusal names the domain, read off the renderer, never hard-coded.
+export function tplHoleHandled(
+  callIx: i32,
+  callPos: i32,
+  holeIx: i32,
+  at: i32,
+  expected: i32,
+) {
+  // A string-literal type or a union of them is a set of strings, delivered as one (D1485).
+  // Not rewritten under a pinned re-check: the body is every instance's, and the emitter
+  // delivers a string-pinned hole itself (`tplStrHoleOf`, D2241).
+  if isStringTy(softenLitTy(at)) {
+    if monoRecheckDepth == 0 {
+      arenaReplaceNode(callIx, mkParen(holeIx, callPos))
+    }
+    return true
+  }
+  if at < 0 { return false }
+  const t = T.tys[at]
+  if t is TyErr { return false }
+  if tyIsHole(at) { return false }
+  // A gradual union is checked at its concrete members, and the pin re-asks the whole union
+  // as it does a bare hole's (`argCstrFits`).
+  const gv = tpGradualView(at)
+  if gv != at {
+    if isStringTy(softenLitTy(gv)) || tyIsHole(gv) || assignable(gv, expected) {
+      noteArgCstr(at, expected, "", ACF_TPL, -1)
+      return !tyIsHole(gv) && isStringTy(softenLitTy(gv))
+    }
+  }
+  if assignable(at, expected) { return false }
+  tErr(
+    "an interpolation hole is `string` or "
+      + tyToStr(expected)
+      + " — this one is "
+      + tyToStr(at),
+    holeIx,
+  )
+  true
+}
+
+// The member arm's own sentence, for a receiver type that is not a hole: "" when
+// `recv.prop` is a legal read (or deferred), otherwise the exact words `checkMemberNode`
+// raises. Mirrors that arm arm-for-arm, in its order — load-bearing, since the pin's whole
+// soundness argument is that it refuses only what the direct spelling already refuses.
+function memberFloorMsg(objTy: i32, prop: string) {
+  if objTy < 0 { return "" }
+  const ot = T.tys[objTy]
+  if ot is TyObj {
+    if objFieldType(ot, prop) >= 0 { return "" }
+    return "no field '" + prop + "' on " + tyToStr(objTy)
+  }
+  if ot is TyErr { return "" }
+  if ot is TyUnion {
+    if sharedUnionFieldTy(ot, prop) >= 0 { return "" }
+    if prop == "length" && tyIsLitUnion(objTy) { return "" }
+    return "field '"
+      + prop
+      + "' is not on every member of "
+      + tyToStr(objTy)
+      + " — narrow with `is` first"
+      + unionFieldGapNote(ot, prop)
+  }
+  if ot is TyArray {
+    if prop == "length" { return "" }
+    return "no field '"
+      + prop
+      + "' on array "
+      + tyToStr(objTy)
+      + lengthSpellNote(prop)
+  }
+  if ot is TyMap {
+    if prop == "length" { return "" }
+    if ot.mSet == 1 {
+      return "no field '"
+        + prop
+        + "' on set "
+        + tyToStr(objTy)
+        + lengthSpellNote(prop)
+    }
+    return "no field '"
+      + prop
+      + "' on map "
+      + tyToStr(objTy)
+      + lengthSpellNote(prop)
+  }
+  if ot is TyPrim {
+    if ot.primName == "string" {
+      if prop == "length" { return "" }
+      return "no field '" + prop + "' on string" + lengthSpellNote(prop)
+    }
+  }
+  if ot is TyVar { return tpMemberFloorMsg(ot.tvName, prop) }
+  // The receiver is a scalar, so `.toString`/`.toStr` on it is almost certainly the
+  // migration, not a typo — `stdFmtMovedNote` says which import brings the name back.
+  // Deliberately only on this arm: a struct missing a `.toString` field is a different mistake.
+  "member access '."
+    + prop
+    + "' on non-object "
+    + tyToStr(objTy)
+    + stdFmtMovedNote(prop)
+}
+
+// Raises the member arm's sentence at node `ix` — `memberFloorMsg`'s words, unless the call
+// site banked a missing-import answer for this node, in which case D1230's sentence and its
+// `ufcs-not-imported` code replace them. One home for the raise, since `checkMemberNode`
+// refuses from seven arms and a per-arm enrichment would silently miss most of them.
+export function memberFloorErr(objTy: i32, prop: string, ix: i32) {
+  // A method lookup over a receiver built from an error already reported is that error's
+  // cascade: its instance differs from the method's only by the error. A missing FIELD is not,
+  // so the floor below still raises for one.
+  const cascade = tyMentionsErr(objTy, 8)
+  const specs = ufcsMissSpecsAt(ix)
+  if specs != "" {
+    if cascade { return 0 }
+    const alias = ufcsImportAliasAt(ix, prop, objTy)
+    return tErrCodedData(
+      ufcsNotImportedMsg(prop, specs, objTy, alias),
+      ix,
+      CODE_UFCS_NOT_IMPORTED,
+      ufcsNotImportedData(prop, specs, objTy, alias),
+    )
+  }
+  // The name is a function in scope that is not a method. Second, so D1230 keeps winning
+  // wherever it applies: a name not in scope at all cannot reach this bank (D1570).
+  const whyRow = ufcsWhyRow(ix)
+  if whyRow >= 0 {
+    if cascade { return 0 }
+    return tErrCodedData(
+      ufcsWhyMsg[whyRow],
+      ix,
+      CODE_UFCS_NOT_METHOD,
+      ufcsWhyData[whyRow],
+    )
+  }
+  // Never raise a wordless diagnostic. `memberFloorMsg`'s "" means "this read is fine or
+  // is deferred" — a sentinel its two constraint-pin callers test, and this one, the only
+  // one that raises, formatted unconditionally. A rung that answered "" while its own arm
+  // went on to refuse printed nothing but a caret (D1004, D1221).
+  const msg = memberFloorMsg(objTy, prop)
+  if msg == "" {
+    return tErr("member access '." + prop + "' on " + tyToStr(objTy), ix)
+  }
+  tErr(
+    msg
+      + unkeyedSubscriptNote(ix)
+      + getterNarrowNote(objTy, ix)
+      + builtinMethodNote(objTy, prop, ix),
+    ix,
+  )
+}
+
+// D1230 at member node `memIx`, else D1570 at call node `ix`, for `recv.prop(argc args)`; false
+// when neither applies. For the string and array arms, which answer before the general one, so
+// `memberFloorErr` never sees their calls. D1230 spans the property, as the quick-fix reads it.
+export function ufcsMissRaise(
+  prop: string,
+  recvTy: i32,
+  argc: i32,
+  ix: i32,
+  memIx: i32,
+): boolean {
+  if tyMentionsErr(recvTy, 8) { return true }
+  const specs = ufcsMissingImportSpecs(prop, recvTy, argc, ix)
+  if specs != "" {
+    const alias = ufcsImportAliasAt(ix, prop, recvTy)
+    tErrCodedData(
+      ufcsNotImportedMsg(prop, specs, recvTy, alias),
+      memIx,
+      CODE_UFCS_NOT_IMPORTED,
+      ufcsNotImportedData(prop, specs, recvTy, alias),
+    )
+    return true
+  }
+  const name = ufcsSiteFn(ix, prop)
+  const kind = ufcsNotMethodKind(name, recvTy, argc)
+  if kind != 0 {
+    tErrCodedData(
+      ufcsNotMethodMsg(prop, name, recvTy, argc, kind),
+      ix,
+      CODE_UFCS_NOT_METHOD,
+      ufcsNotMethodData(prop, name, recvTy, kind),
+    )
+    return true
+  }
+  false
+}
+
+// D1570's gate classifier — which arm of the UFCS rule refused `recv.prop(argc args)`, given
+// that `prop` names a function in scope. 0 = no answer, 1 = the `self`-name rule, 2 = the
+// arity range, 3 = the receiver type. Mirrors `ufcsWouldDispatch` arm for arm, and stops
+// where that one stops, since this runs on a call that has already failed.
+function ufcsNotMethodKind(name: string, recvTy: i32, argc: i32) {
+  if (fnDeclIx[name] ?? -1) < 0 { return 0 }
+  const fnTy = lookup(name)
+  if fnTy < 0 { return 0 }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const params = ft.fnParamTypes
+    if params.length < 1 { return 1 }
+    if !declFirstParamIsSelf(name) { return 1 }
+    const uDecl = declParamsAfterSelf(name)
+    let uRequired = params.length - 1
+    if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    if argc < uRequired || argc + 1 > params.length { return 2 }
+    if !assignable(recvTy, params[0]) { return 3 }
+    return 0
+  }
+  0
+}
+
+// Records `memberFloorErr`'s answer, computed here because only the call site knows `argc`.
+// No-ops when no gate claims the call — every member access that is really a missing field
+// must stay untouched.
+export function noteUfcsNotMethod(
+  memIx: i32,
+  prop: string,
+  name: string,
+  recvTy: i32,
+  argc: i32,
+) {
+  let nm = name
+  if (fnDeclIx[nm] ?? -1) < 0 { nm = mergedDeclKeyOf(prop) }
+  const kind = ufcsNotMethodKind(nm, recvTy, argc)
+  if kind == 0 { return 0 }
+  noteUfcsWhy(
+    memIx,
+    ufcsNotMethodMsg(prop, nm, recvTy, argc, kind),
+    ufcsNotMethodData(prop, nm, recvTy, kind),
+  )
+}
+
+// The index arm's own sentence: "" when `recv[i]` resolves or defers, otherwise
+// `checkIndexNode`'s `cannot index non-array …`. The write-only operator case also answers
+// "" rather than borrow that arm's sentence — its diagnostic names a missing declaration,
+// not this receiver, and repeating it at a call site the reader never wrote it at would mislead.
+export function indexFloorMsg(arrTy: i32) {
+  if arrTy < 0 { return "" }
+  if tyBuiltinIndexable(arrTy) { return "" }
+  if opIdxDeclared() {
+    if opIdxFnFor(OP_INDEX_GET, arrTy) != "" { return "" }
+    if opIdxFnFor(OP_INDEX_SET, arrTy) != "" { return "" }
+  }
+  const at = T.tys[arrTy]
+  if at is TyObj {
+    // The index trap: gated exactly as the arm gates it — a `"[]"` field of any shape
+    // other than a one-parameter function falls through there and must fall through here too.
+    const trap = objFieldType(at, OP_INDEX_GET)
+    if trap >= 0 {
+      const tt = T.tys[trap]
+      if tt is TyFunc {
+        if tt.fnParamTypes.length == 1 { return "" }
+      }
+    }
+  }
+  "cannot index non-array " + tyToStr(arrTy)
+}
+
+// `memberFloorMsg` / `indexFloorMsg` in one call, keyed the way the table stores the
+// operation: `OP_INDEX_GET` is the index form, anything else is that member name.
+export function memCstrMsg(recv: i32, prop: string) {
+  if prop == OP_INDEX_GET { return indexFloorMsg(recv) }
+  if prop == OP_CALL_PIN { return callFloorMsg(recv) }
+  if prop == OP_CALL_GUARDED_PIN {
+    if isNullTy(recv) { return "" }
+    return callFloorMsg(recv)
+  }
+  if keyHasPrefix(prop, MC_NULL_READ_MARK) {
+    if !tyAdmitsNull(recv) { return "" }
+    const nrProp = prop.slice(MC_NULL_READ_MARK.length, prop.length)
+    if nrProp == OP_INDEX_GET { return indexFloorMsg(recv) }
+    return memberFloorMsg(recv, nrProp)
+  }
+  if keyHasPrefix(prop, MC_METHOD_MARK) {
+    const name = prop.slice(MC_METHOD_MARK.length, prop.length)
+    if builtinMethodClaims(recv, name) { return "" }
+    return "no method '." + name + "' on " + tyToStr(recv)
+  }
+  memberFloorMsg(recv, prop)
+}
+
+// Re-validates every deferred `print` constraint this call resolves, holding the substituted
+// type to the same two floors the direct spelling is held to. A type still touching an
+// unresolved hole is re-recorded under the caller's hole and defers. The diagnostic is the
+// direct spelling's, verbatim, reported at the call — the only position that knows the instance.
+export function validatePrintCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigP = printCstr.ty.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigP {
+    if (
+      cstrOwnedBy(printCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(printCstr.ix[ci])
+    ) {
+      cvNow = cvPick(CV_PRINT, ci, cvWas)
+      const cpt = substTyDeep(printCstr.ty[ci], bNames, bTys)
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if cpt != printCstr.ty[ci] {
+          if tyHasHole(cpt) { notePrintCstr(cpt, printCstr.ix[ci]) }
+        }
+      }
+      if !tyHasHole(cpt) {
+        // The two floors use different channels: a domain rejection (`tErr`, checked first,
+        // as at the direct site) versus a capability reject for a union the emitter can't classify.
+        let pMsg = ""
+        let pUnsup = false
+        if tyPrintsAsRef(cpt, 24) {
+          pMsg = printRefRefusal(cpt)
+        } else {
+          pMsg = printUnionRefusal(cpt)
+          if pMsg != "" { pUnsup = true }
+        }
+        if pMsg != "" {
+          let pWho = "a type parameter is printed here: "
+          if who != "" {
+            pWho = "`" + who + "` prints its type parameter here: "
+          }
+          if pUnsup {
+            tErrUnsupported(pWho + pMsg, ix)
+          } else {
+            tErr(pWho + pMsg, ix)
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Re-validates every escaped join inside the body `calleeFn` instantiates; a join at module
+// scope names holes no later call binds. One that re-folds to a single type collapsed
+// faithfully; one that re-folds to a genuine multi-member union did not, and rejects at the
+// inner call, naming both the callee and the union its arms resolve to.
+export function validateEscJoins(bNames: string[], bTys: i32[], calleeFn: i32) {
+  let ci = 0
+  while ci < escJoinTy.length {
+    if escJoinFn[ci] < 0 || !cstrOwnedBy(escJoinFn[ci], calleeFn) {
+      ci = ci + 1
+      continue
+    }
+    const rj = substTyDeep(escJoinTy[ci], bNames, bTys)
+    if rj != escJoinTy[ci] && !tyIsHole(rj) && !tyIsDeferredJoin(rj) {
+      const rt = T.tys[rj]
+      if rt is TyUnion {
+        if rt.uMembers.length > 1 {
+          let who = escJoinWho[ci]
+          if who == "" { who = "a call" } else { who = "`" + who + "`" }
+          tErrUnsupported(
+            "the returns of "
+              + who
+              + " join to "
+              + tyToStr(rj)
+              + " for this argument — type-valid, but an inferred union return through an"
+              + " un-annotated parameter is not yet supported by codegen; annotate the return type",
+            escJoinIx[ci],
+          )
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Raises demand `ci`'s refusal at call `ix`, in the direct spelling's words: a template
+// hole's is `tplHoleHandled`'s sentence, any other names the callee.
+export function argCstrErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
+  if argCstr.form[ci] > 0 {
+    let callee = "a function value"
+    if argCstr.who[ci] != "" { callee = "`" + argCstr.who[ci] + "`" }
+    return tErr(
+      "argument "
+        + i32ToStr(argCstr.form[ci])
+        + ": expected "
+        + tyToStr(rexp)
+        + ", got "
+        + tyToStr(rat)
+        + boolForNumberNote(rat, rexp)
+        + " (the call of "
+        + callee
+        + " at the call's argument types)",
+      ix,
+    )
+  }
+  if argCstr.form[ci] == ACF_INDEX {
+    return tErr(
+      "array index must be i32, got "
+        + tyToStr(rat)
+        + " (the call's argument types)",
+      ix,
+    )
+  }
+  if argCstr.form[ci] == ACF_TPL {
+    return tErr(
+      "an interpolation hole is `string` or "
+        + tyToStr(rexp)
+        + " — this one is "
+        + tyToStr(rat),
+      ix,
+    )
+  }
+  argFlowErr(rat, rexp, ci, ix)
+}
+
+// The refusal of demand `ci`'s argument `rat` flowing into a parameter `rexp`, naming the
+// conversion when the direct spelling would.
+export function argFlowErr(rat: i32, rexp: i32, ci: i32, ix: i32) {
+  let who = argCstr.who[ci]
+  if who == "" { who = "a call" } else { who = "`" + who + "`" }
+  tErr(
+    "argument of type "
+      + tyToStr(rat)
+      + " flows into "
+      + who
+      + " expecting "
+      + tyToStr(rexp)
+      + boolForNumberNote(rat, rexp)
+      + " (the call's argument types)",
+    ix,
+  )
+}
+
+// A deferred `.push(v)` whose receiver pins to an open list: the list's element takes what the
+// direct spelling's first push gives it (`v`'s widened type, or the open `_ | null` a bare null
+// mints), so the argument's row carries the element the body decided (D2218).
+function cnhPinBmElem(
+  want: i32,
+  bNames: string[],
+  bTys: i32[],
+  at: i32,
+  got: i32,
+  pinRows: i32[],
+) {
+  const row = hdRowOf(want)
+  if row < 0 || row >= hdKind.length { return 0 }
+  if hdKind[row] != HD_ELEM { return 0 }
+  const arr = substTyDeep(hdBase[row], bNames, bTys)
+  if arr < 0 { return 0 }
+  // A value's own type pins only a list written at the call; a binding's list keeps its own
+  // later writes, which may still widen it.
+  const valPin = isNullTy(got) || nhOpen(got) || i32ListHas(pinRows, arr)
+  if !valPin {
+    // A quiet re-check's write is not the program's; the real check records it again.
+    if unresolvedHole(arr) && !inferQuiet {
+      calleeWriteRow.push(arr)
+      calleeWriteGot.push(got)
+      calleeWriteAt.push(at)
+    }
+    return 0
+  }
+  const a = T.tys[arr]
+  if a is TyArray {
+    if a.aElem < 0 {
+      let pin = got
+      if !nhOpen(got) { pin = cnhPinTy(got, at, -1, false, false) }
+      a.aElem = pin
+      tyMutEpoch = tyMutEpoch + 1 // a hole body's push pinned the argument in place
+    } else if !nhOpen(got) {
+      cnhFill(a.aElem, got)
+    }
+  }
+  0
+}
+
+// The pins a body's deferred `.push` arguments and element stores owe the open lists written at
+// this call, in check order, ahead of every validation that reads those elements: the first
+// write decides the element, as at the direct spelling (D2218).
+export function pinBmCstrElems(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  args: i32[],
+) {
+  const pinRows = callSiteOpenListRows(args)
+  const nb = bmCstr.got.length
+  const nl = letCstr.got.length
+  let ci = 0
+  let li = 0
+  while ci < nb || li < nl {
+    while ci < nb && !cstrOwnedBy(bmCstr.fn[ci], calleeFn) { ci = ci + 1 }
+    while li < nl && !cstrOwnedBy(letCstr.fn[li], calleeFn) { li = li + 1 }
+    let takeBm = ci < nb
+    if ci < nb && li < nl { takeBm = bmCstr.seq[ci] <= letCstr.seq[li] }
+    if takeBm && ci < nb {
+      pinOpenElemFrom(
+        bmCstr.got[ci],
+        bmCstr.want[ci],
+        bNames,
+        bTys,
+        ix,
+        pinRows,
+      )
+      ci = ci + 1
+    } else if li < nl {
+      pinOpenElemFrom(
+        letCstr.got[li],
+        letCstr.want[li],
+        bNames,
+        bTys,
+        ix,
+        pinRows,
+      )
+      li = li + 1
+    }
+  }
+  0
+}
+
+// One deferred write of `got` into `want` at the pin: an open list element adopts it.
+function pinOpenElemFrom(
+  got: i32,
+  want: i32,
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  pinRows: i32[],
+) {
+  const g = substTyDeep(got, bNames, bTys)
+  if isNullTy(g) || nhOpen(g) || (g >= 0 && !tyHasTyVar(g)) {
+    cnhPinBmElem(want, bNames, bTys, ix, g, pinRows)
+  }
+  0
+}
+
+// Whether the deferred UFCS-receiver constraints this binding resolves hold, in three steps
+// mirroring the language's own dispatch precedence: a receiver still carrying a hole
+// re-defers; a receiver with a field of that name (any field, `drwWalk`'s `sFieldIndex` test)
+// is a field call this constraint does not speak about; otherwise it must fit `self`, in the direct spelling's own words (`memberFloorMsg`).
+export function validateUfcsCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrigU = ufcsCstr.ty.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigU {
+    if (
+      cstrOwnedBy(ufcsCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(ufcsCstr.ix[ci])
+    ) {
+      cvNow = cvPick(CV_UFCS, ci, cvWas)
+      const ur = substTyDeep(ufcsCstr.ty[ci], bNames, bTys)
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if ur != ufcsCstr.ty[ci] {
+          if tyHasHole(ur) {
+            noteUfcsCstr(
+              ur,
+              ufcsCstr.prop[ci],
+              ufcsCstr.ix[ci],
+              ufcsCstr.p0[ci],
+            )
+          }
+        }
+      }
+      if !tyHasHole(ur) {
+        // The member-call order at the pinned receiver (D2517): a built-in method or a field
+        // takes the call over the `self`-function, and must fit how the body used it.
+        const uRung = memberRungOnTy(ur, ufcsCstr.prop[ci])
+        if uRung != 0 {
+          let uWho0 = "the callee's body"
+          if who != "" { uWho0 = "the body of `" + who + "`" }
+          memberPinFitsAt(
+            ufcsCstr.ix[ci],
+            ur,
+            ufcsCstr.prop[ci],
+            uRung,
+            bNames,
+            bTys,
+            ix,
+            uWho0,
+          )
+          let mi = 0
+          while mi < ufcsCstr.more[ci].length {
+            memberPinFitsAt(
+              ufcsCstr.more[ci][mi],
+              ur,
+              ufcsCstr.prop[ci],
+              uRung,
+              bNames,
+              bTys,
+              ix,
+              uWho0,
+            )
+            mi = mi + 1
+          }
+        }
+        // An overloaded call noted no `self` type: each pin picks its own candidate.
+        if uRung == 0 && ufcsCstr.p0[ci] < 0 {
+          let oWho = "the callee's body"
+          if who != "" { oWho = "the body of `" + who + "`" }
+          ovPinCheck(
+            ufcsCstr.ix[ci],
+            ur,
+            ufcsCstr.prop[ci],
+            bNames,
+            bTys,
+            ix,
+            oWho,
+          )
+          for mo in ufcsCstr.more[ci] {
+            ovPinCheck(mo, ur, ufcsCstr.prop[ci], bNames, bTys, ix, oWho)
+          }
+        } else if uRung == 0 {
+          if !assignable(ur, ufcsCstr.p0[ci]) {
+            let uMsg = memberFloorMsg(ur, ufcsCstr.prop[ci])
+            let uSuggest = ""
+            if uMsg == "" {
+              uMsg = "no method '." + ufcsCstr.prop[ci] + "' on " + tyToStr(ur)
+              uSuggest = methodDidYouMean(ur, ufcsCstr.prop[ci])
+            }
+            let uWho = "the callee's body"
+            if who != "" { uWho = "the body of `" + who + "`" }
+            tErr(
+              uMsg
+                + " — the `"
+                + ufcsCstr.prop[ci]
+                + "` in scope takes "
+                + tyToStr(ufcsCstr.p0[ci])
+                + " ("
+                + uWho
+                + " at the call's argument types)"
+                + uSuggest,
+              ix,
+            )
+          } else if !tyHasHole(ufcsCstr.p0[ci]) {
+            ufcsRecvPinSeam(ufcsCstr.ix[ci], ur, ufcsCstr.p0[ci], ix)
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// At a pin where the receiver's built-in method or field `prop` (`rung`) takes member call
+// `callIx` over the `self`-function the generic body is typed against, the call must fit
+// that member as the body used it: its arguments, and its value unless the body discarded a
+// `void`. The emitter picks per instance only on a parameter of the generic itself (D2520).
+function memberPinFitsAt(
+  callIx: i32,
+  recv: i32,
+  prop: string,
+  rung: i32,
+  bNames: string[],
+  bTys: i32[],
+  at: i32,
+  who: string,
+) {
+  if callIx < 0 || callIx >= P.nodes.length { return 0 }
+  const c = P.nodes[callIx]
+  if c is Call {
+    let what = "built-in method"
+    if rung == MC_RUNG_FIELD { what = "field" }
+    const params: i32[] = []
+    let res = -1
+    if rung == MC_RUNG_BUILTIN {
+      res = builtinSigOf(recv, prop, c.callArgs.length, params)
+    } else {
+      res = fieldSigOf(recv, prop, c.callArgs.length, params)
+    }
+    let why = ""
+    if i32ListHas(ufcsUnpinnedSites, callIx) {
+      why = "and this call cannot pick it per instance from inside a closure or through a "
+        + "local — call it on the generic's own parameter"
+    } else if hasNamedArgs(c.callArgNames) {
+      why = "which takes no named arguments"
+    } else if res < 0 {
+      why = "which takes different arguments than this call passes"
+    } else {
+      let i = 0
+      while i < c.callArgs.length && why == "" {
+        const a = substTyDeep(nodeTyIxOf(c.callArgs[i]), bNames, bTys)
+        if a >= 0 && !tyHasHole(a) && !assignable(a, params[i]) {
+          why = "whose argument "
+            + i32ToStr(i + 1)
+            + " is "
+            + tyToStr(params[i])
+            + ", not "
+            + tyToStr(a)
+        }
+        i = i + 1
+      }
+      // A field's value is not held to the body's use: a field call already ran per instance
+      // before the built-in rung existed, and `print(x.tag())` reads either value.
+      const used = substTyDeep(nodeTyIxOf(callIx), bNames, bTys)
+      if (
+        why == ""
+        && rung == MC_RUNG_BUILTIN
+        && used >= 0
+        && used != TY_VOID
+        && !tyHasHole(used)
+      ) {
+        if !tyEq(used, res) {
+          why = "which returns "
+            + tyToStr(res)
+            + ", not the "
+            + tyToStr(used)
+            + " the body uses"
+        }
+      }
+    }
+    if why != "" {
+      tErr(
+        "`."
+          + prop
+          + "` on "
+          + tyToStr(recv)
+          + " is its "
+          + what
+          + ", not the `"
+          + prop
+          + "` in scope, "
+          + why
+          + " ("
+          + who
+          + " at the call's argument types)",
+        at,
+      )
+    }
+  }
+  0
+}
+
+// Whether the deferred receiver-classification constraints this binding resolves hold — see
+// `memCstr.ty`'s header for why the index and UFCS arms cannot decide it in the body (D651 /
+// D691). The index form defers to the argument-flow gate where it already speaks; a receiver
+// that is not the bare parameter is uncovered by either gate, a known bound rather than a defect.
+export function validateMemCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+  hNames: string[],
+  hArgNo: i32[],
+  hArgNode: i32[],
+) {
+  const nOrigM = memCstr.ty.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigM {
+    if (
+      cstrOwnedBy(memCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(memCstr.ix[ci])
+    ) {
+      cvNow = cvPick(CV_MEM, ci, cvWas)
+      const mr = substTyDeep(memCstr.ty[ci], bNames, bTys)
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if mr != memCstr.ty[ci] {
+          if tyHasHole(mr) {
+            noteMemCstr(mr, memCstr.prop[ci], memCstr.ix[ci], memCstr.dem[ci])
+          }
+        }
+      }
+      if !tyHasHole(mr) {
+        let skip = false
+        // A resolved index operator: BANK it on its site for the emitter's dispatch rewrite,
+        // or the read/write reaches the emitter as a raw Index over a receiver with no list
+        // rep — a clause-2 emit reject on a check-clean program (D1892). GET's site is the
+        // index node, SET's the assignment node; each constraint carries the right `memCstr.ix`.
+        if opIdxDeclared() && !tyBuiltinIndexable(mr) {
+          if memCstr.prop[ci] == OP_INDEX_GET {
+            const gfn = opIdxFnFor(OP_INDEX_GET, mr)
+            if gfn != "" {
+              opIdxBank(memCstr.ix[ci], gfn)
+            } else {
+              // A SET-only receiver has no readable index: the inline arm refuses an annotated
+              // one here, so the hole path must too — `indexFloorMsg` answers "" for it (it
+              // sees the setter) and would fall silently to the emitter (D1932).
+              const sOnly = opIdxFnFor(OP_INDEX_SET, mr)
+              if sOnly != "" {
+                tErr(
+                  "operator "
+                    + opDeclLabel(sOnly)
+                    + " needs a matching \""
+                    + OP_INDEX_GET
+                    + "\" operator — an index that cannot be READ cannot be written either",
+                  ix,
+                )
+                skip = true
+              }
+            }
+          } else if memCstr.prop[ci] == OP_INDEX_SET {
+            const sfn = opIdxFnFor(OP_INDEX_SET, mr)
+            if sfn != "" {
+              opIdxBank(memCstr.ix[ci], sfn)
+            } else if opIdxFnFor(OP_INDEX_GET, mr) != "" {
+              // A GET operator with no SET: name the missing half, as the inline arm does.
+              tErr(
+                "no \""
+                  + OP_INDEX_SET
+                  + "\" operator for index assignment on "
+                  + tyToStr(mr),
+                ix,
+              )
+            }
+          }
+        }
+        if memCstr.prop[ci] == OP_INDEX_GET {
+          if tyRefusesArrayDemand(mr) { skip = true }
+        }
+        // `"[]="` is not a field name, so `memCstrMsg` cannot grade it; the assignment arm at
+        // check time owns a concrete receiver's write diagnostic, and a builtin-indexable pin
+        // is a real array/map write. The SET operator's own site is settled just above.
+        if memCstr.prop[ci] == OP_INDEX_SET { skip = true }
+        if !skip {
+          const mMsg = memCstrMsg(mr, memCstr.prop[ci])
+          if mMsg != "" {
+            // Refuses in the hole's own words, attributed to the argument only when exactly
+            // one parameter is spelled with this type variable — otherwise naming one would guess.
+            let told = false
+            if memCstr.dem[ci] {
+              const dNo = cstrArgNoOf(memCstr.ty[ci], hNames, hArgNo)
+              if dNo > 0 && cstrArgCountOf(memCstr.ty[ci], hNames) == 1 {
+                const dTy = tpDemandTy(memCstr.ty[ci], calleeFn)
+                if dTy >= 0 {
+                  argMismatchErr(
+                    dNo,
+                    dTy,
+                    mr,
+                    cstrArgNodeOf(dNo, hArgNo, hArgNode),
+                  )
+                  told = true
+                }
+              }
+            }
+            if !told {
+              let mWho = "the callee's body"
+              if who != "" { mWho = "the body of `" + who + "`" }
+              tErr(mMsg + " (" + mWho + " at the call's argument types)", ix)
+            }
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Substitutes every `HD_COAL` result hole this call resolves, for its BANK alone: the
+// substitution is what records the pin (`substHoleTy`), and `nodeTyPinIxOf` is what the
+// emitter's `??` arm then reads. No diagnostic here — the body owns the operand check, and a
+// hole two calls pin differently poisons its own row, which is the answer the emitter needs.
+export function bankCoalHoles(bNames: string[], bTys: i32[], calleeFn: i32) {
+  let ci = 0
+  while ci < coalHoleTy.length {
+    if cstrOwnedBy(coalHoleFn[ci], calleeFn) {
+      substHoleTy(coalHoleTy[ci], bNames, bTys)
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Instantiates a generic function passed to an un-annotated parameter at the arguments the
+// body calls that parameter with (`take(same)` where `take` calls `a("x")`): binding `vNames[k]`
+// to `same<T>`'s open signature would leave every call of the hole typed `T` (D4420). Kept
+// generic when a call is unpinned or two calls disagree, which the emitter still refuses.
+export function instGenFnHolePins(
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  hNames: string[],
+  hArgNode: i32[],
+) {
+  if calleeFn < 0 { return 0 }
+  let k = 0
+  while k < vNames.length {
+    const vt = vTys[k]
+    if vt >= 0 && vt < T.tys.length && tyHasTyVar(vt) {
+      const vf = T.tys[vt]
+      if (
+        vf is TyFunc
+        && argIsOwnGenericFnValue(holeArgNodeOf(vNames[k], hNames, hArgNode))
+      ) {
+        const inst = genFnHoleInstance(vNames, vTys, k, vt, calleeFn)
+        if inst >= 0 { vTys[k] = inst }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Re-validates every deferred binary-op constraint this call resolves: substitutes the holes
+// to the call's concrete argument types and checks the operator is defined for them — the one
+// rule numeric, string and relational operators all reduce to. Re-defers when a hole
+// substitutes to another hole; scoped to the callee (`cstrOwnedBy`) for the same by-name reason `noteMemCstr` needs it.
+export function validateBinCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+  hNames: string[],
+  hArgNo: i32[],
+  hArgNode: i32[],
+) {
+  const nOrigB = binCstr.op.length
+  const cvWas = cvNow
+  let ci = 0
+  while ci < nOrigB {
+    if cstrOwnedBy(binCstr.fn[ci], calleeFn) {
+      cvNow = cvPick(CV_BIN, ci, cvWas)
+      let clt = substTyDeep(binCstr.lt[ci], bNames, bTys)
+      let crt = substTyDeep(binCstr.rt[ci], bNames, bTys)
+      // Re-records only when the callee is named — an unnamed call cannot reassign ownership,
+      // or a HOF's own element hole could adopt a sibling generic's constraint as its own.
+      if (
+        calleeFn >= 0
+        || substNestMode == SUBST_NESTED
+        || substNestMode == SUBST_HOLES
+      ) {
+        if clt != binCstr.lt[ci] || crt != binCstr.rt[ci] {
+          if tyHasHole(clt) || tyHasHole(crt) {
+            noteBinCstr(clt, binCstr.op[ci], crt)
+          }
+        }
+      }
+      let litHolds = false
+      if !tyHasHole(clt) && !tyHasHole(crt) {
+        litHolds = eqLitMemberOk(clt, crt) || eqLitMemberOk(crt, clt)
+        // A literal outside the pin's closed set is refused, as the direct spelling is (D3158).
+        if !litHolds && eqLitNonMember(clt, crt) {
+          litHolds = true
+          let lWho = "a type parameter is compared with `"
+            + binCstr.op[ci]
+            + "` here: "
+          if who != "" {
+            lWho = "`"
+              + who
+              + "` compares its type parameter with `"
+              + binCstr.op[ci]
+              + "` here: "
+          }
+          tErr(
+            lWho
+              + "cannot compare "
+              + tyToStr(clt)
+              + " with "
+              + tyToStr(crt)
+              + " — not a member of the union",
+            ix,
+          )
+        }
+        clt = softenBareLitTy(clt)
+        crt = softenBareLitTy(crt)
+      }
+      if !tyHasHole(clt) && !litHolds {
+        if !tyHasHole(crt) {
+          // The equality refusal (in the direct spelling's own words) replaces the generic
+          // sentence here, with the attribution placed in front since it ends on a remedy clause.
+          const pMsgs: string[] = []
+          const pChan: i32[] = []
+          if binCstr.op[ci] == "==" || binCstr.op[ci] == "!=" {
+            eqRefusals(binCstr.op[ci], clt, crt, true, pMsgs, pChan)
+          }
+          if pMsgs.length > 0 {
+            let pWho = "a type parameter is compared with `"
+              + binCstr.op[ci]
+              + "` here: "
+            if who != "" {
+              pWho = "`"
+                + who
+                + "` compares its type parameter with `"
+                + binCstr.op[ci]
+                + "` here: "
+            }
+            let pm = 0
+            while pm < pMsgs.length {
+              const pTxt = pWho + pMsgs[pm]
+              if pChan[pm] == 1 {
+                tErrUnsupported(pTxt, ix)
+              } else {
+                tErr(pTxt, ix)
+              }
+              pm = pm + 1
+            }
+          } else if !binOpDefinedFor(binCstr.op[ci], clt, crt) {
+            // The refusal sentence is the direct spelling's, verbatim; the anchor moves to
+            // the first argument (not the call's last token) so a one-line call carets correctly.
+            const lNo = cstrArgNoOf(binCstr.lt[ci], hNames, hArgNo)
+            const rNo = cstrArgNoOf(binCstr.rt[ci], hNames, hArgNo)
+            const lN = cstrArgCountOf(binCstr.lt[ci], hNames)
+            const rN = cstrArgCountOf(binCstr.rt[ci], hNames)
+            let refusal = "operator '"
+              + binCstr.op[ci]
+              + "' is not defined for "
+              + tyToStr(clt)
+              + " and "
+              + tyToStr(crt)
+            if binCstr.op[ci] == OP_NEG {
+              refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
+            }
+            if binCstr.op[ci] == OP_BNOT {
+              refusal = "unary '~' expects a numeric type, got " + tyToStr(clt)
+              if isNumeric(clt) {
+                refusal = "operator '~' is integer-only, got " + tyToStr(clt)
+              }
+            }
+            if binCstr.op[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
+            if binCstr.op[ci] == OP_LITFIT {
+              refusal = tyToStr(clt)
+                + " cannot hold the 64-bit operand it meets"
+            }
+            // An ordering over a gradual union is refused in the direct spelling's words.
+            const cop = binCstr.op[ci]
+            if (
+              (cop == "<" || cop == ">" || cop == "<=" || cop == ">=")
+              && (tyIsGradualUnion(binCstr.lt[ci])
+                || tyIsGradualUnion(binCstr.rt[ci]))
+            ) {
+              refusal = "comparison expects numeric operands, got "
+                + tyToStr(clt)
+                + " and "
+                + tyToStr(crt)
+            }
+            let anchorNo = lNo
+            if anchorNo == 0 { anchorNo = rNo }
+            let msg = refusal + " (the call's argument types)"
+            if lN <= 1 && rN <= 1 && anchorNo > 0 {
+              let bodyWho = "the callee's body"
+              if who != "" { bodyWho = "the body of `" + who + "`" }
+              // One argument responsible gets the `argument N:` head every other diagnostic
+              // uses; two get no head (it would blame one) and the tail names both instead.
+              let head = "argument " + i32ToStr(anchorNo) + ": "
+              let tail = " ("
+                + bodyWho
+                + " applies '"
+                + binCstr.op[ci]
+                + "' to this argument)"
+              if lNo != 0 && rNo != 0 {
+                if lNo == rNo {
+                  tail = " ("
+                    + bodyWho
+                    + " uses it on both sides of '"
+                    + binCstr.op[ci]
+                    + "')"
+                } else {
+                  head = ""
+                  tail = " ("
+                    + bodyWho
+                    + " applies '"
+                    + binCstr.op[ci]
+                    + "' to arguments "
+                    + i32ToStr(lNo)
+                    + " and "
+                    + i32ToStr(rNo)
+                    + ")"
+                }
+              }
+              if binCstr.op[ci] == OP_NEG {
+                tail = " (" + bodyWho + " negates this argument)"
+              }
+              if binCstr.op[ci] == OP_BNOT {
+                tail = " (" + bodyWho + " flips this argument's bits)"
+              }
+              if binCstr.op[ci] == OP_LITFIT {
+                tail = " (" + bodyWho + " computes with it and a 64-bit value)"
+              }
+              msg = head + refusal + tail
+            }
+            const aNode = cstrArgNodeOf(anchorNo, hArgNo, hArgNode)
+            if aNode >= 0 { tErr(msg, aNode) } else { tErr(msg, ix) }
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  cvNow = cvWas
+  0
+}
+
+// Records the return values of the body at `body` when its inferred return `ret` is a join a pin
+// re-joins (`tpJoinUnions`): each value's type, and whether it is a list stored as built.
+export function noteRetJoinValues(ret: i32, body: i32) {
+  if ret < 0 || ret >= T.tys.length || tpJoinUnions.length == 0 { return 0 }
+  let inner = ret
+  const rt = T.tys[ret]
+  if rt is TyNullable { inner = rt.nInner }
+  if !tpJoinUnions.has(ret) && !tpJoinUnions.has(inner) { return 0 }
+  const rets: i32[] = []
+  collectRetValues(body, rets)
+  const tys: i32[] = []
+  const fixed: boolean[] = []
+  let i = 0
+  while i < rets.length {
+    const r = rets[i]
+    i = i + 1
+    // A value `if` yields its arms: its own node carries one arm's type, not their join.
+    const x = parenPeelIx(r)
+    if x >= 0 && x < P.nodes.length && P.nodes[x] is IfStmt {
+      a20RetWalk(x, true, rets)
+      continue
+    }
+    const t = nodeTyIxOf(r)
+    if t < 0 { return 0 }
+    // A value that is itself a recorded join (`return w(t)`) contributes that join's own values.
+    const sub = tpRetJoinTys.get(t) ?? []
+    const subFixed = tpRetJoinFixed.get(t) ?? []
+    if sub.length > 0 && subFixed.length == sub.length {
+      let k = 0
+      while k < sub.length {
+        tys.push(sub[k])
+        fixed.push(subFixed[k])
+        k = k + 1
+      }
+    } else {
+      if t == ret || t == inner { return 0 }
+      tys.push(t)
+      fixed.push(!listLitFresh(r))
+    }
+  }
+  if !retValuesCover(inner, tys) { return 0 }
+  noteRetJoin(ret, tys, fixed)
+}
+
+// The index-operator function `op` dispatches to for a receiver of type `recvTy` — the first
+// declaration whose `self` parameter accepts it, or "" when none does. First-declared wins,
+// reachable only when two declared receivers both accept one value (one structurally
+// assignable to the other); a nominal newtype is never in that position, since a brand accepts only itself.
+export function opIdxFnFor(op: string, recvTy: i32) {
+  if recvTy < 0 { return "" }
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      const nm = opIdxFns[i]
+      const fnTy = lookup(nm)
+      if fnTy >= 0 {
+        // Forces an un-annotated return past its pending sentinel here, exactly as the UFCS
+        // and `a op b` resolutions do, so a call ahead of the declaration reads a real type.
+        const preFt = T.tys[fnTy]
+        if preFt is TyFunc {
+          if preFt.fnRet == -2 {
+            if !onInferStack(nm) {
+              const dIx = fnDeclIx[nm] ?? -1
+              if dIx >= 0 { checkerForceFn(0, dIx, -1, -1) }
+            }
+          }
+        }
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          const ps = ft.fnParamTypes
+          if ps.length > 0 {
+            if assignable(recvTy, ps[0]) { return nm }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Binds the index operator's declared type parameters from the receiver and key types, the
+// way `opSelfFnTy` binds a binary operator's. One `"[]"` function serves every instantiation,
+// so its declared types are a template, not the site's own — taken verbatim, an unbound type
+// variable would be check-clean and invalid at emit. `keyTy < 0` binds the receiver alone (the write arm).
+export function opIdxBindGen(
+  fn: string,
+  recvTy: i32,
+  keyTy: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  const fnTy = lookup(fn)
+  if fnTy >= 0 {
+    const ft = T.tys[fnTy]
+    if ft is TyFunc {
+      const ps = ft.fnParamTypes
+      if ps.length > 0 { bindGenWalk(ps[0], recvTy, bNames, bTys) }
+      if ps.length > 1 {
+        if keyTy >= 0 { bindGenWalk(ps[1], keyTy, bNames, bTys) }
+      }
+    }
+  }
+}
+
+// Rewrite `f(a, b, c)` into `f(a, [b, c])` when `f`'s last parameter is a rest one, in place,
+// so every later reader — this function's index-parallel loop, the monomorphizer's positional
+// column, the emitter's list-literal path — sees an ordinary fixed-arity call. Returns false
+// when it refused; `callIsRestPacked` is what stops it running twice.
+export function restCallPack(n: Call, ix: i32, restIx: i32) {
+  const args = n.callArgs
+  if hasNamedArgs(n.callArgNames) {
+    tErr(
+      "a named argument binds one parameter and a rest parameter is many, so a call "
+        + "that reaches a rest parameter is positional",
+      ix,
+    )
+    return false
+  }
+  const head: i32[] = []
+  let i = 0
+  while i < restIx {
+    head.push(args[i])
+    i = i + 1
+  }
+  const tail: i32[] = []
+  while i < args.length {
+    tail.push(args[i])
+    i = i + 1
+  }
+  // The packed list reports at the first argument it swallows, so an element mismatch points
+  // there rather than at the end of the file; with nothing to swallow it takes the call's.
+  const lst = mkArrayLit(tail, n.pos)
+  // The pack is checked as the rest argument, and its type is recorded like any argument's.
+  while nodeTyIx.length <= lst { nodeTyIx.push(-1) }
+  if tail.length > 0 {
+    adoptNodeTok(lst, tail[0])
+  } else {
+    adoptNodeTok(lst, ix)
+  }
+  head.push(lst)
+  n.callArgs = head
+  const names: string[] = []
+  n.callArgNames = names
+  markCallRestPacked(ix)
+  // Stamp the arena: the parse bank must not serve a cached tree by popping the rows this
+  // appended, which would leave `callArgs` pointing past the truncation and make every name
+  // inside the packed list read as unused.
+  arenaNoteEdit(ix)
+  true
+}
+
+// Binds a call's arguments into parameter order when any is named (`f(b: 1, a: 2)`): named
+// args fill their parameter's slot, positionals fill what remains in order. Returns the
+// value-node indices in parameter order, or an empty list on a binding failure (an
+// unknown/duplicate name, diagnosed here). A slot with neither an argument nor a default names the parameter it is missing.
+export function orderNamedCallArgs(
+  paramNames: string[],
+  args: i32[],
+  argNames: string[],
+  ix: i32,
+  declParams: i32[],
+) {
+  const bad: i32[] = []
+  if paramNames.length < args.length {
+    // Arity is diagnosed by the caller; just refuse to reorder.
+    tErr("named arguments require a declared function with matching arity", ix)
+    return bad
+  }
+  const ordered = orderArgsByParamNames(paramNames, args, argNames)
+  if namedOrderRefused(paramNames, args, argNames, ordered) { return bad }
+  if ordered.length != paramNames.length {
+    tErr("named argument does not match a parameter", ix)
+    return bad
+  }
+  const missing = fillArgDefaults(ordered, declParams, ix)
+  if missing >= 0 {
+    let who = ""
+    if missing < paramNames.length { who = paramNames[missing] }
+    tErr("missing argument for parameter `" + who + "`", ix)
+    return bad
+  }
+  ordered
+}
+
+// The Q8 rule (D4061): a positional argument lands at its written index, so it may follow named
+// ones only when each sits in its own parameter's position, and a name may not take a parameter
+// a positional argument filled. A method call's `paramNames` leaves the receiver out, which is
+// position 0. Raises the first fault left to right; true when it raised.
+function namedOrderRefused(
+  paramNames: string[],
+  args: i32[],
+  argNames: string[],
+  ordered: i32[],
+) {
+  let outAt = -1
+  let outK = -1
+  let j = 0
+  while j < args.length {
+    const nm = callArgNameAt(argNames, j)
+    if nm == "" {
+      if outAt >= 0 {
+        tErrCodedData(
+          "`"
+            + callArgNameAt(argNames, outAt)
+            + "` is parameter "
+            + i32ToStr(outK + 1)
+            + " but is written in position "
+            + i32ToStr(outAt + 1)
+            + namedOrderSlotOwner(paramNames, outAt)
+            + "; name the arguments after it, or move it",
+          args[j],
+          CODE_NAMED_ARG_OUT_OF_POSITION,
+          namedOrderFixData(paramNames, args, argNames, ordered, outAt),
+        )
+        return true
+      }
+    } else {
+      const k = paramIndexOfName(paramNames, nm)
+      if k < paramNames.length && k != j {
+        if k < j && callArgNameAt(argNames, k) == "" {
+          tErr(
+            "`"
+              + nm
+              + "` is already given by the positional argument in position "
+              + i32ToStr(k + 1)
+              + "; give it once",
+            args[j],
+          )
+          return true
+        }
+        if outAt < 0 {
+          outAt = j
+          outK = k
+        }
+      }
+    }
+    j = j + 1
+  }
+  false
+}
+
+// —— constraints phase 1: bounds ————————————————————————————————————————————
+// A validation layer over machinery that already lowers: the body resolves a generic bound
+// member against the bound, the instantiation site resolves it against the argument, and the
+// two must agree — a mismatch is check-clean invalid wasm without this layer (D1001).
+
+// The strict body (OQ-5, as ruled): inside `function f<T: B>(x: T)`, a member use on `x`
+// resolves against `B`'s members and nothing else — `-1` when the bound has no such member,
+// so the caller raises the refusal naming `B`. An unbounded `<T>` never reaches here; operator
+// use is untouched, since the implicit `HD_BINOP` machinery is a separate mechanism (OQ-2).
+export function boundMemberTy(tvName: string, prop: string, wantCall: boolean) {
+  const bAnn = tpBoundOfName(tvName)
+  if bAnn < 0 { return -1 }
+  const root = boundObjRootOf(bAnn)
+  if root < 0 { return -1 }
+  const bn: string[] = []
+  const bt: i32[] = []
+  const bm: boolean[] = []
+  boundMembersOf(root, bn, bt, bm)
+  let i = 0
+  while i < bn.length {
+    if bn[i] == prop {
+      // Distinct from "no such member" (-1): `assignable` reads a negative side as "accept
+      // anything", so feeding -1 here would make an unresolved bound silently accept every argument.
+      if bt[i] < 0 { return BOUND_UNRESOLVED }
+      // A method member is call-only (`x.m` alone has no closure to hand back); a field
+      // member serves both spellings, since a field is a value and calling it calls the closure it holds.
+      if bm[i] && !wantCall { return -1 }
+      return bt[i]
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether a UFCS call with `argc` explicit arguments on `recvTy` would dispatch to the free
+// self-function merged as `mangled` (D1230) — mirrors `ufcsCallTy`'s gate arm for arm, and
+// deliberately nothing after it, since this runs speculatively over every same-named candidate
+// for a call that already failed and must not raise diagnostics or mutate inference state. A true answer is not a promise the call would compile, only the promise the message makes.
+function ufcsWouldDispatch(mangled: string, recvTy: i32, argc: i32) {
+  const fnTy = lookup(mangled)
+  if fnTy < 0 { return false }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const params = ft.fnParamTypes
+    if params.length < 1 { return false }
+    if !declFirstParamIsSelf(mangled) { return false }
+    const uDecl = declParamsAfterSelf(mangled)
+    let uRequired = params.length - 1
+    if uDecl.length == params.length - 1 { uRequired = fnRequiredArity(uDecl) }
+    // `ufcsCallTy`'s storage-type refusal: a `self` whose type parameter would bind `u8`.
+    if tyIsU8ArrayTy(recvTy) {
+      const bNames: string[] = []
+      const bTys: i32[] = []
+      bindGenWalk(params[0], recvTy, bNames, bTys)
+      if tyReachesHole(substTyDeep(params[0], bNames, bTys), 8) { return false }
+    }
+    // The rest arm of `ufcsCallTy`'s gate, mirrored: a variadic callee's upper bound is
+    // unbounded, and this speculative twin must agree about what dispatches.
+    const uRest = restParamIndex(uDecl)
+    if uRest >= 0 {
+      let uLo = uRequired
+      if uLo > uRest { uLo = uRest }
+      if argc < uLo { return false }
+      return assignable(recvTy, params[0])
+    }
+    if argc < uRequired || argc + 1 > params.length { return false }
+    return assignable(recvTy, params[0])
+  }
+  false
+}
+
+// The comma-joined module specifiers that would make `recv.prop(argc args)` at call node `ix`
+// resolve, or "" (D1230): the graph registry's rows in dependency-first order, then std's
+// catalog (D3122), deduplicated. When the call's module binds `prop` as a function D1570
+// explains (`ufcsSiteKind`), a plain one yields "" and a `self`-function drops the catalog.
+export function ufcsMissingImportSpecs(
+  prop: string,
+  recvTy: i32,
+  argc: i32,
+  ix: i32,
+) {
+  const specs: string[] = []
+  const siteKind = ufcsSiteKind(ix, prop, recvTy, argc)
+  if siteKind == 1 { return "" }
+  let i = 0
+  while i < ufcsImpName.length {
+    if ufcsImpName[i] == prop {
+      if ufcsWouldDispatch(ufcsImpMangled[i], recvTy, argc) {
+        if !strListHas(specs, ufcsImpSpec[i]) { specs.push(ufcsImpSpec[i]) }
+      }
+    }
+    i = i + 1
+  }
+  if siteKind == 0 { stdRecvSpecsInto(specs, prop, recvTy, argc) }
+  let out = ""
+  let j = 0
+  while j < specs.length {
+    if j > 0 { out = out + "," }
+    out = out + specs[j]
+    j = j + 1
+  }
+  out
+}
+
+// D1570's gate kind for `ufcsSiteFn`, or 0 (D3122). A plain function (1) answers ahead of
+// every candidate module, since its author meant it as the method; any kind answers ahead of a
+// std module the author never mentioned.
+function ufcsSiteKind(ix: i32, prop: string, recvTy: i32, argc: i32) {
+  ufcsNotMethodKind(ufcsSiteFn(ix, prop), recvTy, argc)
+}
+
+// D3122 — the std catalog's half of `ufcsMissingImportSpecs`: appends to `specs` each std
+// module outside the registry whose `self`-function `prop` takes `argc` arguments and whose
+// receiver annotation `recvTy` fits. Nothing of those modules is loaded, so the fit is read
+// from the annotation's spelling (`stdRecvFits`) rather than from a declaration.
+function stdRecvSpecsInto(
+  specs: string[],
+  prop: string,
+  recvTy: i32,
+  argc: i32,
+) {
+  if recvTy < 0 { return 0 }
+  const rt = T.tys[recvTy]
+  if rt is TyVar || rt is TyErr { return 0 }
+  stdRecvLoad()
+  let i = 0
+  while i < stdRecvName.length {
+    if (
+      stdRecvName[i] == prop
+      && !strListHas(specs, stdRecvSpec[i])
+      && !ufcsRegistryHas(prop, stdRecvSpec[i])
+      && argc >= stdRecvMin[i]
+      && (stdRecvMax[i] < 0 || argc <= stdRecvMax[i])
+      && stdRecvFits(stdRecvSelf[i], stdRecvTparams[i], recvTy)
+    ) {
+      specs.push(stdRecvSpec[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether a value of type `ty` is assignable to a catalog `self` annotation `spell`, whose
+// type parameters are the `,`-joined `tparams`. The spelling holds only builtin leaves, those
+// parameters, `[]`, a leading `readonly` and `|` (the generator's filter); a union annotation
+// fits when every member of `ty` fits one of its members.
+function stdRecvFits(spell: string, tparams: string, ty: i32) {
+  let body = spell
+  let ro = false
+  if body.length > 9 && body.slice(0, 9) == "readonly " {
+    ro = true
+    body = body.slice(9, body.length)
+  }
+  const tps = stdRecvSplit(tparams, ',')
+  const alts = stdRecvSplit(body, '|')
+  const t = T.tys[ty]
+  if alts.length > 1 && t is TyUnion {
+    for m in t.uMembers {
+      if !stdRecvFitsSome(alts, tps, m, ro) { return false }
+    }
+    return true
+  }
+  stdRecvFitsSome(alts, tps, ty, ro)
+}
+
+// Whether `ty` fits any one of the annotation members `alts`.
+function stdRecvFitsSome(alts: string[], tps: string[], ty: i32, ro: boolean) {
+  for a in alts {
+    if stdRecvFitsOne(a, tps, ty, ro) { return true }
+  }
+  false
+}
+
+// Whether `ty` fits one annotation member `sp`: a type parameter anything but the storage type
+// `u8`, which it never binds; `X[]` an array whose element is exactly `X` (a growable one unless
+// `ro`); and a builtin leaf by `assignable`.
+function stdRecvFitsOne(
+  sp: string,
+  tps: string[],
+  ty: i32,
+  ro: boolean,
+): boolean {
+  if ty < 0 { return false }
+  if strListHas(tps, sp) { return ty != TY_U8 }
+  if stdRecvIsList(sp) {
+    const t = T.tys[ty]
+    if t is TyArray {
+      if !ro && t.aRead != 0 { return false }
+      const inner = sp.slice(0, sp.length - 2)
+      if strListHas(tps, inner) { return t.aElem != TY_U8 }
+      if t.aElem < 0 { return false }
+      return stdRecvFitsOne(inner, tps, t.aElem, false)
+        && stdRecvLeafExact(inner, t.aElem)
+    }
+    return false
+  }
+  const lt = stdRecvLeafTy(sp)
+  if lt < 0 { return false }
+  assignable(ty, lt)
+}
+
+// An array element is invariant: `X[]` takes an element type `X` accepts and that accepts `X`.
+// A nested `X[][]` element is decided by the recursion, so only a leaf is compared here.
+function stdRecvLeafExact(sp: string, ty: i32): boolean {
+  if stdRecvIsList(sp) { return true }
+  const lt = stdRecvLeafTy(sp)
+  lt >= 0 && assignable(lt, ty)
+}
+
+// Whether `name` is a `self`-function whose declared `self` type accepts `recvTy`, raising no
+// diagnostic — asked only of the type-bound candidate, once the scope's own has stepped aside.
+export function ufcsSelfAccepts(name: string, fnTy: i32, recvTy: i32): boolean {
+  if fnTy < 0 { return false }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length < 1 { return false }
+    if !declFirstParamIsSelf(name) { return false }
+    const p0 = ft.fnParamTypes[0]
+    if p0 < 0 { return false }
+    return assignable(recvTy, p0)
+  }
+  false
+}
+
+// The `self`-function of set `row` a receiver of `recvTy` selects: the one whose head is the
+// receiver's, else the one whose first parameter accepts it (a wider record), as a lone
+// candidate would. "" when none does, "*" when several do. One lookup, after the receiver is
+// typed, so the choice never feeds back into the receiver's inference.
+export function ovPickFor(row: i32, recvTy: i32): string {
+  const heads = ovRecvHeads(recvTy)
+  let found = ""
+  for c in ovSetCands[row] {
+    if declFirstParamIsSelf(c) && strListHas(heads, ovFnHead[c] ?? "") {
+      if found != "" { return "*" }
+      found = c
+    }
+  }
+  if found != "" || tyHasHole(recvTy) { return found }
+  for c in ovSetCands[row] {
+    if declFirstParamIsSelf(c) && ufcsSelfAccepts(c, lookup(c), recvTy) {
+      if found != "" { return "*" }
+      found = c
+    }
+  }
+  found
+}
+
+// One instance's answer for the overloaded member call `site`, whose receiver this pin
+// binds to `ur`: the candidate its head selects, its receiver and arguments checked under the
+// pin, and the choice recorded per instance (`ovInstSite`) for the editor.
+function ovPinCheck(
+  site: i32,
+  ur: i32,
+  prop: string,
+  bNames: string[],
+  bTys: i32[],
+  at: i32,
+  uWho: string,
+) {
+  const row = ovSiteSetOf(site)
+  if row < 0 { return 0 }
+  let pick = ovPickFor(row, ur)
+  if pick == "" || pick == "*" {
+    tErr(
+      ovRefuseMsg(row, prop, ur, pick)
+        + " ("
+        + uWho
+        + " at the call's argument types)",
+      at,
+    )
+    pick = ""
+  }
+  // Recorded refused or not ("" picks nothing), so the site is not also reported unpinned.
+  const urS = tyToStrUser(ur)
+  let seen = false
+  let k = 0
+  while k < ovInstSite.length {
+    if ovInstSite[k] == site && ovInstRecv[k] == urS { seen = true }
+    k = k + 1
+  }
+  if !seen {
+    ovInstSite.push(site)
+    ovInstRecv.push(urS)
+    ovInstPick.push(pick)
+  }
+  if pick == "" { return 0 }
+  const ft = T.tys[lookup(pick)]
+  const c = P.nodes[site]
+  if ft is TyFunc {
+    if c is Call {
+      const pN: string[] = []
+      const pT: i32[] = []
+      bindGenWalk(ft.fnParamTypes[0], ur, pN, pT)
+      let i = 0
+      while i < c.callArgs.length && i + 1 < ft.fnParamTypes.length {
+        const got = substTyDeep(nodeTyIxOf(c.callArgs[i]), bNames, bTys)
+        if got >= 0 && !tyHasHole(got) {
+          bindGenWalk(ft.fnParamTypes[i + 1], got, pN, pT)
+          const want = substTyDeep(ft.fnParamTypes[i + 1], pN, pT)
+          if !assignable(got, want) {
+            tErr(
+              "argument "
+                + i32ToStr(i + 1)
+                + " of `."
+                + prop
+                + "(…)`: expected "
+                + tyToStr(want)
+                + ", got "
+                + tyToStr(got)
+                + " — the receiver "
+                + tyToStrUser(ur)
+                + " picks "
+                + ovCandText(row, strListIndexOf(ovSetCands[row], pick))
+                + " ("
+                + uWho
+                + " at the call's argument types)",
+              at,
+            )
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// Records each literal argument that bound one of `names` at its parameter's substituted
+// type, which is the type the instance is pinned by (`monoArgPinTyIx`) and the literal emitted at.
+export function dstRetypeLitArgs(
+  names: string[],
+  params: i32[],
+  args: i32[],
+  bNames: string[],
+  bTys: i32[],
+) {
+  let i = 0
+  while i < params.length && i < args.length {
+    let hit = false
+    for nm in names {
+      if tyMentionsTyVarNamed(params[i], nm, 8) { hit = true }
+    }
+    if hit && args[i] >= 0 {
+      const pt = substTyDeep(params[i], bNames, bTys)
+      nodeTyRecord(args[i], pt)
+      nodeTyRecord(parenPeelIx(args[i]), pt)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The natural-return accumulator for the redundant-return rule (annotated funcs):
+// the FIRST non-void/non-error return observed, mirroring noteInferredRet so the
+// captured type IS what an unannotated version would infer.
+export function noteNaturalRet(t: i32) {
+  if t < 0 { return 0 }
+  const tt = T.tys[t]
+  if tt is TyErr {
+    retNaturalErrSet(true)
+    return 0
+  }
+  if tt is TyPrim {
+    if tt.primName == "void" { return 0 }
+  }
+  // JOIN, mirroring noteInferredRet (above) so the captured "natural" return IS what
+  // an unannotated version would infer — a multi-return function joins to a union.
+  if retNatural < 0 {
+    retNaturalSet(t)
+  } else {
+    retNaturalSet(joinTys(retNatural, t))
+  }
+  0
+}
+
+// Mark every bare `{}` that `srcExpr` delivers into `dstTy`, following parentheses, the
+// fallback of `??`, list elements, record fields and the value tails of `if` / `match`. True
+// only when it reported a refusal, or when `srcExpr` itself (`direct`, parentheses aside) is
+// a `{}` it completed as a union member; every enclosing value is left to the ordinary check.
+export function bareBraceDeliver(
+  srcExpr: i32,
+  dstTy: i32,
+  depth: i32,
+  direct: boolean,
+): boolean {
+  if srcExpr < 0 || srcExpr >= P.nodes.length || depth <= 0 { return false }
+  const e = P.nodes[srcExpr]
+  if e is Paren {
+    return bareBraceDeliver(e.parInner, dstTy, depth - 1, direct)
+  }
+  if e is BinExpr {
+    if e.binOp == "??" {
+      return bareBraceDeliver(e.binRight, dstTy, depth - 1, false)
+    }
+    return false
+  }
+  if e is Block {
+    if e.blkStmts.length == 0 { return false }
+    const last = e.blkStmts[e.blkStmts.length - 1]
+    return bareBraceDeliver(last, dstTy, depth - 1, false)
+  }
+  if e is IfStmt {
+    const a = bareBraceDeliver(e.ifThen, dstTy, depth - 1, false)
+    const b = bareBraceDeliver(e.ifElse, dstTy, depth - 1, false)
+    return a || b
+  }
+  if e is MatchExpr {
+    let any = false
+    let m = 0
+    while m < e.matchBodies.length {
+      if bareBraceDeliver(e.matchBodies[m], dstTy, depth - 1, false) {
+        any = true
+      }
+      m = m + 1
+    }
+    return any
+  }
+  if e is ArrayLit { return bareBraceDeliverElems(e.arrElems, dstTy, depth) }
+  if !(e is ObjLit) { return false }
+  if e.objFields.length != 0 {
+    bareBraceDeliverFields(e.objFields, dstTy, depth)
+    return false
+  }
+  if i32ListHas(stmtBraceNodes, srcExpr) {
+    // A block's last `{}` whose value is delivered is refused naming the `({})` spelling.
+    if !i32ListHas(stmtBraceTails, srcExpr) || bareBraceSpec > 0 {
+      return false
+    }
+    while bareBraceMark.length <= srcExpr { bareBraceMark.push(0) }
+    bareBraceMark[srcExpr] = 1
+    if inferQuiet { return false }
+    tErr(
+      "a `{}` here is an empty block; to produce an empty record write `({})`",
+      srcExpr,
+    )
+    return true
+  }
+  if bareBraceHoleDst(dstTy) { return false }
+  while bareBraceMark.length <= srcExpr { bareBraceMark.push(0) }
+  bareBraceMark[srcExpr] = 1
+  if inferQuiet { return false }
+  const rec = bareBraceRecordOf(dstTy)
+  if rec >= 0 {
+    // The emitter builds the literal as this record, since no row has zero fields: its
+    // recorded type, not only its rep, names the record every reader then resolves.
+    recordRepTyAdopt(srcExpr, rec, 6)
+    while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+    nodeTySet(srcExpr, rec)
+    // Into a union the chosen member is the answer: the first whose fields all admit `null`,
+    // the order the literal-to-union adoption below tries members in. A speculative trial of
+    // one member only records; the outer delivery decides.
+    if bareBraceSpec > 0 || !direct { return false }
+    return rec != dstTy && bareBraceMembers(dstTy).length > 1
+  }
+  if bareBraceSpec > 0 { return false }
+  const msg = bareBraceRequiredMsg(dstTy)
+  if msg == "" { return false }
+  bareBraceCountSet(bareBraceCount + 1)
+  tErr(msg, srcExpr)
+  true
+}
+
+// `bareBraceDeliver` over a list literal's elements, against the element type of `dstTy`.
+function bareBraceDeliverElems(elems: i32[], dstTy: i32, depth: i32): boolean {
+  if dstTy < 0 { return false }
+  let at = dstTy
+  const an = T.tys[at]
+  if an is TyNullable { at = an.nInner }
+  if at < 0 { return false }
+  const aa = T.tys[at]
+  if !(aa is TyArray) { return false }
+  let any = false
+  let k = 0
+  while k < elems.length {
+    if bareBraceDeliver(elems[k], aa.aElem, depth - 1, false) { any = true }
+    k = k + 1
+  }
+  any
+}
+
+// Marks the `{}` values among a record literal's fields against the field types the record
+// members of `dstTy` declare, reporting nothing: the literal's own check judges the fields,
+// and a mark only records that a record type is expected there.
+function bareBraceDeliverFields(fields: i32[], dstTy: i32, depth: i32) {
+  const ms = bareBraceMembers(dstTy)
+  bareBraceSpecSet(bareBraceSpec + 1)
+  let k = 0
+  while k < fields.length {
+    const f = P.nodes[fields[k]]
+    if f is FieldInit {
+      let i = 0
+      let done = false
+      while i < ms.length && !done {
+        const mo = T.tys[ms[i]]
+        if mo is TyObj {
+          let j = 0
+          while j < mo.objFieldNames.length && !done {
+            if mo.objFieldNames[j] == f.fiName {
+              bareBraceDeliver(f.fiValue, mo.objFieldTypes[j], depth - 1, false)
+              done = true
+            }
+            j = j + 1
+          }
+        }
+        i = i + 1
+      }
+    }
+    k = k + 1
+  }
+  bareBraceSpecSet(bareBraceSpec - 1)
+  0
+}
+
+// Refuse every value-position `{}` no delivery gave a record type to complete, unless another
+// diagnostic already stands on that literal.
+export function bareBraceUndelivered() {
+  let i = 0
+  while i < bareBraceLits.length {
+    const ix = bareBraceLits[i]
+    let marked = ix < bareBraceMark.length && bareBraceMark[ix] == 1
+    let d = 0
+    while d < T.diags.length && !marked {
+      if T.diags[d].tat == ix { marked = true }
+      d = d + 1
+    }
+    if !marked {
+      if i32ListHas(stmtBraceTails, ix) {
+        tErr("an empty block does nothing; remove it", ix)
+      } else {
+        tErr(
+          "`{}` has no record type here to complete — give its destination a record type "
+            + "whose fields admit `null`, or write its fields",
+          ix,
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Re-asks every recorded `is` test this call resolves to a nullable record operand, with the
+// annotated spelling's refusal when the tested record is not its record: that operand carries
+// no tag, so the test reads the layout and can answer true for the wrong record.
+export function validateIsCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  const nOrig = isCstr.ty.length
+  let ci = 0
+  while ci < nOrig {
+    if cstrOwnedBy(isCstr.fn[ci], calleeFn) && !nestCstrOutside(isCstr.ix[ci]) {
+      const ct = substTyDeep(isCstr.ty[ci], bNames, bTys)
+      if tyHasHole(ct) {
+        if calleeFn >= 0 && ct != isCstr.ty[ci] {
+          noteIsCstr(ct, isCstr.chk[ci], isCstr.name[ci], isCstr.ix[ci])
+        }
+      } else if ct >= 0 {
+        const t = T.tys[ct]
+        let base = -1
+        if t is TyUnion { base = ct }
+        if t is TyNullable { base = t.nInner }
+        const chk = isCstr.chk[ci]
+        const bad = base >= 0
+          && (!assignable(chk, base) || isWidenNotVariant(chk, base))
+        if bad && t is TyNullable && tyHasObjMember(base) {
+          let pWho = "a parameter is tested here: "
+          if who != "" { pWho = "`" + who + "` tests its parameter here: " }
+          tErr(
+            pWho
+              + "`is` check type '"
+              + isCstr.name[ci]
+              + "' is not a variant of "
+              + tyToStr(ct),
+            ix,
+          )
+          return 0
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Re-asks every recorded container this call instantiates under its bindings. Skipped unless
+// a binding is (or holds) a vector, so a pin that binds no vector does no work.
+export function validateNestCstrs(
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+  who: string,
+) {
+  let anyVec = false
+  let bi = 0
+  while bi < bTys.length {
+    if tyIsOrNestsV128(bTys[bi], 8) { anyVec = true }
+    bi = bi + 1
+  }
+  if !anyVec { return 0 }
+  const nOrig = nestCstr.ty.length
+  let ci = 0
+  while ci < nOrig {
+    if (
+      cstrOwnedBy(nestCstr.fn[ci], calleeFn)
+      && !nestCstrOutside(nestCstr.ix[ci])
+    ) {
+      const ct = substTyDeep(nestCstr.ty[ci], bNames, bTys)
+      if tyHasHole(ct) {
+        if calleeFn >= 0 && ct != nestCstr.ty[ci] {
+          noteNestCstr(ct, nestCstr.ix[ci])
+        }
+      } else if tyNestsV128(ct, 8) {
+        let pWho = "a type parameter is stored in a container here: "
+        if who != "" {
+          pWho = "`" + who + "` stores its type parameter in a container here: "
+        }
+        tErrUnsupported(pWho + v128NestMsg(ct), ix)
+        return 0
+      } else if tyBoxesV128(ct, 8) {
+        // A generic body's `T | null` or union has no instance at a vector yet (D2634).
+        let bWho = "a type parameter"
+        if who != "" { bWho = "`" + who + "`'s type parameter" }
+        tErrUnsupported(
+          tyToStr(ct)
+            + " boxes "
+            + bWho
+            + " bound to a 128-bit vector, which a generic body has no lowering for yet — write the `v128 | null` spelling outside the generic function",
+          ix,
+        )
+        return 0
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// Refuses an inferred return that carries a body-scoped nominal type. Called from the two
+// sites that witness a pending function's result (the explicit `return` and the trailing
+// expression), so the diagnostic lands on the return. A declared return is untouched — writing
+// `: Id` is the author saying they meant it.
+export function refuseLocalNomEscape(t: i32, at: i32) {
+  if t < 0 { return 0 }
+  const nm = localNomEscapeAt(t, 0)
+  if nm == "" { return 0 }
+  tErr(
+    "return type `"
+      + nm
+      + "` is declared inside `"
+      + demangleName(curFnEscName)
+      + "` and no caller can name it; annotate the return or move `"
+      + nm
+      + "` to module scope",
+    at,
+  )
+  0
+}
+// —— dense membership over the `Ty`-arena index sets ————————————————————————
+// Each nominal-identity sidecar set is membership-tested through a parallel `boolean[]`
+// indexed by the arena index itself, since the emitter probes membership on nearly every
+// typed node. Some sets are also iterated in order — write only through `cTyIxSetAdd`.
+
+// The closing half: pops the scope, rolls the `RB_MONO` families (the type-parameter bindings
+// and the diagnostic stream among them) back to `sv`'s mark, then restores the flags — so the
+// global checker state the emitter still reads matches its original values.
+export function monoRecheckEnd(sv: MonoSave) {
+  monoRecheckDepthSet(monoRecheckDepth - 1)
+  njFnIxSet(njFnStack.pop() ?? -1)
+  popScope()
+  crFnLeave()
+  checkRollback(sv.mark, RB_MONO)
+  symEnabled = sv.sym
+  inferQuiet = sv.quiet
+  if prbArmed {
+    if tpIfCmpOn {
+      prbLeave("monoRecheck (in tpIfRecheck)")
+    } else {
+      prbLeave("monoRecheck")
+    }
+  }
+  0
+}
+
+// —— value-union name classification (moved from wasmEmit to break the typecheck<->emitter
+// import cycle) ——————————————————————————————————————————————————————————
+// An inline union annotation's synthetic name (`"A|B"`) has no `unNames` entry the way a
+// named alias does — register it as a union alias too, so the same tables/tags/lookups apply.
+
+// The value-atom kind of a niche-nullable scalar-element list member name — `(K | null)[]`
+// rides the i32-list backing (kind 7), `(boolean | null)[]` too under its own tag (kind 18),
+// `(string | null)[]` the string-list backing (kind 9); -1 otherwise. Decided over `elem`'s member spans with no
+// split and no per-member slice, mirroring the three arms of the splitting form it replaces.
+
+// `x as T` (B2) is an explicit, checked numeric conversion — unlike the implicit
+// lossless-widening rule, it permits every numeric-scalar direction (plus narrowings and
+// int/float conversions). The propagation obligation a bare `as` takes on, shared by the union
+// and numeric arms; `src` is the operand's numeric type, or -1 for a union's remainder `rest`.
+export function castPropagationFits(
+  rest: i32,
+  asTy: string,
+  ix: i32,
+  curRet: i32,
+  src: i32,
+): boolean {
+  // A pending return (-2, still inferring) is refused rather than joined into — a cast that
+  // silently widens the function's own signature defeats the point of an explicit cast.
+  if curRet == -2 {
+    tErr(
+      "`as "
+        + asTy
+        + "` propagates "
+        + tyToStr(rest)
+        + " — use `as!` to trap instead, or `as?` to take the null here"
+        + castWrapNote(asTy, src)
+        + "; to propagate it, annotate the enclosing function's return type",
+      ix,
+    )
+    return false
+  }
+  // At module scope there is nowhere to propagate to, and "the enclosing function cannot
+  // return it" would name a function that does not exist — its own sentence, its own fix.
+  if curRet < 0 {
+    tErr(
+      "`as "
+        + asTy
+        + "` propagates "
+        + tyToStr(rest)
+        + " out of the enclosing function, and there is none here — at module scope, use `as!` to trap or `as?` to take a nullable"
+        + castWrapNote(asTy, src),
+      ix,
+    )
+    return false
+  }
+  if !assignable(rest, curRet) {
+    tErr(
+      "`as "
+        + asTy
+        + "` propagates "
+        + tyToStr(rest)
+        + ", which the enclosing function cannot return (it returns "
+        + tyToStr(curRet)
+        + ") — use `as!` to trap instead, or `as?` to take the null here"
+        + castWrapNote(asTy, src),
+      ix,
+    )
+    return false
+  }
+  true
+}
+
+// Parks an `as` cast whose operand is still a hole: both of the trio's type-level questions
+// depend on the operand, and a hole answers neither, so the numeric ladder admits the cast and
+// types it `T`. One row per cast site, re-asked by `holeCastPinCheck` at the call that pins
+// the hole (D1342).
+export function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
+  if name == "" { return 0 }
+  // The pin describes the parameter, so the demand may only speak for a direct read of it —
+  // `const b = a ?? 0` retypes `b`, so a rung reading the pin there must not fire on `b`.
+  const vn = castOperandIdent(n.asObj)
+  if vn == "" { return 0 }
+  // A narrowing in force over the operand's place is the operand's type, not the pin's:
+  // `a = 7` ahead of the cast leaves the parameter pinned while the cast reads a value that can't fail.
+  if narrowedPathTy(vn) >= 0 { return 0 }
+  // ...and a write to the hole binding is the same fact with no overlay to carry it: a hole
+  // has nothing to narrow from, so only the write's own record says the pin has stopped describing it.
+  if castClobbered(name + "." + vn) { return 0 }
+  // An `is` guard over the hole means the same thing one statement out — declining is the
+  // safe direction (never adds a refusal); this rung exists to close exactly that divergence.
+  if holeHasIsAlt(name) { return 0 }
+  let i = 0
+  while i < holeCastIx.length {
+    if holeCastIx[i] == ix { return 0 }
+    i = i + 1
+  }
+  holeCastNames.push(name)
+  holeCastModePush(n.asMode)
+  holeCastVarPush(vn)
+  holeCastTgtTyPush(target)
+  holeCastTgtNamePush(n.asTy)
+  holeCastIxPush(ix)
+  holeCastRetPush(T.curRet)
+  holeCastArgNPush(0 - 1)
+  holeCastArgExpPush(0 - 1)
+  holeCastArgIxPush(0 - 1)
+  0
+}
+
+// Every parked cast on hole `name`, re-asked under the type this call site pinned it to. The
+// same shape `holeIsArrayDemanded` uses: the body records what it needs to know, and the
+// argument is the first place the answer exists. Gated on the real pass because the `as?` half
+// writes a node type, which a probe's save/restore does not cover.
+export function holeCastPinCheck(name: string, at: i32, pName: string) {
+  if inferQuiet { return 0 }
+  if at < 0 { return 0 }
+  if pName == "" { return 0 }
+  if tyIsHole(at) { return 0 }
+  let k = 0
+  while k < holeCastNames.length {
+    if holeCastNames[k] == name && holeCastVar[k] == pName {
+      castPinAdjudicate(k, at)
+    }
+    k = k + 1
+  }
+  0
+}
+
+// One parked cast, adjudicated against the pinned operand type `at`. The ladder is
+// `checkCastNode`'s own, minus the arms a hole already answered — this rung must never be the
+// first place a cast is rejected for a reason the direct spelling reports differently.
+function castPinAdjudicate(k: i32, at: i32) {
+  const target = holeCastTgtTy[k]
+  if target < 0 { return 0 }
+  const mode = holeCastMode[k]
+  if mode == "trap" { return 0 }
+  const castIx = holeCastIx[k]
+  // `as%` picks no arm and cannot fail, so the pin answers only the two questions a hole hid:
+  // is the pinned operand a number at all, and is either side a float.
+  if mode == "wrap" { return castPinWrapCheck(at, target, castIx) }
+  // A nullable operand is a union operand, expanded exactly as `checkCastNode`'s arm expands
+  // it — one rule, two entry points, so the hole and the annotation cannot disagree.
+  let argU = at
+  const argN = T.tys[at]
+  if argN is TyNullable {
+    if argN.nInner >= 0 {
+      const nulU = mkUnionTy([argN.nInner, TY_NULL])
+      if nulU >= 0 { argU = nulU }
+    }
+  }
+  const argT = T.tys[argU]
+  const dom = numCastDomainName(holeCastTgtName[k], target)
+  if argT is TyUnion {
+    // A numeric union converts at the member it holds where no member can fail, as there.
+    if numUnionAsConverts(argU, target) { return 0 }
+    // `as u8` over a union, refused at the pin in `checkCastNode`'s own words (D1587) — the
+    // hole is where the operand's union first becomes visible; declining silently would diverge.
+    if dom == "u8" {
+      tErr(
+        "`as u8` narrows a number into 0..255, and "
+          + tyToStr(argU)
+          + " is a union — take the numeric arm first, then the range (`(x as! i32) as! u8`)",
+        castIx,
+      )
+      return 0
+    }
+    if !unionCoversTy(argT, target) { return 0 }
+    const rest = subtractTy(argU, target)
+    if rest < 0 { return 0 }
+    if mode == "null" { return castPinNullLand(k, castIx, target) }
+    castPropagationFits(rest, holeCastTgtName[k], castIx, holeCastRet[k], -1)
+    return 0
+  }
+  const sn = primNameStr(primNameOf(at))
+  // A pin at no number is never the target, so the cast fails there as a fallible one can. A
+  // `boolean` pin converts exactly, as the direct spelling does.
+  if sn == "boolean" { return 0 }
+  const snNum = sn == "i32" || sn == "i64" || sn == "f32" || sn == "f64"
+  if snNum && !numCastCanFail(sn, dom) { return 0 }
+  if mode == "null" { return castPinNullLand(k, castIx, target) }
+  castPropagationFits(TY_NULL, holeCastTgtName[k], castIx, holeCastRet[k], at)
+  0
+}
+
+// D1371 — the re-record is not the whole answer: the body already handed the cast's value
+// somewhere, at the pre-pin type, so it must be re-asked here through `argMismatchErr` — the
+// one home of both the wording and the anchor, so the hole reports character-for-character
+// what the annotated twin reports at the same position.
+function castPinNullLand(k: i32, castIx: i32, target: i32) {
+  castPinNullResult(castIx, target)
+  const exp = holeCastArgExp[k]
+  if exp < 0 { return 0 }
+  const nt = nodeTyIxOf(castIx)
+  if nt < 0 { return 0 }
+  if assignable(nt, exp) { return 0 }
+  argMismatchErr(holeCastArgN[k], exp, nt, holeCastArgIx[k])
+  0
+}
+
+// Whether a numeric cast can fail, under the owner's ruling: a cast to an integer target is
+// exact-or-fail, a cast to a float target rounds and cannot. `u8` is a domain, not a target
+// type (D1587) — `x as u8` produces an `i32`, and what `u8` names is the range 0..255, so
+// every numeric source (i32 included) can fail it. The nine pairs are closed, matching the emitter (D965).
+
+// Reports and answers true when a wrap cast names a float on either side. `as%` is integers
+// only by ruling, and the refusal names the family that does convert a float. One home for the
+// wording, because a hole operand re-asks it at the call site that pins the width.
+export function wrapCastFloatRefused(
+  argTy: i32,
+  target: i32,
+  ix: i32,
+): boolean {
+  const sn = primNameStr(primNameOf(argTy))
+  const tn = primNameStr(primNameOf(target))
+  let bad = ""
+  if sn == "f32" || sn == "f64" { bad = sn }
+  if tn == "f32" || tn == "f64" { bad = tn }
+  if bad == "" { return false }
+  tErr(
+    "`as%` wraps between integer widths, and "
+      + bad
+      + " is a float — use the exact family (`as!` traps, `as?` yields null)",
+    ix,
+  )
+  true
+}
+
+// One parked `as%` cast, re-asked under the type its call site pinned the hole to. Reported in
+// `checkCastNode`'s own words, so the pin and the direct spelling cannot disagree.
+function castPinWrapCheck(at: i32, target: i32, castIx: i32) {
+  if primNameOf(at) == "boolean" {
+    tErr(AS_WRAP_BOOL_MSG, castIx)
+    return 0
+  }
+  if !isNumeric(at) {
+    tErr("`as` supports numeric conversions only", castIx)
+    return 0
+  }
+  if wrapCastFloatRefused(at, target, castIx) { return 0 }
+  0
+}
+
+// Raises the redundant-cast refusal when cast `n` at `ix` names the type its operand already
+// has (`t as! string` after `t is string`), with the edit that drops it; false otherwise.
+export function redundantCastRaise(
+  n: AsExpr,
+  arg: i32,
+  target: i32,
+  ix: i32,
+): boolean {
+  if arg < 0 || target < 0 || arg == TY_ERR || target == TY_ERR { return false }
+  if !tyEq(softenLitTy(arg), target) { return false }
+  let what = "this value"
+  const on = P.nodes[n.asObj]
+  if on is Ident { what = "`" + on.identName + "`" }
+  let form = "as"
+  if n.asMode == "trap" { form = "as!" }
+  if n.asMode == "null" { form = "as?" }
+  if n.asMode == "wrap" { form = "as%" }
+  let data = ""
+  const st = nodeStartTok(ix)
+  const ot = nodeLastTok(n.asObj)
+  // A one-token operand (a literal, `this`) is named as written.
+  if st >= 0 && ot == st && ot < P.toks.length {
+    what = "`" + P.toks[st].text + "`"
+  }
+  if st >= 0 && ot >= st && ot < P.toks.length {
+    const keep = P.toks[ot].start + P.toks[ot].text.length - P.toks[st].start
+    if keep > 0 { data = diagDataField("keep", i32ToStr(keep)) }
+  }
+  tErrCodedData(
+    what
+      + " is already `"
+      + tyToStr(target)
+      + "` here, so the `"
+      + form
+      + "` cast does nothing — drop it",
+    ix,
+    CODE_REDUNDANT_CAST,
+    data,
+  )
+  true
+}
+
+// A cast over a constant tree is decided at its exact value (D3588): a value the domain holds
+// converts exactly in every mode, a value it does not hold is a check error. 0 when the operand
+// is no constant, 1 when it holds, 2 when refused. A radix pattern whose top bit is set at its
+// own width stays the width-dependent reading the ordinary cast takes.
+export function castConstDecide(
+  n: AsExpr,
+  ix: i32,
+  arg: i32,
+  target: i32,
+): i32 {
+  const p = parenPeelIx(n.asObj)
+  if p < 0 || cexTreeShape(p, 0) != 1 { return 0 }
+  const v = cexEvalAt(p, 0)
+  if !cexOk(v) { return 0 }
+  if v.cxPat {
+    let bits = 32
+    if arg == TY_I64 { bits = 64 }
+    if v.cxNeg || !cexFitsSigned(v, bits) { return 0 }
+  }
+  const dom = numCastDomainName(n.asTy, target)
+  const why = castConstMisfit(v, dom, p)
+  if why != "" {
+    tErr(why + castConstModeTail(n.asMode, dom, v), ix)
+    return 2
+  }
+  castConstSettle(n, ix, v, arg, dom)
+  1
+}
+
+// ── unary ──────────────────────────────────────────────────────────────────
+
+export function jsonDeepIsSite(
+  ix: i32,
+  chkTy: i32,
+  objIx: i32,
+  objTy0: i32,
+): i32 {
+  jwBadMsgSet("")
+  if chkTy < 0 { return -1 }
+  const objTy = jsonReceiverDeclTy(objIx, objTy0)
+  const root = jsonUnionRootIn(objTy)
+  if root < 0 { return -1 }
+  // `x is Json` is the whole union and is trivially true — left to the ordinary route.
+  // Membership is asked of the ROOT, not the receiver's possibly-narrowed view.
+  if jsonSelfRef(chkTy, root) { return -1 }
+  if jsonExactMemberOf(root, chkTy) { return -1 }
+  // And an arm of the RECEIVER, not the same set when it is wider than the tree — a union
+  // of `Json | Payload` makes `x is Payload` a tag test, not a walk.
+  if jsonExactMemberOf(objTy, chkTy) { return -1 }
+  const seen: i32[] = []
+  const bad = jsonShapeBad(chkTy, root, seen)
+  if bad != "" {
+    // Not an error on its own: a JSON-shaped union is still an ordinary union, and the
+    // ordinary route answers plenty of non-shape spellings — banked, used only if that gate rejects too.
+    jwBadMsgSet(bad)
+    return 0
+  }
+  jwRecordSite(ix, chkTy, jsonParamSpell(objTy, root), root)
+  1
+}
+
+// The walker's parameter, spelled through names the program already carries — the root, plus
+// any arms the receiver reaches beyond the tree (a wider receiver like `Json | JsonError`).
+// Not `tyToStr(objTy)`: a narrowed receiver's arena type renders as the union flattened, which
+// mints a spelling nothing registered — an emit reject on a check-clean program.
+function jsonParamSpell(objTy: i32, root: i32): string {
+  if assignable(objTy, root) { return tyToStr(root) }
+  let s = tyToStr(root)
+  const ms = jsonUnionMembers(objTy)
+  let i = 0
+  while i < ms.length {
+    if !jsonSelfRef(ms[i], root) {
+      if !jsonExactMemberOf(root, ms[i]) {
+        const m = tyToStr(ms[i])
+        if !jsonSpellHas(s, m) { s = s + " | " + m }
+      }
+    }
+    i = i + 1
+  }
+  s
+}
+
+// Settles the `return <void expr>` sites an inferred body recorded from `from` on: refused when
+// the function's final return type `ret` is a value, kept for `voidRetRewrite` when it is void.
+export function refuseVoidRetsFrom(from: i32, ret: i32) {
+  if from < 0 || from > inferVoidRetSites.length { return 0 }
+  const valued = ret >= 0 && !isVoidTy(ret) && ret != TY_ERR && ret != TY_NEVER
+  let i = from
+  while i < inferVoidRetSites.length {
+    if valued {
+      tErr(
+        "return expects a value of type " + tyToStr(ret) + ", got void",
+        inferVoidRetSites[i],
+      )
+    } else if isVoidTy(ret) {
+      voidRetRwRet.push(inferVoidRetSites[i])
+      voidRetRwBlk.push(inferVoidRetBlks[i])
+    }
+    i = i + 1
+  }
+  while inferVoidRetSites.length > from {
+    inferVoidRetSites.pop()
+    inferVoidRetBlks.pop()
+  }
+  0
+}

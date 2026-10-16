@@ -1,0 +1,4849 @@
+// The checker's type relation and what it is built from: `assignable`, the joins, type
+// substitution and generic binding, annotation resolution (`nameToTy`/`tsToTy`), and the
+// diagnostic sink (`tErr*`) every check reports through. These are one strongly connected set,
+// so they share a module. Nothing here walks a node by kind: where a relation needs the core
+// checker (an operator's pending return, a `??` default) it calls `checkerForceFn`, which
+// `checkProgramPass` installs.
+
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  FieldDef,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  LetDecl,
+  MatchExpr,
+  Member,
+  Node,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  StrLit,
+  TS_APP,
+  TS_ARR,
+  TS_ERR,
+  TS_FIELD,
+  TS_FUNC,
+  TS_ISECT,
+  TS_LITNUM,
+  TS_LITSTR,
+  TS_MAP,
+  TS_METHOD,
+  TS_NAME,
+  TS_NEG,
+  TS_NULL,
+  TS_OBJ,
+  TS_PAREN,
+  TS_UNION,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  annTsOf,
+  braceNameStmts,
+  callTyArgsOf,
+  declNameTokOf,
+  i32ToStr,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsText,
+  tsToName,
+  udTsRootAt,
+  ufcsModOfNode,
+} from "./ast"
+import { singleAliasMemberTyIx } from "./check_alias_transparent"
+import {
+  asgDstStack,
+  asgDstStackPop,
+  asgDstStackPush,
+  asgSrcStack,
+  asgSrcStackPop,
+  asgSrcStackPush,
+  bgDstStack,
+  bgDstStackPop,
+  bgDstStackPush,
+  bgSrcStack,
+  bgSrcStackPop,
+  bgSrcStackPush,
+} from "./check_asg_rows"
+import {
+  collapsedAliases,
+  collapsedAliasesSetAt,
+  collapsedTy,
+  collapsedTySet,
+  numLitFnNoteQueue,
+} from "./check_bind_rows"
+import { crMisuseNote } from "./check_call_retire"
+import { opIdxFns, opIdxOps } from "./check_callee"
+import { crLostAny, crLostNote } from "./check_capture_loss"
+import { crRdRet } from "./check_capture_rows"
+import { chPendGiven, chPendNodes, chPendTys } from "./check_coal"
+import {
+  apartHoleJoins,
+  argPinChecking,
+  argPinCheckingSet,
+  cFillActive,
+  checkerForceFn,
+  cnhIsOpen,
+  concatsAsStr,
+  fvaDone,
+  gaParamCount,
+  gaParamNames,
+  gaParamStart,
+  isJoinHoleUnion,
+  joinHoleUnions,
+  paramNullJoins,
+  recordJoinMinted,
+  recordJoinMintedSet,
+} from "./check_core_state"
+import { argCstr, binCstr, cvNow } from "./check_cstr_rows"
+import {
+  inferQuiet,
+  lamCheckDepth,
+  lamRefoldDepth,
+  tpEnvNames,
+  tpEnvTyOfName,
+  tpEnvTys,
+} from "./check_cursor"
+import { cBoundDecls, primTyOfName } from "./check_decl_scan"
+import {
+  TY_ARG_READ_HINT,
+  cvViaNote,
+  methodInValuePosMsg,
+  tyArgUnknownText,
+  tyParamListText,
+  unknownTyTextIn,
+} from "./check_diag_text"
+import { fnLitRetMismatchSite } from "./check_fn_lit_sites"
+import { gaDeclIxs, gaIndexOf } from "./check_gen_alias_anns"
+import { noteHoleLink } from "./check_hole_links"
+import {
+  HD_BINOP,
+  HD_COAL,
+  HD_COALD,
+  HD_ELEM,
+  HD_ELEMV,
+  HD_GALT,
+  HD_GNOT,
+  HD_HWR,
+  HD_PARAM,
+  HD_RET,
+  HD_TVW,
+  coalDeadAtPin,
+  hdAlt,
+  hdBase,
+  hdField,
+  hdInner,
+  hdKind,
+  hdRowOf,
+  holeBaseTy,
+  holePinKey,
+  holePinSet,
+  tyVarOwnerOf,
+} from "./check_hole_pins"
+import {
+  f32JoinAdoptCount,
+  f32JoinAdoptCountSet,
+  f32JoinAdoptedSetAt,
+} from "./check_if_value"
+import { onInferStack } from "./check_infer_rows"
+import {
+  annRegisterVariantMembers,
+  cFillStmtIx,
+  cTyIxSetAdd,
+  nwBrand,
+  registerInlineLitUnion,
+} from "./check_inline_lit_union"
+import {
+  ACF_COMP,
+  ACF_TPL,
+  OP_AS,
+  OP_BNOT,
+  OP_LITFIT,
+  OP_NEG,
+  annArmsPart,
+  annotDiagAt,
+  annotDiagAtSet,
+  bindOf,
+  builtinCtorTyLeafFail,
+  callPinFnTy,
+  collTyArgCountMsg,
+  dropStrLitsBesideString,
+  exprNegatedArg,
+  flatStorageSpellWidth,
+  fnSlotAtomToString,
+  fnSlotNulDiffers,
+  mapKeyUnsupportedMsg,
+  minMaxPinOk,
+  negInAnnotationMsg,
+  njApart,
+  njApartRet,
+  njApartRetSet,
+  njApartSet,
+  njRejoinApart,
+  njRejoinApartSet,
+  nomLitRelax,
+  nullTestOp,
+  rebaseDerivedHole,
+  rejoinDropSubsumed,
+  storageTyLeafFail,
+  substListTwin,
+  substNullableOver,
+} from "./check_leaf_steps"
+import { luAnnTy, tpRetJoinFixed, tpRetJoinTys } from "./check_list_union"
+import {
+  funcArrowAt,
+  isTopLevelFuncTypeName,
+  nameHasPipe,
+  nameHasSep,
+} from "./check_lit_union_spell"
+import { litUnionAliasTyOfMembers } from "./check_literals"
+import { litTyOfExpr } from "./check_match_desugar"
+import {
+  CODE_MISSING_IMPORT,
+  CODE_NARROWING_ENDED_BY_CALL,
+  CODE_UNSUPPORTED_LOWERING,
+  CODE_ZERO_BYTES,
+  floatLitTypeFail,
+  unkTyClash,
+  unkTyClashSet,
+  unkTyDepth,
+  unkTyDepthSet,
+  unkTyPart,
+  unkTyPartSet,
+} from "./check_messages"
+import {
+  boolForNumberNote,
+  charLitForStringNote,
+  litMemberNote,
+  storageListNote,
+  zeroBytesFixIx,
+} from "./check_mismatch_notes"
+import { njJoinGated } from "./check_nj_join"
+import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
+import { numCmpOp, numPairTy, valueTailSplit } from "./check_num_adopt"
+import {
+  cexReported,
+  cexWideConstNote,
+  nlAsgGot,
+  nlAsgTgt,
+  nlDefaultAnn,
+  nlDefaultTy,
+  nlLeafWant,
+  nlWantTy,
+  nlnAnn,
+  nlnDecl,
+  nlnDiag,
+  nlnLeaf,
+  nlnLeafTy,
+  nlnMsg,
+  nlnSlot,
+  nlnText,
+  nlnUse,
+  nlnWant,
+  numLitBindName,
+  numLitDeclOf,
+  numLitDefaultNote,
+  numLitReadLeafPush,
+  numLitReadNotePush,
+} from "./check_num_lit_state"
+import {
+  binFloatOperandPair,
+  binIntOnlyOp,
+  cexFitsAt,
+  cexLitPeel,
+  cexMisfitMsg,
+  exprIsNumLit,
+  intLitIsNegated,
+  isFloatLitExpr,
+  numLitAnnotNote,
+  numLitArithOp,
+  numLitFitsStore,
+  numLitListIsBytes,
+  numLitReadIdent,
+  numLitText,
+  numLitValuesFit,
+  numUnionAsConverts,
+  numUnionMembersOf,
+  numUnionOp,
+  numUnionPinOk,
+} from "./check_num_lits"
+import { diagDataField } from "./check_overload"
+import { parenPeelIx } from "./check_places"
+import { recAdNoteFor, recAdWholeErr } from "./check_rec_adopt"
+import {
+  recAdLoose,
+  recAdMentions,
+  recAdOrigDecl,
+  recAdRaising,
+} from "./check_rec_adopt_rows"
+import { rcwWhere } from "./check_record_writes"
+import { lookup, lookupDepth, lookupFnDeclNode } from "./check_scopes"
+import {
+  carryRetJoin,
+  fillDone,
+  markFillDone,
+  nhLink,
+  nhLinkA,
+  nhLinkB,
+  noteVoidCoerceVal,
+} from "./check_side_rows"
+import {
+  CSTR_ANYFN,
+  SUBST_ALL,
+  argPinDone,
+  argPinDoneSetAt,
+  argPinGot,
+  argPinNo,
+  argPinNode,
+  argPinWant,
+  cstrOwnedBy,
+  joinClashMsgSet,
+  shMemo,
+  shMemoPut,
+  shMemoStampSame,
+  shMemoSync,
+  shMemoVer,
+  stSeenStack,
+  stSeenStackPop,
+  stSeenStackPush,
+  substBindsNestRow,
+  substNestMode,
+} from "./check_subst"
+import {
+  annUnionTys,
+  nullableFlatInner,
+  substListTwinNominal,
+  substUnionNullFolded,
+} from "./check_subst_fold"
+import { demangleName, isBuiltinTyName } from "./check_suggest"
+import {
+  joinTyParamNull,
+  markTpJoinApart,
+  noteHoleTpJoin,
+  paramJoinDropsNull,
+  sameDeclaredTyParam,
+  tpArmJoinDepth,
+  tpGradualView,
+  tpJoinUnions,
+  tpOpenJoin,
+  tyIsDeferredJoin,
+  tyIsGradualParam,
+  tyIsTpJoinUnion,
+  tyParamBesideBare,
+  writtenTpUnion,
+} from "./check_tp_join"
+import {
+  containerElemClassDiffers,
+  eqRefusals,
+  holeArgScalarRefused,
+  joinWidensMap,
+  listJoinStorageDiffers,
+  numWidens,
+  numWidensName,
+  objNumWidens,
+} from "./check_ty_relate"
+import { mapKeyTySupported, nomBaseTyIx, nomErasedTyIx } from "./check_ty_rep"
+import {
+  allStrLitArms,
+  fnTyHasHole,
+  numericVariantUncovered,
+  operandKind,
+  tpApartConcrete,
+  tpApartConcreteSet,
+  tyParamsPart,
+} from "./check_type_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_I32,
+  TY_I64,
+  TY_NEVER,
+  TY_NULL,
+  TY_STR,
+  TY_U8,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cUserTypes,
+  cUserTypesVer,
+  cVariantMemberTyIxSet,
+  cVariantMemberTyIxs,
+  gaAppArgCount,
+  gaAppArgFlat,
+  gaAppArgStart,
+  gaAppFinite,
+  gaAppHeads,
+  gaAppTyIxSet,
+  gaAppTyIxs,
+  litBaseTy,
+  litMemberTy,
+  mkArrayTy,
+  mkArrayViewTy,
+  mkFuncTy,
+  mkLitTy,
+  mkMapTy,
+  mkNegTy,
+  mkNullableTy,
+  mkObjTy,
+  nomNameOfTy,
+  nwTyIxs,
+  objFieldType,
+  primNameStr,
+  softenLitTy,
+  tyBearsNull,
+  tyHasHole,
+  tyIsHole,
+  tyIsLitUnion,
+  tyMutEpoch,
+  tySame,
+  tyToStr,
+} from "./check_types"
+import {
+  tailPushBlockTail,
+  tailPushIfArms,
+  tailPushMatchArms,
+} from "./check_unconsumed"
+import {
+  fieldJoinKeepsRecordsApart,
+  objArmsDiscriminable,
+  objArmsSameType,
+  objPairedTy,
+  objSigSame,
+  setMapUnionClashMsg,
+} from "./check_union_arm_msgs"
+import {
+  mkUnionTy,
+  noteUnionMembers,
+  numUnionLossNote,
+  tyIsNumUnion,
+  tyOfMembers,
+} from "./check_union_mint"
+import { isWideLitJoin, wideLitTyIxs } from "./check_wide_lits"
+import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
+import { numLexIsFloat } from "./emit_bignum"
+import { nodeLastTok, nodeStartTok } from "./fmt_util"
+import { i32ListHas } from "./listutil"
+import {
+  mimpAnyProgramSpec,
+  mimpExportedByNote,
+  mimpNoteMiss,
+  mimpSpecsFor,
+} from "./missing_import"
+import {
+  annGenAppSpanEnds,
+  arrElemNameRaw,
+  fieldNameOf,
+  fieldTypeTextOf,
+  fnParamsTextOf,
+  fnRetTextOf,
+  gaeArgsTextOf,
+  gaeHeadNameOf,
+  gaeLtAt,
+  groupInnerOf,
+  mapSpellKeyEnd,
+  mapSpellKeyName,
+  mapSpellValName,
+  nameIsArray,
+  nameIsBareIdent,
+  nameIsBraceSpanEnds,
+  nameIsMapSpanEnds,
+  nameIsParenSpanEnds,
+  nameIsReadOnlyList,
+  parenEnclosesWhole,
+  roListInnerName,
+  tyTopIndexOf,
+  tyTopLevelSplit,
+} from "./tyname"
+import {
+  armLiteralBaseTy,
+  arrElemValueTy,
+  flattenVariantsInto,
+  homogLitUnionBase,
+  isLitBearing,
+  isNeverTy,
+  isNullTy,
+  isNumeric,
+  isNumericPrimTy,
+  isStringTy,
+  isVoidTy,
+  nhOpen,
+  nonNullTy,
+  numericRepsApart,
+  primNameOf,
+  tyAdmitsNull,
+  tyExcludesNull,
+  tyHasNullMember,
+  tyHasTyVar,
+  tyHoldsNumericPrim,
+  unionArmSubsumedBy,
+  unionCoversTy,
+  unionDropSubsumedArms,
+} from "./tyquery"
+
+// Re-derive every pending `??` over the hole `ty`, now that its inner is known. Runs at the fill,
+// the first moment the answer exists, and validates as much as it re-banks: the read is already
+// checked against `given`, so a fill whose inner does not fit is a disagreement to name, not to
+// bank over. The derivation is the `??` arm's own tail, re-asked through `assignableExpr`.
+function fillCoalHoleNodes(ty: i32) {
+  let i = 0
+  while i < chPendNodes.length {
+    if chPendTys[i] == ty {
+      const cn = chPendNodes[i]
+      const nd = P.nodes[cn]
+      if nd is BinExpr {
+        const inner = nonNullTy(ty)
+        const dft = nodeTyIxOf(nd.binRight)
+        let res = inner
+        if dft >= 0 {
+          if checkerForceFn(1, nd.binRight, dft, inner) == 0 {
+            res = joinTys(inner, dft)
+          }
+        }
+        const given = chPendGiven[i]
+        if assignable(res, given) {
+          if cn < nodeTyIx.length { nodeTySet(cn, res) }
+        } else {
+          tErr(
+            "`??` here was typed "
+              + tyToStr(given)
+              + " — the assignment below makes the binding "
+              + tyToStr(ty)
+              + ", so the read is "
+              + tyToStr(res)
+              + "; annotate the binding",
+            cn,
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Fill the open container null hole `slot` from a write or destination of type `vt`: its
+// non-null part becomes `T`, as the `=` arm fills a `let x = null`. A no-op on any other slot.
+export function cnhFill(slot: i32, vt: i32) {
+  if vt < 0 || vt == TY_ERR || vt == TY_VOID { return 0 }
+  if !cnhIsOpen(slot) { return 0 }
+  if nhOpen(vt) { return nhLink(slot, vt) }
+  let inner = vt
+  const v = T.tys[vt]
+  if v is TyNullable { inner = v.nInner }
+  if inner < 0 || isNullTy(inner) { return 0 }
+  nhFillLinked(slot, widenLitTy(inner))
+}
+
+// Fill the open null hole `h` with `inner` in place, and every hole linked to it. A hole already
+// filled stops the walk, which is what bounds it.
+export function nhFillLinked(h: i32, inner: i32) {
+  const t = T.tys[h]
+  if t is TyNullable {
+    if t.nInner >= 0 { return 0 }
+    t.nInner = inner
+    tyMutEpoch = tyMutEpoch + 1 // a null hole filled in place
+    fillCoalHoleNodes(h)
+  } else {
+    return 0
+  }
+  let i = 0
+  while i < nhLinkA.length {
+    if nhLinkA[i] == h { nhFillLinked(nhLinkB[i], inner) }
+    if nhLinkB[i] == h { nhFillLinked(nhLinkA[i], inner) }
+    i = i + 1
+  }
+  0
+}
+
+// Usage-driven inference through a typed context: an empty `[]` / bare `Map()`/`Set()` flowing
+// into a slot with a concrete shape (a `T[]` param at a call site, an annotated assignment, a
+// `T[]`-returning tail) has its open holes pinned to the destination's, in place. A no-op
+// unless the shapes match. Depth-bounded: a recursive struct would otherwise recur forever.
+export function constrainEmpty(srcTy: i32, dstTy: i32) {
+  constrainEmptyD(srcTy, dstTy, 12)
+}
+
+function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
+  if srcTy < 0 || dstTy < 0 || depth <= 0 { return 0 }
+  const s = T.tys[srcTy]
+  const d = T.tys[dstTy]
+  // A container null hole delivered to a nullable slot takes the slot's `T` (D2506).
+  if d is TyNullable {
+    if d.nInner >= 0 && cnhIsOpen(srcTy) { return cnhFill(srcTy, dstTy) }
+  }
+  // A nullable destination pins the same holes its inner shape does: a `string[] | null` field
+  // or map value accepts a non-null `[]`, and the hole behind it needs the element rep either
+  // way. Unwrapped on the source side too, so a nullable producer flowing into a nullable slot
+  // lines its inner shapes up rather than stopping at the wrapper.
+  if d is TyNullable { return constrainEmptyD(srcTy, d.nInner, depth - 1) }
+  if s is TyNullable { return constrainEmptyD(s.nInner, dstTy, depth - 1) }
+  // An open `[]` delivered to a union is built as its first list member, the arm
+  // `recordRepTyAdopt` records for a literal, so a call returning one pins the same way.
+  if s is TyArray {
+    if s.aElem < 0 {
+      if d is TyUnion {
+        let ui = 0
+        while ui < d.uMembers.length {
+          const um = T.tys[d.uMembers[ui]]
+          if um is TyArray {
+            return constrainEmptyD(srcTy, d.uMembers[ui], depth - 1)
+          }
+          ui = ui + 1
+        }
+        return 0
+      }
+    }
+  }
+  if s is TyArray {
+    if d is TyArray {
+      if s.aElem < 0 {
+        // Both sides open is not a pin but a link — `s.aElem = d.aElem` would write the `-1`
+        // back and lose the fact that these two rows must agree, which `arrDefHoleToI32` needs
+        // once an unpinned hole acquires a default. D1470.
+        if d.aElem < 0 {
+          noteHoleLink(srcTy, dstTy)
+        } else {
+          s.aElem = d.aElem
+          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        }
+      } else {
+        constrainEmptyD(s.aElem, d.aElem, depth - 1)
+      }
+    }
+    return 0
+  }
+  if s is TyMap {
+    if d is TyMap {
+      if s.mKey < 0 {
+        s.mKey = d.mKey
+        tyMutEpoch = tyMutEpoch + 1 // in-place key pin
+      }
+      if s.mVal < 0 {
+        s.mVal = d.mVal
+        tyMutEpoch = tyMutEpoch + 1 // in-place value pin
+      } else {
+        constrainEmptyD(s.mVal, d.mVal, depth - 1)
+      }
+    }
+    return 0
+  }
+  // A struct destination pins field-wise, by name. The source is an object literal's own
+  // inferred shape, so its field order is the literal's, not the declaration's — matching
+  // positionally would pin `{ b: fq(), a: [1] }` from the wrong field.
+  if s is TyObj {
+    if d is TyObj {
+      let i = 0
+      while i < s.objFieldNames.length {
+        if i < s.objFieldTypes.length {
+          const dft = objFieldType(d, s.objFieldNames[i])
+          if dft >= 0 { constrainEmptyD(s.objFieldTypes[i], dft, depth - 1) }
+        }
+        i = i + 1
+      }
+    }
+    return 0
+  }
+  0
+}
+
+// Whether a value typed `rt` may be a `te`: `rt` or one of its members overlaps `te`.
+export function tyMayHoldTy(rt: i32, te: i32): boolean {
+  if assignable(rt, te) || assignable(te, rt) { return true }
+  const r = T.tys[rt]
+  if r is TyUnion {
+    let i = 0
+    while i < r.uMembers.length {
+      if assignable(r.uMembers[i], te) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The member of `dcl` a place declared so reads at after a write of a value pinned at `pin`
+// (`writeMemberTy`): `dcl` itself when the pin lands on no narrower member, and the literal
+// union `nonNullTy(dcl)` when a non-null pin fits it, as no one member names it (D3423).
+export function tvWriteLandTy(dcl: i32, pin: i32): i32 {
+  const m = writeMemberTy(dcl, pin)
+  if m != dcl || pin < 0 || isNullTy(pin) || tyAdmitsNull(pin) { return m }
+  const nn = nonNullTy(dcl)
+  if nn >= 0 && tyIsLitUnion(nn) && assignable(pin, nn) { return nn }
+  m
+}
+
+// The member of the declaration `dcl` a write of a value typed `rt` under a narrowing lands on,
+// or `dcl` when it names none: as `writeReNarrowTy`, but a value lands on the member it IS before
+// one it widens to, and a nullable declaration re-narrows its inner type too (D2609).
+export function writeMemberTy(dcl: i32, rt: i32) {
+  if rt < 0 || dcl < 0 { return dcl }
+  if isNullTy(rt) { return dcl }
+  const rtT = T.tys[rt]
+  if rtT is TyNullable { return dcl }
+  const d = T.tys[dcl]
+  if d is TyUnion { return unionMemberOfWrite(dcl, d.uMembers, rt) }
+  // A nullable declaration re-narrows its inner type the same way; nothing else has members.
+  nullableMemberOfWrite(dcl, rt)
+}
+
+// `writeMemberTy` over a nullable declaration `dcl`: the member of its inner type, or `dcl`.
+function nullableMemberOfWrite(dcl: i32, rt: i32): i32 {
+  const d = T.tys[dcl]
+  if d is TyNullable {
+    if d.nInner < 0 { return dcl }
+    const inT = T.tys[d.nInner]
+    if inT is TyUnion { return unionMemberOfWrite(dcl, inT.uMembers, rt) }
+    if assignable(rt, d.nInner) { return d.nInner }
+  }
+  dcl
+}
+
+// The member of `ms` a written value typed `rt` lands on: the one it IS, else the sole one it is
+// assignable to (an `i32` into `i32 | f64` is the `i32` member, not a widened `f64`); `dcl` when
+// neither names one.
+function unionMemberOfWrite(dcl: i32, ms: i32[], rt: i32): i32 {
+  // A union-typed value lands on one member only when every member of it does.
+  const rT = T.tys[rt]
+  if rT is TyUnion {
+    let one = -1
+    let k = 0
+    while k < rT.uMembers.length {
+      const m = unionMemberOfWrite(dcl, ms, rT.uMembers[k])
+      if m == dcl || (one >= 0 && !tySame(m, one)) { return dcl }
+      one = m
+      k = k + 1
+    }
+    if one >= 0 { return one }
+    return dcl
+  }
+  const w = widenLitTy(rt)
+  let i = 0
+  while i < ms.length {
+    if !isNullTy(ms[i]) && tySame(w, ms[i]) { return ms[i] }
+    i = i + 1
+  }
+  let hit = -1
+  let n = 0
+  i = 0
+  while i < ms.length {
+    if assignable(rt, ms[i]) {
+      hit = ms[i]
+      n = n + 1
+    }
+    i = i + 1
+  }
+  if n == 1 { return hit }
+  dcl
+}
+
+// Two arena types denoting the same variant (mutually assignable). A generic
+// type variable is never "the same variant" as anything — the host's hole
+// guard (`isHole`) — so narrowing never pins an un-instantiated parameter.
+export function sameVariantTy(a: i32, b: i32) {
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  if ta is TyVar { return false }
+  const tb = T.tys[b]
+  if tb is TyVar { return false }
+  // Named variants resolve to one canonical arena entry (`cUserTypes`), so
+  // the common same-variant case is index equality — skip both traversals.
+  if a == b { return true }
+  // `A[]` and `B[]` are two variants though each is assignable to the other in the body (D2760).
+  if tyParamsPart(a, b, 0) { return false }
+  if !assignable(a, b) { return false }
+  assignable(b, a)
+}
+
+// Remove a variant from a union or nullable, returning the residual type — the else-branch
+// narrowing of `if x is A { … } else { … }`, where `x` is `U − A`. Returns -1 both when nothing
+// concrete is removed (open-world negation is not tracked) and when nothing remains, a dead branch
+// the caller does not overlay.
+export function subtractTy(ty: i32, removed: i32) {
+  if ty < 0 || removed < 0 { return -1 }
+  const drop: i32[] = []
+  flattenVariantsInto(removed, drop)
+  const vars: i32[] = []
+  flattenVariantsInto(ty, vars)
+  const kept: i32[] = []
+  let i = 0
+  while i < vars.length {
+    const v = vars[i]
+    let hit = false
+    let j = 0
+    while j < drop.length {
+      if sameVariantTy(v, drop[j]) { hit = true }
+      j = j + 1
+    }
+    if !hit { kept.push(v) }
+    i = i + 1
+  }
+  if kept.length == vars.length { return -1 }
+  if kept.length == 0 { return -1 }
+  // Reassemble the residual: a surviving `null` folds back into a nullable.
+  let hasNull = false
+  const core: i32[] = []
+  let k = 0
+  while k < kept.length {
+    if isNullTy(kept[k]) { hasNull = true } else { core.push(kept[k]) }
+    k = k + 1
+  }
+  if core.length == 0 { return TY_NULL }
+  let res = core[0]
+  if core.length > 1 { res = mkUnionTy(core) }
+  if hasNull { return mkNullableTy(res) }
+  res
+}
+
+// `A & !B` under an intersection fold: drop B's variants from A. It differs from the narrowing
+// `subtractTy` in its edges — nothing concrete dropped leaves A unchanged (open-world negation,
+// `i32 & !2`), everything dropped folds to `never`, an empty intersection.
+function isectSubtract(ty: i32, removed: i32) {
+  if ty < 0 || removed < 0 { return -1 }
+  const drop: i32[] = []
+  flattenVariantsInto(removed, drop)
+  const vars: i32[] = []
+  flattenVariantsInto(ty, vars)
+  const kept: i32[] = []
+  let i = 0
+  while i < vars.length {
+    const v = vars[i]
+    let hit = false
+    let j = 0
+    while j < drop.length {
+      if sameVariantTy(v, drop[j]) { hit = true }
+      j = j + 1
+    }
+    if !hit { kept.push(v) }
+    i = i + 1
+  }
+  if kept.length == vars.length { return ty }
+  if kept.length == 0 { return TY_NEVER }
+  let hasNull = false
+  const core: i32[] = []
+  let k = 0
+  while k < kept.length {
+    if isNullTy(kept[k]) { hasNull = true } else { core.push(kept[k]) }
+    k = k + 1
+  }
+  if core.length == 0 { return TY_NULL }
+  let res = core[0]
+  if core.length > 1 { res = mkUnionTy(core) }
+  if hasNull { return mkNullableTy(res) }
+  res
+}
+
+// Fold `A & B`: a negation operand subtracts, a union operand distributes (`(0|1|2) & !2` →
+// `0 | 1`), two object types merge field-wise (`{a} & {b}` is `{a, b}`, a shared field refining to
+// the meet), a subtype pair keeps the narrower side, and a disjoint concrete pair folds to `never`,
+// there being no common values. -1, unresolved, poisons the fold.
+function intersectTy(a: i32, b: i32) {
+  if a < 0 || b < 0 { return -1 }
+  const tb = T.tys[b]
+  if tb is TyNeg { return isectSubtract(a, tb.negTy) }
+  const ta = T.tys[a]
+  if ta is TyNeg { return isectSubtract(b, ta.negTy) }
+  if ta is TyUnion { return isectDistribute(ta.uMembers, b) }
+  if tb is TyUnion { return isectDistribute(tb.uMembers, a) }
+  if ta is TyObj {
+    if tb is TyObj {
+      // Structural field-wise merge: the value that is both carries every field of each side, and
+      // a shared field is the meet of the two.
+      const mnames: string[] = []
+      const mtys: i32[] = []
+      const anames = ta.objFieldNames
+      const atys = ta.objFieldTypes
+      let ai = 0
+      while ai < anames.length {
+        mnames.push(anames[ai])
+        mtys.push(atys[ai])
+        ai = ai + 1
+      }
+      const bnames = tb.objFieldNames
+      const btys = tb.objFieldTypes
+      let bi = 0
+      while bi < bnames.length {
+        let at2 = -1
+        let mi = 0
+        while mi < mnames.length {
+          if mnames[mi] == bnames[bi] { at2 = mi }
+          mi = mi + 1
+        }
+        if at2 >= 0 {
+          mtys[at2] = intersectTy(mtys[at2], btys[bi])
+        } else {
+          mnames.push(bnames[bi])
+          mtys.push(btys[bi])
+        }
+        bi = bi + 1
+      }
+      return mkObjTy(mnames, mtys)
+    }
+  }
+  if assignable(a, b) { return a }
+  if assignable(b, a) { return b }
+  TY_NEVER
+}
+
+// Distribute an intersection over a union operand: `(A | B) & C` is
+// `(A & C) | (B & C)`, dropping members that fold to `never`.
+function isectDistribute(members: i32[], other: i32) {
+  const kept: i32[] = []
+  let i = 0
+  while i < members.length {
+    const r = intersectTy(members[i], other)
+    if r >= 0 && !isNeverTy(r) {
+      let dup = false
+      let j = 0
+      while j < kept.length {
+        if sameVariantTy(r, kept[j]) { dup = true }
+        j = j + 1
+      }
+      if !dup { kept.push(r) }
+    }
+    i = i + 1
+  }
+  if kept.length == 0 { return TY_NEVER }
+  if kept.length == 1 { return kept[0] }
+  mkUnionTy(kept)
+}
+
+// An `i64` value delivered into `i32` whose every leaf is an integer constant, through `if`,
+// `match` and block tails and integer operators: it is `i64` only because some constant overflows
+// `i32`, so that constant is refused in its own words (D3780). Answers whether it found one.
+function cexJoinMisfit(srcExpr: i32): boolean {
+  const todo: i32[] = [srcExpr]
+  let bad = -1
+  let badV = cexNotConst()
+  let badLit = -1
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { return false }
+    const e = P.nodes[at]
+    if (
+      tailPushIfArms(at, todo)
+      || tailPushMatchArms(at, todo)
+      || tailPushBlockTail(at, todo)
+    ) {
+      continue
+    }
+    if e is BinExpr {
+      if (
+        !binIntOnlyOp(e.binOp)
+        && e.binOp != "+"
+        && e.binOp != "-"
+        && e.binOp != "*"
+        && e.binOp != "/"
+        && e.binOp != "%"
+      ) {
+        return false
+      }
+      todo.push(e.binLeft)
+      todo.push(e.binRight)
+      continue
+    }
+    const lit = cexLitPeel(at)
+    if lit < 0 {
+      if e is Unary && (e.unOp == "-" || e.unOp == "~") {
+        todo.push(e.unArg)
+        continue
+      }
+      return false
+    }
+    const l = P.nodes[lit]
+    if !(l is NumLit) { return false }
+    if numLexIsFloat(l.numText) { return false }
+    let v = cexOfLexeme(l.numText)
+    if !cexOk(v) { return false }
+    if intLitIsNegated(at) { v = cexNeg(v) }
+    if bad < 0 && !cexFitsAt(v, l.numText, TY_I32) {
+      bad = at
+      badV = v
+      badLit = lit
+    }
+  }
+  if bad < 0 { return false }
+  // A constant already refused is not refused twice, nor is its join's mismatch reported.
+  if !(cexReported[badLit] ?? false) {
+    cexReported[badLit] = true
+    tErr(cexMisfitMsg(badV, "i32", false), bad)
+  }
+  true
+}
+
+// When `at` is the name braced as a whole statement, `{ steps }`, and `want` is a one-field record
+// of that name that the name's own type does not already fit: a note that the braces are a block,
+// not the record shorthand (DV-1216).
+export function braceNameNote(at: i32, want: i32): string {
+  if at < 0 || at >= P.nodes.length || want < 0 || want >= T.tys.length {
+    return ""
+  }
+  if !i32ListHas(braceNameStmts, at) { return "" }
+  const e = P.nodes[at]
+  const w = T.tys[want]
+  if e is Ident && w is TyObj {
+    if w.objFieldNames.length != 1 { return "" }
+    if assignable(nodeTyOf(at), want) { return "" }
+    // The field is the binding's source name, which the merge may have renamed apart.
+    const fld = demangleName(e.identName)
+    if objFieldType(w, fld) >= 0 {
+      return " — `{ "
+        + fld
+        + " }` here is a block, not a record; write `({ "
+        + fld
+        + " })` for the record"
+    }
+  }
+  ""
+}
+
+// The note for the refused store into `nlAsgTgt` of a value typed `nlAsgGot`, when the target is
+// a numeric-literal binding written whole, through one index, or at one literal field, and the
+// literal also fits the stored type; queued with the slot and the suggested type.
+function numLitAsgNoteQueue(msg: string, di: i32) {
+  const tgt = parenPeelIx(nlAsgTgt)
+  if tgt < 0 || tgt >= P.nodes.length { return 0 }
+  let idIx = tgt
+  let slot = "="
+  let fname = ""
+  const tn = P.nodes[tgt]
+  if tn is Index {
+    idIx = parenPeelIx(tn.idxArr)
+    slot = "[]"
+  } else if tn is Member {
+    idIx = parenPeelIx(tn.memObj)
+    fname = tn.memProp
+    slot = "." + fname
+  }
+  if idIx < 0 || idIx >= P.nodes.length { return 0 }
+  const id = P.nodes[idIx]
+  if !(id is Ident) { return 0 }
+  if id is Ident {
+    const decl = numLitDeclOf(id.identName)
+    if decl < 0 { return 0 }
+    const dn = P.nodes[decl]
+    const bt = lookup(id.identName)
+    if bt < 0 || nlAsgGot < 0 { return 0 }
+    const btt = T.tys[bt]
+    const got = widenLitTy(nlAsgGot)
+    if got < 0 || got >= T.tys.length { return 0 }
+    if dn is LetDecl {
+      let base = bt
+      let gotBase = got
+      let list = ""
+      let fieldLit = -1
+      if btt is TyArray {
+        if btt.aRead != 0 || fname != "" { return 0 }
+        base = btt.aElem
+        list = "[]"
+        if slot == "=" {
+          const gt = T.tys[got]
+          if !(gt is TyArray) { return 0 }
+          if gt is TyArray { gotBase = gt.aElem }
+        }
+      } else if btt is TyObj {
+        if fname == "" { return 0 }
+        base = objFieldType(btt, fname)
+        const iv = P.nodes[parenPeelIx(dn.letInit)]
+        if iv is ObjLit {
+          for fi in iv.objFields {
+            const f = P.nodes[fi]
+            if f is FieldInit {
+              if f.fiName == fname && exprIsNumLit(f.fiValue) {
+                fieldLit = f.fiValue
+              }
+            }
+          }
+        }
+        if fieldLit < 0 { return 0 }
+      } else if slot != "=" {
+        return 0
+      }
+      const bn = primNameStr(primNameOf(base))
+      const gn = primNameStr(primNameOf(gotBase))
+      const bytes = slot == "=" && list != "" && numLitListIsBytes(dn.letInit)
+      if !numLitFitsStore(bn, gn, bytes) { return 0 }
+      let litAt = dn.letInit
+      if fieldLit >= 0 { litAt = fieldLit }
+      if !numLitValuesFit(litAt, gn) { return 0 }
+      // A `const` refuses the whole store already; annotating it would not help.
+      if slot == "=" && dn.letKw == "const" { return 0 }
+      let note = ""
+      if fieldLit >= 0 {
+        note = " — field `"
+          + demangleName(fname)
+          + "` of `"
+          + demangleName(dn.letName)
+          + "` on "
+          + rcwWhere(decl, nlAsgTgt)
+          + " has no annotation, so its literal defaulted to `"
+          + bn
+          + "`; write it `"
+          + demangleName(fname)
+          + ": "
+          + numLitText(fieldLit)
+          + " as "
+          + gn
+          + "`"
+      } else {
+        note = numLitAnnotNote(dn, decl, nlAsgTgt, bt, gn + list)
+      }
+      nlnDiag.push(di)
+      nlnMsg.push(msg)
+      nlnText.push(note)
+      nlnDecl.push(decl)
+      nlnUse.push(id.identName)
+      if list != "" && slot == "=" { slot = "=[]" }
+      nlnSlot.push(slot)
+      nlnWant.push(gotBase)
+      if fieldLit >= 0 { nlnAnn.push("") } else { nlnAnn.push(gn + list) }
+      nlnLeaf.push(-1)
+      // A whole scalar store's suggestion is graded against the binding's reads as well.
+      if slot == "=" && fieldLit < 0 {
+        nlnLeafTy.push(gotBase)
+      } else {
+        nlnLeafTy.push(-1)
+      }
+    }
+  }
+  0
+}
+
+// Queue the note for the diagnostic about to be pushed at index `di`, if it has one.
+function numLitNoteQueue(msg: string, at: i32, di: i32) {
+  if nlWantTy >= 0 && numLitFnNoteQueue(msg, at, di) { return 0 }
+  if numLitBindName.length == 0 { return 0 }
+  if nlAsgTgt >= 0 { return numLitAsgNoteQueue(msg, di) }
+  const idIx = numLitReadIdent(at)
+  if idIx >= 0 {
+    const id = P.nodes[idIx]
+    if id is Ident {
+      const decl = numLitDeclOf(id.identName)
+      if decl >= 0 {
+        const note = numLitDefaultNote(msg, at, idIx, decl)
+        if note != "" {
+          let leaf = -1
+          if nlDefaultTy >= 0 { leaf = idIx }
+          numLitReadNotePush(di, msg, note, decl, id.identName, nlDefaultAnn)
+          return numLitReadLeafPush(leaf, nlDefaultTy)
+        }
+      }
+    }
+  }
+  numLitLeafNoteQueue(msg, at, di)
+}
+
+// Would value `v` have type `want` once every numeric-literal binding it reads is annotated
+// `want`? Through arithmetic and negation; every other leaf must be a literal that fits or
+// already have that type.
+function numLitArithFits(v: i32, want: i32, depth: i32): boolean {
+  const p = parenPeelIx(v)
+  if depth <= 0 || p < 0 || p >= P.nodes.length { return false }
+  const n = P.nodes[p]
+  const wn = primNameStr(primNameOf(want))
+  let t = widenLitTy(nodeTyIxOf(p))
+  if n is Ident {
+    if numLitDeclOf(n.identName) >= 0 { t = lookup(n.identName) }
+  }
+  if t >= 0 && tySame(t, want) { return true }
+  if n is Unary {
+    if n.unOp == "-" { return numLitArithFits(n.unArg, want, depth - 1) }
+    return false
+  }
+  if n is BinExpr {
+    if !numLitArithOp(n.binOp) { return false }
+    return numLitArithFits(n.binLeft, want, depth - 1)
+      && numLitArithFits(n.binRight, want, depth - 1)
+  }
+  if n is Ident {
+    if numLitDeclOf(n.identName) < 0 { return false }
+  } else if !(n is NumLit) {
+    return false
+  }
+  numLitFitsStore(primNameStr(primNameOf(t)), wn, false)
+}
+
+// The numeric-literal binding read within value `v` that a `want`-typed destination refuses and
+// whose annotation `want` fixes, through record and list literals, arithmetic and negation; -1
+// when none. Sets `nlLeafWant` to the type the binding should carry.
+function numLitLeafFor(v: i32, want: i32, depth: i32): i32 {
+  const p = parenPeelIx(v)
+  if depth <= 0 || want < 0 || want >= T.tys.length { return -1 }
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const n = P.nodes[p]
+  const wt = T.tys[want]
+  if n is Ident {
+    if numLitDeclOf(n.identName) < 0 { return -1 }
+    const bt = lookup(n.identName)
+    if bt < 0 || tySame(bt, want) { return -1 }
+    const bn = primNameStr(primNameOf(bt))
+    const wn = primNameStr(primNameOf(want))
+    if !numLitFitsStore(bn, wn, false) { return -1 }
+    const decl = numLitDeclOf(n.identName)
+    if decl < 0 || decl >= P.nodes.length { return -1 }
+    const dn = P.nodes[decl]
+    if dn is LetDecl {
+      if !numLitValuesFit(dn.letInit, wn) { return -1 }
+    }
+    nlLeafWant = want
+    return p
+  }
+  if n is ObjLit {
+    if wt is TyObj {
+      for fi in n.objFields {
+        const f = P.nodes[fi]
+        if f is FieldInit {
+          const r = numLitLeafFor(
+            f.fiValue,
+            objFieldType(wt, f.fiName),
+            depth - 1,
+          )
+          if r >= 0 { return r }
+        }
+      }
+    }
+    return -1
+  }
+  if n is ArrayLit {
+    if wt is TyArray {
+      for el in n.arrElems {
+        const r = numLitLeafFor(el, wt.aElem, depth - 1)
+        if r >= 0 { return r }
+      }
+    }
+    return -1
+  }
+  numLitLeafInOp(p, want, depth)
+}
+
+// `numLitLeafFor` through a negation or an arithmetic operator whose value fits `want` once its
+// literal bindings do; -1 for every other node, which reads no binding a note can name.
+function numLitLeafInOp(p: i32, want: i32, depth: i32): i32 {
+  const n = P.nodes[p]
+  if n is BinExpr {
+    if !numLitArithOp(n.binOp) || !numLitArithFits(p, want, 8) { return -1 }
+    const r = numLitLeafFor(n.binLeft, want, depth - 1)
+    if r >= 0 { return r }
+    return numLitLeafFor(n.binRight, want, depth - 1)
+  }
+  const neg = exprNegatedArg(p)
+  if neg >= 0 { return numLitLeafFor(neg, want, depth - 1) }
+  -1
+}
+
+// The note for a mismatch whose value holds a numeric-literal binding inside a record or list
+// literal or an arithmetic expression, found against the destination type `nlWantTy`; for an
+// `operator … mixes` refusal, against the other operand's type.
+function numLitLeafNoteQueue(msg: string, at: i32, di: i32) {
+  const v = parenPeelIx(at)
+  if v < 0 || v >= P.nodes.length { return 0 }
+  let leaf = -1
+  if nlWantTy >= 0 {
+    leaf = numLitLeafFor(v, nlWantTy, 8)
+  } else {
+    const bn = P.nodes[v]
+    if bn is BinExpr && msg.slice(0, 10) == "operator '" {
+      const lt = widenLitTy(nodeTyIxOf(bn.binLeft))
+      const rt = widenLitTy(nodeTyIxOf(bn.binRight))
+      if rt >= 0 && numLitArithFits(v, rt, 8) {
+        leaf = numLitLeafFor(bn.binLeft, rt, 8)
+      }
+      if leaf < 0 && lt >= 0 && numLitArithFits(v, lt, 8) {
+        leaf = numLitLeafFor(bn.binRight, lt, 8)
+      }
+    }
+  }
+  if leaf < 0 { return 0 }
+  const id = P.nodes[leaf]
+  if id is Ident {
+    const decl = numLitDeclOf(id.identName)
+    if decl < 0 { return 0 }
+    const dn = P.nodes[decl]
+    const bt = lookup(id.identName)
+    if dn is LetDecl {
+      const ann = primNameStr(primNameOf(nlLeafWant))
+      const note = numLitAnnotNote(dn, decl, at, bt, ann)
+      numLitReadNotePush(di, msg, note, decl, id.identName, ann)
+      return numLitReadLeafPush(leaf, nlLeafWant)
+    }
+  }
+  0
+}
+
+// Raise a diagnostic at AST node `at`, resolving its source position — the node's anchor token
+// through the `nodeToks` side table — eagerly, so the driver can render `line:col: message`. Every
+// lookup is bounds-checked: a harness that builds `P.nodes` by hand yields an out-of-range index,
+// which degrades to "no position" (`tline == 0`) rather than trapping.
+export function tErr(msg: string, at: i32) { tErrCoded(msg, at, "") }
+
+// `tErr` for a value delivered to a `want`-typed destination, which lets the numeric-literal note
+// find a literal binding inside a record, list or arithmetic value.
+export function tErrWant(msg: string, at: i32, want: i32) {
+  let m = msg
+  // An `i64` made only of constants, one of which overflows `i32`: that constant is the
+  // error, refused at its own span (D3780). Beside other operands, the note names it.
+  if want == TY_I32 && !inferQuiet && at >= 0 && nodeTyOf(at) == TY_I64 {
+    if cexJoinMisfit(at) { return 0 }
+    m = m + cexWideConstNote(at)
+  }
+  m = m + braceNameNote(at, want)
+  nlWantTy = want
+  tErr(m, at)
+  nlWantTy = -1
+  0
+}
+
+// The emitter-capability channel: raise an error for a construct the type system accepts but
+// codegen cannot lower yet, under the stable `unsupported-lowering` category code. Both are errors,
+// an unbuildable program not being allowed to pass, but tooling can tell them apart by code.
+// Message convention: name the type-valid construct, then the workaround after an em dash.
+export function tErrUnsupported(msg: string, at: i32) {
+  tErrCoded(msg, at, CODE_UNSUPPORTED_LOWERING)
+}
+
+export function tErrCoded(msg: string, at: i32, code: string) {
+  tErrCodedData(msg, at, code, "")
+}
+
+// `tErrCoded` plus the structured payload — the only raise that fills `tdata`. Anchoring: a node
+// whose own NAME is the subject spans that one token — a declaration's declared name, a member
+// access's property, the names `driver.vl`'s emit and module anchors already prefer. Every other
+// kind spans WHOLE, which is `tErrPushNodeSpan`'s arm.
+export function tErrCodedData(
+  msg: string,
+  at: i32,
+  code: string,
+  data: string,
+) {
+  if at >= 0 && at < P.nodes.length {
+    const n = P.nodes[at]
+    // A loop's binder and a parameter's name carry `declNameTok` too, and neither is its
+    // construct's subject — the diagnostics there are about the loop and the parameter.
+    if n is FuncDecl || n is TypeDecl || n is UnionDecl || n is LetDecl {
+      const nm = declNameTokOf(at)
+      if nm >= 0 && nm < P.toks.length {
+        return tErrPushTok(msg, at, nm, code, data)
+      }
+    } else if n is Member || n is OptMember {
+      const tk = nodeLastTok(at)
+      if tk >= 0 { return tErrPushTok(msg, at, tk, code, data) }
+    }
+  }
+  tErrPushNodeSpan(msg, at, code, data)
+}
+
+// Raise `msg` over node `at`'s whole span: its first token through its last, across lines.
+// `nodeStartTok` resolves inside the node's own module, so the two bound one span; a last
+// token at or before the start is a one-token node. With no start token: the `nodeToks`
+// anchor, else positionless.
+function tErrPushNodeSpan(msg: string, at: i32, code: string, data: string) {
+  const first = nodeStartTok(at)
+  if first >= 0 {
+    let end = nodeLastTok(at)
+    if end < first { end = first }
+    return tErrPush(
+      msg,
+      at,
+      P.toks[first].line,
+      P.toks[first].col,
+      end,
+      code,
+      data,
+    )
+  }
+  const last = nodeLastTok(at)
+  if last >= 0 { return tErrPushTok(msg, at, last, code, data) }
+  tErrPush(msg, at, 0, 0, -1, code, data)
+}
+
+// Raise `msg` spanning exactly token `tk` — the caller has already decided the token is the
+// whole subject, so nothing widens it. Out-of-range is the caller's to rule out.
+export function tErrPushTok(
+  msg: string,
+  at: i32,
+  tk: i32,
+  code: string,
+  data: string,
+) {
+  tErrPush(msg, at, P.toks[tk].line, P.toks[tk].col, tk, code, data)
+}
+
+// D1585 — the reserved-name refusal, raised from one place by both faces: a single file's
+// declaration and a module's (`driver.modCheckReservedDecls`, the only reader that still sees the
+// pre-merge name). Message, channel and anchor are shared, so the two faces cannot drift in
+// wording. Anchored at the declaration's name token, the `nodeToks` anchor being a closing brace.
+export function tErrBuiltinTyDecl(name: string, at: i32): i32 {
+  const msg = "a `type` declaration may not take the built-in type name `"
+    + name
+    + "` — every annotation resolves that name to the primitive, so the declaration "
+    + "can never be referred to; rename it"
+  const tk = declNameTokOf(at)
+  if tk >= 0 && tk < P.toks.length { return tErrPushTok(msg, at, tk, "", "") }
+  tErr(msg, at)
+  0
+}
+
+export function tErrPush(
+  msg0: string,
+  at: i32,
+  ln: i32,
+  co: i32,
+  endTok: i32,
+  code0: string,
+  data: string,
+) {
+  // A misuse of a name a call un-narrowed says so, whichever check refused it (D2390).
+  let msg = msg0
+  let code = code0
+  if crRdRet.length > 0 {
+    const note = crMisuseNote(msg0, at)
+    if note != "" {
+      msg = msg0 + note
+      if code == "" { code = CODE_NARROWING_ENDED_BY_CALL }
+    }
+  }
+  if crLostAny() {
+    const lnote = crLostNote(msg, at)
+    if lnote != "" { msg = msg + lnote }
+  }
+  // A demand re-asked at a pin away from the delivery it came through names that delivery.
+  if cvNow >= 0 && at != cvNow { msg = msg + cvViaNote(cvNow) }
+  if code == "" && zeroBytesFixIx.length > 0 && i32ListHas(zeroBytesFixIx, at) {
+    code = CODE_ZERO_BYTES
+  }
+  // An exact repeat (same message, same anchor) is noise, not information — two passes can resolve
+  // the same annotation, the pass-1.5 hoist and the real pass both reporting a generic-alias arity
+  // error at the same position. Drop the repeat; the diagnostic count stays small, so the scan is
+  // cheap.
+  let di = 0
+  while di < T.diags.length {
+    const d = T.diags[di]
+    if d.tat == at && d.tmsg == msg { return 0 }
+    di = di + 1
+  }
+  numLitNoteQueue(msg, at, T.diags.length)
+  if recAdOrigDecl.length > 0 && !recAdRaising {
+    if recAdWholeErr(at) || recAdMentions(at, 6) {
+      msg = msg + recAdNoteFor(at)
+    }
+    if !recAdWholeErr(at) { recAdLoose = recAdLoose + 1 }
+  }
+  T.diags.push(
+    {
+      tmsg: msg,
+      tat: at,
+      tline: ln,
+      tcol: co,
+      tendTok: endTok,
+      tcode: code,
+      tdata: data,
+    },
+  )
+  0
+}
+
+// ── small numeric / string helpers (no union narrowing) ──────────────────────
+
+// Whether `v` is a type parameter and `u` a union with `v` among its members.
+function tyVarMemberOf(v: i32, u: i32): boolean {
+  if v < 0 || u < 0 || v >= T.tys.length || u >= T.tys.length { return false }
+  if !(T.tys[v] is TyVar) { return false }
+  const ut = T.tys[u]
+  if ut is TyUnion {
+    let i = 0
+    while i < ut.uMembers.length {
+      const m = ut.uMembers[i]
+      if m == v || (m >= 0 && sameVariantTy(m, v)) { return true }
+      if m >= 0 && m < T.tys.length && sameDeclaredTyParam(m, v) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `as` from `from` to `to`, deferred off a gradual union, holds at a pin: an arm of a
+// union, or a numeric conversion or the type itself.
+function asPinHolds(from: i32, to: i32): boolean {
+  if from < 0 || to < 0 || from >= T.tys.length { return true }
+  const f = T.tys[from]
+  if f is TyUnion { return unionCoversTy(f, to) }
+  // A nullable operand is a union operand, as `checkCastNode` reads it.
+  if f is TyNullable {
+    if f.nInner < 0 { return true }
+    const nu = T.tys[mkUnionTy([f.nInner, TY_NULL])]
+    if nu is TyUnion { return unionCoversTy(nu, to) }
+    return true
+  }
+  if from == to || assignable(from, to) { return true }
+  isNumeric(from) && isNumeric(to) && primNameOf(from) != "boolean"
+}
+
+// The join of `a` and `b` when one is a join kept apart over a type parameter and the other a
+// union holding one too: the side holding every member of the other, or their union kept
+// apart. -1 otherwise.
+function gradualUnionJoin(a: i32, b: i32): i32 {
+  if tpJoinUnions.length == 0 { return -1 }
+  const ta = tpJoinUnions.has(a)
+  const tb = tpJoinUnions.has(b)
+  if !ta && !tb { return -1 }
+  // A kept-apart join beside a concrete type keeps it too, unless it already holds it.
+  const concreteBeside = (ta && !tyHasTyVar(b)) || (tb && !tyHasTyVar(a))
+  if !concreteBeside && (tpGradualView(a) == a || tpGradualView(b) == b) {
+    return -1
+  }
+  if isNullTy(a) || isNullTy(b) || a == TY_VOID || b == TY_VOID { return -1 }
+  if tyMembersWithin(b, a) { return a }
+  if tyMembersWithin(a, b) { return b }
+  const tc = joinVariantTys(a, b)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  tpJoinUnions[tc] = 1
+  tc
+}
+
+// Whether every member of `x` is a member of `u`.
+function tyMembersWithin(x: i32, u: i32): boolean {
+  const xs: i32[] = []
+  flattenVariantsInto(x, xs)
+  const us: i32[] = []
+  flattenVariantsInto(u, us)
+  for m in xs {
+    let hit = false
+    for n in us {
+      if n == m || sameVariantTy(n, m) { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// The least upper bound used by `??` (host: `flatten(Union(nonNull(l), r))`):
+// mutually-assignable types collapse to the wider; otherwise a two-member union.
+export function joinTys(a: i32, b: i32) {
+  const apart = njApart
+  njApartSet(false)
+  if a < 0 { return b }
+  if b < 0 { return a }
+  // A join is a destination for both sides: an empty `[]` / `Map()` arm takes its sibling's
+  // element type, in either order, so the literal is built at the type it flows into (D2209).
+  constrainEmpty(a, b)
+  constrainEmpty(b, a)
+  const tpn = joinTyParamNull(a, b)
+  if tpn >= 0 { return tpn }
+  // A bare declared parameter beside a concrete type is their union, re-joined at each pin:
+  // folding `5` into `T` would read it as the pin's type (D2906).
+  const aVar = T.tys[a] is TyVar
+  const bVar = T.tys[b] is TyVar
+  if (aVar || bVar) && (tyParamBesideBare(a, b) || tyParamBesideBare(b, a)) {
+    const tc = joinVariantTys(a, b)
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[tc] = 1
+    noteHoleTpJoin(tc)
+    return tc
+  }
+  // Such a union absorbs only its own members: its parameter member is assignable from
+  // anything, which would fold `T | string` beside `T | i32` to the first (D3212).
+  if tpJoinUnions.length > 0 && !aVar && !bVar {
+    const gj = gradualUnionJoin(a, b)
+    if gj >= 0 { return gj }
+  }
+  // A declared parameter beside such a union joins into it, as a member or kept apart: the
+  // parameter is assignable to the union's own parameter, which would drop one of them.
+  if tpJoinUnions.length > 0 {
+    if (
+      (aVar && tyIsGradualParam(a) && tpJoinUnions.has(b))
+      || (bVar && tyIsGradualParam(b) && tpJoinUnions.has(a))
+    ) {
+      if aVar && tyVarMemberOf(a, b) { return b }
+      if bVar && tyVarMemberOf(b, a) { return a }
+      const tv = joinVariantTys(a, b)
+      // arena-tick exempt: a per-program mark on a fresh arena row.
+      tpJoinUnions[tv] = 1
+      noteHoleTpJoin(tv)
+      return tv
+    }
+  }
+  // Two different declared type parameters are two types, though a type variable is
+  // assignable either way inside a generic body: collapsing would type the join as one
+  // side and every instance binding them apart would read the other as it (D2760).
+  if (
+    tyParamsPart(a, b, 0)
+    || tyParamArmAbsorbs(a, b)
+    || tyParamArmAbsorbs(b, a)
+  ) {
+    const tj = joinVariantTys(a, b)
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[tj] = 1
+    return tj
+  }
+  // A type parameter beside a union holding it joins as that union: inside the body the
+  // parameter is assignable to either, and taking it alone drops the union's other members (D2876).
+  if tyVarMemberOf(a, b) { return b }
+  if tyVarMemberOf(b, a) { return a }
+  const oj = tpOpenJoin(a, b)
+  if oj >= 0 { return oj }
+  if apart {
+    const nj = numApartJoin(a, b)
+    if nj >= 0 { return nj }
+  }
+  // Two different records may join wider than either (`{f: i32}` into `{f: f64}`) (D2731).
+  if !recordJoinMinted && a != b {
+    if T.tys[a] is TyObj && T.tys[b] is TyObj { recordJoinMintedSet(true) }
+  }
+  if paramJoinDropsNull(a, b) || paramJoinDropsNull(b, a) {
+    return paramNullJoin(a, b)
+  }
+  if assignable(b, a) && !joinWidensMap(b, a) { return a }
+  if assignable(a, b) && !joinWidensMap(a, b) { return b }
+  joinVariantTys(a, b)
+}
+
+// The join `paramJoinDropsNull` keeps: each member once, the null as a member rather than a
+// wrapper, so a pin binding a parameter to a nullable type substitutes to one flat union.
+function paramNullJoin(a: i32, b: i32): i32 {
+  const ms: i32[] = []
+  flattenVariantsInto(a, ms)
+  flattenVariantsInto(b, ms)
+  const kept: i32[] = []
+  let hasNull = false
+  for m in ms {
+    if isNullTy(m) {
+      hasNull = true
+    } else {
+      let dup = false
+      for k in kept {
+        if k == m || sameVariantTy(k, m) { dup = true }
+        if k >= 0 && m >= 0 && sameDeclaredTyParam(k, m) { dup = true }
+      }
+      if !dup { kept.push(m) }
+    }
+  }
+  if hasNull { kept.push(TY_NULL) }
+  const res = mkUnionTy(kept)
+  if tyIsTpJoinUnion(a) || tyIsTpJoinUnion(b) {
+    // arena-tick exempt: a per-program mark on a fresh arena row.
+    tpJoinUnions[res] = 1
+  }
+  if isJoinHoleUnion(a) || isJoinHoleUnion(b) { joinHoleUnions.push(res) }
+  noteHoleTpJoin(res)
+  // arena-tick exempt: a per-program mark on a fresh arena row.
+  paramNullJoins[res] = 1
+  res
+}
+
+// `a op b` where an operand is a numeric union: each member pair takes the scalar rule, and
+// the result is the union of the pair results in first-seen order (a comparison is boolean).
+export function numUnionBinTy(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
+  let ls = numUnionMembersOf(lt)
+  if ls.length == 0 { ls = [lt] }
+  let rs = numUnionMembersOf(rt)
+  if rs.length == 0 { rs = [rt] }
+  const cmp = numCmpOp(n.binOp)
+  const res: i32[] = []
+  for a in ls {
+    for b in rs {
+      if !isNumericPrimTy(a) || !isNumericPrimTy(b) {
+        tErr(
+          "operator '"
+            + n.binOp
+            + "' is not defined for "
+            + tyToStr(lt)
+            + " and "
+            + tyToStr(rt),
+          ix,
+        )
+        if cmp { return TY_BOOL }
+        return TY_ERR
+      }
+      const p = numPairTy(n, a, b)
+      if p < 0 {
+        tErr(
+          "operator '"
+            + n.binOp
+            + "' over "
+            + tyToStr(lt)
+            + " and "
+            + tyToStr(rt)
+            + " mixes the members "
+            + tyToStr(a)
+            + " and "
+            + tyToStr(b)
+            + "; narrow with `is` or convert with `as` first",
+          ix,
+        )
+        if cmp { return TY_BOOL }
+        return TY_ERR
+      }
+      let seen = false
+      for r in res {
+        if r == p || tySame(r, p) { seen = true }
+      }
+      if !seen { res.push(p) }
+    }
+  }
+  if cmp { return TY_BOOL }
+  if res.length == 1 { return res[0] }
+  mkUnionTy(res)
+}
+
+// `joinTys` for the arms of a value `if` or `match`.
+export function joinArmTys(a: i32, b: i32): i32 {
+  tpArmJoinDepth = tpArmJoinDepth + 1
+  const j = joinTys(a, b)
+  tpArmJoinDepth = tpArmJoinDepth - 1
+  j
+}
+
+// `joinArmTys` of an arm typed `a` beside one typed `b`, where `aLit`/`bLit` say an arm's every
+// value is a literal. Two runtime values of different numeric types join as their union; a
+// literal adapts to its sibling as before.
+export function joinArmLit(a: i32, aLit: boolean, b: i32, bLit: boolean): i32 {
+  if a == b {
+    const same = joinArmTys(a, b)
+    // A kept-apart join of runtime arms joined with itself is still one (D3569), and so is a
+    // written union of type parameters, whose runtime members a pin must not fold (D3594).
+    if (tpJoinUnions.get(a) ?? 0) == 2 { markTpJoinApart(same) }
+    else if !aLit && !bLit && writtenTpUnion(a) { markTpJoinApart(same) }
+    return same
+  }
+  const apart = !aLit && !bLit && !njJoinGated(a, b, false)
+  njApartSet(apart)
+  const j = joinArmTys(a, b)
+  njApartSet(false)
+  if apart { markTpJoinApart(j) }
+  j
+}
+
+// The union of `a` and `b` when each holds a numeric primitive and their numeric members differ,
+// else -1: runtime values of different numeric types join apart, never widened.
+function numApartJoin(a: i32, b: i32): i32 {
+  if a == b || a < 0 || b < 0 { return -1 }
+  if !tyHoldsNumericPrim(a) || !tyHoldsNumericPrim(b) { return -1 }
+  if tyHasTyVar(a) || tyHasTyVar(b) { return -1 }
+  if !numericVariantUncovered(a, b) && !numericVariantUncovered(b, a) {
+    return -1
+  }
+  joinVariantTys(a, b)
+}
+
+// Whether `o` holds a member apart from some member of `u` (`tyParamsPart`) that no member of
+// `u` is the same variant as, one of the two being a union: `T[] | f64[]` beside `string[]`
+// keeps all three, and `T[]` beside `T[] | f64[]` both (D2783, D2814).
+export function tyParamArmAbsorbs(u: i32, o: i32): boolean {
+  if !tpApartConcrete { return false }
+  if u < 0 || o < 0 || u >= T.tys.length || o >= T.tys.length { return false }
+  if !(T.tys[u] is TyUnion) && !(T.tys[o] is TyUnion) { return false }
+  const us: i32[] = []
+  flattenVariantsInto(u, us)
+  const os: i32[] = []
+  flattenVariantsInto(o, os)
+  let j = 0
+  while j < os.length {
+    let same = false
+    let apart = false
+    let i = 0
+    while i < us.length {
+      if us[i] == os[j] || sameVariantTy(us[i], os[j]) { same = true }
+      if tyParamsPart(us[i], os[j], 0) { apart = true }
+      i = i + 1
+    }
+    if apart && !same { return true }
+    j = j + 1
+  }
+  false
+}
+
+// The join of `a` and `b` as distinct variants: a flattened, deduped union, with nullability
+// folding back into a `?` wrapper.
+export function joinVariantTys(a: i32, b: i32) {
+  const vars: i32[] = []
+  flattenVariantsInto(a, vars)
+  flattenVariantsInto(b, vars)
+  const kept: i32[] = []
+  let hasNull = false
+  let i = 0
+  while i < vars.length {
+    const v = vars[i]
+    if isNullTy(v) {
+      hasNull = true
+    } else {
+      let dup = false
+      let j = 0
+      while j < kept.length {
+        if kept[j] == v { dup = true }
+        if sameVariantTy(kept[j], v) { dup = true }
+        if !dup {
+          const fw = joinObjFieldwise(kept[j], v)
+          if fw >= 0 {
+            kept[j] = fw
+            dup = true
+          }
+        }
+        j = j + 1
+      }
+      if !dup { kept.push(v) }
+    }
+    i = i + 1
+  }
+  dropStrLitsBesideString(kept)
+  if kept.length == 0 { return TY_NULL }
+  // A set joined with a map it shares a rep with has no union to become (D2673); the node whose
+  // check made the join reports it (`checkNodeDone`).
+  const jclash = setMapUnionClashMsg(kept, true)
+  if jclash != "" {
+    joinClashMsgSet(jclash)
+    return TY_ERR
+  }
+  let res = kept[0]
+  if kept.length > 1 { res = mkUnionTy(kept) }
+  if hasNull { return mkNullableTy(res) }
+  res
+}
+
+// Two records sharing a field-name set that D1023 would refuse as union arms join as one
+// record of per-field joins, the type the annotated spelling names (D2731); -1 otherwise.
+function joinObjFieldwise(a: i32, b: i32): i32 {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return -1 }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyObj {
+    if tb is TyObj {
+      if !objSigSame(ta, tb) || objArmsSameType(ta, tb) { return -1 }
+      if objArmsDiscriminable(ta, tb) { return -1 }
+      let k = 0
+      while k < ta.objFieldNames.length {
+        if (
+          !fieldJoinKeepsRecordsApart(
+            ta.objFieldTypes[k],
+            objPairedTy(ta, tb, k),
+          )
+        ) {
+          return -1
+        }
+        k = k + 1
+      }
+      const names: string[] = []
+      const tys: i32[] = []
+      let i = 0
+      while i < ta.objFieldNames.length {
+        names.push(ta.objFieldNames[i])
+        tys.push(joinTys(ta.objFieldTypes[i], objPairedTy(ta, tb, i)))
+        i = i + 1
+      }
+      recordJoinMintedSet(true)
+      return mkObjTy(names, tys)
+    }
+  }
+  -1
+}
+
+// The return-inference join, for `noteInferredRet` alone — not the general `joinTys`. A hole must
+// not collapse here: it is permissively assignable both ways, so the mutual-assignability collapse
+// picks one side and drops the other. Keeping both as a deferred join hands the choice to the call
+// site; such a join has no runtime shape, so every path to the emitter must collapse it again.
+export function joinRetTys(a: i32, b: i32) {
+  if a < 0 { return b }
+  if b < 0 { return a }
+  if a == b { return a }
+  if !tyIsHole(a) && !tyIsHole(b) {
+    const saved = tpApartConcrete
+    tpApartConcreteSet(true)
+    njApartSet(njApartRet)
+    const j = joinTys(a, b)
+    tpApartConcreteSet(saved)
+    return j
+  }
+  const kept: i32[] = []
+  flattenVariantsInto(a, kept)
+  flattenVariantsInto(b, kept)
+  const uniq: i32[] = []
+  let i = 0
+  while i < kept.length {
+    let dup = false
+    let j = 0
+    while j < uniq.length {
+      if uniq[j] == kept[i] { dup = true }
+      j = j + 1
+    }
+    if !dup { uniq.push(kept[i]) }
+    i = i + 1
+  }
+  if uniq.length == 1 { return uniq[0] }
+  const res = mkUnionTy(uniq)
+  joinHoleUnions.push(res)
+  if njApartRet { apartHoleJoins[res] = true }
+  res
+}
+
+// Soundness gate on the re-fold: is deferred-join member `mIx` provably dead under these bindings,
+// a branch the pinned argument can never take? Only a derived member-read hole can be proven dead,
+// and only against a concrete pin. Everything else is live — in particular a member that merely
+// resolved to another hole is still undecided, and calling that dead is itself a soundness hole.
+function holeMemberDeadAt(mIx: i32, bNames: string[], bTys: i32[]) {
+  if mIx < 0 { return false }
+  const t = T.tys[mIx]
+  if !(t is TyVar) { return false }
+  const base = holeBaseTy(mIx)
+  if base == mIx {
+    return false // not a derived read — never provably dead
+  }
+  const pin = substHoleTy(base, bNames, bTys)
+  if pin < 0 {
+    return false // the base is not pinned here — defer
+  }
+  if tyIsHole(pin) {
+    return false // pinned to another hole — still undecided
+  }
+  // The base is concrete, yet the derived read does not resolve: this branch cannot be reached by
+  // this argument.
+  substHoleTy(mIx, bNames, bTys) < 0
+}
+
+// Re-fold a deferred join under a call's bindings: drop every provably dead member and re-join the
+// rest, so a call site where exactly one arm is live sees that arm's type rather than a spurious
+// `A | B`. A merely unresolved member survives, and the join re-folds again at the site that pins
+// it. The re-join goes through `joinRetTys`, so a surviving hole member is not collapsed away.
+function refoldJoinUnion(
+  tyIx: i32,
+  orig: i32[],
+  subst: i32[],
+  changed: boolean,
+  bNames: string[],
+  bTys: i32[],
+) {
+  let anyDead = false
+  let i = 0
+  while i < orig.length {
+    if holeMemberDeadAt(orig[i], bNames, bTys) { anyDead = true }
+    i = i + 1
+  }
+  if !anyDead && !changed { return tyIx }
+  let res = -1
+  let live = 0
+  let j = 0
+  // A lambda's deferred return re-joins as it always has: its instance builds no kept-apart join.
+  lamCheckDepth = lamCheckDepth + 1
+  lamRefoldDepth = lamRefoldDepth + 1
+  const apart = apartHoleJoins.get(tyIx) ?? false
+  while j < orig.length {
+    if !holeMemberDeadAt(orig[j], bNames, bTys) {
+      njApartRetSet(apart)
+      res = joinRetTys(res, subst[j])
+      njApartRetSet(false)
+      live = live + 1
+    }
+    j = j + 1
+  }
+  lamCheckDepth = lamCheckDepth - 1
+  lamRefoldDepth = lamRefoldDepth - 1
+  // Every arm proven dead is not a type — keep the union rather than invent one.
+  if live == 0 || res < 0 { return mkUnionTy(subst) }
+  // The null `paramNullJoin` kept stays: re-joined here, outside the body that declared the
+  // holes, the caller's holes would absorb it (D3497).
+  if paramNullJoins.has(tyIx) && !isNullTy(res) && !tyBearsNull(res) {
+    for m in subst {
+      if isNullTy(m) { return mkNullableTy(res) }
+    }
+  }
+  res
+}
+
+// Do every deferred binary-op constraint this binding resolves hold — the capability check as a
+// pure boolean, `validateBinCstrs` being the diagnostic-emitting twin? A constraint still touching
+// an unbound hole defers, answering true.
+function binCstrsHold(bNames: string[], bTys: i32[], calleeFn: i32) {
+  let ci = 0
+  while ci < binCstr.op.length {
+    if cstrOwnedBy(binCstr.fn[ci], calleeFn) {
+      const clt = substTyDeep(binCstr.lt[ci], bNames, bTys)
+      const crt = substTyDeep(binCstr.rt[ci], bNames, bTys)
+      if !tyHasHole(clt) {
+        if !tyHasHole(crt) {
+          if eqLitNonMember(clt, crt) { return false }
+          if !eqLitMemberOk(clt, crt) && !eqLitMemberOk(crt, clt) {
+            if !binOpDefinedFor(binCstr.op[ci], clt, crt) { return false }
+          }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  true
+}
+
+// Is a generic function value of type `srcTy` (hole params or return) assignable to the concrete
+// function type `dstTy`? Instantiate it at `dstTy`'s param types, require the body's capability to
+// hold there and the substituted return to match — the per-call-site instantiation driven by the
+// target type. The permissive structural `assignable` would accept a mismatch that cannot lower.
+function genericFnAssignable(srcTy: i32, dstTy: i32) {
+  const s = T.tys[srcTy]
+  const d = T.tys[dstTy]
+  if s is TyFunc {
+    if d is TyFunc {
+      const sp = s.fnParamTypes
+      const dp = d.fnParamTypes
+      if sp.length != dp.length { return false }
+      const bNames: string[] = []
+      const bTys: i32[] = []
+      let i = 0
+      while i < sp.length {
+        bindGenWalk(sp[i], dp[i], bNames, bTys)
+        if !assignable(dp[i], sp[i]) { return false }
+        i = i + 1
+      }
+      // -1: a function value names no declaration here, so every constraint is still consulted —
+      // `cstrOwnedBy`'s unknown-callee fallback, rather than guessing an owner from a `TyFunc`.
+      if !binCstrsHold(bNames, bTys, CSTR_ANYFN) { return false }
+      if !argCstrsHold(bNames, bTys) { return false }
+      // No `retCstrsHold` rung here, and its absence is deliberate. A function value names no
+      // declaration, so `cstrOwnedBy`'s fallback puts every generic's return constraint in scope,
+      // and `substTyDeep` matches TyVars by name, so it can refuse an unrelated instantiation.
+      // The `assignable` on the next line already compares the instance's return to the target's.
+      return assignable(substTyDeep(s.fnRet, bNames, bTys), d.fnRet)
+    }
+  }
+  false
+}
+
+// The function-value into void-slot grant (see its call site in `assignableExpr`). True — and the
+// seam recorded for the emitter's twin mint — when `dstTy` is a `TyFunc` returning `void`, `srcTy`
+// is a concrete `TyFunc` with a resolved non-void return, the param lists match pairwise under
+// `fnSlotAssignable`, and `srcExpr` names an unshadowed module-scope `function` declaration.
+export function fnValVoidCoerce(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
+  const d = T.tys[dstTy]
+  if !(d is TyFunc) { return false }
+  if !isVoidTy(d.fnRet) { return false }
+  const s = T.tys[srcTy]
+  if !(s is TyFunc) { return false }
+  if fnTyHasHole(srcTy) { return false }
+  // The source's return must be resolved and non-void: a `-2` pending return is still being
+  // inferred, and a void source needs no coercion, taking the plain assignable path.
+  if s.fnRet < 0 { return false }
+  if isVoidTy(s.fnRet) { return false }
+  const sp = s.fnParamTypes
+  const dp = d.fnParamTypes
+  if sp.length != dp.length { return false }
+  let i = 0
+  while i < sp.length {
+    if !fnSlotAssignable(dp[i], sp[i]) { return false }
+    i = i + 1
+  }
+  // The expression form: a paren-peeled Ident naming an unshadowed module-scope
+  // `function` declaration.
+  let u = srcExpr
+  let done = false
+  while !done {
+    const pn = P.nodes[u]
+    if pn is Paren { u = pn.parInner } else { done = true }
+  }
+  const en = P.nodes[u]
+  if en is Ident {
+    if (fnDeclIx[en.identName] ?? -1) < 0 { return false }
+    if lookupDepth(en.identName) != 0 { return false }
+    if !inferQuiet { noteVoidCoerceVal(u, en.identName) }
+    return true
+  }
+  false
+}
+
+// The type of the value `if` or `match` at `ix` when some tail is an `f32` value and every other
+// is a float literal, which adopts f32 as it does beside an operator (`raw * 2.0`); else -1. Its
+// `if`/`match` nodes are re-typed f32, so each literal re-encodes at single precision (D2775).
+export function joinF32LitTails(ix: i32): i32 {
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(ix, spine, leaves)
+  let fTy = -1
+  let lits = 0
+  let i = 0
+  while i < leaves.length {
+    const lt = nodeTyOf(leaves[i])
+    if isFloatLitExpr(leaves[i]) { lits = lits + 1 }
+    else if lt >= 0 && primNameOf(lt) == "f32" { fTy = joinTys(fTy, lt) }
+    else { return -1 }
+    i = i + 1
+  }
+  if lits == 0 || fTy < 0 || primNameOf(fTy) != "f32" { return -1 }
+  // Flagged on every pass: an inference pass records the `if`'s value type too.
+  let s = 0
+  while s < spine.length {
+    if !inferQuiet && spine[s] < nodeTyIx.length { nodeTySet(spine[s], fTy) }
+    f32JoinAdoptedSetAt(spine[s], true)
+    f32JoinAdoptCountSet(f32JoinAdoptCount + 1)
+    s = s + 1
+  }
+  fTy
+}
+
+// Resolve an annotation from the parser's spelling tree where the annotation node carries one, and
+// from the concatenated name where it does not. `annTsOf` answers -1 for exactly two populations,
+// neither a checker-time annotation: an emitter-synthesized `TypeRef`, and a name a later pass
+// rewrote without the node. Both reach `nameToTy` through the unpositioned entries.
+export function annotResolve(name: string, root: i32) {
+  if root >= 0 { return tsToTy(root) }
+  nameToTy(name)
+}
+
+// Resolve annotation `name` with resolution diagnostics anchored at node `at`, reading the spelling
+// tree banked on annotation node `ann`. The two are the same node at three of the four callers;
+// they differ at a struct field, whose "unknown type" diagnostic anchors on the `FieldDef` so the
+// message points at the field, while the spelling is banked on the `TypeRef` child.
+function nameToTyAnn(name: string, at: i32, ann: i32) {
+  // An annotation a rewrite minted is typed as the rewrite typed it.
+  const minted = luAnnTy[ann] ?? -1
+  if minted >= 0 { return minted }
+  const saved = annotDiagAt
+  annotDiagAtSet(at)
+  const r = annotResolve(name, annTsOf(ann))
+  annotDiagAtSet(saved)
+  r
+}
+
+// The same, where the diagnostic anchor IS the annotation node.
+export function nameToTyAt(name: string, at: i32) { nameToTyAnn(name, at, at) }
+
+// Apply a generic alias (`Box<i32>`, `Pair<i32,string>`, `Box<T>` under a live type-param env):
+// resolve the arguments, check the arity, bind the declared parameter names to them, and resolve
+// the declaration's fields under those bindings. Memoizes into `cUserTypes` under a resolved key,
+// registered as a placeholder first so recursion terminates. -1 for an unknown base or argument.
+export function applyGenAlias(head: string, inner: string) {
+  applyGenAliasArgs(head, inner, -1)
+}
+
+// The body of `applyGenAlias`, with the argument list taken from either source: `appIx >= 0` is a
+// `TS_APP` spelling node whose kids are the arguments, and `inner` is then unused; `appIx < 0`
+// splits `inner` at its top-level commas. Everything after the argument list is one body precisely
+// because the two routes must not be able to drift.
+function applyGenAliasArgs(head: string, inner: string, appIx: i32) {
+  const gi = gaIndexOf(head)
+  // `Map<K, V>` / `Set<T>` — the builtin collections' names, reached only when no user
+  // declaration claims the head (a user `type Map<A> = …` is found by `gaIndexOf` above).
+  if gi < 0 {
+    if (head == "Map" || head == "Set") && !cUserTypes.has(head) {
+      return builtinCollAppTy(head, inner, appIx)
+    }
+    return builtinCtorTyLeafFail(head)
+  }
+  // The declared parameter names, read as a slice of the flat column — split once when the alias
+  // registered (D-GAPARAM), not re-split here per application. `pcount` is the declared arity.
+  const pstart = gaParamStart[gi]
+  const pcount = gaParamCount[gi]
+  const argTys: i32[] = []
+  if appIx >= 0 {
+    const astart = tsKidStart[appIx]
+    const acnt = tsKidCount[appIx]
+    let ti = 0
+    while ti < acnt {
+      const kid = tsKids[astart + ti]
+      // The recovery leaf renders `""`, which `splitGenArgs` drops — so `Box<>` is an arity
+      // error on both routes, not an unresolved argument.
+      if tsKind[kid] != TS_ERR {
+        const a = tsToTy(kid)
+        if a < 0 { return -1 }
+        argTys.push(a)
+      }
+      ti = ti + 1
+    }
+  } else {
+    const argNames: string[] = []
+    tyTopLevelSplit(inner, ',', true, argNames)
+    let ai = 0
+    while ai < argNames.length {
+      const a = nameToTy(argNames[ai])
+      if a < 0 { return -1 }
+      argTys.push(a)
+      ai = ai + 1
+    }
+  }
+  if argTys.length != pcount {
+    tErr(
+      "`"
+        + head
+        + "` expects "
+        + i32ToStr(pcount)
+        + " type arguments but got "
+        + i32ToStr(argTys.length),
+      annotDiagAt,
+    )
+    return TY_ERR
+  }
+  let memoKey = head + "<#"
+  let mi = 0
+  while mi < argTys.length {
+    memoKey = memoKey + i32ToStr(argTys[mi]) + ","
+    mi = mi + 1
+  }
+  const cuHit = cUserTypes[memoKey]
+  if cuHit is i32 { return cuHit }
+  const fnames: string[] = []
+  const ftys: i32[] = []
+  const resIx = mkObjTy(fnames, ftys)
+  cUserTypes[memoKey] = resIx
+  cUserTypesVer = cUserTypesVer + 1 // new declared-name resolution registered
+  // Bank the fact that this arena index is the application `head<argTys>`. Recorded on the memo
+  // miss, so exactly one row exists per distinct application — the same population `cUserTypes`
+  // keys, and the same index every later hit returns.
+  cTyIxSetAdd(gaAppTyIxs, gaAppTyIxSet, resIx)
+  gaAppHeads.push(head)
+  gaAppArgStart.push(gaAppArgFlat.length)
+  gaAppArgCount.push(argTys.length)
+  gaAppFinite.push(-1)
+  let gaf = 0
+  while gaf < argTys.length {
+    gaAppArgFlat.push(argTys[gaf])
+    gaf = gaf + 1
+  }
+  let bi = 0
+  while bi < pcount {
+    tpEnvNames.push(gaParamNames[pstart + bi])
+    tpEnvTys.push(argTys[bi])
+    bi = bi + 1
+  }
+  const decl = P.nodes[gaDeclIxs[gi]]
+  if decl is TypeDecl {
+    const dfields = decl.tdFields
+    let fi = 0
+    while fi < dfields.length {
+      const fd = P.nodes[dfields[fi]]
+      if fd is FieldDef {
+        fnames.push(fd.fdName)
+        let fty = TY_ERR
+        if fd.fdType >= 0 {
+          const ftn = P.nodes[fd.fdType]
+          if ftn is TypeRef {
+            // The alias body's field annotation is a parsed `TypeRef` like any
+            // other, so it resolves from its own spelling tree — under the `<T>`
+            // bindings pushed above, which both routes read from `tpEnvNames`.
+            const r = annotResolve(ftn.tyName, annTsOf(fd.fdType))
+            if r >= 0 {
+              fty = r
+              // Record the resolved type on the field's type-annotation node so the emitter
+              // classifies a field type structurally from the `Ty` arena, not a re-parsed name.
+              if !inferQuiet && fd.fdType < nodeTyIx.length {
+                nodeTySet(fd.fdType, r)
+              }
+            } else {
+              unknownTyErr(
+                ftn.tyName,
+                " for field '" + fd.fdName + "'",
+                dfields[fi],
+              )
+            }
+          }
+        }
+        ftys.push(fty)
+      }
+      fi = fi + 1
+    }
+  }
+  // The placeholder registered above is now filled in place (its field arrays are `fnames`/`ftys`)
+  // — an existing arena entry changed shape.
+  tyMutEpoch = tyMutEpoch + 1
+  let pj = 0
+  while pj < pcount {
+    tpEnvNames.pop()
+    tpEnvTys.pop()
+    pj = pj + 1
+  }
+  resIx
+}
+
+// ── the three leaf rungs both resolvers bottom out at ────────────────────────
+
+// `nameToTy` (the character-surgery resolver) and `tsToTy` (the structural one) differ only in how
+// they take a composition apart — a union, an array suffix, an inline object. Where the spelling is
+// a bare identifier there is nothing to take apart and both must answer identically, so the three
+// leaf rungs live here once. Each is a nominal lookup and inspects no character of its argument.
+
+// An INTERSECTION operand, spelling-tree route: a negation here is subtracted from the
+// operand beside it and the annotation's own type is the positive remainder, which is the one
+// place the ruling keeps a written `!T`. Every other position reaches `tsToTy`'s refusing arm,
+// so `A & (B | !C)` — a negation stored inside a union — is refused like any other.
+function tsIsectOperandTy(kid: i32) {
+  if tsKind[kid] == TS_NEG {
+    const inner = tsToTy(tsKids[tsKidStart[kid]])
+    if inner < 0 { return -1 }
+    return mkNegTy(inner)
+  }
+  tsToTy(kid)
+}
+
+// The name route's twin, for the same reason and with the same scope: only a `!` that IS the
+// whole operand resolves, so a negation nested any deeper reaches the refusal.
+function nameIsectOperandTy(part: string) {
+  if part.length > 0 {
+    if part[0] == '!' {
+      const inner = nameToTy(part.slice(1, part.length))
+      if inner < 0 { return -1 }
+      return mkNegTy(inner)
+    }
+  }
+  nameToTy(part)
+}
+
+function declaredTyOfName(name: string) {
+  // A bound in value position: a design refusal, not a capability gap. `{ toString(): string }` as
+  // a parameter type would be an existential needing dynamic dispatch, and everything in VL
+  // monomorphizes. The sentence names the position it is legal in. A body-scope `type` needs no arm
+  // here — the parser hoists it under a unique name, so pass 0a registers it like any other (D1045).
+  if cBoundDecls.has(name) {
+    tErr(
+      "`"
+        + name
+        + "` is a BOUND, not a type — it declares method members, which constrain a type parameter and have no values. Use it as a constraint: `function f<T: "
+        + name
+        + ">(x: T)`",
+      annotDiagAt,
+    )
+    return TY_ERR
+  }
+  if cUserTypes.has(name) {
+    // Order-independence, at the one entry point every route to a declared type comes through
+    // (`tsLeafTy` and `nameToTyReal`'s last rung both bottom out here). Pass 0a minted this entry as
+    // an empty placeholder and pass 0b fills it; a name resolved in between reads the placeholder,
+    // which is a different type and not merely a missing one. Inert outside pass 0b.
+    forceDeclFill(name)
+    const ut = cUserTypes[name] ?? -1
+    let res = ut
+    if ut >= 0 {
+      const utt = T.tys[ut]
+      if utt is TyUnion {
+        // Collapse a primitive-scalar single member, and an object member reached through a plain
+        // alias reference (`type MyCat = Cat`, `type Y = Box<i32>`). The one-member object case that
+        // stays opaque is the canonicalized intersection, which the emitter interns as a named
+        // struct. `singleAliasMemberTyIx` is the single rule both sides read.
+        const sm = singleAliasMemberTyIx(ut, name)
+        // A nominal newtype keeps the collapse and adds a brand on top of it — `nwBrand` is the
+        // identity for every name not declared `new`. The collapse must stay: it is what the
+        // emitter's `singleMemberAliasTyIx` twin does with the same annotation, and the brand is
+        // invisible to it, which is precisely why the newtype costs nothing to emit.
+        if sm >= 0 { res = sm }
+      }
+    }
+    const answer = nwBrand(name, res)
+    // D1048's second-hint provenance, re-banked at the reference. The declaration route recorded
+    // that `type R = string | "err"` dropped an arm, and every later `: R` resolves through here.
+    // It banks the index the reference actually answers, which is what makes an enclosing spelling
+    // (`R[]`, `R | i32`) decline on its own. `forceDeclFill` above makes it order-independent.
+    if collapsedAliases.has(name) {
+      if answer >= 0 { collapsedTySet(answer) }
+    }
+    return answer
+  }
+  // A bare reference to a generic alias has no concrete type: its parameters are never supplied.
+
+  if gaIndexOf(name) >= 0 {
+    tErr(
+      "Generic type `"
+        + name
+        + "` expects type arguments but was used without any",
+      annotDiagAt,
+    )
+    return TY_ERR
+  }
+  -1
+}
+
+// The leaf a spelling node with nothing to decompose resolves to: `TS_NAME`'s identifier,
+// `TS_MAP`'s key token, and `TS_ERR`'s `""`. All three are single tokens the lexer produced, so the
+// composition arms `nameToTy` runs between the primitive check and the type-param check provably
+// cannot fire on them — an ident lexeme holds no `[`, `{`, `<` or `|`.
+export function tsLeafTy(name: string) {
+  if name == "u8" { return storageTyLeafFail() }
+  const pv = primTyOfName(name)
+  if pv >= 0 { return pv }
+  const tv = tpEnvTyOfName(name)
+  if tv >= 0 { return tv }
+  const dv = declaredTyOfName(name)
+  if dv >= 0 { return dv }
+  builtinCtorTyLeafFail(name)
+}
+
+// `Map<K, V>` is the map type `{[K]: V}`, a long spelling of it. `Set<T>` is its own type, the
+// set flavor (`mSet` 1) over the same rep, so both lower through the index signature
+// (`builtinCollSpelling`). Arguments come from the spelling tree when `appIx` has one, else
+// from `inner`'s text. An unsupported key banks the index signature's refusal.
+function builtinCollAppTy(head: string, inner: string, appIx: i32) {
+  const argTys: i32[] = []
+  if appIx >= 0 {
+    const astart = tsKidStart[appIx]
+    const acnt = tsKidCount[appIx]
+    let ti = 0
+    while ti < acnt {
+      const kid = tsKids[astart + ti]
+      if tsKind[kid] != TS_ERR {
+        const a = tsToTy(kid)
+        if a < 0 { return -1 }
+        argTys.push(a)
+      }
+      ti = ti + 1
+    }
+  } else {
+    const argNames: string[] = []
+    tyTopLevelSplit(inner, ',', true, argNames)
+    let ai = 0
+    while ai < argNames.length {
+      const a = nameToTy(argNames[ai])
+      if a < 0 { return -1 }
+      argTys.push(a)
+      ai = ai + 1
+    }
+  }
+  let want = 2
+  if head == "Set" { want = 1 }
+  if argTys.length != want {
+    tErr(collTyArgCountMsg(head, want, argTys.length), annotDiagAt)
+    return TY_ERR
+  }
+  const k = argTys[0]
+  if !mapKeyTySupported(k) {
+    unkTyClashSet(mapKeyUnsupportedMsg(tyToStr(k), head))
+    return -1
+  }
+  if head == "Set" { return mkMapTy(k, TY_BOOL, 1) }
+  mkMapTy(k, argTys[1], 0)
+}
+
+// Raises the unknown-type sentence for `name` (with the caller's `tail`) at `at`. When a module
+// of the program or std exports the unresolved name, it is the missing-import refusal instead,
+// whose edit `check --fix` applies; with none it is recorded as a miss for the CLI's wider look.
+export function unknownTyErr(name: string, tail: string, at: i32) {
+  let part = unkTyPart
+  if part.length == 0 { part = name }
+  if unkTyClash.length == 0 && nameIsBareIdent(part) && !isBuiltinTyName(part) {
+    const from = ufcsModOfNode(at)
+    const specs = mimpSpecsFor(part, from, -1)
+    if !mimpAnyProgramSpec(specs) { mimpNoteMiss(part) }
+    if specs.length > 0 {
+      let data = diagDataField("member", part)
+      for sp in specs { data = data + diagDataField("modules", sp) }
+      return tErrCodedData(
+        "unknown type '"
+          + part
+          + "'"
+          + tail
+          + mimpExportedByNote(part, specs, from),
+        at,
+        CODE_MISSING_IMPORT,
+        data,
+      )
+    }
+  }
+  tErr(unknownTyTextIn(name, tail), at)
+}
+
+// The spelling-tree resolver, wrapped: bank this subtree's spelling if it is the
+// innermost frame that failed. `tsToName` re-renders the parser's tree, so the quoted
+// part matches the whole name's canonical spacing.
+export function tsToTy(ix: i32) {
+  unkTyDepthSet(unkTyDepth + 1)
+  if unkTyDepth == 1 {
+    unkTyPartSet("")
+    unkTyClashSet("")
+    collapsedTySet(-1)
+  }
+  const r = tsToTyReal(ix)
+  if r < 0 {
+    if unkTyPart.length == 0 { unkTyPartSet(tsToName(ix)) }
+  }
+  unkTyDepthSet(unkTyDepth - 1)
+  r
+}
+
+// The name resolver, wrapped the same way — unpositioned entries and the emitter's
+// re-resolutions come through here.
+export function nameToTy(name: string) {
+  unkTyDepthSet(unkTyDepth + 1)
+  if unkTyDepth == 1 {
+    unkTyPartSet("")
+    unkTyClashSet("")
+    collapsedTySet(-1)
+  }
+  // A bare identifier cannot enter any composite arm of `nameToTyReal`, so its answer is
+  // the shared leaf ladder: `tsLeafTy`, already the tree route's leaf, rather than a
+  // second copy of the prim/type-parameter/declared lookup. Arena-neutral by construction
+  // — all three leaf rungs are lookups of an index someone else already minted.
+  let r = -1
+  if nameIsBareIdent(name) {
+    r = tsLeafTy(name)
+  } else {
+    r = nameToTyReal(name)
+  }
+  if r < 0 {
+    if unkTyPart.length == 0 { unkTyPartSet(name) }
+  }
+  unkTyDepthSet(unkTyDepth - 1)
+  r
+}
+
+// —— literal-union flatten, shared by the annotation and declaration routes ——
+// "A union whose members are all literal unions is one" (`litunion-compact-rep-design.md`
+// §8.3), stated once because the annotation (`annUnionInnerTy`) and declaration
+// (`fillTypeDeclAt`'s `UnionDecl` arm) routes build a union's member list separately.
+
+// Push `ty` onto `out` unless a member already there is the same variant — the dedup both
+// the flatten and non-flatten legs need, so an overlapping pair keeps a shared member
+// exactly once.
+function pushDistinctVariantTy(out: i32[], ty: i32) {
+  let i = 0
+  while i < out.length {
+    if sameVariantTy(ty, out[i]) && !annArmsPart(ty, out[i]) { return 0 }
+    i = i + 1
+  }
+  out.push(ty)
+  0
+}
+
+// Flattens `members` into `out` and answers true only when every member is a literal or a
+// homogeneous literal union over one common base; otherwise leaves `out` untouched and
+// answers false. A bare literal of the common base is a member of that set, not a reason to
+// decline (D1043) — this is not the subsumption collapse, it adds a value rather than dropping one.
+function litUnionFlatMembers(members: i32[], out: i32[]): boolean {
+  if members.length < 2 { return false }
+  let base = -1
+  let sawUnion = false
+  let i = 0
+  while i < members.length {
+    let b = homogLitUnionBase(members[i])
+    if b >= 0 { sawUnion = true } else { b = armLiteralBaseTy(members[i]) }
+    if b < 0 { return false }
+    if base < 0 { base = b }
+    if base != b { return false }
+    i = i + 1
+  }
+  if !sawUnion { return false }
+  i = 0
+  while i < members.length {
+    const mt = T.tys[members[i]]
+    if mt is TyUnion {
+      let ml = 0
+      while ml < mt.uMembers.length {
+        pushDistinctVariantTy(out, mt.uMembers[ml])
+        ml = ml + 1
+      }
+    } else {
+      pushDistinctVariantTy(out, members[i])
+    }
+    i = i + 1
+  }
+  true
+}
+
+// The annotation routes' member dedup, and the one place that records what a dropped
+// duplicate collapsed with: `type A = {v: i32}` and `type B = {v: i32}` mint distinct arena
+// nodes that `sameVariantTy` calls one variant, so `A | B` keeps one member but both names
+// must register here — `sameVariantTy` is mutual, so a match can hold across either index.
+function annUnionPushDistinctMember(members: i32[], m: i32) {
+  let dup = false
+  let dj = 0
+  while dj < members.length {
+    const kept = members[dj]
+    if sameVariantTy(m, kept) && !annArmsPart(m, kept) {
+      dup = true
+      if m != kept { annRegisterVariantMembers([m, kept]) }
+    }
+    dj = dj + 1
+  }
+  if !dup { members.push(m) }
+  0
+}
+
+// —— the annotation union's member list, shared by both annotation routes ——
+// `tsToTyReal` (the tree route) and `nameToTyReal` (the string route) build the same union
+// from the same members, through one shared home per rule rather than a copy per route.
+
+// The union type an annotation's kept `members` denote, with the literal-union flatten: a
+// union of literal unions is a literal union, so without flattening `is K` const-folds to a
+// guard that can never fire (`litunion-compact-rep-design.md` §8.3). Shares
+// `litUnionFlatMembers` with the declaration route; a one-member list returns unchanged.
+function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
+  if members.length == 0 { return TY_ERR }
+  if members.length == 1 { return members[0] }
+  // Two members the emitter cannot separate poison the annotation (-1), reason banked —
+  // ahead of the `null` early-out, since `N | i32 | null` is the same union.
+  const nwClash = nomUnionRepClashMsg(members)
+  if nwClash.length > 0 {
+    unkTyClashSet(nwClash)
+    return -1
+  }
+  // The subsumed-arm collapse, ahead of the `null` wrap — `string | "err" | null` is
+  // `string?` for the same reason `string | "err"` is `string`, else the duplicate atom
+  // would carry into the niche. Re-enters on the survivors so a one-member result collapses exactly once.
+  const kept: i32[] = []
+  if unionDropSubsumedArms(members, kept) {
+    const collapsed = annUnionInnerTy(kept, hasNull)
+    // Banks the provenance, since the result itself carries no trace of a dropped arm.
+    // Written after the recursion, so a double collapse banks the final index (D1048).
+    if collapsed >= 0 { collapsedTySet(collapsed) }
+    return collapsed
+  }
+  // An inline string-literal union under `| null` is the same hidden alias as without it, so
+  // `"a" | "b" | null` and `K | null` name one inner type (D3198).
+  if hasNull && !allStrLitArms(members) {
+    annRegisterVariantMembers(members)
+    return mkUnionTy(members)
+  }
+  // Every member must be a literal union — a litunion member of a mixed union keeps its own
+  // arena node, since that mixed shape is load-bearing elsewhere
+  // (`closure-result-union-composed-carrier.vl` miscompiles if flattened). Shares
+  // `litUnionFlatMembers` with the declaration route's `UnionDecl` arm.
+  const flat: i32[] = []
+  if !litUnionFlatMembers(members, flat) {
+    let i = 0
+    while i < members.length {
+      pushDistinctVariantTy(flat, members[i])
+      i = i + 1
+    }
+  }
+  if flat.length == 1 { return flat[0] }
+  annRegisterVariantMembers(flat)
+  // A declared alias with exactly these literal members owns the arena index
+  // (`litUnionAliasTyOfMembers`) — minting a twin instead is invisible to the index-identity
+  // classifiers. Asked of the non-flattened list too: a pure inline `"aa"|"bb"` beside `type
+  // K = "aa"|"bb"` must resolve to the same index canon spells `K`, or the two producers disagree.
+  const lal = litUnionAliasTyOfMembers(flat)
+  if lal >= 0 { return lal }
+  const fresh = mkUnionTy(flat)
+  if tyIsLitUnion(fresh) { registerInlineLitUnion(fresh) }
+  fresh
+}
+
+// The whole union type an `A | B | null` spelling denotes: `annUnionInnerTy` over the
+// non-`null` members, wrapped in the null niche when `null` is present (a poisoned -1
+// propagates unwrapped, since `mkNullableTy(-1)` would lose the sentinel). A declared union
+// alias with a `null` member must resolve to this same niche rep, not a plain `TyUnion`.
+function annUnionTy(members: i32[], hasNull: boolean): i32 {
+  // A declaration's own members have no annotation position; pass 0d reports those.
+  const clash = setMapUnionClashMsg(members, false)
+  if clash != "" && annotDiagAt >= 0 {
+    tErr(clash, annotDiagAt)
+    return TY_ERR
+  }
+  // A member that is itself `null` (`null | null`, `N | null` over `type N = null`) is the
+  // niche, not an inner type; with no other member the union is the `null` type (D4673).
+  const nonNull: i32[] = []
+  let anyNull = hasNull
+  for m in members {
+    if isNullTy(m) { anyNull = true } else { nonNull.push(m) }
+  }
+  if nonNull.length == 0 && anyNull { return TY_NULL }
+  if nonNull.length < members.length { return annUnionTy(nonNull, anyNull) }
+  const inner = annUnionInnerTy(members, hasNull)
+  if inner < 0 { return -1 }
+  // arena-tick exempt: a per-program mark on an annotation's row.
+  annUnionTys[inner] = true
+  if hasNull {
+    const wrapped = mkNullableTy(inner)
+    // Carries the collapse bank through the niche wrap: `string | "err" | null` is
+    // `string?`, and without this the bank would still name the unwrapped `string`.
+    if collapsedTy == inner { collapsedTySet(wrapped) }
+    return wrapped
+  }
+  inner
+}
+
+function tsToTyReal(ix: i32) {
+  if ix < 0 { return -1 }
+  const k = tsKind[ix]
+  const start = tsKidStart[ix]
+  const cnt = tsKidCount[ix]
+  // An inline union `A | B | null`: a `null` member makes the result nullable, duplicate
+  // members collapse, and an unresolved member poisons the whole union (-1) rather than
+  // let `assignable` treat the negative sentinel as "accept anything".
+  if k == TS_UNION {
+    const members: i32[] = []
+    let hasNull = false
+    let pi = 0
+    while pi < cnt {
+      const kid = tsKids[start + pi]
+      const kk = tsKind[kid]
+      if kk == TS_NULL {
+        hasNull = true
+      } else if kk != TS_ERR {
+        // renders "" for the string arm's `part.length > 0` check
+        const m = tsToTy(kid)
+        if m < 0 { return -1 }
+        annUnionPushDistinctMember(members, m)
+      }
+      pi = pi + 1
+    }
+    return annUnionTy(members, hasNull)
+  }
+  // An intersection `A & B` — fold the operands through `intersectTy` so a finite
+  // annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`).
+  if k == TS_ISECT {
+    let acc = -1
+    let ii = 0
+    while ii < cnt {
+      const operand = tsIsectOperandTy(tsKids[start + ii])
+      if operand < 0 { return -1 }
+      if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
+      ii = ii + 1
+    }
+    return acc
+  }
+  // A prefix negation `!A` written in an annotation — refused at both routes, since a rule
+  // enforced on one is one a re-render can walk around. `TyErr`, not -1: the diagnosis
+  // already stands and -1 would make the caller append a misleading `unknown type`.
+  if k == TS_NEG {
+    tErr(negInAnnotationMsg("!" + tsToName(tsKids[start])), annotDiagAt)
+    return TY_ERR
+  }
+  // A parenthesized group `(A)`: strip the parens and re-enter, so a comma group
+  // `(A, B)` re-enters on `"A,B"`, matches no arm, and resolves to -1 — a group is a
+  // single type or it is nothing.
+  if k == TS_PAREN {
+    if cnt == 1 { return tsToTy(tsKids[start]) }
+    return -1
+  }
+  // A function type `(params)=>ret` — the children are the parameters in order, then
+  // the return last (`parseTypeAtom`'s contract).
+  if k == TS_FUNC {
+    const ptys: i32[] = []
+    let pn = cnt - 1
+    // A lone recovery param renders `""`, so the string arm sees `paramsStr` empty and
+    // builds a zero-parameter function; two of them render `","` and do not collapse.
+    if pn == 1 {
+      if tsKind[tsKids[start]] == TS_ERR { pn = 0 }
+    }
+    let pk = 0
+    while pk < pn {
+      const pt = tsToTy(tsKids[start + pk])
+      if pt < 0 { return -1 }
+      ptys.push(pt)
+      pk = pk + 1
+    }
+    const rty = tsToTy(tsKids[start + cnt - 1])
+    if rty < 0 { return -1 }
+    return mkFuncTy(ptys, rty)
+  }
+  // A string-literal type `"a"`: `tsText` keeps the quoted lexeme, so `tsToName`
+  // reproduces the annotation exactly, and the member is the raw inner text — the same
+  // rule as the literal-expression side. `ast.tsToName` returns `tsText[ix]` verbatim for
+  // a `TS_LITSTR` node, matching the string the parser also concatenates into `TypeRef.tyName`.
+  if k == TS_LITSTR {
+    const lex = tsText[ix]
+    return mkLitTy("str", groupInnerOf(lex))
+  }
+  // An integer-literal type (`0`). A float literal in a type is refused (`floatLitTypeFail`).
+  if k == TS_LITNUM {
+    if numLexIsFloat(tsText[ix]) { return floatLitTypeFail(tsText[ix]) }
+    return mkLitTy("int", tsText[ix])
+  }
+  if k == TS_NULL { return TY_NULL }
+  // An array type `T[]`. An unresolved element poisons the annotation: `mkArrayTy(-1)`
+  // would leak the empty-`[]` element hole as the type of every `xs[i]` read, and a member
+  // access on that hole indexes the arena at -1 — a checker crash (`type-alias-nested.vl`).
+  if k == TS_ARR {
+    // A `readonly` marker on this suffix mints the view over the same element — the tree
+    // route's twin of `nameToTyReal`'s marker arm.
+    const ro = tsText[ix] == "readonly"
+    // `u8[]` — the one position `u8` is legal in. Matched on the element spelling rather
+    // than by resolving it, since `u8` deliberately never resolves as a leaf (`TY_U8`) —
+    // this keeps the storage type out of every value position with no context flag threaded through.
+    const aeKid = tsKids[start]
+    if tsKind[aeKid] == TS_NAME && tsText[aeKid] == "u8" {
+      if ro { return mkArrayViewTy(TY_U8) }
+      return mkArrayTy(TY_U8)
+    }
+    const aeTy = tsToTy(aeKid)
+    if aeTy < 0 { return -1 }
+    if ro { return mkArrayViewTy(aeTy) }
+    return mkArrayTy(aeTy)
+  }
+  // A map `{[K]: V}` — the key is a bare identifier token, not a parsed type, so it rides
+  // `tsText`; only `string`/`i32` keys are supported (`mapKeyTySupported`), any other
+  // resolves to -1. An unresolved value also poisons the annotation: `mkMapTy(str, -1)`
+  // would be indistinguishable from the empty-`Map()` inference hole.
+  if k == TS_MAP {
+    const mk = tsLeafTy(tsText[ix])
+    if !mapKeyTySupported(mk) { return -1 }
+    const mvTy = tsToTy(tsKids[start])
+    if mvTy < 0 { return -1 }
+    return mkMapTy(mk, mvTy, 0)
+  }
+  // An inline object type `{x: T, y: U}`. A field whose name failed to parse renders
+  // `":T"` and drops here too, since its first top-level colon sits at index 0
+  // (`colonAt > 0`). An unresolved field type also poisons the annotation (-1) — storing
+  // it in `objFieldTypes` would crash a consumer that assumes resolution succeeded.
+  if k == TS_OBJ {
+    const fnames: string[] = []
+    const ftys: i32[] = []
+    let fi = 0
+    while fi < cnt {
+      const fdIx = tsKids[start + fi]
+      // A method member in value position — the tree route's half of the refusal
+      // `nameToTyReal`'s brace arm raises, so both routes reach one wording. A design
+      // rule enforced on only one route is one a re-render can walk around.
+      if tsKind[fdIx] == TS_METHOD {
+        tErr(methodInValuePosMsg(tsToName(fdIx)), annotDiagAt)
+        return TY_ERR
+      }
+      if tsKind[fdIx] == TS_FIELD {
+        if tsText[fdIx].length > 0 {
+          const fdTy = tsToTy(tsKids[tsKidStart[fdIx]])
+          if fdTy < 0 { return -1 }
+          fnames.push(tsText[fdIx])
+          ftys.push(fdTy)
+        }
+      }
+      fi = fi + 1
+    }
+    return mkObjTy(fnames, ftys)
+  }
+  // A generic alias application `Box<i32>` / `Pair<i32,string>` — substitute the
+  // arguments into the declared body. The head is the identifier the parser read,
+  // never a slice of a rendered name.
+  if k == TS_APP { return applyGenAliasArgs(tsText[ix], "", ix) }
+  // `TS_NAME` (a bare identifier), and `TS_ERR`, whose `""` text falls through
+  // every leaf rung to -1 exactly as `nameToTy("")` does.
+  tsLeafTy(tsText[ix])
+}
+
+function nameToTyReal(name: string) {
+  // An inline union `A | B | null` — the parser joins members with `|` into one synthetic
+  // name. Split on top-level `|`s (depth-aware), resolve each member, and build the union
+  // (a `null` member makes it nullable). Checked first so a member's `[]`/map shape isn't
+  // read as a suffix of the whole union name; duplicate members collapse.
+  if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
+    const parts: string[] = []
+    tyTopLevelSplit(name, '|', false, parts)
+    const members: i32[] = []
+    let hasNull = false
+    let pi = 0
+    while pi < parts.length {
+      const part = parts[pi]
+      if part == "null" {
+        hasNull = true
+      } else if part.length > 0 {
+        // An unresolved member poisons the whole union (-1): pushing it into the member
+        // list would let `assignable` treat the negative sentinel as "accept anything".
+        const m = nameToTy(part)
+        if m < 0 { return -1 }
+        annUnionPushDistinctMember(members, m)
+      }
+      pi = pi + 1
+    }
+    // The litunion flatten and the `null` niche wrap at their shared home — the tree
+    // route's mirror of `tsToTyReal`'s `TS_UNION` arm. Three routes, one rule.
+    return annUnionTy(members, hasNull)
+  }
+  // An intersection `A & B` — fold the operands through `intersectTy` so a finite
+  // annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`). An unresolvable
+  // operand poisons the whole name (-1).
+  if nameHasSep(name, '&') && !isTopLevelFuncTypeName(name) {
+    const iparts: string[] = []
+    tyTopLevelSplit(name, '&', false, iparts)
+    let acc = -1
+    let ii = 0
+    while ii < iparts.length {
+      const operand = nameIsectOperandTy(iparts[ii])
+      if operand < 0 { return -1 }
+      if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
+      ii = ii + 1
+    }
+    return acc
+  }
+  if name.length > 0 {
+    // A prefix negation `!A` written in an annotation — the name route's half of the
+    // refusal the spelling tree raises, so both reach one wording.
+    if name[0] == '!' {
+      tErr(negInAnnotationMsg(name), annotDiagAt)
+      return TY_ERR
+    }
+    // A float literal written as a type — the name route's half of the spelling tree's refusal.
+    if name[0] >= '0' && name[0] <= '9' {
+      if numLexIsFloat(name) { return floatLitTypeFail(name) }
+    }
+    // A parenthesized group `(A | B)`: peel only when `tyname.parenEnclosesWhole` says the
+    // leading `(` closes at the final character — not `emit_base.tyGroupWrapsWhole`, which
+    // disagrees on a group that never closes (returns true where this needs false, since
+    // `groupInnerOf` would otherwise take a real closer for one that doesn't exist).
+    if nameIsParenSpanEnds(name) {
+      if parenEnclosesWhole(name) { return nameToTy(groupInnerOf(name)) }
+    }
+    // A function type `(params)=>ret` (the parser's synthetic name for `(i32) => i32`):
+    // builds a `TyFunc` so a function-typed binding/param/field type-checks. Matches
+    // `isTopLevelFuncTypeName`; `funcArrowAt` banks the arrow index and must be read
+    // immediately, since the recursion below (`nameToTy`) reaches the predicate again and overwrites it.
+    if isTopLevelFuncTypeName(name) {
+      const arrowAt = funcArrowAt
+      const paramsStr = fnParamsTextOf(name, arrowAt)
+      const retStr = fnRetTextOf(name, arrowAt)
+      const ptys: i32[] = []
+      if paramsStr.length > 0 {
+        const pparts: string[] = []
+        tyTopLevelSplit(paramsStr, ',', false, pparts)
+        let pk = 0
+        while pk < pparts.length {
+          const pt = nameToTy(pparts[pk])
+          if pt < 0 { return -1 }
+          ptys.push(pt)
+          pk = pk + 1
+        }
+      }
+      const rty = nameToTy(retStr)
+      if rty < 0 { return -1 }
+      return mkFuncTy(ptys, rty)
+    }
+    // A string- or numeric-literal type (`"a"`, `0`, `1.5`), at the lexeme grammar's
+    // home — shared with `canonEmitName`'s literal arm.
+    const lmt = litMemberTy(name)
+    if lmt >= 0 { return lmt }
+  }
+  if name == "u8" { return storageTyLeafFail() }
+  const pv = primTyOfName(name)
+  if pv >= 0 { return pv }
+  // `readonly T[]` — the view's marker prefixes the whole list spelling, so it is stripped
+  // here and the list under it resolves through the array arm below. A marker over anything
+  // but a list resolves to nothing: there is no read-only view of a scalar or a map.
+  if nameIsReadOnlyList(name) {
+    const listIx = nameToTy(roListInnerName(name))
+    if listIx < 0 { return -1 }
+    const lt = T.tys[listIx]
+    if lt is TyArray { return mkArrayViewTy(lt.aElem) }
+    return -1
+  }
+  // An array type `T[]`: the parser appends a literal `[]` per array suffix to the type
+  // name (`i32[]`, `Tok[]`, `i32[][]`). Strip one suffix and wrap the element.
+  const nlen = name.length
+  // The array-name grammar's test then its cut, both at their home in `tyname.vl`. Not
+  // `arrElemNameRaw(name) != ""`: the degenerate `"[]"` is an array whose element is "",
+  // and this arm must still enter for it — the one-call form would skip it.
+  if nameIsArray(name) {
+    // `u8[]` through the rendered-name path, the twin of `tsToTyReal`'s `TS_ARR` arm — the
+    // same element-spelling door, so an answer only one route knows never diverges.
+    const aeName = arrElemNameRaw(name)
+    if aeName == "u8" { return mkArrayTy(TY_U8) }
+    // An unresolved element name poisons the whole array annotation (-1): `mkArrayTy(-1)`
+    // would leak the empty-`[]` element hole, and a member access on it crashes the checker.
+    const aeTy = nameToTy(aeName)
+    if aeTy < 0 { return -1 }
+    return mkArrayTy(aeTy)
+  }
+  // A map `{[K]:V}` (the parser's synthetic index-signature name) — span and cuts live in
+  // `tyname.vl`. Supported keys are `string`/`i32` (`mapKeyTySupported`); any other key, or
+  // an unresolved value, resolves to -1 rather than building `mkMapTy(str, -1)`, which would
+  // be indistinguishable from the empty-`Map()` inference hole.
+  if nameIsMapSpanEnds(name) && mapSpellKeyEnd(name) >= 0 {
+    const mk = nameToTy(mapSpellKeyName(name))
+    if !mapKeyTySupported(mk) { return -1 }
+    const mv = nameToTy(mapSpellValName(name))
+    if mv < 0 { return -1 }
+    return mkMapTy(mk, mv, 0)
+  }
+  // An inline object type `{x:T,y:U}` (starts `{` but not `{[`). Split top-level commas
+  // (depth-aware), then each field at its first top-level `:`, and build the structural
+  // `TyObj`. An unresolved field type poisons the whole annotation (-1) — the sentinel stored
+  // in `objFieldTypes` would crash a consumer that assumes resolution succeeded.
+  if nameIsBraceSpanEnds(name) {
+    const fnames: string[] = []
+    const ftys: i32[] = []
+    // Fields are the top-level commas of the brace's interior, scanned from index 1 so
+    // the opening `{` doesn't count; the run ends at the closing brace, not the name's end.
+    let fstart = 1
+    let fgoing = true
+    while fgoing {
+      let fend = tyTopIndexOf(name, ',', 0, fstart)
+      if fend < 0 {
+        fend = nlen - 1
+        fgoing = false
+      }
+      const field = name.slice(fstart, fend)
+      if field.length > 0 {
+        const colonAt = tyTopIndexOf(field, ':', 0, 0)
+        // A method member in value position (`function f(x: { m(): string })`). The
+        // refusal belongs here, not the grammar, since the grammar cannot see which
+        // position it is in — the same rule `declaredTyOfName`'s alias arm applies.
+        if colonAt > 1 {
+          if field[colonAt - 1] == ')' {
+            tErr(methodInValuePosMsg(field), annotDiagAt)
+            // `TyErr`, not -1: this diagnosis already stands, and -1 would make the caller
+            // append a misleading `unknown type` — the type is known, just not a value type.
+            return TY_ERR
+          }
+        }
+        if colonAt > 0 {
+          // Field-colon cut at its home (`tyname.fieldTypeTextOf`/`fieldNameOf`), given the
+          // top-level colon already found; the emitter's own copies use a depth-blind `indexOf(":")`.
+          const fdTy = nameToTy(fieldTypeTextOf(field, colonAt))
+          if fdTy < 0 { return -1 }
+          fnames.push(fieldNameOf(field, colonAt))
+          ftys.push(fdTy)
+        }
+      }
+      fstart = fend + 1
+    }
+    return mkObjTy(fnames, ftys)
+  }
+  // A live type-parameter binding (a generic function's `<T>` while its annotations
+  // resolve via `resolveAnnot`, or a generic alias application's params while its body
+  // resolves via `applyGenAlias`) — innermost wins.
+  const tv = tpEnvTyOfName(name)
+  if tv >= 0 { return tv }
+  // A generic alias application `Box<i32>` / `Pair<i32,string>` — the parser folds the
+  // arguments into the synthetic name; substitute them into the declared body. Span test at
+  // its home in `tyname.vl` (`annGenAppSpanEnds`); a name failing it falls through to
+  // `declaredTyOfName`. Slices are `tyname.gaeHeadNameOf`/`gaeArgsTextOf`, given `gaeLtAt`'s index.
+  if annGenAppSpanEnds(name) {
+    const ltAt = gaeLtAt(name)
+    return applyGenAlias(gaeHeadNameOf(name, ltAt), gaeArgsTextOf(name, ltAt))
+  }
+  const dvn = declaredTyOfName(name)
+  if dvn >= 0 { return dvn }
+  builtinCtorTyLeafFail(name)
+}
+
+// How a value of record arm `y` fits record arm `x` when both carry the same field names: 0
+// when some field's types share no value, 1 when every field of `y` is assignable to `x`'s,
+// 2 when a field overlaps without containment, so only the stored value can answer (D4056).
+export function recArmFitKind(x: i32, y: i32): i32 {
+  if x < 0 || y < 0 { return 0 }
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if !(tx is TyObj) || !(ty is TyObj) { return 0 }
+  if !objSigSame(tx, ty) || !objSigSame(ty, tx) { return 0 }
+  let all = true
+  let i = 0
+  while i < ty.objFieldNames.length {
+    const fy = ty.objFieldTypes[i]
+    const k = tyFitKind(fy, objFieldType(tx, ty.objFieldNames[i]))
+    if k == 0 { return 0 }
+    if k == 2 { all = false }
+    i = i + 1
+  }
+  if all { 1 } else { 2 }
+}
+
+// How a value of type `src` fits `dst`: 1 always (assignable), 0 never (no shared value), 2
+// only for some values, so a test has to read the value.
+export function tyFitKind(src: i32, dst: i32): i32 {
+  if numericRepsApart(src, dst) { return 0 }
+  if assignable(src, dst) { return 1 }
+  if tysShareValue(src, dst) { 2 } else { 0 }
+}
+
+// Can one value inhabit both `a` and `b`? Member-wise: a pair where either side is assignable to
+// the other, or two same-shape records whose arms fit (`recArmFitKind`).
+function tysShareValue(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const ams: i32[] = []
+  const bms: i32[] = []
+  flattenVariantsInto(a, ams)
+  flattenVariantsInto(b, bms)
+  for ma in ams {
+    for mb in bms {
+      if ma >= 0 && mb >= 0 && !numericRepsApart(ma, mb) {
+        if assignable(ma, mb) || assignable(mb, ma) { return true }
+        if recArmFitKind(ma, mb) != 0 { return true }
+      }
+    }
+  }
+  false
+}
+
+// Reports `msg` unless already reported, at any anchor — `tErrPush`'s own dedupe keys on
+// `(message, anchor)`, too weak here since one bad union is reachable from its declaration
+// and every annotation naming it. The message alone is the key; the first writer wins.
+export function tErrOncePerMsg(msg: string, at: i32) {
+  let di = 0
+  while di < T.diags.length {
+    if T.diags[di].tmsg == msg { return 0 }
+    di = di + 1
+  }
+  tErr(msg, at)
+}
+
+// —— unions whose arms share one runtime representation ——
+// The diagnostic for a union two of whose members are distinct to the checker but one value
+// shape to the emitter, or "" when every member is separable — a nominal brand is a second
+// index erased before the emitter runs, so a brand and its base reach a union box's tag identically.
+function nomUnionRepClashMsg(members: i32[]) {
+  if nwTyIxs.length == 0 { return "" }
+  let i = 1
+  while i < members.length {
+    let j = 0
+    while j < i {
+      if sameVariantTy(nomErasedTyIx(members[i]), nomErasedTyIx(members[j])) {
+        return "union members '"
+          + tyToStr(members[j])
+          + "' and '"
+          + tyToStr(members[i])
+          + "' have the same runtime representation, so `is` cannot tell "
+          + "them apart — a nominal newtype is erased to its base at run time"
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// —— structural assignability: is `src` assignable to `dst`? ——
+// The error type is assignable both ways (so one failure doesn't cascade). An object is
+// assignable when it has at least every target field, each assignable (width + depth
+// subtyping); a union source needs every member assignable, a union target needs some member to accept it.
+function fnSlotAssignable(src: i32, dst: i32) {
+  if numWidens(src, dst) { return false }
+  if objNumWidens(src, dst) { return false }
+  if fnSlotAtomToString(src, dst) { return assignable(src, dst) }
+  if containerElemClassDiffers(src, dst) { return false }
+  if fnSlotNulDiffers(src, dst) { return false }
+  assignable(src, dst)
+}
+
+// Exported for the LSP query layer's UFCS candidate scan, which asks exactly the question
+// `ufcsCallTy` asks of a written call — of every declared `self`-function — so the editor
+// can offer the ones whose import is missing. The export is a visibility change, not a new answer.
+export function assignable(src: i32, dst: i32) {
+  if src < 0 || dst < 0 { return true }
+  if src == dst { return true }
+  let gi = asgSrcStack.length - 1
+  while gi >= 0 {
+    if asgSrcStack[gi] == src && asgDstStack[gi] == dst { return true }
+    gi = gi - 1
+  }
+  asgSrcStackPush(src)
+  asgDstStackPush(dst)
+  const ok = assignableGo(src, dst)
+  asgSrcStackPop()
+  asgDstStackPop()
+  ok
+}
+
+function assignableGo(src: i32, dst: i32) {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  // A second, never-narrowed name for the same source variant, bound where `s` is still
+  // the whole `Ty` union. The `s is X` guards below each subtract their variant from `s`
+  // for the rest of the body, so a structural tail wanting the declared union needs `sTail`
+  // instead — bound at the top so it is provably the same variant as `s`.
+  const sTail = s
+  if s is TyErr { return true }
+  if d is TyErr { return true }
+  if s is TyVar { return true }
+  if d is TyVar { return true }
+  // `never` (the empty type) is the bottom type: assignable anywhere. As a target it
+  // accepts nothing — no concrete source reaches `s.primName == d.primName` with "never" on only one side.
+  if s is TyPrim {
+    if s.primName == "never" { return true }
+  }
+  // Nullable target: accepts `null` itself, the inner, or another nullable's inner.
+  if d is TyNullable {
+    if src == TY_NULL { return true }
+    if s is TyNullable { return assignable(s.nInner, d.nInner) }
+    return assignable(src, d.nInner)
+  }
+  // A nullable source is not assignable to a non-nullable target unless the target already
+  // admits `null` (D1030): `T | null` is assignable to `D` iff `T` is and `null` is. A
+  // self-referential union with a `null` arm interns as `TyUnion[TyNullable(rest)]`, so
+  // without this `Json` is not assignable to its own superset `Json | JsonError`.
+  if s is TyNullable {
+    if assignable(TY_NULL, dst) { return assignable(s.nInner, dst) }
+    return false
+  }
+  // Union source: every member must be assignable to the target. A value box holding a
+  // numeric member that only widens to a numeric target has no conversion yet (D2611).
+  if s is TyUnion {
+    const members = s.uMembers
+    const numDst = isNumericPrimTy(dst)
+    let i = 0
+    let ok = true
+    while i < members.length {
+      if !assignable(members[i], dst) { ok = false }
+      if numDst && isNumericPrimTy(members[i]) && !tySame(members[i], dst) {
+        ok = false
+      }
+      i = i + 1
+    }
+    return ok
+  }
+  // Union target: the source must be assignable to some member.
+  if d is TyUnion {
+    const members = d.uMembers
+    let i = 0
+    let ok = false
+    while i < members.length {
+      if assignable(src, members[i]) { ok = true }
+      i = i + 1
+    }
+    return ok
+  }
+  // Literal types: a literal source is assignable to the same literal, or anywhere its base
+  // scalar flows (`0` → i32, `"a"` → string). A non-literal source is never assignable to a
+  // literal target — `string` does not flow into `"a" | "b"`, a closed set, not an open string type.
+  if s is TyLit {
+    if d is TyLit { return s.litKind == d.litKind && s.litText == d.litText }
+    return assignable(litBaseTy(s), dst)
+  }
+  if d is TyLit { return false }
+  // A negation target `!T` (residual, usually folded away by `intersectTy`): accepts a
+  // source not assignable to the negated type.
+  if d is TyNeg { return !assignable(src, d.negTy) }
+  if s is TyNeg { return false }
+  // Nominal newtype: a brand and its base — or two different brands — do not flow into each
+  // other, though every structural rule below would accept them. `assignable` is the single
+  // chokepoint every position goes through, so no position can be taught half the rule.
+  // Placement is load-bearing: after the holes, `never`, and the nullable/union/literal/negation arms, all of which destructure and recurse.
+  if nomLitRelax == 0 {
+    if nomNameOfTy(src) != nomNameOfTy(dst) { return false }
+  }
+  // The structural tail, exhaustive over `Ty` and deliberately `_`-less: a 12th arena
+  // variant breaks the self-compile here instead of silently answering `false`, a spurious
+  // loud reject of a valid program. Scrutinised on `sTail`, not `s`: `s` has had every
+  // guarded variant above subtracted from it, while `sTail` carries the full declared `Ty`.
+  match sTail {
+    TyPrim => {
+      if d is TyPrim {
+        // Lossless numeric widening: a narrower numeric value flows into a wider slot along
+        // the lattice i32→{i64,f32,f64}, i64→f64, f32→f64; the reverse is not assignable,
+        // since it is lossy and must be made explicit. Codegen inserts the matching wasm
+        // convert at the boundary; the binding takes the wider type.
+        if numWidensName(sTail.primName, d.primName) { return true }
+        return sTail.primName == d.primName
+      }
+      return false
+    }
+    TyObj => {
+      if d is TyObj {
+        const dnames = d.objFieldNames
+        const dtys = d.objFieldTypes
+        let i = 0
+        let ok = true
+        while i < dnames.length {
+          const srcIx = objFieldType(sTail, dnames[i])
+          if srcIx < 0 { ok = false }
+          else if !assignable(srcIx, dtys[i]) { ok = false }
+          i = i + 1
+        }
+        return ok
+      }
+      return false
+    }
+    TyArray => {
+      if d is TyArray {
+        // A view never satisfies a mutable list. The view exists to forbid the writes the
+        // list spelling licenses, so admitting it here would launder every one of them.
+        if sTail.aRead == 1 {
+          if d.aRead == 0 { return false }
+        }
+        // An empty `[]` (element `-1`) is assignable to any array; otherwise the
+        // element types must be assignable.
+        return assignable(sTail.aElem, d.aElem)
+      }
+      return false
+    }
+    TyMap => {
+      if d is TyMap {
+        // A set and a map are distinct types, neither assignable to the other, and a set is
+        // invariant in its element. A bare `Map()`/`Set()` (holes, `-1`) fits its own flavor.
+        if sTail.mSet != d.mSet { return false }
+        if d.mSet == 1 {
+          return assignable(sTail.mKey, d.mKey)
+            && assignable(d.mKey, sTail.mKey)
+        }
+        return assignable(sTail.mKey, d.mKey) && assignable(sTail.mVal, d.mVal)
+      }
+      return false
+    }
+    TyFunc => {
+      if d is TyFunc {
+        // A generic function value (hole params/return) is assignable to a concrete
+        // function type only by instantiation — its body's capability must hold at the
+        // target's param types and yield the target's return, not the structural rule
+        // below, which a hole passes unconditionally.
+        if fnTyHasHole(src) { return genericFnAssignable(src, dst) }
+        const sp = sTail.fnParamTypes
+        const dp = d.fnParamTypes
+        if sp.length != dp.length { return false }
+        let i = 0
+        let ok = fnSlotAssignable(sTail.fnRet, d.fnRet)
+        while i < sp.length {
+          if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
+          i = i + 1
+        }
+        return ok
+      }
+      return false
+    }
+    TyErr => {
+      // Claimed by `s is TyErr` at the top, which returns true.
+    }
+    TyVar => {
+      // Claimed by `s is TyVar` at the top, which returns true.
+    }
+    TyNullable => {
+      // Claimed by the nullable pair above: the `d is TyNullable` arm peels both
+      // sides, and the bare `s is TyNullable` guard right after it returns false.
+    }
+    TyUnion => {
+      // Claimed by the union-SOURCE arm above, which returns its `ok`.
+    }
+    TyLit => {
+      // Claimed by the literal-SOURCE arm above, which returns on both legs.
+    }
+    TyNeg => {
+      // Claimed by `s is TyNeg` above, which returns false.
+    }
+  }
+  // Unreachable by construction: each empty arm is claimed by an earlier `s`-test that
+  // returns, and the five real arms return on every leg.
+  false
+}
+
+// ── per-kind helpers (take a narrowed variant; recurse back through checkNode) ──
+// These helpers receive an already-narrowed `Node` variant as a struct parameter, narrow
+// further children themselves, and call back into `checkNode` — a host miscompile once
+// prohibited this shape, fixed and pinned by `union-two-visitors.vl`.
+
+// Reports an `argument N: expected …, got …` mismatch — one home for the wording and the
+// anchor policy, shared by the general call path and the UFCS one. The anchor is the
+// argument node, not the call, whose closing-paren anchor is a whole call away. A
+// function-literal argument anchors at its first value-bearing return site when only the return type offends; otherwise at the literal's start token.
+export function argMismatchErr(argN: i32, expected: i32, at: i32, argIx: i32) {
+  const msg = "argument "
+    + i32ToStr(argN)
+    + ": expected "
+    + tyToStr(expected)
+    + ", got "
+    + tyToStr(at)
+    + charLitForStringNote(argIx, expected)
+    + boolForNumberNote(at, expected)
+    + numUnionLossNote(at, expected)
+    + storageListNote(argIx, at, expected)
+    + litMemberNote(argIx, expected, 8)
+  if argIx >= 0 && argIx < P.nodes.length {
+    const n = P.nodes[argIx]
+    if n is FuncDecl {
+      const site = fnLitRetMismatchSite(n, expected, at)
+      if site >= 0 { return tErr(msg, site) }
+      return tErr(msg, argIx)
+    }
+  }
+  tErrWant(msg, argIx, expected)
+}
+
+// Whether `lit` is a literal type that literal-bearing `other` admits: `x == "b"` at a pin that
+// holds `"b"` is the direct spelling's comparison, which softening the literal would refuse.
+export function eqLitMemberOk(lit: i32, other: i32): boolean {
+  if lit < 0 || lit >= T.tys.length || !(T.tys[lit] is TyLit) { return false }
+  if !isLitBearing(other) { return false }
+  assignable(lit, other)
+}
+
+// Whether an equality between `a` and `b` sets a literal against a literal-bearing type that does
+// not admit it, in either order: the closed-set comparison the direct spelling refuses.
+export function eqLitNonMember(a: i32, b: i32): boolean {
+  if eqLitOutside(a, b) { return true }
+  eqLitOutside(b, a)
+}
+
+// `eqLitNonMember` with the literal on the `lit` side.
+function eqLitOutside(lit: i32, other: i32): boolean {
+  if lit < 0 || lit >= T.tys.length || !(T.tys[lit] is TyLit) { return false }
+  if !isLitBearing(other) { return false }
+  !assignable(lit, other)
+}
+
+// Whether an object left operand has an operator dispatch for `op` (a free `self`-function
+// named for the operator, or an operator field), asked from types alone since `opSelfFnTy`
+// needs the right operand's node and can report diagnostics. Deliberately the weaker
+// question: a false true costs nothing extra, a false false rejects a program that runs.
+function objOpDispatchTy(op: string, lt: i32) {
+  const ot = T.tys[lt]
+  if ot is TyObj {
+    if objFieldType(ot, op) >= 0 { return true }
+  } else {
+    return false
+  }
+  objOpSelfFnRetTy(op, lt) >= 0
+}
+
+// `checkBinary`'s dispatch arm as a type question: does `lt op …` resolve to a free
+// `self`-function overload, and to what result type (-1 = no dispatch)? The `is TyObj` gate
+// is load-bearing since a non-object receiver takes the language's own lowering and consults
+// no declaration. Shared by `binOpDefinedFor`'s pin gate and `substHoleTy`'s `HD_BINOP` result, which must agree.
+function objOpSelfDispatchTy(op: string, lt: i32) {
+  const ot = T.tys[lt]
+  if !(ot is TyObj) { return -1 }
+  objOpSelfFnRetTy(op, lt)
+}
+
+// The self-function half of `objOpDispatchTy`, answering with the overload's return type
+// (-1 = no dispatch) instead of a boolean. `objOpDispatchTy` also admits the operator-field
+// route since a false true there is free; this one must not, because `monoPinBinOps` only
+// rewrites through `drwSelfFnOf(op, 2)` and has no struct-table row for a field closure.
+function objOpSelfFnRetTy(op: string, lt: i32) {
+  // Receiver-directed, the same scan `opSelfFnTy` uses: the declaration whose `self` accepts
+  // `lt`, keyed on `(symbol, receiver)` so each receiver type's operator resolves on its own.
+  const opKey = opSelfFnKeyFor(op, lt)
+  if opKey == "" { return -1 }
+  const fnTy = lookup(opKey)
+  if fnTy < 0 { return -1 }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length != 2 { return -1 }
+    const dIx = fnDeclIx[opKey] ?? -1
+    if dIx < 0 { return -1 }
+    const d = P.nodes[dIx]
+    if d is FuncDecl {
+      if d.fnParams.length == 2 {
+        const p0 = P.nodes[d.fnParams[0]]
+        if p0 is Param {
+          if p0.parName == "self" {
+            if assignable(lt, ft.fnParamTypes[0]) { return ft.fnRet }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Whether the emitter can lower `lt op rt` for two concrete operand types — the soundness
+// criterion a generic call site checks after substituting a hole to its argument type. A
+// still-unresolved operand defers (true — the outer call validates it). Mirrors
+// `checkBinary`'s accepted forms and its arm order; operators not modelled here return true.
+export function binOpDefinedFor(op: string, lt0: i32, rt0: i32) {
+  // A two-width literal set is not softened at a pin: its `i64` result is no `T` (D3524).
+  const lt = softenLitTy(lt0)
+  const rt = softenLitTy(rt0)
+  if tyHasHole(lt) || tyHasHole(rt) { return true }
+  if op == "min" || op == "max" || op == "abs" { return minMaxPinOk(lt, rt) }
+  if op == OP_NEG { return isNumeric(lt) || tyIsNumUnion(lt) }
+  if op == OP_BNOT { return isNumeric(lt) && !binFloatOperandPair(lt, lt) }
+  if op == OP_AS { return asPinHolds(lt0, rt0) || numUnionAsConverts(lt0, rt0) }
+  if op == OP_LITFIT { return primNameOf(lt) != "i32" }
+  // A numeric union operand dispatches per member, each pair a scalar one (`numUnionBinTy`).
+  if (
+    numUnionOp(op)
+    && (tyIsNumUnion(lt) || tyIsNumUnion(rt))
+    && !nullTestOp(op, lt, rt)
+  ) {
+    return numUnionPinOk(op, lt, rt)
+  }
+  // The nominal-brand mix the BODY deferred on a hole operand (D1747). Both operands are
+  // concrete here, which is the precondition that question needs; only a branded PAIR is
+  // judged, since a pin has no expression node for `nomBinMixes`'s literal-adoption legs.
+  if op != "??" {
+    const bl = nomNameOfTy(lt0)
+    const br = nomNameOfTy(rt0)
+    if bl != "" && br != "" && bl != br { return false }
+  }
+  if op == "==" || op == "!=" {
+    // Mutual compatibility (no cross-type equality) with two exemptions: a nullness test
+    // defers to `checkBinary`'s null arms, and a nominal brand is erased before comparing.
+    if isNullTy(lt) || isNullTy(rt) { return true }
+    const eqL = nomErasedTyIx(lt)
+    const eqR = nomErasedTyIx(rt)
+    // The written pair too, as `checkBinary` asks it: `K | i32` beside `K` softens one side only.
+    const eqL0 = nomErasedTyIx(lt0)
+    const eqR0 = nomErasedTyIx(rt0)
+    if (
+      !assignable(eqL, eqR)
+      && !assignable(eqR, eqL)
+      && !assignable(eqL0, eqR0)
+      && !assignable(eqR0, eqL0)
+    ) {
+      return false
+    }
+    // Pinned equality is held to the same two gates as the direct spelling — inside a
+    // generic body `T` looks equatable (a `TyVar` is opaque) with nobody left to ask (D35).
+    const pinMsgs: string[] = []
+    const pinChan: i32[] = []
+    eqRefusals(op, lt, rt, true, pinMsgs, pinChan)
+    return pinMsgs.length == 0
+  }
+  // The object-dispatch gate, positioned exactly where `checkBinary`'s own arm order
+  // puts it — self-function overloads only; the operator-field route is `objOpDispatchTy`'s.
+  if objOpSelfDispatchTy(op, lt0) >= 0 { return true }
+  if op == "+" {
+    // The unsoftened pair on purpose: `checkBinary`'s `+` arm concatenates strings and lists
+    // before the arithmetic tail softens, and mirroring that order matters for what it accepts.
+    // Its gate is ONE operand concatenating AS a string plus mutual assignability, not both
+    // being the prim — the narrower reading refused at the pin what the direct spelling takes.
+    if concatsAsStr(lt0) || concatsAsStr(rt0) {
+      if assignable(lt0, TY_STR) && assignable(rt0, TY_STR) {
+        return true // string concat
+      }
+    }
+    // `checkBinary`'s newtype leg, the branch this mirror did not copy: a `new string` brand
+    // concatenates with a same-brand value or a literal and keeps the brand (D1747).
+    if nomNameOfTy(lt0) != "" || nomNameOfTy(rt0) != "" {
+      if assignable(nomBaseTyIx(lt0), TY_STR) {
+        if assignable(nomBaseTyIx(rt0), TY_STR) { return true }
+      }
+    }
+    const lArr0 = T.tys[lt0]
+    if lArr0 is TyArray {
+      const rArr0 = T.tys[rt0]
+      if rArr0 is TyArray {
+        // Element agreement is `checkBinary`'s to report; lowering does not depend on
+        // element type at all, so every list pair the direct spelling admits lowers here too.
+        return true
+      }
+    }
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  if op == "-" || op == "*" || op == "/" {
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  if op == "%" {
+    // `%` shares the arithmetic rule rather than the integer-only one below so it still
+    // reaches the operator-field dispatch route `checkBinary` checks before any numeric rule.
+    if objOpDispatchTy(op, lt) { return true }
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  if binIntOnlyOp(op) {
+    // Mirrors `checkBinary`'s arm order, not just its predicates: the object-dispatch defer
+    // above must run first, or an object receiver with a real dispatch is falsely rejected here.
+    if objOpDispatchTy(op, lt) { return true }
+    if !isNumeric(lt) || !isNumeric(rt) { return false }
+    return !binFloatOperandPair(lt, rt)
+  }
+  if op == "<" || op == ">" || op == "<=" || op == ">=" {
+    if isStringTy(lt) && isStringTy(rt) { return true }
+    return isNumeric(lt) && isNumeric(rt)
+  }
+  true
+}
+
+// Whether a resolved argument demand holds: `rat` fits `rexp`, or the demand is a template
+// hole's and `rat` is a string, which the hole delivers without its renderer. A hole callee's
+// argument with no origin node is held to the scalar rule alone: its type cannot say literal.
+export function argCstrFits(rat: i32, rexp: i32, form: i32) {
+  if form == ACF_TPL && isStringTy(softenLitTy(rat)) { return true }
+  if form > 0 { return !holeArgScalarRefused(rat, rexp) }
+  // Decided by its node at the pin (`validateCompArgCstr`); a type alone would refuse a literal.
+  if form == ACF_COMP { return true }
+  assignable(rat, rexp)
+}
+
+// Whether `ix` is an `if` or `match` every value of which is a string literal fitting `dst`: the direct
+// spelling types such a join at its destination (`litJoinOf`), which a generic body cannot (D3423).
+export function joinLitsFitAt(ix: i32, dst: i32): boolean {
+  if dst < 0 || dst >= T.tys.length || tyHasTyVar(dst) || tyHasNullMember(dst) {
+    return false
+  }
+  const p = parenPeelIx(ix)
+  if p < 0 || p >= P.nodes.length { return false }
+  if !(P.nodes[p] is IfStmt || P.nodes[p] is MatchExpr) { return false }
+  const todo: i32[] = [p]
+  let guard = 0
+  while todo.length > 0 {
+    guard = guard + 1
+    if guard > 64 { return false }
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { return false }
+    if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+      if !tailPushBlockTail(at, todo) {
+        if !(P.nodes[at] is StrLit) { return false }
+        const lt = litTyOfExpr(at)
+        if lt < 0 || !assignable(lt, dst) { return false }
+      }
+    }
+  }
+  true
+}
+
+// Do every deferred call-argument constraint THIS binding resolves hold (the pure-boolean
+// twin of `validateArgCstrs`, for `genericFnAssignable`)? An unresolved hole defers.
+function argCstrsHold(bNames: string[], bTys: i32[]) {
+  let ci = 0
+  while ci < argCstr.at.length {
+    const rat = substTyDeep(argCstr.at[ci], bNames, bTys)
+    const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+    if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
+      if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
+        if !argCstrFits(rat, rexp, argCstr.form[ci]) { return false }
+      }
+    }
+    ci = ci + 1
+  }
+  true
+}
+
+// `vt` instantiated at every argument the callee's body passes when calling hole `vNames[k]`,
+// or -1 when there is no such call, an argument is still open, or two calls disagree.
+export function genFnHoleInstance(
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  vt: i32,
+  calleeFn: i32,
+): i32 {
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) { return -1 }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  let seen = false
+  let ci = 0
+  while ci < argCstr.at.length {
+    if cstrOwnedBy(argCstr.fn[ci], calleeFn) && argCstr.form[ci] > 0 {
+      const row = hdRowOf(argCstr.exp[ci])
+      if row >= 0 && hdKind[row] == HD_PARAM && hdBase[row] >= 0 {
+        const bt = T.tys[hdBase[row]]
+        if bt is TyVar && bt.tvName == vNames[k] {
+          const pj = hdInner[row]
+          if pj < 0 || pj >= vf.fnParamTypes.length { return -1 }
+          const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
+          if rat < 0 || tyHasTyVar(rat) || tyIsDeferredJoin(rat) { return -1 }
+          bindGenWalk(vf.fnParamTypes[pj], rat, gNames, gTys)
+          const want = substTyDeep(vf.fnParamTypes[pj], gNames, gTys)
+          if tyHasTyVar(want) || !assignable(rat, want) { return -1 }
+          seen = true
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  if !seen { return -1 }
+  const inst = substTyDeep(vt, gNames, gTys)
+  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst
+}
+
+// Re-ask every demand parked on `name` with the pin substituted. Re-entrancy-guarded, since
+// `substTyDeep` banks derived holes and would re-enter through `notePinnedHole`.
+function argPinRecheck(name: string, ty: i32) {
+  if argPinChecking { return 0 }
+  argPinCheckingSet(true)
+  const bN: string[] = []
+  const bT: i32[] = []
+  bN.push(name)
+  bT.push(ty)
+  let i = 0
+  while i < argPinWant.length {
+    if argPinDone[i] == 0 {
+      const sub = substTyDeep(argPinGot[i], bN, bT)
+      // Only a substitution that CHANGED the type says this pin reaches this demand, and only
+      // a fully concrete result can be compared. An argument the function-value adapter
+      // rewrote is already at the parameter's type.
+      if sub >= 0 && sub != argPinGot[i] && !tyHasTyVar(sub) {
+        if (
+          !assignable(sub, argPinWant[i])
+          && !(fvaDone[argPinNode[i]] ?? false)
+        ) {
+          argPinDoneSetAt(i, 1)
+          argMismatchErr(argPinNo[i], argPinWant[i], sub, argPinNode[i])
+        }
+      }
+    }
+    i = i + 1
+  }
+  argPinCheckingSet(false)
+  0
+}
+
+// Banks the pin `ty` that `owner`'s hole named `name` took, appending it to the hole's set
+// unless a `tySame` pin is already there. Never banked from a quiet probe: `solveUnannotParams`
+// truncates its tables afterward. The collapse (`HOLE_PIN_CONFLICT`) is derived on read.
+function notePinnedHole(name: string, ty: i32, owner: string) {
+  if inferQuiet { return 0 }
+  if ty < 0 { return 0 }
+  argPinRecheck(name, ty)
+  const key = holePinKey(owner, name)
+  const s = holePinSet[key] ?? []
+  let i = 0
+  while i < s.length {
+    if s[i] == ty { return 0 }
+    if tySame(s[i], ty) { return 0 }
+    i = i + 1
+  }
+  s.push(ty)
+  holePinSet[key] = s
+  0
+}
+
+// `substHoleTyReal`, banking the answer for a DERIVED hole under its own name the way the
+// direct-binding rung already banks its own. A derived hole is what the emitter reads back for a
+// narrowed or projected parameter (`nodeTyPinIxOf`), and without a row of its own it reads an
+// unresolved `TyVar` and classifies the value by its declared rep instead (D1693).
+export function substHoleTy(tyIx: i32, bNames: string[], bTys: i32[]) {
+  const ver = shMemoSync(bNames, bTys)
+  if ver >= 0 && shMemo.has(tyIx) { return shMemo.get(tyIx) ?? -1 }
+  const r = substHoleTyReal(tyIx, bNames, bTys)
+  if r >= 0 && hdRowOf(tyIx) >= 0 && !tyIsHole(r) {
+    const t = T.tys[tyIx]
+    if t is TyVar { notePinnedHole(t.tvName, r, tyVarOwnerOf(tyIx)) }
+  }
+  if ver >= 0 && ver == shMemoVer && shMemoStampSame() { shMemoPut(tyIx, r) }
+  r
+}
+
+// True when union `pin` has a member assignable to `alt`: an `is alt` guard over a parameter
+// pinned at `pin` can pass. A non-union pin answers false; its own assignability is asked first.
+function pinHasMemberOf(pin: i32, alt: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(pin, vs)
+  if vs.length < 2 { return false }
+  let i = 0
+  while i < vs.length {
+    if assignable(vs[i], alt) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Resolves a (possibly derived) hole against a call's bindings: a direct binding on its name
+// wins; a return derivation collapses to the pinned function's return; a field derivation to
+// the pinned object's field. A base that resolves to another hole re-bases onto it
+// (`rebaseDerivedHole`) instead of going unresolved — the two-level chain where dropping the link let an i32 reach a `string` param with no diagnostic. -1 = unresolved.
+function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if !(t is TyVar) { return -1 }
+  const b = bindOf(bNames, bTys, t.tvName)
+  if b >= 0 {
+    notePinnedHole(t.tvName, b, tyVarOwnerOf(tyIx))
+    return b
+  }
+  const row = hdRowOf(tyIx)
+  if row < 0 { return -1 }
+  const kind = hdKind[row]
+  // A guarded return member (`mkGuardedRetTy`): the pin decides reachability — satisfying the
+  // guard's tested type makes the branch live, otherwise it stays unresolved and drops out.
+  if kind == HD_GALT {
+    const gInner = hdInner[row]
+    const gAlt = hdAlt[row]
+    if gInner < 0 || gAlt < 0 { return -1 }
+    const gPin = substHoleTy(hdBase[row], bNames, bTys)
+    if gPin < 0 { return -1 }
+    if tyIsHole(gPin) { return rebaseDerivedHole(row, gPin) }
+    if assignable(gPin, gAlt) { return gInner }
+    // A union pin with a member of the tested type reaches the branch too, so its return is a
+    // member of the call's type, as the annotated parameter's is (D3094).
+    if pinHasMemberOf(gPin, gAlt) { return gInner }
+    return -1
+  }
+  // The guard's complement (`else` on a hole): the pin is the first place a remainder exists
+  // (`subtractTy` needs a member list); a pin it cannot reduce keeps itself, as the un-narrowed `else` already meant.
+  if kind == HD_GNOT {
+    const nAlt = hdAlt[row]
+    if nAlt < 0 { return -1 }
+    const nPin = substHoleTy(hdBase[row], bNames, bTys)
+    if nPin < 0 { return -1 }
+    if tyIsHole(nPin) { return rebaseDerivedHole(row, nPin) }
+    const nRest = subtractTy(nPin, nAlt)
+    if nRest >= 0 { return nRest }
+    return nPin
+  }
+  // The `??` result, deferred: the pin's non-null face when the default fits it, else the join
+  // — `checkBinExprNodeReal`'s own coalesce tail, which needs both sides concrete to decide.
+  if kind == HD_COAL {
+    const cPin = substHoleTy(hdBase[row], bNames, bTys)
+    if cPin < 0 { return -1 }
+    if tyIsHole(cPin) { return rebaseDerivedHole(row, cPin) }
+    // A declared parameter's pin that cannot be null leaves the default dead, as the concrete
+    // `??` types it; a hole's keeps the join its instance lowers (D2951).
+    if coalDeadAtPin(row, cPin) { return cPin }
+    const cInner = nonNullTy(cPin)
+    const cDft = substTyDeep(hdInner[row], bNames, bTys)
+    // A pin that is only ever `null` always takes the default, as the concrete `??` types it.
+    if isNullTy(cPin) && cDft >= 0 && !tyHasHole(cDft) {
+      return widenLitTy(cDft)
+    }
+    if cDft < 0 || tyHasHole(cDft) { return cInner }
+    if assignable(cDft, cInner) { return cInner }
+    // A literal default the face does not hold widens to its base, as the concrete `??` types it.
+    const cDt = T.tys[cDft]
+    if cDt is TyLit { return joinTys(cInner, litBaseTy(cDt)) }
+    return joinTys(cInner, widenLitTy(cDft))
+  }
+  // The `??` result over a hole default: the concrete tail, now that the default has a type.
+  if kind == HD_COALD {
+    const dPin = substHoleTy(hdBase[row], bNames, bTys)
+    if dPin < 0 { return -1 }
+    if tyIsHole(dPin) { return rebaseDerivedHole(row, dPin) }
+    const dFace = substTyDeep(hdInner[row], bNames, bTys)
+    if dFace < 0 || tyHasHole(dFace) { return -1 }
+    if assignable(dPin, dFace) { return dFace }
+    return joinTys(dFace, dPin)
+  }
+  // A place holding a written parameter value: the member of its declaration the pin lands on.
+  if kind == HD_TVW {
+    const wPin = substHoleTy(hdBase[row], bNames, bTys)
+    if wPin < 0 { return -1 }
+    if tyIsHole(wPin) { return rebaseDerivedHole(row, wPin) }
+    return tvWriteLandTy(hdInner[row], wPin)
+  }
+  if kind == HD_HWR {
+    const hPin = substHoleTy(hdBase[row], bNames, bTys)
+    if hPin < 0 { return -1 }
+    if tyIsHole(hPin) { return rebaseDerivedHole(row, hPin) }
+    return writeMemberTy(hPin, hdInner[row])
+  }
+  if kind == HD_RET {
+    const inner = substHoleTy(hdBase[row], bNames, bTys)
+    if inner >= 0 {
+      const fi = callPinFnTy(inner)
+      if fi >= 0 {
+        const it = T.tys[fi]
+        if it is TyFunc { return it.fnRet }
+      }
+      return rebaseDerivedHole(row, inner)
+    }
+    return -1
+  }
+  // A parameter of calling the hole: the pinned function's own, -1 past its arity.
+  if kind == HD_PARAM {
+    const innerP = substHoleTy(hdBase[row], bNames, bTys)
+    if innerP < 0 { return -1 }
+    const itP = T.tys[innerP]
+    if itP is TyFunc {
+      const pj = hdInner[row]
+      if pj >= 0 && pj < itP.fnParamTypes.length { return itP.fnParamTypes[pj] }
+      return -1
+    }
+    return rebaseDerivedHole(row, innerP)
+  }
+  // A deferred binary-op result (`mkBinOpRetTy`): an object pin with a `self`-function
+  // overload takes the overload's return type; every other pin keeps the body's own answer, mirroring `checkBinExprNode`'s dispatch arm exactly, including its `is TyObj` gate.
+  if kind == HD_BINOP {
+    const innerB = substHoleTy(hdBase[row], bNames, bTys)
+    if innerB < 0 { return -1 }
+    if tyIsHole(innerB) { return rebaseDerivedHole(row, innerB) }
+    const dTy = objOpSelfDispatchTy(hdField[row], innerB)
+    if dTy >= 0 { return dTy }
+    // A pinned operand that concatenates as a string makes `+` a concat, whose result is
+    // `string` and not the operand — the same answer `checkBinary`'s own arm reaches once the
+    // hole is concrete, which is the agreement the pin exists to keep (D1739).
+    if hdField[row] == "+" {
+      if concatsAsStr(innerB) { return TY_STR }
+    }
+    // No dispatch: the body's own answer, which may itself name this hole (`return lt` for
+    // the arithmetic tail) or be concrete (`TY_BOOL` for an ordering comparison).
+    const bInner = hdInner[row]
+    // An answer naming the operand is the operand's pin, already resolved above: resolving it
+    // again would double the walk per link of an operator chain (D3407).
+    if bInner == hdBase[row] && bNames.length > 0 {
+      const bv = T.tys[bInner]
+      if bv is TyVar {
+        if substNestMode == SUBST_ALL || substBindsNestRow(bInner, bv.tvName) {
+          return innerB
+        }
+      }
+    }
+    return substTyDeep(bInner, bNames, bTys)
+  }
+  // The element of an indexed hole (`self[i]`): resolve the hole to its pinned
+  // argument; an array yields its element (its value type for `HD_ELEMV`, so a `u8` byte
+  // reads as `i32`), a string an i32 code point. Mirrors the FIELD read for indexing.
+  if kind == HD_ELEM || kind == HD_ELEMV {
+    const innerE = substHoleTy(hdBase[row], bNames, bTys)
+    if innerE >= 0 {
+      const itE = T.tys[innerE]
+      if itE is TyArray {
+        if kind == HD_ELEMV { return arrElemValueTy(itE.aElem) }
+        return itE.aElem
+      }
+      if itE is TyPrim {
+        if itE.primName == "string" { return TY_I32 }
+      }
+      return rebaseDerivedHole(row, innerE)
+    }
+    return -1
+  }
+  // HD_FLD. An empty property name never resolves — the string form's `dot > 0`
+  // guard, kept verbatim (see `holeBaseTy`).
+  if hdField[row].length == 0 { return -1 }
+  const inner2 = substHoleTy(hdBase[row], bNames, bTys)
+  if inner2 >= 0 {
+    const it2 = T.tys[inner2]
+    if it2 is TyObj {
+      const f = objFieldType(it2, hdField[row])
+      if f >= 0 { return f }
+    }
+    return rebaseDerivedHole(row, inner2)
+  }
+  -1
+}
+
+// Generic call-site binding, deep: walks an expected parameter type against the argument's
+// actual type and binds every `TyVar` leaf on first use. Later uses are checked by the caller
+// against the substituted expected type, so disagreeing uses still error. Nested positions
+// bind too — a `Box<T>` param pins `T` from the argument's field, a callback's from its signature.
+export function bindGenWalk(
+  expIx: i32,
+  atIx: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if expIx < 0 || atIx < 0 { return 0 }
+  const e = T.tys[expIx]
+  if e is TyVar {
+    // `T` ranges over value types; `u8` is a storage type with no value rep, so binding it
+    // would instantiate an i32-list over a one-byte backing — declined here so `assignable` reports it at the argument instead.
+    if primNameOf(atIx) == "u8" { return 0 }
+    if bindOf(bNames, bTys, e.tvName) < 0 {
+      bNames.push(e.tvName)
+      bTys.push(widenLitTy(atIx))
+    }
+    return 0
+  }
+  let gi = bgSrcStack.length - 1
+  while gi >= 0 {
+    if bgSrcStack[gi] == expIx && bgDstStack[gi] == atIx { return 0 }
+    gi = gi - 1
+  }
+  bgSrcStackPush(expIx)
+  bgDstStackPush(atIx)
+  const a = T.tys[atIx]
+  if e is TyArray {
+    if a is TyArray { bindGenWalk(e.aElem, a.aElem, bNames, bTys) }
+  } else if e is TyNullable {
+    if a is TyNullable { bindGenWalk(e.nInner, a.nInner, bNames, bTys) }
+    else if atIx != TY_NULL { bindGenWalk(e.nInner, atIx, bNames, bTys) }
+  } else if e is TyObj {
+    if a is TyObj {
+      const enames = e.objFieldNames
+      const etys = e.objFieldTypes
+      let i = 0
+      while i < enames.length {
+        const sf = objFieldType(a, enames[i])
+        if sf >= 0 { bindGenWalk(etys[i], sf, bNames, bTys) }
+        i = i + 1
+      }
+    }
+  } else if e is TyFunc {
+    if a is TyFunc {
+      const ep = e.fnParamTypes
+      const ap = a.fnParamTypes
+      let i = 0
+      while i < ep.length {
+        if i < ap.length { bindGenWalk(ep[i], ap[i], bNames, bTys) }
+        i = i + 1
+      }
+      bindGenWalk(e.fnRet, a.fnRet, bNames, bTys)
+    }
+  } else if e is TyMap {
+    // A map/set param (`{[string]: T}`) pins `T` from the argument's value
+    // type (the key position walks too, for symmetry).
+    if a is TyMap {
+      bindGenWalk(e.mKey, a.mKey, bNames, bTys)
+      bindGenWalk(e.mVal, a.mVal, bNames, bTys)
+    }
+  }
+  bgSrcStackPop()
+  bgDstStackPop()
+  0
+}
+
+// The union arm `bindGenWalk` lacks, into bindings of its own: a parameter `T | string` binds its
+// one open member to the argument's members no concrete member admits (`R` at `string | R`, `U`
+// of `U[] | i32[]` at `string[]`). Only the call's deferred checks read them (D2803, D4922).
+export function bindGenUnionArm(
+  expIx: i32,
+  atIx: i32,
+  uNames: string[],
+  uTys: i32[],
+) {
+  if expIx < 0 || atIx < 0 { return 0 }
+  if !(T.tys[expIx] is TyUnion) { return 0 }
+  const gms: i32[] = []
+  flattenVariantsInto(expIx, gms)
+  let open = -1
+  let i = 0
+  while i < gms.length {
+    if gms[i] >= 0 && tyHasTyVar(gms[i]) {
+      if open >= 0 { return 0 }
+      open = gms[i]
+    }
+    i = i + 1
+  }
+  if open < 0 { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(atIx, pms)
+  const rest: i32[] = []
+  let k = 0
+  while k < pms.length {
+    if pms[k] < 0 || tyHasTyVar(pms[k]) { return 0 }
+    let covered = false
+    let m = 0
+    while m < gms.length && !covered {
+      if gms[m] != open && assignable(pms[k], gms[m]) { covered = true }
+      m = m + 1
+    }
+    if !covered { rest.push(pms[k]) }
+    k = k + 1
+  }
+  if rest.length == 0 { return 0 }
+  bindGenWalk(open, tyOfMembers(rest), uNames, uTys)
+}
+
+// Banks `newTy` as the same generic application `origTy` is, with the arguments substituted
+// (D949) — a no-op when `origTy` is not an application, when nothing changed, or when `newTy`
+// is already banked (the memo can hand back an index this walk has already seen).
+function genAppCarry(origTy: i32, newTy: i32, bNames: string[], bTys: i32[]) {
+  if origTy < 0 || newTy < 0 { return 0 }
+  if origTy == newTy { return 0 }
+  let k = 0
+  while k < gaAppTyIxs.length {
+    if gaAppTyIxs[k] == newTy { return 0 }
+    k = k + 1
+  }
+  let j = 0
+  while j < gaAppTyIxs.length {
+    if gaAppTyIxs[j] == origTy {
+      const st = gaAppArgStart[j]
+      const cn = gaAppArgCount[j]
+      // Reads the substituted arguments before pushing the row: `substTyDeep` can bank rows
+      // of its own, and a half-written row would be visible to it.
+      const subbed: i32[] = []
+      let a = 0
+      while a < cn {
+        subbed.push(substTyDeep(gaAppArgFlat[st + a], bNames, bTys))
+        a = a + 1
+      }
+      cTyIxSetAdd(gaAppTyIxs, gaAppTyIxSet, newTy)
+      gaAppHeads.push(gaAppHeads[j])
+      gaAppArgStart.push(gaAppArgFlat.length)
+      gaAppArgCount.push(cn)
+      gaAppFinite.push(0 - 1)
+      let b = 0
+      while b < subbed.length {
+        gaAppArgFlat.push(subbed[b])
+        b = b + 1
+      }
+      return 0
+    }
+    j = j + 1
+  }
+  0
+}
+
+// The members of a union re-joined one at a time, as the join that made it would at these types.
+// `fixed[i]` says member `i` is a list that keeps its own storage (`joinKeepingStorage`).
+function rejoinMembers(ms: i32[], fixed: boolean[]): i32 {
+  const apart = njRejoinApart
+  njRejoinApartSet(false)
+  if ms.length == 0 { return -1 }
+  let r = ms[0]
+  let rFixed = fixed[0]
+  let i = 1
+  while i < ms.length {
+    njApartSet(apart)
+    r = joinKeepingStorage(r, rFixed, ms[i], fixed[i])
+    njApartSet(false)
+    rFixed = rFixed || fixed[i]
+    i = i + 1
+  }
+  rejoinDropSubsumed(r)
+}
+
+// The join of `a` and `b`, or the two apart when it collapsed onto a list that a side stored as
+// built (`aFixed`, `bFixed`) keeps differently: only a fresh list literal is built at a join (D4862).
+export function joinKeepingStorage(
+  a: i32,
+  aFixed: boolean,
+  b: i32,
+  bFixed: boolean,
+): i32 {
+  const j = joinTys(a, b)
+  if (
+    (aFixed && listJoinStorageDiffers(a, j, 8))
+    || (bFixed && listJoinStorageDiffers(b, j, 8))
+  ) {
+    return joinVariantTys(a, b)
+  }
+  j
+}
+
+// The members of the return join at row `key` at this pin, one return value at a time: each
+// value's recorded type substituted, with `fixed` saying whether it is a list stored as built
+// (not a list literal). False when the row records no return set.
+function retJoinMembersAt(
+  key: i32,
+  bNames: string[],
+  bTys: i32[],
+  ms: i32[],
+  fixed: boolean[],
+  vals: i32[],
+): boolean {
+  const tys = tpRetJoinTys.get(key) ?? []
+  const fl = tpRetJoinFixed.get(key) ?? []
+  if tys.length == 0 || fl.length != tys.length { return false }
+  let k = 0
+  while k < tys.length {
+    const s = substTyDeep(tys[k], bNames, bTys)
+    vals.push(s)
+    const one: i32[] = []
+    flattenVariantsInto(s, one)
+    for m in one {
+      ms.push(m)
+      fixed.push(fl[k])
+    }
+    k = k + 1
+  }
+  ms.length > 0
+}
+
+// Deep substitution of a call's bindings into a type: a bound `TyVar` becomes its binding; a
+// derived return hole collapses to the pinned function's return. Composites rebuild only when
+// a child actually changed, so a concrete type keeps its arena identity (and the in-place
+// pinning semantics that ride on it). A cyclic arena (a recursive named type) returns itself unchanged.
+export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
+  if tyIx < 0 || bNames.length == 0 { return tyIx }
+  const t = T.tys[tyIx]
+  if t is TyVar {
+    if substNestMode != SUBST_ALL && !substBindsNestRow(tyIx, t.tvName) {
+      return tyIx
+    }
+    const b = substHoleTy(tyIx, bNames, bTys)
+    if b >= 0 { return b }
+    return tyIx
+  }
+  let si = stSeenStack.length - 1
+  while si >= 0 {
+    if stSeenStack[si] == tyIx { return tyIx }
+    si = si - 1
+  }
+  stSeenStackPush(tyIx)
+  let res = tyIx
+  if t is TyArray {
+    const e2 = substTyDeep(t.aElem, bNames, bTys)
+    // A `readonly T[]` stays a view once `T` is bound, or its covariance is lost.
+    if e2 != t.aElem {
+      if t.aRead == 1 { res = mkArrayViewTy(e2) } else { res = mkArrayTy(e2) }
+    }
+  } else if t is TyNullable {
+    let n2 = substTyDeep(t.nInner, bNames, bTys)
+    if (
+      n2 != t.nInner
+      && t.nInner >= 0
+      && tpJoinUnions.has(tyIx)
+      && T.tys[t.nInner] is TyUnion
+    ) {
+      // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
+      let key = tyIx
+      if !tpRetJoinTys.has(tyIx) { key = t.nInner }
+      let nms: i32[] = []
+      let nFixed: boolean[] = []
+      const vals: i32[] = []
+      const recorded = retJoinMembersAt(key, bNames, bTys, nms, nFixed, vals)
+      if !recorded {
+        nms = []
+        nFixed = []
+        flattenVariantsInto(n2, nms)
+        for _ in nms { nFixed.push(true) }
+      }
+      const tpSaved = tpApartConcrete
+      tpApartConcreteSet(true)
+      njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
+      n2 = rejoinMembers(nms, nFixed)
+      tpApartConcreteSet(tpSaved)
+      if recorded { carryRetJoin(n2, key, vals) }
+    }
+    if n2 != t.nInner { res = mkNullableTy(nullableFlatInner(n2)) }
+  } else if t is TyObj {
+    const onames = t.objFieldNames
+    const otys = t.objFieldTypes
+    const out: i32[] = []
+    let changed = false
+    let i = 0
+    while i < otys.length {
+      const f2 = substTyDeep(otys[i], bNames, bTys)
+      if f2 != otys[i] { changed = true }
+      out.push(f2)
+      i = i + 1
+    }
+    if changed {
+      const nn: string[] = []
+      let j = 0
+      while j < onames.length {
+        nn.push(onames[j])
+        j = j + 1
+      }
+      res = mkObjTy(nn, out)
+    }
+  } else if t is TyFunc {
+    const ps = t.fnParamTypes
+    const out2: i32[] = []
+    let changed2 = false
+    let k = 0
+    while k < ps.length {
+      const p2 = substTyDeep(ps[k], bNames, bTys)
+      if p2 != ps[k] { changed2 = true }
+      out2.push(p2)
+      k = k + 1
+    }
+    const r2 = substTyDeep(t.fnRet, bNames, bTys)
+    if r2 != t.fnRet { changed2 = true }
+    if changed2 { res = mkFuncTy(out2, r2) }
+  } else if t is TyUnion {
+    const ms = t.uMembers
+    const out3: i32[] = []
+    let changed3 = false
+    let u = 0
+    while u < ms.length {
+      const m2 = substTyDeep(ms[u], bNames, bTys)
+      if m2 != ms[u] { changed3 = true }
+      out3.push(m2)
+      u = u + 1
+    }
+    // A deferred join re-folds: every provably dead member drops and the rest re-joins,
+    // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
+    if isJoinHoleUnion(tyIx) {
+      res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
+    } else if changed3 && tpJoinUnions.has(tyIx) {
+      // A union the return-set join kept apart re-joins under the same rule (D2784).
+      let ums: i32[] = []
+      let uFixed: boolean[] = []
+      const vals: i32[] = []
+      const recorded = retJoinMembersAt(tyIx, bNames, bTys, ums, uFixed, vals)
+      if !recorded {
+        ums = out3
+        uFixed = []
+        for _ in out3 { uFixed.push(true) }
+      }
+      const tpSaved = tpApartConcrete
+      tpApartConcreteSet(true)
+      njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
+      res = rejoinMembers(ums, uFixed)
+      tpApartConcreteSet(tpSaved)
+      if recorded { carryRetJoin(res, tyIx, vals) }
+    } else if changed3 {
+      // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
+      // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
+      const src = substUnionNullFolded(tyIx, ms, out3)
+      const wrapNull = src.length > 0
+      // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
+      // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
+      let dms = out3
+      if wrapNull { dms = src }
+      const uniq: i32[] = []
+      let q = 0
+      while q < dms.length {
+        let seen = false
+        let w = 0
+        while w < uniq.length {
+          if uniq[w] == dms[q] { seen = true }
+          // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
+          if !wrapNull && substListTwin(uniq[w], dms[q]) { seen = true }
+          if wrapNull && substListTwinNominal(uniq[w], dms[q]) { seen = true }
+          w = w + 1
+        }
+        if !seen { uniq.push(dms[q]) }
+        q = q + 1
+      }
+      // The third union-construction site needing the same subsumed-arm collapse
+      // (`unionArmSubsumedBy`) as `annUnionInnerTy` and `fillTypeDeclAt`'s `UnionDecl` arm —
+      // the index dedup above cannot see a value-level duplicate like `T | "err"` at `T :=
+      // string`. `out` is read unconditionally; treating it as optional would double the member list.
+      const kept3: i32[] = []
+      unionDropSubsumedArms(uniq, kept3)
+      // A type argument can make a set and a same-rep map meet in one union (D2673); the
+      // node whose check substituted reports it (`checkNodeDone`).
+      const sclash = setMapUnionClashMsg(kept3, false)
+      if sclash != "" { joinClashMsgSet(sclash) }
+      if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
+      if wrapNull { res = substNullableOver(out3, res) }
+    }
+  } else if t is TyMap {
+    const k2 = substTyDeep(t.mKey, bNames, bTys)
+    const v2 = substTyDeep(t.mVal, bNames, bTys)
+    if k2 != t.mKey || v2 != t.mVal { res = mkMapTy(k2, v2, t.mSet) }
+  } else if t is TyNeg {
+    const g2 = substTyDeep(t.negTy, bNames, bTys)
+    if g2 != t.negTy { res = mkNegTy(g2) }
+  }
+  stSeenStackPop()
+  // Carries the application provenance across substitution (D949): the rebuilt type is a
+  // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
+  genAppCarry(tyIx, res, bNames, bTys)
+  res
+}
+
+// ── free index-operator resolution (B14) ─────────────────────────────────────
+
+// The receiver-keyed declaration name for binary operator `op` whose `self` parameter accepts
+// left-operand type `lt`, or "" — the receiver-directed scan of the operator registry
+// (`opIdxFns`), the twin of `opIdxFnFor` for a binary operator. Several receiver types may each
+// declare `op`; this picks the one the left operand is assignable to (B14 generalized).
+export function opSelfFnKeyFor(op: string, lt: i32): string {
+  if lt < 0 { return "" }
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      const nm = opIdxFns[i]
+      const fnTy = lookup(nm)
+      if fnTy >= 0 {
+        // Force an un-annotated return past its pending sentinel, as `opIdxFnFor` and the
+        // bare `a op b` resolution do, so a call ahead of the declaration reads a real type.
+        const preFt = T.tys[fnTy]
+        if preFt is TyFunc {
+          if preFt.fnRet == -2 {
+            if !onInferStack(nm) {
+              const dIx = fnDeclIx[nm] ?? -1
+              if dIx >= 0 { checkerForceFn(0, dIx, -1, -1) }
+            }
+          }
+        }
+        const ft = T.tys[fnTy]
+        if ft is TyFunc {
+          const ps = ft.fnParamTypes
+          if ps.length > 0 {
+            if assignable(lt, ps[0]) { return nm }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// The type of `self` under the call's bindings. `substTyDeep` rebuilds a list as a mutable
+// one, so a `readonly T[]` parameter is re-wrapped as a view, or it would refuse its receiver.
+export function substSelfTy(p0: i32, bNames: string[], bTys: i32[]): i32 {
+  const sub = substTyDeep(p0, bNames, bTys)
+  if sub == p0 || p0 < 0 || sub < 0 { return sub }
+  const pt = T.tys[p0]
+  const st = T.tys[sub]
+  if pt is TyArray {
+    if st is TyArray {
+      if pt.aRead == 1 && st.aRead == 0 { return mkArrayViewTy(st.aElem) }
+    }
+  }
+  sub
+}
+
+// Resolves a call's explicit type-argument nodes in the call's own scope, banking each type
+// on its node for the emitter. -1 in `out` never survives: an unresolvable argument is
+// reported at its own node and the answer is false.
+export function resolveCallTyArgs(ix: i32, out: i32[]): boolean {
+  const tas = callTyArgsOf(ix)
+  let ok = true
+  let i = 0
+  while i < tas.length {
+    const ta = P.nodes[tas[i]]
+    let t = -1
+    if ta is TypeRef {
+      t = nameToTyAt(ta.tyName, tas[i])
+      if t < 0 { tErr(tyArgUnknownText(ta.tyName), tas[i]) }
+    }
+    if t < 0 {
+      ok = false
+      t = TY_ERR
+    }
+    if !inferQuiet {
+      while nodeTyIx.length <= tas[i] { nodeTyIx.push(-1) }
+      nodeTySet(tas[i], t)
+    }
+    out.push(t)
+    i = i + 1
+  }
+  ok
+}
+
+// Binds a generic callee's type parameters to the call's explicit type arguments, in
+// declaration order, ahead of any argument — so each argument is checked against them.
+// False (reported) on a count mismatch or an unresolvable argument.
+export function bindExplicitTyArgs(
+  cfn: Node,
+  ix: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  if cfn is Ident {
+    const dIx = lookupFnDeclNode(cfn.identName)
+    if dIx < 0 { return true }
+    const d = P.nodes[dIx]
+    if d is FuncDecl {
+      const tys: i32[] = []
+      if !resolveCallTyArgs(ix, tys) { return false }
+      if tys.length != d.fnTyParams.length {
+        let what = "type arguments"
+        if d.fnTyParams.length == 1 { what = "type argument" }
+        tErr(
+          "`"
+            + cfn.identName
+            + "` takes "
+            + i32ToStr(d.fnTyParams.length)
+            + " "
+            + what
+            + " (`"
+            + tyParamListText(d.fnTyParams)
+            + "`), but the call gives "
+            + i32ToStr(tys.length)
+            + TY_ARG_READ_HINT,
+          ix,
+        )
+        return false
+      }
+      let i = 0
+      while i < tys.length {
+        bNames.push(d.fnTyParams[i])
+        bTys.push(tys[i])
+        i = i + 1
+      }
+    }
+  }
+  true
+}
+
+// Whether arm `armIx`, valued `armTy`, fits destination `want`: by its type, or as the literal
+// its tail spells, which its type has already widened to the literal's base.
+export function joinArmFits(armIx: i32, armTy: i32, want: i32): boolean {
+  if armTy < 0 || assignable(armTy, want) { return true }
+  let tail = armIx
+  const a = P.nodes[armIx]
+  if a is Block {
+    if a.blkStmts.length == 0 { return false }
+    tail = a.blkStmts[a.blkStmts.length - 1]
+  }
+  const lt = litTyOfExpr(tail)
+  lt >= 0 && assignable(lt, want)
+}
+
+// Resolves declaration statement `sx`'s fields/variants and fills them into the placeholder
+// pass 0a minted for it. Two callers make the fill order-independent: pass 0b's source-order
+// driver, and `declaredTyOfName`'s on-demand `forceDeclFill` when a body names a declaration
+// the driver has not reached yet. Marks done before the body resolves, so a recursive declaration lands on its own empty placeholder.
+export function fillTypeDeclAt(sx: i32) {
+  const sd = P.nodes[sx]
+  if sd is TypeDecl {
+    const declIx = cUserTypes[sd.tdName] ?? -1
+    if declIx >= 0 && !fillDone(declIx) {
+      markFillDone(declIx)
+      const pt = T.tys[declIx]
+      if pt is TyObj {
+        const fnames = pt.objFieldNames
+        const ftys = pt.objFieldTypes
+        const dfields = sd.tdFields
+        let fi = 0
+        while fi < dfields.length {
+          const fd = P.nodes[dfields[fi]]
+          if fd is FieldDef {
+            fnames.push(fd.fdName)
+            let fty = TY_ERR
+            if fd.fdType >= 0 {
+              const ftn = P.nodes[fd.fdType]
+              // A sub-word storage width (`u8`/`i8`/`u16`/`i16`) is legal only as a `flat` field
+              // — the packed-storage carve-out beside `u8[]`'s, so the leaf gate does not refuse
+              // it. Resolves to the `u8` storage type as a placeholder; the width comes from the
+              // spelling in `flatStageDecl`, and elsewhere it stays illegal.
+              if (
+                ftn is TypeRef
+                && sd.tdFlat == 1
+                && flatStorageSpellWidth(ftn.tyName) > 0
+              ) {
+                fty = TY_U8
+                if !inferQuiet && fd.fdType < nodeTyIx.length {
+                  nodeTySet(fd.fdType, TY_U8)
+                }
+              } else if ftn is TypeRef {
+                // The diagnostic anchors on the FIELD (`dfields[fi]`); the
+                // spelling tree is banked on its `TypeRef` child.
+                const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)
+                if r >= 0 {
+                  fty = r
+                  // Record the resolved type on the field's annotation node so the emitter
+                  // classifies a struct field structurally from the arena, not the name (C1).
+                  if !inferQuiet && fd.fdType < nodeTyIx.length {
+                    nodeTySet(fd.fdType, r)
+                  }
+                } else {
+                  unknownTyErr(
+                    ftn.tyName,
+                    " for field '" + fd.fdName + "'",
+                    dfields[fi],
+                  )
+                }
+              }
+            }
+            ftys.push(fty)
+          }
+          fi = fi + 1
+        }
+        // The 0a placeholder is just filled in place (its field arrays are
+        // the ones pushed above) — an existing arena entry changed shape.
+        tyMutEpoch = tyMutEpoch + 1
+      }
+    }
+  } else if sd is UnionDecl {
+    // A union's variants are type NAMES; resolve each into the member
+    // type-arena indices (forward references hit the 0a placeholders).
+    const declIx = cUserTypes[sd.udName] ?? -1
+    if declIx >= 0 && !fillDone(declIx) {
+      markFillDone(declIx)
+      const pt = T.tys[declIx]
+      if pt is TyUnion {
+        const members = pt.uMembers
+        const variants = sd.udVariants
+        // A degenerate self-cycle — `type D = D`, a body that is nothing but
+        // the alias itself — has no base case, so nothing can inhabit it.
+        // Reported at the declaration (host parser parity), so an unused
+        // `type D = D` still flags; the members stay empty (host: `Never`).
+        if variants.length == 1 && variants[0] == sd.udName {
+          tErr(
+            "Type `"
+              + sd.udName
+              + "` is defined in terms of itself "
+              + "with no base type, so it can never have a value",
+            sx,
+          )
+        } else {
+          let vi = 0
+          let resolvedAny = false
+          const declMemberIxs: i32[] = []
+          // The surviving members, and the two lists the NICHE fold below needs:
+          // every non-`null` survivor, and whether a `null` variant is among them.
+          // Filled here instead of straight into `members` (the live arena array)
+          // because the fold replaces the whole list with one wrapped member.
+          const surviving: i32[] = []
+          const nonNull: i32[] = []
+          let sawNull = false
+          while vi < variants.length {
+            // A union member is a parser spelling, banked on this declaration node in member
+            // order (`setUdTs`) — resolves the tree via `annotResolve`, the shared ladder every
+            // positioned annotation and the `is` test already climb, not the concatenated name.
+            let m = annotResolve(variants[vi], udTsRootAt(sx, vi))
+            // D1022 — a member blocked by a declaration cycle falls back to its placeholder
+            // rather than being dropped: `annotResolve` answers -1 while the fill is still in
+            // progress, and dropping the arm silently narrowed the declared union to a type
+            // the program never wrote. Pass 0a's placeholder exists precisely for this forward reference, so the fallback reaches it instead of losing the member.
+            if m < 0 {
+              const phName = variants[vi]
+              const ph = cUserTypes[phName] ?? -1
+              if ph >= 0 { m = ph }
+            }
+            if m >= 0 {
+              declMemberIxs.push(m)
+              resolvedAny = true
+              // A member that folds to `never` (an empty intersection) drops from the union; a
+              // declaration with no surviving member is the never-value error below. D1022 — an
+              // unfilled placeholder is not `never`: dropping it as one let declaration ORDER
+              // decide a type, since an empty union reads as `never`. The never-drop is only for a resolved empty intersection, not a placeholder still mid-fill.
+              let mPlaceholder = false
+              const mDecl = cFillStmtIx[variants[vi]] ?? -1
+              if mDecl >= 0 {
+                if !fillDone(mDecl) { mPlaceholder = true }
+              }
+              if !isNeverTy(m) || mPlaceholder {
+                surviving.push(m)
+                if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
+              }
+            } else {
+              unknownTyErr(variants[vi], " in union '" + sd.udName + "'", sx)
+            }
+            vi = vi + 1
+          }
+          // The declaration route's copy of `annUnionInnerTy`'s unseparable-member rule: this
+          // loop builds its member list itself, so `type U = N | i32` never reaches the shared
+          // annotation home. The union still fills — one diagnostic at the declaration is the
+          // whole report, since poisoning the arena entry would turn every use into a worse one.
+          const nwClash = nomUnionRepClashMsg(surviving)
+          if nwClash.length > 0 {
+            tErr(nwClash + " in union '" + sd.udName + "'", sx)
+          }
+          // The subsumed-arm collapse on the declaration side (`unionDropSubsumedArms`), the
+          // same shared rule `annUnionInnerTy` applies — the two routes are one language, so
+          // `type R = string | "err"` must collapse to `string` for the same reason the inline
+          // spelling does. The registration list is filtered by the same predicate rather than rebuilt from the survivors, since `declMemberIxs` is a superset pushed before the never-drop.
+          const survU: i32[] = []
+          const nonNullU: i32[] = []
+          const declU: i32[] = []
+          // The declaration route's half of D1048's second-hint provenance: the annotation
+          // route banks the arena index it collapsed to, while a declared alias banks its name
+          // instead, since the index it produces is re-derived at every later `: R` through
+          // `declaredTyOfName`. Recorded from the return value, not a length compare.
+          if unionDropSubsumedArms(surviving, survU) {
+            collapsedAliasesSetAt(sd.udName, true)
+          }
+          let cu = 0
+          while cu < survU.length {
+            if survU[cu] != TY_NULL { nonNullU.push(survU[cu]) }
+            cu = cu + 1
+          }
+          cu = 0
+          while cu < declMemberIxs.length {
+            if !unionArmSubsumedBy(declMemberIxs[cu], surviving) {
+              declU.push(declMemberIxs[cu])
+            }
+            cu = cu + 1
+          }
+          // The `null` niche fold: an un-parenthesized `type T = X | null` denotes `X?`,
+          // exactly as the inline annotation and the parenthesized declaration already do
+          // (`annUnionTy`, the shared home) — without it `null` stayed a sibling variant,
+          // breaking the one-member wrapper shape every niche consumer expects. Ungated on the inner, so this is `annUnionTy` and not a second copy of it.
+          let folded = -1
+          if sawNull && nonNullU.length > 0 {
+            folded = annUnionTy(nonNullU, true)
+          } else if sawNull {
+            // Every member is `null` (`type N = null | null`), which denotes `null` itself.
+            folded = TY_NULL
+          }
+          // The literal-union flatten, on the declaration side (`litUnionFlatMembers`, the
+          // same transform `annUnionInnerTy` climbs): this arm builds its member list itself,
+          // so `type U = A | B` over two litunion aliases would otherwise fill the placeholder
+          // with a union of unions, disagreeing with every channel that softens it. Gated on `!sawNull` since the null fold above already owns that list.
+          const flatU: i32[] = []
+          let flattened = false
+          if folded >= 0 {
+            members.push(folded)
+          } else {
+            if !sawNull { flattened = litUnionFlatMembers(survU, flatU) }
+            if flattened {
+              let fi = 0
+              while fi < flatU.length {
+                members.push(flatU[fi])
+                fi = fi + 1
+              }
+            } else {
+              let mi = 0
+              while mi < survU.length {
+                members.push(survU[mi])
+                mi = mi + 1
+              }
+            }
+          }
+          // Variant-member registration is arity-aware (Stage B b1): only a real (2+
+          // surviving member) union registers its members as variants, since the emitter
+          // lowers a single-member union as the member itself, never as a variant box. A
+          // flattened union registers the flattened members, not the source aliases — marking an alias itself a variant would box it at every other use in the module.
+          if members.length >= 2 {
+            if flattened {
+              let fr = 0
+              while fr < flatU.length {
+                cTyIxSetAdd(
+                  cVariantMemberTyIxs,
+                  cVariantMemberTyIxSet,
+                  flatU[fr],
+                )
+                fr = fr + 1
+              }
+            } else {
+              let ri = 0
+              while ri < declU.length {
+                cTyIxSetAdd(
+                  cVariantMemberTyIxs,
+                  cVariantMemberTyIxSet,
+                  declU[ri],
+                )
+                ri = ri + 1
+              }
+            }
+          }
+          // The 0a placeholder union is just filled in place (`members` is
+          // its `uMembers` array) — an existing arena entry changed shape.
+          noteUnionMembers(members)
+          tyMutEpoch = tyMutEpoch + 1
+          if resolvedAny && members.length == 0 {
+            // Explains the empty intersection in source terms: names the two operands and
+            // their kinds, or calls out a self-reference — falling back to generic wording for
+            // a non-binary/non-intersection never. Reads the intersection's operands from the
+            // member's `TS_ISECT` spelling node directly, rather than re-splitting the parser's concatenated name.
+            const opRoots: i32[] = []
+            const ops: string[] = []
+            const isectRoot = udTsRootAt(sx, 0)
+            if isectRoot >= 0 {
+              if tsKind[isectRoot] == TS_ISECT {
+                const opStart = tsKidStart[isectRoot]
+                let opk = 0
+                while opk < tsKidCount[isectRoot] {
+                  opRoots.push(tsKids[opStart + opk])
+                  ops.push(tsToName(tsKids[opStart + opk]))
+                  opk = opk + 1
+                }
+              }
+            }
+            let didDetail = false
+            if variants.length == 1 && ops.length == 2 {
+              const expr = ops[0] + " & " + ops[1]
+              const selfRef = ops[0] == sd.udName || ops[1] == sd.udName
+              if selfRef {
+                tErr(
+                  "Type `"
+                    + sd.udName
+                    + "` refers to itself inside an intersection (`"
+                    + expr
+                    + "`), so it reduces to `never`",
+                  sx,
+                )
+              } else {
+                tErr(
+                  "Type `"
+                    + sd.udName
+                    + "` is `never` (an empty type — `"
+                    + expr
+                    + "`, "
+                    + operandKind(tsToTy(opRoots[0]))
+                    + " and "
+                    + operandKind(tsToTy(opRoots[1]))
+                    + ", have no common values), so it has no values",
+                  sx,
+                )
+              }
+              didDetail = true
+            }
+            if !didDetail {
+              tErr(
+                "Type `"
+                  + sd.udName
+                  + "` is `never` (an empty type — "
+                  + "its operands have no common values), so it has no values",
+                sx,
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// Fills declaration `name` now, when pass 0b is running and has not reached it yet. Inert
+// outside pass 0b, which keeps every later re-resolution a plain lookup. Saves the
+// unknown-type bank across the nested fill, so a nested failure raises at its own
+// declaration with a fresh frame rather than renaming the caller's diagnostic.
+function forceDeclFill(name: string) {
+  if !cFillActive { return 0 }
+  const sx = cFillStmtIx[name] ?? (-1)
+  if sx < 0 { return 0 }
+  const svDepth = unkTyDepth
+  const svPart = unkTyPart
+  const svClash = unkTyClash
+  unkTyDepthSet(0)
+  fillTypeDeclAt(sx)
+  unkTyDepthSet(svDepth)
+  unkTyPartSet(svPart)
+  unkTyClashSet(svClash)
+  0
+}
+
+// Whether a null test of a value typed `ty` is dead: no member admits `null`, one a recursive
+// alias hides included, which `assignable` sees and the member walk does not.
+export function tyProvesNonNull(ty: i32): boolean {
+  tyExcludesNull(ty) && !assignable(TY_NULL, ty)
+}
+
+// Whether a compare keeps operand type `x` at its `const` literal: only beside a literal-typed
+// other side (or its nullable) that the literal is a member of. Anywhere else it compares as the
+// `string` it is; `constLitNeverMeets` refuses a literal side it can never equal.
+export function eqKeepsWideLit(x: i32, other: i32): boolean {
+  if !isWideLitJoin(x) { return false }
+  if other < 0 || isWideLitJoin(other) { return false }
+  if !isLitBearing(other) { return false }
+  if assignable(x, other) { return true }
+  const o = T.tys[other]
+  if o is TyNullable { return assignable(x, o.nInner) }
+  false
+}
+
+// `ty` with every widening literal inside it replaced by its base scalar: a union of them
+// (`if c { Z } else { W }`), a function's result (`() => Z`), a list's element and a map's key
+// or value, rebuilt only where something widened. Every other type comes back unchanged.
+export function widenLitTy(ty: i32): i32 {
+  if wideLitTyIxs.length == 0 { return ty }
+  widenLitTyGo(ty, 6)
+}
+
+function widenLitTyGo(ty: i32, depth: i32): i32 {
+  if ty < 0 || depth <= 0 { return ty }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      if ty < wideLitTyIxs.length && wideLitTyIxs[ty] { return litBaseTy(t) }
+      return ty
+    }
+    TyUnion => {
+      let changed = false
+      const ws: i32[] = []
+      let i = 0
+      while i < t.uMembers.length {
+        const w = widenLitTyGo(t.uMembers[i], depth - 1)
+        if w != t.uMembers[i] { changed = true }
+        ws.push(w)
+        i = i + 1
+      }
+      if !changed || ws.length == 0 { return ty }
+      let acc = ws[0]
+      let k = 1
+      while k < ws.length {
+        acc = joinTys(acc, ws[k])
+        k = k + 1
+      }
+      return acc
+    }
+    TyNullable => {
+      const wi = widenLitTyGo(t.nInner, depth - 1)
+      if wi == t.nInner { return ty }
+      return mkNullableTy(wi)
+    }
+    TyFunc => {
+      const wr = widenLitTyGo(t.fnRet, depth - 1)
+      if wr == t.fnRet { return ty }
+      return mkFuncTy(t.fnParamTypes, wr)
+    }
+    TyArray => {
+      if t.aRead == 1 { return ty }
+      const we = widenLitTyGo(t.aElem, depth - 1)
+      if we == t.aElem { return ty }
+      return mkArrayTy(we)
+    }
+    TyMap => {
+      const wk = widenLitTyGo(t.mKey, depth - 1)
+      const wv = widenLitTyGo(t.mVal, depth - 1)
+      if wk == t.mKey && wv == t.mVal { return ty }
+      return mkMapTy(wk, wv, t.mSet)
+    }
+    TyPrim => {
+      return ty
+    }
+    TyObj => {
+      // An object literal widens its fields as it is built (`checkObjLitNode`), and a declared
+      // record is annotated, so neither carries a widening literal to find here.
+      return ty
+    }
+    TyErr => {
+      return ty
+    }
+    TyVar => {
+      return ty
+    }
+    TyNeg => {
+      return ty
+    }
+  }
+}
+
+// Raise `head` plus where the first one is, over the token node `dupIx` starts at.
+export function dupNameErr(head: string, dupIx: i32, firstIx: i32) {
+  const ft = nodeStartTok(firstIx)
+  let where = ""
+  if ft >= 0 {
+    where = " (first at "
+      + i32ToStr(P.toks[ft].line)
+      + ":"
+      + i32ToStr(P.toks[ft].col + 1)
+      + ")"
+  }
+  const msg = head + where
+  const dt = nodeStartTok(dupIx)
+  if dt >= 0 { return tErrPushTok(msg, dupIx, dt, "", "") }
+  tErr(msg, dupIx)
+}
+// ── type guard `x is T` ─────────────────────────────────────────────────────
+// Always a `bool`. Checks the operand and that `T` names a known type. The actual narrowing of
+// `x` to `T` happens in the then branch of an enclosing `if`; used elsewhere it is a boolean test.
