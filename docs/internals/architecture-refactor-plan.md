@@ -24,7 +24,7 @@ restate measurements; follow the links.
 | item | state | where |
 | --- | --- | --- |
 | L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a record literal at an inferred list-union field mints its row, and the `if` join at a pin reads its apart union; D2891, D2541, D2795 and D3282 close, D5049–D5051 filed open. Next: D5049, D5050, D5051, the `unc` notes, the call's record ×8, the narrowed family, the scope callers. | [L2 log](#l2-log) |
-| L1 per-call binding, banked once | **in progress as lane SC**. Last: step 8 done; a binding called at several types holds one closure per type (D3975). Next: the (c) literal, and D4891–D4893; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
+| L1 per-call binding, banked once | **in progress as lane SC**. Last: D4891 closed; a write already delivered at the binding's pin still counts as a write of a generic. Next: the (c) literal, blocked while 613 compiling `@run` fixtures carry non-agree shadow rows; D4892, D4893, D5061, D5062; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
@@ -229,6 +229,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - The new matrix `written-fn-binding-two-types` runs 48 of 64 cells, against 0 on master, with 0 silent.
   - regress loses 0 runs, the fixpoint holds, and plumb-shape fuel moves +0.3%.
   - D3975, D3857, D3858, D3868, D4240 and D4890 close; D4891–D4893 are filed.
+- D4891 closes. A written `let` of a generic is pinned as one binding only when every write names a generic, and D3957's local-write arm had already renamed the write `g = k` to `k$1` at `g`'s pin, so the write no longer counted and `[g]` kept the seed's instance (the `string` one another binding's call made). `monoWrittenGenLetFrame` now also counts a write that names an instance of a generic. Graded base → candidate: `[g]` and `[g, g]` emit reject → runs, a capturing `() => g(3)` invalid wasm → runs, an annotated parameter runs → runs. The record field (D5061) and the un-annotated return (D5062) still refuse and are filed. D4892 (a union parameter's adaptation) and D4893 (a copy's literal-union atom set) have other mechanisms and stay open. The (c) literal is still blocked: on the candidate seed, 613 of the 3,334 `@run` fixtures that compile carry a shadow row that does not agree, such as 406 `instance fits no binding` and 351 `binding left open`, so arming it would lose runs. Proof: difftree `--identity` reads `15276 files · 10320 built · 1 differ · 0 uncompared`, the new fixture. Four fn-value matrices lose 0 runs, with 0 silent. Seed +25 bytes, L2 self-compile fuel is unchanged (102,031,586,265 on both seeds), and plumb-shape `--check` passes.
 
 ### L2 log
 
