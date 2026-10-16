@@ -1,13 +1,26 @@
-// `tyquery.vl` — structural one-step queries over the checker's `Ty` arena, written once and
-// imported by every phase that walks a type. Each takes an arena index and answers an arena
-// index (or a boolean); a negative index in is a hole and answers the step's decline.
-// Rendering, parsing and rep decisions do not belong here (code-quality-2026-10.md, L8); a
-// twin that answers what a render would spell, without building it, does (L2).
+// `tyquery.vl` — type-shape queries over the checker's `Ty` arena, written once and imported by
+// every phase that walks a type: whether a type is or admits `null`, `void` or `never`, which
+// numeric primitive it is, what a union holds, which union arm a literal or an arity selects,
+// whether a hole or a type variable is reachable inside it, and the one-step structural moves
+// (element, value, inner, result). A negative index in is a hole and answers the decline.
+// Only the arm a literal selects reads nodes, the literal's own; nothing reads the scope chain
+// or `tErr`, and the only state is the walks' scratch lists and cycle guards and `tyHasTyVar`'s
+// per-call budget. How a type is stored is `check_ty_rep.vl`'s question; rendering, parsing and
+// rep decisions do not belong here (L8), though a twin that answers what a render would spell,
+// without building it, does (L2).
 
-import { lvTyNever } from "./check_leaf_steps"
+import { ArrayLit, FieldInit, ObjLit, P, Paren } from "./ast"
 import {
   PrimName,
   T,
+  TY_ERR,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_NEVER,
+  TY_NULL,
+  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -24,14 +37,25 @@ import {
   litUnionAliasNameOfTy,
   litUnionAliasOfLitTexts,
   litUnionInlineNameOfTy,
+  nomNameOfTy,
   nulFoldWrapperTyIxOf,
+  numLitUnionBaseTy,
+  objFieldType,
+  softenLitTy,
+  tyArrayElemIx,
   tyEq,
   tyIsGenAppInstance,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+  tyIxIsFunc,
+  tyLitMemberTexts,
+  tySame,
 } from "./check_types"
+import { i32ListHas } from "./listutil"
 
 // The element type of array type `ty`, or -1 when `ty` is not a `TyArray`.
 export function tyStepElem(ty: i32): i32 {
-  if ty < 0 { return -1 }
+  if ty < 0 || ty >= T.tys.length { return -1 }
   const t = T.tys[ty]
   if t is TyArray { return t.aElem }
   -1
@@ -53,9 +77,37 @@ export function tyPeelNul(ty: i32): i32 {
   ty
 }
 
+// The result type of function type `ty`, or -1 when `ty` is not a `TyFunc`.
+export function tyStepRet(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// Parameter `i` of function type `ty`, or -1 unless `ty` is a `TyFunc` of exactly `n`
+// parameters: an arity mismatch is a different function.
+export function tyStepParam(ty: i32, i: i32, n: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyFunc {
+    if t.fnParamTypes.length != n { return -1 }
+    return t.fnParamTypes[i]
+  }
+  -1
+}
+
+// A literal's base type (`5` is an `i32`), else `ty` itself, a hole included.
+export function litPeekBaseTy(ty: i32): i32 {
+  if ty < 0 { return ty }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  ty
+}
+
 // True when `ty` IS the `null` type, compared structurally since `null` may be interned more
 // than once; false for a hole and for a nullable of something.
-export function tyIsNullPrim(ty: i32): boolean {
+export function isNullTy(ty: i32): boolean {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyPrim { return t.primName == "null" }
@@ -202,7 +254,7 @@ export function tyEmitElemNulPrimOf(arr: i32, p: PrimName): i32 {
     const mt = T.tys[m]
     if mt is TyLit {
       if mt.litKind == "str" { texts.push(mt.litText) }
-    } else if !tyIsNullPrim(m) {
+    } else if !isNullTy(m) {
       nonLit = true
     }
   }
@@ -308,7 +360,7 @@ function tyEmitNamesGo(ty: i32): boolean {
         if !tyEmitNamesOf(pt) { return false }
       }
       // A `never` result spells `void`.
-      if t.fnRet >= 0 && t.fnRet == lvTyNever() { return true }
+      if t.fnRet >= 0 && t.fnRet == TY_NEVER { return true }
       if tyIsNulAliased(t.fnRet) { return true }
       return tyEmitNamesOrAlias(t.fnRet)
     }
@@ -316,5 +368,1504 @@ function tyEmitNamesGo(ty: i32): boolean {
       // No name at either face.
     }
   }
+  false
+}
+
+// Whether `ix` is the `i32`, `i64`, `f32` or `f64` primitive itself.
+export function isNumericPrimTy(ix: i32): boolean {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyPrim {
+    return t.primName == "i32"
+      || t.primName == "i64"
+      || t.primName == "f64"
+      || t.primName == "f32"
+  }
+  false
+}
+
+// Whether `ty` is an open null hole: a `_ | null` (a `let x = null` binding's, or a container
+// slot's) that no write has filled yet.
+export function nhOpen(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner < 0 }
+  false
+}
+
+// Whether `ty` holds an open null hole BELOW its top: a list element, a map value or a record
+// field no write has filled yet, through closures and unions. A binding that is itself an open
+// hole is not one.
+export function tyHoldsOpenNullHole(ty: i32, seen: i32[]): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  // Each type is walked once, which is what ends a recursive type; the walk has no depth cap.
+  if i32ListHas(seen, ty) { return false }
+  seen.push(ty)
+  const t = T.tys[ty]
+  match t {
+    TyArray => nhOpen(t.aElem) || tyHoldsOpenNullHole(t.aElem, seen)
+    TyMap => nhOpen(t.mVal) || tyHoldsOpenNullHole(t.mVal, seen)
+    TyNullable => tyHoldsOpenNullHole(t.nInner, seen)
+    TyObj => {
+      let i = 0
+      let found = false
+      while i < t.objFieldTypes.length && !found {
+        const f = t.objFieldTypes[i]
+        found = nhOpen(f) || tyHoldsOpenNullHole(f, seen)
+        i = i + 1
+      }
+      found
+    }
+    // A closure holds what its parameters and result hold: a list it returns is the caller's.
+    TyFunc => {
+      let pi = 0
+      let found = tyHoldsOpenNullHole(t.fnRet, seen)
+      while pi < t.fnParamTypes.length && !found {
+        found = tyHoldsOpenNullHole(t.fnParamTypes[pi], seen)
+        pi = pi + 1
+      }
+      found
+    }
+    TyUnion => {
+      let ui = 0
+      let found = false
+      while ui < t.uMembers.length && !found {
+        found = tyHoldsOpenNullHole(t.uMembers[ui], seen)
+        ui = ui + 1
+      }
+      found
+    }
+    // A scalar, a literal, a negation or a hole holds no container slot of its own.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => false
+  }
+}
+
+// The union member index of `u`'s function arm whose parameter arity is `arity` (`(() => i64) |
+// {w:i32}` with a 0-arg lambda → the `() => i64` member), or -1 when no function arm matches. It
+// lets `seedExpected` adopt a bare lambda into a union's closure arm, the checker seam that
+// widens `f: () => 5` to the `() => i64` member. The first matching arm wins.
+export function unionFuncArmForArity(u: TyUnion, arity: i32) {
+  const members = u.uMembers
+  let i = 0
+  while i < members.length {
+    const m = members[i]
+    const mt = T.tys[m]
+    if mt is TyFunc {
+      if mt.fnParamTypes.length == arity { return m }
+    }
+    i = i + 1
+  }
+  -1
+}
+// True if the union object arm `tyIx` can be both boxed into the union's `{tag, value}` rep and
+// have its narrowed fields read back with valid wasm — the safety gate for seeding a struct
+// literal into this arm. A scalar, nested struct or closure field has a sound variant-struct rep;
+// an array, union or nullable field has none, so an arm carrying one stays an un-seeded reject.
+function unionArmSeedSafe(tyIx: i32) {
+  const t = T.tys[tyIx]
+  if !(t is TyObj) { return false }
+  const ftys = t.objFieldTypes
+  let i = 0
+  while i < ftys.length {
+    const ft = T.tys[ftys[i]]
+    if ft is TyPrim {
+      // scalar / string / boolean field — boxes + reads cleanly
+    } else if ft is TyFunc {
+      // a closure field — boxes into the variant struct; a narrowed call is a loud reject
+    } else if ft is TyObj {
+      if !unionArmSeedSafe(ftys[i]) { return false }
+    } else if ft is TyArray {
+      // A closure-array field (`f: ((i32) => K0)[]`): the reflist field boxes into the variant
+      // struct and a narrowed indexed call reads back the closure element, and the seed is what
+      // lets the element lambdas infer their params and result from the arm. Every other element
+      // rep keeps the un-seeded clean reject.
+      if ft.aElem < 0 { return false }
+      const aet = T.tys[ft.aElem]
+      if !(aet is TyFunc) { return false }
+    } else {
+      return false // other array / union / nullable field — no sound narrowed-read rep yet
+    }
+    i = i + 1
+  }
+  true
+}
+// The union member index of `u`'s object arm whose shape covers the object literal `objIx` — every
+// literal field name is a field of the arm — and whose fields are seed-safe, or -1. The object dual
+// of `unionFuncArmForArity`, so a bare field lambda infers its params from the arm's field types;
+// the literal is still gated by the normal assignability check. First match wins.
+export function unionObjArmForLit(u: TyUnion, objIx: i32) {
+  const on = P.nodes[objIx]
+  if on is ObjLit {
+    const members = u.uMembers
+    let i = 0
+    while i < members.length {
+      const m = members[i]
+      const mt = T.tys[m]
+      if mt is TyObj && unionArmSeedSafe(m) {
+        let ok = true
+        let j = 0
+        while j < on.objFields.length {
+          const fnode = P.nodes[on.objFields[j]]
+          if fnode is FieldInit {
+            if objFieldType(mt, fnode.fiName) < 0 { ok = false }
+          }
+          j = j + 1
+        }
+        if ok { return m }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+// The union member index of `u`'s array arm covering the array literal `arrIx`, or -1, so
+// `seedExpected` can descend an array literal flowing into a union into that arm. Two admitted
+// element shapes, both with a sound narrowed read: a closure element, and a struct element whose
+// fields are seed-safe and cover the literal's element field names. First match wins.
+export function unionArrayArmForLit(u: TyUnion, arrIx: i32) {
+  const an = P.nodes[arrIx]
+  if an is ArrayLit {
+    const members = u.uMembers
+    let i = 0
+    while i < members.length {
+      const m = members[i]
+      const mt = T.tys[m]
+      // The hole declines this arm and the scan moves to the next member (`tyArrayElemIx`): an
+      // array arm whose element the arena has not resolved carries `aElem == -1`, and reading it
+      // is an out-of-bounds `array.get` in the compiler. Declining is the same answer the seed
+      // already gives a scalar-element arm.
+      const aeIx = tyArrayElemIx(m)
+      if mt is TyArray && aeIx >= 0 {
+        const aet = T.tys[aeIx]
+        if aet is TyFunc { return m }
+        if aet is TyObj && unionArmSeedSafe(aeIx) {
+          // Every literal element that is an ObjLit must field-check against the arm's struct
+          // element (mirrors `unionObjArmForLit`), so a wrong-shaped arm is not seeded.
+          let ok = true
+          let j = 0
+          while j < an.arrElems.length {
+            let ei = an.arrElems[j]
+            let peeled = false
+            while !peeled {
+              const ep = P.nodes[ei]
+              if ep is Paren { ei = ep.parInner } else { peeled = true }
+            }
+            const en = P.nodes[ei]
+            if en is ObjLit {
+              let k = 0
+              while k < en.objFields.length {
+                const fnode = P.nodes[en.objFields[k]]
+                if fnode is FieldInit {
+                  if objFieldType(aet, fnode.fiName) < 0 { ok = false }
+                }
+                k = k + 1
+              }
+            }
+            j = j + 1
+          }
+          if ok { return m }
+        }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Whether `ty` is the `void` primitive, compared structurally — like `null`, `void` may be
+// interned at more than one arena index, so `== TY_VOID` is not reliable.
+export function isVoidTy(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim { return t.primName == "void" }
+  false
+}
+
+// Whether `ty` carries a `void` — the primitive itself, or a `void` member of a union or nullable.
+// No value has such a type: `void | i32` is what an if-expression with one void arm and one value
+// arm joins to, and it reaches a value slot exactly where a plain `void` does. Depth-bounded, and
+// composites are deliberately not descended: a `void` inside one is refused at its own slot.
+export function tyMentionsVoid(ty: i32, depth: i32) {
+  if ty < 0 { return false }
+  if depth <= 0 { return false }
+  if isVoidTy(ty) { return true }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    let mi = 0
+    while mi < ms.length {
+      if tyMentionsVoid(ms[mi], depth - 1) { return true }
+      mi = mi + 1
+    }
+    return false
+  }
+  if t is TyNullable { return tyMentionsVoid(t.nInner, depth - 1) }
+  false
+}
+
+// Whether `ty` is exactly `string | null` — a `TyNullable` wrapping the `string` primitive. Cheap,
+// with no `tyToStr`; it records an inferred niche if-binding.
+export function isNulStringTy(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const inr = t.nInner
+    if inr < 0 { return false }
+    const it = T.tys[inr]
+    if it is TyPrim { return it.primName == "string" }
+  }
+  false
+}
+
+// Whether `ty` admits null — a `TyNullable`, the bare `null` prim, or a union with a `null` member.
+// Gates the completion coercion: an object literal may omit a field whose declared type admits
+// null, since it is materialized as `null` at construction.
+export function tyAdmitsNull(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return true }
+  if t is TyPrim { return t.primName == "null" }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if isNullTy(ms[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `ty` is a union whose every member is a structural object (`Cat | Dog`) — the
+// variant-boxed struct-union rep the emitter lowers through its expression-based `exprUnion`
+// fallback. A mixed union, a struct together with a scalar or string, is not this: it has no
+// single rep, so it stays floored.
+export function isStructUnionTy(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const members = t.uMembers
+    if members.length < 2 { return false }
+    let i = 0
+    while i < members.length {
+      const m = T.tys[members[i]]
+      if !(m is TyObj) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether `ty` is exactly `boolean | null` — a `TyNullable` wrapping the `boolean` primitive, the
+// niche scalar nullable (an i32 0/1 with sentinel 2 for null). Cheap, with no `tyToStr`; it records
+// an inferred niche if-binding.
+export function isNulBoolTy(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    const inr = t.nInner
+    if inr < 0 { return false }
+    const it = T.tys[inr]
+    // The canonical boolean prim interns as `mkPrim("boolean")` (`TY_BOOL`); an annotation
+    // may also name it "boolean" — accept both, like the inferred-return niche path.
+    if it is TyPrim { return it.primName == "boolean" }
+  }
+  false
+}
+
+// The non-null part of `ty`: a nullable peels to its inner type, anything else is already non-null,
+// and -1 propagates. Nested nullables collapse, since reading a map whose value is already nullable
+// mints `mkNullableTy(T | null)` and a single peel would leave an inner `T?` a narrowed field
+// access rejects. A one-member union around a nullable is not peeled here — the emitter boxes it.
+export function nonNullTy(ty: i32) {
+  if ty < 0 { return -1 }
+  let cur = ty
+  while true {
+    const t = T.tys[cur]
+    if t is TyNullable {
+      if t.nInner < 0 { return cur }
+      cur = t.nInner
+    } else {
+      return cur
+    }
+  }
+  cur
+}
+
+// The value type of an array element type `et`: `et` itself, except that the `u8` storage type
+// widens to `i32` (D1211). One home for the widened-read rule the index arm already applies — a
+// `u8[]` read is the zero-extended byte `array.get_u` produces, and `u8` may not stand in a value
+// position at all. `.pop()` / `.get(i)` are that read one nullable out.
+export function arrElemValueTy(et: i32): i32 {
+  if primNameOf(et) == "u8" { return TY_I32 }
+  et
+}
+
+// Flatten a union/nullable into its variant list (`null` becomes the null
+// type), mirroring the host's `flattenVariants`.
+export function flattenVariantsInto(ty: i32, out: i32[]) {
+  if ty < 0 {
+    out.push(ty)
+    return 0
+  }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const members = t.uMembers
+    let i = 0
+    while i < members.length {
+      flattenVariantsInto(members[i], out)
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyNullable {
+    flattenVariantsInto(t.nInner, out)
+    out.push(TY_NULL)
+    return 0
+  }
+  out.push(ty)
+  0
+}
+
+// Whether `ix` is the `never` primitive (the empty type).
+export function isNeverTy(ix: i32) {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyPrim { return t.primName == "never" }
+  // An empty union (no surviving members — e.g. a degenerate `type D = D` or an
+  // empty intersection `A & B`) is uninhabited, i.e. `never`. The declaration
+  // already reported it; treating it as `never` keeps use sites from cascading.
+  if t is TyUnion { return t.uMembers.length == 0 }
+  false
+}
+
+// Whether `ty` carries literal members — a literal type, or a union or nullable with a literal
+// member. These are the closed-set types whose membership rules the literal-union checks enforce.
+export function isLitBearing(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyLit { return true }
+  if t is TyNullable { return isLitBearing(t.nInner) }
+  if t is TyUnion {
+    const members = t.uMembers
+    let i = 0
+    while i < members.length {
+      if isLitBearing(members[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Is type-arena index `ix` the `string` primitive?
+export function isStringTy(ix: i32) {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyPrim { return t.primName == "string" }
+  false
+}
+
+// Is type-arena index `ix` a numeric primitive (i32/i64/f32/f64)? A `TyErr` or
+// `TyVar` placeholder also counts, so a checking failure or unresolved hole
+// doesn't cascade a spurious "not a number" error.
+export function isNumeric(ix: i32) {
+  if ix < 0 { return false }
+  const t = T.tys[ix]
+  if t is TyErr { return true }
+  if t is TyVar { return true }
+  if t is TyPrim {
+    return t.primName == "i32"
+      || t.primName == "i64"
+      || t.primName == "f64"
+      || t.primName == "f32"
+  }
+  false
+}
+
+// The bare primitive name of type-arena index `ix`, or `null` when it is not a primitive. Absence
+// is `null` rather than `""`: nothing compares this against `""`, it only has to lose every
+// `== "i32"` comparison, and `T | null` is the absence idiom the language already commits to.
+export function primNameOf(ix: i32): PrimName | null {
+  if ix < 0 { return null }
+  const t = T.tys[ix]
+  if t is TyPrim { return t.primName }
+  null
+}
+
+// Do two numeric type indices denote the same numeric type?
+export function sameNumeric(a: i32, b: i32) {
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyErr { return true }
+  if tb is TyErr { return true }
+  if ta is TyVar { return true }
+  if tb is TyVar { return true }
+  if ta is TyPrim {
+    if tb is TyPrim { return ta.primName == tb.primName }
+  }
+  false
+}
+
+// The distinct base scalars of an integer-literal union whose members span two bases (`1 |
+// 9000000000` → `i32`, `i64`), else an empty list: the box that union lowers as (D3491) holds
+// each member at its base, so it converts out member by member like a numeric union.
+export function intLitUnionBasesOf(t: i32): i32[] {
+  const none: i32[] = []
+  if t < 0 || t >= T.tys.length { return none }
+  const u = T.tys[t]
+  if !(u is TyUnion) { return none }
+  const out: i32[] = []
+  for m in u.uMembers {
+    if m < 0 { return none }
+    const mt = T.tys[m]
+    if !(mt is TyLit) { return none }
+    if mt.litKind != "int" { return none }
+    const b = litBaseTy(mt)
+    let seen = false
+    for o in out {
+      if o == b { seen = true }
+    }
+    if !seen { out.push(b) }
+  }
+  if out.length < 2 { return none }
+  out
+}
+
+// Whether `t` is a box of numbers: two or more variants, each a numeric primitive or `null`.
+export function tyIsNumericBox(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  if vs.length < 2 { return false }
+  for v in vs {
+    if !isNumericPrimTy(v) && !isNullTy(v) { return false }
+  }
+  true
+}
+
+// Whether `t` is a numeric box with two numeric members or more, a `null` aside.
+export function tyHoldsNumbersApart(t: i32): boolean {
+  if !tyIsNumericBox(t) { return false }
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  let n = 0
+  for v in vs {
+    if isNumericPrimTy(v) { n = n + 1 }
+  }
+  n >= 2
+}
+
+// The numeric primitive type of value-atom kind `k` (0 i32, 3 i64, 4 f64, 5 f32), or -1.
+export function numPrimTyOfKind(k: i32): i32 {
+  if k == 0 { return TY_I32 }
+  if k == 3 { return TY_I64 }
+  if k == 4 { return TY_F64 }
+  if k == 5 { return TY_F32 }
+  -1
+}
+
+// Whether a variant of `t` is a numeric primitive.
+export function tyHoldsNumericPrim(t: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  for v in vs {
+    if isNumericPrimTy(v) { return true }
+  }
+  false
+}
+
+// How many members `ty` has as a union, else 1.
+export function unionMemberCountOf(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyUnion { return t.uMembers.length }
+  1
+}
+
+// The inner of the nullable type `ty`, or -1.
+export function nullableInnerOrNone(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
+}
+
+// The base scalar of a homogeneous literal union — a `TyUnion` whose members are all
+// `TyLit` over one base (`"aa"|"bb"` → string, `1|2` → i32) — or -1 otherwise. A
+// projection of `softenLitTy`, not a second answer. `tyIsLitUnion` cannot serve here: it
+// is string-only (a string litunion's alias name is its interned-atom identity).
+export function homogLitUnionBase(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return -1 }
+    const soft = softenLitTy(ty)
+    if soft != ty { return soft }
+  }
+  -1
+}
+
+// The base scalar an arm's value set sits inside when the arm denotes only literals — a
+// bare literal or a homogeneous literal union — else -1. Must move together with canon's
+// own arm spelling, or the arena says a plain scalar while canon still spells a union and
+// the emitter reserves a box for it (D1048).
+export function armLiteralBaseTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  // `Kind | string` is `string`, the same as `"a" | string` — `homogLitUnionBase` answers
+  // for the union-arm leg, the `TyLit` leg below for a bare literal. Must stay paired with
+  // canon's `canonDropSubsumedParts`, which drops the same arm from the spelling (D1048).
+  const hb = homogLitUnionBase(ty)
+  if hb >= 0 { return hb }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  -1
+}
+
+// Does `members` carry `base` as an arm, after flattening through aliases (a union-alias
+// member contributes its own arms, a nullable its inner plus `null`)? Compares by index
+// equality against `base`, not `sameVariantTy` — the loose test would also match a sibling
+// `TyLit`, which `"a" | "b" | "err"` must not collapse against.
+function unionMembersCarryBaseArm(members: i32[], base: i32): boolean {
+  let i = 0
+  while i < members.length {
+    const flat: i32[] = []
+    flattenVariantsInto(members[i], flat)
+    let f = 0
+    while f < flat.length {
+      if flat[f] == base { return true }
+      f = f + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Is `ty`'s value set already carried by an arm of `members`? Both union routes filter by
+// this — the annotation route over its member list, the declaration route also over the
+// wider `declMemberIxs` registration list.
+export function unionArmSubsumedBy(ty: i32, members: i32[]): boolean {
+  const base = armLiteralBaseTy(ty)
+  if base < 0 { return false }
+  unionMembersCarryBaseArm(members, base)
+}
+
+// Drops a subsumed literal arm (a union is a set of values: `string | "err"` is `string`),
+// decided per arm after flattening through aliases so both union routes agree. Always
+// fills `out` with the survivors and reports whether it dropped anything — a type rule,
+// not an emitter one, since a union box's tags are positional and must never be deduped (D1024).
+export function unionDropSubsumedArms(members: i32[], out: i32[]): boolean {
+  let dropped = false
+  let i = 0
+  while i < members.length {
+    if members.length >= 2 && unionArmSubsumedBy(members[i], members) {
+      dropped = true
+    } else {
+      out.push(members[i])
+    }
+    i = i + 1
+  }
+  if out.length == 0 { return false }
+  dropped
+}
+
+// The type a `| null` wrapper denotes, or `ty` itself when it is not one; -1 for an absent
+// type or an arena hole. A join carrying `null` interns as `TyNullable` over its non-null
+// members, so a caller asking about those members has to look through the wrapper first.
+export function nonNulTyOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return nonNulTyOf(t.nInner) }
+  ty
+}
+
+// —— pass 0d: a union's arms must be tellable apart ——
+// The base scalar of a literal-set type — `TY_STR` for `"a"|"b"`, a numeric `TY_I32`/
+// `TY_I64`/`TY_F64` — or -1 when `ty` is not a literal set, lifted from one member to the
+// whole set since two arms are discriminable at a field only when both sets are comparable (D1023).
+export function litSetBaseTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  if tyLitSetMemberLexes(ty).length == 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit { return litBaseTy(t) }
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit { return litBaseTy(m) }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Two numeric scalars (or literals over them, or lists of them) of different widths:
+// assignable by widening, yet no value is both, as `is i32` against an `i64` answers.
+export function numericRepsApart(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyArray && tb is TyArray {
+    return numericRepsApart(ta.aElem, tb.aElem)
+  }
+  const ab = litSetBaseTy(a)
+  const bb = litSetBaseTy(b)
+  const x = if ab >= 0 { ab } else { a }
+  const y = if bb >= 0 { bb } else { b }
+  isNumericPrimTy(x) && isNumericPrimTy(y) && !tyEq(x, y)
+}
+
+// True when the emit render of un-named union type `ty` is name-faithful — a property of
+// the members, not the wrapper. A declared struct member is the exception: without this
+// gate a one-member alias over `(Cat | Dog)` drops the variant names `emitIs` dispatches
+// on, and `x is Cat` fails where the alias-free spelling runs.
+export function unionAliasMembersFaithful(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    const ms = t.uMembers
+    if ms.length < 1 { return false }
+    let i = 0
+    while i < ms.length {
+      const mt = T.tys[ms[i]]
+      let ok = false
+      if mt is TyLit { ok = true }
+      if mt is TyPrim { ok = true }
+      // A litunion member of a mixed union (`(K | f64)`, kept nested rather than flattened)
+      // is rendered by its alias on the union arm — faithful for the same reason a `TyLit` is.
+      if tyIsLitUnion(ms[i]) { ok = true }
+      if !ok { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Does `ty` have a numeric-litunion base? The `!= ""` most callers are really asking, with
+// no name built to ask it.
+export function numLitUnionHasBase(ty: i32): boolean {
+  numLitUnionBaseTy(ty) >= 0
+}
+
+// The member literal texts (raw lexemes) of a numeric literal-union type `ty`, in source
+// order. Empty for anything `numLitUnionBaseName` does not claim, so a string litunion
+// answers empty here and a numeric one answers empty in `tyLitMemberTexts` — the two
+// extractors partition the literal kinds exactly as the two reps do.
+export function tyNumLitMemberTexts(ty: i32) {
+  const out: string[] = []
+  if !numLitUnionHasBase(ty) { return out }
+  litMemberTextsInto(numLitPeeled(ty), out)
+}
+
+// The member literal texts of an integer literal union whose members span two widths
+// (`1 | 3000000000`), which has no single base and so no `tyNumLitMemberTexts`; else empty.
+export function tyIntLitWideTexts(ty: i32): string[] {
+  const out: string[] = []
+  const cur = numLitPeeled(ty)
+  if intLitUnionBasesOf(cur).length == 0 { return out }
+  litMemberTextsInto(cur, out)
+}
+
+// `ty` with up to eight one-member union wrappers peeled, or -1.
+function numLitPeeled(ty: i32): i32 {
+  let cur = ty
+  let peels = 0
+  while peels < 8 {
+    if cur < 0 { return -1 }
+    const t = T.tys[cur]
+    let inner = -1
+    if t is TyUnion {
+      if t.uMembers.length == 1 { inner = t.uMembers[0] }
+    }
+    if inner < 0 {
+      peels = 8
+    } else {
+      cur = inner
+      peels = peels + 1
+    }
+  }
+  cur
+}
+
+// The literal texts of `cur`, a literal or a union of them, pushed onto `out`; returns `out`.
+function litMemberTextsInto(cur: i32, out: string[]): string[] {
+  if cur < 0 { return out }
+  const ct = T.tys[cur]
+  if ct is TyUnion {
+    let i = 0
+    while i < ct.uMembers.length {
+      const m = T.tys[ct.uMembers[i]]
+      if m is TyLit { out.push(m.litText) }
+      i = i + 1
+    }
+    return out
+  }
+  if ct is TyLit { out.push(ct.litText) }
+  out
+}
+
+// The single non-null member of a two-member `X | null` union, or -1 when `ty` is not that
+// shape (a wider value union, or one with no `null` member).
+export function unionSoleNonNullMember(ty: i32) {
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length != 2 { return -1 }
+    if isNullTy(t.uMembers[0]) { return t.uMembers[1] }
+    if isNullTy(t.uMembers[1]) { return t.uMembers[0] }
+  }
+  -1
+}
+
+// Every member of the union at `ty` is a literal and they all share one backing — the
+// single cell an `==` compares. Two shapes qualify: an all-string union (interned i32
+// atoms) and an all-numeric one (one base scalar). Wider than `tyLitUnionIsI32Backed`,
+// which is the lowering question and cares which scalar it is. `type M = "a" | 1` fails both — a value-union box, not one cell (D45).
+export function tyUnionIsOneLitCell(ty: i32) {
+  if tyIsLitUnion(ty) { return true }
+  numLitUnionHasBase(ty)
+}
+
+// —— is this `==` refusal a map, i.e. a domain rule rather than a missing lowering? ——
+// True when the reason `eqCmpKindOfTy` answered "none" is a map, is nullable/`| null` over
+// one, or a list bottoming out at one. This is that domain rule, not a gap: a VL map's
+// insertion order is observable, so structural `==` must choose order-sensitive vs set-like, neither a lowering question.
+export function tyEqNoneIsMap(ty: i32, depth: i32): boolean {
+  if ty < 0 { return false }
+  if depth > 8 { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return true }
+  if t is TyNullable { return tyEqNoneIsMap(t.nInner, depth + 1) }
+  if t is TyArray { return tyEqNoneIsMap(t.aElem, depth + 1) }
+  if t is TyUnion {
+    const inner = unionSoleNonNullMember(ty)
+    if inner >= 0 { return tyEqNoneIsMap(inner, depth + 1) }
+  }
+  false
+}
+
+// A `boolean`, or a union with a `boolean` member (a joined literal such as `[0, b]`).
+export function tyIsOrHasBoolean(ty: i32): boolean {
+  if primNameOf(softenLitTy(ty)) == "boolean" { return true }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if primNameOf(softenLitTy(t.uMembers[i])) == "boolean" { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `ty` reaches an inference hole (a `TyVar`, or a demanded shape like `{bar: _}`)
+// anywhere in its tree. A recursive type is a cycle in the arena: a row met again on the path
+// reaches nothing new, so a cycle is no hole, while running out of `depth` still is (D4038).
+export function tyReachesHole(ty: i32, depth: i32): boolean {
+  if ty < 0 { return true }
+  if i32ListHas(trhPath, ty) { return false }
+  if depth <= 0 { return true }
+  trhPath.push(ty)
+  const r = tyReachesHoleRow(ty, depth)
+  trhPath.pop()
+  r
+}
+
+// The rows `tyReachesHole` is inside, outermost first.
+const trhPath: i32[] = []
+
+// One row of `tyReachesHole`'s walk.
+function tyReachesHoleRow(ty: i32, depth: i32): boolean {
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyArray { return tyReachesHole(t.aElem, depth - 1) }
+  if t is TyMap {
+    if tyReachesHole(t.mKey, depth - 1) { return true }
+    return tyReachesHole(t.mVal, depth - 1)
+  }
+  if t is TyNullable { return tyReachesHole(t.nInner, depth - 1) }
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      if tyReachesHole(t.objFieldTypes[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyUnion {
+    let m = 0
+    while m < t.uMembers.length {
+      if tyReachesHole(t.uMembers[m], depth - 1) { return true }
+      m = m + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    let p = 0
+    while p < t.fnParamTypes.length {
+      if tyReachesHole(t.fnParamTypes[p], depth - 1) { return true }
+      p = p + 1
+    }
+    if t.fnRet == -2 { return true }
+    return tyReachesHole(t.fnRet, depth - 1)
+  }
+  false
+}
+
+// A nominal brand over the SIMD substrate (`type F32x4 = new v128`): the one non-object `self`
+// a binary operator dispatches on, because the language gives a v128 no operator of its own.
+export function tyIsV128Brand(ty: i32): boolean {
+  if ty < 0 { return false }
+  if nomNameOfTy(ty) == "" { return false }
+  primNameOf(ty) == "v128"
+}
+
+// Whether the declared type `ty` names the newtype `nom` itself or as a union or nullable
+// member — the shapes a `self` of that newtype can take. Names only: no structural comparison.
+export function tyNamesNominal(ty: i32, nom: string, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  if nomNameOfTy(ty) == nom { return true }
+  const inner = nonNullTy(ty)
+  if inner != ty { return tyNamesNominal(inner, nom, depth - 1) }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tyNamesNominal(t.uMembers[i], nom, depth - 1) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether `ty` is a literal type or a union of them, nullable or not, or a list of one.
+export function tyIsLitUnionLike(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyLit { return true }
+  if t is TyNullable { return tyIsLitUnionLike(t.nInner, depth - 1) }
+  if t is TyArray { return tyIsLitUnionLike(t.aElem, depth - 1) }
+  if t is TyUnion {
+    let lits = 0
+    for m in t.uMembers {
+      if !isNullTy(m) {
+        if !tyIsLitUnionLike(m, depth - 1) { return false }
+        lits = lits + 1
+      }
+    }
+    return lits > 0
+  }
+  tyNotLitUnionLike()
+}
+
+// Every other type (a primitive, record, map or function) holds values outside any literal set.
+function tyNotLitUnionLike(): boolean { false }
+
+// Whether `t` is a nullable or union with a bare vector member, which boxes that vector.
+export function tyHasV128Member(t: i32): boolean {
+  if t < 0 { return false }
+  const tt = T.tys[t]
+  match tt {
+    TyNullable => {
+      return primNameOf(tt.nInner) == "v128"
+    }
+    TyUnion => {
+      let i = 0
+      while i < tt.uMembers.length {
+        if primNameOf(tt.uMembers[i]) == "v128" { return true }
+        i = i + 1
+      }
+    }
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyVar | TyLit | TyErr | TyNeg => {
+      // Not a box: a bare vector, or a container `v128NestCheck` answers for.
+    }
+  }
+  false
+}
+
+// Whether `t` is a record or a union with a record member.
+export function tyHasObjMember(t: i32): boolean {
+  const vs: i32[] = []
+  flattenVariantsInto(t, vs)
+  let i = 0
+  while i < vs.length {
+    if vs[i] >= 0 && T.tys[vs[i]] is TyObj { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether a member of the composite type `t` (not `t` itself) is a v128, within `d` levels.
+export function tyNestsV128(t: i32, d: i32): boolean {
+  if t < 0 || d <= 0 { return false }
+  const tt = T.tys[t]
+  if tt is TyArray { return tyIsOrNestsV128(tt.aElem, d - 1) }
+  // A nullable or union member is boxed, so a bare vector there is not nested; one inside
+  // a container member still is.
+  if tt is TyNullable { return tyNestsV128(tt.nInner, d - 1) }
+  if tt is TyMap {
+    if tyIsOrNestsV128(tt.mKey, d - 1) { return true }
+    return tyIsOrNestsV128(tt.mVal, d - 1)
+  }
+  if tt is TyObj {
+    let i = 0
+    while i < tt.objFieldTypes.length {
+      if tyIsOrNestsV128(tt.objFieldTypes[i], d - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if tt is TyUnion {
+    let j = 0
+    while j < tt.uMembers.length {
+      if tyNestsV128(tt.uMembers[j], d - 1) { return true }
+      j = j + 1
+    }
+    return false
+  }
+  // A function value is D1982's (the emitter refuses it); the rest hold no member at all.
+  if tt is TyFunc { return false }
+  if tt is TyPrim { return false }
+  if tt is TyVar { return false }
+  if tt is TyLit { return false }
+  if tt is TyNeg { return false }
+  if tt is TyErr { return false }
+  false
+}
+
+export function tyIsOrNestsV128(t: i32, d: i32): boolean {
+  if primNameOf(t) == "v128" { return true }
+  tyNestsV128(t, d)
+}
+
+// Whether `ty` is `| null` or a union with a `null` member.
+export function tyHasNullMember(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return true
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if isNullTy(t.uMembers[i]) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // Any other type is one member, which a caller asks `isNullTy` of directly.
+    TyPrim | TyErr | TyObj | TyMap | TyFunc | TyArray | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether `ty` holds an `i64` or `f64` through unions, `| null`, list elements and record
+// fields: the cheap gate a widening retag needs in a program with no map type.
+export function tyHoldsWideScalar(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyPrim => {
+      return t.primName == "i64" || t.primName == "f64"
+    }
+    TyNullable => {
+      return tyHoldsWideScalar(t.nInner, depth - 1)
+    }
+    TyArray => {
+      return tyHoldsWideScalar(t.aElem, depth - 1)
+    }
+    TyUnion => {
+      return tysHoldWideScalar(t.uMembers, depth - 1)
+    }
+    TyObj => {
+      return tysHoldWideScalar(t.objFieldTypes, depth - 1)
+    }
+    // No other type is or holds a member a union box can widen into.
+    TyErr | TyMap | TyFunc | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether a member of `ty`, through unions and `| null` only, is `i64` or `f64`: the check
+// ahead of `unionLeavesInto`, which allocates.
+export function unionLeafIsWide(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyPrim => {
+      return t.primName == "i64" || t.primName == "f64"
+    }
+    TyNullable => {
+      return unionLeafIsWide(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if unionLeafIsWide(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // A list, record or any other type is one member that is not a scalar.
+    TyErr | TyObj | TyMap | TyFunc | TyArray | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// `tyHoldsWideScalar` of any of `tys`.
+function tysHoldWideScalar(tys: i32[], depth: i32): boolean {
+  let i = 0
+  while i < tys.length {
+    if tyHoldsWideScalar(tys[i], depth) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The non-null members of `ty`, through nested unions and `| null`, into `out`.
+export function unionLeavesInto(ty: i32, out: i32[], depth: i32) {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      unionLeavesInto(t.uMembers[i], out, depth - 1)
+      i = i + 1
+    }
+    return 0
+  }
+  if t is TyNullable { return unionLeavesInto(t.nInner, out, depth - 1) }
+  if !isNullTy(ty) { out.push(ty) }
+  0
+}
+
+// Whether `ty` is exactly `f32[]`.
+export function tyIsF32ArrayTy(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem >= 0 && primNameOf(t.aElem) == "f32" }
+  false
+}
+
+// Whether arena type `ty` is a `u8[]` — a `TyArray` whose element is the `u8` storage prim.
+// The arena answers this without the caveat its f32 sibling carries: no literal defaults to
+// `u8[]` (a bare `[1, 2]` types `i32[]`), so the recorded type says `u8[]` exactly when an
+// annotation did — which is what lets the emitter's receiver classifier be short.
+export function tyIsU8ArrayTy(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 || t.aElem >= T.tys.length { return false }
+    return primNameOf(t.aElem) == "u8"
+  }
+  false
+}
+
+// The walk's stack below the shallow depth, where a revisit is a cycle and adds nothing.
+export const tyHasTyVarDeep: i32[] = []
+
+// Whether `ti` is a function type, bare or nullable, whose result is a literal union, bare
+// or nullable.
+export function tyFnRetIsLitUnion(ti: i32): boolean {
+  const f = nonNullTy(ti)
+  if f < 0 || f >= T.tys.length { return false }
+  const ft = T.tys[f]
+  if !(ft is TyFunc) { return false }
+  tyIsLitUnion(ft.fnRet) || tyIsNullableLitUnion(ft.fnRet)
+}
+
+// `ti` with up to `depth` list element and map value layers peeled, `| null` on each.
+export function tyPeelElems(ti: i32, depth: i32): i32 {
+  const n = nonNullTy(ti)
+  if n < 0 || n >= T.tys.length || depth <= 0 { return n }
+  const ae = tyArrayElemIx(n)
+  if ae >= 0 { return tyPeelElems(ae, depth - 1) }
+  const t = T.tys[n]
+  if t is TyMap { return tyPeelElems(t.mVal, depth - 1) }
+  n
+}
+
+// Whether `ti` is a record with a literal-union field, bare or nullable, at any record-nesting
+// depth up to `depth`. The record-field usage arm of `anyLitUnionUsed`.
+export function tyObjFieldIsLitUnion(ti: i32, depth: i32): boolean {
+  if ti < 0 || depth <= 0 { return false }
+  let o = ti
+  const nt = T.tys[o]
+  if nt is TyNullable { o = nt.nInner }
+  if o < 0 { return false }
+  const t = T.tys[o]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length {
+      let f = t.objFieldTypes[i]
+      if f >= 0 {
+        const ft = T.tys[f]
+        if ft is TyNullable { f = ft.nInner }
+      }
+      if f >= 0 {
+        if tyIsLitUnion(f) { return true }
+        if tyFnRetIsLitUnion(f) { return true }
+        if tyObjFieldIsLitUnion(f, depth - 1) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The member lexemes of a literal set — a bare `TyLit`, or a `TyUnion` whose members are all
+// `TyLit` — in declaration order, empty for every other type (D1023's discriminant query).
+// Lexemes, not texts: a string member comes back quoted, a numeric one bare, matching what
+// `emitLitMemberEq` reads to pick string vs numeric equality. A mixed set (`"a" | 1`) returns too.
+export function tyLitSetMemberLexes(ty: i32) {
+  const out: string[] = []
+  if ty < 0 { return out }
+  const t = T.tys[ty]
+  if t is TyLit {
+    if t.litKind == "str" {
+      out.push("\"" + t.litText + "\"")
+    } else {
+      out.push(t.litText)
+    }
+    return out
+  }
+  if t is TyUnion {
+    if t.uMembers.length < 1 { return out }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {
+        if m.litKind == "str" {
+          out.push("\"" + m.litText + "\"")
+        } else {
+          out.push(m.litText)
+        }
+      } else {
+        // Not a literal set: one non-literal member disqualifies the whole type, or a caller
+        // could build a membership chain answering false for every legal non-literal value.
+        return emptyTextList()
+      }
+      i = i + 1
+    }
+    return out
+  }
+  out
+}
+
+// True if `ty` denotes a literal SET — the predicate half of `tyLitSetMemberLexes`, for a
+// caller that only needs the yes/no (the variant field row's `-1` decision).
+export function tyIsLitSet(ty: i32): boolean {
+  tyLitSetMemberLexes(ty).length > 0
+}
+
+// `nodeNulLitUnionMemberTexts` asked of arena type `ty` itself, for a caller whose node records a
+// type parameter and whose type is the instance's pin instead.
+export function tyNulLitUnionMemberTexts(ty: i32) {
+  const lt = nulLitUnionPeelTy(ty)
+  if lt < 0 { return emptyTextList() }
+  tyLitMemberTexts(lt)
+}
+
+// Peels every nullable wrapper off `ty` and answers the arena index of the litunion
+// underneath, or -1 when `ty` is not the nullable niche (a bare litunion included — it needs
+// no sentinel arm). Depth matters: a bare read over `{[string]: K | null}` types `K | null |
+// null`, so a one-wrapper peel would misread a value that IS the niche as "not a niche".
+export function nulLitUnionPeelTy(ty: i32): i32 {
+  if ty < 0 { return 0 - 1 }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if tyIsLitUnion(t.nInner) { return t.nInner }
+    return nulLitUnionPeelTy(t.nInner)
+  }
+  if tyIsNullableLitUnion(ty) { return ty }
+  0 - 1
+}
+
+// A fresh empty `string[]` — `nodeLitUnionMemberTexts`'s two decline arms, which must each hand back a
+// list the caller may keep (the emitter's widening loops read `.length` on it).
+export function emptyTextList() {
+  const out: string[] = []
+  out
+}
+
+// The type-level half of `nodeTyExcludesNull` — shared so the CHECKER (which holds a
+// type, not a node) and the emit-time fold (which holds a node) cannot disagree about
+// which left operands make a `??` redundant.
+export function tyExcludesNull(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return false }
+  if t is TyErr { return false }
+  if t is TyVar { return false }
+  if t is TyNeg { return false }
+  // The bare `null` literal is a `TyPrim` — `null ?? d` IS `d`, the one shape where a
+  // non-`TyNullable` type is entirely null.
+  if isNullTy(ty) { return false }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let i = 0
+    while i < ms.length {
+      if isNullTy(ms[i]) { return false }
+      if T.tys[ms[i]] is TyNullable { return false }
+      i = i + 1
+    }
+  }
+  true
+}
+
+// Whether any variant in `mems` is a literal type. An arm tests its member with `is`, and
+// `x is 0` over a value union does not lower, so such a union has no arm spelling that works —
+// the whole scrutinee is refused, with the shape that does work named.
+export function unionHasLitMember(mems: i32[]) {
+  let i = 0
+  while i < mems.length {
+    const t = T.tys[mems[i]]
+    if t is TyLit { return true }
+    i = i + 1
+  }
+  false
+}
+
+// An integer `match` (D1572, VL-020): the scrutinee types whose arms are integer literals
+// rather than member types or member strings. `i32` and `i64` only — `u8` is a storage type
+// no local/parameter/return may hold, and a float is excluded since dispatching on `==` over
+// one is a trap rather than a feature.
+export function tyIsIntMatchScrut(st: i32) {
+  const p = primNameOf(st)
+  p == "i32" || p == "i64"
+}
+
+// Whether `ty` is one of the union's members, by arena identity or by `tySame` — the same two
+// rungs `isStructOfTy` uses, and for the same reason: an arm reached through an alias is a
+// different index for one type.
+function unionHasMemberTy(u: TyUnion, ty: i32): boolean {
+  if ty < 0 { return false }
+  const ms = u.uMembers
+  let i = 0
+  while i < ms.length {
+    if ms[i] == ty { return true }
+    if tySame(ms[i], ty) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether the union covers `ty` — `ty` is one of its arms, or a sub-union of them. A program
+// often keeps a domain union and an error type apart and joins them at one boundary
+// (`parse(...): Circle | Rect | ParseError` wants `as Shape`), so requiring a single arm
+// rejected exactly that. A sub-union target is also cheaper: the same box at a narrower type, no unbox.
+export function unionCoversTy(u: TyUnion, ty: i32): boolean {
+  if ty < 0 { return false }
+  if unionHasMemberTy(u, ty) { return true }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  const want: i32[] = []
+  flattenVariantsInto(ty, want)
+  if want.length < 1 { return false }
+  let i = 0
+  while i < want.length {
+    if !unionHasMemberTy(u, want[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+export function crTyIsScalar(t0: i32): boolean {
+  if t0 < 0 || t0 >= T.tys.length { return false }
+  const t = nonNullTy(t0)
+  if t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if tt is TyUnion {
+    let i = 0
+    while i < tt.uMembers.length {
+      if !crTyIsScalar(tt.uMembers[i]) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  crTyIsLeafScalar(tt)
+}
+
+// A primitive or a literal type: nothing a renderer can dispatch on to user code.
+function crTyIsLeafScalar(tt: Ty): boolean { tt is TyPrim || tt is TyLit }
+
+export function crTyHasFn(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if tyIxIsFunc(t) || tyIxIsFunc(nonNullTy(t)) { return true }
+  const tt = T.tys[t]
+  if tt is TyUnion {
+    let i = 0
+    while i < tt.uMembers.length {
+      if crTyHasFn(tt.uMembers[i]) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether any of `tys` names a type parameter or a hole.
+export function tysHaveTyVarIn(tys: i32[]): boolean {
+  let i = 0
+  while i < tys.length {
+    if tys[i] >= 0 && tyHasTyVar(tys[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `ty` is a union with a function-type member, or a function type with `null`, with no
+// type parameter in it: an un-annotated return of this shape is pinned to its own spelling by
+// the emitter, and lowers as that annotation does (D4349).
+export function tyIsFnArmUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      if t.nInner >= 0 && T.tys[t.nInner] is TyFunc { return true }
+      return tyIsFnArmUnion(t.nInner)
+    }
+    TyUnion => {
+      if t.uMembers.length < 2 { return false }
+      let i = 0
+      while i < t.uMembers.length {
+        const m = t.uMembers[i]
+        if m >= 0 && m < T.tys.length && T.tys[m] is TyFunc { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a union, and a bare function type is no union with one.
+      return false
+    }
+  }
+}
+
+// Whether `p` is a declared type parameter and `c` a type holding none, nor a hole or error.
+export function tyParamBesideConcrete(p: i32, c: i32): boolean {
+  const tp = T.tys[p]
+  if tp is TyVar {
+    if tp.tvName.length == 0 || tp.tvName[0] == "?"[0] { return false }
+    if c == TY_ERR || tyHasTyVar(c) { return false }
+    return true
+  }
+  false
+}
+
+// Whether one of `tys` still holds a type variable: a binding that leaves a demand undecided.
+export function tysHoldVar(tys: i32[]): boolean {
+  for t in tys {
+    if tyHasTyVar(t) { return true }
+  }
+  false
+}
+
+// Whether `ty` is unknown or mentions a type parameter: a value a generic body may compute on.
+export function tyOpenOrTyVar(ty: i32): boolean { ty < 0 || tyHasTyVar(ty) }
+
+// Whether `ty` still holds an unresolved `TyVar`: `substTyDeep` leaves an unbound parameter in
+// place, and a partly-substituted type recorded on an instance is a wrong type. An acyclic type
+// is read whole, each distinct part once; a cycle is cut, and only the far caps answer true.
+export function tyHasTyVar(ty: i32) {
+  tyHasTyVarBudget = 100000
+  tyHasTyVarCapped = false
+  if tyHasTyVarFreeN > 0 {
+    tyHasTyVarFree = Map()
+    tyHasTyVarFreeN = 0
+  }
+  tyHasTyVarGo(ty, 20000)
+}
+
+// Whether the last `tyHasTyVar` answered true only because it ran out of depth or budget.
+export function tyHasTyVarWasCapped(): boolean { tyHasTyVarCapped }
+
+let tyHasTyVarCapped = false
+
+// The distinct parts the walk may still visit below the shallow depth, and the parts it has
+// found free of a type variable there, so a shared part (a diamond) is read once.
+let tyHasTyVarBudget = 100000
+
+let tyHasTyVarFree: {[i32]: boolean} = Map()
+
+let tyHasTyVarFreeN = 0
+
+export function tyHasTyVarGo(ty: i32, depth: i32) {
+  if ty < 0 { return false }
+  if depth > 19988 { return tyHasTyVarAt(ty, depth) }
+  if tyHasTyVarFree.has(ty) { return false }
+  if depth <= 0 || tyHasTyVarBudget <= 0 {
+    tyHasTyVarCapped = true
+    return true
+  }
+  tyHasTyVarBudget = tyHasTyVarBudget - 1
+  if i32ListHas(tyHasTyVarDeep, ty) { return false }
+  tyHasTyVarDeep.push(ty)
+  const r = tyHasTyVarAt(ty, depth)
+  tyHasTyVarDeep.pop()
+  if !r {
+    tyHasTyVarFree.set(ty, true)
+    tyHasTyVarFreeN = tyHasTyVarFreeN + 1
+  }
+  r
+}
+
+function tyHasTyVarAt(ty: i32, depth: i32) {
+  const t = T.tys[ty]
+  if t is TyVar { return true }
+  if t is TyArray { return tyHasTyVarGo(t.aElem, depth - 1) }
+  if t is TyNullable { return tyHasTyVarGo(t.nInner, depth - 1) }
+  if t is TyNeg { return tyHasTyVarGo(t.negTy, depth - 1) }
+  if t is TyMap {
+    if tyHasTyVarGo(t.mKey, depth - 1) { return true }
+    return tyHasTyVarGo(t.mVal, depth - 1)
+  }
+  if t is TyObj {
+    const fs = t.objFieldTypes
+    let i = 0
+    while i < fs.length {
+      if tyHasTyVarGo(fs[i], depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let k = 0
+    while k < ps.length {
+      if tyHasTyVarGo(ps[k], depth - 1) { return true }
+      k = k + 1
+    }
+    return tyHasTyVarGo(t.fnRet, depth - 1)
+  }
+  if t is TyUnion {
+    const ms = t.uMembers
+    let u = 0
+    while u < ms.length {
+      if tyHasTyVarGo(ms[u], depth - 1) { return true }
+      u = u + 1
+    }
+    return false
+  }
+  false
+}
+
+// Whether any of the members `ms` names a type parameter.
+export function luAnyTyVar(ms: i32[]): boolean {
+  let i = 0
+  while i < ms.length {
+    if tyHasTyVar(ms[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether `t` is the type parameter a rewrite gave a parameter.
+export function wsVarTy(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const v = T.tys[t]
+  if v is TyVar { return v.tvName.length > 3 && v.tvName.slice(0, 3) == "__W" }
   false
 }
