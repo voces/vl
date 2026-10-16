@@ -48,6 +48,7 @@ import {
   builtinRunsNoArg,
   callArgPlaces,
   callDeclFnIx,
+  callFnValueDecls,
   findFnDeclInRoots,
   opSiteArgs,
   opSiteDecls,
@@ -425,7 +426,22 @@ function callEffectsOnReal(cn: Call, callIx: i32, pname: string) {
   // a read-only callee from invalidating its caller's narrowings — the false positive that
   // decides whether the rule is usable at all.
   if declIx == -2 { return "" }
-  argEffectsOn(declIx, callArgPlaces(cn, callIx), pname)
+  const args = callArgPlaces(cn, callIx)
+  if declIx == -1 {
+    const ts = callFnValueDecls(cn)
+    if ts.length > 0 {
+      let acc = ""
+      let i = 0
+      while i < ts.length {
+        const sub = argEffectsOn(ts[i], args, pname)
+        if sub == "*" { return "*" }
+        acc = acc + sub
+        i = i + 1
+      }
+      return acc
+    }
+  }
+  argEffectsOn(declIx, args, pname)
 }
 
 // `callEffectsOn` for an operator site that may dispatch: each declaration it may run, handed
@@ -594,6 +610,19 @@ function callFreeEffects(callIx: i32) {
   if cn is Call {
     const d = callDeclFnIx(cn, callIx)
     if d == -2 { return "" }
+    if d == -1 {
+      const ts = callFnValueDecls(cn)
+      if ts.length == 0 { return "*" }
+      let acc = ""
+      let i = 0
+      while i < ts.length {
+        const sub = fnWriteFreePaths(ts[i])
+        if sub == "*" { return "*" }
+        acc = acc + sub
+        i = i + 1
+      }
+      return acc
+    }
     if d < 0 { return "*" }
     return fnWriteFreePaths(d)
   }
@@ -825,17 +854,25 @@ export function callWriteShapes(
     if !weIsFreshName(cf.memObj, fresh) { own = builtinMethodShape(cn, cf) }
   }
   if d >= 0 {
-    const args = callArgPlaces(cn, callIx)
-    // A call back into a summary still being computed (a recursive edge) cannot say which slot
-    // it calls, so every function value it hands on is charged.
-    if weIsOpen(i32ToStr(d) + "#shape") {
-      const cyc = fnWriteShapes(d) + weCycleArgShapes(d, args, params, bound)
-      if cyc.indexOf("*") >= 0 { return "*" }
-      return own + cyc
-    }
-    const sub = weSubstArgs(fnWriteShapes(d), args, params, bound)
+    const sub = weDeclCallShapes(d, callArgPlaces(cn, callIx), params, bound)
     if sub == "*" { return "*" }
     return own + sub
+  }
+  if d == -1 && cf is Ident {
+    // A binding whose every stored function is known runs one of them (D5017).
+    const ts = callFnValueDecls(cn)
+    if ts.length > 0 {
+      const args = callArgPlaces(cn, callIx)
+      let acc = own
+      let i = 0
+      while i < ts.length {
+        const sub = weDeclCallShapes(ts[i], args, params, bound)
+        if sub == "*" { return "*" }
+        acc = acc + sub
+        i = i + 1
+      }
+      return acc
+    }
   }
   if d == -1 {
     if cf is Member {
@@ -861,6 +898,23 @@ export function callWriteShapes(
     a = a + 1
   }
   acc
+}
+
+// The write shapes a call of the declaration `d` handed `args` contributes, or "*".
+function weDeclCallShapes(
+  d: i32,
+  args: i32[],
+  params: string[],
+  bound: string[],
+) {
+  // A call back into a summary still being computed (a recursive edge) cannot say which slot
+  // it calls, so every function value it hands on is charged.
+  if weIsOpen(i32ToStr(d) + "#shape") {
+    const cyc = fnWriteShapes(d) + weCycleArgShapes(d, args, params, bound)
+    if cyc.indexOf("*") >= 0 { return "*" }
+    return cyc
+  }
+  weSubstArgs(fnWriteShapes(d), args, params, bound)
 }
 
 // `sum` with each `@i` replaced by the write shapes of the call's argument `i` in parameter order,

@@ -29,10 +29,12 @@ import {
   RetStmt,
   Spread,
   elseIfLink,
+  hasNamedArgs,
+  i32ToStr,
   nodeSpineChildren,
 } from "./ast"
 import { sidLookup, sidOf } from "./symbols"
-import { i32ListHas } from "./listutil"
+import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { demangleName } from "./check_suggest"
 
 // —— which binding does a name mean: the frame table the write scan keys on (D1610/D1611) ——
@@ -64,6 +66,8 @@ let cwDeclSid: i32[] = []
 // always meets one.
 let cwDeclSlotFr: i32[] = []
 let cwDeclSlotSid: i32[] = []
+// How many declarations the occupied slot holds: a frame may bind one name twice (two blocks).
+let cwDeclSlotN: i32[] = []
 let cwDeclCap = 0
 // The enclosing frame of a frame, indexed by its `FuncDecl` node — the chain a name walks out
 // along. A lambda is a `FuncDecl` with an empty name, so capture needs no arm of its own.
@@ -83,6 +87,7 @@ export function cwFrameReset() {
   cwDeclSid = []
   cwDeclSlotFr = []
   cwDeclSlotSid = []
+  cwDeclSlotN = []
   cwDeclCap = 0
   cwFrameUp = Map()
   cwFramesBuilt = false
@@ -173,6 +178,10 @@ let cwIxPSlotHead: i32[] = []
 let cwIxPSlotTail: i32[] = []
 let cwIxPCap = 0
 let cwIxPUsed = 0
+// `cwFnValueTargets` memo: `"<frame>#<name>"` to its row in `cwFvSets`, or -2 while that
+// binding is being resolved, so a cycle of bindings declines.
+let cwFvSlot: {[string]: i32} = Map()
+let cwFvSets: i32[][] = []
 
 function cwIxReset() {
   cwIxHead = []
@@ -201,6 +210,8 @@ function cwIxReset() {
   cwIxWrRecv = []
   cwIxAnyWrite = 0
   cwIxBuilt = false
+  cwFvSlot = Map()
+  cwFvSets = []
   0
 }
 
@@ -631,6 +642,7 @@ function cwDeclIndex() {
   while cwDeclSlotSid.length < cap {
     cwDeclSlotSid.push(-1)
     cwDeclSlotFr.push(0)
+    cwDeclSlotN.push(0)
   }
   let i = 0
   while i < cwDeclSid.length {
@@ -638,6 +650,7 @@ function cwDeclIndex() {
     if s >= 0 && s < cwDeclSlotSid.length {
       cwDeclSlotFr[s] = cwDeclFr[i]
       cwDeclSlotSid[s] = cwDeclSid[i]
+      cwDeclSlotN[s] = cwDeclSlotN[s] + 1
     }
     i = i + 1
   }
@@ -651,6 +664,15 @@ function cwFrameDeclares(fr: i32, sid: i32): boolean {
   if s < 0 || s >= cwDeclSlotSid.length { return false }
   if cwDeclSlotSid[s] != sid { return false }
   cwDeclSlotFr[s] == fr
+}
+
+// How many declarations of `sid` frame `fr` holds, of every binder the frame walk declares.
+function cwFrameDeclCount(fr: i32, sid: i32): i32 {
+  if cwDeclCap == 0 { return 0 }
+  const s = cwDeclSlotOf(fr, sid)
+  if s < 0 || s >= cwDeclSlotSid.length { return 0 }
+  if cwDeclSlotSid[s] != sid || cwDeclSlotFr[s] != fr { return 0 }
+  cwDeclSlotN[s]
 }
 
 // The walk. Mirrors `lint.vl`'s `bindScan` arm for arm — a binder it grows and this does not
@@ -723,13 +745,22 @@ export function cwBuildFrames() {
     const n = P.nodes[at]
     if n is Program { roots.push(at) }
   }
+  // A merged root lists each module's statements again; one walk declares them once.
+  const topSeen: boolean[] = []
+  while topSeen.length < P.nodes.length { topSeen.push(false) }
   let r = 0
   while r < roots.length {
     const pn = P.nodes[roots[r]]
     if pn is Program {
       let s = 0
       while s < pn.progStmts.length {
-        cwFrameWalk(pn.progStmts[s], CW_FR_MOD)
+        const st = pn.progStmts[s]
+        if st < 0 || st >= topSeen.length {
+          cwFrameWalk(st, CW_FR_MOD)
+        } else if !topSeen[st] {
+          topSeen[st] = true
+          cwFrameWalk(st, CW_FR_MOD)
+        }
         s = s + 1
       }
     }
@@ -980,6 +1011,154 @@ export function cwBoundInitOf(nm: string, fr: i32): i32 {
     }
   }
   -1
+}
+
+// Every function a call through the binding `nm` of frame `fr` may run: its initialiser and each
+// value assigned to it, where a parameter holds what every call of its function hands it. []
+// when one of them is not a named function or a lambda, or `fr` binds `nm` by another binder.
+export function cwFnValueTargets(nm: string, fr: i32): i32[] {
+  const ts = cwFvTargetsOf(nm, fr)
+  if ts.length == 0 || ts[0] < 0 { return [] }
+  ts
+}
+
+// `cwFnValueTargets` with [-1] for a set not known, so a binding no call fills is the empty set.
+function cwFvTargetsOf(nm: string, fr: i32): i32[] {
+  if nm == "" || fr == CW_FR_UNKNOWN { return [-1] }
+  cwIxBuild()
+  const key = i32ToStr(fr) + "#" + nm
+  const s = cwFvSlot[key] ?? -1
+  if s >= 0 && s < cwFvSets.length { return cwFvSets[s] }
+  if s == -2 { return [-1] }
+  cwFvSlot[key] = -2
+  let out: i32[] = []
+  if !cwFvCollect(nm, fr, out) { out = [-1] }
+  cwFvSlot[key] = cwFvSets.length
+  cwFvSets.push(out)
+  out
+}
+
+// Add to `out` every value stored into the binding (`nm`, `fr`); false when one is unresolved
+// or the frame has a declaration of `nm` this index files no row for (a `for` variable).
+function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
+  const sid = sidLookup(nm)
+  if sid < 0 { return false }
+  let binds = 0
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    const at = cwIxNode[r]
+    const n = P.nodes[at]
+    if cwIxKind[r] == CW_OCC_BIND {
+      if cwIxFr[r] == fr { binds = binds + 1 }
+      if n is LetDecl {
+        if n.letInit >= 0 && !cwFvAddValue(n.letInit, out) { return false }
+      } else if n is Param {
+        if !cwFvAddParam(at, out) { return false }
+      } else {
+        return false
+      }
+    }
+    if cwIxKind[r] == CW_OCC_ASG {
+      if n is BinExpr {
+        // Only `nm = v` re-points the binding; a write into a part of it stores no function.
+        if P.nodes[cwPeel(n.binLeft)] is Ident {
+          if !cwFvAddValue(n.binRight, out) { return false }
+        }
+      }
+    }
+  }
+  binds > 0 && binds == cwFrameDeclCount(fr, sid)
+}
+
+// Add the functions the value expression `e` may be to `out`: a lambda, or what the name it is
+// spells may be. False for anything else.
+function cwFvAddValue(e: i32, out: i32[]): boolean {
+  const v = cwPeel(e)
+  if v < 0 || v >= P.nodes.length { return false }
+  if P.nodes[v] is FuncDecl {
+    if !i32ListHas(out, v) { out.push(v) }
+    return true
+  }
+  cwFvAddNamed(v, out)
+}
+
+// Add the functions the identifier at `v` may be to `out`: the function it declares, or every
+// function the binding it names may hold. False when `v` is not an identifier.
+function cwFvAddNamed(v: i32, out: i32[]): boolean {
+  const n = P.nodes[v]
+  if n is Ident {
+    const vf = cwFrameOfUse(v, n.identName)
+    if vf == CW_FR_UNKNOWN { return false }
+    const d = cwFnDeclOf(n.identName)
+    if d >= 0 && d < cwFrameOf.length && cwFrameOf[d] == vf {
+      if cwFrameDeclCount(vf, sidLookup(n.identName)) != 1 { return false }
+      if !i32ListHas(out, d) { out.push(d) }
+      return true
+    }
+    const ts = cwFvTargetsOf(n.identName, vf)
+    if ts.length > 0 && ts[0] < 0 { return false }
+    let i = 0
+    while i < ts.length {
+      if !i32ListHas(out, ts[i]) { out.push(ts[i]) }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Add what the parameter at `pIx` may hold: the argument every call of its named function hands
+// it, or its default where a call omits it. False when the function is reached any other way —
+// as a value, a method, through a spread or named arguments — or the parameter is a rest one.
+function cwFvAddParam(pIx: i32, out: i32[]): boolean {
+  const pn = P.nodes[pIx]
+  if !(pn is Param) { return false }
+  if pn.parRest == 1 { return false }
+  const f = cwFrameOfDecl(pIx)
+  if f < 0 || f >= P.nodes.length { return false }
+  const fd = P.nodes[f]
+  if !(fd is FuncDecl) { return false }
+  if fd.fnName == "" { return false }
+  const j = i32ListIndexOf(fd.fnParams, pIx)
+  if j < 0 { return false }
+  // A method spelling of the name may reach this function with a receiver in front.
+  let m = cwIxChain(demangleName(fd.fnName))
+  while m >= 0 {
+    if cwIxKind[m] == CW_OCC_MCALL { return false }
+    m = cwIxNext[m]
+  }
+  let r = cwIxChain(fd.fnName)
+  while r >= 0 {
+    if cwIxKind[r] == CW_OCC_USE {
+      const u = cwIxNode[r]
+      if cwIxUpKind[u] != CW_UP_CALLEE { return false }
+      const c = P.nodes[cwIxUp[u]]
+      if !(c is Call) { return false }
+      if hasNamedArgs(c.callArgNames) { return false }
+      let a = 0
+      while a < c.callArgs.length && a <= j {
+        if P.nodes[cwPeel(c.callArgs[a])] is Spread { return false }
+        a = a + 1
+      }
+      if j < c.callArgs.length {
+        if !cwFvAddValue(c.callArgs[j], out) { return false }
+      } else if pn.parDefault >= 0 {
+        if !cwFvAddValue(pn.parDefault, out) { return false }
+      } else {
+        return false
+      }
+    }
+    r = cwIxNext[r]
+  }
+  true
 }
 
 // The `FuncDecl` a callee EXPRESSION resolves to: the declared function its name binds, or
