@@ -21,6 +21,7 @@ import {
   UnionDecl,
   nodeChildren,
 } from "./ast"
+import { memoKeyNew, memoMoved } from "./memo"
 import { splitUnionAtoms } from "./tyname"
 import {
   tailPushBlockTail,
@@ -42,10 +43,13 @@ import {
   TyPrim,
   TyUnion,
   cUserTypes,
+  cUserTypesVer,
   primNameStr,
   tyIsHole,
+  tyMutEpoch,
   tyNameAtoms,
   tyToEmitName,
+  tyVarRenames,
 } from "./check_types"
 import { parenPeelIx } from "./check_places"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
@@ -511,7 +515,33 @@ function aliasDeclRowSet(name: string): string {
 // `string`/`i32` (`registry-by-type-id.md` §3 measures the gap against `repCanonId`).
 export function canonUnionKeyOfName(name: string): i32 {
   if name.length == 0 { return -1 }
+  cukIdOfText(cukTextOfName(name))
+}
+
+// The key for an annotation spelling of two or more members, else -1. A one-member spelling
+// (`"world"`, `type W = 7`) keys a one-member row, and an annotation naming no union type
+// does not denote that row's box. Mints no key for a spelling it declines.
+export function canonUnionKeyOfAnnName(name: string): i32 {
+  const text = cukTextOfName(name)
+  if (cukAtomsOfName[name] ?? 0) < 2 { return -1 }
+  cukIdOfText(text)
+}
+
+// `canonUnionKeyText(name)`, rendered once per spelling while the memo holds, and its width.
+function cukTextOfName(name: string): string {
+  cukMemoSync()
+  const hit = cukTextMemo[name]
+  if hit != null { return hit }
   const text = canonUnionKeyText(name)
+  cukTextMemo[name] = text
+  const atoms: string[] = []
+  splitUnionAtoms(text, atoms)
+  cukAtomsOfName[name] = atoms.length
+  text
+}
+
+// The id of a rendered key text, minted on first sight; -1 for "".
+function cukIdOfText(text: string): i32 {
   if text.length == 0 { return -1 }
   const at = cukIds[text] ?? -1
   if at >= 0 { return at }
@@ -521,14 +551,24 @@ export function canonUnionKeyOfName(name: string): i32 {
   id
 }
 
-// The key for an annotation spelling of two or more members, else -1. A one-member spelling
-// (`"world"`, `type W = 7`) keys a one-member row, and an annotation naming no union type
-// does not denote that row's box.
-export function canonUnionKeyOfAnnName(name: string): i32 {
-  const atoms: string[] = []
-  splitUnionAtoms(canonUnionKeyText(name), atoms)
-  if atoms.length < 2 { return -1 }
-  canonUnionKeyOfName(name)
+// A spelling's key text and its width, memoised by spelling. The render reads the alias
+// tables and the arena, so the memo holds only while none of them has been rewritten.
+let cukTextMemo: {[string]: string} = Map()
+
+let cukAtomsOfName: {[string]: i32} = Map()
+
+const cukMemoKey = memoKeyNew(4)
+
+function cukMemoSync() {
+  let moved = memoMoved(cukMemoKey, 0, tyMutEpoch)
+  moved = memoMoved(cukMemoKey, 1, cUserTypesVer) || moved
+  moved = memoMoved(cukMemoKey, 2, gRootStmts.length) || moved
+  moved = memoMoved(cukMemoKey, 3, tyVarRenames) || moved
+  if moved {
+    cukTextMemo = Map()
+    cukAtomsOfName = Map()
+  }
+  0
 }
 
 // The key for an arena type — the entry point for a producer holding a type rather than a
