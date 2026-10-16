@@ -144,7 +144,7 @@ Measure:
 Measure:
 
     kind: shell
-    cmd: awk '/^type Tok = \{/,/^\}/' compiler/lexer.vl | grep -c ':'
+    cmd: awk '/^(export )?type Tok = \{/,/^\}/' compiler/lexer.vl | grep -c ':'
     filed: 5
     tol: 0
     dir: at-most

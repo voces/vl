@@ -153,7 +153,7 @@ import {
   scopeResTok,
   scopeResType,
 } from "./check_state"
-import { TokKind, tokenize } from "./lexer"
+import { Tok as LexTok, TokKind, tokenize } from "./lexer"
 import {
   P,
   TPL_RENDER_LOCAL,
@@ -4037,248 +4037,10 @@ function modScan(m: i32, src: string): i32 {
       depth = depth - 1
       i = i + 1
     } else if k == "IMPORT" && depth == 0 {
-      // One `import { a as b, … } from "spec"`, scanned inline (a named annotation
-      // can't portably type a token param, since the lexer's token type is renamed
-      // per assembly). Records one entry per specifier (`as` honored); a specifier-
-      // less import records one entry with empty names. Ends past the path string.
-      const kwLine = toks[i].line
-      const kwCol = toks[i].col
-      i = i + 1
-      const names: string[] = []
-      const locals: string[] = []
-      const nameLines: i32[] = []
-      const nameCols: i32[] = []
-      if i < toks.length {
-        if toks[i].kind == "LBRACE" {
-          i = i + 1
-          let going = true
-          while going && i < toks.length {
-            const ck = toks[i].kind
-            if ck == "RBRACE" {
-              i = i + 1
-              going = false
-            } else {
-              if ck == "IDENT" {
-                const nm = toks[i].text
-                let loc = nm
-                nameLines.push(toks[i].line)
-                nameCols.push(toks[i].col)
-                if i + 2 < toks.length {
-                  if (
-                    toks[i + 1].kind == "IDENT"
-                    && toks[i + 1].text == "as"
-                    && toks[i + 2].kind == "IDENT"
-                  ) {
-                    loc = toks[i + 2].text
-                    i = i + 2
-                  }
-                }
-                names.push(nm)
-                locals.push(loc)
-              }
-              i = i + 1
-            }
-          }
-        }
-      }
-      // Forwards to the path string (the `from` keyword rides as an ident), then
-      // strips its surrounding quotes. Bounded exactly as `parseImport` bounds its
-      // own walk (a newline, semi, or statement-start keyword ends it) — unbounded,
-      // a mis-lexed single-quoted specifier would adopt the next string in the file.
-      let spec = ""
-      let specLine = kwLine
-      let specCol = kwCol
-      let specEnd = kwCol
-      let specChar = SPEC_ABSENT
-      let scanning = true
-      while scanning && i < toks.length {
-        const sk = toks[i].kind
-        if sk == "STRING" {
-          spec = toks[i].text
-          specLine = toks[i].line
-          specCol = toks[i].col
-          specEnd = toks[i].col + toks[i].text.length
-          specChar = SPEC_STRING
-          if spec.length >= 2 {
-            if spec[0] == '"' && spec[spec.length - 1] == '"' {
-              spec = spec.slice(1, spec.length - 1)
-            }
-          }
-          i = i + 1
-          scanning = false
-        } else if sk == "CHAR" {
-          // A char literal in the specifier slot. Recorded, not skipped: it is not
-          // a resolvable key, and the reader needs to be told THAT rather than
-          // that the import has no specifier at all. `spec` carries the RAW
-          // lexeme, which is what `importSpecCharMsg` re-quotes.
-          spec = toks[i].text
-          specLine = toks[i].line
-          specCol = toks[i].col
-          specEnd = toks[i].col + toks[i].text.length
-          specChar = SPEC_CHAR
-          i = i + 1
-          scanning = false
-        } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
-          scanning = false
-        } else if isStmtKeyword(sk) {
-          scanning = false
-        } else {
-          i = i + 1
-        }
-      }
-      let key = ""
-      if specChar == SPEC_STRING { key = modResolveSpecifier(spec, modKeys[m]) }
-      let n = 0
-      while n < names.length {
-        impMod.push(m)
-        impSpec.push(spec)
-        impKey.push(key)
-        impName.push(names[n])
-        impLocal.push(locals[n])
-        impNameLine.push(nameLines[n])
-        impNameCol.push(nameCols[n])
-        impSpecLine.push(specLine)
-        impSpecCol.push(specCol)
-        impSpecEnd.push(specEnd)
-        impSpecChar.push(specChar)
-        n = n + 1
-      }
-      if names.length == 0 {
-        impMod.push(m)
-        impSpec.push(spec)
-        impKey.push(key)
-        impName.push("")
-        impLocal.push("")
-        impNameLine.push(kwLine)
-        impNameCol.push(kwCol)
-        impSpecLine.push(specLine)
-        impSpecCol.push(specCol)
-        impSpecEnd.push(specEnd)
-        impSpecChar.push(specChar)
-      }
+      i = modScanImport(m, toks, i)
     } else if k == "EXPORT" && depth == 0 {
       if i + 1 < toks.length && toks[i + 1].kind == "LBRACE" {
-        // A RE-EXPORT `export { a, b as c } from "spec"`: scanned like an import's
-        // name list, but each entry is ALSO recorded as a public re-export. The local
-        // binding (`as` alias, else the name) is what the import created; the public
-        // name is the same alias. Cursor advances past the trailing path STRING.
-        const rkwLine = toks[i].line
-        const rkwCol = toks[i].col
-        i = i + 2 // past EXPORT and LBRACE
-        const rnames: string[] = []
-        const rlocals: string[] = []
-        const rnameLines: i32[] = []
-        const rnameCols: i32[] = []
-        // The PUBLIC token's own span (the `as` alias when there is one), which the
-        // editor surface underlines. Separate from `rnameLines`/`rnameCols` — those
-        // anchor the import row, whose name is the SOURCE half of an alias.
-        const rpubLines: i32[] = []
-        const rpubCols: i32[] = []
-        let rgoing = true
-        while rgoing && i < toks.length {
-          const ck = toks[i].kind
-          if ck == "RBRACE" {
-            i = i + 1
-            rgoing = false
-          } else {
-            if ck == "IDENT" {
-              const nm = toks[i].text
-              let loc = nm
-              rnameLines.push(toks[i].line)
-              rnameCols.push(toks[i].col)
-              let pubLine = toks[i].line
-              let pubCol = toks[i].col
-              if i + 2 < toks.length {
-                if (
-                  toks[i + 1].kind == "IDENT"
-                  && toks[i + 1].text == "as"
-                  && toks[i + 2].kind == "IDENT"
-                ) {
-                  loc = toks[i + 2].text
-                  pubLine = toks[i + 2].line
-                  pubCol = toks[i + 2].col
-                  i = i + 2
-                }
-              }
-              rpubLines.push(pubLine)
-              rpubCols.push(pubCol)
-              rnames.push(nm)
-              rlocals.push(loc)
-            }
-            i = i + 1
-          }
-        }
-        // BOUNDED and CHAR-aware for the same reasons the import arm above is —
-        // `export { a } from 'dep'` stole the next string literal too.
-        let rspec = ""
-        let rspecLine = rkwLine
-        let rspecCol = rkwCol
-        let rspecEnd = rkwCol
-        let rspecChar = SPEC_NO_FROM
-        let rscan = true
-        while rscan && i < toks.length {
-          const sk = toks[i].kind
-          if sk == "STRING" {
-            rspec = toks[i].text
-            rspecLine = toks[i].line
-            rspecCol = toks[i].col
-            rspecEnd = toks[i].col + toks[i].text.length
-            rspecChar = SPEC_STRING
-            if rspec.length >= 2 {
-              if rspec[0] == '"' && rspec[rspec.length - 1] == '"' {
-                rspec = rspec.slice(1, rspec.length - 1)
-              }
-            }
-            i = i + 1
-            rscan = false
-          } else if sk == "CHAR" {
-            rspec = toks[i].text
-            rspecLine = toks[i].line
-            rspecCol = toks[i].col
-            rspecEnd = toks[i].col + toks[i].text.length
-            rspecChar = SPEC_CHAR
-            i = i + 1
-            rscan = false
-          } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
-            rscan = false
-          } else if isStmtKeyword(sk) {
-            rscan = false
-          } else {
-            if sk == "IDENT" && toks[i].text == "from" {
-              rspecChar = SPEC_ABSENT
-            }
-            i = i + 1
-          }
-        }
-        let rkey = ""
-        if rspecChar == SPEC_STRING {
-          rkey = modResolveSpecifier(rspec, modKeys[m])
-        }
-        let rn = 0
-        while rn < rnames.length {
-          // Pull the symbol (an import edge) so the merge binds it and the host fetches `spec`.
-          impMod.push(m)
-          impSpec.push(rspec)
-          impKey.push(rkey)
-          impName.push(rnames[rn])
-          impLocal.push(rlocals[rn])
-          impNameLine.push(rnameLines[rn])
-          impNameCol.push(rnameCols[rn])
-          impSpecLine.push(rspecLine)
-          impSpecCol.push(rspecCol)
-          impSpecEnd.push(rspecEnd)
-          impSpecChar.push(rspecChar)
-          // Record the PUBLIC re-export (its merged target is resolved in `modCompile`).
-          reExpMod.push(m)
-          reExpPublic.push(rlocals[rn])
-          reExpLocal.push(rlocals[rn])
-          reExpNameLine.push(rpubLines[rn])
-          reExpNameCol.push(rpubCols[rn])
-          reExpKwLine.push(rkwLine)
-          reExpKwCol.push(rkwCol)
-          reExpKey.push(rkey)
-          rn = rn + 1
-        }
+        i = modScanReExport(m, toks, i)
       } else if i + 2 < toks.length {
         // `export flat type N = { … }` puts a contextual keyword between `export`
         // and the declaration keyword, so the declared name is one token further
@@ -4329,6 +4091,251 @@ function modScan(m: i32, src: string): i32 {
   }
   0
 }
+
+// `modScan`'s import arm, from the `import` keyword at `kw`: one `import { a as b, … } from
+// "spec"` row per specifier (`as` honored), or one row with empty names for a specifier-less
+// import. Returns the token index past the path string.
+function modScanImport(m: i32, toks: LexTok[], kw: i32): i32 {
+  let i = kw
+  const kwLine = toks[i].line
+  const kwCol = toks[i].col
+  i = i + 1
+  const names: string[] = []
+  const locals: string[] = []
+  const nameLines: i32[] = []
+  const nameCols: i32[] = []
+  if i < toks.length {
+    if toks[i].kind == "LBRACE" {
+      i = i + 1
+      let going = true
+      while going && i < toks.length {
+        const ck = toks[i].kind
+        if ck == "RBRACE" {
+          i = i + 1
+          going = false
+        } else {
+          if ck == "IDENT" {
+            const nm = toks[i].text
+            let loc = nm
+            nameLines.push(toks[i].line)
+            nameCols.push(toks[i].col)
+            if i + 2 < toks.length {
+              if (
+                toks[i + 1].kind == "IDENT"
+                && toks[i + 1].text == "as"
+                && toks[i + 2].kind == "IDENT"
+              ) {
+                loc = toks[i + 2].text
+                i = i + 2
+              }
+            }
+            names.push(nm)
+            locals.push(loc)
+          }
+          i = i + 1
+        }
+      }
+    }
+  }
+  // Forwards to the path string (the `from` keyword rides as an ident), then
+  // strips its surrounding quotes. Bounded exactly as `parseImport` bounds its
+  // own walk (a newline, semi, or statement-start keyword ends it) — unbounded,
+  // a mis-lexed single-quoted specifier would adopt the next string in the file.
+  let spec = ""
+  let specLine = kwLine
+  let specCol = kwCol
+  let specEnd = kwCol
+  let specChar = SPEC_ABSENT
+  let scanning = true
+  while scanning && i < toks.length {
+    const sk = toks[i].kind
+    if sk == "STRING" {
+      spec = toks[i].text
+      specLine = toks[i].line
+      specCol = toks[i].col
+      specEnd = toks[i].col + toks[i].text.length
+      specChar = SPEC_STRING
+      if spec.length >= 2 {
+        if spec[0] == '"' && spec[spec.length - 1] == '"' {
+          spec = spec.slice(1, spec.length - 1)
+        }
+      }
+      i = i + 1
+      scanning = false
+    } else if sk == "CHAR" {
+      // A char literal in the specifier slot. Recorded, not skipped: it is not
+      // a resolvable key, and the reader needs to be told THAT rather than
+      // that the import has no specifier at all. `spec` carries the RAW
+      // lexeme, which is what `importSpecCharMsg` re-quotes.
+      spec = toks[i].text
+      specLine = toks[i].line
+      specCol = toks[i].col
+      specEnd = toks[i].col + toks[i].text.length
+      specChar = SPEC_CHAR
+      i = i + 1
+      scanning = false
+    } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
+      scanning = false
+    } else if isStmtKeyword(sk) {
+      scanning = false
+    } else {
+      i = i + 1
+    }
+  }
+  let key = ""
+  if specChar == SPEC_STRING { key = modResolveSpecifier(spec, modKeys[m]) }
+  let n = 0
+  while n < names.length {
+    impMod.push(m)
+    impSpec.push(spec)
+    impKey.push(key)
+    impName.push(names[n])
+    impLocal.push(locals[n])
+    impNameLine.push(nameLines[n])
+    impNameCol.push(nameCols[n])
+    impSpecLine.push(specLine)
+    impSpecCol.push(specCol)
+    impSpecEnd.push(specEnd)
+    impSpecChar.push(specChar)
+    n = n + 1
+  }
+  if names.length == 0 {
+    impMod.push(m)
+    impSpec.push(spec)
+    impKey.push(key)
+    impName.push("")
+    impLocal.push("")
+    impNameLine.push(kwLine)
+    impNameCol.push(kwCol)
+    impSpecLine.push(specLine)
+    impSpecCol.push(specCol)
+    impSpecEnd.push(specEnd)
+    impSpecChar.push(specChar)
+  }
+  i
+}
+
+// `modScan`'s re-export arm, from the `export` before `{` at `kw`: scanned like an import's
+// name list, and each entry is also recorded as a public re-export under its local binding
+// (the `as` alias, else the name). Returns the token index past the path string.
+function modScanReExport(m: i32, toks: LexTok[], kw: i32): i32 {
+  let i = kw
+  const rkwLine = toks[i].line
+  const rkwCol = toks[i].col
+  i = i + 2 // past EXPORT and LBRACE
+  const rnames: string[] = []
+  const rlocals: string[] = []
+  const rnameLines: i32[] = []
+  const rnameCols: i32[] = []
+  // The PUBLIC token's own span (the `as` alias when there is one), which the
+  // editor surface underlines. Separate from `rnameLines`/`rnameCols` — those
+  // anchor the import row, whose name is the SOURCE half of an alias.
+  const rpubLines: i32[] = []
+  const rpubCols: i32[] = []
+  let rgoing = true
+  while rgoing && i < toks.length {
+    const ck = toks[i].kind
+    if ck == "RBRACE" {
+      i = i + 1
+      rgoing = false
+    } else {
+      if ck == "IDENT" {
+        const nm = toks[i].text
+        let loc = nm
+        rnameLines.push(toks[i].line)
+        rnameCols.push(toks[i].col)
+        let pubLine = toks[i].line
+        let pubCol = toks[i].col
+        if i + 2 < toks.length {
+          if (
+            toks[i + 1].kind == "IDENT"
+            && toks[i + 1].text == "as"
+            && toks[i + 2].kind == "IDENT"
+          ) {
+            loc = toks[i + 2].text
+            pubLine = toks[i + 2].line
+            pubCol = toks[i + 2].col
+            i = i + 2
+          }
+        }
+        rpubLines.push(pubLine)
+        rpubCols.push(pubCol)
+        rnames.push(nm)
+        rlocals.push(loc)
+      }
+      i = i + 1
+    }
+  }
+  // BOUNDED and CHAR-aware for the same reasons the import arm above is —
+  // `export { a } from 'dep'` stole the next string literal too.
+  let rspec = ""
+  let rspecLine = rkwLine
+  let rspecCol = rkwCol
+  let rspecEnd = rkwCol
+  let rspecChar = SPEC_NO_FROM
+  let rscan = true
+  while rscan && i < toks.length {
+    const sk = toks[i].kind
+    if sk == "STRING" {
+      rspec = toks[i].text
+      rspecLine = toks[i].line
+      rspecCol = toks[i].col
+      rspecEnd = toks[i].col + toks[i].text.length
+      rspecChar = SPEC_STRING
+      if rspec.length >= 2 {
+        if rspec[0] == '"' && rspec[rspec.length - 1] == '"' {
+          rspec = rspec.slice(1, rspec.length - 1)
+        }
+      }
+      i = i + 1
+      rscan = false
+    } else if sk == "CHAR" {
+      rspec = toks[i].text
+      rspecLine = toks[i].line
+      rspecCol = toks[i].col
+      rspecEnd = toks[i].col + toks[i].text.length
+      rspecChar = SPEC_CHAR
+      i = i + 1
+      rscan = false
+    } else if sk == "EOF" || sk == "NEWLINE" || sk == "SEMI" {
+      rscan = false
+    } else if isStmtKeyword(sk) {
+      rscan = false
+    } else {
+      if sk == "IDENT" && toks[i].text == "from" { rspecChar = SPEC_ABSENT }
+      i = i + 1
+    }
+  }
+  let rkey = ""
+  if rspecChar == SPEC_STRING { rkey = modResolveSpecifier(rspec, modKeys[m]) }
+  let rn = 0
+  while rn < rnames.length {
+    // Pull the symbol (an import edge) so the merge binds it and the host fetches `spec`.
+    impMod.push(m)
+    impSpec.push(rspec)
+    impKey.push(rkey)
+    impName.push(rnames[rn])
+    impLocal.push(rlocals[rn])
+    impNameLine.push(rnameLines[rn])
+    impNameCol.push(rnameCols[rn])
+    impSpecLine.push(rspecLine)
+    impSpecCol.push(rspecCol)
+    impSpecEnd.push(rspecEnd)
+    impSpecChar.push(rspecChar)
+    // Record the PUBLIC re-export (its merged target is resolved in `modCompile`).
+    reExpMod.push(m)
+    reExpPublic.push(rlocals[rn])
+    reExpLocal.push(rlocals[rn])
+    reExpNameLine.push(rpubLines[rn])
+    reExpNameCol.push(rpubCols[rn])
+    reExpKwLine.push(rkwLine)
+    reExpKwCol.push(rkwCol)
+    reExpKey.push(rkey)
+    rn = rn + 1
+  }
+  i
+}
+
 // ── where a template hole's renderer comes from ───────────────────────────────
 // A template binds absolutely: `` `n=${x}` `` means the same thing in every file
 // regardless of what it imports, so the renderer is named here and never looked

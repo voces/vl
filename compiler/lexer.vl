@@ -115,7 +115,7 @@ type Diag = {
 // and backslashes kept for a `STRING` or `CHAR`), `start` the char offset of its first
 // char, and `line`/`col` the 1-based line and 0-based column. A literal's escapes are
 // not resolved here: `decodeStr` (`emit_base.vl`) is the one decoder, working from `text`.
-type Tok = {
+export type Tok = {
   kind: TokKind,
   text: string,
   start: i32,
@@ -797,28 +797,7 @@ export function tplPartStrLex(raw: string): string {
 // diagnostics. Whitespace is skipped, NEWLINE is emitted as a real token, and `//` / `///`
 // comments are retained as trivia in `gComments` rather than emitted into the stream.
 export function tokenize(source: string): LexResult {
-  // Reset the module-global scanner state for this run.
-  gSrc = source
-  lexInternReset(source.length)
-  gPos = 0
-  gLine = 1
-  gCol = 0
-  const fresh: Diag[] = []
-  gDiags = fresh
-  const freshC: Comment[] = []
-  gComments = freshC
-  gTplStop = 0
-  const freshTL: i32[] = []
-  gTplOpenLine = freshTL
-  const freshTC: i32[] = []
-  gTplOpenCol = freshTC
-  const freshTP: i32[] = []
-  gTplOpenPos = freshTP
-  const freshTB: i32[] = []
-  gTplBrace = freshTB
-  const freshTQ: i32[] = []
-  gTplQuote = freshTQ
-  gBrace = 0
+  lexReset(source)
 
   const toks: Tok[] = []
 
@@ -852,23 +831,7 @@ export function tokenize(source: string): LexResult {
     // is untouched). A doc comment is `///`; a comment is `trailing` when the
     // last emitted token sits on this same source line (`let x = 1 // c`).
     if c == '/' && peek2() == '/' {
-      const isDoc = peekN(2) == '/'
-      while gPos < gSrc.length && peek() != '\n' && peek() != '\r' { advance() }
-      let isTrailing = false
-      if toks.length > 0 {
-        const lt = toks[toks.length - 1]
-        if lt.kind != "NEWLINE" && lt.line == startLine { isTrailing = true }
-      }
-      gComments.push(
-        {
-          doc: isDoc,
-          text: gSrc.slice(startPos, gPos),
-          start: startPos,
-          line: startLine,
-          col: startCol,
-          trailing: isTrailing,
-        },
-      )
+      lexComment(toks, startPos, startLine, startCol)
       continue
     }
 
@@ -887,107 +850,14 @@ export function tokenize(source: string): LexResult {
     // a digit follows the dot, so `a.5` and `p.x` keep `.` as a separate DOT. The token's
     // `text` is the raw lexeme; the base is folded at value time in `parseI32`.
     if isDigit(c) {
-      // Base-prefixed integer: `0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal.
-      // The prefix is recognized regardless of what follows, so a malformed
-      // literal (`0x`, `0xG`, `0x_FF`) becomes one clear lex error via `scanRadix`
-      // instead of silently splitting into `0` + an identifier.
-      if c == '0' && (peek2() == 'x' || peek2() == 'X') {
-        advance() // '0'
-        advance() // 'x' / 'X'
-        scanRadix(16, "hex", 'x')
-        toks.push(mkTok("NUMBER", startPos, startLine, startCol))
-        continue
-      }
-      if c == '0' && (peek2() == 'b' || peek2() == 'B') {
-        advance() // '0'
-        advance() // 'b' / 'B'
-        scanRadix(2, "binary", 'b')
-        toks.push(mkTok("NUMBER", startPos, startLine, startCol))
-        continue
-      }
-      if c == '0' && (peek2() == 'o' || peek2() == 'O') {
-        advance() // '0'
-        advance() // 'o' / 'O'
-        scanRadix(8, "octal", 'o')
-        toks.push(mkTok("NUMBER", startPos, startLine, startCol))
-        continue
-      }
-      // Plain decimal, optional fractional part. A `_` separator is legal only
-      // between digits (consumed when a digit follows).
-      while (
-        gPos < gSrc.length
-        && (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
-      ) {
-        advance()
-      }
-      if peek() == '.' && isDigit(peek2()) {
-        advance()
-        while (
-          gPos < gSrc.length
-          && (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
-        ) {
-          advance()
-        }
-      }
-      // Scientific notation: `e`/`E`, an optional sign, then a decimal digit run with the
-      // same `_`-between-digits rule. Only the decimal arm reaches here, so the `e` of
-      // `0x1e5` is a hex digit. Taken eagerly — once an `e` follows the mantissa the
-      // literal is committed — so `1e` and `1e+` report at the literal, with no cascade.
-      let expBad = false
-      if peek() == 'e' || peek() == 'E' {
-        advance() // 'e' / 'E'
-        if peek() == '+' || peek() == '-' { advance() }
-        // The bool goes through a local first — the shape `scanRadix`'s header
-        // records for every `if` over a boolean call in this file.
-        const eDigit = isDigit(peek())
-        if eDigit {
-          while (
-            gPos < gSrc.length
-            && (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
-          ) {
-            advance()
-          }
-        } else {
-          diag("float exponent has no digits after `e`")
-          expBad = true
-          while gPos < gSrc.length && isIdPart(peek()) { advance() }
-        }
-      }
-      // A misplaced separator (doubled `1__0`, trailing `1_`, `1e5_`) — a `_` left
-      // here sits at the start, end, or against another `_`, never between digits.
-      // Skipped when the exponent already reported: its recovery ate the id run, so
-      // a `_` here would be a second diagnostic for one broken literal.
-      if !expBad && peek() == '_' {
-        diag("`_` may only separate digits in a numeric literal")
-        while gPos < gSrc.length && isIdPart(peek()) { advance() }
-      }
+      lexNumber(c)
       toks.push(mkTok("NUMBER", startPos, startLine, startCol))
       continue
     }
 
     // Char literal `'...'`.
     if c == '\'' {
-      // A char literal must decode to exactly one code point; empty `''` or multi-char
-      // `'ab'` is an error, and a CHAR token is still emitted to recover. `scanQuoted`
-      // counts code points, not bytes — a byte count would reject `'é'` as
-      // multi-character — and is rep-stable, which the bootstrap ladder needs.
-      const cpn = scanQuoted('\'')
-      if cpn != 1 {
-        // Span the whole literal, opening quote through closing quote: the scanner sits
-        // one past it, so `startCol` is the open quote and `gCol` the exclusive end. The
-        // offence is the literal's length, so a one-column caret would point at the one
-        // character that is not the problem.
-        if cpn == 0 {
-          diagSpan("Empty char literal", startLine, startCol, gCol)
-        } else {
-          diagSpan(
-            "Char literal must contain exactly one character",
-            startLine,
-            startCol,
-            gCol,
-          )
-        }
-      }
+      lexCharLit(startLine, startCol)
       toks.push(mkTok("CHAR", startPos, startLine, startCol))
       continue
     }
@@ -1136,6 +1006,152 @@ export function tokenize(source: string): LexResult {
 
   toks.push(mkTok("EOF", gPos, gLine, gCol))
   { tokens: toks, diags: gDiags, comments: gComments }
+}
+
+// Resets the module-global scanner state for a `tokenize` run over `source`.
+function lexReset(source: string) {
+  gSrc = source
+  lexInternReset(source.length)
+  gPos = 0
+  gLine = 1
+  gCol = 0
+  const fresh: Diag[] = []
+  gDiags = fresh
+  const freshC: Comment[] = []
+  gComments = freshC
+  gTplStop = 0
+  const freshTL: i32[] = []
+  gTplOpenLine = freshTL
+  const freshTC: i32[] = []
+  gTplOpenCol = freshTC
+  const freshTP: i32[] = []
+  gTplOpenPos = freshTP
+  const freshTB: i32[] = []
+  gTplBrace = freshTB
+  const freshTQ: i32[] = []
+  gTplQuote = freshTQ
+  gBrace = 0
+}
+
+// `tokenize`'s comment arm, at the `//` that starts at `startPos`: consumes up to the
+// newline and records the comment in `gComments`, `trailing` when the last token in `toks`
+// sits on the same source line.
+function lexComment(toks: Tok[], startPos: i32, startLine: i32, startCol: i32) {
+  const isDoc = peekN(2) == '/'
+  while gPos < gSrc.length && peek() != '\n' && peek() != '\r' { advance() }
+  let isTrailing = false
+  if toks.length > 0 {
+    const lt = toks[toks.length - 1]
+    if lt.kind != "NEWLINE" && lt.line == startLine { isTrailing = true }
+  }
+  gComments.push(
+    {
+      doc: isDoc,
+      text: gSrc.slice(startPos, gPos),
+      start: startPos,
+      line: startLine,
+      col: startCol,
+      trailing: isTrailing,
+    },
+  )
+}
+
+// `tokenize`'s number arm, at the digit `c`: consumes a hex, binary, octal or decimal
+// literal, reporting a malformed one, and leaves the token to the caller.
+function lexNumber(c: i32) {
+  // Base-prefixed integer: `0x`/`0X` hex, `0b`/`0B` binary, `0o`/`0O` octal.
+  // The prefix is recognized regardless of what follows, so a malformed
+  // literal (`0x`, `0xG`, `0x_FF`) becomes one clear lex error via `scanRadix`
+  // instead of silently splitting into `0` + an identifier.
+  if c == '0' && (peek2() == 'x' || peek2() == 'X') {
+    advance() // '0'
+    advance() // 'x' / 'X'
+    scanRadix(16, "hex", 'x')
+  } else if c == '0' && (peek2() == 'b' || peek2() == 'B') {
+    advance() // '0'
+    advance() // 'b' / 'B'
+    scanRadix(2, "binary", 'b')
+  } else if c == '0' && (peek2() == 'o' || peek2() == 'O') {
+    advance() // '0'
+    advance() // 'o' / 'O'
+    scanRadix(8, "octal", 'o')
+  } else {
+    // Plain decimal, optional fractional part. A `_` separator is legal only
+    // between digits (consumed when a digit follows).
+    while (
+      gPos < gSrc.length
+      && (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
+    ) {
+      advance()
+    }
+    if peek() == '.' && isDigit(peek2()) {
+      advance()
+      while (
+        gPos < gSrc.length
+        && (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
+      ) {
+        advance()
+      }
+    }
+    // Scientific notation: `e`/`E`, an optional sign, then a decimal digit run with the
+    // same `_`-between-digits rule. Only the decimal arm reaches here, so the `e` of
+    // `0x1e5` is a hex digit. Taken eagerly — once an `e` follows the mantissa the
+    // literal is committed — so `1e` and `1e+` report at the literal, with no cascade.
+    let expBad = false
+    if peek() == 'e' || peek() == 'E' {
+      advance() // 'e' / 'E'
+      if peek() == '+' || peek() == '-' { advance() }
+      // The bool goes through a local first — the shape `scanRadix`'s header
+      // records for every `if` over a boolean call in this file.
+      const eDigit = isDigit(peek())
+      if eDigit {
+        while (
+          gPos < gSrc.length
+          && (isDigit(peek()) || (peek() == '_' && isDigit(peek2())))
+        ) {
+          advance()
+        }
+      } else {
+        diag("float exponent has no digits after `e`")
+        expBad = true
+        while gPos < gSrc.length && isIdPart(peek()) { advance() }
+      }
+    }
+    // A misplaced separator (doubled `1__0`, trailing `1_`, `1e5_`) — a `_` left
+    // here sits at the start, end, or against another `_`, never between digits.
+    // Skipped when the exponent already reported: its recovery ate the id run, so
+    // a `_` here would be a second diagnostic for one broken literal.
+    if !expBad && peek() == '_' {
+      diag("`_` may only separate digits in a numeric literal")
+      while gPos < gSrc.length && isIdPart(peek()) { advance() }
+    }
+  }
+}
+
+// `tokenize`'s char-literal arm, at the `'` at `startLine`/`startCol`: consumes the literal
+// and reports one that is not exactly one code point, spanning the whole literal.
+function lexCharLit(startLine: i32, startCol: i32) {
+  // A char literal must decode to exactly one code point; empty `''` or multi-char
+  // `'ab'` is an error, and a CHAR token is still emitted to recover. `scanQuoted`
+  // counts code points, not bytes — a byte count would reject `'é'` as
+  // multi-character — and is rep-stable, which the bootstrap ladder needs.
+  const cpn = scanQuoted('\'')
+  if cpn != 1 {
+    // Span the whole literal, opening quote through closing quote: the scanner sits
+    // one past it, so `startCol` is the open quote and `gCol` the exclusive end. The
+    // offence is the literal's length, so a one-column caret would point at the one
+    // character that is not the problem.
+    if cpn == 0 {
+      diagSpan("Empty char literal", startLine, startCol, gCol)
+    } else {
+      diagSpan(
+        "Char literal must contain exactly one character",
+        startLine,
+        startCol,
+        gCol,
+      )
+    }
+  }
 }
 
 // The 0-based exclusive end column of the source line the character at offset `pos`

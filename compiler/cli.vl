@@ -1421,54 +1421,7 @@ function cliCheckCurFileRest() {
   }
   // Error-tier diagnostics — capture them now, straight from the driver stores, before
   // `lintSrc` re-parses the entry source and resets those stores.
-  cliClearDiags()
-  cliImpItem = []
-  cliImpSpec = []
-  cliImpClash = []
-  cliImpMethod = []
-  cliZbLine = []
-  cliZbCol = []
-  cliZbEndLine = []
-  cliZbEndCol = []
-  cliRcLine = []
-  cliRcCol = []
-  cliRcEndLine = []
-  cliRcEndCol = []
-  cliRcKeep = []
-  cliRcWhat = []
-  cliGbLine = []
-  cliGbCol = []
-  cliGbAnnot = []
-  cliNoLine = []
-  cliNoCol = []
-  cliNoName = []
-  const n = diagCount()
-  let i = 0
-  while i < n {
-    // Capture the owning module and the producing stage before `lintSrc` resets
-    // `P.toks` / `nodeToks`, which `diagModule` and `diagStage` resolve through.
-    // Single-file mode is module 0, the entry.
-    cliAddDiagSpan(
-      "error",
-      diagStage(i),
-      "",
-      diagLine(i),
-      diagCol(i),
-      diagEndLine(i),
-      diagEndCol(i),
-      vcDiagMsg(i),
-      diagModule(i),
-    )
-    if cliFix != 0 && diagModule(i) == 0 {
-      cliNoteImportFix(i)
-      cliNoteZeroBytesFix(i)
-      cliNoteGenBindFix(i)
-      cliNoteCastFix(i)
-      cliNoteStrictEqFix(i)
-      cliNoteNamedOrderFix(i)
-    }
-    i = i + 1
-  }
+  cliCaptureErrorDiags()
   // The engine rejected the module this file emitted. Positioned: the emitter banks
   // each function body's module byte range, so the offset the validator names maps back
   // to the function owning those bytes; an unmapped offset keeps the positionless form.
@@ -1546,6 +1499,134 @@ function cliCheckCurFileRest() {
   }
 
   // ── report ──────────────────────────────────────────────────────────────────
+  cliAddReportStreams()
+
+  cliSrcLines = cliSplitLines(cliEntrySrc)
+  if cliBudget != 0 {
+    cliBudgetCollect()
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFile()
+  }
+  const thr = cliSevRank(cliSeverity)
+  let disp = 0
+  if cliSeverityGiven != 0 { disp = thr }
+  // Where this file's contribution to the running tally and to the JSON array begins —
+  // the two things a `--batch` record is a slice of.
+  const gateBase = cliGating
+  const jsonBase = cliJsonItems.length
+  // Fold this file's counts into the running tally (gating + error/warning).
+  let gi = 0
+  while gi < dgSev.length {
+    // A withheld diagnostic counts nowhere — not in the tally, not in the gate: a
+    // warning in an import must not fail the build of the file that imports it. The
+    // hidden count takes only what the display floor would have shown.
+    const why = cliDiagWithheld(gi)
+    const warn = dgSev[gi] == "warning"
+    const shownAt = cliSevRank(dgSev[gi]) >= disp
+    match why {
+      "shown" => {
+        if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
+        if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
+        if warn { cliWarnings = cliWarnings + 1 }
+      }
+      "std" => {
+        if shownAt { cliStdHidden = cliStdHidden + 1 }
+        if shownAt && warn { cliStdHiddenWarn = cliStdHiddenWarn + 1 }
+      }
+      "import" => {
+        if shownAt { cliImpHidden = cliImpHidden + 1 }
+        if shownAt && warn { cliImpHiddenWarn = cliImpHiddenWarn + 1 }
+      }
+      "exclude" => {}
+    }
+    gi = gi + 1
+  }
+  // Display: those at or above the floor, stable-sorted by position, appended.
+  const order: i32[] = []
+  let oj = 0
+  while oj < dgSev.length {
+    if cliSevRank(dgSev[oj]) >= disp && cliDiagWithheld(oj) == "shown" {
+      order.push(oj)
+    }
+    oj = oj + 1
+  }
+  cliStableSort(order)
+  let os = 0
+  while os < order.length {
+    if cliJson != 0 { cliJsonItems.push(cliFmtJson(order[os])) }
+    else if cliConcise != 0 { cliOut.push(cliFmtConcise(order[os])) }
+    else { cliOut.push(cliFmtPretty(order[os])) }
+    os = os + 1
+  }
+  // `--batch --json`: this file's own verdict, sliced out of what it just appended.
+  if cliBatch != 0 && cliJson != 0 {
+    let fexit: CliExit = EXIT_OK
+    if cliGating > gateBase { fexit = EXIT_FAILED }
+    if cliFileInvalid != 0 { fexit = EXIT_COMPILER_BUG }
+    cliBatchRecord(cliCurFile, fexit, jsonBase)
+  }
+  // This file is done (reported); advance to the next.
+  cliFileIdx = cliFileIdx + 1
+  cliStartFile()
+}
+
+// `cliCheckCurFileRest`'s error tier: resets the per-file diagnostic and `--fix` note
+// columns, then adds every driver diagnostic as an `error`, noting the entry module's
+// fixable ones when `--fix` is on.
+function cliCaptureErrorDiags() {
+  cliClearDiags()
+  cliImpItem = []
+  cliImpSpec = []
+  cliImpClash = []
+  cliImpMethod = []
+  cliZbLine = []
+  cliZbCol = []
+  cliZbEndLine = []
+  cliZbEndCol = []
+  cliRcLine = []
+  cliRcCol = []
+  cliRcEndLine = []
+  cliRcEndCol = []
+  cliRcKeep = []
+  cliRcWhat = []
+  cliGbLine = []
+  cliGbCol = []
+  cliGbAnnot = []
+  cliNoLine = []
+  cliNoCol = []
+  cliNoName = []
+  const n = diagCount()
+  let i = 0
+  while i < n {
+    // Capture the owning module and the producing stage before `lintSrc` resets
+    // `P.toks` / `nodeToks`, which `diagModule` and `diagStage` resolve through.
+    // Single-file mode is module 0, the entry.
+    cliAddDiagSpan(
+      "error",
+      diagStage(i),
+      "",
+      diagLine(i),
+      diagCol(i),
+      diagEndLine(i),
+      diagEndCol(i),
+      vcDiagMsg(i),
+      diagModule(i),
+    )
+    if cliFix != 0 && diagModule(i) == 0 {
+      cliNoteImportFix(i)
+      cliNoteZeroBytesFix(i)
+      cliNoteGenBindFix(i)
+      cliNoteCastFix(i)
+      cliNoteStrictEqFix(i)
+      cliNoteNamedOrderFix(i)
+    }
+    i = i + 1
+  }
+}
+
+// `cliCheckCurFileRest`'s report streams after the lint run: the lint findings, the sites
+// `--fix` declined, and the checker's entry-module hints and warnings.
+function cliAddReportStreams() {
   // Lint-tier diagnostics (from the lint run above; read the stored count).
   // Module-aware: a graph lint's finding carries the owning module's index, so the
   // report labels it, and draws its caret context, against that file.
@@ -1664,74 +1745,6 @@ function cliCheckCurFileRest() {
     }
     vi = vi + 1
   }
-
-  cliSrcLines = cliSplitLines(cliEntrySrc)
-  if cliBudget != 0 {
-    cliBudgetCollect()
-    cliFileIdx = cliFileIdx + 1
-    return cliStartFile()
-  }
-  const thr = cliSevRank(cliSeverity)
-  let disp = 0
-  if cliSeverityGiven != 0 { disp = thr }
-  // Where this file's contribution to the running tally and to the JSON array begins —
-  // the two things a `--batch` record is a slice of.
-  const gateBase = cliGating
-  const jsonBase = cliJsonItems.length
-  // Fold this file's counts into the running tally (gating + error/warning).
-  let gi = 0
-  while gi < dgSev.length {
-    // A withheld diagnostic counts nowhere — not in the tally, not in the gate: a
-    // warning in an import must not fail the build of the file that imports it. The
-    // hidden count takes only what the display floor would have shown.
-    const why = cliDiagWithheld(gi)
-    const warn = dgSev[gi] == "warning"
-    const shownAt = cliSevRank(dgSev[gi]) >= disp
-    match why {
-      "shown" => {
-        if cliSevRank(dgSev[gi]) >= thr { cliGating = cliGating + 1 }
-        if dgSev[gi] == "error" { cliErrors = cliErrors + 1 }
-        if warn { cliWarnings = cliWarnings + 1 }
-      }
-      "std" => {
-        if shownAt { cliStdHidden = cliStdHidden + 1 }
-        if shownAt && warn { cliStdHiddenWarn = cliStdHiddenWarn + 1 }
-      }
-      "import" => {
-        if shownAt { cliImpHidden = cliImpHidden + 1 }
-        if shownAt && warn { cliImpHiddenWarn = cliImpHiddenWarn + 1 }
-      }
-      "exclude" => {}
-    }
-    gi = gi + 1
-  }
-  // Display: those at or above the floor, stable-sorted by position, appended.
-  const order: i32[] = []
-  let oj = 0
-  while oj < dgSev.length {
-    if cliSevRank(dgSev[oj]) >= disp && cliDiagWithheld(oj) == "shown" {
-      order.push(oj)
-    }
-    oj = oj + 1
-  }
-  cliStableSort(order)
-  let os = 0
-  while os < order.length {
-    if cliJson != 0 { cliJsonItems.push(cliFmtJson(order[os])) }
-    else if cliConcise != 0 { cliOut.push(cliFmtConcise(order[os])) }
-    else { cliOut.push(cliFmtPretty(order[os])) }
-    os = os + 1
-  }
-  // `--batch --json`: this file's own verdict, sliced out of what it just appended.
-  if cliBatch != 0 && cliJson != 0 {
-    let fexit: CliExit = EXIT_OK
-    if cliGating > gateBase { fexit = EXIT_FAILED }
-    if cliFileInvalid != 0 { fexit = EXIT_COMPILER_BUG }
-    cliBatchRecord(cliCurFile, fexit, jsonBase)
-  }
-  // This file is done (reported); advance to the next.
-  cliFileIdx = cliFileIdx + 1
-  cliStartFile()
 }
 
 // `--budget`: note this file's findings of every budgeted code, at any severity, that the
