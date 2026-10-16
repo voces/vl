@@ -4698,44 +4698,88 @@ impl Floor {
 type FloorFn = fn(&Floor, &mut Caller<'_, ()>, &[Val], &mut [Val]) -> Result<()>;
 
 /// The host floor: every `imports` function beneath `std:fs`, `std:args`, `std:process` and
-/// `std:env`, one row each: the import name, its signature in the compiler's own spelling
-/// (`FS_FLOOR` in `compiler/check_intrinsics.vl`), and its handler.
-/// `tests/vl_host_floor_test.ts` holds the names and signatures to that table.
-const HOST_FLOOR: &[(&str, &str, FloorFn)] = &[
-    ("__fs_errno__", "() => i32", floor_fs_errno),
-    ("__args_count__", "() => i32", floor_args_count),
-    ("__fs_stat__", "(u8[]) => i32", floor_fs_stat),
-    ("__fs_size__", "(u8[]) => i64", floor_fs_size),
-    ("__fs_write__", "(u8[], u8[]) => i32", floor_fs_write),
-    (
-        "__fs_write_at__",
-        "(u8[], i64, u8[], i32) => i32",
-        floor_fs_write_at,
-    ),
-    (
-        "__fs_write_from__",
-        "(u8[], i64, i32, i32, i32) => i32",
-        floor_fs_write_from,
-    ),
-    ("__proc_exit__", "(i32) => void", floor_proc_exit),
-    ("__fs_read__", "(u8[]) => u8[]", floor_fs_read),
-    (
-        "__fs_read_range__",
-        "(u8[], i64, i32) => u8[]",
-        floor_fs_read_range,
-    ),
-    (
-        "__fs_read_into__",
-        "(u8[], i64, i32, i32) => i32",
-        floor_fs_read_into,
-    ),
-    ("__fs_list__", "(u8[]) => u8[]", floor_fs_list),
-    ("__args_get__", "(i32) => u8[]", floor_args_get),
-    ("__proc_run__", "(u8[]) => i32", floor_proc_run),
-    ("__proc_out__", "() => u8[]", floor_proc_out),
-    ("__proc_err__", "() => u8[]", floor_proc_err),
-    ("__env_get__", "(u8[]) => u8[]", floor_env_get),
+/// `std:env`, one row each: the import name and its handler. The signature is not restated
+/// here: `build.rs` reads it from `FS_FLOOR` in `compiler/check_intrinsics.vl` into
+/// `FLOOR_SIGS`, and `floor_drift` refuses a name only one side holds.
+const HOST_FLOOR: &[(&str, FloorFn)] = &[
+    ("__fs_errno__", floor_fs_errno),
+    ("__args_count__", floor_args_count),
+    ("__fs_stat__", floor_fs_stat),
+    ("__fs_size__", floor_fs_size),
+    ("__fs_write__", floor_fs_write),
+    ("__fs_write_at__", floor_fs_write_at),
+    ("__fs_write_from__", floor_fs_write_from),
+    ("__proc_exit__", floor_proc_exit),
+    ("__fs_read__", floor_fs_read),
+    ("__fs_read_range__", floor_fs_read_range),
+    ("__fs_read_into__", floor_fs_read_into),
+    ("__fs_list__", floor_fs_list),
+    ("__args_get__", floor_args_get),
+    ("__proc_run__", floor_proc_run),
+    ("__proc_out__", floor_proc_out),
+    ("__proc_err__", floor_proc_err),
+    ("__env_get__", floor_env_get),
 ];
+
+include!(concat!(env!("OUT_DIR"), "/floor_sigs.rs"));
+
+/// The signature `FS_FLOOR` states for `name`; `floor_drift` guarantees a `HOST_FLOOR` name has one.
+fn floor_sig(name: &str) -> &'static str {
+    FLOOR_SIGS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or("", |(_, s)| *s)
+}
+
+/// Every disagreement between the compiler's table and the host's handler names: a name one
+/// side lacks, or lists twice.
+#[cfg(test)]
+fn floor_drift(sigs: &[(&str, &str)], handlers: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, (n, _)) in sigs.iter().enumerate() {
+        if sigs[..i].iter().any(|(m, _)| m == n) {
+            out.push(format!("FS_FLOOR lists `{n}` twice"));
+        }
+        if !handlers.contains(n) {
+            out.push(format!("FS_FLOOR has `{n}`, HOST_FLOOR has no handler"));
+        }
+    }
+    for (i, n) in handlers.iter().enumerate() {
+        if handlers[..i].contains(n) {
+            out.push(format!("HOST_FLOOR lists `{n}` twice"));
+        }
+        if !sigs.iter().any(|(m, _)| m == n) {
+            out.push(format!("HOST_FLOOR has `{n}`, FS_FLOOR has no row"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::{floor_drift, FLOOR_SIGS, HOST_FLOOR};
+
+    fn names() -> Vec<&'static str> {
+        HOST_FLOOR.iter().map(|(n, _)| *n).collect()
+    }
+
+    #[test]
+    fn host_floor_and_fs_floor_agree() {
+        assert!(FLOOR_SIGS.len() >= 10, "parsed too few FS_FLOOR rows");
+        assert_eq!(floor_drift(FLOOR_SIGS, &names()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn drift_control_names_each_side() {
+        let mut sigs: Vec<(&str, &str)> = FLOOR_SIGS.to_vec();
+        sigs.push(("__fs_new__", "() => i32"));
+        let mut handlers = names();
+        handlers.retain(|n| *n != "__env_get__");
+        handlers.push("__fs_other__");
+        let got = floor_drift(&sigs, &handlers);
+        assert_eq!(got.len(), 3, "{got:?}");
+    }
+}
 
 /// The parameter and result counts a `HOST_FLOOR` signature states: `void` is no result.
 fn floor_sig_arity(sig: &str) -> (usize, usize) {
@@ -4776,7 +4820,11 @@ fn register_fs_imports(
         proc_io: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
         list: u8_list_types(module),
     };
-    for &(name, sig, handler) in HOST_FLOOR {
+    for &(name, handler) in HOST_FLOOR {
+        let sig = floor_sig(name);
+        if sig.is_empty() {
+            bail!("host import `{name}` has no row in FS_FLOOR");
+        }
         let Some((_, ft)) = declared.iter().find(|(n, _)| n == name) else {
             continue;
         };

@@ -44,7 +44,7 @@ fn stamp_host_build_id() {
         .map(|rd| rd.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
     files.sort();
-    files.extend(["build.rs", "Cargo.toml", "Cargo.lock"].iter().map(|f| dir.join(f)));
+    files.extend(["build.rs", "Cargo.toml", "Cargo.lock", "../../compiler/check_intrinsics.vl"].iter().map(|f| dir.join(f)));
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
         for b in bytes.iter().chain((bytes.len() as u64).to_le_bytes().iter()) {
@@ -70,9 +70,47 @@ fn stamp_host_build_id() {
     }
 }
 
+/// Stage `FLOOR_SIGS` into OUT_DIR: the (name, signature) of every row of `FS_FLOOR` in
+/// `compiler/check_intrinsics.vl`, the compiler's one statement of the host floor. The build fails
+/// naming the path when the file is absent, rather than shipping a host with no signatures.
+fn stage_floor_sigs() {
+    let dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let src_path = dir.join("../../compiler/check_intrinsics.vl");
+    let src = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("floor signatures: cannot read `{}`: {e}", src_path.display()));
+    let start = src
+        .find("const FS_FLOOR:")
+        .expect("floor signatures: `const FS_FLOOR:` not found");
+    let body = &src[start..];
+    let end = body.find("\n]\n").expect("floor signatures: FS_FLOOR has no end");
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut quoted = 0;
+    for line in body[..end].lines().skip(1) {
+        let Some(rest) = line.strip_prefix("  \"") else { continue };
+        quoted += 1;
+        let cells: Vec<&str> = rest.trim_end_matches(',').split("\", \"").collect();
+        if cells.len() != 3 {
+            panic!("floor signatures: not a row `\"name\", \"sig\", \"\" | \"memory\",`: {line}");
+        }
+        rows.push((cells[0].to_string(), cells[1].to_string()));
+    }
+    if rows.is_empty() || rows.len() != quoted {
+        panic!("floor signatures: parsed {} of {quoted} FS_FLOOR rows", rows.len());
+    }
+    let mut out = String::from("const FLOOR_SIGS: &[(&str, &str)] = &[\n");
+    for (n, s) in &rows {
+        out.push_str(&format!("    ({n:?}, {s:?}),\n"));
+    }
+    out.push_str("];\n");
+    let dest = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("floor_sigs.rs");
+    std::fs::write(dest, out).expect("floor signatures: writing OUT_DIR");
+    println!("cargo:rerun-if-changed={}", src_path.display());
+}
+
 fn main() {
     stamp_commit();
     stamp_host_build_id();
+    stage_floor_sigs();
 
     // Cargo sets CARGO_FEATURE_<NAME> for each active feature.
     if std::env::var_os("CARGO_FEATURE_EMBED_SEED").is_none() {
