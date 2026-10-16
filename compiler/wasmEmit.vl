@@ -380,6 +380,10 @@ import {
   fa64TypeIdx,
   fa64Used,
   fcpSpillSlot,
+  fitGrowFn,
+  fitGrowLocal,
+  fitGrowName,
+  fitGrowTy,
   fitShLocal,
   fitShName,
   fitShRecv,
@@ -473,6 +477,8 @@ import {
   liKinds,
   liSlots,
   liftWbEnd,
+  listFitStoodIn,
+  listFitStoodWrap,
   listGetIdxSlot,
   listGetIdxStagedIx,
   listGetIdxStagedSet,
@@ -480,6 +486,7 @@ import {
   listGetRecvStagedIx,
   listGetRecvStagedSet,
   listIdxScratchBase,
+  listIsIdentNames,
   localByNode,
   localDeclIx,
   localIsRef,
@@ -3527,9 +3534,13 @@ function emitListEmptyFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   const depth = listDisjointDepth(recvTy, isVarTyIxOf(isIx))
   if depth < 1 { return 0 }
+  let grow = -1
   if listNarrowReadDisjoint(fnIx, isIx, nd.isObj, recvTy) {
     const sh = listFitShadowSet(isIx, recvTy, depth, fnIx)
     if sh < 1 { return sh }
+    if sh == 2 && rv is Ident {
+      grow = listFitGrowRow(rv.identName, isVarTyIxOf(isIx), fnIx)
+    }
   }
   const slots: i32[] = []
   let kind: MfKind = "i32"
@@ -3569,8 +3580,15 @@ function emitListEmptyFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
     if lek == null { return emitFailAt(LIST_FIT_REP_MSG, isIx) }
     kind = listIdxKindOf(lek)
   }
+  // An arm that pushes tests only until its `K[]` is stored (`listFitGrowFill`).
+  if grow >= 0 {
+    fbLocalGet(fitGrowLocal[grow])
+    fbRefIsNull()
+    fbIf(127) // i32
+  }
   if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
   emitListEmptyLoop(slots, 0, kind, slot)
+  if grow >= 0 { return if listFitGrowFill(grow) < 0 { -1 } else { 1 } }
   1
 }
 
@@ -3683,22 +3701,16 @@ const LIST_FIT_PUSH_MSG = "emitProgram: this `is` arm pushes onto an empty list 
 
 const LIST_FIT_SHADOW_MSG = "emitProgram: this `is` arm reads an empty list at an element type it was not built with, and only a variable read directly in its own function can be handed one"
 
-// Stores a fresh empty `K[]` for the `is K[]` at `isIx` in a local the arm's reads of its
-// receiver take instead of the receiver (`listFitShadowRead`): the test is true only when the
-// list is empty, and an empty list of one element type reads as an empty list of any other.
-// 1 when stored, -1 when refused for a receiver no read can be redirected for.
+// Stores a fresh empty `K[]` for the `is K[]` at `isIx` in the local the arm reads in place of
+// its receiver (`listFitShadowRead`), since the test fits only an empty list. 1 when stored, 2
+// when a pushing arm's `listFitGrowRow` local is the test's to store, -1 when refused for a
+// receiver no read can be redirected for.
 function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
   const nd = P.nodes[isIx]
   if !(nd is IsExpr) { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
   const r = P.nodes[unwrapParen(nd.isObj)]
   const fn = P.nodes[fnIx]
   if !(r is Ident) || !(fn is FuncDecl) || depth != 1 {
-    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
-  }
-  if (
-    nestedFnReadsDisjoint(fn.fnBody, r.identName, recvTy, false)
-    || liftedFnReadsDisjoint(r.identName, recvTy, fnIx)
-  ) {
     return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
   }
   const kTy = isVarTyIxOf(isIx)
@@ -3710,11 +3722,25 @@ function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
   const heaps: i32[] = []
   const kind = listFitElemKind(kt.aElem, heaps)
   if kind == null { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
+  // A closure's read stands in with its own empty `K[]` (`listFitCaptureStandIn`), except
+  // between two record lists, which that read cannot tell apart.
+  const rt = if recvTy >= 0 && recvTy < T.tys.length { T.tys[recvTy] } else { kt }
+  const recvHeaps: i32[] = []
+  const recvKind = if rt is TyArray { listFitElemKind(rt.aElem, recvHeaps) } else { null }
+  if (
+    kind == "ref"
+    && (recvKind == null || recvKind == "ref")
+    && (nestedFnReadsDisjoint(fn.fnBody, r.identName, recvTy, false)
+      || liftedFnReadsDisjoint(r.identName, recvTy, fnIx))
+  ) {
+    return emitFailAt(LIST_FIT_SHADOW_MSG, isIx)
+  }
   const slot = heaps[0]
   const back = heaps[1]
   const wrap = heaps[2]
   const recvLoc = localIndexOf(fnIx, r.identName)
   if recvLoc < 0 { return emitFailAt(LIST_FIT_SHADOW_MSG, isIx) }
+  const grow = listFitGrowRow(r.identName, kTy, fnIx)
   let loc = -1
   let i = 0
   while i < fitShName.length {
@@ -3728,12 +3754,13 @@ function listFitShadowSet(isIx: i32, recvTy: i32, depth: i32, fnIx: i32): i32 {
     i = i + 1
   }
   if loc < 0 {
-    loc = listFitSlot(kind, slot, 11)
+    loc = if grow >= 0 { fitGrowLocal[grow] } else { listFitSlot(kind, slot, 11) }
     fitShName.push(r.identName)
     fitShTy.push(kTy)
     fitShLocal.push(loc)
     fitShRecv.push(recvLoc)
   }
+  if grow >= 0 { return 2 }
   fbBacking(back, 0)
   arrLitWrap(0, wrap)
   fbLocalSet(loc)
@@ -3758,6 +3785,329 @@ function listFitShadowRead(name: string, exprIx: i32, fnIx: i32): i32 {
       return fitShLocal[i]
     }
     i = i + 1
+  }
+  -1
+}
+
+// The `fitGrow*` row of an `is K[]` arm in `fnIx` that pushes onto receiver `name` (any `K[]`
+// when `kTy` is -1), or -1 (D4934). Its local holds `K[]` from the first test that fits on, so
+// that list is the receiver's place: a later test fits it and a `.length` reads it.
+function listFitGrowRow(name: string, kTy: i32, fnIx: i32): i32 {
+  if !strListHas(listIsIdentNames, name) { return -1 }
+  if fitGrowFn != fnIx { listFitGrowScan(fnIx) }
+  let i = 0
+  while i < fitGrowName.length {
+    if fitGrowName[i] == name && (kTy < 0 || tySame(fitGrowTy[i], kTy)) {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// Fills the `fitGrow*` rows for `fnIx`: each `is K[]` over a local list whose elements can never
+// be `K`, whose arm pushes onto the receiver, and where every other use of the receiver is one
+// `listFitGrowUsesOk` admits. Any other use would read the receiver's own list, which the
+// pushed `K[]` has replaced, so such an arm keeps `LIST_FIT_PUSH_MSG`.
+function listFitGrowScan(fnIx: i32) {
+  fitGrowFn = fnIx
+  fitGrowName = []
+  fitGrowTy = []
+  fitGrowLocal = []
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return 0 }
+  const isIxs: i32[] = []
+  const pushNames: string[] = []
+  const pushTys: i32[] = []
+  listFitGrowWalk(fn.fnBody, isIxs, pushNames, pushTys)
+  for isIx in isIxs {
+    const nd = P.nodes[isIx]
+    const kTy = isVarTyIxOf(isIx)
+    if nd is IsExpr && kTy >= 0 && kTy < T.tys.length {
+      const r = P.nodes[unwrapParen(nd.isObj)]
+      const kt = T.tys[kTy]
+      if (
+        r is Ident
+        && kt is TyArray
+        && listFitGrowEligible(nd, r.identName, kTy, fnIx)
+      ) {
+        let pushed = false
+        let p = 0
+        while p < pushNames.length {
+          if pushNames[p] == r.identName && tySame(pushTys[p], kTy) {
+            pushed = true
+          }
+          p = p + 1
+        }
+        const heaps: i32[] = []
+        const kind = listFitElemKind(kt.aElem, heaps)
+        if (
+          pushed
+          && kind != null
+          && listFitGrowUsesOk(fn.fnBody, -1, r.identName, kTy, false)
+        ) {
+          fitGrowName.push(r.identName)
+          fitGrowTy.push(kTy)
+          fitGrowLocal.push(listFitSlot(kind, heaps[0], 11))
+        }
+      }
+    }
+  }
+  0
+}
+
+// Whether the `is K[]` `nd` over local `name` takes the shadow `listFitShadowSet` stores: no row
+// yet, a receiver that is neither a union nor nullable, and elements disjoint at the first depth.
+function listFitGrowEligible(
+  nd: IsExpr,
+  name: string,
+  kTy: i32,
+  fnIx: i32,
+): boolean {
+  let i = 0
+  while i < fitGrowName.length {
+    if fitGrowName[i] == name && tySame(fitGrowTy[i], kTy) { return false }
+    i = i + 1
+  }
+  if localIndexOf(fnIx, name) < 0 { return false }
+  if exprUnion(nd.isObj, fnIx) || nodeTyIsNullable(nd.isObj) { return false }
+  const declTy = nodeTyIxOf(nd.isObj)
+  const recvTy = if declTy < 0 || tyHasTyVar(declTy) { exactOperandTyOf(nd.isObj, fnIx) } else { declTy }
+  recvTy >= 0 && listDisjointDepth(recvTy, kTy) == 1
+}
+
+// Collects, under `ix` and outside nested functions, each `is` testing a list type on a named
+// variable, and each `.push` onto a named variable with the type its receiver is read at.
+function listFitGrowWalk(
+  ix: i32,
+  isIxs: i32[],
+  pushNames: string[],
+  pushTys: i32[],
+) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return 0 }
+  if n is IsExpr {
+    const r = P.nodes[unwrapParen(n.isObj)]
+    if r is Ident && strListHas(listIsIdentNames, r.identName) {
+      isIxs.push(ix)
+    }
+  } else if n is Call {
+    const cf = P.nodes[n.callFn]
+    if cf is Member && cf.memProp == "push" {
+      const o = P.nodes[cf.memObj]
+      if o is Ident {
+        pushNames.push(o.identName)
+        pushTys.push(nodeTyIxOf(cf.memObj))
+      }
+    }
+  }
+  for k in nodeChildren(ix) { listFitGrowWalk(k, isIxs, pushNames, pushTys) }
+  0
+}
+
+// Whether every use of `name` under `ix` (child of `par`) is one the arm's `K[]` stands in for:
+// a read typed `K[]`, the operand of another `is K[]`, or the receiver of a `.length`, none of
+// them in a nested function, which would read its own capture of the receiver.
+function listFitGrowUsesOk(
+  ix: i32,
+  par: i32,
+  name: string,
+  kTy: i32,
+  inner: boolean,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return listFitGrowUsesOk(n.fnBody, ix, name, kTy, true) }
+  if n is Ident && n.identName == name {
+    if inner { return false }
+    const t = nodeTyIxOf(ix)
+    if t >= 0 && tySame(t, kTy) { return true }
+    if par < 0 { return false }
+    const p = P.nodes[par]
+    if p is IsExpr && p.isObj == ix {
+      const pk = isVarTyIxOf(par)
+      return pk >= 0 && tySame(pk, kTy)
+    }
+    return p is Member && p.memObj == ix && p.memProp == "length"
+  }
+  for k in nodeChildren(ix) {
+    if !listFitGrowUsesOk(k, ix, name, kTy, inner) { return false }
+  }
+  true
+}
+
+// Whether `loc` is the local of a `fitGrow*` row, which a push may append to.
+function listFitGrowHolds(loc: i32): boolean {
+  for l in fitGrowLocal {
+    if l == loc { return true }
+  }
+  false
+}
+
+// With the test's answer on the stack inside the `if` `emitListEmptyFitIs` opened on a null
+// `fitGrowLocal[row]`, stores a fresh `K[]` there when it fits; a set local answers 1 untested.
+function listFitGrowFill(row: i32): i32 {
+  const kt = T.tys[fitGrowTy[row]]
+  if !(kt is TyArray) { return emitFail(LIST_FIT_SHADOW_MSG) }
+  const heaps: i32[] = []
+  if listFitElemKind(kt.aElem, heaps) == null {
+    return emitFail(LIST_FIT_SHADOW_MSG)
+  }
+  fbIf(127) // i32
+  fbBacking(heaps[1], 0)
+  arrLitWrap(0, heaps[2])
+  fbLocalSet(fitGrowLocal[row])
+  fbI32Const(1)
+  fbElse()
+  fbI32Const(0)
+  fbEnd()
+  fbElse()
+  fbI32Const(1)
+  fbEnd()
+  0
+}
+
+// `name.length` outside the arm of an `is K[]` that pushes onto `name`: the `K[]` once a test
+// has fitted, the receiver's own list before. 0 when `m` is not such a read, 1 when emitted.
+function emitListFitGrowLen(body: u8[], m: Member, memIx: i32, fnIx: i32): i32 {
+  const o = P.nodes[m.memObj]
+  if !(o is Ident) { return 0 }
+  if listFitShadowRead(o.identName, m.memObj, fnIx) >= 0 { return 0 }
+  const g = listFitGrowRow(o.identName, -1, fnIx)
+  if g < 0 { return 0 }
+  const kt = T.tys[fitGrowTy[g]]
+  if !(kt is TyArray) { return 0 }
+  const heaps: i32[] = []
+  const kind = listFitElemKind(kt.aElem, heaps)
+  if kind == null { return 0 }
+  fbLocalGet(fitGrowLocal[g])
+  fbRefIsNull()
+  fbIf(127) // i32
+  if emitArrLen(body, memIx, fnIx) < 0 { return -1 }
+  fbElse()
+  fbLocalGet(fitGrowLocal[g])
+  fbRefAsNonNull()
+  emitListLenOnStack(kind, heaps[0])
+  fbEnd()
+  1
+}
+
+// The wrapper of the empty `K[]` a closure's read of capture `name` at `exprIx` stands in with,
+// or -1 (D4935): only an `is K[]` fitting an empty list of other elements types it so. A read
+// typed at a type parameter's list takes the enclosing region's `K[]` when `anyPos` or when it
+// is delivered whole. Two record lists are not told apart, since rows of one shape alias.
+function listFitCaptureStandIn(
+  name: string,
+  exprIx: i32,
+  fnIx: i32,
+  anyPos: boolean,
+): i32 {
+  if !strListHas(listIsIdentNames, name) || !identIsEnvCapture(fnIx, name) {
+    return -1
+  }
+  const heaps: i32[] = []
+  let kind = listFitStandInKind(nodeTyIxOf(exprIx), heaps)
+  if kind == null && (anyPos || listFitReadIsWhole(fnIx, exprIx)) {
+    kind = listFitStandInKind(listFitRegionKTy(fnIx, name), heaps)
+  }
+  if kind == null { return -1 }
+  const ck = capturedKindOf(fnIx, name)
+  if ck == null { return -1 }
+  if ck == "reflist" { return if kind == "ref" { -1 } else { heaps[2] } }
+  if ck == "strlist" {
+    return if heaps[2] == mkListIdx { -1 } else { heaps[2] }
+  }
+  const se = scalarListElemOfListKind(ck)
+  if se == null || scalarListWrap(se) == heaps[2] { return -1 }
+  heaps[2]
+}
+
+// The scalar element of the stand-in list wrapper `w`, or null for any other list.
+function listFitStoodKind(w: i32): VKind | null {
+  if w == lTypeIdx { return "i32" }
+  if w == fl64TypeIdx { return "f64" }
+  if w == il64TypeIdx { return "i64" }
+  if w == fl32TypeIdx { return "f32" }
+  null
+}
+
+// `listFitElemKind` of list type `t`'s elements, or null when `t` is not a list of a kind
+// the stand-in builds, a type parameter's elements among them.
+function listFitStandInKind(t: i32, heaps: i32[]): MfKind | null {
+  if t < 0 || t >= T.tys.length { return null }
+  const kt = T.tys[t]
+  if !(kt is TyArray) { return null }
+  listFitElemKind(kt.aElem, heaps)
+}
+
+// The `K[]` an `if <name> is K[]` of an enclosing function tests when the closure at `fnIx` is
+// declared in that test's then-branch, or -1: a closure inside a generic body reads its capture at
+// the type parameter's list, and only the region says which list the test fitted.
+function listFitRegionKTy(fnIx: i32, name: string): i32 {
+  let host = fnStmtsPosOf(fnIx)
+  if host < 0 { return -1 }
+  const self = fnStmts[host]
+  while host >= 0 && host < fnParent.length {
+    host = fnParent[host]
+    if host < 0 || host >= fnStmts.length { return -1 }
+    const h = P.nodes[fnStmts[host]]
+    if h is FuncDecl {
+      const k = listFitRegionWalk(h.fnBody, name, self)
+      if k >= 0 { return k }
+    }
+  }
+  -1
+}
+
+// `listFitRegionKTy`'s walk of one function body.
+function listFitRegionWalk(ix: i32, name: string, self: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is IfStmt {
+    const ci = unwrapParen(n.ifCond)
+    const c = if ci < 0 { n } else { P.nodes[ci] }
+    if c is IsExpr && nodeContains(n.ifThen, self) {
+      const r = P.nodes[unwrapParen(c.isObj)]
+      if r is Ident && r.identName == name { return isVarTyIxOf(ci) }
+    }
+  }
+  for k in nodeChildren(ix) {
+    const t = listFitRegionWalk(k, name, self)
+    if t >= 0 { return t }
+  }
+  -1
+}
+
+// Whether the read at `exprIx` in function `fnIx` is delivered whole: not the object of a
+// member, an index or a `for`, which read the list in place.
+function listFitReadIsWhole(fnIx: i32, exprIx: i32): boolean {
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  const f = P.nodes[fnStmts[fe]]
+  if !(f is FuncDecl) { return false }
+  let at = exprIx
+  let par = nodeParentUnder(f.fnBody, at)
+  while par >= 0 && P.nodes[par] is Paren {
+    at = par
+    par = nodeParentUnder(f.fnBody, at)
+  }
+  if par < 0 { return false }
+  // Each of the four holds the list it reads in place as its first child.
+  const p = P.nodes[par]
+  const inPlace = p is Member || p is OptMember || p is Index || p is ForIn
+  if !inPlace { return true }
+  const kids = nodeChildren(par)
+  kids.length == 0 || kids[0] != at
+}
+
+// The node in the subtree at `ix` with `target` as a child, or -1.
+function nodeParentUnder(ix: i32, target: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  for k in nodeChildren(ix) {
+    if k == target { return ix }
+    const r = nodeParentUnder(k, target)
+    if r >= 0 { return r }
   }
   -1
 }
@@ -23486,12 +23836,19 @@ function listOpRecvLocal(
   if recv is Ident {
     if !listOpRecvNarrowedUnion(objIx, recv.identName, fnIx) {
       // An `is K[]` arm's empty list of another element (D4911): an op that only reads it
-      // reads the arm's own, and a push, which the receiver's own list cannot hold, refuses.
+      // reads the arm's own, and a push lands there when the arm keeps it (D4934).
       const fitSh = listFitShadowRead(recv.identName, objIx, fnIx)
-      if fitSh >= 0 && op == ".push" {
+      if fitSh >= 0 && op == ".push" && !listFitGrowHolds(fitSh) {
         return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
       }
       if fitSh >= 0 { return fitSh }
+      // A closure's stand-in for such a list is its own, and a push into it would be lost.
+      if (
+        op == ".push"
+        && listFitCaptureStandIn(recv.identName, objIx, fnIx, true) >= 0
+      ) {
+        return emitFailAt(LIST_FIT_PUSH_MSG, objIx)
+      }
       const lIdx = localIndexOf(fnIx, recv.identName)
       if lIdx >= 0 { return lIdx }
       // A captured list ident (D1965) or a module global: the env field or global holds
@@ -25396,6 +25753,14 @@ function emitScalarListWidenSiteElem(
   fnIx: i32,
   de: VKind,
 ): boolean {
+  if listFitStoodIn >= 0 && listFitStoodIn == unwrapParen(srcIx) {
+    listFitStoodIn = -1
+    const stood = listFitStoodKind(listFitStoodWrap)
+    if stood == null || stood == de || scalarWidenConvOp(stood, de) < 0 {
+      return false
+    }
+    return emitScalarListWidenTop(body, stood, de) >= 0
+  }
   const sk = scalarListElemKind(srcIx, fnIx)
   if sk == null { return false }
   if scalarWidenConvOp(sk, de) < 0 { return false }
@@ -31516,6 +31881,16 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
     fbRefAsNonNull()
     return 0
   }
+  // …and a closure's read of its capture there, which reads an empty `K[]` of its own (D4935).
+  listFitStoodIn = -1
+  const capSh = listFitCaptureStandIn(e.identName, exprIx, fnIx, false)
+  if capSh >= 0 {
+    fbBacking(listBackOfWrap(capSh), 0)
+    arrLitWrap(0, capSh)
+    listFitStoodIn = exprIx
+    listFitStoodWrap = capSh
+    return 0
+  }
   const isid = sidOfNode(exprIx)
   // a module-`const` parameter default reads its global, not a caller-local of the same
   // name: this node is the declaration's expression, substituted into whichever frame
@@ -32066,6 +32441,8 @@ function emitMemberNode(body: u8[], e: Member, exprIx: i32, fnIx: i32) {
   // length field — the list wrapper's `len` (field 1) or the string header's `len`
   // (field 2), a code-point count. `length` over any other receiver falls through to the struct path.
   if e.memProp == "length" {
+    const growLen = emitListFitGrowLen(body, e, exprIx, fnIx)
+    if growLen != 0 { return if growLen < 0 { -1 } else { 0 } }
     // A string-literal union atom widens to its member's string, whose header holds the length.
     if memberLenWidensAtom(e.memObj, fnIx) {
       if emitAtomToStr(body, e.memObj, fnIx) < 0 { return -1 }
