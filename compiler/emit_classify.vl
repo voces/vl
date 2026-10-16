@@ -6988,6 +6988,24 @@ function anonLeafArrBindingLitOf(ix: i32, fnIx: i32): i32 {
   -1
 }
 
+// The type `monoFieldReadTys` holds for read `rd` in function `fx` or the nearest function
+// enclosing it that has one, since a closure minted inside an instance reads at it (D5112).
+function monoFieldReadTyAt(rd: i32, fx: i32): i32 {
+  let f = fx
+  let hops = 0
+  while f >= 0 && hops < 64 {
+    const t = monoFieldReadTyIn(rd, f)
+    if t >= 0 { return t }
+    const pos = fnStmtsPosOf(f)
+    if pos < 0 || pos >= fnParent.length { return -1 }
+    const pp = fnParent[pos]
+    if pp < 0 || pp >= fnStmts.length { return -1 }
+    f = fnStmts[pp]
+    hops = hops + 1
+  }
+  -1
+}
+
 // The callee's interned `$fnsig` KEY for a value call (`f(x)`, `(o.field)(x)`, `fs[i](x)`), or "" —
 // the param tokens drive argument coercion and the key resolves the functype the `call_ref` casts to.
 export function cloCallSigKey(callIx: i32, fnIx: i32) {
@@ -6999,7 +7017,7 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     const cfx = unwrapParen(c.callFn)
     const cre = P.nodes[cfx]
     // A field read a generic's instances share holds its pinned type per instance (D5079).
-    const pk = sigKeyOfTy(monoFieldReadTyIn(cfx, fnIx))
+    const pk = sigKeyOfTy(monoFieldReadTyAt(cfx, fnIx))
     if pk != "" && cloSigPosOfKey(pk) >= 0 { return pk }
     // The syntactic resolvers — fast (no type render): a function-typed binding/param Ident, a struct
     // field closure, an indexed closure-array element.
@@ -16791,6 +16809,22 @@ function identReadOutOfScope(exprIx: i32, fnIx: i32) {
   globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx) < 0
 }
 
+// The list type a local recorded at a union reads at while the emitter's narrowing binds it to
+// one list: the complement of a generic's `is T[]`, which the checker cannot narrow (D5111).
+function narrowedOpenUnionListTy(exprIx: i32): i32 {
+  const e = P.nodes[exprIx]
+  if !(e is Ident) { return -1 }
+  const raw = nodeTyIxOf(exprIx)
+  if raw < 0 || raw >= T.tys.length || !(T.tys[raw] is TyUnion) { return -1 }
+  const i = narrowSlotOf(e.identName)
+  if i < 0 { return -1 }
+  const ty = narrowSlotTy(i)
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyArray) || tyHasTyVar(ty) {
+    return -1
+  }
+  ty
+}
+
 // `exprListRep`'s answers during one outermost query, indexed by expression and stamped with
 // that query's generation, so an answer never outlives the query that computed it. A global's
 // initializer is asked once per list kind its declaration is tested for; without the memo a
@@ -16806,6 +16840,11 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   if fat >= 0 {
     const fd = repOfTy(fat)
     if fd.rdCovered == 1 && vkListClass(fd.rdKind) == 1 { return fd.rdKind }
+  }
+  const nlt = narrowedOpenUnionListTy(exprIx)
+  if nlt >= 0 {
+    const nd = repOfTy(nlt)
+    if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 1 { return nd.rdKind }
   }
   const pin = nodeTyPinIxOf(exprIx)
   const raw = nodeTyIxOf(exprIx)
