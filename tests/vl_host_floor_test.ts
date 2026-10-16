@@ -4,7 +4,7 @@
 //   - `HOST_FLOOR` in scripts/vl-host/src/main.rs: the native host's name, signature and
 //     handler for each import;
 //   - `fsIntrinsicNameAt` in compiler/check_intrinsics.vl: the slot order the emitter writes;
-//   - the `declare(...)` rows in compiler/typecheck.vl: the types the checker gives them;
+//   - the `declare(...)` rows in compiler/check_core_state.vl: the types the checker gives them;
 //   - the `blPush(...)` rows in compiler/driver.vl: the builtin list the editor shows;
 //   - tests/support/runWasm.ts: the Deno harness's stubs.
 //
@@ -14,7 +14,9 @@
 import { ROOT } from "./support/tree.ts";
 
 const MAIN_RS = Deno.readTextFileSync(`${ROOT}/scripts/vl-host/src/main.rs`);
-const TYPECHECK = Deno.readTextFileSync(`${ROOT}/compiler/typecheck.vl`);
+const CHECK_STATE = Deno.readTextFileSync(
+  `${ROOT}/compiler/check_core_state.vl`,
+);
 const INTRINSICS = Deno.readTextFileSync(
   `${ROOT}/compiler/check_intrinsics.vl`,
 );
@@ -102,14 +104,14 @@ function declaredRows(): Map<string, string> {
   const spell = (t: string) => {
     const s = ty[t.trim()];
     if (s === undefined) {
-      throw new Error(`typecheck.vl: no spelling for \`${t.trim()}\``);
+      throw new Error(`check_core_state.vl: no spelling for \`${t.trim()}\``);
     }
     return s;
   };
   const rows = new Map<string, string>();
   const re =
     /declare\(\s*"([^"]+)",\s*mkFuncTy\(\s*(noParams|\[([^\]]*)\]),\s*(\w+)\s*\),?\s*\)/g;
-  for (const m of TYPECHECK.matchAll(re)) {
+  for (const m of CHECK_STATE.matchAll(re)) {
     if (!FLOOR_NAME.test(m[1])) continue;
     const params = m[2] === "noParams" ? [] : m[3].split(",").map(spell);
     rows.set(m[1], `(${params.join(", ")}) => ${spell(m[4])}`);
@@ -159,7 +161,7 @@ Deno.test("host floor: every source names the same imports", () => {
   same("main.rs HOST_FLOOR against fsIntrinsicNameAt", slots, [
     ...hostRows().keys(),
   ]);
-  same("typecheck.vl declare rows against fsIntrinsicNameAt", slots, [
+  same("check_core_state.vl declare rows against fsIntrinsicNameAt", slots, [
     ...declaredRows().keys(),
   ]);
   same("driver.vl blPush rows against fsIntrinsicNameAt", slots, [
@@ -175,7 +177,7 @@ Deno.test("host floor: every source names the same imports", () => {
 Deno.test("host floor: the host, the checker and the builtin list state one signature", () => {
   const host = hostRows();
   bySignature(
-    "typecheck.vl declare rows against main.rs HOST_FLOOR",
+    "check_core_state.vl declare rows against main.rs HOST_FLOOR",
     host,
     declaredRows(),
   );
