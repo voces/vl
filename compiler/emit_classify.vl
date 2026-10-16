@@ -240,6 +240,7 @@ import {
   tyIsNulValueUnionBox,
   tyIsNullableLitUnion,
   tyIsRecord,
+  tyIxIsFunc,
   tyIxIsVariantMember,
   tyLitMemberTexts,
   tyMutEpoch,
@@ -865,15 +866,30 @@ import {
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { strContains } from "./strutil"
 import {
+  flattenVariantsInto,
+  intLitUnionBasesOf,
+  isNullTy,
+  litSetBaseTy,
+  nonNullTy,
+  nullableInnerOrNone,
+  numLitUnionHasBase,
+  primNameOf,
   tyEmitElemNulPrimOf,
   tyEmitElemPrimOf,
   tyEmitNamesOf,
   tyEmitPrimOf,
+  tyHasTyVar,
   tyIsArray,
-  tyIsNullPrim,
+  tyIsF32ArrayTy,
+  tyIsNumericBox,
+  tyIsU8ArrayTy,
+  tyLitSetMemberLexes,
   tyMapValOf,
+  tyNulLitUnionMemberTexts,
   tyPeelNul,
   tyStepElem,
+  tyStepParam,
+  tyStepRet,
 } from "./tyquery"
 import {
   memoGenAdvance,
@@ -887,20 +903,6 @@ import {
   tyRegWrites,
   uFieldReLays,
 } from "./memo"
-import {
-  flattenVariantsInto,
-  intLitUnionBasesOf,
-  litSetBaseTy,
-  nonNullTy,
-  numLitUnionHasBase,
-  primNameOf,
-  tyHasTyVar,
-  tyIsF32ArrayTy,
-  tyIsNumericBox,
-  tyIsU8ArrayTy,
-  tyLitSetMemberLexes,
-  tyNulLitUnionMemberTexts,
-} from "./check_ty_shape"
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
@@ -14567,7 +14569,7 @@ function vakOfUnion(ms: i32[]): i32 {
     const mt = T.tys[m]
     if mt is TyLit {
       if mt.litKind == "str" { texts.push(mt.litText) }
-    } else if !tyIsNullPrim(m) {
+    } else if !isNullTy(m) {
       nonLit = true
     }
   }
@@ -15329,8 +15331,8 @@ function tyNulSoleInner(ty: i32): i32 {
     }
     TyUnion => {
       if t.uMembers.length == 2 {
-        if tyIsNullPrim(t.uMembers[0]) { return t.uMembers[1] }
-        if tyIsNullPrim(t.uMembers[1]) { return t.uMembers[0] }
+        if isNullTy(t.uMembers[0]) { return t.uMembers[1] }
+        if isNullTy(t.uMembers[1]) { return t.uMembers[0] }
       }
     }
     TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
@@ -16156,13 +16158,13 @@ export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
   if spreadBoxingSource(arrIx, fnIx) >= 0 { return "" }
   // Only when the literal's element IS every source's: a `null` or a nullable source joins
   // the literal to `C | null`, whose row is not the source's.
-  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  const de = tyStepElem(nodeTyIxOf(arrIx))
   if de < 0 || T.tys[de] is TyNullable { return "" }
   let i = 0
   while i < a.arrElems.length {
     const src = spreadArgOf(a.arrElems[i])
     if src >= 0 {
-      const se = listElemTyOf(nodeTyIxOf(src))
+      const se = tyStepElem(nodeTyIxOf(src))
       if se < 0 || !tySame(se, de) { return "" }
     }
     i = i + 1
@@ -16174,7 +16176,7 @@ export function spreadLitSrcRowName(arrIx: i32, fnIx: i32): string {
 
 // The ref-list row of the element the checker typed list literal `arrIx` at, or -1.
 export function spreadLitElemRow(arrIx: i32): i32 {
-  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  const de = tyStepElem(nodeTyIxOf(arrIx))
   if de < 0 { return -1 }
   rlSlotOfTy(de)
 }
@@ -16230,7 +16232,7 @@ export function spreadSrcBoxAtom(src: i32, un: string): i32 {
 // Whether the checker typed spread literal `arrIx` a `string[]` or a `(string | null)[]`,
 // which share one rep.
 function spreadLitElemIsString(arrIx: i32): boolean {
-  let de = listElemTyOf(nodeTyIxOf(arrIx))
+  let de = tyStepElem(nodeTyIxOf(arrIx))
   if de < 0 { return false }
   const dt = T.tys[de]
   if dt is TyNullable { de = dt.nInner }
@@ -16243,7 +16245,7 @@ function spreadLitElemIsString(arrIx: i32): boolean {
 export function spreadSrcAtomTexts(src: i32, fnIx: i32): string[] {
   const none: string[] = []
   if mfRecvKindOf(src, fnIx) != "i32" { return none }
-  tyLitMemberTexts(listElemTyOf(nodeTyIxOf(src)))
+  tyLitMemberTexts(tyStepElem(nodeTyIxOf(src)))
 }
 
 // Whether every spread source among `elems` is a string list or a list of literal-union atoms,
@@ -16268,7 +16270,7 @@ export function spreadSourcesStrOrAtoms(elems: i32[], fnIx: i32): boolean {
 export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
   const a = P.nodes[arrIx]
   if !(a is ArrayLit) { return -1 }
-  const de = listElemTyOf(nodeTyIxOf(arrIx))
+  const de = tyStepElem(nodeTyIxOf(arrIx))
   if de < 0 { return -1 }
   const dT = T.tys[de]
   if !(dT is TyUnion || dT is TyNullable) { return -1 }
@@ -16281,7 +16283,7 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
   while i < a.arrElems.length {
     const src = spreadArgOf(a.arrElems[i])
     if src >= 0 {
-      const se = listElemTyOf(nodeTyIxOf(src))
+      const se = tyStepElem(nodeTyIxOf(src))
       if se >= 0 && !tySame(se, de) {
         if dT is TyUnion { return src }
         const sk = mfRecvKindOf(src, fnIx)
@@ -16290,14 +16292,6 @@ export function spreadBoxingSource(arrIx: i32, fnIx: i32): i32 {
     }
     i = i + 1
   }
-  -1
-}
-
-// The element type of list type `t`, or -1 when `t` is no list.
-function listElemTyOf(t: i32): i32 {
-  if t < 0 { return -1 }
-  const at = T.tys[t]
-  if at is TyArray { return at.aElem }
   -1
 }
 
@@ -16905,14 +16899,6 @@ function ifExprRefKindOf(ifIx: i32, fnIx: i32): VKind | null {
   // resolves from the checker's inner struct in `ifExprRefSlot` instead.
   if nodeRepIs(ifIx, "nulstruct") { return "struct" }
   null
-}
-
-// The return type a recorded function type `ty` carries, or -1 when `ty` is not a function.
-export function fnTyRetOf(ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = T.tys[ty]
-  if t is TyFunc { return t.fnRet }
-  -1
 }
 
 // A record type with any nullable wrapper removed, or -1 when `ty` is not a record.
@@ -17616,7 +17602,7 @@ function lambdaJoinsNestedRecord(ix: i32): boolean {
   } else {
     return false
   }
-  const rty = fnTyRetOf(nodeTyIxOf(ix))
+  const rty = tyStepRet(nodeTyIxOf(ix))
   if !fnRetJoinsWiderRecord(ix, rty) { return false }
   const rb = recordBaseTy(rty)
   if rb < 0 { return false }
@@ -17667,7 +17653,7 @@ function rjaWalk(ix: i32, fnIx: i32): i32 {
         return emitFailAt(RECORD_COPY_MSG, n.binRight)
       }
     } else if n is ArrayLit {
-      const ety = arrTyElemOf(nodeTyIxOf(cur))
+      const ety = tyStepElem(nodeTyIxOf(cur))
       if initJoinsWiderRecord(cur, nodeTyIxOf(cur)) {
         const er = joinRowOfTy(recordBaseTy(ety))
         if er >= 0 && rjaLeaves(n.arrElems, er, fnIx) < 0 { return -1 }
@@ -17693,7 +17679,7 @@ export function initJoinsWiderRecord(ini: i32, ty: i32): boolean {
   let base = -1
   const leaves: i32[] = []
   if n is ArrayLit {
-    base = recordBaseTy(arrTyElemOf(ty))
+    base = recordBaseTy(tyStepElem(ty))
     if base < 0 { return false }
     let e = 0
     while e < n.arrElems.length {
@@ -17724,14 +17710,6 @@ export function initJoinsWiderRecord(ini: i32, ty: i32): boolean {
     i = i + 1
   }
   false
-}
-
-// The element type of the list type `ty`, or -1 when `ty` is no list.
-function arrTyElemOf(ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = T.tys[ty]
-  if t is TyArray { return t.aElem }
-  -1
 }
 
 // Whether function `fnIx`, checked to return the record `rty`, returns a record of another
@@ -29498,33 +29476,6 @@ function internShapeArms(set: string, arms: string[]) {
   0
 }
 
-function tyStepNullable(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyNullable { return t.nInner }
-  -1
-}
-
-// The `TyFunc` arms of the same family: `annFnDecompose` hands back the param texts and the
-// result text, and these hand back the matching arena entries, declining unless the arena
-// really is a function of exactly that arity — an arity mismatch is a different function.
-function tyStepParam(ty: i32, i: i32, n: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyFunc {
-    if t.fnParamTypes.length != n { return -1 }
-    return t.fnParamTypes[i]
-  }
-  -1
-}
-
-function tyStepRet(ty: i32): i32 {
-  if ty < 0 { return -1 }
-  const t = T.tys[ty]
-  if t is TyFunc { return t.fnRet }
-  -1
-}
-
 // Peels the arena twin of a trailing-`[]` run, sized by how much the name shortened:
 // `arrLeafNameOf` shortens by exactly two characters per layer, so the layer count is the
 // length delta halved. An odd delta, or a layer the arena lacks, declines.
@@ -29541,12 +29492,12 @@ function tyStepArrRun(ty: i32, full: string, leaf: string): i32 {
   t
 }
 
-// `tyStepNullable`, but only when the name actually lost its `| null` — a non-nullable
+// `nullableInnerOrNone`, but only when the name actually lost its `| null` — a non-nullable
 // spelling keeps its own type rather than declining.
 function tyStepNulIf(ty: i32, full: string, base: string): i32 {
   if ty < 0 { return -1 }
   if base.length == full.length { return ty }
-  tyStepNullable(ty)
+  nullableInnerOrNone(ty)
 }
 
 export function internShapeDeep(nm: string) { internShapeDeepTy(nm, -1) }
@@ -29608,7 +29559,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
     return internFuncTypeShapesTy(nm, ty)
   }
   const np = nullablePartOf(nm)
-  if np != "" { return internShapeDeepTy(np, tyStepNullable(ty)) }
+  if np != "" { return internShapeDeepTy(np, nullableInnerOrNone(ty)) }
   // A mixed composite union: a top-level `|` here means at least one arm is a composite, so
   // its inline struct/map arms must intern now, before `collectAnonShapes` names the same
   // shape `#anonN` and the union arm's name-based lookup fails to find the reflist slot
@@ -29962,7 +29913,7 @@ function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
     return internFuncTypeShapesTy(fRet, tyStepRet(ty))
   }
   const np = nullablePartOf(nm)
-  if np != "" { return internFuncTypeShapesTy(np, tyStepNullable(ty)) }
+  if np != "" { return internFuncTypeShapesTy(np, nullableInnerOrNone(ty)) }
   // A composite-union position: every arm below this line reads one composite, so a
   // top-level `|` that is not a pure value union reached no arm at all and the shapes
   // inside its arms never interned. `internShapeDeepTy` owns that grammar, so this delegates
@@ -35719,7 +35670,7 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
         )
         if un != "" {
           const atoms: string[] = []
-          // The arm's element type is `tyArmElem` (a `TyArray` arm's element, the arena
+          // The arm's element type is `tyStepElem` (a `TyArray` arm's element, the arena
           // dual of the name path's `nameIsRefArray` gate plus its `refArrElemName`
           // re-resolution), and the `.f` leaf's code-19 map test is `tyArmPathIsMap`. An
           // uncovered row keeps the legacy name walk.
@@ -35731,7 +35682,7 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
             if cov {
               const path: string[] = []
               path.push(e.memProp)
-              if tyArmPathIsMap(tyArmElem(mems[i]), path) { return true }
+              if tyArmPathIsMap(tyStepElem(mems[i]), path) { return true }
             } else if nameIsRefArray(a) {
               // The arm's element struct: `refArrElemName` for a nominal element, the raw
               // `[]`-stripped text for an inline shape it cannot see. The dropped length
@@ -35872,7 +35823,7 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     if un == "" { return false }
     const atoms: string[] = []
     // The arm walk is structural (`tyArmPathIsMapList`, a `TyArray` over a `TyMap` leaf),
-    // and so is the indexed-root hop: `tyArmElem` takes a `TyArray` arm's element in place
+    // and so is the indexed-root hop: `tyStepElem` takes a `TyArray` arm's element in place
     // of `nameIsRefArray` + `refArrElemName` on the rendered atom.
     const mems: i32[] = []
     // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
@@ -35882,7 +35833,7 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
     while mi < mems.length {
       if atoms[mi] != "null" {
         let mem = mems[mi]
-        if viaElem { mem = tyArmElem(mem) }
+        if viaElem { mem = tyStepElem(mem) }
         if tyArmPathIsMapList(mem, path) { return true }
       }
       mi = mi + 1
@@ -35990,12 +35941,12 @@ export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
 function unionHasClosureArm(name: string) {
   const atoms: string[] = []
   // Value-atom kind 11 is "the member is a function type" — ask the arena
-  // (`unMemIsFunc`) rather than `valueAtomKind`'s spelling ladder.
+  // (`tyIxIsFunc`) rather than `valueAtomKind`'s spelling ladder.
   const mems: i32[] = []
   if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
-      if unMemIsFunc(mems[m]) { return true }
+      if tyIxIsFunc(mems[m]) { return true }
       m = m + 1
     }
     return false
@@ -36014,13 +35965,13 @@ function unionHasClosureArm(name: string) {
 // arms, so the tag comes from the arena type (`unionClosureArmTy` -> `cloArmTagOfTy`).
 export function unionClosureArmName(name: string) {
   const atoms: string[] = []
-  // The arm selection is structural (`unMemIsFunc`); the returned name stays the
+  // The arm selection is structural (`tyIxIsFunc`); the returned name stays the
   // member's stored spelling.
   const mems: i32[] = []
   if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
-      if unMemIsFunc(mems[m]) { return atoms[m] }
+      if tyIxIsFunc(mems[m]) { return atoms[m] }
       m = m + 1
     }
     return ""
@@ -36058,7 +36009,7 @@ export function unionClosureArmTy(name: string): i32 {
   if unionArmTys(name, atoms, mems) {
     let m = 0
     while m < mems.length {
-      if unMemIsFunc(mems[m]) { return mems[m] }
+      if tyIxIsFunc(mems[m]) { return mems[m] }
       m = m + 1
     }
   }
@@ -36688,10 +36639,10 @@ export function isUnionOfTy(ty: i32): boolean {
           if stn >= 0 {
             const a0 = unMemTys[stn]
             const a1 = unMemTys[stn + 1]
-            if tyIsNullPrim(a1) {
+            if isNullTy(a1) {
               if tySame(a0, t.nInner) { return true }
             }
-            if tyIsNullPrim(a0) {
+            if isNullTy(a0) {
               if tySame(a1, t.nInner) { return true }
             }
           }
@@ -39793,7 +39744,7 @@ export function narrowExcludesNull(name: string): boolean {
   if ty < 0 { return false }
   const t = T.tys[ty]
   if t is TyNullable { return false }
-  !tyIsNullPrim(ty)
+  !isNullTy(ty)
 }
 
 // `narrowExcludesNull`, or a complement narrowing whose surviving member set lacks `null` (the
@@ -41632,15 +41583,6 @@ export function unMemPeelAliasWrapper(m: i32): i32 {
   m
 }
 
-// A bare-closure member (`(() => i64) | i32` — value-atom kind 11).
-export function unMemIsFunc(m: i32): boolean {
-  if m < 0 { return false }
-  const t = T.tys[m]
-  if t is TyFunc { return true }
-  false
-}
-
-// A closure-element array member (`((i32) => f64)[]`, `nameIsClosureArray`). A
 // nullable-closure element (`(((i32) => boolean) | null)[]`) is a `TyNullable`
 // element, not a `TyFunc` — excluded here exactly as `nameIsClosureArray` excludes it.
 function unMemIsFuncArray(m: i32): boolean {
@@ -41820,15 +41762,6 @@ function tyArmPathLeaf(m: i32, path: string[]): i32 {
     cur = ft
     hop = hop + 1
   }
-  -1
-}
-
-// The arm type a `t0[i].f…` root walks from: the ELEMENT of a ref-array arm. -1 for a
-// non-array arm (the name path's `nameIsRefArray(arm)` gate, structurally).
-function tyArmElem(m: i32): i32 {
-  if m < 0 { return -1 }
-  const t = T.tys[m]
-  if t is TyArray { return t.aElem }
   -1
 }
 

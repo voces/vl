@@ -29,7 +29,7 @@ restate measurements; follow the links.
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**. Last: `compiler/check_pins.vl` (#3611), one `pinRun` over three phases. Next: D1 (callee-closed carves of `typecheck.vl`). | [L5 log](#l5-log) |
 | L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: `expCtxReset` clears the 17 pending seeds at compile start, never-cleared 172 of 1,156 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
-| L8 tyquery.vl, split classify | first PR (A3) **done** | `compiler/tyquery.vl` holds the four exact type-step twins once; the checker does not import it yet. |
+| L8 tyquery.vl, split classify | **in progress**. Last: `check_ty_shape.vl` merged into `compiler/tyquery.vl`, which both phases import; fourteen duplicate copies of eight queries deleted. Next: D2, the `emit_classify.vl` split. | [L8 log](#l8-log) |
 | L6 registries by key | step 5 **in progress**. Last: sixth switch, the five binding seams answer by the annotation's own key. Next: the `ty < 0` callers with no annotation node, then step 6. | [L6 log](#l6-log) |
 | L10 the `-O` optimizer | **in progress as T4**. Last: R6d, the compiler's inline-record step is the default and the host's fields step is deleted; 0 of 15,406 programs differ. Next: R7, list flattening. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
@@ -531,3 +531,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 ### L12 log
 
 - The playground adapter is a transport over `lsp/src/features.ts`, as `server.ts` is: `lspAdapter.ts` 614 → 389 lines. Where the two hosts disagreed, the shared behaviour was kept: hover's effect summary, UFCS completions with import edits, the protocol's code-action kind hierarchy, seed folding extents, `=>` token fusion and `\r\n` word scans. `tests/playground_lsp_parity_test.ts` now asserts that both hosts call each row's shared function. Code lens stays out because the playground keeps no use-map.
+
+### L8 log
+
+- `compiler/check_ty_shape.vl` is merged into `compiler/tyquery.vl`, which now imports only `ast`, `check_types` and `listutil`; 62 modules of both phases import it. Fourteen duplicate copies of eight queries are deleted: the `null` primitive, a list's element, a nullable's inner, a function's result and parameter, is-a-function, is-a-view and the literal base. Seed 5,855,200 → 5,853,232 bytes, `difftree.sh --identity` 0 of 15,267 files differ. Next: D2, the `emit_classify.vl` split.
