@@ -32,7 +32,9 @@ import {
   tyIsEmitRepresentable,
   tyIsLitUnion,
   tyIsPrimNamed,
+  tyReachesSelf,
   tyToEmitName,
+  unionAliasDeclNameOfTy,
 } from "./check_types"
 import { isStructUnionTy } from "./tyquery"
 
@@ -391,6 +393,48 @@ export function refArmUnionRetName(er: i32, stmts: i32[]) {
   ""
 }
 
+// The alias of self-referential declared union `u`, or "": `u` itself, or a union a join
+// re-minted with the members of the alias an arm's field spells (`next: Node | null`).
+function selfRefUnionAliasName(u: i32): string {
+  const own = unionAliasDeclNameOfTy(u)
+  if own != "" {
+    if tyReachesSelf(u) { return own }
+    return ""
+  }
+  const t = T.tys[u]
+  if !(t is TyUnion) { return "" }
+  for m in t.uMembers {
+    const mt = T.tys[m]
+    if mt is TyObj {
+      for f in mt.objFieldTypes {
+        let fu = f
+        if fu >= 0 {
+          const ft = T.tys[fu]
+          if ft is TyNullable { fu = ft.nInner }
+        }
+        if fu >= 0 && fu != u {
+          const fut = T.tys[fu]
+          if fut is TyUnion {
+            const nm = unionAliasDeclNameOfTy(fu)
+            if nm != "" && sameMemberSeq(fut.uMembers, t.uMembers) { return nm }
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
+function sameMemberSeq(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
+}
+
 // The emitter-format name of a variant-box union `er` with an inline-struct arm and a
 // scalar/string sibling (`i32 | {w: i32}`): every member an object shape or scalar/string
 // prim, at least one object. `synthRetAnnots` pins a lambda's `fnRet` to this, routing it
@@ -408,6 +452,11 @@ export function variantBoxUnionRetName(er: i32) {
     return ""
   }
   if t is TyUnion {
+    // A self-referential declared union (`type Node = {next: Node | null} | {e: i32}`) is
+    // named by its alias, the spelling its annotation lowers: an arm field spells the union
+    // itself, so the field-wise render below has no finite answer.
+    const selfAlias = selfRefUnionAliasName(er)
+    if selfAlias != "" { return irAtoms(selfAlias, 1) }
     const members = t.uMembers
     if members.length < 2 { return "" }
     // A litunion-alias member's literals flatten into sibling `TyLit` members, so no single
