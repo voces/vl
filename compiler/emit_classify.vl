@@ -171,9 +171,11 @@ import { listDisjointDepth, listIsFitsAcrossReps } from "./check_type_shape"
 import {
   T,
   TyArray,
+  TyErr,
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
@@ -979,6 +981,7 @@ import {
   coalesceRetypedAtomToStr,
   coalesceStaysNullable,
   columnListRep,
+  columnListRepAt,
   condElseMayNarrow,
   exactBindWalk,
   exactSubOuterTyOf,
@@ -14350,6 +14353,9 @@ export function sharedUnionFieldPlan(
   outVis: i32[],
   outFis: i32[],
 ): i32 {
+  // A receiver the checker recorded as a record, scalar, list, map or function is no struct
+  // union at any instance (D5066).
+  if !tyMayInstUnion(nodeTyIxOf(unwrapParen(recvIx))) { return -1 }
   if !exprUnion(recvIx, fnIx) { return -1 }
   const recv = P.nodes[unwrapParen(recvIx)]
   // The receiver need not be an ident — a non-ident receiver's re-evaluation is handled by
@@ -14357,12 +14363,23 @@ export function sharedUnionFieldPlan(
   let set = ""
   let setId = -1
   if recv is Ident {
-    set = currentStructNarrowSetAt(recv.identName, fnIx, unwrapParen(recvIx))
-    setId = currentStructNarrowSetIdAt(
-      recv.identName,
-      fnIx,
-      unwrapParen(recvIx),
-    )
+    // `currentStructNarrowSetAt` and its set-id twin, sharing one slot lookup and one
+    // declared-union read.
+    const slot = narrowSlotOf(recv.identName)
+    if slot >= 0 && narrowVariants[slot] != "" {
+      set = narrowVariants[slot]
+      setId = narrowSets[slot]
+    } else {
+      const ux = unwrapParen(recvIx)
+      set = unionMemberSetOf(
+        unionNameOfIdentAt(sidOf(recv.identName), fnIx, ux),
+      )
+      if slot >= 0 {
+        setId = narrowSets[slot]
+      } else {
+        setId = msSetOfText(set)
+      }
+    }
   } else {
     set = unionMemberSetOf(unionNameOfExpr(recvIx, fnIx))
     setId = msSetOfText(set)
@@ -16811,10 +16828,41 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
 // its first element or its callee spells. A local read from outside its own emission is left
 // to the scope rung.
 function valueUnionBoxList(exprIx: i32, fnIx: i32): boolean {
+  if !tyMayInstUnionList(nodeTyIxOf(exprIx)) { return false }
   if identReadOutOfScope(exprIx, fnIx) { return false }
-  const el = tyArrayElemIx(nodeTyInOf(exprIx, fnIx))
+  const ty = nodeTyInOf(exprIx, fnIx)
+  const el = tyArrayElemIx(ty)
   if el < 0 || !(T.tys[el] is TyUnion) { return false }
-  columnListRep(exprIx, fnIx) == "reflist"
+  columnListRepAt(exprIx, ty) == "reflist"
+}
+
+// Whether a node recorded at `raw` can be a list of unions at some instance, read off its head
+// (D5065): binding a type variable keeps a record, function, map or nullable head, and a
+// union is kept, since its members can collapse onto one list.
+function tyMayInstUnionList(raw: i32): boolean {
+  if raw < 0 || raw >= T.tys.length { return false }
+  const t = T.tys[raw]
+  match t {
+    TyArray => {
+      const el = t.aElem
+      if el < 0 || el >= T.tys.length { return false }
+      const et = T.tys[el]
+      et is TyUnion || et is TyVar
+    }
+    TyVar | TyUnion | TyNeg => true
+    TyPrim | TyErr | TyObj | TyFunc | TyMap | TyLit | TyNullable => false
+  }
+}
+
+// Whether a node recorded at `raw` can be a union at some instance, read off the head alone;
+// true where nothing is recorded.
+function tyMayInstUnion(raw: i32): boolean {
+  if raw < 0 || raw >= T.tys.length { return true }
+  const t = T.tys[raw]
+  match t {
+    TyVar | TyUnion | TyNullable | TyNeg | TyErr => true
+    TyPrim | TyObj | TyFunc | TyMap | TyLit | TyArray => false
+  }
 }
 
 // `exprListRep`'s answer from the expression's shape alone, for a node no recorded type settled.
