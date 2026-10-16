@@ -532,6 +532,48 @@ Old pump (first heap 0) against new (256 MiB), interleaved, three reps, CPU s / 
 `fmt` halves because its many small files no longer collect a growing-from-zero heap over and
 over; `check` is within load noise; the price is up to ~86 MB more peak RSS on a small run.
 
+## Measured 2026-10-16 — the L2 self-compile fuel, 68.3G to 101.9G (D5065–D5067)
+
+The baseline was 69.33G at `749ac2020`, and master `7ce930c32` read 101.87G (+46.9%, the 1.5x
+trip line at 103.99G). Each sample is the current seed building that commit's `compiler/`, then
+that compiler building the same source under `$VL_FUEL=1`. That is codegen at the current seed, and
+it reads the same as the commit's own fixpoint at both ends (`46ab2689e`, `c510d3523`).
+
+| first-parent | date | lines | L2 fuel | fuel per line |
+| --- | --- | ---: | ---: | ---: |
+| `46ab2689e` (#3577) | 10-12 | 255,114 | 68.30G | 267,721 |
+| `d7ac77e90` | 10-13 | 260,999 | 73.04G | 279,844 |
+| `f58c1b27a` | 10-14 | 266,948 | 74.70G | 279,830 |
+| `49c433040` | 10-15 | 275,439 | 80.77G | 293,244 |
+| `3affca3dd` | 10-15 | 277,696 | 92.12G | 331,714 |
+| `d73718aeb` | 10-16 | 288,107 | 94.14G | 326,737 |
+| `7ce930c32` (#3912) | 10-16 | 297,847 | 101.87G | 342,026 |
+
+Source grew 16.8% and 37 modules became 199. Fuel grew 49.2%, so fuel per line grew 27.8%.
+
+- **(c) measurement, −1.5%.** `46ab2689e` reads 68.30G against the baseline's 69.33G. That is
+  the wasmtime 49 fuel unit (2026-10-14 above). **Fuel also depends on the source PATH**: an
+  absolute 110-character path read +0.46% at 37 modules and +3.1% at 199, because module keys
+  are hashed and compared everywhere. `self-compile-time.sh` builds `compiler/entry.vl` from the
+  checkout root, so take every reading that way.
+- **(b) D5065, +11.8%.** #3830 (18 lines): `valueUnionBoxList` asks every list-rep question for
+  the instance type and its type-variable walk. It is 6.1% of master's profile.
+- **(b) D5066, +3.9%.** #3579 (887 lines, Q4 (c)): `sharedUnionFieldPlan` is rebuilt at each
+  classifier question about a member read. It is 4.8% of master's profile.
+- **(b) D5067, +3.3%.** #3885 +1.72% and #3904 +1.62%: a union key is re-rendered from its
+  spelling before its memo is probed. `canonUnionKeyOfAnnName` is 2.7% of master's profile.
+- **(a) source, +7.2G.** The checker and classifier carves (#3862 +0.61%, #3867
+  +1.13%, #3886 +0.46%, #3896 +2.09%, #3905 +1.48%) moved code without adding any. Per module,
+  `modCommitStr` re-scans every import of every committed module (`modRecomputePending`, 0.8%:
+  quadratic in modules, no row yet). #3737 (+2.05%, 2,861 lines) is the multi-value step's new
+  compiler code, and its PR priced it at +2.75%.
+- The other 11.0G spread across ~300 commits. No measured interval outside the steps above
+  reads over 2.5%; the largest single commits bisected were #3607 (the function-value flow
+  table in shadow mode, +1.5%) and #3752 (+1.0%).
+
+The baseline is rewritten with this section, from its own head: the three rows are filed, and
+the rest is source and the fuel unit.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
