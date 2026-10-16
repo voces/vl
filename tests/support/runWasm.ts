@@ -17,6 +17,7 @@
 
 import { sourceFrames, wasmFrames } from "./vlSrcSection.ts";
 import { vlHostImports } from "../../compiler/vlHostImports.ts";
+import { FLOOR_NAMES } from "./hostFloor.ts";
 
 export type RunResult = {
   logs: string[];
@@ -142,7 +143,12 @@ const mapTrap = (err: unknown, wasm?: Uint8Array): unknown => {
       frames,
     );
   }
-  return new VLRuntimeError(`runtime error — ${reason}`, reason, undefined, frames);
+  return new VLRuntimeError(
+    `runtime error — ${reason}`,
+    reason,
+    undefined,
+    frames,
+  );
 };
 
 /**
@@ -220,29 +226,12 @@ export const runWasm = async (wasm: Uint8Array): Promise<RunResult> => {
         // these carries `// @skip`, which this harness honors and the native
         // alignment suite deliberately does not. See `scripts/vl-host/src/main.rs`'s
         // `register_fs_imports` for the working implementation.
+        //
+        // The process floor (`std:process`, `std:env`) is blocked by the SAME two walls;
+        // only `__proc_exit__` is scalar in both directions, and it is implemented below.
+        // The names are `FS_FLOOR`'s rows, read by `hostFloor.ts`, not a list kept here.
         ...Object.fromEntries(
-          [
-            "__fs_read__",
-            "__fs_read_range__",
-            "__fs_read_into__",
-            "__fs_size__",
-            "__fs_write__",
-            "__fs_write_at__",
-            "__fs_write_from__",
-            "__fs_list__",
-            "__fs_stat__",
-            "__args_count__",
-            "__args_get__",
-            "__fs_errno__",
-            // The process floor (`std:process`, `std:env`) is blocked by the SAME two
-            // walls: `__proc_run__` and `__env_get__` are handed a `u8[]`, and the three
-            // that answer one would have to build it. Only `__proc_exit__` is scalar in
-            // both directions, and it is implemented below.
-            "__proc_run__",
-            "__proc_out__",
-            "__proc_err__",
-            "__env_get__",
-          ].map((name) => [name, () => {
+          FLOOR_NAMES.map((name) => [name, () => {
             throw new Error(
               `${name} is not available under the V8 harness — WasmGC values are opaque to JS ` +
                 `and cannot be constructed from it. Run this case through the native \`vl\` ` +
