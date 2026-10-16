@@ -1,0 +1,390 @@
+// `emit_eq_rows.vl` — the equality rows: which element class a compare takes and
+// whether its reps are comparable.
+
+import { Ident, P } from "./ast"
+import { nodeTyIsLitUnionAlias, nodeTyIxOf } from "./check_node_tys"
+import { valueAtomKind } from "./check_ty_rep"
+import { tyIsLitUnion } from "./check_types"
+import {
+  sFieldTgtStructIdx,
+  sFieldTypeAt,
+  variantFieldTypeAt,
+} from "./emit_atom_kinds"
+import { unwrapParen } from "./emit_base"
+import {
+  eqListKindOfListRep,
+  fieldCodeOfListRep,
+  isScalarBackedListRep,
+  listRepOfFieldCode,
+  nulListBase,
+  rlElemListRep,
+} from "./emit_list_rep"
+import { gLitUnionUsed } from "./emit_lit_atoms"
+import { lixFirstOf, lixNextOf, variantIndexOf } from "./emit_narrow_slots"
+import {
+  rlElemInnerSlot,
+  rlElemStructRow,
+  rlElemVariantRow,
+  uFieldTgtStructIdx,
+} from "./emit_shape_rows"
+import {
+  FC_CLOSURE,
+  FC_F64,
+  FC_I32,
+  FC_I32_LIST,
+  FC_NUL_BOOL,
+  FC_NUL_CLOSURE,
+  FC_NUL_LIT_UNION,
+  FC_NUL_STR,
+  FC_STR,
+  FC_STRUCT,
+  LBK_F32_LIST,
+  LBK_F64_LIST,
+  LBK_I32_LIST,
+  LBK_I64_LIST,
+  LBK_REF,
+  LBK_STR_LIST,
+  LBK_U8_LIST,
+  RLK_REF_LIST,
+  localLitUnion,
+  rlElemKindTbl,
+  rlElemNullable,
+  sFieldCount,
+  sHeapIdx,
+  uFieldCount,
+  uVarHeap,
+} from "./emit_state"
+import { unionMemberSetOf } from "./emit_union_registry"
+import { splitUnionAtoms } from "./tyname"
+
+// The reservation scan's over-approximation for a shadowed name. `exprIsLitAtom`'s `Ident` arm
+// resolves through `declaredSlotOf`, whose fallback is a first-match scan over `localNames`,
+// and this scan runs with an empty scope stack, so an outer binding wins where emit time binds
+// the inner one. Scan-side only: over-reserving costs locals, under-reserving is invalid wasm.
+export function identShadowMayBeLitAtom(exprIx: i32, _fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    // Only a name with more than one declared local can be resolved differently by the two
+    // phases; a unique name gets the same answer from both, and claiming it here would reserve
+    // frames for every ordinary string local in the program.
+    let seen = 0
+    let hit = false
+    let i = lixFirstOf(e.identName)
+    while i >= 0 {
+      seen = seen + 1
+      if i < localLitUnion.length {
+        if localLitUnion[i] == 1 { hit = true }
+      }
+      i = lixNextOf(i)
+    }
+    if seen > 1 { return hit }
+  }
+  false
+}
+
+// True if the return annotation at `tyIx` is an un-named (inline) literal union — a pure
+// litunion in the arena that is not a registered alias. The alias reps as an interned atom,
+// the inline form a string ref; `nodeTyIsLitUnionAlias` is the seam between them.
+export function retLitUnionInline(tyIx: i32): boolean {
+  if tyIx < 0 { return false }
+  if nodeTyIsLitUnionAlias(tyIx) { return false }
+  tyIsLitUnion(nodeTyIxOf(tyIx))
+}
+
+// ── the eq layout row ─────────────────────────────────────────────────────────
+// A field-wise compare walks a layout and this emitter has two tables holding one, disjoint
+// because `collectS` skips a `type X = {…}` that is a union member (D57). An eq row encodes
+// both: `row >= 0` is a struct row, `row < 0` variant `-1 - row`; only a chain root is a variant.
+export function eqRowOfVariant(vi: i32) { -1 - vi }
+
+// Field count of an eq row, from whichever table owns it.
+export function eqRowFieldCount(row: i32) {
+  if row < 0 { return uFieldCount[-1 - row] }
+  sFieldCount[row]
+}
+
+// The wasm-type code of an eq row's field `fi`. The two tables share one code vocabulary, so
+// the compare's field ladder is written once and its one loud floor catches the unsupported
+// codes whichever table the row came from.
+export function eqRowFieldTypeAt(row: i32, fi: i32) {
+  if row < 0 { return variantFieldTypeAt(-1 - row, fi) }
+  sFieldTypeAt(row, fi)
+}
+
+// The heap type an eq row's values are physically read through. A variant's cell is
+// `(ref $uVarHeap[vi])` — a different heap type from any same-shaped `sHeapIdx` twin, and
+// reading one through the other is the `expected (ref $type), found (ref $type)` family.
+export function eqRowHeapIdx(row: i32) {
+  if row < 0 { return uVarHeap[-1 - row] }
+  sHeapIdx[row]
+}
+
+// The struct-table row an eq row's code-15 field targets — a struct row from either table, or
+// -1, the loud no-interned-shape floor, when the target is itself an arm.
+export function eqRowTgtStructIdx(row: i32, fi: i32) {
+  if row < 0 { return uFieldTgtStructIdx(-1 - row, fi) }
+  sFieldTgtStructIdx(row, fi)
+}
+
+// ── list `==` and `+` detection: which functions need the list-op frames ──────
+// Which list rep claims an expression: `LR_NONE` 0, string list 1, f64 2, i64 3, f32 4, u8 5,
+// ref 6, the i32 core 7. `lrSlot` is the ref list's `rlElemKindTbl` slot (-1 on every other
+// arm), read here because both consumers need it and neither may ask twice.
+export type ListRep = { lrRep: i32, lrSlot: i32 }
+export const LR_NONE = 0
+export const LR_STR = 1
+export const LR_F64 = 2
+export const LR_I64 = 3
+export const LR_F32 = 4
+export const LR_U8 = 5
+export const LR_REF = 6
+export const LR_I32 = 7
+
+// A rep with no ref slot — every arm but `LR_REF`.
+export function lrOf(rep: i32): ListRep {
+  const r: ListRep = { lrRep: rep, lrSlot: -1 }
+  r
+}
+
+// ── list `==` over a rep with no core of its own — the one home ───────────────
+// The `==` twin of `catListKindOfBin`, separate because a concat inspects no element and a
+// compare does — one opcode per scalar leaf, the string helper for a string leaf, a recursion
+// for a nested list — so the accept set is narrower. `listOpKindOfBin` runs first.
+
+// What `emitListEqGCore` must do with one element of list rep (kind, slot): `scalar` compare
+// two leaves with `eqgNeOpcode(kind)`, `string` through the string-eq helper, `list` recurse
+// into the element's own list core, `struct` field-wise, `none` no answer. Keyed on the rep and
+// not the arena type, because the emitter's frames and heap indices are keyed that way.
+export type EqgElemClass = "none" | "scalar" | "string" | "list" | "struct"
+export function eqgElemClass(kind: i32, slot: i32): EqgElemClass {
+  // The scalar-leaf list reps: i32 (and everything that reps as one), f64, i64, f32, u8.
+  if (
+    kind == LBK_I32_LIST
+    || kind == LBK_F64_LIST
+    || kind == LBK_I64_LIST
+    || kind == LBK_F32_LIST
+    || kind == LBK_U8_LIST
+  ) {
+    return "scalar"
+  }
+  if kind == LBK_STR_LIST { return "string" }
+  if kind == LBK_REF {
+    if slot < 0 || slot >= rlElemKindTbl.length { return "none" }
+    // An inner list of any rep compares through its own list core.
+    if rlElemListRep(rlElemKindTbl[slot]) != null { return "list" }
+    // A struct element, field-wise, but only over the fields whose compare needs no frame of
+    // its own. A nullable element is excluded here rather than by the row lookup, and the two
+    // are not the same test: `(Circle | null)[]` resolves the same row a `Circle[]` does, so a
+    // row-based gate would admit it and the field compare would `struct.get` through a null.
+    if slot < rlElemNullable.length {
+      if rlElemNullable[slot] == 1 { return "none" }
+    }
+    if eqgElemHasEqRow(slot) {
+      if eqgStructElemFlat(eqgElemEqRow(slot), 0) { return "struct" }
+    }
+    return "none"
+  }
+  "none"
+}
+
+// ── the ref-list element's eq row, in both namespaces ─────────────────────────
+// Asked in the order the `==` dispatch asks them: declaring `type Shape = Circle | Sq` moves
+// `Circle` out of the struct table, so a `Circle[]` element resolves a variant row where it
+// resolved a struct one (D57). The found flag is needed because -1 is variant row 0.
+export function eqgElemHasEqRow(slot: i32): boolean {
+  if rlElemStructRow(slot) >= 0 { return true }
+  rlElemVariantRow(slot) >= 0
+}
+
+export function eqgElemEqRow(slot: i32): i32 {
+  const sr = rlElemStructRow(slot)
+  if sr >= 0 { return sr }
+  eqRowOfVariant(rlElemVariantRow(slot))
+}
+
+// Is this struct row's field-wise compare emittable inside a list loop with no frame the
+// reservation scan did not reserve? Every field must be a native-compare scalar or a nested
+// struct whose own row satisfies the same rule. The accept set is drawn around the frames, not
+// around soundness: a `string` field compares correctly but stages in a frame nothing reserved.
+export function eqgStructElemFlat(row: i32, depth: i32): boolean {
+  if depth > 8 { return false }
+  const cnt = eqRowFieldCount(row)
+  // A fieldless struct compares as `i32.const 1`, which is correct and needs nothing — but it
+  // is also the answer a row the tables do not cover gives, so a count alone cannot admit it.
+  if cnt == 0 { return false }
+  let fi = 0
+  while fi < cnt {
+    const code = eqRowFieldTypeAt(row, fi)
+    if code == FC_STRUCT {
+      // A nested-struct field target is a struct row in either namespace, or -1 for no
+      // interned shape, so here — unlike the row above — a negative is the absence and must
+      // be refused.
+      const tgt = eqRowTgtStructIdx(row, fi)
+      if tgt < 0 { return false }
+      if !eqgStructElemFlat(tgt, depth + 1) { return false }
+    } else if (
+      code != FC_I32
+      && code != FC_F64
+      && code != FC_NUL_BOOL
+      && code != FC_NUL_LIT_UNION
+    ) {
+      return false
+    }
+    fi = fi + 1
+  }
+  true
+}
+
+// The nested element's own list-rep kind, in `catListKindOfExpr`'s alphabet. Only a ref-list
+// slot has one; `eqgElemClass` answering `list` is the precondition.
+export function eqgInnerKind(slot: i32) {
+  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
+  const k = rlElemListRep(rlElemKindTbl[slot])
+  if k == null { return -1 }
+  eqListKindOfListRep(k)
+}
+
+// The nested element's ref-list slot, or 0 for an element rep that is not slot-keyed — the
+// same convention `listOpSlotOfBin` uses, and for the same reason.
+export function eqgInnerSlot(slot: i32) {
+  if slot < 0 || slot >= rlElemKindTbl.length { return 0 }
+  if rlElemKindTbl[slot] == RLK_REF_LIST { return rlElemInnerSlot(slot) }
+  0
+}
+
+// The scalar-list field code to generic-compare kind map (D1020), in `catListKindOfExpr`'s
+// alphabet, or -1 for a field code that is not a scalar-backed list. One home because two
+// sides read it: the compare-frame reservation and the field-equality ladder, and a core
+// emitted against a frame nobody reserved refuses loudly. Code 4 is deliberately absent.
+export function eqScalarListFieldKind(code: i32): i32 {
+  const k = listRepOfFieldCode(code)
+  if !isScalarBackedListRep(k) { return -1 }
+  if k == null { return -1 }
+  eqListKindOfListRep(k)
+}
+
+// D1180 — the non-null twin of a ref-niche field code, or -1 when the code is not one. A
+// `(ref null $H)` field is `null` or a value of `$H`, so its compare is the non-null code's
+// core under a null guard — one wrapper, not one arm per rep. One home, since the frame
+// pre-pass resolves a niche through this and `emitStructEqFieldInner` opens the guard from it.
+export function nulFieldInnerCode(code: i32): i32 {
+  if code == FC_NUL_STR {
+    return FC_STR // `string | null`
+  }
+  if code == FC_NUL_CLOSURE {
+    return FC_CLOSURE // `fn | null`
+  }
+  // A nullable list field's twin is its base list's code.
+  const base = nulListBase(listRepOfFieldCode(code))
+  if base == null { return -1 }
+  fieldCodeOfListRep(base)
+}
+
+// D1180 — the same map for a variant arm's field, differing in exactly one rung: code 4 is
+// included here and excluded there, because the struct ladder carries a hand-written `i32[]`
+// arm that predates the generic cores and the variant ladder has none. One home for the same
+// pairing its sibling is one for: the frame reservation and the core emitter read it alike.
+export function eqVariantListFieldKind(code: i32): i32 {
+  if code == FC_I32_LIST {
+    return 0 // i32[] / boolean[] / K[]
+  }
+  eqScalarListFieldKind(code)
+}
+
+// The union-atom code to generic-compare kind map, in `catListKindOfExpr`'s alphabet, or -1
+// for an atom that is not a list (D1095). The union box's `value` field holds a list arm's
+// wrapper ref directly, so an arm's compare is a list compare over that wrapper. The two
+// alphabets differ — an atom's `7` is `i32[]`, a compare kind's `7` is `f32[]` — hence a name.
+export function leqCoreKindOfAtomKind(k: i32): i32 {
+  if k == 7 || k == 17 || k == 18 {
+    return 0 // i32[] / boolean[] / K[]
+  }
+  if k == 8 {
+    return 4 // f64[]
+  }
+  if k == 9 {
+    return 3 // string[]
+  }
+  if k == 10 {
+    return 6 // i64[]
+  }
+  if k == 12 {
+    return 7 // f32[]
+  }
+  if k == 13 {
+    return 10 // u8[] — the packed byte list
+  }
+  0 - 1
+}
+
+// Can `emitListEqGCore` compare two values of list rep (kind, slot)? Walks the element chain
+// the emitter will recurse along, so the reservation scan, the emitter and this predicate
+// cannot disagree about how deep the recursion goes. The depth bound is not decoration: this
+// walks a table, and an inner-slot column pointing at its own row would hang the compiler.
+export function eqgRepComparable(kind: i32, slot: i32, depth: i32): boolean {
+  if depth > 32 { return false }
+  match eqgElemClass(kind, slot) {
+    "scalar" | "string" | "struct" => {
+      return true
+    }
+    "list" => {
+      return eqgRepComparable(eqgInnerKind(slot), eqgInnerSlot(slot), depth + 1)
+    }
+    "none" => {
+      return false
+    }
+  }
+}
+
+// True if the layout at eq row `row` carries a function-typed field, looking through
+// nested-struct fields. `seen` guards recursive shapes and holds eq rows rather than struct
+// indices — the encoding is injective, so a struct row and a variant row cannot collide.
+export function shapeHasCloField(row: i32, seen: i32[]) {
+  let k = 0
+  while k < seen.length {
+    if seen[k] == row { return false }
+    k = k + 1
+  }
+  seen.push(row)
+  let fi = 0
+  while fi < eqRowFieldCount(row) {
+    let code = eqRowFieldTypeAt(row, fi)
+    // A `fn | null` field runs the identity core under a null guard, so it needs the same
+    // two-slot frame its non-null twin does — resolved through the one home the guard opens
+    // from, else the core is a `local.set` into a slot the function never declared (D1292).
+    const cn = nulFieldInnerCode(code)
+    if cn >= 0 { code = cn }
+    if code == FC_CLOSURE { return true }
+    if code == FC_STRUCT {
+      const nsi = eqRowTgtStructIdx(row, fi)
+      if nsi >= 0 {
+        if shapeHasCloField(nsi, seen) { return true }
+      }
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+// Note one `BinExpr`'s function-identity equality site into `fnUsesCloEq` — the compare stages
+// both operands in the two-slot closure-eq frame. All three namespaces, off the shared
+// resolvers: this is a reservation scan, and a layout it cannot see is a `local.set` into a
+// slot the function never declared. `unionArmsNeedCloEq` asks it of a union operand's arms.
+export function unionArmsNeedCloEq(uname: string): boolean {
+  if uname == "" { return false }
+  const arms: string[] = []
+  splitUnionAtoms(unionMemberSetOf(uname), arms)
+  let ui = 0
+  while ui < arms.length {
+    if valueAtomKind(arms[ui]) == 11 { return true }
+    const avi = variantIndexOf(arms[ui])
+    if avi >= 0 {
+      const aseen: i32[] = []
+      if shapeHasCloField(eqRowOfVariant(avi), aseen) { return true }
+    }
+    ui = ui + 1
+  }
+  false
+}

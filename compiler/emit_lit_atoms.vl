@@ -1,0 +1,425 @@
+// `emit_lit_atoms.vl` — the literal-atom interner, and whether an expression or
+// push stages an atom narrow.
+
+import { Call, Ident, LetDecl, P, StrLit } from "./ast"
+import { nodeArrayElemIsNullUnit, nolLitTakenOther } from "./check_bind_rows"
+import { holePinReadOf } from "./check_emit_queries"
+import { nodeTyPinIxOf } from "./check_hole_pins"
+import { anyLitUnionUsed } from "./check_leaf_steps"
+import {
+  nodeArrayElemIsNulBool,
+  nodeArrayElemIsNulStr,
+  nodeArrayElemTyIx,
+  nodeTyIsLitUnionAlias,
+  nodeTyIxOf,
+} from "./check_node_tys"
+import { tyIsNullUnit } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyObj,
+  TyVar,
+  tyBearsNull,
+  tyIsLitUnionAlias,
+  tyIsLitUnionOrLit,
+} from "./check_types"
+import { nodeUnwidenedTyOf } from "./check_wide_lits"
+import { variantFieldElemName, variantFieldTypeAt } from "./emit_atom_kinds"
+import { unionEqOperandOk, unwrapParen } from "./emit_base"
+import { fnStmtsPosOf } from "./emit_capture_frames"
+import { ifJoinNarrowsPerArm } from "./emit_narrow_slots"
+import { paramTypeNode } from "./emit_query"
+import {
+  uFieldMapShape,
+  uFieldTgtStructIdx,
+  variantFieldRefSlot,
+} from "./emit_shape_rows"
+import { cloNameSigKey, sigKeyOfTy } from "./emit_sig_tokens"
+import {
+  FC_CLOSURE,
+  FC_I32,
+  FC_I32_LIST,
+  FC_MAP,
+  FC_NUL_CLOSURE,
+  FC_NUL_LIT_UNION,
+  FC_NUL_MAP,
+  FC_NUL_REF_LIST,
+  FC_REF_LIST,
+  FC_STRUCT,
+  FC_UNION,
+  fnParent,
+  fnStmts,
+  localLitUnion,
+  monoHoleSubN,
+  monoHoleSubRow,
+  monoHoleSubT,
+  sFieldCloSig,
+  sFieldStart,
+  startStmts,
+  uFieldNames,
+  uFieldStart,
+  uVarTyIx,
+} from "./emit_state"
+import { bindingDeclInScope } from "./emit_struct_order"
+import { tyIsNulPrim } from "./emit_ty_canon"
+import { variantFieldIndex } from "./emit_variant_sig"
+import {
+  tyHasTyVar,
+  tyMapValOf,
+  tyNulLitUnionMemberTexts,
+  tyPeelNul,
+  tyStepElem,
+} from "./tyquery"
+
+// Bit 256: does this `.push` need the atom-narrow staging slot? Deliberately an
+// over-approximation, with scope-free inputs — this walk carries no live scope stack, so it
+// claims the whole superset. Claiming too much costs one unused local; claiming too little is
+// a `local.set` against an index the locals vector never declared. It rides `callPushBits`.
+export function pushStagesAtomNarrow(callIx: i32): boolean {
+  if gLitUnionUsed == 0 { return false }
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length != 1 { return false }
+    const a = P.nodes[unwrapParen(c.callArgs[0])]
+    // A member string literal lowers as its interned id with no tower at all.
+    if a is StrLit { return false }
+    // A re-readable place takes the re-reading tower, which needs no slot.
+    return !unionEqOperandOk(c.callArgs[0])
+  }
+  false
+}
+
+// Bit 256 at a value position: does the expression at `ix` itself need the atom-narrow staging
+// slot? The sibling of `pushStagesAtomNarrow`, one destination set wider — that one asks of a
+// `.push` argument, where the members come from the destination, this of any value reaching
+// `emitExpr`'s `pendingLitUnion` hook. `_fnIx` is unused: a scope test here would be wrong.
+export function exprStagesAtomNarrow(exprIx: i32, _fnIx: i32): boolean {
+  if gLitUnionUsed == 0 { return false }
+  const ax = unwrapParen(exprIx)
+  const a = P.nodes[ax]
+  // A member string literal lowers as its interned id with no tower at all.
+  if a is StrLit { return false }
+  // A join hands the atom destination to each arm, which the descent below asks about.
+  if ifJoinNarrowsPerArm(ax) { return false }
+  // A re-readable place takes the re-reading tower, which needs no slot.
+  if unionEqOperandOk(exprIx) { return false }
+  // A value whose recorded type is a registered litunion alias is already the atom — no
+  // conversion is wanted at any destination, and the emit declines it through the same test.
+  // Scope-free, an arena index-set membership, so unlike `exprIsLitAtom` as a whole it cannot
+  // answer differently here from at emit time for the shape it claims.
+  const axTy = nodeUnwidenedTyOf(ax)
+  if tyIsLitUnionAlias(axTy) { return false }
+  // The value's own recorded type — `strReppedLitUnionAt`'s test, and a singleton `TyLit`
+  // counts for that predicate's reason: `if s is "aa"` and an `"aa"` parameter both produce
+  // one, whose value is the same string and whose atom-slot destination is the same i32.
+  tyIsLitUnionOrLit(axTy)
+}
+
+// ── literal-union atoms (`type K = "a" | "b"`) ──
+// A literal-union value is an interned i32 id: each distinct member string gets one id,
+// interned lazily by its raw `StrLit` text. The literal members come from the checker; the
+// emit-side `udVariants` are widened to `"string"` and must not be used.
+let litAtomId: {[string]: i32} = Map()
+
+let litAtomNext: i32 = 0
+
+// Seeded around a literal-union boundary (binding init or `==` operand) so a member `StrLit`
+// lowers as its interned i32 id instead of a string. The atom analogue of `pendingNulString`.
+export let pendingLitUnion: i32 = 0
+
+// Whether the module uses any literal-union type (named or inline). Set once per program by
+// a single `P.nodes` scan; every per-node litunion detector early-outs on it, so a program
+// with no literal unions pays none of the per-node atom-detection cost.
+export let gLitUnionUsed: i32 = 0
+
+export function resetLitAtoms() {
+  litAtomId = Map()
+  litAtomNext = 0
+  gLitUnionUsed = 0
+  if anyLitUnionUsed() { gLitUnionUsed = 1 }
+  // `startStmts` is filled by `collectFns`, so on a compiler instance that emits several
+  // programs the collect passes ahead of it still observe the previous program's node
+  // indices, and dereferencing one into the re-minted arena traps. Emptied here, ahead of
+  // every pass, so a query issued before `collectFns` reads an empty table and declines.
+  startStmts = []
+  sidResetStartBlockLet()
+  0
+}
+
+export function sidResetStartBlockLet() {
+  sblVal = []
+  sblStamp = []
+  sblSortedCand = []
+  sblSortedOwner = []
+  sblSortedPos = []
+  sblSortedSkip = []
+  sblSortStart = []
+  sblSortCount = []
+  0
+}
+
+export function internAtom(text: string) {
+  // One probe, not two: a `.has` guard does not narrow a later `m[k]` read
+  // (`map-has-guard-reread`), and this is the atom interner, hit once per literal in the
+  // program, so a second probe would be on a real path.
+  const atomHit = litAtomId[text]
+  if atomHit is i32 { return atomHit }
+  const id = litAtomNext
+  litAtomId[text] = id
+  litAtomNext = id + 1
+  id
+}
+
+// True if the binding/global at `letIx` is annotated with a literal-union type (an i32-backed atom).
+export function letIsLitUnion(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const r = nodeTyIsLitUnionAlias(d.letType)
+      return r
+    }
+  }
+  false
+}
+
+// Does the local at `slot` hold an interned atom? The flag `collectLocals` actually wrote,
+// read back rather than re-derived, so a store at the binding boundary and the slot it writes
+// into cannot answer differently — the disagreement D1196 priced (D1752).
+export function localSlotIsLitAtom(slot: i32): boolean {
+  if slot < 0 || slot >= localLitUnion.length { return false }
+  localLitUnion[slot] == 1
+}
+
+// ── the declaration fallback, for a body whose expressions record nothing usable ──
+// A monomorphized instance shares its leaf expression nodes with the generic body, so the
+// checker-recorded type is the generic's — worse than absent, since it looks concrete but
+// answers the litunion question falsely. Depth-bounded (32), since a declaration chain is a DAG.
+export function declFallbackDepthCap() { 32 }
+
+// Whether the list at `arrIx` holds `string | null` as instance `fnIx` sees it.
+export function arrElemIsNulStrAt(arrIx: i32, fnIx: i32): boolean {
+  if nodeArrayElemIsNulStr(arrIx) { return true }
+  tyIsNulPrim(arrElemInstTy(arrIx, fnIx), "string")
+}
+
+// Whether the list at `arrIx` holds `boolean | null` as instance `fnIx` sees it.
+export function arrElemIsNulBoolAt(arrIx: i32, fnIx: i32): boolean {
+  if nodeArrayElemIsNulBool(arrIx) { return true }
+  tyIsNulPrim(arrElemInstTy(arrIx, fnIx), "boolean")
+}
+
+// Whether the list at `arrIx` holds the `null` unit type as instance `fnIx` sees it. Its writes
+// store the `boolean | null` sentinel, the one value the element can hold (D4671).
+export function arrElemIsNullUnitAt(arrIx: i32, fnIx: i32): boolean {
+  if nolLitTakenOther(unwrapParen(arrIx)) { return false }
+  if nodeArrayElemIsNullUnit(arrIx) { return true }
+  tyIsNullUnit(arrElemInstTy(arrIx, fnIx))
+}
+
+// The element of the list at `arrIx` as instance `fnIx` sees it, or -1: the banked pin's, else
+// the instance's own annotation of the parameter or local, since a receiver shared with the
+// generic body records only its hole (D2524, D2899).
+function arrElemInstTy(arrIx: i32, fnIx: i32): i32 {
+  arrElemInstTyAt(arrIx, fnIx, 0)
+}
+
+// `arrElemInstTy` with an un-annotated local answered from its initializer, so a receiver the
+// emitter re-binds to a temporary keeps its instance element (D4671); `depth` bounds the chain.
+function arrElemInstTyAt(arrIx: i32, fnIx: i32, depth: i32): i32 {
+  if arrIx < 0 || depth > 8 { return -1 }
+  const pe = tyStepElem(nodeTyPinIxOf(unwrapParen(arrIx)))
+  if pe >= 0 && !tyHasTyVar(pe) { return pe }
+  const n = P.nodes[unwrapParen(arrIx)]
+  if n is Ident {
+    const di = bindingDeclInScope(n.identName)
+    if di >= 0 {
+      const d = P.nodes[di]
+      if d is LetDecl {
+        if d.letType >= 0 { return nodeArrayElemTyIx(d.letType) }
+        return arrElemInstTyAt(d.letInit, fnIx, depth + 1)
+      }
+      return -1
+    }
+    return nodeArrayElemTyIx(paramTypeNode(fnIx, n.identName))
+  }
+  -1
+}
+
+// The element a captured list of a hole holds at the pin of the hole instance enclosing lambda
+// `fnIx`, or -1 (D3831).
+export function holeCaptureArrElemTyOf(arrIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ty = nodeTyIxOf(unwrapParen(arrIx))
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const at = T.tys[ty]
+  if !(at is TyArray) { return -1 }
+  if at.aElem < 0 || at.aElem >= T.tys.length || !(T.tys[at.aElem] is TyVar) {
+    return -1
+  }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && pos < fnParent.length && guard <= fnStmts.length {
+    pos = fnParent[pos]
+    const row = monoHoleSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoHoleSubN.length {
+      const b = holePinReadOf(at.aElem, monoHoleSubN[row], monoHoleSubT[row])
+      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+      return b
+    }
+    guard = guard + 1
+  }
+  -1
+}
+
+// The element a receiver recorded as a list of a hole (`[x]` over a hole `x`) holds at the pin
+// of the instance `fnIx`, or -1 (D3174).
+export function holeArrElemPinTyOf(arrIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ax = unwrapParen(arrIx)
+  if ax < 0 { return -1 }
+  const ty = nodeTyIxOf(ax)
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const at = T.tys[ty]
+  if !(at is TyArray) { return -1 }
+  if at.aElem < 0 || at.aElem >= T.tys.length { return -1 }
+  if !(T.tys[at.aElem] is TyVar) { return -1 }
+  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoHoleSubN.length { return -1 }
+  const b = holePinReadOf(at.aElem, monoHoleSubN[row], monoHoleSubT[row])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// The member texts of `ix` when its checked type, or an instance's pin of it, is the
+// `K | null` niche: a widening to `string | null` must map `-1` to null, not to a member.
+export function nulAtomWidenTexts(ix: i32): string[] {
+  tyNulLitUnionMemberTexts(nodeTyPinIxOf(ix))
+}
+
+// The arena row of shape row `tyIx`'s field named `fnm`, looked up by name. The loop that
+// records these walks a filtered field list, so a positional index into `objFieldTypes`
+// would not be sound.
+export function shapeFieldRowOf(tyIx: i32, fnm: string) {
+  if tyIx < 0 { return -1 }
+  const t = T.tys[tyIx]
+  if t is TyObj {
+    const fns = t.objFieldNames
+    const fts = t.objFieldTypes
+    let i = 0
+    while i < fns.length {
+      if fns[i] == fnm {
+        if i < fts.length { return fts[i] }
+        return -1
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// The arm-for-arm twin of `shapeFieldElemName`, projecting the field's row per code: 16/0/4
+// the field type is the recorded name's type, 15 the `| null`-stripped nested target, 5/28
+// the ref-array element (28 stripped first), 19/29 the map's value (29 stripped first). Code
+// 30 declines: its name carries the shape grammar's own separators, which `repElemId` cannot parse.
+export function shapeFieldElemRow(fty: i32, code: i32) {
+  if fty < 0 { return -1 }
+  if code == FC_UNION { return fty }
+  if code == FC_I32 { return fty }
+  if code == FC_I32_LIST { return fty }
+  if code == FC_STRUCT { return tyPeelNul(fty) }
+  if code == FC_NUL_LIT_UNION { return -1 }
+  if code == FC_REF_LIST { return tyStepElem(fty) }
+  if code == FC_NUL_REF_LIST { return tyStepElem(tyPeelNul(fty)) }
+  if code == FC_MAP { return tyMapValOf(fty) }
+  if code == FC_NUL_MAP { return tyMapValOf(tyPeelNul(fty)) }
+  -1
+}
+
+// The `sFieldCloSig` column's one producer: the `$fnsig` key a closure field (code 14) or a
+// nullable-closure field (code 22) records, "" for every other code. `cloNameSigKey` answers
+// "" for a name it cannot decompose, and "" is read as "unknown", never as "no signature", by
+// the one consumer.
+export function fieldCloSigOf(code: i32, ftxt: string) {
+  if code != FC_CLOSURE && code != FC_NUL_CLOSURE { return "" }
+  cloNameSigKey(ftxt)
+}
+
+// The same column from the arena instead of a spelling: `sigKeyOfTy` is `annSigKey`'s
+// type-taking twin, agreeing by construction, so a row recorded through either provenance
+// keys the same signature. The recorder holding a `FieldDef` node has no rendered field
+// text, and re-introducing one to feed this column would be the render coming back.
+export function fieldCloSigOfTy(code: i32, tyIx: i32) {
+  if code != FC_CLOSURE && code != FC_NUL_CLOSURE { return "" }
+  sigKeyOfTy(tyIx)
+}
+
+// Could row `si`'s field `fi` and a query field spelled `(code, ftxt)` be the same closure
+// field? "" on either side is unknown, not "no signature", so an unknown answers true and
+// the pair keeps whatever behaviour it had before the column existed. Only two signatures
+// that both resolve and disagree split.
+export function sFieldCloSigCompat(
+  si: i32,
+  fi: i32,
+  code: i32,
+  ftxt: string,
+): boolean {
+  const want = fieldCloSigOf(code, ftxt)
+  if want == "" { return true }
+  const have = sFieldCloSigAt(si, fi)
+  if have == "" { return true }
+  have == want
+}
+
+// The `$fnsig` key recorded for row `si`'s field `fi` (`sFieldCloSig`), "" when the row
+// predates the column's fill or the field is not a closure.
+function sFieldCloSigAt(si: i32, fi: i32) {
+  const at = sFieldStart[si] + fi
+  if at < 0 || at >= sFieldCloSig.length { return "" }
+  sFieldCloSig[at]
+}
+
+// Whether variant `vi`'s field `fj` may be left out of a literal: its type admits `null`,
+// read off the variant's record type. A row with no recorded type keeps the omission (D2302).
+export function variantFieldMayOmit(vi: i32, fj: i32): boolean {
+  if vi < 0 || vi >= uVarTyIx.length { return true }
+  const ty = uVarTyIx[vi]
+  if ty < 0 || ty >= T.tys.length { return true }
+  const o = T.tys[ty]
+  if !(o is TyObj) { return true }
+  const fname = uFieldNames[uFieldStart[vi] + fj]
+  let k = 0
+  while k < o.objFieldNames.length {
+    if o.objFieldNames[k] == fname { return tyBearsNull(o.objFieldTypes[k]) }
+    k = k + 1
+  }
+  true
+}
+
+// `sFieldStorageSlot`'s union-variant twin — the `pushFieldStorage` slot argument for
+// variant `vi`'s field `fj`, read by the type section and by the object-literal ORDER
+// STASH (D1510) alike.
+export function uFieldStorageSlot(vi: i32, fj: i32): i32 {
+  const code = variantFieldTypeAt(vi, fj)
+  if code == FC_STRUCT { return uFieldTgtStructIdx(vi, fj) }
+  if code == FC_MAP || code == FC_NUL_MAP { return uFieldMapShape(vi, fj) }
+  variantFieldRefSlot(vi, fj)
+}
+
+// `variantFieldElemName` of variant `vi`'s field NAMED `field`, or "" when the variant has no
+// such field.
+export function variantFieldElemNameOr(vi: i32, field: string): string {
+  const fi = variantFieldIndex(vi, field)
+  if fi < 0 { return "" }
+  variantFieldElemName(vi, fi)
+}
+
+export let sblVal: i32[] = []
+export let sblStamp: i32[] = []
+export let sblSortedCand: i32[] = []
+export let sblSortedOwner: i32[] = []
+export let sblSortedSkip: i32[] = []
+// Each binding's source position, which is its arena index unless the checker's rewrite
+// minted it after the reads it serves (`luDeclPosOf`).
+export let sblSortedPos: i32[] = []
+export let sblSortStart: i32[] = []
+export let sblSortCount: i32[] = []

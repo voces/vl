@@ -1,0 +1,2077 @@
+// `emit_closure_sites.vl` — closure sites: the result kind and signature key a closure
+// call or lambda carries, and the boolean and list-element codes of the values it passes.
+
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  BoolLit,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  Member,
+  NumLit,
+  ObjLit,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  TypeRef,
+  Unary,
+  WhileStmt,
+  i32ToStr,
+  nodeChildren,
+} from "./ast"
+import { nodeTyPinIxOf } from "./check_hole_pins"
+import {
+  nodeArrayElemIsNulBool,
+  nodeTyIsNulFunc,
+  nodeTyIxOf,
+  nodeTyPrimName,
+  nodeTyWidenedRepName,
+} from "./check_node_tys"
+import { valueRowKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  tyArrayElemIx,
+  tyArrayElemPrimName,
+  tyFieldTyOf,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+  tyPrimNameOf,
+  tyToEmitName,
+  tyToNominalName,
+  unionAliasDeclNameOfTy,
+} from "./check_types"
+import { sFieldTgtStructIdx, sFieldTypeAt } from "./emit_atom_kinds"
+import {
+  PL_READ_UNPLACED,
+  objFieldVal,
+  parentLetOf,
+  parentLetOfAt,
+  tyIsBool,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
+import { numLexFitsI32 } from "./emit_bignum"
+import { fnStmtsPosOf, parentBindingOf } from "./emit_capture_frames"
+import {
+  callIsMapFilter,
+  captureNamesOf,
+  capturedKindOf,
+  cloCallSigKey,
+  cloRetKeySuffix,
+  cloRetValKind,
+  cloRetValSlot,
+  cloSigKeyExt,
+  exactOperandTyOf,
+  exprArray,
+  exprF32Array,
+  exprF64Array,
+  exprI64Array,
+  exprIsF32,
+  exprIsF64,
+  exprIsI64,
+  exprIsLitAtom,
+  exprIsV128,
+  exprMap,
+  exprNulBool,
+  exprNullableStruct,
+  exprRefArray,
+  exprString,
+  exprStringArray,
+  exprStruct,
+  exprUnion,
+  exprVariantIndex,
+  fieldClosureFeOfRecv,
+  fnAssignRetElemName,
+  fnAssignRetKind,
+  fnAssignRetSlot,
+  fnIndexOfAt,
+  fnIndexOfNode,
+  fnRetExprOf,
+  globalLetOfIn,
+  holeOrCapturedTyOf,
+  identClosureFe,
+  identClosureFeAt,
+  identCopySourceNodeAt,
+  indexUnionReadKind,
+  letCellKind,
+  letIsRefArray,
+  letIsStruct,
+  letObjLitVariantIdx,
+  letRefListElemName,
+  localCloPinFieldTail,
+  loopVarPinTyOf,
+  memberFieldCode,
+  mfCallbackFe,
+  objLitVariantIdxNoStructRow,
+  preStmtNarrow,
+  pushPostGuardNarrow,
+  refListElemNameOfExpr,
+  retCapturedMapShape,
+  setNarrowFromCond,
+  setNarrowFromCondElse,
+  stmtIsTailValue,
+  structIndexOfExpr,
+  structIndexOfLet,
+  unionIdentReadKind,
+  valueReadPinTy,
+  variantIndexOfLet,
+} from "./emit_classify"
+import { anonParamPinFieldTy } from "./emit_closure_callee"
+import {
+  bodyLetReadAtSid,
+  bodyReadLet,
+  cloParamTok,
+  cloRetIsString,
+  cloSigPosOfKey,
+  cloSigTypeIdxAt,
+  criFnJoinListTy,
+  criLitArmRetKind,
+  criSetRetKind,
+  feParamTyName,
+  fnCheckedRetIsMapUnion,
+  fnCheckedRetIsUnionBox,
+  fnInferredRetLitAtom,
+  frameLetOfLive,
+  paramTypeNodeAt,
+  readSidOf,
+  retKindIsList,
+  stmtPrecedesTail,
+} from "./emit_fn_ret_kinds"
+import {
+  asgValueNode,
+  criFnIsAnonLambda,
+  criRetHoleNode,
+  criRetLocalLet,
+  retIsMapLocal,
+  retLocalLetOfBlock,
+} from "./emit_local_scope"
+import {
+  atomLeafListArmTag,
+  atomLeafListDepthOfTy,
+  boolListArmTag,
+  boolListCodeOfName,
+  frameLetInitOf,
+  refArrSlotTag,
+  tyBoolListCode,
+  unionHasAtomLeafArm,
+  unionHasBoolLeafArm,
+} from "./emit_map_twins"
+import { tyRefArrElemOf } from "./emit_map_value_slots"
+import { emptyArrHoleElemName } from "./emit_obj_lit_fits"
+import {
+  emptyArrHoleKind,
+  letAnnVariantIdx,
+  tyPrimLeafListKind,
+  tyScalarBackedListKind,
+} from "./emit_ref_list_kinds"
+import { repSigTokOfKind } from "./emit_rep"
+import { rlSlotByName, rlSlotsLayoutTwin } from "./emit_shape_rows"
+import {
+  annParamKind,
+  cloArityRepIsWide,
+  drwFieldClosure,
+  mfCbRetIsBool,
+  sigKeyRetKind,
+  sigKeyRetSlot,
+  sigParamTokOfTy,
+  sigRetTokOfTy,
+  tyUnionHasClosureArrayArm,
+  tyUnionHasLitUnionNestedArrayArm,
+  tyUnionHasMapArrayArm,
+  tyUnionHasValueUnionElemArrayArm,
+} from "./emit_sig_tokens"
+import {
+  FC_NUL_BOOL,
+  FC_NUL_LIT_UNION,
+  FC_STRUCT,
+  FC_UNION,
+  VKind,
+  criChanged,
+  fRetBool,
+  fRetKind,
+  fRetRArrElem,
+  fRetStructIdx,
+  fRetVoid,
+  fnStmts,
+  fnValUsed,
+  narrowTop,
+  rlElemName,
+  sNames,
+  sTyIx,
+  uDeclared,
+  vbAtomListTop,
+} from "./emit_state"
+import {
+  blockBindingHidden,
+  rlSlotOfTy,
+  sFieldIndex,
+} from "./emit_struct_order"
+import {
+  holeCaptureTyOf,
+  holeOperandTyOf,
+  indexPlaceNonNull,
+  pinSubOperandTyOf,
+  restoreNarrow,
+} from "./emit_ty_canon"
+import { unionStoreAtomKind } from "./emit_union_casts"
+import { i32ListHas } from "./listutil"
+import { sidOf, sidOfNode } from "./symbols"
+import { arrElemNameRaw } from "./tyname"
+import { primNameOf, tyEmitPrimOf, tyHasTyVar } from "./tyquery"
+
+// True when the `.map` callback at `fe` produces an element riding the string list — a
+// plain `string` or the `string | null` niche, which share one wrapper and backing pair.
+// The collect-time twin of `mfResultKindOf`'s `"str"` answer; the two must name the same
+// set, or the emitter picks the string wrapper for a list type collection never forced.
+export function mfCbResultIsStrList(fe: i32) {
+  cloRetIsString(fe) || cloRetValKind(fe) == "nulstr"
+}
+
+// Re-seat function `i`'s list return kind on the checker's joined result when an earlier
+// return's literal settled a different one: `return [2]` beside `return [1.5]` is an `f64[]`,
+// and `return ["s"]` beside `return [1, "s"]` an `(i32 | string)[]` row (D2716). A return
+// `rx` that relays such a function's call takes the callee's joined result (D2746).
+function criJoinedListKind(i: i32, rx: i32) {
+  if i < 0 || i >= fnStmts.length { return 0 }
+  const fn = P.nodes[fnStmts[i]]
+  let t = -1
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return 0 }
+    t = criFnJoinListTy(i)
+    if t < 0 { t = criRelayJoinListTy(rx, i, 4) }
+  }
+  if t < 0 || t >= T.tys.length { return 0 }
+  if !(T.tys[t] is TyArray) { return 0 }
+  let sk = tyScalarBackedListKind(t)
+  if sk == null { sk = tyPrimLeafListKind(t) }
+  let k: VKind = "reflist"
+  let nm = ""
+  if sk == null {
+    const s = rlSlotOfTy(tyRefArrElemOf(t))
+    if s < 0 || s >= rlElemName.length { return 0 }
+    if fRetKind[i] == "reflist" && i < fRetRArrElem.length {
+      if rlSlotByName(fRetRArrElem[i]) == s { return 0 }
+    }
+    nm = rlElemName[s]
+  } else {
+    if fRetKind[i] == sk { return 0 }
+    k = sk
+  }
+  fRetKind[i] = k
+  if i < fRetRArrElem.length { fRetRArrElem[i] = nm }
+  criChanged = true
+  0
+}
+
+// The joined list type a return `rx` of function `i` relays: `rx` calls a named function whose
+// returns join to one (`criFnJoinListTy`), directly or through up to `depth` more relays; -1 else.
+function criRelayJoinListTy(rx: i32, i: i32, depth: i32): i32 {
+  if rx < 0 || depth < 0 { return -1 }
+  const u = unwrapParen(rx)
+  if u < 0 || u >= P.nodes.length { return -1 }
+  const n = P.nodes[u]
+  if !(n is Call) { return -1 }
+  if n.callFn < 0 || n.callFn >= P.nodes.length { return -1 }
+  if !(P.nodes[n.callFn] is Ident) { return -1 }
+  const cfi = fnIndexOfNode(n.callFn)
+  if cfi < 0 || cfi == i || cfi >= fnStmts.length { return -1 }
+  const t = criFnJoinListTy(cfi)
+  if t >= 0 { return t }
+  criRelayJoinListTy(fnRetExprOf(fnStmts[cfi]), cfi, depth - 1)
+}
+
+// The ref-list row name an un-annotated return of `rx` declares: the expression's own element
+// name when a row carries it, else the row its arena type names. A returned local's element
+// has no collected name during the return pass, and "" would leave the result valtype rowless.
+function criRetRefListElemName(rx: i32, fnIx: i32): string {
+  const nm = refListElemNameOfExpr(rx, fnIx)
+  if rlSlotByName(nm) >= 0 { return nm }
+  const rrs = rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(rx)))
+  if rrs >= 0 && rrs < rlElemName.length { return rlElemName[rrs] }
+  nm
+}
+
+// Which position of `fe`'s signature has no `$fnsig` token — a named parameter and its
+// type, or its result type, else "". It walks `cloSigKeyExt`'s own ladder in that order,
+// so the two cannot disagree about the offender: params first, first fail winning, then
+// the result; a void result is never it, since `>v` is a key.
+export function cloSigRejectWhat(fe: i32): string {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  if fe >= fRetVoid.length { return "" }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let pi = 0
+    while pi < params.length {
+      if cloParamTok(params[pi]) == "" {
+        const p = P.nodes[params[pi]]
+        if p is Param {
+          // The declared spelling: for a lambda whose param the pin synthesized this is
+          // the pinned nullable, which is exactly the type the token table declined. "" is
+          // only a parameter with no annotation node, which `cloParamTok` never refuses.
+          const pn = tyNameOf(p.parType)
+          if pn != "" {
+            return "parameter `" + p.parName + "` of type `" + pn + "`"
+          }
+          return "parameter `" + p.parName + "`"
+        }
+      }
+      pi = pi + 1
+    }
+    if fRetVoid[fe] != 1 {
+      if cloRetKeySuffix(fe) == "" { return "its result type" }
+    }
+  }
+  // Total, so the reject is one message literal rather than two: a caller falling back to a
+  // second sentence writes a second concession into the source. No reachable third case —
+  // the floor fires only when the key build stopped, and this walk is that build's ladder.
+  "its signature"
+}
+
+// The maker function (`fnStmts` position) whose tail object literal built the receiver
+// expression at `recvIx`: a direct `make(...)` call, or an ident bound to one. -1 when the
+// receiver's origin is not a maker call.
+function recvMakerFnOf(recvIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(recvIx)]
+  let initIx = unwrapParen(recvIx)
+  if e is Ident {
+    let li = -1
+    if fnIx >= 0 {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOfIn(fnIx, e.identName, unwrapParen(recvIx)) }
+    if li < 0 { return -1 }
+    const d = P.nodes[li]
+    if d is LetDecl { initIx = unwrapParen(d.letInit) } else { return -1 }
+  }
+  const ie = P.nodes[initIx]
+  if ie is Call {
+    const callee = P.nodes[ie.callFn]
+    if callee is Ident { return fnIndexOfNode(ie.callFn) }
+  }
+  -1
+}
+
+// The return expression of maker `mk`, seen through a `const` it binds to an object literal
+// and returns (`const r = { ... }; return r`), so the record is read per instance (D2853).
+function makerRetObjLitOf(mk: i32): i32 {
+  const rx = fnRetExprOf(fnStmts[mk])
+  if rx < 0 { return rx }
+  const ux = unwrapParen(rx)
+  const re = P.nodes[ux]
+  if re is Ident {
+    const fd = P.nodes[fnStmts[mk]]
+    if fd is FuncDecl {
+      const li = parentLetOf(fd.fnBody, re.identName)
+      if li >= 0 {
+        const ld = P.nodes[li]
+        if ld is LetDecl {
+          // A `let` is followed only when the return is the very next statement, so nothing
+          // can reassign it in between (D2862).
+          if (
+            (ld.letKw == "const" || stmtPrecedesTail(fd.fnBody, li))
+            && ld.letInit >= 0
+          ) {
+            if P.nodes[unwrapParen(ld.letInit)] is ObjLit { return ld.letInit }
+          }
+        }
+      }
+    }
+  }
+  rx
+}
+
+// Boolean-ness of a field-closure trap call `recv.prop(...)`. Monomorphized maker instances
+// share the closure body, so its inferred return kind cannot distinguish `wrap(true)` from
+// `wrap(99)`; follow the receiver to its maker instance and read the closure's tail through
+// that instance's pinned param annotations, falling back to the shared closure's `fRetBool`.
+function fieldCloCallIsBool(recvIx: i32, prop: string, fnIx: i32) {
+  const mk = recvMakerFnOf(recvIx, fnIx)
+  if mk >= 0 {
+    const rx = makerRetObjLitOf(mk)
+    if rx >= 0 {
+      const re = P.nodes[unwrapParen(rx)]
+      if re is ObjLit {
+        const v = objFieldVal(unwrapParen(rx), prop)
+        if v >= 0 {
+          const vf = P.nodes[v]
+          if vf is FuncDecl {
+            const vRet = vf.fnRet
+            // The arena: `nodeTyPrimName` reads `T.tys[ty].primName`, so an aliased
+            // `type B = boolean` return answers `"boolean"` where the spelling reads `"B"`.
+            // The `>= 0` guard decides whether this returns and the predicate only what, so
+            // a wider answer cannot suppress the fallbacks below.
+            if vRet >= 0 { return nodeTyPrimName(vRet) == "boolean" }
+            const tx = fnRetExprOf(v)
+            if tx >= 0 {
+              const te = P.nodes[unwrapParen(tx)]
+              if te is Ident {
+                const ptn = feParamTyName(mk, te.identName)
+                if ptn != "" { return ptn == "boolean" }
+              }
+              return exprIsBool(tx, v)
+            }
+          }
+        }
+      }
+    }
+  }
+  const bfe = fieldClosureFeOfRecv(recvIx, prop, fnIx)
+  if bfe >= 0 {
+    const bfn = P.nodes[fnStmts[bfe]]
+    if bfn is FuncDecl {
+      if bfn.fnRet >= 0 { return nodeTyPrimName(bfn.fnRet) == "boolean" }
+    }
+    if bfe < fRetBool.length { return fRetBool[bfe] == 1 }
+  }
+  false
+}
+
+// The `$fnsig` type index for lifted function `fe`'s own signature, or -1 when it is not
+// value-eligible or not interned. `cloSigKeyExt` equals the value-ABI key for an eligible
+// sig; a void or struct-returning field closure resolves its interned extended sig, so its
+// function-section type is that `$fnsig` and the trap call site's `ref.cast` accepts it.
+export function fnSigIdxOfFn(fe: i32) {
+  const key = cloSigKeyExt(fe)
+  if key == "" { return -1 }
+  cloSigTypeIdxAt(cloSigPosOfKey(key))
+}
+
+// Classify one valued return expression at `rx0` of the function at `fnStmts` position `i`,
+// under the current narrowing stack — the shared loop body of the narrowing-aware walk.
+export function criClassify(rx0: i32, i: i32) {
+  let rx = rx0
+  if fnCheckedRetIsMapUnion(i) || fnCheckedRetIsUnionBox(i) {
+    if fRetKind[i] != "union" {
+      fRetKind[i] = "union"
+      criChanged = true
+    }
+    return 0
+  }
+  if retKindIsList(fRetKind[i]) { criJoinedListKind(i, rx0) }
+  // An assignment's value is its target cell, not the rhs expression, and that is a property
+  // of the function rather than of this return node — so it answers for every node of such a
+  // function and returns, letting no expression fact touch the slot afterwards. The cell kind
+  // is a direct write, so leaving the eager writes beside it would never reach a fixed point.
+  const ark = fnAssignRetKind(i)
+  if ark != null {
+    if fRetKind[i] != ark {
+      fRetKind[i] = ark
+      criChanged = true
+    }
+    // The per-kind payload columns the result valtype needs beside the kind;
+    // `emit_sections`' inferred-return arm reads exactly these.
+    if ark == "struct" || ark == "nulstruct" {
+      fRetStructIdx[i] = fnAssignRetSlot(i)
+    }
+    if ark == "reflist" {
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = fnAssignRetElemName(i)
+      }
+    }
+    return 0
+  }
+  // A tail assignment yields its rhs, so the function's return kind is the rhs's kind; a
+  // literal the target's type built (`c[0] = [3.5, 4]` over `(i32 | f64)[][]`) is the target's (D2395).
+  const rxe = P.nodes[rx]
+  if rxe is BinExpr {
+    if rxe.binOp == "=" { rx = asgValueNode(rx) }
+  }
+  if (
+    fRetKind[i] != "str"
+    && !fnInferredRetLitAtom(i)
+    && exprString(rx, fnStmts[i])
+  ) {
+    criSetRetKind(i, "str")
+  }
+  if !retKindIsList(fRetKind[i]) && exprRefArray(rx, fnStmts[i]) {
+    // Record the element type-name so the inferred functype result can resolve its ref-list
+    // slot: the annotated path fills `fRetRArrElem` from the annotation, but an un-annotated
+    // return must read it off the return expression.
+    if criSetRetKind(i, "reflist") {
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = criRetRefListElemName(rx, fnStmts[i])
+      }
+    }
+  } else if fRetKind[i] == "reflist" && i < fRetRArrElem.length {
+    // The element can be unnamed on the pass that set the kind, when it is a callback's
+    // result that return inference has not reached yet; a later pass of the fixpoint names it.
+    if fRetRArrElem[i] == "" && exprRefArray(rx, fnStmts[i]) {
+      const lateNm = criRetRefListElemName(rx, fnStmts[i])
+      if lateNm != "" {
+        fRetRArrElem[i] = lateNm
+        criChanged = true
+      }
+    }
+  }
+  if !retKindIsList(fRetKind[i]) && exprStringArray(rx, fnStmts[i]) {
+    criSetRetKind(i, "strlist")
+  }
+  // The returned list local whose element spelling only the arena knows — the list twin of
+  // the `retIsMapLocal` rung, for the same reason: a returned local's collected kind does not
+  // exist during this global pass. Asked here and not in `tyKindOf`, because widening that
+  // mapping makes `exprArray` claim a `K[]` at every position, not just the result valtype.
+  if !retKindIsList(fRetKind[i]) {
+    const rlk = tyScalarBackedListKind(nodeTyIxOf(rx))
+    if rlk != null { criSetRetKind(i, rlk) }
+  }
+  if !retKindIsList(fRetKind[i]) && exprF64Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "f64list")
+  }
+  // The i64 and f32 siblings of the f64-list arm, checked before the generic `exprArray` arm
+  // below, which would otherwise claim a wide-magnitude return as a plain i32 list and
+  // declare the i32-list wrapper over a body building the wide one.
+  if !retKindIsList(fRetKind[i]) && exprI64Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "i64list")
+  }
+  if !retKindIsList(fRetKind[i]) && exprF32Array(rx, fnStmts[i]) {
+    criSetRetKind(i, "f32list")
+  }
+  // A `u8[]` return expression — the packed byte list. `u8` is a storage type and not a value
+  // kind (`array.get_u` widens at every value seam), so no `expr*Array` classifier speaks it
+  // and the result would declare an i32 scalar over a body pushing the wrapper. Narrow by
+  // construction: only the `u8` answer is taken, the other leaves being decided above.
+  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
+    if tyPrimLeafListKind(nodeTyIxOf(rx)) == "u8list" {
+      criSetRetKind(i, "u8list")
+    }
+  }
+  // The empty `[]` return — the element hole, and the result-valtype half of D16. Every arm
+  // above classifies from the literal's own elements, so a hole whose element is a struct,
+  // closure or nested list falls to the i32-list default. Read off the type the checker
+  // unified the hole with, the same node `emitReturnValue`'s build seed reads.
+  if !retKindIsList(fRetKind[i]) && fRetKind[i] != "u8list" {
+    // The hole's node, not the return's (D626): `return cc` over `const cc = []` reads `cc`'s
+    // initializer, where the checker recorded the element it unified the hole with.
+    // `criRetHoleNode` is `rx` itself in every other case.
+    const hn = criRetHoleNode(rx, i)
+    const hk = emptyArrHoleKind(hn)
+    if hk != null {
+      if criSetRetKind(i, hk) {
+        // The ref-list payload column the result valtype needs beside the kind — the same
+        // `fRetRArrElem` slot the `exprRefArray` arm above fills, from the same renderer.
+        if hk == "reflist" {
+          if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+            fRetRArrElem[i] = emptyArrHoleElemName(hn)
+          }
+        }
+      }
+    }
+  }
+  if fRetKind[i] != "map" {
+    // `exprMap` classifies a returned map param and a `Map()` or map-returning call. A
+    // returned map local needs `retIsMapLocal`: its kind is not collected during this global
+    // return pass, so read its declaration — the annotation, else the checker's type.
+    if (
+      exprMap(rx, fnStmts[i])
+      || retIsMapLocal(rx, fnStmts[i])
+      || retCapturedMapShape(i, rx) != -3
+    ) {
+      criSetRetKind(i, "map")
+    }
+  }
+  // A returned element of a local ref list (`c[0]` over `(i32 | f64)[][]`), whose collected
+  // kind this pass does not have: the arena type names the ref-list row (D2396).
+  if !retKindIsList(fRetKind[i]) {
+    const rrTy = nodeTyIxOf(rx)
+    if rrTy >= 0 && T.tys[rrTy] is TyArray {
+      const rrs = rlSlotOfTy(tyRefArrElemOf(rrTy))
+      if rrs >= 0 && rrs < rlElemName.length {
+        if criSetRetKind(i, "reflist") {
+          if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+            fRetRArrElem[i] = rlElemName[rrs]
+          }
+        }
+      }
+    }
+  }
+  // The not-a-list guard is what separates i32 and f64 lists here: `exprArray`'s array-literal
+  // case is `!arrLitIsRef` and an f64 element is not a ref, so it also claims `[1.5, 2.5]`.
+  // The f64-list arm above has already set the kind, so this one skips it.
+  if !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
+    criSetRetKind(i, "list")
+  }
+  if fRetKind[i] != "union" && exprUnion(rx, fnStmts[i]) {
+    // A union return subsumes a per-arm struct classification: a value-if join has one arm a
+    // union-variant object literal, which `exprStruct` would also claim as a plain struct, and
+    // struct outranks union, so `criSetRetKind` would refuse. Lambda-gated, because only the
+    // lambda value-if path reaches this order and a named function must not move.
+    if (
+      (fRetKind[i] == "struct" || fRetKind[i] == "variant")
+      && criFnIsAnonLambda(i)
+    ) {
+      fRetKind[i] = "union"
+      criChanged = true
+    } else {
+      criSetRetKind(i, "union")
+    }
+  }
+  if (
+    fRetKind[i] != "nulstruct"
+    && fRetKind[i] != "union"
+    && exprNullableStruct(rx, fnStmts[i])
+  ) {
+    if criSetRetKind(i, "nulstruct") {
+      fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
+    }
+  }
+  // A return expression that already yields a concrete variant — the expression-level twin of
+  // the annotated-local rung below. Safe by `exprVariantIndex`'s own property, not by
+  // inspection here: every arm of it is rep-authoritative rather than a shape match, and it
+  // has no object-literal field-set leg, so a bare `return { r: n }` falls to the struct arm.
+  if (
+    fRetKind[i] != "struct"
+    && fRetKind[i] != "nulstruct"
+    && fRetKind[i] != "union"
+    && fRetKind[i] != "variant"
+    && !retKindIsList(fRetKind[i])
+  ) {
+    const rvx = exprVariantIndex(rx, fnStmts[i])
+    if rvx >= 0 {
+      if criSetRetKind(i, "variant") { fRetStructIdx[i] = rvx }
+    }
+  }
+  if (
+    fRetKind[i] != "struct"
+    && fRetKind[i] != "nulstruct"
+    && fRetKind[i] != "union"
+    && fRetKind[i] != "variant"
+    && exprStruct(rx, fnStmts[i])
+  ) {
+    // The `!= "union"` guard: an inferred struct-union return stores `"union"` in the name
+    // pass, but each of its returns is a single object literal `exprStruct` would also claim
+    // as a plain struct. The union kind dominates, so neither column may be reclaimed.
+    if criSetRetKind(i, "struct") {
+      const rsx = structIndexOfExpr(rx, fnStmts[i])
+      // D51 with no local at all — `function mk(n: i32) { return { r: n } }` beside a declared
+      // union. Same `-1` gate as the returned-local rung, which cannot see this shape because
+      // there is no local to hand it. Three classifiers and one emit seed mint the pair
+      // (`"struct"`, -1), so each one left behind is a program that still refuses.
+      if rsx < 0 {
+        const rov = objLitVariantIdxNoStructRow(rx, fnStmts[i])
+        if rov >= 0 {
+          fRetKind[i] = criLitArmRetKind(i)
+          criChanged = true
+          fRetStructIdx[i] = rov
+        } else {
+          fRetStructIdx[i] = rsx
+        }
+      } else {
+        fRetStructIdx[i] = rsx
+      }
+    }
+  }
+  // A returned nested-struct field read whose chain roots at a local — the member twin of the
+  // returned-local rungs below, blind for the identical reason (D131). `"nulstruct"` and not
+  // `"struct"`: the lowering codes fold `inner: S` and `inner: S | null` onto one code-15 hop
+  // and the slot is `(ref null $S)` either way. Ahead of that block; it fills holes only.
+  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
+    const rnf = criRetNestedFieldStructIdx(rx, i)
+    if rnf >= 0 {
+      if criSetRetKind(i, "nulstruct") { fRetStructIdx[i] = rnf }
+    }
+  }
+  // A returned local `let` of a ref kind: during this global pass the function's locals are
+  // not collected, so the `expr*` Ident cases above miss it and the result would default to
+  // i32 over a body yielding a ref. Classify through the declaration, annotation first, as
+  // `retIsMapLocal` does for a map; the scalar and string kinds are covered by the name pass.
+  const rll = criRetLocalLet(rx, i)
+  if rll >= 0 {
+    if !retKindIsList(fRetKind[i]) && letIsRefArray(rll, fnStmts[i]) {
+      if criSetRetKind(i, "reflist") {
+        if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+          fRetRArrElem[i] = letRefListElemName(rll, fnStmts[i])
+        }
+      }
+    }
+    // A returned local annotated at a concrete union arm, before the struct arm below, whose
+    // `structIndexOfLet` has no row for an arm and falls through to a field-set scan of the
+    // initializer that contradicts the annotation. That scan picks an exact layout twin and
+    // the module is refused one heap type apart. The annotation, not `letIsVariant` (D52).
+    let rlv = letAnnVariantIdx(rll)
+    // The init's own rep, when the annotation has nothing to say — `variantIndexOfLet` is
+    // `structIndexOfLet`'s twin, arm for arm. Asked first: otherwise `structIndexOfLet` falls
+    // through to `structIndexOfExpr`, whose non-kind-gated legs resolve a variant param to a
+    // layout twin's struct row. Storage class beats a structural twin (D99).
+    if rlv < 0 { rlv = variantIndexOfLet(rll, fnStmts[i]) }
+    if (
+      rlv >= 0
+      && fRetKind[i] != "union"
+      && fRetKind[i] != "nulstruct"
+      && !retKindIsList(fRetKind[i])
+    ) {
+      if criSetRetKind(i, "variant") { fRetStructIdx[i] = rlv }
+    }
+    if (
+      fRetKind[i] != "struct"
+      && fRetKind[i] != "nulstruct"
+      && fRetKind[i] != "union"
+      && fRetKind[i] != "variant"
+      && !retKindIsList(fRetKind[i])
+      && letIsStruct(rll, fnStmts[i])
+    ) {
+      // `structIndexOfLet` prefers the annotation's struct over the literal's first
+      // field-shape match, so `const c: Ctx = {…}` returns `Ctx` even when another declared
+      // struct shares its field names.
+      if criSetRetKind(i, "struct") {
+        const rsi = structIndexOfLet(rll, fnStmts[i])
+        // The un-annotated half of the arm above (D51): `const c = { r: n }` beside a declared
+        // union has no struct row at all, since `collectS` skips a `type X = {…}` that is a
+        // union member, so the pair (`"struct"`, -1) trips `fbValtype`'s bounds guard. The `-1`
+        // is the gate; the kind is written directly because the two share one `retKindPri` tier.
+        if rsi < 0 {
+          const rov = letObjLitVariantIdx(rll, fnStmts[i])
+          if rov >= 0 {
+            fRetKind[i] = criLitArmRetKind(i)
+            criChanged = true
+            fRetStructIdx[i] = rov
+          } else {
+            fRetStructIdx[i] = rsi
+          }
+        } else {
+          fRetStructIdx[i] = rsi
+        }
+      }
+    }
+    // A returned local annotated as the string primitive: a branded newtype is not admitted by
+    // `isClassifiableRetName`, so no inferred-return row exists and the result stays i32.
+    // `nodeTyPrimName` is the narrow arena test both ways — a brand is a `TyPrim` named
+    // `string`, a literal union is not — and `letIsString` would claim the litunion's literal.
+    const rld = P.nodes[rll]
+    if rld is LetDecl {
+      if rld.letType >= 0 {
+        if nodeTyPrimName(rld.letType) == "string" { criSetRetKind(i, "str") }
+      }
+    }
+  }
+  // The nullable-closure niche, decided by the arena rather than a rendered name: a
+  // `TyNullable` over a `TyFunc`. The non-null closure never reaches this column — its
+  // channel is `fnReturnsClosure`, a boolean read ahead of the inferred kind — so this arm
+  // and that one cannot both claim one return (D1622).
+  if fRetKind[i] != "nulclosure" && nodeTyIsNulFunc(rx) {
+    criSetRetKind(i, "nulclosure")
+  }
+  if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
+    fRetBool[i] = 1
+    criChanged = true
+  }
+  // Scalar f64, f32 and i64 returns detected from the return expression, for a function the
+  // checker recorded no inferred-return name for — a monomorphized instance, whose body the
+  // checker only saw with a type variable. A `?? d` qualifies unless its result is a union box,
+  // which reads as its unboxed atom and is classified separately (D3692).
+  let scalarOk = fRetKind[i] == "i32" && fRetBool[i] == 0
+  const rxn = P.nodes[rx]
+  if rxn is BinExpr {
+    if rxn.binOp == "??" { scalarOk = scalarOk && !exprUnion(rx, fnStmts[i]) }
+  }
+  if scalarOk {
+    if exprIsV128(rx, fnStmts[i]) { criSetRetKind(i, "v128") }
+    else if exprIsF64(rx, fnStmts[i]) { criSetRetKind(i, "f64") }
+    else if exprIsF32(rx, fnStmts[i]) { criSetRetKind(i, "f32") }
+    else if exprIsI64(rx, fnStmts[i]) { criSetRetKind(i, "i64") }
+  }
+  // Last resort: a returned local typed from its own declaration. Both the typed-IR fast path
+  // and `declaredKind` can be blind at once — the latter reads a table `buildLocals` fills much
+  // later, and a monomorphized instance's body is a clone whose leaves carry no recorded type.
+  // The payload-free kinds only, gated on the slot still being the default, so it fills holes.
+  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
+    const lk = retLocalCellKind(rx, i)
+    if lk != null { criSetRetKind(i, lk) }
+  }
+  0
+}
+
+// The payload-free cell kind of a returned local of function `i`, or `null` — the declaration
+// half of `criClassify`'s last rung. Resolves the `LetDecl` by name in this function's own
+// body and asks `letCellKind`, the shared annotation-else-initializer ladder.
+function retLocalCellKind(rx: i32, i: i32): VKind | null {
+  if i < 0 || i >= fnStmts.length { return null }
+  const rn = P.nodes[unwrapParen(rx)]
+  if rn is Ident {
+    const fn = P.nodes[fnStmts[i]]
+    if fn is FuncDecl {
+      // The binding in scope at the read, not the name's first binding in the body (D3236).
+      const at = unwrapParen(rx)
+      const li = bodyLetReadAtSid(fn.fnBody, sidOfNode(at), at)
+      if li < 0 { return null }
+      const k = letCellKind(li, fnStmts[i])
+      if (
+        k == "f64"
+        || k == "f32"
+        || k == "i64"
+        || k == "str"
+        || k == "list"
+        || k == "strlist"
+        || k == "f64list"
+        || k == "i64list"
+        || k == "f32list"
+      ) {
+        return k
+      }
+    }
+  }
+  null
+}
+
+// The struct-table row a nested-struct (code-15) field-read chain yields, resolved with the
+// local receivers this global return pass cannot otherwise see. The descent is
+// `structIndexOfExpr`'s own Member arm one hop at a time; only the root rung differs, going
+// through the `let` declaration. Nothing but a code-15 hop is followed.
+function criRetMemberChainStructIdx(rx: i32, i: i32): i32 {
+  const u = unwrapParen(rx)
+  const e = P.nodes[u]
+  if e is Member {
+    const psi = criRetMemberChainStructIdx(e.memObj, i)
+    if psi < 0 { return -1 }
+    const pfi = sFieldIndex(psi, e.memProp)
+    if pfi < 0 { return -1 }
+    if sFieldTypeAt(psi, pfi) != FC_STRUCT { return -1 }
+    return sFieldTgtStructIdx(psi, pfi)
+  }
+  const si = structIndexOfExpr(u, fnStmts[i])
+  if si >= 0 { return si }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    const li = retLocalLetOfBlock(fn.fnBody, u)
+    if li >= 0 { return structIndexOfLet(li, fnStmts[i]) }
+  }
+  -1
+}
+
+// The struct row a returned value's code-15 nested-struct field slot targets, for the two
+// spellings `criClassify`'s D131 rung answers: the field read itself, and a returned local
+// bound to one. -1 for everything else. The local leg takes only an un-annotated `let`: an
+// annotated one already has a claimant, and its cell is built from that annotation.
+function criRetNestedFieldStructIdx(rx: i32, i: i32): i32 {
+  if i < 0 || i >= fnStmts.length { return -1 }
+  const u = unwrapParen(rx)
+  const e = P.nodes[u]
+  if e is Member { return criRetMemberChainStructIdx(u, i) }
+  if e is Ident {
+    const fn = P.nodes[fnStmts[i]]
+    if fn is FuncDecl {
+      const li = retLocalLetOfBlock(fn.fnBody, u)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if d.letType < 0 {
+            const iv = unwrapParen(d.letInit)
+            const ivn = P.nodes[iv]
+            if ivn is Member { return criRetMemberChainStructIdx(iv, i) }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Walk a block's statements classifying every `return <e>` under the same narrowing the
+// emit loops apply: each `if` arm under its condition's then or else narrowing, and a
+// divergent guard narrowing the rest of the block. The stack rewinds at block exit. `tail`
+// says whether the block's last statement is the function's value: only then is it one.
+export function criWalkBlock(blockIx: i32, i: i32, tail: boolean) {
+  if blockIx < 0 { return 0 }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    const savedGuardTop = narrowTop
+    let k = 0
+    while k < stmts.length {
+      // An if-arm's last statement may be a bare tail value rather than an explicit
+      // `return`. For an anonymous lambda, classify it under the arm's active narrowing so a
+      // value-if union return types from its arms. Lambda-gated to leave named-function
+      // inference unchanged; an arm of an `if` that is not itself the tail is a statement.
+      const last = k == stmts.length - 1
+      preStmtNarrow(stmts[k])
+      if (
+        tail
+        && last
+        && criFnIsAnonLambda(i)
+        && stmtIsTailValue(stmts[k], fnStmts[i])
+      ) {
+        criClassify(stmts[k], i)
+      }
+      criWalkStmt(stmts[k], i, tail && last)
+      pushPostGuardNarrow(stmts[k], fnStmts[i])
+      k = k + 1
+    }
+    restoreNarrow(savedGuardTop)
+    return 0
+  }
+  criWalkStmt(blockIx, i, tail)
+}
+
+function criWalkStmt(stmtIx: i32, i: i32, tail: boolean) {
+  if stmtIx < 0 { return 0 }
+  const s = P.nodes[stmtIx]
+  if s is RetStmt {
+    if s.retArg >= 0 { criClassify(s.retArg, i) }
+    return 0
+  }
+  if s is IfStmt {
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). Each
+    // link's else narrowing holds across the links below it; the outermost restore is the state
+    // the nested restores would have left.
+    let elseTop = -1
+    let cur = stmtIx
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        const savedTop = narrowTop
+        setNarrowFromCond(c.ifCond, fnStmts[i])
+        criWalkBlock(c.ifThen, i, tail)
+        restoreNarrow(savedTop)
+        if c.ifElse >= 0 {
+          if elseTop < 0 { elseTop = narrowTop }
+          setNarrowFromCondElse(c.ifCond, fnStmts[i])
+          if P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            criWalkBlock(c.ifElse, i, tail)
+          }
+        }
+      }
+    }
+    if elseTop >= 0 { restoreNarrow(elseTop) }
+    return 0
+  }
+  if s is WhileStmt { return criWalkBlock(s.whileBody, i, false) }
+  if s is ForRange { return criWalkBlock(s.frBody, i, false) }
+  if s is ForIn { return criWalkBlock(s.fiBody, i, false) }
+  // A bare `{ … }`, which reaches this walk: `computeRetInference` runs BEFORE
+  // `drwBareBlock` rewrites the block to `if true { … }`, so this is one of the three ladders
+  // a block can still arrive at. No witness — `fRetKind` has other producers that do
+  // descend — so the arm is the exhaustiveness, not a fix (D1901).
+  if s is Block { return criWalkBlock(stmtIx, i, tail) }
+  0
+}
+
+// True if function `fe`'s env-leading signature matches an interned `$fnsig`. Such a
+// function is declared with `fnSigIdxOfFn` as its functype, so its actual type is that
+// `$fnsig` and the call site's `call_indirect` signature check accepts it. A function
+// outside the eligible kinds keeps its own functype and cannot be used as a value.
+export function fnSigIsClosure(fe: i32) { fnSigIdxOfFn(fe) >= 0 }
+
+// The refusal a call `callIx` in instance `fnIx` owes when its callee is a closure reading a
+// field of the instance's parameter (`localCloPinFieldTail`), or "". The lifted closure is
+// shared by every pin, and a list element or an argument cannot follow a niche or box read
+// per pin (D2879).
+export function cloTailRefusal(callIx: i32, fnIx: i32): string {
+  const c = P.nodes[callIx]
+  if !(c is Call) { return "" }
+  // The closures this reads take no argument; most calls pass one.
+  if c.callArgs.length != 0 { return "" }
+  if c.callFn < 0 { return "" }
+  if !(P.nodes[c.callFn] is Ident) { return "" }
+  // A named function is no local closure, and most calls name one.
+  if fnIndexOfNode(c.callFn) >= 0 { return "" }
+  const t = localCloPinFieldTail(c.callFn, fnIx)
+  if t < 0 { return "" }
+  const code = memberFieldCode(t, fnIx)
+  const perPin = code == FC_NUL_BOOL
+    || code == FC_NUL_LIT_UNION
+    || code == FC_UNION
+  if perPin && callIsElemOrArgIn(fnIx, callIx) {
+    return "emitProgram: a closure in a function with an un-annotated parameter delivers a record field read per pin into a list or an argument"
+  }
+  ""
+}
+
+// Whether `target` is an element of a list literal, or an argument `argTakesPerPin` accepts,
+// anywhere in the body of the function at `fnIx`.
+function callIsElemOrArgIn(fnIx: i32, target: i32): boolean {
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { return nodeHoldsAsElemOrArg(fd.fnBody, target) }
+  false
+}
+
+// The walk `callIsElemOrArgIn` makes from node `ix`.
+function nodeHoldsAsElemOrArg(ix: i32, target: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    if i32ListHas(n.arrElems, target) { return true }
+  }
+  if n is Call {
+    let ai = 0
+    while ai < n.callArgs.length {
+      if n.callArgs[ai] == target { return argTakesPerPin(n, ai) }
+      ai = ai + 1
+    }
+  }
+  const kids = nodeChildren(ix)
+  let i = 0
+  while i < kids.length {
+    if nodeHoldsAsElemOrArg(kids[i], target) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether argument `ai` of call `c` is delivered where a per-pin read cannot follow: a
+// parameter left to inference or naming a type parameter, or any callee this cannot resolve.
+// `print` and a concretely annotated parameter convert at the boundary.
+function argTakesPerPin(c: Call, ai: i32): boolean {
+  if c.callFn < 0 { return true }
+  const f = P.nodes[c.callFn]
+  if !(f is Ident) { return true }
+  if f.identName == "print" { return false }
+  const fe = fnIndexOfNode(c.callFn)
+  if fe < 0 || fe >= fnStmts.length { return true }
+  const fd = P.nodes[fnStmts[fe]]
+  if fd is FuncDecl {
+    if ai >= fd.fnParams.length { return true }
+    const pn = P.nodes[fd.fnParams[ai]]
+    if pn is Param {
+      if pn.parType < 0 { return true }
+      return tyHasTyVar(nodeTyIxOf(pn.parType))
+    }
+  }
+  true
+}
+
+// The value-atom kind the concrete (non-box) side of a union `==` compares under — the
+// same ladder `emitUnionCoerce` uses — or -1 when the operand has no atom rep (a struct,
+// a map, a void call). -1 is a real "cannot classify" answer, never an in-band `"i32"`
+// guess (D1071); the fall-through asks the operand's own arena row first.
+export function unionEqAtomKindOf(
+  otherIx: i32,
+  unionName: string,
+  fnIx: i32,
+): i32 {
+  let k = 0
+  // A literal-union atom compares under the box's string arm (`unionTakesAtomAsStr`) since
+  // that's the rep it rides as; checked ahead of `exprString` because an atom isn't a
+  // string ref until `emitUnionEqOther`'s kind-2 arm widens it.
+  if exprIsLitAtom(otherIx, fnIx) {
+    k = 2
+  } else if exprString(otherIx, fnIx) {
+    k = 2
+  } else if exprIsF32(otherIx, fnIx) {
+    k = 5
+  } else if exprIsF64(otherIx, fnIx) {
+    k = 4
+  } else if exprIsI64(otherIx, fnIx) {
+    k = 3
+  } else if exprIsBool(otherIx, fnIx) {
+    k = 1
+  } else {
+    // The operand's own row first: `-1` states the shape has no atom rep at all; `-2` is
+    // the arena declining, which leaves this ladder's own default answer in force.
+    const ork = valueRowKind(nodeTyIxOf(unwrapParen(otherIx)))
+    if ork == -1 { return -1 }
+    // A container or closure atom (codes 7+) rides the box's `value` field directly with
+    // no scalar value box, so it's answered as itself rather than promoted.
+    if ork >= 7 { return ork }
+    // The union's own promotion, asked of the same ladder the store uses
+    // (`unionStoreAtomKind`) rather than re-derived here — so a read and a write agree on
+    // which numeric arm the union promotes to (D291).
+    const eqw = unionStoreAtomKind(unionName, 0)
+    if eqw >= 0 { k = eqw }
+    const bare = P.nodes[unwrapParen(otherIx)]
+    if bare is NumLit {
+      if !numLexFitsI32(bare.numText) { k = 3 }
+    }
+  }
+  // The f64-to-f32 re-encode: a float value against a union whose only float arm is
+  // `f32` is stored in the f32 box, so the compare must select that arm too.
+  if k == 4 {
+    const eqw4 = unionStoreAtomKind(unionName, 4)
+    if eqw4 >= 0 { k = eqw4 }
+  }
+  k
+}
+
+// Whether `ix` is a list of booleans: typed `boolean[]`, or a literal whose first element is one.
+export function exprIsBoolList(ix: i32, fnIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  if primNameOf(tyArrayElemIx(nodeTyIxOf(ix))) == "boolean" { return true }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    if n.arrElems.length > 0 { return exprIsBool(n.arrElems[0], fnIx) }
+  }
+  // Any other node typed as no boolean list is not one.
+  false
+}
+
+// The single-byte blocktype valtype for a value-position if-expression: the widest
+// numeric rep across its arms (checked f64 → f32 → i64, else the i32 default).
+export function ifExprValtype(ifIx: i32, fnIx: i32) {
+  // A join over an instance's type parameters takes the width of the number they pin, and a
+  // literal arm adapts to it (D3528).
+  const pjt = nodeTyIxOf(ifIx)
+  if pjt >= 0 && tyHasTyVar(pjt) {
+    const pjn = tyPrimNameOf(pinSubOperandTyOf(pjt, fnIx))
+    if pjn == "f64" { return 124 }
+    if pjn == "f32" { return 125 }
+    if pjn == "i64" { return 126 }
+  }
+  if exprIsV128(ifIx, fnIx) {
+    return 123 // 0x7b v128
+  }
+  if exprIsF64(ifIx, fnIx) {
+    return 124 // 0x7c f64
+  }
+  if exprIsF32(ifIx, fnIx) {
+    return 125 // 0x7d f32
+  }
+  if exprIsI64(ifIx, fnIx) {
+    return 126 // 0x7e i64
+  }
+  127 // 0x7f i32
+}
+
+export function exprIsBool(ix: i32, fnIx: i32) {
+  if ix < 0 { return false }
+  // Typed-IR fast path (additive, mirroring exprIsF64): boolean shares the i32 rep
+  // everywhere, so the syntactic derivations below still cover paths that lose the tag
+  // (a struct-field read, a map `??` result, a closure-value call, a `boolean[]` param).
+  if nodeTyWidenedRepName(ix) == "boolean" { return true }
+  // A node the generic body shares, typed at a hole this instance pins to `boolean` (D2919).
+  if tyPrimNameOf(holeOperandTyOf(ix, fnIx)) == "boolean" { return true }
+  if tyPrimNameOf(loopVarPinTyOf(ix, fnIx)) == "boolean" { return true }
+  const e = P.nodes[ix]
+  if e is BoolLit { return true }
+  if e is IsExpr { return true }
+  if e is Paren { return exprIsBool(e.parInner, fnIx) }
+  if e is Index {
+    const iuk = indexUnionReadKind(ix, fnIx)
+    if iuk != -3 { return iuk == 1 }
+    // A `(boolean | null)[]` element narrowed past null is the boolean (D2397).
+    if nodeArrayElemIsNulBool(e.idxArr) && indexPlaceNonNull(ix) { return true }
+    // An element read over a boolean-element list prints as true/false: a `.map` result
+    // whose callback returns boolean, or a directly declared `boolean[]`.
+    if mfArrElemIsBool(e.idxArr, fnIx) { return true }
+    if listElemIsBool(e.idxArr, fnIx) { return true }
+    // An element typed at a type parameter an enclosing instance binds to `boolean`, read in
+    // a nested generic's instance that binds only its own (D3831).
+    if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
+      return true
+    }
+    // …and the cell of a written capture, whose read the rewrite minted untyped (D3886).
+    if (
+      tyPrimNameOf(pinSubOperandTyOf(capturedCellElemTy(e.idxArr, fnIx), fnIx))
+      == "boolean"
+    ) {
+      return true
+    }
+    return tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean"
+  }
+  if e is Unary { return e.unOp == "!" }
+  if e is Ident {
+    // A value-union ident narrowed to `boolean` unboxes to the bool rep and prints
+    // true/false (see exprIsI64 for the classification rule).
+    const uk = unionIdentReadKind(ix, fnIx)
+    if uk != -3 { return uk == 1 }
+    // A `boolean|null` niche binding read (narrowed non-null in its branch) prints
+    // true/false. Plain `boolean` idents stay unclassified (existing rule).
+    if exprNulBool(ix, fnIx) { return true }
+    // A captured boolean (a closure returning its maker's `x: boolean` param) — the
+    // closure's inferred return kind (`fRetBool`) sees the bool-ness through the env.
+    if capturedIsBool(fnIx, e.identName) { return true }
+    // A capture typed at a type parameter this lambda's instance pins to `boolean`: an
+    // un-annotated copy of a parameter has no annotation to recover it from (D3520).
+    if capturedKindOf(fnIx, e.identName) != null {
+      if tyPrimNameOf(pinSubOperandTyOf(nodeTyIxOf(ix), fnIx)) == "boolean" {
+        return true
+      }
+      if tyPrimNameOf(holeCaptureTyOf(ix, fnIx)) == "boolean" { return true }
+    }
+    // A plain boolean local/param/global — recovered from the binding's annotation
+    // or initializer, since a boolean local registers identically to an i32.
+    if boundBoolByName(e.identName, fnIx, ix) { return true }
+  }
+  if e is BinExpr {
+    const op = e.binOp
+    if op == "==" || op == "!=" { return true }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" { return true }
+    if op == "&&" || op == "||" { return true }
+    // `lhs ?? d` over a boolean-list `.get`/`.pop` (or a binding seeded by one) yields a
+    // boolean — render true/false. Other `??` reads keep i32 (map gets).
+    if op == "??" {
+      const lhs = P.nodes[unwrapParen(e.binLeft)]
+      if lhs is Call {
+        const lcallee = P.nodes[lhs.callFn]
+        if lcallee is Member {
+          if lcallee.memProp == "get" || lcallee.memProp == "pop" {
+            if !exprMap(lcallee.memObj, fnIx) {
+              return listElemIsBool(lcallee.memObj, fnIx)
+            }
+          }
+        }
+      }
+      if lhs is Ident {
+        if identNullableBoolPop(lhs.identName, fnIx) { return true }
+      }
+      // A `boolean | null` niche with a boolean default is a boolean, whatever spelled the
+      // niche: a hole parameter's pin carries it only as the instance's annotation (D2593).
+      return exprNulBool(e.binLeft, fnIx) && exprIsBool(e.binRight, fnIx)
+    }
+    return false
+  }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    // A field-closure call (an index-trap dispatch) classifies by the field function's
+    // return: the receiver's origin resolves the exact monomorphized instance, since bool-
+    // ness lives in the instance's own pinned param annotation, not the shared closure body.
+    if callee is Member {
+      if (
+        drwFieldClosure(structIndexOfExpr(callee.memObj, fnIx), callee.memProp)
+      ) {
+        return fieldCloCallIsBool(callee.memObj, callee.memProp, fnIx)
+      }
+    }
+    if callee is Ident {
+      const lct = localCloPinFieldTail(e.callFn, fnIx)
+      if lct >= 0 && exprIsBool(lct, fnIx) { return true }
+      const target = fnIndexOfAt(sidOfNode(e.callFn), fnIx, e.callFn)
+      if target >= 0 {
+        const fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 {
+            // The arena also drops the `rt is TypeRef` gate the name form needed: a return
+            // annotation that isn't a bare `TypeRef` still has a recorded type to read.
+            if nodeTyPrimName(fn.fnRet) == "boolean" { return true }
+            const rt = P.nodes[fn.fnRet]
+            if rt is TypeRef { return false }
+          } else {
+            // Un-annotated: `computeRetInference` classifies the callee's first valued
+            // return into `fRetBool` (a fixed point, so mutual recursion resolves).
+            return fRetBool[target] == 1
+          }
+        }
+      }
+    }
+    // A map membership test `m.has(k)` and `m.delete(k)` both yield a boolean (print
+    // true/false): `.has` reports presence, `.delete` reports whether it removed anything.
+    if callee is Member {
+      if callee.memProp == "has" { return exprMap(callee.memObj, fnIx) }
+      if callee.memProp == "delete" { return exprMap(callee.memObj, fnIx) }
+      // A string `s.includes(sub)` yields a boolean (print true/false).
+      if callee.memProp == "includes" { return exprString(callee.memObj, fnIx) }
+    }
+  }
+  if e is Member {
+    // D931 — a generic carrier's boolean field, read in a monomorphized instance: a mono
+    // clone shares its leaf nodes, so the checker's bank on `self.actual` still carries the
+    // original's `T`, and the struct table alone can't answer since a boolean field is code
+    // 0, layout-shared with i32. The instance's own row (`sTyIx`) still holds the precise type.
+    const pft = anonParamPinFieldTy(e.memObj, e.memProp, fnIx)
+    if pft >= 0 { return tyEmitPrimOf(pft) == "boolean" }
+    const msi = structIndexOfExpr(e.memObj, fnIx)
+    if msi >= 0 && msi < sTyIx.length {
+      const mfty = tyFieldTyOf(sTyIx[msi], e.memProp)
+      if mfty >= 0 && tyEmitPrimOf(mfty) == "boolean" { return true }
+    }
+  }
+  false
+}
+
+// The literal-union parameter flavour of value call `callIx`'s parameter `idx`: `1` a `K`
+// atom param, `2` a `K | null` niche param, `0` neither, read off `fnIx`'s pin of the callee
+// (D4352). Can't come from the `$fnsig` key: a litunion param's token is `i`, as an i32's is.
+export function cloCallParamLitUnion(callIx: i32, idx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ft = cloCallParamFnTyOf(callIx, fnIx)
+    if ft < 0 { return 0 }
+    const t = T.tys[ft]
+    if t is TyFunc {
+      if idx < 0 || idx >= t.fnParamTypes.length { return 0 }
+      const pty = t.fnParamTypes[idx]
+      // A string literal union, aliased or inline, is the interned i32 atom.
+      if tyIsLitUnion(pty) { return 1 }
+      // The niche claims both spellings, exactly as `nodeTyIsNulLitUnion` does: inline and
+      // aliased alike rep as the i32 atom with the `-1` null sentinel.
+      if tyIsNullableLitUnion(pty) { return 2 }
+    }
+  }
+  0
+}
+
+// The function type value call `callIx`'s parameters are read off in instance `fnIx`: the
+// callee's recorded type when it is one, else the pin of the hole or type parameter it reads
+// (through `const` aliases); -1 when none is a function type.
+function cloCallParamFnTyOf(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ct = nodeTyIxOf(c.callFn)
+    if ct >= 0 && T.tys[ct] is TyFunc { return ct }
+    const hft = cloCallHoleFnTyOf(callIx, fnIx)
+    if hft >= 0 { return hft }
+    const pt = valueReadPinTy(c.callFn, fnIx, 0)
+    if pt >= 0 && pt < T.tys.length && T.tys[pt] is TyFunc { return pt }
+    return ct
+  }
+  -1
+}
+
+// The last-resort rung of `cloCallParamUnionName`: inside a monomorphized instance the
+// callee `Ident` shares a leaf with the generic, so `nodeTyIxOf` answers a `TyFunc` no
+// union registry ever names. The lifted lambda's own `Param` node carries the substituted
+// pin instead (D426): last, since every callee resolving today takes an earlier candidate.
+function cloLamParamUnionName(calleeIx: i32, idx: i32, fnIx: i32) {
+  const cre = P.nodes[calleeIx]
+  if cre is Ident {
+    const fe = identClosureFeAt(sidOfNode(calleeIx), fnIx, calleeIx)
+    if fe >= 0 && fe < fnStmts.length {
+      const lf = P.nodes[fnStmts[fe]]
+      if lf is FuncDecl {
+        if idx >= 0 && idx < lf.fnParams.length {
+          const p = P.nodes[lf.fnParams[idx]]
+          if p is Param {
+            if p.parType >= 0 {
+              const nm = tyNameOf(p.parType)
+              if nm != "" {
+                // The registration test the arena arms make, restated by the same producer:
+                // a name `annParamKind` keys `u` is one `isUName` admits, hence one
+                // `unionMemberSetOf` resolves.
+                if annParamKind(nm) == repSigTokOfKind("union") { return nm }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
+// The union-box parameter name of value call `callIx`'s parameter `idx` — the emitter's
+// registered union name (`isUName`), which `emitUnionCoerce` resolves to its member set for
+// the tag choice. "" when not a union box. Can't come from the `$fnsig` key: the union token
+// `u` is slot-free (every boxed union shares one valtype), so identity comes from here.
+export function cloCallParamUnionName(callIx: i32, idx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ft = nodeTyIxOf(c.callFn)
+    if ft < 0 { return cloLamParamUnionName(c.callFn, idx, fnIx) }
+    const t = T.tys[ft]
+    if t is TyFunc {
+      if idx < 0 || idx >= t.fnParamTypes.length { return "" }
+      const pty = t.fnParamTypes[idx]
+      if tyIsLitUnion(pty) { return "" }
+      if tyIsNullableLitUnion(pty) { return "" }
+      // A registry lookup, not a key mint: the union registry fills from whichever spelling
+      // reaches it first, and the arena can't say which — so ask, most specific first: (1)
+      // the declared alias, by arena-index identity; (2) the nominal render, for an inline
+      // union registered under its member set; (3) the structural render.
+      let nm = unionAliasDeclNameOfTy(pty)
+      if nm != "" {
+        if annParamKind(nm) == repSigTokOfKind("union") { return nm }
+      }
+      nm = tyToNominalName(pty)
+      if nm != "" {
+        if annParamKind(nm) == repSigTokOfKind("union") { return nm }
+      }
+      nm = tyToEmitName(pty)
+      if nm == "" { return cloLamParamUnionName(c.callFn, idx, fnIx) }
+      // The registration test, made by the token producer itself rather than restated: a
+      // name `annParamKind` keys `u` is one `isUName` admits, hence one `unionMemberSetOf`
+      // resolves. Asking the producer keeps this arm and the ABI from ever disagreeing.
+      if annParamKind(nm) != repSigTokOfKind("union") {
+        return cloLamParamUnionName(c.callFn, idx, fnIx)
+      }
+      return nm
+    }
+  }
+  ""
+}
+
+// The producer (concrete-lambda) `$fnsig` key of a function-value binding `name` — the
+// functype the lambda value actually carries (`cloSigKeyExt` of the resolved lambda),
+// chasing a plain copy to the source binding's initializer lambda. "" when `name` does
+// not resolve to a concrete lambda.
+function producerCloSigKey(name: string, fnIx: i32) {
+  const fe = identClosureFe(name, fnIx)
+  if fe >= 0 { return cloSigKeyExt(fe) }
+  const src = identCopySource(name, fnIx)
+  if src != "" && src != name { return producerCloSigKey(src, fnIx) }
+  ""
+}
+
+// Soundness floor: a function-value call whose resolved cast `$fnsig` and its concrete
+// producer lambda's `$fnsig` are both ref-list results on different, non-layout-twin
+// element slots — array elements are invariant, so the `ref.cast` to the annotation's
+// wrapper traps on the producer's. Rejects loudly rather than emit the latent trap (#875).
+export function cloCallReflistElemTwin(callIx: i32, fnIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident {
+      const castK = cloCallSigKey(callIx, fnIx)
+      if castK == "" { return false }
+      const prodK = producerCloSigKey(cre.identName, fnIx)
+      if prodK == "" { return false }
+      if prodK == castK { return false }
+      if cloSigPosOfKey(castK) < 0 { return false }
+      if cloSigPosOfKey(prodK) < 0 { return false }
+      const crk = sigKeyRetKind(castK)
+      const prk = sigKeyRetKind(prodK)
+      if crk == null || prk == null { return false }
+      if crk == "reflist" && prk == "reflist" {
+        const cs = sigKeyRetSlot(castK)
+        const ps = sigKeyRetSlot(prodK)
+        if cs >= 0 && ps >= 0 && cs != ps {
+          if rlSlotsLayoutTwin(cs, ps) == 0 { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// The declared list type-name of the expression at `ix`, or "" — an annotation, not a rep.
+// Covers all four storage classes a list binding can have (param, function-scoped
+// let/const, module global, one level of index), because inside a monomorphized instance
+// the checker never typed the cloned body, so only the substituted annotation is left.
+function listAnnNameOf(ix: i32, fnIx: i32) {
+  if ix < 0 { return "" }
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Ident {
+    const ptn = paramTypeNodeAt(fnIx, e.identName, unwrapParen(ix))
+    if ptn >= 0 {
+      const pt = P.nodes[ptn]
+      if pt is TypeRef { return pt.tyName }
+    }
+    let li = -1
+    if fnIx >= 0 {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOfIn(fnIx, e.identName, unwrapParen(ix)) }
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType >= 0 {
+          const lt = P.nodes[d.letType]
+          if lt is TypeRef { return lt.tyName }
+        }
+      }
+    }
+    return ""
+  }
+  if e is Index {
+    const outer = listAnnNameOf(e.idxArr, fnIx)
+    if outer != "" { return arrElemNameRaw(outer) }
+  }
+  // A direct call's declared return: inside a generic instance the call node keeps the
+  // template's type, and only the callee instance's return names the pinned list (D2820).
+  if e is Call {
+    if e.callFn >= 0 && P.nodes[e.callFn] is Ident {
+      const target = fnIndexOfNode(e.callFn)
+      if target >= 0 && target < fnStmts.length {
+        const fn = P.nodes[fnStmts[target]]
+        if fn is FuncDecl {
+          if fn.fnRet >= 0 {
+            const rt = P.nodes[fn.fnRet]
+            if rt is TypeRef { return rt.tyName }
+          }
+        }
+      }
+    }
+  }
+  ""
+}
+
+// True if the list at `arrIx` carries boolean elements: a `[true, ...]` literal, a
+// `boolean[]` annotation on any storage class, a name tracing to either through its
+// initializer, or a `.map`/`.filter` callback returning boolean. Rides the i32 list rep
+// (0/1), with spare value 2 encoding a checked `.pop()`'s `boolean | null` niche sentinel.
+export function listElemIsBool(arrIx: i32, fnIx: i32) {
+  if arrIx < 0 { return false }
+  const inner = unwrapParen(arrIx)
+  const e = P.nodes[inner]
+  if e is ArrayLit {
+    if e.arrElems.length > 0 { return exprIsBool(e.arrElems[0], fnIx) }
+    return false
+  }
+  // The array grammar's one cut (`arrElemNameRaw`) plus the bare leaf name — deliberately
+  // not `nameIsI32Array`, which is rep-wide (also accepts `i32[]`, litunion `K[]`, niche
+  // arrays) where this site is about the element's print formatting specifically.
+  const annElem = arrElemNameRaw(listAnnNameOf(inner, fnIx))
+  // Stays on the name rather than the arena twin (`tyArrayElemPrimName`) on purpose: inside
+  // a monomorphized instance the body is a clone the checker never typed, so the node-type
+  // bank has nothing and only the substituted annotation carries the boolean-ness.
+  // Substituting the arena twin breaks `generics/bool-list-arg-print.vl` (B77).
+  if annElem == "boolean" { return true }
+  // A numeric declared element outranks the initializer-derived kind below: a declared
+  // `i32[]` prints its elements as numbers whatever type its initializer's elements have.
+  if annElem == "i32" || annElem == "u8" { return false }
+  // The instance's own pin, for a receiver the body typed only as a hole: the substituted
+  // annotation the rungs above read is the generic's, so this is the first rung with a
+  // concrete element. Below them, since a declared `i32[]` still outranks it.
+  if tyArrayElemPrimName(nodeTyPinIxOf(inner)) == "boolean" { return true }
+  if e is Ident {
+    let li = -1
+    if fnIx >= 0 {
+      const fn = P.nodes[fnIx]
+      if fn is FuncDecl { li = parentLetOf(fn.fnBody, e.identName) }
+    }
+    if li < 0 { li = globalLetOfIn(fnIx, e.identName, inner) }
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letInit >= 0 {
+          if unwrapParen(d.letInit) != inner {
+            return listElemIsBool(d.letInit, fnIx)
+          }
+        }
+      }
+    }
+    return false
+  }
+  mfArrElemIsBool(arrIx, fnIx)
+}
+
+// True if `name` is a binding whose initializer is a checked `.pop()` over a
+// BOOLEAN-element list — its i32 cell holds 0/1 or the niche sentinel 2 (`null`),
+// so a later `name ?? d` must compare against 2, not test a ref.
+export function identNullableBoolPop(name: string, fnIx: i32) {
+  let li = -1
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl { li = parentLetOf(fn.fnBody, name) }
+  }
+  if li < 0 { li = globalLetOfIn(fnIx, name, -1) }
+  if li >= 0 {
+    const d = P.nodes[li]
+    if d is LetDecl {
+      if d.letInit >= 0 {
+        const ini = P.nodes[unwrapParen(d.letInit)]
+        if ini is Call {
+          const callee = P.nodes[ini.callFn]
+          if callee is Member {
+            if callee.memProp == "pop" {
+              return listElemIsBool(callee.memObj, fnIx)
+            }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if `name`, read at node `atIx`, resolves (param / local / module global) to a boolean
+// binding: a `: boolean` annotation, or an un-annotated `const`/`let` with a boolean
+// initializer. A boolean local registers as kind 0 (== i32), so bool-ness must be recovered
+// from the binding here, not the local registry.
+function boundBoolByName(name: string, fnIx: i32, atIx: i32) {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      // A read inside the body resolves at its own position, where a `let` in scope shadows a
+      // parameter and one in a block the read is outside does not (D3236). A node with no
+      // such position takes the scope stack (D1597), after the parameters.
+      const bsid = readSidOf(name, atIx)
+      let li = bodyReadLet(fn.fnBody, bsid, atIx)
+      const positioned = li != PL_READ_UNPLACED
+      if !positioned { li = -1 }
+      if li < 0 {
+        const params = fn.fnParams
+        let i = 0
+        while i < params.length {
+          const p = P.nodes[params[i]]
+          if p is Param {
+            if p.parName == name { return tyIsBool(p.parType) }
+          }
+          i = i + 1
+        }
+      }
+      if !positioned {
+        if !blockBindingHidden() && atIx >= 0 {
+          li = parentLetOfAt(fn.fnBody, bsid, atIx)
+        } else {
+          li = frameLetOfLive(fn.fnBody, name)
+        }
+      }
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if d.letType >= 0 { return tyIsBool(d.letType) }
+          return exprIsBool(d.letInit, fnIx)
+        }
+      }
+    }
+  }
+  const gi = globalLetOfIn(fnIx, name, atIx)
+  if gi >= 0 {
+    const g = P.nodes[gi]
+    if g is LetDecl {
+      if g.letType >= 0 { return tyIsBool(g.letType) }
+      return exprIsBool(g.letInit, -1)
+    }
+  }
+  false
+}
+
+// The element type of captured list `arrIx` read in `fnIx`, or -1 for any other receiver.
+function capturedCellElemTy(arrIx: i32, fnIx: i32): i32 {
+  const a = P.nodes[unwrapParen(arrIx)]
+  if !(a is Ident) || capturedKindOf(fnIx, a.identName) == null { return -1 }
+  tyArrayElemIx(nodeTyIxOf(unwrapParen(arrIx)))
+}
+
+// The boolean-list atom code of the value `ix` builds (`tyBoolListCode`): its recorded type's,
+// else inside a generic instance the pinned type's, else for a list literal its first
+// element's; -1 for any other value.
+export function exprBoolListCode(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const bix = unwrapParen(ix)
+  if bix < 0 || bix >= P.nodes.length { return -1 }
+  const c = tyBoolListCode(nodeTyIxOf(bix))
+  if c >= 0 { return c }
+  const ec = tyBoolListCode(exactOperandTyOf(bix, fnIx))
+  if ec >= 0 { return ec }
+  const pc = tyBoolListCode(nodeTyPinIxOf(bix))
+  if pc >= 0 { return pc }
+  // A name or call read inside an instance: a parameter's substituted annotation, or the callee
+  // instance's declared return (D2820's rung).
+  const an = listAnnNameOf(bix, fnIx)
+  if an != "" { return boolListCodeOfName(an) }
+  const init = frameLetInitOf(bix, fnIx)
+  if init >= 0 { return exprBoolListCode(init, fnIx) }
+  arrLitBoolListCode(bix, fnIx)
+}
+
+// The boolean-list code a list literal `ix` builds from its first element; -1 for any other.
+function arrLitBoolListCode(ix: i32, fnIx: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is ArrayLit) { return -1 }
+  if n.arrElems.length == 0 { return -1 }
+  const e = n.arrElems[0]
+  if exprIsBool(e, fnIx) { return 17 }
+  const sc = exprBoolListCode(e, fnIx)
+  if sc == 17 { return 19 }
+  if sc >= 19 { return sc + 1 }
+  -1
+}
+
+// The box tag of the ref-element list `ix` built at reflist slot `slot` into union `un`: a
+// boolean-leaf list's own code where `un` has that arm, else the slot's tag.
+export function refArrBoxTagOf(ix: i32, fnIx: i32, slot: i32, un: string): i32 {
+  const c = exprBoolListCode(ix, fnIx)
+  if c >= 19 && unionHasBoolLeafArm(un, c - 18) {
+    return boolListArmTag(c - 18)
+  }
+  if vbAtomListTop >= 1 {
+    const ad = exprAtomLeafListDepth(ix, fnIx)
+    if ad >= 1 && unionHasAtomLeafArm(un, ad) { return atomLeafListArmTag(ad) }
+  }
+  refArrSlotTag(slot)
+}
+
+// `atomLeafListDepthOfTy` of the value `ix` builds: its recorded type's, else its operand or
+// pinned type's, else for a list literal one more than its first element's; -1 otherwise.
+function exprAtomLeafListDepth(ix: i32, fnIx: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const bix = unwrapParen(ix)
+  if bix < 0 || bix >= P.nodes.length { return -1 }
+  const d = atomLeafListDepthOfTy(nodeTyIxOf(bix))
+  if d >= 0 { return d }
+  const ed = atomLeafListDepthOfTy(exactOperandTyOf(bix, fnIx))
+  if ed >= 0 { return ed }
+  const pd = atomLeafListDepthOfTy(nodeTyPinIxOf(bix))
+  if pd >= 0 { return pd }
+  const init = frameLetInitOf(bix, fnIx)
+  if init >= 0 { return exprAtomLeafListDepth(init, fnIx) }
+  const n = P.nodes[bix]
+  if !(n is ArrayLit) || n.arrElems.length == 0 { return -1 }
+  const e = n.arrElems[0]
+  if exprIsLitAtom(e, fnIx) { return 0 }
+  const sd = exprAtomLeafListDepth(e, fnIx)
+  if sd >= 0 { return sd + 1 }
+  -1
+}
+
+// True if the CAPTURED variable `name` of the capturing lifted function `fnIx`
+// is BOOLEAN-typed in the parent frame (a `boolean` param annotation, a
+// `boolean`-annotated let, or a bool-literal init). Bool rides in an i32, so
+// `capturedKindOf` cannot carry it — this is the print/`fRetBool` side channel.
+function capturedIsBool(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  if !fnValUsed { return false }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return false }
+  const caps = captureNamesOf(fe)
+  let isCap = false
+  let ci = 0
+  while ci < caps.length {
+    if caps[ci] == name { isCap = true }
+    ci = ci + 1
+  }
+  if !isCap { return false }
+  const b = parentBindingOf(fe, name)
+  if b < 0 { return false }
+  const bn = P.nodes[b]
+  // `tyIsBool` IS this test — `tyNameOf` returns "" for a negative index and for a non-`TypeRef`,
+  // which is that function's `false`. Two hand-written copies of one predicate, now one call each;
+  // the destringification rides in `tyIsBool` alone.
+  if bn is Param { return tyIsBool(bn.parType) }
+  if bn is LetDecl {
+    if bn.letType >= 0 { return tyIsBool(bn.letType) }
+    if bn.letInit >= 0 {
+      const iv = P.nodes[unwrapParen(bn.letInit)]
+      if iv is BoolLit { return true }
+    }
+  }
+  false
+}
+
+// True when value call `callIx`'s callee type has a parameter or result with no `$fnsig`
+// token and no derived i32 rep: the all-i32 arity functype would then be called at the wrong
+// type, so the caller refuses instead of falling back (D2810).
+export function cloCallArityFallbackUnsound(callIx: i32, fnIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    // A hole callee bound to a function type in this instance that `cloCallSigKey` left
+    // unkeyed: the all-i32 functype is sound only where every slot rides an i32 (D3165).
+    const hft = cloCallHoleFnTyOf(callIx, fnIx)
+    if hft >= 0 {
+      const h = T.tys[hft]
+      if h is TyFunc {
+        let k = 0
+        while k < h.fnParamTypes.length {
+          if cloArityRepIsWide(h.fnParamTypes[k]) { return true }
+          k = k + 1
+        }
+        return cloArityRepIsWide(h.fnRet)
+      }
+    }
+    const fty = nodeTyIxOf(c.callFn)
+    if fty >= 0 {
+      const t = T.tys[fty]
+      if t is TyFunc {
+        let i = 0
+        while i < t.fnParamTypes.length {
+          if sigParamTokOfTy(t.fnParamTypes[i]) == "" {
+            if cloArityRepIsWide(t.fnParamTypes[i]) { return true }
+          }
+          i = i + 1
+        }
+        if sigRetTokOfTy(t.fnRet) == "" { return cloArityRepIsWide(t.fnRet) }
+      }
+    }
+  }
+  false
+}
+
+// The function type a value call's callee the checker left a hole is bound to in the instance
+// `fnIx`, or a capture of one; -1 when the callee has a type of its own or no such binding.
+function cloCallHoleFnTyOf(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const ct = nodeTyIxOf(c.callFn)
+    if ct >= 0 && T.tys[ct] is TyFunc { return -1 }
+    const hft = holeOrCapturedTyOf(c.callFn, fnIx)
+    if hft >= 0 && T.tys[hft] is TyFunc { return hft }
+  }
+  -1
+}
+
+// Why a value call `callIx` found no `$fnsig`: the first parameter or the result of the
+// callee's function type that has no token, walked in `sigKeyOfTy`'s order, else the whole
+// signature, which then has a key that no function value of that type interned.
+export function cloCallSigRejectWhat(callIx: i32, fnIx: i32): string {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const hft = cloCallHoleFnTyOf(callIx, fnIx)
+    if hft >= 0 {
+      return "the callee is an un-annotated value this instance binds to `"
+        + tyToEmitName(hft)
+        + "`, and such a call is keyed only for a scalar or string result"
+    }
+    const fty = nodeTyIxOf(c.callFn)
+    if fty >= 0 {
+      const t = T.tys[fty]
+      if t is TyFunc {
+        let i = 0
+        while i < t.fnParamTypes.length {
+          if sigParamTokOfTy(t.fnParamTypes[i]) == "" {
+            return "parameter "
+              + i32ToStr(i + 1)
+              + " of type `"
+              + tyToEmitName(t.fnParamTypes[i])
+              + "` has no representation in the function-value ABI"
+          }
+          i = i + 1
+        }
+        if sigRetTokOfTy(t.fnRet) == "" {
+          return "its result type `"
+            + tyToEmitName(t.fnRet)
+            + "` has no representation in the function-value ABI"
+        }
+        return "no function value of type `"
+          + tyToEmitName(fty)
+          + "` reaches this call to intern its signature"
+      }
+    }
+  }
+  "the callee has no function type to key a signature from"
+}
+
+// The source binding name of an inferred copy `const name = <Ident>` in scope of `fnIx`
+// (`const t0 = p` → `"p"`), or "" when `name` is not such a copy. Lets a closure-value call
+// resolve its sig through the intermediate binding the nullable/closure read pattern
+// introduces, by chasing the copy to its source (a param or annotated binding).
+function identCopySource(name: string, fnIx: i32) {
+  identCopySourceSid(sidOf(name), fnIx)
+}
+
+// Unpositioned: the ambiguous rung of `identCopySourceAt`, first-binding only.
+function identCopySourceSid(sid: i32, fnIx: i32) {
+  identCopySourceAt(sid, fnIx, -1)
+}
+
+// The positioned form (D2316's twin of `identClosureFeAt`): `atIx` picks among sibling
+// function-scoped blocks binding one name.
+function identCopySourceAt(sid: i32, fnIx: i32, atIx: i32) {
+  const ix = identCopySourceNodeAt(sid, fnIx, atIx)
+  if ix < 0 { return "" }
+  const ini = P.nodes[ix]
+  if ini is Ident { return ini.identName }
+  ""
+}
+
+// True when a closure value call's declared result is a value union but the resolved
+// closure `$fnsig` reps its result as a non-union (the lambda self-infers its one concrete
+// arm while the checker types the whole union) — rejects loudly here rather than leaking
+// invalid wasm at the narrow that consumes it. A supported union result (keying `>u`) returns false.
+export function cloCallUnionResultUnrepresentable(
+  callIx: i32,
+  fnIx: i32,
+): boolean {
+  // Case A: a nullable-closure-union result claims a box (`>u`) but no value union is
+  // declared, so the box is never minted — reject here rather than trap on the tag read. #875.
+  const ckeyA = cloCallSigKey(callIx, fnIx)
+  if ckeyA != "" {
+    const rkA = sigKeyRetKind(ckeyA)
+    if rkA != null && rkA == "union" && !uDeclared { return true }
+  }
+  const ty = nodeTyIxOf(callIx)
+  if ty < 0 { return false }
+  // A nullable numeric-scalar result reps as the same value-union box as a nullable-scalar
+  // union arm, so it needs the identical rep-consistency tail; `string|null`/`boolean|null` don't.
+  const tn = T.tys[ty]
+  if tn is TyNullable {
+    // A never-filled `let x = null` captured by a lambda gives it the open null-hole as its
+    // inferred result, so `nInner` is -1 here — representable as `null`'s own rep, not a refusal. D1576.
+    if tn.nInner < 0 || tn.nInner >= T.tys.length { return false }
+    const nit = T.tys[tn.nInner]
+    let nulBoxScalar = false
+    if nit is TyPrim {
+      const pn = nit.primName
+      if pn == "i32" || pn == "f64" || pn == "i64" || pn == "f32" {
+        nulBoxScalar = true
+      }
+    }
+    if !nulBoxScalar {
+      // A nullable value-union result wraps the union in `TyNullable`, bypassing the main
+      // union branch — route the inner union through the same analysis so it floors, not traps.
+      if nit is TyUnion { return cloCallUnionMixUnrep(tn.nInner, callIx, fnIx) }
+      return false
+    }
+    const nkey = cloCallSigKey(callIx, fnIx)
+    if nkey == "" { return true }
+    const nrk = sigKeyRetKind(nkey)
+    if nrk == null { return true }
+    if nrk != "union" { return true }
+    return cloSigPosOfKey(nkey) < 0
+  }
+  if !(T.tys[ty] is TyUnion) { return false }
+  return cloCallUnionMixUnrep(ty, callIx, fnIx)
+}
+
+// The scalar+composite value-union analysis of `cloCallUnionResultUnrepresentable`, factored
+// so both a direct `TyUnion` result and a nullable-wrapped union result (which bypasses the
+// main branch) run the identical representability test. `ty` is the union type index;
+// `callIx`/`fnIx` drive the `$fnsig` producer checks.
+function cloCallUnionMixUnrep(ty: i32, callIx: i32, fnIx: i32): boolean {
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  if t.uMembers.length < 2 { return false }
+  // A "boxing" union needs at least one scalar member and one composite member — their reps
+  // differ, so the closure result needs the shared box; a rep-uniform union already lowers.
+  let hasScalar = false
+  let hasComposite = false
+  let i = 0
+  while i < t.uMembers.length {
+    const mt = T.tys[t.uMembers[i]]
+    if mt is TyPrim {
+      hasScalar = true
+    } else if mt is TyLit {
+      // A litunion member reps as an i32 atom, so a litunion+composite mix is as
+      // rep-heterogeneous as a scalar mix — it needs the box too; a pure litunion stays uniform.
+      hasScalar = true
+    } else if tyIsLitUnion(t.uMembers[i]) {
+      hasScalar = true
+    } else if mt is TyObj {
+      hasComposite = true
+    } else if mt is TyArray {
+      hasComposite = true
+    } else if mt is TyMap {
+      hasComposite = true
+    } else if mt is TyFunc {
+      hasComposite = true
+    }
+    i = i + 1
+  }
+  if !hasComposite { return false }
+  // Rep-consistent only when the resolved `$fnsig` result is the union box (`>u`); a concrete-
+  // member result or no sig means the box read has nothing to recover — the deferred hole.
+  const ckey = cloCallSigKey(callIx, fnIx)
+  if ckey == "" { return hasScalar }
+  const rk = sigKeyRetKind(ckey)
+  if rk == null { return hasScalar }
+  if rk != "union" { return hasScalar }
+  // A `>u` key alone is not consistency — some producer must have actually interned that
+  // box functype; an un-interned `>u` is the same deferred hole for the mix.
+  if cloSigPosOfKey(ckey) < 0 { return hasScalar }
+  // The `>u` box can be interned (e.g. by an outer nullable-closure annotation) while the
+  // producer lambda self-inferred a non-union arm — an iso-recursive twin-cast trap. #938.
+  const pk = callProducerCloSigKey(callIx, fnIx)
+  if pk != "" && pk != ckey {
+    const prk = sigKeyRetKind(pk)
+    if prk != null && prk != "union" { return true }
+  }
+  // A param-fed closure (no resolvable producer) with a map-array union arm: its direct
+  // binding already rejects, but a nullable-closure annotation interns the box, slipping the check.
+  if pk == "" && tyUnionHasMapArrayArm(ty) { return true }
+  // The closure-array sibling of the map-array arm above: a param-fed union with a closure-
+  // array arm slips the same check via an outer `| null` interning the box.
+  if pk == "" && tyUnionHasClosureArrayArm(ty) { return true }
+  // The litunion-2D-array sibling of the two arms above: a nested litunion array folds to a
+  // slot the box doesn't yet compose through, slipping the check the same way.
+  if pk == "" && tyUnionHasLitUnionNestedArrayArm(ty) { return true }
+  // An indexed closure-array-element callee (`f[0]()`) whose result union has a value-union
+  // element-array arm: a param-fed array has no producer to verify its actual arm. #1034.
+  if tyUnionHasValueUnionElemArrayArm(ty) {
+    if calleeIsIndexedRefArrayCall(callIx, fnIx) {
+      if pk == "" { return true }
+      const prkI = sigKeyRetKind(pk)
+      if prkI == null || prkI != "union" { return true }
+    }
+  }
+  false
+}
+
+// The concrete PRODUCER lambda's `$fnsig` key for a value-CALL whose callee is a plain
+// Ident binding — the functype the closure VALUE actually carries. "" for a non-Ident
+// callee or an unresolvable producer.
+function callProducerCloSigKey(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident { return producerCloSigKey(cre.identName, fnIx) }
+  }
+  ""
+}
+
+// True when a call's callee is an index into a ref (closure) array (`f[0]()`): the element
+// sig comes from the array-element annotation, not a resolvable producer lambda. Used by
+// the union-result floor to reject the deferred scalar+composite closure-result union in
+// this spelling (the array element may hold a lambda that self-inferred a non-box arm).
+function calleeIsIndexedRefArrayCall(callIx: i32, fnIx: i32): boolean {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Index { return exprRefArray(cre.idxArr, fnIx) }
+  }
+  false
+}
+
+// True if an index read over the list at `arrIx` yields a boolean element. Today the
+// only boolean-element list producer is a `.map` whose callback returns boolean
+// (`xs.map(function(n: i32) n > 2)`); a `.filter` keeps its receiver's element
+// bool-ness, and a module-global binding traces through its initializer.
+function mfArrElemIsBool(arrIx: i32, fnIx: i32) {
+  if arrIx < 0 { return false }
+  const inner = unwrapParen(arrIx)
+  const e = P.nodes[inner]
+  if e is Call {
+    if callIsMapFilter(inner, fnIx) {
+      const callee = P.nodes[e.callFn]
+      if callee is Member {
+        if callee.memProp == "filter" {
+          return mfArrElemIsBool(callee.memObj, fnIx)
+        }
+        return mfCbRetIsBool(mfCallbackFe(e.callArgs[0], fnIx))
+      }
+    }
+    return false
+  }
+  if e is Ident {
+    const li = globalLetOfIn(fnIx, e.identName, inner)
+    if li >= 0 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letInit >= 0 {
+          if unwrapParen(d.letInit) != inner {
+            return mfArrElemIsBool(d.letInit, -1)
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if `ix` is a bare identifier naming a top-level or lifted function — the shape a
+// `.map`/`.filter` callback takes by plain reference rather than as a closure literal.
+export function exprIsBareFnName(ix: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is Ident { return fnIndexOfNode(ix) >= 0 }
+  false
+}
+
+// The result type name of lifted function `fe` (`i32`, `string`, `i32[]`, a struct name,
+// …) — its declared return annotation, or the inferred kind mapped back to a name, for
+// building a closure argument's function-type name for generic binding.
+export function cloRetTypeName(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return "" }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      // A declared `never` result lowers as `void` (D1972).
+      const rn = tyNameOf(fn.fnRet)
+      if rn == "never" { return "void" }
+      return rn
+    }
+  }
+  const k = cloRetValKind(fe)
+  if k == "i32" { return "i32" }
+  if k == "f64" { return "f64" }
+  if k == "i64" { return "i64" }
+  if k == "f32" { return "f32" }
+  if k == "str" { return "string" }
+  if k == "list" { return "i32[]" }
+  if k == "strlist" { return "string[]" }
+  if k == "f64list" { return "f64[]" }
+  if k == "struct" {
+    const slot = cloRetValSlot(fe)
+    if slot >= 0 && slot < sNames.length { return sNames[slot] }
+  }
+  ""
+}

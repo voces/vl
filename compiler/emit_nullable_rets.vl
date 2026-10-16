@@ -1,0 +1,1499 @@
+// `emit_nullable_rets.vl` — the type-ladder kind of a value type, and whether a
+// function's return or a variant's base bears null.
+
+import {
+  BinExpr,
+  Block,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  LetDecl,
+  Member,
+  NullLit,
+  P,
+  PIN_ANON,
+  PIN_NONE,
+  PIN_SIGKEY,
+  Param,
+  TypeRef,
+  WhileStmt,
+  i32ToStr,
+  mkTypeRef,
+  ufcsSiteRoot,
+} from "./ast"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeTyIsUnionAlias } from "./check_decl_scan"
+import {
+  recordClonedNodeTyFb,
+  recordClonedNodeTyKnown,
+} from "./check_emit_queries"
+import {
+  inferRetBearsNull,
+  inferRetIsNulList,
+  inferRetNameOf,
+} from "./check_infer_ret"
+import {
+  nodeTyBearsNull,
+  nodeTyIsLitUnionAlias,
+  nodeTyIsMap,
+  nodeTyIsNulLitUnion,
+  nodeTyIsNulNumLitUnion,
+  nodeTyIsNulStruct,
+  nodeTyIsStruct,
+  nodeTyIsStructArray,
+  nodeTyIsVariant,
+  nodeTyIxOf,
+  nodeTyMapKeyKindSpan,
+} from "./check_node_tys"
+import { inferRetFnKey, recordNodePin } from "./check_side_rows"
+import { MAP_KEY_STR, isValueUnionName } from "./check_ty_rep"
+import {
+  PrimName,
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyMutEpoch,
+  tyPrimNameOf,
+  tySame,
+} from "./check_types"
+import {
+  anonLeafSupersedeOf,
+  sIsAnonRow,
+  sScanLim,
+  structIndexByName,
+} from "./emit_atom_kinds"
+import {
+  inferNicheNullByName,
+  mapNameKeyKind,
+  mapValNameOf,
+  nameIsClosureArrayTy,
+  nameIsMap,
+  nameIsNulStrList,
+  nameIsU8Array,
+  nulCloFlag,
+  nullablePartOf,
+  retArrFlag,
+  retF32ArrFlag,
+  retF32Flag,
+  retF64ArrFlag,
+  retF64Flag,
+  retI64ArrFlag,
+  retI64Flag,
+  retNulListFlag,
+  retNulStringFlag,
+  retStrArrFlag,
+  retStrFlag,
+  retV128Flag,
+  retVoidAnnFlag,
+  tyIsFuncType,
+  tyIsNulBareMap,
+  tyIsNulBool,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
+import { listRepOfFieldCode } from "./emit_list_rep"
+import {
+  annBareRefArrSlot,
+  annNulRefArrSlot,
+  annRefArrSlot,
+  nonNulBaseOf,
+  nulMapInnerName,
+} from "./emit_map_value_slots"
+import {
+  mapMonoShapeOfKey,
+  mvArmHintOfTyName,
+  mvArmKeyName,
+  mvSlotByValNameKArm,
+  variantRowOfTy,
+} from "./emit_mv_slots"
+import {
+  globalLetOf,
+  globalLetOfSid,
+  lixFirstOf,
+  lixNextOf,
+  variantIndexOf,
+} from "./emit_narrow_slots"
+import {
+  exprIsIfStmt,
+  globalIsNonConst,
+  ifArmValueExpr,
+  paramTypeNode,
+} from "./emit_query"
+import {
+  mvSlotOfTyKArm,
+  mvSlotOfValNameTyKArm,
+  nodeMapValTyIx,
+  nodeRepIs,
+  repRowOfName,
+  repRowOfTyStruct,
+  repShadowAddReason,
+  repShadowOn,
+  repSlotOfTy,
+} from "./emit_rep"
+import {
+  annRepKindOf,
+  mapFindShapeOfNodeTy,
+  mapNodeValKindLowerable,
+  mapValKindLowerable,
+  mvCanonValName,
+  nulScalarListKind,
+  refArrElemNameIf,
+  structIndexOfTypeName,
+  tyIsNulLitUnionArr,
+} from "./emit_shape_rows"
+import {
+  LBK_F32_LIST,
+  LBK_F64_LIST,
+  LBK_I32_LIST,
+  LBK_I64_LIST,
+  LBK_NUL_U8_LIST,
+  LBK_STR_LIST,
+  VKind,
+  anonLeafParamMoved,
+  emitPhaseReached,
+  fnMvBase,
+  localIsRef,
+  mvValsOutBase,
+  sFieldCount,
+  sNames,
+  sTyIx,
+  uVariants,
+  unNames,
+} from "./emit_state"
+import { ArrNewKind, arrNewKindOfElemVKind } from "./emit_struct_order"
+import { i32ListHas } from "./listutil"
+import { memoKeyNew, memoMoved, memoPassMoved } from "./memo"
+import {
+  nonNullTy,
+  tyEmitElemNulPrimOf,
+  tyEmitElemPrimOf,
+  tyIsU8ArrayTy,
+} from "./tyquery"
+
+// The `__array_new__` element kind named by an annotated-PARAMETER fill: the list a value of
+// the parameter's declared `VKind` is an element of. The one channel a monomorphized instance
+// still has, its annotation carrying the pin while the recorded type is the original's
+// unpinned `T`. `"none"` for a fill that is not an annotated parameter.
+export function arrNewFillAnnKind(callIx: i32, fnIx: i32): ArrNewKind {
+  const c = P.nodes[callIx]
+  if c is Call {
+    if c.callArgs.length == 2 {
+      const a = P.nodes[c.callArgs[1]]
+      if a is Ident {
+        const pt = paramTypeNode(fnIx, a.identName)
+        if pt >= 0 { return arrNewKindOfElemVKind(vtKindOfType(pt)) }
+      }
+    }
+  }
+  "none"
+}
+
+export function fnRetNullBearing(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const r = fn.fnRet
+  if tyIsNulBool(r) { return true }
+  if nodeRepIs(r, "nulstr") { return true }
+  if nodeRepIs(r, "nulstruct") { return true }
+  if nodeRepIs(r, "nullist") { return true }
+  // Every list rep `emitNullForRet` has a `ref.null` for, not only the i32-backed one (D2495).
+  if nulScalarListKindOfNode(r) != null { return true }
+  if retNulRefArrFlag(r) == 1 { return true }
+  if retNulMapFlag(r) == 1 { return true }
+  // A nullable closure, whose `ref.null $cloStruct` `emitNullForRet` already emits (D4349).
+  if nulCloFlag(r) == 1 { return true }
+  // The arena, not the render's `|`-split: `nodeTyBearsNull` covers both shapes
+  // `retUnionFlag` admits (a `TyUnion` with a `null` member and a `TyNullable` scalar).
+  if retUnionFlag(r) == 1 { return nodeTyBearsNull(r) }
+  if r < 0 {
+    const irk = inferRetFnKey(fnIx, fn.fnName)
+    const im = inferRetNameOf(irk)
+    if isValueUnionName(im) {
+      // The arena, reached through the inferred-return table's own type column
+      // (`inferRetTyIxOf`), rather than splitting a rendered member set on `|`. The
+      // fallback below is unreachable and kept only as a total-function guard:
+      // `isValueUnionName(im)` being true already proves `inferRetTyIxOf` resolves.
+      return inferRetBearsNull(irk)
+    }
+    if inferNicheNullByName(irk) != "" { return true }
+  }
+  false
+}
+
+// D1240 — a member call the checker typed non-void, which the emitter can deliver as a
+// value. One predicate for three consumers that must agree: `computeVoidFns`,
+// `emitFuncBody`/`emitStmtTail` (the tail is the result), and `emitCallStmt`'s discard.
+// Reads the checker's type at every method, not a by-name exclusion list (D1301, D1592).
+export function memberCallYieldsValue(stmtIx: i32) {
+  const s = P.nodes[stmtIx]
+  if s is Call {
+    const callee = P.nodes[s.callFn]
+    if callee is Member {
+      // An unrecorded type (-1) is "cannot answer", never a value. A per-instance copy of a
+      // call records no type of its own and answers the checked call it copies (D4670).
+      let t = nodeTyIxOf(stmtIx)
+      if t < 0 { t = nodeTyIxOf(ufcsSiteRoot(stmtIx)) }
+      if t < 0 { return false }
+      return tyPrimNameOf(t) != "void"
+    }
+  }
+  false
+}
+
+// Whether assignment `asgIx`'s value is typed a non-nullable function.
+export function asgValueIsFunc(asgIx: i32): boolean {
+  const vt = nodeTyIxOf(asgIx)
+  vt >= 0 && vt < T.tys.length && T.tys[vt] is TyFunc
+}
+
+// Whether the assignment at `asgIx` writes a field or an element, the targets `spillTail`
+// turns into a store of a spilled value followed by a read of it. A bare `null`, a map and a
+// function value are not: an inferred return of theirs has no rep the tail can yield (D2496).
+export function assignTargetSpills(asgIx: i32): boolean {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return false }
+  if a.binOp != "=" { return false }
+  const v = unwrapParen(a.binRight)
+  if v < 0 || P.nodes[v] is NullLit { return false }
+  const t = unwrapParen(a.binLeft)
+  if t < 0 { return false }
+  if !(P.nodes[t] is Member || P.nodes[t] is Index) { return false }
+  const vt = nodeTyIxOf(asgIx)
+  if vt < 0 { return false }
+  const nt = T.tys[nonNullTy(vt)]
+  !(nt is TyMap || nt is TyFunc)
+}
+
+// The function `computeVoidFns` is classifying, or -1: its own call in tail position yields
+// what the rest of its tail yields, so it is assumed void there, by name or through its
+// closure (D3828).
+export let tailSelfFnIx = 0 - 1
+
+// Stages `tailSelfFnIx`.
+export function tailSelfFnSet(fnIx: i32) {
+  tailSelfFnIx = fnIx
+  0
+}
+
+// Whether the function at `fnIx` can return the `null` its inferred nullable return falls
+// through to: a rep `fnRetNullBearing` reads now, or one `synthNulListRetAnns` pins later.
+export function inferNullFallsThrough(fnIx: i32): boolean {
+  if fnRetNullBearing(fnIx) { return true }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet >= 0 { return false }
+  if inferRetNulPinned(inferRetFnKey(fnIx, fn.fnName)) { return true }
+  // An anonymous lambda's row is keyed by its node, which `fnRetNullBearing` does not ask.
+  const nk = "#" + i32ToStr(fnIx)
+  if inferRetNulPinned(nk) || inferNicheNullByName(nk) != "" { return true }
+  isValueUnionName(inferRetNameOf(nk)) && inferRetBearsNull(nk)
+}
+
+// The inferred returns `synthNulListRetAnns` pins: a nullable list, or a nullable declared
+// struct row resolved by the pair `inferNulStructRow` asks, so the pin and `retNulRefIndex`
+// cannot resolve different rows (D1220).
+export function inferRetNulPinned(irk: string): boolean {
+  if inferRetIsNulList(irk) { return true }
+  const part = nullablePartOf(inferRetNameOf(irk))
+  if part == "" { return false }
+  structIndexOfTypeName(part) >= 0
+}
+
+// True if the arm at `blockIx` is a BLOCK with no statements — the shape that has no tail to
+// give a value, and therefore no value for `emitIfTail` to place. A non-Block arm (an
+// `else if` chain) is never "empty" in this sense and answers false.
+export function ifTailArmIsEmpty(blockIx: i32): boolean {
+  if blockIx < 0 { return false }
+  const ab = P.nodes[blockIx]
+  if ab is Block { return ab.blkStmts.length == 0 }
+  false
+}
+
+// True when the function node `fnIx` carries a return annotation other than `void`.
+export function fnDeclaresNonVoid(fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  fn.fnRet >= 0 && retVoidAnnFlag(fn.fnRet) == 0
+}
+
+// How many value-producing exits one return value contributes. An if-expression
+// (`return if c { a } else { b }`) lowers as a void statement-`if` whose arms each
+// terminate as their own return, so it contributes one exit per arm — what makes such a
+// function eligible for the sink at all. Every other expression is a single exit.
+export function retValueExitCount(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const bare = P.nodes[unwrapParen(exprIx)]
+  if bare is IfStmt {
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let total = 0
+    let cur = unwrapParen(exprIx)
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        total = total + retArmExitCount(c.ifThen, fnIx)
+        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          total = total + retArmExitCount(c.ifElse, fnIx)
+        }
+      }
+    }
+    return total
+  }
+  1
+}
+
+// One arm of a returned if-EXPRESSION: an `else if` chain link is another if-expression,
+// a block's single tail value recurses (a NESTED if-expression contributes its own arms),
+// and anything else is one exit.
+function retArmExitCount(armIx: i32, fnIx: i32) {
+  if armIx < 0 { return 0 }
+  const a = P.nodes[armIx]
+  if a is IfStmt { return retValueExitCount(armIx, fnIx) }
+  if a is Block {
+    const av = ifArmValueExpr(armIx)
+    if av >= 0 { return retValueExitCount(av, fnIx) }
+  }
+  1
+}
+
+// Is some collected declared local named `name` the union box rep (kind 4)? The binding
+// sink's prediction asks this rather than re-deriving the slot cursor: `buildLocals` has
+// already run, so a shadowed name that answers for the wrong slot only mis-predicts,
+// costing two unused locals, never a wrong sink (the lowering reads `localIsRef[slot]` directly).
+function localNameIsUnionSlot(name: string) {
+  let i = lixFirstOf(name)
+  while i >= 0 {
+    if localIsRef[i] == "union" { return true }
+    i = lixNextOf(i)
+  }
+  false
+}
+
+// Does the statement at `stmtIx` hold a `let`/`const` of the union BOX rep whose init is
+// an if-EXPRESSION — the shape the binding sink rewrites? Deliberately does NOT descend
+// into a nested `FuncDecl`, whose locals belong to its own lifted wasm function.
+function blockHasUnionLetIf(stmtIx: i32) {
+  if stmtIx < 0 { return false }
+  const s = P.nodes[stmtIx]
+  if s is FuncDecl { return false }
+  if s is LetDecl {
+    if exprIsIfStmt(s.letInit) { return localNameIsUnionSlot(s.letName) }
+    return false
+  }
+  if s is Block {
+    const stmts = s.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if blockHasUnionLetIf(stmts[i]) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if s is IfStmt {
+    if blockHasUnionLetIf(s.ifThen) { return true }
+    return blockHasUnionLetIf(s.ifElse)
+  }
+  if s is WhileStmt { return blockHasUnionLetIf(s.whileBody) }
+  if s is ForRange { return blockHasUnionLetIf(s.frBody) }
+  if s is ForIn { return blockHasUnionLetIf(s.fiBody) }
+  false
+}
+
+// True when function `fnIx` should reserve the union-box sink pair for a binding: it holds
+// a union-box `let`/`const` initialized by an if-expression, so an arm's box can be sunk
+// past the merge. A prediction only (`unionIfBindingAllBox` decides at lowering time
+// whether the rewrite fires); over-firing costs two unused locals, under-firing declines a sink.
+export function fnUnionLetSinkOk(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return blockHasUnionLetIf(fn.fnBody) }
+  false
+}
+
+// The per-function mv frame base for mv slot `slot` (valid when `fnUsesMap`).
+export function fnMvMapRefLocal(slot: i32) { fnMvBase + slot * 3 }
+
+export function fnMvValsBkLocal(slot: i32) { fnMvBase + slot * 3 + 1 }
+
+export function fnMvValStashLocal(slot: i32) { fnMvBase + slot * 3 + 2 }
+
+// The `m.values()` per-mv-slot OUTPUT backing local for mv slot `slot`.
+export function fnMvValsOutLocal(slot: i32) { mvValsOutBase + slot }
+
+// The list rep a `m.values()` result takes; `"none"` is a call that is not one.
+export type MapValuesList = "none"
+  | "list"
+  | "strlist"
+  | "f64list"
+  | "i64list"
+  | "reflist"
+
+export function retNulRefFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    // STRUCTURAL fast-path (C1): the checker recorded this node's type as a nullable declared
+    // struct (`S | null`). Confirms only; `string | null` and everything else fall to the name path.
+    if nodeTyIsNulStruct(tyIx) { return 1 }
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      const base = nullablePartOf(ty.tyName)
+      // `string` is the raw i32 array, NOT a struct — `string | null` is the kind-16
+      // nullable-string ref (`retNulStringFlag`), never a nullable struct. Exclude it
+      // here so it isn't mis-claimed as kind 9 (which would read the box as a struct).
+      if base == "string" { return 0 }
+      // A union variant with no struct row is `nulvariant`, not kind 9 (`retNulVariantFlag`
+      // is the positive answer) — excluded here, at the one producer: `collectS` refuses a
+      // variant its own struct row, so every `nulstruct` answer pairs a real struct index.
+      if base != "" {
+        if variantIndexOf(base) >= 0 && structIndexOfTypeName(base) < 0 {
+          return 0
+        }
+      }
+      if base != "" {
+        // The `structIndexOfTypeName` half is load-bearing: a name can be both a variant and
+        // a declared struct (`std/fs.vl`'s `IoResult`), which keeps its real struct row.
+        const nrt = nodeRepTyIxOf(tyIx)
+        if nrt >= 0 {
+          const tn = T.tys[nrt]
+          if tn is TyNullable {
+            if tn.nInner >= 0 {
+              const ti2 = T.tys[tn.nInner]
+              if ti2 is TyObj { return 1 }
+            }
+            return 0
+          }
+        }
+        if structIndexOfTypeName(base) >= 0 { return 1 }
+      }
+    }
+  }
+  0
+}
+
+// A nullable union variant annotation or expression (`Circle | null`, `x as? Circle`) — `1`,
+// else `0`. Disjoint from `retNulRefFlag` by construction: that flag returns 0 for exactly
+// what this one claims, since a variant has no struct row for the arena to ask about.
+// Defined in terms of the index (`nulVariantIndexOf`), so the kind/slot pair can't disagree.
+export function retNulVariantFlag(tyIx: i32) {
+  if nulVariantIndexOf(tyIx) >= 0 { return 1 }
+  0
+}
+
+// The variant table index behind a `Circle | null` annotation or expression at `tyIx`, or
+// -1 — the `nulvariant` half of `annValtypeSlotOf`'s kind/slot pairing. Two rungs: the name
+// answers an annotation, the arena an expression with a recorded type and no spelling
+// (`mk(a) as? Circle`), since `variantRowOfTy` matches only by arena-index identity.
+export function nulVariantIndexOf(tyIx: i32) {
+  if tyIx < 0 { return -1 }
+  const ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    const base = nullablePartOf(ty.tyName)
+    if base != "" {
+      const nvn = variantIndexOf(base)
+      // ONLY where the struct table refused a row — see `retNulRefFlag`'s matching gate.
+      // A name that is both a variant and a declared struct keeps the kind-9 niche it
+      // already lowers with, so this kind never takes a position that works today.
+      if nvn >= 0 && structIndexOfTypeName(base) < 0 { return nvn }
+      return -1
+    }
+  }
+  const nvt = nodeTyIxOf(tyIx)
+  if nvt >= 0 {
+    const nvty = T.tys[nvt]
+    if nvty is TyNullable {
+      if nvty.nInner >= 0 {
+        const nvr = variantRowOfTy(nvty.nInner)
+        if nvr >= 0 {
+          if structIndexOfTypeName(uVariants[nvr]) < 0 { return nvr }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The base struct table index of a `S | null` annotation at `tyIx`, or -1.
+export function retNulRefIndex(tyIx: i32) {
+  if tyIx >= 0 {
+    // Structural-first: the checker's recorded arena type resolves the slot directly
+    // (`repSlotOfTy`, nominal identity plus the structural-declared bridge). Confirms only.
+    const rt = nodeRepTyIxOf(tyIx)
+    if rt >= 0 {
+      const t = T.tys[rt]
+      if t is TyNullable {
+        const ds = repSlotOfTy(t.nInner)
+        if ds >= 0 { return ds }
+      }
+    }
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      const nb = nulBaseStructRow(tyIx, ty.tyName)
+      if nb >= 0 { return nb }
+    }
+  }
+  -1
+}
+
+// The struct/rep row of the base of a nullable-struct annotation (`S | null` -> `S`'s row),
+// or -1. Three rungs: the arena (a `TyNullable`'s peeled inner via `repRowOfTyStruct`,
+// no render), `repRowOfName` (kept for an inline-shape nullable the arena can't resolve),
+// then `structIndexOfTypeName`'s legacy field-set scan.
+export function nulBaseStructRow(tyIx: i32, name: string): i32 {
+  const base = nullablePartOf(name)
+  if base == "" { return -1 }
+  const nt = nodeRepTyIxOf(tyIx)
+  if nt >= 0 {
+    const t = T.tys[nt]
+    if t is TyNullable {
+      const ar = repRowOfTyStruct(t.nInner, sScanLim())
+      if ar >= 0 { return ar }
+    }
+  }
+  // The arena already answered "not a struct row" whenever the nullable inner isn't an
+  // object row, so the name bridge (`repRowOfName`, which requires `TyObj` too) is never
+  // asked — dual-run confirms it always agrees. A decline with no `TyNullable` in the rep
+  // column at all keeps the full ladder, since there the arena said nothing, not no.
+  let innerIsObj = false
+  let innerKnown = false
+  if nt >= 0 {
+    const t2 = T.tys[nt]
+    if t2 is TyNullable {
+      innerKnown = true
+      if t2.nInner >= 0 {
+        const ti = T.tys[t2.nInner]
+        if ti is TyObj { innerIsObj = true }
+      }
+    }
+  }
+  // And the field-set matcher goes with it: a non-object inner (`string`, `i32`, `K`, a
+  // map) has no field set for `structIndexOfTypeName` to match either, dual-run confirmed
+  // to decline the same way `repRowOfName` does — so the whole name tail is skipped and
+  // the arena alone answers -1, the value it would reach anyway one scan later.
+  if innerKnown && !innerIsObj { return -1 }
+  const rr = repRowOfName(base, sScanLim())
+  if rr >= 0 { return rr }
+  structIndexOfTypeName(base)
+}
+
+// `1` if the type-annotation node at `tyIx` names the struct, else `0` (i32 / none).
+// Used for functype param/result valtypes and the `"struct"` return kind. Returning the
+// flag (not pushing bytes) keeps each call free of a `0→1` local reassignment, which
+// pins a `let x = 0` to the literal `0` type and fails to typecheck.
+export function retTRFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    // STRUCTURAL fast-path (C1): the checker recorded this node's type as a declared struct —
+    // confirm directly, skipping the O(nodes) `nameIsStructDecl` scan `isSName` walks. Only
+    // CONFIRMS (never denies), so anything it doesn't cover falls to the name test below.
+    if nodeTyIsStruct(tyIx) { return 1 }
+    return 0
+  }
+  0
+}
+
+// The struct-TABLE row the type annotation at `tyIx` names, or -1. Struct rows only: a
+// union-variant name has no row of its own, and its VARIANT index belongs to another table.
+// The two coincide only while the arm's struct is row 0, so a reader wanting a row asks
+// here and never the twin below (D1737).
+export function retStructRowIndex(tyIx: i32) {
+  if tyIx < 0 { return -1 }
+  const ds = repSlotOfTy(nodeRepTyIxOf(tyIx))
+  if ds >= 0 { return ds }
+  const ty = P.nodes[tyIx]
+  if ty is TypeRef {
+    const si = structIndexByName(ty.tyName)
+    if si >= 0 { return si }
+    // The arena rung the name scan needs: a struct that is also a union VARIANT has its row
+    // registered under the structural render, not its declared name, so only a match on the
+    // recorded TYPE finds it. Without this the variant-table index answered in its place.
+    const rr = repRowOfTyStruct(nodeRepTyIxOf(tyIx), sScanLim())
+    if rr >= 0 { return rr }
+    return nulBaseStructRow(tyIx, ty.tyName)
+  }
+  -1
+}
+
+// The struct table index named by the type-annotation node at `tyIx`, or -1 if it
+// names no declared struct.
+export function retStructIndex(tyIx: i32) {
+  if tyIx >= 0 {
+    // Structural-first (the first arena-keyed row consumer): a struct annotation resolves
+    // its slot off the checker's arena type (`repSlotOfTy`), skipping the name scan. This
+    // includes the structural-declared bridge (an inline `{…}` resolving to its unique
+    // declared twin), byte-safe now that the sig-canon slice renders twin-safe `$fnsig` digits.
+    const ds = repSlotOfTy(nodeRepTyIxOf(tyIx))
+    if ds >= 0 { return ds }
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      const si = structIndexByName(ty.tyName)
+      if si >= 0 { return si }
+      // A union-variant name carries its VARIANT index here (consumed by `pushVT`'s
+      // `kind == 8` variant-struct case); not a standalone struct, so it is -1 above.
+      const vi = variantIndexOf(ty.tyName)
+      if vi >= 0 { return vi }
+      // A `S | null` annotation resolves to its BASE struct's index — the single
+      // chokepoint the param/local/return struct lookups read, so a nullable-struct
+      // binding's member layout resolves without separate plumbing.
+      return nulBaseStructRow(tyIx, ty.tyName)
+    }
+  }
+  -1
+}
+
+// The name the emitter's own shape table claims for the arena struct row `ty`, or "" when
+// no row claims it (D592). The monomorphizer's un-annotated struct return needs a real
+// name, not a printed shape (`tyToStructStr` prints `{x: i32}`, which nothing registered);
+// `sNames[si]` is the row's own name, what every name-keyed consumer resolves.
+export function monoRetRowName(ty: i32) {
+  const si = repSlotOfTy(ty)
+  if si >= 0 {
+    if si < sNames.length { return sNames[si] }
+  }
+  // D681 — the anonymous row, by arena identity and nothing else: `repSlotOfTy` covers
+  // declared rows only, so a shape that only appeared as an object literal answers -1
+  // there even though `collectAnonShapes` interned exactly this row, under an `#anonN`
+  // handle. Nominal, not structural — a printed-spelling match can't tell two generic instances apart.
+  const ai = sAnonRowByTy(ty)
+  if ai >= 0 { return sNames[ai] }
+  ""
+}
+
+// The ANONYMOUS struct-table row whose D0 `sTyIx` sidecar entry IS the arena type `ty`, or
+// -1 — `repSlotOfTyDecl`'s nominal leg with the `sRowDecl` gate replaced by its complement.
+// First match wins, as in every other row scan; the sidecar holds -1 for a row it does not
+// cover, which never matches a real type.
+function sAnonRowByTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let i = 0
+  while i < sTyIx.length {
+    if sTyIx[i] == ty {
+      if sIsAnonRow(i) { return i }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The ref-list table slot a type-annotation node at `tyIx` names (`Tok[]` → the `Tok`
+// slot), or 0 when it isn't a ref-array annotation. Mirror of `tyAnnRefListKind` for the
+// slot; threads `pendingListSlot` so a ref-list literal builds the annotation's own element type.
+export function tyAnnRefListSlot(tyIx: i32) {
+  if repShadowOn { repABNote("clamp", "tyAnnRefListSlot", "call") }
+  if tyIx >= 0 {
+    // Which ref-list ROW holds this annotation's element — the recorded type first,
+    // then the row the INTERN pass banked on the node. `| null`-tolerant, exactly as
+    // the intern arm is.
+    const raS = annRefArrSlot(tyIx)
+    if raS >= 0 { return raS }
+  }
+  if repShadowOn {
+    // The distinction that decides the hazard: a clamp for an annotation that is NOT a ref
+    // list is the correct "no row of mine"; a clamp for one that IS is the missing row.
+    if retRefArrFlag(tyIx) == 1 || retNulRefArrFlag(tyIx) == 1 {
+      repABNote("clamp", "tyAnnRefListSlot", "CLAMPED-isRefList")
+    } else {
+      repABNote("clamp", "tyAnnRefListSlot", "CLAMPED-notRefList")
+    }
+  }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is a REF array (`S[]`/`N[]`), else `0`.
+// Feeds the `kind == 5` (ref list) branch of `pushVT`.
+export function retRefArrFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    // STRUCTURAL fast-path (C1): the checker recorded this node as an array of a declared struct
+    // (`S[]`) — the clean base case, without the O(nodes) name scan the bare element match walks.
+    if nodeTyIsStructArray(tyIx) { return 1 }
+    // A ref-list ROW for the annotation's element IS the intern-state question, and covers the
+    // nested / union / niche element spellings the struct-array fast path above declines. Gated
+    // to a NON-nullable annotation — a `S[] | null` spelling is `retNulRefArrFlag`'s.
+    if annBareRefArrSlot(tyIx) >= 0 { return 1 }
+  }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is a nullable ref array (`<ref-array> | null` —
+// e.g. `S[] | null`, `i32[][] | null`), else `0`. The value/composite-position analogue of
+// the local ladder's `letIsNulRefArray` (kind 18, `"nulreflist"`): a `(ref null $wrapper)`
+// slot over the inner ref-list's element wrapper. Feeds the `"nulreflist"` arm of `vtKindOfType`.
+export function retNulRefArrFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    // A `TyNullable` annotation whose inner array's element owns a ref-list ROW, with the
+    // nullable gate carried by `annNulRefArrSlot` so a bare `S[]` still answers 0.
+    if annNulRefArrSlot(tyIx) >= 0 { return 1 }
+  }
+  0
+}
+
+// The folded list-rep code of a function return annotation `tyIx`: `2` i32-list, `5`
+// ref-list, `7` string-list, `12` f64-list, or `0` (not a list). The four `nameIs*Array`
+// predicates are mutually exclusive by name, so the priority order is immaterial.
+export function retListKindFlag(tyIx: i32) {
+  if retArrFlag(tyIx) == 1 { return 2 }
+  if retRefArrFlag(tyIx) == 1 { return 5 }
+  if retStrArrFlag(tyIx) == 1 { return 7 }
+  if retF64ArrFlag(tyIx) == 1 { return 12 }
+  0
+}
+
+// The ref-list element type-NAME of a function RETURN type node `tyIx` (an `S[]`/`N[]`),
+// or "". Populates `fRetRArrElem`.
+export function retRefArrElemName(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    // `refArrElemNameIf` IS the `nameIsRefArray`-gated `refArrElemName` this arm spelled
+    // out; its "" for a non-ref-array annotation is the same "" this function's tail
+    // returned, so the early return is exact.
+    if ty is TypeRef { return refArrElemNameIf(ty.tyName) }
+  }
+  ""
+}
+
+// An emitter-synthesized type-annotation node (a mono clone, an inferred-list synthesis, a
+// contextual return/param pin). Records the concrete type on the new node so the
+// structural classifiers cover it (`recordClonedNodeTy`), uniformly across every synthesis
+// site. The returned node carries its resolved type, so a caller reads it off the node.
+export function synthTypeRef(name: string, pos: i32) {
+  synthTypeRefTy(name, pos, -1)
+}
+
+// `synthTypeRef` with a FALLBACK type: the name is resolved first and wins, and `tyFb` is
+// used only where it does not resolve — where `synthTypeRef` records a coarse placeholder.
+// See `recordClonedNodeTyFb` for the measurement that fixes this precedence.
+export function synthTypeRefFb(name: string, pos: i32, tyFb: i32) {
+  const n = mkTypeRef(name, pos)
+  const pin = pinKindOfName(name)
+  recordNodePin(n, pin, synthPinPayloadOf(name, pin))
+  recordClonedNodeTyFb(n, name, pin, tyFb)
+  n
+}
+
+// `synthTypeRef` with the type handed over instead of parsed back out of `name`. See
+// `recordClonedNodeTyKnown`. `tyIx` of -1 is exactly `synthTypeRef`.
+export function synthTypeRefTy(name: string, pos: i32, tyIx: i32) {
+  const n = mkTypeRef(name, pos)
+  const pin = pinKindOfName(name)
+  recordNodePin(n, pin, synthPinPayloadOf(name, pin))
+  recordClonedNodeTyKnown(n, name, pin, tyIx)
+  n
+}
+
+// The mint-side bridge of the pin column: which provenance, if any, the synthesized name
+// `name` carries. Every pin enters the arena through `synthTypeRef` above, so classifying
+// here covers the column completely. The anon leg is an exact-name query
+// (`isSName`) — a prefix test would also match `"#anon3[]"`, an array of an interned shape.
+export function pinKindOfName(name: string) {
+  if sigKeyPinPayload(name) != "" { return PIN_SIGKEY }
+  if isSName(name) { return PIN_ANON }
+  PIN_NONE
+}
+
+// The payload the column stores beside `kind` — the `$fnsig` key for a SIGKEY pin,
+// "" for every other kind (an interned shape's layout rides `sNames`, keyed by the
+// name the node already carries, so it needs no second copy here).
+function synthPinPayloadOf(name: string, kind: i32) {
+  if kind == PIN_SIGKEY { return sigKeyPinPayload(name) }
+  ""
+}
+
+// `nulScalarListKind` of `ty | null`, asked of the type: a list whose element spells one of
+// the five distinct-backing scalars or a nullable string, or a union whose members all spell
+// the same such list.
+export function nulScalarListKindOfTy(ty: i32): VKind | null {
+  const c = nslSpellOf(ty)
+  if c == 1 || c >= 6 { return "nulstrlist" }
+  if c == 2 { return "nulf64list" }
+  if c == 3 { return "nuli64list" }
+  if c == 4 { return "nulf32list" }
+  if c == 5 { return "nulu8list" }
+  null
+}
+
+// The spelling `nulScalarListKindOfTy` reads, as a code: 1-5 `string[]`, `f64[]`, `i64[]`,
+// `f32[]`, `u8[]`; 6 `(string|null)[]`, 7 `(null|string)[]`; 0 anything else. Union members
+// are compared by code, since the render keeps one part only when two spell alike.
+function nslSpellOf(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  for s in nslSeen {
+    if s == ty { return 0 }
+  }
+  nslSeen.push(ty)
+  const r = nslSpellGo(ty)
+  nslSeen.pop()
+  r
+}
+
+// The ancestor stack of `nslSpellOf`: a revisited union spells an alias name, never a list.
+const nslSeen: i32[] = []
+
+function nslSpellGo(ty: i32): i32 {
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: only a list or a union of lists spells one.
+  match t {
+    TyArray => {
+      const p = tyEmitElemPrimOf(ty)
+      if p != null { return nslOfPrim(p) }
+      const o = tyEmitElemNulPrimOf(ty, "string")
+      if o == 0 { return 0 }
+      return 5 + o
+    }
+    TyUnion => {
+      let code = 0
+      for m in t.uMembers {
+        const c = nslSpellOf(m)
+        if c == 0 { return 0 }
+        if code == 0 { code = c }
+        else if code != c { return 0 }
+      }
+      return code
+    }
+    TyPrim | TyLit | TyNullable | TyObj | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
+      return 0
+    }
+  }
+}
+
+// The `nslSpellOf` code of the list spelling `p[]`.
+function nslOfPrim(p: PrimName): i32 {
+  match p {
+    "string" => {
+      return 1
+    }
+    "f64" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f32" => {
+      return 4
+    }
+    "u8" => {
+      return 5
+    }
+    "i32" | "boolean" | "void" | "null" | "never" | "v128" => {
+      return 0
+    }
+  }
+}
+
+// The nullable-scalar-list VKind of annotation node `tyIx`, or `null`. Arena-first and
+// total where it covers: the spelling can't tell the four cases apart any more, since
+// `canonEmitName` softens a bare inline literal union to its base scalar. A covered
+// annotation outside the four answers `null` outright, not a name that lost the distinction.
+export function nulScalarListKindOfNode(tyIx: i32): VKind | null {
+  if tyIx < 0 { return null }
+  const rk = annRepKindOf(tyIx)
+  if rk != null {
+    if isNulScalarListKind(rk) { return rk }
+    return null
+  }
+  const ty = P.nodes[tyIx]
+  if ty is TypeRef { return nulScalarListKind(ty.tyName) }
+  null
+}
+// The `emitArr` list-build code (`pendingListKind` / `ExpCtx.listKind`) a nullable-scalar-list
+// value's list literal builds with: strlist 3 · f64list 4 · i64list 6 · f32list 7 (the leaf-list
+// build codes), or 0 if `kind` is not a nullable scalar list.
+export function nulScalarListBuildKind(kind: VKind | null): i32 {
+  // Exhaustive over `VKind` and `_`-less, `null` included: `0` is a real answer — not a
+  // nullable scalar list — so a new kind must say whether it has a build code (D1898).
+  match kind {
+    "nulstrlist" => {
+      return LBK_STR_LIST
+    }
+    "nulf64list" => {
+      return LBK_F64_LIST
+    }
+    "nuli64list" => {
+      return LBK_I64_LIST
+    }
+    "nulf32list" => {
+      return LBK_F32_LIST
+    }
+    "nulu8list" => {
+      return LBK_NUL_U8_LIST
+    }
+    "i32" | "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {
+      // Not a nullable scalar list, so it builds through no leaf-list code of its own.
+      return LBK_I32_LIST
+    }
+  }
+}
+// True if `kind` is one of the four distinct-backing nullable-scalar-list VKinds.
+export function isNulScalarListKind(kind: VKind | null): boolean {
+  if kind == null { return false }
+  kind == "nulstrlist"
+    || kind == "nulf64list"
+    || kind == "nuli64list"
+    || kind == "nulf32list"
+    || kind == "nulu8list"
+}
+// The nullable-scalar-list VKind behind a field code, or null: the inverse of
+// `nulScalarListFieldCode`, so the store/read/null paths recover the leaf's build kind
+// (`nulScalarListBuildKind`) and wrapper heap (`nulScalarListWrapHeap`) from the code alone.
+export function nulScalarListCodeKind(code: i32): VKind | null {
+  const k = listRepOfFieldCode(code)
+  if isNulScalarListKind(k) { return k }
+  null
+}
+// True if field code `c` is one of the distinct-backing nullable-scalar-list codes.
+export function isNulScalarListFieldCode(c: i32): boolean {
+  nulScalarListCodeKind(c) != null
+}
+
+// The same question asked of an arena index rather than an annotation node — an array
+// whose element is a nullable string, needed after `annIsNulStrListDeep` peels an outer
+// `| null` and has no node left to ask.
+function tyIsNulStrArr(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const e = T.tys[t.aElem]
+    if e is TyNullable {
+      if e.nInner < 0 { return false }
+      const inner = T.tys[e.nInner]
+      if inner is TyPrim { return inner.primName == "string" }
+    }
+  }
+  false
+}
+
+// `nameIsNulStrListDeep` asked of a type-annotation node, with the atom-niche element
+// ruled out structurally first: an inline `(("a" | "b") | null)[]` renders `(string |
+// null)[]` after canon, so the name predicate alone would mis-route it to the string backing.
+export function annIsNulStrListDeep(tyIx: i32) {
+  if tyIx < 0 { return false }
+  let ty = nodeTyIxOf(tyIx)
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyNullable { ty = t.nInner }
+  }
+  if tyIsNulLitUnionArr(ty) { return false }
+  // The arena answers the positive half too, so this predicate doesn't render a type and
+  // pattern-match the render.
+  if ty >= 0 { return tyIsNulStrArr(ty) }
+  // A node the checker did not record still falls back to the spelling.
+  nameIsNulStrListDeep(tyNameOf(tyIx))
+}
+
+export function vtKindOfType(tyIx: i32): VKind {
+  const rk = annRepKindOf(tyIx)
+  if repShadowOn {
+    let dw = "uncovered"
+    if rk != null { dw = rk }
+    repABNote("vtKindOfType", vtKindOfTypeLadder(tyIx), dw)
+  }
+  if rk != null { return rk }
+  vtKindOfTypeLadder(tyIx)
+}
+
+function vtKindOfTypeLadder(tyIx: i32): VKind {
+  // A literal-union annotation (`type K = "a" | "b"`) is an i32-backed interned atom (`"i32"`), NOT
+  // a value-union box — checked first (it IS a `TyUnion`, so `retUnionFlag` would claim it).
+  if tyIx >= 0 {
+    if P.nodes[tyIx] is TypeRef {
+      if nodeTyIsLitUnionAlias(tyIx) { return "i32" }
+    }
+  }
+  // A nullable literal-union (`K | null`) is the same i32 atom (`"i32"`), with the spare
+  // value `-1` encoding `null` (no box). Checked before the `string | null` niche
+  // (`"nulstr"`) as a defensive ordering, ahead of any base-collapse.
+  if tyIx >= 0 {
+    if P.nodes[tyIx] is TypeRef {
+      if nodeTyIsNulLitUnion(tyIx) { return "i32" }
+    }
+  }
+  // A nullable numeric literal union (`1 | 2 | null`) is the value-union box (`<base
+  // scalar> | null`), not the atom niche — neither litunion rule above claims it, so
+  // without this arm it fell to the `"i32"` default while the `let`/global ladder built
+  // it as a box: one type with two reps, `bare null needs a struct-typed context` at `f(null)`.
+  if nodeTyIsNulNumLitUnion(tyIx) { return "union" }
+  // A NULLABLE function `(fn) | null` is the closure fat-pointer made nullable, `"nulclosure"` —
+  // checked BEFORE `tyIsFuncType` (whose `=>` test would otherwise claim it as the non-null
+  // `"closure"`). The non-null part is a function, but the `| null` makes the slot nullable.
+  if nulCloFlag(tyIx) == 1 { return "nulclosure" }
+  // An array of functions (`((i32) => i32)[]`) is a closure-element ref list
+  // (`"reflist"`), not a single closure — checked before `tyIsFuncType`, whose `=>`
+  // substring test would otherwise claim the whole array as `"closure"`.
+  if nameIsClosureArrayTy(tyIx) == 1 { return "reflist" }
+  // A function-typed annotation (a name carrying `=>` — incl. the synthetic
+  // `"=>sigkey"` a monomorphized closure param is pinned with) is the closure
+  // fat-pointer, `"closure"`. Checked first; no other name contains an arrow.
+  if tyIsFuncType(tyIx) { return "closure" }
+  // A string-keyed map annotation (`{[string]: V}`) is the map struct ref, `"map"` — checked
+  // before the struct/object arms (an inline `{[…]:…}` is not a field-struct shape). Its
+  // `fbValtype` arg is the map shape slot (mono i32 ⇒ -1, via `paramStructIdxOf`/`retStructIndex`).
+  if retMapFlag(tyIx) == 1 { return "map" }
+  // A nullable string-keyed map (`{[string]: V} | null`) — the `(ref null $mapStruct)` niche
+  // (`"nulmap"`), the map twin of `nulstruct`. AFTER `retMapFlag` (a bare map is never nullable);
+  // disjoint from it anyway (a `| null` map name is a `nameIsMapMemberUnion`, which `retMapFlag`
+  // excludes). Its shape arg is `mapAnnShape` (now `| null`-aware), resolving THIS map's `$mapStruct`.
+  if retNulMapFlag(tyIx) == 1 { return "nulmap" }
+  // A nullable union variant (`Circle | null`) — the `(ref null $uVarHeap[vi])` niche,
+  // paired in `annValtypeSlotOf` with the variant index. Beside `retNulRefFlag` rather
+  // than after it as a fallback, because the two are disjoint at the producer.
+  if retNulVariantFlag(tyIx) == 1 { return "nulvariant" }
+  if retNulRefFlag(tyIx) == 1 { return "nulstruct" }
+  if retNulStringFlag(tyIx) == 1 { return "nulstr" }
+  // The five nullable scalar-list niches (`string[] | null` and the f64/i64/f32/u8 lists),
+  // each its own wrapper heap type. Before the generic nullable-list arms, which claim the
+  // i32 backing: without this rung all five fell to the `"i32"` default.
+  const nsl = nulScalarListKindOfNode(tyIx)
+  if nsl != null { return nsl }
+  if retNulListFlag(tyIx) == 1 { return "nullist" }
+  // A nullable ref array (`<ref-array> | null`) — the `(ref null $wrapper)` niche (kind 18,
+  // `"nulreflist"`). Before `retRefArrFlag` (whose non-null slot can't hold `null`) and the
+  // union arms. Disjoint from `"nullist"` above: an i32-backed list is `"nullist"`, a
+  // ref-element/nested list is `"nulreflist"`.
+  if retNulRefArrFlag(tyIx) == 1 { return "nulreflist" }
+  if retStrArrFlag(tyIx) == 1 { return "strlist" }
+  if retF64ArrFlag(tyIx) == 1 { return "f64list" }
+  if retI64ArrFlag(tyIx) == 1 { return "i64list" }
+  // A `u8[]` annotation — the packed byte list. Before `retArrFlag`, whose i32-list
+  // answer would name a 4-byte backing for a one-byte one. The `repOf` seam above
+  // already answers for a node the checker recorded a type on; this rung is the
+  // annotation-node fallback its scalar-list siblings each carry too.
+  if annIsU8Array(tyIx) { return "u8list" }
+  if retF32ArrFlag(tyIx) == 1 { return "f32list" }
+  if retRefArrFlag(tyIx) == 1 { return "reflist" }
+  if retUnionFlag(tyIx) == 1 { return "union" }
+  if retVariantFlag(tyIx) == 1 { return "variant" }
+  if retTRFlag(tyIx) == 1 { return "struct" }
+  if retArrFlag(tyIx) == 1 { return "list" }
+  if retStrFlag(tyIx) == 1 { return "str" }
+  if retI64Flag(tyIx) == 1 { return "i64" }
+  if retF64Flag(tyIx) == 1 { return "f64" }
+  if retF32Flag(tyIx) == 1 { return "f32" }
+  if retV128Flag(tyIx) == 1 { return "v128" }
+  "i32"
+}
+
+// `1` if the type-annotation node at `tyIx` is a string-keyed map (`{[string]: V}`), else `0`.
+// Feeds the `kind == 6` (map struct ref) branch of `vtKindOfType`, so a map can be a param /
+// return / functype valtype (the `(ref $mapStruct)` cell), not only a local.
+export function retMapFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      // A string-keyed map crosses a call boundary as kind 6 (`(ref $mapStruct)`), gated by
+      // the same classifier the local path interns with (`mvValKindOfName`). A map-member
+      // union (`{[string]: V} | X`) also starts with `{[`, but the arena distinguishes a
+      // bare `TyMap` from a `TyUnion` with no false positive (D-BAREMAP).
+      if nodeTyIsMap(tyIx) {
+        // The arena's value type, not the annotation's spelling: reached through
+        // `nodeTyMapValName`, so an alias or softened literal union can't change the
+        // answer. Not fully spelling-free — `mvValKindOfName` still tests a name, just one read from the arena.
+        if mapNodeValKindLowerable(tyIx) { return 1 }
+      }
+    }
+  }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` is a nullable string-keyed map (`{[string]: V}
+// | null`), else `0` — the map analogue of `retNulRefFlag`/`retNulRefArrFlag`: a
+// `(ref null $mapStruct)` niche. Gated to the same supported value kinds as the non-null
+// `retMapFlag`, so an unrepresentable nullable-map value keeps failing loudly (D-BAREMAP).
+export function retNulMapFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      if tyIsNulBareMap(tyIx) {
+        if mapValKindLowerable(nulMapInnerName(ty.tyName)) { return 1 }
+      }
+    }
+  }
+  0
+}
+
+// The map shape (`fbValtype`/`mapTypeIdxOf` second arg) of a string-keyed map type
+// annotation: -1 for the mono i32/boolean map, or the value type's interned mv slot. Safe
+// for a non-map/un-interned value, since `retMapFlag` only admits supported value types.
+// Shared by the param/return valtype and the body shape resolution (`mapShapeOfExpr`).
+export function mapAnnShape(tyIx: i32) {
+  if tyIx >= 0 {
+    const ty = P.nodes[tyIx]
+    if ty is TypeRef {
+      // A NULLABLE map annotation (`{[string]: V} | null`) resolves its shape from the BARE inner
+      // map — its `(ref null $mapStruct)` cell selects the SAME `$mapStruct` its non-null twin does.
+      let mn = ty.tyName
+      const nim = nulMapInnerName(mn)
+      if nim != "" { mn = nim }
+      if nameIsMap(mn) {
+        // The key selects which map struct family the annotation names — the param/
+        // return/nulmap valtype and the body shape must agree. The arena answers where it
+        // covers the node (`nodeTyMapKeyKindSpan`, recursing `TyNullable` so the folded
+        // nulmap spelling is covered too); an uncovered node keeps the name bridge.
+        let kAn = mapNameKeyKind(mn)
+        if nodeTyIxOf(tyIx) >= 0 { kAn = nodeTyMapKeyKindSpan(tyIx) }
+        const vn = mapValNameOf(mn)
+        // A mono value rides the shared struct of its own key rep: the `-1`/`-4` pair.
+        if vn == "i32" || vn == "boolean" { return mapMonoShapeOfKey(kAn) }
+        // The arena leg's type comes from this annotation node when the checker banked one
+        // (D-MAPNODETY): every call site hands a node index, so an uncovered node (-1) keeps the name bridge.
+        let aAn = -1
+        const vtAn = nodeMapValTyIx(tyIx)
+        // The slot's key and arm hint come off this node exactly as the mint computes them
+        // (D48): `vn` alone cannot tell an arm from its layout twin, and a find that keys
+        // differently from the mint mints a second slot whose map struct is never filled in.
+        const vnA = mvArmKeyName(vn, vtAn)
+        const armAn = mvArmHintOfTyName(vtAn, mvCanonValName(vnA))
+        if vtAn >= 0 { aAn = mvSlotOfTyKArm(vtAn, kAn, armAn) }
+        if aAn < 0 { aAn = mvSlotOfValNameTyKArm(vnA, kAn, armAn) }
+        if aAn >= 0 { return aAn }
+        const nmAn = mvSlotByValNameKArm(vnA, kAn, armAn)
+        if nmAn >= 0 { return nmAn }
+        // A mono-repped value spelling the two scans above never intern (a literal-union
+        // atom, a nullable atom) still resolves by KEY alone.
+        if kAn != MAP_KEY_STR { return mapMonoShapeOfKey(kAn) }
+      }
+    }
+  }
+  -1
+}
+
+// The map SHAPE of the map PARAM `name` of function `fnIx` (its annotation's value type),
+// or -1. Lets `mapShapeOfExpr` resolve a map param's VALUE type instead of assuming mono i32.
+export function paramMapShape(fnIx: i32, name: string) {
+  if fnIx < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return mapAnnShape(p.parType) }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// ── the re-entrancy guard on an inferred map return's shape ──────────────────
+// The `fnStmts` positions whose inferred map-return shape is currently being resolved. A
+// stack, not a flag, since a chain of map factories nests legitimately. On re-entry the
+// answer is the checker's own recorded type on the call node, never a bare -1 (D30).
+export let retMapFlight: i32[] = []
+
+// The `fnStmts` positions whose tail-`if` assignment target is being joined further up the stack.
+export let tailAssignFlight: i32[] = []
+
+// Drop any in-flight map-return resolution. Called from `emitProgram`'s state block.
+export function resetRetMapFlight() {
+  retMapFlight = []
+  tailAssignFlight = []
+  0
+}
+
+// True when `fe`'s tail-`if` assignment target is already being joined further up the stack.
+export function tailAssignInFlight(fe: i32) { i32ListHas(tailAssignFlight, fe) }
+
+// True when `fe`'s inferred map-return shape is already being resolved further up the stack.
+export function retMapInFlight(fe: i32) { i32ListHas(retMapFlight, fe) }
+
+// The map shape the CHECKER recorded on the call node at `callIx`, or -1 — the re-entry
+// answer, and the same rung `mapShapeOfExpr` / `mapRetExprShape` fall through to when the
+// syntactic path cannot name the callee.
+export function mapRecordedCallShape(callIx: i32) {
+  if callIx >= 0 {
+    if nodeTyIsMap(callIx) { return mapFindShapeOfNodeTy(callIx) }
+  }
+  -1
+}
+
+// `1` if the type-annotation node at `tyIx` names a union VARIANT struct (e.g. `TyObj`
+// of `Ty`), else `0`. Feeds the `kind == 8` (concrete variant struct ref) branch of
+// `pushVT`. A variant-struct param/result is the unboxed variant ref directly — gap #2.
+export function retVariantFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    // STRUCTURAL fast-path (C1): the checker recorded this node's type as a union-variant member.
+    if nodeTyIsVariant(tyIx) { return 1 }
+    return 0
+  }
+  0
+}
+
+// `1` if the type-annotation node at `tyIx` names the declared union alias, else `0`.
+// Feeds the `kind == 4` (union box) branch of `pushVT`.
+export function retUnionFlag(tyIx: i32) {
+  if tyIx >= 0 {
+    // STRUCTURAL fast-path (C1): the checker recorded this node's type as a declared value-union box.
+    if nodeTyIsUnionAlias(tyIx) { return 1 }
+    return 0
+  }
+  0
+}
+
+// The `pushVT` `VKind` for a parameter node at `paramIx` (`"struct"`, `"list"`,
+// `"str"`, `"i32"`, …) — its annotation's `vtKindOfType`, or `"i32"` for a node
+// that is not a `Param`.
+export function vtKindOfParam(paramIx: i32): VKind {
+  const p = P.nodes[paramIx]
+  if p is Param { return vtKindOfType(p.parType) }
+  "i32"
+}
+
+// The second `fbValtype` arg for the parameter node at `paramIx` — its annotation's
+// companion slot, through the shared ladder below. The PARAM storage class's name for
+// `annValtypeSlotOf`, kept so `emitTypeSection` and the `$fnsig` tokens read a
+// param-shaped question; every kind-to-table pairing lives in the one home.
+export function paramStructIdxOf(paramIx: i32) {
+  const p = P.nodes[paramIx]
+  if p is Param {
+    return anonLeafParamRowOf(paramIx, annValtypeSlotOf(p.parType))
+  }
+  -1
+}
+
+// D925 — the same answer with the `??` redirect taken in every phase, for the one caller
+// asking "what row will the bytes say" (the `$fnsig` interning key, `cloParamTok`): the
+// mint is over the moment `collectAnonShapes` returns, well before the `minted` phase.
+export function paramStructIdxFinal(paramIx: i32) {
+  const p = P.nodes[paramIx]
+  if p is Param {
+    const si = annValtypeSlotOf(p.parType)
+    if si < 0 { return si }
+    if paramIx < 0 { return si }
+    if paramIx >= anonLeafParamMoved.length { return si }
+    if anonLeafParamMoved[paramIx] != 1 { return si }
+    return anonLeafSupersedeOf(si)
+  }
+  -1
+}
+
+// D891 — the row a `??`-moved parameter's slot selects, once the mint is over:
+// `annValtypeSlotOf` resolves `p: {r: i32}` to the narrow field-set row regardless of what
+// the merge did with the value reaching it. Gated on the param node's own mark
+// (`anonLeafParamMoved`), never on the row, since a merge's narrow row is shared by shape.
+export function anonLeafParamRowOf(paramIx: i32, si: i32): i32 {
+  if !emitPhaseReached("minted") { return si }
+  if si < 0 { return si }
+  if paramIx < 0 { return si }
+  if paramIx >= anonLeafParamMoved.length { return si }
+  if anonLeafParamMoved[paramIx] != 1 { return si }
+  anonLeafSupersedeOf(si)
+}
+
+// The one home for "which interned table slot does this type annotation's `fbValtype`
+// select" — the companion index every ref-bearing `VKind` needs: `reflist`/`nulreflist`
+// read the ref-list table slot, `map`/`nulmap` the map shape (mono ⇒ -1), `variant` the
+// union-variant index, everything else `retStructIndex`.
+export function annValtypeSlotOf(tyIx: i32) {
+  if retRefArrFlag(tyIx) == 1 { return tyAnnRefListSlot(tyIx) }
+  // A nullable ref array (kind 18) — its `(ref null $wrapper)` slot is the inner ref-list
+  // element wrapper (`tyAnnRefListSlot` is `| null`-aware), mirroring the non-null one above.
+  if retNulRefArrFlag(tyIx) == 1 { return tyAnnRefListSlot(tyIx) }
+  if retMapFlag(tyIx) == 1 { return mapAnnShape(tyIx) }
+  // A nullable map (`{[string]: V} | null`) — the same map shape selects its
+  // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
+  if retNulMapFlag(tyIx) == 1 { return mapAnnShape(tyIx) }
+  if retVariantFlag(tyIx) == 1 {
+    const ptv = P.nodes[tyIx]
+    if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
+  }
+  // `Circle | null` — the variant index under the null, the slot `fbValtype`'s
+  // `nulvariant` arm indexes `uVarHeap` with. The struct rung below cannot answer it:
+  // a variant has no struct row.
+  if retNulVariantFlag(tyIx) == 1 { return nulVariantIndexOf(tyIx) }
+  // Row-only: every variant kind is answered above, so a variant index reaching this tail
+  // would be one table's index in the struct kinds' channel (D1737).
+  retStructRowIndex(tyIx)
+}
+
+// Whether the module global `name` has a non-const initializer — used at READ sites
+// (`global.get`) to decide whether the (nullable) cell needs a `ref.as_non_null`.
+export function globalNameIsNonConst(name: string) {
+  globalIsNonConst(globalLetOf(name))
+}
+
+// The sid-taking primitive (R5): `emitIdentNode` already holds the identifier's id.
+export function globalNameIsNonConstSid(sid: i32) {
+  globalIsNonConst(globalLetOfSid(sid))
+}
+
+// ── the `globalCellKind` walk memo (D1513) ───────────────────────────────────
+// This ladder re-enters itself: a rung asks an `expr*` predicate that reaches a
+// referenced global, whose kind comes back through here, so one link in a chain
+// multiplies the work instead of adding to it, exhausting the GC heap on a valid program.
+export let gckHave: i32[] = []
+export let gckVal: VKind[] = []
+export let gckGen = 1
+const gckGenKey = memoKeyNew(7)
+
+// Has any input the ladder reads changed since the key last read it? The arena's in-place
+// epoch, the LENGTH of every append-only collect table a rung consults, and the PASS a slot's
+// answer belongs to — a rung reads `fRetKind`, which a pass further down the table fills in
+// place, so an answer may not outlive its own pass (D1655).
+export function gckStale(): boolean {
+  let moved = memoMoved(gckGenKey, 0, tyMutEpoch)
+  moved = memoMoved(gckGenKey, 1, sNames.length) || moved
+  moved = memoMoved(gckGenKey, 2, sFieldCount.length) || moved
+  moved = memoMoved(gckGenKey, 3, unNames.length) || moved
+  moved = memoMoved(gckGenKey, 4, uVariants.length) || moved
+  moved = memoPassMoved(gckGenKey, 5) || moved
+  memoMoved(gckGenKey, 6, P.nodes.length) || moved
+}
+
+// Forget every answer in one step: a slot is a hit only while its own stamp equals the live
+// generation, so nothing computed under an older one can be read. Emptying the columns
+// instead re-grew them from zero to a module global's arena index on the next question, once
+// per minted generic instance — the memo's own cost, not its ladder's (D1513).
+export function gckDrop() {
+  gckGen = gckGen + 1
+  // A wrapped generation could alias a slot's old stamp; restarting from an empty column
+  // cannot. Unreachable in a compile (one bump per arena change), cheap to make impossible.
+  if gckGen < 0 {
+    gckHave = []
+    gckVal = []
+    grStamp = []
+    grLet = []
+    grKnown = []
+    grVal = []
+    gckGen = 1
+  }
+  0
+}
+
+// ── the module-global read memo (D3051) ──────────────────────────────────────
+// Whether a global reads as an f64, an i64 or a string re-classifies its initializer, which
+// names earlier globals, so a const chain naming its predecessor twice is 2^depth walks. One
+// answer per global and question, under `globalCellKind`'s generation: same inputs, same pass.
+export let grStamp: i32[] = []
+export let grLet: i32[] = []
+export let grKnown: i32[] = []
+export let grVal: i32[] = []
+
+// True if the type-name `name` refers to one of the declared struct types.
+export function isSName(name: string) { structIndexOfTypeName(name) >= 0 }
+
+// The struct-table ROW whose arena type is `ty`, or -1 — `isStructOfTy`'s index-returning
+// twin, with the same two passes and the same first-match-wins rule.
+export function structRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let s = 0
+  while s < sTyIx.length {
+    if sTyIx[s] == ty { return s }
+    s = s + 1
+  }
+  let q = 0
+  while q < sTyIx.length {
+    if tySame(sTyIx[q], ty) { return q }
+    q = q + 1
+  }
+  -1
+}
+
+// The struct-table index for a ref-list element name, stripping a `| null` niche suffix
+// first (a nullable-struct array's slot keys on the full `"P | null"`, but the struct it
+// stores/reads is the bare `P`). Nominal first (`structIndexByName`), then the structural
+// bridge (`structIndexOfTypeName`) for an inline-shape element deduped onto its declared twin.
+export function structIdxOfElemName(name: string) {
+  const n = nonNulBaseOf(name)
+  // Nominal exact-name match first: unambiguous, cheap, and it moves no bytes.
+  const sbn = structIndexOfTypeName(n)
+  if sbn >= 0 { return sbn }
+  // The same nominal floor `rlElemStructRow` carries, at the second copy of this ladder
+  // (D63): a registered union variant that isn't also a registered plain struct has no
+  // struct-table row (its heap is `uVarHeap[vi]`), so every structural rung below must
+  // decline rather than bridge the arm's shape onto a standalone struct row (D32, D36/D38).
+  if variantIndexOf(n) >= 0 { return -1 }
+  // Consults the canon-key vocabulary (`repRowOfName` → `resolveAnnot` → `repRowOfTyStruct`)
+  // rather than the lenient fieldset scan, since it distinguishes a same-fieldset nested
+  // twin (`{f: {f: i64 | null}}` vs its inner row) by the full nested field type. After the
+  // nominal consult, before the fieldset scan: trust the arena where it covers the element.
+  const rr = repRowOfName(n, sScanLim())
+  if rr >= 0 { return rr }
+  structIndexOfTypeName(n)
+}
+
+// True if `name` is a `(string | null)[]`, also through one `| null` wrapper
+// (`(string | null)[] | null`, the form a `!= null` narrow leaves behind). The one home for
+// a block three sibling classifiers carried verbatim, so they cannot drift on whether the
+// wrapper counts.
+function nameIsNulStrListDeep(name: string) {
+  if nameIsNulStrList(name) { return true }
+  const p = nullablePartOf(name)
+  if p != "" { return nameIsNulStrList(p) }
+  false
+}
+
+// The ladder↔descriptor agreement oracle: per (family, ladder answer, descriptor answer)
+// tallies, so a family is graded "0 disagreements" over the corpus before its ladder is
+// deleted. Keyed by the PAIR, so a new family needs no slot arithmetic and the report names
+// the exact disagreement. Accumulated during emit, reported after `repShadowSweep`'s reset.
+let repABKeys: string[] = []
+let repABCnt: i32[] = []
+let repABIx: {[string]: i32} = Map()
+
+// One (ladder, descriptor) pair recorded. Called only when armed, so the map growth and the
+// read-modify-write are off the unarmed path entirely.
+export function repABNote(family: string, ladder: string, desc: string) {
+  const k = family + " " + ladder + " -> " + desc
+  const i = repABIx[k] ?? -1
+  if i >= 0 {
+    repABCnt[i] = repABCnt[i] + 1
+    return 0
+  }
+  repABIx[k] = repABKeys.length
+  repABKeys.push(k)
+  repABCnt.push(1)
+  0
+}
+
+// Reported once per program beside `unionRegistryABSweep`, after `repShadowSweep` has reset
+// the bucket table — a bump during emit would not survive that reset.
+export function repLadderABSweep() {
+  if !repShadowOn { return 0 }
+  let i = 0
+  while i < repABKeys.length {
+    repShadowAddReason("repAB/" + repABKeys[i], repABCnt[i])
+    i = i + 1
+  }
+  repABKeys = []
+  repABCnt = []
+  repABIx = Map()
+  0
+}
+
+// True if the type-annotation node `tyIx` spells `u8[]` — the arena's recorded type first,
+// the written spelling as the documented second opinion, the pattern every scalar list rung
+// in `vtKindOfType` follows.
+export function annIsU8Array(tyIx: i32) {
+  if tyIx < 0 { return false }
+  if tyIsU8ArrayTy(nodeTyIxOf(tyIx)) { return true }
+  const t = P.nodes[tyIx]
+  if t is TypeRef { return nameIsU8Array(t.tyName) }
+  false
+}
+
+// The one home of the monomorphized closure pin's marker: the `$fnsig` key a closure-pinned
+// parameter carries in its `TypeRef.tyName` slot behind a bare `"=>"` prefix (`"=>i>d"`), or
+// "" when `nm` is not a pin. Not the function-type arrow (which sits at a positive index
+// behind a parenthesized param list) — this asks whether the column holds an interned ABI key.
+export function sigKeyPinPayload(nm: string) {
+  if nm.length <= 2 { return "" }
+  if nm[0] != '=' { return "" }
+  if nm[1] != '>' { return "" }
+  // Bound rather than left as the trailing expression: a bare member-call statement is not
+  // a lowerable form, the same reason `arrElemNameRaw`/`annRetNameOf` bind their slices.
+  const payload = nm.slice(2, nm.length)
+  payload
+}
