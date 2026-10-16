@@ -151,6 +151,7 @@ import { ifYieldsNoValue } from "./check_if_value"
 import {
   canonUnionKey,
   canonUnionKeyNullAtOfTy,
+  canonUnionKeyOfAnnName,
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   collectRetValues,
@@ -37510,8 +37511,7 @@ function letAnnIsUnion(letIx: i32) {
         // its body has two more positive arms — a same-shape-collapsed `TyObj` and a
         // nullable numeric literal union — both wider than `isUName`, and this site needs the
         // narrower set. Trying it broke six passing tests.
-        return isUNameAB(2, lt.tyName, annRowOfNode(d.letType))
-          && !nodeTyIsLitUnionAlias(d.letType)
+        return isUNameAnnAB(2, d.letType) && !nodeTyIsLitUnionAlias(d.letType)
       }
     }
   }
@@ -40421,17 +40421,39 @@ function unRowOfTyAB(site: i32, ty: i32): i32 {
 // a coverage hole as a key disagreement, and the buckets are named apart for that reason.
 // A switched site with a type answers "a row carries its key"; the spelling is read only to tally.
 export function isUNameAB(site: i32, name: string, ty: i32): boolean {
-  const k = ty >= 0 && unSiteOnKey(site)
+  isUNameABAt(site, name, ty, -1)
+}
+
+// `isUNameAB` for a binding's annotation node, whose spelling carries a key of its own: the
+// key answers where the node's type carries none — a softened literal union, same-shape
+// records collapsed to one record, or no recorded type at all.
+export function isUNameAnnAB(site: i32, annIx: i32): boolean {
+  isUNameABAt(site, tyNameOf(annIx), annRowOfNode(annIx), annIx)
+}
+
+// The row carrying the union key of annotation node `annIx`'s spelling, or -1 when that spelling
+// is not a union of two or more members.
+function annKeyRow(annIx: i32): i32 {
+  unRowOfKeyId(canonUnionKeyOfAnnName(tyNameOf(annIx)))
+}
+
+// The shared body; `annIx` is the annotation node, or -1 for a caller with no annotation.
+function isUNameABAt(site: i32, name: string, ty: i32, annIx: i32): boolean {
+  const sw = unSiteOnKey(site)
+  const k = ty >= 0 && sw
   const m = unABOn()
-  if m == 0 && !k { return isUName(name) }
+  if m == 0 && !k {
+    if sw && annIx >= 0 { return annKeyRow(annIx) >= 0 }
+    return isUName(name)
+  }
   let d = -1
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  if m == 0 { return d >= 0 || (k && unSiteWideHit(site, name, ty)) }
+  if m == 0 { return d >= 0 || (k && unSiteWideHit(site, ty, annIx)) }
   const n = isUName(name)
   let nr = -1
   if n { nr = unRowOfName(name) }
   unABProbe(site, nr, d, ty)
-  if k { return d >= 0 || unSiteWideHit(site, name, ty) }
+  if k { return d >= 0 || unSiteWideHit(site, ty, annIx) }
   if m == 2 { return d >= 0 }
   n
 }
@@ -40511,23 +40533,19 @@ function unRowOfTyWide(ty: i32): i32 {
   -1
 }
 
-// A row-existence seam's answer where the key finds no row: a row by `unRowOfTyWide`, or, at
-// the binding and return seams, the spelling when the arena type is no union at all (a softened
-// literal union, or same-shape records collapsed to one). Other sites ask about the spelling.
-function unSiteWideHit(site: i32, name: string, ty: i32): boolean {
-  const asks = unSiteWideAsks(site)
-  if asks == 0 { return false }
+// A row-existence seam's answer where the key finds no row: a row by `unRowOfTyWide`, or, when
+// the arena type is no union at all, a row carrying the key of annotation node `annIx` (-1: none).
+function unSiteWideHit(site: i32, ty: i32, annIx: i32): boolean {
+  if !unSiteWideAsks(site) { return false }
   if unRowOfTyWide(ty) >= 0 { return true }
-  asks == 2 && canonUnionKeyOfTy(ty) < 0 && isUName(name)
+  annIx >= 0 && canonUnionKeyOfTy(ty) < 0 && annKeyRow(annIx) >= 0
 }
 
-// 0: the site asks about the spelling; 1: about a row for the type; 2: as 1, and a binding or
-// return seam whose spelling still answers when the arena type is no union.
-function unSiteWideAsks(site: i32): i32 {
+// Whether the site asks about a row for the type rather than about the spelling.
+function unSiteWideAsks(site: i32): boolean {
   match site {
-    2 | 5 | 6 | 27 | 28 => 2
-    7 | 15 | 16 | 17 | 18 | 20 | 26 => 1
-    _ => 0
+    2 | 5 | 6 | 7 | 15 | 16 | 17 | 18 | 20 | 26 | 27 | 28 => true
+    _ => false
   }
 }
 
@@ -43758,7 +43776,7 @@ export function letIsRefArray(letIx: i32, fnIx: i32) {
       if lt is TypeRef {
         // A union annotation (even `S[] | i64`) is a union-box local, not a reflist local —
         // return false so a ref-array init below doesn't mis-pick the reflist valtype.
-        if isUNameAB(5, lt.tyName, annRowOfNode(d.letType)) { return false }
+        if isUNameAnnAB(5, d.letType) { return false }
         // Arena-first: the arena's `"reflist"` arm covers the settled base cases; the
         // spellings it declines (nested arrays, niches, union/map elements) keep the name walk.
         const k = annRepKindOf(d.letType)
@@ -48419,7 +48437,7 @@ export function letIsMap(letIx: i32, fnIx: i32) {
         }
         // Any registered union annotation carrying a bare map arm is a union-box local whose
         // init is that arm — authoritative, so the map fall-through can't reclaim it as bare.
-        if isUNameAB(6, lt.tyName, annRowOfNode(d.letType)) { return false }
+        if isUNameAnnAB(6, d.letType) { return false }
       }
     }
     return exprMap(d.letInit, fnIx)
