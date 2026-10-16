@@ -751,6 +751,7 @@ import {
   uVariants,
   unDeclIx,
   unKey,
+  unKeyPush,
   unMemAtomIds,
   unMemAtoms,
   unMemKinds,
@@ -35079,7 +35080,12 @@ export function vbHeapIdxOfAtom(atom: string) {
 // caller has only a name. The row's `unTyIx` entry is that index, so the registry can be
 // asked by type rather than by spelling once its readers move.
 function registerValueUnionNameTy(name: string, tyIx: i32) {
-  if isUNameAB(1, name, tyIx) { return 0 }
+  if (
+    (isUNameAB(1, name, tyIx) || isUName(name))
+    && unNameAdoptKeyRow(name, tyIx)
+  ) {
+    return 0
+  }
   // The row decides: `isValueUnionTyOr` asks `valueRowKind` per member, matching
   // `isValueUnionName`'s spelling test, and declines (-1) rather than guess. A value union
   // with a litunion-alias arm registers here too, since the alias rides the box as its
@@ -35093,7 +35099,7 @@ function registerValueUnionNameTy(name: string, tyIx: i32) {
   uDeclared = true
   unNamesPush(name)
   unTyIx.push(tyIx)
-  unKey.push(canonUnionKeyOfName(name))
+  unKeyPush(canonUnionKeyOfName(name))
   unDeclIx.push(-1) // value-union row: registered from a name, no declaration
   unMemberSetPush(name)
   recordUnMemTys(name) // D-UNION foundation
@@ -40362,17 +40368,12 @@ function unionRowOfTyRaw(ty: i32): i32 {
   -1
 }
 
-// The sites whose seam answers from the union KEY instead of the spelling — step 5's switch.
-// A site joins once no reach differs and its modules are proven identical; a fallback seam
-// keeps the spelling's answer where the key finds no row. `docs/internals/registry-by-type-id.md` §5.
+// The seams that answer from the union KEY, step 5's switch: all but site 7, whose caller type
+// at a generic pin can be another pin's union, and site 16, whose softened literal-union
+// spelling (`i32`) keys to a row that is no box element. A fallback seam or a mint guard keeps
+// the spelling's answer where the key finds no row. `docs/internals/registry-by-type-id.md` §5.
 function unSiteOnKey(site: i32): boolean {
-  if site == 3 || site == 4 || site == 8 || site == 9 { return true }
-  if site == 10 || site == 12 || site == 13 || site == 14 { return true }
-  if site == 19 || site == 21 || site == 22 || site == 23 { return true }
-  if site == 30 || site == 31 || site == 32 || site == 33 { return true }
-  if site == 34 || site == 35 || site == 36 || site == 37 { return true }
-  if site == 38 || site == 39 || site == 40 || site == 43 { return true }
-  site == 47
+  site >= 1 && site < UNAB_N && site != 7 && site != 16
 }
 
 // The ID side's row for `site`: a switched site and harness mode 3 key on `unKey`, anything
@@ -40392,13 +40393,23 @@ export function isUNameAB(site: i32, name: string, ty: i32): boolean {
   if m == 0 && !k { return isUName(name) }
   let d = -1
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  if m == 0 { return d >= 0 }
+  if m == 0 { return d >= 0 || (unSiteFallsBack(site) && isUName(name)) }
   const n = isUName(name)
   let nr = -1
   if n { nr = unRowOfName(name) }
   unABProbe(site, nr, d, ty)
-  if k || m == 2 { return d >= 0 }
+  if k { return d >= 0 || (unSiteFallsBack(site) && n) }
+  if m == 2 { return d >= 0 }
   n
+}
+
+// The switched `isUNameAB` sites that still answer true for a spelling naming a row the key
+// misses. Their `name-only` reaches are a nominal spelling of a union whose arena type keys
+// structurally, so a strict switch would read a registered union as none.
+function unSiteFallsBack(site: i32): boolean {
+  if site == 2 || site == 5 || site == 6 || site == 15 { return true }
+  if site == 17 || site == 18 || site == 20 { return true }
+  site == 26 || site == 27 || site == 28
 }
 
 // The row-NAME seam: `name` when it names a row, else "". A switched site with a type answers
@@ -40580,6 +40591,22 @@ export function unVarSliceAdoptKeySibling(u: i32) {
   unVarStart[u] = unVarStart[r]
   unVarCount[u] = unVarCount[r]
   0
+}
+
+// True when `name` names a row, after binding an unregistered spelling to the row its key
+// finds. Only a union spelling that itself keys to that row binds: a softened literal union
+// (`i32` for a litunion's row) or a reordered member sequence stays unbound and answers false,
+// so a mint guard asking this mints exactly where it did before the key could answer.
+export function unNameAdoptKeyRow(name: string, ty: i32): boolean {
+  if isUName(name) { return true }
+  if unionMemberCount(name) < 2 { return false }
+  const k = canonUnionKeyOfName(name)
+  if k < 0 { return false }
+  let r = -1
+  if ty >= 0 { r = unRowOfKey(ty) } else { r = unRowOfKeyId(k) }
+  if r < 0 || r >= unKey.length || unKey[r] != k { return false }
+  sidArrPut(unRowBySid, sidOf(name), r)
+  true
 }
 
 // The ABI assertion step 5 owes: two rows one key would fuse, and how many of those record a
