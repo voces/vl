@@ -6530,574 +6530,452 @@ function collectArrLitScalar(ix: i32) {
   0
 }
 
-// Scan the arena for every use of a collection heap type, setting the presence flags and
-// minting the ref-list, map-value and annotation-node rows keyed against them; an unclaimed
-// array annotation fails loudly. Asked once per minted generic instance, so it resumes on an
-// arena prefix — B7 of `docs/internals/perf-opportunities-2026-09.md`. Returns 0, or -1.
-export function collectA(_stmts: i32[]) {
-  collectTyParamNames()
-  // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
-  // resumed walk's own new rows both move (D791). Ahead of the fork, since both invalidate it.
-  rlWrSlots = []
-  rlWrAns = []
-  pendingNulRefHeap = -1
-  const resume = collectAResumable()
-  let start = caSeenNodes
-  // Retired for the duration: a walk that refuses mid-arena leaves the tables partial, and the
-  // next call must re-mint rather than resume from a prefix that never finished.
-  caSeenNodes = -1
-  if resume {
-    caPopFieldTail()
-  } else {
-    start = 0
-    aUsed = false
-    lUsed = false
-    raUsed = false
-    rlUsed = false
-    rElemKind = 0
-    rlElemName = []
-    listIsIdentNames = []
-    rlElemKey = []
-    rlElemTyIx = []
-    // The per-annotation-node row sidecar names ROWS this pass is about to re-mint, so
-    // it is cleared with them and refilled by the walk below.
-    annRlSlot = []
-    annRlNul = []
-    rlElemHeap = []
-    rlBackIdx = []
-    rlWrapIdx = []
-    rlTwin = []
-    rlElemKindTbl = []
-    rlElemNullable = []
-    mUsed = false
-    mI32Used = false
-    mI64Used = false
-    slUsed = false
-    fa64Used = false
-    mvValName = []
-    mvKeyKind = []
-    mvValTyIx = []
-    mvValKind = []
-    mvValStructIdx = []
-    mvValVariantIdx = []
-    mvValArmSig = []
-    mvRlSlot = []
-    mvMapTypeIdx = []
-    mvTwin = []
-    mapTwinDropSlots()
-    // Re-mark the list-type flags the registered value unions force: `collectU` set them at
-    // registration but the resets above cleared them, and a union annotation (`f64[] | boolean`)
-    // is none of the bare-name forms the walk recognizes. Skipped by a resume, whose rows are
-    // still in hand; these run first, so their rows stay at the head of the table.
-    let umk = 0
-    while umk < unMemberSet.length {
-      markValueUnionAtoms(unMemberSet[umk])
-      // A ref-array union arm (`S[] | {w:i32}`) lost its interned reflist slot to the resets
-      // above, so re-intern it here — the ref-array twin of the value-atom re-mark. This is the
-      // authoritative ref-array-arm interning: `collectU`'s registration-time call is wiped by
-      // those same resets, so the box payload's wrapper heap comes from here.
-      markRefArrayArms(unMemberSet[umk])
-      // The authoritative map-arm re-intern (`{[string]: string} | f64`): the resets above clear
-      // the mv tables, so re-intern each map arm's value slot here — its per-value map struct heap
-      // comes from this pass, before `mAssignTypeIndices`, the map twin of the re-mark above.
-      markMapUnionArms(unMemberSet[umk])
-      umk = umk + 1
-    }
+// A full `collectA` walk's reset: every presence flag and ref-list / map-value row table back
+// to empty, then the rows the registered value unions force re-minted at the head of the table.
+function collectAResetTables() {
+  aUsed = false
+  lUsed = false
+  raUsed = false
+  rlUsed = false
+  rElemKind = 0
+  rlElemName = []
+  listIsIdentNames = []
+  rlElemKey = []
+  rlElemTyIx = []
+  // The per-annotation-node row sidecar names ROWS this pass is about to re-mint, so
+  // it is cleared with them and refilled by the walk below.
+  annRlSlot = []
+  annRlNul = []
+  rlElemHeap = []
+  rlBackIdx = []
+  rlWrapIdx = []
+  rlTwin = []
+  rlElemKindTbl = []
+  rlElemNullable = []
+  mUsed = false
+  mI32Used = false
+  mI64Used = false
+  slUsed = false
+  fa64Used = false
+  mvValName = []
+  mvKeyKind = []
+  mvValTyIx = []
+  mvValKind = []
+  mvValStructIdx = []
+  mvValVariantIdx = []
+  mvValArmSig = []
+  mvRlSlot = []
+  mvMapTypeIdx = []
+  mvTwin = []
+  mapTwinDropSlots()
+  // Re-mark the list-type flags the registered value unions force: `collectU` set them at
+  // registration but the resets above cleared them, and a union annotation (`f64[] | boolean`)
+  // is none of the bare-name forms the walk recognizes. Skipped by a resume, whose rows are
+  // still in hand; these run first, so their rows stay at the head of the table.
+  let umk = 0
+  while umk < unMemberSet.length {
+    markValueUnionAtoms(unMemberSet[umk])
+    // A ref-array union arm (`S[] | {w:i32}`) lost its interned reflist slot to the resets
+    // above, so re-intern it here — the ref-array twin of the value-atom re-mark. This is the
+    // authoritative ref-array-arm interning: `collectU`'s registration-time call is wiped by
+    // those same resets, so the box payload's wrapper heap comes from here.
+    markRefArrayArms(unMemberSet[umk])
+    // The authoritative map-arm re-intern (`{[string]: string} | f64`): the resets above clear
+    // the mv tables, so re-intern each map arm's value slot here — its per-value map struct heap
+    // comes from this pass, before `mAssignTypeIndices`, the map twin of the re-mark above.
+    markMapUnionArms(unMemberSet[umk])
+    umk = umk + 1
   }
-  let i = start
-  while i < P.nodes.length {
-    const nd = P.nodes[i]
-    if nd is ArrayLit {
-      // A `[…]` literal is a growable list: struct or union-variant elements make it a ref list,
-      // an i32-element or empty literal contributes the i32 list. An empty literal whose element
-      // the checker pinned to a registered union is invisible to `arrLitIsRef`, and the
-      // synthesized annotation runs after this pass, so that slot has to be interned here.
-      if nd.arrElems.length == 0 {
-        const emptyElem = arrLitUnionElemName(i)
-        if emptyElem != "" {
-          rlUsed = true
-          raUsed = true
-          // Hinted with the literal's own recorded element row; every corpus firing agrees
-          // with the name path, and the hint is available at each.
-          rlInternNameTy(emptyElem, RLK_UNION, rlHintElemTy(i))
-        }
-        // The same hole at the nested-array element kind: `const outer = []` then
-        // `outer.push(inner)` with `inner: i32[]` reaches this pass with the element pinned to an
-        // array and no row interned. The flags mirror the `arrLitIsRef` branch arm for arm,
-        // because this interns the row the annotated `i32[][]` spelling interns.
-        const nestElem = arrLitNestedElemName(i)
-        if nestElem != "" {
-          rlUsed = true
-          raUsed = true
-          const nestKind = arrLitNestedElemKind(i)
-          // A ref inner list (kind 9 — a struct, map, union or closure leaf, or another nesting
-          // level) has to intern its inner row first, because the outer element's heap is that
-          // inner wrapper and the tables are read forward in this same pass. `ensureRefElemTy`
-          // is the one home of that inner-first walk (D702).
-          if nestKind == RLK_REF_LIST {
-            ensureRefElemTy(nestElem, rlHintElemTy(i))
-          } else {
-            // Same hint, same provenance; every corpus firing agrees.
-            rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
-            if nestKind == RLK_I32_LIST {
-              lUsed = true
-              aUsed = true
-            }
-            if nestKind == RLK_STR_LIST {
-              slUsed = true
-              aUsed = true
-            }
-            if nestKind == RLK_F64_LIST { fa64Used = true }
-            if nestKind == RLK_I64_LIST { ia64Used = true }
-            // The two leaf kinds this arm never had a flag for: an f32 inner list (10) rides
-            // `$fl32TypeIdx`, and a map inner element (3) rides the map struct plus the i32 list
-            // and array its `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
-            if nestKind == RLK_F32_LIST { fa32Used = true }
-            if nestKind == RLK_U8_LIST { ba8Used = true }
-            if nestKind == RLK_MAP {
-              mUsed = true
-              lUsed = true
-              aUsed = true
-            }
-          }
-        }
-        // D1511 — the same hole at the shape element kind: `const xs = []` then
-        // `xs.push({y: 1, x: 2})` reaches this pass with the element pinned to a struct and no
-        // row interned, since no `<shape>[]` spelling exists anywhere in the program. Unhinted:
-        // the name is nominal, and `rlInternNameTy` takes no key hint for a nominal spelling.
-        const shapeElem = arrLitShapeElemName(i)
-        if shapeElem != "" {
-          rlUsed = true
-          raUsed = true
-          ensureRefElem(shapeElem)
-        }
-        // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
-        // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
-        const nulElem = arrLitNulRefElemName(i)
-        if nulElem != "" {
-          rlUsed = true
-          raUsed = true
-          ensureRefElemTy(nulElem, rlHintElemTy(i))
-        }
-        // D1569 — the same hole at a scalar element kind, where the three rescues above are all
-        // ref ones. `const xs = []` then `xs.push(1.5)` pins the element to an f64 the program
-        // spells nowhere, so no `TypeRef` rung minted the f64 pair. The whole scalar vocabulary
-        // comes off the arena in one rung, so a sixth element kind needs no fifth rescue here.
-        forceScalarListRep(nodeTyArrayElemRepName(i))
-      }
-      if arrLitIsRef(i) {
-        rlUsed = true
-        raUsed = true
-        rElemKind = arrLitElemKind(i)
-        // A ref inner list (kind 9) interns inner-first through `ensureRefElemTy`, exactly as the
-        // empty-literal arm above and the annotated spelling do: the outer element's heap is the
-        // inner wrapper, and this pass reads the tables forward (D702). Additive by construction,
-        // since the first-element rung answers 4/6/7/8 for a nested `ArrayLit`.
-        if arrLitElemKind(i) == RLK_REF_LIST {
-          ensureRefElemTy(arrLitElemName(i), arrLitElemHintTy(i))
-        } else {
-          // Hinted with the arm-for-arm arena twin. -1 on every arm whose answer is a
-          // NAME by design or by measurement, which is exactly today's unhinted call.
-          rlInternNameTy(
-            arrLitElemName(i),
-            arrLitElemKind(i),
-            arrLitElemHintTy(i),
-          )
-          // A nested `[[…]]` literal's elements are i32-list wrappers — force the
-          // i32 list + raw array types for them. A string / f64 / i64 leaf (kinds
-          // 6/7/8, the self-classified nested literal) forces ITS inner list's
-          // wrapper+backing pair, exactly as the `T[][]` annotation branch does.
-          if arrLitElemKind(i) == RLK_I32_LIST {
-            lUsed = true
-            aUsed = true
-          }
-          if arrLitElemKind(i) == RLK_STR_LIST {
-            slUsed = true
-            aUsed = true
-          }
-          if arrLitElemKind(i) == RLK_F64_LIST { fa64Used = true }
-          if arrLitElemKind(i) == RLK_I64_LIST { ia64Used = true }
-          // A map element (kind 3) forces the map struct plus the i32 list and array its `index`
-          // and `vals` fields ride — the three flags an annotated map element gets from
-          // `ensureRefElem`'s `k == 3` arm, which a bare literal never reaches. `mI32Used`, that
-          // arm's fourth, is already flipped for this shape by the `Map()` constructor arm.
-          if arrLitElemKind(i) == RLK_MAP {
-            mUsed = true
-            lUsed = true
-            aUsed = true
-          }
-          // The f32 inner list (kind 10), the leaf the old allow-list could not admit — its
-          // element is the `$fl32TypeIdx` wrapper, so force that pair exactly as 6/7/8 above
-          // force theirs. Beside kind 3 for the same reason: both are now reachable here.
-          if arrLitElemKind(i) == RLK_F32_LIST { fa32Used = true }
-          if arrLitElemKind(i) == RLK_U8_LIST { ba8Used = true }
-        }
-      } else if arrLitIsStr(i, -1) {
-        // A STRING-element literal is a string-ref list — the same wrapper/backing
-        // a `string[]` annotation forces.
-        slUsed = true
-        aUsed = true
+}
+
+// `collectA`'s arm for the list literal at node `i`: the list flags and ref-list rows its
+// element type needs. Never fails.
+function collectAArrayLit(i: i32, nd: ArrayLit) {
+  // A `[…]` literal is a growable list: struct or union-variant elements make it a ref list,
+  // an i32-element or empty literal contributes the i32 list. An empty literal whose element
+  // the checker pinned to a registered union is invisible to `arrLitIsRef`, and the
+  // synthesized annotation runs after this pass, so that slot has to be interned here.
+  if nd.arrElems.length == 0 {
+    const emptyElem = arrLitUnionElemName(i)
+    if emptyElem != "" {
+      rlUsed = true
+      raUsed = true
+      // Hinted with the literal's own recorded element row; every corpus firing agrees
+      // with the name path, and the hint is available at each.
+      rlInternNameTy(emptyElem, RLK_UNION, rlHintElemTy(i))
+    }
+    // The same hole at the nested-array element kind: `const outer = []` then
+    // `outer.push(inner)` with `inner: i32[]` reaches this pass with the element pinned to an
+    // array and no row interned. The flags mirror the `arrLitIsRef` branch arm for arm,
+    // because this interns the row the annotated `i32[][]` spelling interns.
+    const nestElem = arrLitNestedElemName(i)
+    if nestElem != "" {
+      rlUsed = true
+      raUsed = true
+      const nestKind = arrLitNestedElemKind(i)
+      // A ref inner list (kind 9 — a struct, map, union or closure leaf, or another nesting
+      // level) has to intern its inner row first, because the outer element's heap is that
+      // inner wrapper and the tables are read forward in this same pass. `ensureRefElemTy`
+      // is the one home of that inner-first walk (D702).
+      if nestKind == RLK_REF_LIST {
+        ensureRefElemTy(nestElem, rlHintElemTy(i))
       } else {
-        collectArrLitScalar(i)
-      }
-      // The scalar rescue the EMPTY-literal arm above already performs, for a non-empty one
-      // whose element rep is only reachable through a hole parameter's pin: every arm of the
-      // ladder above reads the element with no frame, so `[a]` reserves nothing and the emit
-      // floor refuses a rep it can name (D1725). Monotone, so a redundant reservation is inert.
-      forceScalarListRep(nodeTyArrayElemPinRepName(i))
-    } else if nd is StrLit {
-      aUsed = true
-    } else if nd is Call {
-      // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
-      // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
-      // in a program with no other string. The callee is a bare `Ident`.
-      const cf = P.nodes[nd.callFn]
-      // `m.keys()` builds a fresh STRING list of the map's keys — force the string-list
-      // wrapper/backing (`mkListIdx`/`mkArrIdx`) + the shared `(array i32)`. `.keys()` is
-      // only valid on a map (checker-enforced), so any such call contributes the type.
-      if cf is Member {
-        if cf.memProp == "keys" {
+        // Same hint, same provenance; every corpus firing agrees.
+        rlInternNameTy(nestElem, nestKind, rlHintElemTy(i))
+        if nestKind == RLK_I32_LIST {
+          lUsed = true
+          aUsed = true
+        }
+        if nestKind == RLK_STR_LIST {
           slUsed = true
           aUsed = true
         }
-        // A set's `.values()` is its keys list too, whatever produced the set.
-        if cf.memProp == "values" {
-          const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
-          if vss == -2 { slUsed = true }
-          if vss == -5 { lUsed = true }
-          if vss == -7 { ia64Used = true }
-          if vss != 0 { aUsed = true }
-        }
-      }
-      // Gated on the shared vocabulary, so `collectANoteIdentRename` and this arm cannot
-      // disagree about which of the monomorphizer's in-place callee renames retires the
-      // resumable prefix.
-      if cf is Ident && collectACallIntrinsic(cf.identName) {
-        if cf.identName == "fromCodePoint" { aUsed = true }
-        // `fromCodePoints(xs)` builds a fresh string from an i32 list.
-        if cf.identName == "fromCodePoints" {
-          aUsed = true
-          lUsed = true
-        }
-        // An un-annotated `Map()` (usage-inferred binding) still constructs the map
-        // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
-        // is the same 7-field map struct, so it forces the IDENTICAL types.
-        if cf.identName == "Map" || cf.identName == "Set" {
+        if nestKind == RLK_F64_LIST { fa64Used = true }
+        if nestKind == RLK_I64_LIST { ia64Used = true }
+        // The two leaf kinds this arm never had a flag for: an f32 inner list (10) rides
+        // `$fl32TypeIdx`, and a map inner element (3) rides the map struct plus the i32 list
+        // and array its `index` and `vals` fields use. Same flags as the `arrLitIsRef` arm.
+        if nestKind == RLK_F32_LIST { fa32Used = true }
+        if nestKind == RLK_U8_LIST { ba8Used = true }
+        if nestKind == RLK_MAP {
           mUsed = true
           lUsed = true
           aUsed = true
-          // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
-          // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
-          // arena for the `TypeRef` walk below to read, so the KEY comes off the
-          // constructor call's own recorded type.
-          markMapKeyUsed(nodeTyMapKeyKind(i))
-          // …and so does the value. The `TypeRef` walk's `mvShapeOfMapName` is the only other mv
-          // mint, so without this an un-annotated map with a ref or wide value resolves its type
-          // and never mints its rep. Idempotent: an annotated twin interns the same (key, value)
-          // slot. A `Set()` mints nothing, being boolean-valued, but the node type decides that.
-          mvShapeOfMapNodeTy(i)
-        }
-        // The array-intrinsic allocators construct a list with no literal or annotation in
-        // sight, so the pair its element kind names has to be interned here. `arrNewIntrKind` is
-        // the one home of that kind, so the intern and the lowering cannot disagree about it.
-        if (
-          cf.identName == "__array_new__"
-          || cf.identName == "__array_new_default__"
-        ) {
-          collectArrNewIntr(i)
-        }
-      }
-    } else if nd is TypeRef {
-      // The integer-keyed maps' position gate, asked of every annotation name before the
-      // type-forcing chain below reads it: a union member that IS the map lowers into a box that
-      // records no map struct, so that position is a loud reject rather than invalid wasm.
-      if nameMentionsIntKeyedMap(nd.tyName) {
-        if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
-      }
-      // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
-      // see `forceNestedCloSigReps`, which walks INTO the spelling for it.
-      forceNestedCloSigReps(nd.tyName, 0)
-      // A top-level function-type annotation (`(i32) => R`): the function-type name needs no
-      // array or list type, but its return `R` may, so force the return's backing types. The
-      // arrow must be top-level, so an array of functions falls through to the array branches.
-      // Checked first, so a list-returning function type's trailing `[]` is not read as an array.
-      const frRet = annRetNameOf(nd.tyName)
-      if frRet != "" {
-        // This arm takes the array grammar's one cut and compares the leaf, matching its three
-        // named siblings below. Deliberately not `nameIsI32Array`, which is rep-wide (`boolean[]`,
-        // a litunion `K[]` and the nullable forms all ride the i32-list backing): those force
-        // their own types further down this same `TypeRef` arm.
-        if arrElemIs(frRet, "i32") {
-          lUsed = true
-          aUsed = true
-        } else if nameIsStringArray(frRet) {
-          slUsed = true
-          aUsed = true
-        } else if nameIsF64Array(frRet) {
-          fa64Used = true
-        } else if nameIsString(frRet) {
-          aUsed = true
-        }
-      } else if nameIsBareMap(nd.tyName) {
-        // A `{[string]: i32}` annotation is a string-keyed map: the map struct, the keys list
-        // over a string-ref backing, and the i32 vals list. So it forces `aUsed` for the string
-        // and vals backings and `lUsed` for the vals wrapper, alongside the three map types.
-        // Stays on the name here, since this walk sees interior `TypeRef`s the arena does not.
-        mUsed = true
-        lUsed = true
-        aUsed = true
-        // An integer-keyed map additionally forces its own map struct — its `keys` field is the
-        // integer list, not the string-ref list — and its probe helper. The arena where it covers
-        // the node, the name where it does not: `nodeTyMapKeyKindSpan` answers the string kind both
-        // for a string key and for "no type for this node", and this flag must not under-mint.
-        if nodeTyIxOf(i) >= 0 {
-          markMapKeyUsed(nodeTyMapKeyKindSpan(i))
-        } else {
-          markMapKeyUsed(mapNameKeyKind(nd.tyName))
-        }
-        // A ref value type interns a per-(key, value) map slot, its own map struct over a ref
-        // vals list. All mv interning happens here, since collect scans every `TypeRef`, so the
-        // type-index assignment sees the full slot set. Not routed onto this node's banked map
-        // type at the find rung: the call mints, and an arena answer there would skip the mint.
-        mvShapeOfMapNameArmTy(nd.tyName, nodeMapValTyIx(i))
-      } else if nulMapInnerName(nd.tyName) != "" {
-        // A `{[string]: V} | null` annotation collects the same map types as its non-null inner
-        // map, even when the program never `Map()`-constructs one: `mUsed` must be set so the
-        // `$mapStruct` heap type exists for the `(ref null $mapStruct)` cell and the narrowed map
-        // ops. Interns the inner value's mv slot too.
-        mUsed = true
-        lUsed = true
-        aUsed = true
-        // The arena where it covers the node, the name where it does not, and the coverage test
-        // is the point: `nodeTyMapKeyKindSpan` answers the string kind both for a string key and
-        // for "no type for this node", while `markMapKeyUsed` sets a minting flag whose under-answer
-        // leaves the map struct unminted. The uncovered nodes are `parser.vl`'s orphaned fields.
-        if nodeTyIxOf(i) >= 0 {
-          markMapKeyUsed(nodeTyMapKeyKindSpan(i))
-        } else {
-          markMapKeyUsed(mapNameKeyKind(nd.tyName))
-        }
-        mvShapeOfMapName(nulMapInnerName(nd.tyName))
-      } else if nameIsStringArray(nd.tyName) {
-        // Stays on the name, and the reason is the chain rather than the predicate. The arena
-        // form is wider — it also answers for a `(string | null)[]` element sharing this backing
-        // — and these rungs are an `else if` chain, so an over-answering rung does not merely set
-        // its own flags, it suppresses every rung below it. Monotone flags, non-monotone chain.
-        slUsed = true
-        aUsed = true
-      } else if genTyParamNulArr(nd.tyName) {
-        // A `(T | null)[]` over a type parameter: a generic original's annotation, skipped for
-        // the reason the `genTyParamArr` rung gives. Ahead of the ref-array rung, which would
-        // refuse its element as a nullable with no rep (D2525).
-      } else if nameIsRefArray(nd.tyName) || nameIsNulRefList(nd.tyName) {
-        // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing) — and so is its
-        // NULLABLE form `S[] | null` (kind 18): force the wrapper/backing on the NON-null ref-array name,
-        // so a bare local whose value does not self-collect the element (e.g. `(i32|null)[] | null = [5]`)
-        // still emits the element's ref-list type.
-        let ran = nd.tyName
-        const ranp = nullablePartOf(ran)
-        // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
-        // lines down to set the banked row's null flag. The second read is by construction
-        // the same answer: `ranp` is never rewritten and no intern runs between them.
-        const ranIsNul = ranp != "" && nameIsRefArray(ranp)
-        if ranIsNul { ran = ranp }
-        // The element kind, classified once for the seven reads in this arm, which straddle the
-        // `ensureRefElem` intern — the only call between them that mutates a table the classifier
-        // reads. `ran` is final here: the `| null` peel two lines up is its last write.
-        const raKind = refArrElemKind(ran)
-        // The element NAME, resolved ONCE for the same reason: the kind-2 reject and the
-        // UNCONDITIONAL `recordAnnRlSlot` bank below both need it, so hoisting strictly
-        // REMOVES work (one resolution instead of two on every kind-2 element).
-        const ren = refArrElemName(ran)
-        // A kind-2 (union-box) element that is a niche nullable (`(boolean | null)[]`,
-        // `(string | null)[]` — one non-null member plus null, deliberately not a value union)
-        // has no list rep: the box lowering would emit the element's raw value. Reject cleanly.
-        // A value-union element and a struct or heterogeneous element box as usual.
-        if raKind == RLK_UNION {
-          const renNul = nullablePartOf(ren)
-          if !isValueUnionName(ren) && renNul != "" {
-            return emitFail(
-              "emitProgram: a nullable-"
-                + renNul
-                + " list element has no rep; use a non-null element type",
-            )
-          }
-        }
-        rlUsed = true
-        raUsed = true
-        rElemKind = raKind
-        // Bank the interned ROW on the annotation NODE (`annRlSlot`): this arm runs on
-        // exactly the spellings the annotation-node consumers call a ref array, so the
-        // row recorded here is the answer each of them needs — read back through
-        // `annRefArrSlot` without re-deriving it from the rendering.
-        let ranNul = 0
-        if ranIsNul { ranNul = 1 }
-        // The ref-list slot is interned from the annotation's own recorded element row where that
-        // row is what the name denotes, and from the name alone where it is not
-        // (`elemNameIsNominal`). -1 is the unhinted call, so every declined class is unchanged by
-        // construction and the hinted firings agree with the name path.
-        let renTy = -1
-        if !elemNameIsNominal(ren) { renTy = annRefArrElemRow(i) }
-        recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
-        // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
-        // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
-        if raKind == RLK_I32_LIST {
-          lUsed = true
-          aUsed = true
-        }
-        // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
-        // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
-        // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
-        if raKind == RLK_STR_LIST {
-          slUsed = true
-          aUsed = true
-        }
-        if raKind == RLK_F64_LIST { fa64Used = true }
-        if raKind == RLK_F32_LIST { fa32Used = true }
-        if raKind == RLK_U8_LIST { ba8Used = true }
-        if raKind == RLK_I64_LIST { ia64Used = true }
-        // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
-        // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
-        // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
-        // reaches every map element in every position, not just the ones an annotation spells.
-      } else if (
-        nodeTyArrayElemRepName(i) == "f64"
-        || nameIsF64Array(nd.tyName)
-      ) {
-        // An `f64[]` annotation forces the f64 array and wrapper pair, its own
-        // `(array (mut f64))` backing, independent of the i32 array and list. The name is a
-        // second opinion and an `||` rather than a coverage guard: `nodeTyArrayElemRepName` only
-        // answers for a `TyPrim` element, so a covered node can still fall out with "".
-        fa64Used = true
-      } else if (
-        nodeTyArrayElemRepName(i) == "i64"
-        || nameIsI64Array(nd.tyName)
-      ) {
-        // An `i64[]` annotation forces the i64 array + wrapper pair (`ia64`/`il64`). Same
-        // second opinion, for the same reason, with the same mis-route without it.
-        ia64Used = true
-      } else if (
-        nodeTyArrayElemRepName(i) == "f32"
-        || nameIsF32Array(nd.tyName)
-      ) {
-        // The arena first, matching the f64 and i64 rungs above, with the name kept as the
-        // documented second opinion. Both answers are strongly represented and agree, so the
-        // arena never widens here — which matters in a minting chain where an over-answering rung
-        // suppresses every rung below it. The name stays for the families the arena cannot name.
-
-        // An `f32[]` annotation forces the f32 array + wrapper pair (`fa32`/`fl32`).
-        fa32Used = true
-      } else if (
-        nodeTyArrayElemRepName(i) == "u8"
-        || nameIsU8Array(nd.tyName)
-      ) {
-        // A `u8[]` annotation forces the PACKED byte array + wrapper pair
-        // (`ba8`/`bl8`). Arena first then the name, exactly as the three scalar rungs
-        // above do and for the same reason: without a forcing rung here the annotation
-        // falls into `checkArrName` below and is rejected as a non-i32 element array.
-        ba8Used = true
-      } else if genTyParamArr(nd.tyName) || annArrOverTyParam(i, nd.tyName) {
-        // An array over a type parameter — `T[]`, or a record element with a `T` field — is a
-        // generic original's annotation. Its monomorphized instances carry concrete pinned
-        // names when `monomorphize` re-runs this pass, so nothing is forced or validated here.
-      } else if annSpelledArray(i, nd.tyName) && !isUnionOfTy(nodeTyIxOf(i)) {
-        // A union ending in an array arm (`i64 | S[]`) is a box whose arms `markRefArrayArms`
-        // interns, so it is not validated here. An instance's record element is interned by the
-        // shape passes after `monomorphize`, so the walk `monoRebuild` resumes leaves it to
-        // `collectA#2`, which re-walks every node (D4683).
-        if !caResumeArmed || nameIsI32Array(nd.tyName) {
-          if checkArrName(nd.tyName) < 0 { return -1 }
-          // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
-          lUsed = true
-          aUsed = true
-        }
-      } else if nodeTyPrimName(i) == "string" {
-        aUsed = true
-        // The arena: `nodeTyIsNulString` reads `T.tys` directly, rather than a
-        // `<helper>(x) == <const>` twin whose helper never produces that constant.
-      } else if nodeTyIsNulString(i) {
-        // A `string | null` annotation (kind 16) is a `(ref null $aTypeIdx)` slot — it still needs the
-        // string backing forced, exactly like a plain `string`. Without this a bare `string | null = null`
-        // (no other string in the module to force `aUsed`) left `$aTypeIdx` unallocated, so the slot
-        // valtype + `ref.null` referenced a stale type index → invalid wasm at the read.
-        aUsed = true
-      } else if nodeTyIsNulI32List(i) {
-        // An `i32[] | null` annotation still constructs/reads the i32 list — the
-        // nullable wrapper changes only the slot's valtype, not the types needed.
-        lUsed = true
-        aUsed = true
-      } else if nulScalarListKindOfNode(i) != null {
-        // A distinct-backing nullable scalar list annotation (`string[]|null`, `f64[]|null`,
-        // `i64[]|null`, `f32[]|null`) constructs and reads the leaf list, so force its wrapper
-        // and backing even when the module has no other such list. `nulScalarListKindOfNode`
-        // leads with `annRepKindOf` and falls back to the name ladder, so it cannot under-answer.
-        const nsk = nulScalarListKindOfNode(i)
-        if nsk == "nulstrlist" {
-          slUsed = true
-          aUsed = true
-        }
-        if nsk == "nulf64list" { fa64Used = true }
-        if nsk == "nuli64list" { ia64Used = true }
-        if nsk == "nulf32list" { fa32Used = true }
-        if nsk == "nulu8list" { ba8Used = true }
-      } else if nodeTyIsLitUnionAlias(i) || nodeTyIsNulLitUnion(i) {
-        // A literal-union annotation (`: K`): an atom widens to its member `string`, so force the
-        // string backing even when the module has no other string literal. The nullable niche
-        // (`: K | null`) widens the same way and cannot lean on the alias arm, because the inline
-        // spelling has no alias declaration whose own `TypeRef` would force it.
-        aUsed = true
-      }
-      // A map reached only as a closure result inside this annotation — a union arm, the
-      // nullable-closure niche, or a curried result — is invisible to every branch above, since
-      // the whole spelling is one name. Force its machinery and intern its value slot;
-      // self-gating, and outside the chain so it composes with whatever branch claimed the name.
-      forceCloResultMapTypes(nd.tyName)
-      // The list dual: a scalar-leaf or string list reached only as a closure result inside this
-      // annotation forces its wrapper and backing, so the narrowed arm's value-call index read
-      // finds them even when the program never constructs such a list. Same self-gating
-      // placement as the map forcer above.
-      forceCloResultListTypes(nd.tyName)
-      // The generic-application dual of the two forcers above: a type argument (`Box<string>`,
-      // `Pair<i32, string[]>`) no branch of the chain can see, because the whole `Head<…>` is one
-      // name. Same self-gating placement and the same flag-only contract; see the helper.
-      forceGenAppArgTypes(nd.tyName)
-    } else if nd is IfStmt {
-      // An if-EXPRESSION whose arms join to a value union the program declares nowhere; the
-      // `TyUnion` test is what keeps a `T | null` join out, whose rep is the niche (D1745).
-      markInferredJoinAtoms(nodeTyIxOf(i))
-    } else if nd is IsExpr {
-      // An `is K[]` over a list whose elements can never be `K` hands its arm an empty `K[]`
-      // (D4911), a list no annotation or literal of the program need have built.
-      const kTy = isVarTyIxOf(i)
-      const rTy = nodeTyIxOf(nd.isObj)
-      const rv = P.nodes[unwrapParen(nd.isObj)]
-      if (
-        rv is Ident
-        && kTy >= 0
-        && kTy < T.tys.length
-        && T.tys[kTy] is TyArray
-        && !strListHas(listIsIdentNames, rv.identName)
-      ) {
-        listIsIdentNames.push(rv.identName)
-      }
-      // A receiver still typed by a type parameter is an instance's, whose binding may be one,
-      // for a union or nullable receiver as well (D4912).
-      if kTy >= 0 && kTy < T.tys.length && rTy >= 0 && rTy < T.tys.length {
-        if (
-          listDisjointDepth(rTy, kTy) == 1
-          || (T.tys[kTy] is TyArray && tyHasTyVar(rTy))
-        ) {
-          forceListLeafRepsOfTy(kTy)
         }
       }
     }
-    i = i + 1
+    // D1511 — the same hole at the shape element kind: `const xs = []` then
+    // `xs.push({y: 1, x: 2})` reaches this pass with the element pinned to a struct and no
+    // row interned, since no `<shape>[]` spelling exists anywhere in the program. Unhinted:
+    // the name is nominal, and `rlInternNameTy` takes no key hint for a nominal spelling.
+    const shapeElem = arrLitShapeElemName(i)
+    if shapeElem != "" {
+      rlUsed = true
+      raUsed = true
+      ensureRefElem(shapeElem)
+    }
+    // The same hole at a nullable ref element: a push of a `T | null` value, or of a bare
+    // `null` a later write filled, spells the `(T | null)[]` row nowhere (D2506).
+    const nulElem = arrLitNulRefElemName(i)
+    if nulElem != "" {
+      rlUsed = true
+      raUsed = true
+      ensureRefElemTy(nulElem, rlHintElemTy(i))
+    }
+    // D1569 — the same hole at a scalar element kind, where the three rescues above are all
+    // ref ones. `const xs = []` then `xs.push(1.5)` pins the element to an f64 the program
+    // spells nowhere, so no `TypeRef` rung minted the f64 pair. The whole scalar vocabulary
+    // comes off the arena in one rung, so a sixth element kind needs no fifth rescue here.
+    forceScalarListRep(nodeTyArrayElemRepName(i))
   }
-  // The row counts the arena walk above finished at. Everything below appends past them, so a
-  // resumed walk pops back to here before extending — its own rows have to land where a full
-  // re-mint would put them, ahead of this tail.
-  caRlMark = rlElemName.length
-  caMvMark = mvValName.length
+  if arrLitIsRef(i) {
+    rlUsed = true
+    raUsed = true
+    rElemKind = arrLitElemKind(i)
+    // A ref inner list (kind 9) interns inner-first through `ensureRefElemTy`, exactly as the
+    // empty-literal arm above and the annotated spelling do: the outer element's heap is the
+    // inner wrapper, and this pass reads the tables forward (D702). Additive by construction,
+    // since the first-element rung answers 4/6/7/8 for a nested `ArrayLit`.
+    if arrLitElemKind(i) == RLK_REF_LIST {
+      ensureRefElemTy(arrLitElemName(i), arrLitElemHintTy(i))
+    } else {
+      // Hinted with the arm-for-arm arena twin. -1 on every arm whose answer is a
+      // NAME by design or by measurement, which is exactly today's unhinted call.
+      rlInternNameTy(arrLitElemName(i), arrLitElemKind(i), arrLitElemHintTy(i))
+      // A nested `[[…]]` literal's elements are i32-list wrappers — force the
+      // i32 list + raw array types for them. A string / f64 / i64 leaf (kinds
+      // 6/7/8, the self-classified nested literal) forces ITS inner list's
+      // wrapper+backing pair, exactly as the `T[][]` annotation branch does.
+      if arrLitElemKind(i) == RLK_I32_LIST {
+        lUsed = true
+        aUsed = true
+      }
+      if arrLitElemKind(i) == RLK_STR_LIST {
+        slUsed = true
+        aUsed = true
+      }
+      if arrLitElemKind(i) == RLK_F64_LIST { fa64Used = true }
+      if arrLitElemKind(i) == RLK_I64_LIST { ia64Used = true }
+      // A map element (kind 3) forces the map struct plus the i32 list and array its `index`
+      // and `vals` fields ride — the three flags an annotated map element gets from
+      // `ensureRefElem`'s `k == 3` arm, which a bare literal never reaches. `mI32Used`, that
+      // arm's fourth, is already flipped for this shape by the `Map()` constructor arm.
+      if arrLitElemKind(i) == RLK_MAP {
+        mUsed = true
+        lUsed = true
+        aUsed = true
+      }
+      // The f32 inner list (kind 10), the leaf the old allow-list could not admit — its
+      // element is the `$fl32TypeIdx` wrapper, so force that pair exactly as 6/7/8 above
+      // force theirs. Beside kind 3 for the same reason: both are now reachable here.
+      if arrLitElemKind(i) == RLK_F32_LIST { fa32Used = true }
+      if arrLitElemKind(i) == RLK_U8_LIST { ba8Used = true }
+    }
+  } else if arrLitIsStr(i, -1) {
+    // A STRING-element literal is a string-ref list — the same wrapper/backing
+    // a `string[]` annotation forces.
+    slUsed = true
+    aUsed = true
+  } else {
+    collectArrLitScalar(i)
+  }
+  // The scalar rescue the EMPTY-literal arm above already performs, for a non-empty one
+  // whose element rep is only reachable through a hole parameter's pin: every arm of the
+  // ladder above reads the element with no frame, so `[a]` reserves nothing and the emit
+  // floor refuses a rep it can name (D1725). Monotone, so a redundant reservation is inert.
+  forceScalarListRep(nodeTyArrayElemPinRepName(i))
+}
+
+// `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
+// spelling forces. Returns 0, or -1 once a spelling with no rep has failed loudly.
+function collectATypeRef(i: i32, nd: TypeRef) {
+  // The integer-keyed maps' position gate, asked of every annotation name before the
+  // type-forcing chain below reads it: a union member that IS the map lowers into a box that
+  // records no map struct, so that position is a loud reject rather than invalid wasm.
+  if nameMentionsIntKeyedMap(nd.tyName) {
+    if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
+  }
+  // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
+  // see `forceNestedCloSigReps`, which walks INTO the spelling for it.
+  forceNestedCloSigReps(nd.tyName, 0)
+  // A top-level function-type annotation (`(i32) => R`): the function-type name needs no
+  // array or list type, but its return `R` may, so force the return's backing types. The
+  // arrow must be top-level, so an array of functions falls through to the array branches.
+  // Checked first, so a list-returning function type's trailing `[]` is not read as an array.
+  const frRet = annRetNameOf(nd.tyName)
+  if frRet != "" {
+    // This arm takes the array grammar's one cut and compares the leaf, matching its three
+    // named siblings below. Deliberately not `nameIsI32Array`, which is rep-wide (`boolean[]`,
+    // a litunion `K[]` and the nullable forms all ride the i32-list backing): those force
+    // their own types further down this same `TypeRef` arm.
+    if arrElemIs(frRet, "i32") {
+      lUsed = true
+      aUsed = true
+    } else if nameIsStringArray(frRet) {
+      slUsed = true
+      aUsed = true
+    } else if nameIsF64Array(frRet) {
+      fa64Used = true
+    } else if nameIsString(frRet) {
+      aUsed = true
+    }
+  } else if nameIsBareMap(nd.tyName) {
+    // A `{[string]: i32}` annotation is a string-keyed map: the map struct, the keys list
+    // over a string-ref backing, and the i32 vals list. So it forces `aUsed` for the string
+    // and vals backings and `lUsed` for the vals wrapper, alongside the three map types.
+    // Stays on the name here, since this walk sees interior `TypeRef`s the arena does not.
+    mUsed = true
+    lUsed = true
+    aUsed = true
+    // An integer-keyed map additionally forces its own map struct — its `keys` field is the
+    // integer list, not the string-ref list — and its probe helper. The arena where it covers
+    // the node, the name where it does not: `nodeTyMapKeyKindSpan` answers the string kind both
+    // for a string key and for "no type for this node", and this flag must not under-mint.
+    if nodeTyIxOf(i) >= 0 {
+      markMapKeyUsed(nodeTyMapKeyKindSpan(i))
+    } else {
+      markMapKeyUsed(mapNameKeyKind(nd.tyName))
+    }
+    // A ref value type interns a per-(key, value) map slot, its own map struct over a ref
+    // vals list. All mv interning happens here, since collect scans every `TypeRef`, so the
+    // type-index assignment sees the full slot set. Not routed onto this node's banked map
+    // type at the find rung: the call mints, and an arena answer there would skip the mint.
+    mvShapeOfMapNameArmTy(nd.tyName, nodeMapValTyIx(i))
+  } else if nulMapInnerName(nd.tyName) != "" {
+    // A `{[string]: V} | null` annotation collects the same map types as its non-null inner
+    // map, even when the program never `Map()`-constructs one: `mUsed` must be set so the
+    // `$mapStruct` heap type exists for the `(ref null $mapStruct)` cell and the narrowed map
+    // ops. Interns the inner value's mv slot too.
+    mUsed = true
+    lUsed = true
+    aUsed = true
+    // The arena where it covers the node, the name where it does not, and the coverage test
+    // is the point: `nodeTyMapKeyKindSpan` answers the string kind both for a string key and
+    // for "no type for this node", while `markMapKeyUsed` sets a minting flag whose under-answer
+    // leaves the map struct unminted. The uncovered nodes are `parser.vl`'s orphaned fields.
+    if nodeTyIxOf(i) >= 0 {
+      markMapKeyUsed(nodeTyMapKeyKindSpan(i))
+    } else {
+      markMapKeyUsed(mapNameKeyKind(nd.tyName))
+    }
+    mvShapeOfMapName(nulMapInnerName(nd.tyName))
+  } else if nameIsStringArray(nd.tyName) {
+    // Stays on the name, and the reason is the chain rather than the predicate. The arena
+    // form is wider — it also answers for a `(string | null)[]` element sharing this backing
+    // — and these rungs are an `else if` chain, so an over-answering rung does not merely set
+    // its own flags, it suppresses every rung below it. Monotone flags, non-monotone chain.
+    slUsed = true
+    aUsed = true
+  } else if genTyParamNulArr(nd.tyName) {
+    // A `(T | null)[]` over a type parameter: a generic original's annotation, skipped for
+    // the reason the `genTyParamArr` rung gives. Ahead of the ref-array rung, which would
+    // refuse its element as a nullable with no rep (D2525).
+  } else if nameIsRefArray(nd.tyName) || nameIsNulRefList(nd.tyName) {
+    // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing) — and so is its
+    // NULLABLE form `S[] | null` (kind 18): force the wrapper/backing on the NON-null ref-array name,
+    // so a bare local whose value does not self-collect the element (e.g. `(i32|null)[] | null = [5]`)
+    // still emits the element's ref-list type.
+    let ran = nd.tyName
+    const ranp = nullablePartOf(ran)
+    // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
+    // lines down to set the banked row's null flag. The second read is by construction
+    // the same answer: `ranp` is never rewritten and no intern runs between them.
+    const ranIsNul = ranp != "" && nameIsRefArray(ranp)
+    if ranIsNul { ran = ranp }
+    // The element kind, classified once for the seven reads in this arm, which straddle the
+    // `ensureRefElem` intern — the only call between them that mutates a table the classifier
+    // reads. `ran` is final here: the `| null` peel two lines up is its last write.
+    const raKind = refArrElemKind(ran)
+    // The element NAME, resolved ONCE for the same reason: the kind-2 reject and the
+    // UNCONDITIONAL `recordAnnRlSlot` bank below both need it, so hoisting strictly
+    // REMOVES work (one resolution instead of two on every kind-2 element).
+    const ren = refArrElemName(ran)
+    // A kind-2 (union-box) element that is a niche nullable (`(boolean | null)[]`,
+    // `(string | null)[]` — one non-null member plus null, deliberately not a value union)
+    // has no list rep: the box lowering would emit the element's raw value. Reject cleanly.
+    // A value-union element and a struct or heterogeneous element box as usual.
+    if raKind == RLK_UNION {
+      const renNul = nullablePartOf(ren)
+      if !isValueUnionName(ren) && renNul != "" {
+        return emitFail(
+          "emitProgram: a nullable-"
+            + renNul
+            + " list element has no rep; use a non-null element type",
+        )
+      }
+    }
+    rlUsed = true
+    raUsed = true
+    rElemKind = raKind
+    // Bank the interned ROW on the annotation NODE (`annRlSlot`): this arm runs on
+    // exactly the spellings the annotation-node consumers call a ref array, so the
+    // row recorded here is the answer each of them needs — read back through
+    // `annRefArrSlot` without re-deriving it from the rendering.
+    let ranNul = 0
+    if ranIsNul { ranNul = 1 }
+    // The ref-list slot is interned from the annotation's own recorded element row where that
+    // row is what the name denotes, and from the name alone where it is not
+    // (`elemNameIsNominal`). -1 is the unhinted call, so every declined class is unchanged by
+    // construction and the hinted firings agree with the name path.
+    let renTy = -1
+    if !elemNameIsNominal(ren) { renTy = annRefArrElemRow(i) }
+    recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
+    // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
+    // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
+    if raKind == RLK_I32_LIST {
+      lUsed = true
+      aUsed = true
+    }
+    // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
+    // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
+    // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
+    if raKind == RLK_STR_LIST {
+      slUsed = true
+      aUsed = true
+    }
+    if raKind == RLK_F64_LIST { fa64Used = true }
+    if raKind == RLK_F32_LIST { fa32Used = true }
+    if raKind == RLK_U8_LIST { ba8Used = true }
+    if raKind == RLK_I64_LIST { ia64Used = true }
+    // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
+    // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
+    // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
+    // reaches every map element in every position, not just the ones an annotation spells.
+  } else if (nodeTyArrayElemRepName(i) == "f64" || nameIsF64Array(nd.tyName)) {
+    // An `f64[]` annotation forces the f64 array and wrapper pair, its own
+    // `(array (mut f64))` backing, independent of the i32 array and list. The name is a
+    // second opinion and an `||` rather than a coverage guard: `nodeTyArrayElemRepName` only
+    // answers for a `TyPrim` element, so a covered node can still fall out with "".
+    fa64Used = true
+  } else if (nodeTyArrayElemRepName(i) == "i64" || nameIsI64Array(nd.tyName)) {
+    // An `i64[]` annotation forces the i64 array + wrapper pair (`ia64`/`il64`). Same
+    // second opinion, for the same reason, with the same mis-route without it.
+    ia64Used = true
+  } else if (nodeTyArrayElemRepName(i) == "f32" || nameIsF32Array(nd.tyName)) {
+    // The arena first, matching the f64 and i64 rungs above, with the name kept as the
+    // documented second opinion. Both answers are strongly represented and agree, so the
+    // arena never widens here — which matters in a minting chain where an over-answering rung
+    // suppresses every rung below it. The name stays for the families the arena cannot name.
+
+    // An `f32[]` annotation forces the f32 array + wrapper pair (`fa32`/`fl32`).
+    fa32Used = true
+  } else if (nodeTyArrayElemRepName(i) == "u8" || nameIsU8Array(nd.tyName)) {
+    // A `u8[]` annotation forces the PACKED byte array + wrapper pair
+    // (`ba8`/`bl8`). Arena first then the name, exactly as the three scalar rungs
+    // above do and for the same reason: without a forcing rung here the annotation
+    // falls into `checkArrName` below and is rejected as a non-i32 element array.
+    ba8Used = true
+  } else if genTyParamArr(nd.tyName) || annArrOverTyParam(i, nd.tyName) {
+    // An array over a type parameter — `T[]`, or a record element with a `T` field — is a
+    // generic original's annotation. Its monomorphized instances carry concrete pinned
+    // names when `monomorphize` re-runs this pass, so nothing is forced or validated here.
+  } else if annSpelledArray(i, nd.tyName) && !isUnionOfTy(nodeTyIxOf(i)) {
+    // A union ending in an array arm (`i64 | S[]`) is a box whose arms `markRefArrayArms`
+    // interns, so it is not validated here. An instance's record element is interned by the
+    // shape passes after `monomorphize`, so the walk `monoRebuild` resumes leaves it to
+    // `collectA#2`, which re-walks every node (D4683).
+    if !caResumeArmed || nameIsI32Array(nd.tyName) {
+      if checkArrName(nd.tyName) < 0 { return -1 }
+      // An `i32[]` annotation is a list (wrapper struct + raw-array backing).
+      lUsed = true
+      aUsed = true
+    }
+  } else if nodeTyPrimName(i) == "string" {
+    aUsed = true
+    // The arena: `nodeTyIsNulString` reads `T.tys` directly, rather than a
+    // `<helper>(x) == <const>` twin whose helper never produces that constant.
+  } else if nodeTyIsNulString(i) {
+    // A `string | null` annotation (kind 16) is a `(ref null $aTypeIdx)` slot — it still needs the
+    // string backing forced, exactly like a plain `string`. Without this a bare `string | null = null`
+    // (no other string in the module to force `aUsed`) left `$aTypeIdx` unallocated, so the slot
+    // valtype + `ref.null` referenced a stale type index → invalid wasm at the read.
+    aUsed = true
+  } else if nodeTyIsNulI32List(i) {
+    // An `i32[] | null` annotation still constructs/reads the i32 list — the
+    // nullable wrapper changes only the slot's valtype, not the types needed.
+    lUsed = true
+    aUsed = true
+  } else if nulScalarListKindOfNode(i) != null {
+    // A distinct-backing nullable scalar list annotation (`string[]|null`, `f64[]|null`,
+    // `i64[]|null`, `f32[]|null`) constructs and reads the leaf list, so force its wrapper
+    // and backing even when the module has no other such list. `nulScalarListKindOfNode`
+    // leads with `annRepKindOf` and falls back to the name ladder, so it cannot under-answer.
+    const nsk = nulScalarListKindOfNode(i)
+    if nsk == "nulstrlist" {
+      slUsed = true
+      aUsed = true
+    }
+    if nsk == "nulf64list" { fa64Used = true }
+    if nsk == "nuli64list" { ia64Used = true }
+    if nsk == "nulf32list" { fa32Used = true }
+    if nsk == "nulu8list" { ba8Used = true }
+  } else if nodeTyIsLitUnionAlias(i) || nodeTyIsNulLitUnion(i) {
+    // A literal-union annotation (`: K`): an atom widens to its member `string`, so force the
+    // string backing even when the module has no other string literal. The nullable niche
+    // (`: K | null`) widens the same way and cannot lean on the alias arm, because the inline
+    // spelling has no alias declaration whose own `TypeRef` would force it.
+    aUsed = true
+  }
+  // A map reached only as a closure result inside this annotation — a union arm, the
+  // nullable-closure niche, or a curried result — is invisible to every branch above, since
+  // the whole spelling is one name. Force its machinery and intern its value slot;
+  // self-gating, and outside the chain so it composes with whatever branch claimed the name.
+  forceCloResultMapTypes(nd.tyName)
+  // The list dual: a scalar-leaf or string list reached only as a closure result inside this
+  // annotation forces its wrapper and backing, so the narrowed arm's value-call index read
+  // finds them even when the program never constructs such a list. Same self-gating
+  // placement as the map forcer above.
+  forceCloResultListTypes(nd.tyName)
+  // The generic-application dual of the two forcers above: a type argument (`Box<string>`,
+  // `Pair<i32, string[]>`) no branch of the chain can see, because the whole `Head<…>` is one
+  // name. Same self-gating placement and the same flag-only contract; see the helper.
+  forceGenAppArgTypes(nd.tyName)
+  0
+}
+
+// `collectA`'s tail after the arena walk: the field tables' needs re-derived, struct table
+// then variant table, since no field type is a `TypeRef` the walk sees. Every intern is idempotent.
+function collectAFieldTables() {
   // Union-variant nested-struct fields (code 15): intern each field's target shape into the
   // struct table, the intern `collectShapeVariantFields`'s acceptance deferred because
   // `collectU` runs before the struct table exists. Idempotent, and a no-op for a declared
@@ -7247,6 +7125,137 @@ export function collectA(_stmts: i32[]) {
     }
     ufi = ufi + 1
   }
+}
+
+// Scan the arena for every use of a collection heap type, setting the presence flags and
+// minting the ref-list, map-value and annotation-node rows keyed against them; an unclaimed
+// array annotation fails loudly. Asked once per minted generic instance, so it resumes on an
+// arena prefix — B7 of `docs/internals/perf-opportunities-2026-09.md`. Returns 0, or -1.
+export function collectA(_stmts: i32[]) {
+  collectTyParamNames()
+  // The read-only-covariance write memo is keyed by slot number, which a re-mint and a
+  // resumed walk's own new rows both move (D791). Ahead of the fork, since both invalidate it.
+  rlWrSlots = []
+  rlWrAns = []
+  pendingNulRefHeap = -1
+  const resume = collectAResumable()
+  let start = caSeenNodes
+  // Retired for the duration: a walk that refuses mid-arena leaves the tables partial, and the
+  // next call must re-mint rather than resume from a prefix that never finished.
+  caSeenNodes = -1
+  if resume {
+    caPopFieldTail()
+  } else {
+    start = 0
+    collectAResetTables()
+  }
+  let i = start
+  while i < P.nodes.length {
+    const nd = P.nodes[i]
+    if nd is ArrayLit {
+      collectAArrayLit(i, nd)
+    } else if nd is StrLit {
+      aUsed = true
+    } else if nd is Call {
+      // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
+      // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
+      // in a program with no other string. The callee is a bare `Ident`.
+      const cf = P.nodes[nd.callFn]
+      // `m.keys()` builds a fresh STRING list of the map's keys — force the string-list
+      // wrapper/backing (`mkListIdx`/`mkArrIdx`) + the shared `(array i32)`. `.keys()` is
+      // only valid on a map (checker-enforced), so any such call contributes the type.
+      if cf is Member {
+        if cf.memProp == "keys" {
+          slUsed = true
+          aUsed = true
+        }
+        // A set's `.values()` is its keys list too, whatever produced the set.
+        if cf.memProp == "values" {
+          const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
+          if vss == -2 { slUsed = true }
+          if vss == -5 { lUsed = true }
+          if vss == -7 { ia64Used = true }
+          if vss != 0 { aUsed = true }
+        }
+      }
+      // Gated on the shared vocabulary, so `collectANoteIdentRename` and this arm cannot
+      // disagree about which of the monomorphizer's in-place callee renames retires the
+      // resumable prefix.
+      if cf is Ident && collectACallIntrinsic(cf.identName) {
+        if cf.identName == "fromCodePoint" { aUsed = true }
+        // `fromCodePoints(xs)` builds a fresh string from an i32 list.
+        if cf.identName == "fromCodePoints" {
+          aUsed = true
+          lUsed = true
+        }
+        // An un-annotated `Map()` (usage-inferred binding) still constructs the map
+        // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
+        // is the same 7-field map struct, so it forces the IDENTICAL types.
+        if cf.identName == "Map" || cf.identName == "Set" {
+          mUsed = true
+          lUsed = true
+          aUsed = true
+          // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
+          // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
+          // arena for the `TypeRef` walk below to read, so the KEY comes off the
+          // constructor call's own recorded type.
+          markMapKeyUsed(nodeTyMapKeyKind(i))
+          // …and so does the value. The `TypeRef` walk's `mvShapeOfMapName` is the only other mv
+          // mint, so without this an un-annotated map with a ref or wide value resolves its type
+          // and never mints its rep. Idempotent: an annotated twin interns the same (key, value)
+          // slot. A `Set()` mints nothing, being boolean-valued, but the node type decides that.
+          mvShapeOfMapNodeTy(i)
+        }
+        // The array-intrinsic allocators construct a list with no literal or annotation in
+        // sight, so the pair its element kind names has to be interned here. `arrNewIntrKind` is
+        // the one home of that kind, so the intern and the lowering cannot disagree about it.
+        if (
+          cf.identName == "__array_new__"
+          || cf.identName == "__array_new_default__"
+        ) {
+          collectArrNewIntr(i)
+        }
+      }
+    } else if nd is TypeRef {
+      if collectATypeRef(i, nd) < 0 { return -1 }
+    } else if nd is IfStmt {
+      // An if-EXPRESSION whose arms join to a value union the program declares nowhere; the
+      // `TyUnion` test is what keeps a `T | null` join out, whose rep is the niche (D1745).
+      markInferredJoinAtoms(nodeTyIxOf(i))
+    } else if nd is IsExpr {
+      // An `is K[]` over a list whose elements can never be `K` hands its arm an empty `K[]`
+      // (D4911), a list no annotation or literal of the program need have built.
+      const kTy = isVarTyIxOf(i)
+      const rTy = nodeTyIxOf(nd.isObj)
+      const rv = P.nodes[unwrapParen(nd.isObj)]
+      if (
+        rv is Ident
+        && kTy >= 0
+        && kTy < T.tys.length
+        && T.tys[kTy] is TyArray
+        && !strListHas(listIsIdentNames, rv.identName)
+      ) {
+        listIsIdentNames.push(rv.identName)
+      }
+      // A receiver still typed by a type parameter is an instance's, whose binding may be one,
+      // for a union or nullable receiver as well (D4912).
+      if kTy >= 0 && kTy < T.tys.length && rTy >= 0 && rTy < T.tys.length {
+        if (
+          listDisjointDepth(rTy, kTy) == 1
+          || (T.tys[kTy] is TyArray && tyHasTyVar(rTy))
+        ) {
+          forceListLeafRepsOfTy(kTy)
+        }
+      }
+    }
+    i = i + 1
+  }
+  // The row counts the arena walk above finished at. Everything below appends past them, so a
+  // resumed walk pops back to here before extending — its own rows have to land where a full
+  // re-mint would put them, ahead of this tail.
+  caRlMark = rlElemName.length
+  caMvMark = mvValName.length
+  collectAFieldTables()
   collectABankPrefix()
   0
 }
