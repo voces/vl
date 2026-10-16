@@ -564,8 +564,15 @@ What `main.rs` keeps for `-O`: the strip and the cache around the call, `opt_pip
 as before), `opt_pipeline` (the request loop), the `remap` closure and the rung. `rung_argv`,
 `opt_roundtrip_check`, `escape_restore_vl`, `escape_inline_step`, `inline_vl`,
 `inline_rewrite_vl`, `flat_vl`, `multivalue_vl`, `multivalue_step` and their stream readers
-are gone. The per-step exports stay in `compiler/entry.vl` for this PR, so a host built before
-it still runs on the new seed and can be graded against the one after.
+are gone. The per-step exports stayed in `compiler/entry.vl` for that PR, so a host built before
+it still ran on the new seed and could be graded against the one after.
+
+The PR after drops them: the compiler's `-O` surface is the staging (`optInReset`, `optInLoad`,
+`optOut*`), `optStripSrc` and the pipeline (`optPipeStart`, `optPipeResume`, `optPipeArgv`).
+`optRungScan`, which nothing called since R2, is deleted. A host built before R8 cannot run
+`-O` on a seed from after this; every CI host is built from its own commit's source. The
+host is unchanged, and on it master's seed against this one differs on 0 of 15,512 programs
+at `-O` (10,538 identical modules, 4,974 both refused, 0 uncompared). The table below is R8's.
 
 The host built before the cut against the host after, on one seed:
 
