@@ -164,6 +164,11 @@ if [ "$PROVE" = 1 ]; then
     if cmp -s "$WORK/next2.wasm" "$WORK/next.wasm"; then
       echo "compile(next) == next — next is the fixpoint (2 compiles)"
     else
+      # The ship is now `next2` at best, so its tags are warmed beside the third compile.
+      wait "$EARLY_WARM" || true
+      # shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
+      VL="$VL" nice -n 10 scripts/warm-seed.sh $WARM_FUEL "$WORK/next2.wasm" &
+      EARLY_WARM=$!
       echo "== next2 compiles the compiler =="
       "$VL" build compiler/entry.vl -o "$WORK/next3.wasm" --compiler "$WORK/next2.wasm"
       if ! cmp "$WORK/next3.wasm" "$WORK/next2.wasm"; then
