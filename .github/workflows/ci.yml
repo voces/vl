@@ -271,7 +271,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v5
 
@@ -308,7 +308,7 @@ jobs:
       - name: Does this shard meter fuel
         id: fuel
         run: |
-          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 7)
           # shellcheck disable=SC2086  # one argument per file
           if grep -q VL_FUEL $files; then echo "need=true" >> "$GITHUB_OUTPUT"; fi
 
@@ -338,18 +338,18 @@ jobs:
       # case spawns its own `vl` subprocess, so cases are isolated regardless of schedule.
       - name: Native binary suites (corpus alignment, build -O, vl CLI)
         run: |
-          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 5)
-          [ -n "$files" ] || { echo "native shard ${{ matrix.shard }} of 5 is empty" >&2; exit 1; }
+          files=$(bash scripts/ci-shard.sh native ${{ matrix.shard }} 7)
+          [ -n "$files" ] || { echo "native shard ${{ matrix.shard }} of 7 is empty" >&2; exit 1; }
           # shellcheck disable=SC2086  # one argument per file
           deno test -A --no-check --parallel $files
         env:
           SELFHOST_NATIVE_ALIGN: "1"
           # A SELF_SHARDED file (ci-shard.sh) runs in every shard and asserts only this share.
-          VL_CI_SHARD: ${{ matrix.shard }}/5
+          VL_CI_SHARD: ${{ matrix.shard }}/7
 
   # ---------------------------------------------------------------------------
-  # checks — everything on the proven seed that is not a native suite: the ratchets, the
-  # capability probes, the self-lint, the corpus oracle and the seed-backed editor suites.
+  # checks — the ratchets, the capability probes and the self-lint on the proven seed. The
+  # corpus oracle and the seed-backed editor suites run beside it, in `checks-suites`.
   # ---------------------------------------------------------------------------
   checks:
     needs: seed
@@ -455,17 +455,68 @@ jobs:
           scripts/vl-host/target/release/vl run scripts/render-parse-census.vl --compiler build/vl-compiler.wasm -- --out "$RUNNER_TEMP/render-parse.json"
           scripts/vl-host/target/release/vl check --budget scripts/render-parse-budget-baseline.json --findings "$RUNNER_TEMP/render-parse.json" --compiler build/vl-compiler.wasm
 
-      # The corpus oracle on the wasm compiler: the full directive corpus adjudicated by the
-      # proven seed under Deno. Four files so `--parallel` spreads it over the cores; listed
-      # rather than globbed so tests/ci_seed_coverage_test.ts can hold this step to naming
-      # every shard.
-      - name: Corpus oracle on the wasm compiler
-        run: >-
-          deno test -A --parallel
-          tests/cases_wasm_0_test.ts
-          tests/cases_wasm_1_test.ts
-          tests/cases_wasm_2_test.ts
-          tests/cases_wasm_3_test.ts
+      # Collect the backgrounded self-lint. Bounded poll: the subshell wraps lint-self.sh
+      # in `timeout 420`, so 450 s is a margin over that and a dead subshell fails fast.
+      - name: Self-lint (result)
+        run: |
+          for _ in $(seq 1 450); do
+            [ -f /tmp/lint-self.rc ] && break
+            sleep 1
+          done
+          if [ ! -f /tmp/lint-self.rc ]; then
+            echo "self-lint result never arrived after 450s; the subshell itself was killed." >&2
+            cat /tmp/lint-self.log >&2 || true
+            exit 1
+          fi
+          cat /tmp/lint-self.log
+          exit "$(cat /tmp/lint-self.rc)"
+
+  # ---------------------------------------------------------------------------
+  # checks-suites — the seed-backed Deno suites that are not native: the editor features and
+  # the corpus oracle. A job of their own so they run beside `checks`'s ratchets rather than
+  # after them; the editor step stays first, followed by another step, because
+  # scripts/gate.sh reads its file list up to the next `- name:`.
+  # ---------------------------------------------------------------------------
+  checks-suites:
+    needs: seed
+    if: needs.seed.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Cache Deno modules
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/deno
+          key: deno-${{ runner.os }}-${{ hashFiles('deno.lock') }}
+          restore-keys: |
+            deno-${{ runner.os }}-
+
+      - name: Restore vl-host binary
+        uses: actions/cache/restore@v5
+        with:
+          path: scripts/vl-host/target/release/vl
+          key: ${{ needs.seed.outputs.bin_key }}
+          fail-on-cache-miss: true
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Warm the seed's sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          bash scripts/warm-seed.sh
 
       # The seed-backed LSP / playground editor-feature suites. They gate on
       # build/vl-compiler.wasm and self-ignore in the `ci` job (no seed), so they run
@@ -512,21 +563,17 @@ jobs:
           tests/playground_trap_frames_test.ts
           tests/playground_import_actions_test.ts
 
-      # Collect the backgrounded self-lint. Bounded poll: the subshell wraps lint-self.sh
-      # in `timeout 420`, so 450 s is a margin over that and a dead subshell fails fast.
-      - name: Self-lint (result)
-        run: |
-          for _ in $(seq 1 450); do
-            [ -f /tmp/lint-self.rc ] && break
-            sleep 1
-          done
-          if [ ! -f /tmp/lint-self.rc ]; then
-            echo "self-lint result never arrived after 450s; the subshell itself was killed." >&2
-            cat /tmp/lint-self.log >&2 || true
-            exit 1
-          fi
-          cat /tmp/lint-self.log
-          exit "$(cat /tmp/lint-self.rc)"
+      # The corpus oracle on the wasm compiler: the full directive corpus adjudicated by the
+      # proven seed under Deno. Four files so `--parallel` spreads it over the cores; listed
+      # rather than globbed so the seed-coverage test can hold this step to naming every
+      # shard. (No test path in this comment: gate.sh's editor-list read runs into it.)
+      - name: Corpus oracle on the wasm compiler
+        run: >-
+          deno test -A --parallel
+          tests/cases_wasm_0_test.ts
+          tests/cases_wasm_1_test.ts
+          tests/cases_wasm_2_test.ts
+          tests/cases_wasm_3_test.ts
 
   # ---------------------------------------------------------------------------
   # ci-release-shape — the binaryen-backed suites (`vl build -O3` opt / allocation-melt /

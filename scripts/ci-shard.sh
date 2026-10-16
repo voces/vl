@@ -34,34 +34,59 @@ SELF_SHARDED='
 selfhost_native_align_test.ts
 '
 
-# ci.yml's "Warm the seed's sidecars" step with `--fuel` on a cache miss: ~22 s of wall that
+# ci.yml's "Warm the seed's sidecars" step with `--fuel` on a cache miss: ~33 s of wall that
 # holds back all four of the runner's cores, and a weight counts seconds of one file.
-FUEL_WARM=88
+FUEL_WARM=110
 
+# The native rows are the mean over two PR runs of each file's summed test seconds. A
+# self-sharded file's row is its whole cost, and each shard is charged 1/n of it.
 WEIGHTS='
-vl_plumb_shape_port_test.ts 28
-vl_budget_mode_test.ts 25
-vl_capability_probes_port_test.ts 25
-vl_test_runner_test.ts 25
-vl_deep_nesting_test.ts 25
-vl_check_filed_witnesses_test.ts 20
-vl_survey_regrade_port_test.ts 17
-vl_distilled_tools_test.ts 30
-vl_memo_generation_test.ts 12
-vl_std_fs_write_test.ts 12
-vl_emitter_state_audit_test.ts 10
-vl_check_codegen_test.ts 10
-vl_fmt_test.ts 10
-vl_compile_cache_test.ts 8
-vl_compile_gc_test.ts 7
-vl_seed_provenance_test.ts 7
-vl_capability_matrix_test.ts 6
-vl_seed_size_test.ts 6
-vl_ratchet_hold_test.ts 6
-vl_check_fix_test.ts 5
-vl_large_source_test.ts 5
-vl_sentinel_index_test.ts 4
-vl_kind_ladder_test.ts 3
+selfhost_native_align_test.ts 96
+vl_budget_mode_test.ts 49
+vl_distilled_tools_test.ts 37
+vl_deep_nesting_test.ts 35
+vl_capability_probes_port_test.ts 28
+vl_day_one_sampler_test.ts 27
+vl_census_generators_test.ts 24
+vl_check_filed_witnesses_test.ts 24
+vl_capability_matrix_test.ts 23
+vl_capability_matrix_port_test.ts 22
+vl_census_readers_test.ts 20
+vl_fmt_test.ts 18
+vl_memo_generation_test.ts 18
+vl_test_runner_test.ts 18
+vl_check_codegen_test.ts 16
+vl_sentinel_index_test.ts 15
+vl_compile_gc_test.ts 14
+vl_plumb_shape_port_test.ts 13
+vl_survey_regrade_port_test.ts 12
+vl_label_codemod_test.ts 11
+vl_gen_cases_test.ts 10
+vl_ladder_census_test.ts 10
+vl_perf_tools_test.ts 9
+vl_std_math_grade_test.ts 9
+vl_emit_refusal_sites_test.ts 8
+vl_twin_agreement_test.ts 7
+vl_check_fix_test.ts 6
+vl_emitter_state_audit_test.ts 6
+vl_goal_scoreboard_test.ts 6
+vl_std_fs_write_test.ts 6
+vl_std_json_test.ts 6
+vl_label_block_object_test.ts 5
+vl_seed_size_test.ts 5
+vl_union_key_licence_test.ts 5
+vl_compile_cache_test.ts 4
+vl_instance_state_leak_test.ts 4
+vl_kind_ladder_test.ts 4
+vl_large_source_test.ts 4
+vl_print_color_test.ts 4
+vl_profile_rank_test.ts 4
+vl_ratchet_hold_test.ts 4
+vl_shared_memory_test.ts 4
+vl_lint_span_test.ts 3
+vl_run_args_test.ts 3
+vl_seed_provenance_test.ts 3
+vl_std_process_test.ts 3
 vl_deep_else_chain_test.ts 11
 vl_buffer_view_bounds_shape_test.ts 40
 selfhost_native_release_shape_test.ts 30
@@ -107,22 +132,27 @@ assign() {
   local rows
   # "<unit> <weight> <file>": a unit is the file itself, `fuel`, or `own` (self-sharded).
   rows=$(population "$1" | while read -r f; do
-    if is_own "$f"; then echo "own 0 $f"; continue; fi
     w=$(printf '%s' "$WEIGHTS" | awk -v b="${f#tests/}" '$1 == b {print $2}')
+    if is_own "$f"; then echo "own ${w:-0} $f"; continue; fi
     unit="$f"
     if grep -q VL_FUEL "$f"; then unit=fuel; fi
     printf '%s %s %s\n' "$unit" "${w:-2}" "$f"
   done)
-  printf '%s\n' "$rows" | awk -v n="$2" '$1 == "own" {for (s = 1; s <= n; s++) print s, $3}'
-  # Longest unit first, ties by name, each to the least-loaded shard; then its files.
-  printf '%s\n' "$rows" |
-    awk -v warm="$FUEL_WARM" 'NF == 3 && $1 != "own" {w[$1] += $2}
-      END {for (u in w) print w[u] + (u == "fuel" ? warm : 0), u}' |
-    sort -k1,1nr -k2,2 |
-    awk -v n="$2" '{ best = 1
-      for (s = 2; s <= n; s++) if (load[s] < load[best]) best = s
-      load[best] += $1; print best, $2 }' |
-    awk 'NR == FNR {shard[$2] = $1; next} ($1 in shard) {print shard[$1], $3}' - <(printf '%s\n' "$rows")
+  # "<shard> <weight> <file>"; a self-sharded file is charged 1/n of its weight in every shard.
+  {
+    printf '%s\n' "$rows" | awk -v n="$2" '$1 == "own" {for (s = 1; s <= n; s++) print s, $2 / n, $3}'
+    # Longest unit first, ties by name, each to the least-loaded shard; then its files.
+    own=$(printf '%s\n' "$rows" | awk -v n="$2" '$1 == "own" {s += $2 / n} END {print s + 0}')
+    printf '%s\n' "$rows" |
+      awk -v warm="$FUEL_WARM" 'NF == 3 && $1 != "own" {w[$1] += $2}
+        END {for (u in w) print w[u] + (u == "fuel" ? warm : 0), u}' |
+      sort -k1,1nr -k2,2 |
+      awk -v n="$2" -v own="$own" 'NR == 1 {for (s = 1; s <= n; s++) load[s] = own}
+        { best = 1
+        for (s = 2; s <= n; s++) if (load[s] < load[best]) best = s
+        load[best] += $1; print best, $2 }' |
+      awk 'NR == FNR {shard[$2] = $1; next} ($1 in shard) {print shard[$1], $2, $3}' - <(printf '%s\n' "$rows")
+  } | sort -k1,1n -k2,2nr -k3,3 | awk '{print $1, $3}'
 }
 
 if [ "${1:-}" = --check ]; then
