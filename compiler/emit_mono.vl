@@ -73,6 +73,7 @@ import {
   tyProvesNonNull,
 } from "./typecheck"
 import { primTyOfName } from "./check_decl_scan"
+import { tyLeavesDisjoint } from "./check_type_shape"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
 import { isVarTyIxOf, recordClonedIsVarTyIx } from "./check_list_union"
@@ -3517,6 +3518,26 @@ function monoRecvParamElem(
   ""
 }
 
+// The element an `is K[]` arm reads its receiver `recvIx` at, when the instance pinned that
+// receiver's element to `pinEl`, which can never be `K`'s: the arm reads an empty `K[]` in its
+// place (D4993). -1 when the read is the receiver's own list.
+function monoFitArmElem(recvIx: i32, pinEl: i32): i32 {
+  if pinEl < 0 { return -1 }
+  const t = nodeTyIxOf(unwrapParen(recvIx))
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+  const a = T.tys[t]
+  if !(a is TyArray) || !tyLeavesDisjoint(pinEl, a.aElem) { return -1 }
+  a.aElem
+}
+
+// The name a callback parameter pinned at arm element `el` is annotated with: a record's
+// interned row, a primitive's own name, or "" where `el` is -1 or neither.
+function monoFitArmElemName(el: i32): string {
+  if el < 0 || el >= T.tys.length { return "" }
+  if T.tys[el] is TyObj { return monoRetRowName(el) }
+  tyPrimNameOf(el) ?? ""
+}
+
 // Clone an inline `.map`/`.filter` callback lambda with its single un-annotated parameter
 // pinned to `elemType`, lift the clone into `fnStmts`, and return its node index — or -1
 // when the argument is not a cloneable un-annotated 1-param lambda. The body is shared:
@@ -5369,16 +5390,22 @@ function monoPinMapLambdas(
       if callee.memProp == "map" || callee.memProp == "filter" {
         if n.callArgs.length == 1 {
           const elemTyOut: i32[] = []
-          const elem = monoRecvParamElem(
+          let elem = monoRecvParamElem(
             callee.memObj,
             pNames,
             pElems,
             pElemTys,
             elemTyOut,
           )
+          let elemTy = -1
+          if elemTyOut.length > 0 { elemTy = elemTyOut[0] }
+          const armEl = monoFitArmElem(callee.memObj, elemTy)
+          const armName = monoFitArmElemName(armEl)
+          if armName != "" {
+            elem = armName
+            elemTy = armEl
+          }
           if elem != "" && elem != "i32" {
-            let elemTy = -1
-            if elemTyOut.length > 0 { elemTy = elemTyOut[0] }
             const cloned = monoCloneLambdaPinned(n.callArgs[0], elem, elemTy)
             if cloned >= 0 {
               const oneArg: i32[] = [cloned]
