@@ -105,6 +105,7 @@ import {
   canonRewroteNode,
   canonTyIxOf,
   canonUnionKey,
+  canonUnionKeyNullAtOfTy,
   canonUnionKeyOfName,
   canonUnionKeyOfTy,
   capWidenOf,
@@ -195,6 +196,7 @@ import {
   TyUnion,
   TyVar,
   aliasNameOfTyIx,
+  cUserTypes,
   cUserTypesVer,
   litBaseTy,
   litUnionAliasNameOfTy,
@@ -227,6 +229,7 @@ import {
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
+  tyNumScalarBaseName,
   tyPrimNameOf,
   tyReachesUnion,
   tySame,
@@ -26904,7 +26907,10 @@ export function genTyParamNulArr(name: string) {
 export function arrLitUnionElemName(arrIx: i32): string {
   const cen = nodeArrayElemName(arrIx)
   if cen == "" { return "" }
-  if !isUNameAB(16, cen, nodeArrayElemTyIx(arrIx)) { return "" }
+  const ety = nodeArrayElemTyIx(arrIx)
+  // A numeric literal union keys to its own row but reps as its base scalar: no union element.
+  if tyNumScalarBaseName(ety) != "" { return "" }
+  if !isUNameAB(16, cen, ety) { return "" }
   if arrLitIsStr(arrIx, -1) { return "" }
   if arrLitNumKind(arrIx, -1) != ALK_NONE { return "" }
   cen
@@ -40368,13 +40374,10 @@ function unionRowOfTyRaw(ty: i32): i32 {
   -1
 }
 
-// The seams that answer from the union KEY, step 5's switch: all but site 7, whose caller type
-// at a generic pin can be another pin's union, and site 16, whose softened literal-union
-// spelling (`i32`) keys to a row that is no box element. A fallback seam or a mint guard keeps
-// the spelling's answer where the key finds no row. `docs/internals/registry-by-type-id.md` §5.
-function unSiteOnKey(site: i32): boolean {
-  site >= 1 && site < UNAB_N && site != 7 && site != 16
-}
+// The seams that answer from the union KEY, step 5's switch: every one. Where the key finds no
+// row, `unSiteWideHit` and the mint guard say what still answers.
+// `docs/internals/registry-by-type-id.md` §5.
+function unSiteOnKey(site: i32): boolean { site >= 1 && site < UNAB_N }
 
 // The ID side's row for `site`: a switched site and harness mode 3 key on `unKey`, anything
 // else on `repCanonId`. Only the A/B seams route through here.
@@ -40393,23 +40396,109 @@ export function isUNameAB(site: i32, name: string, ty: i32): boolean {
   if m == 0 && !k { return isUName(name) }
   let d = -1
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  if m == 0 { return d >= 0 || (unSiteFallsBack(site) && isUName(name)) }
+  if m == 0 { return d >= 0 || (k && unSiteWideHit(site, name, ty)) }
   const n = isUName(name)
   let nr = -1
   if n { nr = unRowOfName(name) }
   unABProbe(site, nr, d, ty)
-  if k { return d >= 0 || (unSiteFallsBack(site) && n) }
+  if k { return d >= 0 || unSiteWideHit(site, name, ty) }
   if m == 2 { return d >= 0 }
   n
 }
 
-// The switched `isUNameAB` sites that still answer true for a spelling naming a row the key
-// misses. Their `name-only` reaches are a nominal spelling of a union whose arena type keys
-// structurally, so a strict switch would read a registered union as none.
-function unSiteFallsBack(site: i32): boolean {
-  if site == 2 || site == 5 || site == 6 || site == 15 { return true }
-  if site == 17 || site == 18 || site == 20 { return true }
-  site == 26 || site == 27 || site == 28
+// One union member against another in the same position: the same type, or two records or
+// maps of one structure (or lists of such), which the key renders apart when only one
+// carries its declared name.
+function unMemberSameShape(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyPrim {
+    if tb is TyPrim { return ta.primName == tb.primName }
+    return false
+  }
+  if ta is TyArray {
+    if tb is TyArray { return unMemberSameShape(ta.aElem, tb.aElem) }
+    return false
+  }
+  if !(ta is TyObj || ta is TyMap) || !(tb is TyObj || tb is TyMap) {
+    return false
+  }
+  repCanonId(a) == repCanonId(b)
+}
+
+// Two union types with the same member sequence under `unMemberSameShape`, order kept, since
+// a union's box tags are positional over its members.
+function unTySeqSameShape(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  match ta {
+    TyNullable => tb is TyNullable && unTySeqSameShape(ta.nInner, tb.nInner)
+    TyUnion => tb is TyUnion && unMemberSeqSameShape(ta.uMembers, tb.uMembers)
+    TyLit => false
+    TyArray => false
+    TyMap => false
+    TyObj => false
+    TyPrim => false
+    TyErr => false
+    TyFunc => false
+    TyVar => false
+    TyNeg => false
+  }
+}
+
+function unMemberSeqSameShape(ma: i32[], mb: i32[]): boolean {
+  if ma.length != mb.length { return false }
+  let i = 0
+  while i < ma.length {
+    if !unMemberSameShape(ma[i], mb[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// A row for a union type the key missed: by the key of its `null` arm at each member position,
+// since a nullable union's row keeps `null` at its spelled position, else a row whose recorded
+// type has the same member sequence up to record names. For the existence question only.
+function unRowOfTyWide(ty: i32): i32 {
+  let at = 0
+  let k = canonUnionKeyNullAtOfTy(ty, 0)
+  while k >= 0 {
+    const r = unRowOfKeyId(k)
+    if r >= 0 { return r }
+    at = at + 1
+    k = canonUnionKeyNullAtOfTy(ty, at)
+  }
+  if canonUnionKeyOfTy(ty) < 0 { return -1 }
+  let u = 0
+  while u < unTyIx.length {
+    if unTySeqSameShape(unTyIx[u], ty) { return u }
+    u = u + 1
+  }
+  -1
+}
+
+// A row-existence seam's answer where the key finds no row: a row by `unRowOfTyWide`, or, at
+// the binding and return seams, the spelling when the arena type is no union at all (a softened
+// literal union, or same-shape records collapsed to one). Other sites ask about the spelling.
+function unSiteWideHit(site: i32, name: string, ty: i32): boolean {
+  const asks = unSiteWideAsks(site)
+  if asks == 0 { return false }
+  if unRowOfTyWide(ty) >= 0 { return true }
+  asks == 2 && canonUnionKeyOfTy(ty) < 0 && isUName(name)
+}
+
+// 0: the site asks about the spelling; 1: about a row for the type; 2: as 1, and a binding or
+// return seam whose spelling still answers when the arena type is no union.
+function unSiteWideAsks(site: i32): i32 {
+  match site {
+    2 | 5 | 6 | 27 | 28 => 2
+    7 | 15 | 16 | 17 | 18 | 20 | 26 => 1
+    _ => 0
+  }
 }
 
 // The row-NAME seam: `name` when it names a row, else "". A switched site with a type answers
@@ -40594,12 +40683,18 @@ export function unVarSliceAdoptKeySibling(u: i32) {
 }
 
 // True when `name` names a row, after binding an unregistered spelling to the row its key
-// finds. Only a union spelling that itself keys to that row binds: a softened literal union
-// (`i32` for a litunion's row) or a reordered member sequence stays unbound and answers false,
+// finds. Only a union spelling that itself keys to that row binds: a declared alias name, a
+// union type of one member, or a reordered member sequence stays unbound and answers false,
 // so a mint guard asking this mints exactly where it did before the key could answer.
 export function unNameAdoptKeyRow(name: string, ty: i32): boolean {
   if isUName(name) { return true }
-  if unionMemberCount(name) < 2 { return false }
+  if (cUserTypes[name] ?? -1) >= 0 { return false }
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyUnion {
+      if t.uMembers.length < 2 { return false }
+    }
+  }
   const k = canonUnionKeyOfName(name)
   if k < 0 { return false }
   let r = -1
