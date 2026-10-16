@@ -7704,7 +7704,7 @@ arguments), a stored record read whole (D3753) and a cache list (D3752).
 store, and the multi-value step above cannot remove it: a store is not a field use. Slice S1
 of `docs/internals/inline-records-design.md`.
 
-**The rule.** A host step before the multi-value step (`scripts/vl-host/src/inline.rs`)
+**The rule.** A host step before the multi-value step (`scripts/vl-host/src/inline.rs`, since deleted)
 replaces a struct field of record type `V` with `V`'s fields when nothing can tell a shared
 box from a copy: `V` is never written (the multi-value step's charge, D3630), no `ref.eq` or
 `extern.convert_any` can see it, it is a leaf of the subtyping order, and no value crossing
@@ -7751,7 +7751,7 @@ retired, since a flag is the supported spelling and two would drift. sunpa's fee
 
 **Lists too: slice S2 (2026-10-05; D3681).** A `V[]` of such a record, its fields one number
 type, is flattened to one array of those numbers at `n` times the length
-(`scripts/vl-host/src/flat.rs`, run on S1's output; inline-records-design.md §7). Map value
+(`scripts/vl-host/src/flat.rs`, since deleted, run on S1's output; inline-records-design.md §7). Map value
 lists share the backing type and go with it. A list made by `filled(n, v)` (`array.new`) stays
 boxed: its slots share one box, so flat it would be `n` copies of the fields, `n` times the
 memory, past V8's array-length cap at `filled(40000000, q)` (review of the S2 PR). Three

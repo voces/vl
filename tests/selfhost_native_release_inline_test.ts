@@ -521,3 +521,62 @@ Deno.test({
     }
   },
 });
+
+// The compiler's list-flattening step (`optInlineFlatStep`, rung R7) writes the module a
+// flattened list leaves. `$VL_INLINE_FAULT=4`, which ends each rewritten body's locals with an
+// empty entry (a valid module with other bytes), is the control that the module is the compiler's.
+Deno.test({
+  name:
+    "native-release: the compiler's list-flattening step is the module written",
+  ignore: !ENABLED,
+  fn: async () => {
+    const tmp = await Deno.makeTempDir();
+    try {
+      const fx = `${DIR}/flat-melts.vl`;
+      const build = (env: Record<string, string>, dump: string) =>
+        vl(["build", fx, "-O", "-o", `${tmp}/out.wasm`], {
+          VL_INLINE_EXPLAIN: "1",
+          VL_OPT_FLAT_DUMP: dump,
+          ...env,
+        });
+      const plain = await build({}, `${tmp}/plain.wasm`);
+      const padded = await build(
+        { VL_INLINE_FAULT: "4" },
+        `${tmp}/padded.wasm`,
+      );
+      const ran = padded.code === 0
+        ? await vl(["run", `${tmp}/out.wasm`])
+        : undefined;
+      const logs = logsOf(Deno.readTextFileSync(fx));
+      for (
+        const [tag, b] of [["plain", plain], [
+          "VL_INLINE_FAULT=4",
+          padded,
+        ]] as const
+      ) {
+        if (b.code !== 0 || !/: flattened;/.test(b.err)) {
+          throw new Error(
+            `${tag}: want a list flattened, got: ${b.err.trim()}`,
+          );
+        }
+      }
+      if (
+        !ran || ran.code !== 0 ||
+        JSON.stringify(linesOf(ran.out)) !== JSON.stringify(logs)
+      ) {
+        throw new Error(
+          `VL_INLINE_FAULT=4: want the @log lines, got: ${ran?.out}`,
+        );
+      }
+      const a = Deno.readFileSync(`${tmp}/plain.wasm`);
+      const b = Deno.readFileSync(`${tmp}/padded.wasm`);
+      if (a.length === b.length && a.every((x, i) => x === b[i])) {
+        throw new Error(
+          "VL_INLINE_FAULT=4: want the step's module to differ from the unfaulted one",
+        );
+      }
+    } finally {
+      await Deno.remove(tmp, { recursive: true });
+    }
+  },
+});
