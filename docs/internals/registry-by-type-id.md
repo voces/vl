@@ -155,7 +155,7 @@ Byte-identical until step 5; steps 1-2 are this PR.
 | 4a | the ARENA-side member-sequence renderer, so `canonUnionKeyOfTy` reaches the row's key | none | agreement per row against `unKey`, every miss categorised | **SHIPPED — 1,369 → 2,422 of 2,447 (55.9% → 98.98%)** |
 | 4b | thread the key into `registerInlineUnion`'s recursive sites, and separate the counter's `differ` from a key-EQUAL sibling | `emit_collect.vl` | per-site liveness + disagreement | **SHIPPED — 18 sites, 16 at `differ` 0 / `name-only` 0; `differ` 1,587 → 88** |
 | 5 | **the switch**: seams return the id answer; retire `unNames`-scanning readers | `emit_classify.vl` + `emit_collect.vl`, one PR | rep-fuzz, fixpoint, corpus run-diff, **both halves of the ABI assertion** | prerequisite (1) MET 2026-10-13 — `merge-diffvar` 1 → 0 (D1492 closed); (2) MET at the write seams — `differ` 230 → 0 (the probe asked about the `LetDecl` statement), the licence gated by `tests/vl_union_key_licence_test.ts`, 68 off-site reaches a documented exception; blocked on (3) the `name-only` rule (2,248) — §5 "Prerequisite (2)" |
-| 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | — | |
+| 6 | retire `unMemberSet` as a KEY (it stays as a rendering) | `emit_state.vl` | `difftree.sh --identity` | **SHIPPED** — `unRowByMemberSid` and both member-set scans ask the key (`unRowOfSetText`); 0 differ of 10,329 built |
 
 ### What steps 1-3 landed, measured
 

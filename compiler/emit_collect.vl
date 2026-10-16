@@ -537,7 +537,6 @@ import {
   unMemTys,
   unMemberSet,
   unNames,
-  unRowByMemberSid,
   unRowBySid,
   unTyIx,
   unVarCount,
@@ -900,7 +899,6 @@ import {
   rlInternName,
   rlInternNameTy,
   uVariantsPush,
-  unMemberSetPush,
   unNameShareCanonRow,
   unNamesPush,
 } from "./emit_union_atoms"
@@ -3956,6 +3954,301 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   return 0
 }
 
+// Collect one `let` statement's local: classify its init into a fresh slot, allocate the
+// arm-prelude locals its if-expression initializer declares, then bind the name in the current
+// scope. Returns 0, or -1 (via `emitFail`, the open scope popped on the paths that owe it).
+function collectLetLocal(stmtIx: i32, s: LetDecl, fnIx: i32) {
+  synthEmptyListAnn(stmtIx)
+  synthNullableAnn(stmtIx)
+  synthNarrowedReadAnn(stmtIx, fnIx)
+  synthRetPinAnn(stmtIx, fnIx)
+  // `-1` for the program root: the late run has no module scope to hand over and must not
+  // acquire one. It reaches the start function's blocks and the bodies monomorphization
+  // minted, both past the point where a caller's annotation could re-aim an instance's
+  // signature. Every binding the pre-mono pass pinned is declined by the `letType` guard.
+  synthDstPinAnn(stmtIx, fnIx, -1)
+  // An if-expression initializer whose arms declare locals is walked first, by node, and
+  // those locals are bound while the binding is classified, so an arm's tail naming one
+  // reads its slot rather than a type parameter's recorded type (D2785).
+  let initArms = 0
+  if exprArmLocalsAny { initArms = letInitArmsFirst(s.letInit, fnIx) }
+  if initArms < 0 {
+    scopePop()
+    return -1
+  }
+  // Classify the init type before binding the name, then allocate a fresh slot and bind
+  // `name → slot` so a later reference (or a shadowing inner `let`) resolves to this slot.
+  // `slot` is the new slot's declared-local position.
+  const slot = letLocalSlot(stmtIx, s, fnIx)
+  if slot == -2 {
+    scopePop()
+    return -1
+  }
+  if slot == -3 { return -1 }
+  // Pin the declaration to the slot, before the arm preludes below can allocate more. In a
+  // monomorphized instance the annotation on this node is the only concrete type its body
+  // carries (`localDeclIx`), so a rep question about a read of this local has nowhere else
+  // to go.
+  markLocalDecl(slot, stmtIx)
+  if collectByNode > 0 { declSlotByNode[stmtIx] = slot }
+  if fnIx >= 0 { markLetOverGlobal(slot, s.letName) }
+  // An if-expression initializer's arm preludes declare locals of their own. They are
+  // allocated after this binding's own slot and before its name is bound, because that is
+  // the order `emitLetDeclStmt` walks: `emitLetCursor`, then the init, then `scopeBind`.
+  if initArms == 1 {
+    scopePop()
+  } else if collectIfExprLocals(s.letInit, fnIx) < 0 {
+    scopePop()
+    return -1
+  }
+  scopeBind(s.letName, slot)
+  0
+}
+
+// The declared-local slot a `let` statement's binding takes, allocated by the first arm of the
+// classification ladder that claims its annotation or init. Returns the slot, -2 when the i32
+// default rejects the binding, or -3 when an inline-shape annotation fails (via `emitFail`).
+function letLocalSlot(stmtIx: i32, s: LetDecl, fnIx: i32) {
+  let slot = -1
+  if letIsNulNone(stmtIx, fnIx) {
+    // D1576 — a never-filled `let x = null`. The A-infer-null hole nothing assigns into
+    // is not `T | null` for any `T`: the binding's only value is `null`, so its cell is
+    // `nullref`, the GC bottom, which flows to every nullable ref destination with no
+    // coercion. First in the ladder, since several arms below claim a bare `null`.
+    slot = addLocalName(s.letName, "nulnone", -1)
+  } else if letIsLitUnion(stmtIx) || letInitIsLitAtom(stmtIx, fnIx) {
+    // A literal-union local, annotated `: K` or un-annotated off an atom init. It is an
+    // i32-backed interned atom, not a value-union box. First, because its members register
+    // as value-union variants; and before `letIsString`, whose `string`-subtype checker
+    // type would else pick the kind-3 ref slot and store the atom into a `(ref $array)`.
+    slot = addLocalName(s.letName, "i32", -1)
+    localLitUnion[slot] = 1
+  } else if letNulLitUnion(stmtIx, fnIx) {
+    // A `K | null` niche local (kind 0, plain i32): atom ids >= 0 with the spare `-1` for
+    // null. Before `letIsNulString`, since a litunion softens to `string`. Marked
+    // `localLitUnion` so reads widen as atoms; the write path seeds `-1` for a `null`.
+    slot = addLocalName(s.letName, "i32", -1)
+    localLitUnion[slot] = 1
+  } else if letInitJoinsToUnionBox(stmtIx, fnIx) {
+    // A `??` whose nullable-ref operand JOINS with a default of another type: the result
+    // is the union box, so the slot is the box. Ahead of every arm below, which read the
+    // OPERAND's rep and would declare the niche's own ref (D1714).
+    slot = addLocalName(s.letName, "union", -1)
+  } else if letInitTyIsNarrowedArm(stmtIx, fnIx) {
+    // An un-annotated binding of a NARROWED arm (D1741): the init hands over the union
+    // box and the checker types the binding at the arm, so the cell is the arm and the
+    // binding boundary unboxes into it. Above every arm reading the init's own rep,
+    // each of which would give the cell a box every consumer then reads as the arm.
+    slot = addLocalName(s.letName, "variant", letInitTyVariantRow(stmtIx))
+  } else if letInitTyIsNarrowedNulArm(stmtIx, fnIx) {
+    // Its `X | null` twin (D3107): the box narrowed to a nullable arm binds the niche.
+    slot = addLocalName(s.letName, "nulvariant", letInitTyNulArmRow(stmtIx))
+  } else if letIsNulMap(stmtIx, fnIx) {
+    // A nullable map local (kind `nulmap`), before `letIsMap`: a nullable init or
+    // annotation must not collapse to `"map"`, whose `(ref $mapStruct)` cell cannot hold
+    // `null`. Its `localStructIdx` carries the same map shape as the non-null map.
+    slot = addLocalName(s.letName, "nulmap", nulMapShapeOf(stmtIx, fnIx))
+  } else if letNulMapReadValKind(stmtIx, fnIx) != null {
+    // A bare `const t = m[k]` read of a list- or nested-map-valued map (`V | null`): binds
+    // the value's established nullable local kind, the same kinds a direct `V | null`
+    // annotation produces, so the narrow and read machinery lowers unchanged. Before the
+    // union-read guard and the non-null kinds, so a later narrow sees the nullable cell.
+    const nmrK = letNulMapReadValKind(stmtIx, fnIx)
+    if nmrK != null {
+      slot = addLocalName(s.letName, nmrK, letNulMapReadSlotArg(stmtIx, fnIx))
+    }
+  } else if letNulMapReadUnionBox(stmtIx, fnIx) {
+    // A bare `const t = m[k]` read of a union-valued map (mv kind 2): `V | null` binds the
+    // established `A | B | null` rep, the shared box itself, with `null` riding as the
+    // null-tagged atom. Beside the kind-6 arm for the same ladder-order reason.
+    slot = addLocalName(s.letName, "union", -1)
+  } else if letIsMap(stmtIx, fnIx) {
+    // The kind-6 parallel slot carries the map shape: `-2` for a `Set()` binding, an mv
+    // slot for a ref-valued map, `-1` for the mono i32 map. After the bare-map-read arm,
+    // whose nested-map value is `{[string]:V} | null` and would else be claimed here as a
+    // non-null map local, storing the nullable element into a non-null cell.
+    slot = addLocalName(s.letName, "map", letMapShapeOf(stmtIx, fnIx))
+  } else if letPopUnionBoxElem(stmtIx, fnIx) {
+    // A `.pop()` / `.get(i)` over a value-union ref list: `T | null` is the box with
+    // `null` as its tag, the same rep the union-valued map read binds. Before every
+    // nullable-niche arm below, none of which claims it, and before the i32 default,
+    // which stored a `(ref null $uBox)` into an i32 cell.
+    slot = addLocalName(s.letName, "union", -1)
+  } else if letIsNulVariant(stmtIx, fnIx) {
+    // Nullable union variant (`Circle | null`, kind `nulvariant`) — the
+    // `(ref null $uVarHeap[vi])` niche. Before the `nulstruct` arm below: the two are
+    // disjoint at the producer, but a variant has no struct row for
+    // `nulRefStructIdxOfLet` to find, since `collectS` skips it.
+    slot = addLocalName(
+      s.letName,
+      "nulvariant",
+      nulVariantIdxOfLet(stmtIx, fnIx),
+    )
+  } else if letIsNulRef(stmtIx, fnIx) {
+    // Nullable struct (`S | null`, code 9): annotation first, else the initializer's
+    // nullable-returning call. Before the struct case, so a nullable init does not
+    // collapse to the non-null kind 1.
+    slot = addLocalName(
+      s.letName,
+      "nulstruct",
+      nulRefStructIdxOfLet(stmtIx, fnIx),
+    )
+  } else if letIsNulListInfer(stmtIx, fnIx) {
+    // Nullable i32 list (`i32[] | null`, kind 15), before the array case: `letIsArray`'s
+    // init fallback would otherwise claim the binding as a non-null kind 2, and a later
+    // `xs = null` write would be invalid.
+    slot = addLocalName(s.letName, "nullist", -1)
+  } else if letNulScalarListKind(stmtIx, fnIx) != null {
+    // A distinct-backing nullable scalar list local (`string[]|null`, `f64[]|null`,
+    // `i64[]|null`, `f32[]|null`): its own `(ref null $wrapper)` slot, before the non-null
+    // scalar-list arms whose init fallback would else claim a bare list value non-null.
+    const nulSLK = letNulScalarListKind(stmtIx, fnIx)
+    if nulSLK != null { slot = addLocalName(s.letName, nulSLK, -1) }
+    // The scalar-list checks gate on `!letIsUnion`: a `f64[] | string` binding whose init
+    // is a bare list literal would otherwise let `letIsF64Array`'s init fallback claim it
+    // as an f64 list instead of the value-union box. A plain `f64[]` is not a union name.
+  } else if (
+    letIsStringArray(stmtIx, fnIx)
+    && !letIsUnion(stmtIx, fnIx)
+    && !letIsNulRefArray(stmtIx, fnIx)
+  ) {
+    // The `!letIsNulRefArray` gate: a nullable union-element ref-array binding whose init
+    // is a bare string-list literal would otherwise be claimed as a plain string list by
+    // the init fallback, storing the union-box list into a string-list-wrapper local. The
+    // scalar-list siblings below carry the same gate.
+    slot = addLocalName(s.letName, "strlist", -1)
+  } else if (
+    letIsU8Array(stmtIx, fnIx)
+    && !letIsUnion(stmtIx, fnIx)
+    && !letIsNulRefArray(stmtIx, fnIx)
+  ) {
+    // Packed byte-list local (`let b: u8[] = …`) — `(ref $bl8TypeIdx)`. Sits with the
+    // scalar-list arms and carries their two gates for the same reasons.
+    slot = addLocalName(s.letName, "u8list", -1)
+  } else if (
+    letIsF32Array(stmtIx, fnIx)
+    && !letIsUnion(stmtIx, fnIx)
+    && !letIsNulRefArray(stmtIx, fnIx)
+  ) {
+    // Scalar-f32-element list local (`let xs: f32[] = …`), kind 21 — `(ref $fl32TypeIdx)`.
+    // Before the f64 case: an `f32[]` annotation over a float-literal init would else be
+    // claimed by `letIsF64Array`'s init fallback, since a `[1.5]` is `exprF64Array`.
+    slot = addLocalName(s.letName, "f32list", -1)
+  } else if (
+    letIsF64Array(stmtIx, fnIx)
+    && !letIsUnion(stmtIx, fnIx)
+    && !letIsNulRefArray(stmtIx, fnIx)
+  ) {
+    // Scalar-f64-element list local (`let xs: f64[] = …`, or a float-literal array init),
+    // kind 12 — its cell is `(ref $fl64TypeIdx)`.
+    slot = addLocalName(s.letName, "f64list", -1)
+  } else if (
+    letIsI64Array(stmtIx, fnIx)
+    && !letIsUnion(stmtIx, fnIx)
+    && !letIsNulRefArray(stmtIx, fnIx)
+  ) {
+    // Scalar-i64-element list local (`let xs: i64[] = …`), kind 20 — `(ref $il64TypeIdx)`.
+    slot = addLocalName(s.letName, "i64list", -1)
+  } else if letIsNulRefArray(stmtIx, fnIx) {
+    // A nullable ref-array local (`i32[][] | null`, kind 18), before the non-null
+    // ref-array case: its init `v[i]` over a `(<ref-array>|null)[]` would otherwise be
+    // claimed as a non-null kind 5. Stores the inner ref-list slot in `localStructIdx`.
+    slot = addLocalName(
+      s.letName,
+      "nulreflist",
+      nulRefArrayInnerSlotOfLet(stmtIx, fnIx),
+    )
+  } else if letIsRefArray(stmtIx, fnIx) && !letIsUnion(stmtIx, fnIx) {
+    // The `!letIsUnion` gate mirrors the scalar-list branches above: a union-annotated
+    // local whose init is a ref array (`const p: S[] | i64 = xs`) is a union-box local
+    // (kind 4), not a reflist local, since the init coerces into the box. Without the gate
+    // the ref-array init wins the reflist valtype and the boxed store is invalid wasm.
+    slot = addLocalName(s.letName, "reflist", letRefListSlot(stmtIx, fnIx))
+  } else if (
+    letIsNulClosure(stmtIx, fnIx)
+    || letInfersNulClosure(stmtIx, fnIx)
+  ) {
+    // A nullable function-value local (kind 19), or an un-annotated `const f = m[k]` over
+    // a function-valued map, since a bare map read is nullable. Its cell is the nullable
+    // closure fat pointer `(ref null $cloStructIdx)`. Before `letIsUnion`, which reads the
+    // `fn | null` annotation as a union name, and before the non-null closure (kind 14).
+    slot = addLocalName(s.letName, "nulclosure", -1)
+  } else if letIsVariant(stmtIx, fnIx) {
+    // A concrete union-variant local (`const c: Cat = …`), kind 8 — its cell is the
+    // variant struct ref `(ref $(uVarHeap[vi]))`. Before `letIsUnion` and `letIsStruct`:
+    // a variant name is neither the union box nor a standalone struct.
+    slot = addLocalName(s.letName, "variant", variantIndexOfLet(stmtIx, fnIx))
+  } else if letIsUnion(stmtIx, fnIx) {
+    slot = addLocalName(s.letName, "union", -1)
+  } else if letIsStruct(stmtIx, fnIx) {
+    // `letIsStruct` also matches via the init object literal's field-name set, so an
+    // un-internable inline-shape annotation still lands here — and `structIndexOfLet` then
+    // resolves to a wrong, same-field-named struct and emits its layout. Reject cleanly
+    // when the annotation shape itself could not be interned.
+    if letAnnIsUninternedShape(stmtIx) {
+      emitFail(
+        "emitProgram: binding's inline-shape type has an unsupported field",
+      )
+      return -3
+    }
+    // The local half of D51, which `criClassify`'s return rung alone cannot see: `const c
+    // = { r: n }` beside `type Shape = Circle | Sq` has no struct row for its field set,
+    // so `letIsVariant` declines and the pair `("struct", -1)` reached `fbValtype`'s
+    // guard. Gated on the `-1`, so it can only fire on a pair that is a loud reject.
+    const lsi = structIndexOfLet(stmtIx, fnIx)
+    const lov = letObjLitVariantIdx(stmtIx, fnIx)
+    if lsi < 0 && lov >= 0 {
+      slot = addLocalName(s.letName, "variant", lov)
+    } else {
+      slot = addLocalName(s.letName, "struct", lsi)
+    }
+  } else if letIsArray(stmtIx, fnIx) {
+    slot = addLocalName(s.letName, "list", -1)
+  } else if letIsNulString(stmtIx, fnIx) {
+    // Nullable string (`string | null`, kind 16), before the string case so a nullable
+    // annotation or init does not collapse to the non-null kind 3, after which a later
+    // `x = null` write would be invalid.
+    slot = addLocalName(s.letName, "nulstr", -1)
+  } else if letIsString(stmtIx, fnIx) {
+    slot = addLocalName(s.letName, "str", -1)
+  } else if letIsI64(stmtIx, fnIx) {
+    // Scalar i64 local (`let x: i64 = …`, kind 10, valtype 0x7e). Bypasses
+    // `checkLocalI32`, which rejects a non-i32 annotation; the init literal lowers as
+    // `i64.const` in `emitStmt`'s LetDecl path.
+    slot = addLocalName(s.letName, "i64", -1)
+  } else if letInfersV128(stmtIx, fnIx) {
+    // A v128 SIMD-vector local (kind `v128`, valtype 0x7b), annotated (`: F32x4`) or
+    // inferred from a vector init; `emitLetDeclStmt`'s default arm stores it with a
+    // plain `local.set`.
+    slot = addLocalName(s.letName, "v128", -1)
+  } else if letIsF32(stmtIx) || letInfersF32(stmtIx, fnIx) {
+    // Scalar f32 local (`let x: f32 = …`, kind 13, valtype 0x7d), or an un-annotated
+    // `let y = <f32 expr>` — the f32 dual of the init fallback `letIsF64` and `letIsI64`
+    // carry. An annotated float literal lowers as `f32.const`; an inferred f32 init is
+    // already an f32 value. A bare un-annotated float literal stays f64.
+    slot = addLocalName(s.letName, "f32", -1)
+  } else if letIsF64(stmtIx, fnIx) {
+    // Scalar f64 local (`let x: f64 = …`, or an un-annotated `.` literal init), kind 11,
+    // valtype 0x7c. Bypasses `checkLocalI32`; the init literal lowers as `f64.const` in
+    // `emitStmt`'s LetDecl path.
+    slot = addLocalName(s.letName, "f64", -1)
+  } else if letIsClosure(stmtIx, fnIx) {
+    // A function-value local (`const f = function(...)...` or `const g = namedFn`), kind
+    // 14 — its cell is the closure fat-pointer struct `(ref $cloStructIdx)`.
+    slot = addLocalName(s.letName, "closure", -1)
+  } else if letNulBool(stmtIx, fnIx) {
+    // `boolean | null` niche local (kind 17): the cell is a plain i32 holding 0 or 1, with
+    // the spare value 2 encoding `null`, so `fbValtype` renders it i32. A dedicated kind so
+    // `checkLocalI32` does not reject the annotation and the if-binding emit routes it to
+    // the sentinel-2 rep; a later `x = null` consults `exprNulBool`, not the slot kind.
+    slot = addLocalName(s.letName, "nulbool", -1)
+  } else {
+    if checkLocalI32(stmtIx) < 0 { return -2 }
+    slot = addLocalName(s.letName, "i32", -1)
+  }
+  slot
+}
+
 // Recursively collect the declared-local names of the block at `blockIx` into `localNames`,
 // descending into `if` branches, since a wasm local spans the whole function. Each declared
 // local's init type is validated here, so a non-i32 local fails loudly before any bytes are
@@ -3977,307 +4270,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
       preStmtNarrow(stmts[i])
       const s = P.nodes[stmts[i]]
       if s is LetDecl {
-        synthEmptyListAnn(stmts[i])
-        synthNullableAnn(stmts[i])
-        synthNarrowedReadAnn(stmts[i], fnIx)
-        synthRetPinAnn(stmts[i], fnIx)
-        // `-1` for the program root: the late run has no module scope to hand over and must not
-        // acquire one. It reaches the start function's blocks and the bodies monomorphization
-        // minted, both past the point where a caller's annotation could re-aim an instance's
-        // signature. Every binding the pre-mono pass pinned is declined by the `letType` guard.
-        synthDstPinAnn(stmts[i], fnIx, -1)
-        // An if-expression initializer whose arms declare locals is walked first, by node, and
-        // those locals are bound while the binding is classified, so an arm's tail naming one
-        // reads its slot rather than a type parameter's recorded type (D2785).
-        let initArms = 0
-        if exprArmLocalsAny { initArms = letInitArmsFirst(s.letInit, fnIx) }
-        if initArms < 0 {
-          scopePop()
-          return -1
-        }
-        // Classify the init type before binding the name, then allocate a fresh slot and bind
-        // `name → slot` so a later reference (or a shadowing inner `let`) resolves to this slot.
-        // `slot` is the new slot's declared-local position.
-        let slot = -1
-        if letIsNulNone(stmts[i], fnIx) {
-          // D1576 — a never-filled `let x = null`. The A-infer-null hole nothing assigns into
-          // is not `T | null` for any `T`: the binding's only value is `null`, so its cell is
-          // `nullref`, the GC bottom, which flows to every nullable ref destination with no
-          // coercion. First in the ladder, since several arms below claim a bare `null`.
-          slot = addLocalName(s.letName, "nulnone", -1)
-        } else if letIsLitUnion(stmts[i]) || letInitIsLitAtom(stmts[i], fnIx) {
-          // A literal-union local, annotated `: K` or un-annotated off an atom init. It is an
-          // i32-backed interned atom, not a value-union box. First, because its members register
-          // as value-union variants; and before `letIsString`, whose `string`-subtype checker
-          // type would else pick the kind-3 ref slot and store the atom into a `(ref $array)`.
-          slot = addLocalName(s.letName, "i32", -1)
-          localLitUnion[slot] = 1
-        } else if letNulLitUnion(stmts[i], fnIx) {
-          // A `K | null` niche local (kind 0, plain i32): atom ids >= 0 with the spare `-1` for
-          // null. Before `letIsNulString`, since a litunion softens to `string`. Marked
-          // `localLitUnion` so reads widen as atoms; the write path seeds `-1` for a `null`.
-          slot = addLocalName(s.letName, "i32", -1)
-          localLitUnion[slot] = 1
-        } else if letInitJoinsToUnionBox(stmts[i], fnIx) {
-          // A `??` whose nullable-ref operand JOINS with a default of another type: the result
-          // is the union box, so the slot is the box. Ahead of every arm below, which read the
-          // OPERAND's rep and would declare the niche's own ref (D1714).
-          slot = addLocalName(s.letName, "union", -1)
-        } else if letInitTyIsNarrowedArm(stmts[i], fnIx) {
-          // An un-annotated binding of a NARROWED arm (D1741): the init hands over the union
-          // box and the checker types the binding at the arm, so the cell is the arm and the
-          // binding boundary unboxes into it. Above every arm reading the init's own rep,
-          // each of which would give the cell a box every consumer then reads as the arm.
-          slot = addLocalName(
-            s.letName,
-            "variant",
-            letInitTyVariantRow(stmts[i]),
-          )
-        } else if letInitTyIsNarrowedNulArm(stmts[i], fnIx) {
-          // Its `X | null` twin (D3107): the box narrowed to a nullable arm binds the niche.
-          slot = addLocalName(
-            s.letName,
-            "nulvariant",
-            letInitTyNulArmRow(stmts[i]),
-          )
-        } else if letIsNulMap(stmts[i], fnIx) {
-          // A nullable map local (kind `nulmap`), before `letIsMap`: a nullable init or
-          // annotation must not collapse to `"map"`, whose `(ref $mapStruct)` cell cannot hold
-          // `null`. Its `localStructIdx` carries the same map shape as the non-null map.
-          slot = addLocalName(
-            s.letName,
-            "nulmap",
-            nulMapShapeOf(stmts[i], fnIx),
-          )
-        } else if letNulMapReadValKind(stmts[i], fnIx) != null {
-          // A bare `const t = m[k]` read of a list- or nested-map-valued map (`V | null`): binds
-          // the value's established nullable local kind, the same kinds a direct `V | null`
-          // annotation produces, so the narrow and read machinery lowers unchanged. Before the
-          // union-read guard and the non-null kinds, so a later narrow sees the nullable cell.
-          const nmrK = letNulMapReadValKind(stmts[i], fnIx)
-          if nmrK != null {
-            slot = addLocalName(
-              s.letName,
-              nmrK,
-              letNulMapReadSlotArg(stmts[i], fnIx),
-            )
-          }
-        } else if letNulMapReadUnionBox(stmts[i], fnIx) {
-          // A bare `const t = m[k]` read of a union-valued map (mv kind 2): `V | null` binds the
-          // established `A | B | null` rep, the shared box itself, with `null` riding as the
-          // null-tagged atom. Beside the kind-6 arm for the same ladder-order reason.
-          slot = addLocalName(s.letName, "union", -1)
-        } else if letIsMap(stmts[i], fnIx) {
-          // The kind-6 parallel slot carries the map shape: `-2` for a `Set()` binding, an mv
-          // slot for a ref-valued map, `-1` for the mono i32 map. After the bare-map-read arm,
-          // whose nested-map value is `{[string]:V} | null` and would else be claimed here as a
-          // non-null map local, storing the nullable element into a non-null cell.
-          slot = addLocalName(s.letName, "map", letMapShapeOf(stmts[i], fnIx))
-        } else if letPopUnionBoxElem(stmts[i], fnIx) {
-          // A `.pop()` / `.get(i)` over a value-union ref list: `T | null` is the box with
-          // `null` as its tag, the same rep the union-valued map read binds. Before every
-          // nullable-niche arm below, none of which claims it, and before the i32 default,
-          // which stored a `(ref null $uBox)` into an i32 cell.
-          slot = addLocalName(s.letName, "union", -1)
-        } else if letIsNulVariant(stmts[i], fnIx) {
-          // Nullable union variant (`Circle | null`, kind `nulvariant`) — the
-          // `(ref null $uVarHeap[vi])` niche. Before the `nulstruct` arm below: the two are
-          // disjoint at the producer, but a variant has no struct row for
-          // `nulRefStructIdxOfLet` to find, since `collectS` skips it.
-          slot = addLocalName(
-            s.letName,
-            "nulvariant",
-            nulVariantIdxOfLet(stmts[i], fnIx),
-          )
-        } else if letIsNulRef(stmts[i], fnIx) {
-          // Nullable struct (`S | null`, code 9): annotation first, else the initializer's
-          // nullable-returning call. Before the struct case, so a nullable init does not
-          // collapse to the non-null kind 1.
-          slot = addLocalName(
-            s.letName,
-            "nulstruct",
-            nulRefStructIdxOfLet(stmts[i], fnIx),
-          )
-        } else if letIsNulListInfer(stmts[i], fnIx) {
-          // Nullable i32 list (`i32[] | null`, kind 15), before the array case: `letIsArray`'s
-          // init fallback would otherwise claim the binding as a non-null kind 2, and a later
-          // `xs = null` write would be invalid.
-          slot = addLocalName(s.letName, "nullist", -1)
-        } else if letNulScalarListKind(stmts[i], fnIx) != null {
-          // A distinct-backing nullable scalar list local (`string[]|null`, `f64[]|null`,
-          // `i64[]|null`, `f32[]|null`): its own `(ref null $wrapper)` slot, before the non-null
-          // scalar-list arms whose init fallback would else claim a bare list value non-null.
-          const nulSLK = letNulScalarListKind(stmts[i], fnIx)
-          if nulSLK != null { slot = addLocalName(s.letName, nulSLK, -1) }
-          // The scalar-list checks gate on `!letIsUnion`: a `f64[] | string` binding whose init
-          // is a bare list literal would otherwise let `letIsF64Array`'s init fallback claim it
-          // as an f64 list instead of the value-union box. A plain `f64[]` is not a union name.
-        } else if (
-          letIsStringArray(stmts[i], fnIx)
-          && !letIsUnion(stmts[i], fnIx)
-          && !letIsNulRefArray(stmts[i], fnIx)
-        ) {
-          // The `!letIsNulRefArray` gate: a nullable union-element ref-array binding whose init
-          // is a bare string-list literal would otherwise be claimed as a plain string list by
-          // the init fallback, storing the union-box list into a string-list-wrapper local. The
-          // scalar-list siblings below carry the same gate.
-          slot = addLocalName(s.letName, "strlist", -1)
-        } else if (
-          letIsU8Array(stmts[i], fnIx)
-          && !letIsUnion(stmts[i], fnIx)
-          && !letIsNulRefArray(stmts[i], fnIx)
-        ) {
-          // Packed byte-list local (`let b: u8[] = …`) — `(ref $bl8TypeIdx)`. Sits with the
-          // scalar-list arms and carries their two gates for the same reasons.
-          slot = addLocalName(s.letName, "u8list", -1)
-        } else if (
-          letIsF32Array(stmts[i], fnIx)
-          && !letIsUnion(stmts[i], fnIx)
-          && !letIsNulRefArray(stmts[i], fnIx)
-        ) {
-          // Scalar-f32-element list local (`let xs: f32[] = …`), kind 21 — `(ref $fl32TypeIdx)`.
-          // Before the f64 case: an `f32[]` annotation over a float-literal init would else be
-          // claimed by `letIsF64Array`'s init fallback, since a `[1.5]` is `exprF64Array`.
-          slot = addLocalName(s.letName, "f32list", -1)
-        } else if (
-          letIsF64Array(stmts[i], fnIx)
-          && !letIsUnion(stmts[i], fnIx)
-          && !letIsNulRefArray(stmts[i], fnIx)
-        ) {
-          // Scalar-f64-element list local (`let xs: f64[] = …`, or a float-literal array init),
-          // kind 12 — its cell is `(ref $fl64TypeIdx)`.
-          slot = addLocalName(s.letName, "f64list", -1)
-        } else if (
-          letIsI64Array(stmts[i], fnIx)
-          && !letIsUnion(stmts[i], fnIx)
-          && !letIsNulRefArray(stmts[i], fnIx)
-        ) {
-          // Scalar-i64-element list local (`let xs: i64[] = …`), kind 20 — `(ref $il64TypeIdx)`.
-          slot = addLocalName(s.letName, "i64list", -1)
-        } else if letIsNulRefArray(stmts[i], fnIx) {
-          // A nullable ref-array local (`i32[][] | null`, kind 18), before the non-null
-          // ref-array case: its init `v[i]` over a `(<ref-array>|null)[]` would otherwise be
-          // claimed as a non-null kind 5. Stores the inner ref-list slot in `localStructIdx`.
-          slot = addLocalName(
-            s.letName,
-            "nulreflist",
-            nulRefArrayInnerSlotOfLet(stmts[i], fnIx),
-          )
-        } else if letIsRefArray(stmts[i], fnIx) && !letIsUnion(stmts[i], fnIx) {
-          // The `!letIsUnion` gate mirrors the scalar-list branches above: a union-annotated
-          // local whose init is a ref array (`const p: S[] | i64 = xs`) is a union-box local
-          // (kind 4), not a reflist local, since the init coerces into the box. Without the gate
-          // the ref-array init wins the reflist valtype and the boxed store is invalid wasm.
-          slot = addLocalName(
-            s.letName,
-            "reflist",
-            letRefListSlot(stmts[i], fnIx),
-          )
-        } else if (
-          letIsNulClosure(stmts[i], fnIx)
-          || letInfersNulClosure(stmts[i], fnIx)
-        ) {
-          // A nullable function-value local (kind 19), or an un-annotated `const f = m[k]` over
-          // a function-valued map, since a bare map read is nullable. Its cell is the nullable
-          // closure fat pointer `(ref null $cloStructIdx)`. Before `letIsUnion`, which reads the
-          // `fn | null` annotation as a union name, and before the non-null closure (kind 14).
-          slot = addLocalName(s.letName, "nulclosure", -1)
-        } else if letIsVariant(stmts[i], fnIx) {
-          // A concrete union-variant local (`const c: Cat = …`), kind 8 — its cell is the
-          // variant struct ref `(ref $(uVarHeap[vi]))`. Before `letIsUnion` and `letIsStruct`:
-          // a variant name is neither the union box nor a standalone struct.
-          slot = addLocalName(
-            s.letName,
-            "variant",
-            variantIndexOfLet(stmts[i], fnIx),
-          )
-        } else if letIsUnion(stmts[i], fnIx) {
-          slot = addLocalName(s.letName, "union", -1)
-        } else if letIsStruct(stmts[i], fnIx) {
-          // `letIsStruct` also matches via the init object literal's field-name set, so an
-          // un-internable inline-shape annotation still lands here — and `structIndexOfLet` then
-          // resolves to a wrong, same-field-named struct and emits its layout. Reject cleanly
-          // when the annotation shape itself could not be interned.
-          if letAnnIsUninternedShape(stmts[i]) {
-            return emitFail(
-              "emitProgram: binding's inline-shape type has an unsupported field",
-            )
-          }
-          // The local half of D51, which `criClassify`'s return rung alone cannot see: `const c
-          // = { r: n }` beside `type Shape = Circle | Sq` has no struct row for its field set,
-          // so `letIsVariant` declines and the pair `("struct", -1)` reached `fbValtype`'s
-          // guard. Gated on the `-1`, so it can only fire on a pair that is a loud reject.
-          const lsi = structIndexOfLet(stmts[i], fnIx)
-          const lov = letObjLitVariantIdx(stmts[i], fnIx)
-          if lsi < 0 && lov >= 0 {
-            slot = addLocalName(s.letName, "variant", lov)
-          } else {
-            slot = addLocalName(s.letName, "struct", lsi)
-          }
-        } else if letIsArray(stmts[i], fnIx) {
-          slot = addLocalName(s.letName, "list", -1)
-        } else if letIsNulString(stmts[i], fnIx) {
-          // Nullable string (`string | null`, kind 16), before the string case so a nullable
-          // annotation or init does not collapse to the non-null kind 3, after which a later
-          // `x = null` write would be invalid.
-          slot = addLocalName(s.letName, "nulstr", -1)
-        } else if letIsString(stmts[i], fnIx) {
-          slot = addLocalName(s.letName, "str", -1)
-        } else if letIsI64(stmts[i], fnIx) {
-          // Scalar i64 local (`let x: i64 = …`, kind 10, valtype 0x7e). Bypasses
-          // `checkLocalI32`, which rejects a non-i32 annotation; the init literal lowers as
-          // `i64.const` in `emitStmt`'s LetDecl path.
-          slot = addLocalName(s.letName, "i64", -1)
-        } else if letInfersV128(stmts[i], fnIx) {
-          // A v128 SIMD-vector local (kind `v128`, valtype 0x7b), annotated (`: F32x4`) or
-          // inferred from a vector init; `emitLetDeclStmt`'s default arm stores it with a
-          // plain `local.set`.
-          slot = addLocalName(s.letName, "v128", -1)
-        } else if letIsF32(stmts[i]) || letInfersF32(stmts[i], fnIx) {
-          // Scalar f32 local (`let x: f32 = …`, kind 13, valtype 0x7d), or an un-annotated
-          // `let y = <f32 expr>` — the f32 dual of the init fallback `letIsF64` and `letIsI64`
-          // carry. An annotated float literal lowers as `f32.const`; an inferred f32 init is
-          // already an f32 value. A bare un-annotated float literal stays f64.
-          slot = addLocalName(s.letName, "f32", -1)
-        } else if letIsF64(stmts[i], fnIx) {
-          // Scalar f64 local (`let x: f64 = …`, or an un-annotated `.` literal init), kind 11,
-          // valtype 0x7c. Bypasses `checkLocalI32`; the init literal lowers as `f64.const` in
-          // `emitStmt`'s LetDecl path.
-          slot = addLocalName(s.letName, "f64", -1)
-        } else if letIsClosure(stmts[i], fnIx) {
-          // A function-value local (`const f = function(...)...` or `const g = namedFn`), kind
-          // 14 — its cell is the closure fat-pointer struct `(ref $cloStructIdx)`.
-          slot = addLocalName(s.letName, "closure", -1)
-        } else if letNulBool(stmts[i], fnIx) {
-          // `boolean | null` niche local (kind 17): the cell is a plain i32 holding 0 or 1, with
-          // the spare value 2 encoding `null`, so `fbValtype` renders it i32. A dedicated kind so
-          // `checkLocalI32` does not reject the annotation and the if-binding emit routes it to
-          // the sentinel-2 rep; a later `x = null` consults `exprNulBool`, not the slot kind.
-          slot = addLocalName(s.letName, "nulbool", -1)
-        } else {
-          if checkLocalI32(stmts[i]) < 0 {
-            scopePop()
-            return -1
-          }
-          slot = addLocalName(s.letName, "i32", -1)
-        }
-        // Pin the declaration to the slot, before the arm preludes below can allocate more. In a
-        // monomorphized instance the annotation on this node is the only concrete type its body
-        // carries (`localDeclIx`), so a rep question about a read of this local has nowhere else
-        // to go.
-        markLocalDecl(slot, stmts[i])
-        if collectByNode > 0 { declSlotByNode[stmts[i]] = slot }
-        if fnIx >= 0 { markLetOverGlobal(slot, s.letName) }
-        // An if-expression initializer's arm preludes declare locals of their own. They are
-        // allocated after this binding's own slot and before its name is bound, because that is
-        // the order `emitLetDeclStmt` walks: `emitLetCursor`, then the init, then `scopeBind`.
-        if initArms == 1 {
-          scopePop()
-        } else if collectIfExprLocals(s.letInit, fnIx) < 0 {
-          scopePop()
-          return -1
-        }
-        scopeBind(s.letName, slot)
+        if collectLetLocal(stmts[i], s, fnIx) < 0 { return -1 }
       } else if s is IfStmt {
         if collectLocalsIf(stmts[i], fnIx) < 0 {
           scopePop()
@@ -5514,7 +5507,86 @@ export function rvPairOf(s: i32, vi: i32): i32 {
 // nothing, and its index globals still take the counter position they would have occupied.
 export function mAssignTypeIndices(_n: i32) {
   mResetTypeIntern()
+  mAssignStructHeaps()
+  mAssignUnionHeaps()
+  // The raw i32 array (list and map backing), then `string`'s own backing array, then the string
+  // header struct `{backing, start, len}`, then the i32-list wrapper. All three string-side
+  // indices are minted from the one `aUsed` flag, which string use and list use both force, and
+  // every string lowering already guards on it. The type section emits the triple in this order.
+  if aUsed {
+    aTypeIdx = mAllocType(TSK_I32_ARRAY, 0)
+    sBackIdx = mAllocType(TSK_STR_BACK, 0)
+    sTypeIdx = mAllocType(TSK_STR_HEADER, 0)
+  } else {
+    aTypeIdx = mNextType
+    sBackIdx = mNextType
+    sTypeIdx = mNextType
+  }
+  if lUsed {
+    lTypeIdx = mAllocType(TSK_I32_LIST, 0)
+  } else {
+    lTypeIdx = mNextType
+  }
+  const rlDistinctPairs = mAssignRefListTwins()
+  // The map struct index is needed below to resolve a map-array ref-list element, yet the map
+  // struct lands after the ref pairs and the string-list. It is computable up front from the
+  // counter: it follows the distinct ref-pair slots, two per emitted pair post-dedup, plus the
+  // two string-list slots.
+  const mStructIdxPre = mNextType + rlDistinctPairs * 2 + 2
+  mAssignRefListPairs(mStructIdxPre)
+  mAssignStrListAndMapStructs(mStructIdxPre)
+  mAssignScalarListPairs()
+  // The scalar list views (D3028), after every wrapper they subtype or keep a source of.
+  let svk = 0
+  while svk < 3 {
+    if svPairOn(svk) { svViewTy[svk] = mAllocType(TSK_SV_VIEW, svk) }
+    svk = svk + 1
+  }
+  rvAssignViews()
+  // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
+  // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
+  // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValName` (slUsed / fa64Used
+  // / ia64Used), so the index is real here.
+  let rsfix = 0
+  while rsfix < rlElemName.length {
+    if rlElemKindTbl[rsfix] == RLK_STR_LIST {
+      rlElemHeap[rsfix] = mkListIdx
+    } else if rlElemKindTbl[rsfix] == RLK_F64_LIST {
+      rlElemHeap[rsfix] = fl64TypeIdx
+    } else if rlElemKindTbl[rsfix] == RLK_F32_LIST {
+      rlElemHeap[rsfix] = fl32TypeIdx
+    } else if rlElemKindTbl[rsfix] == RLK_I64_LIST {
+      rlElemHeap[rsfix] = il64TypeIdx
+    } else if rlElemKindTbl[rsfix] == RLK_U8_LIST {
+      rlElemHeap[rsfix] = bl8TypeIdx
+    }
+    rsfix = rsfix + 1
+  }
+  mAssignClosureTypes()
+  const mvFail = mAssignMapValueStructs()
+  if mvFail < 0 { return mvFail }
+  // Second pass for the TYPED-value map ref-list elements (kind 3, deferred above): now
+  // that `mvMapTypeIdx` is minted, point each such element's heap at its own typed map
+  // struct. A mono / atom map element kept `mStructIdxPre` in the first pass (slot -1).
+  let rmf = 0
+  while rmf < rlElemName.length {
+    if rlElemKindTbl[rmf] == RLK_MAP {
+      // `canon` means the value-name leg canonicalizes (`mvCanonValName`) before its lookup: the
+      // mv table is keyed canonically, so a raw element-map name would miss the slot and leave
+      // the element heap at the shared mono map while the map's own binding uses the box-backed
+      // struct. Mirrors `mvShapeOfValName`; the arena leg folds that itself.
+      const mmv = rlMapElemValSlot(rmf, true)
+      if mmv >= 0 { rlElemHeap[rmf] = mvMapTypeIdx[mmv] }
+    }
+    rmf = rmf + 1
+  }
+  // The functypes follow; the first lands at the current counter (`typeOffset`).
+  mNextType
+}
 
+// Mint the standalone struct heap types, in `structEmitOrder`, into `sHeapIdx`; a structural
+// twin (`sTwin[i] < i`) shares its representative's index and mints nothing.
+function mAssignStructHeaps() {
   // Standalone structs occupy the first indices, one heap type per distinct structure:
   // structural twins share a slot's heap index rather than minting a fresh one, so a `B`-value
   // and an `A`-slot use the same `(ref $S)`. `sTwin[i] < i` marks slot `i` a twin of an earlier
@@ -5543,6 +5615,12 @@ export function mAssignTypeIndices(_n: i32) {
     if sTwin[stw] < stw { sHeapIdx[stw] = sHeapIdx[sTwin[stw]] }
     stw = stw + 1
   }
+  0
+}
+
+// Mint the declared unions' variant struct heaps into `uVarHeap`, then the union box and the
+// per-rep value boxes the registered value unions use. Mints nothing when no union is declared.
+function mAssignUnionHeaps() {
   // Union variant structs (one heap type per distinct variant layout), then the union box.
   // `uVarTwin[vi] < vi` marks variant `vi` a layout twin of an earlier slot — the same `sTwin`
   // discipline — so it reuses that heap index and the type-section emit skips it in lock-step.
@@ -5574,24 +5652,12 @@ export function mAssignTypeIndices(_n: i32) {
     if vbF64Used { vbF64Idx = mAllocType(TSK_VALUE_BOX, 3) }
     if vbV128Used { vbV128Idx = mAllocType(TSK_VALUE_BOX, 4) }
   }
-  // The raw i32 array (list and map backing), then `string`'s own backing array, then the string
-  // header struct `{backing, start, len}`, then the i32-list wrapper. All three string-side
-  // indices are minted from the one `aUsed` flag, which string use and list use both force, and
-  // every string lowering already guards on it. The type section emits the triple in this order.
-  if aUsed {
-    aTypeIdx = mAllocType(TSK_I32_ARRAY, 0)
-    sBackIdx = mAllocType(TSK_STR_BACK, 0)
-    sTypeIdx = mAllocType(TSK_STR_HEADER, 0)
-  } else {
-    aTypeIdx = mNextType
-    sBackIdx = mNextType
-    sTypeIdx = mNextType
-  }
-  if lUsed {
-    lTypeIdx = mAllocType(TSK_I32_LIST, 0)
-  } else {
-    lTypeIdx = mNextType
-  }
+  0
+}
+
+// Assign every ref-list slot its twin representative into `rlTwin`, from an element-heap
+// signature knowable before any pair is minted; returns the count of distinct pairs.
+function mAssignRefListTwins() {
   // Ref-list slot dedup, the `sTwin` analogue: two slots emit identical (backing, wrapper) pairs
   // exactly when they resolve to the same element heap, so after struct dedup `A[]` and `B[]`
   // must share one wrapper. `rlTwin[s]` is `s`'s representative, from a signature knowable up
@@ -5660,11 +5726,13 @@ export function mAssignTypeIndices(_n: i32) {
     if rlTwin[rdp] == rdp { rlDistinctPairs = rlDistinctPairs + 1 }
     rdp = rdp + 1
   }
-  // The map struct index is needed below to resolve a map-array ref-list element, yet the map
-  // struct lands after the ref pairs and the string-list. It is computable up front from the
-  // counter: it follows the distinct ref-pair slots, two per emitted pair post-dedup, plus the
-  // two string-list slots.
-  const mStructIdxPre = mNextType + rlDistinctPairs * 2 + 2
+  rlDistinctPairs
+}
+
+// Mint one (backing, wrapper) pair per distinct ref-list slot and fill each slot's element heap
+// that is known by now; `mStructIdxPre` is the mono map struct's precomputed index. The nested
+// scalar-list, closure and typed-map elements are left 0 for the later passes to fill.
+function mAssignRefListPairs(mStructIdxPre: i32) {
   // One (backing, wrapper) pair per DISTINCT ref-list element type, interleaved; a
   // twin (`rlTwin[rs] < rs`) reuses its representative's pair (no new heap type).
   let rs = 0
@@ -5745,6 +5813,12 @@ export function mAssignTypeIndices(_n: i32) {
     raTypeIdx = mNextType
     rlTypeIdx = mNextType
   }
+  0
+}
+
+// Mint the string-ref list pair and the string-, i32- and i64-keyed map structs, each only when
+// used; `mStructIdxPre` is the counter position the map struct lands at, precomputed by the caller.
+function mAssignStrListAndMapStructs(mStructIdxPre: i32) {
   // The string-ref list (keys backing + keys wrapper), shared by the map's keys
   // list AND any `string[]` field (present when `slUsed || mUsed`).
   if slUsed || mUsed {
@@ -5777,6 +5851,12 @@ export function mAssignTypeIndices(_n: i32) {
   } else {
     mStructI64Idx = mStructIdx
   }
+  0
+}
+
+// Mint the f64, i64, f32 and `u8` (backing, wrapper) list pairs, each only when used; an
+// unused pair aliases the next two counter positions and mints nothing.
+function mAssignScalarListPairs() {
   // The f64 array and list-wrapper pair, interned last among the heap types so no existing index
   // shifts: the `(array (mut f64))` backing first, then its `{backing,len,cap}` wrapper struct,
   // which references the backing. Present only when `fa64Used`.
@@ -5818,32 +5898,12 @@ export function mAssignTypeIndices(_n: i32) {
     ba8TypeIdx = mNextType
     bl8TypeIdx = mNextType + 1
   }
-  // The scalar list views (D3028), after every wrapper they subtype or keep a source of.
-  let svk = 0
-  while svk < 3 {
-    if svPairOn(svk) { svViewTy[svk] = mAllocType(TSK_SV_VIEW, svk) }
-    svk = svk + 1
-  }
-  rvAssignViews()
-  // Second pass: fill the NON-i32 nested-list ref-list element heaps now that the inner
-  // string/f64/i64 list wrappers exist (a `string[]`/`f64[]`/`i64[]`-VALUED map's vals
-  // ref-list — kinds 6/7/8). The wrappers are forced by `mvShapeOfValName` (slUsed / fa64Used
-  // / ia64Used), so the index is real here.
-  let rsfix = 0
-  while rsfix < rlElemName.length {
-    if rlElemKindTbl[rsfix] == RLK_STR_LIST {
-      rlElemHeap[rsfix] = mkListIdx
-    } else if rlElemKindTbl[rsfix] == RLK_F64_LIST {
-      rlElemHeap[rsfix] = fl64TypeIdx
-    } else if rlElemKindTbl[rsfix] == RLK_F32_LIST {
-      rlElemHeap[rsfix] = fl32TypeIdx
-    } else if rlElemKindTbl[rsfix] == RLK_I64_LIST {
-      rlElemHeap[rsfix] = il64TypeIdx
-    } else if rlElemKindTbl[rsfix] == RLK_U8_LIST {
-      rlElemHeap[rsfix] = bl8TypeIdx
-    }
-    rsfix = rsfix + 1
-  }
+  0
+}
+
+// Mint the closure fat-pointer struct, one `$fnsig` per value-call signature and one env struct
+// per capturing lifted function into `fnEnvIdx` (-1 for a non-capturing one), when `fnValUsed`.
+function mAssignClosureTypes() {
   // The function-value closure types, interned last among the heap types so no existing index
   // shifts: the closure fat-pointer struct `{ code: (ref $fnsig), env: structref }` first, then
   // the env-leading functype `$fnsig`, mutually recursive in one rec group. Then one env struct
@@ -5883,6 +5943,12 @@ export function mAssignTypeIndices(_n: i32) {
     cloStructIdx = mNextType
     cloSigBase = mNextType + 1
   }
+  0
+}
+
+// Mint one ref-valued map struct per distinct value layout into `mvMapTypeIdx`, a layout twin
+// sharing its representative's; returns 0, or -1 (via `emitFail`) when two twins disagree.
+function mAssignMapValueStructs() {
   // The ref-valued map structs, one 7-field struct per distinct value layout, interned last so
   // no existing index shifts. Slot dedup: the struct's only varying field is the vals-list
   // wrapper, so two slots whose value types are layout twins emit the same bytes and must share
@@ -5912,23 +5978,7 @@ export function mAssignTypeIndices(_n: i32) {
     }
     mvi = mvi + 1
   }
-  // Second pass for the TYPED-value map ref-list elements (kind 3, deferred above): now
-  // that `mvMapTypeIdx` is minted, point each such element's heap at its own typed map
-  // struct. A mono / atom map element kept `mStructIdxPre` in the first pass (slot -1).
-  let rmf = 0
-  while rmf < rlElemName.length {
-    if rlElemKindTbl[rmf] == RLK_MAP {
-      // `canon` means the value-name leg canonicalizes (`mvCanonValName`) before its lookup: the
-      // mv table is keyed canonically, so a raw element-map name would miss the slot and leave
-      // the element heap at the shared mono map while the map's own binding uses the box-backed
-      // struct. Mirrors `mvShapeOfValName`; the arena leg folds that itself.
-      const mmv = rlMapElemValSlot(rmf, true)
-      if mmv >= 0 { rlElemHeap[rmf] = mvMapTypeIdx[mmv] }
-    }
-    rmf = rmf + 1
-  }
-  // The functypes follow; the first lands at the current counter (`typeOffset`).
-  mNextType
+  0
 }
 
 // Whether an annotation spelling that mentions an i32-keyed map is one the emitter can lower:
@@ -12332,7 +12382,7 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   unTyIx.push(mintTyIx)
   unKeyPush(canonUnionKeyOfName(name)) // D-UNIONKEY: obtained from canon, never rendered
   unDeclIx.push(-1) // inline union: no declaration node
-  unMemberSetPush(name)
+  unMemberSet.push(name)
   recordUnMemTys(name) // D-UNION foundation
   // The member list below is the row just recorded, not a second split of `name`:
   // `recordUnMemTys` already split it once, so this just reads the tail it appended.
@@ -13168,6 +13218,96 @@ export function collectU(stmts: i32[]) {
   // The first emit pass, so this is the first thing in the emitter that would walk a
   // declared type — reject the ones no renderer can finish before any of them tries.
   if guardFiniteUserTypes() < 0 { return -1 }
+  collectUReset()
+  let i = 0
+  while i < stmts.length {
+    // D1519 — the declaration cursor `emitFail` anchors refusals at, since this pass runs before
+    // any function body arms one; a failure freezes it, so early returns cannot leak a stale anchor.
+    emitCurStmtIx = stmts[i]
+    const s = P.nodes[stmts[i]]
+    if s is UnionDecl {
+      if collectDeclaredUnion(stmts, stmts[i], s) < 0 { return -1 }
+    }
+    i = i + 1
+  }
+  // Inline union annotations carry no `UnionDecl`; registers each as a synthetic alias so
+  // every name-keyed lookup treats it like a named one. Runs after `UnionDecl`, before `assignTags`.
+  if collectInlineUnions(stmts) < 0 { return -1 }
+  if collectInferredUnions(stmts) < 0 { return -1 }
+  // Inferred array-element unions: an un-annotated array literal spells its element union
+  // nowhere, so without this the row is never minted.
+  let iau = 0
+  while iau < P.nodes.length {
+    const an = P.nodes[iau]
+    if an is ArrayLit {
+      const aeu = arrLitInferUnionElemName(iau)
+      if aeu != "" {
+        const aety = arrLitElemTyIxOf(iau)
+        if !(isUNameAB(24, aeu, aety) && unNameAdoptKeyRow(aeu, aety)) {
+          if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
+          if registerInlineUnionAt(stmts, aeu, 45, -1) < 0 { return -1 }
+        }
+      }
+      // The NULLABLE spelling of the same box. `i32 | null` is recorded as `TyNullable`, so
+      // the union rung above declines and an UN-ANNOTATED literal gets no row at all, while
+      // the annotated `(i32 | null)[]` mints one through its annotation. Same producer the
+      // `.pop`/`.get` loop below uses, which is why those two spellings already registered it (D1830).
+      const anu = nulNumScalarUnionName(arrLitElemTyIxOf(iau))
+      if anu != "" { registerValueUnionName(anu) }
+    }
+    iau = iau + 1
+  }
+  // A numeric-scalar `.pop()` has the same missing-row shape: `xs.pop()` is `T | null` with
+  // no niche to hide absence in, so without this the box is never interned (D1174).
+  let ipu = 0
+  while ipu < P.nodes.length {
+    const pn = P.nodes[ipu]
+    if pn is Call {
+      const pcf = P.nodes[pn.callFn]
+      if pcf is Member {
+        // `.get(i)` is the same unspoken box (D1281): the checker types the checked
+        // read `T | null` at both members, and neither spells the union anywhere.
+        if pcf.memProp == "pop" || pcf.memProp == "get" {
+          const pun = nulNumScalarUnionName(nodeTyIxOf(ipu))
+          if pun != "" { registerValueUnionName(pun) }
+        }
+      }
+    }
+    // D1250 — an if-expression `??` operand is a second producer of an unspoken solo box, keyed
+    // on the `??` (not the `if`, whose statement form also types nullable but has no consumer).
+    if pn is BinExpr {
+      if pn.binOp == "??" {
+        const lin = P.nodes[unwrapParen(pn.binLeft)]
+        if lin is IfStmt {
+          const iun = nulNumScalarUnionName(nodeTyIxOf(unwrapParen(pn.binLeft)))
+          if iun != "" { registerValueUnionName(iun) }
+        }
+        // A `??` that joins into a value union (`x ?? 2.5` over `i64 | null`) spells that union
+        // nowhere, and a consumer with no annotation of its own reads the box (D3513).
+        const cty = nodeTyIxOf(ipu)
+        if cty >= 0 && T.tys[cty] is TyUnion && isValueUnionTyOr(cty) == 1 {
+          if collectTyReachRegister(stmts, cty, 16, false) < 0 { return -1 }
+        }
+      }
+    }
+    // A standalone `?.` over a non-null scalar field is `T | null`, spelled nowhere (D3513).
+    if pn is OptMember {
+      const oun = nulNumScalarUnionName(nodeTyIxOf(ipu))
+      if oun != "" { registerValueUnionName(oun) }
+    }
+    ipu = ipu + 1
+  }
+  emitCurStmtIx = -1
+  if uDeclared {
+    if assignTags() < 0 { return -1 }
+  }
+  0
+}
+
+// Clear every union-registry table and value-box flag `collectU` fills, so this program's
+// registration starts from nothing a previous program left behind; only the i64 and f64 boxes
+// a retag widening asks for start used.
+function collectUReset() {
   uDeclared = false
   vbI32Used = false
   vbI64Used = false
@@ -13193,7 +13333,6 @@ export function collectU(stmts: i32[]) {
   unKeyFirstRow = []
   unDeclIx = []
   unMemberSet = []
-  unRowByMemberSid = []
   unMemTyStart = []
   unMemTyCount = []
   unMemTys = []
@@ -13214,113 +13353,106 @@ export function collectU(stmts: i32[]) {
   uFieldElemKeyKind = []
   variantSigMemoDrop()
   objVariantIndexDrop()
-  let i = 0
-  while i < stmts.length {
-    // D1519 — the declaration cursor `emitFail` anchors refusals at, since this pass runs before
-    // any function body arms one; a failure freezes it, so early returns cannot leak a stale anchor.
-    emitCurStmtIx = stmts[i]
-    const s = P.nodes[stmts[i]]
-    if s is UnionDecl {
-      // A struct-alias union (single inline-shape variant) is a named struct, not a union:
-      // `collectS` interns it; skip it here.
-      if unionStructAliasShape(s.udVariants) != "" {
-        i = i + 1
-        continue
-      }
-      // A transparent one-member alias denotes its member, not a union (#1122's ruling), so it
-      // gets no row here: minting one pushed the member's name into `uVariants` a second time.
-      if isTransparentAlias(s.udName) {
-        i = i + 1
-        continue
-      }
-      // Nor does an alias whose lists all spell one list: it denotes that list (D4743).
-      if oneListUnionAliasName(s.udName) != "" {
-        i = i + 1
-        continue
-      }
-      uDeclared = true
-      const vs = s.udVariants
-      if vs.length < 1 {
-        return emitFail("emitProgram: union must have at least one variant")
-      }
-      // Field unions of the arms register first, so they push their own rows before this union's
-      // slice; arena-rooted since a named union carries no annotation node (`rootUnionDeclMembers`).
-      if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
-      unNamesPush(s.udName)
-      unTyIx.push(declTyIxOfName(s.udName)) // B-1 step 1
-      unDeclIx.push(stmts[i]) // the DECLARATION node — a nominal id that is not a string
-      // D1028 — a union-alias member (`Json` in `type JR = Json | E`) flattens here too, or its
-      // own members are absent from the row and delivered raw; a litunion alias is not expanded.
-      let udSet = ""
-      let usj = 0
-      while usj < vs.length {
-        let udMem = vs[usj]
-        // Asked of the arena row (knows both numeric and string litunion bases); only a multi-atom
-        // expansion is taken (a litunion alias renders as one atom), and never deduped (box-tag ABI).
-        const udExp = unionAliasMembers(udMem)
-        if udExp != "" {
-          const udExpAtoms: string[] = []
-          splitUnionAtoms(udExp, udExpAtoms)
-          if udExpAtoms.length > 1 { udMem = udExp }
-        }
-        // A function-type member keeps its grouping parens in the join, as the inline union's
-        // name does: bare, `(i32)=>i32|string` reads as one arrow returning `i32|string`.
-        if nameIsFuncTypeAtom(udMem) && peelGroupParens(udMem) == udMem {
-          udMem = "(" + udMem + ")"
-        }
-        if udSet != "" { udSet = udSet + "|" }
-        udSet = udSet + udMem
-        usj = usj + 1
-      }
-      unMemberSetPush(udSet)
-      // Keyed on the set this row actually records, not the alias name — the row's tag slice
-      // is positional over `udSet`, which a query must reproduce to name this row.
-      unKeyPush(canonUnionKeyOfName(udSet))
-      // The alias's own key finds the row too: canon unrolls a self-referential arm in `udSet`,
-      // which then keys apart from the name (D4615).
-      unKeyAliasRow(canonUnionKeyOfName(s.udName), unKey.length - 1)
-      recordUnMemTys(udSet) // D-UNION foundation
-      unVarStart.push(uVariants.length)
-      // Only struct variants get a variant struct + fields; an atom member of a mixed union
-      // boxes through the shared value boxes instead, as the inline-annotation path does.
-      let nStructs = 0
-      let nc = 0
-      while nc < vs.length {
-        if vs[nc] != "null" {
-          if isStructAtom(stmts, vs[nc]) { nStructs = nStructs + 1 }
-        }
-        nc = nc + 1
-      }
-      unVarCount.push(nStructs)
-      let vi = 0
-      while vi < vs.length {
-        if vs[vi] != "null" {
-          if isStructAtom(stmts, vs[vi]) {
-            uVariantsPush(vs[vi])
-            uVarTyIx.push(declTyIxOfName(vs[vi]))
-            if collectVariantFields(stmts, vs[vi]) < 0 { return -1 }
-          }
-        }
-        vi = vi + 1
-      }
-      // A one-member declaration over an inline union shares that union's slice (D1492).
-      if vs.length == 1 && nStructs == 0 {
-        unVarSliceAdoptKeySibling(unNames.length - 1)
-      }
-      // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
-      // all-struct union).
-      markValueUnionAtoms(udSet)
-      // A ref-array arm of a named union interns its element shape + reflist slot, the same as
-      // the inline path — so the two spellings register identically.
-      markRefArrayArms(udSet)
-      // A map arm of a named union interns its value shape too, matching the inline path.
-      markMapUnionArms(udSet)
-    }
-    i = i + 1
+  0
+}
+
+// Register the declared union `s` (at statement `stmtIx`): its row, member set and key, its
+// struct variants and their fields, and the value boxes, ref-array and map arms its members
+// need. A struct alias or an alias that denotes one member or one list gets no row. Returns 0,
+// or -1 (via `emitFail`).
+function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
+  // A struct-alias union (single inline-shape variant) is a named struct, not a union:
+  // `collectS` interns it; skip it here.
+  if unionStructAliasShape(s.udVariants) != "" { return 0 }
+  // A transparent one-member alias denotes its member, not a union (#1122's ruling), so it
+  // gets no row here: minting one pushed the member's name into `uVariants` a second time.
+  if isTransparentAlias(s.udName) { return 0 }
+  // Nor does an alias whose lists all spell one list: it denotes that list (D4743).
+  if oneListUnionAliasName(s.udName) != "" { return 0 }
+  uDeclared = true
+  const vs = s.udVariants
+  if vs.length < 1 {
+    return emitFail("emitProgram: union must have at least one variant")
   }
-  // Inline union annotations carry no `UnionDecl`; registers each as a synthetic alias so
-  // every name-keyed lookup treats it like a named one. Runs after `UnionDecl`, before `assignTags`.
-  if collectInlineUnions(stmts) < 0 { return -1 }
+  // Field unions of the arms register first, so they push their own rows before this union's
+  // slice; arena-rooted since a named union carries no annotation node (`rootUnionDeclMembers`).
+  if rootUnionDeclMembers(stmts, s.udName) < 0 { return -1 }
+  unNamesPush(s.udName)
+  unTyIx.push(declTyIxOfName(s.udName)) // B-1 step 1
+  unDeclIx.push(stmtIx) // the DECLARATION node — a nominal id that is not a string
+  // D1028 — a union-alias member (`Json` in `type JR = Json | E`) flattens here too, or its
+  // own members are absent from the row and delivered raw; a litunion alias is not expanded.
+  let udSet = ""
+  let usj = 0
+  while usj < vs.length {
+    let udMem = vs[usj]
+    // Asked of the arena row (knows both numeric and string litunion bases); only a multi-atom
+    // expansion is taken (a litunion alias renders as one atom), and never deduped (box-tag ABI).
+    const udExp = unionAliasMembers(udMem)
+    if udExp != "" {
+      const udExpAtoms: string[] = []
+      splitUnionAtoms(udExp, udExpAtoms)
+      if udExpAtoms.length > 1 { udMem = udExp }
+    }
+    // A function-type member keeps its grouping parens in the join, as the inline union's
+    // name does: bare, `(i32)=>i32|string` reads as one arrow returning `i32|string`.
+    if nameIsFuncTypeAtom(udMem) && peelGroupParens(udMem) == udMem {
+      udMem = "(" + udMem + ")"
+    }
+    if udSet != "" { udSet = udSet + "|" }
+    udSet = udSet + udMem
+    usj = usj + 1
+  }
+  unMemberSet.push(udSet)
+  // Keyed on the set this row actually records, not the alias name — the row's tag slice
+  // is positional over `udSet`, which a query must reproduce to name this row.
+  unKeyPush(canonUnionKeyOfName(udSet))
+  // The alias's own key finds the row too: canon unrolls a self-referential arm in `udSet`,
+  // which then keys apart from the name (D4615).
+  unKeyAliasRow(canonUnionKeyOfName(s.udName), unKey.length - 1)
+  recordUnMemTys(udSet) // D-UNION foundation
+  unVarStart.push(uVariants.length)
+  // Only struct variants get a variant struct + fields; an atom member of a mixed union
+  // boxes through the shared value boxes instead, as the inline-annotation path does.
+  let nStructs = 0
+  let nc = 0
+  while nc < vs.length {
+    if vs[nc] != "null" {
+      if isStructAtom(stmts, vs[nc]) { nStructs = nStructs + 1 }
+    }
+    nc = nc + 1
+  }
+  unVarCount.push(nStructs)
+  let vi = 0
+  while vi < vs.length {
+    if vs[vi] != "null" {
+      if isStructAtom(stmts, vs[vi]) {
+        uVariantsPush(vs[vi])
+        uVarTyIx.push(declTyIxOfName(vs[vi]))
+        if collectVariantFields(stmts, vs[vi]) < 0 { return -1 }
+      }
+    }
+    vi = vi + 1
+  }
+  // A one-member declaration over an inline union shares that union's slice (D1492).
+  if vs.length == 1 && nStructs == 0 {
+    unVarSliceAdoptKeySibling(unNames.length - 1)
+  }
+  // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
+  // all-struct union).
+  markValueUnionAtoms(udSet)
+  // A ref-array arm of a named union interns its element shape + reflist slot, the same as
+  // the inline path — so the two spellings register identically.
+  markRefArrayArms(udSet)
+  // A map arm of a named union interns its value shape too, matching the inline path.
+  markMapUnionArms(udSet)
+  0
+}
+
+// Register the unions no declaration or annotation statement spells: a lambda's, an inferred
+// return's or binding's, an inline join's and an optional call's (`collectU` then mints the boxes
+// of array literals, `.pop`/`.get`, `??` and `?.`). Returns 0, or -1 (via `emitFail`).
+function collectInferredUnions(stmts: i32[]) {
   // A lambda sits in an expression, which the statement walk does not enter, so its
   // parameters, result and body register here, as a declared function's do (D3075).
   let li = 0
@@ -13390,73 +13522,6 @@ export function collectU(stmts: i32[]) {
       registerValueUnionNameAB(47, ocName, nodeTyIxOf(optCallRetNodeAt(ocu)))
     }
     ocu = ocu + 1
-  }
-  // Inferred array-element unions (the literal twin of the two loops above): an un-annotated
-  // array literal spells its element union nowhere, so without this the row is never minted.
-  let iau = 0
-  while iau < P.nodes.length {
-    const an = P.nodes[iau]
-    if an is ArrayLit {
-      const aeu = arrLitInferUnionElemName(iau)
-      if aeu != "" {
-        const aety = arrLitElemTyIxOf(iau)
-        if !(isUNameAB(24, aeu, aety) && unNameAdoptKeyRow(aeu, aety)) {
-          if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
-          if registerInlineUnionAt(stmts, aeu, 45, -1) < 0 { return -1 }
-        }
-      }
-      // The NULLABLE spelling of the same box. `i32 | null` is recorded as `TyNullable`, so
-      // the union rung above declines and an UN-ANNOTATED literal gets no row at all, while
-      // the annotated `(i32 | null)[]` mints one through its annotation. Same producer the
-      // `.pop`/`.get` loop below uses, which is why those two spellings already registered it (D1830).
-      const anu = nulNumScalarUnionName(arrLitElemTyIxOf(iau))
-      if anu != "" { registerValueUnionName(anu) }
-    }
-    iau = iau + 1
-  }
-  // A numeric-scalar `.pop()` has the same missing-row shape: `xs.pop()` is `T | null` with
-  // no niche to hide absence in, so without this the box is never interned (D1174).
-  let ipu = 0
-  while ipu < P.nodes.length {
-    const pn = P.nodes[ipu]
-    if pn is Call {
-      const pcf = P.nodes[pn.callFn]
-      if pcf is Member {
-        // `.get(i)` is the same unspoken box (D1281): the checker types the checked
-        // read `T | null` at both members, and neither spells the union anywhere.
-        if pcf.memProp == "pop" || pcf.memProp == "get" {
-          const pun = nulNumScalarUnionName(nodeTyIxOf(ipu))
-          if pun != "" { registerValueUnionName(pun) }
-        }
-      }
-    }
-    // D1250 — an if-expression `??` operand is a second producer of an unspoken solo box, keyed
-    // on the `??` (not the `if`, whose statement form also types nullable but has no consumer).
-    if pn is BinExpr {
-      if pn.binOp == "??" {
-        const lin = P.nodes[unwrapParen(pn.binLeft)]
-        if lin is IfStmt {
-          const iun = nulNumScalarUnionName(nodeTyIxOf(unwrapParen(pn.binLeft)))
-          if iun != "" { registerValueUnionName(iun) }
-        }
-        // A `??` that joins into a value union (`x ?? 2.5` over `i64 | null`) spells that union
-        // nowhere, and a consumer with no annotation of its own reads the box (D3513).
-        const cty = nodeTyIxOf(ipu)
-        if cty >= 0 && T.tys[cty] is TyUnion && isValueUnionTyOr(cty) == 1 {
-          if collectTyReachRegister(stmts, cty, 16, false) < 0 { return -1 }
-        }
-      }
-    }
-    // A standalone `?.` over a non-null scalar field is `T | null`, spelled nowhere (D3513).
-    if pn is OptMember {
-      const oun = nulNumScalarUnionName(nodeTyIxOf(ipu))
-      if oun != "" { registerValueUnionName(oun) }
-    }
-    ipu = ipu + 1
-  }
-  emitCurStmtIx = -1
-  if uDeclared {
-    if assignTags() < 0 { return -1 }
   }
   0
 }
