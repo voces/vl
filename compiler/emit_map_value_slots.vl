@@ -1,0 +1,644 @@
+// `emit_map_value_slots.vl` — a map value's null, niche and annotation slots: whether
+// a map-value union bears null and which slot its inner value takes.
+
+import { nodeTyIxOf } from "./check_node_tys"
+import { valueAtomKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+} from "./check_types"
+import { sScanLim, structIndexByName, structIndexOfTy } from "./emit_atom_kinds"
+import {
+  mapNameKeyKind,
+  nameIsBareMap,
+  nullablePartOf,
+  removeAtomFrom,
+} from "./emit_base"
+import { mvSlotOfValTyK } from "./emit_mv_slots"
+import { variantIndexOf } from "./emit_narrow_slots"
+import {
+  repCanonId,
+  repNameCanonId,
+  repRowOfTyStruct,
+  tyIsI32LeafElem,
+  tyIsStrLeafElem,
+  tyMapKeyKind,
+} from "./emit_rep"
+import {
+  MVK_UNION,
+  annRlNul,
+  annRlSlot,
+  arrLitCommitName,
+  mvValKind,
+  mvValName,
+  mvValTyIx,
+  rlElemName,
+} from "./emit_state"
+import { rlElemTyIxAt, rlSlotOfTy } from "./emit_struct_order"
+import {
+  boolTagElemKind,
+  unionHasAtomTy,
+  unionSetHasNull,
+} from "./emit_union_registry"
+import { splitUnionAtoms } from "./tyname"
+
+// True when a boxed value-union map slot's value is exactly `scalar | null`: the fused
+// `m[k] ?? d` coalesce peels it to the raw unboxed scalar rather than a union box, so the
+// `??` result classifies as that scalar. A multi-member `A | B | null` stays a boxed union.
+export function mvUnionIsScalarNull(slot: i32) {
+  if slot < 0 { return false }
+  if mvValKind[slot] != MVK_UNION { return false }
+  const ar = mvValUnionScalarNullAt(slot)
+  if ar >= 0 { return ar == 1 }
+  const vn = mvValName[slot]
+  if !unionSetHasNull(vn) { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(vn, atoms)
+  if atoms.length != 2 { return false }
+  // Not migrated onto the set ADT: this tail sits behind the arena chokepoint
+  // `mvValUnionScalarNullAt` and a two-member gate, with no witness to verify a migration
+  // against, so it keeps the string surgery.
+  const ak = valueAtomKind(removeAtomFrom(vn, "null"))
+  ak >= 0 && ak != 2 && ak != 6
+}
+
+// ── the render-and-reparse round trip: is this node typed as a function ───────
+// `nodeTyName` renders the node's recorded arena type and consumers took that render apart
+// with a top-level `=>` scan. The dual is exact for every render it can produce — a `TyArray`
+// parenthesizes a `TyFunc` element — so `typecheck.nodeTyIsFunc` is the one home.
+
+// `refArrElemName`'s structural dual over a ref-list element type: peel one `TyNullable` hop,
+// the `(S[] | null)[]` niche the name path recurses through, then take the `TyArray`'s
+// element. -1 when the element is not an array, where the name path also declines.
+export function tyRefArrElemOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if t is TyNullable { b = t.nInner }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyArray { return bt.aElem }
+  -1
+}
+
+// The ref-list slot of a nested ref-list element's inner list — the arena reading of
+// `rlSlotByName(refArrElemName(rlElemName[slot]))`. -1 when the sidecar does not cover the
+// slot, the element is not an array, or no slot claims the element type; the caller then
+// keeps its name path.
+export function rlInnerSlotOfElem(slot: i32): i32 {
+  rlSlotOfTy(tyRefArrElemOf(rlElemTyIxAt(slot)))
+}
+
+// ── the ref-array annotation-node chokepoints ─────────────────────────────────
+// The consumers ask which ref-list row holds an annotation's element — intern state, not shape
+// — and whether it is a ref array, which that row existing answers. Deliberately not the
+// structural test, since `nameIsRefArray` also requires the element be nameable by the layer.
+
+// `1` when the type-annotation node's recorded arena type is a `TyNullable`, `0` when it is
+// not, `-1` when the checker recorded no type for the node. The tri-state keeps uncovered
+// distinguishable from not-nullable, so a caller never reads a missing row as a positive.
+function annTyNulFlag(tyNodeIx: i32): i32 {
+  if tyNodeIx < 0 { return -1 }
+  const ty = nodeTyIxOf(tyNodeIx)
+  // A node the checker never typed falls to the intern sidecar's flag, which the ref-array
+  // arm records from the very spelling the name path would peel.
+  if ty < 0 { return annRlNulAt(tyNodeIx) }
+  const t = T.tys[ty]
+  if t is TyNullable { return 1 }
+  0
+}
+
+// ── the intern-pass annotation-node sidecar ───────────────────────────────────
+// `collectA` resolves every ref-array annotation spelling into the ref-list table, and the row
+// it interns is the row every annotation-node consumer asks for, so banking it per node turns
+// their question into a lookup. The later annotation syntheses record here at their own sites.
+export function recordAnnRlSlot(nodeIx: i32, slot: i32, nul: i32) {
+  if nodeIx < 0 { return 0 }
+  if slot < 0 { return 0 }
+  while annRlSlot.length <= nodeIx {
+    annRlSlot.push(-1)
+    annRlNul.push(-1)
+  }
+  annRlSlot[nodeIx] = slot
+  annRlNul[nodeIx] = nul
+  0
+}
+
+// The element type-name the array literal at `nodeIx` has committed to through its first
+// element's own annotation, or "" (D163). Written once, with scope, by `scanArrLitCommit`, and
+// read by all three ref-list classifiers so they answer alike at the scope-less collect walk
+// and at the scope-carrying emit.
+export function recordArrLitCommitName(nodeIx: i32, name: string) {
+  if nodeIx < 0 { return 0 }
+  if name == "" { return 0 }
+  while arrLitCommitName.length <= nodeIx { arrLitCommitName.push("") }
+  arrLitCommitName[nodeIx] = name
+  0
+}
+
+export function arrLitCommitNameAt(nodeIx: i32): string {
+  if nodeIx < 0 { return "" }
+  if nodeIx >= arrLitCommitName.length { return "" }
+  arrLitCommitName[nodeIx]
+}
+
+// The ref-list row the intern pass recorded for annotation node `nodeIx`, or -1.
+function annRlSlotAt(nodeIx: i32): i32 {
+  if nodeIx < 0 { return -1 }
+  if nodeIx >= annRlSlot.length { return -1 }
+  annRlSlot[nodeIx]
+}
+
+// The intern pass's `| null` flag for annotation node `nodeIx` (`1` a nullable ref
+// array, `0` a bare one), or -1 when the node is not a recorded ref-array annotation.
+function annRlNulAt(nodeIx: i32): i32 {
+  if nodeIx < 0 { return -1 }
+  if nodeIx >= annRlNul.length { return -1 }
+  annRlNul[nodeIx]
+}
+
+// The ref-list table slot of the ref-array type a type-annotation node names — the arena
+// reading of `rlSlotByName(refArrElemName(<the node's rendered name>))`. `tyRefArrElemOf`
+// peels the same single `| null` hop the name path peels, so a `S[] | null` annotation
+// resolves the same inner row. -1 when no recorded type, not an array, or no row claims it.
+export function annRefArrSlot(tyNodeIx: i32): i32 {
+  if tyNodeIx < 0 { return -1 }
+  const a = rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(tyNodeIx)))
+  if a >= 0 { return a }
+  // The intern-pass sidecar: the row `collectA` interned for this node. Covers what the
+  // recorded type cannot — a node the checker never typed, and an element the reflist layer
+  // keys by a synthetic name no arena key can match.
+  annRlSlotAt(tyNodeIx)
+}
+
+// `annRefArrSlot` restricted to a non-nullable annotation. The consumers that ask
+// `nameIsRefArray` of the whole annotation get no for a `S[] | null` spelling, since the name
+// predicate does not peel a top-level `| null`, so their arena leg must decline it too —
+// without this gate `tyRefArrElemOf`'s nullable hop would answer where the name says no.
+export function annBareRefArrSlot(tyNodeIx: i32): i32 {
+  if annTyNulFlag(tyNodeIx) != 0 { return -1 }
+  annRefArrSlot(tyNodeIx)
+}
+
+// `annRefArrSlot` restricted to a nullable annotation (`<ref-array> | null`) — the dual of
+// `annBareRefArrSlot`. The consumers that peel `nullablePartOf` first and decline a non-null
+// spelling outright need the same restriction on the arena leg.
+export function annNulRefArrSlot(tyNodeIx: i32): i32 {
+  if annTyNulFlag(tyNodeIx) != 1 { return -1 }
+  annRefArrSlot(tyNodeIx)
+}
+
+// `structIdxOfElemName`'s structural dual: the struct-table row of a ref-list element type,
+// peeling the `| null` niche exactly as the name path does before resolving. -1 when uncovered
+// or not a declared row, where the caller keeps its name path.
+export function structIdxOfElemTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if t is TyNullable { b = t.nInner }
+  structIndexOfTy(b)
+}
+
+// The struct-table row of a ref-list slot's element, off the arena sidecar.
+export function rlElemStructIdxAt(slot: i32): i32 {
+  structIdxOfElemTy(rlElemTyIxAt(slot))
+}
+
+// The recorded element type of ref-list slot `slot` with its `| null` niche peeled —
+// the arena reading of `nullablePartOf(rlElemName[slot])`, and the input the canon-key
+// row rung keys on. -1 when the sidecar does not cover the slot.
+export function rlElemNonNulTyAt(slot: i32): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  ty
+}
+
+// Tri-state dual of `nullablePartOf(rlElemName[slot]) != ""`: `1` the element type
+// is a `TyNullable`, `0` it is not, `-1` the sidecar does not cover the slot — the
+// caller then keeps its name test, so the arena never answers where it cannot.
+function rlElemTyNullableAt(slot: i32): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return 1 }
+  0
+}
+
+// The interned ref-list slot of union member `m`'s ref-array arm — the arena reading of the
+// four arm scanners' shared per-atom step. It asks the intern-state question directly: does
+// the ref-list table hold a row for this member's element type, which is what all four
+// consumers want. A bare-scalar array member cannot answer, a row's element never being one.
+export function unMemRefArrArmSlot(m: i32): i32 {
+  rlSlotOfTy(tyRefArrElemOf(m))
+}
+
+// The array-literal element's struct row: the same arena leg, with the nominal
+// `structIndexByName` as the fall-through. Its answer seeds `pendingStructIdx`, whose job is to
+// override a field-shape match, so it must not be produced by one; a `-1` also routes on to
+// the concrete-variant lookup (D1859).
+export function rlElemLitStructRow(slot: i32): i32 {
+  const ar = rlElemStructIdxAt(slot)
+  if ar >= 0 { return ar }
+  const ln = nonNulBaseOf(rlElemName[slot])
+  const bn = structIndexByName(ln)
+  if bn >= 0 || variantIndexOf(ln) >= 0 { return bn }
+  // An inline record element: its literal's `#anon` row recorded another arena index of the
+  // same type, which the canonical identity matches, never a field-shape guess (D4721).
+  repRowOfTyStruct(rlElemNonNulTyAt(slot), sScanLim())
+}
+
+// Whether a ref-list slot's element is a nullable niche: the arena test
+// (`T.tys[..] is TyNullable`) first, `nullablePartOf`'s render test for an uncovered row.
+export function rlElemIsNulNiche(slot: i32): boolean {
+  const ar = rlElemTyNullableAt(slot)
+  if ar >= 0 { return ar == 1 }
+  nullablePartOf(rlElemName[slot]) != ""
+}
+
+// The mv slot of a map-element ref-list slot's inner value. `peelNul` strips one
+// `TyNullable` hop before asking (the twin comparator and the nested-map read don't
+// peel). Answers only a real slot (>= 0); every negative — uncovered, not a map, no
+// claiming row — collapses to one result and must never be read as "mono" (D3').
+export function rlElemMapValMvSlotAt(slot: i32, peelNul: boolean): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if peelNul {
+    if t is TyNullable { b = t.nInner }
+  }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  // The slot's key comes off the same `TyMap` its value does — one hop, both halves.
+  if bt is TyMap { return mvSlotOfValTyK(bt.mVal, tyMapKeyKind(b)) }
+  -1
+}
+
+// The key half of the same element question: the element map's key kind, from the arena where
+// the sidecar covers the slot and from the element name where it does not. Always peels one
+// `TyNullable` — a `{[i32]: V} | null` element carries the same map struct as its non-null
+// twin, so its key must answer the same way.
+export function rlElemMapKeyKind(slot: i32): i32 {
+  const ar = rlElemMapKeyKindAt(slot)
+  if ar >= 0 { return ar }
+  let en = rlElemName[slot]
+  const enn = nulMapInnerName(en)
+  if enn != "" { en = enn }
+  mapNameKeyKind(en)
+}
+
+function rlElemMapKeyKindAt(slot: i32): i32 {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[b]
+  if t is TyNullable { b = t.nInner }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyMap { return tyMapKeyKind(b) }
+  -1
+}
+
+// The arena type a map-value slot's stored value name denotes, or -1 when the sidecar
+// doesn't cover the slot. `mvValTyIx` pads on push and resets per program, so a lagging
+// or stale row answers "uncovered" and every consumer falls to its value-name path.
+export function mvValTyIxAt(slot: i32): i32 {
+  if slot < 0 { return -1 }
+  if slot >= mvValTyIx.length { return -1 }
+  mvValTyIx[slot]
+}
+
+// The inner ref-list slot of a ref-list-valued map slot — the arena reading of
+// `rlSlotByName(refArrElemName(mvValName[slot]))`. A slot is a rep question (D2), so it
+// resolves through `rlSlotOfTy`/`repElemKey`, never `repCanonKey`. -1 when the sidecar
+// doesn't cover the slot, the value isn't an array, or no ref-list slot claims the element.
+export function mvValInnerRlSlotAt(slot: i32): i32 {
+  rlSlotOfTy(tyRefArrElemOf(mvValTyIxAt(slot)))
+}
+
+// The mv slot of a nested map-valued slot's inner value — the arena reading of
+// `mvSlotOfMapValNameOrMono(mapValNameOf(mvValName[slot]))`. Answers only a real slot
+// (>= 0); every negative falls through to the name path, and no caller can see the
+// arena's miss value, so a miss here can never be read as "mono" (D3').
+export function mvValInnerMvSlotAt(slot: i32, peelNul: boolean): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  let b = ty
+  const t = T.tys[ty]
+  // `peelNul` strips one `TyNullable` hop: a `{[K]: V} | null` value rides its non-null
+  // twin's struct, so a caller wanting the backing shape (not just "is this a map") needs it.
+  if peelNul {
+    if t is TyNullable { b = t.nInner }
+  }
+  if b < 0 { return -1 }
+  const bt = T.tys[b]
+  if bt is TyMap { return mvSlotOfValTyK(bt.mVal, tyMapKeyKind(b)) }
+  -1
+}
+
+// Tri-state dual of `unionHasAtomTy(mvValName[slot], "null", false)` over a boxed-union
+// map value: `1` admits null, `0` doesn't, `-1` the sidecar doesn't cover the slot or the
+// type isn't a union (caller keeps its member-set test).
+function mvValUnionHasNullAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: only a union shape can admit null, and a new arena
+  // variant that can must say so rather than take the `-1` decline.
+  match t {
+    TyNullable => {
+      return 1
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        const mt = T.tys[t.uMembers[i]]
+        // Exhaustive over `Ty` and `_`-less: the two spellings of a null member.
+        match mt {
+          TyPrim => {
+            if mt.primName == "null" { return 1 }
+          }
+          TyNullable => {
+            return 1
+          }
+          TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+            // Not a null member.
+          }
+        }
+        i = i + 1
+      }
+      return 0
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a union shape; the caller keeps its member-set test.
+    }
+  }
+  -1
+}
+
+// The single non-null member of a nullable value type (`TyNullable`'s inner, or the one
+// non-null member of an `X | null` union) — `nulRefMapValInnerOf`'s structural front
+// half. -1 unless the type is exactly one non-null member plus null.
+function tyNulSoloMember(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: only a union shape carries a solo non-null member.
+  match t {
+    TyNullable => {
+      return t.nInner
+    }
+    TyUnion => {
+      let solo = -1
+      let nonNull = 0
+      let hasNull = false
+      let i = 0
+      while i < t.uMembers.length {
+        const mt = T.tys[t.uMembers[i]]
+        let isNull = false
+        if mt is TyPrim {
+          if mt.primName == "null" { isNull = true }
+        }
+        if isNull {
+          hasNull = true
+        } else {
+          nonNull = nonNull + 1
+          solo = t.uMembers[i]
+        }
+        i = i + 1
+      }
+      if !hasNull { return -1 }
+      if nonNull != 1 { return -1 }
+      return solo
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a nullable shape.
+    }
+  }
+  -1
+}
+
+// The function type under a nullable one (`((i32) => i32) | null`) — the inner `TyFunc`'s
+// arena index, or -1 when `ty` isn't a nullable function type. Sees through both nullable
+// encodings (`TyNullable`, and the two-arm `X | null` union) and through a declared alias
+// body, so the result is always a type `sigKeyOfTy` can key directly.
+export function tyNulFuncInner(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t0 = T.tys[ty]
+  let nullable = false
+  if t0 is TyNullable { nullable = true }
+  if t0 is TyUnion { nullable = true }
+  if !nullable { return -1 }
+  let inner = tyNulSoloMember(ty)
+  if inner < 0 { return -1 }
+  // Peels the degenerate one-member alias wrapper the same way `tyDenotesFunc` walks it,
+  // so the returned index is always a `TyFunc`.
+  let steps = 0
+  while inner >= 0 && inner < T.tys.length && steps < 8 {
+    const it = T.tys[inner]
+    // Exhaustive over `Ty` and `_`-less: a new arena variant has to choose between peeling and
+    // declining, which the language checks here rather than a convention.
+    match it {
+      TyFunc => {
+        return inner
+      }
+      TyUnion => {
+        if it.uMembers.length != 1 { return -1 }
+        inner = it.uMembers[0]
+        steps = steps + 1
+      }
+      TyPrim | TyErr | TyObj | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+        // Not a wrapper the peel walks, and not a function.
+        return -1
+      }
+    }
+  }
+  -1
+}
+
+// Tri-state dual of `nulRefMapValInnerOf(mvValName[slot]) != ""` — is the slot's value a
+// niche-nullable ref (string / map / closure / struct, plus null)? `1` yes, `0` no, `-1`
+// the arena declines (uncovered, or a shape the struct table doesn't claim). Declining is
+// the safe direction: the caller keeps its rendered-name test.
+export function mvValNulRefNicheAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const t0 = T.tys[ty]
+  let nullable = false
+  if t0 is TyNullable { nullable = true }
+  if t0 is TyUnion { nullable = true }
+  if !nullable { return 0 }
+  const inner = tyNulSoloMember(ty)
+  if inner < 0 { return 0 }
+  const it = T.tys[inner]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that is a nullable-ref niche must
+  // say so rather than take the `-1` decline and lose the niche.
+  match it {
+    TyPrim => {
+      if it.primName == "string" { return 1 }
+      return 0
+    }
+    TyMap => {
+      return 1
+    }
+    TyFunc => {
+      return 1
+    }
+    TyArray => {
+      // A list member can be a niche, but only for reps the name path's kind-6 pair names;
+      // that distinction lives in intern state, not the shape, so this declines (-1).
+      return -1
+    }
+    TyObj => {
+      if structIndexOfTy(inner) >= 0 { return 1 }
+      return -1
+    }
+    TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      // The arena declines rather than guess; the caller keeps its name test.
+    }
+  }
+  -1
+}
+
+// `valueAtomKind`'s arena dual over a union member type: same code vocabulary (0 i32 ·
+// 1 boolean · 2 string · 3 i64 · 4 f64 · 5 f32 · 6 null · 7 i32-list · 8 f64-list ·
+// 9 string-list · 10 i64-list · 11 closure · 12 f32-list). `-1` is the arena declining,
+// never "not an atom" — every consumer falls through.
+function tyValueAtomKindOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that is a value atom must take a
+  // code here rather than the `-1`, which every consumer reads as "the arena declined".
+  match t {
+    TyPrim => {
+      // Exhaustive over `PrimName` and `_`-less: `-1` (the outer return) is the arena
+      // declining, a real answer, so a new prim must take a value-atom code here.
+      match t.primName {
+        "i32" => {
+          return 0
+        }
+        "boolean" => {
+          return 1
+        }
+        "string" => {
+          return 2
+        }
+        "i64" => {
+          return 3
+        }
+        "f64" => {
+          return 4
+        }
+        "f32" => {
+          return 5
+        }
+        "null" => {
+          return 6
+        }
+        "void" | "never" | "u8" | "v128" => {
+          // No value-atom code of its own; the outer `-1` stands. (A v128 is never a
+          // value-union member in S1-S2.)
+        }
+      }
+    }
+    TyFunc => {
+      return 11
+    }
+    TyArray => {
+      if tyIsI32LeafElem(t.aElem) {
+        const tbk = boolTagElemKind(t.aElem)
+        if tbk >= 0 { return tbk }
+        return 7
+      }
+      if tyIsStrLeafElem(t.aElem) { return 9 }
+      if t.aElem < 0 { return -1 }
+      const et = T.tys[t.aElem]
+      if et is TyPrim {
+        // Exhaustive over `PrimName` and `_`-less over the per-width numeric leaves; the
+        // outer `-1` covers the rest.
+        match et.primName {
+          "f64" => {
+            return 8
+          }
+          "i64" => {
+            return 10
+          }
+          "f32" => {
+            return 12
+          }
+          "i32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+            // Not a per-width numeric leaf; the outer `-1` stands.
+          }
+        }
+      }
+      return -1
+    }
+    TyErr | TyObj | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a value atom; the arena declines.
+    }
+  }
+  -1
+}
+
+// Tri-state dual of `mvUnionIsScalarNull`'s value test: is the boxed union value exactly
+// `<scalar> | null` (so the fused `?? d` peels to the raw unboxed scalar)? `1` yes, `0`
+// no, `-1` the arena declines (uncovered, or an unclassified member) — caller keeps its
+// atom-set path.
+function mvValUnionScalarNullAt(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty < 0 { return -1 }
+  const solo = tyNulSoloMember(ty)
+  if solo < 0 { return 0 }
+  const ak = tyValueAtomKindOf(solo)
+  if ak < 0 { return -1 }
+  if ak == 2 { return 0 }
+  if ak == 6 { return 0 }
+  1
+}
+
+// Does a boxed-union map value admit `null`? Arena first (a `TyNullable`, or a `TyUnion`
+// with a null member); the union member-set test is the fall-through for a value the
+// sidecar doesn't cover (D5-final).
+export function mvValUnionHasNull(slot: i32): boolean {
+  const ar = mvValUnionHasNullAt(slot)
+  if ar >= 0 { return ar == 1 }
+  unionHasAtomTy(mvValName[slot], "null", false)
+}
+
+// The canonical structural identity of a map-value slot — the `mvTwin` comparator's
+// input. Arena first (`repCanonId` over the recorded index, computed at query time so
+// an in-place arena mutation moves both sides together), `repNameCanonId` by name for
+// an uncovered row. Neither leg builds a spelling; both answer in ids (D5-final).
+export function mvValCanonId(slot: i32): i32 {
+  const ty = mvValTyIxAt(slot)
+  if ty >= 0 { return repCanonId(ty) }
+  repNameCanonId(mvValName[slot])
+}
+
+// The bare (non-null) inner map name of a `{[string]: V} | null` type-name, or "" for
+// anything that isn't a nullable map. The one chokepoint every `nulmap` classifier strips
+// through, so downstream readers see the inner `{[string]: V}`, never a garbled slice.
+export function nulMapInnerName(name: string) {
+  const np = nullablePartOf(name)
+  if np != "" && nameIsBareMap(np) { return np }
+  ""
+}
+// The type under `name`'s `| null` wrapper, or `name` unchanged when it carries none.
+// `nullablePartOf` answers "" for no; this is the answer-or-the-original fold every
+// caller that means to look through nullability wants, rather than branch on it.
+export function nonNulBaseOf(name: string) {
+  const nb = nullablePartOf(name)
+  if nb != "" { return nb }
+  name
+}

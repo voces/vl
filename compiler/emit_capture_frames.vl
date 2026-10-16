@@ -1,0 +1,431 @@
+// `emit_capture_frames.vl` — which frame, loop or `let` a captured binding belongs
+// to, and whether a module-level loop holds it.
+
+import {
+  Block,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  IfStmt,
+  LetDecl,
+  P,
+  Param,
+  Program,
+  WhileStmt,
+  elseIfLink,
+  nodeSpineChildren,
+} from "./ast"
+import { nodeTyIxOf } from "./check_node_tys"
+import { tySame } from "./check_types"
+import {
+  moduleBindsLoopVar,
+  moduleLocalLetOfAt,
+  parentLetOf,
+  parentLetOfAt,
+  parentLetReadAt,
+  parentLoopAt,
+  parentLoopVarOf,
+} from "./emit_base"
+import {
+  buildFnChildIndex,
+  capMemoArmed,
+  cnRecording,
+  emitCurFnIx,
+  emitCurFnPos,
+  emitRootIx,
+  fnChildHead,
+  fnChildNext,
+  fnEnvIdx,
+  fnInstOrigin,
+  fnParent,
+  fnStmts,
+  fnStmtsIndexOf,
+  monoOrigNode,
+  nestedNameBySid,
+} from "./emit_state"
+import { memoKeyNew } from "./memo"
+import { sidArrGet, sidOf } from "./symbols"
+
+// The `fnStmts` position of a lifted function named `name` whose parent frame is the `fnStmts`
+// position `pp`, or -1 when that frame declares no such function. Visits `pp`'s children in
+// `fnStmts` order, so the first declaration wins. The length compare is the lazy build: the
+// index is minted per program and re-mints after a late `fnStmts` push, so it is not a flag.
+export function nestedFnDeclaredIn(name: string, pp: i32) {
+  if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
+  if pp < 0 || pp >= fnChildHead.length { return -1 }
+  let i = fnChildHead[pp]
+  while i >= 0 {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      if s.fnName == name { return i }
+    }
+    i = fnChildNext[i]
+  }
+  -1
+}
+
+// The pass, the node count and the reported edits; then a slot replaced or a name rewritten in
+// place, and a lifted function added: what `monomorphize`, the one armed pass that clones and
+// renames, does without a reported edit.
+export const capMemoGenKey = memoKeyNew(6)
+export let capMemoEdits: i32 = 0
+// An armed pass that rewrites a body without minting a node (re-pointing a child at an
+// existing one, appending a shared default argument) calls this after the edit. Defensive:
+// no edit reported today changes a capture set, but nothing makes that hold for the next one.
+export function capMemoNoteEdit() {
+  capMemoEdits = capMemoEdits + 1
+  0
+}
+
+// True when a query may be served from, or stored in, the pass memo. A recording walk has
+// side effects a hit would skip, and a sibling walk under way answers relative to its stack.
+export function capMemoUsable(fe: i32): boolean {
+  if !capMemoArmed { return false }
+  if cnRecording { return false }
+  if capSibStack.length > 0 { return false }
+  fe >= 0 && fe < fnStmts.length
+}
+
+// The module-scope `for` binding `name` whose body holds the lifted frame `fe`, or -1. A
+// module loop variable is a start-function local, in scope only inside its own loop's body, so
+// a closure written anywhere else that spells the name means the global meaning (D2010).
+export function moduleLoopEnclosing(fe: i32, name: string): i32 {
+  if !moduleBindsLoopVar(emitRootIx, name) { return -1 }
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  let at = fnStmts[fe]
+  if (
+    fe < fnInstOrigin.length
+    && fnInstOrigin[fe] >= 0
+    && fnInstOrigin[fe] < fnStmts.length
+  ) {
+    at = fnStmts[fnInstOrigin[fe]]
+  }
+  frameLoopAt(emitRootIx, name, at)
+}
+
+// The innermost loop of frame body `body` (a function's, or the `Program`) binding `name` whose
+// body holds node `at`, or -1. Off the cached plan's post-order ranges; a node appended past the
+// body after parsing (a rewrite's) is outside every range, so it is found by walking (D3139).
+export function frameLoopAt(body: i32, name: string, at: i32): i32 {
+  if body < 0 { return -1 }
+  const lp = parentLoopAt(body, sidOf(name), at)
+  if lp >= 0 || at < body { return lp }
+  const b = P.nodes[body]
+  if b is Program {
+    const stmts = b.progStmts
+    let i = 0
+    while i < stmts.length {
+      const hit = modLoopHolding(stmts[i], name, at)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    return -1
+  }
+  modLoopHolding(body, name, at)
+}
+
+// `moduleLoopEnclosing`'s walk over one module-scope statement: the innermost loop binding
+// `name` whose body contains node `at`, or -1. Stops at a `FuncDecl`, which is its own frame.
+export function modLoopHolding(ix: i32, name: string, at: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const st = P.nodes[ix]
+  if st is ForIn {
+    const inner = modLoopHolding(st.fiBody, name, at)
+    if inner >= 0 { return inner }
+    if (
+      (st.fiVar == name || st.fiVar2 == name)
+      && nodeSubtreeHas(st.fiBody, at)
+    ) {
+      return ix
+    }
+    return -1
+  }
+  if st is ForRange {
+    const inner = modLoopHolding(st.frBody, name, at)
+    if inner >= 0 { return inner }
+    if st.frVar == name && nodeSubtreeHas(st.frBody, at) { return ix }
+    return -1
+  }
+  if st is WhileStmt { return modLoopHolding(st.whileBody, name, at) }
+  if st is IfStmt {
+    const th = modLoopHolding(st.ifThen, name, at)
+    if th >= 0 { return th }
+    return modLoopHolding(st.ifElse, name, at)
+  }
+  if st is Block {
+    const kids = st.blkStmts
+    let i = 0
+    while i < kids.length {
+      const hit = modLoopHolding(kids[i], name, at)
+      if hit >= 0 { return hit }
+      i = i + 1
+    }
+    return -1
+  }
+  modLoopNoneHere()
+}
+
+// Every statement kind `modLoopHolding` does not test, as one answer: no loop of the module
+// frame. A `FuncDecl` is its own frame, whose loops bind its own locals, and every other kind
+// holds no statement that could be a module-scope `for`.
+function modLoopNoneHere(): i32 { -1 }
+
+// True when node `at` is `ix` or one of its descendants.
+export function nodeSubtreeHas(ix: i32, at: i32): boolean {
+  if ix < 0 { return false }
+  if ix == at { return true }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    if cur != ix {
+      if cur == at { return true }
+    }
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      if nodeSubtreeHas(kids[i], at) { return true }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// The nested functions whose frees are being folded in, so two that call each other do not
+// recur forever. A stack rather than a set: the same sibling reached down two different paths
+// is folded in each time, which is what a capture set of names needs.
+export const capSibStack: i32[] = []
+
+// The names `capScan` has bound, in the scopes still open, that the enclosing scope leaves
+// unbound, so leaving a block or loop unbinds exactly those (D2068). A name the enclosing scope
+// binds needs no entry: it stays bound on the way out.
+export const capTrailName: string[] = []
+
+// Binds `name` in `bound` for the rest of the innermost open scope.
+export function capBind(bound: {[string]: i32}, name: string) {
+  if (bound[name] ?? 0) == 1 { return 0 }
+  capTrailName.push(name)
+  bound[name] = 1
+  0
+}
+
+// Closes the scopes opened since `mark` (a `capTrailName.length`), unbinding what they bound so
+// the enclosing name is visible, and capturable, again.
+export function capTrim(bound: {[string]: i32}, mark: i32) {
+  while capTrailName.length > mark {
+    bound[capTrailName[capTrailName.length - 1]] = 0
+    capTrailName.pop()
+  }
+  0
+}
+
+// The env struct heap-type index for the lifted function at index `fe`, or -1 if it
+// captures nothing (its closure env is `ref.null structref`). Resolved by
+// `mAssignTypeIndices` into `fnEnvIdx`.
+export function fnEnvIdxOf(fe: i32) {
+  if fe < 0 || fe >= fnEnvIdx.length { return -1 }
+  fnEnvIdx[fe]
+}
+
+// The `fnStmts` position of the enclosing frame whose binding a captured `name` resolves to
+// — the direct parent when it binds `name`, else the nearest ancestor that does. For a
+// transitive capture every intermediate lifted function re-captures the name, so the value
+// flows env to env while the type lives at the owning frame's binding. -1 when none does.
+export function parentBindingFrameOf(fe: i32, name: string): i32 {
+  parentBindingFrameAt(fe, name, -1)
+}
+
+// `parentBindingFrameOf` asked for a read at node `atIx`: a body `let` binds the read only
+// where its scope covers it, so a lambda written above a later local of a module function's
+// or builtin's name does not capture that local (D3604). A negative `atIx` asks unpositioned.
+export function parentBindingFrameAt(fe: i32, name: string, atIx: i32): i32 {
+  if fe < 0 || fe >= fnParent.length { return -1 }
+  const par = fnParent[fe]
+  if par < 0 || par >= fnStmts.length { return -1 }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl {
+    const params = pfn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return par }
+      }
+      i = i + 1
+    }
+    if atIx < 0 {
+      if parentLetOf(pfn.fnBody, name) >= 0 { return par }
+    } else if parentLetReadAt(pfn.fnBody, sidOf(name), atIx) != -1 {
+      // An unplaceable binding (spliced in after parsing) keeps the unpositioned answer.
+      return par
+    }
+    // A `for` loop variable binds the frame exactly as a body `let` does — same
+    // function-scoped wasm local, same shadowing. Without this arm the frame answers "does
+    // not bind it" and `capRecord`'s global and function-name guard drops the capture, so a
+    // closure over the loop variable reads a module function of the same name instead.
+    if parentLoopVarOf(pfn.fnBody, name) >= 0 { return par }
+    // A function the frame declares shadows every outer binding of its name (D3911).
+    if sidArrGet(nestedNameBySid, sidOf(name)) == 1 {
+      if nestedFnDeclaredIn(name, par) >= 0 { return -1 }
+    }
+    return parentBindingFrameAt(par, name, atIx)
+  }
+  -1
+}
+
+// The arena index of the enclosing frame's binding for a captured `name` — the owning
+// frame's matching `Param` node, or a `LetDecl` in its body, or -1. Resolves through
+// `parentBindingFrameOf`, so a transitive capture types exactly as a direct one. It is what
+// resolves a capture's wasm valtype, whose declared type lives in the owning frame.
+export function parentBindingOf(fe: i32, name: string) {
+  const par = parentBindingFrameOf(fe, name)
+  // The module frame (D1244): the top level is not in `fnStmts`, so the walk runs off the
+  // chain for a closure written in a module-scope block and every ref-repped capture there
+  // takes `captureValKind`'s i32 default. `moduleLocalLetOf` excludes top-level bindings,
+  // which are globals and never captures.
+  if par < 0 {
+    // The reader is the lifted function's own declaration node, which is what picks among
+    // sibling blocks binding one name; an out-of-range `fe` has no position to offer.
+    let atIx = -1
+    if fe >= 0 && fe < fnStmts.length { atIx = fnStmts[fe] }
+    return moduleLocalLetOfAt(emitRootIx, name, atIx)
+  }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl {
+    const params = pfn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return params[i] }
+      }
+      i = i + 1
+    }
+    return frameLetAt(pfn.fnBody, name, captureDeclAt(fe))
+  }
+  -1
+}
+
+// The arena index of the `FuncDecl` whose frame owns a captured `name`'s binding, or -1 —
+// `parentBindingFrameOf`'s answer converted out of `fnStmts` positions into the arena index
+// space every classifier's `fnIx` argument is in. One home: the two spaces coincide only at
+// small indices, so forwarding a raw position makes frame-dependent arms silently decline.
+export function parentBindingFrameArenaOf(fe: i32, name: string) {
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 || par >= fnStmts.length { return -1 }
+  fnStmts[par]
+}
+
+// The arena index of the frame owning capturing function `fnIx`'s captured `name`, or -1.
+// `capturedFrameOf`'s companion: an un-annotated binding is classified from its
+// initializer, which only resolves in the frame it is written in. Takes an arena index where
+// `parentBindingFrameArenaOf` takes a position — the same question from either side.
+export function capturedBindingFrameOf(fnIx: i32, name: string) {
+  if fnIx < 0 { return -1 }
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return -1 }
+  parentBindingFrameArenaOf(fe, name)
+}
+
+// The loop node binding a captured `name` of lifted frame `fe` as a loop variable — either of
+// a `for-in`'s two names, or a range's counter — or -1.
+export function captureLoopNodeOf(fe: i32, name: string): i32 {
+  const par = parentBindingFrameOf(fe, name)
+  if par < 0 { return moduleLoopEnclosing(fe, name) }
+  if par >= fnStmts.length { return -1 }
+  const pfn = P.nodes[fnStmts[par]]
+  if pfn is FuncDecl { return frameLoopEnclosing(fe, pfn.fnBody, name) }
+  -1
+}
+
+// The loop in frame body `body` binding `name` whose body holds lifted frame `fe`'s
+// declaration, the innermost first; else the frame's first loop binding it. A frame may walk
+// several loops under one name, each over its own element type (D3139).
+export function frameLoopEnclosing(fe: i32, body: i32, name: string): i32 {
+  const at = captureDeclAt(fe)
+  if at >= 0 {
+    const hit = frameLoopAt(body, name, at)
+    if hit >= 0 { return hit }
+  }
+  parentLoopVarOf(body, name)
+}
+
+// The `let` in frame body `body` a capture written at `at` reads as `name`, or -1 when a loop
+// variable enclosing `at` shadows every such `let` or none binds it. A frame may bind one
+// name in several blocks and loops, each at its own type (D3139).
+export function frameLetAt(body: i32, name: string, at: i32): i32 {
+  if at < 0 { return parentLetOf(body, name) }
+  const sid = sidOf(name)
+  const li = parentLetOfAt(body, sid, at)
+  const lp = frameLoopAt(body, name, at)
+  if lp < 0 { return li }
+  if li < 0 { return -1 }
+  // A `let` inside the loop shadows its variable; one outside it is shadowed.
+  if frameLoopAt(body, name, li) == lp { return li }
+  -1
+}
+
+// The source node lifted frame `fe` is written as, its template's for an instance, or -1: the
+// position a capture's binding is resolved at.
+function captureDeclAt(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  if (
+    fe < fnInstOrigin.length
+    && fnInstOrigin[fe] >= 0
+    && fnInstOrigin[fe] < fnStmts.length
+  ) {
+    return fnStmts[fnInstOrigin[fe]]
+  }
+  fnStmts[fe]
+}
+
+// Whether a captured loop variable `name` is its `for-in`'s SECOND name — a map's value or a
+// sequence's index, typed by `forInPairElemKind` rather than the element ladder (D2511).
+export function captureLoopVarIsPair(fe: i32, name: string): boolean {
+  const lv = captureLoopNodeOf(fe, name)
+  if lv < 0 { return false }
+  const ln = P.nodes[lv]
+  if ln is ForIn { return ln.fiVar2 == name }
+  false
+}
+
+// Whether the read `ix` of the `let` at `srcIx` is typed as that `let` is (no narrowing between
+// the declaration and the read), so a copy made there has the `let`'s own cell (D3139).
+export function copyReadIsUnnarrowed(ix: i32, srcIx: i32): boolean {
+  if ix < 0 || srcIx < 0 { return false }
+  const sd = P.nodes[srcIx]
+  if !(sd is LetDecl) { return false }
+  let st = -1
+  if sd.letType >= 0 {
+    st = nodeTyIxOf(sd.letType)
+  } else {
+    st = nodeTyIxOf(sd.letInit)
+  }
+  const rt = nodeTyIxOf(ix)
+  if st < 0 || rt < 0 { return false }
+  tySame(st, rt)
+}
+
+// The `fnStmts` position of the `FuncDecl` at arena index `fnIx`, or -1. The function
+// `emitCodeSection` is lowering answers from `emitCurFnPos`; any other from
+// `fnStmtsIndexOf`, which serves the scan below's answer. The scan runs only for a negative
+// `fnIx` when some slot holds a negative entry.
+export function fnStmtsPosOf(fnIx: i32) {
+  if fnIx >= 0 && fnIx == emitCurFnIx { return emitCurFnPos }
+  const hit = fnStmtsIndexOf(fnIx)
+  if hit != 0 - 2 { return hit }
+  let i = 0
+  while i < fnStmts.length {
+    if fnStmts[i] == fnIx { return i }
+    i = i + 1
+  }
+  // A monomorphized slot replaced in place (a count-0 instance overwrote `fnStmts[fe]`), so
+  // the scan above can't find the original node — a lambda literal a binding still points
+  // at. `monoOrigNode[fe]` still records it as the fallback.
+  let j = 0
+  while j < monoOrigNode.length {
+    if monoOrigNode[j] == fnIx { return j }
+    j = j + 1
+  }
+  -1
+}

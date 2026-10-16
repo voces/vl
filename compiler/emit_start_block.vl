@@ -1,0 +1,853 @@
+// `emit_start_block.vl` — the start block's `let` rows, and the narrowed value,
+// map or ref array a read resolves to.
+
+import {
+  BinExpr,
+  Block,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  P,
+  Param,
+  TypeRef,
+  WhileStmt,
+} from "./ast"
+import { nodeTyIsUnionAlias } from "./check_decl_scan"
+import { nodeTyPinIxOf } from "./check_hole_pins"
+import { luDeclPosOf } from "./check_list_union"
+import { nodeTyIsNulBool, nodeTyIxOf } from "./check_node_tys"
+import {
+  isValueUnionName,
+  nameIsLitUnionArmValueUnion,
+  nameIsLitUnionType,
+  valueAtomKind,
+} from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  numLitUnionBaseName,
+  tyIsLitUnion,
+  tyIsLitUnionOrLit,
+  tyIsNulValueUnionBox,
+  tyLitMemberTexts,
+  tyToEmitName,
+} from "./check_types"
+import {
+  annRetNameOf,
+  nameIsBareMap,
+  normTypeAtom,
+  placeNarrowKeyOf,
+  unwrapParen,
+} from "./emit_base"
+import { bodyLetReadAtSid } from "./emit_fn_ret_kinds"
+import {
+  sblSortCount,
+  sblSortStart,
+  sblSortedCand,
+  sblSortedOwner,
+  sblSortedPos,
+  sblSortedSkip,
+  sblStamp,
+  sblVal,
+} from "./emit_lit_atoms"
+import { unMemRefArrArmSlot } from "./emit_map_value_slots"
+import { globalLetOfSid, narrowSlotOf } from "./emit_narrow_slots"
+import { paramTypeNode } from "./emit_query"
+import { nodeRepIs } from "./emit_rep"
+import { nameIsRefArray } from "./emit_shape_rows"
+import { fnBlockShadowsAt } from "./emit_sig_tokens"
+import {
+  localDeclIx,
+  narrowSets,
+  narrowTop,
+  narrowVariants,
+  scopeSlotOf,
+  startStmts,
+  unMemTyCount,
+  unNames,
+  unVarCount,
+} from "./emit_state"
+import { declaredKind } from "./emit_struct_order"
+import { pinSubOperandTyOf } from "./emit_ty_canon"
+import {
+  annRowOfNode,
+  unionArmMemberTys,
+  unionHasMapArm,
+} from "./emit_union_atoms"
+import { SCRATCH_BY_CODE, scratchSlot } from "./emit_union_casts"
+import {
+  isUName,
+  msHasNull,
+  narrowSlotTy,
+  unMemAtomKind,
+  unMemIsMap,
+  unMemIsRefElemArray,
+  unRowOfCanon,
+  unRowOfName,
+  unionMemberSetOf,
+  unionRowNameAB,
+  unionSetNonNullCount,
+} from "./emit_union_registry"
+import { sidArrGet, sidArrPut, sidOfNode, sidText } from "./symbols"
+import { nameIsParenOpen, splitUnionAtoms } from "./tyname"
+import { intLitUnionBasesOf, isNullTy, tyHasTyVar, tyMapValOf } from "./tyquery"
+
+// True if the parameter `name` of function `fnIx` is the union type.
+export function paramUnion(fnIx: i32, name: string) {
+  const pt = paramTypeNode(fnIx, name)
+  // STRUCTURAL fast-path (C1): a recorded declared value-union param, else the name test.
+  if nodeTyIsUnionAlias(pt) { return true }
+  false
+}
+
+// True if the already-collected declared local `name` is a union ref (code `4`).
+export function declaredUnion(name: string) { declaredKind(name) == "union" }
+
+// Whether node `ix` has a union type whose members are all integer literals (`1 | 2`).
+export function nodeTyIsNumLitUnion(ix: i32): boolean {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return false }
+    // Integer members of two widths are the value box, not one scalar (D3491).
+    if intLitUnionBasesOf(ty).length > 0 { return false }
+    let i = 0
+    while i < t.uMembers.length {
+      const m = T.tys[t.uMembers[i]]
+      if m is TyLit {
+        if m.litKind != "int" { return false }
+      } else {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Every start-scope `LetDecl` binding `targetSid`, appended to `tmpCand`/`tmpOwner` in
+// ascending arena order. A direct walk of `ix`'s own ladder, not `parentLetOfAt`'s: that
+// primitive rebuilds a whole per-block plan on every distinct blockIx, which is the cost
+// this avoids over many siblings (D2326 perf).
+function sblFind(
+  ix: i32,
+  owner: i32,
+  targetSid: i32,
+  tmpCand: i32[],
+  tmpOwner: i32[],
+) {
+  if ix < 0 { return 0 }
+  const st = P.nodes[ix]
+  if st is LetDecl {
+    if sidOfNode(ix) == targetSid {
+      tmpCand.push(ix)
+      tmpOwner.push(owner)
+    }
+  } else if st is IfStmt {
+    let cur = ix
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        sblFind(c.ifThen, c.ifThen, targetSid, tmpCand, tmpOwner)
+        if c.ifElse >= 0 {
+          if P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            sblFind(c.ifElse, c.ifElse, targetSid, tmpCand, tmpOwner)
+          }
+        }
+      }
+    }
+  } else if st is WhileStmt {
+    sblFind(st.whileBody, st.whileBody, targetSid, tmpCand, tmpOwner)
+  } else if st is ForRange {
+    sblFind(st.frBody, st.frBody, targetSid, tmpCand, tmpOwner)
+  } else if st is ForIn {
+    sblFind(st.fiBody, st.fiBody, targetSid, tmpCand, tmpOwner)
+  } else if st is Block {
+    const stmts = st.blkStmts
+    let i = 0
+    while i < stmts.length {
+      sblFind(stmts[i], ix, targetSid, tmpCand, tmpOwner)
+      i = i + 1
+    }
+  }
+  0
+}
+
+// The `LetDecl` for a module-scope binding declared inside a top-level block, or -1 — a
+// start-function local neither `globalLetOf` nor `parentLetOf` can see. Memoized per sid
+// (`sblStamp`) over a fresh `sblFind` search of every start statement, never `parentLetOf`'s
+// plan cache (D2326).
+function startBlockLetRowOfSid(sid: i32) {
+  if startStmts.length < 1 { return -1 }
+  if sid < 0 { return -1 }
+  if sidArrGet(sblStamp, sid) == 1 { return sidArrGet(sblVal, sid) }
+  const tmpCand: i32[] = []
+  const tmpOwner: i32[] = []
+  let si = 0
+  while si < startStmts.length {
+    sblFind(startStmts[si], startStmts[si], sid, tmpCand, tmpOwner)
+    si = si + 1
+  }
+  const found = sblBuildSorted(sid, tmpCand, tmpOwner)
+  sidArrPut(sblStamp, sid, 1)
+  sidArrPut(sblVal, sid, found)
+  found
+}
+
+// Builds `sid`'s sorted-plus-skip slice from `tmpCand`/`tmpOwner` (already ascending — one
+// monotonic-stack pass, `plBuildSortedDup`'s own shape) and answers the first (smallest)
+// binding, `startBlockLetRowOfSid`'s unpositioned answer.
+function sblBuildSorted(sid: i32, tmpCand: i32[], tmpOwner: i32[]): i32 {
+  const start = sblSortedCand.length
+  const stack: i32[] = []
+  let j = 0
+  while j < tmpCand.length {
+    const cand = tmpCand[j]
+    const cpos = luDeclPosOf(cand)
+    while stack.length > 0 && sblSortedOwner[stack[stack.length - 1]] <= cpos {
+      stack.pop()
+    }
+    let skip = -1
+    if stack.length > 0 { skip = stack[stack.length - 1] }
+    const idx = sblSortedCand.length
+    sblSortedCand.push(cand)
+    sblSortedPos.push(cpos)
+    sblSortedOwner.push(tmpOwner[j])
+    sblSortedSkip.push(skip)
+    stack.push(idx)
+    j = j + 1
+  }
+  sidArrPut(sblSortStart, sid, start)
+  sidArrPut(sblSortCount, sid, tmpCand.length)
+  if tmpCand.length > 0 { return tmpCand[0] }
+  -1
+}
+
+// `startBlockLetRowOfSid`, positioned: the memoized unpositioned answer gates the search,
+// skipped when `sid` binds nowhere at start scope. Otherwise binary searches `sid`'s
+// sorted-plus-skip slice for the rightmost binding `< atIx`, then follows the skip column —
+// no statement's plan is rebuilt and no other sid's rows are walked (D2326).
+function startBlockLetRowOfAt(sid: i32, atIx: i32) {
+  const first = startBlockLetRowOfSid(sid)
+  if first < 0 { return -1 }
+  if atIx < 0 { return first }
+  const start = sidArrGet(sblSortStart, sid)
+  const count = sidArrGet(sblSortCount, sid)
+  let lo = 0
+  let hi = count - 1
+  let pos = -1
+  while lo <= hi {
+    const mid = (lo + hi) / 2
+    if sblSortedPos[start + mid] < atIx {
+      pos = mid
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  let k = start + pos
+  let searching = pos >= 0
+  let best = -1
+  while searching && k >= start {
+    if atIx <= sblSortedOwner[k] {
+      best = sblSortedCand[k]
+      searching = false
+    } else {
+      k = sblSortedSkip[k]
+      if k < start { searching = false }
+    }
+  }
+  best
+}
+
+// The start-block `LetDecl` a read of `sid` denotes, or -1 — the one home both union rungs
+// consult. The live lexical slot (`scopeSlotOf` → `localDeclIx`, unaffected by `atIx`)
+// outranks the sibling-block scan `startBlockLetRowOfAt` positions (D2326); only reached at
+// module scope, since a function-scope caller's own scan runs first. D1593.
+export function startBlockLetOfAt(sid: i32, fnIx: i32, atIx: i32) {
+  if fnIx < 0 {
+    const slot = scopeSlotOf(sidText(sid))
+    if slot >= 0 && slot < localDeclIx.length { return localDeclIx[slot] }
+  }
+  startBlockLetRowOfAt(sid, atIx)
+}
+
+// The declaration's arena type for a union-typed ident — `unionNameOfIdentSid`'s type-taking
+// twin, arm for arm over its two annotation arms (D1491). Answers from the annotation's type,
+// not the expression's, since a narrowed read's own type differs from what names its member
+// set; the inferred/captured/loop-var arms answer -1, an honest "no id here".
+function letUnionDeclTyIxOf(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return annRowOfNode(d.letType) }
+  }
+  -1
+}
+
+// `unionDeclTyIxOfIdentSid`'s positioned form, same shape as `unionNameOfIdentAt` (D2326):
+// `atIx` picks among sibling blocks binding one name, and a block shadow of a same-named
+// parameter wins over the param's own annotation (`fnBlockShadowsAt`, D2325) — the two rungs
+// answer the same binding, so they must agree on which one that is.
+function unionDeclTyIxOfIdentAt(sid: i32, fnIx: i32, atIx: i32): i32 {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const body = fn.fnBody
+      const params = fn.fnParams
+      // Cheap scan first — see `unionNameOfIdentAt`'s identical guard for why.
+      let pIx = -1
+      let i = 0
+      while i < params.length {
+        if sidOfNode(params[i]) == sid {
+          pIx = params[i]
+          break
+        }
+        i = i + 1
+      }
+      if pIx >= 0 && !fnBlockShadowsAt(fnIx, sid, atIx) {
+        const p = P.nodes[pIx]
+        if p is Param { return annRowOfNode(p.parType) }
+      }
+      const li = bodyLetReadAtSid(body, sid, atIx)
+      if li >= 0 { return letUnionDeclTyIxOf(li) }
+    }
+  }
+  const gi = globalLetOfSid(sid)
+  if gi >= 0 { return letUnionDeclTyIxOf(gi) }
+  const bl = startBlockLetOfAt(sid, fnIx, atIx)
+  if bl >= 0 { return letUnionDeclTyIxOf(bl) }
+  -1
+}
+
+// The same question of an expression: the declaration's type where the ident has one, else
+// the node's own — mirroring `letUnionNameOf`'s annotation-first, expression-second order.
+// The fallback is load-bearing: without it, an ident resolvable through its declaration
+// loses that answer and reports no type instead.
+export function unionDeclTyIxOfExpr(exprIx: i32, fnIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const un = unwrapParen(exprIx)
+    const di = unionDeclTyIxOfIdentAt(sidOfNode(un), fnIx, un)
+    if di >= 0 { return di }
+  }
+  nodeTyIxOf(unwrapParen(exprIx))
+}
+
+// The UNION return of a function-type NAME (`(i32) => A | B` → "A | B", an alias `(i32) => Sh` → its
+// member set via `isUName`), or "" when the name is not a function type returning a multi-member union.
+export function unionRetOfFnType(fnTyName: string) {
+  // Mirrors `annRetNameOf`'s gate (#1144) and `emit_base.nameIsParenOpen`'s open-only test,
+  // hoisted ahead of the scan as in the `forceCloResult*` twins.
+  if nameIsParenOpen(fnTyName) {
+    const ret0 = annRetNameOf(fnTyName)
+    if ret0 == "" { return "" }
+    return unionRetName(normTypeAtom(ret0))
+  }
+  ""
+}
+
+// `ret` when a function result of that name boxes as a union, else "".
+export function unionRetName(ret: string) {
+  if isUName(ret) { return ret }
+  if isValueUnionName(ret) { return ret }
+  // A value union with a litunion-alias arm (`K0 | i64`) is neither a registered union alias
+  // nor `isValueUnionName`, yet still boxes as a value union via the alias arm's atom.
+  if nameIsLitUnionArmValueUnion(ret) { return ret }
+  ""
+}
+
+// The union return-type NAME of a closure-typed PARAM `name` of function `fnIx` (`g: (i32) => A | B`
+// → "A | B"), or "" when `name` is not a union-returning closure param. Lets a value call THROUGH a
+// closure param (`g(x)` inside a HOF) classify its result union so a narrowed read unboxes.
+export function paramUnionRetName(fnIx: i32, name: string) {
+  if fnIx < 0 { return "" }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef { return unionRetOfFnType(ty.tyName) }
+          }
+          return ""
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// The registered name of a MIXED union — one carrying both a struct VARIANT arm and a value
+// atom — that node `ix`'s own type is, or "". A `??` result reps as the value box exactly
+// there: an all-atom union is `isValueUnionName`'s, and a literal union is an interned i32 this
+// must not claim, which is what asking for a variant arm excludes (D1703).
+export function nodeMixedUnionName(ix: i32): string {
+  const nm = nodeRegisteredUnionName(ix)
+  if nm == "" { return "" }
+  const u = unRowOfName(nm)
+  if u < 0 { return "" }
+  if unVarCount[u] < 1 { return "" }
+  // The ROW's member count, not the name's: a registered union answers by its ALIAS here, and
+  // `unionMemberCount` reads a `|`-joined spelling, so an alias would count as one member and
+  // every mixed row would read as all-variant.
+  if unVarCount[u] >= unMemTyCount[u] { return "" }
+  nm
+}
+
+// The registered name of a union carrying at least one struct VARIANT or map arm, or "". Wider
+// than `nodeMixedUnionName`, whose second clause also excludes an ALL-variant join (`A | B`);
+// both exclude a literal union, which is an interned i32 and not a box. A map arm boxes under
+// its own tag with no variant row, so a join of two maps is the box too (D2666).
+export function nodeVariantUnionName(ix: i32): string {
+  const nm = nodeRegisteredUnionName(ix)
+  if nm == "" { return "" }
+  const u = unRowOfName(nm)
+  if u < 0 { return "" }
+  if unVarCount[u] < 1 && !unionHasMapArm(nm) { return "" }
+  nm
+}
+
+// The union a `??` RESULT reps as, or "": the checker's own type for the node when its render
+// names a value union, else the variant-bearing row keyed on the node's canon. One home, so
+// the lowering, the destination and the stash reservation cannot disagree about the rep.
+export function coalesceResultUnionName(ix: i32): string {
+  const nm = tyToEmitName(nodeTyPinIxOf(ix))
+  if nm != "" {
+    if isValueUnionName(nm) { return nm }
+    // A join grouping string literals into a literal-union arm (`K|i32`) boxes as its row (D2952).
+    if nameIsLitUnionArmValueUnion(nm) && unRowOfName(nm) >= 0 { return nm }
+  }
+  const vn = nodeVariantUnionName(ix)
+  if vn != "" { return vn }
+  // A row whose arm is a list of lists is a box too, though it has no variant (D2819).
+  const rn = nodeRegisteredUnionName(ix)
+  if rn != "" && unionHasRefArrayArm(rn) { return rn }
+  ""
+}
+
+// Does the union row `name` carry an arm that is a list of references?
+function unionHasRefArrayArm(name: string): boolean {
+  const mems: i32[] = []
+  if !unionArmMemberTys(name, mems) { return false }
+  let i = 0
+  while i < mems.length {
+    if unMemRefArrArmSlot(mems[i]) >= 0 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Is the `??` at `ix` typed as a union box, two or more non-null members under one row? Then
+// no single record row answers for its value, whatever rep its left operand has (D2373).
+export function coalesceResultIsBox(ix: i32): boolean {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if e.binOp != "??" { return false }
+    // The arena answers first: a result that is no union, or a one-member niche, renders nothing.
+    let rt = nodeTyPinIxOf(ix)
+    if rt < 0 || rt >= T.tys.length { return false }
+    const rtt = T.tys[rt]
+    if rtt is TyNullable { rt = rtt.nInner }
+    if rt < 0 || rt >= T.tys.length { return false }
+    const rtu = T.tys[rt]
+    if !(rtu is TyUnion) { return false }
+    if rtu.uMembers.length < 2 { return false }
+    const jn = coalesceResultUnionName(ix)
+    if jn == "" { return false }
+    let js = unionMemberSetOf(jn)
+    if js == "" { js = jn }
+    return unionSetNonNullCount(js) >= 2
+  }
+  false
+}
+
+// The first operand of a left-nested `??` chain, parens peeled: `emitCoalesceGo` lowers
+// `(a ?? b) ?? d` as `a ?? (b ?? d)` under the chain's type, so `a` is the operand whose
+// niche the lowering tests, never the inner link's box.
+export function coalesceChainLeftmost(ix: i32): i32 {
+  let l = unwrapParen(ix)
+  let more = true
+  while more && l >= 0 {
+    more = false
+    const ln = P.nodes[l]
+    if ln is BinExpr {
+      if ln.binOp == "??" {
+        l = unwrapParen(ln.binLeft)
+        more = true
+      }
+    }
+  }
+  l
+}
+
+// The registered union a node's own type is, when its render cannot name it: an inference
+// (a desugared `??`, a hole-param call) renders its union arms structurally, so a name-keyed
+// registry scan finds nothing. `unRowOfCanon` answers from the canon-keyed reverse index
+// instead, naming the row every downstream member-set, narrow and variant lookup keys on. D1561.
+export function nodeRegisteredUnionName(ix: i32): string {
+  const ty = nodeTyPinIxOf(unwrapParen(ix))
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less. A nullable union is a union too — `string | A | null`
+  // interns as `TyNullable` over the non-null members — and the `unRowOfCanon` scan is a pass
+  // over every registered row, so only those two shapes pay it.
+  match t {
+    TyUnion => {
+      if t.uMembers.length < 2 { return "" }
+      const u = unRowOfCanon(ty)
+      if u >= 0 { return unNames[u] }
+    }
+    TyNullable => {
+      // The inner is an arena HOLE for a never-filled `let x = null` (`mkNullableTy(-1)`), so
+      // the index is bound-tested before the read — unguarded it trapped the compiler (D1721).
+      if t.nInner < 0 { return "" }
+      const it = T.tys[t.nInner]
+      if it is TyUnion {
+        if it.uMembers.length < 2 { return "" }
+        if tyIsLitUnion(t.nInner) { return "" }
+        const nu = unRowOfCanon(ty)
+        if nu >= 0 { return unNames[nu] }
+      }
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a union shape; no registered row to name.
+    }
+  }
+  ""
+}
+
+// The union a value `if`'s JOIN reps as, read off the join's own recorded type and never off
+// an arm alone: an arm narrowed by the `if`'s own condition (`if n != null { n } …`) keeps its
+// declared union, while the join is the bare scalar. "" when the join is not a union.
+export function ifJoinUnionName(ifIx: i32) {
+  // Through the banked pin, as the `??` arm below is: a `??` in an ARM makes the join a
+  // deferred hole, and without this name the pinned face falls to a numeric block type (D1702).
+  const pin = nodeTyPinIxOf(ifIx)
+  const icn = tyToEmitName(pin)
+  if icn != "" {
+    if isValueUnionName(icn) { return icn }
+    const jn = unionRowNameAB(4, icn, pin)
+    if jn != "" { return jn }
+  }
+  // A `??` over a declared struct union desugars to this `if`, whose recorded type renders
+  // structurally, so the two rungs above miss it — named off the type instead. D1561.
+  const irn = nodeRegisteredUnionName(ifIx)
+  if irn != "" { return irn }
+  // A nullable box join no row names (a map `??` over a union value): its own member set, `null`
+  // included, so an arm that is a nullable niche boxes its null as the union's null (D2251).
+  if tyIsNulValueUnionBox(pin) { return icn }
+  ""
+}
+
+// The render of `ty` when it names a value union the emitter boxes, else "".
+export function valueUnionRenderOfTy(ty: i32): string {
+  const nm = tyToEmitName(ty)
+  if isValueUnionName(nm) { return nm }
+  ""
+}
+
+// Whether `t` is a union, or a nullable over one.
+export function tyIsUnionShaped(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const tt = T.tys[t]
+  if tt is TyNullable {
+    return tt.nInner >= 0
+      && tt.nInner < T.tys.length
+      && T.tys[tt.nInner] is TyUnion
+  }
+  tt is TyUnion
+}
+
+// `ifJoinUnionName` inside function `fnIx`, where a join over an instance's type parameters
+// is named at the pin (D3528).
+export function ifJoinUnionNameIn(ifIx: i32, fnIx: i32): string {
+  const own = ifJoinUnionName(ifIx)
+  if own != "" { return own }
+  const t = nodeTyPinIxOf(ifIx)
+  if t < 0 || !tyHasTyVar(t) { return "" }
+  const ps = pinSubOperandTyOf(t, fnIx)
+  if ps < 0 { return "" }
+  const nm = tyToEmitName(ps)
+  if nm != "" && isValueUnionName(nm) { return nm }
+  if tyIsNulValueUnionBox(ps) { return nm }
+  ""
+}
+
+// True when the live narrowing on `name` proves it not null (`emitIdentNode` reads at the
+// arm's rep, but the `??` lowering and a `!= null` test still target the declared nullable
+// rep unless this says otherwise). Decided on the arena type the narrow banked, never the
+// rendered variant — a slot with no single banked type answers false, the safe default.
+export function narrowExcludesNull(name: string): boolean {
+  const i = narrowSlotOf(name)
+  if i < 0 { return false }
+  const v = narrowVariants[i]
+  if v == "" { return false }
+  if v == "null" { return false }
+  const ty = narrowSlotTy(i)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return false }
+  !isNullTy(ty)
+}
+
+// `narrowExcludesNull`, or a complement narrowing whose surviving member set lacks `null` (the
+// `!= null` arm of `i32 | i64 | null`, which keeps two members and so binds no one type).
+export function narrowDropsNull(name: string): boolean {
+  if narrowExcludesNull(name) { return true }
+  const i = narrowSlotOf(name)
+  if i < 0 { return false }
+  const v = narrowVariants[i]
+  if v == "" || v == "null" { return false }
+  const s = narrowSets[i]
+  s >= 0 && !msHasNull(s)
+}
+
+export function narrowedValueAtomOf(name: string) {
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  const v = narrowVariants[i]
+  if v == "" { return "" }
+  // The narrowed type decides reject (no value-atom or litunion arm, however costly its
+  // spelling is to classify); only where it IS an atom does the spelling decide instead.
+  const ty = narrowSlotTy(i)
+  if ty >= 0 {
+    const tk = unMemAtomKind(ty)
+    if tk == 6 { return "" }
+    if tk < 0 {
+      // A numeric litunion arm (`if p is N` where `type N = 1 | 2`) unboxes as its base
+      // scalar, asked of the arena since no rendered spelling carries a numeric literal's kind.
+      const nb = numLitUnionBaseName(ty)
+      if nb != "" { return nb }
+      // A bare string-literal arm (`if r is "err"` over `i32 | "err"`) unboxes as the string
+      // ref the box holds, exactly as a litunion-alias arm — `tyIsLitUnionOrLit` covers both. D1193.
+      if !tyIsLitUnion(ty) {
+        // `tyIsLitUnionOrLit` minus the already-excluded `tyIsLitUnion` case is exactly "a
+        // bare string-literal type", so this needs no predicate of its own.
+        if !tyIsLitUnionOrLit(ty) { return "" }
+        return "string"
+      }
+    }
+  }
+  const k = valueAtomKind(v)
+  if k >= 0 && k != 6 { return v }
+  // A transparent alias (`type N = i32`) banks the alias spelling, which `valueAtomKind`
+  // declines; fall back to the arena `TyPrim`'s canonical `primName` for the same atom.
+  if k < 0 && ty >= 0 {
+    const at = T.tys[ty]
+    if at is TyPrim {
+      const ak = valueAtomKind(at.primName)
+      if ak >= 0 && ak != 6 { return at.primName }
+    }
+  }
+  // A litunion-alias narrow (`x is K0` where `type K0 = "a" | "b"`) unboxes as the
+  // STRING ref the box stores its litunion member as (`emitUnionCoerce` boxes it so).
+  if k < 0 && nameIsLitUnionType(v) { return "string" }
+  ""
+}
+
+// The kind of `A` when a union binding `name` is narrowed to exactly `A | null` and that pair has a
+// niche rep of its own (`boolean | null` is an i32 with 2 for null, `string | null` a nullable ref),
+// else -1. A read then converts the box to the niche, the type the checker gave it (D2590).
+function narrowedNicheAtomOf(name: string): i32 {
+  const i = narrowSlotOf(name)
+  if i < 0 { return -1 }
+  const v = narrowVariants[i]
+  if v == "" { return -1 }
+  const atoms: string[] = []
+  splitUnionAtoms(v, atoms)
+  if atoms.length != 2 { return -1 }
+  let k = -1
+  let nulls = 0
+  let a = 0
+  while a < 2 {
+    const ak = valueAtomKind(atoms[a])
+    if ak == 6 { nulls = nulls + 1 } else { k = ak }
+    a = a + 1
+  }
+  if nulls != 1 { return -1 }
+  if k == 1 || k == 2 { return k }
+  -1
+}
+
+// The stash a niche read parks a field's or cell's box in between its tag test and its payload
+// read. It shares the literal-`is` stash, code 17: neither holds it across any user code.
+export function nicheReadStashSlot() {
+  scratchSlot(17, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// `narrowedNicheAtomOf` for the read at node `ix` of key `key`, where the checker agrees: the
+// read's recorded type is that niche. A read it typed otherwise keeps the box.
+export function nicheReadKindAt(ix: i32, key: string): i32 {
+  const nk = narrowedNicheAtomOf(key)
+  if nk == 1 && nodeTyIsNulBool(ix) { return 1 }
+  if nk == 2 && nodeRepIs(ix, "nulstr") { return 2 }
+  -1
+}
+
+// Whether `name` is narrowed to exactly `K | null`, or `K | L | null`, every non-null member a
+// literal-union alias or the `string` arm a mixed box holds its litunions in (D3174). The caller
+// has already asked that the read is typed as the nullable litunion.
+export function narrowedNulLitAlias(name: string): boolean {
+  const i = narrowSlotOf(name)
+  if i < 0 { return false }
+  const v = narrowVariants[i]
+  if v == "" { return false }
+  const atoms: string[] = []
+  splitUnionAtoms(v, atoms)
+  if atoms.length < 2 { return false }
+  let nulls = 0
+  let a = 0
+  while a < atoms.length {
+    // Value-atom kind 6 is `null`, 2 the `string` arm.
+    const ak = valueAtomKind(atoms[a])
+    if ak == 6 { nulls = nulls + 1 }
+    else if ak != 2 && !nameIsLitUnionType(atoms[a]) { return false }
+    a = a + 1
+  }
+  nulls == 1
+}
+
+// The niche kind of a nullable literal union read out of a box: the atom id, `-1` for null.
+export const NICHE_NUL_LIT = 3
+
+// The member texts of a nullable literal union `ty`, read through its `null`.
+export function nulLitMemberTexts(ty: i32): string[] {
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyNullable { return tyLitMemberTexts(t.nInner) }
+  }
+  tyLitMemberTexts(ty)
+}
+
+// The ref-element-array arm a union binding `name` is currently narrowed to (`if x is S[]`
+// → `S[]`), or "" when not narrowed to a ref array. A non-"" answer means an ident read
+// recovers the reflist wrapper ref from the box (`ref.cast` of the anyref payload), so
+// indexing and `.length` see the list directly.
+export function narrowedRefArrayOf(name: string) {
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  const v = narrowVariants[i]
+  if v == "" { return "" }
+  const ty = narrowSlotTy(i)
+  if ty >= 0 {
+    if unMemAtomKind(ty) >= 0 { return "" }
+    // `unMemIsRefElemArray` is a shape question and `nameIsRefArray` is that shape plus
+    // nameability, so the arena leg can only reject; a shape match re-asks the name.
+    if !unMemIsRefElemArray(ty) { return "" }
+  }
+  if valueAtomKind(v) >= 0 { return "" }
+  if nameIsRefArray(v) { return v }
+  // A SECOND narrowing over the same binding banks the alias the program wrote (`JsonArr`)
+  // where the first banked the rendered spelling, and a name test cannot see through it. The
+  // arena row already answered — `unMemIsRefElemArray` above — so render that rather than let
+  // the spelling veto it (D1822).
+  if ty >= 0 {
+    const rn = tyToEmitName(ty)
+    if nameIsRefArray(rn) { return rn }
+  }
+  ""
+}
+
+// The bare-closure arm a union binding `name` is currently narrowed to (`if x is () => i64`
+// → `() => i64`), or "" otherwise. The narrowed read already unboxes via
+// `narrowedValueAtomOf`; this isolates the closure case so `exprIsClosure` can route the
+// call through `call_ref` with the arm's `$fnsig`.
+export function narrowedClosureOf(name: string) {
+  const v = narrowedValueAtomOf(name)
+  if v != "" && valueAtomKind(v) == 11 { return v }
+  ""
+}
+
+// The map arm a union binding `name` is currently narrowed to (`if x is {[string]: string}`
+// → `{[string]: string}`), or "" otherwise. A non-"" answer means an ident read recovers the
+// map struct ref from the box, so `x[k]`, `x[k] ?? d` and `x.has(k)` route through the map
+// lowering directly.
+export function narrowedMapOf(name: string) {
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  const v = narrowVariants[i]
+  if v == "" { return "" }
+  // A narrowed type that is not a `TyMap` cannot be the map arm, whatever it is spelled —
+  // free rejection for the map-member union the name path still has to exclude.
+  const ty = narrowSlotTy(i)
+  if ty >= 0 {
+    if !unMemIsMap(ty) { return "" }
+  }
+  if valueAtomKind(v) >= 0 { return "" }
+  // A narrow can land on a member set, not a single arm — a name starting with `{[` can still
+  // be a union box, not a bare map. Skipping this guard misclassifies a rebind as a mono map.
+  if nameIsBareMap(v) { return v }
+  // A SECOND narrowing over the same binding banks the alias the program wrote (`JsonMap`)
+  // where the first banked the rendered spelling, and a name test cannot see through it. The
+  // arena row already answered — `unMemIsMap` above — so render that rather than let the
+  // spelling veto it (D1864).
+  if ty >= 0 {
+    const rn = tyToEmitName(ty)
+    if nameIsBareMap(rn) { return rn }
+  }
+  ""
+}
+
+// The map value type the narrowing banks for `name`, or -1 — `narrowedMapOf`'s structural
+// sibling, reading the same slot's type column (`pushNarrowRep` writes `narrowVariants[i]`
+// and `narrowTys[i]` together) instead of re-deriving `V` from the rendered `{[K]: V}`
+// spelling through the annotation grammar.
+export function narrowedMapValTyOf(name: string): i32 {
+  const i = narrowSlotOf(name)
+  if i < 0 { return -1 }
+  tyMapValOf(narrowSlotTy(i))
+}
+
+// The ref-element-array arm a non-identifier place is currently narrowed to (`if n.v is K[]`
+// → `K[]`), or "" — `narrowedRefArrayOf`'s place-keyed dual. A consumer asking about an
+// identifier misses a place narrow entirely (`if n.v is K[] { for e in n.v … }` failed at
+// whichever floor came first), so `narrowTop` gates first since the key is a built string. D1014.
+export function narrowedRefArrayOfPlace(exprIx: i32): string {
+  if narrowTop == 0 { return "" }
+  const k = placeNarrowKeyOf(exprIx)
+  if k == "" { return "" }
+  narrowedRefArrayOf(k)
+}
+
+// The map arm a non-identifier place is currently narrowed to, or "" — see
+// `narrowedRefArrayOfPlace`.
+export function narrowedMapOfPlace(exprIx: i32): string {
+  if narrowTop == 0 { return "" }
+  const k = placeNarrowKeyOf(exprIx)
+  if k == "" { return "" }
+  narrowedMapOf(k)
+}
+
+// The map VALUE type banked beside `narrowedMapOfPlace`'s arm, or -1 — the place-keyed dual of
+// `narrowedMapValTyOf`, read off the SAME narrow-stack row so the arm spelling and its value
+// type cannot describe two different maps.
+export function narrowedMapValTyOfPlace(exprIx: i32): i32 {
+  if narrowTop == 0 { return -1 }
+  const k = placeNarrowKeyOf(exprIx)
+  if k == "" { return -1 }
+  narrowedMapValTyOf(k)
+}

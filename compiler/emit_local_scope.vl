@@ -1,0 +1,1045 @@
+// `emit_local_scope.vl` — what a local read resolves to in scope: the function,
+// loop or shadowing block that binds it, and the type a `let` initialiser leaves.
+
+import {
+  BinExpr,
+  Block,
+  Call,
+  ForIn,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  LetDecl,
+  Member,
+  NumLit,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  TypeRef,
+  Unary,
+} from "./ast"
+import {
+  nodeTyIsFunc,
+  nodeTyIsMap,
+  nodeTyIsNulScalarBox,
+  nodeTyIsNullable,
+  nodeTyIsPureLitUnion,
+  nodeTyIxOf,
+} from "./check_node_tys"
+import { isValueUnionTyOr, tyIsValueUnionBox } from "./check_ty_rep"
+import {
+  PrimName,
+  T,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+  tyPrimNameOf,
+  tySame,
+} from "./check_types"
+import { structIndexOfTy } from "./emit_atom_kinds"
+import {
+  callOriginOf,
+  frameBindsCacheGet,
+  frameBindsCachePut,
+  moduleBindsLoopVar,
+  moduleLocalLetCoversAt,
+  moduleLocalLetOf,
+  moduleLocalLetOfAt,
+  parentLetCoversAt,
+  parentLoopCoversAt,
+  parentLoopVarOf,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
+import { numLexIsFloat } from "./emit_bignum"
+import {
+  fnStmtsPosOf,
+  frameLetAt,
+  frameLoopAt,
+  nestedFnDeclaredIn,
+} from "./emit_capture_frames"
+import { bodyLetReadAt, fnHasParamSid } from "./emit_fn_ret_kinds"
+import { frameChainBindsName } from "./emit_list_rep"
+import { isStructOfTy, variantRowOfTy } from "./emit_mv_slots"
+import { nulVariantIndexOf, structRowOfTy } from "./emit_nullable_rets"
+import { paramIndexOf, paramIsF64 } from "./emit_query"
+import {
+  RepDesc,
+  nodeRepIs,
+  repDescNone,
+  repDescRet,
+  repOfTy,
+} from "./emit_rep"
+import {
+  annRepKindOf,
+  emptyArrLitIxOf,
+  mapFindShapeOfNodeTy,
+  mapNodeValKindLowerable,
+} from "./emit_shape_rows"
+import {
+  VKind,
+  emitRootIx,
+  fRetKind,
+  fRetRArrElem,
+  fRetStructIdx,
+  fnIndexBySid,
+  fnInstOrigin,
+  fnParent,
+  fnStmts,
+  lfBlockOf,
+  lfCloneHead,
+  lfCloneNext,
+  lfDeclAt,
+  lfDeclBlock,
+  lfDeclLo,
+  lfMintedOf,
+  lfOriginOf,
+  lfSidHead,
+  lfSidNext,
+  nestedNameBySid,
+} from "./emit_state"
+import { declaredKind, declaredSlotOf } from "./emit_struct_order"
+import { holeOperandTyOf, identNameOrEmpty } from "./emit_ty_canon"
+import { msKeepTy, msSetOfText, unionMemberSetOf } from "./emit_union_registry"
+import { sidArrGet, sidLookup, sidOfNode } from "./symbols"
+import { tyHasTyVar } from "./tyquery"
+
+// Registry-independent f64-ness of a lifted callback's tail expression: float literals,
+// f64 params, f64 arithmetic over those, and f64-returning named calls. It avoids
+// `declaredF64` and `declaredSlotOf` — the locals registry belongs to whichever function
+// is being emitted — so the answer is the same during sig collection and section emission.
+export function tailIsF64NoLocal(ix: i32, fnArenaIx: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[ix]
+  if e is NumLit { return numLexIsFloat(e.numText) }
+  if e is Paren { return tailIsF64NoLocal(e.parInner, fnArenaIx) }
+  if e is Ident { return paramIsF64(fnArenaIx, e.identName) }
+  if e is BinExpr {
+    const op = e.binOp
+    if op == "+" || op == "-" || op == "*" || op == "/" {
+      if tailIsF64NoLocal(e.binLeft, fnArenaIx) { return true }
+      return tailIsF64NoLocal(e.binRight, fnArenaIx)
+    }
+    return false
+  }
+  if e is Unary {
+    if e.unOp == "-" { return tailIsF64NoLocal(e.unArg, fnArenaIx) }
+    return false
+  }
+  if e is Call {
+    const callee = P.nodes[e.callFn]
+    if callee is Ident {
+      const t = fnIndexOfInScopeAt(
+        sidOfNode(e.callFn),
+        callee.identName,
+        fnArenaIx,
+        e.callFn,
+      )
+      if t >= 0 {
+        if t < fRetKind.length { return fRetKind[t] == "f64" }
+      }
+    }
+    return false
+  }
+  false
+}
+
+// ── nullable-string (`string | null`) predicates — the ref-rep analogue of the
+// nullable-list family: `null` is `ref.null $aTypeIdx` and `!= null` is `ref.is_null`.
+// Unlike a nullable list an initializer can produce one, so `letIsNulString` consults it.
+export function declaredNulString(name: string) {
+  declaredKind(name) == "nulstr"
+}
+
+// The struct row an `x as? S` yields `S | null` over, where `S` has a struct row and no
+// `nulvariant` one; else -1. A record first made a union member by a generic pin is a checker
+// variant member that kept its struct row, so neither niche's usual rung claims it (D2676).
+export function asNulStructRow(asIx: i32): i32 {
+  if nulVariantIndexOf(asIx) >= 0 { return -1 }
+  const t = nodeTyIxOf(asIx)
+  if t < 0 { return -1 }
+  const tn = T.tys[t]
+  if tn is TyNullable { return structIndexOfTy(tn.nInner) }
+  -1
+}
+
+// True if `rx` returns a body-declared map local whose value type the mv layer can lower.
+// The local's kind is not collected during the global return pass, so neither `exprMap` nor
+// any Ident classifier can see it; this reads the declaration instead, and it is what puts
+// `"map"` in `fRetKind`.
+export function retIsMapLocal(rx: i32, fnIx: i32) {
+  let u = rx
+  let done = false
+  while !done {
+    const node = P.nodes[u]
+    if node is Paren { u = node.parInner } else { done = true }
+  }
+  const e = P.nodes[u]
+  if e is Ident {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = bodyLetReadAt(fn.fnBody, e.identName, u)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if d.letType >= 0 {
+            const lt = P.nodes[d.letType]
+            if lt is TypeRef {
+              // The arena: a `TyMap` annotation, never the union box a map-first spelling
+              // can fool `nameIsMap` into claiming.
+              if nodeTyIsMap(d.letType) {
+                // A supported map value type, asked of the arena — the same call the
+                // un-annotated leg makes. The return's shape is recovered at the
+                // functype-result site through `mapShapeOfExpr` over this same local.
+                return mapNodeValKindLowerable(d.letType)
+              }
+            }
+            return false
+          }
+          // An un-annotated map local has no annotation for the rung above to read: the
+          // checker's recorded type on the returned ident is the only spelling of it.
+          // Unclassified, the functype result stays at the `"i32"` default over a body that
+          // returns a map ref, while the caller resolves the same recorded type.
+          if nodeTyIsMap(u) { return mapNodeValKindLowerable(u) }
+        }
+      }
+    }
+  }
+  false
+}
+
+// The parent-`let` arena index a returned bare ident names in the body at `bodyIx`, or -1.
+// The alias hop is part of the lookup because this pass is global: an init that is itself a
+// bare local ident is the same miss one hop in (D41). Only an un-annotated link is followed,
+// since an annotation pins the cell's rep. One home, so its callers cannot drift apart.
+export function retLocalLetOfBlock(bodyIx: i32, rx: i32) {
+  const u = unwrapParen(rx)
+  const e = P.nodes[u]
+  if e is Ident {
+    let li = bodyLetReadAt(bodyIx, e.identName, u)
+    let hops = 0
+    while li >= 0 && hops < 8 {
+      const d = P.nodes[li]
+      if d is LetDecl {
+        if d.letType >= 0 { return li }
+        const ivx = unwrapParen(d.letInit)
+        if ivx < 0 { return li }
+        const iv = P.nodes[ivx]
+        if iv is Ident {
+          const nx = bodyLetReadAt(bodyIx, iv.identName, ivx)
+          if nx < 0 { return li }
+          if nx == li { return li }
+          li = nx
+          hops = hops + 1
+        } else {
+          return li
+        }
+      } else {
+        return li
+      }
+    }
+    return li
+  }
+  -1
+}
+
+export function criRetLocalLet(rx: i32, i: i32) {
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl { return retLocalLetOfBlock(fn.fnBody, rx) }
+  -1
+}
+
+// The node an empty-`[]` hole must be read off for return `rx` of function `i` — the return
+// expression when that is the literal, else the initializer of the local it names (D626).
+// It routes through `retLocalLetOfBlock`, which hops un-annotated alias chains and stops at
+// an annotated binding, whose annotation has already decided the cell's rep.
+export function criRetHoleNode(rx: i32, i: i32) {
+  if emptyArrLitIxOf(rx) >= 0 { return rx }
+  const rll = criRetLocalLet(rx, i)
+  if rll < 0 { return rx }
+  const d = P.nodes[rll]
+  if d is LetDecl {
+    if d.letType >= 0 { return rx }
+    return d.letInit
+  }
+  rx
+}
+
+// The `Param` node of function `fnIx` named `name`, or -1.
+export function fnParamNodeOf(fnIx: i32, name: string) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parName == name { return ps[i] }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Whether an un-annotated binding's initializer carries a `TyFunc` in the arena — the
+// checker's own answer, for the spellings `letIsClosure`'s syntactic ladder cannot reach.
+export function letInitTyIsFunc(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return nodeTyIsFunc(d.letInit)
+  }
+  false
+}
+
+// Whether an un-annotated binding's initializer carries a registered STRUCT in the arena —
+// the checker's own answer for the projection spellings (`xs[0]`, `box.it`) that commit no
+// rep the `letIs*` ladder can read. Shared by the kind and its slot so the two agree (D1476).
+export function letInitTyIsStruct(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    return isStructOfTy(nodeTyIxOf(d.letInit))
+  }
+  false
+}
+
+// Whether the initializer is a nested-struct FIELD read — the one projection shape whose slot
+// is nullable, so a cell over it is `nulstruct` and not `struct` (D1476). Annotation-blind:
+// the field's storage is what it is, and the capture classifier asks this of an ANNOTATED
+// binding too, where the annotation's own kind is the non-null twin (D1759).
+export function initIsNestedStructFieldRead(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    const e = P.nodes[unwrapParen(d.letInit)]
+    if e is Member { return isStructOfTy(nodeTyIxOf(d.letInit)) }
+  }
+  false
+}
+
+// The `letInitCellKind` rung's own entry: UN-annotated only, since an annotated binding's cell
+// is the annotation's and this ladder never sees one.
+export function letInitIsNestedStructField(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+  }
+  initIsNestedStructFieldRead(letIx)
+}
+
+// An un-annotated binding's PROJECTION initializer node, or -1 — an index or a field read,
+// the two shapes that commit no rep for the `letIs*` ladder to read. The gate on the arena
+// rungs below: every other initializer shape commits one, and letting the arena claim those
+// would overrule an answer the syntactic ladder already gives (D1758).
+function letInitProjNode(letIx: i32): i32 {
+  if letIx < 0 || letIx >= P.nodes.length { return -1 }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const pr = unwrapParen(d.letInit)
+    if pr < 0 || pr >= P.nodes.length { return -1 }
+    const e = P.nodes[pr]
+    if e is Index { return d.letInit }
+    if e is Member { return d.letInit }
+  }
+  -1
+}
+
+// The rep such an initializer commits, or `null` — `annRepKindOf` is `vtKindOfType`'s own
+// first leg, so the un-annotated face and the annotated one derive the kind from one place
+// and cannot answer differently. The map arm is its own because the descriptor leaves
+// `TyMap` uncovered; its companion is `letInitProjMapShape` (D1758).
+export function letInitProjKind(letIx: i32): VKind | null {
+  const ini = letInitProjNode(letIx)
+  if ini < 0 { return null }
+  const rk = annRepKindOf(ini)
+  if rk != null { return rk }
+  if nodeTyIsMap(ini) { return "map" }
+  null
+}
+
+// That map arm's companion — the mv slot the recorded value type names, a FIND and never a
+// mint. Gated on the KIND its twin answers, not on which of that twin's two rungs answered:
+// the descriptor covers a nested map and not a struct-valued shallow one, and a `"map"` cell
+// whose shape stays -1 is the mono map, a different layout (D1772).
+export function letInitProjMapShape(letIx: i32): i32 {
+  const ini = letInitProjNode(letIx)
+  if ini < 0 { return -1 }
+  if letInitProjKind(letIx) != "map" { return -1 }
+  if nodeTyIsMap(ini) { return mapFindShapeOfNodeTy(ini) }
+  -1
+}
+
+// The struct row that rung names, or -1 — the companion index `fbValtype` reads for a
+// `"struct"` cell.
+export function letInitTyStructRow(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    return structRowOfTy(nodeTyIxOf(d.letInit))
+  }
+  -1
+}
+
+// The variant row the checker recorded for an UN-annotated binding's initializer, or -1 —
+// the narrowed-arm spelling, whose init produces the union box while the checker types the
+// binding at the arm. `exprVariantIndex` answers the init's REP and so declines here; the
+// binding boundary's own unbox is what lands the box in the arm cell (D1741).
+export function letInitTyVariantRow(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    return variantRowOfTy(nodeTyIxOf(d.letInit))
+  }
+  -1
+}
+
+// Whether node `ix` is a read typed as only a narrowing of a wider box can be: a record, a
+// nullable, or a literal union. The cheap pre-test of the narrowed-cell rungs, which a read
+// typed at the whole box never needs.
+export function nodeTyIsNarrowedShape(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is Ident || n is Member || n is Index) { return false }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  if T.tys[ty] is TyObj { return true }
+  nodeTyIsNullable(ix) || tyIsLitUnion(ty) || tyIsNullableLitUnion(ty)
+}
+
+// Whether node `ix`'s recorded type is a `TyUnion` or a `TyNullable`: the cheap pre-test of
+// `nodeTyIsBoxRep`, on the path every un-annotated binding takes.
+export function nodeTyIsUnionShaped(ix: i32): boolean {
+  if ix < 0 { return false }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  t is TyUnion || t is TyNullable
+}
+
+// Whether node `ix`'s recorded type reps as the value-union box: a union of non-literal
+// members, or a scalar plus `null`.
+export function nodeTyIsBoxRep(ix: i32): boolean {
+  if ix < 0 { return false }
+  if nodeTyIsNulScalarBox(ix) { return true }
+  tyIsValueUnionBox(nodeTyIxOf(ix)) && !nodeTyIsPureLitUnion(ix)
+}
+
+// The `for-in` loop whose element variable the read `ix` of `name` in frame `fnIx` (-1 the
+// module) is, found by the loop enclosing the read, or -1. Declines where the frame also binds
+// `name` with a `let`, so a shadowing binding is never mistaken for the loop's.
+export function readLoopNodeOf(ix: i32, name: string, fnIx: i32): i32 {
+  let lp = -1
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      if parentLoopVarOf(fn.fnBody, name) < 0 { return -1 }
+      // A live slot is the frame's own answer, which every caller has already asked.
+      if declaredSlotOf(name) >= 0 { return -1 }
+      if frameLetAt(fn.fnBody, name, ix) >= 0 { return -1 }
+      lp = frameLoopAt(fn.fnBody, name, ix)
+    }
+  } else {
+    if !moduleBindsLoopVar(emitRootIx, name) { return -1 }
+    if declaredSlotOf(name) >= 0 { return -1 }
+    if moduleLocalLetOfAt(emitRootIx, name, ix) >= 0 { return -1 }
+    lp = frameLoopAt(emitRootIx, name, ix)
+  }
+  if lp < 0 { return -1 }
+  const ln = P.nodes[lp]
+  if ln is ForIn {
+    if ln.fiVar == name { return lp }
+  }
+  -1
+}
+
+// The nullable twin of `letInitTyVariantRow`: the variant row of `X` when an un-annotated
+// binding's initializer is typed `X | null` with `X` a union arm, else -1 (D3107).
+export function letInitTyNulArmRow(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return -1 }
+    if d.letInit < 0 { return -1 }
+    const t = nodeTyIxOf(d.letInit)
+    if t < 0 { return -1 }
+    const tt = T.tys[t]
+    if tt is TyNullable { return nulArmRowOfTy(tt.nInner) }
+  }
+  -1
+}
+
+// The nullable twin: the initializer carries a `TyNullable` over a `TyFunc`, which a bare
+// `const t = m[k]` read of a function-valued map is and no syntactic arm claims (D1621).
+export function letInitTyIsNulFunc(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letInit < 0 { return false }
+    return nodeRepIs(d.letInit, "nulclosure")
+  }
+  false
+}
+
+// True when an un-annotated binding's initializer records a `T | null` whose `T` is a value
+// UNION — the box rep, `null` riding as its tag. Asked of the arena alone, so it needs no
+// frame. `isValueUnionTyOr` is the row twin of `isValueUnionName`, which answers on a spelling
+// and so declines an alias; the inner must be a real `TyUnion`, keeping `i32 | null` out.
+export function letInitTyIsNulValueUnion(letIx: i32): boolean {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return false }
+    if d.letInit < 0 { return false }
+    const t = nodeTyIxOf(unwrapParen(d.letInit))
+    if t < 0 { return false }
+    const tt = T.tys[t]
+    if tt is TyNullable {
+      if tt.nInner < 0 { return false }
+      if tyIsLitUnion(tt.nInner) { return false }
+      const it = T.tys[tt.nInner]
+      if it is TyUnion { return isValueUnionTyOr(t) == 1 }
+    }
+  }
+  false
+}
+
+// The last rung of `letInitCellKind`: an initializer the generic body shares, typed at a hole
+// that instance `fnIx` pins to a scalar or a string, takes the pin's rep, since every rung above
+// read the hole (D2918). `"i32"` for anything else, the ladder's default.
+export function letInitHoleKind(letIx: i32, fnIx: i32): VKind {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const t = holeOperandTyOf(d.letInit, fnIx)
+    if t >= 0 {
+      const rd = repOfTy(t)
+      if rd.rdCovered == 1 {
+        const k = rd.rdKind
+        if (
+          k == "f64"
+          || k == "i64"
+          || k == "f32"
+          || k == "str"
+          || k == "nulstr"
+        ) {
+          return k
+        }
+      }
+    }
+  }
+  "i32"
+}
+
+// ── the assignment target cell ─────────────────────────────────────────────────────
+// The storage-class dispatch itself: the body `let` in scope at the target `Ident` node `tx`,
+// then a parameter, then a module global — the emitter's own order, so a shadowing binding
+// answers for the cell stored into (D3237), through the resolver deciding its valtype.
+
+// The body `let` assignment target `tx` of function `fnIx` stores into, or -1.
+export function asgCellLetOf(fnIx: i32, tx: i32): i32 {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    return bodyLetReadAt(fn.fnBody, identNameOrEmpty(tx), tx)
+  }
+  -1
+}
+
+// The declared type spelling of the `LetDecl` at `letIx`, or "" when un-annotated, its kind
+// then coming from the initializer through `letInitCellKind`.
+export function letDeclTypeName(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 { return tyNameOf(d.letType) }
+  }
+  ""
+}
+
+// ── the if-arm join ────────────────────────────────────────────────────────────────
+// Two arms join exactly when their target cells have the same result identity: the same
+// guarded kind, struct-table slot, ref-list element name and declared type spelling. Not a
+// widening join: the lowering is store-then-re-read per arm with no coercion site between.
+
+// The tail statement of an if-arm block, or -1 for an empty arm or a non-block arm.
+export function armTailStmtOf(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const st = b.blkStmts
+    if st.length > 0 { return st[st.length - 1] }
+  }
+  -1
+}
+
+// The target `Ident` node an arm-tail statement assigns to, or -1 — the same unwrap
+// `fnAssignRetTarget` runs on a straight-line tail, since both reach `emitBinExprNode`'s
+// `=` arm and both leave the target cell on the stack. An index or member target answers -1:
+// its value form is not lowered, so `emitIfTail` never claims the `if`.
+export function armAssignTarget(stmtIx: i32): i32 {
+  if stmtIx < 0 { return -1 }
+  let tx = stmtIx
+  const ts = P.nodes[tx]
+  if ts is RetStmt {
+    if ts.retArg < 0 { return -1 }
+    tx = ts.retArg
+  }
+  const a = P.nodes[unwrapParen(tx)]
+  if a is BinExpr {
+    if a.binOp == "=" {
+      const t = unwrapParen(a.binLeft)
+      if t >= 0 && P.nodes[t] is Ident { return t }
+    }
+  }
+  -1
+}
+
+// The assignment node of an arm-tail statement, seen through a `return` and parentheses.
+export function asgOfArmTail(stmtIx: i32): i32 {
+  const ts = P.nodes[stmtIx]
+  if ts is RetStmt { return unwrapParen(ts.retArg) }
+  unwrapParen(stmtIx)
+}
+
+// The leftmost arm-tail assignment target under the tail `if` at `ifIx` — the candidate the
+// other arms are compared against. -1 when the then-arm's tail is not an assignment. A
+// nested tail `if` in the then-arm recurses to its own first arm.
+export function ifTailFirstAssignTarget(ifIx: i32): i32 {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const t = armTailStmtOf(s.ifThen)
+    if t < 0 { return -1 }
+    const tn = P.nodes[t]
+    if tn is IfStmt { return ifTailFirstAssignTarget(t) }
+    return armAssignTarget(t)
+  }
+  -1
+}
+
+// Whether targets `a` and `b` of function `fnIx` store into one cell: the same body `let`, or,
+// with no `let` in scope at either, one name's parameter or global.
+export function asgSameCell(fnIx: i32, a: i32, b: i32): boolean {
+  const la = asgCellLetOf(fnIx, a)
+  if la != asgCellLetOf(fnIx, b) { return false }
+  if la >= 0 { return true }
+  identNameOrEmpty(a) == identNameOrEmpty(b)
+}
+
+// The node whose rep the value of assignment `asgIx` has: its right side, or its target where
+// the checker typed the assignment at the target's type rather than the right side's, a
+// literal built at the place's type.
+export function asgValueNode(asgIx: i32): i32 {
+  const a = P.nodes[asgIx]
+  if !(a is BinExpr) { return asgIx }
+  const at = nodeTyIxOf(asgIx)
+  const lt = nodeTyIxOf(a.binLeft)
+  const rt = nodeTyIxOf(a.binRight)
+  if at < 0 || lt < 0 || rt < 0 { return a.binRight }
+  if tySame(at, lt) && !tySame(at, rt) { return a.binLeft }
+  a.binRight
+}
+
+// The one-member set of union `un` that type `ty` selects, or -1, read as
+// `pushNarrowWriteReNarrow` reads it so the predicate and the push cannot disagree.
+export function asgReadNarrowSet(un: string, ty: i32): i32 {
+  const r = msKeepTy(msSetOfText(un), ty)
+  if r >= 0 { return r }
+  msKeepTy(msSetOfText(unionMemberSetOf(un)), ty)
+}
+
+// The opcode taking primitive `vt`, widened into a primitive `st` cell, back to `vt`, or -1.
+export function asgUnwidenPrim(vt: i32, st: i32): i32 {
+  const vn = tyPrimNameOf(vt)
+  const sn = tyPrimNameOf(st)
+  if vn == null || sn == null { return -1 }
+  match vn {
+    "i32" => {
+      return unwidenI32From(sn)
+    }
+    "f32" => {
+      if sn == "f64" {
+        return 182 // 0xb6 f32.demote_f64
+      }
+      return -1
+    }
+    "i64" | "f64" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+      return -1
+    }
+  }
+}
+
+// The opcode taking an `i32` value widened into a `sn` cell back to `i32`, or -1 where `sn`
+// is no widening of it.
+function unwidenI32From(sn: PrimName): i32 {
+  match sn {
+    "f64" => {
+      return 170 // 0xaa i32.trunc_f64_s
+    }
+    "i64" => {
+      return 167 // 0xa7 i32.wrap_i64
+    }
+    "f32" => {
+      return 168 // 0xa8 i32.trunc_f32_s
+    }
+    "i32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+      return -1
+    }
+  }
+}
+
+// True if the tail statement `t`, or an arm tail of it when it is an `if`, is `asgIx`.
+export function tailHoldsAsg(t: i32, asgIx: i32): boolean {
+  if t < 0 { return false }
+  const tn = P.nodes[t]
+  if tn is IfStmt {
+    if tailHoldsAsg(armTailStmtOf(tn.ifThen), asgIx) { return true }
+    if tn.ifElse < 0 { return false }
+    if P.nodes[tn.ifElse] is IfStmt { return tailHoldsAsg(tn.ifElse, asgIx) }
+    return tailHoldsAsg(armTailStmtOf(tn.ifElse), asgIx)
+  }
+  asgOfArmTail(t) == asgIx
+}
+
+// True if lifted function `i` is an anonymous lambda with no source name. It restricts the
+// if-arm tail-value return classification to lambdas, leaving named-function inference to
+// `buildFnMap`'s name pass and `criWalkStmt`'s explicit-`return` classification.
+export function criFnIsAnonLambda(i: i32) {
+  if i < 0 || i >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    // The emitter rewrites an anonymous lambda's empty name to `__lambda_N` before this pass
+    // runs, so the prefix is the test and `fnName == ""` never matches a lifted lambda. A
+    // source function never starts with `__lambda`.
+    const nm = fn.fnName
+    return nm.length >= 8 && nm.slice(0, 8) == "__lambda"
+  }
+  false
+}
+
+// Whether the `fnStmts` frame `frame` is `pos` or one of its enclosing frames, following an
+// instance into its origin as `fnIndexOfInScopeSid` does.
+export function fnPosOnScopeChain(frame: i32, pos: i32): boolean {
+  let pp = pos
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if pp == frame { return true }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  false
+}
+
+// `lfFnAt`'s answer for a read at a node a pass appended past the module root.
+export const LF_UNPLACED = -2
+
+// The block-local function named by `sid` that a read at node `readIx` denotes, as a `fnStmts`
+// position, or -1 when none is in scope there. Lexical, so it needs no frame: the arena is
+// post-order, and a declaration's scope is its own subtree and the rest of its block. The
+// innermost wins (D3608).
+export function lfFnAt(sid: i32, readIx: i32): i32 {
+  if readIx < 0 || emitRootIx < 0 { return LF_UNPLACED }
+  // A callee a rewrite minted (a UFCS call's, a cloned generic call's) stands at its source.
+  let atIx = lfMintedOf(readIx)
+  if atIx > emitRootIx { atIx = callOriginOf(atIx) }
+  if atIx > emitRootIx { return LF_UNPLACED }
+  let best = -1
+  let bestFrom = -1
+  if sid < 0 || sid >= lfSidHead.length { return best }
+  let i = lfSidHead[sid]
+  while i >= 0 {
+    // A read inside the declaration sees its own name from the subtree's start.
+    let from = -1
+    if lfDeclLo[i] <= atIx && atIx < lfDeclAt[i] { from = lfDeclLo[i] }
+    else if lfDeclAt[i] < atIx && atIx <= lfDeclBlock[i] { from = lfDeclAt[i] }
+    if from > bestFrom {
+      best = i
+      bestFrom = from
+    }
+    i = lfSidNext[i]
+  }
+  best
+}
+
+// `lfFnAt` asked from frame `fnIx`: in an instance of the declaring frame, the monomorphizer's
+// per-pin clone of the lexical answer is the one called. A clone no row records is found by
+// name on the frame chain, as before.
+export function lfResolveAt(sid: i32, name: string, fnIx: i32, atIx: i32): i32 {
+  const t = lfFnAt(sid, atIx)
+  if t >= 0 && fnIx >= 0 {
+    const pos = fnStmtsPosOf(fnIx)
+    const c = lfCloneOnChain(t, pos)
+    if c >= 0 { return c }
+    if lfChainHasInstance(pos) {
+      const h = nestedFnOnChain(name, fnIx)
+      if h >= 0 && h != t && lfBlockOf(h) < 0 { return h }
+    }
+  }
+  t
+}
+
+// Whether frame position `pos` or a frame enclosing it is a monomorphized instance, the only
+// frames a clone no row records hangs under.
+function lfChainHasInstance(pos: i32): boolean {
+  let pp = pos
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if pp < fnInstOrigin.length && fnInstOrigin[pp] >= 0 { return true }
+    if pp >= fnParent.length { return false }
+    pp = fnParent[pp]
+    steps = steps + 1
+  }
+  false
+}
+
+// The clone of the block-local function at `t` that frame position `pos` or a frame enclosing
+// it is, or declares; -1 when none is.
+export function lfCloneOnChain(t: i32, pos: i32): i32 {
+  if t < 0 || t >= lfCloneHead.length || lfCloneHead[t] < 0 { return -1 }
+  let pp = pos
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if lfOriginOf(pp) == t { return pp }
+    let c = lfCloneHead[t]
+    while c >= 0 {
+      if c < fnParent.length && fnParent[c] == pp { return c }
+      c = lfCloneNext[c]
+    }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  -1
+}
+
+// The function a read of `sid` names once `lfFnAt` found no block-local one in scope: the
+// top-level function of the name, or -1 when the flat map holds only a block-local function,
+// which the read cannot see (D3614).
+export function lfFlatAt(sid: i32): i32 {
+  const flat = sidArrGet(fnIndexBySid, sid)
+  if lfBlockOf(flat) >= 0 { return -1 }
+  flat
+}
+
+// The `fnStmts` position of the nearest function named `name` declared by a frame on
+// `fnIx`'s scope chain, innermost first, or -1 when none is. An instance frame declares none
+// of its origin's nested functions, so the chain continues into the origin (D1817). Callers
+// gate it on `nestedNameBySid`, which is false for most names, so the call is rarely paid.
+export function nestedFnOnChain(name: string, fnIx: i32) {
+  let pp = fnStmtsPosOf(fnIx)
+  // `fnStmts.length` bounds the walk: a parent chain cannot be longer than the function
+  // count, so this terminates even if `fnParent` ever held a cycle.
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    const hit = nestedFnDeclaredIn(name, pp)
+    if hit >= 0 { return hit }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  -1
+}
+
+// `fnIndexOf` but scope-aware for a name referenced inside `fnIx`: when two lifted functions
+// share a name the flat map always returns the first. Resolution walks outward from the
+// calling frame and from an instance into its origin frame, stopping at the first scope
+// declaring `name`; the flat answer stands only past both (D1817).
+export function fnIndexOfInScope(name: string, fnIx: i32) {
+  fnIndexOfInScopeSid(sidLookup(name), name, fnIx)
+}
+
+// The sid-taking primitive, for a caller with no reading position.
+export function fnIndexOfInScopeSid(sid: i32, name: string, fnIx: i32) {
+  fnIndexOfInScopeAt(sid, name, fnIx, -1)
+}
+
+// Whether a parameter named `sid` of frame `fnIx`, or of a frame between it and the frame that
+// declares nested function `fe`, shadows that function: the read is the parameter (D3894).
+function paramShadowsNested(sid: i32, fnIx: i32, fe: i32): boolean {
+  if fe < 0 || fe >= fnParent.length || fnIx < 0 { return false }
+  const declFrame = fnParent[fe]
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && pp != declFrame && pp != fe && steps <= fnStmts.length {
+    const f = P.nodes[fnStmts[pp]]
+    if f is FuncDecl {
+      if fnHasParamSid(f.fnParams, sid) { return true }
+    }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    pp = up
+    steps = steps + 1
+  }
+  false
+}
+
+// The positioned form: `atIx` is the reading identifier's arena node, or -1 when the caller has
+// none, in which case only a parameter on the chain shadows the flat answer (D2289).
+export function fnIndexOfInScopeAt(
+  sid: i32,
+  name: string,
+  fnIx: i32,
+  atIx: i32,
+) {
+  // The chain scan can only succeed for a nested function named `name`; a placed read asks
+  // the block-local scopes instead, which decide it lexically (D3608).
+  let placed = false
+  if sidArrGet(nestedNameBySid, sid) == 1 {
+    const lf = lfResolveAt(sid, name, fnIx, atIx)
+    if lf >= 0 {
+      if paramShadowsNested(sid, fnIx, lf) { return -1 }
+      return lf
+    }
+    placed = lf == -1
+    if !placed && fnIx >= 0 {
+      const hit = nestedFnOnChain(name, fnIx)
+      if hit >= 0 {
+        if paramShadowsNested(sid, fnIx, hit) { return -1 }
+        return hit
+      }
+    }
+  }
+  // No frame on the chain declares a function `name`, so the flat answer is a top-level one or
+  // nested off the chain; a binding of `name` on the chain shadows either (D2289). A placed read
+  // no block-local function covers does not see one the flat map holds (D3614).
+  let flat = sidArrGet(fnIndexBySid, sid)
+  if placed { flat = lfFlatAt(sid) }
+  if flat >= 0 && fnIx >= 0 {
+    let binds = frameBindsCacheGet(fnIx, sid)
+    if binds < 0 {
+      binds = 0
+      if frameChainBindsName(fnIx, name) { binds = 1 }
+      frameBindsCachePut(sid, binds)
+    }
+    if binds == 1 && chainShadowsAt(fnIx, sid, name, atIx) { return -1 }
+  }
+  if flat >= 0 && moduleBlockShadowsAt(fnIx, name, atIx) { return -1 }
+  flat
+}
+
+// True when a module-scope block binding of `name` is in scope at `atIx` in frame `fnIx`
+// (-1 for the start function): asked of the outermost enclosing frame's own declaration,
+// because a lifted frame sees the module block that encloses its source (D2415).
+function moduleBlockShadowsAt(fnIx: i32, name: string, atIx: i32): boolean {
+  if atIx < 0 { return false }
+  if moduleLocalLetOf(emitRootIx, name) < 0 { return false }
+  let at = atIx
+  if fnIx >= 0 {
+    if frameChainBindsName(fnIx, name) { return false }
+    let pp = fnStmtsPosOf(fnIx)
+    let steps = 0
+    while pp >= 0 && steps <= fnStmts.length {
+      at = fnStmts[pp]
+      let up = -1
+      if pp < fnParent.length { up = fnParent[pp] }
+      // An instance's own node is no source position; its origin's declaration is.
+      if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+      if up >= fnStmts.length { up = -1 }
+      pp = up
+      steps = steps + 1
+    }
+  }
+  moduleLocalLetCoversAt(emitRootIx, name, at)
+}
+
+// True when a binding of `name` on `fnIx`'s frame chain is in scope at `atIx`: a parameter of
+// any chain frame, or a block `let` or loop variable whose scope covers the position. An
+// enclosing frame is asked at the nested function's own declaration; `atIx < 0` asks
+// parameters only.
+function chainShadowsAt(fnIx: i32, sid: i32, name: string, atIx: i32): boolean {
+  let pp = fnStmtsPosOf(fnIx)
+  let at = atIx
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    const frame = fnStmts[pp]
+    if paramIndexOf(frame, name) >= 0 { return true }
+    if at >= 0 {
+      const fn = P.nodes[frame]
+      if fn is FuncDecl {
+        if parentLetCoversAt(fn.fnBody, sid, at) { return true }
+        if parentLoopCoversAt(fn.fnBody, sid, at) { return true }
+      }
+    }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    at = frame
+    // An instance's origin declares the same bindings its clone does, which the first frame
+    // already asked about, so the origin itself is asked about parameters only.
+    if up < 0 && pp < fnInstOrigin.length {
+      up = fnInstOrigin[pp]
+      at = -1
+    }
+    if up >= fnStmts.length { up = -1 }
+    pp = up
+    steps = steps + 1
+  }
+  false
+}
+
+// The rep of the RESULT of calling the lifted function at `fnStmts` slot `fe`, or an
+// uncovered descriptor for no slot. The three columns are pushed together in `buildFnMap`'s
+// one loop, so an index valid for any of them is valid for all three; reading them together
+// here is what makes this a descriptor rather than three lookups that can drift.
+export function repOfFnSlot(fe: i32): RepDesc {
+  if fe < 0 || fe >= fRetKind.length { return repDescNone() }
+  repDescRet(fRetKind[fe], fRetStructIdx[fe], fRetRArrElem[fe])
+}
+
+// A resolved slot's stored return kind as a report word, or `declined` for no slot.
+export function repABRetWord(i: i32): string {
+  if i < 0 { return "declined" }
+  if i >= fRetKind.length { return "declined" }
+  fRetKind[i]
+}
+
+// Whether the callee at `calleeIx` declares parameter `pi` in source, as a type naming no type
+// parameter: the argument is then built at that declared type, as an annotation would build it.
+export function calleeParamDeclared(
+  calleeIx: i32,
+  pi: i32,
+  fnIx: i32,
+): boolean {
+  const ce = P.nodes[unwrapParen(calleeIx)]
+  if ce is Ident {
+    const fe = fnIndexOfInScopeAt(
+      sidOfNode(calleeIx),
+      ce.identName,
+      fnIx,
+      calleeIx,
+    )
+    if fe < 0 || fe >= fnStmts.length { return false }
+    const fd = P.nodes[fnStmts[fe]]
+    if fd is FuncDecl {
+      if pi >= fd.fnParams.length { return false }
+      const p = P.nodes[fd.fnParams[pi]]
+      if p is Param {
+        if p.parType < 0 { return false }
+        const tr = P.nodes[p.parType]
+        if tr is TypeRef {
+          if tr.pos < 0 { return false }
+          return !tyHasTyVar(nodeTyIxOf(p.parType))
+        }
+      }
+    }
+  }
+  false
+}
+
+// The variant row of the non-null half `inner` of a `T | null`, when `T` is a union arm by
+// arena identity, else -1.
+export function nulArmRowOfTy(inner: i32): i32 {
+  if inner < 0 { return -1 }
+  if !(T.tys[inner] is TyObj) { return -1 }
+  variantRowOfTy(inner)
+}

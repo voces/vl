@@ -1,0 +1,3189 @@
+// `emit_fn_scans.vl` — what a block or function holds that its lowering must prepare for:
+// push/pop and atom-widening bits, string, equality, map and list ops, and which union arm
+// a closure call reaches.
+
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  Call,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  Member,
+  NullLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  RetStmt,
+  Spread,
+  Unary,
+  WhileStmt,
+  arithRegionSeen,
+  callIsNever,
+} from "./ast"
+import { ifYieldsNoValue } from "./check_if_value"
+import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
+import {
+  nodeEqCmpKind,
+  nodeTyHasTyVar,
+  nodeTyIsLitUnionAlias,
+  nodeTyIsMap,
+  nodeTyIsNulLitUnion,
+  nodeTyIxOf,
+} from "./check_node_tys"
+import { inferRetFnKey } from "./check_side_rows"
+import { EqCmpKind, EqCore, eqCoreKindOfTyToken } from "./check_ty_relate"
+import {
+  isValueUnionName,
+  nameIsLitUnionType,
+  valueAtomKind,
+} from "./check_ty_rep"
+import { T, TyFunc } from "./check_types"
+import {
+  listGetStagesOperand,
+  optChainStagesRecv,
+  recordFitIsStagesRecv,
+  sFieldTypeAt,
+  structIndexByName,
+} from "./emit_atom_kinds"
+import {
+  nulCloFlag,
+  parenUnionArrElemName,
+  parentLetOf,
+  tyNameOf,
+  unionTakesAtomAsStr,
+  unwrapParen,
+} from "./emit_base"
+import { fnStmtsPosOf } from "./emit_capture_frames"
+import {
+  assignTargetReReads,
+  callIsIntrMinMax,
+  captureCountOf,
+  captureValKind,
+  capturedKindOf,
+  catListKindOfExpr,
+  catSameKindOfBin,
+  catWidenSideOfBin,
+  cloCallSigKey,
+  coalesceNicheJoinsToBox,
+  coalesceNulAtomToStr,
+  exprF32Array,
+  exprF64Array,
+  exprI64Array,
+  exprIsClosure,
+  exprIsLitAtom,
+  exprIsStrConcat,
+  exprIsStrMethod,
+  exprMap,
+  exprNulClosure,
+  exprNulLitUnion,
+  exprNulScalarListKind,
+  exprNulStrArray,
+  exprNullableList,
+  exprNullableRefArray,
+  exprNullableRefNiche,
+  exprNullableString,
+  exprRefArray,
+  exprString,
+  exprStringArray,
+  exprStruct,
+  exprU8Array,
+  exprUnion,
+  exprVariantIndex,
+  fnIndexOfNode,
+  forInMapRecv,
+  globalCellKind,
+  globalLetOfSidIn,
+  identIsBoundClosure,
+  identIsEnvCapture,
+  ifJoinAtomMeetsString,
+  listOpRepOf,
+  localIndexOf,
+  mapReadNarrowableSlot,
+  mfRecvKindOf,
+  nulVariantIdxOfExpr,
+  preStmtNarrow,
+  pushPostGuardNarrow,
+  refListSlotOfExpr,
+  setNarrowFromCond,
+  setNarrowFromCondElse,
+  stmtIsTailValue,
+  structIndexOfExpr,
+  unionNameOfExpr,
+  unionNameOfIdentAt,
+} from "./emit_classify"
+import {
+  bcOpen,
+  bcSpineEnter,
+  bcSpineLeave,
+  sigParamTakesAtomStr,
+} from "./emit_closure_callee"
+import {
+  LR_I32,
+  LR_REF,
+  LR_STR,
+  eqRowOfVariant,
+  eqgRepComparable,
+  identShadowMayBeLitAtom,
+  retLitUnionInline,
+  shapeHasCloField,
+  unionArmsNeedCloEq,
+} from "./emit_eq_rows"
+import { cloRetIsString, globalIndexOf } from "./emit_fn_ret_kinds"
+import { ifThenValueIx } from "./emit_if_arm_values"
+import { exprMapOpNotAnOperand } from "./emit_list_rep"
+import {
+  exprStagesAtomNarrow,
+  gLitUnionUsed,
+  letIsLitUnion,
+  pushStagesAtomNarrow,
+} from "./emit_lit_atoms"
+import {
+  PushKind,
+  globalLetOf,
+  maskNarrowFor,
+  narrowedToNullKey,
+  pushKindBit,
+  unmaskNarrow,
+} from "./emit_narrow_slots"
+import {
+  assignTargetSpills,
+  fnDeclaresNonVoid,
+  fnRetNullBearing,
+  ifTailArmIsEmpty,
+  inferNullFallsThrough,
+  isNulScalarListKind,
+  memberCallYieldsValue,
+  nulScalarListBuildKind,
+  retUnionFlag,
+  retValueExitCount,
+  vtKindOfParam,
+  vtKindOfType,
+} from "./emit_nullable_rets"
+import {
+  tyArmPathHasCloValue,
+  tyArmPathIsCloArray,
+  tyArmPathIsClosure,
+  tyArmPathIsMap,
+  tyArmPathIsMapList,
+  unMemIsFuncReachArray,
+} from "./emit_obj_lit_fits"
+import { ifArmValueExpr, paramTypeNode } from "./emit_query"
+import { TK_STR, rlSlotIsKindList, tyKindOf } from "./emit_ref_list_kinds"
+import { msMemberValKindsOf, nodeRepIs, nullValKind } from "./emit_rep"
+import {
+  nameIsRefArray,
+  refArrElemName,
+  refArrElemNameIf,
+} from "./emit_shape_rows"
+import {
+  coalesceChainLeftmost,
+  coalesceResultIsBox,
+  coalesceResultUnionName,
+} from "./emit_start_block"
+import {
+  FC_MAP,
+  LBK_REF,
+  RLK_I32_LIST,
+  fnStmts,
+  fnUsesCloEq,
+  modFcpSpillHit,
+  modFcpSpillSeen,
+  modIntMinMaxHit,
+  modIntMinMaxSeen,
+  narrowTop,
+  rlElemKindTbl,
+  sFieldCount,
+  sHeapIdx,
+  uDeclared,
+} from "./emit_state"
+import { declaredKind, sFieldIndex } from "./emit_struct_order"
+import { coalesceRetypedAtomToStr, restoreNarrow } from "./emit_ty_canon"
+import {
+  armPathArenaDeclined,
+  nodeTyUnionHasMapArm,
+  unionArmTys,
+  unionHasClosureArm,
+  unionHasClosureArrayArm,
+  unionHasMapArm,
+  unionHasMapArrayArm,
+} from "./emit_union_atoms"
+import {
+  StashWant,
+  minMaxRecordedFloat,
+  structIdxHasReboxVariant,
+} from "./emit_union_casts"
+import {
+  isUNameAB,
+  msMemberAtomsOfSet,
+  msSetOfText,
+  printNarrowKeepsBox,
+  printNarrowKey,
+  printNarrowLiveAtoms,
+  printPlanNullPinned,
+  printPlanPinNull,
+  unionHasAtomAB,
+  unionMemberSetOf,
+  unionSetHasNull,
+} from "./emit_union_registry"
+import { strListHas } from "./listutil"
+import { strContains } from "./strutil"
+import { sidOfNode } from "./symbols"
+import { arrElemNameRaw, nameIsQuotedLeaf, splitUnionAtoms } from "./tyname"
+import { tyStepElem } from "./tyquery"
+
+// Classify the `.push` or `.pop` receiver at `objIx` into its PushKind bits with one classifier
+// fan-out: the ref, str, f64, i64 and f32 list kinds, or the i32 list kind when none claim it.
+function pushKindBitsOf(objIx: i32, fnIx: i32) {
+  let bits = 0
+  if exprRefArray(objIx, fnIx) { bits = bits | 2 }
+  if exprStringArray(objIx, fnIx) { bits = bits | 4 }
+  if exprF64Array(objIx, fnIx) { bits = bits | 8 }
+  if exprI64Array(objIx, fnIx) { bits = bits | 16 }
+  if exprF32Array(objIx, fnIx) { bits = bits | 32 }
+  // The packed byte list gets its own bit, and so its own scratch quad: its value slot is an
+  // i32 like the plain list's, but its backing and receiver refs are not.
+  if exprU8Array(objIx, fnIx) { bits = bits | 128 }
+  // Bit 64 is additive to bit 4, not an alternative: a `(string | null)[]` push uses the string
+  // quad, one backing, and only its value slot changes — to `(ref null $sTypeIdx)`, since the
+  // pushed value may be `null`. `exprNulStrArray` is the same predicate the element read and
+  // the for-in loop var ask, so the frame cannot disagree with the value.
+  if exprNulStrArray(objIx, fnIx) { bits = bits | 4 | 64 }
+  if bits == 0 { return 1 }
+  bits
+}
+
+// The receiver-kind bits of a `recv.push(x)` member call, or 0 when `callIx` is no such call.
+// Detects which inline-push scratch locals a function needs; the kinds get distinct scratch
+// frames so a function may push onto any mix. Asked at value positions too (D1592): `.push`
+// yields the new length, so `const n = xs.push(2)` runs the same grow sequence.
+export function callPushBits(callIx: i32, fnIx: i32) {
+  const s = P.nodes[callIx]
+  if s is Call {
+    const callee = P.nodes[s.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        let b = pushKindBitsOf(callee.memObj, fnIx)
+        if pushStagesAtomNarrow(callIx) { b = b | 256 }
+        if listOpRecvStages(callee.memObj, fnIx) { b = b | 512 }
+        return b
+      }
+    }
+  }
+  0
+}
+
+// True when captured `name` of lifted frame `fnIx` rides a NULLABLE list env field — the
+// capture twin of `globalNulListCellRead`: a staged list-op receiver must recover it non-null.
+export function capturedNulListCellRead(fnIx: i32, name: string): boolean {
+  if !identIsEnvCapture(fnIx, name) { return false }
+  const k = captureValKind(fnStmtsPosOf(fnIx), name)
+  k == "nullist" || k == "nulreflist" || isNulScalarListKind(k)
+}
+
+// True if a list op on receiver `objIx` must materialize the wrapper ref into the frame's one
+// `recvRef` slot rather than referencing a local in place. A frame slot holding a union box
+// narrowed to a list arm stages too, and is asked of the slot because this walk runs with no
+// narrowing active. Two readers must agree: `callPopBits` and `emitPush` (D1280).
+function listOpRecvStages(objIx: i32, fnIx: i32): boolean {
+  const recv = P.nodes[objIx]
+  if recv is Ident {
+    if identSlotIsUnionBox(fnIx, recv.identName) { return true }
+    if localIndexOf(fnIx, recv.identName) >= 0 { return false }
+    if identIsEnvCapture(fnIx, recv.identName) { return true }
+    return globalIndexOf(recv.identName) >= 0
+  }
+  true
+}
+
+// The receiver-kind bits of a `recv.pop()` at `callIx` whose receiver is a struct-field or
+// global-field array read, or 0 otherwise. A bare-local pop needs no scratch, referencing the
+// local in place, so it reports no bits — only a `Member` receiver, which must be materialized
+// into the push frame's `recvRef` slot.
+function callPopBits(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      // `.clear()` resolves its receiver the way `.pop()` does, and since D1281 so does
+      // `.get(i)`, which shares `.pop`'s body. `.get` is gated on the receiver being a list,
+      // because a map `.get(k)` is a different lowering and `pushKindBitsOf`'s no-bits
+      // fallback would hand it the i32-list quad it never uses.
+      let getIsList = false
+      if callee.memProp == "get" {
+        getIsList = mfRecvKindOf(callee.memObj, fnIx) != null
+      }
+      let clearIsList = false
+      if callee.memProp == "clear" {
+        clearIsList = !exprMap(callee.memObj, fnIx)
+      }
+      if callee.memProp == "pop" || clearIsList || getIsList {
+        // Bit 512 rides along: this op parks its receiver in the frame's one `recvRef` slot,
+        // which is what `emitPush` must know about its own pushed value (D1592).
+        if listOpRecvStages(callee.memObj, fnIx) {
+          return pushKindBitsOf(callee.memObj, fnIx) | 512
+        }
+      }
+    }
+  }
+  0
+}
+
+// True if the call at `callIx` is a `recv.push(x)` whose receiver's list kind matches `kind` —
+// the single-kind view of `callPushBits`, for the ref-slot collectors.
+export function callIsPushKind(callIx: i32, fnIx: i32, kind: PushKind) {
+  (callPushBits(callIx, fnIx) & pushKindBit(kind)) != 0
+}
+
+// True if `callIx` is a `Member` or global-receiver `.pop` or `.clear` of list kind `kind` —
+// the single-kind view of `callPopBits`, for the ref-slot collectors.
+export function callIsMemberPopKind(callIx: i32, fnIx: i32, kind: PushKind) {
+  (callPopBits(callIx, fnIx) & pushKindBit(kind)) != 0
+}
+
+// The pop and staging bits of every arm VALUE of the `if` chain at `ifIx`. The block walk asks
+// only of statement kinds that can hold a `.push`, and an arm's tail value can be any expression
+// that meets the join's destination (D2199).
+function ifChainArmValueBits(ifIx: i32, fnIx: i32) {
+  let bits = 0
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      bits = bits | exprPopBits(ifArmValueExpr(s.ifThen), fnIx)
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          bits = bits | exprPopBits(ifArmValueExpr(s.ifElse), fnIx)
+        }
+      }
+    }
+  }
+  bits
+}
+
+// The `Member`-receiver `.pop` kind bits anywhere in the expression at `exprIx`. A `.pop`
+// appears in value position, so the reservation walk must descend expressions rather than
+// only statement receivers.
+export function exprPopBits(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  if exprStagesAtomNarrow(exprIx, fnIx) {
+    // Or'd in and the descent continues: the staging slot is one shared local, so a second
+    // site inside the same expression needs nothing more, but the `.pop` bits below still do.
+    return 256 | exprPopBitsGo(exprIx, fnIx)
+  }
+  exprPopBitsGo(exprIx, fnIx)
+}
+
+function exprPopBitsGo(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return 0 }
+  const e = P.nodes[exprIx]
+  if e is Call {
+    // A `.push` in value position (D1592) runs the same grow sequence a statement one does and
+    // needs the same scratch frame. This walk is the one that descends value positions, so it
+    // asks for both here rather than growing a second walker whose node set could drift.
+    let bits = callPopBits(exprIx, fnIx) | callPushBits(exprIx, fnIx)
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      bits = bits | exprPopBits(args[i], fnIx)
+      i = i + 1
+    }
+    return bits
+  }
+  if e is BinExpr {
+    return exprPopBits(e.binLeft, fnIx) | exprPopBits(e.binRight, fnIx)
+  }
+  if e is Member { return exprPopBits(e.memObj, fnIx) }
+  // The `?.` receiver, walked like the `.` one above (D1667).
+  if e is OptMember { return exprPopBits(e.omObj, fnIx) }
+  if e is Index {
+    return exprPopBits(e.idxArr, fnIx) | exprPopBits(e.idxIndex, fnIx)
+  }
+  if e is Unary { return exprPopBits(e.unArg, fnIx) }
+  if e is Paren { return exprPopBits(e.parInner, fnIx) }
+  // An if-EXPRESSION's arms are value positions too: `if c { xs.push(1) } else { 0 }` runs
+  // the grow sequence inside the arm and needs the frame reserved (D1992).
+  if e is IfStmt {
+    return ifChainPushPopBits(exprIx, fnIx) | ifChainArmValueBits(exprIx, fnIx)
+  }
+  // The four remaining value positions, taught from this file's own sibling walker
+  // `exprHasMapOp`. `emitExpr` lowers all four into `emitPop` and `emitPopOr`, which test no
+  // `fnUses*Push` flag, so a `.pop()` in an array-literal element, an object-literal field
+  // value or an `as`-cast operand would stage into a frame `fbBeginFunc` never reserved.
+  if e is AsExpr { return exprPopBits(e.asObj, fnIx) }
+  if e is IsExpr { return exprPopBits(e.isObj, fnIx) }
+  // A spread's source is an operand like any other (D2334).
+  if e is Spread { return exprPopBits(e.spdArg, fnIx) }
+  if e is ObjLit {
+    let bits = 0
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit { bits = bits | exprPopBits(f.fiValue, fnIx) }
+      i = i + 1
+    }
+    return bits
+  }
+  if e is ArrayLit {
+    let bits = 0
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      bits = bits | exprPopBits(elems[i], fnIx)
+      i = i + 1
+    }
+    return bits
+  }
+  0
+}
+
+// One walk of the block at `blockIx`, descending into if, else, while and for bodies — the
+// scopes `collectLocals` walks — accumulating both the statement-level `.push` receiver kinds
+// and the `Member`-receiver `.pop` kinds in every let-init, return, condition, for-header and
+// expression-statement position. `if` conditions are scanned by `ifChainPushPopBits`.
+export function blockPushPopBits(blockIx: i32, fnIx: i32) {
+  let bits = 0
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        bits = bits | exprPopBits(s.letInit, fnIx)
+      } else if s is RetStmt {
+        bits = bits | exprPopBits(s.retArg, fnIx)
+      } else if s is BinExpr {
+        bits = bits | exprPopBits(stmts[i], fnIx)
+      } else if s is Call {
+        // `exprPopBits` asks `callPushBits` of every `Call` it reaches (D1592), so the
+        // statement receiver is covered by the same descent as a value-position one.
+        bits = bits | exprPopBits(stmts[i], fnIx)
+      } else if s is IfStmt {
+        bits = bits | ifChainPushPopBits(stmts[i], fnIx)
+      } else if s is WhileStmt {
+        bits = bits
+          | exprPopBits(s.whileCond, fnIx)
+          | blockPushPopBits(s.whileBody, fnIx)
+      } else if s is ForIn {
+        bits = bits
+          | exprPopBits(s.fiIter, fnIx)
+          | blockPushPopBits(s.fiBody, fnIx)
+      } else if s is ForRange {
+        bits = bits
+          | exprPopBits(s.frFrom, fnIx)
+          | exprPopBits(s.frTo, fnIx)
+          | exprPopBits(s.frStep, fnIx)
+          | blockPushPopBits(s.frBody, fnIx)
+      }
+      i = i + 1
+    }
+  }
+  bits
+}
+
+// The push and pop kind bits of every arm of the `if` chain at `ifIx` — the then-branch, an
+// `else` block, or recursively a chained `else if`. Mirrors the recursion in `collectLocalsIf`
+// so a push buried under several arms is detected. The condition is walked too: `emitPop` and
+// `emitPopOr` test no `fnUses*Push` flag, so a `.pop()` there needs the frame reserved.
+function ifChainPushPopBits(ifIx: i32, fnIx: i32) {
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let bits = 0
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      bits = bits
+        | exprPopBits(s.ifCond, fnIx)
+        | blockPushPopBits(s.ifThen, fnIx)
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          bits = bits | blockPushPopBits(s.ifElse, fnIx)
+        }
+      }
+    }
+  }
+  bits
+}
+
+// A literal-union atom pushed into a `string[]` widens to its member string, which stages the
+// atom id in the string-op scratch frame — the emit's reservation side. The receiver test is
+// the list's element type and the value test is the value's rep, a pairing `emitPush`'s other
+// seeds do not make. Deliberately a superset: `(string | null)[]` takes an earlier arm.
+function pushWidensAtomToStr(callIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "push" {
+        if c.callArgs.length == 1 {
+          if exprStringArray(callee.memObj, fnIx) {
+            if exprIsLitAtom(c.callArgs[0], fnIx) { return true }
+            if identShadowMayBeLitAtom(c.callArgs[0], fnIx) { return true }
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if the `Call` at `callIx` passes a literal-union atom into a parameter that widens it to
+// a string — a `string` param, or a boxed union param with a litunion or `string` arm, whose
+// store lowers through `emitAtomToStr` exactly as the `string` param does. An
+// over-approximation is fine here: it only reserves a frame.
+function callWidensAtomToStr(callIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Ident {
+      const target = fnIndexOfNode(c.callFn)
+      if target >= 0 {
+        const cFn = P.nodes[fnStmts[target]]
+        if cFn is FuncDecl {
+          let anyAtom = false
+          let ai = 0
+          while ai < c.callArgs.length {
+            if exprIsLitAtom(c.callArgs[ai], fnIx) { anyAtom = true }
+            if identShadowMayBeLitAtom(c.callArgs[ai], fnIx) { anyAtom = true }
+            ai = ai + 1
+          }
+          if anyAtom {
+            const params = cFn.fnParams
+            let pi = 0
+            while pi < params.length {
+              if vtKindOfParam(params[pi]) == "str" { return true }
+              const pn = P.nodes[params[pi]]
+              if pn is Param {
+                if unionTakesAtomAsStr(tyNameOf(pn.parType)) { return true }
+              }
+              pi = pi + 1
+            }
+          }
+        }
+      }
+    }
+    // A function-value callee has no `FuncDecl` to read its parameters off, so the kinds come
+    // from the resolved `$fnsig` key — the same byte `emitCallRef`'s widening arm reads, so the
+    // scan and the handler cannot disagree about which positions widen. Without this leg the
+    // widening writes to a local the vector never declared.
+    const vkey = cloCallSigKey(callIx, fnIx)
+    if vkey != "" {
+      let vAtom = false
+      let vi = 0
+      while vi < c.callArgs.length {
+        if exprIsLitAtom(c.callArgs[vi], fnIx) { vAtom = true }
+        if identShadowMayBeLitAtom(c.callArgs[vi], fnIx) { vAtom = true }
+        vi = vi + 1
+      }
+      if vAtom {
+        let vp = 0
+        while vp < c.callArgs.length {
+          // A box parameter may hold the atom as its string arm; the key names no union, so
+          // the frame is reserved for any box parameter.
+          if sigParamTakesAtomStr(vkey, vp) { return true }
+          vp = vp + 1
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if the assignment at `binIx` writes a literal-union atom into a target that widens it to
+// a string — a `string`-typed lvalue, which `exprString` covers for a local, global or field
+// alike, or a boxed union lvalue with a litunion or `string` arm. Either way the atom widens to
+// its member string, riding the string-op scratch frame.
+function assignWidensAtomToStr(binIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  const a = P.nodes[binIx]
+  if a is BinExpr {
+    if a.binOp == "=" {
+      if (
+        exprIsLitAtom(a.binRight, fnIx)
+        || identShadowMayBeLitAtom(a.binRight, fnIx)
+      ) {
+        if exprString(a.binLeft, fnIx) { return true }
+        if unionTakesAtomAsStr(unionNameOfExpr(a.binLeft, fnIx)) { return true }
+        // A string-valued map target (`m["k"] = <atom>`): `exprString`'s `Index` arm asks
+        // `exprStringArray(idxArr)`, which declines for a map receiver, so neither test above
+        // fires and the string-op scratch frame goes unreserved for the widen
+        // `emitMapSetValExpr` performs. Without it `strScratchBase` aliases `mapScratchBase`.
+        const at = P.nodes[unwrapParen(a.binLeft)]
+        if at is Index {
+          if nodeTyIsMap(at.idxArr) { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if `initIx` is a literal-union atom read in a global initializer — an `Ident`
+// referencing another module global whose declared type is a literal union, or a call
+// returning a litunion alias. Gates the start function's `string`-global widening and its
+// scratch-frame reservation.
+export function globalInitIsLitAtom(initIx: i32) {
+  if initIx < 0 { return false }
+  const e = P.nodes[unwrapParen(initIx)]
+  if e is Ident {
+    const gli = globalLetOf(e.identName)
+    if gli >= 0 {
+      if letIsLitUnion(gli) { return true }
+      // A `K | null` niche global widens too, its `-1` to `null` (D3198).
+      return exprNulLitUnion(initIx, -1)
+    }
+  }
+  // A call returning a litunion alias is the other atom form a module-global initializer can
+  // take: the start function's own coercion widens it through `exprIsLitAtom`'s `Call` arm, so
+  // the scan has to claim it too or the frame is not there.
+  const r2 = exprIsLitAtom(initIx, -1)
+  r2
+}
+
+// True if the global at `letIx` is a cell that widens a literal-union atom initializer to its
+// member string in the start function, riding the string-op scratch frame: a `string` cell or
+// its nullable, or a boxed union cell with a litunion or `string` arm. This is the one position
+// whose frame belongs to the start function, so its miss cannot be masked from inside one.
+export function globalInitWidensAtomToStr(letIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if letIx < 0 { return false }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    const gk = globalCellKind(letIx)
+    let takes = false
+    if gk == "str" || gk == "nulstr" { takes = true }
+    if !takes && d.letType >= 0 {
+      if unionTakesAtomAsStr(tyNameOf(d.letType)) { takes = true }
+    }
+    if !takes { return false }
+    const r = globalInitIsLitAtom(d.letInit)
+    return r
+  }
+  false
+}
+
+// True if the binding at `letIx` is annotated with a target that widens a literal-union atom
+// initializer to its member string, riding the string-op scratch frame: `: string`, a boxed
+// union with a litunion or `string` arm, and the array of one, whose literal elements each take
+// the same store. The array leg covers the element position `exprHasStrOp`'s ArrayLit arm misses.
+function letWidensAtomToStr(letIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    // A binding with no initializer (a loop value's result binding) widens nothing here.
+    if d.letType >= 0 && d.letInit >= 0 {
+      const tn = tyNameOf(d.letType)
+      if unionTakesAtomAsStr(tn) {
+        if exprIsLitAtom(d.letInit, fnIx) { return true }
+        if identShadowMayBeLitAtom(d.letInit, fnIx) { return true }
+      }
+      const el = parenUnionArrElemName(tn)
+      if el != "" && unionTakesAtomAsStr(el) {
+        if arrLitHasAtomElem(d.letInit, fnIx) { return true }
+      }
+    }
+  }
+  false
+}
+
+// True if the expression at `ix` is an array literal with at least one literal-union atom
+// element. The element-position half of `letWidensAtomToStr`.
+function arrLitHasAtomElem(ix: i32, fnIx: i32) {
+  if ix < 0 { return false }
+  const e = P.nodes[unwrapParen(ix)]
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprIsLitAtom(elems[i], fnIx) { return true }
+      if identShadowMayBeLitAtom(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if `retArgIx` is a literal-union atom returned from a function whose return type widens
+// it to a string — `string`, or a boxed union with a litunion or `string` arm. It widens at the
+// return, riding the string-op scratch frame. An inline literal-union return reps as a string
+// ref and so widens an atom operand; a named alias reps as the atom itself and must not.
+function retWidensAtomToStr(retArgIx: i32, fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if retArgIx < 0 { return false }
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if unionTakesAtomAsStr(tyNameOf(fn.fnRet)) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
+    }
+    // The inline literal-union return, mirroring the arm of the same name in
+    // `emitReturnValue`'s widen ladder. This is a reservation pass and that is an emit pass,
+    // and the two must claim the same set arm for arm, or the widen runs against unreserved
+    // locals. Reachable only through a monomorphized instance, whose element read is an atom.
+    if retLitUnionInline(fn.fnRet) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
+    }
+    // The inferred-string dual, mirroring `emitReturnValue`'s widen: an un-annotated function
+    // whose recorded return is `string` — one path returning a member literal, another the
+    // atom — widens an atom return too, so reserve the frame.
+    if fn.fnRet < 0 && cloRetIsString(fnStmtsPosOf(fnIx)) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
+    }
+    // An inferred union return holding the atom as its string (`K|i32`, D2952).
+    if (
+      fn.fnRet < 0
+      && unionTakesAtomAsStr(inferRetNameOf(inferRetFnKey(fnIx, fn.fnName)))
+    ) {
+      if exprIsLitAtom(retArgIx, fnIx) { return true }
+      if identShadowMayBeLitAtom(retArgIx, fnIx) { return true }
+    }
+  }
+  false
+}
+
+// The implicit-return twin of `retWidensAtomToStr`, and the reason the pair exists: a VL
+// function's value is its last statement, so `emitFuncBody` routes that statement through
+// `emitReturnExit` or `emitIfTail` and both reach the same `emitReturnValue` widen. The
+// reservation scan has to ask the atom-widening question in tail position too.
+function fnTailWidensAtomToStr(fnIx: i32) {
+  if gLitUnionUsed == 0 { return false }
+  if fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const savedTop = narrowTop
+    const hit = tailBlockWidensAtomToStr(fn.fnBody, fnIx)
+    restoreNarrow(savedTop)
+    return hit
+  }
+  false
+}
+
+// Mirrors `emitStmtsTail`: every statement but the last is an ordinary statement, walked here
+// only for the post-guard narrowing the tail value is classified under, exactly as the emit
+// loop does, and the last one is the block's value.
+function tailBlockWidensAtomToStr(blockIx: i32, fnIx: i32) {
+  if blockIx < 0 { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    const n = stmts.length
+    if n == 0 { return false }
+    let i = 0
+    while i < n - 1 {
+      preStmtNarrow(stmts[i])
+      pushPostGuardNarrow(stmts[i], fnIx)
+      i = i + 1
+    }
+    preStmtNarrow(stmts[n - 1])
+    return tailStmtWidensAtomToStr(stmts[n - 1], fnIx)
+  }
+  false
+}
+
+// Mirrors `emitStmtTail`: a tail `if` whose arms yield values recurses into both arms under the
+// same narrowing `emitIfTail` applies, an `else if` being a lone nested `IfStmt` still in tail
+// position; any other tail value statement widens exactly like a `return` of it.
+function tailStmtWidensAtomToStr(stmtIx: i32, fnIx: i32) {
+  if P.nodes[stmtIx] is IfStmt {
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). The
+    // outermost else narrowing restored is the state the nested restores would have left.
+    let elseTop = -1
+    let hit = false
+    let cur = stmtIx
+    while cur >= 0 {
+      const s = P.nodes[cur]
+      const at = cur
+      cur = -1
+      if s is IfStmt {
+        if lastStmtIsValueIf(at, fnIx) || elseLessNullableTail(at, fnIx) {
+          const savedTop = narrowTop
+          const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+          const hitThen = tailBlockWidensAtomToStr(s.ifThen, fnIx)
+          if narrowed { restoreNarrow(savedTop) }
+          if hitThen {
+            hit = true
+          } else if s.ifElse >= 0 {
+            const savedElseTop = narrowTop
+            if setNarrowFromCondElse(s.ifCond, fnIx) {
+              if elseTop < 0 { elseTop = savedElseTop }
+            }
+            const els = P.nodes[s.ifElse]
+            if els is Block { hit = tailBlockWidensAtomToStr(s.ifElse, fnIx) }
+            else if els is IfStmt { cur = s.ifElse }
+            else { hit = tailStmtWidensAtomToStr(s.ifElse, fnIx) }
+          }
+        }
+      }
+    }
+    if elseTop >= 0 { restoreNarrow(elseTop) }
+    return hit
+  }
+  if !stmtIsTailValue(stmtIx, fnIx) { return false }
+  retWidensAtomToStr(stmtIx, fnIx)
+}
+
+// True if `binIx` is `==`/`!=` whose operands are strings (string value-equality).
+export function exprIsStrEq(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      // A comparison with `null` is a null check, handled by the nullable `ref.is_null` paths,
+      // never element-wise string equality — a `string | null` operand would otherwise be
+      // element-compared against `null`.
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return false }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return false }
+      return exprString(e.binLeft, fnIx) || exprString(e.binRight, fnIx)
+    }
+  }
+  false
+}
+
+// True if `binIx` is an ordering comparison whose operands are text — a lexicographic compare
+// (`emitStrLessCore`), not the numeric `i32.lt_s` path. Both operands must be text. "Text" is
+// wider than "string ref": a litunion whose type is a registered alias reps as the interned
+// atom, and comparing two ids follows interning order rather than member text.
+export function exprIsStrOrder(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const op = e.binOp
+    if op == "<" || op == ">" || op == "<=" || op == ">=" {
+      return strOrderOperandIsText(e.binLeft, fnIx)
+        && strOrderOperandIsText(e.binRight, fnIx)
+    }
+  }
+  false
+}
+
+// One ordering operand's is-this-text test: a string ref, or a literal-union atom that widens
+// to its member string. Exactly the set `emitStrValue` can push as a string, which is what
+// makes one predicate safe as both the dispatch and the frame reservation. A mixed `s < k` is
+// claimed: the checker accepts the spelling, and declining leaves a ref under `i32.lt_s`.
+function strOrderOperandIsText(ix: i32, fnIx: i32) {
+  if exprString(ix, fnIx) { return true }
+  exprIsLitAtom(ix, fnIx)
+}
+
+// True if `binIx` is a `==` or `!=` whose union-box value compare can hit the string arm — a
+// box compared against a string operand, or two boxes whose shared arms include `string`.
+// Those payload compares stage their operands in the string scratch frame, so it must be
+// reserved.
+function exprIsUnionStrEq(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const lU = exprUnion(e.binLeft, fnIx)
+      const rU = exprUnion(e.binRight, fnIx)
+      if lU && rU {
+        const ln = unionNameOfExpr(e.binLeft, fnIx)
+        const rn = unionNameOfExpr(e.binRight, fnIx)
+        return unionHasAtomAB(
+          11,
+          ln,
+          nodeTyIxOf(unwrapParen(e.binLeft)),
+          "string",
+        )
+          && unionHasAtomAB(
+          12,
+          rn,
+          nodeTyIxOf(unwrapParen(e.binRight)),
+          "string",
+        )
+      }
+      // A literal-union atom operand reaches the box's string arm too, by widening to its
+      // member string, which stages the id in this very frame. The handler and this scan have
+      // to claim the same operands or the frame is unreserved under a `local.set`.
+      if lU {
+        return exprString(e.binRight, fnIx) || exprIsLitAtom(e.binRight, fnIx)
+      }
+      if rU {
+        return exprString(e.binLeft, fnIx) || exprIsLitAtom(e.binLeft, fnIx)
+      }
+    }
+  }
+  false
+}
+
+// ── the one row resolution for a `==`, in three namespaces ───────────────────
+// Read by the frame-reservation scan and by the core emitter alike: a compare the scan does
+// not know about is emitted against locals the function never declared. Each answers on
+// agreement only, and returns a table index (-1 none) — a bare eq row of -1 is variant row 0.
+
+// The union-variant row both operands of a `==` or `!=` resolve to, or -1.
+export function binEqVariantRow(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const lvi = exprVariantIndex(e.binLeft, fnIx)
+      if lvi >= 0 && lvi == exprVariantIndex(e.binRight, fnIx) { return lvi }
+    }
+  }
+  -1
+}
+
+// The nullable-niche variant row both operands resolve to, or -1 — the `Circle | null` twin of
+// `binEqVariantRow`, off `nulVariantIdxOfExpr`. Kept separate rather than laddered into one
+// resolver: the two reach different emitters, and a resolver answering for both would let the
+// unguarded dispatch claim a niche pair if the guard's dispatch ever stopped running first.
+export function binEqNulVariantRow(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const lvi = nulVariantIdxOfExpr(e.binLeft, fnIx)
+      if lvi >= 0 && lvi == nulVariantIdxOfExpr(e.binRight, fnIx) { return lvi }
+    }
+  }
+  -1
+}
+
+// The struct-table row both operands resolve to, or -1.
+export function binEqStructRow(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      const lsi = structIndexOfExpr(e.binLeft, fnIx)
+      const rsi = structIndexOfExpr(e.binRight, fnIx)
+      if lsi >= 0 && lsi == rsi { return lsi }
+      // D959 — two different rows that share a heap type are one wasm type, and VL is
+      // structurally typed, so they are one VL type too: two same-shaped declarations get two
+      // struct-table rows and one emitted struct. The heap index is the test, not the field
+      // lists, and both must be resolved — an unassigned row is not evidence of agreement.
+      if (
+        lsi >= 0
+        && rsi >= 0
+        && lsi < sHeapIdx.length
+        && rsi < sHeapIdx.length
+      ) {
+        if sHeapIdx[lsi] >= 0 && sHeapIdx[lsi] == sHeapIdx[rsi] { return lsi }
+      }
+    }
+  }
+  -1
+}
+
+// True if `binIx` is a same-layout field-wise `==` or `!=` — over a standalone struct or over
+// a union arm, non-null or through the nullable niche. Its string and array field compares
+// stage operands in the string-op scratch frame, so it counts as a string op for reservation.
+function exprIsStructEq(binIx: i32, fnIx: i32) {
+  if binEqStructRow(binIx, fnIx) >= 0 { return true }
+  if binEqVariantRow(binIx, fnIx) >= 0 { return true }
+  binEqNulVariantRow(binIx, fnIx) >= 0
+}
+
+// The list-op operand core of an expression: `"i32list"`, `"strlist"` or `"reflist"` (an
+// `i32[][]`), or `"none"` for a non-list or an unsupported element kind. The four
+// distinct-backing scalar lists decline here; `eqgListKindOfBin` claims them (D755).
+function listOpKindOf(exprIx: i32, fnIx: i32): EqCore {
+  const lr = listOpRepOf(exprIx, fnIx)
+  if lr.lrRep == LR_STR { return "strlist" }
+  if lr.lrRep == LR_REF {
+    if rlSlotIsKindList(lr.lrSlot, 4) { return "reflist" }
+    return "none"
+  }
+  if lr.lrRep == LR_I32 { return "i32list" }
+  "none"
+}
+
+// The concat rep of a list `+` `BinExpr`, or -1. Two operands of one rep and slot answer that
+// rep; ref lists at different slots have different heap types, so `array.copy` between them
+// would not validate. Otherwise one operand that widens into the other's rep
+// (`catWidenSideOfBin`) answers the wider operand's kind.
+export function catListKindOfBin(binIx: i32, fnIx: i32) {
+  const k = catSameKindOfBin(binIx, fnIx)
+  if k >= 0 || binIx < 0 { return k }
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const side = catWidenSideOfBin(binIx, fnIx)
+    if side == 2 { return catListKindOfExpr(e.binLeft, fnIx) }
+    if side == 1 { return catListKindOfExpr(e.binRight, fnIx) }
+  }
+  -1
+}
+
+// The ref-list row a list `+` concatenates at, or 0 for a rep that is not slot-keyed: the
+// widened-into operand's row for a mixed pair, else `listOpSlotOfBin`'s.
+export function catSlotOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if catSameKindOfBin(binIx, fnIx) < 0 {
+      let into = -1
+      const side = catWidenSideOfBin(binIx, fnIx)
+      if side == 2 { into = e.binLeft }
+      if side == 1 { into = e.binRight }
+      if into >= 0 {
+        const s = refListSlotOfExpr(into, fnIx)
+        if s >= 0 { return s }
+        return 0
+      }
+    }
+  }
+  listOpSlotOfBin(binIx, fnIx)
+}
+
+// One `==` operand's list rep, in `catListKindOfExpr`'s alphabet, through a `| null`.
+// `emitNulNicheEq` guards the compare and then runs the rep's own core on the unwrapped refs,
+// so a niche and its base share one core by construction. `catListKindOfExpr`'s classifiers
+// are non-null, so without this the guard is emitted and the core underneath finds no frame.
+function eqgListKindOfExpr(exprIx: i32, fnIx: i32) {
+  const k = catListKindOfExpr(exprIx, fnIx)
+  if k >= 0 { return k }
+  // The four distinct-backing nullable scalar lists, off the same home the build side reads
+  // them through.
+  const nk = exprNulScalarListKind(exprIx, fnIx)
+  if isNulScalarListKind(nk) { return nulScalarListBuildKind(nk) }
+  if exprNullableRefArray(exprIx, fnIx) {
+    if refListSlotOfExpr(exprIx, fnIx) >= 0 { return LBK_REF }
+  }
+  -1
+}
+
+// `lopK` is this node's own `listOpKindOfBin`, passed in rather than re-derived: every caller
+// holds it. Threaded and not memoised — the answer reads the emitter's live tables and the
+// narrowing stack, so a memo would need a generation key a caller holding the value does not.
+
+// The generic-compare rep of a `==` or `!=` whose operands are both lists of one rep that has
+// no core of its own, or -1. Both must resolve to the same rep and the same ref-list slot, as
+// `catListKindOfBin` requires and for the same reason: two ref lists at different slots have
+// different wrapper and backing heap types, and one core cannot read both.
+export function eqgListKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      // A bare `null` operand is a null test, not a value compare.
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return -1 }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return -1 }
+      // The three existing cores decide every shape they claim.
+      if lopK != "none" { return -1 }
+      // So does the checker's own token, the stronger of the two gates: `eqCmpKindOfOperand`
+      // names the core the checker accepted this program for, so a token naming one of the old
+      // three is that core's shape however the classifiers read it. A token of `"none"` is the
+      // opaque case — a monomorphized instance — where the classifiers are the only channel.
+      const tl = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binLeft, fnIx))
+      if tl != "none" && tl != "glist" { return -1 }
+      const tr = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binRight, fnIx))
+      if tr != "none" && tr != "glist" { return -1 }
+      const lk = eqgListKindOfExpr(e.binLeft, fnIx)
+      if lk < 0 { return -1 }
+      if eqgListKindOfExpr(e.binRight, fnIx) != lk { return -1 }
+      let sl = 0
+      if lk == LBK_REF {
+        const ls = refListSlotOfExpr(e.binLeft, fnIx)
+        if ls < 0 { return -1 }
+        if refListSlotOfExpr(e.binRight, fnIx) != ls { return -1 }
+        sl = ls
+      }
+      if !eqgRepComparable(lk, sl, 0) { return -1 }
+      return lk
+    }
+  }
+  -1
+}
+
+// The ref-list slot a list `==`, `!=` or `+` `BinExpr` runs over, read off its left operand,
+// or 0 for a rep that is not slot-keyed. Split from the op's kind rather than packed into its
+// return value: the callers needing the slot need the kind too, and an encoded pair is a
+// decode at every site.
+export function listOpSlotOfBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    const s = refListSlotOfExpr(e.binLeft, fnIx)
+    if s >= 0 { return s }
+  }
+  0
+}
+
+// The list-op kind of a `==`, `!=` or `+` whose operands are both lists of one kind, or `"none"`
+// when it is not a list op, leaving the caller its existing dispatch.
+export function listOpKindOfBin(binIx: i32, fnIx: i32): EqCore {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
+      const lk = listOpKindOf(e.binLeft, fnIx)
+      if lk == "none" { return "none" }
+      const rk = listOpKindOf(e.binRight, fnIx)
+      if rk != lk { return "none" }
+      return lk
+    }
+  }
+  "none"
+}
+
+// ── `==` compare-core selection — the one home ───────────────────────────────
+
+// `lopK` is this node's own `listOpKindOfBin`, threaded in for the reason `eqgListKindOfBin`
+// states: both are asked of one node by callers that already hold the answer.
+
+// Which compare core a `==` needs, or `"none"`. Read by the frame-reservation scan and by
+// the core emitter, which must never disagree: a core the scan does not know about is emitted
+// against locals the function never declared. `nodeEqCmpKind` is the classifiers' fallback.
+export function eqCoreKindOfBin(binIx: i32, fnIx: i32, lopK: EqCore): EqCore {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      // A bare `null` operand makes this a null test, which consumes no compare core at all.
+      // Claiming one here would reserve a compare frame for every `xs != null` guard in the
+      // language and shift every local index after it.
+      if P.nodes[unwrapParen(e.binLeft)] is NullLit { return "none" }
+      if P.nodes[unwrapParen(e.binRight)] is NullLit { return "none" }
+      if lopK != "none" { return lopK }
+      // The generic list compare, above the string and closure rungs for the same reason the
+      // three cores above it are: a list operand must be claimed by a list answer before a
+      // scalar ladder reads it. Its own home declines every shape `listOpKindOfBin` claims, so
+      // this rung can only add a rep that had no core at all.
+      if eqgListKindOfBin(binIx, fnIx, lopK) >= 0 { return "glist" }
+      if exprIsStrEq(binIx, fnIx) { return "str" }
+      if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
+        return "closure"
+      }
+      const tl = eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binLeft, fnIx))
+      if tl != "none" { return tl }
+      return eqCoreKindOfTyToken(eqCmpKindOfOperand(e.binRight, fnIx))
+    }
+  }
+  "none"
+}
+
+// ── the emitter's own name for a nullable ref niche, `fnIx`-scoped ────────────
+// The second channel of `binEqNulNiche`: the same six tokens, read off the emitter's rep
+// classifiers rather than the checker's banked type, which inside a monomorphized instance is
+// the type variable and answers "" (D42). Exactly the six niches whose non-null core exists.
+export function exprNulNicheKind(exprIx: i32, fnIx: i32): EqCmpKind {
+  if exprIx < 0 { return "" }
+  if exprNullableString(exprIx, fnIx) { return "nulstr" }
+  // `exprNullableRefNiche`, not the struct-only twin: a nullable union variant is a
+  // `(ref null $uVarHeap[vi])` whose arena type is a `TyObj`, so the other channel names it
+  // `nulstruct` too, and a channel answering differently would be a second guess.
+  if exprNullableRefNiche(exprIx, fnIx) { return "nulstruct" }
+  if exprNulClosure(exprIx, fnIx) { return "nulclosure" }
+  if exprNullableList(exprIx, fnIx) { return "nullist" }
+  if exprNulScalarListKind(exprIx, fnIx) == "nulstrlist" { return "nulstrlist" }
+  // The generic core's niche on the second channel. `eqCmpKindOfNulInner` names `nulglist` on
+  // the first, so a written-out `f64[] | null == null` takes the guard; inside a monomorphized
+  // instance the banked type is `T | null` and that channel answers "", so without this arm
+  // `emitEqRecoverNarrowed` emits `ref.as_non_null` on a genuinely null operand.
+  const nsk = exprNulScalarListKind(exprIx, fnIx)
+  if isNulScalarListKind(nsk) {
+    // `nulstrlist` is claimed one line up, having the string-list core; the other three
+    // distinct-backing niches are exactly the generic core's.
+    if nsk != "nulstrlist" { return "nulglist" }
+  }
+  if exprNullableRefArray(exprIx, fnIx) {
+    const slot = refListSlotOfExpr(exprIx, fnIx)
+    if slot >= 0 && slot < rlElemKindTbl.length {
+      if rlElemKindTbl[slot] == RLK_I32_LIST { return "nulreflist" }
+      if eqgRepComparable(LBK_REF, slot, 0) { return "nulglist" }
+    }
+  }
+  ""
+}
+
+// ── one `==` operand's lowering token, across both channels ──────────────────
+// The checker's banked type first, the emitter's own `fnIx`-scoped rep classifiers when — and
+// only when — it still contains a type variable. Both consumers ask this, one deciding whether
+// the compare needs a null guard and the other which core goes under it (D421).
+export function eqCmpKindOfOperand(exprIx: i32, fnIx: i32): EqCmpKind {
+  const k = nodeEqCmpKind(exprIx)
+  if k != "" { return k }
+  if !nodeTyHasTyVar(exprIx) { return "" }
+  exprNulNicheKind(exprIx, fnIx)
+}
+
+export function cloEqNoteBin(binIx: i32, fnIx: i32) {
+  const e = P.nodes[binIx]
+  if e is BinExpr {
+    if e.binOp == "==" || e.binOp == "!=" {
+      if exprIsClosure(e.binLeft, fnIx) || exprIsClosure(e.binRight, fnIx) {
+        fnUsesCloEq = true
+        return 0
+      }
+      // And the arms of a union operand (D1096), which the legs below cannot see: they read
+      // the binary's own operands and here those are boxes. A union `==` compares the arm its
+      // tag selects, and which arm runs is a runtime test, so every arm of either operand has
+      // to be reserved for. Over-reserving costs two locals; under-reserving is invalid wasm.
+      if unionArmsNeedCloEq(unionNameOfExpr(e.binLeft, fnIx)) {
+        fnUsesCloEq = true
+      }
+      if unionArmsNeedCloEq(unionNameOfExpr(e.binRight, fnIx)) {
+        fnUsesCloEq = true
+      }
+      // The struct leg stays left-only, deliberately, and is not `binEqStructRow`. A
+      // reservation scan may over-reserve and may not under-reserve, and this one fires on the
+      // left operand's row alone, so a pair the emitter will refuse still reserves the frame.
+      // Tightening it to the shared agreement resolver moves bytes for no defect.
+      const si = structIndexOfExpr(e.binLeft, fnIx)
+      if si >= 0 {
+        const seen: i32[] = []
+        if shapeHasCloField(si, seen) { fnUsesCloEq = true }
+        return 0
+      }
+      // The variant leg is agreement-gated, because that is exactly when the emitter emits a
+      // variant compare — reserve for the compare that will be produced, no wider.
+      let vi = binEqVariantRow(binIx, fnIx)
+      if vi < 0 { vi = binEqNulVariantRow(binIx, fnIx) }
+      if vi >= 0 {
+        const vseen: i32[] = []
+        if shapeHasCloField(eqRowOfVariant(vi), vseen) { fnUsesCloEq = true }
+      }
+    }
+  }
+  0
+}
+
+// True if `callIx` is a `recv.indexOf(sub)` or `recv.includes(sub)` over a string receiver —
+// both ride the same indexOf scan, `includes` negating the -1 compare.
+export function exprIsStrIndexOf(callIx: i32, fnIx: i32) {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "indexOf" || callee.memProp == "includes" {
+        return exprString(callee.memObj, fnIx)
+      }
+    }
+  }
+  false
+}
+
+// True when a `.length` over `recvIx` reads a literal-union atom, which widens to its string.
+export function memberLenWidensAtom(recvIx: i32, fnIx: i32): boolean {
+  if !exprIsLitAtom(recvIx, fnIx) { return false }
+  !exprString(recvIx, fnIx) || readsGlobalAtomCell(recvIx, fnIx)
+}
+
+// True when `ix` names a module global whose cell is the literal-union atom (`K`, `K | null`):
+// `exprString` answers for its narrowed read as for a `string | null` global, but the cell is an i32.
+function readsGlobalAtomCell(ix: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(ix)]
+  if !(e is Ident) { return false }
+  const li = globalLetOfSidIn(fnIx, sidOfNode(unwrapParen(ix)), unwrapParen(ix))
+  li >= 0 && globalCellKind(li) == "i32"
+}
+
+// True if the expression at `exprIx`, or any sub-expression, is a string `+`, `==` or
+// `.slice`.
+export function exprHasStrOp(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is BinExpr {
+    if arithRegionSeen && e.binRegion != 0 && !bcOpen {
+      return exprHasStrOpHeld(exprIx, fnIx)
+    }
+    if exprIsStrConcat(exprIx, fnIx) { return true }
+    if exprIsStrEq(exprIx, fnIx) { return true }
+    // A string ordering rides the same lexicographic compare loop.
+    if exprIsStrOrder(exprIx, fnIx) { return true }
+    // A union-box `==` whose value compare can hit the string arm stages its payloads in the
+    // same frame.
+    if exprIsUnionStrEq(exprIx, fnIx) { return true }
+    // A struct `==` stages its string and array field compares in the same frame.
+    if exprIsStructEq(exprIx, fnIx) { return true }
+    // An assignment of a literal-union atom into a `string` target widens, which stages the
+    // atom id in the string-op scratch frame.
+    if assignWidensAtomToStr(exprIx, fnIx) { return true }
+    if gLitUnionUsed != 0 && e.binOp == "??" {
+      if coalesceNulAtomToStr(exprIx, fnIx) { return true }
+      // A literal-union atom default of a `string | null` operand widens through the same
+      // frame (`emitCoalesceAtomStrDefault`); over-reserving costs only locals.
+      if exprIsLitAtom(e.binRight, fnIx) { return true }
+      if coalesceRetypedAtomToStr(exprIx, fnIx) { return true }
+    }
+    if exprHasStrOp(e.binLeft, fnIx) { return true }
+    return exprHasStrOp(e.binRight, fnIx)
+  }
+  if e is Call {
+    if exprIsStrMethod(exprIx, fnIx, "slice") { return true }
+    // A literal-union atom argument flowing into a `string` param widens, which stages the
+    // atom id in the string-op scratch frame.
+    if callWidensAtomToStr(exprIx, fnIx) { return true }
+    // `xs.push(atom)` into a `string[]` widens the same way — its twin emit arm is in
+    // `emitPush`.
+    if pushWidensAtomToStr(exprIx, fnIx) { return true }
+    // `s.indexOf(sub)` and `s.includes(sub)` stage their receiver, needle and loop counters in
+    // the same string scratch frame. `charCodeAt` is a bare `array.get` and needs no frame; its
+    // operands recurse below.
+    if exprIsStrIndexOf(exprIx, fnIx) { return true }
+    // `print(<string>)` rides the string-op scratch frame: the streaming loop's string ref,
+    // cursor and length live there.
+    const pcal = P.nodes[e.callFn]
+    if pcal is Ident {
+      if pcal.identName == "print" {
+        if e.callArgs.length == 1 {
+          if exprString(e.callArgs[0], fnIx) { return true }
+          // `print(<literal-union atom>)` widens to its member string, and its per-member
+          // print chain rides the same string-op scratch frame.
+          if exprIsLitAtom(e.callArgs[0], fnIx) { return true }
+          if identShadowMayBeLitAtom(e.callArgs[0], fnIx) { return true }
+          // `print(<string | null>)` streams through `emitPrintNulString`, which `local.set`s
+          // the ref it recovers into the same frame. The two ends of one decision must ask the
+          // same question: `exprNullableString` is strictly wider than `exprString`, so where
+          // the handler claims a value the scan does not, the frame is never reserved.
+          if exprNullableString(e.callArgs[0], fnIx) { return true }
+          // `print(<value-union box>)` with a string arm streams that arm through the same
+          // tail, out of the same frame. Asked through the shared plan, which is what the
+          // handler dispatches on, so reservation and lowering cannot disagree about the arm.
+          if printUnionHasStrArm(e.callArgs[0], fnIx) { return true }
+        }
+      }
+      // `__trap__(<string>)` prints its reason through the same string streaming loop before
+      // the abort, so it rides the string-op scratch frame too.
+      if pcal.identName == "__trap__" {
+        if e.callArgs.length == 1 {
+          if exprString(e.callArgs[0], fnIx) { return true }
+        }
+      }
+      // `fromCodePoints(xs)` stages its length and result there too.
+      if pcal.identName == "fromCodePoints" { return true }
+    }
+    if exprHasStrOp(e.callFn, fnIx) { return true }
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasStrOp(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if e is Member {
+    // A `.length` over a literal-union atom widens it, staging the id in this frame.
+    if e.memProp == "length" && memberLenWidensAtom(e.memObj, fnIx) {
+      return true
+    }
+    return exprHasStrOp(e.memObj, fnIx)
+  }
+  // The `?.` receiver, walked like the `.` one above (D1667).
+  if e is OptMember { return exprHasStrOp(e.omObj, fnIx) }
+  if e is Index {
+    if exprHasStrOp(e.idxArr, fnIx) { return true }
+    return exprHasStrOp(e.idxIndex, fnIx)
+  }
+  // An if-expression in value position: a string op in the condition or either arm needs the
+  // frame reserved too.
+  if e is IfStmt {
+    if exprHasStrOp(e.ifCond, fnIx) { return true }
+    // An atom arm under a `string`-typed join widens, staging the atom id in the string-op
+    // frame. Mirrors the emit decision: the join type recorded by the checker, any arm.
+    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeRepIs(exprIx, "nulstr") {
+      if ifChainHasAtomArm(exprIx, fnIx) { return true }
+    }
+    // A join the generic body shares, typed at a hole: the instance may lower it as a string,
+    // and over-reserving costs only locals.
+    if fnIx >= 0 && nodeTyHasTyVar(exprIx) {
+      if ifChainHasAtomArm(exprIx, fnIx) { return true }
+    }
+    // The same widening reached through the arms, where the join records one arm's type.
+    if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
+    // An atom arm boxed into a join whose union holds it as its string (`K|i32`, D2952).
+    if (
+      gLitUnionUsed != 0
+      && unionTakesAtomAsStr(coalesceResultUnionName(exprIx))
+    ) {
+      if ifChainHasAtomArm(exprIx, fnIx) { return true }
+    }
+    if blockHasStrOp(e.ifThen, fnIx) { return true }
+    if e.ifElse < 0 { return false }
+    // An `else if` link is an if-expression of its own, not a block (D3355).
+    if P.nodes[e.ifElse] is IfStmt { return exprHasStrOp(e.ifElse, fnIx) }
+    return blockHasStrOp(e.ifElse, fnIx)
+  }
+  if e is Unary { return exprHasStrOp(e.unArg, fnIx) }
+  if e is Paren { return exprHasStrOp(e.parInner, fnIx) }
+  if e is IsExpr {
+    // A string-literal `is` (`s is "a"`) lowers through `emitStrEqCore`, so it stages operands
+    // in the string scratch frame like a string `==`. The quoted-leaf test is at its home in
+    // `tyname.nameIsQuotedLeaf`, with the `length > 0` bound in front of it.
+    if e.isVariant.length > 0 && nameIsQuotedLeaf(e.isVariant) { return true }
+    return exprHasStrOp(e.isObj, fnIx)
+  }
+  if e is AsExpr { return exprHasStrOp(e.asObj, fnIx) }
+  if e is ObjLit {
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasStrOp(f.fiValue, fnIx) { return true }
+        // A literal-union atom field value widens to a string for a `string` field. Any atom
+        // field value is destined for one, and a literal-union field is not yet a rep, so this
+        // is a safe over-approximation.
+        if exprIsLitAtom(f.fiValue, fnIx) { return true }
+        if identShadowMayBeLitAtom(f.fiValue, fnIx) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  // A spread's source is an operand like any other (D2334).
+  if e is Spread { return exprHasStrOp(e.spdArg, fnIx) }
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasStrOp(elems[i], fnIx) { return true }
+      // A literal-union atom element of a string-array literal widens to its member string,
+      // which stages the atom id in the string-op scratch frame — the emit's reservation side.
+      // Deliberately not gated on the literal being a string list: `arrLitIsStr` is an
+      // emit-time classification this scan does not repeat, and over-reserving only costs locals.
+      if exprIsLitAtom(elems[i], fnIx) { return true }
+      if identShadowMayBeLitAtom(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// `exprHasStrOp` of a long chain's root, inside a session over its region, as an emission is.
+function exprHasStrOpHeld(exprIx: i32, fnIx: i32) {
+  const opened = bcSpineEnter(exprIx, fnIx)
+  const r = exprHasStrOp(exprIx, fnIx)
+  bcSpineLeave(opened)
+  r
+}
+
+// True if any arm tail of the value if chain at `ifIx` is a literal-union atom: under a
+// `string`-typed join the atom arm widens to its member string, which rides the string-op
+// scratch frame.
+function ifChainHasAtomArm(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const tv = ifThenValueIx(ifIx)
+    if tv >= 0 {
+      if exprIsLitAtom(tv, fnIx) { return true }
+      if identShadowMayBeLitAtom(tv, fnIx) { return true }
+    }
+    if s.ifElse >= 0 {
+      const els = P.nodes[s.ifElse]
+      if els is IfStmt { return ifChainHasAtomArm(s.ifElse, fnIx) }
+      if els is Block {
+        const ev = ifArmValueExpr(s.ifElse)
+        if ev >= 0 {
+          if exprIsLitAtom(ev, fnIx) { return true }
+          return identShadowMayBeLitAtom(ev, fnIx)
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if any statement in the block at `blockIx` contains a string op, descending into if and
+// else branches and while bodies — the scopes `collectLocals` walks. The wrapper restores the
+// narrowing depth the scan's post-guard pushes may leave behind on an early `true`.
+export function blockHasStrOp(blockIx: i32, fnIx: i32) {
+  const savedGuardTop = narrowTop
+  const hit = blockHasStrOpScan(blockIx, fnIx)
+  restoreNarrow(savedGuardTop)
+  hit
+}
+
+function blockHasStrOpScan(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      preStmtNarrow(stmts[i])
+      const s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasStrOp(s.letInit, fnIx) { return true }
+        // A literal-union atom initializing a `string` local widens — reserve the frame.
+        if letWidensAtomToStr(stmts[i], fnIx) { return true }
+      } else if s is RetStmt {
+        if exprHasStrOp(s.retArg, fnIx) { return true }
+        // A literal-union atom returned as `string` widens — reserve the string-op frame.
+        if retWidensAtomToStr(s.retArg, fnIx) { return true }
+      } else if s is BinExpr {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is Call {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is ObjLit {
+        // A bare trailing object-literal statement is a function's implicit-return value, and
+        // its field initializers can contain string ops, so descend — `exprHasStrOp` walks
+        // `objFields`.
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is Member {
+        // A bare trailing member access is also an implicit-return value, and its receiver may
+        // be a string op, such as `s.slice(a, b).length`. Without this the slice's scratch
+        // frame goes unreserved and the slice emit references an unallocated local.
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is Index {
+        // Likewise a trailing `xs[i]` or `m[k]` index whose receiver or key uses a string op.
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is ArrayLit {
+        // A trailing array literal is an implicit-return value, and a literal-union atom
+        // element of a string list widens there exactly as it does at a `let`. `exprHasStrOp`'s
+        // own ArrayLit arm asks the per-element atom question; this arm routes a tail literal
+        // to it.
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is Paren {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is Unary {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is IsExpr {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is AsExpr {
+        if exprHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is IfStmt {
+        if ifChainHasStrOp(stmts[i], fnIx) { return true }
+      } else if s is WhileStmt {
+        if exprHasStrOp(s.whileCond, fnIx) { return true }
+        if blockHasStrOp(s.whileBody, fnIx) { return true }
+      } else if s is ForIn {
+        if exprHasStrOp(s.fiIter, fnIx) { return true }
+        if blockHasStrOp(s.fiBody, fnIx) { return true }
+      } else if s is ForRange {
+        if exprHasStrOp(s.frFrom, fnIx) { return true }
+        if exprHasStrOp(s.frTo, fnIx) { return true }
+        if exprHasStrOp(s.frStep, fnIx) { return true }
+        if blockHasStrOp(s.frBody, fnIx) { return true }
+      }
+      // Post-guard complement narrowing, mirroring the emit loops, so a string read below a
+      // returning guard is detected under the same narrowing the emit applies. The wrapper
+      // restores the depth.
+      pushPostGuardNarrow(stmts[i], fnIx)
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` chain at `ifIx` contains a string op — its condition, then-branch,
+// `else` block, or recursively a chained `else if`. Mirrors `ifChainPushPopBits`: it walks the
+// whole chain, not just one level.
+function ifChainHasStrOp(ifIx: i32, fnIx: i32) {
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990). The
+  // outermost else narrowing restored is the state the nested restores would have left.
+  let elseTop = -1
+  let hit = false
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      if exprHasStrOp(s.ifCond, fnIx) {
+        hit = true
+      } else {
+        // Narrow across the then-branch, mirroring `emitStmt` and `collectLocalsIf`, so a string
+        // op over a narrowed variant field is detected — `exprString` resolves a variant field's
+        // string type only while the receiver's narrowing is active. Save and restore the depth.
+        const savedTop = narrowTop
+        const narrowed = setNarrowFromCond(s.ifCond, fnIx)
+        hit = blockHasStrOp(s.ifThen, fnIx)
+        if narrowed { restoreNarrow(savedTop) }
+      }
+      if !hit && s.ifElse >= 0 {
+        // A value union narrows to the complement set in the else-arm, mirroring `emitStmt`'s
+        // else lowering, so `else { print(v) }` with `v` now `string` is detected as a string
+        // print and reserves the scratch frame.
+        const savedElseTop = narrowTop
+        if setNarrowFromCondElse(s.ifCond, fnIx) {
+          if elseTop < 0 { elseTop = savedElseTop }
+        }
+        const els = P.nodes[s.ifElse]
+        if els is Block { hit = blockHasStrOp(s.ifElse, fnIx) }
+        else if els is IfStmt { cur = s.ifElse }
+      }
+    }
+  }
+  if elseTop >= 0 { restoreNarrow(elseTop) }
+  hit
+}
+
+// True if the `FuncDecl` at `fnIx` uses any string op, so it reserves the shared string
+// scratch frame. The statement scan covers every op reachable from a statement; the tail leg
+// covers the one position that is a return without being spelled as one.
+export function fnHasStrOp(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if blockHasStrOp(fn.fnBody, fnIx) { return true }
+    return fnTailWidensAtomToStr(fnIx)
+  }
+  false
+}
+
+// Is the node at `ix` a builtin `fromCodePoints(e)` whose argument is not a bare name? Such
+// an argument is evaluated once into the spill slot, because the lowering wants the list's
+// backing AND its length and a second emission would re-run the argument's effects. One home
+// for the question, so the frame reserved and the code emitted cannot disagree (D1640).
+export function callSpillsFcpArg(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is Call) { return false }
+  if n.callArgs.length != 1 { return false }
+  const cf = n.callFn
+  const a0 = n.callArgs[0]
+  if cf < 0 || a0 < 0 { return false }
+  const callee = P.nodes[cf]
+  if !(callee is Ident) { return false }
+  if callee.identName != "fromCodePoints" { return false }
+  // A user function of the same name is not the builtin, exactly as `emitCall` reads it.
+  if fnIndexOfNode(cf) >= 0 { return false }
+  const ai = unwrapParen(a0)
+  if ai < 0 { return false }
+  const a = P.nodes[ai]
+  !(a is Ident)
+}
+
+// Does the module spill a `fromCodePoints` argument anywhere? The `moduleHasNumCast` twin,
+// reserving the one reference slot by the same linear arena walk and memoised the same way.
+export function moduleHasFcpSpill(): boolean {
+  if modFcpSpillHit { return true }
+  let i = modFcpSpillSeen
+  while i < P.nodes.length {
+    if callSpillsFcpArg(i) {
+      modFcpSpillHit = true
+      return true
+    }
+    i = i + 1
+  }
+  modFcpSpillSeen = P.nodes.length
+  false
+}
+
+// Does the module hold a `min` / `max` that may lower at an integer width? Any intrinsic call
+// `minMaxKind` does not decide as a float from its recorded type, so a generic body's call
+// reserves the frame for its instances.
+export function moduleHasIntMinMax(): boolean {
+  if modIntMinMaxHit { return true }
+  let i = modIntMinMaxSeen
+  while i < P.nodes.length {
+    if callIsIntrMinMax(i, -1) && minMaxRecordedFloat(i) == "" {
+      modIntMinMaxHit = true
+      return true
+    }
+    i = i + 1
+  }
+  modIntMinMaxSeen = P.nodes.length
+  false
+}
+
+// True if the statement/expression tree at `ix` contains a function-value call (a `Call`
+// whose callee is a closure value rather than a known function name) — so the function
+// needs the closure scratch slot for `call_ref`.
+export function blockHasCallRef(ix: i32, fnIx: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is Call {
+    const callee = P.nodes[n.callFn]
+    let isVal = false
+    // A call by name to a module function with no captures is a plain `call`: no frame.
+    let isDirect = false
+    if callee is Ident {
+      let t = fnIndexOfNode(n.callFn)
+      // A live closure binding of the name is what the call denotes, so the frame needs
+      // the scratch even though a module function carries the name — without it the
+      // `call_ref` spills into a local the vector never declared (D1602).
+      if t >= 0 && identIsBoundClosure(callee.identName, fnIx) { t = -1 }
+      if t < 0 {
+        if exprIsClosure(n.callFn, fnIx) { isVal = true }
+        // `t()` where `t` is a union binding with a bare-closure arm: the `is`-narrowing
+        // that makes `t` a closure isn't active in this pre-pass, so reserve conservatively.
+        if !isVal && calleeIsUnionClosureIdent(n.callFn, fnIx) { isVal = true }
+      } else {
+        // A direct call to a capturing function is lowered via call_ref too.
+        if captureCountOf(t) > 0 { isVal = true } else { isDirect = true }
+      }
+    } else {
+      if exprIsClosure(n.callFn, fnIx) { isVal = true }
+      // `p[0]()` where `p` is a union with a closure-array arm: the `is`-narrowing needed to
+      // see it isn't active in this pre-pass, so reserve conservatively (a spare local is harmless).
+      if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
+        isVal = true
+      }
+      // `t0.f[0]()` through a union struct-arm's closure-array field: same pre-pass
+      // narrowing gap, reserved conservatively (the indexed-member twin of the arm above).
+      if !isVal && calleeIsUnionArmCloArrayIndex(n.callFn, fnIx) {
+        isVal = true
+      }
+      // `t0.f.f()` through a union struct-arm's closure-field chain: same gap, reserved
+      // conservatively — an unreserved `call_ref` would spill into the next frame's local.
+      if !isVal && calleeIsUnionArmClosureMember(n.callFn, fnIx) {
+        isVal = true
+      }
+      // `t0[0].f()` where `t0`'s union has a ref-array arm whose element struct carries a
+      // closure field — the indexed-element-field twin of the arms above.
+      if !isVal && calleeIsUnionElemFieldClosure(n.callFn, fnIx) {
+        isVal = true
+      }
+    }
+    // The typed-IR net for any callee spelling the syntactic classifiers above miss: the
+    // checker records every callee's own checked type, so one that types as a closure
+    // reserves the scratch regardless of shape or depth — covering narrowed callees the
+    // syntactic union-closure chain above cannot see. Over-reservation is harmless.
+    if !isVal && !isDirect {
+      const cty = nodeTyIxOf(n.callFn)
+      if cty >= 0 {
+        if T.tys[cty] is TyFunc { isVal = true }
+      }
+    }
+    if isVal { return true }
+    if blockHasCallRef(n.callFn, fnIx) { return true }
+    const args = n.callArgs
+    let i = 0
+    while i < args.length {
+      if blockHasCallRef(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is Block {
+    const stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if blockHasCallRef(stmts[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { return blockHasCallRef(n.letInit, fnIx) }
+    return false
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { return blockHasCallRef(n.retArg, fnIx) }
+    return false
+  }
+  if n is IfStmt {
+    if blockHasCallRef(n.ifCond, fnIx) { return true }
+    if blockHasCallRef(n.ifThen, fnIx) { return true }
+    if n.ifElse >= 0 { return blockHasCallRef(n.ifElse, fnIx) }
+    return false
+  }
+  if n is WhileStmt {
+    if blockHasCallRef(n.whileCond, fnIx) { return true }
+    return blockHasCallRef(n.whileBody, fnIx)
+  }
+  if n is ForRange {
+    if blockHasCallRef(n.frFrom, fnIx) { return true }
+    if blockHasCallRef(n.frTo, fnIx) { return true }
+    if n.frStep >= 0 {
+      if blockHasCallRef(n.frStep, fnIx) { return true }
+    }
+    return blockHasCallRef(n.frBody, fnIx)
+  }
+  if n is ForIn {
+    if blockHasCallRef(n.fiIter, fnIx) { return true }
+    return blockHasCallRef(n.fiBody, fnIx)
+  }
+  if n is BinExpr {
+    if blockHasCallRef(n.binLeft, fnIx) { return true }
+    return blockHasCallRef(n.binRight, fnIx)
+  }
+  if n is Unary { return blockHasCallRef(n.unArg, fnIx) }
+  if n is Paren { return blockHasCallRef(n.parInner, fnIx) }
+  // An `is` operand (`f(x) is i32`) may itself be a function-value call — without this the
+  // closure scratch slot (`callRefSlot`) goes unreserved and the inline `call_ref` reads a
+  // non-existent local 0.
+  if n is IsExpr { return blockHasCallRef(n.isObj, fnIx) }
+  if n is AsExpr { return blockHasCallRef(n.asObj, fnIx) }
+  if n is Member { return blockHasCallRef(n.memObj, fnIx) }
+  // A `?.` RECEIVER is lowered exactly as a `.` one is (`emitOptChainIsNull` emits it), so a
+  // function-value call under it needs the same slot; without this arm the `call_ref` spills
+  // into a local the vector never declared (D1667).
+  if n is OptMember { return blockHasCallRef(n.omObj, fnIx) }
+  if n is Index {
+    if blockHasCallRef(n.idxArr, fnIx) { return true }
+    return blockHasCallRef(n.idxIndex, fnIx)
+  }
+  if n is ObjLit {
+    const fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if blockHasCallRef(f.fiValue, fnIx) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  // A spread's source is an operand like any other (D2334).
+  if n is Spread { return blockHasCallRef(n.spdArg, fnIx) }
+  if n is ArrayLit {
+    const elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      if blockHasCallRef(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if the expression at `exprIx` is a multi-field struct-returning call — a
+// non-re-readable source, since a call can't be re-evaluated per field — whose result
+// shape must be re-boxed into a variant-box union arm, the one case
+// `emitStructExprAsVariantBox` stashes in `variantReboxSlot`. Drives that slot's reservation.
+function exprIsMultiFieldReboxCall(exprIx: i32, fnIx: i32): boolean {
+  const inner = unwrapParen(exprIx)
+  if inner < 0 { return false }
+  const n = P.nodes[inner]
+  if !(n is Call) { return false }
+  if !exprStruct(inner, fnIx) { return false }
+  const ssi = structIndexOfExpr(inner, fnIx)
+  // `structIndexOfExpr` can return a variant index (its own heap table) for a variant-
+  // returning call, not a struct-table index. Bounded to the struct table so it's never
+  // misused as one — a variant-returning call never reboxes; it builds the variant directly.
+  if ssi < 0 || ssi >= sFieldCount.length { return false }
+  if sFieldCount[ssi] <= 1 { return false }
+  structIdxHasReboxVariant(ssi)
+}
+
+// Does the single node at `ix` need the stash `want` names?
+function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
+  match want {
+    "rebox" => {
+      return exprIsMultiFieldReboxCall(ix, fnIx)
+    }
+    "optrecv" => {
+      if optChainStagesRecv(ix) { return true }
+      // A record-fit `is` over a receiver that is not a re-readable place stages it here too.
+      if recordFitIsStagesRecv(ix) { return true }
+      // The `??` niche join stages its operand in the SAME slot: it evaluates the nullable ref
+      // once, tests it and reads it back on the non-null path (D1714). Sharing the reservation
+      // is sound because the two never stage inside one another — a `?.` operand of a joining
+      // `??` has finished with its own base by the time the join tees over it.
+      if coalesceNicheJoinsToBox(ix, fnIx) { return true }
+      // A left-nested chain is re-associated at emit time, so any link may become a niche
+      // join the original nodes do not show; a boxed chain reserves the slot for all of them.
+      if !coalesceResultIsBox(ix) { return false }
+      const cj = P.nodes[ix]
+      if cj is BinExpr {
+        return coalesceChainLeftmost(cj.binLeft) != unwrapParen(cj.binLeft)
+      }
+      return false
+    }
+    "listget" => {
+      return listGetStagesOperand(ix)
+    }
+  }
+}
+
+// Whether the tree at `ix` holds a node needing the `want` stash, so the function reserves
+// its slot. Mirrors `blockHasCallRef`'s traversal; under-reserving the rebox slot fails
+// loudly and the `?.` one is invalid wasm, so the walk over-approximates for both.
+export function blockHasStash(ix: i32, fnIx: i32, want: StashWant): boolean {
+  if ix < 0 { return false }
+  if stashHitAt(ix, fnIx, want) { return true }
+  const n = P.nodes[ix]
+  if n is Call {
+    if blockHasStash(n.callFn, fnIx, want) { return true }
+    const args = n.callArgs
+    let i = 0
+    while i < args.length {
+      if blockHasStash(args[i], fnIx, want) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is Block {
+    const stmts = n.blkStmts
+    let i = 0
+    while i < stmts.length {
+      if blockHasStash(stmts[i], fnIx, want) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if n is LetDecl {
+    if n.letInit >= 0 { return blockHasStash(n.letInit, fnIx, want) }
+    return false
+  }
+  if n is RetStmt {
+    if n.retArg >= 0 { return blockHasStash(n.retArg, fnIx, want) }
+    return false
+  }
+  if n is IfStmt {
+    if blockHasStash(n.ifCond, fnIx, want) { return true }
+    if blockHasStash(n.ifThen, fnIx, want) { return true }
+    if n.ifElse >= 0 { return blockHasStash(n.ifElse, fnIx, want) }
+    return false
+  }
+  if n is WhileStmt {
+    if blockHasStash(n.whileCond, fnIx, want) { return true }
+    return blockHasStash(n.whileBody, fnIx, want)
+  }
+  if n is ForRange {
+    if blockHasStash(n.frFrom, fnIx, want) { return true }
+    if blockHasStash(n.frTo, fnIx, want) { return true }
+    if n.frStep >= 0 {
+      if blockHasStash(n.frStep, fnIx, want) { return true }
+    }
+    return blockHasStash(n.frBody, fnIx, want)
+  }
+  if n is ForIn {
+    if blockHasStash(n.fiIter, fnIx, want) { return true }
+    return blockHasStash(n.fiBody, fnIx, want)
+  }
+  if n is BinExpr {
+    if blockHasStash(n.binLeft, fnIx, want) { return true }
+    return blockHasStash(n.binRight, fnIx, want)
+  }
+  if n is Unary { return blockHasStash(n.unArg, fnIx, want) }
+  if n is Paren { return blockHasStash(n.parInner, fnIx, want) }
+  if n is IsExpr { return blockHasStash(n.isObj, fnIx, want) }
+  if n is AsExpr { return blockHasStash(n.asObj, fnIx, want) }
+  if n is Member { return blockHasStash(n.memObj, fnIx, want) }
+  // A `?.` RECEIVER is lowered exactly as a `.` one is, so a stash needed under it belongs
+  // to the enclosing frame (D1667).
+  if n is OptMember { return blockHasStash(n.omObj, fnIx, want) }
+  if n is Index {
+    if blockHasStash(n.idxArr, fnIx, want) { return true }
+    return blockHasStash(n.idxIndex, fnIx, want)
+  }
+  if n is ObjLit {
+    const fields = n.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if blockHasStash(f.fiValue, fnIx, want) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  // A spread's source is an operand like any other (D2334).
+  if n is Spread { return blockHasStash(n.spdArg, fnIx, want) }
+  if n is ArrayLit {
+    const elems = n.arrElems
+    let i = 0
+    while i < elems.length {
+      if blockHasStash(elems[i], fnIx, want) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  false
+}
+
+// The variant-rebox reservation's own question (`variantReboxSlot`), the walk's first
+// claimant.
+export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
+  blockHasStash(ix, fnIx, "rebox")
+}
+
+// True if `stmtIx` is usable as an if-expression arm value: a plain tail value, a member call
+// the checker typed non-void (`s.slice(a, b)`, D1992), or a nested if-expression. Kept apart
+// from `stmtIsTailValue`, whose lambda-return walk reads the last statement of ANY block and
+// must keep a non-tail `if c { xs.pop() }` a statement.
+export function ifArmIsValue(stmtIx: i32, fnIx: i32) {
+  if stmtIsTailValue(stmtIx, fnIx) { return true }
+  if memberCallYieldsValue(stmtIx) { return true }
+  // A `never` call stands in any arm: its `unreachable` satisfies whatever the join wants (D1972).
+  if callIsNever(stmtIx) { return true }
+  const s = P.nodes[stmtIx]
+  if s is IfStmt { return ifTailIsValue(stmtIx, fnIx) }
+  false
+}
+
+// True if the BLOCK at `blockIx` ends in a bare tail VALUE statement (an implicit
+// return), as opposed to an explicit `return`/`while`/etc. — i.e. lowering it in tail
+// position would need `emitStmtTail`. A nested `if`/`else` tail recurses (any arm).
+export function blockTailIsValue(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    const n = stmts.length
+    if n == 0 { return false }
+    const last = stmts[n - 1]
+    const s = P.nodes[last]
+    if s is IfStmt { return ifTailIsValue(last, fnIx) }
+    return stmtIsTailValue(last, fnIx)
+  }
+  false
+}
+
+// D1029/D1032/D1034 — is the nullable inference's non-voidness real? `inferRetBearsNull`
+// exists for an else-less tail `if c { 5 }`, whose fall-through is the `null`. An empty arm or
+// a bare-return guard is not a value, and an arm ending in a spilled write is one only where
+// that `null` lowers (D2496).
+export function tailIfNullableIsReal(blockIx: i32, fnIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return true }
+    const last = b.blkStmts[n - 1]
+    if P.nodes[last] is IfStmt {
+      if !ifArmsAllValues(last, fnIx) { return false }
+      return !ifArmEndsInSpill(last, fnIx) || inferNullFallsThrough(fnIx)
+    }
+  }
+  true
+}
+
+// Whether some arm of the `if`/`else if` chain at `stmtIx` ends in a write only `spillTail`
+// can deliver as a value.
+function ifArmEndsInSpill(stmtIx: i32, fnIx: i32): boolean {
+  let cur = stmtIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    if !(s is IfStmt) { return false }
+    if blockEndsInSpill(s.ifThen, fnIx) { return true }
+    if s.ifElse < 0 { return false }
+    if P.nodes[s.ifElse] is Block { return blockEndsInSpill(s.ifElse, fnIx) }
+    cur = s.ifElse
+  }
+  false
+}
+
+// Whether the block at `blockIx` ends in a write `assignTargetSpills` accepts and
+// `assignTargetReReads` does not.
+function blockEndsInSpill(blockIx: i32, fnIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if !(b is Block) { return false }
+  const n = b.blkStmts.length
+  if n == 0 { return false }
+  const last = b.blkStmts[n - 1]
+  if P.nodes[last] is IfStmt { return ifArmEndsInSpill(last, fnIx) }
+  assignTargetSpills(last) && !assignTargetReReads(last, fnIx)
+}
+
+// Every arm of the `if`/`else if` chain at `stmtIx` ends in a bare tail VALUE. An EMPTY arm
+// answers false (nothing to be a value), and so does an arm whose tail is a statement.
+function ifArmsAllValues(stmtIx: i32, fnIx: i32): boolean {
+  // Walked along the `else if` spine, so a chain's depth costs no stack (D1990).
+  let cur = stmtIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    if !(s is IfStmt) { return false }
+    if !armTailIsValue(s.ifThen, fnIx) { return false }
+    if s.ifElse < 0 { return true }
+    const e = P.nodes[s.ifElse]
+    if e is Block { return armTailIsValue(s.ifElse, fnIx) }
+    cur = s.ifElse
+  }
+  false
+}
+
+// An if-arm block's tail is a value: a bare value, or an else-less `if` whose then-arm is one
+// (its `T | null`, owner ruling on D1995), at any depth.
+function armTailIsValue(blockIx: i32, fnIx: i32): boolean {
+  if blockTailIsValue(blockIx, fnIx) { return true }
+  const b = P.nodes[blockIx]
+  if !(b is Block) { return false }
+  const n = b.blkStmts.length
+  if n == 0 { return false }
+  const last = P.nodes[b.blkStmts[n - 1]]
+  if last is IfStmt {
+    if last.ifElse < 0 { return armTailIsValue(last.ifThen, fnIx) }
+  }
+  false
+}
+
+// True if the `if`/`else` at `stmtIx` (in tail position) has any arm that ends in a bare value
+// expression rather than an explicit `return` — so it must be lowered via `emitIfTail`. An
+// `if` WITHOUT an `else` can fall through with no value, so it never qualifies (the existing
+// void-if path handles it). Recurses through `else if` chains.
+function ifTailIsValue(stmtIx: i32, fnIx: i32) {
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990): `links`
+  // holds the links that deferred to their `else if`, and `r` is the deepest link's answer.
+  const links: i32[] = []
+  let last = -1
+  let r = false
+  let cur = stmtIx
+  while cur >= 0 {
+    const at = cur
+    cur = -1
+    const s = P.nodes[at]
+    if s is IfStmt {
+      last = at
+      const v = ifLinkTailValue(s, at, fnIx)
+      if v == 2 {
+        links.push(at)
+        cur = s.ifElse
+      } else {
+        r = v == 1
+      }
+    }
+  }
+  if r || links.length == 0 { return r }
+  // A deferring link whose next link answered false answers `ifArmsAllMemberValues` of itself:
+  // its then arm's verdict and the next link's, read bottom-up one step per link.
+  let all = ifArmsAllMemberValues(last, fnIx)
+  let k = links.length - 1
+  while k >= 0 {
+    const s = P.nodes[links[k]]
+    if s is IfStmt { all = all && armBlockAllMemberValues(s.ifThen, fnIx) }
+    if all { return true }
+    k = k - 1
+  }
+  false
+}
+
+// One link of `ifTailIsValue`: 1 or 0 for its answer, or 2 when it defers to its `else if`.
+function ifLinkTailValue(s: IfStmt, at: i32, fnIx: i32): i32 {
+  // An else-less `if` never qualifies here (it can fall through with no value) — load-
+  // bearing for the `fRetVoid` fixpoint, which must not treat a void recursive tail
+  // `if n>0 { rec(n-1) }` as a value. The nullable-return case is handled separately by
+  // `elseLessNullableTail` at emit time.
+  if s.ifElse < 0 { return 0 }
+  // The checker's verdict: an arm that completes with no value makes the `if` a statement —
+  // in a function that is not declared non-void, the only context that discards a tail.
+  if ifYieldsNoValue(at) && !fnDeclaresNonVoid(fnIx) { return 0 }
+  // D1034 — an empty arm disqualifies the whole `if`: this asks "does any arm end in a
+  // bare value", so `if c { } else { buf.push(1) }` (one value arm, one empty) would
+  // otherwise be wrongly classified non-void. Not "every arm must be a value" — an
+  // explicit `return x` arm is not a bare tail value.
+  if ifTailArmIsEmpty(s.ifThen) { return 0 }
+  if ifTailArmIsEmpty(s.ifElse) { return 0 }
+  if armTailIsValue(s.ifThen, fnIx) { return 1 }
+  const els = P.nodes[s.ifElse]
+  if !(els is Block) { return 2 }
+  if armTailIsValue(s.ifElse, fnIx) { return 1 }
+  // A member-call arm counts only when EVERY arm is a value (D1992): one `xs.push(x)` arm
+  // beside a `print(0)` arm is a statement tail, and the function stays void.
+  if ifArmsAllMemberValues(at, fnIx) { return 1 }
+  0
+}
+
+// Every arm of the else-ful `if` chain at `stmtIx` ends in a tail value or a member call the
+// checker typed non-void; a nested `if` arm must itself qualify. False on an empty arm.
+function ifArmsAllMemberValues(stmtIx: i32, fnIx: i32): boolean {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse < 0 { return false }
+    if !armBlockAllMemberValues(s.ifThen, fnIx) { return false }
+    const els = P.nodes[s.ifElse]
+    if els is Block { return armBlockAllMemberValues(s.ifElse, fnIx) }
+    return ifArmsAllMemberValues(s.ifElse, fnIx)
+  }
+  false
+}
+
+// The last statement of the block at `blockIx` qualifies for `ifArmsAllMemberValues`.
+function armBlockAllMemberValues(blockIx: i32, fnIx: i32): boolean {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    if n == 0 { return false }
+    const last = b.blkStmts[n - 1]
+    if P.nodes[last] is IfStmt { return ifArmsAllMemberValues(last, fnIx) }
+    return stmtIsTailValue(last, fnIx) || memberCallYieldsValue(last)
+  }
+  false
+}
+
+// True if the statement at `stmtIx` is a body-tail `if`/`else` whose arms yield a
+// value (implicit return) and so must be lowered tail-aware by `emitIfTail`.
+export function lastStmtIsValueIf(stmtIx: i32, fnIx: i32) {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt { return ifTailIsValue(stmtIx, fnIx) }
+  false
+}
+
+// True if the body-tail statement at `stmtIx` is an else-less `if` whose then-arm yields
+// a value and function `fnIx` returns a nullable type — so the false fall-through is the
+// `null` of that nullable, lowered by the function-end `emitNullForRet`. Consulted only at
+// emit time (where `fRetVoid` is final), so it never perturbs that fixpoint.
+export function elseLessNullableTail(stmtIx: i32, fnIx: i32) {
+  const s = P.nodes[stmtIx]
+  if s is IfStmt {
+    if s.ifElse >= 0 { return false }
+    if !armTailIsValue(s.ifThen, fnIx) { return false }
+    return fnRetNullBearing(fnIx)
+  }
+  false
+}
+
+// True if the function's top-level body block at `blockIx` ends in an instruction the
+// wasm validator treats as making the fallthrough unreachable — an explicit `return` or a
+// bare tail value. Otherwise control falls through to `end` with an empty stack, so an
+// explicit `unreachable` pads it — sound because the typechecker proved that path dead.
+export function bodyEndsInReturn(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    const n = stmts.length
+    if n == 0 { return false }
+    const last = stmts[n - 1]
+    const s = P.nodes[last]
+    if s is RetStmt { return true }
+    return stmtIsTailValue(last, fnIx)
+  }
+  false
+}
+
+// How many value-producing exits the statement at `stmtIx` contributes, counting an
+// explicit `return` and a tail value the same way `emitFuncBody`/`emitStmtTail` do.
+// Recurses into structured statements, never a nested `FuncDecl`. A prediction only, used
+// to size the return-sink's local reservation — it may over- or under-count harmlessly.
+function retExitCount(stmtIx: i32, fnIx: i32) {
+  if stmtIx < 0 { return 0 }
+  const s = P.nodes[stmtIx]
+  if s is FuncDecl { return 0 }
+  if s is RetStmt { return retValueExitCount(s.retArg, fnIx) }
+  if s is Block {
+    const stmts = s.blkStmts
+    let n = 0
+    let i = 0
+    while i < stmts.length {
+      const isLast = i == stmts.length - 1
+      if isLast && stmtIsTailValue(stmts[i], fnIx) {
+        n = n + retValueExitCount(stmts[i], fnIx)
+      } else {
+        n = n + retExitCount(stmts[i], fnIx)
+      }
+      i = i + 1
+    }
+    return n
+  }
+  if s is IfStmt {
+    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+    let total = 0
+    let cur = stmtIx
+    while cur >= 0 {
+      const c = P.nodes[cur]
+      cur = -1
+      if c is IfStmt {
+        total = total + retExitCount(c.ifThen, fnIx)
+        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          total = total + retExitCount(c.ifElse, fnIx)
+        }
+      }
+    }
+    return total
+  }
+  if s is WhileStmt { return retExitCount(s.whileBody, fnIx) }
+  if s is ForRange { return retExitCount(s.frBody, fnIx) }
+  if s is ForIn { return retExitCount(s.fiBody, fnIx) }
+  0
+}
+
+// True when function `fnIx` should reserve the union-box return-sink frame: its result
+// rep is the shared union box and it has at least two value-producing exits (a single-exit
+// function already has the one construction site the sink would build). The box test must
+// agree with `emitReturnValue`'s own `retUNm` ladder, or the frame is reserved for nothing.
+export function fnUnionRetSinkOk(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let isBox = false
+    if retUnionFlag(fn.fnRet) == 1 {
+      if (
+        !nodeTyIsLitUnionAlias(fn.fnRet)
+        && !nodeTyIsNulLitUnion(fn.fnRet)
+        && nulCloFlag(fn.fnRet) != 1
+      ) {
+        isBox = true
+      }
+    }
+    if fn.fnRet < 0 {
+      const irk = inferRetFnKey(fnIx, fn.fnName)
+      const im = inferRetNameOf(irk)
+      if isValueUnionName(im) || isUNameAB(15, im, inferRetTyIxOf(irk)) {
+        isBox = true
+      }
+    }
+    if !isBox { return false }
+    return retExitCount(fn.fnBody, fnIx) >= 2
+  }
+  false
+}
+
+// True if `exprIx` is an IDENT whose DECLARED union has a map arm — the receiver shape the frame
+// pre-pass reserves the map scratch for (`t[k]` / `t[k] ?? d` / `t.has(k)` on a union narrowed to
+// a map). Narrowing-blind: reads the binding's declared union, not the active narrowing.
+export function unionMapArmIdent(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const un = unionNameOfIdentAt(
+      sidOfNode(unwrapParen(exprIx)),
+      fnIx,
+      unwrapParen(exprIx),
+    )
+    if un != "" { return unionHasMapArm(un) }
+    // The typed-IR fallback: a union binding whose name the syntactic resolution cannot
+    // render still records the union on its node type. The emitter lowers the narrowed map
+    // read regardless, so the frame pre-pass must reserve the map scratch from the same
+    // signal. An over-reservation is a harmless spare.
+    return nodeTyUnionHasMapArm(exprIx)
+  }
+  false
+}
+
+// True if `exprIx` is a member read whose object indexes an ident declared as a union with
+// a ref-array arm whose element struct's field is a map — the receiver shape the frame
+// pre-pass must reserve the map scratch for. Narrowing-blind: the `is`-narrow that makes
+// `t[i]` a struct is not active in the pre-pass, so without this the map read clobbered i32 scratch slots — invalid wasm.
+export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    const obj = P.nodes[unwrapParen(e.memObj)]
+    if obj is Index {
+      const arr = P.nodes[unwrapParen(obj.idxArr)]
+      if arr is Ident {
+        const un = unionNameOfIdentAt(
+          sidOfNode(unwrapParen(obj.idxArr)),
+          fnIx,
+          unwrapParen(obj.idxArr),
+        )
+        if un != "" {
+          const atoms: string[] = []
+          // The arm's element type is `tyStepElem` (a `TyArray` arm's element, the arena
+          // dual of the name path's `nameIsRefArray` gate plus its `refArrElemName`
+          // re-resolution), and the `.f` leaf's code-19 map test is `tyArmPathIsMap`. An
+          // uncovered row keeps the legacy name walk.
+          const mems: i32[] = []
+          const cov = unionArmTys(un, atoms, mems)
+          let i = 0
+          while i < atoms.length {
+            const a = atoms[i]
+            if cov {
+              const path: string[] = []
+              path.push(e.memProp)
+              if tyArmPathIsMap(tyStepElem(mems[i]), path) { return true }
+            } else if nameIsRefArray(a) {
+              // The arm's element struct: `refArrElemName` for a nominal element, the raw
+              // `[]`-stripped text for an inline shape it cannot see. The dropped length
+              // conjunct is dischargeable: `nameIsRefArray(a)` already establishes
+              // `nameIsArray(a)`, and `arrElemNameRaw` agrees with the guarded spelling on "".
+              let en = refArrElemName(a)
+              if en == "" { en = arrElemNameRaw(a) }
+              const si = structIndexByName(en)
+              if si >= 0 {
+                const fi = sFieldIndex(si, e.memProp)
+                if fi >= 0 {
+                  if sFieldTypeAt(si, fi) == FC_MAP { return true }
+                }
+              }
+            }
+            i = i + 1
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if `exprIx` is a member read whose object is an ident declared as a union with a
+// struct arm whose field is a map — the receiver shape the frame pre-pass must reserve the
+// map scratch for, narrowing-blind like the list-element sibling above. Probes both field
+// tables: the struct table and the variant table (`uVariants`). An over-reservation is a harmless spare.
+export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    // Collect the field chain root-first: `t0.f.g` -> root `t0`, props [f, g] — the same
+    // walk `calleeIsUnionArmClosureMember` performs, so a map field reached through
+    // code-15 nested-struct hops is spotted, not just the single-hop `t0.f[k]`.
+    const props: string[] = []
+    let cur = unwrapParen(exprIx)
+    let rootName = ""
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootName = cn.identName
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 { return false }
+    // props collected leaf-first — reverse into walk order.
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
+    if un == "" { return false }
+    const atoms: string[] = []
+    // The arm's field path is walked over the member's arena type (`tyArmPathIsMap`)
+    // instead of re-resolving the rendered atom to a struct/variant row.
+    // a struct/variant row and consulting its per-field lowering codes.
+    const mems: i32[] = []
+    // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
+    // second walk over the arms' rendered spellings.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let m = 0
+    while m < mems.length {
+      if atoms[m] != "null" {
+        if tyArmPathIsMap(mems[m], path) { return true }
+      }
+      m = m + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if `exprIx` is an index whose receiver is a member chain rooted at a union ident,
+// whose field path walks — narrowing-blindly — to a list-of-maps field. The receiver shape
+// the frame pre-pass must reserve the map scratch for: without it the narrowed map read's
+// scratch stores fall on unreserved indices shared with unrelated locals — invalid wasm.
+export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
+  if !uDeclared { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const m = unwrapParen(e.idxArr)
+    if !(P.nodes[m] is Member) { return false }
+    // Collect the field chain root-first: `t0.f.g[0]` -> root `t0`, props [f, g]. The
+    // root may also be an indexed union ident, whose ref-array arm's element struct
+    // carries the field: bottom out at `Index(Ident)` with the via-element flag, so the
+    // arm walk starts at the array arm's element.
+    const props: string[] = []
+    let cur = m
+    let rootIx = -1
+    let rootName = ""
+    let viaElem = false
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootIx = cur
+        rootName = cn.identName
+        break
+      } else if cn is Index {
+        const rin = P.nodes[unwrapParen(cn.idxArr)]
+        if rin is Ident {
+          rootIx = unwrapParen(cn.idxArr)
+          rootName = rin.identName
+          viaElem = true
+        }
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 || rootIx < 0 { return false }
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdentAt(sidOfNode(rootIx), fnIx, rootIx)
+    if un == "" { return false }
+    const atoms: string[] = []
+    // The arm walk is structural (`tyArmPathIsMapList`, a `TyArray` over a `TyMap` leaf),
+    // and so is the indexed-root hop: `tyStepElem` takes a `TyArray` arm's element in place
+    // of `nameIsRefArray` + `refArrElemName` on the rendered atom.
+    const mems: i32[] = []
+    // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
+    // second walk over the arms' rendered spellings.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let mi = 0
+    while mi < mems.length {
+      if atoms[mi] != "null" {
+        let mem = mems[mi]
+        if viaElem { mem = tyStepElem(mem) }
+        if tyArmPathIsMapList(mem, path) { return true }
+      }
+      mi = mi + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if `exprIx` is `p[0]` where `p` is a union IDENT whose union has a closure-array arm —
+// the callee shape `blockHasCallRef` reserves `callRefSlot` for (the narrowing-blind pre-pass).
+function calleeIsUnionClosureArrayIndex(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const arr = P.nodes[unwrapParen(e.idxArr)]
+    if arr is Ident {
+      const un = unionNameOfIdentAt(
+        sidOfNode(unwrapParen(e.idxArr)),
+        fnIx,
+        unwrapParen(e.idxArr),
+      )
+      if un != "" { return unionHasClosureArrayArm(un) }
+    }
+  }
+  false
+}
+
+// `t0[0].f()` where `t0`'s union has a ref-array arm whose element struct carries a
+// closure field: the `is`-narrowing that makes `t0` the ref array is not active in this
+// frame pre-pass, so `exprIsClosure` is false and `callRefSlot` must be reserved
+// conservatively, or an unreserved `call_ref` spill shares the next frame's local — invalid wasm.
+export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    const ix = P.nodes[unwrapParen(e.memObj)]
+    if ix is Index {
+      const arr = P.nodes[unwrapParen(ix.idxArr)]
+      if arr is Ident {
+        const un = unionNameOfIdentAt(
+          sidOfNode(unwrapParen(ix.idxArr)),
+          fnIx,
+          unwrapParen(ix.idxArr),
+        )
+        if un != "" {
+          const atoms: string[] = []
+          // The deliberately-conservative `strContains(elem, "=>")` arm test is a
+          // reachability question — `unMemIsFuncReachArray` asks it of the arena (a
+          // `TyArray` whose element structure reaches a `TyFunc`) instead of the rendered spelling.
+          const mems: i32[] = []
+          if unionArmTys(un, atoms, mems) {
+            let m = 0
+            while m < mems.length {
+              if unMemIsFuncReachArray(mems[m]) { return true }
+              m = m + 1
+            }
+            return false
+          }
+          let i = 0
+          while i < atoms.length {
+            const a = atoms[i]
+            // `refArrElemNameIf` IS the `nameIsRefArray` gate plus the element read;
+            // a non-ref-array atom yields "" and `strContains("", "=>")` is false, so
+            // dropping the conjunct is exact.
+            if a != "null" && valueAtomKind(a) < 0 {
+              if strContains(refArrElemNameIf(a), "=>") { return true }
+            }
+            i = i + 1
+          }
+        }
+      }
+    }
+  }
+  false
+}
+
+// True if `exprIx` is an ident whose declared union has a bare-closure arm — the callee shape
+// `blockHasCallRef` reserves `callRefSlot` for, since the `is`-narrowing that makes the ident
+// a closure is not active during the narrowing-blind frame pre-pass. The bare-binding
+// analogue of `calleeIsUnionClosureArrayIndex`.
+export function calleeIsUnionClosureIdent(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident {
+    const un = unionNameOfIdentAt(
+      sidOfNode(unwrapParen(exprIx)),
+      fnIx,
+      unwrapParen(exprIx),
+    )
+    if un != "" { return unionHasClosureArm(un) }
+    // A rebind of a union-arm field union: the binding's own union name resolves "" here,
+    // so walk the init chain to the member's field table — a closure field or a union-box
+    // field with a closure arm means the narrowed `call_ref` needs its scratch.
+    // Reservation-only; without it the closure spill indexed an unreserved local — invalid wasm.
+    return identRebindUnionArmClosureField(e.identName, fnIx, 4)
+  }
+  false
+}
+
+// True when local `name`'s let-init chain (rebinds followed up to `depth`) bottoms out at
+// a member chain rooted at a union-typed ident whose arm field path leafs at a closure
+// field (code 14/22) or a closure-armed union-box field (code 16) — the rebound-binding
+// dual of `calleeIsUnionArmClosureMember`, for `blockHasCallRef`'s reservation.
+function identRebindUnionArmClosureField(
+  name: string,
+  fnIx: i32,
+  depth: i32,
+): boolean {
+  if depth <= 0 || fnIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return false }
+  const li = parentLetOf(fn.fnBody, name)
+  if li < 0 { return false }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return false }
+  if d.letInit < 0 { return false }
+  const init = P.nodes[unwrapParen(d.letInit)]
+  if init is Ident {
+    return identRebindUnionArmClosureField(init.identName, fnIx, depth - 1)
+  }
+  if init is Member {
+    // Collect the field chain root-first (the `calleeIsUnionArmClosureMember` walk).
+    const props: string[] = []
+    let cur = unwrapParen(d.letInit)
+    let rootName = ""
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootName = cn.identName
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 { return false }
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
+    if un == "" { return false }
+    const atoms: string[] = []
+    // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
+    // bare / nullable, or a `TyUnion` with a `TyFunc` member).
+    const mems: i32[] = []
+    // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
+    // second walk over the arms' rendered spellings.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let m = 0
+    while m < mems.length {
+      if atoms[m] != "null" {
+        if tyArmPathHasCloValue(mems[m], path) { return true }
+      }
+      m = m + 1
+    }
+    return false
+  }
+  false
+}
+
+// True if `exprIx` is a member chain rooted at an ident declared as a union, whose field
+// path walks — narrowing-blindly through the arms' field tables — to a closure field
+// (code 14, or the nullable-closure niche 22). The callee shape `blockHasCallRef` reserves
+// `callRefSlot` for, since without it the closure spill falls on an unreserved index — invalid wasm.
+export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
+  if !uDeclared {
+    return false // no unions declared — nothing to probe (cheap bail)
+  }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Member {
+    // Collect the field chain root-first: `t0.f.g` → root `t0`, props [f, g].
+    const props: string[] = []
+    let cur = unwrapParen(exprIx)
+    let rootName = ""
+    let guard = 0
+    while guard < 32 {
+      guard = guard + 1
+      const cn = P.nodes[cur]
+      if cn is Member {
+        props.push(cn.memProp)
+        cur = unwrapParen(cn.memObj)
+      } else if cn is Ident {
+        rootName = cn.identName
+        break
+      } else {
+        return false
+      }
+    }
+    if rootName == "" || props.length == 0 { return false }
+    // props collected leaf-first — reverse into walk order.
+    const path: string[] = []
+    let pr = props.length - 1
+    while pr >= 0 {
+      path.push(props[pr])
+      pr = pr - 1
+    }
+    const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
+    if un == "" { return false }
+    const atoms: string[] = []
+    // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
+    // or under the nullable-closure niche's `TyNullable`).
+    const mems: i32[] = []
+    // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
+    // second walk over the arms' rendered spellings.
+    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+    let m = 0
+    while m < mems.length {
+      if atoms[m] != "null" {
+        if tyArmPathIsClosure(mems[m], path) { return true }
+      }
+      m = m + 1
+    }
+    return false
+  }
+  false
+}
+
+// Walks field path `path` from union arm `arm`: the first hop resolves through the arm's
+// struct-table or variant-table row, each mid hop must be a code-15 nested-struct field,
+// and the last hop is a closure field (code 14/22) — used for the index whose receiver is
+// a member chain rooted at a union ident, needing `blockHasCallRef`'s reservation.
+export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
+  if !uDeclared { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const m = P.nodes[unwrapParen(e.idxArr)]
+    if m is Member {
+      const props: string[] = []
+      let cur = unwrapParen(e.idxArr)
+      let rootName = ""
+      let guard = 0
+      while guard < 32 {
+        guard = guard + 1
+        const cn = P.nodes[cur]
+        if cn is Member {
+          props.push(cn.memProp)
+          cur = unwrapParen(cn.memObj)
+        } else if cn is Ident {
+          rootName = cn.identName
+          break
+        } else {
+          return false
+        }
+      }
+      if rootName == "" || props.length == 0 { return false }
+      const path: string[] = []
+      let pr = props.length - 1
+      while pr >= 0 {
+        path.push(props[pr])
+        pr = pr - 1
+      }
+      const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
+      if un == "" { return false }
+      const atoms: string[] = []
+      // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
+      // `TyFunc` leaf).
+      const mems: i32[] = []
+      // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
+      // second walk over the arms' rendered spellings.
+      if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+      let mi = 0
+      while mi < mems.length {
+        if atoms[mi] != "null" {
+          if tyArmPathIsCloArray(mems[mi], path) { return true }
+        }
+        mi = mi + 1
+      }
+      return false
+    }
+  }
+  false
+}
+
+// True if `exprIx` is an index read whose array indexes an ident declared as a union with
+// an array-of-map arm — the receiver shape the frame pre-pass reserves the map scratch
+// for. Narrowing-blind, like `unionMapArmIdent`. An over-reservation is a harmless spare local.
+export function unionMapArrayElemIndex(exprIx: i32, fnIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Index {
+    const arr = P.nodes[unwrapParen(e.idxArr)]
+    if arr is Ident {
+      const un = unionNameOfIdentAt(
+        sidOfNode(unwrapParen(e.idxArr)),
+        fnIx,
+        unwrapParen(e.idxArr),
+      )
+      if un != "" { return unionHasMapArrayArm(un) }
+    }
+  }
+  false
+}
+
+// True when `name` is a capture of `fnIx` whose env field holds the value-union box. Asked
+// of `captureValKind`, the function that typed that field, so the answer cannot disagree with
+// what rides in the env. The gate for the narrowed-read unbox in `emitIdentNode` on the
+// capture storage class, since the name-based gate the other storage classes use answers "" for a capture.
+export function capturedIsUnionBox(fnIx: i32, name: string) {
+  capturedKindOf(fnIx, name) == "union"
+}
+
+// True when the identifier `name` reads a frame slot of `fnIx` — a param, declared local, or
+// capture — that holds the union box. Narrowing-blind on purpose: a list op's scratch
+// reservation and its receiver resolution run in different passes and must answer the same
+// way, since what the slot holds does not depend on narrowing. A global is deliberately not here.
+export function identSlotIsUnionBox(fnIx: i32, name: string) {
+  const pt = paramTypeNode(fnIx, name)
+  if pt >= 0 { return vtKindOfType(pt) == "union" }
+  if declaredKind(name) == "union" { return true }
+  capturedIsUnionBox(fnIx, name)
+}
+
+export function printUnionRecvIsBox(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 { return false }
+  if !exprUnion(exprIx, fnIx) { return false }
+  const key = printNarrowKey(exprIx)
+  if key == "" { return true }
+  printNarrowKeepsBox(key)
+}
+
+function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
+  // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
+  // handler both plan the whole box with the narrowing lifted (D2801).
+  const nnKey = narrowedToNullKey(exprIx)
+  if nnKey != "" {
+    const nnMask = maskNarrowFor(nnKey)
+    const nnWas = printPlanPinNull(true)
+    const nnRc = printUnionPlanCode(exprIx, fnIx, out)
+    printPlanPinNull(nnWas)
+    unmaskNarrow(nnMask)
+    return nnRc
+  }
+  if !printUnionRecvIsBox(exprIx, fnIx) { return 0 }
+  const nm = unionNameOfExpr(exprIx, fnIx)
+  if nm == "" { return 0 }
+  // The row's recorded members, in box-tag ABI order — the order the dispatch walks and
+  // `emitUnionCoerce` tagged them in; an uncovered set falls back to the rendered expansion.
+  const sid = msSetOfText(nm)
+  const atoms: string[] = []
+  if !msMemberAtomsOfSet(sid, atoms) {
+    splitUnionAtoms(unionMemberSetOf(nm), atoms)
+  }
+  if atoms.length < 2 { return 0 }
+  const kinds: i32[] = []
+  // The BANKED codes when the row has them (`unMemValKind` is index-parallel to the atom
+  // column and is literally `valueAtomKind` per member), else the per-atom derivation.
+  if !msMemberValKindsOf(sid, kinds) || kinds.length != atoms.length {
+    while kinds.length > 0 { kinds.pop() }
+    let d = 0
+    while d < atoms.length {
+      kinds.push(valueAtomKind(atoms[d]))
+      d = d + 1
+    }
+  }
+  // A bare map read is `V | null` whatever `V` is (a missing key reads the null-tagged box),
+  // so the dispatch needs a `null` arm the map's declared value set may not carry.
+  if mapReadNarrowableSlot(unwrapParen(exprIx), fnIx) >= 0 {
+    if !unionSetHasNull(nm) {
+      atoms.push("null")
+      kinds.push(nullValKind())
+    }
+  }
+  let nonNull = 0
+  let hasNull = false
+  let solo = -1
+  let bad = false
+  let pinSkipped = 0
+  const seen: i32[] = []
+  const live: string[] = []
+  printNarrowLiveAtoms(exprIx, live)
+  let i = 0
+  while i < kinds.length {
+    let k = kinds[i]
+    // A member the narrowing excluded is no arm of this read.
+    if live.length > 0 && !strListHas(live, atoms[i]) {
+      i = i + 1
+      continue
+    }
+    // A literal-union arm (`K0 | i64`) is not a value atom but boxes as one under the string
+    // tag (`emitUnionCoerce`'s `unionTakesAtomAsStr`), so it prints as the string arm here.
+    if k < 0 && nameIsLitUnionType(atoms[i]) { k = 2 }
+    if k < 0 && printPlanNullPinned {
+      pinSkipped = pinSkipped + 1
+      i = i + 1
+      continue
+    }
+    // A member the box ABI does not classify (a struct arm, an inline shape) means this
+    // isn't the boxed value union — decline the shape rather than call it a failure.
+    if k < 0 { return 0 }
+    // A container arm (kinds 7..13) is in a box the dispatch cannot render — recorded and
+    // answered below, so the result tells "not my shape" apart from "my shape, can't do it".
+    // The vector (14) never prints: the checker refuses a print it could reach.
+    if k > 6 && k != 14 { bad = true }
+    if k == nullValKind() {
+      hasNull = true
+    } else {
+      nonNull = nonNull + 1
+      solo = k
+    }
+    // One arm per TAG. Two members can share a tag (a litunion arm beside a `string` one),
+    // and a second `if tag == 2` would be dead code the last-arm fall-through never reaches.
+    let dup = false
+    let s = 0
+    while s < seen.length {
+      if seen[s] == k { dup = true }
+      s = s + 1
+    }
+    if !dup { seen.push(k) }
+    i = i + 1
+  }
+  // The box test mirrors the checker's `valueUnionFromAtomKinds` gate: 2+ non-null atoms
+  // box, and one numeric atom beside `null` boxes — `boolean|null`/`string|null` are niches.
+  // A record arm skipped under a `null` pin still shares the box, so `Rec | string | null`
+  // is the box even though `string | null` alone is a niche (D3500).
+  let boxed = nonNull >= 2 || (nonNull == 1 && pinSkipped > 0)
+  if nonNull == 1 && hasNull {
+    if solo == 0 || solo == 3 || solo == 4 || solo == 5 || solo == 14 {
+      boxed = true
+    }
+  }
+  if !boxed { return 0 }
+  if bad { return -1 }
+  let o = 0
+  while o < seen.length {
+    out.push(seen[o])
+    o = o + 1
+  }
+  1
+}
+
+// The boolean face — "will this LOWER" — for the reservation scan and the handler.
+export function printUnionPlan(exprIx: i32, fnIx: i32, out: i32[]): boolean {
+  printUnionPlanCode(exprIx, fnIx, out) == 1
+}
+
+// "The value is the box and the dispatch cannot render one of its arms" — the emitter's last
+// line of defence, not `printUnionRecvIsBox` (which over-claims). Falling through with a real
+// box on the stack ends in `call __print_i32__` against a `(ref $uBox)`: check-clean invalid
+// wasm. Should be unreachable — this exists to make a disagreement between the two gates loud.
+export function printUnionArmsUnrenderable(exprIx: i32, fnIx: i32): boolean {
+  const pk: i32[] = []
+  printUnionPlanCode(exprIx, fnIx, pk) < 0
+}
+
+// Does the print-union plan for `exprIx` carry a STRING arm? The reservation scan's half of
+// the pair above — a string arm streams through `emitPrintStrFromScratch`, which lives in
+// the str-op scratch frame.
+export function printUnionHasStrArm(exprIx: i32, fnIx: i32): boolean {
+  const pk: i32[] = []
+  if !printUnionPlan(exprIx, fnIx, pk) { return false }
+  let i = 0
+  while i < pk.length {
+    if pk[i] == 2 { return true }
+    i = i + 1
+  }
+  false
+}
+
+// ── G8: map ops on a global struct-field map-array element ──────────────────────
+
+// `fnHasMap` reserves the map scratch frame from map params/locals/map-array locals, but a
+// map op can also run on a global struct-field map-array element with no map local at all,
+// which the local scan misses. This walk matches the exact four shapes `emitExpr`/`emitStmt`
+// lower as map ops, each gated by `exprMap` on the same receiver, so it never over-reserves.
+
+// True if the expression at `exprIx` (recursively) contains a map-op shape whose
+// receiver `exprMap` resolves — i.e. a shape the emitter lowers via the map scratch
+// frame.
+export function exprHasMapOp(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Index {
+    // Map GET `recv[k]`.
+    if exprMap(e.idxArr, fnIx) { return true }
+    // A union binding with a map arm indexed `t[k]`: the narrowing isn't active in this
+    // pre-pass frame, so `exprMap` misses it — spot the union-with-map-arm ident directly.
+    if unionMapArmIdent(e.idxArr, fnIx) { return true }
+    // A map-field read through a union's ref-array arm (`t[i].f[k]` after an `is S[]` narrow):
+    // likewise invisible to `exprMap` here — spot the member shape from the declared union.
+    if unionListElemMapFieldMember(e.idxArr, fnIx) { return true }
+    // A map-field read through a union's struct arm (`t.f[k]` after an `is {f:{[string]:V}}`
+    // narrow): likewise invisible — spot it from the declared union's arm field tables.
+    if unionStructArmMapFieldMember(e.idxArr, fnIx) { return true }
+    // A map read through a union's ARRAY-OF-MAP arm (`t[i][k]` after an `is {[string]:V}[]`
+    // narrow): likewise invisible — spot the index shape from the declared union.
+    if unionMapArrayElemIndex(e.idxArr, fnIx) { return true }
+    // A map read through a union STRUCT arm's LIST-OF-MAPS field (`t.f[0][k]` after an
+    // `is {f: {[string]:V}[]}` narrow): likewise invisible — walk the arm's field path.
+    if unionStructArmMapListElemIndex(e.idxArr, fnIx) { return true }
+    // The typed-IR net for any receiver spelling the syntactic classifiers above miss: the
+    // checker's own recorded type reserves the frame regardless of shape or depth (harmless spare).
+    if nodeTyUnionHasMapArm(e.idxArr) { return true }
+    if exprHasMapOp(e.idxArr, fnIx) { return true }
+    return exprHasMapOp(e.idxIndex, fnIx)
+  }
+  if e is BinExpr {
+    // Fused map get-with-default `recv[k] ?? d` (and the method form `recv.get(k) ?? d`).
+    if e.binOp == "??" {
+      const lhs = P.nodes[e.binLeft]
+      if lhs is Index {
+        if exprMap(lhs.idxArr, fnIx) { return true }
+        if unionMapArmIdent(lhs.idxArr, fnIx) { return true }
+        if unionListElemMapFieldMember(lhs.idxArr, fnIx) { return true }
+        if unionStructArmMapFieldMember(lhs.idxArr, fnIx) { return true }
+        if unionMapArrayElemIndex(lhs.idxArr, fnIx) { return true }
+        if unionStructArmMapListElemIndex(lhs.idxArr, fnIx) { return true }
+        if nodeTyUnionHasMapArm(lhs.idxArr) { return true }
+      }
+      if lhs is Call {
+        const lcallee = P.nodes[lhs.callFn]
+        if lcallee is Member {
+          if lcallee.memProp == "get" {
+            if exprMap(lcallee.memObj, fnIx) { return true }
+          }
+        }
+      }
+    }
+    // Map SET `recv[k] = v` (an assignment is a statement, but walk it defensively).
+    if e.binOp == "=" {
+      const target = P.nodes[e.binLeft]
+      if target is Index {
+        if exprMap(target.idxArr, fnIx) { return true }
+        if unionMapArmIdent(target.idxArr, fnIx) { return true }
+        if unionListElemMapFieldMember(target.idxArr, fnIx) { return true }
+        if unionStructArmMapFieldMember(target.idxArr, fnIx) { return true }
+        if unionMapArrayElemIndex(target.idxArr, fnIx) { return true }
+        if unionStructArmMapListElemIndex(target.idxArr, fnIx) { return true }
+        if nodeTyUnionHasMapArm(target.idxArr) { return true }
+      }
+    }
+    if exprHasMapOp(e.binLeft, fnIx) { return true }
+    return exprHasMapOp(e.binRight, fnIx)
+  }
+  if e is Call {
+    // `recv.has(k)` map membership / `recv.delete(k)` map removal — both touch a map.
+    // `m.keys()` / `m.values()` ITERATION also needs the map scratch frame (slot 0
+    // holds the map ref for the tombstone-aware `live[i]` skip in the for-in loop).
+    const callee = P.nodes[e.callFn]
+    if callee is Member {
+      if callee.memProp == "has" {
+        if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if unionMapArrayElemIndex(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
+      }
+      if callee.memProp == "delete" {
+        if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
+      }
+      if callee.memProp == "clear" {
+        if exprMap(callee.memObj, fnIx) { return true }
+      }
+      if callee.memProp == "keys" || callee.memProp == "values" {
+        if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
+      }
+      // The method map SET `recv.set(k, v)`/`recv.add(x)` — without this, a receiver only
+      // this arm claims emitted a store against a frame nothing reserved (invalid wasm).
+      if callee.memProp == "set" || callee.memProp == "add" {
+        if exprMap(callee.memObj, fnIx) { return true }
+        if unionMapArmIdent(callee.memObj, fnIx) { return true }
+        if unionMapArrayElemIndex(callee.memObj, fnIx) { return true }
+        if nodeTyUnionHasMapArm(callee.memObj) { return true }
+      }
+    }
+    if exprHasMapOp(e.callFn, fnIx) { return true }
+    const args = e.callArgs
+    let i = 0
+    while i < args.length {
+      if exprHasMapOp(args[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  // An if used as an EXPRESSION — the shape a binding, a `return`, an argument or a literal
+  // element delivers. The chain walk owns it either way, so the statement and the expression
+  // spelling cannot reserve different frames (D1827).
+  if e is IfStmt { return ifChainHasMapOp(exprIx, fnIx) }
+  if e is Member { return exprHasMapOp(e.memObj, fnIx) }
+  // The `?.` receiver, walked like the `.` one above (D1667).
+  if e is OptMember { return exprHasMapOp(e.omObj, fnIx) }
+  if e is Unary { return exprHasMapOp(e.unArg, fnIx) }
+  if e is Paren { return exprHasMapOp(e.parInner, fnIx) }
+  if e is IsExpr { return exprHasMapOp(e.isObj, fnIx) }
+  if e is AsExpr { return exprHasMapOp(e.asObj, fnIx) }
+  if e is ObjLit {
+    const fields = e.objFields
+    let i = 0
+    while i < fields.length {
+      const f = P.nodes[fields[i]]
+      if f is FieldInit {
+        if exprHasMapOp(f.fiValue, fnIx) { return true }
+      }
+      i = i + 1
+    }
+    return false
+  }
+  // A spread's source is an operand like any other (D2334).
+  if e is Spread { return exprHasMapOp(e.spdArg, fnIx) }
+  if e is ArrayLit {
+    const elems = e.arrElems
+    let i = 0
+    while i < elems.length {
+      if exprHasMapOp(elems[i], fnIx) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  exprMapOpNotAnOperand(exprIx)
+}
+
+// True if any statement in the block at `blockIx` (descending into if/else branches
+// and while bodies) contains a map op. An assignment statement (`recv[k] = v`) is a
+// bare `BinExpr` with `binOp == "="` — `exprHasMapOp` recognizes its SET shape.
+export function blockHasMapOp(blockIx: i32, fnIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    let i = 0
+    while i < stmts.length {
+      const s = P.nodes[stmts[i]]
+      if s is LetDecl {
+        if exprHasMapOp(s.letInit, fnIx) { return true }
+      } else if s is RetStmt {
+        if exprHasMapOp(s.retArg, fnIx) { return true }
+      } else if s is IfStmt {
+        if ifChainHasMapOp(stmts[i], fnIx) { return true }
+      } else if s is WhileStmt {
+        if exprHasMapOp(s.whileCond, fnIx) { return true }
+        if blockHasMapOp(s.whileBody, fnIx) { return true }
+      } else if s is ForIn {
+        // The iterable is asked through `forInMapRecv`, the emitter's own header predicate: a
+        // bare `for k in m` walks the map's live/keys arrays but is invisible to `exprHasMapOp`.
+        if forInMapRecv(s.fiIter, fnIx) >= 0 { return true }
+        if exprHasMapOp(s.fiIter, fnIx) { return true }
+        if blockHasMapOp(s.fiBody, fnIx) { return true }
+      } else if s is ForRange {
+        if exprHasMapOp(s.frFrom, fnIx) { return true }
+        if exprHasMapOp(s.frTo, fnIx) { return true }
+        if exprHasMapOp(s.frStep, fnIx) { return true }
+        if blockHasMapOp(s.frBody, fnIx) { return true }
+      } else if s is Block {
+        if blockHasMapOp(stmts[i], fnIx) { return true }
+      } else {
+        // Every other statement is an expression statement: a tail `mk()["k"]` is an `Index`
+        // statement nothing else walked, so ask the widest form — it cannot over-reserve. D1101.
+        if exprHasMapOp(stmts[i], fnIx) { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if any arm of the `if` / `else if` chain at `ifIx` contains a map op — its
+// condition, then-branch, `else` block, OR (recursively) a chained `else if`.
+function ifChainHasMapOp(ifIx: i32, fnIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if exprHasMapOp(s.ifCond, fnIx) { return true }
+    if blockHasMapOp(s.ifThen, fnIx) { return true }
+    if s.ifElse < 0 { return false }
+    const els = P.nodes[s.ifElse]
+    if els is Block { return blockHasMapOp(s.ifElse, fnIx) }
+    return ifChainHasMapOp(s.ifElse, fnIx)
+  }
+  // Anything handed to the chain walk that is not an `if` is an ordinary operand, and the
+  // expression half owns those — so no kind falls between the two halves (D1827).
+  exprHasMapOp(ifIx, fnIx)
+}
+
+// True if the FuncDecl at `fnIx` performs a map op on a GLOBAL struct-field map-array
+// element (or any map-op shape `fnHasMap`'s local scan does not already cover) — so it
+// reserves the shared 12-slot map scratch frame. OR'd into `fnUsesMap`.
+export function fnHasGlobalMapOp(fnIx: i32) {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return blockHasMapOp(fn.fnBody, fnIx) }
+  false
+}
