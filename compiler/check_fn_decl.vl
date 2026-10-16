@@ -501,8 +501,6 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // ...and for a result no caller reads, which the hoist already bound as `: void` (D2631).
   const ucVoided = inferring && fnResultUnconsumed(fnIx)
   if ucVoided { inferring = false }
-  // The return an unread function shows in the editor: its tail's value, never lowered.
-  let ucShowRet = TY_VOID
   // The infer-stack key: a named function uses its name (so self-recursion is detected); an
   // anonymous lambda has no name and keys by node index instead — else two nested anonymous
   // lambdas would both key on "" and the inner would falsely trip the recursive-cycle guard, mis-inferring its return as `void`.
@@ -511,36 +509,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // Already inferred on demand (a forward call checked this body before pass 2
   // reached it)? Skip the re-check so diagnostics aren't duplicated.
   if inferring {
-    // Recursive cycle: this function is already on the inference stack. Break with a
-    // provisional `void` (the binding-group fixpoint re-infers it once the cycle's
-    // resolvable members settle), and COUNT the break so the completion below knows
-    // the result is tentative rather than final.
-    if onInferStack(inferKey) {
-      cycleBreakCountSet(cycleBreakCount + 1)
-      return TY_VOID
-    }
-    if inferQuiet && !paramSolveProbe && !cstrProbe {
-      // Suppressed pre-pass: memoize a resolved return (a `-2` reset by the fixpoint
-      // forces a fresh re-inference). The PARAMETER-solve probe never takes the memo:
-      // it needs the body walked for the flow constraints, not the return.
-      const hoisted = lookup(n.fnName)
-      if hoisted >= 0 {
-        if (fnDeclIx[n.fnName] ?? -1) >= 0 {
-          const ht = T.tys[hoisted]
-          if ht is TyFunc {
-            if ht.fnRet != -2 { return TY_VOID }
-          }
-        }
-      }
-    } else {
-      // Real check pass: returns are already resolved by the pre-pass, so skip only a
-      // top-level body already diagnostic-checked (a forward call reached it before pass 2
-      // did). Gated on `fnIx` matching the registered top-level decl, so a nested function
-      // sharing a name (e.g. two `add` closures) is never skipped.
-      if (fnDeclIx[n.fnName] ?? -1) == fnIx {
-        if bodyChecked[n.fnName] ?? false { return TY_VOID }
-      }
-    }
+    if fnDeclAlreadyInferred(n, fnIx, inferKey) { return TY_VOID }
   }
   // Solves this declaration's un-annotated parameters from its body usage. A no-op for a
   // top-level function (already done in pass 1.6) and inside a probe; this reach is the
@@ -548,17 +517,248 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // parameter the receiver already pinned contextually is not a hole here, so `cbExpect` below still wins — one answer, not two.
   solveUnannotParams(fnIx)
   const params = n.fnParams
-  // The contextual expected param types recorded for THIS lambda node (`seedExpected` at a
+  const paramTys: i32[] = []
+  // Parallel to `paramTys`: did THIS parameter's annotation collapse a subsumed literal
+  // arm (D1048's second hint)? Recorded where the annotation resolves, and read in the
+  // declare loop, which is where the binding — and so the scope depth the mark is keyed by — comes into existence.
+  const paramCollapsed: boolean[] = []
+  const paramUninferable = fnDeclResolveParams(
+    n,
+    fnIx,
+    params,
+    paramTys,
+    paramCollapsed,
+  )
+  // Parameter DEFAULTS (`a: i32 = 0`, and the `a?: T` spelling the parser
+  // desugars into one), checked once the annotations have resolved.
+  checkParamDefaults(n, params, paramTys)
+  if n.fnName != "" && params.length > 0 {
+    const sp0 = P.nodes[params[0]]
+    if sp0 is Param {
+      if sp0.parName == "self" && sp0.parType >= 0 {
+        checkSelfFnReachable(demangleName(n.fnName), paramTys[0], fnIx)
+      }
+    }
+  }
+  // Resolve the return-type annotation (or the pending sentinel when inferring).
+  let ret = fnDeclResolveRet(n, fnIx, inferring, paramTys)
+  // A generic nested in another function owns its parameter rows (D3853).
+  const nestedDecl = n.fnName != ""
+    && n.fnTyParams.length > 0
+    && (fnDeclIx[n.fnName] ?? -1) != fnIx
+  if nestedDecl {
+    nestParentOfPut(fnIx, curFnDeclIx)
+    for pt in paramTys { markNestRows(pt, n.fnTyParams, fnIx, 0) }
+    markNestRows(ret, n.fnTyParams, fnIx, 0)
+  }
+  // Save the inference accumulators (a demand-inference can nest inside another
+  // function's body check) and the enclosing return type.
+  const savedObserved = inferObserved
+  const savedObservedLit = inferObservedLit
+  const savedSawErr = inferSawErr
+  const savedRetLogLen = inferRetLogTy.length
+  const savedVoidRetLen = inferVoidRetSites.length
+  const savedDroppedLen = inferDroppedTy.length
+  const cbBefore = cycleBreakCount
+  const bbBefore = bareBraceCount
+  const savedValueRet = fnSawValueRet
+  const savedRetNatural = retNatural
+  const savedRetNaturalErr = retNaturalErr
+  const pinnedReads0 = lbiPinnedReads
+  retNaturalSet(-1)
+  retNaturalErrSet(false)
+  if inferring {
+    inferStack.push(inferKey)
+    inferObservedSet(-1)
+    inferObservedLitSet(true)
+    inferSawErrSet(false)
+    fnSawValueRetSet(false)
+  }
+  // A function body checked here can capture whatever narrowings are live around it, and
+  // it runs later — so a narrowing installed before this point and retired after it would
+  // be retired behind the capture's back. `narFnEpoch` is how the write side tells the two
+  // apart (`writeStorageTy`).
+  narFnEpoch = narFnEpoch + 1
+  // The body keeps its own ledger; the enclosing function's rows, and the marks an enclosing
+  // `if` holds into them, come back when it closes.
+  const savedClobKeys = narClobKeys
+  const savedClobTys = narClobTys
+  const savedClobPrev = narClobPrev
+  const savedClobDepths = narClobDepths
+  const savedClobRetired = narClobRetired
+  const savedClobBind = narClobBind
+  const savedClobDecl = narClobDecl
+  narClobKeysSet([])
+  narClobTysSet([])
+  narClobPrevSet([])
+  narClobDepthsSet([])
+  narClobRetiredSet([])
+  narClobBindSet([])
+  narClobDeclSet([])
+  fnDeclEnterBodyScope(n, fnIx, params)
+  const fsbCallsAt = fsbCallIx.length
+  const cstrOwnerPushed = fnDeclPushCstrOwner(n, fnIx)
+  fnDeclPushTyParams(n, fnIx, nestedDecl)
+  // Definite-assignment: a function body is its own flow context — it runs at call time,
+  // not at the declaration site, so a nested function capturing an outer still-unassigned
+  // `let x` must not be flagged (the call may happen after `x` is written). The body checks in
+  // its own frame, against an empty live set; `daLeaveFrame` restores the enclosing path.
+  const daSavedUnassigned = daEnterFrame()
+  const savedRet = T.curRet
+  T.curRet = ret
+  const savedInRetArg = inRetArg
+  inRetArgSet(false)
+  // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
+  // lambda keeps the ENCLOSING function's name, which is the scope the declaration
+  // is actually inside.
+  const savedEscName = curFnEscName
+  if n.fnName != "" { curFnEscNameSet(n.fnName) }
+  const savedFnDeclIx = curFnDeclIx
+  curFnDeclIx = fnIx
+  const savedNjFn = njFnIx
+  njFnIxSet(fnIx)
+  // Why this body's return type is void, for the return that disagrees with it: nobody wrote
+  // `: void`, so the mismatch has to name the bare `return` that decided it.
+  const savedBareRetVoid = curFnBareRetVoid
+  curFnBareRetVoidSet(bareRetVoid)
+  fnDeclDeclareParams(n, fnIx, params, paramTys, paramCollapsed, ret)
+  const bodyTotalForRet = fnDeclCheckBody(
+    n,
+    fnIx,
+    params,
+    paramTys,
+    inferring,
+    ret,
+    ucVoided,
+  )
+  T.curRet = savedRet
+  inRetArgSet(savedInRetArg)
+  curFnEscNameSet(savedEscName)
+  curFnDeclIx = savedFnDeclIx
+  njFnIxSet(savedNjFn)
+  curFnBareRetVoidSet(savedBareRetVoid)
+  daLeaveFrame(daSavedUnassigned)
+  // A write after a call in source order (a loop's back edge) is re-asked here, inside this body,
+  // so a pair naming its type parameter is deferred to its instances as at the call.
+  let fsbC = fsbCallsAt
+  while fsbC < fsbCallIx.length {
+    fsbRecheckFrom(fsbC)
+    fsbC = fsbC + 1
+  }
+  fnDeclPopTyParams(n)
+  if cstrOwnerPushed { cstrOwnerStack.pop() }
+  // Every return witness is in, so the inferred return type is final — pin the empty
+  // collections this body delivered to it, BEFORE `popScope` grades their bindings. An
+  // ANNOTATED body recorded nothing (those positions pin at the delivery) (D1591).
+  flushInferRetHoles()
+  popScope()
+  crFnLeave()
+  narClobKeysSet(savedClobKeys)
+  narClobTysSet(savedClobTys)
+  narClobPrevSet(savedClobPrev)
+  narClobDepthsSet(savedClobDepths)
+  narClobRetiredSet(savedClobRetired)
+  narClobBindSet(savedClobBind)
+  narClobDeclSet(savedClobDecl)
+  if !inferQuiet {
+    // Marks only the registered top-level decl (not a nested/shadowing namesake).
+    if n.fnName != "" && (fnDeclIx[n.fnName] ?? -1) == fnIx {
+      bodyChecked[n.fnName] = true
+    }
+  }
+  fnDeclJoinDropped(inferring, savedDroppedLen)
+  inferObservedSet(inferRetF32Join(inferring, inferObserved))
+  if inferring {
+    ret = finishInferredReturn(
+      n,
+      fnIx,
+      paramTys,
+      paramUninferable || bareBraceCount > bbBefore,
+      cbBefore,
+      savedObserved,
+      savedSawErr,
+      savedValueRet,
+      bodyTotalForRet,
+    )
+    inferObservedLitSet(savedObservedLit)
+    // Inferred non-void after all: the tail's value arms return (`clearTailVerdict`).
+    if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
+      clearTailVerdict(blockLastStmt(n.fnBody))
+    }
+  }
+  refuseVoidRetsFrom(savedVoidRetLen, ret)
+  // This body's witnesses belong to its own inference, not to an enclosing `if`'s replay.
+  while inferRetLogTy.length > savedRetLogLen {
+    inferRetLogTy.pop()
+    inferRetLogSeed.pop()
+    inferRetLogLit.pop()
+  }
+  fnDeclRefuseFallOff(n, ret, bodyTotalForRet)
+  fnDeclNoteRedundantRet(n, fnIx, ret, inferring, pinnedReads0)
+  retNaturalSet(savedRetNatural)
+  retNaturalErrSet(savedRetNaturalErr)
+  fnDeclRegisterGuard(n, params)
+  // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
+  // named function referenced as a value) evaluates to it.
+  mkFuncTy(paramTys, ret)
+}
+
+// Whether an inferring check of declaration `fnIx` is skipped and answers `void` (its caller
+// returns `TY_VOID`): a recursive cycle on the infer stack (counted as a break), a pre-pass
+// whose hoisted return is already resolved, or a real pass over a body already checked.
+function fnDeclAlreadyInferred(
+  n: FuncDecl,
+  fnIx: i32,
+  inferKey: string,
+): boolean {
+  // Recursive cycle: this function is already on the inference stack. Break with a
+  // provisional `void` (the binding-group fixpoint re-infers it once the cycle's
+  // resolvable members settle), and count the break so the completion knows
+  // the result is tentative rather than final.
+  if onInferStack(inferKey) {
+    cycleBreakCountSet(cycleBreakCount + 1)
+    return true
+  }
+  if inferQuiet && !paramSolveProbe && !cstrProbe {
+    // Suppressed pre-pass: memoize a resolved return (a `-2` reset by the fixpoint
+    // forces a fresh re-inference). The PARAMETER-solve probe never takes the memo:
+    // it needs the body walked for the flow constraints, not the return.
+    const hoisted = lookup(n.fnName)
+    if hoisted >= 0 {
+      if (fnDeclIx[n.fnName] ?? -1) >= 0 {
+        const ht = T.tys[hoisted]
+        if ht is TyFunc {
+          if ht.fnRet != -2 { return true }
+        }
+      }
+    }
+  } else {
+    // Real check pass: returns are already resolved by the pre-pass, so skip only a
+    // top-level body already diagnostic-checked (a forward call reached it before pass 2
+    // did). Gated on `fnIx` matching the registered top-level decl, so a nested function
+    // sharing a name (e.g. two `add` closures) is never skipped.
+    if (fnDeclIx[n.fnName] ?? -1) == fnIx {
+      if bodyChecked[n.fnName] ?? false { return true }
+    }
+  }
+  false
+}
+
+// Resolves each parameter's type of declaration `fnIx` into `paramTys`, and whether its
+// annotation collapsed a literal arm into `paramCollapsed` (both caller-owned, one row per
+// parameter, `TY_ERR` where it cannot resolve). True when an anonymous literal's parameter is uninferable.
+function fnDeclResolveParams(
+  n: FuncDecl,
+  fnIx: i32,
+  params: i32[],
+  paramTys: i32[],
+  paramCollapsed: boolean[],
+): boolean {
+  // The contextual expected param types recorded for this lambda node (`seedExpected` at a
   // call arg, a `.map`/`.filter` receiver, or an annotated let/return/field/element). Keyed by
   // node index, so a composite's many lambdas each read their own — no single-shot leak.
   const cbExpect = cbExpectedFor(fnIx)
   const cbExpectUsable = cbExpect.length == params.length
-  const paramTys: i32[] = []
-  // Parallel to `paramTys`: did THIS parameter's annotation collapse a subsumed literal
-  // arm (D1048's second hint)? Recorded here, where the annotation resolves, and read in
-  // the declare loop below, which is where the binding — and so the scope depth the mark
-  // is keyed by — comes into existence.
-  const paramCollapsed: boolean[] = []
   let paramUninferable = false
   let pi = 0
   while pi < params.length {
@@ -632,18 +832,18 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     paramCollapsed.push(ptCollapsed)
     pi = pi + 1
   }
-  // Parameter DEFAULTS (`a: i32 = 0`, and the `a?: T` spelling the parser
-  // desugars into one), checked once the annotations have resolved.
-  checkParamDefaults(n, params, paramTys)
-  if n.fnName != "" && params.length > 0 {
-    const sp0 = P.nodes[params[0]]
-    if sp0 is Param {
-      if sp0.parName == "self" && sp0.parType >= 0 {
-        checkSelfFnReachable(demangleName(n.fnName), paramTys[0], fnIx)
-      }
-    }
-  }
-  // Resolve the return-type annotation (or the pending sentinel when inferring).
+  paramUninferable
+}
+
+// The return type of declaration `fnIx`: `-2` (pending) while inferring, else its resolved
+// annotation (`TY_VOID` when absent, `TY_ERR` when unknown). Binds a named function's
+// signature in the current scope, the pending one for a nested function being inferred.
+function fnDeclResolveRet(
+  n: FuncDecl,
+  fnIx: i32,
+  inferring: boolean,
+  paramTys: i32[],
+): i32 {
   let ret = -2
   if !inferring {
     ret = TY_VOID
@@ -678,63 +878,15 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     // hoist does, so a self-call resolves and `finishInferredReturn` patches this binding.
     declare(n.fnName, mkFuncTy(paramTys, -2))
   }
-  // A generic nested in another function owns its parameter rows (D3853).
-  const nestedDecl = n.fnName != ""
-    && n.fnTyParams.length > 0
-    && (fnDeclIx[n.fnName] ?? -1) != fnIx
-  if nestedDecl {
-    nestParentOfPut(fnIx, curFnDeclIx)
-    for pt in paramTys { markNestRows(pt, n.fnTyParams, fnIx, 0) }
-    markNestRows(ret, n.fnTyParams, fnIx, 0)
-  }
-  // Save the inference accumulators (a demand-inference can nest inside another
-  // function's body check) and the enclosing return type.
-  const savedObserved = inferObserved
-  const savedObservedLit = inferObservedLit
-  const savedSawErr = inferSawErr
-  const savedRetLogLen = inferRetLogTy.length
-  const savedVoidRetLen = inferVoidRetSites.length
-  const savedDroppedLen = inferDroppedTy.length
-  const cbBefore = cycleBreakCount
-  const bbBefore = bareBraceCount
-  const savedValueRet = fnSawValueRet
-  const savedRetNatural = retNatural
-  const savedRetNaturalErr = retNaturalErr
-  const pinnedReads0 = lbiPinnedReads
-  retNaturalSet(-1)
-  retNaturalErrSet(false)
-  if inferring {
-    inferStack.push(inferKey)
-    inferObservedSet(-1)
-    inferObservedLitSet(true)
-    inferSawErrSet(false)
-    fnSawValueRetSet(false)
-  }
-  // A function body checked here can capture whatever narrowings are live around it, and
-  // it runs later — so a narrowing installed before this point and retired after it would
-  // be retired behind the capture's back. `narFnEpoch` is how the write side tells the two
-  // apart (`writeStorageTy`).
-  narFnEpoch = narFnEpoch + 1
-  // The body keeps its own ledger; the enclosing function's rows, and the marks an enclosing
-  // `if` holds into them, come back when it closes.
-  const savedClobKeys = narClobKeys
-  const savedClobTys = narClobTys
-  const savedClobPrev = narClobPrev
-  const savedClobDepths = narClobDepths
-  const savedClobRetired = narClobRetired
-  const savedClobBind = narClobBind
-  const savedClobDecl = narClobDecl
-  narClobKeysSet([])
-  narClobTysSet([])
-  narClobPrevSet([])
-  narClobDepthsSet([])
-  narClobRetiredSet([])
-  narClobBindSet([])
-  narClobDeclSet([])
+  ret
+}
+
+// Enters the body of declaration `fnIx`: its closure-capture frame, a fresh scope sharing the
+// parameters (each shadowing an enclosing binding's path narrowings), the capture widening and
+// the inferred-return holes `flushInferRetHoles` drains before the scope pops (D1591).
+function fnDeclEnterBodyScope(n: FuncDecl, fnIx: i32, params: i32[]) {
   crFnEnter(fnIx)
-  // Check the body in a fresh scope sharing the parameters.
   pushScope(n.fnBody)
-  // A parameter shadows an enclosing binding's path narrowings for the body.
   if npKeys.length > 0 {
     let spi = 0
     while spi < params.length {
@@ -744,60 +896,61 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     }
   }
   crCaptureWiden(fnIx)
-  // Paired with the `flushInferRetHoles` below, which must run while this scope is still
-  // live — `popScope` is what raises the uninferable-binding floor (D1591).
   pushInferRetHoles()
-  // Owns the deferred constraints this body records, so a call site can tell whose type
-  // parameters they speak about (`cstrOwnedBy`). Only a registered top-level declaration is
-  // pushed: a nested function or lambda has no `fnDeclIx` entry for a call site to match
-  // against, so its constraints stay owned by the enclosing named function.
+}
+
+// Pushes `fnIx` as the owner of the deferred constraints its body records (`cstrOwnedBy`) when
+// it is the registered top-level declaration of its name; true when pushed. A nested function
+// or lambda has no `fnDeclIx` entry, so its constraints stay owned by the enclosing one.
+function fnDeclPushCstrOwner(n: FuncDecl, fnIx: i32): boolean {
   let cstrOwnerPushed = false
-  const fsbCallsAt = fsbCallIx.length
   if n.fnName != "" {
     if (fnDeclIx[n.fnName] ?? -1) == fnIx {
       cstrOwnerStack.push(fnIx)
       cstrOwnerPushed = true
     }
   }
-  // Keeps the function's type parameters in scope for the whole body, so a body annotation
-  // that names one — a local `const out: T[]`, `const x: T` — resolves to an opaque `TyVar`
-  // instead of failing "unknown type 'T'"; `resolveAnnot` alone only scopes typarams around
-  // a single param/return annotation. The emitter substitutes the concrete type per instance (`monoCloneBody`).
+  cstrOwnerPushed
+}
+
+// Keeps the type parameters of `fnIx` in scope for its whole body, each as an opaque `TyVar`
+// with its bound row (pushed even when unbounded, so an unbounded `<T>` shadows an enclosing
+// bounded `T`). `fnDeclPopTyParams` pops them; the emitter substitutes per instance.
+function fnDeclPushTyParams(n: FuncDecl, fnIx: i32, nestedDecl: boolean) {
   let tpBody = 0
   while tpBody < n.fnTyParams.length {
     tpEnvNames.push(n.fnTyParams[tpBody])
     tpEnvTys.push(mkTyVar(n.fnTyParams[tpBody]))
     if nestedDecl { tvNestOf.set(tpEnvTys[tpEnvTys.length - 1], fnIx) }
-    // The parameter's bound, for the same span (OQ-5, strict bodies). A row is pushed even
-    // when the parameter is unbounded (-1), so the two stacks stay one-to-one with
-    // `fnTyParams` and an unbounded `<T>` shadows an enclosing bounded `T` rather than
-    // inheriting its bound — `tpEnv`'s own innermost-wins rule.
     tpBoundNamesPush(n.fnTyParams[tpBody])
     tpBoundAnnsPush(fnTpBoundOf(fnIx, tpBody))
     tpBody = tpBody + 1
   }
-  // Definite-assignment: a function body is its own flow context — it runs at call time,
-  // not at the declaration site, so a nested function capturing an outer still-unassigned
-  // `let x` must not be flagged (the call may happen after `x` is written). The body checks in
-  // its own frame, against an empty live set; `daLeaveFrame` restores the enclosing path.
-  const daSavedUnassigned = daEnterFrame()
-  const savedRet = T.curRet
-  T.curRet = ret
-  const savedInRetArg = inRetArg
-  inRetArgSet(false)
-  // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
-  // lambda keeps the ENCLOSING function's name, which is the scope the declaration
-  // is actually inside.
-  const savedEscName = curFnEscName
-  if n.fnName != "" { curFnEscNameSet(n.fnName) }
-  const savedFnDeclIx = curFnDeclIx
-  curFnDeclIx = fnIx
-  const savedNjFn = njFnIx
-  njFnIxSet(fnIx)
-  // Why this body's return type is void, for the return that disagrees with it: nobody wrote
-  // `: void`, so the mismatch has to name the bare `return` that decided it.
-  const savedBareRetVoid = curFnBareRetVoid
-  curFnBareRetVoidSet(bareRetVoid)
+}
+
+// Pops the type-parameter rows `fnDeclPushTyParams` pushed for `n`.
+function fnDeclPopTyParams(n: FuncDecl) {
+  let tpPop = 0
+  while tpPop < n.fnTyParams.length {
+    tpEnvNames.pop()
+    tpEnvTys.pop()
+    tpBoundNamesPop()
+    tpBoundAnnsPop()
+    tpPop = tpPop + 1
+  }
+}
+
+// Binds the parameters of declaration `fnIx` in the body scope (marking a collapsed
+// annotation on its binding, D1048), and the name itself in the outer scope for the
+// binding-identity column; a sole parameter starts fresh-narrowed.
+function fnDeclDeclareParams(
+  n: FuncDecl,
+  fnIx: i32,
+  params: i32[],
+  paramTys: i32[],
+  paramCollapsed: boolean[],
+  ret: i32,
+) {
   // The function name binds in the OUTER scope (decl-scope chain), but its body — params +
   // statements — is checked under this pushed scope. Bound in every compile, not only the
   // LSP's: the binding-identity column resolves through the same chain.
@@ -824,6 +977,22 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     if pn1 is Param { narrowFreshBinding(pn1.parName, fnIx) }
   }
   checkParamNestedFnClash(n, params)
+}
+
+// Checks the statements of the body of declaration `fnIx` under its scope, the last as the
+// implicit return (graded against `ret`, or a witness under inference), and retains hover
+// types. Answers whether the body is total, asked while the scope is still live.
+function fnDeclCheckBody(
+  n: FuncDecl,
+  fnIx: i32,
+  params: i32[],
+  paramTys: i32[],
+  inferring: boolean,
+  ret: i32,
+  ucVoided: boolean,
+): boolean {
+  // The return an unread function shows in the editor: its tail's value, never lowered.
+  let ucShowRet = TY_VOID
   const body = P.nodes[n.fnBody]
   const savedStmtBlk = chkStmtBlk
   chkStmtBlkSet(n.fnBody)
@@ -991,48 +1160,12 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   if ucVoided && symEnabled != 0 && ucShowRet >= 0 && ucShowRet != TY_ERR {
     symRetainType(fnIx, mkFuncTy(paramTys, ucShowRet), 2)
   }
-  T.curRet = savedRet
-  inRetArgSet(savedInRetArg)
-  curFnEscNameSet(savedEscName)
-  curFnDeclIx = savedFnDeclIx
-  njFnIxSet(savedNjFn)
-  curFnBareRetVoidSet(savedBareRetVoid)
-  daLeaveFrame(daSavedUnassigned)
-  // A write after a call in source order (a loop's back edge) is re-asked here, inside this body,
-  // so a pair naming its type parameter is deferred to its instances as at the call.
-  let fsbC = fsbCallsAt
-  while fsbC < fsbCallIx.length {
-    fsbRecheckFrom(fsbC)
-    fsbC = fsbC + 1
-  }
-  let tpPop = 0
-  while tpPop < n.fnTyParams.length {
-    tpEnvNames.pop()
-    tpEnvTys.pop()
-    tpBoundNamesPop()
-    tpBoundAnnsPop()
-    tpPop = tpPop + 1
-  }
-  if cstrOwnerPushed { cstrOwnerStack.pop() }
-  // Every return witness is in, so the inferred return type is final — pin the empty
-  // collections this body delivered to it, BEFORE `popScope` grades their bindings. An
-  // ANNOTATED body recorded nothing (those positions pin at the delivery) (D1591).
-  flushInferRetHoles()
-  popScope()
-  crFnLeave()
-  narClobKeysSet(savedClobKeys)
-  narClobTysSet(savedClobTys)
-  narClobPrevSet(savedClobPrev)
-  narClobDepthsSet(savedClobDepths)
-  narClobRetiredSet(savedClobRetired)
-  narClobBindSet(savedClobBind)
-  narClobDeclSet(savedClobDecl)
-  if !inferQuiet {
-    // Marks only the registered top-level decl (not a nested/shadowing namesake).
-    if n.fnName != "" && (fnDeclIx[n.fnName] ?? -1) == fnIx {
-      bodyChecked[n.fnName] = true
-    }
-  }
+  bodyTotalForRet
+}
+
+// Joins the return witnesses an inferring body dropped since `savedDroppedLen` into the
+// observed return (only once an observation exists), then truncates the dropped log to that mark.
+function fnDeclJoinDropped(inferring: boolean, savedDroppedLen: i32) {
   if inferring && inferObserved >= 0 {
     let dk = savedDroppedLen
     while dk < inferDroppedTy.length {
@@ -1044,32 +1177,12 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     inferDroppedTy.pop()
     inferDroppedLit.pop()
   }
-  inferObservedSet(inferRetF32Join(inferring, inferObserved))
-  if inferring {
-    ret = finishInferredReturn(
-      n,
-      fnIx,
-      paramTys,
-      paramUninferable || bareBraceCount > bbBefore,
-      cbBefore,
-      savedObserved,
-      savedSawErr,
-      savedValueRet,
-      bodyTotalForRet,
-    )
-    inferObservedLitSet(savedObservedLit)
-    // Inferred non-void after all: the tail's value arms return (`clearTailVerdict`).
-    if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
-      clearTailVerdict(blockLastStmt(n.fnBody))
-    }
-  }
-  refuseVoidRetsFrom(savedVoidRetLen, ret)
-  // This body's witnesses belong to its own inference, not to an enclosing `if`'s replay.
-  while inferRetLogTy.length > savedRetLogLen {
-    inferRetLogTy.pop()
-    inferRetLogSeed.pop()
-    inferRetLogLit.pop()
-  }
+}
+
+// Refuses a body of `n` that can fall off its end against return `ret`: a `never` function
+// that can return, or a value return whose body is not total and whose type does not admit
+// `null` (naming a `{ name }` block tail that reads like a record). Silent in the pre-pass.
+function fnDeclRefuseFallOff(n: FuncDecl, ret: i32, bodyTotalForRet: boolean) {
   // Soundness — missing return: a function whose body can fall off the end without yielding a
   // value on some path implicitly produces `null`, sound only when `null` is part of the
   // return type. Asks whether the whole type admits `null` (`tyBearsNull`, recursive), not
@@ -1119,6 +1232,18 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       )
     }
   }
+}
+
+// Records the annotated return of `n` as redundant when its body's natural return renders
+// identically, is concrete and not influenced by the annotation, the body has no bare
+// `return`, and no read got pinned since `pinnedReads0`. Never under inference or the pre-pass.
+function fnDeclNoteRedundantRet(
+  n: FuncDecl,
+  fnIx: i32,
+  ret: i32,
+  inferring: boolean,
+  pinnedReads0: i32,
+) {
   // Redundant return annotation: the body's natural inferred return already equals the
   // explicit `: T`, so removing it yields the identical type. Conservative: a single
   // concrete observed return rendering identically to `ret`; a hole / error / `never` /
@@ -1139,12 +1264,11 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       }
     }
   }
-  retNaturalSet(savedRetNatural)
-  retNaturalErrSet(savedRetNaturalErr)
-  // Inferred type guard (A6b, host parity — degenerate case): a NAMED function
-  // whose body's RESULT is exactly a null-test on one of its params registers
-  // as a guard, so calling it in a condition narrows the argument (inline,
-  // UFCS, and the guard-clause form).
+}
+
+// Registers named function `n` as an inferred type guard when its body's result is exactly a
+// null-test on one of `params` (A6b), so a call in a condition narrows that argument.
+function fnDeclRegisterGuard(n: FuncDecl, params: i32[]) {
   if n.fnName != "" {
     const gBody = P.nodes[n.fnBody]
     if gBody is Block {
@@ -1177,7 +1301,4 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       }
     }
   }
-  // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
-  // named function referenced as a value) evaluates to it.
-  mkFuncTy(paramTys, ret)
 }
