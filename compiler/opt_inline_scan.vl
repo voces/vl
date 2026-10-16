@@ -1,9 +1,10 @@
-// The `-O` inline-record step (docs/internals/optimizer-in-vl.md, rungs R6b to R6d): which
+// The `-O` inline-record step (docs/internals/optimizer-in-vl.md, rungs R6b to R7): which
 // struct fields holding a leaf record are stored inline, why each other one stays a reference,
-// and the module rewritten so. It walks every body under an emulation of the validator's
-// operand stack. The host stages the module with `optInLoad`, calls
-// `optInlineRewrite`, and reads the module and its explain lines through `optOut*`. A module
-// this cannot read is left alone.
+// and the module rewritten so; then which lists of leaf records hold their fields side by side.
+// It walks every body under an emulation of the validator's operand stack. The host stages the
+// module with `optInLoad`, calls `optInlineRewrite`, then `optInlineFlatScan` and
+// `optInlineFlatStep` on its output, and reads each module and its explain lines through
+// `optOut*`. A module this cannot read is left alone.
 
 import {
   WasmCursor,
@@ -17,7 +18,11 @@ import {
 import { WasmModule, wmRead } from "./wasm_write"
 import { copyBytes, wnPutLeb, wnRead, wnTable } from "./wasm_names"
 import { optInBytes, optOutSet } from "./opt_scan"
-import { mvFieldOnlyParams, mvTableArity } from "./opt_multivalue"
+import {
+  mvFieldOnlyParams,
+  mvProducerRecords,
+  mvTableArity,
+} from "./opt_multivalue"
 import { namesFields } from "./opt_inline"
 
 const NONE = -1
@@ -43,6 +48,24 @@ const SM_GET = 2
 const SM_SET = 3
 const SM_TEE = 4
 const SM_SGET = 5
+const SM_NEW = 6
+const SM_AGET = 7
+const SM_CALL = 8
+// The ops on a candidate array the flattening rewrites, and how an element read is used.
+const AK_NEWDEF = 0
+const AK_FIXED = 1
+const AK_GET = 2
+const AK_SET = 3
+const AK_LEN = 4
+const AK_COPY = 5
+const AU_FIELD = 0
+const AU_LOCAL = 1
+const AU_ARG = 2
+const AU_WHOLE = 3
+// A flattened array stays boxed past this many whole-element reads per store
+// (inline-records-design.md §7); V8 refuses an `array.new_fixed` of more operands than this.
+const FLAT_READS_PER_STORE = 6
+const NEW_FIXED_MAX = 10000
 const MAX_LOCALS = 50000
 const PAIR = 65536
 
@@ -71,6 +94,56 @@ let potKeys: i32[] = []
 let isParent: boolean[] = []
 let isRecord: boolean[] = []
 let constMade: boolean[] = []
+// The list-flattening step's candidates: per type the record a candidate array's elements
+// hold or -1, the candidates ascending, and why each is refused outright (`arrBadF` -2 when
+// it is not, -1 when no function is to blame); the array types constant expressions make.
+let arrRec: i32[] = []
+let arrList: i32[] = []
+let arrBadW: u8[][] = []
+let arrBadF: i32[] = []
+let constArr: i32[] = []
+// Whether the walk records array sites, and what the last flattening scan found: `gate` 0
+// refused (`scanWhy` says why), 1 no candidate at all, 2 no candidate array, 3 candidate arrays,
+// whose bodies `flatWalked` says are read.
+let flatScan = false
+let gate = 0
+let flatWalked = false
+let scanWhy = ""
+// The flattening's sites over every body: per site its op, offset, reachability, array type,
+// kind and operands `[fsOLo, fsOHi)`, how an element read is used, and whether a
+// `ref.as_non_null` follows it; per body its sites `[fbLo, fbHi)`.
+let fsK: i32[] = []
+let fsOff: i32[] = []
+let fsReach: boolean[] = []
+let fsTy: i32[] = []
+let fsKind: i32[] = []
+let fsOLo: i32[] = []
+let fsOHi: i32[] = []
+let fsUse: i32[] = []
+let fsUA: i32[] = []
+let fsUB: i32[] = []
+let fsCast: boolean[] = []
+let foNull: boolean[] = []
+let foProd: i32[] = []
+let foCast: boolean[] = []
+let fbLo: i32[] = []
+let fbHi: i32[] = []
+// The multi-value step's facts on the scanned module, read once: its field-only parameters
+// (`g * 64 + j`) and per function the record its result is taken apart as, or -1.
+let mvReady = false
+let mvFo: {[i32]: i32} = Map()
+let mvProd: i32[] = []
+// The step: per type whether the multi-value step leaves its free reads boxed, the number type
+// a flattened array holds or -1, and the free reads it counted.
+let unfreed: boolean[] = []
+let flatNum: i32[] = []
+let flRebox = false
+let fhA: i32[] = []
+let fhF: i32[] = []
+let fhL: i32[] = []
+let faA: i32[] = []
+let faG: i32[] = []
+let faJ: i32[] = []
 let nameW = wnRead([])
 let nameTab: i32[] = []
 
@@ -189,6 +262,9 @@ let imBtK = 0
 let imBtV = 0
 let imL: i32[] = []
 
+// The first flattening site of the body being walked.
+let fbCur = 0
+
 // The step's decision on `b`, into `decInl`/`decWhy` per candidate pair and `decRecs`/
 // `decRecWhy` per record; sets `bad` when the module cannot be read. `stable` is
 // `--stable-layout`, `rebox` inlines a field whatever its whole-record reads, and `fault`
@@ -214,7 +290,11 @@ function decide(b: u8[], stable: boolean, rebox: boolean, fault: boolean) {
 function readModule(b: u8[]): boolean {
   B = b
   M = wmRead(b)
-  if !M.ok || namesFields(M) { return false }
+  if !M.ok { return false }
+  if namesFields(M) {
+    scanWhy = "the name section names struct fields"
+    return false
+  }
   nameW = wnRead(b)
   if !nameW.ok { return false }
   nTypes = M.types.length
@@ -233,6 +313,7 @@ function readModule(b: u8[]): boolean {
   bndH = []
   bndW = []
   constMade = []
+  constArr = []
   for _ in M.types { constMade.push(false) }
   let structGroups = 0
   let t = 0
@@ -249,7 +330,10 @@ function readModule(b: u8[]): boolean {
     if hasStruct { structGroups = structGroups + 1 }
     t = t + size
   }
-  if structGroups > 1 { return false }
+  if structGroups > 1 {
+    scanWhy = "struct types span several rec groups, so a changed parent could become equal to another type"
+    return false
+  }
   let s = 0
   while s < M.secId.length {
     const id = M.secId[s]
@@ -418,12 +502,21 @@ function readTags(c: WasmCursor) {
   }
 }
 
-// Skips a constant expression, marking every struct type it makes.
+// Skips a constant expression, marking every struct type it makes and every array type it
+// makes other than as an empty `array.new_fixed`.
 function constScan(c: WasmCursor) {
   while !c.failed {
+    const at = c.pos
     const op = wcOp(c)
     if op == 0xfb0000 || op == 0xfb0001 {
       if c.imm >= 0 && c.imm < nTypes { constMade[c.imm] = true }
+    }
+    if op == 0xfb0006 || op == 0xfb0007 || op == 0xfb0008 {
+      const d = wcNew(c.b, at, c.pos)
+      wcByte(d)
+      wcU32(d)
+      const t = wcU32(d)
+      if op != 0xfb0008 || wcU32(d) != 0 { constArr.push(t) }
     }
     if op == 0x0b { return }
   }
@@ -708,9 +801,16 @@ function findCandidates() {
   potKeys = []
   isParent = []
   isRecord = []
+  arrRec = []
+  arrList = []
+  arrBadW = []
+  arrBadF = []
   for _ in M.types {
     isParent.push(false)
     isRecord.push(false)
+    arrRec.push(-1)
+    arrBadW.push([])
+    arrBadF.push(-2)
   }
   let p = 0
   while p < nTypes {
@@ -732,6 +832,8 @@ function findCandidates() {
       const v = refIdx(st.params[0])
       if v >= 0 && v < nTypes && recOk[v] && !hasSub[v] && uniform(v) {
         isRecord[v] = true
+        arrRec[p] = v
+        arrList.push(p)
       }
     }
     p = p + 1
@@ -1091,6 +1193,7 @@ function walk(bi: i32, rec: boolean): i32 {
   bsNew = []
   bsLo = []
   bsHi = []
+  fbCur = fsK.length
   boField = []
   boNull = []
   boProd = []
@@ -1725,6 +1828,12 @@ function record(
   if op == 0x20 { kind = SM_GET; a = imA }
   if op == 0x21 { kind = SM_SET; a = imA }
   if op == 0x22 { kind = SM_TEE; a = imA }
+  if sub == 0 { kind = SM_NEW; a = imA }
+  if sub == 11 { kind = SM_AGET; a = imA }
+  if op == 0x10 { kind = SM_CALL; a = imA }
+  if flatScan && arrList.length > 0 {
+    flatSite(op, sub, k, off, hb, reach, base, segLo)
+  }
   let at = -1
   if sub == 2 {
     kind = SM_SGET
@@ -1818,6 +1927,101 @@ function erase(op: i32, f: i32) {
   }
 }
 
+// ---- The flattening's sites, read before each op runs ----
+
+function flatCand(a: i32): boolean { a >= 0 && a < nTypes && arrRec[a] >= 0 }
+
+// Refuses candidate array type `a` outright, the first reason winning.
+function flatBad(a: i32, what: string) {
+  if flatCand(a) && arrBadF[a] == -2 {
+    const w: u8[] = []
+    putText(w, what)
+    arrBadW[a] = w
+    arrBadF[a] = curF
+  }
+}
+
+function flatPush(kind: i32, a: i32, k: i32, off: i32, reach: boolean) {
+  fsK.push(k)
+  fsOff.push(off)
+  fsReach.push(reach)
+  fsTy.push(a)
+  fsKind.push(kind)
+  fsOLo.push(foNull.length)
+  fsOHi.push(foNull.length)
+  fsUse.push(-1)
+  fsUA.push(0)
+  fsUB.push(0)
+  fsCast.push(false)
+}
+
+// Records the operand `d` below the top as an element the last site stores.
+function flatOpnd(d: i32, hb: i32, reach: boolean, base: i32, segLo: i32) {
+  const q = if hb > d { producer(hb - 1 - d, reach, base, segLo) } else { NONE }
+  foNull.push(nullableAt(d, reach))
+  foProd.push(q)
+  foCast.push(false)
+  fsOHi[fsOHi.length - 1] = foNull.length
+}
+
+function flatSite(
+  op: i32,
+  sub: i32,
+  k: i32,
+  off: i32,
+  hb: i32,
+  reach: boolean,
+  base: i32,
+  segLo: i32,
+) {
+  if op == 0xd4 {
+    const s = fsK.length - 1
+    if s >= fbCur && fsK[s] == k - 1 && fsKind[s] == AK_GET { fsCast[s] = true }
+    return
+  }
+  if sub == 6 {
+    flatBad(
+      imA,
+      "an array.new fills it from one shared value, which a flat array would copy into every element",
+    )
+  } else if sub == 7 && flatCand(imA) {
+    flatPush(AK_NEWDEF, imA, k, off, reach)
+  } else if sub == 8 && flatCand(imA) {
+    flatPush(AK_FIXED, imA, k, off, reach)
+    let i = 0
+    while i < imB {
+      flatOpnd(imB - 1 - i, hb, reach, base, segLo)
+      i = i + 1
+    }
+  } else if sub == 11 && flatCand(imA) {
+    flatPush(AK_GET, imA, k, off, reach)
+  } else if sub == 14 && flatCand(imA) {
+    flatPush(AK_SET, imA, k, off, reach)
+    flatOpnd(0, hb, reach, base, segLo)
+  } else if sub == 17 {
+    if imA == imB && flatCand(imA) {
+      flatPush(AK_COPY, imA, k, off, reach)
+    } else {
+      flatBad(imA, "an array.copy from another array type")
+      flatBad(imB, "an array.copy into another array type")
+    }
+  } else if sub == 15 {
+    const e = peek(0)
+    if e >= REF {
+      const h = holderOfOperand(e)
+      if h >= 0 {
+        if flatCand(h) { flatPush(AK_LEN, h, k, off, reach) }
+      } else {
+        for a in arrList {
+          flatBad(a, "an array.len of an abstract array reference")
+        }
+      }
+    }
+  } else if sub == 9 || sub == 10 || sub == 16 || sub == 18 || sub == 19 {
+    flatBad(imA, "an array op the flattening does not rewrite")
+  }
+}
+
 // ---- After the walk: which stores are of non-null values, and how each read is used ----
 
 function afterWalk(f: i32, tight: boolean) {
@@ -1867,6 +2071,7 @@ function afterWalk(f: i32, tight: boolean) {
     }
     s = s + 1
   }
+  if flatScan && arrList.length > 0 { flatAfter(nonNull) }
   tally(f)
 }
 
@@ -2120,6 +2325,227 @@ function copyL(s: i32[]): i32[] {
   const out: i32[] = []
   for x in s { out.push(x) }
   out
+}
+
+// ---- After the walk: how each element read of a candidate array is used ----
+
+// The walked body closes its sites: a stored value whose type admits null is
+// non-null after all when the local it is read from holds no null there.
+function flatAfter(nonNull: boolean[]) {
+  const lo = fbCur
+  const hi = fsK.length
+  fbLo.push(lo)
+  fbHi.push(hi)
+  const gets: i32[] = []
+  const stored: {[i32]: i32} = Map()
+  let s = lo
+  while s < hi {
+    let x = fsOLo[s]
+    while x < fsOHi[s] {
+      const q = foProd[x]
+      if foNull[x] && q != NONE && nonNull[q] {
+        foNull[x] = false
+        foCast[x] = true
+      }
+      x = x + 1
+    }
+    if fsKind[s] == AK_GET { gets.push(s) }
+    if fsKind[s] == AK_SET && foProd[fsOLo[s]] != NONE {
+      stored[foProd[fsOLo[s]]] = fsTy[s]
+    }
+    s = s + 1
+  }
+  if gets.length == 0 { return }
+  const sets: {[i32]: i32} = Map()
+  let q = 0
+  while q < smK.length {
+    if smK[q] == SM_SET || smK[q] == SM_TEE {
+      sets[smA[q]] = (sets[smA[q]] ?? 0) + 1
+    }
+    q = q + 1
+  }
+  const plain = elemLocals(gets, stored, false)
+  const held = elemLocals(gets, stored, true)
+  for g in gets {
+    const k = fsK[g]
+    const v = arrRec[fsTy[g]]
+    const last = if k + 1 < smK.length && smK[k + 1] == SM_ASNN { k + 1 } else { k }
+    const n = afterCast(k)
+    const l = if n >= 0 && smK[n] == SM_SET { smA[n] } else { -1 }
+    const isPlain = l >= 0 && plain.has(l) && (sets[l] ?? 0) == 1
+    if fieldReadOf(n, v) {
+      fsUse[g] = AU_FIELD
+      fsUA[g] = n
+      fsUB[g] = smB[n]
+    } else if l >= 0 && (isPlain || held.has(l)) {
+      fsUse[g] = AU_LOCAL
+      fsUA[g] = l
+      fsUB[g] = if isPlain { 0 } else { 1 }
+    } else {
+      const ag = argOfG[last]
+      if ag != null {
+        fsUse[g] = AU_ARG
+        fsUA[g] = ag
+        fsUB[g] = argOfJ[last] ?? 0
+      } else {
+        fsUse[g] = AU_WHOLE
+      }
+    }
+  }
+}
+
+// The locals (not parameters) an element read of a candidate array is set into that are never
+// tee'd, set only to such a read of that array (past an optional `ref.as_non_null`), a fresh
+// record of its element type or a producer's result, and read only for a field, a store back
+// or a field-only parameter. `wide` also takes the locals a store reads, and producer calls.
+function elemLocals(
+  gets: i32[],
+  stored: {[i32]: i32},
+  wide: boolean,
+): {[i32]: i32} {
+  const arrOf: {[i32]: i32} = Map()
+  const keys: i32[] = []
+  const badL: {[i32]: i32} = Map()
+  for g in gets {
+    const n = afterCast(fsK[g])
+    if n >= 0 && smK[n] == SM_SET && smA[n] >= nParams {
+      const l = smA[n]
+      if !arrOf.has(l) {
+        arrOf[l] = fsTy[g]
+        keys.push(l)
+      } else if (arrOf[l] ?? 0) != fsTy[g] {
+        badL[l] = 1
+      }
+    }
+  }
+  let grow = wide
+  while grow {
+    const before = keys.length
+    let q = 0
+    while q < smK.length {
+      const l = smA[q]
+      if smK[q] == SM_GET && l >= nParams && !arrOf.has(l) {
+        let into = -1
+        if q + 1 < smK.length && smK[q + 1] == SM_SET {
+          const l3 = smA[q + 1]
+          if l3 != l { into = arrOf[l3] ?? -1 }
+        } else {
+          into = stored[q] ?? -1
+        }
+        if into >= 0 {
+          arrOf[l] = into
+          keys.push(l)
+        }
+      }
+      q = q + 1
+    }
+    grow = keys.length != before
+  }
+  let q = 0
+  while q < smK.length {
+    if smK[q] == SM_TEE { badL[smA[q]] = 1 }
+    q = q + 1
+  }
+  let again = true
+  while again {
+    const drop: i32[] = []
+    q = 0
+    while q < smK.length {
+      const kind = smK[q]
+      const l = smA[q]
+      if (kind == SM_SET || kind == SM_GET) && !badL.has(l) && arrOf.has(l) {
+        const a = arrOf[l] ?? 0
+        if (
+          !(if kind == SM_SET { setOk(q, l, a, arrOf, badL, wide) } else { getOk(q, l, a, arrOf, badL, stored, wide) })
+        ) {
+          drop.push(l)
+        }
+      }
+      q = q + 1
+    }
+    for l in drop { badL[l] = 1 }
+    again = drop.length > 0
+  }
+  const out: {[i32]: i32} = Map()
+  for l in keys {
+    if !badL.has(l) { out[l] = 1 }
+  }
+  out
+}
+
+function goodL(
+  arrOf: {[i32]: i32},
+  badL: {[i32]: i32},
+  l: i32,
+  a: i32,
+): boolean {
+  arrOf.has(l) && (arrOf[l] ?? 0) == a && !badL.has(l)
+}
+
+// Whether the `local.set` at op `q` of local `l` (held for array type `a`) sets what it may.
+function setOk(
+  q: i32,
+  l: i32,
+  a: i32,
+  arrOf: {[i32]: i32},
+  badL: {[i32]: i32},
+  wide: boolean,
+): boolean {
+  if q == 0 { return false }
+  const p = smK[q - 1]
+  if p == SM_NEW { return smA[q - 1] == arrRec[a] }
+  if p == SM_ASNN { return q >= 2 && smK[q - 2] == SM_AGET && smA[q - 2] == a }
+  if p == SM_GET { return smA[q - 1] != l && goodL(arrOf, badL, smA[q - 1], a) }
+  if p == SM_CALL { return wide && mvProdOf(smA[q - 1]) == arrRec[a] }
+  p == SM_AGET && smA[q - 1] == a
+}
+
+// Whether the `local.get` at op `q` of local `l` reads it as it may.
+function getOk(
+  q: i32,
+  l: i32,
+  a: i32,
+  arrOf: {[i32]: i32},
+  badL: {[i32]: i32},
+  stored: {[i32]: i32},
+  wide: boolean,
+): boolean {
+  const v = arrRec[a]
+  const n = afterCast(q)
+  if fieldReadOf(n, v) { return true }
+  if n >= 0 && smK[n] == SM_SET {
+    return n == q + 1 && smA[n] != l && goodL(arrOf, badL, smA[n], a)
+  }
+  if (stored[q] ?? -1) == a { return true }
+  argOfG.has(q) && fieldArg(argOfG[q] ?? 0, argOfJ[q] ?? 0, v, wide)
+}
+
+// Parameter `j` of function `g` is a field-only parameter of exactly record type `v`.
+function fieldArg(g: i32, j: i32, v: i32, wide: boolean): boolean {
+  if !wide || g < 0 || g >= funcType.length || !isFunc(funcType[g]) {
+    return false
+  }
+  const ps = M.types[funcType[g]].params
+  j < ps.length && refIdx(ps[j]) == v && mvFoHas(g, j)
+}
+
+// The multi-value step's facts on the scanned module, read when first asked.
+function ensureMv() {
+  if mvReady { return }
+  mvReady = true
+  mvFo = Map()
+  for key in mvFieldOnlyParams(B, true) { mvFo[key] = 1 }
+  mvProd = mvProducerRecords()
+}
+
+function mvFoHas(g: i32, j: i32): boolean {
+  ensureMv()
+  j < 64 && mvFo.has(g * 64 + j)
+}
+
+function mvProdOf(g: i32): i32 {
+  ensureMv()
+  if g >= 0 && g < mvProd.length { mvProd[g] } else { -1 }
 }
 
 // ---- The decision ----
@@ -2403,6 +2829,7 @@ export function optInlineRewrite(
   rwLog = []
   rwSum = []
   rwMoves = []
+  flatNum = []
   if valid == 0 { return 0 }
   bad = false
   decide(optInBytes(), stable != 0, rebox != 0, fault == 2)
@@ -2594,6 +3021,15 @@ function rewrite(spill: boolean, fault: boolean): u8[] {
     }
     bi = bi + 1
   }
+  const types = typeSection()
+  if rwErr.length > 0 { return none }
+  assemble(types, bodies, moves, hdr)
+}
+
+// The type section, every type re-encoded by `encodeSub`, its rec groups kept; sets `rwErr`
+// when it cannot.
+function typeSection(): u8[] {
+  const none: u8[] = []
   const types: u8[] = []
   wnPutLeb(types, M.groupSize.length)
   let t = 0
@@ -2618,7 +3054,35 @@ function rewrite(spill: boolean, fault: boolean): u8[] {
     }
     g = g + 1
   }
-  assemble(types, bodies, moves, hdr)
+  types
+}
+
+// Body `bi`'s ops into `opOff`, `opEnd`, `opCode`, `opA` and `opB`; false, with `rwErr` set,
+// when it does not decode.
+function decodeOps(bi: i32): boolean {
+  const body = M.bodies[bi]
+  opOff = []
+  opEnd = []
+  opCode = []
+  opA = []
+  opB = []
+  const c = wcNew(B, body.from, body.to)
+  while c.pos < c.end {
+    const off = c.pos
+    imA = 0
+    imB = 0
+    const op = wcOp(c)
+    if c.failed || !decodeImm(op, off, c.pos) {
+      rwErr = "a body does not decode"
+      return false
+    }
+    opOff.push(off)
+    opEnd.push(c.pos)
+    opCode.push(op)
+    opA.push(imA)
+    opB.push(imB)
+  }
+  true
 }
 
 // Each body's start in the module: where its locals header begins, past its size.
@@ -2697,28 +3161,7 @@ function rewriteBody(
     if rwErr.length > 0 { return none }
     s = s + 1
   }
-  const body = M.bodies[bi]
-  opOff = []
-  opEnd = []
-  opCode = []
-  opA = []
-  opB = []
-  const c = wcNew(B, body.from, body.to)
-  while c.pos < c.end {
-    const off = c.pos
-    imA = 0
-    imB = 0
-    const op = wcOp(c)
-    if c.failed || !decodeImm(op, off, c.pos) {
-      rwErr = "a body does not decode"
-      return none
-    }
-    opOff.push(off)
-    opEnd.push(c.pos)
-    opCode.push(op)
-    opA.push(imA)
-    opB.push(imB)
-  }
+  if !decodeOps(bi) { return none }
   const out: u8[] = []
   const moved: i32[] = []
   const n = opOff.length
@@ -3032,6 +3475,11 @@ function encodeSub(out: u8[], t: i32): boolean {
     }
     return true
   }
+  if st.form == 0x5e && t < flatNum.length && flatNum[t] >= 0 {
+    if !putValLong(out, flatNum[t]) { return false }
+    out.push(if st.mutable[0] { 1 } else { 0 })
+    return true
+  }
   const L = if st.form == 0x5f { layIx[t] } else { -1 }
   if L < 0 {
     if st.form == 0x5f { wnPutLeb(out, st.params.length) }
@@ -3175,11 +3623,696 @@ function assemble(
 
 function putSleb(out: u8[], v: i32) {
   let x = v
-  while x >= 0x40 {
-    out.push((x & 0x7f) | 0x80)
+  let more = true
+  while more {
+    const byte = x & 0x7f
     x = x >> 7
+    more = !(x == 0 && (byte & 0x40) == 0 || x == -1 && (byte & 0x40) != 0)
+    out.push(if more { byte | 0x80 } else { byte })
   }
-  out.push(x)
+}
+
+// ---- The list-flattening step ----
+
+// Scans the staged module for the list-flattening step. Returns 0 when it cannot read the
+// module (`optOut` says why), 1 when nothing holds a leaf record, 2 when no array does, 3 when
+// the step may run. `valid` 0 says the module does not validate; `walk` 0 stops before the
+// bodies, for a host that only asks whether the step applies, and leaves no step to run.
+export function optInlineFlatScan(stable: i32, valid: i32, walk: i32): i32 {
+  optOutSet([])
+  flatScan = true
+  flatWalked = false
+  gate = flatScanRun(stable != 0, valid != 0, walk != 0)
+  flatScan = false
+  if gate == 0 {
+    const w: u8[] = []
+    putText(w, scanWhy)
+    optOutSet(w)
+  }
+  gate
+}
+
+function flatScanRun(stable: boolean, valid: boolean, walk: boolean): i32 {
+  bad = false
+  scanWhy = "the module does not parse"
+  if !readModule(optInBytes()) || bad { return 0 }
+  findCandidates()
+  if potKeys.length == 0 && !anyRecord() { return 1 }
+  if !valid {
+    scanWhy = "the module does not validate"
+    return 0
+  }
+  if arrList.length == 0 { return 2 }
+  if !walk { return 3 }
+  curF = -1
+  for a in constArr { flatBad(a, "it is made in a constant expression") }
+  findCrossing(!stable)
+  resetFound()
+  fsK = []
+  fsOff = []
+  fsReach = []
+  fsTy = []
+  fsKind = []
+  fsOLo = []
+  fsOHi = []
+  fsUse = []
+  fsUA = []
+  fsUB = []
+  fsCast = []
+  foNull = []
+  foProd = []
+  foCast = []
+  fbLo = []
+  fbHi = []
+  fbCur = 0
+  mvReady = false
+  unfreed = []
+  for _ in M.types { unfreed.push(false) }
+  let bi = 0
+  while bi < M.bodies.length && !bad {
+    scanBody(bi)
+    bi = bi + 1
+  }
+  if bad {
+    scanWhy = "the module does not validate"
+    return 0
+  }
+  if (
+    M.bodies.length + nImports != funcType.length
+    || fbLo.length != M.bodies.length
+  ) {
+    scanWhy = "the function and code sections disagree"
+    return 0
+  }
+  closeErased(!stable)
+  flatWalked = true
+  3
+}
+
+// The step on the last scan: which candidate arrays are flattened and why each other one is
+// not, then the module rewritten so. Returns 1 with the module in `optOut`, else 0. `rebox`
+// and `spill` are as in `optInlineRewrite`; `fault` 4 ends each rewritten body's locals with
+// an empty entry.
+export function optInlineFlatStep(rebox: i32, spill: i32, fault: i32): i32 {
+  optOutSet([])
+  rwLog = []
+  rwSum = []
+  rwMoves = []
+  flatNum = []
+  if gate != 3 || !flatWalked { return 0 }
+  flRebox = rebox != 0
+  for _ in M.types { flatNum.push(-1) }
+  flatTallies()
+  let any = false
+  for a in arrList {
+    const v = arrRec[a]
+    const why = flatRefusal(a, v, rebox != 0)
+    if why.length > 0 {
+      putText(rwLog, "inline-explain: array type ")
+      putDec(rwLog, a)
+      putText(rwLog, " (of type ")
+      putDec(rwLog, v)
+      putText(rwLog, "): not flattened: ")
+      putBytes(rwLog, why)
+      rwLog.push(10)
+    } else {
+      flatNum[a] = M.types[v].params[0]
+      any = true
+    }
+  }
+  if !any {
+    putText(rwLog, "inline-explain: no array flattened\n")
+    return 0
+  }
+  rwErr = ""
+  const out = flatRewrite(spill != 0, fault == 4)
+  if rwErr.length > 0 {
+    putText(rwLog, "inline-explain: flattening abandoned: ")
+    putText(rwLog, rwErr)
+    rwLog.push(10)
+    rwMoves = []
+    return 0
+  }
+  for a in arrList {
+    if flatNum[a] >= 0 {
+      putText(rwSum, "inline-explain: array type ")
+      putDec(rwSum, a)
+      putText(rwSum, " (of type ")
+      putDec(rwSum, arrRec[a])
+      putText(rwSum, "): flattened; ")
+      putDec(rwSum, tStores[a])
+      putText(rwSum, " store(s) (")
+      putDec(rwSum, stAtProd[a] ?? 0)
+      putText(rwSum, " taken apart at the producer, ")
+      putDec(rwSum, stSpilled[a] ?? 0)
+      putText(rwSum, " spilled), ")
+      putDec(rwSum, stFieldReads[a] ?? 0)
+      putText(rwSum, " read(s) as fields, ")
+      putDec(rwSum, stReboxed[a] ?? 0)
+      putText(rwSum, " re-boxed (")
+      putDec(rwSum, tLocal[a])
+      putText(rwSum, " into a local whose box is taken apart, ")
+      putDec(rwSum, tArg[a])
+      putText(rwSum, " into a field parameter)\n")
+    }
+  }
+  optOutSet(out)
+  1
+}
+
+// The reads the last step counted free on the multi-value step's word: a count, then per held
+// read its array type, body and local, then a count and per field argument its array type,
+// callee and parameter (all ULEB128). Only flattened arrays' reads, and none under `rebox`.
+export function optInlineFlatRelied(): i32 {
+  const out: u8[] = []
+  const held: i32[] = []
+  const args: i32[] = []
+  if !flRebox {
+    let i = 0
+    while i < fhA.length {
+      if flatNum[fhA[i]] >= 0 { held.push(i) }
+      i = i + 1
+    }
+    i = 0
+    while i < faA.length {
+      if flatNum[faA[i]] >= 0 { args.push(i) }
+      i = i + 1
+    }
+  }
+  wnPutLeb(out, held.length)
+  for i in held {
+    wnPutLeb(out, fhA[i])
+    wnPutLeb(out, fhF[i] - nImports)
+    wnPutLeb(out, fhL[i])
+  }
+  wnPutLeb(out, args.length)
+  for i in args {
+    wnPutLeb(out, faA[i])
+    wnPutLeb(out, faG[i])
+    wnPutLeb(out, faJ[i])
+  }
+  optOutSet(out)
+  0
+}
+
+// Array type `a`'s reads into a local or a field parameter count whole from the next step on:
+// the multi-value step does not take them apart.
+export function optInlineFlatUnfree(a: i32): i32 {
+  if a >= 0 && a < unfreed.length { unfreed[a] = true }
+  0
+}
+
+// Per array type: its stores, its element reads by use, the first function a whole read is
+// in, and why it is refused outright (empty when it is not).
+let tStores: i32[] = []
+let tField: i32[] = []
+let tLocal: i32[] = []
+let tArg: i32[] = []
+let tWhole: i32[] = []
+let tWholeIn: i32[] = []
+let tRefused: u8[][] = []
+
+function flatTallies() {
+  tStores = []
+  tField = []
+  tLocal = []
+  tArg = []
+  tWhole = []
+  tWholeIn = []
+  tRefused = []
+  for _ in M.types {
+    tStores.push(0)
+    tField.push(0)
+    tLocal.push(0)
+    tArg.push(0)
+    tWhole.push(0)
+    tWholeIn.push(-1)
+    tRefused.push([])
+  }
+  fhA = []
+  fhF = []
+  fhL = []
+  faA = []
+  faG = []
+  faJ = []
+  const rA: i32[] = []
+  const rG: i32[] = []
+  const rJ: i32[] = []
+  const rF: i32[] = []
+  let bi = 0
+  while bi < fbLo.length {
+    const f = nImports + bi
+    let s = fbLo[bi]
+    while s < fbHi[bi] {
+      const a = fsTy[s]
+      const kind = fsKind[s]
+      if kind == AK_SET || kind == AK_FIXED {
+        let x = fsOLo[s]
+        while x < fsOHi[s] {
+          tStores[a] = tStores[a] + 1
+          if fsReach[s] && foNull[x] && tRefused[a].length == 0 {
+            const w: u8[] = []
+            putText(w, "a value whose type admits null is stored into it (")
+            putText(
+              w,
+              if kind == AK_SET { "array.set" } else { "array.new_fixed" },
+            )
+            putText(w, " at byte 0x")
+            putHex(w, fsOff[s])
+            putText(w, " in ")
+            putName(w, f)
+            putText(w, ")")
+            tRefused[a] = w
+          }
+          x = x + 1
+        }
+        const m = fsOHi[s] - fsOLo[s]
+        if (
+          kind == AK_FIXED
+          && m * recLen(arrRec[a]) > NEW_FIXED_MAX
+          && tRefused[a].length == 0
+        ) {
+          const w: u8[] = []
+          putText(w, "an array.new_fixed of ")
+          putDec(w, m)
+          putText(w, " elements would exceed 10000 operands (in ")
+          putName(w, f)
+          putText(w, ")")
+          tRefused[a] = w
+        }
+      } else if kind == AK_GET {
+        const u = fsUse[s]
+        if u == AU_FIELD {
+          tField[a] = tField[a] + 1
+        } else if u == AU_LOCAL && !(fsUB[s] == 1 && unfreed[a]) {
+          tLocal[a] = tLocal[a] + 1
+          if fsUB[s] == 1 {
+            fhA.push(a)
+            fhF.push(f)
+            fhL.push(fsUA[s])
+          }
+        } else if u == AU_ARG && !unfreed[a] {
+          rA.push(a)
+          rG.push(fsUA[s])
+          rJ.push(fsUB[s])
+          rF.push(f)
+        } else {
+          wholeRead(a, f)
+        }
+      }
+      s = s + 1
+    }
+    bi = bi + 1
+  }
+  let i = 0
+  while i < rA.length {
+    const a = rA[i]
+    if mvFoHas(rG[i], rJ[i]) {
+      tArg[a] = tArg[a] + 1
+      faA.push(a)
+      faG.push(rG[i])
+      faJ.push(rJ[i])
+    } else {
+      wholeRead(a, rF[i])
+    }
+    i = i + 1
+  }
+}
+
+function wholeRead(a: i32, f: i32) {
+  tWhole[a] = tWhole[a] + 1
+  if tWholeIn[a] < 0 { tWholeIn[a] = f }
+}
+
+// Why candidate array type `a` of record type `v` stays boxed, or empty.
+function flatRefusal(a: i32, v: i32, rebox: boolean): u8[] {
+  const out: u8[] = []
+  const n = recLen(v)
+  const rec = recordRefusal(v)
+  if rec.length > 0 {
+    putText(out, "its element type ")
+    putDec(out, v)
+    putText(out, " is refused: ")
+    putBytes(out, rec)
+    return out
+  }
+  if superOf[a] >= 0 || hasSub[a] {
+    putText(out, "it is in a subtyping relation")
+    return out
+  }
+  if groupOf(a) != groupOf(v) {
+    putText(out, "it is not in the rec group of its element type ")
+    putDec(out, v)
+    return out
+  }
+  const cross = crossing(a)
+  if cross.length > 0 {
+    putText(out, "it can cross the module boundary (")
+    putBytes(out, cross)
+    putText(out, ")")
+    return out
+  }
+  if arrBadF[a] != -2 {
+    putBytes(out, arrBadW[a])
+    if arrBadF[a] >= 0 {
+      putText(out, " (in ")
+      putName(out, arrBadF[a])
+      putText(out, ")")
+    }
+    return out
+  }
+  if tRefused[a].length > 0 { return tRefused[a] }
+  const reads = tField[a] + tLocal[a] + tArg[a] + tWhole[a]
+  if tWhole[a] > 0 && !rebox {
+    putDec(out, tWhole[a])
+    putText(out, " of its ")
+    putDec(out, reads)
+    putText(out, " element read(s) take the whole element (first in ")
+    putName(out, max(tWholeIn[a], 0))
+    putText(
+      out,
+      "), and each would allocate a copy where today it shares the box",
+    )
+    if unfreed[a] {
+      putText(
+        out,
+        " (the multi-value step would not take its held reads apart)",
+      )
+    }
+    return out
+  }
+  const boxed = tLocal[a] + tArg[a]
+  if tField[a] + n * boxed > FLAT_READS_PER_STORE * n * tStores[a] && !rebox {
+    putText(out, "its reads (")
+    putDec(out, tField[a])
+    putText(out, " of a field, ")
+    putDec(out, boxed)
+    putText(
+      out,
+      " of a whole element) are more than 6 whole elements' worth per store (",
+    )
+    putDec(out, tStores[a])
+    putText(
+      out,
+      " store(s)), and a flat read costs one bounds-checked array.get per field",
+    )
+  }
+  out
+}
+
+// The index of the rec group type `t` is in.
+function groupOf(t: i32): i32 {
+  let at = 0
+  let g = 0
+  while g < M.groupSize.length {
+    at = at + M.groupSize[g]
+    if t < at { return g }
+    g = g + 1
+  }
+  g
+}
+
+// The module with every flattened array's elements' fields side by side and every body naming
+// one rewritten, `rwMoves` filled; sets `rwErr` when it cannot.
+function flatRewrite(spill: boolean, fault: boolean): u8[] {
+  const none: u8[] = []
+  stAtProd = Map()
+  stSpilled = Map()
+  stFieldReads = Map()
+  stReboxed = Map()
+  layIx = []
+  layStart = []
+  layRec = []
+  for _ in M.types { layIx.push(-1) }
+  const hdr = bodyStarts()
+  if rwErr.length > 0 { return none }
+  const bodies: u8[][] = []
+  const moves: i32[][] = []
+  let bi = 0
+  while bi < M.bodies.length {
+    const sites: i32[] = []
+    let s = fbLo[bi]
+    while s < fbHi[bi] {
+      if flatNum[fsTy[s]] >= 0 { sites.push(s) }
+      s = s + 1
+    }
+    if sites.length == 0 {
+      const b: u8[] = []
+      copyBytes(b, B, hdr[bi], M.bodies[bi].to - hdr[bi])
+      bodies.push(b)
+      moves.push([hdr[bi], 0])
+    } else {
+      const mv: i32[] = []
+      const b = flatBody(bi, hdr[bi], sites, spill, fault, mv)
+      if rwErr.length > 0 { return none }
+      bodies.push(b)
+      moves.push(mv)
+    }
+    bi = bi + 1
+  }
+  const types = typeSection()
+  if rwErr.length > 0 { return none }
+  assemble(types, bodies, moves, hdr)
+}
+
+// Body `bi`, whose header starts at `h0`, with each of its flattened arrays' `sites` rewritten
+// to index the fields side by side; `mv` gets its moves.
+function flatBody(
+  bi: i32,
+  h0: i32,
+  sites: i32[],
+  spill: boolean,
+  fault: boolean,
+  mv: i32[],
+): u8[] {
+  const none: u8[] = []
+  rwExtra = []
+  rwNext = rbLocals[bi]
+  rwRep = Map()
+  rwAft = Map()
+  rwCodes = []
+  const ti = newLocal(0x7f)
+  // Each store's value is held in a local, set right after its producer when that is known
+  // (so a producer call is left `call; local.set` for the multi-value step), else at the store.
+  const hTv: {[i32]: i32} = Map()
+  const hAt: {[i32]: i32} = Map()
+  for s in sites {
+    if fsKind[s] == AK_SET {
+      const a = fsTy[s]
+      const tv = newLocal(refT(false, arrRec[a]))
+      const o = fsOLo[s]
+      const q = foProd[o]
+      if fsReach[s] && q != NONE && !spill && !rwAft.has(q) {
+        const c: u8[] = []
+        castIf(c, foCast[o])
+        localOp(c, 0x21, tv)
+        rwAft[q] = keep(c)
+        bump(stAtProd, a)
+        hAt[fsK[s]] = 0
+      } else {
+        bump(stSpilled, a)
+        hAt[fsK[s]] = if foCast[o] { 2 } else { 1 }
+      }
+      hTv[fsK[s]] = tv
+    }
+  }
+  const consume: {[i32]: i32} = Map()
+  for s in sites {
+    const k = fsK[s]
+    const a = fsTy[s]
+    const v = arrRec[a]
+    const n = recLen(v)
+    const kind = fsKind[s]
+    const code: u8[] = []
+    if kind == AK_GET {
+      let field = fsUse[s] == AU_FIELD && !rwAft.has(k)
+      let q = k + 1
+      while field && q <= fsUA[s] {
+        if rwAft.has(q) { field = false }
+        q = q + 1
+      }
+      if field {
+        scale(code, n, ti)
+        plus(code, fsUB[s])
+        gcOp(code, 11, a, -1)
+        consume[k] = fsUA[s] - k + 1
+        bump(stFieldReads, a)
+      } else {
+        const tb = newLocal(0x7f)
+        const tarr = newLocal(refT(true, a))
+        scale(code, n, ti)
+        localOp(code, 0x21, tb)
+        localOp(code, 0x21, tarr)
+        let j = 0
+        while j < n {
+          localOp(code, 0x20, tarr)
+          localOp(code, 0x20, tb)
+          plus(code, j)
+          gcOp(code, 11, a, -1)
+          j = j + 1
+        }
+        gcOp(code, 0, v, -1)
+        bump(stReboxed, a)
+        // The box is non-null already; a cast after it would hide the allocation from the
+        // multi-value step.
+        if fsCast[s] && !rwAft.has(k) && !rwAft.has(k + 1) { consume[k] = 2 }
+      }
+    } else if kind == AK_SET {
+      const tb = newLocal(0x7f)
+      const tarr = newLocal(refT(true, a))
+      if !hTv.has(k) {
+        rwErr = "a store was not planned"
+        return none
+      }
+      const tv = hTv[k] ?? 0
+      const at = hAt[k] ?? 0
+      if at > 0 {
+        castIf(code, at == 2)
+        localOp(code, 0x21, tv)
+      }
+      scale(code, n, ti)
+      localOp(code, 0x21, tb)
+      localOp(code, 0x21, tarr)
+      let j = 0
+      while j < n {
+        localOp(code, 0x20, tarr)
+        localOp(code, 0x20, tb)
+        plus(code, j)
+        localOp(code, 0x20, tv)
+        gcOp(code, 2, v, j)
+        gcOp(code, 14, a, -1)
+        j = j + 1
+      }
+    } else if kind == AK_NEWDEF {
+      scale(code, n, ti)
+      gcOp(code, 7, a, -1)
+    } else if kind == AK_FIXED {
+      const m = fsOHi[s] - fsOLo[s]
+      if m > 0 {
+        const tvs: i32[] = []
+        let i = 0
+        while i < m {
+          tvs.push(newLocal(refT(false, v)))
+          i = i + 1
+        }
+        i = m - 1
+        while i >= 0 {
+          castIf(code, foCast[fsOLo[s] + i])
+          localOp(code, 0x21, tvs[i])
+          i = i - 1
+        }
+        for tv in tvs {
+          let j = 0
+          while j < n {
+            localOp(code, 0x20, tv)
+            gcOp(code, 2, v, j)
+            j = j + 1
+          }
+        }
+        code.push(0xfb)
+        wnPutLeb(code, 8)
+        wnPutLeb(code, a)
+        wnPutLeb(code, m * n)
+        stSpilled[a] = (stSpilled[a] ?? 0) + m
+      }
+    } else if kind == AK_LEN {
+      code.push(0xfb)
+      wnPutLeb(code, 15)
+      if n > 1 {
+        i32Const(code, n)
+        code.push(0x6e)
+      }
+    } else if kind == AK_COPY {
+      const tl = newLocal(0x7f)
+      const ts = newLocal(0x7f)
+      const td = newLocal(0x7f)
+      const tsrc = newLocal(refT(true, a))
+      localOp(code, 0x21, tl)
+      localOp(code, 0x21, ts)
+      localOp(code, 0x21, tsrc)
+      localOp(code, 0x21, td)
+      localOp(code, 0x20, td)
+      scale(code, n, ti)
+      localOp(code, 0x20, tsrc)
+      localOp(code, 0x20, ts)
+      scale(code, n, ti)
+      localOp(code, 0x20, tl)
+      scale(code, n, ti)
+      code.push(0xfb)
+      wnPutLeb(code, 17)
+      wnPutLeb(code, a)
+      wnPutLeb(code, a)
+    } else {
+      rwErr = "a site of an unknown kind"
+      return none
+    }
+    if kind != AK_FIXED || fsOHi[s] > fsOLo[s] {
+      if rwRep.has(k) {
+        rwErr = "two rewrites claim one op"
+        return none
+      }
+      rwRep[k] = keep(code)
+    }
+  }
+  if !decodeOps(bi) { return none }
+  const out: u8[] = []
+  const moved: i32[] = []
+  const nOps = opOff.length
+  let i = 0
+  while i < nOps {
+    moved.push(opOff[i])
+    moved.push(out.length)
+    const rep = rwRep[i] ?? -1
+    if rep >= 0 {
+      putBytes(out, rwCodes[rep])
+    } else {
+      copyBytes(out, B, opOff[i], opEnd[i] - opOff[i])
+    }
+    const consumed = consume[i] ?? 1
+    const aft = rwAft[i] ?? -1
+    if aft >= 0 { putBytes(out, rwCodes[aft]) }
+    let q = 1
+    while q < consumed && i + q < nOps {
+      moved.push(opOff[i + q])
+      moved.push(out.length)
+      q = q + 1
+    }
+    i = i + consumed
+  }
+  finishBody(bi, h0, out, moved, fault, mv)
+}
+
+// `x` on the stack becomes `x * n`, or `-n` when that would wrap: every index it gives, plus
+// a field offset below `n`, is then out of bounds exactly when `x` is.
+function scale(code: u8[], n: i32, ti: i32) {
+  if n == 1 { return }
+  localOp(code, 0x22, ti)
+  i32Const(code, n)
+  code.push(0x6c)
+  i32Const(code, 0 - n)
+  localOp(code, 0x20, ti)
+  i32Const(code, wrapLimit(n))
+  code.push(0x49)
+  code.push(0x1b)
+}
+
+// The least unsigned `x` whose `x * n` wraps, as an i32: `(2^32 - n) / n + 1`, for `n >= 2`.
+function wrapLimit(n: i32): i32 {
+  const q = 0x7fffffff / n
+  const r = 0x7fffffff % n
+  2 * q + (2 * r + 2) / n
+}
+
+function plus(code: u8[], j: i32) {
+  if j > 0 {
+    i32Const(code, j)
+    code.push(0x6a)
+  }
+}
+
+function i32Const(code: u8[], v: i32) {
+  code.push(0x41)
+  putSleb(code, v)
 }
 
 // ---- Text ----

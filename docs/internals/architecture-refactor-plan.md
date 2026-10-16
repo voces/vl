@@ -31,7 +31,7 @@ restate measurements; follow the links.
 | L7 `pending*` into `ExpCtx` | **in progress as C3**; the per-function conversion is **done**. Last: `expCtxReset` clears the 17 pending seeds at compile start, never-cleared 172 of 1,156 (`scripts/emitter-state-audit.vl --check`). Next: the never-cleared ratchet keeps falling. | [L7 log](#l7-log) |
 | L8 tyquery.vl, split classify | **in progress**. Last: `check_ty_shape.vl` merged into `compiler/tyquery.vl`, which both phases import; fourteen duplicate copies of eight queries deleted. Next: D2, the `emit_classify.vl` split. | [L8 log](#l8-log) |
 | L6 registries by key | step 5 **in progress**. Last: eighth switch, every seam and `isUName` answer by the key; binding sites ask `unNameBound`. Next: the litunion-alias key (its key is one atom, its row's is the set), then step 6. | [L6 log](#l6-log) |
-| L10 the `-O` optimizer | **in progress as T4**. Last: R6d, the compiler's inline-record step is the default and the host's fields step is deleted; 0 of 15,406 programs differ. Next: R7, list flattening. | [L10 log](#l10-log) |
+| L10 the `-O` optimizer | **in progress as T4**. Last: R7, the compiler's list-flattening step is the default and `flat.rs`, `inline.rs` and `multivalue.rs` are deleted; 0 of 15,505 programs differ. Next: the host's `-O` chain in `main.rs` as one compiler call. | [L10 log](#l10-log) |
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the Deno stubs are `FS_FLOOR`'s names, read at load by `tests/support/hostFloor.ts`. Next: none in the floor; every copy reads the table. | [L13 log](#l13-log) |
@@ -346,6 +346,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - Next: R6c (the rewrite, the default flip and the Rust deletion), then R7, list flattening.
 - R6c, the rewrite (`optInlineRewrite`, with `optInlineMoves` / `optInlineExplain` / `optInlineSummary`), runs beside the Rust and retires `optInlineDecide`; 0 of 15,399 programs differ, and the fault control differs on 155 of the 190 rewritten (the other 35 rewrite types only). Next: R6d, the default flip and the Rust deletion.
 - R6d, the compiler's inline-record step is the default, and the host's fields step, its decision and `$VL_OPT_INLINE` are deleted; 0 of 15,406 programs differ from the host built before the deletion. Next: R7, list flattening.
+- R7, the list-flattening step (`optInlineFlatScan`, `optInlineFlatStep`) is the compiler's, and `flat.rs`, `inline.rs` and `multivalue.rs` leave the host: `VL_OPT_FLAT=rust` against `vl` and the host built before the deletion against the one after each differ on 0 of 15,505 programs, and on 0 of the 1,646 that reach the step plus the 25 fixtures under six flag variants and two rebox settings; the fault control (`VL_INLINE_FAULT=4`) differs on 481 of those 1,671. Next: the host's `-O` chain in `main.rs` as one compiler call.
 
 ### L13 log
 

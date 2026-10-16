@@ -1,6 +1,6 @@
 # Inline storage for records nobody writes (sunpa SP-038, SP-039)
 
-**Status: S1 (inline record fields) is built as a host step, `scripts/vl-host/src/inline.rs` (D3678), and S2 (flattened lists) as its second slice, `scripts/vl-host/src/flat.rs` (D3681, §7). §6 Q2 is ruled; Q1 and Q3 are open.** The question is whether a record
+**Status: S1 (inline record fields) is built as an `-O` step (D3678), and S2 (flattened lists) as its second slice (D3681, §7), both in `compiler/opt_inline_scan.vl` (optimizer-in-vl.md R6, R7). §6 Q2 is ruled; Q1 and Q3 are open.** The question is whether a record
 type whose fields are never written can be stored by value: inline in its containing records,
 and flattened in lists. The language would not change; only the compiler's storage choice
 would. The fixed-array design (PR #3375, `fixed-arrays-design.md` §4.3 and §6) makes the same
@@ -337,7 +337,7 @@ The `-O`-only question is not new. It is fixed-arrays Q5, and the same answer ap
 
 ## 7. S2 as built: flattened lists (D3681)
 
-`scripts/vl-host/src/flat.rs`, run by the inline-record step on S1's output, so a re-boxed
+`optInlineFlatStep` in `compiler/opt_inline_scan.vl`, run by the inline-record step on S1's output, so a re-boxed
 field read S1 leaves is seen. `$VL_OPT_NO_FLAT=1` keeps S1 and skips S2.
 
 **What qualifies.** An array type `A` whose element is a reference to a record `V`:
