@@ -6196,7 +6196,7 @@ fn parse_low_memory(raw: &str) -> std::result::Result<i64, String> {
 fn opt_stage(store: &mut Store<()>, inst: &Instance, bytes: &[u8]) -> Result<()> {
     let predates = |e: Error| {
         e.context(
-            "`-O` builds its `wasm-opt` argv through the compiler's `optRungArgv` and \
+            "`-O` stages the module through the compiler's `optInReset` and \
              `optStripSrc`, which this seed predates",
         )
     };
@@ -6215,34 +6215,6 @@ fn opt_stage(store: &mut Store<()>, inst: &Instance, bytes: &[u8]) -> Result<()>
         load.call(&mut *store, chunk.len() as i32)?;
     }
     Ok(())
-}
-
-/// The rung's `wasm-opt` passes over `bytes`, the module it optimizes, from the compiler's
-/// `optRungArgv`: the `--no-inline` marks, the low-memory pass, `-g` under `--names`, the
-/// rung's own passes and the scan's extra pass, one per line of `optOut`. The binaryen
-/// features, the source map and the paths are the caller's.
-fn rung_argv(
-    bytes: &[u8],
-    engine: &Engine,
-    compiler: &CompilerSource,
-    flag: &str,
-    names: bool,
-    low_memory: Option<i64>,
-) -> Result<Vec<String>> {
-    let (mut store, inst) = load_compiler(engine, compiler)?;
-    opt_stage(&mut store, &inst, bytes)?;
-    opt_roundtrip_check(&mut store, &inst, bytes, "the rung's input")?;
-    let argv = inst.get_typed_func::<(i32, i32, i32), i32>(&mut store, "optRungArgv")?;
-    let rung = if flag == "-O3" { 3 } else { 1 };
-    let low = low_memory.map_or(0, |n| n as i32);
-    if argv.call(&mut store, (rung, names as i32, low))? != 1 {
-        bail!("the compiler's optRungArgv refused the rung {flag}");
-    }
-    let text = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-    Ok(String::from_utf8_lossy(&text)
-        .split_terminator('\n')
-        .map(String::from)
-        .collect())
 }
 
 /// `bytes` without its `vl-src` section (`None` when it has none), by the compiler's
@@ -6264,58 +6236,6 @@ fn strip_src(
     let out = BytesOut::probe(store, inst, "optOut")?.read(store)?;
     Ok(removed.then_some(out))
 }
-
-/// `$VL_OPT_ROUNDTRIP=1`: the compiler's module writer (`optRoundTrip`, rung R4 of
-/// docs/internals/optimizer-in-vl.md) must decode the staged `bytes` and write them back
-/// unchanged, or the build fails naming `what`; `fault` flips a bit of its answer first, the
-/// check's control. Unset or empty, nothing runs.
-fn opt_roundtrip_check(
-    store: &mut Store<()>,
-    inst: &Instance,
-    bytes: &[u8],
-    what: &str,
-) -> Result<()> {
-    let mode = std::env::var("VL_OPT_ROUNDTRIP").unwrap_or_default();
-    let fault = match mode.as_str() {
-        "" => return Ok(()),
-        "1" => false,
-        "fault" => true,
-        other => bail!("$VL_OPT_ROUNDTRIP={other} — expected `1` or `fault`"),
-    };
-    let write = inst
-        .get_typed_func::<(), i32>(&mut *store, "optRoundTrip")
-        .map_err(|e| e.context("$VL_OPT_ROUNDTRIP: this seed predates `optRoundTrip`"))?;
-    if write.call(&mut *store, ())? != 1 {
-        bail!("$VL_OPT_ROUNDTRIP: the compiler's module writer does not decode {what}");
-    }
-    let mut out = BytesOut::probe(store, inst, "optOut")?.read(store)?;
-    if fault {
-        if let Some(b) = out.last_mut() {
-            *b ^= 1;
-        }
-    }
-    if out != bytes {
-        let at = out.iter().zip(bytes).take_while(|(a, b)| a == b).count();
-        bail!(
-            "$VL_OPT_ROUNDTRIP: the compiler's module writer changes {what}: {} bytes in, {} \
-             out, the first difference at offset {at}",
-            bytes.len(),
-            out.len()
-        );
-    }
-    Ok(())
-}
-
-/// The step both rungs run first when `optEscapeChoose` chooses any callee: inline
-/// exactly the functions not named `L4n.*`, whatever binaryen's size heuristics would say.
-/// `-g` keeps the name section, which carries each function's original index back out.
-const ESCAPE_INLINE_PASSES: &[&str] = &[
-    "-g",
-    "--no-inline=L4n.*",
-    "--always-inline-max-function-size",
-    "100000",
-    "--inlining",
-];
 
 fn put_leb_u32(out: &mut Vec<u8>, mut v: u32) {
     loop {
@@ -6360,98 +6280,6 @@ fn put_name(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
 }
 
-/// The compiler's restore (`optEscapeRestore`) of `stepped`, on the instance whose
-/// `optEscapeChoose` renamed the step's input.
-fn escape_restore_vl(
-    store: &mut Store<()>,
-    inst: &Instance,
-    stepped: &[u8],
-    flag: &str,
-) -> Result<Vec<u8>> {
-    opt_stage(store, inst, stepped)?;
-    let restore = inst.get_typed_func::<(), i32>(&mut *store, "optEscapeRestore")?;
-    match restore.call(&mut *store, ())? {
-        1 => BytesOut::probe(store, inst, "optOut")?.read(store),
-        0 => bail!("{flag}: the escape step's module lost the function names it was given"),
-        -1 => bail!("{flag}: the escape step wrote a module it cannot read"),
-        rc => bail!("{flag}: the compiler's optEscapeRestore answered {rc}"),
-    }
-}
-
-/// The escape step on the module at `path` (holding `bytes`): the compiler's `optEscapeChoose`
-/// names the chosen callees apart from everything else, one `wasm-opt` run inlines them, and
-/// `optEscapeRestore` gives every function back the name it had, or none. Answers the
-/// rewritten bytes (also left at `path`), or `None` when no callee is chosen and the module is
-/// untouched. A `--source-map` build's map at `map` is carried through the run; the renames
-/// touch only the name section, after the code.
-fn escape_inline_step(
-    path: &str,
-    flag: &str,
-    bytes: &[u8],
-    map: Option<&str>,
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<Option<Vec<u8>>> {
-    let (mut store, inst) = load_compiler(engine, compiler)?;
-    opt_stage(&mut store, &inst, bytes)?;
-    let choose = inst
-        .get_typed_func::<(), i32>(&mut store, "optEscapeChoose")
-        .map_err(|e| {
-            e.context(
-                "`-O` chooses its escape step's callees through the compiler's \
-                 `optEscapeChoose`, which this seed predates",
-            )
-        })?;
-    if choose.call(&mut store, ())? != 1 {
-        return Ok(None);
-    }
-    let named = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-    std::fs::write(path, &named)?;
-    optimize_in_place(path, flag, ESCAPE_INLINE_PASSES, map)?;
-    let stepped = std::fs::read(path)
-        .map_err(|e| Error::from(e).context(format!("reading back the {flag}'d `{path}`")))?;
-    let restored = escape_restore_vl(&mut store, &inst, &stepped, flag)?;
-    if map.is_some() && code_section_start(&stepped) != code_section_start(&restored) {
-        bail!("{flag}: restoring the escape step's names moved the code its source map describes");
-    }
-    std::fs::write(path, &restored)?;
-    // `$VL_OPT_ESCAPE_DUMP=<file>`: a copy of the step's output, for tests and diagnosis — the
-    // rung overwrites `path` next. Undocumented in `vl help build`: a measurement facility.
-    if let Some(dump) = std::env::var_os("VL_OPT_ESCAPE_DUMP").filter(|v| !v.is_empty()) {
-        std::fs::write(dump, &restored)?;
-    }
-    Ok(Some(restored))
-}
-
-/// The compiler's census of the inline-record step (`optInline`, rung R6a) on `bytes`: its
-/// `$VL_INLINE_EXPLAIN` line when it leaves the module alone, or `None` when the record-field
-/// rewrite must run. `$VL_INLINE_FAULT=1` makes it leave every module alone, so a test can
-/// show it sees this answer.
-fn inline_vl(
-    bytes: &[u8],
-    explaining: bool,
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<Option<String>> {
-    let (mut store, inst) = load_compiler(engine, compiler)?;
-    opt_stage(&mut store, &inst, bytes)?;
-    let census = inst
-        .get_typed_func::<(i32, i32), i32>(&mut store, "optInline")
-        .map_err(|e| {
-            e.context(
-                "`-O` runs the inline-record step's census through the compiler's \
-                 `optInline`, which this seed predates",
-            )
-        })?;
-    let fault = inline_fault() == 1;
-    if census.call(&mut store, (explaining as i32, fault as i32))? == 1 {
-        return Ok(None);
-    }
-    let log = String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
-        .map_err(|_| Error::msg("the compiler's optInline wrote bytes that are not UTF-8"))?;
-    Ok(Some(log))
-}
-
 /// `$VL_INLINE_FAULT`: 1 faults the census (`optInline`), 2 the decision, 3 the rewrite
 /// (`optInlineRewrite`) and 4 the list-flattening step (`optInlineFlatStep`).
 fn inline_fault() -> u32 {
@@ -6460,96 +6288,6 @@ fn inline_fault() -> u32 {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)
 }
-
-/// The compiler's record-field step of the inline-record step (`optInlineRewrite`, rung R6c) on
-/// `bytes`: the module it wrote and its body moves, or `None` when it changes nothing, beside
-/// its `$VL_INLINE_EXPLAIN` lines. A module that does not validate is left alone, and so is a
-/// rewrite that does not. `$VL_INLINE_FAULT=2` refuses every field, and 3 ends each rewritten
-/// body's locals with an empty entry, a module that validates with other bytes.
-fn inline_rewrite_vl(
-    bytes: &[u8],
-    stable_layout: bool,
-    rebox: bool,
-    spill: bool,
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<VlFields> {
-    let validate = |b: &[u8]| {
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
-            .validate_all(b)
-            .map(|_| ())
-    };
-    let fault = inline_fault() as i32;
-    let run = |valid: bool| -> Result<_> {
-        let (mut store, inst) = load_compiler(engine, compiler)?;
-        opt_stage(&mut store, &inst, bytes)?;
-        let step = inst
-            .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, "optInlineRewrite")
-            .map_err(|e| {
-                e.context(
-                    "`-O` runs the inline-record step's rewrite through the compiler's \
-                     `optInlineRewrite`, which this seed predates",
-                )
-            })?;
-        let args = (
-            stable_layout as i32,
-            rebox as i32,
-            spill as i32,
-            valid as i32,
-            fault,
-        );
-        let changed = step.call(&mut store, args)? == 1;
-        Ok((store, inst, changed))
-    };
-    // The step runs while another thread validates its input; on one that does not validate,
-    // its answer (or trap) is discarded and the module left alone.
-    let (valid, stepped) = std::thread::scope(|s| {
-        let check = s.spawn(|| validate(bytes).is_ok());
-        let stepped = run(true);
-        (check.join().unwrap_or(false), stepped)
-    });
-    if !valid {
-        return Ok(VlFields {
-            out: None,
-            log: String::new(),
-        });
-    }
-    let (mut store, inst, changed) = stepped?;
-    let out = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-    let moves = inst.get_typed_func::<(), i32>(&mut store, "optInlineMoves")?;
-    moves.call(&mut store, ())?;
-    let stream = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-    let utf8 = |b: Vec<u8>| {
-        String::from_utf8(b).map_err(|_| {
-            Error::msg("the compiler's inline-record step wrote explain bytes that are not UTF-8")
-        })
-    };
-    let explain = inst.get_typed_func::<(), i32>(&mut store, "optInlineExplain")?;
-    explain.call(&mut store, ())?;
-    let mut log = utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)?;
-    let summary = inst.get_typed_func::<(), i32>(&mut store, "optInlineSummary")?;
-    summary.call(&mut store, ())?;
-    let summary = utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)?;
-    if !changed {
-        return Ok(VlFields { out: None, log });
-    }
-    if let Err(e) = validate(&out) {
-        log.push_str(&format!(
-            "inline-explain: step abandoned: its output does not validate: {e}\n"
-        ));
-        return Ok(VlFields { out: None, log });
-    }
-    let moved = inline_moves(&stream)?;
-    log.push_str(&summary);
-    Ok(VlFields {
-        out: Some((out, moved)),
-        log,
-    })
-}
-
-/// The most fields a leaf record has: the compiler's `MV_RECORD_MAX_FIELDS`
-/// (`compiler/opt_multivalue.vl`), which the step-skipped line names.
-const MV_RECORD_MAX_FIELDS: usize = 8;
 
 /// One body of a step's output and where its ops came from: the input body `from..to` (a
 /// twin's is its function's), and per op `(old offset, new offset)` in the two modules,
@@ -6570,32 +6308,9 @@ impl BodyMove {
     }
 }
 
-/// What the multi-value step holds field by field in a module: per defined function the locals
-/// it scalarizes, and the `(function, parameter)` pairs a call passes as fields.
-type Scalarized = (Vec<std::collections::HashSet<u32>>, std::collections::HashSet<(u32, u32)>);
-
-/// The compiler's record-field step (`optInlineRewrite`) on a module: what it wrote and where
-/// each body came from, or `None` when it changed nothing, beside its `$VL_INLINE_EXPLAIN`
-/// lines.
-struct VlFields {
-    out: Option<(Vec<u8>, Vec<BodyMove>)>,
-    log: String,
-}
-
-/// The inline-record step's output: the module, where each body came from, and which of its
-/// two steps changed it.
-struct Stepped {
-    bytes: Vec<u8>,
-    moved: Vec<BodyMove>,
-    /// The record-field step inlined a record field.
-    fields: bool,
-    /// The list-flattening step flattened a list.
-    flat: bool,
-}
-
-/// The body moves `optInlineMoves` wrote: per output body its input range and op pairs.
-fn inline_moves(stream: &[u8]) -> Result<Vec<BodyMove>> {
-    let bad = || Error::msg("the compiler's optInlineMoves wrote a stream it cannot read");
+/// The body moves of a step that moved code: per output body its input range and op pairs.
+fn body_moves(stream: &[u8]) -> Result<Vec<BodyMove>> {
+    let bad = || Error::msg("the compiler's -O pipeline wrote a moves stream it cannot read");
     let mut p = 0usize;
     let mut moved = Vec::new();
     let n = leb_u32(stream, &mut p).ok_or_else(bad)?;
@@ -6617,345 +6332,146 @@ fn inline_moves(stream: &[u8]) -> Result<Vec<BodyMove>> {
     Ok(moved)
 }
 
-/// The compiler's list-flattening step (`optInlineFlatScan` and `optInlineFlatStep`, rung R7)
-/// after the record-field step's `fields`, on their output: the module and which steps changed
-/// it, or `None` when neither did. Prints both steps' `$VL_INLINE_EXPLAIN` lines. A rewrite
-/// that does not validate is dropped; one whose free reads the multi-value step would leave
-/// boxed is planned again with those arrays' reads counted whole.
-fn flat_vl(
-    bytes: &[u8],
-    stable_layout: bool,
-    fields: VlFields,
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<Option<Stepped>> {
-    let flag = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
-    let explaining = flag("VL_INLINE_EXPLAIN");
-    let silent = fields.log.is_empty() && fields.out.is_none();
-    if explaining {
-        eprint!("{}", fields.log);
-    }
-    let fields = fields.out;
-    let fields_only = |fields: Option<(Vec<u8>, Vec<BodyMove>)>| {
-        fields.map(|(bytes, moved)| Stepped {
-            bytes,
-            moved,
-            fields: true,
-            flat: false,
-        })
+/// `optPipeStart`'s option bits (`O_*` in `compiler/opt_pipe.vl`), from the build's flags and
+/// the variables the `-O` chain reads.
+fn opt_pipe_options(names: bool, stable_layout: bool, map: bool) -> Result<i32> {
+    let set = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty());
+    let on = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0");
+    let roundtrip = match std::env::var("VL_OPT_ROUNDTRIP")
+        .unwrap_or_default()
+        .as_str()
+    {
+        "" => 0,
+        "1" => 256,
+        "fault" => 256 | 512,
+        other => bail!("$VL_OPT_ROUNDTRIP={other} — expected `1` or `fault`"),
     };
-    let validate = |b: &[u8]| {
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
-            .validate_all(b)
-            .map(|_| ())
-    };
-    let (mut store, inst) = load_compiler(engine, compiler)?;
-    let scan = inst
-        .get_typed_func::<(i32, i32, i32), i32>(&mut store, "optInlineFlatScan")
-        .map_err(|e| {
-            e.context(
-                "`-O` runs the list-flattening step through the compiler's \
-                 `optInlineFlatScan`, which this seed predates",
-            )
-        })?;
-    let utf8 = |b: Vec<u8>| {
-        String::from_utf8(b).map_err(|_| {
-            Error::msg("the compiler's list-flattening step wrote explain bytes that are not UTF-8")
-        })
-    };
-    // The step's input says whether it applies; a record-field rewrite walked it already.
-    opt_stage(&mut store, &inst, bytes)?;
-    let valid = fields.is_some() || validate(bytes).is_ok();
-    let stable = stable_layout as i32;
-    let gate = scan.call(&mut store, (stable, valid as i32, fields.is_none() as i32))?;
-    if gate <= 1 {
-        if explaining && silent {
-            if gate == 0 {
-                let why = utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)?;
-                eprintln!("inline-explain: step skipped: {why}");
-            } else {
-                eprintln!(
-                    "inline-explain: step skipped: no struct field or array element holds a \
-                     leaf record (1 to {} numeric fields)",
-                    MV_RECORD_MAX_FIELDS
-                );
-            }
-        }
-        return Ok(fields_only(fields));
-    }
-    // `$VL_OPT_NO_FLAT=1`: inline record fields but flatten no list (S2's control).
-    if gate == 2 || flag("VL_OPT_NO_FLAT") {
-        return Ok(fields_only(fields));
-    }
-    // The step reads the field step's output, so a re-boxed field read it stores is seen.
-    if let Some((out, _)) = &fields {
-        opt_stage(&mut store, &inst, out)?;
-        if scan.call(&mut store, (stable, 1, 1))? != 3 {
-            return Ok(fields_only(fields));
-        }
-    }
-    let step = inst.get_typed_func::<(i32, i32, i32), i32>(&mut store, "optInlineFlatStep")?;
-    let relied = inst.get_typed_func::<(), i32>(&mut store, "optInlineFlatRelied")?;
-    let unfree = inst.get_typed_func::<i32, i32>(&mut store, "optInlineFlatUnfree")?;
-    let read = |store: &mut Store<()>, export: &str| -> Result<Vec<u8>> {
-        inst.get_typed_func::<(), i32>(&mut *store, export)?
-            .call(&mut *store, ())?;
-        BytesOut::probe(store, &inst, "optOut")?.read(store)
-    };
-    let args = (
-        flag("VL_INLINE_REBOX") as i32,
-        flag("VL_INLINE_SPILL") as i32,
-        if inline_fault() == 4 { 4 } else { 0 },
-    );
-    loop {
-        let changed = step.call(&mut store, args)? == 1;
-        let out = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-        let log = utf8(read(&mut store, "optInlineExplain")?)?;
-        if !changed {
-            if explaining {
-                eprint!("{log}");
-            }
-            return Ok(fields_only(fields));
-        }
-        if let Err(e) = validate(&out) {
-            if explaining {
-                eprint!("{log}");
-                eprintln!("inline-explain: flattening abandoned: its output does not validate: {e}");
-            }
-            return Ok(fields_only(fields));
-        }
-        // Does the multi-value step take apart every read counted free?
-        relied.call(&mut store, ())?;
-        let s = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-        let bad = || Error::msg("the compiler's optInlineFlatRelied wrote a stream it cannot read");
-        let mut p = 0usize;
-        let triples = |n: u32, p: &mut usize| -> Result<Vec<(u32, u32, u32)>> {
-            (0..n)
-                .map(|_| {
-                    Ok((
-                        leb_u32(&s, p).ok_or_else(bad)?,
-                        leb_u32(&s, p).ok_or_else(bad)?,
-                        leb_u32(&s, p).ok_or_else(bad)?,
-                    ))
-                })
-                .collect()
-        };
-        let n = leb_u32(&s, &mut p).ok_or_else(bad)?;
-        let held = triples(n, &mut p)?;
-        let n = leb_u32(&s, &mut p).ok_or_else(bad)?;
-        let params = triples(n, &mut p)?;
-        if p != s.len() {
-            return Err(bad());
-        }
-        if !held.is_empty() || !params.is_empty() {
-            let took = multivalue_scalarized(&out, engine, compiler)?;
-            let mut left = std::collections::BTreeSet::new();
-            for &(a, bi, l) in &held {
-                let ok = took.as_ref().is_some_and(|(locals, _)| {
-                    locals.get(bi as usize).is_some_and(|ls| ls.contains(&l))
-                });
-                if !ok {
-                    left.insert(a);
-                }
-            }
-            for &(a, g, j) in &params {
-                if !took.as_ref().is_some_and(|(_, ps)| ps.contains(&(g, j))) {
-                    left.insert(a);
-                }
-            }
-            if !left.is_empty() {
-                for a in left {
-                    unfree.call(&mut store, a as i32)?;
-                }
-                continue;
-            }
-        }
-        let summary = utf8(read(&mut store, "optInlineSummary")?)?;
-        if explaining {
-            eprint!("{log}{summary}");
-        }
-        let second = inline_moves(&read(&mut store, "optInlineMoves")?)?;
-        return Ok(Some(match fields {
-            None => Stepped {
-                bytes: out,
-                moved: second,
-                fields: false,
-                flat: true,
-            },
-            Some((_, first)) => Stepped {
-                bytes: out,
-                moved: first
-                    .into_iter()
-                    .zip(second)
-                    .map(|(a, b)| BodyMove {
-                        from: a.from,
-                        to: a.to,
-                        pairs: a.pairs.iter().map(|&(o, m)| (o, b.place(m))).collect(),
-                    })
-                    .collect(),
-                fields: true,
-                flat: true,
-            },
-        }));
-    }
+    let bits = [
+        (set("VL_OPT_NO_INLINE"), 1),
+        (on("VL_INLINE_EXPLAIN"), 2),
+        (on("VL_INLINE_REBOX"), 4),
+        (on("VL_INLINE_SPILL"), 8),
+        (on("VL_OPT_NO_FLAT"), 16),
+        (set("VL_OPT_NO_MULTIVALUE"), 32),
+        (on("VL_MV_EXPLAIN"), 64),
+        (on("VL_MV_FAULT"), 128),
+        (map, 1024),
+        (names, 2048),
+        (stable_layout, 4096),
+        (set("VL_OPT_INLINE_DUMP"), 8192),
+        (set("VL_OPT_FLAT_DUMP"), 16384),
+        (set("VL_OPT_MV_DUMP"), 32768),
+        (set("VL_OPT_ESCAPE_DUMP"), 65536),
+    ];
+    Ok(bits
+        .iter()
+        .filter(|(b, _)| *b)
+        .fold(roundtrip, |acc, (_, bit)| acc | bit))
 }
 
-/// The step's answer: the rewritten module and its body moves, or `None` when it changes
-/// nothing.
-type MultivalueOut = Option<(Vec<u8>, Vec<BodyMove>)>;
-
-/// The compiler's multi-value step (`optMultivalue`, rung R5) on `bytes`, beside its
-/// `$VL_MV_EXPLAIN` lines and, when `scalar`, what it holds field by field
-/// (`optMultivalueScalarized`). The host validates both its input and its output, and a
-/// rewrite that does not validate is dropped.
-fn multivalue_vl(
+/// The compiler's whole `-O` chain (`optPipeStart`, `compiler/opt_pipe.vl`) on `bytes`, on one
+/// instance: the host answers its requests — validating a module, printing, a source map's
+/// moves, a dump, the escape step's `wasm-opt` run — and writes the module it ends with to
+/// `sink`. Answers the rung's `wasm-opt` argv over it.
+#[allow(clippy::too_many_arguments)]
+fn opt_pipeline(
     bytes: &[u8],
-    explaining: bool,
-    scalar: bool,
+    sink: &str,
+    flag: &str,
+    options: i32,
+    low_memory: Option<i64>,
+    map: Option<&str>,
+    moved: &mut dyn FnMut(&[BodyMove]) -> Result<()>,
     engine: &Engine,
     compiler: &CompilerSource,
-) -> Result<(MultivalueOut, String, Option<Scalarized>)> {
+) -> Result<Vec<String>> {
     let validate = |b: &[u8]| {
         wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
             .validate_all(b)
             .map(|_| ())
     };
-    // The step runs while another thread validates its input; an input that does not validate
-    // is stepped again from a fresh instance with `valid` 0, which leaves it alone, and the
-    // first run's answer (or trap) is discarded.
-    let run = |valid: bool| -> Result<_> {
+    // The input validates on another thread while the steps before its answer run.
+    std::thread::scope(|s| {
+        let mut check = Some(s.spawn(|| validate(bytes).is_ok()));
+        let mut input_valid = None;
         let (mut store, inst) = load_compiler(engine, compiler)?;
         opt_stage(&mut store, &inst, bytes)?;
-        let step = inst
-            .get_typed_func::<(i32, i32), i32>(&mut store, "optMultivalue")
+        let start = inst
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "optPipeStart")
             .map_err(|e| {
                 e.context(
-                    "`-O` runs the multi-value step through the compiler's `optMultivalue`, \
-                     which this seed predates",
+                    "`-O` runs through the compiler's `optPipeStart`, which this seed predates",
                 )
             })?;
-        let changed = step.call(&mut store, (explaining as i32, valid as i32))? == 1;
-        Ok((store, inst, changed))
-    };
-    let (valid, stepped) = std::thread::scope(|s| {
-        let check = s.spawn(|| validate(bytes).is_ok());
-        let stepped = run(true);
-        (check.join().unwrap_or(false), stepped)
-    });
-    let (mut store, inst, changed) = if valid { stepped? } else { run(false)? };
-    let mut out = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-    let moves = inst.get_typed_func::<(), i32>(&mut store, "optMultivalueMoves")?;
-    moves.call(&mut store, ())?;
-    let stream = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
-    let explain = inst.get_typed_func::<(), i32>(&mut store, "optMultivalueExplain")?;
-    explain.call(&mut store, ())?;
-    let mut log =
-        String::from_utf8(BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?)
-            .map_err(|_| {
-                Error::msg("the compiler's optMultivalueExplain wrote bytes that are not UTF-8")
-            })?;
-    if !changed {
-        return Ok((None, log, None));
-    }
-    // `$VL_MV_FAULT=1` corrupts the output first, to prove a rewrite that does not validate is
-    // dropped.
-    if std::env::var_os("VL_MV_FAULT").is_some_and(|v| !v.is_empty() && v != "0") {
-        out.push(0xff);
-    }
-    if let Err(e) =
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all()).validate_all(&out)
-    {
-        if explaining {
-            log.push_str(&format!(
-                "mv-explain: step abandoned: its output does not validate: {e}\n"
-            ));
+        let resume = inst.get_typed_func::<i32, i32>(&mut store, "optPipeResume")?;
+        let argv_of = inst.get_typed_func::<(), i32>(&mut store, "optPipeArgv")?;
+        let rung = if flag == "-O3" { 3 } else { 1 };
+        let low = low_memory.map_or(0, |n| n as i32);
+        let fault = inline_fault() as i32;
+        let mut rq = start.call(&mut store, (rung, low, options, fault))?;
+        loop {
+            let data = BytesOut::probe(&mut store, &inst, "optOut")?.read(&mut store)?;
+            let argv = |store: &mut Store<()>| -> Result<Vec<String>> {
+                argv_of.call(&mut *store, ())?;
+                let text = BytesOut::probe(&mut *store, &inst, "optOut")?.read(&mut *store)?;
+                Ok(String::from_utf8_lossy(&text)
+                    .split_terminator('\n')
+                    .map(String::from)
+                    .collect())
+            };
+            let answer = match rq {
+                0 => {
+                    std::fs::write(sink, &data)?;
+                    return argv(&mut store);
+                }
+                1 => {
+                    eprint!("{}", String::from_utf8_lossy(&data));
+                    0
+                }
+                2 => match validate(&data) {
+                    Ok(()) => 1,
+                    Err(e) => {
+                        opt_stage(&mut store, &inst, e.to_string().as_bytes())?;
+                        0
+                    }
+                },
+                3 => *input_valid
+                    .get_or_insert_with(|| check.take().is_some_and(|h| h.join().unwrap_or(false)))
+                    as i32,
+                4 => {
+                    moved(&body_moves(&data)?)?;
+                    0
+                }
+                5..=8 => {
+                    let var = [
+                        "VL_OPT_INLINE_DUMP",
+                        "VL_OPT_FLAT_DUMP",
+                        "VL_OPT_MV_DUMP",
+                        "VL_OPT_ESCAPE_DUMP",
+                    ][(rq - 5) as usize];
+                    if let Some(dump) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                        std::fs::write(dump, &data)?;
+                    }
+                    0
+                }
+                9 => {
+                    let passes = argv(&mut store)?;
+                    std::fs::write(sink, &data)?;
+                    optimize_in_place(sink, flag, &passes, map)?;
+                    let stepped = std::fs::read(sink).map_err(|e| {
+                        Error::from(e).context(format!("reading back the {flag}'d `{sink}`"))
+                    })?;
+                    opt_stage(&mut store, &inst, &stepped)?;
+                    1
+                }
+                10 => bail!("{}", String::from_utf8_lossy(&data)),
+                rc => {
+                    bail!("the compiler's -O pipeline made a request this host does not know: {rc}")
+                }
+            };
+            rq = resume.call(&mut store, answer)?;
         }
-        return Ok((None, log, None));
-    }
-    let bad = || Error::msg("the compiler's optMultivalueMoves wrote a stream it cannot read");
-    let mut p = 0usize;
-    let mut moved = Vec::new();
-    let n = leb_u32(&stream, &mut p).ok_or_else(bad)?;
-    for _ in 0..n {
-        let from = leb_u32(&stream, &mut p).ok_or_else(bad)?;
-        let to = leb_u32(&stream, &mut p).ok_or_else(bad)?;
-        let pairs = leb_u32(&stream, &mut p).ok_or_else(bad)?;
-        let mut v = Vec::with_capacity(pairs as usize);
-        for _ in 0..pairs {
-            let old = leb_u32(&stream, &mut p).ok_or_else(bad)?;
-            let new = leb_u32(&stream, &mut p).ok_or_else(bad)?;
-            v.push((old, new));
-        }
-        moved.push(BodyMove { from, to, pairs: v });
-    }
-    if p != stream.len() {
-        return Err(bad());
-    }
-    let held = if scalar {
-        Some(multivalue_scalarized_read(&mut store, &inst)?)
-    } else {
-        None
-    };
-    Ok((Some((out, moved)), log, held))
-}
-
-/// The `optMultivalueScalarized` stream of the step just run on `inst`.
-fn multivalue_scalarized_read(
-    store: &mut Store<()>,
-    inst: &Instance,
-) -> Result<Scalarized> {
-    let scalarized = inst
-        .get_typed_func::<(), i32>(&mut *store, "optMultivalueScalarized")
-        .map_err(|e| {
-            e.context(
-                "`-O` reads what the multi-value step holds field by field through the \
-                 compiler's `optMultivalueScalarized`, which this seed predates",
-            )
-        })?;
-    scalarized.call(&mut *store, ())?;
-    let s = BytesOut::probe(store, inst, "optOut")?.read(store)?;
-    let bad = || Error::msg("the compiler's optMultivalueScalarized wrote a stream it cannot read");
-    let mut p = 0usize;
-    let mut locals = Vec::new();
-    for _ in 0..leb_u32(&s, &mut p).ok_or_else(bad)? {
-        let mut ls = std::collections::HashSet::new();
-        for _ in 0..leb_u32(&s, &mut p).ok_or_else(bad)? {
-            ls.insert(leb_u32(&s, &mut p).ok_or_else(bad)?);
-        }
-        locals.push(ls);
-    }
-    let mut params = std::collections::HashSet::new();
-    for _ in 0..leb_u32(&s, &mut p).ok_or_else(bad)? {
-        let f = leb_u32(&s, &mut p).ok_or_else(bad)?;
-        let j = leb_u32(&s, &mut p).ok_or_else(bad)?;
-        params.insert((f, j));
-    }
-    if p != s.len() {
-        return Err(bad());
-    }
-    Ok((locals, params))
-}
-
-/// What the multi-value step would hold field by field in `bytes`, were it run on it, for the
-/// list-flattening step's cost rule; `None` when it would leave the module untouched.
-fn multivalue_scalarized(
-    bytes: &[u8],
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<Option<Scalarized>> {
-    Ok(multivalue_vl(bytes, false, true, engine, compiler)?.2)
-}
-
-/// The multi-value step on `bytes`, printing its `$VL_MV_EXPLAIN` lines.
-fn multivalue_step(
-    bytes: &[u8],
-    engine: &Engine,
-    compiler: &CompilerSource,
-) -> Result<MultivalueOut> {
-    let explaining = std::env::var_os("VL_MV_EXPLAIN").is_some_and(|v| !v.is_empty() && v != "0");
-    let (out, log, _) = multivalue_vl(bytes, explaining, false, engine, compiler)?;
-    eprint!("{log}");
-    Ok(out)
+    })
 }
 
 /// The `wasm-opt` worker count when `$BINARYEN_CORES` is unset. Measured on plumb units
@@ -9872,18 +9388,6 @@ fn source_mapping_url(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// The code section's first byte, or `None` without one: the anchor a map's offsets hang
-/// from, which a rewrite that keeps a map valid must not move.
-fn code_section_start(bytes: &[u8]) -> Option<usize> {
-    use wasmparser::{Parser, Payload};
-    for payload in Parser::new(0).parse_all(bytes) {
-        if let Ok(Payload::CodeSectionStart { range, .. }) = payload {
-            return Some(upos(range.start));
-        }
-    }
-    None
-}
-
 /// `to` written relative to the directory `from`, both resolved against the working
 /// directory, so a map beside the module finds sources beside the input. `None` when
 /// either cannot be resolved; the map then names its sources bare.
@@ -10875,7 +10379,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         let map = map_path.as_deref();
         let rows_in = map_rows.take();
         // The chain is a function of these and of `bytes` (stage S2's key); a hit skips it.
-        // The seed is one of them: its `optRungArgv` reads the rung's input (`rung_argv`).
+        // The seed is one of them: its `optRungArgv` reads the rung's input (`opt_pipeline`).
         let seed = compiler_hash(&compiler)
             .map(|h| hex(&h))
             .unwrap_or_default();
@@ -10886,127 +10390,43 @@ fn build_cmd(args: &[String]) -> Result<()> {
             map.map(|_| (emitted_bytes.as_slice(), input, out.as_str())),
         );
         let chain = || -> Result<Vec<u8>> {
-            let mut bytes = bytes.clone();
             let mut map_rows = rows_in.clone();
             if let (Some(mp), Some(rows)) = (map, map_rows.as_ref()) {
                 std::fs::write(mp, build_source_map(rows, input, &out))
                     .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))?;
             }
             std::fs::write(&sink, &bytes)?;
-            if std::env::var_os("VL_OPT_ROUNDTRIP").is_some_and(|v| !v.is_empty()) {
-                let (mut store, inst) = load_compiler(&compile_engine, &compiler)?;
-                opt_stage(&mut store, &inst, &bytes)?;
-                opt_roundtrip_check(&mut store, &inst, &bytes, "the emitted module")?;
-            }
             // A step that moves code has the map made again from its rows, each moved with the
             // op it names; a twin is a copy of its function, so it gets a copy of its rows.
-            let remap =
-                |rows: &mut SrcMap, moved: &[BodyMove], mp: &str| -> Result<()> {
-                    let old = std::mem::take(&mut rows.rows);
-                    for body in moved {
-                        for r in old.iter().filter(|r| body.from <= r.0 && r.1 <= body.to) {
-                            rows.rows
-                                .push((body.place(r.0), body.place(r.1), r.2, r.3, r.4));
-                        }
-                    }
-                    std::fs::write(mp, build_source_map(rows, input, &out))
-                        .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))
+            let mut remap = |moved: &[BodyMove]| -> Result<()> {
+                let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) else {
+                    return Ok(());
                 };
-            // The inline-record step goes first: a field holding a small record nobody writes
-            // stores its fields in the parent, and a list of them holds the fields side by
-            // side, so a stored producer's result is then only read field by field and the
-            // multi-value step below gives it a twin.
-            if std::env::var_os("VL_OPT_NO_INLINE").is_none_or(|v| v.is_empty()) {
-                let explaining = std::env::var_os("VL_INLINE_EXPLAIN")
-                    .is_some_and(|v| !v.is_empty() && v != "0");
-                let decided = phase!(
-                    "opt.inline_census",
-                    inline_vl(&bytes, explaining, &compile_engine, &compiler)
-                )?;
-                let stepped = match decided {
-                    Some(log) => {
-                        if explaining {
-                            eprint!("{log}");
-                        }
-                        None
-                    }
-                    None => {
-                        let flag = |n: &str| {
-                            std::env::var_os(n).is_some_and(|v| !v.is_empty() && v != "0")
-                        };
-                        let fields = phase!(
-                            "opt.inline_rewrite",
-                            inline_rewrite_vl(
-                                &bytes,
-                                stable_layout,
-                                flag("VL_INLINE_REBOX"),
-                                flag("VL_INLINE_SPILL"),
-                                &compile_engine,
-                                &compiler
-                            )
-                        )?;
-                        phase!(
-                            "opt.inline_step",
-                            flat_vl(&bytes, stable_layout, fields, &compile_engine, &compiler)
-                        )?
-                    }
-                };
-                if let Some(st) = stepped {
-                    bytes = st.bytes;
-                    std::fs::write(&sink, &bytes)?;
-                    if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
-                        remap(rows, &st.moved, mp)?;
-                    }
-                    // `$VL_OPT_INLINE_DUMP=<file>` when a record field was inlined, and
-                    // `$VL_OPT_FLAT_DUMP=<file>` when a list was flattened: the step's output,
-                    // a measurement facility.
-                    for (on, var) in [
-                        (st.fields, "VL_OPT_INLINE_DUMP"),
-                        (st.flat, "VL_OPT_FLAT_DUMP"),
-                    ] {
-                        if let Some(dump) = std::env::var_os(var).filter(|v| on && !v.is_empty()) {
-                            std::fs::write(dump, &bytes)?;
-                        }
+                let old = std::mem::take(&mut rows.rows);
+                for body in moved {
+                    for r in old.iter().filter(|r| body.from <= r.0 && r.1 <= body.to) {
+                        rows.rows
+                            .push((body.place(r.0), body.place(r.1), r.2, r.3, r.4));
                     }
                 }
-            }
-            // The multi-value step goes before the escape step: a call site whose small record
-            // is only read calls a twin returning the fields (D3625).
-            if std::env::var_os("VL_OPT_NO_MULTIVALUE").is_none_or(|v| v.is_empty()) {
-                if let Some((mv, moved)) = phase!(
-                    "opt.multivalue_step",
-                    multivalue_step(&bytes, &compile_engine, &compiler)
-                )? {
-                    bytes = mv;
-                    std::fs::write(&sink, &bytes)?;
-                    if let (Some(mp), Some(rows)) = (map, map_rows.as_mut()) {
-                        remap(rows, &moved, mp)?;
-                    }
-                    // `$VL_OPT_MV_DUMP=<file>`: the step's output, as `$VL_OPT_ESCAPE_DUMP` is
-                    // the escape step's — a measurement facility, undocumented in `vl help build`.
-                    if let Some(dump) = std::env::var_os("VL_OPT_MV_DUMP").filter(|v| !v.is_empty())
-                    {
-                        std::fs::write(dump, &bytes)?;
-                    }
-                }
-            }
-            // The escape step goes first among the binaryen runs, so the rung's own passes
-            // (`--heap2local` among them) see each per-call struct and its uses in one
-            // function. It renumbers functions, so the run-once marks are read off its output.
-            let stepped = phase!(
-                "opt.escape_step",
-                escape_inline_step(&sink_str, flag, &bytes, map, &compile_engine, &compiler)
-            )?;
-            let rung_input: &[u8] = stepped.as_deref().unwrap_or(&bytes);
+                std::fs::write(mp, build_source_map(rows, input, &out))
+                    .map_err(|e| Error::from(e).context(format!("writing `{mp}`")))
+            };
+            // The compiler runs the steps before the rung, in order: the inline-record step, the
+            // multi-value step and the escape step (docs/internals/optimizer-in-vl.md).
+            let options = opt_pipe_options(names, stable_layout, map.is_some())?;
             let argv = phase!(
-                "opt.run_once_scan",
-                rung_argv(
-                    rung_input,
-                    &compile_engine,
-                    &compiler,
+                "opt.pipeline",
+                opt_pipeline(
+                    &bytes,
+                    &sink_str,
                     flag,
-                    names,
-                    low_memory
+                    options,
+                    low_memory,
+                    map,
+                    &mut remap,
+                    &compile_engine,
+                    &compiler
                 )
             )?;
             phase!("opt.rung", optimize_in_place(&sink_str, flag, &argv, map))?;
