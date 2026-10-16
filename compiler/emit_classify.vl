@@ -11803,21 +11803,27 @@ function declaredIndexOf(fnIx: i32, name: string) {
   declaredIndexAt(fnIx, declaredSlotLive(name))
 }
 
-// The wasm-local-index offset introduced by the env-leading closure param: when any function
-// value exists in the module, every function but the start one carries a hidden leading
-// `structref env` at local 0, so its params shift to 1..p and its locals to p+1 on. Zero
-// otherwise, so a module with no lambda keeps the original 0-based layout.
+// Whether function `fe` carries the hidden leading `structref env` param: only a function
+// that reads one, which is one with captures or one lambda-lifted (its captures follow the
+// env). Every other function keeps its plain signature, and a value of it dispatches through
+// an env-taking thunk (`cloThunkFes`).
+export function fnHasEnvParam(fe: i32): boolean {
+  if !fnValUsed || fe < 0 { return false }
+  if fe < cloLiftCapN.length && cloLiftCapN[fe] >= 0 { return true }
+  captureCountOf(fe) > 0
+}
+
+// The wasm-local-index offset of a function's declared params: the env (local 0) when the
+// function carries one (`fnHasEnvParam`), plus a lifted function's captures after it. Zero
+// for every other function and for the start one.
 export function envSlotShift(fnIx: i32) {
-  if fnValUsed && fnIx >= 0 {
-    // A lifted function's captures are parameters between the env and the declared ones.
-    if cloLiftCapN.length == 0 { return 1 }
-    const fe = fnStmtsPosOf(fnIx)
-    if fe >= 0 && fe < cloLiftCapN.length && cloLiftCapN[fe] > 0 {
-      return 1 + cloLiftCapN[fe]
-    }
-    return 1
+  if !fnValUsed || fnIx < 0 { return 0 }
+  const fe = fnStmtsPosOf(fnIx)
+  if !fnHasEnvParam(fe) { return 0 }
+  if fe < cloLiftCapN.length && cloLiftCapN[fe] > 0 {
+    return 1 + cloLiftCapN[fe]
   }
-  0
+  1
 }
 
 // Is `name` bound by the user in this frame — a parameter, a local, or a capture of one?
@@ -15637,6 +15643,8 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
   if n is Call {
     const callee = P.nodes[n.callFn]
     let isVal = false
+    // A call by name to a module function with no captures is a plain `call`: no frame.
+    let isDirect = false
     if callee is Ident {
       let t = fnIndexOfNode(n.callFn)
       // A live closure binding of the name is what the call denotes, so the frame needs
@@ -15650,7 +15658,7 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
         if !isVal && calleeIsUnionClosureIdent(n.callFn, fnIx) { isVal = true }
       } else {
         // A direct call to a capturing function is lowered via call_ref too.
-        if captureCountOf(t) > 0 { isVal = true }
+        if captureCountOf(t) > 0 { isVal = true } else { isDirect = true }
       }
     } else {
       if exprIsClosure(n.callFn, fnIx) { isVal = true }
@@ -15679,7 +15687,7 @@ export function blockHasCallRef(ix: i32, fnIx: i32) {
     // checker records every callee's own checked type, so one that types as a closure
     // reserves the scratch regardless of shape or depth — covering narrowed callees the
     // syntactic union-closure chain above cannot see. Over-reservation is harmless.
-    if !isVal {
+    if !isVal && !isDirect {
       const cty = nodeTyIxOf(n.callFn)
       if cty >= 0 {
         if T.tys[cty] is TyFunc { isVal = true }
