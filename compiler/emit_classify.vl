@@ -26505,7 +26505,7 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   // declared `type Opt = { v: i32 | null }` carries the same rep as the inline
   // `{v:i32|null}` annotation.
   if isValueUnionName(t) { return FC_UNION }
-  if isUName(t) { return FC_UNION }
+  if unNameBound(t) { return FC_UNION }
   // A field naming another struct, or a nullable struct, stores a `(ref null $S)`, code 15.
   // Resolved via the declaration scan rather than the incrementally-built struct table, so a
   // forward or mutually-recursive reference ties into the shared rec group.
@@ -36704,10 +36704,10 @@ export function annRowOfNode(ix: i32): i32 {
   nodeTyIxOf(ix)
 }
 
-// The `unNames` row a spelling names, or -1 — `isUName`'s row-valued sibling, so registry-
+// The `unNames` row a spelling names, or -1 — `unNameBound`'s row-valued sibling, so registry-
 // by-id seams can compare row to row rather than boolean to boolean: "both said yes" and
 // "both named the same row" are different findings. `unionRowOf` is a wider lookup (it also
-// scans `unMemberSet`); this one is the exact row `isUName` answers about.
+// scans `unMemberSet`); this one is the exact row `unNameBound` answers about.
 function unRowOfName(name: string): i32 {
   sidArrGet(unRowBySid, sidLookup(name))
 }
@@ -36734,13 +36734,21 @@ export function unMemberSetPush(set: string) {
   0
 }
 
-export function isUName(name: string) { unRowOfName(name) >= 0 }
+// Whether a row carries the union key of spelling `name`, one member or more; the empty name
+// has no key. Whether `name` itself is bound to a row is `unNameBound`'s question.
+export function isUName(name: string) {
+  const k = canonUnionKeyOfName(name)
+  k >= 0 && unRowOfKeyId(k) >= 0
+}
+
+// Whether the spelling `name` is bound to a row, for a caller about to bind or rewrite it.
+export function unNameBound(name: string) { unRowOfName(name) >= 0 }
 
 // Names the registered row of a union structurally equal to arena union `ty` by `name` too, so a
 // record's shape spelling and its declared name read one box and one set of tags (D4930). The
 // row, or -1 when no row holds that type.
 export function unNameShareCanonRow(name: string, ty: i32): i32 {
-  if isUName(name) { return unRowOfName(name) }
+  if unNameBound(name) { return unRowOfName(name) }
   const u = unRowOfCanon(ty)
   if u < 0 { return -1 }
   sidArrPut(unRowBySid, sidOf(name), u)
@@ -40512,35 +40520,21 @@ function unSiteWideAsks(site: i32): boolean {
   }
 }
 
-// The row-NAME seam: `name` when it names a row, else "". A switched site with a type answers
-// with the name of the row carrying its key instead, so a spelling no row is named by still
-// reaches the row its key finds; the spelling is read only to tally.
+// The row-NAME seam: the name of the row carrying the union key, else "". A site with a type
+// keys on it, and one with no type (`ty < 0`) on the key of `name`, so a spelling no row is
+// named by still reaches the row its key finds; armed, the spelling's own row is only tallied.
 function unionRowNameAB(site: i32, name: string, ty: i32): string {
-  const k = ty >= 0 && unSiteOnKey(site)
-  const m = unABOn()
-  if m == 0 && !k {
-    if isUName(name) { return name }
-    return ""
-  }
   let d = -1
-  if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  if m > 0 { unABProbe(site, unRowOfName(name), d, ty) }
-  if k || m == 2 {
-    if d >= 0 && d < unNames.length { return unNames[d] }
-    return ""
-  }
-  if isUName(name) { return name }
+  if ty >= 0 { d = unRowOfTyAB(site, ty) } else { d = nameKeyRow(name) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if d >= 0 && d < unNames.length { return unNames[d] }
   ""
 }
 
-// `isUName`'s seam for a caller with no arena node: the id side takes the caller's TYPE where
-// it has one and otherwise the key canon mints for the spelling — an identity, not a re-cut
-// substring. A key of -1 (the empty name) is "no id offered": tallied as `no-ty`, and a
-// switched site answers from the name there, since no key can name a row.
+// `isUName`'s seam for a caller with no arena node: the row its type keys to where it has one,
+// and otherwise the row carrying the key canon mints for the spelling, one member or more. The
+// empty name has no key and names no row; armed, a key of -1 is tallied as `no-ty`.
 export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
-  const sw = unSiteOnKey(site)
-  const m = unABOn()
-  if m == 0 && !sw { return isUName(name) }
   let d = -1
   let key = -1
   if ty >= 0 {
@@ -40550,57 +40544,40 @@ export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
     key = canonUnionKeyOfName(name)
     if key >= 0 { d = unRowOfKeyId(key) }
   }
-  const k = sw && key >= 0
-  if m == 0 {
-    if k { return d >= 0 }
-    return isUName(name)
-  }
-  const n = isUName(name)
-  let nr = -1
-  if n { nr = unRowOfName(name) }
-  unABProbe(site, nr, d, key)
-  if k || m == 2 { return d >= 0 }
-  n
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, key) }
+  d >= 0
 }
 
-// The member-type seam. A switched site with a type reads the key's row when it finds one and
-// the spelling otherwise. Mode 2 is an additive retry: it fills `out` from the id-keyed row
-// only where the spelling found none, since the name leg has already appended to `out` by then.
+// The member-type seam: the members of the row the type keys to, or, where the type finds no
+// row or there is none (`ty < 0`), of the row carrying the key of `name`. False when neither
+// finds a covered row, leaving `out` untouched.
 function unionMemberTysOfAB(
   site: i32,
   name: string,
   ty: i32,
   out: i32[],
 ): boolean {
-  const k = ty >= 0 && unSiteOnKey(site)
-  const m = unABOn()
-  if m == 0 && !k { return unionMemberTysOf(name, out) }
   let d = -1
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  if m > 0 { unABProbe(site, unRowOfName(name), d, ty) }
-  if k && d >= 0 { return unionMemberTysOfRow(d, out) }
-  const r = unionMemberTysOf(name, out)
-  if m == 2 && !r { return unionMemberTysOfRow(d, out) }
-  r
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if d < 0 { d = nameKeyRow(name) }
+  unionMemberTysOfRow(d, out)
 }
 
-// `unionHasAtom`'s seam. That predicate is a SPELLING scan, not a registry read — it walks
-// the pipe-separated spans of `name` — so its id-keyed twin walks the row's recorded
-// `unMemAtoms` instead, which is the same member list the mint recorded verbatim. A switched
-// site reads the key's row when it finds one and the spelling otherwise.
+// `unionHasAtom`'s seam: whether the row the type keys to, or else the row carrying the key of
+// `name`, records the member atom `atom` verbatim (`unMemAtoms`). Where neither key finds a row,
+// the spelling's own atoms answer, since a spelling no row holds is a text question.
 export function unionHasAtomAB(
   site: i32,
   name: string,
   ty: i32,
   atom: string,
 ): boolean {
-  const k = ty >= 0 && unSiteOnKey(site)
-  const m = unABOn()
-  if m == 0 && !k { return unionHasAtom(name, atom) }
   let d = -1
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
-  if m > 0 { unABProbe(site, unRowOfName(name), d, ty) }
-  if (k || m == 2) && d >= 0 { return unionHasAtomRow(d, atom) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if d < 0 { d = nameKeyRow(name) }
+  if d >= 0 { return unionHasAtomRow(d, atom) }
   unionHasAtom(name, atom)
 }
 
@@ -40698,7 +40675,7 @@ export function unVarSliceAdoptKeySibling(u: i32) {
 // union type of one member, or a reordered member sequence stays unbound and answers false,
 // so a mint guard asking this mints exactly where it did before the key could answer.
 export function unNameAdoptKeyRow(name: string, ty: i32): boolean {
-  if isUName(name) { return true }
+  if unNameBound(name) { return true }
   if (cUserTypes[name] ?? -1) >= 0 { return false }
   if ty >= 0 {
     const t = T.tys[ty]
