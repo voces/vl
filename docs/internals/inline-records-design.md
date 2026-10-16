@@ -8,7 +8,7 @@ placement argument for `T[N]`. This document makes it for ordinary records.
 
 **The ask.** sunpa's posing still allocates about 250 small records a frame: `V3 {x, y, z}` and
 `Q {x, y, z, w}`, all `f64`, pushed into lists and stored into record fields. The #3372/#3374
-multi-value step (`scripts/vl-host/src/multivalue.rs`, D3625, D3630) removes a record only
+multi-value step (`scripts/vl-host/src/multivalue.rs`, since deleted, D3625, D3630) removes a record only
 where the caller reads its fields. A store keeps the struct: SP-039's `joints[0].rot =
 qnorm(…)` is 52 `Q` a frame on its own.
 

@@ -1,7 +1,7 @@
 # The `-O` optimizer in VL — the port plan
 
 Owner ruling (A), plan row T4 / L10: `-O` becomes a VL compiler pass over the emitted module,
-identical for every host. The host's own optimizer — `scripts/vl-host/src/inline.rs`,
+identical for every host. The host's own optimizer — `scripts/vl-host/src/inline.rs` (since deleted),
 `multivalue.rs`, `flat.rs` and the `-O` parts of `main.rs` — retired rung by rung (since R7
 the three files are gone, and the host keeps only the chain in `main.rs`): each rung is
 ported into `compiler/` BESIDE its Rust, selectable by an environment variable, graded
