@@ -1,8 +1,8 @@
 # The emitter's module-scope state — where each piece is reset, and what is not
 
 **Re-derive before quoting: `vl run scripts/emitter-state-audit.vl`.** Every number below
-is the output of its Python predecessor on 2026-09-04. The NEVER count is a ratchet now
-(`-- --check`, baseline `scripts/emitter-state-baseline.json`). A hand-written audit table goes stale in ONE
+is the output of its Python predecessor on 2026-09-04. The NEVER count is 0 and `-- --check`
+holds it there: any new never-cleared mutable fails it. A hand-written audit table goes stale in ONE
 direction — a variable that gains a reset keeps reading as a hazard, and one that LOSES a
 reset keeps reading as safe, which is the direction that ships bugs.
 

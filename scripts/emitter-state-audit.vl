@@ -1,7 +1,7 @@
 // Where is the emitter's module-scope mutable state CLEARED, and the ratchet on what is not.
 //
 //     vl run scripts/emitter-state-audit.vl [-- --names]
-//     vl run scripts/emitter-state-audit.vl -- --check | --write-baseline [--baseline P]
+//     vl run scripts/emitter-state-audit.vl -- --check [--without-reset NAME]
 //
 // Every `let` at column 0 in an emitter module survives a compile, and one wasm instance
 // runs many compiles (the LSP, `tests/cases_wasm_test.ts`). For each one this finds every
@@ -15,30 +15,21 @@
 // lists the `fnUses*` flags one of the two frame builders resets and the other does not
 // (D1006/D1007), pinned by `tests/vl_emitter_state_audit_test.ts`.
 //
-// `--check` exits 1 when the NEVER count is above `scripts/emitter-state-baseline.json`
-// (lane L7's ratchet); `--write-baseline` records it, in the same PR as the change that
-// earned it. Run from the checkout root: paths are relative to the working directory.
+// `--check` is an invariant, not a ratchet: it exits 1 and names every NEVER row when there
+// is any (lane L7 took the count to 0). `--without-reset NAME` ignores the clears one
+// function makes, so the test's control can make it red. Run from the checkout root: paths
+// are relative to the working directory.
 
-import { IoError, listDir, readTextFile, writeTextFile } from "std:fs"
-import { JsonError, parseJson } from "std:json"
+import { IoError, listDir, readTextFile } from "std:fs"
 import { programArgs } from "std:args"
-import { exit, runProgram } from "std:process"
-import { Utf8Error, decodeUtf8 } from "std:utf8"
+import { exit } from "std:process"
+import { Utf8Error } from "std:utf8"
 import { toString } from "std:fmt"
-import {
-  endsWith,
-  join,
-  padEnd,
-  padStart,
-  split,
-  startsWith,
-  trim,
-} from "std:str"
+import { endsWith, join, padEnd, padStart, split, startsWith } from "std:str"
 import { sort } from "std:array"
-import { JsonMap, die, hasFlag, lstripWs, stripWs } from "./lib/common"
+import { die, hasFlag, lstripWs, stripWs } from "./lib/common"
 
 const CDIR = "compiler"
-const BASELINE = "scripts/emitter-state-baseline.json"
 
 // The emitter's own modules. The checker and the front end have the same hazard and their
 // own reset homes; this audit is scoped to the emitter, where the filed rows live.
@@ -74,7 +65,7 @@ const PROLOGUE = [
   "wasmEmitStateReset", "bcReset", "bignumReset", "capMemoEditsReset",
   "declStructIndexReset", "dslReset", "dupIndexReset", "iisReset",
   "mvShapeNestReset", "printPlanReset", "rewriteCountersReset",
-  "shapeRowsReset", "tailSelfFnReset", "monoStateReset",
+  "shapeRowsReset", "tailSelfFnReset", "monoStateReset", "classifyStateReset",
 ]
 
 // State that lives across compiles by design, so it is no NEVER row: the host options a
@@ -349,7 +340,8 @@ function addUnique(xs: string[], x: string) {
   0
 }
 
-function audit(): Audit {
+// `without` names one function whose clears are not counted ("" for none): the check's control.
+function audit(without: string): Audit {
   const files = compilerFiles()
   const srcs: Src[] = []
   for f in files { srcs.push(loadSrc(f)) }
@@ -424,7 +416,7 @@ function audit(): Audit {
   for w in ws {
     writes[w.ix] = writes[w.ix] + 1
     addUnique(assigned[w.ix], w.fn)
-    if w.clear { addUnique(homes[w.ix], w.fn) }
+    if w.clear && w.fn != without { addUnique(homes[w.ix], w.fn) }
   }
   // Memo keys and generations are registered, and `memoCompileReset` resets them all.
   let di = 0
@@ -591,43 +583,6 @@ function report(a: Audit, names: boolean) {
   0
 }
 
-// The short sha the baseline was written from: provenance for a reader, never an input.
-function headCommit(): string {
-  const r = runProgram("git", ["rev-parse", "--short", "HEAD"])
-  if r is IoError { return "unknown" }
-  if r.code != 0 { return "unknown" }
-  const t = decodeUtf8(r.stdout)
-  if t is Utf8Error { return "unknown" }
-  trim(t)
-}
-
-function loadNever(path: string): i32 {
-  const text = readTextFile(path)
-  if text is IoError {
-    die(
-      "emitter-state-audit: cannot read the baseline \{path} (\{text.msg}). Write one with\n  vl run scripts/emitter-state-audit.vl -- --write-baseline",
-      1,
-    )
-    return 0
-  }
-  const row = parseJson(text)
-  if row is JsonMap {
-    const v = row["never"]
-    if v is f64 {
-      const n = v as? i32
-      if n != null { return n }
-    }
-    die("emitter-state-audit: " + path + " has no integer `never` field", 1)
-    return 0
-  }
-  if row is JsonError {
-    die("emitter-state-audit: " + path + " is not JSON: " + row.msg, 1)
-    return 0
-  }
-  die("emitter-state-audit: " + path + " is not a JSON object", 1)
-  0
-}
-
 function flagValue(
   args: readonly string[],
   flag: string,
@@ -642,38 +597,26 @@ function flagValue(
 }
 
 function main(args: readonly string[]) {
-  const baseline = flagValue(args, "--baseline", BASELINE)
-  if hasFlag(args, "--write-baseline") {
-    const a = audit()
-    const never = countKind(a, "NEVER")
-    const commit = headCommit()
-    const w = writeTextFile(
-      baseline,
-      "{\"never\": \{never}, \"commit\": \"\{commit}\"}\n",
-    )
-    if w != null {
-      die("emitter-state-audit: cannot write \{baseline} (\{w.msg})", 1)
-    }
-    print("wrote \{baseline}: \{never} never-cleared at \{commit}")
-    return 0
-  }
+  const a = audit(flagValue(args, "--without-reset", ""))
   if hasFlag(args, "--check") {
-    const base = loadNever(baseline)
-    const a = audit()
-    const never = countKind(a, "NEVER")
-    const line = "never-cleared emitter state \{never} of \{a.decls.length} mutables (baseline \{base})"
-    if never > base {
-      print("emitter state budget EXCEEDED: " + line)
+    const never = sortedIx(a, (i: i32): boolean => a.kinds[i] == "NEVER")
+    const line = "never-cleared emitter state \{never.length} of \{a.decls.length} mutables"
+    if never.length > 0 {
+      print("emitter state invariant BROKEN: " + line)
       print(
-        "A module-scope `let` in an emitter module that no reset clears survives into the next compile on the same instance.\nClear it in `emitProgram`'s prologue, a pass or a frame builder, or derive it per call. Names:\n  vl run scripts/emitter-state-audit.vl",
+        "A module-scope `let` in an emitter module that no reset clears survives into the next compile on the same instance.\nClear it in `emitProgram`'s prologue, a pass or a frame builder, derive it per call, or name it in INSTANCE with its reason:",
       )
+      for i in never {
+        const d = a.decls[i]
+        print("  \{d.name} \{d.file}:\{d.line}")
+      }
       exit(1)
       return 0
     }
     print(line)
     return 0
   }
-  report(audit(), hasFlag(args, "--names"))
+  report(a, hasFlag(args, "--names"))
 }
 
 const argv = programArgs()
