@@ -263,7 +263,7 @@ Measure:
 Measure:
 
     kind: shell
-    cmd: awk '/^function checkFuncDeclNode\(/{f=1} f{n++} f&&/^\}/{print n; exit}' compiler/typecheck.vl
+    cmd: cat compiler/typecheck.vl compiler/check_*.vl | awk '/^(export )?function checkFuncDeclNode\(/{f=1} f{n++} f&&/^\}/{print n; exit}'
     filed: 549
     tol: 60
     dir: at-most
