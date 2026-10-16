@@ -1,0 +1,5067 @@
+// One whole-program check: `checkProgramPass` arms the tables, walks the program with
+// `checkNode`, then runs the passes that need every node typed. Those are the extern and
+// getter contracts, the effect summaries, the record-covariance writes and widenings, the
+// numeric-literal refutations and the rewrite of annotation names into the emitter's
+// vocabulary. It sits above `typecheck.vl`, which never calls it.
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  Node,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  annTsOf,
+  arenaEpochBump,
+  brkValSeen,
+  clearAnnTs,
+  clearUdTs,
+  extDeclLink,
+  extDeclPos,
+  extDeclSig,
+  extDeclVl,
+  extGDeclLink,
+  extGDeclMut,
+  extGDeclNode,
+  extGDeclPos,
+  extGDeclTy,
+  extGMut,
+  extGNames,
+  extGTys,
+  extNames,
+  extPoss,
+  extSigs,
+  externArityAt,
+  externCount,
+  externDeclCount,
+  externLinkOf,
+  externNameAt,
+  externParamAt,
+  externRetAt,
+  getDeclLabel,
+  i32ToStr,
+  lblBlkSeen,
+  nodeChildren,
+  recDupField,
+  spreadArgOf,
+  udTsRootAt,
+  ufcsModOfNode,
+} from "./ast"
+import {
+  isTransparentAlias,
+  singleMemberAliasTyIx,
+} from "./check_alias_transparent"
+import {
+  asgKeepNarrowSet,
+  asgNarTyIxSet,
+  asgStripTysSet,
+  asgTvWriteSet,
+} from "./check_asg_rows"
+import {
+  fsbCallIx,
+  lpOnSet,
+  nolLits,
+  nolLitsSet,
+  nolOperand,
+  nolOperandSet,
+  nolTaken,
+  nolTakenOtherSet,
+  nolTakenSet,
+  ulLitNSet,
+  ulTakenSet,
+} from "./check_bind_rows"
+import {
+  opBinDeclined,
+  opBinDispatched,
+  opBinHoleDeclAnn,
+  opBinHoleDeclName,
+  opBinHoleDeclNode,
+} from "./check_call_resolve"
+import { calleeNameOf, opBinFnAtNode, opIdxFnAtNode } from "./check_callee"
+import {
+  CANON_SLOT_AS,
+  CANON_SLOT_IS,
+  CANON_SLOT_TY,
+  canonAtoms,
+  canonAtomsSet,
+  canonBankRaw,
+  canonClearedPush,
+  canonClearedSet,
+  canonRawNodeSet,
+  canonRawSlotSet,
+  canonRawTextSet,
+  canonTyIxColPush,
+  canonTyIxColSet,
+  nameNeedsCanon,
+} from "./check_canon_raw"
+import { nodeLineOf } from "./check_capture_loss"
+import { crProgRoot, crReset } from "./check_capture_rows"
+import { weSplit } from "./check_capture_walks"
+import {
+  arrDefCallIx,
+  cFuncPinTyIxSet,
+  cObjPinTyIxSet,
+  checkerArmed,
+  checkerArmedSet,
+  cnhAts,
+  cnhDemand,
+  cnhIsOpen,
+  cnhIsVal,
+  cnhNames,
+  cnhTys,
+  extFnTyMark,
+  inferJoinListIdx,
+  isParentElseTyIxSet,
+  isParentTyIxSet,
+  narIfEndsSet,
+  narListDeclReadsSet,
+  shiftCountNodes,
+  topUnannotFns,
+  voidRetRwBlk,
+  voidRetRwRet,
+} from "./check_core_state"
+import {
+  ljwReported,
+  rcwArenaReady,
+  rcwBdCall,
+  rcwBdConc,
+  rcwBdCovs,
+  rcwBdDecl,
+  rcwBdTp,
+  rcwIndexReady,
+  rcwIsRefTy,
+  rcwPendCovs,
+  rcwPendDstTy,
+  rcwPendSrc,
+  rcwPendSrcTy,
+  rcwReported,
+  rcwTvCount,
+  rcwTvInputOnly,
+  rcwTvPaths,
+} from "./check_covar_pins"
+import { annUnionAtomsSet, annUnionAtomsSetAt } from "./check_decl_scan"
+import { containerWidenCopyHint } from "./check_diag_text"
+import {
+  ES_UNBOUNDED,
+  esAlloc,
+  esAllocVia,
+  esBindCount,
+  esBindNames,
+  esBindStart,
+  esBindTys,
+  esCost,
+  esCounter,
+  esDecl,
+  esFrame,
+  esHost,
+  esHostVia,
+  esKeyIx,
+  esLow,
+  esOnStack,
+  esOrder,
+  esReadLet,
+  esReadLetVia,
+  esScopeBase,
+  esScopeNames,
+  esStack,
+  esUnknown,
+  esUnknownVia,
+  esWhy,
+  esWhyVia,
+  esWrite,
+  esWriteLocal,
+  esWriteVia,
+  gcCmpCount,
+  gcCmpSteps,
+  gcTopCount,
+  gcTopRow,
+  gcTopSteps,
+  gcTrail,
+} from "./check_effect_rows"
+import {
+  esBinOverTyVar,
+  esBindText,
+  esCallArgs,
+  esCalleeDecl,
+  esCalleeIsField,
+  esDumpLabel,
+  esIsBareName,
+  esIsBuiltLiteral,
+  esIsTyVar,
+  esScopePush,
+  esScopeTruncate,
+} from "./check_escape_parts"
+import {
+  builtinCollNorm,
+  collectGenAliasFieldAnns,
+  nameIsGenAppOfDecl,
+} from "./check_gen_alias_anns"
+import { annotateTyArgLambdas } from "./check_generic_args"
+import {
+  GETTER_STEP_CAP,
+  esAssignWrite,
+  esAtLine,
+  esBindWalk,
+  esCloseCycle,
+  esFactPath,
+  esLocalKind,
+  esOpenOperator,
+  esSetAlloc,
+  esSetUnknown,
+  esShownTy,
+  esText,
+  esUnbound,
+  gcAdd,
+  gcBuiltinCall,
+  gcBuiltinMethod,
+  gcCharge,
+  gcCostSoFar,
+  gcIdent,
+  gcPath,
+  gcSummarise,
+  getDecls,
+  getFns,
+  getLetTyOf,
+  getProps,
+  getRowOf,
+  getSelfTys,
+  getterMethodClash,
+  getterMethodFix,
+  getterRepOk,
+  getterRewriteSites,
+  gwErasedIs,
+  gwLoopCmpOperand,
+  gwStrLitEqLen,
+  gwStrLitLenOf,
+  homeModuleOf,
+  memberHasBuiltin,
+  modIxOfMangled,
+  moduleGlobals,
+} from "./check_getter_effects"
+import {
+  GETTER_STEP_BUDGET,
+  GW_ALLOC,
+  GW_CALL,
+  GW_EFFECT,
+  GW_LOOP,
+  GW_OTHER,
+  GW_RECUR,
+  GW_STATE,
+  gcCost,
+  gcCostPush,
+  gcCostSet,
+  gcIsOver,
+  gcReadByOver,
+  getEdgeFromPush,
+  getEdgeFromSet,
+  getEdgeToPush,
+  getEdgeToSet,
+  getterIntrinsicOk,
+  getterReaches,
+  gwBoxedFirst,
+  gwBoxedSeenSet,
+  gwConcatInner,
+  gwConcatInnerSet,
+  gwConcatMarkInner,
+  gwDiscardPush,
+  gwDiscardSet,
+  gwDiscarded,
+  gwIsCompare,
+  gwIsFloat,
+  gwIsLocal,
+  gwLocals,
+  gwLocalsPop,
+  gwLocalsPush,
+  gwLocalsSet,
+  gwRow,
+  gwRowSet,
+  gwSaid,
+  gwSaidPush,
+  gwSaidSet,
+} from "./check_getter_walk"
+import { arrDefCallTy, linkedRowElem } from "./check_hole_links"
+import {
+  calleeWriteAt,
+  calleeWriteGot,
+  calleeWriteRow,
+} from "./check_hole_rows"
+import { valDiscarded } from "./check_if_value"
+import { synthInlineLitUnionDecls } from "./check_inline_lit_union"
+import {
+  a20RetSetDisagrees,
+  arrDefElemDeferred,
+  ctorExprOf,
+  externGlobalSig,
+  gcIsLitSteps,
+  letJoinCandidatesSet,
+  ljwTailSplit,
+  ljwWalked,
+  ljwWalkedSet,
+  lwStoreDstSet,
+  objLitFieldExpr,
+  recAnnObjsSet,
+  recCallResultInferred,
+  shapeAdaptRecStorageFieldSet,
+  shapeAdaptRecStorageSet,
+  sourceBuildTy,
+} from "./check_leaf_steps"
+import { exprIsCollCtorCall } from "./check_list_origin"
+import {
+  isTyColCapSet,
+  isVarTyIxCapSet,
+  isVarTyIxSet,
+} from "./check_list_union"
+import {
+  LRP_LITS,
+  funcArrowAt,
+  isTopLevelFuncTypeName,
+  litUnionPreserve,
+  lupAtoms,
+  mixedUnionLitAliasRegroup,
+  nameHasPipe,
+  nameHasSep,
+  partIsStrLitSet,
+} from "./check_lit_union_spell"
+import { hoistMatchScrutinees } from "./check_match_hoist"
+import {
+  declaredStructUnionMembers,
+  gRootStmts,
+  gRootStmtsSet,
+  numLitNamesStoredNonLit,
+  recordTopScalars,
+  unionAliasMembers,
+} from "./check_nj_join"
+import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTyWrites } from "./check_node_tys"
+import {
+  cexIsDerived,
+  cexNegOperand,
+  cexReported,
+  cexWideFloatOk,
+  cexWideLits,
+  lbiDefaultExpr,
+  nlSugg,
+  nlnAnn,
+  nlnDecl,
+  nlnDiag,
+  nlnLeaf,
+  nlnLeafTy,
+  nlnMsg,
+  nlnSlot,
+  nlnText,
+  nlnUse,
+  nlnWant,
+  nluAtoms,
+  numLitFnReadNamed,
+  numLitNotesDisagree,
+} from "./check_num_lit_state"
+import {
+  cexCountBelow,
+  cexIsMinI64,
+  exprIsNumLit,
+  intLitIsNegated,
+  intLitLexemeOf,
+  numLitArithOp,
+  numLitAssignedValue,
+  numLitFitsStore,
+  numLitFnCallOf,
+  numLitIsFnTail,
+  numLitIsInt,
+  numLitNameAt,
+  shiftCountMsg,
+} from "./check_num_lits"
+import { getSiteFnOf, keyHasPrefix, parenPeelIx } from "./check_places"
+import {
+  RCW_DEPTH,
+  RCW_DEPTH_LIMIT,
+  RCW_OPAQUE,
+  RCW_WRITE,
+  rcwCommonNarrow,
+  rcwCtxFnPop,
+  rcwCtxFnPush,
+  rcwCtxFnSet,
+  rcwCtxKey,
+  rcwCtxNarrowPop,
+  rcwCtxNarrowPush,
+  rcwCtxNarrowSet,
+  rcwCtxTvPop,
+  rcwCtxTvPush,
+  rcwCtxTvSet,
+  rcwCut,
+  rcwFound,
+  rcwFoundCallee,
+  rcwInferredRetTy,
+  rcwIsErrNode,
+  rcwMemoGet,
+  rcwMemoPut,
+  rcwOpenSet,
+  rcwParametricOk,
+  rcwSeen,
+  rcwSeenCut,
+  rcwSeenSet,
+  rcwSeenSetAt,
+  rcwSlotNoun,
+  rcwStmtStep,
+  rcwValueNoun,
+  rcwVia,
+  rcwViaSet,
+  rcwWhat,
+  rcwWhyAs,
+  rcwWhyKind,
+  rcwWhyKindSet,
+  rcwWhySet,
+  rcwWrote,
+} from "./check_rcw"
+import { recAdRaising } from "./check_rec_adopt_rows"
+import {
+  recFreshOriginDecl,
+  recInferredFnOf,
+  recOriginExpr,
+} from "./check_rec_fresh"
+import {
+  recKeptAt,
+  recKeptAtSet,
+  recKeptDecl,
+  recKeptDeclSet,
+  recKeptDst,
+  recKeptDstSet,
+  recOwnPend,
+  recOwnSrc,
+  recOwnSrcSet,
+  recPendAt,
+  recPendAtSet,
+  recPendDstTy,
+  recPendDstTySet,
+  recPendSeenSet,
+  recPendSrc,
+  recPendSrcSet,
+  recPendSrcTy,
+  recPendSrcTySet,
+} from "./check_rec_rows"
+import {
+  recCoalesceOperands,
+  recIndexBase,
+  recIsJoin,
+  recKeptWhat,
+  recLeafEscapes,
+  recOwnIsPin,
+} from "./check_record_origins"
+import {
+  rcwCallSites,
+  rcwFixHint,
+  rcwFnLabel,
+  rcwKey,
+  rcwLeafVacuous,
+  rcwParamIndexOf,
+  rcwParamNameOf,
+  rcwParamSpellsTp,
+  rcwPathOf,
+  rcwPlainAlias,
+  rcwPrefix,
+  rcwReadsOnly,
+  rcwReturnsElem,
+  rcwRootIdent,
+  rcwSameElems,
+  rcwSelfDeclsOf,
+  rcwSlotFresh,
+  rcwSourceSlotTy,
+  rcwStoredArg,
+  rcwStoresElem,
+  rcwStrictlyUnder,
+  rcwTyOf,
+  rcwTyUnknown,
+  rcwUnder,
+} from "./check_record_writes"
+import { isClassifiableRetName } from "./check_redundant_ret"
+import {
+  IR_REC_CLASSIFIABLE,
+  IR_REC_NULL_ONLY,
+  IR_RUNG_LITUNION_ALIAS,
+  IR_RUNG_MAP_UNION,
+  IR_RUNG_NULLABLE,
+  IR_RUNG_NUL_LIST_RET,
+  IR_RUNG_NUL_LITUNION,
+  IR_RUNG_STRUCT_UNION,
+  IR_RUNG_VALUE_UNION,
+  IR_RUNG_VARIANT_BOX,
+  inferRetNameAtoms,
+  mapUnionRetName,
+  nulListRetName,
+  valueUnionRetName,
+} from "./check_ret_names"
+import { declare, isConstName, lookup } from "./check_scopes"
+import {
+  joinHeadSet,
+  joinNameSet,
+  joinNextSet,
+  joinTySet,
+  nestedUnannotFns,
+  nestedUnannotTys,
+  nodePinKindSet,
+  nodePinPaySet,
+  pgVoidSet,
+} from "./check_side_rows"
+import { tyIsDeferredJoin } from "./check_tp_join"
+import {
+  REC_STORE_DEPTH,
+  fieldStorageEq,
+  listJoinStorageDiffers,
+  objFieldNameSetsEq,
+  recStorageField,
+} from "./check_ty_relate"
+import {
+  nameIsLitUnionType,
+  nomErasedTyIx,
+  numLitUnionAliasName,
+  oneListUnionAliasName,
+  transparentMemberEmitName,
+} from "./check_ty_rep"
+import {
+  arrElemTyOrNone,
+  nonNullTy,
+  primNameOf,
+  tyHasTyVar,
+  tyReachesHole,
+} from "./check_ty_shape"
+import {
+  elemHasZero,
+  partsHaveNull,
+  recFnValueLeaves,
+  shapeAdaptDstTySet,
+  shapeAdaptElemPairSet,
+  shapeAdaptSrcExprSet,
+  shapeAdaptSrcTySet,
+  shapeAdaptWidthFieldSet,
+} from "./check_type_shape"
+import {
+  RC_ELEM,
+  RC_FIELD,
+  RC_FN_PARAM,
+  RC_FN_RES,
+  RC_MAP_KEY,
+  RC_MAP_VAL,
+  RC_NULLABLE,
+  RC_ROOT,
+  RC_UNION_MEM,
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_NULL,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  ctxKeepsLitUnion,
+  demangleMsg,
+  genAppNameOfTy,
+  litMemberTy,
+  litUnionAliasNameOfTy,
+  mkArrayTy,
+  mkFuncTy,
+  nomNameOfTy,
+  numLitUnionBaseTy,
+  objFieldType,
+  primNameStr,
+  softenLitTy,
+  tyArrayElemIx,
+  tyEq,
+  tyHasHole,
+  tyHoldsObj,
+  tyIsPrimNamed,
+  tyNameAtoms,
+  tySame,
+  tyToEmitName,
+  tyToEmitNameAt,
+  tyToStr,
+  tyToStructStr,
+} from "./check_types"
+import { tailValueLeaves, ucCompute } from "./check_unconsumed"
+import { wsPassReset } from "./check_width"
+import {
+  CW_FR_UNKNOWN,
+  CW_OCC_USE,
+  CW_UP_ARG,
+  CW_UP_ARM,
+  CW_UP_ASG_LHS,
+  CW_UP_ASG_RHS,
+  CW_UP_CALLEE,
+  CW_UP_CMP,
+  CW_UP_COAL,
+  CW_UP_ELEM,
+  CW_UP_FIELD,
+  CW_UP_IS,
+  CW_UP_ITER,
+  CW_UP_LETINIT,
+  CW_UP_NONE,
+  CW_UP_OBJ,
+  CW_UP_RET,
+  CW_UP_SPREAD,
+  CW_UP_TAIL,
+  covarRootFrame,
+  cwBuildFrames,
+  cwCallNamed,
+  cwCalleeDeclOf,
+  cwFnTailStmt,
+  cwFrJoins,
+  cwFrRets,
+  cwFrameOf,
+  cwFrameOfDecl,
+  cwFrameOfUse,
+  cwIxBuild,
+  cwIxFrHead,
+  cwIxFrNext,
+  cwIxKind,
+  cwIxNode,
+  cwIxPNext,
+  cwIxParent,
+  cwIxUnkHead,
+  cwIxUp,
+  cwIxUpAux,
+  cwIxUpKind,
+  cwPeel,
+  fnDeclIx,
+  rcwBlockTail,
+} from "./check_write_scan"
+import { numLexFitsI32 } from "./emit_bignum"
+import { nodeStartTok } from "./fmt_util"
+import { i32ListHas, strListHas } from "./listutil"
+import {
+  annGenAppSpanEnds,
+  arrElemNameRaw,
+  fieldNameOf,
+  fieldTypeTextOf,
+  fnParamsTextOf,
+  fnRetTextOf,
+  gaeArgsTextOf,
+  gaeHeadNameOf,
+  gaeLtAt,
+  groupInnerOf,
+  mapSpellKeyEnd,
+  mapSpellKeyName,
+  mapSpellValName,
+  nameIsBraceSpanEnds,
+  nameIsMapOpen,
+  nameIsParenSpanEnds,
+  nameIsReadOnlyList,
+  roListInnerName,
+  splitUnionAtoms,
+  tyTopIndexOf,
+  tyTopLevelSplit,
+} from "./tyname"
+import {
+  annotResolve,
+  arrDefPinHoleElem,
+  assignable,
+  checkNode,
+  dupNameErr,
+  flushUninferred,
+  fsbRecheckFrom,
+  nameToTy,
+  nullableRetName,
+  objShapeAdapterlessErr,
+  opIdxFnFor,
+  opSelfFnKeyFor,
+  rcwPend,
+  recAdoptNote,
+  recordInferRet,
+  resolveAnnot,
+  structUnionRetName,
+  tErr,
+  tErrPush,
+  tErrPushTok,
+  variantBoxUnionRetName,
+  widenLitTy,
+} from "./typecheck"
+
+// Refuse every container null hole nothing filled: the program never said what else it holds.
+function flushContainerNullHoles() {
+  let i = 0
+  while i < cnhTys.length {
+    if !cnhDemand[i] && cnhIsOpen(cnhTys[i]) {
+      let what = "the element type of "
+      if cnhIsVal[i] { what = "the value type of " }
+      let nm = "this container"
+      if cnhNames[i] != "" { nm = "`" + cnhNames[i] + "`" }
+      tErr(what + nm + " is only ever null — annotate it", cnhAts[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Refuse every hole callee's write into a binding's list that the list's final element cannot
+// hold: the callee's instance is built over that element (D3775).
+function checkCalleeWrites() {
+  let i = 0
+  while i < calleeWriteRow.length {
+    const el = linkedRowElem(calleeWriteRow[i])
+    const got = calleeWriteGot[i]
+    if el >= 0 && got >= 0 && !tyHasHole(got) && !tyHasHole(el) {
+      if !assignable(got, el) {
+        tErr(
+          "the callee's body writes "
+            + tyToStr(widenLitTy(got))
+            + " into the list passed here, whose element is "
+            + tyToStr(el),
+          calleeWriteAt[i],
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// D965 — grade every `__array_new_default__` call once the pins are all in: an element with no
+// zero is refused here, at the checker, because the emitter reaching it would build the i32
+// backing under a destination of some other rep. A still-open hole is pinned to `i32` so the
+// arena says what the emitter builds. Keyed by the call, so one pass covers every position.
+function checkArrayNewDefaultElems() {
+  let i = 0
+  while i < arrDefCallTy.length {
+    const t = T.tys[arrDefCallTy[i]]
+    if t is TyArray {
+      // Pin first, then grade — one order, not two paths: defaulting an unpinned hole and
+      // skipping the grade leaves the link unread and never asks an element a partner supplies
+      // for its zero. D1512.
+      const el = arrDefPinHoleElem(arrDefCallTy[i])
+      if arrDefElemDeferred(el) {
+        // An error element already has its own diagnostic and a hole element is a generic
+        // body's, where this question has no answer until the pin — the same deferral every
+        // other floor in this file makes over a `TyVar` (see `notePrintCstr`).
+      } else if !elemHasZero(el) {
+        tErr(
+          "__array_new_default__ fills every slot with the element's default value, and "
+            + tyToStr(el)
+            + " has none — use __array_new__(n, fill)",
+          arrDefCallIx[i],
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// An integer literal no 64-bit integer holds, which no float destination took, overflows i64.
+function cexCheckWideLits() {
+  let i = 0
+  while i < cexWideLits.length {
+    const ix = cexWideLits[i]
+    const e = P.nodes[ix]
+    if e is NumLit {
+      if !(cexWideFloatOk[ix] ?? false) && !(cexReported[ix] ?? false) {
+        cexReported[ix] = true
+        let what = "integer literal "
+        if cexIsDerived(ix) { what = "constant " }
+        let s = e.numText
+        const neg = cexNegOperand[ix] ?? false
+        if neg { s = "-" + s }
+        if !(neg && cexIsMinI64(e.numText)) {
+          tErr(what + s + " overflows i64", ix)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// After the walk, when every write is known: each call through a marked binding re-asks the
+// deferred constraints of each function written to it, as a call naming that function would.
+function fsbRecheckCalls() {
+  let c = 0
+  while c < fsbCallIx.length {
+    fsbRecheckFrom(c)
+    c = c + 1
+  }
+  0
+}
+
+// Drop each function-value note whose suggested return another use of the function would refuse:
+// every read of its name, or member call by it, within the top-level statement that declares it
+// (anywhere, for a module-level one) must be a read some note names or a call whose result
+// `numLitFnCallAccepts` keeps.
+function numLitFnNotesRefuted(drop: boolean[]) {
+  const names: {[string]: boolean} = Map()
+  const decls: {[i32]: boolean} = Map()
+  let any = false
+  let j = 0
+  while j < nlnSlot.length {
+    if nlnSlot[j] == "fn" && nlnUse[j] != "" {
+      names[nlnUse[j]] = true
+      decls[nlnDecl[j]] = true
+      any = true
+    }
+    j = j + 1
+  }
+  if !any { return 0 }
+  nlSugg = Map()
+  const par: {[i32]: i32} = Map()
+  const owner: {[i32]: i32} = Map()
+  const reads: i32[] = []
+  const readOwner: i32[] = []
+  const stack: i32[] = []
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
+    stack.pop()
+    owners.pop()
+    if decls[ix] ?? false { owner[ix] = own }
+    const n = P.nodes[ix]
+    let rn = ""
+    if n is Ident { rn = n.identName }
+    if n is Member { rn = n.memProp }
+    if rn != "" && (names[rn] ?? false) {
+      reads.push(ix)
+      readOwner.push(own)
+    }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length {
+        par[c] = ix
+        stack.push(c)
+        owners.push(own)
+      }
+    }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    if nlnSlot[k] == "fn" && nlnUse[k] != "" && !drop[k] {
+      const fd = nlnDecl[k]
+      const own = owner[fd] ?? -1
+      let bind = fd
+      const fdn = P.nodes[fd]
+      if fdn is FuncDecl {
+        if fdn.fnName == "" { bind = par[fd] ?? -1 }
+      }
+      const scoped = own >= 0 && own != bind
+      let ri = 0
+      while ri < reads.length && !drop[k] {
+        const r = reads[ri]
+        const id = P.nodes[r]
+        let mine = false
+        if id is Ident { mine = id.identName == nlnUse[k] }
+        if id is Member { mine = id.memProp == nlnUse[k] }
+        if mine && (!scoped || readOwner[ri] == own) {
+          if (
+            !numLitFnReadNamed(r, nlnAnn[k])
+            && !numLitFnCallAccepts(r, nlnWant[k], par)
+          ) {
+            drop[k] = true
+          }
+        }
+        ri = ri + 1
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Is the read `r` the callee of a call whose result keeps its value at type `s` wherever it goes:
+// discarded as a statement, a `print` argument, an argument whose parameter takes `s`, an
+// annotated `let` that takes `s`, or the return of a function whose declared return takes `s`?
+// Anything else (a cast, an operator, an inferred return or binding) refutes the note (D3070).
+function numLitFnCallAccepts(r: i32, s: i32, par: {[i32]: i32}): boolean {
+  const p = numLitFnCallOf(r, par)
+  if p < 0 { return false }
+  const up = par[p] ?? -1
+  // A top-level statement has no parent here, and its result is discarded.
+  if up < 0 { return true }
+  const un = P.nodes[up]
+  if un is Block {
+    const n = un.blkStmts.length
+    if n > 0 && un.blkStmts[n - 1] != p { return true }
+    return numLitIsFnTail(p, up, par) && numLitFnRetTakes(up, s, par)
+  }
+  if un is LetDecl {
+    const lt = nodeTyIxOf(un.letType)
+    return un.letInit == p && un.letType >= 0 && lt >= 0 && assignable(s, lt)
+  }
+  if un is RetStmt { return numLitFnRetTakes(up, s, par) }
+  numLitFnArgTakes(up, p, s)
+}
+
+// Is `c` an argument of call `p` that `print` takes, or whose non-generic parameter takes `s`?
+function numLitFnArgTakes(p: i32, c: i32, s: i32): boolean {
+  const pn = P.nodes[p]
+  if pn is Call {
+    if pn.callFn == c { return false }
+    const cf = P.nodes[parenPeelIx(pn.callFn)]
+    if cf is Ident {
+      if cf.identName == "print" && pn.callArgs.length == 1 { return true }
+    }
+    const ft = nodeTyIxOf(pn.callFn)
+    if ft < 0 || ft >= T.tys.length { return false }
+    const ftt = T.tys[ft]
+    if ftt is TyFunc {
+      let i = 0
+      while i < pn.callArgs.length && i < ftt.fnParamTypes.length {
+        if pn.callArgs[i] == c {
+          return numLitParamTakes(ftt.fnParamTypes[i], s)
+        }
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+// Does the function the node `p` sits in declare a return type that takes `s`? An inferred return
+// follows the value, so the suggestion would change it: no.
+function numLitFnRetTakes(p: i32, s: i32, par: {[i32]: i32}): boolean {
+  let f = p
+  let k = 0
+  while f >= 0 && k < 4096 {
+    const fd = P.nodes[f]
+    if fd is FuncDecl {
+      if fd.fnRet < 0 { return false }
+      const ft = nodeTyIxOf(f)
+      if ft < 0 || ft >= T.tys.length { return false }
+      const ftt = T.tys[ft]
+      if ftt is TyFunc { return numLitParamTakes(ftt.fnRet, s) }
+      return false
+    }
+    f = par[f] ?? -1
+    k = k + 1
+  }
+  false
+}
+
+// Would the store of `v` into a slot annotated `want` be refused? A list value is compared by
+// element; an integer literal fits every numeric type, a float literal only a float.
+function numLitStoreRefused(v: i32, want: i32, wholeList: boolean): boolean {
+  let vt = nodeTyIxOf(parenPeelIx(v))
+  if vt < 0 || want < 0 { return false }
+  vt = widenLitTy(vt)
+  if vt < 0 || vt >= T.tys.length { return false }
+  if wholeList {
+    const vtt = T.tys[vt]
+    if P.nodes[parenPeelIx(v)] is ArrayLit {
+      if vtt is TyArray { vt = vtt.aElem } else { return false }
+    } else {
+      if vtt is TyArray { return !tySame(vtt.aElem, want) }
+      return false
+    }
+  }
+  if exprIsNumLit(v) { return vt == TY_F64 && want != TY_F32 && want != TY_F64 }
+  !assignable(vt, want)
+}
+
+// Drop the queued store notes (`nlnSlot` non-empty) whose suggested type another store to the
+// same binding and slot would be refused by: a whole or compound assignment, an element or
+// field assignment, or a `push`. By name, within the top-level statement that declares the
+// binding (anywhere, for a module-level one); one walk.
+function numLitAsgNotesRefuted(drop: boolean[]) {
+  const names: {[string]: boolean} = Map()
+  const declOwner: i32[] = []
+  let any = false
+  let j = 0
+  while j < nlnSlot.length {
+    declOwner.push(-1)
+    if nlnSlot[j] != "" {
+      names[nlnUse[j]] = true
+      any = true
+    }
+    j = j + 1
+  }
+  if !any { return 0 }
+  // Each store to a queued name: its name, slot, value, and the top-level statement it sits in.
+  const sName: string[] = []
+  const sSlot: string[] = []
+  const sVal: i32[] = []
+  const sOwner: i32[] = []
+  const stack: i32[] = []
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
+    stack.pop()
+    owners.pop()
+    let k0 = 0
+    while k0 < nlnDecl.length {
+      if nlnDecl[k0] == ix { declOwner[k0] = own }
+      k0 = k0 + 1
+    }
+    const n = P.nodes[ix]
+    let tn = ""
+    let slot = ""
+    let v = -1
+    if n is BinExpr {
+      if n.binOp == "=" {
+        const tgt = P.nodes[parenPeelIx(n.binLeft)]
+        tn = numLitNameAt(n.binLeft)
+        slot = "="
+        if tgt is Index {
+          tn = numLitNameAt(tgt.idxArr)
+          slot = "[]"
+        } else if tgt is Member {
+          tn = numLitNameAt(tgt.memObj)
+          slot = "." + tgt.memProp
+        }
+        v = numLitAssignedValue(n)
+      }
+    } else if n is Call {
+      const cf = P.nodes[parenPeelIx(n.callFn)]
+      if cf is Member && cf.memProp == "push" && n.callArgs.length > 0 {
+        tn = numLitNameAt(cf.memObj)
+        slot = "[]"
+        v = n.callArgs[0]
+      }
+    }
+    if tn != "" && (names[tn] ?? false) {
+      sName.push(tn)
+      sSlot.push(slot)
+      sVal.push(v)
+      sOwner.push(own)
+    }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length {
+        stack.push(c)
+        owners.push(own)
+      }
+    }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    const ks = nlnSlot[k]
+    // A module-level declaration is its own top-level statement, and any store may reach it.
+    const scoped = declOwner[k] >= 0 && declOwner[k] != nlnDecl[k]
+    let si = 0
+    while ks != "" && si < sName.length {
+      if sName[si] == nlnUse[k] && (!scoped || sOwner[si] == declOwner[k]) {
+        // A list's note (`[]` or `=[]`) is refuted by an element store or a whole one.
+        const slot = sSlot[si]
+        const listNote = ks == "[]" || ks == "=[]"
+        let hit = false
+        if listNote && (slot == "=" || slot == "[]") {
+          hit = numLitStoreRefused(sVal[si], nlnWant[k], slot == "=")
+        } else if ks == slot {
+          hit = numLitStoreRefused(sVal[si], nlnWant[k], false)
+        }
+        if hit { drop[k] = true }
+      }
+      si = si + 1
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Would the read `r` of a numeric-literal binding still check with the binding annotated `s`?
+// Yes as a cast operand, a `print` argument, an argument whose parameter takes `s`, either side of
+// a store to the binding itself (stores are `numLitAsgNotesRefuted`'s), a comparison operand the
+// other side meets, or an arithmetic operand whose result still fits where it goes; else no.
+function numLitUseAccepts(
+  r: i32,
+  s: i32,
+  nm: string,
+  par: {[i32]: i32},
+  depth: i32,
+): boolean {
+  if depth <= 0 { return false }
+  let c = r
+  let p = par[c] ?? -1
+  while p >= 0 && P.nodes[p] is Paren {
+    c = p
+    p = par[p] ?? -1
+  }
+  if p < 0 { return false }
+  const pn = P.nodes[p]
+  if pn is AsExpr { return true }
+  if pn is Unary {
+    if pn.unOp == "-" { return numLitUseAccepts(p, s, nm, par, depth - 1) }
+    return false
+  }
+  if pn is Call {
+    const cf = P.nodes[parenPeelIx(pn.callFn)]
+    if pn.callFn == c { return false }
+    if cf is Ident {
+      if cf.identName == "print" { return true }
+    }
+    const ft = nodeTyIxOf(pn.callFn)
+    if ft < 0 || ft >= T.tys.length { return false }
+    const ftt = T.tys[ft]
+    if ftt is TyFunc {
+      let i = 0
+      while i < pn.callArgs.length && i < ftt.fnParamTypes.length {
+        // A type parameter takes `s` too, and hands it on to where this walk cannot follow.
+        if pn.callArgs[i] == c {
+          return numLitParamTakes(ftt.fnParamTypes[i], s)
+        }
+        i = i + 1
+      }
+    }
+    return false
+  }
+  if pn is RetStmt || numLitIsFnTail(c, p, par) {
+    return numLitRetTakes(p, s, par)
+  }
+  if pn is BinExpr {
+    if pn.binOp == "=" { return numLitNameAt(pn.binLeft) == nm }
+    // The operand a compound store `nm op= v` reads back is the store's own, graded as a store.
+    const up = par[p] ?? -1
+    if up >= 0 && up < P.nodes.length && pn.binLeft == c {
+      const un = P.nodes[up]
+      if un is BinExpr {
+        if un.binOp == "=" && un.binCompound != "" && un.binRight == p {
+          return numLitNameAt(un.binLeft) == nm
+        }
+      }
+    }
+    let o = pn.binLeft
+    if o == c { o = pn.binRight }
+    let ot = widenLitTy(nodeTyIxOf(o))
+    const on = numLitNameAt(o)
+    if on == nm { ot = s }
+    else if on != "" { ot = nlSugg[on] ?? ot }
+    if ot < 0 || ot >= T.tys.length { return false }
+    const lit = exprIsNumLit(o)
+    const litFits = lit
+      && (tySame(ot, s)
+      || numLitFitsStore(
+      primNameStr(primNameOf(ot)),
+      primNameStr(primNameOf(s)),
+      false,
+    ))
+    const op = pn.binOp
+    // Equality takes a literal at its own default type; ordering adapts it.
+    if op == "==" || op == "!=" {
+      return assignable(ot, s) || assignable(s, ot)
+    }
+    if op == "<" || op == ">" || op == "<=" || op == ">=" {
+      return litFits || assignable(ot, s) || assignable(s, ot)
+    }
+    if !numLitArithOp(op) { return false }
+    let res = -1
+    if litFits || assignable(ot, s) { res = s }
+    else if assignable(s, ot) { res = ot }
+    else { return false }
+    const old = widenLitTy(nodeTyIxOf(p))
+    // An integer `/` or `%` that becomes a float one computes a different value.
+    if (op == "/" || op == "%") && numLitIsInt(old) && !numLitIsInt(res) {
+      return false
+    }
+    if old >= 0 && tySame(res, old) { return true }
+    return numLitUseAccepts(p, res, nm, par, depth - 1)
+  }
+  false
+}
+
+// Does a parameter of type `pt` take a value of type `s`? Never a type parameter's, whose
+// instance would change with the annotation.
+function numLitParamTakes(pt: i32, s: i32): boolean {
+  if pt < 0 || pt >= T.tys.length || tyHasHole(pt) { return false }
+  if T.tys[pt] is TyVar { return false }
+  assignable(s, pt)
+}
+
+// Does the function a return at `p` leaves take `s`? A declared return type decides; an inferred
+// one follows the value, so it takes it.
+function numLitRetTakes(p: i32, s: i32, par: {[i32]: i32}): boolean {
+  let f = p
+  let k = 0
+  while f >= 0 && k < 4096 {
+    const fd = P.nodes[f]
+    if fd is FuncDecl {
+      if fd.fnRet < 0 { return true }
+      const ft = nodeTyIxOf(f)
+      if ft < 0 || ft >= T.tys.length { return false }
+      const ftt = T.tys[ft]
+      if ftt is TyFunc { return numLitParamTakes(ftt.fnRet, s) }
+      return false
+    }
+    f = par[f] ?? -1
+    k = k + 1
+  }
+  false
+}
+
+// Drop each read note whose suggested annotation another read of its binding would refuse: every
+// read of the name within the top-level statement that declares it (anywhere, for a module-level
+// one), other than the reads the notes themselves name, must pass `numLitUseAccepts`. One walk.
+function numLitReadsRefuted(drop: boolean[]) {
+  const names: {[string]: boolean} = Map()
+  let any = false
+  let j = 0
+  while j < nlnSlot.length {
+    if nlnAnn[j] != "" && nlnLeafTy[j] >= 0 {
+      names[nlnUse[j]] = true
+      any = true
+    }
+    j = j + 1
+  }
+  if !any { return 0 }
+  nlSugg = Map()
+  let q = 0
+  while q < nlnAnn.length {
+    if nlnAnn[q] != "" && nlnLeafTy[q] >= 0 && !(nlSugg.has(nlnUse[q])) {
+      nlSugg[nlnUse[q]] = nlnLeafTy[q]
+    }
+    q = q + 1
+  }
+  const par: {[i32]: i32} = Map()
+  const reads: i32[] = []
+  const readOwner: i32[] = []
+  const declOwner: i32[] = []
+  while declOwner.length < nlnDecl.length { declOwner.push(-1) }
+  const stack: i32[] = []
+  const owners: i32[] = []
+  for s in gRootStmts {
+    stack.push(s)
+    owners.push(s)
+  }
+  while stack.length > 0 {
+    const ix = stack[stack.length - 1]
+    const own = owners[owners.length - 1]
+    stack.pop()
+    owners.pop()
+    let k0 = 0
+    while k0 < nlnDecl.length {
+      if nlnDecl[k0] == ix { declOwner[k0] = own }
+      k0 = k0 + 1
+    }
+    const n = P.nodes[ix]
+    if n is Ident {
+      if names[n.identName] ?? false {
+        reads.push(ix)
+        readOwner.push(own)
+      }
+    }
+    for c in nodeChildren(ix) {
+      if c >= 0 && c < P.nodes.length {
+        par[c] = ix
+        stack.push(c)
+        owners.push(own)
+      }
+    }
+  }
+  let k = 0
+  while k < nlnSlot.length {
+    if nlnAnn[k] != "" && nlnLeafTy[k] >= 0 && !drop[k] {
+      const scoped = declOwner[k] >= 0 && declOwner[k] != nlnDecl[k]
+      const s = nlnLeafTy[k]
+      let ri = 0
+      while ri < reads.length && !drop[k] {
+        const r = reads[ri]
+        const id = P.nodes[r]
+        let mine = false
+        if id is Ident { mine = id.identName == nlnUse[k] }
+        if mine && (!scoped || readOwner[ri] == declOwner[k]) {
+          let named = false
+          let m = 0
+          while m < nlnLeaf.length {
+            if nlnLeaf[m] == r && nlnAnn[m] == nlnAnn[k] { named = true }
+            m = m + 1
+          }
+          if !named && !numLitUseAccepts(r, s, nlnUse[k], par, 8) {
+            drop[k] = true
+          }
+        }
+        ri = ri + 1
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Append each queued note whose diagnostic survived. A read's note is dropped when
+// `numLitNamesStoredNonLit` finds a non-literal store to the binding, under its declared or its
+// used name; a store's note when `numLitAsgNotesRefuted` finds a store its annotation refuses.
+function numLitNotesApply() {
+  if nlnDiag.length == 0 { return 0 }
+  const names: {[string]: boolean} = Map()
+  const lists: {[string]: boolean} = Map()
+  const drop: boolean[] = []
+  let j = 0
+  while j < nlnDiag.length {
+    drop.push(false)
+    if nlnSlot[j] == "" {
+      names[nlnUse[j]] = true
+      const dj = P.nodes[nlnDecl[j]]
+      if dj is LetDecl {
+        names[dj.letName] = true
+        if P.nodes[parenPeelIx(dj.letInit)] is ArrayLit {
+          lists[nlnUse[j]] = true
+          lists[dj.letName] = true
+        }
+      }
+    }
+    j = j + 1
+  }
+  const stored = numLitNamesStoredNonLit(names, lists)
+  numLitAsgNotesRefuted(drop)
+  numLitReadsRefuted(drop)
+  numLitFnNotesRefuted(drop)
+  numLitNotesDisagree(drop)
+  let i = 0
+  while i < nlnDiag.length {
+    const di = nlnDiag[i]
+    const dn = P.nodes[nlnDecl[i]]
+    let keep = di >= 0 && di < T.diags.length && !drop[i]
+    if nlnSlot[i] == "" {
+      keep = keep && !(stored[nlnUse[i]] ?? false)
+      if keep && dn is LetDecl { keep = !(stored[dn.letName] ?? false) }
+    }
+    if keep {
+      const d = T.diags[di]
+      if d.tmsg == nlnMsg[i] { d.tmsg = d.tmsg + nlnText[i] }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Canonicalizes one inline `{…}` shape name (an object or a map): each field/key/value type
+// recurses through `canonEmitName`, rebuilt with the parser's exact conventions (no spaces),
+// so a shape with no literal field is reproduced unchanged. Takes no `ctx` of its own and
+// needs none — a field is a field and a map value is a map value regardless of the shape's own position.
+function canonShapeName(name: string) {
+  // A map `{[K]:V}` — the open, key-end walk and two cuts are the map-name grammar's, at
+  // its home. The caller has already established the closing `}` (`canonEmitNameAt`'s
+  // brace arm), which is what makes `mapSpellValName`'s span gate a no-op here.
+  if mapSpellKeyEnd(name) >= 0 {
+    return "{["
+      + canonEmitNameAt(mapSpellKeyName(name), RC_MAP_KEY)
+      + "]:"
+      + canonEmitNameAt(mapSpellValName(name), RC_MAP_VAL)
+      + "}"
+  }
+  // The `{…}` shape body, cut at the group-interior home (`tyname.groupInnerOf`). The guard
+  // is the caller's — `canonEmitNameAt`'s brace arm has already established the closing `}`.
+  const inner = groupInnerOf(name)
+  // A `{[`-opening name whose key never closes into a `]:` is not a map and not an object
+  // shape either — returned untouched.
+  if nameIsMapOpen(name) { return name }
+  // An object shape `{f:T,…}`: split the interior at its top-level commas, canon
+  // each field's type past its first top-level `:`.
+  let out = "{"
+  let start = 0
+  let going = true
+  while going {
+    let end = tyTopIndexOf(inner, ',', 0, start)
+    if end < 0 {
+      end = inner.length
+      going = false
+    }
+    const field = inner.slice(start, end)
+    const colonAt = tyTopIndexOf(field, ':', 0, 0)
+    if start > 0 { out = out + "," }
+    if colonAt >= 0 {
+      // The field-colon cut at its home (`tyname.fieldNameOf`/`fieldTypeTextOf`), the one
+      // writing that keeps the delimiter: rebuilding the shape text needs the `:` back, so
+      // the name half is taken at `colonAt + 1` — the same home at a different index.
+      out = out
+        + fieldNameOf(field, colonAt + 1)
+        + canonEmitNameAt(fieldTypeTextOf(field, colonAt), RC_FIELD)
+    } else {
+      out = out + field
+    }
+    start = end + 1
+  }
+  out + "}"
+}
+
+// The structural emit name of a generic-alias application standing as one member of a
+// multi-member declared union (`type U = Box<i32> | Tag` → "{v:i32}"), or "" otherwise —
+// without it `collectU`'s `isStructAtom` check (which reads `TypeDecl` names, never
+// `Box<i32>`) drops the member from `uVariants` while the alias still registers, silent invalid wasm at every construction site.
+function unionMemberGenAppShape(member: string) {
+  if !nameIsGenAppOfDecl(member) { return "" }
+  const ti = nameToTy(member)
+  if ti < 0 { return "" }
+  const t = T.tys[ti]
+  if t is TyObj { return tyToEmitName(ti) }
+  ""
+}
+
+// A nullable literal-union's preserved canonical name, or "" if `parts` are not one. `K |
+// null` must keep the litunion members intact, or the generic union soften collapses each
+// quoted literal to `string` and mis-routes the type to the `string | null` ref box instead
+// of the i32 atom niche. Reconstructs as `<litunion-core>|null`.
+function nulLitUnionPreserve(parts: string[], ctx: i32) {
+  let hasNull = false
+  const rest: string[] = []
+  let i = 0
+  while i < parts.length {
+    if parts[i] == "null" { hasNull = true } else { rest.push(parts[i]) }
+    i = i + 1
+  }
+  if !hasNull { return "" }
+  if rest.length == 0 { return "" }
+  let core = rest[0]
+  let j = 1
+  while j < rest.length {
+    core = core + "|" + rest[j]
+    j = j + 1
+  }
+  if nameIsLitUnionType(core) {
+    // The reconstructed name's atom count, banked for `canonEmitName`: `rest` holds
+    // top-level members of the original split and the `null` arm adds one — duplicate
+    // `null` members collapse into the single suffix, so this is `rest.length + 1`, not `parts.length`.
+    nluAtoms = rest.length + 1
+    return core + "|null"
+  }
+  // The same question through one grouping paren. A top-level `|` split hands out a part
+  // still carrying its grouper: `(("a"|"b")|null)[]` splits its element into `("a"|"b")` +
+  // `null`, so `core` arrives grouped and `nameIsLitUnionType` declines it by construction.
+  // Without this, `("a"|"b")[]|null` and `(("a"|"b")|null)[]` canon'd to different spellings for one arena type.
+  if nameIsParenSpanEnds(core) && !isTopLevelFuncTypeName(core) {
+    const iparts: string[] = []
+    tyTopLevelSplit(groupInnerOf(core), '|', false, iparts)
+    const lup = litUnionPreserve(iparts)
+    if lup != "" {
+      // `litUnionPreserve` banks its own width (1 for an alias, one per kept member
+      // otherwise); the `null` arm adds one, exactly as the ungrouped path does.
+      nluAtoms = lupAtoms + 1
+      return lup + "|null"
+    }
+  }
+  // …and through one transparent alias, the third spelling of the same question: `type K2 =
+  // K` denotes the litunion, but `nameIsLitUnionType` reads the alias's own one-member
+  // wrapper, not a litunion, so it declines and canon softened `K2 | null` to `string |
+  // null` — a `{[string]: K2|null}` map built a ref-typed slot while every read lowered the i32 atom, invalid wasm.
+  if isTransparentAlias(core) {
+    const cCore = canonEmitNameAt(core, ctx)
+    if nameIsLitUnionType(cCore) {
+      nluAtoms = canonAtoms + 1
+      return cCore + "|null"
+    }
+  }
+  // A nullable union of literal unions (`K | K2 | null`) deliberately does not flatten
+  // here: `annUnionInnerTy` declines a `null`-carrying annotation, so flattening the
+  // spelling alone would have canon naming an atom niche the arena classifies otherwise.
+  ""
+}
+
+// The survivors of the collapse over a union spelling's top-level `parts`, and whether any
+// arm is dropped. `out` is filled unconditionally, the same contract
+// `unionDropSubsumedArms` keeps. The `string` arm is looked for among non-literal parts
+// only, since flattening a literal member yields its literals, never the base prim.
+function canonDropSubsumedParts(parts: string[], out: string[]): boolean {
+  if parts.length < 2 { return false }
+  const isLit: boolean[] = []
+  let anyLit = false
+  let i = 0
+  while i < parts.length {
+    const l = partIsStrLitSet(parts[i])
+    isLit.push(l)
+    if l { anyLit = true }
+    i = i + 1
+  }
+  // The cheap reject: no literal arm, nothing to subsume. Keeps the extra render that
+  // follows off every ordinary union spelling.
+  if !anyLit { return false }
+  let hasStrArm = false
+  i = 0
+  while i < parts.length {
+    if !isLit[i] {
+      if canonEmitNameAt(parts[i], RC_ROOT) == "string" { hasStrArm = true }
+    }
+    i = i + 1
+  }
+  if !hasStrArm { return false }
+  let dropped = false
+  i = 0
+  while i < parts.length {
+    if isLit[i] { dropped = true } else { out.push(parts[i]) }
+    i = i + 1
+  }
+  // A list that collapses to nothing cannot arise (a dropped arm needs the surviving
+  // `string` arm that subsumed it), but the guard keeps the degenerate case out of the
+  // rejoin — the same length guard `unionDropSubsumedArms` keeps.
+  if out.length == 0 { return false }
+  dropped
+}
+
+// The position-free entry, as `tyToEmitName`'s: `emit_collect.vl` canons a whole render,
+// which is `RC_ROOT` and holds no parser tree by construction.
+export function canonEmitName(name: string) { canonEmitNameAt(name, RC_ROOT) }
+
+// The same rewrite, told the position the name occupies in the annotation around it, and
+// holding no tree — every recursion into a sub-spelling enters here, since a canon arm cuts
+// a substring and the parser banked a root only for the whole one.
+function canonEmitNameAt(name: string, ctx: i32) {
+  canonEmitNameTs(name, ctx, -1)
+}
+
+// The same rewrite, told the parser's spelling root for `name` — `canonEmitTypeNames`'s two
+// rewrite sites are the only callers holding one. Consumed by exactly one arm, the
+// intersection fold, since that is the only place canon still asks the checker to resolve a
+// whole annotation spelling; everything else is a leaf question or a recursion with no root to hand.
+function canonEmitNameTs(name: string, ctx: i32, root: i32) {
+  canonAtomsSet(1)
+  if name.length == 0 { return name }
+  // `Map<K, V>` / `Set<T>`, at any depth, reach the emitter as the index signature they denote.
+  const bcn = builtinCollNorm(name)
+  if bcn != name { return canonEmitNameTs(bcn, ctx, -1) }
+  // A single-member union alias is transparent — render its member first, ahead of the
+  // `nameNeedsCanon` early-out that would otherwise return the bare alias name unchanged.
+  // Transparency doesn't move the name, so this can render at `ctx` rather than at `RC_ROOT`.
+  const smt = singleMemberAliasTyIx(name)
+  if smt >= 0 {
+    // A declared union of declared structs renders as its member spellings, never as their
+    // shapes (`declaredStructUnionMembers`), reached both from an inline `Shape | null`
+    // annotation and from a `null`-inside-declaration form. Without it the structural render
+    // drops the arm names, so an inline object literal falls to a global field-set scan (D1172).
+    const dsu = declaredStructUnionMembers(name)
+    if dsu != "" {
+      canonAtomsSet(tyNameAtoms)
+      return dsu
+    }
+    const smr = transparentMemberEmitName(smt, ctx)
+    // The emptiness guard the predecessor carried implicitly: it tested its own render for
+    // "" and fell through when the member had no emit name at all. Same test, one render
+    // later, so an unnameable member still reaches the arms that follow.
+    if smr != "" {
+      // The render's own atom width, as its producer reported it — the hand-off the
+      // second renderer needs for exactly this purpose.
+      canonAtomsSet(tyNameAtoms)
+      return smr
+    }
+  }
+  // A declared alias for a numeric literal union (`type Z = 0 | 1`) denotes its base scalar
+  // here, ahead of the `nameNeedsCanon` early-out that would otherwise return the bare alias
+  // name untouched. Untouched, `collectU` registers it in `unNames` so `isUName` claims a
+  // union box while every read lowers the plain i32 — silent invalid wasm, `vl check` clean.
+  if annGenAppSpanEnds(name) {
+    const gLt = gaeLtAt(name)
+    const gArgs: string[] = []
+    // Both cuts are `tyname.gaeHeadNameOf`/`gaeArgsTextOf`, writing both halves.
+    tyTopLevelSplit(gaeArgsTextOf(name, gLt), ',', false, gArgs)
+    let gOut = gaeHeadNameOf(name, gLt) + "<"
+    let gi2 = 0
+    while gi2 < gArgs.length {
+      if gi2 > 0 { gOut = gOut + "," }
+      // An argument stands where the parameter it binds stands, a position this rewrite has
+      // no way to know — `RC_ROOT` is what every other whole-annotation entry uses and what
+      // the argument text arrived carrying.
+      gOut = gOut + canonEmitNameAt(gArgs[gi2], RC_ROOT)
+      gi2 = gi2 + 1
+    }
+    // An application is one atom — its separators all sit inside the `<>`. Set explicitly,
+    // since the argument recursions leave their own widths behind.
+    canonAtomsSet(1)
+    return gOut + ">"
+  }
+  const nla = numLitUnionAliasName(name)
+  if nla != "" {
+    canonAtomsSet(1)
+    return nla
+  }
+  const ola = oneListUnionAliasName(name)
+  if ola != "" {
+    canonAtomsSet(1)
+    return ola
+  }
+  if !nameNeedsCanon(name) { return name }
+  // A top-level union: canon each member and collapse duplicates (a mixed-base union keeps
+  // each softened member). A top-level function type is not a union — its `=>` binds looser
+  // than `|`, so `(i32) => A | B` is a function returning a union, left for the
+  // function-type pass-through, not split here.
+  if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
+    const parts: string[] = []
+    tyTopLevelSplit(name, '|', false, parts)
+    // The subsumed-arm collapse, ahead of every other arm — the mirror of where
+    // `annUnionInnerTy` puts it: `K | string | null` is `string?` exactly as `K | string`
+    // is `string`, so the `| null` preserve must not claim it first. Re-enters on the
+    // survivors (D1048).
+    const dsKept: string[] = []
+    if canonDropSubsumedParts(parts, dsKept) {
+      let dsJoin = dsKept[0]
+      let dsI = 1
+      while dsI < dsKept.length {
+        dsJoin = dsJoin + "|" + dsKept[dsI]
+        dsI = dsI + 1
+      }
+      return canonEmitNameTs(dsJoin, ctx, -1)
+    }
+    // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
+    const nlu = nulLitUnionPreserve(parts, ctx)
+    if nlu != "" {
+      canonAtomsSet(nluAtoms)
+      return nlu
+    }
+    // A pure literal union (`"a" | "b"`) keeps its members too, exactly as the `| null`
+    // sibling does. Without this every member softens to `string` and dedups to one base
+    // scalar, so an inline spelling names a `string` while its `K` alias spelling keeps the
+    // litunion name — two spellings of one type carrying two reps.
+    const lup = litUnionPreserve(parts)
+    // …and a preserve whose answer is a declared alias name is kept at every position
+    // (`ctxKeepsLitUnion`): an ungated preserve reddens a bare inline litunion spelling as a
+    // function param or struct field, whose valtype ladders have an arm for the alias name
+    // and none for the inline spelling. Also required since `annUnionInnerTy` gives `K | K2` the alias's own arena index.
+    if lup != "" {
+      const lupAlias = !nameHasPipe(lup)
+      if ctxKeepsLitUnion(ctx) || lupAlias {
+        canonAtomsSet(lupAtoms)
+        return lup
+      }
+    }
+    const kept: string[] = []
+    // The mixed-union literal-run regroup, on the annotation side: `tyToNameGo`'s union
+    // arm spells a mixed union's string-literal run by its registered alias (`K0 | f64` →
+    // `K0|f64`); without this the same union canon'd to `string|f64` here, since a `K0`
+    // member expands through `unionAliasMembers` and its pure-litunion arena type softens.
+    const rgCls: i32[] = []
+    const rgAlias = mixedUnionLitAliasRegroup(parts, rgCls)
+    let rgDone = false
+    // The position every member below is rendered at. `RC_NULLABLE` is re-derived from a
+    // `null` sibling here, since the flat split has no enclosing nullable node to inherit it
+    // from, and it is or'd with the inherited bit so a nested nullable union stays one.
+    let memCtx = RC_UNION_MEM | (ctx & RC_NULLABLE)
+    if partsHaveNull(parts) { memCtx = memCtx | RC_NULLABLE }
+    // The kept members' atom counts, summed — not `kept.length`. A kept member is normally
+    // one atom, but the union-alias expansion substitutes a whole rendered member set for
+    // one member (`AB` → `A|B`), so `AB | null` joins to a three-atom name.
+    let atoms = 0
+    let i = 0
+    while i < parts.length {
+      // The regrouped run stands at the first literal-derived member's position and the
+      // rest drops — character-for-character what the renderer's `rgDone` does over the
+      // arena's members.
+      if rgAlias != "" && rgCls[i] == LRP_LITS {
+        if !rgDone {
+          rgDone = true
+          // An alias name is one identifier — one atom.
+          kept.push(rgAlias)
+          atoms = atoms + 1
+        }
+        i = i + 1
+        continue
+      }
+      let c = canonEmitNameAt(parts[i], memCtx)
+      let ca = canonAtoms
+      // A union-alias member flattens into this outer union (`AB | null` → `A | B | null`):
+      // a union of unions is one union, so expand the alias to its members, matching the
+      // inline `(A | B) | null` form. A bare `AB` annotation has no top-level `|`, so it
+      // never reaches here.
+      const exp = unionAliasMembers(c)
+      if exp != "" {
+        c = exp
+        // `unionAliasMembers` renders through `tyToEmitName`, which reports the render's
+        // own atom width — the flattened member set is as wide as the alias's union.
+        ca = tyNameAtoms
+      }
+      // A function-type member keeps grouping parens (`((i32) => i32) | null`), so the
+      // rejoined name stays distinct from a function returning a nullable. `canonEmitName`
+      // strips a member's own wrapping parens, so re-add them.
+      if isTopLevelFuncTypeName(c) {
+        c = "(" + c + ")"
+        ca = 1
+      }
+      // Dedupe at the atom, not at the member (D1026): the alias expansion substitutes a
+      // whole member set for one member, so a flattened member can hold several top-level
+      // atoms — comparing whole members cannot see that `"f64|null"` and `"null"` share one.
+      const cAtoms: string[] = []
+      splitUnionAtoms(c, cAtoms)
+      let ci2 = 0
+      while ci2 < cAtoms.length {
+        const cAtom = cAtoms[ci2]
+        let dup = false
+        let j = 0
+        while j < kept.length {
+          if kept[j] == cAtom { dup = true }
+          j = j + 1
+        }
+        if !dup {
+          kept.push(cAtom)
+          if cAtoms.length == 1 {
+            atoms = atoms + ca
+          } else {
+            atoms = atoms + 1
+          }
+        }
+        ci2 = ci2 + 1
+      }
+      i = i + 1
+    }
+    let out = kept[0]
+    let k = 1
+    while k < kept.length {
+      out = out + "|" + kept[k]
+      k = k + 1
+    }
+    canonAtomsSet(atoms)
+    return out
+  }
+  // A top-level intersection: fold through `intersectTy`, then render the fold, unchanged
+  // if unrenderable. The fold asks the parser's spelling tree where one is banked for
+  // `name` (`annotResolve`), re-parsing only where none is. A recursion enters with `root =
+  // -1` and takes the name leg unchanged.
+  if (nameHasSep(name, '&')) {
+    const folded = annotResolve(name, root)
+    if folded >= 0 {
+      // The fold stands exactly where the intersection spelling stood, so the position
+      // passes straight through — `nameToTy` then render, converting by deleting a string
+      // round-trip rather than inventing one.
+      const r = tyToEmitNameAt(folded, ctx)
+      // The fold's render carries its own width — `(0|1|2) & !2` folds to the one-atom
+      // `i32`, but a fold that stays a union renders as one.
+      const ra = tyNameAtoms
+      if r != "" {
+        canonAtomsSet(ra)
+        return r
+      }
+    }
+    // The unchanged name: it reached here with no top-level `|` at all (the union arm
+    // claims every name that has one, bar a top-level function type), so it is one atom.
+    canonAtomsSet(1)
+    return name
+  }
+  // The read-only view's marker leaves the vocabulary here: a view and its list are one
+  // rep, so the emitter spells only the list and every rep-keyed table holds one row for
+  // the pair. The checker raises every refusal the marker buys before this runs.
+  if nameIsReadOnlyList(name) {
+    return canonEmitNameAt(roListInnerName(name), ctx)
+  }
+  // A trailing `[]`: canon the element (no top-level `|`/`&` here, so the suffix binds the
+  // whole core); a union element keeps its grouping parens. Not for a top-level function
+  // type (`(i32) => i32[]`) — there the `[]` binds the return type, so it is a function
+  // returning a list, handled by the function-type pass-through, not an array of functions.
+  const arrCore = arrElemNameRaw(name)
+  if arrCore != "" && !isTopLevelFuncTypeName(name) {
+    const core = canonEmitNameAt(arrCore, RC_ELEM)
+    // The element's own atom width, as the element's producer reported it. A wide element
+    // (more than one top-level atom) is exactly a union element.
+    const coreAtoms = canonAtoms
+    // A list name is one atom in every form — a union element is parenthesized so its
+    // `|`s stop being top-level. Set explicitly, since the element recursion leaves its
+    // width in `canonAtoms`.
+    canonAtomsSet(1)
+    // A union element (`(A|B)[]`) or a function-type element (`((i32) => i32)[]`, distinct
+    // from `(i32) => i32[]`) keeps grouping parens; `canonEmitName` strips a member's own
+    // wrapping parens, so re-add them. Width and `nameHasPipe` disagree on exactly one
+    // shape — a function type whose result is a union — but that shape is claimed by the second test first.
+    if coreAtoms > 1 { return "(" + core + ")[]" }
+    if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
+    return core + "[]"
+  }
+  // A parenthesized group wrapping the whole (no top-level `|`/`&`/`[]` left): strip and
+  // canon the inside. Not for a top-level function type whose return is parenthesized
+  // (`(i32) => ((i32) => i32)`) — its leading `(` wraps only the param list, so a blind
+  // strip corrupts it; such a name keeps its top-level arrow instead.
+  if nameIsParenSpanEnds(name) && !isTopLevelFuncTypeName(name) {
+    // A grouper is not a position: `(X)` stands wherever `X` would, so the ctx rides
+    // through the strip.
+    return canonEmitNameAt(groupInnerOf(name), ctx)
+  }
+  // A top-level function type — any one: canon the param list and the result, re-render
+  // with the result's grouping parens when it is itself a function. Leaving the interior
+  // verbatim forks the two spellings of one closure, since `annRetKind` would make the
+  // `$fnsig` result a union box while the declaration's own softened annotation stays a scalar.
+  if isTopLevelFuncTypeName(name) {
+    // The arrow index the guard just scanned for, not a second scan of the same name for
+    // the same position — nothing runs between the predicate's return and this read.
+    // Both cuts are `tyname.fnParamsTextOf`/`fnRetTextOf`, given that banked index.
+    const fa = funcArrowAt
+    const psStr = fnParamsTextOf(name, fa)
+    let out = "("
+    if psStr.length > 0 {
+      const parts: string[] = []
+      tyTopLevelSplit(psStr, ',', false, parts)
+      let pi = 0
+      while pi < parts.length {
+        if pi > 0 { out = out + "," }
+        out = out + canonEmitNameAt(parts[pi], RC_FN_PARAM)
+        pi = pi + 1
+      }
+    }
+    let rc = canonEmitNameAt(fnRetTextOf(name, fa), RC_FN_RES)
+    if isTopLevelFuncTypeName(rc) { rc = "(" + rc + ")" }
+    // A function type is one atom (params parenthesized, result behind the top-level `=>`
+    // where `unionMemberCount` stops). Set explicitly, since the param/result recursions
+    // leave their own widths behind.
+    canonAtomsSet(1)
+    return out + ")=>" + rc
+  }
+  // A literal member — its base scalar, rendered from the arena rather than by a second
+  // spelling rule. Its dual is the checker's own `softenLitTy`; canon lacked a way to get
+  // an arena type at a leaf, which `litMemberTy` now supplies. Total here, since
+  // `softenLitTy` of a `TyLit` is never `never`, the only prim this renderer has no name for.
+  const lmt = litMemberTy(name)
+  if lmt >= 0 {
+    const lbn = tyToEmitNameAt(softenLitTy(lmt), ctx)
+    // A softened literal is a base scalar — one atom. Set explicitly, since the render
+    // leaves its own width behind in `tyNameAtoms`.
+    canonAtomsSet(1)
+    return lbn
+  }
+  // A residual negation (only meaningful under `&`) — leave for the emitter.
+  if name[0] == '!' { return name }
+  // An inline `{…}` shape: canon its field/value types. The wide brace-endpoint span at its
+  // home in `tyname.vl` is deliberately wide, since `canonShapeName` also handles a map name
+  // (on `{[`), so a tighter test would leave a map's value type un-canonicalized.
+  if nameIsBraceSpanEnds(name) {
+    const shp = canonShapeName(name)
+    // Every separator sits inside the braces — one atom. Set explicitly, since the field
+    // recursions inside `canonShapeName` leave their own widths behind.
+    canonAtomsSet(1)
+    return shp
+  }
+  name
+}
+
+export function canonEmitTypeNames() {
+  // Reset with `annUnionAtoms`, for the same reason: a second program on this instance
+  // must not inherit the first one's node indices.
+  canonRawNodeSet([])
+  canonRawSlotSet([])
+  canonRawTextSet([])
+  canonClearedSet([])
+  canonTyIxColSet([])
+  annUnionAtomsSet(Map())
+  // Before the rewrite loop — the bank holds the declared spellings, which is the whole
+  // point of it.
+  collectGenAliasFieldAnns()
+  let i = 0
+  while i < P.nodes.length {
+    // The atom-count bank: a `TypeRef` banks the count `canonEmitName` reported directly, not
+    // re-derived by scanning the finished string; every other node stays unbanked and reads -1.
+    let atoms = -1
+    const n = P.nodes[i]
+    if n is TypeRef {
+      // This site holds the parser's root for the spelling it is about to rewrite, so it
+      // hands it over instead of leaving the intersection fold — the one arm that still
+      // takes a whole annotation apart — to re-parse it. Read before the rewrite.
+      const c = canonEmitNameTs(n.tyName, RC_ROOT, annTsOf(i))
+      // The rewrite invalidates the parser's spelling tree for this node: canon is not a
+      // rename, so a tree kept past it would describe a different type, not a different
+      // spelling of the same one. Dropped before the assignment so the two never disagree.
+      if c != n.tyName {
+        clearAnnTs(i)
+        canonClearedPush(i)
+        canonTyIxColPush(nameToTy(c))
+        canonBankRaw(i, CANON_SLOT_TY, n.tyName)
+        n.tyName = c
+      }
+      atoms = canonAtoms
+    } else if n is UnionDecl {
+      const vs = n.udVariants
+      let vi = 0
+      while vi < vs.length {
+        // A member spelling is banked on this node in member order (`setUdTs`), so the
+        // intersection fold reads the member's own tree rather than re-parsing the
+        // concatenation — the same read `checkProgram`'s union registration already makes.
+        let c2 = canonEmitNameTs(vs[vi], RC_ROOT, udTsRootAt(i, vi))
+        // A generic-alias application member of a multi-member union resolves to its
+        // structural shape (`unionMemberGenAppShape`), since the emitter has no route to it
+        // under the application name. A one-member union is excluded: that alias is already
+        // transparent on both sides, and expanding it here would double-register the shape.
+        if vs.length >= 2 {
+          const gs = unionMemberGenAppShape(c2)
+          if gs != "" { c2 = gs }
+        }
+        // …and the rewrite drops that root too (`ast.clearUdTs`, `clearAnnTs`'s twin over
+        // the member table).
+        if c2 != vs[vi] {
+          clearUdTs(i, vi)
+          canonBankRaw(i, vi, vs[vi])
+          vs[vi] = c2
+        }
+        vi = vi + 1
+      }
+    } else if n is IsExpr {
+      // `u is Box<i32>` against a union operand: the union's own member rewrites to its
+      // structural shape, so the tested name must follow or the emitter resolves no
+      // variant. Gated on the operand's type being a `TyUnion` (a nullable is excluded); the
+      // same repair applies to a transparent one-member alias, where a stale `is L` names none.
+      const opTy = nodeTyIxOf(n.isObj)
+      if opTy >= 0 {
+        const ot = T.tys[opTy]
+        if ot is TyUnion {
+          // `Map<K, V>` / `Set<T>` inside the tested spelling denote an index signature, the
+          // spelling canon gives the union's own member, so the test names the same arm (D2468).
+          const bci = builtinCollNorm(n.isVariant)
+          if bci != n.isVariant {
+            canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            n.isVariant = bci
+          }
+          const gis = unionMemberGenAppShape(n.isVariant)
+          if gis != "" {
+            if gis != n.isVariant {
+              canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            }
+            n.isVariant = gis
+          }
+          const sit = singleMemberAliasTyIx(n.isVariant)
+          if sit >= 0 {
+            const sir = transparentMemberEmitName(sit, RC_ROOT)
+            if sir != "" {
+              if sir != n.isVariant {
+                canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+              }
+              n.isVariant = sir
+            }
+          }
+          // …and the application rewrite runs after the transparency render too, since the
+          // member arm applies the two in that order: a member spelled `Y` for `type Y =
+          // Box<i32>` lands in `uVariants` as `{v:i32}`, so the `is` test must travel the
+          // same two rungs or it names `Box<i32>` against a variant table holding `{v:i32}`.
+          const gis2 = unionMemberGenAppShape(n.isVariant)
+          if gis2 != "" {
+            if gis2 != n.isVariant {
+              canonBankRaw(i, CANON_SLOT_IS, n.isVariant)
+            }
+            n.isVariant = gis2
+          }
+        }
+      }
+    } else if n is AsExpr {
+      // `x as W` where `W` is a user alias of a numeric scalar (`type W = f64`). Four emit
+      // consumers compare this string to the four primitive spellings, so an alias fell
+      // through every one and the cast emitted invalid wasm for i64/f32/f64 targets. Not
+      // re-derived from the string: `checkCastNode` already banked the checked type on this node.
+
+      // `u8` keeps its spelling: `x as u8` types as `i32`, so canonicalizing the string
+      // would lose the cast's domain and the emitter would lower a full-width narrowing
+      // with no 0..255 test. It is a range inside `i32`, not an alias of it (D1587).
+      const at = primNameOf(nodeTyIxOf(i))
+      const atCanon = at == "i32" || at == "i64" || at == "f32" || at == "f64"
+      if n.asTy != "u8" && atCanon {
+        // `n.asTy` is the author's spelling, a plain string on the node, so the atom is
+        // materialized here rather than the node's field changing type.
+        const ats = primNameStr(at)
+        if ats != n.asTy {
+          canonBankRaw(i, CANON_SLOT_AS, n.asTy)
+          n.asTy = ats
+        }
+      }
+    }
+    if atoms != -1 { annUnionAtomsSetAt(i, atoms) }
+    i = i + 1
+  }
+  0
+}
+
+// Does a write of the value `val` at slot `w` store what the source's own slot cannot hold? A
+// value the source's narrower slot type accepts leaves its rep intact, so only a value that
+// type does not accept (or whose type is unknown) is the hazard. Under a `*` entry every write is.
+function rcwWriteHits(
+  covs: string[],
+  w: string,
+  val: i32,
+  at: i32,
+  root: i32,
+): boolean {
+  if w == "" { return false }
+  // A value the checker typed as an error has already been reported: no verdict from it.
+  if rcwIsErrNode(val) { return false }
+  let i = 0
+  while i < covs.length {
+    const c = covs[i]
+    if c.length > 0 && c[c.length - 1] == '*' {
+      const base = c.slice(0, c.length - 1)
+      if w == base || base == "" || rcwStrictlyUnder(w, base) { return true }
+    } else if rcwPathOf(c) == w {
+      const narrow = rcwTyOf(c)
+      let vt = nodeTyOf(val)
+      if narrow < 0 || vt < 0 || val < 0 { return true }
+      // A value read back out of the same source's own slot holds that slot's source type.
+      const prov = rcwSourceSlotTy(val, root, covs, 0)
+      if prov >= 0 { vt = prov }
+      if !rcwParametricOk(vt, narrow, at) {
+        // A type variable or an error type on either side is unknown here, so it refuses.
+        if rcwTyUnknown(vt) || rcwTyUnknown(narrow) { return true }
+        if !assignable(vt, narrow) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// A list spread at `sp` (`...xs`) hands its elements on at the same element slots: into the
+// list literal it sits in, or as the packed rest argument of the call it sits in. The slots now
+// also hold the literal's other elements, so they are marked mixed.
+function rcwSpreadWrites(sp: i32, covs: string[], depth: i32): boolean {
+  if sp < 0 || sp >= cwIxUpKind.length { return rcwFound(sp) }
+  const k = cwIxUpKind[sp]
+  const up = cwIxUp[sp]
+  if up < 0 || up >= P.nodes.length { return rcwFound(sp) }
+  if k == CW_UP_ELEM {
+    return rcwValueWrites(up, rcwPrefix("", covs, false), depth + 1)
+  }
+  if k == CW_UP_ARG {
+    const cn = P.nodes[up]
+    if cn is Call {
+      return rcwArgWrites(up, cn, cwIxUpAux[sp], covs, depth + 1)
+    }
+  }
+  rcwFound(sp)
+}
+
+// Can the value at expression `v`, carrying the widened slots `covs`, be written at one of
+// them? Climbs the projection chain `v.a[i].b` to the node that consumes it, then asks that
+// consumer — a write target, a binding, a call, a literal, a return. A consumer the occurrence
+// index does not model answers yes, so a gap in the index is a refusal, never a hole.
+function rcwValueWrites(v: i32, covs0: string[], depth: i32): boolean {
+  if covs0.length == 0 { return false }
+  if depth > RCW_DEPTH_LIMIT { return rcwWhyAs(v, RCW_DEPTH) }
+  let node = cwPeel(v)
+  let path = ""
+  let climbing = true
+  while climbing {
+    if node < 0 || node >= cwIxUpKind.length { return rcwFound(v) }
+    climbing = false
+    // An `if` arm's tail is the `if`'s own value: climb without a segment, as a loop so a
+    // long `else if` chain costs no stack.
+    if cwIxUpKind[node] == CW_UP_ARM {
+      node = cwIxUp[node]
+      climbing = true
+    } else if cwIxUpKind[node] == CW_UP_OBJ {
+      const pu = cwIxUp[node]
+      if pu < 0 || pu >= P.nodes.length { return rcwFound(v) }
+      const pn = P.nodes[pu]
+      if pn is Member {
+        if strListHas(getProps, pn.memProp) {
+          if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
+          return false
+        }
+        if pu < cwIxUpKind.length && cwIxUpKind[pu] == CW_UP_CALLEE {
+          return rcwMethodWrites(
+            pu,
+            pn,
+            cwIxUp[pu],
+            rcwUnder(covs0, path),
+            covs0,
+            path,
+            depth,
+          )
+        }
+        path = path + "." + pn.memProp
+        node = pu
+        climbing = true
+      } else if pn is OptMember {
+        if pu < cwIxUpKind.length && cwIxUpKind[pu] == CW_UP_CALLEE {
+          if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
+          return false
+        }
+        path = path + "." + pn.omProp
+        node = pu
+        climbing = true
+      } else if pn is Index {
+        path = path + "[]"
+        node = pu
+        climbing = true
+      } else {
+        if rcwUnder(covs0, path).length > 0 { return rcwFound(pu) }
+        return false
+      }
+    }
+  }
+  const kind = cwIxUpKind[node]
+  const up = cwIxUp[node]
+  if kind == CW_UP_ASG_LHS {
+    const asg = P.nodes[up]
+    let val = -1
+    if asg is BinExpr { val = asg.binRight }
+    if rcwWriteHits(covs0, path, val, up, rcwRootIdent(v)) {
+      return rcwWrote(up)
+    }
+    return false
+  }
+  // A scalar read out of the value holds no slot a store could reach: the path ends here.
+  if path != "" {
+    const rt = nodeTyOf(node)
+    if rt >= 0 && rt < T.tys.length && !rcwIsRefTy(rt) && !rcwTyUnknown(rt) {
+      return false
+    }
+  }
+  const covs = rcwUnder(covs0, path)
+  if covs.length == 0 { return false }
+  if kind == CW_UP_CMP { return false }
+  if kind == CW_UP_CALLEE { return false }
+  if kind == CW_UP_COAL { return rcwValueWrites(cwIxUp[node], covs, depth + 1) }
+  if kind == CW_UP_IS { return false }
+  if kind == CW_UP_NONE { return rcwStmtValueWrites(node, covs, depth) }
+  if kind == CW_UP_SPREAD { return rcwSpreadWrites(up, covs, depth + 1) }
+  if up < 0 || up >= P.nodes.length { return rcwFound(node) }
+  const un = P.nodes[up]
+  if kind == CW_UP_LETINIT {
+    if un is LetDecl {
+      return rcwNameWrites(un.letName, cwFrameOfDecl(up), covs, depth + 1)
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_ASG_RHS {
+    if un is BinExpr { return rcwPlaceWrites(un.binLeft, "", covs, depth + 1) }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_ARG {
+    if un is Call {
+      return rcwArgWrites(up, un, cwIxUpAux[node], covs, depth + 1)
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_FIELD {
+    const fi = P.nodes[cwIxUpAux[node]]
+    if fi is FieldInit {
+      return rcwValueWrites(
+        up,
+        rcwPrefix("." + fi.fiName, covs, true),
+        depth + 1,
+      )
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_ELEM {
+    return rcwValueWrites(up, rcwPrefix("[]", covs, false), depth + 1)
+  }
+  if kind == CW_UP_RET {
+    if up < cwFrameOf.length {
+      return rcwReturnWrites(cwFrameOf[up], up, covs, depth + 1)
+    }
+    return rcwFound(up)
+  }
+  if kind == CW_UP_TAIL { return rcwReturnWrites(up, node, covs, depth + 1) }
+  if kind == CW_UP_ITER {
+    // A list's loop variable is its element and a map's second one its value; both are the
+    // `[]` slot. Asked of both names, since the loop's collection kind is not known yet here.
+    if un is ForIn {
+      const ec = rcwUnder(covs, "[]")
+      const fr = cwFrameOfDecl(up)
+      if rcwNameWrites(un.fiVar, fr, ec, depth + 1) { return true }
+      if un.fiVar2 != "" { return rcwNameWrites(un.fiVar2, fr, ec, depth + 1) }
+      return false
+    }
+    return rcwFound(up)
+  }
+  rcwStmtValueWrites(node, covs, depth)
+}
+
+// A value no index row consumes, climbed through the statements that hold it: a statement that
+// is not its block's last discards its value, a block's last hands it to the block, an `if` arm
+// to the `if`, and a loop body or a top-level statement drops it. Anything else is unmodelled.
+function rcwStmtValueWrites(node: i32, covs: string[], depth: i32): boolean {
+  let n = node
+  while n >= 0 && n < cwIxParent.length {
+    const p = cwIxParent[n]
+    if p < 0 || p >= P.nodes.length { return rcwFound(node) }
+    const step = rcwStmtStep(p, n, node)
+    if step == 1 { return false }
+    if step == 2 { return true }
+    if cwIxUpKind[p] != CW_UP_NONE { return rcwValueWrites(p, covs, depth + 1) }
+    n = p
+  }
+  rcwFound(node)
+}
+
+// A method called on the widened value at `path`: `recv.m(…)`, where `callee` is the `Member`
+// node and `call` the `Call`. A `self`-function is the receiver's parameter 0; a collection
+// method is judged by what it does to the receiver's element slots.
+function rcwMethodWrites(
+  callee: i32,
+  m: Member,
+  call: i32,
+  covs: string[],
+  covs0: string[],
+  path: string,
+  depth: i32,
+): boolean {
+  // A method spelling may reach any `self`-function of that name, merged modules included,
+  // or the collection method of the same name; each reading is asked.
+  const ds = rcwSelfDeclsOf(m.memProp, callee)
+  let di = 0
+  while di < ds.length {
+    if covs.length > 0 && rcwParamWrites(ds[di], 0, covs, depth + 1) {
+      return true
+    }
+    di = di + 1
+  }
+  if rcwStoresElem(m.memProp) {
+    if rcwWriteHits(covs0, path + "[]", rcwStoredArg(call), call, -1) {
+      return rcwWrote(call)
+    }
+    return false
+  }
+  if covs.length == 0 { return false }
+  if rcwReadsOnly(m.memProp) { return false }
+  if rcwReturnsElem(m.memProp) {
+    return rcwValueWrites(call, rcwUnder(covs, "[]"), depth + 1)
+  }
+  // `map` / `filter` hand each element to a callback; `filter`, `slice` and `values` answer a
+  // list of the receiver's own elements, so the result carries the receiver's slots.
+  if m.memProp == "map" || rcwSameElems(m.memProp) {
+    if rcwCallbacksWrite(call, rcwUnder(covs, "[]"), depth) { return true }
+    if m.memProp == "map" { return false }
+    return rcwValueWrites(call, covs, depth + 1)
+  }
+  if ds.length > 0 { return false }
+  rcwFoundCallee(call)
+}
+
+// Each callback argument of the collection call `call`, receiving one element at a time: a
+// lambda written in place or a declared function is followed into its first parameter.
+function rcwCallbacksWrite(call: i32, elemCovs: string[], depth: i32): boolean {
+  if elemCovs.length == 0 { return false }
+  const cn = P.nodes[call]
+  if cn is Call {
+    let i = 0
+    while i < cn.callArgs.length {
+      const a = cwPeel(cn.callArgs[i])
+      if a >= 0 && a < P.nodes.length {
+        if !rcwLeafVacuous(a) || P.nodes[a] is FuncDecl {
+          if rcwCallableWrites(a, call, 0, elemCovs, depth + 1) { return true }
+        }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The value carrying `covs` stored into the place `lhs` (plus the segments `below` it): the
+// place's root binding then holds the widened slots under the place's own path.
+function rcwPlaceWrites(
+  lhs: i32,
+  below: string,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const p = cwPeel(lhs)
+  if p < 0 || p >= P.nodes.length { return rcwFound(lhs) }
+  const n = P.nodes[p]
+  if n is Ident {
+    return rcwNameWrites(
+      n.identName,
+      covarRootFrame(p),
+      rcwPrefix(below, covs, false),
+      depth + 1,
+    )
+  }
+  if n is Member {
+    return rcwPlaceWrites(n.memObj, "." + n.memProp + below, covs, depth + 1)
+  }
+  if n is Index {
+    return rcwPlaceWrites(n.idxArr, "[]" + below, covs, depth + 1)
+  }
+  rcwFound(lhs)
+}
+
+// The widened value passed as argument `argNo` of `call`. A declared function or a lambda
+// bound once is followed into its parameter; a bare intrinsic stores nothing; a storing
+// collection method puts the value in its receiver's element slots; anything else is opaque.
+function rcwArgWrites(
+  callIx: i32,
+  cn: Call,
+  argNo: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  if cwCallNamed(cn.callArgNames) { return rcwFound(callIx) }
+  const cf = cwPeel(cn.callFn)
+  if cf < 0 || cf >= P.nodes.length { return rcwFound(callIx) }
+  const f = P.nodes[cf]
+  if f is Ident {
+    const d = cwCalleeDeclOf(cn.callFn)
+    if d >= 0 { return rcwParamWrites(d, argNo, covs, depth + 1) }
+    // `print` renders its argument and keeps nothing.
+    if (
+      f.identName == "print"
+      && cwFrameOfUse(cf, f.identName) == CW_FR_UNKNOWN
+    ) {
+      return false
+    }
+    // A callee that is a parameter of the enclosing function is whatever its callers pass.
+    return rcwCallableWrites(cf, callIx, argNo, covs, depth + 1)
+  }
+  if f is Member {
+    const ds = rcwSelfDeclsOf(f.memProp, cn.callFn)
+    let di = 0
+    while di < ds.length {
+      if rcwParamWrites(ds[di], argNo + 1, covs, depth + 1) { return true }
+      di = di + 1
+    }
+    if strListHas(getProps, f.memProp) { return rcwFound(callIx) }
+    if rcwStoresElem(f.memProp) {
+      return rcwPlaceWrites(f.memObj, "[]", covs, depth + 1)
+    }
+    if rcwReadsOnly(f.memProp) { return false }
+    if ds.length > 0 { return false }
+  }
+  rcwFoundCallee(callIx)
+}
+
+// The function values the expression `fx` may hold, each asked what it does with its parameter
+// `argNo` given the widened slots: a lambda or a declared function directly, and a parameter of
+// the enclosing function through every call site of that function. `at` names the refusal.
+function rcwCallableWrites(
+  fx: i32,
+  at: i32,
+  argNo: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  if depth > RCW_DEPTH_LIMIT { return rcwWhyAs(at, RCW_DEPTH) }
+  const a = cwPeel(fx)
+  if a < 0 || a >= P.nodes.length { return rcwFoundCallee(at) }
+  const n = P.nodes[a]
+  if n is FuncDecl { return rcwParamWrites(a, argNo, covs, depth + 1) }
+  const d = cwCalleeDeclOf(a)
+  if d >= 0 { return rcwParamWrites(d, argNo, covs, depth + 1) }
+  if n is Ident {
+    const fr = cwFrameOfUse(a, n.identName)
+    if fr >= 0 && fr < P.nodes.length {
+      const k = rcwParamIndexOf(fr, n.identName)
+      if k >= 0 {
+        return rcwParamCallbackWrites(fr, k, at, argNo, covs, depth + 1)
+      }
+    }
+  }
+  rcwFoundCallee(at)
+}
+
+// Parameter `k` of `fnIx` called with the widened value as its argument `argNo`: every call site
+// of `fnIx` names what it passes there.
+function rcwParamCallbackWrites(
+  fnIx: i32,
+  k: i32,
+  at: i32,
+  argNo: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const key = "cb#"
+    + i32ToStr(fnIx)
+    + "#"
+    + i32ToStr(k)
+    + "#"
+    + i32ToStr(argNo)
+    + "#"
+    + rcwKey(covs)
+  const m = rcwMemoGet(key)
+  if m != 0 { return m == 2 }
+  if rcwSeenCut(key) { return false }
+  const cut0 = rcwCut
+  const sites: i32[] = []
+  const bad = rcwCallSites(fnIx, sites)
+  let res = false
+  if bad >= 0 {
+    res = rcwFoundCallee(at)
+  } else {
+    let i = 0
+    while i < sites.length && !res {
+      const c = sites[i] / 2
+      const off = sites[i] % 2
+      const cn = P.nodes[c]
+      if cn is Call {
+        if cwCallNamed(cn.callArgNames) {
+          res = rcwFoundCallee(c)
+        } else if off == 1 && k == 0 {
+          res = rcwFoundCallee(c)
+        } else if k - off < cn.callArgs.length {
+          res = rcwCallableWrites(
+            cn.callArgs[k - off],
+            at,
+            argNo,
+            covs,
+            depth + 1,
+          )
+        }
+      }
+      i = i + 1
+    }
+    if res && sites.length > 1 && rcwVia == "" && rcwWhyKind == RCW_WRITE {
+      rcwViaSet(
+        "the function parameter `"
+          + rcwParamNameOf(fnIx, k)
+          + "` of `"
+          + rcwFnLabel(fnIx)
+          + "`, whose callers' arguments all meet there",
+      )
+    }
+  }
+  rcwMemoPut(key, res, cut0)
+  res
+}
+
+// Parameter `paramIx` of the function `d` receiving the widened value.
+function rcwParamWrites(
+  d: i32,
+  paramIx: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if paramIx < 0 || paramIx >= fd.fnParams.length { return rcwFound(d) }
+    const pn = P.nodes[fd.fnParams[paramIx]]
+    if pn is Param {
+      rcwCtxPush(d, paramIx, covs)
+      const r = rcwNameWrites(pn.parName, d, covs, depth + 1)
+      rcwCtxFnPop()
+      rcwCtxTvPop()
+      rcwCtxNarrowPop()
+      return r
+    }
+  }
+  rcwFound(d)
+}
+
+// Push the context for the widened value entering `d` at parameter `k` carrying `covs`.
+function rcwCtxPush(d: i32, k: i32, covs: string[]) {
+  let tv = ""
+  let narrow = -1
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    const pt = rcwParamTy(d, k)
+    if pt >= 0 {
+      let ti = 0
+      while ti < fd.fnTyParams.length && tv == "" {
+        if rcwTvCount(pt, fd.fnTyParams[ti], 0) > 0 { tv = fd.fnTyParams[ti] }
+        ti = ti + 1
+      }
+    }
+    if tv != "" {
+      const paths: string[] = []
+      if (
+        !rcwTvPaths(pt, tv, "", paths, 0)
+        || paths.length != rcwTvCount(pt, tv, 0)
+        || !rcwTvOnlyAsInput(d, k, tv)
+      ) {
+        tv = ""
+      } else {
+        narrow = rcwCommonNarrow(paths, covs)
+      }
+    }
+    if narrow < 0 { tv = "" }
+  }
+  rcwCtxFnPush(d)
+  rcwCtxTvPush(tv)
+  rcwCtxNarrowPush(narrow)
+  0
+}
+
+// The resolved type of parameter `k` of `d`, or -1 when it has no annotation.
+function rcwParamTy(d: i32, k: i32): i32 {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    if k < 0 || k >= fd.fnParams.length { return -1 }
+    const pn = P.nodes[fd.fnParams[k]]
+    if pn is Param {
+      if pn.parType < 0 || pn.parType >= P.nodes.length { return -1 }
+      const a = P.nodes[pn.parType]
+      if a is TypeRef { return resolveAnnot(a.tyName, fd.fnTyParams) }
+    }
+  }
+  -1
+}
+
+// Whether no parameter of `d` but `k` can supply a `tv` value: each mentions it only as a
+// direct argument type of a function-typed parameter, which the body can pass to but never get
+// back from.
+function rcwTvOnlyAsInput(d: i32, k: i32, tv: string): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    let i = 0
+    while i < fd.fnParams.length {
+      if i != k {
+        const pt = rcwParamTy(d, i)
+        if pt < 0 { return false }
+        if rcwTvCount(pt, tv, 0) > 0 && !rcwTvInputOnly(pt, tv) { return false }
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// The widened value returned by the function `fnIx` (from the node `at`): every call of the
+// function then carries it.
+function rcwReturnWrites(
+  fnIx: i32,
+  _at: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  const key = "ret#" + i32ToStr(fnIx) + "#" + rcwKey(covs) + rcwCtxKey(fnIx)
+  const m = rcwMemoGet(key)
+  if m != 0 { return m == 2 }
+  if rcwSeenCut(key) { return false }
+  const cut0 = rcwCut
+  const sites: i32[] = []
+  const bad = rcwCallSites(fnIx, sites)
+  let res = false
+  if bad >= 0 {
+    res = rcwFound(bad)
+  } else {
+    let i = 0
+    while i < sites.length && !res {
+      res = rcwValueWrites(sites[i] / 2, covs, depth + 1)
+      i = i + 1
+    }
+    if res && sites.length > 1 && rcwVia == "" {
+      rcwViaSet(
+        "the result of `"
+          + rcwFnLabel(fnIx)
+          + "`, whose calls all share what it returns",
+      )
+    }
+  }
+  rcwMemoPut(key, res, cut0)
+  res
+}
+
+// Can the binding `name` in frame `fr`, holding a value with the widened slots `covs`, be
+// written at one of them? Every read of the binding, a captured one included, is a handle.
+function rcwNameWrites(
+  name: string,
+  fr: i32,
+  covs: string[],
+  depth: i32,
+): boolean {
+  if covs.length == 0 { return false }
+  const key = name + "@" + i32ToStr(fr) + "#" + rcwKey(covs) + rcwCtxKey(fr)
+  const m = rcwMemoGet(key)
+  if m != 0 { return m == 2 }
+  if rcwSeenCut(key) { return false }
+  const cut0 = rcwCut
+  // A plain `const b = a` hands `b` exactly these slots; such aliases join a worklist rather
+  // than a recursion, so a long chain of them costs no stack.
+  const names: string[] = [name]
+  const frs: i32[] = [fr]
+  let res = false
+  let i = 0
+  while i < names.length && !res {
+    if i > 0 {
+      const ak = names[i]
+        + "@"
+        + i32ToStr(frs[i])
+        + "#"
+        + rcwKey(covs)
+        + rcwCtxKey(frs[i])
+      const am = rcwMemoGet(ak)
+      if am == 2 { res = true }
+      if am != 0 || rcwSeen.has(ak) {
+        i = i + 1
+        continue
+      }
+      rcwSeenSetAt(ak, true)
+    }
+    let ixA = cwIxFrHead(names[i], frs[i])
+    let ixU = cwIxUnkHead(names[i], frs[i])
+    while (ixA >= 0 || ixU >= 0) && !res {
+      let r = ixA
+      if ixU > ixA {
+        r = ixU
+        ixU = cwIxPNext[ixU]
+      } else {
+        ixA = cwIxFrNext(ixA, frs[i])
+      }
+      if cwIxKind[r] == CW_OCC_USE {
+        const u = cwIxNode[r]
+        const al = rcwPlainAlias(u)
+        if al >= 0 {
+          const ld = P.nodes[al]
+          if ld is LetDecl {
+            names.push(ld.letName)
+            frs.push(cwFrameOfDecl(al))
+          }
+        } else {
+          res = rcwValueWrites(u, covs, depth + 1)
+        }
+      }
+    }
+    i = i + 1
+  }
+  rcwMemoPut(key, res, cut0)
+  res
+}
+
+// Decide every recorded delivery, after adding the ones no assignment check sees: a narrower
+// operand of a join — a list literal's element, an `if` value's arm, a `??` operand, a return
+// of a function whose result type is inferred — is delivered into the joined type.
+function rcwRunPending() {
+  // The joins need only the frame walk; the occurrence index is built when something is left
+  // to decide, which in a program with no covariant record delivery is never.
+  rcwArenaReady()
+  cwBuildFrames()
+  rcwPendJoins()
+  if rcwPendSrc.length == 0 && rcwBdDecl.length == 0 { return 0 }
+  rcwIndexReady()
+  let i = 0
+  while i < rcwPendSrc.length {
+    if rcwCovsWrite(rcwPendSrc[i], weSplit(rcwPendCovs[i])) {
+      rcwErr(rcwPendSrc[i], rcwPendSrcTy[i], rcwPendDstTy[i])
+    }
+    i = i + 1
+  }
+  let b = 0
+  while b < rcwBdDecl.length {
+    rcwBoundDeliveries(
+      rcwBdDecl[b],
+      rcwBdTp[b],
+      rcwBdConc[b],
+      weSplit(rcwBdCovs[b]),
+      rcwBdCall[b],
+    )
+    b = b + 1
+  }
+  0
+}
+
+// Record a join operand `op` delivered into the joined type `j`, when it is assignable there.
+function rcwPendJoinOperand(op: i32, j: i32) {
+  const p = cwPeel(op)
+  if p < 0 || j < 0 || j >= T.tys.length { return 0 }
+  const t = nodeTyOf(p)
+  if t < 0 || t == j || tyEq(t, j) { return 0 }
+  if !assignable(t, j) { return 0 }
+  rcwPend(p, t, j)
+  recJoinCheck(p, t, j)
+}
+
+// Refuses each value an `if`, `match`, `??` or inferred return set hands to its joined list
+// type `j` when the join would store that list's elements differently: that takes a copy,
+// and a list never widens by copying (DECISIONS.md §"No implicit container widening"). A list
+// literal leaf is built at the joined type and needs none (D2838, D2274).
+function listJoinWidenCheck(at: i32, op: i32, j: i32) {
+  if op < 0 || j < 0 || j >= T.tys.length || valDiscarded(at) { return 0 }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  ljwTailSplit(op, j, spine, leaves)
+  for s in spine { ljwWalked.set(s, j) }
+  let i = 0
+  while i < leaves.length {
+    const lf = leaves[i]
+    const n = P.nodes[lf]
+    if n is BinExpr && n.binOp == "??" {
+      listJoinWidenCheck(at, n.binLeft, j)
+      listJoinWidenCheck(at, n.binRight, j)
+    } else if !(n is ArrayLit) && !i32ListHas(ljwReported, lf) {
+      const lt = nodeTyOf(lf)
+      if listJoinStorageDiffers(lt, j, 8) {
+        ljwReported.push(lf)
+        const src = nonNullTy(lt)
+        const dst = nonNullTy(j)
+        // `.map` copies one level, so it is offered only where that level is the one that differs.
+        let hint = ""
+        if listJoinStorageDiffers(src, dst, 1) {
+          hint = containerWidenCopyHint(src, dst)
+        }
+        ljwRefuse(src, dst, sourceBuildTy(dst), hint, lf)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The join refusal: `src` would be held as `dst`, and `build` is what the source should be built as.
+function ljwRefuse(src: i32, dst: i32, build: i32, hint: string, at: i32) {
+  tErr(
+    tyToStr(src)
+      + " is not "
+      + tyToStr(dst)
+      + ": this join would hold both, and a container never widens implicitly. Its "
+      + "elements would be stored differently, so it would be a copy, and a write through "
+      + "either list would not reach the other. Build it as `"
+      + tyToStr(build)
+      + "`"
+      + hint,
+    at,
+  )
+}
+
+// Refuses a spread or list `+` operand `op` copied into a list of element `de` when a level
+// BELOW the copied one is stored differently: the copy converts its own level's scalars
+// (D965), but an element list would have to be copied too (D4861).
+function ljwCopiedLevelCheck(at: i32, op: i32, de: i32) {
+  const p = cwPeel(op)
+  if p < 0 || p >= P.nodes.length || de < 0 || de >= T.tys.length { return 0 }
+  const n = P.nodes[p]
+  if n is ArrayLit {
+    for el in n.arrElems {
+      const en = P.nodes[el]
+      if en is Spread {
+        ljwCopiedLevelCheck(at, en.spdArg, de)
+      } else {
+        listJoinWidenCheck(at, el, de)
+      }
+    }
+    return 0
+  }
+  if i32ListHas(ljwReported, p) { return 0 }
+  const lt = nonNullTy(nodeTyOf(p))
+  if lt < 0 || lt >= T.tys.length { return 0 }
+  const se = arrElemTyOrNone(lt)
+  if se < 0 || !listJoinStorageDiffers(se, de, 8) { return 0 }
+  ljwReported.push(p)
+  ljwRefuse(nonNullTy(se), nonNullTy(de), sourceBuildTy(mkArrayTy(de)), "", p)
+}
+
+// Walk the join sites the occurrence index collected.
+function rcwPendJoins() {
+  ljwWalkedSet(Map())
+  let i = 0
+  while i < cwFrJoins.length {
+    const at = cwFrJoins[i]
+    const n = P.nodes[at]
+    const jt = nodeTyOf(at)
+    if n is ArrayLit {
+      if jt >= 0 && jt < T.tys.length {
+        const at2 = T.tys[jt]
+        if at2 is TyArray {
+          let e = 0
+          while e < n.arrElems.length {
+            const el = P.nodes[n.arrElems[e]]
+            if el is Spread {
+              // A spread operand's elements join the literal's element type: the operand list
+              // is delivered into the literal's own list type.
+              rcwPendJoinOperand(el.spdArg, jt)
+              ljwCopiedLevelCheck(at, el.spdArg, at2.aElem)
+            } else {
+              rcwPendJoinOperand(n.arrElems[e], at2.aElem)
+              listJoinWidenCheck(at, n.arrElems[e], at2.aElem)
+            }
+            e = e + 1
+          }
+        }
+      }
+    } else if n is IfStmt {
+      if jt >= 0 {
+        rcwPendJoinOperand(rcwBlockTail(n.ifThen), jt)
+        listJoinWidenCheck(at, rcwBlockTail(n.ifThen), jt)
+        if n.ifElse >= 0 && n.ifElse < P.nodes.length {
+          if P.nodes[n.ifElse] is IfStmt {
+            rcwPendJoinOperand(n.ifElse, jt)
+            listJoinWidenCheck(at, n.ifElse, jt)
+          } else {
+            rcwPendJoinOperand(rcwBlockTail(n.ifElse), jt)
+            listJoinWidenCheck(at, rcwBlockTail(n.ifElse), jt)
+          }
+        }
+      }
+    } else if n is BinExpr && n.binOp == "+" {
+      const le = if jt >= 0 && jt < T.tys.length { arrElemTyOrNone(jt) } else { -1 }
+      if le >= 0 {
+        ljwCopiedLevelCheck(at, n.binLeft, le)
+        ljwCopiedLevelCheck(at, n.binRight, le)
+      }
+    } else if n is BinExpr {
+      if jt >= 0 {
+        rcwPendJoinOperand(n.binLeft, jt)
+        rcwPendJoinOperand(n.binRight, jt)
+        listJoinWidenCheck(at, n.binLeft, jt)
+        listJoinWidenCheck(at, n.binRight, jt)
+      }
+    } else if n is MatchExpr {
+      if jt >= 0 {
+        let mb = 0
+        while mb < n.matchBodies.length {
+          rcwPendJoinOperand(rcwBlockTail(n.matchBodies[mb]), jt)
+          listJoinWidenCheck(at, rcwBlockTail(n.matchBodies[mb]), jt)
+          mb = mb + 1
+        }
+      }
+    } else if n is FuncDecl {
+      if n.fnRet < 0 {
+        const tail = cwFnTailStmt(at)
+        if tail >= 0 {
+          rcwPendJoinOperand(tail, rcwInferredRetTy(at))
+          listJoinWidenCheck(at, tail, rcwInferredRetTy(at))
+        }
+      }
+    }
+    i = i + 1
+  }
+  let r = 0
+  while r < cwFrRets.length {
+    const ri = cwFrRets[r]
+    const rn = P.nodes[ri]
+    if rn is RetStmt {
+      if rn.retArg >= 0 && ri < cwFrameOf.length {
+        const f = cwFrameOf[ri]
+        if f >= 0 && f < P.nodes.length {
+          const fd = P.nodes[f]
+          if fd is FuncDecl {
+            if fd.fnRet < 0 {
+              rcwPendJoinOperand(rn.retArg, rcwInferredRetTy(f))
+              listJoinWidenCheck(ri, rn.retArg, rcwInferredRetTy(f))
+            }
+          }
+        }
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The delivery seam: `srcExpr` reaching a `dstTy` wider in some field. True when a handle the
+// delivery creates may write a widened slot the source shares; `rcwWhy` then names the node.
+function rcwCovsWrite(srcExpr: i32, covs: string[]): boolean {
+  if srcExpr < 0 || covs.length == 0 { return false }
+  rcwIndexReady()
+  rcwWhySet(-1)
+  rcwWhyKindSet(RCW_OPAQUE)
+  rcwSeenSet(Map())
+  rcwOpenSet(0)
+  rcwViaSet("")
+  rcwCtxFnSet([])
+  rcwCtxTvSet([])
+  rcwCtxNarrowSet([])
+  rcwValueWrites(srcExpr, covs, 0)
+}
+
+// The same question for a handle that is a parameter rather than an expression: the
+// parameter `paramIx` of `d` receiving `srcExpr` under a bound whose field is wider.
+function rcwParamDeliveryWrites(
+  srcExpr: i32,
+  covs0: string[],
+  d: i32,
+  paramIx: i32,
+): boolean {
+  const covs: string[] = []
+  let i = 0
+  while i < covs0.length {
+    if !rcwSlotFresh(srcExpr, rcwPathOf(covs0[i]), 0, 0) { covs.push(covs0[i]) }
+    i = i + 1
+  }
+  if covs.length == 0 { return false }
+  rcwIndexReady()
+  rcwWhySet(-1)
+  rcwWhyKindSet(RCW_OPAQUE)
+  rcwSeenSet(Map())
+  rcwOpenSet(0)
+  rcwViaSet("")
+  rcwCtxFnSet([])
+  rcwCtxTvSet([])
+  rcwCtxNarrowSet([])
+  rcwParamWrites(d, paramIx, covs, 0)
+}
+
+// The refusal, at the delivery, naming the write — or the place the analysis could not follow.
+function rcwErr(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if i32ListHas(rcwReported, srcExpr) { return 0 }
+  rcwReported.push(srcExpr)
+  tErr(
+    "a "
+      + tyToStr(srcTy)
+      + " cannot be delivered as "
+      + tyToStr(dstTy)
+      + " here: "
+      + rcwWhat(srcExpr, "a widened " + rcwSlotNoun(srcTy))
+      + ". A "
+      + rcwValueNoun(srcTy)
+      + " is shared, not copied, so a wider value stored through the "
+      + tyToStr(dstTy)
+      + " would sit in the "
+      + tyToStr(srcTy)
+      + " it came from. "
+      + rcwFixHint(dstTy),
+    srcExpr,
+  )
+  0
+}
+
+// A bounded call `f<G: {x: i32 | string}>(t: G)` given a `{x: i32}`: every parameter typed
+// `G` (or `G[]`) is a handle on the argument at the bound's wider field types. A parameter
+// spelling `G` any other way is not followed, and refuses.
+function rcwBoundDeliveries(
+  declIx: i32,
+  tpName: string,
+  conc: i32,
+  covs: string[],
+  callIx: i32,
+) {
+  const fd = P.nodes[declIx]
+  const cn = P.nodes[callIx]
+  if fd is FuncDecl {
+    if cn is Call {
+      let i = 0
+      while i < fd.fnParams.length {
+        const pn = P.nodes[fd.fnParams[i]]
+        if pn is Param {
+          const spelled = rcwParamSpellsTp(pn.parType, tpName)
+          if spelled != 0 {
+            let arg = callIx
+            if i < cn.callArgs.length && !cwCallNamed(cn.callArgNames) {
+              arg = cn.callArgs[i]
+            }
+            let pc = covs
+            if spelled == 2 { pc = rcwPrefix("[]", covs, true) }
+            let writes = true
+            rcwWhySet(-1)
+            rcwWhyKindSet(RCW_OPAQUE)
+            if spelled != 3 && arg != callIx {
+              writes = rcwParamDeliveryWrites(arg, pc, declIx, i)
+            }
+            if writes { rcwBoundErr(arg, conc) }
+          }
+        }
+        i = i + 1
+      }
+    }
+  }
+  0
+}
+
+// The bound spelling of the refusal.
+function rcwBoundErr(arg: i32, conc: i32) {
+  if i32ListHas(rcwReported, arg) { return 0 }
+  rcwReported.push(arg)
+  tErr(
+    "a "
+      + tyToStr(conc)
+      + " cannot be bound here to a type parameter whose bound declares a wider field: "
+      + rcwWhat(arg, "a field the bound widens")
+      + ". A record is shared, not copied, so a wider value stored through the bound's type "
+      + "would sit in the "
+      + tyToStr(conc)
+      + " it came from. Declare the argument with the bound's field types, pass a fresh copy, "
+      + "or drop the write",
+    arg,
+  )
+  0
+}
+
+// The record storage rule at a join operand: `op`, a `t`, joined into `j`.
+function recJoinCheck(op: i32, t: i32, j: i32) {
+  if !tyHoldsObj(t, 8) || !tyHoldsObj(j, 8) { return 0 }
+  if !recWidenWalk(-1, t, j, 12) { return 0 }
+  shapeAdaptRecStorageSet(false)
+  shapeAdaptSrcTySet(-1)
+  shapeAdaptDstTySet(-1)
+  shapeAdaptSrcExprSet(-1)
+  if recWidenWalk(op, t, j, 12) { objShapeAdapterlessErr(op, t, j) }
+  shapeAdaptRecStorageSet(false)
+  0
+}
+
+// The walk: through `| null`, unions, list elements, map entries and function types to each
+// record pair, judging every literal's parts by their own expressions.
+function recWidenWalk(expr: i32, src: i32, dst: i32, depth: i32): boolean {
+  if src < 0 || dst < 0 || depth <= 0 { return false }
+  if src >= T.tys.length || dst >= T.tys.length { return false }
+  if src == dst { return false }
+  if tyReachesHole(src, 8) || tyReachesHole(dst, 8) { return false }
+  const x = recOriginExpr(expr)
+  // A value `if`, `match` or block delivers each of its tails, each judged by its own origin.
+  if x >= 0 && recIsJoin(x) {
+    const leaves: i32[] = []
+    tailValueLeaves(x, leaves)
+    let li = 0
+    while li < leaves.length {
+      if recWidenWalk(leaves[li], nodeTyIxOf(leaves[li]), dst, depth - 1) {
+        return true
+      }
+      li = li + 1
+    }
+    return false
+  }
+  // A `Map()` or `Set()` is built at the type it flows into, as the container rule has it; a
+  // call of a function with no declared result delivers what that function returns.
+  if x >= 0 {
+    if exprIsCollCtorCall(x) { return false }
+    const fd = recInferredFnOf(x)
+    if fd >= 0 {
+      const rl = recFnValueLeaves(fd)
+      let ri = 0
+      while ri < rl.length {
+        // A local the function also hands elsewhere is shared, so it is judged by its type.
+        const lx = if recLeafEscapes(rl[ri]) { -1 } else { rl[ri] }
+        if recWidenWalk(lx, nodeTyIxOf(rl[ri]), dst, depth - 1) { return true }
+        ri = ri + 1
+      }
+      return false
+    }
+  }
+  // An element read is judged by where its container comes from, and a `??` by both operands.
+  if x >= 0 {
+    const ib = recIndexBase(x)
+    if ib >= 0 { return recElemWalk(ib, src, dst, depth - 1) }
+    const co = recCoalesceOperands(x)
+    if co.length == 2 {
+      return recWidenWalk(co[0], nodeTyIxOf(co[0]), dst, depth - 1)
+        || recWidenWalk(co[1], nodeTyIxOf(co[1]), dst, depth - 1)
+    }
+  }
+  const d = T.tys[dst]
+  const s = T.tys[src]
+  if d is TyNullable {
+    if s is TyNullable {
+      return recWidenWalk(-1, s.nInner, d.nInner, depth - 1)
+    }
+    return recWidenWalk(x, src, d.nInner, depth - 1)
+  }
+  // A `| null` source reaches a non-null place only through `??` or a narrowing: its record is
+  // the one delivered, from the same origin.
+  if s is TyNullable { return recWidenWalk(x, s.nInner, dst, depth - 1) }
+  if s is TyUnion {
+    let i = 0
+    while i < s.uMembers.length {
+      if recWidenWalk(-1, s.uMembers[i], dst, depth - 1) { return true }
+      i = i + 1
+    }
+    return false
+  }
+  if d is TyUnion {
+    // Delivered at a member that accepts it; refused only when every accepting member refuses.
+    let anyClean = false
+    let anyBad = false
+    let i = 0
+    while i < d.uMembers.length {
+      if assignable(src, d.uMembers[i]) {
+        if recWidenWalk(x, src, d.uMembers[i], depth - 1) {
+          anyBad = true
+        } else {
+          anyClean = true
+        }
+      }
+      i = i + 1
+    }
+    return anyBad && !anyClean
+  }
+  match s {
+    TyObj => {
+      return recWidenObj(x, s, src, dst, depth)
+    }
+    TyArray => {
+      return recWidenArray(x, s, dst, depth)
+    }
+    TyMap => {
+      const dm = T.tys[dst]
+      if dm is TyMap {
+        return recWidenWalk(-1, s.mKey, dm.mKey, depth - 1)
+          || recWidenWalk(-1, s.mVal, dm.mVal, depth - 1)
+      }
+      return false
+    }
+    TyFunc => {
+      return recWidenFunc(s, dst, depth)
+    }
+    // A leaf holds no record.
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Judge every queued delivery, and note the ones that adopt a binding or function.
+function recRunPending() {
+  let i = 0
+  while i < recPendSrc.length {
+    // The types alone first: a pair no existing value could be refused at needs no origin.
+    if recWidenWalk(-1, recPendSrcTy[i], recPendDstTy[i], 12) {
+      shapeAdaptRecStorageSet(false)
+      shapeAdaptSrcTySet(-1)
+      shapeAdaptDstTySet(-1)
+      shapeAdaptSrcExprSet(-1)
+      lwStoreDstSet(-1)
+      if recWidenWalk(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i], 12) {
+        objShapeAdapterlessErr(recPendAt[i], recPendSrcTy[i], recPendDstTy[i])
+      }
+      shapeAdaptRecStorageSet(false)
+      recAdoptNote(recPendSrc[i], recPendSrcTy[i], recPendDstTy[i])
+    } else {
+      recOwnPend(recPendSrc[i], recPendSrcTy[i])
+    }
+    i = i + 1
+  }
+  recKeptConflicts()
+  recAnnObjsSet([])
+  recPendSrcSet([])
+  recPendSrcTySet([])
+  recPendDstTySet([])
+  recPendAtSet([])
+  recPendSeenSet(Map())
+  recOwnSrcSet([])
+  recKeptDeclSet([])
+  recKeptDstSet([])
+  recKeptAtSet([])
+  0
+}
+
+// Refuse every own-storage delivery of a value a kept delivery builds at another storage: one
+// value cannot be stored both ways, and a record is shared, not copied.
+function recKeptConflicts() {
+  if recKeptDecl.length == 0 { return 0 }
+  // Two deliveries that build one kept binding at two storages.
+  let i = 0
+  while i < recKeptDecl.length {
+    let j = i + 1
+    while j < recKeptDecl.length {
+      if (
+        recKeptDecl[j] == recKeptDecl[i]
+        && P.nodes[recKeptDecl[i]] is LetDecl
+        && !fieldStorageEq(recKeptDst[i], recKeptDst[j], REC_STORE_DEPTH)
+      ) {
+        recAdRaising = true
+        tErr(
+          recKeptWhat(recKeptDecl[i])
+            + " is built as "
+            + tyToStr(recKeptDst[i])
+            + " where line "
+            + i32ToStr(nodeLineOf(recKeptAt[i]))
+            + " delivers it, and as "
+            + tyToStr(recKeptDst[j])
+            + " where line "
+            + i32ToStr(nodeLineOf(recKeptAt[j]))
+            + " does, which store a field differently; a record is shared, not copied. Annotate "
+            + "it with one of them, and copy it with an object literal for the other",
+          recKeptDecl[i],
+        )
+        recAdRaising = false
+        j = recKeptDecl.length
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  cwIxBuild()
+  for u in recOwnSrc {
+    const d = if recOwnIsPin(u) { -1 } else { recFreshOriginDecl(u, 6) }
+    if d >= 0 {
+      let k = recKeptDecl.length - 1
+      while k >= 0 && recKeptDecl[k] != d { k = k - 1 }
+      if k >= 0 {
+        recAdRaising = true
+        // One delivery in a generic body reaches the value at two instances' types.
+        let how = " where line "
+          + i32ToStr(nodeLineOf(recKeptAt[k]))
+          + " delivers it, and it is handed on here at its own type"
+        if recKeptAt[k] == u {
+          how = " by this delivery at one instance of the generic function around it, and "
+            + "kept at its own type at another"
+        }
+        tErr(
+          recKeptWhat(d)
+            + " is built as "
+            + tyToStr(recKeptDst[k])
+            + how
+            + ", which stores a field differently; a record is shared, not copied, so one "
+            + "value cannot be both. Annotate it with one of the types, and copy it with an "
+            + "object literal for the other",
+          u,
+        )
+        recAdRaising = false
+      }
+    }
+  }
+  0
+}
+
+// A function value: its result covariant, its parameters contravariant.
+function recWidenFunc(s: TyFunc, dst: i32, depth: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyFunc {
+    if s.fnParamTypes.length != d.fnParamTypes.length { return false }
+    if recWidenWalk(-1, s.fnRet, d.fnRet, depth - 1) { return true }
+    let i = 0
+    while i < s.fnParamTypes.length {
+      if recWidenWalk(-1, d.fnParamTypes[i], s.fnParamTypes[i], depth - 1) {
+        return true
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// A record into a record. An object literal is built at the destination, so only its field
+// values are judged; any other record of the same field names is refused when a field's
+// storage differs. Other field-name pairs belong to the width rule.
+function recWidenObj(
+  x: i32,
+  s: TyObj,
+  src: i32,
+  dst: i32,
+  depth: i32,
+): boolean {
+  const d = T.tys[dst]
+  if d is TyObj {
+    let lit = -1
+    if x >= 0 {
+      const ol = P.nodes[x]
+      if ol is ObjLit { lit = x }
+    }
+    if lit >= 0 {
+      let i = 0
+      while i < d.objFieldNames.length {
+        const sf = objFieldType(s, d.objFieldNames[i])
+        if sf >= 0 {
+          const fx = objLitFieldExpr(lit, d.objFieldNames[i])
+          if recWidenWalk(fx, sf, d.objFieldTypes[i], depth - 1) { return true }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    if !objFieldNameSetsEq(src, dst) { return false }
+    const bad = recStorageField(s, d)
+    if bad != "" {
+      shapeAdaptSrcTySet(src)
+      shapeAdaptDstTySet(dst)
+      shapeAdaptSrcExprSet(x)
+      shapeAdaptElemPairSet(false)
+      shapeAdaptWidthFieldSet(false)
+      shapeAdaptRecStorageSet(true)
+      shapeAdaptRecStorageFieldSet(bad)
+      return true
+    }
+  }
+  false
+}
+
+// A list into a list: a list literal's elements by their own expressions, a spread's and any
+// other list's by the element type.
+function recWidenArray(x: i32, s: TyArray, dst: i32, depth: i32): boolean {
+  const d = T.tys[dst]
+  if d is TyArray {
+    if x >= 0 {
+      const lit = P.nodes[x]
+      if lit is ArrayLit { return recWidenLitElems(lit, d.aElem, depth) }
+    }
+    return recWidenWalk(-1, s.aElem, d.aElem, depth - 1)
+  }
+  false
+}
+
+// Each element of the list literal `lit` delivered as a `de`: an element by its own expression,
+// a spread of a list literal by that literal's (D4871), any other spread's by the element type.
+function recWidenLitElems(lit: ArrayLit, de: i32, depth: i32): boolean {
+  let i = 0
+  while i < lit.arrElems.length {
+    const ex = lit.arrElems[i]
+    const el = P.nodes[ex]
+    let et = nodeTyIxOf(ex)
+    let eo = ex
+    const sx = ctorExprOf(spreadArgOf(ex))
+    const sl = if sx >= 0 { P.nodes[sx] } else { el }
+    if sl is ArrayLit && sx >= 0 {
+      if recWidenLitElems(sl, de, depth - 1) { return true }
+      et = -1
+    } else if el is Spread {
+      et = tyArrayElemIx(nodeTyIxOf(el.spdArg))
+      eo = -1
+    }
+    if recWidenWalk(eo, et, de, depth - 1) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// An element `el` (a `src`) read out of the container `box`, delivered as a `dst`. A list
+// literal's elements are judged by their own expressions; a container built by inference (a
+// `Map()`, `Set()` or a call whose result is inferred) holds values built where they are
+// delivered; a join or another element read is followed; anything else is judged by type.
+function recElemWalk(box: i32, src: i32, dst: i32, depth: i32): boolean {
+  if depth <= 0 { return false }
+  const bx = recOriginExpr(box)
+  if bx >= 0 {
+    const b = P.nodes[bx]
+    if b is ArrayLit { return recWidenLitElems(b, dst, depth) }
+    if exprIsCollCtorCall(bx) || recCallResultInferred(bx) { return false }
+    if recIsJoin(bx) {
+      const leaves: i32[] = []
+      tailValueLeaves(bx, leaves)
+      for lf in leaves {
+        if recElemWalk(lf, src, dst, depth - 1) { return true }
+      }
+      return false
+    }
+    const co = recCoalesceOperands(bx)
+    if co.length == 2 {
+      return recElemWalk(co[0], src, dst, depth - 1)
+        || recElemWalk(co[1], src, dst, depth - 1)
+    }
+    const ib = recIndexBase(bx)
+    if ib >= 0 {
+      // A container read out of another: its elements are judged through the outer one.
+      const ob = recOriginExpr(ib)
+      if ob >= 0 {
+        if exprIsCollCtorCall(ob) || recCallResultInferred(ob) { return false }
+        const ol = P.nodes[ob]
+        if ol is ArrayLit {
+          for inner in ol.arrElems {
+            if (
+              !(P.nodes[inner] is Spread)
+              && recElemWalk(inner, src, dst, depth - 1)
+            ) {
+              return true
+            }
+          }
+          return false
+        }
+      }
+    }
+  }
+  recWidenWalk(-1, src, dst, depth - 1)
+}
+
+// The whole-program verdict on a type-parameter `self` (D491), run once at the end of
+// `checkProgram` when every site has been visited: a banked hole-`self` declaration with no
+// site that dispatched to its name, and at least one site that took the language's own
+// lowering. Neither a declaration-site nor call-site rule alone can state this — a call-site version would also refuse `40 + 2` in an unrelated function.
+function checkProgramEndOpDecls() {
+  let i = 0
+  while i < opBinHoleDeclName.length {
+    const nm = opBinHoleDeclName[i]
+    if !strListHas(opBinDispatched, nm) {
+      if strListHas(opBinDeclined, nm) {
+        let why = "`self` has NO ANNOTATION, so its type is inferred and whether it fires is "
+        if opBinHoleDeclAnn[i] {
+          why = "`self` is a TYPE PARAMETER, so whether it fires is "
+        }
+        tErr(
+          "operator `"
+            + nm
+            + "` never dispatches: "
+            + why
+            + "decided at each site — and every `"
+            + nm
+            + "` site in this program took the language's own lowering. Annotate `self` "
+            + "with the object type the operator is for, or remove the declaration",
+          opBinHoleDeclNode[i],
+        )
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A diagnostic anchored at an extern's own name TOKEN. Externs mint no AST node, so `tErr`'s
+// node-to-token resolution has nothing to read and the position is supplied directly.
+function externErr(msg: string, tok: i32) {
+  if tok >= 0 && tok < P.toks.length {
+    return tErrPushTok(msg, -1, tok, "", "")
+  }
+  tErrPush(msg, -1, 0, 0, 0, "", "")
+}
+
+// The type-arena index an `extern function` parameter or return spelling resolves to — the
+// closed set that crosses a host boundary in both hosts (`docs/internals/extern-design.md` §2).
+// Every other spelling is refused here and answers `TY_ERR`, so the declaration still gets a
+// type and no caller holds a sentinel it could forget.
+function externScalarTy(
+  name: string,
+  what: string,
+  spelling: string,
+  tok: i32,
+): i32 {
+  if spelling == "i32" { return TY_I32 }
+  if spelling == "i64" { return TY_I64 }
+  if spelling == "f32" { return TY_F32 }
+  if spelling == "f64" { return TY_F64 }
+  if spelling == "boolean" { return TY_BOOL }
+  // `void` is legal only as the result, which the caller reads before asking here.
+  if spelling == "void" {
+    externErr(
+      "extern `"
+        + name
+        + "` takes `void`, which is not a value — `void` is legal only as an extern's return type",
+      tok,
+    )
+    return TY_ERR
+  }
+  externBadTy(name, what, spelling, tok)
+  TY_ERR
+}
+
+// The one refusal for a type that cannot cross, naming the workaround the design settles on:
+// bytes travel as a `Buf`'s two i32s through the module's exported `memory`.
+function externBadTy(name: string, what: string, spelling: string, tok: i32) {
+  externErr(
+    "extern `"
+      + name
+      + "` "
+      + what
+      + " `"
+      + spelling
+      + "`, which cannot cross a host boundary — an extern carries i32, i64, f32, f64 and boolean "
+      + "only; pass bytes as a `Buf`'s `base` and `length` (two i32s) and read them through the "
+      + "module's exported `memory`",
+    tok,
+  )
+  0
+}
+
+// The refusal for an extern with no return type, naming the fix: an extern has no body to
+// infer a result from, so the author states it, `: void` included.
+function externNoRetErr(name: string, tok: i32) {
+  externErr(
+    "extern `"
+      + name
+      + "` has no return type — an extern has no body to infer one from; write `: void` "
+      + "for an extern that returns nothing",
+    tok,
+  )
+  0
+}
+
+// Declare every `extern function` the module graph carries, and refuse the two shapes that
+// cannot become one import: a type that does not cross, and two declarations of one link name
+// whose signatures disagree. Runs before `checkNode` so a call in any module resolves.
+function checkExternDecls() {
+  // The link rows first: one type check per IMPORT, so an extern declared in two modules is
+  // graded once. `linkTys` is parallel to the link table and read by the declaration loop.
+  const linkTys: i32[] = []
+  let k = 0
+  while k < externCount() {
+    const nm = externNameAt(k)
+    const tok = extPoss[k]
+    if nm == "" {
+      externErr(
+        "`extern function` needs a name — it is the host import's name",
+        tok,
+      )
+    }
+    const ptys: i32[] = []
+    let p = 0
+    const ar = externArityAt(k)
+    while p < ar {
+      ptys.push(externScalarTy(nm, "takes", externParamAt(k, p), tok))
+      p = p + 1
+    }
+    const rs = externRetAt(k)
+    // `: void` is a result-less import. No annotation at all is refused rather than read as
+    // void: an extern has no body to infer a result from, so the author has to say which.
+    let rt = TY_VOID
+    if rs == "" { externNoRetErr(nm, tok) }
+    else if rs != "void" { rt = externScalarTy(nm, "returns", rs, tok) }
+    linkTys.push(mkFuncTy(ptys, rt))
+    k = k + 1
+  }
+  // Then one binding per DECLARATION, under the name the merge left it — so a module-private
+  // extern is private to name lookup while the link it points at stays shared. A declaration
+  // whose signature disagrees with its link row is reported at its own site: same signature is
+  // the supported shape, and only a disagreement has no import section that satisfies both.
+  let d = 0
+  while d < externDeclCount() {
+    const link = extDeclLink[d]
+    if link >= 0 && link < linkTys.length {
+      const dsig = extDeclSig[d]
+      if (
+        extSigs[link] != dsig
+        && dsig.length >= 2
+        && dsig.slice(dsig.length - 2, dsig.length) == "->"
+      ) {
+        // This declaration names no return type while an earlier one does: the fix is the
+        // annotation, not agreement with the other declaration.
+        externNoRetErr(extNames[link], extDeclPos[d])
+      } else if extSigs[link] != dsig {
+        externErr(
+          "extern `"
+            + extNames[link]
+            + "` is declared `"
+            + extDeclSig[d]
+            + "` here and `"
+            + extSigs[link]
+            + "` elsewhere — one name is one host import, so every declaration of it must agree",
+          extDeclPos[d],
+        )
+      }
+      if extDeclVl[d] != "" {
+        declare(extDeclVl[d], linkTys[link])
+        extFnTyMark(linkTys[link])
+      }
+    }
+    d = d + 1
+  }
+  checkExternGlobals()
+  0
+}
+
+// The `extern let` / `extern const` rows: a scalar type, one name per import across both
+// kinds, and every declaration of one name agreeing on type and mutability. The binding
+// itself is an ordinary `LetDecl`, declared by `checkNode` like any module global.
+function checkExternGlobals() {
+  let g = 0
+  while g < extGNames.length {
+    const nm = extGNames[g]
+    let fk = 0
+    while fk < extNames.length {
+      if extNames[fk] == nm {
+        externErr(
+          "extern `"
+            + nm
+            + "` is declared both as a function and as a global — one name is one host import",
+          extPoss[fk],
+        )
+      }
+      fk = fk + 1
+    }
+    g = g + 1
+  }
+  let d = 0
+  while d < extGDeclNode.length {
+    const link = extGDeclLink[d]
+    const tok = extGDeclPos[d]
+    if link >= 0 && link < extGNames.length {
+      const nm = extGNames[link]
+      const ty = extGDeclTy[d]
+      // The closed set is `externScalarTy`'s; a global has no `Buf` workaround to name.
+      if (
+        ty != ""
+        && ty != "i32"
+        && ty != "i64"
+        && ty != "f32"
+        && ty != "f64"
+        && ty != "boolean"
+      ) {
+        externErr(
+          "extern `"
+            + nm
+            + "` is typed `"
+            + ty
+            + "`, which cannot cross a host boundary — "
+            + "an imported global holds i32, i64, f32, f64 or boolean only",
+          tok,
+        )
+      }
+      if extGTys[link] != ty || extGMut[link] != extGDeclMut[d] {
+        externErr(
+          "extern `"
+            + nm
+            + "` is declared `"
+            + externGlobalSig(extGDeclMut[d], ty)
+            + "` here and `"
+            + externGlobalSig(extGMut[link], extGTys[link])
+            + "` elsewhere — one name is one host import, so every declaration of it must agree",
+          tok,
+        )
+      }
+    }
+    d = d + 1
+  }
+  0
+}
+
+// One walk of the program; `initChecker()` must have run first. Every module table this walk
+// fills is emptied there, so a walk over a stale one reads another program's rows.
+export function checkProgramPass(rootIx: i32) {
+  // Read here, after every module parsed: `initChecker` can run before the parse.
+  lpOnSet(brkValSeen || lblBlkSeen)
+  if !checkerArmed {
+    tErr(
+      "internal: checkProgram without initChecker since the previous program",
+      -1,
+    )
+  }
+  checkerArmedSet(false)
+  wsPassReset()
+  recDupFieldErrs()
+  // Before the tables below are sized, so every node it mints is checked (D1991).
+  hoistMatchScrutinees(rootIx)
+  annotateTyArgLambdas()
+  ucCompute(rootIx)
+  const rootN0 = P.nodes[rootIx]
+  if rootN0 is Program { gRootStmtsSet(rootN0.progStmts) }
+  crReset()
+  crProgRoot = rootIx
+  // Size the typed-IR table to the (now fully parsed) node arena, all holes (-1).
+  nodeTyIx = []
+  nodeTyWrites = nodeTyWrites + 1
+  letJoinCandidatesSet([])
+  isVarTyIxSet([])
+  isParentTyIxSet([])
+  isParentElseTyIxSet([])
+  asgNarTyIxSet([])
+  asgStripTysSet([])
+  asgKeepNarrowSet(Map())
+  asgTvWriteSet(Map())
+  narIfEndsSet(Map())
+  narListDeclReadsSet(Map())
+  pgVoidSet([])
+  joinHeadSet([])
+  joinNameSet([])
+  joinTySet([])
+  joinNextSet([])
+  cFuncPinTyIxSet(-1)
+  cObjPinTyIxSet(-1)
+  nodePinKindSet([])
+  nodePinPaySet([])
+  let ntz = 0
+  lbiDefaultExpr = Map()
+  nolLitsSet([])
+  nolTakenSet(Map())
+  ulLitNSet(0)
+  ulTakenSet(Map())
+  nolTakenOtherSet(Map())
+  nolOperandSet(Map())
+  while ntz < P.nodes.length {
+    nodeTyIx.push(-1)
+    const pn = P.nodes[ntz]
+    if pn is Param {
+      if pn.parDefault >= 0 { lbiDefaultExpr[pn.parDefault] = true }
+    }
+    ntz = ntz + 1
+  }
+  isTyColCapSet(P.nodes.length)
+  isVarTyIxCapSet(P.nodes.length)
+  checkExternDecls()
+  checkNode(rootIx)
+  // The global scope (depth 0) is never popped, so flush its un-annotated
+  // empty-collection bindings here: any still-open hole is genuinely uninferable.
+  flushUninferred(0)
+  flushNullOnlyLits()
+  flushContainerNullHoles()
+  // …and with every pin now in, grade what `__array_new_default__` needed to default.
+  checkArrayNewDefaultElems()
+  checkCalleeWrites()
+  synthInlineLitUnionDecls(rootIx)
+  // Rewrite literal/intersection annotation names into the emitter's runtime vocabulary —
+  // membership is already enforced above; names without those constructs are untouched.
+  canonEmitTypeNames()
+  // A20: records each un-annotated function's inferred concrete return name for the emitter
+  // (never the AST, so `fmt` stays oblivious).
+  let ei = 0
+  while ei < topUnannotFns.length {
+    const efn = P.nodes[topUnannotFns[ei]]
+    if efn is FuncDecl {
+      const eft = lookup(efn.fnName)
+      if eft >= 0 {
+        const eftt = T.tys[eft]
+        if eftt is TyFunc { a20RecordFn(efn.fnName, efn, eftt) }
+      }
+    }
+    ei = ei + 1
+  }
+  // D1966 — a nested named function is lifted like a lambda, so its row is keyed by its node.
+  let ni = 0
+  while ni < nestedUnannotFns.length {
+    const nfn = P.nodes[nestedUnannotFns[ni]]
+    const nft = T.tys[nestedUnannotTys[ni]]
+    if nfn is FuncDecl {
+      if nft is TyFunc {
+        a20RecordFn("#" + i32ToStr(nestedUnannotFns[ni]), nfn, nft)
+      }
+    }
+    ni = ni + 1
+  }
+  checkProgramEndOpDecls()
+  recordTopScalars()
+  checkShiftCounts()
+  cexCheckWideLits()
+  rcwRunPending()
+  recRunPending()
+  checkProgramEndGetters()
+  voidRetRewrite()
+  numLitNotesApply()
+  fsbRecheckCalls()
+  T.diags.length
+}
+
+// A literal shift count must be below its operand's width: wasm takes the count modulo the
+// width, so `x << 32` over an `i32` would shift by nothing (D2710). Graded once every literal tree
+// has its destination's width, so `const a: i64 = 1 << 40` is not refused at 32 bits.
+function checkShiftCounts() {
+  const reported: {[i32]: boolean} = Map()
+  let i = 0
+  while i < shiftCountNodes.length {
+    const ix = shiftCountNodes[i]
+    const n = P.nodes[ix]
+    if n is BinExpr {
+      let w = -1
+      const lt = nodeTyOf(n.binLeft)
+      if lt == TY_I32 { w = 32 }
+      if lt == TY_I64 { w = 64 }
+      const lex = intLitLexemeOf(n.binRight)
+      if w > 0 && lex != "" {
+        const neg = intLitIsNegated(n.binRight)
+        if (
+          (neg || !numLexFitsI32(lex) || !cexCountBelow(lex, w))
+          && !(reported[ix] ?? false)
+        ) {
+          reported[ix] = true
+          tErr(shiftCountMsg(n.binOp, lex, neg, w), n.binRight)
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// A20 for one un-annotated function: records its inferred return under `key` for the
+// emitter — its name at top level, `#<nodeIx>` for a nested named function, whose name is
+// not unique and whose binding is gone once its enclosing scope pops (D1966).
+function a20RecordFn(key: string, efn: FuncDecl, eftt: TyFunc) {
+  // A join of `const` literals is recorded as the `string` its reads are (D2157).
+  const er = widenLitTy(eftt.fnRet)
+  // Generic functions skip (a `self` marker, an un-annotated param, or a deferred-join
+  // return) — their type is per-call-site and would export a misleading or wrong name.
+  let generic = false
+  // D1643 — `fnRet` still holds the PENDING sentinel (-2) whenever inference never
+  // patches it, which is every anonymous lambda written as a module-level statement.
+  // Both arena reads take a real index, the gate the recording rung below already has.
+  if er >= 0 {
+    const ert0 = T.tys[er]
+    if ert0 is TyVar { generic = true }
+  }
+  if tyIsDeferredJoin(er) { generic = true }
+  // D970 — an un-annotated param alone does not make a concrete union return generic;
+  // the skip is for a per-call-site return, which a deferred join still is.
+  let retIsConcreteUnion = false
+  if !generic && er >= 0 {
+    const ertU = T.tys[er]
+    if ertU is TyUnion {
+      // Only when the body genuinely returns two different concrete types — a join
+      // over the function's own TyVars must still skip (admitting it produces invalid wasm).
+      if a20RetSetDisagrees(efn.fnBody) { retIsConcreteUnion = true }
+    }
+  }
+  let gp = 0
+  while gp < eftt.fnParamTypes.length {
+    const pt = T.tys[eftt.fnParamTypes[gp]]
+    if pt is TyVar {
+      if !retIsConcreteUnion { generic = true }
+    }
+    if tyIsDeferredJoin(eftt.fnParamTypes[gp]) { generic = true }
+    gp = gp + 1
+  }
+  if !generic && er >= 0 && T.tys[er] is TyArray {
+    if a20RetSetDisagrees(efn.fnBody) { inferJoinListIdx[key] = er }
+  }
+  if !generic && er >= 0 && er != TY_VOID && er != TY_ERR {
+    // Only scalar/string returns are recorded — a structural name (`{x:i32}`, `A|B`,
+    // `Tok[]`) can mis-classify, and the emitter's expression-based fallback covers those.
+    const enm = tyToStructStr(er)
+    // A branded newtype (`type NS = new string`) is minted as a copy of its base `Ty`,
+    // so it renders as its own brand name and is not classifiable without erasure below.
+    let recNm = enm
+    let recTy = er
+    if !isClassifiableRetName(recNm) {
+      const erased = nomErasedTyIx(er)
+      if erased != er {
+        const ernm = tyToStructStr(erased)
+        if isClassifiableRetName(ernm) {
+          recNm = ernm
+          recTy = erased
+        }
+      }
+    }
+    // A numeric literal union (`NK = 0 | 1 | 2`) erases to its base scalar the same
+    // way a brand does — its rep is the base's. `NK[]` is untouched (declined as an array).
+    if !isClassifiableRetName(recNm) {
+      const nlb = numLitUnionBaseTy(er)
+      if nlb >= 0 {
+        const nlnm = tyToStructStr(nlb)
+        if isClassifiableRetName(nlnm) {
+          recNm = nlnm
+          recTy = nlb
+        }
+      }
+    }
+    // D1576 — a never-filled infer-null hole returned is the `null` type too: `let x =
+    // null; return x` hands on `TyNullable(-1)`, which the rung below must also catch.
+    let enmNull = enm == "null"
+    const erNH = T.tys[er]
+    if erNH is TyNullable {
+      if erNH.nInner < 0 { enmNull = true }
+    }
+    if enmNull {
+      // D1567 — a return whose only value is bare `null` is the `null` type (reps as
+      // `nullref`), checked ahead of the erasure rungs since `null` has no classifiable name.
+
+      // The recorded arena type is `TY_NULL`, not `er`: the hole spelling's `er` is
+      // `TyNullable(-1)` itself, and a downstream `T.tys[-1]` read would be out of bounds.
+      recordInferRet(key, "null", TY_NULL, 1, IR_REC_NULL_ONLY)
+    } else if isClassifiableRetName(recNm) {
+      // `isClassifiableRetName`'s admitted set is six scalar spellings plus
+      // `i32[]`/`string[]` — every one of them a single atom (#1115).
+      recordInferRet(key, recNm, recTy, 1, IR_REC_CLASSIFIABLE)
+    } else {
+      // A value union/nullable inferred return lowers through the same `uBoxIdx`
+      // machinery as an annotation — export its name so the return site picks it up.
+      const un = valueUnionRetName(er)
+      if un != "" {
+        recordInferRet(key, un, er, inferRetNameAtoms, IR_RUNG_VALUE_UNION)
+      } else if structUnionRetName(er, gRootStmts) != "" {
+        // A struct union lowers via the same variant-boxed rep as an annotated union;
+        // the width is read from a local AFTER the render (#1115), not argument order.
+        const sun = structUnionRetName(er, gRootStmts)
+        recordInferRet(key, sun, er, inferRetNameAtoms, IR_RUNG_STRUCT_UNION)
+      } else if litUnionAliasNameOfTy(er) != "" {
+        // A pure literal-union inferred return reps as the interned i32 atom, like the
+        // annotated spelling — export the alias name so classification reaches that atom.
+        recordInferRet(
+          key,
+          litUnionAliasNameOfTy(er),
+          er,
+          1,
+          IR_RUNG_LITUNION_ALIAS,
+        )
+      } else if variantBoxUnionRetName(er) != "" {
+        // A variant-box union (`{w:i32} | i32`) lowers un-annotated via the same `>u`
+        // box an annotated spelling interns — export the render so `collectU` registers it.
+        const vbn = variantBoxUnionRetName(er)
+        recordInferRet(key, vbn, er, inferRetNameAtoms, IR_RUNG_VARIANT_BOX)
+      } else if mapUnionRetName(er) != "" {
+        // A union with a map member boxes each arm under its own tag, as the annotated
+        // union does; the join of two map types lands here (D2666).
+        const mun = mapUnionRetName(er)
+        recordInferRet(key, mun, er, inferRetNameAtoms, IR_RUNG_MAP_UNION)
+      } else {
+        // A niche nullable (`boolean | null`, `string | null`) lowers via its sentinel
+        // rep, not the box, so `valueUnionRetName` declines it — export the niche name instead.
+        const ert = T.tys[er]
+        if ert is TyNullable {
+          // Two atoms, written out literally right here (#1115).
+          if tyIsPrimNamed(ert.nInner, "boolean") {
+            recordInferRet(key, "boolean|null", er, 2, IR_RUNG_NULLABLE)
+          } else if tyIsPrimNamed(ert.nInner, "string") {
+            recordInferRet(key, "string|null", er, 2, IR_RUNG_NULLABLE)
+          } else if litUnionAliasNameOfTy(ert.nInner) != "" {
+            // The literal-union niche (`K | null`): an i32 atom with `-1` for null, the
+            // same rep an annotated `: K | null` spelling reaches.
+            recordInferRet(
+              key,
+              litUnionAliasNameOfTy(ert.nInner) + "|null",
+              er,
+              2,
+              IR_RUNG_NUL_LITUNION,
+            )
+          } else {
+            // D887 — the nullable struct ref (`{r:i32} | null`, `P | null`) already has a
+            // rep (`ref.null $S`); `nullableRetName` is the same renderer the lambda ladder uses.
+            const nsn = nullableRetName(er, gRootStmts)
+            if nsn != "" {
+              recordInferRet(key, nsn, er, inferRetNameAtoms, IR_RUNG_NULLABLE)
+            } else {
+              // D1062 — a nullable list at an element type the arm above does not name.
+              // Recorded so `synthNulListRetAnns` can pin the function's own annotation.
+              const nln = nulListRetName(er)
+              if nln != "" {
+                recordInferRet(
+                  key,
+                  nln,
+                  er,
+                  inferRetNameAtoms,
+                  IR_RUNG_NUL_LIST_RET,
+                )
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// A refusal of a call to a named callee, raised once per getter for each callee.
+function getterCallErr(what: string, rule: string, at: i32) {
+  const key = what + "|" + rule
+  let i = 0
+  while i < gwSaid.length {
+    if gwSaid[i] == key { return 0 }
+    i = i + 1
+  }
+  gwSaidPush(key)
+  getterContractErr(what, rule, at)
+}
+
+// One contract refusal, anchored at the offending construct: what the getter does, the rule it
+// breaks, and the method it could be instead.
+function getterContractErr(what: string, rule: string, at: i32) {
+  tErr(
+    "the "
+      + getDeclLabel(getFns[gwRow])
+      + " "
+      + what
+      + ", and "
+      + rule
+      + " — "
+      + getterMethodFix(gwRow),
+    at,
+  )
+  0
+}
+
+// Checks a value node's type against the non-boxing rule, naming the type.
+function gwTypeOk(ix: i32) {
+  if gwDiscarded(ix) { return 0 }
+  const ty = nodeTyIxOf(ix)
+  if ty >= 0 && ty != TY_VOID && !getterRepOk(ty) && gwBoxedFirst(ty) {
+    getterContractErr(
+      "computes a value of type `" + tyToStr(ty) + "`, which is allocated",
+      GW_ALLOC,
+      ix,
+    )
+  }
+  0
+}
+
+// A read of name `nm` at node `ix`: a local or a module `const` is fine; a module `let` is
+// mutable state, and a function named as a value is a function value.
+function gwIdentRead(nm: string, ix: i32) {
+  if gwIsLocal(nm) { return 0 }
+  if fnDeclIx.has(nm) {
+    getterContractErr("uses the function `" + nm + "` as a value", GW_OTHER, ix)
+    return 0
+  }
+  if moduleGlobals[nm] ?? false {
+    if !isConstName(nm) {
+      getterContractErr(
+        "reads the mutable module `let` `" + nm + "`",
+        GW_STATE,
+        ix,
+      )
+    }
+  }
+  0
+}
+
+// One node of a getter body, against the contract. Every AST kind is named: a kind added
+// later reaches the final refusal until someone classifies it (§D3a-contract).
+function gwWalk(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if (
+    n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+  ) {
+    return gwTypeOk(ix)
+  }
+  if n is ErrExpr { return 0 }
+  if n is Ident {
+    gwIdentRead(n.identName, ix)
+    return gwTypeOk(ix)
+  }
+  if n is Paren {
+    gwWalk(n.parInner)
+    return gwTypeOk(ix)
+  }
+  if n is Unary {
+    gwWalk(n.unArg)
+    return gwTypeOk(ix)
+  }
+  if n is IsExpr {
+    gwWalk(n.isObj)
+    return gwTypeOk(ix)
+  }
+  if n is AsExpr {
+    gwWalk(n.asObj)
+    return gwTypeOk(ix)
+  }
+  if n is Member {
+    const gFn = getSiteFnOf(ix)
+    if gFn != "" {
+      const to = getRowOf(gFn)
+      if to >= 0 {
+        getEdgeFromPush(gwRow)
+        getEdgeToPush(to)
+      }
+    }
+    gwWalk(n.memObj)
+    return gwTypeOk(ix)
+  }
+  if n is OptMember {
+    gwWalk(n.omObj)
+    return gwTypeOk(ix)
+  }
+  if n is Index {
+    const idxOp = opIdxFnAtNode(ix)
+    if idxOp != "" {
+      const args: i32[] = [n.idxArr, n.idxIndex]
+      gwOperatorCall(idxOp, args, "calls a user `\"[]\"` operator", ix)
+    } else if gwErasedIs(nodeTyIxOf(n.idxArr)) == "map" {
+      getterContractErr(
+        "indexes the map `"
+          + tyToStr(nodeTyIxOf(n.idxArr))
+          + "`, which hashes and probes in a loop",
+        GW_LOOP,
+        ix,
+      )
+      // The read's `V | null` result would be refused too; the map index is the one fact.
+      gwWalk(n.idxArr)
+      gwWalk(n.idxIndex)
+      return 0
+    }
+    gwWalk(n.idxArr)
+    gwWalk(n.idxIndex)
+    return gwTypeOk(ix)
+  }
+  if n is BinExpr { return gwBinExpr(n, ix) }
+  if n is Call { return gwCall(n, ix) }
+  if n is LetDecl {
+    const lty = getLetTyOf(ix)
+    // A closure initializer is refused as the allocation it is; its type would say it twice.
+    let initIsFn = false
+    if n.letInit >= 0 {
+      const li = P.nodes[n.letInit]
+      if li is FuncDecl { initIsFn = true }
+    }
+    if lty >= 0 && !initIsFn && !getterRepOk(lty) && gwBoxedFirst(lty) {
+      getterContractErr(
+        "declares the local `"
+          + n.letName
+          + "` of type `"
+          + tyToStr(lty)
+          + "`, which is allocated",
+        GW_ALLOC,
+        ix,
+      )
+    }
+    gwWalk(n.letInit)
+    gwLocalsPush(n.letName)
+    return 0
+  }
+  if n is Block {
+    // A block's locals end with it, so a later read of the same name is the outer binding's.
+    const mark = gwLocals.length
+    const blockDiscarded = gwDiscarded(ix)
+    let i = 0
+    while i < n.blkStmts.length {
+      if i < n.blkStmts.length - 1 || blockDiscarded {
+        gwDiscardPush(n.blkStmts[i])
+      }
+      gwWalk(n.blkStmts[i])
+      i = i + 1
+    }
+    while gwLocals.length > mark { gwLocalsPop() }
+    return gwTypeOk(ix)
+  }
+  if n is IfStmt {
+    if gwDiscarded(ix) {
+      gwDiscardPush(n.ifThen)
+      gwDiscardPush(n.ifElse)
+    }
+    gwWalk(n.ifCond)
+    gwWalk(n.ifThen)
+    gwWalk(n.ifElse)
+    return gwTypeOk(ix)
+  }
+  if n is MatchExpr { return gwMatch(n, ix) }
+  if n is RetStmt { return gwWalk(n.retArg) }
+  if n is WhileStmt || n is ForRange || n is ForIn {
+    return getterContractErr("contains a loop", GW_LOOP, ix)
+  }
+  if n is BreakStmt || n is ContinueStmt {
+    return getterContractErr("contains a loop", GW_LOOP, ix)
+  }
+  if n is FuncDecl {
+    return getterContractErr("declares a function, a closure", GW_ALLOC, ix)
+  }
+  if n is ObjLit || n is FieldInit {
+    return getterContractErr("constructs a struct", GW_ALLOC, ix)
+  }
+  if n is ArrayLit || n is Spread {
+    return getterContractErr("constructs a list", GW_ALLOC, ix)
+  }
+  if n is TypeDecl || n is UnionDecl || n is FieldDef {
+    return getterContractErr("declares a type", GW_OTHER, ix)
+  }
+  // A parameter and an annotation are not walked (the parameter list is fixed as `self`), and
+  // a program root or an import cannot appear in a body.
+  if n is Param || n is TypeRef || n is Program || n is ImportDecl {
+    return getterContractErr(
+      "contains a construct the contract does not classify",
+      GW_OTHER,
+      ix,
+    )
+  }
+  getterContractErr(
+    "contains a construct the contract does not classify",
+    GW_OTHER,
+    ix,
+  )
+}
+
+// A binary expression: an assignment may write only the getter's own `let` locals, a string
+// `+` allocates, and an operator dispatched to a user function is a user call.
+function gwBinExpr(n: BinExpr, ix: i32) {
+  if n.binOp == "=" {
+    const tgt = P.nodes[n.binLeft]
+    let ok = false
+    if tgt is Ident { ok = gwIsLocal(tgt.identName) && tgt.identName != "self" }
+    if !ok {
+      getterContractErr(
+        "writes a place that is not one of its own locals",
+        GW_EFFECT,
+        n.binLeft,
+      )
+    }
+    if tgt is Ident { gwTypeOk(n.binLeft) } else { gwWalk(n.binLeft) }
+    gwWalk(n.binRight)
+    return 0
+  }
+  // A template is refused once, at its root: its holes render through `toString` and its
+  // parts concatenate, and naming each of those would bury the one fact that matters.
+  if n.binTpl == 1 {
+    return getterContractErr("uses string interpolation", GW_ALLOC, ix)
+  }
+  if n.binOp == "+" && tyIsPrimNamed(nodeTyIxOf(ix), "string") {
+    gwConcatErr("concatenates strings", n, ix)
+  }
+  if n.binOp == "+" && gwErasedIs(nodeTyIxOf(ix)) == "list" {
+    gwConcatErr("concatenates lists with `+`", n, ix)
+  }
+  if n.binOp == "%" && gwIsFloat(nodeTyIxOf(ix)) {
+    getterContractErr(
+      "takes a float remainder with `%`, which loops as many times as the operands' exponents differ",
+      GW_LOOP,
+      ix,
+    )
+  }
+  if gwIsCompare(n.binOp) && gwStrLitEqLen(n) < 0 {
+    const bad = gwLoopCmpOperand(n.binLeft, n.binRight)
+    if bad >= 0 {
+      getterContractErr(
+        "compares `"
+          + tyToStr(nodeTyIxOf(bad))
+          + "` values with `"
+          + n.binOp
+          + "`, which loops over their contents",
+        GW_LOOP,
+        ix,
+      )
+    }
+  }
+  const opFn = opBinFnAtNode(ix)
+  if opFn != "" {
+    const args: i32[] = [n.binLeft, n.binRight]
+    gwOperatorCall(opFn, args, "calls the user operator `" + n.binOp + "`", ix)
+  }
+  gwWalk(n.binLeft)
+  gwWalk(n.binRight)
+  gwTypeOk(ix)
+}
+
+// Refuses the concatenation at `+` node `ix` unless it is nested in one already refused, and
+// marks its `+` operands as nested, so a chain is one error at its outermost `+`.
+function gwConcatErr(what: string, n: BinExpr, ix: i32) {
+  let inner = false
+  let i = 0
+  while i < gwConcatInner.length {
+    if gwConcatInner[i] == ix { inner = true }
+    i = i + 1
+  }
+  if !inner { getterContractErr(what, GW_ALLOC, ix) }
+  gwConcatMarkInner(n.binLeft)
+  gwConcatMarkInner(n.binRight)
+  0
+}
+
+// A call: an intrinsic the contract admits, or a declared function — directly or by UFCS —
+// whose summary at this call's types writes, allocates and prints nothing and has a step bound
+// (D2136). A getter read is a `Member`, not a call; a method, an extern and a function value
+// are refused.
+function gwCall(n: Call, ix: i32) {
+  const callee = P.nodes[n.callFn]
+  let local = false
+  if callee is Ident { local = gwIsLocal(callee.identName) }
+  let kind = -1
+  if local { kind = 1 }
+  const d = esCalleeDecl(getDecls[gwRow], n, ix, kind)
+  if d >= 0 {
+    const row = esCalleeRow(esDeclRow(getDecls[gwRow]), d, esCallArgs(n))
+    gwCalleeCheck(row, "calls `" + calleeNameOf(ix) + "`", ix)
+    if callee is Member { gwWalk(callee.memObj) }
+  } else if callee is Ident {
+    const nm = callee.identName
+    if externLinkOf(nm) >= 0 {
+      getterCallErr("calls the host function `" + nm + "`", GW_EFFECT, ix)
+    } else if local || (moduleGlobals[nm] ?? false) {
+      getterCallErr("calls the function value `" + nm + "`", GW_CALL, ix)
+    } else if !getterIntrinsicOk(nm) {
+      getterCallErr("calls `" + nm + "`", GW_CALL, ix)
+    }
+  } else if callee is Member {
+    getterCallErr("calls the method `." + callee.memProp + "()`", GW_CALL, ix)
+    gwWalk(callee.memObj)
+  } else {
+    getterContractErr("calls a function value", GW_CALL, ix)
+  }
+  let i = 0
+  while i < n.callArgs.length {
+    gwWalk(n.callArgs[i])
+    i = i + 1
+  }
+  gwTypeOk(ix)
+}
+
+// A user operator or `"[]"` at node `ix`, the function `fn` it dispatches to, called with
+// `args`: admitted on the same summary as any other call.
+function gwOperatorCall(fn: string, args: i32[], what: string, ix: i32) {
+  const d = fnDeclIx[fn] ?? -1
+  if d < 0 {
+    return getterContractErr(what + ", an ordinary function", GW_CALL, ix)
+  }
+  const row = esCalleeRow(esDeclRow(getDecls[gwRow]), d, args)
+  gwCalleeCheck(row, what, ix)
+}
+
+// A `match`: its scrutinee, its payload bindings and its arm bodies; patterns are literals or
+// type names and hold nothing to check.
+function gwMatch(n: MatchExpr, ix: i32) {
+  if gwDiscarded(ix) {
+    let d = 0
+    while d < n.matchBodies.length {
+      gwDiscardPush(n.matchBodies[d])
+      d = d + 1
+    }
+  }
+  gwWalk(n.matchScrut)
+  let i = 0
+  while i < n.matchBinds.length {
+    gwWalk(n.matchBinds[i])
+    i = i + 1
+  }
+  let j = 0
+  while j < n.matchBodies.length {
+    gwWalk(n.matchBodies[j])
+    j = j + 1
+  }
+  gwTypeOk(ix)
+}
+
+// The summary row of declaration `decl` pinned at bindings `names`/`tys`, created on first ask
+// and computed before it is returned. Bindings are keyed by their rendering, so two calls that
+// pin the same types share one row.
+export function esRowFor(decl: i32, names: string[], tys: i32[]): i32 {
+  let key = i32ToStr(decl)
+  let i = 0
+  while i < names.length {
+    key = key + "|" + names[i] + "=" + tyToStr(tys[i])
+    i = i + 1
+  }
+  const hit = esKeyIx[key] ?? -1
+  if hit >= 0 {
+    if esOrder[hit] < 0 { esVisit(hit) }
+    return hit
+  }
+  const r = esDecl.length
+  esKeyIx[key] = r
+  esDecl.push(decl)
+  esBindStart.push(esBindNames.length)
+  esBindCount.push(names.length)
+  let j = 0
+  while j < names.length {
+    esBindNames.push(names[j])
+    esBindTys.push(tys[j])
+    j = j + 1
+  }
+  esCost.push(-1)
+  esWhy.push("")
+  esWrite.push("")
+  esAlloc.push("")
+  esHost.push("")
+  esUnknown.push("")
+  esReadLet.push("")
+  esReadLetVia.push(-1)
+  esWriteLocal.push(false)
+  esWhyVia.push(-1)
+  esWriteVia.push(-1)
+  esAllocVia.push(-1)
+  esHostVia.push(-1)
+  esUnknownVia.push(-1)
+  esOrder.push(-1)
+  esLow.push(-1)
+  esOnStack.push(false)
+  gcTopRow.push(-1)
+  gcTopCount.push(0)
+  gcTopSteps.push(0)
+  gcCmpSteps.push(0)
+  gcCmpCount.push(0)
+  esVisit(r)
+  r
+}
+
+// The unpinned summary row of declaration `decl`: a type parameter no call bound erases as
+// "may loop", so a generic's own row is the worst of its instances.
+export function esDeclRow(decl: i32): i32 {
+  const none: string[] = []
+  const noTys: i32[] = []
+  esRowFor(decl, none, noTys)
+}
+
+// Computes row `r` once, callees first (Tarjan over the instance call graph, §C4). A row on a
+// cycle has no step bound, and every row of one cycle shares the cycle's facts.
+function esVisit(r: i32) {
+  esOrder[r] = esCounter
+  esLow[r] = esCounter
+  esCounter = esCounter + 1
+  esStack.push(r)
+  esOnStack[r] = true
+  const saveFrame = esFrame
+  const saveBase = esScopeBase
+  esFrame = r
+  esScopeBase = esScopeNames.length
+  const mark = gcTrail.length
+  let c = 0
+  const d = P.nodes[esDecl[r]]
+  if d is FuncDecl {
+    let i = 0
+    while i < d.fnParams.length {
+      const p = P.nodes[d.fnParams[i]]
+      if p is Param { esScopePush(p.parName, 0) }
+      i = i + 1
+    }
+    c = gcNode(r, d.fnBody)
+  }
+  gcSummarise(r, mark)
+  while gcTrail.length > mark { gcTrail.pop() }
+  esScopeTruncate(esScopeBase)
+  esScopeBase = saveBase
+  esFrame = saveFrame
+  if esCost[r] < c { esCost[r] = c }
+  if esLow[r] == esOrder[r] { esCloseCycle(r) }
+  0
+}
+
+// The steps node `ix` of row `r`'s body costs, recording the row's facts as it goes. Every AST
+// kind is named; a getter body's refused constructs are costed as what they do, and the body
+// walk's refusal stays the error that program gets.
+function gcNode(r: i32, ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Paren { return gcNode(r, n.parInner) }
+  if n is Unary { return gcNode(r, n.unArg) }
+  if n is AsExpr { return gcNode(r, n.asObj) }
+  if n is IsExpr { return gcAdd(gcNode(r, n.isObj), gcIsLitSteps(n, ix)) }
+  if n is OptMember { return gcNode(r, n.omObj) }
+  if n is Index { return gcIndex(r, n, ix) }
+  if n is LetDecl {
+    const c = gcNode(r, n.letInit)
+    let kind = 1
+    if n.letKw == "const" && esIsBuiltLiteral(n.letInit) { kind = 2 }
+    esScopePush(n.letName, kind)
+    return c
+  }
+  if n is RetStmt { return gcNode(r, n.retArg) }
+  if n is Member { return gcMember(r, n, ix) }
+  if n is BinExpr { return gcBinExpr(r, n, ix) }
+  if n is Call { return gcCall(r, n, ix) }
+  if n is Block {
+    const mark = esScopeNames.length
+    let c = 0
+    let i = 0
+    while i < n.blkStmts.length {
+      c = gcAdd(c, gcNode(r, n.blkStmts[i]))
+      i = i + 1
+    }
+    esScopeTruncate(mark)
+    return c
+  }
+  if n is IfStmt {
+    const arms: i32[] = [n.ifThen, n.ifElse]
+    return gcAdd(gcNode(r, n.ifCond), gcDearest(r, arms))
+  }
+  if n is MatchExpr { return gcMatch(r, n) }
+  if n is WhileStmt {
+    gcNode(r, n.whileCond)
+    gcNode(r, n.whileBody)
+    return esUnbound(r, "it loops (`while`" + esAtLine(ix) + ")", -1)
+  }
+  if n is ForRange {
+    gcNode(r, n.frFrom)
+    gcNode(r, n.frTo)
+    gcNode(r, n.frStep)
+    const mark = esScopeNames.length
+    esScopePush(n.frVar, 1)
+    gcNode(r, n.frBody)
+    esScopeTruncate(mark)
+    return esUnbound(r, "it loops (`for`" + esAtLine(ix) + ")", -1)
+  }
+  if n is ForIn {
+    gcNode(r, n.fiIter)
+    const mark = esScopeNames.length
+    esScopePush(n.fiVar, 1)
+    if n.fiVar2 != "" { esScopePush(n.fiVar2, 1) }
+    gcNode(r, n.fiBody)
+    esScopeTruncate(mark)
+    return esUnbound(r, "it loops (`for … in`" + esAtLine(ix) + ")", -1)
+  }
+  if n is BreakStmt { return 0 }
+  if n is ContinueStmt { return 0 }
+  // A leaf costs nothing.
+  if n is NumLit { return 0 }
+  if n is StrLit { return 0 }
+  if n is CharLit { return 0 }
+  if n is BoolLit { return 0 }
+  if n is NullLit { return 0 }
+  if n is Ident { return gcIdent(r, n, ix) }
+  if n is ErrExpr { return 0 }
+  // A nested function or a lambda builds a closure; its body runs only when it is called.
+  if n is FuncDecl {
+    esSetAlloc(r, "a closure", ix)
+    esScopePush(n.fnName, 3)
+    return 0
+  }
+  if n is ObjLit {
+    esSetAlloc(r, "a struct literal", ix)
+    let c = 0
+    let i = 0
+    while i < n.objFields.length {
+      c = gcAdd(c, gcNode(r, n.objFields[i]))
+      i = i + 1
+    }
+    return c
+  }
+  if n is FieldInit { return gcNode(r, n.fiValue) }
+  if n is ArrayLit {
+    esSetAlloc(r, "a list literal", ix)
+    let c = 0
+    let i = 0
+    while i < n.arrElems.length {
+      c = gcAdd(c, gcNode(r, n.arrElems[i]))
+      i = i + 1
+    }
+    return c
+  }
+  if n is Spread {
+    esSetAlloc(r, "a spread", ix)
+    gcNode(r, n.spdArg)
+    return esUnbound(r, "it copies a list with `...`" + esAtLine(ix), -1)
+  }
+  // Declarations and annotations run nothing.
+  if n is TypeDecl { return 0 }
+  if n is UnionDecl { return 0 }
+  if n is FieldDef { return 0 }
+  if n is Param { return 0 }
+  if n is TypeRef { return 0 }
+  if n is Program { return 0 }
+  if n is ImportDecl { return 0 }
+  0
+}
+
+// An index read: a user `"[]"` operator is a call to it, a map read probes in a loop.
+function gcIndex(r: i32, n: Index, ix: i32): i32 {
+  const c = gcAdd(gcNode(r, n.idxArr), gcNode(r, n.idxIndex))
+  let op = opIdxFnAtNode(ix)
+  const rawTy = nodeTyIxOf(n.idxArr)
+  const recvTy = esShownTy(r, rawTy)
+  if op == "" && esIsTyVar(rawTy) {
+    if esIsTyVar(recvTy) { return gcAdd(c, esOpenOperator(r, "[]", ix)) }
+    op = opIdxFnFor("[]", recvTy)
+  }
+  if op != "" {
+    const args: i32[] = [n.idxArr, n.idxIndex]
+    return gcAdd(c, gcCallDecl(r, fnDeclIx[op] ?? -1, args, ix))
+  }
+  if gwErasedIs(recvTy) == "map" {
+    return esUnbound(
+      r,
+      "it indexes a map, which probes in a loop" + esAtLine(ix),
+      -1,
+    )
+  }
+  c
+}
+
+// A member read: a getter read is a call of that getter.
+function gcMember(r: i32, n: Member, ix: i32): i32 {
+  let c = gcNode(r, n.memObj)
+  const gFn = getSiteFnOf(ix)
+  if gFn != "" {
+    const d = fnDeclIx[gFn] ?? -1
+    if d >= 0 {
+      const to = esDeclRow(d)
+      c = gcAdd(c, gcCharge(r, to))
+    }
+  }
+  c
+}
+
+// A binary expression: an assignment's write, the operators whose lowering allocates or
+// loops, a string-literal compare at the literal's length, and a user operator as a call.
+function gcBinExpr(r: i32, n: BinExpr, ix: i32): i32 {
+  if n.binOp == "=" {
+    // A bare name assigned to is written, not read; a place's object and index are read.
+    let lc = 0
+    if !esIsBareName(n.binLeft) { lc = gcNode(r, n.binLeft) }
+    esAssignWrite(r, n.binLeft)
+    return gcAdd(lc, gcNode(r, n.binRight))
+  }
+  const c = gcAdd(gcNode(r, n.binLeft), gcNode(r, n.binRight))
+  if n.binTpl == 1 {
+    esSetAlloc(r, "string interpolation", ix)
+    return esUnbound(r, "it interpolates a string" + esAtLine(ix), -1)
+  }
+  if n.binOp == "&&" || n.binOp == "||" || n.binOp == "??" { return c }
+  // Inside a generic the operand types are the instance's: the shared node banks no operator
+  // dispatch, so a user operator is resolved here for the bound type, and an unbound type
+  // parameter may be anything.
+  const lt = esShownTy(r, nodeTyIxOf(n.binLeft))
+  const rt = esShownTy(r, nodeTyIxOf(n.binRight))
+  const resTy = esShownTy(r, nodeTyIxOf(ix))
+  let opFn = opBinFnAtNode(ix)
+  if opFn == "" && esBinOverTyVar(n) {
+    if esIsTyVar(lt) || esIsTyVar(rt) {
+      return gcAdd(c, esOpenOperator(r, n.binOp, ix))
+    }
+    opFn = opSelfFnKeyFor(n.binOp, lt)
+  }
+  if opFn != "" {
+    const args: i32[] = [n.binLeft, n.binRight]
+    return gcAdd(c, gcCallDecl(r, fnDeclIx[opFn] ?? -1, args, ix))
+  }
+  if (
+    n.binOp == "+"
+    && (tyIsPrimNamed(resTy, "string") || tyIsPrimNamed(lt, "string"))
+  ) {
+    esSetAlloc(r, "a string concatenation", ix)
+    return esUnbound(r, "it concatenates strings" + esAtLine(ix), -1)
+  }
+  if (
+    n.binOp == "+"
+    && (gwErasedIs(resTy) == "list" || gwErasedIs(lt) == "list")
+  ) {
+    esSetAlloc(r, "a list concatenation", ix)
+    return esUnbound(r, "it concatenates lists" + esAtLine(ix), -1)
+  }
+  if n.binOp == "%" && (gwIsFloat(resTy) || gwIsFloat(lt)) {
+    return esUnbound(r, "it takes a float remainder" + esAtLine(ix), -1)
+  }
+  if gwIsCompare(n.binOp) {
+    const lit = gwStrLitEqLen(n)
+    if lit > 0 {
+      gcTrail.push(0 - lit)
+      return gcAdd(c, lit)
+    }
+    if lit < 0 {
+      const bad = gwLoopCmpOperand(n.binLeft, n.binRight)
+      if bad >= 0 {
+        return esUnbound(
+          r,
+          "it compares `"
+            + tyToStr(esShownTy(r, nodeTyIxOf(bad)))
+            + "` values with `"
+            + n.binOp
+            + "`"
+            + esAtLine(ix),
+          -1,
+        )
+      }
+    }
+  }
+  c
+}
+
+// A call: its receiver and arguments, then the callee — a declared function (directly, by
+// UFCS or through a nested declaration) as a call of its summary, a built-in by what it does,
+// and anything else as a call of unknown effect.
+function gcCall(r: i32, n: Call, ix: i32): i32 {
+  let c = 0
+  const callee = P.nodes[n.callFn]
+  if callee is Member { c = gcNode(r, callee.memObj) }
+  let i = 0
+  while i < n.callArgs.length {
+    c = gcAdd(c, gcNode(r, n.callArgs[i]))
+    i = i + 1
+  }
+  let kind = -1
+  if callee is Ident { kind = esLocalKind(callee.identName) }
+  const local = kind >= 0
+  const d = esCalleeDecl(esDecl[r], n, ix, kind)
+  if d >= 0 { return gcAdd(c, gcCallDecl(r, d, esCallArgs(n), ix)) }
+  if callee is Ident {
+    const nm = callee.identName
+    if !local && !(moduleGlobals[nm] ?? false) {
+      return gcAdd(c, gcBuiltinCall(r, nm, ix))
+    }
+  }
+  if callee is Member {
+    if !esCalleeIsField(callee) {
+      return gcAdd(c, gcBuiltinMethod(r, callee, ix))
+    }
+  }
+  esSetUnknown(r, "a call of a function value", ix)
+  gcAdd(c, esUnbound(r, "it calls a function value" + esAtLine(ix), -1))
+}
+
+// One call from row `r` of declaration `d` with argument nodes `args`: the callee's row at the
+// types this call binds its type parameters to, charged as a call.
+function gcCallDecl(r: i32, d: i32, args: i32[], ix: i32): i32 {
+  if d < 0 {
+    esSetUnknown(r, "a call whose callee is not known", ix)
+    return esUnbound(
+      r,
+      "it calls a function that is not known" + esAtLine(ix),
+      -1,
+    )
+  }
+  gcCharge(r, esCalleeRow(r, d, args))
+}
+
+// The row call arguments `args` from row `r` pin declaration `d` at: each type parameter bound
+// to its argument's type, read through `r`'s own bindings (§C4). An unbound one stays open.
+export function esCalleeRow(r: i32, d: i32, args: i32[]): i32 {
+  const names: string[] = []
+  const tys: i32[] = []
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    const fnTy = lookup(fd.fnName)
+    if fnTy >= 0 && tyHasTyVar(fnTy) {
+      const ft = T.tys[fnTy]
+      if ft is TyFunc {
+        let i = 0
+        while i < ft.fnParamTypes.length && i < args.length {
+          esBindWalk(r, ft.fnParamTypes[i], nodeTyIxOf(args[i]), names, tys, 0)
+          i = i + 1
+        }
+      }
+    }
+  }
+  esRowFor(d, names, tys)
+}
+
+// The dearest of alternative nodes `arms`, keeping only that arm's trail entries.
+function gcDearest(r: i32, arms: i32[]): i32 {
+  const mark = gcTrail.length
+  let best = 0
+  let keep: i32[] = []
+  let a = 0
+  while a < arms.length {
+    const c = gcNode(r, arms[a])
+    if a == 0 || c > best {
+      best = c
+      keep = gcTrail.slice(mark, gcTrail.length)
+    }
+    while gcTrail.length > mark { gcTrail.pop() }
+    a = a + 1
+  }
+  let k = 0
+  while k < keep.length {
+    gcTrail.push(keep[k])
+    k = k + 1
+  }
+  best
+}
+
+// A `match`: its scrutinee, then each string-literal pattern tested in turn when the scrutinee
+// is stored as a string (an undeclared literal union), then its dearest arm. Over a declared
+// literal union the patterns compare by tag and cost nothing.
+function gcMatch(r: i32, n: MatchExpr): i32 {
+  let c = gcNode(r, n.matchScrut)
+  if gwErasedIs(nodeTyIxOf(n.matchScrut)) == "string" {
+    let i = 0
+    while i < n.matchPats.length {
+      const lit = gwStrLitLenOf(n.matchPats[i])
+      if lit > 0 {
+        c = gcAdd(c, lit)
+        gcTrail.push(0 - lit)
+      }
+      i = i + 1
+    }
+  }
+  gcAdd(c, gcDearest(r, n.matchBodies))
+}
+
+// Refuses every getter over the step budget that no other getter over the budget reads, so a
+// chain is one error at its top, naming the path that made the total. A getter with no bound
+// at all is refused where the unbounded construct is, by the body walk or its call check.
+function getterBudgetCheck() {
+  gcCostSet([])
+  const rows: i32[] = []
+  let i = 0
+  while i < getFns.length {
+    const row = esDeclRow(getDecls[i])
+    rows.push(row)
+    gcCostPush(gcCostSoFar(row))
+    i = i + 1
+  }
+  let r = 0
+  while r < getFns.length {
+    if gcIsOver(gcCost[r]) && !gcReadByOver(r) {
+      let total = i32ToStr(gcCost[r])
+      if gcCost[r] >= GETTER_STEP_CAP {
+        total = "over " + i32ToStr(GETTER_STEP_CAP)
+      }
+      gwRowSet(r)
+      getterContractErr(
+        "costs " + total + " steps (" + gcPath(rows[r]) + ")",
+        "a getter must cost at most " + i32ToStr(GETTER_STEP_BUDGET) + " steps",
+        getDecls[r],
+      )
+    }
+    r = r + 1
+  }
+  0
+}
+
+// Refuses the getter's call, spelled `what` at node `at`, of summary row `c` unless the row
+// writes nothing, allocates nothing, calls neither the host nor something unknown, and has a
+// step bound; the refusal names the fact and the path to where it holds (D2136).
+function gwCalleeCheck(c: i32, what: string, at: i32) {
+  if esWrite[c] != "" {
+    return getterCallErr(
+      what + ", which writes " + esWrite[c] + esFactPath(c, esWriteVia),
+      GW_EFFECT,
+      at,
+    )
+  }
+  if esReadLet[c] != "" {
+    return getterCallErr(
+      what + ", which reads " + esReadLet[c] + esFactPath(c, esReadLetVia),
+      GW_STATE,
+      at,
+    )
+  }
+  if esHost[c] != "" {
+    return getterCallErr(
+      what
+        + ", which calls the host function "
+        + esHost[c]
+        + esFactPath(c, esHostVia),
+      GW_EFFECT,
+      at,
+    )
+  }
+  if esUnknown[c] != "" {
+    return getterCallErr(
+      what
+        + ", which makes "
+        + esUnknown[c]
+        + esFactPath(c, esUnknownVia)
+        + ", whose effects are not known",
+      GW_CALL,
+      at,
+    )
+  }
+  if esAlloc[c] != "" {
+    return getterCallErr(
+      what + ", which allocates " + esAlloc[c] + esFactPath(c, esAllocVia),
+      GW_ALLOC,
+      at,
+    )
+  }
+  if esCost[c] >= ES_UNBOUNDED {
+    let rule = GW_LOOP
+    if keyHasPrefix(esWhy[c], "it recurses") { rule = GW_RECUR }
+    return getterCallErr(
+      what
+        + ", which has no step bound: "
+        + esWhy[c]
+        + esFactPath(c, esWhyVia),
+      rule,
+      at,
+    )
+  }
+  0
+}
+
+// The summary of the function declared at node `decl`, as `esText` spells it, or "" when the
+// node is not a function declaration.
+export function esTextOfDecl(decl: i32): string {
+  if decl < 0 || decl >= P.nodes.length { return "" }
+  const d = P.nodes[decl]
+  if d is FuncDecl { return demangleMsg(esText(esDeclRow(decl))) }
+  ""
+}
+
+// One line per top-level function and getter the entry module declares, in source order, each
+// followed by the instances its calls pinned: `name<T = i32>: <esText>`.
+export function esDumpText(): string {
+  const decls: i32[] = []
+  let i = 0
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is FuncDecl {
+      if (fnDeclIx[n.fnName] ?? -1) == i && ufcsModOfNode(i) <= 0 {
+        decls.push(i)
+        esDeclRow(i)
+      }
+    }
+    i = i + 1
+  }
+  let out = ""
+  let k = 0
+  while k < decls.length {
+    const r0 = esDeclRow(decls[k])
+    out = out + esDumpLabel(r0) + ": " + esText(r0) + "\n"
+    let r = 0
+    while r < esDecl.length {
+      if esDecl[r] == decls[k] && esBindCount[r] > 0 {
+        out = out + esDumpLabel(r) + esBindText(r) + ": " + esText(r) + "\n"
+      }
+      r = r + 1
+    }
+    k = k + 1
+  }
+  demangleMsg(out)
+}
+
+// The declaration half of the contract for registry row `gi`: a nominal receiver declared in the
+// same module, no field or built-in member of the same name, and a non-boxing result type.
+function getterDeclCheck(gi: i32) {
+  const d = P.nodes[getDecls[gi]]
+  const selfTy = getSelfTys[gi]
+  const label = getDeclLabel(getFns[gi])
+  if selfTy < 0 { return 0 }
+  if nomNameOfTy(selfTy) == "" && genAppNameOfTy(selfTy) != "" {
+    // D2031 — an instance of a generic `new` type is not branded, so it has no identity a
+    // getter could hang on.
+    tErr(
+      "the "
+        + label
+        + " needs a nominal receiver, and an instance of a generic `new` type such as `"
+        + tyToStr(selfTy)
+        + "` is not branded yet (D2031) — declare a non-generic `new` type for the receiver",
+      getDecls[gi],
+    )
+    return 0
+  }
+  if nomNameOfTy(selfTy) == "" {
+    tErr(
+      "the "
+        + label
+        + " needs a nominal receiver: `"
+        + tyToStr(selfTy)
+        + "` is a structural type, and a getter never becomes part of one — declare the receiver with `type N = new …`",
+      getDecls[gi],
+    )
+    return 0
+  }
+  const home = homeModuleOf(selfTy)
+  const own = modIxOfMangled(getFns[gi])
+  if home >= 0 && own >= 0 && home != own {
+    tErr(
+      "the "
+        + label
+        + " must be declared in the module that declares `"
+        + tyToStr(selfTy)
+        + "` — a getter belongs to its receiver type",
+      getDecls[gi],
+    )
+  }
+  if memberHasBuiltin(selfTy, getProps[gi]) {
+    tErr(
+      "the "
+        + label
+        + " can never be read: `"
+        + tyToStr(selfTy)
+        + "` already has a member `"
+        + getProps[gi]
+        + "`, and a field wins",
+      getDecls[gi],
+    )
+  }
+  const shadow = getterMethodClash(gi)
+  if shadow != "" {
+    tErr(
+      "the "
+        + label
+        + " shares its name with "
+        + shadow
+        + ", so `v."
+        + getProps[gi]
+        + "` and `v."
+        + getProps[gi]
+        + "()` would mean different things — rename one",
+      getDecls[gi],
+    )
+  }
+  if d is FuncDecl {
+    const fnTy = lookup(getFns[gi])
+    if fnTy >= 0 {
+      const ft = T.tys[fnTy]
+      if ft is TyFunc {
+        if ft.fnRet == TY_VOID {
+          tErr("the " + label + " must return a value", getDecls[gi])
+        } else if ft.fnRet >= 0 && !getterRepOk(ft.fnRet) {
+          // The body computes this same type, and one mistake is one error.
+          gwBoxedFirst(ft.fnRet)
+          let alt = "return a type that needs no allocation"
+          if T.tys[nomErasedTyIx(ft.fnRet)] is TyNullable {
+            alt = "return a type without `| null`"
+          }
+          tErr(
+            "the "
+              + label
+              + " returns `"
+              + tyToStr(ft.fnRet)
+              + "`, which is allocated, and "
+              + GW_ALLOC
+              + " — "
+              + alt
+              + ", or "
+              + getterMethodFix(gi),
+            d.fnRet,
+          )
+        }
+      }
+    }
+  }
+  0
+}
+
+// The end-of-program getter pass: each declaration's checks, each body's contract walk, the
+// cycle check over getter reads, the step budget, and the rewrite of every read into a call.
+function checkProgramEndGetters() {
+  if getFns.length == 0 { return 0 }
+  getEdgeFromSet([])
+  getEdgeToSet([])
+  let gi = 0
+  while gi < getFns.length {
+    gwBoxedSeenSet([])
+    gwSaidSet([])
+    gwConcatInnerSet([])
+    getterDeclCheck(gi)
+    const d = P.nodes[getDecls[gi]]
+    if d is FuncDecl {
+      gwRowSet(gi)
+      gwLocalsSet([])
+      gwLocalsPush("self")
+      gwDiscardSet([])
+      gwWalk(d.fnBody)
+    }
+    gi = gi + 1
+  }
+  let ci = 0
+  while ci < getFns.length {
+    if getterReaches(ci, ci) {
+      gwRowSet(ci)
+      getterContractErr(
+        "reads itself through a chain of getters",
+        GW_RECUR,
+        getDecls[ci],
+      )
+    }
+    ci = ci + 1
+  }
+  getterBudgetCheck()
+  gwRowSet(-1)
+  getterRewriteSites()
+  0
+}
+
+// Refuses every null-only list literal no typed destination received: its element type is
+// `null` alone, which has no rep. An annotation names one, except on a `+` operand or a spread
+// source, which takes no type from the destination around it.
+function flushNullOnlyLits() {
+  const done: {[i32]: boolean} = Map()
+  for ix in nolLits {
+    if !(nolTaken[ix] ?? false) && !(done[ix] ?? false) {
+      done[ix] = true
+      if nolOperand[ix] ?? false {
+        tErr(
+          "a list of only `null` takes no element type from a `+` operand or a spread; bind it to an annotated name first, e.g. `const e: (i32 | null)[] = [null]`",
+          ix,
+        )
+      } else {
+        tErr(
+          "a list of only `null` has no element type; annotate it, e.g. `const e: (i32 | null)[] = [null]`",
+          ix,
+        )
+      }
+    }
+  }
+  0
+}
+
+// A record type declaring a field twice is refused at the repeated field name, the ruling
+// D3484 made for literals applied to declarations (D3537). The parser records the pairs.
+function recDupFieldErrs() {
+  let i = 0
+  while i + 1 < recDupField.length {
+    const dt = nodeStartTok(recDupField[i])
+    if dt >= 0 {
+      dupNameErr(
+        "field `" + P.toks[dt].text + "` is declared twice in this record type",
+        recDupField[i],
+        recDupField[i + 1],
+      )
+    }
+    i = i + 2
+  }
+  0
+}
+
+// Splits each settled void return `return e` into the statement `e` and a bare `return` in its
+// own block, so the emitter sees the two statements it already lowers. A site already split is
+// skipped; one whose recorded block does not list it is refused rather than left to the emitter.
+function voidRetRewrite() {
+  let changed = false
+  let i = 0
+  while i < voidRetRwRet.length {
+    const r = voidRetRwRet[i]
+    const b = voidRetRwBlk[i]
+    if r >= 0 && b >= 0 && r < P.nodes.length && b < P.nodes.length {
+      const rn = P.nodes[r]
+      const bn = P.nodes[b]
+      if rn is RetStmt && bn is Block && rn.retArg >= 0 {
+        const out: i32[] = []
+        let found = false
+        let k = 0
+        while k < bn.blkStmts.length {
+          if bn.blkStmts[k] == r {
+            out.push(cwPeel(rn.retArg))
+            found = true
+          }
+          out.push(bn.blkStmts[k])
+          k = k + 1
+        }
+        if found {
+          const nb: Node = { blkStmts: out, pos: bn.pos }
+          P.nodes[b] = nb
+          const nr: Node = { retArg: -1, pos: rn.pos }
+          P.nodes[r] = nr
+          changed = true
+        } else {
+          tErr(
+            "a `return` of a void value here is not split — write the call, then `return`",
+            r,
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+  // The banked parse differs from the tree now, so a later consumer re-parses, as after getters.
+  if changed { arenaEpochBump() }
+  0
+}

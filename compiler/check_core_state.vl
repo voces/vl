@@ -1,0 +1,1341 @@
+// The checker core's per-walk state: the flags, cursors and tables `checkNode` and its
+// helpers keep while a program is checked, the queries that read nothing else, and
+// `initChecker`, which empties them and every module table below before a walk.
+// The core writes a flag here through its `<name>Set` setter. Does not import the checker.
+import {
+  ArrayLit,
+  Block,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  MatchExpr,
+  Node,
+  P,
+  i32ToStr,
+  nodeToks,
+  stmtAlwaysExits,
+} from "./ast"
+import { aliasTransparentReset } from "./check_alias_transparent"
+import { asgRowsReset } from "./check_asg_rows"
+import { bindRowsReset, isvalReset } from "./check_bind_rows"
+import { callResolveReset } from "./check_call_resolve"
+import { calleeReset } from "./check_callee"
+import { canonRestoreSpellings } from "./check_canon_raw"
+import { crReset } from "./check_capture_rows"
+import { coalReset, rcoalReset } from "./check_coal"
+import { covarWriteReset } from "./check_covar_pins"
+import { cstrProbeReset } from "./check_cstr_probe"
+import {
+  argCstr,
+  binCstr,
+  bmCstr,
+  cstrSeqNext,
+  cvNow,
+  cvViaAt,
+  isCstr,
+  letCstr,
+  memCstr,
+  nestCstr,
+  nestCstrSeen,
+  printCstr,
+  retCstr,
+  ufcsCstr,
+} from "./check_cstr_rows"
+import { cursorReset } from "./check_cursor"
+import {
+  declScanReset,
+  declareAtomicIntrinsics,
+  declareSimdIntrinsics,
+  declareTruncSatIntrinsics,
+} from "./check_decl_scan"
+import { daResetForCheck, daWriteTarget } from "./check_definite"
+import { discardedReset } from "./check_discarded"
+import { esReset } from "./check_effect_rows"
+import { expObsProbeReset } from "./check_exp_obs"
+import { expectedReset } from "./check_expected"
+import { flatLayoutReset } from "./check_flat_layout"
+import { genAliasAnnsReset } from "./check_gen_alias_anns"
+import { getterEffectsReset } from "./check_getter_effects"
+import { guardReset } from "./check_guard"
+import { holeLinksReset } from "./check_hole_links"
+import { hdReset, pinResolvedAtomTy } from "./check_hole_pins"
+import { holeRowsReset } from "./check_hole_rows"
+import { ifValueReset } from "./check_if_value"
+import { inferRetReset } from "./check_infer_ret"
+import { inferRowsReset } from "./check_infer_rows"
+import { inlineLitUnionReset } from "./check_inline_lit_union"
+import { listUnionReset } from "./check_list_union"
+import { literalsReset } from "./check_literals"
+import { matchDesugarReset } from "./check_match_desugar"
+import { matchHeadsReset } from "./check_match_heads"
+import { mismatchNotesReset } from "./check_mismatch_notes"
+import { narBankReset } from "./check_nar_bank"
+import { narWrittenReset } from "./check_nar_written"
+import { narPathsReset } from "./check_narrow_paths"
+import { njGateReset } from "./check_nj_gate"
+import { njJoinReset } from "./check_nj_join"
+import { colAt, nodeTyIx, nodeTyIxOf, nodeTyWrites } from "./check_node_tys"
+import {
+  lpColSet,
+  noteExitArm,
+  noteExitFirst,
+  nullHolesReset,
+} from "./check_null_holes"
+import { numAdoptReset } from "./check_num_adopt"
+import {
+  cexNegOperand,
+  cexReported,
+  cexWideFloatOk,
+  cexWideLits,
+} from "./check_num_lit_state"
+import { getSiteFns, getSiteNodes, parenPeelIx } from "./check_places"
+import { refListViewReset } from "./check_ref_list_view"
+import { irReset } from "./check_ret_names"
+import { retagRowsReset } from "./check_retag_rows"
+import {
+  constScopes,
+  declare,
+  fnAliasScopes,
+  fnDeclScopes,
+  isConstName,
+  lookupDepth,
+  lookupFnDeclNode,
+  moduleConstDecl,
+  scopeDepthsOf,
+} from "./check_scopes"
+import { jwReset, sideRowsReset } from "./check_side_rows"
+import {
+  redunECol,
+  redunELine,
+  redunName,
+  redunRet,
+  redunSCol,
+  redunSLine,
+  redunTok,
+  redunType,
+  scopeResKind,
+  scopeResName,
+  scopeResType,
+  symBindKind,
+  symBindNode,
+  symBindType,
+  symMemCol,
+  symMemEndCol,
+  symMemGetter,
+  symMemGetterDecl,
+  symMemLine,
+  symMemNode,
+  symMemTy,
+  symOccDecl,
+  symOccIsDecl,
+  symOccTok,
+  symOccTy,
+  symRefCursorCol,
+  symRefCursorLine,
+  symRefOcc,
+  symVisEC,
+  symVisEL,
+  symVisKind,
+  symVisName,
+  symVisNode,
+  symVisSC,
+  symVisSL,
+} from "./check_state"
+import { substReset } from "./check_subst"
+import { substFoldReset } from "./check_subst_fold"
+import { jwGenTokStart, jwSetGenTokStart, symOccReset } from "./check_sym_occ"
+import { tpBoundReset } from "./check_tp_bound"
+import { holeTpJoinNames, joinRowsReset, tpJoinUnions } from "./check_tp_join"
+import { isStringTy, isVoidTy, tyHasTyVar } from "./check_ty_shape"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_NEVER,
+  TY_NULL,
+  TY_STR,
+  TY_U8,
+  TY_V128,
+  TY_VOID,
+  TyFunc,
+  TyNullable,
+  cStructFirstPos,
+  cStructNames,
+  cStructTyIxSet,
+  cStructTyIxs,
+  cUnionNames,
+  cUnionTyIxSet,
+  cUnionTyIxs,
+  cUserTypes,
+  cUserTypesVer,
+  cVariantMemberTyIxSet,
+  cVariantMemberTyIxs,
+  gaAppArgCount,
+  gaAppArgFlat,
+  gaAppArgStart,
+  gaAppFinite,
+  gaAppHeads,
+  gaAppTyIxSet,
+  gaAppTyIxs,
+  luIxCursor,
+  luPending,
+  luPosByKey,
+  luPosByTy,
+  mkArrayTy,
+  mkErrTy,
+  mkFuncTy,
+  mkObjTy,
+  mkPrim,
+  nwBaseTyIxs,
+  nwDeclNames,
+  nwNames,
+  nwTyIxs,
+  softenLitTy,
+  tvNestOf,
+  tyMutEpoch,
+  tyToStrDepth,
+  tyToStrStack,
+} from "./check_types"
+import { wideLitsReset } from "./check_wide_lits"
+import { peelParenIx, weReset } from "./check_write_effects"
+import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+import { mimpClear } from "./missing_import"
+import { identColReset } from "./symbols"
+import { nameMentionsIdent } from "./tyname"
+
+// The `initChecker` then `checkProgram` protocol, enforced rather than stated: every table
+// `checkProgram` fills is emptied in `initChecker`, so a second walk on an unarmed instance
+// reads the previous program's rows. `initChecker` arms this, `checkProgram` consumes it,
+// and consuming it when it is already clear is an `internal:` diagnostic, never a trap.
+export let checkerArmed = false
+export function checkerArmedSet(v: boolean) { checkerArmed = v }
+
+// D-GAPARAM — the declared type-parameter names, as a flat column plus a (start, count)
+// slice per alias, the shape the spelling arena uses for its kids. `parseTypeDecl` folds
+// the parameter tokens into the declared name, so the `<` scan and slice happen once here
+// at registration and the binding loop reads `gaParamNames[start + k]` directly.
+export let gaParamNames: string[] = []
+
+export let gaParamStart: i32[] = []
+
+export let gaParamCount: i32[] = []
+
+// One row per (generic function, instantiation type, bound member) some site resolved; a
+// second site resolving the same key to a different witness is the refusal, and it names
+// both sites. The key is `tyToStr` — `tyEq`'s exact string equivalent, nominality folded
+// in — never an arena index, which is append-only, nor the emit-side `canon`/`tyToEmitName`.
+export let cohKeys: string[] = []
+
+export let cohWitness: string[] = []
+
+export let cohSiteLine: i32[] = []
+
+export let cohSiteCol: i32[] = []
+
+// Unions minted by `joinTys` that carry at least one hole member. `substTyDeep` re-folds
+// such a union under a call's bindings (`refoldJoinUnion`): members that resolve are
+// re-joined, and one still unresolved is dropped once some member did, naming a branch the
+// pinned argument can never reach. Without the re-fold `A | B` surfaces where one arm is live.
+export let joinHoleUnions: i32[] = []
+
+// The generic whose instance the emitter is building, -1 outside one (`joinPinnedArmLit`).
+export let njPinFn = -1
+
+export function njSetPinFn(fx: i32): i32 {
+  const was = njPinFn
+  njPinFn = fx
+  was
+}
+
+// The deferred return joins of runtime witnesses, which re-join apart wherever they collapse.
+export let apartHoleJoins: {[i32]: boolean} = Map()
+
+// D1470 — every `__array_new_default__(n)` call, its node and the array-hole row it returned.
+// `array.new_default` writes each slot's zero, so the element type is decided by what pins the
+// hole and neither answer exists where the call is checked. `flushUninferred` defaults an
+// unpinned hole to `i32`; `checkArrayNewDefaultElems` refuses a pinned element with no zero.
+export let arrDefCallIx: i32[] = []
+
+// The element narrowing a `map`/`filter` callback's parameter or a `for` variable starts with,
+// keyed on the callback or the loop (`elemFactFor`); a leaf of -1 is none.
+export let efLeaf: {[i32]: i32} = Map()
+
+export let efSteps: {[i32]: i32} = Map()
+
+export let argPinChecking = false
+export function argPinCheckingSet(v: boolean) { argPinChecking = v }
+
+// Per hole-carrying function type: the same signature with each hole at its banked pin,
+// minted once however many classifiers ask for it (D1794).
+let pinFnTy: {[i32]: i32} = Map()
+
+// Declarations whose solve has been attempted, keyed by decl node index — a body is probed at
+// most once, whether or not the probe found anything to solve.
+export let paramSolveTried: {[string]: boolean} = Map()
+
+// Set while pass 1.9 walks a generic body only to record its deferred constraints, so the
+// walk takes no memo and patches no return (`cstrPrePass`).
+export let cstrProbe = false
+export function cstrProbeSet(v: boolean) { cstrProbe = v }
+
+// The container null holes (D2506): an un-annotated list element or map value pinned by a bare
+// `null` write holds an open `_ | null` a later write or a destination fills. One row
+// per hole: its arena index, the write that minted it, the container's spelling, whether it is a
+// map value, and whether it is a param-hole map demand's, whose value each call site fills.
+export let cnhTys: i32[] = []
+
+export let cnhAts: i32[] = []
+
+export let cnhNames: string[] = []
+
+export let cnhIsVal: boolean[] = []
+
+export let cnhDemand: boolean[] = []
+
+// Post-guard narrowings handed up by an `if` that is itself the else arm of another `if`. Such
+// an `if` has no enclosing block of its own — the rest of its block is the rest of the parent's
+// — so it cannot `declare` its own fall-through narrowing. The parent consumes these only when
+// its own then diverges. Bare names only; pushed in post-order and applied in reverse.
+export let pgUpKeys: string[] = []
+
+export let pgUpTys: i32[] = []
+
+// The node index of the `if` currently being checked as the else arm of a chain, or `-1`. Set
+// by a link's head immediately before the next link's head runs, and read-and-cleared at the
+// very top of `checkIfHead`, so only that link sees it: an `if` nested inside an arm's body
+// has a block of its own and declares normally.
+export let pgUpArmIx = -1
+export function pgUpArmIxSet(v: i32) { pgUpArmIx = v }
+
+// The place type a trailing chain saw, banked at the instant the post-guard subtraction replaced
+// it. `ifChainExhausts` asks whether a chain's arms cover its place's union, and by then the
+// chain has already subtracted them, so asking `lookup` is circular. Keyed by the chain head's
+// node index — a head that does not post-narrow writes nothing, and a miss falls back to `lookup`.
+export let pgPreIx = -1
+export function pgPreIxSet(v: i32) { pgPreIx = v }
+
+export let pgPreKeys: string[] = []
+export function pgPreKeysSet(v: string[]) { pgPreKeys = v }
+
+export let pgPreTys: i32[] = []
+export function pgPreTysSet(v: i32[]) { pgPreTys = v }
+
+// Per `if` node and written key, the type the key holds after that `if`, as its arm join found
+// it: what an enclosing `if` whose `else` is this one reads as that arm's end.
+export let narIfEnds: {[string]: i32} = Map()
+export function narIfEndsSet(v: {[string]: i32}) { narIfEnds = v }
+// Reads of a list narrowed by `is K[]` that a delivery takes whole at a type its declared type
+// fits (`narListDeliveryErr`): the emitter hands over the list itself, not an arm stand-in.
+export let narListDeclReads: {[i32]: boolean} = Map()
+export function narListDeclReadsSet(v: {[i32]: boolean}) {
+  narListDeclReads = v
+}
+// Whether the read at `ix` of a list narrowed by `is K[]` is delivered whole at its declared type.
+export function narListReadsDecl(ix: i32): boolean {
+  narListDeclReads[ix] ?? false
+}
+
+export function narNoteChainEnd(ifIx: i32, key: string, ty: i32) {
+  if ty < 0 { return 0 }
+  narIfEnds[i32ToStr(ifIx) + "#" + key] = ty
+  0
+}
+
+// The end type of the `else if` link of the `if` at `ifIx` for `key`, or -1 when its `else` is
+// no `if`, or the link's own join recorded nothing for `key`.
+export function narChainEndTy(ifIx: i32, key: string): i32 {
+  const n = P.nodes[ifIx]
+  if n is IfStmt {
+    if n.ifElse >= 0 && P.nodes[n.ifElse] is IfStmt {
+      return narIfEnds[i32ToStr(n.ifElse) + "#" + key] ?? -1
+    }
+  }
+  -1
+}
+
+// Whether `ty` is a still-open container null hole.
+export function cnhIsOpen(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner >= 0 { return false }
+  } else {
+    return false
+  }
+  let i = 0
+  while i < cnhTys.length {
+    if cnhTys[i] == ty { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The joins `paramNullJoin` kept a null in (D3497): re-folding one at a call keeps the null even
+// when the bound members absorb it, as a caller's own holes do.
+export let paramNullJoins: {[i32]: i32} = Map()
+
+// Whether any join has made one record of two (`joinObjFieldwise`). Only ever set, so the
+// emitter passes that build a join's arms at its row can skip a program with none (D2731).
+export let recordJoinMinted = false
+export function recordJoinMintedSet(v: boolean) { recordJoinMinted = v }
+
+// The emitter's read of `recordJoinMinted`.
+export function recordJoinSeen(): boolean { recordJoinMinted }
+
+// The `__memory_shared__()` Call nodes that denote the build intrinsic rather than a local of
+// that name; `foldMemShared` folds an `if` only on one of these. Reset by `initChecker`.
+export let memSharedCalls: i32[] = []
+
+// The `Member` node an assignment is about to write, so a getter there is refused as a write
+// rather than resolved as a read. -1 outside an assignment target.
+export let getWriteTarget = -1
+export function getWriteTargetSet(v: i32) { getWriteTarget = v }
+
+// Every `+` the real pass checked, by anchor token, and whether its left operand concatenates
+// as a string — no operator declaration takes one as receiver, so the link is the built-in
+// concat. Read by the `prefer-interpolation` lint, which has no types: a link rechecked with
+// another left operand type (a generic pin) records twice, and any `0` among its rows wins.
+let plusLinkTok: i32[] = []
+
+let plusLinkStr: i32[] = []
+
+// Every index read the real pass checked, by anchor token, and whether its receiver checked
+// as a `string`, so the element is a UTF-8 byte. Read by the `byte-as-code-point` lint under
+// `plusLinkStr`'s rule: a site rechecked with another receiver type records twice.
+let strIdxTok: i32[] = []
+
+let strIdxStr: i32[] = []
+
+export let inferObserved = -1
+export function inferObservedSet(v: i32) { inferObserved = v }
+
+export let inferSawErr = false
+export function inferSawErrSet(v: boolean) { inferSawErr = v }
+
+export let inferObservedLit = true
+export function inferObservedLitSet(v: boolean) { inferObservedLit = v }
+
+// The `return <void expr>` statements of the functions being inferred, per inference frame, and
+// the block each sits in: a void return, refused if its function returns a value (D2635).
+export let inferVoidRetSites: i32[] = []
+
+export let inferVoidRetBlks: i32[] = []
+
+// The innermost block whose statements are being checked: the block a `return` sits in.
+export let chkStmtBlk = -1
+export function chkStmtBlkSet(v: i32) { chkStmtBlk = v }
+
+// The void returns settled in void functions, and their blocks, which `voidRetRewrite` splits
+// into the expression statement and a bare `return` once every body is checked.
+export let voidRetRwRet: i32[] = []
+
+export let voidRetRwBlk: i32[] = []
+
+export let inferRetSeeding = false
+export function inferRetSeedingSet(v: boolean) { inferRetSeeding = v }
+
+// The seeds `dropTailIfSeeds` removed, per inference frame: re-joined when the function turns
+// out to return a value anyway, since then the tail's value arms return (`clearTailVerdict`).
+export let inferDroppedTy: i32[] = []
+
+export let inferDroppedLit: boolean[] = []
+
+// The `match` `checkNode` last entered in return-tail position, which it leaves as a non-spine node.
+export let matchTailNode = -1
+export function matchTailNodeSet(v: i32) { matchTailNode = v }
+
+// Each top-level `let`/`const` by name to its node, or -1 once pass 2 has reached the
+// declaration: a top-level write to one still mapped is a write before its initializer (D2654).
+export let moduleBeforeDecl: {[string]: i32} = Map()
+
+// Recursive return-type inference (binding-group fixpoint). A function whose return becomes
+// knowable only after a recursive cycle resolves cannot be inferred in one demand pass, since the
+// cycle-break commits a provisional `void`. A suppressed pre-pass resolves every un-annotated
+// return first, iterating to a fixpoint; `bodyChecked` lets the real pass still check each once.
+export let topUnannotFns: i32[] = []
+
+// An un-annotated function whose returns disagree and join to one list type, keyed as
+// `inferRetIdx` is: the joined `Ty` index, which no single return's own list rep names (D2716).
+export let inferJoinListIdx: {[string]: i32} = Map()
+
+export let bodyChecked: {[string]: boolean} = Map()
+
+// The arm patterns a `const`-pattern refusal already reported, so the vocabulary does not again.
+export let matchPatRefused: {[i32]: boolean} = Map()
+
+// The delivery sites the function-value adapter rewrote, so a second delivery of one does not
+// wrap the adapter again.
+export let fvaDone: {[i32]: boolean} = Map()
+
+// The function declaration a name delivered as a value resolves to in its own scope, or -1,
+// banked for a deferred re-check, which runs outside that scope (D3918).
+let fvaNameDecl: {[i32]: i32} = Map()
+
+// The discriminant bank, parallel to `isVarTyIx` and sized with it. At an `is` test whose receiver
+// is a member path over a struct union, it records the type the receiver narrows to in the then
+// branch (`pushDiscrimParentFact`'s answer), which the emitter cannot cheaply re-derive: an arm's
+// tag identity lives in a different column depending on how the tag is written. Then branch only.
+export let isParentTyIx: i32[] = []
+export function isParentTyIxSet(v: i32[]) { isParentTyIx = v }
+
+// The else twin of `isParentTyIx`. One table per branch rather than one table plus a direction
+// flag: both facts are keyed on the same condition node, and the emitter reads them from two sites
+// (`setNarrowFromCond` and `setNarrowFromCondElse`) that never run together for one branch, so a
+// flag would be set by whichever site asked last.
+export let isParentElseTyIx: i32[] = []
+export function isParentElseTyIxSet(v: i32[]) { isParentElseTyIx = v }
+
+// Context-resolved type sidecar, parallel to `nodeTyIx`: at the arena-pure adoption sites it
+// records the destination type a literal node widened into, which is the rep the emitter builds.
+// `nodeTyIx` keeps the checker's self-inferred type for its existing consumers; the emitter's rep
+// keying reads `nodeRepTyIxOf`, which falls back to `nodeTyIxOf` when nothing is recorded.
+export let nodeRepTyIx: i32[] = []
+
+// Per node, the map type a union of maps is delivered as (D2692): the members share that map's
+// storage, so the emitter unboxes the union's payload there. -1 where nothing is recorded.
+export let mapUnboxTyIx: i32[] = []
+
+// The shift nodes whose count is a literal, graded once every width is in (`checkShiftCounts`).
+export let shiftCountNodes: i32[] = []
+
+// Whether the checker has typed an identifier naming an `extern` anywhere but as a callee: the
+// one case the emitter's `synthExternValues` has work for, so a program that only calls its
+// externs skips it (D2618). `ckCalleeIx` is the callee node the general call arm is typing, or -1.
+export let extValueSeen = false
+export function extValueSeenSet(v: boolean) { extValueSeen = v }
+
+export let ckCalleeIx = -1
+export function ckCalleeIxSet(v: i32) { ckCalleeIx = v }
+
+// The arena types externs are declared at, by index: the cheap filter in front of the name.
+export let extFnTy: boolean[] = []
+
+// The least of them, so a read at any earlier-interned type (every primitive) is one compare.
+export let extFnTyMin = 2147483647
+
+export function extFnTyMark(ty: i32) {
+  if ty < 0 { return 0 }
+  while extFnTy.length <= ty { extFnTy.push(false) }
+  extFnTy[ty] = true
+  if ty < extFnTyMin { extFnTyMin = ty }
+  0
+}
+
+export function externValueSeen(): boolean { extValueSeen }
+
+export let cFillActive = false
+export function cFillActiveSet(v: boolean) { cFillActive = v }
+
+// The declaration's arena node, so the cycle report — which is discovered in the fixpoint, long
+// after the statement walk that found the declaration — can still anchor on the right line.
+export let flDeclNodes: i32[] = []
+
+// A single placeholder `TyFunc` arena index for monomorphizer `=>sigkey` closure pins (C1 endgame).
+export let cFuncPinTyIx = -1
+export function cFuncPinTyIxSet(v: i32) { cFuncPinTyIx = v }
+
+// A single placeholder `TyObj` arena index for interned anonymous-shape `#anonN` names (C1 endgame).
+export let cObjPinTyIx = -1
+export function cObjPinTyIxSet(v: i32) { cObjPinTyIx = v }
+
+export let cycleBreakCount = 0
+export function cycleBreakCountSet(v: i32) { cycleBreakCount = v }
+
+// Bare `{}` literals refused so far (D2223): a body holding one has already been reported, so
+// its return inference owes no second message.
+export let bareBraceCount = 0
+export function bareBraceCountSet(v: i32) { bareBraceCount = v }
+
+// D2223: every value-position `{}` checked, and per node whether a delivery gave it a record
+// type to complete (1). `bareBraceUndelivered` refuses the rest once every body is checked.
+export let bareBraceLits: i32[] = []
+
+export let bareBraceMark: i32[] = []
+
+// Nesting depth of a speculative `assignableExpr` (one union member tried of several): a `{}`
+// is judged once, by the outer delivery that sees every member.
+export let bareBraceSpec = 0
+export function bareBraceSpecSet(v: i32) { bareBraceSpec = v }
+
+export let unresolvedFns: string[] = []
+export function unresolvedFnsSet(v: string[]) { unresolvedFns = v }
+
+export let fnSawValueRet = false
+export function fnSawValueRetSet(v: boolean) { fnSawValueRet = v }
+
+// Redundant return-type annotation rule: `retNatural` is the body's natural inferred return — the
+// first non-void, non-error one, mirroring `noteInferredRet` — accumulated for an annotated
+// function so the rule can compare it against the explicit `: T`. A match means removing the
+// annotation yields the identical inferred return. Saved, reset and restored per function.
+export let retNatural = -1
+export function retNaturalSet(v: i32) { retNatural = v }
+
+export let retNaturalErr = false
+export function retNaturalErrSet(v: boolean) { retNaturalErr = v }
+
+// The contextual expected return type per lambda node, the return-side dual of the param seeding:
+// a lambda whose body infers a narrower numeric than the expected return adopts it, so the
+// widening happens inside the body at the return seam rather than riding function-type variance.
+// `cbSeedUsed` counts seeds that changed an inference, so `checkLetDecl` cannot call it redundant (D1442).
+export let cbSeedUsed = 0
+export function cbSeedUsedSet(v: i32) { cbSeedUsed = v }
+
+// Reset all checker module state, then intern the well-known primitives and the global
+// scope. Call once before checking: `checkProgram` assumes it, and this is the only reset
+// surface, so a new checker module table belongs here and nowhere else.
+export function initChecker() {
+  mimpClear()
+  identColReset()
+  sideRowsReset()
+  jwReset()
+  redunReset()
+  rcoalReset()
+  isvalReset()
+  covarWriteReset()
+  cursorReset()
+  holeRowsReset()
+  joinRowsReset()
+  inferRowsReset()
+  expectedReset()
+  cbSeedUsed = 0
+  T.tys = []
+  tpJoinUnions = Map()
+  listUnionReset()
+  paramNullJoins = Map()
+  substFoldReset()
+  holeTpJoinNames = Map()
+  genFnCstrBusy = false
+  ifValueReset()
+  recordJoinMinted = false
+  T.scopes = []
+  scopeDepthsOf = Map()
+  T.diags = []
+  T.curRet = -1
+  cUserTypes = Map()
+  // The arena is re-minted for this program: advance both generations so no emit-side memo
+  // stamped under a previous program can be consulted on a shared instance. Advance, never
+  // reset — a reset could collide with a stamp an earlier program left behind.
+  tyMutEpoch = tyMutEpoch + 1
+  cUserTypesVer = cUserTypesVer + 1
+  genAliasAnnsReset()
+  gaParamNames = []
+  gaParamStart = []
+  gaParamCount = []
+  annotNameMemo = Map()
+  annotNameMemoNegVer = Map()
+  annotPart = Map()
+  annotClash = Map()
+  declScanReset()
+  tpBoundReset()
+  cohKeys = []
+  cohWitness = []
+  cohSiteLine = []
+  cohSiteCol = []
+  asgRowsReset()
+  substReset()
+  holeLinksReset()
+  coalReset()
+  narPathsReset()
+  hdReset()
+  guardReset()
+  joinHoleUnions = []
+  njGateReset()
+  njJoinReset()
+  njPinFn = -1
+  apartHoleJoins = Map()
+  binCstr.lt = []
+  binCstr.op = []
+  binCstr.rt = []
+  binCstr.fn = []
+  cvViaAt = Map()
+  cvNow = -1
+  argCstr.at = []
+  argCstr.exp = []
+  argCstr.who = []
+  argCstr.fn = []
+  argCstr.node = []
+  argCstr.form = []
+  printCstr.ty = []
+  printCstr.ix = []
+  printCstr.fn = []
+  nestCstr.ty = []
+  nestCstr.ix = []
+  nestCstr.fn = []
+  nestCstrSeen = Map()
+  isCstr.ty = []
+  isCstr.chk = []
+  isCstr.name = []
+  isCstr.ix = []
+  isCstr.fn = []
+  arrDefCallIx = []
+  retCstr.got = []
+  retCstr.want = []
+  retCstr.ix = []
+  retCstr.fn = []
+  retCstr.wOnly = []
+  letCstr.got = []
+  letCstr.want = []
+  letCstr.ix = []
+  letCstr.fn = []
+  letCstr.name = []
+  letCstr.seq = []
+  bmCstr.seq = []
+  cstrSeqNext = 0
+  mismatchNotesReset()
+  bmCstr.got = []
+  bmCstr.want = []
+  bmCstr.ctx = []
+  bmCstr.ix = []
+  bmCstr.fn = []
+  bmCstr.form = []
+  bmCstr.label = []
+  memCstr.ty = []
+  memCstr.prop = []
+  memCstr.ix = []
+  memCstr.fn = []
+  memCstr.dem = []
+  ufcsCstr.ty = []
+  ufcsCstr.prop = []
+  ufcsCstr.ix = []
+  ufcsCstr.fn = []
+  ufcsCstr.p0 = []
+  ufcsCstr.more = []
+  callResolveReset()
+  efLeaf = Map()
+  efSteps = Map()
+  tvNestOf = Map()
+  argPinChecking = false
+  pinFnTy = Map()
+  paramSolveTried = Map()
+  expObsProbeReset()
+  cstrProbe = false
+  cstrProbeReset()
+  fnDeclIx = Map()
+  memSharedCalls = []
+  calleeReset()
+  getterEffectsReset()
+  getSiteNodes = []
+  getSiteFns = []
+  getWriteTarget = -1
+  esReset()
+  plusLinkTok = []
+  plusLinkStr = []
+  strIdxTok = []
+  strIdxStr = []
+  discardedReset()
+  moduleBeforeDecl = Map()
+  topUnannotFns = []
+  irReset()
+  inferRetReset()
+  inferJoinListIdx = Map()
+  inlineLitUnionReset()
+  bodyChecked = Map()
+  nodeTyIx = []
+  nodeTyWrites = nodeTyWrites + 1
+  matchHeadsReset()
+  matchDesugarReset()
+  matchPatRefused = Map()
+  chainProvenCond = []
+  narIfEnds = Map()
+  narListDeclReads = Map()
+  fvaDone = Map()
+  fvaNameDecl = Map()
+  isParentTyIx = []
+  isParentElseTyIx = []
+  nodeRepTyIx = []
+  mapUnboxTyIx = []
+  retagRowsReset()
+  refListViewReset()
+  literalsReset()
+  numAdoptReset()
+  shiftCountNodes = []
+  cexWideLits = []
+  cexWideFloatOk = Map()
+  cexReported = Map()
+  cexNegOperand = Map()
+  extValueSeen = false
+  ckCalleeIx = -1
+  extFnTy = []
+  extFnTyMin = 2147483647
+  cFuncPinTyIx = -1
+  cObjPinTyIx = -1
+  cycleBreakCount = 0
+  bareBraceCount = 0
+  bareBraceLits = []
+  bareBraceMark = []
+  bareBraceSpec = 0
+  unresolvedFns = []
+  fnSawValueRet = false
+  retNatural = -1
+  retNaturalErr = false
+  daResetForCheck()
+  daWriteTarget = -1
+  inferObserved = -1
+  inferObservedLit = true
+  inferSawErr = false
+  inferVoidRetSites = []
+  inferVoidRetBlks = []
+  chkStmtBlk = -1
+  voidRetRwRet = []
+  voidRetRwBlk = []
+  inferRetSeeding = false
+  matchTailNode = -1
+  nullHolesReset()
+  valueArmAt = -1
+  nestedExitFirstAt = []
+  lpValSeen = false
+  bindRowsReset()
+  brkPrevTy = -1
+  inferDroppedTy = []
+  inferDroppedLit = []
+  // Pass 0 and pass 1's collect tables, reset here with everything else: every
+  // `checkProgram` reaches its walk through a caller that ran `initChecker` first
+  // (`compileSrc`, `checkSrc`, `checkSrcSym`, `jwSecondPass`), so this is the one
+  // reset surface, and a new checker module table has one place to go.
+  cStructTyIxs = []
+  cStructTyIxSet = []
+  cStructNames = []
+  cStructFirstPos = []
+  cVariantMemberTyIxs = []
+  cVariantMemberTyIxSet = []
+  cUnionTyIxs = []
+  cUnionTyIxSet = []
+  cUnionNames = []
+  luPosByKey = Map()
+  luPosByTy = []
+  luIxCursor = 0
+  luPending = []
+  wideLitsReset()
+  gaAppTyIxs = []
+  gaAppTyIxSet = []
+  gaAppHeads = []
+  gaAppArgStart = []
+  gaAppArgCount = []
+  gaAppArgFlat = []
+  gaAppFinite = []
+  aliasTransparentReset()
+  cFillActive = false
+  nwDeclNames = []
+  nwTyIxs = []
+  nwNames = []
+  nwBaseTyIxs = []
+  flatLayoutReset()
+  flDeclNodes = []
+  checkerArmed = true
+  TY_I32 = mkPrim("i32")
+  TY_I64 = mkPrim("i64")
+  TY_F64 = mkPrim("f64")
+  TY_F32 = mkPrim("f32")
+  TY_BOOL = mkPrim("boolean")
+  TY_STR = mkPrim("string")
+  TY_VOID = mkPrim("void")
+  TY_ERR = mkErrTy()
+  TY_NULL = mkPrim("null")
+  TY_NEVER = mkPrim("never")
+  TY_U8 = mkPrim("u8")
+  TY_V128 = mkPrim("v128")
+  // Per-compile state: the checker instance outlives one program (LSP, the corpus oracle).
+  v128NestReported = []
+  T.scopes.push(Map())
+  constScopes = []
+  constScopes.push(Map())
+  moduleConstDecl = Map()
+  fnDeclScopes = []
+  fnDeclScopes.push(Map())
+  fnAliasScopes = []
+  fnAliasScopes.push(Map())
+  cnhTys = []
+  cnhAts = []
+  cnhNames = []
+  cnhIsVal = []
+  cnhDemand = []
+  pgUpKeys = []
+  pgUpTys = []
+  pgUpArmIx = -1
+  pgPreIx = -1
+  pgPreKeys = []
+  pgPreTys = []
+  weReset()
+  tyToStrDepth = 0
+  tyToStrStack = []
+  narBankReset()
+  narWrittenReset()
+  crReset()
+  // LSP symbol-table data, cleared every check; the `symEnabled` mode flag is the driver's to
+  // set, so it is not reset here. The global scope's decl frame is seeded to parallel the global
+  // type scope `T.scopes` already pushed below.
+  symOccTok = []
+  symOccDecl = []
+  symOccIsDecl = []
+  symOccTy = []
+  // Find-references' filled result column indexes `symOccTok`, so it is dropped with it.
+  symRefOcc = []
+  symRefCursorLine = -1
+  symRefCursorCol = -1
+  symBindNode = []
+  symBindType = []
+  symBindKind = []
+  symMemNode = []
+  symMemGetter = []
+  symMemGetterDecl = []
+  symMemTy = []
+  symMemLine = []
+  symMemCol = []
+  symMemEndCol = []
+  symVisName = []
+  symVisNode = []
+  symVisKind = []
+  symVisSL = []
+  symVisSC = []
+  symVisEL = []
+  symVisEC = []
+  scopeResName = []
+  scopeResKind = []
+  scopeResType = []
+  // Opens the module scope for every compile: the binding-identity column resolves through it
+  // (`identResolve`). The token-membership set is cleared with `symOccTok` above.
+  symOccReset()
+  // Memory intrinsics (host `defaultScope`): raw linear-memory stores/loads and
+  // the `__log__` host hook used by low-level corpus programs.
+  declare("__store_i32__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__store_i64__", mkFuncTy([TY_I32, TY_I64], TY_VOID))
+  declare("__store_f32__", mkFuncTy([TY_I32, TY_F32], TY_VOID))
+  declare("__store_f64__", mkFuncTy([TY_I32, TY_F64], TY_VOID))
+  declare("__store_i8__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__store_i16__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__load_i32__", mkFuncTy([TY_I32], TY_I32))
+  declare("__store_string__", mkFuncTy([TY_I32, TY_STR], TY_I32))
+  declare("__log_string__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__log__", mkFuncTy([TY_I32, TY_I32], TY_VOID))
+  declare("__memory_grow__", mkFuncTy([TY_I32], TY_I32))
+  const noParams: i32[] = []
+  declare("__memory_size__", mkFuncTy(noParams, TY_I32))
+  // The build's heap window, as two constants the host fixed before the compile.
+  declare("__heap_base__", mkFuncTy(noParams, TY_I32))
+  declare("__heap_limit__", mkFuncTy(noParams, TY_I32))
+  // Whether the build declared its memory shared (`--shared-memory`), a build-time constant.
+  declare("__memory_shared__", mkFuncTy(noParams, TY_BOOL))
+  declare("__memory_copy__", mkFuncTy([TY_I32, TY_I32, TY_I32], TY_VOID))
+  declare("__memory_fill__", mkFuncTy([TY_I32, TY_I32, TY_I32], TY_VOID))
+  // The load-width matrix (`buffer-design.md` §C2). Each VL signature is the wasm instruction's
+  // signature, so there is nothing to choose beyond the name: the narrow loads all result in i32
+  // because that is what the instruction does, and the `_s`/`_u` split is why both spellings
+  // exist. The narrow stores truncate, so there is no `__store_u8__`/`__store_u16__` twin.
+  declare("__load_i8__", mkFuncTy([TY_I32], TY_I32))
+  declare("__load_u8__", mkFuncTy([TY_I32], TY_I32))
+  declare("__load_i16__", mkFuncTy([TY_I32], TY_I32))
+  declare("__load_u16__", mkFuncTy([TY_I32], TY_I32))
+  declare("__load_i64__", mkFuncTy([TY_I32], TY_I64))
+  declare("__load_f32__", mkFuncTy([TY_I32], TY_F32))
+  declare("__load_f64__", mkFuncTy([TY_I32], TY_F64))
+  // The zero-extending i64 loads: `i64.load{8,16,32}_u`, the non-atomic twins of the
+  // `__atomic_load*_u_i64__` rows. No signed trio: `__load_i32__(p) as i64` already is one.
+  declare("__load_u8_i64__", mkFuncTy([TY_I32], TY_I64))
+  declare("__load_u16_i64__", mkFuncTy([TY_I32], TY_I64))
+  declare("__load_u32_i64__", mkFuncTy([TY_I32], TY_I64))
+  // The SIMD substrate (`simd-design.md` §D6): one declaration per row of the intrinsic table,
+  // typed by the row's operand shape. A lane or shuffle index is a literal (checked below).
+  declareSimdIntrinsics()
+  // The atomics (`simd-design.md` §G1): one declaration per row of the atomic table.
+  declareAtomicIntrinsics()
+  // The scalar saturating truncations, one declaration per `0xFC` sub-opcode.
+  declareTruncSatIntrinsics()
+  // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
+  // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
+  // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
+  // out of band: a failing call answers an empty `u8[]` and `__fs_errno__()` carries WASI errno.
+  const u8Arr = mkArrayTy(TY_U8)
+  declare("__fs_read__", mkFuncTy([u8Arr], u8Arr))
+  declare("__fs_write__", mkFuncTy([u8Arr, u8Arr], TY_I32))
+  declare("__fs_list__", mkFuncTy([u8Arr], u8Arr))
+  declare("__fs_stat__", mkFuncTy([u8Arr], TY_I32))
+  declare("__fs_read_range__", mkFuncTy([u8Arr, TY_I64, TY_I32], u8Arr))
+  declare("__fs_size__", mkFuncTy([u8Arr], TY_I64))
+  declare("__fs_read_into__", mkFuncTy([u8Arr, TY_I64, TY_I32, TY_I32], TY_I32))
+  declare("__args_count__", mkFuncTy(noParams, TY_I32))
+  declare("__args_get__", mkFuncTy([TY_I32], u8Arr))
+  declare("__fs_errno__", mkFuncTy(noParams, TY_I32))
+  // The positional and appending writes: `mode` is 0 replace, 1 at `offset` without
+  // truncating, 2 append. The second takes its bytes from linear memory at `addr`.
+  declare("__fs_write_at__", mkFuncTy([u8Arr, TY_I64, u8Arr, TY_I32], TY_I32))
+  declare(
+    "__fs_write_from__",
+    mkFuncTy([u8Arr, TY_I64, TY_I32, TY_I32, TY_I32], TY_I32),
+  )
+  // The process floor (`std:process`, `std:env`): five more host imports on the same
+  // out-of-band error channel. `__proc_run__` takes the command and its arguments as ONE
+  // NUL-separated block — the one byte an argv element cannot hold — and answers the
+  // child's exit code; its two captured streams are fetched by the slots after it.
+  declare("__proc_run__", mkFuncTy([u8Arr], TY_I32))
+  declare("__proc_out__", mkFuncTy(noParams, u8Arr))
+  declare("__proc_err__", mkFuncTy(noParams, u8Arr))
+  declare("__proc_exit__", mkFuncTy([TY_I32], TY_NEVER))
+  declare("__env_get__", mkFuncTy([u8Arr], u8Arr))
+  0
+}
+
+// Does `ty` concatenate as a string? The `+` gate's operand test, in one home because the
+// checker and its pin mirror must not drift about it (D1732). A literal union of strings is a
+// SET of strings, so it concatenates and the result is `string` — never the union (D1739).
+export function concatsAsStr(ty: i32): boolean { isStringTy(softenLitTy(ty)) }
+
+function redunReset() {
+  redunSLine = []
+  redunSCol = []
+  redunELine = []
+  redunECol = []
+  redunName = []
+  redunType = []
+  redunTok = []
+  redunRet = []
+  0
+}
+
+export function isJoinHoleUnion(tyIx: i32) {
+  let k = 0
+  while k < joinHoleUnions.length {
+    if joinHoleUnions[k] == tyIx { return true }
+    k = k + 1
+  }
+  false
+}
+
+export let genFnCstrBusy = false
+export function genFnCstrBusySet(v: boolean) { genFnCstrBusy = v }
+
+// The list rows of the arguments written at the call as an empty `[]` or an
+// `__array_new_default__(…)`: the only open lists a callee's writes may decide (D2218).
+export function callSiteOpenListRows(args: i32[]): i32[] {
+  const rows: i32[] = []
+  for a in args {
+    const ax = peelParenIx(a)
+    if ax >= 0 && ax < P.nodes.length {
+      if isEmptyArrayLitNode(ax) || arrDefCallNode(ax) {
+        rows.push(nodeTyIxOf(ax))
+      }
+    }
+  }
+  rows
+}
+
+// Whether node `ix` is a `[]` with no elements.
+function isEmptyArrayLitNode(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is ArrayLit { return n.arrElems.length == 0 }
+  false
+}
+
+// Whether node `ix` is a recorded `__array_new_default__(n)` call.
+function arrDefCallNode(ix: i32): boolean { i32ListHas(arrDefCallIx, ix) }
+
+// A function type with each hole in its signature at that hole's pin, minted once per row. The
+// argument itself when it carries no hole; -1 for a non-function type, and for one whose holes
+// this program pinned to no single answer — the case a node two instances share cannot have.
+export function pinResolvedFnTy(tyIx: i32): i32 {
+  if tyIx < 0 { return -1 }
+  if !tyHasTyVar(tyIx) { return tyIx }
+  const memo = pinFnTy[tyIx] ?? -1
+  if memo >= 0 { return memo }
+  const t = T.tys[tyIx]
+  if t is TyFunc {
+    const ps: i32[] = []
+    let i = 0
+    while i < t.fnParamTypes.length {
+      const p = pinResolvedAtomTy(t.fnParamTypes[i])
+      if p < 0 { return -1 }
+      ps.push(p)
+      i = i + 1
+    }
+    const r = pinResolvedAtomTy(t.fnRet)
+    if r < 0 { return -1 }
+    const m = mkFuncTy(ps, r)
+    pinFnTy[tyIx] = m
+    return m
+  }
+  -1
+}
+
+// The redirect for another language's list constructor, keyed on the spelling `Array`; ""
+// for any other name.
+export function arrayCtorNote(name: string): string {
+  if name != "Array" { return "" }
+  " — VL has no `Array` constructor: `n` copies of `v` is `filled(n, v)` (`import { filled } from \"std:array\"`), and an empty list is `[]`"
+}
+
+// `arrayCtorNote` for an `Array` that is called (`Array(n, v)`), "" for any other use of the
+// name, such as `Array.isArray(x)`.
+export function arrayCtorCallNote(name: string, ix: i32): string {
+  if ix != ckCalleeIx { return "" }
+  arrayCtorNote(name)
+}
+
+// Resolves a written annotation name in the context of generic type-parameter names: params
+// bind to their `TyVar`s in the type-param environment `nameToTy` consults, so a bare `T`, a
+// `T[]` suffix, a structural shape, and a generic alias application all resolve through one
+// name grammar. Memoized only for the env-free case (a live `tpEnv` bypasses, since one spelling means different types under different bindings), and only once resolution succeeds.
+export let annotNameMemo: {[string]: i32} = Map()
+
+// Failed resolutions memoize too, under the version that failed (`cUserTypesVer`): a name
+// unresolvable now may resolve once later declarations register, so the negative hit is
+// honored only while no new declared-name resolution has registered since. `nameToTy` mints
+// partial types before failing, so an un-memoized failure re-probed in a loop would still grow the arena.
+export let annotNameMemoNegVer: {[string]: i32} = Map()
+
+// The component the failure banked also restores from a negative memo hit (`unkTyPart`) —
+// without it a diagnostic would quote whichever name failed last anywhere in the program,
+// since pass 1 hoists every signature (priming the negative memo) before pass 2 reports.
+export let annotPart: {[string]: string} = Map()
+
+// The unseparable-member reason (`unkTyClash`) restores the same way and for the same
+// mechanism: a negative memo hit returns -1 without re-entering the resolver, so a hoisted
+// pass-1 signature reported in pass 2 would otherwise fall back to the generic wording. Kept
+// as a separate map from `annotPart` since the two are different bank fields, each restored on its own.
+export let annotClash: {[string]: string} = Map()
+
+// The component banked for the failing spelling `name`, or "".
+export function annotPartOf(name: string) { return annotPart[name] ?? "" }
+
+// The unseparable-member reason banked for the failing spelling `name`, or "".
+export function annotClashOf(name: string) { return annotClash[name] ?? "" }
+
+// Whether `name` resolves to a module global whose declaration pass 2 has not reached.
+export function globalBeforeDecl(name: string): boolean {
+  lookupDepth(name) == 0 && (moduleBeforeDecl[name] ?? -1) >= 0
+}
+
+// A-exhaust: the arena nodes of `is` conditions `ifChainExhausts` PROVED true — the last arm
+// of an exhaustive chain, reached only when the value is one of the members no earlier arm
+// covers. The emitter reads it to lower that arm as the bare `else` the design names, rather
+// than re-deriving coverage from the arena.
+export let chainProvenCond: i32[] = []
+
+// Whether `ix` is a condition the exhaustiveness proof marked always-true.
+export function condProvenTrue(ix: i32) {
+  if ix < 0 { return false }
+  let i = 0
+  while i < chainProvenCond.length {
+    if chainProvenCond[i] == ix { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The container types `v128NestCheck` already reported, so one type is refused once.
+export let v128NestReported: i32[] = []
+
+// Readies the checker for another walk of the program it just checked: the parse's spellings
+// restored and every per-walk table emptied, the generic-token mark kept.
+export function checkRestart() {
+  const genTok = jwGenTokStart
+  canonRestoreSpellings()
+  initChecker()
+  jwSetGenTokStart(genTok)
+  0
+}
+
+// The joined list type `inferJoinListIdx` banked for the function keyed `name`, or -1.
+export function inferJoinListTyOf(name: string): i32 {
+  const h = inferJoinListIdx[name]
+  if h is i32 { return h }
+  -1
+}
+
+// The type the receiver of a member-path `is` test narrows to in the then branch — the
+// discriminant rule's answer, banked at the `is` node. -1 when the test does not discriminate
+// a parent union, which is when the emitter should push nothing.
+export function isParentTyIxOf(ix: i32) { colAt(isParentTyIx, ix) }
+
+// The else-branch twin: the type the receiver of a member-path test narrows to when the test
+// is false. -1 when the complement does not refine the parent, which is when the emitter
+// should push nothing.
+export function isParentElseTyIxOf(ix: i32) { colAt(isParentElseTyIx, ix) }
+
+// The context-resolved companion of `nodeTyIxOf`: returns the destination type recorded by
+// `recordRepTyAdopt` at an adoption site when present, else the naive `nodeTyIxOf`. The
+// emitter's rep/layer resolvers key on this so a widened literal's row resolves to the shape
+// the emitter actually builds.
+export function nodeRepTyIxOf(ix: i32) {
+  if ix >= 0 {
+    if ix < nodeRepTyIx.length {
+      const r = nodeRepTyIx[ix]
+      if r >= 0 { return r }
+    }
+  }
+  nodeTyIxOf(ix)
+}
+
+// The map type a union of maps at `ix` is delivered as, or -1 (`recordMapUnbox`).
+export function mapUnboxTyOf(ix: i32): i32 { colAt(mapUnboxTyIx, ix) }
+
+// The lazily-built placeholder `TyFunc` for closure pins — only its `is TyFunc`-ness is read
+// (via `nodeTyIsFunc`); the real signature rides the pin column's payload. Reset per program.
+export function funcPinTyIx() {
+  if cFuncPinTyIx < 0 {
+    const ps: i32[] = []
+    cFuncPinTyIx = mkFuncTy(ps, -1)
+  }
+  cFuncPinTyIx
+}
+
+// The lazily-built placeholder `TyObj` for interned anonymous shapes — only its `is TyObj`-ness
+// is read (`nodeTyIsStruct`); the real layout rides the `#anonN` name (the emitter's `sNames` table).
+export function objPinTyIx() {
+  if cObjPinTyIx < 0 {
+    const ns: string[] = []
+    const ts: i32[] = []
+    cObjPinTyIx = mkObjTy(ns, ts)
+  }
+  cObjPinTyIx
+}
+
+// Whether `nm` mentions any of the module's generic-alias type-parameter names
+// (`nameMentionsIdent`'s whole-token match, not a substring test).
+export function nameMentionsGenAliasParam(nm: string): boolean {
+  let i = 0
+  while i < gaParamNames.length {
+    if nameMentionsIdent(nm, gaParamNames[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Record `+` link `ix`, whose left operand checked as `lt`, for `plusLinkCount` and its readers.
+export function plusLinkRecord(ix: i32, lt: i32) {
+  if ix < 0 || ix >= nodeToks.length { return 0 }
+  const tk = nodeToks[ix]
+  if tk < 0 { return 0 }
+  plusLinkTok.push(tk)
+  if lt >= 0 && concatsAsStr(lt) {
+    plusLinkStr.push(1)
+  } else {
+    plusLinkStr.push(0)
+  }
+  0
+}
+
+export function plusLinkCount() { plusLinkTok.length }
+
+export function plusLinkTokAt(i: i32) { plusLinkTok[i] }
+
+export function plusLinkStrAt(i: i32) { plusLinkStr[i] }
+
+// Record index read `ix`, whose receiver checked as `rt`, for `strIdxCount` and its readers.
+export function strIdxRecord(ix: i32, rt: i32) {
+  if ix < 0 || ix >= nodeToks.length { return 0 }
+  const tk = nodeToks[ix]
+  if tk < 0 { return 0 }
+  strIdxTok.push(tk)
+  strIdxStr.push(if isStringTy(rt) { 1 } else { 0 })
+  0
+}
+
+export function strIdxCount() { strIdxTok.length }
+
+export function strIdxTokAt(i: i32) { strIdxTok[i] }
+
+export function strIdxStrAt(i: i32) { strIdxStr[i] }
+
+// Whether the `match` arm `body` is a block that always exits, which hands the join nothing and
+// is noted for the emitter's `never` tail, as an `if` arm is (D3222).
+export function matchArmExits(ix: i32, body: i32, armTy: i32): boolean {
+  // An arm with a value cannot always exit, and a statement or tail `match` (`matchOnSpine`)
+  // lowers its arms without one, so neither pays for the walk of the arm.
+  if matchOnSpine || !isVoidTy(armTy) || !(P.nodes[body] is Block) {
+    return false
+  }
+  const mn = P.nodes[ix]
+  let first = false
+  if mn is MatchExpr {
+    first = mn.matchBodies.length > 0 && mn.matchBodies[0] == body
+  }
+  if !stmtAlwaysExits(body) { return false }
+  if first && atValueArmTail(ix) { lpColSet(nestedExitFirstAt, ix, 1) }
+  noteExitArm(body)
+  if first { noteExitFirst(ix) }
+  true
+}
+
+// Whether a `const`-pattern refusal already reported arm pattern `patIx`.
+export function matchPatWasRefused(patIx: i32) {
+  matchPatRefused[patIx] ?? false
+}
+
+export let matchOnSpine = false
+export function matchOnSpineSet(v: boolean) { matchOnSpine = v }
+
+// Banks, the first time a name reaches `fvaAdapt`, the declaration it resolves to there.
+export function fvaNoteNameDecl(srcExpr: i32) {
+  if srcExpr < 0 { return 0 }
+  const x = parenPeelIx(srcExpr)
+  if x < 0 || fvaNameDecl.has(x) { return 0 }
+  const n = P.nodes[x]
+  if n is Ident { fvaNameDecl.set(x, lookupFnDeclNode(n.identName)) }
+  0
+}
+
+// The function declaration name node `ix` resolves to in its own scope, else in this one.
+function fvaDeclOfName(ix: i32, name: string): i32 {
+  const banked = fvaNameDecl.get(ix) ?? -2
+  if banked != -2 { return banked }
+  lookupFnDeclNode(name)
+}
+
+// Whether `n` (node `ix`) names a generic function declaration.
+export function fvaNamesGeneric(n: Node, ix: i32): boolean {
+  if n is Ident {
+    const gd = fvaDeclOfName(ix, n.identName)
+    if gd < 0 { return false }
+    const gf = P.nodes[gd]
+    if gf is FuncDecl { return gf.fnTyParams.length > 0 }
+  }
+  false
+}
+
+// Whether `n` (node `ix`) names a binding the adapter may read at call time: a function
+// declaration or a `const`, neither of which a later statement can rebind.
+export function fvaStableName(n: Node, ix: i32): boolean {
+  if n is Ident {
+    if fvaDeclOfName(ix, n.identName) >= 0 { return true }
+    return isConstName(n.identName)
+  }
+  false
+}
+
+// The type of the statement the enclosing block checked last: a `break v`'s value is the
+// statement just before the break (`BreakStmt.brkHasVal`).
+export let brkPrevTy = -1
+export function brkPrevTySet(v: i32) { brkPrevTy = v }
+
+// The arm block of a value `if` or `match` being checked, or -1. A construct standing at its tail
+// is read through its first arm by the enclosing construct's classifiers, which a first arm with
+// no value misleads, so an exit there keeps the `void` join and its check reject (D3222).
+export let valueArmAt = -1
+export function valueArmAtSet(v: i32) { valueArmAt = v }
+
+// Whether the construct at `ix` is the tail statement of the value arm block being checked. A
+// construct elsewhere in the arm, such as a binding's initializer, is read by its own name.
+export function atValueArmTail(ix: i32): boolean {
+  if chkStmtBlk < 0 || chkStmtBlk != valueArmAt { return false }
+  const b = P.nodes[chkStmtBlk]
+  if b is Block {
+    const st = b.blkStmts
+    return st.length > 0 && cwPeel(st[st.length - 1]) == ix
+  }
+  false
+}
+
+// The `match`es whose exiting first arm stands at another construct's value arm tail, whose
+// joined type `refuseNestedExitFirst` asks once it is known.
+export let nestedExitFirstAt: i32[] = []
+
+// Whether any loop or labelled block of the program carries a value, so the emitter's
+// rewrite of them costs a program without one nothing.
+export function loopValAny(): boolean { lpValSeen }
+
+export let lpValSeen = false
+export function lpValSeenSet(v: boolean) { lpValSeen = v }
