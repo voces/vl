@@ -11011,10 +11011,26 @@ function monoFlowLeafGen(v: i32): i32 {
     return monoFlowLeafGen(c)
   }
   if !(n is Ident) { return -1 }
-  const g = identDeclOf(v)
-  if !(mfrGen[g] ?? false) { return -1 }
-  if (mfrNameCount[n.identName] ?? 0) != 1 { return -1 }
-  g
+  // A chain of un-annotated `const` aliases names what its last initializer names (D5061).
+  let r = v
+  let hops = 0
+  while hops <= MONO_ALIAS_CHAIN_MAX {
+    const rn = P.nodes[r]
+    if !(rn is Ident) { return -1 }
+    const g = identDeclOf(r)
+    if g < 0 { return -1 }
+    const ad = P.nodes[g]
+    if !(ad is LetDecl) {
+      if !(mfrGen[g] ?? false) { return -1 }
+      if (mfrNameCount[rn.identName] ?? 0) != 1 { return -1 }
+      return g
+    }
+    if ad.letKw != "const" || ad.letType >= 0 || ad.letInit < 0 { return -1 }
+    r = unwrapParen(ad.letInit)
+    if r < 0 { return -1 }
+    hops = hops + 1
+  }
+  -1
 }
 
 // Whether the slot at `path` of binding `d` holds generic `g` alone, unwritten: each source the
@@ -11769,6 +11785,46 @@ function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
   0
 }
 
+// Types each read `d.name` in frame `fx` of the record binding declared at `at` at the pinned
+// function type `ft` where the checker left it open, so a call through the field has a
+// signature when the field's value is not a name the emitter resolves to one function (D5061).
+// A generic's frame is declined: its instances share the read node, so one type cannot serve.
+function monoRetypeFieldReads(fx: i32, at: i32, name: string, ft: i32) {
+  const d = P.nodes[at]
+  if !(d is LetDecl) { return 0 }
+  const stack: i32[] = []
+  if fx >= 0 {
+    if monoFrameIsGenericInstance(fx) { return 0 }
+    const b = monoNestedBodyOf(fx)
+    if b < 0 { return 0 }
+    stack.push(b)
+  } else {
+    for st in monoProgStmts { stack.push(st) }
+  }
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Member {
+        const o = unwrapParen(n.memObj)
+        if n.memProp == name && o >= 0 {
+          const on = P.nodes[o]
+          if on is Ident {
+            if on.identName == d.letName && monoReadIsBinding(o, fx, at) {
+              const rt = nodeTyIxOf(ix)
+              if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(ix, ft) }
+            }
+          }
+        }
+      }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  0
+}
+
 // `monoPinRecordFields` for the field `name` initialized with `val`.
 function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   const lf: i32[] = [ctx, at]
@@ -11783,6 +11839,7 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   if !monoTyConcreteFn(ft) { return 0 }
   const vt = nodeTyIxOf(val)
   if vt < 0 || tyHasTyVar(vt) { nodeTyRecord(val, ft) }
+  monoRetypeFieldReads(ctx, at, name, ft)
   for w in monoWritesOf("f:", at) {
     const wb = P.nodes[w]
     const wf = monoLetWriteFrame(lf, w)
