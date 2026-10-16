@@ -1,0 +1,1691 @@
+// `emit_ty_canon.vl` — a type's canonical key and spelled-alike tests, and the
+// pinned or hole type a binding, operand or instance carries.
+
+import {
+  BinExpr,
+  Block,
+  ForIn,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  NullLit,
+  NumLit,
+  P,
+  Param,
+  Unary,
+} from "./ast"
+import { holePinReadOf } from "./check_emit_queries"
+import { narrowKeyRoot } from "./check_getter_effects"
+import { nodeTyPinIxOf } from "./check_hole_pins"
+import { condRhsRetiredOf } from "./check_leaf_steps"
+import { isVarTyIxOf } from "./check_list_union"
+import { cmpLitNodeOf } from "./check_match_desugar"
+import { nodeTyIsNullable, nodeTyIxOf } from "./check_node_tys"
+import { tyIsTpJoinUnion } from "./check_tp_join"
+import { mapValSoftBase } from "./check_ty_relate"
+import { MAP_KEY_I32, MAP_KEY_I64, isValueUnionName } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litBaseTy,
+  mkArrayTy,
+  mkArrayViewTy,
+  mkNullableTyOf,
+  nomNameOfTy,
+  numLitUnionBaseName,
+  primNameStr,
+  tyEq,
+  tyIsLitUnion,
+  tyIsLitUnionOrLit,
+  tyIsNullableLitUnion,
+  tyPrimNameOf,
+  tySame,
+  tyScalarBaseIs,
+  tyToEmitName,
+  tyToNominalName,
+  tyToStr,
+} from "./check_types"
+import { tyOfMembers } from "./check_union_mint"
+import {
+  indexPathKeyOf,
+  mapShapeFoldSet,
+  parentLetOf,
+  strLess,
+  subscriptKeyLexemeOf,
+  unwrapParen,
+} from "./emit_base"
+import { fnStmtsPosOf, modLoopHolding } from "./emit_capture_frames"
+import { vkListClass } from "./emit_list_rep"
+import { mvUnionIsScalarNull } from "./emit_map_value_slots"
+import { mapMonoShapeOfKey, mvSlotOfValTyK } from "./emit_mv_slots"
+import {
+  narrowPathIdx,
+  narrowShadowSlot,
+  narrowSlotOf,
+  narrowVariantFor,
+  retireNarrowFor,
+  variantIndexOf,
+} from "./emit_narrow_slots"
+import { ifArmValueExpr, paramTypeNode } from "./emit_query"
+import {
+  RepDesc,
+  mapShapeKeyKind,
+  repOfNodeAt,
+  repOfTy,
+  tyMapKeyKind,
+} from "./emit_rep"
+import { mvCanonRepOf } from "./emit_shape_rows"
+import {
+  MVK_F32,
+  MVK_F64,
+  MVK_I64,
+  MVK_UNION,
+  VKind,
+  fnParent,
+  fnStmts,
+  mTwinCodes,
+  mTwinExtra,
+  mTwinShapes,
+  mTwinTys,
+  monoExactSubN,
+  monoExactSubRow,
+  monoExactSubT,
+  monoHoleSubN,
+  monoHoleSubRow,
+  monoHoleSubT,
+  monoParamPinTy,
+  monoPinSubN,
+  monoPinSubRow,
+  monoPinSubT,
+  mvValKind,
+  narrowNames,
+  narrowRetired,
+  narrowTop,
+  narrowVariants,
+} from "./emit_state"
+import {
+  removeAtomFromSet,
+  unMemAtomKind,
+  unMemIsMap,
+  unMemPeelAliasWrapper,
+  unionMemberSetOf,
+  unionSetHasNull,
+  unionSetNonNullCount,
+} from "./emit_union_registry"
+import { i32ListHas } from "./listutil"
+import { unionMemberCount } from "./tyname"
+import { bindGenWalk, substTyDeep, tyProvesNonNull } from "./typecheck"
+import {
+  flattenVariantsInto,
+  numLitUnionHasBase,
+  tyEmitPrimOf,
+  tyHasTyVar,
+  tyLitSetMemberLexes,
+  tyMapValOf,
+} from "./tyquery"
+
+// The set a null test over the index cell keyed `ik` subtracts from: a live narrowing that
+// an `is` complement left narrower than the declared set and still admitting `null`, else
+// its element union `un`'s declared set (D2586).
+export function indexCellCurSet(ik: string, un: string): string {
+  const dcl = unionMemberSetOf(un)
+  const slot = narrowSlotOf(ik)
+  if slot < 0 { return dcl }
+  const cur = narrowVariants[slot]
+  if cur == "" || cur == "null" || removeAtomFromSet(cur, "null") == cur {
+    return dcl
+  }
+  if unionMemberCount(cur) >= unionMemberCount(dcl) { return dcl }
+  cur
+}
+
+// Is `k` a place BELOW `tgt` — `tgt[…]`, `tgt.f`, or anything under those? The emitter's
+// copy of `writeRetiresNarrowing`'s prefix legs, in both separators, so a write retires the
+// same keys on both sides of the compiler.
+function keyIsBelow(k: string, tgt: string): boolean {
+  const n = tgt.length
+  if k.length <= n + 1 { return false }
+  if k[n] != '[' && k[n] != '.' { return false }
+  k.slice(0, n) == tgt
+}
+
+// Retire every live narrowing whose key is a place below the one keyed `root` — the
+// emitter twin of `retireNarrowingsForWrite`'s prefix rule. Needed because the checker
+// retires and re-types a write's reads at the declared rep, which for a niche cell is one
+// `print` renders fine, so the program stays check-clean while the stale emit-side entry traps.
+export function retireNarrowForIndexCells(root: string) {
+  if root == "" || narrowTop == 0 { return 0 }
+  const l = narrowPathIdx[narrowKeyRoot(root)]
+  if l == null { return 0 }
+  // A path below the root's innermost shadow is the outer binding's, and stays.
+  const shadow = narrowShadowSlot(narrowKeyRoot(root))
+  // Keeps the entries this write leaves standing, so the next write does not re-read the rest.
+  const keep: i32[] = []
+  let j = 0
+  while j < l.length {
+    const s = l[j]
+    if s >= 0 && s < narrowTop && narrowRetired[s] == 0 {
+      if s > shadow && keyIsBelow(narrowNames[s], root) {
+        narrowRetired[s] = 1
+      } else {
+        keep.push(s)
+      }
+    }
+    j = j + 1
+  }
+  narrowPathIdx[narrowKeyRoot(root)] = keep
+  0
+}
+
+// True when the index place `xs[0]` carries a live narrowing that excludes `null` — the
+// question a niche read asks before recovering non-null. Deliberately not
+// `narrowExcludesNull`, which needs an arena type behind the entry (`narrowSlotTy >= 0`); a
+// niche push banks a rendered spelling only, so that predicate would answer false for every one of them.
+export function indexPlaceNonNull(idxIx: i32) {
+  const k = indexPathKeyOf(idxIx)
+  if k == "" { return false }
+  const v = narrowVariantFor(k)
+  if v == "" { return false }
+  v != "null"
+}
+
+// Retire the narrowings the left operand of the `&&`/`||` at `opIx` pushed from slot `mark` on
+// that its right operand writes, as the checker drops those facts (D2589). A re-test in the
+// right operand pushes afresh above them.
+export function retireRhsWritten(opIx: i32, mark: i32) {
+  const gone = condRhsRetiredOf(opIx)
+  if gone == "" { return 0 }
+  let i = mark
+  while i < narrowTop {
+    if narrowRetired[i] == 0 && gone.indexOf("," + narrowNames[i] + ",") >= 0 {
+      narrowRetired[i] = 1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// `x == L` over a literal union (Q10): the receiver `x`, or -1 when the checker banked no literal
+// test at `condIx` (a plain `string` or `i32` operand, which narrows nothing).
+export function litEqRecv(condIx: i32): i32 {
+  if condIx < 0 || isVarTyIxOf(condIx) < 0 { return -1 }
+  const c = P.nodes[condIx]
+  if !(c is BinExpr) { return -1 }
+  if litEqLexeme(c.binRight) != "" { return c.binLeft }
+  if litEqLexeme(c.binLeft) != "" { return c.binRight }
+  -1
+}
+
+// The `is` spelling of an operand the checker reads as a literal (`cmpLitNodeOf`) — its source
+// lexeme — or "" when it is not one.
+function litEqLexeme(ix: i32): string {
+  const lx = cmpLitNodeOf(ix)
+  if lx < 0 { return "" }
+  const e = P.nodes[lx]
+  if e is NumLit { return e.numText }
+  subscriptKeyLexemeOf(lx)
+}
+
+// The tested literal of a comparison `litEqRecv` accepted.
+export function litEqVariant(condIx: i32): string {
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    const r = litEqLexeme(c.binRight)
+    if r != "" { return r }
+    return litEqLexeme(c.binLeft)
+  }
+  ""
+}
+
+// The name a narrowing test of the operand at `ix` narrows: the target of an assignment it tests
+// (`(x = e) != null` narrows `x`, the checker's `asgTestedPlace`), else `ix`. -1 stays -1.
+export function asgTestedIdent(ix: i32): i32 {
+  if ix < 0 { return ix }
+  const u = unwrapParen(ix)
+  if u < 0 { return ix }
+  const n = P.nodes[u]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const t = unwrapParen(n.binLeft)
+      if t >= 0 && P.nodes[t] is Ident { return t }
+    }
+  }
+  ix
+}
+
+// The one base of the literals the checker typed null compare `condIx`'s operand at beside
+// `null`, or -1 when the operand's type is anything else.
+export function nullCmpLitBase(condIx: i32): i32 {
+  const ref = nullCmpRefOf(condIx)
+  if ref < 0 { return -1 }
+  const ty = nodeTyIxOf(ref)
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  let inner = ty
+  let sawNull = false
+  const t = T.tys[ty]
+  if t is TyNullable {
+    sawNull = true
+    inner = t.nInner
+    if inner < 0 || inner >= T.tys.length { return -1 }
+  }
+  const it = T.tys[inner]
+  const mems = if it is TyUnion { it.uMembers } else { [inner] }
+  let base = -1
+  for m in mems {
+    if m < 0 || m >= T.tys.length { return -1 }
+    const mt = T.tys[m]
+    if mt is TyLit {
+      const b = litBaseTy(mt)
+      if base >= 0 && base != b { return -1 }
+      base = b
+    } else if tyPrimNameOf(m) == "null" {
+      sawNull = true
+    } else {
+      return -1
+    }
+  }
+  if !sawNull { return -1 }
+  base
+}
+
+// The non-null operand of a `x == null` / `x != null` comparison at `condIx` (parens
+// peeled, either operand order), or -1 when `condIx` isn't a null compare. The one home
+// for that extraction — a grammar question (which side is the literal), not a per-rep
+// one, so a rep added to one selector can't get the peel subtly different from its siblings.
+export function nullCmpRefOf(condIx: i32) {
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "==" || c.binOp == "!=" {
+      const lhs = P.nodes[unwrapParen(c.binLeft)]
+      const rhs = P.nodes[unwrapParen(c.binRight)]
+      if rhs is NullLit { return unwrapParen(c.binLeft) }
+      if lhs is NullLit { return unwrapParen(c.binRight) }
+    }
+  }
+  -1
+}
+
+// Whether a place's union is a box a null compare narrows: a value union, or a struct union
+// with `null` and two or more arms — the same pair the ident arms split between them (D2565).
+export function nullCmpBoxUnion(un: string): boolean {
+  if isValueUnionName(un) { return true }
+  const uset = unionMemberSetOf(un)
+  unionSetHasNull(uset) && unionSetNonNullCount(uset) >= 2
+}
+
+// D1193/D1194 — the spelling to push for the sole survivor of a literal complement, or ""
+// when the survivor is one this narrowing cannot name. Two survivor kinds, two renderers: a
+// value atom needs its canonical spelling (`tyToEmitName`); a struct arm needs the nominal
+// one, and only when registered (`variantIndexOf`). Anything else answers "".
+export function litElseSurvName(surv: i32): string {
+  if unMemAtomKind(surv) >= 0 { return tyToEmitName(surv) }
+  const nom = tyToNominalName(surv)
+  if nom == "" { return "" }
+  if variantIndexOf(nom) < 0 { return "" }
+  nom
+}
+
+// The one base scalar every literal that survives `is variant` over the literal box `mems` has,
+// or -1: the else of `x is "s"` or `x is string` over `1 | 2 | "s"` holds an `i32` (D3522). A
+// member is ruled out by its lexeme or by its base's name; the box spans two bases or more.
+export function litBoxElseBase(mems: i32[], variant: string): i32 {
+  let survBase = -1
+  let hit = 0
+  const bases: i32[] = []
+  for m in mems {
+    if m < 0 { return -1 }
+    const mt = T.tys[m]
+    if !(mt is TyLit) { return -1 }
+    const b = litBaseTy(mt)
+    let seen = false
+    for o in bases {
+      if o == b { seen = true }
+    }
+    if !seen { bases.push(b) }
+    const lex = tyLitSetMemberLexes(m)
+    if (
+      (lex.length == 1 && lex[0] == variant)
+      || primNameStr(tyEmitPrimOf(b)) == variant
+    ) {
+      hit = hit + 1
+    } else if survBase < 0 {
+      survBase = b
+    } else if survBase != b {
+      return -1
+    }
+  }
+  if hit == 0 || bases.length < 2 { return -1 }
+  survBase
+}
+
+// False only when `setNarrowFromCondElse` provably pushes nothing for `condIx`: every arm there
+// needs an `is`, a `!`, or a `||` / `==` / `!=` at the top of the condition. Keep the two in step.
+export function condElseMayNarrow(condIx: i32): boolean {
+  const c = P.nodes[unwrapParen(condIx)]
+  if c is IsExpr { return true }
+  if c is Unary { return c.unOp == "!" }
+  if c is BinExpr {
+    return c.binOp == "||" || c.binOp == "==" || c.binOp == "!="
+  }
+  false
+}
+
+// Retire every name in `names` — the checker's call retirements, mirrored (D2390). A name a
+// closure writes lives in a cell by then, `v[0]` for a `let` and `v$cb[0]` for a parameter or a
+// loop variable (`cboxWalk`), and its narrowing is keyed on that cell.
+export function retireNarrowNames(names: string[]) {
+  let i = 0
+  while i < names.length {
+    retireNarrowFor(names[i])
+    retireNarrowForIndexCells(names[i])
+    retireNarrowForIndexCells(names[i] + "$cb")
+    i = i + 1
+  }
+  0
+}
+
+// End the loop variable's shadow of `name` once its loop is done.
+export function unshadowNarrowFor(name: string) {
+  const b = narrowShadowSlot(name)
+  if b >= 0 { narrowRetired[b] = 1 }
+  0
+}
+
+// Rewind the narrowing stack depth back to `n` (drop bindings a branch pushed). The
+// arrays keep their backing slots — only the logical depth changes, so no `.pop()`.
+export function restoreNarrow(n: i32) {
+  narrowTop = n
+  0
+}
+
+// `ty` at the pin of the instance `fnIx` is, or is lifted inside: its type parameters or holes
+// bound to this instance's pins; -1 where one stays open.
+export function instanceTyOf(ty: i32, fnIx: i32): i32 {
+  if ty < 0 || !tyHasTyVar(ty) { return ty }
+  const row = monoExactSubRowOf(fnIx)
+  if row >= 0 && row < monoExactSubN.length {
+    const st = substTyDeep(ty, monoExactSubN[row], monoExactSubT[row])
+    if st >= 0 && !tyHasTyVar(st) { return st }
+  }
+  const p = pinSubOperandTyOf(ty, fnIx)
+  if p >= 0 { return p }
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const hrow = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if hrow < 0 || hrow >= monoHoleSubN.length { return -1 }
+  const b = holePinReadOf(ty, monoHoleSubN[hrow], monoHoleSubT[hrow])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// Whether a `for` range's step is a constant the emitter FOLDS — absent (the implicit `+1`),
+// an integer literal, or a negated one. Anything else is evaluated once into the loop's own
+// step slot, so the collect pass and the emitter read this one predicate rather than each
+// deciding which loops own that slot.
+export function forRangeStepIsConst(stepIx: i32) {
+  if stepIx < 0 { return true }
+  const st = P.nodes[stepIx]
+  if st is Unary {
+    // A negation folds exactly when its operand is the literal — `step -1` does, `step -n`
+    // does not — which is the same question one node down.
+    if st.unOp == "-" { return exprIsNumberLiteral(st.unArg) }
+    return false
+  }
+  exprIsNumberLiteral(stepIx)
+}
+
+// Whether `ix` is a NUMBER literal. Every other expression shape is EVALUATED rather than
+// folded, which is the whole of the classification above — there is no third answer.
+function exprIsNumberLiteral(ix: i32) {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is NumLit { return true }
+  false
+}
+
+// The element kind a map shape's keys bind at: `str`, `i32` or `i64`, by the shape's key kind.
+export function mapKeyElemVKind(sh: i32): VKind {
+  const kk = mapShapeKeyKind(sh)
+  if kk == MAP_KEY_I32 { return "i32" }
+  if kk == MAP_KEY_I64 { return "i64" }
+  "str"
+}
+
+// The value-atom kind a numeric literal union reps as inside the union box — `1 | 2` → 0
+// (i32), `1.5 | 2.5` → 4 (f64) — or -1 otherwise. A numeric litunion is not the `-1`
+// sentinel `K | null` uses: its rep is the number itself (#1866), so no bit pattern is
+// spare, and `{[string]: N}` needs the same conditional box every no-spare scalar needs (D6).
+function numLitUnionBoxKind(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const bn = numLitUnionBaseName(ty)
+  if bn == "i32" { return 0 }
+  if bn == "i64" { return 3 }
+  if bn == "f64" { return 4 }
+  -1
+}
+
+// `numLitUnionBoxKind` asked of a map READ expression inside `fnIx`, from the receiver's type
+// there (`mapRecvTyIn`) — the one place the numeric-litunion rule is applied.
+export function mapReadNumLitBoxKind(exprIx: i32, fnIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is Index) { return -1 }
+  const rt = mapRecvTyIn(e.idxArr, fnIx)
+  if rt < 0 { return -1 }
+  const r = T.tys[rt]
+  if !(r is TyMap) { return -1 }
+  numLitUnionBoxKind(r.mVal)
+}
+
+// The arena-only twin of `mapReadScalarBoxKind` below: same question, answered from the
+// recorded types alone so it can run in passes with no enclosing function. A twin rather
+// than a default argument: `mapReadScalarBoxKind` resolves its receiver through the
+// function's locals, so a missing `fnIx` would silently answer "not a map read" everywhere.
+export function mapReadScalarBoxKindTy(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is Index) { return -1 }
+  mapRecvScalarBoxKindTy(e.idxArr)
+}
+
+// `mapReadScalarBoxKindTy` asked of the map RECEIVER: the atom kind its scalar value boxes at,
+// or -1 for a value with a niche of its own or no scalar rep.
+export function mapRecvScalarBoxKindTy(recvIx: i32) {
+  if recvIx < 0 { return -1 }
+  mapTyScalarBoxKind(nodeTyPinIxOf(recvIx))
+}
+
+// `mapRecvScalarBoxKindTy` inside function `fnIx`, whose instance may pin the receiver.
+export function mapRecvScalarBoxKindIn(recvIx: i32, fnIx: i32) {
+  mapTyScalarBoxKind(mapRecvTyIn(recvIx, fnIx))
+}
+
+// `mapRecvScalarBoxKindTy` of the map type `rt` itself.
+function mapTyScalarBoxKind(rt: i32) {
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  const r = T.tys[rt]
+  if !(r is TyMap) { return -1 }
+  const v = r.mVal
+  if v < 0 { return -1 }
+  // Every niche-bearing value carries its own "absent" and must keep today's lowering.
+  if tyIsLitUnion(v) { return -1 }
+  // The numeric litunion has no niche (see `numLitUnionBoxKind` above): it takes the box,
+  // at its base scalar's atom, asked before `tyScalarBaseIs` since the two questions differ.
+  const nlk = numLitUnionBoxKind(v)
+  if nlk >= 0 { return nlk }
+  if numLitUnionHasBase(v) { return -1 }
+  if tyScalarBaseIs(v, "boolean") { return -1 }
+  if tyScalarBaseIs(v, "i32") { return 0 }
+  if tyScalarBaseIs(v, "i64") { return 3 }
+  if tyScalarBaseIs(v, "f64") { return 4 }
+  if tyScalarBaseIs(v, "f32") { return 5 }
+  -1
+}
+
+// True when a `m[k] ?? d` read over the map value slot `cns` stays nullable — i.e. the
+// default `d` is itself nullable (a bare `null`, or a nullable-typed default). A miss is the
+// read's null whether or not the value type admits one, so the slot's own nullability does
+// not enter: `m[k] ?? null` over `{[K]: V}` is `V | null` (D2247).
+export function coalesceStaysNullable(exprIx: i32, cns: i32, _fnIx: i32) {
+  if cns < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" {
+      const d = P.nodes[unwrapParen(e.binRight)]
+      if d is NullLit { return true }
+      return nodeTyIsNullable(e.binRight)
+    }
+  }
+  false
+}
+
+// True when `m[k] ?? d` over the map value slot `cns` is the value-union box because `d` is
+// nullable and the value is a scalar: a `scalar | null` union value, or an f64/i64/f32 one. The
+// fused get builds exactly this rep (`emitMapGetOrScalarBox`, `emitMapGetOrUnionBox`).
+export function coalesceKeepsScalarBox(exprIx: i32, cns: i32, fnIx: i32) {
+  if !coalesceStaysNullable(exprIx, cns, fnIx) { return false }
+  const k = mvValKind[cns]
+  if k == MVK_UNION { return mvUnionIsScalarNull(cns) }
+  k == MVK_I64 || k == MVK_F64 || k == MVK_F32
+}
+
+// The LHS place of a non-map `??`, or -1 when `exprIx` isn't a `??` — the consumer-side
+// hook of every nullable-niche `??` arm, the counterpart of `coalesceMvSlot` for the fused
+// map-get spellings. `p ?? d` carries the LHS's rep in both halves, so the rep question and
+// the nullable-half question (`coalesceDefaultNullable`) come from two separate homes.
+export function coalesceNicheLhs(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is BinExpr {
+    if e.binOp == "??" { return e.binLeft }
+  }
+  -1
+}
+
+// True when the `??` at `exprIx` is lowered in an instance that re-typed its operand to a
+// literal union, which excludes `null`, while the `??` reads as `string`: the default is dead
+// and the operand's atom widens to the string it names (D3423).
+export function coalesceRetypedAtomToStr(exprIx: i32, fnIx: i32): boolean {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is BinExpr) || e.binOp != "??" || !fnInPinnedInstance(fnIx) {
+    return false
+  }
+  tyIsLitUnionOrLit(nodeTyIxOf(unwrapParen(e.binLeft)))
+    && tyPrimNameOf(nodeTyPinIxOf(exprIx)) == "string"
+}
+
+// The type an instance pins the `??` operand `lhsIx` to, when the generic body records it at
+// a type parameter; -1 otherwise.
+export function coalesceOperandPinTy(lhsIx: i32, fnIx: i32): i32 {
+  const h = holeOperandTyOf(lhsIx, fnIx)
+  if h >= 0 { return h }
+  const own = nodeTyIxOf(lhsIx)
+  if own < 0 || own >= T.tys.length { return -1 }
+  if !(T.tys[own] is TyVar) { return -1 }
+  const p = nodeTyPinIxOf(lhsIx)
+  if p == own { return -1 }
+  p
+}
+
+// Whether `ty` is `<prim> | null`.
+export function tyIsNulPrim(ty: i32, prim: string): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 { return false }
+    const it = T.tys[t.nInner]
+    if it is TyPrim { return it.primName == prim }
+  }
+  false
+}
+
+// Whether a folded map shape is one of the three mono structs a slot does not name.
+export function mapShapeIsMono(sh: i32): boolean {
+  sh == -1 || sh == -4 || sh == -6
+}
+
+// Whether two folded shapes name one map struct: two value slots that are canonical twins
+// (a nullable-ref value and its non-null twin store alike), or one mono shape. A mono shape is
+// compared as it stands, so collection never asks a value slot's struct before it is settled.
+export function mapTwinOneStruct(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return a == b }
+  mvCanonRepOf(a) == mvCanonRepOf(b)
+}
+
+// Whether `s` is a `Set<K>` and `m` the `{[K]: boolean}` a union spelling renders it as.
+export function mapSetSpelledAs(s: i32, m: i32): boolean {
+  if s < 0 || m < 0 { return false }
+  const st = T.tys[s]
+  const mt = T.tys[m]
+  if st is TyMap {
+    if mt is TyMap {
+      if st.mSet == 1 && mt.mSet == 0 {
+        return tyEq(st.mKey, mt.mKey) && tyScalarBaseIs(mt.mVal, "boolean")
+      }
+    }
+  }
+  false
+}
+
+// Whether `a` and `b` are one type once every nested Set is spelled as its boolean map, as a
+// union's spelling renders its members; union members compare in order, as `tyEq`'s do.
+export function tySameSpelled(a: i32, b: i32, depth: i32): boolean {
+  if tyEq(a, b) { return true }
+  if a < 0 || b < 0 || depth <= 0 { return false }
+  if tyWalkPairOn(a, b) { return true }
+  if tyWalkA.length == 0 { tyWalkReset() }
+  // Past the shallow depth a shared part (a diamond) is compared once per pair.
+  const deep = depth <= TY_WALK_DEPTH - 12
+  if deep {
+    const row = tySpelledMemo.get(a)
+    if row != null {
+      const hit = row.get(b)
+      if hit != null { return hit }
+    }
+  }
+  if tyWalkBudget <= 0 { return false }
+  tyWalkBudget = tyWalkBudget - 1
+  tyWalkA.push(a)
+  tyWalkB.push(b)
+  const r = tySameSpelledGo(a, b, depth)
+  tyWalkA.pop()
+  tyWalkB.pop()
+  if deep { tyWalkMemoSet(tySpelledMemo, a, b, r) }
+  r
+}
+
+function tySameSpelledGo(a: i32, b: i32, depth: i32): boolean {
+  const xs: i32[] = []
+  const ys: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(a), xs)
+  flattenVariantsInto(unMemPeelAliasWrapper(b), ys)
+  if xs.length != ys.length { return false }
+  if xs.length > 1 {
+    let i = 0
+    while i < xs.length {
+      if !tySameSpelled(xs[i], ys[i], depth - 1) { return false }
+      i = i + 1
+    }
+    return true
+  }
+  const x = xs[0]
+  const y = ys[0]
+  if x < 0 || y < 0 { return x == y }
+  const tx = T.tys[x]
+  match tx {
+    TyMap => {
+      return tySameSpelledMap(tx, y, depth)
+    }
+    TyArray => {
+      return tySameSpelledList(tx.aElem, y, depth)
+    }
+    TyObj => {
+      if nomNameOfTy(x) != nomNameOfTy(y) { return false }
+      return tySameSpelledObj(tx, y, depth)
+    }
+    // The flattening above leaves no union or nullable here, and no other kind holds a Set.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return tyEq(x, y)
+    }
+  }
+}
+
+// Whether a Set appears anywhere in `ty` below a list, map or union: a spelling renders it as its
+// boolean map, so a slot keyed by that spelling is not its own.
+export function tyMentionsSet(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 || i32ListHas(tySetWalk, ty) { return false }
+  if tySetWalk.length == 0 {
+    tySetBudget = 100000
+    if tySetFreeN > 0 {
+      tySetFree = Map()
+      tySetFreeN = 0
+    }
+  }
+  if tySetFree.has(ty) { return false }
+  if tySetBudget <= 0 { return true }
+  tySetBudget = tySetBudget - 1
+  tySetWalk.push(ty)
+  const r = tyMentionsSetGo(ty, depth)
+  tySetWalk.pop()
+  if !r {
+    tySetFree.set(ty, true)
+    tySetFreeN = tySetFreeN + 1
+  }
+  r
+}
+
+// The types a `tyMentionsSet` walk is inside: one met again is a cycle, and adds no Set.
+const tySetWalk: i32[] = []
+// The distinct types one outermost walk may still visit (past it, yes, refusing a tag), and the
+// ones it found free of a Set, so a shared part is read once.
+let tySetBudget = 100000
+let tySetFree: {[i32]: boolean} = Map()
+let tySetFreeN = 0
+
+function tyMentionsSetGo(ty: i32, depth: i32): boolean {
+  const t = T.tys[unMemPeelAliasWrapper(ty)]
+  match t {
+    TyMap => {
+      if t.mSet == 1 { return true }
+      return tyMentionsSet(t.mVal, depth - 1)
+    }
+    TyArray => {
+      return tyMentionsSet(t.aElem, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if tyMentionsSet(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyNullable => {
+      return tyMentionsSet(t.nInner, depth - 1)
+    }
+    // A record's fields ride its own row, and no other kind holds a map.
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg | TyObj => {
+      return false
+    }
+  }
+}
+
+// Whether `y` is the map or Set `m` once a Set is spelled as its boolean map, key and value
+// compared as `tySameSpelled` does.
+function tySameSpelledMap(m: TyMap, y: i32, depth: i32): boolean {
+  const ty = T.tys[y]
+  if ty is TyMap {
+    if !tySameSpelled(m.mKey, ty.mKey, depth - 1) { return false }
+    if m.mSet == ty.mSet { return tySameSpelled(m.mVal, ty.mVal, depth - 1) }
+    if m.mSet == 1 { return tyScalarBaseIs(ty.mVal, "boolean") }
+    return tyScalarBaseIs(m.mVal, "boolean")
+  }
+  false
+}
+
+// Whether `y` is a list of this element, as `tySameSpelled` compares them.
+function tySameSpelledList(elem: i32, y: i32, depth: i32): boolean {
+  const ty = T.tys[y]
+  if ty is TyArray { return tySameSpelled(elem, ty.aElem, depth - 1) }
+  false
+}
+
+// Whether `y` is a record of `o`'s field names in order, each field as `tySameSpelled` compares.
+function tySameSpelledObj(o: TyObj, y: i32, depth: i32): boolean {
+  const ty = T.tys[y]
+  if ty is TyObj {
+    if o.objFieldNames.length != ty.objFieldNames.length { return false }
+    let f = 0
+    while f < o.objFieldNames.length {
+      if o.objFieldNames[f] != ty.objFieldNames[f] { return false }
+      if !tySameSpelled(o.objFieldTypes[f], ty.objFieldTypes[f], depth - 1) {
+        return false
+      }
+      f = f + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether the module's unions hold two map types of the folded shape `sh`, so a box of that
+// shape tags by member type rather than by shape.
+export function mapShapeTwinned(sh: i32): boolean {
+  if mTwinExtra == 0 || !(sh >= 0 || mapShapeIsMono(sh)) { return false }
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinCodes[i] >= 0 && mapTwinOneStruct(mTwinShapes[i], sh) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// How many distinct non-null members the union `ty` has (1 for `A | A | null`, whose rep is
+// the one member's niche); 0 for -1.
+export function tyDistinctNonNullMembers(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  const seen: i32[] = []
+  let i = 0
+  while i < flat.length {
+    const m = unMemPeelAliasWrapper(flat[i])
+    let isNull = false
+    if m >= 0 {
+      const mt = T.tys[m]
+      if mt is TyPrim { isNull = mt.primName == "null" }
+    }
+    if m >= 0 && !isNull {
+      let dup = false
+      let j = 0
+      while j < seen.length {
+        if tyEq(seen[j], m) { dup = true }
+        j = j + 1
+      }
+      if !dup { seen.push(m) }
+    }
+    i = i + 1
+  }
+  seen.length
+}
+
+// Whether two map types are the one type, alias peeled and union members compared as a set at
+// every level; a Set is never its boolean map. Compares only: box tags stay positional.
+export function mapTwinExact(a: i32, b: i32): boolean {
+  tySameSet(a, b, TY_WALK_DEPTH)
+}
+
+// Whether `a` and `b` are one type up to the order and repetition of union members, at any
+// depth of a map, list, union or record; a function, literal or primitive compares as `tyEq`.
+export function tySameSet(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 || depth <= 0 { return false }
+  if tyWalkPairOn(a, b) { return true }
+  if tyWalkA.length == 0 { tyWalkReset() }
+  // Past the shallow depth a shared part (a diamond) is compared once per pair.
+  const deep = depth <= TY_WALK_DEPTH - 12
+  if deep {
+    const row = tySetMemo.get(a)
+    if row != null {
+      const hit = row.get(b)
+      if hit != null { return hit }
+    }
+  }
+  if tyWalkBudget <= 0 { return false }
+  tyWalkBudget = tyWalkBudget - 1
+  tyWalkA.push(a)
+  tyWalkB.push(b)
+  const r = tySameSetGo(a, b, depth)
+  tyWalkA.pop()
+  tyWalkB.pop()
+  if deep { tyWalkMemoSet(tySetMemo, a, b, r) }
+  r
+}
+
+// The pairs a `tySameSet` or `tySameSpelled` walk is comparing: a pair met again is a cycle
+// through a recursive type, assumed equal as `tyEq` assumes it.
+const tyWalkA: i32[] = []
+const tyWalkB: i32[] = []
+// The distinct pairs one outermost comparison may still visit, and the answers it has, so a
+// shared part (a diamond) is compared once; past the budget a pair compares unequal.
+let tyWalkBudget = 100000
+let tySetMemo: {[i32]: {[i32]: boolean}} = Map()
+let tySpelledMemo: {[i32]: {[i32]: boolean}} = Map()
+let tyWalkMemoN = 0
+
+// Records the answer for pair `a`, `b` in `memo`, a map of maps so no key is spelled.
+function tyWalkMemoSet(
+  memo: {[i32]: {[i32]: boolean}},
+  a: i32,
+  b: i32,
+  r: boolean,
+) {
+  const row = memo.get(a)
+  if row != null {
+    row.set(b, r)
+  } else {
+    const fresh: {[i32]: boolean} = Map()
+    fresh.set(b, r)
+    memo.set(a, fresh)
+  }
+  tyWalkMemoN = tyWalkMemoN + 1
+  0
+}
+
+// Starts an outermost comparison: a fresh budget, and the last one's answers dropped.
+function tyWalkReset() {
+  tyWalkBudget = 100000
+  if tyWalkMemoN > 0 {
+    tySetMemo = Map()
+    tySpelledMemo = Map()
+    tyWalkMemoN = 0
+  }
+  0
+}
+
+// The depth every whole-type walk here starts from: a revisited type is a cycle, so an acyclic
+// type is compared or keyed whole and this cap is only a backstop (D2751).
+export const TY_WALK_DEPTH = 20000
+
+// Whether the pair `a`, `b` is already on the walk, which a recursive type reaches again.
+function tyWalkPairOn(a: i32, b: i32): boolean {
+  let i = 0
+  while i < tyWalkA.length {
+    if tyWalkA[i] == a && tyWalkB[i] == b { return true }
+    i = i + 1
+  }
+  false
+}
+
+function tySameSetGo(a: i32, b: i32, depth: i32): boolean {
+  const xs: i32[] = []
+  const ys: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(a), xs)
+  flattenVariantsInto(unMemPeelAliasWrapper(b), ys)
+  if xs.length > 1 || ys.length > 1 {
+    return tyMembersCover(xs, ys, depth) && tyMembersCover(ys, xs, depth)
+  }
+  const x = xs[0]
+  const y = ys[0]
+  if x < 0 || y < 0 { return x == y }
+  const tx = T.tys[x]
+  match tx {
+    TyMap => {
+      return tySameSetMap(tx.mSet, tx.mKey, tx.mVal, y, depth)
+    }
+    TyArray => {
+      return tySameSetList(tx.aElem, y, depth)
+    }
+    TyObj => {
+      if nomNameOfTy(x) != nomNameOfTy(y) { return false }
+      return tySameSetObj(tx, y, depth)
+    }
+    // The flattening above leaves no union or nullable here, and no other kind has members.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {
+      return tyEq(x, y)
+    }
+  }
+}
+
+// Whether `y` is a record of `o`'s field names in order, each field as `tySameSet` compares.
+function tySameSetObj(o: TyObj, y: i32, depth: i32): boolean {
+  const ty = T.tys[y]
+  if ty is TyObj {
+    if o.objFieldNames.length != ty.objFieldNames.length { return false }
+    let f = 0
+    while f < o.objFieldNames.length {
+      if o.objFieldNames[f] != ty.objFieldNames[f] { return false }
+      if !tySameSet(o.objFieldTypes[f], ty.objFieldTypes[f], depth - 1) {
+        return false
+      }
+      f = f + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether `y` is a map or set with this kind, key and value, as `tySameSet` compares them.
+function tySameSetMap(
+  mSet: i32,
+  key: i32,
+  val: i32,
+  y: i32,
+  depth: i32,
+): boolean {
+  const ty = T.tys[y]
+  if ty is TyMap {
+    if mSet != ty.mSet { return false }
+    return tySameSet(key, ty.mKey, depth - 1)
+      && tySameSet(val, ty.mVal, depth - 1)
+  }
+  false
+}
+
+// Whether `y` is a list of this element, as `tySameSet` compares them.
+function tySameSetList(elem: i32, y: i32, depth: i32): boolean {
+  const ty = T.tys[y]
+  if ty is TyArray { return tySameSet(elem, ty.aElem, depth - 1) }
+  false
+}
+
+// Whether every member of `xs` is `tySameSet` as some member of `ys`.
+function tyMembersCover(xs: i32[], ys: i32[], depth: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    let hit = false
+    let j = 0
+    while j < ys.length && !hit {
+      hit = tySameSet(xs[i], ys[j], depth - 1)
+      j = j + 1
+    }
+    if !hit { return false }
+    i = i + 1
+  }
+  true
+}
+
+// An identity key for `ty` that `tySameSet` types share: union members flattened, keyed, deduped
+// and sorted at every level of a map, list or union; any other type is its `tyToStr`.
+export function tyCanonKey(ty: i32, depth: i32): string {
+  if ty < 0 { return "?" }
+  if depth <= 0 { return tyToStr(ty) }
+  if i32ListHas(tyCanonWalk, ty) { return tyToStr(ty) }
+  if tyCanonWalk.length == 0 {
+    tyCanonBudget = 100000
+    if tyCanonMemoN > 0 {
+      tyCanonMemo = Map()
+      tyCanonMemoN = 0
+    }
+  }
+  const hit = tyCanonMemo.get(ty)
+  if hit != null { return hit }
+  if tyCanonBudget <= 0 { return tyToStr(ty) }
+  tyCanonBudget = tyCanonBudget - 1
+  tyCanonWalk.push(ty)
+  const r = tyCanonKeyGo(ty, depth)
+  tyCanonWalk.pop()
+  tyCanonMemo.set(ty, r)
+  tyCanonMemoN = tyCanonMemoN + 1
+  r
+}
+
+// The types a deep `tyCanonKey` is keying: one met again is a cycle, keyed by its render.
+const tyCanonWalk: i32[] = []
+// The distinct types one outermost key may still spell (past it, a subtree is keyed by its
+// render), and the keys it has spelled, so a shared part is keyed once.
+let tyCanonBudget = 100000
+let tyCanonMemo: {[i32]: string} = Map()
+let tyCanonMemoN = 0
+
+function tyCanonKeyGo(ty: i32, depth: i32): string {
+  const xs: i32[] = []
+  flattenVariantsInto(unMemPeelAliasWrapper(ty), xs)
+  if xs.length > 1 {
+    const ks: string[] = []
+    let i = 0
+    while i < xs.length {
+      const k = tyCanonKey(xs[i], depth - 1)
+      let at = 0
+      while at < ks.length && strLess(ks[at], k) { at = at + 1 }
+      if at >= ks.length || ks[at] != k {
+        ks.push(k)
+        let m = ks.length - 1
+        while m > at {
+          ks[m] = ks[m - 1]
+          m = m - 1
+        }
+        ks[at] = k
+      }
+      i = i + 1
+    }
+    let out = "("
+    let j = 0
+    while j < ks.length {
+      if j > 0 { out = out + "|" }
+      out = out + ks[j]
+      j = j + 1
+    }
+    return out + ")"
+  }
+  const x = xs[0]
+  if x < 0 { return "?" }
+  const t = T.tys[x]
+  match t {
+    TyMap => {
+      if t.mSet == 1 { return "Set<" + tyCanonKey(t.mKey, depth - 1) + ">" }
+      return "{["
+        + tyCanonKey(t.mKey, depth - 1)
+        + "]:"
+        + tyCanonKey(t.mVal, depth - 1)
+        + "}"
+    }
+    TyArray => {
+      return "[" + tyCanonKey(t.aElem, depth - 1) + "]"
+    }
+    // The flattening above leaves no union or nullable here, and no other kind has members.
+    TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg | TyObj => {
+      return tyToStr(x)
+    }
+  }
+}
+
+// Whether the map `patTy` a test names is not the map `heldTy` a nullable niche holds, so the
+// test is false whatever the niche is: a niche carries no tag, only non-null.
+export function mapNicheLacks(heldTy: i32, patTy: i32): boolean {
+  if heldTy < 0 || patTy < 0 { return false }
+  const h = unMemPeelAliasWrapper(heldTy)
+  const p = unMemPeelAliasWrapper(patTy)
+  if tySameSet(h, p, TY_WALK_DEPTH) { return false }
+  // A spelling renders a Set as its boolean map, so the two are told apart only by the pin.
+  if mapSetSpelledAs(h, p) || mapSetSpelledAs(p, h) { return false }
+  // A pinned annotation spells a literal-union value by its base, so a literal value on either
+  // side is told apart from the other only by a differing base.
+  const hv = tyMapValOf(h)
+  const pv = tyMapValOf(p)
+  if (
+    tyIsLitUnionOrLit(hv)
+    || tyIsLitUnionOrLit(pv)
+    || numLitUnionBaseName(hv) != ""
+    || numLitUnionBaseName(pv) != ""
+  ) {
+    if tyMapKeyKind(h) == tyMapKeyKind(p) && mapValBase(hv) == mapValBase(pv) {
+      return false
+    }
+  }
+  true
+}
+
+// The scalar a map value reps as: a literal union's base, else the primitive it is, else "".
+function mapValBase(v: i32): string {
+  const nb = numLitUnionBaseName(v)
+  if nb != "" { return nb }
+  if tyIsLitUnionOrLit(v) { return "string" }
+  primNameStr(tyEmitPrimOf(v))
+}
+
+// The map an un-narrowed instance parameter `exprIx` is pinned at, read from the pin itself
+// (`monoParamPinTy`) rather than its spelling, which renders a Set as its boolean map and a
+// literal-union value by its base; -1 for any other expression.
+export function mapPinnedParamTyOf(exprIx: i32, fnIx: i32): i32 {
+  mapTyPeel(pinnedParamTyAt(exprIx, fnIx, 4))
+}
+
+// The type an un-narrowed parameter of instance `fnIx` named by `exprIx` is pinned at, through
+// at most `depth` `const` locals initialized from another name; -1 for any other expression.
+export function pinnedParamTyAt(exprIx: i32, fnIx: i32, depth: i32): i32 {
+  const ax = unwrapParen(exprIx)
+  if ax < 0 || depth <= 0 { return -1 }
+  const n = P.nodes[ax]
+  if n is Ident {
+    if narrowSlotOf(n.identName) >= 0 { return -1 }
+    const ptn = paramTypeNode(fnIx, n.identName)
+    if ptn >= 0 { return monoParamPinTy.get(ptn) ?? -1 }
+    if fnIx >= 0 {
+      const fd = P.nodes[fnIx]
+      if fd is FuncDecl {
+        const li = parentLetOf(fd.fnBody, n.identName)
+        if li >= 0 {
+          const ld = P.nodes[li]
+          if ld is LetDecl {
+            if ld.letKw == "const" {
+              return pinnedParamTyAt(ld.letInit, fnIx, depth - 1)
+            }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// Whether function `fnIx` is, or is lifted inside, a generic or hole instance: a body the
+// checker typed once at its parameters and the emitter lowers at a pin.
+export function fnInPinnedInstance(fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    if (monoExactSubRow.get(pos) ?? -1) >= 0 { return true }
+    if (monoPinSubRow.get(pos) ?? -1) >= 0 { return true }
+    if (monoHoleSubRow.get(pos) ?? -1) >= 0 { return true }
+    if pos >= fnParent.length { return false }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  false
+}
+
+// The row of `monoExactSubN`/`monoExactSubT` binding the type parameters of the instance that
+// function `fnIx` is, or is lifted inside; -1 when that instance is shared between pins.
+export function monoExactSubRowOf(fnIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoExactSubRow.get(pos) ?? -1
+    if row >= 0 { return row }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
+// `ty`, left open by the exact instance `fnIx` is, or is lifted inside, substituted through the
+// exact instances enclosing that one: a nested generic's instance binds its own parameters
+// only, and its enclosing instance binds the rest (D3831). -1 where one stays unbound.
+export function exactSubOuterTyOf(ty: i32, fnIx: i32): i32 {
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  let seen = false
+  let cur = ty
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoExactSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoExactSubN.length {
+      // The innermost row is the one the caller already applied.
+      if seen {
+        const st = substTyDeep(cur, monoExactSubN[row], monoExactSubT[row])
+        if st < 0 { return -1 }
+        if !tyHasTyVar(st) { return st }
+        cur = st
+      }
+      seen = true
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
+// `ty` with the type parameters the instance `fnIx` is, or is lifted inside, binds to its
+// parameters' pins substituted; -1 outside one, or where one stays unbound.
+export function pinSubOperandTyOf(ty: i32, fnIx: i32): i32 {
+  if ty < 0 || monoPinSubN.length == 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  let cur = ty
+  while pos >= 0 && guard <= fnStmts.length {
+    const row = monoPinSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoPinSubN.length {
+      const st = substTyDeep(cur, monoPinSubN[row], monoPinSubT[row])
+      if st < 0 { return -1 }
+      if !tyHasTyVar(st) { return st }
+      // A nested generic's instance leaves its enclosing instance's parameters open (D3831).
+      cur = st
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
+}
+
+// `holeOperandTyOf` for a capture read in lambda `fnIx`, read at the hole instance it is
+// lifted inside; -1 where no enclosing function is one.
+export function holeCaptureTyOf(exprIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ty = nodeTyIxOf(unwrapParen(exprIx))
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyVar) { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  while pos >= 0 && pos < fnParent.length && guard <= fnStmts.length {
+    pos = fnParent[pos]
+    const row = monoHoleSubRow.get(pos) ?? -1
+    if row >= 0 && row < monoHoleSubN.length {
+      const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
+      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+      return b
+    }
+    guard = guard + 1
+  }
+  -1
+}
+
+// The type of `exprIx` inside the hole instance `fnIx` is: its recorded type is a hole's
+// variable, which that instance binds. A read, not a substitution, which would bank pins. -1
+// anywhere else, including a lambda lifted inside the instance, which may be shared (D2921).
+export function holeOperandTyOf(exprIx: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  const ax = unwrapParen(exprIx)
+  if ax < 0 { return -1 }
+  const ty = nodeTyIxOf(ax)
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoHoleSubN.length { return -1 }
+  const tu = T.tys[ty]
+  // A join of holes the checker kept apart reads as their one pin when every hole has it (D3520).
+  if tu is TyUnion && tyIsTpJoinUnion(ty) {
+    let one = -1
+    for m in tu.uMembers {
+      const mb = holePinReadOf(m, monoHoleSubN[row], monoHoleSubT[row])
+      if mb < 0 || mb >= T.tys.length || tyHasTyVar(mb) { return -1 }
+      if one >= 0 && mb != one && !tySame(mb, one) { return -1 }
+      one = mb
+    }
+    return one
+  }
+  if !(tu is TyVar) { return -1 }
+  const b = holePinReadOf(ty, monoHoleSubN[row], monoHoleSubT[row])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// The map type receiver `recvIx` reads as inside function `fnIx`: its recorded type, else the
+// pin the hole or type-parameter instance `fnIx` gives it, else the one pin the program banked.
+// -1 when none is a map. The instance is asked first, since every instance shares the node.
+export function mapRecvTyIn(recvIx: i32, fnIx: i32): i32 {
+  const r = unwrapParen(recvIx)
+  if r < 0 { return -1 }
+  const own = nodeTyIxOf(r)
+  if own < 0 || own >= T.tys.length { return -1 }
+  if T.tys[own] is TyMap { return own }
+  // Only a hole's read has a pin to ask.
+  if !(T.tys[own] is TyVar) { return -1 }
+  const h = holeOperandTyOf(r, fnIx)
+  if tyIsMapAt(h) { return h }
+  const x = exactDerivedPinTyOf(r, fnIx)
+  if tyIsMapAt(x) { return x }
+  const p = nodeTyPinIxOf(r)
+  if tyIsMapAt(p) { return p }
+  -1
+}
+
+// A read `exprIx` records as a hole derived off a type parameter, at the binding of the exact
+// instance `fnIx`; -1 outside one, in a lambda lifted inside it, or where the read is unresolved.
+function exactDerivedPinTyOf(exprIx: i32, fnIx: i32): i32 {
+  if monoExactSubN.length == 0 || fnIx < 0 { return -1 }
+  const row = monoExactSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoExactSubN.length { return -1 }
+  const ty = nodeTyIxOf(exprIx)
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyVar) { return -1 }
+  const b = holePinReadOf(ty, monoExactSubN[row], monoExactSubT[row])
+  if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+  b
+}
+
+// The type of node `ix` inside function `fnIx`: its recorded type, or where that names a type
+// parameter or a hole, the binding the instance `fnIx` gives it (a hole's, an exact instance's,
+// then its parameters' pins), else the one pin the program banked. The recorded type otherwise.
+export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
+  const raw = nodeTyIxOf(ix)
+  if raw < 0 || raw >= T.tys.length || !tyHasTyVar(raw) { return raw }
+  const h = holeOperandTyOf(ix, fnIx)
+  if h >= 0 { return h }
+  const hc = holeCompositeTyOf(raw, fnIx)
+  if hc >= 0 { return hc }
+  const x = exactDerivedPinTyOf(ix, fnIx)
+  if x >= 0 { return x }
+  const s = pinSubOperandTyOf(raw, fnIx)
+  if s >= 0 { return s }
+  nodeTyPinIxOf(ix)
+}
+
+// A list or nullable type `ty` over holes, read at the bindings of the hole instance `fnIx`:
+// each hole read as `holeOperandTyOf` reads a bare one, without banking a pin. -1 outside a
+// hole instance, for a bare hole, or where a hole stays unbound.
+function holeCompositeTyOf(ty: i32, fnIx: i32): i32 {
+  if monoHoleSubN.length == 0 || fnIx < 0 { return -1 }
+  if ty < 0 || ty >= T.tys.length || T.tys[ty] is TyVar { return -1 }
+  const row = monoHoleSubRow.get(fnStmtsPosOf(fnIx)) ?? -1
+  if row < 0 || row >= monoHoleSubN.length { return -1 }
+  holeTyRead(ty, monoHoleSubN[row], monoHoleSubT[row], 0)
+}
+
+// `holeCompositeTyOf`'s walk: `ty` with every hole replaced by its binding, -1 where one has
+// none or the type is a shape the walk does not rebuild.
+function holeTyRead(ty: i32, bNames: string[], bTys: i32[], depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return -1 }
+  if !tyHasTyVar(ty) { return ty }
+  const t = T.tys[ty]
+  match t {
+    TyVar => {
+      const b = holePinReadOf(ty, bNames, bTys)
+      if b < 0 || b >= T.tys.length || tyHasTyVar(b) { return -1 }
+      return b
+    }
+    TyArray => {
+      const e = holeTyRead(t.aElem, bNames, bTys, depth + 1)
+      if e < 0 { return -1 }
+      if t.aRead == 1 { return mkArrayViewTy(e) }
+      return mkArrayTy(e)
+    }
+    TyNullable => {
+      const n = holeTyRead(t.nInner, bNames, bTys, depth + 1)
+      if n < 0 { return -1 }
+      return mkNullableTyOf(n)
+    }
+    TyUnion | TyObj | TyMap | TyFunc | TyNeg => {
+      // A union over a bound hole needs the checker's join, and a record, map, function or
+      // negated type is not rebuilt here: the caller asks its next reader.
+      return -1
+    }
+    TyPrim | TyLit | TyErr => {
+      // Holds no hole, so `tyHasTyVar` answered above.
+      return ty
+    }
+  }
+}
+
+// The checked-rep column read inside function `fnIx`: node `ix`'s rep at the type its instance
+// gives it (`nodeTyInOf`), so a node a generic body shares answers its instantiation's rep.
+export function nodeRepIn(ix: i32, fnIx: i32): RepDesc {
+  if ix < 0 { return repOfTy(-1) }
+  repOfNodeAt(ix, nodeTyInOf(ix, fnIx))
+}
+
+// Whether arena type `ty` is a map.
+function tyIsMapAt(ty: i32): boolean {
+  ty >= 0 && ty < T.tys.length && T.tys[ty] is TyMap
+}
+
+// `holeOperandTyOf` where that type is `string | null`, whose niche a join keeps (D3016), or a
+// join's own recorded `string | null`; -1 otherwise.
+export function holeNulStringPinTyOf(exprIx: i32, fnIx: i32): i32 {
+  const t = holeOperandTyOf(exprIx, fnIx)
+  if tyIsNulPrim(t, "string") { return t }
+  // A join an instance re-made at its pin records that type itself.
+  const ix = unwrapParen(exprIx)
+  if ix >= 0 && nodeIsValueJoin(ix) && tyIsNulPrim(nodeTyIxOf(ix), "string") {
+    return nodeTyIxOf(ix)
+  }
+  -1
+}
+
+// Whether `ty` is `boolean` or a literal union, `i32` values a pin tells apart only by type.
+export function tyIsI32AtomPin(ty: i32): boolean {
+  tyPrimNameOf(ty) == "boolean" || tyIsLitUnion(ty) || tyIsI32NichePin(ty)
+}
+
+// Whether `ty` is a nullable literal union or `boolean | null`, the two `i32` niches.
+export function tyIsI32NichePin(ty: i32): boolean {
+  tyIsNullableLitUnion(ty) || tyIsNulPrim(ty, "boolean")
+}
+
+// The name of Ident node `ix`, or "" for any other node.
+export function identNameOrEmpty(ix: i32): string {
+  const e = P.nodes[ix]
+  if e is Ident { return e.identName }
+  ""
+}
+
+// The value expression of each arm of the `if` chain or `match` at `ix`, -1 for an arm with no
+// tail value; empty when `ix` is neither, or is an `if` with no final `else`.
+export function valueJoinArmValues(ix: i32): i32[] {
+  const arms: i32[] = []
+  const n = P.nodes[ix]
+  if n is MatchExpr {
+    for b in n.matchBodies {
+      if b >= 0 && P.nodes[b] is Block {
+        arms.push(ifArmValueExpr(b))
+      } else {
+        arms.push(b)
+      }
+    }
+    return arms
+  }
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt {
+      arms.push(ifArmValueExpr(c.ifThen))
+      if c.ifElse < 0 { return [] }
+      if P.nodes[c.ifElse] is IfStmt {
+        cur = c.ifElse
+      } else {
+        arms.push(ifArmValueExpr(c.ifElse))
+      }
+    }
+  }
+  arms
+}
+
+// A callback's declared return `at` at the pin of the instance `fnIx`: itself when it names no
+// type parameter, else its substitution by the instance's exact bindings; -1 otherwise.
+export function mapCbDeclRetPinTy(at: i32, fnIx: i32): i32 {
+  if at < 0 { return -1 }
+  if !tyHasTyVar(at) { return at }
+  const row = monoExactSubRowOf(fnIx)
+  if row < 0 || row >= monoExactSubN.length { return -1 }
+  const st = substTyDeep(at, monoExactSubN[row], monoExactSubT[row])
+  if st < 0 || tyHasTyVar(st) { return -1 }
+  st
+}
+
+// A hole read (`v.q` in `function g(v)`) whose pin in instance `fnIx` admits no `null` (D4637).
+export function holePinProvesNonNull(ix: i32, fnIx: i32): boolean {
+  tyProvesNonNull(nodeTyInOf(ix, fnIx))
+}
+
+// The name every element of `elems` reads, all one bare Ident; "" otherwise.
+export function arrLitSameIdentName(elems: i32[]): string {
+  if elems.length == 0 { return "" }
+  const name = identNameOrEmpty(unwrapParen(elems[0]))
+  let i = 1
+  while i < elems.length {
+    if identNameOrEmpty(unwrapParen(elems[i])) != name { return "" }
+    i = i + 1
+  }
+  name
+}
+
+// The `for`-in statement of body `bodyIx` whose first binding is Ident `ix`'s name and whose body
+// holds `ix`, or -1.
+export function loopVarForIn(ix: i32, bodyIx: i32): i32 {
+  const name = identNameOrEmpty(ix)
+  if name == "" { return -1 }
+  const lp = modLoopHolding(bodyIx, name, ix)
+  if lp < 0 { return -1 }
+  const fl = P.nodes[lp]
+  if fl is ForIn {
+    if fl.fiVar == name { return lp }
+  }
+  -1
+}
+
+// Whether node `ix` is an `if` or `match` in value position, whose value joins its arms.
+export function nodeIsValueJoin(ix: i32): boolean {
+  P.nodes[ix] is IfStmt || P.nodes[ix] is MatchExpr
+}
+
+// `bindGenWalk` of annotation `gt` against pin `pin`, with the arm it lacks: a union annotation
+// with one member naming a type parameter binds that member to the pin's members no concrete
+// member of the annotation is (`T | string` at `M | null` binds `T` to `M | null`).
+export function exactBindWalk(gt: i32, pin: i32, outN: string[], outT: i32[]) {
+  const gms: i32[] = []
+  flattenVariantsInto(gt, gms)
+  if gms.length < 2 { return bindGenWalk(gt, pin, outN, outT) }
+  let open = -1
+  let i = 0
+  while i < gms.length {
+    if gms[i] >= 0 && tyHasTyVar(gms[i]) {
+      if open >= 0 { return bindGenWalk(gt, pin, outN, outT) }
+      open = gms[i]
+    }
+    i = i + 1
+  }
+  if open < 0 { return 0 }
+  const pms: i32[] = []
+  flattenVariantsInto(pin, pms)
+  const rest: i32[] = []
+  let k = 0
+  while k < pms.length {
+    let covered = false
+    let m = 0
+    while m < gms.length && !covered {
+      if gms[m] != open && tySameSet(gms[m], pms[k], TY_WALK_DEPTH) {
+        covered = true
+      }
+      m = m + 1
+    }
+    if !covered { rest.push(pms[k]) }
+    k = k + 1
+  }
+  if rest.length == 0 { return 0 }
+  bindGenWalk(open, tyOfMembers(rest), outN, outT)
+}
+
+// Whether `a` and `b` are anonymous records with the same field names in the same order: one
+// variant row holds both, so its tag cannot tell them apart.
+export function tySameAnonRow(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  const x = unMemPeelAliasWrapper(a)
+  const y = unMemPeelAliasWrapper(b)
+  if x < 0 || y < 0 || nomNameOfTy(x) != "" || nomNameOfTy(y) != "" {
+    return false
+  }
+  const tx = T.tys[x]
+  const ty = T.tys[y]
+  if tx is TyObj {
+    if ty is TyObj {
+      if tx.objFieldNames.length != ty.objFieldNames.length { return false }
+      let i = 0
+      while i < tx.objFieldNames.length {
+        if tx.objFieldNames[i] != ty.objFieldNames[i] { return false }
+        i = i + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// The maps the parameters of instance `fnIx` are pinned at, their unions and nullables
+// flattened; -2 for a parameter whose instance serves pins of two different map types.
+export function instancePinnedMaps(fnIx: i32, out: i32[]) {
+  if fnIx < 0 { return 0 }
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl {
+    let i = 0
+    while i < fd.fnParams.length {
+      const pn = P.nodes[fd.fnParams[i]]
+      if pn is Param {
+        if pn.parType >= 0 {
+          const pt = monoParamPinTy.get(pn.parType) ?? -1
+          if pt == -2 { out.push(-2) }
+          if pt >= 0 {
+            const flat: i32[] = []
+            flattenVariantsInto(pt, flat)
+            let j = 0
+            while j < flat.length {
+              const m = mapTyPeel(flat[j])
+              if m >= 0 { out.push(m) }
+              j = j + 1
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+  0
+}
+
+// Whether a niche `is P` in instance `fnIx` needs the exact pinned map to answer, with none
+// reaching the operand: a pin that is shared, spelled inexactly (a Set, a literal-union value),
+// or another map of P's struct (D2684).
+export function mapNicheNeedsPin(fnIx: i32, patTy: i32): boolean {
+  const pins: i32[] = []
+  instancePinnedMaps(fnIx, pins)
+  const ps = mapShapeFoldSet(mapArmShapeOfTy(unMemPeelAliasWrapper(patTy)))
+  let i = 0
+  while i < pins.length {
+    const q = pins[i]
+    if q < 0 { return true }
+    const t = T.tys[q]
+    if t is TyMap {
+      if t.mSet == 1 || tyIsLitUnion(t.mVal) { return true }
+      if t.mVal >= 0 && t.mVal < T.tys.length {
+        if T.tys[t.mVal] is TyLit { return true }
+      }
+    }
+    if mapShapeIsMono(ps) && mapShapeFoldSet(mapArmShapeOfTy(q)) == ps {
+      if !mapTwinExact(q, patTy) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether two maps are one box member but not one type: a numeric literal-union value reads as
+// its base (`{[K]: 1 | 2}` beside `{[K]: i32}`), so no tag can tell them apart (D2493).
+export function mapSoftTwin(a: i32, b: i32): boolean {
+  const x = unMemPeelAliasWrapper(a)
+  const y = unMemPeelAliasWrapper(b)
+  if x < 0 || y < 0 || tyEq(x, y) { return false }
+  const xt = T.tys[x]
+  const yt = T.tys[y]
+  if xt is TyMap {
+    if yt is TyMap {
+      if xt.mSet != yt.mSet || !tyEq(xt.mKey, yt.mKey) { return false }
+      return tyEq(mapValSoftBase(xt.mVal), mapValSoftBase(yt.mVal))
+    }
+  }
+  false
+}
+
+// The map shape of a map arm's arena type: its value's mv slot, or the mono sentinel of its
+// key rep when the value interns none, so an integer-keyed mono arm names its own struct.
+export function mapArmShapeOfTy(armTy: i32): i32 {
+  const ki = tyMapKeyKind(armTy)
+  const slot = mvSlotOfValTyK(tyMapValOf(armTy), ki)
+  if slot == -1 { return mapMonoShapeOfKey(ki) }
+  slot
+}
+
+// `ty` when it is a map, or a nullable map's inner map; -1 otherwise.
+export function mapTyPeel(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return mapTyPeel(t.nInner) }
+  if unMemIsMap(ty) { return unMemPeelAliasWrapper(ty) }
+  -1
+}
+
+// The non-null list the checked-rep column names for the node at `exprIx` at its instance's
+// type, or null: what a call, member, index, binary operation or in-scope name read answers
+// when its own resolvers name nothing. Only a node typed as a non-null `TyArray` is read.
+export function columnListRep(exprIx: i32, fnIx: i32): VKind | null {
+  const ty = nodeTyInOf(exprIx, fnIx)
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyArray) { return null }
+  const d = repOfNodeAt(exprIx, ty)
+  if d.rdCovered == 1 && vkListClass(d.rdKind) == 1 { return d.rdKind }
+  null
+}

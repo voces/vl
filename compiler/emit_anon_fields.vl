@@ -1,0 +1,475 @@
+// `emit_anon_fields.vl` — the field codes and spellings of anonymous record
+// fields.
+
+import { ArrayLit, BinExpr, NullLit, P, StrLit } from "./ast"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeTyIxOf, nodeTyMapKeyKind } from "./check_node_tys"
+import { MAP_KEY_STR, isValueUnionName } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
+  tyFieldTyOf,
+  tyIsLitUnionAlias,
+  tyIsLitUnionArray,
+  tyNomNameCycled,
+  tyToEmitName,
+  tyToNominalName,
+} from "./check_types"
+import { sScanLim } from "./emit_atom_kinds"
+import { unwrapParen } from "./emit_base"
+import { fieldCodeOfTy } from "./emit_field_codes"
+import { isNulScalarListFieldCode } from "./emit_nullable_rets"
+import { TK_F32, TK_F64, TK_I64, tyKindOf } from "./emit_ref_list_kinds"
+import { repRowOfTyStruct } from "./emit_rep"
+import {
+  mapTyValKindLowerable,
+  refArrElemKeyDeferred,
+  tyElemIsNulRefListElem,
+  tyElemIsRefListElem,
+  tyIsNulLitUnionArr,
+} from "./emit_shape_rows"
+import {
+  FC_F32,
+  FC_F64,
+  FC_F64_LIST,
+  FC_I32,
+  FC_I64,
+  FC_I64_LIST,
+  FC_MAP,
+  FC_NUL_BOOL,
+  FC_NUL_CLOSURE,
+  FC_NUL_F32_LIST,
+  FC_NUL_F64_LIST,
+  FC_NUL_I32_LIST,
+  FC_NUL_I64_LIST,
+  FC_NUL_LIT_UNION,
+  FC_NUL_MAP,
+  FC_NUL_REF_LIST,
+  FC_NUL_STR,
+  FC_NUL_STR_LIST,
+  FC_NUL_U8_LIST,
+  FC_STRUCT,
+  FC_UNION,
+  sNames,
+  unNames,
+} from "./emit_state"
+import { unRowOfCanon, unionRowOf } from "./emit_union_registry"
+import {
+  nonNullTy,
+  tyIsNumericBox,
+  tyMapValOf,
+  tyNulLitUnionMemberTexts,
+} from "./tyquery"
+
+// True if a `+` expression has a string literal anywhere in its chain — the syntactic
+// concat test `anonFieldCode` can run where `exprIsStrConcat` cannot: a field value is
+// classified during `collectS`, before the locals a typed-operand test needs exist, so
+// there is no `fnIx` to ask. Walks the whole chain, since `+` associates left.
+export function plusChainHasStrLit(ix: i32) {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is StrLit { return true }
+  if e is BinExpr {
+    if e.binOp == "+" {
+      if plusChainHasStrLit(e.binLeft) { return true }
+      return plusChainHasStrLit(e.binRight)
+    }
+  }
+  false
+}
+
+// `nodeTyName` returns "" for a type it will not spell, and `anonFieldCode` uses that
+// emptiness as a gate on both of its paths. This is that gate's own partition, read off the
+// type so it can apply without building the string: non-empty for a non-void `TyPrim`, a
+// `TyObj`, a `TyFunc`, or a `TyArray`; "" for everything else. Copied from those arms directly.
+export function anonTySpellable(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant the anon spelling can carry must
+  // be admitted here rather than take the `false` and lose its row.
+  match t {
+    TyPrim => {
+      return t.primName != "void"
+    }
+    TyObj => {
+      return true
+    }
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return true
+    }
+    TyErr | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a shape the anon spelling names.
+    }
+  }
+  false
+}
+
+// The member-set name an anonymous literal's value-union field records, or "" when it is
+// not one. Two load-bearing conjuncts: the arena must grade the type a value union
+// (`fieldCodeOfTy == 16`), and the render must produce a name the registry accepts, since
+// that string is the box's key at intern time and at every read.
+export function anonUnionFieldName(valIx: i32): string {
+  if valIx < 0 { return "" }
+  const ty = nodeTyIxOf(valIx)
+  if ty < 0 { return "" }
+  const nm = tyToEmitName(ty)
+  if nm == "" { return "" }
+  // The two rungs the declared ladder ends on, in order: `isValueUnionName` for a union of
+  // atoms (plus null), then `isUName` for a registered struct or heterogeneous one — which
+  // `fieldCodeOfTy` declines by design, its own rung being the value-union half alone.
+  if fieldCodeOfTy(ty) == FC_UNION {
+    if isValueUnionName(nm) { return nm }
+    return ""
+  }
+  // Matched on either registry column (`unionRowOf`), not `isUName`, which reads alias
+  // names alone while `tyToEmitName` renders a union alias as its member set — without
+  // this a `type AB = A | B`-valued field kept minting nothing.
+  if unionRowOf(nm) >= 0 { return nm }
+  // The arena, once the render has declined: `unRowOfCanon` keys the registry on the
+  // type's canonical id rather than a spelling, so a declared union whose render is
+  // structural still finds its row.
+  const ur = unRowOfCanon(ty)
+  if ur >= 0 { return unNames[ur] }
+  ""
+}
+
+// The literal-union alias whose members a nullable literal union `ty` holds, in either
+// spelling (`TyNullable` or a flat union with `null`), or "" for any other type.
+export function nulLitAliasNameOfTy(ty: i32): string {
+  const texts = tyNulLitUnionMemberTexts(ty)
+  if texts.length == 0 { return "" }
+  litUnionAliasOfLitTexts(texts)
+}
+
+// The inner type of node `valIx`'s recorded niche nullable, or -1 when it is not one — the
+// node-taking form of the peel `anonNulFieldCodeOfTy` makes on a type, so a code and its
+// companion column cannot resolve against different types.
+export function anonNulInnerTyOf(valIx: i32): i32 {
+  const ty = nodeTyIxOf(valIx)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner }
+  -1
+}
+
+// The FIELD code of a niche-nullable type, from the arena, or -1 — the `| null` twin of
+// `fieldCodeOfTy`'s arms, in the order `fieldCodeOfSpelling` reads the same spellings. Only
+// the anonymous-literal path asks: a declared field carries a `| null` name the render
+// already codes, and this one has none to read (D1627).
+export function anonNulFieldCodeOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyNullable) { return -1 }
+  const inner = t.nInner
+  if inner < 0 { return -1 }
+  if tyIsLitUnionAlias(inner) { return FC_NUL_LIT_UNION }
+  const it = T.tys[inner]
+  // Exhaustive over `Ty` and deliberately `_`-less: a twelfth arena variant breaks the
+  // self-compile here rather than taking the -1 that hands the literal to the render ladder.
+  // The deliberate leaves are empty arms carrying their reason.
+  match it {
+    TyPrim => {
+      if it.primName == "string" { return FC_NUL_STR }
+      if it.primName == "boolean" { return FC_NUL_BOOL }
+      // A scalar plus null is the value-union box, which the caller claimed above.
+    }
+    TyFunc => {
+      return FC_NUL_CLOSURE
+    }
+    TyObj => {
+      return FC_STRUCT
+    }
+    TyArray => {
+      // A LITERAL-union element list is the i32 ATOM backing, so its niche is the nullable
+      // i32 list wrapper — code 18, the rep the declared spelling already codes through
+      // `annRepKindOf`'s `nullist` arm. `tyIsNulLitUnionArr` is the nullable-ELEMENT twin,
+      // which the same atom backing claims, and both subtract before the ref ladder (D1710).
+      if tyIsLitUnionArray(inner) { return FC_NUL_I32_LIST }
+      if tyIsNulLitUnionArr(inner) { return FC_NUL_I32_LIST }
+      // An element hole nothing pinned (`if c { [] } else { null }`) takes the nullable i32
+      // list, the rep the same value gets when bound to a plain local (D2228).
+      if it.aElem < 0 { return FC_NUL_I32_LIST }
+      return anonNulListFieldCodeOfElem(it.aElem)
+    }
+    TyMap => {
+      // A nullable map field is code 29, the nullable ref to the value type's mv struct —
+      // the rep the declared `{[K]: V} | null` spelling already codes. Gated to the value
+      // kinds the mv layer lowers, so an unrepresentable value keeps refusing loudly (D1665).
+      if mapTyValKindLowerable(inner) { return FC_NUL_MAP }
+    }
+    TyUnion => {
+      // A union plus null is the box, not a niche — `anonUnionFieldName` claims it above.
+    }
+    TyNullable => {
+      // One niche per type: the checker collapses a doubly-nullable before it reaches here.
+    }
+    TyLit => {
+      // A bare literal plus null is the litunion niche, claimed by the alias test above.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no rep until the monomorphizer pins it.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, with no field rep of its own.
+    }
+    TyErr => {
+      // The error hole — nothing to code.
+    }
+  }
+  -1
+}
+
+// The element half of `anonNulFieldCodeOfTy`'s list arm: the i32-backed leaves all fold onto
+// code 18, each distinct backing keeps its own wrapper (31..34, 36), and a ref element is the
+// nullable ref list, code 28. An unrecognised element answers -1 rather than guessing.
+function anonNulListFieldCodeOfElem(elem: i32): i32 {
+  if elem < 0 { return -1 }
+  // The ref-element set at its one home, so this niche cannot admit fewer elements than the
+  // plain code-5 field whose wrapper it shares. The render that would have answered for a
+  // nested list, a map or a nullable ref is unreachable here: `anonTySpellable` declines a
+  // `TyNullable`, so this ladder's decline is terminal and had to be complete (D1691).
+  if tyElemIsRefListElem(elem) { return FC_NUL_REF_LIST }
+  if tyElemIsNulRefListElem(elem) { return FC_NUL_REF_LIST }
+  const et = T.tys[elem]
+  // Exhaustive over `Ty` and `_`-less, for the reason its caller is.
+  match et {
+    TyPrim => {
+      // Exhaustive over `PrimName`, `_`-less like its `Ty` parent. The i32-backed leaves
+      // fold onto code 18; each distinct backing keeps its own wrapper.
+      match et.primName {
+        "i32" => {
+          return FC_NUL_I32_LIST
+        }
+        "boolean" => {
+          return FC_NUL_I32_LIST
+        }
+        "string" => {
+          return FC_NUL_STR_LIST
+        }
+        "f64" => {
+          return FC_NUL_F64_LIST
+        }
+        "i64" => {
+          return FC_NUL_I64_LIST
+        }
+        "f32" => {
+          return FC_NUL_F32_LIST
+        }
+        "u8" => {
+          return FC_NUL_U8_LIST
+        }
+        "v128" => {
+          // Not a nullable-list element type: v128 has no list in S1-S2.
+        }
+        "void" => {
+          // Not an element type.
+        }
+        "null" => {
+          // Not an element type: `(T | null)[] | null` folds onto the element family.
+        }
+        "never" => {
+          // Not an element type.
+        }
+      }
+    }
+    TyObj => {
+      // The five ref kinds and the nullable-ref element are claimed by the two rungs above,
+      // which are the code-5 ladder's own set; these arms are unreachable and say so.
+    }
+    TyUnion => {
+      // Claimed above.
+    }
+    TyFunc => {
+      // Claimed above.
+    }
+    TyArray => {
+      // Claimed above.
+    }
+    TyMap => {
+      // Claimed above.
+    }
+    TyNullable => {
+      // A nullable REF element is claimed above; what reaches here is a nullable SCALAR or
+      // literal element, whose list has its own i32-backed wrapper and its own code.
+    }
+    TyLit => {
+      // A literal element is a litunion list, claimed by the alias test in the caller.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep yet.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole — nothing to code.
+    }
+  }
+  -1
+}
+
+// The struct row a code-5 (struct-ref list) field's element names, read from the arena, or
+// -1 (D1515). A list produced by anything but an array literal of object literals has no
+// element node to read a row off; `repRowOfTyStruct` turns the recorded element type into
+// the row the emitter interns through instead.
+export function anonRefListElemRow(valIx: i32): i32 {
+  anonRefListElemRowOfTy(nodeTyIxOf(valIx))
+}
+
+// That row asked of the ARRAY type rather than of the node, so the plain field and the
+// `| null` niche share one rung: the niche's own recorded type is the `TyNullable`, and its
+// array lives one peel further in (D1663).
+function anonRefListElemRowOfTy(arrTy: i32): i32 {
+  if arrTy < 0 { return -1 }
+  const t = T.tys[arrTy]
+  if t is TyArray { return repRowOfTyStruct(t.aElem, sScanLim()) }
+  -1
+}
+
+// The element key for a code-5 element NO `sNames` row names — a union, a nullable ref, a
+// nested list, a map, a closure (D1688). Both faces intern one wrapper through this key, so
+// it is the field's recorded type rendered NOMINALLY and cut the way `shapeFieldElemName`
+// cuts the declared text; "" for a cyclic or nameless type, which stays refused.
+export function anonRefListElemKeyOf(valIx: i32): string {
+  anonRefListElemKeyOfTy(nodeTyIxOf(valIx))
+}
+
+// The whole key ladder over an ARRAY type: the element's own struct row names it, else the
+// nominal render cut to its element. The plain code-5 field and the code-28 niche both come
+// through here, so ONE element type is ONE key at both codes; two renderers would key one
+// list two ways and the two columns could not be compared (D1663).
+export function anonRefListElemKeyOfTy(arrTy: i32): string {
+  if arrTy < 0 { return "" }
+  const row = anonRefListElemRowOfTy(arrTy)
+  if row >= 0 { return sNames[row] }
+  const nm = tyToNominalName(arrTy)
+  if nm == "" { return "" }
+  if tyNomNameCycled() { return "" }
+  refArrElemKeyDeferred(nm)
+}
+
+// The nullable half of `anonCodeIsSelfContained`: the niche codes whose slot is a
+// module-global heap type or a raw valtype, so the `| null` costs the field a nullable ref
+// and no companion column. Widening this set means widening `anonFieldElemName` with it.
+export function anonNulCodeIsSelfContained(c: i32) {
+  if (
+    c == FC_NUL_I32_LIST
+    || c == FC_NUL_STR
+    || c == FC_NUL_BOOL
+    || c == FC_NUL_CLOSURE
+  ) {
+    return true
+  }
+  isNulScalarListFieldCode(c)
+}
+
+// The width of an arithmetic field value, from the arena, falling back to i32 (D1586): the
+// operator alone is not the answer, since `{ f: mkF64() - mkF64() }` stores an f64 into an
+// i32 field if coded by operator. The i32 fall-back stays for a value whose type the
+// checker never recorded, since i32 is what the surrounding ladder assumes there.
+export function anonArithFieldCode(valIx: i32) {
+  const bk = tyKindOf(nodeTyIxOf(valIx))
+  if bk == TK_I64 { return FC_I64 }
+  if bk == TK_F64 { return FC_F64 }
+  if bk == TK_F32 { return FC_F32 }
+  FC_I32
+}
+
+// Whether the number list literal at `ix`, coded `lc` from its literals alone, has a list type of
+// another number type or of a union of numbers: a runtime element the literal scan skips widens it.
+export function anonListWiderThanLits(ix: i32, lc: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length { return false }
+  const at = T.tys[t]
+  if !(at is TyArray) || at.aElem < 0 { return false }
+  if tyIsNumericBox(at.aElem) { return true }
+  const k = tyKindOf(at.aElem)
+  if k == TK_I64 { return lc != FC_I64_LIST }
+  if k == TK_F64 { return lc != FC_F64_LIST }
+  k == TK_F32
+}
+
+// Does the literal hold a bare `null` element?
+export function arrLitHasNullElem(a: ArrayLit): boolean {
+  let j = 0
+  while j < a.arrElems.length {
+    if P.nodes[a.arrElems[j]] is NullLit { return true }
+    j = j + 1
+  }
+  false
+}
+
+// Can object literal `objIx`'s map-valued field `fname` be stored as a map in the literal's own
+// row? Not when the record the checker delivered the literal into holds something else there,
+// a union or a type parameter: that slot is a box, and the literal would build a row whose
+// field reads back as the wrong member, so the field stays uncoded and refuses (D3123).
+export function anonMapFieldDestAdmits(objIx: i32, fname: string): boolean {
+  const ft = tyFieldTyOf(nodeRepTyIxOf(objIx), fname)
+  if ft < 0 { return true }
+  const t = T.tys[nonNullTy(ft)]
+  t is TyMap
+}
+
+// Whether a literal type sits anywhere in `ty`: a union member, a nullable's inner, a list's
+// element, a map's key or value, or a record's field. Past `depth` the answer is true.
+export function tyHasLitDeep(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  if depth <= 0 { return true }
+  const t = T.tys[ty]
+  match t {
+    TyLit => true
+    TyNullable => tyHasLitDeep(t.nInner, depth - 1)
+    TyArray => tyHasLitDeep(t.aElem, depth - 1)
+    TyMap => tyHasLitDeep(t.mKey, depth - 1) || tyHasLitDeep(t.mVal, depth - 1)
+    TyUnion => tysHaveLitDeep(t.uMembers, depth - 1)
+    TyObj => tysHaveLitDeep(t.objFieldTypes, depth - 1)
+    TyPrim => false
+    TyErr => false
+    TyFunc => false
+    TyVar => false
+    TyNeg => false
+  }
+}
+
+function tysHaveLitDeep(tys: i32[], depth: i32): boolean {
+  let i = 0
+  while i < tys.length {
+    if tyHasLitDeep(tys[i], depth) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The mv-slot key of map type `mapTy`'s value: a literal union by its alias or member set, the
+// key the declared spelling's `mapValNameOf` cuts, since a root render widens it to `string`
+// and keys a string-valued slot the map's i32 atoms are not in (D3123). "" for a non-map.
+export function anonMapValName(mapTy: i32): string {
+  const mv = tyMapValOf(mapTy)
+  if mv < 0 { return "" }
+  const lu = litUnionAliasNameOfTy(mv)
+  if lu != "" { return lu }
+  tyToEmitName(mv)
+}
+
+// The key column of an anonymous-shape field row: true only for a map field, plain (19) or
+// nullable (29), whose (key, value) pair is the mv slot's identity — every other code is
+// string-keyed by construction. Read off the checker's recorded type, the literal's only
+// spelling of the map; `nodeTyMapKeyKind` peels the `| null` the declared twin reads.
+export function anonFieldElemKeyKind(valIx: i32, code: i32): i32 {
+  if code != FC_MAP && code != FC_NUL_MAP { return MAP_KEY_STR }
+  nodeTyMapKeyKind(valIx)
+}

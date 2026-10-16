@@ -1,0 +1,439 @@
+// `emit_closure_callee.vl` — the callee type of a closure call, its result kind,
+// and the block-capture spine.
+
+import {
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  NumLit,
+  P,
+  Param,
+  Paren,
+  Unary,
+  opIsArith,
+} from "./ast"
+import { nodeTyIxOf } from "./check_node_tys"
+import {
+  T,
+  TyFunc,
+  tyFieldTyOf,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+} from "./check_types"
+import { annRetNameOf, unwrapParen } from "./emit_base"
+import { numLexIsFloat } from "./emit_bignum"
+import { nonNulBaseOf } from "./emit_map_value_slots"
+import { anonLeafRetMovedOf } from "./emit_mv_slots"
+import { narrowSlotOf } from "./emit_narrow_slots"
+import { paramTypeNode } from "./emit_query"
+import { repKindOfSigTok, repSigTokHasSlot } from "./emit_rep"
+import {
+  identFnTypeAnnNodeAt,
+  rlElemCloSigKey,
+  sigSlotAtTok,
+} from "./emit_sig_tokens"
+import {
+  MfKind,
+  RLK_CLOSURE,
+  VKind,
+  anonLeafParamMoved,
+  fnStmts,
+  monoAnonParamPinTy,
+  rlElemKindTbl,
+  rlElemName,
+} from "./emit_state"
+import { declaredKind } from "./emit_struct_order"
+import { sidOfNode } from "./symbols"
+import { groupInnerOf, nameIsParenSpanEnds } from "./tyname"
+import { primNameOf } from "./tyquery"
+
+// True if the declared local `name` is an f32 slot (kind 13 in the local registry).
+export function declaredF32(name: string) { declaredKind(name) == "f32" }
+
+// Whether the checker recorded a `v128` (or a brand over it, a copy of the prim) at `exprIx`.
+export function nodeTyIsV128(exprIx: i32): boolean {
+  primNameOf(nodeTyIxOf(exprIx)) == "v128"
+}
+
+// Is the expression at `exprIx` a float number literal, peeling grouping parens and a
+// leading unary `-`? A float literal is polymorphic across the float types (it adapts
+// down to an f32 operand), so it doesn't force f64 like a genuine f64 value. The unary
+// peel matters: `-1.0` parses as a `Unary` over the literal, which `emitExprAsF32` re-encodes to match.
+export function exprIsFloatLit(exprIx: i32) {
+  if exprIx < 0 { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is NumLit { return numLexIsFloat(e.numText) }
+  if e is Unary {
+    if e.unOp == "-" {
+      const neg = P.nodes[unwrapParen(e.unArg)]
+      if neg is NumLit { return numLexIsFloat(neg.numText) }
+    }
+  }
+  false
+}
+
+// A per-node memo of the arithmetic classifiers over one long arithmetic chain, so the chain
+// classifies in time linear in its length (D2445). A session spans one classification or one
+// walk (an emission, a reservation scan) of the region the parser marked, which changes nothing
+// the classifiers read; its tables cover that region's node range alone and die with it.
+const bcStack: i32[] = []
+const bcFound: i32[] = []
+export let bcOpen = false
+let bcSessFn = -1
+let bcBase = 0
+let bcIn: i32[] = []
+let bcBits: i32[] = []
+export const BC_F64 = 0
+export const BC_F32 = 1
+export const BC_I64 = 2
+export const BC_STR = 3
+export const BC_LEAF = 4
+
+function bcPush(sp: i32, ix: i32) {
+  if sp < bcStack.length { bcStack[sp] = ix } else { bcStack.push(ix) }
+}
+
+// Whether node `ix` is an operator of the open session's region.
+function bcInWindow(ix: i32) {
+  ix >= bcBase && ix - bcBase < bcIn.length && bcIn[ix - bcBase] == 1
+}
+
+// Kind `k`'s answer at node `ix`: its value (0 to 3) when filed; -1 when not yet filed; -3 when
+// not filed and this call opened a session over the region `ix` heads; -2 when `ix` is in no
+// session and heads no region. A caller given -1 or -3 files its answer with `bcPutB`, which on
+// -3 also closes the session.
+export function bcGet(ix: i32, fnIx: i32, k: i32): i32 {
+  if !bcOpen {
+    if bcSpineEnter(ix, fnIx) { return -3 }
+    return -2
+  }
+  if fnIx != bcSessFn || !bcInWindow(ix) { return -2 }
+  const b = bcBits[ix - bcBase]
+  if ((b >> (3 * k)) & 1) == 0 { return -1 }
+  (b >> (3 * k + 1)) & 3
+}
+
+// File answer `v` (two bits) of kind `k` at node `ix`, when it belongs to the open session.
+export function bcPut(ix: i32, fnIx: i32, k: i32, v: i32) {
+  if !bcOpen || fnIx != bcSessFn || !bcInWindow(ix) { return }
+  const at = ix - bcBase
+  bcBits[at] = bcBits[at] | (1 << (3 * k)) | (v << (3 * k + 1))
+}
+
+// `bcPut` of a boolean answer `v` for a `bcGet` answer `m`, closing the session `m` opened.
+export function bcPutB(m: i32, ix: i32, fnIx: i32, k: i32, v: boolean) {
+  if m == -2 { return }
+  if v { bcPut(ix, fnIx, k, 1) } else { bcPut(ix, fnIx, k, 0) }
+  bcSpineLeave(m == -3)
+}
+
+// Push node `ix`'s children inside an arithmetic region (operators, parens, unary `-`/`~`)
+// onto `bcStack` from `sp` and return the new top, which is `sp + 2` exactly for an operator.
+function bcRegionStep(ix: i32, sp: i32): i32 {
+  if ix < 0 { return sp }
+  const e = P.nodes[ix]
+  if e is BinExpr {
+    if !opIsArith(e.binOp) { return sp }
+    bcPush(sp, e.binLeft)
+    bcPush(sp + 1, e.binRight)
+    return sp + 2
+  }
+  if e is Paren {
+    bcPush(sp, e.parInner)
+    return sp + 1
+  }
+  if e is Unary {
+    if e.unOp != "-" && e.unOp != "~" { return sp }
+    bcPush(sp, e.unArg)
+    return sp + 1
+  }
+  bcRegionLeaf(sp)
+}
+
+// Every other expression kind, as one answer: a leaf of the region, which the classifiers
+// answer without recursing, so it pushes nothing.
+function bcRegionLeaf(sp: i32): i32 { sp }
+
+// Whether `ix` is the root of a long arithmetic chain, as the parser marked it.
+function bcIsRegionHead(ix: i32) {
+  const e = P.nodes[ix]
+  if e is BinExpr { return e.binRegion != 0 }
+  false
+}
+
+// Collect the operators of the region under `root` into `bcFound`, returning their count.
+function bcCollect(root: i32): i32 {
+  bcPush(0, root)
+  let sp = 1
+  let n = 0
+  while sp > 0 {
+    sp = sp - 1
+    const ix = bcStack[sp]
+    const next = bcRegionStep(ix, sp)
+    if next == sp + 2 {
+      if n < bcFound.length { bcFound[n] = ix } else { bcFound.push(ix) }
+      n = n + 1
+    }
+    sp = next
+  }
+  n
+}
+
+// Open a session over the region `exprIx` heads, or add it to the open one when it lies inside
+// that one's node range; true when this call opened it and must close it with `bcSpineLeave`.
+export function bcSpineEnter(exprIx: i32, fnIx: i32): boolean {
+  if exprIx < 0 || !bcIsRegionHead(exprIx) { return false }
+  if bcOpen && (fnIx != bcSessFn || bcInWindow(exprIx)) { return false }
+  const n = bcCollect(exprIx)
+  let lo = exprIx
+  let hi = exprIx
+  let i = 0
+  while i < n {
+    if bcFound[i] < lo { lo = bcFound[i] }
+    if bcFound[i] > hi { hi = bcFound[i] }
+    i = i + 1
+  }
+  if bcOpen {
+    if lo < bcBase || hi - bcBase >= bcIn.length { return false }
+  } else {
+    bcBase = lo
+    bcIn = __array_new__(hi - lo + 1, 0)
+    bcBits = __array_new__(hi - lo + 1, 0)
+  }
+  i = 0
+  while i < n {
+    bcIn[bcFound[i] - bcBase] = 1
+    i = i + 1
+  }
+  if bcOpen { return false }
+  bcOpen = true
+  bcSessFn = fnIx
+  true
+}
+
+export function bcSpineLeave(opened: boolean) {
+  if opened { bcOpen = false }
+}
+
+// The non-i32 numeric rep an if-expression arm can carry. A pure selector, never encoded:
+// it tags which `exprIs*` classifier `armValueIsKind` consults, rather than threading the
+// bare wasm blocktype bytes 124/125/126 through each call site directly.
+export type BtKind = "f64" | "f32" | "i64"
+
+// True if the declared local `name` is an f64 slot (kind 11 in the local registry).
+export function declaredF64(name: string) { declaredKind(name) == "f64" }
+
+// The type of field `prop` of an un-narrowed parameter of instance `fnIx` pinned at an
+// anonymous record row, read from the argument's own record type, or -1 (D2762).
+export function anonParamPinFieldTy(recvIx: i32, prop: string, fnIx: i32): i32 {
+  const r = P.nodes[unwrapParen(recvIx)]
+  if r is Ident {
+    if narrowSlotOf(r.identName) >= 0 { return -1 }
+    const ptn = paramTypeNode(fnIx, r.identName)
+    if ptn < 0 { return -1 }
+    const pt = monoAnonParamPinTy.get(ptn) ?? -1
+    if pt < 0 { return -1 }
+    return tyFieldTyOf(pt, prop)
+  }
+  -1
+}
+
+// Whether the function declared at `fnIx` has a parameter named `name`.
+export function fnHasParamNamed(fnIx: i32, name: string): boolean {
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    let i = 0
+    while i < fn.fnParams.length {
+      const p = P.nodes[fn.fnParams[i]]
+      if p is Param {
+        if p.parName == name { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The closure `$fnsig` key for the elements of a closure-element ref list (kind 5): strip the
+// slot element's grouping parens and read its signature key. "" for a non-closure slot or an
+// un-keyable signature. Lets an indexed closure call (`fs[i](x)`) cast to the element's real
+// functype instead of the all-i32 arity fallback.
+export function cloArrSlotSigKey(slot: i32) {
+  if slot < 0 || slot >= rlElemName.length { return "" }
+  if rlElemKindTbl[slot] != RLK_CLOSURE { return "" }
+  rlElemCloSigKey(slot)
+}
+
+// The closure result type-name of a closure-element ref-list slot (kind 5): the element name
+// is the parenthesized function type `(() => K0 | null)`; strip the grouping parens and return
+// the text after the top-level `=>`. "" for a non-closure slot or an un-parseable element.
+export function cloArrSlotRetName(slot: i32) {
+  if slot < 0 || slot >= rlElemName.length { return "" }
+  if rlElemKindTbl[slot] != RLK_CLOSURE { return "" }
+  let nm = rlElemName[slot]
+  // A nullable-closure element slot: peel the `| null` (the call classifies on the
+  // narrowed non-null closure), mirroring `cloArrSlotSigKey`.
+  nm = nonNulBaseOf(nm)
+  // Same paren-span-then-cut pair as `rlElemCloSigKey`: the span test guards the cut, with
+  // no balance walk and an implied `length >= 2`.
+  if !nameIsParenSpanEnds(nm) { return "" }
+  // `annRetNameOf` is this `annArrowAt`-then-slice pair; its gate differs only for an arrow
+  // at index 0, a spelling no renderer produces.
+  return annRetNameOf(groupInnerOf(nm))
+}
+
+// The wide-scalar coercion kind of parameter `idx` from a `$fnsig` key's param-token spine:
+// `"i64"` / `"f64"` / `"f32"`, or `null` (i32 or a ref kind — no coercion). Lets a value call
+// widen an i32-literal argument into a wider parameter exactly as a direct call does —
+// without it the `call_ref` pushes an i32 and traps.
+export function sigParamCoerceKind(key: string, idx: i32): VKind | null {
+  const k = sigParamKindAt(key, idx)
+  if k == "i64" || k == "f64" || k == "f32" { return k }
+  null
+}
+
+// Whether parameter `idx` of `$fnsig` key `key` widens a literal-union atom argument to its
+// string: a `string` parameter, or a box that may hold it as its string arm.
+export function sigParamTakesAtomStr(key: string, idx: i32): boolean {
+  const k = sigParamKindAt(key, idx)
+  k == "str" || k == "union"
+}
+
+// The `VKind` of parameter `idx` in a `$fnsig` key's param-token spine — the whole answer
+// `sigParamCoerceKind` filters to its three wide-scalar rows. `null` for an out-of-range
+// index or a character outside the token vocabulary. The interlock: this token IS the
+// valtype the `call_ref`'s cast functype declares, so a coercion decided from it agrees with the bytes.
+export function sigParamKindAt(key: string, idx: i32): VKind | null {
+  const ti = sigParamTokIx(key, idx)
+  if ti < 0 { return null }
+  repKindOfSigTok(key[ti])
+}
+
+// The character index where parameter `idx`'s token starts, or -1 (the walk met the `>`
+// result separator or ran out of key). The one param-spine walk: the kind projection above
+// and the slot projection below both read it, so the two cannot disagree about token boundaries.
+function sigParamTokIx(key: string, idx: i32): i32 {
+  let i = 0
+  let p = 0
+  while i < key.length {
+    const c = key[i]
+    if c == '>' { return -1 }
+    if p == idx { return i }
+    if repSigTokHasSlot(repKindOfSigTok(c)) {
+      while i < key.length && key[i] != ';' { i = i + 1 }
+      i = i + 1
+    } else {
+      i = i + 1
+    }
+    p = p + 1
+  }
+  -1
+}
+
+// The interned slot of parameter `idx` — the `;`-terminated decimal a slot-carrying token
+// carries (`s3;`, `V0;`, `r1;`) — or -1 for a slot-free kind or no such parameter. The
+// interlock: the digit is the table row whose heap type the `call_ref`'s cast declares.
+export function sigParamSlotAt(key: string, idx: i32): i32 {
+  sigSlotAtTok(key, sigParamTokIx(key, idx))
+}
+
+// D1100 — the arena node of lifted-function position `fe`, or -1. Every parallel-table read
+// the container-delivery redirects make goes through it: a position past `fnStmts`'s end is
+// an OOB read, which traps the compiler rather than refusing (D1152).
+export function anonLeafFeDeclNode(fe: i32): i32 {
+  if fe < 0 { return -1 }
+  if fe >= fnStmts.length { return -1 }
+  fnStmts[fe]
+}
+
+// D1100 — did the `??` merge move either row of the function declared at `fnDeclIx`? The
+// gate every container-delivery redirect takes, so a program with no merge keeps every byte.
+export function anonLeafFnRowsMovedOf(fnDeclIx: i32): boolean {
+  if fnDeclIx < 0 { return false }
+  if anonLeafRetMovedOf(fnDeclIx) { return true }
+  const n = P.nodes[fnDeclIx]
+  if n is FuncDecl {
+    let pj = 0
+    while pj < n.fnParams.length {
+      const px = n.fnParams[pj]
+      if px < anonLeafParamMoved.length {
+        if anonLeafParamMoved[px] == 1 { return true }
+      }
+      pj = pj + 1
+    }
+  }
+  false
+}
+
+// Whether the callee node `fnNode` is typed as a function whose result is a nullable literal
+// union.
+export function calleeRetIsNulLitUnion(fnNode: i32): boolean {
+  const ft = nodeTyIxOf(fnNode)
+  if ft < 0 || ft >= T.tys.length { return false }
+  const t = T.tys[ft]
+  if t is TyFunc { return tyIsNullableLitUnion(t.fnRet) }
+  false
+}
+
+// The callee's own `TyFunc` arena row for value call `callIx`, or -1 — asked of the
+// callee's annotation before the call node's recorded type, and the order matters: inside
+// a monomorphized instance the body shares leaf nodes with the generic, so
+// `nodeTyIxOf(c.callFn)` answers the generic's own type-variable signature, not the pin.
+export function cloCallCalleeFnTy(callIx: i32, fnIx: i32): i32 {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cre = P.nodes[c.callFn]
+    if cre is Ident {
+      // A parameter (an instance's substituted `f: (i32, i32) => K`, or an ordinary
+      // annotated function-typed param).
+      const pt = paramTypeNode(fnIx, cre.identName)
+      if pt >= 0 {
+        const pty = nodeTyIxOf(pt)
+        if pty >= 0 {
+          if T.tys[pty] is TyFunc { return pty }
+        }
+      }
+      // An annotated function-typed binding (`const f: (i32) => K = base`).
+      const jnd = identFnTypeAnnNodeAt(sidOfNode(c.callFn), fnIx, c.callFn)
+      if jnd >= 0 {
+        const jty = nodeTyIxOf(jnd)
+        if jty >= 0 {
+          if T.tys[jty] is TyFunc { return jty }
+        }
+      }
+    }
+    // Everything else — a field closure, an indexed element, an inferred binding — keys off
+    // the callee's own checker type, exactly as `cloCallSigKey`'s general fallback does.
+    const direct = nodeTyIxOf(c.callFn)
+    if direct >= 0 {
+      if T.tys[direct] is TyFunc { return direct }
+    }
+  }
+  -1
+}
+
+// The result twin of `cloCallParamLitUnion`: does value call `callIx` yield a literal-union
+// interned i32 atom? The `$fnsig` key can't supply it (a litunion result's token is `i`,
+// identical to a plain i32's). Without it, a function-value call inside a monomorphized
+// instance staged the atom into a string-narrow slot: `vl check` rc 0, refused at load.
+export function cloCallResultLitUnion(callIx: i32, fnIx: i32): boolean {
+  const ft = cloCallCalleeFnTy(callIx, fnIx)
+  if ft < 0 { return false }
+  const t = T.tys[ft]
+  if t is TyFunc { return tyIsLitUnion(t.fnRet) }
+  false
+}
+
+// Map a closure sig-return kind (`sigKeyRetKind`) to a `.map` result element kind
+// (`mfResultKindOf`'s vocabulary), for a closure-value callback. A struct return maps to a
+// ref-list result — its slot comes from `mfResultSlotOf`'s closure-value branch. `null`
+// for a void result / still-unwired ref kind.
+export function mfResKindFromSigRet(k: VKind | null): MfKind | null {
+  if k == "i32" { return "i32" }
+  if k == "f64" { return "f64" }
+  if k == "i64" { return "i64" }
+  if k == "str" { return "str" }
+  if k == "struct" { return "ref" }
+  null
+}

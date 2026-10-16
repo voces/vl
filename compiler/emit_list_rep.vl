@@ -1,0 +1,559 @@
+// `emit_list_rep.vl` — which list rep a binding or field takes, and the gate that
+// decides whether a list rep is admitted.
+
+import {
+  ArrayLit,
+  Call,
+  FuncDecl,
+  LetDecl,
+  Member,
+  P,
+  hasSpreadItem,
+} from "./ast"
+import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
+import {
+  nodeTyExcludesNull,
+  nodeTyIxOf,
+  nodeTyMapKeyKind,
+  nodeTyMapKeyKindSpan,
+} from "./check_node_tys"
+import { MAP_KEY_STR } from "./check_ty_rep"
+import { T, TyArray, TyUnion, TyVar, tyScalarBaseIs } from "./check_types"
+import {
+  moduleLocalLetOfUnique,
+  parentLetOf,
+  parentLoopVarOf,
+  retNulStringFlag,
+} from "./emit_base"
+import { fnStmtsPosOf } from "./emit_capture_frames"
+import { paramIndexOf, paramTypeNode } from "./emit_query"
+import { RepDesc, repOfTy } from "./emit_rep"
+import {
+  FC_F32_LIST,
+  FC_F64_LIST,
+  FC_I32_LIST,
+  FC_I64_LIST,
+  FC_NUL_F32_LIST,
+  FC_NUL_F64_LIST,
+  FC_NUL_I32_LIST,
+  FC_NUL_I64_LIST,
+  FC_NUL_REF_LIST,
+  FC_NUL_STR_LIST,
+  FC_NUL_U8_LIST,
+  FC_REF_LIST,
+  FC_STR_LIST,
+  FC_U8_LIST,
+  LBK_F32_LIST,
+  LBK_F64_LIST,
+  LBK_I32_LIST,
+  LBK_I64_LIST,
+  LBK_REF,
+  LBK_STR_LIST,
+  LBK_U8_LIST,
+  MfKind,
+  VKind,
+  emitRootIx,
+  fnInstOrigin,
+  fnParent,
+  fnStmts,
+} from "./emit_state"
+import { declaredKind } from "./emit_struct_order"
+import { memoGenNew } from "./memo"
+
+// How `k` relates to the list reps: 1 for one of the seven non-null lists, 2 for a nullable
+// list niche, 0 for everything else. Exhaustive and `_`-less, so a new kind has to say which.
+export function vkListClass(k: VKind): i32 {
+  match k {
+    "list" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "reflist" => {
+      return 1
+    }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" => {
+      return 2
+    }
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return 0
+    }
+  }
+}
+
+// `k` when it names a non-null list rep, else null.
+export function listRepOrNull(k: VKind | null): VKind | null {
+  if k == null { return null }
+  if vkListClass(k) == 1 { return k }
+  null
+}
+
+// ── the list reps' integer code tables ──
+// Each integer table that names a list rep has one `_`-less encoder from the rep, and its
+// readers decode by walking the reps in `nextListRep` order and asking that encoder, so a rep
+// with no row in some table is a compile error at the encoder, not a silent miss (D2295).
+
+// The list rep after `k` in the decoders' walk, which starts at `"list"` and visits all
+// fourteen list reps; null after the last, and for a kind that is not a list rep.
+function nextListRep(k: VKind): VKind | null {
+  match k {
+    "list" => {
+      return "u8list"
+    }
+    "u8list" => {
+      return "i64list"
+    }
+    "i64list" => {
+      return "f32list"
+    }
+    "f32list" => {
+      return "f64list"
+    }
+    "f64list" => {
+      return "strlist"
+    }
+    "strlist" => {
+      return "reflist"
+    }
+    "reflist" => {
+      return "nullist"
+    }
+    "nullist" => {
+      return "nulu8list"
+    }
+    "nulu8list" => {
+      return "nuli64list"
+    }
+    "nuli64list" => {
+      return "nulf32list"
+    }
+    "nulf32list" => {
+      return "nulf64list"
+    }
+    "nulf64list" => {
+      return "nulstrlist"
+    }
+    "nulstrlist" => {
+      return "nulreflist"
+    }
+    "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return null
+    }
+  }
+}
+
+// The seven non-null list reps in one order, the index both list-code tables below are read at;
+// -1 for any other rep. A nullable list element is the non-null code plus the slot's
+// `rlElemNullable` bit, so it has no ordinal of its own.
+function nonNullListOrdinal(k: VKind): i32 {
+  match k {
+    "list" => {
+      return 0
+    }
+    "u8list" => {
+      return 1
+    }
+    "i64list" => {
+      return 2
+    }
+    "f32list" => {
+      return 3
+    }
+    "f64list" => {
+      return 4
+    }
+    "strlist" => {
+      return 5
+    }
+    "reflist" => {
+      return 6
+    }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
+}
+
+// The ref-list element code (`rlElemKindTbl`) of each non-null list rep, by ordinal. Codes 1,
+// 2, 3 and 5 (struct, union, map, closure) are not lists.
+const rlElemCodeByList: i32[] = [4, 11, 8, 10, 7, 6, 9]
+
+// The ref-list element code of a list element of rep `k`, or -1 for a rep that is not a
+// non-null list.
+export function rlElemCodeOfListRep(k: VKind): i32 {
+  const o = nonNullListOrdinal(k)
+  if o < 0 { return -1 }
+  rlElemCodeByList[o]
+}
+
+// The non-null list rep of ref-list element code `code`, or null when the element is no list.
+// Only the non-null reps are compared: the encoder's -1 for a nullable rep is its decline, and
+// matching it would decode a code of -1 as `"nullist"`.
+export function rlElemListRep(code: i32): VKind | null {
+  if code < 0 { return null }
+  rlElemListRepFrom(code, "list")
+}
+
+function rlElemListRepFrom(code: i32, k: VKind): VKind | null {
+  if vkListClass(k) == 1 && rlElemCodeOfListRep(k) == code { return k }
+  const n = nextListRep(k)
+  if n == null { return null }
+  rlElemListRepFrom(code, n)
+}
+
+// The struct/variant field code (`fieldCodeOfSpelling`'s vocabulary) of a field of list rep
+// `k`, or -1 for a rep that is not a list. Each nullable rep has its own code, since its slot
+// is a `(ref null …)` where the non-null code's is a `(ref …)`.
+export function fieldCodeOfListRep(k: VKind): i32 {
+  match k {
+    "list" => {
+      return FC_I32_LIST
+    }
+    "u8list" => {
+      return FC_U8_LIST
+    }
+    "i64list" => {
+      return FC_I64_LIST
+    }
+    "f32list" => {
+      return FC_F32_LIST
+    }
+    "f64list" => {
+      return FC_F64_LIST
+    }
+    "strlist" => {
+      return FC_STR_LIST
+    }
+    "reflist" => {
+      return FC_REF_LIST
+    }
+    "nullist" => {
+      return FC_NUL_I32_LIST
+    }
+    "nulu8list" => {
+      return FC_NUL_U8_LIST
+    }
+    "nuli64list" => {
+      return FC_NUL_I64_LIST
+    }
+    "nulf32list" => {
+      return FC_NUL_F32_LIST
+    }
+    "nulf64list" => {
+      return FC_NUL_F64_LIST
+    }
+    "nulstrlist" => {
+      return FC_NUL_STR_LIST
+    }
+    "nulreflist" => {
+      return FC_NUL_REF_LIST
+    }
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
+}
+
+// The list rep of field code `code`, or null when the field is no list.
+export function listRepOfFieldCode(code: i32): VKind | null {
+  if code < 0 { return null }
+  listRepOfFieldCodeFrom(code, "list")
+}
+
+function listRepOfFieldCodeFrom(code: i32, k: VKind): VKind | null {
+  if fieldCodeOfListRep(k) == code { return k }
+  const n = nextListRep(k)
+  if n == null { return null }
+  listRepOfFieldCodeFrom(code, n)
+}
+
+// The generic-compare kind of a list of rep `k`, or -1 for a rep that is not a non-null list.
+export function eqListKindOfListRep(k: VKind): i32 {
+  match k {
+    "list" => {
+      return LBK_I32_LIST
+    }
+    "u8list" => {
+      return LBK_U8_LIST
+    }
+    "i64list" => {
+      return LBK_I64_LIST
+    }
+    "f32list" => {
+      return LBK_F32_LIST
+    }
+    "f64list" => {
+      return LBK_F64_LIST
+    }
+    "strlist" => {
+      return LBK_STR_LIST
+    }
+    "reflist" => {
+      return LBK_REF
+    }
+    "nullist" | "nulu8list" | "nuli64list" | "nulf32list" | "nulf64list" | "nulstrlist" | "nulreflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return -1
+    }
+  }
+}
+
+// True if `k` is one of the five non-null lists over a distinct scalar backing: every list but
+// the i32-backed one and the ref list.
+export function isScalarBackedListRep(k: VKind | null): boolean {
+  if k == null { return false }
+  if k == "list" || k == "reflist" { return false }
+  vkListClass(k) == 1
+}
+
+export const lrGen = memoGenNew(0)
+export const lrMemoGen: i32[] = []
+export const lrMemoFn: i32[] = []
+export const lrMemoKind: VKind[] = []
+export const lrMemoNul: i32[] = []
+
+// The descriptor of the recorded type `pin` when it can name a list rep: an array, or a type
+// variable or union that may stand for one. Uncovered for every other type, which asks nothing.
+export function arenaRepOf(pin: i32): RepDesc {
+  if pin >= 0 {
+    const t = T.tys[pin]
+    if t is TyArray || t is TyVar || t is TyUnion { return repOfTy(pin) }
+  }
+  repOfTy(-1)
+}
+
+// True if `exprIx` is an array literal with a spread item.
+export function arrLitHasSpread(exprIx: i32) {
+  const e = P.nodes[exprIx]
+  if e is ArrayLit { return hasSpreadItem(e.arrElems) }
+  false
+}
+
+// A position whose syntactic answer is narrowed to the list reps some old `expr*Array` rung
+// named there. Each gate is an open step: un-gating one is a behaviour change graded on its own
+// `list-kind-grid.py --only <kind>` run (D2277).
+type ListRepGate = "map-read"
+  | "if-join"
+  | "empty-hole"
+  | "spread"
+  | "narrowed-hole"
+  | "capture"
+  | "member-field"
+  | "closure-array-call"
+  | "map-filter"
+  | "callee-return"
+  | "callee-value"
+  | "coalesce"
+
+// `k` when it names a non-null list rep position `g` answers, else null.
+export function gatedListRep(k: VKind | null, g: ListRepGate): VKind | null {
+  const r = listRepOrNull(k)
+  if r == null { return null }
+  if listRepGateAdmits(g, r) { return r }
+  null
+}
+
+// Whether position `g` answers the non-null list rep `k`.
+function listRepGateAdmits(g: ListRepGate, k: VKind): boolean {
+  match g {
+    "map-read" | "capture" | "callee-value" | "map-filter" => {
+      return k != "u8list"
+    }
+    "narrowed-hole" => {
+      return k != "list" && k != "reflist"
+    }
+    "if-join" => {
+      return k == "strlist" || k == "f32list" || k == "reflist"
+    }
+    "empty-hole" => {
+      return k == "strlist"
+        || k == "f64list"
+        || k == "i64list"
+        || k == "f32list"
+    }
+    "spread" => {
+      return k != "u8list" && k != "reflist"
+    }
+    "member-field" => {
+      return k == "list"
+        || k == "reflist"
+        || k == "strlist"
+        || k == "f64list"
+        || k == "i64list"
+        || k == "f32list"
+    }
+    "closure-array-call" => {
+      return k == "list" || k == "strlist" || k == "f64list"
+    }
+    "callee-return" => {
+      return k != "u8list" && k != "i64list"
+    }
+    "coalesce" => {
+      return k == "strlist"
+    }
+  }
+}
+
+// The non-null list rep of the nullable list niche `k`, else null.
+export function nulListBase(k: VKind | null): VKind | null {
+  if k == null { return null }
+  match k {
+    "nullist" => {
+      return "list"
+    }
+    "nulu8list" => {
+      return "u8list"
+    }
+    "nuli64list" => {
+      return "i64list"
+    }
+    "nulf32list" => {
+      return "f32list"
+    }
+    "nulf64list" => {
+      return "f64list"
+    }
+    "nulstrlist" => {
+      return "strlist"
+    }
+    "nulreflist" => {
+      return "reflist"
+    }
+    "list" | "u8list" | "i64list" | "f32list" | "f64list" | "strlist" | "reflist" | "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" => {
+      return null
+    }
+  }
+}
+
+// The list rep whose element is the `.map`/`.filter`/`.slice`/spread element kind `k`.
+export function listRepOfMf(k: MfKind | null): VKind | null {
+  if k == null { return null }
+  match k {
+    "i32" => {
+      return "list"
+    }
+    "u8" => {
+      return "u8list"
+    }
+    "i64" => {
+      return "i64list"
+    }
+    "f32" => {
+      return "f32list"
+    }
+    "f64" => {
+      return "f64list"
+    }
+    "str" => {
+      return "strlist"
+    }
+    "ref" => {
+      return "reflist"
+    }
+  }
+}
+
+// ── map-typedness of expressions (G8: `{[string]: i32}`) ────────────────────────
+
+// Parallel to the array family: decide whether an expression / param / local produces a
+// string-keyed map — a `(ref $mStructIdx)`. An index read `m[k]` / `m.has(k)` yields an
+// i32, not a map, so neither counts here.
+
+// True if the already-collected declared local `name` is a map ref (code `6`).
+export function declaredMap(name: string) { declaredKind(name) == "map" }
+export function declaredNulMap(name: string) { declaredKind(name) == "nulmap" }
+
+// The module-scope block binding a read of `name` in frame `fnIx` can denote, or -1 when that
+// frame binds the name itself — a parameter, a `let` or a loop variable shadows every module
+// block's binding of it, so a function's own `r` never takes the kind of a top-level block's `r`.
+// A lifted closure also sees every enclosing frame's bindings, so any of them shadows too. D2252.
+export function moduleLocalLetSeenFrom(fnIx: i32, name: string) {
+  if frameChainBindsName(fnIx, name) { return -1 }
+  moduleLocalLetOfUnique(emitRootIx, name)
+}
+
+// True when frame `fnIx` or any frame enclosing it binds `name`, so a read of `name` there can
+// never denote a module-scope block's binding. Outward through `fnParent`, and from a generic
+// instance into its origin, whose nested frames the instance's slot does not parent (D1817).
+export function frameChainBindsName(fnIx: i32, name: string) {
+  if fnIx < 0 { return false }
+  if frameBindsName(fnIx, name) { return true }
+  let pp = fnStmtsPosOf(fnIx)
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if frameBindsName(fnStmts[pp], name) { return true }
+    let up = -1
+    if pp < fnParent.length { up = fnParent[pp] }
+    if up < 0 && pp < fnInstOrigin.length { up = fnInstOrigin[pp] }
+    if up >= fnStmts.length { up = -1 }
+    pp = up
+    steps = steps + 1
+  }
+  false
+}
+
+// True when the frame `fnIx` itself binds `name`: a parameter, a body `let` or a loop variable.
+function frameBindsName(fnIx: i32, name: string) {
+  if paramIndexOf(fnIx, name) >= 0 { return true }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    if parentLetOf(fn.fnBody, name) >= 0 { return true }
+    if parentLoopVarOf(fn.fnBody, name) >= 0 { return true }
+  }
+  false
+}
+
+// Every `Node` kind `exprHasMapOp`'s ladder does not test, as one answer: a leaf or a
+// declaration, neither of which can hold a map op an enclosing walk has not already seen. A
+// nested `FuncDecl` is deliberately here — its locals are its own lifted frame's.
+export function exprMapOpNotAnOperand(_exprIx: i32): boolean { false }
+
+// The key kind of the map/set the `LetDecl` at `letIx` declares. Annotation-first (the
+// spelling, `| null` tolerated by the key cut's width), else the checker's recorded type
+// on the initializer — the only answer for an un-annotated `const s = Set()` whose key the
+// first `.add(1)` pinned.
+export function letMapKeyKind(letIx: i32): i32 {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      // Matches the name form's span width (`nameIsI32KeyedMap` cuts `{[K]:` from anywhere),
+      // rather than the narrower exact width, since the only consumer picks a Set rep by width.
+      const ka = nodeTyMapKeyKindSpan(d.letType)
+      if ka != MAP_KEY_STR { return ka }
+    }
+    return nodeTyMapKeyKind(d.letInit)
+  }
+  MAP_KEY_STR
+}
+
+// True if the parameter `name` of function `fnIx` is `string`-typed.
+export function paramString(fnIx: i32, name: string) {
+  const pt = paramTypeNode(fnIx, name)
+  if retNulStringFlag(pt) == 1 { return true }
+  // Canon's banked type (B143): a litunion param's spelling softens to `string`, and here
+  // the softened name is right — an Ident read of it IS a string at a string sink.
+  let psTy = nodeTyIxOf(pt)
+  if canonRewroteNode(pt) { psTy = canonTyIxOf(pt) }
+  tyScalarBaseIs(psTy, "string")
+}
+
+// True if the already-collected declared local `name` is a string ref (code `3`).
+export function declaredString(name: string) {
+  // A `string | null` (kind 16) local reads as a string for string ops — narrowed non-null
+  // at every such read, so `!= null` (checked first via `exprNullableString`) never mis-routes.
+  const dk = declaredKind(name)
+  return dk == "str" || dk == "nulstr"
+}
+
+// The receiver of the `.pop()` call at `ix`, or -1 when `ix` is not one.
+export function popRecvOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const c = P.nodes[ix]
+  if c is Call {
+    if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+    const callee = P.nodes[c.callFn]
+    if callee is Member {
+      if callee.memProp == "pop" { return callee.memObj }
+    }
+  }
+  -1
+}
+
+// Whether node `ix` is a `.pop()` the checker typed as the element itself (D3558).
+export function popTakesElem(ix: i32): boolean {
+  popRecvOf(ix) >= 0 && nodeTyExcludesNull(ix)
+}

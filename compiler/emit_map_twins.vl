@@ -1,0 +1,624 @@
+// `emit_map_twins.vl` — a map's twin slots and arm tags, and whether a variant
+// needs a discriminant field.
+
+import { FuncDecl, Ident, LetDecl, P } from "./ast"
+import { mapRetagAllRows } from "./check_retag_rows"
+import { valueAtomKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyMap,
+  TyNullable,
+  TyUnion,
+  tyEq,
+  tyIsLitUnion,
+  tyIsNullableLitUnion,
+} from "./check_types"
+import { mapValIsI32Cell } from "./check_union_arm_msgs"
+import { mapShapeFoldSet, parentLetOf, unwrapParen } from "./emit_base"
+import { emitFail } from "./emit_bytes"
+import { scalarTagOfKind } from "./emit_rep"
+import { mvCanonRepOf, variantLitPairKind } from "./emit_shape_rows"
+import {
+  ba8Used,
+  emitPhaseReached,
+  mIntMonoArmUsed,
+  mTwinCodes,
+  mTwinExtra,
+  mTwinRetagMemo,
+  mTwinSettled,
+  mTwinShapes,
+  mTwinTys,
+  uFieldCount,
+  uFieldElemName,
+  uFieldLitTyIx,
+  uFieldNames,
+  uFieldStart,
+  uFieldTyText,
+  uFieldTypes,
+  uVariants,
+  unMemAtoms,
+  unMemTyCount,
+  unMemTyStart,
+  unMemTys,
+  vbAtomListTop,
+  vbAtomListUsed,
+  vbBoolListTop,
+  vbV128Used,
+} from "./emit_state"
+import {
+  mapArmShapeOfTy,
+  mapSetSpelledAs,
+  mapShapeIsMono,
+  mapShapeTwinned,
+  mapSoftTwin,
+  mapTwinOneStruct,
+} from "./emit_ty_canon"
+import {
+  boolTagElemKind,
+  unMemIsMap,
+  unMemPeelAliasWrapper,
+  unionMemberTysOf,
+  unionRowOf,
+} from "./emit_union_registry"
+import { variantSig, variantTagKey } from "./emit_variant_sig"
+import { strListHas } from "./listutil"
+import { splitUnionAtoms } from "./tyname"
+import { flattenVariantsInto, primNameOf, tyLitSetMemberLexes } from "./tyquery"
+
+// ── D1023: the discriminant column's three queries ──
+// `is A` over two struct arms that share a field-name set is a discriminant-value test: true
+// iff the tag names the shared shape and the value's literal-typed fields are members of
+// `A`'s sets. These three answer what `vi`'s members are at field `fi`, whether two arms' sets agree, and whether `fi` needs testing.
+
+// The literal-set member lexemes of variant `vi`'s field `fi` — empty when the field is not
+// a literal set. Reads the discriminant column rather than the identity column
+// (`uFieldTyText`), since canon softens a multi-member set to its base.
+export function variantFieldLitLexes(vi: i32, fi: i32) {
+  const none: string[] = []
+  if vi < 0 || vi >= uFieldStart.length { return none }
+  if fi < 0 || fi >= uFieldCount[vi] { return none }
+  const row = uFieldStart[vi] + fi
+  if row < 0 || row >= uFieldLitTyIx.length { return none }
+  tyLitSetMemberLexes(uFieldLitTyIx[row])
+}
+
+// Do variants `a` and `b` carry the SAME literal set at field `fi`? Set equality, not list
+// equality: `"x" | "y"` and `"y" | "x"` are one type, and a test that called them different
+// would emit a membership compare that is a tautology in both directions.
+function variantFieldLitSetSame(a: i32, b: i32, fi: i32): boolean {
+  const la = variantFieldLitLexes(a, fi)
+  const lb = variantFieldLitLexes(b, fi)
+  if la.length != lb.length { return false }
+  let i = 0
+  while i < la.length {
+    if !strListHas(lb, la[i]) { return false }
+    i = i + 1
+  }
+  let j = 0
+  while j < lb.length {
+    if !strListHas(la, lb[j]) { return false }
+    j = j + 1
+  }
+  true
+}
+
+// Must `x is <vi>` test field `fi`'s value, or does the tag already settle it? The gate is
+// "another arm shares my tag and disagrees at this field": a variant whose tag is its own has
+// nothing to disambiguate, and a same-signature sibling with the same set at `fi` does not
+// disagree. Asked directly off `variantSig`, since this runs before `uTags` is filled too.
+export function variantDiscrimFieldNeeded(vi: i32, fi: i32): boolean {
+  if variantFieldLitLexes(vi, fi).length == 0 { return false }
+  const sig = variantSig(vi)
+  const key = variantTagKey(vi)
+  let vj = 0
+  while vj < uVariants.length {
+    if vj != vi {
+      if variantSig(vj) == sig && variantTagKey(vj) == key {
+        if !variantFieldLitSetSame(vi, vj, fi) { return true }
+      }
+    }
+    vj = vj + 1
+  }
+  false
+}
+
+// Would the pair be discriminable if its mixed literal fields got re-laid (D1050)? True
+// only for a pair not discriminable as laid out, so the two questions partition. One
+// derivation, three readers — `assignTags` admits on this, `unifyMixedLitRepArms` acts on
+// it, `buildVariantTwins` folds on it — so the three cannot drift the way copies would.
+export function variantLitRepUnifiable(a: i32, b: i32): boolean {
+  variantLitPairKind(a, b) >= 2
+}
+
+// Do `a` and `b` differ at a field where a literal set meets a different storage? Since
+// D1050 every such pair is re-laid onto one rep before this runs, so this is the floor's own
+// applicability test rather than a program anyone can write. Kept separate because the other
+// refusal beside it (arms nothing tells apart) is still live.
+export function variantLitRepMismatch(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return false }
+  if uFieldCount[a] != uFieldCount[b] { return false }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    if uFieldLitTyIx[ra] >= 0 || uFieldLitTyIx[rb] >= 0 {
+      if uFieldTypes[ra] != uFieldTypes[rb] { return true }
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+// The name of the first field at which `a` and `b` disagree, for `assignTags`' floor, or ""
+// when nothing does. A floor that cannot say where sends its reader to re-derive the walk it
+// just ran (D1461).
+export function variantFirstLayoutDisagreeField(a: i32, b: i32): string {
+  if a < 0 || b < 0 { return "" }
+  if a >= uFieldCount.length || b >= uFieldCount.length { return "" }
+  if uFieldCount[a] != uFieldCount[b] { return "" }
+  let fi = 0
+  while fi < uFieldCount[a] {
+    const ra = uFieldStart[a] + fi
+    const rb = uFieldStart[b] + fi
+    if uFieldTypes[ra] != uFieldTypes[rb] { return uFieldNames[ra] }
+    if uFieldElemName[ra] != uFieldElemName[rb] { return uFieldNames[ra] }
+    if uFieldTyText[ra] != uFieldTyText[rb] { return uFieldNames[ra] }
+    fi = fi + 1
+  }
+  ""
+}
+
+// Does variant `vi` carry ANY field whose value `is` must test — i.e. is `vi` one of a set
+// of arms sharing a tag and parted by a discriminant? The whole-variant form of
+// `variantDiscrimFieldNeeded`, for the callers that ask about the arm rather than a field:
+// `emitIs`'s static fold, which is unsound exactly when this is true.
+export function variantHasDiscrimField(vi: i32): boolean {
+  if vi < 0 || vi >= uFieldCount.length { return false }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    if variantDiscrimFieldNeeded(vi, fi) { return true }
+    fi = fi + 1
+  }
+  false
+}
+
+// The globally-stable tag of a value-union atom: every struct variant takes the dense ranks
+// `0 .. uVariants.length-1`, so atom kinds claim the fixed slots above them, stable across
+// every union in the module. The kind-to-tag table lives in `emit_rep` (`scalarTagOfKind`);
+// this is the atom-spelled entry point into it, not a second copy of the table.
+export function scalarTagOf(atom: string) {
+  scalarTagOfKind(valueAtomKind(atom))
+}
+
+// The first tag above the value-atom band — the base the three slot-keyed bands below sit
+// on. Code 13 (the packed byte list) exists only in a module that has one (`ba8Used`),
+// settled before `emitModule` runs. Conditional rather than a flat 14, since a flat lift
+// would renumber every tag in a program with no `u8[]`, though any base keeps the three bands disjoint.
+export function uAtomBandTop(): i32 {
+  if vbAtomListTop >= 1 { return atomListCode() + vbAtomListTop + 1 }
+  if vbAtomListUsed { return atomListCode() + 1 }
+  atomListCode()
+}
+
+// The code of the atom-leaf list arm (`atomListArmTag`): the first code above every other
+// value-atom code, so a module with no such arm keeps its numbering.
+function atomListCode(): i32 {
+  if mTwinExtra > 0 { return mTwinCodeBase() + mTwinExtra }
+  if vbBoolListTop >= 0 { return mTwinCodeBase() }
+  if mIntMonoArmUsed { return 17 }
+  if vbV128Used { return 15 }
+  if ba8Used { return 14 }
+  13
+}
+
+// The first map-twin code: 17, or the first code above the boolean-leaf list codes.
+function mTwinCodeBase(): i32 {
+  if vbBoolListTop >= 0 { return 19 + vbBoolListTop }
+  17
+}
+
+// How many list layers sit above a `boolean` leaf, less one: 0 for `boolean[]`, 1 for
+// `boolean[][]`; -1 for any other type, a nullable layer included.
+export function boolLeafListDepthOfTy(ty: i32): i32 {
+  let cur = ty
+  let d = -1
+  while cur >= 0 && cur < T.tys.length && d < 64 {
+    const t = T.tys[cur]
+    if !(t is TyArray) {
+      if d >= 0 && primNameOf(cur) == "boolean" { return d }
+      return -1
+    }
+    cur = t.aElem
+    d = d + 1
+  }
+  -1
+}
+
+// The boolean-list atom code of the list type `ty`: 17, 18, or `18 + depth` for a nested
+// boolean leaf; -1 for any other type.
+export function tyBoolListCode(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const d = boolLeafListDepthOfTy(ty)
+  if d >= 1 { return 18 + d }
+  if d == 0 { return 17 }
+  const t = T.tys[ty]
+  if t is TyArray { return boolTagElemKind(t.aElem) }
+  -1
+}
+
+// `tyBoolListCode` over a rendered list spelling.
+export function boolListCodeOfName(name: string): i32 {
+  const d = boolLeafListDepthOfName(name)
+  if d >= 1 { return 18 + d }
+  if d == 0 { return 17 }
+  if valueAtomKind(name) == 18 { return 18 }
+  -1
+}
+
+// `boolLeafListDepthOfTy` over a rendered member spelling.
+export function boolLeafListDepthOfName(name: string): i32 {
+  let n = name.length
+  let d = -1
+  while n >= 2 && name[n - 1] == ']' && name[n - 2] == '[' {
+    n = n - 2
+    d = d + 1
+  }
+  if d >= 0 && name.slice(0, n) == "boolean" { return d }
+  -1
+}
+
+// The initializer of the frame binding the name read `ix` names, or -1 when `ix` is no such
+// name (or is that initializer itself).
+export function frameLetInitOf(ix: i32, fnIx: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is Ident) { return -1 }
+  if fnIx < 0 || fnIx >= P.nodes.length { return -1 }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return -1 }
+  const li = parentLetOf(fd.fnBody, n.identName)
+  if li < 0 { return -1 }
+  const d = P.nodes[li]
+  if !(d is LetDecl) { return -1 }
+  if d.letInit < 0 || unwrapParen(d.letInit) == ix { return -1 }
+  d.letInit
+}
+
+// How many list layers sit above a literal-union leaf, less one: 0 for `K[]`, 1 for `K[][]`;
+// -1 for any other type. A nullable literal-union leaf counts; a nullable list layer does not.
+export function atomLeafListDepthOfTy(ty: i32): i32 {
+  let cur = ty
+  let d = -1
+  while cur >= 0 && cur < T.tys.length && d < 64 {
+    const t = T.tys[cur]
+    if !(t is TyArray) {
+      if d >= 0 && (tyIsLitUnion(cur) || tyIsNullableLitUnion(cur)) { return d }
+      return -1
+    }
+    cur = t.aElem
+    d = d + 1
+  }
+  -1
+}
+
+// Whether union `un` has the literal-union-leaf list arm of depth `d`.
+export function unionHasAtomLeafArm(un: string, d: i32): boolean {
+  const atoms: string[] = []
+  const tys: i32[] = []
+  if !unionSetArmTys(un, atoms, tys) { return false }
+  for t in tys {
+    if atomLeafListDepthOfTy(t) == d { return true }
+  }
+  false
+}
+
+// The box tag of the nested literal-union-leaf list arm of depth `d >= 1`, or -1 when no union
+// registered one that deep.
+export function atomLeafListArmTag(d: i32): i32 {
+  if d < 1 || d > vbAtomListTop { return -1 }
+  scalarTagOfKind(atomListCode() + d)
+}
+
+// Whether union `un` has the boolean-leaf list arm of depth `d`.
+export function unionHasBoolLeafArm(un: string, d: i32): boolean {
+  const arms: string[] = []
+  splitUnionAtoms(un, arms)
+  let i = 0
+  while i < arms.length {
+    if boolLeafListDepthOfName(arms[i]) == d { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The box tag of the boolean-leaf list arm of depth `d` (code 17, or `18 + d` when nested), or
+// -1 when no union registered one that deep, which no box or test may guess at.
+export function boolListArmTag(d: i32): i32 {
+  if d < 0 || d > vbBoolListTop { return -1 }
+  if d == 0 { return scalarTagOfKind(17) }
+  scalarTagOfKind(18 + d)
+}
+
+// The box tag a list of string-literal atoms takes where some union also holds another list
+// on the i32 storage, or -1 in a module with no such union, where it tags as `i32[]` does.
+export function atomListArmTag(): i32 {
+  if !vbAtomListUsed { return -1 }
+  scalarTagOfKind(atomListCode())
+}
+
+// Whether `ty` is a one-layer list of string-literal atoms, `K[]` or `(K | null)[]` (D4906).
+export function tyIsAtomLeafList(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyArray) { return false }
+  let e = t.aElem
+  if e < 0 || e >= T.tys.length { return false }
+  const et = T.tys[e]
+  if et is TyNullable { e = et.nInner }
+  tyIsLitUnion(e)
+}
+
+// The globally-stable tag of the ref-element-array arm whose interned reflist slot is `slot`,
+// claiming the band above the value-atom band. Three slot-keyed bands share that space and
+// interleave by residue mod 3 so none can collide however deep its table runs: ref-arrays
+// `+B + 3*slot`, maps `+B+4 + 3*slot`, closures `+B+2 + 3*(slot-1)`, where `B = uAtomBandTop()`.
+export function refArrSlotTag(slot: i32) {
+  uVariants.length + uAtomBandTop() + slot * 3
+}
+
+// The globally-stable tag of the map arm whose interned map value-slot is `slot` (mono
+// rides slot -1), taking residue 2 of the mod-3 interleave. The slot canonicalizes through
+// `mvCanonRepOf` first: layout-twin value spellings share one map-struct heap type, so they
+// must share one tag, or an `is` compare would miss its own twin-spelled value.
+export function mapSlotTag(slot: i32) {
+  // The integer-keyed mono maps are the other two map structs a slot does not name, so they
+  // tag at codes 15 (i32 key) and 16 (i64 key), which exist only once `mIntMonoArmUsed` lifts
+  // the band; `mapBoxTag` refuses to box one without it. A Set shares its key's map's tag.
+  let s = mapShapeFoldSet(slot)
+  if mIntMonoArmUsed {
+    if s == -4 { return scalarTagOfKind(15) }
+    if s == -6 { return scalarTagOfKind(16) }
+  }
+  if s >= 0 { s = mvCanonRepOf(s) }
+  uVariants.length + uAtomBandTop() + 4 + s * 3
+}
+
+// Registers the union arm `ty`, a map of folded shape `sh`, in the same-struct family table:
+// the first type of a struct keeps the shape's tag, each further distinct type claims a code
+// above the value-atom band. Only a type the band has not yet been sized for is refused.
+export function mapTwinNote(tyIn: i32, sh: i32) {
+  const ty = unMemPeelAliasWrapper(tyIn)
+  if ty < 0 || !mapTwinShapeHolds(sh, ty) { return 0 }
+  if sh >= 0 && !mTwinSettled { return mapTwinNoteSlot(ty, sh) }
+  let first = true
+  let i = 0
+  while i < mTwinTys.length {
+    if mapTwinOneStruct(mTwinShapes[i], sh) {
+      if mapTwinSame(mTwinTys[i], ty) { return 0 }
+      first = false
+    }
+    i = i + 1
+  }
+  if first {
+    mTwinCodes.push(-1)
+  } else {
+    if emitPhaseReached("arenaFinal") {
+      return emitFail(
+        "emitProgram: a map union arm was not collected before emission",
+      )
+    }
+    mTwinCodes.push(mTwinExtra)
+    mTwinExtra = mTwinExtra + 1
+  }
+  mTwinTys.push(ty)
+  mTwinShapes.push(sh)
+  0
+}
+
+// Records the value-slot arm `ty` of shape `sh`, once per type, with no code yet: which slots
+// emit one struct is settled when collection ends (`mapTwinSettle`).
+function mapTwinNoteSlot(ty: i32, sh: i32) {
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] == sh && mapTwinSame(mTwinTys[i], ty) { return 0 }
+    i = i + 1
+  }
+  mTwinTys.push(ty)
+  mTwinShapes.push(sh)
+  mTwinCodes.push(-1)
+  0
+}
+
+// The tag pairs a retag rows' types need, pushed onto `fromTags`/`toTags`: one per row whose
+// two maps share a struct and whose tags differ; a row of two structs is left as it is boxed.
+export function mapRetagTagPairs(
+  from: i32[],
+  to: i32[],
+  fromTags: i32[],
+  toTags: i32[],
+) {
+  let i = 0
+  while i < from.length {
+    const fs = mapShapeFoldSet(mapArmShapeOfTy(from[i]))
+    const ts = mapShapeFoldSet(mapArmShapeOfTy(to[i]))
+    if mapTwinOneStruct(fs, ts) {
+      const ft = mapArmTagOfTy(from[i], fs)
+      const tt = mapArmTagOfTy(to[i], ts)
+      if ft >= 0 && tt >= 0 && ft != tt {
+        fromTags.push(ft)
+        toTags.push(tt)
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether any delivery in the program retags a box (`mapRetagTagPairs` over every row).
+export function mapRetagAnyEmitted(): boolean {
+  if mTwinRetagMemo >= 0 { return mTwinRetagMemo == 1 }
+  mTwinRetagMemo = 0
+  const from: i32[] = []
+  const to: i32[] = []
+  mapRetagAllRows(from, to)
+  const ft: i32[] = []
+  const tt: i32[] = []
+  mapRetagTagPairs(from, to, ft, tt)
+  if ft.length > 0 { mTwinRetagMemo = 1 }
+  ft.length > 0
+}
+
+// Drops the value-slot rows: they name slots of the mv tables, which a collect pass is about to
+// clear and re-intern. Mono rows name no slot and keep their codes.
+export function mapTwinDropSlots() {
+  const tys: i32[] = []
+  const shapes: i32[] = []
+  const codes: i32[] = []
+  let i = 0
+  while i < mTwinTys.length {
+    if mTwinShapes[i] < 0 {
+      tys.push(mTwinTys[i])
+      shapes.push(mTwinShapes[i])
+      codes.push(mTwinCodes[i])
+    }
+    i = i + 1
+  }
+  mTwinTys = tys
+  mTwinShapes = shapes
+  mTwinCodes = codes
+  0
+}
+
+// Groups the value-slot rows by the struct each emits: the first type of a struct keeps its
+// slot's tag and every other claims a code of its own. Runs once, before any tag is read.
+export function mapTwinSettle() {
+  mTwinSettled = true
+  let i = 0
+  while i < mTwinTys.length {
+    const sh = mTwinShapes[i]
+    if sh >= 0 {
+      let first = true
+      let j = 0
+      while j < i {
+        if mTwinShapes[j] >= 0 && mapTwinOneStruct(mTwinShapes[j], sh) {
+          first = false
+        }
+        j = j + 1
+      }
+      if !first {
+        mTwinCodes[i] = mTwinExtra
+        mTwinExtra = mTwinExtra + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Registers each map a test pattern `ty` names (its union and nullable members flattened) in
+// the family table, as `mapTwinNote` does a union arm.
+export function mapTwinNotePattern(ty: i32) {
+  if ty < 0 { return 0 }
+  const flat: i32[] = []
+  flattenVariantsInto(ty, flat)
+  let i = 0
+  while i < flat.length {
+    const m = unMemPeelAliasWrapper(flat[i])
+    if unMemIsMap(m) { mapTwinNote(m, mapShapeFoldSet(mapArmShapeOfTy(m))) }
+    i = i + 1
+  }
+  0
+}
+
+// `mapTwinNotePattern` over `ty` when it is a union; any other type registers nothing.
+export function mapTwinNoteUnionTy(ty: i32) {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  if T.tys[ty] is TyUnion { return mapTwinNotePattern(ty) }
+  0
+}
+
+// Whether the map `ty` stores one i32 cell per key — a Set, or a value the checker reps so —
+// the maps that share a mono struct; any other value takes its own slot and struct.
+function mapArmIsI32Cell(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyMap { return t.mSet == 1 || mapValIsI32Cell(t.mVal) }
+  false
+}
+
+// Whether the map `ty` of folded shape `sh` can share its struct with another map type: any
+// map with a value slot, or a mono map whose value is one i32 cell.
+function mapTwinShapeHolds(sh: i32, ty: i32): boolean {
+  if sh >= 0 { return true }
+  mapShapeIsMono(sh) && mapArmIsI32Cell(ty)
+}
+
+// Whether two map arm types are the one member: the checker's type equality, alias peeled. A
+// union spells `Set<K>` as the boolean map, so the two are one atom and one member (D2673).
+export function mapTwinSame(a: i32, b: i32): boolean {
+  const x = unMemPeelAliasWrapper(a)
+  const y = unMemPeelAliasWrapper(b)
+  tyEq(x, y)
+    || mapSetSpelledAs(x, y)
+    || mapSetSpelledAs(y, x)
+    || mapSoftTwin(x, y)
+}
+
+// The box tag of the map arm type `ty` of folded shape `sh`: its family row's code, or the
+// shape's own tag when the shape has one type. -1 for a type no union arm registered in a
+// shape that has several, which no box or test may guess at.
+export function mapArmTagOfTy(ty: i32, sh: i32): i32 {
+  // A value that is not one i32 cell rides a slot of its own; with none interned, no union
+  // arm holds this map, and the mono shape it would fall to belongs to other maps.
+  if mapShapeIsMono(sh) && !mapArmIsI32Cell(unMemPeelAliasWrapper(ty)) {
+    return -1
+  }
+  if !mapShapeTwinned(sh) { return mapSlotTag(sh) }
+  let i = 0
+  while i < mTwinTys.length {
+    if mapTwinOneStruct(mTwinShapes[i], sh) && mapTwinSame(mTwinTys[i], ty) {
+      if mTwinCodes[i] < 0 { return mapSlotTag(sh) }
+      return scalarTagOfKind(mTwinCodeBase() + mTwinCodes[i])
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// `unionArmTys` for a caller that already holds a member set and must not have it resolved
+// as an alias name — the union registration paths, which are handed `unMemberSet[u]` or an
+// inline set directly. `unionArmsOf` would re-expand a registered alias name to its arms,
+// changing which arms get interned and tag-matched, so this deliberately skips that resolve.
+export function unionSetArmTys(
+  set: string,
+  atoms: string[],
+  tys: i32[],
+): boolean {
+  // Both arrays come from one slice of one recorded row (`recordUnMemTys`'s columns), so their
+  // lengths agree by construction on this fast path; a miss falls through to the split below.
+  const u = unionRowOf(set)
+  if u >= 0 && u < unMemTyStart.length {
+    const st = unMemTyStart[u]
+    const n = unMemTyCount[u]
+    if st >= 0 && st + n <= unMemAtoms.length && st + n <= unMemTys.length {
+      let allRes = true
+      let i = 0
+      while i < n {
+        if unMemTys[st + i] < 0 { allRes = false }
+        i = i + 1
+      }
+      if allRes {
+        let j = 0
+        while j < n {
+          atoms.push(unMemAtoms[st + j])
+          tys.push(unMemTys[st + j])
+          j = j + 1
+        }
+        return true
+      }
+    }
+  }
+  splitUnionAtoms(set, atoms)
+  unionMemberTysOf(set, tys) && tys.length == atoms.length
+}

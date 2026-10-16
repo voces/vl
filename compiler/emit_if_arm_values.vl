@@ -1,0 +1,563 @@
+// `emit_if_arm_values.vl` — the value each arm of an `if` join yields, and whether a
+// spread element widens.
+
+import {
+  Block,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  LetDecl,
+  NullLit,
+  P,
+  callIsNever,
+  elseIfLink,
+  nodeChildren,
+} from "./ast"
+import { recordJoinSeen } from "./check_core_state"
+import {
+  nodeTyIsNullable,
+  nodeTyIsNullableOneRep,
+  nodeTyIxOf,
+} from "./check_node_tys"
+import { valueAtomKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyMap,
+  TyNullable,
+  TyPrim,
+  TyUnion,
+  tyArrayElemPrimName,
+  tyBearsNull,
+  tyPrimNameOf,
+} from "./check_types"
+import { unwrapParen } from "./emit_base"
+import { initJoinsWiderRecord, recordBaseTy } from "./emit_join_records"
+import { ifArmValueExpr } from "./emit_query"
+import { emptyArrLitIxOf, joinRowOfTy } from "./emit_shape_rows"
+import {
+  MfKind,
+  liBack,
+  liKinds,
+  liSlots,
+  listIdxScratchBase,
+  scopeSlotOf,
+} from "./emit_state"
+import { rlSlotOfTy } from "./emit_struct_order"
+import { holeOperandTyOf, tyIsNulPrim } from "./emit_ty_canon"
+import {
+  SCRATCH_BY_BOTH,
+  SCRATCH_BY_CODE,
+  SCRATCH_BY_KEY,
+  SCRATCH_BY_KIND,
+  scratchSlot,
+  unionHasAtomKindArm,
+} from "./emit_union_casts"
+import { tyStepElem } from "./tyquery"
+
+// ── the element-converting copy's frame slots (D791) ─────────────────────────
+// Four locals: the source wrapper (once), the fresh destination backing, and two i32
+// temps — lazy, since a pre-pass can't know a delivery widens before the tables intern.
+// Sharing is safe: the source is fully emitted before the stash, no user code runs between.
+export function widenSrcWrapSlot(slot: i32) {
+  scratchSlot(8, "ref", slot, SCRATCH_BY_KEY)
+}
+
+export function widenDstBackSlot(slot: i32) {
+  scratchSlot(9, "ref", slot, SCRATCH_BY_KEY)
+}
+
+// D972 — the union-`==` operand stash, code 13. Its own code rather than
+// `sharedFieldRecvSlot`'s 7: that shared receiver can be live across this compare (the
+// operand of a `==` may itself be a shared-union-field read), and two writers of one slot
+// is how a stash gets clobbered — an operand assigning itself.
+export function unionEqStashSlot() {
+  scratchSlot(13, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// D1510 — the object-literal order stash, codes `100 + <field code>`. A struct/variant
+// literal written out of layout order evaluates each initialiser here in source order,
+// and `struct.new` reads the slots back in layout order; the code carries the field's own
+// type so it can never disagree with `pushFieldStorage`. Fresh per field, never shared.
+export function objOrderStashSlot(code: i32, storageSlot: i32) {
+  liKinds.push("i32") // unread — `liBack` alone carries the field code
+  liSlots.push(storageSlot)
+  liBack.push(100 + code)
+  listIdxScratchBase + liKinds.length
+}
+
+// D1060 — the literal-`is` receiver stash, code 17. A `v is <literal>` over a boxed union
+// reads its receiver twice (the tag, then the payload), so a non-re-readable receiver is
+// parked here at first read. Its own code, not `unionEqStashSlot`'s 13, because an `is`
+// can sit inside a union `==`'s operand and a second writer of one slot is how a stash clobbers.
+export function unionLitIsStashSlot() {
+  scratchSlot(17, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// D973 — the three scratch slots a struct-union `==` needs: the two operand boxes (codes 13
+// and 15, `(ref null $uBoxIdx)`) and, per arm, the pair of casted variant payloads (code 14,
+// keyed by variant index; the right operand is keyed `vi + 1024`, outside any variant table).
+export function unionEqStashSlot2() {
+  scratchSlot(15, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// D1721 — the nullable-niche box stash, code 19: an `anyref` slot parking a `V | null` value
+// so the null test and the payload read share ONE evaluation. `anyref` rather than the
+// niche's own heap, since the box payload is `anyref` and every niche rep is a subtype of it.
+export function nulNicheBoxSlot() { scratchSlot(19, "i32", 0, SCRATCH_BY_CODE) }
+
+// The `anyref` payload stash of a narrowed list read, code 28, parked between its wrapper test
+// and its cast (D4939). Its own code: a niche box may be staged in code 19 around the read.
+export function listPayloadStashSlot() {
+  scratchSlot(28, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// D974 — a struct-heap-typed stash pair, code 16, keyed by struct-table row (the right
+// operand `row + 1024`). A struct union's arm may carry a nested shape field, and that
+// shape is interned into the struct table even though the arms themselves are not, so the
+// nested compare can use `emitStructEqRec` given operands parked at the nested row's heap.
+export function structEqStashSlot(row: i32) {
+  scratchSlot(16, "ref", row, SCRATCH_BY_KEY)
+}
+
+export function unionEqArmSlot(vi: i32) {
+  scratchSlot(14, "ref", vi, SCRATCH_BY_KEY)
+}
+
+// The scalar analogue of `widenSrcWrapSlot`/`widenDstBackSlot`: codes 11 and 12, keyed by
+// the list's element kind rather than a ref-list row, since a scalar list's wrapper and
+// backing heap types come from the kind alone. Two copies over the same kind share one
+// slot for the same reason: the source is fully emitted before the stash (D965).
+export function widenScalarWrapSlot(kind: MfKind) {
+  scratchSlot(11, kind, 0, SCRATCH_BY_KIND)
+}
+
+export function widenScalarBackSlot(kind: MfKind) {
+  scratchSlot(12, kind, 0, SCRATCH_BY_KIND)
+}
+
+export function widenTmpSlot(which: i32) {
+  scratchSlot(10, "i32", which, SCRATCH_BY_KEY)
+}
+
+// The ref-list row of the element the checker typed list literal `arrIx` at, or -1.
+export function spreadLitElemRow(arrIx: i32): i32 {
+  const de = tyStepElem(nodeTyIxOf(arrIx))
+  if de < 0 { return -1 }
+  rlSlotOfTy(de)
+}
+
+// The value atom a scalar list `src`'s element boxes under in union `un`: its own when that is
+// a member, else the member it widens to losslessly (`i32` to `i64` or `f64`, `f32` to `f64`),
+// each element then converted before it is boxed (D2882). -1 when neither.
+export function spreadSrcBoxAtom(src: i32, un: string): i32 {
+  const pn = tyArrayElemPrimName(nodeTyIxOf(src))
+  if pn == "" { return -1 }
+  const k = valueAtomKind(pn)
+  if k < 0 || k > 5 { return -1 }
+  if unionHasAtomKindArm(un, k) { return k }
+  if k == 0 && unionHasAtomKindArm(un, 3) { return 3 }
+  if (k == 0 || k == 5) && unionHasAtomKindArm(un, 4) { return 4 }
+  -1
+}
+
+// Whether the checker typed spread literal `arrIx` a `string[]` or a `(string | null)[]`,
+// which share one rep.
+export function spreadLitElemIsString(arrIx: i32): boolean {
+  let de = tyStepElem(nodeTyIxOf(arrIx))
+  if de < 0 { return false }
+  const dt = T.tys[de]
+  if dt is TyNullable { de = dt.nInner }
+  if de < 0 { return false }
+  tyPrimNameOf(de) == "string"
+}
+
+// The scalar element kind the checker typed list literal `arrIx` at, or `null` for any other.
+export function spreadLitScalarElem(arrIx: i32): MfKind | null {
+  const t = nodeTyIxOf(arrIx)
+  if t < 0 { return null }
+  const at = T.tys[t]
+  if !(at is TyArray) { return null }
+  if at.aElem < 0 { return null }
+  const p = tyPrimNameOf(at.aElem)
+  // A record, list or union element is no primitive, and has no converting copy.
+  if p == null { return null }
+  match p {
+    "f64" => {
+      return "f64"
+    }
+    "i64" => {
+      return "i64"
+    }
+    "f32" => {
+      return "f32"
+    }
+    "i32" => {
+      return "i32"
+    }
+    "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" => {
+      return null
+    }
+  }
+}
+
+// Whether a spread source of element kind `sk` converts losslessly into a `de` element: the
+// three widenings scalar assignability admits (i32 to i64, i32 to f64, f32 to f64).
+export function spreadElemWidens(sk: MfKind | null, de: MfKind): boolean {
+  if sk == null { return false }
+  match sk {
+    "i32" => {
+      return de == "f64" || de == "i64"
+    }
+    "f32" => {
+      return de == "f64"
+    }
+    "f64" | "i64" | "u8" | "str" | "ref" => {
+      return false
+    }
+  }
+}
+
+// A spread literal's frame slots: one list WRAPPER per item group (code 20) and one
+// destination BACKING (code 21), keyed by a per-site sequence so a nested spread literal
+// cannot write a live outer slot. Kind maps to heap type as codes 11 and 12 do, and the
+// ref-list row is `key % 4096`.
+export function spreadGroupWrapSlot(kind: MfKind, row: i32, seq: i32) {
+  scratchSlot(20, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
+}
+
+export function spreadDstBackSlot(kind: MfKind, row: i32, seq: i32) {
+  scratchSlot(21, kind, row + 4096 * seq, SCRATCH_BY_BOTH)
+}
+
+// The arm block's tail value, seen through to the initializer when the tail names a local of
+// the arm's own prelude that no scope has bound yet: a classifier asked before the arm lowers
+// (a global's cell, say) would otherwise read the name as unbound (D2785).
+export function armTailValue(blockIx: i32): i32 {
+  const tv = ifArmValueExpr(blockIx)
+  if tv < 0 { return tv }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    let cur = tv
+    let before = b.blkStmts.length - 1
+    let going = true
+    while going {
+      going = false
+      const n = P.nodes[unwrapParen(cur)]
+      if n is Ident {
+        if scopeSlotOf(n.identName) < 0 {
+          let i = before - 1
+          while i >= 0 {
+            const d = P.nodes[b.blkStmts[i]]
+            if d is LetDecl {
+              if d.letName == n.identName {
+                if d.letInit >= 0 {
+                  cur = d.letInit
+                  before = i
+                  going = true
+                }
+                i = -1
+              }
+            }
+            i = i - 1
+          }
+        }
+      }
+    }
+    return cur
+  }
+  tv
+}
+
+// The tail value of the if-expression's first arm that is not a bare `null`, following an
+// `else if` chain, or -1. The arms share the checker's join type, so that arm's rep classifies
+// the whole if-expression; a `null` arm has no rep, and reading it made the join's rep depend on
+// arm order (D2227). When every arm is `null` the then arm's value is returned.
+export function ifThenValueIx(ifIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    const tv = armTailValue(s.ifThen)
+    // A `never` tail (an arm that always exits, D3222) has no rep; the else arm speaks.
+    const thenNever = tv >= 0 && callIsNever(tv)
+    if !exprIsNullLike(tv) && !thenNever { return tv }
+    const nv = ifNonNullArmValueIx(s.ifElse)
+    if nv >= 0 { return nv }
+    return tv
+  }
+  -1
+}
+
+// The first non-`null` arm value at or below the else slot `elseIx` (a block or an `else if`),
+// or -1 when there is none.
+function ifNonNullArmValueIx(elseIx: i32) {
+  let cur = elseIx
+  while cur >= 0 {
+    const n = P.nodes[cur]
+    if n is IfStmt {
+      const tv = armTailValue(n.ifThen)
+      if tv >= 0 && !exprIsNullLike(tv) { return tv }
+      cur = n.ifElse
+    } else {
+      // The final else: `ifArmValueExpr` reads a block's tail value and answers -1 for any other node.
+      const ev = armTailValue(cur)
+      if ev >= 0 && !exprIsNullLike(ev) { return ev }
+      return -1
+    }
+  }
+  -1
+}
+
+// The first non-`null` arm value of an if-expression (an `else if` chain followed) that has a
+// `null` arm — a bare `null` in any position, or a missing final else — at `exprIx`, parens
+// peeled; -1 for every other shape. Such an `if` is `T | null` in every position (DECISIONS), so
+// the value's niche is that arm's own rep made nullable, whichever arm holds the `null` (D2227).
+export function nulArmIfThenValueIx(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  let cur = unwrapParen(exprIx)
+  let val = -1
+  let first = -1
+  let sawNull = false
+  while cur >= 0 {
+    const e = P.nodes[cur]
+    if e is IfStmt {
+      const tv = ifArmValueExpr(e.ifThen)
+      if first < 0 { first = tv }
+      if exprIsNullLike(tv) { sawNull = true }
+      else if val < 0 { val = tv }
+      cur = -1
+      if e.ifElse < 0 {
+        sawNull = true
+      } else {
+        const eb = P.nodes[e.ifElse]
+        if eb is IfStmt {
+          cur = e.ifElse
+        } else if eb is Block {
+          const ev = ifArmValueExpr(e.ifElse)
+          if exprIsNullLike(ev) { sawNull = true }
+          else if val < 0 { val = ev }
+        } else {
+          return -1
+        }
+      }
+    } else {
+      return -1
+    }
+  }
+  if !sawNull { return -1 }
+  if val < 0 { return first }
+  val
+}
+
+// Whether `if` node `ix` is no other `if`'s `else` in function `fnIx`'s body; false when
+// `fnIx` is no function declaration, so an unknown frame keeps the chain's answer.
+export function ifIsChainHeadIn(ix: i32, fnIx: i32): boolean {
+  if fnIx < 0 || fnIx >= P.nodes.length { return false }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return false }
+  const work: i32[] = [fd.fnBody]
+  let wi = 0
+  while wi < work.length {
+    const cur = work[wi]
+    wi = wi + 1
+    if cur >= 0 {
+      if elseIfLink(cur) == ix { return false }
+      for k in nodeChildren(cur) { work.push(k) }
+    }
+  }
+  true
+}
+
+// Whether `ix` is a two-arm value `if` (no `else if`) recorded at `string | null`.
+export function ifJoinIsNulStringPair(ix: i32): boolean {
+  const e = P.nodes[ix]
+  if e is IfStmt {
+    if e.ifElse < 0 || P.nodes[e.ifElse] is IfStmt { return false }
+    return tyIsNulPrim(nodeTyIxOf(ix), "string")
+  }
+  false
+}
+
+// The value arm of an if-expression whose deciding arm is itself nullable, at `exprIx`, or
+// -1 — the shape `nulArmIfThenValueIx` can't answer, since both arms carry `T | null` here.
+// Gated on the checker's join being one rep (`nodeTyIsNullableOneRep`): two differently-
+// shaped nullable arms join to a union box, whose rep neither arm alone can name (D1560).
+export function nulIfArmNullableValueIx(exprIx: i32) {
+  if exprIx < 0 { return -1 }
+  const ix = unwrapParen(exprIx)
+  const e = P.nodes[ix]
+  if e is IfStmt {
+    if !nodeTyIsNullableOneRep(ix) { return -1 }
+    const tv = ifArmValueExpr(e.ifThen)
+    if tv >= 0 {
+      if exprIsNullLit(tv) {
+        // `if c { null } else { v }` — the then arm is the null half, so the else arm
+        // decides. The mirror of `nulArmIfThenValueIx`, which reads null in the else.
+        if e.ifElse >= 0 {
+          if P.nodes[e.ifElse] is Block { return ifArmValueExpr(e.ifElse) }
+        }
+        return -1
+      }
+      return tv
+    }
+  }
+  -1
+}
+
+// True if the `if` link at `ifIx` can yield `null`: its recorded join is nullable, it has no
+// else, or one of its own arms is a bare `null`. A chain's blocktype is nullable from the first
+// such link inward, so a link typed `null` alone still matches its enclosing frame (D2227).
+// In a hole instance the join's recorded type is the hole's variable, read at its pin (D3016).
+export function ifLinkYieldsNull(ifIx: i32, fnIx: i32) {
+  if nodeTyIsNullable(ifIx) { return true }
+  if tyBearsNull(holeOperandTyOf(ifIx, fnIx)) { return true }
+  const s = P.nodes[unwrapParen(ifIx)]
+  if s is IfStmt {
+    if s.ifElse < 0 { return true }
+    if exprIsNullLike(ifArmValueExpr(s.ifThen)) { return true }
+    if P.nodes[s.ifElse] is Block {
+      return exprIsNullLike(ifArmValueExpr(s.ifElse))
+    }
+  }
+  false
+}
+
+// True if any link along the `else if` chain at `ifIx` can yield `null` (`ifLinkYieldsNull`).
+export function ifChainYieldsNull(ifIx: i32, fnIx: i32): boolean {
+  let cur = ifIx
+  while cur >= 0 {
+    if ifLinkYieldsNull(cur, fnIx) { return true }
+    const s = P.nodes[unwrapParen(cur)]
+    cur = -1
+    if s is IfStmt {
+      if s.ifElse >= 0 && P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+    }
+  }
+  false
+}
+
+// True if the expression at `exprIx` is the bare `null` literal, grouping parens peeled.
+export function exprIsNullLit(exprIx: i32) {
+  if exprIx < 0 { return false }
+  P.nodes[unwrapParen(exprIx)] is NullLit
+}
+
+// True if the expression at `exprIx` is a bare `null`, or an if-expression whose every arm is
+// one (`ifChainAllBareNull`): an arm holding either has no rep for a join to read (D2227).
+export function exprIsNullLike(exprIx: i32) {
+  if exprIsNullLit(exprIx) { return true }
+  if exprIx < 0 { return false }
+  const ix = unwrapParen(exprIx)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  P.nodes[ix] is IfStmt && ifChainAllBareNull(ix)
+}
+
+// True if every arm of the if-expression at `ifIx` (an `else if` chain followed) is a block
+// holding only a bare `null`, or only another such if-expression: the join is the `null` type.
+export function ifChainAllBareNull(ifIx: i32) {
+  let cur = unwrapParen(ifIx)
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    if s is IfStmt {
+      if !armIsBareNull(s.ifThen) { return false }
+      cur = -1
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+        else if !armIsBareNull(s.ifElse) { return false }
+      }
+    } else {
+      return false
+    }
+  }
+  true
+}
+
+// True if `blockIx` is an arm block whose one statement is `exprIsNullLike`.
+function armIsBareNull(blockIx: i32) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    return b.blkStmts.length == 1 && exprIsNullLike(b.blkStmts[0])
+  }
+  false
+}
+
+// The if-expression arm whose own rep decides the join's — the then arm, except where that
+// arm is the bare `null` half of a `T | null` join, when it is the else arm. The kind and
+// its companion slot must be read off one arm, or `fbValtype` names a heap type the value
+// does not actually hold (D1560).
+export function ifRepArmValueIx(ifIx: i32) {
+  const tv = ifListArmValueIx(ifIx)
+  if tv >= 0 {
+    if !exprIsNullLit(tv) { return tv }
+  }
+  const nlv = nulIfArmNullableValueIx(ifIx)
+  if nlv >= 0 { return nlv }
+  tv
+}
+
+// The then arm's value, unless it is an empty `[]` beside a non-empty, non-`null` else arm:
+// an empty literal has no element to classify by, so its sibling decides the join (D2209). A
+// `null` sibling decides nothing; the nullable-join rungs read the `[]` arm instead.
+export function ifListArmValueIx(ifIx: i32) {
+  const tv = ifThenValueIx(ifIx)
+  if emptyArrLitIxOf(tv) < 0 { return tv }
+  const ev = ifElseValueIx(ifIx)
+  if ev < 0 || emptyArrLitIxOf(ev) >= 0 || exprIsNullLit(ev) { return tv }
+  ev
+}
+
+// The else arm's tail value of the if-expression at `ifIx`, or -1 when the else is absent or
+// is an `else if` chain rather than a block. The then arm's twin, needed wherever the join's
+// rep is a question about BOTH arms rather than about the one that decides it.
+export function ifElseValueIx(ifIx: i32) {
+  const s = P.nodes[ifIx]
+  if s is IfStmt {
+    if s.ifElse >= 0 {
+      if P.nodes[s.ifElse] is Block { return armTailValue(s.ifElse) }
+    }
+  }
+  -1
+}
+
+// True if the checker recorded the join at `ifIx` as a bare `i32`, `i64`, `f64`, `f32` or
+// `boolean`. The raw type, never a pin, so a generic body's hole-typed join is not claimed.
+export function ifJoinIsScalarPrim(ifIx: i32) {
+  const ty = nodeTyIxOf(ifIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyPrim {
+    const n = t.primName
+    return n == "i32"
+      || n == "i64"
+      || n == "f64"
+      || n == "f32"
+      || n == "boolean"
+  }
+  false
+}
+
+// Whether the `if` join at `ifIx` is checked as a union with a map member: its arms are
+// different map types, so no single map rep holds both.
+export function ifJoinIsMapUnion(ifIx: i32): boolean {
+  const ty = nodeTyIxOf(ifIx)
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      const m = t.uMembers[i]
+      if m >= 0 {
+        if T.tys[m] is TyMap { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The struct row a value `if` or `match` joining records into a wider one is built at, or -1.
+export function joinedRecordRowOf(ix: i32): i32 {
+  if !recordJoinSeen() { return -1 }
+  const ty = nodeTyIxOf(ix)
+  if !initJoinsWiderRecord(ix, ty) { return -1 }
+  joinRowOfTy(recordBaseTy(ty))
+}

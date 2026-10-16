@@ -1,0 +1,674 @@
+// `emit_mv_slots.vl` — which multi-value slot a value type or arm lowers to, and
+// the narrowing record a capture carries.
+
+import { FuncDecl, P, nodeChildren } from "./ast"
+import { narrowKeyRoot } from "./check_getter_effects"
+import { capWidenOf } from "./check_leaf_steps"
+import { MAP_KEY_I32, MAP_KEY_I64 } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litUnionAliasNameOfTy,
+  nulFoldWrapperTyIxOf,
+  tyIsLitUnion,
+  tySame,
+  tyToNominalName,
+} from "./check_types"
+import { anonLeafSupersedeOf, structIndexOfTy } from "./emit_atom_kinds"
+import {
+  mapValNameOf,
+  nameIsF32Array,
+  nameIsF64Array,
+  nameIsI32Array,
+  nameIsI64Array,
+  nameIsMap,
+  nameIsStringArray,
+  nameIsU8Array,
+} from "./emit_base"
+import { emitFail } from "./emit_bytes"
+import { fnStmtsPosOf } from "./emit_capture_frames"
+import { rlElemListRep } from "./emit_list_rep"
+import { narrowShadowSlot, variantIndexOf } from "./emit_narrow_slots"
+import {
+  MV_ARM_NOHINT,
+  mvSlotArmMatches,
+  mvSlotKeyKind,
+  mvSlotOfTyKArm,
+  repSlotOfTy,
+} from "./emit_rep"
+import {
+  MVK_REF,
+  RLK_MAP,
+  VKind,
+  anonLeafRetMoved,
+  cnFe,
+  cnName,
+  cnSet,
+  cnTy,
+  cnVariant,
+  fnRefPushSlots,
+  fnStmts,
+  ia64Used,
+  mI32Used,
+  mI64Used,
+  monoOrigNode,
+  mvRlSlot,
+  mvValKind,
+  mvValName,
+  mvValVariantIdx,
+  narrowNames,
+  narrowRetired,
+  narrowSets,
+  narrowTop,
+  narrowTys,
+  narrowVariants,
+  refPushBaseBySlot,
+  refPushScratchBase,
+  rlElemKindTbl,
+  sTyIx,
+  scopeFrames,
+  scopeNames,
+  scopeStackPop,
+  scopeStackPush,
+  uVarSTwin,
+  uVarTyIx,
+  uVariants,
+} from "./emit_state"
+import { strListHas } from "./listutil"
+
+// Bank the narrowing active at the declaration site of the nested function at arena index
+// `fnIx`, for each key whose root the body reads: a free name in `ifree` or a module global in
+// `iglob`. Under nested guards the innermost is appended last, and a replay pushes records in
+// order, so the innermost wins, the same rule `narrowSlotOf` applies to the live stack.
+export function capNarrowRecord(
+  fnIx: i32,
+  ifree: string[],
+  iglob: {[string]: i32},
+) {
+  const fe = fnStmtsPosOf(fnIx)
+  if fe < 0 { return 0 }
+  const widened = capWidenOf(fnIx)
+  let i = 0
+  while i < narrowTop {
+    const nm = narrowNames[i]
+    const root = narrowKeyRoot(nm)
+    // A retired entry is not a declaration-site fact: the closure below the write reads its
+    // capture at the declared rep, the same as the live stack answers for it. Nor is one the
+    // checker widened in this body, since a writer may run before it does (D2402).
+    if (
+      (strListHas(ifree, root) || (iglob[root] ?? 0) == 1)
+      && narrowRetired[i] == 0
+      && !capWidened(widened, nm)
+      && narrowShadowSlot(root) < i
+    ) {
+      cnFe.push(fe)
+      cnName.push(nm)
+      cnVariant.push(narrowVariants[i])
+      cnTy.push(narrowTys[i])
+      cnSet.push(narrowSets[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The module-scope `for` variables whose body the recording walk is inside, innermost last:
+// a start-function local has no slot until the start function emits, which is after every
+// closure written in the loop, so a guard over one resolves its box from here (D3136).
+export const cnModLoopName: string[] = []
+export const cnModLoopIter: i32[] = []
+
+// The iterable of the innermost recorded module loop binding `name` to a box, or -1.
+export function cnModLoopIterOf(name: string): i32 {
+  let i = cnModLoopName.length - 1
+  while i >= 0 {
+    if cnModLoopName[i] == name { return cnModLoopIter[i] }
+    i = i - 1
+  }
+  -1
+}
+
+// Whether narrowing key `key` is one of the `,`-joined `widened` keys: a path whose captured
+// narrowing the checker dropped, or a name, also through its capture cell `v[0]` / `v$cb[0]`.
+function capWidened(widened: string, key: string): boolean {
+  if widened == "" { return false }
+  if widened.indexOf("," + key + ",") >= 0 { return true }
+  let k = key
+  if k.length > 3 && k.slice(k.length - 3, k.length) == "[0]" {
+    k = k.slice(0, k.length - 3)
+  }
+  if k.length > 3 && k.slice(k.length - 3, k.length) == "$cb" {
+    k = k.slice(0, k.length - 3)
+  }
+  widened.indexOf("," + k + ",") >= 0
+}
+
+// Whether the subtree at `ix` holds a `FuncDecl` — the one node a recording `capScan` banks a
+// narrowing at, so a frame whose body holds none records nothing. A worklist, not recursion: a
+// long `else if` chain is that many levels deep and must cost no stack (D1990).
+export function subtreeHasFuncDecl(ix: i32): boolean {
+  const stack: i32[] = [ix]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur >= 0 && cur < P.nodes.length {
+      if P.nodes[cur] is FuncDecl { return true }
+      for k in nodeChildren(cur) { stack.push(k) }
+    }
+  }
+  false
+}
+
+// The source node of top-level frame `fe`: the pre-pass original of a slot an instance
+// overwrote, an appended instance's origin's, or the slot's own.
+export function cnFrameOrigin(fe: i32, instOrig: {[i32]: i32}): i32 {
+  if fe < monoOrigNode.length { return monoOrigNode[fe] }
+  const of = instOrig[fe] ?? -1
+  if of >= 0 && of < monoOrigNode.length { return monoOrigNode[of] }
+  fnStmts[fe]
+}
+
+// Enter a new lexical block: remember the current binding count as this frame's
+// boundary. Returns 0.
+export function scopePush() {
+  scopeFrames.push(scopeNames.length)
+  0
+}
+
+// Leave the innermost lexical block: drop its frame boundary and discard every
+// binding appended within it (truncate `scopeNames`/`scopeSlots` back to the mark).
+// Returns 0.
+export function scopePop() {
+  if scopeFrames.length == 0 { return 0 }
+  const mark = scopeFrames[scopeFrames.length - 1]
+  scopeFrames.pop()
+  while scopeNames.length > mark { scopeStackPop() }
+  0
+}
+
+// Bind name `name` to declared-local position `slot` in the innermost frame. Called as each
+// `let` is reached, so a binding is in scope only after its declaration, which also yields
+// correct shadowing of an outer same-named binding. Returns 0.
+export function scopeBind(name: string, slot: i32) {
+  scopeStackPush(name, slot)
+}
+
+// Drop the most recent binding — the loop-variable unbind. A `for` binds its variable in the
+// enclosing frame, but the variable's scope is the loop, so both passes unbind it as the loop
+// closes. Without it the loop var keeps shadowing a same-named binding that resolves through
+// a later channel, and `for i in …` followed by `let i = 0` reads the dead loop counter.
+export function scopeUnbind() { scopeStackPop() }
+
+// The wasm local base of the ref-push scratch frame for ref-list table slot `slot`.
+export function refPushScratchBaseFor(slot: i32) {
+  let i = 0
+  while i < fnRefPushSlots.length {
+    if fnRefPushSlots[i] == slot { return refPushBaseBySlot[i] }
+    i = i + 1
+  }
+  // No slot, no frame, and a fall-through here can never be right: with `fnRefPushSlots` empty
+  // `refPushScratchBase` is the cursor past every reserved frame, and with it non-empty it
+  // names a quad typed for a different element. It is reached when the frame pre-pass, which
+  // runs with no `is`-narrow active, classified this receiver differently from the emit.
+  emitFail(
+    "emitProgram: a ref-element list op needs its receiver's element type known before "
+      + "the body is lowered; a union arm narrowed to a ref-element list is not yet reached "
+      + "by that pass",
+  )
+  refPushScratchBase
+}
+
+// D871 — did a `??` family take the returned literals of the function declared at node
+// `fnDeclIx`? The gate on every return-row redirect. See `anonLeafRetMoved`.
+export function anonLeafRetMovedOf(fnDeclIx: i32): boolean {
+  if fnDeclIx < 0 { return false }
+  if fnDeclIx >= anonLeafRetMoved.length { return false }
+  anonLeafRetMoved[fnDeclIx] == 1
+}
+
+// D911 — the return-row redirect as one call: the mark and the supersede together, so a site
+// following a `??` merge cannot pick up one half and miss the other. `fnDeclIx` is the arena
+// node of the owning `FuncDecl`. The sites that spell the pair out longhand each carry a
+// different extra gate; this is for the readers that need only the pair.
+export function anonLeafRetRowOf(fnDeclIx: i32, si: i32): i32 {
+  if !anonLeafRetMovedOf(fnDeclIx) { return si }
+  anonLeafSupersedeOf(si)
+}
+
+// The one home of the scalar-element list classification: the list rep a list type-name rides
+// when its element is a scalar (the i32 list and its niches, the string, f64, i64, f32 and
+// packed u8 lists), or null. The u8 test is first because it is the narrowest spelling.
+// `tyAnnRefListKind` and `nulScalarListKind` are not folded in: they split what this folds.
+export function scalarListRepOfName(t: string): VKind | null {
+  if nameIsU8Array(t) { return "u8list" }
+  if nameIsI32Array(t) { return "list" }
+  if nameIsStringArray(t) { return "strlist" }
+  if nameIsF64Array(t) { return "f64list" }
+  if nameIsI64Array(t) { return "i64list" }
+  if nameIsF32Array(t) { return "f32list" }
+  null
+}
+
+// 1 when this map value type unambiguously lowers, 0 for "ask the spelling". A strict subset
+// of `mvValKindOfName`'s lowering set, read off the type rather than off a render. A shape
+// this cannot decide must answer 0: claiming one the name ladder would reject turns a loud
+// refusal into a silent lowering.
+export function mvValLowersTy(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant must say whether a map value of
+  // that shape lowers, rather than take the `0` below and refuse a value that does.
+  match t {
+    TyPrim => {
+      const p = t.primName
+      if p == "i32" { return 1 }
+      if p == "boolean" { return 1 }
+      if p == "string" { return 1 }
+      if p == "f64" { return 1 }
+      if p == "i64" { return 1 }
+      if p == "f32" { return 1 }
+      if p == "null" { return 1 }
+      return 0
+    }
+    TyMap => {
+      return 1
+    }
+    TyFunc => {
+      return 1
+    }
+    TyArray => {
+      // A list value reaches `mvValKindOfName`'s two array arms and both answer kind 6, so every
+      // array shape the classifier recognises lowers. The `-3` guard tests the top level, which an
+      // array spelling never trips: `(T | null)[]` is an array with a nullable element.
+      return 1
+    }
+    TyObj => {
+      // A struct-valued map is kind 1, the name ladder's last arm, which asks
+      // `structIndexByValName` — a name lookup into the struct table. `isStructOfTy` is that same
+      // registry question asked of the type.
+      if isStructOfTy(ty) { return 1 }
+      // The nominal half, paired with the name ladder's (D47): `isStructOfTy` answers no for a
+      // union arm, since `collectS` skips a `type X = {…}` that is a union member, so the arm has
+      // a `uVariants` row and no `sNames` one. This gate and the interner must not drift —
+      // teaching only the interner leaves an arm-valued map's return at the mono i32 valtype.
+      if variantRowOfTy(ty) >= 0 { return 1 }
+    }
+    TyNullable => {
+      // A nullable value with a single ref inner is a lowering branch, not a rejecting one: only a
+      // closure inner whose result is a literal union rejects, and that shape is excluded rather
+      // than reproduced.
+      const inr = t.nInner
+      if inr >= 0 {
+        const it2 = T.tys[inr]
+        // Exhaustive over `Ty` and `_`-less: the inner decides the whole answer.
+        match it2 {
+          TyObj => {
+            return 1
+          }
+          TyMap => {
+            return 1
+          }
+          TyArray => {
+            return 1
+          }
+          TyPrim => {
+            // Any prim inner, not just `string`: a non-ref inner leaves `nulRefMapValInnerOf` empty
+            // and falls to the atom counting, where a prim is a value atom, and the only remaining
+            // `-3` there needs `!isValueUnionName`, which `prim | null` is not.
+            return 1
+          }
+          TyFunc => {
+            // A closure inner lowers as the nullable fat-pointer unless its result is a literal
+            // union, the branch's one reject. Reproduced faithfully rather than approximated:
+            // `tyIsLitUnion` of the return type is the same question the name ladder asks of the
+            // rendered return spelling.
+            if !tyIsLitUnion(it2.fnRet) { return 1 }
+          }
+          TyUnion => {
+            // A nullable literal-union alias is an i32 niche (atom ids, `-1` for null): the mono map.
+            if litUnionAliasNameOfTy(inr) != "" { return 1 }
+            // A nullable union value lands in the atom counting, whose second `-3` needs
+            // `!isValueUnionName`. That predicate is copied rather than re-derived: every atom must
+            // have a `valueAtomKind` — the prims, `null`, and the list atoms — with at least two
+            // non-null; a paraphrase treating arrays as refs, which `valueAtomKind` does not, is inert.
+            const ims = it2.uMembers
+            let allAtoms = true
+            let nonNull = 0
+            let m2 = 0
+            while m2 < ims.length {
+              const mt2 = T.tys[ims[m2]]
+              let isAtom = false
+              let isNull = false
+              // Stays an `if` chain: `tyIsLitUnion` is a PREDICATE rung between two kind rungs,
+              // so this is not one dispatch and a `match` cannot spell it.
+              if mt2 is TyPrim {
+                isAtom = true
+                if mt2.primName == "null" { isNull = true }
+              }
+              if mt2 is TyArray { isAtom = true }
+              if tyIsLitUnion(ims[m2]) { isAtom = true }
+              if !isAtom { allAtoms = false }
+              if !isNull { nonNull = nonNull + 1 }
+              m2 = m2 + 1
+            }
+            if allAtoms {
+              if nonNull >= 2 { return 1 }
+            }
+          }
+          TyErr | TyNullable | TyVar | TyLit | TyNeg => {
+            // No nullable map-value lowering is claimed for this inner.
+          }
+        }
+      }
+    }
+    TyUnion => {
+      // A union with no null member never reaches the `-3` guard at all, which is entered only
+      // under `unionSetHasNull`, so this arm claims it.
+      const ms = t.uMembers
+      if ms.length > 1 {
+        let anyNull = false
+        let k = 0
+        while k < ms.length {
+          const mt = T.tys[ms[k]]
+          // Exhaustive over `Ty` and `_`-less: the two spellings of a null member.
+          match mt {
+            TyNullable => {
+              anyNull = true
+            }
+            TyPrim => {
+              if mt.primName == "null" { anyNull = true }
+            }
+            TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+              // Not a null member.
+            }
+          }
+          k = k + 1
+        }
+        if !anyNull { return 1 }
+      }
+    }
+    TyErr | TyVar | TyLit | TyNeg => {
+      // No map-value lowering is claimed for this shape.
+    }
+  }
+  0
+}
+
+// The mv table's name scan — first match wins over the recorded canonical value spellings,
+// within one key rep. The `keyK` argument is the slot identity's other half: `{[string]: S}`
+// and `{[i32]: S}` record the same value spelling and are two layouts, so a key-blind scan
+// would hand the second map the first one's struct.
+export function mvSlotByValNameK(valName: string, keyK: i32): i32 {
+  mvSlotByValNameKArm(valName, keyK, MV_ARM_NOHINT)
+}
+
+// The name rung's half of the arm component (D48). Both rungs of an mv slot's identity have
+// to carry it or neither does: a spelling is a render here, so an arm and its layout twin
+// record the same `mvValName`. Tri-state as `mvSlotOfTyKArm` documents — `MV_ARM_NOHINT`
+// matches any parity and is what every un-hinted entry point passes.
+export function mvSlotByValNameKArm(
+  valName: string,
+  keyK: i32,
+  armHint: i32,
+): i32 {
+  let i = 0
+  while i < mvValName.length {
+    if mvValName[i] == valName {
+      if mvSlotKeyKind(i) == keyK {
+        if mvSlotArmMatches(i, armHint) { return i }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+// The mono map shape of a key rep — `-1`, `-4` or `-6`, named once. A value riding the shared
+// i32 `vals` list interns no slot on any key, so every resolver landing on "mono" still has to
+// say which of the three structs it means.
+export function mapMonoShapeOfKey(keyK: i32) {
+  if keyK == MAP_KEY_I32 { return -4 }
+  if keyK == MAP_KEY_I64 { return -6 }
+  -1
+}
+
+// Record that a map of key kind `keyK` exists, so its map struct, keys list and probe are
+// minted: the flag each integer key's struct is gated on. A string key needs nothing beyond `mUsed`.
+export function markMapKeyUsed(keyK: i32) {
+  if keyK == MAP_KEY_I32 { mI32Used = true }
+  if keyK == MAP_KEY_I64 { markMapI64Used() }
+  0
+}
+
+// The i64 key's flag, plus the i64 array and list pair its keys list is built from.
+export function markMapI64Used() {
+  mI64Used = true
+  ia64Used = true
+  0
+}
+
+// The variant-table row a map-value slot's value is a declared arm of, or -1. Every consumer
+// pairs it with the struct half and the two cannot both answer. Read through the slot's layout
+// identity (D123) via `mvCanonRepOf`; `mvValVariantRawOf` is the exception by construction,
+// since `mvCanonRepOf` asks this column and reading the canonical row would recurse.
+export function mvValVariantRawOf(slot: i32): i32 {
+  if slot < 0 { return -1 }
+  if slot >= mvValVariantIdx.length { return -1 }
+  mvValVariantIdx[slot]
+}
+// The bounds-guarded read of the cross-table twin column (every parallel-table
+// accessor in this file carries one): an uncovered variant reads -1, which is "no
+// cross-table merge" and is what every site meant before the column existed.
+export function uVarSTwinAt(vi: i32): i32 {
+  if vi < 0 { return -1 }
+  if vi >= uVarSTwin.length { return -1 }
+  uVarSTwin[vi]
+}
+
+// Is the union arm named `armName` contested — is there a declared struct row of its exact
+// layout (D171)? `repSlotOfTy`'s structural-to-nominal bridge is the same unique-declared-twin
+// question asked of the arm's own declaration index rather than of a render, which would
+// re-resolve to a fresh anonymous row. False for a name that is not a registered arm.
+export function armLayoutContested(armName: string): boolean {
+  armLayoutContestedAt(variantIndexOf(armName))
+}
+
+// The index-taking primitive, for a caller that already holds the variant index and would
+// otherwise render it to a name only to look the name back up. -1, not an arm at all, is not
+// contested, which is what lets any caller ask this unconditionally.
+export function armLayoutContestedAt(vi: i32): boolean {
+  if vi < 0 { return false }
+  if vi >= uVarTyIx.length { return false }
+  repSlotOfTy(uVarTyIx[vi]) >= 0
+}
+
+// The tri-state arm hint a caller's recorded value type produces (D48): `MV_ARM_NOHINT` when
+// there is no type to ask, else the type's arm signature — the arm's declaration row, or -1
+// for a resolved type that reaches no arm. Only the second may refuse an arm's slot. Nominal
+// at every rung, and `mvArmSigOfTy` rather than `variantRowOfTy` so a map hop is followed.
+export function mvArmHintOfTy(ty: i32): i32 {
+  if ty < 0 { return MV_ARM_NOHINT }
+  mvArmSigOfTy(ty)
+}
+
+// `mvArmHintOfTy` with the spelling fallback the mint's `mvValArmSig` push takes, so a find for
+// canonical value name `valName` asks what that mint recorded. An inline arm annotation's type
+// reaches no arm row; a type-only hint then declines the slot and a later call mints a twin (D4638).
+export function mvArmHintOfTyName(ty: i32, valName: string): i32 {
+  const h = mvArmHintOfTy(ty)
+  if h != -1 { return h }
+  mvArmSigOfName(valName, 8)
+}
+
+// The typed-find entry point, since every caller of the mv slot find holds the value's type
+// (D93). An un-hinted find matches a slot of any arm parity and lands on the first slot of
+// that structural key; the hint is a pure function of the argument the caller already had. A
+// find, therefore safe: a hint can only make one decline, never succeed where it failed.
+export function mvSlotOfValTyK(valTy: i32, keyK: i32): i32 {
+  const direct = mvSlotOfTyKArm(valTy, keyK, mvArmHintOfTy(valTy))
+  if direct >= 0 { return direct }
+  // Through the null fold's wrapper on a miss (D1037): `type J = null | f64 | JO` fills its
+  // placeholder with the fold as its single member, so `cUserTypes["J"]` is the wrapper while
+  // a map value's `mVal` is the member inside it. Both are the type `J` and the slot is the
+  // same slot; on a miss only, so no lookup that answers today can move.
+  const wrap = nulFoldWrapperTyIxOf(valTy)
+  if wrap >= 0 { return mvSlotOfTyKArm(wrap, keyK, mvArmHintOfTy(wrap)) }
+  -1
+}
+
+// The arm signature of a map-value type: the variant row the value is, or — one container
+// further out — the row its transitive map value is, or -1 for a resolved type reaching no
+// arm (D93). `variantRowOfTy` alone cannot answer the second, so `{[string]: Circle}` and
+// `{[string]: Dot}` would share one slot. Nominal at every depth, so an anonymous value stays -1.
+export function mvArmSigOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const v = variantRowOfTy(ty)
+  if v >= 0 { return v }
+  mvDeepArmOfTy(ty, 8)
+}
+
+// The name-side twin of `mvArmSigOfTy`, for the mint's fallback: the arm a rendered map value
+// spelling reaches through its own value. `mapValNameOf` peels one `{[K]: V}` hop and
+// `variantIndexOf` is the same nominal table lookup reached by index.
+export function mvArmSigOfName(nm: string, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const direct = variantIndexOf(nm)
+  if direct >= 0 { return direct }
+  if !nameIsMap(nm) { return -1 }
+  mvArmSigOfName(mapValNameOf(nm), depth - 1)
+}
+
+// The declared union arm a map value's arena type names, or "" when the value is not one —
+// the mv layer's reading of the nominal question the ref-list element asks too. It must be
+// asked of the type: every name this layer holds is a render, so an arm arrives spelled
+// `{r:i32}` and `structIndexByValName` would accept it as the inline-shape row.
+export function mvValArmName(ty: i32): string {
+  const vr = variantRowOfTy(ty)
+  if vr < 0 { return "" }
+  if vr >= uVariants.length { return "" }
+  uVariants[vr]
+}
+
+// The mv table's key for a value the caller's type says is a declared union arm: the arm's own
+// name, whatever the caller spelled (D47). Two spellings of one map reach this layer as two
+// names — an inline annotation hands over `Circle`, a hoisted alias `{r:i32}` — and the arm's
+// name is the key computable from either. It cannot move a non-arm slot.
+export function mvArmKeyName(valNameIn: string, armTy: i32): string {
+  const an = mvValArmName(armTy)
+  if an != "" { return an }
+  const dn = mvDeepArmKeyName(armTy)
+  if dn != "" { return dn }
+  const dd = mvDeepDeclKeyName(armTy)
+  if dd != "" { return dd }
+  valNameIn
+}
+
+// The variant row a map value type reaches through its own value, or -1 — the arm the render
+// drops at a depth `mvValArmName` cannot see, because that one asks whether the value is an
+// arm and this one whether it contains one. Depth-bounded: a recursive alias is a cycle in
+// the arena, and the bound declines, which leaves the render the layer has always used.
+function mvDeepArmOfTy(ty: i32, depth: i32): i32 {
+  if ty < 0 { return -1 }
+  if depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyMap {
+    const v = variantRowOfTy(t.mVal)
+    if v >= 0 { return v }
+    return mvDeepArmOfTy(t.mVal, depth - 1)
+  }
+  -1
+}
+
+// The mv table's key for a map-valued map whose transitive value is a declared arm (D93) —
+// `mvArmKeyName`'s rewrite one container out, which D47's cannot reach because the outer value
+// is a `TyMap`. A key and not a refusal: a refusal would have to decide whether a
+// differently-armed value will later claim the slot, a property of the pair a mint cannot see.
+function mvDeepArmKeyName(armTy: i32): string {
+  if mvDeepArmOfTy(armTy, 8) < 0 { return "" }
+  tyToNominalName(armTy)
+}
+
+// The other side of the same pair (D93): the rung above rewrites the arm side's key, this one
+// the side that is a declared struct. Both are needed — rewriting only the arm side leaves the
+// other's key a render, and that render re-resolves through `resolveAnnot` to the index the
+// arm's declaration owns. Gated on declaredness, so an anonymous value keeps its render.
+function mvDeepDeclKeyName(armTy: i32): string {
+  if mvDeepDeclOfTy(armTy, 8) == 0 { return "" }
+  tyToNominalName(armTy)
+}
+
+// True when a map type's transitive value is a declared type — an arm or a struct row.
+// Depth-bounded: a recursive alias is a cycle in the arena, and an unbounded descent would
+// trap the compiler rather than answer.
+function mvDeepDeclOfTy(ty: i32, depth: i32): i32 {
+  if ty < 0 { return 0 }
+  if depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyMap {
+    if variantRowOfTy(t.mVal) >= 0 { return 1 }
+    if structIndexOfTy(t.mVal) >= 0 { return 1 }
+    return mvDeepDeclOfTy(t.mVal, depth - 1)
+  }
+  0
+}
+
+// A ref-value map slot's values are either inner map structs (ref-list element kind 3) or
+// i32-list wrappers (element kind 4). This splits the two so a read classifies as the right
+// thing: `m[k]` over a nested map is a Map, over a list-valued map an i32 list.
+export function mvValIsMap(slot: i32) {
+  if slot < 0 { return false }
+  if mvValKind[slot] != MVK_REF { return false }
+  rlElemKindTbl[mvRlSlot[slot]] == RLK_MAP
+}
+
+// The list rep of a list-valued map slot's value, or null when the value is not a list: the
+// value list's ref-list element code, decoded.
+export function mvListValKind(slot: i32): VKind | null {
+  if slot < 0 { return null }
+  if mvValKind[slot] != MVK_REF { return null }
+  rlElemListRep(rlElemKindTbl[mvRlSlot[slot]])
+}
+
+// "Is this type a registered struct", asked of the arena — the struct companion to
+// `isUnionOfTy`. Structural here, unlike unions: the intern layer dedupes an inline shape
+// onto a declared struct, so `tySame` is the right comparison for every row.
+export function isStructOfTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  let s = 0
+  while s < sTyIx.length {
+    if sTyIx[s] == ty { return true }
+    s = s + 1
+  }
+  let q = 0
+  while q < sTyIx.length {
+    if tySame(sTyIx[q], ty) { return true }
+    q = q + 1
+  }
+  false
+}
+
+// The variant registry asked of the arena — the row index whose arm type is `ty`, or -1.
+// Variants are nominal: two variants with the same field set are different variants, so
+// there is no structural fallback here. A query-side hazard: `nodeTyIxOf(paramTypeNode(...))`
+// for a union-annotated param hands back the first arm, not the union.
+export function variantRowOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let i = 0
+  while i < uVarTyIx.length {
+    if uVarTyIx[i] == ty { return i }
+    i = i + 1
+  }
+  // No structural rung: two variants with the same field set are different variants, and a
+  // `tySame` fallback here would match the first of them for both. Variants are nominal,
+  // like unions and unlike structs, since their whole purpose is to be told apart. The index
+  // rung is the whole function: `declTyIxOfName` resolves each arm's declaration.
+  -1
+}

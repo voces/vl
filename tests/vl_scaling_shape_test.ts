@@ -670,7 +670,7 @@ const axis = (name: string, bar: number, note: string, mk: (d: string) => [strin
 axis(
   "functions",
   2.5,
-  "Memoise it on an arena prefix the way `moduleHasUnionAs` does (compiler/emit_classify.vl), clearing the memo in `emitProgram`.",
+  "Memoise it on an arena prefix the way `moduleHasUnionAs` does (compiler/emit_union_casts.vl), clearing the memo in `emitProgram`.",
   (d) => twoFiles(d, genFunctions(1600, 20), genFunctions(80, 400)),
 );
 
@@ -726,7 +726,7 @@ hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking th
 axis(
   "signature width x calls",
   4.3,
-  "`sigKeyOfTy` or `structIndexOfTypeName` (compiler/emit_classify.vl) is re-deriving per call instead of reading its `tyRegGenNow` memo.",
+  "`sigKeyOfTy` or `structIndexOfTypeName` (compiler/emit_sig_tokens.vl, compiler/emit_shape_rows.vl) is re-deriving per call instead of reading its `tyRegGenNow` memo.",
   (d) => twoFiles(d, genSigWidthCalls(2000, 64, true), genSigWidthCalls(2000, 64, false)),
 );
 
@@ -869,7 +869,7 @@ axis("modules", 2.5, "The module merge is scaling with the file count.", (d) => 
   writeModules(`${d}/one`, 200, 4, 30),
 ]);
 
-// Fuel reads 1.27, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_classify.vl)
+// Fuel reads 1.27, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_capture_frames.vl)
 // is the scan that once made this axis super-linear: `fnStmts` walked once per closure.
 axis("closures", 2.5, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
   twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
