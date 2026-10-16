@@ -349,82 +349,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
     if tpEnvNames.length > 0 { tpIfMarkOk(n.letInit) }
     initTy = checkNodeHook(n.letInit)
   }
-  // A `void` initializer has no value to bind — reject with a source-located message,
-  // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
-  // A minted scrutinee binding (D1991) keeps the `void`, so the `match` reports it in its own words.
-  if n.letInit >= 0 && isVoidTy(initTy) && !symNameIsMinted(n.letName) {
-    if !voidSlotExemptExpr(n.letInit) {
-      tErr(
-        "cannot bind the void result of '"
-          + n.letName
-          + "' — a void function returns no value",
-        ix,
-      )
-      initTy = TY_ERR
-    }
-  }
-  // An initializer whose type includes `void` has no value to store: refused at the if or match arm
-  // that yields none, else at the initializer (D4071).
-  if (
-    n.letInit >= 0
-    && annot < 0
-    && initTy >= 0
-    && !isVoidTy(initTy)
-    && tyMentionsVoid(initTy, 8)
-    && !symNameIsMinted(n.letName)
-  ) {
-    const arm = ifNoValueArmAt(n.letInit)
-    if arm != n.letInit {
-      const kw = valueBranchKeyword(n.letInit)
-      tErr(
-        "this arm yields no value, but the `"
-          + kw
-          + "` is the value of `"
-          + n.letName
-          + "`: end the arm with a value, or make the `"
-          + kw
-          + "` a statement",
-        arm,
-      )
-    } else {
-      tErr(
-        "`"
-          + n.letName
-          + "` would take the type "
-          + tyToStr(initTy)
-          + ", and a value that may be `void` cannot be stored: test it before binding "
-          + "it, or bind it only where it holds a value",
-        n.letInit,
-      )
-    }
-    initTy = TY_ERR
-  }
-  // A `never` initializer leaves nothing to bind, and an un-annotated binding would take a type
-  // no value has; a declared type gives the dead binding a real one (D1972).
-  if n.letInit >= 0 && annot < 0 && initTy == TY_NEVER && initTy >= 0 {
-    tErr(
-      "`"
-        + n.letName
-        + "` would hold a `never` value, and none exists: its initializer never returns — call it as a statement, or declare the binding's type",
-      ix,
-    )
-    initTy = TY_ERR
-  }
-  // Redundant explicit annotation: skipped when checking the initializer consumed a contextual
-  // seed the annotation supplied (an un-annotated lambda param) — comparing then would be circular (D1442).
-  if (
-    annot >= 0
-    && initTy >= 0
-    && n.letInit >= 0
-    && cbSeedUsed == seedMark
-    && !lbiIsSynth(n.letType, ix)
-  ) {
-    if exprIsNumLit(n.letInit) && lbiNumTy(annot) {
-      lbiDeferRedundant(ix, initTy)
-    } else if !lbiReadsPinned(n.letInit) {
-      recordRedundantAnnot(n, ix, initTy, annot)
-    }
-  }
+  initTy = letDeclInitVerdicts(n, ix, annot, initTy, seedMark)
   let bound = TY_ERR
   if annot >= 0 {
     bound = annot
@@ -455,66 +380,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       }
     }
   } else if initTy >= 0 {
-    bound = constStrLitBound(n, initTy)
-    if tpIfJoinAt.length > 0 { bound = tpIfBindTy(n.letInit, bound) }
-    // A-infer-null: an un-annotated `let x = null` binds a nullable with an open inner hole;
-    // the first non-null assignment fills it in place (the `=` arm), so `x` becomes `T | null`.
-    if isNullTy(initTy) {
-      bound = mkNullableTy(-1)
-      // ...and record the hole, so scope close can say whether anything ever filled it. A
-      // hole nothing fills is the `null` type and has a rep (D1576).
-      noteNullHole(bound, ix)
-    }
-    // Un-inferred empty-collection floor: a still-open hole may yet be pinned by a downstream
-    // `.push`/`.set`/`.add` — recorded for the scope-close re-check (`flushUninferred`).
-    if unresolvedHole(bound) { notePending(n.letName, bound, ix) }
-    // Exports an un-annotated if-expression binding's inferred value-union type for the
-    // emitter. Gated to if-expr/`?.` inits only — rendering via `tyToStr` is costly on the hot path.
-    let initIf = n.letInit
-    if initIf >= 0 {
-      const ini0 = P.nodes[initIf]
-      if ini0 is Paren { initIf = ini0.parInner }
-    }
-    let isIfInit = false
-    if initIf >= 0 {
-      const ini1 = P.nodes[initIf]
-      if ini1 is IfStmt { isIfInit = true }
-      // A standalone optional chain (`const t = a?.w`) is the other init shape whose union the
-      // emitter can learn about from nowhere else — as rare as an if-expression init.
-      if ini1 is OptMember { isIfInit = true }
-      // …and a `??`, whose result is a join the program spells nowhere else (D1709).
-      if ini1 is BinExpr {
-        if ini1.binOp == "??" { isIfInit = true }
-      }
-      // …and an optional CALL (`const t = p?.f()`), whose `| null` comes from the guard and
-      // so appears in neither the callee's type nor the call's own spelling (D1814).
-      if ini1 is Call {
-        const iniCallee = P.nodes[ini1.callFn]
-        if iniCallee is OptMember { isIfInit = true }
-      }
-    }
-    if isIfInit {
-      const lvn = valueUnionRetName(bound)
-      if lvn != "" {
-        inferLetIx.push(ix)
-        inferLetTy.push(lvn)
-      } else if tyIsStructBearingUnion(bound) {
-        // A MIXED union renders "" above — a struct member is not a value ATOM — and still reps
-        // as the box, so its row is minted from the arena type instead of from a name. Its
-        // struct members register as ARMS here, the one place the join is named (D1746).
-        inferRegisterVariantMembers(bound)
-        inferLetIx.push(ix)
-        inferLetTy.push("")
-      } else if isNulStringTy(bound) {
-        // `string | null` is a niche (not a value-union box) so `valueUnionRetName`
-        // renders "" — record it separately for the kind-16 slot classification.
-        inferLetNulStrIx.push(ix)
-      } else if isNulBoolTy(bound) {
-        // `boolean | null` is the other niche (the i32 sentinel-2 rep) — same story,
-        // recorded for the niche slot classification (`isInferLetNulBool`).
-        inferLetNulBoolIx.push(ix)
-      }
-    }
+    bound = letDeclInferredBound(n, ix, initTy)
   } else {
     tErr("'" + n.letName + "' needs a type annotation or initializer", ix)
   }
@@ -594,6 +460,162 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   // An `extern let` is assigned by whoever provides the import, before any code here runs.
   if n.letInit < 0 && externGlobalLinkOfNode(ix) < 0 { daAdd(n.letName) }
   return TY_VOID
+}
+
+// The refusals `checkLetDeclNodeIn` asks of an initializer of type `initTy0`: a `void` or
+// `never` value, one that may be `void`, and a redundant annotation `annot`. Answers the
+// initializer's type, `TY_ERR` once refused.
+function letDeclInitVerdicts(
+  n: LetDecl,
+  ix: i32,
+  annot: i32,
+  initTy0: i32,
+  seedMark: i32,
+): i32 {
+  let initTy = initTy0
+  // A `void` initializer has no value to bind — reject with a source-located message,
+  // poisoning `initTy`. Exempted: an if-expression init, whose false path is implicit `null`.
+  // A minted scrutinee binding (D1991) keeps the `void`, so the `match` reports it in its own words.
+  if n.letInit >= 0 && isVoidTy(initTy) && !symNameIsMinted(n.letName) {
+    if !voidSlotExemptExpr(n.letInit) {
+      tErr(
+        "cannot bind the void result of '"
+          + n.letName
+          + "' — a void function returns no value",
+        ix,
+      )
+      initTy = TY_ERR
+    }
+  }
+  // An initializer whose type includes `void` has no value to store: refused at the if or match arm
+  // that yields none, else at the initializer (D4071).
+  if (
+    n.letInit >= 0
+    && annot < 0
+    && initTy >= 0
+    && !isVoidTy(initTy)
+    && tyMentionsVoid(initTy, 8)
+    && !symNameIsMinted(n.letName)
+  ) {
+    const arm = ifNoValueArmAt(n.letInit)
+    if arm != n.letInit {
+      const kw = valueBranchKeyword(n.letInit)
+      tErr(
+        "this arm yields no value, but the `"
+          + kw
+          + "` is the value of `"
+          + n.letName
+          + "`: end the arm with a value, or make the `"
+          + kw
+          + "` a statement",
+        arm,
+      )
+    } else {
+      tErr(
+        "`"
+          + n.letName
+          + "` would take the type "
+          + tyToStr(initTy)
+          + ", and a value that may be `void` cannot be stored: test it before binding "
+          + "it, or bind it only where it holds a value",
+        n.letInit,
+      )
+    }
+    initTy = TY_ERR
+  }
+  // A `never` initializer leaves nothing to bind, and an un-annotated binding would take a type
+  // no value has; a declared type gives the dead binding a real one (D1972).
+  if n.letInit >= 0 && annot < 0 && initTy == TY_NEVER && initTy >= 0 {
+    tErr(
+      "`"
+        + n.letName
+        + "` would hold a `never` value, and none exists: its initializer never returns — call it as a statement, or declare the binding's type",
+      ix,
+    )
+    initTy = TY_ERR
+  }
+  // Redundant explicit annotation: skipped when checking the initializer consumed a contextual
+  // seed the annotation supplied (an un-annotated lambda param) — comparing then would be circular (D1442).
+  if (
+    annot >= 0
+    && initTy >= 0
+    && n.letInit >= 0
+    && cbSeedUsed == seedMark
+    && !lbiIsSynth(n.letType, ix)
+  ) {
+    if exprIsNumLit(n.letInit) && lbiNumTy(annot) {
+      lbiDeferRedundant(ix, initTy)
+    } else if !lbiReadsPinned(n.letInit) {
+      recordRedundantAnnot(n, ix, initTy, annot)
+    }
+  }
+  initTy
+}
+
+// The type an un-annotated `let` node `ix` binds from its initializer's type `initTy`, and
+// the rows an if-expression, `?.`, `??` or optional-call initializer exports to the emitter.
+function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
+  let bound = constStrLitBound(n, initTy)
+  if tpIfJoinAt.length > 0 { bound = tpIfBindTy(n.letInit, bound) }
+  // A-infer-null: an un-annotated `let x = null` binds a nullable with an open inner hole;
+  // the first non-null assignment fills it in place (the `=` arm), so `x` becomes `T | null`.
+  if isNullTy(initTy) {
+    bound = mkNullableTy(-1)
+    // ...and record the hole, so scope close can say whether anything ever filled it. A
+    // hole nothing fills is the `null` type and has a rep (D1576).
+    noteNullHole(bound, ix)
+  }
+  // Un-inferred empty-collection floor: a still-open hole may yet be pinned by a downstream
+  // `.push`/`.set`/`.add` — recorded for the scope-close re-check (`flushUninferred`).
+  if unresolvedHole(bound) { notePending(n.letName, bound, ix) }
+  // Exports an un-annotated if-expression binding's inferred value-union type for the
+  // emitter. Gated to if-expr/`?.` inits only — rendering via `tyToStr` is costly on the hot path.
+  let initIf = n.letInit
+  if initIf >= 0 {
+    const ini0 = P.nodes[initIf]
+    if ini0 is Paren { initIf = ini0.parInner }
+  }
+  let isIfInit = false
+  if initIf >= 0 {
+    const ini1 = P.nodes[initIf]
+    if ini1 is IfStmt { isIfInit = true }
+    // A standalone optional chain (`const t = a?.w`) is the other init shape whose union the
+    // emitter can learn about from nowhere else — as rare as an if-expression init.
+    if ini1 is OptMember { isIfInit = true }
+    // …and a `??`, whose result is a join the program spells nowhere else (D1709).
+    if ini1 is BinExpr {
+      if ini1.binOp == "??" { isIfInit = true }
+    }
+    // …and an optional CALL (`const t = p?.f()`), whose `| null` comes from the guard and
+    // so appears in neither the callee's type nor the call's own spelling (D1814).
+    if ini1 is Call {
+      const iniCallee = P.nodes[ini1.callFn]
+      if iniCallee is OptMember { isIfInit = true }
+    }
+  }
+  if isIfInit {
+    const lvn = valueUnionRetName(bound)
+    if lvn != "" {
+      inferLetIx.push(ix)
+      inferLetTy.push(lvn)
+    } else if tyIsStructBearingUnion(bound) {
+      // A MIXED union renders "" above — a struct member is not a value ATOM — and still reps
+      // as the box, so its row is minted from the arena type instead of from a name. Its
+      // struct members register as ARMS here, the one place the join is named (D1746).
+      inferRegisterVariantMembers(bound)
+      inferLetIx.push(ix)
+      inferLetTy.push("")
+    } else if isNulStringTy(bound) {
+      // `string | null` is a niche (not a value-union box) so `valueUnionRetName`
+      // renders "" — record it separately for the kind-16 slot classification.
+      inferLetNulStrIx.push(ix)
+    } else if isNulBoolTy(bound) {
+      // `boolean | null` is the other niche (the i32 sentinel-2 rep) — same story,
+      // recorded for the niche slot classification (`isInferLetNulBool`).
+      inferLetNulBoolIx.push(ix)
+    }
+  }
+  bound
 }
 
 // An `else if` chain is checked along its spine: every link's head runs outermost-first, then

@@ -1618,130 +1618,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // than `|`, so `(i32) => A | B` is a function returning a union, left for the
   // function-type pass-through, not split here.
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
-    const parts: string[] = []
-    tyTopLevelSplit(name, '|', false, parts)
-    // The subsumed-arm collapse, ahead of every other arm — the mirror of where
-    // `annUnionInnerTy` puts it: `K | string | null` is `string?` exactly as `K | string`
-    // is `string`, so the `| null` preserve must not claim it first. Re-enters on the
-    // survivors (D1048).
-    const dsKept: string[] = []
-    if canonDropSubsumedParts(parts, dsKept) {
-      let dsJoin = dsKept[0]
-      let dsI = 1
-      while dsI < dsKept.length {
-        dsJoin = dsJoin + "|" + dsKept[dsI]
-        dsI = dsI + 1
-      }
-      return canonEmitNameTs(dsJoin, ctx, -1)
-    }
-    // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
-    const nlu = nulLitUnionPreserve(parts, ctx)
-    if nlu != "" {
-      canonAtomsSet(nluAtoms)
-      return nlu
-    }
-    // A pure literal union (`"a" | "b"`) keeps its members too, exactly as the `| null`
-    // sibling does. Without this every member softens to `string` and dedups to one base
-    // scalar, so an inline spelling names a `string` while its `K` alias spelling keeps the
-    // litunion name — two spellings of one type carrying two reps.
-    const lup = litUnionPreserve(parts)
-    // …and a preserve whose answer is a declared alias name is kept at every position
-    // (`ctxKeepsLitUnion`): an ungated preserve reddens a bare inline litunion spelling as a
-    // function param or struct field, whose valtype ladders have an arm for the alias name
-    // and none for the inline spelling. Also required since `annUnionInnerTy` gives `K | K2` the alias's own arena index.
-    if lup != "" {
-      const lupAlias = !nameHasPipe(lup)
-      if ctxKeepsLitUnion(ctx) || lupAlias {
-        canonAtomsSet(lupAtoms)
-        return lup
-      }
-    }
-    const kept: string[] = []
-    // The mixed-union literal-run regroup, on the annotation side: `tyToNameGo`'s union
-    // arm spells a mixed union's string-literal run by its registered alias (`K0 | f64` →
-    // `K0|f64`); without this the same union canon'd to `string|f64` here, since a `K0`
-    // member expands through `unionAliasMembers` and its pure-litunion arena type softens.
-    const rgCls: i32[] = []
-    const rgAlias = mixedUnionLitAliasRegroup(parts, rgCls)
-    let rgDone = false
-    // The position every member below is rendered at. `RC_NULLABLE` is re-derived from a
-    // `null` sibling here, since the flat split has no enclosing nullable node to inherit it
-    // from, and it is or'd with the inherited bit so a nested nullable union stays one.
-    let memCtx = RC_UNION_MEM | (ctx & RC_NULLABLE)
-    if partsHaveNull(parts) { memCtx = memCtx | RC_NULLABLE }
-    // The kept members' atom counts, summed — not `kept.length`. A kept member is normally
-    // one atom, but the union-alias expansion substitutes a whole rendered member set for
-    // one member (`AB` → `A|B`), so `AB | null` joins to a three-atom name.
-    let atoms = 0
-    let i = 0
-    while i < parts.length {
-      // The regrouped run stands at the first literal-derived member's position and the
-      // rest drops — character-for-character what the renderer's `rgDone` does over the
-      // arena's members.
-      if rgAlias != "" && rgCls[i] == LRP_LITS {
-        if !rgDone {
-          rgDone = true
-          // An alias name is one identifier — one atom.
-          kept.push(rgAlias)
-          atoms = atoms + 1
-        }
-        i = i + 1
-        continue
-      }
-      let c = canonEmitNameAt(parts[i], memCtx)
-      let ca = canonAtoms
-      // A union-alias member flattens into this outer union (`AB | null` → `A | B | null`):
-      // a union of unions is one union, so expand the alias to its members, matching the
-      // inline `(A | B) | null` form. A bare `AB` annotation has no top-level `|`, so it
-      // never reaches here.
-      const exp = unionAliasMembers(c)
-      if exp != "" {
-        c = exp
-        // `unionAliasMembers` renders through `tyToEmitName`, which reports the render's
-        // own atom width — the flattened member set is as wide as the alias's union.
-        ca = tyNameAtoms
-      }
-      // A function-type member keeps grouping parens (`((i32) => i32) | null`), so the
-      // rejoined name stays distinct from a function returning a nullable. `canonEmitName`
-      // strips a member's own wrapping parens, so re-add them.
-      if isTopLevelFuncTypeName(c) {
-        c = "(" + c + ")"
-        ca = 1
-      }
-      // Dedupe at the atom, not at the member (D1026): the alias expansion substitutes a
-      // whole member set for one member, so a flattened member can hold several top-level
-      // atoms — comparing whole members cannot see that `"f64|null"` and `"null"` share one.
-      const cAtoms: string[] = []
-      splitUnionAtoms(c, cAtoms)
-      let ci2 = 0
-      while ci2 < cAtoms.length {
-        const cAtom = cAtoms[ci2]
-        let dup = false
-        let j = 0
-        while j < kept.length {
-          if kept[j] == cAtom { dup = true }
-          j = j + 1
-        }
-        if !dup {
-          kept.push(cAtom)
-          if cAtoms.length == 1 {
-            atoms = atoms + ca
-          } else {
-            atoms = atoms + 1
-          }
-        }
-        ci2 = ci2 + 1
-      }
-      i = i + 1
-    }
-    let out = kept[0]
-    let k = 1
-    while k < kept.length {
-      out = out + "|" + kept[k]
-      k = k + 1
-    }
-    canonAtomsSet(atoms)
-    return out
+    return canonEmitUnionName(name, ctx)
   }
   // A top-level intersection: fold through `intersectTy`, then render the fold, unchanged
   // if unrenderable. The fold asks the parser's spelling tree where one is banked for
@@ -1858,6 +1735,132 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     return shp
   }
   name
+}
+
+// The top-level union arm of `canonEmitNameTs`: `name` at position `ctx` split on `|`, each
+// member canon'd and deduped at the atom, with the subsumed-arm collapse and the literal-union
+// preserves ahead of it. Answers the rejoined spelling and sets `canonAtoms` to its width.
+function canonEmitUnionName(name: string, ctx: i32): string {
+  const parts: string[] = []
+  tyTopLevelSplit(name, '|', false, parts)
+  // The subsumed-arm collapse, ahead of every other arm — the mirror of where
+  // `annUnionInnerTy` puts it: `K | string | null` is `string?` exactly as `K | string`
+  // is `string`, so the `| null` preserve must not claim it first. Re-enters on the
+  // survivors (D1048).
+  const dsKept: string[] = []
+  if canonDropSubsumedParts(parts, dsKept) {
+    let dsJoin = dsKept[0]
+    let dsI = 1
+    while dsI < dsKept.length {
+      dsJoin = dsJoin + "|" + dsKept[dsI]
+      dsI = dsI + 1
+    }
+    return canonEmitNameTs(dsJoin, ctx, -1)
+  }
+  // A nullable literal-union (`K | null`) keeps its litunion members — see `nulLitUnionPreserve`.
+  const nlu = nulLitUnionPreserve(parts, ctx)
+  if nlu != "" {
+    canonAtomsSet(nluAtoms)
+    return nlu
+  }
+  // A pure literal union (`"a" | "b"`) keeps its members too, exactly as the `| null`
+  // sibling does. Without this every member softens to `string` and dedups to one base
+  // scalar, so an inline spelling names a `string` while its `K` alias spelling keeps the
+  // litunion name — two spellings of one type carrying two reps.
+  const lup = litUnionPreserve(parts)
+  // …and a preserve whose answer is a declared alias name is kept at every position
+  // (`ctxKeepsLitUnion`): an ungated preserve reddens a bare inline litunion spelling as a
+  // function param or struct field, whose valtype ladders have an arm for the alias name
+  // and none for the inline spelling. Also required since `annUnionInnerTy` gives `K | K2` the alias's own arena index.
+  if lup != "" {
+    const lupAlias = !nameHasPipe(lup)
+    if ctxKeepsLitUnion(ctx) || lupAlias {
+      canonAtomsSet(lupAtoms)
+      return lup
+    }
+  }
+  const kept: string[] = []
+  // The mixed-union literal-run regroup, on the annotation side: `tyToNameGo`'s union
+  // arm spells a mixed union's string-literal run by its registered alias (`K0 | f64` →
+  // `K0|f64`); without this the same union canon'd to `string|f64` here, since a `K0`
+  // member expands through `unionAliasMembers` and its pure-litunion arena type softens.
+  const rgCls: i32[] = []
+  const rgAlias = mixedUnionLitAliasRegroup(parts, rgCls)
+  let rgDone = false
+  // The position every member below is rendered at. `RC_NULLABLE` is re-derived from a
+  // `null` sibling here, since the flat split has no enclosing nullable node to inherit it
+  // from, and it is or'd with the inherited bit so a nested nullable union stays one.
+  let memCtx = RC_UNION_MEM | (ctx & RC_NULLABLE)
+  if partsHaveNull(parts) { memCtx = memCtx | RC_NULLABLE }
+  // The kept members' atom counts, summed — not `kept.length`. A kept member is normally
+  // one atom, but the union-alias expansion substitutes a whole rendered member set for
+  // one member (`AB` → `A|B`), so `AB | null` joins to a three-atom name.
+  let atoms = 0
+  let i = 0
+  while i < parts.length {
+    // The regrouped run stands at the first literal-derived member's position and the
+    // rest drops — character-for-character what the renderer's `rgDone` does over the
+    // arena's members.
+    if rgAlias != "" && rgCls[i] == LRP_LITS {
+      if !rgDone {
+        rgDone = true
+        // An alias name is one identifier — one atom.
+        kept.push(rgAlias)
+        atoms = atoms + 1
+      }
+      i = i + 1
+      continue
+    }
+    let c = canonEmitNameAt(parts[i], memCtx)
+    let ca = canonAtoms
+    // A union-alias member flattens into this outer union (`AB | null` → `A | B | null`):
+    // a union of unions is one union, so expand the alias to its members, matching the
+    // inline `(A | B) | null` form. A bare `AB` annotation has no top-level `|`, so it
+    // never reaches here.
+    const exp = unionAliasMembers(c)
+    if exp != "" {
+      c = exp
+      // `unionAliasMembers` renders through `tyToEmitName`, which reports the render's
+      // own atom width — the flattened member set is as wide as the alias's union.
+      ca = tyNameAtoms
+    }
+    // A function-type member keeps grouping parens (`((i32) => i32) | null`), so the
+    // rejoined name stays distinct from a function returning a nullable. `canonEmitName`
+    // strips a member's own wrapping parens, so re-add them.
+    if isTopLevelFuncTypeName(c) {
+      c = "(" + c + ")"
+      ca = 1
+    }
+    // Dedupe at the atom, not at the member (D1026): the alias expansion substitutes a
+    // whole member set for one member, so a flattened member can hold several top-level
+    // atoms — comparing whole members cannot see that `"f64|null"` and `"null"` share one.
+    const cAtoms: string[] = []
+    splitUnionAtoms(c, cAtoms)
+    let ci2 = 0
+    while ci2 < cAtoms.length {
+      const cAtom = cAtoms[ci2]
+      let dup = false
+      let j = 0
+      while j < kept.length {
+        if kept[j] == cAtom { dup = true }
+        j = j + 1
+      }
+      if !dup {
+        kept.push(cAtom)
+        if cAtoms.length == 1 { atoms = atoms + ca } else { atoms = atoms + 1 }
+      }
+      ci2 = ci2 + 1
+    }
+    i = i + 1
+  }
+  let out = kept[0]
+  let k = 1
+  while k < kept.length {
+    out = out + "|" + kept[k]
+    k = k + 1
+  }
+  canonAtomsSet(atoms)
+  return out
 }
 
 export function canonEmitTypeNames() {
