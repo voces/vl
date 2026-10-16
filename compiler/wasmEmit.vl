@@ -966,7 +966,6 @@ import {
   indexPlaceNonNull,
   inferredRetMapSlot,
   instancePinnedMaps,
-  instanceTyOf,
   internAtom,
   internInlineShapeTy,
   isFitsAcrossTagRows,
@@ -1003,6 +1002,7 @@ import {
   listGetIdxReReadable,
   listIdxKindOf,
   listIdxWrapSlot,
+  listIsRecvTyOf,
   listOpKindOfBin,
   listOpSlotOfBin,
   listPayloadStashSlot,
@@ -1343,6 +1343,7 @@ import { covarRootFrame, covarRootName } from "./check_write_scan"
 import {
   flattenVariantsInto,
   nonNullTy,
+  nullableInnerOrNone,
   numLitUnionHasBase,
   numPrimTyOfKind,
   primNameOf,
@@ -3374,17 +3375,6 @@ function emitRecordFitIs(body: u8[], isIx: i32, fnIx: i32): i32 {
   }
   if nullable { fbEnd() }
   1
-}
-
-// The type the receiver `recv` of a list `is` has in function `fnIx`: its recorded type, or where
-// that names a type parameter, the instance's binding of it, exact, pinned or a hole's (D4771).
-// -1 where the instance leaves it open.
-function listIsRecvTyOf(recv: i32, fnIx: i32): i32 {
-  const declTy = nodeTyIxOf(recv)
-  if declTy >= 0 && !tyHasTyVar(declTy) { return declTy }
-  const ext = exactOperandTyOf(recv, fnIx)
-  if ext >= 0 || declTy < 0 { return ext }
-  instanceTyOf(declTy, fnIx)
 }
 
 // `xs is L[]` over a list whose elements are a wider type than the literal set `L`: true when
@@ -7982,10 +7972,25 @@ function emitUnionIfArm(
 // must satisfy, and where the arm is merged with a declared twin the indices are the same
 // anyway. Not a change to `exprUnion`, which would move every narrowed struct receiver.
 function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
-  if narrowedStructArmVi(exprIx) < 0 && !narrowedNulStructArm(exprIx) {
+  if (
+    narrowedStructArmVi(exprIx) < 0
+    && !narrowedNulStructArm(exprIx)
+    && !exprTyIsRecord(exprIx, false)
+    && !exprTyIsRecord(exprIx, true)
+  ) {
     return false
   }
   exprUnion(exprIx, fnIx)
+}
+
+// Whether the checker typed `exprIx` as one record, or as `record | null` when `nullable`.
+// A box of that type is a union of same-shape records collapsed to the record (D4989), so
+// its payload is the record itself.
+function exprTyIsRecord(exprIx: i32, nullable: boolean): boolean {
+  if exprIx < 0 { return false }
+  const ty = nodeTyIxOf(unwrapParen(exprIx))
+  if nullable { return ty >= 0 && tyIsRecord(nullableInnerOrNone(ty)) }
+  tyIsRecord(ty)
 }
 
 // The unbox itself: recover the box's `anyref` payload and cast it to `heapIdx`, nullably when
@@ -7993,12 +7998,16 @@ function narrowedArmNeedsUnbox(exprIx: i32, fnIx: i32): boolean {
 // stack. A negative `heapIdx` emits nothing: a destination whose table slot never resolved has
 // no cast target, and `ref.cast -1` would put a garbage heap index in the module.
 function emitNarrowedArmUnboxTo(heapIdx: i32, exprIx: i32) {
-  emitArmUnboxCast(heapIdx, narrowedNulStructArm(exprIx))
+  emitArmUnboxCast(
+    heapIdx,
+    narrowedNulStructArm(exprIx) || exprTyIsRecord(exprIx, true),
+  )
 }
 
-// That unbox with its nullability given, for a destination that knows it is a niche.
+// That unbox with its nullability given, for a destination that knows it is a niche. A
+// destination whose heap is the box itself takes the box as it is.
 function emitArmUnboxCast(heapIdx: i32, nullable: boolean) {
-  if heapIdx < 0 { return 0 }
+  if heapIdx < 0 || heapIdx == uBoxIdx { return 0 }
   fbStructGet(uBoxIdx, 1) // 0xfb 0x02 <box ht> field 1: value (anyref)
   if nullable { fbRefCastNull(heapIdx) } else { fbRefCast(heapIdx) }
   0
@@ -8046,6 +8055,16 @@ function rlElemArmHeapOf(rslot: i32): i32 {
 function globalCellArmIdx(gLet: i32, kind: VKind): i32 {
   if kind == "nulstruct" { return nulRefStructIdxOfLet(gLet, -1) }
   globalCellStructIdx(gLet)
+}
+
+// The arm unbox at a module global's start-fn initializer, the assignment arm's twin: a box
+// delivered into a record cell recovers its payload. A `variant` cell's coerce owns its own.
+export function emitGlobalInitArmUnbox(gLet: i32, kind: VKind, initIx: i32) {
+  if kind == "variant" || !narrowedArmNeedsUnbox(initIx, -1) { return 0 }
+  emitNarrowedArmUnboxTo(
+    armDestHeapOf(kind, globalCellArmIdx(gLet, kind)),
+    initIx,
+  )
 }
 
 function armDestHeapOf(kind: VKind, idx: i32): i32 {

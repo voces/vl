@@ -122,7 +122,11 @@ import {
   tyFitKind,
   tyProvesNonNull,
 } from "./typecheck"
-import { listIsFitsAcrossReps, nameIsNewtypeBrand } from "./check_type_shape"
+import {
+  listDisjointDepth,
+  listIsFitsAcrossReps,
+  nameIsNewtypeBrand,
+} from "./check_type_shape"
 import { annUnionAtomsOf, nodeTyIsUnionAlias } from "./check_decl_scan"
 import {
   inferRetFnKey,
@@ -571,7 +575,6 @@ import {
   fa64Used,
   fitShName,
   fitShRecv,
-  fitShSlot,
   fitShTy,
   fnChildHead,
   fnChildNext,
@@ -621,6 +624,7 @@ import {
   liKinds,
   liSlots,
   listIdxScratchBase,
+  listIsIdentNames,
   localBlockLet,
   localByNode,
   localDeclIx,
@@ -29542,9 +29546,11 @@ function tyStepNulIf(ty: i32, full: string, base: string): i32 {
 export function internShapeDeep(nm: string) { internShapeDeepTy(nm, -1) }
 
 // `internShapeDeepTy` for an arena type, walked under its emitter render: the one place a
-// caller holding only `ty` turns it into the name the walk still keys on.
-export function internShapeDeepOfTy(ty: i32) {
-  internShapeDeepTy(tyToEmitName(ty), ty)
+// caller holding only `ty` turns it into the name the walk still keys on, which it returns.
+export function internShapeDeepOfTy(ty: i32): string {
+  const nm = tyToEmitName(ty)
+  internShapeDeepTy(nm, ty)
+  nm
 }
 
 // Recursively peels the composition wrappers off a type name — grouping parens, a trailing
@@ -38479,6 +38485,10 @@ export function structIndexOfLet(letIx: i32, fnIx: i32) {
           const si2 = structIndexOfTypeName(nb)
           if si2 >= 0 { return si2 }
         }
+        // A non-null part spelled as a same-shape union (`A | B | null`) names no struct
+        // row; its arena type is the one record they share.
+        const si3 = structIndexOfTy(nonNullTy(nodeTyIxOf(d.letType)))
+        if si3 >= 0 { return si3 }
       }
     }
     return structIndexOfExpr(d.letInit, fnIx)
@@ -43102,6 +43112,61 @@ function recordListSlotOfNode(exprIx: i32, fnIx: i32): i32 {
   rlSlotOfTy(el)
 }
 
+// The type the receiver `recv` of a list `is` has in function `fnIx`: its recorded type, or where
+// that names a type parameter, the instance's binding of it, exact, pinned or a hole's (D4771).
+// -1 where the instance leaves it open.
+export function listIsRecvTyOf(recv: i32, fnIx: i32): i32 {
+  const declTy = nodeTyIxOf(recv)
+  if declTy >= 0 && !tyHasTyVar(declTy) { return declTy }
+  const ext = exactOperandTyOf(recv, fnIx)
+  if ext >= 0 || declTy < 0 { return ext }
+  instanceTyOf(declTy, fnIx)
+}
+
+// The `K[]` a read `exprIx` of a local list takes in `fnIx` when it is typed by an `is K[]` over
+// that local whose elements can never be `K`, so the arm reads an empty `K[]` in its place
+// (D4911, D4962); -1 for any other read. Answered from types alone, so collect and emit agree.
+export function listFitArmTyOf(exprIx: i32, fnIx: i32): i32 {
+  if fnIx < 0 || listIsIdentNames.length == 0 { return -1 }
+  const ax = unwrapParen(exprIx)
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  const r = P.nodes[ax]
+  if !(r is Ident) || !strListHas(listIsIdentNames, r.identName) { return -1 }
+  const t = nodeTyIxOf(ax)
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyArray) || tyHasTyVar(t) {
+    return -1
+  }
+  const fn = P.nodes[fnIx]
+  if !(fn is FuncDecl) { return -1 }
+  if listFitArmTestIn(fn.fnBody, r.identName, t, fnIx) { return t }
+  -1
+}
+
+// Whether `ix` holds, outside nested functions, an `is` over local `name` testing `kTy` whose
+// receiver's elements, in `fnIx`, can never be `kTy`'s, the receiver neither a union nor nullable.
+function listFitArmTestIn(ix: i32, name: string, kTy: i32, fnIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is IsExpr {
+    const o = P.nodes[unwrapParen(n.isObj)]
+    if (
+      o is Ident
+      && o.identName == name
+      && tySame(isVarTyIxOf(ix), kTy)
+      && !exprUnion(n.isObj, fnIx)
+      && !nodeTyIsNullable(n.isObj)
+      && listDisjointDepth(listIsRecvTyOf(n.isObj, fnIx), kTy) == 1
+    ) {
+      return true
+    }
+  }
+  for k in nodeChildren(ix) {
+    if listFitArmTestIn(k, name, kTy, fnIx) { return true }
+  }
+  false
+}
+
 // The `fitSh*` row `listFitShadowSet` stored for a read of `name` at node `exprIx` typed as that
 // row's list and resolving to the same binding, or -1 when the read takes the binding itself.
 export function listFitShadowRow(name: string, exprIx: i32, fnIx: i32): i32 {
@@ -43238,9 +43303,11 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   }
   if e is Ident {
     // An `is K[]` arm's read of an empty list of another element is the arm's own `K[]` (D4962).
-    const fsr = listFitShadowRow(e.identName, exprIx, fnIx)
-    if fsr >= 0 && fitShSlot[fsr] >= 0 && fitShSlot[fsr] < rlElemName.length {
-      return rlElemName[fitShSlot[fsr]]
+    const fat = listFitArmTyOf(exprIx, fnIx)
+    if fat >= 0 {
+      const fa = T.tys[fat]
+      const fsl = if fa is TyArray { rlSlotOfTy(fa.aElem) } else { -1 }
+      if fsl >= 0 && fsl < rlElemName.length { return rlElemName[fsl] }
     }
     // A union binding NARROWED to a ref-element array arm (`if x is S[]` then `x[i]`): its element
     // name is the arm's, so `refListSlotOfExpr` resolves the wrapper the narrowed read casts to.
@@ -47232,6 +47299,12 @@ const lrMemoNul: i32[] = []
 // its list unless a float literal or spread built another; a recorded `f64[]` yields to an f32
 // shape, and the unpinned `i32[]` to any shape.
 function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
+  // An `is K[]` arm reading an empty list of another element reads the arm's `K[]` (D4993).
+  const fat = listFitArmTyOf(exprIx, fnIx)
+  if fat >= 0 {
+    const fd = repOfTy(fat)
+    if fd.rdCovered == 1 && vkListClass(fd.rdKind) == 1 { return fd.rdKind }
+  }
   const pin = nodeTyPinIxOf(exprIx)
   const raw = nodeTyIxOf(exprIx)
   const e = P.nodes[exprIx]

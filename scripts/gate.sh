@@ -50,6 +50,11 @@ if ! command -v cygpath >/dev/null && [ -n "${TMPDIR:-}" ] && [ -d "$TMPDIR" ]; 
   TMPDIR="$(cd "$TMPDIR" && pwd -P)"; export TMPDIR
 fi
 LOGS="${TMPDIR:-/tmp}/vl-gate.$$"; mkdir -p "$LOGS"
+# The logs are removed when every row passed (177 dirs had piled up in a day). A failure keeps
+# them: callers copy the failed rows' logs out of $LOGS. GATE_PASSED is set only on the two
+# passing exits below; GATE_KEEP_LOGS=1 keeps them regardless.
+GATE_PASSED=0
+trap '[ "$GATE_PASSED" = 1 ] && [ "${GATE_KEEP_LOGS:-0}" != 1 ] && rm -rf "$LOGS"' EXIT
 : "${JOBS:=4}"; : "${DENO_JOBS:=4}"; export JOBS DENO_JOBS
 # The native binary and the seed, for the rows written in VL. One row is today
 # (`seed size`, ported from Python); the paths are the ones every suite derives.
@@ -83,6 +88,10 @@ FAST=0
 for a in "$@"; do [ "$a" = --fast ] && FAST=1; done
 SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|survey measurements|native-fixpoint|self-compile time|rep-fuzz|plumb-shape cost|"
 SKIPPED=()
+# A row the caller has already proven appears in the table with its reason rather than
+# vanishing: an empty PID marks it, and the reason is the report loop's RESULT column.
+SKIP_WHY=()
+skip_row() { SKIP_WHY[${#PIDS[@]}]="$2"; NAMES+=("$1"); PIDS+=(""); STARTS+=(0); }
 # bash 3.2 (macOS's /bin/bash) has no `wait -n`; there a queued row polls once a second.
 if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then
   wait_any() { wait -n 2>/dev/null || true; }
@@ -138,8 +147,16 @@ DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | pas
 # turns each list into argv, and they hold `tests/<name>.ts` and nothing else. Through a
 # `bash -c` instead, every newline would be a COMMAND separator (measured: 78 of
 # ci-native's 79 files ran as commands, rc=126).
+# THE CORPUS ORACLE (tests/cases_wasm_{0..3}_test.ts) is the V8 face of the ~5,300-fixture
+# tests/cases corpus; ci-native's selfhost_native_align_test.ts is the native face, over the
+# same files. A fixture red in the retro of 2026-10-15 was red in BOTH, so the gate pays for one.
+# What only the oracle pins - @error message text and spans, @warning/@hint/@info - stays
+# graded by CI (ci.yml "Corpus oracle on the wasm compiler" and `deno task test`).
+# GATE_V8_CORPUS=1 puts the oracle back.
+ORACLE=$(ls tests/cases_wasm_*_test.ts | paste -sd, -)
+[ "${GATE_V8_CORPUS:-0}" = 1 ] && ROW1_IGNORE="$DEDUPE" || ROW1_IGNORE="$DEDUPE,$ORACLE"
 # shellcheck disable=SC2086
-run "deno task test"           deno test -A --no-check --parallel --ignore="$DEDUPE" tests/
+run "deno task test"           deno test -A --no-check --parallel --ignore="$ROW1_IGNORE" tests/
 # shellcheck disable=SC2086
 run "ci-native"                env SELFHOST_NATIVE_ALIGN=1 deno test -A --no-check --parallel $CI_NATIVE
 # shellcheck disable=SC2086
@@ -158,7 +175,12 @@ run "lsp typecheck"            deno check --node-modules-dir=none --config lsp/d
 # CLI is skipped. lsp/deno.json carries no exclude, so linting through it sees
 # lsp/src/. Mirrors ci.yml's "Lint (lsp)" step.
 run "lsp lint"                 deno lint --config lsp/deno.json lsp/src/
-run "native-fixpoint"          bash scripts/native-fixpoint.sh
+# GATE_FIXPOINT_PROVEN=1: the caller has already proven compile(seed)==seed on THIS tree (the
+# merge-queue audit proves c2==c3 before `gate.sh --no-build`), so re-proving it is a repeat.
+# The row stays in the table as skipped-with-reason. Nothing reads its SELF_COMPILE_USER_SECONDS
+# line; `self-compile time` below measures the same build on its own.
+if [ "${GATE_FIXPOINT_PROVEN:-0}" = 1 ]; then skip_row "native-fixpoint" "skipped: proven by caller"
+else run "native-fixpoint"     bash scripts/native-fixpoint.sh; fi
 # THE L2 TRIPWIRE. Its own build rather than native-fixpoint's stage-4 number, because
 # the rows here are independent by construction and the two run concurrently — one extra
 # self-compile against a row that already does two costs the table nothing.
@@ -179,9 +201,9 @@ run "lint-self + fmt"          bash scripts/lint-self.sh
 run "seed size"                "$VL" run scripts/seed-size.vl --compiler "$SEED" -- --check
 # No Python anywhere in the tree: a tracked .py file or a python invocation in a script fails.
 run "no-python"                "$VL" run scripts/no-python.vl
-# Lane L7's ratchet: emitter module-scope `let`s that no prologue, pass or frame builder
-# clears may only fall (baseline scripts/emitter-state-baseline.json).
-run "emitter state budget"     "$VL" run scripts/emitter-state-audit.vl -- --check
+# No `emitter state budget` row: lane L7's ratchet (`emitter-state-audit.vl --check`, baseline
+# scripts/emitter-state-baseline.json) is held by tests/vl_emitter_state_audit_test.ts, which
+# `ci-native` runs - it asserts --check exits 0 on the committed baseline and reds one below it.
 # THE COST OF GENERATED CODE: guest fuel and peak RSS of one `-O` build of each of two 2 MB
 # plumb-shaped units (a median one, and a one-function tail one), against a committed
 # baseline, plus two exact facts about the rung input. Fuel is a count, so the fan-out's
@@ -296,6 +318,7 @@ echo
 echo "WALL = elapsed once launched   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
 printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
+  if [ -z "${PIDS[$i]}" ]; then printf '%-22s %8s %8s  %s\n' "${NAMES[$i]}" "-" "-" "${SKIP_WHY[$i]:-skipped}"; continue; fi
   wait "${PIDS[$i]}"; rc=$?
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
   [ -n "$fin" ] || fin=$(now)
@@ -309,8 +332,9 @@ done
 if [ $FAIL -ne 0 ]; then
   echo; echo "GATE FAILED — logs in $LOGS"; exit 1
 fi
+GATE_PASSED=1
 if [ "$FAST" = 1 ]; then
-  echo; echo "FAST TIER PASSED — not the merge gate; skipped: ${SKIPPED[*]}  (logs in $LOGS)"
+  echo; echo "FAST TIER PASSED — not the merge gate; skipped: ${SKIPPED[*]}  (logs $([ "${GATE_KEEP_LOGS:-0}" = 1 ] && echo "kept in $LOGS" || echo removed))"
   exit 0
 fi
-echo; echo "ALL GATES PASS ✅  (logs in $LOGS)"
+echo; echo "ALL GATES PASS ✅  (logs $([ "${GATE_KEEP_LOGS:-0}" = 1 ] && echo "kept in $LOGS" || echo removed))"
