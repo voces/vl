@@ -915,6 +915,46 @@ annotation node (`isUNameAB` with `ty < 0`), and at the sites that ask about the
 such as site 9. The `|| isUName(name)` disjunctions beside sites 1, 24 and 46 are their callers' own
 reads, not the seams'.
 
+### Step 5 — the seventh switch: `isUName` stops answering in its own seam
+
+**`isUNameABAt` no longer calls `isUName`.** A caller with no type (`ty < 0`) answers by the row
+carrying the key of its spelling (`nameKeyRow`, the same two-or-more-member key the sixth switch
+uses). A caller with a type answers by its key and the wide hit, as before. The annotation leg
+became a flag, `own`: when `name` is the type's own spelling and the type carries no union key,
+the spelling's key answers. `isUNameAnnAB` and the new `isUNameOwnAB` set it. Armed and unarmed
+now give the same answer, and the probe still tallies the spelling's row.
+
+**Measured before the switch.** A scratch seed recorded every `ty < 0` reach over `tests/cases`
+and both halves of the distilled corpus. There were many reaches (`fnUnionRetSinkOk` 28,404 in
+6,904 files, `emitLetDeclStmt` 111,079 in 5,384), and every one carried the empty spelling. So
+the old answer (`isUName("")`, false) and the new one (`nameKeyRow("")`, -1) agree on the whole
+population, and the `ty < 0` leg cannot be shown live there. Site 9 (`inferRetArenaUnionIsDup`)
+always has a union type and already answered by `unRowOfKey`, so it had no spelling to retire.
+
+**The three caller disjunctions are gone.** Sites 24 and 46 drop `|| isUName(name)`; it answered
+true where the seam said false in no program. Site 1 (`registerValueUnionNameTy`) asks
+`isUNameOwnAB`. Its disjunction answered alone in 11 programs, softened literal unions and
+collapsed same-shape unions, and difftree finds every one of their modules unchanged.
+
+**One behaviour change: D2779 closes.** At `f<i32 | string>` the instance's return is spelled
+`i32|string|string`. A row already carried that spelling but not the type, so the old
+disjunction skipped registering the type and `print` refused the box. Site 1 now finds no row
+for the type's key and registers it, so the program prints `3`. This program is in no swept
+population, so difftree does not see it; `check-filed-witnesses` does. Pin:
+`tests/cases/generics/union-pin-already-holding-string-return.vl`, five pins plus an `is` read.
+Put back `|| isUName(name)` at site 1 and the pin fails to build. Force the `own` leg off and
+`unions/same-shape-inline-union-is` fails to build (`` `is` receiver is not a union value ``).
+
+**What remains.** These still answer from a spelling:
+
+- the other seams, which read the spelling when `ty < 0` (`unionRowNameAB`, `isUNameKeyAB`,
+  `unionMemberTysOfAB`, `unionHasAtomAB`);
+- `registerInlineUnionAt`'s own `isUNameKeyAB(...) || isUName(name)` guard;
+- the name-binding check at the top of `unNameAdoptKeyRow`, which asks whether the spelling is
+  bound before writing it, and is a spelling question by design;
+- 30 `isUName(` call sites in `compiler/*.vl` outside the seam (16 in `emit_classify`, 8 in
+  `emit_collect`, 5 in `emit_mono`, 1 in `check_decl_scan`).
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch
