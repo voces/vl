@@ -1,0 +1,165 @@
+// The type of a list literal, a spread inside one, and an object literal.
+
+import {
+  ArrayLit,
+  FieldInit,
+  ObjLit,
+  P,
+  hasSpreadItem,
+  spreadArgOf,
+  stmtBraceNodes,
+  stmtBraceTails,
+} from "./ast"
+import { nolLitsPush, ulLitN, ulLitNSet } from "./check_bind_rows"
+import {
+  bareBraceCount,
+  bareBraceCountSet,
+  bareBraceLits,
+  checkNodeHook,
+} from "./check_core_state"
+import { f32LitJoinOf, listJoinApart } from "./check_fit_rules"
+import { f32JoinRetypesRunning } from "./check_leaf_steps"
+import {
+  neverValueSlotErr,
+  objLitDupKeyErrs,
+  voidValueSlotErr,
+} from "./check_node_rules"
+import { joinTys, tErr, widenLitTy } from "./check_relate_core"
+import {
+  T,
+  TY_ERR,
+  TY_NULL,
+  TY_STR,
+  TyArray,
+  TyUnion,
+  mkArrayTy,
+  mkObjTy,
+  tyToStr,
+} from "./check_types"
+import { i32ListHas } from "./listutil"
+import { primNameOf } from "./tyquery"
+
+// The ELEMENT type a spread contributes: `...ys` over `ys: T[]` gives `T`. A `readonly` view
+// spreads too — the destination list is fresh, so nothing the view forbids is laundered.
+// Returns -1 for an empty-list source (element not yet known) and TY_ERR after refusing one
+// that is not a list at all.
+export function spreadElemTy(spdIx: i32) {
+  const inner = spreadArgOf(spdIx)
+  if inner < 0 { return TY_ERR }
+  const st = checkNodeHook(inner)
+  if st < 0 { return TY_ERR }
+  const t = T.tys[st]
+  if t is TyArray { return t.aElem }
+  let note = ""
+  if st == TY_STR { note = " — a string is not a list of characters in VL" }
+  tErr("`...` spreads a list, and this is " + tyToStr(st) + note, inner)
+  TY_ERR
+}
+// ── array literal ───────────────────────────────────────────────────────────
+// `[e, e, ...]` types as `T[]` where `T` is the first element's type (the rest must be
+// assignable to it). An empty `[]` is `T[]` with an unknown element (`-1`), assignable to any
+// array — its concrete element is pinned by the binding's annotation.
+
+// Extracted from `checkNodeReal`'s `ArrayLit` arm (C3: thin the dispatcher).
+export function checkArrayLitNode(n: ArrayLit, _ix: i32) {
+  const elems = n.arrElems
+  if elems.length < 1 { return mkArrayTy(-1) }
+  if hasSpreadItem(elems) { return checkSpreadArrayLit(elems) }
+  // A `void` element has no value to store — poisoned to `TY_ERR` rather than joined, so an
+  // annotated literal keeps one "cannot assign" message instead of a second one.
+  let elemTy = widenLitTy(checkNodeHook(elems[0]))
+  if voidValueSlotErr(elemTy, elems[0], "list element", elems[0]) {
+    elemTy = TY_ERR
+  }
+  const ets: i32[] = [elemTy]
+  let ei = 1
+  while ei < elems.length {
+    let et = widenLitTy(checkNodeHook(elems[ei]))
+    if voidValueSlotErr(et, elems[ei], "list element", elems[ei]) {
+      et = TY_ERR
+    }
+    ets.push(et)
+    // Host parity: the element type is the union of every element's type (flattened/deduped)
+    // — mixed struct variants type as `(A | B | C)[]`; an annotation then checks structurally.
+    elemTy = joinTys(elemTy, et)
+    ei = ei + 1
+  }
+  const apart = listJoinApart(elems, ets)
+  if apart >= 0 { elemTy = apart }
+  // An f32 element beside literal ones types the list `f32[]`, as it does an `if` join.
+  if (
+    apart < 0
+    && elemTy >= 0
+    && primNameOf(elemTy) != "f32"
+    && elems.length > 1
+    && f32JoinRetypesRunning()
+  ) {
+    const f32El = f32LitJoinOf(elems, ets)
+    if f32El >= 0 { elemTy = f32El }
+  }
+  if neverValueSlotErr(elemTy, "a list element", elems[0]) { elemTy = TY_ERR }
+  if elemTy == TY_NULL { nolLitsPush(_ix) }
+  if elemTy >= 0 && T.tys[elemTy] is TyUnion { ulLitNSet(ulLitN + 1) }
+  return mkArrayTy(elemTy)
+}
+
+// `[...a, e, ...b]` — the element type joins every plain element's type with every spread
+// source's ELEMENT type. A spread of an empty list contributes nothing, so `[...[]]` stays an
+// unpinned `T[]` exactly as `[]` does, and a literal that is only spreads of empty lists is
+// pinned by its destination like any other empty one.
+function checkSpreadArrayLit(elems: i32[]) {
+  let elemTy = -1
+  let ei = 0
+  while ei < elems.length {
+    let et = -1
+    if spreadArgOf(elems[ei]) >= 0 {
+      et = spreadElemTy(elems[ei])
+    } else {
+      et = widenLitTy(checkNodeHook(elems[ei]))
+      if voidValueSlotErr(et, elems[ei], "list element", elems[ei]) {
+        et = TY_ERR
+      }
+    }
+    if et >= 0 {
+      if elemTy < 0 { elemTy = et } else { elemTy = joinTys(elemTy, et) }
+    }
+    ei = ei + 1
+  }
+  mkArrayTy(elemTy)
+}
+
+// Extracted from `checkNodeReal`'s `ObjLit` arm (C3: thin the dispatcher).
+export function checkObjLitNode(n: ObjLit, ix: i32) {
+  const fields = n.objFields
+  if fields.length == 0 {
+    // A `{}` statement is an empty block, refused by the parser, or for a block's last
+    // statement by `bareBraceDeliver` / `bareBraceUndelivered`; the error type keeps it at one.
+    if i32ListHas(stmtBraceNodes, ix) {
+      bareBraceCountSet(bareBraceCount + 1)
+      if i32ListHas(stmtBraceTails, ix) { bareBraceLits.push(ix) }
+      return TY_ERR
+    }
+    bareBraceLits.push(ix)
+  }
+  const fnames: string[] = []
+  const ftys: i32[] = []
+  let i = 0
+  while i < fields.length {
+    const fnode = P.nodes[fields[i]]
+    if fnode is FieldInit {
+      fnames.push(fnode.fiName)
+      // A `void` field initializer has no value to store — poisoned to `TY_ERR` so an
+      // annotated literal keeps one message, instead of an uninterned-shape reject naming nothing.
+      let fty = widenLitTy(checkNodeHook(fnode.fiValue))
+      const fslot = "field '" + fnode.fiName + "'"
+      if voidValueSlotErr(fty, fnode.fiValue, fslot, fnode.fiValue) {
+        fty = TY_ERR
+      }
+      if neverValueSlotErr(fty, fslot, fnode.fiValue) { fty = TY_ERR }
+      ftys.push(fty)
+    }
+    i = i + 1
+  }
+  objLitDupKeyErrs(fields)
+  return mkObjTy(fnames, ftys)
+}

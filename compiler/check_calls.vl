@@ -1,0 +1,1535 @@
+// The type of a call: a built-in identifier call, a memory-offset or numeric intrinsic, an
+// optional call, or a call through a function type with its bounds, constraints and rest
+// parameter.
+
+import {
+  Call,
+  FuncDecl,
+  Ident,
+  Member,
+  Node,
+  OptMember,
+  P,
+  callHasTyArgs,
+  callIsRestPacked,
+  fillArgDefaults,
+  fnHasTpBound,
+  fnRequiredArity,
+  fnTpBoundOf,
+  getDeclLabel,
+  getDeclPropOf,
+  hasNamedArgs,
+  hasSpreadItem,
+  i32ToStr,
+  nodeIsTplHole,
+  restParamIndex,
+  ufcsAliasInScope,
+} from "./ast"
+import { collCtorTyArgsTy } from "./check_annot_resolve"
+import {
+  assignableExpr,
+  dstBindLitTyParams,
+  fsbNoteCall,
+  genFnValueCstrs,
+  validateArgCstrs,
+  validateBmCstrs,
+  validateLetCstrs,
+  validateRetCstrs,
+  validateTpIfJoins,
+} from "./check_assignable"
+import { callBindNote, fsbDeclAtNode, fsbName } from "./check_bind_rows"
+import { strLitRecvTy } from "./check_builtin_methods"
+import { builtinMethodNamesOf } from "./check_callee"
+import {
+  coalDefHole,
+  coalPinTy,
+  mkDerivedHole,
+  noteCastArgDest,
+} from "./check_coal"
+import {
+  apartHoleJoins,
+  arrDefCallIx,
+  checkNodeHook,
+  ckCalleeIx,
+  ckCalleeIxSet,
+  globalBeforeDecl,
+  inferObserved,
+  memSharedCalls,
+} from "./check_core_state"
+import {
+  rcwBdCall,
+  rcwBdConc,
+  rcwBdCovs,
+  rcwBdDecl,
+  rcwBdTp,
+} from "./check_covar_pins"
+import {
+  compArgCstrOk,
+  noteArgCstr,
+  noteBinCstr,
+  noteMemCstr,
+  notePrintCstr,
+} from "./check_cstr_rows"
+import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
+import {
+  boundObjRootOf,
+  memOffsetCheckedValue,
+  v128SeenSet,
+} from "./check_decl_scan"
+import {
+  bankCoalHoles,
+  dstRetypeLitArgs,
+  holeArgArrayErr,
+  holeArgDemandErr,
+  holeArgViewErr,
+  holeCastPinCheck,
+  holeDemandOk,
+  instGenFnHolePins,
+  memberFloorErr,
+  orderNamedCallArgs,
+  pinBmCstrElems,
+  refuseOpenNullHoleArg,
+  restCallPack,
+  tplHoleHandled,
+  validateBinCstrs,
+  validateEscJoins,
+  validateIsCstrs,
+  validateMemCstrs,
+  validateNestCstrs,
+  validatePrintCstrs,
+  validateRcwPins,
+  validateUfcsCstrs,
+  wsCandidate,
+  wsOrigTyOf,
+} from "./check_demands"
+import {
+  boundText,
+  printRefRefusal,
+  spreadNoRestMsg,
+  tyArgReadHintIfAny,
+} from "./check_diag_text"
+import {
+  callDstTyOf,
+  calleeIdentName,
+  calleeRetDeclared,
+  seedExpected,
+} from "./check_expected"
+import {
+  boundMembersOf,
+  cohRecord,
+  collapseDeferredJoin,
+  constrainEmptyExpr,
+  rcwCovs,
+} from "./check_fit_rules"
+import {
+  CSTR_NODECL,
+  argIsOwnGenericFnValue,
+  lambdaLastOrder,
+} from "./check_generic_args"
+import {
+  bitcastArgTy,
+  builtinShadowMsg,
+  getterBoundNote,
+  getterFnFor,
+} from "./check_getter_effects"
+import { arrDefCallTy, holeCastParamName } from "./check_hole_links"
+import { HD_PARAM, HD_RET, tyIsNonNullHoleRead } from "./check_hole_pins"
+import {
+  arrayDemandKey,
+  holeIsArrayWriteDemanded,
+  noteArrayDemand,
+  rowIsArrayDemanded,
+} from "./check_hole_rows"
+import { inferRetTyOf, tpIfMarkOk } from "./check_if_value"
+import { inferStack, onInferStack } from "./check_infer_rows"
+import {
+  floatIntrArity,
+  intIntrArity,
+  intIntrIsCompare,
+  memOffsetBaseArity,
+  nameIsSimdIntrinsic,
+} from "./check_intrinsics"
+import {
+  ACF_COMP,
+  ACF_PLAIN,
+  ACF_TPL,
+  NO_DST_NAMES,
+  OP_CALL_GUARDED_PIN,
+  OP_CALL_PIN,
+  SUBST_DECLARED,
+  argIsLitAggregate,
+  bitcastRetTy,
+  holeArgOrigins,
+  intIntrWidth,
+  intMinMaxOperands,
+  minMaxHoleOperand,
+  namesAllHoles,
+  noteEscJoin,
+  noteOptCallRet,
+  omGuardSet,
+  omGuardTyAt,
+  omRecvTy,
+  printUnionRefusal,
+  restRequiredArity,
+  retOfFuncTy,
+  voidSlotExemptExpr,
+  withUnionArmBinds,
+} from "./check_leaf_steps"
+import { checkMemberCallNode } from "./check_member_call"
+import { callTyArgsCalleeOk } from "./check_narrow_flow"
+import { noteHoleArgNullRead } from "./check_narrow_paths"
+import { njFnReached } from "./check_nj_gate"
+import { njFnIx } from "./check_nj_join"
+import {
+  checkBoundSubsumes,
+  checkRetTyParamBound,
+  checkSimdLaneArg,
+  checkUnimplementedIntrinsicCall,
+  fsbArgTysOf,
+  voidValueSlotErr,
+} from "./check_node_rules"
+import { nodeTyOf } from "./check_node_tys"
+import { lbiNoDest } from "./check_num_lit_state"
+import { floatIntrWidth } from "./check_num_lits"
+import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
+import { getSiteFnOf, placeKeyOf } from "./check_places"
+import { rcwKey } from "./check_record_writes"
+import {
+  argMismatchErr,
+  assignable,
+  bindExplicitTyArgs,
+  bindGenUnionArm,
+  bindGenWalk,
+  substTyDeep,
+  tErr,
+  tErrUnsupported,
+} from "./check_relate_core"
+import { valueUnionRetName } from "./check_ret_names"
+import {
+  calleeDeclParams,
+  lookup,
+  lookupDepth,
+  lookupFnAliasNode,
+  lookupFnDeclNode,
+  numIntrShadowed,
+} from "./check_scopes"
+import {
+  identNoteUse,
+  noteDeferredJoinNode,
+  widenRetagGenArg,
+  widenRetagGenArgSet,
+} from "./check_side_rows"
+import {
+  SUBST_ALL,
+  SUBST_HOLES,
+  SUBST_NESTED,
+  argPinPark,
+  nestParentOf,
+  substNestDecl,
+  substNestDeclSet,
+  substNestMode,
+  substNestModeSet,
+} from "./check_subst"
+import {
+  keptParamUnion,
+  tpGradualView,
+  tpIfFn,
+  tpIfReFn,
+  tyIsDeferredJoin,
+} from "./check_tp_join"
+import { unionRidesI32Spine } from "./check_ty_rep"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_F64,
+  TY_I32,
+  TY_NEVER,
+  TY_STR,
+  TY_U8,
+  TY_VOID,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  TyVar,
+  mkArrayTy,
+  mkMapTy,
+  mkNullableTy,
+  objFieldType,
+  tyArrayElemIx,
+  tyHasHole,
+  tyIsFuncArena,
+  tyIsHole,
+  tyIxIsView,
+  tyPrintsAsRef,
+  tyRefusesArrayDemand,
+  tyToStr,
+  tyWideUnionMinted,
+} from "./check_types"
+import {
+  argLitAt,
+  wsNoteInstErr,
+  wsNotePending,
+  wsSuppress,
+} from "./check_width"
+import { peelParenIx } from "./check_write_effects"
+import { fnDeclIx } from "./check_write_scan"
+import { strListHas } from "./listutil"
+import {
+  isVoidTy,
+  nonNullTy,
+  tyHasTyVar,
+  tyIsU8ArrayTy,
+  tyReachesHole,
+  tysHoldVar,
+} from "./tyquery"
+
+// True, having reported, when a rest parameter's element is an unbound HOLE and the packed
+// list's element joined to a union that BOXES. `T` would pin to that union and the instance
+// the monomorphizer mints for it misbuilds — check-clean invalid wasm, the worst outcome
+// there is — so it is refused at the pin, naming the concrete spelling that runs (D1851).
+function restHoleUnionErr(pTy: i32, packIx: i32, ix: i32): boolean {
+  const pe = tyArrayElemIx(pTy)
+  if pe < 0 || pe >= T.tys.length { return false }
+  const pt = T.tys[pe]
+  if pt is TyVar {
+    const at = tyArrayElemIx(checkNodeHook(packIx))
+    if at < 0 || at >= T.tys.length { return false }
+    const a = T.tys[at]
+    if a is TyUnion {
+      if unionRidesI32Spine(at) { return false }
+      tErr(
+        "a rest parameter's element is inferred from the arguments, and these join to "
+          + tyToStr(at)
+          + " — a boxed union a type parameter cannot be pinned to. Spell the element out, "
+          + "`...xs: ("
+          + tyToStr(at)
+          + ")[]`, or pass one element type",
+        ix,
+      )
+      return true
+    }
+  }
+  false
+}
+
+// —— the witness: satisfaction is the existing call resolution ————————————————
+// `x.m(a)` under a bound resolves by the same order every method call uses — a field of the
+// receiver first, then a free `self`-function in scope. Returns a stable string naming which
+// won (`"field"`, the mangled `self`-function name, or `""`) — the coherence key's value and the words the disagreement diagnostic prints (resolved in the instantiation site's own module scope, D1191).
+function witnessOf(memberName: string, wantTy: i32, concTy: i32, ix: i32) {
+  if concTy < 0 || wantTy < 0 { return "" }
+  const ct = T.tys[concTy]
+  if ct is TyObj {
+    const ft = objFieldType(ct, memberName)
+    if ft >= 0 {
+      if assignable(ft, wantTy) { return "field" }
+      return ""
+    }
+  }
+  const mangled = ufcsAliasInScope(ix, memberName)
+  const fnTy = lookup(mangled)
+  if fnTy < 0 { return "" }
+  const ft2 = T.tys[fnTy]
+  if ft2 is TyFunc {
+    const wt = T.tys[wantTy]
+    if wt is TyFunc {
+      // The receiver occupies slot 0 and the bound's arguments fill the rest —
+      // the arity `ufcsCallTy` enforces, asked here of a type rather than of a
+      // node so it can be asked before any call exists.
+      if ft2.fnParamTypes.length != wt.fnParamTypes.length + 1 { return "" }
+      if !assignable(concTy, ft2.fnParamTypes[0]) { return "" }
+      let i = 0
+      while i < wt.fnParamTypes.length {
+        if !assignable(wt.fnParamTypes[i], ft2.fnParamTypes[i + 1]) {
+          return ""
+        }
+        i = i + 1
+      }
+      // A callee whose return is still pending (-2) has not been inferred yet; force it,
+      // exactly as `ufcsCallTy` does, so an un-annotated std export's real type is known here rather than guessed.
+      let retTy = ft2.fnRet
+      if retTy == (-2) {
+        if !onInferStack(mangled) {
+          const dIx = fnDeclIx[mangled] ?? -1
+          if dIx >= 0 {
+            checkNodeHook(dIx)
+            const re = T.tys[lookup(mangled)]
+            if re is TyFunc { retTy = re.fnRet }
+          }
+        }
+      }
+      if !assignable(retTy, wt.fnRet) { return "" }
+      return mangled
+    }
+  }
+  ""
+}
+
+// The instantiation-site check: for each bounded type parameter the call actually bound,
+// resolves every bound member against the concrete type in this site's scope and refuses
+// what nothing satisfies. The bound's own member types resolve with the parameter bound to
+// the concrete type, which is what makes `{ eq(T): boolean }` mean "eq takes another one of me" at each instantiation with no self-type machinery.
+function checkBoundsAtCall(
+  who: string,
+  declIx: i32,
+  bNames: string[],
+  bTys: i32[],
+  ix: i32,
+) {
+  if declIx < 0 { return 0 }
+  if !fnHasTpBound(declIx) { return 0 }
+  const dn = P.nodes[declIx]
+  if !(dn is FuncDecl) { return 0 }
+  let k = 0
+  while k < dn.fnTyParams.length {
+    const bAnn = fnTpBoundOf(declIx, k)
+    if bAnn >= 0 {
+      const tpName = dn.fnTyParams[k]
+      let conc = -1
+      let bi = 0
+      while bi < bNames.length {
+        if bNames[bi] == tpName { conc = bTys[bi] }
+        bi = bi + 1
+      }
+      // Chaining through another generic's own type parameter has no instantiation type to
+      // resolve a witness against, so it is decided by subsumption instead — statically,
+      // which lands the error on the declaration that is wrong rather than a distant caller.
+      // Bounds are free at emit once substitution has run; the check is what needs this, since a bounded generic relayed through an unbounded one has no pin left to ask (`vl check`-clean and invalid).
+      if conc >= 0 {
+        const ct0 = T.tys[conc]
+        if ct0 is TyVar {
+          if ct0.tvName.length > 0 {
+            if ct0.tvName[0] != '?' {
+              checkBoundSubsumes(ct0.tvName, tpName, bAnn, who, ix)
+              k = k + 1
+              continue
+            }
+          }
+        }
+      }
+      if conc >= 0 && !tyHasHole(conc) {
+        const root = boundObjRootOf(bAnn)
+        if root < 0 {
+          tErr(
+            "`"
+              + boundText(bAnn)
+              + "` is not a bound — a bound is a type with method members (`type "
+              + boundText(bAnn)
+              + " = { m(): R }`) or an inline `{ m(): R }`",
+            ix,
+          )
+        } else {
+          // Bind the parameter to the CONCRETE type while the bound's member
+          // types resolve, so a self-referential member means what it says here.
+          tpEnvNames.push(tpName)
+          tpEnvTys.push(conc)
+          const bn: string[] = []
+          const bt: i32[] = []
+          const bm: boolean[] = []
+          boundMembersOf(root, bn, bt, bm)
+          tpEnvNames.pop()
+          tpEnvTys.pop()
+          const tyKey = tyToStr(conc)
+          const bCovs: string[] = []
+          let m = 0
+          while m < bn.length {
+            let wit = ""
+            // An unresolved member type is the alias-self-reference case, reported at the
+            // declaration (the body's own use raised it) rather than adding a second voice here.
+            if bt[m] < 0 {
+              m = m + 1
+              continue
+            }
+            if bm[m] {
+              wit = witnessOf(bn[m], bt[m], conc, ix)
+            } else {
+              // A COLON member is a layout demand and stays one: the value must
+              // carry the field, which is ordinary structural assignability.
+              const ct = T.tys[conc]
+              if ct is TyObj {
+                const ft = objFieldType(ct, bn[m])
+                if ft >= 0 {
+                  if assignable(ft, bt[m]) {
+                    wit = "field"
+                    rcwCovs(ft, bt[m], "." + bn[m], bCovs, 0)
+                  }
+                }
+              }
+            }
+            const gBound = getterFnFor(conc, bn[m])
+            if wit == "" && gBound != "" {
+              tErr(
+                tyKey
+                  + " does not satisfy `"
+                  + boundText(bAnn)
+                  + "`: "
+                  + getterBoundNote(gBound, bm[m]),
+                ix,
+              )
+            } else if wit == "" && !bm[m] {
+              tErr(
+                tyKey
+                  + " does not satisfy `"
+                  + boundText(bAnn)
+                  + "`: no field `"
+                  + bn[m]
+                  + ": "
+                  + tyToStr(bt[m])
+                  + "` — a field bound is satisfied only by a stored field; to accept a `"
+                  + bn[m]
+                  + "(self: "
+                  + tyKey
+                  + ")` function, bound on `{ "
+                  + bn[m]
+                  + "(): "
+                  + tyToStr(bt[m])
+                  + " }`",
+                ix,
+              )
+            } else if wit == "" {
+              let what = bn[m]
+              if bm[m] { what = bn[m] + "(): " + tyToStr(retOfFuncTy(bt[m])) }
+              tErr(
+                tyKey
+                  + " does not satisfy `"
+                  + boundText(bAnn)
+                  + "`: no `"
+                  + what
+                  + "` — the bound needs a field of that type or a `"
+                  + bn[m]
+                  + "(self: "
+                  + tyKey
+                  + ", …)` function in scope at this call",
+                ix,
+              )
+            } else {
+              cohRecord(who, tyKey, bn[m], wit, ix)
+            }
+            m = m + 1
+          }
+          // D2060 — a colon member wider than the argument's field is the covariant delivery
+          // of a record, and the body writes through the bound's type.
+          if bCovs.length > 0 && !inferQuiet {
+            rcwBdDecl.push(declIx)
+            rcwBdTp.push(tpName)
+            rcwBdConc.push(conc)
+            rcwBdCovs.push(rcwKey(bCovs))
+            rcwBdCall.push(ix)
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Type the bitcast call `name(arg)`, or -1 when `name` is not a bitcast. Arity and the
+// argument type are checked here; `assignableExpr` (not bare `assignable`) so a float
+// LITERAL argument re-encodes into an `f32` parameter, matching every other f32 position.
+function bitcastCallTy(name: string, n: Call, ix: i32) {
+  const want = bitcastArgTy(name)
+  if want < 0 { return -1 }
+  const args = n.callArgs
+  if args.length != 1 {
+    tErr(name + " expects 1 argument, got " + i32ToStr(args.length), ix)
+  } else {
+    const got = checkNodeHook(args[0])
+    if !assignableExpr(args[0], got, want) {
+      tErr(name + " expects " + tyToStr(want) + ", got " + tyToStr(got), ix)
+    }
+  }
+  bitcastRetTy(name)
+}
+
+// Type the float / integer intrinsic call `name(args…)`, or -1 when `name` is not one.
+// The operand width is decided from the arguments and every argument is then checked
+// against it, so a mixed call reports the width it actually computes at.
+function numIntrCallTy(name: string, n: Call, ix: i32) {
+  const isFloat = floatIntrArity(name) > 0
+  let arity = intIntrArity(name)
+  if isFloat { arity = floatIntrArity(name) }
+  if arity == 0 { return -1 }
+  const args = n.callArgs
+  if args.length != arity {
+    let want = i32ToStr(arity) + " arguments"
+    if arity == 1 { want = "1 argument" }
+    tErr(name + " expects " + want + ", got " + i32ToStr(args.length), ix)
+    // Still yield a type so the call site does not cascade: the width is unknowable
+    // from a wrong-arity call, so take the family's default.
+    if isFloat { return TY_F64 }
+    if intIntrIsCompare(name) { return TY_BOOL }
+    return TY_I32
+  }
+  const argTys: i32[] = []
+  let i = 0
+  while i < args.length {
+    argTys.push(checkNodeHook(args[i]))
+    i = i + 1
+  }
+  const holeTy = minMaxHoleOperand(name, argTys)
+  if holeTy >= 0 {
+    noteBinCstr(argTys[0], name, argTys[argTys.length - 1])
+    return holeTy
+  }
+  let width = intIntrWidth(argTys)
+  if isFloat && !intMinMaxOperands(name, argTys) {
+    width = floatIntrWidth(args, argTys)
+  }
+  // An operand is no delivery: `ltU(a, b)` computes at the width `a` and `b` give it.
+  const savedNoDest = lbiNoDest
+  lbiNoDest = true
+  let j = 0
+  while j < args.length {
+    if !assignableExpr(args[j], argTys[j], width) {
+      tErr(
+        name + " expects " + tyToStr(width) + ", got " + tyToStr(argTys[j]),
+        ix,
+      )
+    }
+    j = j + 1
+  }
+  lbiNoDest = savedNoDest
+  if !isFloat {
+    if intIntrIsCompare(name) { return TY_BOOL }
+  }
+  width
+}
+
+// A memory intrinsic called with one argument more than it declares: the offset form, whose
+// second argument is the memarg offset. Checks the offset (`memOffsetArgCheck`) and every other
+// argument against the declared parameter it stands for; answers the call's type, or -1 when
+// the call is not this form (a shadowed name, a named argument, any other arity).
+function checkMemOffsetCall(n: Call, cfn: Ident): i32 {
+  const nm = cfn.identName
+  const base = memOffsetBaseArity(nm)
+  if base < 0 || n.callArgs.length != base + 1 { return -1 }
+  if hasNamedArgs(n.callArgNames) { return -1 }
+  if (fnDeclIx[nm] ?? -1) >= 0 || lookupDepth(nm) != 0 { return -1 }
+  const ft = T.tys[checkNodeHook(n.callFn)]
+  if ft is TyFunc {
+    const ps = ft.fnParamTypes
+    if ps.length != base { return -1 }
+    memOffsetArgCheck(nm, n.callArgs[1])
+    let k = 0
+    while k < base {
+      let pos = k
+      if k >= 1 { pos = k + 1 }
+      const a = n.callArgs[pos]
+      seedExpected(a, ps[k])
+      const at = checkNodeHook(a)
+      if !assignableExpr(a, at, ps[k]) { argMismatchErr(pos + 1, ps[k], at, a) }
+      k = k + 1
+    }
+    return ft.fnRet
+  }
+  -1
+}
+
+// Reports unless the offset argument at `argIx` is a compile-time integer in
+// `0..MEM_OFFSET_MAX`: a literal, a top-level `const` bound to one that no nearer binding
+// shadows, or a sum of those.
+function memOffsetArgCheck(nm: string, argIx: i32) {
+  checkNodeHook(argIx)
+  if memOffsetCheckedValue(argIx) >= 0 { return 0 }
+  tErr(
+    nm
+      + " takes its offset (argument 2) as a compile-time integer in 0..4294967295 — a literal, a top-level `const` bound to one, or a sum of those — since it is the instruction's memarg immediate, not a runtime operand",
+    argIx,
+  )
+  0
+}
+
+// Calls to a compiler builtin named by the callee identifier — `print`, `Map`/`Set`, the
+// codepoint constructors and the `__array_*` / bitcast / numeric intrinsics. None has a
+// declaration to check against, so arity and argument types are checked here. Returns the
+// call type, or `-1` when the name is none of them and the caller checks it as a value.
+function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
+  // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
+  // single value of any printable type and yields void. Special-cased so a program
+  // that prints does not trip "undeclared identifier 'print'". Each argument is
+  // still checked so a type error inside it surfaces.
+  if cfn.identName == "print" {
+    const pargs = n.callArgs
+    if pargs.length != 1 {
+      tErr("print expects 1 argument, got " + i32ToStr(pargs.length), ix)
+    }
+    let pj = 0
+    while pj < pargs.length {
+      const pt = checkNodeHook(pargs[pj])
+      // `print` demands a value to render, and a `void` call has none — the emitter's
+      // print ladder ends in `call __print_i32__` with nothing on the stack.
+      voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
+      // A domain rejection, asked first (the ruling): `print` takes one value of
+      // `printDomainStr()`'s reps, and an array/struct/map/function value (bare, behind
+      // `| null`, or inside a union) is not one — an ordinary domain error (`tErr`, no
+      // code), not a capability admission, since the language never defined what such a print outputs (D711).
+      if tyPrintsAsRef(pt, 24) {
+        tErr(printRefRefusal(pt), pargs[pj])
+      } else {
+        // The BOXED value-union residue. `print(<i32 | string>)` now LOWERS — every arm
+        // is inside the domain and the emitter dispatches on the box tag, the same
+        // dispatch it performs for `is` (D712) — so what is left here is a box whose
+        // arms that dispatch cannot classify, and only that keeps the concession.
+        const puMsg = printUnionRefusal(pt)
+        if puMsg != "" { tErrUnsupported(puMsg, pargs[pj]) }
+      }
+      // A printed type that still carries a HOLE answers FALSE to both floors above — it
+      // is neither a ref nor a box YET — so the two of them together admit every generic
+      // `print`. Defer it to the pin, the only position that knows the instance.
+      // (`silent-class-inventory` D401; the recorder's header has the measurement.)
+      notePrintCstr(pt, pargs[pj])
+      pj = pj + 1
+    }
+    return TY_VOID
+  }
+  // `Map()` / `Set()` construct an empty string-keyed map: key/value HOLES (-1)
+  // assignable to any map annotation (`const m: {[string]: i32} = Map()`).
+  if cfn.identName == "Map" || cfn.identName == "Set" {
+    if n.callArgs.length != 0 {
+      tErr(cfn.identName + " expects no arguments", ix)
+    }
+    if callHasTyArgs(ix) { return collCtorTyArgsTy(cfn.identName, ix) }
+    if cfn.identName == "Set" {
+      // A set's VALUE type is the membership boolean; the element (key) is a
+      // hole pinned by the annotation or the first `.add`.
+      return mkMapTy(-1, TY_BOOL, 1)
+    }
+    return mkMapTy(-1, -1, 0)
+  }
+  // `toString(x)` resolves through the ordinary scope as `std:fmt`'s export now, and an
+  // un-imported use gets the migration hint `undeclaredIdentMsg` appends.
+  // `fromCodePoints(xs)` is a builtin: an `i32[]` of code points to a string, in one bulk
+  // copy (the amortized alternative to per-char concat).
+  if cfn.identName == "fromCodePoints" {
+    const pargs = n.callArgs
+    if pargs.length != 1 {
+      tErr(
+        "fromCodePoints expects 1 argument, got " + i32ToStr(pargs.length),
+        ix,
+      )
+    } else {
+      const p0 = checkNodeHook(pargs[0])
+      const p0t = T.tys[p0]
+      let pOk = false
+      if p0t is TyArray {
+        // An empty `[]` literal's element hole (-1) pins to i32 here.
+        if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
+      }
+      if p0t is TyErr { pOk = true }
+      if !pOk {
+        tErr("fromCodePoints expects an i32[], got " + tyToStr(p0), ix)
+      }
+    }
+    return TY_STR
+  }
+  // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
+  if cfn.identName == "fromCodePoint" {
+    const fargs = n.callArgs
+    if fargs.length != 1 {
+      tErr(
+        "fromCodePoint expects 1 argument, got " + i32ToStr(fargs.length),
+        ix,
+      )
+    } else {
+      const f0 = checkNodeHook(fargs[0])
+      if !assignable(f0, TY_I32) {
+        tErr("fromCodePoint expects an i32, got " + tyToStr(f0), ix)
+      }
+    }
+    return TY_STR
+  }
+  // `__str_from_bytes__(src, at, count)` (D4784): the bytes `src[at .. at + count]` as a fresh
+  // string; the caller guarantees UTF-8. A builtin, not a declaration, so a call is no opaque
+  // function value to the narrowing rule (`callDeclFnIx`).
+  if cfn.identName == "__str_from_bytes__" {
+    const sbArgs = n.callArgs
+    if sbArgs.length != 3 {
+      tErr(
+        "__str_from_bytes__ expects 3 arguments, got " + i32ToStr(sbArgs.length),
+        ix,
+      )
+      return TY_STR
+    }
+    const sbSrc = checkNodeHook(sbArgs[0])
+    if !assignable(sbSrc, mkArrayTy(TY_U8)) {
+      tErr(
+        "__str_from_bytes__ expects a u8[] source, got " + tyToStr(sbSrc),
+        ix,
+      )
+    }
+    let sbI = 1
+    while sbI < 3 {
+      const sbT = checkNodeHook(sbArgs[sbI])
+      if !assignable(sbT, TY_I32) {
+        tErr("__str_from_bytes__ expects an i32 bound, got " + tyToStr(sbT), ix)
+      }
+      sbI = sbI + 1
+    }
+    return TY_STR
+  }
+  // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
+  // host parity: `defaultScope.ts`. `__array_new__(n, fill)` allocates `n`
+  // slots each set to `fill`, typing as `T[]` with `T` = the fill's type.
+  if cfn.identName == "__array_new__" {
+    const anArgs = n.callArgs
+    if anArgs.length != 2 {
+      tErr(
+        "__array_new__ expects 2 arguments, got " + i32ToStr(anArgs.length),
+        ix,
+      )
+      return mkArrayTy(-1)
+    }
+    const anLen = checkNodeHook(anArgs[0])
+    if !assignable(anLen, TY_I32) {
+      tErr("__array_new__ expects an i32 length, got " + tyToStr(anLen), ix)
+    }
+    return mkArrayTy(checkNodeHook(anArgs[1]))
+  }
+  // `__array_new_default__(n)`: `n` zeroed/default slots. The element type is a hole (-1)
+  // pinned by the destination — the empty-`[]` mechanism — and the emitter reads the same
+  // pinned row back off this node (`arrNewDefaultKind`), so the two cannot disagree about
+  // the rep. Two questions this arm cannot answer yet are recorded here and asked late (`arrDefCallIx`).
+  if cfn.identName == "__array_new_default__" {
+    const adArgs = n.callArgs
+    if adArgs.length != 1 {
+      tErr(
+        "__array_new_default__ expects 1 argument, got " + i32ToStr(adArgs.length),
+        ix,
+      )
+    } else {
+      const adLen = checkNodeHook(adArgs[0])
+      if !assignable(adLen, TY_I32) {
+        tErr(
+          "__array_new_default__ expects an i32 length, got " + tyToStr(adLen),
+          ix,
+        )
+      }
+    }
+    const adTy = mkArrayTy(-1)
+    arrDefCallIx.push(ix)
+    arrDefCallTy.push(adTy)
+    return adTy
+  }
+  // `__array_copy__(dst, dstAt, src, srcAt, count)`: bulk-moves `count` elements from
+  // `src[srcAt..]` into `dst[dstAt..]`; void. Both must be arrays; the element correlation
+  // between them is deliberately not enforced here, matching the host's own leniency (a
+  // mismatched pair fails loudly at the emit stage in both compilers).
+  if cfn.identName == "__array_copy__" {
+    const acArgs = n.callArgs
+    if acArgs.length != 5 {
+      tErr(
+        "__array_copy__ expects 5 arguments, got " + i32ToStr(acArgs.length),
+        ix,
+      )
+      return TY_VOID
+    }
+    let acI = 0
+    while acI < 5 {
+      const acT = checkNodeHook(acArgs[acI])
+      if acI == 0 || acI == 2 {
+        const acTy = T.tys[acT]
+        let acOk = false
+        if acTy is TyArray { acOk = true }
+        if acTy is TyErr { acOk = true }
+        if !acOk {
+          tErr("__array_copy__ expects a T[], got " + tyToStr(acT), ix)
+        }
+      } else {
+        if !assignable(acT, TY_I32) {
+          tErr("__array_copy__ expects an i32, got " + tyToStr(acT), ix)
+        }
+      }
+      acI = acI + 1
+    }
+    return TY_VOID
+  }
+  // `__trap__()`: the deliberate abort primitive — lowered to `unreachable`.
+  // `__trap__("reason")`: an OPTIONAL single string message, printed to the
+  // host boundary (the print-of-string path) before the abort — so the trap
+  // carries a human-readable reason. Either form still "never returns".
+  if cfn.identName == "__trap__" {
+    if n.callArgs.length > 1 {
+      tErr("__trap__ takes an optional string message", ix)
+    } else if n.callArgs.length == 1 {
+      const trapMsgTy = checkNodeHook(n.callArgs[0])
+      if !assignable(trapMsgTy, TY_STR) {
+        tErr(
+          "__trap__ takes an optional string message, got " + tyToStr(trapMsgTy),
+          ix,
+        )
+      }
+    }
+    return TY_NEVER
+  }
+  // The numeric-opcode intrinsics: each lowers to exactly one wasm instruction, so
+  // the checker only has to type them. A user binding of the same name shadows the
+  // intrinsic (`numIntrShadowed`), and the emitter gates on the same rule — the
+  // intrinsic arm is a fallback for a name the program did not define itself.
+  if !numIntrShadowed(cfn.identName) {
+    const bcTy = bitcastCallTy(cfn.identName, n, ix)
+    if bcTy >= 0 { return bcTy }
+    const niTy = numIntrCallTy(cfn.identName, n, ix)
+    if niTy >= 0 { return niTy }
+  }
+  -1
+}
+
+// The ordinary call: the callee evaluates to a function type, so the arguments are checked
+// against its parameter list — named arguments reordered, an omitted trailing one filled
+// from the declaration default, and type-parameter bindings solved from the argument types.
+// Always answers; the caller's remaining arms cover an error or still-unsolved callee.
+function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
+  let args = n.callArgs
+  // PENDING return (-2): the un-annotated callee hasn't been inferred yet (a
+  // forward call). Demand-infer it now — check its FuncDecl, which patches this
+  // very TyFunc in place — unless it is already on the in-progress stack (an
+  // in-cycle call: contribute TY_ERR so the cycle can be detected at the root).
+  if ft.fnRet == -2 {
+    if cfn is Ident {
+      if !onInferStack(cfn.identName) {
+        const dIx = fnDeclIx[cfn.identName] ?? -1
+        if dIx >= 0 { checkNodeHook(dIx) }
+      }
+    }
+  }
+  let retTy = ft.fnRet
+  if retTy == -2 {
+    retTy = TY_ERR
+    // A direct self-recursive call resolves to the function's own provisional inferred
+    // type (`inferObserved`, already holding the base case since it is checked first) —
+    // without this, `TY_ERR` makes `assignable(TY_ERR, string)` vacuously true and a `+`
+    // over the recursive call pollutes the inferred return. Mutual recursion keeps `TY_ERR` for the fixpoint to settle.
+    if cfn is Ident {
+      if inferStack.length > 0 {
+        if inferStack[inferStack.length - 1] == cfn.identName {
+          if inferObserved >= 0 { retTy = inferObserved }
+        }
+      }
+    }
+  }
+  const params = ft.fnParamTypes
+  // Defaults are direct-call-site sugar: a call naming a declared function may omit
+  // trailing arguments whose parameters carry a default, so the accepted arity is the
+  // range [`fnRequiredArity`, `params.length`]. A call through a function value has no
+  // declaration to read defaults from and keeps its exact-arity gate.
+  const dParams = calleeDeclParams(n.callFn)
+  // A rest parameter is the one thing that makes the accepted arity unbounded above, and the
+  // pack below is what puts it back: after it the argument list is index-parallel with the
+  // parameter list again, which is the invariant everything from here down is written around.
+  let restIx = -1
+  if dParams.length == params.length { restIx = restParamIndex(dParams) }
+  if restIx >= 0 {
+    if !callIsRestPacked(ix) {
+      const lo = restRequiredArity(dParams, restIx)
+      if args.length < lo {
+        tErr(
+          "wrong number of arguments: expected at least "
+            + i32ToStr(lo)
+            + ", got "
+            + i32ToStr(args.length),
+          ix,
+        )
+        return retTy
+      }
+      if !restCallPack(n, ix, restIx) { return retTy }
+    }
+    args = n.callArgs
+    // Written type arguments already say what the element is, which is the refusal's remedy.
+    if restIx < args.length && !callHasTyArgs(ix) {
+      if restHoleUnionErr(params[restIx], args[restIx], ix) { return retTy }
+    }
+  } else if hasSpreadItem(args) {
+    tErr(spreadNoRestMsg(calleeIdentName(cfn)), ix)
+    return retTy
+  }
+  let required = params.length
+  if dParams.length == params.length { required = fnRequiredArity(dParams) }
+  if args.length < required || args.length > params.length {
+    tErr(
+      "wrong number of arguments: expected "
+        + arityWantText(required, params.length)
+        + ", got "
+        + i32ToStr(args.length)
+        + tyArgReadHintIfAny(args)
+        + ovPlainHint(ix),
+      ix,
+    )
+    return retTy
+  }
+  // Named arguments bind to parameters by name, then positionally — source order is
+  // irrelevant for named args. `TyFunc` carries no parameter names, so the names resolve
+  // against the declaration the scope chain gives this callee; a closure-valued binding has
+  // none and cannot take named arguments, whatever a same-named declaration says (D1604).
+  if hasNamedArgs(n.callArgNames) {
+    const cNames = paramNamesOfNodes(dParams)
+    if cNames.length != params.length {
+      tErr(
+        "named arguments work only on declared functions, not on a function value",
+        ix,
+      )
+      return retTy
+    }
+    args = orderNamedCallArgs(cNames, args, n.callArgNames, ix, dParams)
+    if args.length != params.length { return retTy }
+  } else if args.length < params.length {
+    // Trailing positional omission: check the defaults against their
+    // parameters alongside the supplied arguments, so one loop below covers
+    // the whole parameter list. (`args` is rebound to a COPY — `n.callArgs`
+    // stays the source list; the emit-side normalization is `emit_rewrite`'s.)
+    const padded: i32[] = []
+    let pj = 0
+    while pj < params.length {
+      if pj < args.length { padded.push(args[pj]) } else { padded.push(-1) }
+      pj = pj + 1
+    }
+    if fillArgDefaults(padded, dParams, ix) >= 0 { return retTy }
+    args = padded
+  }
+  // Generic call-site inference: a `TyVar` param (or `T[]`) binds its type-param to
+  // the argument's type (first use wins; later uses must agree), and the return
+  // type substitutes through the binding — so `id("s")` is `string`, and
+  // `let n: i32 = id("s")` is a genuine type error downstream.
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  const uNames: string[] = []
+  const uTys: i32[] = []
+  // Explicit type arguments bind first, so every argument is checked against them.
+  const explicitTa = callHasTyArgs(ix)
+  if explicitTa {
+    if !bindExplicitTyArgs(cfn, ix, bNames, bTys) { return TY_ERR }
+  }
+  let dstNames = NO_DST_NAMES
+  if !explicitTa && callDstTyOf(ix) >= 0 {
+    dstNames = []
+    dstBindLitTyParams(ix, ft.fnRet, params, args, bNames, bTys, dstNames)
+  }
+  const argOrder = lambdaLastOrder(params, args)
+  // Each argument's destination as its own turn saw it, for the literals re-delivered below.
+  const argExp: i32[] = []
+  while argExp.length < args.length { argExp.push(-1) }
+  let oi = 0
+  while oi < argOrder.length {
+    const i = argOrder[oi]
+    // Contextual param inference for a function-value argument: propagates the expected
+    // param type into it so an un-annotated literal param infers from the signature
+    // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
+    // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
+    seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
+    if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
+    const at = checkNodeHook(args[i])
+    // A template hole meeting its injected renderer. This line is the first
+    // moment the hole's type exists, which is why the type-directed half of
+    // the template lowering lives here and not in the parser's desugar.
+    if nodeIsTplHole(args[i]) {
+      if tplHoleHandled(ix, n.pos, args[i], at, params[i]) { return TY_STR }
+    }
+    // A void argument would bind a type parameter to `void`, which no instance can carry; a
+    // concrete parameter already refuses it through `assignable`, with its own message.
+    if tyHasTyVar(params[i]) || tyIsHole(params[i]) {
+      if isVoidTy(at) && !voidSlotExemptExpr(args[i]) {
+        tErr(
+          "argument " + i32ToStr(i + 1) + " expects a value, got void",
+          args[i],
+        )
+        return TY_ERR
+      }
+    }
+    // Bind every TyVar reachable in the expected param position from the
+    // argument's shape (first use wins), then check the argument against the
+    // SUBSTITUTED expected type — a later disagreeing use errors here.
+    bindGenWalk(params[i], at, bNames, bTys)
+    bindGenUnionArm(params[i], at, uNames, uTys)
+    const expected = substTyDeep(params[i], bNames, bTys)
+    argExp[i] = expected
+    // A `u8[]` argument meeting a generic parameter: `bindGenWalk` above declined to bind
+    // `T` to storage type `u8`, so `expected` still carries the unsolved hole and
+    // `assignable` answers true vacuously — needing its own message here, or the
+    // monomorphizer builds i32-list machinery over a one-byte backing. `u8[]` is not an instantiation of `T[]`, since `T` ranges over value types and `u8` is storage.
+    if !inferQuiet {
+      if tyIsU8ArrayTy(at) && tyReachesHole(expected, 8) {
+        tErr(
+          "`u8[]` cannot be passed to a generic parameter — `u8` is a storage type, so a type parameter never binds it and a `u8[]` is not a `T[]`",
+          args[i],
+        )
+      }
+    }
+    // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
+    // recorded here and re-validated at the generic call site that pins it under the
+    // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
+    // type-checks `f("s")` clean and dies at wasm validation. Recorded on the argument's uncollapsed type, since a join's collapsed arm can later prove unreachable.
+    let atCstr = inferRetTyOf(args[i], at)
+    if coalDefHole.length > 0 { atCstr = coalPinTy(args[i], atCstr) }
+    if (
+      tyIsHole(atCstr)
+      || tyIsDeferredJoin(atCstr)
+      || (atCstr >= 0
+        && atCstr < T.tys.length
+        && T.tys[atCstr] is TyUnion
+        && tpGradualView(atCstr) != atCstr)
+    ) {
+      if !tyIsHole(expected) {
+        let ccWho = ""
+        if cfn is Ident { ccWho = cfn.identName }
+        let acForm = ACF_PLAIN
+        if nodeIsTplHole(args[i]) { acForm = ACF_TPL }
+        noteArgCstr(atCstr, expected, ccWho, acForm, -1)
+      }
+    } else if compArgCstrOk(atCstr, expected) {
+      let cpWho = ""
+      if cfn is Ident { cpWho = cfn.identName }
+      noteArgCstr(atCstr, expected, cpWho, ACF_COMP, args[i])
+    }
+    // A hole param whose body DEMANDED fields (member access on the hole)
+    // checks the argument against the demanded shape, so `getx(5)` rejects
+    // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
+    const pHole = T.tys[params[i]]
+    if pHole is TyVar {
+      noteHoleArgNullRead(pHole.tvName, at, args[i])
+      if !holeDemandOk(pHole.tvName, args[i], at) {
+        holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
+      }
+      // A hole the body INDEXED (`self[i]`) demands an array — a scalar argument can't be
+      // indexed, so reject it here (`head(5)`) instead of deferring to an emit failure.
+      if rowIsArrayDemanded(params[i]) {
+        if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+        // An enclosing type parameter passed in takes the demand to its own pin.
+        if at >= 0 && T.tys[at] is TyVar { noteArrayDemand(arrayDemandKey(at)) }
+      }
+      if holeIsArrayWriteDemanded(calleeIdentName(cfn), pHole.tvName) {
+        if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
+      }
+      // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+      holeCastPinCheck(
+        pHole.tvName,
+        at,
+        holeCastParamName(n.callFn, dParams, i, pHole.tvName),
+      )
+    }
+    // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
+    // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
+    // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
+    if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
+    // Passing an empty-collection argument into a concrete `T[]` / map param pins
+    // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
+    // clearing its uninferred floor — pure downstream-usage inference, no push.
+    constrainEmptyExpr(args[i], at, expected)
+    const savedGenArg = widenRetagGenArg
+    widenRetagGenArgSet(tyWideUnionMinted && tyHasTyVar(params[i]))
+    const savedLbiGen = lbiNoDest
+    lbiNoDest = tyHasTyVar(params[i])
+    // A wider record into a declared record parameter: a parameter already made generic is
+    // still held to its declared type, and a new one is made generic after this pass (D3992).
+    const wsOrig = wsOrigTyOf(n, i)
+    if wsOrig >= 0 && i < args.length && args[i] >= 0 && !tyHasTyVar(at) {
+      wsSuppress = true
+      const savedOrigLit = argLitAt
+      argLitAt = peelParenIx(args[i])
+      const wsOk = assignableExpr(args[i], at, wsOrig)
+      argLitAt = savedOrigLit
+      wsSuppress = false
+      if !wsOk { argMismatchErr(i + 1, wsOrig, at, args[i]) }
+    }
+    const wsNew = wsOrig < 0
+      && !inferQuiet
+      && i < args.length
+      && wsCandidate(n, i, args[i], at, expected)
+    if wsNew { wsNotePending(n, i) }
+    wsSuppress = wsNew
+    const savedArgLit = argLitAt
+    argLitAt = peelParenIx(args[i])
+    const argOk = assignableExpr(args[i], at, expected)
+    argLitAt = savedArgLit
+    wsSuppress = false
+    lbiNoDest = savedLbiGen
+    widenRetagGenArgSet(savedGenArg)
+    if !argOk {
+      // Anchored at the offending argument (or its offending return site),
+      // never at the call node — see `argMismatchErr`.
+      argMismatchErr(i + 1, expected, at, args[i])
+    } else if !tyIsHole(params[i]) {
+      // It passed, and for a hole-bearing argument that means nothing: a hole is assignable
+      // to anything, so a concrete parameter's comparison is answered before the deciding
+      // type exists. Parked here and re-asked as the hole takes a pin (D1821).
+      if tyHasTyVar(at) && tyIsFuncArena(expected) {
+        if !argIsOwnGenericFnValue(args[i]) {
+          argPinPark(expected, at, args[i], i + 1)
+        }
+      }
+    }
+    oi = oi + 1
+  }
+  // A list or record literal holding a generic function, met before a later argument bound the
+  // type parameter its element type rides, is delivered again at the bound type (D3923).
+  if !inferQuiet {
+    let li = 0
+    while li < args.length && li < params.length {
+      if (
+        argExp[li] >= 0
+        && tyHasTyVar(argExp[li])
+        && argIsLitAggregate(args[li])
+      ) {
+        const fin = substTyDeep(params[li], bNames, bTys)
+        if fin != argExp[li] {
+          genFnValueCstrs(args[li], nodeTyOf(args[li]), fin)
+        }
+      }
+      li = li + 1
+    }
+  }
+  if dstNames.length > 0 && !inferQuiet {
+    dstRetypeLitArgs(dstNames, params, args, bNames, bTys)
+  }
+  // After the arguments, so a mismatched argument gets the more specific diagnostic first;
+  // the answer itself is the callee's declaration, not this site's bindings.
+  if cfn is Ident {
+    let rtpDecl = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+    if rtpDecl == CSTR_NODECL { rtpDecl = lookupFnAliasNode(cfn.identName) }
+    if !explicitTa {
+      checkRetTyParamBound(rtpDecl, cfn.identName, ix, ft.fnRet)
+    }
+  }
+  // Substitutes the binding into a generic return type — deep, so a structural return
+  // (`{first: B, second: A}`, a generic alias body, a function-typed field) concretizes
+  // per call site; a derived `?ret.` hole collapses to the pinned callee's return
+  // (`substTyDeep`).
+  const vNames: string[] = []
+  const vTys: i32[] = []
+  withUnionArmBinds(bNames, bTys, uNames, uTys, vNames, vTys)
+  if vNames.length > 0 {
+    const dBeforeC = T.diags.length
+    let cstrCallee = CSTR_NODECL
+    let cstrWho = ""
+    if cfn is Ident {
+      cstrCallee = fnDeclIx[cfn.identName] ?? CSTR_NODECL
+      // A local bound to a declared generic names that declaration — without this rung the
+      // call falls to `CSTR_NODECL` and adjudicates every generic in the program, since
+      // `substTyDeep` matches `TyVar`s by name and `const g = idT  g(structList)` would
+      // otherwise report a sibling's refusal.
+      if cstrCallee == CSTR_NODECL {
+        const aliasIx = lookupFnAliasNode(cfn.identName)
+        if aliasIx >= 0 { cstrCallee = aliasIx }
+      }
+      cstrWho = cfn.identName
+    }
+    // The direct spelling has no receiver, so every parameter is an argument (`selfOff` 0)
+    // and `params`/`args` are already 1:1 (named arguments reordered, defaults padded).
+    const dhNames: string[] = []
+    const dhArgNo: i32[] = []
+    const dhArgNode: i32[] = []
+    holeArgOrigins(params, args, 0, dhNames, dhArgNo, dhArgNode)
+    const modeWas = substNestMode
+    const declWas = substNestDecl
+    let nestCallee = -1
+    if cfn is Ident {
+      // The declaration the callee names, directly or through an alias.
+      nestCallee = lookupFnDeclNode(cfn.identName)
+      if nestCallee < 0 { nestCallee = lookupFnAliasNode(cfn.identName) }
+      if !nestParentOf.has(nestCallee) { nestCallee = -1 }
+    }
+    if nestCallee >= 0 {
+      // A nested generic, named directly or through an alias, owns no constraint: they are its
+      // enclosing function's, and a top-level function of the same name is another declaration.
+      cstrCallee = CSTR_NODECL
+      substNestModeSet(SUBST_NESTED)
+      substNestDeclSet(nestCallee)
+    } else if cstrCallee >= 0 {
+      substNestModeSet(SUBST_DECLARED)
+    } else if namesAllHoles(vNames) && tysHoldVar(vTys) {
+      substNestModeSet(SUBST_HOLES)
+    } else {
+      substNestModeSet(SUBST_ALL)
+    }
+    const wsVd = T.diags.length
+    instGenFnHolePins(vNames, vTys, cstrCallee, dhNames, dhArgNode)
+    callBindNote(ix, vNames, vTys)
+    pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
+    if fsbName.length > 0 {
+      fsbNoteCall(
+        ix,
+        fsbDeclAtNode(n.callFn),
+        cstrCallee,
+        cstrWho,
+        dhNames,
+        dhArgNo,
+        dhArgNode,
+        fsbArgTysOf(ft, vNames, vTys),
+      )
+    }
+    validateBinCstrs(
+      vNames,
+      vTys,
+      ix,
+      cstrCallee,
+      cstrWho,
+      dhNames,
+      dhArgNo,
+      dhArgNode,
+    )
+    validatePrintCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateNestCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateIsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateArgCstrs(vNames, vTys, ix, cstrCallee, dhNames, dhArgNode)
+    // The declared return rides the same pin: the body's mismatch check is vacuous under
+    // a hole, and this is the first position that knows the instance (D551).
+    validateRetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    // The destination seam, for the same reason: a value landing in a hole-typed local /
+    // field / element inside the body is a mismatch the body's own gate cannot decide (D572).
+    validateLetCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    // A builtin collection method's argument inside the body, for the same reason at a
+    // callee kind the deferred-argument table cannot name: a builtin has no `FuncDecl`, so its own arm is the whole check and is vacuous under a hole (D582).
+    validateBmCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    // After the pins above, which can leave an argument's element open (`cnhPinBmElem`).
+    if !inferQuiet {
+      let oa = 0
+      while oa < args.length {
+        refuseOpenNullHoleArg(args[oa], cstrWho)
+        oa = oa + 1
+      }
+    }
+    // The receiver classification of a `.length` / `x[i]` inside the body: both arms admit
+    // the operation on a type variable correctly (a `T` pinned to a collection has it), and
+    // this is the first position that knows which rep `T` became (D651 / D691).
+    validateMemCstrs(
+      vNames,
+      vTys,
+      ix,
+      cstrCallee,
+      cstrWho,
+      dhNames,
+      dhArgNo,
+      dhArgNode,
+    )
+    validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+    validateRcwPins(vNames, vTys, cstrCallee)
+    if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
+    substNestModeSet(modeWas)
+    substNestDeclSet(declWas)
+    // Not a validation: the `??` result holes are substituted here for their BANK, which is
+    // the only route the emitter has to the type this call gave the expression (D1702).
+    if bNames.length > 0 { bankCoalHoles(bNames, bTys, cstrCallee) }
+    // The bounds the callee declared, judged here in this site's own scope against the
+    // types this site bound — not deferred, since a bound is written at the declaration:
+    // there is nothing to record on the way in, only something to check on the way out.
+    checkBoundsAtCall(cstrWho, cstrCallee, bNames, bTys, ix)
+    // The escaped-join reject is a fallback, not an additional voice: when this site
+    // already reported a precise operand/argument-flow diagnostic, a join report would only repeat it in vaguer words.
+    if T.diags.length == dBeforeC && bNames.length > 0 {
+      validateEscJoins(bNames, bTys, cstrCallee)
+    }
+    retTy = substTyDeep(retTy, vNames, vTys)
+    if tpIfFn.length > 0 || tpIfReFn.length > 0 {
+      const pinTys: i32[] = []
+      let pp = 0
+      while pp < params.length {
+        pinTys.push(substTyDeep(params[pp], vNames, vTys))
+        pp = pp + 1
+      }
+      validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
+    }
+  }
+  // A deferred join this site cannot decide has no rep, so it collapses to one arm, parked
+  // whole for a `return h(w)` relay (`inferRetTyOf`); in a body the gate does not hold, one of
+  // that body's own parameters is kept as a union instead, which its pins re-join (D3589).
+  let kept = -1
+  if tyIsDeferredJoin(retTy) && !njFnReached(njFnIx) {
+    const keep = (apartHoleJoins.get(retTy) ?? false) || calleeRetDeclared(cfn)
+    kept = keptParamUnion(retTy, keep)
+  }
+  let cRetTy = kept
+  if kept < 0 { cRetTy = collapseDeferredJoin(retTy) }
+  if cRetTy != retTy {
+    noteDeferredJoinNode(ix, retTy)
+    let ejWho = ""
+    if cfn is Ident { ejWho = cfn.identName }
+    if kept < 0 { noteEscJoin(retTy, ix, ejWho) }
+  }
+  return cRetTy
+}
+
+// `p?.f(args)` — one guard over the receiver covers the whole call, so the callee and the
+// arguments resolve against the receiver's non-null type and the result is that call's own
+// return re-wrapped nullable. `-1` when no arm claimed the callee, leaving the caller's
+// "called value is not a function" to speak (D1814).
+function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
+  omGuardSet(-1, -1)
+  const recv = checkNodeHook(cfn.omObj)
+  if recv < 0 { return TY_ERR }
+  const eff = omRecvTy(cfn.omObj, recv)
+  if eff < 0 { return TY_ERR }
+  // A `.` that inherited the chain's guard may not re-guard: same rule, same words, as the
+  // member link's.
+  if cfn.omDot {
+    const de = T.tys[eff]
+    if de is TyNullable {
+      memberFloorErr(eff, cfn.omProp, ix)
+      return TY_ERR
+    }
+  }
+  const rcv = T.tys[recv]
+  let wasNullable = false
+  if rcv is TyNullable { wasNullable = true }
+  const base = nonNullTy(eff)
+  if base < 0 { return TY_ERR }
+  let rt = checkMemberCallNode(n, ix, cfn.omObj, cfn.omProp, base)
+  if rt < 0 {
+    // No method arm claimed it: the callee is a VALUE on the receiver — a closure-typed
+    // field. Its guarded type is the field's own function type, which is what the call
+    // needs; the `?.` node's type is that same function behind a `| null`.
+    const fnTy = checkNodeHook(n.callFn)
+    const g = omGuardTyAt(n.callFn)
+    let cft = fnTy
+    if g >= 0 { cft = g }
+    if cft < 0 { return TY_ERR }
+    const ft = T.tys[cft]
+    if ft is TyErr { return TY_ERR }
+    if !(ft is TyFunc) { return -1 }
+    rt = checkCallOnFuncTy(n, ix, cfn, ft)
+    if rt < 0 { return -1 }
+  }
+  omGuardSet(ix, rt)
+  if rt == TY_VOID {
+    noteOptCallRet(ix, rt, "")
+    return TY_VOID
+  }
+  if wasNullable {
+    const ort = mkNullableTy(rt)
+    noteOptCallRet(ix, rt, valueUnionRetName(ort))
+    return ort
+  }
+  noteOptCallRet(ix, rt, "")
+  rt
+}
+
+// A call expression, dispatched on the callee's shape: a member callee to
+// `checkMemberCallNode`, a bare identifier to `checkUnimplementedIntrinsicCall` and
+// `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
+// three return `-1` for "no arm claimed it"; an unclaimed callee is reported here as `TY_ERR`.
+export function checkCallNode(n: Call, ix: i32) {
+  const cfn = P.nodes[n.callFn]
+  if callHasTyArgs(ix) {
+    if !callTyArgsCalleeOk(cfn, ix) { return TY_ERR }
+  }
+  if cfn is Member {
+    const mt = checkMemberCallNode(n, ix, cfn.memObj, cfn.memProp, -1)
+    if mt >= 0 { return mt }
+  }
+  // `p?.f(args)` — the receiver's guard covers the whole call. Answered before the callee is
+  // typed as a value, which is what read a nullable closure field as "not a function" (D1814).
+  if cfn is OptMember {
+    const ot = checkOptCallNode(n, ix, cfn)
+    if ot >= 0 { return ot }
+  }
+  // A built-in call below answers without checking its callee, so the callee's binding is
+  // recorded here, before any of them.
+  if cfn is Ident { identNoteUse(n.callFn, cfn.identName) }
+  if cfn is Ident {
+    checkUnimplementedIntrinsicCall(cfn, ix)
+    if cfn.identName == "__memory_shared__" && lookupDepth(cfn.identName) == 0 {
+      memSharedCalls.push(ix)
+    }
+  }
+  if cfn is Ident {
+    if nameIsSimdIntrinsic(cfn.identName) { v128SeenSet(true) }
+    checkSimdLaneArg(n, cfn)
+  }
+  if cfn is Ident {
+    const mo = checkMemOffsetCall(n, cfn)
+    if mo >= 0 { return mo }
+  }
+  if cfn is Ident {
+    const bt = checkBuiltinIdentCall(n, ix, cfn)
+    if bt >= 0 { return bt }
+    if foreignLenCall(n, cfn) { return TY_ERR }
+  }
+  const savedCallee = ckCalleeIx
+  ckCalleeIxSet(n.callFn)
+  const fnTy = checkNodeHook(n.callFn)
+  ckCalleeIxSet(savedCallee)
+  const ft = T.tys[fnTy]
+  if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
+  if ft is TyErr {
+    // A module global called above its declaration, which the hoist could not type: its
+    // arguments are still checked on their own, as a hole callee's are (D3899).
+    if cfn is Ident && globalBeforeDecl(cfn.identName) {
+      for ga in n.callArgs { checkNodeHook(ga) }
+    }
+    return TY_ERR
+  }
+  if ft is TyVar {
+    // Calling an inference-hole value — an un-annotated parameter used as a function inside
+    // its own generic body (`function apply(fn, a, b) { fn(a, b) }`): the arguments are
+    // checked on their own and the call yields a fresh hole, resolved once an outer call
+    // binds the generic signature (the emitter compiles each instance concretely).
+    const hargs = n.callArgs
+    let hWho = ""
+    if cfn is Ident { hWho = cfn.identName }
+    let hj = 0
+    while hj < hargs.length {
+      const hat = checkNodeHook(hargs[hj])
+      // What the pinned function takes here, demanded of the argument at the pin (D3225).
+      const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)
+      if hat >= 0 && hexp >= 0 {
+        noteArgCstr(hat, hexp, hWho, hj + 1, hargs[hj])
+      }
+      hj = hj + 1
+    }
+    if tyIsNonNullHoleRead(fnTy) {
+      noteMemCstr(fnTy, OP_CALL_GUARDED_PIN, ix, false)
+    } else {
+      noteMemCstr(fnTy, OP_CALL_PIN, ix, false)
+    }
+    return mkDerivedHole(HD_RET, "", -1, -1, fnTy)
+  }
+  // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
+  let calledGetter = getSiteFnOf(n.callFn)
+  if calledGetter == "" && cfn is Member {
+    calledGetter = getterFnFor(checkNodeHook(cfn.memObj), cfn.memProp)
+  }
+  if calledGetter != "" {
+    tErr(
+      "called value is not a function ("
+        + tyToStr(fnTy)
+        + ") — `."
+        + getDeclPropOf(calledGetter)
+        + "` reads the "
+        + getDeclLabel(calledGetter)
+        + "; drop the `()`",
+      ix,
+    )
+    return TY_ERR
+  }
+  const shadow = builtinShadowMsg(n.callFn, fnTy)
+  if shadow != "" {
+    tErr(shadow, ix)
+    return TY_ERR
+  }
+  tErr("called value is not a function (" + tyToStr(fnTy) + ")", ix)
+  TY_ERR
+}
+
+// `len(x)` with no `len` in scope: refused at the callee with the VL spelling, `x.length`.
+// True when it raised. A program that declares or imports its own `len` never reaches it.
+function foreignLenCall(n: Call, cfn: Ident): boolean {
+  if cfn.identName != "len" || n.callArgs.length != 1 { return false }
+  if lookup("len") >= 0 { return false }
+  const at = strLitRecvTy(checkNodeHook(n.callArgs[0]))
+  if !strListHas(builtinMethodNamesOf(at), "length") {
+    tErr("undeclared identifier 'len'", n.callFn)
+    return true
+  }
+  const recv = placeKeyOf(n.callArgs[0])
+  let fix = "'.length'"
+  if recv != "" { fix = "'" + recv + ".length'" }
+  tErr(
+    "undeclared identifier 'len' — a length is a member in VL; did you mean "
+      + fix
+      + "?",
+    n.callFn,
+  )
+  true
+}

@@ -1,0 +1,644 @@
+// The type of reading a member, an optional member or an element, including a literal
+// union's `length` and index.
+
+import {
+  Index,
+  Member,
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  OptMember,
+  getDeclLabel,
+  i32ToStr,
+  opDeclLabel,
+} from "./ast"
+import {
+  flatMemberFold,
+  luAllSpell,
+  luChain,
+  luDecl,
+  luElemTy,
+  luSpell,
+} from "./check_annot_resolve"
+import { assignableExpr } from "./check_assignable"
+import { strLitRecvTy } from "./check_builtin_methods"
+import { opIdxBank, opIdxParamTy, opIdxRetTy } from "./check_call_resolve"
+import { opIdxDeclared } from "./check_callee"
+import { mkDerivedHole } from "./check_coal"
+import { checkNodeHook, strIdxRecord } from "./check_core_state"
+import { crPathDropRead } from "./check_cr_walk"
+import { noteArgCstr, noteMemCstr, tpGradualRecv } from "./check_cstr_rows"
+import { inferQuiet } from "./check_cursor"
+import {
+  boundMemberTy,
+  indexFloorMsg,
+  memberFloorErr,
+  noteCallInvalidations,
+  opIdxBindGen,
+  opIdxFnFor,
+} from "./check_demands"
+import { boundMemberUnknownMsg } from "./check_diag_text"
+import {
+  boundMemberFloorMsg,
+  sharedFieldJoinWidens,
+  sharedUnionFieldTy,
+} from "./check_fit_rules"
+import { getterFnFor } from "./check_getter_effects"
+import {
+  HD_ELEMV,
+  HD_FLD,
+  hdRootTy,
+  tyIsWriteLandRead,
+} from "./check_hole_pins"
+import {
+  arrayDemandKey,
+  holeMapDemandTy,
+  noteArrayDemand,
+} from "./check_hole_rows"
+import { lbiNoteIndex } from "./check_lbi_notes"
+import {
+  ACF_INDEX,
+  BOUND_UNRESOLVED,
+  omDotStr,
+  omGuardSet,
+  omRecvTy,
+} from "./check_leaf_steps"
+import {
+  luMembers,
+  luOwnRecv,
+  luRecvLowers,
+  luValueAt,
+  luWriteTgt,
+} from "./check_list_union"
+import {
+  crNoteCaptureRead,
+  crNoteLostRead,
+  elemEveryReadTy,
+  getterReadTy,
+  identNotePlace,
+  narrowedPathInvBy,
+  narrowedPathTy,
+  pathInvalidatedErr,
+} from "./check_narrow_flow"
+import {
+  MC_NULL_READ_MARK,
+  crNoteLoopRead,
+  holeRemainderEndedSure,
+  narrowingEndedAt,
+  noteNullReadCstr,
+  pathReadsDeclared,
+} from "./check_narrow_paths"
+import { lengthWriteRefused } from "./check_node_rules"
+import { placeKeyOf } from "./check_places"
+import { assignable, substTyDeep, tErr } from "./check_relate_core"
+import { symMem } from "./check_sym_occ"
+import { tpBoundOfName } from "./check_tp_bound"
+import { mapKeyTySupported } from "./check_ty_rep"
+import { holeMemberTy } from "./check_type_shape"
+import {
+  T,
+  TY_ERR,
+  TY_I32,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  mkNullableTy,
+  objFieldType,
+  tyBuiltinIndexable,
+  tyIsDeclaredParam,
+  tyIsLitUnion,
+  tyMutEpoch,
+  tyToStr,
+} from "./check_types"
+import { IDENT_BUILTIN, identSet } from "./symbols"
+import { arrElemValueTy, nonNullTy, tyHasTyVar } from "./tyquery"
+
+// ── getters `get p(self: T): R` (property-access-design.md §D3a) ──────────────
+
+// `recv.length` over a union of lists: i32, or -1 when `objTy` is not one the rewrite names.
+function luLengthAt(n: Member, ix: i32, objTy: i32): i32 {
+  if luOwnRecv(n.memObj) || (luWriteTgt[ix] ?? false) { return -1 }
+  const ms = luMembers(objTy)
+  if ms.length == 0 || !luRecvLowers(n.memObj, ms) { return -1 }
+  if inferQuiet { return symMem(ix, TY_I32) }
+  if !luAllSpell(objTy, ms) { return -1 }
+  const recv = "$lu" + i32ToStr(ix)
+  const stmts: i32[] = []
+  stmts.push(luDecl("const", recv, objTy, n.memObj, ix, n.pos))
+  stmts.push(luChain(ms, 0, recv, "", -1, ix, n.pos))
+  luValueAt(ix, stmts, n.pos)
+  checkNodeHook(ix)
+}
+
+// `recv[i]` read over a union of lists: the element union, or -1 as `luLengthAt`. A write
+// through the index is not rewritten, since storing one arm's element in another is unsound.
+function luIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
+  if luWriteTgt[ix] ?? false { return -1 }
+  if luOwnRecv(n.idxArr) { return -1 }
+  const ms = luMembers(arrTy)
+  if ms.length == 0 || !luRecvLowers(n.idxArr, ms) { return -1 }
+  const elem = luElemTy(ms)
+  if elem < 0 { return -1 }
+  if inferQuiet { return elem }
+  if !luAllSpell(arrTy, ms) || luSpell(elem) == "" { return -1 }
+  const recv = "$lu" + i32ToStr(ix)
+  const idx = "$li" + i32ToStr(ix)
+  const stmts: i32[] = []
+  stmts.push(luDecl("const", recv, arrTy, n.idxArr, ix, n.pos))
+  stmts.push(luDecl("const", idx, -1, n.idxIndex, ix, n.pos))
+  stmts.push(luChain(ms, 0, recv, idx, elem, ix, n.pos))
+  luValueAt(ix, stmts, n.pos)
+  checkNodeHook(ix)
+}
+
+// Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
+export function checkMemberNode(n: Member, ix: i32) {
+  // Flat layout constant (webcraft P1.2): answered before the receiver is checked, since the
+  // receiver is a TYPE name and checking it as an expression would be "undeclared identifier".
+  const fl = flatMemberFold(n, ix)
+  // The receiver of a folded layout member names a type, which no value binding declares.
+  if fl == 1 || fl == 3 { identSet(n.memObj, IDENT_BUILTIN) }
+  if fl == 1 { return TY_I32 }
+  if fl == 2 { return TY_ERR }
+  // A layout member on a type parameter: an `i32` whose value the monomorphizer
+  // supplies per instance. The node stays a `Member` until then.
+  if fl == 3 { return TY_I32 }
+  // A flow-narrowed property path (`if o.v is T { … }`) overrides the stored
+  // field type within the branch (the host's `narrowedPaths` overlay).
+  const mKey = placeKeyOf(ix)
+  if mKey != "" {
+    const mOv = narrowedPathTy(mKey)
+    if mOv >= 0 {
+      identNotePlace(n.memObj)
+      crNoteLoopRead(mKey, ix)
+      crNoteCaptureRead(mKey)
+      return symMem(ix, mOv)
+    }
+    crNoteLostRead(mKey, ix)
+    const mInv = narrowedPathInvBy(mKey)
+    if (
+      mInv >= 0
+      && !(luWriteTgt[ix] ?? false)
+      && !pathReadsDeclared(mKey, mInv, ix)
+    ) {
+      return pathInvalidatedErr(mKey, mInv, ix)
+    }
+    if mInv < 0 { crPathDropRead(mKey, ix) }
+  }
+  const objTy0 = strLitRecvTy(checkNodeHook(n.memObj))
+  // A negative receiver type is an unpinned inference hole, not an arena index — indexing
+  // `T.tys` with it would crash. Already reported elsewhere, so don't cascade.
+  if objTy0 < 0 { return TY_ERR }
+  let objTy = objTy0
+  if T.tys[objTy0] is TyUnion {
+    const gObj = tpGradualRecv(objTy0, n.memProp, ix)
+    if gObj >= 0 && gObj < T.tys.length { objTy = gObj }
+  }
+  // A getter on the receiver's nominal type, when no field or built-in member shares its name.
+  const gFn = getterFnFor(objTy, n.memProp)
+  if gFn != "" { return getterReadTy(gFn, n, ix) }
+  const ot = T.tys[objTy]
+  if ot is TyObj {
+    const ft = objFieldType(ot, n.memProp)
+    if ft < 0 {
+      memberFloorErr(objTy, n.memProp, ix)
+      return TY_ERR
+    }
+    return symMem(ix, ft)
+  }
+  if ot is TyErr { return TY_ERR }
+  // Shared-field access over a struct union — a field every member carries at the same
+  // type; an unshared field still needs an `is` narrowing.
+  if ot is TyUnion {
+    const sf = sharedUnionFieldTy(ot, n.memProp)
+    if sf >= 0 {
+      sharedFieldJoinWidens(ot, n.memProp, sf, ix)
+      return symMem(ix, sf)
+    }
+    if n.memProp == "length" {
+      // A string-literal union is a string: its length is the member's (D3423).
+      if tyIsLitUnion(objTy) {
+        if lengthWriteRefused(n, ix, 2) { return TY_ERR }
+        return symMem(ix, TY_I32)
+      }
+      const lul = luLengthAt(n, ix, objTy)
+      if lul >= 0 { return lul }
+    }
+    // The field is on some but not all members — unsafe until narrowed to a member that
+    // has it. Names the offending member so a reader need not diff a four-arm union by hand.
+    memberFloorErr(objTy, n.memProp, ix)
+    return TY_ERR
+  }
+  // `.length` on an array, a map, or a string is an i32.
+  if ot is TyArray {
+    if lengthWriteRefused(n, ix, 0) { return TY_ERR }
+    if n.memProp == "length" { return symMem(ix, TY_I32) }
+    memberFloorErr(objTy, n.memProp, ix)
+    return TY_ERR
+  }
+  if ot is TyMap {
+    // `.length` is the live-entry count (an i32), the one name every collection answers;
+    // `.size` is refused with a redirect to it (`lengthSpellNote`).
+    if lengthWriteRefused(n, ix, 1) { return TY_ERR }
+    if n.memProp == "length" { return symMem(ix, TY_I32) }
+    memberFloorErr(objTy, n.memProp, ix)
+    return TY_ERR
+  }
+  if ot is TyPrim {
+    if ot.primName == "string" {
+      if lengthWriteRefused(n, ix, 2) { return TY_ERR }
+      if n.memProp == "length" { return symMem(ix, TY_I32) }
+      memberFloorErr(objTy, n.memProp, ix)
+      return TY_ERR
+    }
+  }
+  // Member access on an inference hole records the demanded field and yields its derived
+  // hole; the call site pins both (A13).
+  if ot is TyVar {
+    // D14-L/D691: `.length` on a type parameter is admitted here and re-asked at the pin —
+    // a bounded type parameter reads its members from its bound first, checked before `.length` (OQ-5).
+    const bmTy = boundMemberTy(ot.tvName, n.memProp, false)
+    if bmTy == BOUND_UNRESOLVED {
+      tErr(boundMemberUnknownMsg(ot.tvName, n.memProp), ix)
+      return TY_ERR
+    }
+    if bmTy >= 0 { return symMem(ix, bmTy) }
+    const bmMsg = boundMemberFloorMsg(ot.tvName, n.memProp)
+    if bmMsg != "" {
+      tErr(bmMsg, ix)
+      return TY_ERR
+    }
+    if n.memProp == "length" {
+      noteMemCstr(objTy, n.memProp, ix, false)
+      return symMem(ix, TY_I32)
+    }
+    // A place holding a written type-parameter value reads its members as the parameter does:
+    // each pin re-asks the read of the member it lands on, a nullable one included (D3240).
+    if tyIsWriteLandRead(objTy) {
+      noteMemCstr(objTy, n.memProp, ix, false)
+      const twFld = mkDerivedHole(HD_FLD, n.memProp, -1, -1, objTy)
+      if twFld >= 0 { return symMem(ix, twFld) }
+    }
+    if ot.tvName.length > 0 {
+      if ot.tvName[0] == '?' {
+        noteNullReadCstr(objTy, n.memProp, ix, n.memObj)
+        // A read off a parameter's derivation after a write or call ended its narrowing is
+        // re-asked at its pin, as the direct spelling's read is (D3233); off an un-annotated
+        // parameter's, only an `is` remainder every pin sees ended (D3420).
+        if (
+          narrowingEndedAt(n.memObj)
+          && (tyIsDeclaredParam(hdRootTy(objTy))
+            || holeRemainderEndedSure(n.memObj))
+        ) {
+          noteMemCstr(objTy, n.memProp, ix, false)
+        }
+        // `.length` is the i32 length an array/string/map exposes — treat it as that (not a
+        // struct field), so a collection-shaped hole infers without growing a bogus `{length}` shape.
+        return symMem(ix, holeMemberTy(objTy, ot.tvName, n.memProp))
+      }
+    }
+    // An unbounded `<T>` is an entirely open hole: the member read derives its type as the
+    // `?`-hole does, keyed by the receiver's arena type so each generic adjudicates its own calls (D1431).
+    if tpBoundOfName(ot.tvName) < 0 {
+      noteMemCstr(objTy, n.memProp, ix, true)
+      const tpFld = mkDerivedHole(HD_FLD, n.memProp, -1, -1, objTy)
+      if tpFld >= 0 { return symMem(ix, tpFld) }
+    }
+  }
+  memberFloorErr(objTy, n.memProp, ix)
+  return TY_ERR
+}
+// ── index `a[i]` ────────────────────────────────────────────────────────────
+
+// Extracted from `checkNodeReal`'s `Index` arm (C3: thin the dispatcher).
+export function checkIndexNode(n: Index, ix: i32) {
+  const arrTy0 = strLitRecvTy(checkNodeHook(n.idxArr))
+  const idxTy = checkNodeHook(n.idxIndex)
+  // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
+  if arrTy0 < 0 { return TY_ERR }
+  let arrTy = arrTy0
+  if T.tys[arrTy0] is TyUnion {
+    const gArr = tpGradualRecv(arrTy0, OP_INDEX_GET, ix)
+    if gArr >= 0 && gArr < T.tys.length { arrTy = gArr }
+  }
+  lbiNoteIndex(arrTy, n.idxIndex)
+  if !inferQuiet { strIdxRecord(ix, arrTy) }
+  // A flow-narrowed constant-index place overrides the element type within the branch — asked
+  // after the receiver/subscript check (unlike the member arm) since the subscript node needs banking.
+  const xKey = placeKeyOf(ix)
+  if xKey != "" {
+    const xOv = narrowedPathTy(xKey)
+    if xOv >= 0 {
+      crNoteLoopRead(xKey, ix)
+      crNoteCaptureRead(xKey)
+      return xOv
+    }
+    crNoteLostRead(xKey, ix)
+    const xInv = narrowedPathInvBy(xKey)
+    if (
+      xInv >= 0
+      && !(luWriteTgt[ix] ?? false)
+      && !pathReadsDeclared(xKey, xInv, ix)
+    ) {
+      return pathInvalidatedErr(xKey, xInv, ix)
+    }
+    if xInv < 0 { crPathDropRead(xKey, ix) }
+  }
+  const at = T.tys[arrTy]
+  // A map index: the key must match the map's key type; a read yields the nullable value
+  // (`V | null`), and an assignment target accepts a plain `V`.
+  if at is TyMap {
+    // A set has no index: membership is `has`, insertion `add`.
+    if at.mSet == 1 {
+      tErr(
+        "a Set has no index — test membership with `.has(x)` and insert with `.add(x)`",
+        ix,
+      )
+      return TY_ERR
+    }
+    // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
+    // literal-union-keyed map is a member of that union, and `checkNode` types a string
+    // literal as the widened `string` with no destination to narrow it against (D1748).
+    if !assignableExpr(n.idxIndex, idxTy, at.mKey) {
+      tErr(
+        "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
+        n.idxIndex,
+      )
+    }
+    return mkNullableTy(at.mVal)
+  }
+  // Indexing a hole constrains it to an array: demand an i32 index and return the element as
+  // a derived hole (`HD_ELEM`), resolved per call site — mirrors `holeMemberTy` for `self.x`.
+  if at is TyVar {
+    if !assignable(idxTy, TY_I32) {
+      // A non-i32 index can only be a map — constrain the hole to its demanded map and pin
+      // the key from the index (the index-spelling twin of the `.set` arm's pin).
+      if mapKeyTySupported(idxTy) {
+        if tyIsWriteLandRead(arrTy) {
+          noteMemCstr(arrTy, MC_NULL_READ_MARK + OP_INDEX_GET, ix, false)
+        }
+        const hmi = holeMapDemandTy(at.tvName, false)
+        const hmt = T.tys[hmi]
+        if hmt is TyMap {
+          if hmt.mKey < 0 {
+            hmt.mKey = idxTy
+            tyMutEpoch = tyMutEpoch + 1 // hole index-read pinned the demanded key in place
+          }
+          return mkNullableTy(hmt.mVal)
+        }
+      }
+      tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+    }
+    noteArrayDemand(arrayDemandKey(arrTy))
+    // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
+    // receiver and refuses scalars/maps — a record/nullable/function/union pinned reaches the emitter unruled.
+    noteMemCstr(arrTy, OP_INDEX_GET, ix, false)
+    return mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
+  }
+  // Free index operator (B14): `x[i]` on a non-indexable receiver resolves to a declared
+  // `"[]"` function by type. Checked before the closure-field trap, mirroring the `a op b` order.
+  if opIdxDeclared() {
+    if !tyBuiltinIndexable(arrTy) {
+      const rfn = opIdxFnFor(OP_INDEX_GET, arrTy)
+      if rfn != "" {
+        const bNames: string[] = []
+        const bTys: i32[] = []
+        opIdxBindGen(rfn, arrTy, idxTy, bNames, bTys)
+        const kt = opIdxParamTy(rfn, 1)
+        if kt >= 0 {
+          const ktb = substTyDeep(kt, bNames, bTys)
+          if !assignableExpr(n.idxIndex, idxTy, ktb) {
+            tErr(
+              "index: expected " + tyToStr(ktb) + ", got " + tyToStr(idxTy),
+              ix,
+            )
+          }
+        }
+        opIdxBank(ix, rfn)
+        noteCallInvalidations(ix)
+        const rty = opIdxRetTy(rfn)
+        if bNames.length > 0 { return substTyDeep(rty, bNames, bTys) }
+        return rty
+      }
+      // A write operator with no read operator is not a usable type: the assignment form
+      // checks the target as an ordinary index and would name the wrong half — say which is missing.
+      const wOnly = opIdxFnFor(OP_INDEX_SET, arrTy)
+      if wOnly != "" {
+        tErr(
+          "operator "
+            + opDeclLabel(wOnly)
+            + " needs a matching \""
+            + OP_INDEX_GET
+            + "\" operator — an index that cannot be READ cannot be written either",
+          ix,
+        )
+        return TY_ERR
+      }
+    }
+  }
+  // Index trap (B13): a user object declaring `"[]"` handles `o[k]` itself — the key checks
+  // against the method's parameter, checked before the native i32-index rule. Write traps use `"[]="`.
+  if at is TyObj {
+    const trap = objFieldType(at, "[]")
+    if trap >= 0 {
+      const tt = T.tys[trap]
+      if tt is TyFunc {
+        if tt.fnParamTypes.length == 1 {
+          if !assignableExpr(n.idxIndex, idxTy, tt.fnParamTypes[0]) {
+            tErr(
+              "index: expected "
+                + tyToStr(tt.fnParamTypes[0])
+                + ", got "
+                + tyToStr(idxTy),
+              ix,
+            )
+          }
+          return tt.fnRet
+        }
+      }
+    }
+    tErr(indexFloorMsg(arrTy), ix)
+    return TY_ERR
+  }
+  if !assignable(idxTy, TY_I32) {
+    tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+  } else if tyHasTyVar(idxTy) {
+    // A hole passes vacuously; the pin asks again at the type it binds (D3584).
+    noteArgCstr(idxTy, TY_I32, "", ACF_INDEX, -1)
+  }
+  if at is TyUnion {
+    // An index that is not an `i32` is already reported above.
+    if !assignable(idxTy, TY_I32) && luMembers(arrTy).length > 0 {
+      return TY_ERR
+    }
+    const lui = luIndexAt(n, ix, arrTy)
+    if lui >= 0 { return lui }
+    // A read rewrites; a write is refused by design, since the stored value would have to
+    // fit every member's element at once.
+    if (luWriteTgt[ix] ?? false) && luMembers(arrTy).length > 0 {
+      tErr(
+        "cannot write through an index of "
+          + tyToStr(arrTy)
+          + ": the value would have to fit every member's element — narrow with `is` first",
+        ix,
+      )
+      return TY_ERR
+    }
+  }
+  if at is TyArray {
+    const ev = elemEveryReadTy(ix)
+    if ev >= 0 { return ev }
+    // The element's value type — a `u8[]` read is an `i32`, never a `u8`. Same shape as the
+    // string arm below: `string` is `(array i32)` with no `char` type above it (DECISIONS A7).
+    return arrElemValueTy(at.aElem)
+  }
+  if at is TyErr { return TY_ERR }
+  // Indexing a string yields the UTF-8 byte at that position, as an `i32`.
+  if at is TyPrim {
+    if at.primName == "string" { return TY_I32 }
+  }
+  tErr(indexFloorMsg(arrTy), ix)
+  return TY_ERR
+}
+
+// Extracted from `checkNodeReal`'s `OptMember` arm (C3: thin the dispatcher).
+export function checkOptMemberNode(n: OptMember, ix: i32) {
+  // `x?.y` keys the same narrowed place as `x.y` (host `placeKey`).
+  const omKey = placeKeyOf(ix)
+  if omKey != "" {
+    const omOv = narrowedPathTy(omKey)
+    if omOv >= 0 {
+      identNotePlace(n.omObj)
+      omGuardSet(ix, nonNullTy(omOv))
+      crNoteLoopRead(omKey, ix)
+      crNoteCaptureRead(omKey)
+      return symMem(ix, omOv)
+    }
+    crNoteLostRead(omKey, ix)
+    const omInv = narrowedPathInvBy(omKey)
+    if omInv >= 0 && !pathReadsDeclared(omKey, omInv, ix) {
+      omGuardSet(-1, -1)
+      return pathInvalidatedErr(omKey, omInv, ix)
+    }
+  }
+  omGuardSet(-1, -1)
+  const recv = checkNodeHook(n.omObj)
+  // Guard the unpinned-hole receiver (`-1` — see the Member-arm note).
+  if recv < 0 {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
+  const eff = omRecvTy(n.omObj, recv)
+  if eff < 0 {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
+  // A `.` that inherited the chain's guard reads through it, so a field that is nullable in
+  // its own right is a plain member access on a nullable value — the same refusal, and the
+  // same fix (`o?.y?.z`), the direct spelling gives.
+  if n.omDot {
+    const de = T.tys[eff]
+    if de is TyNullable {
+      omGuardSet(-1, -1)
+      memberFloorErr(eff, n.omProp, ix)
+      return TY_ERR
+    }
+  }
+  const rcv = T.tys[recv]
+  let wasNullable = false
+  let baseTy = eff
+  if rcv is TyNullable { wasNullable = true }
+  const et = T.tys[eff]
+  if et is TyNullable {
+    baseTy = et.nInner
+    // Peels a second nullable layer too: the host's `flattenType` collapses `T??` to `T?`,
+    // so a doubly-nullable receiver still reads its field with one `?.`.
+    if baseTy >= 0 {
+      const rcv2 = T.tys[baseTy]
+      if rcv2 is TyNullable { baseTy = rcv2.nInner }
+    }
+  }
+  if baseTy < 0 {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
+  // `?.` reads a declared struct field, as it refuses a built-in `.length`, so a getter is
+  // refused by name rather than as a missing field (property-access-design.md §D3a).
+  const omGet = getterFnFor(baseTy, n.omProp)
+  if omGet != "" {
+    omGuardSet(-1, -1)
+    tErr(
+      "`?."
+        + n.omProp
+        + "` reads the "
+        + getDeclLabel(omGet)
+        + ", and `?.` reads only a declared struct field — narrow the receiver instead, e.g. `if v != null { v."
+        + n.omProp
+        + " }`",
+      ix,
+    )
+    return TY_ERR
+  }
+  const bt = T.tys[baseTy]
+  if bt is TyObj {
+    const oft = objFieldType(bt, n.omProp)
+    if oft < 0 {
+      omGuardSet(-1, -1)
+      tErr("no field '" + n.omProp + "' on " + tyToStr(baseTy), ix)
+      return TY_ERR
+    }
+    omGuardSet(ix, oft)
+    if wasNullable { return symMem(ix, mkNullableTy(oft)) }
+    return symMem(ix, oft)
+  }
+  if bt is TyErr {
+    omGuardSet(-1, -1)
+    return TY_ERR
+  }
+  // Shared union field through `?.` — same rule as the plain member read.
+  if bt is TyUnion {
+    const osf = sharedUnionFieldTy(bt, n.omProp)
+    if osf >= 0 {
+      if sharedFieldJoinWidens(bt, n.omProp, osf, ix) {
+        omGuardSet(-1, -1)
+        return TY_ERR
+      }
+      omGuardSet(ix, osf)
+      if wasNullable { return symMem(ix, mkNullableTy(osf)) }
+      return symMem(ix, osf)
+    }
+  }
+  omGuardSet(-1, -1)
+  // A nullable receiver here is not "a non-object" — it is an object-less base behind a
+  // `| null`. `?.` reaches declared struct fields only; builtins (`.length`) are unreachable through it.
+  if wasNullable {
+    tErr(
+      "`"
+        + omDotStr(n)
+        + n.omProp
+        + "` is not available on "
+        + tyToStr(recv)
+        + " — `?.` reads a declared struct field, and "
+        + tyToStr(baseTy)
+        + " has none; narrow the receiver instead, e.g. `if v != null { v."
+        + n.omProp
+        + " }`",
+      ix,
+    )
+    return TY_ERR
+  }
+  tErr(
+    "member access '"
+      + omDotStr(n)
+      + n.omProp
+      + "' on non-object "
+      + tyToStr(recv),
+    ix,
+  )
+  return TY_ERR
+}

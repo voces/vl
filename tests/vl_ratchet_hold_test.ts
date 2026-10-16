@@ -198,22 +198,29 @@ Deno.test({
 // before the pass runs. These pin both halves against the REAL wasm checker on
 // REAL and PLANTED sources, not a recording.
 
+// The interpolation pair reads a file that builds its messages by concatenation, which
+// typecheck.vl stopped doing once the per-kind checkers were carved out of it.
+const INTERP_REL = "compiler/check_calls.vl";
+const INTERP = `${ROOT}/${INTERP_REL}`;
+
 Deno.test({
-  name: "ratchet-hold: prefer-interpolation is EXCLUDED (not merely held) for typecheck.vl once its path is staged",
+  name: "ratchet-hold: prefer-interpolation is EXCLUDED (not merely held) for a compiler/ file once its path is staged",
   ignore: !ENABLED,
   fn: async () => {
     invalidateRatchetBaselines();
-    const { diags } = await rawFindings(); // staged with REL, like the editor now does
+    const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
+    const src = Deno.readTextFileSync(INTERP);
+    const diags = await checker.lintInGraph(src, INTERP_REL, INTERP, diskReader); // staged, like the editor
     const found = diags.filter((d) => d.code === "prefer-interpolation");
     if (found.length !== 0) {
       throw new Error(
-        `want 0 raw prefer-interpolation findings for ${REL} — the exclusion, not ` +
+        `want 0 raw prefer-interpolation findings for ${INTERP_REL} — the exclusion, not ` +
           `a hold — got ${found.length}: ${JSON.stringify(found.slice(0, 3))}`,
       );
     }
     // Nothing for applyRatchetHold to filter — the interp-budget baseline's
     // compiler/ rows staying gone (316 -> 45) is safe BECAUSE the exclusion holds.
-    const out = applyRatchetHold(diags, TARGET, ROOT, false);
+    const out = applyRatchetHold(diags, INTERP, ROOT, false);
     const published = out.filter((d) => d.code === "prefer-interpolation");
     if (published.length !== 0) {
       throw new Error(`want 0 published, got ${published.length}`);
@@ -227,13 +234,13 @@ Deno.test({
   fn: () => {
     invalidateRatchetBaselines();
     const checker = loadWasmChecker(COMPILER, (m) => logs.push(m))!;
-    const src = Deno.readTextFileSync(TARGET);
+    const src = Deno.readTextFileSync(INTERP);
     const diags = checker.lint(src); // no second argument — the pre-fix call shape
     const found = diags.filter((d) => d.code === "prefer-interpolation").length;
-    // Non-vacuity only: the typecheck.vl carves move findings out, so no size floor.
+    // Non-vacuity only: carves move findings between files, so no size floor.
     if (found === 0) {
       throw new Error(
-        `the scoping fix's premise is that typecheck.vl carries an unscoped ` +
+        `the scoping fix's premise is that ${INTERP_REL} carries an unscoped ` +
           `prefer-interpolation count when no path is staged; got only ${found}`,
       );
     }
