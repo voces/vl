@@ -27,52 +27,57 @@ import {
   annUnionAtomsOf,
   asgAnyWiderStore,
   asgStoreTyOf,
-  exitArmBlockAt,
-  exitArmCount,
-  exitFirstLetAt,
-  exitFirstLetCount,
   externValueSeen,
   forInBindTy,
   identModuleDeclOf,
   ifYieldsNoValue,
   inferRetFnKey,
-  inferRetNameByNode,
-  inferRetNameOf,
-  inferRetRowByNode,
-  inferRetTyIxByNode,
-  inferRetTyIxOf,
-  isIdentNamed,
+  isVarTyIxOf,
   joinHeadOf,
   joinRowName,
   joinRowNext,
   joinRowRename,
   lambdaVoidAdoptedAt,
   letJoinCandidates,
-  letNullHoleFilledTy,
-  letNullHoleUnfilled,
   loopValAny,
-  loopValTailOf,
-  loopValTyOf,
   lvTyBool,
   lvTyNever,
   lvTyNull,
   lvTyVoid,
   memSharedCalls,
   nulRecListNominalName,
-  opBinFnAtNode,
-  opIdxFnAtNode,
   optCallRestamp,
   recordNodeTyFrom,
-  refViewCarry,
-  strLitRecvTy,
   voidCoerceValAt,
   voidCoerceValCount,
   voidCoerceValNameAt,
 } from "./typecheck"
 import {
+  exitArmBlockAt,
+  exitArmCount,
+  exitFirstLetAt,
+  exitFirstLetCount,
+  letNullHoleFilledTy,
+  letNullHoleUnfilled,
+  loopValTailOf,
+  loopValTyOf,
+} from "./check_null_holes"
+import {
+  inferRetNameByNode,
+  inferRetNameOf,
+  inferRetRowByNode,
+  inferRetTyIxByNode,
+  inferRetTyIxOf,
+} from "./check_infer_ret"
+import { isIdentNamed } from "./check_call_retire"
+import { refViewCarry } from "./check_ref_list_view"
+import { strLitRecvTy } from "./check_builtin_methods"
+import {
   T,
   TY_I32,
+  TyArray,
   TyFunc,
+  TyUnion,
   litUnionAliasNameOfTy,
   mkArrayTy,
   mkNullableTyOf,
@@ -272,6 +277,7 @@ import {
   inferRetRungIsStructElemList,
 } from "./check_ret_names"
 import { nodeTyMapValExcludesNull } from "./check_hole_pins"
+import { opBinFnAtNode, opIdxFnAtNode } from "./check_callee"
 
 // ── loop and labelled-block values ────────────────────────────────────────────────────────────
 
@@ -3203,7 +3209,21 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     cboxScan(n.idxArr, depth, dlets, alam)
     return cboxScan(n.idxIndex, depth, dlets, alam)
   }
-  if n is IsExpr { return cboxScan(n.isObj, depth, dlets, alam) }
+  if n is IsExpr {
+    cboxScan(n.isObj, depth, dlets, alam)
+    // `x is L` may store an empty `L` back into `x`, so it writes `x` as an assignment does.
+    const w = P.nodes[unwrapParen(n.isObj)]
+    if w is Ident {
+      if cboxIsMayStore(ix, n.isObj) {
+        if depth == 0 {
+          cboxNoteAsg(w.identName)
+        } else if (cboxShadow[w.identName] ?? 0) == 0 {
+          if !strListHas(alam, w.identName) { alam.push(w.identName) }
+        }
+      }
+    }
+    return 0
+  }
   if n is AsExpr { return cboxScan(n.asObj, depth, dlets, alam) }
   if n is Call {
     cboxScan(n.callFn, depth, dlets, alam)
@@ -3242,6 +3262,27 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     return 0
   }
   0
+}
+
+// Whether `is` test `isIx` over operand `obj` may store an empty list of its tested type back
+// into the operand: the test names a list type and the operand is a union with another list
+// arm, which fits when empty (D4949).
+function cboxIsMayStore(isIx: i32, obj: i32): boolean {
+  const chk = isVarTyIxOf(isIx)
+  const ot = nodeTyIxOf(obj)
+  if chk < 0 || chk >= T.tys.length || ot < 0 || ot >= T.tys.length {
+    return false
+  }
+  if !(T.tys[chk] is TyArray) { return false }
+  const u = T.tys[ot]
+  if u is TyUnion {
+    for m in u.uMembers {
+      if m >= 0 && m < T.tys.length && T.tys[m] is TyArray && !tySame(m, chk) {
+        return true
+      }
+    }
+  }
+  false
 }
 
 // The boxed name on the left of `n` when `n` is a `??` or an `=` (`c ?? d`, `(c) = e`) and no

@@ -1,0 +1,227 @@
+// Open list rows: the links that make two array rows carry one element, the default-row
+// licence, and the callee a parked cast on a hole speaks for.
+// Does not import the checker.
+import { BinExpr, FuncDecl, Ident, LetDecl, P, Param, i32ToStr } from "./ast"
+import { T, TyArray } from "./check_types"
+import {
+  CW_OCC_ASG,
+  CW_OCC_BIND,
+  covarRootFrame,
+  covarRootName,
+  cwBoundInitOf,
+  cwCalleeDeclOf,
+  cwIxBuild,
+  cwIxFrHead,
+  cwIxFrNext,
+  cwIxKind,
+  cwIxNode,
+  cwIxPNext,
+  cwIxUnkHead,
+  cwPeel,
+} from "./check_write_scan"
+import { i32ListHas } from "./listutil"
+
+// Hole names whose body applied an `as` cast to the hole itself (`a as i32`), one row per
+// cast site. Both type-level obligations — a bare `as` needs a declared home for what it
+// propagates, and `as?` yields `T | null` exactly when the cast can fail — are decided from
+// the operand's type, which a hole does not carry, so the pinning call site re-asks them. D1342.
+export let holeCastNames: string[] = []
+
+export let arrDefCallTy: i32[] = []
+
+// D1470 — two open array holes that met at a store (`b = a` between two un-annotated bindings,
+// and every other position `constrainEmpty` covers). Neither pins the other, and a later use
+// pins only one of the two rows, so a default applied to the other would silently disagree.
+// Recorded as an unordered pair and read by `arrDefHoleToI32` before it reaches for `i32`.
+export let holeLinkA: i32[] = []
+export let holeLinkB: i32[] = []
+
+// Is `ty` the row an `__array_new_default__` call returned? That membership is the whole licence
+// to default an open element to `i32`: it says `array.new_default` already promised every slot
+// its zero, which a bare `[]` never did — that hole is genuinely under-determined and gets a
+// diagnostic instead. D1470.
+export function arrDefRowIsCall(ty: i32) {
+  if ty < 0 { return false }
+  let j = 0
+  while j < arrDefCallTy.length {
+    if arrDefCallTy[j] == ty { return true }
+    j = j + 1
+  }
+  false
+}
+
+// …or one hop from such a row through a recorded hole link, which is what `let b = a` between
+// two open bindings leaves behind (`noteHoleLink`): `b`'s row is not the call's, and the default
+// it is entitled to arrives through the pair. This is the licence question, not the propagation
+// `resolveHoleLinks` performs — a row it cannot reach is exactly a row no pin decided.
+export function arrDefRowServed(ty: i32) {
+  if arrDefRowIsCall(ty) { return true }
+  let i = 0
+  while i < holeLinkA.length {
+    if holeLinkA[i] == ty {
+      if arrDefRowIsCall(holeLinkB[i]) { return true }
+    }
+    if holeLinkB[i] == ty {
+      if arrDefRowIsCall(holeLinkA[i]) { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Row `ty` and every row a chain of recorded hole links joins to it.
+export function holeLinkClosure(ty: i32): i32[] {
+  const rows: i32[] = [ty]
+  let k = 0
+  while k < rows.length {
+    const r = rows[k]
+    let i = 0
+    while i < holeLinkA.length {
+      if holeLinkA[i] == r && !i32ListHas(rows, holeLinkB[i]) {
+        rows.push(holeLinkB[i])
+      }
+      if holeLinkB[i] == r && !i32ListHas(rows, holeLinkA[i]) {
+        rows.push(holeLinkA[i])
+      }
+      i = i + 1
+    }
+    k = k + 1
+  }
+  rows
+}
+
+// The element of the list row `ty` or of a row a hole link joins to it, or -1 while all are open.
+export function linkedRowElem(ty: i32): i32 {
+  const rows = holeLinkClosure(ty)
+  let k = 0
+  while k < rows.length {
+    const t = T.tys[rows[k]]
+    if t is TyArray {
+      if t.aElem >= 0 { return t.aElem }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// Record that the two array rows `a` and `b` must carry the same element. Deduped, because
+// one `b = a` inside a loop body is checked once but a repeated store spelling is not.
+export function noteHoleLink(a: i32, b: i32) {
+  if a < 0 || b < 0 || a == b { return 0 }
+  let i = 0
+  while i < holeLinkA.length {
+    if holeLinkA[i] == a && holeLinkB[i] == b { return 0 }
+    if holeLinkA[i] == b && holeLinkB[i] == a { return 0 }
+    i = i + 1
+  }
+  holeLinkA.push(a)
+  holeLinkB.push(b)
+  0
+}
+
+// The declared name of parameter `i` in a `Param`-node list, or "" — the call site's half of
+// the direct-read rule above. A call through a function value has no declaration to read, and
+// answers "", which declines every parked cast rather than adjudicating one blind.
+export function declParamNameAt(dParams: i32[], i: i32): string {
+  if i < 0 || i >= dParams.length { return "" }
+  const pn = P.nodes[dParams[i]]
+  if pn is Param { return pn.parName }
+  ""
+}
+
+// The name of parameter `i` of the callee a parked cast on hole `name` speaks for: the declared
+// function's, else the lambda a `const` binds once, so a call through it re-asks the cast (D3624).
+export function holeCastParamName(
+  callFnIx: i32,
+  dParams: i32[],
+  i: i32,
+  name: string,
+): string {
+  const dn = declParamNameAt(dParams, i)
+  if dn != "" { return dn }
+  let parked = false
+  for hn in holeCastNames {
+    if hn == name { parked = true }
+  }
+  if !parked { return "" }
+  hcWrittenMemo = Map()
+  const ld = holeCastCalleeDeclOf(callFnIx, 8)
+  if ld < 0 { return "" }
+  const f = P.nodes[ld]
+  if f is FuncDecl { return declParamNameAt(f.fnParams, i) }
+  ""
+}
+
+// The `FuncDecl` a callee reaches, through up to `depth` `const` aliases of a function or a
+// lambda (`const j = k`), or -1.
+function holeCastCalleeDeclOf(callFnIx: i32, depth: i32): i32 {
+  const d = cwCalleeDeclOf(callFnIx)
+  if d >= 0 || depth <= 0 { return d }
+  const nm = covarRootName(callFnIx)
+  const fr = covarRootFrame(callFnIx)
+  const init = cwBoundInitOf(nm, fr)
+  if init < 0 { return holeCastWrittenDeclOf(nm, fr, depth) }
+  if !(P.nodes[init] is Ident) { return -1 }
+  holeCastCalleeDeclOf(init, depth - 1)
+}
+
+// `holeCastWrittenDeclOf`'s answers within one callee lookup, by `<name>@<frame>`: a chain of
+// bindings each re-pointed several times would otherwise be walked once per path through it.
+let hcWrittenMemo: {[string]: i32} = Map()
+
+// The one `FuncDecl` every write of binding `nm` in frame `fr` reaches, its initialiser and each
+// whole re-pointing `nm = e` alike, or -1 when two writes reach different ones (D3659).
+function holeCastWrittenDeclOf(nm: string, fr: i32, depth: i32): i32 {
+  if nm == "" { return -1 }
+  const key = nm + "@" + i32ToStr(fr)
+  const seen = hcWrittenMemo[key] ?? -2
+  if seen != -2 { return seen }
+  // A cycle (`a = b`, `b = a`) reads as no answer while it is being walked.
+  hcWrittenMemo[key] = -1
+  const r = holeCastWrittenDeclGo(nm, fr, depth)
+  hcWrittenMemo[key] = r
+  r
+}
+
+function holeCastWrittenDeclGo(nm: string, fr: i32, depth: i32): i32 {
+  cwIxBuild()
+  let one = -1
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    let src = -1
+    const k = cwIxKind[r]
+    if k == CW_OCC_BIND || k == CW_OCC_ASG {
+      const w = P.nodes[cwIxNode[r]]
+      if w is LetDecl {
+        src = cwPeel(w.letInit)
+      } else if w is BinExpr {
+        const lhs = P.nodes[cwPeel(w.binLeft)]
+        if !(lhs is Ident) { return -1 }
+        src = cwPeel(w.binRight)
+      }
+      if src < 0 || src >= P.nodes.length { return -1 }
+      let d = -1
+      if P.nodes[src] is FuncDecl { d = src }
+      else if P.nodes[src] is Ident { d = holeCastCalleeDeclOf(src, depth - 1) }
+      if d < 0 || (one >= 0 && d != one) { return -1 }
+      one = d
+    }
+  }
+  one
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function holeLinksReset() {
+  holeCastNames = []
+  arrDefCallTy = []
+  holeLinkA = []
+  holeLinkB = []
+}

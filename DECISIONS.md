@@ -7062,7 +7062,10 @@ allocates more than one 192 MiB semispace, which is where null's footprint cross
 The self-compile is +59% under copying and the gate runs it many times; its entry file is small,
 so `auto` picks null, and every self-compile script (`native-fixpoint.sh`,
 `self-compile-time.sh`, `refresh-compiler.sh`, `survey-profile.sh`) also exports
-`VL_COMPILE_GC=null`, so a change to the threshold cannot move the fixpoint's collector. The threshold reads the ENTRY file only, because the host loads imports on
+`VL_COMPILE_GC=null`, so a change to the threshold cannot move the fixpoint's collector. (The +59% and the pin are
+both superseded: those scripts now source `scripts/self-compile-gc.sh`, copying from a 2 GiB heap,
+which costs the self-compile no CPU — "The self-compile runs under copying from a 2 GiB heap"
+below.) The threshold reads the ENTRY file only, because the host loads imports on
 demand and cannot sum them first. A small entry importing large modules therefore stays null;
 `VL_COMPILE_GC=copying` is the escape.
 
@@ -7150,8 +7153,8 @@ of what is left.)
 **Supersedes the entry-file threshold above.** `vl build` and `vl run` compile under the
 copying collector from a 256 MiB first heap at EVERY entry-file size (`compile_engine`,
 `scripts/vl-host/src/main.rs`). `$VL_COMPILE_GC=null|copying` stay as overrides (`auto` is
-copying), `$VL_COMPILE_GC_HEAP` still sets the first heap, and the self-compile scripts still
-pin null.
+copying), `$VL_COMPILE_GC_HEAP` still sets the first heap. The self-compile scripts pinned null until
+2026-10-15 and now pin copying from a 2 GiB heap (the section after this one).
 
 **Why.** The threshold read the ENTRY file, so sunpa's `game.vl` — a 260 KB entry over a 2 MB
 module graph — compiled under null and held every byte the compiler allocated: 2.4 GB peak per
@@ -7181,9 +7184,8 @@ the most collections but the least memory, and keeps the engine configuration �
 `.cwasm` sidecar — that `refresh-compiler.sh` already warms. Each distinct value is a fresh
 Cranelift compile of the seed (~9 s, ~1.9 GB peak, once per host binary).
 
-**Why the self-compile stays null.** It is the one input here where null is faster (~10% wall,
-~16% CPU, against 54% less memory), and the gate runs it many times; the scripts pin it, so the
-default does not move it.
+The self-compile's own collector is the next section's: it was pinned null here and is no
+longer.
 
 **Declined.**
 * *A null start that switches to copying when the heap nears a size.* Impossible mid-instance:
@@ -7198,6 +7200,68 @@ default does not move it.
 **Rows that moved.** D2771, D2780 and D3407 filed a compiler trap that was the null heap filling
 with garbage; under copying their witnesses build in 8–10 s at about 300 MB, and the trap is
 closed while the exponential cost in their titles stays open.
+
+## The self-compile runs under copying from a 2 GiB heap (2026-10-15) — D4942
+
+**The rule.** Every script that compiles the compiler (`refresh-compiler.sh`,
+`native-fixpoint.sh`, `self-compile-time.sh`, `survey-profile.sh`) sources
+`scripts/self-compile-gc.sh`, which exports `VL_COMPILE_GC=copying` and
+`VL_COMPILE_GC_HEAP=2G`. CI's seed, publish and fuzz jobs reach the self-compile only through
+those scripts. `self-compile-time.sh` also reads the copying heap's peak live set
+(`VL_GC_STATS=1`) and fails past 75% of the 2 GiB that is the most a copying heap can hold live.
+
+**Why null had to go.** Under null the 4 GiB heap cap is a cap on TOTAL allocation, not on what
+is live, and the self-compile's total grows with every merge. Each commit's own fixpoint seed
+compiling itself, `VL_COMPILE_GC=null`, `[alloc] guest`:
+
+| commit (date) | allocated | of 4 GiB | guest fuel |
+| --- | ---: | ---: | ---: |
+| `deeedb5a8` (10-07) | 2,166,890,496 | 50.5% | 60.61e9 |
+| `1af9fe52f` (10-08) | 2,041,344,000 | 47.5% | 58.07e9 |
+| `cbda47ace` (10-13) | 3,167,567,872 | 73.7% | 71.53e9 |
+| `d3a1d199e` (10-14) | 3,445,157,888 | 80.2% | 78.67e9 |
+| `56035e845` (10-15) | 3,487,502,336 | 81.2% | 79.69e9 |
+| `479bffedb` (10-15) | 3,645,943,808 | 84.9% | 89.57e9 |
+
+That is +478 MB over the last 200 merges and ~650 MB of headroom left. #3863 (3,542,106,112 B)
+plus ONE appended generic declaration was enough: it builds and reaches its fixpoint under
+copying, and the null self-compile traps `wasm trap: allocation size too large`. A cliff that one
+ordinary declaration falls off is not headroom.
+
+**Why copying costs nothing here now.** The section above measured null ~10% faster on the
+self-compile; that reading was the 256 MiB default, and does not hold at 2 GiB. On `479bffedb`,
+four rounds in rotated order on a loaded box (load 15–70), CPU = user+sys, all four
+configurations emitting the same 5,782,219 bytes:
+
+| configuration | CPU per round (s) | peak RSS | collections | peak live |
+| --- | --- | ---: | ---: | ---: |
+| null | 19.1 / 17.1 / 19.3 / 28.1 | 3,912 MB | 0 | — |
+| copying 256 MiB (the default) | 20.4 / 25.1 / 30.0 / 40.8 | 1,114 MB | 62 | 484,078 KiB |
+| copying 1 GiB | 17.7 / 22.1 / 29.7 / 36.0 | 1,114 MB | 44 | — |
+| copying 2 GiB | 15.5 / 18.1 / 19.1 / 28.3 | 2,163 MB | 6 | 476,784 KiB |
+
+The 256 MiB default doubles to a 512 MiB semispace and stops there, with a ~480 MB live set
+inside it — the bad band the section above describes, re-collecting 62 times. 2 GiB starts past
+it: six collections, CPU level with null, 45% less RSS.
+
+**Why this removes the cliff rather than moving it.** A copying heap's limit is the live set
+against a 2 GiB semispace (half the 4 GiB cap), and the live set is 477 MB — about 4x headroom,
+and growth in garbage costs collections, not a trap. That is what the tripwire watches: a live
+set nearing the cap is a compiler that keeps too much alive across phases, and no collector
+setting fixes it.
+
+**What did not move.** Guest fuel is the same under either collector (89,567,007,365 on
+`479bffedb`), so `scripts/self-compile-baseline.json` stands. Fixpoint bytes are identical. The
+2 GiB setting is its own engine configuration, so the seed gets one more `.cwasm` sidecar, which
+`refresh-compiler.sh`'s sanity run warms.
+
+**Declined.**
+* *(b) keep null, add a headroom failure and an allocation ratchet.* The ratchet would fire on
+  ordinary growth every few hundred merges and the only response to it is this change; null's
+  cap stays a cap on everything ever allocated.
+* *Free the compiler's tables between phases.* Worth doing for the live set, but cannot help
+  null, which never frees.
+* *Copying from the 256 MiB default.* Fixes the cliff but re-collects 62 times, +20–45% CPU.
 
 ## `wasm-opt` runs on at most four threads (2026-09-24) — plumb compile perf, D2311
 
@@ -10279,8 +10343,66 @@ elements do.
 
 **What it keeps.** A `string[]` tested against a string literal set does not narrow to
 `S[]` in the then-branch, because strings and atoms are stored differently; the same reason
-D4058 keeps a record's declared type. A box union's list arm is still tested by its tag
-(D4778, D4779).
+D4058 keeps a record's declared type. A box union's list arm is tested by its tag only where
+the tag gives the structural answer: a `string[]` arm tested `is S[]` also tests its elements,
+and the then-branch keeps the union, as D4056 keeps a record union's (D4779). A list of
+string-literal atoms beside an `i32[]` arm holds its own tag (D4906), at every list depth
+(D4914), and two atom-list arms sharing a tag test their atoms (D4938). An arm in a disjoint
+rep fits when it is empty (D4915).
+
+**An `is` that fits that way stores a new empty list back into the place (D4949).** The
+local, global, record field, list element or captured variable it tested now holds an empty
+list of the tested arm, so the then-branch reads, pushes into and delivers that arm's rep. A
+captured variable a closure tests so becomes a shared cell, as one a closure assigns does.
+
+```vl
+const e: f64[] = []
+const b: { items: f64[] | string[] } = { items: e }
+if b.items is string[] { b.items.push("v") }
+print(b.items.length)   // 1
+print(e.length)         // 0
+```
+
+The old list cannot change rep in place, since another reference typed as the other arm (`e`
+here) would then hold a `string`. Nor can the push go through the old list, which cannot hold
+the new element. The price: after such an `is`, the place and any earlier reference to the old
+empty list no longer share writes, so an `e.push(1.5)` after the test is not seen through
+`b.items`, where with no `is` it would be. A place the `is` has no store for still reads an
+empty list of the tested arm (D4939).
+`is K[]` with a numeric `K` over a union with no `K[]` arm is still refused (D4778).
+
+## A reassigned function binding called at several types holds one closure per type (owner ruling, 2026-10-15) — D3975
+
+**The rule.** A written function binding called at more than one argument type compiles.
+Its rep is an instance record with one closure slot per call type: a write such as `f = k`
+fills every slot, and each call reads its own slot.
+
+```vl
+function id<T>(x: T): T { return x }
+function k<T>(x: T): T { return x }
+let f = id
+f = k
+print(f(1))     // 1
+print(f("s"))   // s
+```
+
+**Delivery is by value.** Where the binding goes to a place that holds one plain function
+(a list element of `((x: i32) => i32)[]`, a parameter, a field, a return, a `push`, a map
+value, an annotated `let`), the compiler stores the instance at the destination's type. A
+later write to `f` does not reach the stored value. A destination with no fixed function
+type (an un-annotated list, an inferred return) has no instance to pick and keeps the emit
+refusal.
+
+**Cost.** Only a binding that is both reassigned and called at two or more types changes
+rep. Every other call, plain or generic, compiles byte-identically; the difftree
+`--identity` proof differs only on programs master refused.
+
+**`==`.** Every `==`/`!=` read of the binding reads one slot, so equality compares the
+function the binding holds, as it does for a plain function binding; the record itself is
+never compared. Of the three options (compare the held function, compare slot by slot,
+refuse `==` on such a binding) this is the conservative one, and the other two stay open.
+A15's line that `==` on two functions is a check error does not describe the compiler:
+`==` on two function bindings compiles and compares the function held.
 
 ## Record arms that share a field name form a legal union (Q4 (c), owner ruling, 2026-10-12) — D4056
 
@@ -10408,3 +10530,53 @@ implementation; this is that record. Each direction in its own words:
 Items 2 and 8 also carry open sub-questions in §5 (a shadowable convenience name;
 graduated visibility levels). They stay open. `docs/spec/modules.md` cites directions 4
 and 8 for M1.2 and M2.3; D4063 is the gap in direction 4.
+
+## An unbound type parameter defaults at the call (D4551 option (b), 2026-10-15) — D4551, D4910
+
+**The rule.** An inferred call that leaves a type parameter unbound, because no parameter
+annotation of the callee names it and no type argument is written, binds it to `i32`
+(`MONO_UNBOUND_TY_PARAM_DEFAULT`, `monoDefaultUnboundTyParams` in `compiler/emit_mono.vl`). The
+instance is keyed as the explicit call would be, so `opT(a)` and `opT<i32, i32>(a)` share one.
+
+```vl
+function opT<T, U>(a: T[]) {
+  const q: U[] = []
+  return inner(q) + a.length   // was invalid wasm: `q` was a list over a hole
+}
+print(opT([1]))                // 2, as opT<i32, i32>([1])
+```
+
+**Why a default and not a refusal.** D1819 accepts `countOf<T>()`, whose local `xs: T[]` is
+read through `.length`; refusing every body local that names an unbound parameter would
+re-rule that accept set, and the program has nothing a caller could get wrong. Such a
+parameter names only body locals, and those hold no value of it: nothing outside the body can
+deliver one, and nothing inside can make one.
+
+**The invariant: the choice is not observable.** Any default must give every program the
+same output. It is enforced in four places:
+
+* **Scope.** Only a parameter that no parameter annotation names is defaulted. One a
+  parameter names is bound by its argument or stays an inference error.
+* **No spelling reads it.** A parameter whose binding could reach an `is` check type or a
+  `T.field` layout constant, in the body (lambdas included) or in a generic the body calls with
+  a type argument naming it or an argument whose type has a type variable, is left unbound
+  (`monoTyParamReachesSpelling`). Such a program keeps the refusal it had before the default:
+  `T.size` with no binding still says `T` needs a parameter, never that `i32` is not `flat`.
+* **No values.** A local of an unbound parameter can only be empty (`[]`, `null`, a record
+  over such lists), so a read of its length, its nullness or its elements agrees under every
+  default.
+* **`is` answers by the value.** `q is K[]` over a list whose element type is disjoint from
+  `K`'s at some depth tests emptiness (D4910, by the D4771 ruling), so an empty `q` is a `K[]`
+  for every `K`, in the body and in any generic it is passed to.
+
+**Measured.** A build with the default set to `f64` against the shipped `i32` build, over a
+probe set covering the witness, explicit bindings, `countOf`, nullable locals, closures, list
+literals, transitive `is`, nested lists and record fields: identical output.
+
+**An arm that reads the receiver reads an empty `K[]`** (D4911). Where an arm the `is`
+narrows reads the receiver as `K[]`, it reads a fresh empty `K[]` in the receiver's place, so
+`if q is f64[] { print(q.length) }` prints `0` under every default. A push through the arm
+pushes onto that `K[]`, which stays the receiver's place from the first test that fits on, so a
+later `q.length` reads it (D4934); the caller's own list is not pushed onto, the detach D4949
+pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
+(D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.

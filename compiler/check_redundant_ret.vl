@@ -1,0 +1,114 @@
+// Redundant return-type annotations: a declared result the body's inferred return already
+// is, recorded for the hint.
+// Does not import the checker.
+import {
+  Block,
+  FuncDecl,
+  P,
+  Param,
+  declExported,
+  declNameTokOf,
+  getDeclPropOf,
+  opDeclLabelBin,
+} from "./ast"
+import {
+  redunECol,
+  redunELine,
+  redunName,
+  redunRet,
+  redunSCol,
+  redunSLine,
+  redunTok,
+  redunType,
+} from "./check_state"
+import { demangleName } from "./check_suggest"
+import { jwTokIsGenerated } from "./check_sym_occ"
+import { tyToStrUser, tyToStructStr } from "./check_types"
+import { arrElemNameRaw } from "./tyname"
+
+// Record a redundant return-type annotation (`function f(): T { … }` whose body's inferred return
+// already is T) into the same finding stream the `let` rule uses. The fix deletes the `: T` between
+// the params `)` and the body `{`; both span ends are token-index scans, robust in a merged
+// multi-module compile. An object return is excluded — equal by render, not always by rep.
+export function recordRedundantRet(n: FuncDecl, fnIx: i32, ret: i32) {
+  // Only scalar and string returns — the categories the emitter default and the inferred-return
+  // elaboration classify for an un-annotated function. Object / array / union / nullable returns
+  // can mis-lower, the emitter re-deriving them from the return expression, so keep those.
+  const rnm = tyToStructStr(ret)
+  if !isClassifiableRetName(rnm) { return 0 }
+  // A getter's result type is required, not redundant: the body contract checks against it.
+  if getDeclPropOf(n.fnName) != "" { return 0 }
+  // An exported function's return type documents the module's API (D3597).
+  if declExported(fnIx) { return 0 }
+  // Skip generic functions: an un-annotated param is a per-call-site hole the inferred-return
+  // elaboration does not cover, so a removed string return could mis-lower.
+  let gi = 0
+  while gi < n.fnParams.length {
+    const gpn = P.nodes[n.fnParams[gi]]
+    if gpn is Param {
+      if gpn.parType < 0 { return 0 }
+    }
+    gi = gi + 1
+  }
+  const nameTok = declNameTokOf(fnIx)
+  if nameTok < 0 { return 0 }
+  const bn = P.nodes[n.fnBody]
+  if !(bn is Block) { return 0 }
+  if bn.pos < 0 { return 0 }
+  let braceTok = -1
+  let bi = nameTok + 1
+  while bi < P.toks.length && braceTok < 0 {
+    if P.toks[bi].start == bn.pos { braceTok = bi }
+    bi = bi + 1
+  }
+  if braceTok < 0 { return 0 }
+  // The return annotation's colon, found by scanning backward from the body `{`. Forward from the
+  // name finds the wrong one: a type-parameter bound's colon (`<T: Showable>`) is also at bracket
+  // depth 0, because `<`/`>` are not brackets, and the fix then wrote source that does not parse
+  // (D1441). Backward, the return's colon is the first depth-0 one.
+  let colonTok = -1
+  let depth = 0
+  let ci = braceTok - 1
+  while ci > nameTok && colonTok < 0 {
+    const kd = P.toks[ci].kind
+    if kd == "RPAREN" || kd == "RBRACK" || kd == "RBRACE" {
+      depth = depth + 1
+    } else if kd == "LPAREN" || kd == "LBRACK" || kd == "LBRACE" {
+      depth = depth - 1
+    } else if depth == 0 && kd == "COLON" {
+      colonTok = ci
+    }
+    ci = ci - 1
+  }
+  if colonTok < 0 { return 0 }
+  if jwTokIsGenerated(nameTok) { return 0 }
+  redunSLine.push(P.toks[colonTok].line)
+  redunSCol.push(P.toks[colonTok].col)
+  redunELine.push(P.toks[braceTok].line)
+  redunECol.push(P.toks[braceTok].col)
+  redunName.push(opDeclLabelBin(demangleName(n.fnName)))
+  // User-facing (the finding's message quotes it) — the user render, not the raw one.
+  redunType.push(tyToStrUser(ret))
+  redunTok.push(nameTok)
+  redunRet.push(true)
+  0
+}
+
+// Whether an inferred return type name is one the emitter's A20 classifier carries directly
+// (a scalar/string/simple list) — the set the inferred-return table records. The two list
+// names go through `arrElemNameRaw`'s array-grammar cut plus a leaf-name check rather than a
+// raw string match, so the array `[]` and the leaf name are decided at one shared seam.
+export function isClassifiableRetName(nm: string) {
+  if (
+    nm == "i32"
+    || nm == "i64"
+    || nm == "f32"
+    || nm == "f64"
+    || nm == "boolean"
+    || nm == "string"
+  ) {
+    return true
+  }
+  const elem = arrElemNameRaw(nm)
+  elem == "i32" || elem == "string"
+}

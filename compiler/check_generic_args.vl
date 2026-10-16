@@ -1,0 +1,351 @@
+// Generic calls and their arguments: whether a generic body makes no new value of a type
+// parameter, lambdas annotated from written type arguments, and the argument order an open
+// parameter meeting a type variable needs.
+// Does not import the checker.
+import {
+  AsExpr,
+  BinExpr,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  Member,
+  P,
+  Param,
+  TS_FUNC,
+  TypeRef,
+  Unary,
+  annTsOf,
+  arenaNoteEdit,
+  callTyArgsAny,
+  callTyArgsOf,
+  mkTypeRef,
+  nodeChildren,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsToNameSubst,
+} from "./ast"
+import { isReservedIntrinsicName } from "./check_intrinsics"
+import { nodeTyIxOf } from "./check_node_tys"
+import { tyHasTyVar, tyOpenOrTyVar } from "./check_ty_shape"
+import { T, TyFunc } from "./check_types"
+import { cwFnDeclOf, cwPeel, cwUfcsDeclOf, fnDeclIx } from "./check_write_scan"
+
+// How much a call site knows about its callee, for `cstrOwnedBy`: a declared callee is its own
+// node index; `CSTR_NODECL` is a name with no declaration (a closure parameter called inside a
+// generic body); `CSTR_ANYFN` is no callee at all (a function value instantiated from its type
+// by `genericFnAssignable`).
+export const CSTR_NODECL = -1
+
+// The callee a re-ask names for owner `o`: its declaration, or none for a module-level write.
+export function fsbOwnerCallee(o: i32): i32 {
+  if o >= 0 { return o }
+  CSTR_NODECL
+}
+
+// Is this argument a generic function taken as a VALUE — `applyTS(idT)`, where the boundary
+// itself binds `idT`'s own `<T>` and a second boundary binds it differently in the same
+// program? Such a hole belongs to the argument's declaration, not to an enclosing frame, so
+// it is pinned per boundary and no parked demand may be re-asked against another's pin.
+export function argIsOwnGenericFnValue(argIx: i32): boolean {
+  if argIx < 0 || argIx >= P.nodes.length { return false }
+  const a = P.nodes[argIx]
+  if a is Ident {
+    const d = fnDeclIx[a.identName] ?? CSTR_NODECL
+    if d >= 0 && d < P.nodes.length {
+      const fd = P.nodes[d]
+      if fd is FuncDecl { return fd.fnTyParams.length > 0 }
+    }
+  }
+  false
+}
+
+// The order `checkCall` checks a call's arguments in: source order, except that a function
+// with an open parameter whose arrow position rides a type variable goes after the rest, so
+// the variable binds from the values and never to the function's own hole. A variable only in
+// the arrow's return binds from the function itself, and keeps source order.
+export function lambdaLastOrder(params: i32[], args: i32[]): i32[] {
+  const order: i32[] = []
+  const later: i32[] = []
+  let i = 0
+  while i < args.length {
+    if i < params.length && argOpenMeetsTyVar(params[i], args[i]) {
+      later.push(i)
+    } else {
+      order.push(i)
+    }
+    i = i + 1
+  }
+  let k = 0
+  while k < later.length {
+    order.push(later[k])
+    k = k + 1
+  }
+  order
+}
+
+// Does argument `argIx`, a function literal with an un-annotated parameter (D2426) or a declared
+// generic named as a value (D2425), have an open parameter at an arrow position of `paramTy`
+// that carries a type variable?
+function argOpenMeetsTyVar(paramTy: i32, argIx: i32): boolean {
+  if paramTy < 0 || paramTy >= T.tys.length { return false }
+  const pt = T.tys[paramTy]
+  if !(pt is TyFunc) { return false }
+  if argIx < 0 || argIx >= P.nodes.length { return false }
+  const ax = cwPeel(argIx)
+  if ax < 0 || ax >= P.nodes.length { return false }
+  // A name resolves to its declaration; any other node is its own candidate.
+  let d = ax
+  const a = P.nodes[ax]
+  if a is Ident { d = fnDeclIx[a.identName] ?? CSTR_NODECL }
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) { return false }
+  const generic = fd.fnTyParams.length > 0
+  const pps = pt.fnParamTypes
+  let k = 0
+  while k < fd.fnParams.length && k < pps.length {
+    const p = P.nodes[fd.fnParams[k]]
+    if p is Param {
+      if (generic || p.parType < 0) && tyHasTyVar(pps[k]) { return true }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The declared function the call `c` in the generic `d` names, -2 for a compiler intrinsic or
+// `print`, or -1 when the callee is anything else: an alias, a local, a parameter, a field or
+// an index. A body is proven closed only through calls that resolve here.
+function closedCalleeDecl(c: Call, d: i32): i32 {
+  const cf = P.nodes[c.callFn]
+  let name = ""
+  let dx = -1
+  if cf is Ident {
+    name = cf.identName
+    if isReservedIntrinsicName(name) || name == "print" {
+      if !closedNameBound(d, name) { return -2 }
+      return -1
+    }
+    dx = cwFnDeclOf(name)
+  } else if cf is Member {
+    name = cf.memProp
+    dx = cwUfcsDeclOf(c.callFn)
+  }
+  if dx < 0 || dx >= P.nodes.length || closedNameBound(d, name) { return -1 }
+  if P.nodes[dx] is FuncDecl { return dx }
+  -1
+}
+
+// Whether the function `d` binds `name` itself — a parameter, a local, a loop variable or a
+// nested function — so a call spelled `name` there does not reach the declared function.
+function closedNameBound(d: i32, name: string): boolean {
+  if d < 0 || d >= P.nodes.length { return true }
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    for p in dn.fnParams {
+      const pn = P.nodes[p]
+      if pn is Param {
+        if pn.parName == name { return true }
+      }
+    }
+    return nodeBindsNameGo(dn.fnBody, name)
+  }
+  true
+}
+
+function nodeBindsNameGo(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letName == name { return true }
+  } else if n is Param {
+    if n.parName == name { return true }
+  } else if n is FuncDecl {
+    if n.fnName == name { return true }
+  } else if n is ForRange {
+    if n.frVar == name { return true }
+  } else if n is ForIn {
+    if n.fiVar == name || n.fiVar2 == name { return true }
+  }
+  for k in nodeChildren(ix) {
+    if nodeBindsNameGo(k, name) { return true }
+  }
+  false
+}
+
+// Whether the generic function `d`'s body makes no new value of a type parameter: no operator
+// but a comparison, logic or assignment takes one, no `as` yields one, and every call resolves
+// to a declared function, closed too when generic. Only such a body keeps a literal-union
+// binding a member (D3602).
+export function genericBodyClosed(d: i32, depth: i32): boolean {
+  if depth > 4 || d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return nodeClosedGo(dn.fnBody, d, depth) }
+  false
+}
+
+function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    const op = n.binOp
+    const keeps = (op == "=="
+      || op == "!="
+      || op == "<"
+      || op == ">"
+      || op == "<="
+      || op == ">="
+      || op == "&&"
+      || op == "||"
+      || op == "="
+      || op == "??")
+    if !keeps {
+      if (
+        tyOpenOrTyVar(nodeTyIxOf(n.binLeft))
+        || tyOpenOrTyVar(nodeTyIxOf(n.binRight))
+      ) {
+        return false
+      }
+    }
+  } else if n is Unary {
+    if n.unOp != "!" && tyOpenOrTyVar(nodeTyIxOf(n.unArg)) { return false }
+  } else if n is AsExpr {
+    if tyOpenOrTyVar(nodeTyIxOf(ix)) { return false }
+  } else if n is Call {
+    const g = closedCalleeDecl(n, d)
+    if g != -2 {
+      if g < 0 { return false }
+      const gn = P.nodes[g]
+      if gn is FuncDecl {
+        if (
+          gn.fnTyParams.length > 0
+          && g != d
+          && !genericBodyClosed(g, depth + 1)
+        ) {
+          return false
+        }
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if !nodeClosedGo(k, d, depth) { return false }
+  }
+  true
+}
+
+// Under written type arguments, a function literal's un-annotated parameter becomes annotated
+// with the callee's declared parameter spelling, its type parameters replaced by the written
+// arguments: the program is then the annotated twin every later pass already lowers. Runs
+// before checking, on spellings only; a callee the arena does not name uniquely is skipped.
+export function annotateTyArgLambdas() {
+  genDeclByName = Map()
+  // With no call writing a type argument there is nothing to annotate, and no reader of the
+  // generic-declaration index is reached (each asks with a call's written arguments).
+  if !callTyArgsAny() { return 0 }
+  const n0 = P.nodes.length
+  let i = 0
+  while i < n0 {
+    const d = P.nodes[i]
+    if d is FuncDecl {
+      if d.fnTyParams.length > 0 {
+        if genDeclByName.has(d.fnName) {
+          genDeclByName[d.fnName] = -1
+        } else {
+          genDeclByName[d.fnName] = i
+        }
+      }
+    }
+    i = i + 1
+  }
+  let c = 0
+  while c < n0 {
+    const cn = P.nodes[c]
+    if cn is Call {
+      const tas = callTyArgsOf(c)
+      if tas.length > 0 { annotateCallLambdas(cn, tas) }
+    }
+    c = c + 1
+  }
+  0
+}
+
+// Each generic function name the program declares once, to its `FuncDecl`; -1 for a name
+// declared more than once. Filled by `annotateTyArgLambdas` for this program.
+let genDeclByName: {[string]: i32} = Map()
+
+// The one generic `FuncDecl` named `name` with `arity` type parameters, or -1.
+export function uniqueGenericDeclNamed(name: string, arity: i32): i32 {
+  const ix = genDeclByName[name] ?? -1
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const d = P.nodes[ix]
+  if d is FuncDecl {
+    if d.fnTyParams.length == arity { return ix }
+  }
+  -1
+}
+
+function annotateCallLambdas(cn: Call, tas: i32[]) {
+  const f = P.nodes[cn.callFn]
+  if !(f is Ident) { return 0 }
+  const dIx = uniqueGenericDeclNamed(f.identName, tas.length)
+  if dIx < 0 { return 0 }
+  const d = P.nodes[dIx]
+  if !(d is FuncDecl) { return 0 }
+  const names: string[] = []
+  let t = 0
+  while t < tas.length {
+    const ta = P.nodes[tas[t]]
+    if ta is TypeRef { names.push(ta.tyName) } else { return 0 }
+    t = t + 1
+  }
+  let a = 0
+  while a < cn.callArgs.length && a < d.fnParams.length {
+    if a < cn.callArgNames.length && cn.callArgNames[a] != "" { return 0 }
+    const dp = P.nodes[d.fnParams[a]]
+    const lx = cwPeel(cn.callArgs[a])
+    if dp is Param && lx >= 0 && lx < P.nodes.length {
+      const lam = P.nodes[lx]
+      if lam is FuncDecl {
+        if dp.parType >= 0 {
+          annotateLambdaFrom(lam, annTsOf(dp.parType), d.fnTyParams, names)
+        }
+      }
+    }
+    a = a + 1
+  }
+  0
+}
+
+// `lam`'s un-annotated parameters, annotated from the function-type spelling `root`.
+function annotateLambdaFrom(
+  lam: FuncDecl,
+  root: i32,
+  typarams: string[],
+  args: string[],
+) {
+  if root < 0 || root >= tsKind.length { return 0 }
+  if tsKind[root] != TS_FUNC { return 0 }
+  const cnt = tsKidCount[root] - 1
+  if cnt != lam.fnParams.length { return 0 }
+  let k = 0
+  while k < cnt {
+    const p = P.nodes[lam.fnParams[k]]
+    if p is Param {
+      if p.parType < 0 {
+        const kid = tsKids[tsKidStart[root] + k]
+        const spelled = tsToNameSubst(kid, typarams, args)
+        if spelled != "" {
+          arenaNoteEdit(lam.fnParams[k])
+          p.parType = mkTypeRef(spelled, p.pos)
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}

@@ -18,10 +18,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# The self-compile's collector is a CHOICE, not the default's accident: `auto` is copying,
-# and null is ~10% faster here, so pinning it keeps a default change from silently
-# moving the fixpoint's CPU (DECISIONS.md, "The compiler's collector is copying by default").
-export VL_COMPILE_GC=null
+# The self-compile's collector is a CHOICE, not the default's accident: copying from a 2 GiB
+# first heap, owned by scripts/self-compile-gc.sh (DECISIONS.md, "The self-compile runs under
+# copying from a 2 GiB heap").
+. scripts/self-compile-gc.sh
 SEED="${SEED:-build/vl-compiler.wasm}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

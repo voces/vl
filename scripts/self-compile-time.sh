@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # THE L2 TRIPWIRE: the candidate compiling the compiler, in guest FUEL, against a committed
-# baseline. Fails past the baseline's factor (1.5x).
+# baseline. Fails past the baseline's factor (1.5x), and when the live set nears the heap's cap.
 #
 # It is a tripwire, not a measurement. A cost regression does not slow the SOURCE, it
 # slows the compiler BUILT from it — stage 3 runs the old compiler and stays fast, so an
@@ -23,10 +23,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
-# The self-compile's collector is a CHOICE, not the default's accident: pinned so the
-# committed baseline always prices the same collector (DECISIONS.md, "The compiler's
-# collector is copying by default").
-export VL_COMPILE_GC=null
+# The self-compile's collector is a CHOICE, not the default's accident: pinned by
+# scripts/self-compile-gc.sh, so this row times the build the other self-compile rows run.
+# Fuel does not depend on the collector; the heap headroom below does.
+. scripts/self-compile-gc.sh
 SEED="${SEED:-build/vl-compiler.wasm}"
 SRC="${SRC:-compiler/entry.vl}"
 BASELINE="${BASELINE:-scripts/self-compile-baseline.json}"
@@ -50,11 +50,27 @@ VL_FUEL=1 timeout 600 "$VL" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compile
 # compiling the compiler. `timeout` bounds the BUILD, never the shell around it — a
 # killed shell leaves the build re-parented to init at 90% of a core (CLAUDE.md,
 # "timeout KILLS THE SHELL, NOT THE BUILD").
-{ time -p VL_FUEL=1 timeout 600 "$VL" build "$SRC" -o "$WORK/l2.wasm" --compiler "$SEED"; } \
+{ time -p VL_FUEL=1 VL_GC_STATS=1 timeout 600 "$VL" build "$SRC" -o "$WORK/l2.wasm" --compiler "$SEED"; } \
   2> "$WORK/t" || { echo "L2 self-compile FAILED (rc above; 124 is a real hang)"; cat "$WORK/t"; exit 1; }
 CPU=$(awk '/^user/{u=$2} /^sys/{s=$2} END{printf "%.1f", u + s}' "$WORK/t")
 FUEL=$(awk '/^\[fuel\] guest: [0-9]+$/{print $3}' "$WORK/t")
 [ -n "$FUEL" ] || { echo "this host prints no \`[fuel]\` line (it predates \$VL_FUEL); rebuild scripts/vl-host"; exit 1; }
+
+# HEAP HEADROOM. A copying heap tops out at 4 GiB, half of it a semispace, so the largest live
+# set any self-compile can hold is 2 GiB. Past 75% of that, ordinary growth is one feature from
+# `allocation size too large`, so this fails loudly while there is still room to act. Not a
+# ratchet: the live set may grow, it may not approach the cap unnoticed.
+LIVE_KIB=$(sed -n 's/.*peak live after a collection: \([0-9][0-9]*\) KiB.*/\1/p' "$WORK/t")
+[ -n "$LIVE_KIB" ] || { echo "this host prints no peak live set under \$VL_GC_STATS=1; rebuild scripts/vl-host"; exit 1; }
+CAP_KIB=$((2 * 1024 * 1024))
+LIVE_PCT=$((100 * LIVE_KIB / CAP_KIB))
+echo "L2 self-compile peak live set $((LIVE_KIB / 1024)) MiB, ${LIVE_PCT}% of the 2 GiB a copying heap can hold (fails past 75%)"
+if [ "$LIVE_PCT" -gt 75 ]; then
+  echo "SELF-COMPILE HEAP HEADROOM: the compiler's live set is ${LIVE_PCT}% of the most a copying"
+  echo "  heap can hold. Find what the compiler keeps alive across phases (profiling-the-compiler.md,"
+  echo "  the heap census) before a feature pushes it over; no collector setting raises the cap."
+  exit 1
+fi
 
 if [ "${1:-}" = "--write-baseline" ]; then
   COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)

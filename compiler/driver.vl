@@ -16,6 +16,18 @@ import {
   mimpNoteMoved,
   mimpSpecsFor,
 } from "./missing_import"
+import {
+  FS_APPLY,
+  FS_COMPILE,
+  FS_PLAN,
+  fsAfterParse,
+  fsAsked,
+  fsGrew,
+  fsModeOf,
+  fsPlan,
+  fsReset,
+  fsSetMode,
+} from "./fn_split"
 // The source-in / bytes-out driver — the interface `scripts/vl-host` embeds against.
 // A real `import`/`export` module that imports the pipeline (lexer → ast → parser →
 // typecheck → wasmEmit → lint → format) and exposes the host ABI
@@ -250,13 +262,9 @@ import {
   canonRestoreSpellings,
   checkNotIntrinsicImportLocal,
   checkNotIntrinsicName,
-  discLeafCollect,
-  discLeafScalarAt,
-  discLeafTokAt,
   esDumpText,
   esTextOfDecl,
   initChecker,
-  isBuiltinCallName,
   jwSiteNode,
   memSharedCalls,
   plusLinkCount,
@@ -269,6 +277,12 @@ import {
   tErr,
   tErrBuiltinTyDecl,
 } from "./typecheck"
+import {
+  discLeafCollect,
+  discLeafScalarAt,
+  discLeafTokAt,
+} from "./check_discarded"
+import { isBuiltinCallName } from "./check_getter_effects"
 import { T, demangleMsg } from "./check_types"
 import { isReservedIntrinsicName } from "./check_intrinsics"
 import { isBuiltinTyName } from "./check_suggest"
@@ -1191,8 +1205,38 @@ function pipelineReset(): i32 {
   0
 }
 
-// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error.
+// 0 = ok; 1 = lex/parse error; 2 = type error; 3 = emit error. A program whose only emit
+// error is a function binding wanting two signatures compiles again with an instance record
+// (`fn_split.vl`); when that does not build either, the first compile is run again so its
+// error is the one reported.
 export function compileSrc(): i32 {
+  fsReset()
+  const rc = compileSrcOnce()
+  if rc != 3 || !fsAsked() { return rc }
+  let round = 0
+  while round < FS_ROUNDS {
+    fsSetMode(FS_PLAN)
+    if compileSrcOnce() != 0 {
+      round = FS_ROUNDS
+    } else {
+      fsSetMode(FS_APPLY)
+      const rc3 = compileSrcOnce()
+      if rc3 == 0 {
+        fsSetMode(FS_COMPILE)
+        return 0
+      }
+      if rc3 != 3 || !fsGrew() { round = FS_ROUNDS }
+    }
+    round = round + 1
+  }
+  fsSetMode(FS_COMPILE)
+  compileSrcOnce()
+}
+
+// The rounds a split may take, each adding the bindings the previous one's compile refused.
+const FS_ROUNDS = 4
+
+function compileSrcOnce(): i32 {
   plusLinksClear()
   symSetEnabled(0)
   pipelineReset()
@@ -1203,6 +1247,7 @@ export function compileSrc(): i32 {
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
+  if fsAfterParse() < 0 { return 3 }
   // No vcEpBank: only a check's tree is replayed by the lint, and a compile never is.
   ambientRenameSingle(root)
   csPreMintLocs()
@@ -1241,6 +1286,7 @@ export function compileSrc(): i32 {
     }
     xt = xt + 1
   }
+  if fsModeOf() == FS_PLAN { return fsPlan(root) }
   const rc = emitProgram(root)
   if rc < 0 { return 3 }
   emitSrcSection()
@@ -4632,6 +4678,7 @@ function modCompile(emit: i32): i32 {
   // quantifier spans the WHOLE graph — one lossy diagnostic in any module stops
   // the merge for all of them, which is what the shared arena requires anyway.
   if vcParseBlocked() { return 1 }
+  if fsAfterParse() < 0 { return 3 }
   // 2b. The reserved-name rules. Duplicate bindings are decided after the rewrite below,
   // by `modCheckOverloads`, which needs every function's merged first-parameter type.
   let dc = 0
@@ -4768,6 +4815,7 @@ function modCompile(emit: i32): i32 {
   if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
+  if fsModeOf() == FS_PLAN { return fsPlan(merged) }
   if emit != 0 {
     const rc = emitProgram(merged)
     if rc < 0 { return 3 }

@@ -1,0 +1,459 @@
+// `check_callee.vl` — which declaration a call or operator site runs. `callDeclFnIx` sorts a
+// call's callee into a `FuncDecl`, an opaque target or an intrinsic, looking through the bodies
+// on the `weRoots` stack for a nested declaration; the built-in method tables say which member
+// calls a receiver's own type answers and what each does to the receiver; and the operator
+// tables hold every declared index and binary operator and the one the checker resolved at each
+// site, which the emitter's dispatch rewrite reads back. The checker fills the operator tables
+// and pushes `weRoots`; `calleeReset` clears every table per program.
+import {
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  Index,
+  Member,
+  OP_INDEX_GET,
+  OP_INDEX_SET,
+  P,
+  Paren,
+  elseIfLink,
+  i32ToStr,
+  isBinOpFuncName,
+  nodeSpineChildren,
+  ufcsAliasAtSite,
+} from "./ast"
+import { crOpOpaque } from "./check_capture_rows"
+import { crOpOf } from "./check_capture_walks"
+import { nodeTyOf } from "./check_node_tys"
+import { lookup, lookupFnDeclNode } from "./check_scopes"
+import { listMethodNames, strMethodNames } from "./check_suggest"
+import { nomErasedTyIx } from "./check_ty_rep"
+import { nonNullTy } from "./check_ty_shape"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+} from "./check_types"
+import {
+  CW_FR_UNKNOWN,
+  covarRootFrame,
+  cwFramedNode,
+  cwLambdaDeclOf,
+  fnDeclIx,
+} from "./check_write_scan"
+import { strListHas, strListIndexOf } from "./listutil"
+
+// Every `function "[]"(self: T, …)` / `function "[]="(self: T, …)` the program declares, as the
+// operator it implements and the possibly merge-mangled name it declared under, collected by the
+// top-level hoist so the registry describes the merged program. Dispatch is by the receiver's
+// type: a candidate wins when the receiver is `assignable` to its `self` parameter.
+export let opIdxOps: string[] = []
+export let opIdxFns: string[] = []
+
+// The resolved operator function for one index site, keyed by the node the checker resolved it at
+// (an `Index` for a read, the assignment `BinExpr` for a write) and read back by the emitter's
+// dispatch rewrite, so the two never re-derive the choice independently. Sparse: a program that
+// declares no index operator banks nothing.
+export let opIdxSiteNode: i32[] = []
+export let opIdxSiteFn: string[] = []
+// The receiver-keyed operator function the checker resolved at a binary-operator site, banked
+// for the emitter's dispatch rewrite to read back — the `a op b` twin of `opIdxSiteFn`, so the
+// emitter names the exact declaration the checker chose rather than re-running the receiver scan.
+export let opBinSiteNode: i32[] = []
+export let opBinSiteFn: string[] = []
+
+// The function bodies currently being summarised, innermost last. A call inside a callee body may
+// name a function declared in that body, or in a sibling frame of it, and `lookupFnDeclNode` reads
+// the caller's scope chain, where neither is visible — answering "not a function" there makes the
+// whole nested-write route fail open.
+export let weRoots: i32[] = []
+
+// The `FuncDecl` named `name` declared inside any body currently being summarised,
+// innermost frame first, or -1.
+export function findFnDeclInRoots(name: string) {
+  let i = weRoots.length - 1
+  while i >= 0 {
+    const d = findFnDeclIn(weRoots[i], name)
+    if d >= 0 { return d }
+    i = i - 1
+  }
+  -1
+}
+
+// The subtree walk, memoised on `(rootIx, name)`: every query inside one summary asks the same
+// root, and an intrinsic call asks a name no root holds, so the uncached walk makes one summary
+// quadratic in the body's call count. The negative answer is the one worth banking. Keying on the
+// root is load-bearing — a name-only memo can answer a declaration this walk would never reach.
+export function findFnDeclIn(rootIx: i32, name: string) {
+  if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
+  const key = i32ToStr(rootIx) + "#" + name
+  const wfHit = weFnDecls[key]
+  if wfHit is i32 { return wfHit }
+  const d = findFnDeclWalk(rootIx, name)
+  weFnDecls[key] = d
+  d
+}
+
+// Memo bank for `findFnDeclIn`, keyed `"<subtree-root-node-ix>#<name>"`.
+let weFnDecls: {[string]: i32} = Map()
+
+// The uncached pre-order walk: the first `FuncDecl` named `name` in the subtree, the root itself
+// included, or -1.
+function findFnDeclWalk(rootIx: i32, name: string) {
+  if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
+  const n = P.nodes[rootIx]
+  if n is FuncDecl {
+    if n.fnName == name { return rootIx }
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = rootIx
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let i = 0
+    while i < kids.length {
+      const d = findFnDeclWalk(kids[i], name)
+      if d >= 0 { return d }
+      i = i + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  -1
+}
+
+// A call's argument places in callee-parameter order. A UFCS or method callee (`o.m(a)`) puts the
+// receiver at parameter 0, which is how `m(o, a)` declares it; every other shape is the written
+// argument list.
+export function callArgPlaces(cn: Call, callIx: i32) {
+  const out: i32[] = []
+  const cf = P.nodes[cn.callFn]
+  if cf is Member {
+    if callDeclFnIx(cn, callIx) >= 0 { out.push(cf.memObj) }
+  }
+  let i = 0
+  while i < cn.callArgs.length {
+    out.push(cn.callArgs[i])
+    i = i + 1
+  }
+  out
+}
+
+// The parameters of a callback not yet checked whose type is already known, so a write check run
+// before its body (`cbElemNarrowFor`) resolves a method called on one (`cbPendCollect`).
+export let cbPendNames: string[] = []
+export let cbPendTys: i32[] = []
+
+export function cbPendClear() {
+  cbPendNames = []
+  cbPendTys = []
+  0
+}
+
+// The type recorded for the method receiver `ix`, or for a not-yet-checked callback parameter
+// it names, the type `cbPendCollect` gave it; -1 when neither is known.
+export function recvTyOf(ix: i32): i32 {
+  const t = nodeTyOf(ix)
+  if t >= 0 || cbPendNames.length == 0 { return t }
+  let px = ix
+  while px >= 0 && px < P.nodes.length && P.nodes[px] is Paren {
+    const pn = P.nodes[px]
+    if pn is Paren { px = pn.parInner }
+  }
+  if px < 0 || px >= P.nodes.length { return -1 }
+  const n = P.nodes[px]
+  if n is Ident {
+    const j = strListIndexOf(cbPendNames, n.identName)
+    if j >= 0 { return cbPendTys[j] }
+  }
+  -1
+}
+
+// The callee classification behind every invalidation decision: `>= 0` is the `FuncDecl` the call
+// resolves to statically, with a UFCS receiver at parameter 0; `-1` is opaque — a function value,
+// a struct field holding one, or an unresolved receiver — so assume it writes anything reachable;
+// `-2` is an intrinsic, which writes no field of an object handed to it.
+export function callDeclFnIx(cn: Call, callIx: i32) {
+  const cf = P.nodes[cn.callFn]
+  if cf is Ident {
+    const d = lookupFnDeclNode(cf.identName)
+    if d >= 0 { return d }
+    const nd = findFnDeclInRoots(cf.identName)
+    if nd >= 0 { return nd }
+    if lookup(cf.identName) >= 0 {
+      // A binding bound once to a lambda, never re-pointed, calls that lambda's body; the write
+      // shapes see a write through an alias of a captured object (D2461). Anything else stays
+      // opaque.
+      const lfr = covarRootFrame(cn.callFn)
+      if cwFramedNode(cn.callFn) && lfr != CW_FR_UNKNOWN {
+        const ld = cwLambdaDeclOf(cf.identName, lfr)
+        if ld >= 0 { return ld }
+      }
+      return -1 // a function VALUE: target unknown
+    }
+    return -2 // an intrinsic named by a bare identifier
+  }
+  if cf is Member {
+    // A built-in of the receiver's type runs whatever `self`-function shares its name.
+    if builtinMethodOn(recvTyOf(cf.memObj), cf.memProp) { return -2 }
+    const d = lookupFnDeclNode(cf.memProp)
+    if d >= 0 { return d }
+    // A `self`-function merged from another module, by the name this site resolved to.
+    if callIx >= 0 {
+      const al = ufcsAliasAtSite(callIx, cf.memProp)
+      if al != cf.memProp {
+        const ad = lookupFnDeclNode(al)
+        if ad >= 0 { return ad }
+      }
+    }
+    const nd = findFnDeclInRoots(cf.memProp)
+    if nd >= 0 { return nd }
+    return memberCalleeKind(cf)
+  }
+  -1
+}
+
+// A non-UFCS member callee: a struct field holding a function is opaque, the value it holds not
+// being statically one body; anything else is a collection or string method.
+function memberCalleeKind(cf: Member) {
+  const rt = recvTyOf(cf.memObj)
+  if rt < 0 {
+    return -1 // receiver type unresolved → fail closed
+  }
+  const t = T.tys[rt]
+  // A record or a collection has no other built-in method, so one not resolved above is a
+  // `self`-function this reading cannot see: opaque.
+  if t is TyObj || t is TyArray || t is TyMap { return -1 }
+  -2
+}
+
+// Whether a receiver of type `rt`, or its non-null part for an optional call, has the built-in
+// method `p` (`builtinMethodClaims`). Any other method is a `self`-function or a field.
+export function builtinMethodOn(rt: i32, p: string): boolean {
+  if rt < 0 { return false }
+  builtinMethodClaims(nonNullTy(rt), p)
+}
+
+// Whether a built-in method may run a function it is handed: only `map` and `filter` take one.
+export function builtinMethodRunsArgs(p: string): boolean {
+  p == "map" || p == "filter"
+}
+
+// Whether a built-in named by a bare identifier runs none of its arguments.
+export function builtinRunsNoArg(nm: string): boolean {
+  nm == "print"
+    || nm == "Map"
+    || nm == "Set"
+    || nm == "fromCodePoint"
+    || nm == "fromCodePoints"
+    || nm == "__str_from_bytes__"
+}
+
+// The operand places an operator site hands its declaration, in parameter order: `a op b`,
+// `p[i]`, and `p[i] = x`.
+export function opSiteArgs(ix: i32): i32[] {
+  if crOpOf(ix) == OP_INDEX_GET { return opIndexReadArgs(ix) }
+  opBinSiteArgs(ix)
+}
+
+// The receiver and subscript of an index read `p[i]`.
+function opIndexReadArgs(ix: i32): i32[] {
+  const out: i32[] = []
+  const n = P.nodes[ix]
+  if n is Index {
+    out.push(n.idxArr)
+    out.push(n.idxIndex)
+  }
+  out
+}
+
+// The operands of `a op b`, or the receiver, subscript and value of `p[i] = x`.
+function opBinSiteArgs(ix: i32): i32[] {
+  const out: i32[] = []
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const t = P.nodes[n.binLeft]
+      if t is Index {
+        out.push(t.idxArr)
+        out.push(t.idxIndex)
+        out.push(n.binRight)
+      }
+      return out
+    }
+    out.push(n.binLeft)
+    out.push(n.binRight)
+  }
+  out
+}
+
+// The declarations an operator site may run: the one the checker resolved there, else every
+// declaration of its operator; -1 stands for an operator closure field, whose body is opaque.
+// Empty when the site dispatches to nothing.
+export function opSiteDecls(ix: i32): i32[] {
+  const out: i32[] = []
+  if ix < 0 || ix >= P.nodes.length { return out }
+  if crOpOpaque[ix] ?? false {
+    out.push(-1)
+    return out
+  }
+  if !crIsDispatchSite(ix) { return out }
+  const op = crOpOf(ix)
+  let nm = opBinFnAtNode(ix)
+  if op == OP_INDEX_GET || op == OP_INDEX_SET { nm = opIdxFnAtNode(ix) }
+  if nm != "" {
+    out.push(fnDeclIx[nm] ?? -1)
+    return out
+  }
+  let i = 0
+  while i < opIdxOps.length {
+    if opIdxOps[i] == op { out.push(fnDeclIx[opIdxFns[i]] ?? -1) }
+    i = i + 1
+  }
+  out
+}
+
+// Whether a node that is not a `Call` may still call a user declaration: a declared binary
+// operator, or any index read or index write once the program declares an index operator.
+// Asked before the node is checked, so it cannot read which declaration dispatched.
+export function crIsDispatchSite(ix: i32): boolean {
+  const op = crOpOf(ix)
+  if op == OP_INDEX_GET || op == OP_INDEX_SET { return opIdxDeclared() }
+  op != "" && isBinOpFuncName(op) && binOpSymDeclared(op)
+}
+
+// Map/set intrinsic names, gated exactly as `checkCallNode`'s own arms gate them: `set`/
+// `get` are a map surface a set must not leak, and `add` a set surface a map must not.
+export function mapMethodNames(recvTy: i32) {
+  const out = ["has", "delete", "clear", "keys", "values", "length"]
+  const rt = T.tys[recvTy]
+  if rt is TyMap {
+    if rt.mSet == 0 {
+      out.push("set")
+      out.push("get")
+    }
+    if rt.mSet == 1 { out.push("add") }
+  }
+  out
+}
+
+const noMethodNames: string[] = []
+
+// The built-in method names of a receiver of `recvTy`'s representation, from the tables
+// above; a record, function, union, nullable, type parameter, literal or negation has none.
+export function builtinMethodNamesOf(recvTy: i32): string[] {
+  if recvTy < 0 { return noMethodNames }
+  const ix = nomErasedTyIx(recvTy)
+  if ix < 0 || ix >= T.tys.length { return noMethodNames }
+  const t = T.tys[ix]
+  match t {
+    TyArray => {
+      return listMethodNames
+    }
+    TyMap => {
+      return mapMethodNames(ix)
+    }
+    TyPrim => {
+      if t.primName == "string" { return strMethodNames }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
+  }
+  noMethodNames
+}
+
+// Whether a built-in method arm of `checkMemberCallNode` claims `recv.prop(…)`. `length` is a
+// member read, so its call spelling falls through to a `self`-function.
+export function builtinMethodClaims(recvTy: i32, prop: string): boolean {
+  if prop == "length" { return false }
+  strListHas(builtinMethodNamesOf(recvTy), prop)
+}
+
+// What a built-in method does to the cells its receiver holds before the call — the effect
+// column every write question reads, the narrowing summaries and the getter effects alike. NONE
+// reads or builds; APPENDS adds a cell and leaves every held one untouched; CELLS may replace or
+// remove one.
+export const BME_NONE = 0
+const BME_APPENDS = 1
+export const BME_CELLS = 2
+export function builtinMethodEffect(p: string): i32 {
+  if p == "push" || p == "add" { return BME_APPENDS }
+  if p == "pop" || p == "clear" || p == "set" || p == "delete" {
+    return BME_CELLS
+  }
+  BME_NONE
+}
+
+// Does the program declare ANY index operator? The single inertness gate: false
+// for every program that declares none, and then no index expression anywhere
+// does any extra work and nothing is banked.
+export function opIdxDeclared() { opIdxFns.length > 0 }
+
+// The operator function the checker resolved at index site `ix`, or "" — the
+// emitter's read of the bank above.
+export function opIdxFnAtNode(ix: i32) {
+  if ix < 0 { return "" }
+  let i = 0
+  while i < opIdxSiteNode.length {
+    if opIdxSiteNode[i] == ix { return opIdxSiteFn[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// The receiver-keyed operator function the checker resolved at binary-operator site `ix`, or ""
+// — the emitter's read of the bank above, the `a op b` twin of `opIdxFnAtNode`.
+export function opBinFnAtNode(ix: i32) {
+  if ix < 0 { return "" }
+  let i = 0
+  while i < opBinSiteNode.length {
+    if opBinSiteNode[i] == ix { return opBinSiteFn[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether any receiver's declaration of binary operator symbol `op` is registered — the
+// pin-deferral gate's question, keyed on the symbol across all receivers, since an operator
+// declaration takes no `fnDeclIx` slot.
+export function binOpSymDeclared(op: string): boolean {
+  let i = 0
+  while i < opIdxOps.length {
+    if opIdxOps[i] == op {
+      if lookup(opIdxFns[i]) >= 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+export function calleeReset() {
+  opIdxOps = []
+  opIdxFns = []
+  opIdxSiteNode = []
+  opIdxSiteFn = []
+  opBinSiteNode = []
+  opBinSiteFn = []
+  weRoots = []
+  weFnDecls = Map()
+  cbPendClear()
+  0
+}
+
+// The callee's written name, for the diagnostic. `"?"` when the callee is neither a
+// bare name nor a member access (a parenthesised or computed callee).
+export function calleeNameOf(callIx: i32) {
+  const cn = P.nodes[callIx]
+  if cn is Call {
+    const cf = P.nodes[cn.callFn]
+    if cf is Ident { return cf.identName }
+    if cf is Member { return cf.memProp }
+  }
+  "?"
+}

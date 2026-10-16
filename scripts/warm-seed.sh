@@ -4,9 +4,10 @@
 #
 #   scripts/warm-seed.sh [--fuel] [--stash <dir>] [<seed>]     default seed: build/vl-compiler.wasm
 #
-# Two tags always: the null-collector compile (refresh-compiler.sh's pin), and the copying
-# seed engine that `vl build`/`vl run` and the `check`/`fmt`/`test` pump share. `--fuel` adds
-# the two `$VL_FUEL=1` tags the cost rows compile under.
+# Two tags always: the null-collector compile (`$VL_COMPILE_GC=null`), and the copying seed
+# engine that `vl build`/`vl run` and the `check`/`fmt`/`test` pump share. `--fuel` adds the two
+# `$VL_FUEL=1` tags the cost rows compile under. The self-compile's own tag
+# (scripts/self-compile-gc.sh) is left to refresh-compiler.sh's sanity run, which compiles under it.
 # `--stash <dir>` places every sidecar in <dir> beside the seed first, then places every
 # sidecar this run created into <dir>, so a CI cache of <dir> carries them to the next job.
 #
@@ -43,16 +44,19 @@ fi
 before="$(ls "$SEED".*.cwasm 2>/dev/null || true)"
 
 note() { echo "  note: could not warm the $1 sidecar — its first use re-JITs the seed" >&2; }
+# Each warm names its whole configuration, so a `$VL_COMPILE_GC_HEAP` the caller exported
+# (refresh-compiler.sh sources the self-compile's) cannot turn the default warm into another.
 warm_null() {
-  VL_COMPILE_GC=null "$VL" run "$WORK/hello.vl" --compiler "$SEED" > /dev/null 2>&1 || note "null-compile"
+  VL_COMPILE_GC=null VL_COMPILE_GC_HEAP= "$VL" run "$WORK/hello.vl" --compiler "$SEED" \
+    > /dev/null 2>&1 || note "null-compile"
 }
 warm_copying() {
-  VL_COMPILE_GC=copying "$VL" build "$WORK/hello.vl" -o "$WORK/copying.wasm" \
+  VL_COMPILE_GC=copying VL_COMPILE_GC_HEAP= "$VL" build "$WORK/hello.vl" -o "$WORK/copying.wasm" \
     --compiler "$SEED" > /dev/null 2>&1 || note "copying-compile"
 }
 warm_fuel() {
-  VL_FUEL=1 VL_COMPILE_GC="$1" "$VL" build "$WORK/hello.vl" -o "$WORK/fuel-$1.wasm" \
-    --compiler "$SEED" > /dev/null 2>&1 || note "fuel/$1"
+  VL_FUEL=1 VL_COMPILE_GC="$1" VL_COMPILE_GC_HEAP= "$VL" build "$WORK/hello.vl" \
+    -o "$WORK/fuel-$1.wasm" --compiler "$SEED" > /dev/null 2>&1 || note "fuel/$1"
 }
 
 warm_null & warm_copying &
