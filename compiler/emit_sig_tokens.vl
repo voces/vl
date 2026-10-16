@@ -1,0 +1,1542 @@
+// `emit_sig_tokens.vl` — the signature tokens of parameters and returns, and the
+// annotated kind a parameter or return lowers as.
+
+import {
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  P,
+  Param,
+  TS_FUNC,
+  TS_OBJ,
+  TypeRef,
+  annTsOf,
+  tsHasKind,
+  tsKind,
+} from "./ast"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { annUnionAtomsOf } from "./check_decl_scan"
+import { nodeTyIsLitUnionAlias, nodeTyIxOf } from "./check_node_tys"
+import { nameIsLitUnionType } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litUnionAliasNameOfTy,
+  tyEq,
+  tyIsLitUnion,
+  tySame,
+  tyToEmitName,
+} from "./check_types"
+import { sFieldTypeAt, sScanLim } from "./emit_atom_kinds"
+import {
+  PL_READ_UNPLACED,
+  annArrowAt,
+  annFnDecompose,
+  annSplitPipe,
+  moduleLocalLetOf,
+  nameIsBareMap,
+  nameIsI32Array,
+  nameIsNulClosure,
+  nameIsNulI32List,
+  nameIsNulLitUnion,
+  nameIsShapeSpanEnds,
+  nameIsString,
+  normTypeAtom,
+  nullablePartOf,
+  parentLetCoversAt,
+  parentLetOf,
+  parentLoopAt,
+  parentLoopVarOf,
+  tyIsBool,
+  tyIsFuncType,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
+import {
+  captureLoopNodeOf,
+  fnStmtsPosOf,
+  moduleLoopEnclosing,
+  nodeSubtreeHas,
+} from "./emit_capture_frames"
+import {
+  bodyLetReadAtSid,
+  bodyReadInLoop,
+  bodyReadLet,
+  readSidOf,
+} from "./emit_fn_ret_kinds"
+import {
+  isScalarBackedListRep,
+  listRepOfFieldCode,
+  listRepOfMf,
+  listRepOrNull,
+} from "./emit_list_rep"
+import {
+  fnIndexOfInScopeAt,
+  fnParamNodeOf,
+  nulArmRowOfTy,
+} from "./emit_local_scope"
+import { nonNulBaseOf } from "./emit_map_value_slots"
+import {
+  mvListValKind,
+  scalarListRepOfName,
+  variantRowOfTy,
+} from "./emit_mv_slots"
+import { variantIndexOf } from "./emit_narrow_slots"
+import {
+  anonLeafParamRowOf,
+  isSName,
+  nulBaseStructRow,
+  nulScalarListCodeKind,
+  retVariantFlag,
+} from "./emit_nullable_rets"
+import { paramTypeNode } from "./emit_query"
+import {
+  repKindOfSigTok,
+  repOfTy,
+  repRowOfTyStruct,
+  repSigSlotTokOfKind,
+  repSigTokHasSlot,
+  repSigTokOfKind,
+  repSlotOfTy,
+} from "./emit_rep"
+import {
+  mvSlotOfMapName,
+  nameIsRefArray,
+  nulScalarListKind,
+  repSigNulVariantTok,
+  repSigVariantTok,
+  repVariantSlotRep,
+  rlSlotOfArrName,
+  shapeNominalOfTy,
+  sktGen,
+  sktKey,
+  structIndexOfTypeName,
+  tyRegGenNow,
+  variantIndexOfTypeName,
+} from "./emit_shape_rows"
+import {
+  FC_CLOSURE,
+  FC_MAP,
+  FC_NUL_CLOSURE,
+  FC_STR,
+  MfKind,
+  VKind,
+  emitRootIx,
+  fRetBool,
+  fRetKind,
+  fRetStructIdx,
+  fnParent,
+  fnStmts,
+  localIsRef,
+  localStructIdx,
+  rlElemName,
+  sFieldCount,
+  sFieldNames,
+  sFieldStart,
+  sNames,
+  uVariants,
+  unTyIx,
+} from "./emit_state"
+import {
+  declaredKind,
+  declaredSlotOf,
+  rlElemTyIxAt,
+  rlSlotOfTy,
+  sFieldIndex,
+} from "./emit_struct_order"
+import { nodeRepIn } from "./emit_ty_canon"
+import { isUNameAnnAB } from "./emit_union_atoms"
+import { isUName, unionMemberSetOf } from "./emit_union_registry"
+import { strListHas } from "./listutil"
+import { strContains } from "./strutil"
+import {
+  arrElemNameRaw,
+  groupInnerOf,
+  mapSpellKeyEnd,
+  mapSpellKeyName,
+  nameIsArray,
+  nameIsParenSpanEnds,
+  peelGroupParens,
+  splitUnionAtoms,
+} from "./tyname"
+import { flattenVariantsInto } from "./tyquery"
+
+// The niche twin of `mvListValKind` — the nullable `VKind` a `{[K]: T[] | null}` value binds,
+// or null when the value is not a list. Composed on `mvListValKind` so the element-kind to rep
+// mapping has one home. It is half of a pair: the `.values()` loop var binds the niche here
+// and `emitForInStmt` must leave the element read raw, or the stored null traps.
+export function mvNulListValKind(slot: i32): VKind | null {
+  const k = mvListValKind(slot)
+  if k == null { return null }
+  vkNulNicheOf(k)
+}
+
+// The atom of member set `set` that spells variant `v`: `v` itself, else the atom naming the
+// same record row by its shape (`{r:i32}[]` for a tested `Circle[]`), else `v`.
+export function setAtomSpelling(set: string, v: string): string {
+  const atoms: string[] = []
+  splitUnionAtoms(set, atoms)
+  if strListHas(atoms, v) { return v }
+  const nv = resolveShapeToNominal(v)
+  let i = 0
+  while i < atoms.length {
+    if nameIsRefArray(atoms[i]) || isSName(atoms[i]) {
+      if resolveShapeToNominal(atoms[i]) == nv { return atoms[i] }
+    }
+    i = i + 1
+  }
+  v
+}
+
+// The `$fnsig` key of a closure-element ref-list slot, off the arena: peel the `| null` niche,
+// since the narrowed indexed call casts to the same functype a non-null element does, then key
+// the `TyFunc` spine directly rather than re-parsing the rendered signature. "" when uncovered
+// or not a function type.
+export function rlElemCloSigKeyAt(slot: i32): string {
+  const ty = rlElemTyIxAt(slot)
+  if ty < 0 { return "" }
+  let b = ty
+  const t = T.tys[ty]
+  if t is TyNullable { b = t.nInner }
+  if b < 0 { return "" }
+  const bt = T.tys[b]
+  if bt is TyFunc { return sigKeyOfTy(b) }
+  ""
+}
+
+// The `$fnsig` key of a closure-element ref-list slot: the arena keys the `TyFunc`
+// spine directly (`sigKeyOfTy`), so the grouping-paren strip and `annSigKey` re-parse
+// of the rendered element name is the fall-through only (D5-final).
+export function rlElemCloSigKey(slot: i32): string {
+  const ar = rlElemCloSigKeyAt(slot)
+  if ar != "" { return ar }
+  const nm = nonNulBaseOf(rlElemName[slot])
+  // The paren-span test (`nameIsParenSpanEnds`, first/last char, no balance walk)
+  // already declines any name under 2 chars; a balanced walk would wrongly re-key `(a)|(b)`.
+  if !nameIsParenSpanEnds(nm) { return "" }
+  // `groupInnerOf` is the paired cut; it has no endpoint test of its own, so the span
+  // check above must run first (the brace-shaped call sites below share this cut).
+  annSigKey(groupInnerOf(nm))
+}
+
+// The emitter-format name of the list union `ty`, a record element spelled by its row
+// (`Circle[]|i32[]`); "" when a member has no name.
+export function listUnionEmitName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      const inn = listUnionEmitName(t.nInner)
+      if inn == "" { return "" }
+      return inn + "|null"
+    }
+    TyUnion => {
+      let nm = ""
+      let i = 0
+      while i < t.uMembers.length {
+        const mn = resolveShapeToNominal(tyToEmitName(t.uMembers[i]))
+        if mn == "" { return "" }
+        if i > 0 { nm = nm + "|" }
+        nm = nm + mn
+        i = i + 1
+      }
+      return nm
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // `tyIsListUnion` admits only the two shapes above.
+      return ""
+    }
+  }
+}
+
+// The nullable-scalar-list `VKind` a field of code `code` yields when it is read through a
+// `?.`: the receiver's `| null` is what makes the value nullable, so a NON-nullable list
+// field answers here too. `nulScalarListCodeKind`'s twin for that one delivery (D1676).
+export function optChainLeafNulListKind(code: i32): VKind | null {
+  const k = listRepOfFieldCode(code)
+  if isScalarBackedListRep(k) {
+    if k != null { return vkNulNicheOf(k) }
+  }
+  nulScalarListCodeKind(code)
+}
+
+// ── the non-null ref kind and its nullable niche (D1115) ──
+// Every nullable ref niche is `(ref null $H)` over the same heap `$H` its non-null kind is
+// `(ref $H)` over; this table doubles as "is `K` a non-null ref". Stated once, since two
+// hand-written kind lists can drift out of step with each other otherwise.
+export function vkNulNicheOf(k: VKind): VKind | null {
+  // Exhaustive over `VKind` and `_`-less: `null` means no nullable niche is owed, so a new
+  // kind has to declare whether it has one rather than silently owe nothing.
+  match k {
+    "struct" => {
+      return "nulstruct"
+    }
+    "variant" => {
+      return "nulvariant"
+    }
+    "list" => {
+      return "nullist"
+    }
+    "reflist" => {
+      return "nulreflist"
+    }
+    "strlist" => {
+      return "nulstrlist"
+    }
+    "f64list" => {
+      return "nulf64list"
+    }
+    "i64list" => {
+      return "nuli64list"
+    }
+    "f32list" => {
+      return "nulf32list"
+    }
+    "u8list" => {
+      return "nulu8list"
+    }
+    "map" => {
+      return "nulmap"
+    }
+    "str" => {
+      return "nulstr"
+    }
+    "closure" => {
+      return "nulclosure"
+    }
+    "i32" | "union" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "v128" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" => {
+      // No nullable niche is owed: the scalars ride a sentinel, and the `nul*` kinds are
+      // already the niche.
+      return null
+    }
+  }
+}
+
+// D1222 — the struct-field destination's rep kind, from its field code: a field names its
+// destination by code while every other delivery names it by kind, so this is the code-to-
+// kind edge, feeding the same `vkNulNicheOf` table. Only the non-null ref codes answer; a
+// scalar, nullable, union-box, or unrepresentable field code is `null` — nothing is owed.
+
+// Membership is `pushFieldStorage`'s own test: a code answers here exactly when it stores
+// `0x64`. Code 15 stores `0x63`, since one hop carries both `S` and `S | null`, so a store
+// into it never owes the recover and asking for one traps on `null` (D1720).
+export function fieldCodeVKind(code: i32): VKind | null {
+  if code == FC_STR { return "str" }
+  if code == FC_CLOSURE { return "closure" }
+  if code == FC_MAP { return "map" }
+  listRepOrNull(listRepOfFieldCode(code))
+}
+
+// The declared-local SLOT an ident expression names, or -1 — `identCellVKind`'s twin, so a
+// delivery boundary reads the `localIsRef`/`localStructIdx` pair the binding boundary reads.
+// Deriving the row from the expression's type instead answers -1 for a cell holding an
+// inferred union's arm, which is a `variant` (D1685).
+export function identCellSlot(exprIx: i32): i32 {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident { return declaredSlotOf(e.identName) }
+  -1
+}
+
+// True if `name` is a declared NULLABLE function-value local (`fn | null`, kind 19) — the
+// closure dual of `declaredNulRef`.
+export function declaredNulClosure(name: string) {
+  declaredKind(name) == "nulclosure"
+}
+
+// True if the already-collected declared local `name` is a nullable i32 list (kind 15).
+export function declaredNulList(name: string) {
+  declaredKind(name) == "nullist"
+}
+
+// True if the already-collected declared local `name` is a struct ref. Resolves to
+// the IN-SCOPE binding's slot (so a same-named binding in a sibling/inner block reads
+// ITS own valtype, not an unrelated branch's).
+export function declaredStruct(name: string) { declaredKind(name) == "struct" }
+
+// True if the binding's annotation is a single inline object shape (with a trailing `|
+// null` stripped) that is not interned as a struct — its shape could not be built (an
+// unsupported field type). Checked only after union/nullable-struct/struct classification,
+// so a valid inline-struct binding never reaches it; catches the remainder so it rejects cleanly.
+export function letAnnIsUninternedShape(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType < 0 { return false }
+    const nm = nonNulBaseOf(tyNameOf(d.letType))
+    // The spelled-shape half asks the tree, not the arena: `nameIsShapeSpanEnds` is character
+    // surgery over the rendering, testing whether the author wrote an inline object shape
+    // rather than a map. The arena's `TyObj` sees through a named alias or generic application
+    // to the object it denotes, so testing it directly admits false positives it must reject.
+    if !annIsSpelledInlineShape(d.letType, nm) { return false }
+    // The struct-table lookup stays name-keyed: `sTyRow` is not populated for every shape
+    // `sNames` knows, and the row's identity is the name. That is the interning layer, not a
+    // type decision.
+    if structIndexOfTypeName(nm) >= 0 { return false }
+    // The third resolver's fall-through, mirroring `paramStructIndex`'s inline-shape rung
+    // (D111): the name above cannot find an inline shape a declared struct of the same
+    // layout already owns, since `internInlineShapeTy` dedups onto that row and pushes no
+    // `sNames` entry. `monoAnnPinName`'s inline-shape rung must land first; not safe alone.
+    repSlotOfTy(nodeRepTyIxOf(d.letType)) < 0
+  }
+  false
+}
+
+// True if the `LetDecl` at `letIx` carries a value-union annotation — the declared-spelling
+// half of `letIsUnion`, asked without looking at the initializer. A literal union is
+// excluded, since it reps as an interned i32 atom, not the box. The initializer-free
+// reading is what makes it usable from `structIndexOfLet`, on the path `exprUnion` reaches.
+export function letAnnIsUnion(letIx: i32) {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 {
+      const lt = P.nodes[d.letType]
+      if lt is TypeRef {
+        // Not `nodeTyIsUnionAlias(d.letType)`, though it reads as exactly this conjunction:
+        // its body has two more positive arms — a same-shape-collapsed `TyObj` and a
+        // nullable numeric literal union — both wider than `isUName`, and this site needs the
+        // narrower set. Trying it broke six passing tests.
+        return isUNameAnnAB(2, d.letType) && !nodeTyIsLitUnionAlias(d.letType)
+      }
+    }
+  }
+  false
+}
+
+// ── multi-struct index resolution ──
+// Parallel to the boolean `exprStruct` family, these return the struct table index a
+// struct-typed expression, param, local, or return produces, so a field read/write can
+// resolve the right heap type and field layout. Return -1 when not a struct.
+
+// The struct table index of the param `name` of function `fnIx` (from its annotation), or
+// -1 (D891). `structIndexOfExpr`'s `Ident` arm resolves a parameter's layout through the
+// ladder below, not through `paramStructIdxOf`, so a param whose slot a merge moved must be
+// redirected on both, or the two disagree by construction and the module fails to parse.
+export function paramStructIndex(fnIx: i32, name: string) {
+  // The `fnIx < 0` guard is first and load-bearing: at module scope there is no enclosing
+  // function, and `fnParamNodeOf` indexes `P.nodes[-1]` — a compiler trap (out of bounds
+  // array access). The raw body below opens with the same guard, for the same reason.
+  if fnIx < 0 { return -1 }
+  return anonLeafParamRowOf(
+    fnParamNodeOf(fnIx, name),
+    paramStructIndexRaw(fnIx, name),
+  )
+}
+
+// The un-redirected answer: the annotation's own row, through the three-rung ladder below.
+function paramStructIndexRaw(fnIx: i32, name: string) {
+  if fnIx < 0 {
+    return -1 // module-scope initializer (no enclosing function)
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            if ty is TypeRef {
+              // A plain struct name, or the `S | null` nullable base — not a union variant,
+              // since a variant-typed param rides the gap-#2 path. Name, not the arena: for a
+              // generic original's param, the arena's recorded type is the un-substituted
+              // shape, while the shadow ruling correctly says the parameter binds nothing.
+              const psi = structIndexOfTypeName(ty.tyName)
+              if psi >= 0 { return psi }
+              const pnb = nulBaseStructRow(p.parType, ty.tyName)
+              if pnb >= 0 { return pnb }
+              // The inline-shape rung (`annValtypeSlotOf`'s, verbatim): an inline shape whose
+              // row a declared struct of the same layout already owns dedups with no `sNames`
+              // entry, while the functype for the same node resolves through `repSlotOfTy`
+              // (D53). Last, inline-shape only, and not a generic original — each guard answers a recorded failure.
+              if fn.fnTyParams.length == 0 {
+                if nameIsShapeSpanEnds(ty.tyName) {
+                  if variantIndexOf(ty.tyName) < 0 {
+                    const pbr = repSlotOfTy(nodeRepTyIxOf(p.parType))
+                    if pbr >= 0 { return pbr }
+                  }
+                }
+              }
+            }
+          }
+          return -1
+        }
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// The union-variant table index of the param `name` of function `fnIx` (when its annotation
+// names a variant struct of the declared union), or -1 — such a param's value is already
+// narrowed/unboxed, so a field read needs no box unwrap. Name, not the arena: a union whose
+// arms are structurally identical collapses to arm 0's row, but the param is the whole union.
+export function paramVariantIndex(fnIx: i32, name: string) {
+  const pv = paramTypeNode(fnIx, name)
+  if annUnionAtomsOf(pv) >= 2 { return -1 }
+  variantRowOfTy(nodeTyIxOf(pv))
+}
+
+// The union-VARIANT table index a function `name` returns (its `: Cat` return
+// annotation), or -1.
+export function fnRetVariantIndexSid(
+  sid: i32,
+  name: string,
+  fnIx: i32,
+  at: i32,
+) {
+  const fe = fnIndexOfInScopeAt(sid, name, fnIx, at)
+  if fe >= 0 {
+    const fn = P.nodes[fnStmts[fe]]
+    if fn is FuncDecl {
+      if fn.fnRet >= 0 {
+        // The kind decides, not the name: `variantIndexOf` answers for any spelling
+        // `uVariants` holds, including one that still lowers as the standalone struct because
+        // the checker never called it a variant. Taking the index anyway would feed a
+        // `uVarHeap` cell from an `sHeapIdx` value — invalid wasm.
+        if retVariantFlag(fn.fnRet) != 1 { return -1 }
+        const rt = P.nodes[fn.fnRet]
+        if rt is TypeRef { return variantIndexOf(rt.tyName) }
+        return -1
+      }
+      // The un-annotated callee, by the same rule the arm above states: when there is no
+      // annotation, the predicate is `fRetKind`/`fRetStructIdx`, the pair `emitOneFuncType`'s
+      // inferred variant arm emits — reading the same pair here is agreement, not a second
+      // opinion. Without it the callee validates but the caller does not (D52).
+      if fe < fRetKind.length {
+        if fRetKind[fe] == "variant" { return fRetStructIdx[fe] }
+      }
+    }
+  }
+  -1
+}
+
+// The union-variant table index of the declared local `name` (a kind-8 variant local —
+// its `localStructIdx` holds the variant index), or -1.
+export function declaredVariantIndex(name: string) {
+  const slot = declaredSlotOf(name)
+  if slot < 0 { return -1 }
+  if localIsRef[slot] == "variant" { return localStructIdx[slot] }
+  -1
+}
+
+// The struct table index of the declared local `name` (recorded in `localStructIdx`),
+// or -1 if `name` is not a struct local.
+export function declaredStructIndex(name: string) {
+  const slot = declaredSlotOf(name)
+  if slot < 0 { return -1 }
+  if localIsRef[slot] == "struct" { return localStructIdx[slot] }
+  if localIsRef[slot] == "nulstruct" { return localStructIdx[slot] }
+  -1
+}
+
+// The inner struct row of an expression the checker recorded as a nullable struct (`S | null`),
+// read off its per-node type rather than any spelling — the frame-independent fallback for a
+// nullable-struct field read whose receiver `structIndexOfExpr` cannot resolve syntactically (an
+// un-annotated module-block binding, D1636). -1 unless the node type peels to a struct (D1933).
+export function nulStructRowOfNodeTy(exprIx: i32): i32 {
+  const ty = nodeRepTyIxOf(exprIx)
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyNullable { return repRowOfTyStruct(t.nInner, sScanLim()) }
+  -1
+}
+
+// The closure-ABI param-kind code for a type name — the annotation-string analogue of
+// `cloParamTok` (which reads the AST), producing the identical token per valtype so a value
+// call over an annotated higher-order callee resolves the same interned `$fnsig`. "" for a
+// type outside the value-call ABI (the all-i32 arity fallback then applies).
+export function annParamKind(t: string) {
+  if t == "i32" || t == "boolean" { return repSigTokOfKind("i32") }
+  if t == "f64" { return repSigTokOfKind("f64") }
+  if t == "i64" { return repSigTokOfKind("i64") }
+  if t == "f32" { return repSigTokOfKind("f32") }
+  if t == "v128" { return repSigTokOfKind("v128") }
+  // A string literal union, bare or nullable, aliased or inline, is the interned i32 atom —
+  // before the string test, which would read an inline spelling as `str`.
+  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
+    return repSigTokOfKind("i32")
+  }
+  // Any other registered union name is the `{tag, value}` box.
+  if isUName(t) { return repSigTokOfKind("union") }
+  if nameIsString(t) { return repSigTokOfKind("str") }
+  // The scalar-element list backings, via the one home `scalarListRepOfName` — the same
+  // enumeration `annRetKind` reads, so the two `$fnsig` producers cannot drift.
+  const sk = scalarListRepOfName(t)
+  if sk != null { return repSigTokOfKind(sk) }
+  // A nullable scalar-element list, the dual of `cloParamTok`'s niche tokens (D2399).
+  const nsk = annNulListKind(t)
+  if nsk != null { return repSigTokOfKind(nsk) }
+  const si = structIndexOfTypeName(t)
+  if si >= 0 { return repSigSlotTokOfKind("struct", si) }
+  // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
+  const vti = variantIndexOf(t)
+  if vti >= 0 { return repSigVariantTok(vti) }
+  // A ref-list param — the recursive dual of `annRetKind`'s ref-list result. Before the arrow
+  // case so a closure-element array's nested `=>` isn't misread as a single closure.
+  if nameIsRefArray(t) {
+    const rs = rlSlotOfArrName(t)
+    if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
+  }
+  // A map param, the annotation-string twin of `cloParamTok`'s map arm (D701 wired the AST
+  // side) — without it a map-param lambda call keys "" against the closure's interned map sig.
+  if nameIsBareMap(t) { return repSigSlotTokOfKind("map", mvSlotOfMapName(t)) }
+  // A function-type param is the shared closure fat-pointer, matching `cloParamTok` — without
+  // it a higher-order closure param left its `$fnsig` un-interned (invalid wasm).
+  if annArrowAt(t) >= 0 { return repSigTokOfKind("closure") }
+  // A struct param the checker rendered structurally resolves by field-set to the same index
+  // the AST producer's `cloParamTok` keys, matching a nominal name too.
+  const sti = structIndexOfTypeName(t)
+  if sti >= 0 { return repSigSlotTokOfKind("struct", sti) }
+  // The nullable and union params, the name twin of `cloParamTok`'s niche kinds: without them
+  // an annotation or arena type naming `string | null` keyed nothing, and the call fell to an
+  // unrelated arity functype (D2552). A nullable closure param stays outside the ABI there.
+  const uslot: i32[] = [-1]
+  const uk = annUnionSigKind(t, uslot)
+  if repSigTokHasSlot(uk) { return repSigSlotTokOfKind(uk, uslot[0]) }
+  if uk != null && uk != "nulclosure" { return repSigTokOfKind(uk) }
+  ""
+}
+
+// The nullable-list `VKind` of type name `t` with a `$fnsig` token: the i32-backed `nullist`
+// or one of the distinct-backing scalar lists, else `null`.
+function annNulListKind(t: string): VKind | null {
+  if nameIsNulI32List(t) { return "nullist" }
+  nulScalarListKind(t)
+}
+
+function annRetKind(t: string) {
+  if t == "i32" || t == "boolean" { return ">" + repSigTokOfKind("i32") }
+  if t == "f64" { return ">" + repSigTokOfKind("f64") }
+  // A literal-union (or nullable litunion) result reps as the interned i32 atom, matching
+  // `cloRetKeySuffix`'s `>i` — checked before the union split below, which would mis-key it.
+  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
+    return ">" + repSigTokOfKind("i32")
+  }
+  // The numeric half of that subtraction is unreachable here, as in `annParamKind`: #1273
+  // canons a function type's interior, so this producer never sees a numeric alias.
+  if t == "void" { return ">v" }
+  if t == "string" { return ">" + repSigTokOfKind("str") }
+  if t == "i64" { return ">" + repSigTokOfKind("i64") }
+  if t == "f32" { return ">" + repSigTokOfKind("f32") }
+  if t == "v128" { return ">" + repSigTokOfKind("v128") }
+  // A list return, matching `cloRetKeySuffix` — `nameIsI32Array` folds `boolean[]` and a
+  // litunion `K[]` into the same i32-list token the param dual already keys.
+  const sk = scalarListRepOfName(t)
+  if sk != null { return ">" + repSigTokOfKind(sk) }
+  const nsk = annNulListKind(t)
+  if nsk != null { return ">" + repSigTokOfKind(nsk) }
+  // A ref-list return, matching `cloRetKeySuffix` — before the closure case so a closure-
+  // element array's nested `=>` isn't misread, keyed by the same `rlSlotByName` the AST side uses.
+  if nameIsRefArray(t) {
+    const rs = rlSlotOfArrName(t)
+    if rs >= 0 { return ">" + repSigSlotTokOfKind("reflist", rs) }
+  }
+  // A map return, matching `cloRetKeySuffix` — a map-member union also starts `{[` but is a
+  // union box, excluded so it falls to the `>u` arm instead of mis-keying `>m`.
+  if nameIsBareMap(t) {
+    return ">" + repSigSlotTokOfKind("map", mvSlotOfMapName(t))
+  }
+  // A closure return, matching `cloRetKeySuffix` — the result often arrives parenthesized,
+  // so peel one fully-wrapping `(...)` before testing for the arrow.
+  const tc = normTypeAtom(t)
+  if annArrowAt(tc) >= 0 { return ">" + repSigTokOfKind("closure") }
+  // `structIndexOfTypeName` (not `structIndexByName`) so a checker-rendered inline-shape
+  // struct return resolves by field-set to the same index the AST producer keys.
+  const si = structIndexOfTypeName(t)
+  if si >= 0 { return ">" + repSigSlotTokOfKind("struct", si) }
+  // A union/nullable return boxes, matching `cloRetKeySuffix` — a union alias resolves to its
+  // member set first, so a closure returning the alias still keys the box.
+  const uslot: i32[] = [-1]
+  const uk = annUnionSigKind(t, uslot)
+  if repSigTokHasSlot(uk) { return ">" + repSigSlotTokOfKind(uk, uslot[0]) }
+  if uk != null { return ">" + repSigTokOfKind(uk) }
+  ""
+}
+
+// The value-ABI kind a union or `X | null` spelling `t` reps as in a `$fnsig`, shared by the
+// result and parameter producers: `nulstr`, `nullist`, `nulstruct` or `nulvariant` (its row, or
+// folded variant row, in `slotOut[0]`), `nulclosure`, or `union` for the box. null for a
+// non-union and for a niche outside the ABI.
+function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
+  const parts: string[] = []
+  annSplitPipe(unionMemberSetOf(t), parts)
+  if parts.length < 2 { return null }
+  const nonNull: string[] = []
+  let hasNull = false
+  let pi = 0
+  while pi < parts.length {
+    const p = parts[pi]
+    if p == "null" { hasNull = true }
+    else if p.length > 0 { nonNull.push(p) }
+    pi = pi + 1
+  }
+  if nonNull.length >= 2 { return "union" }
+  if !hasNull || nonNull.length != 1 { return null }
+  if nonNull[0] == "string" { return "nulstr" }
+  // A nullable i32-backed list: the i32-list wrapper made nullable, slot-free, matching
+  // `cloRetKeySuffix`'s `>o`; distinct-backing nullable lists fall through to null.
+  if nameIsI32Array(nonNull[0]) { return "nullist" }
+  const msi = structIndexOfTypeName(nonNull[0])
+  if msi >= 0 {
+    slotOut[0] = msi
+    return "nulstruct"
+  }
+  // A nullable union arm, keyed by its variant row like `cloParamTok`'s niche arm.
+  const mvi = variantIndexOf(nonNull[0])
+  if mvi >= 0 {
+    slotOut[0] = repVariantSlotRep(mvi)
+    return "nulvariant"
+  }
+  // A nullable closure: the shared fat-pointer made nullable, slot-free, matching `>C`.
+  if strContains(nonNull[0], "=>") { return "nulclosure" }
+  // A nullable numeric scalar or vector reps as the value-union box; `boolean | null` is the
+  // i32-sentinel niche instead, outside the ABI since its valtype is plain i32.
+  if (
+    nonNull[0] == "i32"
+    || nonNull[0] == "i64"
+    || nonNull[0] == "f64"
+    || nonNull[0] == "f32"
+    || nonNull[0] == "v128"
+  ) {
+    return "union"
+  }
+  null
+}
+
+// The `$fnsig` KEY of a SOURCE function-type annotation `(params)=>ret` — the SAME
+// encoding `fnSigKeyOf` produces for a function (`"i>i"`, `"d>d"`, `"s3;>i"`), so a value
+// call over an annotated callee resolves the interned signature. "" if any param/return
+// type is outside the value-call ABI (the all-i32 arity fallback then applies).
+export function annSigKey(name: string) {
+  // `annFnDecompose` (#1144) IS this whole preamble — the three gates, the param-list
+  // slice, the `length > 0`-guarded `annSplitParams` and the return slice. The home's ""
+  // sentinel covers all three of this copy's own `return ""` legs.
+  const parts: string[] = []
+  const retStr = annFnDecompose(name, parts)
+  if retStr == "" { return "" }
+  let key = ""
+  let i = 0
+  while i < parts.length {
+    const pc = annParamKind(parts[i])
+    if pc == "" { return "" }
+    key = key + pc
+    i = i + 1
+  }
+  const rc = annRetKind(retStr)
+  if rc == "" { return "" }
+  key + rc
+}
+
+// The `$fnsig` key of a function-type arena type `funcTyIx` (a `TyFunc`) — the destringify-D3
+// dual of `annSigKey(nodeTyName(node))`: walks the arena spine (`fnParamTypes`, `fnRet`)
+// directly instead of rendering to a name and re-parsing, classifying leaves with the same
+// `annParamKind`/`annRetKind` the string path uses. "" for a non-function type or leaf outside the ABI.
+function paramTokOfTy(ty: i32) {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that has a `$fnsig` token must
+  // name it here, since a `""` decline is what the name path is left to answer.
+  match t {
+    TyPrim => {
+      const pn = t.primName
+      if pn == "i32" || pn == "boolean" { return repSigTokOfKind("i32") }
+      if pn == "f64" { return repSigTokOfKind("f64") }
+      if pn == "i64" { return repSigTokOfKind("i64") }
+      if pn == "f32" { return repSigTokOfKind("f32") }
+      if pn == "v128" { return repSigTokOfKind("v128") }
+      if pn == "string" { return repSigTokOfKind("str") }
+      return ""
+    }
+    TyArray => {
+      if t.aElem < 0 { return "" }
+      const el = T.tys[t.aElem]
+      if el is TyPrim {
+        const en = el.primName
+        if en == "i32" || en == "boolean" { return repSigTokOfKind("list") }
+        if en == "string" { return repSigTokOfKind("strlist") }
+        if en == "f64" { return repSigTokOfKind("f64list") }
+        if en == "i64" { return repSigTokOfKind("i64list") }
+        if en == "f32" { return repSigTokOfKind("f32list") }
+      }
+      return ""
+    }
+    TyObj => {
+      // A union-arm's identity is its declaration, not its structure (two variants can share a
+      // field set) — `variantRowOfTy` matches by arena index only, unlike the name path's field-set match.
+      const vrow = variantRowOfTy(ty)
+      if vrow >= 0 { return repSigVariantTok(vrow) }
+      return ""
+    }
+    TyNullable => {
+      // The nullable arm, by the same arena identity: the render softens `Circle` to its field
+      // set, which the name path keys as an inline struct the lambda never declares (D3074).
+      const nvrow = nulArmRowOfTy(t.nInner)
+      if nvrow >= 0 { return repSigNulVariantTok(nvrow) }
+    }
+    TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      // No parameter token of its own; the name path answers.
+    }
+  }
+  ""
+}
+
+// The return-side twin of `paramTokOfTy` — same partition, same declines, and one extra
+// decline of its own: the litunion arms. `annRetKind` keys `>i` for a litunion alias name
+// while a raw render softens an inline litunion to `string` (`>S`), so the name arm stays
+// authoritative there. Dual-written inside `sigKeyOfTy`.
+function retTokOfTy(ty: i32) {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less, the partition `paramTokOfTy` uses: a new arena variant
+  // with a result token must name it rather than take the `""` decline.
+  match t {
+    TyPrim => {
+      const pn = t.primName
+      if pn == "i32" || pn == "boolean" { return ">" + repSigTokOfKind("i32") }
+      if pn == "f64" { return ">" + repSigTokOfKind("f64") }
+      if pn == "i64" { return ">" + repSigTokOfKind("i64") }
+      if pn == "f32" { return ">" + repSigTokOfKind("f32") }
+      if pn == "v128" { return ">" + repSigTokOfKind("v128") }
+      if pn == "string" { return ">" + repSigTokOfKind("str") }
+      return ""
+    }
+    TyArray => {
+      if t.aElem < 0 { return "" }
+      const el = T.tys[t.aElem]
+      if el is TyPrim {
+        const en = el.primName
+        if en == "i32" || en == "boolean" {
+          return ">" + repSigTokOfKind("list")
+        }
+        if en == "string" { return ">" + repSigTokOfKind("strlist") }
+        if en == "f64" { return ">" + repSigTokOfKind("f64list") }
+        if en == "i64" { return ">" + repSigTokOfKind("i64list") }
+        if en == "f32" { return ">" + repSigTokOfKind("f32list") }
+      }
+      // The ref-array arm: the arena twin of `annRetKind`'s `nameIsRefArray` path, resolved
+      // through the element's own ref-list slot via `repElemId` — the same key the name resolver ends at.
+      const rslot = rlSlotOfTy(t.aElem)
+      if rslot >= 0 { return ">" + repSigSlotTokOfKind("reflist", rslot) }
+      return ""
+    }
+    TyObj => {
+      // The result twin of `paramTokOfTy`'s union-arm arm, added together: a `(Circle) => Circle`
+      // annotation keys both halves, or half a key still disagrees with the lambda's functype.
+      const vrow = variantRowOfTy(ty)
+      if vrow >= 0 { return ">" + repSigVariantTok(vrow) }
+      return ""
+    }
+    TyNullable => {
+      // The result twin of `paramTokOfTy`'s nullable-arm arm.
+      const nvrow = nulArmRowOfTy(t.nInner)
+      if nvrow >= 0 { return ">" + repSigNulVariantTok(nvrow) }
+    }
+    TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+      // No result token of its own; the name path answers.
+    }
+  }
+  ""
+}
+
+// A function type's result `ty` rendered as `sigKeyOfTy` keys it: a litunion alias, bare or
+// nullable, keeps its alias name, since a raw render softens it to `string`. "" when unrendered.
+export function fnRetEmitName(ty: i32): string {
+  if ty < 0 { return "" }
+  const rtn = T.tys[ty]
+  if rtn is TyNullable {
+    const nal = litUnionAliasNameOfTy(rtn.nInner)
+    if nal != "" { return nal + "|null" }
+  }
+  const bal = litUnionAliasNameOfTy(ty)
+  if bal != "" { return bal }
+  tyToEmitName(ty)
+}
+
+export function sigKeyOfTy(funcTyIx: i32): string {
+  if funcTyIx < 0 { return "" }
+  const gen = tyRegGenNow()
+  while sktGen.length <= funcTyIx {
+    sktGen.push(-1)
+    sktKey.push("")
+  }
+  if sktGen[funcTyIx] == gen { return sktKey[funcTyIx] }
+  const k = sigKeyOfTyGo(funcTyIx)
+  sktGen[funcTyIx] = gen
+  sktKey[funcTyIx] = k
+  k
+}
+
+function sigKeyOfTyGo(funcTyIx: i32): string {
+  const t = T.tys[funcTyIx]
+  if !(t is TyFunc) { return "" }
+  let key = ""
+  let i = 0
+  while i < t.fnParamTypes.length {
+    const pc = sigParamTokOfTy(t.fnParamTypes[i])
+    if pc == "" { return "" }
+    key = key + pc
+    i = i + 1
+  }
+  const rc = sigRetTokOfTy(t.fnRet)
+  if rc == "" { return "" }
+  key + rc
+}
+
+// One parameter's `$fnsig` token for `sigKeyOfTy`, arena first, else its render. A string
+// literal union keys the i32 atom, since a raw render may soften it to `string`. "" when the
+// type has no token.
+export function sigParamTokOfTy(pty: i32): string {
+  const pc = paramTokOfTy(pty)
+  if pc != "" { return pc }
+  if tyIsLitUnion(pty) { return repSigTokOfKind("i32") }
+  const pnm = tyToEmitName(pty)
+  if pnm == "" { return "" }
+  annParamKind(pnm)
+}
+
+// The result half of `sigKeyOfTy` (`>X`), arena first so a scalar or scalar-list result is
+// never rendered; the render keeps a litunion alias so it keys `>i`, not `>S`. "" when none.
+export function sigRetTokOfTy(rty: i32): string {
+  const raTok = retTokOfTy(rty)
+  if raTok != "" { return raTok }
+  let rs = fnRetEmitName(rty)
+  if rs == "" { return "" }
+  const rt = T.tys[rty]
+  if rt is TyFunc { rs = "(" + rs + ")" }
+  annRetKind(rs)
+}
+
+// Whether type `ty` may be something other than the i32 valtype: only a derived `i32` or
+// `boolean | null` rep is known to ride an i32, so an underived rep answers true.
+export function cloArityRepIsWide(ty: i32): boolean {
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return true }
+  d.rdKind != "i32" && d.rdKind != "nulbool"
+}
+
+// The `$fnsig` key of a union member-set arm (a `splitUnionAtoms` atom), or "" for a
+// non-closure arm or a signature outside the value-call ABI. A closure arm arrives wrapped
+// in its disambiguating parens and may carry `| `-split whitespace, neither peeled by
+// `annSigKey` — normalized here so the key byte-matches the narrowed call site's.
+export function unionArmSigKey(arm: string) {
+  // Trim then peel one fully-wrapping `(...)` — the same steps as `emit_base.normTypeAtom`,
+  // kept as a separate copy here and dual-run against it with no disagreement. #1150.
+  const t = normTypeAtom(arm)
+  if annArrowAt(t) < 0 { return "" }
+  annSigKey(t)
+}
+
+// The annotation node behind `identFnTypeAnnNameSid`'s first arm — a `LetDecl` whose
+// `letType` is a function type, or -1. `atIx` picks among sibling function-scoped blocks
+// binding one name (D2316), same as `identClosureFeAt`. The sid-taking primitive:
+// `parentLetOf` and `globalLetOf` reached from here, one id serves both.
+export function identFnTypeAnnNodeAt(sid: i32, fnIx: i32, atIx: i32) {
+  if fnIx >= 0 {
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = bodyLetReadAtSid(fn.fnBody, sid, atIx)
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          if tyIsFuncType(d.letType) { return d.letType }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The `$fnsig` key of a function-type name that may be a plain closure or a nullable one
+// (kind 19, its arrow nested one paren-depth down, invisible to `annArrowAt`) — peeled to
+// the bare closure first. "" when neither resolves, so the call keeps its all-i32 arity
+// fallback; otherwise it recovers the result token so a narrowed nullable-closure call classifies correctly.
+export function cloNameSigKey(nm: string) {
+  if annArrowAt(nm) >= 0 { return annSigKey(nm) }
+  if nameIsNulClosure(nm) {
+    const clo = peelGroupParens(nullablePartOf(nm))
+    if annArrowAt(clo) >= 0 { return annSigKey(clo) }
+  }
+  ""
+}
+
+// True when a function-scoped block binding of `sid` is still open at `atIx` — reusing
+// `parentLetCoversAt` (D2325) rather than a second duplicate-tracking walk. Asked before the
+// loop-variable/parameter/anon-leaf rungs, which answer for the OUTER declaration with no
+// notion of a nearer block shadow; shared with `monoBakeCallback`'s direct-call rewrite.
+export function fnBlockShadowsAt(fnIx: i32, sid: i32, atIx: i32): boolean {
+  if fnIx < 0 { return false }
+  if atIx < 0 { return false }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return parentLetCoversAt(fn.fnBody, sid, atIx) }
+  false
+}
+
+// The links `moduleCopySigKey` follows: the monomorphizer's own alias-chain limit.
+export const COPY_CHAIN_MAX = 64
+
+// The last arena index of frame `fnIx`'s source (its body block; the program node for the
+// start function), or -1. The arena is post-order, so a node past it is a rewrite's own.
+export function frameBodyEnd(fnIx: i32): i32 {
+  if fnIx < 0 { return emitRootIx }
+  if fnIx >= P.nodes.length { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl { return fn.fnBody }
+  -1
+}
+
+// The `$fnsig` key of the callee node at `atIx` from its own checker type, or "" when it has
+// no function type or no position (`atIx < 0`).
+export function calleeNodeSigKey(atIx: i32): string {
+  if atIx < 0 { return "" }
+  const aty = nodeTyIxOf(atIx)
+  if aty >= 0 {
+    if T.tys[aty] is TyFunc { return sigKeyOfTy(aty) }
+  }
+  ""
+}
+
+// Whether the frame binding a capture `name` of lifted frame `fe` binds it as a loop variable:
+// the table lookups `captureLoopVarIterOf` starts with, without its element-kind reads. False
+// means that function answers -1.
+export function enclosingLoopVarBinds(fe: i32, name: string): boolean {
+  captureLoopNodeOf(fe, name) >= 0
+}
+
+// The position of a `$fnsig` key's result token char — just past the last `>` (params never
+// contain one) — or -1 for an empty/result-less key. The one last-`>` scan every result-side
+// reader (`sigKeyRetKind`/`sigKeyRetIsVoid`/`sigKeyRetSlot`) decodes through, instead of
+// re-scanning the key string per site. Not a type-name grammar — the `$fnsig` ABI alphabet.
+function sigKeyRetTokIx(k: string) {
+  const n = k.length
+  let gt = -1
+  let i = 0
+  while i < n {
+    if k[i] == '>' { gt = i }
+    i = i + 1
+  }
+  if gt < 0 || gt + 1 >= n { return -1 }
+  gt + 1
+}
+
+// The result value-kind encoded in a closure `$fnsig` key (the atom after the final `>`), or
+// `null` when the key is empty or malformed. Shared by the Ident-callee path
+// (`calleeRetKindAt`), the indexed-element path (`cloArrCallRetKind`), and — for a
+// monomorphized closure-pinned param — the instance-return pin (emit_mono).
+export function sigKeyRetKind(k: string): VKind | null {
+  const ti = sigKeyRetTokIx(k)
+  if ti < 0 { return null }
+  const c = k[ti]
+  // Void is the ABSENCE of a result kind, not a member of the token
+  // vocabulary — tested before the shared table.
+  if c == 'v' { return null }
+  // ONE vocabulary with the encode sites: the token decodes through the
+  // canonical char→kind table (`repKindOfSigTok` — the inverse of the
+  // `repSigTokOfKind` the encoders read). Every encoder arm must carry a decoder twin.
+  repKindOfSigTok(c)
+}
+
+// True when a `$fnsig` key's result token is the literal void marker (`…>v`) —
+// distinguishable from an EMPTY/unresolved key, which `sigKeyRetKind` folds into the
+// same `null` a void result yields.
+export function sigKeyRetIsVoid(k: string) {
+  const ti = sigKeyRetTokIx(k)
+  ti >= 0 && k[ti] == 'v'
+}
+
+// True when the `TyUnion` at `ty` has a member that is an array whose element is itself a
+// value union (`(i64 | boolean)[]`) — the deferred hole in a closure-result union, since the
+// box-of-value-union-element-array rep does not yet compose through a closure result. A
+// struct/closure/plain-scalar-list arm is not flagged — those rep fine.
+export function tyUnionHasValueUnionElemArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray && m.aElem >= 0 {
+      const el = T.tys[m.aElem]
+      if el is TyUnion {
+        // A VALUE union element (2+ members, at least one scalar) — not a variant union.
+        if el.uMembers.length >= 2 {
+          let hasPrim = false
+          let j = 0
+          while j < el.uMembers.length {
+            if T.tys[el.uMembers[j]] is TyPrim { hasPrim = true }
+            j = j + 1
+          }
+          if hasPrim { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when `mt` is a declared member of the union type `ut` — used by the `is` emitter's
+// loud floor to tell apart "not a union variant" (the tested type isn't in the union) from
+// "a declared member with no interned rep" (the arm is checker-approved but nothing ever
+// boxed a value into it). A nullable union receiver peels; structural, because VL is.
+export function tyIsUnionMemberOf(ut: i32, mt: i32): boolean {
+  if ut < 0 || mt < 0 { return false }
+  let u = ut
+  const un = T.tys[u]
+  if un is TyNullable { u = un.nInner }
+  if u < 0 { return false }
+  const t = T.tys[u]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    if tySame(t.uMembers[i], mt) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True when the `TyUnion` at `ty` has a member that is an array whose element is a map
+// (`{[string]: f32}[]`) — a deferred hole in a closure-result value union, since the
+// box-of-map-array rep does not yet compose through a closure result. A struct-array,
+// plain scalar-list, struct, or closure arm is not flagged — those rep fine.
+export function tyUnionHasMapArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray && m.aElem >= 0 {
+      if T.tys[m.aElem] is TyMap { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the `TyUnion` at `ty` has a member that is an array whose element is a closure
+// (a nullable-closure element peels its `| null` to the `TyFunc`) — a deferred hole in a
+// closure-result value union, since the box-of-closure-array rep does not yet compose
+// through a closure result. A struct-array or scalar-list arm is not flagged.
+export function tyUnionHasClosureArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray && m.aElem >= 0 {
+      let el = m.aElem
+      const en = T.tys[el]
+      if en is TyNullable { el = en.nInner }
+      if el >= 0 {
+        if T.tys[el] is TyFunc { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// True when the `TyUnion` at `ty` has a member that is a nested (2-D+) array whose leaf
+// element is a litunion (`K0[][]`) — a deferred hole in a closure-result value union, since
+// the litunion 2-D array folds to a distinct wrapper slot that does not yet compose through
+// the box. A 1-D litunion array or a scalar-leaf nested array reps fine — gate precisely.
+export function tyUnionHasLitUnionNestedArrayArm(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  let i = 0
+  while i < t.uMembers.length {
+    const m = T.tys[t.uMembers[i]]
+    if m is TyArray && m.aElem >= 0 {
+      const el = T.tys[m.aElem]
+      // A NESTED array: the outer array's element is itself an array. Walk to the leaf.
+      if m.aElem >= 0 && el is TyArray {
+        let leaf = m.aElem
+        while leaf >= 0 {
+          const lt = T.tys[leaf]
+          if lt is TyArray { leaf = lt.aElem } else { break }
+        }
+        if leaf >= 0 && tyIsLitUnion(leaf) { return true }
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The interned slot of a slot-carrying result token (`>s3;`, `>n1;`, `>V0;`, `>r2;`,
+// `>m0;`) — the `;`-terminated decimal after the token char — or -1 when the key's result
+// kind carries no slot or the digits are malformed. The one result-slot digit parser;
+// callers gate on `sigKeyRetKind` for which table the slot indexes.
+export function sigKeyRetSlot(k: string) { sigSlotAtTok(k, sigKeyRetTokIx(k)) }
+
+// The `;`-terminated decimal SLOT of the token starting at `ti`, or -1 when `ti` names no
+// token or that kind carries no slot / malformed digits. The ONE slot-digit parse, read by
+// both key decoders that want one (`sigKeyRetSlot` for the result token, `sigParamSlotAt`
+// for the param spine).
+export function sigSlotAtTok(k: string, ti: i32): i32 {
+  if ti < 0 || ti >= k.length { return -1 }
+  if !repSigTokHasSlot(repKindOfSigTok(k[ti])) { return -1 }
+  let j = ti + 1
+  let acc = 0
+  let saw = false
+  while j < k.length && k[j] != ';' {
+    const d = k[j]
+    if d < '0' || d > '9' { return -1 }
+    acc = acc * 10 + (d - '0')
+    saw = true
+    j = j + 1
+  }
+  if !saw { return -1 }
+  acc
+}
+
+// `exprIsClosure` restricted to forms safe to query during return-kind classification
+// (avoids recursion through `declaredSlotOf`, which needs the local registry built): a
+// function name, a `function(...)` literal, or an object field — the arm this ladder
+// lacked, a closure-typed param or local returned by name.
+function frameBindingNode(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name { return params[i] }
+      }
+      i = i + 1
+    }
+    const li = parentLetOf(fn.fnBody, name)
+    if li >= 0 { return li }
+    return parentLoopVarOf(fn.fnBody, name)
+  }
+  -1
+}
+
+// `frameBindingNode` for a read at node `atIx` (-1: no position): the `let` or loop variable in
+// scope there shadows a parameter, and one in a block the read is outside binds nothing.
+function frameBindingNodeAt(fnIx: i32, name: string, atIx: i32): i32 {
+  if fnIx < 0 { return -1 }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const sid = readSidOf(name, atIx)
+    const li = bodyReadLet(fn.fnBody, sid, atIx)
+    if li == PL_READ_UNPLACED { return frameBindingNode(fnIx, name) }
+    if li >= 0 { return li }
+    if emitRootIx >= 0 && fn.fnBody <= emitRootIx {
+      const lp = parentLoopAt(fn.fnBody, sid, atIx)
+      if lp >= 0 { return lp }
+    } else if bodyReadInLoop(fn.fnBody, sid, atIx) {
+      return frameBindingNode(fnIx, name)
+    }
+    return fnParamNodeOf(fnIx, name)
+  }
+  -1
+}
+
+// The binding a bare identifier read at node `atIx` denotes, seen from inside the function at
+// arena index `fnIx`: this frame's own param/`let`/`for` variable, else the nearest enclosing frame
+// that binds it (a capture there). -1 when no scope in the chain binds it — the only case
+// where the name can denote a module-level global or function.
+export function identBindingNoLocal(fnIx: i32, name: string, atIx: i32): i32 {
+  const own = frameBindingNodeAt(fnIx, name, atIx)
+  if own >= 0 { return own }
+  let pp = fnStmtsPosOf(fnIx)
+  // `fnStmts.length` bounds the walk the way `fnIndexOfInScopeSid`'s does: a parent chain
+  // cannot outrun the function count, so a malformed `fnParent` cannot spin here.
+  let steps = 0
+  while pp >= 0 && steps <= fnStmts.length {
+    if pp >= fnParent.length { return -1 }
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return -1 }
+    const hit = frameBindingNode(fnStmts[pp], name)
+    if hit >= 0 { return hit }
+    steps = steps + 1
+  }
+  -1
+}
+
+// Whether `name` read in the frame of function node `fnIx` (-1 for the module's statements)
+// denotes a module-level declaration. A loop variable binds only inside its own loop, so the
+// caller tracks those of the frame it walks by position, and `outerFrameBinds` those of the
+// frames around it (D2620).
+export function nameFreeToModule(fnIx: i32, name: string): boolean {
+  if fnIx >= 0 {
+    const own = frameBindingNode(fnIx, name)
+    if own >= 0 {
+      const on = P.nodes[own]
+      if !(on is ForRange || on is ForIn) { return false }
+    }
+    const fe = fnStmtsPosOf(fnIx)
+    if outerFrameBinds(fe, fnIx, name) { return false }
+    if moduleLoopEnclosing(fe, name) >= 0 { return false }
+  }
+  moduleLocalLetOf(emitRootIx, name) < 0
+}
+
+// Whether a frame enclosing the lifted function at position `fe` (node `fnIx`) binds `name`
+// where `fnIx` reads it: any binding but a loop variable, and a loop variable only when `fnIx`
+// sits inside that loop.
+export function outerFrameBinds(fe: i32, fnIx: i32, name: string): boolean {
+  let pp = fe
+  let steps = 0
+  while pp >= 0 && pp < fnParent.length && steps <= fnStmts.length {
+    pp = fnParent[pp]
+    if pp < 0 || pp >= fnStmts.length { return false }
+    const hit = frameBindingNode(fnStmts[pp], name)
+    if hit >= 0 {
+      const hn = P.nodes[hit]
+      if !(hn is ForRange || hn is ForIn) { return true }
+      if nodeSubtreeHas(hit, fnIx) { return true }
+    }
+    steps = steps + 1
+  }
+  false
+}
+
+// True if field `prop` of struct table index `si` is a function-valued field — a bare
+// closure (code 14) or a NULLABLE closure (code 22). Both read back as a closure and call
+// via `call_ref`; the nullable one is recovered to non-null at the call site.
+export function structFieldIsClosure(si: i32, prop: string) {
+  if si < 0 || si >= sNames.length { return false }
+  const cnt = sFieldCount[si]
+  const start = sFieldStart[si]
+  let fj = 0
+  while fj < cnt {
+    if sFieldNames[start + fj] == prop {
+      const fc = sFieldTypeAt(si, fj)
+      return fc == FC_CLOSURE || fc == FC_NUL_CLOSURE
+    }
+    fj = fj + 1
+  }
+  false
+}
+
+// Is `k` the result kind of a non-nullable list?
+export function vkIsPlainList(k: VKind | null): boolean {
+  k == "list"
+    || k == "f64list"
+    || k == "strlist"
+    || k == "reflist"
+    || k == "i64list"
+    || k == "f32list"
+    || k == "u8list"
+}
+
+// The `.map` result kind where callback `fe` reads as `i32`. An un-annotated callback holds that
+// kind until return inference reaches it, so the call's checked list rep answers where it names
+// another list.
+export function mfI32ResultOrColumn(callIx: i32, fnIx: i32, fe: i32): MfKind {
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 { return "i32" }
+  }
+  const d = nodeRepIn(callIx, fnIx)
+  if d.rdCovered != 1 { return "i32" }
+  const ks: MfKind[] = ["ref", "str", "f64", "i64", "f32"]
+  let i = 0
+  while i < ks.length {
+    if listRepOfMf(ks[i]) == d.rdKind { return ks[i] }
+    i = i + 1
+  }
+  "i32"
+}
+
+// The `unNames` row a box of `ty` reads through: the one whose flattened members are exactly
+// `ty`'s without the repeats a substitution leaves (`T | i32` at `T := i32 | null`), else the
+// first holding every one of them. A box's tag names its member, so a wider row reads it
+// right. -1 when no row holds them all.
+export function unRowOfFlatMembers(ty: i32): i32 {
+  const xs = flatDistinctMembers(ty)
+  if xs.length < 2 { return -1 }
+  let cover = -1
+  let u = 0
+  while u < unTyIx.length {
+    const ys: i32[] = []
+    if unTyIx[u] >= 0 { flattenVariantsInto(unTyIx[u], ys) }
+    let all = ys.length > 0
+    let k = 0
+    while k < xs.length {
+      if !tyListHasEq(ys, xs[k]) { all = false }
+      k = k + 1
+    }
+    if all && ys.length == xs.length { return u }
+    if all && cover < 0 { cover = u }
+    u = u + 1
+  }
+  cover
+}
+
+// `ty`'s flattened members with the repeats a substitution leaves dropped; empty when one is
+// unresolved.
+function flatDistinctMembers(ty: i32): i32[] {
+  const raw: i32[] = []
+  flattenVariantsInto(ty, raw)
+  const xs: i32[] = []
+  let i = 0
+  while i < raw.length {
+    if raw[i] < 0 { return [] }
+    if !tyListHasEq(xs, raw[i]) { xs.push(raw[i]) }
+    i = i + 1
+  }
+  xs
+}
+
+// Whether some member of `xs` is `tyEq` to `t`.
+function tyListHasEq(xs: i32[], t: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    if xs[i] >= 0 && tyEq(xs[i], t) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// True if the lifted callback at `fe` returns a BOOLEAN (its annotation, or the
+// inferred `fRetBool`) — the element-bool-ness of a `.map` result, threaded to the
+// print import choice (`__print_bool__` renders true/false).
+export function mfCbRetIsBool(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      // Drops the `rt is TypeRef` gate the spelling path needed: a non-`TypeRef` return
+      // annotation still has a recorded type, so the name form couldn't even ask.
+      return tyIsBool(fn.fnRet)
+    }
+    if fe < fRetBool.length { return fRetBool[fe] == 1 }
+  }
+  false
+}
+
+// The function-type nominalizer, on the arena: built from `TyFunc`'s own param and result
+// types instead of by slicing a rendered function name apart and re-parsing each piece.
+// Each part is nominalized by `shapeNominalOfTy` and otherwise rendered. "" means the type
+// is not a `TyFunc`. A litunion alias keeps its name at both parameter and result positions.
+function nominalizePartOfTy(ty: i32): string {
+  const al = litUnionAliasNameOfTy(ty)
+  if al != "" { return al }
+  const sn = shapeNominalOfTy(ty)
+  if sn != "" { return sn }
+  tyToEmitName(ty)
+}
+
+export function nominalizeFnTypeOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if !(t is TyFunc) { return "" }
+  let out = "("
+  const pts = t.fnParamTypes
+  let i = 0
+  while i < pts.length {
+    if i > 0 { out = out + "," }
+    out = out + nominalizePartOfTy(pts[i])
+    i = i + 1
+  }
+  out + ")=>" + fnResultEmitName(t.fnRet)
+}
+
+// A function type's result as the emitter spells it: `never` lowers as `void`, since the
+// callee leaves nothing and each call site follows it with `unreachable` (D1972).
+function fnResultEmitName(ty: i32): string {
+  if ty >= 0 {
+    const r = T.tys[ty]
+    if r is TyPrim {
+      if r.primName == "never" { return "void" }
+    }
+  }
+  nominalizePartOfTy(ty)
+}
+
+// Does struct `si` carry a closure-valued field `name` (code 14)?
+export function drwFieldClosure(si: i32, name: string) {
+  if si < 0 { return false }
+  const fi = sFieldIndex(si, name)
+  if fi < 0 { return false }
+  sFieldTypeAt(si, fi) == FC_CLOSURE
+}
+
+// `shapeNominalOfTy` asked of an ARRAY's ELEMENT: peel the `TyArray`, then resolve. "" when the
+// node is not an array or the element does not resolve to a declared row.
+export function arrElemNominalOfTy(arrIx: i32): string {
+  const aty = nodeTyIxOf(arrIx)
+  if aty < 0 { return "" }
+  const at = T.tys[aty]
+  if at is TyArray { return shapeNominalOfTy(at.aElem) }
+  ""
+}
+
+// The map-value twin of `arrElemNominalOfTy` (D88): `shapeNominalOfTy` recurses through
+// `TyArray`, but nothing asked it about a map value, so `tyToEmitName` rendered a declared
+// arm structurally there instead — two map structs for one map, `vl check` rc 0 and the
+// engine refusing. `variantRowOfTy` is the narrowing kept; only the value text changes.
+export function nodeMapArmNominalName(ix: i32): string {
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 { return "" }
+  const t = T.tys[ty]
+  if t is TyMap {
+    const vr = variantRowOfTy(t.mVal)
+    if vr < 0 { return "" }
+    if vr >= uVariants.length { return "" }
+    const whole = tyToEmitName(ty)
+    if mapSpellKeyEnd(whole) < 0 { return "" }
+    return "{[" + mapSpellKeyName(whole) + "]:" + uVariants[vr] + "}"
+  }
+  ""
+}
+
+export function resolveShapeToNominal(name: string) {
+  if name == "" { return "" }
+  if nameIsArray(name) {
+    const inner = resolveShapeToNominal(arrElemNameRaw(name))
+    if inner == "" { return "" }
+    return inner + "[]"
+  }
+  const si = structIndexOfTypeName(name)
+  if si >= 0 { return sNames[si] }
+  const vti = variantIndexOfTypeName(name)
+  if vti >= 0 { return uVariants[vti] }
+  name
+}
+
+// Does the annotation at `ix` spell a function type anywhere? The tree when it survives,
+// the rendered name's arrow scan when it does not.
+export function annCloSigSpelled(ix: i32, nm: string): boolean {
+  const root = annTsOf(ix)
+  if root >= 0 { return tsHasKind(root, TS_FUNC) }
+  strContains(nm, "=>")
+}
+
+// Is the annotation at `ix` spelled as a top-level function type? The tree's root kind where
+// the tree survives, `annArrowAt`'s depth-0 scan of the rendering where it does not.
+export function annIsTopLevelFunc(ix: i32, nm: string): boolean {
+  const root = annTsOf(ix)
+  if root >= 0 { return tsKind[root] == TS_FUNC }
+  annArrowAt(nm) >= 0
+}
+
+// Is the annotation at `ix` spelled as an inline object shape (`{a: i32}`, not a map
+// `{[k]: v}`)? The tree's root kind where the tree survives, the rendering's opening
+// characters where it does not.
+function annIsSpelledInlineShape(ix: i32, nm: string): boolean {
+  const root = annTsOf(ix)
+  if root >= 0 { return tsKind[root] == TS_OBJ }
+  nameIsShapeSpanEnds(nm)
+}

@@ -1,0 +1,603 @@
+// `emit_union_casts.vl` — whether a module casts unions or numbers, the niche casts
+// it wires, and which functions use a map.
+
+import { AsExpr, FuncDecl, P, Param, TypeRef } from "./ast"
+import {
+  nodeTyIsFunc,
+  nodeTyIxOf,
+  nodeTyPrimName,
+  nodeTyReachesMap,
+} from "./check_node_tys"
+import { numCastCanFail } from "./check_num_lits"
+import { widenRetagAny } from "./check_retag_rows"
+import { valueAtomKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  primNameStr,
+  tyIxIsVariantMember,
+} from "./check_types"
+import { structIndexOfTy, valueAtomKindOfTy } from "./emit_atom_kinds"
+import { mapRetagAnyEmitted } from "./emit_map_twins"
+import { structIdxMatchesVariantIdx } from "./emit_obj_lit_fits"
+import { msHasValKind } from "./emit_rep"
+import {
+  MfKind,
+  RLK_MAP,
+  VKind,
+  liBack,
+  liKinds,
+  liSlots,
+  listIdxScratchBase,
+  localIsRef,
+  localNames,
+  localStructIdx,
+  mTwinSettled,
+  mfDstBases,
+  mfDstKinds,
+  mfDstSlots,
+  mfSrcBases,
+  mfSrcKinds,
+  mfSrcSlots,
+  modNumCastHit,
+  modNumCastSeen,
+  modUnionAsHit,
+  modUnionAsSeen,
+  monoGradualAsScalar,
+  rlElemKindTbl,
+  sHeapIdx,
+  uVarHeap,
+  unNames,
+  unVarCount,
+  unVarStart,
+} from "./emit_state"
+import { msSetOfText, unionHasAtomTy } from "./emit_union_registry"
+import { splitUnionAtoms } from "./tyname"
+import { isNullTy, primNameOf, tyPeelNul } from "./tyquery"
+
+// The struct row an `x as! S` yields over a nullable-ref `S | null` operand, where `S` is a
+// standalone struct; else -1 — the first row denoting `S`, as an annotated binding resolves it.
+export function asTrapStructRow(asIx: i32): i32 {
+  const n = P.nodes[asIx]
+  if !(n is AsExpr) { return -1 }
+  if n.asMode != "trap" { return -1 }
+  const payload = nulRefNichePayloadTy(nodeTyIxOf(n.asObj))
+  if payload < 0 { return -1 }
+  if !(T.tys[payload] is TyObj) { return -1 }
+  if tyIxIsVariantMember(payload) { return -1 }
+  structIndexOfTy(payload)
+}
+
+// The value atom the checker banked at an un-narrowed code-16 read — condition 2 of the
+// channel predicate on its own, with no union anywhere in it. -1 when the checker typed
+// the node as anything but a non-`null` value atom.
+export function memReadCheckerAtomKind(memIx: i32): i32 {
+  const cty = nodeTyIxOf(memIx)
+  if cty < 0 { return -1 }
+  const t = T.tys[cty]
+  // A read the checker narrowed to a function arm delivers the closure the box holds (D4346).
+  if nodeTyIsFunc(memIx) { return valueAtomKindOfTy(cty) }
+  if t is TyPrim {
+    const k = valueAtomKind(t.primName)
+    if k < 0 || k == 6 { return -1 }
+    return k
+  }
+  -1
+}
+
+// Membership of a scalar value atom in the union `nm`, answered from the banked kind
+// column where the pool covers the set and the member-name path where it doesn't — one
+// function so the store ladder and the read predicate ask the same question.
+export function unionHasAtomK(s: i32, nm: string, kw: string, k: i32): boolean {
+  const b = msHasValKind(s, k)
+  if b >= 0 { return b == 1 }
+  unionHasAtomTy(nm, kw, false)
+}
+
+// `unionHasAtomK` for a kind with no single spelling — the list codes and up, where
+// `valueAtomNameOfKind` answers "" because a code (e.g. 7) names several distinct member
+// spellings (D1095). Walks the member spellings and asks each one's own kind instead. Reads
+// only kinds, never positions — the arm's box tag still comes from `scalarTagOfKind(k)`.
+export function unionHasAtomKindArm(unionName: string, k: i32): boolean {
+  if k < 0 { return false }
+  const arms: string[] = []
+  splitUnionAtoms(unionName, arms)
+  let i = 0
+  while i < arms.length {
+    if valueAtomKind(arms[i]) == k { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The spelling of a value-atom kind — `valueAtomKind`'s inverse over the seven scalar
+// keywords it's a bijection on (codes 0-6). "" for every other code: a list code like 7
+// folds several spellings into one (`i32[]`, `boolean[]`, a litunion `K[]`), so there's
+// no single name to hand back.
+export function valueAtomNameOfKind(k: i32): string {
+  if k == 0 { return "i32" }
+  if k == 1 { return "boolean" }
+  if k == 2 { return "string" }
+  if k == 3 { return "i64" }
+  if k == 4 { return "f64" }
+  if k == 5 { return "f32" }
+  if k == 6 { return "null" }
+  ""
+}
+
+// ── the store's own ladder, named ────────────────────────────────────────────
+// The value-atom kind stored when a value (atom `atom`/`vk`) is boxed into `unionName`,
+// or -1 when no arm can hold it — a function, not an open-coded chain, because both the
+// coercion (picking its tag) and the un-narrowed read ask it (D291).
+export function unionStoreAtomKind(unionName: string, vk: i32): i32 {
+  const atom = valueAtomNameOfKind(vk)
+  if atom == "" { return -1 }
+  const s = msSetOfText(unionName)
+  if unionHasAtomK(s, unionName, atom, vk) { return vk }
+  if vk == 0 {
+    if unionHasAtomK(s, unionName, "i64", 3) { return 3 }
+    if unionHasAtomK(s, unionName, "f64", 4) { return 4 }
+    if unionHasAtomK(s, unionName, "f32", 5) { return 5 }
+  }
+  if vk == 4 {
+    if unionHasAtomK(s, unionName, "f32", 5) { return 5 }
+  }
+  -1
+}
+
+// The row of the (kind, ref-list slot) pair in the parallel frame tables `kinds`/`slots`, or
+// -1 when no frame requirement records it.
+function mfFrameIndex(kinds: MfKind[], slots: i32[], kind: MfKind, slot: i32) {
+  let i = 0
+  while i < kinds.length {
+    if kinds[i] == kind && slots[i] == slot { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Record a distinct (kind, ref-list slot) source frame requirement.
+export function mfRecordSrc(kind: MfKind, slot: i32) {
+  if mfFrameIndex(mfSrcKinds, mfSrcSlots, kind, slot) >= 0 { return 0 }
+  mfSrcKinds.push(kind)
+  mfSrcSlots.push(slot)
+  0
+}
+
+// Record a distinct (result-element-kind, ref-list slot) dest frame requirement. `slot` is
+// the ref-list table slot for a kind-2 (ref-list) dest (so two struct-array filters of
+// different element types get distinct backing locals), -1 for a non-ref dest.
+export function mfRecordDst(kind: MfKind, slot: i32) {
+  if mfFrameIndex(mfDstKinds, mfDstSlots, kind, slot) >= 0 { return 0 }
+  mfDstKinds.push(kind)
+  mfDstSlots.push(slot)
+  0
+}
+
+// The wasm local holding the source wrapper ref for (kind, slot), or -1.
+export function mfSrcLocalFor(kind: MfKind, slot: i32) {
+  const i = mfFrameIndex(mfSrcKinds, mfSrcSlots, kind, slot)
+  if i >= 0 && i < mfSrcBases.length { return mfSrcBases[i] }
+  -1
+}
+
+// The wasm local holding the dest backing ref for result (kind, slot), or -1.
+export function mfDstLocalFor(kind: MfKind, slot: i32) {
+  const i = mfFrameIndex(mfDstKinds, mfDstSlots, kind, slot)
+  if i >= 0 && i < mfDstBases.length { return mfDstBases[i] }
+  -1
+}
+
+// True if function `fnIx` operates on a map — it has a map param, or `buildLocals`
+// flagged a map local (code 6). Drives the map scratch-frame reservation; must run
+// after `buildLocals`, so `localIsRef` is populated.
+export function fnHasMap(fnIx: i32) {
+  let i = 0
+  while i < localNames.length {
+    if localIsRef[i] == "map" { return true }
+    // A map-array local (`{[string]:i32}[]`, code 5 with element kind 3) lets map ops run
+    // on an indexed element, so the function needs the scratch frame even with no bare map local.
+    if localIsRef[i] == "reflist" {
+      const s = localStructIdx[i]
+      if s >= 0 {
+        if s < rlElemKindTbl.length {
+          if rlElemKindTbl[s] == RLK_MAP { return true }
+        }
+      }
+    }
+    i = i + 1
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let pj = 0
+    while pj < params.length {
+      const p = P.nodes[params[pj]]
+      if p is Param {
+        if p.parType >= 0 {
+          const ty = P.nodes[p.parType]
+          if ty is TypeRef {
+            // The arena test must match the WIDTH of the name test it replaces
+            // (`nameIsMap` accepted a nullable- or union-wrapped map too, not just bare) —
+            // `nodeTyIsMap` alone would under-reserve for those. Over-answering is the safe
+            // direction for a reservation: an unused frame costs nothing, a missing one doesn't build.
+            if nodeTyReachesMap(p.parType) { return true }
+          }
+        }
+      }
+      pj = pj + 1
+    }
+  }
+  false
+}
+
+// Does the module contain a union-operand `as` cast? It needs a 1-slot box scratch, since
+// its operand is evaluated once and then both tested and unboxed. Module-wide rather than
+// a per-function hand-walk (like `blockHasCallRef`'s), deliberately: a hand-walk that
+// misses a node kind under-reserves the slot, invalid wasm — a linear arena pass cannot.
+export function moduleHasUnionAs(): boolean {
+  // Memoised on an arena prefix (never a plain boolean): asked once per emitted function,
+  // so a full rescan on every call would cost noticeably more self-compile time.
+  if modUnionAsHit { return true }
+  // A box retagged on delivery stages in the same slot (`emitMapRetag`).
+  if mTwinSettled && mapRetagAnyEmitted() { return true }
+  if widenRetagAny() { return true }
+  let i = modUnionAsSeen
+  while i < P.nodes.length {
+    if asExprIsUnionCast(i) {
+      modUnionAsHit = true
+      return true
+    }
+    // The hole operand, over-approximated: with no `fnIx` here this can't ask the rep
+    // question the emit-time check does, so it reserves rather than risk an invalid-wasm
+    // miss — an unused local costs nothing (D1251).
+    if asExprOperandIsHole(i) {
+      modUnionAsHit = true
+      return true
+    }
+    i = i + 1
+  }
+  modUnionAsSeen = P.nodes.length
+  false
+}
+
+// Whether the `AsExpr` at `ix` is the union-operand form. One home, read by the reservation
+// scan and by the lowering, so the two cannot disagree about which casts need the frame.
+// Asked of the operand's checker type, not the cast's: the cast node's own type is the
+// target arm, so it cannot tell a union propagation from a numeric conversion.
+export function asExprIsUnionCast(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  const oty = nodeTyIxOf(n.asObj)
+  if oty < 0 { return false }
+  const ot = T.tys[oty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that boxes must be admitted here,
+  // not fall to `false` and route the cast through the plain numeric ladder.
+  match ot {
+    TyUnion => {
+      return true
+    }
+    TyNullable => {
+      // A nullable operand is a union operand too — same bar, same meaning — and the checker's
+      // own arm expands it before deciding; this gate must agree or the cast emits an i32 op over a ref.
+      return true
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a boxed operand.
+    }
+  }
+  false
+}
+
+// The operand's recorded type is an unresolved inference hole (a `TyVar`): a parameter only
+// the call site pins keeps one on every read, even though the monomorphizer has already
+// pinned the instance's parameter to the argument's union. Without this rung
+// `asExprIsUnionCast` declines and the cast falls to the plain numeric ladder (D1251).
+export function asExprOperandIsHole(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  const oty = nodeTyIxOf(n.asObj)
+  if oty < 0 { return true }
+  const ot = T.tys[oty]
+  if ot is TyVar { return true }
+  false
+}
+
+// The payload of a nullable-REF niche, or -1: the arena type of `T` when `T | null` reps as
+// a `(ref null $H)` cell, so `ref.null` is the whole encoding of the absent arm and there is
+// neither a tag to test nor a payload to unbox. Every other nullable is a value niche (a
+// `boolean` or literal-union sentinel) or the value box (D1812).
+export function nulRefNichePayloadTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const inner = tyNulSoleInner(ty)
+  if inner < 0 { return -1 }
+  const it = T.tys[inner]
+  // Exhaustive over `Ty` and deliberately `_`-less: whether a nullable is a REF cell is a
+  // question each arena variant answers for itself, so a twelfth breaks the self-compile
+  // here rather than falling to -1, which reads as "this is a value niche" and is a lie.
+  match it {
+    TyPrim => {
+      // Only `string` is a ref; every other primitive nullable is the sentinel or the box.
+      if it.primName == "string" { return inner }
+    }
+    TyObj => {
+      return inner
+    }
+    TyFunc => {
+      return inner
+    }
+    TyArray => {
+      return inner
+    }
+    TyMap => {
+      return inner
+    }
+    TyUnion => {}
+    TyNullable => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+    TyErr => {}
+  }
+  -1
+}
+
+// Does a niche-repped `T | null` reach the `as` trio at EVERY delivery position? A string, a
+// list, a struct and a union VARIANT do: their rep classifiers read a cast node. A map and a
+// closure do not — every un-annotated face is invalid wasm, so the cast keeps its loud
+// refusal for them rather than trading it for a miscompile (D1812).
+export function nulNicheCastWiredTy(inner: i32): boolean {
+  if inner < 0 { return false }
+  const it = T.tys[inner]
+  // `_`-less over `Ty` for the same reason as its payload sibling: a twelfth variant is a
+  // rep nobody has graded, and admitting it silently is how a loud refusal becomes a
+  // miscompile at the delivery positions the matrix would have reddened.
+  match it {
+    TyPrim => {
+      return it.primName == "string"
+    }
+    TyArray => {
+      return true
+    }
+    TyObj => {
+      return true
+    }
+    TyFunc => {}
+    TyMap => {}
+    TyUnion => {}
+    TyNullable => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+    TyErr => {}
+  }
+  false
+}
+
+// The single non-null member of a `T | null`, or -1 — `TyNullable`'s inner, or the lone
+// survivor of a two-member `TyUnion` carrying `null`. The two spellings reach the emitter as
+// different arena shapes and must classify alike.
+function tyNulSoleInner(ty: i32): i32 {
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: the two shapes that spell `X | null`.
+  match t {
+    TyNullable => {
+      return t.nInner
+    }
+    TyUnion => {
+      if t.uMembers.length == 2 {
+        if isNullTy(t.uMembers[0]) { return t.uMembers[1] }
+        if isNullTy(t.uMembers[1]) { return t.uMembers[0] }
+      }
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a nullable shape.
+    }
+  }
+  -1
+}
+
+// Whether the `as?` at `ix` casts a type-parameter operand to a number: the checker types it
+// `N | null` at every pin, so each instance's lowering yields the value box (D2754).
+export function asExprHoleNumOpt(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  if n.asMode != "null" { return false }
+  if !asExprOperandIsHole(ix) && !(monoGradualAsScalar.get(ix) ?? false) {
+    return false
+  }
+  const tn = asExprNumTgtName(ix)
+  tn == "i32" || tn == "i64" || tn == "f32" || tn == "f64"
+}
+
+// ── the numeric exact-or-fail cast (D1041) ───────────────────────────────────
+// The source and target primitive names of the `AsExpr` at `ix`, read from the arena
+// rather than the spelling `n.asTy` (safe for `emitAsCast`'s lossless ladder, which only
+// compares the four primitive names). Survives an alias (`type Px = i32`) and `T | null`.
+export function asExprNumSrcName(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  primNameStr(primNameOf(nodeTyIxOf(n.asObj)))
+}
+export function asExprNumTgtName(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  // `as?` records `T | null` on the node; the other two record `T`. Peeling is a no-op on a
+  // non-nullable, so one read serves all three modes.
+  primNameStr(primNameOf(tyPeelNul(nodeTyIxOf(ix))))
+}
+
+// The exactness domain, the target name except at `u8` — the emitter's half of the
+// checker's `numCastDomainName`, and the one place `n.asTy` outranks the arena: `x as u8`
+// records `i32` (the value it produces), so only the spelling still says `u8` (D1587). The
+// target name still decides the conversion opcode, so the two must not be merged.
+export function asExprNumCastDomain(ix: i32): string {
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return "" }
+  if n.asTy == "u8" { return "u8" }
+  asExprNumTgtName(ix)
+}
+
+// Whether the `AsExpr` at `ix` is a numeric cast that can fail — the emitter's half of the
+// checker's `numCastCanFail`, asked of the same two names. Disjoint from `asExprIsUnionCast`
+// by operand (a union operand is never a primitive), so the two gates cannot both claim a cast.
+export function asExprNumFallible(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  // `as%` keeps the low bits, so it cannot fail at any width pair and owes no staging slot,
+  // no `T | null` box row and no trap message.
+  if n.asMode == "wrap" { return false }
+  if asExprIsUnionCast(ix) { return false }
+  numCastCanFail(asExprNumSrcName(ix), asExprNumCastDomain(ix))
+}
+
+// Whether the `AsExpr` at `ix` is an `as!` or bare `as` to a number over a type-parameter
+// operand: the checker cannot tell there whether it can fail, so each instance asks (D2791).
+export function asExprHoleNumSad(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is AsExpr) { return false }
+  if n.asMode != "trap" && n.asMode != "prop" { return false }
+  if !asExprOperandIsHole(ix) { return false }
+  const d = asExprNumCastDomain(ix)
+  d == "i32" || d == "i64" || d == "f32" || d == "f64" || d == "u8"
+}
+
+// Does the module contain a fallible numeric cast? The `moduleHasUnionAs` twin, reserving
+// the three staging slots by the same linear arena walk, since an exactness test's operand
+// is read twice and is typically not re-readable. Memoised the same way, for the same reason.
+export function moduleHasNumCast(): boolean {
+  if modNumCastHit { return true }
+  let i = modNumCastSeen
+  while i < P.nodes.length {
+    if P.nodes[i] is AsExpr {
+      if asExprNumFallible(i) || asExprHoleNumOpt(i) || asExprHoleNumSad(i) {
+        modNumCastHit = true
+        return true
+      }
+    }
+    i = i + 1
+  }
+  modNumCastSeen = P.nodes.length
+  false
+}
+
+// The float width the checker recorded for the `min` / `max` call at `ix`, or "". The one
+// fact both the lowering and the frame reservation read, so neither can go integer alone.
+export function minMaxRecordedFloat(ix: i32): string {
+  const p = nodeTyPrimName(ix)
+  if p == "f64" || p == "f32" { return p }
+  ""
+}
+
+// True if struct-table entry `ssi` layout-matches a variant arm of some registered
+// variant-box union whose arm heap type differs from `sHeapIdx[ssi]` — a struct of this
+// shape flowing into that union must be re-boxed, never passed raw. The reservation
+// pre-pass has no flow context, so this over-approximates (a harmless spare local).
+export function structIdxHasReboxVariant(ssi: i32): boolean {
+  if ssi < 0 || ssi >= sHeapIdx.length { return false }
+  let u = 0
+  while u < unNames.length {
+    let vi = unVarStart[u]
+    while vi < unVarStart[u] + unVarCount[u] {
+      if vi >= 0 && vi < uVarHeap.length {
+        if structIdxMatchesVariantIdx(ssi, vi) {
+          if sHeapIdx[ssi] != uVarHeap[vi] { return true }
+        }
+      }
+      vi = vi + 1
+    }
+    u = u + 1
+  }
+  false
+}
+
+// The two `(ref null struct)` stashes a frame may need, each asked of one node by
+// `stashHitAt`: a multi-field struct call re-boxed into a variant arm, and a `?.` chain
+// base that is not re-readable. One traversal answers both, so a node kind taught to the
+// walk cannot reach one reservation and miss the other (D1667).
+export type StashWant = "rebox" | "optrecv" | "listget"
+
+// The bounds-check frame kind for a scalar list element kind (`scalarListElemKind`
+// only ever yields the four scalar members of `VKind`).
+export function listIdxKindOf(ek: VKind): MfKind {
+  // The packed byte list's frame slots must carry its own heap types (`bl8`/`ba8`), not the
+  // i32 list's — the `"i32"` default below would type the hoisted wrapper local
+  // `(ref null $lTypeIdx)` and store a `(ref $bl8TypeIdx)` into it.
+  if ek == "u8list" { return "u8" }
+  if ek == "f64" { return "f64" }
+  if ek == "i64" { return "i64" }
+  if ek == "f32" { return "f32" }
+  "i32"
+}
+
+// Which columns join the `liBack` code in a stash's match: the code alone, the code and
+// `liSlots`, the code and `liKinds`, or all three. `scratchSlot` takes the code as an
+// ARGUMENT rather than each allocator copying a constant, so a new stash cannot silently
+// hand back a slot a live one already owns.
+export const SCRATCH_BY_CODE = 0
+export const SCRATCH_BY_KEY = 1
+export const SCRATCH_BY_KIND = 2
+export const SCRATCH_BY_BOTH = 3
+
+// The frame slot carrying `liBack` code `code`, found in the lazily grown table or reserved
+// now as the row `(kind, key, code)`. A column `by` does not key on is still WRITTEN, so a
+// row always reads back the valtype it reserved. Slot 0 of the frame is the shared i32
+// index stash, so row k is slot `listIdxScratchBase + 1 + k`.
+export function scratchSlot(code: i32, kind: MfKind, key: i32, by: i32) {
+  let k = 0
+  while k < liKinds.length {
+    if liBack[k] == code {
+      let hit = true
+      if by == SCRATCH_BY_KEY || by == SCRATCH_BY_BOTH {
+        if liSlots[k] != key { hit = false }
+      }
+      if by == SCRATCH_BY_KIND || by == SCRATCH_BY_BOTH {
+        if liKinds[k] != kind { hit = false }
+      }
+      if hit { return listIdxScratchBase + 1 + k }
+    }
+    k = k + 1
+  }
+  liKinds.push(kind)
+  liSlots.push(key)
+  liBack.push(code)
+  listIdxScratchBase + liKinds.length
+}
+
+// The bounds-check wrapper-ref slot for list kind `kind` (`slot` = the ref-list table slot
+// for kind "ref", else 0), code 0 — the one stash keyed on both columns, since a wrapper's
+// heap type comes from the kind and its ref-list row together. Handed out during lowering:
+// first-use order is what keeps the layout deterministic.
+export function listIdxWrapSlot(kind: MfKind, slot: i32) {
+  scratchSlot(0, kind, slot, SCRATCH_BY_BOTH)
+}
+
+// The shared-union-field receiver stash, code 7 — one `(ref null $uBoxIdx)` slot holding
+// the box across a per-tag dispatch whose receiver cannot be re-emitted per arm. Lazy, not
+// eagerly reserved: whether a read is "shared" depends on `is`-narrowing, which a pre-pass
+// runs before and so cannot see.
+export function sharedFieldRecvSlot() {
+  scratchSlot(7, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// The closure stash of a function-value call lowered inside another's arguments, code 23,
+// keyed by nesting depth so siblings share a slot and an inner call never writes the outer
+// call's (D2329). `(ref null $cloStruct)`; depth 0 uses the eager `callRefSlot` instead.
+export function callRefNestSlot(depth: i32) {
+  scratchSlot(23, "i32", depth, SCRATCH_BY_KEY)
+}

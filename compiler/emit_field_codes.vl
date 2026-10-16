@@ -1,0 +1,800 @@
+// `emit_field_codes.vl` — the field code a type, value kind or match spelling
+// lowers to, and the shape fields it parses.
+
+import { inferRetNameByNode, inferRetTyIxByNode } from "./check_infer_ret"
+import { isValueUnionTyOr, nameIsLitUnionType } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litUnionAliasNameOfTy,
+  tyArrayElemIx,
+  tyIsLitUnion,
+  tyIsLitUnionAlias,
+  tyIsLitUnionArray,
+  tySame,
+  tyToEmitName,
+} from "./check_types"
+import {
+  rowCanonIdOfName,
+  sFieldElemNameAt,
+  sFieldElemTyIxAt,
+  sFieldTypeAt,
+  sIsAnonRow,
+  sScanLim,
+  structIndexOfTy,
+  variantFieldElemName,
+  variantFieldTypeAt,
+} from "./emit_atom_kinds"
+import { nameIsShapeSpanEnds, tyGroupWrapsWhole } from "./emit_base"
+import { jrBoxFits, rowFieldCode0Kind } from "./emit_join_records"
+import { fieldCodeOfListRep } from "./emit_list_rep"
+import { isStructOfTy, mvValLowersTy, variantRowOfTy } from "./emit_mv_slots"
+import { variantIndexOf } from "./emit_narrow_slots"
+import {
+  fieldElemTyIxOfName,
+  repCanonId,
+  repNameCanonId,
+  repOfTy,
+} from "./emit_rep"
+import {
+  FC_CLOSURE,
+  FC_F32,
+  FC_F64,
+  FC_I32,
+  FC_I32_LIST,
+  FC_I64,
+  FC_MAP,
+  FC_NUL_CLOSURE,
+  FC_NUL_LIT_UNION,
+  FC_NUL_REF_LIST,
+  FC_NUL_STR,
+  FC_REF_LIST,
+  FC_STR,
+  FC_STRUCT,
+  FC_UNION,
+  VKind,
+  fRetKind,
+  fRetStructIdx,
+  fnStmts,
+  gaeBases,
+  sFieldCount,
+  sFieldElemName,
+  sFieldNames,
+  sFieldStart,
+  sNames,
+  sTyIx,
+  uFieldCount,
+  uFieldElemName,
+  uFieldStart,
+  uVarTyIx,
+  uVariants,
+  unMemberSet,
+} from "./emit_state"
+import { sFieldIndex } from "./emit_struct_order"
+import { unionMemberSetOf, unionRowOf } from "./emit_union_registry"
+import { variantFieldIndex } from "./emit_variant_sig"
+import { strListIndexOf } from "./listutil"
+import {
+  annGenAppSpanEnds,
+  fieldNameOf,
+  fieldTypeTextOf,
+  gaeHeadNameOf,
+  gaeLtAt,
+  groupInnerOf,
+  nameIsShapeOpen,
+  nameStripSpaces,
+  tyTopLevelSplit,
+} from "./tyname"
+import { tyEmitNamesOf, tyEmitPrimOf } from "./tyquery"
+
+// The struct half: the declared row `structIndexOfObj` adopted the literal onto. -1 for a
+// name that is not a whole-span shape, or one no adopter would have claimed.
+export function mvValRowOfShape(name: string): i32 {
+  if !nameIsWholeSpanShape(name) { return -1 }
+  const fnames: string[] = []
+  const ftypes: string[] = []
+  shapeFieldParse(name, fnames, ftypes)
+  let si = 0
+  while si < sScanLim() {
+    // The half-built-row guard `shapeRowScanK` carries, for the same reason: a code-5
+    // element-name computation re-enters this scanner mid-field-loop.
+    if sFieldStart[si] + sFieldCount[si] > sFieldElemName.length {
+      si = si + 1
+      continue
+    }
+    // An anonymous row's codes are read off a literal, so they are exact and the strict scan
+    // above already had its chance at them; only a declared row adopts.
+    if sFieldCount[si] == fnames.length && !sIsAnonRow(si) {
+      let ok = true
+      let k = 0
+      while k < fnames.length {
+        const fj = sFieldIndex(si, fnames[k])
+        if fj < 0 { ok = false }
+        else if !adoptedFieldCompat(ftypes[k], si, fj) { ok = false }
+        k = k + 1
+      }
+      if ok { return si }
+    }
+    si = si + 1
+  }
+  -1
+}
+
+// Could a value of the field type spelled `t` be adopted into row `si`'s field `fj`?
+// `anonValueFitsField`'s declared-row tier, read off a spelling rather than off a value node:
+// the two scalar pairs no adoption can bridge refute, and a nested-struct field keeps the
+// canonical-rep tightening, so two arms sharing a field-name set cannot collide.
+function adoptedFieldCompat(t: string, si: i32, fj: i32): boolean {
+  const want = fieldCodeForMatch(fieldElemTyIxOfName(t))
+  const code = sFieldTypeAt(si, fj)
+  if want == code {
+    if code == FC_STRUCT {
+      return nestedStructNamesCompat(t, sFieldElemNameAt(si, fj))
+    }
+    return true
+  }
+  // An integer or boolean value into a string slot, or a string into a plain i32 one — the
+  // two pairs `anonValueFitsField` refutes against every row. A code-0 slot recording a
+  // literal-union name is the atom slot a string literal legitimately writes.
+  if want == FC_I32 && code == FC_STR { return false }
+  if want == FC_STR && code == FC_I32 { return sFieldElemNameAt(si, fj) != "" }
+  // A nested-struct or closure slot takes neither a scalar nor a string.
+  if code == FC_STRUCT || code == FC_CLOSURE { return false }
+  if want == FC_STRUCT || want == FC_CLOSURE { return false }
+  true
+}
+
+// True if `name` is a single inline struct shape spanning the whole string (`{f: i32}`) —
+// its first `{`'s matching `}` is the last char, and it isn't a map spelling (`{[`). The
+// brace-only alphabet is safe against `<`/`>` but not a quoted literal member
+// (`{v: "a}b"}` closes the group early), so `tyGroupWrapsWhole` is quote-aware instead.
+export function nameIsWholeSpanShape(name: string) {
+  // The endpoint span alone (`nameIsShapeSpanEnds`) is a wider test that a composite
+  // union name like `{a:{b:i32}}|{c:i32}` also passes; the walk here is strictly tighter.
+  if !nameIsShapeSpanEnds(name) { return false }
+  tyGroupWrapsWhole(name)
+}
+
+// Does some struct row carry exactly this `TyObj`'s field-name set? A shallow,
+// terminating structural test for "this field is a struct" — no code comparison, so a
+// recursive shape (`type Node = {next: Node | null}`) cannot loop. Ignoring field types is
+// sound here: this decides only the code (15, "a nested struct"), never which row.
+function tyHasStructRowShallow(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyObj {
+    const fnames = t.objFieldNames
+    if fnames.length == 0 { return false }
+    const lim = sScanLim()
+    let si = 0
+    while si < lim {
+      if sFieldStart[si] + sFieldCount[si] <= sFieldElemName.length {
+        if sFieldCount[si] == fnames.length {
+          let ok = true
+          let k = 0
+          while k < fnames.length {
+            if sFieldIndex(si, fnames[k]) < 0 { ok = false }
+            k = k + 1
+          }
+          if ok { return true }
+        }
+      }
+      si = si + 1
+    }
+  }
+  false
+}
+
+// `fieldCodeOfTy` for the matcher only (D-MATCHCODE): `fieldCodeOfTy` serves two
+// consumers — the matcher below, which only compares a code, and `nameFieldCodeTy`, which
+// feeds the path that records `sFieldTypes`. Code 15 is a two-part answer (code plus an
+// element name), so widening it there would leave `refSlot` unresolved; widening only here doesn't.
+export function fieldCodeForMatch(ty: i32): i32 {
+  const c = fieldCodeOfTy(ty)
+  if c != -2 { return c }
+  if ty < 0 { return -2 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant with a match field code must name
+  // it here rather than take the `-2` and fall to the spelling ladder.
+  match t {
+    TyObj => {
+      if isStructOfTy(ty) { return FC_STRUCT }
+      if tyHasStructRowShallow(ty) { return FC_STRUCT }
+    }
+    TyNullable => {
+      if isStructOfTy(t.nInner) { return FC_STRUCT }
+      if tyHasStructRowShallow(t.nInner) { return FC_STRUCT }
+    }
+    TyMap => {
+      // A map-typed field is code 19, gated identically to the spelling ladder
+      // (`mvValLowersTy`): a map whose value the classifier can't lower keeps failing loudly.
+      if mvValLowersTy(t.mVal) == 1 { return FC_MAP }
+    }
+    TyPrim | TyErr | TyFunc | TyUnion | TyArray | TyVar | TyLit | TyNeg => {
+      // No match field code of its own; the spelling ladder answers.
+    }
+  }
+  -2
+}
+
+// The variant twin of `structRowOfObjFieldSet` below, and specifically of
+// `variantIndexOfTypeName`'s field-set arm — not of `variantRowOfTy`, which matches on
+// arena-index identity (two variants sharing a field set are still different variants).
+// Asks the same field-set question of the type instead of a spelling, first match wins.
+function variantRowOfObjFieldSet(ty: i32): i32 {
+  variantRowOfObjFieldSetK(ty, false)
+}
+
+// The leniency-levelled form (D733), the variant half of `structRowOfObjFieldSetK`.
+// `widen` applies `objFieldCodeWidens` in place of code equality. First-match is kept on
+// the widened pass here (unlike the struct twin, which demands uniqueness) because the
+// variant side already has one first-match authority (`objVariantName`) this can only agree with or decline.
+export function variantRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyObj {
+    const fnames = t.objFieldNames
+    const ftys = t.objFieldTypes
+    let vi = 0
+    while vi < uVariants.length {
+      if uFieldStart[vi] + uFieldCount[vi] > uFieldElemName.length {
+        vi = vi + 1
+        continue
+      }
+      if uFieldCount[vi] == fnames.length {
+        let ok = true
+        let k = 0
+        while k < fnames.length {
+          const fj = variantFieldIndex(vi, fnames[k])
+          if fj < 0 {
+            ok = false
+          } else {
+            const want = fieldCodeForMatch(ftys[k])
+            if want >= 0 {
+              if widen {
+                if (
+                  !variantFieldCodeWidens(
+                    want,
+                    variantFieldTypeAt(vi, fj),
+                    vi,
+                    fj,
+                  )
+                ) {
+                  ok = false
+                }
+              } else if want != variantFieldTypeAt(vi, fj) {
+                ok = false
+              }
+            } else {
+              // The same leniency-with-one-tightening the struct matcher carries: uncoded
+              // fields are lenient, except a code-15 nested row checked by canonical rep.
+              if variantFieldTypeAt(vi, fj) == FC_STRUCT {
+                const rowElem = variantFieldElemName(vi, fj)
+                if rowElem != "" {
+                  const cq = repCanonId(ftys[k])
+                  let cr = repNameCanonId(rowElem)
+                  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
+                  if cq >= 0 {
+                    if cr >= 0 {
+                      if cq != cr { ok = false }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          k = k + 1
+        }
+        if ok { return vi }
+      }
+      vi = vi + 1
+    }
+  }
+  -1
+}
+
+// The declaration-identity name of an arena type — `shapeNominalOfTy`'s two arena rungs,
+// lifted out so other nominal questions can ask them without the two field-set scans that
+// follow there. Both rungs answer by declaration identity, never a guess. "" for an
+// anonymous shape — the two field-set rungs are deliberately not here (D33).
+export function declNominalOfTy(ty: i32): string {
+  if ty < 0 { return "" }
+  const si = structIndexOfTy(ty)
+  if si >= 0 { return sNames[si] }
+  const av = variantRowOfTy(ty)
+  if av >= 0 { return uVariants[av] }
+  ""
+}
+
+// `emit_rep.fieldCodeRefsElemHeap`, private to its own module and needed here for the
+// same reason: 15 a nested struct, 5 a ref list, 28 its `| null` niche — field codes whose
+// storage is a `(ref [null] <heap>)` the code alone doesn't name, so two rows can
+// field-set match, code-match and canon-match while still emitting different layouts.
+export function fieldCodeRefsElemHeapC(code: i32): boolean {
+  code == FC_STRUCT || code == FC_REF_LIST || code == FC_NUL_REF_LIST
+}
+
+// That field's ELEMENT, asked of the QUERY side's arena type: a ref list peels its
+// `TyArray`, the `| null` niche peels the nullable first, and a nested struct IS its own
+// element. -1 for every other code and for a type that does not have the peeled shape.
+export function fieldElemTyOfQueryTy(ty: i32, code: i32): i32 {
+  if ty < 0 { return -1 }
+  if code == FC_STRUCT { return ty }
+  let base = ty
+  if code == FC_NUL_REF_LIST {
+    const n = T.tys[ty]
+    if n is TyNullable { base = n.nInner } else { return -1 }
+  }
+  if base < 0 { return -1 }
+  const b = T.tys[base]
+  if b is TyArray { return b.aElem }
+  -1
+}
+
+// `fieldElemDeclConflict`'s union-box twin: every box field is code 16 whatever it boxes, so
+// the field-set scan matches two boxes on their code alone. Two boxes are one layout only if
+// their member SEQUENCES are, the tags being positional. Refutation-only, like its sibling.
+export function fieldBoxSetConflict(qTy: i32, si: i32, fj: i32): boolean {
+  if !tyEmitNamesOf(qTy) { return false }
+  if sFieldElemNameAt(si, fj) == "" { return false }
+  !jrBoxFits(qTy, sFieldElemTyIxAt(si, fj))
+}
+
+// The declared-row widenings `anonValueFitsField` grants an object literal's field value,
+// asked of a recorded field type instead of a value node. The two sides must agree:
+// `structIndexOfObj` accepts a widening building the row, so the shape resolver must
+// accept the same widening naming it, or a container's element type resolves to no row at all.
+function fieldCodeWidensElem(qc: i32, rc: i32, elem: string): boolean {
+  if qc == rc { return true }
+  // A union-BOX field takes any member — `anonValueFitsField`'s own first line, and the
+  // pairing D461 added to the NAME side of this same question.
+  if rc == FC_UNION { return true }
+  if qc == FC_I32 {
+    // An i32/boolean/litunion-atom value widens into wider numeric slots and the `K | null`
+    // atom niche — not the `boolean | null` niche (21), which needs a boolean literal, a
+    // distinction the code has erased and a type can't recover; not the map slots either.
+    if rc == FC_I64 { return true }
+    if rc == FC_F32 { return true }
+    if rc == FC_NUL_LIT_UNION { return true }
+    return false
+  }
+  if qc == FC_STR {
+    // A string value: the `string | null` ref niche, the `K | null` atom niche, and a
+    // literal-union atom slot (records its union name in the element column).
+    if rc == FC_NUL_STR { return true }
+    if rc == FC_NUL_LIT_UNION { return true }
+    if rc == FC_I32 { return elem != "" }
+    return false
+  }
+  false
+}
+
+// `fieldCodeWidensElem` against a STRUCT row's field.
+export function objFieldCodeWidens(
+  qc: i32,
+  rc: i32,
+  si: i32,
+  fj: i32,
+): boolean {
+  fieldCodeWidensElem(qc, rc, sFieldElemNameAt(si, fj))
+}
+
+// `fieldCodeWidensElem` against a VARIANT row's field — the same relation read out of the
+// other table, so the two field-set scans cannot drift on what a widening is.
+function variantFieldCodeWidens(qc: i32, rc: i32, vi: i32, fj: i32): boolean {
+  fieldCodeWidensElem(qc, rc, variantFieldElemName(vi, fj))
+}
+
+// Whether every field a shape spelling writes as `i32` or `boolean` has that same code-0 kind
+// in row `si`'s own type; a row whose field type is unknown or a hole agrees.
+export function code0SpellingFitsRow(
+  fnames: string[],
+  ftypes: string[],
+  si: i32,
+): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  let k = 0
+  while k < fnames.length {
+    let tk = 0
+    if ftypes[k] == "i32" { tk = 1 }
+    if ftypes[k] == "boolean" { tk = 2 }
+    if tk != 0 {
+      const rk = rowFieldCode0Kind(si, fnames[k])
+      if rk != 0 && rk != tk { return false }
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Whether no field of row `p` is `i32` in one of rows `p` and `c` and `boolean` in the other.
+// The two share a layout, so a supertype edge would validate while relating two records the
+// checker keeps apart; a call pinned to either then reads the other's row (D3693).
+export function rowBoolI32Agree(p: i32, c: i32): boolean {
+  if p < 0 || p >= sFieldCount.length { return true }
+  let k = 0
+  while k < sFieldCount[p] {
+    const nm = sFieldNames[sFieldStart[p] + k]
+    const pk = rowFieldCode0Kind(p, nm)
+    const ck = rowFieldCode0Kind(c, nm)
+    if (pk == 1 && ck == 2) || (pk == 2 && ck == 1) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Parse a canonical inline shape name `{a:T,b:U}` into parallel field-name / field-type
+// string lists. A non-`{…}` name appends nothing. Shared by the variant/struct field-set
+// resolvers so a field-name match can be tightened with a field-type check. A part with no
+// `:` keeps the whole part as the field name.
+export function shapeFieldParse(
+  name: string,
+  outNames: string[],
+  outTypes: string[],
+) {
+  if nameIsShapeOpen(name) {
+    const flat = nameStripSpaces(name)
+    const parts: string[] = []
+    // The group-interior cut (`groupInnerOf`) runs on the despaced name, so a hypothetical
+    // `"{ "` reaches here as `flat == "{"` — `.slice` clamps, so the answer stays "".
+    tyTopLevelSplit(groupInnerOf(flat), ',', false, parts)
+    let k = 0
+    while k < parts.length {
+      const part = parts[k]
+      const ci = part.indexOf(":")
+      if ci < 0 {
+        outNames.push(part)
+        outTypes.push("")
+      } else {
+        // The field-colon cut (`fieldNameOf`/`fieldTypeTextOf`). The `ci < 0` guard above
+        // keeps the whole part as the field name, unlike siblings that gate `ci <= 0`.
+        outNames.push(fieldNameOf(part, ci))
+        outTypes.push(fieldTypeTextOf(part, ci))
+      }
+      k = k + 1
+    }
+  }
+}
+
+// The member SEQUENCE a union-box field key names, canonical where the registry knows it: a
+// registered alias answers with its own set, so `U` and `A|B` are one key. Despaced, never
+// deduped and never reordered — a box's tags are positional, so the sequence IS the layout
+// (DECISIONS.md, the union member-set ABI). "" for a name that resolves to nothing.
+function unionBoxMemberSeqOf(name: string): string {
+  if name == "" { return "" }
+  const u = unionRowOf(name)
+  if u >= 0 && u < unMemberSet.length { return nameStripSpaces(unMemberSet[u]) }
+  nameStripSpaces(unionMemberSetOf(name))
+}
+
+// True unless two union-box field keys are proven to name different member sequences — the
+// code-16 tightening the field-set matchers apply, since every box field shares code 16
+// whatever it boxes. Refutation-only: a key resolving to "" is unknown, not a mismatch, and
+// the alias resolve is what keeps `U` and its own set one key rather than two (D1675).
+export function unionMemberSetsCompat(ta: string, tb: string): boolean {
+  if ta == tb { return true }
+  const sa = unionBoxMemberSeqOf(ta)
+  if sa == "" { return true }
+  const sb = unionBoxMemberSeqOf(tb)
+  if sb == "" { return true }
+  sa == sb
+}
+
+// Whether spelling `t` is an inline record or an application of a generic record alias.
+export function nameIsRecordSpelling(t: string): boolean {
+  if nameIsWholeSpanShape(t) { return true }
+  if !annGenAppSpanEnds(t) { return false }
+  gaeIndexOf(gaeHeadNameOf(t, gaeLtAt(t))) >= 0
+}
+
+// Whether a row's recorded field type-name `elem` is a literal union.
+export function elemIsLitUnion(elem: string): boolean {
+  nameIsLitUnionType(elem)
+}
+
+// True unless the two nested-struct type spellings `ta` / `elem` are proven to denote
+// distinct structures: both resolve through the checker's canonical structural key
+// (`repNameCanonId`) and the keys differ. Either side unresolvable (-1) stays lenient —
+// never a false reject of a twin the canon layer doesn't cover.
+export function nestedStructNamesCompat(ta: string, elem: string): boolean {
+  if ta == elem { return true }
+  const ka = repNameCanonId(ta)
+  if ka < 0 { return true }
+  let ke = repNameCanonId(elem)
+  // An anonymous row's name resolves to no declaration; its own recorded type is its identity,
+  // so `{f: boolean}` does not take a `{f: 4}` literal's row (D2841).
+  if ke < 0 { ke = rowCanonIdOfName(elem) }
+  if ke < 0 { return true }
+  ka == ke
+}
+
+// The arm whose own canonical render is `name` (D762) — strictly tighter than
+// `variantIndexOfTypeName` below, which is a lenient field-set match so an adopted
+// literal's render can reach the arm the adoption already chose. This asks whether canon,
+// rendering the arm itself, would produce exactly this string — the container-element question.
+export function variantIndexOfOwnRender(name: string): i32 {
+  if !nameIsShapeOpen(name) { return -1 }
+  variantRowOwnRender(name, -1)
+}
+
+// The arm whose own type renders as the record `ty` does — the arm recorded at that record
+// itself, else the first with its fields in its order, each spelled alike; -1 for none.
+export function variantRowOfOwnRenderTy(tyIn: i32): i32 {
+  const ty = jrOneRecordOf(tyIn)
+  if ty < 0 { return -1 }
+  variantRowOwnRender("", ty)
+}
+
+// The one arm scan both keys share: the first arm rendering as `name` when it is not "", else
+// the first matching the record `ty`; -1 for none.
+function variantRowOwnRender(name: string, ty: i32): i32 {
+  let vi = 0
+  while vi < uVariants.length {
+    if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
+      const a = uVarTyIx[vi]
+      if name != "" {
+        if tyToEmitName(a) == name { return vi }
+      } else if a == ty || jrSameFieldSeq(a, ty, 0) {
+        return vi
+      }
+    }
+    vi = vi + 1
+  }
+  -1
+}
+
+// The record `ty` renders as: itself, or the first member of a union whose members are all
+// records spelled alike, which the render dedups to one; -1 for anything else.
+function jrOneRecordOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  if t is TyObj { return ty }
+  if !(t is TyUnion) { return -1 }
+  const ms = t.uMembers
+  if ms.length == 0 { return -1 }
+  const m0 = ms[0]
+  if m0 < 0 || !(T.tys[m0] is TyObj) { return -1 }
+  for m in ms {
+    if m < 0 || !(T.tys[m] is TyObj) { return -1 }
+    if !jrSpelledAlike(m, m0, 0) { return -1 }
+  }
+  m0
+}
+
+// Whether records `a` and `b` have the same fields in the same order, each spelled alike.
+function jrSameFieldSeq(a: i32, b: i32, depth: i32): boolean {
+  if a < 0 || a >= T.tys.length || b < 0 || b >= T.tys.length { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyObj {
+    if tb is TyObj {
+      const na = ta.objFieldNames
+      const nb = tb.objFieldNames
+      if na.length != nb.length { return false }
+      let k = 0
+      while k < na.length {
+        if na[k] != nb[k] { return false }
+        if (
+          !jrSpelledAlike(ta.objFieldTypes[k], tb.objFieldTypes[k], depth + 1)
+        ) {
+          return false
+        }
+        k = k + 1
+      }
+      return true
+    }
+  }
+  false
+}
+
+// Whether field types `a` and `b` render alike: one literal-union alias, one primitive (a
+// literal spells its base), or the same shape all the way down.
+function jrSpelledAlike(a: i32, b: i32, depth: i32): boolean {
+  if a == b { return true }
+  if depth > 8 || a < 0 || b < 0 { return false }
+  if litUnionAliasNameOfTy(a) != litUnionAliasNameOfTy(b) { return false }
+  const pa = tyEmitPrimOf(a)
+  const pb = tyEmitPrimOf(b)
+  if pa != null || pb != null { return pa == pb }
+  if tySame(a, b) { return true }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  // Exhaustive over `Ty` and `_`-less: only a shape, a list or a nullable spells its parts.
+  match ta {
+    TyObj => {
+      return jrSameFieldSeq(a, b, depth + 1)
+    }
+    TyArray => {
+      const eb = tyArrayElemIx(b)
+      return eb >= 0 && jrSpelledAlike(ta.aElem, eb, depth + 1)
+    }
+    TyNullable => {
+      if tb is TyNullable {
+        return jrSpelledAlike(ta.nInner, tb.nInner, depth + 1)
+      }
+    }
+    TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyMap => {
+      // Spelled alike only as the same type, which `tySame` above already answered.
+    }
+  }
+  false
+}
+
+// The union-variant index a lifted callback `fe` returns when it collapses to a single
+// variant (`(a) => if a is Cat { a } else { catShape }`), read from the checker's recorded
+// node-keyed return shape, or -1. Lets `.map`/`.filter` classify the result as the variant
+// ref list, rather than widening the narrowed receiver back to the box.
+export function cbRetVariantIdx(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const nm = inferRetNameByNode(fnStmts[fe])
+  // The nominal arm on the name, the structural arm on the arena: `variantIndexOfTypeName`
+  // runs both, but only the direct name match asks whether this IS a declared variant —
+  // identity the arena can't recover (B208). The arena arm is stricter, refusing a
+  // field-set collision `shapeFieldTypeCompatK` would let through (avoided by the `fRetKind` guard below).
+  let vi = variantIndexOf(nm)
+  if vi < 0 { vi = variantRowOfObjFieldSet(inferRetTyIxByNode(fnStmts[fe])) }
+  if vi < 0 { return -1 }
+  // A lambda whose inferred return the checker classified as a plain struct must not
+  // collapse to a variant merely because its anonymous shape coincides with an unrelated
+  // sibling field's union arm: its `$fnsig` result must key the struct token, not the
+  // variant one. A direct nominal variant name is always a genuine collapse and passes through.
+  if fe < fRetKind.length {
+    if variantIndexOf(nm) < 0 {
+      const k = fRetKind[fe]
+      if (k == "struct" || k == "nulstruct") && fRetStructIdx[fe] >= 0 {
+        return -1
+      }
+    }
+  }
+  vi
+}
+
+// ── the field-code classifier's arena rung ──
+// The one translation from `VKind` into the field-code vocabulary, so the fourteen constants
+// live here rather than at fourteen arms. `-2` is the vocabulary's decline — a kind it does
+// not name, never a code.
+function fieldCodeOfVKind(k: VKind): i32 {
+  // Exhaustive over `VKind` and `_`-less: `-2` is the vocabulary declining, a real answer the
+  // caller reads, so a new kind has to say whether it has a code rather than inherit one.
+  match k {
+    "i32" => {
+      return FC_I32
+    }
+    "str" => {
+      return FC_STR
+    }
+    "list" | "reflist" | "strlist" | "f64list" | "i64list" | "f32list" => {
+      // A non-null list's code is the list vocabulary's own; `u8list` and the nullable lists
+      // stay outside this one, below.
+      return fieldCodeOfListRep(k)
+    }
+    "closure" => {
+      return FC_CLOSURE
+    }
+    "union" => {
+      return FC_UNION
+    }
+    "f64" => {
+      return FC_F64
+    }
+    "nulclosure" => {
+      return FC_NUL_CLOSURE
+    }
+    "i64" => {
+      return FC_I64
+    }
+    "f32" => {
+      return FC_F32
+    }
+    "struct" | "map" | "variant" | "nulvariant" | "nulstruct" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {
+      // Outside this vocabulary: `-2` hands the question to the spelling ladder, which is
+      // what the caller's domain gate expects.
+      return -2
+    }
+  }
+}
+
+// The descriptor's field code for `ty`, or -2 where it declines or names a kind outside this
+// vocabulary. Asked only from inside a DOMAIN gate below, never as the opening rung: letting
+// it answer where the ladder declines widens the domain, which costs 8 modules (§6.4).
+function fieldCodeOfDesc(ty: i32): i32 {
+  const d = repOfTy(ty)
+  if d.rdCovered == 0 { return -2 }
+  fieldCodeOfVKind(d.rdKind)
+}
+
+// The field code for arena type `ty`, or `-2` meaning "the spelling ladder owns the rest".
+// Every arm below is a DOMAIN gate — which shapes this vocabulary speaks for — and the code
+// it hands back is the descriptor's, through the one translation above.
+export function fieldCodeOfTy(ty: i32): i32 {
+  if ty < 0 { return -2 }
+  // The registration split the two ladders beside this one make: a registered literal-union
+  // alias reps as the interned atom, an unregistered inline set as a string ref. Alias-ness
+  // is checker metadata rather than structure, so the descriptor declines all three.
+  if tyIsLitUnionAlias(ty) { return FC_I32 }
+  if tyIsLitUnion(ty) { return FC_STR }
+  if tyIsLitUnionArray(ty) { return FC_I32_LIST }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less. The two predicates outside it stay outside: the
+  // litunion trio above is checker metadata, and `isValueUnionTyOr` below is the box arm every
+  // falling-through kind still reaches, which is why `TyUnion` here is an empty arm.
+  match t {
+    TyPrim => {
+      // `void` is the one prim the descriptor reps (as the ladder fallthrough `i32`) and this
+      // vocabulary never has: a void field has no storage.
+      if t.primName == "void" { return -2 }
+      return fieldCodeOfDesc(ty)
+    }
+    TyNullable => {
+      // Order matters, mirroring the text ladder: a nullable closure is the nullable fat-pointer
+      // 22, tested before the bare arrow (closure rep 14).
+      const inner = T.tys[t.nInner]
+      if inner is TyFunc { return fieldCodeOfDesc(ty) }
+    }
+    TyFunc => {
+      return fieldCodeOfDesc(ty)
+    }
+    TyArray => {
+      // The array arm mirrors `fieldCodeOfSpelling`'s `scalarListRepOfName` ladder, deliberately
+      // narrower: an unrecognised element stays uncoded (-2) and falls through to the render,
+      // rather than a blanket 5. No `TyObj` arm for the array ITSELF: the spelling ladder's
+      // declaration scan lets a forward reference tie into the shared rec group.
+      const e = t.aElem
+      if e >= 0 {
+        const et = T.tys[e]
+        // Exhaustive over `Ty` and `_`-less: code 5 names struct/union/closure elements only. A
+        // nested list and a map-element list are ref lists too; a NULLABLE element stays out,
+        // since coding it 5 would mis-code the wrapper and trap on an out-of-bounds index (B171).
+        match et {
+          TyPrim => {
+            return fieldCodeOfDesc(ty)
+          }
+          TyObj => {
+            return FC_REF_LIST
+          }
+          TyUnion => {
+            return FC_REF_LIST
+          }
+          TyFunc => {
+            return FC_REF_LIST
+          }
+          TyArray => {
+            return FC_REF_LIST
+          }
+          TyMap => {
+            return FC_REF_LIST
+          }
+          TyErr | TyNullable | TyVar | TyLit | TyNeg => {
+            // Not an element the code vocabulary names; falls to the render.
+          }
+        }
+      }
+    }
+    TyUnion => {
+      // A union carrying a closure member is a value union (the box), not a closure field, so
+      // this arm falls through to `isValueUnionTyOr` below, as it should.
+    }
+    TyErr | TyObj | TyMap | TyVar | TyLit | TyNeg => {
+      // No arena field code of its own; the box arm and the render answer.
+    }
+  }
+  // A value union is the box, code 16 — the arm the name ladder states as
+  // `isValueUnionName(t)`. Placed last so every arm the arena already claims still wins.
+  // `isValueUnionTyOr` declines rather than guess, so a literal union (`TyLit` members,
+  // answering 0) can never be claimed as a box.
+  if isValueUnionTyOr(ty) == 1 { return FC_UNION }
+  -2
+}
+
+// The registry slot of generic-alias base `name`, or -1.
+export function gaeIndexOf(name: string) { strListIndexOf(gaeBases, name) }

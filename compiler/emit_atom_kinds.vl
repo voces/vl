@@ -1,0 +1,1202 @@
+// `emit_atom_kinds.vl` — which value-atom kind a type, list element or declared row
+// field lowers as, and whether a declared row's scalar fields fit an instance.
+
+import {
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  IsExpr,
+  Member,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  StrLit,
+  Unary,
+} from "./ast"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { isVarTyIxOf } from "./check_list_union"
+import { nodeTyIxOf } from "./check_node_tys"
+import {
+  nameIsLitUnionType,
+  nomErasedTyIx,
+  valueAtomKind,
+  valueRowKind,
+} from "./check_ty_rep"
+import {
+  PrimName,
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  litBaseTy,
+  litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
+  litUnionInlineNameOfTy,
+  numLitUnionBaseTy,
+  tyEq,
+  tyFieldTyOf,
+  tyIsLitUnion,
+  tyIsLitUnionAlias,
+  tyIsLitUnionArray,
+  tyIsLitUnionOrLit,
+  tyLitMemberTexts,
+  tyPrimNameOf,
+  tyToEmitName,
+} from "./check_types"
+import {
+  nameIsLitUnionArray,
+  objFieldVal,
+  placeNarrowKeyOf,
+  unionEqOperandOk,
+  unwrapParen,
+} from "./emit_base"
+import {
+  narrowSlotOf,
+  narrowVariantFor,
+  variantIndexOf,
+} from "./emit_narrow_slots"
+import { declTyIxOfName, repCanonId, repNameCanonId } from "./emit_rep"
+import {
+  FC_F32_LIST,
+  FC_F64_LIST,
+  FC_I32,
+  FC_I32_LIST,
+  FC_I64_LIST,
+  FC_STR_LIST,
+  FC_U8_LIST,
+  anonLeafJoined,
+  anonLeafSupersede,
+  emitPhaseReached,
+  fnStmts,
+  narrowTop,
+  sAnonOwnTy,
+  sFieldCount,
+  sFieldElemName,
+  sFieldElemTyIx,
+  sFieldNames,
+  sFieldStart,
+  sFieldTypes,
+  sNames,
+  sTyIx,
+  uFieldElemName,
+  uFieldElemTyIx,
+  uFieldStart,
+  uFieldTypes,
+} from "./emit_state"
+import { memoKeyNew } from "./memo"
+import { strContains } from "./strutil"
+import { recFitNarrowedFields } from "./typecheck"
+import {
+  isNullTy,
+  nonNullTy,
+  tyEmitElemNulPrimOf,
+  tyEmitElemPrimOf,
+  tyEmitNamesOf,
+  tyEmitPrimOf,
+  tyHasTyVar,
+  tyStepElem,
+} from "./tyquery"
+
+// D833 — the row a `??` merge put in `si`'s place, or `si` unchanged. `collectAnonShapes`
+// records one only where a merged row exists for a family a narrower same-fieldset row
+// already claimed, so outside that shape every row supersedes to itself and this is one
+// bounds-checked array read. See `anonLeafSupersede`.
+export function anonLeafSupersedeOf(si: i32): i32 {
+  if si < 0 { return si }
+  if si >= anonLeafSupersede.length { return si }
+  if anonLeafSupersede[si] < 0 { return si }
+  anonLeafSupersede[si]
+}
+
+// The wasm-type code (`0` i32, `3` string, `4` i32-list, `5` ref-list) of struct `si`'s
+// field at field index `fi`.
+export function sFieldTypeAt(si: i32, fi: i32) {
+  sFieldTypes[sFieldStart[si] + fi]
+}
+
+// The ref-list element type-name of struct `si`'s field `fi` (a code-5 field), "" otherwise.
+export function sFieldElemNameAt(si: i32, fi: i32) {
+  sFieldElemName[sFieldStart[si] + fi]
+}
+
+// The arena type of struct `si`'s field `fi`'s element or target — the `sFieldElemTyIx`
+// sidecar's accessor and `sFieldElemNameAt`'s structural twin. -1 when the sidecar does not
+// cover the row, which every consumer treats as "keep the name path".
+export function sFieldElemTyIxAt(si: i32, fi: i32): i32 {
+  const ix = sFieldStart[si] + fi
+  if ix >= sFieldElemTyIx.length { return -1 }
+  sFieldElemTyIx[ix]
+}
+
+// The `sFieldElemTyIxAt` twin for variant fields (`uFieldElemTyIx`).
+export function uFieldElemTyIxAt(vi: i32, fi: i32): i32 {
+  const ix = uFieldStart[vi] + fi
+  if ix >= uFieldElemTyIx.length { return -1 }
+  uFieldElemTyIx[ix]
+}
+
+// ── the struct-row arena index ───────────────────────────────────────────────
+// Push-only column (`recordSTyIx` pads with -1 and pushes), first match wins,
+// reset explicitly per program since a watermark can't see `collectS`'s reset.
+// Keyed by arena index — a dense space, so a plain array beats a map; -1 entries skipped.
+let sTyRow: i32[] = []
+let sTyRowLen = 0
+
+export function structTyIxReset() {
+  sTyRow = []
+  sTyRowLen = 0
+  0
+}
+
+function sTyRowSync() {
+  if sTyRowLen > sTyIx.length { structTyIxReset() }
+  while sTyRowLen < sTyIx.length {
+    const ty = sTyIx[sTyRowLen]
+    if ty >= 0 {
+      while sTyRow.length <= ty { sTyRow.push(-1) }
+      if sTyRow[ty] < 0 { sTyRow[ty] = sTyRowLen }
+    }
+    sTyRowLen = sTyRowLen + 1
+  }
+  0
+}
+
+// The struct-table row for an arena type — `structIndexByName`'s arena-input twin,
+// scanning `sTyIx` (the arena type each row denotes) instead of the name column, same
+// first-match-wins order. -1 when the sidecar doesn't cover the row, so it never matches
+// a real type and the caller falls through to its name path.
+export function structIndexOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  sTyRowSync()
+  if ty < sTyRow.length && sTyRow[ty] >= 0 { return sTyRow[ty] }
+  // A `new` brand is a second arena index over its base and erases to it at run time, so it
+  // denotes the base's row; no row records the brand's own index (D3762).
+  const b = nomErasedTyIx(ty)
+  if b == ty || b < 0 || b >= sTyRow.length { return -1 }
+  sTyRow[b]
+}
+
+// The struct-table row a nested-struct field (code 15) targets — the chokepoint every
+// code-15 consumer shares (default / literal seed / struct-eq / type section / closure
+// scan / optional-chain). Arena first (`sFieldElemTyIx` to `structIndexOfTy`), then the
+// recorded name (`structIndexByName`) for a row the sidecar doesn't cover.
+export function sFieldTgtStructIdx(si: i32, fi: i32): i32 {
+  const a = structIndexOfTy(sFieldElemTyIxAt(si, fi))
+  if a >= 0 { return a }
+  structIndexByName(sFieldElemNameAt(si, fi))
+}
+
+// True if struct `si`'s field `fi` is a literal-union atom field (code 0 whose recorded
+// elem name is a literal union) — construction/read/assign seed the atom rep for it.
+export function sFieldIsLitUnion(si: i32, fi: i32) {
+  if sFieldTypeAt(si, fi) != FC_I32 { return false }
+  // Arena leg: the sidecar records the arena type the field's element name denotes, so
+  // this answers structurally instead of re-classifying the rendered spelling. Tests
+  // `tyIsLitUnionOrLit`, not `tyIsLitUnion` — a one-member set is atom material at both
+  // of its spellings (D1460), reachable here only through `promoteLitFieldToAtom`.
+  const ety = sFieldElemTyIxAt(si, fi)
+  if ety >= 0 { return tyIsLitUnionOrLit(ety) }
+  const r = nameIsLitUnionType(sFieldElemNameAt(si, fi))
+  r
+}
+
+// True if struct `si`'s field `fi` is an atom-array field (`f: K[]` — code 4 whose recorded
+// elem name is a litunion array). The field IS the i32 list; construction/assign seed the
+// atom-element context so member literals build the i32 backing (not a string list whose
+// wrapper ref would mismatch the field type).
+export function sFieldIsLitUnionArray(si: i32, fi: i32) {
+  if sFieldTypeAt(si, fi) != FC_I32_LIST { return false }
+  // Arena leg (`sFieldIsLitUnion`'s array sibling): a code-4 field records its array
+  // type name, so `tyIsLitUnionArray` reads the `TyArray` structurally.
+  const ety = sFieldElemTyIxAt(si, fi)
+  if ety >= 0 { return tyIsLitUnionArray(ety) }
+  const r = nameIsLitUnionArray(sFieldElemNameAt(si, fi))
+  r
+}
+
+// The union-variant twin of `sFieldIsLitUnionArray`: variant `vi`'s field `fj` is an
+// atom-array field (`f: K[]`, code 4 with a recorded litunion-array element name) — the
+// variant payload build seeds the atom context so the literal builds the i32 list of
+// atom ids, not a string list.
+export function variantFieldIsLitUnionArray(vi: i32, fj: i32) {
+  if variantFieldTypeAt(vi, fj) != FC_I32_LIST { return false }
+  // Arena leg, off the `uFieldElemTyIx` sidecar (the struct twin above).
+  const ety = uFieldElemTyIxAt(vi, fj)
+  if ety >= 0 { return tyIsLitUnionArray(ety) }
+  nameIsLitUnionArray(variantFieldElemName(vi, fj))
+}
+
+// The union-variant twin of `sFieldIsLitUnion`: variant `vi`'s field `fj` is a
+// literal-union atom field (code 0 with a recorded litunion element name), so the
+// variant payload build and the atom-read classifier seed the atom rep for it — the
+// chokepoint for `emitVariantStruct`'s construct arm and `exprIsLitAtom`'s member read.
+export function variantFieldIsLitUnion(vi: i32, fj: i32) {
+  if variantFieldTypeAt(vi, fj) != FC_I32 { return false }
+  // `tyIsLitUnionOrLit`, for `sFieldIsLitUnion`'s reason (D1460).
+  const ety = uFieldElemTyIxAt(vi, fj)
+  if ety >= 0 { return tyIsLitUnionOrLit(ety) }
+  nameIsLitUnionType(variantFieldElemName(vi, fj))
+}
+
+// ── the struct-row name index ────────────────────────────────────────────────
+// Incremental, not rebuilt on demand: `sNames` is push-only within a program, so the
+// index scans only rows past its watermark, first match wins. Reset is explicit
+// (`structNameIxReset`) — a watermark alone can't see `collectS` resetting `sNames`.
+let sNameIx: {[string]: i32} = Map()
+let sNameIxLen = 0
+
+export function structNameIxReset() {
+  sNameIx = Map()
+  sNameIxLen = 0
+  0
+}
+
+function sNameIxSync() {
+  // Defensive, and free: a table that shrank without the explicit reset would otherwise
+  // answer from a longer past; costs one compare per query.
+  if sNameIxLen > sNames.length { structNameIxReset() }
+  while sNameIxLen < sNames.length {
+    const nm = sNames[sNameIxLen]
+    if (sNameIx[nm] ?? -1) < 0 { sNameIx[nm] = sNameIxLen }
+    sNameIxLen = sNameIxLen + 1
+  }
+  0
+}
+
+// ── the struct-row field-name index (D3738) ─────────────────────────────────
+// Per field name, the rows carrying it and the rows it comes first in, ascending, and the rows
+// with no field at all. A row joins once its names are stored, so a reader takes every row
+// past `sfnLen` as a candidate itself.
+let sfnRows: {[string]: i32[]} = Map()
+let sfnFirst: {[string]: i32[]} = Map()
+let sfnEmpty: i32[] = []
+let sfnLen = 0
+
+export function structFieldNameIxReset() {
+  sfnRows = Map()
+  sfnFirst = Map()
+  sfnEmpty = []
+  sfnLen = 0
+  0
+}
+
+function sfnSync() {
+  if sfnLen > sNames.length { structFieldNameIxReset() }
+  const n = sScanLim()
+  while sfnLen < n {
+    const st = sFieldStart[sfnLen]
+    const cnt = sFieldCount[sfnLen]
+    if st + cnt > sFieldNames.length { return 0 }
+    if cnt == 0 {
+      sfnEmpty.push(sfnLen)
+    } else {
+      const fb = sfnFirst[sFieldNames[st]] ?? []
+      if fb.length == 0 { sfnFirst[sFieldNames[st]] = fb }
+      fb.push(sfnLen)
+    }
+    let j = 0
+    while j < cnt {
+      const nm = sFieldNames[st + j]
+      const b = sfnRows[nm] ?? []
+      if b.length == 0 { sfnRows[nm] = b }
+      if b.length == 0 || b[b.length - 1] != sfnLen { b.push(sfnLen) }
+      j = j + 1
+    }
+    sfnLen = sfnLen + 1
+  }
+  0
+}
+
+// The rows below `lim`, ascending, that can carry every field of the object literal `o`: those
+// holding its first field's name (or no field, for `{}`), then each row the index has not reached.
+// A literal whose first field is not a `name: value` pair matches no row's names.
+export function objLitNameCands(o: ObjLit, lim: i32): i32[] {
+  sfnSync()
+  const out: i32[] = []
+  let b = sfnEmpty
+  if o.objFields.length > 0 {
+    const f = P.nodes[o.objFields[0]]
+    if f is FieldInit { b = sfnRows[f.fiName] ?? [] } else { return out }
+  }
+  sfnCands(b, lim, out)
+}
+
+// The rows below `lim`, ascending, that can be a proper prefix of row `c`: those whose first
+// field is `c`'s first, then each row the index has not reached. A row with no field has none.
+export function structPrefixCands(c: i32, lim: i32): i32[] {
+  sfnSync()
+  const out: i32[] = []
+  if c < 0 || c >= sFieldCount.length || c >= sFieldStart.length { return out }
+  if sFieldCount[c] == 0 || sFieldStart[c] >= sFieldNames.length { return out }
+  sfnCands(sfnFirst[sFieldNames[sFieldStart[c]]] ?? [], lim, out)
+}
+
+// Append to `out` the rows of bucket `b` below `lim`, then every row from `sfnLen` to `lim`.
+function sfnCands(b: i32[], lim: i32, out: i32[]): i32[] {
+  let i = 0
+  while i < b.length && b[i] < lim {
+    out.push(b[i])
+    i = i + 1
+  }
+  let si = sfnLen
+  while si < lim {
+    out.push(si)
+    si = si + 1
+  }
+  out
+}
+
+// The struct table index whose name is `name`, or -1 if `name` is not a declared struct type.
+export function structIndexByName(name: string) {
+  sNameIxSync()
+  sNameIx[name] ?? -1
+}
+
+// The number of fully-collected struct entries — the scan bound for any matcher reading
+// a struct's field metadata. During `collectS`'s field-coding loop the in-flight
+// declaration has `sNames` pushed but `sFieldCount` not yet, and `fieldTypeCode` can
+// re-enter these matchers, so a raw `sNames.length` bound would read `sFieldCount` out of bounds.
+export function sScanLim() {
+  let n = sNames.length
+  if sFieldCount.length < n { n = sFieldCount.length }
+  if sFieldStart.length < n { n = sFieldStart.length }
+  n
+}
+
+// Whether declared row `si`'s field `mfi` stores field `name` of the object literal at `objIx`
+// with the scalar type the checker gave it. Two rows of one field name can share a code (`i32`
+// and `boolean`) or differ by one the value's code cannot see (an `i32` beside an `f32`), and a
+// read formats and types by the row. Refutation only: an unknown kind on either side agrees.
+export function declRowFieldKindFits(
+  objIx: i32,
+  name: string,
+  si: i32,
+  mfi: i32,
+): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const rt = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  const lt = tyFieldTyOf(nodeRepTyIxOf(objIx), name)
+  if !fnFieldTyFits(objFieldOwnTyOf(objIx, name, lt), rt) { return false }
+  const rk = fieldScalarKindOf(rt)
+  if rk == 0 { return true }
+  const lk = fieldScalarKindOf(lt)
+  if lk == 0 { return true }
+  fieldKindWidens(lk, rk)
+}
+
+// `fnFieldTyFits` against field `name` of row `si` where that row is declared; true for an
+// anonymous row, whose closure fields `anonValueFitsField` checks by signature instead.
+export function declRowFnFieldFits(lt: i32, si: i32, name: string): boolean {
+  if sIsAnonRow(si) { return true }
+  rowFnFieldFits(lt, si, name)
+}
+
+// `fnFieldTyFits` against field `name` of row `si`'s recorded type, declared or anonymous.
+export function rowFnFieldFits(lt: i32, si: i32, name: string): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  fnFieldTyFits(lt, tyFieldTyOf(sTyIx[si], name))
+}
+
+// `declRowFnFieldFits` for a field spelled `text`, resolved only where it spells an arrow and
+// row `si` declares that field a function.
+export function declRowFnSpellingFits(
+  text: string,
+  si: i32,
+  name: string,
+): boolean {
+  if si < 0 || si >= sTyIx.length || sIsAnonRow(si) { return true }
+  if !strContains(text, "=>") { return true }
+  const rt = tyFieldTyOf(sTyIx[si], name)
+  const rf = nonNullTy(rt)
+  if rf < 0 || rf >= T.tys.length || !(T.tys[rf] is TyFunc) { return true }
+  fnFieldTyFits(declTyIxOfName(text), rt)
+}
+
+// Field `name`'s type `lt` in the object literal at `objIx`, or, where that names a hole (a
+// literal handed to an un-annotated parameter), the field value's own checked type.
+function objFieldOwnTyOf(objIx: i32, name: string, lt: i32): i32 {
+  if lt >= 0 && !tyHasTyVar(lt) { return lt }
+  const fv = objFieldVal(objIx, name)
+  if fv < 0 { return lt }
+  nodeTyIxOf(unwrapParen(fv))
+}
+
+// Whether a field of function type `lt` may be stored at a declared field of type `rt`: a call
+// through the row reads its closure at the row's signature, so the two must be one signature
+// (`| null` on the row aside). Refutation only: a non-function or a type parameter agrees (D3181).
+function fnFieldTyFits(lt: i32, rt: i32): boolean {
+  if lt < 0 || rt < 0 || lt >= T.tys.length || rt >= T.tys.length {
+    return true
+  }
+  if !(T.tys[lt] is TyFunc) { return true }
+  const rf = nonNullTy(rt)
+  if rf < 0 || !(T.tys[rf] is TyFunc) { return true }
+  if tyHasTyVar(lt) || tyHasTyVar(rf) { return true }
+  tyEq(lt, rf)
+}
+
+// Whether `ty` is a record, list, map or function: a reference that no scalar slot holds.
+export function tyIsRefShaped(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  t is TyObj || t is TyArray || t is TyMap || t is TyFunc
+}
+
+// Whether a field of kind `lk` (`fieldScalarKindOf`) may be stored at one of kind `rk`: the same
+// kind, a numeric widening the checker lets a record take, or either into a `| null`. An `i32`
+// field is not an `f32` one, since the checker refuses that record assignment.
+export function fieldKindWidens(lk: i32, rk: i32): boolean {
+  if lk == rk { return true }
+  if rk > 8 {
+    if lk > 8 { return fieldKindWidens(lk - 8, rk - 8) }
+    return fieldKindWidens(lk, rk - 8)
+  }
+  if lk > 8 { return false }
+  if lk == 1 { return rk == 3 || rk == 5 }
+  if lk == 3 || lk == 4 { return rk == 5 }
+  false
+}
+
+// The layout kind of a union field type: 7 when every member is a string literal (`"a" | "b"`,
+// stored as a member id, not a string), else 0. A `| null` over it is the `TyNullable` around it.
+function litSetScalarKindOf(members: i32[]): i32 {
+  let i = 0
+  while i < members.length {
+    const m = members[i]
+    if m < 0 || m >= T.tys.length { return 0 }
+    const mt = T.tys[m]
+    if !(mt is TyLit) { return 0 }
+    if mt.litKind != "str" { return 0 }
+    i = i + 1
+  }
+  if members.length == 0 { return 0 }
+  7
+}
+
+// The layout kind of a record field of type `ty`: 1 `i32`, 2 `boolean`, 3 `i64`, 4 `f32`,
+// 5 `f64`, 6 `string`, 7 a string literal set, each plus 8 as `| null`; a literal type reads as
+// its base. 0 for any other type, which `declRowFieldKindFits` does not refute on.
+export function fieldScalarKindOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less.
+  match t {
+    TyNullable => {
+      const k = fieldScalarKindOf(t.nInner)
+      if k == 0 || k > 8 { return 0 }
+      return k + 8
+    }
+    TyLit => {
+      return fieldScalarKindOf(litBaseTy(t))
+    }
+    TyUnion => {
+      return litSetScalarKindOf(t.uMembers)
+    }
+    TyPrim => {
+      return primScalarKindOf(t.primName)
+    }
+    TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyNeg => {
+      return 0
+    }
+  }
+}
+
+// `fieldScalarKindOf` of a primitive; 0 for one no record field stores as a scalar.
+function primScalarKindOf(p: PrimName): i32 {
+  // Exhaustive over `PrimName` and `_`-less.
+  match p {
+    "i32" => {
+      return 1
+    }
+    "boolean" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f32" => {
+      return 4
+    }
+    "f64" => {
+      return 5
+    }
+    "string" => {
+      return 6
+    }
+    "v128" | "void" | "null" | "never" | "u8" => {
+      return 0
+    }
+  }
+}
+
+// Is field code `c` a list whose layout its code alone decides: an `i32`, `f64`, `i64`, `f32`,
+// `u8` or `string` list?
+export function fieldCodeIsFlatList(c: i32): boolean {
+  c == FC_I32_LIST
+    || c == FC_STR_LIST
+    || c == FC_F64_LIST
+    || c == FC_I64_LIST
+    || c == FC_F32_LIST
+    || c == FC_U8_LIST
+}
+
+// Code 0 is shared by `i32`, `boolean` and a string literal union's atom, so the code cannot
+// tell them apart: ask the declared row's own field type. Refutes a primitive value against a
+// different primitive or against a string literal set (D2435).
+export function declRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  // The anon row's comparator first, so the two readers cannot disagree on a known kind.
+  const fk = code0KindOf(fty)
+  const vk = code0KindOf(nodeTyIxOf(valIx))
+  if fk != 0 && vk != 0 { return fk == vk }
+  const vp = tyPrimNameOf(nodeTyIxOf(valIx))
+  if vp == null || fty < 0 { return true }
+  const fp = tyPrimNameOf(fty)
+  if fp != null { return fp == vp }
+  if tyIsLitUnion(fty) || tyIsLitUnionAlias(fty) {
+    return numLitUnionBaseTy(fty) >= 0
+  }
+  true
+}
+
+// `declRowScalarFits`' anonymous-row twin, symmetric because both sides come from literals:
+// a `boolean`, an `i32` and a string literal set are three code-0 kinds, and two known kinds
+// fit only when equal. A kind this cannot name (a hole, a numeric literal set) stays lenient.
+export function anonRowScalarFits(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fnm = sFieldNames[sFieldStart[si] + mfi]
+  let fk = code0KindOf(tyFieldTyOf(sTyIx[si], fnm))
+  if fk == 0 { fk = code0KindOf(tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, fnm)) }
+  const vk = code0KindOf(nodeTyIxOf(valIx))
+  // A row recorded at a hole has no field type to ask; its atom companion still says whether
+  // the slot holds a literal set (D2762).
+  if fk == 0 && vk != 0 {
+    return (vk == 3) == (sFieldElemNameAt(si, mfi) != "")
+  }
+  if fk == 0 || vk == 0 { return true }
+  fk == vk
+}
+
+// Whether a parameter of instance `fnIx` read as a field value may be stored in row `si`'s
+// field `mfi`: an `i32` or `boolean` pin takes no literal-set slot, whose reads print a member.
+// The shared literal records the template's hole, so the instance's parameter type says it (D2762).
+export function instParamAtomFits(
+  valIx: i32,
+  si: i32,
+  mfi: i32,
+  fnIx: i32,
+): boolean {
+  if fnIx < 0 { return true }
+  const v = P.nodes[unwrapParen(valIx)]
+  if !(v is Ident) { return true }
+  if narrowSlotOf(v.identName) >= 0 { return true }
+  const fd = P.nodes[fnIx]
+  if !(fd is FuncDecl) { return true }
+  let vk = 0
+  let i = 0
+  while i < fd.fnParams.length {
+    const p = P.nodes[fd.fnParams[i]]
+    if p is Param {
+      if p.parName == v.identName {
+        if p.parType < 0 {
+          vk = 1
+        } else {
+          vk = code0KindOf(nodeTyIxOf(p.parType))
+        }
+      }
+    }
+    i = i + 1
+  }
+  if vk != 1 && vk != 2 { return true }
+  sFieldElemNameAt(si, mfi) == ""
+}
+
+// The code-0 kind of type `ty`: 1 `i32`, 2 `boolean`, 3 a string literal or literal set, 0
+// for anything else, which no caller refutes on.
+export function code0KindOf(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  const p = tyPrimNameOf(ty)
+  if p != null {
+    // Exhaustive over `PrimName` and `_`-less: only two prims are code-0 kinds.
+    match p {
+      "i32" => {
+        return 1
+      }
+      "boolean" => {
+        return 2
+      }
+      "string" | "i64" | "f64" | "f32" | "v128" | "void" | "null" | "never" | "u8" => {
+        return 0
+      }
+    }
+  }
+  if tyIsLitUnionOrLit(ty) { return 3 }
+  0
+}
+
+// Whether the string value at `valIx` is a string literal naming a member of row `si`'s atom
+// field `mfi`; an unknown field type stays lenient, and a non-literal field takes no string.
+export function atomFieldTakesStr(valIx: i32, si: i32, mfi: i32): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  if mfi < 0 || mfi >= sFieldCount[si] { return true }
+  const fty = tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + mfi])
+  if fty < 0 { return true }
+  if code0KindOf(fty) != 3 { return false }
+  strLitNamesMember(valIx, tyLitMemberTexts(fty))
+}
+
+// Whether the value at `valIx` is a string literal whose text is one of `texts`. `strText`
+// keeps the quotes a member text drops.
+function strLitNamesMember(valIx: i32, texts: string[]): boolean {
+  const v = P.nodes[unwrapParen(valIx)]
+  if v is StrLit {
+    const raw = v.strText
+    if raw.length < 2 { return false }
+    const body = raw.slice(1, raw.length - 1)
+    let i = 0
+    while i < texts.length {
+      if texts[i] == body { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether a nested-record field of type `fty` may share row `si`'s field `fi`: the field's
+// target row and `fty` must agree canonically where both are known (D2841).
+export function nestedAnonRowFits(fty: i32, si: i32, fi: i32): boolean {
+  if tyHasTyVar(fty) { return true }
+  // The row's recorded element type answers the common agreeing case without resolving a name.
+  const ety = sFieldElemTyIxAt(si, fi)
+  if ety >= 0 && repCanonId(ety) == repCanonId(fty) { return true }
+  const rowElem = sFieldElemNameAt(si, fi)
+  if rowElem == "" { return true }
+  let cr = repNameCanonId(rowElem)
+  if cr < 0 { cr = rowCanonIdOfName(rowElem) }
+  if cr < 0 { return true }
+  repCanonId(fty) == cr
+}
+
+// Whether a code-0 field of type `fty` may share row `si`'s field `fi`: false only when both
+// code-0 kinds are known and differ (D2841).
+export function code0TyFitsRow(fty: i32, si: i32, fi: i32): boolean {
+  const tk = code0KindOf(fty)
+  if tk == 0 || si < 0 || si >= sTyIx.length { return true }
+  const rk = code0KindOf(
+    tyFieldTyOf(sTyIx[si], sFieldNames[sFieldStart[si] + fi]),
+  )
+  rk == 0 || rk == tk
+}
+
+// Does an array literal coded `vc` re-encode into a `sc` list by widening each element: an
+// integer literal into an `f64`, `i64`, `f32` or `u8` list, a float one into an `f32` list?
+export function flatListLitWidens(vc: i32, sc: i32): boolean {
+  if vc == FC_I32_LIST {
+    return sc == FC_F64_LIST
+      || sc == FC_I64_LIST
+      || sc == FC_F32_LIST
+      || sc == FC_U8_LIST
+  }
+  vc == FC_F64_LIST && sc == FC_F32_LIST
+}
+
+// An open-addressed pair table, generation-stamped so a new walk costs no clearing: a slot is
+// live only while its stamp equals the walk id, and the capacity is sized once per emit pass.
+// The arrays are the caller's, so two users cannot share a slot (D1705).
+export function pxSized(
+  cap: i32,
+  keyA: i32[],
+  keyB: i32[],
+  stamp: i32[],
+  val: i32[],
+) {
+  while keyA.length < cap {
+    keyA.push(-1)
+    keyB.push(-1)
+    stamp.push(-1)
+    val.push(-1)
+  }
+  0
+}
+
+// The capacity for a table over `want` keys: a power of two at least four times it, so the
+// probe stays short, floored at 1024 and capped so one table cannot outgrow the heap.
+export function pxCapFor(want: i32): i32 {
+  let cap = 1024
+  while cap < want * 4 {
+    if cap >= 262144 { return 262144 }
+    cap = cap * 2
+  }
+  cap
+}
+
+// The slot `(a, b)` occupies on walk `walk`, or the free slot it would take; -1 when the probe
+// finds neither, which is the caller's named default. Reading a free slot back is how a caller
+// answers "not seen", so both callers read the slot rather than a boolean.
+export function pxSlotOf(
+  keyA: i32[],
+  keyB: i32[],
+  stamp: i32[],
+  cap: i32,
+  walk: i32,
+  a: i32,
+  b: i32,
+): i32 {
+  if cap < 16 { return -1 }
+  if keyA.length < cap { return -1 }
+  let h = (a + 3) * 1000003 + b
+  h = h % cap
+  if h < 0 { h = h + cap }
+  let steps = 0
+  while steps < cap {
+    if stamp[h] != walk { return h }
+    if keyA[h] == a {
+      if keyB[h] == b { return h }
+    }
+    h = h + 1
+    if h == cap { h = 0 }
+    steps = steps + 1
+  }
+  -1
+}
+
+export const ercGenKey = memoKeyNew(1)
+// True if struct-table row `si` is an anonymous shape — one `collectAnonShapes` minted
+// from an object literal under a synthetic `#anonN` name, rather than a declared `type`
+// or inline-shape annotation. An anon row's codes read directly off the literal (exact); a
+// declared row's come from an annotation the checker can reach with values the code omits.
+export function sIsAnonRow(si: i32) {
+  if si < 0 || si >= sNames.length { return false }
+  const nm = sNames[si]
+  nm.length >= 5 && nm.slice(0, 5) == "#anon"
+}
+
+// A memo over `structIndexOfObjCtxGo`, keyed by node index and the querying `fnIx` (the
+// f64 axis is per-instance). A hit is stable since rows only append, so an existing
+// first match stays first; a miss is stamped with the row count and only recomputed
+// once the table grows. Reset per program in `collectS` (`sioMemoReset`).
+export let sioMemoIx: i32[] = []
+export let sioMemoFn: i32[] = []
+export let sioMemoVer: i32[] = []
+export function sioMemoReset() {
+  sioMemoIx = []
+  sioMemoFn = []
+  sioMemoVer = []
+}
+
+// The row a `??`-joined literal builds at, once the merge is decided: redirects every
+// reader of a literal's row to the merged destination, keyed on the literal being a join
+// mark (not a row), so an unrelated same-fieldset literal is untouched. Applied outside
+// the memo, whose cached value is the pre-merge answer (D882).
+export function anonLeafJoinRowOf(objIx: i32, si: i32): i32 {
+  if !emitPhaseReached("minted") { return si }
+  if si < 0 { return si }
+  if objIx < 0 { return si }
+  if objIx >= anonLeafJoined.length { return si }
+  if anonLeafJoined[objIx] != 1 { return si }
+  anonLeafSupersedeOf(si)
+}
+
+// True if lifted function `fe` has any un-annotated parameter — a generic whose param is
+// a per-call-site inference hole. Such a function monomorphizes per direct call but
+// i32-defaults when taken as a value, so the value site rejects it.
+export function fnHasUnannotatedParam(fe: i32) {
+  if fe < 0 || fe >= fnStmts.length { return false }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType < 0 { return true }
+      }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// True if `exprIx` is a re-readable place — a bare name, or a `.`/`?.` chain bottoming out
+// in a name. Such a receiver is an effect-free `local.get`/`struct.get` sequence, so a `?.`
+// lowering may emit it twice; anything else is staged once (`optChainStagesRecv`).
+export function optRecvReReadable(exprIx: i32) {
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident { return true }
+  if e is Member { return optRecvReReadable(e.memObj) }
+  if e is OptMember { return optRecvReReadable(e.omObj) }
+  // The default is named, not fallen through: see `optRecvNotAPlace`.
+  optRecvNotAPlace()
+}
+
+// Every `Node` kind `optRecvReReadable`'s ladder does not test, as one answer: not a place.
+// A call, an index, an operator and a literal are all VALUES, so a second emission of one
+// recomputes it — cheaply for a literal, observably for a call. Fails closed on purpose: an
+// unclassified kind is staged rather than re-emitted.
+function optRecvNotAPlace(): boolean { false }
+
+// The bottom of the `?.` chain at `exprIx` — the receiver that is not itself a `?.`, and the
+// only arbitrary expression in the chain (every link above it is a `struct.get`). -1 when
+// `exprIx` is no chain at all.
+export function optChainBaseOf(exprIx: i32) {
+  const inner = unwrapParen(exprIx)
+  if inner < 0 { return -1 }
+  const e = P.nodes[inner]
+  if e is OptMember {
+    const b = optChainBaseOf(e.omObj)
+    if b >= 0 { return b }
+    return unwrapParen(e.omObj)
+  }
+  -1
+}
+
+// Is the node at `ix` a record-fit `is` (a literal-set field test) whose receiver is not a
+// re-readable place, so its lowering stages the receiver once in `optRecvSlot`?
+export function recordFitIsStagesRecv(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if !(n is IsExpr) { return false }
+  if n.isVariant == "null" || unionEqOperandOk(n.isObj) { return false }
+  const names: string[] = []
+  const sets: i32[] = []
+  recFitNarrowedFields(nodeTyIxOf(n.isObj), isVarTyIxOf(ix), names, sets) > 0
+}
+
+// Is the node at `ix` a `?.` whose chain base must be STAGED — evaluated once into
+// `optRecvSlot` — because it is not a re-readable place? One home for the question, so the
+// slot reserved and the code emitted cannot disagree (D1671).
+export function optChainStagesRecv(ix: i32): boolean {
+  const b = optChainBaseOf(ix)
+  if b < 0 { return false }
+  !optRecvReReadable(b)
+}
+
+// A `.get` INDEX the lowering may emit twice: a literal, a name, or a NEGATIVE literal, whose
+// unsigned bounds compare maps it past `len` and so takes the absent arm. Anything else is
+// evaluated once into the index stash (D1677).
+export function listGetIdxReReadable(idxIx: i32): boolean {
+  const n = P.nodes[unwrapParen(idxIx)]
+  if n is NumLit { return true }
+  if n is Ident { return true }
+  if n is Unary {
+    if n.unOp == "-" {
+      const inner = P.nodes[unwrapParen(n.unArg)]
+      if inner is NumLit { return true }
+    }
+  }
+  false
+}
+
+// Is the node at `ix` a `.get(i)` whose index or receiver must be STAGED, because it is not a
+// re-readable place? One home for the question, so the slots reserved and the code emitted
+// cannot disagree (D1677).
+export function listGetStagesOperand(ix: i32): boolean {
+  const c = P.nodes[unwrapParen(ix)]
+  if !(c is Call) { return false }
+  const callee = P.nodes[unwrapParen(c.callFn)]
+  if !(callee is Member) { return false }
+  if callee.memProp != "get" { return false }
+  if !optRecvReReadable(callee.memObj) { return true }
+  if c.callArgs.length != 1 { return false }
+  !listGetIdxReReadable(c.callArgs[0])
+}
+// `valueAtomKind` of a type's render, read off the type. One shape still asks the spelling: a
+// union of two or more members that share a list or closure kind whose spelling that kind
+// does not fix (`i32[] | K[]`, two function types), since the render keeps one part only when
+// the members spell alike (D4320); and a list element union this does not walk.
+export function valueAtomKindOfTy(ty: i32): i32 {
+  const k = vakOfTy(ty)
+  if k != -2 { return k }
+  valueAtomKind(tyToEmitName(ty))
+}
+
+// `valueAtomKindOfTy`'s decision, or -2 for "ask the spelling".
+function vakOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  for s in vakSeen {
+    // A revisited ancestor spells an alias name or nothing, neither of them an atom.
+    if s == ty { return -1 }
+  }
+  vakSeen.push(ty)
+  const r = vakGo(ty)
+  vakSeen.pop()
+  r
+}
+
+// The ancestor stack of `vakOfTy`: the renderer's cycle guard, mirrored.
+const vakSeen: i32[] = []
+
+// The atom kind of a primitive's own spelling, -1 for one that is not a value atom.
+function vakOfPrim(p: PrimName | null): i32 {
+  if p == null { return -1 }
+  match p {
+    "i32" => {
+      return 0
+    }
+    "boolean" => {
+      return 1
+    }
+    "string" => {
+      return 2
+    }
+    "i64" => {
+      return 3
+    }
+    "f64" => {
+      return 4
+    }
+    "f32" => {
+      return 5
+    }
+    "null" => {
+      return 6
+    }
+    "v128" => {
+      return 14
+    }
+    "void" | "never" | "u8" => {
+      return -1
+    }
+  }
+}
+
+// The atom kind of the list spelling `p[]`, -1 for one that is not a value atom.
+function vakOfPrimList(p: PrimName | null): i32 {
+  if p == null { return -1 }
+  match p {
+    "i32" => {
+      return 7
+    }
+    "boolean" => {
+      return 17
+    }
+    "f64" => {
+      return 8
+    }
+    "string" => {
+      return 9
+    }
+    "i64" => {
+      return 10
+    }
+    "f32" => {
+      return 12
+    }
+    "u8" => {
+      return 13
+    }
+    "void" | "null" | "never" | "v128" => {
+      return -1
+    }
+  }
+}
+
+function vakGo(ty: i32): i32 {
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: every arena shape says what its render reads as.
+  match t {
+    TyPrim => {
+      return valueRowKind(ty)
+    }
+    TyObj | TyMap | TyNullable => {
+      // A shape, a map and a `T | null` are never one value atom.
+      return -1
+    }
+    TyLit => {
+      return vakOfPrim(tyEmitPrimOf(ty))
+    }
+    TyVar | TyNeg | TyErr => {
+      // No spelling at all.
+      return -1
+    }
+    TyFunc => {
+      // A result that is a list or a union can end the spelling in `[]`, which the list cuts read.
+      if t.fnRet >= 0 {
+        const rt = T.tys[t.fnRet]
+        if rt is TyArray || rt is TyUnion { return -2 }
+      }
+      if tyEmitNamesOf(ty) { return 11 }
+      return -1
+    }
+    TyArray => {
+      const k = valueRowKind(ty)
+      if k != -2 { return k }
+      return vakOfListElem(ty)
+    }
+    TyUnion => {
+      const p = tyEmitPrimOf(ty)
+      if p != null { return vakOfPrim(p) }
+      return vakOfUnion(t.uMembers)
+    }
+  }
+}
+
+// The atom kind of list `arr` whose element the arena row does not classify, by the element's
+// spelling inside the list's render, or -2 for an element union this does not walk.
+function vakOfListElem(arr: i32): i32 {
+  const p = tyEmitElemPrimOf(arr)
+  if p != null { return vakOfPrimList(p) }
+  if tyEmitElemNulPrimOf(arr, "boolean") != 0 { return 18 }
+  if tyEmitElemNulPrimOf(arr, "string") != 0 { return 9 }
+  const el = tyStepElem(arr)
+  if el < 0 { return -1 }
+  // A quoted literal run with a null, or its alias with one, is the atom list.
+  if litUnionInlineNameOfTy(el) != "" { return 7 }
+  const e = T.tys[el]
+  // Exhaustive over `Ty` and `_`-less: every element shape says whether it is an atom list.
+  match e {
+    TyNullable => {
+      const inr = e.nInner
+      if inr < 0 { return -1 }
+      if litUnionAliasNameOfTy(inr) != "" || litUnionInlineNameOfTy(inr) != "" {
+        return 7
+      }
+      const it = T.tys[inr]
+      if it is TyUnion || it is TyNullable { return -2 }
+      // A function, any other primitive, a shape, a list or a map beside the null is not one
+      // of the three nullable-element lists.
+      return -1
+    }
+    TyUnion => {
+      return -2
+    }
+    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
+      // A shape, list, map or function element, or an element with no spelling.
+      return -1
+    }
+  }
+}
+
+// The atom kind of a union no primitive spells, from its members' kinds: one part when every
+// member spells alike, else several parts, which are never one atom.
+function vakOfUnion(ms: i32[]): i32 {
+  if ms.length == 0 { return -1 }
+  // Two string literals beside a non-null member spell their registered alias, an extra part.
+  const texts: string[] = []
+  let nonLit = false
+  for m in ms {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind == "str" { texts.push(mt.litText) }
+    } else if !isNullTy(m) {
+      nonLit = true
+    }
+  }
+  if nonLit && texts.length >= 2 && litUnionAliasOfLitTexts(texts) != "" {
+    return -1
+  }
+  let kind = -3
+  for m in ms {
+    let mk = -1
+    const mt = T.tys[m]
+    if litUnionAliasNameOfTy(m) != "" {
+      mk = -1
+    } else if mt is TyFunc {
+      // A function member is grouped, so its spelling never ends in `[]`.
+      if tyEmitNamesOf(m) { mk = 11 }
+    } else if mt is TyUnion {
+      return -2
+    } else {
+      mk = vakOfTy(m)
+      if mk == -2 { return -2 }
+    }
+    if mk == -1 { return -1 }
+    if kind == -3 { kind = mk }
+    else if kind != mk { return -1 }
+  }
+  // One spelling per kind, except the atom list, the string list, the nullable boolean list
+  // and the closure, each of which several spellings share (D4320).
+  if ms.length > 1 && (kind == 7 || kind == 9 || kind == 11 || kind == 18) {
+    return -2
+  }
+  kind
+}
+
+// True if the member access at `memIx` reads a field of a currently-narrowed union receiver
+// — an identifier with an active binding on the narrowing stack, or a place with an active
+// key. The receiver is unwrapped through parens, matching its two twins
+// (`memNarrowVariantIndex`, `emitNarrowedMem`), which key the place half the same way.
+export function memIsNarrowed(memIx: i32) {
+  if narrowTop == 0 { return false }
+  const m = P.nodes[memIx]
+  if m is Member {
+    const recv = P.nodes[unwrapParen(m.memObj)]
+    if recv is Ident {
+      if narrowVariantFor(recv.identName) != "" { return true }
+    }
+    // Any other narrowable PLACE receiver — a nested union field (`t.v.a`, keyed `t.v`) or a
+    // list / map element (`xs[0].r`, keyed `xs[0]`). One keyer for both, so the element
+    // receiver cannot be the arm this ladder lacks while its member twin carries it; a
+    // receiver that is neither keys "" and falls to the same false (D1719).
+    const pk = placeNarrowKeyOf(m.memObj)
+    if pk != "" {
+      if narrowVariantFor(pk) != "" { return true }
+    }
+  }
+  false
+}
+
+// The variant table index the Member `memIx`'s receiver is currently narrowed to, or -1
+// if that receiver carries no variant narrowing. Resolves each receiver's own active
+// narrowing, so simultaneously-narrowed locals each map to their own variant.
+export function memNarrowVariantIndex(memIx: i32) {
+  const m = P.nodes[memIx]
+  if m is Member {
+    // Unwrapped in lock-step with `memIsNarrowed` (D222) — a predicate saying "narrowed"
+    // and an index answering -1 would be the worse of the two failures.
+    const recv = P.nodes[unwrapParen(m.memObj)]
+    if recv is Ident { return variantIndexOf(narrowVariantFor(recv.identName)) }
+    const pk = placeNarrowKeyOf(m.memObj)
+    if pk != "" { return variantIndexOf(narrowVariantFor(pk)) }
+  }
+  -1
+}
+
+// The variant row an expression is currently narrowed to, or -1 — asked of the
+// expression itself, unlike `memNarrowVariantIndex` which asks it of a Member's receiver.
+// A struct arm's read never unboxes (stays `{tag, payload}`), so a destination typed at
+// the arm must recover the payload itself. Paren/place unwrap shared with that sibling (D222).
+export function narrowedStructArmVi(exprIx: i32): i32 {
+  if exprIx < 0 { return -1 }
+  if narrowTop == 0 { return -1 }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if e is Ident { return variantIndexOf(narrowVariantFor(e.identName)) }
+  const pk = placeNarrowKeyOf(exprIx)
+  if pk != "" { return variantIndexOf(narrowVariantFor(pk)) }
+  -1
+}
+
+// The canonical identity of the struct row named `name` from the type it recorded, or -1.
+export function rowCanonIdOfName(name: string): i32 {
+  const si = structIndexByName(name)
+  if si < 0 || si >= sTyIx.length { return -1 }
+  const ty = sTyIx[si]
+  if ty < 0 || tyHasTyVar(ty) { return -1 }
+  repCanonId(ty)
+}
+
+// The wasm-type code (`0` i32, `3` string) of variant `vi`'s field at field index `fi`.
+export function variantFieldTypeAt(vi: i32, fi: i32) {
+  uFieldTypes[uFieldStart[vi] + fi]
+}
+
+// The ELEMENT/atom-set NAME recorded for variant `vi`'s field `fi` — a union-box field
+// (code 16) records its atom-set name (the key `emitUnionCoerce` boxes against), a
+// ref-list its element name, a nested-struct its target. "" for a plain scalar field.
+export function variantFieldElemName(vi: i32, fi: i32) {
+  uFieldElemName[uFieldStart[vi] + fi]
+}

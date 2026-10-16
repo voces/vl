@@ -1,0 +1,1398 @@
+// `emit_union_registry.vl` — the union registry's member sets: which atoms and
+// ref-array members a registered union carries, and the member-set interner.
+
+import { Ident, Index, Member, P } from "./ast"
+import {
+  canonUnionKey,
+  canonUnionKeyNullAtOfTy,
+  canonUnionKeyOfAnnName,
+  canonUnionKeyOfName,
+  canonUnionKeyOfTy,
+} from "./check_nj_join"
+import { valueAtomKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cUserTypes,
+  tySame,
+} from "./check_types"
+import {
+  indexPathKeyOf,
+  memberPathKeyOf,
+  nonNullMemberCountOf,
+  removeAtomFrom,
+  unionHasAtom,
+  unwrapParen,
+} from "./emit_base"
+import { emitFail } from "./emit_bytes"
+import { narrowVariantFor } from "./emit_narrow_slots"
+import {
+  declTyIxOfName,
+  msAtomIdOf,
+  repCanonId,
+  repShadowAddReason,
+  repShadowBumpReason,
+  repShadowOn,
+  tyIsI32LeafElem,
+  tyIsStrLeafElem,
+  unMemRowStart,
+  unRowOfKey,
+  unRowOfKeyId,
+} from "./emit_rep"
+import {
+  msGen,
+  msRowChain,
+  msSetByText,
+  msSetGen,
+  msSetMask,
+  msSetMiss,
+  msSetNext,
+  msSetRow,
+  msSetText,
+  narrowSets,
+  narrowTys,
+  uVariants,
+  unKey,
+  unMemAtomIds,
+  unMemAtoms,
+  unMemKinds,
+  unMemTyCount,
+  unMemTyStart,
+  unMemTys,
+  unMemberSet,
+  unNames,
+  unRowByMemberSid,
+  unRowBySid,
+  unTyIx,
+  unVarCount,
+  unVarStart,
+} from "./emit_state"
+import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
+import {
+  roListInnerName,
+  splitUnionAtoms,
+  tyTopIndexOf,
+  unionMemberCount,
+} from "./tyname"
+import { primNameOf } from "./tyquery"
+
+// The arena type the narrowing at stack slot `i` binds — see `narrowSlotTy`. Exported for the
+// emitter's narrowed-arm consumers, which ask it of the slot `narrowSlotOf` returned.
+export function narrowSlotTyOf(i: i32): i32 { narrowSlotTy(i) }
+
+// The arena type the narrowing at stack slot `i` binds: the type banked by an `is` push, or —
+// for a complement push — the sole surviving member of its set (`i32 | null` minus `null`
+// binds `i32`). -1 when the slot binds no single type: a two-or-more-member set, a set the
+// pool does not cover, or a push that banked nothing.
+export function narrowSlotTy(i: i32): i32 {
+  const t = narrowTys[i]
+  if t >= 0 { return t }
+  msSoleMemberTy(narrowSets[i])
+}
+
+// The atom code a list of element `e` takes on the i32 list's storage: 17 for `boolean`, 18
+// for its `boolean | null` niche, -1 for any other element.
+export function boolTagElemKind(e: i32): i32 {
+  if primNameOf(e) == "boolean" { return 17 }
+  if e < 0 || e >= T.tys.length { return -1 }
+  const t = T.tys[e]
+  if t is TyNullable {
+    if primNameOf(t.nInner) == "boolean" { return 18 }
+  }
+  -1
+}
+
+// The `unNames` row whose recorded arena type is STRUCTURALLY `ty` — the canon-keyed reverse
+// index. `unTyIx` alone is not enough: the arena is not hash-consed for composite spellings, so
+// one spelling can mint several rows and a row-IDENTITY scan misses the registered one.
+// `repCanonId` is the interned structural id those duplicates share.
+export function unRowOfCanon(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const c = repCanonId(ty)
+  let u = 0
+  while u < unTyIx.length {
+    if unTyIx[u] >= 0 {
+      if repCanonId(unTyIx[u]) == c { return u }
+    }
+    u = u + 1
+  }
+  -1
+}
+
+// The `unNames` row a spelling names, or -1 — `unNameBound`'s row-valued sibling, so registry-
+// by-id seams can compare row to row rather than boolean to boolean: "both said yes" and
+// "both named the same row" are different findings. `unionRowOf` is a wider lookup (it also
+// scans `unMemberSet`); this one is the exact row `unNameBound` answers about.
+export function unRowOfName(name: string): i32 {
+  sidArrGet(unRowBySid, sidLookup(name))
+}
+
+// Whether a row carries the union key of spelling `name`, one member or more; the empty name
+// has no key. Whether `name` itself is bound to a row is `unNameBound`'s question.
+export function isUName(name: string) {
+  const k = canonUnionKeyOfName(name)
+  k >= 0 && unRowOfKeyId(k) >= 0
+}
+
+// Whether the spelling `name` is bound to a row, for a caller about to bind or rewrite it.
+export function unNameBound(name: string) { unRowOfName(name) >= 0 }
+
+// The full pipe-joined member set of the union named `name`: a registered alias returns its
+// `unMemberSet` entry (`type N = A | B` expands to `"A|B"`); an unregistered or already
+// pipe-joined name passes through unchanged. Lets complement narrowing subtract variants
+// from an alias-annotated binding's set.
+export function unionMemberSetOf(name: string) {
+  const u = unRowOfName(name)
+  if u >= 0 { return unMemberSet[u] }
+  name
+}
+
+// Resolves `name` to its member-set spelling (an alias name to its declared set, else itself)
+// and splits it into pipe-joined atoms into `out`, using the `msMemberAtomsOf` memo before
+// falling back to `splitUnionAtoms`. The single home for that resolve-then-split pair, so
+// every caller shares one splitting grammar and one memo.
+export function unionArmsOf(name: string, out: string[]) {
+  let nm = unionMemberSetOf(name)
+  if nm == "" { nm = name }
+  if !msMemberAtomsOf(nm, out) { splitUnionAtoms(nm, out) }
+  nm
+}
+
+// The `unNames` ROW of the union `name` — matched on the alias NAME or on the
+// pipe-joined member SET (a consumer that already resolved the alias hands us the
+// set), or -1. Nominal identity lookup, not a structural decision.
+export function unionRowOf(name: string): i32 {
+  if name == "" { return -1 }
+  const u = unRowOfName(name)
+  if u >= 0 { return u }
+  // The alias name is asked first and still is: a spelling that is both one row's name and an
+  // earlier row's member set keeps naming the row it named.
+  sidArrGet(unRowByMemberSid, sidLookup(name))
+}
+
+// ── the union registry asked by arena type id — an A/B shadow harness (docs/internals/registry-by-type-id.md)
+
+// Off by default: `unABOn()` is 0 unless the host arms the shadow harness, and every AB
+// function then returns exactly what its unshadowed twin does, so an unarmed compile is
+// unaffected. Mode 2 prefers the id answer; mode 3 re-keys the tally on `unKey` instead of
+// `repCanonId`, both armed from source only, since a compiler reading its own environment is a second input.
+export const unABMode: i32 = 0
+
+// The emit-time tallies, per converted site — counters, not a shared reason-bucket, because
+// `repShadowSweep` resets the bucket table before this sweep runs (a bump during emit would
+// not survive to the report) and a pooled bucket can't say which site a disagreement belongs
+// to: `unABCnt[site * UNAB_K + k]`, six outcomes per site.
+let unABCnt: i32[] = []
+const UNAB_K = 7
+// 0 agree · 1 differ · 2 name-only · 3 id-only · 4 neither · 5 no-ty · 6 alias.
+const UNAB_AGREE = 0
+const UNAB_DIFFER = 1
+const UNAB_NAMEONLY = 2
+const UNAB_IDONLY = 3
+const UNAB_NEITHER = 4
+const UNAB_NOTY = 5
+// Two rows keyed to the same member sequence but differing only in name (a declared alias
+// beside its inline spelling, or two monomorphized instances) are not a disagreement — their
+// tag slices are identical and either row answers. D1491.
+const UNAB_ALIAS = 6
+let unRetryHit: i32 = 0
+let unRetryMiss: i32 = 0
+
+export function unABOn(): i32 {
+  if unABMode > 0 { return unABMode }
+  if repShadowOn { return 1 }
+  0
+}
+
+// One reach recorded. Called only when armed, so the growth loop and the read-modify-write
+// are off the unarmed path entirely.
+function unABBump(site: i32, k: i32) {
+  const at = site * UNAB_K + k
+  while unABCnt.length <= at { unABCnt.push(0) }
+  unABCnt[at] = unABCnt[at] + 1
+  0
+}
+
+// Two rows the KEY cannot tell apart: both covered, and their minted `unKey` is the same id.
+// Bounded on both sides — a row named by a key the column never grew is exactly the read that
+// trapped at D1152.
+function unRowKeySame(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 { return false }
+  if a >= unKey.length || b >= unKey.length { return false }
+  if unKey[a] < 0 { return false }
+  unKey[a] == unKey[b]
+}
+
+// Classify one reach: `n` the row the SPELLING named, `d` the row the ARENA ID named, both
+// -1 for "no row". `ty < 0` is its OWN bucket — "this site had no id to offer" and "the id
+// disagreed" are different findings, and collapsing them is how a coverage gap reads as
+// agreement.
+export function unABProbe(site: i32, n: i32, d: i32, ty: i32) {
+  if ty < 0 { return unABBump(site, UNAB_NOTY) }
+  if n >= 0 && d >= 0 {
+    if n == d { return unABBump(site, UNAB_AGREE) }
+    if unRowKeySame(n, d) { return unABBump(site, UNAB_ALIAS) }
+    return unABBump(site, UNAB_DIFFER)
+  }
+  if n >= 0 { return unABBump(site, UNAB_NAMEONLY) }
+  if d >= 0 { return unABBump(site, UNAB_IDONLY) }
+  unABBump(site, UNAB_NEITHER)
+}
+
+// The converted sites, by name — an i32 constant at each call site, so an unarmed compile
+// just pushes it and returns; the spelling is needed only by the report. Ids 1-10 are the
+// sites the initial shim added (including id-free callers that already hold an arena id);
+// 11+ came from later one-hop threading. `UNAB_N` bounds the report loop.
+const UNAB_N = 48
+function unABSiteName(s: i32): string {
+  if s == 47 { return "collectU/optCallRet" }
+  // 29-46 are step 4b(c): `registerInlineUnion`'s recursions, each keyed on the sub-spelling's
+  // own canon key, plus `collectTyReachRegister`'s two ID-FREE callers, which hold a type.
+  if s == 29 { return "riu/mapVal" }
+  if s == 30 { return "riu/arrayAtom" }
+  if s == 31 { return "riu/pun" }
+  if s == 32 { return "riu/nulRefArray" }
+  if s == 33 { return "riu/nulShape" }
+  if s == 34 { return "riu/nulCloValue" }
+  if s == 35 { return "riu/nulCloVariant" }
+  if s == 36 { return "riu/nulCloRefArray" }
+  if s == 37 { return "riu/nestedArray" }
+  if s == 38 { return "riu/arrayShape" }
+  if s == 39 { return "riu/fnResult" }
+  if s == 40 { return "riu/refArrayArm" }
+  if s == 41 { return "ctr/nullableName" }
+  if s == 42 { return "ctr/unionName" }
+  if s == 43 { return "riu/collapsedName" }
+  if s == 44 { return "riu/inferRetNominal" }
+  if s == 45 { return "riu/arrElemUnion" }
+  if s == 46 { return "riu/api" }
+  if s == 1 { return "regValueUnionTy" }
+  if s == 2 { return "letAnnUnionKind" }
+  if s == 3 { return "unionNameOfExpr/as" }
+  if s == 4 { return "unionNameOfExpr/is" }
+  if s == 5 { return "letAnnUnionRetSink" }
+  if s == 6 { return "letAnnUnionSlot" }
+  if s == 7 { return "internShapeDeep/valueUnion" }
+  if s == 8 { return "internFuncTypeShapes/valueUnion" }
+  if s == 9 { return "inferRetArenaUnionIsDup" }
+  if s == 10 { return "internShapeDeep/armTys" }
+  if s == 11 { return "exprIsUnionStrEq/l" }
+  if s == 12 { return "exprIsUnionStrEq/r" }
+  if s == 13 { return "memberUnionFieldName" }
+  if s == 14 { return "writeRhsIsNullBearing" }
+  if s == 15 { return "fnUnionRetSinkOk" }
+  if s == 16 { return "arrLitUnionElemName" }
+  if s == 17 { return "arrLitBoxElem" }
+  if s == 18 { return "unionNameOfExpr/callee" }
+  if s == 19 { return "unionNameOfExpr/closure" }
+  if s == 20 { return "unionNameOfExpr/method" }
+  if s == 21 { return "nliInferIfLet" }
+  if s == 22 { return "nliInferOptChainLet" }
+  if s == 23 { return "collectU/inferLetTy" }
+  if s == 24 { return "collectU/arrLitInferElem" }
+  if s == 25 { return "emitUnionUnionEq" }
+  if s == 26 { return "emitReturnValue/inferRet" }
+  if s == 27 { return "emitLetDeclStmt/union" }
+  if s == 28 { return "emitLetDeclStmt/nli" }
+  "site?"
+}
+
+// One bucket's name. Split out so the report loop reads as a table rather than as a
+// six-armed ladder inside two nested loops.
+function unABKindName(k: i32): string {
+  if k == UNAB_AGREE { return "agree" }
+  if k == UNAB_DIFFER { return "differ" }
+  if k == UNAB_NAMEONLY { return "name-only" }
+  if k == UNAB_IDONLY { return "id-only" }
+  if k == UNAB_NEITHER { return "neither" }
+  if k == UNAB_ALIAS { return "alias" }
+  "no-ty"
+}
+
+// The id-keyed twin of `unionRowOf(name)`. `unRowOfCanon` is the reverse index this repo
+// already built (`repCanonId` over the `unTyIx` sidecar B-1 step 1 populated); this name is
+// its registry-facing spelling, so a converted call site reads as the twin of the call it
+// replaces rather than as a new idea.
+function unionRowOfTy(ty: i32): i32 { unRowOfCanon(ty) }
+
+// The raw-arena-index twin, kept beside the canon one so all three candidate keys can be
+// priced against each other on one run. The arena is not hash-consed for composite
+// spellings, so one spelling mints several indices and this misses rows the canon key
+// finds — that gap is the argument against keying on the raw index.
+function unionRowOfTyRaw(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  let u = 0
+  while u < unTyIx.length {
+    if unTyIx[u] == ty { return u }
+    u = u + 1
+  }
+  -1
+}
+
+// The seams that answer from the union KEY, step 5's switch: every one. Where the key finds no
+// row, `unSiteWideHit` and the mint guard say what still answers.
+// `docs/internals/registry-by-type-id.md` §5.
+export function unSiteOnKey(site: i32): boolean { site >= 1 && site < UNAB_N }
+
+// The ID side's row for `site`: a switched site and harness mode 3 key on `unKey`, anything
+// else on `repCanonId`. Only the A/B seams route through here.
+export function unRowOfTyAB(site: i32, ty: i32): i32 {
+  if unABMode == 3 || unSiteOnKey(site) { return unRowOfKey(ty) }
+  unionRowOfTy(ty)
+}
+
+// `isUName`'s seam, which does not read `isUName`: a site with a type answers "a row carries its
+// key", and one with no type (`ty < 0`) answers by the key of `name`. Armed, the spelling's own
+// row is read only to tally; it scans `unNames` where the key scans `unTyIx`, so the buckets
+// name a coverage hole apart from a key disagreement.
+export function isUNameAB(site: i32, name: string, ty: i32): boolean {
+  isUNameABAt(site, name, ty, false)
+}
+
+// `isUNameAB` for a mint guard where `name` is the type's own spelling: the key of `name` also
+// answers where that type carries no union key (a softened literal union, or same-shape records
+// collapsed to one record).
+export function isUNameOwnAB(site: i32, name: string, ty: i32): boolean {
+  isUNameABAt(site, name, ty, true)
+}
+
+// The row carrying the union key of spelling `name`, or -1 when `name` is not a union of two or
+// more members.
+function nameKeyRow(name: string): i32 {
+  unRowOfKeyId(canonUnionKeyOfAnnName(name))
+}
+
+// The shared body. `own` says `name` is the type's own spelling, so the key of `name` answers
+// where the type carries no union key.
+export function isUNameABAt(
+  site: i32,
+  name: string,
+  ty: i32,
+  own: boolean,
+): boolean {
+  let d = -1
+  if ty >= 0 { d = unRowOfTyAB(site, ty) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if ty < 0 { return nameKeyRow(name) >= 0 }
+  if d >= 0 || unSiteWideHit(site, ty) { return true }
+  own && canonUnionKeyOfTy(ty) < 0 && nameKeyRow(name) >= 0
+}
+
+// One union member against another in the same position: the same type, or two records or
+// maps of one structure (or lists of such), which the key renders apart when only one
+// carries its declared name.
+function unMemberSameShape(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  if ta is TyPrim {
+    if tb is TyPrim { return ta.primName == tb.primName }
+    return false
+  }
+  if ta is TyArray {
+    if tb is TyArray { return unMemberSameShape(ta.aElem, tb.aElem) }
+    return false
+  }
+  if !(ta is TyObj || ta is TyMap) || !(tb is TyObj || tb is TyMap) {
+    return false
+  }
+  repCanonId(a) == repCanonId(b)
+}
+
+// Two union types with the same member sequence under `unMemberSameShape`, order kept, since
+// a union's box tags are positional over its members.
+function unTySeqSameShape(a: i32, b: i32): boolean {
+  if a == b { return true }
+  if a < 0 || b < 0 { return false }
+  const ta = T.tys[a]
+  const tb = T.tys[b]
+  match ta {
+    TyNullable => tb is TyNullable && unTySeqSameShape(ta.nInner, tb.nInner)
+    TyUnion => tb is TyUnion && unMemberSeqSameShape(ta.uMembers, tb.uMembers)
+    TyLit => false
+    TyArray => false
+    TyMap => false
+    TyObj => false
+    TyPrim => false
+    TyErr => false
+    TyFunc => false
+    TyVar => false
+    TyNeg => false
+  }
+}
+
+function unMemberSeqSameShape(ma: i32[], mb: i32[]): boolean {
+  if ma.length != mb.length { return false }
+  let i = 0
+  while i < ma.length {
+    if !unMemberSameShape(ma[i], mb[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// A row for a union type the key missed: by the key of its `null` arm at each member position,
+// since a nullable union's row keeps `null` at its spelled position, else a row whose recorded
+// type has the same member sequence up to record names. For the existence question only.
+function unRowOfTyWide(ty: i32): i32 {
+  let at = 0
+  let k = canonUnionKeyNullAtOfTy(ty, 0)
+  while k >= 0 {
+    const r = unRowOfKeyId(k)
+    if r >= 0 { return r }
+    at = at + 1
+    k = canonUnionKeyNullAtOfTy(ty, at)
+  }
+  if canonUnionKeyOfTy(ty) < 0 { return -1 }
+  let u = 0
+  while u < unTyIx.length {
+    if unTySeqSameShape(unTyIx[u], ty) { return u }
+    u = u + 1
+  }
+  -1
+}
+
+// A row-existence seam's answer where the key finds no row: a row by `unRowOfTyWide`.
+function unSiteWideHit(site: i32, ty: i32): boolean {
+  if !unSiteWideAsks(site) { return false }
+  unRowOfTyWide(ty) >= 0
+}
+
+// Whether the site asks about a row for the type rather than about the spelling.
+function unSiteWideAsks(site: i32): boolean {
+  match site {
+    2 | 5 | 6 | 7 | 15 | 16 | 17 | 18 | 20 | 26 | 27 | 28 => true
+    _ => false
+  }
+}
+
+// The row-NAME seam: the name of the row carrying the union key, else "". A site with a type
+// keys on it, and one with no type (`ty < 0`) on the key of `name`, so a spelling no row is
+// named by still reaches the row its key finds; armed, the spelling's own row is only tallied.
+export function unionRowNameAB(site: i32, name: string, ty: i32): string {
+  let d = -1
+  if ty >= 0 { d = unRowOfTyAB(site, ty) } else { d = nameKeyRow(name) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if d >= 0 && d < unNames.length { return unNames[d] }
+  ""
+}
+
+// `isUName`'s seam for a caller with no arena node: the row its type keys to where it has one,
+// and otherwise the row carrying the key canon mints for the spelling, one member or more. The
+// empty name has no key and names no row; armed, a key of -1 is tallied as `no-ty`.
+export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
+  let d = -1
+  let key = -1
+  if ty >= 0 {
+    key = 0
+    d = unRowOfTyAB(site, ty)
+  } else {
+    key = canonUnionKeyOfName(name)
+    if key >= 0 { d = unRowOfKeyId(key) }
+  }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, key) }
+  d >= 0
+}
+
+// The member-type seam: the members of the row the type keys to, or, where the type finds no
+// row or there is none (`ty < 0`), of the row carrying the key of `name`. False when neither
+// finds a covered row, leaving `out` untouched.
+export function unionMemberTysOfAB(
+  site: i32,
+  name: string,
+  ty: i32,
+  out: i32[],
+): boolean {
+  let d = -1
+  if ty >= 0 { d = unRowOfTyAB(site, ty) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if d < 0 { d = nameKeyRow(name) }
+  unionMemberTysOfRow(d, out)
+}
+
+// `unionHasAtom`'s seam: whether the row the type keys to, or else the row carrying the key of
+// `name`, records the member atom `atom` verbatim (`unMemAtoms`). Where neither key finds a row,
+// the spelling's own atoms answer, since a spelling no row holds is a text question.
+export function unionHasAtomAB(
+  site: i32,
+  name: string,
+  ty: i32,
+  atom: string,
+): boolean {
+  let d = -1
+  if ty >= 0 { d = unRowOfTyAB(site, ty) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
+  if d < 0 { d = nameKeyRow(name) }
+  if d >= 0 { return unionHasAtomRow(d, atom) }
+  unionHasAtom(name, atom)
+}
+
+// The key-stability check, per row: does the key the row's producer minted equal the key the
+// other two producers (the arena type, the recorded member set) would obtain? A key with
+// three entry points is only a key if they land on one id — the property step 5's switch
+// rests on. `ty-none` separates "the arena route has no render" from "it disagrees".
+function unKeySweepRow(u: i32, ty: i32) {
+  let k = -1
+  if u < unKey.length { k = unKey[u] }
+  if k >= 0 { repShadowBumpReason("keySweep/covered") }
+  if ty >= 0 {
+    const kt = canonUnionKey(ty)
+    if kt < 0 { repShadowBumpReason("keySweep/ty-none") }
+    else if kt == k { repShadowBumpReason("keySweep/ty-agree") }
+    else { repShadowBumpReason("keySweep/ty-differ") }
+    // The step-4a route beside the step-3 one, on the same rows in the same run: the
+    // structural render's reach is what `tykey-*` has to beat, and a table of one is a
+    // number nobody can grade.
+    const kn = canonUnionKeyOfTy(ty)
+    if kn < 0 { repShadowBumpReason("keySweep/tykey-none") }
+    else if kn == k { repShadowBumpReason("keySweep/tykey-agree") }
+    else { repShadowBumpReason("keySweep/tykey-differ") }
+  }
+  if u < unMemberSet.length {
+    const ks = canonUnionKeyOfName(unMemberSet[u])
+    if ks == k {
+      repShadowBumpReason("keySweep/set-agree")
+    } else {
+      repShadowBumpReason("keySweep/set-differ")
+    }
+  }
+  0
+}
+
+// The second half of the key's licence — `merge-diffset` alone is not it (D1492). A struct
+// union's tags are positional over its variant slice, not the member-set string, so two rows
+// with the same set but different slices need this too. Complementary: a value union owns no
+// variants, so only the set compare can see two atom sets fused.
+function unRowVariantsSame(a: i32, b: i32): boolean {
+  if a >= unVarStart.length || b >= unVarStart.length { return false }
+  if a >= unVarCount.length || b >= unVarCount.length { return false }
+  const na = unVarCount[a]
+  if na != unVarCount[b] { return false }
+  const sa = unVarStart[a]
+  const sb = unVarStart[b]
+  if sa < 0 || sb < 0 { return false }
+  if sa + na > uVariants.length || sb + na > uVariants.length { return false }
+  let i = 0
+  while i < na {
+    if uVariants[sa + i] != uVariants[sb + i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Points row `u`'s empty variant slice at the slice of the first earlier row minted under the
+// same key, or leaves it alone. A one-member declaration over an inline union records the
+// expansion's member set but has no struct member of its own to push (D1492); sharing the slice
+// pushes no variant, so no tag moves.
+export function unVarSliceAdoptKeySibling(u: i32) {
+  if u < 0 || u >= unKey.length || u >= unVarCount.length { return 0 }
+  if unVarCount[u] != 0 { return 0 }
+  const r = unRowOfKeyId(unKey[u])
+  if r < 0 || r >= u || r >= unVarCount.length { return 0 }
+  if unVarCount[r] < 1 { return 0 }
+  unVarStart[u] = unVarStart[r]
+  unVarCount[u] = unVarCount[r]
+  0
+}
+
+// True when `name` names a row, after binding an unregistered spelling to the row its key
+// finds. Only a union spelling that itself keys to that row binds: a declared alias name, a
+// union type of one member, or a reordered member sequence stays unbound and answers false,
+// so a mint guard asking this mints exactly where it did before the key could answer.
+export function unNameAdoptKeyRow(name: string, ty: i32): boolean {
+  if unNameBound(name) { return true }
+  if (cUserTypes[name] ?? -1) >= 0 { return false }
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyUnion {
+      if t.uMembers.length < 2 { return false }
+    }
+  }
+  const k = canonUnionKeyOfName(name)
+  if k < 0 { return false }
+  let r = -1
+  if ty >= 0 { r = unRowOfKey(ty) } else { r = unRowOfKeyId(k) }
+  if r < 0 || r >= unKey.length || unKey[r] != k { return false }
+  sidArrPut(unRowBySid, sidOf(name), r)
+  true
+}
+
+// The ABI assertion step 5 owes: two rows one key would fuse, and how many of those record a
+// different member set. A union's box tags are positional over its own member set, so a merge
+// across different sets reads a value tagged under one slice through the other's — the
+// hazard that disqualified `repCanonId`. `merge-diffset` must be 0 for the key to be usable.
+function unKeySweepPair(u: i32, v: i32) {
+  let k = -1
+  let kv = -1
+  if u < unKey.length { k = unKey[u] }
+  if v < unKey.length { kv = unKey[v] }
+  if k < 0 || kv < 0 { return 0 }
+  if k != kv { return 0 }
+  repShadowBumpReason("keySweep/merge")
+  if unNames[u] != unNames[v] { repShadowBumpReason("keySweep/merge-diffname") }
+  if v < unMemberSet.length && u < unMemberSet.length {
+    if unMemberSet[u] != unMemberSet[v] {
+      repShadowBumpReason("keySweep/merge-diffset")
+    }
+  }
+  if !unRowVariantsSame(u, v) { repShadowBumpReason("keySweep/merge-diffvar") }
+  0
+}
+
+// The whole-registry measurement, run once per program beside `repShadowSweep`: every row
+// asked about itself, both ways, with no call-site plumbing. The round-trips say whether a
+// key can even name its own row; `canon-merge` counts pairs of distinct rows one canon id
+// would fuse — the ABI hazard, since a union's box tags are positional over its own member set.
+export function unionRegistryABSweep() {
+  if unABOn() == 0 { return 0 }
+  let s = 1
+  while s < UNAB_N {
+    let k = 0
+    while k < UNAB_K {
+      const at = s * UNAB_K + k
+      if at < unABCnt.length {
+        repShadowAddReason(
+          "unionAB/" + unABSiteName(s) + "/" + unABKindName(k),
+          unABCnt[at],
+        )
+      }
+      k = k + 1
+    }
+    s = s + 1
+  }
+  repShadowAddReason("atomRetry/id-hit", unRetryHit)
+  repShadowAddReason("atomRetry/id-miss", unRetryMiss)
+  unABCnt = []
+  unRetryHit = 0
+  unRetryMiss = 0
+  let u = 0
+  while u < unNames.length {
+    repShadowBumpReason("unionSweep/rows")
+    if unionRowOf(unNames[u]) == u { repShadowBumpReason("unionSweep/name-rt") }
+    let ty = -1
+    if u < unTyIx.length { ty = unTyIx[u] }
+    if ty >= 0 {
+      repShadowBumpReason("unionSweep/covered")
+      if unionRowOfTy(ty) == u { repShadowBumpReason("unionSweep/canon-rt") }
+      if unionRowOfTyRaw(ty) == u { repShadowBumpReason("unionSweep/raw-rt") }
+    }
+    unKeySweepRow(u, ty)
+    let v = u + 1
+    while v < unNames.length {
+      if unNames[u] == unNames[v] { repShadowBumpReason("unionSweep/name-dup") }
+      let tv = -1
+      if v < unTyIx.length { tv = unTyIx[v] }
+      unKeySweepPair(u, v)
+      if ty >= 0 && tv >= 0 {
+        if repCanonId(ty) == repCanonId(tv) {
+          repShadowBumpReason("unionSweep/canon-merge")
+          if unNames[u] != unNames[v] {
+            repShadowBumpReason("unionSweep/canon-merge-diffname")
+          }
+          // Bounded, not assumed adjacent: `unMemberSet` is pushed in lockstep with `unNames`
+          // at all three mint sites, but this sweep never relies on that alignment holding.
+          if v < unMemberSet.length && u < unMemberSet.length {
+            if unMemberSet[u] != unMemberSet[v] {
+              repShadowBumpReason("unionSweep/canon-merge-diffset")
+            }
+          }
+        }
+      }
+      v = v + 1
+    }
+    u = u + 1
+  }
+  0
+}
+
+// The row-keyed core of `unMemHasAtom` — the same walk from a row instead of a spelling.
+// Every parallel-table read here is bounded: a row named by a key the table never grew
+// is exactly the shape that trapped before. D1152.
+function unMemHasAtomRow(u: i32, want: string, arr: boolean): i32 {
+  if u < 0 { return -1 }
+  if u >= unMemTyStart.length { return -1 }
+  if u >= unMemTyCount.length { return -1 }
+  const st = unMemTyStart[u]
+  const n = unMemTyCount[u]
+  if st < 0 { return -1 }
+  if st + n > unMemTys.length { return -1 }
+  let i = 0
+  while i < n {
+    let m = unMemTys[st + i]
+    if m < 0 { return -1 }
+    if m >= T.tys.length { return -1 }
+    if arr {
+      const ta = T.tys[m]
+      m = -1
+      if ta is TyArray { m = ta.aElem }
+      if m >= T.tys.length { return -1 }
+    }
+    if m >= 0 {
+      const t = T.tys[m]
+      if t is TyPrim {
+        if t.primName == want { return 1 }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// `unionHasAtom`'s row-keyed twin: does row `u` record a member whose verbatim atom
+// spelling is `atom`? The name-keyed original scans the pipe-separated spans of a
+// spelling; this scans `unMemAtoms`, recorded from exactly those spans, so the two answer
+// the same question off the same text. Bounded through `unMemRowStart`. D1152.
+function unionHasAtomRow(u: i32, atom: string): boolean {
+  const st = unMemRowStart(u)
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  let i = 0
+  while i < n {
+    if unMemAtoms[st + i] == atom { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The registry row for a SPELLING, keyed by rep identity rather than by text: the name is
+// used only as a ROUTE to the arena (`declTyIxOfName`), and the comparison is `repCanonId`.
+// This is the query a registry keyed on an interned rep key would perform, written so the
+// three filed witnesses can be graded without threading a type through their call chains.
+function unionRowOfSpellingTy(name: string): i32 {
+  const ty = declTyIxOfName(name)
+  if ty < 0 { return -1 }
+  unionRowOfTy(ty)
+}
+
+// The id-keyed RETRY at the atom test's decline. -1 always when unarmed, so the shipped
+// compiler reaches its `emitFail` exactly as before; mode 1 only TALLIES whether the id key
+// would have found the row, mode 2 answers from it. `id-hit` counts the refusals a rep-keyed
+// registry would not have raised — the number the design's witness claim rests on.
+function unABAtomRetry(name: string, want: string, arr: boolean): i32 {
+  const m = unABOn()
+  if m == 0 { return -1 }
+  const u = unionRowOfSpellingTy(name)
+  if u < 0 {
+    unRetryMiss = unRetryMiss + 1
+    return -1
+  }
+  unRetryHit = unRetryHit + 1
+  if m != 2 { return -1 }
+  unMemHasAtomRow(u, want, arr)
+}
+
+// The arena member types of the union `name`, appended to `out` in the row's recorded order
+// (the box-tag ABI order). True when the row is covered and every member resolved; false
+// leaves `out` untouched and the caller keeps its legacy member-name path. Consumers then
+// classify each member structurally instead of re-deriving shape from its rendered spelling.
+export function unionMemberTysOf(name: string, out: i32[]): boolean {
+  unionMemberTysOfRow(unionRowOf(name), out)
+}
+
+// The same walk from a ROW — the one place the member columns are read, so a
+// spelling-keyed and an arena-keyed entry point cannot drift into two readings of them.
+function unionMemberTysOfRow(u: i32, out: i32[]): boolean {
+  if u < 0 { return false }
+  if u >= unMemTyStart.length { return false }
+  const st = unMemTyStart[u]
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  let i = 0
+  while i < n {
+    if unMemTys[st + i] < 0 { return false }
+    i = i + 1
+  }
+  let j = 0
+  while j < n {
+    out.push(unMemTys[st + j])
+    j = j + 1
+  }
+  true
+}
+
+// The union-box ABI's atom test, from the arena: 1 when the union `name` has a member whose
+// type is exactly the keyword primitive `want` (or exactly an array over it when `arr`), 0
+// for none, -1 when the row is uncovered — a "cannot happen" its only caller diagnoses. Exact
+// match only: the caller turns the atom into a tag, never asking "reps like this" instead.
+export function unMemHasAtom(name: string, want: string, arr: boolean): i32 {
+  const mems: i32[] = []
+  if !unionMemberTysOf(name, mems) { return -1 }
+  let i = 0
+  while i < mems.length {
+    let m = mems[i]
+    if m >= T.tys.length { return -1 }
+    if arr {
+      const ta = T.tys[m]
+      m = -1
+      if ta is TyArray { m = ta.aElem }
+      if m >= T.tys.length { return -1 }
+    }
+    if m >= 0 {
+      const t = T.tys[m]
+      if t is TyPrim {
+        if t.primName == want { return 1 }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The union-box ABI's atom test, answered only from the arena: a row minted without its
+// members, an unresolved member spelling, or an unregistered name are each structurally
+// impossible once a value is boxed with a tag, since the registration that mints the tag
+// also records the members. An uncovered row is a "cannot happen" — it fails loudly.
+export function unionHasAtomTy(
+  name: string,
+  want: string,
+  arr: boolean,
+): boolean {
+  const a = unMemHasAtom(name, want, arr)
+  if a >= 0 { return a == 1 }
+  // SPIKE: would a registry keyed on rep identity have found this row? -1 when unarmed, so
+  // the refusal below is reached exactly as before (`unABAtomRetry`).
+  const r = unABAtomRetry(name, want, arr)
+  if r >= 0 { return r == 1 }
+  // The RENDERED member set, when the name is one: an inferred join has no registered row,
+  // and its render is the checker's own member list, so reading it invents neither a row nor
+  // an order. A name with no top-level `|` is an alias and still refuses (D1733).
+  if tyTopIndexOf(name, '|', 0, 0) >= 0 {
+    let spell = want
+    if arr { spell = want + "[]" }
+    return unionHasAtom(name, spell)
+  }
+  emitFail(
+    "emitProgram: union box atom test on a union with no recorded members: "
+      + name,
+  )
+  false
+}
+
+// ── the union member set as a structure ────────────────────────────────────────
+
+// A member set is a subset of one union row's recorded members: the pair (row, mask), where
+// bit `i` of the mask is member `i` in the row's recorded (box-tag ABI) order — never
+// re-derived, only masked. Membership is a kind test or interned-id compare, not a substring
+// search; a set renders (`msTextOf`) only when handed to a name-keyed consumer.
+
+// The member slice of union row `u`, or -1 when the row is not covered by the reference
+// columns (a row the recorder missed, an empty row, or one wider than the 31-bit mask).
+// `unMemTyStart`/`unMemTyCount` slice all four member columns alike. The bound lives once,
+// in `emit_rep` beside the recorder that writes the columns (#1110) — this is its local spelling.
+function msRowStart(u: i32): i32 { unMemRowStart(u) }
+
+// Is member `i` present in `mask`? (Bitwise `&` binds LOOSER than `==` in this
+// language, so the test is parenthesized once here rather than at five call sites.)
+function msBitSet(mask: i32, i: i32): boolean { ((mask >>> i) & 1) == 1 }
+
+// The rendered form of the subset `mask` of row `u`: the surviving members'
+// verbatim spellings, joined on `|`, in the row's recorded order.
+function msRenderSet(u: i32, mask: i32): string {
+  const st = msRowStart(u)
+  if st < 0 { return "" }
+  const n = unMemTyCount[u]
+  let out = ""
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if out != "" { out = out + "|" }
+      out = out + unMemAtoms[st + i]
+    }
+    i = i + 1
+  }
+  out
+}
+
+// The interned set id for the subset `mask` of row `u` — one id per distinct
+// (row, mask), so a set's rendering is built once and every later operation on it is
+// a table read. Stamped with the pool generation (method note 7).
+function msSetIntern(u: i32, mask: i32): i32 {
+  while msRowChain.length <= u { msRowChain.push(-1) }
+  let s = msRowChain[u]
+  while s >= 0 {
+    if msSetMask[s] == mask && msSetGen[s] == msGen.at { return s }
+    s = msSetNext[s]
+  }
+  const id = msSetRow.length
+  const txt = msRenderSet(u, mask)
+  msSetRow.push(u)
+  msSetMask.push(mask)
+  msSetGen.push(msGen.at)
+  msSetNext.push(msRowChain[u])
+  msSetText.push(txt)
+  msRowChain[u] = id
+  if txt != "" {
+    if (msSetByText[txt] ?? -1) < 0 { msSetByText[txt] = id }
+  }
+  id
+}
+
+// The set id of union row `u`'s FULL member set, or -1 when the row is uncovered.
+function msSetOfRow(u: i32): i32 {
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  msSetIntern(u, (1 << n) - 1)
+}
+
+// The set id for a member-set string — the bridge for a consumer still holding text. A set
+// the pool already rendered answers from the text index; otherwise the string must be some
+// union row's full member set, and a row whose recorded set matches hands over its members.
+// -1 = uncovered; an alias name (`N`) is deliberately kept as a one-atom set, like the legacy path.
+export function msSetOfText(set: string): i32 {
+  if set == "" { return -1 }
+  const hit = msSetByText[set] ?? -1
+  if hit >= 0 {
+    if msSetGen[hit] == msGen.at { return hit }
+  }
+  if (msSetMiss[set] ?? -1) == msGen.at { return -1 }
+  let u = 0
+  while u < unMemberSet.length {
+    if unMemberSet[u] == set {
+      const id = msSetOfRow(u)
+      if id >= 0 { return id }
+    }
+    u = u + 1
+  }
+  msSetMiss[set] = msGen.at
+  -1
+}
+
+// The rendered member set of `s` (see `msRenderSet`).
+export function msTextOf(s: i32): string {
+  if s < 0 || s >= msSetText.length { return "" }
+  msSetText[s]
+}
+
+// Appends the set's member spellings to `out`, in the row's recorded (box-tag ABI) order,
+// without re-splitting anything: the recorded member column is what `splitUnionAtoms` would
+// rebuild, since `msSetOfText` only hands back a set matching the row's own recorded string.
+// False = uncovered, `out` untouched, and the caller splits as before.
+export function msMemberAtomsOf(set: string, out: string[]): boolean {
+  msMemberAtomsOfSet(msSetOfText(set), out)
+}
+
+// `msMemberAtomsOf` for a caller that already holds the set id — the whole point of banking
+// one: `msSetOfText` is a text→set resolution (a map probe, or on a miss a linear scan of
+// every registered row); a consumer that already has its set from the narrowing table or an
+// earlier resolution has no reason to render it and look it up again.
+export function msMemberAtomsOfSet(s: i32, out: string[]): boolean {
+  if s < 0 { return false }
+  if s >= msSetRow.length { return false }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) { out.push(unMemAtoms[st + i]) }
+    i = i + 1
+  }
+  true
+}
+
+// MEMBERSHIP of the `null` keyword — a member-KIND test over the set's members, with
+// no string compare at all.
+export function msHasNull(s: i32): boolean {
+  if s < 0 || s >= msSetRow.length { return false }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return false }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemKinds[st + i] == 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// CARDINALITY of the non-`null` members — a bit count over the kind column.
+function msNonNullCount(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return 0 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return 0 }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let c = 0
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemKinds[st + i] != 0 { c = c + 1 }
+    }
+    i = i + 1
+  }
+  c
+}
+
+// The arena type of the set's sole member, or -1 when the set is empty, uncovered, or has
+// two or more members. The bridge from the set ADT to the per-type classifiers: a complement
+// narrowing subtracted down to one member (`i32 | null` minus `null`) binds that member's
+// type, so "what is this binding now" asks the type, not the rendered survivor.
+export function msSoleMemberTy(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  const mask = msSetMask[s]
+  let found = -1
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if found >= 0 { return -1 }
+      found = st + i
+    }
+    i = i + 1
+  }
+  if found < 0 { return -1 }
+  unMemTys[found]
+}
+
+// SUBTRACTION of the `null` keyword: clear every member whose KIND is the null token.
+export function msSubNull(s: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  let mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemKinds[st + i] == 0 { mask = mask - (1 << i) }
+    }
+    i = i + 1
+  }
+  msSetIntern(u, mask)
+}
+
+// SELECTION of one member by arena TYPE: clear every member the type is not. The write
+// half of the reads-only rule needs a member the CHECKER named, and it names it by arena
+// index — `msSubAtom`'s spelling identity cannot answer for a type with no written atom.
+export function msKeepTy(s: i32, ty: i32): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  if ty < 0 { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  let mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if !msTyCovers(ty, unMemTys[st + i]) { mask = mask - (1 << i) }
+    }
+    i = i + 1
+  }
+  if mask == 0 { return -1 }
+  msSetIntern(u, mask)
+}
+
+// Does `ty` cover member type `m`? A single type covers itself; a UNION covers each of its own
+// members, which is the shape an arm join hands back (`i32 | string` out of a three-arm
+// declaration). The set keeps the declared row and narrows only its mask, so box tags stay
+// positional whatever the join's own arena row looks like (D1846).
+function msTyCovers(ty: i32, m: i32): boolean {
+  if tySame(ty, m) { return true }
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let i = 0
+    while i < t.uMembers.length {
+      if tySame(t.uMembers[i], m) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// SUBTRACTION of a named member: clear every member whose interned IDENTITY is the
+// removed one. `msAtomIdOf` peels grouping parens on both sides, exactly as the
+// string surgery's `peelGroupParens` comparison did, so an `is () => i64` test still
+// strips the `(() => i64)` member.
+export function msSubAtom(s: i32, removed: string): i32 {
+  if s < 0 || s >= msSetRow.length { return -1 }
+  const u = msSetRow[s]
+  const st = msRowStart(u)
+  if st < 0 { return -1 }
+  const n = unMemTyCount[u]
+  const rid = msAtomIdOf(removed)
+  let mask = msSetMask[s]
+  let i = 0
+  while i < n {
+    if msBitSet(mask, i) {
+      if unMemAtomIds[st + i] == rid { mask = mask - (1 << i) }
+    }
+    i = i + 1
+  }
+  msSetIntern(u, mask)
+}
+
+// ── the set ADT's consumers (structure first, string surgery as fall-through) ──
+
+// Set SUBTRACTION — the else-branch complement of `is removed` / `!= null`. The
+// structural path resolves the set, clears the removed member's bits and renders the
+// survivors in the row's recorded ORDER; `removeAtomFrom`'s string surgery stays as
+// the fall-through for a set the pool does not cover.
+export function removeAtomFromSet(set: string, removed: string): string {
+  const s = msSetOfText(set)
+  if s >= 0 {
+    let r = -1
+    // `null` is a keyword, not a rendered shape — the one member the structural path
+    // identifies without any name at all, and the dominant removal (`!= null` else-branches).
+    if removed == "null" {
+      r = msSubNull(s)
+    } else {
+      r = msSubAtomOrView(s, removed)
+    }
+    if r >= 0 { return msTextOf(r) }
+  }
+  const out = removeAtomFrom(set, removed)
+  if out != set { return out }
+  const roIn = roListInnerName(removed)
+  if roIn != "" { return removeAtomFrom(set, roIn) }
+  out
+}
+
+// `msSubAtom`, where a set that spells a view's member as its list still loses it: the two are
+// one rep and one atom, so `is readonly f64[]` rules out an `f64[]` member (D2887).
+export function msSubAtomOrView(s: i32, removed: string): i32 {
+  const r = msSubAtom(s, removed)
+  if r != s { return r }
+  const roIn = roListInnerName(removed)
+  if roIn == "" { return r }
+  msSubAtom(s, roIn)
+}
+
+// The per-arm plan for `print(<value-union box>)`: the box-tag ABI-ordered value-atom kind of
+// every arm, appended to `out`, true only when every arm is a value `print` renders on its
+// own. Kinds 0..5 are `print`'s declared scalar/string domain (plus 6 for `null`); kinds
+// 7..13 (lists, closures) are containers with no defined print rendering and decline. D711.
+export function printNarrowKeepsBox(key: string): boolean {
+  const nv = narrowVariantFor(key)
+  if nv == "" { return true }
+  // A narrowing to a union ALIAS (`m[k] != null` over `{[string]: U}`) counts U's members (D3511).
+  unionMemberCount(unionMemberSetOf(nv)) > 1
+}
+
+// The narrowing key of a print argument: a name, a member path or an index path, else "".
+export function printNarrowKey(exprIx: i32): string {
+  const pe = P.nodes[unwrapParen(exprIx)]
+  if pe is Ident { return pe.identName }
+  if pe is Member { return memberPathKeyOf(unwrapParen(exprIx)) }
+  if pe is Index { return indexPathKeyOf(unwrapParen(exprIx)) }
+  ""
+}
+
+// The members a narrowing to two or more of them leaves a print argument's box holding, into
+// `live`; nothing when it is not so narrowed. A box with a record arm the narrowing excluded
+// prints from these alone (D3231).
+export function printNarrowLiveAtoms(exprIx: i32, live: string[]) {
+  const key = printNarrowKey(exprIx)
+  if key == "" { return 0 }
+  const nv = narrowVariantFor(key)
+  if nv == "" || unionMemberCount(unionMemberSetOf(nv)) < 2 { return 0 }
+  unionArmsOf(nv, live)
+  0
+}
+
+// Set while a read the narrowing pins to `null` is planned with that narrowing lifted: the plan
+// then skips a record arm rather than decline the box, since the narrowing ruled it out (D3231).
+export let printPlanNullPinned = false
+
+// Sets whether the print plan reads a `null`-pinned box; the previous setting, to restore.
+export function printPlanPinNull(on: boolean): boolean {
+  const was = printPlanNullPinned
+  printPlanNullPinned = on
+  was
+}
+
+// MEMBERSHIP of `null` in a member set, structurally.
+export function unionSetHasNull(set: string): boolean {
+  const s = msSetOfText(set)
+  if s >= 0 { return msHasNull(s) }
+  unionHasAtom(set, "null")
+}
+
+// CARDINALITY of a member set's non-`null` members, structurally.
+export function unionSetNonNullCount(set: string): i32 {
+  const s = msSetOfText(set)
+  if s >= 0 { return msNonNullCount(s) }
+  nonNullMemberCountOf(set)
+}
+
+// ── the arena duals of the union structural member classifiers ─────────────────
+
+// Each answers the same question `nameIs*` asked of a rendered atom spelling, from the
+// member's arena type instead — `nameIsMap` / `nameIsClosureArray` / `valueAtomKind(.) ==
+// 11` / `nameIsArray(.) && nameIsMap(refArrElemName(.))`.
+
+// A MAP member (`{[string]: V}`). The `nameIsMapMemberUnion` exclusion the name path
+// carries is structural here for free: a union whose FIRST atom is a map renders as a
+// `{[`-prefixed name but IS a `TyUnion`, never a `TyMap`.
+export function unMemIsMap(m: i32): boolean {
+  unMemPeelAliasWrapper(m) >= 0 && tyIsMapRow(unMemPeelAliasWrapper(m))
+}
+
+function tyIsMapRow(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyMap { return true }
+  false
+}
+
+export function unMemPeelAliasWrapper(m: i32): i32 {
+  if m < 0 { return m }
+  const t = T.tys[m]
+  if t is TyUnion {
+    if t.uMembers.length == 1 { return t.uMembers[0] }
+  }
+  m
+}
+
+// nullable-closure element (`(((i32) => boolean) | null)[]`) is a `TyNullable`
+// element, not a `TyFunc` — excluded here exactly as `nameIsClosureArray` excludes it.
+export function unMemIsFuncArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const e = T.tys[t.aElem]
+    if e is TyFunc { return true }
+  }
+  false
+}
+
+// An ARRAY-OF-MAP member (`{[string]: V}[]`). The name path's
+// `!nameIsMapMemberUnion(elem)` guard is again free: a map-member-UNION element is a
+// `TyUnion`, not a `TyMap`.
+export function unMemIsMapArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const e = T.tys[t.aElem]
+    if e is TyMap { return true }
+  }
+  false
+}
+
+// A ref-element array member — the structural dual of `markRefArrayArms`'s gate over a
+// member's rendered spelling: a `TyArray` whose element does not ride a scalar-leaf list
+// backing. Not the dual of `nameIsRefArray`, which is a strict subset (it also demands the
+// element be nameable by the reflist layer) — see the refutation at `unionHasRefArrayArmSlot`.
+export function unMemIsRefElemArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray {
+    const e = t.aElem
+    if e < 0 { return false }
+    if tyIsI32LeafElem(e) { return false }
+    if tyIsStrLeafElem(e) { return false }
+    const et = T.tys[e]
+    if et is TyPrim {
+      // Exhaustive over `PrimName` and `_`-less: the four scalar-list leaves are not
+      // ref-element arrays; `true` (below) is the real answer for the rest.
+      match et.primName {
+        "f64" => {
+          return false
+        }
+        "i64" => {
+          return false
+        }
+        "f32" => {
+          // A packed byte list is not a ref-element array either — without the `u8` arm below,
+          // `u8[]` fell through to `true` and took a reflist wrapper over its `$bl8` rep (#1805).
+          return false
+        }
+        "u8" => {
+          return false
+        }
+        "v128" => {
+          // A v128 element is a scalar, not a ref element (no v128[] in S1-S2).
+          return false
+        }
+        "i32" | "boolean" | "string" | "void" | "null" | "never" => {
+          // A ref-element leaf; the `true` below stands.
+        }
+      }
+    }
+    return true
+  }
+  false
+}
+
+// The value-atom kind of a union member, from the arena — the structural dual of
+// `valueAtomKind(atom)` over the member's rendered spelling, tested in the same order:
+// primitives by `primName`, an i32-backed leaf array as 7 (before the per-width numeric
+// lists and the string leaf array), a function type as 11. Anything else is -1.
+export function unMemAtomKind(m: i32): i32 {
+  if m < 0 { return -1 }
+  const t = T.tys[m]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that is a union-member atom must
+  // take a code here rather than the `-1` decline.
+  match t {
+    TyPrim => {
+      return valueAtomKind(t.primName)
+    }
+    TyArray => {
+      const e = t.aElem
+      if e < 0 { return -1 }
+      if tyIsI32LeafElem(e) {
+        const ubk = boolTagElemKind(e)
+        if ubk >= 0 { return ubk }
+        return 7
+      }
+      const et = T.tys[e]
+      if et is TyPrim {
+        // Exhaustive over `PrimName` and `_`-less over the per-width numeric + byte leaves; the
+        // string leaf and the `-1` decline below cover the rest.
+        match et.primName {
+          "f64" => {
+            return 8
+          }
+          "i64" => {
+            return 10
+          }
+          "f32" => {
+            return 12
+          }
+          "u8" => {
+            // The packed byte list — `valueAtomKind`'s `u8` arm; without it `is u8[]` fell
+            // past the value-atom arm to the struct-variant ladder and rejected.
+            return 13
+          }
+          "i32" | "boolean" | "string" | "void" | "null" | "never" | "v128" => {
+            // Not a per-width numeric or byte leaf; falls to the string/`-1` arms below.
+          }
+        }
+      }
+      if tyIsStrLeafElem(e) { return 9 }
+      return -1
+    }
+    TyFunc => {
+      return 11
+    }
+    TyErr | TyObj | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {
+      // Not a union-member atom; the arena declines.
+    }
+  }
+  -1
+}

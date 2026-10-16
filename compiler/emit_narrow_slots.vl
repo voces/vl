@@ -1,0 +1,497 @@
+// `emit_narrow_slots.vl` — the emitter's narrowing slots: which binding a narrow is
+// recorded against, when it is masked or retired, and the push/pop bits a scope carries.
+
+import { Ident, IfStmt, P, StrLit } from "./ast"
+import { nominalStructNameOfTy } from "./check_emit_queries"
+import { narrowKeyRoot } from "./check_getter_effects"
+import { nodeTyIxOf } from "./check_node_tys"
+import { litUnionAliasNameOfTy } from "./check_types"
+import { placeNarrowKeyOf, unwrapParen } from "./emit_base"
+import { ifArmValueExpr } from "./emit_query"
+import {
+  VKind,
+  collectByNode,
+  exprArmLocalsAny,
+  fnRefPushSlots,
+  fnUsesAtomStage,
+  fnUsesF32Push,
+  fnUsesF64Push,
+  fnUsesI64Push,
+  fnUsesNulStrPush,
+  fnUsesPush,
+  fnUsesRefPush,
+  fnUsesStrPush,
+  fnUsesU8Push,
+  globalIndexBySid,
+  globalStmts,
+  localBlockLet,
+  localByNode,
+  localDeclIx,
+  localIsRef,
+  localLitUnion,
+  localLoopIter,
+  localLoopVar,
+  localNames,
+  localPairIter,
+  localStructIdx,
+  narrowNames,
+  narrowRetired,
+  narrowTop,
+  narrowVariants,
+  scopeFrames,
+  uVariantRowBySid,
+} from "./emit_state"
+import { i32ListHas } from "./listutil"
+import { sidArrGet, sidLookup } from "./symbols"
+
+// The arena index of the `LetDecl` for the global symbol `sid`, or -1.
+export function globalLetOfSid(sid: i32) {
+  const gi = sidArrGet(globalIndexBySid, sid)
+  if gi < 0 { return -1 }
+  globalStmts[gi]
+}
+
+// The arena index of the `LetDecl` for the global `name`, or -1 if not a global.
+export function globalLetOf(name: string) { globalLetOfSid(sidLookup(name)) }
+
+// ── active `is`-narrowing scope ───────────────────────────────────────────────
+// The active narrowings are a stack of parallel columns, so nested guards over distinct union
+// locals each stay narrowed in the inner branch. A branch saves the stack length and truncates
+// on exit; `narrowTop` is the logical depth, rewound rather than popped.
+
+// Per key, the stack slots its pushes occupy, ascending among the live ones; per key ROOT,
+// the slots of the path keys under it (`o.v`, `xs[0]`). A query costs the key's own entries, not
+// the whole stack a long block grows. An entry is stale once its slot is at or above `narrowTop`
+// or holds another key.
+let narrowIdx: {[string]: i32[]} = Map()
+export let narrowPathIdx: {[string]: i32[]} = Map()
+
+// Forget both indexes, with the stack they describe.
+export function narrowIdxReset() {
+  narrowIdx = Map()
+  narrowPathIdx = Map()
+  0
+}
+
+// Whether slot `s` holds a pushed entry of `name`.
+function narrowSlotHolds(s: i32, name: string): boolean {
+  s >= 0 && s < narrowTop && narrowNames[s] == name
+}
+
+// Record slot `s` in `idx[key]`, keeping the live slots ascending (an `unmaskNarrow` re-adds
+// one below the newest).
+function narrowIdxAdd(idx: {[string]: i32[]}, key: string, s: i32) {
+  const got = idx[key]
+  if got == null { idx[key] = [] }
+  const l: i32[] = idx[key] ?? []
+  l.push(s)
+  let j = l.length - 1
+  while j > 0 && l[j - 1] > s {
+    l[j] = l[j - 1]
+    j = j - 1
+  }
+  l[j] = s
+  0
+}
+
+// Record the push now in slot `s`.
+export function narrowIdxPush(name: string, s: i32) {
+  narrowIdxAdd(narrowIdx, name, s)
+  const root = narrowKeyRoot(name)
+  if root != name { narrowIdxAdd(narrowPathIdx, root, s) }
+  0
+}
+
+// The stack slot of the innermost active narrowing of `name`, or -1 when `name` is not
+// narrowed — the one query every narrowing reader shares. A retired entry is skipped rather
+// than answering, so a name whose narrowing a write falsified reads at the declared rep;
+// skipping rather than stopping lets an outer narrowing of the same name still answer.
+export function narrowSlotOf(name: string): i32 {
+  if narrowTop == 0 { return -1 }
+  const l = narrowIdx[name]
+  if l == null { return -1 }
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, name) {
+      if narrowRetired[s] == 0 {
+        const root = narrowKeyRoot(name)
+        if root != name && narrowShadowSlot(root) > s { return -1 }
+        return s
+      }
+      if narrowRetired[s] == NARROW_SHADOW { return -1 }
+    } else if j == l.length - 1 {
+      l.pop()
+    }
+    j = j - 1
+  }
+  -1
+}
+
+// A `narrowRetired` value marking a slot as a shadow: a declaration of the name in an inner block,
+// which hides every narrowing below it until that block's `restoreNarrow` pops it (D3285).
+export const NARROW_SHADOW = 2
+
+// Whether a live narrowing of a path under the root `name` stands.
+export function narrowPathLive(name: string): boolean {
+  const l = narrowPathIdx[name]
+  if l == null { return false }
+  let j = 0
+  while j < l.length {
+    const s = l[j]
+    if s >= 0 && s < narrowTop && narrowRetired[s] == 0 { return true }
+    j = j + 1
+  }
+  false
+}
+
+// The slot of the innermost shadow of `name`, or -1.
+export function narrowShadowSlot(name: string): i32 {
+  const l = narrowIdx[name]
+  if l == null { return -1 }
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, name) && narrowRetired[s] == NARROW_SHADOW {
+      return s
+    }
+    j = j - 1
+  }
+  -1
+}
+
+// Retire every live narrowing of `name`. Called for a write the narrowing does not admit;
+// the entry is marked in place (see `narrowRetired`).
+export function retireNarrowFor(name: string) {
+  if narrowTop == 0 { return 0 }
+  const l = narrowIdx[name]
+  if l == null { return 0 }
+  // Down to the innermost shadow, which stays with everything below it: those narrow another
+  // binding. A retired entry answers again only through `unmaskNarrow`, which re-adds it.
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, name) {
+      if narrowRetired[s] == NARROW_SHADOW { break }
+      narrowRetired[s] = 1
+    }
+    j = j - 1
+  }
+  while l.length > j + 1 { l.pop() }
+  0
+}
+
+// Lift every live narrowing of `key` for the span of one read, returning the slots lifted so
+// `unmaskNarrow` restores exactly those; "" lifts nothing. A lifted slot reads as retired.
+export function maskNarrowFor(key: string): i32[] {
+  const out: i32[] = []
+  if key == "" { return out }
+  const l = narrowIdx[key]
+  if l == null { return out }
+  let j = l.length - 1
+  while j >= 0 {
+    const s = l[j]
+    if narrowSlotHolds(s, key) {
+      if narrowRetired[s] == NARROW_SHADOW { break }
+      if narrowRetired[s] == 0 {
+        narrowRetired[s] = 1
+        out.push(s)
+      }
+    }
+    j = j - 1
+  }
+  out
+}
+
+// Restore the slots `maskNarrowFor` lifted.
+export function unmaskNarrow(slots: i32[]) {
+  let i = 0
+  while i < slots.length {
+    narrowRetired[slots[i]] = 0
+    // A retirement between the mask and here may have dropped it from its key's list.
+    const nm = narrowNames[slots[i]]
+    const l = narrowIdx[nm]
+    if l == null || !i32ListHas(l, slots[i]) {
+      narrowIdxAdd(narrowIdx, nm, slots[i])
+    }
+    const root = narrowKeyRoot(nm)
+    const pl = narrowPathIdx[root]
+    if root != nm && (pl == null || !i32ListHas(pl, slots[i])) {
+      narrowIdxAdd(narrowPathIdx, root, slots[i])
+    }
+    i = i + 1
+  }
+  0
+}
+
+// `name` when its live narrowing pins `null`, else "". A `null` pin is a hint a call or a
+// closure may have falsified, so a later null re-test strips `null` from the declared set
+// rather than from the pin, which would leave nothing (D2815).
+export function nullPinnedKey(name: string): string {
+  if narrowVariantFor(name) == "null" { return name }
+  ""
+}
+
+// The variant a union local `name` is narrowed to in the current scope (the innermost
+// active binding within `narrowTop`), or "" if `name` is not currently narrowed.
+export function narrowVariantFor(name: string) {
+  const i = narrowSlotOf(name)
+  if i < 0 { return "" }
+  narrowVariants[i]
+}
+
+// The key of the name, member path or index place the active narrowing pins to `null` (`else`
+// of `x != null`), or "". A hint, not a proof: a loop back-edge, a closure or a call may write
+// the place after the test, so a consumer lifts it and tests the box at run time (D2801).
+export function narrowedToNullKey(exprIx: i32): string {
+  if narrowTop == 0 || exprIx < 0 { return "" }
+  const ix = unwrapParen(exprIx)
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  let key = placeNarrowKeyOf(ix)
+  const n = P.nodes[ix]
+  if n is Ident { key = n.identName }
+  if key == "" || narrowVariantFor(key) != "null" { return "" }
+  key
+}
+
+// The `uVariants` spelling of an `is`-tested type: the author's own spelling when it names a
+// variant row, otherwise the declared name of the struct that spelling's type equals. The
+// emitter resolves an `is` test by an exact string compare against `uVariants`, so which
+// spellings work is decided by which got registered. Two gates read it, so both must ask here.
+export function isVariantSpelling(variant: string, tyIx: i32): string {
+  if variantIndexOf(variant) >= 0 { return variant }
+  const nomn = nominalStructNameOfTy(tyIx)
+  if nomn != "" {
+    if variantIndexOf(nomn) >= 0 { return nomn }
+  }
+  variant
+}
+
+// The name index over `localNames`: the first slot of each name, and per slot the next slot
+// of the same name, so a name's slots are a chain in ascending order and a lookup costs the
+// chain rather than the frame. `lixLen` is how many slots it covers; any other length means
+// `localNames` got reset behind it, and the next use rebuilds (D2090).
+export let lixFirst: {[string]: i32} = Map()
+let lixLast: {[string]: i32} = Map()
+let lixNext: i32[] = []
+export let lixLen = 0
+export let lixDup = false
+
+export function lixRebuild() {
+  lixFirst = Map()
+  lixLast = Map()
+  lixNext = []
+  lixLen = 0
+  lixDup = false
+  while lixLen < localNames.length { lixAppend(lixLen) }
+  0
+}
+
+function lixAppend(pos: i32) {
+  const name = localNames[pos]
+  const last = lixLast[name] ?? -1
+  lixNext.push(-1)
+  if last >= 0 {
+    lixNext[last] = pos
+    lixDup = true
+  } else {
+    lixFirst[name] = pos
+  }
+  lixLast[name] = pos
+  lixLen = pos + 1
+  0
+}
+
+// The first declared-local slot named `name`, or -1; walk on with `lixNextOf`.
+export function lixFirstOf(name: string) {
+  if lixLen != localNames.length { lixRebuild() }
+  lixFirst[name] ?? -1
+}
+
+export function lixNextOf(pos: i32) { lixNext[pos] }
+
+// Append the declared-local name `name` to `localNames` as a fresh slot — one wasm local per
+// lexical binding, with no dedupe by name, so two same-named `let`s in disjoint branches get
+// distinct slots and distinct valtypes. `structIdx` is the local's struct table index when it
+// is a ref, else -1. Returns the new slot's position (its wasm index is `paramCount + pos`).
+export function addLocalName(name: string, isRef: VKind, structIdx: i32) {
+  const pos = localNames.length
+  if lixLen != pos { lixRebuild() }
+  localNames.push(name)
+  lixAppend(pos)
+  localIsRef.push(isRef)
+  localStructIdx.push(structIdx)
+  localLoopVar.push(0)
+  // Block-scoped when the collect walk is inside a nested block: depth 1 is the frame's own
+  // statement list, deeper is a block whose bindings die at its `}`. Every call site sits
+  // inside `collectLocals` or `collectStartLocals`, so the depth is the caller's answer.
+  let inBlk = 0
+  if scopeFrames.length > 1 { inBlk = 1 }
+  localBlockLet.push(inBlk)
+  localLoopIter.push(-1)
+  localPairIter.push(-1)
+  localDeclIx.push(-1)
+  localLitUnion.push(0)
+  // Filled only while some arm local is allocated by node; empty, the cursor never steps over.
+  if exprArmLocalsAny {
+    let byNode = 0
+    if collectByNode > 0 { byNode = 1 }
+    localByNode.push(byNode)
+  }
+  pos
+}
+
+// Pin the `LetDecl` that declared the slot, so a question only the declaration can answer
+// resolves from the slot the scope stack hands out. The `LetDecl` twin of `markLoopVarIter`.
+export function markLocalDecl(slot: i32, declIx: i32) {
+  if slot >= 0 { localDeclIx[slot] = declIx }
+  0
+}
+
+// Hide a function's own binding of a name a module global also binds until its declaration,
+// as a nested block's binding is: a read above the `let` denotes the global (D2664).
+export function markLetOverGlobal(slot: i32, name: string) {
+  if slot >= 0 && globalLetOf(name) >= 0 { localBlockLet[slot] = 1 }
+  0
+}
+
+// Mark the declared-local slot as a loop variable. A loop var's scope is the loop: while it is
+// live the scope stack resolves it, and once its loop closes it must not be resolvable again —
+// but the flat `localNames` fallback scan would still find it, since that serves the scope-less
+// detection passes. `declaredIndexOf` therefore skips flagged slots in its fallback.
+export function markLoopVarSlot(slot: i32) {
+  localLoopVar[slot] = 1
+  0
+}
+
+// Mark the declared-local slot as a for-in element loop variable and pin the iterable node its
+// loop iterates, so a question only the iterable can answer resolves from the slot the scope
+// stack hands out rather than from the loop var's name. The `for`-counter form has no iterable
+// and keeps the plain `markLoopVarSlot`.
+export function markLoopVarIter(slot: i32, iterIx: i32) {
+  localLoopVar[slot] = 1
+  localLoopIter[slot] = iterIx
+  0
+}
+
+// Pin the map a `for k, v in m` walk iterates on the slot its second name binds, so the
+// value's union member set resolves from the map's vals slot as `.values()`'s would.
+export function markPairVarIter(slot: i32, iterIx: i32) {
+  if slot >= 0 { localPairIter[slot] = iterIx }
+  0
+}
+
+// The `.push` and `.pop` element-kind selector threaded through the reservation walkers.
+// `pop` only uses i32, ref and str.
+export type PushKind = "i32" | "ref" | "str" | "f64" | "i64" | "f32" | "u8"
+
+// The scratch pre-scan carries all the PushKinds as one bitmask, least-significant first in
+// declaration order, so a single body walk classifies every `.push` and `.pop` receiver once
+// rather than one whole-body walk per kind per query.
+export function pushKindBit(kind: PushKind) {
+  match kind {
+    "i32" => {
+      return 1
+    }
+    "ref" => {
+      return 2
+    }
+    "str" => {
+      return 4
+    }
+    "f64" => {
+      return 8
+    }
+    "i64" => {
+      return 16
+    }
+    "f32" => {
+      return 32
+    }
+    // Bit 64 is taken by the additive `(string | null)[]` value-slot marker (see
+    // `pushKindBitsOf`), so the packed byte list takes 128.
+    "u8" => {
+      return 128
+    }
+  }
+}
+
+// True when the value `if` at `ix` meets an atom destination arm by arm: each arm's value is
+// narrowed where it is produced, so no arm is widened to a string and narrowed back, and the
+// join itself is never staged. An else-less `if` is a nullable value and is not a member.
+export function ifJoinNarrowsPerArm(ix: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if n is IfStmt { return n.ifElse >= 0 }
+  false
+}
+
+// True when every value of the `if` chain at `ix` is a string literal, as a generic body's join
+// is that the checker typed `string` while its pin's destination is a literal union (D3423).
+export function ifJoinArmsAllStrLit(ix: i32): boolean {
+  if !ifJoinNarrowsPerArm(ix) { return false }
+  const todo: i32[] = [ix]
+  let guard = 0
+  while todo.length > 0 {
+    guard = guard + 1
+    if guard > 64 { return false }
+    const at = unwrapParen(todo.pop() ?? -1)
+    if at < 0 { return false }
+    const a = P.nodes[at]
+    if a is IfStmt {
+      if a.ifElse < 0 { return false }
+      todo.push(ifArmValueExpr(a.ifThen))
+      if P.nodes[a.ifElse] is IfStmt {
+        todo.push(a.ifElse)
+      } else {
+        todo.push(ifArmValueExpr(a.ifElse))
+      }
+    } else if !(a is StrLit) {
+      return false
+    }
+  }
+  true
+}
+
+// True when the value `if` at `ix` records a registered literal-union type, so it is an atom
+// whatever its arms' own reps are: every arm is lowered in the atom context, and a binding of
+// it takes the atom slot its type names (D2206). Asked by member set, as a binding's rep is: a
+// join mints a fresh index even when its set is a declared alias's (D2208).
+export function ifJoinTypedAtom(ix: i32): boolean {
+  if !ifJoinNarrowsPerArm(ix) { return false }
+  litUnionAliasNameOfTy(nodeTyIxOf(ix)) != ""
+}
+
+// Or a push/pop kind mask into the per-function `fnUses*Push` scratch-frame flags; a `.push`
+// and a `Member`-receiver `.pop` of the same kind share a frame. Bit 512, the staging tell
+// `emitPush` reads, reserves nothing and is ignored here.
+export function applyPushPopBits(bits: i32) {
+  if (bits & 1) != 0 { fnUsesPush = true }
+  if (bits & 2) != 0 { fnUsesRefPush = true }
+  if (bits & 4) != 0 { fnUsesStrPush = true }
+  if (bits & 64) != 0 { fnUsesNulStrPush = true }
+  if (bits & 8) != 0 { fnUsesF64Push = true }
+  if (bits & 16) != 0 { fnUsesI64Push = true }
+  if (bits & 32) != 0 { fnUsesF32Push = true }
+  if (bits & 128) != 0 { fnUsesU8Push = true }
+  if (bits & 256) != 0 { fnUsesAtomStage = true }
+  0
+}
+
+// Append the ref-list table slot of a ref `.push` receiver to `fnRefPushSlots` if not already
+// present, so each distinct pushed element type gets its own typed scratch frame. A receiver
+// whose slot does not resolve (-1) records nothing: no row exists to type a frame with.
+export function recordRefPushSlot(slot: i32) {
+  if slot < 0 { return 0 }
+  let i = 0
+  while i < fnRefPushSlots.length {
+    if fnRefPushSlots[i] == slot { return 0 }
+    i = i + 1
+  }
+  fnRefPushSlots.push(slot)
+  0
+}
+
+export function variantIndexOf(name: string) {
+  sidArrGet(uVariantRowBySid, sidLookup(name))
+}

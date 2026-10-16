@@ -1,0 +1,988 @@
+// `emit_obj_lit_fits.vl` — whether an object literal or field fits a row, and the
+// leaf an arm path reaches.
+
+import {
+  BoolLit,
+  CharLit,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  Index,
+  LetDecl,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  P,
+  Param,
+  Paren,
+  StrLit,
+  TypeRef,
+} from "./ast"
+import { nodeRepTyIxOf } from "./check_core_state"
+import { nodeArrayElemName } from "./check_emit_queries"
+import { nodeTyMapValIsLitUnion, nodeTyMapValName } from "./check_hole_pins"
+import { nodeTyIsMap, nodeTyIsStructArray, nodeTyIxOf } from "./check_node_tys"
+import { fieldNameOrder } from "./check_obj_shape"
+import { isValueUnionName, valueAtomKind } from "./check_ty_rep"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyBearsNull,
+  tyFieldTyOf,
+  tyIsRecord,
+  tySame,
+  tyToEmitName,
+} from "./check_types"
+import {
+  declRowFieldKindFits,
+  fieldKindWidens,
+  fieldScalarKindOf,
+  sFieldTgtStructIdx,
+  sFieldTypeAt,
+  variantFieldElemName,
+  variantFieldIsLitUnion,
+  variantFieldTypeAt,
+} from "./emit_atom_kinds"
+import {
+  nullablePartOf,
+  objFieldVal,
+  parentLetOf,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
+import { fnIndexOfInScopeAt } from "./emit_local_scope"
+import { annBareRefArrSlot, tyRefArrElemOf } from "./emit_map_value_slots"
+import { annIsU8Array, retNulRefArrFlag } from "./emit_nullable_rets"
+import {
+  paramArray,
+  paramF32Array,
+  paramF64Array,
+  paramI64Array,
+  paramIndexOf,
+  paramNulList,
+  paramStringArray,
+  paramTypeNode,
+} from "./emit_query"
+import { nullValKind } from "./emit_rep"
+import {
+  emptyArrLitIxOf,
+  mvValKindOfName,
+  mvValNamesCompat,
+  refArrElemNameIf,
+  rlSlotByName,
+  structIndexOfTypeName,
+} from "./emit_shape_rows"
+import {
+  FC_STRUCT,
+  FC_UNION,
+  MVK_MONO,
+  VKind,
+  fnStmts,
+  localIsRef,
+  localStructIdx,
+  rlElemName,
+  sFieldCount,
+  sFieldNames,
+  sFieldStart,
+  sTyIx,
+  uFieldCount,
+  uFieldLitTyIx,
+  uFieldNames,
+  uFieldStart,
+  uFieldTyText,
+  uFieldTypes,
+  uVarHeap,
+  uVarTyIx,
+  uVariants,
+  unVarCount,
+  unVarStart,
+} from "./emit_state"
+import { declaredSlotOf, rlSlotOfTy, sFieldIndex } from "./emit_struct_order"
+import { nodeTyInOf } from "./emit_ty_canon"
+import { registerValueUnionName } from "./emit_union_atoms"
+import { unionRowOf } from "./emit_union_registry"
+import { variantSig } from "./emit_variant_sig"
+import { strListHas } from "./listutil"
+import { sidArrGet, sidArrPut, sidLookup, sidOf } from "./symbols"
+import {
+  litSetBaseTy,
+  nonNullTy,
+  tyHasTyVar,
+  tyLitSetMemberLexes,
+  tyPeelNul,
+} from "./tyquery"
+
+// A ref-array member whose element type reaches a function type — the structural dual
+// of the deliberately-conservative `strContains(refArrElemName(a), "=>")` arm test
+// (`calleeIsUnionElemFieldClosure`). Depth-bounded and cycle-tolerant by the bound.
+export function unMemIsFuncReachArray(m: i32): boolean {
+  if m < 0 { return false }
+  const t = T.tys[m]
+  if t is TyArray { return tyReachesFuncD(t.aElem, 12) }
+  false
+}
+
+// ── the union arm-path walk, from the arena ─────────────────────────────────────
+
+// The `unionArmPath*` family answers "does this union arm's field path `a.b.c` leaf at a
+// map / a list-of-maps / a closure / a closure-array / a closure-carrying value" by walking
+// the arena structurally instead of the emitter's per-field lowering codes — narrowing-blind
+// and conservative, so an unresolvable arm answers "no".
+
+// The arena type of field `name` of the object type `ty` (nullable-peeled — a code-15
+// hop follows `S` and `S | null` alike), or -1 when `ty` is not an object or has no
+// such field.
+function tyObjFieldTy(ty: i32, name: string): i32 {
+  const b = tyPeelNul(ty)
+  if b < 0 { return -1 }
+  const t = T.tys[b]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldNames.length {
+      if t.objFieldNames[i] == name { return t.objFieldTypes[i] }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Walks the field path `path` from the union member type `m` and returns the arena type of
+// the leaf field, or -1. Mid hops must be object-typed — a map/union-box/list mid field
+// yields no field — mirroring the lowering-code walk's own `code != 15` guard. The leaf
+// comes back unclassified so each consumer applies its own predicate.
+function tyArmPathLeaf(m: i32, path: string[]): i32 {
+  if m < 0 || path.length == 0 { return -1 }
+  let cur = m
+  let hop = 0
+  while hop < path.length {
+    const ft = tyObjFieldTy(cur, path[hop])
+    if ft < 0 { return -1 }
+    if hop == path.length - 1 { return ft }
+    cur = ft
+    hop = hop + 1
+  }
+  -1
+}
+
+// `tyArmPathIsMap`'s leaf: a MAP field (code 19). NOT nullable-peeled — a
+// `{[string]: V} | null` field is code 29, which the code walk does not accept.
+export function tyArmPathIsMap(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyMap { return true }
+  false
+}
+
+// `tyArmPathIsMapList`'s leaf: a LIST-OF-MAPS field (code 5 whose element renders as
+// a map) — a `TyArray` over a `TyMap`.
+export function tyArmPathIsMapList(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const e = T.tys[t.aElem]
+    if e is TyMap { return true }
+  }
+  false
+}
+
+// `tyArmPathIsClosure`'s leaf: a closure field (code 14) or its nullable niche
+// (code 22) — a `TyFunc`, bare or under one `TyNullable`.
+export function tyArmPathIsClosure(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const b = tyPeelNul(leaf)
+  if b < 0 { return false }
+  const t = T.tys[b]
+  if t is TyFunc { return true }
+  false
+}
+
+// `tyArmPathIsCloArray`'s leaf: a closure-element array field (code 5 whose element
+// name carries a top-level arrow) — a `TyArray` over a `TyFunc`. A nullable-closure
+// element is a `TyNullable`, excluded here exactly as the arrow scan excludes it (the
+// arrow sits under the element's own parens, never at depth 0).
+export function tyArmPathIsCloArray(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const t = T.tys[leaf]
+  if t is TyArray {
+    if t.aElem < 0 { return false }
+    const e = T.tys[t.aElem]
+    if e is TyFunc { return true }
+  }
+  false
+}
+
+// `tyArmPathHasCloValue`'s leaf: a closure field (14/22) or a union-box field (16) whose
+// member set has a bare-closure arm — a `TyFunc`, or a `TyUnion` with a `TyFunc` member.
+// Both are nullable-peeled: an `((i32) => i32) | null` field is code 22, and a `(A | B) |
+// null` box field keeps its `null` atom in the member set the code walk consults.
+export function tyArmPathHasCloValue(m: i32, path: string[]): boolean {
+  const leaf = tyArmPathLeaf(m, path)
+  if leaf < 0 { return false }
+  const b = tyPeelNul(leaf)
+  if b < 0 { return false }
+  const t = T.tys[b]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a closure value must
+  // be asked here rather than take the `false`.
+  match t {
+    TyFunc => {
+      return true
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        const mt = T.tys[tyPeelNul(t.uMembers[i])]
+        if mt is TyFunc { return true }
+        i = i + 1
+      }
+    }
+    TyPrim | TyErr | TyObj | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // Holds no closure value at this level.
+    }
+  }
+  false
+}
+
+// True when `ty` contains a `TyFunc` anywhere in its structure (fields, elements, map
+// values, nullable inners, union members) within `depth` wrapper hops.
+export function tyReachesFuncD(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a function owes this
+  // walk a descent, and a silent leaf answers `false` for a type that reaches one.
+  match t {
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return tyReachesFuncD(t.aElem, depth - 1)
+    }
+    TyNullable => {
+      return tyReachesFuncD(t.nInner, depth - 1)
+    }
+    TyMap => {
+      return tyReachesFuncD(t.mVal, depth - 1)
+    }
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if tyReachesFuncD(t.uMembers[i], depth - 1) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    TyObj => {
+      let j = 0
+      while j < t.objFieldTypes.length {
+        if tyReachesFuncD(t.objFieldTypes[j], depth - 1) { return true }
+        j = j + 1
+      }
+      return false
+    }
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {
+      // A leaf: nothing under it to reach a function.
+    }
+  }
+  false
+}
+
+// The map-value compat of an object literal's field value against a candidate variant's
+// code-19 field: the literal's checker-recorded map value type must not contradict the
+// variant's recorded value rep. Lenient when the value isn't classifiable as a map (it
+// fails loudly downstream); an atom-valued literal field is compatible with any mono elem.
+export function objMapFieldCompat(
+  objIx: i32,
+  fname: string,
+  elem: string,
+): boolean {
+  const valIx = objFieldVal(objIx, fname)
+  if valIx < 0 { return true }
+  if !nodeTyIsMap(valIx) { return true }
+  if nodeTyMapValIsLitUnion(valIx) { return mvValKindOfName(elem) == MVK_MONO }
+  mvValNamesCompat(nodeTyMapValName(valIx), elem)
+}
+
+// Whether a literal's map-typed field value has variant `vi`'s key type and is a `Set` exactly
+// when that field is — the columns the value rep alone cannot see (D2493, D4056). True when
+// either side's arena type is unknown, open, or not a map.
+export function objMapFieldKeyFits(
+  objIx: i32,
+  fname: string,
+  vi: i32,
+): boolean {
+  const valIx = objFieldVal(objIx, fname)
+  if valIx < 0 || vi < 0 || vi >= uVarTyIx.length { return true }
+  const vt = nodeRepTyIxOf(valIx)
+  const ft = tyFieldTyOf(uVarTyIx[vi], fname)
+  if vt < 0 || vt >= T.tys.length || ft < 0 || ft >= T.tys.length {
+    return true
+  }
+  const t = T.tys[vt]
+  const f = T.tys[ft]
+  if !(t is TyMap) || !(f is TyMap) { return true }
+  if t.mKey < 0 || tyHasTyVar(t.mKey) || tyHasTyVar(vt) { return true }
+  t.mSet == f.mSet && tySame(t.mKey, f.mKey)
+}
+
+// The nested-struct compat of an object literal's field value against a candidate
+// variant's code-15 field: a nested literal value fits the target struct by
+// `objLitFitsRow`. A non-literal value stays lenient (it fails loudly downstream if wrong).
+export function objNestedFieldCompat(
+  objIx: i32,
+  fname: string,
+  elem: string,
+): boolean {
+  const valIx = objFieldVal(objIx, fname)
+  if valIx < 0 { return true }
+  objLitFitsRow(unwrapParen(valIx), structIndexOfTypeName(elem), 8, true)
+}
+
+// Whether the object literal at `litIx` fits struct row `si`: each scalar field of a kind the
+// row's stores (`declRowFieldKindFits`) and each nested literal fitting its own target row, to
+// `depth` levels (D3031); with `exact`, also the same field-name set, less any nullable field
+// the literal leaves out (D4601). True for a non-literal or an unknown row.
+export function objLitFitsRow(
+  litIx: i32,
+  si: i32,
+  depth: i32,
+  exact: boolean,
+): boolean {
+  if litIx < 0 || si < 0 || si >= sFieldCount.length || depth <= 0 {
+    return true
+  }
+  const v = P.nodes[litIx]
+  if v is ObjLit {
+    if exact && v.objFields.length > sFieldCount[si] { return false }
+    let present = 0
+    let fi = 0
+    while fi < sFieldCount[si] {
+      const name = sFieldNames[sFieldStart[si] + fi]
+      const fv = objFieldVal(litIx, name)
+      if fv >= 0 { present = present + 1 }
+      if fv < 0 {
+        if exact && !structRowFieldMayOmit(si, name) { return false }
+      } else if sFieldTypeAt(si, fi) == FC_STRUCT {
+        if (
+          !objLitFitsRow(
+            unwrapParen(fv),
+            sFieldTgtStructIdx(si, fi),
+            depth - 1,
+            exact,
+          )
+        ) {
+          return false
+        }
+      } else if !declRowFieldKindFits(litIx, name, si, fi) {
+        return false
+      }
+      fi = fi + 1
+    }
+    if exact && present != v.objFields.length { return false }
+  }
+  true
+}
+
+// Whether struct row `si`'s field `name` bears null, so a literal may leave it out; true when
+// the row records no type to ask.
+function structRowFieldMayOmit(si: i32, name: string): boolean {
+  if si < 0 || si >= sTyIx.length { return true }
+  const ty = sTyIx[si]
+  if ty < 0 || ty >= T.tys.length { return true }
+  const o = T.tys[ty]
+  if !(o is TyObj) { return true }
+  let k = 0
+  while k < o.objFieldNames.length {
+    if o.objFieldNames[k] == name { return tyBearsNull(o.objFieldTypes[k]) }
+    k = k + 1
+  }
+  true
+}
+
+// The signature of the object literal at `objIx` — its field names in `fieldNameOrder`,
+// comma-joined, the construction `variantSig` applies to a variant's own already-canonical
+// name column. Duplicate names are kept, so two spellings differ exactly where the sets do.
+export function objLitFieldSig(objIx: i32) {
+  const o = P.nodes[objIx]
+  const names: string[] = []
+  if o is ObjLit {
+    let i = 0
+    while i < o.objFields.length {
+      const f = P.nodes[o.objFields[i]]
+      // One name per ENTRY, so the signature counts what the matcher counts. A malformed
+      // entry contributes "", which no variant field can spell, so it matches nothing —
+      // the answer the matcher reaches by failing to find that entry's name.
+      let nm = ""
+      if f is FieldInit { nm = f.fiName }
+      names.push(nm)
+      i = i + 1
+    }
+  }
+  fieldNamesSig(names)
+}
+
+// The signature of a field-name list: the names in `fieldNameOrder`, comma-joined.
+export function fieldNamesSig(names: string[]) {
+  const ord = fieldNameOrder(names)
+  let out = ""
+  let j = 0
+  while j < ord.length {
+    if j > 0 { out = out + "," }
+    out = out + names[ord[j]]
+    j = j + 1
+  }
+  out
+}
+
+// The variant buckets by signature: `ovnHeadBySid` holds the first variant row at each
+// signature's interned id, `ovnTailBySid` the last, `ovnNext` the next row sharing it, all in
+// ascending row order. Rebuilt when the variant table or either span column moves.
+let ovnHeadBySid: i32[] = []
+let ovnTailBySid: i32[] = []
+let ovnNext: i32[] = []
+let ovnVarsLen = -1
+let ovnStartLen = -1
+let ovnCountLen = -1
+
+// Drops the buckets. `collectU` rebuilds the variant table from empty and a second module can
+// refill it to the same three lengths with different names, which the stamp cannot see; the
+// signature ids are sid-keyed too, and a sid means nothing in the next program.
+export function objVariantIndexDrop() {
+  ovnHeadBySid = []
+  ovnTailBySid = []
+  ovnNext = []
+  ovnVarsLen = -1
+  ovnStartLen = -1
+  ovnCountLen = -1
+  0
+}
+
+// Fills the buckets from the variant table. Every row is appended to its signature's chain,
+// so a chain lists its rows in the order the scan this replaces visited them.
+function ovnBuild() {
+  ovnHeadBySid = []
+  ovnTailBySid = []
+  ovnNext = []
+  ovnVarsLen = uVariants.length
+  ovnStartLen = uFieldStart.length
+  ovnCountLen = uFieldCount.length
+  let vi = 0
+  while vi < uVariants.length {
+    ovnNext.push(-1)
+    if vi < uFieldStart.length && vi < uFieldCount.length {
+      const s = sidOf(variantSig(vi))
+      // The tail is kept beside the head so an append is a write, not a walk: a program whose
+      // variants all share one signature would otherwise make this build quadratic in them.
+      const tail = sidArrGet(ovnTailBySid, s)
+      if tail < 0 { sidArrPut(ovnHeadBySid, s, vi) } else { ovnNext[tail] = vi }
+      sidArrPut(ovnTailBySid, s, vi)
+    }
+    vi = vi + 1
+  }
+  0
+}
+
+// Whether variant `vi` stores field `name` of the object literal at `objIx` at the scalar kind
+// the checker gave it, by `declRowFieldKindFits`'s rule: an `i32` field is no `string` slot,
+// whatever names the two share (D3024). Refutation only: an unknown kind on either side agrees.
+export function variantFieldKindFits(
+  objIx: i32,
+  name: string,
+  vi: i32,
+): boolean {
+  if vi < 0 || vi >= uVarTyIx.length { return true }
+  const vt = uVarTyIx[vi]
+  if vt < 0 || vt >= T.tys.length { return true }
+  const rft = tyFieldTyOf(vt, name)
+  let rk = fieldScalarKindOf(rft)
+  // An integer literal set stores as its base scalar.
+  if rk == 0 && litSetBaseTy(rft) >= 0 {
+    rk = fieldScalarKindOf(litSetBaseTy(rft))
+  }
+  // The field value's own type refutes across kind classes only: a literal typed by its
+  // union destination may carry the destination's arm, while a width still adapts. A record
+  // value is no scalar field, and a scalar value no record one.
+  const fv = objFieldVal(objIx, name)
+  let vk = 0
+  if fv >= 0 { vk = fieldScalarKindOf(nodeRepTyIxOf(fv)) }
+  if rk == 0 {
+    if fv >= 0 && fieldValueIsRecord(fv) {
+      return tyHoldsRecord(nonNullTy(rft))
+    }
+    if !tyIsRecord(nonNullTy(rft)) { return true }
+    return vk == 0 && !fieldValueIsScalarLit(fv)
+  }
+  if fv >= 0 && fieldValueIsRecord(fv) { return false }
+  let lk = 0
+  const ot = nodeRepTyIxOf(objIx)
+  if ot >= 0 && ot < T.tys.length {
+    lk = fieldScalarKindOf(tyFieldTyOf(ot, name))
+  }
+  if vk != 0 && fieldKindClass(vk) != fieldKindClass(rk) { return false }
+  if lk == 0 { lk = vk }
+  if lk == 0 { return true }
+  // A string value may be a member of a string literal set; a literal one is asked.
+  if (lk == 6 || lk == 14) && (rk == 7 || rk == 15) {
+    if fv < 0 { return true }
+    const lit = P.nodes[unwrapParen(fv)]
+    if lit is StrLit {
+      return strListHas(tyLitSetMemberLexes(nonNullTy(rft)), lit.strText)
+    }
+    return true
+  }
+  fieldKindWidens(lk, rk)
+}
+
+// Whether field value node `fv` is a record: an object literal, or typed as a record.
+function fieldValueIsRecord(fv: i32): boolean {
+  if P.nodes[unwrapParen(fv)] is ObjLit { return true }
+  const t = nodeRepTyIxOf(fv)
+  t >= 0 && tyIsRecord(t)
+}
+
+// Whether field value node `fv` is a number, string, char or boolean literal.
+function fieldValueIsScalarLit(fv: i32): boolean {
+  if fv < 0 { return false }
+  const n = P.nodes[unwrapParen(fv)]
+  n is NumLit || n is StrLit || n is CharLit || n is BoolLit
+}
+
+// Whether type `t` is a record or a union with a record member.
+function tyHoldsRecord(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return true }
+  if tyIsRecord(t) { return true }
+  const u = T.tys[t]
+  if u is TyUnion {
+    let i = 0
+    while i < u.uMembers.length {
+      const m = u.uMembers[i]
+      if m >= 0 && m < T.tys.length && tyIsRecord(m) { return true }
+      i = i + 1
+    }
+  }
+  false
+}
+
+// The class of a `fieldScalarKindOf` kind, nullability dropped: 1 numeric, 2 `boolean`,
+// 3 a string or string literal set, 0 none.
+function fieldKindClass(k: i32): i32 {
+  let b = k
+  if b > 8 { b = b - 8 }
+  if b == 1 || b == 3 || b == 4 || b == 5 { return 1 }
+  if b == 2 { return 2 }
+  if b == 6 || b == 7 { return 3 }
+  0
+}
+
+// The first variant row whose signature is `sig`, or -1. Rebuilds first when the stamp
+// disagrees, so a caller can never read a chain the current variant table did not produce.
+export function ovnFirst(sig: string) {
+  if (
+    ovnVarsLen != uVariants.length
+    || ovnStartLen != uFieldStart.length
+    || ovnCountLen != uFieldCount.length
+  ) {
+    ovnBuild()
+  }
+  sidArrGet(ovnHeadBySid, sidLookup(sig))
+}
+
+// The next variant row sharing `vi`'s signature, or -1. Only reached through `ovnFirst`,
+// which is what makes the chain current.
+export function ovnNextOf(vi: i32) {
+  if vi < 0 || vi >= ovnNext.length { return -1 }
+  ovnNext[vi]
+}
+
+// Does the union registered under `set` carry a struct arm — a variant a `{…}` value could
+// be stored as? Refutation-only: an unregistered set answers yes, since a helper that refutes
+// must never refute on ignorance. `unVarCount == 0` is the one positive fact this can state —
+// a union of atoms alone (`i32 | null`) has nowhere to put a struct.
+export function unionSetCanHoldStruct(set: string): boolean {
+  const u = unionRowOf(set)
+  if u < 0 { return true }
+  unVarCount[u] > 0
+}
+
+// True if the plain struct at table index `ssi` has the same field layout (name set, count,
+// per-field type code) as the union-variant arm `vi` — the struct-index dual of
+// `objMatchesVariantIdxOmit`. Recognizes a struct-typed value (an ident/call result, built as a
+// distinct heap type from the arm's variant struct) as a union member so it can be re-boxed.
+export function structIdxMatchesVariantIdx(ssi: i32, vi: i32): boolean {
+  if ssi < 0 { return false }
+  // The bound this parallel-table read lacked: an unguarded read past these arrays traps the
+  // compiler instead of surfacing the diagnostic `emitFail` already recorded.
+  if ssi >= sFieldCount.length { return false }
+  if vi < 0 { return false }
+  if vi >= uFieldCount.length { return false }
+  const cnt = uFieldCount[vi]
+  if cnt != sFieldCount[ssi] { return false }
+  const start = uFieldStart[vi]
+  let fj = 0
+  while fj < cnt {
+    const fname = uFieldNames[start + fj]
+    const sfi = sFieldIndex(ssi, fname)
+    if sfi < 0 { return false }
+    if sFieldTypeAt(ssi, sfi) != uFieldTypes[start + fj] { return false }
+    fj = fj + 1
+  }
+  true
+}
+
+// The union variant arm (of `unionSet`) whose own heap type IS `heapIx`, or -1 — the rep dual
+// of the layout compare above. A value already built as the arm's heap type rides the box's
+// anyref unchanged, so its tag is the whole of what boxing it needs.
+export function unionArmVariantWithHeap(unionSet: string, heapIx: i32): i32 {
+  if heapIx < 0 { return -1 }
+  const u = unionRowOf(unionSet)
+  if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return -1 }
+  let vi = unVarStart[u]
+  while vi < unVarStart[u] + unVarCount[u] {
+    if vi < uVarHeap.length && uVarHeap[vi] == heapIx { return vi }
+    vi = vi + 1
+  }
+  -1
+}
+
+// True if re-evaluating the expression at `exprIx` is side-effect-free and yields the same
+// value — a literal, an ident (local/param/global/captured), a parenthesized such, or a pure
+// field/index navigation of one. A call is not re-readable (its effects, and any
+// allocation, would fire again). Gates the field-copy variant re-box, re-emitted per field.
+export function exprReReadable(exprIx: i32): boolean {
+  if exprIx < 0 { return false }
+  const e = P.nodes[exprIx]
+  if e is Ident { return true }
+  // A literal recomputes to itself. Without this arm a CONSTANT subscript made its whole
+  // index read un-re-readable, which is what refused `xs[0]?.f()` (D1814).
+  if e is NumLit { return true }
+  if e is StrLit { return true }
+  if e is BoolLit { return true }
+  if e is CharLit { return true }
+  if e is NullLit { return true }
+  if e is Paren { return exprReReadable(e.parInner) }
+  if e is Member { return exprReReadable(e.memObj) }
+  if e is Index {
+    return exprReReadable(e.idxArr) && exprReReadable(e.idxIndex)
+  }
+  false
+}
+
+// Whether a shared field the members store at different reps reads as a value-union box: every
+// member's field is a value atom, which the read boxes under that atom's tag (D3562). The checker
+// types such a read as the union of the members' field types, numbers kept apart.
+export function sharedFieldArmsBoxable(vis: i32[], fis: i32[]): boolean {
+  let atoms = 0
+  let i = 0
+  while i < vis.length {
+    if sharedFieldArmAtomKind(vis[i], fis[i]) >= 0 { atoms = atoms + 1 }
+    else if !sharedFieldArmValueBox(vis[i], fis[i]) { return false }
+    i = i + 1
+  }
+  vis.length > 1 && atoms > 0
+}
+
+// Whether some member of a shared read stores its field as a scalar the read boxes.
+export function sharedPlanBoxesSome(vis: i32[], fis: i32[]): boolean {
+  let i = 0
+  while i < vis.length && i < fis.length {
+    if variantFieldTypeAt(vis[i], fis[i]) != FC_UNION { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The value-union name of the first member of a shared read storing the field as a box, or "".
+export function sharedPlanBoxName(vis: i32[], fis: i32[]): string {
+  let i = 0
+  while i < vis.length && i < fis.length {
+    if sharedFieldArmValueBox(vis[i], fis[i]) {
+      return variantFieldElemName(vis[i], fis[i])
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// Whether member `vi` stores its field `fi` as a value-union box, which a mixed shared read
+// delivers as stored beside the members it boxes (D4056).
+function sharedFieldArmValueBox(vi: i32, fi: i32): boolean {
+  variantFieldTypeAt(vi, fi) == FC_UNION
+    && isValueUnionName(variantFieldElemName(vi, fi))
+}
+
+// Whether the checker typed node `ix` as a union: the cheap test ahead of a shared-field plan.
+export function nodeTyIsUnionRow(ix: i32): boolean {
+  const t = nodeTyIxOf(ix)
+  t >= 0 && t < T.tys.length && T.tys[t] is TyUnion
+}
+
+// Registers the value union a field read at `memIx` over a union receiver `recvIx` is typed as,
+// so its box and value-box types exist when the read boxes its members' atoms.
+export function registerSharedReadUnion(memIx: i32, recvIx: i32) {
+  const t = nodeTyIxOf(memIx)
+  if t < 0 || t >= T.tys.length { return 0 }
+  if !(T.tys[t] is TyUnion) { return 0 }
+  let r = nodeTyIxOf(unwrapParen(recvIx))
+  if r < 0 || r >= T.tys.length { return 0 }
+  const rt = T.tys[r]
+  if rt is TyNullable { r = rt.nInner }
+  if r < 0 || r >= T.tys.length { return 0 }
+  if !(T.tys[r] is TyUnion) { return 0 }
+  const nm = tyToEmitName(t)
+  if isValueUnionName(nm) { registerValueUnionName(nm) }
+  0
+}
+
+// The scalar or string atom kind member `vi` stores its field `fi` as, or -1 for any other
+// field: a struct, a nullable, a union box, a list, or a literal-typed field (a discriminant,
+// whose reads keep their own lowering), none of which is boxed here.
+export function sharedFieldArmAtomKind(vi: i32, fi: i32): i32 {
+  if variantFieldTypeAt(vi, fi) == FC_UNION { return -1 }
+  const at = uFieldStart[vi] + fi
+  if at < 0 || at >= uFieldTyText.length { return -1 }
+  if at < uFieldLitTyIx.length && uFieldLitTyIx[at] >= 0 { return -1 }
+  if variantFieldIsLitUnion(vi, fi) { return -1 }
+  const k = valueAtomKind(uFieldTyText[at])
+  if k < 0 || k > 5 || k == nullValKind() { return -1 }
+  k
+}
+
+// The narrowing opcode from value atom `wk` back to the atom `k` a delivery widened it from
+// (`i32` from `i64`, `f64` or `f32`, `f32` from `f64`), or -1: `unwidenI32From`'s table by kind.
+export function atomNarrowOp(wk: i32, k: i32): i32 {
+  if k == 0 && wk == 3 {
+    return 167 // i32.wrap_i64
+  }
+  if k == 0 && wk == 4 {
+    return 170 // i32.trunc_f64_s
+  }
+  if k == 0 && wk == 5 {
+    return 168 // i32.trunc_f32_s
+  }
+  if k == 5 && wk == 4 {
+    return 182 // f32.demote_f64
+  }
+  -1
+}
+
+// Whether a box retag widens value atom `fk` to `tk`: `i32` to `i64` or `f64`, `f32` to `f64`.
+export function atomWidens(fk: i32, tk: i32): boolean {
+  (fk == 0 && (tk == 3 || tk == 4)) || (fk == 5 && tk == 4)
+}
+
+// The kind member `p` of `from` is stored as in a union `to` lacking it, or -1: the FIRST member
+// of `to`, in `to`'s order, that `from` lacks and `p` widens to. A read inverts exactly this
+// first-match rule (`boxNarrowAtomFor`), so the two directions cannot disagree.
+export function boxWidenAtomFor(p: string, to: string[], from: string[]): i32 {
+  if strListHas(to, p) { return -1 }
+  const fk = valueAtomKind(p)
+  let j = 0
+  while j < to.length {
+    const k = valueAtomKind(to[j])
+    if !strListHas(from, to[j]) && atomWidens(fk, k) { return k }
+    j = j + 1
+  }
+  -1
+}
+
+// The kind of the one member of `own` that `boxWidenAtomFor` stores as the stored member `p`,
+// -1 when none is, or -2 when two are and a read cannot tell them apart.
+export function boxNarrowAtomFor(
+  p: string,
+  own: string[],
+  stored: string[],
+): i32 {
+  const pk = valueAtomKind(p)
+  if pk < 0 || strListHas(own, p) { return -1 }
+  let found = -1
+  let j = 0
+  while j < own.length {
+    if boxWidenAtomFor(own[j], stored, own) == pk {
+      if found >= 0 { return -2 }
+      found = valueAtomKind(own[j])
+    }
+    j = j + 1
+  }
+  found
+}
+
+// True when the ident `name`, read inside frame `fnIx`, is shadowed by a binding of the
+// frame itself — a declared param, or a collected declared local. The `expr*Array` global
+// fallbacks must not resolve `name` through a module global when such an inner binding
+// exists, since scope resolution picks the inner binding regardless of its kind. #922.
+export function identShadowedByFrame(fnIx: i32, name: string) {
+  if paramIndexOf(fnIx, name) >= 0 { return true }
+  declaredSlotOf(name) >= 0
+}
+
+// ── ref-array-typedness of expressions (G7-ref) ─────────────────────────────────
+
+// Parallel to the i32-array family: decide whether an expression / param / local produces
+// a ref list — `Tok[]` / `Node[]`, a `(ref $rlTypeIdx)`. Receiver shapes mirror `exprArray`
+// but for `S[]`/`N[]` annotations. `localIsRef` code `5` flags a ref-list local.
+
+// True if the parameter `name` of function `fnIx` is a ref-array type.
+function paramRefArray(fnIx: i32, name: string) {
+  const pt = paramTypeNode(fnIx, name)
+  // STRUCTURAL fast-path (C1): a recorded array-of-declared-struct param, else the name test.
+  if nodeTyIsStructArray(pt) { return true }
+  // A ref-list row for the param's element — covers the nested/union/closure/niche
+  // element spellings the struct-array fast path declines (non-nullable only).
+  annBareRefArrSlot(pt) >= 0
+}
+
+// True if the parameter `name` of function `fnIx` is a NULLABLE ref-array type (`<ref-array> | null`,
+// kind 18 — e.g. `i32[][] | null`, `S[] | null`). The param analogue of `paramRefArray`: `retNulRefArrFlag`
+// (already `| null`-aware) recognizes the annotation. Lets `exprNullableRefArray` / `exprRefArray` classify
+// a nulreflist PARAM (its `!= null` narrow + narrowed indexing), which #877 wired only for a LOCAL.
+export function paramNulRefArray(fnIx: i32, name: string) {
+  retNulRefArrFlag(paramTypeNode(fnIx, name)) == 1
+}
+
+// The ref-list ELEMENT type-NAME a ref-array param `name` of function `fnIx` declares
+// (`p: Tok[]` → `Tok`), or "" if not a ref-array param.
+export function paramRefArrayName(fnIx: i32, name: string) {
+  if fnIx < 0 {
+    return "" // module-scope initializer (no enclosing function)
+  }
+  const fn = P.nodes[fnIx]
+  if fn is FuncDecl {
+    const params = fn.fnParams
+    let i = 0
+    while i < params.length {
+      const p = P.nodes[params[i]]
+      if p is Param {
+        if p.parName == name {
+          if p.parType >= 0 {
+            const ty = P.nodes[p.parType]
+            // `refArrElemNameIf` (the `nameIsRefArray`-gated element read): its "" for a
+            // non-ref-array annotation is the same "" the next line returns.
+            if ty is TypeRef { return refArrElemNameIf(ty.tyName) }
+          }
+          return ""
+        }
+      }
+      i = i + 1
+    }
+  }
+  ""
+}
+
+// The INNER ref-list element type-NAME a function `name` returns when its return is a NULLABLE ref array
+// (`i32[][] | null` → the inner `i32[]`), else "". Reads the return-type node directly (`fRetRArrElem`
+// records only the NON-null ref-array element), so a consumer `const t = mk()` infers the kind-18 niche
+// and its `!= null` narrow + narrowed indexing resolve the inner ref-list slot.
+export function fnRetNulRefArrayNameSid(
+  sid: i32,
+  name: string,
+  fnIx: i32,
+  at: i32,
+) {
+  const i = fnIndexOfInScopeAt(sid, name, fnIx, at)
+  if i < 0 { return "" }
+  const fn = P.nodes[fnStmts[i]]
+  if fn is FuncDecl {
+    if fn.fnRet >= 0 {
+      // The `np != ""` conjunct is kept rather than folded in: `nameIsRefArray("")` is not
+      // free (an arrow scan and a full shape ladder), so the short-circuit stays.
+      const np = nullablePartOf(tyNameOf(fn.fnRet))
+      if np != "" { return refArrElemNameIf(np) }
+    }
+  }
+  ""
+}
+
+// The ref-list ELEMENT type-NAME of the declared local `name` (recorded in
+// `localStructIdx` as its table SLOT for code-5 locals), or "".
+export function declaredRefArrayName(name: string) {
+  const i = declaredSlotOf(name)
+  if i >= 0 {
+    if localIsRef[i] == "reflist" {
+      const slot = localStructIdx[i]
+      if slot >= 0 {
+        if slot < rlElemName.length { return rlElemName[slot] }
+      }
+    }
+  }
+  ""
+}
+
+// The annotation NAME the instance `fnIx` carries for the identifier at `exprIx`, or "".
+// A monomorphized clone rebuilds only its statement spine, so a shared leaf expression's
+// recorded type is still the template's `T`; the instance's own parameter or `LetDecl`
+// annotation is the one channel that answers per instance (D1605).
+export function instAnnTyNameOfExpr(exprIx: i32, fnIx: i32): string {
+  if fnIx < 0 { return "" }
+  const ax = unwrapParen(exprIx)
+  if ax < 0 { return "" }
+  const an = P.nodes[ax]
+  if an is Ident {
+    const pt = paramTypeNode(fnIx, an.identName)
+    if pt >= 0 { return tyNameOf(pt) }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const li = parentLetOf(fn.fnBody, an.identName)
+      if li >= 0 {
+        const ld = P.nodes[li]
+        if ld is LetDecl { return tyNameOf(ld.letType) }
+      }
+    }
+  }
+  ""
+}
+
+// The ref-list slot of a node typed as a list of records, or -1 for any other element: a
+// closure or union element keeps its own storage, which this slot does not describe (D4930).
+export function recordListSlotOfNode(exprIx: i32, fnIx: i32): i32 {
+  const el = tyRefArrElemOf(nodeTyInOf(exprIx, fnIx))
+  if el < 0 || el >= T.tys.length || !(T.tys[el] is TyObj) { return -1 }
+  rlSlotOfTy(el)
+}
+
+// The interned ref-list row an empty `[]`'s element resolves to, or -1. The element name is
+// the checker's own rendering of the recorded element type, character-for-character the key
+// an equivalent annotated spelling interns its row under, so the hole and the annotation land
+// on one row.
+export function emptyArrHoleElemName(exprIx: i32) {
+  const ax = emptyArrLitIxOf(exprIx)
+  if ax < 0 { return "" }
+  // The arena decides which row first (D626): `nodeArrayElemName` renders a nested element
+  // structurally, which is not the key an annotated spelling interned its row under.
+  const aslot = rlSlotOfTy(tyRefArrElemOf(nodeTyIxOf(ax)))
+  if aslot >= 0 && aslot < rlElemName.length { return rlElemName[aslot] }
+  nodeArrayElemName(ax)
+}
+
+export function emptyArrHoleElemSlot(exprIx: i32) {
+  const en = emptyArrHoleElemName(exprIx)
+  if en == "" { return -1 }
+  rlSlotByName(en)
+}
+
+// The list rep parameter `name` of function `fnIx` declares, a nullable i32 or ref list's included.
+export function paramListRep(fnIx: i32, name: string): VKind | null {
+  if paramStringArray(fnIx, name) { return "strlist" }
+  if paramF64Array(fnIx, name) { return "f64list" }
+  if paramI64Array(fnIx, name) { return "i64list" }
+  if paramF32Array(fnIx, name) { return "f32list" }
+  if annIsU8Array(paramTypeNode(fnIx, name)) { return "u8list" }
+  if paramNulRefArray(fnIx, name) { return "reflist" }
+  if paramRefArray(fnIx, name) { return "reflist" }
+  if paramArray(fnIx, name) { return "list" }
+  if paramNulList(fnIx, name) { return "list" }
+  null
+}
