@@ -1,0 +1,153 @@
+// Diagnostic codes and the fixed message sentences the checker raises with them; each code's
+// comment names the data fields a fix reads. Does not import the checker.
+
+// The stable category code for emitter-capability rejections: the construct is type-valid
+// but codegen cannot lower it yet. Machine-distinguishable from a type-soundness verdict
+// (the LSP reads it through `diagCodeLen`/`diagCodeByte`), yet still an error — a program
+// that cannot build must not pass `vl check`.
+export const CODE_UNSUPPORTED_LOWERING = "unsupported-lowering"
+
+// D1230 — a bare category code whose answer rides the data channel
+// (`ufcsNotImportedData`): `member` (the property as written), `modules` (one field per
+// candidate module, spelled as the file can write it today, dependency-first, deduplicated)
+// `recv` (the receiver type, demangled) and `alias` when the import needs one. A fix reads the keys.
+export const CODE_UFCS_NOT_IMPORTED = "ufcs-not-imported"
+
+// An undeclared name some module of the program or of std exports. Its answer rides the
+// data channel as `ufcs-not-imported`'s does: `member` and one `modules` field per exporter.
+export const CODE_MISSING_IMPORT = "missing-import"
+
+// A `std:array` `filled(n, 0)` delivered where a `u8[]` is wanted. The diagnostic spans the
+// call, which `check --fix` rewrites to `zeroBytes(n)` and imports from `std:bytes`.
+export const CODE_ZERO_BYTES = "filled-zero-bytes"
+
+// A non-numeric `as` whose operand already has the target type. The diagnostic spans the cast,
+// and its `keep` field is the operand's length from the cast's start: `check --fix` keeps that.
+export const CODE_REDUNDANT_CAST = "redundant-cast"
+
+// D1570 — the name is a function in scope and is not a method. Its answer rides the data
+// channel under `member`, `recv`, `reason` (`self-name` / `arity` / `receiver`: which gate
+// refused), `param` (the first parameter's declared name, `self-name` only) and
+// `declLine`/`declCol` — that parameter's position in its declaring module, `0` when none.
+export const CODE_UFCS_NOT_METHOD = "ufcs-not-method"
+
+// D1588 — a constant range descriptor that cannot complete as written. Its answer rides
+// the data channel under `from`/`to` (the folded bounds, decimal; absent when a bound is
+// not constant) and `step` (the folded step, `1` when defaulted). A quick-fix reads
+// `step`: a non-zero one flips sign, a `0` has no such fix; it never parses the sentence.
+export const CODE_RANGE_NEVER_RUNS = "range-never-runs"
+
+// D2390 — a read of a bare name whose narrowing a call ended: refused in the call's own
+// statement, or a type error in a later one naming the call. No payload.
+export const CODE_NARROWING_ENDED_BY_CALL = "narrowing-ended-by-call"
+
+// D2475 — a `self`-function whose name the receiver type already defines as a method or a
+// field, so the member call never reaches it. Data: `member`, `recv`, `rung` (`method`/`field`).
+export const CODE_SELF_FN_SHADOWED = "self-fn-shadowed"
+
+// D3960 — a concrete function written to a `let` that keeps its initializer's generic type. Data:
+// `annot` (the written type, as an annotation), `line`/`col` (1-based line and 0-based column
+// just after the binding's name, where `check --fix` inserts `: annot`; absent across modules).
+export const CODE_GENERIC_BINDING_CONCRETE_WRITE = "generic-binding-concrete-write"
+
+// D4061 — a positional argument after a named one that is not in its own parameter's position.
+// Data, repeated per positional argument after it: `name` (the parameter the call binds it to),
+// `line`/`col` (1-based line, 0-based column of its first token, where `check --fix` inserts
+// `name: `); absent when no naming keeps the call's meaning.
+export const CODE_NAMED_ARG_OUT_OF_POSITION = "named-arg-out-of-position"
+
+// ── checker state (one struct, held in the global `T`) ───────────────────────
+
+// The sentence forms, one per (wording, predicate) pair the fourteen arms use. Separate values
+// even where two share a wording — `set`'s key retries the newtype rule while its value asks
+// the expression predicate — so `bmArgPred` keys off the form alone and the two can never be
+// confused for each other.
+export const BM_PUSH = 0
+
+export const BM_SETVAL = 1
+
+export const BM_SETKEY = 2
+
+export const BM_ADDKEY = 3
+
+export const BM_KEYMUST = 4
+
+export const BM_INDEXMUST = 5
+
+export const BM_BOUNDMUST = 6
+
+export const BM_EXPECTSA = 7
+
+export const BM_IDXPHRASE = 8
+
+export const BM_BYTEOFF = 9
+
+export const BM_BOUNDS0 = 10
+
+export const BM_BOUNDS1 = 11
+
+// D691 — deferred receiver-classification constraints. `checkMemberNode`'s `TyVar` arm admits
+// `.length` on every type variable and `checkIndexNode`'s admits `x[i]`, both deliberately: a
+// `T` pinned to a list / string / map / set has both, and refusing them in the body refuses
+// every rep that works. This table re-asks at the pin, in `memberFloorMsg`/`indexFloorMsg`'s words.
+
+// A float literal written as a type, on either annotation route: banks the reason on the
+// `unkTyClash` wire, as `storageTyLeafFail` does, so the positioned caller reports it once.
+export function floatLitTypeFail(lex: string) {
+  unkTyClash = floatLitTypeMsg(lex)
+  -1
+}
+
+// The one wording for that refusal. A design rule (owner ruling, D2221): float equality is not
+// set membership, so a float literal names no set `is` or `==` could test. An integral lexeme
+// (`2.0`) suggests its integer.
+function floatLitTypeMsg(lex: string): string {
+  let intPart = ""
+  let dot = false
+  let whole = true
+  let i = 0
+  while i < lex.length {
+    const c = lex[i]
+    if c == 'e' || c == 'E' {
+      whole = false
+    } else if c == '.' {
+      dot = true
+    } else if dot {
+      if c != '0' && c != '_' { whole = false }
+    } else {
+      intPart = intPart + lex.slice(i, i + 1)
+    }
+    i = i + 1
+  }
+  if intPart.length == 0 { whole = false }
+  let intHint = ", or an integer literal if an integer was meant"
+  if whole {
+    intHint = ", or the integer literal `"
+      + intPart
+      + "` if an integer was meant"
+  }
+  "a float literal cannot be a type: float equality is not set membership (`-0.0 == 0.0`, NaN never equals itself, and rounding makes different spellings one value), so no `is` or `==` could test the set it names. Write `f64` (or `f32`)"
+    + intHint
+    + ", in place of the float literal `"
+    + lex
+    + "`"
+}
+
+// The unknown-type component bank: both resolvers answer -1 and -1 propagates out of every
+// composite arm, so the caller only ever held the whole annotation. `unkTyPart` banks the first
+// failing component — the innermost frame to fail writes its spelling, enclosing frames leave a
+// non-empty bank alone, and `unkTyDepth`'s outermost frame clears it. One shared counter.
+export let unkTyPart = ""
+export function unkTyPartSet(v: string) { unkTyPart = v }
+
+export let unkTyDepth = 0
+export function unkTyDepthSet(v: i32) { unkTyDepth = v }
+
+// The second bank on the same wire: a union member list the emitter cannot separate
+// (`nomUnionRepClashMsg`) is a resolution failure with a diagnostic of its own, so
+// `annUnionInnerTy` poisons the annotation to -1 exactly as an unresolved member does and banks
+// why. Every `unknownTyText` caller then reports the specific reason without gaining an arm.
+export let unkTyClash = ""
+
+// ── the subsumed-arm collapse's provenance (D1048) ───────────────────────────
+export function unkTyClashSet(v: string) { unkTyClash = v }

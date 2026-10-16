@@ -1,0 +1,755 @@
+// Side rows the body walk records for later passes: un-annotated empty collections awaiting
+// scope close, linked null holes, deferred `if` joins, identifier resolutions, return joins
+// and void-coerced values. Emptied by `sideRowsReset` and `jwReset`.
+// Does not import the checker.
+import { lookup, lookupDepth } from "./check_scopes"
+import { BinExpr, IfStmt, LetDecl, P, PIN_NONE, i32ToStr } from "./ast"
+import { IDENT_BUILTIN, identSet } from "./symbols"
+import {
+  rcoalCode,
+  rcoalCol,
+  rcoalEnd,
+  rcoalLine,
+  rcoalMsg,
+  rcoalTok,
+  rcoalType,
+  rcoalWhy,
+} from "./check_state"
+import { i32ListHas } from "./listutil"
+import {
+  T,
+  TY_I32,
+  TyArray,
+  TyFunc,
+  TyNullable,
+  TyUnion,
+  demangleMsg,
+  tyMutEpoch,
+  tyToStr,
+  tyToStrUser,
+} from "./check_types"
+import { placeKeyOf } from "./check_places"
+import { crFnBases, crStmtFns, crStmtIxs } from "./check_capture_rows"
+import {
+  nhOpen,
+  nullableInnerOrNone,
+  tyHasTyVar,
+  unionLeafIsWide,
+  unionLeavesInto,
+} from "./check_ty_shape"
+import {
+  ESC_F32,
+  ESC_F64,
+  ESC_I32,
+  ESC_I64,
+  elemStoreClassOf,
+} from "./check_ty_rep"
+import { primAmong, widenMemberPairs } from "./check_ty_relate"
+import { peelParenIx, placeRootOf } from "./check_write_effects"
+import { colAt, nodeTyIx, nodeTyIxOf } from "./check_node_tys"
+import { inferQuiet } from "./check_cursor"
+import { dJoinNode, dJoinTy } from "./check_tp_join"
+import {
+  jwSetGenTokStart,
+  jwTokIsGenerated,
+  symDeclScope,
+  symResolve,
+} from "./check_sym_occ"
+import { valueTailLeaves } from "./check_num_adopt"
+import {
+  widenRetagAt,
+  widenRetagFromTy,
+  widenRetagN,
+  widenRetagToTy,
+} from "./check_retag_rows"
+import { findingEndCol, findingStartTok } from "./check_bind_rows"
+import {
+  tpRetJoinFixed,
+  tpRetJoinFixedSetAt,
+  tpRetJoinTysSetAt,
+} from "./check_list_union"
+import { paramSolveProbe } from "./check_exp_obs"
+
+// The un-inferred empty-collection floor: an un-annotated empty `[]` / `Map()` / `Set()` whose
+// element/key/value hole is never pinned — by an annotation or a downstream `.push`/`.set`/
+// `.add` — has a genuinely unknown type, and a later use may still pin it, so the question
+// waits. `flushUninferred(depth)` grades each at scope close: a still-open hole needs an annotation.
+export let pendNames: string[] = []
+export function pendNamesSet(v: string[]) { pendNames = v }
+
+export let pendTys: i32[] = []
+export function pendTysSet(v: i32[]) { pendTys = v }
+
+export let pendAts: i32[] = []
+export function pendAtsSet(v: i32[]) { pendAts = v }
+
+export let pendDepths: i32[] = []
+export function pendDepthsSet(v: i32[]) { pendDepths = v }
+
+// Pairs of open null holes, one written into the other, that fill together (`nhFillLinked`).
+export let nhLinkA: i32[] = []
+
+export let nhLinkB: i32[] = []
+
+// The joins of a value-position `if` waiting for their statement to end, innermost last.
+export let narDefStmt: i32[] = []
+export function narDefStmtPop(): i32 | null { narDefStmt.pop() }
+
+export let narDefKey: string[] = []
+export function narDefKeyPop(): string | null { narDefKey.pop() }
+
+export let narDefTy: i32[] = []
+export function narDefTyPop(): i32 | null { narDefTy.pop() }
+
+export let narDefChain: boolean[] = []
+export function narDefChainPop(): boolean | null { narDefChain.pop() }
+
+// The `if` a statement evaluates unconditionally as its whole value — a `let`'s initializer or
+// an assignment's right side — or -1.
+function narStmtValueIf(st: i32): i32 {
+  const s = P.nodes[st]
+  let v = -1
+  if s is LetDecl { v = s.letInit }
+  if s is BinExpr {
+    if s.binOp == "=" { v = s.binRight }
+  }
+  if v < 0 { return -1 }
+  v = peelParenIx(v)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  if P.nodes[v] is IfStmt { return v }
+  -1
+}
+
+// Hold the join of `key` at the value-position `if` at `ix` for its statement's end, when the
+// statement is this function's and its whole value is that `if`; drop it otherwise.
+export function narDeferJoin(ix: i32, key: string, jt: i32, viaChain: boolean) {
+  const top = crStmtIxs.length - 1
+  if top < 0 || crStmtFns[top] != crFnBases.length { return 0 }
+  const st = crStmtIxs[top]
+  if narStmtValueIf(st) != ix { return 0 }
+  // The binding the statement itself declares is not the one the key names.
+  const sn = P.nodes[st]
+  if sn is LetDecl {
+    if placeRootOf(key) == sn.letName { return 0 }
+  }
+  narDefStmt.push(st)
+  narDefKey.push(key)
+  narDefTy.push(jt)
+  narDefChain.push(viaChain)
+  0
+}
+
+// Link two open null holes, one written into the other, so that one fill fills both and a
+// later write that disagrees is refused at the type the first fill chose (D2506).
+export function nhLink(a: i32, b: i32) {
+  if a == b || !nhOpen(a) || !nhOpen(b) { return 0 }
+  nhLinkA.push(a)
+  nhLinkB.push(b)
+  0
+}
+
+// Record an un-annotated empty-collection binding for the deferred scope-close check.
+export function notePending(name: string, ty: i32, at: i32) {
+  pendNames.push(name)
+  pendTys.push(ty)
+  pendAts.push(at)
+  pendDepths.push(T.scopes.length - 1)
+  0
+}
+
+// Whether the delivery being checked is an argument to a parameter whose declared type names a
+// type parameter: an instance shared across pins holds the member unwidened, so no retag.
+export let widenRetagGenArg = false
+export function widenRetagGenArgSet(v: boolean) { widenRetagGenArg = v }
+
+// The nested named un-annotated functions (`FuncDecl` node) and their final inferred `TyFunc`,
+// banked at `finishInferredReturn` because their binding does not outlive the enclosing scope.
+export let nestedUnannotFns: i32[] = []
+
+export let nestedUnannotTys: i32[] = []
+
+// D1736 — the post-guard residual's veto, keyed by the `if` node: 1 when an arm wrote a
+// different member into a name the residual would describe, so neither half installs it.
+export let pgVoid: i32[] = []
+export function pgVoidSet(v: i32[]) { pgVoid = v }
+
+// D1846 — the arm JOIN, keyed by the `if` node: the type each bare name reads at below the `if`
+// when its arms wrote it. A node-sized head index into three small columns, so a node with no
+// join costs one `-1` and the emitter's lookup is a chain walk rather than a table scan.
+export let joinHead: i32[] = []
+export function joinHeadSet(v: i32[]) { joinHead = v }
+
+export let joinName: string[] = []
+export function joinNameSet(v: string[]) { joinName = v }
+
+export let joinTy: i32[] = []
+export function joinTySet(v: i32[]) { joinTy = v }
+
+export let joinNext: i32[] = []
+export function joinNextSet(v: i32[]) { joinNext = v }
+
+// Per node, the element an empty-list hole closed to: `i32` where the node's recorded type is still
+// `_[]` or `_[] | null` after the last walk, else -1. `nodeTyIx` keeps the hole (`recordClosedHoles`).
+export let holeElemIx: i32[] = []
+
+// Whether any delivery recorded an unbox or a retag: one flag the emitter's per-expression
+// hooks read before asking the tables.
+export let mapDeliveryRecorded = false
+export function mapDeliveryRecordedSet(v: boolean) { mapDeliveryRecorded = v }
+
+// The scalar list pairs delivered as a `readonly` list from a source whose other handles the
+// write analysis cannot see, one bit per pair: 1 `i32`->`i64`, 2 `i32`->`f64`, 4 `f32`->`f64`.
+// Such a delivery is a view that reads through its source, not a copy (D3028).
+export let scalarViewPairs = 0
+
+export let cFillDoneAt: i32[] = []
+export function cFillDoneAtSet(v: i32[]) { cFillDoneAt = v }
+
+// A synthesized annotation node's provenance in its own column: the `PIN_*` kind and, for
+// `PIN_SIGKEY`, the `$fnsig` key that is its payload. Keyed by node index, exactly like `nodeTyIx`
+// beside it and reset with it, so no consumer decodes a prefix off the `tyName` column. Only the
+// mint still bridges from the legacy string form (`synthPinKindOf`).
+export let nodePinKind: i32[] = []
+export function nodePinKindSet(v: i32[]) { nodePinKind = v }
+
+export let nodePinPay: string[] = []
+export function nodePinPaySet(v: string[]) { nodePinPay = v }
+
+// Lambda nodes that are the init of an un-annotated `const`/`let` binding (`const add = (a, b) =>
+// a + b`). Such a lambda's un-annotated params are inference holes, monomorphized per use exactly
+// like a named generic function, rather than rejected as uninferable. Any other no-context
+// anonymous lambda stays a clean rejection.
+export let valBindLambda: i32[] = []
+
+export function noteValBindLambda(nodeIx: i32) { valBindLambda.push(nodeIx) }
+
+export function isValBindLambda(nodeIx: i32) {
+  let i = 0
+  while i < valBindLambda.length {
+    if valBindLambda[i] == nodeIx { return true }
+    i = i + 1
+  }
+  false
+}
+
+// ── void-context discard ─────────────────────────────────────────────────────
+
+// The two node ledgers below are the checker-to-emitter channel for the void-discard rule, both
+// keyed on the context being void, never on a tail's shape. `voidCtxLambdaNodes` holds lambda
+// literal nodes checked against an expected `(…) => void`: such a lambda adopts the void return,
+// so an explicit `return expr` inside it mismatches and a value-bearing tail is discarded.
+export let voidCtxLambdaNodes: i32[] = []
+
+export function noteVoidCtxLambda(nodeIx: i32) {
+  if !i32ListHas(voidCtxLambdaNodes, nodeIx) { voidCtxLambdaNodes.push(nodeIx) }
+  0
+}
+
+export function lambdaVoidAdoptedAt(nodeIx: i32) {
+  i32ListHas(voidCtxLambdaNodes, nodeIx)
+}
+
+// `voidCoerceValNodes`: expression nodes (paren-peeled idents naming a module-scope `function`)
+// whose `(P…) => T` value is granted wholesale coercion into an expected `(P…) => void` slot
+// (`fnValVoidCoerce`). The emitter mints one void twin per coerced target and swaps the closure
+// build at exactly these nodes; `voidCoerceValNames` carries the target's name for that mint.
+export let voidCoerceValNodes: i32[] = []
+
+export let voidCoerceValNames: string[] = []
+
+export function noteVoidCoerceVal(nodeIx: i32, name: string) {
+  if !i32ListHas(voidCoerceValNodes, nodeIx) {
+    voidCoerceValNodes.push(nodeIx)
+    voidCoerceValNames.push(name)
+  }
+  0
+}
+
+export function voidCoerceValAt(nodeIx: i32) {
+  i32ListHas(voidCoerceValNodes, nodeIx)
+}
+
+export function voidCoerceValCount() { voidCoerceValNodes.length }
+
+export function voidCoerceValNameAt(i: i32) { voidCoerceValNames[i] }
+
+// D1035 — `r is T` where `r`'s type is a JSON-shaped union and `T` is not one of its arms is a
+// runtime shape walk, not a tag test. The checker cannot lower one, so it records the site and
+// the target here and `json_walk.vl` turns each distinct target into one generated VL walker.
+// `jwTgt*` is deduped by (target spelling, receiver spelling), which is the walker's identity.
+export let jwTgtSpell: string[] = []
+
+export let jwTgtRecv: string[] = []
+
+export let jwTgtTy: i32[] = []
+
+// The canonical `Json` the walk is written against, which is not always the walker's parameter
+// type: `parseJson` answers `Json | JsonError`, a value of which is not assignable to `Json`, so
+// the walker takes the wider union and tests its container arms directly. The root is what the
+// shape predicate, the wildcard leaf and the two arm spellings are read from.
+export let jwTgtRootTy: i32[] = []
+
+// One row per admitted site: the `IsExpr` arena index, and the `jwTgt*` row it walks.
+export let jwSiteNode: i32[] = []
+
+export let jwSiteTgt: i32[] = []
+
+export function jwReset() {
+  jwSetGenTokStart(-1)
+  jwTgtSpell = []
+  jwTgtRecv = []
+  jwTgtTy = []
+  jwTgtRootTy = []
+  jwSiteNode = []
+  jwSiteTgt = []
+  0
+}
+
+// The declaration `name` resolves to where it stands: the decl frame `lookup` answers from
+// when it holds one, else the innermost frame that does (a narrowing overlay declares no node).
+function identResolve(name: string) {
+  const d = lookupDepth(name)
+  if d >= 0 && d < symDeclScope.length {
+    const hit = symDeclScope[d][name] ?? -1
+    if hit >= 0 { return hit }
+  }
+  symResolve(name)
+}
+
+// Record the resolution of the read `ix` of `name` in the binding-identity column. A name with
+// no declaration in scope yet is a module binding declared below the read, or a builtin; the
+// pending pair is settled against the module frame by `identFlushPending`.
+export let identPendNode: i32[] = []
+
+export let identPendName: string[] = []
+
+export function identNoteUse(ix: i32, name: string) {
+  if inferQuiet { return 0 }
+  const d = identResolve(name)
+  if d >= 0 { return identSet(ix, d) }
+  identPendNode.push(ix)
+  identPendName.push(name)
+  0
+}
+
+// A use of `name` that resolves in the module frame whatever encloses it, settled when the
+// pass flushes.
+export function identNoteModuleUse(ix: i32, name: string) {
+  if inferQuiet { return 0 }
+  identPendNode.push(ix)
+  identPendName.push(name)
+  0
+}
+
+export function identFlushPending() {
+  let i = 0
+  while i < identPendNode.length {
+    let d = -1
+    if symDeclScope.length > 0 { d = symDeclScope[0][identPendName[i]] ?? -1 }
+    if d < 0 { d = IDENT_BUILTIN }
+    identSet(identPendNode[i], d)
+    i = i + 1
+  }
+  identPendNode = []
+  identPendName = []
+  0
+}
+
+// Record `x == null` / `x != null` over a value the checker proved non-null: the test is dead,
+// always false or always true, and the emitter folds it (DECISIONS.md, the dead null test).
+export function recordDeadNullTest(
+  ix: i32,
+  subjIx: i32,
+  subjTy: i32,
+  op: string,
+) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  const t = P.toks[tk]
+  let subj = demangleMsg(placeKeyOf(subjIx))
+  if subj == "" { subj = "the value" }
+  let always = "false"
+  if op == "!=" { always = "true" }
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
+  rcoalTok.push(tk)
+  rcoalType.push(tyToStrUser(subjTy))
+  rcoalCode.push("dead-null-test")
+  rcoalMsg.push(
+    "`"
+      + subj
+      + " "
+      + op
+      + " null` is always "
+      + always
+      + " here ("
+      + subj
+      + " is "
+      + tyToStrUser(subjTy)
+      + ")",
+  )
+  rcoalWhy.push("")
+  0
+}
+
+// Record a `==` / `!=` whose operands are records holding a list: the compare walks every
+// element, which reads like an identity test and costs O(n). `path` names the list field.
+export function recordDeepRecordEq(ix: i32, ty: i32, path: string, op: string) {
+  const tk = findingStartTok(ix)
+  if tk < 0 { return 0 }
+  if jwTokIsGenerated(tk) { return 0 }
+  let i = 0
+  while i < rcoalTok.length {
+    if rcoalTok[i] == tk { return 0 }
+    i = i + 1
+  }
+  const t = P.toks[tk]
+  const tyS = tyToStrUser(ty)
+  rcoalLine.push(t.line)
+  rcoalCol.push(t.col)
+  rcoalEnd.push(findingEndCol(ix, tk))
+  rcoalTok.push(tk)
+  rcoalType.push(tyS)
+  rcoalCode.push("deep-record-compare")
+  rcoalMsg.push(
+    "`"
+      + op
+      + "` on `"
+      + tyS
+      + "` compares every element of its list field `"
+      + path
+      + "`, not whether both sides are the same record — compare a field that identifies the record, or the `"
+      + path
+      + "` fields directly when the element-wise compare is the intent",
+  )
+  rcoalWhy.push("")
+  0
+}
+
+// Park the uncollapsed deferred join `tyIx` under call node `nodeIx`, last write winning — the
+// checker re-walks a body once per inference pass, and the pass whose witnesses reach the call site
+// is the last one. Never from the parameter-solve probe: that probe observes a body, and this table
+// is keyed by call node, so a probe row would block the real pass's re-park.
+export function noteDeferredJoinNode(nodeIx: i32, tyIx: i32) {
+  if paramSolveProbe { return 0 }
+  if nodeIx < 0 { return 0 }
+  let k = 0
+  while k < dJoinNode.length {
+    if dJoinNode[k] == nodeIx {
+      dJoinTy[k] = tyIx
+      return 0
+    }
+    k = k + 1
+  }
+  dJoinNode.push(nodeIx)
+  dJoinTy.push(tyIx)
+  0
+}
+
+// Record the pair `se` -> `de` as delivered as a view (`scalarViewPairs`).
+export function noteScalarView(se: i32, de: i32) {
+  const sc = elemStoreClassOf(se, 8)
+  const dc = elemStoreClassOf(de, 8)
+  let bit = 0
+  if sc == ESC_I32 && dc == ESC_I64 { bit = 1 }
+  if sc == ESC_I32 && dc == ESC_F64 { bit = 2 }
+  if sc == ESC_F32 && dc == ESC_F64 { bit = 4 }
+  if (scalarViewPairs & bit) == 0 { scalarViewPairs = scalarViewPairs + bit }
+  0
+}
+
+// A re-join `res` still open in a type parameter keeps the return set it is made from, each
+// value at its type at this pin (`vals`), for the pin that binds it.
+export function carryRetJoin(res: i32, key: i32, vals: i32[]) {
+  if res < 0 || res >= T.tys.length || !tyHasTyVar(res) { return 0 }
+  noteRetJoin(res, vals, tpRetJoinFixed.get(key) ?? [])
+}
+
+// Records the return set (`tys`, `fixed`) of the join at row `ret` and its null wrapper's inner.
+export function noteRetJoin(ret: i32, tys: i32[], fixed: boolean[]) {
+  // arena-tick exempt: a per-program mark on an existing arena row.
+  tpRetJoinTysSetAt(ret, tys)
+  // arena-tick exempt: a per-program mark on an existing arena row.
+  tpRetJoinFixedSetAt(ret, fixed)
+  const rt = T.tys[ret]
+  if rt is TyNullable {
+    // arena-tick exempt: a per-program mark on an existing arena row.
+    tpRetJoinTysSetAt(rt.nInner, tys)
+    // arena-tick exempt: a per-program mark on an existing arena row.
+    tpRetJoinFixedSetAt(rt.nInner, fixed)
+  }
+  0
+}
+
+export function resetReturnPending(name: string) {
+  const h = lookup(name)
+  if h >= 0 {
+    const ht = T.tys[h]
+    if ht is TyFunc {
+      ht.fnRet = -2
+      tyMutEpoch = tyMutEpoch + 1 // return-inference fixpoint reset in place
+    }
+  }
+  0
+}
+
+// Banks a nested named function's inferred signature for the A20 export; a re-check of the
+// same declaration replaces its row rather than adding a second.
+export function noteNestedUnannotFn(fnIx: i32, fty: i32) {
+  if fty < 0 { return 0 }
+  let i = 0
+  while i < nestedUnannotFns.length {
+    if nestedUnannotFns[i] == fnIx {
+      nestedUnannotTys[i] = fty
+      return 0
+    }
+    i = i + 1
+  }
+  nestedUnannotFns.push(fnIx)
+  nestedUnannotTys.push(fty)
+  0
+}
+
+// Is the arena entry `declIx` already filled? Keyed by arena index, not by name, so two
+// declarations sharing one placeholder (a redeclaration) fill it exactly once. One
+// bounds-checked read of the flag column; an index past its end is simply not yet marked.
+export function fillDone(declIx: i32) {
+  if declIx < 0 || declIx >= cFillDoneAt.length { return false }
+  cFillDoneAt[declIx] == 1
+}
+
+// Mark arena entry `declIx` filled, extending the flag column to cover it. The column only
+// ever grows, so the extension costs O(highest arena index marked) across the whole pass.
+export function markFillDone(declIx: i32) {
+  if declIx < 0 { return 0 }
+  while cFillDoneAt.length <= declIx { cFillDoneAt.push(0) }
+  cFillDoneAt[declIx] = 1
+  0
+}
+
+// The inferred-return key of the function declared at `declIx` named `name`: `#<declIx>` for
+// a nested named un-annotated function (a name there is neither unique nor the checker's
+// key), else `name`. Every emitter read of a declaration's row goes through this (D1966).
+export function inferRetFnKey(declIx: i32, name: string): string {
+  let i = 0
+  while i < nestedUnannotFns.length {
+    if nestedUnannotFns[i] == declIx { return "#" + i32ToStr(declIx) }
+    i = i + 1
+  }
+  name
+}
+
+// Did the post-guard residual of the `if` at node `ix` drop, because an arm wrote a
+// different member into a name it narrows? The emitter pushes nothing for such an `if`, so
+// the reads after it stay at the declared rep the checker left them at (D1736).
+export function pgResidualVoidOf(ix: i32) {
+  if ix >= 0 {
+    if ix < pgVoid.length { return pgVoid[ix] == 1 }
+  }
+  false
+}
+
+// Bank `pgResidualVoidOf`'s answer at the `if` node.
+export function recordPgResidualVoid(ix: i32) {
+  if ix < 0 { return 0 }
+  while pgVoid.length <= ix { pgVoid.push(0) }
+  pgVoid[ix] = 1
+  0
+}
+
+// The first arm-join row of the `if` at node `ix`, or -1. The emitter walks the chain with
+// `joinRowNext` and pushes each name at `joinRowTy`, so the reads below the `if` lower at the
+// join the checker typed them with (D1846).
+export function joinHeadOf(ix: i32) { colAt(joinHead, ix) }
+
+export function joinRowName(r: i32) {
+  if r >= 0 {
+    if r < joinName.length { return joinName[r] }
+  }
+  ""
+}
+
+export function joinRowTy(r: i32) { colAt(joinTy, r) }
+
+export function joinRowNext(r: i32) { colAt(joinNext, r) }
+
+// Rename arm-join row `r`: a binding a closure writes is read through its cell once the
+// capture rewrite runs, and the emitter's push has to name what the reads name.
+export function joinRowRename(r: i32, name: string) {
+  if r >= 0 && r < joinName.length { joinName[r] = name }
+  0
+}
+
+// Bank one arm-join row, newest first — the order does not matter, since every row names a
+// different binding.
+export function recordArmJoin(ix: i32, name: string, ty: i32) {
+  if ix < 0 || ty < 0 { return 0 }
+  while joinHead.length <= ix { joinHead.push(-1) }
+  joinName.push(name)
+  joinTy.push(ty)
+  joinNext.push(joinHead[ix])
+  joinHead[ix] = joinName.length - 1
+  0
+}
+
+// The element the empty-list hole at node `ix` closed to, or -1 where none closed there. The rep
+// column reads it; the node's recorded type, and so hover and `--json`, keep `_[]`.
+export function nodeHoleElemOf(ix: i32) { colAt(holeElemIx, ix) }
+
+// Records the designed `i32` element at every node whose recorded type is still a hole list. Run
+// once the last walk has finished, so every pin the checker makes has had its chance and the
+// hole readers that unify a hole with its consumer have seen it open.
+export function recordClosedHoles() {
+  holeElemIx = []
+  let ix = 0
+  while ix < nodeTyIx.length {
+    if tyIsHoleList(nodeTyIx[ix]) {
+      while holeElemIx.length <= ix { holeElemIx.push(-1) }
+      holeElemIx[ix] = TY_I32
+    }
+    ix = ix + 1
+  }
+  0
+}
+
+// Whether `ty` is `_[]` or `_[] | null`: a list whose element no pin decided.
+function tyIsHoleList(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const inner = nullableInnerOrNone(ty)
+  if inner >= 0 { return tyIsHoleList(inner) }
+  const t = T.tys[ty]
+  if t is TyArray { return t.aElem < 0 }
+  false
+}
+
+// `recordWidenRetag` at each value a delivery into `dstTy` hands over, when `dstTy` is a union
+// or nullable with an `i64` or `f64` member a narrower scalar member can widen to (D2974).
+export function recordWidenRetagTails(srcExpr: i32, dstTy: i32) {
+  if widenRetagGenArg || dstTy < 0 || dstTy >= T.tys.length { return 0 }
+  const dt = T.tys[dstTy]
+  if !(dt is TyUnion || dt is TyNullable) { return 0 }
+  if !unionLeafIsWide(dstTy, 8) { return 0 }
+  const dm: i32[] = []
+  unionLeavesInto(dstTy, dm, 8)
+  if primAmong("i64", dm) < 0 && primAmong("f64", dm) < 0 { return 0 }
+  const leaves = valueTailLeaves(srcExpr)
+  let i = 0
+  while i < leaves.length {
+    recordWidenRetag(leaves[i], nodeTyIxOf(leaves[i]), dm)
+    i = i + 1
+  }
+  0
+}
+
+// Records, for a union box `srcTy` delivered into a union whose non-null members are `dm`,
+// each scalar member `dm` lacks beside the member it widens to: the box built under the source
+// member's tag must hold the widened payload under the destination member's (`widenRetagRowsOf`).
+function recordWidenRetag(srcExpr: i32, srcTy: i32, dm: i32[]) {
+  if srcExpr < 0 { return 0 }
+  const start = widenRetagFromTy.length
+  widenMemberPairs(srcTy, dm, widenRetagFromTy, widenRetagToTy)
+  if widenRetagFromTy.length > start {
+    mapDeliveryRecorded = true
+    widenRetagAt.set(srcExpr, start)
+    widenRetagN.set(srcExpr, widenRetagFromTy.length - start)
+  }
+  0
+}
+
+// The pin column's writer. `kind`/`payload` describe node `nodeIx`'s provenance; a `PIN_NONE`
+// write is a no-op that keeps an ordinary synthesized annotation out of the column entirely,
+// so a reader's "" / `PIN_NONE` answer is unambiguously "not a pin".
+export function recordNodePin(nodeIx: i32, kind: i32, payload: string) {
+  if nodeIx < 0 { return 0 }
+  if kind == PIN_NONE { return 0 }
+  while nodePinKind.length <= nodeIx {
+    nodePinKind.push(PIN_NONE)
+    nodePinPay.push("")
+  }
+  nodePinKind[nodeIx] = kind
+  nodePinPay[nodeIx] = payload
+  0
+}
+
+// The pin payload recorded for node `ix` — for `PIN_SIGKEY`, the `$fnsig` key the
+// monomorphizer resolved for the closure argument that pinned this parameter. "" when the
+// node carries no pin. The read `emit_classify.paramCloSigKey` makes instead of slicing the
+// marker off the node's name.
+export function nodePinPayloadOf(ix: i32) {
+  if ix < 0 { return "" }
+  if ix >= nodePinPay.length { return "" }
+  nodePinPay[ix]
+}
+
+// The deduping record: one `jwTgt*` row per (target, receiver) pair, one `jwSite*` row per
+// admitted site. Returns the target row.
+export function jwRecordSite(
+  ix: i32,
+  chkTy: i32,
+  recv: string,
+  rootTy: i32,
+): i32 {
+  const spell = tyToStr(chkTy)
+  let ti = -1
+  let i = 0
+  while i < jwTgtSpell.length {
+    if jwTgtSpell[i] == spell && jwTgtRecv[i] == recv { ti = i }
+    i = i + 1
+  }
+  if ti < 0 {
+    ti = jwTgtSpell.length
+    jwTgtSpell.push(spell)
+    jwTgtRecv.push(recv)
+    jwTgtTy.push(chkTy)
+    jwTgtRootTy.push(rootTy)
+  }
+  // One row per site, however many times the checker visits it: an un-annotated return is
+  // checked more than once, and the rewrite is in-place, so a second visit must not re-add a row.
+  let j = 0
+  while j < jwSiteNode.length {
+    if jwSiteNode[j] == ix { return ti }
+    j = j + 1
+  }
+  jwSiteNode.push(ix)
+  jwSiteTgt.push(ti)
+  ti
+}
+
+export function sideRowsReset() {
+  identPendNode = []
+  identPendName = []
+  valBindLambda = []
+  voidCtxLambdaNodes = []
+  voidCoerceValNodes = []
+  voidCoerceValNames = []
+  nestedUnannotFns = []
+  nestedUnannotTys = []
+  pgVoid = []
+  joinHead = []
+  joinName = []
+  joinTy = []
+  joinNext = []
+  holeElemIx = []
+  mapDeliveryRecorded = false
+  scalarViewPairs = 0
+  nodePinKind = []
+  nodePinPay = []
+  cFillDoneAt = []
+  pendNames = []
+  pendTys = []
+  pendAts = []
+  pendDepths = []
+  nhLinkA = []
+  nhLinkB = []
+  narDefStmt = []
+  narDefKey = []
+  narDefTy = []
+  narDefChain = []
+}

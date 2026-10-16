@@ -1,0 +1,125 @@
+// Export observation: the reads of an exported function's un-annotated parameters and the
+// concrete types each is delivered to, gathered for the parameter solve.
+// Emptied by `expObsReset` and `expObsProbeReset`. Does not import the checker.
+import { FuncDecl, Ident, P, Param, declNameTokOf, ufcsModOfNode } from "./ast"
+import { i32ListHas, strListIndexOf } from "./listutil"
+import { T, TyVar, tyHasHole } from "./check_types"
+import { fnDeclIx } from "./check_write_scan"
+import { tyHasTyVar } from "./check_ty_shape"
+import { peelParenIx } from "./check_write_effects"
+import { paramHoleName } from "./check_tp_join"
+
+export let paramSolveProbe = false
+export function paramSolveProbeSet(v: boolean) { paramSolveProbe = v }
+
+// ── What the parameter solve saw of an exported function (D3817) ─────────────────────────────
+// `check_pins.vl` decides an uncalled export's parameters from these: each read of a parameter,
+// and each delivery of one read, whole, to a concrete type. Once per declaration per program.
+export let expObsReadParam: i32[] = []
+
+export let expObsReadAt: i32[] = []
+
+export let expObsPinParam: i32[] = []
+
+export let expObsPinTy: i32[] = []
+
+export let expObsPinAt: i32[] = []
+
+let expObsDone: i32[] = []
+
+// The declaration being observed, or -1; its parameters' hole names, names and nodes.
+export let expObsFn = -1
+export function expObsFnSet(v: i32) { expObsFn = v }
+
+let expObsHoles: string[] = []
+
+let expObsNames: string[] = []
+
+let expObsParams: i32[] = []
+
+// Empties the observations; once per program, before its first walk.
+export function expObsReset() {
+  expObsReadParam = []
+  expObsReadAt = []
+  expObsPinParam = []
+  expObsPinTy = []
+  expObsPinAt = []
+  expObsDone = []
+  expObsFn = -1
+  0
+}
+
+// Starts observing the probe of `fd` when it is an exported top-level function of the entry
+// module not observed yet.
+export function expObsBegin(fd: FuncDecl, fnIx: i32) {
+  if fd.fnName == "" || (fnDeclIx[fd.fnName] ?? -1) != fnIx { return 0 }
+  if ufcsModOfNode(fnIx) > 0 || !declIsExportedFn(fnIx) { return 0 }
+  if i32ListHas(expObsDone, fnIx) { return 0 }
+  expObsDone.push(fnIx)
+  expObsHoles = []
+  expObsNames = []
+  expObsParams = []
+  let pi = 0
+  while pi < fd.fnParams.length {
+    const pn = P.nodes[fd.fnParams[pi]]
+    if pn is Param {
+      expObsHoles.push(paramHoleName(fd.fnName, fnIx, pi))
+      expObsNames.push(pn.parName)
+      expObsParams.push(fd.fnParams[pi])
+    }
+    pi = pi + 1
+  }
+  expObsFn = fnIx
+  0
+}
+
+// Whether function node `fx` is declared `export function name`.
+export function declIsExportedFn(fx: i32): boolean {
+  const tk = declNameTokOf(fx)
+  if tk < 2 || tk >= P.toks.length { return false }
+  P.toks[tk - 1].kind == "FUNCTION" && P.toks[tk - 2].kind == "EXPORT"
+}
+
+// The observed parameter identifier `ix`, typed `t`, reads, or -1: its name and its hole both
+// have to be the parameter's, so a binding initialised from it is not it.
+function expObsParamOf(ix: i32, t: i32): i32 {
+  if ix < 0 || t < 0 || t >= T.tys.length { return -1 }
+  const n = P.nodes[ix]
+  const v = T.tys[t]
+  if n is Ident {
+    if v is TyVar {
+      const k = strListIndexOf(expObsHoles, v.tvName)
+      if k >= 0 && expObsNames[k] == n.identName { return expObsParams[k] }
+    }
+  }
+  -1
+}
+
+// Records identifier `ix`, typed `t`, when it reads an observed parameter.
+export function expObsRead(ix: i32, t: i32) {
+  const px = expObsParamOf(ix, t)
+  if px < 0 { return 0 }
+  expObsReadParam.push(px)
+  expObsReadAt.push(ix)
+  0
+}
+
+// Records the delivery of `at`, typed `src`, to `dst` when `at` reads an observed parameter and
+// `dst` is concrete; once per read. The solve's own filters do not apply.
+export function expObsPin(src: i32, dst: i32, at: i32) {
+  if at < 0 { return 0 }
+  const u = peelParenIx(at)
+  const px = expObsParamOf(u, src)
+  if px < 0 || dst < 0 || tyHasHole(dst) || tyHasTyVar(dst) { return 0 }
+  let k = 0
+  while k < expObsPinAt.length {
+    if expObsPinAt[k] == u { return 0 }
+    k = k + 1
+  }
+  expObsPinParam.push(px)
+  expObsPinTy.push(dst)
+  expObsPinAt.push(u)
+  0
+}
+
+export function expObsProbeReset() { paramSolveProbe = false }

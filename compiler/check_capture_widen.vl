@@ -1,0 +1,395 @@
+// A top-level function's captured narrowings (D2529): `crRootCaptureWiden` rebinds, at its
+// declared type, each module binding the body reads whose narrowing a write elsewhere may end
+// before the function runs. With it go the steps the capture-retire analysis shares: the current
+// root and body base (`crCurRoot`, `crFnBase`), the writer key and memo key of a name, the narrowing
+// bank lookups (`crFirstBank`, `crInnerRowBelow`, `crOuterWidest`), the widened-binding rows, the
+// names a body reads, and whether a call or subtree runs user code (`crCallBenign`,
+// `crSubtreeBenign`). The checker owns the steps that report; nothing here imports it.
+import {
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  P,
+  Program,
+  elseIfLink,
+  i32ToStr,
+  nodeSpineChildren,
+} from "./ast"
+import { callDeclFnIx, crIsDispatchSite } from "./check_callee"
+import {
+  crAsgMemo,
+  crCapLossAny,
+  crCapLossBank,
+  crCapWidenBank,
+  crFnBases,
+  crFnIxs,
+  crFnRoots,
+  crProgRoot,
+  crReadLists,
+  crReadMemo,
+  crWideDepths,
+  crWideNames,
+} from "./check_capture_rows"
+import {
+  crAssignTarget,
+  crNodeTok,
+  crNulledBuilt,
+  crNulledNames,
+  crNulledWalk,
+  crRhsNonNull,
+  crsReset,
+  crwAddName,
+  crwBound,
+  crwEnsure,
+  crwUseKinds,
+  crwUseNames,
+  weSplit,
+} from "./check_capture_walks"
+import { inferQuiet } from "./check_cursor"
+import {
+  NAR_KIND_ASG,
+  asgDeclDepths,
+  asgDeclFrames,
+  asgDeclKeys,
+  asgDeclKinds,
+  asgDeclTys,
+} from "./check_nar_bank"
+import { declare, lookup, scopeDepthsOf } from "./check_scopes"
+import { T } from "./check_types"
+import { crArgMayBeFn, crIsScalarRender } from "./check_write_effects"
+
+export function crFnBase(): i32 {
+  if crFnBases.length == 0 { return 0 }
+  crFnBases[crFnBases.length - 1]
+}
+
+export function crCurRoot(): i32 {
+  if crFnRoots.length == 0 { return crProgRoot }
+  crFnRoots[crFnRoots.length - 1]
+}
+
+// The key the writer analysis answers `name` under: the name itself for a binding of the root's
+// own level or the module, which no write resolving inside a nested function can reach, else
+// `name@`, which also counts those writes. Unsure is `name@`, the answer ending more narrowings.
+export function crWriteKey(name: string): string {
+  if crNameAtRootLevel(name) { return name }
+  name + "@"
+}
+
+// The memo key of `crInfoOf(name)` under the current root.
+export function crInfoKey(name: string): string {
+  i32ToStr(crCurRoot()) + "#" + crWriteKey(name)
+}
+
+// Whether `name` reads, through its narrowing layers, a binding declared outside every function
+// body being checked or in the body of the current root itself.
+function crNameAtRootLevel(name: string): boolean {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return false }
+  let j = ds.length - 1
+  while j > 0 && (crFirstBank(name, ds[j]) >= 0 || crWidenedAt(name, ds[j])) {
+    j = j - 1
+  }
+  const d = ds[j]
+  let f = crFnBases.length - 1
+  while f >= 0 && crFnBases[f] > d { f = f - 1 }
+  if f < 0 { return true }
+  crFnIxs[f] == crCurRoot()
+}
+
+// A call that runs no user code and whose function-valued arguments, if any, are lambdas written
+// in place that call only such calls and do not write `name`. A callee named by a binding of the
+// root counts as user code even before that binding is in scope.
+export function crCallBenign(cn: Call, callIx: i32, name: string): boolean {
+  if crIsScalarRender(cn) { return true }
+  const cf = P.nodes[cn.callFn]
+  if cf is Ident {
+    if crwBound.has(cf.identName) { return false }
+  }
+  if callDeclFnIx(cn, callIx) != -2 { return false }
+  let i = 0
+  while i < cn.callArgs.length {
+    const a = cn.callArgs[i]
+    if a >= 0 && a < P.nodes.length {
+      const an = P.nodes[a]
+      if an is FuncDecl {
+        if !crSubtreeBenign(an.fnBody, name) { return false }
+      } else if crArgMayBeFn(a) {
+        return false
+      }
+    }
+    i = i + 1
+  }
+  true
+}
+
+// Whether the subtree at `ix` neither writes `name` nor makes a call `crCallBenign` refuses.
+function crSubtreeBenign(ix: i32, name: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is BinExpr {
+    if n.binOp == "=" {
+      const l = P.nodes[n.binLeft]
+      if l is Ident {
+        if l.identName == name { return false }
+      }
+    }
+  } else if n is Call {
+    if !crCallBenign(n, ix, name) { return false }
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if !crSubtreeBenign(kids[k], name) { return false }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  true
+}
+
+// The first bank row of `name` at depth `d`: the widest type banked there.
+export function crFirstBank(name: string, d: i32): i32 {
+  // A row is banked at the scope on top when it is noted, so depth `d`'s rows are its own
+  // frame's span (`pushScope`); the whole bank is read only when `d` has no frame.
+  const f = d - (T.scopes.length - asgDeclFrames.length)
+  if f >= 0 && f < asgDeclFrames.length {
+    let hi = asgDeclKeys.length
+    if f + 1 < asgDeclFrames.length { hi = asgDeclFrames[f + 1] }
+    let j = asgDeclFrames[f]
+    while j < hi {
+      if asgDeclKeys[j] == name && asgDeclDepths[j] == d { return j }
+      j = j + 1
+    }
+    return -1
+  }
+  let i = 0
+  while i < asgDeclKeys.length {
+    if asgDeclKeys[i] == name && asgDeclDepths[i] == d { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// A top-level function may be called anywhere, after any write, so its body reads a module
+// binding that some code assigns at the declared type, whatever narrowing surrounds it (D2529).
+// Bind `name` at its declared type `wide` in the body scope. The binding stands in for the
+// captured one, so a declaration of the same name in the body shadows it rather than clashing.
+export function crDeclareWidened(name: string, wide: i32) {
+  declare(name, wide)
+  crWideNames.push(name)
+  crWideDepths.push(T.scopes.length - 1)
+  0
+}
+
+export function crWidenedAt(name: string, d: i32): boolean {
+  let i = crWideNames.length - 1
+  while i >= 0 && crWideDepths[i] >= d {
+    if crWideDepths[i] == d && crWideNames[i] == name { return true }
+    i = i - 1
+  }
+  false
+}
+
+export function crRootCaptureWiden(fnIx: i32) {
+  if !inferQuiet { crCapWidenBank[fnIx] = "," }
+  const base = crFnBase()
+  // Rows sit in scope order, so the first is the outermost: none below `base` means no capture.
+  if asgDeclKeys.length == 0 || asgDeclDepths[0] >= base { return 0 }
+  const reads = crBodyReadNames(fnIx)
+  let r = 0
+  while r < reads.length {
+    const nm = reads[r]
+    const i = crInnerRowBelow(nm, base)
+    if i >= 0 && crNameIsModuleTop(nm) {
+      const wide = crOuterWidest(nm, base)
+      if (
+        wide >= 0
+        && wide != lookup(nm)
+        && crRootLoses(fnIx, nm, asgDeclKinds[i])
+      ) {
+        crDeclareWidened(nm, wide)
+        crCapWidenBank[fnIx] = crwAddName(crCapWidenBank[fnIx] ?? ",", nm)
+        crCapLossBank[fnIx] = crwAddName(crCapLossBank[fnIx] ?? ",", nm)
+        crCapLossAny = true
+      }
+    }
+    r = r + 1
+  }
+  0
+}
+
+// Whether top-level function `fnIx` loses the narrowing of module binding `name`, whose innermost
+// layer has bank kind `kind`. An assignment's narrowing, which only removed `null`, is kept when
+// no write can store `null` and nothing can call the function ahead of the narrowing write.
+function crRootLoses(fnIx: i32, name: string, kind: i32): boolean {
+  if kind != NAR_KIND_ASG { return crNameAssignedInProgram(name) }
+  crNameNulledInProgram(name) || !crRootMayKeep(fnIx, name)
+}
+
+export function crNameAssignedInRoot(name: string): boolean {
+  const key = crInfoKey(name)
+  const hit = crAsgMemo[key]
+  if hit is boolean { return hit }
+  crwEnsure(crCurRoot())
+  // A write resolving to a nested function's own binding (kind 3) counts only for such a binding.
+  let inner = 2
+  if crWriteKey(name) != name { inner = 3 }
+  let found = false
+  let u = 0
+  while u < crwUseNames.length && !found {
+    const k = crwUseKinds[u]
+    if (k == 2 || k == inner) && crwUseNames[u] == name { found = true }
+    u = u + 1
+  }
+  crAsgMemo[key] = found
+  found
+}
+
+// Whether `name`'s innermost declaration is at module scope, looking through narrowing layers.
+export function crNameIsModuleTop(name: string): boolean {
+  const ds = scopeDepthsOf[name]
+  if ds == null { return false }
+  let j = ds.length - 1
+  while j >= 0 {
+    if ds[j] == 0 { return true }
+    if crFirstBank(name, ds[j]) < 0 { return false }
+    j = j - 1
+  }
+  false
+}
+
+function crNameAssignedInProgram(name: string): boolean {
+  crFnRoots.push(crProgRoot)
+  const r = crNameAssignedInRoot(name)
+  crFnRoots.pop()
+  r
+}
+
+// Whether an assignment anywhere in the program may store `null` into the module binding `name`:
+// one whose right side is not a non-null literal, and whose target does not resolve to a binding
+// local to a function. One walk of the program answers every name.
+export function crNameNulledInProgram(name: string): boolean {
+  if !crNulledBuilt {
+    crNulledBuilt = true
+    crsReset()
+    crNulledWalk(crProgRoot, 0)
+  }
+  crNulledNames[name] ?? false
+}
+
+// Whether a top-level function `fnIx` may keep an assignment narrowing of module binding `name`:
+// the program's first top-level write of it stores a non-null literal, and no call runs before
+// that write, so nothing can call the function while the binding still holds `null`.
+function crRootMayKeep(fnIx: i32, name: string): boolean {
+  const pr = P.nodes[crProgRoot]
+  if !(pr is Program) { return false }
+  const stmts = pr.progStmts
+  const fnTok = crNodeTok(fnIx)
+  let sawCall = false
+  let s = 0
+  while s < stmts.length {
+    if crNodeTok(stmts[s]) >= fnTok { return false }
+    if crAssignTarget(stmts[s]) == name {
+      const a = P.nodes[stmts[s]]
+      if a is BinExpr {
+        if crRhsNonNull(a.binRight) { return !sawCall }
+      }
+      return false
+    }
+    if !sawCall && crHasCall(stmts[s]) { sawCall = true }
+    s = s + 1
+  }
+  false
+}
+
+// Whether evaluating the statement or expression `ix` may run user code: a call anywhere in it,
+// outside a nested function's body, that `crCallBenign` does not clear, or an operator or index
+// that may dispatch to a declaration.
+function crHasCall(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is FuncDecl { return false }
+  if n is Call {
+    if !crCallBenign(n, ix, "") { return true }
+  }
+  if crIsDispatchSite(ix) { return true }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      if crHasCall(kids[k]) { return true }
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  false
+}
+
+// The distinct bare names the body of function `fnIx` reads, nested functions included.
+export function crBodyReadNames(fnIx: i32): string[] {
+  const hit = crReadLists[fnIx]
+  if hit is string { return weSplit(hit) }
+  crReadAcc = ","
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { crReadWalk(fd.fnBody, i32ToStr(fnIx) + "#") }
+  crReadLists[fnIx] = crReadAcc
+  weSplit(crReadAcc)
+}
+
+// The innermost narrowing bank row of `name` below scope depth `base`, or -1.
+export function crInnerRowBelow(name: string, base: i32): i32 {
+  let i = asgDeclKeys.length - 1
+  while i >= 0 {
+    if asgDeclDepths[i] < base && asgDeclKeys[i] == name { return i }
+    i = i - 1
+  }
+  -1
+}
+
+function crReadWalk(ix: i32, pre: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    const key = pre + n.identName
+    if !crReadMemo.has(key) {
+      crReadMemo[key] = true
+      crReadAcc = crReadAcc + n.identName + ","
+    }
+    return 0
+  }
+  let cur = ix
+  while cur >= 0 {
+    const kids = nodeSpineChildren(cur)
+    let k = 0
+    while k < kids.length {
+      crReadWalk(kids[k], pre)
+      k = k + 1
+    }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+let crReadAcc = ","
+
+// The type `name` reads at under no narrowing, when its innermost binding is a narrowing layer
+// of a function enclosing the one whose body starts at scope depth `base`; -1 otherwise.
+export function crOuterWidest(name: string, base: i32): i32 {
+  const ds = scopeDepthsOf[name]
+  if ds == null || ds.length == 0 { return -1 }
+  if ds[ds.length - 1] >= base { return -1 }
+  let widest = -1
+  let j = ds.length - 1
+  while j >= 0 {
+    const e = crFirstBank(name, ds[j])
+    if e < 0 { return widest }
+    widest = asgDeclTys[e]
+    j = j - 1
+  }
+  widest
+}

@@ -1,0 +1,268 @@
+// The JSON-tree questions a deep `is` asks: which union a receiver is a view of, its
+// members and self-reference, and whether a target shape is one the walker can build.
+// Does not import the checker.
+import { primNameOf } from "./check_ty_shape"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  nomNameOfTy,
+  tySame,
+  tyToStr,
+  tyToStructStr,
+} from "./check_types"
+import { i32ListHas } from "./listutil"
+
+// Extracted from `checkNodeReal`'s `IsExpr` arm (C3: thin the dispatcher).
+// ── the deep-`is` predicates (D1035) ────────────────────────────────────────
+// The array arm's element (`want` 0) or the string-keyed map arm's value (`want` 1) of a
+// union, or -1 when it has none.
+function jsonArmElemOf(ix: i32, want: i32): i32 {
+  const ms = jsonUnionMembers(ix)
+  let i = 0
+  while i < ms.length {
+    const m = T.tys[ms[i]]
+    if m is TyArray {
+      if want == 0 { return m.aElem }
+    } else if m is TyMap {
+      if want == 1 {
+        if m.mSet == 0 {
+          if primNameOf(m.mKey) == "string" { return m.mVal }
+        }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+// The canonical `Json` a receiver type is a view of, or -1 when it is not a JSON tree at all.
+// A receiver is often a complement narrowing of `Json` rather than `Json` itself (`if r is
+// boolean { return }` leaves later reads typed `Json` minus boolean) — the walk resolves the
+// complement to the union its arms are made of, so the memo key stays one per real target.
+function jsonUnionRootOf(ix: i32): i32 {
+  const e = jsonArmElemOf(ix, 0)
+  const v = jsonArmElemOf(ix, 1)
+  if e < 0 { return -1 }
+  if v < 0 { return -1 }
+  if !jsonSelfRef(e, v) {
+    if !tySame(e, v) { return -1 }
+  }
+  if jsonSelfRef(e, ix) { return ix }
+  const e2 = jsonArmElemOf(e, 0)
+  if e2 < 0 { return -1 }
+  if jsonSelfRef(e2, e) { return e }
+  -1
+}
+
+// `jsonUnionRootOf` with the wider receiver admitted: `Json | JsonError` holds no container
+// arm of its own, so the direct question answers -1 and the tree is found one member in.
+// Bounded to one hop deliberately — a union of two JSON trees has no single root to guess at.
+export function jsonUnionRootIn(ix: i32): i32 {
+  const direct = jsonUnionRootOf(ix)
+  if direct >= 0 { return direct }
+  const ms = jsonUnionMembers(ix)
+  let i = 0
+  while i < ms.length {
+    const r = jsonUnionRootOf(ms[i])
+    if r >= 0 { return r }
+    i = i + 1
+  }
+  -1
+}
+
+// The member list of a union type, peeling a `TyNullable` wrapper. `type Json = null |
+// boolean | ...` normalizes to a nullable over the five non-null arms, so a predicate that
+// only reads `TyUnion.uMembers` answers false for the very type it is about.
+export function jsonUnionMembers(ix: i32): i32[] {
+  const none: i32[] = []
+  if ix < 0 { return none }
+  let cur = ix
+  let g = 0
+  while g < 8 {
+    if cur < 0 { return none }
+    const t = T.tys[cur]
+    if t is TyNullable {
+      cur = t.nInner
+    } else if t is TyUnion {
+      if t.uMembers.length == 1 {
+        cur = t.uMembers[0]
+      } else {
+        return t.uMembers
+      }
+    } else {
+      return none
+    }
+    g = g + 1
+  }
+  none
+}
+
+// Does `m` denote the union `ix` itself — the recursion that makes `Json` a tree? The
+// nullable peel above means the arm's element type is the outer index while the member
+// scan reads the inner union, so identity alone is not enough.
+export function jsonSelfRef(m: i32, ix: i32): boolean {
+  if m < 0 { return false }
+  let cur = ix
+  let g = 0
+  while g < 8 {
+    if cur < 0 { return tySame(m, ix) }
+    if m == cur { return true }
+    const t = T.tys[cur]
+    if t is TyNullable {
+      cur = t.nInner
+    } else if t is TyUnion {
+      if t.uMembers.length == 1 {
+        cur = t.uMembers[0]
+      } else {
+        return tySame(m, ix)
+      }
+    } else {
+      return tySame(m, ix)
+    }
+    g = g + 1
+  }
+  tySame(m, ix)
+}
+
+// Whether `mt` is one of `ut`'s members by identity. The membership question `is` asks today
+// is answered by assignability, which admits a refinement of an arm and then answers false for
+// it (D1035). The deep route needs the exact question: an arm is a tag, and only an arm has one.
+export function jsonExactMemberOf(ut: i32, mt: i32): boolean {
+  if ut < 0 || mt < 0 { return false }
+  // `null` is an arm of every nullable spelling and is tested by the ordinary route.
+  if primNameOf(mt) == "null" { return true }
+  const ms = jsonUnionMembers(ut)
+  let i = 0
+  while i < ms.length {
+    if ms[i] == mt { return true }
+    if tySame(ms[i], mt) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The target side. "" when `ix` is a JSON shape the walker can build; otherwise the offending
+// component, in words that name what the author wrote — the refusal blames the `is` site's `T`,
+// never a std file. Vocabulary is `docs/serde-design.md`'s: prims, `T[]`, `{[string]: T}`,
+// structs of those, `T | null`, and the JSON union itself (a wildcard, copied by reference).
+export function jsonShapeBad(ix: i32, recvTy: i32, seen: i32[]): string {
+  if ix < 0 { return "an unresolved type" }
+  // The JSON union itself is the wildcard leaf: `x is Json` inside a shape is trivially true
+  // and the value is taken by reference — asked first so a recursive `Json` skips the cycle guard.
+  if jsonSelfRef(ix, recvTy) { return "" }
+  const nw = nomNameOfTy(ix)
+  if nw != "" {
+    return "`" + nw + "` is a newtype; a JSON shape carries no brand"
+  }
+  if i32ListHas(seen, ix) {
+    return "`"
+      + tyToStr(ix)
+      + "` is recursive; a recursive JSON shape has no walker yet"
+  }
+  const t = T.tys[ix]
+  if t is TyPrim {
+    const p = t.primName
+    if p == "boolean" { return "" }
+    if p == "f64" { return "" }
+    if p == "i32" { return "" }
+    if p == "i64" { return "" }
+    if p == "string" { return "" }
+    if p == "null" { return "" }
+    return "`" + p + "` has no JSON shape"
+  }
+  if t is TyErr { return "an unresolved type" }
+  if t is TyFunc {
+    return "`" + tyToStr(ix) + "` is a closure; a JSON shape cannot hold one"
+  }
+  if t is TyVar {
+    return "`"
+      + tyToStr(ix)
+      + "` is a type parameter; a JSON shape must be concrete"
+  }
+  if t is TyLit {
+    return "`"
+      + tyToStr(ix)
+      + "` is a literal type; a JSON shape has no literal walker yet"
+  }
+  if t is TyNeg { return "`" + tyToStr(ix) + "` is a negation" }
+  seen.push(ix)
+  if t is TyNullable {
+    const r = jsonShapeBad(t.nInner, recvTy, seen)
+    seen.pop()
+    return r
+  }
+  if t is TyArray {
+    if t.aElem < 0 {
+      seen.pop()
+      return "an array whose element type is unknown"
+    }
+    const r = jsonShapeBad(t.aElem, recvTy, seen)
+    seen.pop()
+    return r
+  }
+  if t is TyMap {
+    if t.mSet == 1 {
+      seen.pop()
+      return "`" + tyToStr(ix) + "` is a Set; a JSON object is a map"
+    }
+    if primNameOf(t.mKey) != "string" {
+      seen.pop()
+      return "`"
+        + tyToStr(ix)
+        + "` has a non-string map key; a JSON object's keys are strings"
+    }
+    const r = jsonShapeBad(t.mVal, recvTy, seen)
+    seen.pop()
+    return r
+  }
+  if t is TyObj {
+    const ftys = t.objFieldTypes
+    const fnames = t.objFieldNames
+    let i = 0
+    while i < ftys.length {
+      const r = jsonShapeBad(ftys[i], recvTy, seen)
+      if r != "" {
+        seen.pop()
+        return "field `" + fnames[i] + "`: " + r
+      }
+      i = i + 1
+    }
+    seen.pop()
+    return ""
+  }
+  if t is TyUnion {
+    // `T | null` spelled as a two-member union is the one union shape the walker reads
+    // unambiguously; every wider union refuses by naming the ambiguity rather than guessing an arm.
+    const ms = t.uMembers
+    if ms.length == 2 {
+      if primNameOf(ms[0]) == "null" {
+        const r = jsonShapeBad(ms[1], recvTy, seen)
+        seen.pop()
+        return r
+      }
+      if primNameOf(ms[1]) == "null" {
+        const r = jsonShapeBad(ms[0], recvTy, seen)
+        seen.pop()
+        return r
+      }
+    }
+    seen.pop()
+    // The structural render, not the nominal one: the reader needs to see the arms to see
+    // why they cannot be told apart, and `Amb` on its own names nothing.
+    return "`"
+      + tyToStructStr(ix)
+      + "` is an ambiguous union of shapes; a JSON walker can only tell `T | null` apart"
+  }
+  seen.pop()
+  "`" + tyToStr(ix) + "` has no JSON shape"
+}

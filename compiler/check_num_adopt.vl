@@ -1,0 +1,284 @@
+// Numeric operator typing over a numeric union, and literal adoption: the tails of a value
+// join, an `f32` peer, and a literal tree taking its destination's width.
+// Does not import the checker.
+import {
+  ArrayLit,
+  BinExpr,
+  Block,
+  IfStmt,
+  MatchExpr,
+  ObjLit,
+  P,
+  Paren,
+  Unary,
+} from "./ast"
+import { inferQuiet } from "./check_cursor"
+import { nodeTyIx, nodeTySet } from "./check_node_tys"
+import {
+  binFloatOperandPair,
+  binIntOnlyOp,
+  cmpF32LitAdopts,
+  isExactF64IntLitExpr,
+  isF32AdoptingLitExpr,
+  isFloatLitExpr,
+  litTreeWideTy,
+  numUnionMembersOf,
+} from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import { mixesNumeric, widerNumeric } from "./check_ty_relate"
+import {
+  isNumericPrimTy,
+  nonNullTy,
+  primNameOf,
+  sameNumeric,
+  tyHoldsWideScalar,
+} from "./check_ty_shape"
+import {
+  T,
+  TY_BOOL,
+  TyNullable,
+  TyUnion,
+  tyMapMinted,
+  tySame,
+  tyWideUnionMinted,
+} from "./check_types"
+import {
+  tailPushBlockTail,
+  tailPushIfArms,
+  tailPushMatchArms,
+} from "./check_unconsumed"
+import { mkUnionTy } from "./check_union_mint"
+import { cwPeel } from "./check_write_scan"
+
+// The type an integer literal of an operator tree adopted from its destination or a wide peer
+// (`litTreeAdopt`), parallel to `nodeTyIx`; -1 where none did. Read by `checkNodeReal` so a
+// re-check keeps the width (D2709).
+export let litTreeTy: i32[] = []
+
+// Whether `op` is a comparison, which answers boolean for every member pair.
+export function numCmpOp(op: string): boolean {
+  op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!="
+}
+
+// The type of `a op b` at one member pair, by the rule a scalar pair takes, or -1 when that
+// rule refuses the pair. `n` supplies the operand nodes, so a literal adapts as it does alone.
+export function numPairTy(n: BinExpr, a: i32, b: i32): i32 {
+  const t = numPairOpTy(n, a, b)
+  if t < 0 || !numCmpOp(n.binOp) { return t }
+  TY_BOOL
+}
+
+// The type both operands of `a op b` are brought to at one member pair, which is the result
+// for arithmetic, or -1 when the scalar rule refuses the pair.
+export function numPairOpTy(n: BinExpr, a: i32, b: i32): i32 {
+  const op = n.binOp
+  if numCmpOp(op) {
+    if sameNumeric(a, b) { return a }
+    if mixesNumeric(a, b) { return widerNumeric(a, b) }
+    if !cmpF32LitAdopts(n, a, b) { return -1 }
+    if primNameOf(a) == "f32" || primNameOf(a) == "f64" { return a }
+    return b
+  }
+  if binIntOnlyOp(op) && binFloatOperandPair(a, b) { return -1 }
+  if primNameOf(a) == "f32" && f32AdoptingOperand(n.binRight, a) { return a }
+  if primNameOf(b) == "f32" && f32AdoptingOperand(n.binLeft, b) { return b }
+  if primNameOf(a) == "f64" && isExactF64IntLitExpr(n.binRight) { return a }
+  if primNameOf(b) == "f64" && isExactF64IntLitExpr(n.binLeft) { return b }
+  if mixesNumeric(a, b) { return widerNumeric(a, b) }
+  if sameNumeric(a, b) { return a }
+  -1
+}
+
+// The type of `a op b` at operand types `lt`/`rt`, one a numeric union, as `numUnionBinTy`
+// computes it, or -1 when a member pair has no scalar form. Reports nothing.
+export function numUnionResultTy(n: BinExpr, lt: i32, rt: i32): i32 {
+  let ls = numUnionMembersOf(lt)
+  if ls.length == 0 { ls = [lt] }
+  let rs = numUnionMembersOf(rt)
+  if rs.length == 0 { rs = [rt] }
+  const res: i32[] = []
+  for a in ls {
+    for b in rs {
+      if !isNumericPrimTy(a) || !isNumericPrimTy(b) { return -1 }
+      const p = numPairTy(n, a, b)
+      if p < 0 { return -1 }
+      let seen = false
+      for r in res {
+        if r == p || tySame(r, p) { seen = true }
+      }
+      if !seen { res.push(p) }
+    }
+  }
+  if res.length == 1 { return res[0] }
+  mkUnionTy(res)
+}
+
+// Splits the value `if`, `match` or block at `ix` into `spine`, its `if` and `match` nodes, and
+// `leaves`, the tail values they yield.
+export function valueTailSplit(ix: i32, spine: i32[], leaves: i32[]) {
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = cwPeel(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if tailPushIfArms(at, todo) || tailPushMatchArms(at, todo) {
+        spine.push(at)
+      } else if !tailPushBlockTail(at, todo) {
+        leaves.push(at)
+      }
+    }
+  }
+  0
+}
+
+// A value `if`, `match` or block every tail of which adopts `f32` as a bare literal does, at an
+// `f32` destination or its nullable. Its `if` and `match` nodes are re-typed `f32`, so the
+// emitter builds the join there and each literal re-encodes at single precision (D2619).
+export function f32LitTailsAdopt(srcExpr: i32, dstTy: i32): boolean {
+  const fty = nonNullTy(dstTy)
+  if srcExpr < 0 || primNameOf(fty) != "f32" { return false }
+  const lix = parenPeelIx(srcExpr)
+  if lix < 0 { return false }
+  const e = P.nodes[lix]
+  if !(e is IfStmt || e is MatchExpr || e is Block) { return false }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(lix, spine, leaves)
+  if leaves.length == 0 { return false }
+  let i = 0
+  while i < leaves.length {
+    if !isF32AdoptingLitExpr(leaves[i]) {
+      if litTreeAdoptDst(parenPeelIx(leaves[i]), fty) < 0 { return false }
+    }
+    i = i + 1
+  }
+  if !inferQuiet {
+    let s = 0
+    while s < spine.length {
+      if spine[s] < nodeTyIx.length { nodeTySet(spine[s], fty) }
+      s = s + 1
+    }
+  }
+  true
+}
+
+// Whether the value at `ix` is a float literal, or an `if`, `match` or block every tail of which
+// is one: the values a join beside an f32 value adopts f32 as.
+export function floatLitTails(ix: i32): boolean {
+  if isFloatLitExpr(ix) { return true }
+  const lix = parenPeelIx(ix)
+  if lix < 0 { return false }
+  const e = P.nodes[lix]
+  if !(e is IfStmt || e is MatchExpr || e is Block) { return false }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(lix, spine, leaves)
+  if leaves.length == 0 { return false }
+  let i = 0
+  while i < leaves.length {
+    if !isFloatLitExpr(leaves[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// An operand beside an `f32` peer `peerTy` that adopts f32 as a literal does: a bare literal,
+// or a value `if`, `match` or block whose every tail is one.
+export function f32AdoptingOperand(ix: i32, peerTy: i32): boolean {
+  if isF32AdoptingLitExpr(ix) { return true }
+  f32LitTailsAdopt(ix, peerTy)
+}
+
+// Types every node of the literal tree at `ix` as `ty`, its literals through `litTreeTy` so a
+// re-check keeps the width. Answers `ty`.
+function litTreeAdopt(ix: i32, ty: i32): i32 {
+  if ix < nodeTyIx.length { nodeTySet(ix, ty) }
+  const e = P.nodes[ix]
+  if e is Paren { return litTreeAdopt(e.parInner, ty) }
+  if e is Unary { return litTreeAdopt(e.unArg, ty) }
+  if e is BinExpr {
+    litTreeAdopt(e.binLeft, ty)
+    // A shift count is not an operand of the result's width; it keeps its own.
+    if binShiftOp(e.binOp) { return ty }
+    return litTreeAdopt(e.binRight, ty)
+  }
+  litTreeAdoptLeaf(ix, ty)
+}
+
+// A tree's other nodes are its literals (`litTreeOps` admits no other), each recorded so a
+// re-check keeps the width.
+function litTreeAdoptLeaf(ix: i32, ty: i32): i32 {
+  while litTreeTy.length <= ix { litTreeTy.push(-1) }
+  litTreeTy[ix] = ty
+  ty
+}
+
+// A tree of integer literals takes its destination's width, as a bare literal does, so
+// `const a: i64 = 3 << 32` computes at 64 bits rather than wrapping at 32 first, and the operand
+// beside a wide one takes that one's, so `x + (1 << 40)` over an `i64` adds 2^40 (D2709).
+// Answers the adopted type, or -1; a speculative check answers without recording.
+export function litTreeAdoptDst(ix: i32, dstTy: i32): i32 {
+  if ix < 0 { return -1 }
+  const ty = litTreeWideTy(ix, dstTy)
+  if ty < 0 || inferQuiet { return ty }
+  litTreeAdopt(ix, ty)
+}
+
+export function litTreeTyOf(ix: i32): i32 {
+  if ix >= 0 && ix < litTreeTy.length { return litTreeTy[ix] }
+  -1
+}
+
+export function binShiftOp(op: string): boolean {
+  op == "<<" || op == ">>" || op == ">>>"
+}
+
+// The values a delivery of `srcExpr` hands over: the value itself, or every tail of a value
+// `if`, `match` or block, so a literal in an arm is walked as the bare literal is (D2730).
+export function valueTailLeaves(srcExpr: i32): i32[] {
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(srcExpr, spine, leaves)
+  leaves
+}
+
+// The cheap gate ahead of `recordMapUnbox`: only a union (a box, or a value join typed as one)
+// or a list or record literal, which is walked to its parts, can record anything.
+export function mapDeliveryMayRecord(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  if !tyMapMinted && !(tyWideUnionMinted && tyHoldsWideScalar(dstTy, 8)) {
+    return false
+  }
+  if srcTy >= 0 && srcTy < T.tys.length {
+    const st = T.tys[srcTy]
+    if st is TyUnion || st is TyNullable { return true }
+  }
+  if nodeIsCtorLit(srcExpr) { return true }
+  if !nodeIsValueJoin(srcExpr) { return false }
+  // Every tail of a value `if` or `match`, which joins record literals as one record rather
+  // than a union (D2731).
+  const ls = valueTailLeaves(srcExpr)
+  let i = 0
+  while i < ls.length {
+    if nodeIsCtorLit(ls[i]) { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether node `ix` is a list or record literal.
+function nodeIsCtorLit(ix: i32): boolean {
+  const n = P.nodes[ix]
+  n is ArrayLit || n is ObjLit
+}
+
+// Whether node `ix` is an `if` or a `match`, the two value joins with tails.
+function nodeIsValueJoin(ix: i32): boolean {
+  const n = P.nodes[ix]
+  n is IfStmt || n is MatchExpr
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function numAdoptReset() { litTreeTy = [] }

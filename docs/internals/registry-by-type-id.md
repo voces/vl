@@ -684,6 +684,193 @@ this change.)
 **What the next switch needs.** Site 42 needs the class-As sibling resolved, as above. Every
 other site still holds a `name-only` or `differ` reach.
 
+### Step 5 — the third switch: fallback seams take their `name-only` reaches with them
+
+Re-measured at d55ca0e8c, armed, over 5,344 `tests/cases` files and the distilled corpus. No
+reach moved class since the second switch. The switch criterion changes: a site with no `differ`
+reach is a CANDIDATE, and `difftree.sh --identity` decides. That admits two kinds the first two
+switches excluded. A `neither` reach finds a row on neither side, so the boolean answer is the
+same. A `name-only` reach at a FALLBACK seam (`unionHasAtomAB`, `unionMemberTysOfAB`) keeps the
+spelling's answer, because the key finds no row there. `unionMemberTysOfAB` gained the switch.
+Before, it always read the spelling.
+
+**Thirteen sites join.** Reaches are agree / name-only / id-only / neither / alias.
+
+| site | seam | `tests/cases` | distilled |
+| --- | --- | --- | --- |
+| 3 `unionNameOfExpr/as` | `isUNameAB` | 0 / 0 / 6 / 24,262 / 0 | 0 / 0 / 0 / 28,088 / 0 |
+| 10 `internShapeDeep/armTys` | `unionMemberTysOfAB` | 214 / 4 / 0 / 0 / 0 | 0 |
+| 13 `memberUnionFieldName` | `unionMemberTysOfAB` | 666 / 79 / 0 / 0 / 0 | 0 |
+| 14 `writeRhsIsNullBearing` | `unionHasAtomAB` | 319 / 85 / 0 / 0 / 2 | 198 / 0 / 0 / 0 / 0 |
+| 23 `collectU/inferLetTy` | mint | 147 / 2 / 0 / 0 / 4 | 45 / 0 / 0 / 0 / 2 |
+| 19 `unionNameOfExpr/closure` | `isUNameAB` | neither 5 | 0 |
+| 30, 32, 33, 36, 37, 38, 39 (`riu/arrayAtom`, `nulRefArray`, `nulShape`, `nulCloRefArray`, `nestedArray`, `arrayShape`, `fnResult`) | `isUNameAB` / `isUNameKeyAB` | neither only: 1,144 / 159 / 305 / 4 / 210 / 44 / 11 | neither only: 63 / 39 / 256 / 0 / 140 / 0 / 0 |
+
+**Five candidates were refused by the module diff.** That puts the switched set at 24 sites.
+
+| site | why | modules changed |
+| --- | --- | --- |
+| 24 `collectU/arrLitInferElem`, 44 `riu/inferRetNominal`, 45 `riu/arrElemUnion`, 46 `riu/api` | an `id-only` reach at a mint GUARD: the key finds a row, so the sibling mint is skipped, the same shape as class As/Av | 6 (`capture-inferred-projection-nonstruct`, `closure-alias-union-return-hof`, `union-returning-map`, `arm-literal-through-a-list-conduit`, `map-read-coalesce-other-arm`, `union-if-value-variant`) |
+| 11 `exprIsUnionStrEq/l` | its 6 reaches in `value-union-eq-both-sides.vl` are `agree` on the ROW, but the answers differ. `unionHasAtom("U", "string")` reads the alias spelling and answers false, while the key row's atoms answer true | 1, which gains 12 unused locals in the start function |
+
+Site 11 is the lesson. An `agree` reach says that both sides find the same row. It does not say
+that a fallback seam's name leg reads that row: `unionHasAtom` splits the spelling and never
+looks the row up. So for a fallback seam, `agree` is evidence, and the module diff is the proof.
+
+**The proof.** `difftree.sh --identity` over 15,233 files: **10,282 modules built, 0 differ,
+0 uncompared**. The candidate compiling master's source reproduces master's fixpoint. The seed
+is still a fixpoint (5,794,849 bytes, 208 more than master's). `rep-fuzz-check.sh` reads exact
+with 0 baselined failures. `regress.vl` loses no runs. The render-parse ratchet reads 98
+`tyToEmitName` / 378 type-string parses, unchanged: a seam switch removes no parser call.
+
+**What the next switch needs.** The unswitched sites fall into four groups:
+
+* Site 42 is still blocked by class As.
+* Sites 24, 44, 45 and 46 are `id-only` mint guards of the same shape. They switch when a key
+  sibling's mint adopts the key row, which is also what unblocks site 42.
+* Site 11 needs `unionHasAtom`'s name leg to read the row for a declared alias. That is a module
+  change, so it needs its own output-identical proof.
+* Sites 1, 2, 5, 6, 7, 15, 17, 26, 27 and 29 hold `differ` reaches. Sites 16, 18, 28 and 41 hold
+  `name-only` reaches at strict seams. Sites 20 and 25 have no reach at all.
+
+### Step 5 — the fourth switch: a mint guard adopts the key row, 45 of 47 sites on the key
+
+**The adopt.** `unNameAdoptKeyRow(name, ty)` binds an unregistered spelling to the row its key
+finds (`unRowBySid`) and answers whether `name` now names a row. Every mint guard (sites 1, 24,
+45/`registerInlineUnionAt`, 46) skips the mint only when the key OR the spelling says a row
+exists AND the adopt succeeds. The adopt is conservative: a spelling with fewer than two members
+(a softened literal union, `i32` for a litunion's row) or one whose own key is not the row's
+stays unbound and mints exactly as before. Without the member guard two `literal-unions`
+fixtures build invalid modules, because `i32` keys to a litunion's row.
+
+**`differ` is answer-neutral at a boolean seam.** At `isUNameAB` a `differ` reach finds a row on
+both sides, so both answer true. The reaches that change an answer are `name-only` ones: a
+spelling names a row the key misses. Traced, they are nominal against structural keys: a row
+`Cat|Dog` against the arena type `{meow:i32}|{woof:i32}`, a `Json` composite against its
+expanded type, and `i32|{f:i32}`, whose record `canonUnionKeyAtomOfTy` renders nominally. So
+sites 2, 5, 6, 15, 17, 18, 20, 26, 27 and 28 switch with the FALLBACK flavour
+(`unSiteFallsBack`): true when the key finds a row, else the spelling's answer.
+
+**Site 11's two answers.** `exprIsUnionStrEq` only decides whether the string scratch frame is
+reserved; the string arm calls `gHelpStrEq`, which needs no frame. For `U = i32 | string` the key's
+`true` is the contract's answer and only over-reserves (12 unused locals); the spelling's `false`
+gives no wrong value. No row is filed.
+
+**Two sites stay on the spelling.** Each was found by a bisection over single-site exclusions:
+
+| site | what the key did | witness |
+| --- | --- | --- |
+| 7 `internShapeDeep` value-union mint | the caller's type at a generic pin can be another pin's union, so the row was minted under the wrong key | `f<T>(x: T) { print([x].map((e): T \| f64 => e)[0]) }` pinned at `i32 \| null` then `i32 \| string`: prints `null` for `"u"`. Its corpus fixture (`map-declared-return-flattens-at-pin`) ran the same, only the module changed |
+| 16 `arrLitUnionElemName` | the softened spelling `i32` keyed to a numeric litunion's row, which is no box element | `numeric-litunion-empty-list-seed`, `list-element-narrowing-map-copy-runs` (invalid wasm) and the four `d362*_numlitun_*` cells (emit refusal) |
+
+**Rows closed.** D1790: the inline-union registrar now adopts the row for an alias-arm spelling
+(`[mkU()]` with `mkU(): U | boolean`) instead of declining, and the
+`is-union-alias-arm` matrix's two skipped positions run (66 of 66). D3153: `letAnnIsUnion`
+(site 2) finds the narrowed copy's row by key, so a closure capturing it builds; the `string`
+twin and both walk spellings run too.
+
+**The 17 changed modules.** `difftree.sh --identity` against master's seed: 10,285 built, 19
+differ, 0 uncompared. Two of the 19 are this step's new fixtures, which master cannot build. The
+other 17 run the same, and all but one keep their size.
+
+| modules | change |
+| --- | --- |
+| 16: `inferred-union-element-literal`, `capture-inferred-projection-nonstruct`, `capture-ref-types`, `closure-alias-union-return-hof`, `closure-litunion-param-pin-boxed-first`, `closure-union-param-pin-litunion-first`, `closure-union-return`, `union-returning-map`, `generics/union-arg`, `arm-literal-through-a-list-conduit`, `coalesce-result-rep`, `is-inline-shape-names-a-nominal-variant`, `map-read-coalesce-other-arm`, `nullable-union-alias`, `union-annotated-local-unclaimed-twin`, `union-if-value-variant` | only `i32.const` operands: the adopted spelling no longer mints a duplicate variant slice, so `assignTags` ranks and the scalar tags after the variants fall |
+| `value-union-eq-both-sides` (2,592 → 2,622 bytes) | site 11's 12 unused string-scratch locals in the start function |
+
+**Proof.** The fixpoint holds at 5,808,655 bytes (+0.2% on the baseline), and
+difftree's fixpoint identity holds against master. rep-fuzz is exact (0 unsound, 0 reject).
+`regress.vl` loses no runs; its three `rv3310` trap_loads→trap_loads movements read the same
+under the third switch's seed. `check-filed-witnesses --strict` reports 0 MOVED. The
+render-parse ratchet goes from 98 / 378 to 98 / 379: the adopt's
+`unionMemberCount(name) < 2` guard is one new parse. It stays because the type and the row
+cannot tell a one-atom litunion alias from its expansion, and dropping the guard breaks
+`litunion-list-concat-backing` and `single-literal-type`.
+
+**What remains.** Sites 7 and 16. Making the fallback sites strict needs `canonUnionKeyOfTy` and
+the name key to agree on nominal against structural records, and site 16 needs the key to tell a
+softened literal union from its base scalar.
+
+### Step 5 — the fifth switch: all 47 sites on the key, the fallback answers by type
+
+**Every site is on the key.** `unSiteOnKey` is now every site from 1 to `UNAB_N - 1`. Where the
+key finds no row, `unSiteWideHit(site, name, ty)` answers. Its answer comes from the type, not
+the spelling, and it applies only at the twelve sites that ask whether the TYPE has a row: 2, 5,
+6, 7, 15, 16, 17, 18, 20, 26, 27 and 28 (`unSiteWideAsks`). `unSiteFallsBack` is deleted.
+
+`unRowOfTyWide(ty)` finds the row in two ways, the cases where the key and the row differ only
+in rendering:
+
+- By the key of the nullable union with `null` at each member position
+  (`canonUnionKeyNullAtOfTy`). A nullable union's row keeps `null` where it was spelled, while
+  the arena renders it last.
+- By a recorded union type with the same member sequence, order kept (`unTySeqSameShape`).
+  Records and maps compare by `repCanonId`, so a nominal `Cat|Dog` row answers for its
+  structural `{meow:i32}|{woof:i32}`.
+
+The binding and return seams (2, 5, 6, 27, 28) also keep the spelling's answer when the arena type is not a union at all.
+That happens for a softened literal union, and for same-shape records collapsed into one record
+(`unions/same-shape-inline-union-is`).
+
+**Site 9 asks about the spelling, and the licence cannot see it.** The first candidate gave the
+type's answer at every site, and site 9 broke. `inferRetArenaUnionIsDup` asks whether the arena
+SPELLING already names a row. The type's answer said yes, so `{meow:i32}|{woof:i32}` was minted
+beside `Cat|Dog`. `functions/inferred-union-one-row` went from 1 row to 2, with a
+`canon-merge-diffset`, and its tag constants moved from 1 to 2. `vl_union_key_licence_test.ts`
+passed, because the licence counts merges at the write seams. The bug showed up in the
+per-file `unionSweep/rows` sweep under `VL_REP_SHADOW=1`. A second candidate gave the type's
+answer only at the ten former fallback sites, and that broke site 16: `arrLitUnionElemName` went
+name-only, and a list-literal fixture's module pulled in the string runtime (621 → 2,235 bytes).
+The set above is the one where both hold.
+
+**Site 7.** The fourth switch's witness, `f<T>(x: T)` returning `T | f64` and pinned at
+`i32 | null` and then at `i32 | string`, is a nested union: at the second pin the return type
+is `(i32 | string) | f64`. `valueUnionVerdict` counted the nested union as one member and
+declined, so the mint read the first pin's row. `valueUnionFlatten` now flattens nested unions
+before counting (depth 8, declining past it), and the witness prints `u`
+(`generics/union-return-pinned-at-two-unions`).
+
+**Site 16.** `arrLitUnionElemName` answers `""` when the element type is a numeric literal union
+(`tyNumScalarBaseName`). Such a type keys to its own row but is represented as its base scalar,
+so it is never a box element. `numeric-litunion-empty-list-seed`,
+`list-element-narrowing-map-copy-runs` and the four `d362*_numlitun_*` cells all build.
+
+**The adopt's guard.** The parse `unionMemberCount(name) < 2` is gone from `unNameAdoptKeyRow`.
+A declared alias name (`cUserTypes`) stays unbound, and so does a type that is a union of fewer
+than two members. `litunion-list-concat-backing` and `single-literal-type` run, and render-parse
+goes from 379 to 378.
+
+**Row filed.** D4989: an `A | B` value of two same-shape records, delivered into `A | B | null`,
+is stored as the bare record where the slot wants the union box. That is check-clean invalid
+wasm, and it reproduces the same at the fourth switch's head. A fallback-site probe found it;
+this step does not touch it.
+
+**One changed module.** `difftree.sh --identity` against master's seed reports 10,296 built,
+28 differ and 0 uncompared. 26 of the 28 build byte-identical modules under the fourth
+switch's head, so they belong to that PR, not this step. The other two:
+
+| module | change |
+| --- | --- |
+| `lists/spread-boxes-into-union-element-list` | a duplicate row is gone: 6 rows and one `canon-merge-diffset` become 5 rows and none. Only `i32.const` tags fall by 2, and the module is 4,466 bytes on both sides with the same output |
+| `generics/error-is-list-arm-read-by-closure-unbound` | an emit-error fixture that builds on neither side, with identical diagnostics |
+
+The per-file `unionSweep/rows` and `canon-merge-diffset` sweep over the same population,
+fourth-switch head against candidate, differs in that one file only.
+
+**Proof.** The fixpoint holds at 5,830,238 bytes (+0.6% on the baseline; the fourth switch's head
+builds to 5,827,005), and difftree's fixpoint identity holds against master. rep-fuzz is exact
+(0 unsound, 0 reject). `regress.vl` loses no runs and moves nothing to silent; its three
+`rv3310` trap_loads→trap_loads movements are the same ones as before. `check-filed-witnesses
+--strict` reports 2,825 graded, 0 MOVED. Render-parse goes from 99 / 379 to 99 / 378. Ten
+union-delivery position matrices show 0 runs→not-runs and 0 silent, among them
+`is-union-alias-arm`, `union-member-widened-delivery`, `nullable-record-beside-record-union`
+and `inline-litunion-value` (66 of 66 each).
+
+**What remains.** The key answers every site. The spelling still answers in two places: for a
+caller with no type (`ty < 0`), and at the five binding and return seams when the arena type is
+not a union. The second goes away once a softened literal union and a collapsed same-shape union
+carry a key of their own.
+
 ## 6. The storage-class ladders
 
 `VKind` has **30 members** (`emit_state.vl:536`). Measured across `compiler/*.vl`: **119 dispatch

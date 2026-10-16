@@ -1,0 +1,171 @@
+// Delivery retag rows: a list of union boxes widened into a `readonly` list, and the map
+// and widening rows the emitter's per-expression hook reads.
+// Does not import the checker.
+import {
+  containerElemClassDiffers,
+  primAmong,
+  scalarElemWidenServed,
+  widenMemberPairs,
+} from "./check_ty_relate"
+import {
+  nonNullTy,
+  tyHasNullMember,
+  unionLeafIsWide,
+  unionLeavesInto,
+} from "./check_ty_shape"
+import { T, TyArray, tyWideUnionMinted } from "./check_types"
+
+// Per node, the retag rows of a union delivered into a union lacking one of its map members
+// (`recordMapRetag`): the first row and the count, over the two parallel type columns.
+export let mapRetagAt: {[i32]: i32} = Map()
+export let mapRetagN: {[i32]: i32} = Map()
+export let mapRetagFromTy: i32[] = []
+export let mapRetagToTy: i32[] = []
+// Per node, the rows of a union box delivered into a union that lacks one of its scalar members
+// but holds one it widens to (`recordWidenRetag`): the first row and the count, as above.
+export let widenRetagAt: {[i32]: i32} = Map()
+export let widenRetagN: {[i32]: i32} = Map()
+export let widenRetagFromTy: i32[] = []
+export let widenRetagToTy: i32[] = []
+// Per node, the same rows for each element of a list of such boxes delivered as a `readonly`
+// list (`recordListWidenRetag`), over the two columns above.
+export let listRetagAt: {[i32]: i32} = Map()
+export let listRetagN: {[i32]: i32} = Map()
+
+// Is `src` -> `dst` a list pair refused only because `dst` is mutable, so `readonly dst`
+// would accept it? A converting-copy pair (D965) or one whose element keeps its storage.
+export function containerWidenReadonlyServes(src: i32, dst: i32): boolean {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray {
+      if d.aRead == 1 { return false }
+      if scalarElemWidenServed(s.aElem, d.aElem) { return true }
+      if unionElemMemberWidens(s.aElem, d.aElem) { return false }
+      return !containerElemClassDiffers(s.aElem, d.aElem)
+    }
+  }
+  false
+}
+
+// A list of union boxes delivered as a `readonly` list whose element holds one of their scalar
+// members only widened is copied, each box rebuilt as `recordWidenRetag` rebuilds one (D2999).
+export function recordListWidenRetag(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return 0 }
+  if srcTy >= T.tys.length || dstTy >= T.tys.length { return 0 }
+  const s = T.tys[srcTy]
+  // A destination that may be null holds the copy as it would the list.
+  const dn = nonNullTy(dstTy)
+  if dn < 0 || dn >= T.tys.length { return 0 }
+  const d = T.tys[dn]
+  if !(s is TyArray) || !(d is TyArray) { return 0 }
+  if d.aRead != 1 || !unionElemMemberWidens(s.aElem, d.aElem) { return 0 }
+  const dm: i32[] = []
+  unionLeavesInto(d.aElem, dm, 8)
+  const start = widenRetagFromTy.length
+  widenMemberPairs(s.aElem, dm, widenRetagFromTy, widenRetagToTy)
+  if widenRetagFromTy.length > start {
+    listRetagAt.set(srcExpr, start)
+    listRetagN.set(srcExpr, widenRetagFromTy.length - start)
+  }
+  0
+}
+
+// Whether the module delivers some list of union boxes as a `readonly` list with a widened
+// member, so a list of such a union may hold a box under a narrower member's tag (D3026).
+export function listWidenRetagAny(): boolean { listRetagN.length > 0 }
+
+// The rows `recordListWidenRetag` recorded at `ix`, pushed onto `from` and `to`.
+export function listWidenRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
+  if listRetagN.length == 0 { return 0 }
+  const st = listRetagAt.get(ix) ?? -1
+  if st < 0 { return 0 }
+  widenRetagRowsFrom(st, listRetagN.get(ix) ?? 0, from, to)
+}
+
+// The `n` widening rows from `st`, pushed onto `from` and `to`.
+function widenRetagRowsFrom(st: i32, n: i32, from: i32[], to: i32[]) {
+  let i = st
+  while i < st + n && i < widenRetagFromTy.length {
+    from.push(widenRetagFromTy[i])
+    to.push(widenRetagToTy[i])
+    i = i + 1
+  }
+  0
+}
+
+// Whether a union box element `se` stored where `de` is wanted needs a member widened, which
+// changes what its box holds: a list or map of them is stored differently (D2982).
+export function unionElemMemberWidens(se: i32, de: i32): boolean {
+  if de < 0 || de >= T.tys.length { return false }
+  if !tyWideUnionMinted || !unionLeafIsWide(de, 8) { return false }
+  const dm: i32[] = []
+  unionLeavesInto(de, dm, 8)
+  if dm.length < 2 && !tyHasNullMember(de) { return false }
+  const from: i32[] = []
+  const to: i32[] = []
+  widenMemberPairs(se, dm, from, to)
+  from.length > 0
+}
+
+// Whether `recordMapRetag` or `recordWidenRetag` recorded a row at `ix`: one gate for the
+// emitter's per-expression hook.
+export function deliveryRetagHas(ix: i32): boolean {
+  if mapRetagFromTy.length == 0 && widenRetagFromTy.length == 0 { return false }
+  mapRetagAt.has(ix) || widenRetagAt.has(ix)
+}
+
+// Whether a widening retag row rebuilds a box under the primitive `name`, whose value box the
+// module must then carry even where no declared union names it (a pin can mint the member).
+export function widenRetagToHas(name: string): boolean {
+  primAmong(name, widenRetagToTy) >= 0
+}
+
+// Whether any delivery in the program records a widening retag.
+export function widenRetagAny(): boolean { widenRetagFromTy.length > 0 }
+
+// The widening rows `recordWidenRetag` recorded at `ix`, pushed onto `from` and `to`.
+export function widenRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
+  const st = widenRetagAt.get(ix) ?? -1
+  if st < 0 { return 0 }
+  widenRetagRowsFrom(st, widenRetagN.get(ix) ?? 0, from, to)
+}
+
+// The retag rows `recordMapRetag` recorded at `ix`, pushed onto `from` and `to`.
+export function mapRetagRowsOf(ix: i32, from: i32[], to: i32[]) {
+  const st = mapRetagAt.get(ix) ?? -1
+  if st < 0 { return 0 }
+  const n = mapRetagN.get(ix) ?? 0
+  let i = st
+  while i < st + n && i < mapRetagFromTy.length {
+    from.push(mapRetagFromTy[i])
+    to.push(mapRetagToTy[i])
+    i = i + 1
+  }
+  0
+}
+
+// Every retag row recorded in the program, pushed onto `from` and `to`.
+export function mapRetagAllRows(from: i32[], to: i32[]) {
+  let i = 0
+  while i < mapRetagFromTy.length {
+    from.push(mapRetagFromTy[i])
+    to.push(mapRetagToTy[i])
+    i = i + 1
+  }
+  0
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function retagRowsReset() {
+  mapRetagAt = Map()
+  mapRetagN = Map()
+  mapRetagFromTy = []
+  mapRetagToTy = []
+  widenRetagAt = Map()
+  widenRetagN = Map()
+  widenRetagFromTy = []
+  widenRetagToTy = []
+  listRetagAt = Map()
+  listRetagN = Map()
+}

@@ -1,0 +1,383 @@
+// Call resolution rows: unpinned UFCS sites and misses, overloaded member calls and function
+// values, operator self-functions, and the `a op b` sites a hole declaration dispatched or
+// declined. Emptied by `callResolveReset`. Does not import the checker.
+import { lookup } from "./check_scopes"
+import { Call, FuncDecl, Ident, OP_INDEX_SET, P, Param, i32ToStr } from "./ast"
+import { i32ListHas, strListHas } from "./listutil"
+import {
+  T,
+  TY_ERR,
+  TyErr,
+  TyFunc,
+  TyVar,
+  tyBuiltinIndexable,
+  tyHasHole,
+  tyToStrUser,
+} from "./check_types"
+import { fnDeclIx } from "./check_write_scan"
+import { tyHasTyVar } from "./check_ty_shape"
+import { peelParenIx } from "./check_write_effects"
+import { ufcsRecvExpr } from "./check_overload"
+import { nodeTyIxOf } from "./check_node_tys"
+import { curFnDeclIx, inferQuiet } from "./check_cursor"
+import {
+  opBinSiteFn,
+  opBinSiteNode,
+  opIdxFns,
+  opIdxOps,
+  opIdxSiteFn,
+  opIdxSiteNode,
+} from "./check_callee"
+
+// The member calls of those rows the emitter cannot re-dispatch per instance: inside a closure
+// or a nested function, or on a receiver that is not the generic's own parameter (D2520).
+export let ufcsUnpinnedSites: i32[] = []
+export function ufcsUnpinnedSitesPush(v: i32) { ufcsUnpinnedSites.push(v) }
+
+// Overloaded member calls whose receiver each instance supplies (`ovHoleCallTy`).
+export let ovHoleSites: i32[] = []
+export function ovHoleSitesPush(v: i32) { ovHoleSites.push(v) }
+
+// Functions whose instances pick an overloaded candidate per call, and function names read
+// as values (node, declaration, name): such a value is refused (`ovUnpinnedReport`).
+export let ovDepFns: i32[] = []
+export function ovDepFnsPush(v: i32) { ovDepFns.push(v) }
+
+export let ovFnValIx: i32[] = []
+
+export let ovFnValDecl: i32[] = []
+
+export let ovFnValName: string[] = []
+
+// The element type a named `map`/`filter` callback is typed by, keyed on its `Ident` node.
+export let ovCbElem: {[i32]: i32} = Map()
+export function ovCbElemSetAt(k: i32, v: i32) { ovCbElem[k] = v }
+
+// D1230 — the missing-import answer, banked at the callee member node by the call site that
+// computed it and read back by the member arm that raises the sentence: only the call knows the
+// argument count deciding whether a candidate's arity fits, only `checkMemberNode` reaches the
+// arm that names the receiver. `ufcsMissSpecs[i]` is the `,`-joined list; a node is banked once.
+export let ufcsMissAt: i32[] = []
+export function ufcsMissAtPush(v: i32) { ufcsMissAt.push(v) }
+
+export let ufcsMissSpecs: string[] = []
+export function ufcsMissSpecsPush(v: string) { ufcsMissSpecs.push(v) }
+
+// D1570 — the "the function exists and is not a method" answer, banked the same way and for the
+// same reason: the call knows the argument count, the member arm raises the sentence. The
+// message is banked rather than the ingredients `ufcsMissSpecs` banks, because three arms of one
+// mirror produce it and re-deriving the arm at the raise would be the ladder written twice.
+export let ufcsWhyAt: i32[] = []
+export function ufcsWhyAtPush(v: i32) { ufcsWhyAt.push(v) }
+
+export let ufcsWhyMsg: string[] = []
+export function ufcsWhyMsgPush(v: string) { ufcsWhyMsg.push(v) }
+
+export let ufcsWhyData: string[] = []
+export function ufcsWhyDataPush(v: string) { ufcsWhyData.push(v) }
+
+// D491 — `binOpDeadSelf` refuses a binary-operator declaration whose `self` can never be an
+// object and subtracts the hole, since `function "+"<T>(self: T, other: T)` is silent at an i32
+// site and dispatches at an object one. The missing input is at the sites, so this banks what
+// each `a op b` site did; a declaration with no site anywhere is not this class and stays legal.
+export let opBinHoleDeclName: string[] = []
+export function opBinHoleDeclNamePush(v: string) { opBinHoleDeclName.push(v) }
+
+export let opBinHoleDeclNode: i32[] = []
+export function opBinHoleDeclNodePush(v: i32) { opBinHoleDeclNode.push(v) }
+
+export let opBinHoleDeclAnn: boolean[] = []
+export function opBinHoleDeclAnnPush(v: boolean) { opBinHoleDeclAnn.push(v) }
+
+export let opBinDispatched: string[] = []
+
+export let opBinDeclined: string[] = []
+
+// The banked row for member node `memIx`, or -1. A node is banked at most once.
+export function ufcsWhyRow(memIx: i32) {
+  let i = 0
+  while i < ufcsWhyAt.length {
+    if ufcsWhyAt[i] == memIx { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether the emitter can re-dispatch member call `ix` per instance of `owner`: the call sits
+// in `owner`'s own body, not a closure's, and its receiver is one of `owner`'s parameters.
+export function ufcsSitePinnable(ix: i32, owner: i32): boolean {
+  if owner < 0 || owner != curFnDeclIx || ix < 0 || ix >= P.nodes.length {
+    return false
+  }
+  const c = P.nodes[ix]
+  const fd = P.nodes[owner]
+  if c is Call {
+    if fd is FuncDecl {
+      const rx = peelParenIx(ufcsRecvExpr(c))
+      if rx < 0 { return false }
+      const r = P.nodes[rx]
+      if r is Ident {
+        let i = 0
+        while i < fd.fnParams.length {
+          const pp = P.nodes[fd.fnParams[i]]
+          if pp is Param {
+            if pp.parName == r.identName { return true }
+          }
+          i = i + 1
+        }
+      }
+    }
+  }
+  false
+}
+
+// The tail of the parameter list an index operator wants, for the arity error.
+export function opIdxArityTail(op: string) {
+  if op == OP_INDEX_SET { return ", value" }
+  ""
+}
+
+// A `self` annotation whose index expression the language always answers itself, so an index
+// operator declared over it can never dispatch (D445). Routed through `tyBuiltinIndexable`
+// rather than re-listing its arms, so the reject and the swallow cannot drift — minus an
+// un-pinned hole (a live receiver) and the error type (already reported at the annotation).
+export function opIdxDeadRecv(ty: i32) {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyVar { return false }
+  if t is TyErr { return false }
+  tyBuiltinIndexable(ty)
+}
+
+// BANK the resolved operator function on its site node, for the emitter's
+// dispatch rewrite to read back. Only on the REAL pass — a quiet inference probe
+// may resolve against a hole that later pins elsewhere.
+export function opIdxBank(siteIx: i32, fn: string) {
+  if inferQuiet { return 0 }
+  if siteIx < 0 { return 0 }
+  let i = 0
+  while i < opIdxSiteNode.length {
+    if opIdxSiteNode[i] == siteIx {
+      opIdxSiteFn[i] = fn
+      return 0
+    }
+    i = i + 1
+  }
+  opIdxSiteNode.push(siteIx)
+  opIdxSiteFn.push(fn)
+  0
+}
+
+// BANK the resolved binary-operator function on its site node, for the emitter's dispatch
+// rewrite. Real pass only, for the reason `opIdxBank` is (a quiet probe may resolve a hole).
+export function opBinBank(siteIx: i32, fn: string) {
+  if inferQuiet { return 0 }
+  if siteIx < 0 { return 0 }
+  let i = 0
+  while i < opBinSiteNode.length {
+    if opBinSiteNode[i] == siteIx {
+      opBinSiteFn[i] = fn
+      return 0
+    }
+    i = i + 1
+  }
+  opBinSiteNode.push(siteIx)
+  opBinSiteFn.push(fn)
+  0
+}
+
+// The declared type of parameter `pi` of the operator function `fn`, or -1.
+export function opIdxParamTy(fn: string, pi: i32) {
+  const fnTy = lookup(fn)
+  if fnTy < 0 { return -1 }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    const ps = ft.fnParamTypes
+    if pi < ps.length { return ps[pi] }
+  }
+  -1
+}
+
+// The declared RETURN type of the operator function `fn` (TY_ERR while pending).
+export function opIdxRetTy(fn: string) {
+  const fnTy = lookup(fn)
+  if fnTy < 0 { return TY_ERR }
+  const ft = T.tys[fnTy]
+  if ft is TyFunc {
+    if ft.fnRet == -2 { return TY_ERR }
+    return ft.fnRet
+  }
+  TY_ERR
+}
+
+// The one registered declaration name for `op` when the receiver is not yet known (a hole on
+// the LEFT), or "" when none or more than one exists. A single declaration per symbol is the
+// only case where seeding a hole from it is unambiguous, which is every program that compiles.
+function opSelfFnKeyOnly(op: string): string {
+  let found = ""
+  let n = 0
+  let i = 0
+  while i < opIdxFns.length {
+    if opIdxOps[i] == op {
+      if lookup(opIdxFns[i]) >= 0 {
+        found = opIdxFns[i]
+        n = n + 1
+      }
+    }
+    i = i + 1
+  }
+  if n == 1 { return found }
+  ""
+}
+
+// The `self` parameter's type for `op`'s declaration, or -1 when the operator names no
+// two-parameter `self`-function. The receiver half of `opSelfFnTy`'s own resolution, split out
+// so a hole on the LEFT can be seeded from the same declaration.
+export function opSelfParamTy(op: string) {
+  const opKey = opSelfFnKeyOnly(op)
+  if opKey == "" { return -1 }
+  const fnTy = lookup(opKey)
+  if fnTy < 0 { return -1 }
+  const dIx = fnDeclIx[opKey] ?? -1
+  if dIx < 0 { return -1 }
+  const d = P.nodes[dIx]
+  if d is FuncDecl {
+    if d.fnParams.length == 2 {
+      const p0 = P.nodes[d.fnParams[0]]
+      if p0 is Param {
+        if p0.parName == "self" {
+          const ft = T.tys[fnTy]
+          if ft is TyFunc {
+            if ft.fnParamTypes.length == 2 { return ft.fnParamTypes[0] }
+          }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The banked answer for member node `memIx`, or "" when the call site banked none.
+export function ufcsMissSpecsAt(memIx: i32) {
+  let i = 0
+  while i < ufcsMissAt.length {
+    if ufcsMissAt[i] == memIx { return ufcsMissSpecs[i] }
+    i = i + 1
+  }
+  ""
+}
+
+// Records what one `a op b` site did with the operator name (D491): `dispatched` true means
+// a user declaration fired, false means the language's own lowering took it. Guarded on
+// `inferQuiet` for the same hazard `opIdxBank` guards on — a quiet inference probe resolves
+// against a hole that may pin elsewhere later, so its answer is not a site's answer.
+export function opBinSiteTook(op: string, dispatched: boolean) {
+  if inferQuiet { return 0 }
+  if dispatched {
+    if !strListHas(opBinDispatched, op) { opBinDispatched.push(op) }
+    return 0
+  }
+  if !strListHas(opBinDeclined, op) { opBinDeclined.push(op) }
+  0
+}
+
+// The spelling a refused function value can take instead: a lambda annotated at the concrete
+// parameter types the value is used at, else (still generic there) a direct call.
+export function ovFnValFix(ix: i32, nm: string): string {
+  const fallback = "annotate it where its parameter types are concrete, or call `"
+    + nm
+    + "` directly"
+  const el = ovCbElem[ix] ?? -1
+  if el >= 0 && !tyHasHole(el) && !tyHasTyVar(el) {
+    return "pass a lambda, `(x: " + tyToStrUser(el) + ") => " + nm + "(x)`"
+  }
+  const ty = nodeTyIxOf(ix)
+  if ty < 0 || ty >= T.tys.length { return fallback }
+  const ft = T.tys[ty]
+  if ft is TyFunc {
+    if ft.fnParamTypes.length == 0 { return fallback }
+    let ps = ""
+    let as = ""
+    let k = 0
+    while k < ft.fnParamTypes.length {
+      const pt = ft.fnParamTypes[k]
+      if pt < 0 || tyHasHole(pt) || tyHasTyVar(pt) { return fallback }
+      let v = "x"
+      if ft.fnParamTypes.length > 1 { v = "x" + i32ToStr(k) }
+      if k > 0 {
+        ps = ps + ", "
+        as = as + ", "
+      }
+      ps = ps + v + ": " + tyToStrUser(pt)
+      as = as + v
+      k = k + 1
+    }
+    return "pass a lambda, `(" + ps + ") => " + nm + "(" + as + ")`"
+  }
+  fallback
+}
+
+// A function name read as a value (not called), kept for `ovUnpinnedReport`.
+export function ovNoteFnValue(ix: i32, name: string, ty: i32) {
+  const d = fnDeclIx[name] ?? -1
+  if d < 0 || i32ListHas(ovFnValIx, ix) { return 0 }
+  if T.scopes.length == 0 || (T.scopes[0][name] ?? -1) != ty { return 0 }
+  ovFnValIx.push(ix)
+  ovFnValDecl.push(d)
+  ovFnValName.push(name)
+  0
+}
+
+// The type `p?.f(…)` has once its receiver guard holds — the callee's own return, before the
+// `| null` the optional call wraps around it. Banked per call site: the node's recorded type
+// is the whole optional call's, and the guarded arm the emit-time desugar builds yields only
+// the call (D1814).
+export let optCallRetIx: i32[] = []
+export function optCallRetIxPush(v: i32) { optCallRetIx.push(v) }
+
+export let optCallRetTy: i32[] = []
+export function optCallRetTyPush(v: i32) { optCallRetTy.push(v) }
+export function optCallRetTySetAt(k: i32, v: i32) { optCallRetTy[k] = v }
+
+export let optCallRetName: string[] = []
+export function optCallRetNamePush(v: string) { optCallRetName.push(v) }
+export function optCallRetNameSetAt(k: i32, v: string) { optCallRetName[k] = v }
+
+// How many optional calls the program has, and the arena node of each — the emit-side union
+// collection walks them, since an optional call's `| null` is spelled in no annotation.
+export function optCallRetCount() { optCallRetIx.length }
+
+export function optCallRetNodeAt(i: i32) {
+  if i < 0 || i >= optCallRetIx.length { return -1 }
+  optCallRetIx[i]
+}
+
+// The value-union spelling of the optional call's own `R | null`, or "" when that result is
+// not a boxed value union (a nullable struct, list or string carries its own niche).
+export function optCallRetNameAt(i: i32) {
+  if i < 0 || i >= optCallRetName.length { return "" }
+  optCallRetName[i]
+}
+
+export function callResolveReset() {
+  ufcsUnpinnedSites = []
+  ovHoleSites = []
+  ovDepFns = []
+  ovFnValIx = []
+  ovFnValDecl = []
+  ovFnValName = []
+  ovCbElem = Map()
+  ufcsMissAt = []
+  ufcsMissSpecs = []
+  ufcsWhyAt = []
+  ufcsWhyMsg = []
+  ufcsWhyData = []
+  opBinHoleDeclName = []
+  opBinHoleDeclNode = []
+  opBinHoleDeclAnn = []
+  opBinDispatched = []
+  opBinDeclined = []
+  optCallRetIx = []
+  optCallRetTy = []
+  optCallRetName = []
+}

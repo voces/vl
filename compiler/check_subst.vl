@@ -1,0 +1,453 @@
+// Type substitution: type variables, the parameter types solved from usage, the nested-
+// generic substitution mode, and the argument pins a solve reports once.
+// Emptied by `substReset`. Does not import the checker.
+import { lookupFnDeclNode } from "./check_scopes"
+import { Call, FuncDecl, P, i32ToStr, nodeChildren } from "./ast"
+import { strListHas } from "./listutil"
+import {
+  T,
+  Ty,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  addTy,
+  mkObjTy,
+  tvNestOf,
+  tyMutEpoch,
+} from "./check_types"
+import { fnDeclIx } from "./check_write_scan"
+import { tyHasTyVarGo } from "./check_ty_shape"
+import { nodeTyIxOf } from "./check_node_tys"
+import { tyVarOwner, tyVarOwnerOf } from "./check_hole_pins"
+import { inferQuiet } from "./check_cursor"
+import { memCstr } from "./check_cstr_rows"
+import { holeWriteKey, noteArrayDemand } from "./check_hole_rows"
+import { CSTR_NODECL } from "./check_generic_args"
+import { identNameAt } from "./check_narrow_paths"
+
+export const CSTR_ANYFN = -2
+
+// Solved un-annotated parameter types — the parameter's own body usage, read back as its type.
+// A hole is permissively assignable both ways, so a usage that requires a concrete type rejects
+// nothing in the body and leaves the parameter's rep to whatever the call's argument supplied.
+// Solving the hole to what its usage demands makes it match the annotated spelling exactly.
+export let solvedParamTys: {[string]: i32} = Map()
+export function solvedParamTysSetAt(k: string, v: i32) { solvedParamTys[k] = v }
+
+// Each such nested generic's enclosing declaration node, and whether that body names the
+// generic other than as a callee (1) or not (0), found on first use.
+export let nestParentOf: {[i32]: i32} = Map()
+export function nestParentOfPut(k: i32, v: i32) { nestParentOf.set(k, v) }
+
+export let nestEscapeMemo: {[i32]: i32} = Map()
+
+// `substTyDeep`'s reach over nested rows: `SUBST_ALL` binds every row by name;
+// `SUBST_DECLARED`, a declared callee's pin, leaves them unbound; `SUBST_NESTED`, a call to the
+// nested generic `substNestDecl`, binds its rows and leaves the others unbound.
+export const SUBST_ALL = 0
+
+export const SUBST_NESTED = 2
+
+// A call binding only inference holes (a hole lambda's, a hole function's), one of them to a type
+// still holding a type variable: it binds the holes alone, and re-records what it leaves undecided
+// under the enclosing owner (D3893).
+export const SUBST_HOLES = 3
+
+export let substNestMode = SUBST_ALL
+export function substNestModeSet(v: i32) { substNestMode = v }
+
+export let substNestDecl = 0 - 1
+export function substNestDeclSet(v: i32) { substNestDecl = v }
+
+// Argument demands parked on a hole: an argument whose type still rides an unsolved hole is
+// assignable to anything, so the comparison a concrete parameter deserves cannot be answered
+// where it is asked. Each row is re-asked as the hole takes a pin (D1821). `argPinDone` marks
+// a row that already reported, so two pins do not report twice.
+export let argPinWant: i32[] = []
+
+export let argPinGot: i32[] = []
+
+export let argPinNode: i32[] = []
+
+export let argPinNo: i32[] = []
+
+export let argPinDone: i32[] = []
+export function argPinDoneSetAt(k: i32, v: i32) { argPinDone[k] = v }
+
+export let stSeenStack: i32[] = []
+export function stSeenStackPop(): i32 | null { stSeenStack.pop() }
+export function stSeenStackPush(v: i32) { stSeenStack.push(v) }
+
+export function mkTyVar(name: string) {
+  const t: Ty = { tvName: name }
+  const ix = addTy(t)
+  // The ambient body owns the row unless a site knows better (`mkTyVarOwned`).
+  tyVarOwner[ix] = curFnEscName
+  ix
+}
+
+// `mkTyVar` for a site that knows the function whose type variable this is.
+export function mkTyVarOwned(name: string, owner: string) {
+  const ix = mkTyVar(name)
+  tyVarOwner[ix] = owner
+  ix
+}
+
+// ── return-type inference state (module globals, reset by `initChecker`) ─────
+
+// The enclosing function's name while its body is checked, for that refusal's
+// sentence. Saved and restored beside `T.curRet` in `checkFuncDeclNode`; "" at
+// module scope and for an anonymous lambda.
+export let curFnEscName = ""
+export function curFnEscNameSet(v: string) { curFnEscName = v }
+
+// Set while a re-ask names one declaration, whose constraints alone it means: an owner-less
+// constraint is the program's, which the call itself already asked.
+export let cstrOwnedStrict = false
+export function cstrOwnedStrictSet(v: boolean) { cstrOwnedStrict = v }
+
+// The refusal a join owes when it would pair a set with a map of the same rep, handed to the
+// node whose check made the join; "" when no join is pending.
+export let joinClashMsg = ""
+export function joinClashMsgSet(v: string) { joinClashMsg = v }
+
+// The body wrote THROUGH this hole (`xs.push(v)`, `xs[0] = v`), not merely indexed it. A
+// read-only list view is refused at such a pin and accepted at every other.
+export function noteArrayWriteDemand(tvName: string) {
+  noteArrayDemand(holeWriteKey(curFnEscName, tvName))
+}
+
+// Does constraint `owner` belong to the body a call to `calleeFn` will instantiate? A
+// declared callee adjudicates its own body's constraints and nobody else's; an owner-less
+// constraint always applies; a call that cannot name its callee consults everything.
+// Scoping the unnamed callee to the enclosing body is wrong: `const f = addT; f(c, c)` has holes that are `addT`'s, not the caller's.
+export function cstrOwnedBy(owner: i32, calleeFn: i32) {
+  if owner < 0 { return !cstrOwnedStrict }
+  if calleeFn == CSTR_ANYFN { return true }
+  if calleeFn == CSTR_NODECL { return true }
+  owner == calleeFn
+}
+
+// The type an un-annotated parameter takes — the single source of truth. A parameter whose
+// own body pinned it takes that type as if annotated; one nothing pinned takes a fresh
+// inference hole. Every producer (the pass-1 hoist, `checkFuncDeclNode`, the emitter's
+// synthesized annotation) reads through here, so none of them can drift apart.
+export function unannotParamTy(holeName: string) {
+  const s = solvedParamTys[holeName] ?? -1
+  if s >= 0 { return s }
+  // `paramHoleName` already qualifies this name with its function, so the name IS the owner:
+  // two pins of it are one parameter's and can never be two functions'.
+  mkTyVarOwned(holeName, holeName)
+}
+
+// The demanded shape an unbounded `<T>` accumulated, as one type: every member the owning
+// body read off that same receiver, each typed `_`. The twin of `holeDemandTy`, built from
+// the deferred rows instead of the hole-shape table, since a declared parameter has no global
+// hole name the way an inference hole does (two declarations may both spell theirs `T`).
+export function tpDemandTy(recv: i32, calleeFn: i32) {
+  const names: string[] = []
+  const tys: i32[] = []
+  let k = 0
+  while k < memCstr.ty.length {
+    if memCstr.ty[k] == recv && memCstr.dem[k] {
+      if (
+        cstrOwnedBy(memCstr.fn[k], calleeFn)
+        && !nestCstrOutside(memCstr.ix[k])
+      ) {
+        if !strListHas(names, memCstr.prop[k]) {
+          names.push(memCstr.prop[k])
+          tys.push(mkTyVarOwned("?", "#c" + i32ToStr(calleeFn)))
+        }
+      }
+    }
+    k = k + 1
+  }
+  if names.length == 0 { return -1 }
+  mkObjTy(names, tys)
+}
+
+// Park the comparison a concrete parameter deserves but cannot get yet: `got` still rides an
+// unsolved hole, so `assignable` says yes to everything. Re-asked per pin by `argPinRecheck`.
+export function argPinPark(want: i32, got: i32, argIx: i32, argN: i32) {
+  argPinWant.push(want)
+  argPinGot.push(got)
+  argPinNode.push(argIx)
+  argPinNo.push(argN)
+  argPinDone.push(0)
+  0
+}
+
+// `substHoleTy`'s answers under one set of bindings, kept while nothing an answer reads can have
+// moved: each link of an operator chain resolves the link below it, so without them a chain
+// of n links costs n walks of the chain (D3407). A repeated answer notes no pin again, and
+// `notePinnedHole` ignores a repeated pin.
+export let shMemo: {[i32]: i32} = Map()
+export function shMemoPut(k: i32, v: i32) { shMemo.set(k, v) }
+
+let shMemoNames: string[] = []
+
+let shMemoTys: i32[] = []
+
+export let shMemoVer = 0
+
+// The state an answer reads beyond its bindings, stamped at each fill: the arena's size and
+// in-place epoch, the parked argument demands a pin re-asks, and the substitution mode.
+let shMemoArena = -1
+
+let shMemoEpoch = -1
+
+let shMemoParked = -1
+
+let shMemoMode = -1
+
+let shMemoDecl = -1
+
+let shMemoQuiet = false
+
+export function shMemoStampSame(): boolean {
+  shMemoArena == T.tys.length
+    && shMemoEpoch == tyMutEpoch
+    && shMemoParked == argPinWant.length
+    && shMemoMode == substNestMode
+    && shMemoDecl == substNestDecl
+    && shMemoQuiet == inferQuiet
+}
+
+// Points the memo at `bNames`/`bTys` and the current state, emptying it when either moved, and
+// returns its version; -1 where an answer may not be kept: under a composite's cycle guard, or
+// while a join clash waits to be reported, which only a walk that runs reports.
+export function shMemoSync(bNames: string[], bTys: i32[]): i32 {
+  if stSeenStack.length > 0 || joinClashMsg != "" { return -1 }
+  let same = shMemoStampSame()
+    && bNames.length == shMemoNames.length
+    && bTys.length == shMemoTys.length
+  let i = 0
+  while same && i < bTys.length {
+    if bTys[i] != shMemoTys[i] || bNames[i] != shMemoNames[i] { same = false }
+    i = i + 1
+  }
+  if !same {
+    shMemo = Map()
+    shMemoNames = []
+    shMemoTys = []
+    for nm in bNames { shMemoNames.push(nm) }
+    for ty in bTys { shMemoTys.push(ty) }
+    shMemoArena = T.tys.length
+    shMemoEpoch = tyMutEpoch
+    shMemoParked = argPinWant.length
+    shMemoMode = substNestMode
+    shMemoDecl = substNestDecl
+    shMemoQuiet = inferQuiet
+    shMemoVer = shMemoVer + 1
+  }
+  shMemoVer
+}
+
+// Whether constraint node `ix` lies outside the nested generic a `SUBST_NESTED` binding names:
+// a use of that generic in its enclosing body (`const g: (n: i32) => void = b`) is no demand of
+// its body, and each such use binds the generic afresh (D3896).
+export function nestCstrOutside(ix: i32): boolean {
+  if substNestMode != SUBST_NESTED || substNestDecl < 0 || ix < 0 {
+    return false
+  }
+  if ix > substNestDecl { return true }
+  ix < nestSubtreeLo(substNestDecl)
+}
+
+// The lowest node index in the subtree of declaration `nd`: the arena is post-order, so the
+// subtree is the contiguous range from it up to `nd`.
+export let nestLoMemo: {[i32]: i32} = Map()
+
+function nestSubtreeLo(nd: i32): i32 {
+  const m = nestLoMemo.get(nd) ?? -1
+  if m >= 0 { return m }
+  let lo = nd
+  const stack: i32[] = [nd]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      if ix < lo { lo = ix }
+      for k in nodeChildren(ix) { stack.push(k) }
+    }
+  }
+  nestLoMemo.set(nd, lo)
+  lo
+}
+
+// Whether the current `substNestMode` binds type-variable row `row`, named `name`. A nested
+// generic its enclosing body names other than as a callee binds by name everywhere (D3853).
+export function substBindsNestRow(row: i32, name: string): boolean {
+  if substNestMode == SUBST_HOLES { return name != "" && name[0] == '?' }
+  const nd = tvNestOf.get(row) ?? -1
+  if nd >= 0 {
+    if substNestMode == SUBST_NESTED { return nd == substNestDecl }
+    return nestEscapes(nd)
+  }
+  if substNestMode != SUBST_NESTED || name == "" || name[0] == '?' {
+    return true
+  }
+  // An unmarked parameter row is another declaration's: the callee's own rows are all marked.
+  false
+}
+
+// Whether nested generic `nd`'s enclosing body reads its name anywhere but as a callee.
+function nestEscapes(nd: i32): boolean {
+  const memo = nestEscapeMemo.get(nd) ?? -1
+  if memo >= 0 { return memo == 1 }
+  let esc = true
+  let known = true
+  const par = nestParentOf.get(nd) ?? -1
+  const f = P.nodes[nd]
+  if par >= 0 && par < P.nodes.length && f is FuncDecl {
+    const pf = P.nodes[par]
+    if pf is FuncDecl {
+      esc = false
+      const callees: {[i32]: i32} = Map()
+      const stack: i32[] = [pf.fnBody]
+      while stack.length > 0 && !esc {
+        const ix = stack.pop() ?? -1
+        if ix >= 0 && ix < P.nodes.length {
+          const nn = P.nodes[ix]
+          if nn is Call { callees.set(nn.callFn, 1) }
+          // A read of the name that is the declaration, by its type: a parameter or loop
+          // variable of the same name is another binding. An unchecked read counts.
+          if identNameAt(ix) == f.fnName && !callees.has(ix) {
+            const it = nodeTyIxOf(ix)
+            if it < 0 {
+              esc = true
+              known = false
+            } else if nestTyHas(it, nd, 0) {
+              esc = true
+            }
+          }
+          for k in nodeChildren(ix) { stack.push(k) }
+        }
+      }
+    }
+  }
+  if known {
+    if esc { nestEscapeMemo.set(nd, 1) } else { nestEscapeMemo.set(nd, 0) }
+  }
+  esc
+}
+
+// Whether `ty` holds a type-parameter row of nested generic `nd`.
+function nestTyHas(ty: i32, nd: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyVar => {
+      return (tvNestOf.get(ty) ?? -1) == nd
+    }
+    TyArray => {
+      return nestTyHas(t.aElem, nd, depth + 1)
+    }
+    TyNullable => {
+      return nestTyHas(t.nInner, nd, depth + 1)
+    }
+    TyMap => {
+      return nestTyHas(t.mKey, nd, depth + 1)
+        || nestTyHas(t.mVal, nd, depth + 1)
+    }
+    TyObj => {
+      for ft in t.objFieldTypes {
+        if nestTyHas(ft, nd, depth + 1) { return true }
+      }
+      return false
+    }
+    TyFunc => {
+      for pt in t.fnParamTypes {
+        if nestTyHas(pt, nd, depth + 1) { return true }
+      }
+      return nestTyHas(t.fnRet, nd, depth + 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if nestTyHas(m, nd, depth + 1) { return true }
+      }
+      return false
+    }
+    TyPrim | TyErr | TyLit | TyNeg => {
+      return false
+    }
+  }
+}
+
+// Whether every type variable in `ty` belongs to the named generic whose body is being checked.
+export function tyVarsOfEnclosingGeneric(ty: i32): boolean {
+  if curFnEscName == "" { return false }
+  let d = fnDeclIx[curFnEscName] ?? -1
+  if d < 0 { d = lookupFnDeclNode(curFnEscName) }
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
+  tyVarsOwnedBy(ty, curFnEscName, fd.fnTyParams, 64)
+}
+
+// Whether every type variable in `ty` is one function `owner` declared: recorded as its, or
+// unrecorded and named in its type parameters `names`. A type too deep to walk answers false.
+function tyVarsOwnedBy(
+  ty: i32,
+  owner: string,
+  names: string[],
+  depth: i32,
+): boolean {
+  if ty < 0 || ty >= T.tys.length { return true }
+  if depth <= 0 { return false }
+  const t = T.tys[ty]
+  if t is TyVar {
+    const o = tyVarOwnerOf(ty)
+    return o == owner || (o == "" && strListHas(names, t.tvName))
+  }
+  if t is TyArray { return tyVarsOwnedBy(t.aElem, owner, names, depth - 1) }
+  if t is TyNullable { return tyVarsOwnedBy(t.nInner, owner, names, depth - 1) }
+  if t is TyNeg { return tyVarsOwnedBy(t.negTy, owner, names, depth - 1) }
+  if t is TyMap {
+    return tyVarsOwnedBy(t.mKey, owner, names, depth - 1)
+      && tyVarsOwnedBy(t.mVal, owner, names, depth - 1)
+  }
+  if t is TyObj { return tysOwnedBy(t.objFieldTypes, owner, names, depth - 1) }
+  if t is TyFunc {
+    return tysOwnedBy(t.fnParamTypes, owner, names, depth - 1)
+      && tyVarsOwnedBy(t.fnRet, owner, names, depth - 1)
+  }
+  if t is TyUnion { return tysOwnedBy(t.uMembers, owner, names, depth - 1) }
+  // Every other kind holds a type variable only if `tyHasTyVarGo` finds one.
+  !tyHasTyVarGo(ty, depth)
+}
+
+// `tyVarsOwnedBy` over each of `tys`.
+function tysOwnedBy(
+  tys: i32[],
+  owner: string,
+  names: string[],
+  depth: i32,
+): boolean {
+  for t in tys {
+    if !tyVarsOwnedBy(t, owner, names, depth) { return false }
+  }
+  true
+}
+
+export function substReset() {
+  stSeenStack = []
+  solvedParamTys = Map()
+  nestParentOf = Map()
+  nestEscapeMemo = Map()
+  nestLoMemo = Map()
+  substNestMode = SUBST_ALL
+  substNestDecl = -1
+  argPinWant = []
+  argPinGot = []
+  argPinNode = []
+  argPinNo = []
+  argPinDone = []
+}

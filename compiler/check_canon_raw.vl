@@ -1,0 +1,168 @@
+// Canon bookkeeping: which nodes the canonical type-name rewrite cleared or rewrote in place,
+// and the raw spelling banked for each so a diagnostic quotes what the author wrote.
+// Does not import the checker.
+import {
+  AsExpr,
+  IsExpr,
+  Node,
+  P,
+  TypeRef,
+  UnionDecl,
+  restoreAnnTsAll,
+} from "./ast"
+
+// Whether `name` contains a construct the emitter can't classify: a quoted string-literal
+// member, an `&` intersection, a `!` negation, a parenthesized group, or a numeric-literal
+// member (a digit at a member-start position — after `|`/`:`/`,` or at the very start; a
+// digit inside an identifier like `i32` never starts a member).
+export function nameNeedsCanon(name: string) {
+  let i = 0
+  while i < name.length {
+    const c = name[i]
+    if c == '"' || c == '&' || c == '!' || c == '(' { return true }
+    // A composite (`Id[]`, `{[string]: Id}`, `{x: Id}`) may embed a single-member alias in its
+    // element/value/field, which `canonEmitName`'s recursion resolves — so it must run even
+    // with no other canon trigger present. Idempotent for an already-canon composite, so this
+    // only broadens which names recurse, not the result of a name that already canon'd.
+    if c == '[' || c == '{' { return true }
+    // A top-level union (`AB | null`) must be processed so a union-alias member expands to
+    // its flattened members (an inline `(A|B)|null` already trips the parenthesized-group
+    // test). Idempotent for an already-flat union, so this is a no-op there.
+    if c == '|' { return true }
+    if c >= '0' && c <= '9' {
+      if i == 0 { return true }
+      const p = name[i - 1]
+      if p == '|' || p == ':' || p == ',' { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// `RC_NULLABLE` is sticky across a union join, and has to be: structurally `A | B | null` is
+// a `TyNullable` over a `TyUnion` so `A` sits two levels down, while the string spelling
+// splits `null` as a sibling — a rule asking "am I under a nullable" must agree either way.
+// Every other bit is replaced at each descent (a struct field that is itself an array element is a field, not both).
+
+// The top-level atom count of the name the last `canonEmitName` call returned, and its
+// `nulLitUnionPreserve` sibling — read by `canonEmitTypeNames` instead of re-splitting the
+// string it just joined. A canon'd name gains a top-level `|` at exactly two places (the
+// union join, `nulLitUnionPreserve`'s `|null` suffix); every other arm recurses or is one atom.
+export let canonAtoms = 1
+export function canonAtomsSet(v: i32) { canonAtoms = v }
+
+// The post-check sweep: rewrites every `TypeRef` annotation and every `UnionDecl` variant
+// name in the arena, once at the end of `checkProgram` — the same arena `emitProgram` sees.
+// Asks directly whether a node's recorded type still describes its spelling, rather than
+// through `annTs`, since canon is not a rename and a surviving tree is not a reliable signal either way.
+export let canonCleared: i32[] = []
+export function canonClearedPush(v: i32) { canonCleared.push(v) }
+export function canonClearedSet(v: i32[]) { canonCleared = v }
+
+// The arena type each rewritten node's new spelling denotes, parallel to `canonCleared`.
+// `nodeTyIx` is untouched, so no existing consumer changes; the only reader is the
+// emitter's collect-site gate.
+export let canonTyIxCol: i32[] = []
+export function canonTyIxColPush(v: i32) { canonTyIxCol.push(v) }
+export function canonTyIxColSet(v: i32[]) { canonTyIxCol = v }
+
+// The slot of node `ix` in `canonCleared` (and so in `canonTyIxCol`), or -1 when canon left it alone.
+function canonClearedSlot(ix: i32): i32 {
+  let lo = 0
+  let hi = canonCleared.length - 1
+  while lo <= hi {
+    const mid = lo + (hi - lo) / 2
+    const at = canonCleared[mid]
+    if at == ix { return mid }
+    if at < ix { lo = mid + 1 } else { hi = mid - 1 }
+  }
+  -1
+}
+
+export function canonTyIxOf(ix: i32): i32 {
+  const s = canonClearedSlot(ix)
+  if s < 0 { return -1 }
+  canonTyIxCol[s]
+}
+
+// Did `canonEmitTypeNames` rewrite node `ix` in place (and drop its spelling tree)?
+export function canonRewroteNode(ix: i32): boolean { canonClearedSlot(ix) >= 0 }
+
+// The spelling each rewrite below replaced, as a node column, a member slot and the text
+// that stood there. `driver.vl`'s parse bank writes them back, so the lint reads the names
+// the author wrote; nothing else consumes it and the next sweep clears it.
+export let canonRawNode: i32[] = []
+export function canonRawNodeSet(v: i32[]) { canonRawNode = v }
+
+export let canonRawSlot: i32[] = []
+export function canonRawSlotSet(v: i32[]) { canonRawSlot = v }
+
+export let canonRawText: string[] = []
+export function canonRawTextSet(v: string[]) { canonRawText = v }
+
+// The three whole-node spelling fields, as `canonRawSlot` codes; a slot >= 0 is a
+// `UnionDecl` member index.
+export const CANON_SLOT_TY = -1
+
+export const CANON_SLOT_IS = -2
+
+export const CANON_SLOT_AS = -3
+
+export function canonBankRaw(nodeIx: i32, slot: i32, raw: string) {
+  canonRawNode.push(nodeIx)
+  canonRawSlot.push(slot)
+  canonRawText.push(raw)
+  0
+}
+
+// One setter per banked field. Each takes the node the row names and answers 0 when that node
+// does not carry the kind its slot claims — impossible by construction, since a slot is minted
+// beside the write it records.
+function canonPutTyName(n: Node, raw: string) {
+  if n is TypeRef { n.tyName = raw }
+  0
+}
+
+function canonPutIsVariant(n: Node, raw: string) {
+  if n is IsExpr { n.isVariant = raw }
+  0
+}
+
+function canonPutAsTy(n: Node, raw: string) {
+  if n is AsExpr { n.asTy = raw }
+  0
+}
+
+function canonPutUdVariant(n: Node, slot: i32, raw: string) {
+  if n is UnionDecl {
+    if slot >= 0 && slot < n.udVariants.length { n.udVariants[slot] = raw }
+  }
+  0
+}
+
+// Write `raw` back into the one spelling field `slot` names on node `ix`. `ix` is
+// bounds-tested because the sweep walks nodes a later pop may have removed.
+function canonRestoreOne(ix: i32, slot: i32, raw: string) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if slot == CANON_SLOT_TY { return canonPutTyName(n, raw) }
+  if slot == CANON_SLOT_IS { return canonPutIsVariant(n, raw) }
+  if slot == CANON_SLOT_AS { return canonPutAsTy(n, raw) }
+  canonPutUdVariant(n, slot, raw)
+}
+
+// Put every rewritten spelling back, newest first so a field written more than once ends at
+// the one the parser gave it. One-shot: the bank empties, so a second call is a no-op.
+export function canonRestoreSpellings(): i32 {
+  let i = canonRawNode.length - 1
+  while i >= 0 {
+    canonRestoreOne(canonRawNode[i], canonRawSlot[i], canonRawText[i])
+    i = i - 1
+  }
+  canonRawNode = []
+  canonRawSlot = []
+  canonRawText = []
+  // The trees canon dropped describe these restored names again, and a re-check reads them.
+  restoreAnnTsAll()
+  0
+}

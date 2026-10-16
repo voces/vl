@@ -1,0 +1,426 @@
+// The list-union rewrite: the annotations it mints, the writes and declarations it leaves
+// alone, the `is` type columns a monomorphized body banks, and the apart joins of a
+// type-parameter `if` that a pin re-joins. Emptied by `listUnionReset`.
+// Does not import the checker.
+import { lookupFnDeclNode } from "./check_scopes"
+import {
+  Block,
+  Call,
+  Ident,
+  IfStmt,
+  Node,
+  P,
+  adoptNodeTok,
+  arenaSetNode,
+  mkBlock,
+  mkBool,
+  mkCall,
+  mkIdent,
+  valueIfAdd,
+} from "./ast"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyEq,
+  tyIsPrimNamed,
+} from "./check_types"
+import { crUnParen } from "./check_narrow_ends"
+import {
+  arrElemTyOrNone,
+  flattenVariantsInto,
+  isNumeric,
+  luAnyTyVar,
+  tyHasTyVar,
+} from "./check_ty_shape"
+import { peelParenIx } from "./check_write_effects"
+import { colAt, nodeTyIx } from "./check_node_tys"
+import { cstrOwnerTop } from "./check_cstr_rows"
+import { tpIfFn, tpIfJoin, tpIfNode, tpIfOk } from "./check_tp_join"
+
+// Of a body's kept-apart return join (and its null wrapper), each return value's type and whether
+// it is a list stored as built: a pin re-joins those values, not the join's members.
+export let tpRetJoinTys: {[i32]: i32[]} = Map()
+export function tpRetJoinTysSetAt(k: i32, v: i32[]) { tpRetJoinTys[k] = v }
+
+export let tpRetJoinFixed: {[i32]: boolean[]} = Map()
+export function tpRetJoinFixedSetAt(k: i32, v: boolean[]) {
+  tpRetJoinFixed[k] = v
+}
+
+// An if-join a generic body reads collapsed (`T[]` beside `string[]` is `T[]`) that the
+// return-set rule keeps apart, by `if` node: the apart join, which a pin re-joins (D2832).
+export let tpIfJoinAt: {[i32]: i32} = Map()
+
+// The `Index` and `Member` nodes an assignment writes through, which the list-union read
+// rewrite leaves alone.
+export let luWriteTgt: {[i32]: boolean} = Map()
+export function luWriteTgtPut(k: i32, v: boolean) { luWriteTgt.set(k, v) }
+
+// The source position of each loop binding the list-union rewrite minted: the iterable's node,
+// which precedes every read of the binding in the body, though the binding is minted later.
+export let luDeclPos: {[i32]: i32} = Map()
+export function luDeclPosPut(k: i32, v: i32) { luDeclPos.set(k, v) }
+
+// The type each annotation the list-union rewrite minted stands for, keyed by its `TypeRef`.
+export let luAnnTy: {[i32]: i32} = Map()
+export function luAnnTyPut(k: i32, v: i32) { luAnnTy.set(k, v) }
+
+// D951 — the `is`-test type sidecar: the arena type an `IsExpr`'s check type resolves to, keyed by
+// the `IsExpr` node, so the emitter's narrowing stack banks the answer instead of re-deriving the
+// narrowed type from the tested spelling. Sized with `nodeTyIx` and read through `isVarTyIxOf`; a
+// monomorphized `is T` must bank through `recordClonedIsVarTy` or the emitter reads a `TyVar`.
+export let isVarTyIx: i32[] = []
+export function isVarTyIxPush(v: i32) { isVarTyIx.push(v) }
+export function isVarTyIxSet(v: i32[]) { isVarTyIx = v }
+export function isVarTyIxSetAt(k: i32, v: i32) { isVarTyIx[k] = v }
+
+// The length the four sidecars above present to a bounded write: the arena as `checkProgram`
+// found it, and for `isVarTyIx` also past any row a monomorphized clone banked. The columns
+// themselves hold only up to the last row written, since almost every node reads -1 (D2319).
+export let isTyColCap = 0
+export function isTyColCapSet(v: i32) { isTyColCap = v }
+
+export let isVarTyIxCap = 0
+export function isVarTyIxCapSet(v: i32) { isVarTyIxCap = v }
+
+// Whether the `match` being checked is delivered where its union is built (`tpIfMarkOk`).
+export let tpMatchOk = false
+export function tpMatchOkSet(v: boolean) { tpMatchOk = v }
+
+// Records the join at `ix` that a generic body reads collapsed to `j` while the return-set rule
+// keeps it apart as `aj` (-1: none), for its pins to re-ask (D2832).
+export function noteTpJoinRow(ix: i32, aj: i32, j: i32, ok: boolean) {
+  if ix < 0 || aj < 0 || j < 0 || monoRecheckDepth > 0 { return 0 }
+  if aj == j || tyEq(aj, j) { return 0 }
+  if !tyHasTyVar(aj) || !(T.tys[aj] is TyUnion) { return 0 }
+  tpIfJoinAt.set(ix, aj)
+  const owner = cstrOwnerTop()
+  if owner < 0 { return 0 }
+  let k = 0
+  while k < tpIfFn.length {
+    if tpIfFn[k] == owner && tpIfNode[k] == ix {
+      tpIfJoin[k] = aj
+      tpIfOk[k] = ok
+      return 0
+    }
+    k = k + 1
+  }
+  tpIfFn.push(owner)
+  tpIfJoin.push(aj)
+  tpIfNode.push(ix)
+  tpIfOk.push(ok)
+  0
+}
+
+// Whether the if-expression `child` is an arm value, or an `else if` link, of the if-expression
+// `parent`, at any depth through such arms: it is built wherever `parent` is.
+function tpIfArmOf(parent: i32, child: i32, depth: i32): boolean {
+  if parent < 0 || depth > 16 { return false }
+  const p = P.nodes[parent]
+  if p is IfStmt {
+    if tpIfArmTailIs(p.ifThen, child, depth) { return true }
+    if p.ifElse >= 0 {
+      if P.nodes[p.ifElse] is IfStmt {
+        if p.ifElse == child { return true }
+        return tpIfArmOf(p.ifElse, child, depth + 1)
+      }
+      return tpIfArmTailIs(p.ifElse, child, depth)
+    }
+  }
+  false
+}
+
+function tpIfArmTailIs(blockIx: i32, child: i32, depth: i32): boolean {
+  if blockIx < 0 { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    if b.blkStmts.length == 0 { return false }
+    const tv = crUnParen(b.blkStmts[b.blkStmts.length - 1])
+    if tv == child { return true }
+    if tv >= 0 && P.nodes[tv] is IfStmt {
+      return tpIfArmOf(tv, child, depth + 1)
+    }
+  }
+  false
+}
+
+// Whether row `k`'s join is built where it is delivered: its own position, or an arm of a join
+// of the same body that is.
+export function tpIfRowBuilt(k: i32): boolean {
+  if tpIfOk[k] { return true }
+  let q = 0
+  while q < tpIfFn.length {
+    if q != k && tpIfFn[q] == tpIfFn[k] && tpIfOk[q] {
+      if tpIfArmOf(tpIfNode[q], tpIfNode[k], 0) { return true }
+    }
+    q = q + 1
+  }
+  false
+}
+
+// The type an un-annotated binding of the if-join `init` takes where its concrete list absorbed
+// a type parameter's (`string[]` beside `T[]`): the parameter's list, which each instance reads
+// at its own pin (D2832). A number or boolean list keeps the collapse, since a pin may store the
+// two alike or widen one into the other, and the instance then builds the concrete one.
+export function tpIfBindTy(init: i32, bound: i32): i32 {
+  if init < 0 || bound < 0 || tpIfJoinAt.length == 0 || monoRecheckDepth > 0 {
+    return bound
+  }
+  if tyHasTyVar(bound) { return bound }
+  const be = arrElemTyOrNone(bound)
+  if be < 0 || isNumeric(be) || tyIsPrimNamed(be, "boolean") { return bound }
+  const aj = tpIfJoinAt.get(crUnParen(init)) ?? -1
+  if aj < 0 { return bound }
+  const ms: i32[] = []
+  flattenVariantsInto(aj, ms)
+  let i = 0
+  while i < ms.length {
+    const m = ms[i]
+    if m >= 0 && T.tys[m] is TyArray && tyHasTyVar(m) { return m }
+    i = i + 1
+  }
+  bound
+}
+
+// Set while `tpIfRecheck` runs, with its bindings: each node the re-check types is compared with
+// the type the template recorded for it, as the instance will build it (`tpIfCmpNode`).
+export let tpIfCmpOn = false
+export function tpIfCmpOnSet(v: boolean) { tpIfCmpOn = v }
+
+export let tpIfCmpNames: string[] = []
+export function tpIfCmpNamesSet(v: string[]) { tpIfCmpNames = v }
+
+export let tpIfCmpTys: i32[] = []
+export function tpIfCmpTysSet(v: i32[]) { tpIfCmpTys = v }
+
+export let tpIfCmpBad = ""
+export function tpIfCmpBadSet(v: string) { tpIfCmpBad = v }
+
+// The arena type the `is` test at node `ix` checks AGAINST — what the narrowing binds the
+// tested place to — or -1 for a node the checker never resolved (an emitter-synthesized
+// `is`, or a non-`IsExpr` node). Recorded by `checkIsExprNode`.
+export function isVarTyIxOf(ix: i32) { colAt(isVarTyIx, ix) }
+
+// The `isVarTyIx` twin of `recordClonedNodeTy`: `checkIsExprNode` banks the resolved check
+// type at every `is` node the checker sees, but a node the monomorphizer mints postdates
+// that pass and reads -1 forever. For a substituted test (`is T` at `T := i32`) this resolves
+// the row the new spelling names, via the same `nameToTy` route. Returns the banked row, or -1.
+export function recordClonedIsVarTyIx(nodeIx: i32, ty: i32) {
+  if nodeIx < 0 { return -1 }
+  if ty < 0 { return -1 }
+  while isVarTyIx.length <= nodeIx { isVarTyIx.push(-1) }
+  isVarTyIx[nodeIx] = ty
+  if isVarTyIxCap <= nodeIx { isVarTyIxCap = nodeIx + 1 }
+  ty
+}
+
+// How many pinned re-checks (`monoRecheckBegin`) are open. The body under one is shared by
+// every instance, so a check-time arena rewrite that depends on the pin must not run.
+export let monoRecheckDepth = 0
+export function monoRecheckDepthSet(v: i32) { monoRecheckDepth = v }
+
+// Whether `recv` is a receiver the rewrite itself bound. An arm reading one as a union is an
+// `is` test that did not narrow, which a second rewrite would only repeat without end.
+export function luOwnRecv(recv: i32): boolean {
+  if recv < 0 { return false }
+  const r = P.nodes[recv]
+  if r is Ident { return r.identName.slice(0, 3) == "$lu" }
+  false
+}
+
+// The members of `ty` when it is a union of two or more lists, otherwise empty. Not over a
+// type parameter's list (D2876), a literal element (D2886), or a readonly member beside any
+// member holding a readonly list (D2913), whose reads do not lower; nor under a pinned re-check.
+export function luMembers(ty: i32): i32[] {
+  const none: i32[] = []
+  if ty < 0 || monoRecheckDepth > 0 { return none }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    if t.uMembers.length < 2 { return none }
+    let i = 0
+    let anyRo = false
+    let anyView = false
+    while i < t.uMembers.length {
+      const m = t.uMembers[i]
+      if m < 0 { return none }
+      const mt = T.tys[m]
+      if mt is TyArray {
+        if mt.aElem < 0 { return none }
+        if luHasLit(mt.aElem, 8) { return none }
+        if mt.aRead == 1 { anyRo = true }
+        if luHasView(mt.aElem, 8) { anyView = true }
+      } else {
+        return none
+      }
+      i = i + 1
+    }
+    if anyRo && anyView { return none }
+    return t.uMembers
+  }
+  none
+}
+
+// Whether `ty` is or holds a readonly list, through a list, a nullable or a union.
+function luHasView(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      t.aRead == 1 || luHasView(t.aElem, depth - 1)
+    }
+    TyNullable => {
+      luHasView(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let hit = false
+      let i = 0
+      while i < t.uMembers.length {
+        if luHasView(t.uMembers[i], depth - 1) { hit = true }
+        i = i + 1
+      }
+      hit
+    }
+    TyPrim | TyErr | TyObj | TyVar | TyNeg | TyMap | TyLit | TyFunc => {
+      false
+    }
+  }
+}
+
+// Whether `ty` is or holds a literal type, through a nullable or a union.
+function luHasLit(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  match t {
+    TyLit => {
+      true
+    }
+    TyNullable => {
+      luHasLit(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      let hit = false
+      let i = 0
+      while i < t.uMembers.length {
+        if luHasLit(t.uMembers[i], depth - 1) { hit = true }
+        i = i + 1
+      }
+      hit
+    }
+    // A composite's literal sits inside its own container, which the element read keeps.
+    TyPrim | TyErr | TyObj | TyVar | TyNeg | TyMap | TyArray | TyFunc => {
+      false
+    }
+  }
+}
+
+// `s` with the spaces around each ` | ` dropped, the form an annotation's union name takes.
+export function luPipeTight(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if i + 2 < s.length && s[i] == ' ' && s[i + 1] == '|' && s[i + 2] == ' ' {
+      out = out + "|"
+      i = i + 3
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// `s` with the spaces around each ` => ` dropped, the form an annotation's function type takes.
+export function luArrowTight(s: string): string {
+  let out = ""
+  let i = 0
+  while i < s.length {
+    if (
+      i + 3 < s.length
+      && s[i] == ' '
+      && s[i + 1] == '='
+      && s[i + 2] == '>'
+      && s[i + 3] == ' '
+    ) {
+      out = out + "=>"
+      i = i + 4
+    } else {
+      out = out + s.slice(i, i + 1)
+      i = i + 1
+    }
+  }
+  out
+}
+
+// Where declaration `ix` stands in source order: its own index, or for a loop binding the
+// list-union rewrite minted after its body, the position of the loop's iterable.
+export function luDeclPosOf(ix: i32): i32 { luDeclPos[ix] ?? ix }
+
+// Node `n`, minted by the rewrite, anchored at the rewritten site's token.
+export function luAt(n: i32, site: i32): i32 {
+  adoptNodeTok(n, site)
+  n
+}
+
+export function luRef(name: string, site: i32, pos: i32): i32 {
+  luAt(mkIdent(name, pos), site)
+}
+
+// Whether receiver `recv` of a union with members `ms` lowers at each pin: a type parameter's
+// list returned through a function value is not built as the union there, so its reads stay
+// refused rather than lowered over a value of another rep.
+export function luRecvLowers(recv: i32, ms: i32[]): boolean {
+  if !luAnyTyVar(ms) { return true }
+  const r = P.nodes[peelParenIx(recv)]
+  if r is Call {
+    const f = P.nodes[r.callFn]
+    if f is Ident { return lookupFnDeclNode(f.identName) >= 0 }
+    return false
+  }
+  true
+}
+
+// Sizes the node-keyed columns to the nodes the rewrite minted, so the real pass records them.
+export function luGrow() {
+  while nodeTyIx.length < P.nodes.length { nodeTyIx.push(-1) }
+  isTyColCap = P.nodes.length
+  isVarTyIxCap = P.nodes.length
+  0
+}
+
+// Overwrites `site` with `if true { stmts } else { __trap__() }`, the value form of a block.
+// The condition has no position, which is how the constant-condition lint tells it is not the author's.
+export function luValueAt(site: i32, stmts: i32[], pos: i32) {
+  const cond = luAt(mkBool(1, -1), site)
+  const thenB = luAt(mkBlock(stmts, pos), site)
+  const none: i32[] = []
+  const trap = luAt(mkCall(luRef("__trap__", site, pos), none, pos), site)
+  const tl: i32[] = []
+  tl.push(trap)
+  const elseB = luAt(mkBlock(tl, pos), site)
+  const w: Node = { ifCond: cond, ifThen: thenB, ifElse: elseB, pos: pos }
+  arenaSetNode(site, w)
+  valueIfAdd(site)
+  luGrow()
+}
+
+export function listUnionReset() {
+  tpRetJoinTys = Map()
+  tpRetJoinFixed = Map()
+  tpIfJoinAt = Map()
+  isVarTyIx = []
+  isTyColCap = 0
+  isVarTyIxCap = 0
+  luWriteTgt = Map()
+  luDeclPos = Map()
+  luAnnTy = Map()
+}

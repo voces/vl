@@ -24,10 +24,11 @@
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
-// multiplying. Eight are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
+// multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
 // `in-function value writes`, the two `if joins` pairs, `nested inline record types across
-// functions (fuel)`, `record-parameter field calls` and `closure arguments in one function`.
+// functions (fuel)`, `record-parameter field calls`, `closure arguments in one function` and
+// the four `functions under a callback parameter` pairs.
 // The CPU readings quoted
 // beside individual pairs below predate fuel grading.
 
@@ -113,6 +114,28 @@ const genClosureArgCalls = (n: number): string => {
   ];
   for (let i = 0; i < n; i++) o.push(`  acc = acc + apply(${i % 7}, g)`);
   o.push("  acc", "}", "print(run(3))");
+  return o.join("\n") + "\n";
+};
+
+// `n` functions in a program with one callback parameter, which switches on `monomorphize` and
+// its fn-value flow table. Each function's body is one shape: `copy` binds a local to one
+// shared global (D4942), `rewrite` also writes it (D4942), `global` writes a module global from
+// another (D4942), `list` hands a list literal of its parameter on (D4942).
+type HofShape = "copy" | "rewrite" | "global" | "list";
+const genHofBodies = (n: number, shape: HofShape): string => {
+  const o: string[] = ["let H = 4", "let G = H", "function sink(v: i32): i32 { v + 1 }"];
+  o.push("function sinkL(v: i32[]): i32 { v.length }", "function hook(f: (ix: i32) => i32): i32 { f(1) }");
+  for (let i = 0; i < n; i++) {
+    o.push(`function f${i}(x: i32): i32 {`);
+    if (shape === "copy") o.push("  let y = G", "  sink(y)");
+    if (shape === "rewrite") o.push("  let y = G", `  if x > ${i} { y = H }`, "  sink(y)");
+    if (shape === "global") o.push(`  if x > ${i} { G = H }`, "  sink(G)");
+    if (shape === "list") o.push(`  sinkL([x, x + 1, x + ${i}])`);
+    o.push("}");
+  }
+  o.push("let t = 0");
+  for (let i = 0; i < n; i += 97) o.push(`t = t + f${i}(${i})`);
+  o.push("print(t)");
   return o.join("\n") + "\n";
 };
 
@@ -679,6 +702,22 @@ axis(
   "`captureNamesOf` is re-walking a frame per query in `monomorphize`; is the pass still in `passKeepsCaptures` (compiler/emit_sections.vl)?",
   (d) => twoFiles(d, genClosureArgCalls(1600), genClosureArgCalls(400)),
 );
+
+// Lane FFQ's four GROWTH pairs, 2,000 functions against 500 under one callback parameter, so
+// linear reads 4. Each arm's shape isolates one of four per-query whole-program costs in the
+// mono pass; master read 45.7 (copy, cubic), 10.9 (list), and with the flow fixes alone 12.6
+// (rewrite) and 12.3 (global). Fuel and the seeds of each reading: D4942.
+const hofAxis = (shape: HofShape, bar: number, note: string) =>
+  axis(
+    `functions under a callback parameter (${shape})`,
+    bar,
+    note,
+    (d) => twoFiles(d, genHofBodies(2000, shape), genHofBodies(500, shape)),
+  );
+hofAxis("copy", 5.1, "`ffMerge` (compiler/fn_flow_shadow.vl) is copying the larger class into the smaller root, or deduping by scan (D4942).");
+hofAxis("list", 5.1, "`ffDirectedPins` (compiler/fn_flow_shadow.vl) is walking slots that reach no pin (D4942).");
+hofAxis("rewrite", 5.1, "`monoSubtreeHolds` or `monoTopFrameOf` (compiler/emit_mono.vl) is walking the program per write (D4942).");
+hofAxis("global", 5.1, "`monoTopFnUnnamed` (compiler/emit_mono.vl) is walking the program per module-scope function (D4942).");
 
 // Lane HS's second pair: 2,000 calls through a 64-field record signature against a one-field
 // one. Fuel reads 3.38; the #3422 compiler read 6.17, from `sigKeyOfTy` and
@@ -2327,6 +2366,32 @@ shardTest({
     }
   },
 });
+
+// D4942's GROWTH pair. One generic anywhere turns on the function-value flow table and the
+// monomorphizer's walk over the WHOLE program, so every function here, which reads one shared
+// list, pushes a local one and writes a module `let`, is a site for the flow table's class
+// merge and for the walk's frame questions. 1,600 functions against 400, so linear reads 4.
+const genGenericProgram = (n: number): string => {
+  const o = ["let G: i32[] = [1, 2, 3]", "let T = 0", "function id<V>(v: V): V { v }"];
+  for (let i = 0; i < n; i++) {
+    o.push(`function f${i}(): i32 {`, "  const a = G[0]", "  const xs: i32[] = []", "  xs.push(a)");
+    o.push("  T = T + 1", `  xs[0] + ${i}`, "}");
+  }
+  o.push("let s = 0");
+  for (let i = 0; i < n; i++) o.push(`s = s + f${i}()`);
+  o.push("print(id(s) + T)");
+  return o.join("\n") + "\n";
+};
+
+// Fuel reads 4.02; master read 30.88, from `ffMerge` copying the larger
+// class into the smaller with a linear membership test per fact, and from per-site walks of the
+// whole program in `monomorphize` (`monoFrameHolds`, `monoTopFrameOf`, `monoTopFnUnnamed`).
+axis(
+  "functions in a program with one generic",
+  5.0,
+  "A flow-table merge (`ffMerge`, compiler/fn_flow_shadow.vl) or a `monomorphize` frame question (compiler/emit_mono.vl) is re-walking the program per site.",
+  (d) => twoFiles(d, genGenericProgram(1600), genGenericProgram(400)),
+);
 
 // THE FUEL GRADER'S CONTROL. The same program at 20x the statements against 1x: twenty times
 // the work by construction, so it must red a 2.5 bar, and only a broken fuel reading (no

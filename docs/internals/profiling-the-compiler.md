@@ -34,8 +34,11 @@ size each time, even where it costs little fuel.
 **WHICH COLLECTOR, AND WHAT IT COSTS.** `vl build` and `vl run` compile under the copying
 collector from a 256 MiB first heap; `VL_COMPILE_GC=null` and `=copying` are the overrides,
 `VL_COMPILE_GC_HEAP` sets the first heap, and `VL_GC_STATS=1` prints the collection count and
-the peak live set. The self-compile scripts pin null, which is ~10% faster there. Measurements
-and the options declined: DECISIONS.md, "The compiler's collector is copying by default".
+the peak live set. The self-compile scripts pin copying from a 2 GiB first heap
+(`scripts/self-compile-gc.sh`): CPU level with null, 45% less memory, and a cap on the live set
+rather than on total allocation, which null's self-compile had grown to 85% of. Measurements
+and the options declined: DECISIONS.md, "The compiler's collector is copying by default" and
+"The self-compile runs under copying from a 2 GiB heap".
 
 Notes, each of which cost something to learn:
 

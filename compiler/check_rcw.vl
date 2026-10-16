@@ -1,0 +1,380 @@
+// Reach-can-write: whether a call can write the value a handle reaches, answered as a least
+// fixpoint over handles with a depth limit, and the node and kind that decided a refusal.
+// Does not import the checker.
+import { lookup } from "./check_scopes"
+import {
+  Block,
+  Call,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  IfStmt,
+  P,
+  Program,
+  WhileStmt,
+  i32ToStr,
+} from "./ast"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyEq,
+} from "./check_types"
+import { cwFrameOf } from "./check_write_scan"
+import {
+  rcwCalleeText,
+  rcwExprText,
+  rcwMixed,
+  rcwPathOf,
+  rcwTyOf,
+  rcwWhere,
+} from "./check_record_writes"
+import { nodeTyOf } from "./check_node_tys"
+import { rcwMemo, rcwTvName } from "./check_covar_pins"
+
+// The types a value of type `t` may be one of: a union's members, a nullable's inner type
+// (its `null` has no slots), and the type itself for everything else. Exhaustive over `Ty`.
+export function rcwMembersOf(t: i32): i32[] {
+  const out: i32[] = []
+  if t < 0 || t >= T.tys.length {
+    out.push(t)
+    return out
+  }
+  const tt = T.tys[t]
+  match tt {
+    TyUnion => {
+      let i = 0
+      while i < tt.uMembers.length {
+        out.push(tt.uMembers[i])
+        i = i + 1
+      }
+    }
+    TyNullable => {
+      out.push(tt.nInner)
+    }
+    TyPrim => {
+      out.push(t)
+    }
+    TyErr => {
+      out.push(t)
+    }
+    TyObj => {
+      out.push(t)
+    }
+    TyFunc => {
+      out.push(t)
+    }
+    TyArray => {
+      out.push(t)
+    }
+    TyMap => {
+      out.push(t)
+    }
+    TyVar => {
+      out.push(t)
+    }
+    TyLit => {
+      out.push(t)
+    }
+    TyNeg => {
+      out.push(t)
+    }
+  }
+  out
+}
+
+// The query's state: the node that decides a refusal, and the (handle, slots) pairs already
+// asked, so an alias cycle answers "no write" — the least fixpoint of a may-write question.
+export let rcwWhy = -1
+export function rcwWhySet(v: i32) { rcwWhy = v }
+
+// The imprecise hop a write is reached through — the result of a function whose calls share
+// what it returns, or a function parameter whose callers' arguments are pooled — or "".
+export let rcwVia = ""
+export function rcwViaSet(v: string) { rcwVia = v }
+
+// What `rcwWhy` is: `RCW_OPAQUE` a consumer the index does not model, `RCW_WRITE` a definite
+// write, `RCW_CALLEE` a function value whose body this cannot name, `RCW_DEPTH` the depth limit.
+export let rcwWhyKind = 0
+export function rcwWhyKindSet(v: i32) { rcwWhyKind = v }
+
+export const RCW_OPAQUE = 0
+
+export const RCW_WRITE = 1
+
+const RCW_CALLEE = 2
+
+export const RCW_DEPTH = 3
+
+// How deep one query follows handles before it refuses, in recursion steps (about four a call).
+export const RCW_DEPTH_LIMIT = 4000
+
+export let rcwSeen: {[string]: boolean} = Map()
+export function rcwSeenSet(v: {[string]: boolean}) { rcwSeen = v }
+export function rcwSeenSetAt(k: string, v: boolean) { rcwSeen[k] = v }
+
+export let rcwCut = 0
+
+// How many memoised questions are open on the current path. A "nothing writes" answer with a
+// cycle cut beneath it is final at the outermost one, since every cut there is inside it.
+export let rcwOpen = 0
+export function rcwOpenSet(v: i32) { rcwOpen = v }
+
+// Record the node that decided a refusal, keeping the first.
+export function rcwFound(at: i32): boolean { rcwWhyAs(at, RCW_OPAQUE) }
+
+// Record the deciding node with its kind, keeping the first.
+export function rcwWhyAs(at: i32, kind: i32): boolean {
+  if rcwWhy < 0 {
+    rcwWhy = at
+    rcwWhyKind = kind
+  }
+  true
+}
+
+// Refuse at a call whose callee is a function value this check cannot name a body for.
+export function rcwFoundCallee(at: i32): boolean {
+  if rcwIsErrNode(at) { return false }
+  rcwWhyAs(at, RCW_CALLEE)
+}
+
+// Whether the checker typed `at` as an error: it already reported there, and the program does
+// not build, so a second refusal would only repeat the first.
+export function rcwIsErrNode(at: i32): boolean {
+  const t = nodeTyOf(at)
+  if t < 0 || t >= T.tys.length { return false }
+  T.tys[t] is TyErr
+}
+
+// The memo's answer for `key`, replayed into the query state: 0 not banked, 1 nothing writes,
+// 2 something does.
+export function rcwMemoGet(key: string): i32 {
+  const hit = rcwMemo[key]
+  if hit is i32 {
+    if hit < 0 { return 1 }
+    rcwWhyAs(hit / 4, hit % 4)
+    return 2
+  }
+  0
+}
+
+// Bank the answer `res` for `key`, computed while `cut0` cycles had been cut.
+export function rcwMemoPut(key: string, res: boolean, cut0: i32) {
+  if res {
+    if rcwWhy >= 0 { rcwMemo[key] = rcwWhy * 4 + rcwWhyKind }
+  } else if rcwCut == cut0 || rcwOpen <= 1 {
+    rcwMemo[key] = -1
+  }
+  rcwOpen = rcwOpen - 1
+  0
+}
+
+// Whether `key` is already being asked in this query: a cycle, cut at "nothing writes".
+export function rcwSeenCut(key: string): boolean {
+  if rcwSeen.has(key) {
+    rcwCut = rcwCut + 1
+    return true
+  }
+  rcwSeen[key] = true
+  rcwOpen = rcwOpen + 1
+  false
+}
+
+// Record the node that decided a refusal as a definite write rather than an opaque edge.
+export function rcwWrote(at: i32): boolean { rcwWhyAs(at, RCW_WRITE) }
+
+// What the statement or block `p` does with its child `n`'s value: 0 makes it `p`'s own (the
+// last statement of a block, an arm of an `if`), 1 drops it (any other statement of a block or
+// the program, a loop or function body), 2 is a use this does not model, refused at `node`.
+export function rcwStmtStep(p: i32, n: i32, node: i32): i32 {
+  const pn = P.nodes[p]
+  if pn is Block {
+    if pn.blkStmts.length > 0 && pn.blkStmts[pn.blkStmts.length - 1] == n {
+      return 0
+    }
+    return 1
+  }
+  if pn is IfStmt {
+    if pn.ifThen == n || pn.ifElse == n { return 0 }
+  }
+  if pn is Program { return 1 }
+  if pn is WhileStmt {
+    if pn.whileBody == n { return 1 }
+  }
+  if pn is ForIn {
+    if pn.fiBody == n { return 1 }
+  }
+  if pn is ForRange {
+    if pn.frBody == n { return 1 }
+  }
+  if pn is FuncDecl {
+    if pn.fnBody == n { return 1 }
+  }
+  rcwStmtUnmodelled(node)
+}
+
+// Refuse at `node`, a value held by a statement form the climb above does not model.
+function rcwStmtUnmodelled(node: i32): i32 {
+  rcwFound(node)
+  2
+}
+
+// Parametricity: a widened value entering `d` at the one parameter that can supply `d`'s type
+// parameter `T` (`T[]`, `{f: T}`; elsewhere `T` only as a function parameter's argument type)
+// makes every `T` in the body one of that slot's own values, so storing one back is a
+// permutation (`sort`'s swaps). Per entered function: `T` and the source's slot type, or "", -1.
+export let rcwCtxFn: i32[] = []
+export function rcwCtxFnPop(): i32 | null { rcwCtxFn.pop() }
+export function rcwCtxFnPush(v: i32) { rcwCtxFn.push(v) }
+export function rcwCtxFnSet(v: i32[]) { rcwCtxFn = v }
+
+export let rcwCtxTv: string[] = []
+export function rcwCtxTvPop(): string | null { rcwCtxTv.pop() }
+export function rcwCtxTvPush(v: string) { rcwCtxTv.push(v) }
+export function rcwCtxTvSet(v: string[]) { rcwCtxTv = v }
+
+export let rcwCtxNarrow: i32[] = []
+export function rcwCtxNarrowPop(): i32 | null { rcwCtxNarrow.pop() }
+export function rcwCtxNarrowPush(v: i32) { rcwCtxNarrow.push(v) }
+export function rcwCtxNarrowSet(v: i32[]) { rcwCtxNarrow = v }
+
+// The source type every slot in `paths` has in `covs`, or -1 when one is missing or they differ.
+export function rcwCommonNarrow(paths: string[], covs: string[]): i32 {
+  let narrow = -1
+  let i = 0
+  while i < paths.length {
+    let found = -1
+    let c = 0
+    while c < covs.length {
+      if rcwPathOf(covs[c]) == paths[i] {
+        if rcwMixed(covs[c]) { return -1 }
+        found = rcwTyOf(covs[c])
+      }
+      c = c + 1
+    }
+    if found < 0 { return -1 }
+    if narrow >= 0 && !tyEq(narrow, found) { return -1 }
+    narrow = found
+    i = i + 1
+  }
+  narrow
+}
+
+// Whether a write at `at` of a value typed `vt` into a slot whose source type is `narrow` is a
+// permutation under the innermost parametricity context.
+export function rcwParametricOk(vt: i32, narrow: i32, at: i32): boolean {
+  const top = rcwCtxFn.length - 1
+  if top < 0 || rcwCtxTv[top] == "" { return false }
+  if at < 0 || at >= cwFrameOf.length || cwFrameOf[at] != rcwCtxFn[top] {
+    return false
+  }
+  if rcwTvName(vt, [rcwCtxTv[top]]) == "" { return false }
+  tyEq(narrow, rcwCtxNarrow[top])
+}
+
+// The context part of a memo key for a binding of frame `fr`: a binding of the innermost
+// entered function answers under that entry's parametricity context.
+export function rcwCtxKey(fr: i32): string {
+  const top = rcwCtxFn.length - 1
+  if top < 0 || rcwCtxFn[top] != fr { return "" }
+  "|" + rcwCtxTv[top] + ":" + i32ToStr(rcwCtxNarrow[top])
+}
+
+// The inferred result type of the function `fnIx`: its recorded type, or its name's binding.
+export function rcwInferredRetTy(fnIx: i32): i32 {
+  const fd = P.nodes[fnIx]
+  let ft = nodeTyOf(fnIx)
+  if ft < 0 || ft >= T.tys.length || !(T.tys[ft] is TyFunc) {
+    ft = -1
+    if fd is FuncDecl {
+      if fd.fnName != "" { ft = lookup(fd.fnName) }
+    }
+  }
+  if ft < 0 || ft >= T.tys.length { return -1 }
+  const t = T.tys[ft]
+  if t is TyFunc { return t.fnRet }
+  -1
+}
+
+// What a delivered value is called in the refusal: a list, a map, or a record.
+export function rcwValueNoun(t: i32): string {
+  if t < 0 || t >= T.tys.length { return "record" }
+  const tt = T.tys[t]
+  let noun = "record"
+  match tt {
+    TyArray => {
+      noun = "list"
+    }
+    TyMap => {
+      noun = "map"
+    }
+    // Every other delivered value this rule sees is a record, or a union or nullable of one.
+    TyObj => {}
+    TyUnion => {}
+    TyNullable => {}
+    TyPrim => {}
+    TyErr => {}
+    TyFunc => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  noun
+}
+
+// What a widened slot of that value is called: a list's or map's element, a record's field.
+export function rcwSlotNoun(t: i32): string {
+  const n = rcwValueNoun(t)
+  if n == "record" { return "field" }
+  "element or field"
+}
+
+// The clause naming why the delivery at `src` is refused, from `rcwWhy` and its kind; `slot`
+// is how a write's target is spoken of.
+export function rcwWhat(src: i32, slot: string): string {
+  const w = rcwWhy
+  if w < 0 || w >= P.nodes.length {
+    return "a handle to it reaches a place this check cannot follow"
+  }
+  const where = rcwWhere(w, src)
+  const wn = P.nodes[w]
+  if rcwWhyKind == RCW_WRITE {
+    let via = ""
+    if rcwVia != "" { via = ", reached through " + rcwVia }
+    if wn is Call {
+      return "the call to "
+        + rcwCalleeText(w)
+        + " on "
+        + where
+        + " writes "
+        + slot
+        + via
+    }
+    return "the assignment on " + where + " writes " + slot + via
+  }
+  if rcwWhyKind == RCW_CALLEE {
+    return "it reaches the call to "
+      + rcwCalleeText(w)
+      + " on "
+      + where
+      + ", a function value this check cannot see the body of"
+  }
+  if rcwWhyKind == RCW_DEPTH {
+    return "it is handed on through more steps than this check follows (a depth limit), at "
+      + where
+  }
+  "a handle to it reaches "
+    + rcwExprText(w, 0)
+    + " on "
+    + where
+    + ", which this check cannot follow"
+}

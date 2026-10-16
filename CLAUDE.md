@@ -723,7 +723,7 @@ seed with an anonymous `out of bounds array access` — the error a user reads a
 being out of range (the host banner now says which module trapped, exit 70).
 **`sentinel-index-unguarded`** is the rule (`compiler/lint.vl`, `warning`): within one function,
 a read `<t>[<idx>]` whose base the function did not declare and whose index is a call result, a
-HOLE FIELD (one the module itself compares `< 0` / `>= 0`), or a fall-through `i32` parameter
+HOLE FIELD (one some module in the graph compares `< 0` / `>= 0`), or a fall-through `i32` parameter
 of a reader, with no comparison of `<idx>` against `0`, `-1` or any `.length` before it.
 Ratchet: `vl check --budget scripts/sentinel-budget-baseline.json` (386 + 0 when it landed, #2499), census
 `vl run scripts/sentinel-census.vl`, `--why` names what left since the baseline's commit.

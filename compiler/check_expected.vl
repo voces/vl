@@ -1,0 +1,315 @@
+// Expected types handed to an expression before it is checked: the parameter and result
+// types recorded for a lambda, and the destination type recorded for a call.
+// Does not import the checker.
+import {
+  ArrayLit,
+  Block,
+  Call,
+  FieldInit,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  MatchExpr,
+  Node,
+  ObjLit,
+  P,
+  Paren,
+  RetStmt,
+  Spread,
+} from "./ast"
+import { ufcsRecvExpr } from "./check_overload"
+import { parenPeelIx } from "./check_places"
+import { lookupFnDeclNode } from "./check_scopes"
+import {
+  unionArrayArmForLit,
+  unionFuncArmForArity,
+  unionObjArmForLit,
+} from "./check_ty_shape"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyNullable,
+  TyObj,
+  TyUnion,
+  objFieldType,
+} from "./check_types"
+import {
+  joinLeavesOf,
+  tailPushBlockTail,
+  tailPushIfArms,
+  tailPushMatchArms,
+} from "./check_unconsumed"
+import { fnDeclIx } from "./check_write_scan"
+
+// The type an `if` or `match` used as a value is delivered to, seeded by `seedExpected`.
+export let joinWantAt: {[i32]: i32} = Map()
+
+// Contextual (bidirectional) inference for un-annotated function-literal params: an expression
+// checked in a position with a known expected type lets a lambda sitting there infer its params
+// from the expected function type, even nested inside a composite. `seedExpected` walks expected
+// type and expression in lockstep and records them per lambda node, so no seed leaks into a body.
+export let cbExpNode: i32[] = [] // lambda node index
+export let cbExpOff: i32[] = []  // offset of its param-type run in `cbExpPool`
+export let cbExpLen: i32[] = []  // run length (param count)
+export let cbExpPool: i32[] = [] // flattened expected param-type arena indices
+
+export let cbExpRetNode: i32[] = []
+export let cbExpRetTy: i32[] = []
+// The type a delivery position expects of the call at a node index (`seedExpected`): what lets
+// a type parameter bound only by literal arguments take the destination's type (D3539).
+export let callDstTy: {[i32]: i32} = Map()
+// Whether `callDstTy` holds any row, so a program with no generic call never asks it.
+export let callDstAny = false
+
+// Record `retTy` as the expected return type of the lambda at `nodeIx` (latest wins).
+function recordCbExpectedRet(nodeIx: i32, retTy: i32) {
+  cbExpRetNode.push(nodeIx)
+  cbExpRetTy.push(retTy)
+  0
+}
+
+// The expected return type recorded for the lambda at `nodeIx` — the last recorded one, the real
+// pass overriding the pre-inference pass — or -1 when none.
+export function cbExpectedRetFor(nodeIx: i32) {
+  let found = -1
+  let i = 0
+  while i < cbExpRetNode.length {
+    if cbExpRetNode[i] == nodeIx { found = cbExpRetTy[i] }
+    i = i + 1
+  }
+  found
+}
+
+// Record `paramTys` as the expected param types of the lambda at `nodeIx` (latest wins).
+export function recordCbExpected(nodeIx: i32, paramTys: i32[]) {
+  cbExpNode.push(nodeIx)
+  cbExpOff.push(cbExpPool.length)
+  cbExpLen.push(paramTys.length)
+  let i = 0
+  while i < paramTys.length {
+    cbExpPool.push(paramTys[i])
+    i = i + 1
+  }
+  0
+}
+
+// The expected param types recorded for the lambda at `nodeIx` — the last recorded run, the real
+// pass overriding the pre-inference pass — or `[]` when none.
+export function cbExpectedFor(nodeIx: i32) {
+  let found = -1
+  let i = 0
+  while i < cbExpNode.length {
+    if cbExpNode[i] == nodeIx { found = i }
+    i = i + 1
+  }
+  const out: i32[] = []
+  if found >= 0 {
+    let j = 0
+    while j < cbExpLen[found] {
+      out.push(cbExpPool[cbExpOff[found] + j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+// The body's tail expression of a lambda, its implicit-return value — the last statement's return
+// argument, or a bare trailing-expression statement. A lambda body is always a (possibly synthetic
+// one-statement) `Block`, and -1 means no tail value. It lets `seedExpected` flow an expected
+// result type into a body, so a curried `(a) => (b) => …` reaches its inner lambda.
+export function lambdaBodyTail(bodyIx: i32) {
+  if bodyIx < 0 { return -1 }
+  const b = P.nodes[bodyIx]
+  if b is Block {
+    const stmts = b.blkStmts
+    if stmts.length == 0 { return -1 }
+    const last = stmts[stmts.length - 1]
+    const ln = P.nodes[last]
+    if ln is RetStmt { return ln.retArg }
+    return last
+  }
+  -1
+}
+
+// Returns 1 when the seed actually reached a lambda and pinned its params or result, i.e. when
+// the expected type is load-bearing for what the expression infers to. `recordRedundantAnnot`
+// needs the answer: an annotation that seeded its own initializer cannot be judged redundant by
+// comparing the two, the comparison being circular (D1442). Every other arm only recurses.
+export function seedExpected(exprIx: i32, expectedTy: i32) {
+  if exprIx < 0 || expectedTy < 0 { return 0 }
+  let u = exprIx
+  let done = false
+  while !done {
+    const node = P.nodes[u]
+    if node is Paren { u = node.parInner } else { done = true }
+  }
+  let did = 0
+  const en = P.nodes[u]
+  const et = T.tys[expectedTy]
+  // A nullable expected type (`(i32) => i32 | null`, e.g. a map value slot, which is `V | null`)
+  // seeds its inner: the right-hand lambda or literal still wants the non-null shape.
+  // A generic call keeps the whole nullable type, which only a bare `null` argument binds from.
+  if et is TyNullable {
+    const nr = seedExpected(u, et.nInner)
+    if en is Call {
+      if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
+    }
+    return nr
+  }
+  if en is FuncDecl {
+    if en.fnName == "" {
+      if et is TyFunc {
+        recordCbExpected(u, et.fnParamTypes)
+        recordCbExpectedRet(u, et.fnRet)
+        did = 1
+        // Recurse into the lambda's body against the expected result type, the dual of the
+        // array/object recursion below. A curried `(a) => (b) => …` against `(i32) => ((i32) =>
+        // i32)` then types its inner lambda's params from the result type, at any depth.
+        seedExpected(lambdaBodyTail(en.fnBody), et.fnRet)
+      } else if et is TyUnion {
+        // A lambda flowing into a union with a bare-closure arm (`f: (() => i64) | {w:i32}`):
+        // seed it against the arity-matching function arm, so `() => 5` widens to `() => i64` and
+        // adopts the union. Without it the lambda infers its own `() => i32` and the assignment
+        // is a loud type error. Arity-matched, so a wrong-arity arm falls to assignability.
+        const arm = unionFuncArmForArity(et, en.fnParams.length)
+        if arm >= 0 { did = seedExpected(u, arm) }
+      }
+    }
+  } else if en is Call {
+    if callNamesGenericDecl(en) { setCallDstTy(u, expectedTy) }
+  } else if en is IfStmt || en is MatchExpr || en is Block {
+    seedCallDstLeaves(u, expectedTy)
+    seedJoinWant(u, expectedTy)
+  } else if en is ArrayLit {
+    if et is TyArray {
+      let i = 0
+      while i < en.arrElems.length {
+        const sp = P.nodes[en.arrElems[i]]
+        if sp is Spread { seedCallDstLeaves(sp.spdArg, expectedTy) }
+        if seedExpected(en.arrElems[i], et.aElem) != 0 { did = 1 }
+        i = i + 1
+      }
+    } else if et is TyUnion {
+      // An array literal flowing into a union with a closure-array arm, or a struct-array arm
+      // with closure-bearing element fields: descend into the matching array arm so a bare
+      // element lambda infers its params and result from that arm's element type. Without the
+      // seed a nested field lambda self-infers narrower and the boxed producer and consumer part.
+      const arm = unionArrayArmForLit(et, u)
+      if arm >= 0 { did = seedExpected(u, arm) }
+    }
+  } else if en is ObjLit {
+    if et is TyObj {
+      const fields = en.objFields
+      let i = 0
+      while i < fields.length {
+        const fnode = P.nodes[fields[i]]
+        if fnode is FieldInit {
+          const fty = objFieldType(et, fnode.fiName)
+          if fty >= 0 {
+            if seedExpected(fnode.fiValue, fty) != 0 { did = 1 }
+          }
+        }
+        i = i + 1
+      }
+    } else if et is TyUnion {
+      // A struct literal flowing into a union (`{f: (i32) => i32, …} | boolean`): descend into
+      // the matching struct arm so a bare field lambda infers its params from that arm's field
+      // types. Without it an un-annotated field lambda has no contextual seed and fails "cannot
+      // infer a type for parameter". Assignability still gates the literal against the union.
+      const arm = unionObjArmForLit(et, u)
+      if arm >= 0 { did = seedExpected(u, arm) }
+    }
+  }
+  did
+}
+
+// Whether call callee `cfn` names a declared function whose return type is written.
+export function calleeRetDeclared(cfn: Node): boolean {
+  const name = calleeIdentName(cfn)
+  if name == "" { return false }
+  let d = fnDeclIx[name] ?? -1
+  if d < 0 { d = lookupFnDeclNode(name) }
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return dn.fnRet >= 0 }
+  false
+}
+
+// The declared name a callee EXPRESSION spells, or "" for a call through a value. The
+// owner half of a write demand's key at the pin; "" matches nothing a body filed.
+export function calleeIdentName(cfn: Node): string {
+  if cfn is Ident { return cfn.identName }
+  ""
+}
+
+export function setCallDstTy(ix: i32, ty: i32) {
+  if ix < 0 { return 0 }
+  callDstTy[ix] = ty
+  callDstAny = true
+  0
+}
+
+// The type `setCallDstTy` recorded for the call at `ix`, or -1.
+export function callDstTyOf(ix: i32): i32 {
+  if !callDstAny { return -1 }
+  callDstTy[ix] ?? -1
+}
+
+// Whether the call `c` names a declared function with type parameters, or is a method call:
+// the only callees whose instance a destination can choose.
+function callNamesGenericDecl(c: Call): boolean {
+  // A method resolves to its `self`-function only at the call, so it is always recorded.
+  if ufcsRecvExpr(c) >= 0 { return true }
+  const name = calleeIdentName(P.nodes[c.callFn])
+  if name == "" { return false }
+  // A top-level name is one table read; a local takes the scope chain.
+  let d = fnDeclIx[name] ?? -1
+  if d < 0 { d = lookupFnDeclNode(name) }
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return dn.fnTyParams.length > 0 }
+  false
+}
+
+// Records `ty` as the destination of each call `ix` yields: itself, or a leaf of the `if`,
+// `match` or block it is, so a type parameter its literals bind reads the destination too.
+function seedCallDstLeaves(ix: i32, ty: i32) {
+  const todo: i32[] = [ix]
+  let guard = 0
+  while todo.length > 0 && guard < 64 {
+    guard = guard + 1
+    const at = parenPeelIx(todo.pop() ?? -1)
+    if at >= 0 && at < P.nodes.length {
+      if !tailPushIfArms(at, todo) && !tailPushMatchArms(at, todo) {
+        if !tailPushBlockTail(at, todo) {
+          const cn = P.nodes[at]
+          if cn is Call {
+            if callNamesGenericDecl(cn) { setCallDstTy(at, ty) }
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// Banks destination `ty` on every `if` and `match` whose value reaches it through `ix`'s arms.
+function seedJoinWant(ix: i32, ty: i32) {
+  if ty < 0 { return 0 }
+  for at in joinLeavesOf(ix) { joinWantAt.set(at, ty) }
+  0
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function expectedReset() {
+  cbExpNode = []
+  cbExpOff = []
+  cbExpLen = []
+  cbExpPool = []
+  cbExpRetNode = []
+  cbExpRetTy = []
+  callDstTy = Map()
+  callDstAny = false
+  joinWantAt = Map()
+}

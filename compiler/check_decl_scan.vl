@@ -1,0 +1,772 @@
+// Declaration scans run before the body walk: bound declarations, the function a binding or
+// write belongs to, module integer constants, union atoms of annotations, nominal names
+// scoped to a body, and the SIMD, atomic and saturating intrinsics' types.
+// Emptied by `declScanReset`. Does not import the checker.
+import { cexPastF64, cexRootShape, lbiNameKey } from "./check_num_lits"
+import { declare, isModuleScopeConst, lookupDepth } from "./check_scopes"
+import { cexOk } from "./const_exact"
+import {
+  BinExpr,
+  BoolLit,
+  Call,
+  CharLit,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  Member,
+  NullLit,
+  NumLit,
+  P,
+  Param,
+  StrLit,
+  TS_ARR,
+  TS_ISECT,
+  TS_MAP,
+  TS_NAME,
+  TS_OBJ,
+  TS_UNION,
+  Unary,
+  annTsOf,
+  markDefaultGlobalRef,
+  nodeChildren,
+  nodeToks,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsText,
+} from "./ast"
+import { identDeclOf, sidOfNode } from "./symbols"
+import { symOccTok, symOccTy } from "./check_state"
+import {
+  T,
+  TY_BOOL,
+  TY_ERR,
+  TY_F32,
+  TY_F64,
+  TY_I32,
+  TY_I64,
+  TY_NULL,
+  TY_STR,
+  TY_U8,
+  TY_V128,
+  TY_VOID,
+  TyArray,
+  TyFunc,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  cUserTypes,
+  mkFuncTy,
+  nomNameOfTy,
+} from "./check_types"
+import { keyHasPrefix, parenPeelIx, placeKeyOf } from "./check_places"
+import { demangleName } from "./check_suggest"
+import { weSplit } from "./check_capture_walks"
+import {
+  ATOMIC_SIG_CMPXCHG,
+  ATOMIC_SIG_FENCE,
+  ATOMIC_SIG_LOAD,
+  ATOMIC_SIG_NOTIFY,
+  ATOMIC_SIG_RMW,
+  ATOMIC_SIG_STORE,
+  ATOMIC_SIG_WAIT,
+  MEM_OFFSET_MAX,
+  SIMD_SIG_F_V,
+  SIMD_SIG_I_V,
+  SIMD_SIG_LANE_F,
+  SIMD_SIG_LANE_I,
+  SIMD_SIG_LANE_L,
+  SIMD_SIG_LOAD,
+  SIMD_SIG_L_V,
+  SIMD_SIG_REPL_F,
+  SIMD_SIG_REPL_I,
+  SIMD_SIG_REPL_L,
+  SIMD_SIG_SHUF16,
+  SIMD_SIG_SHUF4,
+  SIMD_SIG_STORE,
+  SIMD_SIG_VI_V,
+  SIMD_SIG_VVV_V,
+  SIMD_SIG_VV_V,
+  SIMD_SIG_V_I,
+  SIMD_SIG_V_V,
+  TRUNC_SAT_NAMES,
+  atomicI64,
+  atomicNames,
+  atomicSigs,
+  atomicTableBuild,
+  memOffsetLexValue,
+  simdNames,
+  simdSigs,
+  simdTableBuild,
+  truncSatFromF64,
+  truncSatIsI64,
+} from "./check_intrinsics"
+import { isValueUnionBox, nulNumLitUnionBaseName } from "./check_ty_rep"
+import {
+  crCalleeUnresolved,
+  fnWriteEffects,
+  fnWriteFreePaths,
+} from "./check_write_effects"
+import {
+  cexEvalAt,
+  cexModScan,
+  cexRewrite,
+  lbiCandOfName,
+  lbiInitLit,
+  lbiModLit,
+  lbiNameSeen,
+  lbiOccIx,
+  lbiOccLit,
+  lbiOccNode,
+  lbiReadCand,
+  lbiReadNode,
+  lbiReadWide,
+  lbiUseTy,
+} from "./check_num_lit_state"
+import { nodeTyIxOf, nodeTyOf } from "./check_node_tys"
+import { inferQuiet, tpEnvTyOfName } from "./check_cursor"
+import { letCstr } from "./check_cstr_rows"
+import {
+  BME_CELLS,
+  builtinMethodEffect,
+  callArgPlaces,
+  callDeclFnIx,
+} from "./check_callee"
+import { gaIndexOf } from "./check_gen_alias_anns"
+import { CSTR_NODECL } from "./check_generic_args"
+import { identNameAt } from "./check_narrow_paths"
+
+// `cBoundDecls` — every `type Showable = { toString(): string }` in the program, name → the
+// declaration's bound-body annotation node. Registered in pass 0a instead of `cUserTypes`:
+// a bound constrains a type parameter and has no values, so it is not a type, and
+// `declaredTyOfName` turns a value-position use into a sentence rather than into a struct.
+export let cBoundDecls: {[string]: i32} = Map()
+export function cBoundDeclsSetAt(k: string, v: i32) { cBoundDecls[k] = v }
+
+// The function a local `let`/`const` is declared in, and the binding a plain `x = e` write stores
+// into, keyed on `e`: what a pin asks to tell whether a call can reach the written value.
+export let letDeclFn: {[i32]: i32} = Map()
+export function letDeclFnPut(k: i32, v: i32) { letDeclFn.set(k, v) }
+
+export let wrDstDecl: {[i32]: i32} = Map()
+export function wrDstDeclPut(k: i32, v: i32) { wrDstDecl.set(k, v) }
+
+// The integer-literal initializer of each top-level `const`, by name: what a memory
+// intrinsic's offset may name besides a literal (`memOffsetArgCheck`).
+export let moduleConstIntInit: {[string]: i32} = Map()
+export function moduleConstIntInitSetAt(k: string, v: i32) {
+  moduleConstIntInit[k] = v
+}
+
+// Annotation atom-count sidecar: how many top-level union atoms the annotation node's emit-time
+// spelling is joined from, banked by `canonEmitTypeNames`, the producer of that spelling. The
+// count cannot be recovered from the arena — an annotation over two same-shape declared structs
+// dedups to a plain `TyObj`. Keyed by node, holding the `TypeRef`s only: every other node reads -1.
+export let annUnionAtoms: {[i32]: i32} = Map()
+
+// ── the declaration fill registry (pass 0a / 0b) ─────────────────────────────
+export function annUnionAtomsSet(v: {[i32]: i32}) { annUnionAtoms = v }
+export function annUnionAtomsSetAt(k: i32, v: i32) { annUnionAtoms[k] = v }
+
+// D1045 — the nominal declarations declared inside a block, keyed by their mangled name. A nominal
+// type is its name, so one whose name goes out of scope takes the nominal identity with it:
+// nothing can spell the return of `function fresh() { type Id = new i32; return 7 as Id }`, and
+// the checker refuses the inferred return. Only nominal rows; a local struct escapes freely.
+export let nwBodyScopedNames: {[string]: i32} = Map()
+export function nwBodyScopedNamesSetAt(k: string, v: i32) {
+  nwBodyScopedNames[k] = v
+}
+
+// The checker type of SIMD row `row`, built from its operand shape.
+function simdRowTy(row: i32): i32 {
+  const v = TY_V128
+  const sig = simdSigs[row]
+  if sig == SIMD_SIG_V_V { return mkFuncTy([v], v) }
+  if sig == SIMD_SIG_VV_V { return mkFuncTy([v, v], v) }
+  if sig == SIMD_SIG_VVV_V { return mkFuncTy([v, v, v], v) }
+  if sig == SIMD_SIG_V_I { return mkFuncTy([v], TY_I32) }
+  if sig == SIMD_SIG_VI_V { return mkFuncTy([v, TY_I32], v) }
+  if sig == SIMD_SIG_I_V { return mkFuncTy([TY_I32], v) }
+  if sig == SIMD_SIG_L_V { return mkFuncTy([TY_I64], v) }
+  if sig == SIMD_SIG_F_V { return mkFuncTy([TY_F32], v) }
+  if sig == SIMD_SIG_LOAD { return mkFuncTy([TY_I32], v) }
+  if sig == SIMD_SIG_STORE { return mkFuncTy([TY_I32, v], TY_VOID) }
+  if sig == SIMD_SIG_LANE_I { return mkFuncTy([v, TY_I32], TY_I32) }
+  if sig == SIMD_SIG_LANE_L { return mkFuncTy([v, TY_I32], TY_I64) }
+  if sig == SIMD_SIG_LANE_F { return mkFuncTy([v, TY_I32], TY_F32) }
+  if sig == SIMD_SIG_REPL_I { return mkFuncTy([v, TY_I32, TY_I32], v) }
+  if sig == SIMD_SIG_REPL_L { return mkFuncTy([v, TY_I32, TY_I64], v) }
+  if sig == SIMD_SIG_REPL_F { return mkFuncTy([v, TY_I32, TY_F32], v) }
+  let lanes = -1
+  if sig == SIMD_SIG_SHUF4 { lanes = 4 }
+  if sig == SIMD_SIG_SHUF16 { lanes = 16 }
+  // No other shape exists; an unknown one types as an error rather than as some shuffle.
+  if lanes < 0 { return TY_ERR }
+  const ps: i32[] = [v, v]
+  while ps.length < lanes + 2 { ps.push(TY_I32) }
+  mkFuncTy(ps, v)
+}
+
+// Declares every SIMD row at the type its operand shape names.
+export function declareSimdIntrinsics() {
+  if simdNames.length == 0 { simdTableBuild() }
+  let i = 0
+  while i < simdNames.length {
+    declare(simdNames[i], simdRowTy(i))
+    i = i + 1
+  }
+  0
+}
+
+export function declareTruncSatIntrinsics() {
+  let op = 0
+  while op < TRUNC_SAT_NAMES.length {
+    let arg = TY_F32
+    if truncSatFromF64(op) { arg = TY_F64 }
+    let ret = TY_I32
+    if truncSatIsI64(op) { ret = TY_I64 }
+    declare(TRUNC_SAT_NAMES[op], mkFuncTy([arg], ret))
+    op = op + 1
+  }
+  0
+}
+
+// The checker type of atomic row `row`, built from its operand shape and value width.
+function atomicRowTy(row: i32): i32 {
+  const a = TY_I32
+  let v = TY_I32
+  if atomicI64[row] { v = TY_I64 }
+  const sig = atomicSigs[row]
+  if sig == ATOMIC_SIG_LOAD { return mkFuncTy([a], v) }
+  if sig == ATOMIC_SIG_STORE { return mkFuncTy([a, v], TY_VOID) }
+  if sig == ATOMIC_SIG_RMW { return mkFuncTy([a, v], v) }
+  if sig == ATOMIC_SIG_CMPXCHG { return mkFuncTy([a, v, v], v) }
+  if sig == ATOMIC_SIG_WAIT { return mkFuncTy([a, v, TY_I64], TY_I32) }
+  if sig == ATOMIC_SIG_NOTIFY { return mkFuncTy([a, TY_I32], TY_I32) }
+  const noParams: i32[] = []
+  if sig == ATOMIC_SIG_FENCE { return mkFuncTy(noParams, TY_VOID) }
+  TY_ERR
+}
+
+// Declares every atomic row at the type its operand shape names.
+export function declareAtomicIntrinsics() {
+  if atomicNames.length == 0 { atomicTableBuild() }
+  let i = 0
+  while i < atomicNames.length {
+    declare(atomicNames[i], atomicRowTy(i))
+    i = i + 1
+  }
+  0
+}
+
+// The collection methods that can remove or replace a cell — the only intrinsic calls that falsify
+// a narrowing of a cell of their own receiver: a removal, and a map's `set`, which writes the key's
+// value like `m[k] = v`. Deliberately not `cwMutatesList`'s whole set: `push` appends and `add`
+// inserts, neither of which can change what `xs[0]` or `m["a"]` holds.
+export function cellRemovingMethod(p: string): boolean {
+  builtinMethodEffect(p) == BME_CELLS
+}
+
+// Whether any written sub-path in the `,`-terminated summary `sum` (each optionally carried under
+// `under`) is `path` itself or a prefix of it. Writing `o.a` replaces the sub-object, so it kills
+// `o.a.v` and `o.a[0]` as surely as writing them does.
+export function pathHitsAny(path: string, sum: string, under: string) {
+  const parts = weSplit(sum)
+  let j = 0
+  while j < parts.length {
+    const w = under + parts[j]
+    if path == w || keyHasPrefix(path, w + ".") || keyHasPrefix(path, w + "[") {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+// The occurrence recorded for node `ix`, or -1.
+function lbiOccOfNode(ix: i32): i32 {
+  if ix < 0 || ix >= nodeToks.length { return -1 }
+  const tok = nodeToks[ix]
+  let i = symOccTok.length - 1
+  while i >= 0 {
+    if symOccTok[i] == tok { return i }
+    i = i - 1
+  }
+  -1
+}
+
+// Give each rewritten read's occurrence the type its literal took there.
+export function lbiSymTypes() {
+  let i = 0
+  while i < lbiOccIx.length {
+    const n = lbiOccNode[i]
+    let o = lbiOccIx[i]
+    if o < 0 { o = lbiOccOfNode(n) }
+    const t = lbiUseTy[n] ?? nodeTyOf(n)
+    if t >= 0 && o >= 0 && o < symOccTy.length { symOccTy[o] = t }
+    if o >= 0 { lbiOccLit[o] = n }
+    i = i + 1
+  }
+  0
+}
+
+// Fill `lbiModLit` from the top-level statements `stmts`, following copies in any order.
+export function lbiScanModLits(stmts: i32[]) {
+  lbiModLit = Map()
+  let grew = true
+  while grew {
+    grew = false
+    for st in stmts {
+      const d = P.nodes[st]
+      if d is LetDecl {
+        if (
+          d.letKw == "const"
+          && d.letType < 0
+          && d.letInit >= 0
+          && !lbiModLit.has(d.letName)
+        ) {
+          let lit = lbiInitLit(d.letInit)
+          if lit < 0 && cexFoldModInit(d.letInit) {
+            lit = lbiInitLit(d.letInit)
+          }
+          if lit >= 0 {
+            lbiModLit[d.letName] = lit
+            grew = true
+          }
+        }
+      }
+    }
+  }
+  // Every other module initializer that is a constant tree is its literal too, so the declaration
+  // pass sees it as the bare spelling (an annotated `const`, a `let`).
+  for st in stmts {
+    const d = P.nodes[st]
+    if d is LetDecl {
+      if d.letInit >= 0 && (d.letKw != "const" || d.letType >= 0) {
+        cexFoldModInit(d.letInit)
+      }
+    }
+  }
+  0
+}
+
+// ── exact constants (DECISIONS.md, "Exact constant arithmetic") ─────────────────────────────
+// A tree of numeric literals, literal `const`s and arithmetic, bitwise and shift operators is
+// computed exactly and rewritten into the literal of its value, which each use then types as it
+// would that literal written there.
+
+// Fold the module initializer `init` before the module is checked, so its reads anywhere are
+// its literal; false when it is not (yet) a constant tree.
+function cexFoldModInit(init: i32): boolean {
+  const p = parenPeelIx(init)
+  if p < 0 || !cexRootShape(p) { return false }
+  cexModScan = true
+  const v = cexEvalAt(p, 0)
+  cexModScan = false
+  if !cexOk(v) || cexPastF64(v) { return false }
+  cexRewrite(p, v)
+  true
+}
+
+// A read `ix` of the name `name`, recorded when it is a candidate's.
+export function lbiNoteRead(ix: i32, name: string) {
+  if inferQuiet || !lbiNameSeen[lbiNameKey(name)] { return 0 }
+  const c = lbiCandOfName(name, sidOfNode(ix))
+  if c >= 0 {
+    lbiReadNode.push(ix)
+    lbiReadCand.push(c)
+    lbiReadWide.push(-1)
+  }
+  0
+}
+
+// The primitive spellings. -1 means "not a primitive" — every hit is a fixed arena index, all >= 0,
+// so the sentinel cannot collide with an answer. Exported because the emit side's name bridge
+// (`emit_rep.declTyIxOfName`) asks it directly, and the answers are the arena's seeded indices, so
+// the emit-side rung and this resolver's leaf are the same value by construction.
+export function primTyOfName(name: string) {
+  if name == "i32" { return TY_I32 }
+  if name == "i64" { return TY_I64 }
+  if name == "f64" { return TY_F64 }
+  if name == "f32" { return TY_F32 }
+  if name == "boolean" { return TY_BOOL }
+  if name == "string" { return TY_STR }
+  if name == "void" { return TY_VOID }
+  // The `null` type itself — the check type of `x is null` (host: an Alias
+  // named "null"); union members spell it through the `|`-split / `TS_NULL`.
+  if name == "null" { return TY_NULL }
+  // The SIMD substrate, spelled so `std:simd` can brand it (`type F32x4 = new v128`).
+  if name == "v128" {
+    v128Seen = true
+    return TY_V128
+  }
+  -1
+}
+
+// D-MAPKEYDIAG — the spelling node whose key the unsupported-map-key diagnostic names, or -1 when
+// this annotation opens no map spelling. The structural dual of `tyname.mapSpellKeyName`'s gate,
+// which is deliberately wider than a whole map span: a list of boolean-keyed maps and a nullable
+// one are the same mistake. Read structurally, that width is a descent down the left spine.
+export function tsMapKeyNodeOf(root: i32) {
+  let ix = root
+  let out = -1
+  let going = true
+  while going {
+    going = false
+    if ix >= 0 {
+      const k = tsKind[ix]
+      if k == TS_MAP {
+        out = ix
+      } else if k == TS_ARR || k == TS_UNION || k == TS_ISECT {
+        if tsKidCount[ix] > 0 {
+          ix = tsKids[tsKidStart[ix]]
+          going = true
+        }
+      }
+    }
+  }
+  out
+}
+
+// ── `tsToTy` — the structural dual of `nameToTy` ─────────────────────────────
+
+// `nameToTy` below is the compiler's second recursive-descent type parser; the first is
+// `parseTypeName`, which returned a concatenated string. This consumes the flat spelling tree that
+// parser keeps — arm for arm, in `nameToTy`'s order, with the same constructors in the same
+// sequence, because the arena is not hash-consed and a dual that allocates differently is not one.
+
+// Whether the call at `callIx` ends the narrowing keyed `key` by a rule that holds at every pin:
+// an opaque callee, a cell-removing method on the path's own receiver, or a callee whose
+// summary writes the path by name through an argument or a free variable.
+export function callKillSure(callIx: i32, key: string): boolean {
+  const cn = P.nodes[callIx]
+  if !(cn is Call) { return false }
+  const rmRecv = P.nodes[cn.callFn]
+  if rmRecv is Member {
+    if cellRemovingMethod(rmRecv.memProp) {
+      const rmRoot = placeKeyOf(rmRecv.memObj)
+      if rmRoot != "" && keyHasPrefix(key, rmRoot + "[") { return true }
+    }
+  }
+  const declIx = callDeclFnIx(cn, callIx)
+  if declIx == -1 { return !crCalleeUnresolved(callIx) }
+  if declIx < 0 { return false }
+  const free = fnWriteFreePaths(declIx)
+  if free == "*" || pathHitsAny(key, free, "") { return true }
+  const args = callArgPlaces(cn, callIx)
+  let i = 0
+  while i < args.length {
+    const ak = placeKeyOf(args[i])
+    if ak != "" && keyHasPrefix(key, ak + ".") {
+      const sum = fnWriteEffects(declIx, i)
+      if sum == "*" { return true }
+      if pathHitsAny(key.slice(ak.length + 1, key.length), sum, "") {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Whether unnamed call `c` cannot reach the function value row `ci` writes to a local binding:
+// the call sits in the binding's own function, is not through it, and that function reads the
+// binding only as a callee or a write target. Type variables bind by name, so the call's bindings
+// would otherwise adjudicate a write whose generic merely shares a parameter name (D4890).
+export function wrUnreachedBy(ci: i32, c: i32, calleeFn: i32): boolean {
+  if calleeFn != CSTR_NODECL { return false }
+  const got = letCstr.got[ci]
+  if got < 0 || got >= T.tys.length || !(T.tys[got] is TyFunc) { return false }
+  const d = wrDstDecl.get(letCstr.ix[ci]) ?? -1
+  if d < 0 || d >= P.nodes.length || c < 0 || c >= P.nodes.length {
+    return false
+  }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) { return false }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return false }
+  if identNameAt(cn.callFn) == dn.letName { return false }
+  const fx = letDeclFn.get(d) ?? -1
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) { return false }
+  const quiet: {[i32]: i32} = Map()
+  const stack: i32[] = [fd.fnBody]
+  let inside = false
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if at == c { inside = true }
+      if n is Call { quiet.set(n.callFn, 1) }
+      if n is BinExpr && n.binOp == "=" { quiet.set(n.binLeft, 1) }
+      // A read of another binding of the name is not this one's; an unresolved read counts.
+      if identNameAt(at) == dn.letName && !quiet.has(at) {
+        const r = identDeclOf(at)
+        if r == d || r < 0 { return false }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  // Elsewhere, a call instantiates the binding's body only if that body is generic.
+  inside || (wrFnClosed(fx) && wrFnClosed(letCstr.fn[ci]))
+}
+
+// Whether declaration `fx` is a function with no type parameter and no un-annotated parameter.
+function wrFnClosed(fx: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) || fd.fnTyParams.length > 0 { return false }
+  for p in fd.fnParams {
+    const pn = P.nodes[p]
+    if !(pn is Param) || pn.parType < 0 { return false }
+  }
+  true
+}
+
+// Whether `dIx` is a form allowed as a parameter default. A default is substituted into each
+// direct call site that omits the argument, so its expression resolves names at the
+// declaration but evaluates in the caller's frame — v1 admits only a literal, a module
+// `const` (marked so no caller-local can capture it), and `__callsite__`; anything else needs evaluating inside the callee, which is an ABI change.
+export function paramDefaultIsLiteral(dIx: i32) {
+  if dIx < 0 { return false }
+  const d = P.nodes[dIx]
+  if d is NumLit { return true }
+  if d is StrLit { return true }
+  if d is CharLit { return true }
+  if d is BoolLit { return true }
+  if d is NullLit { return true }
+  if d is Unary {
+    // A SIGNED numeric literal (`-1`): the sign is a `Unary` over the literal,
+    // and it is still name-free.
+    if d.unOp == "-" || d.unOp == "+" {
+      // Bound-tested: `unArg` is a node index, and an unbounded `P.nodes[…]` read on one is a
+      // compiler trap rather than a diagnostic (D1440's shape).
+      if d.unArg >= 0 && d.unArg < P.nodes.length {
+        const inner = P.nodes[d.unArg]
+        if inner is NumLit { return true }
+      }
+    }
+  }
+  if d is Ident {
+    if isModuleScopeConst(d.identName) {
+      markDefaultGlobalRef(dIx)
+      return true
+    }
+  }
+  false
+}
+
+// The spelling root of the bound `annIx` names: an inline object literal directly, or one hop
+// through a bound-alias name. -1 when the annotation is not a bound. One hop, not a chain — a
+// bound alias's body is always a `{ … }` with a method member, so there is nothing for a
+// second hop to reach; `type S2 = Showable` is not a bound alias (it parses as a union alias).
+export function boundObjRootOf(annIx: i32) {
+  if annIx < 0 { return -1 }
+  const root = annTsOf(annIx)
+  if root < 0 { return -1 }
+  if tsKind[root] == TS_OBJ { return root }
+  if tsKind[root] == TS_NAME {
+    const hit = cBoundDecls[tsText[root]] ?? -1
+    if hit >= 0 { return annTsOf(hit) }
+  }
+  -1
+}
+
+// The builtin type a catalog leaf spells, or -1 for any other name.
+export function stdRecvLeafTy(sp: string): i32 {
+  if sp == "u8" { return TY_U8 }
+  if sp == "void" || sp == "v128" { return -1 }
+  primTyOfName(sp)
+}
+
+// The offset value `memOffsetArgCheck` accepts at `argIx`, or -1. A sum adds exactly, with no
+// i32 wrap, and must itself stay within `MEM_OFFSET_MAX`.
+export function memOffsetCheckedValue(argIx: i32): i64 {
+  const ox = parenPeelIx(argIx)
+  if ox < 0 || ox >= P.nodes.length { return -1 }
+  const e = P.nodes[ox]
+  if e is NumLit { return memOffsetLexValue(e.numText) }
+  if e is BinExpr { return memOffsetSumValue(e) }
+  memOffsetNameValue(ox)
+}
+
+// The exact sum of a `+` of two accepted offsets, or -1 for another operator or a term that is
+// not one.
+function memOffsetSumValue(e: BinExpr): i64 {
+  if e.binOp != "+" { return -1 }
+  const l = memOffsetCheckedValue(e.binLeft)
+  const r = memOffsetCheckedValue(e.binRight)
+  if l < 0 || r < 0 || l + r > MEM_OFFSET_MAX { return -1 }
+  l + r
+}
+
+// The value of the top-level integer `const` the name at `ix` denotes when no nearer binding
+// shadows it; -1 for anything else, which is every node that is not such a name.
+function memOffsetNameValue(ix: i32): i64 {
+  const e = P.nodes[ix]
+  if e is Ident {
+    if lookupDepth(e.identName) != 0 { return -1 }
+    const init = moduleConstIntInit[e.identName] ?? -1
+    if init >= 0 && init < P.nodes.length {
+      const lit = P.nodes[init]
+      if lit is NumLit { return memOffsetLexValue(lit.numText) }
+    }
+  }
+  -1
+}
+
+// Set once a program names `v128` or calls a SIMD intrinsic, so `v128NestCheck` costs a program
+// that never touches a vector nothing.
+export let v128Seen = false
+export function v128SeenSet(v: boolean) { v128Seen = v }
+
+// Annotation atom count (#1055): how many top-level `|`-joined atoms the annotation node
+// `ix`'s emit-time spelling has, banked by `canonEmitTypeNames`. -1 for a node that is not a
+// `TypeRef` or that postdates the bank (an emitter-synthesized annotation); >= 1 otherwise.
+export function annUnionAtomsOf(ix: i32) {
+  if ix < 0 { return -1 }
+  annUnionAtoms[ix] ?? -1
+}
+
+// D1045's nominal-escape rule (DECISIONS.md): the source name of a body-scoped nominal type
+// reachable inside `tyIx`, or "". Descends `TyFunc` (unlike `tyHasRepHoleAt` above) because
+// this asks whether a caller could write the type down, not what rep a slot needs. Demangled,
+// since the name goes into a diagnostic a person reads.
+export function localNomEscapeAt(tyIx: i32, depth: i32): string {
+  if tyIx < 0 { return "" }
+  if depth > 8 { return "" }
+  const nwn = nomNameOfTy(tyIx)
+  if nwn != "" {
+    if nwBodyScopedNames.has(nwn) { return demangleName(nwn) }
+  }
+  const t = T.tys[tyIx]
+  if t is TyArray { return localNomEscapeAt(t.aElem, depth + 1) }
+  if t is TyNullable { return localNomEscapeAt(t.nInner, depth + 1) }
+  if t is TyMap {
+    const k = localNomEscapeAt(t.mKey, depth + 1)
+    if k != "" { return k }
+    return localNomEscapeAt(t.mVal, depth + 1)
+  }
+  if t is TyObj {
+    const ofts = t.objFieldTypes
+    let i = 0
+    while i < ofts.length {
+      const f = localNomEscapeAt(ofts[i], depth + 1)
+      if f != "" { return f }
+      i = i + 1
+    }
+    return ""
+  }
+  if t is TyUnion {
+    const ums = t.uMembers
+    let u = 0
+    while u < ums.length {
+      const m = localNomEscapeAt(ums[u], depth + 1)
+      if m != "" { return m }
+      u = u + 1
+    }
+    return ""
+  }
+  if t is TyFunc {
+    const ps = t.fnParamTypes
+    let p = 0
+    while p < ps.length {
+      const a = localNomEscapeAt(ps[p], depth + 1)
+      if a != "" { return a }
+      p = p + 1
+    }
+    return localNomEscapeAt(t.fnRet, depth + 1)
+  }
+  ""
+}
+
+// A value/struct union box (`isUName`'s registry) or a nullable-numeric-literal-union base
+// (`nulNumLitUnionBaseName`) or a same-shape-collapsed struct union (`annUnionAtomsOf(ix) >=
+// 2`) — wider than "excludes a nullable niche and a literal union" alone suggests. Keep this
+// and `isUName(nm) && !nodeTyIsLitUnionAlias(ix)` in sync; they are not interchangeable.
+export function nodeTyIsUnionAlias(ix: i32) {
+  const ty0 = nodeTyIxOf(ix)
+  if ty0 < 0 { return false }
+  // A one-member union wrapper is transparent here — a self-referential union with a `null`
+  // arm interns one level deeper than the non-recursive spelling, so unwrap to ask the same question.
+  let ty = ty0
+  const tw = T.tys[ty0]
+  if tw is TyUnion {
+    if tw.uMembers.length == 1 { ty = tw.uMembers[0] }
+  }
+  const t = T.tys[ty]
+  // A value/struct union box (inline or declared) — the emitter registers both in `unNames`
+  // (`isUName`). Excludes a nullable niche and a literal union (an interned atom, not a box).
+  if isValueUnionBox(ty) { return true }
+  // D1027 — a nullable over a union that already boxes is still that box: the niche exclusion
+  // above is wrong once the inner is a value-union box, since the composition IS the union.
+  if t is TyNullable {
+    // Peels to a fixpoint: `Json | null` interns as nested `TyNullable`/one-member-`TyUnion`
+    // wrappers, so one unwrap is not always enough to reach the underlying box.
+    let nin = t.nInner
+    let guard = 0
+    while nin >= 0 && guard < 8 {
+      const nw = T.tys[nin]
+      if nw is TyNullable {
+        nin = nw.nInner
+      } else if nw is TyUnion {
+        if nw.uMembers.length == 1 { nin = nw.uMembers[0] } else { guard = 8 }
+      } else {
+        guard = 8
+      }
+      guard = guard + 1
+    }
+    if nin >= 0 {
+      if isValueUnionBox(nin) { return true }
+    }
+  }
+  // A same-shape union (`A | B`, structurally identical) collapses to one `TyObj` in the arena,
+  // losing its union-ness — recovered from the annotation's banked atom count (`annUnionAtomsOf`).
+  if t is TyObj {
+    if annUnionAtomsOf(ix) >= 2 { return true }
+  }
+  if t is TyNullable {
+    const inner = t.nInner
+    if inner >= 0 {
+      const it = T.tys[inner]
+      if it is TyPrim {
+        const pn = it.primName
+        if (
+          pn == "i32"
+          || pn == "f64"
+          || pn == "i64"
+          || pn == "f32"
+          || pn == "v128"
+        ) {
+          return true
+        }
+      }
+      if isValueUnionBox(inner) { return true }
+    }
+  }
+  // A nullable numeric literal union (`1 | 2 | null`) is the box too — its rep is `<base scalar>
+  // | null`, matched via `nulNumLitUnionBaseName` since inline/declared forms intern differently.
+  nulNumLitUnionBaseName(ty) != ""
+}
+
+// Whether the bare name `nm` resolves as a type here, so the pattern stays a type pattern.
+export function matchPatNamesType(nm: string) {
+  if nm == "null" || nm == "Map" || nm == "Set" { return true }
+  if primTyOfName(nm) >= 0 || tpEnvTyOfName(nm) >= 0 { return true }
+  if cUserTypes.has(nm) || cBoundDecls.has(nm) { return true }
+  gaIndexOf(nm) >= 0
+}
+
+export function declScanReset() {
+  cBoundDecls = Map()
+  letDeclFn = Map()
+  wrDstDecl = Map()
+  moduleConstIntInit = Map()
+  annUnionAtoms = Map()
+  nwBodyScopedNames = Map()
+  v128Seen = false
+}

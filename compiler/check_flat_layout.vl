@@ -1,0 +1,111 @@
+// The flat-layout sidecar: sizes and field offsets of `flat type` declarations, and the
+// layout constants `name.prop` reads.
+// Does not import the checker.
+
+// Flat-record sidecar: the layout of every `flat type N = { … }`, built by `resolveFlatLayouts`
+// and read by the `N.size` / `N.field` fold in `checkMemberNode`. Offsets are the running sum of
+// the declared field widths and the compiler never inserts a byte — no alignment, no pad, no
+// reordering. `flSizes[d]` is the total, `FL_UNRESOLVED` mid-fixpoint, `FL_INVALID` if rejected.
+export let flNames: string[] = []
+export let flSizes: i32[] = []
+export let flFStart: i32[] = []
+export let flFCount: i32[] = []
+
+// Per field, in declaration order: the name, the width (or `-1` when the field is a nested flat
+// record, in which case `flFNest` is that record's index here), and the byte offset once the
+// declaration resolves.
+export let flFNames: string[] = []
+export let flFWidth: i32[] = []
+export let flFNest: i32[] = []
+export let flFOff: i32[] = []
+
+// `flSizes[d]` sentinels. Negative so they can never collide with a real size
+// (which is a sum of non-negative widths).
+export const FL_UNRESOLVED = -1
+export const FL_INVALID = -2
+
+// The index of `name` in the flat-layout sidecar, or -1 when no `flat type name = { … }`
+// declaration names it.
+export function flatIndexOf(name: string) {
+  let i = 0
+  while i < flNames.length {
+    if flNames[i] == name { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Try to size declaration `d`: succeeds once every nested record it holds has a size. Fills
+// the per-field byte offsets as a running sum — no alignment, no padding, no reordering (§2).
+export function flatTrySize(d: i32) {
+  const start = flFStart[d]
+  const count = flFCount[d]
+  let k = 0
+  while k < count {
+    if flFWidth[start + k] < 0 {
+      const nest = flFNest[start + k]
+      if nest < 0 { return false }
+      if flSizes[nest] == FL_UNRESOLVED { return false }
+      // A nested record that is invalid makes this one unsizeable too, but the error is
+      // already on the page — take the declaration out of the fixpoint silently rather
+      // than reporting a cycle for it.
+      if flSizes[nest] == FL_INVALID {
+        flSizes[d] = FL_INVALID
+        return true
+      }
+    }
+    k = k + 1
+  }
+  let off = 0
+  let j = 0
+  while j < count {
+    flFOff[start + j] = off
+    let w = flFWidth[start + j]
+    if w < 0 { w = flSizes[flFNest[start + j]] }
+    off = off + w
+    j = j + 1
+  }
+  flSizes[d] = off
+  true
+}
+
+// The i32 value of the layout constant `name.prop`, or -1 when `prop` names neither the
+// record's size nor one of its fields. Only ever asked about a name already known to be a
+// sized flat type.
+export function flatConstOf(d: i32, prop: string) {
+  if prop == "size" { return flSizes[d] }
+  const start = flFStart[d]
+  const count = flFCount[d]
+  let k = 0
+  while k < count {
+    if flFNames[start + k] == prop { return flFOff[start + k] }
+    k = k + 1
+  }
+  -1
+}
+
+// The layout constant `name.prop` by name, for the monomorphizer's per-instance fold of a
+// type parameter's layout members (`monoFoldTyParamLayout`): -1 when `name` is not a usable
+// `flat` type, -2 when it is one but has no member `prop` — different mistakes, named
+// separately against the binding that made them.
+export function flatConstOfNameProp(name: string, prop: string) {
+  const d = flatIndexOf(name)
+  if d < 0 { return -1 }
+  // A rejected or cyclic declaration: its error is already on the page.
+  if flSizes[d] < 0 { return -1 }
+  const v = flatConstOf(d, prop)
+  if v < 0 { return -2 }
+  v
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function flatLayoutReset() {
+  flNames = []
+  flSizes = []
+  flFStart = []
+  flFCount = []
+  flFNames = []
+  flFWidth = []
+  flFNest = []
+  flFOff = []
+}

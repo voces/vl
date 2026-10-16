@@ -1,0 +1,678 @@
+// Diagnostic text: the sentences and hint clauses refusals are spelled with — unknown-type
+// suggestions, container-copy hints, push and argument refusals, subscript and spread notes.
+// Does not import the checker.
+import { lookup } from "./check_scopes"
+import {
+  ArrayLit,
+  BinExpr,
+  Call,
+  Ident,
+  Index,
+  Member,
+  P,
+  StrLit,
+  TypeRef,
+  callHasTyArgs,
+  i32ToStr,
+  ufcsModOfNode,
+} from "./ast"
+import { boolForNumberNote, storageListNote } from "./check_mismatch_notes"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cTyIxSetHas,
+  cVariantMemberTyIxSet,
+  tyDidYouMean,
+  tyToStr,
+} from "./check_types"
+import { placeKeyOf, subscriptKeyTextOf } from "./check_places"
+import { nodeLineOf } from "./check_capture_loss"
+import { foreignGenericHead } from "./check_suggest"
+import { flattenVariantsInto, isVoidTy } from "./check_ty_shape"
+import {
+  ESC_F32,
+  ESC_F64,
+  ESC_I32,
+  ESC_I64,
+  elemStoreClassOf,
+  nomErasedTyIx,
+} from "./check_ty_rep"
+import { peelParenIx } from "./check_write_effects"
+import {
+  ufcsMissAt,
+  ufcsMissAtPush,
+  ufcsMissSpecsPush,
+} from "./check_call_resolve"
+import { tpBoundOfName } from "./check_tp_bound"
+import {
+  BM_ADDKEY,
+  BM_BOUNDMUST,
+  BM_BOUNDS0,
+  BM_BYTEOFF,
+  BM_EXPECTSA,
+  BM_IDXPHRASE,
+  BM_INDEXMUST,
+  BM_KEYMUST,
+  BM_PUSH,
+  BM_SETKEY,
+  BM_SETVAL,
+  unkTyClash,
+  unkTyPart,
+} from "./check_messages"
+
+// D1591 — the fix clause of the uninferable-binding diagnostic: what the binding is missing and
+// the two ways to supply it. `add a type annotation` alone reads as though the annotation is
+// the only route, while delivering the value where its type is known is what every usage-driven
+// pin serves. Spelled with the binding's own name and the constructor its flavor uses.
+export function uninferredFixText(name: string, ty: i32) {
+  const useIt = " until it is used; use it where its type is known, or annotate the binding ("
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyMap {
+      if t.mSet == 1 {
+        return "an empty Set has no element type"
+          + useIt
+          + "`const "
+          + name
+          + ": Set<string> = Set()`)"
+      }
+      return "an empty Map has no key or value type"
+        + useIt
+        + "`const "
+        + name
+        + ": {[string]: i32} = Map()`)"
+    }
+  }
+  "an empty array literal has no element type"
+    + useIt
+    + "`const "
+    + name
+    + ": i32[] = []`)"
+}
+
+// Is the enclosing function's void return the bare-`return` pin rather than an annotation?
+// Read only to explain a `return <expr>` mismatch no written `: void` accounts for. Saved
+// and restored beside `curFnEscName`.
+export let curFnBareRetVoid = false
+export function curFnBareRetVoidSet(v: boolean) { curFnBareRetVoid = v }
+
+// The cell a `delete(<literal>)` or `set(<literal>, v)` names, as its key text, or "" when the call
+// names no single cell (`clear` / `pop` take no key; a variable key names none). Same rule as a
+// write target: a literal subscript names its cell and nothing else, anything else may hit any.
+export function removedCellKeyText(cn: Call, prop: string): string {
+  if prop == "set" && cn.callArgs.length == 2 {
+    return subscriptKeyTextOf(cn.callArgs[0])
+  }
+  if prop != "delete" { return "" }
+  if cn.callArgs.length != 1 { return "" }
+  subscriptKeyTextOf(cn.callArgs[0])
+}
+
+// The direct spelling's sentence for an `as` `asPinHolds` refuses.
+export function asPinRefusal(from: i32, to: i32): string {
+  if (
+    from >= 0
+    && from < T.tys.length
+    && (T.tys[from] is TyUnion || T.tys[from] is TyNullable)
+  ) {
+    return "`as "
+      + tyToStr(to)
+      + "` names a type that is not a member of "
+      + tyToStr(from)
+  }
+  "`as` supports numeric conversions only"
+}
+
+// The members of `ty` as `a and b`.
+export function tpMembersListText(ty: i32): string {
+  const ms: i32[] = []
+  flattenVariantsInto(ty, ms)
+  let out = ""
+  let i = 0
+  while i < ms.length {
+    if i > 0 { out = out + " and " }
+    out = out + tyToStr(ms[i])
+    i = i + 1
+  }
+  out
+}
+
+// The sentence a radix lexeme gets when its pattern is wider than the destination. One home so the
+// no-destination report (64 bits, the widest VL has) and the pinned one read alike.
+export function radixLitTooWideMsg(lex: string, width: i32) {
+  let kind = "a hex literal"
+  if lex.length >= 2 {
+    const p = lex[1]
+    if p == 'b' || p == 'B' { kind = "a binary literal" }
+    else if p == 'o' || p == 'O' { kind = "an octal literal" }
+  }
+  if width >= 64 {
+    return lex
+      + " does not fit a 64-bit destination — "
+      + kind
+      + " is a bit pattern of the destination's width, and 64 bits is the widest VL has"
+  }
+  lex
+    + " does not fit a "
+    + i32ToStr(width)
+    + "-bit destination — "
+    + kind
+    + " is a bit pattern of the destination's width; write it in decimal for its value, or give it an i64 destination"
+}
+
+// The one wording for a method member written where a value type belongs, raised by both annotation
+// routes (`nameToTyReal`'s rendered-name arm and `tsToTyReal`'s spelling-tree arm). `member` is the
+// member's own text as the author spelled it. A design refusal, not a capability gap: a method
+// member demands that a call type-check, while a value type describes what a value carries.
+export function methodInValuePosMsg(member: string) {
+  "a method member `"
+    + member
+    + "` may only appear in a BOUND — it demands that a call type-checks, which is not something a value carries. For a stored closure write the field form `name: (…) => R`; to constrain a type parameter write `<T: { "
+    + member
+    + " }>`"
+}
+
+// The `unknown type` diagnostic text for the whole annotation `name`, naming the
+// offending component when the bank holds one that is not the whole name. Read
+// immediately after the failing resolution — every call site is a resolve/`tErr` pair.
+function unknownTyText(name: string) { unknownTyTextIn(name, "") }
+
+// The same text with the caller's own trailing clause (`… for field 'a'`, `… in union
+// 'U'`) placed before the suggestion, so `did you mean` always ends the sentence.
+export function unknownTyTextIn(name: string, tail: string) {
+  if unkTyClash.length > 0 { return unkTyClash + tail }
+  if name == "never" || unkTyPart == "never" {
+    return "`never`"
+      + tail
+      + " has no values, so it is legal only as a function's declared return type"
+  }
+  const part = unkTyPart
+  if part.length == 0 {
+    return "unknown type '" + name + "'" + tail + tyDidYouMean(name)
+  }
+  if part == name {
+    return "unknown type '" + name + "'" + tail + tyDidYouMean(name)
+  }
+  // "within", not "in": some call sites already append their own `in …` clause, and
+  // "unknown type 'T' in 'T&S' in union 'Both<T>'" would read as one clause too many.
+  "unknown type '"
+    + part
+    + "' within '"
+    + name
+    + "'"
+    + tail
+    + tyDidYouMean(part)
+}
+
+// The clause naming why a field type has no place in a flat record. Every arm names a
+// representation fact, because that is the thing the programmer has to work around.
+export function flatWhyNot(tyIx: i32, spelling: string) {
+  if tyIx < 0 { return "its type has no byte width" }
+  const t = T.tys[tyIx]
+  // Exhaustive over `Ty`, deliberately without a `_` arm: a new variant breaks the
+  // self-compile here instead of silently printing a representation fact about a shape
+  // nobody classified.
+  match t {
+    TyPrim => {
+      if t.primName == "boolean" {
+        return "`boolean` has no declared byte width (use i32 — C's `bool` is 1 "
+          + "byte and VL's is 4, so this tier will not guess)"
+      }
+      if t.primName == "string" { return "a string is a heap reference" }
+      return "`" + t.primName + "` has no byte width"
+    }
+    TyArray => {
+      return "an array is a heap reference"
+    }
+    TyMap => {
+      return "a map/set is a heap reference"
+    }
+    TyFunc => {
+      return "a function value is a reference"
+    }
+    TyNullable => {
+      return "a nullable has no in-memory discriminant in this tier"
+    }
+    TyUnion => {
+      return "a union is boxed on the heap"
+    }
+    TyObj => {
+      if spelling == "" { return "an inline record is not a `flat` type" }
+      return "`" + spelling + "` is a record but is not declared `flat`"
+    }
+    TyLit => {
+      // A literal type — its base scalar is what the field would hold, and that base is
+      // already named by the `TyPrim` arm, so the generic clause is the honest one here.
+    }
+    TyVar => {
+      // An unsolved type parameter: the monomorphizer folds a `flat` layout
+      // per-instance (`monoFoldTyParamLayout`), so no rep fact exists yet.
+    }
+    TyNeg => {
+      // A residual negation — no representation to name.
+    }
+    TyErr => {
+      // Suppressed one caller earlier by `flatTyAlreadyErrored`, so this clause is
+      // never the message a programmer sees for the error type.
+    }
+  }
+  // The literal, type-parameter, negation and error arms land here: no representation fact
+  // to name, so the clause states only the width consequence.
+  "its type has no byte width"
+}
+
+// The explicit copy the element-storage refusal suggests. A list converts each element with
+// `.map`, a numeric one through `as` and any other through an annotated callback return; a
+// map has no `.map`, so it gets the closing clause alone.
+export function containerWidenCopyHint(src: i32, dst: i32): string {
+  const s = T.tys[src]
+  const d = T.tys[dst]
+  if s is TyArray {
+    if d is TyArray {
+      const de = tyToStr(d.aElem)
+      if !mapCopyBuilds(d.aElem) { return "" }
+      if elemClassIsNumeric(s.aElem) && elemClassIsNumeric(d.aElem) {
+        return ", or copy it with `.map((x) => x as " + de + ")`"
+      }
+      return ", or copy it with `.map((x): " + de + " => x)`"
+    }
+  }
+  ", filling it from the source"
+}
+
+// Can `.map` build a result list of element `de`? Not yet for a nullable list or a nullable
+// union arm (D2193), so no message offers that copy.
+function mapCopyBuilds(de: i32): boolean {
+  if de < 0 || de >= T.tys.length { return false }
+  const t = T.tys[de]
+  if t is TyNullable {
+    const ni = t.nInner
+    if ni < 0 || ni >= T.tys.length { return false }
+    const it = T.tys[ni]
+    if it is TyArray { return false }
+    if cTyIxSetHas(cVariantMemberTyIxSet, ni) { return false }
+  }
+  true
+}
+
+// Is `ty` stored as one of the four numeric element classes?
+function elemClassIsNumeric(ty: i32): boolean {
+  const c = elemStoreClassOf(ty, 8)
+  c == ESC_I32 || c == ESC_I64 || c == ESC_F32 || c == ESC_F64
+}
+
+// The clause naming delivery `at` that a refusal raised elsewhere ends with, "" for none.
+export function cvViaNote(at: i32): string {
+  if at < 0 || at >= P.nodes.length { return "" }
+  const n = P.nodes[at]
+  if !(n is Ident) { return "" }
+  let where = ""
+  const ln = nodeLineOf(at)
+  if ufcsModOfNode(at) <= 0 && ln > 0 { where = " at line " + i32ToStr(ln) }
+  " (the demand is `"
+    + n.identName
+    + "`'s, used as a function value"
+    + where
+    + ")"
+}
+
+// A builtin method argument's sentence, in one home because the arm and the pin
+// (`validateBmCstrs`) both have to say it and must not drift. `ctx` is the type a form
+// needs that is neither side of the comparison (the receiver array; the other bound of a string `slice`).
+// `bmArgMsg`'s `push` refusal, whose storage-list note names the pushed value `src` when known.
+export function bmPushMsg(
+  label: string,
+  got: i32,
+  want: i32,
+  ctx: i32,
+  src: i32,
+) {
+  label
+    + ": cannot add "
+    + tyToStr(got)
+    + " to "
+    + tyToStr(ctx)
+    + boolForNumberNote(got, want)
+    + storageListNote(src, got, want)
+}
+
+export function bmArgMsg(
+  form: i32,
+  label: string,
+  got: i32,
+  want: i32,
+  ctx: i32,
+) {
+  if form == BM_PUSH { return bmPushMsg(label, got, want, ctx, -1) }
+  if form == BM_SETVAL || form == BM_SETKEY || form == BM_ADDKEY {
+    return label
+      + ": expected "
+      + tyToStr(want)
+      + ", got "
+      + tyToStr(got)
+      + boolForNumberNote(got, want)
+  }
+  if form == BM_KEYMUST {
+    return label + ": key must be " + tyToStr(want) + ", got " + tyToStr(got)
+  }
+  if form == BM_INDEXMUST {
+    return label + ": index must be " + tyToStr(want) + ", got " + tyToStr(got)
+  }
+  if form == BM_BOUNDMUST {
+    return label + ": bound must be " + tyToStr(want) + ", got " + tyToStr(got)
+  }
+  if form == BM_EXPECTSA {
+    return label + " expects a " + tyToStr(want) + ", got " + tyToStr(got)
+  }
+  if form == BM_IDXPHRASE {
+    return label + " expects an i32 index, got " + tyToStr(got)
+  }
+  if form == BM_BYTEOFF {
+    return label + " expects an i32 byte offset, got " + tyToStr(got)
+  }
+  if form == BM_BOUNDS0 {
+    return label
+      + " expects i32 bounds, got "
+      + tyToStr(got)
+      + " and "
+      + tyToStr(ctx)
+  }
+  label + " expects i32 bounds, got " + tyToStr(ctx) + " and " + tyToStr(got)
+}
+
+// The two spellings a program can reach for and fail to find, and the one import that
+// answers both, appended to whatever sentence the lookup failed with. `toString` is an
+// ambient builtin and `toStr` is `std:fmt`'s export name, until the rename; both spellings
+// stop resolving on the same day. A note on the existing diagnostic, keyed on the spelling alone.
+export function stdFmtMovedNote(name: string) {
+  if name == "toString" {
+    return " — `toString` is not a builtin any more, it is `std:fmt`'s: add `import { toString } from \"std:fmt\"`"
+  }
+  if name == "toStr" {
+    return " — `toStr` was renamed to `toString`: add `import { toString } from \"std:fmt\"`"
+  }
+  ""
+}
+
+// Why an `is` test the author already wrote did not narrow this read: its receiver is an
+// index whose subscript keys no place. A narrowing key is a SPELLING, so only a literal names
+// one cell — telling the author to narrow with `is` when they did is D1730's message half.
+// A `?.` receiver is out of scope: the suffix names a subscript, and `x?.r` has none to name.
+export function unkeyedSubscriptNote(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return "" }
+  const m = P.nodes[ix]
+  if m is Member { return unkeyedSubscriptNoteAt(peelParenIx(m.memObj)) }
+  ""
+}
+
+// The receiver half: the sentence when `recvIx` is an index whose subscript is a NAME, which
+// `subscriptKeyTextOf` declines and so keys no place. "" for a literal subscript, which keys
+// one and narrows, and for every receiver that is not an index.
+function unkeyedSubscriptNoteAt(recvIx: i32) {
+  if recvIx < 0 || recvIx >= P.nodes.length { return "" }
+  const r = P.nodes[recvIx]
+  if r is Index {
+    if subscriptKeyTextOf(r.idxIndex) != "" { return "" }
+    const sub = P.nodes[peelParenIx(r.idxIndex)]
+    if sub is Ident {
+      return " — the `is` test was accepted; what it could not narrow is the READ, because `"
+        + sub.identName
+        + "` is not a literal subscript and so names no one cell. Bind the element first: `const v = …["
+        + sub.identName
+        + "]`, then test and read `v`"
+    }
+  }
+  ""
+}
+
+// Why a list cannot be spread into a fixed-arity call, naming the callee when it has a name.
+// VL has no tuple type, so a list's length is never known at the call — TypeScript's own
+// condition — which is why the rest parameter is the whole of the rule and not half of it.
+export function spreadNoRestMsg(who: string) {
+  let whom = "this call"
+  if who != "" { whom = "`" + who + "`" }
+  "`...` unpacks a list into a rest parameter, and "
+    + whom
+    + " has none — VL has no tuple type, so a list's length is not known at the call. "
+    + "Declare the last parameter `...xs: T[]`, or pass the elements one by one"
+}
+
+// How a bound names itself in a diagnostic: the alias name when the author wrote
+// one, else the literal they wrote. Never the synthetic re-render — a reader
+// searching for the sentence should find the text in their own file.
+export function boundText(annIx: i32) {
+  if annIx < 0 { return "" }
+  const t = P.nodes[annIx]
+  if t is TypeRef { return t.tyName }
+  ""
+}
+
+// A bound member whose own annotation does not resolve in the scope that reads it. The live
+// case is a self-referential member in an alias bound (`type Eq = { eq(T): boolean }`): the
+// alias body resolves in the alias's own scope, where `T` is an ordinary type name, not the
+// using function's parameter — phase 1 has no F-bounded generic bound aliases, so this reads as inline.
+export function boundMemberUnknownMsg(tvName: string, prop: string) {
+  const bAnn = tpBoundOfName(tvName)
+  "the bound member `"
+    + prop
+    + "` on `"
+    + tvName
+    + "` names a type that does not resolve here — a bound alias body resolves in its OWN scope, so it cannot name `"
+    + tvName
+    + "`. Spell a self-referential member inline: `<"
+    + tvName
+    + ": { "
+    + prop
+    + "("
+    + tvName
+    + "): … }>` (the bound as written is `"
+    + boundText(bAnn)
+    + "`)"
+}
+
+// Bank the callee MEMBER node's missing-import answer for `memberFloorErr`.
+export function noteUfcsMiss(memIx: i32, specs: string) {
+  if memIx < 0 { return 0 }
+  if specs == "" { return 0 }
+  let i = 0
+  while i < ufcsMissAt.length {
+    if ufcsMissAt[i] == memIx { return 0 }
+    i = i + 1
+  }
+  ufcsMissAtPush(memIx)
+  ufcsMissSpecsPush(specs)
+  0
+}
+
+// Appended where a call read as `name<…>(…)` fails: the source may have meant a comparison,
+// `a < b, c > (d)`, which TypeScript's rule reads as type arguments.
+export const TY_ARG_READ_HINT = "; `<` … `>` directly followed by `(` is read as type arguments — if this was a comparison, parenthesise it: `(a < b)`"
+
+// The unknown-type sentence for a written type argument `name`, read right after it failed
+// to resolve. The comparison hint sits before any `did you mean`, and is dropped when the
+// failing part is another language's collection generic, which is plainly a type.
+export function tyArgUnknownText(name: string): string {
+  let part = unkTyPart
+  if part.length == 0 { part = name }
+  if foreignGenericHead(part) != 0 { return unknownTyText(name) }
+  unknownTyTextIn(name, TY_ARG_READ_HINT)
+}
+
+// The hint when any of `args` is a call written with type arguments, else "".
+export function tyArgReadHintIfAny(args: i32[]): string {
+  let i = 0
+  while i < args.length {
+    if args[i] >= 0 {
+      if callHasTyArgs(args[i]) { return TY_ARG_READ_HINT }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+// A type-parameter list as written between the angle brackets: `K, V`.
+export function tyParamListText(names: string[]): string {
+  let out = ""
+  let i = 0
+  while i < names.length {
+    if i > 0 { out = out + ", " }
+    out = out + names[i]
+    i = i + 1
+  }
+  out
+}
+
+// `print`'s DOMAIN, spelled once. `driver.builtinScan` renders the LSP completion detail
+// from this (`(<domain>) => void`) and `tyPrintsAsRef`'s refusal quotes it, so the type the
+// compiler advertises and the type it enforces cannot drift into two answers — which is
+// what the hand-written completion string next to a hand-written message invited.
+export function printDomainStr(): string {
+  "i32 | i64 | f32 | f64 | boolean | string"
+}
+
+// The domain refusal `tyPrintsAsRef` raises, written once so the direct spelling and the
+// generic pin cannot say it differently. Named type first (the subject the reader wrote),
+// then the domain, then the workaround after an em dash — `tErrUnsupported`'s message
+// convention, on a plain `tErr` channel now.
+export function printRefRefusal(pt: i32): string {
+  "print expects one scalar or string value ("
+    + printDomainStr()
+    + "), got "
+    + tyToStr(pt)
+    + " — print the elements or fields individually, e.g. `print(xs[0])`"
+}
+
+// The refusal's first clause, shared by every receiver.
+export function inOpHead(): string {
+  "`in` is not an operator in VL outside a `for` loop's head"
+}
+
+// `s.includes(a)` spelled with the program's own operands where they are a name or a string
+// literal, else the placeholders.
+export function inStrFix(n: BinExpr): string {
+  let recv = placeKeyOf(n.binRight)
+  if recv == "" { recv = "s" }
+  let needle = placeKeyOf(n.binLeft)
+  const ln = P.nodes[n.binLeft]
+  if ln is StrLit { needle = ln.strText }
+  if needle == "" { needle = "x" }
+  recv + ".includes(" + needle + ")"
+}
+
+// The sentence for `a in b` over a receiver of type `rt`, naming that receiver's own test;
+// a nullable receiver answers for its inner type.
+export function inOpRefusal(rt: i32): string {
+  const head = inOpHead()
+  if rt < 0 || rt >= T.tys.length { return head }
+  const base = nomErasedTyIx(rt)
+  if base < 0 || base >= T.tys.length { return head }
+  const t = T.tys[base]
+  match t {
+    TyMap => {
+      if t.mSet == 1 {
+        return head + "; to test set membership, use `s.has(x)`"
+      }
+      return head + "; to test for a key, use `m.has(k)`"
+    }
+    TyArray => {
+      return head
+        + "; use `xs.includes(x)` for a value, or `i < xs.length` for an index"
+    }
+    TyNullable => {
+      if t.nInner != base { return inOpRefusal(t.nInner) }
+    }
+    TyErr | TyObj | TyFunc | TyUnion | TyVar | TyLit | TyNeg | TyPrim => {}
+  }
+  head
+}
+
+// A type pattern over a value union naming no type. A value there is named as one: the arms
+// of this vocabulary are member types, so a constant is not a pattern over it (D3271).
+export function matchUnknownTypeMsg(nm: string, st: i32) {
+  if lookup(nm) >= 0 {
+    return "match pattern `"
+      + nm
+      + "` is a value, not a type — a pattern over "
+      + tyToStr(st)
+      + " is a member type or the `_` wildcard"
+  }
+  "unknown type '" + nm + "' in match pattern"
+}
+
+// The `; write `[]` …` clause on the numeric-only `as` refusal, or "" for every other
+// operand. An empty array literal takes its element type from its destination, so a cast to
+// an array type is not merely unsupported but unnecessary, and no other `as` spelling works
+// either — the bare sentence sends the reader looking for one (D1641).
+export function emptyArrCastHint(objIx: i32, target: i32): string {
+  if objIx < 0 || target < 0 { return "" }
+  const tt = T.tys[target]
+  if tt is TyArray {
+    const o = P.nodes[objIx]
+    if o is ArrayLit {
+      if o.arrElems.length == 0 {
+        return "; write `[]` — an empty array literal takes its element type from its destination"
+      }
+    }
+  }
+  ""
+}
+
+// The refusal's sentence. `stepWritten` is false for a defaulted step, so the quoted range
+// stays spelled as written while the parenthetical still names the deciding step. The
+// suggested fix flips the step's sign, dropping it when the flip is the default `+1`, so the
+// advice is always something the author could type (D1588).
+export function rangeNeverRunsMsg(
+  from: i32,
+  to: i32,
+  step: i32,
+  stepWritten: boolean,
+  excl: boolean,
+) {
+  let kw = " to "
+  if excl { kw = " until " }
+  const bounds = i32ToStr(from) + kw + i32ToStr(to)
+  let written = bounds
+  if stepWritten { written = bounds + " step " + i32ToStr(step) }
+  const flipped = 0 - step
+  let fix = bounds
+  if flipped != 1 { fix = bounds + " step " + i32ToStr(flipped) }
+  let dir = "down"
+  let rel = "below"
+  let other = "up"
+  if step > 0 {
+    dir = "up"
+    rel = "above"
+    other = "down"
+  }
+  "this range never runs: `"
+    + written
+    + "` counts "
+    + dir
+    + " (step "
+    + i32ToStr(step)
+    + ") from a start "
+    + rel
+    + " its end — write `"
+    + fix
+    + "` to count "
+    + other
+    + ", or swap the bounds"
+}
+
+// Where an "expected void" comes from when nobody wrote `: void`: the bare `return`
+// elsewhere in the body, which pins the return type (D1600). Empty for every other want.
+export function bareRetVoidNote(want: i32): string {
+  if !curFnBareRetVoid { return "" }
+  if !isVoidTy(want) { return "" }
+  " — a bare `return` in this body makes the function void; drop it, or return no value here"
+}

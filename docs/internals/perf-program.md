@@ -430,7 +430,7 @@ directions. Same box, same minute, interleaved fresh-child min-of-5 (§18.1):
 | --- | ---: | ---: |
 | `vl check compiler/entry.vl` (27-module graph) | 2,387 ms | **282.8 MB** |
 | … the same, `VL_PUMP_GC=null` (the engine the 969/649.5 row had) | **891 ms** | 680.0 MB |
-| `vl build compiler/entry.vl` (self-compile, always `Collector::Null`) | 1,497 ms | 504.6 MB |
+| `vl build compiler/entry.vl` (self-compile, `Collector::Null` at the time; copying from a 2 GiB heap since D4942) | 1,497 ms | 504.6 MB |
 | `vl check compiler/typecheck.vl` | 450 ms | **151.0 MB** |
 | `vl fmt --check compiler` (whole tree) | 577 ms | **150.7 MB** |
 | `vl check tiny.vl` / `vl build tiny.vl` (the floors) | 6 / 7 ms | 20.1 / 20.2 MB |
