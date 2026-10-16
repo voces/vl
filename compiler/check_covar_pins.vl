@@ -1,0 +1,290 @@
+// The covariant-write pin notes: a delivery typed at a hole recorded for the enclosing
+// function's pins, and the type-variable slot paths those pins are taken along.
+// Does not import the checker.
+import { P } from "./ast"
+import { cstrOwnerTop } from "./check_cstr_rows"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+} from "./check_types"
+import {
+  cwAnswers,
+  cwArenaLen,
+  cwFrameReset,
+  cwIxBuild,
+  cwRootFrames,
+  cwRootNames,
+  cwSplits,
+  cwWriteAts,
+} from "./check_write_scan"
+import { strListHas } from "./listutil"
+
+export function covarWriteReset() {
+  rcwReported = []
+  ljwReported = []
+  rcwMemo = Map()
+  rcwPendSrc = []
+  rcwPendCovs = []
+  rcwPendSrcTy = []
+  rcwPendDstTy = []
+  rcwPendSeen = Map()
+  rcwBdDecl = []
+  rcwBdTp = []
+  rcwBdConc = []
+  rcwBdCovs = []
+  rcwBdCall = []
+  rcwPinSrc = []
+  rcwPinSrcTy = []
+  rcwPinDstTy = []
+  rcwPinFn = []
+  cwRootNames = []
+  cwRootFrames = []
+  cwAnswers = []
+  cwSplits = []
+  cwWriteAts = []
+  cwArenaLen = -1
+  cwFrameReset()
+}
+
+// A type whose values are shared handles: a record, a list, a map, or a union holding one.
+export function rcwIsRefTy(s: i32): boolean {
+  if s < 0 || s >= T.tys.length { return false }
+  const st = T.tys[s]
+  match st {
+    TyObj => {
+      return true
+    }
+    TyArray => {
+      return true
+    }
+    TyMap => {
+      return true
+    }
+    TyNullable => {
+      return rcwIsRefTy(st.nInner)
+    }
+    TyUnion => {
+      let i = 0
+      while i < st.uMembers.length {
+        if rcwIsRefTy(st.uMembers[i]) { return true }
+        i = i + 1
+      }
+    }
+    // Scalars, functions (immutable), holes and literal or negated scalar types.
+    TyPrim => {}
+    TyErr => {}
+    TyFunc => {}
+    TyVar => {}
+    TyLit => {}
+    TyNeg => {}
+  }
+  false
+}
+
+// Answers that outlive one query, keyed like `rcwSeen`: -1 for "nothing writes", else the
+// deciding node times four plus its kind. A "nothing writes" answer is banked only when no cycle
+// is cut beneath it, since a cut answer is provisional while its ancestor is still open.
+export let rcwMemo: {[string]: i32} = Map()
+
+// The slot paths where the type variable `tv` stands in `t`, through lists and record fields
+// only. False when `tv` also occurs somewhere a slot cannot name (a union, a map, a function).
+export function rcwTvPaths(
+  t: i32,
+  tv: string,
+  path: string,
+  out: string[],
+  depth: i32,
+): boolean {
+  if t < 0 || t >= T.tys.length || depth > 12 { return false }
+  const tt = T.tys[t]
+  if tt is TyVar {
+    if tt.tvName == tv { out.push(path) }
+    return true
+  }
+  if tt is TyArray {
+    return rcwTvPaths(tt.aElem, tv, path + "[]", out, depth + 1)
+  }
+  if tt is TyObj {
+    let i = 0
+    while i < tt.objFieldTypes.length {
+      const f = tt.objFieldTypes[i]
+      if !rcwTvPaths(f, tv, path + "." + tt.objFieldNames[i], out, depth + 1) {
+        return false
+      }
+      i = i + 1
+    }
+    return true
+  }
+  rcwTvCount(t, tv, depth) == 0
+}
+
+// The name of `t` when it is one of the type parameters `tps`, else "".
+export function rcwTvName(t: i32, tps: string[]): string {
+  if t < 0 || t >= T.tys.length { return "" }
+  const tt = T.tys[t]
+  if tt is TyVar {
+    if strListHas(tps, tt.tvName) { return tt.tvName }
+  }
+  ""
+}
+
+// How many times the type variable `tv` occurs in `t`.
+export function rcwTvCount(t: i32, tv: string, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length { return 0 }
+  // Past the depth limit the answer is "mentioned, many times": fail closed.
+  if depth > 12 { return 99 }
+  const tt = T.tys[t]
+  let n = 0
+  match tt {
+    TyVar => {
+      if tt.tvName == tv { n = 1 }
+    }
+    TyArray => {
+      n = rcwTvCount(tt.aElem, tv, depth + 1)
+    }
+    TyMap => {
+      n = rcwTvCount(tt.mKey, tv, depth + 1)
+        + rcwTvCount(tt.mVal, tv, depth + 1)
+    }
+    TyNullable => {
+      n = rcwTvCount(tt.nInner, tv, depth + 1)
+    }
+    TyNeg => {
+      n = rcwTvCount(tt.negTy, tv, depth + 1)
+    }
+    TyObj => {
+      let i = 0
+      while i < tt.objFieldTypes.length {
+        n = n + rcwTvCount(tt.objFieldTypes[i], tv, depth + 1)
+        i = i + 1
+      }
+    }
+    TyUnion => {
+      let i = 0
+      while i < tt.uMembers.length {
+        n = n + rcwTvCount(tt.uMembers[i], tv, depth + 1)
+        i = i + 1
+      }
+    }
+    TyFunc => {
+      n = rcwTvCount(tt.fnRet, tv, depth + 1)
+      let i = 0
+      while i < tt.fnParamTypes.length {
+        n = n + rcwTvCount(tt.fnParamTypes[i], tv, depth + 1)
+        i = i + 1
+      }
+    }
+    TyPrim => {}
+    TyErr => {}
+    TyLit => {}
+  }
+  n
+}
+
+// `t` is a function type whose result and whose parameters' insides never mention `tv`.
+export function rcwTvInputOnly(t: i32, tv: string): boolean {
+  const tt = T.tys[t]
+  if tt is TyFunc {
+    if rcwTvCount(tt.fnRet, tv, 0) > 0 { return false }
+    let i = 0
+    while i < tt.fnParamTypes.length {
+      const pp = tt.fnParamTypes[i]
+      if rcwTvName(pp, [tv]) == "" && rcwTvCount(pp, tv, 0) > 0 { return false }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Make the occurrence index current for this arena, as `covarValueWriteState` does.
+export function rcwIndexReady() {
+  rcwArenaReady()
+  cwIxBuild()
+  0
+}
+
+// Drop every arena-derived answer once the arena has grown past the one it describes.
+export function rcwArenaReady() {
+  if P.nodes.length != cwArenaLen {
+    cwRootNames = []
+    cwRootFrames = []
+    cwAnswers = []
+    cwSplits = []
+    cwFrameReset()
+    cwArenaLen = P.nodes.length
+    rcwMemo = Map()
+  }
+  0
+}
+
+// The delivery nodes already refused, so a delivery the checker visits twice is reported once.
+export let rcwReported: i32[] = []
+
+// Deliveries recorded while checking and decided once every body is checked, so a write's
+// value type is known whichever of caller and callee the file declares first. Keyed on
+// (source node, destination type) so a re-checked delivery is asked once.
+export let rcwPendSrc: i32[] = []
+export let rcwPendCovs: string[] = []
+export let rcwPendSrcTy: i32[] = []
+export let rcwPendDstTy: i32[] = []
+export let rcwPendSeen: {[string]: boolean} = Map()
+// Bounded-call deliveries, likewise deferred: the callee, its type parameter, the argument's
+// concrete type, the widened slots (`rcwKey` form) and the call.
+export let rcwBdDecl: i32[] = []
+export let rcwBdTp: string[] = []
+export let rcwBdConc: i32[] = []
+export let rcwBdCovs: string[] = []
+export let rcwBdCall: i32[] = []
+// Deliveries whose source is typed at a hole or type parameter, re-asked at each pin of the
+// function that owns them (`validateRcwPins`): the source, its type, the destination, the owner.
+export let rcwPinSrc: i32[] = []
+export let rcwPinSrcTy: i32[] = []
+export let rcwPinDstTy: i32[] = []
+export let rcwPinFn: i32[] = []
+
+// Record a delivery of `srcExpr`, typed at a hole `srcTy`, into `dstTy` for the pins of the
+// function whose body is being checked.
+export function rcwPinNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  const owner = cstrOwnerTop()
+  let i = 0
+  while i < rcwPinSrc.length {
+    if (
+      rcwPinSrc[i] == srcExpr
+      && rcwPinSrcTy[i] == srcTy
+      && rcwPinDstTy[i] == dstTy
+      && rcwPinFn[i] == owner
+    ) {
+      return 0
+    }
+    i = i + 1
+  }
+  rcwPinSrc.push(srcExpr)
+  rcwPinSrcTy.push(srcTy)
+  rcwPinDstTy.push(dstTy)
+  rcwPinFn.push(owner)
+  0
+}
+
+// `rcwPend`'s pin half, for the constraint probe, which records nothing else.
+export function rcwPinProbe(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy < 0 || srcTy >= T.tys.length || dstTy < 0 { return 0 }
+  if T.tys[srcTy] is TyVar && rcwIsRefTy(dstTy) && cstrOwnerTop() >= 0 {
+    rcwPinNote(srcExpr, srcTy, dstTy)
+  }
+  0
+}
+
+// The join leaves already refused by `listJoinWidenCheck`, so a leaf of two nested joins is
+// reported once.
+export let ljwReported: i32[] = []

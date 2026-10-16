@@ -1,0 +1,98 @@
+// The constraint pre-pass: indexes generic declarations, each after the candidates its body
+// names, for the call-site constraint probe.
+// Does not import the checker.
+import { FuncDecl, Ident, Member, P, nodeChildren } from "./ast"
+import { lookup } from "./check_scopes"
+import { T, TyFunc, tyHasHole } from "./check_types"
+import { fnDeclIx } from "./check_write_scan"
+
+// The top-level generic declarations by name, and each one's walk state (0 unprobed, 1 on the
+// walk, 2 placed); `cstrCandAny` is false when there are none (`cstrPrePass`).
+export let cstrCandIx: {[string]: i32} = Map()
+export let cstrCandState: {[string]: i32} = Map()
+export let cstrCandAny = false
+
+// Whether top-level declaration `ix` can own a constraint a call site adjudicates: it
+// declares a type parameter, or the hoist left one of its parameters a hole.
+function cstrProbeCandidate(ix: i32): boolean {
+  const fd = P.nodes[ix]
+  if fd is FuncDecl {
+    if (fnDeclIx[fd.fnName] ?? -1) != ix { return false }
+    if fd.fnTyParams.length > 0 { return true }
+    const h = lookup(fd.fnName)
+    if h < 0 { return false }
+    const ht = T.tys[h]
+    if ht is TyFunc {
+      for pt in ht.fnParamTypes {
+        if pt >= 0 && tyHasHole(pt) { return true }
+      }
+    }
+  }
+  false
+}
+
+// Visits every not-yet-probed candidate the subtree at `root` names, each after the
+// candidates its own body names, appending them to `order`. A candidate's state is 1 on the
+// walk and 2 when placed; a name met at 1 is a cycle, and the result says whether it met one.
+export function cstrProbeWalk(root: i32, order: i32[]): boolean {
+  let cyc = false
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const an = P.nodes[at]
+      let named = ""
+      if an is Ident { named = an.identName }
+      if an is Member { named = an.memProp }
+      if named != "" {
+        const cix = cstrCandIx[named] ?? -1
+        if cix >= 0 {
+          const st = cstrCandState[named] ?? 0
+          if st == 1 { cyc = true }
+          if st == 0 {
+            if cstrProbeVisit(cix, order) { cyc = true }
+          }
+        }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  cyc
+}
+
+// Places candidate `ix` after the candidates its body names.
+export function cstrProbeVisit(ix: i32, order: i32[]): boolean {
+  const fd = P.nodes[ix]
+  let cyc = false
+  if fd is FuncDecl {
+    cstrCandState[fd.fnName] = 1
+    cyc = cstrProbeWalk(fd.fnBody, order)
+    cstrCandState[fd.fnName] = 2
+    order.push(ix)
+  }
+  cyc
+}
+
+// Pass 1.9: indexes the generic declarations whose bodies `cstrProbeBefore` will walk.
+export function cstrPrePass(stmts: i32[]) {
+  cstrCandIx = Map()
+  cstrCandState = Map()
+  cstrCandAny = false
+  for si in stmts {
+    if cstrProbeCandidate(si) {
+      const fd = P.nodes[si]
+      if fd is FuncDecl {
+        cstrCandIx[fd.fnName] = si
+        cstrCandAny = true
+      }
+    }
+  }
+  0
+}
+
+// Clears this module's tables (called from `initChecker`).
+export function cstrProbeReset() {
+  cstrCandIx = Map()
+  cstrCandState = Map()
+  cstrCandAny = false
+}

@@ -1,0 +1,176 @@
+// Where a delivered record comes from: the literal it names through un-annotated bindings,
+// aliases and calls, and whether such a binding is ever reassigned.
+// Does not import the checker.
+import {
+  ArrayLit,
+  BinExpr,
+  Call,
+  FuncDecl,
+  Ident,
+  LetDecl,
+  ObjLit,
+  P,
+} from "./ast"
+import { parenPeelIx } from "./check_places"
+import {
+  recBindDeclOf,
+  recDeclInit,
+  recIndexBase,
+  recPassThroughArg,
+} from "./check_record_origins"
+import { recFnDeclByName } from "./check_scopes"
+import {
+  CW_OCC_ASG,
+  covarRootFrame,
+  cwIxBuild,
+  cwIxFrHead,
+  cwIxFrNext,
+  cwIxKind,
+  cwIxNode,
+  cwIxPNext,
+  cwIxUnkHead,
+  cwPeel,
+  cwPeelValue,
+} from "./check_write_scan"
+
+// Where a delivered record comes from: an object or list literal it names through un-annotated
+// bindings that hold only that literal, or itself. -1 stays -1.
+export function recOriginExpr(expr: i32): i32 {
+  if expr < 0 { return -1 }
+  let x = cwPeelValue(expr)
+  let hops = 0
+  while hops < 16 {
+    if x < 0 || x >= P.nodes.length { return -1 }
+    const e = P.nodes[x]
+    if e is Ident {
+      const init = recHeldLit(x)
+      if init < 0 { return x }
+      x = cwPeelValue(init)
+      hops = hops + 1
+      continue
+    }
+    const pass = recPassThroughArg(x)
+    if pass >= 0 {
+      x = cwPeelValue(pass)
+      hops = hops + 1
+      continue
+    }
+    return x
+  }
+  x
+}
+
+// The declaration of the un-annotated `let` or `const` the read `x` names, when it holds only
+// its initializer (a `let` is assigned nothing but object literals), else -1.
+// Resolved from the occurrence index, so a walk after the check, out of scope, answers alike.
+function recHeldDecl(x: i32): i32 {
+  const e = P.nodes[x]
+  if e is Ident {
+    const d = recBindDeclOf(x, e.identName)
+    if d < 0 { return -1 }
+    const dn = P.nodes[d]
+    if dn is LetDecl {
+      if dn.letType >= 0 || dn.letInit < 0 { return -1 }
+      if dn.letKw == "const" { return d }
+      if recBindReassigned(e.identName, covarRootFrame(x)) { return -1 }
+      return d
+    }
+  }
+  -1
+}
+
+// The initializer of `recHeldDecl`'s declaration, or -1.
+function recHeldLit(x: i32): i32 {
+  const d = recHeldDecl(x)
+  if d < 0 { return -1 }
+  const dn = P.nodes[d]
+  if dn is LetDecl { return dn.letInit }
+  -1
+}
+
+// Is the binding (`nm`, `fr`) the target of a whole assignment of anything but an object literal,
+// so it may hold a value other than a literal?
+function recBindReassigned(nm: string, fr: i32): boolean {
+  if nm == "" { return true }
+  cwIxBuild()
+  let ixA = cwIxFrHead(nm, fr)
+  let ixU = cwIxUnkHead(nm, fr)
+  while ixA >= 0 || ixU >= 0 {
+    let r = ixA
+    if ixU > ixA {
+      r = ixU
+      ixU = cwIxPNext[ixU]
+    } else {
+      ixA = cwIxFrNext(ixA, fr)
+    }
+    if cwIxKind[r] == CW_OCC_ASG && !recAsgStoresLit(cwIxNode[r]) {
+      return true
+    }
+  }
+  false
+}
+
+// How deep `recAsgStoresLit` has followed stores into bindings that are themselves stored into.
+let recAsgDepth = 0
+
+// Does the whole assignment at `a` store an object literal, written there or held by a binding?
+function recAsgStoresLit(a: i32): boolean {
+  if a < 0 || a >= P.nodes.length || recAsgDepth > 4 { return false }
+  const n = P.nodes[a]
+  if n is BinExpr {
+    recAsgDepth = recAsgDepth + 1
+    const o = recOriginExpr(n.binRight)
+    recAsgDepth = recAsgDepth - 1
+    return o >= 0 && P.nodes[o] is ObjLit
+  }
+  false
+}
+
+// The declaration of the function the call `x` names, when it declares no result and no type
+// parameter, so its result is built where the call delivers it; -1 otherwise.
+export function recInferredFnOf(x: i32): i32 {
+  const c = P.nodes[x]
+  if c is Call {
+    const cn = P.nodes[c.callFn]
+    if cn is Ident {
+      let fd = recFnDeclByName(cn.identName)
+      if fd < 0 { fd = cwPeel(recHeldLit(c.callFn)) }
+      if fd >= 0 && fd < P.nodes.length {
+        const f = P.nodes[fd]
+        if f is FuncDecl {
+          if f.fnRet < 0 && f.fnTyParams.length == 0 { return fd }
+        }
+      }
+    }
+  }
+  -1
+}
+
+// The fresh binding or function that `x` reads, through un-annotated aliases, a call or an
+// element of a list literal binding; -1 for any other value.
+export function recFreshOriginDecl(x: i32, depth: i32): i32 {
+  if depth <= 0 { return -1 }
+  const p = cwPeelValue(x)
+  if p < 0 || p >= P.nodes.length { return -1 }
+  const fd = recInferredFnOf(p)
+  if fd >= 0 { return fd }
+  const ib = recIndexBase(p)
+  if ib >= 0 { return recFreshOriginDecl(ib, depth - 1) }
+  const d = recHeldDecl(p)
+  if d < 0 { return -1 }
+  const init = cwPeel(recDeclInit(d))
+  if init < 0 || init >= P.nodes.length { return -1 }
+  const iv = P.nodes[init]
+  if iv is ObjLit || iv is ArrayLit { return d }
+  recFreshOriginDecl(init, depth - 1)
+}
+
+// The declaration of the binding the read `at` names, when it holds only an object literal or
+// a list literal. -1 otherwise.
+export function recFreshDeclOf(at: i32): i32 {
+  const init = recHeldLit(at)
+  if init < 0 { return -1 }
+  const iv = P.nodes[parenPeelIx(init)]
+  if iv is ObjLit || iv is ArrayLit { return recHeldDecl(at) }
+  -1
+}

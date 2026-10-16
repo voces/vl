@@ -1,0 +1,104 @@
+// Numeric casts whose operand's shape bounds it into the target's domain, and the
+// exactness domain a cast narrows into.
+// Does not import the checker.
+import { AsExpr, BinExpr, NumLit, P, Paren, arenaSetNode } from "./ast"
+import { CEX_DEPTH, cexEvalAt, cexTreeShape } from "./check_num_lit_state"
+import { castShiftCount, numCastCanFail } from "./check_num_lits"
+import { parenPeelIx } from "./check_places"
+import { primNameOf } from "./check_ty_shape"
+import { primNameStr } from "./check_types"
+import { Cex, cexAdd, cexFitsSigned, cexOfLexeme, cexOk } from "./const_exact"
+
+// The exactness domain a numeric cast narrows into — the target's primitive name, except
+// where the author wrote `u8` (D1587), whose value type is `i32` but this returns "u8"
+// instead. Two names for one cast: the rep target decides the conversion opcode and the box
+// row, the domain decides the range test and the `as!` message.
+export function numCastDomainName(asTy: string, target: i32): string {
+  if asTy == "u8" { return "u8" }
+  primNameStr(primNameOf(target))
+}
+
+// A cast whose operand's own shape bounds it into the target's domain cannot fail (D3622), so it
+// becomes the `as%` it then equals and answers the target in every mode. The bounds read no
+// width, so an operand an `i32` here and an `i64` at a later pin or store is bounded alike.
+export function castBoundDecide(
+  n: AsExpr,
+  ix: i32,
+  arg: i32,
+  target: i32,
+): boolean {
+  if arg < 0 { return false }
+  const sn = primNameStr(primNameOf(arg))
+  const dom = numCastDomainName(n.asTy, target)
+  if (sn != "i32" && sn != "i64") || !numCastCanFail(sn, dom) { return false }
+  let room = 63
+  if dom == "u8" { room = 8 }
+  if dom == "i32" { room = 31 }
+  const b = castBoundBits(n.asObj, 0)
+  if b < 0 || b > room { return false }
+  arenaSetNode(ix, { asObj: n.asObj, asTy: n.asTy, asMode: "wrap", pos: n.pos })
+  true
+}
+
+// The least `b` with the integer expression at `ix` in `0 .. 2^b - 1` at either width, or -1.
+// Its rules: a constant in `0 .. 2^31 - 1`; `a & c` when either side is bounded; `a >>> k` with
+// a literal `k`, below `2^(64-k)` (an `i32` shift is tighter); `a % c` over a bounded `a`.
+function castBoundBits(ix: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > CEX_DEPTH { return -1 }
+  const e = P.nodes[ix]
+  if e is Paren { return castBoundBits(e.parInner, depth + 1) }
+  if e is BinExpr {
+    if e.binCompound.length > 0 { return -1 }
+    if e.binOp == "&" {
+      const l = castBoundBits(e.binLeft, depth + 1)
+      const r = castBoundBits(e.binRight, depth + 1)
+      if l < 0 || (r >= 0 && r < l) { return r }
+      return l
+    }
+    if e.binOp == ">>>" {
+      const k = castShiftCount(e.binRight)
+      if k < 1 { return -1 }
+      let b = 64 - k
+      // An `i32` operand shifts by `k` modulo 32, so a bounded one sheds only that many bits.
+      let shed = k
+      if shed >= 32 { shed = k - 32 }
+      const l = castBoundBits(e.binLeft, depth + 1)
+      if l >= 0 && l - shed < b { b = l - shed }
+      if b < 0 { b = 0 }
+      return b
+    }
+    if e.binOp == "%" {
+      const l = castBoundBits(e.binLeft, depth + 1)
+      if l < 0 { return -1 }
+      if castBoundConst(e.binRight) <= 0 { return l }
+      const below = castBoundBitsOf(
+        cexAdd(cexEvalAt(e.binRight, 0), cexOfLexeme("1"), true),
+      )
+      if below >= 0 && below < l { return below }
+      return l
+    }
+    return -1
+  }
+  castBoundConst(ix)
+}
+
+// The bit length of the constant at `ix` when it is an integer in `0 .. 2^31 - 1`, else -1. A
+// radix pattern counts only as a lone literal, since a tree over one is read at its use's width.
+function castBoundConst(ix: i32): i32 {
+  if cexTreeShape(ix, 0) != 1 { return -1 }
+  const v = cexEvalAt(ix, 0)
+  if !cexOk(v) || v.cxFloat || v.cxNeg || !cexFitsSigned(v, 32) { return -1 }
+  if v.cxPat && !(P.nodes[parenPeelIx(ix)] is NumLit) { return -1 }
+  castBoundBitsOf(v)
+}
+
+// The least `b` with the non-negative integer `v` below `2^b`, or -1 past 32 bits.
+function castBoundBitsOf(v: Cex): i32 {
+  if !cexOk(v) || v.cxNeg { return -1 }
+  let b = 0
+  while b <= 32 {
+    if cexFitsSigned(v, b + 1) { return b }
+    b = b + 1
+  }
+  -1
+}
