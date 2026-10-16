@@ -7317,15 +7317,14 @@ export function collectAnnShapes() {
   if emitPhaseReached("monomorphized") {
     mintPinnedObjLitRows()
     mintGradualObjLitRows()
-    // A concrete record literal with a field at a union a generic instance returns mints its
-    // row once every annotation has its own; no instance returning one, no walk (D3264).
-    if monoGradualRetPinned {
-      const nLim = P.nodes.length
-      let li = 0
-      while li < nLim {
-        if P.nodes[li] is ObjLit { mintUnionFieldObjRow(li) }
-        li = li + 1
-      }
+    // A concrete record literal with a field at a union mints its row once every annotation
+    // has its own: a generic instance's return (D3264) or a function's inferred return set,
+    // which no annotation names (D2891).
+    const nLim = P.nodes.length
+    let li = 0
+    while li < nLim {
+      if P.nodes[li] is ObjLit { mintUnionFieldObjRow(li) }
+      li = li + 1
     }
   }
   0
@@ -7381,6 +7380,34 @@ function shareObjLitFieldUnionRows() {
   0
 }
 
+// Whether record field type `ft` is a value union's box, nullable or not, or a record holding
+// one in a field, at most four records down.
+function objFieldHoldsUnionBox(ft: i32, depth: i32): boolean {
+  if ft < 0 || ft >= T.tys.length || depth > 4 { return false }
+  const fu = T.tys[ft]
+  match fu {
+    TyUnion => {
+      return !tyIsLitUnion(ft)
+    }
+    TyNullable => {
+      const ni = fu.nInner
+      return ni >= 0
+        && ni < T.tys.length
+        && T.tys[ni] is TyUnion
+        && !tyIsLitUnion(ft)
+    }
+    TyObj => {
+      for gt in fu.objFieldTypes {
+        if objFieldHoldsUnionBox(gt, depth + 1) { return true }
+      }
+    }
+    TyPrim | TyErr | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      // A list, map or function field holds its own row, not a box this literal mints.
+    }
+  }
+  false
+}
+
 // Interns the row of concrete record literal `ix` when a field of its recorded type is a union,
 // whose box exists by now. A spelling that already resolves to a row is left to it (D1694).
 function mintUnionFieldObjRow(ix: i32) {
@@ -7391,16 +7418,10 @@ function mintUnionFieldObjRow(ix: i32) {
   for ft in o.objFieldTypes {
     if ft >= 0 && ft < T.tys.length {
       const fu = T.tys[ft]
-      let boxed = fu is TyUnion
-      if fu is TyNullable {
-        boxed = fu.nInner >= 0
-          && fu.nInner < T.tys.length
-          && T.tys[fu.nInner] is TyUnion
-      }
-      if boxed && !tyIsLitUnion(ft) {
+      if objFieldHoldsUnionBox(ft, 0) {
         if tyHasTyVar(lt) { return 0 }
         const nm = tyToEmitName(lt)
-        if structIndexOfTypeName(nm) < 0 {
+        if structIndexOfTypeName(nm) < 0 || structIndexOfObj(ix) < 0 {
           // An instance registers its return at the pin's spelling (`P[] | i32[]`) while the
           // record renders the same union by shape, so the shape spelling names that row, or
           // a row of its own where no instance registered one (D4930).
