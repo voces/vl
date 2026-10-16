@@ -3,7 +3,8 @@
 Owner ruling (A), plan row T4 / L10: `-O` becomes a VL compiler pass over the emitted module,
 identical for every host. The host's own optimizer — `scripts/vl-host/src/inline.rs` (since deleted),
 `multivalue.rs`, `flat.rs` and the `-O` parts of `main.rs` — retired rung by rung (since R7
-the three files are gone, and the host keeps only the chain in `main.rs`): each rung is
+the three files are gone, and since R8 the host makes one call into the compiler's pipeline and
+answers what it asks): each rung is
 ported into `compiler/` BESIDE its Rust, selectable by an environment variable, graded
 byte-identical against the Rust over tests/cases and the distilled corpus, then made the
 default and its Rust deleted. Binaryen (`wasm-opt`) stays an external tool; what moves is
@@ -18,11 +19,12 @@ everything VL does to the module around it.
 | --- | --- | --- |
 | strip `vl-src` | `strip_src`, which calls the compiler's `optStripSrc` | a `--source-map` build's source rows describe the emitter's bytes, which every later step rewrites; it is the only `-O` build whose module carries them |
 | opt cache | `opt_cache_action` | keyed on the stripped bytes, the rung, `--names`, `--low-memory`, `--stable-layout`, the `wasm-opt` identity, the seed's digest and every `VL_*` variable; a hit skips the rest |
-| inline step | `flat_vl`, after the compiler's `optInline` (`compiler/opt_inline.vl`) and `optInlineRewrite` (`compiler/opt_inline_scan.vl`), runs the compiler's `optInlineFlatScan` and `optInlineFlatStep` on their module | a field holding a small unwritten record stores its fields in the parent; a list of such records holds them side by side; `$VL_OPT_NO_INLINE` skips it |
-| multi-value step | `multivalue_step`, which calls the compiler's `optMultivalue` (`compiler/opt_multivalue.vl`) | a call site that only reads its small record result calls a twin returning the fields; `$VL_OPT_NO_MULTIVALUE` skips it |
-| source-map remap | `remap` closure | a step that moves code rebuilds the map from the rows each moved op carries |
-| escape step | `escape_inline_step`, which calls the compiler's `optEscapeChoose` / `optEscapeRestore` (`compiler/opt_escape.vl`) and runs `wasm-opt` between them | chooses callees whose struct argument never escapes, renames every function `L4c.<i>` / `L4n.<i>`, runs `wasm-opt -g --no-inline=L4n.* --always-inline-max-function-size 100000 --inlining`, restores the names |
-| the rung's argv | `rung_argv`, which calls the compiler's `optRungArgv` (`compiler/opt_scan.vl`) | in order: `--no-inline=<name>` for each hot callee of run-once code (lane L8); `--low-memory-unused` at a `--low-memory-unused` of 1,024 bytes or more; `-g` under `--names`; `OPT_PASSES` (`--always-inline-max-function-size 16 -O`) or `RELEASE_PASSES` (`--closed-world -O3 --gufa -O3`); and `--skip-pass=ssa-nomerge` when a body has more than 8,192 `local.set`/`local.tee` |
+| the steps | `opt_pipeline`, which calls the compiler's `optPipeStart` (`compiler/opt_pipe.vl`) once and answers its requests | the four rows below run in order on one instance; the host validates, prints, writes dumps and the source map, and runs the escape step's `wasm-opt`, and the compiler does the rest (see "One call") |
+| inline step | the compiler's `optInline` (`compiler/opt_inline.vl`), `optInlineRewrite`, `optInlineFlatScan` and `optInlineFlatStep` (`compiler/opt_inline_scan.vl`) | a field holding a small unwritten record stores its fields in the parent; a list of such records holds them side by side; `$VL_OPT_NO_INLINE` skips it |
+| multi-value step | the compiler's `optMultivalue` (`compiler/opt_multivalue.vl`) | a call site that only reads its small record result calls a twin returning the fields; `$VL_OPT_NO_MULTIVALUE` skips it |
+| source-map remap | `remap` closure, on the pipeline's moves request | a step that moves code rebuilds the map from the rows each moved op carries |
+| escape step | the compiler's `optEscapeChoose` / `optEscapeRestore` (`compiler/opt_escape.vl`), with the host's `wasm-opt` run between them | chooses callees whose struct argument never escapes, renames every function `L4c.<i>` / `L4n.<i>`, runs `wasm-opt -g --no-inline=L4n.* --always-inline-max-function-size 100000 --inlining`, restores the names |
+| the rung's argv | the compiler's `optRungArgv` (`compiler/opt_scan.vl`), which the pipeline's last answer carries | in order: `--no-inline=<name>` for each hot callee of run-once code (lane L8); `--low-memory-unused` at a `--low-memory-unused` of 1,024 bytes or more; `-g` under `--names`; `OPT_PASSES` (`--always-inline-max-function-size 16 -O`) or `RELEASE_PASSES` (`--closed-world -O3 --gufa -O3`); and `--skip-pass=ssa-nomerge` when a body has more than 8,192 `local.set`/`local.tee` |
 | the rung | `optimize_in_place` | one `wasm-opt` run over the sink with the passes above |
 
 ## Rungs, in order, each with its oracle
@@ -47,6 +49,7 @@ after, on one seed.
 | R6b | the inline-record step's walk, validator emulation, dataflow and decision (`compiler/opt_inline_scan.vl`); the default, its Rust deleted | retired (`$VL_OPT_INLINE`) | the decision text (`inline::decision_rust`), the `$VL_INLINE_EXPLAIN` lines, and the module bytes |
 | R6c | the inline-record step's rewrite: new types, bodies and body moves (`compiler/opt_inline_scan.vl`, `optInlineRewrite`); the default, its Rust deleted (R6d) | retired (`$VL_OPT_INLINE`) | the step's module bytes and body moves under `both`, the `$VL_INLINE_EXPLAIN` lines, the built module, and the `--source-map` file |
 | R7 | the list-flattening step: its scan, cost rule, rewrite and explain lines (`compiler/opt_inline_scan.vl`, `optInlineFlatScan`, `optInlineFlatStep`); the default, its Rust deleted | retired (`$VL_OPT_FLAT`) | `$VL_OPT_FLAT_DUMP`, the multi-value step's output, the `$VL_INLINE_EXPLAIN` lines, and the built module |
+| R8 | the chain itself: the steps' order, their skips, the body-move composition and the roundtrip checks (`compiler/opt_pipe.vl`, `optPipeStart`); the host makes one call and answers requests | none (a host built before against the one after) | every dump, explain line and source map above, under each step's flags and faults |
 
 The order is cheapest-first by what each needs: R1 and R2 only read; R3 rewrites one custom
 section; R5 to R7 rewrite bodies and need R4. A rung's default switches, and its Rust is
@@ -536,3 +539,53 @@ The control, the old host against the new under `VL_INLINE_FAULT=4` (which only 
 step reads), differs on 481 of the 1,671: 428 by the step's output and 53 by the multi-value
 step's, which reads the padded bodies first. The other 116 that flatten a list rewrite no
 body. The built modules agree, because `wasm-opt` re-encodes the locals the fault pads.
+
+## R8, one call
+
+`compiler/opt_pipe.vl` runs the chain the host used to run step by step: the inline-record
+census and rewrite, the list-flattening scan and step, the multi-value step, the escape step and
+the rung's argv, in that order, with the skips (`$VL_OPT_NO_INLINE`, `$VL_OPT_NO_FLAT`,
+`$VL_OPT_NO_MULTIVALUE`), the faults, the composition of the steps' body moves and the
+`$VL_OPT_ROUNDTRIP` checks. The host stages the emitted module with `optInLoad`, calls
+`optPipeStart(rung, low, options, inlineFault)` once with one bit per flag or variable it read,
+and answers each request until DONE; `optPipeResume(answer)` carries the answer, `optOut` what
+each request carries.
+
+The requests are what a guest cannot do: PRINT a line to stderr, VALIDATE a step's output
+(answered 1, or 0 with the error staged), VALIDATE_INPUT (the emitter's module, validated on a
+host thread while the compiler loads), MOVES (the body moves the source map is remapped with),
+the four DUMP files, WASM_OPT (the escape step's inlining run, whose result the host stages
+back), and ERROR, which ends the build with the message carried. DONE's argv, read with
+`optPipeArgv`, is the rung's. Binaryen stays a host tool, as above: the escape step's `wasm-opt`
+run is a request, and the rung is the host's last `optimize_in_place`.
+
+What `main.rs` keeps for `-O`: the strip and the cache around the call, `opt_pipe_options`
+(the environment read into bits, which refuses a `$VL_OPT_ROUNDTRIP` other than `1` or `fault`
+as before), `opt_pipeline` (the request loop), the `remap` closure and the rung. `rung_argv`,
+`opt_roundtrip_check`, `escape_restore_vl`, `escape_inline_step`, `inline_vl`,
+`inline_rewrite_vl`, `flat_vl`, `multivalue_vl`, `multivalue_step` and their stream readers
+are gone. The per-step exports stay in `compiler/entry.vl` for this PR, so a host built before
+it still runs on the new seed and can be graded against the one after.
+
+The host built before the cut against the host after, on one seed:
+
+| population | programs | identical | both refused | with a mark | skipping the inline-record step | through an escape step | flattening a list | differ | uncompared |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tests/cases, distilled `cells/` and `named/`, `-O` | 15,510 | 10,536 | 4,974 | 3,616 | 8,890 | 1,549 | 592 | 0 | 0 |
+| the 2,913 that reach a step and the 25 fixtures, `-O3`, `--names` or `--source-map` | 2,938 | 2,938 | 0 | 1,984 | 1,268 | 1,562 | 597 | 0 | 0 |
+| the same, `--stable-layout`, at `-O` or `-O3` | 2,938 | 2,938 | 0 | 1,984 | 1,268 | 1,562 | 593 | 0 | 0 |
+| the same, `VL_INLINE_REBOX=1`, with and without `VL_INLINE_SPILL=1` | 2,938 | 2,938 | 0 | 1,992 | 1,268 | 1,571 | 1,148 | 0 | 0 |
+| the same, `$VL_OPT_NO_INLINE` | 2,938 | 2,938 | 0 | 1,991 | 0 | 1,569 | 0 | 0 | 0 |
+| the same, `$VL_OPT_NO_FLAT` | 2,938 | 2,938 | 0 | 1,988 | 1,268 | 1,564 | 0 | 0 | 0 |
+| the same, `$VL_OPT_NO_MULTIVALUE` | 2,938 | 2,938 | 0 | 2,031 | 1,268 | 1,617 | 597 | 0 | 0 |
+| the same, `VL_MV_FAULT=1` | 2,938 | 2,938 | 0 | 2,030 | 1,268 | 1,613 | 591 | 0 | 0 |
+| the same, `VL_INLINE_FAULT=1` | 2,938 | 2,938 | 0 | 1,991 | 2,938 | 1,569 | 0 | 0 | 0 |
+| the same, `VL_INLINE_FAULT=2` | 2,938 | 2,938 | 0 | 1,987 | 1,268 | 1,567 | 596 | 0 | 0 |
+| the same, `VL_INLINE_FAULT=3` or `4`, `VL_OPT_ROUNDTRIP=1`, or `VL_MV_EXPLAIN=1` | 2,938 | 2,938 | 0 | 1,984 | 1,268 | 1,562 | 597 | 0 | 0 |
+
+The 2,913 are every program the `-O` row's verdicts put through the inline-record step, an
+escape step or a flattened list. Under `VL_OPT_ROUNDTRIP=fault` no build reaches `wasm-opt` on
+either side; a hand A/B of a fixture under it, under `VL_OPT_ROUNDTRIP=bogus` and under each
+fault with both explain variables set gives the same exit status, module and stderr on both
+hosts. `plumb-shape-cost` reads the same guest fuel on both hosts (8,653,308,342 main,
+6,249,248,346 tail) and peak RSS 0.3 to 0.7 MB higher, inside its bar.
