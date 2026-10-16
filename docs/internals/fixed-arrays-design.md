@@ -139,7 +139,7 @@ Each is **[measured]** (a program was run on today's master seed, `0502ce8f0`), 
 * **A16 [measured, rev 2]. Containers never widen**: `const b: f64[] = a` with `a: i32[]` is
   refused because "it would be a copy, and a write through either list would not reach the
   other". Only `readonly T[]` is covariant.
-* **A18 [read]. The host's multi-value step (`scripts/vl-host/src/multivalue.rs`) already
+* **A18 [read]. The host's multi-value step (`scripts/vl-host/src/multivalue.rs`, since deleted) already
   scalarises immutable records**: a struct type no `struct.set` reaches, used only field by
   field, becomes N locals and N results, with twins per call site, loop-carried locals
   included. It runs at `-O`/`-O3` only. Its bound is 8 fields.
