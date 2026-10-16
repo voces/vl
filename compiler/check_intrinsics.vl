@@ -506,138 +506,131 @@ export function memOffsetLexValue(t: string): i64 {
   v
 }
 
-// ── the host floor: one ordered list, six readers ────────────────────────────
+// ── the host floor: one ordered table, every reader derives from it ──────────
 
-// The slot is the identity of a host intrinsic everywhere downstream — files, argv, processes
-// and the environment share one table because they share one lowering — and the order below is
-// the only place it is written, so a name added here appears in all six consumers or in none.
-// Append-only: inserting a name would move every later import's wasm index. -1 for a non-member.
+// One row per host-floor import, in slot order: its name, its signature spelled as VL source
+// spells a function type, and `memory` when the host reads or writes linear memory by address.
+// Append-only: inserting a row would move every later import's wasm index. A parameter is
+// `u8[]`, `i64` or `i32`; a result is one of those or `void`, which the checker reads as `never`.
+const FS_FLOOR: string[] = [
+  "__fs_read__", "(u8[]) => u8[]", "",
+  "__fs_write__", "(u8[], u8[]) => i32", "",
+  "__fs_list__", "(u8[]) => u8[]", "",
+  "__fs_stat__", "(u8[]) => i32", "",
+  "__args_count__", "() => i32", "",
+  "__args_get__", "(i32) => u8[]", "",
+  "__fs_errno__", "() => i32", "",
+  "__fs_read_range__", "(u8[], i64, i32) => u8[]", "",
+  "__fs_size__", "(u8[]) => i64", "",
+  "__fs_read_into__", "(u8[], i64, i32, i32) => i32", "memory",
+  // The command and its arguments as one NUL-separated block; the two slots after it fetch
+  // the child's captured streams.
+  "__proc_run__", "(u8[]) => i32", "",
+  "__proc_out__", "() => u8[]", "",
+  "__proc_err__", "() => u8[]", "",
+  "__proc_exit__", "(i32) => void", "",
+  "__env_get__", "(u8[]) => u8[]", "",
+  // The positional writes: `mode` is 0 replace, 1 at `offset` without truncating, 2 append.
+  // The second takes its bytes from linear memory at `addr`.
+  "__fs_write_at__", "(u8[], i64, u8[], i32) => i32", "",
+  "__fs_write_from__", "(u8[], i64, i32, i32, i32) => i32", "memory",
+]
+
+// How many floor slots exist. Every parallel table the emitter keeps (`gFsUse`, `gFsIdx`) is
+// exactly this long, and every read of one is bound-checked against it.
+export function fsIntrinsicCount(): i32 { FS_FLOOR.length / 3 }
+
+// Column `col` of slot `k`'s row, or "" for a slot out of range.
+function fsFloorCell(k: i32, col: i32): string {
+  if k < 0 || k >= fsIntrinsicCount() { return "" }
+  FS_FLOOR[k * 3 + col]
+}
+
+// The slot `name` occupies, or -1 for a non-member.
 export function fsIntrinsicSlot(name: string): i32 {
-  if name == "__fs_read__" { return 0 }
-  if name == "__fs_write__" { return 1 }
-  if name == "__fs_list__" { return 2 }
-  if name == "__fs_stat__" { return 3 }
-  if name == "__args_count__" { return 4 }
-  if name == "__args_get__" { return 5 }
-  if name == "__fs_errno__" { return 6 }
-  if name == "__fs_read_range__" { return 7 }
-  if name == "__fs_size__" { return 8 }
-  if name == "__fs_read_into__" { return 9 }
-  if name == "__proc_run__" { return 10 }
-  if name == "__proc_out__" { return 11 }
-  if name == "__proc_err__" { return 12 }
-  if name == "__proc_exit__" { return 13 }
-  if name == "__env_get__" { return 14 }
-  if name == "__fs_write_at__" { return 15 }
-  if name == "__fs_write_from__" { return 16 }
+  let k = 0
+  while k < fsIntrinsicCount() {
+    if FS_FLOOR[k * 3] == name { return k }
+    k = k + 1
+  }
   -1
 }
 
-// How many fs slots exist. Every parallel table the emitter keeps (`gFsUse`, `gFsIdx`) is exactly
-// this long, and every read of one is bound-checked against it — `emitFail` does not halt
-// emission, so an out-of-bounds read here would trap a compiler that had already decided to fail.
-export function fsIntrinsicCount(): i32 { 17 }
+// The name at slot `k`, or "" for a slot out of range, which every caller treats as "emit
+// nothing" rather than writing an empty name.
+export function fsIntrinsicNameAt(k: i32): string { fsFloorCell(k, 0) }
 
-// The name at slot `k` — the inverse of `fsIntrinsicSlot`, used by the import and name
-// sections, which iterate slots rather than spelling names. `""` for a slot out of
-// range, which every caller treats as "emit nothing" rather than writing an empty name.
-export function fsIntrinsicNameAt(k: i32): string {
-  if k == 0 { return "__fs_read__" }
-  if k == 1 { return "__fs_write__" }
-  if k == 2 { return "__fs_list__" }
-  if k == 3 { return "__fs_stat__" }
-  if k == 4 { return "__args_count__" }
-  if k == 5 { return "__args_get__" }
-  if k == 6 { return "__fs_errno__" }
-  if k == 7 { return "__fs_read_range__" }
-  if k == 8 { return "__fs_size__" }
-  if k == 9 { return "__fs_read_into__" }
-  if k == 10 { return "__proc_run__" }
-  if k == 11 { return "__proc_out__" }
-  if k == 12 { return "__proc_err__" }
-  if k == 13 { return "__proc_exit__" }
-  if k == 14 { return "__env_get__" }
-  if k == 15 { return "__fs_write_at__" }
-  if k == 16 { return "__fs_write_from__" }
-  ""
-}
+// Slot `k`'s signature, `(params) => result`, or "" for a slot out of range.
+export function fsIntrinsicSig(k: i32): string { fsFloorCell(k, 1) }
 
-// True when `name` is a floor slot. A projection of `fsIntrinsicSlot`, deliberately not a
-// second `if`-chain: the two could not then disagree.
+// True when `name` is a floor slot.
 export function nameIsFsIntrinsic(name: string) { fsIntrinsicSlot(name) >= 0 }
 
-// True when slot `k` takes a `u8[]` in argument position `a` (0-based). Drives the call lowering's
-// per-argument context seeding — a `u8[]` operand threads the packed-list build kind so an empty
-// `[]` literal argument builds the packed wrapper, while an i32 operand (`__args_get__`'s index)
-// takes the ordinary width-cleared spine.
-export function fsArgIsU8List(k: i32, a: i32) {
-  if k == 0 { return a == 0 }
-  if k == 1 { return a == 0 || a == 1 }
-  if k == 2 { return a == 0 }
-  if k == 3 { return a == 0 }
-  if k == 7 { return a == 0 }
-  if k == 8 { return a == 0 }
-  if k == 9 { return a == 0 }
-  if k == 10 { return a == 0 }
-  if k == 14 { return a == 0 }
-  if k == 15 { return a == 0 || a == 2 }
-  if k == 16 { return a == 0 }
-  false
-}
-
-// The declared arity of slot `k`. The emitter checks it before lowering, so a wrong-arity call is
-// a named diagnostic rather than a stack shape that happens to validate.
+// The declared arity of slot `k`, or -1 for a slot out of range.
 export function fsIntrinsicArity(k: i32): i32 {
-  if k == 1 { return 2 }
-  if k == 4 { return 0 }
-  if k == 6 { return 0 }
-  if k == 5 { return 1 }
-  if k == 7 { return 3 }
-  if k == 8 { return 1 }
-  if k == 9 { return 4 }
-  if k == 10 { return 1 }
-  if k == 11 { return 0 }
-  if k == 12 { return 0 }
-  if k == 13 { return 1 }
-  if k == 14 { return 1 }
-  if k == 15 { return 4 }
-  if k == 16 { return 5 }
-  if k >= 0 && k <= 3 { return 1 }
-  -1
+  const sig = fsIntrinsicSig(k)
+  if sig == "" { return -1 }
+  if sig[1] == 41 {
+    return 0 // `()`
+  }
+  let n = 1
+  let i = 1
+  while sig[i] != 41 {
+    if sig[i] == 44 {
+      n = n + 1 // `,`
+    }
+    i = i + 1
+  }
+  n
 }
 
-// True when slot `k` returns a `u8[]` (the packed wrapper) rather than an i32 — the split the type
-// section's functype shapes and the emitter's result classification both turn on.
-export function fsRetIsU8List(k: i32) {
-  k == 0 || k == 2 || k == 5 || k == 7 || k == 11 || k == 12 || k == 14
+// Parameter `a` (0-based) of slot `k`, spelled `u8[]`, `i64` or `i32`; "" when there is none.
+export function fsIntrinsicParam(k: i32, a: i32): string {
+  if a < 0 || a >= fsIntrinsicArity(k) { return "" }
+  const sig = fsIntrinsicSig(k)
+  let at = 0
+  let start = 1
+  let i = 1
+  while sig[i] != 41 {
+    if sig[i] == 44 {
+      if at == a { return sig.slice(start, i) }
+      at = at + 1
+      start = i + 2
+    }
+    i = i + 1
+  }
+  sig.slice(start, i)
 }
 
-// True when slot `k` takes an i64 in argument position `a` — a byte offset into the FILE,
-// which an i32 cannot address past 2 GiB. Read beside `fsArgIsU8List` by the functype
-// writer and the call lowering, so every position is a packed list, an i64, or an i32.
-export function fsArgIsI64(k: i32, a: i32) {
-  if k == 7 { return a == 1 }
-  if k == 9 { return a == 1 }
-  if k == 15 { return a == 1 }
-  if k == 16 { return a == 1 }
-  false
+// Slot `k`'s result, spelled `u8[]`, `i64`, `i32` or `void`; "" for a slot out of range.
+export function fsIntrinsicResult(k: i32): string {
+  const sig = fsIntrinsicSig(k)
+  if sig == "" { return "" }
+  sig.slice(sig.indexOf(" => ") + 4, sig.length)
 }
 
-// True when slot `k` returns an i64 rather than an i32 or the packed wrapper — a file size, for
-// the same addressing reason. Read beside `fsRetIsU8List` by the same two.
-export function fsRetIsI64(k: i32) { k == 8 }
+// True when slot `k` takes a `u8[]` in argument position `a`: the call lowering threads the
+// packed-list build kind into that operand, so an empty `[]` literal builds the packed wrapper.
+export function fsArgIsU8List(k: i32, a: i32) {
+  fsIntrinsicParam(k, a) == "u8[]"
+}
 
-// True when slot `k` returns NOTHING — the one slot that never returns at all,
-// `__proc_exit__`. Read beside the two above by the functype writer, which otherwise
-// declares exactly one result per slot; a diverging import declared with a result would
-// oblige every host to leave a value on the stack it can never reach the code to push.
-export function fsRetIsVoid(k: i32) { k == 13 }
+// True when slot `k` takes an i64 in argument position `a` — a byte offset into the file,
+// which an i32 cannot address past 2 GiB.
+export function fsArgIsI64(k: i32, a: i32) { fsIntrinsicParam(k, a) == "i64" }
+
+// True when slot `k` returns a `u8[]`, the packed wrapper.
+export function fsRetIsU8List(k: i32) { fsIntrinsicResult(k) == "u8[]" }
+
+// True when slot `k` returns an i64 — a file size, for the same addressing reason.
+export function fsRetIsI64(k: i32) { fsIntrinsicResult(k) == "i64" }
+
+// True when slot `k` returns nothing: `__proc_exit__`, which never returns at all.
+export function fsRetIsVoid(k: i32) { fsIntrinsicResult(k) == "void" }
 
 // True when slot `k` reads or writes linear memory by address, so the module needs the memory
-// emitted and exported even when it contacts it nowhere else. Without this a program whose only
-// memory use is `__fs_read_into__` names a memory that does not exist, and the host has nowhere
-// to write. Read by the use scan beside the memory intrinsics, which force it the same way.
-export function fsSlotTouchesMemory(k: i32) { k == 9 || k == 16 }
+// emitted and exported even when it contacts it nowhere else.
+export function fsSlotTouchesMemory(k: i32) { fsFloorCell(k, 2) == "memory" }
 
 // The declared-but-unlowered memory intrinsics: names that pass `vl check` and then die at emit
 // with `emitProgram: call to unknown function`, which reads like a mistyped identifier when the

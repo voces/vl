@@ -64,6 +64,13 @@ import { ifValueReset } from "./check_if_value"
 import { inferRetReset } from "./check_infer_ret"
 import { inferRowsReset } from "./check_infer_rows"
 import { inlineLitUnionReset } from "./check_inline_lit_union"
+import {
+  fsIntrinsicArity,
+  fsIntrinsicCount,
+  fsIntrinsicNameAt,
+  fsIntrinsicParam,
+  fsIntrinsicResult,
+} from "./check_intrinsics"
 import { listUnionReset } from "./check_list_union"
 import { literalsReset } from "./check_literals"
 import { matchDesugarReset } from "./check_match_desugar"
@@ -945,38 +952,35 @@ export function initChecker() {
   declareAtomicIntrinsics()
   // The scalar saturating truncations, one declaration per `0xFC` sub-opcode.
   declareTruncSatIntrinsics()
-  // The filesystem floor (`std:fs`, `std:args`), which unlike everything above it does not
-  // lower to instructions — a syscall is the one thing wasm cannot express. Bytes, not
-  // strings, in both directions, so a payload crosses as one packed `u8[]` GC object. Errors are
-  // out of band: a failing call answers an empty `u8[]` and `__fs_errno__()` carries WASI errno.
+  // The host floor, one declaration per row of its table (`check_intrinsics.vl`). Unlike
+  // everything above it these are host imports: bytes cross as one packed `u8[]` GC object,
+  // and errors are out of band — an empty `u8[]` or a negative i32, with `__fs_errno__()`
+  // carrying the WASI errno.
   const u8Arr = mkArrayTy(TY_U8)
-  declare("__fs_read__", mkFuncTy([u8Arr], u8Arr))
-  declare("__fs_write__", mkFuncTy([u8Arr, u8Arr], TY_I32))
-  declare("__fs_list__", mkFuncTy([u8Arr], u8Arr))
-  declare("__fs_stat__", mkFuncTy([u8Arr], TY_I32))
-  declare("__fs_read_range__", mkFuncTy([u8Arr, TY_I64, TY_I32], u8Arr))
-  declare("__fs_size__", mkFuncTy([u8Arr], TY_I64))
-  declare("__fs_read_into__", mkFuncTy([u8Arr, TY_I64, TY_I32, TY_I32], TY_I32))
-  declare("__args_count__", mkFuncTy(noParams, TY_I32))
-  declare("__args_get__", mkFuncTy([TY_I32], u8Arr))
-  declare("__fs_errno__", mkFuncTy(noParams, TY_I32))
-  // The positional and appending writes: `mode` is 0 replace, 1 at `offset` without
-  // truncating, 2 append. The second takes its bytes from linear memory at `addr`.
-  declare("__fs_write_at__", mkFuncTy([u8Arr, TY_I64, u8Arr, TY_I32], TY_I32))
-  declare(
-    "__fs_write_from__",
-    mkFuncTy([u8Arr, TY_I64, TY_I32, TY_I32, TY_I32], TY_I32),
-  )
-  // The process floor (`std:process`, `std:env`): five more host imports on the same
-  // out-of-band error channel. `__proc_run__` takes the command and its arguments as ONE
-  // NUL-separated block — the one byte an argv element cannot hold — and answers the
-  // child's exit code; its two captured streams are fetched by the slots after it.
-  declare("__proc_run__", mkFuncTy([u8Arr], TY_I32))
-  declare("__proc_out__", mkFuncTy(noParams, u8Arr))
-  declare("__proc_err__", mkFuncTy(noParams, u8Arr))
-  declare("__proc_exit__", mkFuncTy([TY_I32], TY_NEVER))
-  declare("__env_get__", mkFuncTy([u8Arr], u8Arr))
+  let fk = 0
+  while fk < fsIntrinsicCount() {
+    const fps: i32[] = []
+    let fa = 0
+    while fa < fsIntrinsicArity(fk) {
+      fps.push(fsFloorTy(fsIntrinsicParam(fk, fa), u8Arr))
+      fa = fa + 1
+    }
+    declare(
+      fsIntrinsicNameAt(fk),
+      mkFuncTy(fps, fsFloorTy(fsIntrinsicResult(fk), u8Arr)),
+    )
+    fk = fk + 1
+  }
   0
+}
+
+// The checker type of a floor signature's spelling: `u8[]`, `i64`, `i32`, or `void`, which is
+// `never` because the one slot that declares it never returns.
+function fsFloorTy(spell: string, u8Arr: i32): i32 {
+  if spell == "u8[]" { return u8Arr }
+  if spell == "i64" { return TY_I64 }
+  if spell == "void" { return TY_NEVER }
+  TY_I32
 }
 
 // Does `ty` concatenate as a string? The `+` gate's operand test, in one home because the
