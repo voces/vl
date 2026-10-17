@@ -175,9 +175,145 @@ export function checkNode(ix: i32) {
   t
 }
 
+// The undeclared-identifier floor for the read `n` at `ix`: names the one position
+// `__callsite__` is legal in, the unmerged interpolation renderer, or a moved or unimported
+// name, before the generic message. Always answers `TY_ERR`.
+function checkIdentUndeclared(n: Ident, ix: i32): i32 {
+  // `__callsite__` is legal — as a parameter default value, and nowhere else.
+  // Reaching the undeclared-identifier floor means it appears in an expression, so
+  // say which position it belongs in rather than that the name does not exist
+  // (it does; `checkParamDefaults` accepts it).
+  if n.identName == CALLSITE_NAME {
+    tErr(
+      "`__callsite__` is legal only as a parameter default value — write `caller: { file: string, line: i32, col: i32 } = __callsite__`",
+      ix,
+    )
+    return TY_ERR
+  }
+  // The interpolation renderer's floor: `$tpl$render` is minted by the parser and
+  // rewritten to the merged `toString$mN` by `modBuildRename`, so reaching here means
+  // `std:fmt` never entered the module graph. Named, since the generic
+  // undeclared-identifier message would point at a name the author cannot have written.
+  if n.identName == TPL_RENDER_LOCAL {
+    tErr(
+      "internal: an interpolation hole's renderer was not merged — `std:fmt` is missing from this program's module graph",
+      ix,
+    )
+    return TY_ERR
+  }
+  const moved = stdFmtMovedNote(n.identName)
+  if moved == "" && undeclaredImportRaise(n.identName, ix) { return TY_ERR }
+  tErr(
+    "undeclared identifier '"
+      + n.identName
+      + "'"
+      + moved
+      + arrayCtorCallNote(n.identName, ix),
+    ix,
+  )
+  TY_ERR
+}
+
+// A numeric literal's type: f64 for a float lexeme (refusing one past the largest finite
+// double), else the adopted or narrowest integer type that holds it exactly.
+function checkNumLitNode(n: NumLit, ix: i32): i32 {
+  // A literal with a "." is f64. An integer literal defaults to the NARROWEST
+  // type that holds it exactly — i32 if its magnitude fits, else i64 — the
+  // host's `defaultIntegerType` rule (`numLexFitsI32`).
+  if numLexIsFloat(n.numText) {
+    // A literal whose magnitude rounds past the largest finite double names a value f64
+    // cannot represent — and VL has no infinity spelling to encode it honestly, so it is an
+    // error (a silent ±inf would be a lossy implicit conversion). Runtime arithmetic still
+    // yields ±inf per IEEE-754; this rejects only literal text.
+    if f64LitOverflows(n.numText) { tErr("float literal overflows f64", ix) }
+    return TY_F64
+  }
+  // A radix literal that adopted a 64-bit destination keeps that width across re-checks; one
+  // wider than 64 bits has no destination at all, and says so here rather than wrapping.
+  if n.numText.length >= 19 { cexNoteWideLit(ix, n.numText) }
+  if litWide64Of(ix) { return TY_I64 }
+  const ltt = litTreeTyOf(ix)
+  if ltt >= 0 { return ltt }
+  if numLexRadixBits(n.numText) > 64 {
+    if !cexIsDerived(ix) { tErr(radixLitTooWideMsg(n.numText, 64), ix) }
+    return TY_I64
+  }
+  if numLexFitsI32(n.numText) { return TY_I32 }
+  TY_I64
+}
+
+// A bare-name read's type: a parameter default's module-frame read, a literal `const`'s
+// literal, or the scope's binding with its use, capture and definite-assignment notes.
+// An unbound name is the undeclared-identifier floor.
+function checkIdentNode(n: Ident, ix: i32): i32 {
+  // A marked parameter default resolves in the declaration's scope — for the one name form
+  // v1 admits, the module frame. Checked once at the declaration and again at every call
+  // site that omits the argument; the second reading is why the mark exists, so a
+  // caller-local binding sharing the const's name cannot capture the substituted reference.
+  if isDefaultGlobalRef(ix) {
+    // A literal `const` is its literal here too, taken at the parameter's type.
+    const dlit = lbiModLit[n.identName] ?? -1
+    if dlit >= 0 {
+      lbiInlineLit(ix, dlit, n.pos, n.identName)
+      return checkNodeReal(ix)
+    }
+    identNoteModuleUse(ix, n.identName)
+    if T.scopes.length > 0 {
+      if T.scopes[0].has(n.identName) {
+        return T.scopes[0][n.identName] ?? TY_ERR
+      }
+    }
+    return TY_ERR
+  }
+  // A literal `const` has no single type: each read is its literal, typed by where it stands.
+  const lit = lbiConstLitAt(ix, n.identName)
+  if lit >= 0 {
+    lbiInlineLit(ix, lit, n.pos, n.identName)
+    return checkNodeReal(ix)
+  }
+  const ty = lookup(n.identName)
+  // A module name declared as both a function and a value is refused as redeclared; which
+  // of the two a read means is unknowable, so the read is that error's cascade.
+  if lookupDepth(n.identName) == 0 && (modClashNames[n.identName] ?? false) {
+    return TY_ERR
+  }
+  // Only a read at an extern's own type can name one, so the name lookup is asked of those alone.
+  if ty >= extFnTyMin && ty < extFnTy.length && !extValueSeen {
+    if extFnTy[ty] && ix != ckCalleeIx {
+      if externLinkOf(n.identName) >= 0 { extValueSeenSet(true) }
+    }
+  }
+  if ty < 0 { return checkIdentUndeclared(n, ix) }
+  // `ty` is this use's type as the checker resolved it — narrowed when the use
+  // sits inside a guarded arm. Threaded in so the occurrence retains it.
+  identNoteUse(ix, n.identName)
+  if symEnabled != 0 { symUse(ix, n.identName, ty) }
+  if ovSetMod.length > 0 && ix != ckCalleeIx {
+    ovNoteFnValue(ix, n.identName, ty)
+  }
+  if ix != daWriteTarget {
+    if crCapLossAny { crNoteLostName(n.identName, ix) }
+    const crr = crReadHook(n.identName, ix)
+    if crr >= 0 { return crr }
+  }
+  // Definite-assignment read gate: a bare-name read of a still-unassigned binding is "used
+  // before assigned". The LHS of a plain `=` is a write, not a read (the `BinExpr` `=` arm
+  // marks it `daWriteTarget` before evaluating the target), so it is skipped here; a
+  // compound `x += …` desugars to `x = x + (…)`, whose RHS read does reach this gate.
+  if ix != daWriteTarget { daCheckRead(n.identName, ix) }
+  if lbiBindName.length > 0 && ix != daWriteTarget {
+    lbiNoteRead(ix, n.identName)
+  }
+  // A top-level function read as a value keeps its declared parameters (D3992).
+  if ix != ckCalleeIx && lookupDepth(n.identName) == 0 {
+    if fnDeclIx.has(n.identName) { wsValueRead[n.identName] = true }
+  }
+  ty
+}
+
 // Dispatches every node kind — expressions and statements — and returns the node's
-// type-arena index (statements yield `TY_VOID`). Literals and identifiers are checked inline;
-// every other kind goes to its per-kind checker with the narrowed variant.
+// type-arena index (statements yield `TY_VOID`). The constant literals answer inline; every
+// other kind goes to its per-kind checker with the narrowed variant.
 // On a type error it raises a diagnostic and returns `TY_ERR` so checking continues.
 function checkNodeReal(ix: i32) {
   if ix < 0 { return TY_ERR }
@@ -186,29 +322,7 @@ function checkNodeReal(ix: i32) {
 
   // ── literals & identifiers ────────────────────────────────────────────────
   if n is NumLit {
-    // A literal with a "." is f64. An integer literal defaults to the NARROWEST
-    // type that holds it exactly — i32 if its magnitude fits, else i64 — the
-    // host's `defaultIntegerType` rule (`numLexFitsI32`).
-    if numLexIsFloat(n.numText) {
-      // A literal whose magnitude rounds past the largest finite double names a value f64
-      // cannot represent — and VL has no infinity spelling to encode it honestly, so it is an
-      // error (a silent ±inf would be a lossy implicit conversion). Runtime arithmetic still
-      // yields ±inf per IEEE-754; this rejects only literal text.
-      if f64LitOverflows(n.numText) { tErr("float literal overflows f64", ix) }
-      return TY_F64
-    }
-    // A radix literal that adopted a 64-bit destination keeps that width across re-checks; one
-    // wider than 64 bits has no destination at all, and says so here rather than wrapping.
-    if n.numText.length >= 19 { cexNoteWideLit(ix, n.numText) }
-    if litWide64Of(ix) { return TY_I64 }
-    const ltt = litTreeTyOf(ix)
-    if ltt >= 0 { return ltt }
-    if numLexRadixBits(n.numText) > 64 {
-      if !cexIsDerived(ix) { tErr(radixLitTooWideMsg(n.numText, 64), ix) }
-      return TY_I64
-    }
-    if numLexFitsI32(n.numText) { return TY_I32 }
-    return TY_I64
+    return checkNumLitNode(n, ix)
   } else if n is StrLit {
     return TY_STR
   } else if n is CharLit {
@@ -220,103 +334,7 @@ function checkNodeReal(ix: i32) {
   } else if n is NullLit {
     return TY_NULL
   } else if n is Ident {
-    // A marked parameter default resolves in the declaration's scope — for the one name form
-    // v1 admits, the module frame. Checked once at the declaration and again at every call
-    // site that omits the argument; the second reading is why the mark exists, so a
-    // caller-local binding sharing the const's name cannot capture the substituted reference.
-    if isDefaultGlobalRef(ix) {
-      // A literal `const` is its literal here too, taken at the parameter's type.
-      const dlit = lbiModLit[n.identName] ?? -1
-      if dlit >= 0 {
-        lbiInlineLit(ix, dlit, n.pos, n.identName)
-        return checkNodeReal(ix)
-      }
-      identNoteModuleUse(ix, n.identName)
-      if T.scopes.length > 0 {
-        if T.scopes[0].has(n.identName) {
-          return T.scopes[0][n.identName] ?? TY_ERR
-        }
-      }
-      return TY_ERR
-    }
-    // A literal `const` has no single type: each read is its literal, typed by where it stands.
-    const lit = lbiConstLitAt(ix, n.identName)
-    if lit >= 0 {
-      lbiInlineLit(ix, lit, n.pos, n.identName)
-      return checkNodeReal(ix)
-    }
-    const ty = lookup(n.identName)
-    // A module name declared as both a function and a value is refused as redeclared; which
-    // of the two a read means is unknowable, so the read is that error's cascade.
-    if lookupDepth(n.identName) == 0 && (modClashNames[n.identName] ?? false) {
-      return TY_ERR
-    }
-    // Only a read at an extern's own type can name one, so the name lookup is asked of those alone.
-    if ty >= extFnTyMin && ty < extFnTy.length && !extValueSeen {
-      if extFnTy[ty] && ix != ckCalleeIx {
-        if externLinkOf(n.identName) >= 0 { extValueSeenSet(true) }
-      }
-    }
-    if ty < 0 {
-      // `__callsite__` is legal — as a parameter default value, and nowhere else.
-      // Reaching the undeclared-identifier floor means it appears in an expression, so
-      // say which position it belongs in rather than that the name does not exist
-      // (it does; `checkParamDefaults` accepts it).
-      if n.identName == CALLSITE_NAME {
-        tErr(
-          "`__callsite__` is legal only as a parameter default value — write `caller: { file: string, line: i32, col: i32 } = __callsite__`",
-          ix,
-        )
-        return TY_ERR
-      }
-      // The interpolation renderer's floor: `$tpl$render` is minted by the parser and
-      // rewritten to the merged `toString$mN` by `modBuildRename`, so reaching here means
-      // `std:fmt` never entered the module graph. Named, since the generic
-      // undeclared-identifier message would point at a name the author cannot have written.
-      if n.identName == TPL_RENDER_LOCAL {
-        tErr(
-          "internal: an interpolation hole's renderer was not merged — `std:fmt` is missing from this program's module graph",
-          ix,
-        )
-        return TY_ERR
-      }
-      const moved = stdFmtMovedNote(n.identName)
-      if moved == "" && undeclaredImportRaise(n.identName, ix) { return TY_ERR }
-      tErr(
-        "undeclared identifier '"
-          + n.identName
-          + "'"
-          + moved
-          + arrayCtorCallNote(n.identName, ix),
-        ix,
-      )
-      return TY_ERR
-    }
-    // `ty` is this use's type as the checker resolved it — narrowed when the use
-    // sits inside a guarded arm. Threaded in so the occurrence retains it.
-    identNoteUse(ix, n.identName)
-    if symEnabled != 0 { symUse(ix, n.identName, ty) }
-    if ovSetMod.length > 0 && ix != ckCalleeIx {
-      ovNoteFnValue(ix, n.identName, ty)
-    }
-    if ix != daWriteTarget {
-      if crCapLossAny { crNoteLostName(n.identName, ix) }
-      const crr = crReadHook(n.identName, ix)
-      if crr >= 0 { return crr }
-    }
-    // Definite-assignment read gate: a bare-name read of a still-unassigned binding is "used
-    // before assigned". The LHS of a plain `=` is a write, not a read (the `BinExpr` `=` arm
-    // marks it `daWriteTarget` before evaluating the target), so it is skipped here; a
-    // compound `x += …` desugars to `x = x + (…)`, whose RHS read does reach this gate.
-    if ix != daWriteTarget { daCheckRead(n.identName, ix) }
-    if lbiBindName.length > 0 && ix != daWriteTarget {
-      lbiNoteRead(ix, n.identName)
-    }
-    // A top-level function read as a value keeps its declared parameters (D3992).
-    if ix != ckCalleeIx && lookupDepth(n.identName) == 0 {
-      if fnDeclIx.has(n.identName) { wsValueRead[n.identName] = true }
-    }
-    return ty
+    return checkIdentNode(n, ix)
   } else if n is Paren {
     return checkNode(n.parInner)
     // ── explicit numeric cast `x as T` ──────────────────────────────────────────
