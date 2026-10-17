@@ -30,6 +30,8 @@ import {
   nodeChildren,
   nodeToks,
 } from "./ast"
+import { luSpell } from "./check_annot_resolve"
+import { fsbBankAsk } from "./check_bind_rows"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
   T,
@@ -38,11 +40,12 @@ import {
   TyMap,
   TyObj,
   TyUnion,
+  mkFuncTy,
   objFieldType,
   tyIsLitUnionOrLit,
   tyToStr,
 } from "./check_types"
-import { tyHasTyVar, tyReachesHole } from "./tyquery"
+import { litPeekBaseTy, tyHasTyVar, tyReachesHole } from "./tyquery"
 import { reparseArrowLambdaAt } from "./parser"
 import { declOrigOf, identDeclOf } from "./symbols"
 
@@ -55,6 +58,8 @@ let fsMode = FS_COMPILE
 
 // The refused declarations, as parse-arena indices, and whether the last compile added one.
 let fsAsks: i32[] = []
+// The asked declarations the checker wants banked at their call signature.
+let fsBanked: i32[] = []
 let fsAskGrew = false
 // The parse arena's length in the current compile; a node at or past it is minted by the plan.
 let fsParseLen = 0
@@ -66,6 +71,7 @@ let pdAnchor: i32[] = []
 let pdKw: string[] = []
 let pdName: string[] = []
 let pdTy: i32[] = []
+let pdTyName: string[] = []
 let pdValSrc: i32[] = []
 let pdValName: string[] = []
 let pwAnchor: i32[] = []
@@ -74,8 +80,14 @@ let pwValSrc: i32[] = []
 let pwValName: string[] = []
 let prIdent: i32[] = []
 let prName: string[] = []
+// An un-annotated member banked at its one slot's signature: declaration `paDecl` takes `paTy`.
+let paDecl: i32[] = []
+let paTy: string[] = []
 
 function fsPlanReset(): i32 {
+  paDecl = []
+  paTy = []
+  pdTyName = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -95,6 +107,7 @@ function fsPlanReset(): i32 {
 export function fsReset(): i32 {
   fsMode = FS_COMPILE
   fsAsks = []
+  fsBanked = []
   fsAskGrew = false
   fsPlanReset()
 }
@@ -121,6 +134,17 @@ export function fsAsk(d: i32): i32 {
   }
   fsAsks.push(o)
   fsAskGrew = true
+  0
+}
+
+// Asks for every binding the checker found wanting to be banked at its call's signature.
+export function fsAskBanked(): i32 {
+  for d in fsbBankAsk {
+    fsAsk(d)
+    let o = declOrigOf(d)
+    if o < 0 { o = d }
+    if o >= 0 && !hasI32(fsBanked, o) { fsBanked.push(o) }
+  }
   0
 }
 
@@ -281,9 +305,37 @@ function fsDestFixed(r: i32): boolean {
   !tyHasTyVar(t) && !tyReachesHole(t, 8)
 }
 
-// The members of the split set, their slot keys, and each slot's binding name.
+// The members of the split set, their slot keys, each slot's signature spelling ("" when it
+// has none), and whether an un-annotated member is banked at its slots' signatures.
 let fsMem: i32[] = []
 let fsLanes: string[][] = []
+let fsLaneTys: string[][] = []
+let fsAnn: boolean[] = []
+
+// The annotation spelling of the signature slot `key` of read `r` fixes: a call's argument
+// types and result, or the function type a delivery lands in. "" when it fixes none.
+function fsLaneSpell(r: i32, key: string): string {
+  if key.slice(0, 2) == "u:" {
+    if !fsDestFixed(r) { return "" }
+    return luSpell(fsDestTy(r))
+  }
+  if key.slice(0, 2) != "c:" { return "" }
+  const p = fsParent[r]
+  const pn = P.nodes[p]
+  if !(pn is Call) { return "" }
+  for nm in pn.callArgNames {
+    if nm != "" { return "" }
+  }
+  const ps: i32[] = []
+  for a in pn.callArgs {
+    const t = litPeekBaseTy(nodeTyIxOf(a))
+    if t < 0 || tyHasTyVar(t) || tyReachesHole(t, 8) { return "" }
+    ps.push(t)
+  }
+  const rt = litPeekBaseTy(nodeTyIxOf(p))
+  if rt < 0 || tyHasTyVar(rt) || tyReachesHole(rt, 8) { return "" }
+  luSpell(mkFuncTy(ps, rt))
+}
 
 function memIx(d: i32): i32 {
   let i = 0
@@ -311,14 +363,15 @@ function laneName(mi: i32, key: string): string {
 }
 
 // A value written to a member is a copy of a peer member, a fresh name, or a lambda; anything
-// else declines the plan. Answers the peer's member index, -1 for no peer, -2 to decline.
-function fsValuePeer(v: i32): i32 {
+// else declines the plan. Answers the peer's member index, -1 for no peer, -2 to decline. A
+// banked member (`ann`) adapts a union-parameter function at its signature.
+function fsValuePeer(v: i32, ann: boolean): i32 {
   if v < 0 { return -1 }
   const n = P.nodes[v]
   if n is Ident {
     const d = letDeclOfRead(v)
     if d >= 0 { return memIx(d) }
-    if fsUnionParamFn(identDeclOf(v)) { return -2 }
+    if !ann && fsUnionParamFn(identDeclOf(v)) { return -2 }
     return -1
   }
   if n is FuncDecl && n.fnName == "" { return -1 }
@@ -396,10 +449,13 @@ export function fsPlan(root: i32): i32 {
     }
     i = i + 1
   }
+  fsLaneTys = []
+  fsAnn = []
   let copies = false
   let litCalls = false
   for m in fsMem {
     const ks: string[] = []
+    const ts: string[] = []
     for r in fsIdents {
       if identDeclOf(r) == m {
         const key = fsReadKey(r)
@@ -407,12 +463,15 @@ export function fsPlan(root: i32): i32 {
         if key.slice(0, 2) == "c:" && fsLitUnionCall(r) { litCalls = true }
         // A delivery into a type that does not fix one instantiation keeps the refusal.
         if key.slice(0, 2) == "u:" && !fsDestFixed(r) { return 1 }
-        if key != "" && key != "=" && !hasStr(ks, key) { ks.push(key) }
+        if key != "" && key != "=" && !hasStr(ks, key) {
+          ks.push(key)
+          ts.push(fsLaneSpell(r, key))
+        }
       }
     }
     fsLanes.push(ks)
+    fsLaneTys.push(ts)
   }
-  if copies && litCalls { return 1 }
   // A member needs every slot a binding it is copied into needs.
   let changed = true
   while changed {
@@ -422,21 +481,43 @@ export function fsPlan(root: i32): i32 {
       if si >= 0 && fsReadKey(r) == "=" {
         const ti = memIx(fsCopyTarget(r))
         if ti >= 0 {
-          for k in fsLanes[ti] {
-            if !hasStr(fsLanes[si], k) {
-              fsLanes[si].push(k)
+          let k = 0
+          while k < fsLanes[ti].length {
+            if !hasStr(fsLanes[si], fsLanes[ti][k]) {
+              fsLanes[si].push(fsLanes[ti][k])
+              fsLaneTys[si].push(fsLaneTys[ti][k])
               changed = true
             }
+            k = k + 1
           }
         }
       }
     }
   }
-  let split = false
-  for ks in fsLanes {
-    if ks.length > 1 { split = true }
+  // A record the checker asked to bank banks each un-annotated member whose every slot has a
+  // signature; a copy that reaches a literal-union call is planned only when all of them are.
+  let banked = false
+  for m in fsMem {
+    if hasI32(fsBanked, m) { banked = true }
   }
-  if !split { return 1 }
+  let split = false
+  let anyAnn = false
+  let allAnn = true
+  let ai = 0
+  while ai < fsMem.length {
+    const d = P.nodes[fsMem[ai]]
+    let ann = banked && d is LetDecl && d.letType < 0 && fsLanes[ai].length > 0
+    for t in fsLaneTys[ai] {
+      if t == "" { ann = false }
+    }
+    fsAnn.push(ann)
+    if ann { anyAnn = true }
+    if !ann && fsLanes[ai].length > 0 { allAnn = false }
+    if fsLanes[ai].length > 1 { split = true }
+    ai = ai + 1
+  }
+  if copies && litCalls && !allAnn { return 1 }
+  if !split && !anyAnn { return 1 }
   let mi = 0
   while mi < fsMem.length {
     if fsPlanMember(mi) != 0 { return 1 }
@@ -455,7 +536,8 @@ function fsPlanMember(mi: i32): i32 {
   if lanes.length == 0 { return 0 }
   if d.letType >= 0 && !(P.nodes[d.letType] is TypeRef) { return 1 }
   if !fsStmtParentOk(m) { return 1 }
-  const ip = fsValuePeer(d.letInit)
+  const ann = fsAnn[mi]
+  const ip = fsValuePeer(d.letInit, ann)
   if ip == -2 { return 1 }
   let k = 0
   while k < lanes.length {
@@ -463,11 +545,16 @@ function fsPlanMember(mi: i32): i32 {
     if ip >= 0 { vn = laneName(ip, lanes[k]) }
     if k == 0 {
       if ip >= 0 { fsRename(d.letInit, vn) }
+      if ann {
+        paDecl.push(m)
+        paTy.push(fsLaneTys[mi][0])
+      }
     } else {
       pdAnchor.push(m)
       pdKw.push(d.letKw)
       pdName.push(laneName(mi, lanes[k]))
       pdTy.push(d.letType)
+      if ann { pdTyName.push(fsLaneTys[mi][k]) } else { pdTyName.push("") }
       pdValSrc.push(d.letInit)
       pdValName.push(vn)
     }
@@ -480,7 +567,7 @@ function fsPlanMember(mi: i32): i32 {
         const w = fsParent[r]
         const wn = P.nodes[w]
         if !(wn is BinExpr) || !fsStmtParentOk(w) { return 1 }
-        const vp = fsValuePeer(wn.binRight)
+        const vp = fsValuePeer(wn.binRight, ann)
         if vp == -2 { return 1 }
         let wk = 0
         while wk < lanes.length {
@@ -608,13 +695,26 @@ function fsApply(): i32 {
     i = i + 1
   }
   i = 0
+  while i < paDecl.length {
+    const n = P.nodes[paDecl[i]]
+    if n is LetDecl && n.letType < 0 {
+      P.pos = nodeToks[paDecl[i]] + 1
+      n.letType = mkTypeRef(paTy[i], n.pos)
+    } else {
+      rc = -1
+    }
+    i = i + 1
+  }
+  i = 0
   while i < pdAnchor.length {
     if rc == 0 {
       const a = pdAnchor[i]
       P.pos = nodeToks[a] + 1
       const v = fsValueNode(pdValSrc[i], pdValName[i])
       let ty = -1
-      if pdTy[i] >= 0 {
+      if pdTyName[i] != "" {
+        ty = mkTypeRef(pdTyName[i], P.nodes[a].pos)
+      } else if pdTy[i] >= 0 {
         const tn = P.nodes[pdTy[i]]
         if tn is TypeRef { ty = mkTypeRef(tn.tyName, tn.pos) } else { rc = -1 }
       }

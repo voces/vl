@@ -33,6 +33,7 @@ import {
   fvaUnionArm,
 } from "./check_annot_resolve"
 import {
+  fsbBankAskPush,
   fsbCallArgTys,
   fsbCallArgTysPush,
   fsbCallDecl,
@@ -276,6 +277,7 @@ import {
 import {
   fvaFnMayDiffer,
   fvaNestedFnDiffers,
+  fvaSlotMayDiffer,
   litNumUnionConverts,
   scalarPrimPair,
 } from "./check_ty_relate"
@@ -348,6 +350,7 @@ export function fsbNoteCall(
   argTys: i32[],
 ) {
   if decl < 0 || inferQuiet { return 0 }
+  if fsbLitUnionArg(argTys) { fsbBankAskPush(decl) }
   fsbCallArgTysPush(argTys)
   fsbCallIxPush(ix)
   fsbCallDeclPush(decl)
@@ -360,6 +363,45 @@ export function fsbNoteCall(
   // The writes already seen are re-asked here, inside the body the call stands in, so a pair
   // naming that body's type parameter is deferred to its instances as a direct call's is.
   fsbRecheckFrom(fsbCallIx.length - 1)
+}
+
+// Whether a call through a marked binding passes a literal union, whose atoms a copy of the
+// binding would reach at another set's instance (D4893).
+function fsbLitUnionArg(argTys: i32[]): boolean {
+  for a in argTys {
+    if (
+      a >= 0
+      && a < T.tys.length
+      && T.tys[a] is TyUnion
+      && tyIsLitUnionLike(a, 4)
+    ) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether the function of type `rt` written to call `c`'s binding takes a concrete parameter
+// of another rep than the call passes, which only an adapter reaches (D4892).
+function fsbNeedsAdapter(c: i32, rt: i32): boolean {
+  const f = T.tys[rt]
+  if !(f is TyFunc) { return false }
+  const args = fsbCallArgTys[c]
+  let i = 0
+  while i < f.fnParamTypes.length && i < args.length {
+    const want = f.fnParamTypes[i]
+    if (
+      want >= 0
+      && args[i] >= 0
+      && !tyHasTyVar(want)
+      && !tyReachesHole(want, 8)
+      && fvaSlotMayDiffer(args[i], want, 8)
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Re-ask, at call `c`, each owner row recorded since it last asked.
@@ -383,7 +425,9 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32) {
   const nm: string[] = []
   const ty: i32[] = []
   const added = fsbBindParams(rt, fsbCallArgTys[c], nm, ty)
-  if added == 0 || o == fsbCallUsed[c] { return 0 }
+  if added == 0 { return 0 }
+  if fsbNeedsAdapter(c, rt) { fsbBankAskPush(fsbCallDecl[c]) }
+  if o == fsbCallUsed[c] { return 0 }
   if !fsbArgsFit(c, rt, nm, ty) { return 0 }
   const modeWas = substNestMode
   const declWas = substNestDecl
