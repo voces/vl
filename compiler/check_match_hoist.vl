@@ -43,10 +43,15 @@ import {
   elseIfLink,
   i32ToStr,
   mkBlock,
+  mkBool,
   mkIdent,
+  mkIf,
   mkLet,
+  mkNull,
+  mkOptMember,
   nodeSpineChildren,
   nodeValueChildren,
+  valueIfAdd,
 } from "./ast"
 import { nodePos } from "./fmt_util"
 import { placeKeyOf } from "./check_places"
@@ -95,6 +100,7 @@ export function hoistMatchScrutinees(rootIx: i32) {
   let k = 0
   while k < hmsMatches.length {
     if hoistMatchScrutAt(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
+    else if hmsBindOptInPlace(hmsMatches[k], hmsPaths[k]) { done = done + 1 }
     k = k + 1
   }
   hmsMatches = []
@@ -260,6 +266,48 @@ function hoistMatchScrutAt(m: i32, anc: i32[]): boolean {
     }
     cur = p
     k = k - 1
+  }
+  false
+}
+
+// A `?.` read whose receiver cannot move ahead of its statement is bound where it stands:
+// `(if true { const $om<m> = <receiver>; $om<m>?.p } else { null })` evaluates the receiver
+// once, in source order (D5331). Declined when the read is a callee, an index base, an
+// assignment target or a link of a longer chain, whose meaning the wrap would change.
+function hmsBindOptInPlace(m: i32, anc: i32[]): boolean {
+  const n = P.nodes[m]
+  if !(n is OptMember) { return false }
+  if anc.length > 0 {
+    const pn = P.nodes[anc[anc.length - 1]]
+    if pn is Member || pn is OptMember { return false }
+    if pn is Call {
+      if pn.callFn == m { return false }
+    }
+    if pn is Index {
+      if pn.idxArr == m { return false }
+    }
+    if pn is BinExpr {
+      if pn.binLeft == m && pn.binOp == "=" { return false }
+    }
+  }
+  if n is OptMember {
+    const sp = nodePos(n.omObj)
+    const name = "$om" + i32ToStr(m)
+    const decl = mkLet("const", name, -1, n.omObj, sp)
+    adoptNodeTok(decl, n.omObj)
+    const ref = mkIdent(name, sp)
+    adoptNodeTok(ref, n.omObj)
+    const read = mkOptMember(ref, n.omProp, n.omDot, n.pos)
+    adoptNodeTok(read, m)
+    const thenStmts: i32[] = [decl, read]
+    const thenB = mkBlock(thenStmts, sp)
+    const elseStmts: i32[] = [mkNull("null", n.pos)]
+    const elseB = mkBlock(elseStmts, n.pos)
+    const ifn = valueIfAdd(mkIf(mkBool(1, n.pos), thenB, elseB, n.pos))
+    adoptNodeTok(ifn, m)
+    const wrap: Node = { parInner: ifn, pos: n.pos }
+    arenaSetNode(m, wrap)
+    return true
   }
   false
 }

@@ -39,7 +39,7 @@ import { nodeTyOf } from "./check_node_tys"
 import { lookup, lookupFnDeclNode } from "./check_scopes"
 import { crTyHasFn, crTyIsScalar, tyHasTyVar } from "./tyquery"
 import { T, TyFunc, tyIsHole } from "./check_types"
-import { strListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import {
   BME_CELLS,
   builtinMethodEffect,
@@ -62,6 +62,7 @@ import {
   covarRootFrame,
   cwFramedNode,
   cwLambdaDeclOf,
+  fnDeclIx,
 } from "./check_write_scan"
 
 // `sum` with each shape kept once: a summary is a set, and one that repeats a callee's shapes per
@@ -982,8 +983,11 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
     return weClosed(fnWriteShapes(a))
   }
   if an is Ident {
-    // A scalar is no function value, whatever the call hands it to (`clz(m)`, `max(v, i)`).
-    if crTyIsScalar(nodeTyOf(a)) { return "" }
+    // A scalar is no function value, whatever the call hands it to (`clz(m)`, `max(v, i)`); an
+    // argument not typed yet may still be one, so that answer is not cached.
+    const at = nodeTyOf(a)
+    if at < 0 { weUnres = weUnres + 1 }
+    if crTyIsScalar(at) { return "" }
     const pj = strListIndexOf(params, an.identName)
     if pj >= 0 { return "@" + i32ToStr(pj) + "," }
     const d = lookupFnDeclNode(an.identName)
@@ -1050,6 +1054,40 @@ export function peelParenIx(ix: i32): i32 {
   const n = P.nodes[ix]
   if n is Paren { return peelParenIx(n.parInner) }
   ix
+}
+
+// The top-level functions the body of `fnIx` names or dispatches an operator to, each once.
+export function weFnRefs(fnIx: i32): i32[] {
+  const refs: i32[] = []
+  const fd = P.nodes[fnIx]
+  if fd is FuncDecl { weRefsIn(fd.fnBody, refs) }
+  refs
+}
+
+// Whether the write summary of function `d` still reads an untyped node, so checking its body
+// first sharpens what a call to it may write (D5593).
+export function weSummaryUnsettled(d: i32): boolean {
+  const before = weUnres
+  fnWriteShapes(d)
+  weUnres != before
+}
+
+function weRefsIn(ix: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    const d = fnDeclIx[n.identName] ?? -1
+    if d >= 0 && !i32ListHas(out, d) { out.push(d) }
+  }
+  for d in opSiteDecls(ix) {
+    if d >= 0 && !i32ListHas(out, d) { out.push(d) }
+  }
+  let cur = ix
+  while cur >= 0 {
+    for k in nodeSpineChildren(cur) { weRefsIn(k, out) }
+    cur = elseIfLink(cur)
+  }
+  0
 }
 
 // Drop the summaries that read a node with no type yet, once a body is entered or left: another
