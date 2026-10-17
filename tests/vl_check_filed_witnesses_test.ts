@@ -433,6 +433,7 @@ Deno.test({
         `### D1 — a witness that never finishes\n**check-clean invalid wasm**\n\nRepro:\n\n` +
           `${ind("let i = 0\nwhile true { i = i + 1 }")}\n`,
       );
+      const t0 = performance.now();
       const { code, stdout } = await new Deno.Command(VL, {
         args: ["run", "scripts/check-filed-witnesses.vl", "--compiler", COMPILER, "--", doc],
         cwd: ROOT,
@@ -444,6 +445,12 @@ Deno.test({
       const want = "0 graded · 0 as filed · 0 MOVED · 1 not graded";
       if (code !== 0 || !out.includes(want) || !out.includes("`vl run` was stopped after 2 s twice")) {
         throw new Error(`want exit 0, "${want}" and the timeout reason, got exit ${code}:\n${out}`);
+      }
+      // The batch run and both solo tries each wait out the 2 s bound, so a grader that
+      // dropped the retry finishes in two bounds; load can only add to this, never take away.
+      const secs = (performance.now() - t0) / 1000;
+      if (secs < 5.5) {
+        throw new Error(`want three 2 s waits (the retry included), the grader took ${secs.toFixed(1)} s`);
       }
     } finally {
       await Deno.remove(dir, { recursive: true });

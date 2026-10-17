@@ -393,6 +393,14 @@ Deno.test({
         "--require-profile",
         "second.md",
       ], 0);
+      // A moved row with nothing else wrong: exit 0, and 1 only under `--strict`.
+      await Deno.writeTextFile(`${dir}/moved.md`, row("1", " — moved", sh("echo 6", "5", "0")));
+      for (const [argv, want] of [[["moved.md"], 0], [["--strict", "moved.md"], 1]] as const) {
+        const v = await port([...argv]);
+        if (v.code !== want || !v.out.includes("stale-")) {
+          throw new Error(`${argv.join(" ")}: want exit ${want} and a moved row, got ${v.code}:\n${v.out}`);
+        }
+      }
       await pinned("the profile argument is missing", [
         "survey.md",
         "--profile",
