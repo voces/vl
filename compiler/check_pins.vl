@@ -39,12 +39,7 @@ import { nodeStartTok } from "./fmt_util"
 import { i32ListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { checkRestart } from "./check_core_state"
-import {
-  lbiReport,
-  ovUnpinnedReport,
-  recAdForcedReport,
-  recAdReport,
-} from "./check_emit_queries"
+import { ovUnpinnedReport, recAdForcedReport } from "./check_emit_queries"
 import { checkProgramPass } from "./check_program"
 import { luSpell } from "./check_annot_resolve"
 import { tErr } from "./check_relate_core"
@@ -70,7 +65,20 @@ import {
 import { gRootStmts } from "./check_nj_join"
 import { lbiSolve } from "./check_lbi_notes"
 import { recAdSolve } from "./check_rec_adopt"
-import { recAdPassReset, recAdReset } from "./check_rec_adopt_rows"
+import {
+  recAdPassReset,
+  recAdRaising,
+  recAdReset,
+} from "./check_rec_adopt_rows"
+import {
+  PinSolver,
+  pinRefAt,
+  pinRefDrop,
+  pinRefMsg,
+  pinRefSolver,
+  pinRefuse,
+  pinRefusedAt,
+} from "./check_pin_refusals"
 import {
   lbiApplyPins,
   lbiDropUnobservable,
@@ -178,16 +186,28 @@ function checkProgramAgain(rootIx: i32) {
   0
 }
 
+// Raises solver `s`'s queued refusals, in queue order.
+function pinRefRaise(s: PinSolver) {
+  let i = 0
+  while i < pinRefAt.length {
+    if pinRefSolver[i] == s { tErr(pinRefMsg[i], pinRefAt[i]) }
+    i = i + 1
+  }
+  0
+}
+
 // What only the last walk may report, in phase order.
 function pinReport() {
   symFlushPending()
   identFlushPending()
   lbiSymTypes()
-  lbiReport()
+  pinRefRaise("lbi")
   recAdForcedReport()
-  recAdReport()
+  recAdRaising = true
+  pinRefRaise("recAd")
+  recAdRaising = false
   ovUnpinnedReport()
-  expInfReport()
+  pinRefRaise("expParam")
   // A program with errors is typed in part against what its annotations say, so none of them
   // is reported redundant (D3800).
   if T.diags.length > 0 { redunTruncate(0) }
@@ -196,10 +216,9 @@ function pinReport() {
 
 // ── Exported entry functions nothing in the program calls (D3817) ───────────────────────────
 // The host calls one, so an un-annotated parameter takes the one type its pinning uses agree on,
-// and anything else, a generic one included, is refused. Refusals wait for the last check pass,
-// which a re-check would otherwise clear.
-let expInfErrMsg: string[] = []
-let expInfErrAt: i32[] = []
+// and anything else, a generic one included, is refused. Refusals queue as `"expParam"` rows, which a re-check
+// keeps.
+
 // The parameters annotated so far, so a re-check does not infer them twice.
 let expInfDone: i32[] = []
 // Whether the entry is a std module, which only ever runs imported: its exports have callers.
@@ -391,22 +410,10 @@ function expParamInfer(): i32 {
   made
 }
 
-// Queues refusal `msg` at node `at` for the end of the check.
+// Queues refusal `msg` at node `at` for the end of the check, once per node.
 function expInfRefuse(msg: string, at: i32) {
-  if i32ListHas(expInfErrAt, at) { return 0 }
-  expInfErrMsg.push(msg)
-  expInfErrAt.push(at)
-  0
-}
-
-// Raises the queued refusals; run once, after the last check pass.
-function expInfReport() {
-  let i = 0
-  while i < expInfErrMsg.length {
-    tErr(expInfErrMsg[i], expInfErrAt[i])
-    i = i + 1
-  }
-  0
+  if pinRefusedAt("expParam", at) { return 0 }
+  pinRefuse("expParam", msg, at)
 }
 
 // Each node's parent within body `b`.
@@ -776,8 +783,7 @@ function expInfHintAdd(px: i32, nm: string, ty: string, use: string) {
 // Empties D3817's tables; once per program, since the re-check its annotations need would
 // otherwise drop what the first pass found.
 function expInfReset() {
-  expInfErrMsg = []
-  expInfErrAt = []
+  pinRefDrop("expParam")
   expInfDone = []
   expInfPinLets = []
   expInfLine = []
