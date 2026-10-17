@@ -186,9 +186,11 @@ else run "native-fixpoint"     bash scripts/native-fixpoint.sh; fi
 # self-compile against a row that already does two costs the table nothing.
 run "self-compile time"        bash scripts/self-compile-time.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
-# The comment-budget, kind-ladder and sentinel-index RATCHETS are held inside
-# "lint-self + fmt": each counts the findings that row's compiler-graph lint already
-# produced (`vl check --budget --findings`) instead of walking compiler/ again.
+# The comment-budget, kind-ladder, sentinel-index, arena-scan and prefer-interpolation
+# RATCHETS are held inside "lint-self + fmt": each counts the findings that row's
+# compiler-graph, std/ and scripts/ lints already produced (`vl check --budget
+# --findings`) instead of walking its targets again. `arena-scan-outside-pass` is the
+# guard that stops a whole-program scan being added outside a pass (#2419's class).
 # The seed-size RATCHET: the compiler's own bytes, against a committed baseline, so a
 # jump names the landing that bought it rather than being found weeks later. It reads
 # the seed built above — ONE self-compile, which off a stale seed is the OLD codegen's
@@ -211,18 +213,14 @@ run "no-python"                "$VL" run scripts/no-python.vl
 # which inside this fan-out is usually none. ~20 s, plus ~12 s once per new seed while
 # the fuel engine's sidecar compiles. #3108, #3112, D2335 and D2336 are what it holds.
 run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler "$SEED" -- --check
-# The arena-scan RATCHET, same shape and the same reason: `arena-scan-outside-pass`
-# is a `warning` lint-self.sh holds out while the baseline is non-zero, so this is
-# what stops a whole-program scan being added outside a pass. #2419's class.
-run "arena-scan budget"        "$VL" check --budget scripts/scan-budget-baseline.json --compiler "$SEED"
 # The kind-ladder RATCHET rides "lint-self + fmt"; this row re-derives the lint's copy of
 # every closed set from the `export type` that declares it and FAILS on drift.
 run "kind-ladder sets"         "$VL" run scripts/ladder-sets.vl --compiler "$SEED"
-# The dead-export RATCHET, fifth of the same shape: `unused-function` exempts an exported
+# The dead-export RATCHET, of the same shape: `unused-function` exempts an exported
 # declaration ("public surface"), so for a tree whose only consumer is itself the export
-# list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO,
-# unlike the four above, because the tree reached zero in the PR that added it. No lint
-# sees a reference from another tree, so scripts/dead-exports.vl writes the report and
+# list is a blind spot — 19 exports were in it when this landed. Its baseline is at ZERO
+# because the tree reached zero in the PR that added it. No lint sees a reference from
+# another tree, so scripts/dead-exports.vl writes the report and
 # `vl check --budget --findings` counts it.
 dead_export_budget() {
   "$VL" run scripts/dead-exports.vl --compiler "$SEED" -- --out "$LOGS/dead-exports.json" &&
@@ -230,12 +228,7 @@ dead_export_budget() {
       --findings "$LOGS/dead-exports.json" --compiler "$SEED"
 }
 run "dead-export budget"       dead_export_budget
-# The prefer-interpolation RATCHET, sixth of the same shape and the first held by the
-# lint itself: `vl check --budget` walks the baseline's own targets in one process and
-# compares per-file counts (architecture-refactor-plan T2); `--write-baseline` rewrites
-# it in the layout the retired ratchet.py wrote, which tests/vl_budget_mode_test.ts holds.
-run "interp budget"            "$VL" check --budget scripts/interp-budget-baseline.json --compiler "$SEED"
-# The render-parse RATCHET, seventh of the same shape: `tyToEmitName(` calls and the ten
+# The render-parse RATCHET, of the same shape: `tyToEmitName(` calls and the ten
 # type-string parsers in the emitter. A rep is decided from the checked type, not from
 # a rendered spelling parsed back (code-quality-2026-10.md L2). scripts/render-parse-census.vl
 # writes the report, `vl check --budget --findings` counts it.

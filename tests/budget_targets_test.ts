@@ -61,3 +61,54 @@ Deno.test("budget targets: the graph-counted baselines target compiler/entry.vl"
     }
   }
 });
+
+// arena-scan and interp are counted with `--findings` over lint-self.sh's joined reports:
+// the compiler graph, `std/`, and (interp only) `scripts/` linted with the baseline's own
+// `exclude` globs, which lint-self reads from the baseline's one-line `"exclude"` key.
+const JOINED: Record<string, string[]> = {
+  "scripts/scan-budget-baseline.json": ["compiler/entry.vl", "std"],
+  "scripts/interp-budget-baseline.json": [
+    "compiler/entry.vl",
+    "std",
+    "scripts",
+  ],
+};
+
+Deno.test("budget targets: the joined-report baselines target what lint-self.sh lints", () => {
+  for (const [path, want] of Object.entries(JOINED)) {
+    const text = Deno.readTextFileSync(`${ROOT}/${path}`);
+    const b = JSON.parse(text) as { targets?: string[]; exclude?: string[] };
+    const got = JSON.stringify(b.targets ?? []);
+    if (got !== JSON.stringify(want)) {
+      throw new Error(
+        `${path} targets ${got}, want ${
+          JSON.stringify(want)
+        }: scripts/lint-self.sh ` +
+          `counts it with --findings over exactly those runs`,
+      );
+    }
+    const excl = b.exclude ?? [];
+    if (path.includes("interp")) {
+      const line = text.split("\n").find((l) => l.startsWith('"exclude": ['));
+      const parsed = line === undefined ? [] : line
+        .replace(/^"exclude": \[(.*)\],?$/, "$1").split(",")
+        .map((s) => s.trim().replace(/^"|"$/g, ""));
+      if (
+        excl.length === 0 || JSON.stringify(parsed) !== JSON.stringify(excl)
+      ) {
+        throw new Error(
+          `${path}: lint-self.sh reads the exclude globs ${
+            JSON.stringify(parsed)
+          } ` +
+            `from its one-line "exclude" key, but the baseline holds ${
+              JSON.stringify(excl)
+            }`,
+        );
+      }
+    } else if (excl.length > 0) {
+      throw new Error(
+        `${path}: lint-self.sh's graph and std/ runs apply no exclude globs`,
+      );
+    }
+  }
+});
