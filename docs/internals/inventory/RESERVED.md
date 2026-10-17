@@ -134,3 +134,4 @@ D5143-D5146  lane-L6  2026-10-16  closing D5119 and D5105: D5119 closed (the mem
 D5170-D5179  lane-L1  2026-10-17  re-grading D4244 after #3941: D5170 filed open (a written `let` of a generic called at a nullable string literal union and at a nullable `string`), D5171 filed open (a copy of a written `let` called both at `string` and at a string literal union); D5172-D5179 left unused
 D5230-D5239  lane-L1  2026-10-17  closing D5170 and D5171: both closed, D5230 filed open (an alias of a generic delivered into an annotated `void` function type inside a module-scope block emits a `drop` after the call); D5231-D5239 left unused
 D5260-D5269  lane-L6  2026-10-17  the `unionMemberCount` fallbacks and `emitUnionUnionEq`'s double append: D5260 filed open (union `==` union over a literal-union alias arm beside a scalar arm has no payload kind); D5261-D5269 left unused
+D5320-D5329  lane-L6  2026-10-17  the paren re-grouping counts: no defect found; D5320-D5329 left unused
