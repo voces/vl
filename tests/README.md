@@ -22,7 +22,7 @@ of each row, backticked, `*` = any run of characters).
 | `cases_wasm_*_test.ts` | The corpus oracle: `tests/cases/` through the seed driven as a wasm module (shard files over `tests/support/casesWasmOracle.ts`) | `deno task test` | `checks`, "Corpus oracle on the wasm compiler" |
 | `lsp_*_test.ts` | Editor features (hover, completion, rename, inlay hints, semantic tokens) | `lsp suites (ci list)` for the seed-backed ones, else `deno task test` | `checks`, "Editor features on the wasm compiler", else `ci` |
 | `playground_*_test.ts` | The browser playground's LSP, completion, trap frames and theme | as `lsp_*` | as `lsp_*` |
-| `ci_*_test.ts` | The CI wiring itself: shard partition, seed-backed coverage of ci.yml's lists, the docs-only doc-reader list | `deno task test` | `ci` |
+| `ci_*_test.ts` | The CI wiring itself: shard partition, seed-backed coverage of ci.yml's lists, the docs-only doc-reader list, which jobs a queue-gated push may skip | `deno task test` | `ci` |
 | `cli_*_test.ts`, `budget_*_test.ts`, `keyword_*_test.ts`, `module_*_test.ts`, `std_*_test.ts`, `tests_*_test.ts` | Single-file cross-checks of one table or one vocabulary against its twin (CLI vs host, budget targets, keywords, module gate, embedded std, this index) | `deno task test` | `ci` |
 
 `deno task test` (`deno.json`) runs every file in `tests/` that the other rows do not claim.

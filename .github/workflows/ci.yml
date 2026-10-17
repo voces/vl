@@ -18,6 +18,10 @@ env:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    # `actions: read` reads the previous head's CI verdict (scripts/ci-verdict.sh).
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -37,6 +41,15 @@ jobs:
         id: docs_check
         uses: ./.github/actions/docs-only
 
+      # An inherited run (a clean catch-up merge whose previous head passed) skips the
+      # heavy steps; this job's steps are not ones the queue's `gated` skips.
+      - name: Decide what this run repeats
+        id: verdict
+        uses: ./.github/actions/ci-verdict
+        with:
+          docs_only: ${{ steps.docs_check.outputs.docs_only }}
+          modes: inherit
+
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -50,7 +63,7 @@ jobs:
       # The LSP bundle is built with esbuild over node-resolved deps (binaryen,
       # vscode-languageserver*), so Node + node_modules are needed for that step.
       - uses: actions/setup-node@v5
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         with:
           node-version: 22
           cache: npm
@@ -58,7 +71,7 @@ jobs:
       # Deno's module cache (esbuild, the jsr loader, std) — keyed on the lockfile
       # so it's reused until a dependency moves.
       - name: Cache Deno modules
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         uses: actions/cache@v5
         with:
           path: ~/.cache/deno
@@ -67,14 +80,14 @@ jobs:
             deno-${{ runner.os }}-
 
       - name: Install node deps
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: npm ci
 
       # `deno check` now covers only the surviving type leaves (coreTypes.ts,
       # diagnostics.ts) — the TS compiler core is deleted; the `.vl` compiler is
       # type-checked by the native checker (lint-self.sh in the `checks` job).
       - name: Type-check (compiler)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: deno check compiler/*.ts
 
       # The root deno.json EXCLUDES lsp/ and the test suites run --no-check, so
@@ -88,26 +101,26 @@ jobs:
       # nearest-manifest rule graded three different answers across those
       # layouts (measured 2026-09-01).
       - name: Type-check (lsp)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: deno check --node-modules-dir=none --config lsp/deno.json lsp/src/*.ts
 
       - name: Lint
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: deno lint
 
       # The root deno.json EXCLUDES lsp/ from the step above — even a path passed
       # explicitly on its CLI is skipped — so lsp/src/*.ts is linted by nothing
       # without this. lsp/deno.json carries no exclude of its own.
       - name: Lint (lsp)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: deno lint --config lsp/deno.json lsp/src/
 
       - name: Test (.vl corpus)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: deno task test
 
       - name: Build LSP bundle (verify it compiles)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: deno task build
         working-directory: lsp
 
@@ -126,16 +139,24 @@ jobs:
   # (`fail-on-cache-miss`), so every suite runs on the proven fixpoint of THIS commit's
   # compiler source — never on an earlier rung, and never on a seed it built itself.
   #
-  # The docs-only verdict is `seed`'s output; a docs-only change skips every downstream job.
+  # `seed` outputs `heavy` (false for a docs-only or an inherited run, which skip every
+  # downstream job) and `gated`. `gated` is true only on a master push of a tree the merge
+  # queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the four
+  # jobs gate.sh runs whole: ci-native, ci-release-shape, fuel-sidecars, ci-cost.
+  # tests/ci_verdict_test.ts holds that list to what gate.sh covers.
   # ---------------------------------------------------------------------------
   seed:
     runs-on: ubuntu-latest
-    # `actions: read` lets a master run find and download a pull request's proven seed.
+    # `actions: read` lets a master run find and download a pull request's proven seed, and
+    # read a PR head's CI verdict; `statuses` and `pull-requests` read the queue's mark.
     permissions:
       contents: read
       actions: read
+      statuses: read
+      pull-requests: read
     outputs:
-      docs_only: ${{ steps.docs_check.outputs.docs_only }}
+      heavy: ${{ steps.verdict.outputs.heavy }}
+      gated: ${{ steps.verdict.outputs.gated }}
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
     steps:
@@ -149,6 +170,12 @@ jobs:
       - name: Detect docs-only change
         id: docs_check
         uses: ./.github/actions/docs-only
+
+      - name: Decide what this run repeats
+        id: verdict
+        uses: ./.github/actions/ci-verdict
+        with:
+          docs_only: ${{ steps.docs_check.outputs.docs_only }}
 
       # The two exact keys every downstream job restores. The binary is keyed on everything
       # that determines it (rustc, Cargo.lock, the crate source); the seed on the compiler
@@ -169,7 +196,7 @@ jobs:
       # outright; "the host still compiles" stays covered every run by `ci-embed-seed`,
       # which compiles the same crate (a feature superset) from scratch inputs.
       - name: Cache vl-host binary
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         id: vlbin
         uses: actions/cache@v5
         with:
@@ -180,7 +207,7 @@ jobs:
       # target dir compiled by one rustc is fully invalidated under the next, and
       # actions/cache never re-saves an existing key. `ci-embed-seed` restores this same key.
       - name: Cache cargo + vl-host target
-        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.vlbin.outputs.cache-hit != 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -193,7 +220,7 @@ jobs:
             cargo-${{ runner.os }}-
 
       - name: Build vl-host (native tool)
-        if: steps.docs_check.outputs.docs_only != 'true' && steps.vlbin.outputs.cache-hit != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && steps.vlbin.outputs.cache-hit != 'true'
         run: cargo build --release
         working-directory: scripts/vl-host
 
@@ -204,7 +231,7 @@ jobs:
       # ride along, so no downstream `vl` re-JITs the seed. A stale sidecar costs time, never
       # correctness: the host recompiles one whose key does not match.
       - name: Cache seed compiler wasm
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         id: seedcache
         uses: actions/cache@v5
         with:
@@ -224,7 +251,7 @@ jobs:
       # installs it after checking the producing run (scripts/ci-proven-seed.sh). The ladder
       # still runs: a reused seed is a better start that proves out in one compile.
       - name: Reuse a seed a pull request proved
-        if: steps.docs_check.outputs.docs_only != 'true' && github.event_name != 'pull_request' && steps.seedcache.outputs.cache-hit != 'true'
+        if: steps.verdict.outputs.heavy == 'true' && github.event_name != 'pull_request' && steps.seedcache.outputs.cache-hit != 'true'
         run: ./scripts/ci-proven-seed.sh fetch "proven-${{ steps.keys.outputs.seed }}"
         env:
           GH_TOKEN: ${{ github.token }}
@@ -238,7 +265,7 @@ jobs:
       # shard whose files read `$VL_FUEL`), which share them through their own `vl-fuel-`
       # cache: each is a whole-seed JIT, and warming them here put both on the critical path.
       - name: Refresh seed + native fixpoint (self-reproduction ladder)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars
         env:
           GH_TOKEN: ${{ github.token }}
@@ -247,7 +274,7 @@ jobs:
       # run uploads nothing; the reader refuses one anyway.
       - name: Checksum the proven seed for master
         id: pack
-        if: steps.docs_check.outputs.docs_only != 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: steps.verdict.outputs.heavy == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         run: ./scripts/ci-proven-seed.sh pack
 
       - name: Upload the proven seed for master
@@ -272,7 +299,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-native:
     needs: seed
-    if: needs.seed.outputs.docs_only != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -359,7 +386,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checks:
     needs: seed
-    if: needs.seed.outputs.docs_only != 'true'
+    if: needs.seed.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -481,7 +508,7 @@ jobs:
   # ---------------------------------------------------------------------------
   checks-suites:
     needs: seed
-    if: needs.seed.outputs.docs_only != 'true'
+    if: needs.seed.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -587,7 +614,7 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-release-shape:
     needs: seed
-    if: needs.seed.outputs.docs_only != 'true'
+    if: needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -709,7 +736,7 @@ jobs:
   # ---------------------------------------------------------------------------
   fuel-sidecars:
     needs: seed
-    if: github.event_name != 'pull_request' && needs.seed.outputs.docs_only != 'true'
+    if: github.event_name != 'pull_request' && needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -745,7 +772,7 @@ jobs:
 
   ci-cost:
     needs: [seed, fuel-sidecars]
-    if: github.event_name != 'pull_request' && needs.seed.outputs.docs_only != 'true'
+    if: github.event_name != 'pull_request' && needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -840,6 +867,9 @@ jobs:
   # ---------------------------------------------------------------------------
   ci-embed-seed:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v5
         with:
@@ -850,8 +880,15 @@ jobs:
         id: docs_check
         uses: ./.github/actions/docs-only
 
+      - name: Decide what this run repeats
+        id: verdict
+        uses: ./.github/actions/ci-verdict
+        with:
+          docs_only: ${{ steps.docs_check.outputs.docs_only }}
+          modes: inherit
+
       - name: Rustc version (cargo cache key)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         id: rustc
         run: echo "v=$(rustc -V | tr ' ' '_')" >> "$GITHUB_OUTPUT"
 
@@ -863,7 +900,7 @@ jobs:
       # restores, builds and saves. One cold wasmtime build after a toolchain bump
       # is the same cost as before the split.
       - name: Restore cargo + vl-host target
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -880,7 +917,7 @@ jobs:
       # while `seed` stays the sole writer of the seed pair, which is what
       # keeps the `.cwasm` sidecars riding along with the wasm they were built from.
       - name: Restore seed compiler wasm
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         uses: actions/cache/restore@v5
         with:
           path: |
@@ -893,13 +930,13 @@ jobs:
 
       # Idempotent: fetch-seed.sh leaves a present, non-empty seed untouched.
       - name: Ensure a seed to embed
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: ./scripts/fetch-seed.sh
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Verify embedded-seed build (distribution path)
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: |
           cargo build --release --features embed-seed --manifest-path scripts/vl-host/Cargo.toml
           probe="$(mktemp -d)"
@@ -934,7 +971,7 @@ jobs:
       # is the whole claim. The stale-seed row is the other half: a released `vl`
       # must not become a different compiler because of what sits in the CWD.
       - name: Verify a released `vl` carries std and ignores the CWD
-        if: steps.docs_check.outputs.docs_only != 'true'
+        if: steps.verdict.outputs.heavy == 'true'
         run: |
           set -e
           export VL_CACHE_DIR="$(mktemp -d)"
