@@ -36,7 +36,8 @@ per-module wasm.
    caching. sunpa's graph costs about 10 times the compiler's own per-line fuel.
 4. Finer reuse is per function or instance inside the one-module emit. It has two
    prerequisites: importer-independent phase outputs and symbolic indices in the emitter. The
-   owner has to rule on one known exception to importer independence (Q1).
+   owner ruled the one known exception to importer independence (Q1, 2026-10-07): record
+   adoption keeps crossing module boundaries, so a module's cache key includes its importers' demands.
 
 ## 1. The problem, measured
 
@@ -378,7 +379,7 @@ the same under `rules.test.vl` as under `beast.test.vl`.
 | order + rename | the whole graph | **no**: `$mN` is the discovery position, so adding an import above M renames everything in M | needs a stable module id (path- or content-derived); a compiler-internal change, no ruling |
 | checker: exported `let` inference | M + its imports | **yes, by rule**: "an exported `let` is typed only by its own module's uses; an importer's use is an ordinary use" (DECISIONS.md, the B′+C literal-binding entry). Probe below. | yes, after rename and arena are fixed |
 | checker: un-annotated `const` | each use site | yes: typed per use, "no cross-module effect" (same entry) | yes |
-| checker: record adoption | **the importers' deliveries** | **no**. Probe below. | **needs an owner ruling (Q1)** |
+| checker: record adoption | **the importers' deliveries** | **no**. Probe below. | ruled (Q1, B): adoption crosses the boundary, so M's result is keyed on its importers' deliveries |
 | checker: a generic's body | each instance's arguments | diagnostics land at the importer's call site | the generic's BODY is part of M's interface (GHC's unfoldings) |
 | A20 inferred returns | M + its imports' signatures | plausibly yes, but unproven for 1,205 bindings | after a differential test (Stage 5's gate) |
 | monomorphization | every call site in the graph | **no** by construction: the instance set is the union over importers | per instance, keyed on (generic body, type arguments) |
@@ -460,8 +461,9 @@ at most the 5 s that `vl check` costs. The build's other 22 s is only reachable 
 - symbolic indices in the emitter;
 - every cache in §4.
 
-**Needs a ruling:**
-- **record adoption across a module boundary (Q1)**;
+**Ruled:** record adoption across a module boundary (Q1, B): it crosses, and S5 tracks importer demands.
+
+**Needs a ruling (none blocks S5):**
 - whether exported signatures must be annotated to give modules a frozen interface (Q4). The
   recommendation is no;
 - the user-visible surfaces: cache default and location (Q2), and a watch command (Q3).
@@ -829,7 +831,7 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
 | **S2** | The `-O` chain cache (A2 in §4.6) | 1 | up to 10.3 s of sunpa's 32.3 s `-O3` (`27e3417`) when the emitted bytes did not move | the same verify mode; the mutation matrix gains "one emitted byte" and "one `-O` flag" | the hit rate over a week of sunpa's `-O3` builds |
 | **S3** | `--watch` for `test`, `build`, `run` and `check` (§4.9), resident, polling, pool-backed | 3–5 | no per-action speed beyond S1; the loop becomes automatic, and unchanged files cost nothing | a watch session's report must equal a cold run's after each edit in a scripted edit sequence | wall time from save to report for the beast-edit case |
 | **S4** | Keep cutting compile cost on sunpa's shape (`C-compile-hotspots` and its successors) | ongoing | the only stage that speeds the compile whose input changed; headroom suggested by the 10× per-line gap | byte-identical output, which every perf PR already shows | fuel on a committed sunpa-shaped generator, beside `plumb-shape-cost.vl` |
-| **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, Q1 ruled, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15, after Q1 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 4.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes | LSP latency on sunpa and on `compiler/entry.vl` |
+| **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 4.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes; a module adopted by an importer is keyed on that importer's demands (Q1, B) | LSP latency on sunpa and on `compiler/entry.vl` |
 | **S6** | Per-function and per-instance emit reuse: the emitter writes bodies against symbolic indices (function, type, global, string, union tag) and a late pass assigns and patches them, inside the one module; cache each body keyed on its typed body and the interface hashes of what it references | months; high risk | the edited graph's compile scales with what changed: most of a 25.0 s build when one function body changes (estimate, pending S0) | cold-versus-incremental byte identity over the whole corpus and the self-compile, run continuously; the memo census's in-place-fill lesson says this is where staleness would hide | S0's split, before and after |
 | — | separate compilation and linking (plumb) | separate track | — | — | — |
 
@@ -880,6 +882,51 @@ the chain as action kind `opt` (`opt_cache_action`, `main.rs`), traced as `-O hi
 - Measured on sunpa `91667c7`'s `build:vl` (`-O3 --names --source-map`, binaryen.js 130): cold
   39.0 s / 567 MiB RSS; S1 hit with the chain run 30.7 s / 323 MiB; S1+S2 hit 0.2 s / 102 MiB;
   module and map byte-identical to the cold build, and a verify run agrees.
+
+**S4 on eardstap's test files (2026-10-17, master `7fe51e77c`).** One `vl build` of a
+`play/*.test.vl` costs 3.4–3.9 G guest fuel. Almost all of that is the game's shared module
+graph: `play/game.vl` alone is 2.3 G, `rules/state.vl` 0.26 G, a trivial print 1.4 M.
+- Profile: guest samples (`VL_PROFILE_GUEST` on a `--names` seed) over seven test files, 4,856
+  samples in all, inclusive share.
+
+  | frame | incl |
+  | --- | ---: |
+  | `emitProgram` | 73.7% |
+  | `runEmitPasses` | 40.8% |
+  | `emitModule` / `emitFuncCode` | 31% |
+  | `checkProgramPass` | 21% |
+  | `monomorphize` | 18.6% |
+  | `monoRebuild` | 12.7% |
+  | `computeRetInference` | 10.5% (440 of its samples under `monoRebuild`, 72 from the pass table) |
+  | `dupScanRun` | 9.2% |
+  | `sigKeyOfTy` | 9.0% |
+  | `criClassify` | 7.4% |
+
+  The top self frame is `__str_eq__` at 9.6%, spread over many callers.
+- The cut: `monoRebuild` re-ran `computeVoidFns` and `computeRetInference`, both
+  whole-program fixpoints, after every minted instance. On `journey.test.vl` that was 21 full
+  rebuilds. They now run once, in `monoRetSettle`, when the walk ends and again after
+  `monoPruneTemplates`. `collectA` and `buildFnMap` still rebuild per instance. During the
+  walk, the return rows of un-annotated functions therefore hold `buildFnMap`'s annotation
+  seed, not the inferred kind. No static argument covers every mono-walk reader. The evidence
+  that no reader's answer moves is output identity: `difftree.sh --identity` over the corpus,
+  plus every `.vl` file of eardstap (74) and diderven (331) built byte-identical.
+- Fuel, `vl build`, master seed against the candidate:
+
+  | file | before | after |
+  | --- | ---: | ---: |
+  | `journey.test.vl` | 3,377,572,016 | 3,018,749,719 (−10.6%) |
+  | `camp.test.vl` | 3,918,405,651 | 3,214,974,854 (−18.0%) |
+  | `combat.test.vl` | 3,611,694,503 | 3,127,796,605 (−13.4%) |
+  | `clarity.test.vl` | 3,590,541,072 | 3,105,731,477 (−13.5%) |
+
+  The self-compile does not move: L2 is 92,156,524,372 before and 92,156,524,374 after. The
+  compiler declares no generic, so `monomorphize` returns before its walk.
+- Guard: the `generic instances beside inferred returns` pair in
+  `tests/vl_scaling_shape_test.ts` reads 1.23, against 3.59 on master.
+- What is left is flatter. `sigKeyOfTy` mostly hits its memo: 12,265 calls and 1,977 misses on
+  `journey`, so a perfect memo saves about 4.5%. `dupScanRun` and the checker are the next
+  frames to profile.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
