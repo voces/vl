@@ -19,7 +19,16 @@
 #
 #   scripts/self-compile-time.sh                   # grade
 #   scripts/self-compile-time.sh --write-baseline  # after a real change in cost lands
+#   scripts/self-compile-time.sh --pair <dir>      # grade the stage 4 scripts/self-compile-pair.sh built
 set -euo pipefail
+WRITE=0; PAIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --write-baseline) WRITE=1; shift ;;
+    --pair) PAIR="${2:?--pair takes a directory}"; shift 2 ;;
+    *) echo "usage: scripts/self-compile-time.sh [--write-baseline] [--pair <dir>]"; exit 2 ;;
+  esac
+done
 cd "$(dirname "$0")/.."
 
 VL="${VL:-scripts/vl-host/target/release/vl}"
@@ -40,6 +49,14 @@ FACTOR="${FACTOR:-$(awk -F'[:,]' '/"factor"/{gsub(/[^0-9.]/, "", $2); print $2}'
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+if [ -n "$PAIR" ]; then
+  # The pair's stage 4 is this row's L2 build: the candidate compiling the compiler under
+  # VL_FUEL=1 VL_GC_STATS=1. Its compiler is the seed's `--names` build, whose custom sections
+  # add no fuel, and its profiler ticks add none either; its CPU also pays the profiler and a
+  # fresh sidecar, which is why CPU is not graded.
+  [ -f "$PAIR/stage4.time" ] || { echo "missing $PAIR/stage4.time (scripts/self-compile-pair.sh --build $PAIR)"; exit 1; }
+  cp "$PAIR/stage4.time" "$WORK/t"
+else
 # WARM THE FUEL ENGINE'S `.cwasm` SIDECAR FIRST, untimed. A fuel engine compiles the seed to
 # different code and caches it under its own sidecar; a fresh seed has none, and Cranelift
 # costs CPU but no fuel, so this only keeps the printed CPU honest.
@@ -52,6 +69,7 @@ VL_FUEL=1 timeout 600 "$VL" build "$WORK/warm.vl" -o "$WORK/warm.wasm" --compile
 # "timeout KILLS THE SHELL, NOT THE BUILD").
 { time -p VL_FUEL=1 VL_GC_STATS=1 timeout 600 "$VL" build "$SRC" -o "$WORK/l2.wasm" --compiler "$SEED"; } \
   2> "$WORK/t" || { echo "L2 self-compile FAILED (rc above; 124 is a real hang)"; cat "$WORK/t"; exit 1; }
+fi
 CPU=$(awk '/^user/{u=$2} /^sys/{s=$2} END{printf "%.1f", u + s}' "$WORK/t")
 FUEL=$(awk '/^\[fuel\] guest: [0-9]+$/{print $3}' "$WORK/t")
 [ -n "$FUEL" ] || { echo "this host prints no \`[fuel]\` line (it predates \$VL_FUEL); rebuild scripts/vl-host"; exit 1; }
@@ -72,7 +90,7 @@ if [ "$LIVE_PCT" -gt 75 ]; then
   exit 1
 fi
 
-if [ "${1:-}" = "--write-baseline" ]; then
+if [ "$WRITE" = 1 ]; then
   COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
   printf '{\n"fuel": %s,\n"factor": %s,\n"commit": "%s",\n"note": "candidate compiles the compiler, VL_FUEL=1 guest fuel: a count, so load cannot move it. Re-baseline when the cost really changes: scripts/self-compile-time.sh --write-baseline"\n}\n' \
     "$FUEL" "$FACTOR" "$COMMIT" > "$BASELINE"

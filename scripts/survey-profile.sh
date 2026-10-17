@@ -20,17 +20,25 @@ export VL_STD="$PWD/std"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+PROFILE="$WORK/p.json"
 
+if [ "${1:-}" = "--pair" ]; then
+  # scripts/self-compile-pair.sh took the profile on its stage 4, which is this script's
+  # profiled compile: the `--names` build compiling the compiler.
+  PROFILE="${2:?usage: scripts/survey-profile.sh [--pair <dir>]}/profile.json"
+  [ -s "$PROFILE" ] || { echo "survey-profile: the pair left no profile at $PROFILE"; exit 1; }
+else
 # A guest frame reads `wasm-function[N]` without a name section, so the profile is taken
 # against a `--names` build of the SAME source the seed came from, never against the seed.
 timeout 300 "$VL" build compiler/entry.vl -o "$WORK/names.wasm" --names --compiler "$SEED" \
   >/dev/null || { echo "survey-profile: the --names seed build failed"; exit 1; }
-VL_PROFILE_GUEST="$WORK/p.json" "$VL" build compiler/entry.vl --compiler "$WORK/names.wasm" \
+VL_PROFILE_GUEST="$PROFILE" "$VL" build compiler/entry.vl --compiler "$WORK/names.wasm" \
   -o "$WORK/out.wasm" >/dev/null 2>&1 || {
   echo "survey-profile: the profiled compile failed"; exit 1; }
+fi
 
 RG=(scripts/survey-regrade.vl --compiler "$SEED" --)
 "$VL" run "${RG[@]}" --self-test >/dev/null || {
   echo "survey-profile: survey-regrade.vl --self-test failed"; exit 1; }
-"$VL" run "${RG[@]}" --require-profile --profile "$WORK/p.json" "$DOC"
+"$VL" run "${RG[@]}" --require-profile --profile "$PROFILE" "$DOC"
 exit $?
