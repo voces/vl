@@ -1080,7 +1080,14 @@ import {
 import { isFitsAcrossTagRows, variantFieldIndex } from "./emit_variant_sig"
 import { strListHas } from "./listutil"
 import { memoGenAdvance, memoMoved, memoPassMoved } from "./memo"
-import { sidArrGet, sidLookup, sidOf, sidOfNode, sidText } from "./symbols"
+import {
+  identDeclOf,
+  sidArrGet,
+  sidLookup,
+  sidOf,
+  sidOfNode,
+  sidText,
+} from "./symbols"
 import { arrElemNameRaw, nameIsArray, peelGroupParens } from "./tyname"
 import { substTyDeep, tvWriteLandTy } from "./check_relate_core"
 import {
@@ -4314,6 +4321,9 @@ function captureLoopCopySrcAt(fe: i32, name: string, depth: i32): string {
   ""
 }
 
+// Set only while `captureValKind` types an un-annotated env field off its initializer.
+let capInitAsk = false
+
 // The `fbValtype` kind for a captured variable `name` of lifted function `fe`, resolved
 // against the parent frame's binding — a param's annotation, or a local `let`'s annotation
 // or initializer. Defaults to i32.
@@ -4380,7 +4390,11 @@ export function captureValKind(fe: i32, name: string): VKind {
     // list, string or struct env field carries its real ref valtype. The frame is an arena
     // index and not an `fnStmts` position — `parentBindingFrameArenaOf` is that one home.
     if bn.letInit >= 0 {
-      return letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
+      const askWas = capInitAsk
+      capInitAsk = true
+      const ck = letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
+      capInitAsk = askWas
+      return ck
     }
   }
   "i32"
@@ -9313,6 +9327,8 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
     return true
   }
   if s is Member { return true }
+  // A `?.` read yields its field or null, so it is a value wherever it ends an arm.
+  if s is OptMember { return true }
   if s is Index { return true }
   if s is IsExpr { return true }
   if s is AsExpr { return true }
@@ -13568,6 +13584,13 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // init): top-level `const a = make(42)` / `let w: string | i32 = "a"`.
   const gi = globalLetOfIn(fnIx, e.identName, exprIx)
   if gi >= 0 { return letIsUnion(gi, -1) }
+  // While a capture's env field is typed off its initializer from the capturing frame, a
+  // parent local with no loaded slot answers from its own declaration, so the field and the
+  // parent's cell agree. Only there: elsewhere an unloaded ident may be flow-narrowed (D5332).
+  if capInitAsk && declaredSlotOf(e.identName) < 0 {
+    const ud = identDeclOf(exprIx)
+    if ud >= 0 && P.nodes[ud] is LetDecl { return letIsUnion(ud, fnIx) }
+  }
   return false
 }
 
@@ -19563,6 +19586,7 @@ export function mfCallbackFe(cbIx: i32, fnIx: i32) {
 // every path that returns; a trap inside a query leaves a depth above 0 and stales its memo.
 export function classifyStateReset() {
   capFrame = -1
+  capInitAsk = false
   gckDepth = 0
   irkDepth = 0
   lrDepth = 0
