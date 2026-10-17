@@ -772,7 +772,8 @@ export function sharedFieldArmLitTexts(vi: i32, fi: i32): string[] {
 }
 
 // `isVariantSpellingOfShape`, then the arm row of the receiver `recvIx`'s union that holds the
-// tested record: an inline arm's row spells a lone literal field at its base (D5143).
+// tested record: an inline arm's row spells a lone literal field at its base (D5143). A
+// receiver already narrowed to that record names the one row any union stores it in (D5157).
 export function isVariantSpellingAtRecv(
   variant: string,
   tyIx: i32,
@@ -780,17 +781,38 @@ export function isVariantSpellingAtRecv(
 ): string {
   const sp = isVariantSpellingOfShape(variant, tyIx)
   if variantIndexOf(sp) >= 0 || recvIx < 0 { return sp }
-  const nm = armRowNameOfDeclaredMember(
+  let nm = armRowNameOfDeclaredMember(
     nodeTyInOf(unwrapParen(recvIx), emitCurFnIx),
     tyIx,
   )
+  if nm == "" && recvIsTestedRecord(recvIx, tyIx) {
+    nm = armRowNameOfRecord(tyIx)
+  }
   if nm != "" { nm } else { sp }
 }
 
-// The variant name of the row of the receiver's union holding record `ty`, or "" unless every
-// row of that union matching it shares one name and exactly one member matches the row.
-// `recvTy` is the receiver's type, through one `| null`; an inline arm's row spells a lone
-// literal field at its base (D5143).
+// The name every variant row storing record `ty` shares, or "" when none does or two differ.
+// A row storing it has its field names, so only that signature's chain is walked.
+function armRowNameOfRecord(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const rt = T.tys[ty]
+  if !(rt is TyObj) { return "" }
+  let nm = ""
+  let r = ovnFirst(fieldNamesSig(rt.objFieldNames))
+  while r >= 0 && r < uVariants.length {
+    if armRowIsMember(r, ty) {
+      if nm != "" && uVariants[r] != nm { return "" }
+      nm = uVariants[r]
+    }
+    r = ovnNextOf(r)
+  }
+  nm
+}
+
+// The variant name of the row of the receiver's union holding member `ty`, or "" unless every
+// row of that union matching it shares one name. `recvTy` is the receiver's type, through one
+// `| null`; an inline arm's row spells a lone literal field at its base (D5143), so arms that
+// differ only there share a row, which `armRowSharedAtRecv` names (D5157).
 export function armRowNameOfDeclaredMember(recvTy: i32, ty: i32): string {
   if ty < 0 { return "" }
   const ut = unionTyOfRecv(recvTy)
@@ -809,13 +831,40 @@ export function armRowNameOfDeclaredMember(recvTy: i32, ty: i32): string {
   if found < 0 { return "" }
   const rt = T.tys[ut]
   if !(rt is TyUnion) { return "" }
-  let isMember = false
+  for m in rt.uMembers {
+    if tyEq(m, ty) { return uVariants[found] }
+  }
+  ""
+}
+
+// Whether row `vi` holds more than one member of the receiver `recvIx`'s union, so its tag
+// alone does not say which member a value is and `is` reads the fields as well (D5157).
+export function armRowSharedAtRecv(recvIx: i32, vi: i32): boolean {
+  if recvIx < 0 { return false }
+  const ut = unionTyOfRecv(nodeTyInOf(unwrapParen(recvIx), emitCurFnIx))
+  if ut < 0 { return false }
+  const rt = T.tys[ut]
+  if !(rt is TyUnion) { return false }
+  if vi < 0 || vi >= uFieldCount.length { return false }
   let pairs = 0
   for m in rt.uMembers {
-    if tyEq(m, ty) { isMember = true }
-    if armRowIsMember(found, m) { pairs = pairs + 1 }
+    const mt = T.tys[m]
+    if mt is TyObj {
+      if mt.objFieldNames.length == uFieldCount[vi] && armRowIsMember(vi, m) {
+        pairs = pairs + 1
+        if pairs > 1 { return true }
+      }
+    }
   }
-  if isMember && pairs == 1 { uVariants[found] } else { "" }
+  false
+}
+
+// Whether the receiver `recvIx` is typed at exactly record `ty`, as the checker narrows a shared
+// row's value once its other members are ruled out, so `is ty` holds (D5157).
+export function recvIsTestedRecord(recvIx: i32, ty: i32): boolean {
+  if recvIx < 0 || ty < 0 || !tyIsRecord(ty) { return false }
+  const rt = nodeTyInOf(unwrapParen(recvIx), emitCurFnIx)
+  rt >= 0 && tyEq(rt, ty)
 }
 
 // The union type `t` is, through one `| null`, or -1.
