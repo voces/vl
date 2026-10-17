@@ -483,9 +483,9 @@ references are compared by) and `unMemKinds` (0 the `null` keyword · 1 NOMINAL,
 declared name `cUserTypes` resolved · 2 a scalar `TyPrim` · 3 a composite · -1
 unresolved). **That is the only place a member set is ever split.**
 
-A SET is then a subset of one row: `(msSetRow[s], msSetMask[s])`, a bitmask over the
+A SET is then a subset of one row: `msSetRow[s]` plus a bitmask of 32-bit words (`msSetWords` from `msSetWordAt[s]`, any width) over the
 row's members **in the row's recorded order**. So membership is a kind test or a bit
-test, subtraction is `mask - (1 << i)`, cardinality is a bit count, and iteration walks
+test, subtraction clears bit `i`, cardinality is a bit count, and iteration walks
 the row's members. Sets are interned per row (`msRowChain`/`msSetNext`), and each is
 RENDERED once (`msSetText`) by joining the surviving members' verbatim spellings — which
 is byte-identical to the string surgery's output, because those spellings ARE the
