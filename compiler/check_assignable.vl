@@ -17,6 +17,7 @@ import {
   Param,
   Paren,
   Spread,
+  StrLit,
   Unary,
   addNode,
   adoptNodeTok,
@@ -59,6 +60,10 @@ import {
   fsbOwnRhs,
   fsbOwnTy,
   fsbOwnerReaches,
+  holeLitMovedHas,
+  holeLitMovedSet,
+  holeLitPinOf,
+  holeLitPinSet,
   nolNoteDelivery,
 } from "./check_bind_rows"
 import {
@@ -207,6 +212,7 @@ import { fsbArgsFit, fsbBindParams } from "./check_node_rules"
 import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   f32LitTailsAdopt,
+  f64ExactJoinLeaves,
   litTreeAdoptDst,
   mapDeliveryMayRecord,
 } from "./check_num_adopt"
@@ -301,6 +307,7 @@ import {
   TyNullable,
   TyObj,
   TyUnion,
+  TyVar,
   mkFuncTy,
   nwTyIxs,
   objFieldType,
@@ -311,6 +318,7 @@ import {
   tyIsNewtypeBrand,
   tyIsNicheNulScalarElem,
   tyMayHoldFn,
+  tyMentionsErr,
   tyMentionsTyVarNamed,
   tyReachesBrand,
   tyReachesEmptyHole,
@@ -325,6 +333,7 @@ import { wideLitByNode } from "./check_wide_lits"
 import { argLitAt, wsSuppress } from "./check_width"
 import { fnDeclIx } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
+import { strListHas } from "./listutil"
 import { nodePos } from "./fmt_util"
 import {
   flattenVariantsInto,
@@ -435,6 +444,7 @@ function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   const who = fsbCallWho[c]
   const callee = fsbOwnerCallee(o)
   cstrOwnedStrictSet(o >= 0)
+  adoptHoleLitArgs(nm, ty, callee, fsbCallHNames[c], fsbCallHNode[c])
   validateBinCstrs(
     nm,
     ty,
@@ -1045,6 +1055,8 @@ export function assignableExpr(srcExpr: i32, srcTy: i32, dstTy: i32) {
       cexFloatUse(srcExpr)
       return true
     }
+    // A join that is `i64` only because one of its literals outgrew i32 (D5712).
+    if f64ExactJoinLeaves(srcExpr, srcTy, dstTy) { return true }
   }
   // A `const` literal, or a join of them, read as `string`: a literal-typed destination takes it at
   // the literal type it is, in a list or object literal exactly as at an argument (D2157).
@@ -1329,6 +1341,20 @@ function argCstrFitsAt(
     // A composite side is asked the same question of the node, or a list reaches a scalar
     // parameter through `call_ref` unconverted (D5790).
     if tyHasHole(rat) || tyHasHole(rexp) { return argCstrFits(rat, rexp, form) }
+    // An argument whose type is already an earlier diagnostic's error is not refused again.
+    if tyMentionsErr(rat, 8) { return true }
+    // A literal already retyped for another of the hole's demands is that type now; it is not
+    // rebuilt a second time for this one.
+    const pinned = holeLitPinOf(parenPeelIx(org))
+    if pinned >= 0 {
+      return pinned == rexp
+        || assignable(pinned, rexp) && assignable(rexp, pinned)
+    }
+    // Loud at a pin that is not itself a probe: a container delivery reports its own refusal
+    // and answers true, so a quiet ask cannot see it (D5840).
+    if !inferQuiet && !(P.nodes[parenPeelIx(org)] is ObjLit) {
+      return assignableExpr(org, rat, rexp)
+    }
   }
   const savedQuiet = inferQuiet
   if prbArmed { prbEnter() }
@@ -1337,6 +1363,54 @@ function argCstrFitsAt(
   inferQuiet = savedQuiet
   if prbArmed { prbLeave("argCstrFitsAt") }
   ok
+}
+
+// The type another demand retyped demand `ci`'s literal at, else `rat`.
+function litPinnedOr(
+  rat: i32,
+  ci: i32,
+  hNames: string[],
+  hArgNode: i32[],
+): i32 {
+  const org = holeArgOriginNode(ci, hNames, hArgNode)
+  if org < 0 { return rat }
+  const pinned = holeLitPinOf(parenPeelIx(org))
+  if pinned >= 0 { return pinned }
+  rat
+}
+
+// The function type a lambda handed to hole `holeTy` takes from the call the callee's body makes
+// through another hole this call already bound (D5842); -1 for none, or two. `calleeFn` scopes the
+// demands to a declared callee; -1 reads them by the hole's qualified name alone.
+export function holeLambdaSeedTy(
+  calleeFn: i32,
+  holeTy: i32,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  if holeTy < 0 || !tyIsHole(holeTy) { return -1 }
+  const hv = T.tys[holeTy]
+  if !(hv is TyVar) { return -1 }
+  let got = -1
+  let ci = 0
+  while ci < argCstr.at.length {
+    const mine = calleeFn < 0 || argCstr.fn[ci] == calleeFn
+    if argCstr.form[ci] > 0 && mine && tyVarNamed(argCstr.at[ci], hv.tvName) {
+      const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+      if rexp >= 0 && !tyHasHole(rexp) && T.tys[rexp] is TyFunc {
+        if got >= 0 && !tySame(got, rexp) { return -1 }
+        got = rexp
+      }
+    }
+    ci = ci + 1
+  }
+  got
+}
+
+function tyVarNamed(t: i32, name: string): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  const v = T.tys[t]
+  v is TyVar && v.tvName == name
 }
 
 // A composite argument demand at the pin that closes it: its node is asked the direct call's
@@ -1398,10 +1472,15 @@ export function validateArgCstrs(
     }
     // A hole callee's parameter still unpinned here moves out to the caller's hole with its
     // argument, whichever side this call resolved.
-    if calleeFn >= 0 && argCstr.form[ci] > 0 && hdKindIs(rexp, HD_PARAM) {
+    if (
+      (calleeFn >= 0 || calleeFn == CSTR_NODECL)
+      && argCstr.form[ci] > 0
+      && hdKindIs(rexp, HD_PARAM)
+    ) {
       if rat != argCstr.at[ci] || rexp != argCstr.exp[ci] {
         let mvNode = -1
         if !tyIsHole(rat) { mvNode = holeArgOriginNode(ci, hNames, hArgNode) }
+        if mvNode >= 0 && !inferQuiet { holeLitMovedSet(parenPeelIx(mvNode)) }
         noteArgCstr(rat, rexp, argCstr.who[ci], argCstr.form[ci], mvNode)
       }
     }
@@ -1410,7 +1489,7 @@ export function validateArgCstrs(
     if !tyIsHole(rat) && !tyIsDeferredJoin(rat) {
       if !tyIsHole(rexp) && !tyIsDeferredJoin(rexp) {
         if !argCstrFitsAt(rat, rexp, ci, hNames, hArgNode) {
-          argCstrErr(rat, rexp, ci, ix)
+          argCstrErr(litPinnedOr(rat, ci, hNames, hArgNode), rexp, ci, ix)
         }
       }
     }
@@ -1418,6 +1497,133 @@ export function validateArgCstrs(
   }
   cvNow = cvWas
   0
+}
+
+// A literal argument handed to a hole parameter that the body delivers to a function value's
+// concrete parameter takes that parameter's type, as it does at the direct call, so the instance
+// passes `call_ref` the callee's own rep (D5840). Rebinds `bTys` in place, once per hole.
+export function adoptHoleLitArgs(
+  bNames: string[],
+  bTys: i32[],
+  calleeFn: i32,
+  hNames: string[],
+  hArgNode: i32[],
+) {
+  if calleeFn < 0 && calleeFn != CSTR_NODECL { return 0 }
+  const done: string[] = []
+  let ci = 0
+  while ci < argCstr.at.length {
+    if argCstr.form[ci] > 0 && cstrOwnedBy(argCstr.fn[ci], calleeFn) {
+      adoptHoleLitArg(ci, bNames, bTys, calleeFn, hNames, hArgNode, done)
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// `adoptHoleLitArgs` for demand `ci`; `done` holds the holes already rebound. A demand moved out
+// of a forwarder carries its literal and that literal's own type in place of the hole. A call
+// with no declaration (a hole lambda) adopts only for the holes it binds itself.
+function adoptHoleLitArg(
+  ci: i32,
+  bNames: string[],
+  bTys: i32[],
+  calleeFn: i32,
+  hNames: string[],
+  hArgNode: i32[],
+  done: string[],
+) {
+  const at = argCstr.at[ci]
+  if at < 0 || at >= T.tys.length { return 0 }
+  const hv = T.tys[at]
+  const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+  if !(hv is TyVar) {
+    if calleeFn < 0 { return 0 }
+    const mv = argCstr.node[ci]
+    if (
+      mv < 0
+      || holeLitPinOf(parenPeelIx(mv)) >= 0
+      || !holeLitMovedHas(parenPeelIx(mv))
+    ) {
+      return 0
+    }
+    const mvLit = P.nodes[parenPeelIx(mv)]
+    if !(mvLit is ArrayLit || mvLit is ObjLit) { return 0 }
+    if holeLitAdopts(mv, at, rexp) { holeLitAdopt(mv, at, rexp) }
+    return 0
+  }
+  if strListHas(done, hv.tvName) { return 0 }
+  if calleeFn < 0 && !strListHas(hNames, hv.tvName) { return 0 }
+  let k = 0
+  while k < bNames.length && bNames[k] != hv.tvName { k = k + 1 }
+  if k >= bNames.length || k >= bTys.length { return 0 }
+  const org = holeArgOriginNode(ci, hNames, hArgNode)
+  if org < 0 { return 0 }
+  const lit = P.nodes[parenPeelIx(org)]
+  if !(lit is ArrayLit || lit is ObjLit || lit is StrLit) { return 0 }
+  if !holeLitAdopts(org, bTys[k], rexp) { return 0 }
+  holeLitAdopt(org, bTys[k], rexp)
+  bTys[k] = rexp
+  done.push(hv.tvName)
+  0
+}
+
+// Whether literal `org` of type `rat` is rebuilt at `rexp`: the direct call would retype it, and
+// its own type is not already the same rep (a wider record literal fits by width as it is).
+function holeLitAdopts(org: i32, rat: i32, rexp: i32): boolean {
+  if rat == rexp || tyHasHole(rexp) { return false }
+  const empty = tyReachesEmptyHole(rat, 8)
+  if tyHasHole(rat) && !empty { return false }
+  if scalarPrimPair(rat, rexp) { return false }
+  if !empty && assignable(rat, rexp) && assignable(rexp, rat) { return false }
+  if P.nodes[parenPeelIx(org)] is ObjLit && objWidthFitsExact(rat, rexp) {
+    return false
+  }
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  const ok = assignableExpr(org, rat, rexp)
+  inferQuiet = savedQuiet
+  ok
+}
+
+// Retypes literal `org` at `rexp` for the checker and for the instance mono builds.
+function holeLitAdopt(org: i32, rat: i32, rexp: i32) {
+  if inferQuiet { return 0 }
+  assignableExpr(org, rat, rexp)
+  nodeTySet(org, rexp)
+  recordRepTyAdopt(org, rexp, 6)
+  // A string literal already pins at its literal union through the atom channel.
+  if !(P.nodes[parenPeelIx(org)] is StrLit) {
+    holeLitPinSet(parenPeelIx(org), rexp)
+  }
+  0
+}
+
+// True when record `wide` carries every field of `narrow` at the identical type, so a wider
+// literal already fits by width and needs no retyping (an extra field stays readable).
+function objWidthFitsExact(wide: i32, narrow: i32): boolean {
+  if wide < 0 || wide >= T.tys.length || narrow < 0 || narrow >= T.tys.length {
+    return false
+  }
+  const w = T.tys[wide]
+  const n = T.tys[narrow]
+  if !(w is TyObj) || !(n is TyObj) { return false }
+  let i = 0
+  while i < n.objFieldNames.length {
+    let j = 0
+    while (
+      j < w.objFieldNames.length
+      && w.objFieldNames[j] != n.objFieldNames[i]
+    ) {
+      j = j + 1
+    }
+    if j >= w.objFieldTypes.length || i >= n.objFieldTypes.length {
+      return false
+    }
+    if w.objFieldTypes[j] != n.objFieldTypes[i] { return false }
+    i = i + 1
+  }
+  true
 }
 
 // Whether a return-type mismatch is nominal-only, at a destination the author has no syntax

@@ -6037,7 +6037,12 @@ fn run_batch(args: &[String]) -> Result<()> {
         .map_err(|e| Error::from(e).context(format!("creating --out-dir `{out_dir}`")))?;
     let compiler = resolve_compiler(compiler);
 
-    let compile_engine = seed_engine(Collector::Null)?;
+    // The one-shot compile's collector, so a case compiles in the batch exactly as it would
+    // alone: under null a large compile fills the heap and traps where `vl run` succeeds.
+    let compile_engine = match compile_collector()? {
+        Collector::Copying => copying_seed_engine()?,
+        other => seed_engine(other)?,
+    };
     let run_engine = gc_engine(run_collector()?, gc_heap_initial(BATCH_GC_HEAP_INITIAL)?)?;
     let module = load_compiler_module(&compile_engine, &compiler)?;
     // Pre-link once; `instantiate_pre` re-checks nothing per case.
