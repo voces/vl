@@ -105,7 +105,8 @@ Detail: `docs/internals/modules-design.md`, `docs/internals/parser-notes.md`.
    (`exp*`) — and write their answers back as annotations;
 3. a re-check (`checkProgramAgain`: restore spellings, re-initialise, pass again) while any solver
    changed something, bounded by a fixed pass budget;
-4. the reports each solver owes, emitted once at the end.
+4. the reports each solver owes, emitted once at the end: refusals from one queue
+   (`check_pin_refusals.vl`), hints from another the host reads (`check_pin_hints.vl`).
 
 The driver can run the checker once more after the main check: `jwSecondPass` generates source
 for deep `is` walkers, splices it into the arena, and re-checks.
