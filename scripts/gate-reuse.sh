@@ -3,18 +3,25 @@
 # A row that declares READS is keyed on the contents of everything its result can depend on:
 # the seed, the host binary, std/, gate.sh and this file, the keyed env, its argv and every
 # file under its declared paths. A green result stored under that key is reused instead of
-# re-running the row. The declaration is backed by a read check: a miss runs under
-# `strace -f`, and a run that touched a repo path its READS does not cover is RED (rc 96),
-# so a declaration cannot drift out of date silently. Reads outside the repo (system tools,
-# libraries, PATH probes) are recorded with their sha256 and re-checked on every hit.
+# re-running the row.
 #
-# GATE_REUSE=0 turns it off. GATE_REUSE_VERIFY=1 re-runs every hit and fails a row whose
-# fresh result disagrees. GATE_REUSE_DIR moves the store (default ~/.cache/vl-gate).
-# Without strace (macOS, a runner without it) nothing is stored or reused: no read check,
-# no reuse. Design and what cannot be declared: docs/internals/gate-reuse.md.
+# The declaration is backed by a PROOF: one run under `strace -f` showing the row touched no
+# repo path its READS does not cover (an uncovered read is RED, rc 96). The proof is keyed on
+# what decides which paths a row opens -- its argv, its code entries, the READS text, gate.sh,
+# this file, std, the host and the seed's file-request modules -- and not on the seed or the
+# `data:` entries, so a compiler change misses the result but keeps the proof and re-runs the
+# row untraced. Soundness of that split: docs/internals/gate-reuse.md.
+#
+# GATE_REUSE=0 turns it off. GATE_REUSE_VERIFY=1 traces every run, hits included, and fails a
+# row whose stored result is green and whose fresh run is red. GATE_REUSE_DIR moves the store
+# (default ~/.cache/vl-gate); GATE_REUSE_PROOF_DAYS (default 7) is a proof's lifetime.
+# Without strace (macOS, a runner without it) nothing is stored or reused.
 
 # The paths every keyed row depends on, besides its own READS.
-REUSE_IMPLICIT="std scripts/gate.sh scripts/gate-reuse.sh scripts/compat build/vl-compiler.wasm"
+REUSE_IMPLICIT="std scripts/gate.sh scripts/gate-reuse.sh scripts/compat build/vl-compiler.wasm build/vl-compiler.wasm.src"
+# What every proof is keyed on besides a row's code entries. compiler/cli.vl and
+# compiler/driver.vl are where the seed computes every path it asks the host to open.
+REUSE_PROOF_IMPLICIT="std scripts/gate.sh scripts/gate-reuse.sh scripts/compat compiler/cli.vl compiler/driver.vl"
 REUSE_TRACE="open,openat,openat2,newfstatat,statx,faccessat,faccessat2,access,stat,lstat,readlink,readlinkat,execve,mkdir,mkdirat,chdir,fchdir,clone,clone3,fork,vfork"
 
 reuse_init() {
@@ -26,10 +33,13 @@ reuse_init() {
   elif ! command -v strace >/dev/null; then REUSE_WHY="off: strace is not installed, so no read check"
   elif ! strace -f --seccomp-bpf -qq -e trace=openat -o /dev/null true 2>/dev/null; then
     REUSE_WHY="off: strace cannot trace here (ptrace denied?)"
-  elif ! mkdir -p "$REUSE_DIR" 2>/dev/null; then REUSE_WHY="off: cannot create $REUSE_DIR"
+  elif ! mkdir -p "$REUSE_DIR/proof" 2>/dev/null; then REUSE_WHY="off: cannot create $REUSE_DIR"
   else REUSE_ON=1; REUSE_WHY="on ($REUSE_DIR)"; fi
   REUSE_MEMO="$LOGS/reuse-memo"; mkdir -p "$REUSE_MEMO"
 }
+
+# A READS entry's path: `data:` and `run:` mark what the proof key leaves out, `@` a listing.
+reuse_path() { local p="${1#data:}"; printf '%s' "${p#run:}"; }
 
 # Every file under one declared entry, as `f <path> <sha256>`, or `missing <path>`.
 # `$2` = fresh bypasses the per-run memo (the after-run re-key must see the tree as it is).
@@ -49,21 +59,82 @@ reuse_entry() {
   mv -f "$m.$BASHPID" "$m"; cat "$m"
 }
 
-# The manifest a key hashes: `reuse_manifest <fresh|memo> <row> <reads> <argv...>`.
-reuse_manifest() {
-  local mode="$1" name="$2" reads="$3" e a; shift 3
-  echo "gate-reuse v1"; echo "row $name"
+# The lines both manifests share: row, argv, a function row's body, platform, host, env.
+reuse_common() {
+  local name="$1" a; shift
+  echo "row $name"
   printf 'argv'; for a in "$@"; do a="${a//$REUSE_ROOTL/<root>}"; printf ' %s' "${a//$REUSE_ROOT/<root>}"; done; echo
   # A row given as a shell function is keyed on the function's body too.
   declare -F "$1" >/dev/null 2>&1 && declare -f "$1" | sed "s#$REUSE_ROOT#<root>#g"
   echo "platform $(uname -sm)"
   echo "host $(sha256sum < "$VL" | cut -c1-64)"
-  echo "seed $(sha256sum < "$SEED" | cut -c1-64)"
   env | LC_ALL=C sort | grep -E '^(VL_|SELFHOST_|LC_ALL=|LANG=|TZ=)' | sed "s#$REUSE_ROOTL#<root>#g; s#$REUSE_ROOT#<root>#g"
+}
+
+# The manifest a result key hashes: `reuse_manifest <fresh|memo> <row> <reads> <argv...>`.
+reuse_manifest() {
+  local mode="$1" name="$2" reads="$3" e; shift 3
+  echo "gate-reuse v2"
+  reuse_common "$name" "$@"
+  echo "seed $(sha256sum < "$SEED" | cut -c1-64)"
   for e in $REUSE_IMPLICIT $reads; do
     case "$e" in '!'*) continue ;; esac
+    reuse_entry "$(reuse_path "$e")" "$([ "$mode" = fresh ] && echo fresh)"
+  done | reuse_drop_excluded "$reads"
+}
+
+# The manifest a proof key hashes, `reuse_proof_manifest <fresh|memo> <row> <reads> <argv...>`:
+# the result key without the seed and the `data:`/`run:` entries, plus the READS text, the
+# seed's file-request modules and the two scans below.
+reuse_proof_manifest() {
+  local mode="$1" name="$2" reads="$3" e; shift 3
+  echo "gate-reuse proof v1"
+  reuse_common "$name" "$@"
+  echo "reads $reads"
+  for e in $REUSE_PROOF_IMPLICIT $reads; do
+    case "$e" in '!'*|data:*|run:*) continue ;; esac
     reuse_entry "$e" "$([ "$mode" = fresh ] && echo fresh)"
   done | reuse_drop_excluded "$reads"
+  reuse_scan "$reads"
+}
+
+reuse_proof_key() { echo "p$(reuse_proof_manifest "$@" | sha256sum | cut -c1-23)"; }
+
+# The two invariants that stand in for the data entries' content in a proof key.
+# `escape <file> <string>`: a quoted string with a `..` segment that, resolved against its own file's
+# directory, lands outside every declared path. `capable <file> <sha256>`: a file under a `run:`
+# entry (data the row executes) that can open files or start processes.
+reuse_scan() {
+  local reads="$1" decl="" e p data=() runs=()
+  for e in $REUSE_IMPLICIT $reads; do
+    case "$e" in '!'*|'@'*) ;; *) decl="$decl $(reuse_path "$e")" ;; esac
+  done
+  for e in $reads; do
+    case "$e" in data:*) data+=("${e#data:}") ;; run:*) data+=("${e#run:}"); runs+=("${e#run:}") ;; esac
+  done
+  [ ${#data[@]} -gt 0 ] || return 0
+  grep -rIHoE '"[^"]*\.\.[^"]*"' -- "${data[@]}" 2>/dev/null | awk -v decl="$decl" '
+    function norm(p,   n, a, i, o, k, s) {
+      n = split(p, a, "/"); k = 0
+      for (i = 1; i <= n; i++) {
+        if (a[i] == "" || a[i] == ".") continue
+        if (a[i] == "..") { if (k > 0) k--; else o[++k] = ".."; continue }
+        o[++k] = a[i]
+      }
+      s = ""; for (i = 1; i <= k; i++) s = s (i > 1 ? "/" : "") o[i]
+      return s
+    }
+    BEGIN { nd = split(decl, D, " ") }
+    {
+      c = index($0, ":"); f = substr($0, 1, c - 1); s = substr($0, c + 2); s = substr(s, 1, length(s) - 1)
+      d = f; sub(/\/[^\/]*$/, "", d); if (d == f) d = "."
+      r = norm(d "/" s); ok = 0
+      for (i = 1; i <= nd; i++) if (r == D[i] || index(r, D[i] "/") == 1) ok = 1
+      if (!ok) print "escape " f " " s
+    }' | LC_ALL=C sort -u
+  [ ${#runs[@]} -gt 0 ] || return 0
+  grep -rlIE 'std:(fs|process)"|__(fs|proc)_[a-z0-9_]*__' -- "${runs[@]}" 2>/dev/null | LC_ALL=C sort |
+    xargs -r -d '\n' sha256sum | awk '{ print "capable " $2 " " $1 }'
 }
 
 # Drop the `!path` exclusions (a row's own outputs under a declared directory) from a manifest.
@@ -77,18 +148,31 @@ reuse_drop_excluded() {
 
 reuse_key() { reuse_manifest "$@" | sha256sum | cut -c1-24; }
 
-# 0 when <key> holds a green result whose outside-the-repo reads are all unchanged.
-reuse_hit() {
-  local d="$REUSE_DIR/$1" kind sha p
-  [ -f "$d/ok" ] && [ -f "$d/log" ] && [ -f "$d/outside" ] || return 1
+# 0 when every outside-the-repo path recorded in <file> is as it was.
+reuse_outside_ok() {
+  local kind sha p
   while read -r kind sha p; do
     case "$kind" in
       file) [ -f "$p" ] && [ "$(sha256sum < "$p" | cut -c1-64)" = "$sha" ] || return 1 ;;
       present) [ -e "$p" ] && [ ! -f "$p" ] || return 1 ;;
       absent) [ ! -e "$p" ] || return 1 ;;
     esac
-  done < "$d/outside"
+  done < "$1"
   return 0
+}
+
+# 0 when <key> holds a green result whose outside-the-repo reads are all unchanged.
+reuse_hit() {
+  local d="$REUSE_DIR/$1"
+  [ -f "$d/ok" ] && [ -f "$d/log" ] && [ -f "$d/outside" ] && reuse_outside_ok "$d/outside"
+}
+
+# 0 when <pkey> holds a proof younger than GATE_REUSE_PROOF_DAYS whose outside reads hold.
+reuse_proof_ok() {
+  local d="$REUSE_DIR/proof/$1" days="${GATE_REUSE_PROOF_DAYS:-7}"
+  [ -f "$d/ok" ] && [ -f "$d/outside" ] || return 1
+  [ -n "$(find "$d/ok" -mmin "-$((days * 1440))" 2>/dev/null)" ] || return 1
+  reuse_outside_ok "$d/outside"
 }
 
 # The read check. Reads a strace log; prints `undeclared <kind> <path>` for each repo path the
@@ -98,7 +182,7 @@ reuse_audit() {
   local tr="$1" reads="$2" decl="" ex="" links="" e l
   local lsd=""
   for e in $REUSE_IMPLICIT $reads; do
-    case "$e" in '!'*) ex="$ex ${e#!}" ;; '@'*) lsd="$lsd ${e#@}" ;; *) decl="$decl $e" ;; esac
+    case "$e" in '!'*) ex="$ex ${e#!}" ;; '@'*) lsd="$lsd ${e#@}" ;; *) decl="$decl $(reuse_path "$e")" ;; esac
   done
   # In-repo symlinks (the shared cargo target, node_modules) map their real path back.
   while IFS= read -r l; do
@@ -238,10 +322,25 @@ reuse_audit() {
     }' "$tr"
 }
 
-# Runs one keyed row (a miss) under the read check and stores a green result.
-# `reuse_run <i> <key> <row> <reads> <argv...>`; prints the row's own output.
+# Stores a green result under <key>: `reuse_store <i> <key> <outside-file> <row> <reads> <argv...>`.
+# The row is re-keyed from the tree as it is now, so an input edited while it ran is not stored.
+reuse_store() {
+  local i="$1" key="$2" out="$3" name="$4" reads="$5" k2 d t; shift 5
+  k2=$(reuse_key fresh "$name" "$reads" "$@")
+  if [ "$k2" != "$key" ]; then echo "gate-reuse: not stored — a declared input changed while the row ran"; return 1; fi
+  # The staging dir is named once: `$BASHPID` inside a pipeline is another process.
+  d="$REUSE_DIR/$key"; t="$REUSE_DIR/$key.tmp.$BASHPID"
+  mkdir -p "$t" && cp "$out" "$t/outside" && cp "$LOGS/$i.log" "$t/log" &&
+    reuse_manifest memo "$name" "$reads" "$@" > "$t/manifest" &&
+    touch "$t/ok" && rm -rf "$d" && mv "$t" "$d" ||
+    { echo "gate-reuse: not stored — $REUSE_DIR could not be written"; rm -rf "$t"; return 1; }
+}
+
+# Runs one keyed row under the read check, and on a clean green run stores both its result
+# and the proof that its READS is complete. `reuse_run <i> <key> <pkey> <row> <reads> <argv...>`;
+# prints the row's own output.
 reuse_run() {
-  local i="$1" key="$2" name="$3" reads="$4" rc tr="$LOGS/$1.strace" au="$LOGS/$1.audit" k2 d n; shift 4
+  local i="$1" key="$2" pkey="$3" name="$4" reads="$5" rc tr="$LOGS/$1.strace" au="$LOGS/$1.audit" n p t; shift 5
   if declare -F "$1" >/dev/null 2>&1; then
     env VL="$VL" SEED="$SEED" LOGS="$LOGS" strace -f --seccomp-bpf -y -qq -o "$tr" -e trace="$REUSE_TRACE" \
       bash -c "$(declare -f "$1")"'; "$@"' _ "$@"
@@ -259,11 +358,6 @@ reuse_run() {
     grep '^undeclared ' "$au" | head -40 | sed 's/^undeclared /  /'
     return 96
   fi
-  k2=$(reuse_key fresh "$name" "$reads" "$@")
-  if [ "$k2" != "$key" ]; then echo "gate-reuse: not stored — a declared input changed while the row ran"; return 0; fi
-  # The staging dir is named once: `$BASHPID` inside the pipeline below is another process.
-  d="$REUSE_DIR/$key"; t="$REUSE_DIR/$key.tmp.$BASHPID"
-  mkdir -p "$t" || return 0
   # Each outside path as it is now: a file with its sha256, a directory as `present`, and a
   # path that does not exist as `absent` (a failed probe can still name a file, e.g. a PATH
   # entry that is not executable). A file read that has since gone is stored so it never hits.
@@ -272,10 +366,45 @@ reuse_run() {
     elif [ -e "$p" ]; then echo "present - $p"
     elif [ "$kind" = file ]; then echo "file gone $p"
     else echo "absent - $p"; fi
-  done > "$t/outside" &&
-    cp "$LOGS/$i.log" "$t/log" &&
-    reuse_manifest memo "$name" "$reads" "$@" > "$t/manifest" &&
-    touch "$t/ok" && rm -rf "$d" && mv "$t" "$d" ||
-    { echo "gate-reuse: not stored — $REUSE_DIR could not be written"; rm -rf "$t"; }
+  done > "$LOGS/$i.outside"
+  reuse_store "$i" "$key" "$LOGS/$i.outside" "$name" "$reads" "$@" || return 0
+  # The proof is re-keyed too: a code entry edited mid-run must not be recorded as proven.
+  [ "$(reuse_proof_key fresh "$name" "$reads" "$@")" = "$pkey" ] || return 0
+  p="$REUSE_DIR/proof/$pkey"; t="$p.tmp.$BASHPID"
+  mkdir -p "$t" && cp "$LOGS/$i.outside" "$t/outside" &&
+    reuse_proof_manifest memo "$name" "$reads" "$@" > "$t/manifest" &&
+    touch "$t/ok" && rm -rf "$p" && mv "$t" "$p" || rm -rf "$t"
   return 0
+}
+
+# Runs one keyed row untraced, its declaration already proven, and stores a green result with
+# the proof's outside reads. `reuse_run_plain <i> <key> <pkey> <row> <reads> <argv...>`.
+reuse_run_plain() {
+  local i="$1" key="$2" pkey="$3" name="$4" reads="$5" rc; shift 5
+  "$@"; rc=$?
+  [ $rc = 0 ] || return $rc
+  reuse_store "$i" "$key" "$REUSE_DIR/proof/$pkey/outside" "$name" "$reads" "$@"
+  return 0
+}
+
+# One keyed row, start to finish: `reuse_row <i> <row> <reads> <argv...>`. Writes the row's
+# output to `$LOGS/<i>.log` and how it was answered to `$LOGS/<i>.mode`; returns its rc.
+reuse_row() {
+  local i="$1" name="$2" reads="$3" key pkey rc hit=0 verify="${GATE_REUSE_VERIFY:-0}"; shift 3
+  key=$(reuse_key memo "$name" "$reads" "$@")
+  reuse_hit "$key" && hit=1
+  if [ $hit = 1 ] && [ "$verify" != 1 ]; then
+    { cat "$REUSE_DIR/$key/log"; echo "gate-reuse: reused $key"; } > "$LOGS/$i.log"
+    echo "reused $key" > "$LOGS/$i.mode"; return 0
+  fi
+  pkey=$(reuse_proof_key memo "$name" "$reads" "$@")
+  if [ "$verify" != 1 ] && reuse_proof_ok "$pkey"; then
+    reuse_run_plain "$i" "$key" "$pkey" "$name" "$reads" "$@" > "$LOGS/$i.log" 2>&1; rc=$?
+    echo "miss, proven $pkey" > "$LOGS/$i.mode"; return $rc
+  fi
+  reuse_run "$i" "$key" "$pkey" "$name" "$reads" "$@" > "$LOGS/$i.log" 2>&1; rc=$?
+  echo "miss, traced" > "$LOGS/$i.mode"
+  [ $rc != 0 ] && [ $hit = 1 ] &&
+    echo "gate-reuse: VERIFY FAILED — key $key holds a green result for this row and the fresh run is red, so its declaration misses an input" >> "$LOGS/$i.log"
+  return $rc
 }

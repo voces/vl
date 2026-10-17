@@ -104,8 +104,9 @@ fi
 if [ "$(date +%N)" != N ]; then now() { date +%s.%N; }
 else now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; fi
 # A row run as `READS="<paths>" run ...` is keyed (scripts/gate-reuse.sh): its green result
-# is reused while the seed, host, std and every declared path are unchanged, and a miss runs
-# under the read check, red on any repo path the declaration does not cover.
+# is reused while the seed, host, std and every declared path are unchanged. A miss runs
+# untraced when a proof holds for its declaration, and otherwise under the read check, red on
+# any repo path the declaration does not cover.
 run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1"); return 0; fi
         if [ "$GATE_MAX_PAR" -gt 0 ]; then
           while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait_any; done
@@ -115,16 +116,7 @@ run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1
           ( "$@" > "$LOGS/$i.log" 2>&1; rc=$?; now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!)
           return 0
         fi
-        ( key=$(reuse_key memo "$name" "$reads" "$@")
-          if reuse_hit "$key" && [ "${GATE_REUSE_VERIFY:-0}" != 1 ]; then
-            { cat "$REUSE_DIR/$key/log"; echo "gate-reuse: reused $key"; } > "$LOGS/$i.log"
-            echo "$key" > "$LOGS/$i.reused"; rc=0
-          else
-            reuse_hit "$key" && hit=1 || hit=0
-            reuse_run "$i" "$key" "$name" "$reads" "$@" > "$LOGS/$i.log" 2>&1; rc=$?
-            [ $rc != 0 ] && [ $hit = 1 ] &&
-              echo "gate-reuse: VERIFY FAILED — key $key holds a green result for this row and the fresh run is red, so its declaration misses an input" >> "$LOGS/$i.log"
-          fi
+        ( reuse_row "$i" "$name" "$reads" "$@"; rc=$?
           now > "$LOGS/$i.t"; times > "$LOGS/$i.cpu"; exit $rc ) & PIDS+=($!); }
 # `times` prints `<m>m<s>s <m>m<s>s`; sum both into seconds.
 cpusec() { local tot=0 p m x
@@ -209,7 +201,7 @@ run "lsp lint"                 deno lint --config lsp/deno.json lsp/src/
 # NOT SKIPPED UNDER GATE_FIXPOINT_PROVEN. The fuel and the profile need the pair's builds
 # anyway, and the fixpoint is a `cmp` of two files they leave, so re-proving it costs nothing.
 run "self-compile pair"        bash scripts/self-compile-pair.sh
-READS="compiler scripts tests/cases tests/fixtures tests/support bench @tests $LAST_JSON" \
+READS="scripts/lint-self.sh scripts/lint-filter.vl scripts/comment-budget-baseline.json scripts/interp-budget-baseline.json scripts/scan-budget-baseline.json scripts/ladder-budget-baseline.json scripts/sentinel-budget-baseline.json data:compiler data:scripts data:tests/cases data:tests/fixtures data:tests/support data:bench @tests $LAST_JSON" \
 run "lint-self + fmt"          bash scripts/lint-self.sh
 # The comment-budget, kind-ladder, sentinel-index, arena-scan and prefer-interpolation
 # RATCHETS are held inside "lint-self + fmt": each counts the findings that row's
@@ -237,7 +229,7 @@ run "no-python"                "$VL" run scripts/no-python.vl
 # contention cannot move it; CPU is graded only from runs a control says were quiet,
 # which inside this fan-out is usually none. ~20 s, plus ~12 s once per new seed while
 # the fuel engine's sidecar compiles. #3108, #3112, D2335 and D2336 are what it holds.
-READS="scripts/plumb-shape-cost.vl scripts/plumb-shape-baseline.json scripts/lib scripts/perf" \
+READS="scripts/plumb-shape-cost.vl scripts/lib scripts/perf data:scripts/plumb-shape-baseline.json" \
 run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler "$SEED" -- --check
 # The kind-ladder RATCHET rides "lint-self + fmt"; this row re-derives the lint's copy of
 # every closed set from the `export type` that declares it and FAILS on drift.
@@ -269,7 +261,7 @@ run "render-parse budget"      render_parse_budget
 # ~40 s, and it reds on the pre-#2419 compiler.
 run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
-READS="scripts/rep-fuzz-check.sh scripts/rep-fuzz-baseline.txt scripts/fuzz-vl.sh scripts/fuzzgen.vl" \
+READS="scripts/rep-fuzz-check.sh scripts/fuzz-vl.sh scripts/fuzzgen.vl data:scripts/rep-fuzz-baseline.txt" \
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
 READS="scripts/mono-tyaram-grid.sh scripts/mono-tyaram-cells.vl" \
 run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
@@ -288,7 +280,7 @@ run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 # `--self-test` first: the grader's outcome vocabulary and its `Want:` output rule are each
 # seen to fire on specimens before the rows are graded by them. The grader is the VL port;
 # the Python stays beside it, and tests/vl_check_filed_witnesses_test.ts holds them equal.
-READS="compiler scripts/check-filed-witnesses.vl scripts/lib docs/internals/inventory docs/internals/inventory-2" \
+READS="scripts/check-filed-witnesses.vl scripts/lib data:compiler run:docs/internals/inventory run:docs/internals/inventory-2" \
 run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/check-filed-witnesses.vl --compiler \"$SEED\" -- --strict docs/internals/inventory docs/internals/inventory-2"
 # THE OTHER HALF: a row that stopped EXISTING. #2405 resolved a conflict in the inventory's
 # tail and deleted a ROW, with its citations left standing, and every gate was green —
@@ -301,11 +293,11 @@ run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_t
 # of its rows had moved (one a compiler trap, one invalid wasm) and nothing was red (D2301).
 # `--floor` holds every probe to clause 1; a refusal passes, a trap or bad module does not.
 # Both run on `scripts/capability-probes.vl`.
-READS="compiler scripts/capability-probes.vl scripts/capability-probes scripts/lib" \
+READS="scripts/capability-probes.vl scripts/lib data:compiler run:scripts/capability-probes" \
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
-READS="scripts/silent-sweep/distilled scripts/lib $LAST_JSON" \
+READS="scripts/silent-sweep/distilled/regress.vl scripts/lib run:scripts/silent-sweep/distilled $LAST_JSON" \
 run "distilled corpus"         "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 
 # ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
@@ -335,8 +327,8 @@ for i in "${!PIDS[@]}"; do
   el=$(awk -v f="$fin" -v s="${STARTS[$i]}" 'BEGIN { print f - s }')
   cpu=$(cpusec $(tail -1 "$LOGS/$i.cpu" 2>/dev/null))
   [ -n "$cpu" ] || cpu=0
-  if [ $rc -eq 0 ] && [ -f "$LOGS/$i.reused" ]; then
-    printf '%-22s %7.1fs %7.1fs  ok (reused %s)\n' "${NAMES[$i]}" "$el" "$cpu" "$(cat "$LOGS/$i.reused")"
+  if [ $rc -eq 0 ] && [ -f "$LOGS/$i.mode" ]; then
+    printf '%-22s %7.1fs %7.1fs  ok (%s)\n' "${NAMES[$i]}" "$el" "$cpu" "$(cat "$LOGS/$i.mode")"
   elif [ $rc -eq 0 ]; then printf '%-22s %7.1fs %7.1fs  ok\n' "${NAMES[$i]}" "$el" "$cpu"
   else FAIL=1; printf '%-22s %7.1fs %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$cpu" "$rc" "$LOGS/$i.log"; fi
 done
