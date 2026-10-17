@@ -237,7 +237,9 @@ Everything above runs natively on Windows, with Git for Windows supplying the sh
   8, 332 s; 6, 306 s; 4, 333 s.
 - Set `VL_BINARYEN` to a directory of binaryen's native release (the version in
   `package.json`) and the suites use it instead of npm's JS build. The output is
-  byte-identical, `-O` is about 5x faster, and each call skips node's start-up.
+  byte-identical, `-O` is about 5x faster, and each call skips node's start-up. On Linux
+  and macOS `gate.sh` sets it itself from `scripts/fetch-binaryen.sh`, which downloads the
+  pinned release once into `~/.cache/vl`; Windows has no pinned build there.
 - `gate.sh`'s CPU column reads 0 here. Git Bash's `times` cannot see a native child's CPU,
   and no gate grades on that column.
 
