@@ -12,7 +12,8 @@ instruction wherever wasm has an `_s`/`_u` pair. Wasm itself makes the same spli
 unsigned types, only unsigned instructions. VL's `u8` already does the same thing for storage.
 
 Section 5 holds the questions for the owner, one per decision, each with a sample per option
-and a recommendation. Sections 1 to 4 are the evidence behind them.
+and a recommendation; U5 to U14 are awaiting ruling. Sections 1 to 4 are the evidence behind
+them. Section 6 is the smallest build that unblocks eardstap's EV-001 (splitmix64 over `u64`).
 
 ---
 
@@ -661,156 +662,393 @@ U + I              // error anyway: u64 + i64 has no common type
 **Recommendation: (a).** It is Rust's, Go's and Zig's rule, and it already falls out of VL's
 lattice.
 
-### U5. Does `u32` join numeric unions like every other number?
+### What the open questions build on: today's behaviour
+
+U5 to U14 below are **awaiting ruling**. Each samples what a user would write under each option.
+The block below is not an option: it was run on 2026-10-17 with `dist/vl run` (master
+`15bd386db`), and each comment quotes what the line printed:
 
 ```vl
-// (a) a union, as the numeric-join ruling does for i32 and f64
-function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
-const r = pick(true, 7, 9)             // r: i32 | u32
-print(r is u32)                        // true
-const w: i64 = r                       // ok — every member widens to i64 exactly
-
-// (b) join to the widest exact type
-function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
-const r = pick(true, 7, 9)             // r: i64
-print(r is u32)                        // error — r is not a union
-const w: i64 = r                       // ok
+let b: i64 = 0x7FFFFFFFFFFFFFFF
+print(b + 1)                       // -9223372036854775808   — i64 wraps
+let q: i64 = -1
+print(q >> 60)                     // -1                     — shr_s
+print(q >>> 60)                    // 15                     — shr_u
+print(divU(q, 3))                  // 6148914691236517205
+print(q as% i32)                   // -1                     — low 32 bits
+let big: i64 = 9007199254740993
+print(big as f64)                  // 9007199254740992       — i64 → f64 rounds
+print(big as? f64)                 // 9007199254740992       — and as? does not refuse it
+function g(c: boolean, a: i32, x: i64) { if c { a } else { x } }
+print(g(true, 1, 5) is i32)        // true                   — a mixed numeric join is a union
+print(__trunc_sat_f64_u_i32__(3.0e9))   // -1294967296       — the u32 bits, typed i32
+let i = 300
+print(i as% u8)                    // 44
+print(i as? u8)                    // null
+type Rng = { state: u64 }          // unknown type 'u64' for field 'state'; did you mean 'i64'?
 ```
 
-**Recommendation: (a).** This is the numeric-join ruling with two more members. It needs new box
-tags (3.3).
+The Rust, Go and Zig rows in each recommendation come from section 1.5. "Consumers" names the
+programs whose source today contains the idiom the question decides, from section 4's counts and
+a read of `~/eardstap` and `~/diderven` on 2026-10-17. eardstap's `src/core/rng.vl` and
+diderven's `src/rng.vl` both hash and xorshift over `i32` with `>>>`.
 
-### U6. Overflow?
+### U5. Does a join of a `u32` with a signed number make a union? — awaiting ruling
+
+**Question.** When `if`/`match` arms, `??` or a list literal mix a runtime `u32`/`u64` with
+a different number type, what is the result's type?
+
+```vl
+function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
+
+// (a) a union, as the numeric-join ruling does for i32 and f64 (and i32 and i64 today)
+const r = pick(true, 7, 9)       // r: i32 | u32
+print(r is u32)                  // true
+const w: i64 = r                 // ok — every member widens to i64 exactly
+const n: i32 = r                 // error: u32 does not convert to i32 exactly — write `as`
+
+// (b) the widest exact type
+const r = pick(true, 7, 9)       // r: i64
+print(r is u32)                  // error: r is i64, not a union
+
+// (c) refused, as Rust, Go and Zig refuse arms of different type
+function pick(c: boolean, u: u32, i: i32) { if c { u } else { i } }
+// error: the arms are u32 and i32 — write `i as u32` or annotate the result
+```
+
+**Recommended: (a).** It is the numeric-join ruling of 2026-09-30 with two more members, and
+the probe above shows `i32` with `i64` already joins to a union today. (c) is the
+Rust/Go/Zig answer (Zig's peer resolution does give `u32` with `i64` the type `i64`, and
+refuses `u32` with `i32`), but the owner rejected "runtime values must agree" for VL because
+it requires annotations. (b) makes `is u32` depend on which arm ran. The cost of (a) is two
+new box tags (3.3), and a phase-1 build may refuse a mixed join loudly until phase 2.
+
+**Consumers.** None today; no consumer names `u32`. plumb's generator would meet it first, if
+it emits `u32` registers alongside `i64` (3.5, item 5). splitmix64 (EV-001) does not join.
+
+### U6. What does overflow do in `u32`/`u64` arithmetic? — awaiting ruling
+
+**Question.** What do `+`, `-`, `*` and `<<` on `u32`/`u64` produce when the true result
+does not fit?
 
 ```vl
 const u: u32 = 0
-// (a) wrap, as i32 and i64 do
-print(u - 1)       // 4294967295
-// (b) trap (Swift)
-print(u - 1)       // trap
-// (c) trap in a debug build, wrap in release (Rust)
-print(u - 1)       // trap under a debug build, 4294967295 under -O
+let x = u
+// (a) wrap modulo 2^32 / 2^64, as i32 and i64 do today
+print(x - 1)        // 4294967295
+// (b) trap, as Swift does
+print(x - 1)        // trap: unsigned overflow
+// (c) trap in a debug build, wrap under -O, as Rust does
+print(x - 1)        // trap without -O, 4294967295 with -O
 ```
 
-**Recommendation: (a).** Wrap matches the standing ruling for `i32`/`i64`.
+**Recommended: (a), wrap.** The determinism rulings already make `i32`/`i64` wrap, and the
+probe shows `i64` max + 1 wraps today. A `u32` that traps where `i32` wraps would make the
+safer-looking type the slower one, and `add`/`sub`/`mul` are the same wasm instruction for
+both. Go wraps. Rust wraps in release builds. Zig calls it illegal behaviour and spells wrap
+`+%`; VL's `as%` is the nearest analogue, and VL has no `+%`. A checked form belongs in the
+`std:math` checked helpers that the determinism ruling already filed, not in the operator.
 
-### U7. Unary minus on an unsigned operand?
+**Consumers.** eardstap EV-001: splitmix64 is defined by wrapping `*` and `+` mod 2^64.
+glean's RNG and hashes, sunpa's mulberry32 and noise hashes, and the `hash3`/xorshift in
+eardstap and diderven all depend on wrapping multiplies; today they do it at `i32`.
+
+### U7. Is unary minus allowed on an unsigned operand? — awaiting ruling
+
+**Question.** Does `-u` with `u: u32` compile, and if so what does it mean?
 
 ```vl
-const u: u32 = 5
-// (a) refused (Rust)
-print(-u)          // error — write `0 - u`, which wraps
-// (b) allowed, wrapping (Go)
-print(-u)          // 4294967291
+let u: u32 = 5
+// (a) refused, as Rust and Zig refuse it
+print(-u)           // error: unary '-' is not defined for u32 — write `0 - u`, which wraps
+// (b) allowed and wrapping, as Go does
+print(-u)           // 4294967291
+// (c) refused, with a wrapping negation as its own spelling, as Zig's `-%u` is
+print(-u)           // error
+print(-%u)          // 4294967291   (a new operator)
 ```
 
-**Recommendation: (a).** A negated unsigned value is nearly always a mistake, and the deliberate
-spelling is one token longer.
+**Recommended: (a).** A negated unsigned value is nearly always a slip, and `0 - u` already
+says "wrap" in one more token. (c) adds an operator for one use when `0 - u` does the same
+thing. A negative literal is unaffected: `let u: u32 = -1` is already refused by U3's literal
+rule (`constant -1 overflows u32`).
 
-### U8. How does `print` render a `u64`?
+**Consumers.** None found. The idiom that would want it, `x & -x` (lowest set bit), does not
+occur in any consumer listed in section 4, nor in eardstap or diderven.
+
+### U8. How does `print` render a `u64`? — awaiting ruling
+
+**Question.** `print(u32)` widens into the existing `__print_i64__`, but no host import renders
+a value at or above 2^63. Which lowering prints a `u64`?
 
 ```vl
-const m: u64 = 0xFFFFFFFFFFFFFFFF
-print(m)           // every option prints 18446744073709551615; they differ in the lowering
+let m: u64 = 0xFFFFFFFFFFFFFFFF
+print(m)            // every option prints 18446744073709551615; they differ in the lowering
 
-// (a) a new host import — the emitted call:
-//       __print_u64__(m)            (the native host, JS runtime and playground each add it)
-// (b) an emitted helper over the existing imports — the emitted shape:
-//       if m >= 0 as i64 { __print_i64__(m) }
-//       else { /* divU(m, 10) then the last digit, through the print stream */ }
-// (c) lowered through std:fmt — the emitted shape:
-//       print(toString(m))          (toString's domain gains u32 | u64, see U14)
+// (a) a new host import:          __print_u64__(m)
+//     the native host, the JS runtime and the playground each add it
+// (b) an emitted helper over existing imports:
+//     if (m as% i64) >= 0 { __print_i64__(m) } else { print divU(m, 10), then the last digit }
+// (c) lowered through std:fmt:     print(toString(m))   — toString's domain gains u64 (U14)
+// (d) refused until one of the above is built:
+print(m)            // error: print of u64 is not built yet — print `m as% i64` or `"\{…}"`
 ```
 
-**Recommendation: (c).** It needs no host ABI change and reuses one rendering path. `u32`
-needs none of this: it extends into `__print_i64__`.
+**Recommended: (c).** It changes no host ABI and keeps one decimal renderer, and string
+interpolation already depends on `std:fmt`. Rust, Go and Zig all format integers in their
+library (`Display`, `fmt`, `std.fmt`); none asks the platform to. (b) needs two writes per
+line, which the print stream is not verified to accept. (d) is acceptable only as a phase-1
+stopgap, and it is a clause-2 refusal while it stands.
 
-### U9. Comparisons between signed and unsigned operands?
+**Consumers.** eardstap, and any test that prints a hash or seed. glean's `le64` values would
+print through it once they are `u64`. EV-001's slice can avoid it (section 6).
+
+### U9. May a comparison mix signed and unsigned operands? — awaiting ruling
+
+**Question.** Are `<`, `<=`, `>` and `>=` between a `u32` and an `i32` (or `u64` and `i64`)
+refused like the other operators, or given exact meaning?
 
 ```vl
-// (a) same signedness or a literal; u < 0 gets a warning lint
-u < i              // error
-u < 10             // ok (lt_u)
-u >= 0             // warning: always true
-
-// (b) mixed comparisons are mathematically exact
-u < i              // compares as i64: false when i is negative
+let u: u32 = 3000000000
+let i: i32 = -1
+// (a) U4's rule for every comparison, == included; a lint flags the always-true compares
+print(u < i)        // error: '<' is not defined for u32 and i32 — write `i as u32` or `u as i32`
+print(u == i)       // error, the same message
+print(u < 10)       // false   (lt_u)
+print(u >= 0)       // true, with warning: an unsigned value is always >= 0
+// (b) mathematically exact, as Zig and C++20 `std::cmp_less` are
+print(u < i)        // false   — compared as i64; at 64 bits, `i < 0 || i as% u64 > u`
+print(u == i)       // false
+// (c) relational compares refused, `==`/`!=` allowed on the bits, as AssemblyScript does
+print(u < i)        // error
+print(u == i)       // false here, but true when u is 4294967295 and i is -1
 ```
 
-**Recommendation: (a), with the lint.** It is U4's rule, and AssemblyScript's for relational
-compares.
+**Recommended: (a), with the lint.** It is U4 applied to one more family of operators,
+including `==`. Rust and Go refuse every mixed compare, `==` too; Zig accepts them and answers
+exactly, which is (b). (b) is defensible but makes comparisons the one exception to U4, and its
+64-bit form costs a branch the user did not write. (c) is wasm's view (`eq` is sign-agnostic),
+but it makes `==` the one operator that compares bits rather than values.
 
-### U10. Should the saturating truncations return unsigned types?
+**Consumers.** plumb's hand-written parsers (15 `ltU`-family calls in `src/`) and its generated
+carry compares (809 `ltU` in one unit), which stay on `i64` under U12. No consumer compares a
+`u32` today.
+
+### U10. Do the unsigned saturating truncations return `u32`/`u64`? — awaiting ruling
+
+**Question.** `__trunc_sat_f64_u_i32__` and its three `_u` siblings return the unsigned
+result as `i32`/`i64` bits. Should they be retyped to `u32`/`u64`?
 
 ```vl
-const f = 3.0e9
-// (a) unchanged: the _u intrinsics keep their i32/i64 results
-const a = __trunc_sat_f64_u_i32__(f)   // a: i32, prints -1294967296
+let f = 3.0e9
+// (a) unchanged — today it prints -1294967296
+const a = __trunc_sat_f64_u_i32__(f)   // a: i32
 const b = a as% u32                    // 3000000000
-// (b) retyped: the _u intrinsics return u32/u64
+// (b) retyped
 const a = __trunc_sat_f64_u_i32__(f)   // a: u32, prints 3000000000
+// (c) unchanged, and the saturating u32 conversion is a std:math function
+const a = truncSatU32(f)               // a: u32 (a new std export, through std-api-review)
 ```
 
-**Recommendation: (a).** (b) changes an existing intrinsic's signature, and any current caller
-that combines the result with an `i32` would then be refused under U4.
+**Recommended: (a).** It changes no signature, and `as% u32` recovers the unsigned reading
+in one cast. (b) would turn any caller that mixes the result with an `i32` into a U4 error.
+(c) is the Rust shape (`as` from a float saturates, since 1.45), but VL's `f64 as u32` is the
+exact trio (2.8), and a saturating twin is a new std name with no consumer asking. Go leaves
+an out-of-range float-to-int conversion implementation-defined, and Zig's `@intFromFloat` is
+illegal behaviour out of range; neither has a saturating spelling in the operator.
 
-### U11. May a `u8[]` element deliver into `u32` without a cast?
+**Consumers.** None. plumb is the only consumer that calls any `__trunc_sat_*__` intrinsic
+(17 calls), and every one is a signed `_s` form.
+
+### U11. May a `u8[]` element read deliver into `u32`/`u64` without a cast? — awaiting ruling
+
+**Question.** A `u8[]` read is an `i32` in 0..255. Does it convert implicitly to `u32` and
+`u64`, which `i32` does not (U2)?
 
 ```vl
-const b: u8[] = [200]
-// (a) the read adapts like a literal
-let w: u32 = b[0]          // ok
+const b: u8[] = [200, 1]
+// (a) the read adapts to u32/u64 the way a literal does
+let w: u32 = b[0]                       // ok
+let x: u64 = (b[0] as u64) << 56        // the cast is still needed where nothing names u64
 // (b) the read is i32, so it needs a cast that cannot fail
-let w: u32 = b[0] as u32
+let w: u32 = b[0]                       // error: i32 does not convert to u32 — write `as u32`
+let w: u32 = b[0] as u32                // ok
 ```
 
-**Recommendation: (a).** The value is 0..255 by construction.
+**Recommended: (a).** The value is in range by construction, which is what made `u8` storage
+honest under the 2026-08-22 ruling, and the `as u32` in (b) would carry failure paths that
+never run. Zig agrees: `u8` coerces to `u32` implicitly. Rust and Go need an explicit
+conversion (`u32::from(b)`, `uint32(b)`), but they have no implicit widening at all, and
+U2 already put VL on Zig's side.
 
-### U12. What happens to `divU`, `remU`, `ltU`/`leU`/`gtU`/`geU`?
+**Consumers.** glean's byte readers (231 widen-then-mask sites, mostly the `le32`/`le64`
+helpers), plumb's file parsers (`pdb.vl`, `dxbc.vl`, `avi.vl`, each with its own `u32`
+function), and sunpa's PNG writer.
+
+### U12. What happens to `divU`, `remU`, `ltU`/`leU`/`gtU`/`geU` and `>>>`? — awaiting ruling
+
+**Question.** Once `u32`/`u64` exist, do the unsigned intrinsics stay as they are, go, or
+change type?
 
 ```vl
-// (a) keep them; on an unsigned operand an info lint suggests the operator
-divU(i, 3)          // i: i32 — unchanged
-divU(u, 3)          // u: u32 — hint: this is `u / 3`
-
-// (b) deprecate them
-divU(i, 3)          // warning: deprecated — write `(i as% u32) / 3`
-                    // plumb's generator emits ~800 such calls per unit
-
-// (c) retype them over the unsigned types
-divU(i, 3)          // error: divU takes u32 — every current call breaks
-divU(u, 3)          // ok
+let i: i32 = -1
+let u: u32 = 7
+// (a) kept for i32/i64; accepted on u32/u64 with an info-tier hint
+print(divU(i, 3))   // 1431655765, as today
+print(divU(u, 3))   // 2 — hint: on u32 this is `u / 3`
+// (b) deprecated
+print(divU(i, 3))   // warning: deprecated — write `(i as% u32) / 3`
+// (c) retyped over the unsigned types
+print(divU(i, 3))   // error: divU takes u32 — every current call breaks
 ```
 
-**Recommendation: (a).** They are the right tool for an `i64` that carries both readings, which
-is plumb's register model.
+**Recommended: (a).** They are the right tool for a word that carries both readings, which is
+plumb's register model. They are compiler intrinsics, not std exports, but VL has no
+deprecation story for either, and (c) breaks every caller. Rust, Go and Zig have no such
+intrinsics: they cast to the unsigned type at each use, which is the `as% u32` spelling (b)
+would force on every plumb unit. `>>>` stays an operator; on `u32` it is the same
+instruction as `>>`.
 
-### U13. `u16`, `i8` and `i16`?
+**Consumers.** plumb: its generator emits `ltU`/`leU`/`divU`/`remU` into every unit (809 `ltU`
+in one), and `src/` calls them 23 times. glean, sunpa, eardstap and diderven use `>>>` only.
+
+### U13. Do `u16`, `i8` and `i16` become value types? — awaiting ruling
+
+**Question.** Should the narrow widths, which exist today only as `flat` field widths, become
+value types beside `u32`/`u64`?
 
 ```vl
 // (a) out of scope: still flat-field widths only
 flat type H = { kind: u16 }    // ok, as today
 let x: u16 = 5                 // error, as today
-// (b) value types, i32-repped
-let x: u16 = 5                 // the rep would hold 70000 after `x * 14000`
+// (b) value types that mask after every operation, as Rust, Go and Zig do
+let x: u16 = 60000
+print(x + 10000)               // 4464 — an extra `& 0xFFFF` after each operator
+// (c) value types on an i32 rep with no masking
+let x: u16 = 60000
+print(x + 10000)               // 70000 — a u16 holding a value outside 0..65535
 ```
 
-**Recommendation: (a).** (b) is exactly the "lying" value type the 2026-08-22 ruling refused.
-Packed `u16[]`/`i16[]` arrays are a separate storage-only proposal.
+**Recommended: (a).** (c) is the value type that lies about its range, which the 2026-08-22
+ruling refused. (b) is honest and is what Rust, Go and Zig do, but it adds a mask or sign
+extension after every arithmetic operator and a third set of opcode choices, and no
+consumer has asked for it. Packed `u16[]`/`i16[]` arrays (WasmGC `i16` storage) are honest the
+way `u8[]` is, and are a separate storage-only proposal.
 
-### U14. Which std additions, through std-api-review?
+**Consumers.** plumb reads 16-bit quantities through `__load_u16__` or `loadU16` in 15 `src/`
+files (`inflate.vl`, `crc.vl` and `render.vl` among them), and glean in 5 (`src/mpq.vl` among them). All of them
+work at `i32` today, and neither declares a `u16`/`i16` `flat` field.
+
+### U14. Which std additions follow, through std-api-review? — awaiting ruling
+
+**Question.** Which new std exports, if any, ship with the type?
 
 ```vl
-// (a) add them in phase 3, each through std-api-review
+let u: u32 = 7
+// (a) std:fmt and std:bytes together, each through std-api-review
 import { u32le, u64le } from "std:bytes"     // new
 import { parseU32, parseU64 } from "std:fmt" // new
 print("\{u}")                                // toString's domain gains u32 | u64
-
-// (b) leave std untouched until a consumer files an ask
+// (b) only toString's domain, which interpolation and U8 (c) need; the rest waits for an ask
+print("\{u}")                                // ok
+import { u32le } from "std:bytes"            // error: no export u32le
+// (c) leave std untouched until a consumer files an ask
 const w = (b.i32le(0) as i64) & 0xFFFFFFFF   // the glean idiom stays the spelling
 print("\{u}")                                // error: toString takes i32 | i64 | boolean | f64
 ```
 
-**Recommendation: (a), `std:fmt` and `std:bytes` together.** Interpolation needs `std:fmt`, and
-`std:bytes` is the glean helper, whose absence is currently a documented rule. `std:buffer`'s
-`loadU32` is the reviewer's call, given that `loadU16` already returns an `i32`.
+**Recommended: (a).** Interpolation of a `u32` needs `std:fmt`, and the `std:bytes` helper is
+the one glean wrote 231 times, whose absence `std:bytes`' header currently states as a rule.
+Rust, Go and Zig all ship unsigned parse, format and byte-order reads in their standard
+libraries. `std:buffer`'s `loadU32`/`loadU64` are the reviewer's call, because `loadU16`
+already returns an `i32`. (b) is the narrowest order consistent with U8 = (c), if the owner
+wants std to wait for asks.
+
+**Consumers.** glean (`le32`/`le64`), plumb's five `u32` helpers, sunpa's `unsigned(x): f64`,
+and every consumer that interpolates a `u32`.
+
+---
+
+## 6. Minimum slice for EV-001
+
+eardstap's EV-001 is `type Rng = { state: u64 }` refused as an unknown type, for splitmix64.
+The goal of this slice is that program, and nothing broader.
+
+**Today's workaround runs.** splitmix64 needs only wrapping `+`, `*`, `^` and a logical right
+shift, and `i64` with `>>>` has all four. This program, run the same way, prints the
+reference sequence for seed 0 as signed bits (`0xE220A8397B1DCDAF`, `0x6E789E6AA1B965F4`):
+
+```vl
+type Rng = { state: i64 }
+function next(r: Rng): i64 {
+  r.state = r.state + 0x9E3779B97F4A7C15
+  let z = r.state
+  z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9
+  z = (z ^ (z >>> 27)) * 0x94D049BB133111EB
+  z ^ (z >>> 31)
+}
+const r: Rng = { state: 0 }
+print(next(r))                                   // -2152535657050944081
+print(next(r))                                   // 7960286522194355700
+const v = next(r)
+print((v >>> 11) as f64 / 9007199254740992.0)    // 0.026433771592597743
+print(v as% i32)                                 // -2146876081
+```
+
+So the bits are already right. What `u64` adds is the spelling eardstap tried, `>>` instead of
+`>>>`, and a type that cannot meet a signed `/` or `<` by accident.
+
+**The target program.**
+
+```vl
+type Rng = { state: u64 }
+function next(r: Rng): u64 {
+  r.state = r.state + 0x9E3779B97F4A7C15
+  let z = r.state
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+  z ^ (z >> 31)
+}
+function unit(r: Rng): f64 { (next(r) >> 11) as f64 / 9007199254740992.0 }
+function small(r: Rng): i32 { next(r) as% i32 }
+```
+
+**Rulings it needs.** U1 to U4 are ruled and cover it: the type (U1), `as`/`as%` to `f64`
+and `i32` (U2), the literal `0x9E3779B97F4A7C15` taking its bit pattern at `u64` (U3; as a
+`u64` it is 11400714819323198485, the same bits as today's -7046029254386353131), and the
+literal operands of `*` and the shift counts (U4's two exceptions).
+
+**Open questions it depends on.**
+
+* **U6 (overflow) is required.** splitmix64 is defined by wrapping `+` and `*`.
+* **U8 (print) only if the program prints a `u64`.** The target program prints through `f64` or
+  `i32`, so a phase-1 build can refuse `print(u64)` loudly and still unblock EV-001. If U8 is
+  (c), printing also needs U14's `toString` domain.
+* **Not needed:** U5 (the program joins nothing), U7 (no negation), U9 (no comparison), U10,
+  U11, U12, U13. U14 only through U8.
+
+**One fact the slice relies on that no question settles.** `u64 as f64` rounds (2.8), as
+`i64 as f64` does today; the probe above shows `as?` does not refuse a rounding `i64 → f64`
+either. The `>> 11` keeps the value below 2^53, so the slice is exact whichever way that is
+later decided.
+
+**Build steps, smallest first.** Each is phase 1 of section 3.4, cut to `u64` scalars:
+
+1. Admit `u64` as a `PrimName` in local, parameter, return and struct-field position, with the
+   rep normaliser of 3.1 mapping it to `i64`. A `u64` in a union, list, map value or
+   generic argument is a loud capability refusal until phase 2, never a fall-through.
+2. Literal adaptation at a `u64` destination: a decimal fits in 0..2^64−1; a radix literal is
+   its 64-bit pattern.
+3. Operators. `+ - * & | ^ <<` reuse the `i64` instructions. `>>` emits `i64.shr_u`. `/`, `%`
+   and the four compares emit the `_u` instructions, or refuse loudly. Leaving them on the
+   signed default would be valid wasm with a wrong value (3.5, risk 1).
+4. U4's mixed-operand refusal, with the literal and shift-count exceptions.
+5. `as% i32` (`i32.wrap_i64`), `as f64` (`f64.convert_i64_u`) and `as` to and from `i64`
+   (the exact trio: a `u64` value at or above 2^63 fails `as i64`).
+6. `print(u64)`: built per U8, or refused loudly.
+7. Fixtures in both faces (annotated, and `let z = r.state` inferred), each printing a value
+   only the unsigned instruction produces, such as `0xFFFFFFFFFFFFFFFF >> 60` → 15, plus a
+   `scripts/capability-matrix.vl` template for `u64` and its un-annotated twin.
+
+`u32` follows the same steps with the `i32` instructions, plus the three U2 edges. It is not
+needed for EV-001.
