@@ -3,8 +3,9 @@
 // per slot: every write fills each slot, a call reads the slot of its argument types, and any
 // other read (a delivery by value) reads a slot of its own. The emitter refuses such a binding
 // and asks for it here; the driver then checks the program again to plan the slots, and
-// compiles a third time with the plan applied to the fresh parse. A program the emitter never
-// refuses runs none of this, so its output is unchanged.
+// compiles a third time with the plan applied to the fresh parse. A function returning a
+// generic its results call at two types is planned the same way, as a copy per result type.
+// A program the emitter never refuses runs none of this, so its output is unchanged.
 import {
   ArrayLit,
   BinExpr,
@@ -41,7 +42,7 @@ import {
   tyToStr,
 } from "./check_types"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
-import { reparseArrowLambdaAt } from "./parser"
+import { reparseArrowLambdaAt, reparseFuncDeclAt } from "./parser"
 import { declOrigOf, identDeclOf } from "./symbols"
 
 // The pass the driver is running: an ordinary compile, the planning check, or the compile
@@ -72,6 +73,9 @@ let pwValSrc: i32[] = []
 let pwValName: string[] = []
 let prIdent: i32[] = []
 let prName: string[] = []
+// A copy of function `pfAnchor` named `pfName` goes after it.
+let pfAnchor: i32[] = []
+let pfName: string[] = []
 
 function fsPlanReset(): i32 {
   pdAnchor = []
@@ -86,6 +90,8 @@ function fsPlanReset(): i32 {
   pwValName = []
   prIdent = []
   prName = []
+  pfAnchor = []
+  pfName = []
   0
 }
 
@@ -319,7 +325,95 @@ function fsValuePeer(v: i32): i32 {
     return -1
   }
   if n is FuncDecl && n.fnName == "" { return -1 }
-  fsExcluded(-2, "a value that is not a name or a lambda")
+  const ia = fsIdentityArg(v)
+  if ia >= 0 && letDeclOfRead(ia) < 0 { return -1 }
+  fsExcluded(
+    -2,
+    "a value that is not a name, a lambda or a name through an identity call",
+  )
+}
+
+// The argument node call `c` hands back unchanged, or -1. The callee is a declared function
+// whose every return, its last statement among them, reads one never-written parameter bare,
+// and the argument there is a name, so a slot can hold that name's value without the call.
+function fsIdentityArg(c: i32): i32 {
+  if c < 0 || c >= fsParseLen { return -1 }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return -1 }
+  const fd = identDeclOf(cn.callFn)
+  if fd < 0 || fd >= fsParseLen { return -1 }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) || f.fnName == "" { return -1 }
+  if cn.callArgs.length != f.fnParams.length { return -1 }
+  for nm in cn.callArgNames {
+    if nm != "" { return -1 }
+  }
+  if f.fnBody < 0 || f.fnBody >= P.nodes.length { return -1 }
+  const body = P.nodes[f.fnBody]
+  if !(body is Block) || body.blkStmts.length == 0 { return -1 }
+  const last = P.nodes[body.blkStmts[body.blkStmts.length - 1]]
+  if !(last is RetStmt) || last.retArg < 0 || !(P.nodes[last.retArg] is Ident) {
+    return -1
+  }
+  const par = identDeclOf(last.retArg)
+  let p = 0
+  while p < f.fnParams.length && f.fnParams[p] != par { p = p + 1 }
+  if p == f.fnParams.length { return -1 }
+  let i = 0
+  while i < fsParseLen {
+    const rn = P.nodes[i]
+    if rn is RetStmt && fsEnclosingFn(i) == fd {
+      if (
+        rn.retArg < 0
+        || !(P.nodes[rn.retArg] is Ident)
+        || identDeclOf(rn.retArg) != par
+      ) {
+        return -1
+      }
+    }
+    i = i + 1
+  }
+  for r in fsIdents {
+    if identDeclOf(r) == par && fsParent[r] >= 0 {
+      const w = P.nodes[fsParent[r]]
+      if (
+        w is BinExpr
+        && w.binLeft == r
+        && (w.binOp == "=" || w.binCompound != "")
+      ) {
+        return -1
+      }
+    }
+  }
+  const arg = cn.callArgs[p]
+  if !(P.nodes[arg] is Ident) { return -1 }
+  arg
+}
+
+// The nearest function or lambda enclosing node `n`, or -1.
+function fsEnclosingFn(n: i32): i32 {
+  let q = fsParent[n]
+  while q >= 0 && !(P.nodes[q] is FuncDecl) { q = fsParent[q] }
+  q
+}
+
+// The un-annotated binding that identifier `a`, an argument of an identity call, initializes
+// through that call; -1 when it is not one.
+function fsIdentityLetOf(a: i32): i32 {
+  const c = fsParent[a]
+  if c < 0 || fsIdentityArg(c) != a { return -1 }
+  const d = fsParent[c]
+  if d < 0 { return -1 }
+  const dn = P.nodes[d]
+  if dn is LetDecl && dn.letInit == c && dn.letType < 0 { return d }
+  -1
+}
+
+// The node a slot past the first copies for value `v`: an identity call's argument, else `v`.
+function fsSlotSrc(v: i32): i32 {
+  const a = fsIdentityArg(v)
+  if a >= 0 { return a }
+  v
 }
 
 function fsStmtParentOk(s: i32): boolean {
@@ -333,11 +427,107 @@ function fsStmtParentOk(s: i32): boolean {
 export function fsPlan(root: i32): i32 {
   fsPlanReset()
   fsWalk(root)
+  // A generic read refused as an identity call's argument asks for the binding it initializes.
+  let ai = 0
+  while ai < fsAsks.length {
+    const a = fsAsks[ai]
+    if a >= 0 && a < P.nodes.length && P.nodes[a] is Ident {
+      const d = fsIdentityLetOf(a)
+      if d >= 0 && !hasI32(fsAsks, d) { fsAsks.push(d) }
+    }
+    ai = ai + 1
+  }
+  let anyLet = false
+  for a in fsAsks {
+    if a >= 0 && a < P.nodes.length && P.nodes[a] is LetDecl { anyLet = true }
+  }
+  if anyLet && fsPlanLets() != 0 { return 1 }
+  let fns = 1
+  for a in fsAsks {
+    if (
+      a >= 0
+      && a < P.nodes.length
+      && P.nodes[a] is FuncDecl
+      && fsPlanFn(a) == 0
+    ) {
+      fns = 0
+    }
+  }
+  if anyLet { return 0 }
+  fns
+}
+
+// The result key of call `c` of an asked function: the slot keys of the binding its result
+// initializes when every read of it is a call, the call's own when it is called at once, else
+// a key of its own.
+function fsCallResultKey(c: i32): string {
+  const p = fsParent[c]
+  if p < 0 { return "u:" + i32ToStr(c) }
+  const pn = P.nodes[p]
+  if pn is Call && pn.callFn == c { return fsReadKey(c) }
+  if pn is LetDecl && pn.letInit == c && pn.letType < 0 {
+    let k = "l:"
+    for r in fsIdents {
+      if identDeclOf(r) == p {
+        const rk = fsReadKey(r)
+        if rk.slice(0, 2) != "c:" { return "u:" + i32ToStr(c) }
+        if k.indexOf(";" + rk + ";") < 0 { k = k + ";" + rk + ";" }
+      }
+    }
+    return k
+  }
+  "u:" + i32ToStr(c)
+}
+
+// Function `m`, asked for returning a generic its results call at two types: one copy of it per
+// result key past the first, inserted after it, with each call of that key renamed to its copy
+// (D5531). 1 when its calls share one key.
+function fsPlanFn(m: i32): i32 {
+  const f = P.nodes[m]
+  if !(f is FuncDecl) || f.fnName == "" || fsParent[m] < 0 { return 1 }
+  if !(P.nodes[fsParent[m]] is Program) { return 1 }
+  const keys: string[] = []
+  const calls: i32[] = []
+  const lanes: i32[] = []
+  for r in fsIdents {
+    const c = fsParent[r]
+    if identDeclOf(r) == m && r != m {
+      if c < 0 { return 1 }
+      const cn = P.nodes[c]
+      if !(cn is Call && cn.callFn == r) { return 1 }
+      if cn is Call {
+        const key = fsCallResultKey(c)
+        let k = 0
+        while k < keys.length && keys[k] != key { k = k + 1 }
+        if k == keys.length { keys.push(key) }
+        calls.push(r)
+        lanes.push(k)
+      }
+    }
+  }
+  if keys.length < 2 { return 1 }
+  let k = 1
+  while k < keys.length {
+    const nm = f.fnName + "$s" + i32ToStr(m) + "_" + i32ToStr(k)
+    pfAnchor.push(m)
+    pfName.push(nm)
+    let i = 0
+    while i < calls.length {
+      if lanes[i] == k { fsRename(calls[i], nm) }
+      i = i + 1
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The let slots of every asked `let`; 0 with a plan, 1 when there is nothing it can split.
+function fsPlanLets(): i32 {
   fsMem = []
   fsLanes = []
   // The set: the asked declarations, closed over copies in either direction.
   for a in fsAsks {
-    if a < P.nodes.length && P.nodes[a] is LetDecl && memIx(a) < 0 {
+    if a >= 0 && a < P.nodes.length && P.nodes[a] is LetDecl && memIx(a) < 0 {
       fsMem.push(a)
     }
   }
@@ -433,7 +623,7 @@ function fsPlanMember(mi: i32): i32 {
       pdKw.push(d.letKw)
       pdName.push(laneName(mi, lanes[k]))
       pdTy.push(d.letType)
-      pdValSrc.push(d.letInit)
+      pdValSrc.push(fsSlotSrc(d.letInit))
       pdValName.push(vn)
     }
     k = k + 1
@@ -456,7 +646,7 @@ function fsPlanMember(mi: i32): i32 {
           } else {
             pwAnchor.push(w)
             pwName.push(laneName(mi, lanes[wk]))
-            pwValSrc.push(wn.binRight)
+            pwValSrc.push(fsSlotSrc(wn.binRight))
             pwValName.push(vn)
           }
           wk = wk + 1
@@ -602,6 +792,21 @@ function fsApply(): i32 {
         P.pos = nodeToks[a] + 1
         const pos = P.nodes[a].pos
         rc = fsInsertAfter(a, mkBinary("=", mkIdent(pwName[i], pos), v, pos))
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < pfAnchor.length {
+    if rc == 0 {
+      const f = reparseFuncDeclAt(fsFirstTok(pfAnchor[i]))
+      rc = -1
+      if f >= 0 {
+        const fn = P.nodes[f]
+        if fn is FuncDecl {
+          fn.fnName = pfName[i]
+          rc = fsInsertAfter(pfAnchor[i], f)
+        }
       }
     }
     i = i + 1

@@ -10496,6 +10496,19 @@ the question only if receiver overloading (O1) and a shadowable prelude tier bot
 the default set is versioned, or if agents keep retrying imports after the receiver-typed
 `--fix`.
 
+## Exported signatures are not frozen at the module boundary (owner ruling, incremental-compilation Q4 (A), 2026-10-17)
+
+**The rule.** An exported function may leave its parameters and return unannotated, as any
+function may. `export function twice(x) { x * 2 }` stays a generic whose body is its
+interface. Nothing requires an annotation on an export so that a build can be faster.
+
+**Why.** In the owner's words, a frozen signature "impacts users outside of perf
+improvements". Requiring annotations changes what users write, and
+the only gain is a cheaper incremental re-check. So the incremental build pays instead: S5's
+interface hash includes the bodies of exported generics and of exports with an inferred
+return, and an edit to one re-checks its importers
+(`docs/internals/incremental-compilation-design.md` §"Owner questions", Q4).
+
 ## Record adoption crosses module boundaries (owner ruling, incremental-compilation Q1 (B), 2026-10-07)
 
 **The rule.** An exported record binding without an annotation takes the field types its
