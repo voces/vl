@@ -1565,6 +1565,28 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   "i32"
 }
 
+// A projected union's pin at the name of the union row its canon matches, the spelling an
+// annotated parameter or a call return pins at, or "" when the union has no row. The checker
+// types a projection structurally, so its render keys no row or pool set (D5380). A type that
+// names a type parameter or hole is read through the enclosing instance's pins first.
+function monoProjectedUnionRowPin(cax: i32, fnIx: i32): string {
+  let ty = nodeTyIxOf(cax)
+  if ty < 0 { return "" }
+  if tyHasTyVar(ty) {
+    ty = monoPinSubTyOf(ty, fnIx)
+    if ty < 0 || ty >= T.tys.length { return "" }
+    if tyHasTyVar(ty) || tyIsLitUnion(ty) { return "" }
+    const st = T.tys[ty]
+    if !(st is TyUnion) { return "" }
+    if st.uMembers.length < 2 { return "" }
+  } else if !nodeTyIsUnionish(cax) {
+    return ""
+  }
+  const ur = unRowOfCanon(ty)
+  if ur < 0 || ur >= unNames.length { return "" }
+  monoAnnPinName(unNames[ur])
+}
+
 // The projection rungs of `monoArgTyName`: an indexed element and a record field, named
 // from the pin of what they project. Falls to `monoArgTyNameRep` where neither answers.
 function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
@@ -1589,6 +1611,8 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
         }
       }
     }
+    const eur = monoProjectedUnionRowPin(cax, fnIx)
+    if eur != "" { return eur }
     // The array NAME cannot carry a literal-union element: such an array reps as the
     // interned-atom i32 list, so an INFERRED one is named `i32[]` and this arm would pin the
     // atom's raw width. The element's own recorded type is exact, so it is left to the litunion
@@ -1633,6 +1657,8 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
     // struct name, so the code-15 rung above cannot carry it. Asked here, gated to a union
     // so no struct / list / scalar pin is touched, and through `monoAnnPinName` so the
     // answer is a spelling an annotated parameter already lowers.
+    const fur = monoProjectedUnionRowPin(cax, fnIx)
+    if fur != "" { return fur }
     if nodeTyIsUnionish(cax) {
       const mun = monoUnionPinName(cax)
       if mun != "" { return mun }
@@ -13491,13 +13517,18 @@ function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
   const nm = monoConcreteFnTyName(bt)
   if nm == "" { return "" }
   if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
-  monoArgFnTypeName(argIx, ctx)
+  const an = monoArgFnTypeName(argIx, ctx)
+  if an != "" { return an }
+  nm
 }
 
 // The concrete function type the checker bound hole parameter `pIx` to at call `callIx`, when
-// `argIx` is a generic function; -1 otherwise.
+// `argIx` is a generic function, named or through never-written aliases (D5361); -1 otherwise.
 function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
-  if !monoCalleeIsGeneric(unwrapParen(argIx)) { return -1 }
+  const ax = unwrapParen(argIx)
+  if ax < 0 || (!monoCalleeIsGeneric(ax) && monoReadGenFnFe(ax) < 0) {
+    return -1
+  }
   const pt = nodeTyIxOf(pIx)
   if pt < 0 || pt >= T.tys.length { return -1 }
   const pv = T.tys[pt]
@@ -14840,6 +14871,7 @@ function monoWalk(ix: i32, ctx: i32) {
       const cf = P.nodes[ctx]
       if cf is FuncDecl {
         if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
+        if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
       }
     }
     return monoWalk(n.retArg, ctx)
@@ -15677,6 +15709,20 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
     }
   }
   0
+}
+
+// For a value `v` an un-annotated function returns in frame `ctx`: a declared generic is delivered
+// at the one signature the flow table pins the read at, past the return, and each call taking
+// that pin is typed at it (D5360). No pin, or two, leaves the value to the emitter's refusal.
+function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
+  if v < 0 { return 0 }
+  const x = unwrapParen(v)
+  if x < 0 || !monoNamesDeclaredGeneric(x, ctx) { return 0 }
+  const noPath: string[] = []
+  const nm = monoSlotPinName(x, noPath, ctx)
+  if nm == "" { return 0 }
+  if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
+  monoRetypePinCalls(x, noPath)
 }
 
 // Whether every write of the binding `d` the checker gave a closed function type takes the

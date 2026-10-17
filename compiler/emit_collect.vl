@@ -703,6 +703,7 @@ import {
 import {
   eqRowFieldCount,
   eqRowFieldTypeAt,
+  eqRowTgtStructIdx,
   eqScalarListFieldKind,
   eqVariantListFieldKind,
   eqgElemClass,
@@ -4959,7 +4960,8 @@ function leqgNoteRep(kind: i32, slot: i32, depth: i32) {
         ni = ni + 1
       }
     }
-    "none" | "scalar" => {}
+    // A call compares inside the minted function, which reserves its own frames.
+    "none" | "scalar" | "call" => {}
   }
   0
 }
@@ -5014,6 +5016,38 @@ function leqNoteVariantFields(vi: i32) {
       if lk >= 0 { leqgNoteRep(lk, 0, 0) }
     }
     j = j + 1
+  }
+  0
+}
+
+// Reserve a compare frame per list field of struct row `row` and of every struct row its
+// nested-struct fields reach, since the inline compare walks those fields too. `seen` holds the
+// rows already walked, so a record that nests itself is walked once.
+function leqNoteStructRowFields(row: i32, seen: i32[]) {
+  if row < 0 || i32ListHas(seen, row) { return 0 }
+  seen.push(row)
+  const fc = eqRowFieldCount(row)
+  let fj = 0
+  while fj < fc {
+    // A `T[] | null` field compares through its non-null twin's core under a null guard, so
+    // the frame it needs is that twin's (D1180).
+    let fjc = eqRowFieldTypeAt(row, fj)
+    const fjn = nulFieldInnerCode(fjc)
+    if fjn >= 0 { fjc = fjn }
+    if fjc == FC_REF_LIST {
+      const en = sFieldElemNameAt(row, fj)
+      if en != "" {
+        const rs = rlSlotByNameKeyTy(en, -1)
+        if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
+      }
+    }
+    if fjc == FC_STRUCT {
+      leqNoteStructRowFields(eqRowTgtStructIdx(row, fj), seen)
+    }
+    // A scalar-backed list field (`string[]`, `f64[]`, `i64[]`, `f32[]`, `u8[]`) too (D1020).
+    const eqSk = eqScalarListFieldKind(fjc)
+    if eqSk >= 0 { leqgNoteRep(eqSk, 0, 0) }
+    fj = fj + 1
   }
   0
 }
@@ -5073,31 +5107,7 @@ function leqNoteBin(binIx: i32, fnIx: i32) {
   // `eqgListKindOfBin` answers -1 and `emitListEqGCore` refuses (D1017). Walk the row and note
   // a frame per ref-list field.
   const eqRow = binEqStructRow(binIx, fnIx)
-  if eqRow >= 0 {
-    const fc = eqRowFieldCount(eqRow)
-    let fj = 0
-    while fj < fc {
-      // A `T[] | null` field compares through its non-null twin's core under a null guard, so
-      // the frame it needs is that twin's — resolved through the one home the emitter opens the
-      // guard from, else the guard runs over a frame nobody reserved (D1180).
-      let fjc = eqRowFieldTypeAt(eqRow, fj)
-      const fjn = nulFieldInnerCode(fjc)
-      if fjn >= 0 { fjc = fjn }
-      if fjc == FC_REF_LIST {
-        const en = sFieldElemNameAt(eqRow, fj)
-        if en != "" {
-          const rs = rlSlotByNameKeyTy(en, -1)
-          if rs >= 0 { leqgNoteRep(LBK_REF, rs, 0) }
-        }
-      }
-      // …and a scalar-backed list field needs one for the same reason (D1020): the cores exist
-      // for `string[]`, `f64[]`, `i64[]`, `f32[]` and `u8[]` fields, so what this supplies is
-      // the frame here and the routing there.
-      const eqSk = eqScalarListFieldKind(fjc)
-      if eqSk >= 0 { leqgNoteRep(eqSk, 0, 0) }
-      fj = fj + 1
-    }
-  }
+  if eqRow >= 0 { leqNoteStructRowFields(eqRow, []) }
   // A `+` over a non-i32 list rep needs its own 4-slot concat frame. The i32 list is excluded
   // because it rides LEQI's `out` slot, which `k == 0` above already reserved; a second frame
   // would move every later frame's base and change the bytes of every concatenating program.
@@ -13569,9 +13579,9 @@ function collectInferredUnions(stmts: i32[]) {
   0
 }
 
-// Detects bare named-function value uses the other flips miss: a `let`/`const` initialized
-// to a function name, a reassignment, an equality operand, or a function-valued object-literal
-// field. Each such cell is a closure fat-pointer (kind 14), so the closure rec-group types
+// Detects bare named-function value uses the other flips miss: a `let`/`const` initialized to
+// or a `return` of a function name, a reassignment, an equality operand, or a function-valued
+// object-literal field. Each such cell is a closure fat-pointer (kind 14), so the closure rec-group types
 // must intern (`fnValUsed`) even when no lambda or `.map` site otherwise flips it.
 export function collectFnValUse() {
   let i = 0
@@ -13579,6 +13589,11 @@ export function collectFnValUse() {
     const nd = P.nodes[i]
     if nd is LetDecl {
       if exprIsBareFnName(nd.letInit) { fnValUsed = true }
+    }
+    if nd is RetStmt {
+      if nd.retArg >= 0 && exprIsBareFnName(unwrapParen(nd.retArg)) {
+        fnValUsed = true
+      }
     }
     if nd is BinExpr {
       if nd.binOp == "=" || nd.binOp == "==" || nd.binOp == "!=" {
