@@ -27,10 +27,12 @@ import {
 } from "./ast"
 import { collCtorTyArgsTy } from "./check_annot_resolve"
 import {
+  adoptHoleLitArgs,
   assignableExpr,
   dstBindLitTyParams,
   fsbNoteCall,
   genFnValueCstrs,
+  holeLambdaSeedTy,
   validateArgCstrs,
   validateBmCstrs,
   validateLetCstrs,
@@ -192,7 +194,7 @@ import { nodeTyOf } from "./check_node_tys"
 import { lbiNoDest } from "./check_num_lit_state"
 import { floatIntrWidth } from "./check_num_lits"
 import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
-import { getSiteFnOf, placeKeyOf } from "./check_places"
+import { getSiteFnOf, parenPeelIx, placeKeyOf } from "./check_places"
 import { rcwKey } from "./check_record_writes"
 import {
   argMismatchErr,
@@ -1150,7 +1152,15 @@ function callFtyCheckArg(
   // param type into it so an un-annotated literal param infers from the signature
   // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
   // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
-  seedExpected(args[i], substTyDeep(params[i], bNames, bTys))
+  let seedTy = substTyDeep(params[i], bNames, bTys)
+  // A lambda at a hole takes the function type the callee's body hands it to (D5842).
+  if tyIsHole(seedTy) && P.nodes[parenPeelIx(args[i])] is FuncDecl {
+    let owner = -1
+    if cfn is Ident { owner = fnDeclIx[cfn.identName] ?? -1 }
+    const hs = holeLambdaSeedTy(owner, params[i], bNames, bTys)
+    if hs >= 0 { seedTy = hs }
+  }
+  seedExpected(args[i], seedTy)
   if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
   const at = checkNodeHook(args[i])
   // A template hole meeting its injected renderer. This line is the first
@@ -1357,6 +1367,7 @@ function callFtyPinCstrs(
     substNestModeSet(SUBST_ALL)
   }
   const wsVd = T.diags.length
+  adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
   instGenFnHolePins(vNames, vTys, cstrCallee)
   callBindNote(ix, vNames, vTys)
   pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
