@@ -513,6 +513,8 @@ import {
   nonNullTy,
   tyAdmitsNull,
   tyHasTyVar,
+  tyMapValOf,
+  tyStepElem,
 } from "./tyquery"
 
 // The join of two types a place may hold after an `if`. A place holds a member of its declared
@@ -823,9 +825,17 @@ function arrDefHoleToI32(ty: i32) {
 }
 
 // Default to `i32`, after every pin, the element of each empty `[]` that is a record literal's
-// field value and that nothing pinned: nothing stores an element into it, so no read can tell
-// which element it holds, and the record gets a shape it can be built and stored at (D5344).
+// field value (D5344) or an index store's value (D5471) and that nothing pinned: nothing stores
+// an element into it, so no read can tell which element it holds, and the record or map gets a
+// shape it can be built and stored at. A store's `[]` takes what its destination holds first.
 export function objFieldHolesToI32() {
+  const dstRows: i32[] = []
+  const dstElems: i32[] = []
+  let j = 0
+  while j < P.nodes.length {
+    idxStoreNote(j, dstRows, dstElems)
+    j = j + 1
+  }
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
@@ -842,8 +852,98 @@ export function objFieldHolesToI32() {
         f = f + 1
       }
     }
+    const st = idxStoreOf(i)
+    if st >= 0 && P.nodes[st] is ArrayLit && unresolvedHole(nodeTyIxOf(st)) {
+      const n2 = P.nodes[i]
+      if n2 is BinExpr {
+        idxStoreHolePin(
+          nodeTyIxOf(st),
+          idxStoreDstRow(n2.binLeft),
+          dstRows,
+          dstElems,
+        )
+      }
+    }
     i = i + 1
   }
+  0
+}
+
+// The value node of the index store `xs[k] = v` at `ix`, or -1 when `ix` is not one.
+function idxStoreOf(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is BinExpr) || n.binOp != "=" || n.binLeft < 0 || n.binRight < 0 {
+    return -1
+  }
+  if !(P.nodes[n.binLeft] is Index) { return -1 }
+  n.binRight
+}
+
+// The non-null list row of type `ty`, or -1 when it is not a list.
+function listRowOf(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const d = nonNullTy(ty)
+  if d < 0 || d >= T.tys.length { return -1 }
+  if T.tys[d] is TyArray { d } else { -1 }
+}
+
+// The list row the store target `xs[k]` at `ix` writes into: a map receiver's value row, or a list
+// receiver's element row; -1 when that is not a list.
+function idxStoreDstRow(ix: i32): i32 {
+  const t = P.nodes[ix]
+  if !(t is Index) { return -1 }
+  const recv = nodeTyIxOf(t.idxArr)
+  if recv < 0 { return -1 }
+  const r = nonNullTy(recv)
+  const mv = tyMapValOf(r)
+  if mv >= 0 { listRowOf(mv) } else { listRowOf(tyStepElem(r)) }
+}
+
+// Record the element the index store at `ix` writes into its destination list row: one row per
+// destination in `rows`, its element in `elems`, or -2 once two stores disagree or one is open.
+function idxStoreNote(ix: i32, rows: i32[], elems: i32[]) {
+  const st = idxStoreOf(ix)
+  const n = P.nodes[ix]
+  const v = if st >= 0 { listRowOf(nodeTyIxOf(st)) } else { -1 }
+  if v < 0 || !(n is BinExpr) { return 0 }
+  const d = idxStoreDstRow(n.binLeft)
+  const vt = T.tys[v]
+  if d >= 0 && vt is TyArray && vt.aElem >= 0 {
+    const el = if tyHasHole(vt.aElem) { -2 } else { vt.aElem }
+    let k = 0
+    while k < rows.length && rows[k] != d { k = k + 1 }
+    if k == rows.length {
+      rows.push(d)
+      elems.push(el)
+    } else if elems[k] != -2 && (el == -2 || !tySame(elems[k], el)) {
+      elems[k] = -2
+    }
+  }
+  0
+}
+
+// Pin list row `lit`, an index store's empty value, to the element its destination list row `d`
+// holds: the destination's own when known, else the one `idxStoreNote` found every store into it
+// writing, else `i32` when none writes one. Stores that disagree leave it open for the emitter.
+function idxStoreHolePin(lit: i32, d: i32, rows: i32[], elems: i32[]) {
+  if lit < 0 || d < 0 { return 0 }
+  const lt = T.tys[lit]
+  if !(lt is TyArray) { return 0 }
+  const dt = T.tys[d]
+  if !(dt is TyArray) { return 0 }
+  let el = if dt.aElem >= 0 && !tyHasHole(dt.aElem) { dt.aElem } else { -1 }
+  if el < 0 {
+    let k = 0
+    while k < rows.length && rows[k] != d { k = k + 1 }
+    if k < rows.length { el = elems[k] }
+  }
+  if el == -2 { return 0 }
+  if el < 0 {
+    arrDefPinHoleElem(lit)
+    return 0
+  }
+  lt.aElem = el
+  tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
   0
 }
 
