@@ -144,13 +144,14 @@ DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | pas
 # `bash -c` instead, every newline would be a COMMAND separator (measured: 78 of
 # ci-native's 79 files ran as commands, rc=126).
 # THE CORPUS ORACLE (tests/cases_wasm_{0..3}_test.ts) is the V8 face of the ~5,300-fixture
-# tests/cases corpus; ci-native's selfhost_native_align_test.ts is the native face, over the
-# same files. A fixture red in the retro of 2026-10-15 was red in BOTH, so the gate pays for one.
-# What only the oracle pins - @error message text and spans, @warning/@hint/@info - stays
-# graded by CI (ci.yml "Corpus oracle on the wasm compiler" and `deno task test`).
-# GATE_V8_CORPUS=1 puts the oracle back.
+# tests/cases corpus, and it carries the corpus's content here: it pins everything the native
+# face does over the same seed bytes, plus @error message text and spans and
+# @warning/@hint/@info. ci-native's selfhost_native_align_test.ts asserts only the host-face
+# subset (the host, wasmtime, the batch CLIs); a cross-face census over 41 archived seeds
+# found no case outside it that native failed and the oracle passed.
+# GATE_V8_CORPUS=0 drops the oracle from row 1.
 ORACLE=$(ls tests/cases_wasm_*_test.ts | paste -sd, -)
-[ "${GATE_V8_CORPUS:-0}" = 1 ] && ROW1_IGNORE="$DEDUPE" || ROW1_IGNORE="$DEDUPE,$ORACLE"
+[ "${GATE_V8_CORPUS:-1}" = 1 ] && ROW1_IGNORE="$DEDUPE" || ROW1_IGNORE="$DEDUPE,$ORACLE"
 # shellcheck disable=SC2086
 run "deno task test"           deno test -A --no-check --parallel --ignore="$ROW1_IGNORE" tests/
 # shellcheck disable=SC2086
