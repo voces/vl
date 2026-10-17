@@ -1227,6 +1227,220 @@ function scanBody(bi: i32, f: i32): boolean {
   true
 }
 
+// `scanArm`'s result: the height after the op, its pushes, its call results, whether it opened
+// a frame, and the op it recorded, written into `out` in that order. Returns true.
+function scanArmOut(
+  out: i32[],
+  h: i32,
+  pushes: i32,
+  rp: i32,
+  grew: boolean,
+  last: i32,
+): boolean {
+  out[0] = h
+  out[1] = pushes
+  out[2] = rp
+  out[3] = if grew { 1 } else { 0 }
+  out[4] = last
+  true
+}
+
+// `scanArm`'s `end` (0x0b) or `delegate` (0x18) at op `k`: closes the top frame, recording the
+// function's exit or a merge of an `if`'s two record-typed arms. Fills `out` as `scanArm` does.
+function scanArmEnd(
+  bi: i32,
+  op: i32,
+  k: i32,
+  hb: i32,
+  prev: i32,
+  depth: i32,
+  out: i32[],
+): boolean {
+  const top = depth - 1
+  let last = -1
+  if op == 0x0b && depth == 1 {
+    follow(prev, k, NX_EXIT, 0, 0)
+    record(K_EXIT, 0, producerBelow(hb), argv.length)
+  } else if op == 0x0b && frMg[top] {
+    follow(prev, k, NX_ARM, 0, 0)
+    if frElse[top] != NONE && !frBr[top] {
+      const mi = gIf.length
+      gIf.push(frIf[top])
+      gElse.push(frElse[top])
+      gEnd.push(k)
+      gT.push(frT[top])
+      gT0.push(frTail[top])
+      gT1.push(producerBelow(hb))
+      armEnd[opTotal + frElse[top]] = mi
+      armEnd[opTotal + k] = mi
+      mergeAt[opTotal + k] = mi
+      last = record(K_MERGE, frT[top], NONE, argv.length)
+    }
+  }
+  if op == 0x18 { bExits[bi] = true }
+  const h = frH[top] + frR[top]
+  const pushes = frR[top]
+  popFrame()
+  seg.pop()
+  scanArmOut(out, h, pushes, 0, false, last)
+}
+
+// `scanArm`'s frame opener at byte `at` — `block`, `loop`, `if`, `try`, `try_table` — which
+// pushes a frame over its block type's parameters and marks an `if` of a non-null record type
+// as a merge candidate. Fills `out` as `scanArm` does; false on an unreadable block type.
+function scanArmOpen(
+  bi: i32,
+  op: i32,
+  at: i32,
+  k: i32,
+  hb: i32,
+  depth: i32,
+  base: i32,
+  out: i32[],
+): boolean {
+  const top = depth - 1
+  if op == 0x1f {
+    let i = 0
+    while i < frMg.length {
+      if frMg[i] { frBr[i] = true }
+      i = i + 1
+    }
+  }
+  if op == 0x06 || op == 0x1f { bExits[bi] = true }
+  const bt = blockTypeAt(at + 1)
+  if bt < 0 { return false }
+  const bp = bt >> 16
+  const br = bt & 0xffff
+  const pops = if op == 0x04 { bp + 1 } else { bp }
+  const hp = max(hb - pops, base)
+  pushFrame(hp, bp, br, op == 0x03)
+  if op == 0x04 && btVal >= 0 && isRef(btVal) && !isNullable(btVal) {
+    const t = recordOf(btVal)
+    if t >= 0 {
+      frMg[top + 1] = true
+      frIf[top + 1] = k
+      frT[top + 1] = t
+    }
+  }
+  seg.push(k + 1)
+  scanArmOut(out, hp + bp, bp, 0, true, -1)
+}
+
+// `scanArm`'s `call` (0x10) or `return_call` (0x12) at cursor `c`: records a call to a defined
+// function with its argument producers. Fills `out` as `scanArm` does; false on a bad callee.
+function scanArmCall(
+  bi: i32,
+  c: WasmCursor,
+  op: i32,
+  hb: i32,
+  depth: i32,
+  base: i32,
+  out: i32[],
+): boolean {
+  const top = depth - 1
+  let h = hb
+  let last = -1
+  let pushes = 0
+  const callee = c.imm
+  if callee < 0 || callee >= nFuncs { return false }
+  const cps = paramsOf(callee)
+  const rp = resultsOf(callee).length
+  if callee >= nImports {
+    const pn = cps.length
+    const a0 = argv.length
+    let j = 0
+    while j < pn {
+      argv.push(if hb >= pn { producerAt(hb - pn + j) } else { NONE })
+      j = j + 1
+    }
+    last = record(if op == 0x10 { K_CALL } else { K_RCALL }, callee, NONE, a0)
+  } else if op == 0x12 {
+    bExits[bi] = true
+  }
+  if op == 0x10 {
+    pushes = rp
+    h = max(hb - cps.length, base) + rp
+  } else {
+    h = base
+    frUnr[top] = true
+  }
+  scanArmOut(out, h, pushes, rp, false, last)
+}
+
+// `scanArm`'s conditional branches at byte `at` — `br_if`, `br_on_null`, `br_on_non_null`,
+// `br_on_cast`, `br_on_cast_fail` — whose height moves by the target label's arity. Fills `out`
+// as `scanArm` does; false on an unreadable label.
+function scanArmBrIf(
+  bi: i32,
+  c: WasmCursor,
+  op: i32,
+  at: i32,
+  hb: i32,
+  depth: i32,
+  base: i32,
+  out: i32[],
+): boolean {
+  const fnFrame = depth - 1
+  const d = wcNew(mB, at + 1, c.pos)
+  if op > 0xff {
+    wcU32(d)
+    wcByte(d)
+  }
+  const lbl = wcU32(d)
+  markTarget(lbl)
+  if lbl >= fnFrame { bExits[bi] = true }
+  const n = labelArity(lbl)
+  if n < 0 { return false }
+  let pops = n
+  let pushes = n
+  if op == 0x0d { pops = n + 1 }
+  if op == 0xd5 {
+    pops = n + 1
+    pushes = n + 1
+  }
+  if op == 0xd6 { pushes = n - 1 }
+  scanArmOut(out, max(hb - pops, base) + pushes, pushes, 0, false, -1)
+}
+
+// `scanArm`'s `struct.new` (0xfb0000), `struct.set` (0xfb0005) and `array.new_fixed`
+// (0xfb0008) at byte `at` of function `f`: records a new record and taints a set one. Fills
+// `out` as `scanArm` does; false on a type index that is not a struct or an unknown op.
+function scanArmGc(
+  f: i32,
+  c: WasmCursor,
+  op: i32,
+  at: i32,
+  hb: i32,
+  base: i32,
+  out: i32[],
+): boolean {
+  let h = hb
+  let last = -1
+  let pushes = 0
+  const p1 = lebEnd(at + 1, c.pos)
+  const imm = lebAt(p1, c.pos)
+  const imm2 = lebAt(lebEnd(p1, c.pos), c.pos)
+  if op == 0xfb0000 {
+    if shapeOf(imm) { last = record(K_NEW, imm, NONE, argv.length) }
+    if imm < 0 || imm >= nTypes || !isStruct[imm] { return false }
+    h = max(hb - fVals[imm].length, base) + 1
+    pushes = 1
+  } else if op == 0xfb0008 {
+    h = max(hb - imm2, base) + 1
+    pushes = 1
+  } else {
+    if op == 0xfb0005 {
+      tainted.push(imm)
+      if !writer.has(imm) { writer[imm] = f }
+    }
+    const ar = tableArity(op)
+    if ar < 0 { return false }
+    pushes = ar & 15
+    h = max(hb - (ar >> 4), base) + pushes
+  }
+  scanArmOut(out, h, pushes, 0, false, last)
+}
+
 // `scanBody`'s arms for an op that is neither a plain-arity op nor a local op: `op` sits at
 // byte `at`, the stack is `hb` high over the frame base `base`, and `prev` is the recorded op
 // before it. Writes the height after it, its pushes, its call results, 1 when it opened a
@@ -1247,35 +1461,10 @@ function scanArm(
   const top = depth - 1
   const fnFrame = depth - 1
   let h = hb
-  let last = -1
   let pushes = 0
   let rp = 0
-  let grew = false
   if op == 0x0b || op == 0x18 {
-    if op == 0x0b && depth == 1 {
-      follow(prev, k, NX_EXIT, 0, 0)
-      record(K_EXIT, 0, producerBelow(hb), argv.length)
-    } else if op == 0x0b && frMg[top] {
-      follow(prev, k, NX_ARM, 0, 0)
-      if frElse[top] != NONE && !frBr[top] {
-        const mi = gIf.length
-        gIf.push(frIf[top])
-        gElse.push(frElse[top])
-        gEnd.push(k)
-        gT.push(frT[top])
-        gT0.push(frTail[top])
-        gT1.push(producerBelow(hb))
-        armEnd[opTotal + frElse[top]] = mi
-        armEnd[opTotal + k] = mi
-        mergeAt[opTotal + k] = mi
-        last = record(K_MERGE, frT[top], NONE, argv.length)
-      }
-    }
-    if op == 0x18 { bExits[bi] = true }
-    h = frH[top] + frR[top]
-    pushes = frR[top]
-    popFrame()
-    seg.pop()
+    return scanArmEnd(bi, op, k, hb, prev, depth, out)
   } else if (
     op == 0x02
     || op == 0x03
@@ -1283,33 +1472,7 @@ function scanArm(
     || op == 0x06
     || op == 0x1f
   ) {
-    if op == 0x1f {
-      let i = 0
-      while i < frMg.length {
-        if frMg[i] { frBr[i] = true }
-        i = i + 1
-      }
-    }
-    if op == 0x06 || op == 0x1f { bExits[bi] = true }
-    const bt = blockTypeAt(at + 1)
-    if bt < 0 { return false }
-    const bp = bt >> 16
-    const br = bt & 0xffff
-    const pops = if op == 0x04 { bp + 1 } else { bp }
-    const hp = max(hb - pops, base)
-    pushFrame(hp, bp, br, op == 0x03)
-    if op == 0x04 && btVal >= 0 && isRef(btVal) && !isNullable(btVal) {
-      const t = recordOf(btVal)
-      if t >= 0 {
-        frMg[top + 1] = true
-        frIf[top + 1] = k
-        frT[top + 1] = t
-      }
-    }
-    h = hp + bp
-    pushes = bp
-    grew = true
-    seg.push(k + 1)
+    return scanArmOpen(bi, op, at, k, hb, depth, base, out)
   } else if op == 0x05 {
     if frMg[top] {
       follow(prev, k, NX_ARM, 0, 0)
@@ -1321,29 +1484,7 @@ function scanArm(
     pushes = frP[top]
     seg[seg.length - 1] = k + 1
   } else if op == 0x10 || op == 0x12 {
-    const callee = c.imm
-    if callee < 0 || callee >= nFuncs { return false }
-    const cps = paramsOf(callee)
-    rp = resultsOf(callee).length
-    if callee >= nImports {
-      const pn = cps.length
-      const a0 = argv.length
-      let j = 0
-      while j < pn {
-        argv.push(if hb >= pn { producerAt(hb - pn + j) } else { NONE })
-        j = j + 1
-      }
-      last = record(if op == 0x10 { K_CALL } else { K_RCALL }, callee, NONE, a0)
-    } else if op == 0x12 {
-      bExits[bi] = true
-    }
-    if op == 0x10 {
-      pushes = rp
-      h = max(hb - cps.length, base) + rp
-    } else {
-      h = base
-      frUnr[top] = true
-    }
+    return scanArmCall(bi, c, op, hb, depth, base, out)
   } else if op == 0x0c {
     const lbl = lebAt(at + 1, c.pos)
     markTarget(lbl)
@@ -1360,25 +1501,7 @@ function scanArm(
     || op == 0xfb0018
     || op == 0xfb0019
   ) {
-    const d = wcNew(mB, at + 1, c.pos)
-    if op > 0xff {
-      wcU32(d)
-      wcByte(d)
-    }
-    const lbl = wcU32(d)
-    markTarget(lbl)
-    if lbl >= fnFrame { bExits[bi] = true }
-    const n = labelArity(lbl)
-    if n < 0 { return false }
-    let pops = n
-    pushes = n
-    if op == 0x0d { pops = n + 1 }
-    if op == 0xd5 {
-      pops = n + 1
-      pushes = n + 1
-    }
-    if op == 0xd6 { pushes = n - 1 }
-    h = max(hb - pops, base) + pushes
+    return scanArmBrIf(bi, c, op, at, hb, depth, base, out)
   } else if op == 0x0f {
     follow(prev, k, NX_EXIT, 0, 0)
     record(K_EXIT, 0, producerBelow(hb), argv.length)
@@ -1424,39 +1547,14 @@ function scanArm(
     h = base
     frUnr[top] = true
   } else if (op == 0xfb0000 || op == 0xfb0005 || op == 0xfb0008) {
-    const p1 = lebEnd(at + 1, c.pos)
-    const imm = lebAt(p1, c.pos)
-    const imm2 = lebAt(lebEnd(p1, c.pos), c.pos)
-    if op == 0xfb0000 {
-      if shapeOf(imm) { last = record(K_NEW, imm, NONE, argv.length) }
-      if imm < 0 || imm >= nTypes || !isStruct[imm] { return false }
-      h = max(hb - fVals[imm].length, base) + 1
-      pushes = 1
-    } else if op == 0xfb0008 {
-      h = max(hb - imm2, base) + 1
-      pushes = 1
-    } else {
-      if op == 0xfb0005 {
-        tainted.push(imm)
-        if !writer.has(imm) { writer[imm] = f }
-      }
-      const ar = tableArity(op)
-      if ar < 0 { return false }
-      pushes = ar & 15
-      h = max(hb - (ar >> 4), base) + pushes
-    }
+    return scanArmGc(f, c, op, at, hb, base, out)
   } else {
     const ar = tableArity(op)
     if ar < 0 { return false }
     pushes = ar & 15
     h = max(hb - (ar >> 4), base) + pushes
   }
-  out[0] = h
-  out[1] = pushes
-  out[2] = rp
-  out[3] = if grew { 1 } else { 0 }
-  out[4] = last
-  true
+  scanArmOut(out, h, pushes, rp, false, -1)
 }
 
 // Records that the op after recorded op `prev` is `nx` (with its operands), when op `k` is it.

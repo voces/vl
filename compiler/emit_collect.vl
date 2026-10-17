@@ -10,6 +10,7 @@
 // feature, so a program that does not use it emits the bytes it would emit without the
 // feature at all. Each pass below states only its own gate.
 
+import { chainHasPrelude } from "./emit_if_arm_values"
 import {
   nodeTyArrayElemRepName,
   nodeTyIsLitUnionAlias,
@@ -4484,38 +4485,6 @@ function armPreludeBind(blockIx: i32) {
   0
 }
 
-// Whether the arm block at `blockIx` has a statement before its value.
-function armHasPrelude(blockIx: i32): boolean {
-  if blockIx < 0 { return false }
-  const b = P.nodes[blockIx]
-  if b is Block {
-    if b.blkStmts.length > 1 { return true }
-    // An arm whose value is another `if` has that `if`'s arm preludes (D2825).
-    if b.blkStmts.length == 1 {
-      const tail = unwrapParen(b.blkStmts[0])
-      if tail >= 0 && P.nodes[tail] is IfStmt { return chainHasPrelude(tail) }
-    }
-  }
-  false
-}
-
-// Whether any arm along the `if` chain at `ifIx` has a prelude (`armHasPrelude`).
-export function chainHasPrelude(ifIx: i32): boolean {
-  let cur = ifIx
-  while cur >= 0 {
-    const s = P.nodes[cur]
-    cur = -1
-    if s is IfStmt {
-      if armHasPrelude(s.ifThen) { return true }
-      if s.ifElse >= 0 {
-        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
-        else if armHasPrelude(s.ifElse) { return true }
-      }
-    }
-  }
-  false
-}
-
 // Opens one frame binding the arm-prelude locals of every value `if` in the statement at
 // `stmtIx` (an expression, `return`, `let` initializer, or `if`/`while` condition), so a
 // classifier asked outside the arm reads an arm tail at its locals (D5333). Returns the
@@ -6521,10 +6490,10 @@ function forceGenAppArgTypes(name: string): i32 {
 function forceNestedCloSigReps(nm: string, depth: i32): i32 {
   if depth > 6 { return 0 }
   if nm == "" { return 0 }
-  // A union or nullable spelling: the shape may sit in any arm. `splitUnionAtoms` stops at a
+  // A union or nullable spelling: the shape may sit in any arm. `unionSetAtomsOf` stops at a
   // top-level `=>`, so a function type reaches the arrow rung below as one atom.
   const arms: string[] = []
-  splitUnionAtoms(nm, arms)
+  unionSetAtomsOf(nm, arms)
   if arms.length > 1 {
     let ai = 0
     while ai < arms.length {
@@ -12541,46 +12510,9 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // A map member of a 2+-member union rides the variant box, registered via `isVariantBoxUnion`
   // below and returned early, or the map-value recursion further down would swallow the name.
   const matoms: string[] = []
-  splitUnionAtoms(name, matoms)
+  unionSetAtomsOf(name, matoms)
   if matoms.length >= 2 {
-    let mNonNull = 0
-    let mHasMap = false
-    let mk = 0
-    while mk < matoms.length {
-      const ma = matoms[mk]
-      if ma != "null" {
-        mNonNull = mNonNull + 1
-        // Deliberately `nameIsMapOpen`, not `nameIsMap`: an arm that is a list of maps still opens
-        // `{[`, so it must set this flag or the map-value recursion below swallows the union name.
-        if nameIsMapOpen(ma) { mHasMap = true }
-      }
-      mk = mk + 1
-    }
-    // A single map + `null` is exempt (the nullable map, owned by the nullable machinery); only
-    // a map alongside another non-null member is the box-union shape handled here.
-    if mHasMap && mNonNull >= 2 {
-      // Supported falls through to `isVariantBoxUnion` below; unsupported is a loud fail, never a
-      // silent mis-tag. `matoms` reuses the split this predicate would otherwise redo.
-      if !isVariantBoxUnionAtoms(stmts, matoms) {
-        return emitFail(
-          "emitProgram: a map union member is not supported — use a struct member instead",
-        )
-      }
-    }
-    // A ref-array atom's element union needs registration too, since it is not a standalone
-    // annotation the recursions below would otherwise reach. Non-returning: the outer union
-    // still registers through the dispatch below.
-    let ak = 0
-    while ak < matoms.length {
-      const aa = matoms[ak]
-      if aa != "null" && nameIsArray(aa) {
-        registerInlineUnionAt(stmts, aa, 30, -1)
-      }
-      // A map atom's value union is a separate rep from the map arm (registered via
-      // `isVariantBoxUnion`) and needs registering here too, the sibling of the ref-array recursion above.
-      if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa) }
-      ak = ak + 1
-    }
+    if registerInlineUnionAtoms(stmts, matoms) < 0 { return -1 }
   }
   // A union used only as a collection element (`(C|S)[]`, `{[string]: C|S}`) still needs its
   // inner union registered, or a union appearing only inside a collection is never interned.
@@ -12659,9 +12591,61 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // An inline struct-shape annotation's unions live in its fields, interned before this call by
   // `collectTyReachRegister`'s structural walk — a single shape has none to register here.
   if nameIsWholeSpanShape(name) { return 0 }
-  // The atom form again: `matoms` is still `splitUnionAtoms(name)` here — nothing between
+  // The atom form again: `matoms` is still `unionSetAtomsOf(name)` here — nothing between
   // the split at the top of this function and this line rewrites either `name` or `matoms`.
   if !isVariantBoxUnionAtoms(stmts, matoms) { return 0 }
+  mintInlineUnion(stmts, name, ty)
+}
+
+// `registerInlineUnionAt`'s pass over the atoms of a union of two or more: refuses a map
+// member beside another non-null member that cannot box, and registers each ref-array atom's
+// element union and each map atom's value union. Returns 0, or -1 (via `emitFail`).
+function registerInlineUnionAtoms(stmts: i32[], matoms: string[]): i32 {
+  let mNonNull = 0
+  let mHasMap = false
+  let mk = 0
+  while mk < matoms.length {
+    const ma = matoms[mk]
+    if ma != "null" {
+      mNonNull = mNonNull + 1
+      // Deliberately `nameIsMapOpen`, not `nameIsMap`: an arm that is a list of maps still opens
+      // `{[`, so it must set this flag or the map-value recursion below swallows the union name.
+      if nameIsMapOpen(ma) { mHasMap = true }
+    }
+    mk = mk + 1
+  }
+  // A single map + `null` is exempt (the nullable map, owned by the nullable machinery); only
+  // a map alongside another non-null member is the box-union shape handled here.
+  if mHasMap && mNonNull >= 2 {
+    // Supported falls through to `isVariantBoxUnion` below; unsupported is a loud fail, never a
+    // silent mis-tag. `matoms` reuses the split this predicate would otherwise redo.
+    if !isVariantBoxUnionAtoms(stmts, matoms) {
+      return emitFail(
+        "emitProgram: a map union member is not supported — use a struct member instead",
+      )
+    }
+  }
+  // A ref-array atom's element union needs registration too, since it is not a standalone
+  // annotation the recursions below would otherwise reach. Non-returning: the outer union
+  // still registers through the dispatch below.
+  let ak = 0
+  while ak < matoms.length {
+    const aa = matoms[ak]
+    if aa != "null" && nameIsArray(aa) {
+      registerInlineUnionAt(stmts, aa, 30, -1)
+    }
+    // A map atom's value union is a separate rep from the map arm (registered via
+    // `isVariantBoxUnion`) and needs registering here too, the sibling of the ref-array recursion above.
+    if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa) }
+    ak = ak + 1
+  }
+  0
+}
+
+// `registerInlineUnionAt`'s mint: records `name` as a union row (its arena type from the
+// declaration, else `ty`), its struct variants and their fields, and the value, ref-array and
+// map arms' shapes. Returns 0, or -1 once failed.
+function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   // The arms' field unions must already be registered before this point — an interleaved
   // registration would corrupt this union's variant slice — which the arena-driven walk guarantees.
   uDeclared = true
@@ -12725,6 +12709,20 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // A ref-array arm interns its element shape and reflist slot, the twin of the value-atom
   // marking above; this early call ensures the element struct is in `sNames` before heap assignment.
   markRefArrayArms(name)
+  if registerRefArrayArmUnions(stmts, atoms, atomTys) < 0 { return -1 }
+  // A map arm interns its value shape and forces the shared map heap flags, the map twin of
+  // the ref-array marking; this keeps the inline and named spellings identical.
+  markMapUnionArms(name)
+  0
+}
+
+// `mintInlineUnion`'s ref-array arms: an arm whose element is itself a union of two or more
+// registers that inner union, `atomTys[i]` being atom `i`'s arena row. Returns 0, or -1 once failed.
+function registerRefArrayArmUnions(
+  stmts: i32[],
+  atoms: string[],
+  atomTys: i32[],
+): i32 {
   // A ref-array arm whose element is itself a union registers that inner union too, the
   // arm-position twin of the whole-name `parenUnionArrElemName` recursion above.
   let rai = 0
@@ -12754,9 +12752,6 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
     }
     rai = rai + 1
   }
-  // A map arm interns its value shape and forces the shared map heap flags, the map twin of
-  // the ref-array marking; this keeps the inline and named spellings identical.
-  markMapUnionArms(name)
   0
 }
 
@@ -13704,7 +13699,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
     const udExp = unionAliasMembers(udMem)
     if udExp != "" {
       const udExpAtoms: string[] = []
-      splitUnionAtoms(udExp, udExpAtoms)
+      unionSetAtomsOf(udExp, udExpAtoms)
       if udExpAtoms.length > 1 { udMem = udExp }
     }
     // A function-type member keeps its grouping parens in the join, as the inline union's
@@ -14060,7 +14055,7 @@ function nulCloMixedUnionUnregistered(arm: string) {
   const res = cloResultAtomOf(arm)
   if res == "" { return false }
   const atoms: string[] = []
-  splitUnionAtoms(res, atoms)
+  unionSetAtomsOf(res, atoms)
   if atoms.length < 2 { return false }
   let hasScalar = false
   let hasComposite = false

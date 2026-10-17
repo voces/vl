@@ -650,44 +650,7 @@ function memOffsetArgCheck(nm: string, argIx: i32) {
 // declaration to check against, so arity and argument types are checked here. Returns the
 // call type, or `-1` when the name is none of them and the caller checks it as a value.
 function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
-  // `print(x)` is a compiler builtin (no module/import system yet): it accepts a
-  // single value of any printable type and yields void. Special-cased so a program
-  // that prints does not trip "undeclared identifier 'print'". Each argument is
-  // still checked so a type error inside it surfaces.
-  if cfn.identName == "print" {
-    const pargs = n.callArgs
-    if pargs.length != 1 {
-      tErr("print expects 1 argument, got " + i32ToStr(pargs.length), ix)
-    }
-    let pj = 0
-    while pj < pargs.length {
-      const pt = checkNodeHook(pargs[pj])
-      // `print` demands a value to render, and a `void` call has none — the emitter's
-      // print ladder ends in `call __print_i32__` with nothing on the stack.
-      voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
-      // A domain rejection, asked first (the ruling): `print` takes one value of
-      // `printDomainStr()`'s reps, and an array/struct/map/function value (bare, behind
-      // `| null`, or inside a union) is not one — an ordinary domain error (`tErr`, no
-      // code), not a capability admission, since the language never defined what such a print outputs (D711).
-      if tyPrintsAsRef(pt, 24) {
-        tErr(printRefRefusal(pt), pargs[pj])
-      } else {
-        // The BOXED value-union residue. `print(<i32 | string>)` now LOWERS — every arm
-        // is inside the domain and the emitter dispatches on the box tag, the same
-        // dispatch it performs for `is` (D712) — so what is left here is a box whose
-        // arms that dispatch cannot classify, and only that keeps the concession.
-        const puMsg = printUnionRefusal(pt)
-        if puMsg != "" { tErrUnsupported(puMsg, pargs[pj]) }
-      }
-      // A printed type that still carries a HOLE answers FALSE to both floors above — it
-      // is neither a ref nor a box YET — so the two of them together admit every generic
-      // `print`. Defer it to the pin, the only position that knows the instance.
-      // (`silent-class-inventory` D401; the recorder's header has the measurement.)
-      notePrintCstr(pt, pargs[pj])
-      pj = pj + 1
-    }
-    return TY_VOID
-  }
+  if cfn.identName == "print" { return checkPrintCall(n, ix) }
   // `Map()` / `Set()` construct an empty string-keyed map: key/value HOLES (-1)
   // assignable to any map annotation (`const m: {[string]: i32} = Map()`).
   if cfn.identName == "Map" || cfn.identName == "Set" {
@@ -704,30 +667,7 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
   }
   // `toString(x)` resolves through the ordinary scope as `std:fmt`'s export now, and an
   // un-imported use gets the migration hint `undeclaredIdentMsg` appends.
-  // `fromCodePoints(xs)` is a builtin: an `i32[]` of code points to a string, in one bulk
-  // copy (the amortized alternative to per-char concat).
-  if cfn.identName == "fromCodePoints" {
-    const pargs = n.callArgs
-    if pargs.length != 1 {
-      tErr(
-        "fromCodePoints expects 1 argument, got " + i32ToStr(pargs.length),
-        ix,
-      )
-    } else {
-      const p0 = checkNodeHook(pargs[0])
-      const p0t = T.tys[p0]
-      let pOk = false
-      if p0t is TyArray {
-        // An empty `[]` literal's element hole (-1) pins to i32 here.
-        if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
-      }
-      if p0t is TyErr { pOk = true }
-      if !pOk {
-        tErr("fromCodePoints expects an i32[], got " + tyToStr(p0), ix)
-      }
-    }
-    return TY_STR
-  }
+  if cfn.identName == "fromCodePoints" { return checkFromCodePointsCall(n, ix) }
   // `fromCodePoint(code)` is a builtin: an i32 code point -> a length-1 string.
   if cfn.identName == "fromCodePoint" {
     const fargs = n.callArgs
@@ -744,34 +684,8 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
     }
     return TY_STR
   }
-  // `__str_from_bytes__(src, at, count)` (D4784): the bytes `src[at .. at + count]` as a fresh
-  // string; the caller guarantees UTF-8. A builtin, not a declaration, so a call is no opaque
-  // function value to the narrowing rule (`callDeclFnIx`).
   if cfn.identName == "__str_from_bytes__" {
-    const sbArgs = n.callArgs
-    if sbArgs.length != 3 {
-      tErr(
-        "__str_from_bytes__ expects 3 arguments, got " + i32ToStr(sbArgs.length),
-        ix,
-      )
-      return TY_STR
-    }
-    const sbSrc = checkNodeHook(sbArgs[0])
-    if !assignable(sbSrc, mkArrayTy(TY_U8)) {
-      tErr(
-        "__str_from_bytes__ expects a u8[] source, got " + tyToStr(sbSrc),
-        ix,
-      )
-    }
-    let sbI = 1
-    while sbI < 3 {
-      const sbT = checkNodeHook(sbArgs[sbI])
-      if !assignable(sbT, TY_I32) {
-        tErr("__str_from_bytes__ expects an i32 bound, got " + tyToStr(sbT), ix)
-      }
-      sbI = sbI + 1
-    }
-    return TY_STR
+    return checkStrFromBytesCall(n, ix)
   }
   // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
   // host parity: `defaultScope.ts`. `__array_new__(n, fill)` allocates `n`
@@ -791,64 +705,10 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
     }
     return mkArrayTy(checkNodeHook(anArgs[1]))
   }
-  // `__array_new_default__(n)`: `n` zeroed/default slots. The element type is a hole (-1)
-  // pinned by the destination — the empty-`[]` mechanism — and the emitter reads the same
-  // pinned row back off this node (`arrNewDefaultKind`), so the two cannot disagree about
-  // the rep. Two questions this arm cannot answer yet are recorded here and asked late (`arrDefCallIx`).
   if cfn.identName == "__array_new_default__" {
-    const adArgs = n.callArgs
-    if adArgs.length != 1 {
-      tErr(
-        "__array_new_default__ expects 1 argument, got " + i32ToStr(adArgs.length),
-        ix,
-      )
-    } else {
-      const adLen = checkNodeHook(adArgs[0])
-      if !assignable(adLen, TY_I32) {
-        tErr(
-          "__array_new_default__ expects an i32 length, got " + tyToStr(adLen),
-          ix,
-        )
-      }
-    }
-    const adTy = mkArrayTy(-1)
-    arrDefCallIx.push(ix)
-    arrDefCallTy.push(adTy)
-    return adTy
+    return checkArrayNewDefaultCall(n, ix)
   }
-  // `__array_copy__(dst, dstAt, src, srcAt, count)`: bulk-moves `count` elements from
-  // `src[srcAt..]` into `dst[dstAt..]`; void. Both must be arrays; the element correlation
-  // between them is deliberately not enforced here, matching the host's own leniency (a
-  // mismatched pair fails loudly at the emit stage in both compilers).
-  if cfn.identName == "__array_copy__" {
-    const acArgs = n.callArgs
-    if acArgs.length != 5 {
-      tErr(
-        "__array_copy__ expects 5 arguments, got " + i32ToStr(acArgs.length),
-        ix,
-      )
-      return TY_VOID
-    }
-    let acI = 0
-    while acI < 5 {
-      const acT = checkNodeHook(acArgs[acI])
-      if acI == 0 || acI == 2 {
-        const acTy = T.tys[acT]
-        let acOk = false
-        if acTy is TyArray { acOk = true }
-        if acTy is TyErr { acOk = true }
-        if !acOk {
-          tErr("__array_copy__ expects a T[], got " + tyToStr(acT), ix)
-        }
-      } else {
-        if !assignable(acT, TY_I32) {
-          tErr("__array_copy__ expects an i32, got " + tyToStr(acT), ix)
-        }
-      }
-      acI = acI + 1
-    }
-    return TY_VOID
-  }
+  if cfn.identName == "__array_copy__" { return checkArrayCopyCall(n, ix) }
   // `__trap__()`: the deliberate abort primitive — lowered to `unreachable`.
   // `__trap__("reason")`: an OPTIONAL single string message, printed to the
   // host boundary (the print-of-string path) before the abort — so the trap
@@ -878,6 +738,150 @@ function checkBuiltinIdentCall(n: Call, ix: i32, cfn: Ident): i32 {
     if niTy >= 0 { return niTy }
   }
   -1
+}
+
+// `print(x)` is a compiler builtin (no module/import system yet): it accepts a
+// single value of any printable type and yields void. Special-cased so a program
+// that prints does not trip "undeclared identifier 'print'". Each argument is
+// still checked so a type error inside it surfaces.
+function checkPrintCall(n: Call, ix: i32): i32 {
+  const pargs = n.callArgs
+  if pargs.length != 1 {
+    tErr("print expects 1 argument, got " + i32ToStr(pargs.length), ix)
+  }
+  let pj = 0
+  while pj < pargs.length {
+    const pt = checkNodeHook(pargs[pj])
+    // `print` demands a value to render, and a `void` call has none — the emitter's
+    // print ladder ends in `call __print_i32__` with nothing on the stack.
+    voidValueSlotErr(pt, pargs[pj], "print", pargs[pj])
+    // A domain rejection, asked first (the ruling): `print` takes one value of
+    // `printDomainStr()`'s reps, and an array/struct/map/function value (bare, behind
+    // `| null`, or inside a union) is not one — an ordinary domain error (`tErr`, no
+    // code), not a capability admission, since the language never defined what such a print outputs (D711).
+    if tyPrintsAsRef(pt, 24) {
+      tErr(printRefRefusal(pt), pargs[pj])
+    } else {
+      // The BOXED value-union residue. `print(<i32 | string>)` now LOWERS — every arm
+      // is inside the domain and the emitter dispatches on the box tag, the same
+      // dispatch it performs for `is` (D712) — so what is left here is a box whose
+      // arms that dispatch cannot classify, and only that keeps the concession.
+      const puMsg = printUnionRefusal(pt)
+      if puMsg != "" { tErrUnsupported(puMsg, pargs[pj]) }
+    }
+    // A printed type that still carries a HOLE answers FALSE to both floors above — it
+    // is neither a ref nor a box YET — so the two of them together admit every generic
+    // `print`. Defer it to the pin, the only position that knows the instance.
+    // (`silent-class-inventory` D401; the recorder's header has the measurement.)
+    notePrintCstr(pt, pargs[pj])
+    pj = pj + 1
+  }
+  return TY_VOID
+}
+
+// `fromCodePoints(xs)` is a builtin: an `i32[]` of code points to a string, in one bulk
+// copy (the amortized alternative to per-char concat).
+function checkFromCodePointsCall(n: Call, ix: i32): i32 {
+  const pargs = n.callArgs
+  if pargs.length != 1 {
+    tErr("fromCodePoints expects 1 argument, got " + i32ToStr(pargs.length), ix)
+  } else {
+    const p0 = checkNodeHook(pargs[0])
+    const p0t = T.tys[p0]
+    let pOk = false
+    if p0t is TyArray {
+      // An empty `[]` literal's element hole (-1) pins to i32 here.
+      if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
+    }
+    if p0t is TyErr { pOk = true }
+    if !pOk { tErr("fromCodePoints expects an i32[], got " + tyToStr(p0), ix) }
+  }
+  return TY_STR
+}
+
+// `__str_from_bytes__(src, at, count)` (D4784): the bytes `src[at .. at + count]` as a fresh
+// string; the caller guarantees UTF-8. A builtin, not a declaration, so a call is no opaque
+// function value to the narrowing rule (`callDeclFnIx`).
+function checkStrFromBytesCall(n: Call, ix: i32): i32 {
+  const sbArgs = n.callArgs
+  if sbArgs.length != 3 {
+    tErr(
+      "__str_from_bytes__ expects 3 arguments, got " + i32ToStr(sbArgs.length),
+      ix,
+    )
+    return TY_STR
+  }
+  const sbSrc = checkNodeHook(sbArgs[0])
+  if !assignable(sbSrc, mkArrayTy(TY_U8)) {
+    tErr("__str_from_bytes__ expects a u8[] source, got " + tyToStr(sbSrc), ix)
+  }
+  let sbI = 1
+  while sbI < 3 {
+    const sbT = checkNodeHook(sbArgs[sbI])
+    if !assignable(sbT, TY_I32) {
+      tErr("__str_from_bytes__ expects an i32 bound, got " + tyToStr(sbT), ix)
+    }
+    sbI = sbI + 1
+  }
+  return TY_STR
+}
+
+// `__array_new_default__(n)`: `n` zeroed/default slots. The element type is a hole (-1)
+// pinned by the destination — the empty-`[]` mechanism — and the emitter reads the same
+// pinned row back off this node (`arrNewDefaultKind`), so the two cannot disagree about
+// the rep. Two questions this arm cannot answer yet are recorded here and asked late (`arrDefCallIx`).
+function checkArrayNewDefaultCall(n: Call, ix: i32): i32 {
+  const adArgs = n.callArgs
+  if adArgs.length != 1 {
+    tErr(
+      "__array_new_default__ expects 1 argument, got " + i32ToStr(adArgs.length),
+      ix,
+    )
+  } else {
+    const adLen = checkNodeHook(adArgs[0])
+    if !assignable(adLen, TY_I32) {
+      tErr(
+        "__array_new_default__ expects an i32 length, got " + tyToStr(adLen),
+        ix,
+      )
+    }
+  }
+  const adTy = mkArrayTy(-1)
+  arrDefCallIx.push(ix)
+  arrDefCallTy.push(adTy)
+  return adTy
+}
+
+// `__array_copy__(dst, dstAt, src, srcAt, count)`: bulk-moves `count` elements from
+// `src[srcAt..]` into `dst[dstAt..]`; void. Both must be arrays; the element correlation
+// between them is deliberately not enforced here, matching the host's own leniency (a
+// mismatched pair fails loudly at the emit stage in both compilers).
+function checkArrayCopyCall(n: Call, ix: i32): i32 {
+  const acArgs = n.callArgs
+  if acArgs.length != 5 {
+    tErr(
+      "__array_copy__ expects 5 arguments, got " + i32ToStr(acArgs.length),
+      ix,
+    )
+    return TY_VOID
+  }
+  let acI = 0
+  while acI < 5 {
+    const acT = checkNodeHook(acArgs[acI])
+    if acI == 0 || acI == 2 {
+      const acTy = T.tys[acT]
+      let acOk = false
+      if acTy is TyArray { acOk = true }
+      if acTy is TyErr { acOk = true }
+      if !acOk { tErr("__array_copy__ expects a T[], got " + tyToStr(acT), ix) }
+    } else {
+      if !assignable(acT, TY_I32) {
+        tErr("__array_copy__ expects an i32, got " + tyToStr(acT), ix)
+      }
+    }
+    acI = acI + 1
+  }
+  return TY_VOID
 }
 
 // The ordinary call: the callee evaluates to a function type, so the arguments are checked
