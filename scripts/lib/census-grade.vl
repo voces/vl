@@ -259,21 +259,34 @@ function batchCheck(c: Ctx, names: string[], res: Map<string, Res>): string[] {
   clean
 }
 
-// `vl run --batch` over the check-clean cells of a chunk.
+// Module-cache lookups one `vl run --batch` made, and how many of them hit.
+type Seen = { hit: i32, all: i32 }
+
+// `vl run --batch` over the check-clean cells of a chunk. Its stderr carries only the
+// module-cache trace, since each cell's own output goes to `--out-dir`.
 function batchRun(
   c: Ctx,
   names: string[],
   expect: Map<string, string>,
   res: Map<string, Res>,
-) {
+): Seen {
   const od = c.tmp + "/run"
   spawn("mkdir", ["-p", od])
-  const args = ["run", "--batch", "--out-dir", od]
+  const args = ["VL_STD=" + c.std, "VL_CACHE_TRACE=1", "timeout", "600", c.vl]
+  args.push("run")
+  args.push("--batch")
+  args.push("--out-dir")
+  args.push(od)
   for n in names { args.push(c.part + "/" + n + ".vl") }
   args.push("--compiler")
   args.push(c.seed)
-  const p = vlStd(c, "600", args)
-  if p.code == 124 { return 0 }
+  const p = spawn("env", args)
+  const seen: Seen = { hit: 0, all: 0 }
+  for l in p.err.split("\n") {
+    if startsWith(l, "vl: module cache ") { seen.all = seen.all + 1 }
+    if startsWith(l, "vl: module cache hit") { seen.hit = seen.hit + 1 }
+  }
+  if p.code == 124 { return seen }
   for n in names {
     const o = od + "/" + n + ".vl.out"
     const e = od + "/" + n + ".vl.err"
@@ -294,14 +307,15 @@ function batchRun(
       res[n] = { cls: "loud emit reject", msg: norm(rerr) }
     }
   }
-  0
+  seen
 }
 
 // ── the chunk worker: `--grade-chunk <file>` ─────────────────────────────────────────
 
 // A chunk file is six header lines (vl, seed, std, part, scratch, batch flag) and then one
 // cell per two lines, its name and its expected stdout as a JSON string. The answer goes
-// to `<file>.out`, one `name\tclass\tmsg` line per cell.
+// to `<file>.out`, one `name\tclass\tmsg` line per cell, and the batch run's module-cache
+// hits and lookups to `<file>.cache`.
 export function gradeChunk(file: string) {
   const lines = readText(file).split("\n")
   const c: Ctx = {
@@ -326,10 +340,12 @@ export function gradeChunk(file: string) {
     k = k + 2
   }
   const res: Map<string, Res> = Map()
+  let seen: Seen = { hit: 0, all: 0 }
   if batch {
     const clean = batchCheck(c, names, res)
-    if clean.length > 0 { batchRun(c, clean, expect, res) }
+    if clean.length > 0 { seen = batchRun(c, clean, expect, res) }
   }
+  writeText(file + ".cache", "\{seen.hit} \{seen.all}")
   const out: string[] = []
   for n in names {
     let r = res[n]
@@ -412,21 +428,37 @@ export function jobsFromEnv(dflt: i32): i32 {
   n ?? dflt
 }
 
-// Each part's answers by its name; on a worker failure `rc` is non-zero and `failed`
-// names the part whose chunk did not answer.
+// Each part's answers by its name, and how many of the batch runs' module-cache lookups
+// hit; on a worker failure `rc` is non-zero and `failed` names the part whose chunk did
+// not answer.
 export type Fanned = {
   rc: i32,
   failed: string,
   parts: Map<string, Map<string, Res>>,
+  reused: i32,
+  looked: i32,
+}
+
+// The bound on a dedicated module cache, in MB: room for several seeds' corpus modules.
+const CACHE_MB = "1024"
+
+// The `env` prefix the workers run under for `cache`: "" keeps the caller's module cache,
+// "off" turns it off, and anything else is a directory to cache the cells' modules in.
+function cacheEnv(cache: string): string[] {
+  if cache == "" { return [] }
+  if cache == "off" { return ["env", "VL_NO_CACHE=1"] }
+  ["env", "VL_CACHE_DIR=" + cache, "VL_CACHE_MAX_MB=" + CACHE_MB]
 }
 
 // Grade every part against `seed`, `jobs` chunks at a time, by workers built from the
-// tool at `self` (which must hand `--grade-chunk` to `gradeChunk`).
+// tool at `self` (which must hand `--grade-chunk` to `gradeChunk`), under the module
+// cache `cache` names (see `cacheEnv`).
 export function gradeParts(
   self: string,
   parts: Part[],
   seed: string,
   jobs: i32,
+  cache: string,
 ): Fanned {
   const out: Map<string, Map<string, Res>> = Map()
   const abs = cwd()
@@ -445,22 +477,24 @@ export function gradeParts(
     const files: string[] = []
     for ch in chunks { files.push(ch.file) }
     writeText(root + "/chunks", join(files, "\n") + "\n")
-    const x = spawn(
-      "sh",
-      fanOutArgv(
-        root + "/chunks",
-        toString(jobs),
-        [vl, "run", grader, "--", "--grade-chunk"],
-      ),
-    )
+    const cmd = cacheEnv(cache)
+    for a in [vl, "run", grader, "--", "--grade-chunk"] { cmd.push(a) }
+    const x = spawn("sh", fanOutArgv(root + "/chunks", toString(jobs), cmd))
     if x.code != 0 {
       let failed = chunks[0].part
       for ch in chunks {
         if !exists(ch.file + ".out") { failed = ch.part }
       }
       spawn("rm", ["-rf", root])
-      return { rc: x.code, failed: failed, parts: out }
+      return { rc: x.code, failed: failed, parts: out, reused: 0, looked: 0 }
     }
+  }
+  let reused = 0
+  let looked = 0
+  for ch in chunks {
+    const n = readText(ch.file + ".cache").split(" ")
+    reused = reused + (parseI32(n[0]) ?? 0)
+    looked = looked + (parseI32(n[n.length - 1]) ?? 0)
   }
   for p in parts {
     const mine: Map<string, Res> = Map()
@@ -475,7 +509,7 @@ export function gradeParts(
     out[p.name] = mine
   }
   spawn("rm", ["-rf", root])
-  { rc: 0, failed: "", parts: out }
+  { rc: 0, failed: "", parts: out, reused: reused, looked: looked }
 }
 
 // The graded map as `json.dump(res, indent=0, sort_keys=True)` writes it.
