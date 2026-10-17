@@ -194,6 +194,7 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsNewtypeBrand,
+  tyIsRecord,
   tyLitMemberTexts,
   tyNumScalarBaseName,
   tyPrimNameOf,
@@ -1053,6 +1054,7 @@ import {
 import {
   isUName,
   isUNameAB,
+  msKeepTy,
   msMemberAtomsOfSet,
   msSetOfText,
   msSetOfUnion,
@@ -1081,6 +1083,7 @@ import { sidArrGet, sidLookup, sidOf, sidOfNode, sidText } from "./symbols"
 import { arrElemNameRaw, nameIsArray, peelGroupParens } from "./tyname"
 import { substTyDeep, tvWriteLandTy } from "./check_relate_core"
 import {
+  flattenVariantsInto,
   nonNullTy,
   tyEmitPrimOf,
   tyHasTyVar,
@@ -4629,6 +4632,17 @@ function pushNarrow(name: string, variant: string) {
   pushNarrowRep(name, variant, -1, -1)
 }
 
+// Whether `ty` is a union of two or more records and nothing else.
+function tyIsRecordUnion(ty: i32): boolean {
+  const arms: i32[] = []
+  flattenVariantsInto(ty, arms)
+  if arms.length < 2 { return false }
+  for a in arms {
+    if !tyIsRecord(a) { return false }
+  }
+  true
+}
+
 // Push an `is`-test narrowing: the tested spelling plus the arena type the checker resolved
 // it to at the `is` node (`isVarTyIxOf`, -1 for a node the checker never saw, such as a
 // monomorphized clone, which lands on the name path).
@@ -4642,7 +4656,21 @@ function pushNarrowIs(name: string, variant: string, condIx: i32) {
     return narrowTop
   }
   const recv = if cn is IsExpr { cn.isObj } else { -1 }
-  pushNarrowRep(name, isVariantSpellingAtRecv(variant, ity, recv), ity, -1)
+  const sp = isVariantSpellingAtRecv(variant, ity, recv)
+  // A union of records names no one row: the then-arm keeps the members of the receiver's
+  // set that union covers, read at the box the receiver already holds.
+  if variantIndexOf(sp) < 0 && tyIsRecordUnion(ity) {
+    const rv = P.nodes[unwrapParen(recv)]
+    let s = -1
+    if rv is Ident || narrowSlotOf(name) >= 0 {
+      s = currentStructNarrowSetIdAt(name, emitCurFnIx, unwrapParen(recv))
+    }
+    const r = msKeepTy(s, ity)
+    const txt = if r >= 0 { msTextOf(r) } else { "" }
+    if txt == "" { return narrowTop }
+    return pushNarrowRep(name, txt, -1, r)
+  }
+  pushNarrowRep(name, sp, ity, -1)
 }
 
 // True when `name` read in lifted frame `fnIx` is one of its captures, so the read is an env
