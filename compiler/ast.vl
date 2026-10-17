@@ -3358,3 +3358,263 @@ export function nodeValueSpineChildren(ix: i32): i32[] {
   if elseIfLink(ix) >= 0 { return nodeSpineChildren(ix) }
   nodeValueChildren(ix)
 }
+
+// ── per-module parse images ──────────────────────────────────────────────────
+
+// Index `x` of arena `k` printed for a parse image: `sp[2k]..sp[2k+1]` is the module's range
+// in that arena (nodes, tokens, spelling nodes, spelling kids, diagnostics, extern rows,
+// extern-global rows). `rel` rebases on the range's start; a negative sentinel prints as
+// itself and an index outside the module's range as `!<absolute>`.
+export function piIx(x: i32, sp: i32[], k: i32, rel: boolean): string {
+  if x < 0 { return i32ToStr(x) }
+  const b = sp[2 * k]
+  if x < b || x >= sp[2 * k + 1] { return "!" + i32ToStr(x) }
+  if rel { return i32ToStr(x - b) }
+  i32ToStr(x)
+}
+
+// True when `x` lies in arena `k`'s range of `sp`.
+function piIn(x: i32, sp: i32[], k: i32): boolean {
+  x >= sp[2 * k] && x < sp[2 * k + 1]
+}
+
+// A string field of a parse image, length-prefixed so no payload can forge a separator.
+export function piStr(s: string): string { i32ToStr(s.length) + ":" + s }
+
+// `xs` as a bracketed list of arena-`k` indices.
+export function piIxs(xs: i32[], sp: i32[], k: i32, rel: boolean): string {
+  let out = "["
+  let i = 0
+  while i < xs.length {
+    if i > 0 { out = out + "," }
+    out = out + piIx(xs[i], sp, k, rel)
+    i = i + 1
+  }
+  out + "]"
+}
+
+// The members of `xs` inside arena `k`'s range, printed in table order.
+function piIxsIn(xs: i32[], sp: i32[], k: i32, rel: boolean): string {
+  const kept: i32[] = []
+  let i = 0
+  while i < xs.length {
+    if piIn(xs[i], sp, k) { kept.push(xs[i]) }
+    i = i + 1
+  }
+  piIxs(kept, sp, k, rel)
+}
+
+// One module's rows of the side tables the parser writes, for `parse_image.vl`: each row is
+// keyed by a node, diagnostic or extern row inside the module's range of `sp`, in table order.
+// An extern row names its link by import name, since link rows are shared across modules.
+export function parseImageTables(sp: i32[], rel: boolean, out: string[]) {
+  piAnnRows(sp, rel, out)
+  piDeclRows(sp, rel, out)
+  out.push("btd " + piIxsIn(bodyTyDeclNode, sp, 0, rel))
+  out.push("vif " + piIxsIn(valueIfNodes, sp, 0, rel))
+  out.push("fns " + piIxsIn(funcDeclNodes, sp, 0, rel))
+  out.push("sbr " + piIxsIn(stmtBraceNodes, sp, 0, rel))
+  out.push("sbt " + piIxsIn(stmtBraceTails, sp, 0, rel))
+  out.push("bns " + piIxsIn(braceNameStmts, sp, 0, rel))
+  const exps: i32[] = []
+  const holes: i32[] = []
+  let i = sp[0]
+  while i < sp[1] {
+    if exportDeclNodes[i] ?? false { exps.push(i) }
+    if i < tplHole.length && tplHole[i] == 1 { holes.push(i) }
+    i = i + 1
+  }
+  out.push("exp " + piIxs(exps, sp, 0, rel))
+  out.push("tpl " + piIxs(holes, sp, 0, rel))
+  let r = 0
+  while r + 1 < recDupField.length {
+    if piIn(recDupField[r], sp, 0) {
+      out.push(
+        "rdf "
+          + piIx(recDupField[r], sp, 0, rel)
+          + " "
+          + piIx(recDupField[r + 1], sp, 0, rel),
+      )
+    }
+    r = r + 2
+  }
+  piDiagRows(sp, rel, out)
+  piExternRows(sp, rel, out)
+  0
+}
+
+// The spelling-root and explicit type-argument rows of `parseImageTables`.
+function piAnnRows(sp: i32[], rel: boolean, out: string[]) {
+  let r = 0
+  while r < annTsNode.length {
+    if piIn(annTsNode[r], sp, 0) {
+      out.push(
+        "ann "
+          + piIx(annTsNode[r], sp, 0, rel)
+          + " "
+          + piIx(annTsWritten[r], sp, 2, rel),
+      )
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < udTsNode.length {
+    if piIn(udTsNode[r], sp, 0) {
+      out.push(
+        "ud "
+          + piIx(udTsNode[r], sp, 0, rel)
+          + " "
+          + piIx(udTsWritten[r], sp, 2, rel),
+      )
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < callTaCall.length {
+    if piIn(callTaCall[r], sp, 0) {
+      let row = "cta " + piIx(callTaCall[r], sp, 0, rel)
+      let j = callTaStart[r]
+      while j < callTaStart[r] + callTaCount[r] {
+        row = row
+          + " "
+          + piIx(callTaNodes[j], sp, 0, rel)
+          + "@"
+          + i32ToStr(callTaEnds[j])
+        j = j + 1
+      }
+      out.push(row)
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The generic-parameter, bound and getter rows of `parseImageTables`.
+function piDeclRows(sp: i32[], rel: boolean, out: string[]) {
+  let r = 0
+  while r < declGpNode.length {
+    if piIn(declGpNode[r], sp, 0) {
+      let row = "gp "
+        + piIx(declGpNode[r], sp, 0, rel)
+        + " "
+        + piStr(declGpBase[r])
+      let j = declGpStart[r]
+      while j < declGpStart[r] + declGpCount[r] {
+        row = row + " " + piStr(declGpName[j])
+        j = j + 1
+      }
+      out.push(row)
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < fnTpBoundFn.length {
+    if piIn(fnTpBoundFn[r], sp, 0) {
+      out.push(
+        "tpb "
+          + piIx(fnTpBoundFn[r], sp, 0, rel)
+          + " "
+          + i32ToStr(fnTpBoundIx[r])
+          + " "
+          + piIx(fnTpBoundAnn[r], sp, 0, rel),
+      )
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < declBoundNode.length {
+    if piIn(declBoundNode[r], sp, 0) {
+      out.push(
+        "dbd "
+          + piIx(declBoundNode[r], sp, 0, rel)
+          + " "
+          + piIx(declBoundAnn[r], sp, 0, rel),
+      )
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < getDeclNodes.length {
+    if piIn(getDeclNodes[r], sp, 0) {
+      let e = "0"
+      if getDeclExps[r] { e = "1" }
+      out.push("get " + piIx(getDeclNodes[r], sp, 0, rel) + " " + e)
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The diagnostic-keyed rows of `parseImageTables`.
+function piDiagRows(sp: i32[], rel: boolean, out: string[]) {
+  out.push("dgl " + piIxsIn(dgLossless, sp, 4, rel))
+  let r = 0
+  while r < dgSpanIdx.length {
+    if piIn(dgSpanIdx[r], sp, 4) {
+      out.push(
+        "dgs "
+          + piIx(dgSpanIdx[r], sp, 4, rel)
+          + " "
+          + piIx(dgSpanTok[r], sp, 1, rel),
+      )
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < dgCodeIdx.length {
+    if piIn(dgCodeIdx[r], sp, 4) {
+      out.push(
+        "dgc " + piIx(dgCodeIdx[r], sp, 4, rel) + " " + piStr(dgCodeVal[r]),
+      )
+    }
+    r = r + 1
+  }
+  0
+}
+
+// The module's extern declaration rows. The link row is named, never indexed, and the module
+// is implicit; `rel` false prints both indices as the shared tables hold them.
+function piExternRows(sp: i32[], rel: boolean, out: string[]) {
+  let r = sp[10]
+  while r < sp[11] {
+    let at = ""
+    if !rel {
+      at = " link="
+        + i32ToStr(extDeclLink[r])
+        + " mod="
+        + i32ToStr(extDeclMod[r])
+    }
+    out.push(
+      "ext "
+        + piStr(extDeclVl[r])
+        + " "
+        + piStr(extNames[extDeclLink[r]])
+        + " "
+        + piStr(extDeclSig[r])
+        + " "
+        + piIx(extDeclPos[r], sp, 1, rel)
+        + at,
+    )
+    r = r + 1
+  }
+  r = sp[12]
+  while r < sp[13] {
+    let at = ""
+    if !rel { at = " link=" + i32ToStr(extGDeclLink[r]) }
+    out.push(
+      "extg "
+        + piIx(extGDeclNode[r], sp, 0, rel)
+        + " "
+        + piStr(extGNames[extGDeclLink[r]])
+        + " "
+        + piStr(extGDeclTy[r])
+        + " "
+        + i32ToStr(extGDeclMut[r])
+        + " "
+        + piIx(extGDeclPos[r], sp, 1, rel)
+        + at,
+    )
+    r = r + 1
+  }
+  0
+}
