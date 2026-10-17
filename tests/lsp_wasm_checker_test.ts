@@ -461,9 +461,9 @@ Deno.test({ name: "wasm-checker: a missing import is a diagnostic, not a crash",
 Deno.test({ name: "wasm-checker: a std: import resolves through withStd (embedded map)", ignore }, async () => {
   const checker = loadWasmChecker(SEED, log)!;
   // The injected reader knows NOTHING about std — the fetch loop's withStd
-  // wrapper serves `std:seed` from the embedded map.
+  // wrapper serves `std:str` from the embedded map.
   const diags = await checker.check(
-    'import { stdSmoke } from "std:seed"\nprint(stdSmoke())\n',
+    'import { padStart } from "std:str"\nprint(padStart("7", 3, "0"))\n',
     "/proj/main.vl",
     noSiblings,
   );
@@ -486,16 +486,16 @@ Deno.test({ name: "wasm-checker: a std: import resolves through withStd (embedde
 });
 
 Deno.test({ name: "wasm-checker: a workspace std/ dir wins over the embedded map", ignore }, async () => {
-  // The workspace's std/seed.vl declares a DIFFERENT stdSmoke arity; the
-  // zero-arg call that is clean against the embedded map must now error —
+  // The workspace's std/str.vl declares a DIFFERENT padStart arity; the
+  // three-arg call that is clean against the embedded map must now error —
   // proving the workspace override took precedence.
   const checker = loadWasmChecker(SEED, log, () => "/ws/std")!;
   const read = (key: string) =>
-    key === "/ws/std/seed.vl"
-      ? "export function stdSmoke(n: i32): i32 {\n  return n\n}\n"
+    key === "/ws/std/str.vl"
+      ? "export function padStart(n: i32): i32 {\n  return n\n}\n"
       : undefined;
   const diags = await checker.check(
-    'import { stdSmoke } from "std:seed"\nprint(stdSmoke())\n',
+    'import { padStart } from "std:str"\nprint(padStart("7", 3, "0"))\n',
     "/proj/main.vl",
     read,
   );

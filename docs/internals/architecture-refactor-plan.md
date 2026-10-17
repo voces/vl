@@ -38,7 +38,7 @@ restate measurements; follow the links.
 | L9 split `typecheck.vl` | D1 **in progress**. Budget: a carve may add up to +1.5% L2 fuel when the cost is source shape alone and identity reads 0 differ. Last: hook census, 111 sites, none can be direct (each is the checker's own recursion); the code is unchanged, since moving the slot's install beside `checkNode` cost +0.44% L2 fuel with no change in behaviour. Next: none planned in `typecheck.vl` (429 lines, the dispatcher's home). | [L9 log](#l9-log) |
 | L12 | **in review**. Last: the playground adapter calls every `lsp/src/features.ts` function and gains references, highlights, outline and rename; playground TS 3,687 → 3,471 lines. Next: nothing; the lane is done once this merges. | [L12 log](#l12-log) |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; the other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
-| SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-j (#3696). Open: S-e row 2, S-g (waits on SC), S-i row 2, S-l, S-m, S-n. | [SMALL log](#small-log) |
+| SMALL S-a, S-b, S-d … S-n | **partial**. Last: S-e row 2 (#3989), S-i row 2, S-m in part. Open: S-g (waits on SC); S-m's `std:seed` drop (waits on Q14) and hex (waits on `std-hex-parse-format`). | [SMALL log](#small-log) |
 | RepDesc rulings | **ruled** 2026-10-13. `one-literal-union-rep` applied (#3653); `nullable-rep-rule-stated-once` ruled (b). | [RepDesc log](#repdesc-log) |
 
 Update this table in the PR that moves an item.
@@ -589,6 +589,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - **S-a, S-b, S-d … S-n**: Done: S-a rows 1–3 (#3662; row 4 measured not hot and declined), S-b (#3669, #3678, #3682; rows 2 and 3 stale or L4's), S-d rows 1–2 (#3687) and row 3 in part (#3697), S-e rows 1 and 3 (#3688), S-f (#3689, deliberate), S-h (#3665), S-i row 1 and the `value_flags` half of row 2, S-j (#3696).
 - **S-a, S-b, S-d … S-n**: Open: S-e row 2 (the `literal-opcode-write` budget rule), S-g (waits on SC), S-i row 2's `engineFailOffset` test (the seed does not export it), S-l, S-m, S-n.
 - **S-a, S-b, S-d … S-n**: S-k is superseded by the no-Python direction.
+- **S-a, S-b, S-d … S-n**: 2026-10-17. S-l was already done by #3731 and S-n by #3739. S-e row 2 is the `literal-byte-write` budget rule (#3989, baseline 274). S-i row 2: `engineFailOffset` moved to the leaf `compiler/engine_msg.vl`, and one table, `tests/fixtures/engine-fail-offset.txt`, now tests both it and its Rust twin; against master's parser the table fails on 6 cases, which are now aligned. S-m: the tests use `std:str` instead of `std:seed`, and `casesWasmOracle.ts` uses `isStdKey`. Dropping `std:seed` waits on OPEN-QUESTIONS Q14. Hex is filed as `std-hex-parse-format` in `open-rulings.md`.
 
 ### RepDesc log
 
