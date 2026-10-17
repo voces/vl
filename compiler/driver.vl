@@ -4694,13 +4694,9 @@ function modBuiltinImportNote(name: string): string {
   " — `" + name + "` is a builtin and needs no import; remove it from this list"
 }
 
-// The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
-function modCompile(emit: i32): i32 {
-  modIdAssignKeys()
-  plusLinksClear()
-  vcEtDrop()
-  vcEpDrop()
-  // 1. Order + validate (DFS from the entry, table index 0).
+// `modCompile`'s step 1: orders and validates the graph by a DFS from the entry (table index 0).
+// Returns 1 when that left resolution diagnostics, banked tokenless, and 0 otherwise.
+function modOrderGraph(): i32 {
   modState = []
   modOrder = []
   modDiags = []
@@ -4733,20 +4729,20 @@ function modCompile(emit: i32): i32 {
     modResolveDiagN = modDiags.length
     return 1
   }
-  // 2. Parse each module dependency-first into the SHARED arena. Tokens append
-  // to `P.toks` (anchors stay per-module-correct via the global `pos`); each
-  // `parseProgram` starts at its own module's first token.
+  0
+}
+
+// `modCompile`'s step 2: parses each module dependency-first into the SHARED arena, every one
+// even past a failure so one run reports every file's syntax errors. Tokens append to `P.toks`
+// and each `parseProgram` starts at its own module's first token. Returns the roots in
+// `modOrder`'s order.
+function modParseAll(): i32[] {
   const roots: i32[] = []
   modLoadStart = []
   modLoadMod = []
   // The same ranges, in the leaf both `modOfTok` and the emitter's name section read.
   srcmapReset()
   srcmapSetKeys(modKeys)
-  // Sibling modules are independent: parses every module and aggregates their
-  // diagnostics rather than aborting at the first failure, so one run reports
-  // every file's syntax errors. `vcLoadMod` attributes a lex diag to the module
-  // being loaded; parse diags resolve their owner through `modOfTok`.
-
   // The doc table is cleared here, not in `vcLoadToks`: that clear keys on an empty
   // `P.toks`, and a module served from the cache never calls it, so the previous program's
   // rows would answer this one's queries (D1863).
@@ -4775,30 +4771,27 @@ function modCompile(emit: i32): i32 {
     o = o + 1
   }
   vcLoadMod = 0
-  if modOneShot != 0 { modCacheClear() }
-  // The same stage-1 rule the single-source paths use, so a file does not lose
-  // type feedback merely by gaining an `import` (see `vcParseBlocked`). The
-  // quantifier spans the WHOLE graph — one lossy diagnostic in any module stops
-  // the merge for all of them, which is what the shared arena requires anyway.
-  if vcParseBlocked() { return 1 }
-  if fsAfterParse() < 0 { return 3 }
-  // 2b. The reserved-name rules. Duplicate bindings are decided after the rewrite below,
-  // by `modCheckOverloads`, which needs every function's merged first-parameter type.
+  roots
+}
+
+// `modCompile`'s step 2b: the reserved-name rules over each module's declarations and imports,
+// in the pre-rename window — after `modBuildRename` a declared name is `f64$mN` and there is
+// nothing left to recognise. Duplicate bindings are `modCheckOverloads`'s, after the rewrite.
+function modCheckReservedAll(roots: i32[]) {
   let dc = 0
   while dc < modOrder.length {
-    // The same pre-rename window, and the only one: after `modBuildRename` the declared
-    // name is `f64$mN` and the reserved-name rules have nothing left to recognise.
     modCheckReservedDecls(roots[dc])
     let tEnd = P.toks.length
     if dc + 1 < modLoadStart.length { tEnd = modLoadStart[dc + 1] }
     modCheckReservedImports(modOrder[dc], roots[dc], modLoadStart[dc], tEnd)
     dc = dc + 1
   }
-  if vcParseBlocked() { return 1 }
-  // 3 + 4. Per-module rename map + scope-aware arena rewrite. First register
-  // every top-level `self`-function under its mangled name (across ALL modules)
-  // so a UFCS member-call can resolve its (possibly mangled) callee through the
-  // merge; the rewrite records the plain→mangled aliases it discovers.
+}
+
+// `modCompile`'s steps 3 and 4: each module's rename map and scope-aware arena rewrite. Every
+// top-level `self`-function is registered under its mangled name first, across ALL modules, so
+// a UFCS member-call resolves its callee through the merge.
+function modRewriteAll(roots: i32[]) {
   ufcsAliasReset()
   ufcsImpReset()
   // D1571's set spans every module of ONE program, so it is cleared with the other
@@ -4823,14 +4816,12 @@ function modCompile(emit: i32): i32 {
     o2 = o2 + 1
   }
   modRwMod = -1
-  // A duplicate binding is never lossless-flagged, so this stays a hard stop: a name two
-  // overlapping declarations share has no answer the checker could improve on.
-  modCheckOverloads(roots)
-  if vcParseBlocked() { return 1 }
-  // 4b. Resolves each of the root module's re-exports to its merged target, aliasing
-  // the bare `name` onto it in the export section. Only module 0's rows: a
-  // dependency's re-export is that dependency's own surface, and aliasing every
-  // module's row would leak a bare dependency name into the entry's wasm ABI.
+}
+
+// `modCompile`'s step 4b: resolves each of the root module's re-exports to its merged target,
+// aliasing the bare `name` onto it in the export section. A dependency's re-export is its own
+// surface; aliasing it would leak a bare dependency name into the entry's wasm ABI.
+function modResolveRootReExports() {
   reExpName = []
   reExpTarget = []
   let re = 0
@@ -4857,10 +4848,12 @@ function modCompile(emit: i32): i32 {
     }
     re = re + 1
   }
-  // 4c. The root module's plain `export`-marked declarations surface under their
-  // bare names too, appended to the same alias tables, exactly like a re-export.
-  // The emitter exports only these alias tables, so an internal function (a lifted
-  // lambda, a mono instance) never leaks into the wasm ABI.
+}
+
+// `modCompile`'s step 4c: the root module's plain `export`-marked declarations surface under
+// their bare names too, appended to the re-export alias tables. The emitter exports only those
+// tables, so an internal function (a lifted lambda, a mono instance) never leaks into the ABI.
+function modAliasRootExports() {
   const rexSeen: {[string]: boolean} = Map()
   let rsi = 0
   while rsi < reExpName.length {
@@ -4884,8 +4877,11 @@ function modCompile(emit: i32): i32 {
     }
     rex = rex + 1
   }
-  // 5. Merge: ONE Program concatenating the modules' statements dependency-first
-  // (deps' top-level initializers run before their dependents', as in the host).
+}
+
+// `modCompile`'s step 5: ONE Program concatenating the modules' statements dependency-first,
+// so a dependency's top-level initializers run before its dependents', as in the host.
+function modMergeRoots(roots: i32[]): i32 {
   const allStmts: i32[] = []
   let o3 = 0
   while o3 < modOrder.length {
@@ -4900,7 +4896,34 @@ function modCompile(emit: i32): i32 {
     }
     o3 = o3 + 1
   }
-  const merged = mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
+  mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
+}
+
+// The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
+function modCompile(emit: i32): i32 {
+  modIdAssignKeys()
+  plusLinksClear()
+  vcEtDrop()
+  vcEpDrop()
+  if modOrderGraph() != 0 { return 1 }
+  const roots = modParseAll()
+  if modOneShot != 0 { modCacheClear() }
+  // The same stage-1 rule the single-source paths use, so a file does not lose
+  // type feedback merely by gaining an `import` (see `vcParseBlocked`). The
+  // quantifier spans the WHOLE graph — one lossy diagnostic in any module stops
+  // the merge for all of them, which is what the shared arena requires anyway.
+  if vcParseBlocked() { return 1 }
+  if fsAfterParse() < 0 { return 3 }
+  modCheckReservedAll(roots)
+  if vcParseBlocked() { return 1 }
+  modRewriteAll(roots)
+  // A duplicate binding is never lossless-flagged, so this stays a hard stop: a name two
+  // overlapping declarations share has no answer the checker could improve on.
+  modCheckOverloads(roots)
+  if vcParseBlocked() { return 1 }
+  modResolveRootReExports()
+  modAliasRootExports()
+  const merged = modMergeRoots(roots)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   checkProgram(merged)

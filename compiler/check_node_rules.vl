@@ -1099,6 +1099,133 @@ export function checkIfTailAt(
   TY_ERR
 }
 
+// An `if` link's else side once it is left: whether it diverges, its tail type, whether it is an
+// `else if` link, the clobber-ledger mark at its start, and its definite-assignment delta.
+type IfElseArm = {
+  diverges: boolean,
+  ty: i32,
+  isLink: boolean,
+  hi: i32,
+  adds: i32[],
+  rems: i32[],
+}
+
+// `checkIfTail`'s else-arm leave: pops the else scope, seeds a return tail's inferred value and
+// takes the definite-assignment delta since the fork. `elseRes` is a link's join and `elseExits`
+// whether the arm always exits. With no else, every field is its fall-through default.
+function ifTailLeaveElse(
+  n: IfStmt,
+  f: IfChk,
+  elseRes: i32,
+  elseExits: boolean,
+): IfElseArm {
+  const adds: i32[] = []
+  const rems: i32[] = []
+  const el: IfElseArm = {
+    diverges: false,
+    ty: TY_VOID,
+    isLink: false,
+    hi: 0,
+    adds: adds,
+    rems: rems,
+  }
+  if n.ifElse < 0 { return el }
+  const enElse = P.nodes[n.ifElse]
+  el.hi = narClobKeys.length
+  el.diverges = elseExits
+  pgUpArmIxSet(-1)
+  retTailPosSet(false)
+  el.ty = blockTailTy
+  let elseIx = blockTailIx
+  // A chain link's value is the whole inner `if`'s join, and `blockTailIx` then names the
+  // innermost block's tail — a node the join did not come from, so it names none (D1591).
+  if enElse is IfStmt {
+    el.ty = elseRes
+    elseIx = -1
+    el.isLink = true
+  }
+  if f.enNames.length > 0 { popScope() }
+  if f.ifTail {
+    if el.ty != TY_VOID && el.ty != TY_ERR {
+      // A chain link's value is the inner `if` itself.
+      if el.isLink { noteInferRetValue(n.ifElse, el.ty) }
+      noteInferRetWitness(elseIx, el.ty)
+      const seedElse = ifArmValTy(n.ifElse, el.ty)
+      noteInferredSeed(seedElse, armLit(seedElse, n.ifElse))
+    }
+  }
+  const daElseSid: i32[] = []
+  const daElseWas: i32[] = []
+  daTouchedSince(f.daFork, daElseSid, daElseWas)
+  daRollbackTo(f.daFork)
+  daSplitDelta(daElseSid, daElseWas, el.adds, el.rems)
+  el
+}
+
+// `checkIfTail`'s value-less verdict, banked at the node both ways: no completing arm yields a
+// value, so a return tail drops the arm seeds it planted. Returns whether an arm ending in a bare
+// `{ … }` leaves the `if` undecided instead — the open bare-block ruling D1903 pins.
+function ifTailNoValueVerdict(n: IfStmt, f: IfChk, el: IfElseArm): boolean {
+  const ix = f.ifIx
+  let bareArm = armTailUndecided(n.ifThen)
+  if f.daHasElse && !el.isLink && armTailUndecided(n.ifElse) { bareArm = true }
+  let noValue = !bareArm
+    && !f.thenExits
+    && ifArmGivesNoValue(n.ifThen, f.thenTy)
+  if !bareArm && f.daHasElse && !el.diverges {
+    // An `else if` link answers its own verdict: an else-less link's fall-through is its `null`.
+    if el.isLink {
+      if ifYieldsNoValue(n.ifElse) { noValue = true }
+    } else if ifArmGivesNoValue(n.ifElse, el.ty) {
+      noValue = true
+    }
+  }
+  // Written both ways: a later pass re-decides with the callees' final types.
+  if ix >= 0 {
+    if noValue { ifNoValueAtSetAt(ix, true) } else { ifNoValueClear(ix) }
+  }
+  if noValue && f.ifTail && !f.ifInRetArg && f.daHasElse {
+    dropTailIfSeeds(f.seedLogMark, f.seedObsMark, f.seedObsLit)
+  }
+  bareArm
+}
+
+// `checkIfTail`'s banked value type for an `if` with an else at node `ix >= 0`: the arms' join,
+// where an exiting arm adds nothing and `f32Keep` keeps an inner `f32` arm; `f32Join` when one
+// is adopted, and -1 when `bareArm` leaves the value undecided.
+function ifTailBankValTy(
+  n: IfStmt,
+  f: IfChk,
+  el: IfElseArm,
+  f32Keep: boolean,
+  f32Join: i32,
+  bareArm: boolean,
+) {
+  const ix = f.ifIx
+  let valTy = TY_VOID
+  if !f.thenExits {
+    valTy = ifArmValTy(n.ifThen, f.thenTy)
+    if !f32Keep { valTy = f32ArmPlainTy(n.ifThen, valTy) }
+  }
+  if !el.diverges {
+    // A `void` here is an else-less link's value-less fall-through, which adds nothing.
+    let ev = ifArmValTy(n.ifElse, el.ty)
+    if !f32Keep { ev = f32ArmPlainTy(n.ifElse, ev) }
+    if f.thenExits || valTy == TY_VOID {
+      valTy = ev
+    } else if ev != TY_VOID {
+      valTy = joinArmLit(
+        valTy,
+        armLit(valTy, n.ifThen),
+        ev,
+        armLit(ev, n.ifElse),
+      )
+    }
+  }
+  if f32Join >= 0 { valTy = f32Join }
+  if bareArm { ifValTyAtSetAt(ix, -1) } else { ifValTyAtSetAt(ix, valTy) }
+}
+
 function checkIfTail(
   n: IfStmt,
   f: IfChk,
@@ -1118,10 +1245,6 @@ function checkIfTail(
   const pgUpMark = f.pgUpMark
   const clobMark = f.clobMark
   const ifTail = f.ifTail
-  const ifInRetArg = f.ifInRetArg
-  const seedLogMark = f.seedLogMark
-  const seedObsMark = f.seedObsMark
-  const seedObsLit = f.seedObsLit
   const thenExits = f.thenExits
   const enNames = f.enNames
   const enTys = f.enTys
@@ -1129,47 +1252,12 @@ function checkIfTail(
   const thenLo = f.thenLo
   const thenTy = f.thenTy
   const daFork = f.daFork
-  const daThenAdds = f.daThenAdds
-  const daThenRems = f.daThenRems
   const daHasElse = f.daHasElse
   const daThenDiverges = thenExits
-  let daElseDiverges = false
-  const daElseAdds: i32[] = []
-  const daElseRems: i32[] = []
-  let elseTy = TY_VOID
-  let elseIsLink = false
-  let elseHi = 0
-  if daHasElse {
-    const enElse = P.nodes[n.ifElse]
-    elseHi = narClobKeys.length
-    daElseDiverges = elseExits
-    pgUpArmIxSet(-1)
-    retTailPosSet(false)
-    elseTy = blockTailTy
-    let elseIx = blockTailIx
-    // A chain link's value is the whole inner `if`'s join, and `blockTailIx` then names the
-    // innermost block's tail — a node the join did not come from, so it names none (D1591).
-    if enElse is IfStmt {
-      elseTy = elseRes
-      elseIx = -1
-      elseIsLink = true
-    }
-    if enNames.length > 0 { popScope() }
-    if ifTail {
-      if elseTy != TY_VOID && elseTy != TY_ERR {
-        // A chain link's value is the inner `if` itself.
-        if elseIsLink { noteInferRetValue(n.ifElse, elseTy) }
-        noteInferRetWitness(elseIx, elseTy)
-        const seedElse = ifArmValTy(n.ifElse, elseTy)
-        noteInferredSeed(seedElse, armLit(seedElse, n.ifElse))
-      }
-    }
-    const daElseSid: i32[] = []
-    const daElseWas: i32[] = []
-    daTouchedSince(daFork, daElseSid, daElseWas)
-    daRollbackTo(daFork)
-    daSplitDelta(daElseSid, daElseWas, daElseAdds, daElseRems)
-  }
+  const el = ifTailLeaveElse(n, f, elseRes, elseExits)
+  const daElseDiverges = el.diverges
+  const elseTy = el.ty
+  const elseIsLink = el.isLink
   // Closes each `is`-guard alternative: a diverging then-branch leaves the code after this
   // `if` unreachable for that argument (nothing required); otherwise record where the reached suffix starts.
   if !daThenDiverges {
@@ -1185,12 +1273,12 @@ function checkIfTail(
   daRelease(daFork)
   daJoinArms(
     daThenDiverges,
-    daThenAdds,
-    daThenRems,
+    f.daThenAdds,
+    f.daThenRems,
     daHasElse,
     daElseDiverges,
-    daElseAdds,
-    daElseRems,
+    el.adds,
+    el.rems,
   )
   // The narrowing column's own join, `daJoinArms`'s shape one table over: a name an arm wrote
   // reads below the `if` at the join of what the surviving arms left it at, not at its
@@ -1202,7 +1290,7 @@ function checkIfTail(
   if narClobKeys.length > clobMark {
     applyArmJoins(
       f,
-      elseHi,
+      el.hi,
       daThenDiverges,
       daElseDiverges,
       n.ifCond,
@@ -1238,26 +1326,7 @@ function checkIfTail(
   retTailPosSet(ifTail)
   // An `if` with a completing arm that yields no value is a statement: it is `void` as the
   // function's tail, so the arm values it seeded leave the inferred return.
-  // An arm ending in a bare `{ … }` leaves the `if` undecided: whether that block yields its
-  // tail is the open bare-block-as-expression ruling, and D1903 pins what runs today.
-  let bareArm = armTailUndecided(n.ifThen)
-  if daHasElse && !elseIsLink && armTailUndecided(n.ifElse) { bareArm = true }
-  let noValue = !bareArm && !thenExits && ifArmGivesNoValue(n.ifThen, thenTy)
-  if !bareArm && daHasElse && !daElseDiverges {
-    // An `else if` link answers its own verdict: an else-less link's fall-through is its `null`.
-    if elseIsLink {
-      if ifYieldsNoValue(n.ifElse) { noValue = true }
-    } else if ifArmGivesNoValue(n.ifElse, elseTy) {
-      noValue = true
-    }
-  }
-  // Written both ways: a later pass re-decides with the callees' final types.
-  if ix >= 0 {
-    if noValue { ifNoValueAtSetAt(ix, true) } else { ifNoValueClear(ix) }
-  }
-  if noValue && ifTail && !ifInRetArg && daHasElse {
-    dropTailIfSeeds(seedLogMark, seedObsMark, seedObsLit)
-  }
+  const bareArm = ifTailNoValueVerdict(n, f, el)
   // An f32 arm beside literal arms types the join f32, as it does an operator (PL-049). A return
   // tail's arms seed the inferred return one by one, which keeps its reading (D2774).
   let f32Join = -1
@@ -1277,28 +1346,7 @@ function checkIfTail(
     && !valueIsLitOnly(n.ifElse)
     && !njFnReached(njFnIx)
   if daHasElse && ix >= 0 {
-    let valTy = TY_VOID
-    if !thenExits {
-      valTy = ifArmValTy(n.ifThen, thenTy)
-      if !f32Keep { valTy = f32ArmPlainTy(n.ifThen, valTy) }
-    }
-    if !daElseDiverges {
-      // A `void` here is an else-less link's value-less fall-through, which adds nothing.
-      let ev = ifArmValTy(n.ifElse, elseTy)
-      if !f32Keep { ev = f32ArmPlainTy(n.ifElse, ev) }
-      if thenExits || valTy == TY_VOID {
-        valTy = ev
-      } else if ev != TY_VOID {
-        valTy = joinArmLit(
-          valTy,
-          armLit(valTy, n.ifThen),
-          ev,
-          armLit(ev, n.ifElse),
-        )
-      }
-    }
-    if f32Join >= 0 { valTy = f32Join }
-    if bareArm { ifValTyAtSetAt(ix, -1) } else { ifValTyAtSetAt(ix, valTy) }
+    ifTailBankValTy(n, f, el, f32Keep, f32Join, bareArm)
   }
   // A discarded `if` is a statement, whatever its arms hold.
   if valDiscarded(ix) {
