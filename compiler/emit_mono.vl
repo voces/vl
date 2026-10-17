@@ -284,6 +284,7 @@ import {
   fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
   fnFlowDeclPathSrcs,
+  fnFlowDeclPinTys,
   fnFlowDeclWritten,
   fnFlowElemKind,
   fnFlowLamPin,
@@ -13565,7 +13566,7 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 // argument is, so the callee can forward it to a further hole (D5402). "" when the argument is
 // not a generic or the checker bound no concrete signature.
 function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
-  const bt = monoHoleGenFnTy(callIx, pIx, argIx)
+  const bt = monoHoleGenFnTy(callIx, pIx, argIx, ctx)
   if bt < 0 { return "" }
   const nm = monoConcreteFnTyName(bt)
   if nm == "" { return "" }
@@ -13577,27 +13578,47 @@ function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
   nm
 }
 
-// The concrete function type the checker bound hole parameter `pIx` to at call `callIx`, when
+// The concrete function type hole parameter `pIx` takes at call `callIx` in frame `ctx`, when
 // `argIx` is a generic function: named, through never-written aliases, or a value typed at a
 // foreign generic's open signature, as a call returning one is (D5401); -1 otherwise.
-function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
+function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32, ctx: i32): i32 {
   const ax = unwrapParen(argIx)
   if ax < 0 { return -1 }
-  if (
-    !monoCalleeIsGeneric(ax)
-    && monoReadGenFnFe(ax) < 0
-    && !tyIsForeignGenericSig(nodeTyIxOf(ax))
-  ) {
-    return -1
-  }
+  const named = monoCalleeIsGeneric(ax) || monoReadGenFnFe(ax) >= 0
+  if !named && !tyIsForeignGenericSig(nodeTyIxOf(ax)) { return -1 }
   const pt = nodeTyIxOf(pIx)
   if pt < 0 || pt >= T.tys.length { return -1 }
   const pv = T.tys[pt]
   if !(pv is TyVar) { return -1 }
   const bt = callBindTyOf(callIx, pv.tvName)
-  if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) { return -1 }
-  if !(T.tys[bt] is TyFunc) { return -1 }
-  bt
+  if monoTyConcreteFn(bt) { return bt }
+  if !named { return -1 }
+  // With no binding, the generic takes the one signature the flow table pins it at past the
+  // hole, as `apply(add, 1, 2)` pins `add` at `g(x, y)` (D5612).
+  let d = ax
+  const lf = monoReadLetFrame(ax, ctx)
+  if lf[1] >= 0 { d = lf[1] }
+  monoGenFnTyAt(nodeTyIxOf(ax), fnFlowDeclPinTys(d))
+}
+
+// Generic signature `vt` instantiated at parameter types `ps`; -1 when the arity differs, a
+// parameter does not fit, or a type variable stays open.
+function monoGenFnTyAt(vt: i32, ps: i32[]): i32 {
+  if vt < 0 || vt >= T.tys.length || ps.length == 0 || !tyHasTyVar(vt) {
+    return -1
+  }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) || vf.fnParamTypes.length != ps.length { return -1 }
+  const gN: string[] = []
+  const gT: i32[] = []
+  let j = 0
+  while j < ps.length {
+    bindGenWalk(vf.fnParamTypes[j], ps[j], gN, gT)
+    j = j + 1
+  }
+  const inst = substTyDeep(vt, gN, gT)
+  if !monoTyConcreteFn(inst) { return -1 }
+  inst
 }
 
 // Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
@@ -13702,7 +13723,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             let anTy = -1
             if an == "" {
               an = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
-              if an != "" { anTy = monoHoleGenFnTy(callIx, params[i], args[i]) }
+              if an != "" {
+                anTy = monoHoleGenFnTy(callIx, params[i], args[i], ctx)
+              }
             }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
@@ -13907,7 +13930,7 @@ function monoPinAnnotatedParam(
     let an2Ty = -1
     if ann == tp {
       an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
-      if an2 != "" { an2Ty = monoHoleGenFnTy(callIx, params[i], args[i]) }
+      if an2 != "" { an2Ty = monoHoleGenFnTy(callIx, params[i], args[i], ctx) }
     }
     if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
