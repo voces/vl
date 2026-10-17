@@ -321,7 +321,7 @@ Deno.test({
       }
       const got = await addr2line(wasm, topFrame(trace));
       expectLine(got, `${DIR}/inline/helper.vl:6:3`, "inlined callee");
-      if (!got.endsWith("in `outer$m0`")) {
+      if (!/in `outer\$m\d+`$/.test(got)) {
         throw new Error(`want the caller's frame named, got \`${got}\``);
       }
     } finally {
@@ -340,10 +340,12 @@ Deno.test({
       await build(`${DIR}/inline/main.vl`, wasm, ["--names", "--source-map"]);
       const trace = await trapTrace(wasm, "outer", 9);
       const r = await run(["addr2line", wasm, "-"], trace);
-      const marks = r.out.split("\n").filter((l) => l.startsWith("    => "));
+      // A merged name carries its module's stable id, a hash of its key; spelled `$m<id>` here.
+      const marks = r.out.split("\n").filter((l) => l.startsWith("    => "))
+        .map((l) => l.replace(/\$m\d+/g, () => "$m<id>"));
       const want = [
-        "    => " + `${DIR}/inline/helper.vl:6:3` + "  in `grab$m1`",
-        "    => " + `${DIR}/inline/main.vl:5:3` + "  in `outer$m0`",
+        "    => " + `${DIR}/inline/helper.vl:6:3` + "  in `grab$m<id>`",
+        "    => " + `${DIR}/inline/main.vl:5:3` + "  in `outer$m<id>`",
       ];
       if (r.code !== 0 || JSON.stringify(marks) !== JSON.stringify(want)) {
         throw new Error(
