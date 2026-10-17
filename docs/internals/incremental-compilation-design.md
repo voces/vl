@@ -881,6 +881,51 @@ the chain as action kind `opt` (`opt_cache_action`, `main.rs`), traced as `-O hi
   39.0 s / 567 MiB RSS; S1 hit with the chain run 30.7 s / 323 MiB; S1+S2 hit 0.2 s / 102 MiB;
   module and map byte-identical to the cold build, and a verify run agrees.
 
+**S4 on eardstap's test files (2026-10-17, master `7fe51e77c`).** One `vl build` of a
+`play/*.test.vl` costs 3.4–3.9 G guest fuel. Almost all of that is the game's shared module
+graph: `play/game.vl` alone is 2.3 G, `rules/state.vl` 0.26 G, a trivial print 1.4 M.
+- Profile: guest samples (`VL_PROFILE_GUEST` on a `--names` seed) over seven test files, 4,856
+  samples in all, inclusive share.
+
+  | frame | incl |
+  | --- | ---: |
+  | `emitProgram` | 73.7% |
+  | `runEmitPasses` | 40.8% |
+  | `emitModule` / `emitFuncCode` | 31% |
+  | `checkProgramPass` | 21% |
+  | `monomorphize` | 18.6% |
+  | `monoRebuild` | 12.7% |
+  | `computeRetInference` | 10.5% (440 of its samples under `monoRebuild`, 72 from the pass table) |
+  | `dupScanRun` | 9.2% |
+  | `sigKeyOfTy` | 9.0% |
+  | `criClassify` | 7.4% |
+
+  The top self frame is `__str_eq__` at 9.6%, spread over many callers.
+- The cut: `monoRebuild` re-ran `computeVoidFns` and `computeRetInference`, both
+  whole-program fixpoints, after every minted instance. On `journey.test.vl` that was 21 full
+  rebuilds. They now run once, in `monoRetSettle`, when the walk ends and again after
+  `monoPruneTemplates`. `collectA` and `buildFnMap` still rebuild per instance. During the
+  walk, the return rows of un-annotated functions therefore hold `buildFnMap`'s annotation
+  seed, not the inferred kind. No static argument covers every mono-walk reader. The evidence
+  that no reader's answer moves is output identity: `difftree.sh --identity` over the corpus,
+  plus every `.vl` file of eardstap (74) and diderven (331) built byte-identical.
+- Fuel, `vl build`, master seed against the candidate:
+
+  | file | before | after |
+  | --- | ---: | ---: |
+  | `journey.test.vl` | 3,377,572,016 | 3,018,749,719 (−10.6%) |
+  | `camp.test.vl` | 3,918,405,651 | 3,214,974,854 (−18.0%) |
+  | `combat.test.vl` | 3,611,694,503 | 3,127,796,605 (−13.4%) |
+  | `clarity.test.vl` | 3,590,541,072 | 3,105,731,477 (−13.5%) |
+
+  The self-compile does not move: L2 is 92,156,524,372 before and 92,156,524,374 after. The
+  compiler declares no generic, so `monomorphize` returns before its walk.
+- Guard: the `generic instances beside inferred returns` pair in
+  `tests/vl_scaling_shape_test.ts` reads 1.23, against 3.59 on master.
+- What is left is flatter. `sigKeyOfTy` mostly hits its memo: 12,265 calls and 1,977 misses on
+  `journey`, so a perfect memo saves about 4.5%. `dupScanRun` and the checker are the next
+  frames to profile.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.

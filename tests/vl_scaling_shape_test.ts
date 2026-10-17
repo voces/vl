@@ -344,6 +344,27 @@ const genFirstInsts = (n: number, many: boolean): string => {
   return o.join("\n") + "\n";
 };
 
+// GENERIC INSTANCES BESIDE UN-ANNOTATED FUNCTIONS: `u` plain functions with inferred returns
+// and `n` generics instantiated once each, against the same `n` written at `i32`. Only the
+// many arm mints instances, so a whole-program return inference re-run per instance reads as
+// n x u here, which is the shape of a test file importing a game's whole module graph.
+const genInstsBesideInferred = (n: number, u: number, many: boolean): string => {
+  const o: string[] = ["type Row = { id: i32, name: string, w: f64 }"];
+  for (let i = 0; i < u; i++) {
+    o.push(`function plain${i}(r: Row, k: i32) {`, "  let acc = k");
+    for (let j = 0; j < 6; j++) o.push(`  acc = acc + ${(i + j) % 13} * ${j % 7} - ${j % 5}`);
+    o.push(`  if acc > ${i % 50} { r.name + "${i}" } else { r.name }`, "}");
+  }
+  for (let i = 0; i < n; i++) {
+    o.push(many ? `function g${i}<T>(x: T, r: Row) { [x] }` : `function g${i}(x: i32, r: Row) { [x] }`);
+  }
+  o.push(`const row: Row = { id: 1, name: "r", w: 0.5 }`, "let tot = 0");
+  for (let i = 0; i < u; i++) o.push(`tot = tot + plain${i}(row, ${i}).length`);
+  for (let i = 0; i < n; i++) o.push(`tot = tot + g${i}(${i % 97}, row)[0]`);
+  o.push("print(tot)");
+  return o.join("\n") + "\n";
+};
+
 // COVARIANT BINDINGS: N delivery functions either way, `cov` of them binding a covariant
 // list handle (`const b: Shape[] = a`) and the rest binding the same list at its own type.
 // The alias-closure answer is memoised per (root name, frame), so only the covariant ones
@@ -919,6 +940,16 @@ axis(
   2.5,
   "`buildFnMap` re-classifies the whole program per first instance of a generic (D3761).",
   (d) => twoFiles(d, genFirstInsts(200, true), genFirstInsts(200, false)),
+);
+
+// S4 of incremental-compilation-design.md: 100 instances beside 200 inferred-return functions.
+// Fuel reads 1.23 (0.614G / 0.498G); master `7fe51e77c` read 3.59 (1.791G), from
+// `monoRebuild` re-running `computeVoidFns` and `computeRetInference` after every instance.
+axis(
+  "generic instances beside inferred returns",
+  2.5,
+  "`monoRebuild` (compiler/emit_mono.vl) is re-running the return inference per minted instance instead of once at the end of the walk.",
+  (d) => twoFiles(d, genInstsBesideInferred(100, 200, true), genInstsBesideInferred(100, 200, false)),
 );
 
 // 0.78 / 0.91 / 0.86, against 36.51 / 2.82 / 12.95 on the pre-D1657 compiler — the axis the

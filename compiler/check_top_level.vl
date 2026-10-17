@@ -175,6 +175,7 @@ import {
 import { fnResultUnconsumed } from "./check_unconsumed"
 import { mkUnionTy } from "./check_union_mint"
 import { mkWideStrLitTy } from "./check_wide_lits"
+import { weFnRefs, weSummaryUnsettled } from "./check_write_effects"
 import { fnDeclIx } from "./check_write_scan"
 import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
 import { isNeverTy, isNullTy, isVoidTy } from "./tyquery"
@@ -425,13 +426,17 @@ export function checkProgramNode(n: Program) {
   // Pass 1.9: the generic bodies pass 2 walks for their constraints (`cstrProbeBefore`).
   cstrPrePass(stmts)
   // Pass 2: check every top-level statement (bodies included).
+  const stmtAt: {[i32]: i32} = Map()
+  let si = 0
+  while si < stmts.length {
+    if P.nodes[stmts[si]] is FuncDecl { stmtAt[stmts[si]] = si }
+    si = si + 1
+  }
+  const done: boolean[] = []
+  for _ in stmts { done.push(false) }
   let j = 0
   while j < stmts.length {
-    cstrProbeBefore(stmts[j])
-    markValDiscard(stmts[j])
-    crStmtEnter(stmts[j])
-    checkNodeHook(stmts[j])
-    crStmtLeave()
+    if !done[j] { progCheckCalleeFirst(stmts, j, stmtAt, done) }
     j = j + 1
   }
   // A function whose return never resolved (a genuinely base-case-less recursive
@@ -452,6 +457,32 @@ export function checkProgramNode(n: Program) {
   // LAST, because both of its filters read state this pass fills — see its header.
   annCommitVariantMembers()
   TY_VOID
+}
+
+// Pass 2 for top-level statement `j`, after any later-declared function its body reaches whose
+// write summary still reads an untyped node: what a call may write then does not depend on
+// source order (D5593). A statement is marked done on entry, so a cycle keeps source order.
+function progCheckCalleeFirst(
+  stmts: i32[],
+  j: i32,
+  stmtAt: {[i32]: i32},
+  done: boolean[],
+) {
+  done[j] = true
+  if P.nodes[stmts[j]] is FuncDecl {
+    for d in weFnRefs(stmts[j]) {
+      const k = stmtAt[d] ?? -1
+      if k > j && !done[k] && weSummaryUnsettled(d) {
+        progCheckCalleeFirst(stmts, k, stmtAt, done)
+      }
+    }
+  }
+  cstrProbeBefore(stmts[j])
+  markValDiscard(stmts[j])
+  crStmtEnter(stmts[j])
+  checkNodeHook(stmts[j])
+  crStmtLeave()
+  0
 }
 
 // Pass 0a of `checkProgramNode`: every top-level `type` name registers before any body is

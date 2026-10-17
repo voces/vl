@@ -156,6 +156,7 @@ import {
   exprHasScratch,
   fnHasScratch,
   globalCellIsImmutable,
+  globalHasTypeAnn,
   globalIsNonConst,
   letInitFoldsExpr,
   letIsNulBoolAnn,
@@ -773,6 +774,7 @@ import {
 import { cloLiftScan, cloLifted } from "./emit_lift"
 import { identAuditBegin, identAuditMark, identAuditRun } from "./ident_audit"
 import {
+  armScopeOpenOver,
   buildFnMap,
   collectA,
   collectAnnShapes,
@@ -804,6 +806,9 @@ import {
   reconcileVariantFieldSpans,
   scanArrLitCommit,
   scanExprArmLocals,
+  stmtArmRoot,
+  stmtArmScopeClose,
+  stmtArmScopeOpen,
   synthCaptureEmptyListAnns,
   synthCaptureReadAnns,
   synthDstPinAnns,
@@ -1384,6 +1389,19 @@ function recordStartRefPushSlot(stmtIx: i32) {
 function startScanBlock(blockIx: i32) {
   applyPushPopBits(blockPushPopBits(blockIx, -1))
   if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
+  // A statement's arm tail is read at its prelude locals, as `emitStmt` reads it (D5333).
+  const blk = P.nodes[blockIx]
+  if blk is Block {
+    let bi = 0
+    while bi < blk.blkStmts.length {
+      const root = stmtArmRoot(blk.blkStmts[bi])
+      if root >= 0 && armScopeOpenOver(root, blk.blkStmts[bi]) {
+        if exprHasStrOp(root, -1) { fnUsesStrOp = true }
+        scopePop()
+      }
+      bi = bi + 1
+    }
+  }
   if blockHasScratch(blockIx, "arrNew") { fnUsesArrNew = true }
   if blockHasScratch(blockIx, "coalesceCall") { fnUsesCoalesceCall = true }
   if blockHasMapOp(blockIx, -1) { fnUsesMap = true }
@@ -1398,7 +1416,9 @@ function startScanBlock(blockIx: i32) {
 // those expressions lower into the start function's body exactly as a bare top-level statement does, so they need the same frames (a `for`-range `step` is excluded — a non-constant step is already a clean emit reject).
 function startScanHeaderExpr(exprIx: i32) {
   if exprIx < 0 { return 0 }
+  const armScoped = armScopeOpenOver(exprIx, exprIx)
   if exprHasStrOp(exprIx, -1) { fnUsesStrOp = true }
+  if armScoped { scopePop() }
   if exprHasScratch(exprIx, "arrNew") { fnUsesArrNew = true }
   if exprHasScratch(exprIx, "coalesceCall") { fnUsesCoalesceCall = true }
   if exprHasMapOp(exprIx, -1) { fnUsesMap = true }
@@ -1916,6 +1936,61 @@ function startFnDetectFrames() {
   0
 }
 
+// Whether the start function may read a global init's arm tails at their prelude locals:
+// only where no tail decides the global's cell, which `globalCellKind` classifies with no
+// arm frame open — an annotated global, or an init no arm tail yields into (D5430).
+function globalArmScopeOk(stmtIx: i32): boolean {
+  const s = P.nodes[stmtIx]
+  if s is LetDecl {
+    return globalHasTypeAnn(stmtIx) || !initYieldsArmTail(s.letInit)
+  }
+  false
+}
+
+// Whether a value `if` can yield part of the value at `ix`, through a paren, a non-boolean
+// operator's operand, or a list or record element.
+function initYieldsArmTail(ix: i32): boolean {
+  if ix < 0 { return false }
+  const b = unwrapParen(ix)
+  if b < 0 || b >= P.nodes.length { return false }
+  const n = P.nodes[b]
+  if n is BinExpr {
+    const op = n.binOp
+    if (
+      op == "&&"
+      || op == "||"
+      || op == "=="
+      || op == "!="
+      || op == "<"
+      || op == "<="
+      || op == ">"
+      || op == ">="
+    ) {
+      return false
+    }
+    return initYieldsArmTail(n.binLeft) || initYieldsArmTail(n.binRight)
+  }
+  if n is IfStmt { return true }
+  kidsYieldArmTail(b)
+}
+
+// Whether a child of the list literal, record literal, field or spread `b` yields an arm
+// tail; any other kind holds no element a value `if` can yield into.
+function kidsYieldArmTail(b: i32): boolean {
+  if b < 0 || b >= P.nodes.length { return false }
+  const n = P.nodes[b]
+  if !(n is ArrayLit || n is ObjLit || n is FieldInit || n is Spread) {
+    return false
+  }
+  const kids = nodeChildren(b)
+  let k = 0
+  while k < kids.length {
+    if initYieldsArmTail(kids[k]) { return true }
+    k = k + 1
+  }
+  false
+}
+
 // One scratch-detection sweep of the start function, at whatever same-named-slot bias
 // `dupScanRun` has set. A `.push` is a statement-level void call, never in an init value
 // position, so an init's push frames are driven by Member-receiver `.pop`s instead. Split from
@@ -1932,6 +2007,14 @@ function startFnDetectScratch() {
         const ix = g.letInit
         applyPushPopBits(exprPopBits(ix, -1))
         if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
+        // The init's arm tail is read at its prelude locals, as the start emit reads it (D5333).
+        if (
+          globalArmScopeOk(globalStmts[gi])
+          && armScopeOpenOver(ix, globalStmts[gi])
+        ) {
+          if exprHasStrOp(ix, -1) { fnUsesStrOp = true }
+          scopePop()
+        }
         // A `string` global initialized with a literal-union atom widens via the runtime tower
         // (`emitAtomToStr`), which stages the atom id in the string-op scratch frame.
         if globalInitWidensAtomToStr(globalStmts[gi]) { fnUsesStrOp = true }
@@ -1998,7 +2081,10 @@ function startFnDetectScratch() {
       // detector plus the expr walkers
       applyPushPopBits(callPushBits(startStmts[si], -1))
       applyPushPopBits(exprPopBits(startStmts[si], -1))
+      // The emitter reads an arm tail at its prelude locals (`emitStmt`), so this scan does too.
+      const armKept = stmtArmScopeOpen(startStmts[si])
       if exprHasStrOp(startStmts[si], -1) { fnUsesStrOp = true }
+      if armKept >= 0 { scopePop() }
       if exprHasScratch(startStmts[si], "arrNew") { fnUsesArrNew = true }
       if exprHasScratch(startStmts[si], "coalesceCall") {
         fnUsesCoalesceCall = true
@@ -2236,12 +2322,17 @@ function emitStartFnCode(out: u8[]) {
       emitCurStmtIx = globalStmts[gi]
       gInitStartOrd = globalStmtOrd[gi]
       const gSpanAt = bodyExpr.length
+      let gArmKept = -1
+      if globalArmScopeOk(globalStmts[gi]) {
+        gArmKept = stmtArmScopeOpen(globalStmts[gi])
+      }
       const gInitRc = emitStartGlobalInit(
         bodyExpr,
         exprPrev,
         gi,
         globalStmts[gi],
       )
+      if gArmKept >= 0 { stmtArmScopeClose(gArmKept) }
       if gInitRc < 0 { return gInitRc }
       // A guarded global's initializer has run (a folded one, at its declaration): advance the
       // progress cell past it.
