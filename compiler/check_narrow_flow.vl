@@ -472,6 +472,7 @@ import {
   TyArray,
   TyErr,
   TyFunc,
+  TyLit,
   TyMap,
   TyNullable,
   TyObj,
@@ -3358,7 +3359,6 @@ function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]) {
 
 // `x == L` over a literal union narrows `x` as `x is L` does (Q10): to the literal where the test
 // holds, to the union less the literal where it fails. `holds` names the side being collected.
-// Only an operand whose every member is a literal narrows; a plain `string` or `i32` stays as is.
 function pushLitEqFact(
   condIx: i32,
   holds: boolean,
@@ -3369,27 +3369,87 @@ function pushLitEqFact(
   if lp < 0 { return 0 }
   const lit = litCmpTy(condIx)
   if lit < 0 { return 0 }
-  const place = asgTestedPlace(lp)
-  if !holds && placeHasOptionalHop(place) { return 0 }
+  // The tested literal, banked as an `is` node banks its type: the emitter narrows a boxed
+  // receiver through the same `is` channel, keyed on this comparison node.
+  if pushLitEqFactAt(asgTestedPlace(lp), lit, holds, names, tys) {
+    recordClonedIsVarTyIx(condIx, lit)
+  }
+  0
+}
+
+// The fact `place == lit` gives on side `holds`; false when it gives none. A union narrows when
+// every member is a literal, or when `lit` is a member no other member of a non-nullable union
+// admits (D5714); a plain `string` or `i32` stays as is.
+function pushLitEqFactAt(
+  place: i32,
+  lit: i32,
+  holds: boolean,
+  names: string[],
+  tys: i32[],
+): boolean {
+  if place < 0 || lit < 0 { return false }
+  if !holds && placeHasOptionalHop(place) { return false }
   const cur = placeCurTy(place, names, tys)
-  if cur < 0 { return 0 }
+  if cur < 0 { return false }
   let base = cur
   const ct = T.tys[cur]
   if ct is TyNullable { base = ct.nInner }
-  if !allLitMembers(base) { return 0 }
-  if isWideLitJoin(base) { return 0 }
-  // The tested literal, banked as an `is` node banks its type: the emitter narrows a boxed
-  // receiver through the same `is` channel, keyed on this comparison node.
-  recordClonedIsVarTyIx(condIx, lit)
+  if !allLitMembers(base) && !(base == cur && litSoleHolderIn(base, lit)) {
+    return false
+  }
+  if isWideLitJoin(base) { return false }
   if holds {
     const meet = litSetMeetTy(cur, lit)
-    if meet >= 0 { return pushNarrowFact(place, meet, names, tys) }
-    if meet == -1 && assignable(lit, base) {
-      return pushNarrowFact(place, lit, names, tys)
+    if meet >= 0 {
+      pushNarrowFact(place, meet, names, tys)
+    } else if meet == -1 && assignable(lit, base) {
+      pushNarrowFact(place, lit, names, tys)
     }
-    return 0
+    return true
   }
   pushNarrowFact(place, subtractTy(cur, lit), names, tys)
+  true
+}
+
+// The fact a `match` value pattern `lit` gives its scrutinee `scrut` on side `holds`: the one
+// its desugared `scrut == lit` collects, gathered before that compare exists.
+export function matchValPatFact(
+  scrut: i32,
+  lit: i32,
+  holds: boolean,
+  names: string[],
+  tys: i32[],
+) {
+  pushLitEqFactAt(asgTestedPlace(scrut), lit, holds, names, tys)
+  0
+}
+
+// Whether the literal `lit` is a member of the union `u` that no other member admits, so a
+// value equal to it is that member: `"a"` in `"a" | i32`, but not in `"a" | string`.
+function litSoleHolderIn(u: i32, lit: i32): boolean {
+  if !(T.tys[lit] is TyLit) { return false }
+  const ut = T.tys[u]
+  let found = false
+  if ut is TyUnion {
+    for m in ut.uMembers {
+      if sameLitTy(m, lit) { found = true }
+      else if !isNullTy(m) && assignable(lit, m) { return false }
+    }
+  }
+  found
+}
+
+// Whether types `a` and `b` are the same literal (kind and text).
+function sameLitTy(a: i32, b: i32): boolean {
+  if a == b { return true }
+  const at = T.tys[a]
+  const bt = T.tys[b]
+  if at is TyLit {
+    if bt is TyLit {
+      return at.litKind == bt.litKind && at.litText == bt.litText
+    }
+  }
+  false
 }
 
 // Collect the narrowings that hold when `cond` is true into the parallel `names`/`tys` arrays,

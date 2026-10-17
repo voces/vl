@@ -1,7 +1,21 @@
 // A `match` expression: integer and literal arms, type arms with their bindings, and the
 // type the arms join to.
 
-import { Block, IsExpr, LetDecl, MatchExpr, P, StrLit, i32ToStr } from "./ast"
+import {
+  BinExpr,
+  Block,
+  Ident,
+  IfStmt,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  P,
+  StrLit,
+  arenaReplaceNode,
+  i32ToStr,
+  mkBinary,
+  mkIdent,
+} from "./ast"
 import { resolveMatchConstPats } from "./check_annot_resolve"
 import {
   checkNodeHook,
@@ -76,6 +90,7 @@ import {
   collectThenNarrows,
   markUnionCover,
   matchRestNarrows,
+  matchValPatFact,
   popScope,
 } from "./check_narrow_flow"
 import { pushScope } from "./check_narrow_paths"
@@ -202,6 +217,13 @@ function matchIntSetKeys(setTys: i32[], keys: string[], labels: string[]) {
       labels.push(mt.litText)
     }
   }
+  0
+}
+
+// Lowers the checked `match` at `ix` in place and checks the one node the lowering built.
+function matchLower(ix: i32) {
+  const built = desugarMatchAt(ix)
+  if built >= 0 { checkNodeHook(built) }
   0
 }
 
@@ -348,7 +370,7 @@ function checkMatchIntArms(
   }
   // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
   if !inferQuiet {
-    desugarMatchAt(ix)
+    matchLower(ix)
     if !sawBadPat && setKeys.length == 0 { noteIntMatchHead(ix) }
   }
   matchTy
@@ -404,6 +426,10 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // A pattern that names no member covers nothing — report it at the pattern and suppress the
   // exhaustiveness report below (the bad pattern is the root cause; don't cascade).
   let sawBadPat = false
+  // A union with a literal member takes that literal as a value pattern too (D5714); `valMem`
+  // maps each such pattern to the member it names.
+  const litMems = unionHasLitMember(uMems)
+  const valMem: {[i32]: i32} = Map()
   const nArms = n.matchArmStart.length
   // ── pass 1 (SOURCE order): resolve + validate every pattern, bank its check type, mark cover.
   let ai = 0
@@ -415,8 +441,14 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       if matchPatIsWild(patIx) {
         hasWild = true
         if wildArm < 0 { wildArm = ai }
+      } else if matchPatWasRefused(patIx) {
+        sawBadPat = true
       } else if pn is IsExpr {
         if matchTypePatCover(patIx, pn, st, uMems, covered) { sawBadPat = true }
+      } else if litMems && matchValPatMember(patIx, uMems) != -2 {
+        if matchValPatCover(patIx, st, uMems, covered, valMem) {
+          sawBadPat = true
+        }
       } else if pn is StrLit {
         // A string-literal pattern discriminates a litunion's member text; over a value union
         // the arms discriminate types, so name the difference instead of a phantom missing member.
@@ -448,7 +480,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   const elseArm = matchElseArmOf(n.matchPats, n.matchArmStart, n.matchArmCount)
   const accNames: string[] = []
   const accTys: i32[] = []
-  const armAcc = matchElseArmAcc(n, elseArm, accNames, accTys)
+  const armAcc = matchElseArmAcc(n, elseArm, valMem, accNames, accTys)
   // Pass 3 (source order): check each arm body under its branch's narrowing, joining arm value
   // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
   let matchTy = -1
@@ -471,7 +503,13 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     // `applyNarrows` binds in order, so the arm's own type wins over the complement).
     if bi != elseArm || !exhaustive {
       if n.matchArmCount[bi] == 1 {
-        collectThenNarrows(n.matchPats[n.matchArmStart[bi]], nmz, tyz)
+        const p0 = n.matchPats[n.matchArmStart[bi]]
+        const vm0 = valMem[p0]
+        if vm0 != null {
+          matchValPatFact(n.matchScrut, vm0, true, nmz, tyz)
+        } else {
+          collectThenNarrows(p0, nmz, tyz)
+        }
       }
     }
     // The scope is pushed for the payload clause too, not just the narrowing — an arm can
@@ -526,7 +564,10 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // complete without one. Missing members render from the arena types, not a re-split spelling.
   if !hasWild && !sawBadPat { matchTypeExhaustive(ix, uMems, covered) }
   // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
-  if !inferQuiet { desugarMatchAt(ix) }
+  if !inferQuiet {
+    matchLower(ix)
+    if litMems { matchBankValTests(ix, n.matchScrut) }
+  }
   matchTy
 }
 
@@ -578,6 +619,132 @@ function matchTypePatCover(
   false
 }
 
+// The index in `uMems` of the literal member value pattern `patIx` names: a string or integer
+// literal, or a constant holding one. -1 when no member is that literal, -2 for no such pattern.
+function matchValPatMember(patIx: i32, uMems: i32[]): i32 {
+  const valIx = matchPatValNode(patIx)
+  if valIx < 0 || valIx >= P.nodes.length { return -2 }
+  const pv = P.nodes[valIx]
+  let mi = 0
+  if pv is StrLit {
+    const inner = matchStrPatInner(pv)
+    while mi < uMems.length {
+      const mt = T.tys[uMems[mi]]
+      if mt is TyLit {
+        if mt.litKind == "str" && mt.litText == inner { return mi }
+      }
+      mi = mi + 1
+    }
+    return -1
+  }
+  const numIx = matchPatIntNumOf(valIx)
+  if numIx < 0 { return -2 }
+  const key = matchIntPatValue(numIx, numIx != valIx)
+  if key.length != 2 { return -2 }
+  while mi < uMems.length {
+    const v = matchIntLitTyValue(uMems[mi])
+    if v.length == 2 && v[0] == key[0] && v[1] == key[1] { return mi }
+    mi = mi + 1
+  }
+  -1
+}
+
+// A string pattern's member text: its lexeme without the quotes (a degenerate one stays whole).
+function matchStrPatInner(pv: StrLit): string {
+  const raw = pv.strText
+  if raw.length >= 2 { return raw.slice(1, raw.length - 1) }
+  raw
+}
+
+// The value pattern at `patIx` over the union `st` of members `uMems`: checks it, so the
+// desugared `==` has its operand's type, and marks the literal member it names in `covered`
+// and `valMem`, or refuses a non-member or a redundant arm. True when it covers nothing.
+function matchValPatCover(
+  patIx: i32,
+  st: i32,
+  uMems: i32[],
+  covered: i32[],
+  valMem: {[i32]: i32},
+): boolean {
+  checkNodeHook(patIx)
+  const mi = matchValPatMember(patIx, uMems)
+  const valIx = matchPatValNode(patIx)
+  const pv = P.nodes[valIx]
+  let label = ""
+  if pv is StrLit {
+    label = matchStrPatLabel(patIx, matchStrPatInner(pv))
+  } else {
+    const numIx = matchPatIntNumOf(valIx)
+    label = "`" + matchPatLabel(patIx, matchIntPatLexeme(numIx, numIx != valIx))
+  }
+  if mi < 0 {
+    tErr("match pattern " + label + " is not a member of " + tyToStr(st), patIx)
+    return true
+  }
+  if covered[mi] == 1 {
+    tErr("redundant match arm: " + label + " is already covered", patIx)
+  } else {
+    covered[mi] = 1
+    valMem[patIx] = uMems[mi]
+  }
+  false
+}
+
+// Banks each value test of the chain lowered at `ix` for the emitter's narrowing, as a
+// hand-written `==` chain banks its own: a name scrutinee gets its own node in each test, typed
+// as the earlier tests leave it, so the emitter's `else` reads what is left (D5714).
+function matchBankValTests(ix: i32, scrut: i32) {
+  const accN: string[] = []
+  const accT: i32[] = []
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt && c.ifCond >= 0 && c.ifCond < P.nodes.length {
+      if !(P.nodes[c.ifCond] is IsExpr) {
+        pushScope(-1)
+        applyNarrows(accN, accT)
+        matchFreshScrutIn(c.ifCond, scrut)
+        const nm: string[] = []
+        const ty: i32[] = []
+        collectThenNarrows(c.ifCond, nm, ty)
+        popScope()
+      }
+      collectElseNarrows(c.ifCond, accN, accT)
+      cur = c.ifElse
+    }
+  }
+  0
+}
+
+// Gives each `scrut == p` test under `condIx` a fresh copy of the name `scrut`, checked in the
+// current scope, and under the left's failure for the right of `||`. A scrutinee that is not a
+// bare name keeps the shared node.
+function matchFreshScrutIn(condIx: i32, scrut: i32) {
+  const sn = P.nodes[scrut]
+  if !(sn is Ident) { return 0 }
+  const c = P.nodes[condIx]
+  if c is BinExpr {
+    if c.binOp == "||" {
+      matchFreshScrutIn(c.binLeft, scrut)
+      const ln: string[] = []
+      const lt: i32[] = []
+      collectElseNarrows(c.binLeft, ln, lt)
+      pushScope(-1)
+      applyNarrows(ln, lt)
+      matchFreshScrutIn(c.binRight, scrut)
+      popScope()
+    } else if c.binOp == "==" && c.binLeft == scrut {
+      const id = mkIdent(sn.identName, sn.pos)
+      const idTy = checkNodeHook(id)
+      while nodeTyIx.length <= id { nodeTyIx.push(-1) }
+      nodeTySet(id, idTy)
+      arenaReplaceNode(condIx, mkBinary("==", id, c.binRight, c.pos))
+    }
+  }
+  0
+}
+
 // Checks arm `ai`'s payload binding. An or-pattern arm may not carry one: it gets no
 // then-narrowing (`collectThenNarrows` reports none for the `||` condition), so `scrut.x`
 // would not type.
@@ -608,10 +775,11 @@ function matchAllCovered(covered: i32[]): boolean {
 
 // Folds every arm but `elseArm` into the else narrowings `accNames`/`accTys`, in chain order
 // (`collectElseNarrows`' fold), and answers per arm how much of the accumulator holds when the
-// chain enters it.
+// chain enters it. A value pattern in `valMem` takes its member out as its `==` would.
 function matchElseArmAcc(
   n: MatchExpr,
   elseArm: i32,
+  valMem: {[i32]: i32},
   accNames: string[],
   accTys: i32[],
 ): i32[] {
@@ -628,11 +796,13 @@ function matchElseArmAcc(
       armAcc[ck] = accNames.length
       let pj = 0
       while pj < n.matchArmCount[ck] {
-        collectElseNarrows(
-          n.matchPats[n.matchArmStart[ck] + pj],
-          accNames,
-          accTys,
-        )
+        const p = n.matchPats[n.matchArmStart[ck] + pj]
+        const vm = valMem[p]
+        if vm != null {
+          matchValPatFact(n.matchScrut, vm, false, accNames, accTys)
+        } else {
+          collectElseNarrows(p, accNames, accTys)
+        }
         pj = pj + 1
       }
     }
@@ -752,17 +922,17 @@ function matchLitSetTys(st: i32, kind: LitKind): i32[] {
   out
 }
 
-// A scrutinee that is no literal union: a union of types dispatches on member types, and
-// anything else is refused, unless it is error-typed and its own diagnostic already stands.
+// A scrutinee that is no one-kind literal set: a union dispatches on its members, a type by a
+// type pattern and a literal by its value (D5714), and anything else is refused, unless it is
+// error-typed and its own diagnostic already stands.
 function checkMatchUnionScrut(n: MatchExpr, ix: i32, st: i32): i32 {
   const uMems: i32[] = []
   flattenVariantsInto(st, uMems)
-  if uMems.length > 1 && !unionHasLitMember(uMems) {
+  if uMems.length > 1 {
+    if unionHasLitMember(uMems) { resolveMatchConstPats(n, false) }
     return checkMatchTypeArms(n, ix, st, uMems)
   }
-  if st < 0 || !(T.tys[st] is TyErr) {
-    tErr(matchScrutRejectMsg(st, uMems), ix)
-  }
+  if st < 0 || !(T.tys[st] is TyErr) { tErr(matchScrutRejectMsg(st), ix) }
   TY_ERR
 }
 
@@ -951,7 +1121,7 @@ function checkMatchLitUnionArms(
     matchLitUnionExhaustive(ix, members, covered, nulLit && !nulCovered, "\"")
   }
   // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
-  if !inferQuiet { desugarMatchAt(ix) }
+  if !inferQuiet { matchLower(ix) }
   matchTy
 }
 
@@ -966,11 +1136,7 @@ function matchStrPatCover(
   covered: i32[],
 ) {
   if matchConstPatLitAt(patIx) >= 0 { checkNodeHook(patIx) }
-  // The member name is the pattern's inner text (quotes stripped) — an expression
-  // lexeme, not `tyname.groupInnerOf`'s home (a degenerate lexeme stays whole here).
-  const raw = pn.strText
-  let inner = raw
-  if raw.length >= 2 { inner = raw.slice(1, raw.length - 1) }
+  const inner = matchStrPatInner(pn)
   let found = -1
   let fi = 0
   while fi < members.length {
