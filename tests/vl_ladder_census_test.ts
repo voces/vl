@@ -62,9 +62,20 @@ Deno.test({
       for await (const e of Deno.readDir(`${FIX}/compiler`)) {
         await Deno.copyFile(`${FIX}/compiler/${e.name}`, `${dir}/compiler/${e.name}`);
       }
+      // Each tool is built once and its module run per case: the cases grade the tool, and a
+      // `vl run` of the source would compile it again for every one.
+      for (const tool of [LC, RC]) {
+        const b = await new Deno.Command(VL, {
+          args: ["build", `${ROOT}/scripts/${tool}.vl`, "-o", `${dir}/${tool}.wasm`],
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1" }),
+        }).output();
+        if (b.code !== 0) throw new Error(`vl build ${tool}.vl failed:\n${dec.decode(b.stderr)}`);
+      }
       const runs = CASES.map(async (c) => {
         const { code, stdout } = await new Deno.Command(VL, {
-          args: ["run", `${ROOT}/scripts/${c.tool}.vl`, "--", ...c.args],
+          args: ["run", `${dir}/${c.tool}.wasm`, "--", ...c.args],
           cwd: dir,
           stdout: "piped",
           stderr: "piped",
