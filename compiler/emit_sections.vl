@@ -2349,156 +2349,20 @@ function emitStartGlobalInit(
           return -1
         }
       } else {
-        // A map global's start-fn init seeds the map SHAPE (mirrors the
-        // local-`let` seeding) so `Map()` builds THIS global's map struct.
         const entryCtx = expCtxHere()
-        const sc = expCtxHere()
-        if gck == "map" { sc.mapSlot = letMapShapeOf(gst, -1) }
-        // A NULLABLE map global's start-fn init: seed the map SHAPE (`Map()` builds it) and
-        // the null heap (a bare `null` init lowers as `ref.null $mapStruct`).
-        if gck == "nulmap" {
-          const gnmShape = nulMapShapeOf(gst, -1)
-          sc.mapSlot = gnmShape
-          sc.nulRefHeap = mapTypeIdxOf(gnmShape)
-        }
-        // A struct / nullable-struct cell seeds the struct context so a bare
-        // `null` init lowers as `ref.null $S` and a literal builds THIS
-        // global's annotated struct (mirrors the const-path seeding).
-        if gck == "struct" || gck == "nulstruct" {
-          sc.structIdx = globalCellStructIdx(gst)
-        }
-        // The kind-8 variant twin of that seed, for the non-const init path (a variant global whose
-        // initializer is a call, another global, or any other non-constexpr): the literal — or the
-        // value the start fn stores — builds the bare variant struct the cell is declared with.
-        if gck == "nulvariant" {
-          // The promoted-binding mirror of the cell path's nullable-variant seed: a top-level
-          // `const c: Circle | null` that becomes a start-function local still needs the variant
-          // context, so an object-literal init builds `uVarHeap[vi]` and a bare `null` init lowers as that variant's own typed null.
-          const gnvi = globalCellStructIdx(gst)
-          sc.variantIdx = gnvi
-          if gnvi >= 0 && gnvi < uVarHeap.length {
-            sc.nulRefHeap = uVarHeap[gnvi]
-          }
-        }
-        if gck == "variant" { sc.variantIdx = globalCellStructIdx(gst) }
-        // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
-        // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
-        sc.nulBool = letIsNulBoolAnn(gst)
-        sc.nulString = letIsNulString(gst, -1)
-        // D1576 — a `nulnone` cell (a never-filled module-scope `const x = null`) lowers
-        // its init as `ref.null none`, the one value it can hold. This block, not the
-        // constexpr arm in `emitGlobalSection`, is where every `= null` global's null rep
-        // is decided (a bare `null` is not a WasmGC constexpr).
-        sc.nulNone = gck == "nulnone"
-        if letIsLitUnion(gst) { sc.litUnion = 1 }
-        // A `K | null` NICHE global's start-fn init: a member literal lowers as
-        // its atom id, a bare `null` as the `-1` sentinel — the start-fn twin of
-        // the const-path seeding (a `null` init routes here; un-seeded it drew
-        // the "bare null needs a struct-typed context" loud reject).
-        if g.letType >= 0 {
-          if nodeTyIsNulLitUnion(g.letType) {
-            sc.litUnion = 1
-            sc.nulLitUnion = true
-          }
-        }
-        // A list-annotated global seeds the element kind/slot so its literal init builds the
-        // annotation's backing+wrapper, exactly as the const-path and the local-`let` path seed it (a
-        // no-op for a non-list annotation). Needed because a closure-array's function-ident elements
-        // aren't an objlit and a scalar `f64[]`/`i64[]`/`f32[]` literal of bare int elements doesn't self-identify; an un-annotated global takes its destination's kind instead (D381).
-        const gLb = letListBuild(gst, -1)
-        sc.listKind = gLb.lbKind
-        sc.listSlot = gLb.lbSlot
-        expCtxApply(sc)
-        // The cell's null rep and leaf list build, by kind (the local-`let` and `global.set`
-        // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
-        // `= null` global routes here and this is where its null rep is decided.
-        const cellCtx = expCtxForCell(gck)
-        // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
-        // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
-        // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
-        // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
-        if gck == "nulreflist" {
-          if cellCtx.listSlot >= 0 && cellCtx.listSlot < rlWrapIdx.length {
-            const gnraInit = P.nodes[unwrapParen(g.letInit)]
-            if gnraInit is NullLit {
-              cellCtx.nulRefHeap = rlWrapIdx[cellCtx.listSlot]
-            }
-          }
-        }
-        expCtxApply(cellCtx)
-        // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
-        // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
-        // position: a union global's cell is always the box (unlike `buildLocals`), so a
-        // concrete-variant init must be boxed exactly as a call argument, return, or array element is, or a plain coerce would store the wrong ref into the box cell.
-        let gun = ""
-        if gck == "union" { gun = letUnionNameOf(gst, -1) }
-        // A module-level `let f = add` aliasing a GENERIC (un-annotated-param) named
-        // function, used only as a direct-call callee: the closure through the floor-LESS
-        // core, the start-fn twin of the const-cell arm in `emitGlobalSection`.
-        const gAliasFe = monoGenericAliasFe(gst)
-        // The module-scope twin of `emitLetDeclStmt`'s union-box map-read arm. A bare top-level
-        // `const t = m[k]` over a union-valued map must lower its miss as the null-tagged box,
-        // because the consuming `!= null`/`is`/`match`/`??` is a tag compare that recovers the box
-        // with `ref.as_non_null` first. Without this arm the init falls through to `emitMapGet`'s bare `ref.null` miss — check-clean, then a runtime `null reference` trap.
-        const gUmr = letNulMapReadUnionBox(gst, -1)
-        if gUmr {
-          const gumrN = P.nodes[unwrapParen(g.letInit)]
-          if gumrN is Index {
-            if (
-              emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1)
-              < 0
-            ) {
-              wTarget(exprPrev)
-              return -1
-            }
-          } else {
-            wTarget(exprPrev)
-            return emitFail(
-              "emitProgram: union-valued map read binding's init is not an index read",
-            )
-          }
-        } else if gun != "" {
-          if emitUnionBoxArg(bodyExpr, gun, g.letInit, -1) < 0 {
-            wTarget(exprPrev)
-            return -1
-          }
-        } else if (
-          gck == "variant"
-          && sc.variantIdx >= 0
-          && sc.variantIdx < uVarHeap.length
+        const sc = emitStartGlobalSeedCtx(gst, g, gck)
+        if (
+          emitStartGlobalInitValue(
+            bodyExpr,
+            exprPrev,
+            gst,
+            g,
+            gck,
+            sc.variantIdx,
+          )
+          < 0
         ) {
-          // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
-          if emitVariantCoerce(bodyExpr, sc.variantIdx, g.letInit, -1) < 0 {
-            wTarget(exprPrev)
-            return -1
-          }
-        } else if gAliasFe >= 0 {
-          if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
-            wTarget(exprPrev)
-            return -1
-          }
-        } else if gck == "nulnone" {
-          // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
-          if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
-            wTarget(exprPrev)
-            return -1
-          }
-        } else if (
-          (gck == "str" || gck == "nulstr")
-          && globalInitIsLitAtom(g.letInit)
-        ) {
-          // A literal-union atom initializing a `string` global widens to its member string.
-          // The start fn is a real function, so the runtime widening tower runs here (unlike a
-          // CONST global, whose constexpr init has no `select`/scratch).
-          if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
-            wTarget(exprPrev)
-            return -1
-          }
-        } else {
-          if emitExpr(bodyExpr, g.letInit, -1) < 0 {
-            wTarget(exprPrev)
-            return -1
-          }
+          return -1
         }
         // Back to idle, keeping the caller's null reps for a closure and a list. The variant
         // and ref-heap seeds must clear too: `emitNullLitNode` does not consume them, so a left
@@ -2542,6 +2406,169 @@ function emitStartGlobalInit(
         return -1
       }
       wTarget(setPrev)
+    }
+  }
+  0
+}
+
+// `emitStartGlobalInit`'s seeding step for global statement `gst` (its `LetDecl` `g`, cell kind
+// `gck`): applies the expression context its initializer lowers under — shape, struct, variant,
+// null rep and list build — and returns the seeded context, whose `variantIdx` the value step
+// reads.
+function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind) {
+  // A map global's start-fn init seeds the map SHAPE (mirrors the
+  // local-`let` seeding) so `Map()` builds THIS global's map struct.
+  const sc = expCtxHere()
+  if gck == "map" { sc.mapSlot = letMapShapeOf(gst, -1) }
+  // A NULLABLE map global's start-fn init: seed the map SHAPE (`Map()` builds it) and
+  // the null heap (a bare `null` init lowers as `ref.null $mapStruct`).
+  if gck == "nulmap" {
+    const gnmShape = nulMapShapeOf(gst, -1)
+    sc.mapSlot = gnmShape
+    sc.nulRefHeap = mapTypeIdxOf(gnmShape)
+  }
+  // A struct / nullable-struct cell seeds the struct context so a bare
+  // `null` init lowers as `ref.null $S` and a literal builds THIS
+  // global's annotated struct (mirrors the const-path seeding).
+  if gck == "struct" || gck == "nulstruct" {
+    sc.structIdx = globalCellStructIdx(gst)
+  }
+  // The kind-8 variant twin of that seed, for the non-const init path (a variant global whose
+  // initializer is a call, another global, or any other non-constexpr): the literal — or the
+  // value the start fn stores — builds the bare variant struct the cell is declared with.
+  if gck == "nulvariant" {
+    // The promoted-binding mirror of the cell path's nullable-variant seed: a top-level
+    // `const c: Circle | null` that becomes a start-function local still needs the variant
+    // context, so an object-literal init builds `uVarHeap[vi]` and a bare `null` init lowers as that variant's own typed null.
+    const gnvi = globalCellStructIdx(gst)
+    sc.variantIdx = gnvi
+    if gnvi >= 0 && gnvi < uVarHeap.length { sc.nulRefHeap = uVarHeap[gnvi] }
+  }
+  if gck == "variant" { sc.variantIdx = globalCellStructIdx(gst) }
+  // A `boolean|null` NICHE global lowers a bare `null` init as the sentinel 2;
+  // a `string|null` global lowers it as `ref.null $sTypeIdx` (kind 16).
+  sc.nulBool = letIsNulBoolAnn(gst)
+  sc.nulString = letIsNulString(gst, -1)
+  // D1576 — a `nulnone` cell (a never-filled module-scope `const x = null`) lowers
+  // its init as `ref.null none`, the one value it can hold. This block, not the
+  // constexpr arm in `emitGlobalSection`, is where every `= null` global's null rep
+  // is decided (a bare `null` is not a WasmGC constexpr).
+  sc.nulNone = gck == "nulnone"
+  if letIsLitUnion(gst) { sc.litUnion = 1 }
+  // A `K | null` NICHE global's start-fn init: a member literal lowers as
+  // its atom id, a bare `null` as the `-1` sentinel — the start-fn twin of
+  // the const-path seeding (a `null` init routes here; un-seeded it drew
+  // the "bare null needs a struct-typed context" loud reject).
+  if g.letType >= 0 {
+    if nodeTyIsNulLitUnion(g.letType) {
+      sc.litUnion = 1
+      sc.nulLitUnion = true
+    }
+  }
+  // A list-annotated global seeds the element kind/slot so its literal init builds the
+  // annotation's backing+wrapper, exactly as the const-path and the local-`let` path seed it (a
+  // no-op for a non-list annotation). Needed because a closure-array's function-ident elements
+  // aren't an objlit and a scalar `f64[]`/`i64[]`/`f32[]` literal of bare int elements doesn't self-identify; an un-annotated global takes its destination's kind instead (D381).
+  const gLb = letListBuild(gst, -1)
+  sc.listKind = gLb.lbKind
+  sc.listSlot = gLb.lbSlot
+  expCtxApply(sc)
+  // The cell's null rep and leaf list build, by kind (the local-`let` and `global.set`
+  // boundaries share the resolver). A bare `null` is never a WasmGC constexpr, so every
+  // `= null` global routes here and this is where its null rep is decided.
+  const cellCtx = expCtxForCell(gck)
+  // Kind 18, a nullable ref array (`i32[][] | null`, `S[] | null`): the null is this global's
+  // element wrapper (`rlWrapIdx[slot]`), the same slot the cell's valtype selects. Armed only
+  // when the initializer is a bare `null` (the seed-leak gate the local ladder and the
+  // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
+  if gck == "nulreflist" {
+    if cellCtx.listSlot >= 0 && cellCtx.listSlot < rlWrapIdx.length {
+      const gnraInit = P.nodes[unwrapParen(g.letInit)]
+      if gnraInit is NullLit {
+        cellCtx.nulRefHeap = rlWrapIdx[cellCtx.listSlot]
+      }
+    }
+  }
+  expCtxApply(cellCtx)
+  sc
+}
+
+// `emitStartGlobalInit`'s value step for global statement `gst` (its `LetDecl` `g`, cell kind
+// `gck`, seeded variant `svi`): emits the initializer into `bodyExpr` by the cell's coercion. On
+// failure restores the writer to `exprPrev` and returns -1, else 0.
+function emitStartGlobalInitValue(
+  bodyExpr: u8[],
+  exprPrev: u8[],
+  gst: i32,
+  g: LetDecl,
+  gck: VKind,
+  svi: i32,
+) {
+  // A union cell (kind 4) coerces a raw init value into the box (`let w: string | i32 = n`
+  // boxes the i32 read); a union-valued init passes through unchanged. The box-typed
+  // position: a union global's cell is always the box (unlike `buildLocals`), so a
+  // concrete-variant init must be boxed exactly as a call argument, return, or array element is, or a plain coerce would store the wrong ref into the box cell.
+  let gun = ""
+  if gck == "union" { gun = letUnionNameOf(gst, -1) }
+  // A module-level `let f = add` aliasing a GENERIC (un-annotated-param) named
+  // function, used only as a direct-call callee: the closure through the floor-LESS
+  // core, the start-fn twin of the const-cell arm in `emitGlobalSection`.
+  const gAliasFe = monoGenericAliasFe(gst)
+  // The module-scope twin of `emitLetDeclStmt`'s union-box map-read arm. A bare top-level
+  // `const t = m[k]` over a union-valued map must lower its miss as the null-tagged box,
+  // because the consuming `!= null`/`is`/`match`/`??` is a tag compare that recovers the box
+  // with `ref.as_non_null` first. Without this arm the init falls through to `emitMapGet`'s bare `ref.null` miss — check-clean, then a runtime `null reference` trap.
+  const gUmr = letNulMapReadUnionBox(gst, -1)
+  if gUmr {
+    const gumrN = P.nodes[unwrapParen(g.letInit)]
+    if gumrN is Index {
+      if (emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
+        wTarget(exprPrev)
+        return -1
+      }
+    } else {
+      wTarget(exprPrev)
+      return emitFail(
+        "emitProgram: union-valued map read binding's init is not an index read",
+      )
+    }
+  } else if gun != "" {
+    if emitUnionBoxArg(bodyExpr, gun, g.letInit, -1) < 0 {
+      wTarget(exprPrev)
+      return -1
+    }
+  } else if (gck == "variant" && svi >= 0 && svi < uVarHeap.length) {
+    // A bare-arm cell takes the arm's struct whatever builds it, as a local does (D4639).
+    if emitVariantCoerce(bodyExpr, svi, g.letInit, -1) < 0 {
+      wTarget(exprPrev)
+      return -1
+    }
+  } else if gAliasFe >= 0 {
+    if emitClosureValueCore(bodyExpr, gAliasFe, -1) < 0 {
+      wTarget(exprPrev)
+      return -1
+    }
+  } else if gck == "nulnone" {
+    // A `null`-typed init that is not a bare `null` runs for its effects (D3355).
+    if emitNulNoneBoxPayload(bodyExpr, g.letInit, -1) < 0 {
+      wTarget(exprPrev)
+      return -1
+    }
+  } else if (
+    (gck == "str" || gck == "nulstr")
+    && globalInitIsLitAtom(g.letInit)
+  ) {
+    // A literal-union atom initializing a `string` global widens to its member string.
+    // The start fn is a real function, so the runtime widening tower runs here (unlike a
+    // CONST global, whose constexpr init has no `select`/scratch).
+    if emitAtomToStr(bodyExpr, g.letInit, -1) < 0 {
+      wTarget(exprPrev)
+      return -1
+    }
+  } else {
+    if emitExpr(bodyExpr, g.letInit, -1) < 0 {
+      wTarget(exprPrev)
+      return -1
     }
   }
   0
@@ -6293,6 +6320,79 @@ function initGuardScan(): i32 {
   0
 }
 
+// What `scanPrintUse`'s node walk saw: a wide-scalar mention of each width, a float `%`, and
+// a `%` with no recorded type.
+type PrintScanSaw = {
+  sawI64Ann: boolean,
+  sawF64: boolean,
+  sawF32: boolean,
+  sawFloatRem: boolean,
+  sawRemUnknown: boolean,
+}
+
+// Assigns the import indices `scanPrintUse` reserves after its node walk: the extern result
+// widths join `saw`, then the wide-scalar prints, the fs floor and the user externs in order.
+function scanPrintAssignImports(saw: PrintScanSaw) {
+  // An extern's own RESULT width is a scalar the annotation scan cannot see: `print(nowMillis())`
+  // spells `i64` nowhere, and without this the print router would call an undeclared import.
+  // Read off the manifest, which is total, exactly as `fsRetIsI64` is for the fs floor.
+  let exw = 0
+  while exw < externCount() {
+    const exwR = externRetAt(exw)
+    if exwR == "i64" { saw.sawI64Ann = true }
+    if exwR == "f64" { saw.sawF64 = true }
+    if exwR == "f32" { saw.sawF32 = true }
+    exw = exw + 1
+  }
+  // When the program both prints (`gImports == 4`, the print family) and names
+  // an i64 type, add the 5th `__print_i64__` import.
+  if gImports == 4 {
+    if saw.sawI64Ann {
+      gImports = gImports + 1
+      gNeedsI64Print = true
+    }
+    // Then `__print_f64__` (at the next index — 4 or 5). The f64 import always
+    // trails the i64 one so the i64 print index (4) is unchanged. (Slice 3.)
+    if saw.sawF64 {
+      gF64PrintIdx = gImports
+      gImports = gImports + 1
+      gNeedsF64Print = true
+    }
+    // Then `__print_f32__` (at the next index — 4/5/6). It always TRAILS the i64 and
+    // f64 imports so their indices are unchanged. (Slice 5.)
+    if saw.sawF32 {
+      gF32PrintIdx = gImports
+      gImports = gImports + 1
+      gNeedsF32Print = true
+    }
+  }
+  // The fs imports trail the entire print family — the four fixed entries and all three
+  // conditional wide-scalar ones — so no print index ever moves, and within the block they run
+  // in slot order over the used slots only (slots are append-only, so adding a syscall never
+  // moves an earlier one's index). Outside the `gImports == 4` guard on purpose: by the time this runs `gImports` is 4..7, not 4.
+  let fsa = 0
+  while fsa < gFsUse.length {
+    if gFsUse[fsa] == 1 {
+      gFsIdx[fsa] = gImports
+      gImports = gImports + 1
+    }
+    fsa = fsa + 1
+  }
+  // The user externs trail everything: the print family (whose 0..3 the call lowering hardcodes)
+  // and the fs floor. An extern occupies an index, so a program that declares one but does not
+  // print still reserves the four print entries — every host provides them already.
+  if externCount() > 0 {
+    if gImports == 0 { gImports = 4 }
+    let exa = 0
+    while exa < externCount() {
+      gExtIdx[exa] = gImports
+      gImports = gImports + 1
+      exa = exa + 1
+    }
+  }
+  0
+}
+
 // Detects `print(...)`/memory-intrinsic use anywhere in the program: any print pulls in the
 // 4-import print family (imports shift every local function's wasm index, so this is decided
 // up front). "Any print" is the property, not the spelling `print(` — three constructs lower
@@ -6328,15 +6428,17 @@ function scanPrintUse() {
     exr = exr + 1
   }
   let pscan = 0
-  let sawI64Ann = false
-  let sawF64 = false
-  let sawF32 = false
   // D1586 — the `__f64_rem__` reservation, on the same terms as the import reservation this
   // pass exists for: a helper INDEX cannot be discovered mid-emit either. `sawFloatRem` is a
   // `%` the checker recorded at a float type; `sawRemUnknown` is a `%` with no recorded type
   // at all, which only counts once the module is known to mention a float.
-  let sawFloatRem = false
-  let sawRemUnknown = false
+  const saw: PrintScanSaw = {
+    sawI64Ann: false,
+    sawF64: false,
+    sawF32: false,
+    sawFloatRem: false,
+    sawRemUnknown: false,
+  }
   while pscan < P.nodes.length {
     const pn = P.nodes[pscan]
     // A map an `is` or `as` names joins its struct's tag family even where no union arm is
@@ -6379,9 +6481,9 @@ function scanPrintUse() {
           pcallee.identName,
           pn.callArgs.length,
         )
-        if (pmask & REP_SCAL_I64) != 0 { sawI64Ann = true }
-        if (pmask & REP_SCAL_F64) != 0 { sawF64 = true }
-        if (pmask & REP_SCAL_F32) != 0 { sawF32 = true }
+        if (pmask & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
+        if (pmask & REP_SCAL_F64) != 0 { saw.sawF64 = true }
+        if (pmask & REP_SCAL_F32) != 0 { saw.sawF32 = true }
       }
       // `s.bytes()` yields a `u8[]`. It is the one producer of a packed byte list that spells no
       // `u8[]` anywhere — the annotation scan matches a type, and `for b in s.bytes()` has none — so
@@ -6404,8 +6506,8 @@ function scanPrintUse() {
     if pn is BinExpr {
       if pn.binOp == "%" {
         const rneed = binRemFloatNeed(pscan)
-        if rneed > 0 { sawFloatRem = true }
-        else if rneed < 0 { sawRemUnknown = true }
+        if rneed > 0 { saw.sawFloatRem = true }
+        else if rneed < 0 { saw.sawRemUnknown = true }
       }
     }
     // Any type annotation containing an i64/f64/f32 leaf anywhere — bare, `T[]` element, union
@@ -6418,9 +6520,9 @@ function scanPrintUse() {
       // scalar (`type Big = i64`) still flags it. Only a node with no recorded type falls back to the name-substring test, which sees exactly what the synthesis spelled.
       const scal = repNodeScalarMask(pscan)
       if scal >= 0 {
-        if (scal & REP_SCAL_I64) != 0 { sawI64Ann = true }
-        if (scal & REP_SCAL_F64) != 0 { sawF64 = true }
-        if (scal & REP_SCAL_F32) != 0 { sawF32 = true }
+        if (scal & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
+        if (scal & REP_SCAL_F64) != 0 { saw.sawF64 = true }
+        if (scal & REP_SCAL_F32) != 0 { saw.sawF32 = true }
       } else {
         // No recorded type — the parser's spelling tree answers instead of the rendering.
         // `tsMentionsAnyName` walks the annotation the author actually wrote and compares each leaf
@@ -6428,15 +6530,15 @@ function scanPrintUse() {
         // `f64mode` or a type named `Bf64`). The corpus cannot distinguish the two readers, so this rests on the whole-leaf argument alone, not a graded signal.
         const tsRoot = annTsOf(pscan)
         if tsRoot >= 0 {
-          if tsMentionsAnyName(tsRoot, ["i64"]) { sawI64Ann = true }
-          if tsMentionsAnyName(tsRoot, ["f64"]) { sawF64 = true }
-          if tsMentionsAnyName(tsRoot, ["f32"]) { sawF32 = true }
+          if tsMentionsAnyName(tsRoot, ["i64"]) { saw.sawI64Ann = true }
+          if tsMentionsAnyName(tsRoot, ["f64"]) { saw.sawF64 = true }
+          if tsMentionsAnyName(tsRoot, ["f32"]) { saw.sawF32 = true }
         } else {
           // Neither a recorded type nor a spelling tree. Flags all three rather than none: this scan is
           // an over-approximation by design — a spare import is harmless, a missed flag is invalid wasm.
-          sawI64Ann = true
-          sawF64 = true
-          sawF32 = true
+          saw.sawI64Ann = true
+          saw.sawF64 = true
+          saw.sawF32 = true
         }
       }
     }
@@ -6445,8 +6547,8 @@ function scanPrintUse() {
     // types it i64 — the host `defaultIntegerType` rule), so `print(0xDEAD_BEEF)`
     // pulls in the `__print_i64__` import even with no `i64` annotation.
     if pn is NumLit {
-      if numLexIsFloat(pn.numText) { sawF64 = true }
-      else if !numLexFitsI32(pn.numText) { sawI64Ann = true }
+      if numLexIsFloat(pn.numText) { saw.sawF64 = true }
+      else if !numLexFitsI32(pn.numText) { saw.sawI64Ann = true }
     }
     // An explicit `x as T` cast target rides as a string field (`asTy`), not a `TypeRef` node, so
     // the annotation scan above misses it. Flag its scalar directly, or `print(x as i64)`/`print(x as f64)` would route to an undeclared import.
@@ -6456,13 +6558,13 @@ function scanPrintUse() {
       // substring form is also wider than it reads: `strContains(t, "i64")` matches any name containing those characters — a field named `i64x`, an alias whose spelling embeds it — where the arena asks the cast's own recorded type and cannot be fooled.
       const ascal = repNodeScalarMask(pscan)
       if ascal >= 0 {
-        if (ascal & REP_SCAL_I64) != 0 { sawI64Ann = true }
-        if (ascal & REP_SCAL_F64) != 0 { sawF64 = true }
-        if (ascal & REP_SCAL_F32) != 0 { sawF32 = true }
+        if (ascal & REP_SCAL_I64) != 0 { saw.sawI64Ann = true }
+        if (ascal & REP_SCAL_F64) != 0 { saw.sawF64 = true }
+        if (ascal & REP_SCAL_F32) != 0 { saw.sawF32 = true }
       } else {
-        if strContains(pn.asTy, "i64") { sawI64Ann = true }
-        if strContains(pn.asTy, "f64") { sawF64 = true }
-        if strContains(pn.asTy, "f32") { sawF32 = true }
+        if strContains(pn.asTy, "i64") { saw.sawI64Ann = true }
+        if strContains(pn.asTy, "f64") { saw.sawF64 = true }
+        if strContains(pn.asTy, "f32") { saw.sawF32 = true }
       }
     }
     pscan = pscan + 1
@@ -6470,67 +6572,12 @@ function scanPrintUse() {
   // D1586 — the float-remainder helper. A `%` with no recorded type is only counted when
   // the module mentions a float somewhere, which is what keeps an integer-only program's
   // bytes unchanged; the flags this reads are final only now, hence after the loop.
-  gNeedsF64Rem = sawFloatRem || (sawRemUnknown && (sawF64 || sawF32))
+  gNeedsF64Rem = saw.sawFloatRem
+    || (saw.sawRemUnknown && (saw.sawF64 || saw.sawF32))
   // A guarded global read streams its reason through the print pair before the abort, as
   // `as!` does, so a program with one reserves the family (D2652).
   if gInitAny { gImports = 4 }
-  // An extern's own RESULT width is a scalar the annotation scan cannot see: `print(nowMillis())`
-  // spells `i64` nowhere, and without this the print router would call an undeclared import.
-  // Read off the manifest, which is total, exactly as `fsRetIsI64` is for the fs floor.
-  let exw = 0
-  while exw < externCount() {
-    const exwR = externRetAt(exw)
-    if exwR == "i64" { sawI64Ann = true }
-    if exwR == "f64" { sawF64 = true }
-    if exwR == "f32" { sawF32 = true }
-    exw = exw + 1
-  }
-  // When the program both prints (`gImports == 4`, the print family) and names
-  // an i64 type, add the 5th `__print_i64__` import.
-  if gImports == 4 {
-    if sawI64Ann {
-      gImports = gImports + 1
-      gNeedsI64Print = true
-    }
-    // Then `__print_f64__` (at the next index — 4 or 5). The f64 import always
-    // trails the i64 one so the i64 print index (4) is unchanged. (Slice 3.)
-    if sawF64 {
-      gF64PrintIdx = gImports
-      gImports = gImports + 1
-      gNeedsF64Print = true
-    }
-    // Then `__print_f32__` (at the next index — 4/5/6). It always TRAILS the i64 and
-    // f64 imports so their indices are unchanged. (Slice 5.)
-    if sawF32 {
-      gF32PrintIdx = gImports
-      gImports = gImports + 1
-      gNeedsF32Print = true
-    }
-  }
-  // The fs imports trail the entire print family — the four fixed entries and all three
-  // conditional wide-scalar ones — so no print index ever moves, and within the block they run
-  // in slot order over the used slots only (slots are append-only, so adding a syscall never
-  // moves an earlier one's index). Outside the `gImports == 4` guard on purpose: by the time this runs `gImports` is 4..7, not 4.
-  let fsa = 0
-  while fsa < gFsUse.length {
-    if gFsUse[fsa] == 1 {
-      gFsIdx[fsa] = gImports
-      gImports = gImports + 1
-    }
-    fsa = fsa + 1
-  }
-  // The user externs trail everything: the print family (whose 0..3 the call lowering hardcodes)
-  // and the fs floor. An extern occupies an index, so a program that declares one but does not
-  // print still reserves the four print entries — every host provides them already.
-  if externCount() > 0 {
-    if gImports == 0 { gImports = 4 }
-    let exa = 0
-    while exa < externCount() {
-      gExtIdx[exa] = gImports
-      gImports = gImports + 1
-      exa = exa + 1
-    }
-  }
+  scanPrintAssignImports(saw)
   0
 }
 
@@ -7953,6 +8000,29 @@ function emitTypeSection(
   // One `0x60` rectype per used fs slot, in slot order, appended after the print family,
   // standalone outside the rec group — wasmtime will not match a rec-group-member functype
   // against a host-provided function, though a later rectype may reference an earlier type index freely. The wrapper ref is non-null (`0x64`): a failing call answers an empty `u8[]`, and `__fs_errno__()` carries the reason.
+  tsEmitFsFuncTypes()
+  // ── the extern functypes ──
+  // One `0x60` rectype per declared extern, in manifest order, standalone outside the rec group
+  // for the reason the fs block above is: wasmtime will not match a rec-group member against a
+  // host-provided function. Scalars only, so no heap type is ever named here.
+  tsEmitExternFuncTypes()
+  if memLogUsed {
+    wU8(96)  // 0x60 func — the `__log__` decoder
+    wU8(2)   // 2 params
+    wU8(127) // 0x7f i32 (offset)
+    wU8(127) // 0x7f i32 (length)
+    wU8(0)   // 0 results
+  }
+  // The shared runtime helpers, in helper-index order.
+  tsEmitHelperFuncTypes()
+  wTarget(tyPrev)
+  wSection(1, typePayload)
+  0
+}
+
+// Writes one functype per used fs slot, in slot order, to the type-section payload
+// `emitTypeSection` has bound. A slot with no arity records a failure and writes `() -> i32`.
+function tsEmitFsFuncTypes() {
   let fsty = 0
   while fsty < fsIntrinsicCount() {
     if fsUsedAt(fsty) {
@@ -8006,10 +8076,12 @@ function emitTypeSection(
     }
     fsty = fsty + 1
   }
-  // ── the extern functypes ──
-  // One `0x60` rectype per declared extern, in manifest order, standalone outside the rec group
-  // for the reason the fs block above is: wasmtime will not match a rec-group member against a
-  // host-provided function. Scalars only, so no heap type is ever named here.
+  0
+}
+
+// Writes one functype per declared extern, in manifest order, to the type-section payload
+// `emitTypeSection` has bound. A row with no arity records a failure and writes `() -> ()`.
+function tsEmitExternFuncTypes() {
   let exty = 0
   while exty < externCount() {
     const exAr = externArityAt(exty)
@@ -8038,14 +8110,12 @@ function emitTypeSection(
     }
     exty = exty + 1
   }
-  if memLogUsed {
-    wU8(96)  // 0x60 func — the `__log__` decoder
-    wU8(2)   // 2 params
-    wU8(127) // 0x7f i32 (offset)
-    wU8(127) // 0x7f i32 (length)
-    wU8(0)   // 0 results
-  }
-  // The shared runtime helpers, in helper-index order.
+  0
+}
+
+// Writes the functype of every shared runtime helper in use, in helper-index order, to the
+// type-section payload `emitTypeSection` has bound.
+function tsEmitHelperFuncTypes() {
   if gHelpStrHash >= 0 {
     helpFuncType("s", "i")   // __str_hash__: (str) -> i32
     helpFuncType("ss", "i")  // __str_eq__: (str, str) -> i32
@@ -8092,8 +8162,6 @@ function emitTypeSection(
   if gHelpStrFromBytes >= 0 {
     helpFuncType("yii", "s") // __str_from_bytes__: (u8[], at, count) -> (ref str)
   }
-  wTarget(tyPrev)
-  wSection(1, typePayload)
   0
 }
 

@@ -2828,29 +2828,7 @@ export function collectCloSigs() {
       fe = fe + 1
       continue
     }
-    let key = fnSigKeyOf(fe)
-    // A void- (`>v`) or struct-returning (`>sN;`) function used as a value needs its extended
-    // sig interned too — the value-eligible key above excludes both. `cloSigKeyExt` yields ""
-    // for the kinds still outside the value ABI, so those stay unminted.
-    if key == "" { key = cloSigKeyExt(fe) }
-    // The concrete-lambda rep: this key's representative is the lifted function itself, not the
-    // -1 synth sentinel.
-    internCloSigKey(key, fe)
-    // A nullable-closure result (key `…>C`): intern the inner closure's `$fnsig` too, since the
-    // inner closure is never constructed and a narrowed value call would find no interned sig.
-    // The inner type rides the lambda's pinned `fnRet` nullable part, and `unionArmSigKey`
-    // yields the same key the narrowed call site derives. Usage-gated by `fnValUsed`.
-    if cloRetValKind(fe) == "nulclosure" {
-      const rfn = P.nodes[fnStmts[fe]]
-      if rfn is FuncDecl {
-        // The mixed-union skip belongs here too, and this is the one synth site where its
-        // absence is not inert: for an un-instantiated generic template `inm` still carries the
-        // type parameter, which counts as the composite side of the mix test and is registered
-        // by nothing. Unguarded, such a template steals a concrete lambda's rep for its key.
-        const inm = nullablePartOf(tyNameOf(rfn.fnRet))
-        if inm != "" { internCloSigOfAtom(inm) }
-      }
-    }
+    collectLiftedCloSig(fe, fnStmts[fe])
     // A closure-returning-closure result: the lambda keys its own sig as the collapsed `>c` but
     // the inner closure's sig is never minted from a concrete lambda, so `g()(1)` has no
     // interned signature. Walk the result chain off the lambda's checker type — the same source
@@ -2912,55 +2890,7 @@ export function collectCloSigs() {
     } else {
       unionSetAtomsOf(unMemberSet[ui], atoms)
     }
-    let uj = 0
-    while uj < atoms.length {
-      // A function-type union arm: the arm's own closure sig. The row decides the key and also
-      // decides there is not one — `unMemTys` is recorded in `unMemAtoms` order, so a `TyFunc`
-      // row hands `sigKeyOfTy` the key the parse would have produced and a non-`TyFunc` row is
-      // the "" it would have returned. The guard is untouched in both branches.
-      let armRow = -1
-      if uj < atomTys.length { armRow = atomTys[uj] }
-      if armRow >= 0 {
-        const armT = T.tys[armRow]
-        if armT is TyFunc {
-          internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow))
-        }
-      } else {
-        internCloSigOfAtom(atoms[uj])
-      }
-      // A closure-array arm, plain or nullable-element: the element closure sig is interned by
-      // neither the function-arm branch above nor the TypeRef pass below, which sees only a
-      // top-level closure-array annotation. Same `unionArmSigKey` element-key normalization the
-      // call site derives; the row says whether there is a closure element at all.
-      let uCaRow = -1
-      if uj < atomTys.length {
-        const arow2 = atomTys[uj]
-        if arow2 >= 0 {
-          const at2 = T.tys[arow2]
-          if at2 is TyArray {
-            if at2.aElem >= 0 {
-              const ee = T.tys[at2.aElem]
-              if ee is TyFunc {
-                uCaRow = at2.aElem
-              } else if ee is TyNullable {
-                if ee.nInner >= 0 {
-                  const ei = T.tys[ee.nInner]
-                  if ei is TyFunc { uCaRow = ee.nInner }
-                }
-              }
-            }
-          }
-        }
-      }
-      if uCaRow >= 0 {
-        const uCael = cloArrElemNameOf(atoms[uj])
-        if uCael != "" { internCloSigOfAtomTy(uCael, sigKeyOfTy(uCaRow)) }
-      } else if uj >= atomTys.length {
-        const uCael = cloArrElemNameOf(atoms[uj])
-        if uCael != "" { internCloSigOfAtom(uCael) }
-      }
-      uj = uj + 1
-    }
+    collectUnionArmCloSigs(atoms, atomTys)
     ui = ui + 1
   }
   // Nullable-closure annotations whose value is only ever `null` — narrowed and called, with no
@@ -3015,6 +2945,89 @@ export function collectCloSigs() {
       return -1
     }
     lf = lf + 1
+  }
+  0
+}
+
+// `collectCloSigs`'s step for the lifted function `fe`, whose statement is `sx`: interns its
+// own `$fnsig` at rep `fe`, then the inner closure's sig when its result is a nullable closure.
+function collectLiftedCloSig(fe: i32, sx: i32) {
+  let key = fnSigKeyOf(fe)
+  // A void- (`>v`) or struct-returning (`>sN;`) function used as a value needs its extended
+  // sig interned too — the value-eligible key above excludes both. `cloSigKeyExt` yields ""
+  // for the kinds still outside the value ABI, so those stay unminted.
+  if key == "" { key = cloSigKeyExt(fe) }
+  // The concrete-lambda rep: this key's representative is the lifted function itself, not the
+  // -1 synth sentinel.
+  internCloSigKey(key, fe)
+  // A nullable-closure result (key `…>C`): intern the inner closure's `$fnsig` too, since the
+  // inner closure is never constructed and a narrowed value call would find no interned sig.
+  // The inner type rides the lambda's pinned `fnRet` nullable part, and `unionArmSigKey`
+  // yields the same key the narrowed call site derives. Usage-gated by `fnValUsed`.
+  if cloRetValKind(fe) == "nulclosure" {
+    const rfn = P.nodes[sx]
+    if rfn is FuncDecl {
+      // The mixed-union skip belongs here too, and this is the one synth site where its
+      // absence is not inert: for an un-instantiated generic template `inm` still carries the
+      // type parameter, which counts as the composite side of the mix test and is registered
+      // by nothing. Unguarded, such a template steals a concrete lambda's rep for its key.
+      const inm = nullablePartOf(tyNameOf(rfn.fnRet))
+      if inm != "" { internCloSigOfAtom(inm) }
+    }
+  }
+  0
+}
+
+// `collectCloSigs`'s step for one union row: interns the closure sig of each function-type arm
+// and of each closure-array arm's element. `atomTys` is the row's recorded arm types, parallel
+// to `atoms`, or empty when the row has none and the atoms come from its spelling.
+function collectUnionArmCloSigs(atoms: string[], atomTys: i32[]) {
+  let uj = 0
+  while uj < atoms.length {
+    // A function-type union arm: the arm's own closure sig. The row decides the key and also
+    // decides there is not one — `unMemTys` is recorded in `unMemAtoms` order, so a `TyFunc`
+    // row hands `sigKeyOfTy` the key the parse would have produced and a non-`TyFunc` row is
+    // the "" it would have returned. The guard is untouched in both branches.
+    let armRow = -1
+    if uj < atomTys.length { armRow = atomTys[uj] }
+    if armRow >= 0 {
+      const armT = T.tys[armRow]
+      if armT is TyFunc { internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow)) }
+    } else {
+      internCloSigOfAtom(atoms[uj])
+    }
+    // A closure-array arm, plain or nullable-element: the element closure sig is interned by
+    // neither the function-arm branch above nor the TypeRef pass below, which sees only a
+    // top-level closure-array annotation. Same `unionArmSigKey` element-key normalization the
+    // call site derives; the row says whether there is a closure element at all.
+    let uCaRow = -1
+    if uj < atomTys.length {
+      const arow2 = atomTys[uj]
+      if arow2 >= 0 {
+        const at2 = T.tys[arow2]
+        if at2 is TyArray {
+          if at2.aElem >= 0 {
+            const ee = T.tys[at2.aElem]
+            if ee is TyFunc {
+              uCaRow = at2.aElem
+            } else if ee is TyNullable {
+              if ee.nInner >= 0 {
+                const ei = T.tys[ee.nInner]
+                if ei is TyFunc { uCaRow = ee.nInner }
+              }
+            }
+          }
+        }
+      }
+    }
+    if uCaRow >= 0 {
+      const uCael = cloArrElemNameOf(atoms[uj])
+      if uCael != "" { internCloSigOfAtomTy(uCael, sigKeyOfTy(uCaRow)) }
+    } else if uj >= atomTys.length {
+      const uCael = cloArrElemNameOf(atoms[uj])
+      if uCael != "" { internCloSigOfAtom(uCael) }
+    }
+    uj = uj + 1
   }
   0
 }
