@@ -584,6 +584,7 @@ import {
   fnRetNulRefArrayNameSid,
   identShadowedByFrame,
   instAnnTyNameOfExpr,
+  isVariantSpellingAtRecv,
   nodeTyIsUnionRow,
   objLitFieldSig,
   objLitFitsRow,
@@ -597,7 +598,9 @@ import {
   paramRefArrayName,
   recordListSlotOfNode,
   sharedFieldArmAtomKind,
+  sharedFieldArmConverts,
   sharedFieldArmsBoxable,
+  sharedFieldLitSetPlan,
   sharedPlanBoxName,
   sharedPlanBoxesSome,
   unionSetCanHoldStruct,
@@ -4640,7 +4643,8 @@ function pushNarrowIs(name: string, variant: string, condIx: i32) {
   if cn is IsExpr && listIsFitsAcrossReps(nodeTyIxOf(cn.isObj), ity) {
     return narrowTop
   }
-  pushNarrowRep(name, isVariantSpellingOfShape(variant, ity), ity, -1)
+  const recv = if cn is IsExpr { cn.isObj } else { -1 }
+  pushNarrowRep(name, isVariantSpellingAtRecv(variant, ity, recv), ity, -1)
 }
 
 // True when `name` read in lifted frame `fnIx` is one of its captures, so the read is an env
@@ -5691,7 +5695,14 @@ function armFieldUnionName(memIx: i32, fnIx: i32) {
     if avi < 0 && memNarrowVariantIndex(memIx) < 0 {
       const bvis: i32[] = []
       const bfis: i32[] = []
-      const bcode = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, bvis, bfis)
+      const bcode = sharedUnionFieldPlan(
+        m.memObj,
+        m.memProp,
+        memIx,
+        fnIx,
+        bvis,
+        bfis,
+      )
       if bcode == FC_UNION && sharedPlanBoxesSome(bvis, bfis) {
         if nodeTyIsUnionRow(memIx) {
           const bn = valueUnionRenderOfTy(nodeTyPinIxOf(memIx))
@@ -7286,7 +7297,7 @@ function pushIndexStructComplement(
   if slot < 0 { return false }
   const cur = narrowVariants[slot]
   if cur == "" || isValueUnionName(cur) { return false }
-  const sVar = isVariantSpellingOfShape(variant, isVarTyIxOf(condIx))
+  const sVar = isVariantSpellingAtRecv(variant, isVarTyIxOf(condIx), idxIx)
   if (
     pushNarrowComplement(ik, narrowSets[slot], sVar, isVarTyIxOf(condIx))
     != ""
@@ -7753,7 +7764,7 @@ function narrowIsElse(
           fnIx,
           unwrapParen(isObj),
         ),
-        isVariantSpellingOfShape(variant, isVarTyIxOf(condIx)),
+        isVariantSpellingAtRecv(variant, isVarTyIxOf(condIx), isObj),
       )
       const ssid = currentStructNarrowSetIdAt(
         srecv.identName,
@@ -11412,11 +11423,17 @@ function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
   // claim cannot drift; code 0 alone is not sufficient, since it is also plain i32/boolean.
   const avis: i32[] = []
   const afis: i32[] = []
-  if sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, avis, afis) == FC_I32 {
+  if (
+    sharedUnionFieldPlan(e.memObj, e.memProp, mIxA, fnIx, avis, afis)
+    == FC_I32
+  ) {
     let allAtom = avis.length > 0
     let ai = 0
     while ai < avis.length {
-      if !variantFieldIsLitUnion(avis[ai], afis[ai]) { allAtom = false }
+      const conv = sharedFieldArmConverts(FC_I32, avis[ai], afis[ai])
+      if !conv && !variantFieldIsLitUnion(avis[ai], afis[ai]) {
+        allAtom = false
+      }
       ai = ai + 1
     }
     if allAtom { return true }
@@ -13172,7 +13189,7 @@ function sharedFieldTgtStructIdx(recvIx: i32, prop: string, fnIx: i32): i32 {
   }
   const vis: i32[] = []
   const fis: i32[] = []
-  if sharedUnionFieldPlan(recvIx, prop, fnIx, vis, fis) != FC_STRUCT {
+  if sharedUnionFieldPlan(recvIx, prop, -1, fnIx, vis, fis) != FC_STRUCT {
     return -1
   }
   const r0 = uFieldTgtStructIdx(vis[0], fis[0])
@@ -14391,13 +14408,14 @@ export function objMatchesVariantIdxOmit(
 // produces the i32 array (a `(ref $aTypeIdx)`) rather than an i32. An index read
 // `a[i]` and `a.length` are i32 (not arrays), so they are deliberately absent here.
 
-// The shared-field plan over an un-narrowed struct union — `(A | B).tag`, where the checker
-// proved the field present on every member. Fills `outVis`/`outFis` with each member's
-// variant index and its index for this field, in box-tag order, and returns the one field
-// code they all carry. -1 when any member lacks the field or the codes disagree.
+// The shared-field plan over an un-narrowed struct union `(A | B).tag`: fills `outVis`/`outFis`
+// with each member's variant and field index in box-tag order, and returns the one field code
+// they carry, or -1 when a member lacks the field or the codes disagree. `readIx` is the read,
+// whose type picks the rep of a field stored at two (-1 when there is none).
 export function sharedUnionFieldPlan(
   recvIx: i32,
   prop: string,
+  readIx: i32,
   fnIx: i32,
   outVis: i32[],
   outFis: i32[],
@@ -14468,6 +14486,8 @@ export function sharedUnionFieldPlan(
   }
   if outVis.length < 2 { return -1 }
   if mixed {
+    const lit = sharedFieldLitSetPlan(outVis, outFis, readIx)
+    if lit >= 0 { return lit }
     if !sharedFieldArmsBoxable(outVis, outFis) { return -1 }
     return FC_UNION
   }
@@ -14644,7 +14664,14 @@ function memFieldTypeCode(memIx: i32, fnIx: i32) {
     // field at one code (`(A | B).tag`) — without it, a shared read classified as i32.
     const uvis: i32[] = []
     const ufis: i32[] = []
-    const ucode = sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis)
+    const ucode = sharedUnionFieldPlan(
+      e.memObj,
+      e.memProp,
+      memIx,
+      fnIx,
+      uvis,
+      ufis,
+    )
     if ucode >= 0 { return ucode }
   }
   -1
@@ -15026,7 +15053,7 @@ function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
   const uvis: i32[] = []
   const ufis: i32[] = []
   if (
-    sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis)
+    sharedUnionFieldPlan(e.memObj, e.memProp, exprIx, fnIx, uvis, ufis)
     == FC_REF_LIST
   ) {
     const un0 = variantFieldElemName(uvis[0], ufis[0])
@@ -18014,7 +18041,14 @@ export function memberFieldCode(memIx: i32, fnIx: i32) {
     // field at one code (`(A | B).tag`) — without it, a shared read classified as i32.
     const uvis: i32[] = []
     const ufis: i32[] = []
-    const ucode = sharedUnionFieldPlan(e.memObj, e.memProp, fnIx, uvis, ufis)
+    const ucode = sharedUnionFieldPlan(
+      e.memObj,
+      e.memProp,
+      memIx,
+      fnIx,
+      uvis,
+      ufis,
+    )
     if ucode >= 0 { return ucode }
   }
   -1
