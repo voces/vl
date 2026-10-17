@@ -141,10 +141,14 @@ vl run scripts/silent-sweep/distilled/regress.vl -- build/vl-compiler.wasm --wri
 
 Both halves are graded, `cells/` and `named/`, and reported together.
 
-Exit code is 1 **only** for `runs -> not-runs`. Everything else is reported and not blocking:
-a program that did not work before and does not work now has not regressed in the sense a gate
-should stop the world for. `-> silent` is still printed, and still matters — it is the class
-this whole project exists to remove — but it is a thing to read, not a thing to block on.
+Exit code is 1 for `runs -> not-runs`, and for one more thing: a cell of a FLOOR set (`FLOOR`
+in `regress.vl`, today only `mono-tyaram`) that moves from a loud outcome to a silent one. A
+floor set is one that replaced a standalone gate whose bar was "never silent" — `mono-tyaram`
+is the 261 cells of the former `mono-tyaram-grid` gate row — so it keeps that bar here.
+Everything else is reported and not blocking: a program that did not work before and does not
+work now has not regressed in the sense a gate should stop the world for. `-> silent` is still
+printed, and still matters — it is the class this whole project exists to remove — but outside
+a floor set it is a thing to read, not a thing to block on.
 
 `cells/manifest.json` carries the GENERATOR's expectation for each cell, never a compiler's,
 so `runs` still means "printed what the generator said it should" and a wrong-value cell is

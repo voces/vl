@@ -246,7 +246,6 @@ run "render-parse budget"      render_parse_budget
 run "scaling shape"            deno test -A --no-check tests/vl_scaling_shape_test.ts
 run "deno lint"                deno lint
 run "rep-fuzz"                 bash scripts/rep-fuzz-check.sh
-run "mono-tyaram-grid"         bash scripts/mono-tyaram-grid.sh
 # THE DIRECTORY, not the monolith: the inventory is one file per row
 # (`docs/internals/inventory/D1042.md`). The checker reads either form and a directory
 # holding no rows yet falls back to the monolith named in its own README, so this line is
