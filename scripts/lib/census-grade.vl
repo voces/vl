@@ -187,6 +187,8 @@ function gradeOne(c: Ctx, name: string, exp: string): Res {
   const chk = vlStd(c, "120", ["check", f, "--compiler", c.seed])
   if chk.code == 124 { return { cls: "compiler trap", msg: "check timeout" } }
   const cout = chk.out + chk.err
+  // 70 is the host's compiler-crash exit: the checker trapped, it did not refuse.
+  if chk.code == 70 { return { cls: "compiler trap", msg: norm(cout) } }
   let errLine = ""
   let hasErr = false
   for l in splitLines(cout) {
@@ -223,16 +225,38 @@ function gradeOne(c: Ctx, name: string, exp: string): Res {
   { cls: "check-clean invalid wasm", msg: norm(rerr) }
 }
 
-// `vl check --batch` over the chunk; a cell it cannot classify exactly as `gradeOne`
-// would is left out of `res` and out of the check-clean list returned.
-function batchCheck(c: Ctx, names: string[], res: Map<string, Res>): string[] {
-  const clean: string[] = []
-  const args = ["check", "--batch", "--json"]
+// A chunk's `vl check` verdicts: the check-clean cells whose module the check kept, and
+// those that must still be compiled from source to be graded.
+type Checked = { kept: string[], source: string[] }
+
+// Whether a diagnostic comes from lowering the program, which plain `vl check` never runs.
+function emitStage(d: JsonMap): boolean {
+  const s = strField(d, "stage")
+  s == "emit" || s == "validate"
+}
+
+// `vl check --batch --codegen` over the chunk, which checks each cell once and keeps the
+// module of every cell the engine accepts. Its emit and validate diagnostics are set aside,
+// so a cell is graded on what plain `vl check` reports; one it cannot classify exactly as
+// `gradeOne` would is left out of `res` and of both lists.
+function batchCheck(c: Ctx, names: string[], res: Map<string, Res>): Checked {
+  const out: Checked = { kept: [], source: [] }
+  const args = [
+    "VL_STD=" + c.std,
+    "VL_CHECK_KEEP_MODULES=" + c.tmp + "/wasm",
+    "timeout",
+    "600",
+    c.vl,
+    "check",
+    "--batch",
+    "--json",
+    "--codegen",
+  ]
   for n in names { args.push(c.part + "/" + n + ".vl") }
   args.push("--compiler")
   args.push(c.seed)
-  const p = vlStd(c, "600", args)
-  if p.code == 124 { return clean }
+  const p = spawn("env", args)
+  if p.code == 124 { return out }
   const recs: JsonMap[] = []
   for l in splitLines(p.out) {
     if stripWs(l) == "" { continue }
@@ -243,46 +267,63 @@ function batchCheck(c: Ctx, names: string[], res: Map<string, Res>): string[] {
       die("census-grade: a check record is not an object", 1)
     }
   }
-  if recs.length != names.length { return clean }
+  if recs.length != names.length { return out }
   let k = 0
   while k < names.length {
     const r = recs[k]
+    const n = names[k]
     const errs: string[] = []
+    let lowering = 0
     const ds = r["diagnostics"]
     if ds is Json[] {
       for d in ds {
         if d is JsonMap {
           if strField(d, "severity") == "error" {
-            errs.push(strField(d, "message"))
+            if emitStage(d) {
+              lowering = lowering + 1
+            } else {
+              errs.push(strField(d, "message"))
+            }
           }
         }
       }
     }
     const code = numField(r, "exit")
-    if code == 0.0 && errs.length == 0 {
-      clean.push(names[k])
-    } else if code == 1.0 && errs.length > 0 {
-      res[names[k]] = {
+    const failed = code == 1.0 || code == 70.0
+    if code == 0.0 && errs.length == 0 && lowering == 0 {
+      if exists(c.tmp + "/wasm/" + n + ".vl.wasm") {
+        out.kept.push(n)
+      } else {
+        out.source.push(n)
+      }
+    } else if failed && errs.length == 0 && lowering > 0 {
+      out.source.push(n)
+    } else if code == 1.0 && errs.length > 0 && lowering == 0 {
+      res[n] = {
         cls: "loud check reject",
         msg: norm("[ERROR]: " + firstLine(errs[0])),
       }
     }
     k = k + 1
   }
-  clean
+  out
 }
 
-// Module-cache lookups one `vl run --batch` made, and how many of them hit.
+// Module-cache lookups the `vl run --batch` calls made, and how many of them hit.
 type Seen = { hit: i32, all: i32 }
 
-// `vl run --batch` over the check-clean cells of a chunk. Its stderr carries only the
-// module-cache trace, since each cell's own output goes to `--out-dir`.
+// `vl run --batch` over check-clean cells, from the module the check kept when `kept`, else
+// from source, adding the module-cache trace on stderr to `seen`. Returns the kept cells whose
+// run failed: they are run again from source, so a failure is classified from the same text.
 function batchRun(
   c: Ctx,
   names: string[],
+  kept: boolean,
   expect: Map<string, string>,
   res: Map<string, Res>,
-): Seen {
+  seen: Seen,
+): string[] {
+  const again: string[] = []
   const od = c.tmp + "/run"
   spawn("mkdir", ["-p", od])
   const args = ["VL_STD=" + c.std, "VL_CACHE_TRACE=1", "timeout", "600", c.vl]
@@ -290,20 +331,30 @@ function batchRun(
   args.push("--batch")
   args.push("--out-dir")
   args.push(od)
-  for n in names { args.push(c.part + "/" + n + ".vl") }
+  for n in names {
+    if kept {
+      args.push(c.tmp + "/wasm/" + n + ".vl.wasm")
+    } else {
+      args.push(c.part + "/" + n + ".vl")
+    }
+  }
   args.push("--compiler")
   args.push(c.seed)
   const p = spawn("env", args)
-  const seen: Seen = { hit: 0, all: 0 }
   for l in p.err.split("\n") {
     if startsWith(l, "vl: module cache ") { seen.all = seen.all + 1 }
     if startsWith(l, "vl: module cache hit") { seen.hit = seen.hit + 1 }
   }
-  if p.code == 124 { return seen }
+  if p.code == 124 { return again }
   for n in names {
-    const o = od + "/" + n + ".vl.out"
-    const e = od + "/" + n + ".vl.err"
-    if !exists(o) { continue }
+    let base = od + "/" + n + ".vl"
+    if kept { base = base + ".wasm" }
+    const o = base + ".out"
+    const e = base + ".err"
+    if !exists(o) || (kept && exists(e)) {
+      if kept { again.push(n) }
+      continue
+    }
     const got = readText(o)
     const exp = expect[n] ?? ""
     if !exists(e) {
@@ -320,7 +371,7 @@ function batchRun(
       res[n] = { cls: "loud emit reject", msg: norm(rerr) }
     }
   }
-  seen
+  again
 }
 
 // ── the chunk worker: `--grade-chunk <file>` ─────────────────────────────────────────
@@ -353,10 +404,14 @@ export function gradeChunk(file: string) {
     k = k + 2
   }
   const res: Map<string, Res> = Map()
-  let seen: Seen = { hit: 0, all: 0 }
+  const seen: Seen = { hit: 0, all: 0 }
   if batch {
-    const clean = batchCheck(c, names, res)
-    if clean.length > 0 { seen = batchRun(c, clean, expect, res) }
+    const ck = batchCheck(c, names, res)
+    const source = ck.source
+    if ck.kept.length > 0 {
+      for n in batchRun(c, ck.kept, true, expect, res, seen) { source.push(n) }
+    }
+    if source.length > 0 { batchRun(c, source, false, expect, res, seen) }
   }
   writeText(file + ".cache", "\{seen.hit} \{seen.all}")
   const out: string[] = []

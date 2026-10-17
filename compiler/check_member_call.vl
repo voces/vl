@@ -295,6 +295,77 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
   ret
 }
 
+// The receiver's argument-seam verdict at `self`: the dispatch gate asked bare `assignable`,
+// which misses the refusals the seam holds, such as a container widened into a differently
+// stored element (D2165). A receiver that is still a hole is re-asked at the pin.
+function ufcsCheckRecvSeam(
+  n: Call,
+  recvTy: i32,
+  params: i32[],
+  bNames: string[],
+  bTys: i32[],
+) {
+  const recvX = ufcsRecvExpr(n)
+  const selfTy = substSelfTy(params[0], bNames, bTys)
+  // A receiver that is an observed parameter is delivered to `self` here, not at the seam.
+  if expObsFn >= 0 { expObsPin(recvTy, selfTy, recvX) }
+  if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(selfTy) {
+    if !assignableExpr(recvX, recvTy, selfTy) {
+      tErr(
+        "receiver: expected " + tyToStr(selfTy) + ", got " + tyToStr(recvTy),
+        recvX,
+      )
+    }
+  }
+}
+
+// The explicit arguments of the UFCS call to `name`, checked in the direct call's order and
+// seed (`checkCallNode`): a lambda meeting a hole goes last, so `xs.sort((a, b) => …)` types
+// `a` as `sort(xs, …)` does. Each binds into `bNames`/`bTys` and is refused at its own node.
+function ufcsCheckArgs(
+  name: string,
+  params: i32[],
+  args: i32[],
+  uDecl: i32[],
+  bNames: string[],
+  bTys: i32[],
+) {
+  const uOrder = lambdaLastOrder(paramsAfterFirstTy(params), args)
+  let oi = 0
+  while oi < uOrder.length {
+    const i = uOrder[oi]
+    seedExpected(args[i], substTyDeep(params[i + 1], bNames, bTys))
+    const at = checkNodeHook(args[i])
+    bindGenWalk(params[i + 1], at, bNames, bTys)
+    const expected = substTyDeep(params[i + 1], bNames, bTys)
+    const pHole = T.tys[params[i + 1]]
+    if pHole is TyVar {
+      if !holeDemandOk(pHole.tvName, args[i], at) {
+        holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
+      }
+      if rowIsArrayDemanded(params[i + 1]) {
+        if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
+      }
+      if holeIsArrayWriteDemanded(name, pHole.tvName) {
+        if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
+      }
+      // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
+      holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
+    }
+    constrainEmptyExpr(args[i], at, expected)
+    const savedArgLit = argLitAt
+    argLitAt = peelParenIx(args[i])
+    const argOk = assignableExpr(args[i], at, expected)
+    argLitAt = savedArgLit
+    if !argOk {
+      // Anchored at the offending argument (or its offending return site),
+      // never at the call node — see `argMismatchErr`.
+      argMismatchErr(i + 1, expected, at, args[i])
+    }
+    oi = oi + 1
+  }
+}
+
 function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
   // Receiver overloading: a member call the merge left to the receiver's head class picks its
   // candidate here, banking it on the site for every later reader (`ufcsAliasAtSite`).
@@ -468,59 +539,8 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         }
       }
     }
-    // The receiver is `self`'s argument, so it takes the argument seam's verdict too: the
-    // dispatch gate above asks bare `assignable`, which misses the refusals the seam holds,
-    // such as a container widened into a differently stored element (D2165). `self` is asked
-    // under the receiver's own binding; a receiver that is still a hole is re-asked at the pin.
-    const recvX = ufcsRecvExpr(n)
-    const selfTy = substSelfTy(params[0], bNames, bTys)
-    // A receiver that is an observed parameter is delivered to `self` here, not at the seam.
-    if expObsFn >= 0 { expObsPin(recvTy, selfTy, recvX) }
-    if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(selfTy) {
-      if !assignableExpr(recvX, recvTy, selfTy) {
-        tErr(
-          "receiver: expected " + tyToStr(selfTy) + ", got " + tyToStr(recvTy),
-          recvX,
-        )
-      }
-    }
-    // The direct call's order and seed (`checkCallNode`): a lambda whose parameter meets a hole
-    // is checked after the other arguments, against its parameter under the receiver's binding
-    // and theirs, so `xs.sort((a, b) => …)` types `a` as `sort(xs, (a, b) => …)` does.
-    const uOrder = lambdaLastOrder(paramsAfterFirstTy(params), args)
-    let oi = 0
-    while oi < uOrder.length {
-      const i = uOrder[oi]
-      seedExpected(args[i], substTyDeep(params[i + 1], bNames, bTys))
-      const at = checkNodeHook(args[i])
-      bindGenWalk(params[i + 1], at, bNames, bTys)
-      const expected = substTyDeep(params[i + 1], bNames, bTys)
-      const pHole = T.tys[params[i + 1]]
-      if pHole is TyVar {
-        if !holeDemandOk(pHole.tvName, args[i], at) {
-          holeArgDemandErr(pHole.tvName, i + 1, at, args[i])
-        }
-        if rowIsArrayDemanded(params[i + 1]) {
-          if tyRefusesArrayDemand(at) { holeArgArrayErr(i + 1, at, args[i]) }
-        }
-        if holeIsArrayWriteDemanded(name, pHole.tvName) {
-          if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
-        }
-        // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
-        holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
-      }
-      constrainEmptyExpr(args[i], at, expected)
-      const savedArgLit = argLitAt
-      argLitAt = peelParenIx(args[i])
-      const argOk = assignableExpr(args[i], at, expected)
-      argLitAt = savedArgLit
-      if !argOk {
-        // Anchored at the offending argument (or its offending return site),
-        // never at the call node — see `argMismatchErr`.
-        argMismatchErr(i + 1, expected, at, args[i])
-      }
-      oi = oi + 1
-    }
+    ufcsCheckRecvSeam(n, recvTy, params, bNames, bTys)
+    ufcsCheckArgs(name, params, args, uDecl, bNames, bTys)
     if uDst.length > 0 && !inferQuiet {
       dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)
     }

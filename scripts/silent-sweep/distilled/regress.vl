@@ -9,7 +9,8 @@
 // cells are graded `$JOBS` at a time (default 6), their modules compiled through the cache
 // at `$VL_DISTILLED_CACHE` (default `~/.cache/vl-distilled`, `off` for none). `--set` records
 // new `named/*.vl` cells in `expected.jsonl` and the baseline in one move. Exit 1 only
-// when a `runs` cell stopped running, or under `--verify-fresh` when any cell moved.
+// when a `runs` cell stopped running, a FLOOR-set cell went silent, or under
+// `--verify-fresh` when any cell moved.
 
 import { exit } from "std:process"
 import { programArgs } from "std:args"
@@ -120,6 +121,18 @@ function isSilent(cls: string): boolean {
   false
 }
 
+// The named sets that block on loud -> silent as well as on runs -> not-runs. A set is
+// here because it replaced a gate whose bar was "never silent": `mono-tyaram` is the
+// former `mono-tyaram-grid` row, which failed on any invalid module or compiler crash.
+const FLOOR = ["mono-tyaram"]
+
+function isFloor(block: string): boolean {
+  for s in FLOOR {
+    if s == block { return true }
+  }
+  false
+}
+
 // One moved cell: its id, the class it had and has, and the census cells it stands for.
 type Move = { cell: string, was: string, now: string, weight: i32 }
 
@@ -155,7 +168,7 @@ function flagArg(args: string[], flag: string, dflt: string): string {
   dflt
 }
 
-const USAGE = "usage: vl run scripts/silent-sweep/distilled/regress.vl -- <seed.wasm> [--baseline F] [--json OUT]\n           [--write-baseline [--set <named-set>]] [--verify-fresh]\nRun from the checkout root; `$JOBS` chunks at a time (default 6).\nExit 1 only when a cell went `runs` -> not-runs, or under --verify-fresh when any cell moved;\n2 on a usage error or an incomplete corpus index."
+const USAGE = "usage: vl run scripts/silent-sweep/distilled/regress.vl -- <seed.wasm> [--baseline F] [--json OUT]\n           [--write-baseline [--set <named-set>]] [--verify-fresh]\nRun from the checkout root; `$JOBS` chunks at a time (default 6).\nExit 1 only when a cell went `runs` -> not-runs, a floor-set cell went silent,\nor under --verify-fresh when any cell moved; 2 on a usage error or an incomplete corpus index."
 
 function mainReport(args: string[]): i32 {
   if args.length < 1 {
@@ -229,6 +242,7 @@ function mainReport(args: string[]): i32 {
     pop = pop + i.represents
   }
   const lost: Move[] = []
+  const floored: Move[] = []
   const intoSilent: Move[] = []
   const other: Move[] = []
   for c in cells {
@@ -243,9 +257,15 @@ function mainReport(args: string[]): i32 {
       return 1
     }
     const row: Move = { cell: c, was: bcls, now: v.cls, weight: i.represents }
-    if bcls == "runs" { lost.push(row) }
-    else if isSilent(v.cls) && !isSilent(bcls) { intoSilent.push(row) }
-    else { other.push(row) }
+    if bcls == "runs" {
+      lost.push(row)
+    } else if isSilent(v.cls) && !isSilent(bcls) && isFloor(i.block) {
+      floored.push(row)
+    } else if isSilent(v.cls) && !isSilent(bcls) {
+      intoSilent.push(row)
+    } else {
+      other.push(row)
+    }
   }
   let ncur = 0
   for c in cells {
@@ -257,22 +277,26 @@ function mainReport(args: string[]): i32 {
   )
   print(g.reuse)
   show("runs -> NOT-RUNS  (blocking)", lost, pop)
+  show("floor -> SILENT  (blocking)", floored, pop)
   show("-> silent  (report)", intoSilent, pop)
   show("other movement", other, pop)
-  if lost.length == 0 && intoSilent.length == 0 && other.length == 0 {
-    print("  no cell changed class ✅")
-  }
+  const moved = lost.length + floored.length + intoSilent.length + other.length
+  if moved == 0 { print("  no cell changed class ✅") }
   if lost.length > 0 {
     print(
       "\ndistilled: REGRESSION — \{toString(lost.length)} behavioural class(es) stopped running",
     )
-    return 1
   }
+  if floored.length > 0 {
+    print(
+      "\ndistilled: REGRESSION — \{toString(floored.length)} floor-set cell(s) went silent",
+    )
+  }
+  if lost.length > 0 || floored.length > 0 { return 1 }
   if hasFlag(args, "--verify-fresh") {
-    const n = lost.length + intoSilent.length + other.length
-    if n > 0 {
+    if moved > 0 {
       print(
-        "\ndistilled: STALE BASELINE — \{toString(n)} cell(s) disagree with this seed. The committed baseline does not describe the committed compiler; re-run with --write-baseline and commit the result.",
+        "\ndistilled: STALE BASELINE — \{toString(moved)} cell(s) disagree with this seed. The committed baseline does not describe the committed compiler; re-run with --write-baseline and commit the result.",
       )
       return 1
     }

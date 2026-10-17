@@ -59,8 +59,9 @@ trap 'rm -rf "$WORK"' EXIT
 
 # THE RATCHET EXEMPTIONS. The four comment codes (`comment-block-too-long`,
 # `comment-measurement-uncited`, `comment-shouting`, `comment-history`),
-# `arena-scan-outside-pass`, `kind-ladder-incomplete` / `kind-ladder-split` and
-# `sentinel-index-unguarded` / `sentinel-index-strict-untested` are `warning`s this tree
+# `arena-scan-outside-pass`, `kind-ladder-incomplete` / `kind-ladder-split`,
+# `sentinel-index-unguarded` / `sentinel-index-strict-untested` and
+# `literal-byte-write` are `warning`s this tree
 # still violates in bulk, so they are held out of the `info` gate — but ONLY while their
 # baselines still owe them. Each allow-list is READ FROM its own baseline, so it empties
 # itself the day a trim, a banked scan, a named default or a bound test reaches zero;
@@ -89,7 +90,8 @@ lint_graded() { # <target> <json path>
     $("$VL" check --budget scripts/interp-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/scan-budget-baseline.json --exempt-codes) \
     $("$VL" check --budget scripts/ladder-budget-baseline.json --exempt-codes) \
-    $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes)
+    $("$VL" check --budget scripts/sentinel-budget-baseline.json --exempt-codes) \
+    $("$VL" check --budget scripts/byte-budget-baseline.json --exempt-codes)
 }
 
 # std/ goes first: it is near-instant AND its module load warms the seed's
@@ -218,7 +220,7 @@ wait "$SCRIPTS_PID" || SCRIPTS_RC=$?
 [ "$SCRIPTS_RC" = 0 ] || exit "$SCRIPTS_RC"
 # The ratchets count the findings these runs already produced (`--findings`, the same
 # `--include-imports` reports), rather than each walking its targets again. The comment,
-# kind-ladder and sentinel-index baselines target `compiler/entry.vl`, whose import closure
+# kind-ladder, sentinel-index and literal-byte baselines target `compiler/entry.vl`, whose import closure
 # is every compiler/*.vl; arena-scan's add `std`, interp's `std` and `scripts`
 # (tests/budget_targets_test.ts holds both facts). `--findings` takes one report, so the
 # runs' arrays are joined; a position two reports share counts once.
@@ -245,7 +247,7 @@ budget_over() { # <budget> <report>
   return "$rc"
 }
 BUDGET_RC=0
-for budget in comment ladder sentinel; do
+for budget in comment ladder sentinel byte; do
   budget_over "$budget" "$WORK/graph.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
 done
 budget_over scan "$WORK/scan.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }

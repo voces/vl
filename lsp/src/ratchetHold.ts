@@ -1,5 +1,5 @@
-// The editor's half of the per-file ratchets (CLAUDE.md §Gates). Six committed
-// baselines hold a per-file count for eleven lint codes, and the gate's rule is that a
+// The editor's half of the per-file ratchets (CLAUDE.md §Gates). Seven committed
+// baselines hold a per-file count for twelve lint codes, and the gate's rule is that a
 // file's count may only FALL. The editor's rule was different: every finding was a
 // live diagnostic, so `compiler/typecheck.vl` opened with 213 Problems that no gate
 // asks anyone to fix. This makes the two rules ONE — quiet while the debt is held,
@@ -47,6 +47,10 @@ export const RATCHET_CODES: ReadonlyMap<string, RatchetScope> = new Map([
   }],
   ["sentinel-index-strict-untested", {
     baseline: "scripts/sentinel-budget-baseline.json",
+    trees: COMPILER_ONLY,
+  }],
+  ["literal-byte-write", {
+    baseline: "scripts/byte-budget-baseline.json",
     trees: COMPILER_ONLY,
   }],
   ["arena-scan-outside-pass", {
