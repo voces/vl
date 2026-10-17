@@ -36,7 +36,8 @@ per-module wasm.
    caching. sunpa's graph costs about 10 times the compiler's own per-line fuel.
 4. Finer reuse is per function or instance inside the one-module emit. It has two
    prerequisites: importer-independent phase outputs and symbolic indices in the emitter. The
-   owner has to rule on one known exception to importer independence (Q1).
+   owner ruled the one known exception to importer independence (Q1, 2026-10-07): record
+   adoption keeps crossing module boundaries, so a module's cache key includes its importers' demands.
 
 ## 1. The problem, measured
 
@@ -335,8 +336,9 @@ The probes in §3.2 were run on that commit the same day.
 - For a module graph, `modCompile` (4185) does the rest, in order:
   1. orders modules depth-first (`modVisit`, 4202);
   2. parses every module into **one shared node arena**, `P.nodes` (4241–4257);
-  3. renames every module's top level to `name$mN`, where **N is the module's discovery
-     position** (`modBuildRename`, 4561);
+  3. renames every module's top level to `name$mN` (`modBuildRename`), where N is the module's
+     **stable id** (`compiler/modid.vl`, §3.2). Until S5's first step N was the discovery
+     position;
   4. builds the export alias tables for module 0 only (4311–4363);
   5. concatenates every module's statements into **one `Program`** (4366–4380);
   6. runs `checkProgram`, `jwSecondPass` and `emitProgram` on that merged program.
@@ -375,10 +377,10 @@ the same under `rules.test.vl` as under `beast.test.vl`.
 | --- | --- | --- | --- |
 | lex | the module's bytes | yes | **yes**, and already reused within one instance (`modCache*`, `driver.vl:558–636`; the LSP's `modCommitCached`, 3095) |
 | parse | the module's tokens | the AST content is; its **node indices are not** (one shared arena, offset by earlier modules) | needs relocation, or a per-module arena |
-| order + rename | the whole graph | **no**: `$mN` is the discovery position, so adding an import above M renames everything in M | needs a stable module id (path- or content-derived); a compiler-internal change, no ruling |
+| order + rename | the order: the whole graph; the rename: M's key and the set of keys | **the rename, yes** (S5's first step); the order, no | the rename only. `$mN` was the discovery position, so an import added above M renamed everything in M. N is now a 31-bit FNV-1a hash of M's normalised key, written in decimal: a `std:` key as written, otherwise the path relative to the cwd the host stages, or absolute when M lies outside it. When two keys collide, the one that sorts later is salted until unique, so the id depends only on the SET of keys. Digits keep every `$m\d+` demangler working. `tests/vl_module_id_stable_test.ts` holds it |
 | checker: exported `let` inference | M + its imports | **yes, by rule**: "an exported `let` is typed only by its own module's uses; an importer's use is an ordinary use" (DECISIONS.md, the B′+C literal-binding entry). Probe below. | yes, after rename and arena are fixed |
 | checker: un-annotated `const` | each use site | yes: typed per use, "no cross-module effect" (same entry) | yes |
-| checker: record adoption | **the importers' deliveries** | **no**. Probe below. | **needs an owner ruling (Q1)** |
+| checker: record adoption | **the importers' deliveries** | **no**. Probe below. | ruled (Q1, B): adoption crosses the boundary, so M's result is keyed on its importers' deliveries |
 | checker: a generic's body | each instance's arguments | diagnostics land at the importer's call site | the generic's BODY is part of M's interface (GHC's unfoldings) |
 | A20 inferred returns | M + its imports' signatures | plausibly yes, but unproven for 1,205 bindings | after a differential test (Stage 5's gate) |
 | monomorphization | every call site in the graph | **no** by construction: the instance set is the union over importers | per instance, keyed on (generic body, type arguments) |
@@ -454,16 +456,18 @@ at most the 5 s that `vl check` costs. The build's other 22 s is only reachable 
 ### 3.3 What needs a ruling, and what does not
 
 **Compiler-internal (no ruling needed):**
-- a stable module id in place of the discovery position;
+- a stable module id in place of the discovery position (done: §3.2's order + rename row);
 - a per-module arena, or a relocatable one;
 - a host-side transcript of every message into the compiler instance;
 - symbolic indices in the emitter;
 - every cache in §4.
 
-**Needs a ruling:**
-- **record adoption across a module boundary (Q1)**;
-- whether exported signatures must be annotated to give modules a frozen interface (Q4). The
-  recommendation is no;
+**Ruled:**
+- record adoption across a module boundary (Q1, B): it crosses, and S5 tracks importer demands;
+- exported signatures are not frozen at the module boundary (Q4, A): S5's interface hash
+  includes the bodies of exported generics and of exports with an inferred return.
+
+**Needs a ruling (none blocks S5):**
 - the user-visible surfaces: cache default and location (Q2), and a watch command (Q3).
 
 ## 4. The design: one mechanism, three modes
@@ -829,7 +833,7 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
 | **S2** | The `-O` chain cache (A2 in §4.6) | 1 | up to 10.3 s of sunpa's 32.3 s `-O3` (`27e3417`) when the emitted bytes did not move | the same verify mode; the mutation matrix gains "one emitted byte" and "one `-O` flag" | the hit rate over a week of sunpa's `-O3` builds |
 | **S3** | `--watch` for `test`, `build`, `run` and `check` (§4.9), resident, polling, pool-backed | 3–5 | no per-action speed beyond S1; the loop becomes automatic, and unchanged files cost nothing | a watch session's report must equal a cold run's after each edit in a scripted edit sequence | wall time from save to report for the beast-edit case |
 | **S4** | Keep cutting compile cost on sunpa's shape (`C-compile-hotspots` and its successors) | ongoing | the only stage that speeds the compile whose input changed; headroom suggested by the 10× per-line gap | byte-identical output, which every perf PR already shows | fuel on a committed sunpa-shaped generator, beside `plumb-shape-cost.vl` |
-| **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, Q1 ruled, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15, after Q1 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 4.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes | LSP latency on sunpa and on `compiler/entry.vl` |
+| **S5** | An importer-independent checker per module: stable module ids, a per-module or relocatable arena, an **interface hash** (exported signatures, exported generic bodies, exported types' shapes) computed from checker output | 10–15 | the LSP re-checks only the edited module and those whose imports' interface hash moved; `vl check` of a one-module edit goes from 4.2 s toward the edited module's share | a differential test: every module of a named population checked alone and inside N different importer graphs gives identical per-module results (types, diagnostics, pins) — the measurement §3.2 could only sample with probes; a module adopted by an importer is keyed on that importer's demands (Q1, B) | LSP latency on sunpa and on `compiler/entry.vl` |
 | **S6** | Per-function and per-instance emit reuse: the emitter writes bodies against symbolic indices (function, type, global, string, union tag) and a late pass assigns and patches them, inside the one module; cache each body keyed on its typed body and the interface hashes of what it references | months; high risk | the edited graph's compile scales with what changed: most of a 25.0 s build when one function body changes (estimate, pending S0) | cold-versus-incremental byte identity over the whole corpus and the self-compile, run continuously; the memo census's in-place-fill lesson says this is where staleness would hide | S0's split, before and after |
 | — | separate compilation and linking (plumb) | separate track | — | — | — |
 
@@ -925,6 +929,18 @@ graph: `play/game.vl` alone is 2.3 G, `rules/state.vl` 0.26 G, a trivial print 1
 - What is left is flatter. `sigKeyOfTy` mostly hits its memo: 12,265 calls and 1,977 misses on
   `journey`, so a perfect memo saves about 4.5%. `dupScanRun` and the checker are the next
   frames to profile.
+
+**S5 as built so far: stable module ids.** The `$mN` merge suffix is a function of the module's
+own key, not of its position (§3.2's order + rename row, `compiler/modid.vl`). Adding an
+import above M now leaves M's merged names unchanged; `tests/vl_module_id_stable_test.ts`
+fails on the discovery-position compiler. Wasm export names did not move. A `--names` build's
+name section, trap backtraces, `vl addr2line` and profiles now show the hashed id
+(`boom$m979099524` where they used to show `boom$m1`).
+- **Next:** the per-module or relocatable arena, so that a module's check output is a value of
+  its own rather than a range of the shared `P.nodes`. Then the interface hash. Q4 is ruled
+  (A), so the hash covers the bodies of exported generics and of exports whose return is
+  inferred, and it may not assume any export is annotated. Q1 (B) keys a module that an
+  importer adopts records into on that importer's demands.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
@@ -1045,6 +1061,9 @@ vl watch test src/          # (B) a wrapper command
 - The watch loop needs each command's own action list, which only the command knows.
 - C is a fine interim: with S1, an external watcher already gets the whole S3 win except warm
   instances. S3 can therefore wait for a consumer to ask.
+
+Q4 has since been ruled (A) by the owner, 2026-10-17: DECISIONS.md §"Exported signatures
+are not frozen at the module boundary".
 
 **Q4. Should an exported function's signature be frozen at the module boundary?**
 

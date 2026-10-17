@@ -283,6 +283,7 @@ import {
   fnFlowDeclPathPinFns,
   fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
+  fnFlowDeclPathPinTysOf,
   fnFlowDeclPathSrcs,
   fnFlowDeclWritten,
   fnFlowElemKind,
@@ -13572,10 +13573,10 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
   sp
 }
 
-// The pin of hole parameter `pIx` when call `callIx` hands it generic function `argIx`: the
-// instance the checker bound the hole to, materialized here and pinned as a concrete function
-// argument is, so the callee can forward it to a further hole (D5402). "" when the argument is
-// not a generic or no concrete signature is known; `tyOut[0]` takes the pin's type, -1 for none.
+// The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
+// checker's binding, else the generic instanced at the one flow pin of its read past the call
+// (D5612). Delivered as a concrete function argument, so the callee can forward it on. "" when
+// none closes; `tyOut[0]` takes the pin's type.
 function monoHoleGenFnPin(
   callIx: i32,
   pIx: i32,
@@ -13584,14 +13585,19 @@ function monoHoleGenFnPin(
   tyOut: i32[],
 ): string {
   let bt = monoHoleGenFnTy(callIx, pIx, argIx)
-  let nm = monoConcreteFnTyName(bt)
+  let flowDecl = -1
   if bt < 0 {
-    nm = monoHoleGenFnFlowPin(argIx, ctx, tyOut)
-    if nm == "" || tyOut[0] < 0 { return nm }
-    bt = tyOut[0]
-  } else {
-    if nm == "" { return "" }
-    if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+    const fl = monoHoleGenFnFlowDecl(argIx, ctx)
+    bt = monoHoleGenFnFlowTy(argIx, fl)
+    if bt >= 0 { flowDecl = fl[1] }
+  }
+  const nm = monoConcreteFnTyName(bt)
+  if nm == "" { return "" }
+  if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+  // A call taking the flow pin whose callee the checker left open is typed at it.
+  if flowDecl >= 0 {
+    const noPath: string[] = []
+    monoRetypePinCalls(flowDecl, noPath)
   }
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = bt
@@ -13602,59 +13608,51 @@ function monoHoleGenFnPin(
   nm
 }
 
-// Whether `ax` names a function that declares type parameters, by name or through never-written
-// aliases: one generic only by its un-annotated parameters has no one signature to deliver.
-function monoArgHasTyParams(ax: i32): boolean {
-  let d = identDeclOf(ax)
-  if d >= 0 && d < P.nodes.length && !(P.nodes[d] is FuncDecl) {
-    d = fnFlowReadGenFn(ax)
+// The frame and binding (`monoReadLetFrame`) whose flow-table slot holds generic `argIx` read in
+// frame `ctx`: the read itself in `ctx` unless it names a `let`; `[-1, -1]` when `argIx` does not
+// name a generic.
+function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return none }
+  if (
+    !monoNamesDeclaredGeneric(ax, ctx)
+    && !monoCalleeIsGeneric(ax)
+    && monoReadGenFnFe(ax) < 0
+  ) {
+    return none
   }
-  if d < 0 || d >= P.nodes.length { return false }
-  const f = P.nodes[d]
-  f is FuncDecl && f.fnTyParams.length > 0
+  const lf = monoReadLetFrame(ax, ctx)
+  if lf[1] >= 0 { return lf }
+  const out: i32[] = [ctx, ax]
+  out
 }
 
-// For a generic `argIx` the checker bound no instance at the hole, as one the callee returns bare
-// is: the one signature the flow table pins its read at past the call, delivered there with each
-// call taking it typed at it (D5530). "" for no pin, or two; `tyOut[0]` takes the type those
-// calls agree on, -1 when none does.
-function monoHoleGenFnFlowPin(argIx: i32, ctx: i32, tyOut: i32[]): string {
-  const ax = unwrapParen(argIx)
-  if ax < 0 { return "" }
-  if !monoNamesDeclaredGeneric(ax, ctx) && monoReadGenFnFe(ax) < 0 { return "" }
-  if !monoArgHasTyParams(ax) { return "" }
+// Generic `argIx`'s signature instanced at the parameter types of the one closed pin the flow
+// table gives slot `lf` (`monoHoleGenFnFlowDecl`); -1 for no pin, two, a parameter that does not
+// fit, or a type variable left open, as a return no parameter fixes is.
+function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
+  if lf[1] < 0 { return -1 }
   const noPath: string[] = []
-  let d = ax
-  let fr = ctx
-  const lf = monoReadLetFrame(ax, ctx)
-  if lf[1] >= 0 {
-    d = lf[1]
-    fr = lf[0]
+  const pins = monoDeclPathPins(lf, noPath)
+  if pins.length != 1 { return -1 }
+  const ps = fnFlowDeclPathPinTysOf(lf[1], noPath, pins[0])
+  const vt = nodeTyIxOf(unwrapParen(argIx))
+  if vt < 0 || vt >= T.tys.length || ps.length == 0 || !tyHasTyVar(vt) {
+    return -1
   }
-  const nm = monoSlotPinName(d, noPath, fr)
-  if nm == "" { return "" }
-  if monoCoerceFnValueName(ax, nm, ctx, -1) < 0 { return "" }
-  monoRetypePinCalls(d, noPath)
-  let got = -1
-  for cx in fnFlowDeclPathPinCalls(d, noPath) {
-    const c = P.nodes[cx]
-    if c is Call {
-      const ct = nodeTyIxOf(unwrapParen(c.callFn))
-      if (
-        ct < 0
-        || ct >= T.tys.length
-        || !(T.tys[ct] is TyFunc)
-        || tyHasTyVar(ct)
-      ) {
-        return nm
-      }
-      if got >= 0 && !tyEq(got, ct) { return nm }
-      got = ct
-    }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) || vf.fnParamTypes.length != ps.length { return -1 }
+  const gN: string[] = []
+  const gT: i32[] = []
+  let j = 0
+  while j < ps.length {
+    bindGenWalk(vf.fnParamTypes[j], ps[j], gN, gT)
+    j = j + 1
   }
-  // arena-tick exempt: a caller-owned out-parameter, not the arena.
-  tyOut[0] = got
-  nm
+  const inst = substTyDeep(vt, gN, gT)
+  if !monoTyConcreteFn(inst) { return -1 }
+  inst
 }
 
 // The concrete function type the checker bound hole parameter `pIx` to at call `callIx`, when
@@ -13787,6 +13785,8 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
+              // A name handed through an identity call into a binding can take a slot per type.
+              if P.nodes[args[i]] is Ident { fsAsk(args[i]) }
               return emitFail(
                 "emitProgram: monomorphize: unsupported argument type for `"
                   + p.parName
@@ -15872,7 +15872,12 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     fr = lf[0]
   }
   const nm = monoSlotPinName(d, noPath, fr)
-  if nm == "" { return 0 }
+  if nm == "" {
+    // Two pins past the return ask for a copy of the function per result pin (D5531).
+    const lfp = [fr, d]
+    if monoDeclPathPins(lfp, noPath).length > 1 { fsAsk(ctx) }
+    return 0
+  }
   if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
   monoRetypePinCalls(d, noPath)
 }

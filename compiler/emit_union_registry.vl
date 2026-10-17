@@ -41,6 +41,12 @@ import { narrowVariantFor } from "./emit_narrow_slots"
 import {
   declTyIxOfName,
   msAtomIdOf,
+  msMaskClear,
+  msMaskFull,
+  msMaskHas,
+  msMaskIsEmpty,
+  msSetHas,
+  msSetMaskCopy,
   repCanonId,
   repShadowAddReason,
   repShadowBumpReason,
@@ -56,10 +62,11 @@ import {
   msRowChain,
   msSetByText,
   msSetGen,
-  msSetMask,
   msSetNext,
   msSetRow,
   msSetText,
+  msSetWordAt,
+  msSetWords,
   narrowSets,
   narrowTys,
   uVariants,
@@ -1013,25 +1020,21 @@ export function unionHasAtomTy(
 // search; a set renders (`msTextOf`) only when handed to a name-keyed consumer.
 
 // The member slice of union row `u`, or -1 when the row is not covered by the reference
-// columns (a row the recorder missed, an empty row, or one wider than the 31-bit mask).
-// `unMemTyStart`/`unMemTyCount` slice all four member columns alike. The bound lives once,
-// in `emit_rep` beside the recorder that writes the columns (#1110) — this is its local spelling.
+// columns (a row the recorder missed, or an empty row). `unMemTyStart`/`unMemTyCount` slice
+// all four member columns alike. The bound lives once, in `emit_rep` beside the recorder
+// that writes the columns (#1110) — this is its local spelling.
 function msRowStart(u: i32): i32 { unMemRowStart(u) }
-
-// Is member `i` present in `mask`? (Bitwise `&` binds LOOSER than `==` in this
-// language, so the test is parenthesized once here rather than at five call sites.)
-function msBitSet(mask: i32, i: i32): boolean { ((mask >>> i) & 1) == 1 }
 
 // The rendered form of the subset `mask` of row `u`: the surviving members'
 // verbatim spellings, joined on `|`, in the row's recorded order.
-function msRenderSet(u: i32, mask: i32): string {
+function msRenderSet(u: i32, mask: i32[]): string {
   const st = msRowStart(u)
   if st < 0 { return "" }
   const n = unMemTyCount[u]
   let out = ""
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
+    if msMaskHas(mask, i) {
       if out != "" { out = out + "|" }
       out = out + unMemAtoms[st + i]
     }
@@ -1040,20 +1043,37 @@ function msRenderSet(u: i32, mask: i32): string {
   out
 }
 
+// Does set `s` hold exactly the mask `mask`?
+function msSetMaskIs(s: i32, mask: i32[]): boolean {
+  const at = msSetWordAt[s]
+  let k = 0
+  while k < mask.length {
+    if at + k >= msSetWords.length { return false }
+    if msSetWords[at + k] != mask[k] { return false }
+    k = k + 1
+  }
+  true
+}
+
 // The interned set id for the subset `mask` of row `u` — one id per distinct
 // (row, mask), so a set's rendering is built once and every later operation on it is
-// a table read. Stamped with the pool generation (method note 7).
-function msSetIntern(u: i32, mask: i32): i32 {
+// a table read. `mask` is `msMaskWords` words of the row. Stamped with the pool generation (method note 7).
+function msSetIntern(u: i32, mask: i32[]): i32 {
   while msRowChain.length <= u { msRowChain.push(-1) }
   let s = msRowChain[u]
   while s >= 0 {
-    if msSetMask[s] == mask && msSetGen[s] == msGen.at { return s }
+    if msSetGen[s] == msGen.at && msSetMaskIs(s, mask) { return s }
     s = msSetNext[s]
   }
   const id = msSetRow.length
   const txt = msRenderSet(u, mask)
   msSetRow.push(u)
-  msSetMask.push(mask)
+  msSetWordAt.push(msSetWords.length)
+  let k = 0
+  while k < mask.length {
+    msSetWords.push(mask[k])
+    k = k + 1
+  }
   msSetGen.push(msGen.at)
   msSetNext.push(msRowChain[u])
   msSetText.push(txt)
@@ -1068,8 +1088,7 @@ function msSetIntern(u: i32, mask: i32): i32 {
 function msSetOfRow(u: i32): i32 {
   const st = msRowStart(u)
   if st < 0 { return -1 }
-  const n = unMemTyCount[u]
-  msSetIntern(u, (1 << n) - 1)
+  msSetIntern(u, msMaskFull(unMemTyCount[u]))
 }
 
 // The set id for a member-set string — the bridge for a consumer still holding text. A set
@@ -1115,10 +1134,9 @@ export function msMemberAtomsOfSet(s: i32, out: string[]): boolean {
   const st = msRowStart(u)
   if st < 0 { return false }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let i = 0
   while i < n {
-    if msBitSet(mask, i) { out.push(unMemAtoms[st + i]) }
+    if msSetHas(s, i) { out.push(unMemAtoms[st + i]) }
     i = i + 1
   }
   true
@@ -1132,10 +1150,9 @@ export function msHasNull(s: i32): boolean {
   const st = msRowStart(u)
   if st < 0 { return false }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
+    if msSetHas(s, i) {
       if unMemKinds[st + i] == 0 { return true }
     }
     i = i + 1
@@ -1150,11 +1167,10 @@ function msNonNullCount(s: i32): i32 {
   const st = msRowStart(u)
   if st < 0 { return 0 }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let c = 0
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
+    if msSetHas(s, i) {
       if unMemKinds[st + i] != 0 { c = c + 1 }
     }
     i = i + 1
@@ -1172,11 +1188,10 @@ export function msSoleMemberTy(s: i32): i32 {
   const st = msRowStart(u)
   if st < 0 { return -1 }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let found = -1
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
+    if msSetHas(s, i) {
       if found >= 0 { return -1 }
       found = st + i
     }
@@ -1193,11 +1208,11 @@ export function msSubNull(s: i32): i32 {
   const st = msRowStart(u)
   if st < 0 { return -1 }
   const n = unMemTyCount[u]
-  let mask = msSetMask[s]
+  const mask = msSetMaskCopy(s)
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
-      if unMemKinds[st + i] == 0 { mask = mask - (1 << i) }
+    if msMaskHas(mask, i) {
+      if unMemKinds[st + i] == 0 { msMaskClear(mask, i) }
     }
     i = i + 1
   }
@@ -1214,15 +1229,15 @@ export function msKeepTy(s: i32, ty: i32): i32 {
   const st = msRowStart(u)
   if st < 0 { return -1 }
   const n = unMemTyCount[u]
-  let mask = msSetMask[s]
+  const mask = msSetMaskCopy(s)
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
-      if !msTyCovers(ty, unMemTys[st + i]) { mask = mask - (1 << i) }
+    if msMaskHas(mask, i) {
+      if !msTyCovers(ty, unMemTys[st + i]) { msMaskClear(mask, i) }
     }
     i = i + 1
   }
-  if mask == 0 { return -1 }
+  if msMaskIsEmpty(mask) { return -1 }
   msSetIntern(u, mask)
 }
 
@@ -1236,16 +1251,19 @@ export function msSubTy(s: i32, ty: i32): i32 {
   const st = msRowStart(u)
   if st < 0 { return -1 }
   const n = unMemTyCount[u]
-  const mask0 = msSetMask[s]
-  let mask = mask0
+  const mask = msSetMaskCopy(s)
+  let changed = false
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
-      if msTyCovers(ty, unMemTys[st + i]) { mask = mask - (1 << i) }
+    if msMaskHas(mask, i) {
+      if msTyCovers(ty, unMemTys[st + i]) {
+        msMaskClear(mask, i)
+        changed = true
+      }
     }
     i = i + 1
   }
-  if mask == mask0 { return s }
+  if !changed { return s }
   msSetIntern(u, mask)
 }
 
@@ -1278,11 +1296,11 @@ export function msSubAtom(s: i32, removed: string): i32 {
   if st < 0 { return -1 }
   const n = unMemTyCount[u]
   const rid = msAtomIdOf(removed)
-  let mask = msSetMask[s]
+  const mask = msSetMaskCopy(s)
   let i = 0
   while i < n {
-    if msBitSet(mask, i) {
-      if unMemAtomIds[st + i] == rid { mask = mask - (1 << i) }
+    if msMaskHas(mask, i) {
+      if unMemAtomIds[st + i] == rid { msMaskClear(mask, i) }
     }
     i = i + 1
   }

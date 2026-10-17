@@ -89,8 +89,18 @@ const bothHosts = async (
 ) => {
   const dir = await materialise(files);
   try {
-    const native = await nativeFrames(dir, entry);
-    const deno = await denoFrames(dir, entry);
+    // A merged name carries its module's stable id, a hash of its key: both hosts must agree on
+    // it, and the expectation spells it `$m<id>`.
+    const rawNative = await nativeFrames(dir, entry);
+    const rawDeno = await denoFrames(dir, entry);
+    if (JSON.stringify(rawNative) !== JSON.stringify(rawDeno)) {
+      throw new Error(
+        `${what}: the hosts disagree\n  native ${JSON.stringify(rawNative)}\n  deno   ${JSON.stringify(rawDeno)}`,
+      );
+    }
+    const ids = (fs: string[]) => fs.map((f) => f.replace(/\$m\d+/g, () => "$m<id>"));
+    const native = ids(rawNative);
+    const deno = ids(rawDeno);
     const e = JSON.stringify(expect);
     if (JSON.stringify(native) !== e) {
       throw new Error(`${what} (native)\n  want ${e}\n  got  ${JSON.stringify(native)}`);
@@ -226,7 +236,7 @@ Deno.test({
         "",
       ].join("\n"),
     }, "entry.vl", [
-      "at lib.vl:6:3  in `boom$m1`",
+      "at lib.vl:6:3  in `boom$m<id>`",
       "at entry.vl:5:1  in `__start__`",
     ], "two files"),
 });

@@ -117,6 +117,30 @@ const sha = async (b: Uint8Array) => new Uint8Array(await crypto.subtle.digest("
 const unhex = (s: string) => new Uint8Array(s.match(/../g)!.map((h) => parseInt(h, 16)));
 const enc = (s: string) => new TextEncoder().encode(s);
 
+/** The host's `seed_content_key` (vl-host main.rs): FNV-1a over 8-byte words in four lanes. */
+const seedContentKey = (bytes: Uint8Array): string => {
+  const M = (1n << 64n) - 1n, PRIME = 0x100000001b3n;
+  const h = [0, 1, 2, 3].map(() => 0xcbf29ce484222325n);
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const whole = bytes.length - bytes.length % 32;
+  for (let i = 0; i < whole; i += 32) {
+    for (let l = 0; l < 4; l++) h[l] = ((h[l] ^ dv.getBigUint64(i + l * 8, true)) * PRIME) & M;
+  }
+  const rotl = (x: bigint, r: bigint) => ((x << r) | (x >> (64n - r))) & M;
+  let acc = h[0] ^ rotl(h[1], 16n) ^ rotl(h[2], 32n) ^ rotl(h[3], 48n);
+  acc = ((acc ^ BigInt(bytes.length)) * PRIME) & M;
+  for (let i = whole; i < bytes.length; i++) acc = ((acc ^ BigInt(bytes[i])) * PRIME) & M;
+  return acc.toString(16).padStart(16, "0");
+};
+
+/** `[path, engine tag]` of each `<seed>.<key>.<tag>.cwasm` sidecar beside `seed`. */
+const cwasmSidecars = (seed: string, key: string): [string, string][] => {
+  const dir = seed.replace(/\/[^/]*$/, ""), stem = `${seed.slice(dir.length + 1)}.${key}.`;
+  return [...Deno.readDirSync(dir)].map((e) => e.name)
+    .filter((n) => n.startsWith(stem) && n.endsWith(".cwasm"))
+    .map((n) => [`${dir}/${n}`, n.slice(stem.length, -".cwasm".length)]);
+};
+
 const test = (name: string, fn: () => Promise<void>) =>
   Deno.test({ name: `native compile cache: ${name}`, ignore: !ENABLED, fn });
 const testOpt = (name: string, fn: () => Promise<void>) =>
@@ -452,9 +476,16 @@ testOpt("-O3: the seed is a chain input, since its optPipeStart reads the rung's
     // The same compiler with one empty custom section appended: every emitted byte is the
     // same, so only the seed's own key can make the chain miss.
     const seed = `${tmp}/seed.wasm`;
-    await Deno.writeFile(seed, new Uint8Array([...await Deno.readFile(COMPILER), 0, 2, 1, 0x78]));
+    const seedBytes = new Uint8Array([...await Deno.readFile(COMPILER), 0, 2, 1, 0x78]);
+    await Deno.writeFile(seed, seedBytes);
     // `--compiler`, not `$VL_COMPILER_WASM`: a `VL_*` variable is keyed on its own.
     const a = await vl(["build", "main.vl", "-O3", "-o", "a.wasm", "--compiler", COMPILER], p);
+    // The section changes no code, so COMPILER's compiled sidecars serve the new seed under
+    // its own key, and the host skips a whole-seed Cranelift compile.
+    const sidecars = cwasmSidecars(COMPILER, seedContentKey(await Deno.readFile(COMPILER)));
+    expect(sidecars.length > 0, true, "the ported seed key names COMPILER's own sidecar");
+    const key = seedContentKey(seedBytes);
+    for (const [path, tag] of sidecars) await Deno.copyFile(path, `${seed}.${key}.${tag}.cwasm`);
     const b = await vl(["build", "main.vl", "-O3", "-o", "b.wasm", "--compiler", seed], p);
     expect(
       [a.code, optTrace(a.trace), b.code, optTrace(b.trace)],

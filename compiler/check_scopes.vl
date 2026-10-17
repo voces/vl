@@ -6,7 +6,8 @@
 // innermost binding, so shadowing holds. The checker pushes and pops the frames and resets
 // the tables.
 
-import { FuncDecl, Ident, P, i32ToStr } from "./ast"
+import { FuncDecl, Ident, P } from "./ast"
+import { modSuffixOf } from "./modid"
 import { demangleName } from "./check_suggest"
 import { T } from "./check_types"
 import {
@@ -45,6 +46,74 @@ export let fnDeclScopes: {[string]: i32}[] = []
 // `fnDeclScopes` deliberately answers -1 there, a function value keeping the exact-arity gate a
 // value call has. Its one consumer is constraint ownership; a closure parameter is left out.
 export let fnAliasScopes: {[string]: i32}[] = []
+
+// The (name, depth) bindings `scopeHideEnter` took out of `scopeDepthsOf`, innermost window last.
+export let scopeHidName: string[] = []
+export let scopeHidDepth: i32[] = []
+
+// Hides every binding above the module frame from name lookup until `scopeHideLeave`, and answers
+// the mark to hand it. A top-level function's body is checked under this, so a forward callee
+// inferred inside a caller resolves its free names at module scope, not the caller's (D5650).
+export function scopeHideEnter(): i32 {
+  const mark = scopeHidName.length
+  let d = T.scopes.length - 1
+  while d >= 1 {
+    for k in T.scopes[d] {
+      const ds = scopeDepthsOf[k]
+      if ds != null {
+        let j = ds.length - 1
+        while j >= 0 && ds[j] != d { j = j - 1 }
+        if j >= 0 {
+          while j + 1 < ds.length {
+            ds[j] = ds[j + 1]
+            j = j + 1
+          }
+          ds.pop()
+          scopeHidName.push(k)
+          scopeHidDepth.push(d)
+        }
+      }
+    }
+    d = d - 1
+  }
+  mark
+}
+
+// Puts back, in depth order, what `scopeHideEnter` hid since `mark`. A binding whose frame is gone,
+// or that is listed again already, stays out.
+export function scopeHideLeave(mark: i32) {
+  let i = scopeHidName.length - 1
+  while i >= mark {
+    const k = scopeHidName[i]
+    const d = scopeHidDepth[i]
+    if d < T.scopes.length && T.scopes[d].has(k) {
+      const ds = scopeDepthsOf[k]
+      if ds == null {
+        scopeDepthsOf[k] = [d]
+      } else {
+        let j = ds.length
+        let dup = false
+        while j > 0 && ds[j - 1] >= d {
+          if ds[j - 1] == d { dup = true }
+          j = j - 1
+        }
+        if !dup {
+          ds.push(d)
+          let m = ds.length - 1
+          while m > j {
+            ds[m] = ds[m - 1]
+            m = m - 1
+          }
+          ds[j] = d
+        }
+      }
+    }
+    scopeHidName.pop()
+    scopeHidDepth.pop()
+    i = i - 1
+  }
+  0
+}
 
 // The scope-chain depth of the innermost binding of `name`, or -1 when undeclared. `lookup` is
 // the same walk reading the type out; this one reads the frame it came from, which is what the
@@ -206,6 +275,6 @@ export function numIntrShadowed(name: string) {
 export function moduleFnDeclOf(raw: string, m: i32) {
   if fnDeclScopes.length == 0 { return -1 }
   let d = fnDeclScopes[0][raw] ?? -1
-  if d < 0 && m >= 0 { d = fnDeclScopes[0][raw + "$m" + i32ToStr(m)] ?? -1 }
+  if d < 0 && m >= 0 { d = fnDeclScopes[0][raw + modSuffixOf(m)] ?? -1 }
   d
 }

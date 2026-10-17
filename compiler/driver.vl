@@ -28,6 +28,7 @@ import {
   fsReset,
   fsSetMode,
 } from "./fn_split"
+import { modIdAssign, modIdReset, modSuffixOf } from "./modid"
 // The source-in / bytes-out driver — the interface `scripts/vl-host` embeds against.
 // A real `import`/`export` module that imports the pipeline (lexer → ast → parser →
 // typecheck → wasmEmit → lint → format) and exposes the host ABI
@@ -1151,14 +1152,14 @@ function ambientRenameSingle(root: i32): i32 {
       if st is LetDecl { nm = st.letName }
       if nm != "" && isAmbientFnName(nm) && !strListHas(ambTopRenamed, nm) {
         ambTopRenamed.push(nm)
-        modRenamePush(nm, nm + "$m0")
+        modRenamePush(nm, nm + modSuffixOf(0))
       }
       if st is FuncDecl {
         if isAmbientFnName(st.fnName) && st.fnParams.length > 0 {
           const p0 = P.nodes[st.fnParams[0]]
           if p0 is Param {
             if p0.parName == "self" {
-              modSelfFnName.push(st.fnName + "$m0")
+              modSelfFnName.push(st.fnName + modSuffixOf(0))
               modSelfFnArity.push(st.fnParams.length)
               modSelfFnMinArity.push(fnRequiredArity(st.fnParams))
             }
@@ -1181,7 +1182,7 @@ function ambientRenameSingle(root: i32): i32 {
 
 // The wasm export target of a single-source program's top-level `name`.
 function ambTopTarget(name: string): string {
-  if strListHas(ambTopRenamed, name) { return name + "$m0" }
+  if strListHas(ambTopRenamed, name) { return name + modSuffixOf(0) }
   name
 }
 
@@ -3357,6 +3358,7 @@ export function diagDataByte(i: i32, j: i32): i32 { vcDiagData(i)[j] }
 // loop: commits the entry, asks `modPendingCount` which resolved keys are still
 // needed, and repeats until the graph closes. An empty table behaves exactly as before.
 export function modReset(): i32 {
+  modIdReset()
   modKeys = []
   modKeyIx = Map()
   modSrcs = []
@@ -3848,6 +3850,29 @@ function modNormalize(path: string): string {
   }
   if absolute { return "/" + out }
   out
+}
+// The key a module's stable id hashes: a `std:` key as written, else the normalised path,
+// relative to the staged working directory when it lies under it, so one file named absolute
+// or relative gets one id.
+function modIdKeyOf(key: string): string {
+  if modKeyIsStd(key) { return key }
+  let abs = key
+  if !modSpecAbsolute(key) && vlCwd.length > 0 { abs = vlCwd + "/" + key }
+  abs = modNormalize(abs)
+  if vlCwd.length == 0 { return abs }
+  let p = vlCwd
+  if p[p.length - 1] != '/' { p = p + "/" }
+  if abs.length > p.length && abs.slice(0, p.length) == p {
+    return abs.slice(p.length, abs.length)
+  }
+  abs
+}
+// Gives every module of this graph its merge suffix, a function of its own key alone.
+function modIdAssignKeys() {
+  const ks: string[] = []
+  for k in modKeys { ks.push(modIdKeyOf(k)) }
+  modIdAssign(ks)
+  0
 }
 // Resolves `spec` written in the module at `fromKey` to a key, or "" for a kind
 // the resolver rejects (bare, malformed `std:`, or relative-inside-std — a std
@@ -4438,12 +4463,12 @@ function modMergedTargetOf(m: i32, name: string): string {
       }
       r = r + 1
     }
-    if nextMod < 0 { return cn + "$m" + i32ToStr(cm) }
+    if nextMod < 0 { return cn + modSuffixOf(cm) }
     cm = nextMod
     cn = nextName
     hops = hops + 1
   }
-  cn + "$m" + i32ToStr(cm)
+  cn + modSuffixOf(cm)
 }
 // Visits module `m`: resolves and validates its imports (unsupported specifier,
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps first.
@@ -4665,6 +4690,7 @@ function modBuiltinImportNote(name: string): string {
 
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
 function modCompile(emit: i32): i32 {
+  modIdAssignKeys()
   plusLinksClear()
   vcEtDrop()
   vcEpDrop()
@@ -4838,12 +4864,12 @@ function modCompile(emit: i32): i32 {
       // local function to forward to, so an alias row would name a target the merge never
       // defines. Its own import entry is what a host sees.
       if (
-        externLinkOf(expName[rex] + "$m0") < 0
-        && externGlobalLinkOfName(expName[rex] + "$m0") < 0
+        externLinkOf(expName[rex] + modSuffixOf(0)) < 0
+        && externGlobalLinkOfName(expName[rex] + modSuffixOf(0)) < 0
       ) {
         rexSeen[expName[rex]] = true
         reExpName.push(expName[rex])
-        reExpTarget.push(expName[rex] + "$m0")
+        reExpTarget.push(expName[rex] + modSuffixOf(0))
       }
     }
     rex = rex + 1
@@ -5010,7 +5036,7 @@ function modBuildRename(m: i32, root: i32): i32 {
     if impMod[ii] == m && impLocal[ii] != "" { impLocals.push(impLocal[ii]) }
     ii = ii + 1
   }
-  const suffix = "$m" + i32ToStr(m)
+  const suffix = modSuffixOf(m)
   const r = P.nodes[root]
   if r is Program {
     const ss = r.progStmts
@@ -5413,7 +5439,7 @@ function modCheckOverloads(roots: i32[]): i32 {
         if st is UnionDecl { tyDecls[modDeclBase(si, st.udName)] = si }
         const tk = declNameTokOf(si)
         if tk >= 0 && tk < P.toks.length {
-          decls[P.toks[tk].text + "$m" + i32ToStr(modOrder[o])] = si
+          decls[P.toks[tk].text + modSuffixOf(modOrder[o])] = si
         }
       }
     }
@@ -5738,7 +5764,7 @@ export function isAmbientFnName(name: string): boolean {
 // under: renamed apart from the builtin when `name` is ambient, else `name`.
 function modShadowBind(name: string): string {
   let to = ""
-  if isAmbientFnName(name) { to = name + "$m" + i32ToStr(modAmbMod) }
+  if isAmbientFnName(name) { to = name + modSuffixOf(modAmbMod) }
   modShadow.push(name)
   modShadowTo.push(to)
   if to == "" { return name }
