@@ -18,6 +18,7 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { workspaceRelative } from "./ratchetHold.ts";
+import { ROOT_SENTINELS } from "./moduleGraph.ts";
 
 /**
  * Whether `dir` IS a VL checkout root: both `compiler/entry.vl` and `std/fmt.vl`
@@ -76,4 +77,35 @@ export const vlRootFor = (filePath: string): string | undefined => {
 export const lintPathFor = (filePath: string): string | undefined => {
   const root = vlRootFor(filePath);
   return root === undefined ? undefined : workspaceRelative(root, filePath);
+};
+
+/**
+ * The project root a module's stable id is keyed under (D5760): the nearest ancestor of
+ * `filePath`'s directory holding one of `ROOT_SENTINELS`, `/`-separated, or "" when none
+ * does. The CLI host walks the same set (`module_root_of`, scripts/vl-host/src/main.rs),
+ * so `vl build --names` and the editor give a module one id. Memoized per directory.
+ */
+const projectRootCache = new Map<string, string>();
+
+export const projectRootFor = (filePath: string): string => {
+  const visited: string[] = [];
+  let dir = dirname(filePath);
+  let found = "";
+  for (;;) {
+    const known = projectRootCache.get(dir);
+    if (known !== undefined) {
+      found = known;
+      break;
+    }
+    visited.push(dir);
+    if (ROOT_SENTINELS.some((s) => existsSync(join(dir, s)))) {
+      found = dir.replaceAll("\\", "/");
+      break;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  for (const d of visited) projectRootCache.set(d, found);
+  return found;
 };

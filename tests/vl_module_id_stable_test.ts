@@ -5,12 +5,25 @@
 // which is what stops a per-module check result from being reused across importers
 // (docs/internals/incremental-compilation-design.md §3.2). This suite builds one `lib.vl`
 // inside three graphs that discover it at different positions and holds its function names,
-// read off the `--names` build's name section, to one spelling. A control
+// read off the `--names` build's name section, to one spelling. A fourth arm builds one graph from
+// two working directories and compiles it through the editor's checker, and wants one suffix from
+// all three: the id keys on the path from the module's own project root (D5760). A control
 // requires the names to carry a suffix at all, so a merge that stopped renaming cannot pass.
 //
 // GATING: needs the built binary and the seed; reads the name section itself, no wasm-dis.
 
-import { COMPILER, exists, nativeEnv, VL } from "./support/tree.ts";
+import {
+  COMPILER as TREE_COMPILER,
+  exists,
+  nativeEnv,
+  VL as TREE_VL,
+} from "./support/tree.ts";
+import { createWasmChecker, type Exports } from "../lsp/src/wasmChecker.ts";
+import { projectRootFor } from "../lsp/src/vlRoot.ts";
+
+// `VL_MODULE_ID_VL` and `VL_MODULE_ID_COMPILER` grade another host and seed, for a before/after.
+const VL = Deno.env.get("VL_MODULE_ID_VL") ?? TREE_VL;
+const COMPILER = Deno.env.get("VL_MODULE_ID_COMPILER") ?? TREE_COMPILER;
 
 const ENABLED = exists(VL) && exists(COMPILER);
 if (!ENABLED) {
@@ -145,5 +158,104 @@ Deno.test({
         }\n  got  ${JSON.stringify(fns[i])}`,
       );
     }
+  }
+});
+
+// `name$m<id>` of every function the build names from `lib.vl`, sorted.
+const libSuffixed = (bytes: Uint8Array): string[] =>
+  namesOf(bytes).flatMap((n) => {
+    const m = /^([A-Za-z_]\w*\$m\d+)@[^:]*lib\.vl:/.exec(n);
+    return m === null ? [] : [m[1]];
+  }).sort();
+
+Deno.test({
+  name:
+    "module-id-stable: one graph names lib.vl alike from two working directories and the editor",
+  ignore: !ENABLED,
+}, async () => {
+  // The project root is the temp dir, marked by `deno.json`; the modules sit one level down.
+  const dir = Deno.makeTempDirSync({ prefix: "vl-module-id-root-" });
+  try {
+    Deno.mkdirSync(`${dir}/sub`);
+    Deno.writeTextFileSync(`${dir}/deno.json`, "{}\n");
+    Deno.writeTextFileSync(`${dir}/sub/lib.vl`, LIB);
+    const main = 'import { hello, mk } from "./lib"\nprint(hello(2) + mk().y)';
+    Deno.writeTextFileSync(`${dir}/sub/main.vl`, main);
+    const arms: [string, string[]][] = [];
+    for (
+      const [where, cwd, entry] of [
+        ["the project root", dir, "sub/main.vl"],
+        ["the module's own directory", `${dir}/sub`, "main.vl"],
+      ]
+    ) {
+      const p = await new Deno.Command(VL, {
+        args: [
+          "build",
+          entry,
+          "--names",
+          "-o",
+          `${dir}/out.wasm`,
+          "--compiler",
+          COMPILER,
+        ],
+        cwd,
+        env: nativeEnv(),
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (!p.success) {
+        throw new Error(
+          `vl build from ${where} failed:\n${
+            new TextDecoder().decode(p.stdout)
+          }${new TextDecoder().decode(p.stderr)}`,
+        );
+      }
+      arms.push([
+        `vl build from ${where}`,
+        libSuffixed(Deno.readFileSync(`${dir}/out.wasm`)),
+      ]);
+    }
+    const inst = new WebAssembly.Instance(
+      new WebAssembly.Module(Deno.readFileSync(COMPILER)),
+      {},
+    );
+    const checker = createWasmChecker(
+      () => inst.exports as unknown as Exports,
+      undefined,
+      undefined,
+      projectRootFor,
+    );
+    checker.setEmitNames(true);
+    const { bytes, diagnostics } = await checker.compile(
+      main,
+      `${dir}/sub/main.vl`,
+      (key) => Promise.resolve(Deno.readTextFileSync(key)),
+    );
+    if (bytes === undefined) {
+      throw new Error(
+        `the editor's compile failed: ${JSON.stringify(diagnostics)}`,
+      );
+    }
+    arms.push(["the editor's checker", libSuffixed(bytes)]);
+    if (!arms[0][1].some((n) => /^hello\$m\d+$/.test(n))) {
+      throw new Error(
+        `control: want a suffixed hello$m<id>, got ${
+          JSON.stringify(arms[0][1])
+        }`,
+      );
+    }
+    for (const [name, got] of arms.slice(1)) {
+      if (JSON.stringify(got) !== JSON.stringify(arms[0][1])) {
+        throw new Error(
+          `${name} named lib.vl's functions differently from ${
+            arms[0][0]
+          }:\n  want ${JSON.stringify(arms[0][1])}\n  got  ${
+            JSON.stringify(got)
+          }`,
+        );
+      }
+    }
+  } finally {
+    Deno.removeSync(dir, { recursive: true });
   }
 });

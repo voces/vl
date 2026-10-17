@@ -859,11 +859,16 @@ const readBytes = (len: number, at: (j: number) => number): Uint8Array => {
  * (`vlRoot.ts`, filesystem-based); the browser has no checkout to find and omits
  * it, so a playground snippet is never std — correctly, since it never is one.
  * `node:fs`/`node:path` stay out of this module either way.
+ *
+ * `resolveModuleRoot` answers a module key's project root ("" for none), staged per
+ * module (`modRootKeyPush`/`modRootDirPush`/`modRootCommit`) so its stable id is the
+ * one the CLI gives it (D5760). The Node loader passes `projectRootFor` (`vlRoot.ts`).
  */
 export const createWasmChecker = (
   instantiate: () => Exports | undefined,
   wrapReader?: (read: ModuleReader) => ModuleReader,
   resolveVlRoot?: (entryKey: string) => string | undefined,
+  resolveModuleRoot?: (key: string) => string,
 ): WasmChecker => {
   /**
    * What the instance's per-module scan cache holds, AS THE HOST LAST WROTE IT:
@@ -934,6 +939,14 @@ export const createWasmChecker = (
       const readModule = wrapReader ? wrapReader(read) : read;
       const pushed = pushedFor(exp);
       const commit = (key: string, src: string | undefined) => {
+        if (
+          resolveModuleRoot !== undefined && !key.startsWith("std:") &&
+          typeof exp.modRootCommit === "function"
+        ) {
+          pushString(exp.modRootKeyPush, key);
+          pushString(exp.modRootDirPush, resolveModuleRoot(key));
+          exp.modRootCommit();
+        }
         pushString(exp.modKeyPush, key);
         if (src === undefined) {
           exp.modCommit(0);

@@ -1328,13 +1328,14 @@ export function indexFloorMsg(arrTy: i32) {
 }
 
 // `memberFloorMsg` / `indexFloorMsg` in one call, keyed the way the table stores the
-// operation: `OP_INDEX_GET` is the index form, anything else is that member name.
-export function memCstrMsg(recv: i32, prop: string) {
+// operation: `OP_INDEX_GET` is the index form, anything else is that member name. `site` is the
+// operation's own node, or -1 where none is at hand.
+export function memCstrMsg(recv: i32, prop: string, site: i32) {
   if prop == OP_INDEX_GET { return indexFloorMsg(recv) }
-  if prop == OP_CALL_PIN { return callFloorMsg(recv) }
+  if prop == OP_CALL_PIN { return callFloorMsg(recv, site) }
   if prop == OP_CALL_GUARDED_PIN {
     if isNullTy(recv) { return "" }
-    return callFloorMsg(recv)
+    return callFloorMsg(recv, site)
   }
   if keyHasPrefix(prop, MC_NULL_READ_MARK) {
     if !tyAdmitsNull(recv) { return "" }
@@ -1814,6 +1815,22 @@ function memberPinFitsAt(
   0
 }
 
+// A deferred constraint's refusal `msg` reported at the call that resolved it, naming the body
+// `who` it came from.
+function memCstrAtCallMsg(msg: string, who: string): string {
+  let mWho = "the callee's body"
+  if who != "" { mWho = "the body of `" + who + "`" }
+  msg + " (" + mWho + " at the call's argument types)"
+}
+
+// The arity refusal of call pin `prop` at `site` on a function type `recv` still holding a hole;
+// "" for any other constraint, which waits for its holes.
+function callPinOpenArityMsg(recv: i32, prop: string, site: i32): string {
+  if prop != OP_CALL_PIN && prop != OP_CALL_GUARDED_PIN { return "" }
+  if recv < 0 || recv >= T.tys.length || !(T.tys[recv] is TyFunc) { return "" }
+  callFloorMsg(recv, site)
+}
+
 // Whether the deferred receiver-classification constraints this binding resolves hold — see
 // `memCstr.ty`'s header for why the index and UFCS arms cannot decide it in the body (D651 /
 // D691). The index form defers to the argument-flow gate where it already speaks; a receiver
@@ -1845,7 +1862,13 @@ export function validateMemCstrs(
       ) {
         if mr != memCstr.ty[ci] {
           if tyHasHole(mr) {
-            noteMemCstr(mr, memCstr.prop[ci], memCstr.ix[ci], memCstr.dem[ci])
+            // A function value's arity is known before its types are (D5750).
+            const am = callPinOpenArityMsg(mr, memCstr.prop[ci], memCstr.ix[ci])
+            if am != "" {
+              tErr(memCstrAtCallMsg(am, who), ix)
+            } else {
+              noteMemCstr(mr, memCstr.prop[ci], memCstr.ix[ci], memCstr.dem[ci])
+            }
           }
         }
       }
@@ -1901,7 +1924,7 @@ export function validateMemCstrs(
         // is a real array/map write. The SET operator's own site is settled just above.
         if memCstr.prop[ci] == OP_INDEX_SET { skip = true }
         if !skip {
-          const mMsg = memCstrMsg(mr, memCstr.prop[ci])
+          const mMsg = memCstrMsg(mr, memCstr.prop[ci], memCstr.ix[ci])
           if mMsg != "" {
             // Refuses in the hole's own words, attributed to the argument only when exactly
             // one parameter is spelled with this type variable — otherwise naming one would guess.
@@ -1921,11 +1944,7 @@ export function validateMemCstrs(
                 }
               }
             }
-            if !told {
-              let mWho = "the callee's body"
-              if who != "" { mWho = "the body of `" + who + "`" }
-              tErr(mMsg + " (" + mWho + " at the call's argument types)", ix)
-            }
+            if !told { tErr(memCstrAtCallMsg(mMsg, who), ix) }
           }
         }
       }
