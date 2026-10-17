@@ -127,10 +127,13 @@ for (const [fx, want] of FIXTURES) {
                   `  got:  ${JSON.stringify(got)} rc=${r.code} ${r.err.trim()}`,
               );
             }
-            return allocations((await run(WASM_DIS, [out, ...features])).out);
+            // Disassembled only for the `melts` kind, which grades the count.
+            return async () =>
+              allocations((await run(WASM_DIS, [out, ...features])).out);
           };
-          const left = await built(true);
-          if (want === "melts" && left !== allocs) {
+          const count = await built(true);
+          const left = want === "melts" ? await count() : allocs;
+          if (left !== allocs) {
             throw new Error(
               `${fx} ${rung}: ${left} struct.new left in the optimized module\n` +
                 `  want: ${allocs} — every call here only reads the record it gets\n` +
@@ -151,7 +154,7 @@ for (const [fx, want] of FIXTURES) {
                   : "  want: at least one — some call site here only reads its record"),
             );
           }
-          if (want === "melts" && await built(false) <= allocs) {
+          if (want === "melts" && await (await built(false))() <= allocs) {
             throw new Error(
               `${fx} ${rung}: CONTROL — with the step off no more struct.new is left,\n` +
                 "  so this fixture no longer exercises the step; give its producers a record\n" +
