@@ -60,6 +60,13 @@ trap '[ "$GATE_PASSED" = 1 ] && [ "${GATE_KEEP_LOGS:-0}" != 1 ] && rm -rf "$LOGS
 # (`seed size`, ported from Python); the paths are the ones every suite derives.
 VL="${VL:-$PWD/scripts/vl-host/target/release/vl}"
 SEED="${SEED:-$PWD/build/vl-compiler.wasm}"
+# The suites' binaryen: the native release at package.json's version, which writes the same
+# bytes as npm's JS build at a fraction of the CPU (npm's was ~60% of ci-native's, 2026-10-17).
+# Where it cannot be fetched the suites fall back to npm's, slower and still correct.
+if [ -z "${VL_BINARYEN:-}" ]; then
+  if VL_BINARYEN=$(bash scripts/fetch-binaryen.sh); then export VL_BINARYEN
+  else unset VL_BINARYEN; echo "gate.sh: no native binaryen; the suites use npm's (slower)" >&2; fi
+fi
 
 if [ "${1:-}" != "--no-build" ]; then
   echo "== building the seed (everything below reads it) =="

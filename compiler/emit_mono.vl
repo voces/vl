@@ -530,7 +530,7 @@ let monoLamMintedSlots: i32[] = []
 // Never retired, since the instance walks each clone's body once it is registered (D2553).
 let monoLamCloneSlots: i32[] = []
 
-// The arena shape `monoRebuild`'s four whole-program passes are a pure function of:
+// The arena shape `monoRebuild`'s two whole-program passes are a pure function of:
 // `P.nodes`, `fnStmts` and `fnParent` grow, and `monoArenaTick` counts what lands IN PLACE,
 // which no length can see. Every in-place write in this module calls `monoArenaTouch` or
 // carries an `arena-tick exempt:` line; `tests/vl_mono_arena_tick_test.ts` enforces that.
@@ -5581,10 +5581,10 @@ function monoPinMapLambdas(
   ix
 }
 
-// Rebuild the name→index map, the voidness/return-kind inference and `collectA`'s rep rows
-// after a new instance lands in `fnStmts`: a pinned `string[]`/`f64` annotation forces types
-// the original generic name never did. All four read the arena alone, so an unmoved stamp
-// means that state is in hand; `collectA` resumes here alone, where only this module edits.
+// Rebuild the name→index map and `collectA`'s rep rows after a new instance lands in
+// `fnStmts`: a pinned `string[]`/`f64` annotation forces types the original generic name never
+// did. Both read the arena alone, so an unmoved stamp means that state is in hand; `collectA`
+// resumes here alone, where only this module edits. The return inference waits for the settle.
 function monoRebuild() {
   const stamp = monoArenaStamp()
   if stamp == monoRebuiltStamp { return 0 }
@@ -5596,15 +5596,27 @@ function monoRebuild() {
   const bfmRc = buildFnMap(monoProgStmts)
   fmResumeArmed = false
   if bfmRc < 0 { return -1 }
-  // The two passes read capture sets and edit no body, so one rebuild shares one capture memo,
-  // as their pass-table runs do; the edit note drops the answers an earlier rebuild kept (D2771).
+  capMemoNoteEdit()
+  monoRetPending = true
+  monoRebuiltStamp = stamp
+  0
+}
+
+// Set by a rebuild, whose `buildFnMap` re-seeds the return rows; cleared by `monoRetSettle`.
+let monoRetPending = false
+
+// Re-derive voidness and the inferred return kinds once, after the walk, rather than per
+// instance: both are whole-program fixpoints, so per instance they cost instances x functions.
+// They read capture sets and edit no body, so one run shares one capture memo (D2771).
+function monoRetSettle() {
+  if !monoRetPending { return 0 }
+  monoRetPending = false
   capMemoNoteEdit()
   const savedArmed = capMemoArmed
   capMemoArmed = true
   computeVoidFns()
   computeRetInference()
   capMemoArmed = savedArmed
-  monoRebuiltStamp = stamp
   0
 }
 
@@ -16421,6 +16433,7 @@ export function monomorphize(stmts: i32[]) {
   monoLamCallCallees = []
   monoProgLamNames = []
   monoRebuiltStamp = 0 - 1
+  monoRetPending = false
   monoBodyDeclStamp = 0 - 1
   monoGen = []
   monoOrigNode = []
@@ -16572,7 +16585,12 @@ export function monomorphize(stmts: i32[]) {
     }
     fe3 = fe3 + 1
   }
-  monoPruneTemplates(nDecl)
+  // Settled before the prune, as the walk left it, and again after, in case the prune minted.
+  monoRetSettle()
+  const prc = monoPruneTemplates(nDecl)
+  if prc < 0 { return prc }
+  monoRetSettle()
+  prc
 }
 
 // `monomorphize`'s last stage, over the first `nDecl` slots: retypes the cells an instantiated
