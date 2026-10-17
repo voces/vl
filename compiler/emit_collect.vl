@@ -6806,6 +6806,78 @@ function collectAArrayLit(i: i32, nd: ArrayLit) {
   // floor refuses a rep it can name (D1725). Monotone, so a redundant reservation is inert.
   forceScalarListRep(nodeTyArrayElemPinRepName(i))
 }
+// `collectATypeRef`'s ref-list arm: a `S[]`/`N[]` annotation, or its nullable `S[] | null`,
+// forces the wrapper and backing of the non-null ref-array name and banks the interned row on
+// node `i`. Returns 0, or -1 once a niche-nullable element with no list rep has failed loudly.
+function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
+  let ran = nd.tyName
+  const ranp = nullablePartOf(ran)
+  // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
+  // lines down to set the banked row's null flag. The second read is by construction
+  // the same answer: `ranp` is never rewritten and no intern runs between them.
+  const ranIsNul = ranp != "" && nameIsRefArray(ranp)
+  if ranIsNul { ran = ranp }
+  // The element kind, classified once for the seven reads in this arm, which straddle the
+  // `ensureRefElem` intern — the only call between them that mutates a table the classifier
+  // reads. `ran` is final here: the `| null` peel two lines up is its last write.
+  const raKind = refArrElemKind(ran)
+  // The element NAME, resolved ONCE for the same reason: the kind-2 reject and the
+  // UNCONDITIONAL `recordAnnRlSlot` bank below both need it, so hoisting strictly
+  // REMOVES work (one resolution instead of two on every kind-2 element).
+  const ren = refArrElemName(ran)
+  // A kind-2 (union-box) element that is a niche nullable (`(boolean | null)[]`,
+  // `(string | null)[]` — one non-null member plus null, deliberately not a value union)
+  // has no list rep: the box lowering would emit the element's raw value. Reject cleanly.
+  // A value-union element and a struct or heterogeneous element box as usual.
+  if raKind == RLK_UNION {
+    const renNul = nullablePartOf(ren)
+    if !isValueUnionName(ren) && renNul != "" {
+      return emitFail(
+        "emitProgram: a nullable-"
+          + renNul
+          + " list element has no rep; use a non-null element type",
+      )
+    }
+  }
+  rlUsed = true
+  raUsed = true
+  rElemKind = raKind
+  // Bank the interned ROW on the annotation NODE (`annRlSlot`): this arm runs on
+  // exactly the spellings the annotation-node consumers call a ref array, so the
+  // row recorded here is the answer each of them needs — read back through
+  // `annRefArrSlot` without re-deriving it from the rendering.
+  let ranNul = 0
+  if ranIsNul { ranNul = 1 }
+  // The ref-list slot is interned from the annotation's own recorded element row where that
+  // row is what the name denotes, and from the name alone where it is not
+  // (`elemNameIsNominal`). -1 is the unhinted call, so every declined class is unchanged by
+  // construction and the hinted firings agree with the name path.
+  let renTy = -1
+  if !elemNameIsNominal(ren) { renTy = annRefArrElemRow(i) }
+  recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
+  // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
+  // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
+  if raKind == RLK_I32_LIST {
+    lUsed = true
+    aUsed = true
+  }
+  // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
+  // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
+  // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
+  if raKind == RLK_STR_LIST {
+    slUsed = true
+    aUsed = true
+  }
+  if raKind == RLK_F64_LIST { fa64Used = true }
+  if raKind == RLK_F32_LIST { fa32Used = true }
+  if raKind == RLK_U8_LIST { ba8Used = true }
+  if raKind == RLK_I64_LIST { ia64Used = true }
+  // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
+  // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
+  // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
+  // reaches every map element in every position, not just the ones an annotation spells.
+  0
+}
 
 // `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
 // spelling forces. Returns 0, or -1 once a spelling with no rep has failed loudly.
@@ -6892,76 +6964,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     // the reason the `genTyParamArr` rung gives. Ahead of the ref-array rung, which would
     // refuse its element as a nullable with no rep (D2525).
   } else if nameIsRefArray(nd.tyName) || nameIsNulRefList(nd.tyName) {
-    // A `S[]`/`N[]` annotation is a ref list (wrapper + `(ref null $elem)` backing) — and so is its
-    // NULLABLE form `S[] | null` (kind 18): force the wrapper/backing on the NON-null ref-array name,
-    // so a bare local whose value does not self-collect the element (e.g. `(i32|null)[] | null = [5]`)
-    // still emits the element's ref-list type.
-    let ran = nd.tyName
-    const ranp = nullablePartOf(ran)
-    // "Is this the NULLABLE ref-list spelling" — asked ONCE, and read again twenty
-    // lines down to set the banked row's null flag. The second read is by construction
-    // the same answer: `ranp` is never rewritten and no intern runs between them.
-    const ranIsNul = ranp != "" && nameIsRefArray(ranp)
-    if ranIsNul { ran = ranp }
-    // The element kind, classified once for the seven reads in this arm, which straddle the
-    // `ensureRefElem` intern — the only call between them that mutates a table the classifier
-    // reads. `ran` is final here: the `| null` peel two lines up is its last write.
-    const raKind = refArrElemKind(ran)
-    // The element NAME, resolved ONCE for the same reason: the kind-2 reject and the
-    // UNCONDITIONAL `recordAnnRlSlot` bank below both need it, so hoisting strictly
-    // REMOVES work (one resolution instead of two on every kind-2 element).
-    const ren = refArrElemName(ran)
-    // A kind-2 (union-box) element that is a niche nullable (`(boolean | null)[]`,
-    // `(string | null)[]` — one non-null member plus null, deliberately not a value union)
-    // has no list rep: the box lowering would emit the element's raw value. Reject cleanly.
-    // A value-union element and a struct or heterogeneous element box as usual.
-    if raKind == RLK_UNION {
-      const renNul = nullablePartOf(ren)
-      if !isValueUnionName(ren) && renNul != "" {
-        return emitFail(
-          "emitProgram: a nullable-"
-            + renNul
-            + " list element has no rep; use a non-null element type",
-        )
-      }
-    }
-    rlUsed = true
-    raUsed = true
-    rElemKind = raKind
-    // Bank the interned ROW on the annotation NODE (`annRlSlot`): this arm runs on
-    // exactly the spellings the annotation-node consumers call a ref array, so the
-    // row recorded here is the answer each of them needs — read back through
-    // `annRefArrSlot` without re-deriving it from the rendering.
-    let ranNul = 0
-    if ranIsNul { ranNul = 1 }
-    // The ref-list slot is interned from the annotation's own recorded element row where that
-    // row is what the name denotes, and from the name alone where it is not
-    // (`elemNameIsNominal`). -1 is the unhinted call, so every declined class is unchanged by
-    // construction and the hinted firings agree with the name path.
-    let renTy = -1
-    if !elemNameIsNominal(ren) { renTy = annRefArrElemRow(i) }
-    recordAnnRlSlot(i, ensureRefElemTy(ren, renTy), ranNul)
-    // An `i32[][]` annotation's ELEMENTS are i32-list wrappers — force the
-    // i32 list + raw array so `lTypeIdx`/`aTypeIdx` exist for the elements.
-    if raKind == RLK_I32_LIST {
-      lUsed = true
-      aUsed = true
-    }
-    // A nested NON-i32 scalar / string 2D array (`string[][]`/`f64[][]`/`i64[][]`, element
-    // kinds 6/7/8) forces its INNER list's backing+wrapper, as the LIST-valued map path
-    // does — else the element wrapper heap (`mkListIdx`/`fl64`/`il64`) is never allocated.
-    if raKind == RLK_STR_LIST {
-      slUsed = true
-      aUsed = true
-    }
-    if raKind == RLK_F64_LIST { fa64Used = true }
-    if raKind == RLK_F32_LIST { fa32Used = true }
-    if raKind == RLK_U8_LIST { ba8Used = true }
-    if raKind == RLK_I64_LIST { ia64Used = true }
-    // A map element (`{[K]: V}[]`, `({[K]: V} | null)[]`) forces the map machinery — the
-    // three type flags, the element map's mv value slot and `mI32Used` for an i32 key —
-    // inside `ensureRefElem` above, whose `k == 3` arm is the one home of that forcing and
-    // reaches every map element in every position, not just the ones an annotation spells.
+    if collectARefArrayAnn(i, nd) < 0 { return -1 }
   } else if (nodeTyArrayElemRepName(i) == "f64" || nameIsF64Array(nd.tyName)) {
     // An `f64[]` annotation forces the f64 array and wrapper pair, its own
     // `(array (mut f64))` backing, independent of the i32 array and list. The name is a

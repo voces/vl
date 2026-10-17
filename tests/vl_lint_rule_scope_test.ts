@@ -34,6 +34,7 @@ const INTERNAL = [
   "comment-shouting",
   "compiler-no-interpolation",
   "kind-ladder-incomplete",
+  "literal-byte-write",
   "sentinel-index-unguarded",
 ] as const;
 /** The LANGUAGE control: it fires wherever the file sits. */
@@ -71,8 +72,9 @@ function perThing(seed: i32) {
   }
   n
 }
+function wU8(b: i32) { b }
 function label(x: i32): string { "n=\\{x}" }
-let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1)
+let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f)
 print(label(total))
 `;
 
