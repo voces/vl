@@ -997,6 +997,8 @@ function ffCall(ix: i32, fnIx: i32): i32 {
       if dn is FuncDecl { return ffDirect(ix, c, d) }
     }
     if d == IDENT_BUILTIN || d < 0 { return ffOpaque(ix, cn.identName) }
+    const lam = ffConstGenLamOf(d)
+    if lam >= 0 { return ffConstLamCall(ix, ffCalleeSlot(c), lam) }
   }
   if cn is Member {
     const rt = nodeTyIxOf(cn.memObj)
@@ -1007,7 +1009,7 @@ function ffCall(ix: i32, fnIx: i32): i32 {
       }
       if ty is TyObj {
         if strListHas(ty.objFieldNames, cn.memProp) {
-          return ffSlotCall(ix, ffFlow(c, "callee"))
+          return ffSlotCall(ix, ffFlow(c, "callee"), [])
         }
       }
     }
@@ -1016,15 +1018,53 @@ function ffCall(ix: i32, fnIx: i32): i32 {
     if !ffTyKnown(rt) { return ffUntypedResult() }
     return -1
   }
-  ffSlotCall(ix, ffCalleeSlot(c))
+  ffSlotCall(ix, ffCalleeSlot(c), [])
 }
 
 // Any other callee is a value: its slot is the one the call reads a function from.
 function ffCalleeSlot(c: i32): i32 { ffFlow(c, "callee") }
 
+// The lambda an un-annotated `const` declaration `d` binds when that lambda is generic or has a
+// hole, as mono instances it per call; -1 otherwise.
+function ffConstGenLamOf(d: i32): i32 {
+  const t = ffLetOf(d)
+  if t < 0 { return -1 }
+  const n = P.nodes[t]
+  if !(n is LetDecl) || n.letKw != "const" || n.letType >= 0 || n.letInit < 0 {
+    return -1
+  }
+  const iv = P.nodes[n.letInit]
+  if (
+    !(iv is FuncDecl)
+    || !ffIsLambdaName(iv.fnName)
+    || !monoIsGenericDecl(n.letInit)
+  ) {
+    return -1
+  }
+  n.letInit
+}
+
+// A call through slot `s` to the generic lambda `lam` a const binds: the slot call, and the walk
+// of the instance mono builds for it, so a call in its body pins at this call's types (D5751).
+function ffConstLamCall(ix: i32, s: i32, lam: i32): i32 {
+  const fl: i32[] = []
+  const res = ffSlotCall(ix, s, fl)
+  const ctx = ffInstCtx(ix, lam)
+  const fd = P.nodes[lam]
+  if ctx == (fnCtx[lam] ?? 0) || !(fd is FuncDecl) { return res }
+  ffEnsureWalked(lam, ctx)
+  let i = 0
+  while i < fl.length && i < fd.fnParams.length {
+    ffEdge(fl[i], ffSlot(ffDeclKey(fd.fnParams[i], ctx)))
+    i = i + 1
+  }
+  res
+}
+
 // A call through a slot pins the slot's class at the argument types, wherever the callee's own
-// type leaves a parameter open, and flows each argument into the class's parameter slot.
-function ffSlotCall(ix: i32, s: i32): i32 {
+// type leaves a parameter open, and flows each argument into the class's parameter slot. Each
+// argument's own slot is pushed onto `fl`.
+function ffSlotCall(ix: i32, s: i32, fl: i32[]): i32 {
   const n = P.nodes[ix]
   if n is Call {
     let fps: i32[] = []
@@ -1047,7 +1087,9 @@ function ffSlotCall(ix: i32, s: i32): i32 {
       }
       if t < 0 { t = nodeTyIxOf(a) }
       tys.push(ffSubst(t))
-      ffInto(ffKid(s, "p" + i32ToStr(i)), ffFlow(a, "argument"))
+      const af = ffFlow(a, "argument")
+      fl.push(af)
+      ffInto(ffKid(s, "p" + i32ToStr(i)), af)
       i = i + 1
     }
     if s >= 0 { ffAddPin(s, tys, -1, ix) }
@@ -1167,6 +1209,32 @@ function ffOpenSigSiteKey(t: i32, ix: i32): string {
 function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
   const n = P.nodes[ix]
   const fd = P.nodes[fn]
+  const ctx = ffInstCtx(ix, fn)
+  if n is Call {
+    if fd is FuncDecl {
+      if monoIsGenericDecl(fn) {
+        ffRecord(callee, 2, -1, "direct call", fn, ctx)
+      }
+      ffEnsureWalked(fn, ctx)
+      let i = 0
+      while i < n.callArgs.length {
+        const a = n.callArgs[i]
+        const f = ffFlow(a, "argument")
+        if i < fd.fnParams.length {
+          ffInto(ffSlot(ffDeclKey(fd.fnParams[i], ctx)), f)
+        }
+        i = i + 1
+      }
+    }
+  }
+  ffSlot(ffRetKey(fn, ctx))
+}
+
+// The context call `ix` walks `fn` in: one per instance of a generic, keyed by the bindings the
+// call makes; where `fn` is declared for a concrete one.
+function ffInstCtx(ix: i32, fn: i32): i32 {
+  const n = P.nodes[ix]
+  const fd = P.nodes[fn]
   let ctx = fnCtx[fn] ?? 0
   if n is Call {
     if fd is FuncDecl {
@@ -1209,26 +1277,15 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
         } else {
           ctx = 1
         }
-        ffRecord(callee, 2, -1, "direct call", fn, ctx)
-      }
-      ffEnsureWalked(fn, ctx)
-      let i = 0
-      while i < n.callArgs.length {
-        const a = n.callArgs[i]
-        const f = ffFlow(a, "argument")
-        if i < fd.fnParams.length {
-          ffInto(ffSlot(ffDeclKey(fd.fnParams[i], ctx)), f)
-        }
-        i = i + 1
       }
     }
   }
-  ffSlot(ffRetKey(fn, ctx))
+  ctx
 }
 
 // The checker's name for function `fn`'s un-annotated parameter `i` (`paramHoleName`).
 function ffHoleName(fnName: string, fn: i32, i: i32): string {
-  if fnName != "" { return "?" + fnName + "." + i32ToStr(i) }
+  if !ffIsLambdaName(fnName) { return "?" + fnName + "." + i32ToStr(i) }
   "?#L" + i32ToStr(fn) + "." + i32ToStr(i)
 }
 
