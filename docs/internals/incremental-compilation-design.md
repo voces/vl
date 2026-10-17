@@ -461,11 +461,9 @@ at most the 5 s that `vl check` costs. The build's other 22 s is only reachable 
 - symbolic indices in the emitter;
 - every cache in §4.
 
-**Ruled:** record adoption across a module boundary (Q1, B): it crosses, and S5 tracks importer demands.
+**Ruled:** record adoption across a module boundary (Q1, B): it crosses, and S5 tracks importer demands. Exported signatures are not frozen (Q4, A): S5 hashes exported generic and inferred-return bodies.
 
 **Needs a ruling (none blocks S5):**
-- whether exported signatures must be annotated to give modules a frozen interface (Q4). The
-  recommendation is no;
 - the user-visible surfaces: cache default and location (Q2), and a watch command (Q3).
 
 ## 4. The design: one mechanism, three modes
@@ -1047,6 +1045,9 @@ vl watch test src/          # (B) a wrapper command
 - The watch loop needs each command's own action list, which only the command knows.
 - C is a fine interim: with S1, an external watcher already gets the whole S3 win except warm
   instances. S3 can therefore wait for a consumer to ask.
+
+Q4 has since been ruled (A) by the owner, 2026-10-17: DECISIONS.md §"Exported signatures
+are not frozen at the module boundary".
 
 **Q4. Should an exported function's signature be frozen at the module boundary?**
 
