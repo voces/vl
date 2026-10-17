@@ -1450,6 +1450,12 @@ function drwWalk(ix: i32, ctx: i32) {
       nodeTyCarry(omFold, ix)
       return omFold
     }
+    const omFt = recUnionFieldTyOf(
+      nodeTyIxOf(n.omObj),
+      n.omProp,
+      nodeTyIxOf(ix),
+    )
+    if omFt >= 0 { return recUnionOptRead(ix, n, omFt) }
     return ix
   }
   if n is Index {
@@ -1661,29 +1667,11 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
         && exprReReadable(unwrapParen(cl.omObj))
       ) {
         const crRecv = drwWalk(cl.omObj, ctx)
-        // The read's receiver is a fresh node at the receiver's non-null type, the type the
-        // checker gives the same place under `!= null`.
-        const crIn = P.nodes[unwrapParen(crRecv)]
-        let crObj = crRecv
-        if crIn is Member {
-          crObj = mkMember(crIn.memObj, crIn.memProp, crIn.pos)
-        }
-        if crIn is Index {
-          crObj = mkIndex(crIn.idxArr, crIn.idxIndex, crIn.pos)
-        }
-        if crObj != crRecv {
-          nodeTyRecord(crObj, nonNullTy(nodeTyIxOf(unwrapParen(crRecv))))
-        }
-        const crRead = mkMember(crObj, cl.omProp, cl.pos)
-        nodeTyRecord(crRead, clFt)
-        const crThen: i32[] = []
-        crThen.push(crRead)
-        const crElse: i32[] = []
-        crElse.push(drwWalk(n.binRight, ctx))
-        const crIf = mkIf(
-          mkBinary("!=", crRecv, mkNull("null", n.pos), n.pos),
-          mkBlock(crThen, n.pos),
-          mkBlock(crElse, n.pos),
+        const crIf = recUnionGuard(
+          crRecv,
+          cl.omProp,
+          clFt,
+          drwWalk(n.binRight, ctx),
           n.pos,
         )
         nodeTyCarry(crIf, ix)
@@ -1794,6 +1782,49 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     }
   }
   return ix
+}
+
+// `if recv != null { recv.prop } else { other }`: the field read, typed `readTy`, takes a
+// fresh receiver at the receiver's non-null type, the type the checker gives the same place
+// under `!= null`. `recv` is a re-readable place; the caller types the result.
+function recUnionGuard(
+  recv: i32,
+  prop: string,
+  readTy: i32,
+  other: i32,
+  pos: i32,
+): i32 {
+  const rObj = drwRecvClone(recv)
+  nodeTyRecord(rObj, nonNullTy(nodeTyIxOf(unwrapParen(recv))))
+  const rRead = mkMember(rObj, prop, pos)
+  nodeTyRecord(rRead, readTy)
+  const rThen: i32[] = []
+  rThen.push(rRead)
+  const rElse: i32[] = []
+  rElse.push(other)
+  mkIf(
+    mkBinary("!=", recv, mkNull("null", pos), pos),
+    mkBlock(rThen, pos),
+    mkBlock(rElse, pos),
+    pos,
+  )
+}
+
+// A bare `r?.f` over a nullable union of records, `ix` the read and `fieldTy` the field's
+// type there: the guarded read with a `null` default, or `ix` unchanged when `r` cannot be
+// read twice. A computed receiver is bound to a name before the checker runs (D5300).
+function recUnionOptRead(ix: i32, n: OptMember, fieldTy: i32): i32 {
+  if !exprReReadable(unwrapParen(n.omObj)) { return ix }
+  const g = recUnionGuard(
+    n.omObj,
+    n.omProp,
+    fieldTy,
+    mkNull("null", n.pos),
+    n.pos,
+  )
+  nodeTyCarry(g, ix)
+  capMemoNoteEdit()
+  g
 }
 
 // The type of field `prop` read off the non-null part of `recvTy`, when that is a union of

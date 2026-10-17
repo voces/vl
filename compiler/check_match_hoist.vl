@@ -1,8 +1,10 @@
 // A computed `match` scrutinee is evaluated once (D1991): the lowered chain tests the
 // scrutinee at every arm, so `hoistMatchScrutinees` binds one that is neither a literal nor a
 // place to `const $scrut<match>` ahead of the statement holding the match, unless that would
-// reorder or skip an evaluation there (D2038). It rewrites the node arena before the checker
-// walks it and reads no type, so it imports only `./ast`, `./fmt_util` and `./check_places`.
+// reorder or skip an evaluation there (D2038). A computed `?.` receiver is bound the same way,
+// to `const $om<read>`, so the emitter may test it and read it again (D5300). It rewrites the
+// node arena before the checker walks it and reads no type, so it imports only `./ast`,
+// `./fmt_util` and `./check_places`.
 import {
   ArrayLit,
   AsExpr,
@@ -129,22 +131,44 @@ function hmsWalk(ix: i32, anc: i32[]) {
   0
 }
 
-// Records match `ix` with a copy of its ancestor path when its scrutinee is computed.
+// Records match `ix` with a copy of its ancestor path when its scrutinee is computed, and a
+// `?.` read whose receiver is computed and no link of a longer chain.
 function hmsRecordMatch(ix: i32, anc: i32[]) {
-  const n = P.nodes[ix]
-  if n is MatchExpr {
-    if !matchScrutInPlace(n.matchScrut) {
-      const path: i32[] = []
-      let j = 0
-      while j < anc.length {
-        path.push(anc[j])
-        j = j + 1
-      }
-      hmsMatches.push(ix)
-      hmsPaths.push(path)
+  if hmsHoistable(ix) {
+    const path: i32[] = []
+    let j = 0
+    while j < anc.length {
+      path.push(anc[j])
+      j = j + 1
     }
+    hmsMatches.push(ix)
+    hmsPaths.push(path)
   }
   0
+}
+
+// Whether node `ix` is a `?.` read with a computed receiver, or else a match whose
+// scrutinee is computed.
+function hmsHoistable(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is OptMember { return hmsOptRecvComputed(n.omObj) }
+  hmsMatchComputed(ix)
+}
+
+// Whether node `ix` is a match whose scrutinee is neither a literal nor a place.
+function hmsMatchComputed(ix: i32): boolean {
+  const n = P.nodes[ix]
+  if n is MatchExpr { return !matchScrutInPlace(n.matchScrut) }
+  false
+}
+
+// Whether `?.` receiver `ix`, parentheses peeled, is neither in place nor another `?.` read.
+function hmsOptRecvComputed(ix: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is Paren { return hmsOptRecvComputed(n.parInner) }
+  if n is OptMember { return false }
+  !matchScrutInPlace(ix)
 }
 
 // Records the names node `ix` binds that a later write could rebind: a `let`, a parameter,
@@ -250,7 +274,9 @@ function hmsStepOk(p: i32, cur: i32): boolean {
   if pn is Call { return hmsCallArgOk(pn, cur) }
   if pn is BinExpr {
     const op = pn.binOp
-    if op == "&&" || op == "||" || op == "??" { return false }
+    // A `??` evaluates its left operand first and always, its default only on a null.
+    if op == "??" { return pn.binLeft == cur }
+    if op == "&&" || op == "||" { return false }
     // An assignment's target is not moved ahead of its value.
     if op == "=" { return pn.binRight == cur && P.nodes[pn.binLeft] is Ident }
     if pn.binLeft == cur { return true }
@@ -448,9 +474,30 @@ function hmsWrapArm(outer: i32, bodyIx: i32, m: i32): boolean {
   false
 }
 
+// Mints `const $om<m> = <receiver>` and points the `?.` read `m` at it. Returns the declaration.
+function hmsBindOptRecv(m: i32, n: OptMember) {
+  const recv = n.omObj
+  const name = "$om" + i32ToStr(m)
+  const sp = nodePos(recv)
+  const decl = mkLet("const", name, -1, recv, sp)
+  adoptNodeTok(decl, recv)
+  const ref = mkIdent(name, sp)
+  adoptNodeTok(ref, recv)
+  const no: Node = { omObj: ref, omProp: n.omProp, omDot: n.omDot, pos: n.pos }
+  arenaSetNode(m, no)
+  decl
+}
+
+// Binds hoisted node `m`, a `?.` read or a match, to a `const`. Returns the declaration, or -1.
+function hmsBind(m: i32) {
+  const n = P.nodes[m]
+  if n is OptMember { return hmsBindOptRecv(m, n) }
+  hmsBindMatch(m)
+}
+
 // Mints `const $scrut<m> = <scrutinee>` and points match `m` — its scrutinee, its type
 // patterns and its payload reads — at the binding instead. Returns the declaration, or -1.
-function hmsBind(m: i32) {
+function hmsBindMatch(m: i32) {
   const n = P.nodes[m]
   if n is MatchExpr {
     const scrut = n.matchScrut
