@@ -970,16 +970,33 @@ exports no image at all, so both tests fail on it.
     `callTaCall`; `ufcsModBound`; and the token ranges in `modLoadStart`/`srcmap`
     (`modOfTok`) and the reserved-import check. Appending a replayed image at the arena's
     end keeps all six true.
-  - Not yet in the image: four flags OR'd across modules (`arithRegionSeen`, `brkValSeen`,
-    `lblBlkSeen`, `tsAnyParamNames`). A replay must set them from what the module saw, so
-    they need a per-module capture.
-- **The id key (D5760).** `modIdKeyOf` hashes the path relative to the CLI's cwd, and to
-  nothing in the LSP, so `--names` differs by the directory a build starts in. The key
-  should be relative to a root found from the module itself (the nearest `deno.json`,
-  `package.json` or `.git`). That needs the host to stage a root per module, which is a Rust
-  and an LSP change, so it is filed rather than done here.
-- **Next:** replay. Bank the image per (key, source), serve a hit by appending it rebased on
-  the current arena ends, and capture the four flags. Then the interface hash. Q4 is ruled
+  - Four whole-graph flags (`arithRegionSeen`, `brkValSeen`, `lblBlkSeen`,
+    `tsAnyParamNames`). The driver clears them before each module's parse
+    (`parseFlagsTake`, ast.vl) and ORs the earlier modules' bits back after
+    (`parseFlagsMerge`), so the image's `flags` line is what that module set itself and the
+    graph-wide value is unchanged. A replay merges the line's bits. The suite's fourth graph
+    parses `flag.vl`, which sets all four, ahead of `lib.vl`: lib's image still reads
+    `flags 0`, and a build that captures without clearing gives it `flags 15`.
+- **The id key (D5760, closed).** `modIdKeyOf` hashes the path relative to the module's own
+  project root: the nearest ancestor of its directory holding `deno.json`, `package.json` or
+  `.git` (the LSP's `ROOT_SENTINELS`), or the absolute path when there is none. A root found
+  from the entry would key a library shared by two projects differently in each. The guest
+  cannot stat files, so each host stages a root per module key (`modRootKeyPush`,
+  `modRootDirPush`, `modRootCommit`):
+  - The CLI host stages it at all four of its module reads (`RootIn`, main.rs). The answer
+    comes from `module_root_of`, asked through `read_module_key`, so the S1 compile cache
+    records the root in its transcript. Adding a marker then misses the cache instead of
+    replaying a stale id.
+  - The LSP stages it in its module commit, answered by `projectRootFor` (`vlRoot.ts`).
+  - A host that stages no root keeps the old cwd-relative key.
+  - Ordinary builds do not move. The compiler's own modules sit under the repo root, so its
+    keys are the ones the cwd gave.
+  - `tests/vl_module_id_stable_test.ts`'s second test builds one graph from the project root
+    and from the module's directory, and compiles it through the editor's checker. All three
+    name `lib.vl`'s functions with one suffix. On the previous host and seed, the two builds
+    give `$m1742982019` and `$m1503105556`.
+- **Next:** replay. Bank the image per (key, source), and serve a hit by appending it rebased
+  on the current arena ends and merging its flags. Then the interface hash. Q4 is ruled
   (A), so the hash covers the bodies of exported generics and of exports whose return is
   inferred, and it may not assume any export is annotated. Q1 (B) keys a module that an
   importer adopts records into on that importer's demands.

@@ -252,9 +252,10 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".claude", "reference
 
 /**
  * The sentinel file names whose presence in a directory marks it as a project
- * root during the upward walk in {@link detectProjectRoot}.
+ * root during the upward walk in {@link detectProjectRoot}, and the root a module's
+ * stable id is keyed under (`projectRootFor`, vlRoot.ts; the CLI host's `ROOT_SENTINELS`).
  */
-const ROOT_SENTINELS = ["deno.json", "package.json", ".git"];
+export const ROOT_SENTINELS = ["deno.json", "package.json", ".git"];
 
 /** Maximum number of directory levels to walk up when detecting the project root. */
 const ROOT_WALK_LIMIT = 6;

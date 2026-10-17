@@ -60,11 +60,12 @@ type Summary = {
 
 let cached: Promise<Summary> | undefined;
 const sample = (): Promise<Summary> => {
-  // ONE 20-pair run for every assertion below: the sampler is the thing under test, not
-  // the seed's throughput, and this suite has to fit inside gate.sh's budget.
+  // ONE 12-pair run for every assertion below. The sampler covers each axis once before it
+  // draws at random, so one pair per axis (eleven) and one spare is all the axis assertion
+  // needs; the sampler is the thing under test, not the seed's throughput.
   if (!cached) {
     cached = (async () => {
-      const { code, out } = await run(["--seed", "4242", "--count", "40", "--jobs", "4", "--json"]);
+      const { code, out } = await run(["--seed", "4242", "--count", "24", "--jobs", "4", "--json"]);
       if (code !== 0) throw new Error(`sample.vl --json exited ${code}:\n${out}`);
       const line = out.trim().split("\n").pop() ?? "";
       try {
@@ -78,12 +79,12 @@ const sample = (): Promise<Summary> => {
 };
 
 Deno.test({
-  name: "day-one: 40 programs is 20 pairs, and every grade is in the declared vocabulary",
+  name: "day-one: 24 programs is 12 pairs, and every grade is in the declared vocabulary",
   ignore: !ENABLED,
   fn: async () => {
     const s = await sample();
-    if (s.pairs !== 20) {
-      throw new Error(`want 20 pairs from --count 40, got ${s.pairs}`);
+    if (s.pairs !== 12) {
+      throw new Error(`want 12 pairs from --count 24, got ${s.pairs}`);
     }
     for (const g of Object.keys(s.grades)) {
       if (!s.grade_vocabulary.includes(g)) {
