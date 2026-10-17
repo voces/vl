@@ -1,8 +1,9 @@
 // A stand-in `vl` for the census graders' tests (`$VL`): it answers `check`, `check --batch
 // --json`, `run`, `run --batch --out-dir` and `build` for a cell from `//! key: value` lines
 // in the cell itself, so no graded outcome depends on a live compiler defect. Keys:
-// `check-err` (a check error message), `run-out`, `run-err`, `run-rc`, and `built: 1` (a
-// `vl build` writes a module). A literal `\n` in a value is a newline.
+// `check-err` (a check error message), `run-out`, `run-err`, `run-rc`, `built: 1` (a
+// `vl build` writes a module) and `cached: 1` (a batch run under `VL_CACHE_TRACE=1` traces
+// a module-cache hit, else a miss). A literal `\n` in a value is a newline.
 
 const args = Deno.args;
 const enc = new TextEncoder();
@@ -40,6 +41,9 @@ if (args[0] === "check" && args.includes("--batch")) {
     Deno.writeTextFileSync(`${n}.out`, c["run-out"] ?? "");
     if (Number(c["run-rc"] ?? "0") !== 0) {
       Deno.writeTextFileSync(`${n}.err`, c["run-err"] ?? "");
+    }
+    if (Deno.env.get("VL_CACHE_TRACE") === "1") {
+      err(`vl: module cache ${c["cached"] === "1" ? "hit" : "miss"}: ${n}\n`);
     }
   }
 } else if (args[0] === "run") {
