@@ -1282,6 +1282,7 @@ import {
   isUNameAB,
   msMemberAtomsOfSet,
   msSetOfText,
+  msSetOfUnion,
   msSubNull,
   narrowSlotTyOf,
   printPlanPinNull,
@@ -1384,7 +1385,7 @@ import {
   stmtArmScopeOpen,
 } from "./emit_collect"
 import { cboxIsWriteLet, voidTwinForNode } from "./emit_rewrite"
-import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
+import { nameIsQuotedLeaf, nameIsShapeOpen } from "./tyname"
 import {
   exprArmLocalsAny,
   monoGradualAsScalar,
@@ -3189,7 +3190,7 @@ function litStrMembersOutsideBox(
 ): boolean {
   if texts.length == 0 || !exprUnion(recvIx, fnIx) { return false }
   const nm = unionNameOfExpr(recvIx, fnIx)
-  if nm == "" || !isValueUnionOfSet(msSetOfText(nm), nm) { return false }
+  if nm == "" || !isValueUnionOfSet(msSetOfUnion(nm), nm) { return false }
   unionStrArmCountOf(nm) == 0 && !unionCarriesLitUnionArm(nm)
 }
 
@@ -3200,7 +3201,7 @@ function litMembershipRecvOk(recvIx: i32, fnIx: i32) {
   if exprUnion(recvIx, fnIx) {
     const bxNm = unionNameOfExpr(recvIx, fnIx)
     if bxNm == "" { return false }
-    if isValueUnionOfSet(msSetOfText(bxNm), bxNm) { return true }
+    if isValueUnionOfSet(msSetOfUnion(bxNm), bxNm) { return true }
     return unionCarriesLitUnionArm(bxNm)
   }
   if nodeTyIsLitUnion(recvIx) { return true }
@@ -5189,7 +5190,7 @@ function emitIsTestLitArms(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
       const nbNm = unionNameOfExpr(nd0.isObj, fnIx)
       if (
         nbNm != ""
-        && (isValueUnionOfSet(msSetOfText(nbNm), nbNm)
+        && (isValueUnionOfSet(msSetOfUnion(nbNm), nbNm)
           || unionCarriesLitUnionArm(nbNm))
       ) {
         let nbI = 0
@@ -5521,7 +5522,7 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
     const boxNo = exprUnion(nd.isObj, fnIx)
       && tyIsRecord(isVarTyIxOf(isIx))
       && boxNm != ""
-      && (isValueUnionOfSet(msSetOfText(boxNm), boxNm)
+      && (isValueUnionOfSet(msSetOfUnion(boxNm), boxNm)
       || unionCarriesLitUnionArm(boxNm))
     // Only a join the checker kept apart over declared parameters reaches here by design.
     if (
@@ -7096,7 +7097,7 @@ function emitCoalesceMapJoin(
 function unionBoxHasNoRow(unionName: string): boolean {
   if unionName == "" || unionRowOf(unionName) >= 0 { return false }
   const atoms: string[] = []
-  splitUnionAtoms(unionName, atoms)
+  unionSetAtomsOf(unionName, atoms)
   if atoms.length < 2 { return false }
   for a in atoms {
     const k = valueAtomKind(a)
@@ -7563,6 +7564,20 @@ function emitUnionCoerceUnder(
   const viaNulNiche = emitUnionBoxNulNiche(body, unionName, exprIx, fnIx)
   if viaNulNiche < 0 { return -1 }
   if viaNulNiche == 1 { return 0 }
+  emitUnionCoerceRecord(body, unionName, exprIx, bareIx, fnIx)
+}
+
+// `emitUnionCoerceUnder`'s record arms: an object literal, a struct value re-boxed against its
+// variant arm, a bare variant value. Every other value goes on to `emitUnionCoerceMap`.
+// Returns what `emitUnionCoerceUnder` returns.
+function emitUnionCoerceRecord(
+  body: u8[],
+  unionName: string,
+  exprIx: i32,
+  bareIx: i32,
+  fnIx: i32,
+) {
+  const bare = P.nodes[bareIx]
   // A STRUCT value (an object literal, or a struct-typed expr) auto-boxes through
   // `emitExpr`'s `uDeclared` variant path; only a SCALAR value is value-boxed below.
   // This is what lets a MIXED union (`A | i32`) coerce either kind of member: an object
@@ -7621,6 +7636,19 @@ function emitUnionCoerceUnder(
   // union carrying a value atom drops the variant ref into the scalar atom ladder and widens
   // it. A box-typed position routes through `emitUnionBoxArg`, which boxes before deferring.
   if exprVariantIndex(exprIx, fnIx) >= 0 { return emitExpr(body, exprIx, fnIx) }
+  emitUnionCoerceMap(body, unionName, exprIx, bareIx, fnIx)
+}
+
+// `emitUnionCoerceUnder`'s map arms: a map carrier tagged by its value slot, the loud reject of
+// a map the union does not box, and a narrowed map arm's re-box. Every other value goes on to
+// `emitUnionCoerceList`. Returns what `emitUnionCoerceUnder` returns.
+function emitUnionCoerceMap(
+  body: u8[],
+  unionName: string,
+  exprIx: i32,
+  bareIx: i32,
+  fnIx: i32,
+) {
   // A map carrier flowing into a union with a matching map arm: the map struct ref rides the
   // box anyref directly, like a reflist wrapper, tagged by its interned value slot
   // (`mapSlotTag`). Checked before the value-atom gate below — such a union may have no value
@@ -7671,6 +7699,20 @@ function emitUnionCoerceUnder(
   const d29 = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
   if d29 < 0 { return -1 }
   if d29 == 1 { return 0 }
+  emitUnionCoerceList(body, unionName, exprIx, bareIx, fnIx)
+}
+
+// `emitUnionCoerceUnder`'s list and closure arms, then the value-atom gate: an empty list, a
+// ref-element array, a list literal routed through its arm's build, a bare closure, and every
+// remaining value raw or value-boxed. Returns what `emitUnionCoerceUnder` returns.
+function emitUnionCoerceList(
+  body: u8[],
+  unionName: string,
+  exprIx: i32,
+  bareIx: i32,
+  fnIx: i32,
+) {
+  const bare = P.nodes[bareIx]
   const eau = emitEmptyArrUnionArm(body, unionName, exprIx, fnIx)
   if eau < 0 { return -1 }
   if eau == 1 { return 0 }
@@ -8563,7 +8605,7 @@ function emitUnionConcreteEq(
   // D-VALUNION / D-SETONCE: the union's interned member set, resolved ONCE — the
   // value-union gate below reads its banked member codes instead of re-splitting the
   // rendering.
-  const usid = msSetOfText(uname)
+  const usid = msSetOfUnion(uname)
   // The arm spellings with a declared alias resolved, and the litunion-arm shape admitted beside
   // the plain value union — the same two lines `emitUnionLitIs` carries, for the same reason: a
   // `K | i32` box is a value-union box with the litunion arm riding it as its member string, and
@@ -9286,7 +9328,7 @@ function emitUnionUnionEq(
   // need it: it evaluates each operand once into its own slot and reads the slots. The gate
   // exists for the value-union lowering below, which re-reads both sides per arm.
   if lname != "" && lname == rname {
-    if !isValueUnionOfSet(msSetOfText(lname), lname) {
+    if !isValueUnionOfSet(msSetOfUnion(lname), lname) {
       if emitStructUnionEq(body, lIx, rIx, isNe, lname, fnIx) == 0 { return 0 }
     }
   }
@@ -9312,8 +9354,8 @@ function emitUnionUnionEq(
   }
   // Both operands' member sets are resolved once, here, and every later reader takes the id —
   // rather than the gate re-splitting the rendering and each consumer resolving it again.
-  const lsid = msSetOfText(lname)
-  const rsid = msSetOfText(rname)
+  const lsid = msSetOfUnion(lname)
+  const rsid = msSetOfUnion(rname)
   // A literal-union arm rides a value box as its member string, so it compares as one (D3347).
   const lVal = isValueUnionOfSet(lsid, lname) || unionCarriesLitUnionArm(lname)
   const rVal = isValueUnionOfSet(rsid, rname) || unionCarriesLitUnionArm(rname)
@@ -9457,7 +9499,7 @@ function emitUnionLitIs(body: u8[], objIx: i32, lit: string, fnIx: i32) {
   const isOnce = !unionEqOperandOk(objIx)
   const uname = unionNameOfExpr(objIx, fnIx)
   // D-VALUNION / D-SETONCE — see `emitUnionConcreteEq`.
-  const usid = msSetOfText(uname)
+  const usid = msSetOfUnion(uname)
   // The arm spellings with a declared alias resolved — every predicate below that reads a name
   // reads this one, while the interned set stays keyed on the name the receiver carries.
   // `unionHasAtomTy` and `unionTakesAtomAsStr` answer by splitting the spelling at top-level `|`,
@@ -10167,6 +10209,12 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
       }
     }
   }
+  emitMemVariantRead(body, memIx, fnIx)
+}
+
+// `emitMem`'s read of a field off a bare or nullable VARIANT receiver; any other receiver
+// falls through to the shared-field dispatch. Returns 0, or -1 failed.
+function emitMemVariantRead(body: u8[], memIx: i32, fnIx: i32): i32 {
   // A field read on a VARIANT-typed param `o.field` (`o: TyObj`) reads the variant
   // struct directly — the param already IS the unboxed variant ref, so there is NO box
   // unwrap / cast (gap #2). Evaluate the receiver (`local.get o`), then `struct.get
@@ -10211,6 +10259,12 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
       }
     }
   }
+  emitMemSharedRead(body, memIx, fnIx)
+}
+
+// `emitMem`'s shared-field read over a struct union, dispatched on the box tag; a plan that
+// is not dispatchable falls through to the plain struct read. Returns 0, or -1 failed.
+function emitMemSharedRead(body: u8[], memIx: i32, fnIx: i32): i32 {
   // The shared-field dispatch's result rep. The dispatch below is a chain of `if (result …)`
   // blocks, one per box tag, so the field's rep has to be spellable as a blocktype. Pinned to i32
   // it would make `(A | B).tag` readable for an i32 or boolean field and a loud floor for an
@@ -10304,6 +10358,12 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
       return 0
     }
   }
+  emitMemStructRead(body, memIx, fnIx)
+}
+
+// `emitMem`'s plain struct field read, with its null, string-niche and union-box recoveries,
+// or the node-anchored floor naming why the receiver is not a struct. Returns 0, or -1 failed.
+function emitMemStructRead(body: u8[], memIx: i32, fnIx: i32): i32 {
   // The three field-access floors are node-anchored (`emitFailAt`), not function-anchored. A
   // reader given "line 3, inside `g`" for a read on line 7 looks in the wrong place, and for a
   // top-level read that is what the function cursor says — the start function is lowered last, so
@@ -23761,6 +23821,192 @@ function emitAssignIdent(
   return 0
 }
 
+// An indexed store's target list: its rep, its wrapper and backing types, its bounds-check
+// frame kind and ref-list table slot, and the element seeds the value emits under (a struct
+// row, a variant, a box union's name, a ref-list slot whose element needs the value's context;
+// -1 or "" when unset).
+type IdxStore = {
+  isRef: boolean,
+  isStr: boolean,
+  isF64: boolean,
+  isI64: boolean,
+  isF32: boolean,
+  isU8: boolean,
+  lTy: i32,
+  aTy: i32,
+  mfKind: MfKind,
+  slot: i32,
+  structIdx: i32,
+  variantIdx: i32,
+  unionNm: string,
+  nestSlot: i32,
+}
+
+// `emitAssignIndex`'s target classification of list `arrIx` into `st`, which starts as the
+// plain i32 list with no seeds. Returns 0, or a refusal's -1 when the list's type is not
+// collected or its element row does not resolve.
+function idxStoreClassify(arrIx: i32, fnIx: i32, st: IdxStore): i32 {
+  if st.isRef {
+    if !rlUsed {
+      return emitFail(
+        "emitProgram: ref indexed assignment but ref list type not collected",
+      )
+    }
+    const rslot = refListSlotOfExpr(arrIx, fnIx)
+    if rslot < 0 { return refListRowRefused(arrIx) }
+    st.lTy = rlWrapIdx[rslot]
+    st.aTy = rlBackIdx[rslot]
+    st.mfKind = "ref"
+    st.slot = rslot
+    if rlElemKindTbl[rslot] == RLK_STRUCT {
+      st.structIdx = rlElemStructRow(rslot)
+      // ...and where that declines, the element is an ARM: seed the variant so the
+      // ObjLit builds at `uVarHeap[vi]`, the heap the slot's own minting used.
+      if st.structIdx < 0 {
+        st.variantIdx = variantIndexOf(nonNulBaseOf(rlElemName[rslot]))
+      }
+    }
+    if rlElemKindTbl[rslot] == RLK_UNION { st.unionNm = rlElemName[rslot] }
+    // Every element kind whose value emit needs the slot's context — a nested list,
+    // the nullable-CLOSURE niche, a MAP element — through ONE predicate.
+    if rlElemNeedsValueCtx(rslot) { st.nestSlot = rslot }
+  } else if st.isStr {
+    // a string list `xs[i] = s`: unwrap to its `(ref null $sTypeIdx)` backing and
+    // store the string ref, mirroring `emitIndex`'s string path — else it falls into
+    // the i32-list case and `struct.get`s the wrong wrapper type.
+    if !slUsed {
+      return emitFail(
+        "emitProgram: string indexed assignment but string list type not collected",
+      )
+    }
+    st.lTy = mkListIdx
+    st.aTy = mkArrIdx
+    st.mfKind = "str"
+  } else if st.isF64 {
+    if !fa64Used {
+      return emitFail(
+        "emitProgram: f64 indexed assignment but f64 list type not collected",
+      )
+    }
+    st.lTy = fl64TypeIdx
+    st.aTy = fa64TypeIdx
+    st.mfKind = "f64"
+  } else if st.isI64 {
+    if !ia64Used {
+      return emitFail(
+        "emitProgram: i64 indexed assignment but i64 list type not collected",
+      )
+    }
+    st.lTy = il64TypeIdx
+    st.aTy = ia64TypeIdx
+    st.mfKind = "i64"
+  } else if st.isF32 {
+    if !fa32Used {
+      return emitFail(
+        "emitProgram: f32 indexed assignment but f32 list type not collected",
+      )
+    }
+    st.lTy = fl32TypeIdx
+    st.aTy = fa32TypeIdx
+    st.mfKind = "f32"
+  } else if st.isU8 {
+    // a `u8[]` store: the same unwrap + `array.set` spine over the packed backing. The
+    // value takes the plain i32 path below — a `u8` element value is an i32, and
+    // `array.set`'s i8 storage truncates it to the low 8 bits.
+    if !ba8Used {
+      return emitFail(
+        "emitProgram: u8 indexed assignment but u8 list type not collected",
+      )
+    }
+    st.lTy = bl8TypeIdx
+    st.aTy = ba8TypeIdx
+    st.mfKind = "u8"
+  } else {
+    if !lUsed {
+      return emitFail(
+        "emitProgram: indexed assignment but list type not collected",
+      )
+    }
+    if !exprArray(arrIx, fnIx) {
+      return emitFail("emitProgram: indexed-assignment target is not an array")
+    }
+  }
+  0
+}
+
+// `emitAssignIndex`'s stored value `a.binRight` into list `arrIx`, emitted under the target's
+// element seeds and re-encoded at its element rep. Returns 0, or -1 failed.
+function emitIdxStoreValue(
+  body: u8[],
+  fnIx: i32,
+  a: BinExpr,
+  arrIx: i32,
+  st: IdxStore,
+): i32 {
+  const stCtx = expCtxHere()
+  stCtx.structIdx = st.structIdx
+  if st.variantIdx >= 0 { stCtx.variantIdx = st.variantIdx }
+  expCtxApply(stCtx)
+  if st.unionNm != "" {
+    if emitUnionBoxArg(body, st.unionNm, a.binRight, fnIx) < 0 { return -1 }
+  } else if st.nestSlot >= 0 {
+    // A nested-list row store: the RHS builds as the INNER list (inert for a
+    // non-literal RHS — an ident/call emits unchanged).
+    const snCtx = refElemValueCtx(st.nestSlot)
+    if emitExprExpect(body, a.binRight, fnIx, snCtx) < 0 { return -1 }
+  } else if st.isF64 {
+    // The stored value re-encodes at the element valtype (a bare-int / int-literal value
+    // widens into the f64 slot, exactly as a binding / push does).
+    if emitExprAsF64(body, a.binRight, fnIx) < 0 { return -1 }
+  } else if st.isI64 {
+    if emitExprAsI64(body, a.binRight, fnIx) < 0 { return -1 }
+  } else if st.isF32 {
+    stCtx.wantF32 = true
+    expCtxApply(stCtx)
+    if emitExprAsF32(body, a.binRight, fnIx) < 0 { return -1 }
+  } else if arrElemLitUnionTy(arrIx, fnIx) >= 0 {
+    // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id —
+    // the store half of the boundary `exprIsLitAtom`'s Index arm reads. Without it a
+    // monomorphized instance's target classifies off the generic's shared node and
+    // falls through to the string-widen arm, storing a ref into an i32 backing.
+    const xluCtx = expCtxHere()
+    xluCtx.litUnion = 1
+    if emitExprExpect(body, a.binRight, fnIx, xluCtx) < 0 { return -1 }
+  } else if (
+    nodeArrayElemIsNulBool(arrIx)
+    || arrElemIsNullUnitAt(arrIx, fnIx)
+  ) {
+    // `p[i] = null` over a `(boolean | null)[]`: the i32 cell holds 0/1 or the
+    // sentinel 2 — seed `pendingNulBool` (via the ctx) so a `null` RHS emits 2 (a
+    // boolean RHS is a `BoolLit`, untouched). The list analogue of the scalar niche
+    // assignment above.
+    const nbCtx = expCtxHere()
+    nbCtx.nulBool = true
+    if emitExprExpect(body, a.binRight, fnIx, nbCtx) < 0 { return -1 }
+  } else if nodeArrayElemIsNulLitUnion(arrIx) {
+    // `p[i] = "a"` / `p[i] = null` over a `(K | null)[]`: a member RHS lowers as its atom id, a
+    // `null` as the `-1` sentinel — seed BOTH `litUnion` and `nulLitUnion` via the ctx.
+    const nluCtx = expCtxHere()
+    nluCtx.litUnion = 1
+    nluCtx.nulLitUnion = true
+    if emitExprExpect(body, a.binRight, fnIx, nluCtx) < 0 { return -1 }
+  } else if exprIsLitAtom(a.binRight, fnIx) {
+    // a literal-union atom stored into a string-backed list element widens to its
+    // member string — reached only once the atom-element arms above decline, so the
+    // list is genuinely string-backed and the atom's i32 id cannot go in raw.
+    if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
+  } else if nodeArrayElemIsNulStr(arrIx) {
+    // `p[i] = null` over a `(string | null)[]`: the null is the string backing's own
+    // `ref.null`, as in the list literal (D2393).
+    const nsCtx = expCtxHere()
+    nsCtx.nulString = true
+    if emitExprExpect(body, a.binRight, fnIx, nsCtx) < 0 { return -1 }
+  } else {
+    if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
+  }
+  0
+}
+
 // `emitAssignUnder`'s arm over an index target `xs[i] = v`: a map store or a list element
 // store. Returns 0 lowered, -1 failed.
 function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
@@ -23783,211 +24029,154 @@ function emitAssignIndex(body: u8[], fnIx: i32, a: BinExpr, target: Index) {
   // the packed byte list — an i32-element list with a one-byte backing, the one rep
   // the `else` i32 fall-through below would otherwise silently claim.
   const isU8 = exprU8Array(target.idxArr, fnIx)
-  let lTy = lTypeIdx
-  let aTy = aTypeIdx
-  // the bounds-check frame kind (+ ref-list table slot) for this target list — the
-  // write guards `i u< len` exactly like the read path.
-  let idxKind: MfKind = "i32"
-  let idxSlot = 0
-  // the element-value seeds, as `emitArr` seeds a literal's elements: kind 1 hints the
-  // list's declared element struct so `xs[i] = { … }` beats a first-field-name match;
-  // kind 2 boxes the value into the shared box; a nested-list element emits under the
-  // inner list's own context (`refElemValueCtx`), so `b[i] = [7, 8]` over `i64[][]` builds an i64 list.
-  let storeStructIdx = -1
-  // the store's variant hint (D796): a ref-list element whose name is a union arm has
-  // no struct-table row (`rlElemStructRow` declines it on purpose, D32) — the missing
-  // half tells the value where to build instead, else `a[0] = { r: 9 }` stores a box
-  // into a `(ref null $Circle)` slot, check-clean invalid wasm.
-  let storeVariantIdx = -1
-  let storeUnionNm = ""
-  let storeNestSlot = -1
-  if isRef {
-    if !rlUsed {
-      return emitFail(
-        "emitProgram: ref indexed assignment but ref list type not collected",
-      )
-    }
-    const rslot = refListSlotOfExpr(target.idxArr, fnIx)
-    if rslot < 0 { return refListRowRefused(target.idxArr) }
-    lTy = rlWrapIdx[rslot]
-    aTy = rlBackIdx[rslot]
-    idxKind = "ref"
-    idxSlot = rslot
-    if rlElemKindTbl[rslot] == RLK_STRUCT {
-      storeStructIdx = rlElemStructRow(rslot)
-      // ...and where that declines, the element is an ARM: seed the variant so the
-      // ObjLit builds at `uVarHeap[vi]`, the heap the slot's own minting used.
-      if storeStructIdx < 0 {
-        storeVariantIdx = variantIndexOf(nonNulBaseOf(rlElemName[rslot]))
-      }
-    }
-    if rlElemKindTbl[rslot] == RLK_UNION { storeUnionNm = rlElemName[rslot] }
-    // Every element kind whose value emit needs the slot's context — a nested list,
-    // the nullable-CLOSURE niche, a MAP element — through ONE predicate.
-    if rlElemNeedsValueCtx(rslot) { storeNestSlot = rslot }
-  } else if isStr {
-    // a string list `xs[i] = s`: unwrap to its `(ref null $sTypeIdx)` backing and
-    // store the string ref, mirroring `emitIndex`'s string path — else it falls into
-    // the i32-list case and `struct.get`s the wrong wrapper type.
-    if !slUsed {
-      return emitFail(
-        "emitProgram: string indexed assignment but string list type not collected",
-      )
-    }
-    lTy = mkListIdx
-    aTy = mkArrIdx
-    idxKind = "str"
-  } else if isF64 {
-    if !fa64Used {
-      return emitFail(
-        "emitProgram: f64 indexed assignment but f64 list type not collected",
-      )
-    }
-    lTy = fl64TypeIdx
-    aTy = fa64TypeIdx
-    idxKind = "f64"
-  } else if isI64 {
-    if !ia64Used {
-      return emitFail(
-        "emitProgram: i64 indexed assignment but i64 list type not collected",
-      )
-    }
-    lTy = il64TypeIdx
-    aTy = ia64TypeIdx
-    idxKind = "i64"
-  } else if isF32 {
-    if !fa32Used {
-      return emitFail(
-        "emitProgram: f32 indexed assignment but f32 list type not collected",
-      )
-    }
-    lTy = fl32TypeIdx
-    aTy = fa32TypeIdx
-    idxKind = "f32"
-  } else if isU8 {
-    // a `u8[]` store: the same unwrap + `array.set` spine over the packed backing. The
-    // value takes the plain i32 path below — a `u8` element value is an i32, and
-    // `array.set`'s i8 storage truncates it to the low 8 bits.
-    if !ba8Used {
-      return emitFail(
-        "emitProgram: u8 indexed assignment but u8 list type not collected",
-      )
-    }
-    lTy = bl8TypeIdx
-    aTy = ba8TypeIdx
-    idxKind = "u8"
-  } else {
-    if !lUsed {
-      return emitFail(
-        "emitProgram: indexed assignment but list type not collected",
-      )
-    }
-    if !exprArray(target.idxArr, fnIx) {
-      return emitFail("emitProgram: indexed-assignment target is not an array")
-    }
+  const st: IdxStore = {
+    isRef: isRef,
+    isStr: isStr,
+    isF64: isF64,
+    isI64: isI64,
+    isF32: isF32,
+    isU8: isU8,
+    lTy: lTypeIdx,
+    aTy: aTypeIdx,
+    mfKind: "i32",
+    slot: 0,
+    structIdx: -1,
+    variantIdx: -1,
+    unionNm: "",
+    nestSlot: -1,
   }
+  const crc = idxStoreClassify(target.idxArr, fnIx, st)
+  if crc != 0 { return crc }
   // source order — receiver, index, value — with the wrapper + index parked on the
   // stack while the value's user code runs. The backing and len resolve only after
   // the value, since an RHS that pushes onto the target list reallocates it; a live
   // hoist row skips the receiver and guards the cached header, safe in a call-free loop.
-  const stHz = liveHoistRow(target.idxArr, idxKind, idxSlot)
+  const stHz = liveHoistRow(target.idxArr, st.mfKind, st.slot)
   if stHz < 0 {
     if emitExpr(body, target.idxArr, fnIx) < 0 { return -1 }
   }
   if emitExpr(body, target.idxIndex, fnIx) < 0 { return -1 }
-  const stCtx = expCtxHere()
-  stCtx.structIdx = storeStructIdx
-  if storeVariantIdx >= 0 { stCtx.variantIdx = storeVariantIdx }
-  expCtxApply(stCtx)
-  if storeUnionNm != "" {
-    if emitUnionBoxArg(body, storeUnionNm, a.binRight, fnIx) < 0 { return -1 }
-  } else if storeNestSlot >= 0 {
-    // A nested-list row store: the RHS builds as the INNER list (inert for a
-    // non-literal RHS — an ident/call emits unchanged).
-    const snCtx = refElemValueCtx(storeNestSlot)
-    if emitExprExpect(body, a.binRight, fnIx, snCtx) < 0 { return -1 }
-  } else if isF64 {
-    // The stored value re-encodes at the element valtype (a bare-int / int-literal value
-    // widens into the f64 slot, exactly as a binding / push does).
-    if emitExprAsF64(body, a.binRight, fnIx) < 0 { return -1 }
-  } else if isI64 {
-    if emitExprAsI64(body, a.binRight, fnIx) < 0 { return -1 }
-  } else if isF32 {
-    stCtx.wantF32 = true
-    expCtxApply(stCtx)
-    if emitExprAsF32(body, a.binRight, fnIx) < 0 { return -1 }
-  } else if arrElemLitUnionTy(target.idxArr, fnIx) >= 0 {
-    // `xs[i] = "a"` over a literal-union array: the member RHS lowers as its atom id —
-    // the store half of the boundary `exprIsLitAtom`'s Index arm reads. Without it a
-    // monomorphized instance's target classifies off the generic's shared node and
-    // falls through to the string-widen arm, storing a ref into an i32 backing.
-    const xluCtx = expCtxHere()
-    xluCtx.litUnion = 1
-    if emitExprExpect(body, a.binRight, fnIx, xluCtx) < 0 { return -1 }
-  } else if (
-    nodeArrayElemIsNulBool(target.idxArr)
-    || arrElemIsNullUnitAt(target.idxArr, fnIx)
-  ) {
-    // `p[i] = null` over a `(boolean | null)[]`: the i32 cell holds 0/1 or the
-    // sentinel 2 — seed `pendingNulBool` (via the ctx) so a `null` RHS emits 2 (a
-    // boolean RHS is a `BoolLit`, untouched). The list analogue of the scalar niche
-    // assignment above.
-    const nbCtx = expCtxHere()
-    nbCtx.nulBool = true
-    if emitExprExpect(body, a.binRight, fnIx, nbCtx) < 0 { return -1 }
-  } else if nodeArrayElemIsNulLitUnion(target.idxArr) {
-    // `p[i] = "a"` / `p[i] = null` over a `(K | null)[]`: a member RHS lowers as its atom id, a
-    // `null` as the `-1` sentinel — seed BOTH `litUnion` and `nulLitUnion` via the ctx.
-    const nluCtx = expCtxHere()
-    nluCtx.litUnion = 1
-    nluCtx.nulLitUnion = true
-    if emitExprExpect(body, a.binRight, fnIx, nluCtx) < 0 { return -1 }
-  } else if exprIsLitAtom(a.binRight, fnIx) {
-    // a literal-union atom stored into a string-backed list element widens to its
-    // member string — reached only once the atom-element arms above decline, so the
-    // list is genuinely string-backed and the atom's i32 id cannot go in raw.
-    if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
-  } else if nodeArrayElemIsNulStr(target.idxArr) {
-    // `p[i] = null` over a `(string | null)[]`: the null is the string backing's own
-    // `ref.null`, as in the list literal (D2393).
-    const nsCtx = expCtxHere()
-    nsCtx.nulString = true
-    if emitExprExpect(body, a.binRight, fnIx, nsCtx) < 0 { return -1 }
-  } else {
-    if emitExpr(body, a.binRight, fnIx) < 0 { return -1 }
-  }
+  if emitIdxStoreValue(body, fnIx, a, target.idxArr, st) < 0 { return -1 }
   // the read-only covariant copy at the indexed-store boundary (D2163)
-  if idxKind == "ref" {
-    emitNestedListWidenSite(body, a.binRight, fnIx, idxSlot)
+  if st.mfKind == "ref" {
+    emitNestedListWidenSite(body, a.binRight, fnIx, st.slot)
   }
   // the narrowed-arm unbox at the ELEMENT-assignment boundary, the binding boundary's
   // twin one container over: the element's own variant or struct row is where the arm
   // lands, and those two seeds are what the value emits under (D1685).
   if narrowedArmNeedsUnbox(a.binRight, fnIx) {
-    if storeVariantIdx >= 0 {
+    if st.variantIdx >= 0 {
       emitNarrowedArmUnboxTo(
-        armDestHeapOf("variant", storeVariantIdx),
+        armDestHeapOf("variant", st.variantIdx),
         a.binRight,
       )
-    } else if storeStructIdx >= 0 {
-      emitNarrowedArmUnboxTo(
-        armDestHeapOf("struct", storeStructIdx),
-        a.binRight,
-      )
+    } else if st.structIdx >= 0 {
+      emitNarrowedArmUnboxTo(armDestHeapOf("struct", st.structIdx), a.binRight)
     }
   }
-  const storeValSlot = listIdxValSlot(idxKind, idxSlot)
+  const storeValSlot = listIdxValSlot(st.mfKind, st.slot)
   fbLocalSet(storeValSlot) // 0x21 — park the value under the guard operands
   // Guard `i u< len`, unwrap to the backing (`struct.get` field 0) — leaves
   // [backing, safeIndex] resolved AFTER the value ran.
   if stHz >= 0 {
     emitListIdxGuardHoisted(stHz, target.idxIndex)
   } else {
-    emitListIdxGuard(listIdxWrapSlot(idxKind, idxSlot), lTy)
+    emitListIdxGuard(listIdxWrapSlot(st.mfKind, st.slot), st.lTy)
   }
   fbLocalGet(storeValSlot) // 0x20 — the parked value
-  fbArraySet(aTy)          // 0xfb 0x0e <backing array type index>
+  fbArraySet(st.aTy)       // 0xfb 0x0e <backing array type index>
   return 0
+}
+
+// A variant field write's tail once its receiver struct ref is on the stack: seeds an ARRAY
+// field's element kind, widens a scalar f64/i64/f32 field's RHS `rhs` at the store boundary,
+// then `struct.set`s field `fi` of variant `vi`. Returns 0, or -1 failed.
+function emitVariantFieldWrite(
+  body: u8[],
+  vi: i32,
+  fi: i32,
+  rhs: i32,
+  fnIx: i32,
+): i32 {
+  const code = variantFieldTypeAt(vi, fi)
+  const ctx = expCtxHere()
+  if seedFieldListBuild(ctx, code, variantFieldRefSlot(vi, fi)) < 0 {
+    return -1
+  }
+  expCtxApply(ctx)
+  if emitVariantFieldStoreVal(body, vi, fi, rhs, fnIx) < 0 { return -1 }
+  fbStructSet(uVarHeap[vi], fi)
+  0
+}
+
+// `emitAssignMember`'s value for field `fieldIdx` (code `fscode`) of struct row `si`, its
+// target context already applied: a box union coerces into the box, a literal-union atom widens
+// or lowers as its id, a scalar re-encodes, a niche seeds its null. Returns 0, or -1 failed.
+function emitStructFieldStoreValue(
+  body: u8[],
+  si: i32,
+  fieldIdx: i32,
+  fscode: i32,
+  rhs: i32,
+  fnIx: i32,
+): i32 {
+  // The niche fields seed their null rep for a bare `null` (the `emitNullLitNode` table). A
+  // box-union field (code 16) goes through `emitUnionBoxArg`, since the field cell is
+  // `(ref $uBox)` — one home so the three code-16 sites cannot drift.
+  if fscode == FC_UNION {
+    if emitUnionBoxArg(body, sFieldElemNameAt(si, fieldIdx), rhs, fnIx) < 0 {
+      return -1
+    }
+  } else if fscode == FC_STR && exprIsLitAtom(rhs, fnIx) {
+    // A literal-union atom assigned to a `string` field (code 3) widens to its member string.
+    if emitAtomToStr(body, rhs, fnIx) < 0 { return -1 }
+  } else if fscode == FC_NUL_STR && exprIsLitAtom(rhs, fnIx) {
+    // the `string | null` field takes the same widen: its slot is the same string ref
+    // with null permitted, and a widened member string is non-null. `emitObj` and
+    // `emitAssign` are the two halves of every field code, and must agree.
+    if emitStrValue(body, rhs, fnIx) < 0 { return -1 }
+  } else if sFieldIsLitUnion(si, fieldIdx) {
+    // A literal-union atom field assign (`b.kind = "a"`): the member RHS lowers as its atom id.
+    const wluCtx = expCtxHere()
+    wluCtx.litUnion = 1
+    if emitExprExpect(body, rhs, fnIx, wluCtx) < 0 { return -1 }
+  } else if sFieldIsLitUnionArray(si, fieldIdx) {
+    // An atom-array field assign (`g.f = ["bb"]`): the RHS builds the i32 list of atom
+    // ids (the atom context routes the literal off the string-list build — construct
+    // parity with `emitObj`'s code-4 atom arm).
+    const wlaCtx = expCtxHere()
+    wlaCtx.litUnion = 1
+    if emitExprExpect(body, rhs, fnIx, wlaCtx) < 0 { return -1 }
+  } else if fscode == FC_F64 || fscode == FC_I64 || fscode == FC_F32 {
+    // A SCALAR f64/i64/f32 field widens its RHS at the store boundary, the exact
+    // treatment `emitObj` gives the construct (`p.g = 9` into an i64 field emitted
+    // a raw `i32.const` — invalid wasm at `struct.set`; pre-existing, flat AND
+    // nested spellings).
+    if emitScalarFieldStoreVal(body, rhs, fnIx, fscode) < 0 { return -1 }
+  } else if fscode == FC_NUL_NONE {
+    // The `null` unit type's slot, the construct arm's twin (D4671).
+    if emitNulNoneForEffect(body, rhs, fnIx) < 0 { return -1 }
+    fbRefNullNone()
+  } else if fscode == FC_STRUCT {
+    // The ASSIGN half of the construct arm (`p.g = s` after `if s is Circle`) — `emitObj`
+    // and `emitAssign` are the two halves of every field code and have to be wired
+    // together, which is the lesson the code-20 arm three branches up records.
+    if emitArmDelivery(body, rhs, fnIx, sFieldTgtHeapOf(si, fieldIdx)) < 0 {
+      return -1
+    }
+  } else {
+    const fwCtx = expCtxHere()
+    if fscode == FC_NUL_STR { fwCtx.nulString = true }
+    if fscode == FC_NUL_BOOL { fwCtx.nulBool = true }
+    // A `K | null` niche field assign: member RHS -> atom id, `null` -> -1.
+    if fscode == FC_NUL_LIT_UNION {
+      fwCtx.litUnion = 1
+      fwCtx.nulLitUnion = true
+    }
+    // then the value
+    if emitExprExpect(body, rhs, fnIx, fwCtx) < 0 { return -1 }
+  }
+  0
 }
 
 // `emitAssignUnder`'s arm over a field target `o.f = v`: through a narrowed union box, into
@@ -24021,26 +24210,9 @@ function emitAssignMember(
       if emitExpr(body, nm.memObj, fnIx) < 0 { return -1 }
       fbStructGet(uBoxIdx, 1)  // box field 1: value (anyref)
       fbRefCast(uVarHeap[nvi]) // ref.cast to the variant struct
-      // An ARRAY-typed variant field threads its element kind, exactly as the plain
-      // receiver above does — its context is taken AFTER the receiver's own emit, which
-      // may leave seeds of its own behind.
-      const nvCode = variantFieldTypeAt(nvi, nfi)
-      const nvCtx = expCtxHere()
-      if (
-        seedFieldListBuild(nvCtx, nvCode, variantFieldRefSlot(nvi, nfi))
-        < 0
-      ) {
-        return -1
-      }
-      expCtxApply(nvCtx)
-      // A SCALAR f64/i64/f32 variant field widens its RHS at the store boundary,
-      // exactly as the construct does (`v.f = 9` into an i64 field emitted a raw
-      // `i32.const` — invalid wasm at `struct.set`).
-      if emitVariantFieldStoreVal(body, nvi, nfi, a.binRight, fnIx) < 0 {
-        return -1
-      }
-      fbStructSet(uVarHeap[nvi], nfi)
-      return 0
+      // The field's context is taken AFTER the receiver's own emit, which may leave seeds
+      // of its own behind.
+      return emitVariantFieldWrite(body, nvi, nfi, a.binRight, fnIx)
     }
   }
   // A field WRITE on a variant-typed param (`o: TyObj`) writes the variant struct
@@ -24056,22 +24228,7 @@ function emitAssignMember(
         )
       }
       if emitExpr(body, m1.memObj, fnIx) < 0 { return -1 }
-      // Array-field element-kind seed + scalar-field RHS widening, as the narrowed
-      // branch above.
-      const pwCode = variantFieldTypeAt(pwvi, pwfi)
-      const pwCtx = expCtxHere()
-      if (
-        seedFieldListBuild(pwCtx, pwCode, variantFieldRefSlot(pwvi, pwfi))
-        < 0
-      ) {
-        return -1
-      }
-      expCtxApply(pwCtx)
-      if emitVariantFieldStoreVal(body, pwvi, pwfi, a.binRight, fnIx) < 0 {
-        return -1
-      }
-      fbStructSet(uVarHeap[pwvi], pwfi)
-      return 0
+      return emitVariantFieldWrite(body, pwvi, pwfi, a.binRight, fnIx)
     }
   }
   // the nullable-variant receiver: a `T | null` binding whose `T` is a union arm holds
@@ -24085,20 +24242,7 @@ function emitAssignMember(
     }
     if emitExpr(body, target.memObj, fnIx) < 0 { return -1 }
     fbRefAsNonNull() // 0xd4 — the enclosing null test narrowed it
-    const nwCode = variantFieldTypeAt(nwvi, nwfi)
-    const nwCtx = expCtxHere()
-    if (
-      seedFieldListBuild(nwCtx, nwCode, variantFieldRefSlot(nwvi, nwfi))
-      < 0
-    ) {
-      return -1
-    }
-    expCtxApply(nwCtx)
-    if emitVariantFieldStoreVal(body, nwvi, nwfi, a.binRight, fnIx) < 0 {
-      return -1
-    }
-    fbStructSet(uVarHeap[nwvi], nwfi)
-    return 0
+    return emitVariantFieldWrite(body, nwvi, nwfi, a.binRight, fnIx)
   }
   const shw = emitSharedFieldAssign(body, lhsIx, a.binRight, fnIx)
   if shw < 0 { return -1 }
@@ -24138,68 +24282,11 @@ function emitAssignMember(
   // `emitNullLitNode` with every seed unset.
   if fscode == FC_STRUCT { fsCtx.structIdx = sFieldTgtStructIdx(si, fieldIdx) }
   expCtxApply(fsCtx)
-  // a box-union field (code 16) coerces a raw scalar/struct/null RHS into the box; the
-  // niche fields seed their null rep for a bare `null` (the `emitNullLitNode` table).
-  // The write twin of the construct-side seed, through `emitUnionBoxArg` since the
-  // field cell is `(ref $uBox)` — one home so the three code-16 sites cannot drift.
-  if fscode == FC_UNION {
-    if (
-      emitUnionBoxArg(body, sFieldElemNameAt(si, fieldIdx), a.binRight, fnIx)
-      < 0
-    ) {
-      return -1
-    }
-  } else if fscode == FC_STR && exprIsLitAtom(a.binRight, fnIx) {
-    // A literal-union atom assigned to a `string` field (code 3) widens to its member string.
-    if emitAtomToStr(body, a.binRight, fnIx) < 0 { return -1 }
-  } else if fscode == FC_NUL_STR && exprIsLitAtom(a.binRight, fnIx) {
-    // the `string | null` field takes the same widen: its slot is the same string ref
-    // with null permitted, and a widened member string is non-null. `emitObj` and
-    // `emitAssign` are the two halves of every field code, and must agree.
-    if emitStrValue(body, a.binRight, fnIx) < 0 { return -1 }
-  } else if sFieldIsLitUnion(si, fieldIdx) {
-    // A literal-union atom field assign (`b.kind = "a"`): the member RHS lowers as its atom id.
-    const wluCtx = expCtxHere()
-    wluCtx.litUnion = 1
-    if emitExprExpect(body, a.binRight, fnIx, wluCtx) < 0 { return -1 }
-  } else if sFieldIsLitUnionArray(si, fieldIdx) {
-    // An atom-array field assign (`g.f = ["bb"]`): the RHS builds the i32 list of atom
-    // ids (the atom context routes the literal off the string-list build — construct
-    // parity with `emitObj`'s code-4 atom arm).
-    const wlaCtx = expCtxHere()
-    wlaCtx.litUnion = 1
-    if emitExprExpect(body, a.binRight, fnIx, wlaCtx) < 0 { return -1 }
-  } else if fscode == FC_F64 || fscode == FC_I64 || fscode == FC_F32 {
-    // A SCALAR f64/i64/f32 field widens its RHS at the store boundary, the exact
-    // treatment `emitObj` gives the construct (`p.g = 9` into an i64 field emitted
-    // a raw `i32.const` — invalid wasm at `struct.set`; pre-existing, flat AND
-    // nested spellings).
-    if emitScalarFieldStoreVal(body, a.binRight, fnIx, fscode) < 0 { return -1 }
-  } else if fscode == FC_NUL_NONE {
-    // The `null` unit type's slot, the construct arm's twin (D4671).
-    if emitNulNoneForEffect(body, a.binRight, fnIx) < 0 { return -1 }
-    fbRefNullNone()
-  } else if fscode == FC_STRUCT {
-    // The ASSIGN half of the construct arm above (`p.g = s` after `if s is Circle`) —
-    // `emitObj` and `emitAssign` are the two halves of every field code and have to be
-    // wired together, which is the lesson the code-20 arm three branches up records.
-    if (
-      emitArmDelivery(body, a.binRight, fnIx, sFieldTgtHeapOf(si, fieldIdx))
-      < 0
-    ) {
-      return -1
-    }
-  } else {
-    const fwCtx = expCtxHere()
-    if fscode == FC_NUL_STR { fwCtx.nulString = true }
-    if fscode == FC_NUL_BOOL { fwCtx.nulBool = true }
-    // A `K | null` niche field assign: member RHS -> atom id, `null` -> -1.
-    if fscode == FC_NUL_LIT_UNION {
-      fwCtx.litUnion = 1
-      fwCtx.nulLitUnion = true
-    }
-    // then the value
-    if emitExprExpect(body, a.binRight, fnIx, fwCtx) < 0 { return -1 }
+  if (
+    emitStructFieldStoreValue(body, si, fieldIdx, fscode, a.binRight, fnIx)
+    < 0
+  ) {
+    return -1
   }
   // D1222 — the STORE half of the construct-side recover in `emitObj`; the two halves of
   // every field code have to be wired together, as the code-20 arm above records.
@@ -30929,38 +31016,9 @@ type ForInLoop = {
   hSlot: i32,
 }
 
-// A `for`-in walk's break block and loop: the exit test, the map's tombstone skip, the
-// element and pair binds, the body and the cursor step. Returns -1 on a failure, else 0.
-function emitForInLoop(body: u8[], s: ForIn, fnIx: i32, lp: ForInLoop) {
-  const ek = lp.ek
-  const strSrc = lp.strSrc
-  const hasPair = lp.hasPair
-  const pairIsVal = lp.pairIsVal
-  const pairEk = lp.pairEk
-  const pairRecover = lp.pairRecover
-  const pairWrapTy = lp.pairWrapTy
-  const pairBackTy = lp.pairBackTy
-  const vIdx = lp.vIdx
-  const iIdx = lp.iIdx
-  const lIdx = lp.lIdx
-  const pIdx = lp.pIdx
-  const pCtr = lp.pCtr
-  const fiHBack = lp.fiHBack
-  const fiHLen = lp.fiHLen
-  const fiSv = lp.fiSv
-  const fiRv = lp.fiRv
-  const fiSBack = lp.fiSBack
-  const fiSEnd = lp.fiSEnd
-  const fiSPk = lp.fiSPk
-  const mapRecv = lp.mapRecv
-  const mwShape = lp.mwShape
-  const fiMap = lp.fiMap
-  const wrapTy = lp.wrapTy
-  const backTy = lp.backTy
-  const hKind = lp.hKind
-  const hSlot = lp.hSlot
-  // The element kinds whose loop var is a non-null ref recovered from a nullable slot.
-  const elemRecover = ek == "str"
+// The element kinds whose loop var is a non-null ref recovered from a nullable slot.
+function forInElemRecovers(ek: VKind): boolean {
+  ek == "str"
     || ek == "struct"
     || ek == "variant"
     || ek == "union"
@@ -30973,110 +31031,100 @@ function emitForInLoop(body: u8[], s: ForIn, fnIx: i32, lp: ForInLoop) {
     || ek == "closure"
     || ek == "reflist"
     || ek == "map"
-  fbBlock(64) // 0x02 block, void
-  loopBrkDepth.push(ctrlDepth)
-  loopBrkLabel.push(s.fiLabel)
-  if (
-    fiHBack >= 0
-    && !hasPair
-    && ek != "nulnone"
-    && partialUnrollCost(s.fiBody, fnIx) >= 0
-  ) {
-    const fiCopies: ForInCopies = {
-      back: fiHBack,
-      len: fiHLen,
-      cursor: iIdx,
-      v: vIdx,
-      backTy: backTy,
-      recover: elemRecover,
-    }
-    if emitForInCopies(body, s, fnIx, fiCopies) < 0 { return -1 }
-  }
-  fbLoop(64) // 0x03 loop, void
-  loopContDepth.push(ctrlDepth)
-  loopContLabel.push(s.fiLabel)
-  // exit when cursor >= len (the list wrapper's field 1; a STRING compares its
-  // backing-coordinate cursor against the pre-computed `start + len` bound)
-  fbLocalGet(iIdx)
-  if strSrc {
-    fbLocalGet(fiSEnd)
-  } else if fiHLen >= 0 {
-    fbLocalGet(fiHLen)
-  } else if fiSv >= 0 {
-    fbLocalGet(lIdx)
-    fbCall(gHelpSvLen[fiSv])
-  } else if fiRv {
-    fbLocalGet(lIdx)
+}
+
+// `emitForInLoop`'s exit test: `br_if 1` out of the break block when cursor >= len (the list
+// wrapper's field 1; a STRING compares its backing-coordinate cursor against the pre-computed
+// `start + len` bound).
+function emitForInExitTest(lp: ForInLoop) {
+  fbLocalGet(lp.iIdx)
+  if lp.strSrc {
+    fbLocalGet(lp.fiSEnd)
+  } else if lp.fiHLen >= 0 {
+    fbLocalGet(lp.fiHLen)
+  } else if lp.fiSv >= 0 {
+    fbLocalGet(lp.lIdx)
+    fbCall(gHelpSvLen[lp.fiSv])
+  } else if lp.fiRv {
+    fbLocalGet(lp.lIdx)
     fbCall(gHelpRvLen)
   } else {
-    fbLocalGet(lIdx)
-    fbStructGet(wrapTy, 1)
+    fbLocalGet(lp.lIdx)
+    fbStructGet(lp.wrapTy, 1)
   }
   fbI32Bin(78) // 0x4e i32.ge_s
   fbBrIf(1)    // 0x0d br_if -> break out of block
-  // tombstone skip: if M.live[cursor] == 0, advance the cursor and re-loop WITHOUT
-  // binding `v` / running the body — the deleted entry is invisible to iteration
-  // (insertion order of the survivors preserved). `br 1` targets the loop header
-  // (if-frame is 0, loop is 1). A delete-free map has live all-1s, so never taken.
+}
+
+// `emitForInLoop`'s tombstone skip over a map walk in a module that deletes: when
+// M.live[cursor] == 0, advance the cursor and `br 1` to the loop header without binding `v` or
+// running the body. Returns the local holding the entry's sequence for the post-body resync
+// (D2315), or -1 when there is none.
+function emitForInTombstoneSkip(lp: ForInLoop): i32 {
   let fiSeq = -1
-  if mapRecv >= 0 && gMapDeletes {
-    cmSlot = mwShape
+  if lp.mapRecv >= 0 && gMapDeletes {
+    cmSlot = lp.mwShape
     // M.live, off the walk's own stash
-    fbLocalGet(fiMap)
+    fbLocalGet(lp.fiMap)
     fbStructGet(cmMapTy(), 2)
-    fbLocalGet(iIdx)
+    fbLocalGet(lp.iIdx)
     fbArrayGet(aTypeIdx) // M.live[cursor]
     fbI32Eqz()           // live[cursor] == 0 ?
     fbIf(64)             // 0x04 if, void
-    fbLocalGet(iIdx)
+    fbLocalGet(lp.iIdx)
     fbI32Const(1)
     fbI32Bin(106)        // cursor + 1
-    fbLocalSet(iIdx)
+    fbLocalSet(lp.iIdx)
     fbBr(1)              // 0x0c br -> loop header (re-check exit)
     fbEnd()              // 0x0b end (if)
-    // In a module that deletes, keep the entry's sequence so the step after the body can tell
-    // whether a compaction moved the walk (D2315).
     if gHelpMapResync >= 0 {
       fiSeq = mapSeqSaveSlot()
-      fbLocalGet(fiMap)
+      fbLocalGet(lp.fiMap)
       fbStructGet(cmMapTy(), 7)
-      fbLocalGet(iIdx)
+      fbLocalGet(lp.iIdx)
       fbArrayGet(ia64TypeIdx)
       fbLocalSet(fiSeq)
     }
   }
-  // v = backing[cursor] (a string element recovers its non-null ref). A STRING source reads
-  // its HOISTED backing at a cursor that is already a backing offset; the code unit is an i32.
+  fiSeq
+}
+
+// `emitForInLoop`'s binds: `v = backing[cursor]` (a STRING source decodes the code point at its
+// hoisted backing's offset), recovered non-null when `elemRecover`, then a map walk's value or
+// the pair counter into the pair local. Returns 0, or -1 failed.
+function emitForInBind(s: ForIn, lp: ForInLoop, elemRecover: boolean): i32 {
+  const ek = lp.ek
+  const iIdx = lp.iIdx
   if ek == "nulnone" {
     // A `null[]` element is never read: its loop var is the `null` cell, null from its default.
-  } else if strSrc {
+  } else if lp.strSrc {
     // pk = __utf8_dec__(backing, cursor, end) ; v = pk & 0x00ffffff
-    fbLocalGet(fiSBack)
+    fbLocalGet(lp.fiSBack)
     fbRefAsNonNull() // the hoist slot is nullable so it stays defaultable;
     // `array.get` tolerated that, a CALL does not.
     fbLocalGet(iIdx)
-    fbLocalGet(fiSEnd)
+    fbLocalGet(lp.fiSEnd)
     fbCall(gHelpUtf8Dec)
-    fbLocalTee(fiSPk)
+    fbLocalTee(lp.fiSPk)
     fbI32Const(16777215) // 0x00ffffff — strip the width, keep the code point
     fbI32Bin(113)        // 0x71 i32.and
-  } else if fiHBack >= 0 {
-    fbLocalGet(fiHBack)
+  } else if lp.fiHBack >= 0 {
+    fbLocalGet(lp.fiHBack)
     fbLocalGet(iIdx)
-    fbArrayGet(backTy)
-  } else if fiSv >= 0 {
-    fbLocalGet(lIdx)
+    fbArrayGet(lp.backTy)
+  } else if lp.fiSv >= 0 {
+    fbLocalGet(lp.lIdx)
     fbLocalGet(iIdx)
-    fbCall(gHelpSvGet[fiSv])
-  } else if fiRv {
-    fbLocalGet(lIdx)
+    fbCall(gHelpSvGet[lp.fiSv])
+  } else if lp.fiRv {
+    fbLocalGet(lp.lIdx)
     fbLocalGet(iIdx)
     fbCall(gHelpRvGet)
   } else {
-    fbLocalGet(lIdx)
-    fbStructGet(wrapTy, 0)
+    fbLocalGet(lp.lIdx)
+    fbStructGet(lp.wrapTy, 0)
     fbLocalGet(iIdx)
-    fbArrayGet(backTy)
+    fbArrayGet(lp.backTy)
   }
   if elemRecover {
     // string/struct/union-box/closure element, or a nested inner-list/ref-list wrapper: all
@@ -31084,29 +31132,87 @@ function emitForInLoop(body: u8[], s: ForIn, fnIx: i32, lp: ForInLoop) {
     // kind is absent on purpose, since its loop var legitimately holds null — this set and
     // `forInElemKind`'s niche arms are one decision, or a loud reject turns into invalid wasm.
     fbRefAsNonNull()
-    if hKind == "ref" && hSlot >= 0 {
-      if emitStaleBoxRetag(hSlot, s.fiIter) < 0 { return -1 }
+    if lp.hKind == "ref" && lp.hSlot >= 0 {
+      if emitStaleBoxRetag(lp.hSlot, s.fiIter) < 0 { return -1 }
     }
   }
-  if ek != "nulnone" { fbLocalSet(vIdx) }
-  if pairIsVal && pairEk != "nulnone" {
+  if ek != "nulnone" { fbLocalSet(lp.vIdx) }
+  if lp.pairIsVal && lp.pairEk != "nulnone" {
     // `v = M.vals.backing[cursor]` — the value beside the key just bound, off the walk's
     // stash the tombstone skip already reads, so the receiver is evaluated once.
-    cmSlot = mwShape
-    fbLocalGet(fiMap)
+    cmSlot = lp.mwShape
+    fbLocalGet(lp.fiMap)
     fbStructGet(cmMapTy(), 1) // M.vals
-    fbStructGet(pairWrapTy, 0)
+    fbStructGet(lp.pairWrapTy, 0)
     fbLocalGet(iIdx)
-    fbArrayGet(pairBackTy)
-    if pairRecover {
+    fbArrayGet(lp.pairBackTy)
+    if lp.pairRecover {
       fbRefAsNonNull() // a non-null value kind off a nullable element slot
     }
-    fbLocalSet(pIdx)
+    fbLocalSet(lp.pIdx)
   }
-  if pCtr >= 0 {
-    fbLocalGet(pCtr)
-    fbLocalSet(pIdx)
+  if lp.pCtr >= 0 {
+    fbLocalGet(lp.pCtr)
+    fbLocalSet(lp.pIdx)
   }
+  0
+}
+
+// `emitForInLoop`'s step: cursor += <stride>, one element for every source but a string, which
+// strides by the UTF-8 width of the sequence just decoded, parked in the high byte of `fiSPk`
+// (never 0). A key walk's pair index advances too, on the path the BODY ran, so a deleted
+// entry does not consume one.
+function emitForInStep(lp: ForInLoop) {
+  const iIdx = lp.iIdx
+  fbLocalGet(iIdx)
+  if lp.strSrc {
+    fbLocalGet(lp.fiSPk)
+    fbI32Const(24)
+    fbI32Bin(118) // 0x76 i32.shr_u
+  } else {
+    fbI32Const(1)
+  }
+  fbI32Bin(106) // 0x6a i32.add
+  fbLocalSet(iIdx)
+  if lp.hasPair && !lp.pairIsVal {
+    let pStep = lp.pIdx
+    if lp.pCtr >= 0 { pStep = lp.pCtr }
+    fbLocalGet(pStep)
+    fbI32Const(1)
+    fbI32Bin(106) // 0x6a i32.add
+    fbLocalSet(pStep)
+  }
+}
+
+// A `for`-in walk's break block and loop: the exit test, the map's tombstone skip, the
+// element and pair binds, the body and the cursor step. Returns -1 on a failure, else 0.
+function emitForInLoop(body: u8[], s: ForIn, fnIx: i32, lp: ForInLoop) {
+  const elemRecover = forInElemRecovers(lp.ek)
+  fbBlock(64) // 0x02 block, void
+  loopBrkDepth.push(ctrlDepth)
+  loopBrkLabel.push(s.fiLabel)
+  if (
+    lp.fiHBack >= 0
+    && !lp.hasPair
+    && lp.ek != "nulnone"
+    && partialUnrollCost(s.fiBody, fnIx) >= 0
+  ) {
+    const fiCopies: ForInCopies = {
+      back: lp.fiHBack,
+      len: lp.fiHLen,
+      cursor: lp.iIdx,
+      v: lp.vIdx,
+      backTy: lp.backTy,
+      recover: elemRecover,
+    }
+    if emitForInCopies(body, s, fnIx, fiCopies) < 0 { return -1 }
+  }
+  fbLoop(64) // 0x03 loop, void
+  loopContDepth.push(ctrlDepth)
+  loopContLabel.push(s.fiLabel)
+  emitForInExitTest(lp)
+  const fiSeq = emitForInTombstoneSkip(lp)
+  if emitForInBind(s, lp, elemRecover) < 0 { return -1 }
   // Same INNER continue block as for-range: `continue` must still increment.
   const fiHasCont = blockHasContinueFor(s.fiBody, s.fiLabel, false)
   if fiHasCont {
@@ -31120,30 +31226,8 @@ function emitForInLoop(body: u8[], s: ForIn, fnIx: i32, lp: ForInLoop) {
     loopContDepth.pop()
     loopContLabel.pop()
   }
-  if fiSeq >= 0 { emitForInMapResync(fiMap, iIdx, fiSeq, mwShape) }
-  // cursor = cursor + <stride>. Every source but a string strides by one element; a string
-  // strides by the UTF-8 width of the sequence just decoded, parked in the high byte of
-  // `fiSPk` — never 0, since an invalid lead byte decodes as a one-byte U+FFFD.
-  fbLocalGet(iIdx)
-  if strSrc {
-    fbLocalGet(fiSPk)
-    fbI32Const(24)
-    fbI32Bin(118) // 0x76 i32.shr_u
-  } else {
-    fbI32Const(1)
-  }
-  fbI32Bin(106) // 0x6a i32.add
-  fbLocalSet(iIdx)
-  if hasPair && !pairIsVal {
-    // Advanced on the path the BODY ran: the tombstone skip re-loops before reaching here,
-    // so a deleted entry does not consume an index.
-    let pStep = pIdx
-    if pCtr >= 0 { pStep = pCtr }
-    fbLocalGet(pStep)
-    fbI32Const(1)
-    fbI32Bin(106) // 0x6a i32.add
-    fbLocalSet(pStep)
-  }
+  if fiSeq >= 0 { emitForInMapResync(lp.fiMap, lp.iIdx, fiSeq, lp.mwShape) }
+  emitForInStep(lp)
   fbBr(0) // continue loop
   fbEnd() // end loop
   loopContDepth.pop()
@@ -35169,26 +35253,6 @@ function emitDirectCallArgsUnder(
     expCtxApply(argBase)
     const ac = expCtxHere()
     const sd = directArgSeedsOf(target, i, ac)
-    const cVi = sd.cVi
-    const cArgParamKind = sd.cArgParamKind
-    const cArgParamRow = sd.cArgParamRow
-    const cRecoverKind = sd.cRecoverKind
-    const cUNm = sd.cUNm
-    const cParamNulBool = sd.cParamNulBool
-    const cParamNulString = sd.cParamNulString
-    const cParamNulClosure = sd.cParamNulClosure
-    const cParamNulList = sd.cParamNulList
-    const cParamNulNone = sd.cParamNulNone
-    const cParamNulRefArr = sd.cParamNulRefArr
-    const cParamNulRefArrHeap = sd.cParamNulRefArrHeap
-    const cParamNulVariantHeap = sd.cParamNulVariantHeap
-    const cParamNulVariantIdx = sd.cParamNulVariantIdx
-    const cParamNulSLKind = sd.cParamNulSLKind
-    const cParamLitUnion = sd.cParamLitUnion
-    const cParamNulLitUnion = sd.cParamNulLitUnion
-    const cParamStr = sd.cParamStr
-    const cParamRlSlot = sd.cParamRlSlot
-    const cParamSLKind = sd.cParamSLKind
     expCtxApply(ac)
     // An f64 / f32 param position lowers the argument coerced to that float type
     // (a float literal re-encodes; an i32/i64/f32 source converts via the lattice
@@ -35220,117 +35284,157 @@ function emitDirectCallArgsUnder(
       if emitExprAsI64(body, args[i], fnIx) < 0 { return -1 }
       i = i + 1
     } else {
-      if (cParamStr || cParamNulString) && exprIsLitAtom(args[i], fnIx) {
-        // A literal-union atom flowing into a `string` param widens to its member string — and
-        // into a `string | null` param for the same reason, the slot being that same reference
-        // with a null permitted and a widened member string non-null. A `null` argument is not a
-        // lit atom and still takes the `nulString`-seeded context below.
-        if emitAtomToStr(body, args[i], fnIx) < 0 { return -1 }
-      } else if cUNm != "" {
-        // `cUNm` is set only for a kind-4 union-BOX param (see above), so a concrete
-        // variant ARGUMENT (`area(s)` where `s: S`, param `C | S`) is boxed here.
-        if emitUnionBoxArg(body, cUNm, args[i], fnIx) < 0 { return -1 }
-      } else {
-        const argCtx = expCtxHere()
-        // The parameter's nullability is assigned, never or'd with the enclosing position's.
-        // `expCtxHere()` snapshots the ambient seeds, which at a `return f(x)` are
-        // the return boundary's; setting them only to true let a nullable result expectation
-        // reach a non-nullable argument, keeping a narrowed value's `(ref null $s)` rep under a `(ref $s)` param.
-        argCtx.nulBool = cParamNulBool
-        argCtx.nulString = cParamNulString
-        // A raw-read seed is the enclosing null test's or `??` arm's, never the argument's: left
-        // set, a narrowed `string | null` reached a `string` parameter unrecovered (D3816).
-        argCtx.rawNullRead = false
-        argCtx.nulClosure = cParamNulClosure
-        argCtx.nulList = cParamNulList
-        argCtx.nulNone = cParamNulNone
-        if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
-          // The #964 seed-leak gate (stated in full at `emitObj`'s code-28 arm) at the
-          // ARGUMENT boundary. Witness: `useIt([null])` on a `(S | null)[] | null` param
-          // (fuzz seed 160804094 d5).
-          const nraArg = P.nodes[unwrapParen(args[i])]
-          if nraArg is NullLit { argCtx.nulRefHeap = cParamNulRefArrHeap }
-        }
-        const argNulSLK = cParamNulSLKind
-        if argNulSLK != null {
-          // A list-literal argument builds the leaf wrapper; a `null` argument
-          // is `ref.null $wrapper`. Mirrors the return-position seeding.
-          argCtx.listKind = nulScalarListBuildKind(argNulSLK)
-          argCtx.nulRefHeap = nulScalarListWrapHeap(argNulSLK)
-        }
-        if cParamNulVariantHeap >= 0 {
-          const nvArg = P.nodes[args[i]]
-          if nvArg is NullLit { argCtx.nulRefHeap = cParamNulVariantHeap }
-        }
-        // The non-null half of that niche (D22): an object literal builds the concrete
-        // variant struct, which subtypes the `(ref null $uVarHeap[vi])` slot. Seeded
-        // unconditionally, like the `cVi` variant-param seed below — `emitObj` alone consumes
-        // the hint (cleared on use), so a variant/niche value argument ignores it.
-        if cParamNulVariantIdx >= 0 { argCtx.variantIdx = cParamNulVariantIdx }
-        if cParamLitUnion { argCtx.litUnion = 1 }
-        if cParamNulLitUnion {
-          argCtx.litUnion = 1
-          argCtx.nulLitUnion = true
-        }
-        // A variant-PARAM position (`loud(c: Cat)`): seed the variant index so an object
-        // LITERAL argument builds the bare variant struct (kind 8). A variant/union VALUE
-        // argument ignores the hint (the union-unbox cast below handles a boxed value).
-        if cVi >= 0 { argCtx.variantIdx = cVi }
-        const argBoxToNulStr = cParamNulString
-          && boxIsNulStrUnion(args[i], fnIx)
-        if emitExprExpect(body, args[i], fnIx, argCtx) < 0 { return -1 }
-        if argBoxToNulStr { emitBoxToNulStr() }
-        // read-only covariance at the ARGUMENT boundary (D791) — `d773_readonly_param`:
-        // `look(xs: Shape[])` called with a `Circle[]`.
-        if cParamRlSlot >= 0 {
-          emitRefListWidenSite(
-            body,
-            args[i],
-            exprEmittedRefListSlot(args[i], fnIx),
-            cParamRlSlot,
-          )
-        }
-        // the scalar dual (D965) — `take_f(xs: f64[])` called with an `i32[]`. Same
-        // boundary, same licence, a numeric convert instead of a box.
-        if cParamSLKind != null {
-          emitScalarListWidenSite(body, args[i], fnIx, cParamSLKind)
-        }
-        emitNonNullParamRecover(cRecoverKind, args[i], fnIx)
-      }
-      // The niche parameter's unbox (D1031) — `g(r)` into `g(x: Circle | null)` under `if r
-      // is Circle`. The bare variant parameter's unbox is the arm below; its `| null` twin
-      // declares the same heap with a nullable slot and never grew one, so the box went in
-      // whole: `vl check` rc 0, invalid wasm. Guarded on `cVi` being absent so the two arms cannot both fire.
-      if cVi < 0 && cParamNulVariantIdx >= 0 {
-        if narrowedArmNeedsUnbox(args[i], fnIx) {
-          emitNarrowedArmUnboxTo(
-            armDestHeapOf("nulvariant", cParamNulVariantIdx),
-            args[i],
-          )
-        }
-      }
-      if cVi >= 0 {
-        if exprUnion(args[i], fnIx) {
-          if variantHasCrossTagFits(cVi, args[i]) {
-            return emitFailCrossTagDelivery(args[i], cVi)
-          }
-          fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
-          fbRefCast(uVarHeap[cVi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
-        }
-      }
-      // The same unbox for a param whose annotation names a plain struct: an inferred
-      // union's arm is no registered member, so `cVi` is -1 and the box went in whole. The
-      // parameter's own (kind, slot) is the destination, as the cell's is at the binding
-      // boundary; guarded so the three arms cannot both fire (D1723).
-      if cVi < 0 && cParamNulVariantIdx < 0 {
-        if narrowedArmNeedsUnbox(args[i], fnIx) {
-          emitNarrowedArmUnboxTo(
-            armDestHeapOf(cArgParamKind, cArgParamRow),
-            args[i],
-          )
-        }
-      }
+      if emitDirectArgValue(body, args[i], fnIx, sd) < 0 { return -1 }
+      const ub = emitDirectArgUnbox(args[i], fnIx, sd)
+      if ub != 0 { return ub }
       i = i + 1
+    }
+  }
+  0
+}
+
+// `emitDirectCallArgsUnder`'s value for argument `arg` at a parameter that is not a scalar
+// f64/f32/i64, emitted under the seeds `sd` its parameter gives: an atom widening, a box, or
+// the expression under its niche and list seeds, then widened and recovered. Returns 0, or -1.
+function emitDirectArgValue(
+  body: u8[],
+  arg: i32,
+  fnIx: i32,
+  sd: DirectArgSeeds,
+): i32 {
+  const cVi = sd.cVi
+  const cRecoverKind = sd.cRecoverKind
+  const cUNm = sd.cUNm
+  const cParamNulBool = sd.cParamNulBool
+  const cParamNulString = sd.cParamNulString
+  const cParamNulClosure = sd.cParamNulClosure
+  const cParamNulList = sd.cParamNulList
+  const cParamNulNone = sd.cParamNulNone
+  const cParamNulRefArr = sd.cParamNulRefArr
+  const cParamNulRefArrHeap = sd.cParamNulRefArrHeap
+  const cParamNulVariantHeap = sd.cParamNulVariantHeap
+  const cParamNulVariantIdx = sd.cParamNulVariantIdx
+  const cParamNulSLKind = sd.cParamNulSLKind
+  const cParamLitUnion = sd.cParamLitUnion
+  const cParamNulLitUnion = sd.cParamNulLitUnion
+  const cParamStr = sd.cParamStr
+  const cParamRlSlot = sd.cParamRlSlot
+  const cParamSLKind = sd.cParamSLKind
+  if (cParamStr || cParamNulString) && exprIsLitAtom(arg, fnIx) {
+    // A literal-union atom flowing into a `string` param widens to its member string — and
+    // into a `string | null` param for the same reason, the slot being that same reference
+    // with a null permitted and a widened member string non-null. A `null` argument is not a
+    // lit atom and still takes the `nulString`-seeded context below.
+    if emitAtomToStr(body, arg, fnIx) < 0 { return -1 }
+  } else if cUNm != "" {
+    // `cUNm` is set only for a kind-4 union-BOX param (see above), so a concrete
+    // variant ARGUMENT (`area(s)` where `s: S`, param `C | S`) is boxed here.
+    if emitUnionBoxArg(body, cUNm, arg, fnIx) < 0 { return -1 }
+  } else {
+    const argCtx = expCtxHere()
+    // The parameter's nullability is assigned, never or'd with the enclosing position's.
+    // `expCtxHere()` snapshots the ambient seeds, which at a `return f(x)` are
+    // the return boundary's; setting them only to true let a nullable result expectation
+    // reach a non-nullable argument, keeping a narrowed value's `(ref null $s)` rep under a `(ref $s)` param.
+    argCtx.nulBool = cParamNulBool
+    argCtx.nulString = cParamNulString
+    // A raw-read seed is the enclosing null test's or `??` arm's, never the argument's: left
+    // set, a narrowed `string | null` reached a `string` parameter unrecovered (D3816).
+    argCtx.rawNullRead = false
+    argCtx.nulClosure = cParamNulClosure
+    argCtx.nulList = cParamNulList
+    argCtx.nulNone = cParamNulNone
+    if cParamNulRefArr && cParamNulRefArrHeap >= 0 {
+      // The #964 seed-leak gate (stated in full at `emitObj`'s code-28 arm) at the
+      // ARGUMENT boundary. Witness: `useIt([null])` on a `(S | null)[] | null` param
+      // (fuzz seed 160804094 d5).
+      const nraArg = P.nodes[unwrapParen(arg)]
+      if nraArg is NullLit { argCtx.nulRefHeap = cParamNulRefArrHeap }
+    }
+    const argNulSLK = cParamNulSLKind
+    if argNulSLK != null {
+      // A list-literal argument builds the leaf wrapper; a `null` argument
+      // is `ref.null $wrapper`. Mirrors the return-position seeding.
+      argCtx.listKind = nulScalarListBuildKind(argNulSLK)
+      argCtx.nulRefHeap = nulScalarListWrapHeap(argNulSLK)
+    }
+    if cParamNulVariantHeap >= 0 && arg >= 0 {
+      const nvArg = P.nodes[arg]
+      if nvArg is NullLit { argCtx.nulRefHeap = cParamNulVariantHeap }
+    }
+    // The non-null half of that niche (D22): an object literal builds the concrete
+    // variant struct, which subtypes the `(ref null $uVarHeap[vi])` slot. Seeded
+    // unconditionally, like the `cVi` variant-param seed below — `emitObj` alone consumes
+    // the hint (cleared on use), so a variant/niche value argument ignores it.
+    if cParamNulVariantIdx >= 0 { argCtx.variantIdx = cParamNulVariantIdx }
+    if cParamLitUnion { argCtx.litUnion = 1 }
+    if cParamNulLitUnion {
+      argCtx.litUnion = 1
+      argCtx.nulLitUnion = true
+    }
+    // A variant-PARAM position (`loud(c: Cat)`): seed the variant index so an object
+    // LITERAL argument builds the bare variant struct (kind 8). A variant/union VALUE
+    // argument ignores the hint (the union-unbox cast below handles a boxed value).
+    if cVi >= 0 { argCtx.variantIdx = cVi }
+    const argBoxToNulStr = cParamNulString && boxIsNulStrUnion(arg, fnIx)
+    if emitExprExpect(body, arg, fnIx, argCtx) < 0 { return -1 }
+    if argBoxToNulStr { emitBoxToNulStr() }
+    // read-only covariance at the ARGUMENT boundary (D791) — `d773_readonly_param`:
+    // `look(xs: Shape[])` called with a `Circle[]`.
+    if cParamRlSlot >= 0 {
+      emitRefListWidenSite(
+        body,
+        arg,
+        exprEmittedRefListSlot(arg, fnIx),
+        cParamRlSlot,
+      )
+    }
+    // the scalar dual (D965) — `take_f(xs: f64[])` called with an `i32[]`. Same
+    // boundary, same licence, a numeric convert instead of a box.
+    if cParamSLKind != null {
+      emitScalarListWidenSite(body, arg, fnIx, cParamSLKind)
+    }
+    emitNonNullParamRecover(cRecoverKind, arg, fnIx)
+  }
+  0
+}
+
+// `emitDirectCallArgsUnder`'s unbox of a narrowed argument `arg` to the heap its parameter
+// declares, once its value is on the stack: a niche variant, a bare variant, or the
+// parameter's own (kind, slot) — guarded so at most one fires. Returns 0, or a refusal.
+function emitDirectArgUnbox(arg: i32, fnIx: i32, sd: DirectArgSeeds): i32 {
+  const cVi = sd.cVi
+  const cParamNulVariantIdx = sd.cParamNulVariantIdx
+  const cArgParamKind = sd.cArgParamKind
+  const cArgParamRow = sd.cArgParamRow
+  // The niche parameter's unbox (D1031) — `g(r)` into `g(x: Circle | null)` under `if r
+  // is Circle`. The bare variant parameter's unbox is the arm below; its `| null` twin
+  // declares the same heap with a nullable slot and never grew one, so the box went in
+  // whole: `vl check` rc 0, invalid wasm. Guarded on `cVi` being absent so the two arms cannot both fire.
+  if cVi < 0 && cParamNulVariantIdx >= 0 {
+    if narrowedArmNeedsUnbox(arg, fnIx) {
+      emitNarrowedArmUnboxTo(
+        armDestHeapOf("nulvariant", cParamNulVariantIdx),
+        arg,
+      )
+    }
+  }
+  if cVi >= 0 {
+    if exprUnion(arg, fnIx) {
+      if variantHasCrossTagFits(cVi, arg) {
+        return emitFailCrossTagDelivery(arg, cVi)
+      }
+      fbStructGet(uBoxIdx, 1)  // 0xfb 0x02 <box ht> field 1: value (anyref)
+      fbRefCast(uVarHeap[cVi]) // 0xfb 0x16 <variant struct> ref.cast (non-null)
+    }
+  }
+  // The same unbox for a param whose annotation names a plain struct: an inferred
+  // union's arm is no registered member, so `cVi` is -1 and the box went in whole. The
+  // parameter's own (kind, slot) is the destination, as the cell's is at the binding
+  // boundary; guarded so the three arms cannot both fire (D1723).
+  if cVi < 0 && cParamNulVariantIdx < 0 {
+    if narrowedArmNeedsUnbox(arg, fnIx) {
+      emitNarrowedArmUnboxTo(armDestHeapOf(cArgParamKind, cArgParamRow), arg)
     }
   }
   0

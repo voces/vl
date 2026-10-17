@@ -376,7 +376,7 @@ the same under `rules.test.vl` as under `beast.test.vl`.
 | phase | output is a function of | importer-independent? | reusable per module today? |
 | --- | --- | --- | --- |
 | lex | the module's bytes | yes | **yes**, and already reused within one instance (`modCache*`, `driver.vl:558–636`; the LSP's `modCommitCached`, 3095) |
-| parse | the module's tokens | the AST content is; its **node indices are not** (one shared arena, offset by earlier modules) | needs relocation, or a per-module arena |
+| parse | the module's tokens | **the image is** (S5's second step): its node, token and spelling indices are offset by earlier modules in the one shared arena, and the parse image rebases them on the module's own start | the image is, and nothing replays it yet. `compiler/parse_image.vl`; `tests/vl_parse_image_stable_test.ts` holds it |
 | order + rename | the order: the whole graph; the rename: M's key and the set of keys | **the rename, yes** (S5's first step); the order, no | the rename only. `$mN` was the discovery position, so an import added above M renamed everything in M. N is now a 31-bit FNV-1a hash of M's normalised key, written in decimal: a `std:` key as written, otherwise the path relative to the cwd the host stages, or absolute when M lies outside it. When two keys collide, the one that sorts later is salted until unique, so the id depends only on the SET of keys. Digits keep every `$m\d+` demangler working. `tests/vl_module_id_stable_test.ts` holds it |
 | checker: exported `let` inference | M + its imports | **yes, by rule**: "an exported `let` is typed only by its own module's uses; an importer's use is an ordinary use" (DECISIONS.md, the B′+C literal-binding entry). Probe below. | yes, after rename and arena are fixed |
 | checker: un-annotated `const` | each use site | yes: typed per use, "no cross-module effect" (same entry) | yes |
@@ -936,8 +936,50 @@ import above M now leaves M's merged names unchanged; `tests/vl_module_id_stable
 fails on the discovery-position compiler. Wasm export names did not move. A `--names` build's
 name section, trap backtraces, `vl addr2line` and profiles now show the hashed id
 (`boom$m979099524` where they used to show `boom$m1`).
-- **Next:** the per-module or relocatable arena, so that a module's check output is a value of
-  its own rather than a range of the shared `P.nodes`. Then the interface hash. Q4 is ruled
+
+**S5 step 2: the parse arena keeps one shared arena, and a module's parse is RELOCATABLE.**
+Each module still parses onto the end of the shared `P.nodes`/`P.toks`/spelling arena. What
+is now a value of the module alone is its parse image (`compiler/parse_image.vl`): its slice
+of every arena and side table the parser writes, with every index rebased on the module's own
+start. `tests/vl_parse_image_stable_test.ts` parses one `lib.vl` in three graphs that put zero,
+one and two modules ahead of it and finds one image. Its control is the absolute image, the
+arena as stored, and 361 of its 393 lines move between graphs. The seed this PR was cut from
+exports no image at all, so both tests fail on it.
+- **Why relocatable and not per-module arenas.** After the parse, the checker and emitter read
+  ONE merged arena. A per-module arena would break every reader below that assumes M's
+  indices follow the earlier modules': three binary searches and three range tables. The
+  token cache (`modCache*` in driver.vl, served to the LSP through `modCommitCached`) already
+  relocates this way: it stores a module's tokens without their indices and replays them
+  with `pos = P.toks.length`. A parse cache can replay an image the same way, and a parse
+  served from it is then indistinguishable from a fresh one.
+- **Census: what an image must rebase or name.**
+  - Node indices: every child field of the 38 kinds, and the side tables keyed or valued by a
+    node (`annTs*`, `udTs*`, `callTa*`, `declGp*`, `fnTpBound*`, `declBound*`,
+    `bodyTyDeclNode`, `getDecl*`, `exportDeclNodes`, `valueIfNodes`, `funcDeclNodes`,
+    `tplHole`, `recDupField`, `stmtBrace*`, `braceNameStmts`, `extGDeclNode`).
+  - Token indices: `Tok.pos`, `nodeToks`, `declNameTok`, `ErrExpr.errAt`,
+    `ImportDecl.impNameToks`, `Diag.at`, `dgSpanTok`, `extDeclPos`, `extGDeclPos`. The last
+    two were the test's first red: they read like char offsets and are token indices.
+  - Other arenas: the spelling arena (`tsKidStart`, `tsKids`) and the diagnostic index the
+    `dg*` tables key on. A leaf's `tsKidStart` is wherever the kid table ended and no reader
+    looks at it, so the image omits it.
+  - Shared rows: the extern LINK rows are deduped by name across the graph, so
+    `extDeclLink`/`extGDeclLink` depend on who linked first. The image names the link; the
+    module index in `extDeclMod` and `docCmtMod` is implicit.
+  - Readers relying on module order: binary searches over `annTsNode`, `udTsNode` and
+    `callTaCall`; `ufcsModBound`; and the token ranges in `modLoadStart`/`srcmap`
+    (`modOfTok`) and the reserved-import check. Appending a replayed image at the arena's
+    end keeps all six true.
+  - Not yet in the image: four flags OR'd across modules (`arithRegionSeen`, `brkValSeen`,
+    `lblBlkSeen`, `tsAnyParamNames`). A replay must set them from what the module saw, so
+    they need a per-module capture.
+- **The id key (D5760).** `modIdKeyOf` hashes the path relative to the CLI's cwd, and to
+  nothing in the LSP, so `--names` differs by the directory a build starts in. The key
+  should be relative to a root found from the module itself (the nearest `deno.json`,
+  `package.json` or `.git`). That needs the host to stage a root per module, which is a Rust
+  and an LSP change, so it is filed rather than done here.
+- **Next:** replay. Bank the image per (key, source), serve a hit by appending it rebased on
+  the current arena ends, and capture the four flags. Then the interface hash. Q4 is ruled
   (A), so the hash covers the bodies of exported generics and of exports whose return is
   inferred, and it may not assume any export is annotated. Q1 (B) keys a module that an
   importer adopts records into on that importer's demands.
