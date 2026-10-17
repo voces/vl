@@ -31,12 +31,13 @@ if (GATED && !ENABLED) {
   console.warn("[vl-compile-cache] skipped — missing vl binary or seed wasm.");
 }
 
+/** The `PATH` this test's builds see: `$VL_BINARYEN` first when set, since ci-native has no
+ * binaryen on `PATH` and that is its only one. */
+const PATH = [Deno.env.get("VL_BINARYEN"), Deno.env.get("PATH")].filter((d) => d).join(":");
 /** The `wasm-opt` this test's builds resolve: `$VL_WASM_OPT`, else the first on `PATH`. */
 const realWasmOpt = (): string | undefined =>
-  Deno.env.get("VL_WASM_OPT") ??
-    (Deno.env.get("PATH") ?? "").split(":").map((d) => `${d}/wasm-opt`).find(exists);
-// The `-O` cases need binaryen; without it (CI's ci-native job) they register ignored, like
-// the other `-O` suites.
+  Deno.env.get("VL_WASM_OPT") ?? PATH.split(":").map((d) => `${d}/wasm-opt`).find(exists);
+// The `-O` cases need binaryen; with none they register ignored, like the other `-O` suites.
 const HAVE_OPT = realWasmOpt() !== undefined;
 
 type Ran = { code: number; out: string; err: string; trace: string[] };
@@ -57,6 +58,7 @@ const vl = async (
     VL_COMPILE_CACHE: "1",
     VL_COMPILE_CACHE_TRACE: "1",
     NO_COLOR: "1",
+    PATH,
     ...set,
   });
   const inherited = Deno.env.toObject();
@@ -414,7 +416,7 @@ testOpt("-O3: each chain input misses; -o without --source-map does not", async 
         "a wasm-opt wrapper first on PATH",
         OPT,
         OPT,
-        { PATH: `${bin}:${Deno.env.get("PATH") ?? ""}`, VL_WASM_OPT: null },
+        { PATH: `${bin}:${PATH}`, VL_WASM_OPT: null },
       ],
       [
         "-o under --source-map",
