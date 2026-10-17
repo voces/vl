@@ -1605,6 +1605,66 @@ export function tyMembersDistinctRecords(members: i32[]): boolean {
   distinct
 }
 
+// Whether `ty` is a union, bare or nullable, of distinct record arms that all render one shape,
+// as arms that differ only in a lone literal do.
+export function tyIsTwinRecordUnion(ty: i32): boolean {
+  if ty < 0 { return false }
+  const n = T.tys[ty]
+  if n is TyNullable { return tyIsTwinRecordUnion(n.nInner) }
+  const t = T.tys[ty]
+  if !(t is TyUnion) { return false }
+  const recs: i32[] = []
+  for m in t.uMembers {
+    const mt = T.tys[m]
+    let isNull = false
+    if mt is TyPrim { isNull = mt.primName == "null" }
+    if !isNull { recs.push(m) }
+  }
+  if !tyMembersDistinctRecords(recs) { return false }
+  const keep = tyNameAtoms
+  const shape = tyToNameAt(recs[0], RC_UNION_MEM, false)
+  let same = shape != ""
+  for m in recs {
+    if same && tyToNameAt(m, RC_UNION_MEM, false) != shape { same = false }
+  }
+  tyNameAtoms = keep
+  same
+}
+
+// The render of a union whose record arms differ only in a lone literal, given its deduped
+// `parts`: the one shape once per arm, then `null` when a member is, as the declaration's row
+// is keyed (D5157); "" when the members are not such arms. Sets `tyNameAtoms`.
+function twinRecordsRender(members: i32[], parts: string[]): string {
+  const recs: i32[] = []
+  let hasNull = false
+  for m in members {
+    const mt = T.tys[m]
+    let isNull = false
+    if mt is TyPrim { isNull = mt.primName == "null" }
+    if isNull { hasNull = true } else { recs.push(m) }
+  }
+  let shape = ""
+  for p in parts {
+    if p != "null" {
+      if shape != "" { return "" }
+      shape = p
+    }
+  }
+  if shape == "" || !tyMembersDistinctRecords(recs) { return "" }
+  let rep = shape
+  let r = 1
+  while r < recs.length {
+    rep = rep + "|" + shape
+    r = r + 1
+  }
+  tyNameAtoms = recs.length
+  if hasNull {
+    tyNameAtoms = recs.length + 1
+    return rep + "|null"
+  }
+  rep
+}
+
 // `tyToNameGo`'s nominal-first prelude: the name a declared struct, generic application or
 // union alias of `ix` spells as, or "" when the structural render below owns `ix`.
 function tyNameNominal(ix: i32, ctx: i32): string {
@@ -1714,16 +1774,8 @@ function tyNameUnion(ix: i32, t: TyUnion, ctx: i32, nominal: boolean): string {
   // Record arms that differ only in a lone literal render one shape, yet are distinct
   // types and keep their box: the render repeats the shape once per arm, as the
   // declaration's own row is keyed (D5157).
-  if parts.length == 1 && tyMembersDistinctRecords(members) {
-    tyNameAtoms = members.length
-    let rep = parts[0]
-    let r = 1
-    while r < members.length {
-      rep = rep + "|" + parts[0]
-      r = r + 1
-    }
-    return rep
-  }
+  const twin = twinRecordsRender(members, parts)
+  if twin != "" { return twin }
   let out = parts[0]
   let k = 1
   while k < parts.length {
