@@ -13563,17 +13563,85 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 // The pin of hole parameter `pIx` when call `callIx` hands it generic function `argIx`: the
 // instance the checker bound the hole to, materialized here and pinned as a concrete function
 // argument is, so the callee can forward it to a further hole (D5402). "" when the argument is
-// not a generic or the checker bound no concrete signature.
-function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
-  const bt = monoHoleGenFnTy(callIx, pIx, argIx)
-  if bt < 0 { return "" }
-  const nm = monoConcreteFnTyName(bt)
-  if nm == "" { return "" }
-  if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+// not a generic or no concrete signature is known; `tyOut[0]` takes the pin's type, -1 for none.
+function monoHoleGenFnPin(
+  callIx: i32,
+  pIx: i32,
+  argIx: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  let bt = monoHoleGenFnTy(callIx, pIx, argIx)
+  let nm = monoConcreteFnTyName(bt)
+  if bt < 0 {
+    nm = monoHoleGenFnFlowPin(argIx, ctx, tyOut)
+    if nm == "" || tyOut[0] < 0 { return nm }
+    bt = tyOut[0]
+  } else {
+    if nm == "" { return "" }
+    if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+  }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = bt
   const sk = sigKeyOfTy(bt)
   if sk != "" { return "=>" + sk }
   const an = monoArgFnTypeName(argIx, ctx)
   if an != "" { return an }
+  nm
+}
+
+// Whether `ax` names a function that declares type parameters, by name or through never-written
+// aliases: one generic only by its un-annotated parameters has no one signature to deliver.
+function monoArgHasTyParams(ax: i32): boolean {
+  let d = identDeclOf(ax)
+  if d >= 0 && d < P.nodes.length && !(P.nodes[d] is FuncDecl) {
+    d = fnFlowReadGenFn(ax)
+  }
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = P.nodes[d]
+  f is FuncDecl && f.fnTyParams.length > 0
+}
+
+// For a generic `argIx` the checker bound no instance at the hole, as one the callee returns bare
+// is: the one signature the flow table pins its read at past the call, delivered there with each
+// call taking it typed at it (D5530). "" for no pin, or two; `tyOut[0]` takes the type those
+// calls agree on, -1 when none does.
+function monoHoleGenFnFlowPin(argIx: i32, ctx: i32, tyOut: i32[]): string {
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
+  if !monoNamesDeclaredGeneric(ax, ctx) && monoReadGenFnFe(ax) < 0 { return "" }
+  if !monoArgHasTyParams(ax) { return "" }
+  const noPath: string[] = []
+  let d = ax
+  let fr = ctx
+  const lf = monoReadLetFrame(ax, ctx)
+  if lf[1] >= 0 {
+    d = lf[1]
+    fr = lf[0]
+  }
+  const nm = monoSlotPinName(d, noPath, fr)
+  if nm == "" { return "" }
+  if monoCoerceFnValueName(ax, nm, ctx, -1) < 0 { return "" }
+  monoRetypePinCalls(d, noPath)
+  let got = -1
+  for cx in fnFlowDeclPathPinCalls(d, noPath) {
+    const c = P.nodes[cx]
+    if c is Call {
+      const ct = nodeTyIxOf(unwrapParen(c.callFn))
+      if (
+        ct < 0
+        || ct >= T.tys.length
+        || !(T.tys[ct] is TyFunc)
+        || tyHasTyVar(ct)
+      ) {
+        return nm
+      }
+      if got >= 0 && !tyEq(got, ct) { return nm }
+      got = ct
+    }
+  }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = got
   nm
 }
 
@@ -13701,8 +13769,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             let an = recordedParamPinName(params[i])
             let anTy = -1
             if an == "" {
-              an = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
-              if an != "" { anTy = monoHoleGenFnTy(callIx, params[i], args[i]) }
+              const pinTy: i32[] = [0 - 1]
+              an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
+              anTy = pinTy[0]
             }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
@@ -13906,8 +13975,9 @@ function monoPinAnnotatedParam(
     let an2 = ""
     let an2Ty = -1
     if ann == tp {
-      an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
-      if an2 != "" { an2Ty = monoHoleGenFnTy(callIx, params[i], args[i]) }
+      const pinTy: i32[] = [0 - 1]
+      an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
+      an2Ty = pinTy[0]
     }
     if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
