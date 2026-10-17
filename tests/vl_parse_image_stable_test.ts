@@ -2,11 +2,11 @@
 //
 // Every module parses into one shared arena, so a module's node, token and spelling indices
 // start wherever the modules parsed before it ended. A per-module parse cache can only replay
-// an image that does not depend on that. This suite parses one `lib.vl` inside three graphs
-// that put different modules ahead of it — one of them declaring the same extern, so the
-// shared link rows dedupe differently — and holds its RELATIVE image (`parse_image.vl`) to one
+// an image that does not depend on that. This suite parses one `lib.vl` inside four graphs
+// that put different modules ahead of it — one declaring the same extern, so the shared link
+// rows dedupe differently, and one setting every parse flag lib.vl does not — and holds its RELATIVE image (`parse_image.vl`) to one
 // text. The control is the ABSOLUTE image, the arena as it is stored: it must differ across
-// the same three graphs, or the graphs did not move the module and the check proves nothing.
+// the same graphs, or the graphs did not move the module and the check proves nothing.
 //
 // GATING: needs the seed.
 
@@ -68,8 +68,22 @@ export function tick(n: i32): i32 {
 }
 `;
 
-// Three graphs, each an entry plus the sources its imports resolve to. `lib.vl` is parsed
-// first in A, after `other.vl` (which links `hostTick` first) in B, and after two modules in C.
+// A module that sets all four parse flags lib.vl sets none of: a function type that names its
+// parameter, a labelled block, a `break` with a value, and a long arithmetic chain.
+const FLAG_KEY = "/proj/flag.vl";
+const FLAG = `export function flagged(n: i32): i32 {
+  const f: (x: i32) => i32 = (k) => k + 1
+  const v = @B {
+    if f(n) > 0 { break @B 7 }
+    0
+  }
+  v + 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + n
+}
+`;
+
+// Four graphs, each an entry plus the sources its imports resolve to. `lib.vl` is parsed first
+// in A, after `other.vl` (which links `hostTick` first) in B, after two modules in C, and after
+// `flag.vl` in D, so D's lib image holds only if each image carries the module's own flags.
 const GRAPHS: { name: string; entry: string; deps: Record<string, string> }[] =
   [
     {
@@ -101,6 +115,12 @@ const GRAPHS: { name: string; entry: string; deps: Record<string, string> }[] =
           "  let s = 0\n  for i in 0 to n { s = s + i + hostFlag }\n  return s\n}\n",
         [LIB_KEY]: LIB,
       },
+    },
+    {
+      name: "D (entry → flag, lib)",
+      entry:
+        'import { flagged } from "./flag"\nimport { tick } from "./lib"\nprint(tick(flagged(1)))\n',
+      deps: { [FLAG_KEY]: FLAG, [LIB_KEY]: LIB },
     },
   ];
 
@@ -168,7 +188,7 @@ const firstDiff = (a: string, b: string): string => {
 };
 
 const libImages = (mode: number): string[] => {
-  // One instance for all three graphs, so the second and third serve lib's tokens from the
+  // One instance for every graph, so all but the first serve lib's tokens from the
   // per-instance token cache while the first tokenizes it: both paths must agree.
   const exp = new WebAssembly.Instance(
     new WebAssembly.Module(Deno.readFileSync(COMPILER)),
@@ -184,7 +204,7 @@ const libImages = (mode: number): string[] => {
 };
 
 Deno.test({
-  name: "parse-image: lib.vl's relative image is one text in all three graphs",
+  name: "parse-image: lib.vl's relative image is one text in every graph",
   ignore: !ENABLED,
   fn: () => {
     const imgs = libImages(1);
@@ -223,9 +243,40 @@ Deno.test({
     const imgs = libImages(2);
     if (imgs[1] === imgs[0] || imgs[2] === imgs[0] || imgs[2] === imgs[1]) {
       throw new Error(
-        "CONTROL — the absolute images agree, so the three graphs did not move lib.vl in the " +
+        "CONTROL — the absolute images agree, so the graphs did not move lib.vl in the " +
           "arena and the relative check above is vacuous",
       );
+    }
+  },
+});
+
+Deno.test({
+  name:
+    "parse-image: each image carries its own module's parse flags, not the graph's so far",
+  ignore: !ENABLED,
+  fn: () => {
+    const exp = new WebAssembly.Instance(
+      new WebAssembly.Module(Deno.readFileSync(COMPILER)),
+      {},
+    ).exports as unknown as Exports;
+    const imgs = imagesOf(exp, 1, GRAPHS[3]);
+    const keys = [...imgs.keys()];
+    const at = keys.indexOf(FLAG_KEY);
+    if (at < 0 || at > keys.indexOf(LIB_KEY)) {
+      throw new Error(
+        `CONTROL — flag.vl must parse ahead of lib.vl for this to bite; order: ${keys}`,
+      );
+    }
+    // Bits: arith region 1, `break v` 2, labelled block 4, fn-type parameter names 8.
+    for (const [key, want] of [[FLAG_KEY, "flags 15"], [LIB_KEY, "flags 0"]]) {
+      const got = (imgs.get(key) ?? "").split("\n").find((l) =>
+        l.startsWith("flags ")
+      );
+      if (got !== want) {
+        throw new Error(
+          `${key}'s image: want ${want} / got ${got ?? "(no flags line)"}`,
+        );
+      }
     }
   },
 });

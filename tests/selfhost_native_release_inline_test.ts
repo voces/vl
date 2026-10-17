@@ -81,6 +81,15 @@ const FIXTURES: [string, Want][] = [
   ["flat-costly-replan", "flat-costly"],
 ];
 const RUNGS = ["-O", "-O3"];
+// Whether the default build of a kind changes the module, where the `-O` checks say so.
+const STEP_DECIDES: Partial<Record<Want, boolean>> = {
+  "melts": true,
+  "kept": false,
+  "flat-melts": true,
+  "flat-kept": false,
+  "flat-stable": true,
+  "flat-costly": false,
+};
 
 // `struct.new` sites in function bodies: a global's initializer runs once and is not counted.
 const allocations = (wat: string): number => {
@@ -183,6 +192,23 @@ for (const [fx, want] of FIXTURES) {
         };
         for (const rung of RUNGS) {
           const step = await built(rung, "step", {});
+          if (rung === "-O3") {
+            // `-O3` changes only binaryen's passes after the step, which decides the same
+            // either way: its default build is graded by output, decision and count, and the
+            // variant builds below run at `-O` alone.
+            const moved = want.startsWith("flat") ? step.flat : step.inlined;
+            const decided = STEP_DECIDES[want];
+            if (decided !== undefined && moved !== decided) {
+              throw new Error(`${fx} -O3: the step ${moved ? "changed" : "left"} the module`);
+            }
+            if (want === "melts" || want === "flat-melts") {
+              const n = await step.count();
+              if (n !== allocs) {
+                throw new Error(`${fx} -O3: ${n} struct.new left in function bodies, want ${allocs}`);
+              }
+            }
+            continue;
+          }
           if (want === "melts") {
             if (!step.inlined) {
               throw new Error(`${fx} ${rung}: the step inlined no field`);

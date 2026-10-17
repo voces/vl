@@ -154,7 +154,9 @@ for (const [fx, want] of FIXTURES) {
                   : "  want: at least one — some call site here only reads its record"),
             );
           }
-          if (want === "melts" && await (await built(false))() <= allocs) {
+          // The control asks whether the fixture exercises the step, which runs before the
+          // rung's binaryen passes and so answers the same at both: `-O` asks it.
+          if (want === "melts" && rung === "-O" && await (await built(false))() <= allocs) {
             throw new Error(
               `${fx} ${rung}: CONTROL — with the step off no more struct.new is left,\n` +
                 "  so this fixture no longer exercises the step; give its producers a record\n" +

@@ -2669,15 +2669,96 @@ fn prune_cache_dir(dir: &std::path::Path, ours: &std::path::Path, suffixes: &[&s
 
 /// The reply to a guest's request for module `key`: a `std:` key maps to `<stdDir>/<name>.vl`
 /// (slash segments are subdirectories), every other key is a filesystem path read as-is, and
-/// `None` is "not found". Every module the compiler is told about comes through here, so a
-/// compile-cache recording on this thread sees each one (`compile_cache::record_read`).
+/// `None` is "not found". A [`ROOT_QUERY`] key is answered with that module's project root.
+/// Every module the compiler is told about comes through here, so a compile-cache recording
+/// on this thread sees each one (`compile_cache::record_read`), its root included.
 fn read_module_key(key: &str) -> Option<String> {
-    let data = match key.strip_prefix("std:") {
-        Some(name) => read_std_module(name),
-        None => read_utf8(std::path::Path::new(key)),
+    let data = if let Some(path) = key.strip_prefix(ROOT_QUERY) {
+        Some(module_root_of(path))
+    } else {
+        match key.strip_prefix("std:") {
+            Some(name) => read_std_module(name),
+            None => read_utf8(std::path::Path::new(key)),
+        }
     };
     compile_cache::record_read(key, data.as_deref());
     data
+}
+
+/// The key prefix that asks [`read_module_key`] for a module's project root rather than its
+/// source. No path holds a NUL, so it cannot name a file.
+const ROOT_QUERY: &str = "\0root:";
+
+/// The files that mark a directory as a project root: the set `lsp/src/moduleGraph.ts`
+/// (`ROOT_SENTINELS`) uses, so the CLI and the editor find one root per module.
+const ROOT_SENTINELS: [&str; 3] = ["deno.json", "package.json", ".git"];
+
+/// The project root of module path `key`: the nearest ancestor of its directory holding one
+/// of [`ROOT_SENTINELS`], absolute, lexically normalised and `/`-separated, or "" when none
+/// does. A relative key is taken against the cwd, which the guest is staged with too.
+fn module_root_of(key: &str) -> String {
+    let path = std::path::Path::new(key);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(c) => c.join(path),
+            Err(_) => return String::new(),
+        }
+    };
+    let mut norm = std::path::PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                norm.pop();
+            }
+            other => norm.push(other),
+        }
+    }
+    let found = norm.parent().and_then(|d| {
+        d.ancestors()
+            .find(|a| ROOT_SENTINELS.iter().any(|s| a.join(s).exists()))
+    });
+    match found {
+        Some(r) if cfg!(windows) => r.to_string_lossy().replace('\\', "/"),
+        Some(r) => r.to_string_lossy().into_owned(),
+        None => String::new(),
+    }
+}
+
+/// Stages a module's project root into the guest (`modRootKey`/`modRootDir` and
+/// `modRootCommit`, driver.vl), which keys the module's stable id on its path relative to that
+/// root (D5760). `probe` is `None` on a seed that predates the channel.
+struct RootIn {
+    key: StrIn,
+    dir: StrIn,
+    commit: TypedFunc<(), i32>,
+}
+
+impl RootIn {
+    fn probe(store: &mut Store<()>, inst: &Instance) -> Option<Self> {
+        Some(RootIn {
+            key: StrIn::probe(&mut *store, inst, "modRootKey").ok()?,
+            dir: StrIn::probe(&mut *store, inst, "modRootDir").ok()?,
+            commit: inst
+                .get_typed_func::<(), i32>(&mut *store, "modRootCommit")
+                .ok()?,
+        })
+    }
+
+    /// Stages `key`'s root. A `std:` key keys on its name and is skipped.
+    fn note(this: &Option<Self>, store: &mut Store<()>, key: &str) -> Result<()> {
+        let Some(r) = this else { return Ok(()) };
+        if key.starts_with("std:") {
+            return Ok(());
+        }
+        let root = read_module_key(&format!("{ROOT_QUERY}{key}")).unwrap_or_default();
+        r.key.send(&mut *store, key)?;
+        r.dir.send(&mut *store, &root)?;
+        r.commit.call(&mut *store, ())?;
+        Ok(())
+    }
 }
 
 /// Read a file as UTF-8, distinguishing "missing/unreadable" from "present but
@@ -3167,8 +3248,10 @@ fn stage_program(
             inst.get_typed_func::<i32, i32>(&mut *store, "modPendingLen"),
             inst.get_typed_func::<(i32, i32), i32>(&mut *store, "modPendingAt"),
         ) {
+            let root_in = RootIn::probe(&mut *store, inst);
             let commit_module =
                 |store: &mut Store<()>, key: &str, src: Option<&str>| -> Result<()> {
+                    RootIn::note(&root_in, store, key)?;
                     key_in.send(store, key)?;
                     if let Some(s) = src {
                         msrc_in.send(store, s)?;
@@ -7531,6 +7614,7 @@ fn compile_test_file_cold(
     let cmd_data = StrOut::probe(&mut store, &inst, "cliCmdData")?;
     let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
     let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
+    let root_in = RootIn::probe(&mut store, &inst);
     let dir_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliDirCommit")?;
     let exit_code = inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?;
     let mut bytes: Option<Vec<u8>> = None;
@@ -7543,7 +7627,9 @@ fn compile_test_file_cold(
                 dir_commit.call(&mut store, 0)?;
             }
             CMD_READ_FILE => {
-                let data = read_module_key(&cmd_path.read(&mut store)?);
+                let path = cmd_path.read(&mut store)?;
+                RootIn::note(&root_in, &mut store, &path)?;
+                let data = read_module_key(&path);
                 match data {
                     Some(s) => {
                         result_in.send(&mut store, &s)?;
@@ -7629,6 +7715,7 @@ struct CheckWorker {
     cmd_data: StrOut,
     result_in: StrIn,
     file_commit: TypedFunc<i32, i32>,
+    root_in: Option<RootIn>,
     exit_code: TypedFunc<(), i32>,
 }
 
@@ -7669,6 +7756,7 @@ impl CheckWorker {
             cmd_data: StrOut::probe(&mut store, &inst, "cliCmdData")?,
             result_in,
             file_commit: inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?,
+            root_in: RootIn::probe(&mut store, &inst),
             exit_code: inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?,
             store,
         })
@@ -7683,15 +7771,19 @@ impl CheckWorker {
         loop {
             match self.next.call(&mut *store, ())? {
                 CMD_CHECK_ROOT_DONE => break,
-                CMD_READ_FILE => match read_module_key(&self.cmd_path.read(&mut *store)?) {
-                    Some(s) => {
-                        self.result_in.send(&mut *store, &s)?;
-                        self.file_commit.call(&mut *store, 1)?;
+                CMD_READ_FILE => {
+                    let path = self.cmd_path.read(&mut *store)?;
+                    RootIn::note(&self.root_in, &mut *store, &path)?;
+                    match read_module_key(&path) {
+                        Some(s) => {
+                            self.result_in.send(&mut *store, &s)?;
+                            self.file_commit.call(&mut *store, 1)?;
+                        }
+                        None => {
+                            self.file_commit.call(&mut *store, 0)?;
+                        }
                     }
-                    None => {
-                        self.file_commit.call(&mut *store, 0)?;
-                    }
-                },
+                }
                 _ => return Ok((None, false)),
             }
         }
@@ -8554,7 +8646,8 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let cmd_data = StrOut::probe(&mut store, &inst, "cliCmdData")?;
     let result_in = StrIn::probe(&mut store, &inst, "cliResult")?;
     let file_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?;
-    let dir_name_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirNamePush")?;
+    let root_in = RootIn::probe(&mut store, &inst);
+    let dir_name_push =inst.get_typed_func::<i32, i32>(&mut store, "cliDirNamePush")?;
     let dir_entry_push = inst.get_typed_func::<i32, i32>(&mut store, "cliDirEntryPush")?;
     let dir_commit = inst.get_typed_func::<i32, i32>(&mut store, "cliDirCommit")?;
     let exit_code = inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?;
@@ -8607,6 +8700,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 }
                 // A missing file commits `found = 0` (the VL program raises its own
                 // unresolvable-import / cannot-read diagnostic).
+                RootIn::note(&root_in, &mut store, &path)?;
                 let data = read_module_key(&path);
                 match data {
                     Some(s) => {

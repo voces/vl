@@ -322,8 +322,9 @@ test("a file appearing at a recorded-absent path misses", async () => {
     const m = files(tmp).find((n) => n.endsWith(".m"))!;
     const r = files(tmp).find((n) => n.endsWith(".r"))!;
     const lines = (await Deno.readTextFile(`${dir}/${m}`)).trimEnd().split("\n");
-    expect(lines.slice(0, 2), ["VLCM1", "T 1"], "the manifest holds one one-read transcript");
-    const transcript = `T 2\n${lines[2]}\n- ${hex(enc("ghost.vl"))}\n`;
+    // The dependency's read, and the project-root query of each module (D5760).
+    expect(lines.slice(0, 2), ["VLCM1", "T 3"], "the manifest holds one three-read transcript");
+    const transcript = `T 4\n${lines.slice(2, 5).join("\n")}\n- ${hex(enc("ghost.vl"))}\n`;
     const rkey = await sha(new Uint8Array([...unhex(m.slice(0, 64)), ...enc(transcript)]));
     await Deno.writeTextFile(`${dir}/${m}`, `VLCM1\n${transcript}`);
     await Deno.copyFile(`${dir}/${r}`, `${dir}/${hex(rkey)}.r`);
@@ -568,7 +569,8 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   identAuditUnresolved: "uncached", modCommit: "input", modKey: "input",
   modKeyAtCharAt: "output", modKeyAtLen: "output", modKeyCount: "output",
   modPendingAt: "output", modPendingCount: "output", modPendingLen: "output",
-  modReset: "input", modSrc: "input", optInLoad: "input", optInReset: "input",
+  modReset: "input", modRootCommit: "input", modRootDir: "input", modRootKey: "input",
+  modSrc: "input", optInLoad: "input", optInReset: "input",
   optOut: "output", optPipeArgv: "input", optPipeResume: "input", optPipeStart: "input",
   optStripSrc: "input",
   rbyte: "output", repShadowCount: "uncached",

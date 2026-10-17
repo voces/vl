@@ -376,7 +376,7 @@ the same under `rules.test.vl` as under `beast.test.vl`.
 | phase | output is a function of | importer-independent? | reusable per module today? |
 | --- | --- | --- | --- |
 | lex | the module's bytes | yes | **yes**, and already reused within one instance (`modCache*`, `driver.vl:558–636`; the LSP's `modCommitCached`, 3095) |
-| parse | the module's tokens | **the image is** (S5's second step): its node, token and spelling indices are offset by earlier modules in the one shared arena, and the parse image rebases them on the module's own start | the image is, and nothing replays it yet. `compiler/parse_image.vl`; `tests/vl_parse_image_stable_test.ts` holds it |
+| parse | the module's tokens | **the image is** (S5's second step): its node, token and spelling indices are offset by earlier modules in the one shared arena, and the parse image rebases them on the module's own start | the image is, and a reused instance replays it (S5's third step, `compiler/parse_bank.vl`). `compiler/parse_image.vl`; `tests/vl_parse_image_stable_test.ts` and `tests/vl_parse_replay_test.ts` hold it |
 | order + rename | the order: the whole graph; the rename: M's key and the set of keys | **the rename, yes** (S5's first step); the order, no | the rename only. `$mN` was the discovery position, so an import added above M renamed everything in M. N is now a 31-bit FNV-1a hash of M's normalised key, written in decimal: a `std:` key as written, otherwise the path relative to the cwd the host stages, or absolute when M lies outside it. When two keys collide, the one that sorts later is salted until unique, so the id depends only on the SET of keys. Digits keep every `$m\d+` demangler working. `tests/vl_module_id_stable_test.ts` holds it |
 | checker: exported `let` inference | M + its imports | **yes, by rule**: "an exported `let` is typed only by its own module's uses; an importer's use is an ordinary use" (DECISIONS.md, the B′+C literal-binding entry). Probe below. | yes, after rename and arena are fixed |
 | checker: un-annotated `const` | each use site | yes: typed per use, "no cross-module effect" (same entry) | yes |
@@ -970,19 +970,80 @@ exports no image at all, so both tests fail on it.
     `callTaCall`; `ufcsModBound`; and the token ranges in `modLoadStart`/`srcmap`
     (`modOfTok`) and the reserved-import check. Appending a replayed image at the arena's
     end keeps all six true.
-  - Not yet in the image: four flags OR'd across modules (`arithRegionSeen`, `brkValSeen`,
-    `lblBlkSeen`, `tsAnyParamNames`). A replay must set them from what the module saw, so
-    they need a per-module capture.
-- **The id key (D5760).** `modIdKeyOf` hashes the path relative to the CLI's cwd, and to
-  nothing in the LSP, so `--names` differs by the directory a build starts in. The key
-  should be relative to a root found from the module itself (the nearest `deno.json`,
-  `package.json` or `.git`). That needs the host to stage a root per module, which is a Rust
-  and an LSP change, so it is filed rather than done here.
-- **Next:** replay. Bank the image per (key, source), serve a hit by appending it rebased on
-  the current arena ends, and capture the four flags. Then the interface hash. Q4 is ruled
-  (A), so the hash covers the bodies of exported generics and of exports whose return is
-  inferred, and it may not assume any export is annotated. Q1 (B) keys a module that an
-  importer adopts records into on that importer's demands.
+  - Four whole-graph flags (`arithRegionSeen`, `brkValSeen`, `lblBlkSeen`,
+    `tsAnyParamNames`). The driver clears them before each module's parse
+    (`parseFlagsTake`, ast.vl) and ORs the earlier modules' bits back after
+    (`parseFlagsMerge`), so the image's `flags` line is what that module set itself and the
+    graph-wide value is unchanged. A replay merges the line's bits. The suite's fourth graph
+    parses `flag.vl`, which sets all four, ahead of `lib.vl`: lib's image still reads
+    `flags 0`, and a build that captures without clearing gives it `flags 15`.
+- **The id key (D5760, closed).** `modIdKeyOf` hashes the path relative to the module's own
+  project root: the nearest ancestor of its directory holding `deno.json`, `package.json` or
+  `.git` (the LSP's `ROOT_SENTINELS`), or the absolute path when there is none. A root found
+  from the entry would key a library shared by two projects differently in each. The guest
+  cannot stat files, so each host stages a root per module key (`modRootKeyPush`,
+  `modRootDirPush`, `modRootCommit`):
+  - The CLI host stages it at all four of its module reads (`RootIn`, main.rs). The answer
+    comes from `module_root_of`, asked through `read_module_key`, so the S1 compile cache
+    records the root in its transcript. Adding a marker then misses the cache instead of
+    replaying a stale id.
+  - The LSP stages it in its module commit, answered by `projectRootFor` (`vlRoot.ts`).
+  - A host that stages no root keeps the old cwd-relative key.
+  - Ordinary builds do not move. The compiler's own modules sit under the repo root, so its
+    keys are the ones the cwd gave.
+  - `tests/vl_module_id_stable_test.ts`'s second test builds one graph from the project root
+    and from the module's directory, and compiles it through the editor's checker. All three
+    name `lib.vl`'s functions with one suffix. On the previous host and seed, the two builds
+    give `$m1742982019` and `$m1503105556`.
+
+**S5 step 3: a reused instance replays an unchanged module's parse** (`compiler/parse_bank.vl`).
+`modCompile` asks the bank before it parses a module. A slot is keyed on the module key and
+holds its source, a deep copy of its nodes with every child index relative to the module's
+first node, its tokens' count, its own parse flags, and its rows of every side table the parser
+writes (`PbSide`, ast.vl), with node and token indices made relative the same way. On a hit with
+the same source and token count, the driver still loads the tokens (the token cache serves
+them), then appends the copy rebased on the current `P.nodes`/`P.toks`/spelling ends, re-adds
+the extern rows through `externAdd`/`externGlobalAdd` (so the link dedupe runs as in a fresh
+parse), and merges the slot's flags. The parse is skipped.
+- **Scope.** Only an instance that is reused banks: a one-shot instance (`setOneShot`, every
+  CLI command) never opens the bank, so the CLI parses exactly as before. The L2 self-compile
+  moves by 21,641 fuel of 126,966,458,438. That is the cost of the extern rows `externAdd` now
+  also keeps. `parseReplaySet(0)` turns the bank off and `parseReplayStat` counts slots, hits,
+  keeps and refusals. The bank holds at most 256 slots and clears when it is full.
+- **What is not banked.** A parse that recorded any diagnostic, or that edited a table outside
+  its own rows. Also a parse with a node minted before its first token: its `nodeToks` row
+  points into the previous module, so a relative copy cannot say where. Capture checks every
+  index it moves against the module's own range and refuses the slot when one falls outside.
+- **Soundness.** `tests/vl_parse_replay_test.ts` drives two instances through one sequence
+  of compiles, with the bank on and off, and requires each step's diagnostics, wasm and editor
+  symbol rows (`checkSrcSym`'s occurrences and inlays) to be identical. The sequences are:
+  - graphs A–D, an edit of `lib.vl` under its own key and its revert, and a module that parses
+    clean and fails the check;
+  - the compiler's own 216 modules, then the same graph with `listutil.vl` edited, so the 215
+    unchanged modules replay, every one after the edit at a new offset.
+
+  Its control is the hit count. Two mutations fail it:
+  - Child indices rebased one past the slot's base give a cyclic tree; both tests die on a
+    stack overflow.
+  - `nodeToks` rebased one token late passes every diagnostic and every wasm byte. It fails
+    only on the symbol rows (`want occ 28 3 0 1 4:16-17 / got occ 29 3 0 1 4:18-19`), which is
+    why the suite reads them.
+- **What it buys: the parse is about 2% of a check.** A guest profile of `vl check
+  compiler/entry.vl` (`scripts/perf/profile-phases.vl`, 11,921 samples) puts 171 samples in
+  `parseProgram`. That is 1.4% of the run, and 1.8% of it without `lintGraph`, which an editor
+  check does not run. The lex is another 0.3%, and the token cache already serves it to a reused
+  instance. The suite's wall readings of a re-check after a one-module edit vary from run to
+  run, at load 13–22 on 24 threads: 9.9 s with the bank and 11.2 s without; 9.0 s and 12.2 s;
+  a median of 9.1 s against 9.7 s over five rounds, with some rounds going the other way. That
+  noise is larger than the 2% the profile allows, so the readings are noise, not a speedup. The
+  replay's own value is as the first per-module phase an unchanged module skips. Anything
+  after the parse gets skipped only through the interface hash.
+- **Next: the interface hash.** Q4 is ruled (A), so the hash covers the bodies of exported
+  generics and of exports whose return is inferred, and it may not assume any export is
+  annotated. Q1 (B) keys a module that an importer adopts records into on that importer's
+  demands. The rename and rewrite, at 1.7% of the check, are per module and are the next step a
+  replayed module could skip. The rest of the check (74% of the samples fall outside every
+  phase the script names) waits on the hash.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
