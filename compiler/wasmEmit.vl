@@ -1373,13 +1373,17 @@ import {
 } from "./emit_mono"
 import {
   armPreludeBindChain,
+  chainHasPrelude,
   declSlotPinned,
   firstLocalDeclIn,
   rvPairOf,
+  stmtArmScopeClose,
+  stmtArmScopeOpen,
 } from "./emit_collect"
 import { cboxIsWriteLet, voidTwinForNode } from "./emit_rewrite"
 import { nameIsQuotedLeaf, nameIsShapeOpen, splitUnionAtoms } from "./tyname"
 import {
+  exprArmLocalsAny,
   monoGradualAsScalar,
   monoOrigNode,
   monoStubValueOk,
@@ -18776,11 +18780,13 @@ function ifJoinLeavesAtomic(ix: i32, fnIx: i32): boolean {
   false
 }
 
-// Whether arm value `ix` is `null`, a string literal, or of literal-union type.
+// Whether arm value `ix` is `null`, a string literal, or of literal-union type; an arm whose
+// value is another `if` is one when that join's leaves are.
 function atomicJoinLeaf(ix: i32, fnIx: i32): boolean {
   const u = unwrapParen(ix)
   if u < 0 { return false }
   if exprIsNullLike(u) || P.nodes[u] is StrLit { return true }
+  if P.nodes[u] is IfStmt { return ifJoinLeavesAtomic(u, fnIx) }
   exprIsLitAtom(u, fnIx) || strReppedLitUnionAt(u, fnIx)
 }
 
@@ -18793,38 +18799,6 @@ function armPreludeScopeOpen(ifIx: i32): boolean {
   scopePush()
   armPreludeBindChain(ifIx)
   true
-}
-
-// Whether the arm block at `blockIx` has a statement before its value.
-function armHasPrelude(blockIx: i32): boolean {
-  if blockIx < 0 { return false }
-  const b = P.nodes[blockIx]
-  if b is Block {
-    if b.blkStmts.length > 1 { return true }
-    // An arm whose value is another `if` has that `if`'s arm preludes (D2825).
-    if b.blkStmts.length == 1 {
-      const tail = unwrapParen(b.blkStmts[0])
-      if tail >= 0 && P.nodes[tail] is IfStmt { return chainHasPrelude(tail) }
-    }
-  }
-  false
-}
-
-// Whether any arm along the `if` chain at `ifIx` has a prelude (`armHasPrelude`).
-function chainHasPrelude(ifIx: i32): boolean {
-  let cur = ifIx
-  while cur >= 0 {
-    const s = P.nodes[cur]
-    cur = -1
-    if s is IfStmt {
-      if armHasPrelude(s.ifThen) { return true }
-      if s.ifElse >= 0 {
-        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
-        else if armHasPrelude(s.ifElse) { return true }
-      }
-    }
-  }
-  false
 }
 
 // An if-expression whose value is the `null` type, by its arms or by the checker's join: it runs
@@ -28049,6 +28023,15 @@ function uBoxSinkToPair() {
   0
 }
 
+// `emitReturnExit` for a body's tail value statement, read at its arm-prelude locals as
+// `emitStmt` reads a statement (D5331).
+function emitTailReturnExit(body: u8[], stmtIx: i32, fnIx: i32) {
+  const kept = stmtArmScopeOpen(stmtIx)
+  const rc = emitReturnExit(body, stmtIx, fnIx)
+  if kept >= 0 { stmtArmScopeClose(kept) }
+  rc
+}
+
 // Terminate a return: lower the value at `retArg` as function `fnIx`'s result and end the
 // exit. Every exit in the emitter goes through here, so the value lowering and its
 // terminator can never be paired differently. The one exception is a returned
@@ -28246,6 +28229,14 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
 // Lower a single statement at `stmtIx` onto `body`, resolving identifiers/params
 // against function `fnIx`. Returns 0, or -1 (via `emitFail`) on an unsupported shape.
 export function emitStmt(body: u8[], stmtIx: i32, fnIx: i32) {
+  if !exprArmLocalsAny { return emitStmtGo(body, stmtIx, fnIx) }
+  const kept = stmtArmScopeOpen(stmtIx)
+  const rc = emitStmtGo(body, stmtIx, fnIx)
+  if kept >= 0 { stmtArmScopeClose(kept) }
+  rc
+}
+
+function emitStmtGo(body: u8[], stmtIx: i32, fnIx: i32) {
   // stop after a recorded failure: `emitFail` banks the first message and returns -1, but
   // does not halt the pass, so a caller that drops the -1 keeps emitting over invalidated
   // state — the next unguarded parallel-table read then traps the compiler before the
@@ -31311,7 +31302,7 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
         // terminate the exit.
-        if emitReturnExit(body, stmts[i], fnIx) < 0 {
+        if emitTailReturnExit(body, stmts[i], fnIx) < 0 {
           scopePop()
           return -1
         }
@@ -31515,7 +31506,7 @@ function emitStmtTail(body: u8[], stmtIx: i32, fnIx: i32) {
   if stmtIsTailValue(stmtIx, fnIx) {
     // An if-tail arm's implicit return — seed the return context (so a `null` arm
     // boxes / sentinels per the function's return type) exactly like `emitFuncBody`.
-    return emitReturnExit(body, stmtIx, fnIx)
+    return emitTailReturnExit(body, stmtIx, fnIx)
   }
   // D1240 — an if-ARM tail member call is a value for the same reason a body tail is: this
   // path is reached only from `emitIfTail`, i.e. only where the arms ARE the result.
