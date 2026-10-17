@@ -4180,14 +4180,23 @@ function mapCompactFuncType(sh: i32) {
   0
 }
 
-// `__map_compact__(m)` for map shape `sh`: slide the live entries down in place, in order and
-// with their sequences, clear the vacated tail (refs to null, `seqs` to -1, which no entry
-// holds), then rebuild the index at the next power of two above `4*size + 2*INITIAL_CAP`, the
-// cap `__map_resize__` would grow into anyway (D2291, D2315). Only a resized index allocates.
-function emitMapCompactFnCode(out: u8[], sh: i32) {
+// The type indices `__map_compact__` reads for one map shape: the map, its key kind, the keys'
+// and values' list wrappers and backing arrays, and the value element's heap type when a
+// vacated value slot is cleared to null (-1 for a numeric value).
+type MapCompactTys = {
+  mapTy: i32,
+  keyK: i32,
+  keysWrap: i32,
+  keysBack: i32,
+  valsWrap: i32,
+  valsBack: i32,
+  valNull: i32,
+}
+
+// `__map_compact__`'s type indices for map shape `sh`, as `MapCompactTys` names them.
+function mapCompactTysOf(sh: i32): MapCompactTys {
   const mapTy = mapTypeIdxOf(sh)
   const keyK = mapShapeKeyKind(sh)
-  const keyInt = keyK != MAP_KEY_STR
   let keysWrap = mkListIdx
   let keysBack = mkArrIdx
   if keyK == MAP_KEY_I32 {
@@ -4208,25 +4217,22 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
       valNull = mvValElemHeapOf(sh)
     }
   }
-  const body: u8[] = []
-  const prev = wTarget(body)
-  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 mask, 7 tag, 8 entry, 9 idx[, 10 an i64 key]
-  let runs = 2
-  if keyK == MAP_KEY_I64 { runs = 3 }
-  wULEB(runs) // locals runs
-  wULEB(8)
-  wU8(127)    // 0x7f i32
-  wULEB(1)
-  wU8(99)     // 0x63 (ref null ht)
-  wSLEB(aTypeIdx)
-  if keyK == MAP_KEY_I64 {
-    wULEB(1)
-    wU8(126) // 0x7e i64
+  const t: MapCompactTys = {
+    mapTy: mapTy,
+    keyK: keyK,
+    keysWrap: keysWrap,
+    keysBack: keysBack,
+    valsWrap: valsWrap,
+    valsBack: valsBack,
+    valNull: valNull,
   }
-  fbLocalGet(0)
-  fbStructGet(mapTy, 4)
-  fbLocalSet(3)
-  // for i < count: if live[i] { entry j = entry i ; j++ }
+  t
+}
+
+// `__map_compact__`'s slide: for i < count, a live entry i moves down to entry j and j counts
+// it, so j ends as the live count.
+function mapCompactSlide(t: MapCompactTys) {
+  const mapTy = t.mapTy
   fbBlock(64)
   fbLoop(64)
   fbLocalGet(1)
@@ -4238,10 +4244,10 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalGet(1)
   fbArrayGet(aTypeIdx)
   fbIf(64)     // live[i] != 0
-  mapCompactMove(mapTy, 0, keysWrap, keysBack)
-  mapCompactMove(mapTy, 1, valsWrap, valsBack)
+  mapCompactMove(mapTy, 0, t.keysWrap, t.keysBack)
+  mapCompactMove(mapTy, 1, t.valsWrap, t.valsBack)
   mapCompactMove(mapTy, 2, -1, aTypeIdx)
-  if !keyInt { mapCompactMove(mapTy, 6, -1, aTypeIdx) }
+  if t.keyK == MAP_KEY_STR { mapCompactMove(mapTy, 6, -1, aTypeIdx) }
   mapCompactMove(mapTy, 7, -1, ia64TypeIdx)
   fbLocalGet(2)
   fbI32Const(1)
@@ -4255,7 +4261,12 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbBr(0)
   fbEnd()
   fbEnd()
-  // the vacated tail, j <= i < count: dead, no sequence, no payload
+}
+
+// `__map_compact__`'s vacated tail, j <= i < count: each entry dead, with no sequence, and its
+// string key and ref value cleared to null.
+function mapCompactClearTail(t: MapCompactTys) {
+  const mapTy = t.mapTy
   fbLocalGet(2)
   fbLocalSet(1)
   fbBlock(64)
@@ -4274,21 +4285,21 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalGet(1)
   fbI64Const(-1, -1)
   fbArraySet(ia64TypeIdx)
-  if !keyInt {
+  if t.keyK == MAP_KEY_STR {
     fbLocalGet(0)
     fbStructGet(mapTy, 0)
-    fbStructGet(keysWrap, 0)
+    fbStructGet(t.keysWrap, 0)
     fbLocalGet(1)
     fbRefNull(sTypeIdx)
-    fbArraySet(keysBack)
+    fbArraySet(t.keysBack)
   }
-  if valNull >= 0 {
+  if t.valNull >= 0 {
     fbLocalGet(0)
     fbStructGet(mapTy, 1)
-    fbStructGet(valsWrap, 0)
+    fbStructGet(t.valsWrap, 0)
     fbLocalGet(1)
-    fbRefNull(valNull)
-    fbArraySet(valsBack)
+    fbRefNull(t.valNull)
+    fbArraySet(t.valsBack)
   }
   fbLocalGet(1)
   fbI32Const(1)
@@ -4297,19 +4308,11 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbBr(0)
   fbEnd()
   fbEnd()
-  // keys.len = vals.len = count = j
-  fbLocalGet(0)
-  fbStructGet(mapTy, 0)
-  fbLocalGet(2)
-  fbStructSet(keysWrap, 1)
-  fbLocalGet(0)
-  fbStructGet(mapTy, 1)
-  fbLocalGet(2)
-  fbStructSet(valsWrap, 1)
-  fbLocalGet(0)
-  fbLocalGet(2)
-  fbStructSet(mapTy, 4)
-  // cap = 16 ; while cap <= 4*size + 18 { cap *= 2 }
+}
+
+// `__map_compact__`'s new index cap into local 4: 16, doubled while it is at most
+// `4*size + 18`.
+function mapCompactGrowCap(mapTy: i32) {
   fbI32Const(16)
   fbLocalSet(4)
   fbBlock(64)
@@ -4330,9 +4333,15 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbBr(0)
   fbEnd()
   fbEnd()
-  // idx = the index cleared in place when it already has cap slots (a steady churn's case),
-  // else a fresh one; then entry i < j is re-placed from the entries, never the old index: an
-  // i32 key as its own pair tag, an i64 key at its hash, a string key at its stored hash
+}
+
+// `__map_compact__`'s reindex: idx is the index cleared in place when it already has cap slots
+// (a steady churn's case), else a fresh one; then entry i < j is re-placed from the entries,
+// never the old index: an i32 key as its own pair tag, an i64 key at its hash, a string key at
+// its stored hash. Stores idx back into the map.
+function mapCompactReindex(t: MapCompactTys) {
+  const mapTy = t.mapTy
+  const keyInt = t.keyK != MAP_KEY_STR
   let pairShift = 0
   if keyInt { pairShift = 1 }
   fbLocalGet(0)
@@ -4376,10 +4385,10 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalGet(0)
   if keyInt {
     fbStructGet(mapTy, 0)
-    fbStructGet(keysWrap, 0)
+    fbStructGet(t.keysWrap, 0)
     fbLocalGet(1)
-    fbArrayGet(keysBack)
-    if keyK == MAP_KEY_I64 {
+    fbArrayGet(t.keysBack)
+    if t.keyK == MAP_KEY_I64 {
       fbLocalSet(10)
       fbMapTagOfI64(10)
     }
@@ -4405,6 +4414,49 @@ function emitMapCompactFnCode(out: u8[], sh: i32) {
   fbLocalGet(9)
   fbRefAsNonNull()
   fbStructSet(mapTy, 3)
+}
+
+// `__map_compact__(m)` for map shape `sh`: slide the live entries down in place, in order and
+// with their sequences, clear the vacated tail (refs to null, `seqs` to -1, which no entry
+// holds), then rebuild the index at the next power of two above `4*size + 2*INITIAL_CAP`, the
+// cap `__map_resize__` would grow into anyway (D2291, D2315). Only a resized index allocates.
+function emitMapCompactFnCode(out: u8[], sh: i32) {
+  const t = mapCompactTysOf(sh)
+  const mapTy = t.mapTy
+  const body: u8[] = []
+  const prev = wTarget(body)
+  // locals: 1 i, 2 j, 3 count, 4 cap, 5 rslot, 6 mask, 7 tag, 8 entry, 9 idx[, 10 an i64 key]
+  let runs = 2
+  if t.keyK == MAP_KEY_I64 { runs = 3 }
+  wULEB(runs) // locals runs
+  wULEB(8)
+  wU8(127)    // 0x7f i32
+  wULEB(1)
+  wU8(99)     // 0x63 (ref null ht)
+  wSLEB(aTypeIdx)
+  if t.keyK == MAP_KEY_I64 {
+    wULEB(1)
+    wU8(126) // 0x7e i64
+  }
+  fbLocalGet(0)
+  fbStructGet(mapTy, 4)
+  fbLocalSet(3)
+  mapCompactSlide(t)
+  mapCompactClearTail(t)
+  // keys.len = vals.len = count = j
+  fbLocalGet(0)
+  fbStructGet(mapTy, 0)
+  fbLocalGet(2)
+  fbStructSet(t.keysWrap, 1)
+  fbLocalGet(0)
+  fbStructGet(mapTy, 1)
+  fbLocalGet(2)
+  fbStructSet(t.valsWrap, 1)
+  fbLocalGet(0)
+  fbLocalGet(2)
+  fbStructSet(mapTy, 4)
+  mapCompactGrowCap(mapTy)
+  mapCompactReindex(t)
   fbEnd() // end (function)
   wTarget(prev)
   helpFrameBody(out, body)

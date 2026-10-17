@@ -3722,34 +3722,7 @@ function cboxRenameJoins(ix: i32, boxed: string[]) {
 function cboxWalk(ix: i32, boxed: string[]) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Ident {
-    if strListHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
-      // The cell `c` carries the type of its list, so an element question about `c[0]` has
-      // the binding's declared type to answer from. A read `c[0]` records the type the name
-      // read had; a store target is typed by the `BinExpr` arm, and a function-typed read
-      // stays untyped for the reassigned-binding signature check (rep-descriptor-campaign §13.23).
-      const cell = mkIdent(cboxCellOf[n.identName] ?? n.identName, -1)
-      if identAuditDrop != IDENT_DROP_CBOX_READ { identFrom(cell, ix) }
-      const cellTy = cboxCellTy[n.identName] ?? -1
-      if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
-      const rd = mkIndex(cell, mkNum("0", -1), -1)
-      const rty = nodeTyIxOf(ix)
-      if (cboxVecCells[n.identName] ?? 0) == 1 {
-        if cboxStoreTarget { return rd }
-        nodeTyRecord(rd, tyArrayElemIx(cellTy))
-        const un = mkAsExpr(rd, "v128", "trap", -1)
-        if rty >= 0 { nodeTyRecord(un, rty) }
-        return un
-      }
-      if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
-      if rd >= 0 && cboxStoreTarget { cboxStoreCells[rd] = 1 }
-      if rd >= 0 && rty >= 0 && !cboxStoreTarget && !(T.tys[rty] is TyFunc) {
-        nodeTyRecord(rd, rty)
-      }
-      return rd
-    }
-    return ix
-  }
+  if n is Ident { return cboxWalkIdent(ix, n, boxed) }
   if n is FuncDecl {
     const fmark = cboxShTrail.length
     cboxShadowParams(ix)
@@ -3783,101 +3756,15 @@ function cboxWalk(ix: i32, boxed: string[]) {
     if strListHas(boxed, n.letName) { cboxBoxLet(ix, n.letName) }
     return ix
   }
-  if n is BinExpr {
-    cboxRenameJoins(ix, boxed)
-    const leftName = cboxTypedLeftName(n, boxed)
-    cboxStoreTarget = n.binOp == "=" && P.nodes[unwrapParen(n.binLeft)] is Ident
-    n.binLeft = cboxWalk(n.binLeft, boxed)
-    cboxStoreTarget = false
-    n.binRight = cboxWalk(n.binRight, boxed)
-    // The left of a `??` or `=` is typed at the binding's declared type: the coalesce lowers
-    // from its operand's type (a closure may have written the cell since any narrowing), and
-    // an assignment re-reads its target as its value only where that type is the value's.
-    // A literal-union cell stays untyped: its re-read is the atom whatever the member (D2168).
-    if leftName != "" {
-      const elemTy = tyArrayElemIx(cboxCellTy[leftName] ?? -1)
-      if n.binOp == "??" || !tyIsLitUnionOrLit(elemTy) {
-        nodeTyRecord(unwrapParen(n.binLeft), elemTy)
-      }
-    }
-    return ix
-  }
-  if n is IfStmt {
-    cboxRenameJoins(ix, boxed)
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-    let cur = ix
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        c.ifCond = cboxWalk(c.ifCond, boxed)
-        c.ifThen = cboxWalk(c.ifThen, boxed)
-        if c.ifElse >= 0 {
-          if P.nodes[c.ifElse] is IfStmt {
-            cur = c.ifElse
-          } else {
-            c.ifElse = cboxWalk(c.ifElse, boxed)
-          }
-        }
-      }
-    }
-    return ix
-  }
+  if n is BinExpr { return cboxWalkBin(ix, n, boxed) }
+  if n is IfStmt { return cboxWalkIf(ix, boxed) }
   if n is WhileStmt {
     n.whileCond = cboxWalk(n.whileCond, boxed)
     n.whileBody = cboxWalk(n.whileBody, boxed)
     return ix
   }
-  if n is ForRange {
-    n.frFrom = cboxWalk(n.frFrom, boxed)
-    n.frTo = cboxWalk(n.frTo, boxed)
-    n.frStep = cboxWalk(n.frStep, boxed)
-    const rmark = cboxShTrail.length
-    if cboxDepth > 0 { cboxShadowPush(n.frVar) }
-    // A boxed range variable gets a cell per iteration, seeded from the counter, and hands the
-    // cell's value back to the counter wherever the iteration ends and the loop steps on.
-    let rseed = -1
-    if cboxDepth == 0 && strListHas(boxed, n.frVar) {
-      rseed = cboxSeedLet(n.frVar, ix, -1, TY_I32)
-    }
-    n.frBody = cboxWalk(n.frBody, boxed)
-    if rseed >= 0 {
-      cboxContStoreBack(n.frBody, n.frVar, ix, n.frLabel, 0)
-      const rb = P.nodes[n.frBody]
-      if rb is Block {
-        rb.blkStmts.push(cboxStoreBack(n.frVar, ix))
-        plCacheBust()
-      }
-      cboxPrepend(n.frBody, rseed)
-    }
-    cboxShadowTrim(rmark)
-    return ix
-  }
-  if n is ForIn {
-    n.fiIter = cboxWalk(n.fiIter, boxed)
-    const imark = cboxShTrail.length
-    if cboxDepth > 0 {
-      cboxShadowPush(n.fiVar)
-      if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
-    }
-    // A boxed for-in variable gets a cell per iteration, seeded from the element.
-    let iseed = -1
-    let iseed2 = -1
-    if cboxDepth == 0 {
-      const iterTy = strLitRecvTy(nodeTyIxOf(n.fiIter))
-      if strListHas(boxed, n.fiVar) {
-        iseed = cboxSeedLet(n.fiVar, ix, -1, forInBindTy(iterTy, false))
-      }
-      if n.fiVar2 != "" && strListHas(boxed, n.fiVar2) {
-        iseed2 = cboxSeedLet(n.fiVar2, ix, -1, forInBindTy(iterTy, true))
-      }
-    }
-    n.fiBody = cboxWalk(n.fiBody, boxed)
-    if iseed2 >= 0 { cboxPrepend(n.fiBody, iseed2) }
-    if iseed >= 0 { cboxPrepend(n.fiBody, iseed) }
-    cboxShadowTrim(imark)
-    return ix
-  }
+  if n is ForRange { return cboxWalkForRange(ix, n, boxed) }
+  if n is ForIn { return cboxWalkForIn(ix, n, boxed) }
   if n is RetStmt {
     n.retArg = cboxWalk(n.retArg, boxed)
     return ix
@@ -3947,6 +3834,138 @@ function cboxWalk(ix: i32, boxed: string[]) {
     }
     return ix
   }
+  return ix
+}
+
+// `cboxWalk`'s name read: a boxed name not shadowed here becomes `c[0]` over its cell, typed
+// for the element questions later phases ask; any other name is `ix` unchanged.
+function cboxWalkIdent(ix: i32, n: Ident, boxed: string[]): i32 {
+  if strListHas(boxed, n.identName) && (cboxShadow[n.identName] ?? 0) == 0 {
+    // The cell `c` carries the type of its list, so an element question about `c[0]` has
+    // the binding's declared type to answer from. A read `c[0]` records the type the name
+    // read had; a store target is typed by the `BinExpr` arm, and a function-typed read
+    // stays untyped for the reassigned-binding signature check (rep-descriptor-campaign §13.23).
+    const cell = mkIdent(cboxCellOf[n.identName] ?? n.identName, -1)
+    if identAuditDrop != IDENT_DROP_CBOX_READ { identFrom(cell, ix) }
+    const cellTy = cboxCellTy[n.identName] ?? -1
+    if cellTy >= 0 { nodeTyRecord(cell, cellTy) }
+    const rd = mkIndex(cell, mkNum("0", -1), -1)
+    const rty = nodeTyIxOf(ix)
+    if (cboxVecCells[n.identName] ?? 0) == 1 {
+      if cboxStoreTarget { return rd }
+      nodeTyRecord(rd, tyArrayElemIx(cellTy))
+      const un = mkAsExpr(rd, "v128", "trap", -1)
+      if rty >= 0 { nodeTyRecord(un, rty) }
+      return un
+    }
+    if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
+    if rd >= 0 && cboxStoreTarget { cboxStoreCells[rd] = 1 }
+    if rd >= 0 && rty >= 0 && !cboxStoreTarget && !(T.tys[rty] is TyFunc) {
+      nodeTyRecord(rd, rty)
+    }
+    return rd
+  }
+  return ix
+}
+
+// `cboxWalk`'s binary operator: renames its join rows, walks both operands with the left
+// flagged as a store target under `=`, and types a boxed left at its cell's element. Returns `ix`.
+function cboxWalkBin(ix: i32, n: BinExpr, boxed: string[]): i32 {
+  cboxRenameJoins(ix, boxed)
+  const leftName = cboxTypedLeftName(n, boxed)
+  cboxStoreTarget = n.binOp == "=" && P.nodes[unwrapParen(n.binLeft)] is Ident
+  n.binLeft = cboxWalk(n.binLeft, boxed)
+  cboxStoreTarget = false
+  n.binRight = cboxWalk(n.binRight, boxed)
+  // The left of a `??` or `=` is typed at the binding's declared type: the coalesce lowers
+  // from its operand's type (a closure may have written the cell since any narrowing), and
+  // an assignment re-reads its target as its value only where that type is the value's.
+  // A literal-union cell stays untyped: its re-read is the atom whatever the member (D2168).
+  if leftName != "" {
+    const elemTy = tyArrayElemIx(cboxCellTy[leftName] ?? -1)
+    if n.binOp == "??" || !tyIsLitUnionOrLit(elemTy) {
+      nodeTyRecord(unwrapParen(n.binLeft), elemTy)
+    }
+  }
+  return ix
+}
+
+// `cboxWalk`'s `if`: renames its join rows and walks the `else if` chain. Returns `ix`.
+function cboxWalkIf(ix: i32, boxed: string[]): i32 {
+  cboxRenameJoins(ix, boxed)
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt {
+      c.ifCond = cboxWalk(c.ifCond, boxed)
+      c.ifThen = cboxWalk(c.ifThen, boxed)
+      if c.ifElse >= 0 {
+        if P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          c.ifElse = cboxWalk(c.ifElse, boxed)
+        }
+      }
+    }
+  }
+  return ix
+}
+
+// `cboxWalk`'s range loop: walks the bounds and body, and gives a boxed range variable a
+// cell per iteration that hands its value back to the counter. Returns `ix`.
+function cboxWalkForRange(ix: i32, n: ForRange, boxed: string[]): i32 {
+  n.frFrom = cboxWalk(n.frFrom, boxed)
+  n.frTo = cboxWalk(n.frTo, boxed)
+  n.frStep = cboxWalk(n.frStep, boxed)
+  const rmark = cboxShTrail.length
+  if cboxDepth > 0 { cboxShadowPush(n.frVar) }
+  // A boxed range variable gets a cell per iteration, seeded from the counter, and hands the
+  // cell's value back to the counter wherever the iteration ends and the loop steps on.
+  let rseed = -1
+  if cboxDepth == 0 && strListHas(boxed, n.frVar) {
+    rseed = cboxSeedLet(n.frVar, ix, -1, TY_I32)
+  }
+  n.frBody = cboxWalk(n.frBody, boxed)
+  if rseed >= 0 {
+    cboxContStoreBack(n.frBody, n.frVar, ix, n.frLabel, 0)
+    const rb = P.nodes[n.frBody]
+    if rb is Block {
+      rb.blkStmts.push(cboxStoreBack(n.frVar, ix))
+      plCacheBust()
+    }
+    cboxPrepend(n.frBody, rseed)
+  }
+  cboxShadowTrim(rmark)
+  return ix
+}
+
+// `cboxWalk`'s for-in loop: walks the iterable and body, and gives each boxed loop variable a
+// cell per iteration seeded from the element. Returns `ix`.
+function cboxWalkForIn(ix: i32, n: ForIn, boxed: string[]): i32 {
+  n.fiIter = cboxWalk(n.fiIter, boxed)
+  const imark = cboxShTrail.length
+  if cboxDepth > 0 {
+    cboxShadowPush(n.fiVar)
+    if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
+  }
+  // A boxed for-in variable gets a cell per iteration, seeded from the element.
+  let iseed = -1
+  let iseed2 = -1
+  if cboxDepth == 0 {
+    const iterTy = strLitRecvTy(nodeTyIxOf(n.fiIter))
+    if strListHas(boxed, n.fiVar) {
+      iseed = cboxSeedLet(n.fiVar, ix, -1, forInBindTy(iterTy, false))
+    }
+    if n.fiVar2 != "" && strListHas(boxed, n.fiVar2) {
+      iseed2 = cboxSeedLet(n.fiVar2, ix, -1, forInBindTy(iterTy, true))
+    }
+  }
+  n.fiBody = cboxWalk(n.fiBody, boxed)
+  if iseed2 >= 0 { cboxPrepend(n.fiBody, iseed2) }
+  if iseed >= 0 { cboxPrepend(n.fiBody, iseed) }
+  cboxShadowTrim(imark)
   return ix
 }
 

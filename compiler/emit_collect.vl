@@ -12543,44 +12543,7 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   const matoms: string[] = []
   splitUnionAtoms(name, matoms)
   if matoms.length >= 2 {
-    let mNonNull = 0
-    let mHasMap = false
-    let mk = 0
-    while mk < matoms.length {
-      const ma = matoms[mk]
-      if ma != "null" {
-        mNonNull = mNonNull + 1
-        // Deliberately `nameIsMapOpen`, not `nameIsMap`: an arm that is a list of maps still opens
-        // `{[`, so it must set this flag or the map-value recursion below swallows the union name.
-        if nameIsMapOpen(ma) { mHasMap = true }
-      }
-      mk = mk + 1
-    }
-    // A single map + `null` is exempt (the nullable map, owned by the nullable machinery); only
-    // a map alongside another non-null member is the box-union shape handled here.
-    if mHasMap && mNonNull >= 2 {
-      // Supported falls through to `isVariantBoxUnion` below; unsupported is a loud fail, never a
-      // silent mis-tag. `matoms` reuses the split this predicate would otherwise redo.
-      if !isVariantBoxUnionAtoms(stmts, matoms) {
-        return emitFail(
-          "emitProgram: a map union member is not supported — use a struct member instead",
-        )
-      }
-    }
-    // A ref-array atom's element union needs registration too, since it is not a standalone
-    // annotation the recursions below would otherwise reach. Non-returning: the outer union
-    // still registers through the dispatch below.
-    let ak = 0
-    while ak < matoms.length {
-      const aa = matoms[ak]
-      if aa != "null" && nameIsArray(aa) {
-        registerInlineUnionAt(stmts, aa, 30, -1)
-      }
-      // A map atom's value union is a separate rep from the map arm (registered via
-      // `isVariantBoxUnion`) and needs registering here too, the sibling of the ref-array recursion above.
-      if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa) }
-      ak = ak + 1
-    }
+    if registerInlineUnionAtoms(stmts, matoms) < 0 { return -1 }
   }
   // A union used only as a collection element (`(C|S)[]`, `{[string]: C|S}`) still needs its
   // inner union registered, or a union appearing only inside a collection is never interned.
@@ -12662,6 +12625,58 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // The atom form again: `matoms` is still `splitUnionAtoms(name)` here — nothing between
   // the split at the top of this function and this line rewrites either `name` or `matoms`.
   if !isVariantBoxUnionAtoms(stmts, matoms) { return 0 }
+  mintInlineUnion(stmts, name, ty)
+}
+
+// `registerInlineUnionAt`'s pass over the atoms of a union of two or more: refuses a map
+// member beside another non-null member that cannot box, and registers each ref-array atom's
+// element union and each map atom's value union. Returns 0, or -1 (via `emitFail`).
+function registerInlineUnionAtoms(stmts: i32[], matoms: string[]): i32 {
+  let mNonNull = 0
+  let mHasMap = false
+  let mk = 0
+  while mk < matoms.length {
+    const ma = matoms[mk]
+    if ma != "null" {
+      mNonNull = mNonNull + 1
+      // Deliberately `nameIsMapOpen`, not `nameIsMap`: an arm that is a list of maps still opens
+      // `{[`, so it must set this flag or the map-value recursion below swallows the union name.
+      if nameIsMapOpen(ma) { mHasMap = true }
+    }
+    mk = mk + 1
+  }
+  // A single map + `null` is exempt (the nullable map, owned by the nullable machinery); only
+  // a map alongside another non-null member is the box-union shape handled here.
+  if mHasMap && mNonNull >= 2 {
+    // Supported falls through to `isVariantBoxUnion` below; unsupported is a loud fail, never a
+    // silent mis-tag. `matoms` reuses the split this predicate would otherwise redo.
+    if !isVariantBoxUnionAtoms(stmts, matoms) {
+      return emitFail(
+        "emitProgram: a map union member is not supported — use a struct member instead",
+      )
+    }
+  }
+  // A ref-array atom's element union needs registration too, since it is not a standalone
+  // annotation the recursions below would otherwise reach. Non-returning: the outer union
+  // still registers through the dispatch below.
+  let ak = 0
+  while ak < matoms.length {
+    const aa = matoms[ak]
+    if aa != "null" && nameIsArray(aa) {
+      registerInlineUnionAt(stmts, aa, 30, -1)
+    }
+    // A map atom's value union is a separate rep from the map arm (registered via
+    // `isVariantBoxUnion`) and needs registering here too, the sibling of the ref-array recursion above.
+    if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa) }
+    ak = ak + 1
+  }
+  0
+}
+
+// `registerInlineUnionAt`'s mint: records `name` as a union row (its arena type from the
+// declaration, else `ty`), its struct variants and their fields, and the value, ref-array and
+// map arms' shapes. Returns 0, or -1 once failed.
+function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   // The arms' field unions must already be registered before this point — an interleaved
   // registration would corrupt this union's variant slice — which the arena-driven walk guarantees.
   uDeclared = true
@@ -12725,6 +12740,20 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // A ref-array arm interns its element shape and reflist slot, the twin of the value-atom
   // marking above; this early call ensures the element struct is in `sNames` before heap assignment.
   markRefArrayArms(name)
+  if registerRefArrayArmUnions(stmts, atoms, atomTys) < 0 { return -1 }
+  // A map arm interns its value shape and forces the shared map heap flags, the map twin of
+  // the ref-array marking; this keeps the inline and named spellings identical.
+  markMapUnionArms(name)
+  0
+}
+
+// `mintInlineUnion`'s ref-array arms: an arm whose element is itself a union of two or more
+// registers that inner union, `atomTys[i]` being atom `i`'s arena row. Returns 0, or -1 once failed.
+function registerRefArrayArmUnions(
+  stmts: i32[],
+  atoms: string[],
+  atomTys: i32[],
+): i32 {
   // A ref-array arm whose element is itself a union registers that inner union too, the
   // arm-position twin of the whole-name `parenUnionArrElemName` recursion above.
   let rai = 0
@@ -12754,9 +12783,6 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
     }
     rai = rai + 1
   }
-  // A map arm interns its value shape and forces the shared map heap flags, the map twin of
-  // the ref-array marking; this keeps the inline and named spellings identical.
-  markMapUnionArms(name)
   0
 }
 
