@@ -6,10 +6,11 @@
 // the bank on and one with it off, and holds every step's diagnostics, wasm and editor symbol
 // rows identical.
 // The pair isolates the bank: any other per-instance state is the same on both sides. The
-// sequences reorder lib.vl's predecessors (graphs A–D of the parse-image suite), then check the
-// compiler's own module graph, edit one module in the middle of it, and check again, so every
-// module after the edit replays at a different offset. The control is the hit count: a run
-// that served nothing from the bank proves nothing.
+// sequences reorder lib.vl's predecessors (graphs A–D of the parse-image suite), then check a
+// slice of the compiler's own module graph, edit one module in the middle of it, and check
+// again, so every module after the edit replays at a different offset. The slice is the closure
+// of five compiler modules, a tenth of the whole graph's cost, and kills every rebase mutant
+// the whole graph killed. The control is the hit count: a run that served nothing proves nothing.
 //
 // GATING: needs the seed.
 
@@ -142,13 +143,14 @@ const GRAPHS: Graph[] = [
   ),
 ];
 
-// The compiler's own graph, read from this tree; `edit` replaces one module's text.
+// A slice of the compiler's own graph, read from this tree; `edit` replaces one module's text.
+// The entry is not a file: it imports a few modules whose closures hold every node kind.
 const compilerGraph = (name: string, edit?: [string, string]): Graph => {
-  const entryKey = `${ROOT}/compiler/entry.vl`;
+  const entryKey = `${ROOT}/compiler/replay_slice.vl`;
   return {
     name,
     entryKey,
-    entry: Deno.readTextFileSync(entryKey),
+    entry: SLICE,
     dep: (k) => {
       if (edit && k === edit[0]) return edit[1];
       try {
@@ -159,6 +161,14 @@ const compilerGraph = (name: string, edit?: [string, string]): Graph => {
     },
   };
 };
+const SLICE = [
+  'import { lintReset } from "./lint"',
+  'import { jwSetGenTokStart } from "./check_sym_occ"',
+  'import { parseReplaySet } from "./parse_bank"',
+  'import { fmtSetSource } from "./format"',
+  'import { optPipeStart } from "./opt_pipe"',
+  "",
+].join("\n");
 const EDITED = `${ROOT}/compiler/listutil.vl`;
 const EDIT: [string, string] = [
   EDITED,
@@ -366,17 +376,17 @@ Deno.test({
 
 Deno.test({
   name:
-    "parse-replay: the compiler's own graph checks the same before and after a one-module edit",
+    "parse-replay: a slice of the compiler's own graph checks the same before and after a one-module edit",
   ignore: !ENABLED,
   fn: () => {
     const orig = compilerGraph("compiler");
     const edited = compilerGraph("compiler, listutil.vl edited", EDIT);
     const { on, off, hits } = agree([[orig, "check"], [edited, "sym"]]);
-    if (hits === 0) {
-      throw new Error("CONTROL — the compiler graph replayed no module");
+    if (hits < 20) {
+      throw new Error(`CONTROL — want at least 20 replayed compiler modules / got ${hits}`);
     }
     console.log(
-      `[parse-replay] compiler graph re-check after an edit: bank on ${
+      `[parse-replay] compiler slice re-check after an edit: bank on ${
         on[1].ms.toFixed(0)
       } ms, off ${off[1].ms.toFixed(0)} ms; ${hits} modules replayed in all`,
     );
