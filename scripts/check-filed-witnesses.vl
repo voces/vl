@@ -6,19 +6,21 @@
 //     vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] <doc-or-dir>...
 //     vl run scripts/check-filed-witnesses.vl -- --self-test
 //
-// Paths resolve against the working directory, so run it from the checkout root. Rows are
-// graded `$JOBS` at a time (default 4) by `xargs -P` over a build of this file, because
-// `runProgram` waits for its child; `mktemp`, `mkdir` and `rm` stand in for the directory
-// operations `std:fs` lacks. Both are `dogfood:` rows in ROADMAP.md.
+// Run it from the checkout root. Rows are graded in chunks of one `vl check --batch` and one
+// `vl run --batch`, `$JOBS` chunks at a time (default 4) by `xargs -P` over a build of this
+// file, and a row the batches leave unanswered is graded alone. `xargs`, `mktemp`, `mkdir`
+// and `rm` stand in for what `std:process` and `std:fs` lack (`dogfood:` rows in ROADMAP.md).
 
 import { IoError, listDir, readFile, readTextFile, writeTextFile } from "std:fs"
 import { exit, runProgram } from "std:process"
 import { getEnv } from "std:env"
 import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
+import { parseJson } from "std:json"
 import { parseI32, toString } from "std:fmt"
 import { endsWith, join, startsWith, toLowerAscii } from "std:str"
 import {
+  JsonMap,
   Proc,
   cpPrefix,
   die,
@@ -54,12 +56,14 @@ import {
   statusJoinContinues,
   stripByte,
 } from "./lib/inventory"
+import { numField, strField } from "./lib/corpus"
 
 const VL = "./scripts/vl-host/target/release/vl"
 const COMPILER = "build/vl-compiler.wasm"
 const SELF = "scripts/check-filed-witnesses.vl"
 const SIDECAR = "build/vl-compiler.wasm.src"
 const REPEAT_MAX: i64 = 50000000
+const CHUNK = 64
 
 // A section of an inventory doc: one `### <ID> — <title>` row and what it filed.
 type Row = {
@@ -296,20 +300,32 @@ function splitFiles(src0: string): string[] {
   out
 }
 
-// Write the files of the repro staged at `dir/repro` beside it, and answer the entry's path.
-function stageWitness(dir: string): string {
+// A witness written out: its entry's path, and its source when it is one file that names
+// no relative path (so a copy under another name compiles the same program), else "".
+type Staged = { entry: string, alone: string }
+
+// Write the files of the repro staged at `dir/repro` beside it.
+function stageWitness(dir: string): Staged {
   const files = splitFiles(readText(dir + "/repro"))
   let k = 0
   while k < files.length {
     writeText(dir + "/" + files[k], files[k + 1])
     k = k + 2
   }
-  dir + "/" + files[files.length - 2]
+  let alone = ""
+  if (
+    files.length == 2
+    && !contains(files[1], "\"./")
+    && !contains(files[1], "\"../")
+  ) {
+    alone = files[1]
+  }
+  { entry: dir + "/" + files[files.length - 2], alone: alone }
 }
 
 // Classify the witness staged in `dir` on the check, run and build channels.
 function classify(dir: string): Ran {
-  const f = stageWitness(dir)
+  const f = stageWitness(dir).entry
   const chk = vl(["check", f, "--compiler", COMPILER])
   if wasKilled(chk) { return timedOut("check") }
   if chk.code != 0 {
@@ -323,6 +339,11 @@ function classify(dir: string): Ran {
     }
     return { outcome: "check_reject", detail: cpPrefix(diag, 200), stdout: "" }
   }
+  classifyRun(dir, f)
+}
+
+// Classify the check-clean entry `f`, staged in `dir`, on the run and build channels.
+function classifyRun(dir: string, f: string): Ran {
   const run = vl(["run", f, "--compiler", COMPILER])
   if wasKilled(run) { return timedOut("run") }
   if run.code == 0 {
@@ -352,12 +373,106 @@ function classify(dir: string): Ran {
   { outcome: "silent_invalid_wasm", detail: detail, stdout: "" }
 }
 
-// Classify `dir`'s witness and leave the answer in three files beside it.
-function gradeDir(dir: string) {
-  const r = classify(dir)
+// Leave `r` for `dir` in three files beside its witness.
+function writeRan(dir: string, r: Ran) {
   writeText(dir + "/outcome", r.outcome)
   writeText(dir + "/detail", r.detail)
   writeText(dir + "/stdout", r.stdout)
+}
+
+// The timeout-bounded `vl` over a whole chunk; a kill or a crash only loses answers.
+function vlBatch(args: string[]): Proc {
+  const full = [timeoutSecs(), VL]
+  for a in args { full.push(a) }
+  spawn("timeout", full)
+}
+
+// The entries `vl check --batch --json` answered exit 0 for, by path.
+function batchClean(entries: string[]): Map<string, boolean> {
+  const clean: Map<string, boolean> = Map()
+  const args = ["check", "--batch", "--json"]
+  for f in entries { args.push(f) }
+  args.push("--compiler")
+  args.push(COMPILER)
+  const p = vlBatch(args)
+  for l in splitLines(p.out) {
+    if stripWs(l) == "" { continue }
+    const j = parseJson(l)
+    if j is JsonMap {
+      if numField(j, "exit") == 0.0 { clean[strField(j, "file")] = true }
+    }
+  }
+  clean
+}
+
+// Grade the witnesses staged in `dirs` as `classify` would, one `vl check --batch` and one
+// `vl run --batch` for the chunk; a row either batch cannot answer as `runs` is graded alone,
+// so a hang, trap or crash in one row moves no other row's grade.
+function gradeChunk(dirs: string[]) {
+  const staged: Staged[] = []
+  const entries: string[] = []
+  for d in dirs {
+    const s = stageWitness(d)
+    staged.push(s)
+    entries.push(s.entry)
+  }
+  const clean = batchClean(entries)
+  const copies: string[] = []
+  const names: string[] = []
+  const at: i32[] = []
+  let k = 0
+  while k < dirs.length {
+    if (clean[entries[k]] ?? false) && staged[k].alone != "" {
+      const name = "cfw-" + toString(k) + ".vl"
+      writeText(dirs[k] + "/" + name, staged[k].alone)
+      copies.push(dirs[k] + "/" + name)
+      names.push(name)
+      at.push(k)
+    }
+    k = k + 1
+  }
+  const got: Map<i32, Ran> = Map()
+  if copies.length > 0 {
+    const od = dirs[0] + "/batch-run"
+    const args = ["run", "--batch", "--out-dir", od]
+    for c in copies { args.push(c) }
+    args.push("--compiler")
+    args.push(COMPILER)
+    const p = vlBatch(args)
+    // A row's `.err` is written before the next row starts, so an answer is whole once a
+    // later row has one, or once the batch exited 0.
+    let later = p.code == 0
+    let i = copies.length - 1
+    while i >= 0 {
+      const o = od + "/" + names[i] + ".out"
+      const have = exists(o)
+      if have && later && !exists(od + "/" + names[i] + ".err") {
+        const bytes = readFile(o)
+        if bytes is u8[] {
+          const out = univNl(decodeUtf8Lossy(bytes))
+          got[at[i]] = {
+            outcome: "runs",
+            detail: cpPrefix(stripWs(out), 200),
+            stdout: out,
+          }
+        }
+      }
+      if have { later = true }
+      i = i - 1
+    }
+  }
+  k = 0
+  while k < dirs.length {
+    const r = got[k]
+    if r != null {
+      writeRan(dirs[k], r)
+    } else if clean[entries[k]] ?? false {
+      writeRan(dirs[k], classifyRun(dirs[k], entries[k]))
+    } else {
+      writeRan(dirs[k], classify(dirs[k]))
+    }
+    k = k + 1
+  }
 }
 
 function readRan(dir: string): Ran {
@@ -397,13 +512,27 @@ function stageAll(root: string, srcs: string[]): string[] {
   dirs
 }
 
-// Grade every staged directory, `jobs` at a time. Serial grading runs in this process;
-// parallel grading builds this file once and lets `xargs -P` fan the directories out one
-// per worker, so a slow witness holds up no neighbour.
+// Grade every staged directory in chunks, `jobs` chunks at a time. Serial grading runs one
+// chunk in this process; parallel grading builds this file once and lets `xargs -P` fan the
+// chunk lists out one per worker.
 function gradeAll(root: string, dirs: string[], jobs: i32) {
   if jobs <= 1 || dirs.length <= 1 {
-    for d in dirs { gradeDir(d) }
+    gradeChunk(dirs)
     return 0
+  }
+  let size = (dirs.length + jobs * 4 - 1) / (jobs * 4)
+  if size > CHUNK { size = CHUNK }
+  const lists: string[] = []
+  let at = 0
+  while at < dirs.length {
+    const part: string[] = []
+    while at < dirs.length && part.length < size {
+      part.push(dirs[at])
+      at = at + 1
+    }
+    const list = root + "/chunk-" + toString(lists.length)
+    writeText(list, join(part, "\n"))
+    lists.push(list)
   }
   const grader = root + "/grader.wasm"
   const b = spawn(VL, ["build", SELF, "--compiler", COMPILER, "-o", grader])
@@ -413,13 +542,13 @@ function gradeAll(root: string, dirs: string[], jobs: i32) {
       1,
     )
   }
-  writeText(root + "/dirs", join(dirs, "\n") + "\n")
+  writeText(root + "/chunks", join(lists, "\n") + "\n")
   const x = spawn(
     "sh",
     fanOutArgv(
-      root + "/dirs",
+      root + "/chunks",
       toString(jobs),
-      [VL, "run", grader, "--", "--grade-dirs"],
+      [VL, "run", grader, "--", "--grade-chunk"],
     ),
   )
   if x.code != 0 {
@@ -1061,10 +1190,10 @@ function selfTest(): i32 {
 // ── the command ─────────────────────────────────────────────────────────────────
 
 function main(args: string[]): i32 {
-  if args.length > 0 && args[0] == "--grade-dirs" {
+  if args.length > 0 && args[0] == "--grade-chunk" {
     let k = 1
     while k < args.length {
-      gradeDir(args[k])
+      gradeChunk(splitLines(readText(args[k])))
       k = k + 1
     }
     return 0
