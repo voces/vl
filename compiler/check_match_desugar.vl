@@ -23,6 +23,9 @@ import {
   arenaReplaceNode,
   mkBinary,
   mkBlock,
+  mkBool,
+  mkCall,
+  mkIdent,
   mkIf,
   mkParen,
 } from "./ast"
@@ -405,10 +408,10 @@ export function matchElseArmOf(pats: i32[], armStart: i32[], armCount: i32[]) {
 }
 
 // Lowers the checked, exhaustive `MatchExpr` at `ix` to an if/else chain, overwriting the
-// arena slot in place, so lint and emit see only if-chains. The wildcard arm (or the last arm)
-// becomes the bare `else`. A zero-arm `match` has no body for that else — `elseArm == -1` traps
-// the compiler on an unbounded read — but the checker has already reported it non-exhaustive, so a type-erroring program never reaches this, where a surviving `MatchExpr` would matter.
-export function desugarMatchAt(ix: i32) {
+// arena slot in place, so lint and emit see only if-chains, and returns the one node it built
+// that the checker has not seen (a lone block arm's `else` trap), or -1. The wildcard arm (or the
+// last arm) becomes the bare `else`; a zero-arm `match` is already reported non-exhaustive.
+export function desugarMatchAt(ix: i32): i32 {
   const n = P.nodes[ix]
   if n is MatchExpr {
     const scrut = n.matchScrut
@@ -422,14 +425,23 @@ export function desugarMatchAt(ix: i32) {
     if nArms > 0 {
       const elseArm = matchElseArmOf(pats, armStart, armCount)
       const elseBinds = matchArmBindsOf(n, elseArm)
-      // A lone arm tests nothing, so its expression body is the value itself (D5711): a bare
-      // block in value position has no tail the emitter reads.
-      if nArms == 1 && elseBinds < 0 {
+      // A lone arm tests nothing, so its body is the value itself (D5711). A block has no
+      // value form of its own, so it becomes `if true { body } else { __trap__() }` (D5713).
+      if nArms == 1 {
         const b = P.nodes[bodies[0]]
-        if !(b is Block) {
+        if elseBinds < 0 && !(b is Block) {
           arenaReplaceNode(ix, mkParen(bodies[0], mpos))
-          return 0
+          return -1
         }
+        const only = matchArmBlockOf(bodies[0], elseBinds)
+        const trap = mkCall(mkIdent("__trap__", mpos), [], mpos)
+        const tl: i32[] = []
+        tl.push(trap)
+        arenaReplaceNode(
+          ix,
+          mkIf(mkBool(1, mpos), only, mkBlock(tl, mpos), mpos),
+        )
+        return trap
       }
       let chain = matchArmBlockOf(bodies[elseArm], elseBinds)
       let k = nArms - 1
@@ -444,7 +456,7 @@ export function desugarMatchAt(ix: i32) {
       arenaReplaceNode(ix, chain)
     }
   }
-  0
+  -1
 }
 
 // The string-literal set operand `x` (typed `ty`) is confined to — a bare literal, a `const`

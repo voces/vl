@@ -13,7 +13,7 @@ import {
   Unary,
 } from "./ast"
 import { inferQuiet } from "./check_cursor"
-import { nodeTyIx, nodeTySet } from "./check_node_tys"
+import { nodeTyIx, nodeTyOf, nodeTySet } from "./check_node_tys"
 import {
   binFloatOperandPair,
   binIntOnlyOp,
@@ -186,6 +186,58 @@ export function floatLitTails(ix: i32): boolean {
 export function f32AdoptingOperand(ix: i32, peerTy: i32): boolean {
   if isF32AdoptingLitExpr(ix) { return true }
   f32LitTailsAdopt(ix, peerTy)
+}
+
+// Whether the `i64` join at `srcExpr` (a `??`, or a value `if`, `match` or block) holds only
+// values `f64` holds exactly: integer literals up to 2^53 and `i32`, `f32` or `f64` values. Such a
+// join is `i64` only because a literal outgrew i32, so it converts into `f64` exactly (D5712).
+export function f64ExactJoinLeaves(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  if (
+    srcTy < 0
+    || dstTy < 0
+    || primNameOf(srcTy) != "i64"
+    || primNameOf(dstTy) != "f64"
+  ) {
+    return false
+  }
+  const lix = parenPeelIx(srcExpr)
+  if lix < 0 { return false }
+  const todo: i32[] = [lix]
+  let n = 0
+  while todo.length > 0 {
+    const at = parenPeelIx(todo.pop())
+    if at < 0 { return false }
+    const e = P.nodes[at]
+    if e is BinExpr && e.binOp == "??" {
+      todo.push(e.binRight)
+      if !f64ExactValue(nonNullTy(nodeTyOf(e.binLeft))) { return false }
+      n = n + 1
+    } else if e is IfStmt || e is MatchExpr || e is Block {
+      const spine: i32[] = []
+      const leaves: i32[] = []
+      valueTailSplit(at, spine, leaves)
+      if leaves.length == 0 { return false }
+      for l in leaves { todo.push(l) }
+    } else if at == lix {
+      return false
+    } else if !isExactF64IntLitExpr(at) && !f64ExactValue(nodeTyOf(at)) {
+      return false
+    } else {
+      n = n + 1
+    }
+  }
+  n > 0
+}
+
+// Whether every value of type `t` is exact in `f64`: an `i32`, `f32` or `f64`.
+function f64ExactValue(t: i32): boolean {
+  if t < 0 { return false }
+  const pn = primNameOf(t)
+  pn == "i32" || pn == "f32" || pn == "f64"
 }
 
 // Types every node of the literal tree at `ix` as `ty`, its literals through `litTreeTy` so a
