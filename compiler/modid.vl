@@ -1,0 +1,109 @@
+// A module's stable id: the `$m<id>` suffix the merge appends to every top-level name a
+// module declares. The id is a hash of the module's normalised key, so it is a function of
+// the module alone — adding an import elsewhere in the graph leaves every other module's
+// names unchanged (incremental-compilation-design.md §3.2). A leaf with no imports.
+
+// Per module table index: its suffix (`$m` + decimal id), and the reverse map from the id's
+// digits to the index. Both empty outside a module compile.
+let midSuffix: string[] = []
+let midIxOfId: {[string]: i32} = Map()
+
+// FNV-1a over the key's bytes, then `salt` more rounds, cut to 31 bits so the id is a
+// non-negative i32 and its decimal digits never carry a sign.
+function midHash(key: string, salt: i32): i32 {
+  let h = -2128831035
+  let i = 0
+  while i < key.length {
+    h = (h ^ key[i]) * 16777619
+    i = i + 1
+  }
+  let k = 0
+  while k < salt {
+    h = (h ^ 35) * 16777619
+    k = k + 1
+  }
+  h & 2147483647
+}
+
+function midDecimal(v: i32): string {
+  if v == 0 { return "0" }
+  const ds = "0123456789"
+  let out = ""
+  let n = v
+  while n > 0 {
+    const d = n % 10
+    out = ds.slice(d, d + 1) + out
+    n = n / 10
+  }
+  out
+}
+
+// Assign every module of one graph its id from `keys` (already normalised, `[0]` the entry).
+// Two keys that hash alike are told apart by salting the one that sorts later until it is
+// unique, so the outcome depends only on the SET of keys, never on their discovery order.
+export function modIdAssign(keys: string[]) {
+  const ids: i32[] = []
+  const salts: i32[] = []
+  let i = 0
+  while i < keys.length {
+    ids.push(midHash(keys[i], 0))
+    salts.push(0)
+    i = i + 1
+  }
+  let moved = true
+  while moved {
+    moved = false
+    let a = 0
+    while a < keys.length {
+      let b = a + 1
+      while b < keys.length {
+        if ids[a] == ids[b] && keys[a] != keys[b] {
+          let late = b
+          if keys[a] > keys[b] { late = a }
+          salts[late] = salts[late] + 1
+          ids[late] = midHash(keys[late], salts[late])
+          moved = true
+        }
+        b = b + 1
+      }
+      a = a + 1
+    }
+  }
+  midSuffix = []
+  midIxOfId = Map()
+  let j = 0
+  while j < keys.length {
+    const digits = midDecimal(ids[j])
+    midSuffix.push("$m" + digits)
+    if midIxOfId[digits] == null { midIxOfId[digits] = j }
+    j = j + 1
+  }
+  0
+}
+
+// Forget the previous graph's ids; a compile with no module table then names module 0 `$m0`.
+export function modIdReset() {
+  midSuffix = []
+  midIxOfId = Map()
+  0
+}
+
+// The merge suffix of module table index `m`. Outside a module compile (a single-file program,
+// whose only module is the entry) it is `$m` + the index itself.
+export function modSuffixOf(m: i32): string {
+  if m >= 0 && m < midSuffix.length { return midSuffix[m] }
+  "$m" + midDecimal(m)
+}
+
+// The module table index whose id is `digits` (the run after `$m`), or -1 when no module of
+// this graph carries it. With no id table the digits are the index, as `modSuffixOf` spells it.
+export function modIxOfId(digits: string): i32 {
+  if midSuffix.length > 0 { return midIxOfId[digits] ?? (-1) }
+  let v = 0
+  let i = 0
+  while i < digits.length {
+    v = v * 10 + (digits[i] - '0')
+    i = i + 1
+  }
+  v
+}

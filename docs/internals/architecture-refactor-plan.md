@@ -25,7 +25,7 @@ restate measurements; follow the links.
 | --- | --- | --- |
 | L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a call receiver `?.` runs once and in source order under `&&`, `||`, a `while` condition and a place assignment, `??` reads an arm-local `if` tail, and a captured join coalesces (D5331, D5332, D5333). Next: D5430 and D5435 (the start frame classifies without the arm locals), D5431 and D5432, the `unc` notes, the scope callers. | [L2 log](#l2-log) |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: D5531 closed; a function returning a generic that its results call at two types gets a `fn_split` copy per result type, and one value called at two types through an identity call takes a slot per type. Next: D5660–D5664, the D5531 spellings still refused; `tyVarOwner` and `fnDeclIx` key a generic by function name, so two nested `inner` generics share an owner (D3927); the (c) literal; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
-| L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. | [L3 log](#l3-log) |
+| L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. Last: `match` over a literal set of one kind runs, a lone literal or an integer set included (D5594, D5710), and a one-arm match with an expression body is a value (D5711). Next: D5712 (an f64 destination for `??` whose default only fits i64), D5713 (a one-arm match with a block body), D5714 (a match over mixed literal kinds). | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
 | L5 one pin driver | C2 **done**; D1 done by L9. Last: D5650 closed, a top-level body checked on demand sees only the module frame. Next: none filed. | [L5 log](#l5-log) |
 | L7 `pending*` into `ExpCtx` | **done**. Last: `classifyStateReset` clears `emit_classify.vl`'s 5, never-cleared 0 of 1,186, and `scripts/emitter-state-audit.vl --check` now fails on any never-cleared emitter mutable (no baseline). Next: none. | [L7 log](#l7-log) |
@@ -311,6 +311,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - C1(c): every built-in arity floor is an internal invariant; `print` arity moved to the checker.
 - Filed D4551–D4553.
 - (d) waits on SC.
+- D5594, D5710, D5711: `checkMatchExprByScrut` decides the arm vocabulary from one set query, `matchLitSetTys`, so a lone literal, a union and a nullable set of one literal kind take the same path; integer sets go to `checkMatchIntArms` with membership, `null` and exhaustiveness checks. A one-arm match lowers to its body. Filed D5712, D5713, D5714 open.
 
 ### L4 log
 
