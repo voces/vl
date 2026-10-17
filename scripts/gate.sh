@@ -276,18 +276,17 @@ run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_t
 run "capability probes"        bash -c "\"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --live-sites --compiler \"$SEED\" && \"$VL\" run scripts/capability-probes.vl --compiler \"$SEED\" -- --floor --compiler \"$SEED\""
 run "conflict markers"        deno test -A --no-check tests/vl_no_conflict_markers_test.ts
 run "splice scan"              bash -c "\"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\" -- --self-test >/dev/null && \"$VL\" run scripts/inventory/splice-scan.vl --compiler \"$SEED\""
-run "distilled corpus"         "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
-
-# ON MASTER ONLY: the committed baseline must describe the committed seed exactly. A branch
-# is SUPPOSED to disagree with it — that disagreement is the change being measured — so this
-# would be nonsense there. On master it is the check that a merge did not forget
-# `--write-baseline`: six cells shipped mis-recorded on 2026-08-31 and the scoreboard, which
-# reads the baseline, under-reported `runs` by six until an agent noticed while diffing its
-# own corpus run.
+# ON MASTER the same run also requires the committed baseline to describe the committed seed
+# exactly (`--verify-fresh`: exit 1 when any cell moved, after the runs-lost check). A branch
+# is SUPPOSED to disagree with it — that disagreement is the change being measured. On master
+# it is the check that a merge did not forget `--write-baseline`: six cells shipped
+# mis-recorded on 2026-08-31 and the scoreboard, which reads the baseline, under-reported
+# `runs` by six until an agent noticed while diffing its own corpus run. One run grades the
+# cells once for both questions.
 if [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "master" ]; then
-  # Its own --json: the `distilled corpus` row runs regress.vl concurrently, and two runs
-  # writing the default `.last.json` read each other's truncated files.
-  run "baseline freshness"     "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm --verify-fresh --json "$LOGS/fresh.json"
+  run "distilled corpus"       "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm --verify-fresh
+else
+  run "distilled corpus"       "$VL" run scripts/silent-sweep/distilled/regress.vl --compiler "$SEED" -- build/vl-compiler.wasm
 fi
 
 FAIL=0
