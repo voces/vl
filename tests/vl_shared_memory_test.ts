@@ -7,7 +7,8 @@
 // and §"std:buffer's allocator over a shared memory" the allocator every instance shares.
 //
 // Gated like the other native suites (binary + seed); the `-O` rows also need binaryen's
-// `wasm-opt` under `node_modules/.bin`. The `vl_` prefix puts it in the ci-native glob.
+// `wasm-opt` (`$VL_BINARYEN`, else `node_modules/.bin`). The `vl_` prefix puts it in the
+// ci-native glob.
 //
 // @test-timing native
 

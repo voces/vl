@@ -131,18 +131,22 @@ for (const [name, pick] of SHAPES) {
       }
     });
   });
-
-  Deno.test({ name: `deep nesting (native): ${FMT_N} levels, ${name}, formats`, ignore: !NATIVE }, async () => {
-    await withFile(gen(levels(pick, FMT_N)), async (file) => {
-      // `--check` answers 0 or 1 (formatted or not); a trap is 70, and a host error is 1 with
-      // an `Error:` report, so the report is read too.
-      const fmt = await vl(["fmt", "--check", file, "--compiler", COMPILER]);
-      if ((fmt.code !== 0 && fmt.code !== 1) || fmt.err.includes("Error")) {
-        throw new Error(`vl fmt --check: want rc 0 or 1 and no error, got ${fmt.code}\n${fmt.err.slice(0, 600)}`);
-      }
-    });
-  });
 }
+
+// One `vl fmt` run covers every shape: this cycle puts each of the nine ordered (parent, child)
+// pairs of the three levels at every depth, and a printer's fault at depth is in one kind or in
+// one pair. The four single-shape runs it replaced each saw one kind and at most one pair.
+const PAIRS: Level[] = ["bare", "bare", "loop", "bare", "if", "loop", "loop", "if", "if"];
+Deno.test({ name: `deep nesting (native): ${FMT_N} levels, every ordered pair, formats`, ignore: !NATIVE }, async () => {
+  await withFile(gen(levels((k) => PAIRS[k % PAIRS.length], FMT_N)), async (file) => {
+    // `--check` answers 0 or 1 (formatted or not); a trap is 70, and a host error is 1 with
+    // an `Error:` report, so the report is read too.
+    const fmt = await vl(["fmt", "--check", file, "--compiler", COMPILER]);
+    if ((fmt.code !== 0 && fmt.code !== 1) || fmt.err.includes("Error")) {
+      throw new Error(`vl fmt --check: want rc 0 or 1 and no error, got ${fmt.code}\n${fmt.err.slice(0, 600)}`);
+    }
+  });
+});
 
 // Where the host cannot reserve the large stack it runs the compiler on its first thread with
 // wasmtime's default wasm stack, so a deep program is the old clean refusal (exit 70), never an

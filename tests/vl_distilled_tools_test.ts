@@ -314,14 +314,9 @@ Deno.test({
           "$1was ",
         );
       await Deno.writeTextFile(`${dir}/red.jsonl`, red);
+      // A lost `runs` cell exits on the regression, before `--verify-fresh` is read.
       want(
-        "a lost runs cell",
-        await regress([seed, "--baseline", `${dir}/red.jsonl`]),
-        1,
-        RED,
-      );
-      want(
-        "a stale --verify-fresh",
+        "a lost runs cell under --verify-fresh",
         await regress([
           seed,
           "--verify-fresh",
@@ -330,6 +325,26 @@ Deno.test({
         ]),
         1,
         RED,
+      );
+      // A moved cell that was not `runs` is no regression, and still a stale baseline.
+      const stale = BASELINE.replace(
+        /("fx_reject", "class": "loud check reject", "msg": ")/,
+        "$1was ",
+      );
+      await Deno.writeTextFile(`${dir}/stale.jsonl`, stale);
+      want(
+        "a stale --verify-fresh",
+        await regress([seed, "--verify-fresh", "--baseline", `${dir}/stale.jsonl`]),
+        1,
+        HEAD +
+          "  runs -> NOT-RUNS  (blocking)    0 classes  (     0 of 1325 census cells)\n" +
+          "  floor -> SILENT  (blocking)     0 classes  (     0 of 1325 census cells)\n" +
+          "  -> silent  (report)             0 classes  (     0 of 1325 census cells)\n" +
+          "  other movement                  1 classes  (     1 of 1325 census cells)\n" +
+          "      fx_reject  loud check reject -> loud check reject   [1 cells]\n\n" +
+          "distilled: STALE BASELINE — 1 cell(s) disagree with this seed. The committed " +
+          "baseline does not describe the committed compiler; re-run with --write-baseline " +
+          "and commit the result.\n",
       );
 
       // The index: a cell with no row, refused, then repaired by `--set`; then an orphan row.

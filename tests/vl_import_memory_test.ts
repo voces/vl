@@ -12,7 +12,8 @@
 // DECISIONS.md §"Linear memory is a layout contract" carries the rationale.
 //
 // Gated like the other native suites (binary + seed); the link tests also need
-// `node_modules/.bin/wasm-merge`. The `vl_` prefix puts it in the ci-native glob.
+// binaryen's `wasm-merge` (`$VL_BINARYEN`, else `node_modules/.bin`). The `vl_` prefix puts
+// it in the ci-native glob.
 //
 // @test-timing native
 
