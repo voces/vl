@@ -56,6 +56,7 @@ import {
   fsbName,
   fsbOwnDecl,
   fsbOwnFn,
+  fsbOwnRhs,
   fsbOwnTy,
   nolNoteDelivery,
 } from "./check_bind_rows"
@@ -298,6 +299,7 @@ import {
   TyNullable,
   TyObj,
   TyUnion,
+  mkFuncTy,
   nwTyIxs,
   objFieldType,
   tyArrayElemIx,
@@ -362,13 +364,50 @@ export function fsbNoteCall(
   fsbRecheckFrom(fsbCallIx.length - 1)
 }
 
+// Each write `rhs` of the function type `rt`, rewritten into an adapter at call `c`'s argument
+// types when a parameter it fixes takes another rep than the argument there (D4892).
+function fsbAdaptWrites(c: i32, rt: i32, nm: string[], ty: i32[], rhs: i32[]) {
+  const f = T.tys[rt]
+  if !(f is TyFunc) || f.fnRet < 0 { return 0 }
+  const args = fsbCallArgTys[c]
+  if args.length != f.fnParamTypes.length { return 0 }
+  let fixed = false
+  let j = 0
+  while j < args.length {
+    const p = f.fnParamTypes[j]
+    if p >= 0 && args[j] >= 0 && !tyHasTyVar(p) && p != widenLitTy(args[j]) {
+      fixed = true
+    }
+    j = j + 1
+  }
+  if !fixed { return 0 }
+  const sps: i32[] = []
+  const dps: i32[] = []
+  let i = 0
+  while i < args.length {
+    const sp = substTyDeep(f.fnParamTypes[i], nm, ty)
+    if sp < 0 || args[i] < 0 { return 0 }
+    sps.push(sp)
+    dps.push(widenLitTy(args[i]))
+    i = i + 1
+  }
+  const ret = substTyDeep(f.fnRet, nm, ty)
+  const src = mkFuncTy(sps, ret)
+  const dst = mkFuncTy(dps, ret)
+  if tyHasTyVar(dst) || tyReachesHole(dst, 8) || !fvaFnMayDiffer(src, dst, 8) {
+    return 0
+  }
+  for r in rhs { fvaAdapt(r, rt, dst) }
+  0
+}
+
 // Re-ask, at call `c`, each owner row recorded since it last asked.
 export function fsbRecheckFrom(c: i32) {
   if c < 0 || c >= fsbCallOwnN.length { return 0 }
   let w = fsbCallOwnN[c]
   while w < fsbOwnDecl.length {
     if fsbOwnDecl[w] == fsbCallDecl[c] {
-      fsbRecheckOne(c, fsbOwnFn[w], fsbOwnTy[w])
+      fsbRecheckOne(c, fsbOwnFn[w], fsbOwnTy[w], fsbOwnRhs[w])
     }
     w = w + 1
   }
@@ -379,12 +418,13 @@ export function fsbRecheckFrom(c: i32) {
 // One call `c` re-asks owner `o`'s constraints with each type-variable parameter of the written
 // function type `rt` bound, by position, to the argument the call passes there. Only the written
 // function's own parameters are bound: the seed's type variables name another declaration's.
-function fsbRecheckOne(c: i32, o: i32, rt: i32) {
+function fsbRecheckOne(c: i32, o: i32, rt: i32, rhs: i32[]) {
   const nm: string[] = []
   const ty: i32[] = []
   const added = fsbBindParams(rt, fsbCallArgTys[c], nm, ty)
   if added == 0 || o == fsbCallUsed[c] { return 0 }
   if !fsbArgsFit(c, rt, nm, ty) { return 0 }
+  fsbAdaptWrites(c, rt, nm, ty, rhs)
   const modeWas = substNestMode
   const declWas = substNestDecl
   substNestModeSet(SUBST_ALL)
