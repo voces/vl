@@ -25534,6 +25534,87 @@ function emitPopOr(body: u8[], popIx: i32, defIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected a list .pop call")
 }
 
+// Writes into `src` the source list types for receiver kind `recvK` at `recvIx`; `src` arrives
+// holding the i32 list's. `srcElemRef` is whether an element needs `ref.as_non_null` after
+// `array.get`, which a nullable-niche element does not. Returns -1 on a failure, else 0.
+function mfSrcTysOf(recvK: MfKind, recvIx: i32, fnIx: i32, src: MfSrcTys) {
+  const srcElemNul = listElemStaysNullable(recvIx, fnIx)
+  if recvK == "f64" {
+    if !fa64Used {
+      return emitFail(
+        "emitProgram: .map/.filter over f64[] but f64 list type not collected",
+      )
+    }
+    src.srcWrap = fl64TypeIdx
+    src.srcBack = fa64TypeIdx
+  } else if recvK == "i64" {
+    if !ia64Used {
+      return emitFail(
+        "emitProgram: .map/.filter over i64[] but i64 list type not collected",
+      )
+    }
+    src.srcWrap = il64TypeIdx
+    src.srcBack = ia64TypeIdx
+  } else if recvK == "f32" {
+    if !fa32Used {
+      return emitFail(
+        "emitProgram: .map/.filter over f32[] but f32 list type not collected",
+      )
+    }
+    src.srcWrap = fl32TypeIdx
+    src.srcBack = fa32TypeIdx
+  } else if recvK == "ref" {
+    if !rlUsed {
+      return emitFail(
+        "emitProgram: .map/.filter over a ref list but ref list type not collected",
+      )
+    }
+    const srcSlot = refListSlotOfExpr(recvIx, fnIx)
+    if srcSlot < 0 { return refListRowRefused(recvIx) }
+    src.srcSlot = srcSlot
+    src.srcWrap = rlWrapIdx[srcSlot]
+    src.srcBack = rlBackIdx[srcSlot]
+    src.srcElemRef = !srcElemNul
+  } else if recvK == "str" {
+    // A STRING list: wrapper `$mkListIdx`, backing `$mkArrIdx` (the array of string
+    // refs). The element is itself a ref (an `array i32` of code points), so it needs
+    // `ref.as_non_null` after `array.get`, exactly like a ref-list element — unless the
+    // element is the `(string | null)[]` niche, which keeps the nullable read.
+    if !slUsed {
+      return emitFail(
+        "emitProgram: .map/.filter over string[] but string list type not collected",
+      )
+    }
+    src.srcWrap = mkListIdx
+    src.srcBack = mkArrIdx
+    src.srcElemRef = !srcElemNul
+  } else if recvK == "u8" {
+    // the packed byte source, from `mfRecvKindOf`'s `"u8"` rung (D1141). No
+    // `u8[].map`/`.filter` reaches here yet — a `u8` callback parameter is refused one
+    // stage earlier — so this arm buys no cell today, but avoids silently minting the
+    // 4-byte backing the moment the parameter gap closes.
+    if !ba8Used {
+      return emitFail(
+        "emitProgram: .map/.filter over u8[] but the packed byte list type not collected",
+      )
+    }
+    src.srcWrap = bl8TypeIdx
+    src.srcBack = ba8TypeIdx
+  } else if !lUsed || !aUsed {
+    return emitFail("emitProgram: .map/.filter but list type not collected")
+  }
+  0
+}
+
+// The wrapper and backing heap types of a `.map`/`.filter` source list, its ref-list row
+// (-1 for a non-ref list), and whether its element is read as a non-null ref.
+type MfSrcTys = {
+  srcWrap: i32,
+  srcBack: i32,
+  srcElemRef: boolean,
+  srcSlot: i32,
+}
+
 function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
@@ -25575,77 +25656,17 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
           "emitProgram: .map/.filter callback signature is not interned",
         )
       }
-      // The SOURCE wrapper/backing heap types (+ whether the element is a ref that
-      // needs `ref.as_non_null` after `array.get` — a nullable-NICHE element does NOT:
-      // see `listElemStaysNullable`, which the indexed read asks for the same reason).
-      const srcElemNul = listElemStaysNullable(callee.memObj, fnIx)
-      let srcWrap = lTypeIdx
-      let srcBack = aTypeIdx
-      let srcElemRef = false
-      let srcSlot = -1
-      if recvK == "f64" {
-        if !fa64Used {
-          return emitFail(
-            "emitProgram: .map/.filter over f64[] but f64 list type not collected",
-          )
-        }
-        srcWrap = fl64TypeIdx
-        srcBack = fa64TypeIdx
-      } else if recvK == "i64" {
-        if !ia64Used {
-          return emitFail(
-            "emitProgram: .map/.filter over i64[] but i64 list type not collected",
-          )
-        }
-        srcWrap = il64TypeIdx
-        srcBack = ia64TypeIdx
-      } else if recvK == "f32" {
-        if !fa32Used {
-          return emitFail(
-            "emitProgram: .map/.filter over f32[] but f32 list type not collected",
-          )
-        }
-        srcWrap = fl32TypeIdx
-        srcBack = fa32TypeIdx
-      } else if recvK == "ref" {
-        if !rlUsed {
-          return emitFail(
-            "emitProgram: .map/.filter over a ref list but ref list type not collected",
-          )
-        }
-        srcSlot = refListSlotOfExpr(callee.memObj, fnIx)
-        if srcSlot < 0 { return refListRowRefused(callee.memObj) }
-        srcWrap = rlWrapIdx[srcSlot]
-        srcBack = rlBackIdx[srcSlot]
-        srcElemRef = !srcElemNul
-      } else if recvK == "str" {
-        // A STRING list: wrapper `$mkListIdx`, backing `$mkArrIdx` (the array of string
-        // refs). The element is itself a ref (an `array i32` of code points), so it needs
-        // `ref.as_non_null` after `array.get`, exactly like a ref-list element — unless the
-        // element is the `(string | null)[]` niche, which keeps the nullable read.
-        if !slUsed {
-          return emitFail(
-            "emitProgram: .map/.filter over string[] but string list type not collected",
-          )
-        }
-        srcWrap = mkListIdx
-        srcBack = mkArrIdx
-        srcElemRef = !srcElemNul
-      } else if recvK == "u8" {
-        // the packed byte source, from `mfRecvKindOf`'s `"u8"` rung (D1141). No
-        // `u8[].map`/`.filter` reaches here yet — a `u8` callback parameter is refused one
-        // stage earlier — so this arm buys no cell today, but avoids silently minting the
-        // 4-byte backing the moment the parameter gap closes.
-        if !ba8Used {
-          return emitFail(
-            "emitProgram: .map/.filter over u8[] but the packed byte list type not collected",
-          )
-        }
-        srcWrap = bl8TypeIdx
-        srcBack = ba8TypeIdx
-      } else if !lUsed || !aUsed {
-        return emitFail("emitProgram: .map/.filter but list type not collected")
+      const src: MfSrcTys = {
+        srcWrap: lTypeIdx,
+        srcBack: aTypeIdx,
+        srcElemRef: false,
+        srcSlot: -1,
       }
+      if mfSrcTysOf(recvK, callee.memObj, fnIx, src) < 0 { return -1 }
+      const srcWrap = src.srcWrap
+      const srcBack = src.srcBack
+      const srcElemRef = src.srcElemRef
+      const srcSlot = src.srcSlot
       // The RESULT wrapper/backing heap types.
       const dst: MfDstTys = { dstWrap: lTypeIdx, dstBack: aTypeIdx }
       if mfDstTysOf(resK, dstSlot, callIx, dst) < 0 { return -1 }
