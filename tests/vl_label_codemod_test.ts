@@ -80,6 +80,11 @@ const CASES: [string, string, string][] = [
     "function h() {\n@C {}\nn = 5\n}\nfunction k() {\n  @C { n }\n  n = 5\n}\nfunction obj() { a: { b }\n}\n",
   ],
   [
+    "a named argument whose object opens with a shorthand field is left alone",
+    "function g(id: i32, n: i32) { show(r: { id, n }) }\n",
+    "function g(id: i32, n: i32) { show(r: { id, n }) }\n",
+  ],
+  [
     "comments and strings are left alone, holes are code",
     '// B: { break :B }\nconst s = "L: while { break :L }"\nprint("\\{X: { 1 }}")\n',
     '// B: { break :B }\nconst s = "L: while { break :L }"\nprint("\\{@X { 1 }}")\n',
@@ -92,33 +97,50 @@ if (GATED && !ENABLED) {
   console.warn("[vl-label-codemod] skipped — missing vl binary or seed wasm.");
 }
 
-async function migrate(file: string): Promise<string> {
-  const { code, stdout } = await new Deno.Command(VL, {
-    args: ["run", SCRIPT, "--", file],
+const vl = async (args: string[]): Promise<void> => {
+  const { code, stdout, stderr } = await new Deno.Command(VL, {
+    args,
     stdout: "piped",
     stderr: "piped",
     env: nativeEnv({ NO_COLOR: "1" }),
   }).output();
-  if (code !== 0 && code !== 1) throw new Error(`codemod rc ${code}: ${new TextDecoder().decode(stdout)}`);
-  return Deno.readTextFile(file);
-}
+  const dec = new TextDecoder();
+  if (code !== 0 && code !== 1) {
+    throw new Error(`vl ${args[0]} rc ${code}: ${dec.decode(stdout)}${dec.decode(stderr)}`);
+  }
+};
 
-for (const [name, before, want] of CASES) {
+// Every case is a file of one tree: the codemod is built once and run twice over the tree, and
+// each case's test reads its own file after each run.
+let migrated: Promise<{ once: string[]; twice: string[] }> | undefined;
+const migrateAll = (): Promise<{ once: string[]; twice: string[] }> => {
+  migrated ??= (async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_label_at_" });
+    try {
+      const files = CASES.map((_, i) => `${dir}/m${i}.vl`);
+      for (const [i, [, before]] of CASES.entries()) await Deno.writeTextFile(files[i], before);
+      await vl(["build", SCRIPT, "-o", `${dir}/label-at.wasm`]);
+      const pass = async () => {
+        await vl(["run", `${dir}/label-at.wasm`, "--", ...files]);
+        return Promise.all(files.map((f) => Deno.readTextFile(f)));
+      };
+      const once = await pass();
+      return { once, twice: await pass() };
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  })();
+  return migrated;
+};
+
+for (const [i, [name, , want]] of CASES.entries()) {
   Deno.test({
     name: `label-at codemod: ${name}`,
     ignore: !ENABLED,
     fn: async () => {
-      const dir = await Deno.makeTempDir({ prefix: "vl_label_at_" });
-      try {
-        const file = `${dir}/m.vl`;
-        await Deno.writeTextFile(file, before);
-        const got = await migrate(file);
-        if (got !== want) throw new Error(`want:\n${want}\n---\ngot:\n${got}`);
-        const again = await migrate(file);
-        if (again !== want) throw new Error(`a second run changed it:\n${again}`);
-      } finally {
-        await Deno.remove(dir, { recursive: true });
-      }
+      const { once, twice } = await migrateAll();
+      if (once[i] !== want) throw new Error(`want:\n${want}\n---\ngot:\n${once[i]}`);
+      if (twice[i] !== want) throw new Error(`a second run changed it:\n${twice[i]}`);
     },
   });
 }
