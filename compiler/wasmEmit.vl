@@ -13198,6 +13198,10 @@ function emitMapSetValExpr(
       return 0
     }
     svCtx.litUnion = 1
+    // A nullable value can only reach the nullable-atom map, whose null is the `-1` (D5330).
+    if nodeTyIsNulLitUnion(valIx) || nodeTyIsNulString(valIx) {
+      svCtx.nulLitUnion = true
+    }
   }
   // A `boolean | null`-valued MONO map (i32 niche) stores a bare `null` as the `2` sentinel —
   // the store-side dual of the read's `mapTyValIsNulBool` coalesce (sentinel 2). A non-null
@@ -18698,7 +18702,7 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
   let rslot = -1
   if ifChainAllBareNull(ifIx) || nodeTyIsNullType(ifIx) {
     how = 1
-  } else if ifJoinTypedAtom(ifIx) {
+  } else if ifJoinTypedAtom(ifIx) || nulStrJoinTakesAtom(ifIx, fnIx) {
     // An atom join lowers every arm in the atom context, whatever rep the arm has alone (D2206).
     how = 2
   } else {
@@ -18735,6 +18739,38 @@ function emitIfExpr(body: u8[], ifIx: i32, fnIx: i32) {
   if how == 3 { return emitUnionIfValue(body, iun, ifIx, fnIx) }
   if rk != null { return emitIfExprRef(body, ifIx, fnIx, rk, rslot) }
   emitIfExprAs(body, ifIx, fnIx, vt)
+}
+
+// Whether the `if` join at `ifIx`, typed `string | null` or `K | null`, is delivered where a
+// `K | null` atom is seeded and every leaf is `null`, a string literal or literal-union typed,
+// so each arm lowers in the atom context, as a return does (D5330).
+function nulStrJoinTakesAtom(ifIx: i32, fnIx: i32): boolean {
+  if !expCtxHere().nulLitUnion { return false }
+  if !nodeTyIsNulString(ifIx) && !nodeTyIsNulLitUnion(ifIx) { return false }
+  ifJoinLeavesAtomic(ifIx, fnIx)
+}
+
+// Whether every arm value along the `if` chain at `ix`, which has an `else`, is `null`, a string
+// literal, or a value of literal-union type.
+function ifJoinLeavesAtomic(ix: i32, fnIx: i32): boolean {
+  if !ifJoinNarrowsPerArm(ix) { return false }
+  const s = P.nodes[ix]
+  if s is IfStmt {
+    if s.ifElse < 0 || !atomicJoinLeaf(ifArmValueExpr(s.ifThen), fnIx) {
+      return false
+    }
+    if P.nodes[s.ifElse] is IfStmt { return ifJoinLeavesAtomic(s.ifElse, fnIx) }
+    return atomicJoinLeaf(ifArmValueExpr(s.ifElse), fnIx)
+  }
+  false
+}
+
+// Whether arm value `ix` is `null`, a string literal, or of literal-union type.
+function atomicJoinLeaf(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 { return false }
+  if exprIsNullLike(u) || P.nodes[u] is StrLit { return true }
+  exprIsLitAtom(u, fnIx) || strReppedLitUnionAt(u, fnIx)
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -18996,6 +19032,7 @@ function emitIfExprRefLink(
 function emitIfArmOpen(body: u8[], blockIx: i32, fnIx: i32) {
   scopePush()
   armNarrowTops.push(narrowTop)
+  armSeedCtxs.push(expCtxHere())
   const b = P.nodes[blockIx]
   if b is Block {
     const stmts = b.blkStmts
@@ -19043,12 +19080,30 @@ function emitIfArmClose(rc: i32) {
     restoreNarrow(armNarrowTops[armNarrowTops.length - 1])
     armNarrowTops.pop()
   }
+  if armSeedCtxs.length > 0 {
+    armSeedRestore(armSeedCtxs[armSeedCtxs.length - 1])
+    armSeedCtxs.pop()
+  }
   rc
 }
 
 // The narrowing depth at each open arm, restored at its close: a prelude's pushes end with the
 // arm, while a retirement it made in place outlives it.
 const armNarrowTops: i32[] = []
+
+// The ambient seeds at each open arm. A seed the arm set for its own value ends with the arm,
+// so a later literal outside the if does not build at the join's rep (D5370).
+const armSeedCtxs: ExpCtx[] = []
+
+// Put back the list build the arm opened under, and a record seed the arm set and left
+// unconsumed; a record seed the arm consumed stays consumed.
+function armSeedRestore(at: ExpCtx) {
+  expCtxSetListBuild(at.listKind, at.listSlot)
+  if pendingStructIdx >= 0 && pendingStructIdx != at.structIdx {
+    expCtxSetStruct(at.structIdx)
+  }
+  0
+}
 
 // The `emitFail` reason for an if-expression arm with no value on the stack: an empty arm
 // (no value expression at all), a void call (a well-formed expression yielding nothing), or
@@ -27311,6 +27366,204 @@ function emitReturnBoundaryWidens(
   0
 }
 
+// What a function's result asks of its `return` values: the numeric widens, the variant and
+// union-box targets, the niche and map seeds, and the literal-union atom forms.
+type RetFlags = {
+  retF32: boolean,
+  retF64: boolean,
+  retI64: boolean,
+  retNulBool: boolean,
+  retNulString: boolean,
+  retNulClosure: boolean,
+  retNulList: boolean,
+  retNulRefArr: boolean,
+  retNulRefArrHeap: i32,
+  // `{[string]: V} | null`: a `return null` is `ref.null` of this map shape's struct.
+  retNulMap: boolean,
+  retNulMapShape: i32,
+  // `{[string]: V}`: a `return Map()` builds this shape's `$mapStruct`, not the mono one.
+  retMap: boolean,
+  retMapShape: i32,
+  retNulSLKind: VKind | null,
+  retLitUnion: boolean,
+  retNulLitUnion: boolean,
+  // A literal-union atom returned as `string` widens to its member text.
+  retStrWiden: boolean,
+  retUNm: string,
+  retVi: i32,
+  retInferred: boolean,
+}
+
+// Seed `rf`'s variant index, numeric widens and union-box name from `fn`'s result, annotated
+// or inferred. Returns -1 after refusing an inferred `f32[]` return, else 0.
+function retFlagsSeedResult(
+  fn: FuncDecl,
+  retArg: i32,
+  fnIx: i32,
+  fnPos: i32,
+  rf: RetFlags,
+): i32 {
+  rf.retInferred = fn.fnRet < 0
+  // A concrete-variant return (annotated `: Cat`, or a collapsed inferred lambda).
+  if retVariantFlag(fn.fnRet) == 1 {
+    rf.retVi = variantIndexOf(tyNameOf(fn.fnRet))
+  }
+  // Every value an inferred arm return delivers, a join included, goes through
+  // `emitVariantCoerce`, not only the literal the seed above reaches (D4639).
+  if fn.fnRet < 0 {
+    const rvi2 = inferredRetVariantIdx(fnPos)
+    if rvi2 >= 0 { rf.retVi = rvi2 }
+  }
+  if retF32Flag(fn.fnRet) == 1 { rf.retF32 = true }
+  if retF64Flag(fn.fnRet) == 1 { rf.retF64 = true }
+  if retI64Flag(fn.fnRet) == 1 { rf.retI64 = true }
+  // An UN-annotated return INFERRED as i64/f64 (the stored kind the A20 pass fills) widens
+  // its value too — without this a `return 0` (an i32 literal) in a function whose other
+  // branch returns a big i64 / an f64 expression stays `i32.const`, clashing with the i64/f64
+  // functype result the inferred-return path declares (a soundness hole the checker accepts).
+  if fn.fnRet < 0 {
+    const rfe = fnPos
+    if rfe >= 0 {
+      if fRetKind[rfe] == "i64" { rf.retI64 = true }
+      if fRetKind[rfe] == "f64" { rf.retF64 = true }
+      // the f32 dual: an inferred f32 return whose body carries a float literal emits f64
+      // unless forced, clashing with the f32 functype result (#614); a bare f32 `return x` needs no coercion.
+      if fRetKind[rfe] == "f32" { rf.retF32 = true }
+      // an inferred `f32[]` return has no producer, so the functype result stays at the
+      // `"i32"` default while the emitted `return` pushes the f32 list's `(ref $array)` —
+      // check-clean invalid wasm. Neither channel that fills the slot classifies this
+      // shape; refuse loudly until it does. The annotated spelling already lowers.
+      if fRetKind[rfe] == "i32" && exprF32Array(retArg, fnIx) {
+        return emitFail(
+          "emitProgram: an f32[] return must be annotated (`: f32[]`) — the inferred form has no result type",
+        )
+      }
+    }
+  }
+  // a literal-union return reads as a union name but is an i32 atom — excluded from the
+  // value-union box return, since `emitUnionBoxArg` would `struct.new` the member. A
+  // nullable-closure return is the closure niche, not a value box, routed through
+  // `retNulClosure` in `retFlagsSeedNiches`; a nullable literal union is excluded on the same grounds.
+  if retUnionFlag(fn.fnRet) == 1 {
+    if (
+      !nodeTyIsLitUnionAlias(fn.fnRet)
+      && !nodeTyIsNulLitUnion(fn.fnRet)
+      && nulCloFlag(fn.fnRet) != 1
+    ) {
+      rf.retUNm = tyNameOf(fn.fnRet)
+    }
+  }
+  if fn.fnRet < 0 {
+    const im = inferRetNameOf(inferRetFnKey(fnIx, fn.fnName))
+    // a value union or registered struct-union inferred return is a union-box return
+    // (kind 4): box each concrete-variant/value-atom `return` via `retUNm`. A litunion
+    // alias name is excluded on the same grounds as the annotated arm above — it
+    // registers as a union name but its value is the interned i32 atom, so boxing it would be wrong.
+    if (
+      isValueUnionName(im)
+      || (isUNameAB(26, im, inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName)))
+        && !nameIsLitUnionType(im))
+    ) {
+      rf.retUNm = im
+    }
+    // The inferred twins of the `nodeTyIsLitUnionAlias` / `nodeTyIsNulLitUnion` seeds
+    // below: an un-annotated litunion return encodes a member literal as its atom id,
+    // and its `| null` niche encodes a bare `null` as the `-1` sentinel.
+    if nameIsLitUnionType(im) { rf.retLitUnion = true }
+    if nameIsNulLitUnion(im) { rf.retNulLitUnion = true }
+  }
+  0
+}
+
+// Seed `rf`'s niche, map, literal-union and string-widen flags from `fn`'s result; clears
+// `ctx.variantIdx` when a concrete-variant target builds the value itself.
+function retFlagsSeedNiches(
+  fn: FuncDecl,
+  retArg: i32,
+  fnIx: i32,
+  fnPos: i32,
+  ctx: ExpCtx,
+  rf: RetFlags,
+) {
+  // A CONCRETE-variant return (`: Cat`, or a collapsed-to-one-variant inferred lambda):
+  // route the value through `emitVariantCoerce` so a mixed-rep value-`if` (a narrowed
+  // union arm + a literal arm) lands in ONE variant rep. Overrides the `pendingVariantIdx`
+  // literal seeding above — `emitVariantCoerce` builds the literal itself.
+  if rf.retVi >= 0 { ctx.variantIdx = -1 }
+  if tyIsNulBool(fn.fnRet) { rf.retNulBool = true }
+  if retNulStringFlag(fn.fnRet) == 1 { rf.retNulString = true }
+  // A nullable-closure return (`((i32) => i32) | null`, kind 19): a `return null` lowers
+  // as `ref.null $cloStruct` (the niche), a function value passes through as the fat
+  // pointer widened to the nullable storage — the return analogue of the kind-22 field.
+  if nulCloFlag(fn.fnRet) == 1 { rf.retNulClosure = true }
+  if retNulListFlag(fn.fnRet) == 1 { rf.retNulList = true }
+  // A nullable ref-array return (`<ref-array> | null`, kind 18): a `return [x]` builds the ref
+  // list (which subtypes the nullable wrapper), a `return null` is `ref.null $wrapper` — seed the
+  // inner wrapper heap so the bare-`null` return path types it.
+  if retNulRefArrFlag(fn.fnRet) == 1 {
+    rf.retNulRefArr = true
+    const rlsRet = tyAnnRefListSlot(fn.fnRet)
+    if rlsRet >= 0 && rlsRet < rlWrapIdx.length {
+      rf.retNulRefArrHeap = rlWrapIdx[rlsRet]
+    }
+  }
+  if retNulMapFlag(fn.fnRet) == 1 {
+    rf.retNulMap = true
+    rf.retNulMapShape = mapAnnShape(fn.fnRet)
+  }
+  if retMapFlag(fn.fnRet) == 1 {
+    rf.retMap = true
+    rf.retMapShape = mapAnnShape(fn.fnRet)
+  }
+  // the inferred dual of the arm above: an un-annotated map return (`function mk() {
+  // return Map() }`) has no annotation for `retMapFlag` to read, so a bare `Map()` would
+  // build the mono struct while the functype declares the value-typed one. The shape
+  // comes from the same chokepoint the result valtype does (`mapRetExprShape`).
+  if fn.fnRet < 0 && fnPos >= 0 {
+    if fRetKind[fnPos] == "map" {
+      const imrx = fnRetExprOf(fnIx)
+      if imrx >= 0 {
+        rf.retMap = true
+        rf.retMapShape = mapRetExprShape(imrx, fnPos)
+      }
+    }
+  }
+  rf.retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
+  if nodeTyIsLitUnionAlias(fn.fnRet) { rf.retLitUnion = true }
+  // A synthesized `: K` (a lambda pinned at its alias) is typed at the alias's copy, which
+  // the index test above misses and the provenance-reading one does not (D3120).
+  if fn.fnRet >= 0 && tyIsLitUnion(nodeTyIxOf(fn.fnRet)) {
+    rf.retLitUnion = true
+  }
+  // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
+  // as its atom id — so seed BOTH the niche flag and `pendingLitUnion`.
+  if nodeTyIsNulLitUnion(fn.fnRet) { rf.retNulLitUnion = true }
+  rf.retStrWiden = retStrWidenOf(fn, retArg, fnIx, fnPos)
+  // An atom result keeps an atom value: a synthesized `: K` also reads as `string` to the
+  // spelling tests above, which would widen the value the result holds as its id (D3160).
+  if rf.retLitUnion && !retKindIsStr(fnPos) { rf.retStrWiden = false }
+  // an inferred return whose value is an atom is left as an atom, and the call site
+  // widens it (`fRetLitAtom`, from `criClassify`) — one flag, read by both passes.
+  // Inferred niche nullable: seed from the A20 name so a `return null`/`return
+  // <bool|string>` lowers as the sentinel/`ref.null` rep.
+  if fn.fnRet < 0 {
+    const nn = inferNicheNullByName(inferRetFnKey(fnIx, fn.fnName))
+    if nn == "boolean|null" { rf.retNulBool = true }
+    if nn == "string|null" { rf.retNulString = true }
+  }
+  // An implicit-return ASSIGNMENT to a `string | null` cell: the re-read this return
+  // value IS must keep the RAW nullable ref, because the result valtype the functype
+  // declares for it is `(ref null $sTypeIdx)`. Same fact, same function.
+  if fn.fnRet < 0 && fnPos >= 0 {
+    if fnAssignRetKind(fnPos) == "nulstr" { rf.retNulString = true }
+  }
+  // The inferred `string | null` twin of the `cloRetIsString` widen: an atom arm of a join
+  // the checker typed `string | null` widens to its member text, `null` for the niche (D3336).
+  if fn.fnRet < 0 && rf.retNulString && !rf.retLitUnion && !rf.retNulLitUnion {
+    if exprIsLitAtom(retArg, fnIx) { rf.retStrWiden = true }
+  }
+}
+
 // `emitReturnValue` past its seeds: classify the result of `fn` into the return's widen and
 // niche flags, emit `retArg` under `ctx` through the arm they pick, then the list widenings
 // and the narrowed-arm unbox to `retArmHeap`. Restores the caller's context; returns 0 or -1.
@@ -27325,201 +27578,58 @@ function emitReturnValueTail(
   retSLKind: VKind | null,
 ): i32 {
   const fn = P.nodes[fnIx]
-  let retF32 = false
-  let retF64 = false
-  let retI64 = false
-  let retNulBool = false
-  let retNulString = false
-  let retNulClosure = false
-  let retNulList = false
-  let retNulRefArr = false
-  let retNulRefArrHeap = -1
-  // A NULLABLE map return (`{[string]: V} | null`, kind `nulmap`): a `return m` passes the map ref
-  // (which subtypes the nullable result), a `return null` is `ref.null $mapStruct`. `retNulMapShape`
-  // is the map SHAPE (for the null heap + a `return Map()`).
-  let retNulMap = false
-  let retNulMapShape = -1
-  // A non-null map return (`{[string]: V}`, kind 6): a `return Map()` must `struct.new` THIS
-  // value type's `$mapStruct`, not the shared mono one — `retMapShape` carries the annotation's
-  // map SHAPE for the constructor, the bare-map twin of `retNulMapShape`. (`return m` passes an
-  // already-built map ref and needs no seed, which is why only the DIRECT constructor is at risk.)
-  let retMap = false
-  let retMapShape = -1
-  let retNulSLKind: VKind | null = null
-  let retLitUnion = false
-  let retNulLitUnion = false
-  // A `string`-returning function whose `return` value is a literal-union atom: widen the
-  // atom to its member string at the return boundary (the atom-as-string-subtype edge).
-  let retStrWiden = false
-  let retUNm = ""
-  let retVi = -1
-  let retInferred = false
+  const rf: RetFlags = {
+    retF32: false,
+    retF64: false,
+    retI64: false,
+    retNulBool: false,
+    retNulString: false,
+    retNulClosure: false,
+    retNulList: false,
+    retNulRefArr: false,
+    retNulRefArrHeap: -1,
+    retNulMap: false,
+    retNulMapShape: -1,
+    retMap: false,
+    retMapShape: -1,
+    retNulSLKind: null,
+    retLitUnion: false,
+    retNulLitUnion: false,
+    retStrWiden: false,
+    retUNm: "",
+    retVi: -1,
+    retInferred: false,
+  }
   if fn is FuncDecl {
-    retInferred = fn.fnRet < 0
-    // A concrete-variant return (annotated `: Cat`, or a collapsed inferred lambda).
-    if retVariantFlag(fn.fnRet) == 1 {
-      retVi = variantIndexOf(tyNameOf(fn.fnRet))
-    }
-    // Every value an inferred arm return delivers, a join included, goes through
-    // `emitVariantCoerce`, not only the literal the seed above reaches (D4639).
-    if fn.fnRet < 0 {
-      const rvi2 = inferredRetVariantIdx(fnPos)
-      if rvi2 >= 0 { retVi = rvi2 }
-    }
-    if retF32Flag(fn.fnRet) == 1 { retF32 = true }
-    if retF64Flag(fn.fnRet) == 1 { retF64 = true }
-    if retI64Flag(fn.fnRet) == 1 { retI64 = true }
-    // An UN-annotated return INFERRED as i64/f64 (the stored kind the A20 pass fills) widens
-    // its value too — without this a `return 0` (an i32 literal) in a function whose other
-    // branch returns a big i64 / an f64 expression stays `i32.const`, clashing with the i64/f64
-    // functype result the inferred-return path declares (a soundness hole the checker accepts).
-    if fn.fnRet < 0 {
-      const rfe = fnPos
-      if rfe >= 0 {
-        if fRetKind[rfe] == "i64" { retI64 = true }
-        if fRetKind[rfe] == "f64" { retF64 = true }
-        // the f32 dual: an inferred f32 return whose body carries a float literal emits f64
-        // unless forced, clashing with the f32 functype result (#614); a bare f32 `return x` needs no coercion.
-        if fRetKind[rfe] == "f32" { retF32 = true }
-        // an inferred `f32[]` return has no producer, so the functype result stays at the
-        // `"i32"` default while the emitted `return` pushes the f32 list's `(ref $array)` —
-        // check-clean invalid wasm. Neither channel that fills the slot classifies this
-        // shape; refuse loudly until it does. The annotated spelling already lowers.
-        if fRetKind[rfe] == "i32" && exprF32Array(retArg, fnIx) {
-          return emitFail(
-            "emitProgram: an f32[] return must be annotated (`: f32[]`) — the inferred form has no result type",
-          )
-        }
-      }
-    }
-    // a literal-union return reads as a union name but is an i32 atom — excluded from the
-    // value-union box return, since `emitUnionBoxArg` would `struct.new` the member. A
-    // nullable-closure return is the closure niche, not a value box, routed through
-    // `retNulClosure` below; a nullable literal union is excluded on the same grounds.
-    if retUnionFlag(fn.fnRet) == 1 {
-      if (
-        !nodeTyIsLitUnionAlias(fn.fnRet)
-        && !nodeTyIsNulLitUnion(fn.fnRet)
-        && nulCloFlag(fn.fnRet) != 1
-      ) {
-        retUNm = tyNameOf(fn.fnRet)
-      }
-    }
-    if fn.fnRet < 0 {
-      const im = inferRetNameOf(inferRetFnKey(fnIx, fn.fnName))
-      // a value union or registered struct-union inferred return is a union-box return
-      // (kind 4): box each concrete-variant/value-atom `return` via `retUNm`. A litunion
-      // alias name is excluded on the same grounds as the annotated arm above — it
-      // registers as a union name but its value is the interned i32 atom, so boxing it would be wrong.
-      if (
-        isValueUnionName(im)
-        || (isUNameAB(26, im, inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName)))
-          && !nameIsLitUnionType(im))
-      ) {
-        retUNm = im
-      }
-      // The inferred twins of the `nodeTyIsLitUnionAlias` / `nodeTyIsNulLitUnion` seeds
-      // below: an un-annotated litunion return encodes a member literal as its atom id,
-      // and its `| null` niche encodes a bare `null` as the `-1` sentinel.
-      if nameIsLitUnionType(im) { retLitUnion = true }
-      if nameIsNulLitUnion(im) { retNulLitUnion = true }
-    }
-    // A CONCRETE-variant return (`: Cat`, or a collapsed-to-one-variant inferred lambda):
-    // route the value through `emitVariantCoerce` so a mixed-rep value-`if` (a narrowed
-    // union arm + a literal arm) lands in ONE variant rep. Overrides the `pendingVariantIdx`
-    // literal seeding above — `emitVariantCoerce` builds the literal itself.
-    if retVi >= 0 { ctx.variantIdx = -1 }
-    if tyIsNulBool(fn.fnRet) { retNulBool = true }
-    if retNulStringFlag(fn.fnRet) == 1 { retNulString = true }
-    // A nullable-closure return (`((i32) => i32) | null`, kind 19): a `return null` lowers
-    // as `ref.null $cloStruct` (the niche), a function value passes through as the fat
-    // pointer widened to the nullable storage — the return analogue of the kind-22 field.
-    if nulCloFlag(fn.fnRet) == 1 { retNulClosure = true }
-    if retNulListFlag(fn.fnRet) == 1 { retNulList = true }
-    // A nullable ref-array return (`<ref-array> | null`, kind 18): a `return [x]` builds the ref
-    // list (which subtypes the nullable wrapper), a `return null` is `ref.null $wrapper` — seed the
-    // inner wrapper heap so the bare-`null` return path types it.
-    if retNulRefArrFlag(fn.fnRet) == 1 {
-      retNulRefArr = true
-      const rlsRet = tyAnnRefListSlot(fn.fnRet)
-      if rlsRet >= 0 && rlsRet < rlWrapIdx.length {
-        retNulRefArrHeap = rlWrapIdx[rlsRet]
-      }
-    }
-    if retNulMapFlag(fn.fnRet) == 1 {
-      retNulMap = true
-      retNulMapShape = mapAnnShape(fn.fnRet)
-    }
-    if retMapFlag(fn.fnRet) == 1 {
-      retMap = true
-      retMapShape = mapAnnShape(fn.fnRet)
-    }
-    // the inferred dual of the arm above: an un-annotated map return (`function mk() {
-    // return Map() }`) has no annotation for `retMapFlag` to read, so a bare `Map()` would
-    // build the mono struct while the functype declares the value-typed one. The shape
-    // comes from the same chokepoint the result valtype does (`mapRetExprShape`).
-    if fn.fnRet < 0 && fnPos >= 0 {
-      if fRetKind[fnPos] == "map" {
-        const imrx = fnRetExprOf(fnIx)
-        if imrx >= 0 {
-          retMap = true
-          retMapShape = mapRetExprShape(imrx, fnPos)
-        }
-      }
-    }
-    retNulSLKind = nulScalarListKindOfNode(fn.fnRet)
-    if nodeTyIsLitUnionAlias(fn.fnRet) { retLitUnion = true }
-    // A synthesized `: K` (a lambda pinned at its alias) is typed at the alias's copy, which
-    // the index test above misses and the provenance-reading one does not (D3120).
-    if fn.fnRet >= 0 && tyIsLitUnion(nodeTyIxOf(fn.fnRet)) {
-      retLitUnion = true
-    }
-    // A `K | null` NICHE return: a `return null` lowers as the i32 sentinel `-1`, a `return "a"`
-    // as its atom id — so seed BOTH the niche flag and `pendingLitUnion`.
-    if nodeTyIsNulLitUnion(fn.fnRet) { retNulLitUnion = true }
-    retStrWiden = retStrWidenOf(fn, retArg, fnIx, fnPos)
-    // An atom result keeps an atom value: a synthesized `: K` also reads as `string` to the
-    // spelling tests above, which would widen the value the result holds as its id (D3160).
-    if retLitUnion && !retKindIsStr(fnPos) { retStrWiden = false }
-    // an inferred return whose value is an atom is left as an atom, and the call site
-    // widens it (`fRetLitAtom`, from `criClassify`) — one flag, read by both passes.
-    // Inferred niche nullable: seed from the A20 name so a `return null`/`return
-    // <bool|string>` lowers as the sentinel/`ref.null` rep.
-    if fn.fnRet < 0 {
-      const nn = inferNicheNullByName(inferRetFnKey(fnIx, fn.fnName))
-      if nn == "boolean|null" { retNulBool = true }
-      if nn == "string|null" { retNulString = true }
-    }
-    // An implicit-return ASSIGNMENT to a `string | null` cell: the re-read this return
-    // value IS must keep the RAW nullable ref, because the result valtype the functype
-    // declares for it is `(ref null $sTypeIdx)`. Same fact, same function.
-    if fn.fnRet < 0 && fnPos >= 0 {
-      if fnAssignRetKind(fnPos) == "nulstr" { retNulString = true }
-    }
-    // The inferred `string | null` twin of the `cloRetIsString` widen: an atom arm of a join
-    // the checker typed `string | null` widens to its member text, `null` for the niche (D3336).
-    if fn.fnRet < 0 && retNulString && !retLitUnion && !retNulLitUnion {
-      if exprIsLitAtom(retArg, fnIx) { retStrWiden = true }
-    }
+    const seeded = retFlagsSeedResult(fn, retArg, fnIx, fnPos, rf)
+    if seeded < 0 { return seeded }
+    retFlagsSeedNiches(fn, retArg, fnIx, fnPos, ctx, rf)
   }
   // A float literal in an f32 result lowers as `f32.const`.
-  if retF32 { ctx.wantF32 = true }
+  if rf.retF32 { ctx.wantF32 = true }
   const saved = expCtxHere()
   expCtxApply(ctx)
-  if retF32 || retF64 || retI64 || retVi >= 0 || retUNm != "" || retStrWiden {
+  if (
+    rf.retF32
+    || rf.retF64
+    || rf.retI64
+    || rf.retVi >= 0
+    || rf.retUNm != ""
+    || rf.retStrWiden
+  ) {
     if (
       emitReturnCoercedValue(
         body,
         retArg,
         fnIx,
-        retF32,
-        retF64,
-        retI64,
-        retVi,
-        retUNm,
-        retStrWiden,
-        retNulString,
-        retInferred,
+        rf.retF32,
+        rf.retF64,
+        rf.retI64,
+        rf.retVi,
+        rf.retUNm,
+        rf.retStrWiden,
+        rf.retNulString,
+        rf.retInferred,
       )
       < 0
     ) {
@@ -27532,19 +27642,19 @@ function emitReturnValueTail(
         retArg,
         fnIx,
         fnPos,
-        retNulBool,
-        retNulString,
-        retNulClosure,
-        retNulList,
-        retNulRefArr,
-        retNulRefArrHeap,
-        retNulMap,
-        retNulMapShape,
-        retMap,
-        retMapShape,
-        retNulSLKind,
-        retLitUnion,
-        retNulLitUnion,
+        rf.retNulBool,
+        rf.retNulString,
+        rf.retNulClosure,
+        rf.retNulList,
+        rf.retNulRefArr,
+        rf.retNulRefArrHeap,
+        rf.retNulMap,
+        rf.retNulMapShape,
+        rf.retMap,
+        rf.retMapShape,
+        rf.retNulSLKind,
+        rf.retLitUnion,
+        rf.retNulLitUnion,
       )
       < 0
     ) {
@@ -27558,7 +27668,7 @@ function emitReturnValueTail(
     retRlSlot,
     retSLKind,
     retArmHeap,
-    retVi,
+    rf.retVi,
   )
   // The caller's context comes back whole: a seed a `return { … }` or `return Map()` leaves
   // unconsumed would otherwise type the next function's `null` (D2564).
