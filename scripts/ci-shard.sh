@@ -41,7 +41,7 @@ FUEL_WARM=110
 # The native rows are the mean over two PR runs of each file's summed test seconds. A
 # self-sharded file's row is its whole cost, and each shard is charged 1/n of it.
 WEIGHTS='
-selfhost_native_align_test.ts 96
+selfhost_native_align_test.ts 9
 vl_budget_mode_test.ts 49
 vl_distilled_tools_test.ts 37
 vl_deep_nesting_test.ts 35

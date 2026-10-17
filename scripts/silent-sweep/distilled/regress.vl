@@ -6,16 +6,17 @@
 //         [--json OUT] [--write-baseline [--set <named-set>]] [--verify-fresh]
 //
 // Run it from the checkout root: paths resolve against the working directory. Chunks of
-// cells are graded `$JOBS` at a time (default 6). `--set` records new `named/*.vl` cells
-// in `expected.jsonl` and the baseline in one move. Exit 1 only when a `runs` cell
-// stopped running, or under `--verify-fresh` when any cell moved.
+// cells are graded `$JOBS` at a time (default 6), their modules compiled through the cache
+// at `$VL_DISTILLED_CACHE` (default `~/.cache/vl-distilled`, `off` for none). `--set` records
+// new `named/*.vl` cells in `expected.jsonl` and the baseline in one move. Exit 1 only
+// when a `runs` cell stopped running, or under `--verify-fresh` when any cell moved.
 
 import { exit } from "std:process"
 import { programArgs } from "std:args"
 import { Utf8Error } from "std:utf8"
 import { toString } from "std:fmt"
 import { join, startsWith } from "std:str"
-import { JsonMap, die, hasFlag, isFile, jsonStr } from "../../lib/common"
+import { JsonMap, die, envOr, hasFlag, isFile, jsonStr } from "../../lib/common"
 import {
   Idx,
   audit,
@@ -46,8 +47,21 @@ import {
 const HERE = "scripts/silent-sweep/distilled"
 const SELF = "scripts/silent-sweep/distilled/regress.vl"
 
-// Grade both halves of the corpus against `seed`, writing each half's grade beside `out`.
-type Graded = { now: Map<string, Res>, rc: i32 }
+// The module cache the cells compile through, as `gradeParts` takes it: a Cranelift
+// artifact is keyed by the module's bytes and the engine, so a cell whose emitted bytes
+// did not change is not recompiled, and every cell still runs.
+function distilledCache(): string {
+  const c = envOr("VL_DISTILLED_CACHE", "")
+  if c == "off" || c == "0" { return "off" }
+  if c != "" { return c }
+  const home = envOr("HOME", "")
+  if home == "" { return "" }
+  home + "/.cache/vl-distilled"
+}
+
+// Grade both halves of the corpus against `seed`, writing each half's grade beside `out`;
+// `reuse` is the module-cache line of the report.
+type Graded = { now: Map<string, Res>, rc: i32, reuse: string }
 
 function gradeCorpus(seed: string, out: string): Graded {
   const now: Map<string, Res> = Map()
@@ -57,19 +71,20 @@ function gradeCorpus(seed: string, out: string): Graded {
       parts.push({ name: part, dir: HERE + "/" + part })
     }
   }
-  const f = gradeParts(SELF, parts, seed, jobsFromEnv(6))
+  const f = gradeParts(SELF, parts, seed, jobsFromEnv(6), distilledCache())
   if f.rc != 0 {
     print(
       "distilled: the grader itself failed on \{f.failed}/ (rc=\{toString(f.rc)})",
     )
-    return { now: now, rc: f.rc }
+    return { now: now, rc: f.rc, reuse: "" }
   }
   for p in parts {
     const mine = f.parts[p.name] ?? Map()
     for c, r in mine { now[c] = r }
     writeText(out + "." + p.name, gradeJson(mine))
   }
-  { now: now, rc: 0 }
+  const reuse = "  module cache: reused \{toString(f.reused)} of \{toString(f.looked)} compiled cell modules"
+  { now: now, rc: 0, reuse: reuse }
 }
 
 // The `--json` file: every graded cell, sorted, one field per line.
@@ -240,6 +255,7 @@ function mainReport(args: string[]): i32 {
   print(
     "distilled corpus: \{toString(cells.length - ncur)} representatives standing for \{toString(pop)} census cells, plus \{toString(ncur)} curated cells from named regression sets",
   )
+  print(g.reuse)
   show("runs -> NOT-RUNS  (blocking)", lost, pop)
   show("-> silent  (report)", intoSilent, pop)
   show("other movement", other, pop)

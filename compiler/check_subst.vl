@@ -3,7 +3,7 @@
 // Emptied by `substReset`. Does not import the checker.
 import { lookupFnDeclNode } from "./check_scopes"
 import { Call, FuncDecl, P, i32ToStr, nodeChildren } from "./ast"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import {
   T,
   Ty,
@@ -27,7 +27,7 @@ import { fnDeclIx } from "./check_write_scan"
 import { tyHasTyVarGo } from "./tyquery"
 import { nodeTyIxOf } from "./check_node_tys"
 import { tyVarOwner, tyVarOwnerOf } from "./check_hole_pins"
-import { inferQuiet } from "./check_cursor"
+import { cstrOwnerStack, inferQuiet } from "./check_cursor"
 import { memCstr } from "./check_cstr_rows"
 import { holeWriteKey, noteArrayDemand } from "./check_hole_rows"
 import { CSTR_NODECL } from "./check_generic_args"
@@ -435,6 +435,96 @@ function tysOwnedBy(
     if !tyVarsOwnedBy(t, owner, names, depth) { return false }
   }
   true
+}
+
+// Whether `ty` may hold the type variable `name` that `owner` binds. A variable with no recorded
+// owner, a pin with none, and a type too deep to walk all match on the name alone.
+export function tyRidesVarOf(
+  ty: i32,
+  name: string,
+  owner: string,
+  depth: i32,
+): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  if depth <= 0 { return true }
+  const t = T.tys[ty]
+  if t is TyVar {
+    const o = tyVarOwnerOf(ty)
+    return t.tvName == name && (owner == "" || o == "" || o == owner)
+  }
+  if t is TyArray { return tyRidesVarOf(t.aElem, name, owner, depth - 1) }
+  if t is TyNullable { return tyRidesVarOf(t.nInner, name, owner, depth - 1) }
+  if t is TyNeg { return tyRidesVarOf(t.negTy, name, owner, depth - 1) }
+  if t is TyMap {
+    return tyRidesVarOf(t.mKey, name, owner, depth - 1)
+      || tyRidesVarOf(t.mVal, name, owner, depth - 1)
+  }
+  if t is TyObj { return tysRideVarOf(t.objFieldTypes, name, owner, depth - 1) }
+  if t is TyFunc {
+    return tysRideVarOf(t.fnParamTypes, name, owner, depth - 1)
+      || tyRidesVarOf(t.fnRet, name, owner, depth - 1)
+  }
+  if t is TyUnion { return tysRideVarOf(t.uMembers, name, owner, depth - 1) }
+  tyHasTyVarGo(ty, depth)
+}
+
+// `tyRidesVarOf` over any of `tys`.
+function tysRideVarOf(
+  tys: i32[],
+  name: string,
+  owner: string,
+  depth: i32,
+): boolean {
+  for t in tys {
+    if tyRidesVarOf(t, name, owner, depth) { return true }
+  }
+  false
+}
+
+// Whether function type `ty` is the open signature of a top-level generic whose body is not being
+// checked: every variable in it is that declaration's, so each delivery binds them afresh and no
+// pin of the declaration elsewhere speaks for this value (D5290).
+export function tyIsForeignGenericSig(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyFunc) { return false }
+  const owner = tyFirstVarOwner(ty, 64)
+  if owner == "" || owner == curFnEscName { return false }
+  const d = fnDeclIx[owner] ?? -1
+  if d < 0 || d >= P.nodes.length || i32ListHas(cstrOwnerStack, d) {
+    return false
+  }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
+  tyVarsOwnedBy(ty, owner, [], 64)
+}
+
+// The recorded owner of the first type variable met in `ty`, or "" when none is met.
+function tyFirstVarOwner(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
+  const t = T.tys[ty]
+  match t {
+    TyVar => tyVarOwnerOf(ty)
+    TyArray => tyFirstVarOwner(t.aElem, depth - 1)
+    TyNullable => tyFirstVarOwner(t.nInner, depth - 1)
+    TyNeg => tyFirstVarOwner(t.negTy, depth - 1)
+    TyMap => tysFirstVarOwner([t.mKey, t.mVal], depth - 1)
+    TyObj => tysFirstVarOwner(t.objFieldTypes, depth - 1)
+    TyFunc => {
+      const p = tysFirstVarOwner(t.fnParamTypes, depth - 1)
+      if p != "" { return p }
+      tyFirstVarOwner(t.fnRet, depth - 1)
+    }
+    TyUnion => tysFirstVarOwner(t.uMembers, depth - 1)
+    TyPrim | TyErr | TyLit => ""
+  }
+}
+
+// `tyFirstVarOwner` over `tys`, in order.
+function tysFirstVarOwner(tys: i32[], depth: i32): string {
+  for t in tys {
+    const o = tyFirstVarOwner(t, depth)
+    if o != "" { return o }
+  }
+  ""
 }
 
 export function substReset() {
