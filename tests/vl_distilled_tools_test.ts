@@ -42,7 +42,7 @@ const CENSUS = "scripts/silent-sweep/census";
 
 // One cell per class, as (directives, expected stdout). Names sort in the order listed.
 const CELLS: Record<string, [string, string]> = {
-  a000001: ["run-out: 42\n", "42"],
+  a000001: ["run-out: 42\ncached: 1\n", "42"],
   a000002: ["check-err: type mismatch: expected i32, found string", "s"],
   a000003: [
     "run-rc: 1\nrun-err: Error: emit error\\nf.vl:1:1: emitProgram: a range step of i32's minimum has no negation\\n",
@@ -60,7 +60,7 @@ const CELLS: Record<string, [string, string]> = {
   a000007: ["run-rc: 70\nrun-err: error: wasm trap: unreachable\\n", "8"],
 };
 const NAMED: Record<string, [string, string]> = {
-  fx_runs: ["run-out: é\\n", "é"],
+  fx_runs: ["run-out: é\\n\ncached: 1", "é"],
   fx_reject: ["check-err: undefined name `undefinedName`", ""],
   fx_wrong: ["run-out: 1\\n2\\n", "1"],
 };
@@ -80,8 +80,11 @@ const BASELINE = [
   `{"cell": "fx_wrong", "class": "runs but wrong value", "msg": "want '1' got '1\\\\n2'"}`,
 ].join("\n") + "\n";
 
-const HEAD =
+const SUMMARY =
   "distilled corpus: 7 representatives standing for 1325 census cells, plus 3 curated cells from named regression sets\n";
+// The batch run's eight check-clean cells; the stub traces a hit for the two marked `cached`.
+const HEAD = SUMMARY +
+  "  module cache: reused 2 of 8 compiled cell modules\n";
 const QUIET = HEAD +
   "  runs -> NOT-RUNS  (blocking)    0 classes  (     0 of 1325 census cells)\n" +
   "  -> silent  (report)             0 classes  (     0 of 1325 census cells)\n" +
@@ -198,6 +201,7 @@ const runner = (dir: string) => {
         NO_COLOR: "1",
         JOBS: "2",
         VL: `${dir}/stubvl`,
+        VL_DISTILLED_CACHE: `${dir}/module-cache`,
         ...extra,
       }),
     }).output();
@@ -285,7 +289,8 @@ Deno.test({
         "a per-cell grade",
         await regress([seed], { GRADE_BATCH: "0" }),
         0,
-        HEAD +
+        SUMMARY +
+          "  module cache: reused 0 of 0 compiled cell modules\n" +
           "  runs -> NOT-RUNS  (blocking)    0 classes  (     0 of 1325 census cells)\n" +
           "  -> silent  (report)             0 classes  (     0 of 1325 census cells)\n" +
           "  other movement                  1 classes  (  1200 of 1325 census cells)\n" +
