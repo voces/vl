@@ -160,9 +160,14 @@ export function lrOf(rep: i32): ListRep {
 
 // What `emitListEqGCore` must do with one element of list rep (kind, slot): `scalar` compare
 // two leaves with `eqgNeOpcode(kind)`, `string` through the string-eq helper, `list` recurse
-// into the element's own list core, `struct` field-wise, `none` no answer. Keyed on the rep and
-// not the arena type, because the emitter's frames and heap indices are keyed that way.
-export type EqgElemClass = "none" | "scalar" | "string" | "list" | "struct"
+// into the element's own list core, `struct` field-wise, `call` through the row's minted
+// compare function, `none` no answer. Keyed on the rep, as the emitter's frames are.
+export type EqgElemClass = "none"
+  | "scalar"
+  | "string"
+  | "list"
+  | "struct"
+  | "call"
 export function eqgElemClass(kind: i32, slot: i32): EqgElemClass {
   // The scalar-leaf list reps: i32 (and everything that reps as one), f64, i64, f32, u8.
   if (
@@ -189,6 +194,7 @@ function eqgRefElemClass(slot: i32, seen: i32[]): EqgElemClass {
   if slot < 0 || slot >= rlElemKindTbl.length { return "none" }
   // An inner list of any rep compares through its own list core.
   if rlElemListRep(rlElemKindTbl[slot]) != null { return "list" }
+  if eqgCoreFeOfSlot(slot) >= 0 { return "call" }
   if i32ListHas(seen, slot) { return "none" }
   // A struct element, field-wise. A nullable element is excluded here rather than by the row
   // lookup, and the two are not the same test: `(Circle | null)[]` resolves the same row a
@@ -219,6 +225,85 @@ export function eqgElemEqRow(slot: i32): i32 {
   const sr = rlElemStructRow(slot)
   if sr >= 0 { return sr }
   eqRowOfVariant(rlElemVariantRow(slot))
+}
+
+// ── the minted compare functions of recursive records ─────────────────────────
+// A struct row that reaches itself through its fields cannot be compared inline, since the
+// inline compare would unfold forever. `synthRecEqCores` mints one `<row>$eqc(a, b): boolean`
+// per such row and records it here; a list element of that row then compares by a call.
+let eqgCoreRow: i32[] = []
+let eqgCoreFe: i32[] = []
+
+export function eqgCoresReset() {
+  eqgCoreRow = []
+  eqgCoreFe = []
+  0
+}
+
+export function eqgCoreAdd(row: i32, fe: i32) {
+  eqgCoreRow.push(row)
+  eqgCoreFe.push(fe)
+  0
+}
+
+// The `fnStmts` position of the compare function minted for ref-list slot `slot`'s element
+// row, or -1: no function is minted for it, or the element is nullable or not a struct row.
+export function eqgCoreFeOfSlot(slot: i32): i32 {
+  if eqgCoreRow.length == 0 { return -1 }
+  if slot < 0 || slot >= rlElemKindTbl.length { return -1 }
+  if slot < rlElemNullable.length {
+    if rlElemNullable[slot] == 1 { return -1 }
+  }
+  const sr = rlElemStructRow(slot)
+  if sr < 0 { return -1 }
+  let i = 0
+  while i < eqgCoreRow.length {
+    if eqgCoreRow[i] == sr { return eqgCoreFe[i] }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether struct row `row` reaches itself through nested-struct fields and ref-list elements,
+// on a path that crosses at least one list. A cycle through struct fields alone is not one.
+export function eqgRowIsCyclic(row: i32): boolean {
+  // A work entry is `row * 2 + 1` once its path has crossed a list field, `row * 2` before.
+  const seen: i32[] = []
+  const work: i32[] = [row * 2]
+  while work.length > 0 {
+    const w = work.pop()
+    const r = w / 2
+    let fi = 0
+    const nf = if r >= 0 && r < sFieldCount.length { sFieldCount[r] } else { 0 }
+    while fi < nf {
+      const nx = eqgFieldNextRow(r, fi)
+      const viaList = w % 2 == 1 || eqRowFieldTypeAt(r, fi) == FC_REF_LIST
+      if nx == row && viaList { return true }
+      const nw = if viaList { nx * 2 + 1 } else { nx * 2 }
+      if nx >= 0 && !i32ListHas(seen, nw) {
+        seen.push(nw)
+        work.push(nw)
+      }
+      fi = fi + 1
+    }
+  }
+  false
+}
+
+// The struct row field `fi` of struct row `row` leads to, or -1: a nested struct's row, or
+// the struct row a ref-list field's element (through nested lists) resolves.
+function eqgFieldNextRow(row: i32, fi: i32): i32 {
+  const code = eqRowFieldTypeAt(row, fi)
+  if code == FC_STRUCT { return eqRowTgtStructIdx(row, fi) }
+  if code != FC_REF_LIST { return -1 }
+  let slot = eqgFieldRefSlot(row, fi)
+  let depth = 0
+  while slot >= 0 && slot < rlElemKindTbl.length && depth < 32 {
+    if rlElemKindTbl[slot] != RLK_REF_LIST { return rlElemStructRow(slot) }
+    slot = rlElemInnerSlot(slot)
+    depth = depth + 1
+  }
+  -1
 }
 
 // Is this struct row's field-wise compare emittable inside a list loop? Every field must be a
@@ -403,7 +488,7 @@ export function leqCoreKindOfAtomKind(k: i32): i32 {
 export function eqgRepComparable(kind: i32, slot: i32, depth: i32): boolean {
   if depth > 32 { return false }
   match eqgElemClass(kind, slot) {
-    "scalar" | "string" | "struct" => {
+    "scalar" | "string" | "struct" | "call" => {
       return true
     }
     "list" => {

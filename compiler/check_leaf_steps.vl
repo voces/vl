@@ -98,7 +98,7 @@ import {
 import { inferQuiet } from "./check_cursor"
 import { gcTrail } from "./check_effect_rows"
 import { expObsFn, expObsPin, paramSolveProbe } from "./check_exp_obs"
-import { seedExpected } from "./check_expected"
+import { seedExpected, seedJoinWant } from "./check_expected"
 import { gcAdd, gwErasedIs, gwStrLitTyLen } from "./check_getter_effects"
 import { guardAltStack } from "./check_guard"
 import {
@@ -1038,20 +1038,18 @@ export function listLitFresh(ix: i32): boolean {
   x >= 0 && x < P.nodes.length && P.nodes[x] is ArrayLit
 }
 
-// Removes every string-literal member from `kept` when it also holds `string`, which already
-// holds them: `K | null` beside a `string` joins as `string | null`, as `K` alone joins as `string`.
-export function dropStrLitsBesideString(kept: i32[]) {
-  let hasStr = false
-  for k in kept {
-    if isStringTy(k) { hasStr = true }
-  }
-  if !hasStr { return 0 }
+// Removes every literal member of `kept` whose base scalar is also a member, which already holds
+// it: `K | null` beside a `string` joins as `string | null`, and `9000000000 | 1` beside an `i32`
+// as `9000000000 | i32`, so no literal sits beside the scalar that owns its rep (D5522).
+export function dropLitsBesideBase(kept: i32[]) {
   let w = 0
   for k in kept {
     let lit = false
-    if k >= 0 {
-      const kt = T.tys[k]
-      if kt is TyLit { lit = kt.litKind == "str" }
+    if k >= 0 && T.tys[k] is TyLit {
+      const base = softenLitTy(k)
+      for o in kept {
+        if o != k && tySame(o, base) { lit = true }
+      }
     }
     if !lit {
       kept[w] = k
@@ -2271,8 +2269,10 @@ export function dstForArgs(dst: i32, args: i32[], ret: i32): i32 {
 }
 
 // Seeds each value a tail `if`/`else` or `match` yields with the declared return, as the bare
-// tail expression is seeded, so an arm's lambda or literal reads the return type (D2234).
+// tail expression is seeded, so an arm's lambda or literal reads the return type (D2234), and
+// banks the return on each join, so a list-literal arm can type at it (D5287).
 export function seedTailArms(ix: i32, ret: i32) {
+  seedJoinWant(ix, ret)
   const leaves: i32[] = []
   tailValueLeaves(ix, leaves)
   let i = 0

@@ -1657,6 +1657,31 @@ fn engine_fail_offset(msg: &str) -> Option<i32> {
     found
 }
 
+/// `engine_fail_offset` against the case table the guest's `engineFailOffset` is graded
+/// on too (tests/vl_engine_fail_offset_test.ts), so the two parsers cannot drift apart.
+#[cfg(test)]
+mod engine_offset_tests {
+    use super::engine_fail_offset;
+
+    const CASES: &str = include_str!("../../../tests/fixtures/engine-fail-offset.txt");
+
+    #[test]
+    fn engine_offset_table() {
+        let mut n = 0;
+        for line in CASES.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let (want, msg) = line.split_once('|').expect("a case is `<want>|<message>`");
+            let want: i32 = want.parse().expect("a case's want is an i32");
+            let want = if want < 0 { None } else { Some(want) };
+            assert_eq!(engine_fail_offset(msg), want, "message: {msg:?}");
+            n += 1;
+        }
+        assert!(n > 0, "the case table is empty");
+    }
+}
+
 /// Read one guest string through the per-element `<name>Len(i)` / `<name>At(i, j)` ABI.
 ///
 /// STAGE 2c: the element is a UTF-8 **byte**, not a code point. Every one of the five
@@ -7546,6 +7571,44 @@ fn compile_test_file_cold(
     })
 }
 
+/// `$VL_CHECK_KEEP_MODULES=<dir>`: under `vl check --codegen`, keep every module the engine
+/// accepts as `<dir>/<file name>.wasm`, compiled with the names `vl run` compiles with, so a
+/// caller that has just checked a file runs those bytes instead of compiling it again (the
+/// distilled corpus grader). Files are keyed by name alone, so a run's file names must differ.
+/// A seed whose CMD_VALIDATE does not name its file keeps nothing, and says so.
+fn keep_modules_dir(
+    store: &mut Store<()>,
+    inst: &Instance,
+) -> Result<Option<std::path::PathBuf>> {
+    let Some(dir) = std::env::var_os("VL_CHECK_KEEP_MODULES") else {
+        return Ok(None);
+    };
+    if inst.get_typed_func::<(), i32>(&mut *store, "cliValidateNamesFile").is_err() {
+        eprintln!(
+            "note: $VL_CHECK_KEEP_MODULES ignored: this seed does not name the file it validates"
+        );
+        return Ok(None);
+    }
+    if let Ok(set_names) = inst.get_typed_func::<i32, i32>(&mut *store, "setEmitNames") {
+        set_names.call(&mut *store, 1)?;
+    }
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| Error::from(e).context(format!("creating {}", dir.display())))?;
+    Ok(Some(dir))
+}
+
+/// Write the validated module of source `path` under `dir` (see `keep_modules_dir`).
+fn keep_module(dir: &std::path::Path, path: &str, bytes: &[u8]) -> Result<()> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let out = dir.join(format!("{name}.wasm"));
+    std::fs::write(&out, bytes)
+        .map_err(|e| Error::from(e).context(format!("writing {}", out.display())))
+}
+
 /// One `vl check` root-pool worker: a compiler instance on `module`, given the run's own
 /// argv and the parent's walk (`cliCheckPresetRoot`), driven in check-one mode
 /// (`cliCheckPoolStage(2, pick)`) to check the roots it is handed one at a time. Anything
@@ -8467,6 +8530,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     arg_commit.call(&mut store, ())?;
 
     stage_vl_root_and_cwd(&mut store, &inst)?;
+    let keep_dir = keep_modules_dir(&mut store, &inst)?;
     // `vl test`'s compile pool. A seed without the export compiles every test file in
     // this one instance, as before the pool existed.
     if test_pool_allowed() {
@@ -8810,6 +8874,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 }
                 match Module::validate(&engine, &bytes) {
                     Ok(()) => {
+                        if let Some(dir) = &keep_dir {
+                            keep_module(dir, &cmd_path.read(&mut store)?, &bytes)?;
+                        }
                         validate_commit.call(&mut store, 1)?;
                     }
                     Err(e) => {

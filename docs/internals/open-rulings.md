@@ -465,6 +465,59 @@ Explicitly left open by the owner pass and unimplemented. docs/error-handling-de
 
 </details>
 
+### std-hex-parse-format — should std parse and format hexadecimal integers? — raised 2026-10-17
+
+**The question.** std has no hex form in either direction. `"255".parseI32()` is `255`, but
+`"ff".parseI32()` and `"0xff".parseI32()` are both `null`, and `toString(255)` has no radix.
+The only hex code in std is private (`hexDigit`, `hexVal` and `hex4` in `std/json.vl`).
+Consumers write their own. Over `*.vl`, counting functions named `parseHex*`, `hex*` or
+`toHex*` (so `hexVal`-style helpers are included): glean has 102 in 99 files, plumb 145 in
+109, and diderven and sunpa one file each. glean and plumb together spell them at least
+eight ways. The most common are `parseHex(t: string)` ×44, `parseHex32(s: string)` ×41,
+`hexS(v: i32): string` ×18, `parseHex(s: string): i64` ×11 and `hex64(v: i64): string` ×11.
+Some return `i32` and some `i64`.
+
+**Options.**
+
+(a) Two parsers and one formatter in `std:fmt`, shaped like the `parseI32`/`toString` exports
+that sit beside them:
+
+```vl
+import { parseHexI32, parseHexI64, toHex } from "std:fmt"
+print("ff".parseHexI32() ?? -1)   // 255
+print("0xFF".parseHexI32() ?? -1) // 255: a `0x` prefix is accepted, any case
+print(toHex(255))                 // ff
+print(toHex(-1))                  // ffffffff: two's complement at the operand's width
+```
+
+(b) A radix argument on the existing parsers, `"ff".parseI32(16)`. One name per width, but
+it changes `parseI32`'s signature, and the formatter still needs a name of its own.
+
+(c) No std change. Consumers keep their own helpers.
+
+**Recommendation: (a).** It adds names and changes none, and its null-on-failure channel is
+the one `parseI32` already uses. The details to settle in std review, not here:
+- whether a value too large for the width is `null` (lossless, like `parseI32`) or wraps;
+- whether `toHex` takes a minimum width (consumers pad to 2, 4 or 8 digits);
+- whether a u32 operand (the U1 ruling) formats unsigned.
+
+**Blocked while unruled.** Nothing. This is std surface, so nothing ships before a ruling,
+and an implementation goes through `std-api-reviewer`.
+
+**Reversible?** Before it ships, yes. After, a std name has no deprecation story
+(CLAUDE.md §std).
+
+<details><summary>verification</summary>
+
+The four std answers were run on 2026-10-17 at eb4f5333a with `vl run`, `VL_STD` pinned to
+the worktree's `std/`: `255`, `-1`, `-1`, `255` for `"255".parseI32() ?? -1`,
+`"ff".parseI32() ?? -1`, `"0xff".parseI32() ?? -1` and `toString(255)`. The consumer counts
+are `grep -rhoE --include='*.vl' 'function (parseHex|hex|toHex)[A-Za-z0-9]*\('` over each
+checkout. They count definitions by name, which includes copies inside generated trees, not
+distinct implementations. Filed from lane SMALL item S-m (`code-quality-2026-10.md`).
+
+</details>
+
 
 ---
 
