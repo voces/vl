@@ -83,6 +83,7 @@ import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // languages; that file's header names them and `tests/module_gate_agreement_test.ts`
 // is the guard that keeps them agreeing.
 import { needsModules } from "../../compiler/moduleGate.ts";
+import { isStdKey } from "../../lsp/src/editorText.ts";
 
 const CASES_DIR = new URL("../cases/", import.meta.url);
 const STD_DIR = new URL("../../std/", import.meta.url);
@@ -282,7 +283,7 @@ const walk = function* (dir: URL): Generator<Case> {
 const readModuleSrc = (key: string): string | undefined => {
   try {
     return Deno.readTextFileSync(
-      key.startsWith("std:")
+      isStdKey(key)
         ? new URL(`${key.slice("std:".length)}.vl`, STD_DIR)
         : key,
     );
