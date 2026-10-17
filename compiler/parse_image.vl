@@ -1,0 +1,474 @@
+// A module's parse image: its slice of the shared parse arena — tokens, nodes, spelling
+// trees, diagnostics and the side tables the parser writes — printed with every index rebased
+// on the module's own start. Two parses of one source agree on the image whatever modules
+// parse ahead of it, which is what a per-module parse cache needs (S5 in
+// incremental-compilation-design.md). Armed only by a test or a probe; the build never reads it.
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+} from "./ast"
+import {
+  declNameTok,
+  extDeclVl,
+  extGDeclNode,
+  i32ToStr,
+  nodeToks,
+  parseImageTables,
+  piIx,
+  piIxs,
+  piStr,
+  tsKidCount,
+  tsKidStart,
+  tsKids,
+  tsKind,
+  tsText,
+} from "./ast"
+
+// 0 off, 1 relative images, 2 absolute ones (the arena as stored, the control).
+let piMode = 0
+let piKeys: string[] = []
+let piTexts: string[] = []
+
+// Arm image capture for later compiles: `mode` 1 rebases every index, 2 prints them raw.
+export function parseImageArm(mode: i32): i32 {
+  piMode = mode
+  piKeys = []
+  piTexts = []
+  0
+}
+
+export function parseImageArmed(): boolean { piMode != 0 }
+
+// Drop the previous compile's images; the driver calls it before its parse loop.
+export function parseImageBegin(): i32 {
+  piKeys = []
+  piTexts = []
+  0
+}
+
+// The start of every arena a module parse appends to, taken before its tokens load.
+export function parseImageOpen(): i32[] {
+  const sp = [
+    P.nodes.length,
+    0,
+    P.toks.length,
+    0,
+    tsKind.length,
+    0,
+    tsKids.length,
+    0,
+    P.diags.length,
+    0,
+    extDeclVl.length,
+    0,
+    extGDeclNode.length,
+    0,
+  ]
+  sp
+}
+
+// Close the ranges `parseImageOpen` began and bank the image of module `key`.
+export function parseImageClose(sp: i32[], key: string): i32 {
+  sp[1] = P.nodes.length
+  sp[3] = P.toks.length
+  sp[5] = tsKind.length
+  sp[7] = tsKids.length
+  sp[9] = P.diags.length
+  sp[11] = extDeclVl.length
+  sp[13] = extGDeclNode.length
+  const rel = piMode == 1
+  const out: string[] = []
+  let t = sp[2]
+  while t < sp[3] {
+    const k = P.toks[t]
+    out.push(
+      "tok "
+        + piIx(k.pos, sp, 1, rel)
+        + " "
+        + piStr(k.kind)
+        + " "
+        + piStr(k.text)
+        + " "
+        + i32ToStr(k.start)
+        + " "
+        + i32ToStr(k.line)
+        + " "
+        + i32ToStr(k.col),
+    )
+    t = t + 1
+  }
+  let i = sp[0]
+  while i < sp[1] {
+    let nt = -1
+    if i < nodeToks.length { nt = nodeToks[i] }
+    let dt = -1
+    if i < declNameTok.length { dt = declNameTok[i] }
+    out.push(
+      "n"
+        + piIx(i, sp, 0, rel)
+        + " "
+        + piNode(i, sp, rel)
+        + " t="
+        + piIx(nt, sp, 1, rel)
+        + " d="
+        + piIx(dt, sp, 1, rel),
+    )
+    i = i + 1
+  }
+  let s = sp[4]
+  while s < sp[5] {
+    // A leaf's kid start is wherever the kid table ended, which no reader looks at.
+    let kidAt = "_"
+    if tsKidCount[s] > 0 { kidAt = piIx(tsKidStart[s], sp, 3, rel) }
+    out.push(
+      "ts"
+        + piIx(s, sp, 2, rel)
+        + " "
+        + i32ToStr(tsKind[s])
+        + " "
+        + piStr(tsText[s])
+        + " "
+        + kidAt
+        + " "
+        + i32ToStr(tsKidCount[s]),
+    )
+    s = s + 1
+  }
+  const kids: i32[] = []
+  let q = sp[6]
+  while q < sp[7] {
+    kids.push(tsKids[q])
+    q = q + 1
+  }
+  out.push("kids " + piIxs(kids, sp, 2, rel))
+  let d = sp[8]
+  while d < sp[9] {
+    out.push(
+      "dg " + piStr(P.diags[d].msg) + " " + piIx(P.diags[d].at, sp, 1, rel),
+    )
+    d = d + 1
+  }
+  parseImageTables(sp, rel, out)
+  let text = ""
+  let j = 0
+  while j < out.length {
+    text = text + out[j] + "\n"
+    j = j + 1
+  }
+  piKeys.push(key)
+  piTexts.push(text)
+  0
+}
+
+function piStrs(xs: string[]): string {
+  let out = "["
+  let i = 0
+  while i < xs.length {
+    if i > 0 { out = out + "," }
+    out = out + piStr(xs[i])
+    i = i + 1
+  }
+  out + "]"
+}
+
+function piBit(b: boolean): string {
+  if b { return "1" }
+  "0"
+}
+
+// Node `ix` printed field by field, child indices through `piIx`. Exhaustive over `Node`,
+// so a new kind cannot reach an image unprinted.
+function piNode(ix: i32, sp: i32[], rel: boolean): string {
+  const n = P.nodes[ix]
+  match n {
+    NumLit => "NumLit " + piStr(n.numText) + " " + i32ToStr(n.pos)
+    StrLit => "StrLit " + piStr(n.strText) + " " + i32ToStr(n.pos)
+    CharLit => "CharLit " + piStr(n.charText) + " " + i32ToStr(n.pos)
+    BoolLit => "BoolLit " + i32ToStr(n.boolVal) + " " + i32ToStr(n.pos)
+    NullLit => "NullLit " + piStr(n.nullKw) + " " + i32ToStr(n.pos)
+    Ident => "Ident " + piStr(n.identName) + " " + i32ToStr(n.pos)
+    Unary => "Unary "
+      + piStr(n.unOp)
+      + " "
+      + piIx(n.unArg, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    BinExpr => "BinExpr "
+      + piStr(n.binOp)
+      + " "
+      + piIx(n.binLeft, sp, 0, rel)
+      + " "
+      + piIx(n.binRight, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+      + " "
+      + piStr(n.binCompound)
+      + " "
+      + i32ToStr(n.binTpl)
+      + " "
+      + i32ToStr(n.binRegion)
+    Call => "Call "
+      + piIx(n.callFn, sp, 0, rel)
+      + " "
+      + piIxs(n.callArgs, sp, 0, rel)
+      + " "
+      + piStrs(n.callArgNames)
+      + " "
+      + i32ToStr(n.pos)
+    Member => "Member "
+      + piIx(n.memObj, sp, 0, rel)
+      + " "
+      + piStr(n.memProp)
+      + " "
+      + i32ToStr(n.pos)
+    OptMember => "OptMember "
+      + piIx(n.omObj, sp, 0, rel)
+      + " "
+      + piStr(n.omProp)
+      + " "
+      + piBit(n.omDot)
+      + " "
+      + i32ToStr(n.pos)
+    Paren => "Paren " + piIx(n.parInner, sp, 0, rel) + " " + i32ToStr(n.pos)
+    ErrExpr => "ErrExpr "
+      + piStr(n.errWhat)
+      + " "
+      + piIx(n.errAt, sp, 1, rel)
+      + " "
+      + i32ToStr(n.pos)
+    LetDecl => "LetDecl "
+      + piStr(n.letKw)
+      + " "
+      + piStr(n.letName)
+      + " "
+      + piIx(n.letType, sp, 0, rel)
+      + " "
+      + piIx(n.letInit, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    Param => "Param "
+      + piStr(n.parName)
+      + " "
+      + piIx(n.parType, sp, 0, rel)
+      + " "
+      + piIx(n.parDefault, sp, 0, rel)
+      + " "
+      + i32ToStr(n.parOpt)
+      + " "
+      + i32ToStr(n.parRest)
+      + " "
+      + i32ToStr(n.pos)
+    TypeRef => "TypeRef " + piStr(n.tyName) + " " + i32ToStr(n.pos)
+    FuncDecl => "FuncDecl "
+      + piStr(n.fnName)
+      + " "
+      + piStrs(n.fnTyParams)
+      + " "
+      + piIxs(n.fnParams, sp, 0, rel)
+      + " "
+      + piIx(n.fnRet, sp, 0, rel)
+      + " "
+      + piIx(n.fnBody, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    IfStmt => "IfStmt "
+      + piIx(n.ifCond, sp, 0, rel)
+      + " "
+      + piIx(n.ifThen, sp, 0, rel)
+      + " "
+      + piIx(n.ifElse, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    WhileStmt => "WhileStmt "
+      + piIx(n.whileCond, sp, 0, rel)
+      + " "
+      + piIx(n.whileBody, sp, 0, rel)
+      + " "
+      + piStr(n.whileLabel)
+      + " "
+      + i32ToStr(n.pos)
+      + " "
+      + i32ToStr(n.whileBlk)
+      + " "
+      + piStr(n.whileLv)
+    BreakStmt => "BreakStmt "
+      + piStr(n.brkKw)
+      + " "
+      + piStr(n.brkLabel)
+      + " "
+      + i32ToStr(n.pos)
+      + " "
+      + i32ToStr(n.brkHasVal)
+    ContinueStmt => "ContinueStmt "
+      + piStr(n.contKw)
+      + " "
+      + piStr(n.contLabel)
+      + " "
+      + i32ToStr(n.pos)
+    RetStmt => "RetStmt " + piIx(n.retArg, sp, 0, rel) + " " + i32ToStr(n.pos)
+    Block => "Block " + piIxs(n.blkStmts, sp, 0, rel) + " " + i32ToStr(n.pos)
+    Program => "Program " + piIxs(n.progStmts, sp, 0, rel) + " " + i32ToStr(n.pos)
+    FieldDef => "FieldDef "
+      + piStr(n.fdName)
+      + " "
+      + piIx(n.fdType, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    TypeDecl => "TypeDecl "
+      + piStr(n.tdName)
+      + " "
+      + piIxs(n.tdFields, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+      + " "
+      + i32ToStr(n.tdNew)
+      + " "
+      + i32ToStr(n.tdFlat)
+    FieldInit => "FieldInit "
+      + piStr(n.fiName)
+      + " "
+      + piIx(n.fiValue, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    ObjLit => "ObjLit " + piIxs(n.objFields, sp, 0, rel) + " " + i32ToStr(n.pos)
+    ArrayLit => "ArrayLit " + piIxs(n.arrElems, sp, 0, rel) + " " + i32ToStr(n.pos)
+    Index => "Index "
+      + piIx(n.idxArr, sp, 0, rel)
+      + " "
+      + piIx(n.idxIndex, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    UnionDecl => "UnionDecl "
+      + piStr(n.udName)
+      + " "
+      + piStrs(n.udVariants)
+      + " "
+      + i32ToStr(n.pos)
+      + " "
+      + i32ToStr(n.udNew)
+    IsExpr => "IsExpr "
+      + piIx(n.isObj, sp, 0, rel)
+      + " "
+      + piStr(n.isVariant)
+      + " "
+      + i32ToStr(n.pos)
+      + " "
+      + i32ToStr(n.isNeg)
+    AsExpr => "AsExpr "
+      + piIx(n.asObj, sp, 0, rel)
+      + " "
+      + piStr(n.asTy)
+      + " "
+      + piStr(n.asMode)
+      + " "
+      + i32ToStr(n.pos)
+    ForRange => "ForRange "
+      + piStr(n.frVar)
+      + " "
+      + piIx(n.frFrom, sp, 0, rel)
+      + " "
+      + piIx(n.frTo, sp, 0, rel)
+      + " "
+      + piIx(n.frStep, sp, 0, rel)
+      + " "
+      + piBit(n.frExcl)
+      + " "
+      + piIx(n.frBody, sp, 0, rel)
+      + " "
+      + piStr(n.frLabel)
+      + " "
+      + i32ToStr(n.pos)
+    ForIn => "ForIn "
+      + piStr(n.fiVar)
+      + " "
+      + piStr(n.fiVar2)
+      + " "
+      + piIx(n.fiIter, sp, 0, rel)
+      + " "
+      + piIx(n.fiBody, sp, 0, rel)
+      + " "
+      + piStr(n.fiLabel)
+      + " "
+      + i32ToStr(n.pos)
+    MatchExpr => "MatchExpr "
+      + piIx(n.matchScrut, sp, 0, rel)
+      + " "
+      + piIxs(n.matchPats, sp, 0, rel)
+      + " "
+      + piIxs(n.matchBinds, sp, 0, rel)
+      + " "
+      + piInts(n.matchArmStart)
+      + " "
+      + piInts(n.matchArmCount)
+      + " "
+      + piIxs(n.matchBodies, sp, 0, rel)
+      + " "
+      + i32ToStr(n.pos)
+    ImportDecl => "ImportDecl "
+      + piStr(n.impPath)
+      + " "
+      + piStrs(n.impNames)
+      + " "
+      + piStrs(n.impLocals)
+      + " "
+      + piIxs(n.impNameToks, sp, 1, rel)
+      + " "
+      + i32ToStr(n.pos)
+    Spread => "Spread " + piIx(n.spdArg, sp, 0, rel) + " " + i32ToStr(n.pos)
+  }
+}
+
+// Plain integers (arm offsets into a node's own lists), never rebased.
+function piInts(xs: i32[]): string {
+  let out = "["
+  let i = 0
+  while i < xs.length {
+    if i > 0 { out = out + "," }
+    out = out + i32ToStr(xs[i])
+    i = i + 1
+  }
+  out + "]"
+}
+
+export function parseImageCount(): i32 { piKeys.length }
+export function parseImageKeyLen(i: i32): i32 { piKeys[i].length }
+export function parseImageKeyAt(i: i32, j: i32): i32 { piKeys[i][j] }
+export function parseImageLen(i: i32): i32 { piTexts[i].length }
+export function parseImageAt(i: i32, j: i32): i32 { piTexts[i][j] }
