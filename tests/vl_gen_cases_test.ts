@@ -13,7 +13,7 @@
 //
 // @test-timing native
 
-import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { binaryen, COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -21,7 +21,7 @@ if (GATED && !ENABLED) {
   console.warn("[vl-gen-cases] skipped — missing vl binary or seed wasm.");
 }
 
-const WASM_DIS = `${ROOT}/node_modules/.bin/wasm-dis`;
+const WASM_DIS = binaryen("wasm-dis");
 const dec = new TextDecoder();
 
 // Each generator, the arguments it takes beyond `--out`, and the files it writes under it.
