@@ -336,8 +336,9 @@ The probes in §3.2 were run on that commit the same day.
 - For a module graph, `modCompile` (4185) does the rest, in order:
   1. orders modules depth-first (`modVisit`, 4202);
   2. parses every module into **one shared node arena**, `P.nodes` (4241–4257);
-  3. renames every module's top level to `name$mN`, where **N is the module's discovery
-     position** (`modBuildRename`, 4561);
+  3. renames every module's top level to `name$mN` (`modBuildRename`), where N is the module's
+     **stable id** (`compiler/modid.vl`, §3.2). Until S5's first step N was the discovery
+     position;
   4. builds the export alias tables for module 0 only (4311–4363);
   5. concatenates every module's statements into **one `Program`** (4366–4380);
   6. runs `checkProgram`, `jwSecondPass` and `emitProgram` on that merged program.
@@ -376,7 +377,7 @@ the same under `rules.test.vl` as under `beast.test.vl`.
 | --- | --- | --- | --- |
 | lex | the module's bytes | yes | **yes**, and already reused within one instance (`modCache*`, `driver.vl:558–636`; the LSP's `modCommitCached`, 3095) |
 | parse | the module's tokens | the AST content is; its **node indices are not** (one shared arena, offset by earlier modules) | needs relocation, or a per-module arena |
-| order + rename | the whole graph | **no**: `$mN` is the discovery position, so adding an import above M renames everything in M | needs a stable module id (path- or content-derived); a compiler-internal change, no ruling |
+| order + rename | the order: the whole graph; the rename: M's key and the set of keys | **the rename, yes** (S5's first step); the order, no | the rename only. `$mN` was the discovery position, so an import added above M renamed everything in M. N is now a 31-bit FNV-1a hash of M's normalised key, written in decimal: a `std:` key as written, otherwise the path relative to the cwd the host stages, or absolute when M lies outside it. When two keys collide, the one that sorts later is salted until unique, so the id depends only on the SET of keys. Digits keep every `$m\d+` demangler working. `tests/vl_module_id_stable_test.ts` holds it |
 | checker: exported `let` inference | M + its imports | **yes, by rule**: "an exported `let` is typed only by its own module's uses; an importer's use is an ordinary use" (DECISIONS.md, the B′+C literal-binding entry). Probe below. | yes, after rename and arena are fixed |
 | checker: un-annotated `const` | each use site | yes: typed per use, "no cross-module effect" (same entry) | yes |
 | checker: record adoption | **the importers' deliveries** | **no**. Probe below. | ruled (Q1, B): adoption crosses the boundary, so M's result is keyed on its importers' deliveries |
@@ -455,13 +456,16 @@ at most the 5 s that `vl check` costs. The build's other 22 s is only reachable 
 ### 3.3 What needs a ruling, and what does not
 
 **Compiler-internal (no ruling needed):**
-- a stable module id in place of the discovery position;
+- a stable module id in place of the discovery position (done: §3.2's order + rename row);
 - a per-module arena, or a relocatable one;
 - a host-side transcript of every message into the compiler instance;
 - symbolic indices in the emitter;
 - every cache in §4.
 
-**Ruled:** record adoption across a module boundary (Q1, B): it crosses, and S5 tracks importer demands. Exported signatures are not frozen (Q4, A): S5 hashes exported generic and inferred-return bodies.
+**Ruled:**
+- record adoption across a module boundary (Q1, B): it crosses, and S5 tracks importer demands;
+- exported signatures are not frozen at the module boundary (Q4, A): S5's interface hash
+  includes the bodies of exported generics and of exports with an inferred return.
 
 **Needs a ruling (none blocks S5):**
 - the user-visible surfaces: cache default and location (Q2), and a watch command (Q3).
@@ -925,6 +929,18 @@ graph: `play/game.vl` alone is 2.3 G, `rules/state.vl` 0.26 G, a trivial print 1
 - What is left is flatter. `sigKeyOfTy` mostly hits its memo: 12,265 calls and 1,977 misses on
   `journey`, so a perfect memo saves about 4.5%. `dupScanRun` and the checker are the next
   frames to profile.
+
+**S5 as built so far: stable module ids.** The `$mN` merge suffix is a function of the module's
+own key, not of its position (§3.2's order + rename row, `compiler/modid.vl`). Adding an
+import above M now leaves M's merged names unchanged; `tests/vl_module_id_stable_test.ts`
+fails on the discovery-position compiler. Wasm export names did not move. A `--names` build's
+name section, trap backtraces, `vl addr2line` and profiles now show the hashed id
+(`boom$m979099524` where they used to show `boom$m1`).
+- **Next:** the per-module or relocatable arena, so that a module's check output is a value of
+  its own rather than a range of the shared `P.nodes`. Then the interface hash. Q4 is ruled
+  (A), so the hash covers the bodies of exported generics and of exports whose return is
+  inferred, and it may not assume any export is annotated. Q1 (B) keys a module that an
+  importer adopts records into on that importer's demands.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
