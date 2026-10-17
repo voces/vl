@@ -478,29 +478,10 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // defaults. A top-level function is already recorded by the pass-1 hoist under the same
   // name; a nested one has no hoist and is recorded here, which is also the point it becomes callable.
   if n.fnName != "" { declareFnDeclNode(n.fnName, fnIx) }
-  let inferring = n.fnRet < 0
-  // Void-context lambda adoption: an un-annotated lambda literal whose contextual expected
-  // return is `void` is checked as if annotated `: void` rather than inferred, so an explicit
-  // `return expr` fails the same anchored mismatch a named `: void` spelling produces, and a
-  // value-bearing tail is silently discarded by the emitter. Keyed on the context's expected return, never on the tail's own shape.
-  if inferring && n.fnName == "" {
-    if isVoidTy(cbExpectedRetFor(fnIx)) {
-      inferring = false
-      noteVoidCtxLambda(fnIx)
-    }
-  }
-  // The same flip for the same reason: a bare `return` writes `: void`, so stop inferring and
-  // take the `!inferring` ladder's `TY_VOID` default, which already discards a valued tail.
-  let bareRetVoid = false
-  if inferring {
-    if blockHasBareReturn(n.fnBody) {
-      inferring = false
-      bareRetVoid = true
-    }
-  }
-  // ...and for a result no caller reads, which the hoist already bound as `: void` (D2631).
-  const ucVoided = inferring && fnResultUnconsumed(fnIx)
-  if ucVoided { inferring = false }
+  const mode = fnDeclRetMode(n, fnIx)
+  const inferring = mode.inferring
+  const bareRetVoid = mode.bareRetVoid
+  const ucVoided = mode.ucVoided
   // The infer-stack key: a named function uses its name (so self-recursion is detected); an
   // anonymous lambda has no name and keys by node index instead — else two nested anonymous
   // lambdas would both key on "" and the inner would falsely trip the recursive-cycle guard, mis-inferring its return as `void`.
@@ -581,20 +562,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   narFnEpoch = narFnEpoch + 1
   // The body keeps its own ledger; the enclosing function's rows, and the marks an enclosing
   // `if` holds into them, come back when it closes.
-  const savedClobKeys = narClobKeys
-  const savedClobTys = narClobTys
-  const savedClobPrev = narClobPrev
-  const savedClobDepths = narClobDepths
-  const savedClobRetired = narClobRetired
-  const savedClobBind = narClobBind
-  const savedClobDecl = narClobDecl
-  narClobKeysSet([])
-  narClobTysSet([])
-  narClobPrevSet([])
-  narClobDepthsSet([])
-  narClobRetiredSet([])
-  narClobBindSet([])
-  narClobDeclSet([])
+  const savedClob = fnDeclEnterClobLedger()
   fnDeclEnterBodyScope(n, fnIx, params)
   const fsbCallsAt = fsbCallIx.length
   const cstrOwnerPushed = fnDeclPushCstrOwner(n, fnIx)
@@ -604,23 +572,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // `let x` must not be flagged (the call may happen after `x` is written). The body checks in
   // its own frame, against an empty live set; `daLeaveFrame` restores the enclosing path.
   const daSavedUnassigned = daEnterFrame()
-  const savedRet = T.curRet
-  T.curRet = ret
-  const savedInRetArg = inRetArg
-  inRetArgSet(false)
-  // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
-  // lambda keeps the ENCLOSING function's name, which is the scope the declaration
-  // is actually inside.
-  const savedEscName = curFnEscName
-  if n.fnName != "" { curFnEscNameSet(n.fnName) }
-  const savedFnDeclIx = curFnDeclIx
-  curFnDeclIx = fnIx
-  const savedNjFn = njFnIx
-  njFnIxSet(fnIx)
-  // Why this body's return type is void, for the return that disagrees with it: nobody wrote
-  // `: void`, so the mismatch has to name the bare `return` that decided it.
-  const savedBareRetVoid = curFnBareRetVoid
-  curFnBareRetVoidSet(bareRetVoid)
+  const savedFrame = fnDeclEnterBodyFrame(n, fnIx, ret, bareRetVoid)
   fnDeclDeclareParams(n, fnIx, params, paramTys, paramCollapsed, ret)
   const bodyTotalForRet = fnDeclCheckBody(
     n,
@@ -631,12 +583,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     ret,
     ucVoided,
   )
-  T.curRet = savedRet
-  inRetArgSet(savedInRetArg)
-  curFnEscNameSet(savedEscName)
-  curFnDeclIx = savedFnDeclIx
-  njFnIxSet(savedNjFn)
-  curFnBareRetVoidSet(savedBareRetVoid)
+  fnDeclLeaveBodyFrame(savedFrame)
   daLeaveFrame(daSavedUnassigned)
   // A write after a call in source order (a loop's back edge) is re-asked here, inside this body,
   // so a pair naming its type parameter is deferred to its instances as at the call.
@@ -653,13 +600,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   flushInferRetHoles()
   popScope()
   crFnLeave()
-  narClobKeysSet(savedClobKeys)
-  narClobTysSet(savedClobTys)
-  narClobPrevSet(savedClobPrev)
-  narClobDepthsSet(savedClobDepths)
-  narClobRetiredSet(savedClobRetired)
-  narClobBindSet(savedClobBind)
-  narClobDeclSet(savedClobDecl)
+  fnDeclLeaveClobLedger(savedClob)
   if !inferQuiet {
     // Marks only the registered top-level decl (not a nested/shadowing namesake).
     if n.fnName != "" && (fnDeclIx[n.fnName] ?? -1) == fnIx {
@@ -701,6 +642,134 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
   // named function referenced as a value) evaluates to it.
   mkFuncTy(paramTys, ret)
+}
+
+// How `checkFuncDeclNodeReal` treats a declaration's return: `inferring` when it is solved from
+// the body, `bareRetVoid` when a bare `return` made it `: void`, `ucVoided` when no caller reads it.
+type FnRetMode = { inferring: boolean, bareRetVoid: boolean, ucVoided: boolean }
+
+// The return mode of declaration `n` at node `fnIx`. An un-annotated return is inferred unless a
+// void context, a bare `return` or an unread result makes it `: void`.
+function fnDeclRetMode(n: FuncDecl, fnIx: i32): FnRetMode {
+  let inferring = n.fnRet < 0
+  // Void-context lambda adoption: an un-annotated lambda literal whose contextual expected
+  // return is `void` is checked as if annotated `: void` rather than inferred, so an explicit
+  // `return expr` fails the same anchored mismatch a named `: void` spelling produces, and a
+  // value-bearing tail is silently discarded by the emitter. Keyed on the context's expected return, never on the tail's own shape.
+  if inferring && n.fnName == "" {
+    if isVoidTy(cbExpectedRetFor(fnIx)) {
+      inferring = false
+      noteVoidCtxLambda(fnIx)
+    }
+  }
+  // The same flip for the same reason: a bare `return` writes `: void`, so stop inferring and
+  // take the `!inferring` ladder's `TY_VOID` default, which already discards a valued tail.
+  let bareRetVoid = false
+  if inferring {
+    if blockHasBareReturn(n.fnBody) {
+      inferring = false
+      bareRetVoid = true
+    }
+  }
+  // ...and for a result no caller reads, which the hoist already bound as `: void` (D2631).
+  const ucVoided = inferring && fnResultUnconsumed(fnIx)
+  if ucVoided { inferring = false }
+  { inferring: inferring, bareRetVoid: bareRetVoid, ucVoided: ucVoided }
+}
+
+// The enclosing function's narrowing-clobber ledger, held while a nested body keeps its own.
+type NarClobLedger = {
+  keys: string[],
+  tys: i32[],
+  prev: i32[],
+  depths: i32[],
+  retired: i32[],
+  bind: i32[],
+  decl: i32[],
+}
+
+// Saves the live clobber ledger and starts an empty one for the body about to be checked.
+function fnDeclEnterClobLedger(): NarClobLedger {
+  const saved: NarClobLedger = {
+    keys: narClobKeys,
+    tys: narClobTys,
+    prev: narClobPrev,
+    depths: narClobDepths,
+    retired: narClobRetired,
+    bind: narClobBind,
+    decl: narClobDecl,
+  }
+  narClobKeysSet([])
+  narClobTysSet([])
+  narClobPrevSet([])
+  narClobDepthsSet([])
+  narClobRetiredSet([])
+  narClobBindSet([])
+  narClobDeclSet([])
+  saved
+}
+
+// Puts back the ledger `fnDeclEnterClobLedger` saved.
+function fnDeclLeaveClobLedger(saved: NarClobLedger) {
+  narClobKeysSet(saved.keys)
+  narClobTysSet(saved.tys)
+  narClobPrevSet(saved.prev)
+  narClobDepthsSet(saved.depths)
+  narClobRetiredSet(saved.retired)
+  narClobBindSet(saved.bind)
+  narClobDeclSet(saved.decl)
+  0
+}
+
+// The enclosing body's per-function checker state, held while a nested body is checked.
+type FnBodyFrame = {
+  curRet: i32,
+  inRetArg: boolean,
+  escName: string,
+  declIx: i32,
+  njFn: i32,
+  bareRetVoid: boolean,
+}
+
+// Saves the per-function state and installs declaration `n`'s: its return `ret`, its node
+// `fnIx`, and whether a bare `return` made it void (`bareRetVoid`).
+function fnDeclEnterBodyFrame(
+  n: FuncDecl,
+  fnIx: i32,
+  ret: i32,
+  bareRetVoid: boolean,
+): FnBodyFrame {
+  const saved: FnBodyFrame = {
+    curRet: T.curRet,
+    inRetArg: inRetArg,
+    escName: curFnEscName,
+    declIx: curFnDeclIx,
+    njFn: njFnIx,
+    bareRetVoid: curFnBareRetVoid,
+  }
+  T.curRet = ret
+  inRetArgSet(false)
+  // D1045: the name the nominal-escape refusal puts in its sentence. An anonymous
+  // lambda keeps the ENCLOSING function's name, which is the scope the declaration
+  // is actually inside.
+  if n.fnName != "" { curFnEscNameSet(n.fnName) }
+  curFnDeclIx = fnIx
+  njFnIxSet(fnIx)
+  // Why this body's return type is void, for the return that disagrees with it: nobody wrote
+  // `: void`, so the mismatch has to name the bare `return` that decided it.
+  curFnBareRetVoidSet(bareRetVoid)
+  saved
+}
+
+// Puts back the state `fnDeclEnterBodyFrame` saved.
+function fnDeclLeaveBodyFrame(saved: FnBodyFrame) {
+  T.curRet = saved.curRet
+  inRetArgSet(saved.inRetArg)
+  curFnEscNameSet(saved.escName)
+  curFnDeclIx = saved.declIx
+  njFnIxSet(saved.njFn)
+  curFnBareRetVoidSet(saved.bareRetVoid)
+  0
 }
 
 // Whether an inferring check of declaration `fnIx` is skipped and answers `void` (its caller

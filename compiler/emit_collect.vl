@@ -503,6 +503,9 @@ import {
   sTwin,
   sTyIx,
   sTypeIdx,
+  scopeFrames,
+  scopeNames,
+  scopeSlots,
   slUsed,
   startStmtOrd,
   startStmts,
@@ -2828,29 +2831,7 @@ export function collectCloSigs() {
       fe = fe + 1
       continue
     }
-    let key = fnSigKeyOf(fe)
-    // A void- (`>v`) or struct-returning (`>sN;`) function used as a value needs its extended
-    // sig interned too — the value-eligible key above excludes both. `cloSigKeyExt` yields ""
-    // for the kinds still outside the value ABI, so those stay unminted.
-    if key == "" { key = cloSigKeyExt(fe) }
-    // The concrete-lambda rep: this key's representative is the lifted function itself, not the
-    // -1 synth sentinel.
-    internCloSigKey(key, fe)
-    // A nullable-closure result (key `…>C`): intern the inner closure's `$fnsig` too, since the
-    // inner closure is never constructed and a narrowed value call would find no interned sig.
-    // The inner type rides the lambda's pinned `fnRet` nullable part, and `unionArmSigKey`
-    // yields the same key the narrowed call site derives. Usage-gated by `fnValUsed`.
-    if cloRetValKind(fe) == "nulclosure" {
-      const rfn = P.nodes[fnStmts[fe]]
-      if rfn is FuncDecl {
-        // The mixed-union skip belongs here too, and this is the one synth site where its
-        // absence is not inert: for an un-instantiated generic template `inm` still carries the
-        // type parameter, which counts as the composite side of the mix test and is registered
-        // by nothing. Unguarded, such a template steals a concrete lambda's rep for its key.
-        const inm = nullablePartOf(tyNameOf(rfn.fnRet))
-        if inm != "" { internCloSigOfAtom(inm) }
-      }
-    }
+    collectLiftedCloSig(fe, fnStmts[fe])
     // A closure-returning-closure result: the lambda keys its own sig as the collapsed `>c` but
     // the inner closure's sig is never minted from a concrete lambda, so `g()(1)` has no
     // interned signature. Walk the result chain off the lambda's checker type — the same source
@@ -2912,55 +2893,7 @@ export function collectCloSigs() {
     } else {
       unionSetAtomsOf(unMemberSet[ui], atoms)
     }
-    let uj = 0
-    while uj < atoms.length {
-      // A function-type union arm: the arm's own closure sig. The row decides the key and also
-      // decides there is not one — `unMemTys` is recorded in `unMemAtoms` order, so a `TyFunc`
-      // row hands `sigKeyOfTy` the key the parse would have produced and a non-`TyFunc` row is
-      // the "" it would have returned. The guard is untouched in both branches.
-      let armRow = -1
-      if uj < atomTys.length { armRow = atomTys[uj] }
-      if armRow >= 0 {
-        const armT = T.tys[armRow]
-        if armT is TyFunc {
-          internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow))
-        }
-      } else {
-        internCloSigOfAtom(atoms[uj])
-      }
-      // A closure-array arm, plain or nullable-element: the element closure sig is interned by
-      // neither the function-arm branch above nor the TypeRef pass below, which sees only a
-      // top-level closure-array annotation. Same `unionArmSigKey` element-key normalization the
-      // call site derives; the row says whether there is a closure element at all.
-      let uCaRow = -1
-      if uj < atomTys.length {
-        const arow2 = atomTys[uj]
-        if arow2 >= 0 {
-          const at2 = T.tys[arow2]
-          if at2 is TyArray {
-            if at2.aElem >= 0 {
-              const ee = T.tys[at2.aElem]
-              if ee is TyFunc {
-                uCaRow = at2.aElem
-              } else if ee is TyNullable {
-                if ee.nInner >= 0 {
-                  const ei = T.tys[ee.nInner]
-                  if ei is TyFunc { uCaRow = ee.nInner }
-                }
-              }
-            }
-          }
-        }
-      }
-      if uCaRow >= 0 {
-        const uCael = cloArrElemNameOf(atoms[uj])
-        if uCael != "" { internCloSigOfAtomTy(uCael, sigKeyOfTy(uCaRow)) }
-      } else if uj >= atomTys.length {
-        const uCael = cloArrElemNameOf(atoms[uj])
-        if uCael != "" { internCloSigOfAtom(uCael) }
-      }
-      uj = uj + 1
-    }
+    collectUnionArmCloSigs(atoms, atomTys)
     ui = ui + 1
   }
   // Nullable-closure annotations whose value is only ever `null` — narrowed and called, with no
@@ -3015,6 +2948,89 @@ export function collectCloSigs() {
       return -1
     }
     lf = lf + 1
+  }
+  0
+}
+
+// `collectCloSigs`'s step for the lifted function `fe`, whose statement is `sx`: interns its
+// own `$fnsig` at rep `fe`, then the inner closure's sig when its result is a nullable closure.
+function collectLiftedCloSig(fe: i32, sx: i32) {
+  let key = fnSigKeyOf(fe)
+  // A void- (`>v`) or struct-returning (`>sN;`) function used as a value needs its extended
+  // sig interned too — the value-eligible key above excludes both. `cloSigKeyExt` yields ""
+  // for the kinds still outside the value ABI, so those stay unminted.
+  if key == "" { key = cloSigKeyExt(fe) }
+  // The concrete-lambda rep: this key's representative is the lifted function itself, not the
+  // -1 synth sentinel.
+  internCloSigKey(key, fe)
+  // A nullable-closure result (key `…>C`): intern the inner closure's `$fnsig` too, since the
+  // inner closure is never constructed and a narrowed value call would find no interned sig.
+  // The inner type rides the lambda's pinned `fnRet` nullable part, and `unionArmSigKey`
+  // yields the same key the narrowed call site derives. Usage-gated by `fnValUsed`.
+  if cloRetValKind(fe) == "nulclosure" {
+    const rfn = P.nodes[sx]
+    if rfn is FuncDecl {
+      // The mixed-union skip belongs here too, and this is the one synth site where its
+      // absence is not inert: for an un-instantiated generic template `inm` still carries the
+      // type parameter, which counts as the composite side of the mix test and is registered
+      // by nothing. Unguarded, such a template steals a concrete lambda's rep for its key.
+      const inm = nullablePartOf(tyNameOf(rfn.fnRet))
+      if inm != "" { internCloSigOfAtom(inm) }
+    }
+  }
+  0
+}
+
+// `collectCloSigs`'s step for one union row: interns the closure sig of each function-type arm
+// and of each closure-array arm's element. `atomTys` is the row's recorded arm types, parallel
+// to `atoms`, or empty when the row has none and the atoms come from its spelling.
+function collectUnionArmCloSigs(atoms: string[], atomTys: i32[]) {
+  let uj = 0
+  while uj < atoms.length {
+    // A function-type union arm: the arm's own closure sig. The row decides the key and also
+    // decides there is not one — `unMemTys` is recorded in `unMemAtoms` order, so a `TyFunc`
+    // row hands `sigKeyOfTy` the key the parse would have produced and a non-`TyFunc` row is
+    // the "" it would have returned. The guard is untouched in both branches.
+    let armRow = -1
+    if uj < atomTys.length { armRow = atomTys[uj] }
+    if armRow >= 0 {
+      const armT = T.tys[armRow]
+      if armT is TyFunc { internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow)) }
+    } else {
+      internCloSigOfAtom(atoms[uj])
+    }
+    // A closure-array arm, plain or nullable-element: the element closure sig is interned by
+    // neither the function-arm branch above nor the TypeRef pass below, which sees only a
+    // top-level closure-array annotation. Same `unionArmSigKey` element-key normalization the
+    // call site derives; the row says whether there is a closure element at all.
+    let uCaRow = -1
+    if uj < atomTys.length {
+      const arow2 = atomTys[uj]
+      if arow2 >= 0 {
+        const at2 = T.tys[arow2]
+        if at2 is TyArray {
+          if at2.aElem >= 0 {
+            const ee = T.tys[at2.aElem]
+            if ee is TyFunc {
+              uCaRow = at2.aElem
+            } else if ee is TyNullable {
+              if ee.nInner >= 0 {
+                const ei = T.tys[ee.nInner]
+                if ei is TyFunc { uCaRow = ee.nInner }
+              }
+            }
+          }
+        }
+      }
+    }
+    if uCaRow >= 0 {
+      const uCael = cloArrElemNameOf(atoms[uj])
+      if uCael != "" { internCloSigOfAtomTy(uCael, sigKeyOfTy(uCaRow)) }
+    } else if uj >= atomTys.length {
+      const uCael = cloArrElemNameOf(atoms[uj])
+      if uCael != "" { internCloSigOfAtom(uCael) }
+    }
+    uj = uj + 1
   }
   0
 }
@@ -3978,7 +3994,7 @@ function collectLetLocal(stmtIx: i32, s: LetDecl, fnIx: i32) {
   // those locals are bound while the binding is classified, so an arm's tail naming one
   // reads its slot rather than a type parameter's recorded type (D2785).
   let initArms = 0
-  if exprArmLocalsAny { initArms = letInitArmsFirst(s.letInit, fnIx) }
+  if exprArmLocalsAny { initArms = letInitArmsFirst(s.letInit, stmtIx, fnIx) }
   if initArms < 0 {
     scopePop()
     return -1
@@ -4004,6 +4020,8 @@ function collectLetLocal(stmtIx: i32, s: LetDecl, fnIx: i32) {
   // the order `emitLetDeclStmt` walks: `emitLetCursor`, then the init, then `scopeBind`.
   if initArms == 1 {
     scopePop()
+  } else if initArms == 2 {
+    // allocated ahead of the binding, with no frame to close
   } else if collectIfExprLocals(s.letInit, fnIx) < 0 {
     scopePop()
     return -1
@@ -4366,13 +4384,22 @@ function collectIfExprLocals(exprIx: i32, fnIx: i32) {
   collectExprArms(exprIx, fnIx)
 }
 
-// Walk the arm locals of a binding's bare if-expression initializer by node, ahead of the
-// binding's own classification, and push a frame binding each arm's top-level locals: 1 when it
-// did (the caller pops the frame), 0 when the initializer declares nothing, -1 on failure.
-function letInitArmsFirst(initIx: i32, fnIx: i32): i32 {
+// Push a frame binding each arm's top-level locals of a binding's bare if-expression
+// initializer, ahead of the binding's own classification: 1 when it did (the caller pops it),
+// 0 when it declares nothing, -1 on failure, 2 when the statement frame `stmtArmScopeOpen`
+// opens for an `if` nested in the initializer declines (D5333).
+function letInitArmsFirst(initIx: i32, stmtIx: i32, fnIx: i32): i32 {
   if !exprArmLocalsAny || initIx < 0 { return 0 }
   const bare = unwrapParen(initIx)
-  if bare < 0 || !(P.nodes[bare] is IfStmt) { return 0 }
+  if bare < 0 { return 0 }
+  if !(P.nodes[bare] is IfStmt) {
+    const ifs: i32[] = []
+    preludeIfsIn(initIx, ifs)
+    if ifs.length == 0 { return 0 }
+    if collectExprArms(initIx, fnIx) < 0 { return -1 }
+    if armScopeOpenOver(initIx, stmtIx) { return 1 }
+    return 2
+  }
   if firstLocalDeclIn(bare) < 0 { return 0 }
   collectByNode = collectByNode + 1
   const rc = collectLocalsIf(bare, fnIx)
@@ -4455,6 +4482,239 @@ function armPreludeBind(blockIx: i32) {
     }
   }
   0
+}
+
+// Whether the arm block at `blockIx` has a statement before its value.
+function armHasPrelude(blockIx: i32): boolean {
+  if blockIx < 0 { return false }
+  const b = P.nodes[blockIx]
+  if b is Block {
+    if b.blkStmts.length > 1 { return true }
+    // An arm whose value is another `if` has that `if`'s arm preludes (D2825).
+    if b.blkStmts.length == 1 {
+      const tail = unwrapParen(b.blkStmts[0])
+      if tail >= 0 && P.nodes[tail] is IfStmt { return chainHasPrelude(tail) }
+    }
+  }
+  false
+}
+
+// Whether any arm along the `if` chain at `ifIx` has a prelude (`armHasPrelude`).
+export function chainHasPrelude(ifIx: i32): boolean {
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      if armHasPrelude(s.ifThen) { return true }
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
+        else if armHasPrelude(s.ifElse) { return true }
+      }
+    }
+  }
+  false
+}
+
+// Opens one frame binding the arm-prelude locals of every value `if` in the statement at
+// `stmtIx` (an expression, `return`, `let` initializer, or `if`/`while` condition), so a
+// classifier asked outside the arm reads an arm tail at its locals (D5333). Returns the
+// frame's local count, or -1 with no frame pushed; `stmtArmScopeClose` closes it.
+export function stmtArmScopeOpen(stmtIx: i32): i32 {
+  const root = stmtArmRoot(stmtIx)
+  if root < 0 { return -1 }
+  if !armScopeOpenOver(root, stmtIx) { return -1 }
+  scopeNames.length - scopeFrames[scopeFrames.length - 1]
+}
+
+// The expression of the statement at `stmtIx` that `stmtArmScopeOpen` scopes, or -1 for a
+// statement it leaves alone.
+export function stmtArmRoot(stmtIx: i32): i32 {
+  if !exprArmLocalsAny || stmtIx < 0 || stmtIx >= P.nodes.length { return -1 }
+  const s = P.nodes[stmtIx]
+  if s is RetStmt { return s.retArg }
+  if s is IfStmt { return s.ifCond }
+  if s is WhileStmt { return s.whileCond }
+  if s is LetDecl { return letArmRoot(s.letInit) }
+  if stmtIsScopedExpr(stmtIx) { return stmtIx }
+  -1
+}
+
+// Whether the expression statement at `stmtIx` is one whose arm preludes a statement frame
+// scopes.
+function stmtIsScopedExpr(stmtIx: i32): boolean {
+  if stmtIx < 0 || stmtIx >= P.nodes.length { return false }
+  const s = P.nodes[stmtIx]
+  s is Call || s is BinExpr || s is Paren || s is Unary
+}
+
+// A `let` initializer as `stmtArmRoot`'s root, or -1 for a bare `if`, which has its own
+// frame (`letInitArmsFirst`, `emitIfExpr`).
+function letArmRoot(init: i32): i32 {
+  if init < 0 { return -1 }
+  const b = unwrapParen(init)
+  if b < 0 || b >= P.nodes.length { return -1 }
+  if P.nodes[b] is IfStmt { return -1 }
+  init
+}
+
+// `stmtArmScopeOpen` over the expression at `root`, inside node `whole`: declines when two
+// preludes share a name, or `whole` reads one outside the arm statements after its declaration.
+export function armScopeOpenOver(root: i32, whole: i32): boolean {
+  if !exprArmLocalsAny { return false }
+  const ifs: i32[] = []
+  preludeIfsIn(root, ifs)
+  if ifs.length == 0 { return false }
+  const names: string[] = []
+  const blocks: i32[] = []
+  const at: i32[] = []
+  let k = 0
+  while k < ifs.length {
+    chainPreludeDecls(ifs[k], names, blocks, at)
+    k = k + 1
+  }
+  let i = 0
+  while i < names.length {
+    let j = i + 1
+    while j < names.length {
+      if names[j] == names[i] { return false }
+      j = j + 1
+    }
+    const b = P.nodes[blocks[i]]
+    let inArm = 0
+    if b is Block {
+      let t = at[i] + 1
+      while t < b.blkStmts.length {
+        inArm = inArm + identReadsOf(b.blkStmts[t], names[i])
+        t = t + 1
+      }
+    }
+    if identReadsOf(whole, names[i]) != inArm { return false }
+    i = i + 1
+  }
+  scopePush()
+  k = 0
+  while k < ifs.length {
+    armPreludeBindChain(ifs[k])
+    k = k + 1
+  }
+  true
+}
+
+// Closes a frame `stmtArmScopeOpen` opened with `kept` bindings: what the statement bound
+// after them — a `let`'s own name — moves to the enclosing frame.
+export function stmtArmScopeClose(kept: i32) {
+  const mark = scopeFrames[scopeFrames.length - 1] + kept
+  const names: string[] = []
+  const slots: i32[] = []
+  let i = mark
+  while i < scopeNames.length {
+    names.push(scopeNames[i])
+    slots.push(scopeSlots[i])
+    i = i + 1
+  }
+  scopePop()
+  i = 0
+  while i < names.length {
+    scopeBind(names[i], slots[i])
+    i = i + 1
+  }
+  0
+}
+
+// Appends each value `if` under `ix` whose chain has an arm prelude, outermost only; a block
+// or a nested function bounds the walk.
+function preludeIfsIn(ix: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl || n is Block { return 0 }
+  if n is IfStmt {
+    if chainHasPrelude(ix) {
+      out.push(ix)
+      return 0
+    }
+  }
+  const kids = nodeChildren(ix)
+  let k = 0
+  while k < kids.length {
+    preludeIfsIn(kids[k], out)
+    k = k + 1
+  }
+  0
+}
+
+// Appends each prelude `let` along the `if` chain at `ifIx` as `armPreludeBindChain` binds it:
+// its name, its arm block and its statement position there.
+function chainPreludeDecls(
+  ifIx: i32,
+  names: string[],
+  blocks: i32[],
+  at: i32[],
+) {
+  let cur = ifIx
+  while cur >= 0 {
+    const s = P.nodes[cur]
+    cur = -1
+    if s is IfStmt {
+      armPreludeDecls(s.ifThen, names, blocks, at)
+      if s.ifElse >= 0 {
+        if P.nodes[s.ifElse] is IfStmt {
+          cur = s.ifElse
+        } else {
+          armPreludeDecls(s.ifElse, names, blocks, at)
+        }
+      }
+    }
+  }
+  0
+}
+
+// `chainPreludeDecls` for one arm block, then the `if` its tail is.
+function armPreludeDecls(
+  blockIx: i32,
+  names: string[],
+  blocks: i32[],
+  at: i32[],
+) {
+  const b = P.nodes[blockIx]
+  if b is Block {
+    const n = b.blkStmts.length
+    let i = 0
+    while i + 1 < n {
+      const d = P.nodes[b.blkStmts[i]]
+      if d is LetDecl {
+        names.push(d.letName)
+        blocks.push(blockIx)
+        at.push(i)
+      }
+      i = i + 1
+    }
+    if n > 0 {
+      const tail = unwrapParen(b.blkStmts[n - 1])
+      if tail >= 0 && P.nodes[tail] is IfStmt {
+        chainPreludeDecls(tail, names, blocks, at)
+      }
+    }
+  }
+  0
+}
+
+// How many identifier reads under `ix` are spelled `name`.
+function identReadsOf(ix: i32, name: string): i32 {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if n.identName == name { return 1 }
+    return 0
+  }
+  const kids = nodeChildren(ix)
+  let c = 0
+  let k = 0
+  while k < kids.length {
+    c = c + identReadsOf(kids[k], name)
+    k = k + 1
+  }
+  c
 }
 
 // The slot the collect pass gave the `let` at `declIx` in the frame being emitted, or -1.

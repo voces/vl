@@ -3846,50 +3846,9 @@ function monoCloneLambdaSubst(
     // template must not appear in either.
     if !monoLamNodeIsTemplateCore(fnIx, typarams) { return -1 }
     const ps: i32[] = []
-    let any = false
-    let i = 0
-    while i < a.fnParams.length {
-      const p = P.nodes[a.fnParams[i]]
-      if p is Param {
-        const nt = monoSubstAnnNode(p.parType, typarams, tvN, tvV, bN, bT)
-        if nt >= 0 {
-          ps.push(
-            monoCopyOf(
-              a.fnParams[i],
-              mkParam(p.parName, nt, p.parDefault, p.parOpt, p.parRest, p.pos),
-            ),
-          )
-          any = true
-        } else if nt == -2 {
-          // The annotation names a type parameter this instance cannot substitute. The
-          // template stays, this instance keeps calling it, and the `checkParams` floor
-          // refuses loudly — which is why the prune has to be told.
-          monoNoteLamNode(monoLamShared, fnIx)
-          return -1
-        } else {
-          // An un-annotated parameter the checker inferred at the type parameter (a `.filter`
-          // callback over a `T[]`) is annotated at this pin, since nothing else lowers it.
-          const ipn = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
-          if ipn >= 0 {
-            ps.push(
-              monoCopyOf(
-                a.fnParams[i],
-                mkParam(p.parName, ipn, p.parDefault, p.parOpt, p.parRest, p.pos),
-              ),
-            )
-            any = true
-          } else {
-            // Unchanged — share the original `Param` node, so a lambda with one generic
-            // and one concrete parameter mints exactly one node.
-            ps.push(a.fnParams[i])
-          }
-        }
-      } else {
-        monoNoteLamNode(monoLamShared, fnIx)
-        return -1
-      }
-      i = i + 1
-    }
+    const psAny = monoLamSubstParams(a, fnIx, typarams, tvN, tvV, bN, bT, ps)
+    if psAny < 0 { return -1 }
+    let any = psAny > 0
     let nret = a.fnRet
     const rt = monoSubstAnnNode(a.fnRet, typarams, tvN, tvV, bN, bT)
     if rt >= 0 {
@@ -3927,39 +3886,8 @@ function monoCloneLambdaSubst(
     // clone is a node it never saw, so the return expression's own recorded type is the
     // fact, substituted through the same binding. Gated on the type carrying a variable.
     if nret < 0 {
-      const rex = fnRetExprOf(fnIx)
-      let rty = -1
-      if rex >= 0 { rty = nodeTyIxOf(rex) }
-      // A tail `if` or `match` is no return expression: the template's checked signature
-      // holds its join, as the named clone's does.
-      if rex < 0 { rty = monoLamCheckedRet(fnIx) }
-      // A join kept apart over the body's parameters (D3520), or one holding a concrete arm
-      // beside a hole (`string | _`, D3125), is the signature whatever the last arm's own
-      // type: callers re-join it at the pin the same way.
-      const kept = monoLamCheckedRet(fnIx)
-      const keptJoin = kept >= 0
-        && (tyIsTpJoinUnion(kept) || tyIsArmedDeferredJoin(kept))
-      if keptJoin { rty = kept }
-      if rty >= 0 && tyHasTyVar(rty) {
-        let rs = substTyDeep(rty, bN, bT)
-        if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
-        if rs >= 0 && rs != rty {
-          const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin
-          if !tyHasTyVar(rs) && !litGate {
-            const rnm = monoPinAnnSpelling(rs)
-            // The box a kept-apart join returns is registered here, as an instance return's is.
-            if (
-              rnm != ""
-              && keptJoin
-              && monoTyIsUnionOrNulUnion(rs)
-              && !monoTyHoldsRefArm(rs)
-            ) {
-              if monoRegisterPinUnion(rnm) < 0 { return -1 }
-            }
-            if rnm != "" { nret = synthTypeRefTy(rnm, -1, rs) }
-          }
-        }
-      }
+      nret = monoLamPinRetAnn(fnIx, nret, bN, bT)
+      if nret == -2 { return -1 }
     }
     // D1046 — a nested named function keeps its name. An anonymous lambda is reached
     // through the value the clone is written into, so a minted `__lambda_N` is invisible;
@@ -3984,22 +3912,7 @@ function monoCloneLambdaSubst(
     const nbodyL = monoPinBodyLambdas(nbodyF, typarams, tvN, tvV, bN, bT)
     // A generic call in the body is instantiated by rewriting its callee in place, so each
     // clone takes its own copy, as an instance body does (D2553).
-    const svCgcP = monoCgcTyParams
-    const svCgcN = monoCgcTvN
-    const svCgcV = monoCgcTvV
-    monoCgcTyParams = typarams
-    monoCgcTvN = tvN
-    monoCgcTvV = tvV
-    const svCgcBN = monoCgcBN
-    const svCgcBT = monoCgcBT
-    monoCgcBN = bN
-    monoCgcBT = bT
-    const nbody = monoCloneGenericCalls(nbodyL)
-    monoCgcBN = svCgcBN
-    monoCgcBT = svCgcBT
-    monoCgcTyParams = svCgcP
-    monoCgcTvN = svCgcN
-    monoCgcTvV = svCgcV
+    const nbody = monoLamCloneGenericCalls(nbodyL, typarams, tvN, tvV, bN, bT)
     // The lambda twin of the named clone's rule: a bare `return` in the body is void, so the
     // return-expression pin above must not give this instance a result (D1600).
     let cloneRet = nret
@@ -4011,45 +3924,183 @@ function monoCloneLambdaSubst(
     if cty >= 0 && !tyHasTyVar(cty) { nodeTyRecord(clone, cty) }
     // A lifted clone answers what its template did, the captures it widened included (D2402).
     recordClonedCallRetire(fnIx, clone)
-    // D1046 — the first instance of a named nested function replaces the template's slot
-    // rather than pushing beside it: the by-name lookup takes the first child of the
-    // frame, so two same-named children mean the call answers the unsubstituted template.
-    // Later instances push and are re-pointed at their own frame by the caller.
-    if monoFnNameIsSourceNamed(a.fnName) && monoInstIsFirst {
-      const tSlot = monoSlotOfLamNode(fnIx)
-      if tSlot >= 0 {
-        buildFnMapNoteFnStmtWrite(tSlot, clone)
-        fnStmts[tSlot] = clone
-        monoArenaTouch()
-        monoNamedTmplNode.push(fnIx)
-        monoNamedTmplSlot.push(tSlot)
-        monoReparentNestedLams(mark, tSlot)
-        fnValUsed = true
-        fnNestUsed = true
-        monoNoteLamNode(monoLamPinned, fnIx)
-        return clone
-      }
-    }
-    fnStmts.push(clone)
-    // The original's frame, not module scope. The clone shares the body, so its free names
-    // have to resolve up the same scope chain or a lambda that both captures and annotates
-    // `T` loses its environment. (`monoCloneLambdaPinned` pushes -1 because a `.map`
-    // callback is rebuilt from an argument position, not from a lifted slot of its own.)
-    fnParent.push(monoLamParentOf(fnIx))
-    const mySlot = fnStmts.length - 1
-    const tmplSlot = monoSlotOfLamNode(fnIx)
-    monoCloneKeepsHoles(tmplSlot, mySlot, clone)
-    lfNoteClone(mySlot, tmplSlot)
-    monoReparentNestedLams(mark, mySlot)
-    monoLamMintedSlots.push(mySlot)
-    monoLamCloneSlots.push(mySlot)
-    fnDispNames.push("")
-    fnValUsed = true
-    fnNestUsed = true
-    monoNoteLamNode(monoLamPinned, fnIx)
-    return clone
+    return monoLamInstallClone(a, fnIx, clone, mark)
   }
   -1
+}
+
+// `monoCloneLambdaSubst`'s body step: copies the direct generic calls in `nbodyL` for this
+// instance (`typarams`/`tvN`/`tvV`, binding `bN`/`bT`), then restores the enclosing copy's
+// state. Returns the copied body, or `nbodyL` when it makes no generic call.
+function monoLamCloneGenericCalls(
+  nbodyL: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  const svCgcP = monoCgcTyParams
+  const svCgcN = monoCgcTvN
+  const svCgcV = monoCgcTvV
+  monoCgcTyParams = typarams
+  monoCgcTvN = tvN
+  monoCgcTvV = tvV
+  const svCgcBN = monoCgcBN
+  const svCgcBT = monoCgcBT
+  monoCgcBN = bN
+  monoCgcBT = bT
+  const nbody = monoCloneGenericCalls(nbodyL)
+  monoCgcBN = svCgcBN
+  monoCgcBT = svCgcBT
+  monoCgcTyParams = svCgcP
+  monoCgcTvN = svCgcN
+  monoCgcTvV = svCgcV
+  nbody
+}
+
+// `monoCloneLambdaSubst`'s parameter step: appends to `ps` each parameter of the lambda `a` at
+// `fnIx`, substituted through this instance where its annotation or inferred type rides a type
+// parameter. Returns 1 when one changed, 0 when none did, and -1, after noting the template
+// shared, when one cannot be substituted.
+function monoLamSubstParams(
+  a: FuncDecl,
+  fnIx: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+  ps: i32[],
+) {
+  let any = 0
+  let i = 0
+  while i < a.fnParams.length {
+    const p = P.nodes[a.fnParams[i]]
+    if p is Param {
+      const nt = monoSubstAnnNode(p.parType, typarams, tvN, tvV, bN, bT)
+      if nt >= 0 {
+        ps.push(
+          monoCopyOf(
+            a.fnParams[i],
+            mkParam(p.parName, nt, p.parDefault, p.parOpt, p.parRest, p.pos),
+          ),
+        )
+        any = 1
+      } else if nt == -2 {
+        // The annotation names a type parameter this instance cannot substitute. The
+        // template stays, this instance keeps calling it, and the `checkParams` floor
+        // refuses loudly — which is why the prune has to be told.
+        monoNoteLamNode(monoLamShared, fnIx)
+        return -1
+      } else {
+        // An un-annotated parameter the checker inferred at the type parameter (a `.filter`
+        // callback over a `T[]`) is annotated at this pin, since nothing else lowers it.
+        const ipn = monoLamParamPinAnn(fnIx, i, p.parType, bN, bT)
+        if ipn >= 0 {
+          ps.push(
+            monoCopyOf(
+              a.fnParams[i],
+              mkParam(p.parName, ipn, p.parDefault, p.parOpt, p.parRest, p.pos),
+            ),
+          )
+          any = 1
+        } else {
+          // Unchanged — share the original `Param` node, so a lambda with one generic
+          // and one concrete parameter mints exactly one node.
+          ps.push(a.fnParams[i])
+        }
+      }
+    } else {
+      monoNoteLamNode(monoLamShared, fnIx)
+      return -1
+    }
+    i = i + 1
+  }
+  any
+}
+
+// `monoCloneLambdaSubst`'s return step for the un-annotated lambda at `fnIx`: the return
+// annotation its recorded return type takes through binding `bN`/`bT`, or `nret` when none
+// applies. Returns -2 when the pinned union cannot be registered.
+function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
+  const rex = fnRetExprOf(fnIx)
+  let rty = -1
+  if rex >= 0 { rty = nodeTyIxOf(rex) }
+  // A tail `if` or `match` is no return expression: the template's checked signature
+  // holds its join, as the named clone's does.
+  if rex < 0 { rty = monoLamCheckedRet(fnIx) }
+  // A join kept apart over the body's parameters (D3520), or one holding a concrete arm
+  // beside a hole (`string | _`, D3125), is the signature whatever the last arm's own
+  // type: callers re-join it at the pin the same way.
+  const kept = monoLamCheckedRet(fnIx)
+  const keptJoin = kept >= 0
+    && (tyIsTpJoinUnion(kept) || tyIsArmedDeferredJoin(kept))
+  if keptJoin { rty = kept }
+  if rty >= 0 && tyHasTyVar(rty) {
+    let rs = substTyDeep(rty, bN, bT)
+    if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
+    if rs >= 0 && rs != rty {
+      const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin
+      if !tyHasTyVar(rs) && !litGate {
+        const rnm = monoPinAnnSpelling(rs)
+        // The box a kept-apart join returns is registered here, as an instance return's is.
+        if (
+          rnm != ""
+          && keptJoin
+          && monoTyIsUnionOrNulUnion(rs)
+          && !monoTyHoldsRefArm(rs)
+        ) {
+          if monoRegisterPinUnion(rnm) < 0 { return -2 }
+        }
+        if rnm != "" { return synthTypeRefTy(rnm, -1, rs) }
+      }
+    }
+  }
+  nret
+}
+
+// `monoCloneLambdaSubst`'s last step: lifts `clone`, the instance of the lambda template `a`
+// at `fnIx`, into its own `fnStmts` slot and re-parents the lambdas minted since `mark`.
+// Returns `clone`.
+function monoLamInstallClone(a: FuncDecl, fnIx: i32, clone: i32, mark: i32) {
+  // D1046 — the first instance of a named nested function replaces the template's slot
+  // rather than pushing beside it: the by-name lookup takes the first child of the
+  // frame, so two same-named children mean the call answers the unsubstituted template.
+  // Later instances push and are re-pointed at their own frame by the caller.
+  if monoFnNameIsSourceNamed(a.fnName) && monoInstIsFirst {
+    const tSlot = monoSlotOfLamNode(fnIx)
+    if tSlot >= 0 {
+      buildFnMapNoteFnStmtWrite(tSlot, clone)
+      fnStmts[tSlot] = clone
+      monoArenaTouch()
+      monoNamedTmplNode.push(fnIx)
+      monoNamedTmplSlot.push(tSlot)
+      monoReparentNestedLams(mark, tSlot)
+      fnValUsed = true
+      fnNestUsed = true
+      monoNoteLamNode(monoLamPinned, fnIx)
+      return clone
+    }
+  }
+  fnStmts.push(clone)
+  // The original's frame, not module scope. The clone shares the body, so its free names
+  // have to resolve up the same scope chain or a lambda that both captures and annotates
+  // `T` loses its environment. (`monoCloneLambdaPinned` pushes -1 because a `.map`
+  // callback is rebuilt from an argument position, not from a lifted slot of its own.)
+  fnParent.push(monoLamParentOf(fnIx))
+  const mySlot = fnStmts.length - 1
+  const tmplSlot = monoSlotOfLamNode(fnIx)
+  monoCloneKeepsHoles(tmplSlot, mySlot, clone)
+  lfNoteClone(mySlot, tmplSlot)
+  monoReparentNestedLams(mark, mySlot)
+  monoLamMintedSlots.push(mySlot)
+  monoLamCloneSlots.push(mySlot)
+  fnDispNames.push("")
+  fnValUsed = true
+  fnNestUsed = true
+  monoNoteLamNode(monoLamPinned, fnIx)
+  clone
 }
 
 // A clone at `slot` of the lambda at `tmplSlot` whose own parameters are still holes is
@@ -13524,17 +13575,85 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 // The pin of hole parameter `pIx` when call `callIx` hands it generic function `argIx`: the
 // instance the checker bound the hole to, materialized here and pinned as a concrete function
 // argument is, so the callee can forward it to a further hole (D5402). "" when the argument is
-// not a generic or the checker bound no concrete signature.
-function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
-  const bt = monoHoleGenFnTy(callIx, pIx, argIx)
-  if bt < 0 { return "" }
-  const nm = monoConcreteFnTyName(bt)
-  if nm == "" { return "" }
-  if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+// not a generic or no concrete signature is known; `tyOut[0]` takes the pin's type, -1 for none.
+function monoHoleGenFnPin(
+  callIx: i32,
+  pIx: i32,
+  argIx: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  let bt = monoHoleGenFnTy(callIx, pIx, argIx)
+  let nm = monoConcreteFnTyName(bt)
+  if bt < 0 {
+    nm = monoHoleGenFnFlowPin(argIx, ctx, tyOut)
+    if nm == "" || tyOut[0] < 0 { return nm }
+    bt = tyOut[0]
+  } else {
+    if nm == "" { return "" }
+    if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+  }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = bt
   const sk = sigKeyOfTy(bt)
   if sk != "" { return "=>" + sk }
   const an = monoArgFnTypeName(argIx, ctx)
   if an != "" { return an }
+  nm
+}
+
+// Whether `ax` names a function that declares type parameters, by name or through never-written
+// aliases: one generic only by its un-annotated parameters has no one signature to deliver.
+function monoArgHasTyParams(ax: i32): boolean {
+  let d = identDeclOf(ax)
+  if d >= 0 && d < P.nodes.length && !(P.nodes[d] is FuncDecl) {
+    d = fnFlowReadGenFn(ax)
+  }
+  if d < 0 || d >= P.nodes.length { return false }
+  const f = P.nodes[d]
+  f is FuncDecl && f.fnTyParams.length > 0
+}
+
+// For a generic `argIx` the checker bound no instance at the hole, as one the callee returns bare
+// is: the one signature the flow table pins its read at past the call, delivered there with each
+// call taking it typed at it (D5530). "" for no pin, or two; `tyOut[0]` takes the type those
+// calls agree on, -1 when none does.
+function monoHoleGenFnFlowPin(argIx: i32, ctx: i32, tyOut: i32[]): string {
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
+  if !monoNamesDeclaredGeneric(ax, ctx) && monoReadGenFnFe(ax) < 0 { return "" }
+  if !monoArgHasTyParams(ax) { return "" }
+  const noPath: string[] = []
+  let d = ax
+  let fr = ctx
+  const lf = monoReadLetFrame(ax, ctx)
+  if lf[1] >= 0 {
+    d = lf[1]
+    fr = lf[0]
+  }
+  const nm = monoSlotPinName(d, noPath, fr)
+  if nm == "" { return "" }
+  if monoCoerceFnValueName(ax, nm, ctx, -1) < 0 { return "" }
+  monoRetypePinCalls(d, noPath)
+  let got = -1
+  for cx in fnFlowDeclPathPinCalls(d, noPath) {
+    const c = P.nodes[cx]
+    if c is Call {
+      const ct = nodeTyIxOf(unwrapParen(c.callFn))
+      if (
+        ct < 0
+        || ct >= T.tys.length
+        || !(T.tys[ct] is TyFunc)
+        || tyHasTyVar(ct)
+      ) {
+        return nm
+      }
+      if got >= 0 && !tyEq(got, ct) { return nm }
+      got = ct
+    }
+  }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = got
   nm
 }
 
@@ -13662,8 +13781,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             let an = recordedParamPinName(params[i])
             let anTy = -1
             if an == "" {
-              an = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
-              if an != "" { anTy = monoHoleGenFnTy(callIx, params[i], args[i]) }
+              const pinTy: i32[] = [0 - 1]
+              an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
+              anTy = pinTy[0]
             }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
@@ -13867,8 +13987,9 @@ function monoPinAnnotatedParam(
     let an2 = ""
     let an2Ty = -1
     if ann == tp {
-      an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx)
-      if an2 != "" { an2Ty = monoHoleGenFnTy(callIx, params[i], args[i]) }
+      const pinTy: i32[] = [0 - 1]
+      an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
+      an2Ty = pinTy[0]
     }
     if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
