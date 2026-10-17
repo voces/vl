@@ -86,12 +86,8 @@ GATE_MAX_PAR="${GATE_MAX_PAR:-0}"; GATE_MAX_PAR="${GATE_MAX_PAR//[!0-9]/}"; GATE
 # native suite) and ends with a line no merge tooling reads as a pass.
 FAST=0
 for a in "$@"; do [ "$a" = --fast ] && FAST=1; done
-SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|survey measurements|native-fixpoint|self-compile time|rep-fuzz|plumb-shape cost|"
+SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|self-compile pair|rep-fuzz|plumb-shape cost|"
 SKIPPED=()
-# A row the caller has already proven appears in the table with its reason rather than
-# vanishing: an empty PID marks it, and the reason is the report loop's RESULT column.
-SKIP_WHY=()
-skip_row() { SKIP_WHY[${#PIDS[@]}]="$2"; NAMES+=("$1"); PIDS+=(""); STARTS+=(0); }
 # bash 3.2 (macOS's /bin/bash) has no `wait -n`; there a queued row polls once a second.
 if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then
   wait_any() { wait -n 2>/dev/null || true; }
@@ -175,16 +171,21 @@ run "lsp typecheck"            deno check --node-modules-dir=none --config lsp/d
 # CLI is skipped. lsp/deno.json carries no exclude, so linting through it sees
 # lsp/src/. Mirrors ci.yml's "Lint (lsp)" step.
 run "lsp lint"                 deno lint --config lsp/deno.json lsp/src/
-# GATE_FIXPOINT_PROVEN=1: the caller has already proven compile(seed)==seed on THIS tree (the
-# merge-queue audit proves c2==c3 before `gate.sh --no-build`), so re-proving it is a repeat.
-# The row stays in the table as skipped-with-reason. Nothing reads its SELF_COMPILE_USER_SECONDS
-# line; `self-compile time` below measures the same build on its own.
-if [ "${GATE_FIXPOINT_PROVEN:-0}" = 1 ]; then skip_row "native-fixpoint" "skipped: proven by caller"
-else run "native-fixpoint"     bash scripts/native-fixpoint.sh; fi
-# THE L2 TRIPWIRE. Its own build rather than native-fixpoint's stage-4 number, because
-# the rows here are independent by construction and the two run concurrently — one extra
-# self-compile against a row that already does two costs the table nothing.
-run "self-compile time"        bash scripts/self-compile-time.sh
+# THE SELF-COMPILE PAIR: the native fixpoint, the L2 fuel and heap tripwire, and the survey's
+# share rows, read off ONE pair of self-compiles — the seed's `--names` build, then that build
+# compiling the compiler under fuel, GC stats and the guest profiler. Each verdict is still its
+# own script's (`--pair`), and the summary names which of the three failed.
+#
+# THE SURVEY'S NUMBERS, re-read. `code-quality-survey-2026-09/` schedules work by share and
+# by count, and nothing re-ran one of them: row 8 said "campaign" for work #2607
+# had shipped, and row 7 named two functions #2567 merged away. survey-profile.sh runs each
+# row's own `Measure:` block, and REDS only on a number that cannot be re-read at all — a row
+# that moved is printed, since movement is the finding. `--require-profile` makes a missing
+# profile a failure: without one the share rows report `skipped`, which exits 0.
+#
+# NOT SKIPPED UNDER GATE_FIXPOINT_PROVEN. The fuel and the profile need the pair's builds
+# anyway, and the fixpoint is a `cmp` of two files they leave, so re-proving it costs nothing.
+run "self-compile pair"        bash scripts/self-compile-pair.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
 # The comment-budget, kind-ladder, sentinel-index, arena-scan and prefer-interpolation
 # RATCHETS are held inside "lint-self + fmt": each counts the findings that row's
@@ -267,19 +268,6 @@ run "filed witnesses"          bash -c "\"$VL\" run scripts/check-filed-witnesse
 # `deno task test` and the ci-native `vl_*_test.ts` glob; its own row here so the table
 # names it rather than burying it in a suite of hundreds.
 run "inventory refs"           deno test -A --no-check tests/vl_inventory_refs_test.ts
-# THE SURVEY'S NUMBERS, re-read. `code-quality-survey-2026-09/` schedules work by share and
-# by count, and nothing re-ran one of them: row 8 said "campaign" for work #2607
-# had shipped, and row 7 named two functions #2567 merged away. This runs each row's own
-# `Measure:` block, and REDS only on a number that cannot be re-read at all — a row that
-# moved is printed, since movement is the finding.
-#
-# THE SHARE ROWS ARE IN IT, and `--strict` alone would not have put them there: without a
-# profile they report `skipped`, which is neither `moved` nor `broken`, so a run measuring
-# none of the four exits 0 and reads exactly like one measuring all four. `--require-profile`
-# is what makes that a failure. The cost was assumed to be minutes and measured 20 s — a
-# `--names` build at 4.1 s and a profiled compile at 9.5 s (2026-09-06) — against a gate whose
-# critical path is `distilled corpus` at ~155 s, so there is no reason to leave them ungated.
-run "survey measurements"      bash scripts/survey-profile.sh
 # THE PROBES' BEHAVIOURAL HALF. `tests/vl_live_sites_test.ts` checks the list's STRUCTURE
 # and says the compiling half is `capability-probes.vl --live-sites`, which no gate ran: on 2026-09-24 four
 # of its rows had moved (one a compiler trap, one invalid wasm) and nothing was red (D2301).
@@ -311,7 +299,6 @@ echo
 echo "WALL = elapsed once launched   CPU = the row's own user+sys (WALL>>CPU means starved, not slow)"
 printf '%-22s %8s %8s  %s\n' "GATE" "WALL" "CPU" "RESULT"
 for i in "${!PIDS[@]}"; do
-  if [ -z "${PIDS[$i]}" ]; then printf '%-22s %8s %8s  %s\n' "${NAMES[$i]}" "-" "-" "${SKIP_WHY[$i]:-skipped}"; continue; fi
   wait "${PIDS[$i]}"; rc=$?
   fin=$(cat "$LOGS/$i.t" 2>/dev/null)
   [ -n "$fin" ] || fin=$(now)
