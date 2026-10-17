@@ -968,6 +968,7 @@ import {
   uVarTyIx,
   uVariants,
   unNames,
+  unTyIx,
 } from "./emit_state"
 import {
   ArrNewKind,
@@ -1067,6 +1068,7 @@ import {
   msTextOf,
   narrowSlotTy,
   removeAtomFromSet,
+  removeAtomFromSetOf,
   unMemIsRefElemArray,
   unRowOfCanon,
   unionArmsOf,
@@ -1075,6 +1077,7 @@ import {
   unionMemberTysOfAB,
   unionNameHasNull,
   unionNameNonNullCount,
+  unionRowOf,
   unionSetAtomsOf,
   unionSetHasNull,
 } from "./emit_union_registry"
@@ -1090,9 +1093,10 @@ import {
   sidText,
 } from "./symbols"
 import { arrElemNameRaw, nameIsArray, peelGroupParens } from "./tyname"
-import { substTyDeep, tvWriteLandTy } from "./check_relate_core"
+import { assignable, substTyDeep, tvWriteLandTy } from "./check_relate_core"
 import {
   flattenVariantsInto,
+  isNullTy,
   nonNullTy,
   tyEmitPrimOf,
   tyHasTyVar,
@@ -7682,6 +7686,9 @@ function narrowIsElse(
   // claim the narrow, leaving no atom to unbox to. An `Ident` receiver reaches this rung
   // either way, so the order only decides a place's answer (D1729).
   if litElseNarrow(isObj, variant) { return true }
+  // A literal that alone holds its scalar rules that scalar out of the box (D5890).
+  const latom = litElseAtom(isObj, variant)
+  if latom != "" { return narrowIsElse(isObj, latom, condIx, fnIx) }
   // The index dual of the member complement below: the else of `xs[0] is T` subtracts
   // `T` from the cell's set, unboxing `match xs[0] { null => … T => … }`'s second arm.
   if mrecv is Index {
@@ -7709,7 +7716,7 @@ function narrowIsElse(
         ) {
           return true
         }
-        const eirst = removeAtomFromSet(eicur, variant)
+        const eirst = removeAtomFromSetOf(eisid, eicur, variant)
         if eirst != "" {
           pushNarrow(eik, eirst)
           return true
@@ -7747,7 +7754,7 @@ function narrowIsElse(
         if pushNarrowComplement(mk, msid, variant, isVarTyIxOf(condIx)) != "" {
           return true
         }
-        const mrest = removeAtomFromSet(mcur, variant)
+        const mrest = removeAtomFromSetOf(msid, mcur, variant)
         if mrest != "" {
           pushNarrow(mk, mrest)
           return true
@@ -7773,7 +7780,8 @@ function narrowIsElse(
           if pushNarrowComplement(recv.identName, esid, variant, -1) != "" {
             return true
           }
-          const rest = removeAtomFromSet(
+          const rest = removeAtomFromSetOf(
+            esid,
             currentNarrowSetAt(
               recv.identName,
               fnIx,
@@ -7835,7 +7843,8 @@ function narrowIsElse(
       ) {
         return true
       }
-      const srest = removeAtomFromSet(
+      const srest = removeAtomFromSetOf(
+        ssid,
         currentStructNarrowSetAt(
           srecv.identName,
           fnIx,
@@ -8137,6 +8146,38 @@ function litElseNarrow(objIx: i32, variant: string): boolean {
     }
   }
   false
+}
+
+// The scalar a failed `x is L` rules out of a bare name's box, or "": `L` is a member of the
+// declared type that no other member admits and the only one lowering to its scalar, so
+// `"a" | i32 | null` keeps `i32 | null` and `"a" | "b" | i32` keeps its set (D5890).
+function litElseAtom(objIx: i32, variant: string): string {
+  const ox = unwrapParen(objIx)
+  if ox < 0 || ox >= P.nodes.length || !(P.nodes[ox] is Ident) { return "" }
+  let uty = nodeTyIxOf(ox)
+  if uty < 0 { return "" }
+  const puty = pinnedHoleTyOf(uty)
+  if puty >= 0 { uty = puty }
+  const vars: i32[] = []
+  flattenVariantsInto(uty, vars)
+  let hit = -1
+  for m in vars {
+    const lex = tyLitSetMemberLexes(m)
+    if lex.length == 1 && lex[0] == variant && T.tys[m] is TyLit {
+      if hit >= 0 { return "" }
+      hit = m
+    }
+  }
+  if hit < 0 { return "" }
+  const atom = primNameStr(tyEmitPrimOf(hit))
+  if atom == "" { return "" }
+  for m in vars {
+    if m != hit && !isNullTy(m) {
+      if assignable(hit, m) { return "" }
+      if primNameStr(tyEmitPrimOf(m)) == atom { return "" }
+    }
+  }
+  atom
 }
 
 // The else-branch dual of `setNarrowFromCond`, for value unions only: on a failed guard,
@@ -13885,6 +13926,9 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
         if nodeTyIsNarrowedShape(unwrapParen(d.letInit)) {
           if letInitBindsNarrowedCell(letIx, fnIx) { return "" }
         }
+        // A read narrowed to a smaller box binds that box, as its annotation would (D5921).
+        const nrw = narrowedBoxRenderOf(d.letInit, inf)
+        if nrw != "" { return nrw }
         return inf
       }
       // A null-hole binding (`let x = null` filled by a later `x = e`) carries
@@ -13893,6 +13937,28 @@ export function letUnionNameOf(letIx: i32, fnIx: i32) {
     }
   }
   ""
+}
+
+// The value union an identifier read at `ix` is narrowed to, when it has fewer variants than
+// the registered union `whole` (the one its binding holds), else "". Box tags are per atom, so
+// the narrowed box is the same value under fewer members.
+function narrowedBoxRenderOf(ix: i32, whole: string): string {
+  const rx = unwrapParen(ix)
+  if rx < 0 || !(P.nodes[rx] is Ident) { return "" }
+  const nt = nodeTyIxOf(rx)
+  const nrw = valueUnionRenderOfTy(nt)
+  if nrw == "" { return "" }
+  const u = unionRowOf(whole)
+  if u < 0 || u >= unTyIx.length || unTyIx[u] < 0 { return "" }
+  if flatVariantCount(nt) >= flatVariantCount(unTyIx[u]) { return "" }
+  nrw
+}
+
+// How many variants type `ty` flattens to, `null` counted as one.
+function flatVariantCount(ty: i32): i32 {
+  const vs: i32[] = []
+  flattenVariantsInto(ty, vs)
+  vs.length
 }
 
 // Whether call `callIx` goes through a function value: its callee names no lifted function.

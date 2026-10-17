@@ -294,6 +294,7 @@ import {
   fnFlowReadGenFn,
   fnFlowReadWritten,
   fnFlowRespellLam,
+  fnFlowStageInstHoles,
   fnFlowTableBuild,
 } from "./fn_flow_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
@@ -986,6 +987,7 @@ function monoNicheNarrowsFrom(narrow: string, wide: string): boolean {
 
 // Whether every arm of the union `narrow` is an arm of the wider union `wide`.
 function monoArmsNarrowFrom(narrow: string, wide: string): boolean {
+  if narrow == wide { return false }
   const na: string[] = []
   unionArmsOf(narrow, na)
   const wa: string[] = []
@@ -1003,6 +1005,13 @@ function monoArmsNarrowFrom(narrow: string, wide: string): boolean {
     i = i + 1
   }
   true
+}
+
+// Whether arena type `ty` renders with more than one top-level arm: a union or a nullable.
+function monoTyIsUnionShaped(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  t is TyUnion || t is TyNullable
 }
 
 // The pin a narrowed argument at `ax` wants, given the pin `wide` the annotation ladder
@@ -1028,7 +1037,8 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
     return ""
   }
   // A union narrowed to a smaller union of its own arms, which no row may hold yet (D4965).
-  if monoArmsNarrowFrom(n, wide) {
+  // A type that is no union has one arm, which the membership test above already asked.
+  if monoTyIsUnionShaped(nt) && monoArmsNarrowFrom(n, wide) {
     const nu = monoInstUnionAnnPin(n, nt)
     if nu != "" { return nu }
   }
@@ -8152,6 +8162,21 @@ function monoSubtreeNamesIdent(ix: i32, name: string, depth: i32): boolean {
   false
 }
 
+// The `Ident` named `name` at source position `pos` in the subtree of `ix`, or -1.
+function monoIdentAtPosIn(ix: i32, name: string, pos: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > 400 { return -1 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if n.identName == name && n.pos == pos { return ix }
+    return -1
+  }
+  for k in nodeChildren(ix) {
+    const r = monoIdentAtPosIn(k, name, pos, depth + 1)
+    if r >= 0 { return r }
+  }
+  -1
+}
+
 // Whether `ty` is a record type with no type variable left in it.
 function monoConcreteObjTy(ty: i32): boolean {
   if ty < 0 { return false }
@@ -12479,7 +12504,15 @@ function monoDeclPathKeys(
   let pins = monoDeclPathKeysIn(lf[1], path, -1, -1, rets, dead)
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const it = monoFrameInstTmpl(lf[0])
+    // A hole instance's parameters are spelled at its hole binding.
+    const hrow = monoHoleSubRow.get(fnStmtsPosOf(it[0])) ?? -1
+    if hrow >= 0 && hrow < monoHoleSubN.length {
+      fnFlowStageInstHoles(monoHoleSubN[hrow], monoHoleSubT[hrow])
+    }
     pins = monoDeclPathKeysIn(lf[1], path, it[0], it[1], rets, dead)
+    const noN: string[] = []
+    const noT: i32[] = []
+    fnFlowStageInstHoles(noN, noT)
   }
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const none: string[] = []
@@ -15876,16 +15909,27 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   // An alias of one is pinned at its own binding, which the flow table keys the read by (D5400).
   let d = x
   let fr = ctx
+  const it = monoFrameInstTmpl(ctx)
   const lf = monoReadLetFrame(x, ctx)
   if lf[1] >= 0 {
     d = lf[1]
     fr = lf[0]
+  } else {
+    // A read in an instance body is banked under the template's read, at the same position.
+    const xn = P.nodes[x]
+    if it[1] >= 0 && xn is Ident {
+      const tr = monoIdentAtPosIn(it[1], xn.identName, xn.pos, 0)
+      if tr >= 0 { d = tr }
+    }
   }
   const nm = monoSlotPinName(d, noPath, fr)
   if nm == "" {
     // Two pins past the return ask for a copy of the function per result pin (D5531).
     const lfp = [fr, d]
-    if monoDeclPathPins(lfp, noPath).length > 1 { fsAsk(ctx) }
+    // An instance asks for its template, which is what the plan copies.
+    let asked = ctx
+    if it[0] == ctx && it[1] >= 0 { asked = it[1] }
+    if monoDeclPathPins(lfp, noPath).length > 1 { fsAsk(asked) }
     return 0
   }
   if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
