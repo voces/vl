@@ -3924,100 +3924,173 @@ function cliFmtFinish() {
   CMD_DONE
 }
 
+// ST_INIT: parse the arguments and start the command they name.
+function cliStepInit() {
+  cliParseArgs()
+  if cliArgErr != "" { return cliUsageStop(cliArgErr) }
+  if cliArgs.length == 0 { return cliUsageStop("vl: no subcommand") }
+  const sub = cliArgs[0]
+  if sub == "fmt" {
+    cliCmd = 1
+  } else if sub == "check" {
+    cliCmd = 0
+  } else if sub == "test" {
+    cliCmd = 2
+  } else {
+    return cliUsageStop(
+      "vl: this build's pump implements `check`, `fmt` and `test`",
+    )
+  }
+  cliOut = []
+  cliErrors = 0
+  cliWarnings = 0
+  cliGating = 0
+  cliFmtDrift = 0
+  cliFmtBad = 0
+  cliFmtBug = 0
+  cliFixCount = 0
+  cliFixDeclined = 0
+  cliFixRoundsMax = 0
+  cliFixCapHit = 0
+  cliFixKinds = []
+  cliFixKindN = []
+  cliWalkStack = []
+  cliWalkRel = []
+  cliFiles = []
+  cliFileKeys = Map()
+  cliDirNames = []
+  cliDirIsDirs = []
+  cliSrcCacheKeys = []
+  cliSrcCacheSrcs = []
+  cliSrcCacheFound = []
+  // `fmt` with no path formats stdin to stdout; `check` with no path → cwd.
+  if cliCmd == 1 && cliTargets.length == 0 {
+    cliState = ST_FMT_STDIN
+    return CMD_READ_STDIN
+  }
+  if cliBudget != 0 {
+    cliCmdPath = cliBudgetPath
+    cliState = ST_BUDGET_READ
+    return CMD_READ_FILE
+  }
+  return cliBeginTargets()
+}
+
+// ST_BUDGET_READ: load the budget baseline, then start the targets.
+function cliStepBudgetRead() {
+  let err = "cannot read it"
+  if cliFileFound != 0 { err = budgetLoad(cliFileSrc) }
+  if err != "" {
+    return cliUsageStop("check: --budget " + cliBudgetPath + ": " + err)
+  }
+  if cliBudget == 4 {
+    cliJsonOut = budgetExemptLine() + "\n"
+    return cliBeginPrint()
+  }
+  if cliBudgetFindings != "" {
+    cliCmdPath = cliBudgetFindings
+    cliState = ST_BUDGET_FINDINGS
+    return CMD_READ_FILE
+  }
+  // The baseline names the population it counts; a named path narrows it.
+  if cliTargets.length == 0 { cliTargets = budgetTargets() }
+  for g in budgetExcludes() { cliAddExclude(g) }
+  cliIncludeImports = 1
+  return cliBeginTargets()
+}
+
+// ST_BUDGET_FINDINGS: note a `--findings` report against the budget.
+function cliStepBudgetFindings() {
+  let err = "cannot read it"
+  if cliFileFound != 0 { err = budgetNoteJson(cliFileSrc, cliBudgetFindings) }
+  if err != "" {
+    return cliUsageStop("check: --findings " + cliBudgetFindings + ": " + err)
+  }
+  if cliBudget != 1 && budgetUnnamed() > 0 {
+    return cliUsageStop(
+      "check: --findings "
+        + cliBudgetFindings
+        + ": "
+        + i32ToStr(budgetUnnamed())
+        + " finding(s) carry no `text`, so --budget-why and --write-baseline cannot name them",
+    )
+  }
+  if cliBudget == 3 { return cliBudgetGitRead(budgetGitStart()) }
+  cliBudgetFinish()
+  return cliBeginPrint()
+}
+
+// ST_FMT_STDIN: format stdin to stdout.
+function cliStepFmtStdin() {
+  // stdin formatted to stdout; `--check` reports drift through the exit code. A
+  // failed format passes the input through so a mid-pipeline `vl fmt` never eats the
+  // data — the note and nonzero exit carry the failure.
+  cliCurFile = "<stdin>"
+  cliFiles = []
+  cliFileIdx = 0
+  const fst = cliFormatNow(cliFileSrc)
+  cliFmtResult = cliFileSrc
+  if fst == 0 {
+    cliFmtResult = vcFmtOut
+  } else {
+    cliFmtFailNote(cliCurFile, fst)
+  }
+  if cliFmtCheck != 0 {
+    if fst == 0 && cliFmtResult != cliFileSrc { cliFmtDrift = cliFmtDrift + 1 }
+    return cliFmtFinish()
+  }
+  cliCmdData = cliFmtResult
+  cliState = ST_FMT_AFTER
+  return CMD_PRINT_OUT
+}
+
+// ST_FMT_READ: format one file that has been read.
+function cliStepFmtRead() {
+  if cliFileFound == 0 {
+    if cliDirMode == 0 { return cliUsageStop("fmt: cannot read " + cliCurFile) }
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFmtFile()
+  }
+  const fst = cliFormatNow(cliFileSrc)
+  if fst != 0 {
+    // Parse error or gate trip: the file is untouched (and nothing is printed
+    // in stdout mode); the note + exit code carry the failure.
+    cliFmtFailNote(cliCurFile, fst)
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFmtFile()
+  }
+  cliFmtResult = vcFmtOut
+  const changed = cliFmtResult != cliFileSrc
+  if cliFmtCheck != 0 {
+    if changed {
+      cliOut.push(cliCurFile + ": not formatted")
+      cliFmtDrift = cliFmtDrift + 1
+    }
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFmtFile()
+  }
+  if cliFmtWrite != 0 {
+    if changed {
+      cliCmdPath = cliCurFile
+      cliCmdData = cliFmtResult
+      cliState = ST_FMT_AFTER
+      return CMD_WRITE_FILE
+    }
+    cliFileIdx = cliFileIdx + 1
+    return cliStartFmtFile()
+  }
+  cliCmdData = cliFmtResult
+  cliState = ST_FMT_AFTER
+  return CMD_PRINT_OUT
+}
+
 export function cliNext() {
   // Dispatch on a local copy of the state: `cliState == N` would narrow the global to
   // the literal `N`, and a later `cliState = …` write is then checked against that.
   const st = cliState
-  if st == ST_INIT {
-    cliParseArgs()
-    if cliArgErr != "" { return cliUsageStop(cliArgErr) }
-    if cliArgs.length == 0 { return cliUsageStop("vl: no subcommand") }
-    const sub = cliArgs[0]
-    if sub == "fmt" {
-      cliCmd = 1
-    } else if sub == "check" {
-      cliCmd = 0
-    } else if sub == "test" {
-      cliCmd = 2
-    } else {
-      return cliUsageStop(
-        "vl: this build's pump implements `check`, `fmt` and `test`",
-      )
-    }
-    cliOut = []
-    cliErrors = 0
-    cliWarnings = 0
-    cliGating = 0
-    cliFmtDrift = 0
-    cliFmtBad = 0
-    cliFmtBug = 0
-    cliFixCount = 0
-    cliFixDeclined = 0
-    cliFixRoundsMax = 0
-    cliFixCapHit = 0
-    cliFixKinds = []
-    cliFixKindN = []
-    cliWalkStack = []
-    cliWalkRel = []
-    cliFiles = []
-    cliFileKeys = Map()
-    cliDirNames = []
-    cliDirIsDirs = []
-    cliSrcCacheKeys = []
-    cliSrcCacheSrcs = []
-    cliSrcCacheFound = []
-    // `fmt` with no path formats stdin to stdout; `check` with no path → cwd.
-    if cliCmd == 1 && cliTargets.length == 0 {
-      cliState = ST_FMT_STDIN
-      return CMD_READ_STDIN
-    }
-    if cliBudget != 0 {
-      cliCmdPath = cliBudgetPath
-      cliState = ST_BUDGET_READ
-      return CMD_READ_FILE
-    }
-    return cliBeginTargets()
-  }
-  if st == ST_BUDGET_READ {
-    let err = "cannot read it"
-    if cliFileFound != 0 { err = budgetLoad(cliFileSrc) }
-    if err != "" {
-      return cliUsageStop("check: --budget " + cliBudgetPath + ": " + err)
-    }
-    if cliBudget == 4 {
-      cliJsonOut = budgetExemptLine() + "\n"
-      return cliBeginPrint()
-    }
-    if cliBudgetFindings != "" {
-      cliCmdPath = cliBudgetFindings
-      cliState = ST_BUDGET_FINDINGS
-      return CMD_READ_FILE
-    }
-    // The baseline names the population it counts; a named path narrows it.
-    if cliTargets.length == 0 { cliTargets = budgetTargets() }
-    for g in budgetExcludes() { cliAddExclude(g) }
-    cliIncludeImports = 1
-    return cliBeginTargets()
-  }
-  if st == ST_BUDGET_FINDINGS {
-    let err = "cannot read it"
-    if cliFileFound != 0 { err = budgetNoteJson(cliFileSrc, cliBudgetFindings) }
-    if err != "" {
-      return cliUsageStop("check: --findings " + cliBudgetFindings + ": " + err)
-    }
-    if cliBudget != 1 && budgetUnnamed() > 0 {
-      return cliUsageStop(
-        "check: --findings "
-          + cliBudgetFindings
-          + ": "
-          + i32ToStr(budgetUnnamed())
-          + " finding(s) carry no `text`, so --budget-why and --write-baseline cannot name them",
-      )
-    }
-    if cliBudget == 3 { return cliBudgetGitRead(budgetGitStart()) }
-    cliBudgetFinish()
-    return cliBeginPrint()
-  }
+  if st == ST_INIT { return cliStepInit() }
+  if st == ST_BUDGET_READ { return cliStepBudgetRead() }
+  if st == ST_BUDGET_FINDINGS { return cliStepBudgetFindings() }
   if st == ST_BUDGET_GIT {
     return cliBudgetGitRead(budgetGitStep(cliFileFound != 0, cliFileSrc))
   }
@@ -4091,70 +4164,8 @@ export function cliNext() {
     cliModCommitOne(cliFetchKey, cliFileSrc, cliFileFound)
     return cliFetchOrCheckFile()
   }
-  if st == ST_FMT_STDIN {
-    // stdin formatted to stdout; `--check` reports drift through the exit code. A
-    // failed format passes the input through so a mid-pipeline `vl fmt` never eats the
-    // data — the note and nonzero exit carry the failure.
-    cliCurFile = "<stdin>"
-    cliFiles = []
-    cliFileIdx = 0
-    const fst = cliFormatNow(cliFileSrc)
-    cliFmtResult = cliFileSrc
-    if fst == 0 {
-      cliFmtResult = vcFmtOut
-    } else {
-      cliFmtFailNote(cliCurFile, fst)
-    }
-    if cliFmtCheck != 0 {
-      if fst == 0 && cliFmtResult != cliFileSrc {
-        cliFmtDrift = cliFmtDrift + 1
-      }
-      return cliFmtFinish()
-    }
-    cliCmdData = cliFmtResult
-    cliState = ST_FMT_AFTER
-    return CMD_PRINT_OUT
-  }
-  if st == ST_FMT_READ {
-    if cliFileFound == 0 {
-      if cliDirMode == 0 {
-        return cliUsageStop("fmt: cannot read " + cliCurFile)
-      }
-      cliFileIdx = cliFileIdx + 1
-      return cliStartFmtFile()
-    }
-    const fst = cliFormatNow(cliFileSrc)
-    if fst != 0 {
-      // Parse error or gate trip: the file is untouched (and nothing is printed
-      // in stdout mode); the note + exit code carry the failure.
-      cliFmtFailNote(cliCurFile, fst)
-      cliFileIdx = cliFileIdx + 1
-      return cliStartFmtFile()
-    }
-    cliFmtResult = vcFmtOut
-    const changed = cliFmtResult != cliFileSrc
-    if cliFmtCheck != 0 {
-      if changed {
-        cliOut.push(cliCurFile + ": not formatted")
-        cliFmtDrift = cliFmtDrift + 1
-      }
-      cliFileIdx = cliFileIdx + 1
-      return cliStartFmtFile()
-    }
-    if cliFmtWrite != 0 {
-      if changed {
-        cliCmdPath = cliCurFile
-        cliCmdData = cliFmtResult
-        cliState = ST_FMT_AFTER
-        return CMD_WRITE_FILE
-      }
-      cliFileIdx = cliFileIdx + 1
-      return cliStartFmtFile()
-    }
-    cliCmdData = cliFmtResult
-    cliState = ST_FMT_AFTER
-    return CMD_PRINT_OUT
-  }
+  if st == ST_FMT_STDIN { return cliStepFmtStdin() }
+  if st == ST_FMT_READ { return cliStepFmtRead() }
   if st == ST_FMT_AFTER {
     cliFileIdx = cliFileIdx + 1
     return cliStartFmtFile()

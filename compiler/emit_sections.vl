@@ -6747,7 +6747,9 @@ export function sidKeyedTablesReset() {
   0
 }
 
-export function emitProgram(rootIx: i32) {
+// `emitProgram`'s prologue: every per-compile table, scalar and memo back to its empty state,
+// so nothing an earlier compile on a shared instance left can reach this one's passes.
+function emitProgramReset(rootIx: i32) {
   // First, so no memo key carries an earlier compile's inputs into this one.
   memoCompileReset()
   expCtxReset()
@@ -6906,6 +6908,109 @@ export function emitProgram(rootIx: i32) {
   // node that program never minted.
   emitRootIx = rootIx
   stubWriteRhsReset()
+}
+
+// The ordered pass table — see the pass-manager block comment above `passDoneHas` for the row
+// grammar. Each row's `>` dependency is an ordering edge, in three shapes: a pass that
+// mutates the arena runs before every pass that scans it (`dispatchRewrite`,
+// `captureBoxRewrite`, the synth-annotation passes, `monomorphize`); a pass needing a final arena runs after all of them; and a `#2` row re-scans what monomorphization's late-minted annotations invalidated.
+function emitPassTable(): string[] {
+  const passTable = [
+    "loopValueRewrite", "nulScalarSplit > loopValueRewrite", "foldMemShared",
+    "shadowRespell > foldMemShared nulScalarSplit", "collectTyParams",
+    "collectU > collectTyParams", "collectS > collectU collectTyParams",
+    "collectA > collectS collectTyParams", "assignValueSpill > shadowRespell",
+    "collectFns > collectU collectS shadowRespell assignValueSpill",
+    "checkTopLevel > collectFns", "buildFnMap > collectFns",
+    "computeVoidFns > buildFnMap", "capNarrowBuild > buildFnMap",
+    "computeRetInference > buildFnMap computeVoidFns capNarrowBuild",
+    "dispatchRewrite > buildFnMap computeRetInference",
+    "captureBoxRewrite > collectFns", "synthRetAnnots > collectU buildFnMap",
+    "synthNulListRetAnns > collectFns computeRetInference",
+    "synthDstPinAnns > collectU buildFnMap dispatchRewrite",
+    "scanArrLitCommit > collectU buildFnMap synthDstPinAnns",
+    "monomorphize > dispatchRewrite captureBoxRewrite synthRetAnnots synthNulListRetAnns synthDstPinAnns scanArrLitCommit",
+    "collectGenAliasShapes > monomorphize", "collectAnnShapes > monomorphize",
+    "collectA#2 > collectGenAliasShapes collectAnnShapes",
+    "collectArrNewFrames > collectA#2 collectFns monomorphize",
+    "synthGlobalEmptyListAnns > collectA#2 collectFns",
+    "synthVoidTwins > collectFns monomorphize",
+    "synthExternValues > collectFns monomorphize",
+    "buildFnMap#2 > monomorphize collectA#2 synthVoidTwins synthExternValues",
+    "synthParamAnnots > monomorphize buildFnMap#2",
+    "computeVoidFns#2 > synthParamAnnots",
+    "capNarrowBuild#2 > synthParamAnnots",
+    "synthCaptureReadAnns > synthParamAnnots",
+    "computeRetInference#2 > synthParamAnnots computeVoidFns#2 capNarrowBuild#2 synthCaptureReadAnns",
+    "collectMapFilterUse > synthParamAnnots computeRetInference#2",
+    "collectFnValUse > synthParamAnnots computeRetInference#2",
+    "collectCloSigs > collectMapFilterUse collectFnValUse",
+    "initGuardScan > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
+    "scanPrintUse > monomorphize synthParamAnnots initGuardScan",
+    "checkFnParams > monomorphize synthParamAnnots",
+    "capCacheBuild > monomorphize synthParamAnnots",
+    "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
+    "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
+    "scanExprArmLocals > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
+    "cloLiftScan > capCacheBuild scanExprArmLocals",
+  ]
+  // synthVoidTwins mints the void twins for coerced function VALUES — after
+  // mono (`fnStmts` positions are final; the twin table stores them) and
+  // before `buildFnMap#2`, whose `retVoidAnnFlag` seed classifies the twins.
+
+  // Last, and the two edges say why. `collectA#2` is the same prerequisite
+  // `synthGlobalEmptyListAnns` carries — the synthesis resolves a ref-list row and never mints
+  // one, so the intern pass must have already run — and `capCacheBuild` is the pass that makes
+  // the capture lists this walks final. It runs before `emitModule` because the section that reads the annotation (the type section's env structs, here) is emitted after it.
+  passTable
+}
+
+// Runs `emitPassTable`'s rows in order over the program's top-level `stmts`, refusing a row
+// whose prerequisites have not run. Returns -1 when a pass fails, else 0.
+function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
+  const passTable = emitPassTable()
+  // An instance's binding is read before `monomorphize` refills it (D3528), so the previous
+  // program's must not survive into this one's early passes.
+  monoSubTablesReset()
+  callBindShadowBegin()
+  fnFlowShadowBegin()
+  identAuditBegin()
+  const passDone: string[] = []
+  let pi = 0
+  while pi < passTable.length {
+    const prow = passTable[pi]
+    const pname = passRowName(prow)
+    if !passNeedsMet(passRowNeeds(prow), passDone) {
+      return emitFail(
+        "emitProgram: pass "
+          + pname
+          + " ran before a prerequisite (pass table reordered)",
+      )
+    }
+    capMemoArmed = passKeepsCaptures(pname)
+    const prc = runEmitPass(pname, stmts, rootIx)
+    capMemoArmed = false
+    if prc < 0 { return -1 }
+    identAuditMark(pname)
+    // The two phases a pass row advances; see `EmitPhase`.
+    if pname == "monomorphize" { emitPhase = "monomorphized" }
+    if pname == "capCacheBuild" { emitPhase = "capsCached" }
+    passDone.push(pname)
+    // The generation a cross-pass classifier memo stamps: a row that fills a table the
+    // ladder reads is invisible to an arena-shaped staleness test, so an answer may not
+    // outlive the row that computed it (D1655).
+    memoPassAdvance()
+    // `parentLetOf`'s plan cache is keyed by blockIx alone, so a pass that adds a
+    // binding to the SAME block a query already cached (a rewrite's spilled tail temp)
+    // leaves the plan stale with no blockIx change to detect it by (D2389).
+    plCacheBust()
+    pi = pi + 1
+  }
+  0
+}
+
+export function emitProgram(rootIx: i32) {
+  emitProgramReset(rootIx)
   if rootIx < 0 { return emitFail("emitProgram: empty arena (root index < 0)") }
   const root = P.nodes[rootIx]
   if root is Program {
@@ -6919,95 +7024,7 @@ export function emitProgram(rootIx: i32) {
     // `Ty`-arena index — stale across programs, since the arena is re-minted
     // per compile.
     repReset()
-    // The ordered pass table — see the pass-manager block comment above `passDoneHas` for the row
-    // grammar. Each row's `>` dependency is an ordering edge, in three shapes: a pass that
-    // mutates the arena runs before every pass that scans it (`dispatchRewrite`,
-    // `captureBoxRewrite`, the synth-annotation passes, `monomorphize`); a pass needing a final arena runs after all of them; and a `#2` row re-scans what monomorphization's late-minted annotations invalidated.
-    const passTable = [
-      "loopValueRewrite", "nulScalarSplit > loopValueRewrite", "foldMemShared",
-      "shadowRespell > foldMemShared nulScalarSplit", "collectTyParams",
-      "collectU > collectTyParams", "collectS > collectU collectTyParams",
-      "collectA > collectS collectTyParams", "assignValueSpill > shadowRespell",
-      "collectFns > collectU collectS shadowRespell assignValueSpill",
-      "checkTopLevel > collectFns", "buildFnMap > collectFns",
-      "computeVoidFns > buildFnMap", "capNarrowBuild > buildFnMap",
-      "computeRetInference > buildFnMap computeVoidFns capNarrowBuild",
-      "dispatchRewrite > buildFnMap computeRetInference",
-      "captureBoxRewrite > collectFns", "synthRetAnnots > collectU buildFnMap",
-      "synthNulListRetAnns > collectFns computeRetInference",
-      "synthDstPinAnns > collectU buildFnMap dispatchRewrite",
-      "scanArrLitCommit > collectU buildFnMap synthDstPinAnns",
-      "monomorphize > dispatchRewrite captureBoxRewrite synthRetAnnots synthNulListRetAnns synthDstPinAnns scanArrLitCommit",
-      "collectGenAliasShapes > monomorphize", "collectAnnShapes > monomorphize",
-      "collectA#2 > collectGenAliasShapes collectAnnShapes",
-      "collectArrNewFrames > collectA#2 collectFns monomorphize",
-      "synthGlobalEmptyListAnns > collectA#2 collectFns",
-      "synthVoidTwins > collectFns monomorphize",
-      "synthExternValues > collectFns monomorphize",
-      "buildFnMap#2 > monomorphize collectA#2 synthVoidTwins synthExternValues",
-      "synthParamAnnots > monomorphize buildFnMap#2",
-      "computeVoidFns#2 > synthParamAnnots",
-      "capNarrowBuild#2 > synthParamAnnots",
-      "synthCaptureReadAnns > synthParamAnnots",
-      "computeRetInference#2 > synthParamAnnots computeVoidFns#2 capNarrowBuild#2 synthCaptureReadAnns",
-      "collectMapFilterUse > synthParamAnnots computeRetInference#2",
-      "collectFnValUse > synthParamAnnots computeRetInference#2",
-      "collectCloSigs > collectMapFilterUse collectFnValUse",
-      "initGuardScan > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
-      "scanPrintUse > monomorphize synthParamAnnots initGuardScan",
-      "checkFnParams > monomorphize synthParamAnnots",
-      "capCacheBuild > monomorphize synthParamAnnots",
-      "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
-      "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
-      "scanExprArmLocals > monomorphize synthParamAnnots synthVoidTwins synthExternValues",
-      "cloLiftScan > capCacheBuild scanExprArmLocals",
-    ]
-    // synthVoidTwins mints the void twins for coerced function VALUES — after
-    // mono (`fnStmts` positions are final; the twin table stores them) and
-    // before `buildFnMap#2`, whose `retVoidAnnFlag` seed classifies the twins.
-
-    // Last, and the two edges say why. `collectA#2` is the same prerequisite
-    // `synthGlobalEmptyListAnns` carries — the synthesis resolves a ref-list row and never mints
-    // one, so the intern pass must have already run — and `capCacheBuild` is the pass that makes
-    // the capture lists this walks final. It runs before `emitModule` because the section that reads the annotation (the type section's env structs, here) is emitted after it.
-
-    // An instance's binding is read before `monomorphize` refills it (D3528), so the previous
-    // program's must not survive into this one's early passes.
-    monoSubTablesReset()
-    callBindShadowBegin()
-    fnFlowShadowBegin()
-    identAuditBegin()
-    const passDone: string[] = []
-    let pi = 0
-    while pi < passTable.length {
-      const prow = passTable[pi]
-      const pname = passRowName(prow)
-      if !passNeedsMet(passRowNeeds(prow), passDone) {
-        return emitFail(
-          "emitProgram: pass "
-            + pname
-            + " ran before a prerequisite (pass table reordered)",
-        )
-      }
-      capMemoArmed = passKeepsCaptures(pname)
-      const prc = runEmitPass(pname, stmts, rootIx)
-      capMemoArmed = false
-      if prc < 0 { return -1 }
-      identAuditMark(pname)
-      // The two phases a pass row advances; see `EmitPhase`.
-      if pname == "monomorphize" { emitPhase = "monomorphized" }
-      if pname == "capCacheBuild" { emitPhase = "capsCached" }
-      passDone.push(pname)
-      // The generation a cross-pass classifier memo stamps: a row that fills a table the
-      // ladder reads is invisible to an arena-shaped staleness test, so an answer may not
-      // outlive the row that computed it (D1655).
-      memoPassAdvance()
-      // `parentLetOf`'s plan cache is keyed by blockIx alone, so a pass that adds a
-      // binding to the SAME block a query already cached (a rewrite's spilled tail temp)
-      // leaves the plan stale with no blockIx change to detect it by (D2389).
-      plCacheBust()
-      pi = pi + 1
-    }
+    if runEmitPasses(stmts, rootIx) < 0 { return -1 }
     // D882 — the mint is over. From here a `??`-joined literal resolves to the merged row at
     // every reader (`anonLeafJoinRowOf`); before here `collectAnonShapes` needs the pre-merge answer to decide what to mint.
     emitPhase = "minted"
