@@ -4420,6 +4420,319 @@ export function joinArmFits(armIx: i32, armTy: i32, want: i32): boolean {
   lt >= 0 && assignable(lt, want)
 }
 
+// `fillTypeDeclAt`'s object arm: resolves each field of `sd` and pushes its name and type
+// onto placeholder `pt`'s field arrays, in declaration order.
+function fillObjDeclFields(sd: TypeDecl, pt: TyObj) {
+  const fnames = pt.objFieldNames
+  const ftys = pt.objFieldTypes
+  const dfields = sd.tdFields
+  let fi = 0
+  while fi < dfields.length {
+    const fd = P.nodes[dfields[fi]]
+    if fd is FieldDef {
+      fnames.push(fd.fdName)
+      let fty = TY_ERR
+      if fd.fdType >= 0 {
+        const ftn = P.nodes[fd.fdType]
+        // A sub-word storage width (`u8`/`i8`/`u16`/`i16`) is legal only as a `flat` field
+        // — the packed-storage carve-out beside `u8[]`'s, so the leaf gate does not refuse
+        // it. Resolves to the `u8` storage type as a placeholder; the width comes from the
+        // spelling in `flatStageDecl`, and elsewhere it stays illegal.
+        if (
+          ftn is TypeRef
+          && sd.tdFlat == 1
+          && flatStorageSpellWidth(ftn.tyName) > 0
+        ) {
+          fty = TY_U8
+          if !inferQuiet && fd.fdType < nodeTyIx.length {
+            nodeTySet(fd.fdType, TY_U8)
+          }
+        } else if ftn is TypeRef {
+          // The diagnostic anchors on the FIELD (`dfields[fi]`); the
+          // spelling tree is banked on its `TypeRef` child.
+          const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)
+          if r >= 0 {
+            fty = r
+            // Record the resolved type on the field's annotation node so the emitter
+            // classifies a struct field structurally from the arena, not the name (C1).
+            if !inferQuiet && fd.fdType < nodeTyIx.length {
+              nodeTySet(fd.fdType, r)
+            }
+          } else {
+            unknownTyErr(
+              ftn.tyName,
+              " for field '" + fd.fdName + "'",
+              dfields[fi],
+            )
+          }
+        }
+      }
+      ftys.push(fty)
+    }
+    fi = fi + 1
+  }
+  // The 0a placeholder is just filled in place (its field arrays are
+  // the ones pushed above) — an existing arena entry changed shape.
+  tyMutEpoch = tyMutEpoch + 1
+  0
+}
+
+// The subsumed-arm collapse of union `udName`'s `surviving` members into `survU`, the non-null
+// part of that into `nonNullU`, and the declared members no survivor subsumes into `declU`.
+function unionDeclCollapse(
+  udName: string,
+  surviving: i32[],
+  declMemberIxs: i32[],
+  survU: i32[],
+  nonNullU: i32[],
+  declU: i32[],
+) {
+  // The declaration route's half of D1048's second-hint provenance: the annotation
+  // route banks the arena index it collapsed to, while a declared alias banks its name
+  // instead, since the index it produces is re-derived at every later `: R` through
+  // `declaredTyOfName`. Recorded from the return value, not a length compare.
+  if unionDropSubsumedArms(surviving, survU) {
+    collapsedAliasesSetAt(udName, true)
+  }
+  let cu = 0
+  while cu < survU.length {
+    if survU[cu] != TY_NULL { nonNullU.push(survU[cu]) }
+    cu = cu + 1
+  }
+  cu = 0
+  while cu < declMemberIxs.length {
+    if !unionArmSubsumedBy(declMemberIxs[cu], surviving) {
+      declU.push(declMemberIxs[cu])
+    }
+    cu = cu + 1
+  }
+  0
+}
+
+// Pushes a declared union's final members onto `members` (the `null` niche fold of `survU`,
+// else its literal-union flatten, else `survU` itself), and registers them as variants when
+// there are two or more: the flattened members, else the declared members `declU`.
+function unionDeclFillMembers(
+  members: i32[],
+  sawNull: boolean,
+  nonNullU: i32[],
+  survU: i32[],
+  declU: i32[],
+) {
+  // The `null` niche fold: an un-parenthesized `type T = X | null` denotes `X?`,
+  // exactly as the inline annotation and the parenthesized declaration already do
+  // (`annUnionTy`, the shared home) — without it `null` stayed a sibling variant,
+  // breaking the one-member wrapper shape every niche consumer expects. Ungated on the inner, so this is `annUnionTy` and not a second copy of it.
+  let folded = -1
+  if sawNull && nonNullU.length > 0 {
+    folded = annUnionTy(nonNullU, true)
+  } else if sawNull {
+    // Every member is `null` (`type N = null | null`), which denotes `null` itself.
+    folded = TY_NULL
+  }
+  // The literal-union flatten, on the declaration side (`litUnionFlatMembers`, the
+  // same transform `annUnionInnerTy` climbs): this arm builds its member list itself,
+  // so `type U = A | B` over two litunion aliases would otherwise fill the placeholder
+  // with a union of unions, disagreeing with every channel that softens it. Gated on `!sawNull` since the null fold above already owns that list.
+  const flatU: i32[] = []
+  let flattened = false
+  if folded >= 0 {
+    members.push(folded)
+  } else {
+    if !sawNull { flattened = litUnionFlatMembers(survU, flatU) }
+    if flattened {
+      let fi = 0
+      while fi < flatU.length {
+        members.push(flatU[fi])
+        fi = fi + 1
+      }
+    } else {
+      let mi = 0
+      while mi < survU.length {
+        members.push(survU[mi])
+        mi = mi + 1
+      }
+    }
+  }
+  // Variant-member registration is arity-aware (Stage B b1): only a real (2+
+  // surviving member) union registers its members as variants, since the emitter
+  // lowers a single-member union as the member itself, never as a variant box. A
+  // flattened union registers the flattened members, not the source aliases — marking an alias itself a variant would box it at every other use in the module.
+  if members.length >= 2 {
+    if flattened {
+      let fr = 0
+      while fr < flatU.length {
+        cTyIxSetAdd(cVariantMemberTyIxs, cVariantMemberTyIxSet, flatU[fr])
+        fr = fr + 1
+      }
+    } else {
+      let ri = 0
+      while ri < declU.length {
+        cTyIxSetAdd(cVariantMemberTyIxs, cVariantMemberTyIxSet, declU[ri])
+        ri = ri + 1
+      }
+    }
+  }
+  0
+}
+
+// Explains the empty intersection in source terms: names the two operands and
+// their kinds, or calls out a self-reference — falling back to generic wording for
+// a non-binary/non-intersection never. Reads the intersection's operands from the
+// member's `TS_ISECT` spelling node directly, rather than re-splitting the parser's concatenated name.
+function unionDeclNeverErr(sx: i32, sd: UnionDecl, variants: string[]) {
+  const opRoots: i32[] = []
+  const ops: string[] = []
+  const isectRoot = udTsRootAt(sx, 0)
+  if isectRoot >= 0 {
+    if tsKind[isectRoot] == TS_ISECT {
+      const opStart = tsKidStart[isectRoot]
+      let opk = 0
+      while opk < tsKidCount[isectRoot] {
+        opRoots.push(tsKids[opStart + opk])
+        ops.push(tsToName(tsKids[opStart + opk]))
+        opk = opk + 1
+      }
+    }
+  }
+  let didDetail = false
+  if variants.length == 1 && ops.length == 2 {
+    const expr = ops[0] + " & " + ops[1]
+    const selfRef = ops[0] == sd.udName || ops[1] == sd.udName
+    if selfRef {
+      tErr(
+        "Type `"
+          + sd.udName
+          + "` refers to itself inside an intersection (`"
+          + expr
+          + "`), so it reduces to `never`",
+        sx,
+      )
+    } else {
+      tErr(
+        "Type `"
+          + sd.udName
+          + "` is `never` (an empty type — `"
+          + expr
+          + "`, "
+          + operandKind(tsToTy(opRoots[0]))
+          + " and "
+          + operandKind(tsToTy(opRoots[1]))
+          + ", have no common values), so it has no values",
+        sx,
+      )
+    }
+    didDetail = true
+  }
+  if !didDetail {
+    tErr(
+      "Type `"
+        + sd.udName
+        + "` is `never` (an empty type — "
+        + "its operands have no common values), so it has no values",
+      sx,
+    )
+  }
+  0
+}
+
+// `fillTypeDeclAt`'s union arm: resolves the variants of `sd` (statement `sx`) and fills the
+// placeholder's `members` in place, reporting a self-cycle or an empty (`never`) union.
+function fillUnionDeclMembers(sx: i32, sd: UnionDecl, members: i32[]) {
+  const variants = sd.udVariants
+  // A degenerate self-cycle — `type D = D`, a body that is nothing but
+  // the alias itself — has no base case, so nothing can inhabit it.
+  // Reported at the declaration (host parser parity), so an unused
+  // `type D = D` still flags; the members stay empty (host: `Never`).
+  if variants.length == 1 && variants[0] == sd.udName {
+    tErr(
+      "Type `"
+        + sd.udName
+        + "` is defined in terms of itself "
+        + "with no base type, so it can never have a value",
+      sx,
+    )
+  } else {
+    let vi = 0
+    let resolvedAny = false
+    const declMemberIxs: i32[] = []
+    // The surviving members, and the two lists the NICHE fold below needs:
+    // every non-`null` survivor, and whether a `null` variant is among them.
+    // Filled here instead of straight into `members` (the live arena array)
+    // because the fold replaces the whole list with one wrapped member.
+    const surviving: i32[] = []
+    const nonNull: i32[] = []
+    let sawNull = false
+    while vi < variants.length {
+      // A union member is a parser spelling, banked on this declaration node in member
+      // order (`setUdTs`) — resolves the tree via `annotResolve`, the shared ladder every
+      // positioned annotation and the `is` test already climb, not the concatenated name.
+      let m = annotResolve(variants[vi], udTsRootAt(sx, vi))
+      // D1022 — a member blocked by a declaration cycle falls back to its placeholder
+      // rather than being dropped: `annotResolve` answers -1 while the fill is still in
+      // progress, and dropping the arm silently narrowed the declared union to a type
+      // the program never wrote. Pass 0a's placeholder exists precisely for this forward reference, so the fallback reaches it instead of losing the member.
+      if m < 0 {
+        const phName = variants[vi]
+        const ph = cUserTypes[phName] ?? -1
+        if ph >= 0 { m = ph }
+      }
+      if m >= 0 {
+        declMemberIxs.push(m)
+        resolvedAny = true
+        // A member that folds to `never` (an empty intersection) drops from the union; a
+        // declaration with no surviving member is the never-value error below. D1022 — an
+        // unfilled placeholder is not `never`: dropping it as one let declaration ORDER
+        // decide a type, since an empty union reads as `never`. The never-drop is only for a resolved empty intersection, not a placeholder still mid-fill.
+        let mPlaceholder = false
+        const mDecl = cFillStmtIx[variants[vi]] ?? -1
+        if mDecl >= 0 {
+          if !fillDone(mDecl) { mPlaceholder = true }
+        }
+        if !isNeverTy(m) || mPlaceholder {
+          surviving.push(m)
+          if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
+        }
+      } else {
+        unknownTyErr(variants[vi], " in union '" + sd.udName + "'", sx)
+      }
+      vi = vi + 1
+    }
+    // The declaration route's copy of `annUnionInnerTy`'s unseparable-member rule: this
+    // loop builds its member list itself, so `type U = N | i32` never reaches the shared
+    // annotation home. The union still fills — one diagnostic at the declaration is the
+    // whole report, since poisoning the arena entry would turn every use into a worse one.
+    const nwClash = nomUnionRepClashMsg(surviving)
+    if nwClash.length > 0 {
+      tErr(nwClash + " in union '" + sd.udName + "'", sx)
+    }
+    // The subsumed-arm collapse on the declaration side (`unionDropSubsumedArms`), the
+    // same shared rule `annUnionInnerTy` applies — the two routes are one language, so
+    // `type R = string | "err"` must collapse to `string` for the same reason the inline
+    // spelling does. The registration list is filtered by the same predicate rather than rebuilt from the survivors, since `declMemberIxs` is a superset pushed before the never-drop.
+    const survU: i32[] = []
+    const nonNullU: i32[] = []
+    const declU: i32[] = []
+    unionDeclCollapse(
+      sd.udName,
+      surviving,
+      declMemberIxs,
+      survU,
+      nonNullU,
+      declU,
+    )
+    unionDeclFillMembers(members, sawNull, nonNullU, survU, declU)
+    // The 0a placeholder union is just filled in place (`members` is
+    // its `uMembers` array) — an existing arena entry changed shape.
+    noteUnionMembers(members)
+    tyMutEpoch = tyMutEpoch + 1
+    if resolvedAny && members.length == 0 {
+      unionDeclNeverErr(sx, sd, variants)
+    }
+  }
+  0
+}
+
 // Resolves declaration statement `sx`'s fields/variants and fills them into the placeholder
 // pass 0a minted for it. Two callers make the fill order-independent: pass 0b's source-order
 // driver, and `declaredTyOfName`'s on-demand `forceDeclFill` when a body names a declaration
@@ -4431,59 +4744,7 @@ export function fillTypeDeclAt(sx: i32) {
     if declIx >= 0 && !fillDone(declIx) {
       markFillDone(declIx)
       const pt = T.tys[declIx]
-      if pt is TyObj {
-        const fnames = pt.objFieldNames
-        const ftys = pt.objFieldTypes
-        const dfields = sd.tdFields
-        let fi = 0
-        while fi < dfields.length {
-          const fd = P.nodes[dfields[fi]]
-          if fd is FieldDef {
-            fnames.push(fd.fdName)
-            let fty = TY_ERR
-            if fd.fdType >= 0 {
-              const ftn = P.nodes[fd.fdType]
-              // A sub-word storage width (`u8`/`i8`/`u16`/`i16`) is legal only as a `flat` field
-              // — the packed-storage carve-out beside `u8[]`'s, so the leaf gate does not refuse
-              // it. Resolves to the `u8` storage type as a placeholder; the width comes from the
-              // spelling in `flatStageDecl`, and elsewhere it stays illegal.
-              if (
-                ftn is TypeRef
-                && sd.tdFlat == 1
-                && flatStorageSpellWidth(ftn.tyName) > 0
-              ) {
-                fty = TY_U8
-                if !inferQuiet && fd.fdType < nodeTyIx.length {
-                  nodeTySet(fd.fdType, TY_U8)
-                }
-              } else if ftn is TypeRef {
-                // The diagnostic anchors on the FIELD (`dfields[fi]`); the
-                // spelling tree is banked on its `TypeRef` child.
-                const r = nameToTyAnn(ftn.tyName, dfields[fi], fd.fdType)
-                if r >= 0 {
-                  fty = r
-                  // Record the resolved type on the field's annotation node so the emitter
-                  // classifies a struct field structurally from the arena, not the name (C1).
-                  if !inferQuiet && fd.fdType < nodeTyIx.length {
-                    nodeTySet(fd.fdType, r)
-                  }
-                } else {
-                  unknownTyErr(
-                    ftn.tyName,
-                    " for field '" + fd.fdName + "'",
-                    dfields[fi],
-                  )
-                }
-              }
-            }
-            ftys.push(fty)
-          }
-          fi = fi + 1
-        }
-        // The 0a placeholder is just filled in place (its field arrays are
-        // the ones pushed above) — an existing arena entry changed shape.
-        tyMutEpoch = tyMutEpoch + 1
-      }
+      if pt is TyObj { fillObjDeclFields(sd, pt) }
     }
   } else if sd is UnionDecl {
     // A union's variants are type NAMES; resolve each into the member
@@ -4492,227 +4753,7 @@ export function fillTypeDeclAt(sx: i32) {
     if declIx >= 0 && !fillDone(declIx) {
       markFillDone(declIx)
       const pt = T.tys[declIx]
-      if pt is TyUnion {
-        const members = pt.uMembers
-        const variants = sd.udVariants
-        // A degenerate self-cycle — `type D = D`, a body that is nothing but
-        // the alias itself — has no base case, so nothing can inhabit it.
-        // Reported at the declaration (host parser parity), so an unused
-        // `type D = D` still flags; the members stay empty (host: `Never`).
-        if variants.length == 1 && variants[0] == sd.udName {
-          tErr(
-            "Type `"
-              + sd.udName
-              + "` is defined in terms of itself "
-              + "with no base type, so it can never have a value",
-            sx,
-          )
-        } else {
-          let vi = 0
-          let resolvedAny = false
-          const declMemberIxs: i32[] = []
-          // The surviving members, and the two lists the NICHE fold below needs:
-          // every non-`null` survivor, and whether a `null` variant is among them.
-          // Filled here instead of straight into `members` (the live arena array)
-          // because the fold replaces the whole list with one wrapped member.
-          const surviving: i32[] = []
-          const nonNull: i32[] = []
-          let sawNull = false
-          while vi < variants.length {
-            // A union member is a parser spelling, banked on this declaration node in member
-            // order (`setUdTs`) — resolves the tree via `annotResolve`, the shared ladder every
-            // positioned annotation and the `is` test already climb, not the concatenated name.
-            let m = annotResolve(variants[vi], udTsRootAt(sx, vi))
-            // D1022 — a member blocked by a declaration cycle falls back to its placeholder
-            // rather than being dropped: `annotResolve` answers -1 while the fill is still in
-            // progress, and dropping the arm silently narrowed the declared union to a type
-            // the program never wrote. Pass 0a's placeholder exists precisely for this forward reference, so the fallback reaches it instead of losing the member.
-            if m < 0 {
-              const phName = variants[vi]
-              const ph = cUserTypes[phName] ?? -1
-              if ph >= 0 { m = ph }
-            }
-            if m >= 0 {
-              declMemberIxs.push(m)
-              resolvedAny = true
-              // A member that folds to `never` (an empty intersection) drops from the union; a
-              // declaration with no surviving member is the never-value error below. D1022 — an
-              // unfilled placeholder is not `never`: dropping it as one let declaration ORDER
-              // decide a type, since an empty union reads as `never`. The never-drop is only for a resolved empty intersection, not a placeholder still mid-fill.
-              let mPlaceholder = false
-              const mDecl = cFillStmtIx[variants[vi]] ?? -1
-              if mDecl >= 0 {
-                if !fillDone(mDecl) { mPlaceholder = true }
-              }
-              if !isNeverTy(m) || mPlaceholder {
-                surviving.push(m)
-                if m == TY_NULL { sawNull = true } else { nonNull.push(m) }
-              }
-            } else {
-              unknownTyErr(variants[vi], " in union '" + sd.udName + "'", sx)
-            }
-            vi = vi + 1
-          }
-          // The declaration route's copy of `annUnionInnerTy`'s unseparable-member rule: this
-          // loop builds its member list itself, so `type U = N | i32` never reaches the shared
-          // annotation home. The union still fills — one diagnostic at the declaration is the
-          // whole report, since poisoning the arena entry would turn every use into a worse one.
-          const nwClash = nomUnionRepClashMsg(surviving)
-          if nwClash.length > 0 {
-            tErr(nwClash + " in union '" + sd.udName + "'", sx)
-          }
-          // The subsumed-arm collapse on the declaration side (`unionDropSubsumedArms`), the
-          // same shared rule `annUnionInnerTy` applies — the two routes are one language, so
-          // `type R = string | "err"` must collapse to `string` for the same reason the inline
-          // spelling does. The registration list is filtered by the same predicate rather than rebuilt from the survivors, since `declMemberIxs` is a superset pushed before the never-drop.
-          const survU: i32[] = []
-          const nonNullU: i32[] = []
-          const declU: i32[] = []
-          // The declaration route's half of D1048's second-hint provenance: the annotation
-          // route banks the arena index it collapsed to, while a declared alias banks its name
-          // instead, since the index it produces is re-derived at every later `: R` through
-          // `declaredTyOfName`. Recorded from the return value, not a length compare.
-          if unionDropSubsumedArms(surviving, survU) {
-            collapsedAliasesSetAt(sd.udName, true)
-          }
-          let cu = 0
-          while cu < survU.length {
-            if survU[cu] != TY_NULL { nonNullU.push(survU[cu]) }
-            cu = cu + 1
-          }
-          cu = 0
-          while cu < declMemberIxs.length {
-            if !unionArmSubsumedBy(declMemberIxs[cu], surviving) {
-              declU.push(declMemberIxs[cu])
-            }
-            cu = cu + 1
-          }
-          // The `null` niche fold: an un-parenthesized `type T = X | null` denotes `X?`,
-          // exactly as the inline annotation and the parenthesized declaration already do
-          // (`annUnionTy`, the shared home) — without it `null` stayed a sibling variant,
-          // breaking the one-member wrapper shape every niche consumer expects. Ungated on the inner, so this is `annUnionTy` and not a second copy of it.
-          let folded = -1
-          if sawNull && nonNullU.length > 0 {
-            folded = annUnionTy(nonNullU, true)
-          } else if sawNull {
-            // Every member is `null` (`type N = null | null`), which denotes `null` itself.
-            folded = TY_NULL
-          }
-          // The literal-union flatten, on the declaration side (`litUnionFlatMembers`, the
-          // same transform `annUnionInnerTy` climbs): this arm builds its member list itself,
-          // so `type U = A | B` over two litunion aliases would otherwise fill the placeholder
-          // with a union of unions, disagreeing with every channel that softens it. Gated on `!sawNull` since the null fold above already owns that list.
-          const flatU: i32[] = []
-          let flattened = false
-          if folded >= 0 {
-            members.push(folded)
-          } else {
-            if !sawNull { flattened = litUnionFlatMembers(survU, flatU) }
-            if flattened {
-              let fi = 0
-              while fi < flatU.length {
-                members.push(flatU[fi])
-                fi = fi + 1
-              }
-            } else {
-              let mi = 0
-              while mi < survU.length {
-                members.push(survU[mi])
-                mi = mi + 1
-              }
-            }
-          }
-          // Variant-member registration is arity-aware (Stage B b1): only a real (2+
-          // surviving member) union registers its members as variants, since the emitter
-          // lowers a single-member union as the member itself, never as a variant box. A
-          // flattened union registers the flattened members, not the source aliases — marking an alias itself a variant would box it at every other use in the module.
-          if members.length >= 2 {
-            if flattened {
-              let fr = 0
-              while fr < flatU.length {
-                cTyIxSetAdd(
-                  cVariantMemberTyIxs,
-                  cVariantMemberTyIxSet,
-                  flatU[fr],
-                )
-                fr = fr + 1
-              }
-            } else {
-              let ri = 0
-              while ri < declU.length {
-                cTyIxSetAdd(
-                  cVariantMemberTyIxs,
-                  cVariantMemberTyIxSet,
-                  declU[ri],
-                )
-                ri = ri + 1
-              }
-            }
-          }
-          // The 0a placeholder union is just filled in place (`members` is
-          // its `uMembers` array) — an existing arena entry changed shape.
-          noteUnionMembers(members)
-          tyMutEpoch = tyMutEpoch + 1
-          if resolvedAny && members.length == 0 {
-            // Explains the empty intersection in source terms: names the two operands and
-            // their kinds, or calls out a self-reference — falling back to generic wording for
-            // a non-binary/non-intersection never. Reads the intersection's operands from the
-            // member's `TS_ISECT` spelling node directly, rather than re-splitting the parser's concatenated name.
-            const opRoots: i32[] = []
-            const ops: string[] = []
-            const isectRoot = udTsRootAt(sx, 0)
-            if isectRoot >= 0 {
-              if tsKind[isectRoot] == TS_ISECT {
-                const opStart = tsKidStart[isectRoot]
-                let opk = 0
-                while opk < tsKidCount[isectRoot] {
-                  opRoots.push(tsKids[opStart + opk])
-                  ops.push(tsToName(tsKids[opStart + opk]))
-                  opk = opk + 1
-                }
-              }
-            }
-            let didDetail = false
-            if variants.length == 1 && ops.length == 2 {
-              const expr = ops[0] + " & " + ops[1]
-              const selfRef = ops[0] == sd.udName || ops[1] == sd.udName
-              if selfRef {
-                tErr(
-                  "Type `"
-                    + sd.udName
-                    + "` refers to itself inside an intersection (`"
-                    + expr
-                    + "`), so it reduces to `never`",
-                  sx,
-                )
-              } else {
-                tErr(
-                  "Type `"
-                    + sd.udName
-                    + "` is `never` (an empty type — `"
-                    + expr
-                    + "`, "
-                    + operandKind(tsToTy(opRoots[0]))
-                    + " and "
-                    + operandKind(tsToTy(opRoots[1]))
-                    + ", have no common values), so it has no values",
-                  sx,
-                )
-              }
-              didDetail = true
-            }
-            if !didDetail {
-              tErr(
-                "Type `"
-                  + sd.udName
-                  + "` is `never` (an empty type — "
-                  + "its operands have no common values), so it has no values",
-                sx,
-              )
-            }
-          }
-        }
-      }
+      if pt is TyUnion { fillUnionDeclMembers(sx, sd, pt.uMembers) }
     }
   }
   0
