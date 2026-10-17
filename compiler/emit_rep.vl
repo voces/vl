@@ -31,10 +31,11 @@ import {
   msRowChain,
   msSetByText,
   msSetGen,
-  msSetMask,
   msSetNext,
   msSetRow,
   msSetText,
+  msSetWordAt,
+  msSetWords,
   mvKeyKind,
   mvValArmSig,
   mvValName,
@@ -1712,18 +1713,79 @@ function unMemValKindAt(m: i32): i32 {
 }
 
 // The member slice of union row `u`, or -1 when the row is not covered by the member
-// reference columns — the ONE home of the member-slice bounds (same 31-bit mask limit
-// the set ADT's masks are sized by), so a set the pool minted is a set this column can
-// index. `emit_classify`'s `msRowStart` delegates here; there is no second copy.
+// reference columns — the ONE home of the member-slice bounds, so a set the pool minted is
+// a set this column can index. A row of any width is covered: a set's mask is as many words
+// as its row needs (`msMaskWords`). `emit_union_registry`'s `msRowStart` delegates here.
 export function unMemRowStart(u: i32): i32 {
   if u < 0 { return -1 }
   if u >= unMemTyStart.length { return -1 }
   const st = unMemTyStart[u]
   if st < 0 { return -1 }
   const n = unMemTyCount[u]
-  if n < 1 || n > 31 { return -1 }
+  if n < 1 { return -1 }
   if st + n > unMemAtoms.length { return -1 }
   st
+}
+
+// The number of 32-bit words a member mask over `n` members takes.
+function msMaskWords(n: i32): i32 { (n + 31) >>> 5 }
+
+// Is member `i` of its row in set `s`? The one reader of a stored mask; `s` is a set id the
+// caller bounded and `i` below its row's member count. False past the stored words.
+export function msSetHas(s: i32, i: i32): boolean {
+  const ix = msSetWordAt[s] + (i >>> 5)
+  if ix < 0 || ix >= msSetWords.length { return false }
+  ((msSetWords[ix] >>> (i & 31)) & 1) == 1
+}
+
+// A fresh copy of set `s`'s mask words, for a subtraction to clear bits in before it interns
+// the result (`msSetIntern`). `s` is a set id the caller bounded.
+export function msSetMaskCopy(s: i32): i32[] {
+  const n = msMaskWords(unMemTyCount[msSetRow[s]])
+  const at = msSetWordAt[s]
+  const out: i32[] = []
+  let k = 0
+  while k < n {
+    if at + k < msSetWords.length {
+      out.push(msSetWords[at + k])
+    } else {
+      out.push(0)
+    }
+    k = k + 1
+  }
+  out
+}
+
+// The mask holding every one of `n` members.
+export function msMaskFull(n: i32): i32[] {
+  const out: i32[] = []
+  let left = n
+  while left > 0 {
+    if left >= 32 { out.push(-1) } else { out.push((1 << left) - 1) }
+    left = left - 32
+  }
+  out
+}
+
+// Is member `i` in mask `m`?
+export function msMaskHas(m: i32[], i: i32): boolean {
+  ((m[i >>> 5] >>> (i & 31)) & 1) == 1
+}
+
+// Clears member `i` in mask `m`; a no-op when it is already clear.
+export function msMaskClear(m: i32[], i: i32) {
+  if msMaskHas(m, i) { m[i >>> 5] = m[i >>> 5] - (1 << (i & 31)) }
+  0
+}
+
+// Does mask `m` hold no member?
+export function msMaskIsEmpty(m: i32[]): boolean {
+  let k = 0
+  while k < m.length {
+    if m[k] != 0 { return false }
+    k = k + 1
+  }
+  true
 }
 
 // The banked value-atom kind of the single member of interned member set `s` — what
@@ -1737,12 +1799,11 @@ export function msSoloValKind(s: i32): i32 {
   const st = unMemRowStart(u)
   if st < 0 { return -2 }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let solo = -1
   let cnt = 0
   let i = 0
   while i < n {
-    if ((mask >>> i) & 1) == 1 {
+    if msSetHas(s, i) {
       solo = i
       cnt = cnt + 1
     }
@@ -1764,10 +1825,9 @@ export function msMemberValKindsOf(s: i32, out: i32[]): boolean {
   if st < 0 { return false }
   if unMemValKind.length != unMemAtoms.length { return false }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let i = 0
   while i < n {
-    if ((mask >>> i) & 1) == 1 { out.push(unMemValKind[st + i]) }
+    if msSetHas(s, i) { out.push(unMemValKind[st + i]) }
     i = i + 1
   }
   true
@@ -1787,11 +1847,10 @@ export function msHasValKind(s: i32, k: i32): i32 {
   if unMemValKind.length != unMemAtoms.length { return -1 }
   if unMemTys.length != unMemAtoms.length { return -1 }
   const n = unMemTyCount[u]
-  const mask = msSetMask[s]
   let hit = 0
   let i = 0
   while i < n {
-    if ((mask >>> i) & 1) == 1 {
+    if msSetHas(s, i) {
       const mk = unMemValKind[st + i]
       if mk == k { hit = 1 }
       if mk < 0 {
@@ -1965,7 +2024,8 @@ export function valBlockTypeOfKind(k: i32): i32 {
 // uncovered rather than answering from the previous program's rows.
 export function msPoolReset() {
   msSetRow = []
-  msSetMask = []
+  msSetWordAt = []
+  msSetWords = []
   msSetNext = []
   msSetText = []
   msSetGen = []
