@@ -1,0 +1,382 @@
+// The parse bank: one module's parse, kept per (module key, source) on an instance that
+// compiles again (an editor, a harness), and replayed instead of parsing that source anew —
+// its nodes, spelling trees, side-table rows, extern rows and parse flags appended with every
+// index moved onto the current arena ends (S5 in incremental-compilation-design.md). Only a
+// parse that raised no diagnostic is kept, and a host that compiles once never banks.
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  Node,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+} from "./ast"
+import {
+  PbSide,
+  arenaEpochBump,
+  parseFlagsMerge,
+  parseFlagsNow,
+  pbBadTake,
+  pbInts,
+  pbMv,
+  pbMvList,
+  pbSideFits,
+  pbSideOpen,
+  pbSidePut,
+  pbSideTake,
+  pbStrs,
+} from "./ast"
+
+// One banked parse: `nodes` and `root` relative to the module's first node, `posRel` the
+// cursor relative to its first token, `toks` its token count, `flags` its own parse flags.
+type PbSlot = {
+  key: string,
+  src: string,
+  nodes: Node[],
+  side: PbSide,
+  toks: i32,
+  posRel: i32,
+  root: i32,
+  flags: i32,
+}
+
+// The slot cap: a harness that commits many distinct keys clears the bank rather than grow it.
+const PB_SLOTS_MAX = 256
+
+let pbSlots: PbSlot[] = []
+let pbOn = 1
+let pbHits = 0
+let pbKept = 0
+let pbRefused = 0
+
+// Turn replay on (1, the default) or off (0) for later compiles, emptying the bank and its
+// counters either way, so a test can grade a fresh parse against a replayed one.
+export function parseReplaySet(on: i32): i32 {
+  pbOn = on
+  pbSlots = []
+  pbHits = 0
+  pbKept = 0
+  pbRefused = 0
+  0
+}
+
+// 0 = slots, 1 = parses replayed, 2 = parses banked, 3 = clean parses refused a slot.
+export function parseReplayStat(which: i32): i32 {
+  if which == 0 { return pbSlots.length }
+  if which == 1 { return pbHits }
+  if which == 2 { return pbKept }
+  if which == 3 { return pbRefused }
+  -1
+}
+
+// The arena lengths a module's parse starts from, taken before its tokens load; empty when
+// nothing will be banked or served, which every later call reads as "off".
+export function parseBankOpen(oneShot: i32): i32[] {
+  if pbOn == 0 || oneShot != 0 { return [] }
+  pbSideOpen()
+}
+
+function pbSlotOf(key: string): i32 {
+  let i = 0
+  while i < pbSlots.length {
+    if pbSlots[i].key == key { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Replay the banked parse of (`key`, `src`) on the arena as `o` opened it and its tokens now
+// stand, answering the root node, or -1 when there is none to serve and the caller parses.
+export function parseBankServe(key: string, src: string, o: i32[]): i32 {
+  if o.length == 0 { return -1 }
+  const si = pbSlotOf(key)
+  if si < 0 { return -1 }
+  const s = pbSlots[si]
+  const tb = o[1]
+  if s.src != src || s.toks != P.toks.length - tb || !pbSideFits() { return -1 }
+  // A fresh parse bumps the epoch at its start; the replay stands for one.
+  arenaEpochBump()
+  const nb = P.nodes.length
+  const nn = s.nodes.length
+  let i = 0
+  while i < nn {
+    P.nodes.push(pbNode(s.nodes[i], 0, nn, nb, 0, s.toks, tb))
+    i = i + 1
+  }
+  pbSidePut(s.side, nb, nn, tb, s.toks)
+  pbBadTake()
+  P.pos = tb + s.posRel
+  parseFlagsMerge(s.flags)
+  pbHits = pbHits + 1
+  nb + s.root
+}
+
+// Bank the parse that just ran from `o` and answered `root`, when it raised no diagnostic
+// and every index it wrote stayed inside its own module; a slot for `key` is replaced.
+export function parseBankKeep(
+  key: string,
+  src: string,
+  o: i32[],
+  root: i32,
+): i32 {
+  if o.length == 0 || P.diags.length != o[4] { return 0 }
+  const nb = o[0]
+  const ne = P.nodes.length
+  const tb = o[1]
+  const side = pbSideTake(o)
+  const nodes: Node[] = []
+  let i = nb
+  while i < ne {
+    nodes.push(pbNode(P.nodes[i], nb, ne, -nb, tb, P.toks.length, -tb))
+    i = i + 1
+  }
+  const rootRel = pbMv(root, nb, ne, -nb)
+  if pbBadTake() || !side.ok || rootRel < 0 {
+    pbRefused = pbRefused + 1
+    return 0
+  }
+  const slot: PbSlot = {
+    key: key,
+    src: src,
+    nodes: nodes,
+    side: side,
+    toks: P.toks.length - tb,
+    posRel: P.pos - tb,
+    root: rootRel,
+    flags: parseFlagsNow(),
+  }
+  const si = pbSlotOf(key)
+  if si >= 0 {
+    pbSlots[si] = slot
+  } else {
+    if pbSlots.length >= PB_SLOTS_MAX { pbSlots = [] }
+    pbSlots.push(slot)
+  }
+  pbKept = pbKept + 1
+  1
+}
+
+function pbAt(n: Node): Node { n }
+
+// A deep copy of node `n` with every child node index in `[lo, hi)` moved by `d` and every
+// token index in `[tlo, thi)` by `td`. Exhaustive over `Node`, so no kind is half-copied.
+function pbNode(
+  n: Node,
+  lo: i32,
+  hi: i32,
+  d: i32,
+  tlo: i32,
+  thi: i32,
+  td: i32,
+): Node {
+  match n {
+    NumLit => pbAt({ numText: n.numText, pos: n.pos })
+    StrLit => pbAt({ strText: n.strText, pos: n.pos })
+    CharLit => pbAt({ charText: n.charText, pos: n.pos })
+    BoolLit => pbAt({ boolVal: n.boolVal, pos: n.pos })
+    NullLit => pbAt({ nullKw: n.nullKw, pos: n.pos })
+    Ident => pbAt({ identName: n.identName, pos: n.pos })
+    Unary => pbAt({ unOp: n.unOp, unArg: pbMv(n.unArg, lo, hi, d), pos: n.pos })
+    BinExpr => pbAt(
+      {
+        binOp: n.binOp,
+        binLeft: pbMv(n.binLeft, lo, hi, d),
+        binRight: pbMv(n.binRight, lo, hi, d),
+        pos: n.pos,
+        binCompound: n.binCompound,
+        binTpl: n.binTpl,
+        binRegion: n.binRegion,
+      },
+    )
+    Call => pbAt(
+      {
+        callFn: pbMv(n.callFn, lo, hi, d),
+        callArgs: pbMvList(n.callArgs, 0, lo, hi, d),
+        callArgNames: pbStrs(n.callArgNames, 0),
+        pos: n.pos,
+      },
+    )
+    Member => pbAt({ memObj: pbMv(n.memObj, lo, hi, d), memProp: n.memProp, pos: n.pos })
+    OptMember => pbAt(
+      {
+        omObj: pbMv(n.omObj, lo, hi, d),
+        omProp: n.omProp,
+        omDot: n.omDot,
+        pos: n.pos,
+      },
+    )
+    Paren => pbAt({ parInner: pbMv(n.parInner, lo, hi, d), pos: n.pos })
+    ErrExpr => pbAt({ errWhat: n.errWhat, errAt: pbMv(n.errAt, tlo, thi, td), pos: n.pos })
+    LetDecl => pbAt(
+      {
+        letKw: n.letKw,
+        letName: n.letName,
+        letType: pbMv(n.letType, lo, hi, d),
+        letInit: pbMv(n.letInit, lo, hi, d),
+        pos: n.pos,
+      },
+    )
+    Param => pbAt(
+      {
+        parName: n.parName,
+        parType: pbMv(n.parType, lo, hi, d),
+        parDefault: pbMv(n.parDefault, lo, hi, d),
+        parOpt: n.parOpt,
+        parRest: n.parRest,
+        pos: n.pos,
+      },
+    )
+    TypeRef => pbAt({ tyName: n.tyName, pos: n.pos })
+    FuncDecl => pbAt(
+      {
+        fnName: n.fnName,
+        fnTyParams: pbStrs(n.fnTyParams, 0),
+        fnParams: pbMvList(n.fnParams, 0, lo, hi, d),
+        fnRet: pbMv(n.fnRet, lo, hi, d),
+        fnBody: pbMv(n.fnBody, lo, hi, d),
+        pos: n.pos,
+      },
+    )
+    IfStmt => pbAt(
+      {
+        ifCond: pbMv(n.ifCond, lo, hi, d),
+        ifThen: pbMv(n.ifThen, lo, hi, d),
+        ifElse: pbMv(n.ifElse, lo, hi, d),
+        pos: n.pos,
+      },
+    )
+    WhileStmt => pbAt(
+      {
+        whileCond: pbMv(n.whileCond, lo, hi, d),
+        whileBody: pbMv(n.whileBody, lo, hi, d),
+        whileLabel: n.whileLabel,
+        pos: n.pos,
+        whileBlk: n.whileBlk,
+        whileLv: n.whileLv,
+      },
+    )
+    BreakStmt => pbAt(
+      { brkKw: n.brkKw, brkLabel: n.brkLabel, pos: n.pos, brkHasVal: n.brkHasVal },
+    )
+    ContinueStmt => pbAt({ contKw: n.contKw, contLabel: n.contLabel, pos: n.pos })
+    RetStmt => pbAt({ retArg: pbMv(n.retArg, lo, hi, d), pos: n.pos })
+    Block => pbAt({ blkStmts: pbMvList(n.blkStmts, 0, lo, hi, d), pos: n.pos })
+    Program => pbAt({ progStmts: pbMvList(n.progStmts, 0, lo, hi, d), pos: n.pos })
+    FieldDef => pbAt({ fdName: n.fdName, fdType: pbMv(n.fdType, lo, hi, d), pos: n.pos })
+    TypeDecl => pbAt(
+      {
+        tdName: n.tdName,
+        tdFields: pbMvList(n.tdFields, 0, lo, hi, d),
+        pos: n.pos,
+        tdNew: n.tdNew,
+        tdFlat: n.tdFlat,
+      },
+    )
+    FieldInit => pbAt({ fiName: n.fiName, fiValue: pbMv(n.fiValue, lo, hi, d), pos: n.pos })
+    ObjLit => pbAt({ objFields: pbMvList(n.objFields, 0, lo, hi, d), pos: n.pos })
+    ArrayLit => pbAt({ arrElems: pbMvList(n.arrElems, 0, lo, hi, d), pos: n.pos })
+    Index => pbAt(
+      {
+        idxArr: pbMv(n.idxArr, lo, hi, d),
+        idxIndex: pbMv(n.idxIndex, lo, hi, d),
+        pos: n.pos,
+      },
+    )
+    UnionDecl => pbAt(
+      {
+        udName: n.udName,
+        udVariants: pbStrs(n.udVariants, 0),
+        pos: n.pos,
+        udNew: n.udNew,
+      },
+    )
+    IsExpr => pbAt(
+      {
+        isObj: pbMv(n.isObj, lo, hi, d),
+        isVariant: n.isVariant,
+        pos: n.pos,
+        isNeg: n.isNeg,
+      },
+    )
+    AsExpr => pbAt(
+      { asObj: pbMv(n.asObj, lo, hi, d), asTy: n.asTy, asMode: n.asMode, pos: n.pos },
+    )
+    ForRange => pbAt(
+      {
+        frVar: n.frVar,
+        frFrom: pbMv(n.frFrom, lo, hi, d),
+        frTo: pbMv(n.frTo, lo, hi, d),
+        frStep: pbMv(n.frStep, lo, hi, d),
+        frExcl: n.frExcl,
+        frBody: pbMv(n.frBody, lo, hi, d),
+        frLabel: n.frLabel,
+        pos: n.pos,
+      },
+    )
+    ForIn => pbAt(
+      {
+        fiVar: n.fiVar,
+        fiVar2: n.fiVar2,
+        fiIter: pbMv(n.fiIter, lo, hi, d),
+        fiBody: pbMv(n.fiBody, lo, hi, d),
+        fiLabel: n.fiLabel,
+        pos: n.pos,
+      },
+    )
+    MatchExpr => pbAt(
+      {
+        matchScrut: pbMv(n.matchScrut, lo, hi, d),
+        matchPats: pbMvList(n.matchPats, 0, lo, hi, d),
+        matchBinds: pbMvList(n.matchBinds, 0, lo, hi, d),
+        matchArmStart: pbInts(n.matchArmStart, 0),
+        matchArmCount: pbInts(n.matchArmCount, 0),
+        matchBodies: pbMvList(n.matchBodies, 0, lo, hi, d),
+        pos: n.pos,
+      },
+    )
+    ImportDecl => pbAt(
+      {
+        impPath: n.impPath,
+        impNames: pbStrs(n.impNames, 0),
+        impLocals: pbStrs(n.impLocals, 0),
+        impNameToks: pbMvList(n.impNameToks, 0, tlo, thi, td),
+        pos: n.pos,
+      },
+    )
+    Spread => pbAt({ spdArg: pbMv(n.spdArg, lo, hi, d), pos: n.pos })
+  }
+}
