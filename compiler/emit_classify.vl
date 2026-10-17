@@ -9636,7 +9636,10 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   // `k as? K` over an atom is the niche: the id on a hit, the `-1` sentinel on a miss.
   if e is AsExpr {
-    if e.asMode == "null" && asExprLitAtomCast(unwrapParen(exprIx), fnIx) {
+    if (
+      e.asMode == "null"
+      && asExprLitAtomYieldsAtom(unwrapParen(exprIx), fnIx)
+    ) {
       return true
     }
   }
@@ -11354,7 +11357,7 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
   if e is Call { return exprIsLitAtomCall(e, exprIx, fnIx) }
   if e is AsExpr {
     if e.asMode != "null" {
-      return asExprLitAtomCast(unwrapParen(exprIx), fnIx)
+      return asExprLitAtomYieldsAtom(unwrapParen(exprIx), fnIx)
     }
   }
   if e is BinExpr {
@@ -11382,10 +11385,44 @@ export function asExprLitAtomCast(ix: i32, fnIx: i32): boolean {
   if n.asMode == "wrap" { return false }
   let tty = nodeTyIxOf(ix)
   if n.asMode == "null" { tty = tyPeelNul(tty) }
-  if litUnionAliasNameOfTy(tty) == "" || tyLitMemberTexts(tty).length == 0 {
+  if tyLitMemberTexts(tty).length == 0 { return false }
+  if (
+    litUnionAliasNameOfTy(tty) == ""
+    && !asTargetRepsAtom(ix, n.asMode)
+    && !tyIsBareStrLit(tty)
+  ) {
     return false
   }
   exprIsLitAtom(n.asObj, fnIx)
+}
+
+// Whether `as` node `ix` is an atom cast whose result is the atom too: not a lone literal target
+// (`as! "a"`), whose result reps as its string (D5289).
+export function asExprLitAtomYieldsAtom(ix: i32, fnIx: i32): boolean {
+  if !asExprLitAtomCast(ix, fnIx) { return false }
+  !tyIsBareStrLit(tyPeelNul(nodeTyIxOf(ix)))
+}
+
+// Whether `as` node `ix` is an atom cast to a lone literal (`as! "a"`), whose result is its
+// string rather than the atom (D5289).
+export function asExprLitAtomYieldsStr(ix: i32, fnIx: i32): boolean {
+  if !asExprLitAtomCast(ix, fnIx) { return false }
+  tyIsBareStrLit(tyPeelNul(nodeTyIxOf(ix)))
+}
+
+// Whether `ty` is a lone string literal type.
+function tyIsBareStrLit(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyLit { return t.litKind == "str" }
+  false
+}
+
+// Whether `as` node `ix` reps as the atom (`as?`: the nullable atom), so an inline target such
+// as `as! "a"` or `as ("a" | "b")` takes the id compare too (D5289).
+function asTargetRepsAtom(ix: i32, mode: string): boolean {
+  if mode == "null" { return nodeRepIsNulAtom(ix) }
+  nodeRepIsAtom(ix)
 }
 
 // Whether function `fnIx` returns a literal-union atom or its `| null` niche, so a propagating
@@ -18147,7 +18184,12 @@ export function exprString(exprIx: i32, fnIx: i32) {
   if e is Paren { return exprString(e.parInner, fnIx) }
   // `x as T` yields exactly `T`, asked of that recorded type rather than the operand — the
   // point of the cast. A numeric cast lands here too and correctly answers false.
-  if e is AsExpr { return nodeRepIs(exprIx, "str") }
+  if e is AsExpr {
+    if e.asMode != "null" && asExprLitAtomYieldsStr(exprIx, fnIx) {
+      return true
+    }
+    return nodeRepIs(exprIx, "str")
+  }
   // An if-expression whose branch join is a string: the checker proved both arms agree, so
   // the join's type (or the then-arm) classifies the whole `if` as kind 3, matching the emit.
   if e is IfStmt {

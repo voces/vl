@@ -761,6 +761,7 @@ import {
   arrNewIntrKind,
   asExprIsUnionCastIn,
   asExprLitAtomCast,
+  asExprLitAtomYieldsAtom,
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
@@ -948,6 +949,7 @@ import {
   eqRowTgtStructIdx,
   eqScalarListFieldKind,
   eqVariantListFieldKind,
+  eqgCoreFeOfSlot,
   eqgElemClass,
   eqgElemEqRow,
   eqgElemHasEqRow,
@@ -1094,6 +1096,7 @@ import {
   fnMvValStashLocal,
   fnMvValsBkLocal,
   fnMvValsOutLocal,
+  fnRetIsNulAtom,
   globalNameIsNonConst,
   globalNameIsNonConstSid,
   isNulScalarListFieldCode,
@@ -16914,6 +16917,11 @@ function emitListEqGCore(body: u8[], kind: i32, slot: i32, fnIx: i32) {
       if emitEqGStructElem(body, slot, fnIx) < 0 { return -1 }
       fbI32Eqz() // the compare leaves EQUALITY; the branch below tests MISMATCH
     }
+    // A recursive record element, through its minted compare function, which leaves EQUALITY.
+    "call" => {
+      fbCall(gImports + eqgCoreFeOfSlot(slot))
+      fbI32Eqz() // 0x45
+    }
     "scalar" => {
       // Two scalar leaves: one opcode, and it leaves the MISMATCH the branch below tests.
       wU8(eqgNeOpcode(kind))
@@ -20484,7 +20492,9 @@ function emitAsLitAtom(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
   if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
   const s = litAtomCastSlot()
   fbLocalSet(s)
-  if e.asMode == "null" {
+  // A lone literal target (`as! "a"`) yields that literal's string, not the id (D5289).
+  const strOut = !asExprLitAtomYieldsAtom(exprIx, fnIx)
+  if e.asMode == "null" && !strOut {
     fbLocalGet(s)
     fbI32Const(-1)
   }
@@ -20497,6 +20507,14 @@ function emitAsLitAtom(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
       fbI32Bin(114) // 0x72 i32.or
     }
     i = i + 1
+  }
+  if e.asMode == "null" && strOut {
+    fbIfRefNul(sTypeIdx, true)
+    if emitStr(body, mkStr(quoteLex(texts[0]), -1), -1) < 0 { return -1 }
+    fbElse()
+    fbRefNull(sTypeIdx)
+    fbEnd()
+    return 0
   }
   if e.asMode == "null" {
     fbSelect() // the id on a hit, the sentinel on a miss
@@ -20514,6 +20532,7 @@ function emitAsLitAtom(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
     fbReturn()
   }
   fbEnd()
+  if strOut { return emitStr(body, mkStr(quoteLex(texts[0]), -1), -1) }
   fbLocalGet(s)
   0
 }
@@ -28151,6 +28170,10 @@ export function emitNullForRet(_body: u8[], fnIx: i32) {
   // A nullable-closure return (`((i32) => i32) | null`): the niche `ref.null $cloStruct`.
   if nulCloFlag(r) == 1 {
     fbRefNull(cloStructIdx)
+    return 0
+  }
+  if fnRetIsNulAtom(fnIx) {
+    fbI32Const(-1) // the nullable atom's null sentinel
     return 0
   }
   // Value-union box (annotated `i32 | null`, or an inferred return widened to it): the
