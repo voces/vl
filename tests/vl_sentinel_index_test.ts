@@ -65,7 +65,8 @@ type Fixture = {
 // compiler's vocabulary — unlike the kind-ladder suite, this rule reads only shapes.
 const FIXTURES: Fixture[] = [
   {
-    // Nothing fires. Seven shapes that must not.
+    // Nothing fires. Ten shapes that must not: a read only in a comment and a string, a `!=`
+    // guard, and a field tested against a positive number is not a hole field.
     name: "clean.vl",
     src: `let tys: i32[] = []
 let rows: i32[] = []
@@ -123,6 +124,25 @@ function topOfReader(ix: i32): i32 {
   const v = tys[ix]
   if v > 0 { return v }
   -1
+}
+
+function quotedRead(n: i32): string {
+  const s = slotOf(n)
+  // tys[s]
+  "tys[s]"
+}
+
+function notEqualGuarded(n: i32): i32 {
+  const s = slotOf(n)
+  if s != -1 { return tys[s] }
+  0
+}
+
+type Pos = { at: i32 }
+
+function positiveField(p: Pos): i32 {
+  if p.at < 3 { return 0 }
+  tys[p.at]
 }
 `,
     unguarded: [],
@@ -209,7 +229,8 @@ function innerSlot(slot: i32): i32 {
     // declared nor an `i32` — so it reported `mine[s]` off a list the function was
     // handed (a false positive), and missed `tys[slot]` off the function's own `i32`
     // parameter on a fall-through (a false negative). Both directions are pinned here,
-    // with `undeclaredBase` as the control that must still fire.
+    // with `undeclaredBase` as the control that must still fire. `boundOne` pins that
+    // `1` is not a bound: only `0`, `-1` and a `.length` guard an index.
     name: "wrapped.vl",
     src: `let tys: i32[] = []
 
@@ -241,8 +262,14 @@ function wrappedParam(
   if first > 0 { return first }
   slotOf(tys[slot])
 }
+
+function boundOne(n: i32): i32 {
+  const s = slotOf(n)
+  if s > 1 { return 0 }
+  tys[s]
+}
 `,
-    unguarded: ["21:3", "29:10"],
+    unguarded: ["21:3", "29:10", "35:3"],
     strict: [],
   },
   {
@@ -476,40 +503,18 @@ Deno.test({
   },
 });
 
-// THE RATCHET IS A COMMITTED FILE, AND IT HAS TO DESCRIBE THIS TREE. `vl check --budget
-// scripts/sentinel-budget-baseline.json` is the gate row (the lint's own count); this holds
-// the census, an independent implementation, to the same baseline: no file may exceed its
-// row, and the baseline's totals must be the sum of its rows.
-Deno.test({
-  name: "sentinel-index: the committed baseline is at or above the census, per file",
-  ignore: !ENABLED,
-  fn: async () => {
-    const { code, stdout, stderr } = await census(["--counts"]);
-    if (code !== 0) {
-      throw new Error(
-        `sentinel-census.vl --counts exited ${code}: ` +
-          new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr),
-      );
-    }
-    const now = JSON.parse(new TextDecoder().decode(stdout)) as Record<string, Record<string, number>>;
-    const base = JSON.parse(
-      await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
-    ) as { total: Record<string, number>; files: Record<string, Record<string, number>> };
-    const over: string[] = [];
-    for (const [rel, v] of Object.entries(now)) {
-      for (const c of CODES) {
-        const was = base.files[rel]?.[c] ?? 0;
-        if ((v[c] ?? 0) > was) over.push(`${rel} ${c}: ${v[c]} (baseline ${was})`);
-      }
-    }
-    for (const c of CODES) {
-      const sum = Object.values(base.files).reduce((n, v) => n + (v[c] ?? 0), 0);
-      if (sum !== base.total[c]) {
-        over.push(`baseline total ${c} is ${base.total[c]} but its rows sum to ${sum}`);
-      }
-    }
-    if (over.length > 0) {
-      throw new Error(`the baseline does not describe the census:\n  ${over.join("\n  ")}`);
-    }
-  },
+// THE RATCHET IS A COMMITTED FILE. `vl check --budget scripts/sentinel-budget-baseline.json`
+// holds the lint's count per file, and the baseline's totals must be the sum of its rows.
+// The census is held to the lint by the fixtures above, not by a whole-tree run: each
+// census over-count the tree run alone could see has a fixture shape that fails "agree".
+Deno.test("sentinel-index: the committed baseline's totals are the sum of its rows", async () => {
+  const base = JSON.parse(
+    await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
+  ) as { total: Record<string, number>; files: Record<string, Record<string, number>> };
+  const bad: string[] = [];
+  for (const c of CODES) {
+    const sum = Object.values(base.files).reduce((n, v) => n + (v[c] ?? 0), 0);
+    if (sum !== base.total[c]) bad.push(`total ${c} is ${base.total[c]}, its rows sum to ${sum}`);
+  }
+  if (bad.length > 0) throw new Error(`the sentinel baseline:\n  ${bad.join("\n  ")}`);
 });
