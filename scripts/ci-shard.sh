@@ -43,6 +43,8 @@ FUEL_WARM=110
 WEIGHTS='
 selfhost_native_align_test.ts 9
 vl_budget_mode_test.ts 49
+selfhost_native_release_inline_test.ts 45
+vl_compile_cache_test.ts 45
 vl_distilled_tools_test.ts 37
 vl_deep_nesting_test.ts 35
 vl_capability_probes_port_test.ts 28
@@ -60,11 +62,13 @@ vl_sentinel_index_test.ts 15
 vl_compile_gc_test.ts 14
 vl_plumb_shape_port_test.ts 13
 vl_survey_regrade_port_test.ts 12
+selfhost_native_release_multivalue_test.ts 12
 vl_label_codemod_test.ts 11
 vl_gen_cases_test.ts 10
 vl_ladder_census_test.ts 10
 vl_perf_tools_test.ts 9
 vl_std_math_grade_test.ts 9
+vl_memarg_offset_test.ts 8
 vl_emit_refusal_sites_test.ts 8
 vl_twin_agreement_test.ts 7
 vl_check_fix_test.ts 6
@@ -75,7 +79,6 @@ vl_std_json_test.ts 6
 vl_label_block_object_test.ts 5
 vl_seed_size_test.ts 5
 vl_union_key_licence_test.ts 5
-vl_compile_cache_test.ts 4
 vl_instance_state_leak_test.ts 4
 vl_kind_ladder_test.ts 4
 vl_large_source_test.ts 4
