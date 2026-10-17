@@ -92,12 +92,14 @@ const HEAD = SUMMARY +
   "  module cache: reused 2 of 8 compiled cell modules\n";
 const QUIET = HEAD +
   "  runs -> NOT-RUNS  (blocking)    0 classes  (     0 of 1325 census cells)\n" +
+  "  floor -> SILENT  (blocking)     0 classes  (     0 of 1325 census cells)\n" +
   "  -> silent  (report)             0 classes  (     0 of 1325 census cells)\n" +
   "  other movement                  0 classes  (     0 of 1325 census cells)\n" +
   "  no cell changed class ✅\n\n";
 const RED = HEAD +
   "  runs -> NOT-RUNS  (blocking)    1 classes  (     7 of 1325 census cells)\n" +
   "      a000002  runs -> loud check reject   [7 cells]\n" +
+  "  floor -> SILENT  (blocking)     0 classes  (     0 of 1325 census cells)\n" +
   "  -> silent  (report)             1 classes  (    45 of 1325 census cells)\n" +
   "      a000005  loud emit reject -> trap_loads   [45 cells]\n" +
   "  other movement                  1 classes  (     1 of 1325 census cells)\n" +
@@ -297,6 +299,7 @@ Deno.test({
         SUMMARY +
           "  module cache: reused 0 of 0 compiled cell modules\n" +
           "  runs -> NOT-RUNS  (blocking)    0 classes  (     0 of 1325 census cells)\n" +
+          "  floor -> SILENT  (blocking)     0 classes  (     0 of 1325 census cells)\n" +
           "  -> silent  (report)             0 classes  (     0 of 1325 census cells)\n" +
           "  other movement                  1 classes  (  1200 of 1325 census cells)\n" +
           "      a000003  loud emit reject -> loud emit reject   [1200 cells]\n\n" +
