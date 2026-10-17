@@ -143,6 +143,7 @@ order, subject to the one-writer rule.
 | T3 | Dogfood the Python scripts in VL. **In progress.** Last: the last `scripts/*.py` tools ported and deleted. Remaining Python in gate rows includes the ratchets. See [T3 log](#t3-log). | T1 |
 | T4 | L10: the `-O` optimizer. **In progress:** R1–R5 landed, R6a and R6b run beside the Rust. Next: R6c, then R7. See [T4 log](#t4-log). | owner decision 3 below |
 | T5 | L12: the remaining LSP features. **Done:** every seed-backed feature lives in `lsp/src/features.ts`; `server.ts` is transport. See [T5 log](#t5-log). | A7 |
+| T6 | Check CPU: a CI run proves gate rows. **In progress.** Last: `scripts/ci-proof.sh` and `GATE_CI_PROOF`. The queue audit skips the rows that a `vl-queue/` push run proved on the same tree, seed, deno and rustc. Next: the queue pushes its candidate (the vl-tools proposal in the PR), then the audit reuses CI's proven seed. See [T6 log](#t6-log). | none |
 
 ## Concurrency
 
@@ -655,6 +656,10 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - L12: the remaining LSP features.
 - **Done:** every seed-backed feature lives in `lsp/src/features.ts` beside folding (definition, references, document highlights, document symbols, signature help, hover, inlay hints and semantic tokens in the first PR; completion, formatting, code actions, code lens and rename in the second), each taking a `FeatureContext` (checker, module key, reader, log) and answering in plain shapes.
 - `server.ts` is transport: it fetches the document, calls the feature and converts to protocol types.
+
+### T6 log
+
+- `scripts/ci-proof.sh` checks a push run of `ci.yml` on the audited commit. It needs the same tree and a clean checkout, the same seed sha256, deno pinned by `.dvmrc`, the same rustc, and every job passed with every shard present. With `GATE_CI_PROOF=<sha>`, `gate.sh` then skips the 15 rows that CI runs, and the corpus oracle. That is about 1,100 of the gate's 1,750–1,900 CPU-s. With the variable unset, the gate behaves as before. `tests/ci_proof_test.ts` refuses 28 mutated inputs.
 
 ### L12 log
 
