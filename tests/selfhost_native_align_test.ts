@@ -29,6 +29,12 @@
 // directory of cases is covered by NOTHING and the tell is silence; under opt-OUT
 // the default is coverage and every hole is a line of prose someone had to write.
 //
+// WHAT RUNS BY DEFAULT IS THE HOST-FACE SUBSET of what discovery finds (`hostFaceReason`):
+// the V8 face grades the whole corpus over the same seed bytes, so this face asserts the
+// cases that reach the host, wasmtime or the batch CLIs, plus a stratum per directory and
+// tier. The subset is selected by rule, so a new case under a host directory or importing a
+// host module is covered without an edit. `VL_NATIVE_ALIGN_FULL=1` asserts every case.
+//
 // SCOPE (matches the corpus directives the native binary can already adjudicate):
 // `@run`/`@log` runtime parity, `@trap` trap-and-exit, and `@check`/`@error`
 // accept-vs-reject WITH stage classification. OUT of scope (host-checker territory
@@ -275,6 +281,102 @@ for (const rel of [...walkVl(CASES)].sort()) {
   else if (rel in EXCLUSIONS) EXCLUDED.push({ rel, tier: tiers[0] });
   else TIERS[tiers[0]].push(rel);
 }
+
+// ── The host-face subset: what only THIS face can see ─────────────────────────
+// The V8 face (tests/cases_wasm_*_test.ts) grades this same corpus over the same seed bytes,
+// and pins more of each case (message text, spans, lint). What only the native face reaches
+// is the Rust host, wasmtime (its validator, trap rendering, GC heap and engine features) and
+// the two `--batch` CLIs. So by default a case is asserted here when `hostFaceReason` names
+// one of those, or when it holds a tier's or a stage's place for its directory.
+// `VL_NATIVE_ALIGN_FULL=1` asserts the whole corpus. Discovery, the coverage tripwire and
+// the exclusions always see every case.
+const FULL = Deno.env.get("VL_NATIVE_ALIGN_FULL") === "1";
+
+/** Directories whose cases are about a host or engine surface, kept whole. */
+const HOST_DIRS = new Set([
+  "atomics", // wasmtime's threads proposal
+  "extern", // host-supplied extern values
+  "intrinsics", // host imports beside the pure intrinsics
+  "lexer", // parse-stage rejects
+  "memory", // linear memory, under wasmtime's limits
+  "parser", // parse-stage rejects
+  "simd", // wasmtime's simd proposal
+  "std", // std resolution through the host, and the host-backed modules
+  "traps", // the host's trap rendering
+]);
+
+/** A case (or a file of its module) that imports a host-backed module or a host intrinsic. */
+const HOST_SOURCE =
+  /^\s*\/\/\s*@skip\b|"std:(?:args|env|fs|process|test)"|__(?:args|env|fs|proc)_[a-z_]+__/m;
+
+/**
+ * Named cases, each with the reason no rule above selects it. A case that ever grades
+ * differently on the two faces belongs here, whatever else selects it.
+ */
+const HOST_NAMED: Record<string, string> = {
+  "arrays/long-literal-u8-data-segment.vl": "D3417: a long literal's data segment",
+  "arrays/long-literal-widths-exact.vl": "D3417: a long literal's data segment",
+  "arrays/u8-nullable-list-literal-dest.vl": "D986: graded differently by the shared V8 instance",
+  "literals/long-literal-chunked.vl": "D1977: a long literal's string pool",
+  "strings/literal-chunked-bytes.vl": "D1977: a long literal's string pool",
+  "math/sin-cos.vl": "D3476: trig that must agree across hosts",
+  "math/sin-cos-f32.vl": "D3476: trig that must agree across hosts",
+  "math/sin-cos-special.vl": "D3476: trig that must agree across hosts",
+  "globals/global-reference-chain-cost.vl": "D1513: a compiler trap through the host",
+  // The run-tier cases that collect at all under a 64K first GC heap: the rest never
+  // reach wasmtime's collector.
+  "maps/churn-random-against-reference.vl": "GC: collects under a small heap",
+  "maps/forin-walk-mutation-against-reference.vl": "GC: collects under a small heap",
+  "maps/pair-index-against-reference.vl": "GC: collects under a small heap",
+  "maps/pair-index-insert-only-against-reference.vl": "GC: collects under a small heap",
+  "maps/forin-body-writes-another-map.vl": "GC: collects under a small heap",
+  "std/array-sort-agrees.vl": "GC: collects under a small heap",
+  "strings/eq-unroll-grid.vl": "GC: collects under a small heap",
+  "maps/churn-sliding-window-every-rep.vl": "GC: collects under a small heap",
+  "strings/index-of-grid.vl": "GC: collects under a small heap",
+  "maps/i64-keyed-walk-mutation-against-reference.vl": "GC: collects under a small heap",
+  "maps/forin-nested-walks-and-map-fields.vl": "GC: collects under a small heap",
+  "arrays/allocating-literal-chunked-in-body.vl": "GC: collects under a small heap",
+  "maps/forin-walk-deletes-and-inserts.vl": "GC: collects under a small heap",
+  "unions/deep-is-json-shape-walk.vl": "GC: collects under a small heap",
+  "closures/capture-union-closure-write-member-grid.vl": "GC: collects under a small heap",
+  "arrays/push-reserve-known-size.vl": "GC: collects under a small heap",
+};
+
+/** The first cases of each (directory, tier), in sorted order, that hold its place. */
+const STRATUM = 2;
+
+/** Every `.vl` a case's verdict reads: the file, or for a module case its whole directory. */
+const caseSources = (rel: string): string[] => {
+  if (!rel.startsWith("modules/")) return [rel];
+  const root = rel.split("/").slice(0, 2).join("/") + "/";
+  return [...walkVl(new URL(root, CASES))];
+};
+
+/** Why the default run asserts `rel`, or null when only the full run does. */
+const hostFaceReason = (rel: string, tier: Tier, rank: number): string | null => {
+  if (rel in HOST_NAMED) return HOST_NAMED[rel];
+  if (HOST_DIRS.has(rel.split("/")[0])) return "host directory";
+  if (caseSources(rel).some((f) => HOST_SOURCE.test(src(f)))) return "host source";
+  // Every emit-reject case: the only tier the `--codegen` batch leg grades.
+  if (tier === "emit-reject") return "emit-reject tier";
+  if (rank < STRATUM) return "tier stratum";
+  return null;
+};
+
+if (!FULL) {
+  for (const tier of Object.keys(TIERS) as Tier[]) {
+    const seen = new Map<string, number>();
+    TIERS[tier] = TIERS[tier].filter((rel) => {
+      const dir = rel.split("/")[0];
+      const rank = seen.get(dir) ?? 0;
+      seen.set(dir, rank + 1);
+      return hostFaceReason(rel, tier, rank) !== null;
+    });
+  }
+}
+/** Named cases discovery does not place in a tier: moved, renamed, deleted, or excluded. */
+const DISCOVERED_TIERED = new Set(Object.values(TIERS).flat());
 
 // ── CI sharding: `$VL_CI_SHARD=<k>/<n>` registers only the k-th of n shares ──────
 // ci.yml runs this file in every `ci-native` shard (it is SELF_SHARDED in
@@ -734,6 +836,13 @@ Deno.test({
           `(moved, renamed, or deleted): ${stale.join(", ")}`,
       );
     }
+    const staleNamed = Object.keys(HOST_NAMED).filter((rel) => !DISCOVERED_TIERED.has(rel));
+    if (staleNamed.length) {
+      throw new Error(
+        `HOST_NAMED names ${staleNamed.length} case(s) discovery does not place in a tier ` +
+          `(moved, renamed, deleted, or excluded): ${staleNamed.join(", ")}`,
+      );
+    }
     if (AMBIGUOUS.length) {
       throw new Error(
         `${AMBIGUOUS.length} case(s) declare directives for more than one tier — the ` +
@@ -755,6 +864,27 @@ Deno.test({
             orphans.map((o) => `${o.rel} → @${o.d}`).join("\n  ")
           }`,
       );
+    }
+  },
+});
+
+// The subset keeps every tier, and every stage a refusal is graded at, on the native path:
+// a stage no case reaches is a `stageOf` or `diagStage` defect no case can show.
+Deno.test({
+  name: "native-align subset: every tier and every refusal stage is graded",
+  ignore: !ENABLED,
+  fn: async () => {
+    const empty = (Object.keys(TIERS) as Tier[]).filter((t) => TIERS[t].length === 0);
+    if (empty.length) throw new Error(`no case asserts the ${empty.join(", ")} tier(s)`);
+    const check = await checkResults("check");
+    const codegen = await checkResults("codegen");
+    const stages = new Set([
+      ...TIERS.reject.map((rel) => check.get(rel)?.stage),
+      ...TIERS["emit-reject"].map((rel) => codegen.get(rel)?.stage),
+    ]);
+    const missing = ["parse", "type", "emit"].filter((s) => !stages.has(s));
+    if (missing.length) {
+      throw new Error(`no refusal is graded at the ${missing.join(", ")} stage(s)`);
     }
   },
 });
