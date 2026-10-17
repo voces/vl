@@ -2226,25 +2226,8 @@ function objShapeAdapterless(
     }
     return false
   }
-  // A union target accepts the source at some member. It is adapterless only when no
-  // accepting member is: one clean member is a lowering.
   if d is TyUnion {
-    const dms = d.uMembers
-    let di = 0
-    let anyClean = false
-    let anyAdapts = false
-    while di < dms.length {
-      if assignable(src, dms[di]) {
-        if objShapeAdapterless(srcExpr, src, dms[di], depth - 1, false) {
-          anyAdapts = true
-        } else {
-          anyClean = true
-        }
-      }
-      di = di + 1
-    }
-    if anyClean { return false }
-    return anyAdapts
+    return objShapeUnionDstAdapts(srcExpr, src, d.uMembers, depth)
   }
   const cx = ctorExprOf(srcExpr)
   if s is TyObj {
@@ -2261,30 +2244,7 @@ function objShapeAdapterless(
       if cx >= 0 {
         const ce = P.nodes[cx]
         if ce is ObjLit {
-          // The literal itself is rebuilt at `dst`; its field values still have to fit
-          // the destination field types, judged with their own expressions.
-          const dnames = d.objFieldNames
-          const dtys = d.objFieldTypes
-          let li = 0
-          while li < dnames.length {
-            const sft = objFieldType(s, dnames[li])
-            if sft >= 0 {
-              let fexpr = -1
-              const fl = ce.objFields
-              let fi = 0
-              while fi < fl.length {
-                const fn = P.nodes[fl[fi]]
-                if fn is FieldInit {
-                  if fn.fiName == dnames[li] { fexpr = fn.fiValue }
-                }
-                fi = fi + 1
-              }
-              if objShapeAdapterless(fexpr, sft, dtys[li], depth - 1, true) {
-                return true
-              }
-            }
-            li = li + 1
-          }
+          if objShapeLitFieldsAdapt(ce, s, d, depth) { return true }
           // Falls through to the dropped-field decision: the exemption covers what "built
           // at the destination shape" buys, and a field the destination does not declare is
           // not in it. `emitObj` walks the destination's field list, so a lacked field is
@@ -2296,23 +2256,7 @@ function objShapeAdapterless(
       // rather than unsupported, since a struct field is mutable. Not withdrawn here, since
       // the identical pair is correct for an un-annotated literal — the verdict turns on the source's provenance (D622).
       if objFieldNameSetsEq(src, dst) {
-        // …except where a field pair is itself a width pair and the source is not a
-        // rebuilt literal — withdrawing on the types alone would redden the un-annotated
-        // literal case, which is correct, so the axis is the source's provenance
-        // (`litShapeDropSrcExpr`). A struct's mutable field is WasmGC-invariant, so this is a clause-1 soundness violation with no sound lowering to build (D938).
-        if (
-          !litShapeDropSrcExpr(cx)
-          && !srcIsUnannotatedObjBinding(srcExpr)
-          && objFieldWidthPair(src, dst)
-        ) {
-          shapeAdaptSrcTySet(src)
-          shapeAdaptDstTySet(dst)
-          shapeAdaptSrcExprSet(cx)
-          shapeAdaptElemPairSet(false)
-          shapeAdaptWidthFieldSet(true)
-          return true
-        }
-        return false
+        return objShapeSameNamesAdapts(srcExpr, src, dst, cx)
       }
       // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
       // of `Wide`'s, in the canonical layout order with identical types, needs no
@@ -2321,12 +2265,7 @@ function objShapeAdapterless(
       if direct && !litShapeDropSrcExpr(cx) && objWidthPrefix(src, dst) {
         return false
       }
-      shapeAdaptSrcTySet(src)
-      shapeAdaptDstTySet(dst)
-      shapeAdaptSrcExprSet(cx)
-      shapeAdaptElemPairSet(false)
-      shapeAdaptWidthFieldSet(false)
-      return true
+      return objShapeAdaptNote(src, dst, cx, false, false)
     }
     return false
   }
@@ -2335,120 +2274,214 @@ function objShapeAdapterless(
       if cx >= 0 {
         const ae = P.nodes[cx]
         if ae is ArrayLit {
-          const els = ae.arrElems
-          let ei = 0
-          while ei < els.length {
-            // A spread of a list literal is fresh too: it is delivered into the list type, so
-            // its own elements are built at `d.aElem` (D4871).
-            const sx = ctorExprOf(spreadArgOf(els[ei]))
-            if sx >= 0 && P.nodes[sx] is ArrayLit {
-              if (
-                objShapeAdapterless(sx, nodeTyIxOf(sx), dst, depth - 1, direct)
-              ) {
-                return true
-              }
-            } else if (
-              objShapeAdapterless(
-                els[ei],
-                nodeTyIxOf(els[ei]),
-                d.aElem,
-                depth - 1,
-                true,
-              )
-            ) {
-              return true
-            }
-            ei = ei + 1
-          }
-          return false
+          return objShapeListLitAdapts(ae, dst, d.aElem, depth, direct)
         }
       }
-      // The nested pair first, so a container carrying an object pair keeps the precise
-      // object wording; only then the element's own storage class — what makes
-      // `i32[][]` -> `(i32 | null)[][]` report the inner array pair rather than the outer.
-      if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1, false) {
-        return true
-      }
-      if (
-        containerElemClassDiffers(s.aElem, d.aElem)
-        || (d.aRead == 0 && unionElemMemberWidens(s.aElem, d.aElem))
-      ) {
-        // Only a `readonly` destination takes the converting copy (D965), and only where
-        // nothing writes the source: the copy is a snapshot. An unknown write state (2) refuses.
-        if d.aRead == 1 && scalarElemWidenServed(s.aElem, d.aElem) {
-          if cx < 0 {
-            shapeAdaptNestedCopySet(true)
-          } else if (
-            covarValueWriteState(covarRootName(cx), covarRootFrame(cx))
-            == 0
-          ) {
-            if !covarRootFreshLocal(cx) { noteScalarView(s.aElem, d.aElem) }
-            return false
-          }
-        }
-        shapeAdaptSrcTySet(src)
-        shapeAdaptDstTySet(dst)
-        shapeAdaptSrcExprSet(cx)
-        shapeAdaptElemPairSet(true)
-        shapeAdaptWidthFieldSet(false)
-        return true
-      }
-      return false
+      return objShapeListElemAdapts(src, dst, s, d, cx, depth)
     }
     return false
   }
   if s is TyMap {
-    if d is TyMap {
-      if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1, false) {
-        return true
-      }
-      if objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1, false) {
-        return true
-      }
-      if containerElemClassDiffers(s.mKey, d.mKey) {
-        shapeAdaptSrcTySet(src)
-        shapeAdaptDstTySet(dst)
-        shapeAdaptSrcExprSet(cx)
-        shapeAdaptElemPairSet(true)
-        shapeAdaptWidthFieldSet(false)
-        return true
-      }
-      if (
-        containerElemClassDiffers(s.mVal, d.mVal)
-        || mapValBoxDiffers(s.mVal, d.mVal)
-        || unionElemMemberWidens(s.mVal, d.mVal)
-      ) {
-        shapeAdaptSrcTySet(src)
-        shapeAdaptDstTySet(dst)
-        shapeAdaptSrcExprSet(cx)
-        shapeAdaptElemPairSet(true)
-        shapeAdaptWidthFieldSet(false)
-        return true
-      }
-      return false
-    }
+    if d is TyMap { return objShapeMapPairAdapts(src, dst, s, d, cx, depth) }
     return false
   }
   if s is TyFunc {
-    if d is TyFunc {
-      const sp = s.fnParamTypes
-      const dp = d.fnParamTypes
-      if sp.length != dp.length { return false }
-      if objShapeAdapterless(-1, s.fnRet, d.fnRet, depth - 1, false) {
+    if d is TyFunc { return objShapeFuncPairAdapts(s, d, depth) }
+    return false
+  }
+  false
+}
+
+// Records the adapter pair `src` into `dst` (built at `cx`) for the refusal's wording, with
+// whether the pair is an element pair or a field width pair. Always true: the flow adapts.
+function objShapeAdaptNote(
+  src: i32,
+  dst: i32,
+  cx: i32,
+  elemPair: boolean,
+  widthField: boolean,
+): boolean {
+  shapeAdaptSrcTySet(src)
+  shapeAdaptDstTySet(dst)
+  shapeAdaptSrcExprSet(cx)
+  shapeAdaptElemPairSet(elemPair)
+  shapeAdaptWidthFieldSet(widthField)
+  true
+}
+
+// A union target accepts the source at some member of `dms`. It is adapterless only when no
+// accepting member is: one clean member is a lowering.
+function objShapeUnionDstAdapts(
+  srcExpr: i32,
+  src: i32,
+  dms: i32[],
+  depth: i32,
+): boolean {
+  let di = 0
+  let anyClean = false
+  let anyAdapts = false
+  while di < dms.length {
+    if assignable(src, dms[di]) {
+      if objShapeAdapterless(srcExpr, src, dms[di], depth - 1, false) {
+        anyAdapts = true
+      } else {
+        anyClean = true
+      }
+    }
+    di = di + 1
+  }
+  if anyClean { return false }
+  anyAdapts
+}
+
+// The object literal `ce` is rebuilt at `d`; its field values still have to fit the
+// destination field types, judged with their own expressions. True when one needs an adapter.
+function objShapeLitFieldsAdapt(
+  ce: ObjLit,
+  s: TyObj,
+  d: TyObj,
+  depth: i32,
+): boolean {
+  const dnames = d.objFieldNames
+  const dtys = d.objFieldTypes
+  let li = 0
+  while li < dnames.length {
+    const sft = objFieldType(s, dnames[li])
+    if sft >= 0 {
+      let fexpr = -1
+      const fl = ce.objFields
+      let fi = 0
+      while fi < fl.length {
+        const fn = P.nodes[fl[fi]]
+        if fn is FieldInit {
+          if fn.fiName == dnames[li] { fexpr = fn.fiValue }
+        }
+        fi = fi + 1
+      }
+      if objShapeAdapterless(fexpr, sft, dtys[li], depth - 1, true) {
         return true
       }
-      let pi = 0
-      while pi < sp.length {
-        // Parameters compare contravariantly in `assignable`'s `TyFunc` arm; keep the
-        // same operand order so the pair examined is the pair it accepted.
-        if objShapeAdapterless(-1, dp[pi], sp[pi], depth - 1, false) {
-          return true
-        }
-        pi = pi + 1
-      }
-      return false
     }
-    return false
+    li = li + 1
+  }
+  false
+}
+
+// Two records of agreeing field names adapt only where a field pair is a width pair and the
+// source is not a rebuilt literal: the axis is provenance, since the types alone would refuse
+// the correct un-annotated literal. A mutable struct field is WasmGC-invariant (D938).
+function objShapeSameNamesAdapts(
+  srcExpr: i32,
+  src: i32,
+  dst: i32,
+  cx: i32,
+): boolean {
+  if (
+    !litShapeDropSrcExpr(cx)
+    && !srcIsUnannotatedObjBinding(srcExpr)
+    && objFieldWidthPair(src, dst)
+  ) {
+    return objShapeAdaptNote(src, dst, cx, false, true)
+  }
+  false
+}
+
+// A list literal delivered as a list: each element is judged against `dElem` with its own
+// expression, and a spread of a list literal, fresh too, against the list `dst` (D4871).
+function objShapeListLitAdapts(
+  ae: ArrayLit,
+  dst: i32,
+  dElem: i32,
+  depth: i32,
+  direct: boolean,
+): boolean {
+  const els = ae.arrElems
+  let ei = 0
+  while ei < els.length {
+    const sx = ctorExprOf(spreadArgOf(els[ei]))
+    if sx >= 0 && P.nodes[sx] is ArrayLit {
+      if (objShapeAdapterless(sx, nodeTyIxOf(sx), dst, depth - 1, direct)) {
+        return true
+      }
+    } else if (
+      objShapeAdapterless(els[ei], nodeTyIxOf(els[ei]), dElem, depth - 1, true)
+    ) {
+      return true
+    }
+    ei = ei + 1
+  }
+  false
+}
+
+// A list pair other than a literal: the nested pair first, so an object pair keeps its precise
+// wording, then the element's storage class. Only a `readonly` destination over an unwritten
+// source takes the converting copy (D965); an unknown write state refuses.
+function objShapeListElemAdapts(
+  src: i32,
+  dst: i32,
+  s: TyArray,
+  d: TyArray,
+  cx: i32,
+  depth: i32,
+): boolean {
+  if objShapeAdapterless(-1, s.aElem, d.aElem, depth - 1, false) { return true }
+  if (
+    containerElemClassDiffers(s.aElem, d.aElem)
+    || (d.aRead == 0 && unionElemMemberWidens(s.aElem, d.aElem))
+  ) {
+    if d.aRead == 1 && scalarElemWidenServed(s.aElem, d.aElem) {
+      if cx < 0 {
+        shapeAdaptNestedCopySet(true)
+      } else if (
+        covarValueWriteState(covarRootName(cx), covarRootFrame(cx))
+        == 0
+      ) {
+        if !covarRootFreshLocal(cx) { noteScalarView(s.aElem, d.aElem) }
+        return false
+      }
+    }
+    return objShapeAdaptNote(src, dst, cx, true, false)
+  }
+  false
+}
+
+// A map pair adapts through its key or value pair, a differing storage class of either, or a
+// value box or union member the shared map cannot carry.
+function objShapeMapPairAdapts(
+  src: i32,
+  dst: i32,
+  s: TyMap,
+  d: TyMap,
+  cx: i32,
+  depth: i32,
+): boolean {
+  if objShapeAdapterless(-1, s.mKey, d.mKey, depth - 1, false) { return true }
+  if objShapeAdapterless(-1, s.mVal, d.mVal, depth - 1, false) { return true }
+  if containerElemClassDiffers(s.mKey, d.mKey) {
+    return objShapeAdaptNote(src, dst, cx, true, false)
+  }
+  if (
+    containerElemClassDiffers(s.mVal, d.mVal)
+    || mapValBoxDiffers(s.mVal, d.mVal)
+    || unionElemMemberWidens(s.mVal, d.mVal)
+  ) {
+    return objShapeAdaptNote(src, dst, cx, true, false)
+  }
+  false
+}
+
+// A function pair adapts through its result or any parameter. Parameters compare
+// contravariantly, in `assignable`'s `TyFunc` operand order, so the pair examined is the pair
+// it accepted.
+function objShapeFuncPairAdapts(s: TyFunc, d: TyFunc, depth: i32): boolean {
+  const sp = s.fnParamTypes
+  const dp = d.fnParamTypes
+  if sp.length != dp.length { return false }
+  if objShapeAdapterless(-1, s.fnRet, d.fnRet, depth - 1, false) { return true }
+  let pi = 0
+  while pi < sp.length {
+    if objShapeAdapterless(-1, dp[pi], sp[pi], depth - 1, false) { return true }
+    pi = pi + 1
   }
   false
 }

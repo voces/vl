@@ -9942,6 +9942,77 @@ function monoMakeInstanceLaterName(
   instName
 }
 
+// The head of an instance's registry key: the template's slot, the pending `monoKeyExtra`
+// (consumed here), and the call frame when the instance is frame-keyed.
+function monoMakeInstanceKeyHead(origFe: i32, callFrame: i32): string {
+  let key = i32ToStr(origFe) + "#" + monoKeyExtra
+  monoKeyExtra = ""
+  if callFrame >= 0 { key = key + "^" + i32ToStr(callFrame) }
+  key
+}
+
+// A closure-pinned param flips the module's function-value machinery on (the instance body
+// `call_ref`s through it; the argument side builds the fat pointer), as a lifted lambda does.
+function monoPinKindsNoteFnVal(pinKinds: i32[]) {
+  let pv = 0
+  while pv < pinKinds.length {
+    if pinKinds[pv] == PIN_SIGKEY { fnValUsed = true }
+    pv = pv + 1
+  }
+  0
+}
+
+// How many instances of the template at `origFe` exist so far.
+function monoInstanceCount(origFe: i32): i32 {
+  let count = 0
+  let k2 = 0
+  while k2 < monoInstOrig.length {
+    if monoInstOrig[k2] == origFe { count = count + 1 }
+    k2 = k2 + 1
+  }
+  count
+}
+
+// Binds the instance's hole parameters into `monoCgcHoleN`/`monoCgcHoleT` (fresh rows) and
+// names its un-annotated parameters in `monoCgcHoleParams`, for the body clone to read.
+function monoMakeInstanceHoles(
+  origFe: i32,
+  params: i32[],
+  letTyCol: i32[],
+  body: i32,
+) {
+  monoCgcHoleN = []
+  monoCgcHoleT = []
+  monoHoleBinding(origFe, params, letTyCol, monoCgcHoleN, monoCgcHoleT)
+  monoCgcHoleParams = monoHoleParamNames(params, body)
+  0
+}
+
+// The instance's declared result: `nret`, or -1 when a bare `return` makes the template void
+// whatever its tail's type is, or its result is never consumed — `computeVoidFns` then
+// classifies the clone from its own body (D1600).
+function monoMakeInstanceRetIx(fn: FuncDecl, origFe: i32, nret: i32): i32 {
+  let instRet = nret
+  if fn.fnRet < 0 && blockHasBareReturn(fn.fnBody) { instRet = -1 }
+  if fnResultUnconsumed(monoOrigNode[origFe]) { instRet = -1 }
+  instRet
+}
+
+// Installs the first instance `nfn` in the template's own slot: it keeps the bare name and
+// the original's wasm index.
+function monoMakeInstanceFirst(
+  origFe: i32,
+  nfn: i32,
+  calleeIx: i32,
+  instName: string,
+) {
+  buildFnMapNoteFnStmtWrite(origFe, nfn)
+  fnStmts[origFe] = nfn
+  monoArenaTouch()
+  monoLamCallByName(calleeIx, origFe, instName)
+  0
+}
+
 // `monoMakeInstance` itself.
 function monoMakeInstanceGo(
   origFe: i32,
@@ -9980,9 +10051,7 @@ function monoMakeInstanceGo(
     monoEnclosingPinRow(origFe, callFrame, fn.fnTyParams, outerN, outerT)
     monoCurHasLam = monoFnDeclaresLambda(origFe)
     const params = fn.fnParams
-    let key = i32ToStr(origFe) + "#" + monoKeyExtra
-    monoKeyExtra = ""
-    if callFrame >= 0 { key = key + "^" + i32ToStr(callFrame) }
+    let key = monoMakeInstanceKeyHead(origFe, callFrame)
     const exBN = monoExplicitBN
     const exBT = monoExplicitBT
     let on = 0
@@ -10022,14 +10091,7 @@ function monoMakeInstanceGo(
       exSubT,
       cbFnNames,
     )
-    // A closure-pinned param flips the module's function-value machinery on
-    // (the instance body `call_ref`s through it; the argument side builds the
-    // fat pointer) — the same flag a lifted lambda flips in `liftFnsInExpr`.
-    let pv = 0
-    while pv < pinKinds.length {
-      if pinKinds[pv] == PIN_SIGKEY { fnValUsed = true }
-      pv = pv + 1
-    }
+    monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
     if monoMakeInstanceHit(key, origFe, pinned, pinTys, calleeIx, annotateI32) {
       return 0
@@ -10037,12 +10099,7 @@ function monoMakeInstanceGo(
     // New shape: clone the original declaration with pinned annotations. An un-annotated
     // param pinned at plain i32 keeps `parType = -1` — the emitter's default kind, and
     // zero new arena nodes on the all-i32 path.
-    let count = 0
-    let k2 = 0
-    while k2 < monoInstOrig.length {
-      if monoInstOrig[k2] == origFe { count = count + 1 }
-      k2 = k2 + 1
-    }
+    const count = monoInstanceCount(origFe)
     const nps: i32[] = []
     // The pinned params as arena indices, one row per entry of `params` (-1 = no
     // resolvable type). This is the column the speculative-inference windows below take:
@@ -10115,12 +10172,9 @@ function monoMakeInstanceGo(
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
     // no such annotation.
-    monoCgcHoleN = []
-    monoCgcHoleT = []
-    monoHoleBinding(origFe, params, letTyCol, monoCgcHoleN, monoCgcHoleT)
+    monoMakeInstanceHoles(origFe, params, letTyCol, fn.fnBody)
     const instHoleN = monoCgcHoleN
     const instHoleT = monoCgcHoleT
-    monoCgcHoleParams = monoHoleParamNames(params, fn.fnBody)
     const instBody0L = monoMakeInstanceBodyPinned(
       fn,
       origFe,
@@ -10157,22 +10211,14 @@ function monoMakeInstanceGo(
       letBN,
       letBT,
     )
-    // A bare `return` makes the template void whatever its tail's type is, so drop the pins
-    // above and let `computeVoidFns` classify the clone from its own body (D1600).
-    let instRet = nret
-    if fn.fnRet < 0 && blockHasBareReturn(fn.fnBody) { instRet = -1 }
-    if fnResultUnconsumed(monoOrigNode[origFe]) { instRet = -1 }
+    const instRet = monoMakeInstanceRetIx(fn, origFe, nret)
     if instBody != fn.fnBody { bodyRebuiltFrom.set(instBody, fn.fnBody) }
     const nfn = mkFunc(instName, noTyParams, nps, instRet, instBody, -1)
     // D926 — the return-row twin of the param mark above. `monoOrigNode[origFe]` is the
     // template's own `FuncDecl`, which is what `anonLeafMarkRetMoved` marked.
     anonLeafCarryRetMark(monoOrigNode[origFe], nfn)
     if first {
-      // First instance: keep the bare name and the original's wasm index.
-      buildFnMapNoteFnStmtWrite(origFe, nfn)
-      fnStmts[origFe] = nfn
-      monoArenaTouch()
-      monoLamCallByName(calleeIx, origFe, instName)
+      monoMakeInstanceFirst(origFe, nfn, calleeIx, instName)
     } else {
       instFe = monoMakeInstanceLater(
         fn,

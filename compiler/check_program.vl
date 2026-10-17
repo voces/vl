@@ -613,6 +613,7 @@ import {
   tyHasHole,
   tyHoldsObj,
   tyIsPrimNamed,
+  tyIsTwinRecordUnion,
   tyNameAtoms,
   tySame,
   tyToEmitName,
@@ -1737,6 +1738,11 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   name
 }
 
+// The last render `canonEmitUnionName` took from a type rather than a spelling, and that type:
+// the render re-parses to one record, so the annotation's row is the type itself.
+let canonTwinText = ""
+let canonTwinTy = -1
+
 // The top-level union arm of `canonEmitNameTs`: `name` at position `ctx` split on `|`, each
 // member canon'd and deduped at the atom, with the subsumed-arm collapse and the literal-union
 // preserves ahead of it. Answers the rejoined spelling and sets `canonAtoms` to its width.
@@ -1796,6 +1802,8 @@ function canonEmitUnionName(name: string, ctx: i32): string {
   // one atom, but the union-alias expansion substitutes a whole rendered member set for
   // one member (`AB` → `A|B`), so `AB | null` joins to a three-atom name.
   let atoms = 0
+  // Whether a record atom deduped away, which arms differing only in a lone literal do.
+  let recDup = false
   let i = 0
   while i < parts.length {
     // The regrouped run stands at the first literal-derived member's position and the
@@ -1845,6 +1853,7 @@ function canonEmitUnionName(name: string, ctx: i32): string {
         if kept[j] == cAtom { dup = true }
         j = j + 1
       }
+      if dup && cAtom.length > 0 && cAtom[0] == '{' { recDup = true }
       if !dup {
         kept.push(cAtom)
         if cAtoms.length == 1 { atoms = atoms + ca } else { atoms = atoms + 1 }
@@ -1852,6 +1861,19 @@ function canonEmitUnionName(name: string, ctx: i32): string {
       ci2 = ci2 + 1
     }
     i = i + 1
+  }
+  // Those arms are distinct types, so the name is the type's own render, one shape per arm (D5163).
+  if recDup {
+    const tw = nameToTy(name)
+    if tyIsTwinRecordUnion(tw) {
+      const tr = tyToEmitNameAt(tw, ctx)
+      if tr != "" {
+        canonAtomsSet(tyNameAtoms)
+        canonTwinText = tr
+        canonTwinTy = tw
+        return tr
+      }
+    }
   }
   let out = kept[0]
   let k = 1
@@ -1885,6 +1907,7 @@ export function canonEmitTypeNames() {
       // This site holds the parser's root for the spelling it is about to rewrite, so it
       // hands it over instead of leaving the intersection fold — the one arm that still
       // takes a whole annotation apart — to re-parse it. Read before the rewrite.
+      canonTwinTy = -1
       const c = canonEmitNameTs(n.tyName, RC_ROOT, annTsOf(i))
       // The rewrite invalidates the parser's spelling tree for this node: canon is not a
       // rename, so a tree kept past it would describe a different type, not a different
@@ -1892,7 +1915,11 @@ export function canonEmitTypeNames() {
       if c != n.tyName {
         clearAnnTs(i)
         canonClearedPush(i)
-        canonTyIxColPush(nameToTy(c))
+        if canonTwinTy >= 0 && canonTwinText == c {
+          canonTyIxColPush(canonTwinTy)
+        } else {
+          canonTyIxColPush(nameToTy(c))
+        }
         canonBankRaw(i, CANON_SLOT_TY, n.tyName)
         n.tyName = c
       }
