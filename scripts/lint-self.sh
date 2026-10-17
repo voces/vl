@@ -77,7 +77,7 @@ trap 'rm -rf "$WORK"' EXIT
 #
 # `prefer-interpolation` is an `info` suggestion held the same way, by
 # `vl check --budget scripts/interp-budget-baseline.json`: std/'s and scripts/' standing
-# `+` chains are baselined rather than rewritten, and a new one fails that gate row.
+# `+` chains are baselined rather than rewritten, and a new one fails this script.
 lint_graded() { # <target> <json path>
   local rc=0
   "$VL" check "$1" --severity info --include-imports --json > "$2" 2> "$2.err" || rc=$?
@@ -97,7 +97,11 @@ lint_graded() { # <target> <json path>
 # racing to Cranelift-compile (and write the same sidecar) at once. It is also the
 # only run `std-comment-audience` can fire in — the rule is scoped by module path.
 echo "== self-lint: std/ =="
-lint_graded std/ "$WORK/std.json"
+# A run that only KEPT findings (rc 1) still wrote a whole report, so the ratchets below
+# count it before the script fails; a higher rc means there is no report to count.
+STD_RC=0
+lint_graded std/ "$WORK/std.json" || STD_RC=$?
+[ "$STD_RC" -le 1 ] || exit "$STD_RC"
 
 # The compiler is a real module graph — lint it through its entry, so the
 # checker resolves `import`/`export` across the modules exactly as a build does.
@@ -106,6 +110,24 @@ lint_graded std/ "$WORK/std.json"
 echo "== self-lint: the compiler module graph (concurrent with fmt) =="
 lint_graded compiler/entry.vl "$WORK/graph.json" > "$WORK/graph.log" 2>&1 &
 GRAPH_PID=$!
+
+# scripts/ is linted for the interp ratchet only (its baseline's third target), with the
+# baseline's own `exclude` globs; it is not graded at `info` like the two runs above.
+# The globs are read from the line `--write-baseline` writes, so a new one reaches here.
+SCRIPTS_EXCLUDES=()
+while IFS= read -r g; do
+  [ -n "$g" ] && SCRIPTS_EXCLUDES+=(--exclude "$g")
+done < <(sed -n 's/^"exclude": \[\(.*\)\],\{0,1\}$/\1/p' scripts/interp-budget-baseline.json |
+  tr ',' '\n' | sed 's/^ *"//; s/" *$//')
+if [ "${#SCRIPTS_EXCLUDES[@]}" = 0 ]; then
+  echo "self-lint: read no \`exclude\` globs from scripts/interp-budget-baseline.json"
+  exit 1
+fi
+( rc=0
+  "$VL" check scripts --severity info --include-imports --json "${SCRIPTS_EXCLUDES[@]}" \
+    > "$WORK/scripts.json" 2> "$WORK/scripts.err" || rc=$?
+  [ "$rc" -le 1 ] || { cat "$WORK/scripts.err" "$WORK/scripts.json"; exit "$rc"; } ) &
+SCRIPTS_PID=$!
 
 # fmt gate: the source tree must be `vl fmt`-clean. `--check` exits non-zero on
 # any drift, naming the offending file on stderr; xargs propagates any failure
@@ -182,7 +204,7 @@ echo "== self-lint: the compiler module graph (result) =="
 GRAPH_RC=0
 wait "$GRAPH_PID" || GRAPH_RC=$?
 cat "$WORK/graph.log"
-[ "$GRAPH_RC" = 0 ] || exit "$GRAPH_RC"
+[ "$GRAPH_RC" -le 1 ] || exit "$GRAPH_RC"
 # Coverage guard: the graph run must attribute findings to more than the entry. Without
 # `--include-imports` every import's findings are withheld and this run would pass on
 # zero findings having linted nothing but entry.vl.
@@ -191,13 +213,45 @@ if [ "$GRAPH_FILES" -lt 2 ]; then
   echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
   exit 1
 fi
-# The comment, kind-ladder and sentinel-index ratchets count the findings this graph run
-# already produced (`--findings`, the same `--include-imports` report), rather than each
-# walking compiler/ again file by file. Their baselines target `compiler/entry.vl`, whose
-# import closure is every compiler/*.vl (tests/budget_targets_test.ts holds that).
+SCRIPTS_RC=0
+wait "$SCRIPTS_PID" || SCRIPTS_RC=$?
+[ "$SCRIPTS_RC" = 0 ] || exit "$SCRIPTS_RC"
+# The ratchets count the findings these runs already produced (`--findings`, the same
+# `--include-imports` reports), rather than each walking its targets again. The comment,
+# kind-ladder and sentinel-index baselines target `compiler/entry.vl`, whose import closure
+# is every compiler/*.vl; arena-scan's add `std`, interp's `std` and `scripts`
+# (tests/budget_targets_test.ts holds both facts). `--findings` takes one report, so the
+# runs' arrays are joined; a position two reports share counts once.
+join_reports() { # <out> <report>...
+  local out=$1 sep="" body
+  shift
+  {
+    printf '['
+    for f in "$@"; do
+      body=$(sed -e '1s/^[[:space:]]*\[//' -e '$s/\][[:space:]]*$//' "$f")
+      if [ -n "$body" ]; then printf '%s%s' "$sep" "$body"; sep=","; fi
+    done
+    printf ']\n'
+  } > "$out"
+}
+join_reports "$WORK/scan.json" "$WORK/graph.json" "$WORK/std.json"
+join_reports "$WORK/interp.json" "$WORK/graph.json" "$WORK/std.json" "$WORK/scripts.json"
+# The report is a temp file gone at exit, and a lint report names no source lines, so the
+# printed remedy is the baseline's own walk (same population, same counts).
+budget_over() { # <budget> <report>
+  local out rc=0
+  out=$("$VL" check --budget "scripts/$1-budget-baseline.json" --findings "$2" 2>&1) || rc=$?
+  printf '%s\n' "${out//" --findings $2"/}"
+  return "$rc"
+}
+BUDGET_RC=0
 for budget in comment ladder sentinel; do
-  "$VL" check --budget "scripts/$budget-budget-baseline.json" --findings "$WORK/graph.json" || exit $?
+  budget_over "$budget" "$WORK/graph.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
 done
-[ "$FMT_RC" = 0 ] || exit "$FMT_RC"
+budget_over scan "$WORK/scan.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
+budget_over interp "$WORK/interp.json" || { rc=$?; [ "$BUDGET_RC" != 0 ] || BUDGET_RC=$rc; }
+for rc in "$STD_RC" "$GRAPH_RC" "$BUDGET_RC" "$FMT_RC"; do
+  [ "$rc" = 0 ] || exit "$rc"
+done
 
 echo "self-lint + fmt-check clean ✅"
