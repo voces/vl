@@ -62,8 +62,8 @@ class Vl < Formula
     # And the OTHER embedded half: a `std:` import must resolve with no `std/`
     # anywhere near the binary (D1573). `brew test` runs in a scratch directory,
     # which is exactly the condition that used to fail.
-    assert_equal "7", shell_output(
-      "#{bin}/vl run -e 'import { stdSmoke } from \"std:seed\"\n\nprint(stdSmoke())'",
+    assert_equal "007", shell_output(
+      "#{bin}/vl run -e 'import { padStart } from \"std:str\"\n\nprint(padStart(\"7\", 3, \"0\"))'",
     ).strip
   end
 end

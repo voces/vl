@@ -1657,6 +1657,31 @@ fn engine_fail_offset(msg: &str) -> Option<i32> {
     found
 }
 
+/// `engine_fail_offset` against the case table the guest's `engineFailOffset` is graded
+/// on too (tests/vl_engine_fail_offset_test.ts), so the two parsers cannot drift apart.
+#[cfg(test)]
+mod engine_offset_tests {
+    use super::engine_fail_offset;
+
+    const CASES: &str = include_str!("../../../tests/fixtures/engine-fail-offset.txt");
+
+    #[test]
+    fn engine_offset_table() {
+        let mut n = 0;
+        for line in CASES.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let (want, msg) = line.split_once('|').expect("a case is `<want>|<message>`");
+            let want: i32 = want.parse().expect("a case's want is an i32");
+            let want = if want < 0 { None } else { Some(want) };
+            assert_eq!(engine_fail_offset(msg), want, "message: {msg:?}");
+            n += 1;
+        }
+        assert!(n > 0, "the case table is empty");
+    }
+}
+
 /// Read one guest string through the per-element `<name>Len(i)` / `<name>At(i, j)` ABI.
 ///
 /// STAGE 2c: the element is a UTF-8 **byte**, not a code point. Every one of the five

@@ -368,6 +368,7 @@ Deno.test("ratchet-hold: a file outside the workspace is untouched", async () =>
 const BASELINES = [
   "scripts/ladder-budget-baseline.json",
   "scripts/sentinel-budget-baseline.json",
+  "scripts/byte-budget-baseline.json",
   "scripts/scan-budget-baseline.json",
   "scripts/comment-budget-baseline.json",
   "scripts/export-budget-baseline.json",
