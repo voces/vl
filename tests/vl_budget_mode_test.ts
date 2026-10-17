@@ -29,6 +29,9 @@ const BASELINE = `${ROOT}/scripts/interp-budget-baseline.json`;
 const CODE = "prefer-interpolation";
 const NARROW = ["std", "scripts/seed-size.vl"];
 const DOCTORED_FILE = "std/fs.vl";
+// The sentinel write's population: one compiler file. The committed baseline over the whole
+// tree is lint-self.sh's hold; this test owns the writer's layout and sentences.
+const SENTINEL_NARROW = "compiler/parser.vl";
 
 type Run = { code: number; out: string; err: string };
 
@@ -213,7 +216,7 @@ Deno.test({
         ),
       );
       const [w, check, ex] = await Promise.all([
-        vl(["--budget", full, "--write-baseline"]),
+        vl(["--budget", full, "--write-baseline", SENTINEL_NARROW]),
         vl(["--budget", path, "--findings", atBaseline]),
         vl(["--budget", path, "--exempt-codes"]),
       ]);
@@ -236,13 +239,36 @@ Deno.test({
         ) + "\n",
         ex.out,
       );
-      // The write is a fixed point of the committed file but for `commit`.
-      const strip = (t: string) =>
-        t.split("\n").filter((l) => !l.startsWith('"commit"')).join("\n");
+      // A write over one file keeps the committed header byte for byte (ok, remedy and its
+      // escapes, targets) and writes that file's lines exactly as the committed file has them.
+      const want = (await Deno.readTextFile(path)).split("\n");
+      const got = (await Deno.readTextFile(full)).split("\n");
+      const header = (t: string[]) =>
+        t.slice(0, t.findIndex((l) => l.startsWith('"total"')))
+          .filter((l) => !l.startsWith('"commit"'));
+      expectEq("a narrowed write keeps the header", header(want), header(got));
+      const mine = (t: string[]) =>
+        t.filter((l) => l.includes(`"${SENTINEL_NARROW}`))
+          .map((l) => l.replace(/,$/, ""));
+      if (mine(want).length < 2) {
+        throw new Error(`${SENTINEL_NARROW} has no committed entry, so this is vacuous`);
+      }
+      expectEq("a narrowed write's own lines", mine(want), mine(got));
+      const n = committed.files[SENTINEL_NARROW][u];
       expectEq(
-        "a fresh write equals the committed baseline but for commit",
-        strip(await Deno.readTextFile(path)),
-        strip(await Deno.readTextFile(full)),
+        "a narrowed write's total line",
+        `"total": {"${u}": ${n}, "${s}": 0},`,
+        got.find((l) => l.startsWith('"total"')),
+      );
+      // A second write over the first is a fixed point.
+      const again = `${dir}/again.json`;
+      await Deno.copyFile(full, again);
+      const w2 = await vl(["--budget", again, "--write-baseline", SENTINEL_NARROW]);
+      expectEq("a second write: exit", 0, w2.code);
+      expectEq(
+        "a second write is byte-identical",
+        got.join("\n"),
+        await Deno.readTextFile(again),
       );
     } finally {
       await Deno.remove(dir, { recursive: true });
