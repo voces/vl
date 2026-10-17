@@ -66,6 +66,7 @@ import {
 } from "./check_emit_queries"
 import { i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
 import { canonEmitName } from "./check_program"
+import { tyIsForeignGenericSig } from "./check_subst"
 import {
   assignable,
   bindGenWalk,
@@ -13509,24 +13510,33 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 }
 
 // The pin of hole parameter `pIx` when call `callIx` hands it generic function `argIx`: the
-// checker bound the hole to the instance the body calls it at, which is materialized here
-// (D4420). "" when the argument is not a generic or the checker bound no concrete signature.
+// instance the checker bound the hole to, materialized here and pinned as a concrete function
+// argument is, so the callee can forward it to a further hole (D5402). "" when the argument is
+// not a generic or the checker bound no concrete signature.
 function monoHoleGenFnPin(callIx: i32, pIx: i32, argIx: i32, ctx: i32): string {
   const bt = monoHoleGenFnTy(callIx, pIx, argIx)
   if bt < 0 { return "" }
   const nm = monoConcreteFnTyName(bt)
   if nm == "" { return "" }
   if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
+  const sk = sigKeyOfTy(bt)
+  if sk != "" { return "=>" + sk }
   const an = monoArgFnTypeName(argIx, ctx)
   if an != "" { return an }
   nm
 }
 
 // The concrete function type the checker bound hole parameter `pIx` to at call `callIx`, when
-// `argIx` is a generic function, named or through never-written aliases (D5361); -1 otherwise.
+// `argIx` is a generic function: named, through never-written aliases, or a value typed at a
+// foreign generic's open signature, as a call returning one is (D5401); -1 otherwise.
 function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
   const ax = unwrapParen(argIx)
-  if ax < 0 || (!monoCalleeIsGeneric(ax) && monoReadGenFnFe(ax) < 0) {
+  if ax < 0 { return -1 }
+  if (
+    !monoCalleeIsGeneric(ax)
+    && monoReadGenFnFe(ax) < 0
+    && !tyIsForeignGenericSig(nodeTyIxOf(ax))
+  ) {
     return -1
   }
   const pt = nodeTyIxOf(pIx)
@@ -15717,12 +15727,21 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
 function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   if v < 0 { return 0 }
   const x = unwrapParen(v)
-  if x < 0 || !monoNamesDeclaredGeneric(x, ctx) { return 0 }
+  if x < 0 { return 0 }
+  if !monoNamesDeclaredGeneric(x, ctx) && monoReadGenFnFe(x) < 0 { return 0 }
   const noPath: string[] = []
-  const nm = monoSlotPinName(x, noPath, ctx)
+  // An alias of one is pinned at its own binding, which the flow table keys the read by (D5400).
+  let d = x
+  let fr = ctx
+  const lf = monoReadLetFrame(x, ctx)
+  if lf[1] >= 0 {
+    d = lf[1]
+    fr = lf[0]
+  }
+  const nm = monoSlotPinName(d, noPath, fr)
   if nm == "" { return 0 }
   if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
-  monoRetypePinCalls(x, noPath)
+  monoRetypePinCalls(d, noPath)
 }
 
 // Whether every write of the binding `d` the checker gave a closed function type takes the
