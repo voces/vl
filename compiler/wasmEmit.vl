@@ -956,11 +956,7 @@ import {
   nulFieldInnerCode,
   retLitUnionInline,
 } from "./emit_eq_rows"
-import {
-  cbRetVariantIdx,
-  isVariantSpellingOfShape,
-  nameIsWholeSpanShape,
-} from "./emit_field_codes"
+import { cbRetVariantIdx, nameIsWholeSpanShape } from "./emit_field_codes"
 import {
   cloRetIsString,
   cloSigPosOfKey,
@@ -1128,7 +1124,10 @@ import {
   boxNarrowAtomFor,
   boxWidenAtomFor,
   exprReReadable,
+  isVariantSpellingAtRecv,
   sharedFieldArmAtomKind,
+  sharedFieldArmConverts,
+  sharedFieldArmLitTexts,
   unionArmVariantWithHeap,
 } from "./emit_obj_lit_fits"
 import {
@@ -2693,7 +2692,11 @@ function monoStaticIsResult(isIx: i32, fnIx: i32) {
     if variantIndexOf(nd.isVariant) >= 0 { return -1 }
 
     if nodeTyIsUnion(nd.isObj) {
-      const rsp = isVariantSpellingOfShape(nd.isVariant, isVarTyIxOf(isIx))
+      const rsp = isVariantSpellingAtRecv(
+        nd.isVariant,
+        isVarTyIxOf(isIx),
+        nd.isObj,
+      )
       if variantIndexOf(rsp) >= 0 { return -1 }
     }
     if exprUnion(nd.isObj, fnIx) { return -1 }
@@ -5438,7 +5441,7 @@ function emitIsTestNumLit(body: u8[], isIx: i32, nd0: IsExpr, fnIx: i32) {
 // Returns 0 once the test is on the stack, -1 on failure.
 function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
   const vi = variantIndexOf(
-    isVariantSpellingOfShape(nd.isVariant, isVarTyIxOf(isIx)),
+    isVariantSpellingAtRecv(nd.isVariant, isVarTyIxOf(isIx), nd.isObj),
   )
   if vi < 0 {
     // A union alias arm has no single variant row because it is a SUBSET of the outer
@@ -7228,7 +7231,9 @@ function emitUnionCoerceValueAtom(
       fbIfRefNul(sTypeIdx, true)
       fbRefNull(sTypeIdx)
       fbElse()
-      if emitAtomToStrChain(body, nlTexts, 0) < 0 { return -1 }
+      if emitAtomToStrChain(body, nlTexts, 0, strScratchBase + 3) < 0 {
+        return -1
+      }
       fbEnd()
       fbStructNew(uBoxIdx)
       return 0
@@ -9643,11 +9648,39 @@ function emitSharedFieldArm(
   vi: i32,
   fi: i32,
   recvIx: i32,
+  readIx: i32,
   fnIx: i32,
   slot: i32,
 ) {
   if vi < 0 || vi >= uVarHeap.length {
     return emitFail("emitProgram: a shared field read names no member row")
+  }
+  const converts = sharedFieldArmConverts(code, vi, fi)
+  let texts = sharedFieldArmLitTexts(vi, fi)
+  if converts && code == FC_I32 {
+    // A lone literal stored as its string reads as its one member's atom.
+    if texts.length == 1 {
+      fbI32Const(internAtom(quoteLex(texts[0])))
+      return 0
+    }
+    // A member stored at the string whose row spells no literals narrows through the read's
+    // own members.
+    if texts.length == 0 { texts = tyLitMemberTexts(nodeTyIxOf(readIx)) }
+    if texts.length == 0 || !aUsed {
+      return emitFail(
+        "emitProgram: literal-union atom narrowing with no members",
+      )
+    }
+    if emitSharedFieldRecv(body, recvIx, fnIx, slot) < 0 { return -1 }
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(uVarHeap[vi])
+    fbStructGet(uVarHeap[vi], fi)
+    const strSlot = objOrderStashSlot(FC_STR, uFieldStorageSlot(vi, fi))
+    fbLocalSet(strSlot)
+    const savedLU = expCtxSwapLitUnion(0)
+    const r = emitStagedStrToAtomChain(body, texts, 0, strSlot, fnIx)
+    expCtxSwapLitUnion(savedLU)
+    return r
   }
   const boxes = sharedFieldReadBoxes(code, vi, fi)
   const bk = sharedFieldArmAtomKind(vi, fi)
@@ -9656,6 +9689,17 @@ function emitSharedFieldArm(
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   fbRefCast(uVarHeap[vi])
   fbStructGet(uVarHeap[vi], fi)
+  if converts {
+    // An atom set read at the string widens through its own members' tower.
+    if texts.length == 0 || !aUsed {
+      return emitFail(
+        "emitProgram: literal-union string widening with no members",
+      )
+    }
+    const idSlot = objOrderStashSlot(FC_I32, uFieldStorageSlot(vi, fi))
+    fbLocalSet(idSlot)
+    return emitAtomToStrChain(body, texts, 0, idSlot)
+  }
   if boxes {
     if atomKindNeedsValueBox(bk) { fbStructNew(vbHeapIdxOfKind(bk)) }
     fbStructNew(uBoxIdx)
@@ -9672,7 +9716,14 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
   if m is Member {
     const vis: i32[] = []
     const fis: i32[] = []
-    const code = sharedUnionFieldPlan(m.memObj, m.memProp, fnIx, vis, fis)
+    const code = sharedUnionFieldPlan(
+      m.memObj,
+      m.memProp,
+      memIx,
+      fnIx,
+      vis,
+      fis,
+    )
     if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
     if sharedFieldAnyArmBoxes(code, vis, fis) {
       return emitSharedFieldAssignPerArm(body, m.memObj, valIx, fnIx, vis, fis)
@@ -10111,6 +10162,7 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
     const shCode = sharedUnionFieldPlan(
       mS.memObj,
       mS.memProp,
+      memIx,
       fnIx,
       shVis,
       shFis,
@@ -10145,6 +10197,7 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
           shVis[si2],
           shFis[si2],
           mS.memObj,
+          memIx,
           fnIx,
           shSlot,
         )
@@ -10159,6 +10212,7 @@ function emitMem(body: u8[], memIx: i32, fnIx: i32) {
         shVis[shLast],
         shFis[shLast],
         mS.memObj,
+        memIx,
         fnIx,
         shSlot,
       )
@@ -31842,7 +31896,7 @@ function emitPrintAtomStr(body: u8[], argIx: i32, texts: string[], fnIx: i32) {
 // then the streaming print of the string it yields. Split out so the `K | null` niche below
 // reaches it from INSIDE its sentinel guard without re-evaluating the receiver.
 function emitPrintAtomFromStash(body: u8[], texts: string[]) {
-  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  if emitAtomToStrChain(body, texts, 0, strScratchBase + 3) < 0 { return -1 }
   fbLocalSet(strScratchBase + 0)
   emitPrintStrFromScratch(body)
 }
@@ -32043,7 +32097,7 @@ export function emitAtomToStr(body: u8[], atomIx: i32, fnIx: i32) {
     )
   }
   if emitStashAtomId(body, atomIx, fnIx) < 0 { return -1 }
-  const r = emitAtomToStrChain(body, texts, 0)
+  const r = emitAtomToStrChain(body, texts, 0, strScratchBase + 3)
   r
 }
 
@@ -32075,7 +32129,7 @@ function emitNulAtomToStr(body: u8[], atomIx: i32, texts: string[], fnIx: i32) {
   fbIfRefNul(sTypeIdx, true)
   fbRefNull(sTypeIdx)
   fbElse()
-  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  if emitAtomToStrChain(body, texts, 0, strScratchBase + 3) < 0 { return -1 }
   fbEnd()
   0
 }
@@ -32098,8 +32152,8 @@ function retKindIsStr(fnPos: i32): boolean {
 }
 
 // The `select` tower for `emitAtomToStr`: member `i`'s string if its interned id matches
-// the stashed atom, else the chain for `i+1`. The last member is the unconditional default arm.
-function emitAtomToStrChain(body: u8[], texts: string[], i: i32) {
+// the atom stashed in local `idSlot`, else the chain for `i+1`. The last member is the default arm.
+function emitAtomToStrChain(body: u8[], texts: string[], i: i32, idSlot: i32) {
   if i >= texts.length - 1 {
     const rd = emitStr(body, mkStr(quoteLex(texts[i]), -1), -1)
     return rd
@@ -32107,9 +32161,9 @@ function emitAtomToStrChain(body: u8[], texts: string[], i: i32) {
   // val1 = this member's string constant
   if emitStr(body, mkStr(quoteLex(texts[i]), -1), -1) < 0 { return -1 }
   // val2 = the remaining chain
-  if emitAtomToStrChain(body, texts, i + 1) < 0 { return -1 }
+  if emitAtomToStrChain(body, texts, i + 1, idSlot) < 0 { return -1 }
   // cond = (stashed id == this member's id)
-  pushStrScrI(body, 0)
+  fbLocalGet(idSlot)
   fbI32Const(internAtom(quoteLex(texts[i])))
   fbI32Bin(70) // i32.eq
   // select_t typed for a non-null string ref (0x64 $sTypeIdx): val1 if cond else val2
@@ -32187,7 +32241,7 @@ function emitStrToAtom(body: u8[], ix: i32, fnIx: i32) {
     let rv = emitExpr(body, ix, fnIx)
     if rv >= 0 {
       fbLocalSet(atomStageSlot)
-      rv = emitStagedStrToAtomChain(body, texts, 0, fnIx)
+      rv = emitStagedStrToAtomChain(body, texts, 0, atomStageSlot, fnIx)
     }
     expCtxSwapLitUnion(savedST)
     return rv
@@ -32283,15 +32337,16 @@ function emitDestStrToAtom(body: u8[], valIx: i32, fnIx: i32, luTy: i32) {
   expCtxSwapLitUnion(savedLU)
   if rv < 0 { return -1 }
   fbLocalSet(atomStageSlot)
-  emitStagedStrToAtomChain(body, texts, 0, fnIx)
+  emitStagedStrToAtomChain(body, texts, 0, atomStageSlot, fnIx)
 }
 
-// `emitStrToAtomChain` over the STAGED value: member `i`'s interned id if the slot
-// string-equals member `i`, else the chain for `i+1`, last member the unconditional default.
+// `emitStrToAtomChain` over the value staged in string slot `slot`: member `i`'s interned id if
+// the slot string-equals member `i`, else the chain for `i+1`, last member the default.
 function emitStagedStrToAtomChain(
   body: u8[],
   texts: string[],
   i: i32,
+  slot: i32,
   fnIx: i32,
 ) {
   if i >= texts.length - 1 {
@@ -32299,8 +32354,8 @@ function emitStagedStrToAtomChain(
     return 0
   }
   fbI32Const(internAtom(quoteLex(texts[i])))
-  if emitStagedStrToAtomChain(body, texts, i + 1, fnIx) < 0 { return -1 }
-  fbLocalGet(atomStageSlot)
+  if emitStagedStrToAtomChain(body, texts, i + 1, slot, fnIx) < 0 { return -1 }
+  fbLocalGet(slot)
   if emitStrEqLit(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
   fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
   0
@@ -35772,7 +35827,7 @@ function emitCoalesceNulAtomStr(body: u8[], e: BinExpr, fnIx: i32) {
   fbElse() // present → the id's member string
   fbLocalGet(slot)
   setStrScrI(body, 0)
-  if emitAtomToStrChain(body, texts, 0) < 0 { return -1 }
+  if emitAtomToStrChain(body, texts, 0, strScratchBase + 3) < 0 { return -1 }
   fbEnd()
   0
 }

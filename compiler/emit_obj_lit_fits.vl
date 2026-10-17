@@ -39,8 +39,12 @@ import {
   TyUnion,
   TyVar,
   tyBearsNull,
+  tyEq,
+  tyEqSoftLits,
   tyFieldTyOf,
+  tyIsLitUnion,
   tyIsRecord,
+  tyLitMemberTexts,
   tySame,
   tyToEmitName,
 } from "./check_types"
@@ -61,8 +65,10 @@ import {
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
+import { isVariantSpellingOfShape } from "./emit_field_codes"
 import { fnIndexOfInScopeAt } from "./emit_local_scope"
 import { annBareRefArrSlot, tyRefArrElemOf } from "./emit_map_value_slots"
+import { variantIndexOf } from "./emit_narrow_slots"
 import { annIsU8Array, retNulRefArrFlag } from "./emit_nullable_rets"
 import {
   paramArray,
@@ -74,7 +80,7 @@ import {
   paramStringArray,
   paramTypeNode,
 } from "./emit_query"
-import { nullValKind } from "./emit_rep"
+import { nullValKind, unRowOfKey } from "./emit_rep"
 import {
   emptyArrLitIxOf,
   mvValKindOfName,
@@ -84,10 +90,13 @@ import {
   structIndexOfTypeName,
 } from "./emit_shape_rows"
 import {
+  FC_I32,
+  FC_STR,
   FC_STRUCT,
   FC_UNION,
   MVK_MONO,
   VKind,
+  emitCurFnIx,
   fnStmts,
   localIsRef,
   localStructIdx,
@@ -693,6 +702,184 @@ export function sharedFieldArmsBoxable(vis: i32[], fis: i32[]): boolean {
     i = i + 1
   }
   vis.length > 1 && atoms > 0
+}
+
+// The read rep of a shared field some members store as an atom set and the rest as strings, or
+// -1. The read's type decides: `FC_I32` when it is a string literal union, else `FC_STR`;
+// with no read (`readIx` -1), the members' own storage. The read converts each member stored
+// at the other rep (`sharedFieldArmConverts`, D5105).
+export function sharedFieldLitSetPlan(
+  vis: i32[],
+  fis: i32[],
+  readIx: i32,
+): i32 {
+  let atoms = 0
+  let lone = 0
+  let sets = 0
+  let plain = 0
+  let i = 0
+  while i < vis.length && i < fis.length {
+    const k = sharedFieldLitArmKind(vis[i], fis[i])
+    if k < 0 { return -1 }
+    if k == 0 { atoms = atoms + 1 }
+    if k == 1 { lone = lone + 1 }
+    if k == 2 { sets = sets + 1 }
+    if k == 3 { plain = plain + 1 }
+    i = i + 1
+  }
+  if atoms == 0 { return -1 }
+  if readIx >= 0 {
+    if tyIsLitUnion(nodeTyIxOf(readIx)) { return FC_I32 }
+    return FC_STR
+  }
+  if plain > 0 { return FC_STR }
+  if sets > 0 || lone == 0 { return -1 }
+  FC_I32
+}
+
+// How member `vi` stores shared field `fi` for `sharedFieldLitSetPlan`: 0 a string literal set
+// at the atom, 1 one string literal at the string, 2 a wider string literal set at the string,
+// 3 a plain `string`, -1 anything else.
+function sharedFieldLitArmKind(vi: i32, fi: i32): i32 {
+  const code = variantFieldTypeAt(vi, fi)
+  const n = sharedFieldArmLitTexts(vi, fi).length
+  if code == FC_I32 {
+    if n > 0 && variantFieldIsLitUnion(vi, fi) { return 0 }
+    return -1
+  }
+  if code != FC_STR { return -1 }
+  if n == 1 { return 1 }
+  if n > 1 { return 2 }
+  if vi < 0 || vi >= uFieldStart.length { return -1 }
+  const at = uFieldStart[vi] + fi
+  if at < 0 || at >= uFieldTyText.length { return -1 }
+  if at < uFieldLitTyIx.length && uFieldLitTyIx[at] >= 0 { return -1 }
+  if uFieldTyText[at] == "string" { 3 } else { -1 }
+}
+
+// The string literal texts member `vi` declares shared field `fi` at, from its arena type and
+// else the field row's literal column; empty when the field is no string literal set.
+export function sharedFieldArmLitTexts(vi: i32, fi: i32): string[] {
+  if vi < 0 || vi >= uFieldStart.length { return [] }
+  const at = uFieldStart[vi] + fi
+  if at < 0 || at >= uFieldNames.length { return [] }
+  if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
+    const ft = tyFieldTyOf(uVarTyIx[vi], uFieldNames[at])
+    if ft >= 0 { return tyLitMemberTexts(ft) }
+  }
+  if at < uFieldLitTyIx.length { return tyLitMemberTexts(uFieldLitTyIx[at]) }
+  []
+}
+
+// `isVariantSpellingOfShape`, then the arm row of the receiver `recvIx`'s union that holds the
+// tested record: an inline arm's row spells a lone literal field at its base (D5143).
+export function isVariantSpellingAtRecv(
+  variant: string,
+  tyIx: i32,
+  recvIx: i32,
+): string {
+  const sp = isVariantSpellingOfShape(variant, tyIx)
+  if variantIndexOf(sp) >= 0 || recvIx < 0 { return sp }
+  const nm = armRowNameOfDeclaredMember(
+    nodeTyInOf(unwrapParen(recvIx), emitCurFnIx),
+    tyIx,
+  )
+  if nm != "" { nm } else { sp }
+}
+
+// The variant name of the row of the receiver's union holding record `ty`, or "" unless every
+// row of that union matching it shares one name and exactly one member matches the row.
+// `recvTy` is the receiver's type, through one `| null`; an inline arm's row spells a lone
+// literal field at its base (D5143).
+export function armRowNameOfDeclaredMember(recvTy: i32, ty: i32): string {
+  if ty < 0 { return "" }
+  const ut = unionTyOfRecv(recvTy)
+  if ut < 0 { return "" }
+  const u = unRowOfKey(ut)
+  if u < 0 || u >= unVarStart.length || u >= unVarCount.length { return "" }
+  let found = -1
+  let r = unVarStart[u]
+  while r < unVarStart[u] + unVarCount[u] {
+    if armRowIsMember(r, ty) {
+      if found >= 0 && uVariants[r] != uVariants[found] { return "" }
+      if found < 0 { found = r }
+    }
+    r = r + 1
+  }
+  if found < 0 { return "" }
+  const rt = T.tys[ut]
+  if !(rt is TyUnion) { return "" }
+  let isMember = false
+  let pairs = 0
+  for m in rt.uMembers {
+    if tyEq(m, ty) { isMember = true }
+    if armRowIsMember(found, m) { pairs = pairs + 1 }
+  }
+  if isMember && pairs == 1 { uVariants[found] } else { "" }
+}
+
+// The union type `t` is, through one `| null`, or -1.
+function unionTyOfRecv(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  let u = t
+  const rt = T.tys[t]
+  if rt is TyNullable { u = rt.nInner }
+  if u < 0 || u >= T.tys.length { return -1 }
+  if T.tys[u] is TyUnion { u } else { -1 }
+}
+
+// Whether row `vi` is record `ty` as a row stores it: equal with a lone literal at its base,
+// and every literal set the row records at a field is `ty`'s set there.
+function armRowIsMember(vi: i32, ty: i32): boolean {
+  if (
+    vi < 0
+    || vi >= uVarTyIx.length
+    || vi >= uFieldCount.length
+    || vi >= uFieldStart.length
+  ) {
+    return false
+  }
+  if uVarTyIx[vi] < 0 || ty < 0 || ty >= T.tys.length { return false }
+  if !(T.tys[ty] is TyObj) { return false }
+  if !tyEqSoftLits(uVarTyIx[vi], ty) { return false }
+  let fi = 0
+  while fi < uFieldCount[vi] {
+    const at = uFieldStart[vi] + fi
+    let own = sharedFieldArmLitTexts(vi, fi)
+    if own.length == 0 && at < uFieldLitTyIx.length {
+      own = tyLitMemberTexts(uFieldLitTyIx[at])
+    }
+    if own.length > 0 {
+      const want = tyLitMemberTexts(tyFieldTyOf(ty, uFieldNames[at]))
+      if !textSetsEqual(own, want) { return false }
+    }
+    fi = fi + 1
+  }
+  true
+}
+
+// Whether `a` and `b` hold the same texts, as sets.
+function textSetsEqual(a: string[], b: string[]): boolean {
+  textsWithin(a, b) && textsWithin(b, a)
+}
+
+// Whether every text of `a` is in `b`.
+function textsWithin(a: string[], b: string[]): boolean {
+  for x in a {
+    let hit = false
+    for y in b {
+      if x == y { hit = true }
+    }
+    if !hit { return false }
+  }
+  true
+}
+
+// Whether a shared read at plan `code` converts member `vi`'s field `fi` between the atom and
+// the string: the members' plan is `sharedFieldLitSetPlan`'s and this member stores the other.
+export function sharedFieldArmConverts(code: i32, vi: i32, fi: i32): boolean {
+  const own = variantFieldTypeAt(vi, fi)
+  (code == FC_I32 && own == FC_STR) || (code == FC_STR && own == FC_I32)
 }
 
 // Whether some member of a shared read stores its field as a scalar the read boxes.
