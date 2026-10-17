@@ -265,7 +265,6 @@ import {
   tyNameOf,
   unionEqOperandOk,
   unionHasAtom,
-  unionHasValueAtom,
   unionTakesAtomAsStr,
   unwrapParen,
 } from "./emit_base"
@@ -1281,6 +1280,7 @@ import {
   unionArmsOf,
   unionHasAtomAB,
   unionHasAtomTy,
+  unionHasValueAtom,
   unionMemberAtomsOf,
   unionMemberSetOf,
   unionRowOf,
@@ -20162,6 +20162,230 @@ function emitAsNulNiche(body: u8[], e: AsExpr, fnIx: i32) {
   )
 }
 
+// `m[k] as! V` over a scalar-boxed map read `amRef`: the fused probe, trapping on a missing
+// key and reading the stored value otherwise. Returns 0 or -1.
+function emitAsMapProbeTrap(body: u8[], amRef: Index, fnIx: i32) {
+  if emitMapPrep(body, amRef.idxArr, amRef.idxIndex, fnIx) < 0 { return -1 }
+  pushMapScr(body, 5) // entry
+  fbI32Eqz()
+  fbIf(64) // void
+  fbUnreachable()
+  fbEnd()
+  if cmSlot >= 0 {
+    pushMapVals(body)
+    fbStructGet(cmValsWrap(), 0)
+    pushMapScr(body, 5)
+    fbI32Const(1)
+    fbI32Bin(107) // i32.sub
+    fbArrayGet(cmValsBack())
+  } else {
+    pushMapVals(body)
+    fbStructGet(lTypeIdx, 0)
+    pushMapScr(body, 5)
+    fbI32Const(1)
+    fbI32Bin(107)
+    fbArrayGet(aTypeIdx)
+  }
+  return 0
+}
+
+// The `as?` arm of a union-operand cast, after the tag test is on the stack: the target
+// value on a hit and its `null` on a miss, at the rep the arm (`subUnion`, `armVi`, `ak`,
+// `mapHeap`) names for `T | null`. Returns 0, or -1 for an arm with no such rep.
+function emitAsUnionOpt(
+  subUnion: boolean,
+  armVi: i32,
+  ak: i32,
+  mapHeap: i32,
+  tgt: string,
+) {
+  // the boxed targets — a sub-union and a numeric value-atom arm — share one lowering:
+  // a box already tagged with the wanted arm is a value of the target type, so hand
+  // back the operand's own box, or a null box ref on the miss. Boolean is excluded —
+  // `boolean | null` is the sentinel niche (`i32.const 2`), not a box.
+  if (
+    subUnion
+    || armVi < 0 && (ak == 0 || ak == 3 || ak == 4 || ak == 5 || ak == 14)
+  ) {
+    fbIfRefNul(uBoxIdx, false) // if (result (ref $uBoxIdx))
+    fbLocalGet(unionAsSlot)
+    fbElse()
+    // the null-tagged box, what `T | null` means for a boxed union — a non-null box
+    // carrying `nullBoxTag()`, not a null box ref: the rep the null test and
+    // `emitUnionCoerce`'s `NullLit` both use, so a `!= null` on the result agrees.
+    fbI32Const(nullBoxTag())
+    fbRefNullNone() // the payload slot is unread under the null tag
+    fbStructNew(uBoxIdx)
+    fbEnd()
+    return 0
+  }
+  // a map or list target's `M | null` is the nullable ref: the payload on the hit, a null.
+  if mapHeap >= 0 {
+    fbIfRefNul(mapHeap, true)
+    fbLocalGet(unionAsSlot)
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(mapHeap)
+    fbElse()
+    fbRefNull(mapHeap)
+    fbEnd()
+    return 0
+  }
+  // a struct-variant target (`as? Circle`) is the `nulvariant` niche, a
+  // `(ref null $uVarHeap[vi])`: unbox and cast on the hit, a typed null on the miss.
+  if armVi >= 0 {
+    if armVi >= uVarHeap.length {
+      return emitFail(
+        "emitProgram: `as? "
+          + tgt
+          + "` names a variant with no interned shape",
+      )
+    }
+    fbIfRefNul(uVarHeap[armVi], true)
+    fbLocalGet(unionAsSlot)
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(uVarHeap[armVi])
+    fbElse()
+    fbRefNull(uVarHeap[armVi])
+    fbEnd()
+    return 0
+  }
+  // what is left is a value-atom arm: string is the nullable ref below; a numeric arm
+  // is refused — `i32 | null` is a value-niche sentinel, a different lowering entirely.
+  // boolean needs its own arm: `boolean | null` is the sentinel niche (i32 `2` for
+  // null), so the block's result is a scalar where every other target's is a ref.
+  if ak == 1 {
+    fbIf(127) // 0x04 if, 0x7f i32 result blocktype
+    fbLocalGet(unionAsSlot)
+    if emitUnionUnboxTail(ak) < 0 { return -1 }
+    fbElse()
+    fbI32Const(2) // the null sentinel
+    fbEnd()
+    return 0
+  }
+  if ak != 2 {
+    return emitFail(
+      "emitProgram: `as? "
+        + tgt
+        + "` is supported for a value-atom arm, a struct-variant arm and a sub-union; this arm is none of those — write the explicit `if x is "
+        + tgt
+        + " { … }` ladder for it",
+    )
+  }
+  fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
+  fbLocalGet(unionAsSlot)
+  fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+  fbRefCast(sTypeIdx)
+  fbElse()
+  fbRefNull(sTypeIdx)
+  fbEnd()
+  return 0
+}
+
+// The union-operand cast of `e` (node `_exprIx`): a niche operand's null test, else the tag
+// test of the box against the target's arms, then `as?`'s value-producing arm or the
+// propagating (`as`) or trapping (`as!`) miss and the unbox. Returns 0 or -1.
+function emitAsUnionCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
+  const obj = e.asObj
+  const tgt = e.asTy
+  // A niche-repped operand carries no tag, so none of the tag machinery below applies to
+  // it: the arm test is the null test, and the whole trio shares one lowering.
+  if !exprUnion(obj, fnIx) { return emitAsNulNiche(body, e, fnIx) }
+  // the target arm's type is the cast node's own recorded type, the checker's proof; for
+  // `as?` the node's type is `T | null`, so it is peeled to recover `T` — without the peel
+  // the tag and heap derive from the wrong type.
+  let tty = nodeTyIxOf(_exprIx)
+  if e.asMode == "null" { tty = tyPeelNul(tty) }
+  // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
+  // only widens the membership test (a tag chain), with no unbox at all.
+  if mapSoftTwinTagFail(obj, tty, fnIx, _exprIx) < 0 { return -1 }
+  const wantTags: i32[] = []
+  const wantVis: i32[] = []
+  if !unionArmTagsOfTy(tty, wantTags, wantVis) {
+    return emitFail(
+      "emitProgram: `as "
+        + tgt
+        + "` is supported for a value-union arm or a struct-variant arm; this arm is neither — write the explicit `if x is "
+        + tgt
+        + " { … }` ladder for it",
+    )
+  }
+  const subUnion = wantTags.length > 1
+  let armVi = -1
+  let ak = 0
+  // A map arm's payload is its map struct ref, recovered by the heap cast its shape names.
+  let mapHeap = -1
+  if !subUnion {
+    ak = unMemAtomKind(tty)
+    armVi = wantVis[0]
+    if armVi < 0 && ak < 0 && unMemIsMap(tty) {
+      mapHeap = mapTypeIdxOf(mapShapeFoldSet(mapArmShapeOfTy(tty)))
+    }
+    // A list arm's payload is its list wrapper ref, recovered like a map's by one heap cast.
+    if armVi < 0 && ak >= 0 { mapHeap = listWrapHeapOfKind(ak) }
+    if armVi < 0 && ak < 0 && mapHeap < 0 && unMemIsRefElemArray(tty) {
+      const rs = rlSlotOfTy(tyRefArrElemOf(tty))
+      if rs >= 0 && rs < rlWrapIdx.length { mapHeap = rlWrapIdx[rs] }
+    }
+  }
+  // `unionArmTagsOfTy` owns the empty-arm case, so what is left is a single arm the tag
+  // reached but neither the variant table nor the atom kinds can name.
+  if !subUnion && armVi < 0 && ak < 0 && mapHeap < 0 {
+    return emitFail(
+      "emitProgram: `as " + tgt + "` names no union arm this cast can test",
+    )
+  }
+  if emitExpr(body, obj, fnIx) < 0 { return -1 }
+  fbLocalSet(unionAsSlot)
+  // `tag == w0 || tag == w1 || …` — one compare for a single arm, a chain for a sub-union.
+  // The tag is re-read per arm rather than stashed in a second i32 slot: it is a
+  // `struct.get` off a local, two instructions, and costs no frame.
+  let wi = 0
+  while wi < wantTags.length {
+    fbLocalGet(unionAsSlot)
+    fbStructGet(uBoxIdx, 0) // field 0: the tag
+    fbI32Const(wantTags[wi])
+    fbI32Bin(70)            // 0x46 i32.eq
+    if wi > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    wi = wi + 1
+  }
+  // `as?` yields a value on both paths (a value-producing `if`, not the early exit `as`/
+  // `as!` take): `T` when the tag matches, `null` when it does not. Supported only where
+  // `T | null` already has a rep — `Circle | null` over a union arm has none yet
+  // (`emitProgram: ref valtype with no interned shape`), refused here by naming the gap.
+  if e.asMode == "null" {
+    return emitAsUnionOpt(subUnion, armVi, ak, mapHeap, tgt)
+  }
+  fbI32Eqz() // 0x45
+  fbIf(64)   // if, void
+  // the sad path, and the only place `as` and `as!` differ: `as` hands the whole box to
+  // the caller, `as!` traps and needs no value at all.
+  if e.asMode == "trap" {
+    fbUnreachable()
+  } else {
+    fbLocalGet(unionAsSlot)
+    fbReturn()
+  }
+  fbEnd()
+  fbLocalGet(unionAsSlot)
+  // a sub-union result is the box itself, at a narrower type — nothing to unbox.
+  if subUnion { return 0 }
+  // a struct arm's payload is the variant struct — recover it with the variant heap
+  // cast, exactly as the shared-field dispatch does; a value atom takes the shared tail.
+  if armVi >= 0 {
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(uVarHeap[armVi])
+    return 0
+  }
+  if mapHeap >= 0 {
+    fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
+    fbRefCast(mapHeap)
+    return 0
+  }
+  return emitUnionUnboxTail(ak)
+}
+
 function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
@@ -20190,32 +20414,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     const amk = mapReadScalarBoxKindTy(obj)
     if amk >= 0 {
       const amRef = P.nodes[unwrapParen(obj)]
-      if amRef is Index {
-        if emitMapPrep(body, amRef.idxArr, amRef.idxIndex, fnIx) < 0 {
-          return -1
-        }
-        pushMapScr(body, 5) // entry
-        fbI32Eqz()
-        fbIf(64) // void
-        fbUnreachable()
-        fbEnd()
-        if cmSlot >= 0 {
-          pushMapVals(body)
-          fbStructGet(cmValsWrap(), 0)
-          pushMapScr(body, 5)
-          fbI32Const(1)
-          fbI32Bin(107) // i32.sub
-          fbArrayGet(cmValsBack())
-        } else {
-          pushMapVals(body)
-          fbStructGet(lTypeIdx, 0)
-          pushMapScr(body, 5)
-          fbI32Const(1)
-          fbI32Bin(107)
-          fbArrayGet(aTypeIdx)
-        }
-        return 0
-      }
+      if amRef is Index { return emitAsMapProbeTrap(body, amRef, fnIx) }
     }
   }
   // A type-parameter operand fails as the direct spelling does at this instance's pin (D2791).
@@ -20233,184 +20432,7 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     return emitNumExactCast(body, e, _exprIx, fnIx)
   }
   if asExprIsUnionCastIn(_exprIx, fnIx) {
-    // A niche-repped operand carries no tag, so none of the tag machinery below applies to
-    // it: the arm test is the null test, and the whole trio shares one lowering.
-    if !exprUnion(obj, fnIx) { return emitAsNulNiche(body, e, fnIx) }
-    // the target arm's type is the cast node's own recorded type, the checker's proof; for
-    // `as?` the node's type is `T | null`, so it is peeled to recover `T` — without the peel
-    // the tag and heap derive from the wrong type.
-    let tty = nodeTyIxOf(_exprIx)
-    if e.asMode == "null" { tty = tyPeelNul(tty) }
-    // the target's arms, flattened rather than tested as `TyUnion`: a sub-union target
-    // only widens the membership test (a tag chain), with no unbox at all.
-    if mapSoftTwinTagFail(obj, tty, fnIx, _exprIx) < 0 { return -1 }
-    const wantTags: i32[] = []
-    const wantVis: i32[] = []
-    if !unionArmTagsOfTy(tty, wantTags, wantVis) {
-      return emitFail(
-        "emitProgram: `as "
-          + tgt
-          + "` is supported for a value-union arm or a struct-variant arm; this arm is neither — write the explicit `if x is "
-          + tgt
-          + " { … }` ladder for it",
-      )
-    }
-    const subUnion = wantTags.length > 1
-    let armVi = -1
-    let ak = 0
-    // A map arm's payload is its map struct ref, recovered by the heap cast its shape names.
-    let mapHeap = -1
-    if !subUnion {
-      ak = unMemAtomKind(tty)
-      armVi = wantVis[0]
-      if armVi < 0 && ak < 0 && unMemIsMap(tty) {
-        mapHeap = mapTypeIdxOf(mapShapeFoldSet(mapArmShapeOfTy(tty)))
-      }
-      // A list arm's payload is its list wrapper ref, recovered like a map's by one heap cast.
-      if armVi < 0 && ak >= 0 { mapHeap = listWrapHeapOfKind(ak) }
-      if armVi < 0 && ak < 0 && mapHeap < 0 && unMemIsRefElemArray(tty) {
-        const rs = rlSlotOfTy(tyRefArrElemOf(tty))
-        if rs >= 0 && rs < rlWrapIdx.length { mapHeap = rlWrapIdx[rs] }
-      }
-    }
-    // `unionArmTagsOfTy` owns the empty-arm case, so what is left is a single arm the tag
-    // reached but neither the variant table nor the atom kinds can name.
-    if !subUnion && armVi < 0 && ak < 0 && mapHeap < 0 {
-      return emitFail(
-        "emitProgram: `as "
-          + tgt
-          + "` names no union arm this cast can test",
-      )
-    }
-    if emitExpr(body, obj, fnIx) < 0 { return -1 }
-    fbLocalSet(unionAsSlot)
-    // `tag == w0 || tag == w1 || …` — one compare for a single arm, a chain for a sub-union.
-    // The tag is re-read per arm rather than stashed in a second i32 slot: it is a
-    // `struct.get` off a local, two instructions, and costs no frame.
-    let wi = 0
-    while wi < wantTags.length {
-      fbLocalGet(unionAsSlot)
-      fbStructGet(uBoxIdx, 0) // field 0: the tag
-      fbI32Const(wantTags[wi])
-      fbI32Bin(70)            // 0x46 i32.eq
-      if wi > 0 {
-        fbI32Bin(114) // 0x72 i32.or
-      }
-      wi = wi + 1
-    }
-    // `as?` yields a value on both paths (a value-producing `if`, not the early exit `as`/
-    // `as!` take): `T` when the tag matches, `null` when it does not. Supported only where
-    // `T | null` already has a rep — `Circle | null` over a union arm has none yet
-    // (`emitProgram: ref valtype with no interned shape`), refused here by naming the gap.
-    if e.asMode == "null" {
-      // the boxed targets — a sub-union and a numeric value-atom arm — share one lowering:
-      // a box already tagged with the wanted arm is a value of the target type, so hand
-      // back the operand's own box, or a null box ref on the miss. Boolean is excluded —
-      // `boolean | null` is the sentinel niche (`i32.const 2`), not a box.
-      if (
-        subUnion
-        || armVi < 0 && (ak == 0 || ak == 3 || ak == 4 || ak == 5 || ak == 14)
-      ) {
-        fbIfRefNul(uBoxIdx, false) // if (result (ref $uBoxIdx))
-        fbLocalGet(unionAsSlot)
-        fbElse()
-        // the null-tagged box, what `T | null` means for a boxed union — a non-null box
-        // carrying `nullBoxTag()`, not a null box ref: the rep the null test and
-        // `emitUnionCoerce`'s `NullLit` both use, so a `!= null` on the result agrees.
-        fbI32Const(nullBoxTag())
-        fbRefNullNone() // the payload slot is unread under the null tag
-        fbStructNew(uBoxIdx)
-        fbEnd()
-        return 0
-      }
-      // a map or list target's `M | null` is the nullable ref: the payload on the hit, a null.
-      if mapHeap >= 0 {
-        fbIfRefNul(mapHeap, true)
-        fbLocalGet(unionAsSlot)
-        fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-        fbRefCast(mapHeap)
-        fbElse()
-        fbRefNull(mapHeap)
-        fbEnd()
-        return 0
-      }
-      // a struct-variant target (`as? Circle`) is the `nulvariant` niche, a
-      // `(ref null $uVarHeap[vi])`: unbox and cast on the hit, a typed null on the miss.
-      if armVi >= 0 {
-        if armVi >= uVarHeap.length {
-          return emitFail(
-            "emitProgram: `as? "
-              + tgt
-              + "` names a variant with no interned shape",
-          )
-        }
-        fbIfRefNul(uVarHeap[armVi], true)
-        fbLocalGet(unionAsSlot)
-        fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-        fbRefCast(uVarHeap[armVi])
-        fbElse()
-        fbRefNull(uVarHeap[armVi])
-        fbEnd()
-        return 0
-      }
-      // what is left is a value-atom arm: string is the nullable ref below; a numeric arm
-      // is refused — `i32 | null` is a value-niche sentinel, a different lowering entirely.
-      // boolean needs its own arm: `boolean | null` is the sentinel niche (i32 `2` for
-      // null), so the block's result is a scalar where every other target's is a ref.
-      if ak == 1 {
-        fbIf(127) // 0x04 if, 0x7f i32 result blocktype
-        fbLocalGet(unionAsSlot)
-        if emitUnionUnboxTail(ak) < 0 { return -1 }
-        fbElse()
-        fbI32Const(2) // the null sentinel
-        fbEnd()
-        return 0
-      }
-      if ak != 2 {
-        return emitFail(
-          "emitProgram: `as? "
-            + tgt
-            + "` is supported for a value-atom arm, a struct-variant arm and a sub-union; this arm is none of those — write the explicit `if x is "
-            + tgt
-            + " { … }` ladder for it",
-        )
-      }
-      fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
-      fbLocalGet(unionAsSlot)
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(sTypeIdx)
-      fbElse()
-      fbRefNull(sTypeIdx)
-      fbEnd()
-      return 0
-    }
-    fbI32Eqz() // 0x45
-    fbIf(64)   // if, void
-    // the sad path, and the only place `as` and `as!` differ: `as` hands the whole box to
-    // the caller, `as!` traps and needs no value at all.
-    if e.asMode == "trap" {
-      fbUnreachable()
-    } else {
-      fbLocalGet(unionAsSlot)
-      fbReturn()
-    }
-    fbEnd()
-    fbLocalGet(unionAsSlot)
-    // a sub-union result is the box itself, at a narrower type — nothing to unbox.
-    if subUnion { return 0 }
-    // a struct arm's payload is the variant struct — recover it with the variant heap
-    // cast, exactly as the shared-field dispatch does; a value atom takes the shared tail.
-    if armVi >= 0 {
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(uVarHeap[armVi])
-      return 0
-    }
-    if mapHeap >= 0 {
-      fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
-      fbRefCast(mapHeap)
-      return 0
-    }
-    return emitUnionUnboxTail(ak)
+    return emitAsUnionCast(body, e, _exprIx, fnIx)
   }
   emitNumPlainCast(body, obj, tgt, fnIx)
 }
@@ -22600,6 +22622,252 @@ function emitCallCoreUfcsNode(callIx: i32, c: Call, um: Member) {
   -1
 }
 
+// `emitCallCore`'s user-function tail for callee `callee`: the scope-resolved function's
+// direct, captured or low-memory call, a closure binding's `call_ref`, or a numeric
+// intrinsic when the name resolves to no function. Returns 0 or -1.
+function emitCallCoreUserFn(
+  body: u8[],
+  callIx: i32,
+  c: Call,
+  callee: Ident,
+  fnIx: i32,
+) {
+  // Scope-aware: `buildFnMap` keys lifted functions by name, first wins, so the flat map
+  // would give every frame's `inner(…)` the module's first `inner`. The positioned lookup
+  // takes the block-local function whose scope covers this call, else a top-level one.
+  const target = fnIndexOfInScopeChainAt(
+    sidOfNode(c.callFn),
+    callee.identName,
+    fnIx,
+    c.callFn,
+  )
+  // A live closure binding of the name outranks that scan, which cannot see a param or a
+  // local (D1602); a local declared later does not yet shadow the function (D3607). Asked
+  // only on a hit, so a plain call pays nothing.
+  if (
+    target >= 0
+    && identNameIsLiveBound(callee.identName, fnIx)
+    && identIsBoundClosure(callee.identName, fnIx)
+  ) {
+    return emitCallRef(body, callIx, fnIx)
+  }
+  if target < 0 {
+    // Not a known function name — a closure-valued callee, dispatched through the closure
+    // fat-pointer — unless it is a numeric intrinsic's name that no binding covers here,
+    // which is the intrinsic even where a later local closure takes the name (D3607).
+    const intrHere = isNumIntrinsicName(callee.identName)
+      && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
+      && globalIndexOf(callee.identName) < 0
+    if !intrHere && exprIsClosure(c.callFn, fnIx) {
+      return emitCallRef(body, callIx, fnIx)
+    }
+    // The numeric-opcode intrinsics: one wasm instruction over the arguments. Reached
+    // only where the name resolved to no function, no closure value and no frame binding
+    // (a captured loop variable), which IS the shadowing rule the checker types against —
+    // a program that defines its own `min` calls its own (D2010).
+    if !identNameIsLiveBound(callee.identName, fnIx) {
+      const bcRc = emitBitcastIntr(body, callIx, fnIx, callee.identName)
+      if bcRc != NUM_INTR_NONE { return bcRc }
+      const fiRc = emitFloatIntr(body, callIx, fnIx, callee.identName)
+      if fiRc != NUM_INTR_NONE { return fiRc }
+      const iiRc = emitIntIntr(body, callIx, fnIx, callee.identName)
+      if iiRc != NUM_INTR_NONE { return iiRc }
+    }
+    return emitFail("emitProgram: call to unknown function")
+  }
+  // A lambda-lifted function takes its captures as parameters (SP-037).
+  if cloLifted(target) { return emitDirectCall(body, callIx, fnIx, target) }
+  // a direct call to a capturing lifted function (`add(10)` where `add` captures `n`
+  // from the enclosing frame): build its closure value and `call_ref` it — a plain
+  // `call` would pass a null env and lose the captures. Gated on `fnNestUsed` so a
+  // no-lambda module never enters this path.
+  if fnNestUsed && captureCountOf(target) > 0 {
+    return emitCapturedCall(body, callIx, fnIx, target)
+  }
+  if gLowMemUnused > 0 {
+    const lmaRc = emitLowMemAccessorCall(body, callIx, fnIx, target)
+    if lmaRc <= 0 { return lmaRc }
+  }
+  return emitDirectCall(body, callIx, fnIx, target)
+}
+
+// `emitCallCore`'s named-callee arm: the builtins and intrinsics matched by spelling where
+// no user declaration or binding owns the name, then `emitCallCoreUserFn`. Returns 0 or -1.
+function emitCallCoreIdent(
+  body: u8[],
+  callIx: i32,
+  c: Call,
+  callee: Ident,
+  fnIx: i32,
+) {
+  // a user function of the same name must win: checked before any spelling-based
+  // builtin match, since matching by spelling alone routes a same-named user
+  // declaration into the builtin instead — a whole-set bug, not one name's (D975,
+  // filed as a refutation pin: that collision surface must not come back).
+  const userOwnsName = fnIndexOfNode(c.callFn) >= 0
+  // the scope's answer for the dunder intrinsics, whose arms below match the
+  // spelling with no declaration lookup at all. See `identNameIsUserBound`.
+  const userBindsName = identNameIsUserBound(callee.identName, fnIx)
+  // `__str_from_bytes__(src, at, count)` (D4784): one call into the helper, which bounds-checks
+  // the range against `src`'s length and copies it into an exact-fit string.
+  if !userBindsName && callee.identName == "__str_from_bytes__" {
+    return emitCallCoreStrFromBytes(body, c, fnIx)
+  }
+  // `fromCodePoints(xs)` (H2): bulk string construction into the shared `__utf8_enc__`
+  // helper, UTF-8-encoding the list's live code points into an exact-fit backing. Each
+  // i32 is a code point, never a byte — filling the buffer by `buf.push(s[i])` instead
+  // pushes bytes and double-encodes with no type error, so every `std/` builder uses `for cp`.
+  if !userOwnsName && callee.identName == "fromCodePoints" {
+    return emitCallCoreFromCodePoints(body, callIx, c, fnIx)
+  }
+  // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
+  // string from an i32 code point, riding the same `__utf8_enc__` helper `fromCodePoints`
+  // does — a one-element i32 array wrapped around the argument. Sharing the encoder
+  // avoids a second, inlined width-and-shift ladder disagreeing silently with it.
+  if !userOwnsName && callee.identName == "fromCodePoint" {
+    return emitCallCoreFromCodePoint(body, c, fnIx)
+  }
+  // `print(x)` is a compiler builtin lowered to the host's import family: a
+  // boolean-classified arg calls `__print_bool__`, anything else i32-ish
+  // `__print_i32__`. The call yields nothing (void import).
+  if !userOwnsName && callee.identName == "print" {
+    return emitCallCorePrint(body, callIx, c, fnIx)
+  }
+  // The linear-memory intrinsics, lowered inline (the host defines `__store_i32__`/
+  // `__load_i32__` as one-instruction wasm functions): store/load become
+  // `i32.store`/`i32.load` directly; `__log__` calls the synthetic in-module decoder
+  // at `gMemLogIdx` (see `emitMemLogFnCode`).
+  if !userBindsName && callee.identName == "__store_i32__" {
+    const s32Off = emitMemAddr(body, c, 2, fnIx, "__store_i32__")
+    if s32Off < 0 { return -1 }
+    if emitMemIntrinArg(body, memCallArg(c, 2, 1), fnIx) < 0 { return -1 }
+    fbMemAccess(OP_I32_STORE, 2, s32Off)
+    return 0
+  }
+  if !userBindsName && callee.identName == "__load_i32__" {
+    const l32Off = emitMemAddr(body, c, 1, fnIx, "__load_i32__")
+    if l32Off < 0 { return -1 }
+    fbMemAccess(OP_I32_LOAD, 2, l32Off)
+    return 0
+  }
+  // The five other store widths (`buffer-design.md` §C2): push the address (context-
+  // cleared like every memory-intrinsic operand), then the value at its own declared
+  // width — not `emitMemIntrinArg`, since `__store_f64__(0, 1.5)` needs `f64.const
+  // 1.5` — then the opcode at its natural alignment. f32 also seeds `pendingF32`.
+  if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
+    return emitCallCoreMemStore(body, c, callee, fnIx)
+  }
+  // the bulk pair (`buffer-design.md` §C3): three i32 operands, all context-cleared
+  // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
+  // which VL's argument order matches — a mismatched order would mean reordering
+  // arbitrary expressions' side effects.
+  if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
+    return emitCallCoreMemBulk(body, c, callee, fnIx)
+  }
+  // The ten other load widths (`buffer-design.md` §C2): push the address, write the
+  // opcode at its natural alignment — the per-width difference is exactly two bytes,
+  // held in `memLoadOpcode`/`memLoadAlignExp`. `__load_i32__` keeps its own arm above.
+  if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
+    return emitCallCoreMemLoad(body, c, callee, fnIx)
+  }
+  // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
+  // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
+  // Dispatched by name like the memory intrinsics above it.
+  if !userBindsName && nameIsSimdIntrinsic(callee.identName) {
+    return emitSimdIntrinsic(body, c, callee.identName, fnIx)
+  }
+  // The threads-proposal atomics (`simd-design.md` §G1), the 0xFE-prefix family.
+  if !userBindsName && nameIsAtomicIntrinsic(callee.identName) {
+    return emitAtomicIntrinsic(body, c, callee.identName, fnIx)
+  }
+  // The scalar saturating truncations, one `0xFC` instruction each.
+  if !userBindsName && truncSatOp(callee.identName) >= 0 {
+    return emitTruncSatIntrinsic(body, c, callee.identName, fnIx)
+  }
+  // `memory.size` / `memory.grow` — the two ops that lift the 64 KiB ceiling
+  // (`buffer-design.md` §B2/§S4). Both take the memory index as an immediate (0x00,
+  // the one memory), never a stack operand. `memory.grow`'s -1-on-failure is the wasm
+  // spec's own signal, passed through unchanged: a caller checks it as the spec describes.
+  if !userBindsName && callee.identName == "__memory_size__" {
+    if c.callArgs.length != 0 {
+      return emitFail(
+        "emitProgram: internal: __memory_size__ reached with the wrong argument count — the checker's arity rule refuses it",
+      )
+    }
+    fbMemorySize()
+    return 0
+  }
+  if !userBindsName && callee.identName == "__memory_grow__" {
+    if c.callArgs.length != 1 {
+      return emitFail(
+        "emitProgram: internal: __memory_grow__ reached with the wrong argument count — the checker's arity rule refuses it",
+      )
+    }
+    if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
+    fbMemoryGrow()
+    return 0
+  }
+  // The heap window: a read of the immutable global pair `emitGlobalSection` appends.
+  if !userBindsName && callee.identName == "__heap_base__" {
+    return emitHeapWindowRead(c.callArgs.length, 0, "__heap_base__")
+  }
+  if !userBindsName && callee.identName == "__heap_limit__" {
+    return emitHeapWindowRead(c.callArgs.length, 1, "__heap_limit__")
+  }
+  // A build-time constant; as the whole condition of an else-less `if` it never
+  // reaches here, because `foldMemShared` already decided that statement.
+  if !userBindsName && callee.identName == "__memory_shared__" {
+    if c.callArgs.length != 0 {
+      return emitFail(
+        "emitProgram: internal: __memory_shared__ reached with the wrong argument count — the checker's arity rule refuses it",
+      )
+    }
+    if gSharedMemPages > 0 { fbI32Const(1) } else { fbI32Const(0) }
+    return 0
+  }
+  if !userBindsName && callee.identName == "__log__" {
+    return emitCallCoreLog(body, c, fnIx)
+  }
+  // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ───────
+  // The one intrinsic family that lowers to a host call rather than instructions. One
+  // arm for every slot, keyed by four small tables; the index is dynamic (reserved
+  // only when used), so a miss fails loudly.
+  const fsK = fsIntrinsicSlot(callee.identName)
+  if fsK >= 0 { return emitCallCoreHostFloor(body, c, callee, fsK, fnIx) }
+  // ── user externs (`extern function`) ───────────────────────────────────
+  // The second family that lowers to a host call. Guarded by `userBindsName` like every
+  // spelling-matched arm: a PARAMETER of the same name is a legal local and must win.
+  if !userBindsName {
+    const exK = externLinkOf(callee.identName)
+    if exK >= 0 { return emitCallCoreExtern(body, c, callee, exK, fnIx) }
+  }
+  // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
+  // lowered INLINE to single WasmGC instructions (array.new /
+  // array.new_default / array.copy / unreachable). `__trap__()` is the
+  // deliberate abort primitive.
+  if !userBindsName && callee.identName == "__trap__" {
+    return emitCallCoreTrap(body, c, fnIx)
+  }
+  // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
+  // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both yield the
+  // `{backing, len: n, cap: n}` list wrapper, staging the length in the 1-slot arrNew
+  // scratch local. Native element coverage: i32 (i32/boolean) and, for `__array_new__`, f64.
+  if (
+    !userBindsName
+    && (callee.identName == "__array_new__"
+      || callee.identName == "__array_new_default__")
+  ) {
+    return emitArrayNewIntr(body, callIx, fnIx)
+  }
+  // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the two
+  // lists' backings (memmove semantics; OOB spans trap via the instruction's own
+  // check). Operand order matches the instruction's stack shape, so no scratch is needed.
+  if !userBindsName && callee.identName == "__array_copy__" {
+    return emitArrayCopyIntr(body, callIx, fnIx)
+  }
+  return emitCallCoreUserFn(body, callIx, c, callee, fnIx)
+}
+
 // Node shapes read: Call { callFn: i32, callArgs: i32[] }, callee Ident { identName }.
 function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
@@ -22608,228 +22876,7 @@ function emitCallCore(body: u8[], callIx: i32, fnIx: i32) {
     if tplStr >= 0 { return emitStrValue(body, tplStr, fnIx) }
     const callee = P.nodes[c.callFn]
     if callee is Ident {
-      // a user function of the same name must win: checked before any spelling-based
-      // builtin match, since matching by spelling alone routes a same-named user
-      // declaration into the builtin instead — a whole-set bug, not one name's (D975,
-      // filed as a refutation pin: that collision surface must not come back).
-      const userOwnsName = fnIndexOfNode(c.callFn) >= 0
-      // the scope's answer for the dunder intrinsics, whose arms below match the
-      // spelling with no declaration lookup at all. See `identNameIsUserBound`.
-      const userBindsName = identNameIsUserBound(callee.identName, fnIx)
-      // `__str_from_bytes__(src, at, count)` (D4784): one call into the helper, which bounds-checks
-      // the range against `src`'s length and copies it into an exact-fit string.
-      if !userBindsName && callee.identName == "__str_from_bytes__" {
-        return emitCallCoreStrFromBytes(body, c, fnIx)
-      }
-      // `fromCodePoints(xs)` (H2): bulk string construction into the shared `__utf8_enc__`
-      // helper, UTF-8-encoding the list's live code points into an exact-fit backing. Each
-      // i32 is a code point, never a byte — filling the buffer by `buf.push(s[i])` instead
-      // pushes bytes and double-encodes with no type error, so every `std/` builder uses `for cp`.
-      if !userOwnsName && callee.identName == "fromCodePoints" {
-        return emitCallCoreFromCodePoints(body, callIx, c, fnIx)
-      }
-      // `fromCodePoint(code)` is a compiler builtin (H2): construct a single-character VL
-      // string from an i32 code point, riding the same `__utf8_enc__` helper `fromCodePoints`
-      // does — a one-element i32 array wrapped around the argument. Sharing the encoder
-      // avoids a second, inlined width-and-shift ladder disagreeing silently with it.
-      if !userOwnsName && callee.identName == "fromCodePoint" {
-        return emitCallCoreFromCodePoint(body, c, fnIx)
-      }
-      // `print(x)` is a compiler builtin lowered to the host's import family: a
-      // boolean-classified arg calls `__print_bool__`, anything else i32-ish
-      // `__print_i32__`. The call yields nothing (void import).
-      if !userOwnsName && callee.identName == "print" {
-        return emitCallCorePrint(body, callIx, c, fnIx)
-      }
-      // The linear-memory intrinsics, lowered inline (the host defines `__store_i32__`/
-      // `__load_i32__` as one-instruction wasm functions): store/load become
-      // `i32.store`/`i32.load` directly; `__log__` calls the synthetic in-module decoder
-      // at `gMemLogIdx` (see `emitMemLogFnCode`).
-      if !userBindsName && callee.identName == "__store_i32__" {
-        const s32Off = emitMemAddr(body, c, 2, fnIx, "__store_i32__")
-        if s32Off < 0 { return -1 }
-        if emitMemIntrinArg(body, memCallArg(c, 2, 1), fnIx) < 0 { return -1 }
-        fbMemAccess(OP_I32_STORE, 2, s32Off)
-        return 0
-      }
-      if !userBindsName && callee.identName == "__load_i32__" {
-        const l32Off = emitMemAddr(body, c, 1, fnIx, "__load_i32__")
-        if l32Off < 0 { return -1 }
-        fbMemAccess(OP_I32_LOAD, 2, l32Off)
-        return 0
-      }
-      // The five other store widths (`buffer-design.md` §C2): push the address (context-
-      // cleared like every memory-intrinsic operand), then the value at its own declared
-      // width — not `emitMemIntrinArg`, since `__store_f64__(0, 1.5)` needs `f64.const
-      // 1.5` — then the opcode at its natural alignment. f32 also seeds `pendingF32`.
-      if !userBindsName && nameIsMemStoreIntrinsic(callee.identName) {
-        return emitCallCoreMemStore(body, c, callee, fnIx)
-      }
-      // the bulk pair (`buffer-design.md` §C3): three i32 operands, all context-cleared
-      // (no width dispatch, unlike the store arm), pushed in the instruction's own order,
-      // which VL's argument order matches — a mismatched order would mean reordering
-      // arbitrary expressions' side effects.
-      if !userBindsName && nameIsMemBulkIntrinsic(callee.identName) {
-        return emitCallCoreMemBulk(body, c, callee, fnIx)
-      }
-      // The ten other load widths (`buffer-design.md` §C2): push the address, write the
-      // opcode at its natural alignment — the per-width difference is exactly two bytes,
-      // held in `memLoadOpcode`/`memLoadAlignExp`. `__load_i32__` keeps its own arm above.
-      if !userBindsName && nameIsMemLoadIntrinsic(callee.identName) {
-        return emitCallCoreMemLoad(body, c, callee, fnIx)
-      }
-      // The SIMD intrinsics (`simd-design.md` §D6), each lowered inline to a 0xFD-prefix
-      // instruction — the third prefixed family, beside the 0xfb GC and 0xfc misc ones.
-      // Dispatched by name like the memory intrinsics above it.
-      if !userBindsName && nameIsSimdIntrinsic(callee.identName) {
-        return emitSimdIntrinsic(body, c, callee.identName, fnIx)
-      }
-      // The threads-proposal atomics (`simd-design.md` §G1), the 0xFE-prefix family.
-      if !userBindsName && nameIsAtomicIntrinsic(callee.identName) {
-        return emitAtomicIntrinsic(body, c, callee.identName, fnIx)
-      }
-      // The scalar saturating truncations, one `0xFC` instruction each.
-      if !userBindsName && truncSatOp(callee.identName) >= 0 {
-        return emitTruncSatIntrinsic(body, c, callee.identName, fnIx)
-      }
-      // `memory.size` / `memory.grow` — the two ops that lift the 64 KiB ceiling
-      // (`buffer-design.md` §B2/§S4). Both take the memory index as an immediate (0x00,
-      // the one memory), never a stack operand. `memory.grow`'s -1-on-failure is the wasm
-      // spec's own signal, passed through unchanged: a caller checks it as the spec describes.
-      if !userBindsName && callee.identName == "__memory_size__" {
-        if c.callArgs.length != 0 {
-          return emitFail(
-            "emitProgram: internal: __memory_size__ reached with the wrong argument count — the checker's arity rule refuses it",
-          )
-        }
-        fbMemorySize()
-        return 0
-      }
-      if !userBindsName && callee.identName == "__memory_grow__" {
-        if c.callArgs.length != 1 {
-          return emitFail(
-            "emitProgram: internal: __memory_grow__ reached with the wrong argument count — the checker's arity rule refuses it",
-          )
-        }
-        if emitMemIntrinArg(body, c.callArgs[0], fnIx) < 0 { return -1 }
-        fbMemoryGrow()
-        return 0
-      }
-      // The heap window: a read of the immutable global pair `emitGlobalSection` appends.
-      if !userBindsName && callee.identName == "__heap_base__" {
-        return emitHeapWindowRead(c.callArgs.length, 0, "__heap_base__")
-      }
-      if !userBindsName && callee.identName == "__heap_limit__" {
-        return emitHeapWindowRead(c.callArgs.length, 1, "__heap_limit__")
-      }
-      // A build-time constant; as the whole condition of an else-less `if` it never
-      // reaches here, because `foldMemShared` already decided that statement.
-      if !userBindsName && callee.identName == "__memory_shared__" {
-        if c.callArgs.length != 0 {
-          return emitFail(
-            "emitProgram: internal: __memory_shared__ reached with the wrong argument count — the checker's arity rule refuses it",
-          )
-        }
-        if gSharedMemPages > 0 { fbI32Const(1) } else { fbI32Const(0) }
-        return 0
-      }
-      if !userBindsName && callee.identName == "__log__" {
-        return emitCallCoreLog(body, c, fnIx)
-      }
-      // ── the host floor (`std:fs`, `std:args`, `std:process`, `std:env`) ───────
-      // The one intrinsic family that lowers to a host call rather than instructions. One
-      // arm for every slot, keyed by four small tables; the index is dynamic (reserved
-      // only when used), so a miss fails loudly.
-      const fsK = fsIntrinsicSlot(callee.identName)
-      if fsK >= 0 { return emitCallCoreHostFloor(body, c, callee, fsK, fnIx) }
-      // ── user externs (`extern function`) ───────────────────────────────────
-      // The second family that lowers to a host call. Guarded by `userBindsName` like every
-      // spelling-matched arm: a PARAMETER of the same name is a legal local and must win.
-      if !userBindsName {
-        const exK = externLinkOf(callee.identName)
-        if exK >= 0 { return emitCallCoreExtern(body, c, callee, exK, fnIx) }
-      }
-      // The array-intrinsic floor (std-design D1 / collections-design §LS.2),
-      // lowered INLINE to single WasmGC instructions (array.new /
-      // array.new_default / array.copy / unreachable). `__trap__()` is the
-      // deliberate abort primitive.
-      if !userBindsName && callee.identName == "__trap__" {
-        return emitCallCoreTrap(body, c, fnIx)
-      }
-      // `__array_new__(n, fill)` → `array.new` (every slot set to `fill`);
-      // `__array_new_default__(n)` → `array.new_default` (slots zeroed). Both yield the
-      // `{backing, len: n, cap: n}` list wrapper, staging the length in the 1-slot arrNew
-      // scratch local. Native element coverage: i32 (i32/boolean) and, for `__array_new__`, f64.
-      if (
-        !userBindsName
-        && (callee.identName == "__array_new__"
-          || callee.identName == "__array_new_default__")
-      ) {
-        return emitArrayNewIntr(body, callIx, fnIx)
-      }
-      // `__array_copy__(dst, dstAt, src, srcAt, count)` → `array.copy` over the two
-      // lists' backings (memmove semantics; OOB spans trap via the instruction's own
-      // check). Operand order matches the instruction's stack shape, so no scratch is needed.
-      if !userBindsName && callee.identName == "__array_copy__" {
-        return emitArrayCopyIntr(body, callIx, fnIx)
-      }
-      // Scope-aware: `buildFnMap` keys lifted functions by name, first wins, so the flat map
-      // would give every frame's `inner(…)` the module's first `inner`. The positioned lookup
-      // takes the block-local function whose scope covers this call, else a top-level one.
-      const target = fnIndexOfInScopeChainAt(
-        sidOfNode(c.callFn),
-        callee.identName,
-        fnIx,
-        c.callFn,
-      )
-      // A live closure binding of the name outranks that scan, which cannot see a param or a
-      // local (D1602); a local declared later does not yet shadow the function (D3607). Asked
-      // only on a hit, so a plain call pays nothing.
-      if (
-        target >= 0
-        && identNameIsLiveBound(callee.identName, fnIx)
-        && identIsBoundClosure(callee.identName, fnIx)
-      ) {
-        return emitCallRef(body, callIx, fnIx)
-      }
-      if target < 0 {
-        // Not a known function name — a closure-valued callee, dispatched through the closure
-        // fat-pointer — unless it is a numeric intrinsic's name that no binding covers here,
-        // which is the intrinsic even where a later local closure takes the name (D3607).
-        const intrHere = isNumIntrinsicName(callee.identName)
-          && !identNameIsBoundAt(callee.identName, fnIx, c.callFn)
-          && globalIndexOf(callee.identName) < 0
-        if !intrHere && exprIsClosure(c.callFn, fnIx) {
-          return emitCallRef(body, callIx, fnIx)
-        }
-        // The numeric-opcode intrinsics: one wasm instruction over the arguments. Reached
-        // only where the name resolved to no function, no closure value and no frame binding
-        // (a captured loop variable), which IS the shadowing rule the checker types against —
-        // a program that defines its own `min` calls its own (D2010).
-        if !identNameIsLiveBound(callee.identName, fnIx) {
-          const bcRc = emitBitcastIntr(body, callIx, fnIx, callee.identName)
-          if bcRc != NUM_INTR_NONE { return bcRc }
-          const fiRc = emitFloatIntr(body, callIx, fnIx, callee.identName)
-          if fiRc != NUM_INTR_NONE { return fiRc }
-          const iiRc = emitIntIntr(body, callIx, fnIx, callee.identName)
-          if iiRc != NUM_INTR_NONE { return iiRc }
-        }
-        return emitFail("emitProgram: call to unknown function")
-      }
-      // A lambda-lifted function takes its captures as parameters (SP-037).
-      if cloLifted(target) { return emitDirectCall(body, callIx, fnIx, target) }
-      // a direct call to a capturing lifted function (`add(10)` where `add` captures `n`
-      // from the enclosing frame): build its closure value and `call_ref` it — a plain
-      // `call` would pass a null env and lose the captures. Gated on `fnNestUsed` so a
-      // no-lambda module never enters this path.
-      if fnNestUsed && captureCountOf(target) > 0 {
-        return emitCapturedCall(body, callIx, fnIx, target)
-      }
-      if gLowMemUnused > 0 {
-        const lmaRc = emitLowMemAccessorCall(body, callIx, fnIx, target)
-        if lmaRc <= 0 { return lmaRc }
-      }
-      return emitDirectCall(body, callIx, fnIx, target)
+      return emitCallCoreIdent(body, callIx, c, callee, fnIx)
     }
     // A non-Ident callee yielding a function value (`o.go(10)`, `(expr)(args)`):
     // `call_ref` over the closure fat-pointer.
@@ -27102,6 +27149,88 @@ function emitReturnPlainValue(
   0
 }
 
+// The coerced arms of a return value, in priority order: an f32, f64 or i64 widen, a
+// concrete variant (`retVi`), a union box (`retUNm`), or a literal-union atom widened to its
+// string. The caller takes the plain arm when none applies. Returns 0 or -1.
+function emitReturnCoercedValue(
+  body: u8[],
+  retArg: i32,
+  fnIx: i32,
+  retF32: boolean,
+  retF64: boolean,
+  retI64: boolean,
+  retVi: i32,
+  retUNm: string,
+  retStrWiden: boolean,
+  retNulString: boolean,
+  retInferred: boolean,
+): i32 {
+  if retF32 {
+    if emitExprAsF32(body, retArg, fnIx) < 0 { return -1 }
+  } else if retF64 {
+    if emitExprAsF64(body, retArg, fnIx) < 0 { return -1 }
+  } else if retI64 {
+    if emitExprAsI64(body, retArg, fnIx) < 0 { return -1 }
+  } else if retVi >= 0 {
+    if emitVariantCoerce(body, retVi, retArg, fnIx) < 0 { return -1 }
+  } else if retUNm != "" {
+    // `retUNm` is the union-BOX return (kind 4); a concrete variant `return s` (where `s: S`
+    // and the return type is `C | S`) is boxed into the shared `{tag, payload}` rep here.
+    if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 { return -1 }
+  } else if retStrWiden {
+    // A literal-union atom returned from a `string`-typed function widens to its member string.
+    // A `K | null` value needs a result that holds `null`, which an inferred one does not
+    // declare here (D3198).
+    if !retNulString && retInferred && nulAtomWidenTexts(retArg).length > 0 {
+      return emitFailAt(
+        "emitProgram: an inferred return of a nullable literal union has no string result to widen into",
+        retArg,
+      )
+    }
+    if emitAtomToStr(body, retArg, fnIx) < 0 { return -1 }
+  }
+  0
+}
+
+// The widenings at a return boundary, after the value is emitted: a ref-list (`retRlSlot`) or
+// scalar-list (`retSLKind`) covariance copy, and the narrowed-arm unbox to `retArmHeap` when
+// no concrete variant (`retVi`) already served it.
+function emitReturnBoundaryWidens(
+  body: u8[],
+  retArg: i32,
+  fnIx: i32,
+  retRlSlot: i32,
+  retSLKind: VKind | null,
+  retArmHeap: i32,
+  retVi: i32,
+) {
+  // read-only covariance at the RETURN boundary (D791) — `return lv1` from a `(): Shape[]`.
+  if retRlSlot >= 0 {
+    emitRefListWidenSite(
+      body,
+      retArg,
+      exprEmittedRefListSlot(retArg, fnIx),
+      retRlSlot,
+    )
+  }
+  // the scalar dual (D965) — `return e` from a `(): f64[]`. Read off the ANNOTATION for
+  // the reason `retRlSlot` is: the functype's own source is what keeps the widened value
+  // and the declared result in agreement by construction.
+  if retSLKind != null {
+    emitScalarListWidenSite(body, retArg, fnIx, retSLKind)
+  }
+  // the narrowed-arm unbox at the return boundary (D1031): the bare `: Circle` result is
+  // already served through `emitVariantCoerce`; the niche results (`Circle | null`, `Dot |
+  // null`) are the ones that took the box into a `(ref null $H)` slot. Read off the same
+  // (kind, slot) pair the result valtype is written from.
+  if retArmHeap >= 0 && retVi < 0 {
+    if narrowedArmNeedsUnbox(retArg, fnIx) {
+      emitNarrowedArmUnboxTo(retArmHeap, retArg)
+    }
+  }
+  0
+}
+
 // `emitReturnValue` past its seeds: classify the result of `fn` into the return's widen and
 // niche flags, emit `retArg` under `ctx` through the arm they pick, then the list widenings
 // and the narrowed-arm unbox to `retArmHeap`. Restores the caller's context; returns 0 or -1.
@@ -27297,36 +27426,25 @@ function emitReturnValueTail(
   if retF32 { ctx.wantF32 = true }
   const saved = expCtxHere()
   expCtxApply(ctx)
-  if retF32 {
-    if emitExprAsF32(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
-  } else if retF64 {
-    if emitExprAsF64(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
-  } else if retI64 {
-    if emitExprAsI64(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
-  } else if retVi >= 0 {
-    if emitVariantCoerce(body, retVi, retArg, fnIx) < 0 {
-      return expCtxLeave(saved, -1)
-    }
-  } else if retUNm != "" {
-    // `retUNm` is the union-BOX return (kind 4); a concrete variant `return s` (where `s: S`
-    // and the return type is `C | S`) is boxed into the shared `{tag, payload}` rep here.
-    if emitUnionBoxArg(body, retUNm, retArg, fnIx) < 0 {
-      return expCtxLeave(saved, -1)
-    }
-  } else if retStrWiden {
-    // A literal-union atom returned from a `string`-typed function widens to its member string.
-    // A `K | null` value needs a result that holds `null`, which an inferred one does not
-    // declare here (D3198).
-    if !retNulString && retInferred && nulAtomWidenTexts(retArg).length > 0 {
-      return expCtxLeave(
-        saved,
-        emitFailAt(
-          "emitProgram: an inferred return of a nullable literal union has no string result to widen into",
-          retArg,
-        ),
+  if retF32 || retF64 || retI64 || retVi >= 0 || retUNm != "" || retStrWiden {
+    if (
+      emitReturnCoercedValue(
+        body,
+        retArg,
+        fnIx,
+        retF32,
+        retF64,
+        retI64,
+        retVi,
+        retUNm,
+        retStrWiden,
+        retNulString,
+        retInferred,
       )
+      < 0
+    ) {
+      return expCtxLeave(saved, -1)
     }
-    if emitAtomToStr(body, retArg, fnIx) < 0 { return expCtxLeave(saved, -1) }
   } else {
     if (
       emitReturnPlainValue(
@@ -27353,30 +27471,15 @@ function emitReturnValueTail(
       return expCtxLeave(saved, -1)
     }
   }
-  // read-only covariance at the RETURN boundary (D791) — `return lv1` from a `(): Shape[]`.
-  if retRlSlot >= 0 {
-    emitRefListWidenSite(
-      body,
-      retArg,
-      exprEmittedRefListSlot(retArg, fnIx),
-      retRlSlot,
-    )
-  }
-  // the scalar dual (D965) — `return e` from a `(): f64[]`. Read off the ANNOTATION for
-  // the reason `retRlSlot` is: the functype's own source is what keeps the widened value
-  // and the declared result in agreement by construction.
-  if retSLKind != null {
-    emitScalarListWidenSite(body, retArg, fnIx, retSLKind)
-  }
-  // the narrowed-arm unbox at the return boundary (D1031): the bare `: Circle` result is
-  // already served through `emitVariantCoerce`; the niche results (`Circle | null`, `Dot |
-  // null`) are the ones that took the box into a `(ref null $H)` slot. Read off the same
-  // (kind, slot) pair the result valtype is written from.
-  if retArmHeap >= 0 && retVi < 0 {
-    if narrowedArmNeedsUnbox(retArg, fnIx) {
-      emitNarrowedArmUnboxTo(retArmHeap, retArg)
-    }
-  }
+  emitReturnBoundaryWidens(
+    body,
+    retArg,
+    fnIx,
+    retRlSlot,
+    retSLKind,
+    retArmHeap,
+    retVi,
+  )
   // The caller's context comes back whole: a seed a `return { … }` or `return Map()` leaves
   // unconsumed would otherwise type the next function's `null` (D2564).
   expCtxLeave(saved, 0)
