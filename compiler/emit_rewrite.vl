@@ -74,6 +74,7 @@ import { strLitRecvTy } from "./check_builtin_methods"
 import {
   T,
   TY_I32,
+  TY_NULL,
   TyArray,
   TyFunc,
   TyUnion,
@@ -89,6 +90,7 @@ import {
   tyIsLitUnionOrLit,
   tyIsMap,
   tyIsNulValueUnionBox,
+  tyIsRecord,
   tyPrimNameOf,
   tySame,
   tyToEmitName,
@@ -258,6 +260,7 @@ import {
 import { strListHas } from "./listutil"
 import { memoKeyNew, memoMoved } from "./memo"
 import {
+  flattenVariantsInto,
   nonNullTy,
   numLitUnionHasBase,
   tyHasTyVar,
@@ -1645,6 +1648,50 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
       return ix
     }
   }
+  // `r?.f ?? d` over a re-readable nullable union of records whose field `f` is never null
+  // is the null test choosing between the field read and the default (D5243).
+  if n.binOp == "??" {
+    const cl = P.nodes[unwrapParen(n.binLeft)]
+    if cl is OptMember {
+      const clTy = nodeTyIxOf(unwrapParen(n.binLeft))
+      const clFt = recUnionFieldTyOf(nodeTyIxOf(cl.omObj), cl.omProp, clTy)
+      if (
+        clFt >= 0
+        && !tyBearsNull(clFt)
+        && exprReReadable(unwrapParen(cl.omObj))
+      ) {
+        const crRecv = drwWalk(cl.omObj, ctx)
+        // The read's receiver is a fresh node at the receiver's non-null type, the type the
+        // checker gives the same place under `!= null`.
+        const crIn = P.nodes[unwrapParen(crRecv)]
+        let crObj = crRecv
+        if crIn is Member {
+          crObj = mkMember(crIn.memObj, crIn.memProp, crIn.pos)
+        }
+        if crIn is Index {
+          crObj = mkIndex(crIn.idxArr, crIn.idxIndex, crIn.pos)
+        }
+        if crObj != crRecv {
+          nodeTyRecord(crObj, nonNullTy(nodeTyIxOf(unwrapParen(crRecv))))
+        }
+        const crRead = mkMember(crObj, cl.omProp, cl.pos)
+        nodeTyRecord(crRead, clFt)
+        const crThen: i32[] = []
+        crThen.push(crRead)
+        const crElse: i32[] = []
+        crElse.push(drwWalk(n.binRight, ctx))
+        const crIf = mkIf(
+          mkBinary("!=", crRecv, mkNull("null", n.pos), n.pos),
+          mkBlock(crThen, n.pos),
+          mkBlock(crElse, n.pos),
+          n.pos,
+        )
+        nodeTyCarry(crIf, ix)
+        capMemoNoteEdit()
+        return crIf
+      }
+    }
+  }
   n.binLeft = drwWalk(n.binLeft, ctx)
   n.binRight = drwWalk(n.binRight, ctx)
   // `x ?? d` over a provably non-nullable lhs is `x`: the default can never be
@@ -1747,6 +1794,26 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     }
   }
   return ix
+}
+
+// The type of field `prop` read off the non-null part of `recvTy`, when that is a union of
+// two or more records each holding the field; `omTy` is the `?.` read's own type. -1 otherwise.
+function recUnionFieldTyOf(recvTy: i32, prop: string, omTy: i32): i32 {
+  if omTy < 0 || !tyBearsNull(recvTy) { return -1 }
+  const arms: i32[] = []
+  flattenVariantsInto(recvTy, arms)
+  let recs = 0
+  let fieldNul = false
+  for a in arms {
+    if a != TY_NULL {
+      const ft = tyFieldTyOf(a, prop)
+      if !tyIsRecord(a) || ft < 0 { return -1 }
+      if tyBearsNull(ft) { fieldNul = true }
+      recs = recs + 1
+    }
+  }
+  if recs < 2 { return -1 }
+  if fieldNul { omTy } else { nonNullTy(omTy) }
 }
 
 // D1253 — a bare `{ … }` statement becomes `if true { … }`, as a rewrite rather than an
