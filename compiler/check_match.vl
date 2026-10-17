@@ -74,6 +74,7 @@ import {
   collectElseNarrows,
   collectThenNarrows,
   markUnionCover,
+  matchRestNarrows,
   popScope,
 } from "./check_narrow_flow"
 import { pushScope } from "./check_narrow_paths"
@@ -88,6 +89,7 @@ import {
   T,
   TY_BOOL,
   TY_ERR,
+  TY_NULL,
   TY_VOID,
   TyErr,
   TyLit,
@@ -310,6 +312,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     ci = ci + 1
   }
   let hasWild = false
+  let wildArm = -1
   // A pattern that names no member covers nothing — report it at the pattern and suppress the
   // exhaustiveness report below (the bad pattern is the root cause; don't cascade).
   let sawBadPat = false
@@ -323,6 +326,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       const pn = P.nodes[patIx]
       if matchPatIsWild(patIx) {
         hasWild = true
+        if wildArm < 0 { wildArm = ai }
       } else if pn is IsExpr {
         if matchTypePatCover(patIx, pn, st, uMems, covered) { sawBadPat = true }
       } else if pn is StrLit {
@@ -344,6 +348,7 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
       }
       pj = pj + 1
     }
+    matchWildLastAt(n, ai, wildArm)
     checkMatchArmBinds(n, ai)
     ai = ai + 1
   }
@@ -647,6 +652,16 @@ function checkMatchUnionScrut(n: MatchExpr, ix: i32, st: i32): i32 {
 // a null member, so both forms are read here; the `null` member is not among them.
 function matchLitUnionMembers(st: i32): string[] {
   const members: string[] = []
+  for mt in matchLitUnionMemberTys(st) {
+    const mm = T.tys[mt]
+    if mm is TyLit { members.push(mm.litText) }
+  }
+  members
+}
+
+// The literal member types of `st`, parallel to `matchLitUnionMembers`.
+function matchLitUnionMemberTys(st: i32): i32[] {
+  const tys: i32[] = []
   let styIx = st
   const styN = T.tys[st]
   if styN is TyNullable { styIx = styN.nInner }
@@ -655,11 +670,36 @@ function matchLitUnionMembers(st: i32): string[] {
     let mi = 0
     while mi < sty.uMembers.length {
       const mm = T.tys[sty.uMembers[mi]]
-      if mm is TyLit { members.push(mm.litText) }
+      if mm is TyLit { tys.push(sty.uMembers[mi]) }
       mi = mi + 1
     }
   }
-  members
+  tys
+}
+
+// Refuses arm `ai` when it follows the arm `wildArm` holding the `_`: the wildcard becomes the
+// chain's bare `else`, so a later arm would test first (D5288). `wildArm` is -1 for none yet.
+function matchWildLastAt(n: MatchExpr, ai: i32, wildArm: i32) {
+  if wildArm >= 0 && ai > wildArm {
+    tErr(
+      "unreachable match arm — the `_` wildcard must be the last arm",
+      n.matchPats[n.matchArmStart[ai]],
+    )
+  }
+}
+
+// The types the arms before the `_` consumed: each member `covered` marks, and `null` when
+// `nulCovered`. The `_` arm's scrutinee is narrowed to what remains (D5284).
+function matchConsumedTys(st: i32, covered: i32[], nulCovered: boolean): i32[] {
+  const out: i32[] = []
+  const tys = matchLitUnionMemberTys(st)
+  let i = 0
+  while i < tys.length && i < covered.length {
+    if covered[i] == 1 { out.push(tys[i]) }
+    i = i + 1
+  }
+  if nulCovered { out.push(TY_NULL) }
+  out
 }
 
 // A literal union's arms: each pattern is a member string, `null` on a nullable set, a
@@ -681,6 +721,7 @@ function checkMatchLitUnionArms(
   }
   let nulCovered = false
   let hasWild = false
+  let wildArm = -1
   // A pattern that is neither a member string literal nor the `_` wildcard covers nothing —
   // report it at the pattern and suppress the exhaustiveness error below (don't cascade).
   let sawBadPat = false
@@ -701,6 +742,7 @@ function checkMatchLitUnionArms(
       const pn = P.nodes[matchPatValNode(patIx)]
       if matchPatIsWild(patIx) {
         hasWild = true
+        if wildArm < 0 { wildArm = ai }
       } else if matchPatWasRefused(patIx) {
         sawBadPat = true
       } else if pn is IsExpr {
@@ -748,10 +790,22 @@ function checkMatchLitUnionArms(
       }
       pj = pj + 1
     }
+    matchWildLastAt(n, ai, wildArm)
     // Body value type. (Arm bodies are not checked in return-tail position; the match's joined
     // value seeds the function return once, below — avoids a per-arm void/err mis-seed.)
     const body = n.matchBodies[ai]
+    const restNm: string[] = []
+    const restTy: i32[] = []
+    if ai == wildArm && n.matchArmCount[ai] == 1 {
+      const consumed = matchConsumedTys(st, covered, nulCovered)
+      matchRestNarrows(n.matchScrut, consumed, restNm, restTy)
+    }
+    if restNm.length > 0 {
+      pushScope(-1)
+      applyNarrows(restNm, restTy)
+    }
     const armTy = matchArmBodyTy(body)
+    if restNm.length > 0 { popScope() }
     if !matchArmExits(ix, body, armTy) {
       const bodyLit = armLit(armTy, body)
       matchTy = joinArmLit(

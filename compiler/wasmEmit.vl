@@ -760,6 +760,7 @@ import {
   arrLitNumKind,
   arrNewIntrKind,
   asExprIsUnionCastIn,
+  asExprLitAtomCast,
   asgReadNode,
   asgReadUnwidenOp,
   assignTargetReReads,
@@ -830,6 +831,7 @@ import {
   fnIndexOf,
   fnIndexOfNode,
   fnRetExprOf,
+  fnReturnsLitAtom,
   forInElemKind,
   forInMapRecv,
   forInMapValsSlot,
@@ -999,6 +1001,7 @@ import {
   ifChainAllBareNull,
   ifLinkYieldsNull,
   listPayloadStashSlot,
+  litAtomCastSlot,
   nulNicheBoxSlot,
   objOrderStashSlot,
   spreadDstBackSlot,
@@ -20387,6 +20390,66 @@ function emitAsUnionCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   return emitUnionUnboxTail(ak)
 }
 
+// The `as` trio from a literal-union atom to a registered literal union: the id is staged once
+// and compared against each target member's; a miss traps, is handed back by `return`, or is the
+// `-1` null sentinel, by mode (D5286).
+function emitAsLitAtom(body: u8[], e: AsExpr, exprIx: i32, fnIx: i32) {
+  let tty = nodeTyIxOf(exprIx)
+  if e.asMode == "null" { tty = tyPeelNul(tty) }
+  const texts = tyLitMemberTexts(tty)
+  // A propagated miss leaves as the id into a literal-union result, or as its member text
+  // into a `string` one.
+  const retAtom = e.asMode == "prop" && fnReturnsLitAtom(fnIx)
+  const missTexts = tyLitMemberTexts(nodeTyIxOf(e.asObj))
+  if e.asMode == "prop" && !retAtom {
+    const fd = P.nodes[fnIx]
+    let retStr = false
+    if fd is FuncDecl { retStr = fd.fnRet >= 0 && nodeTyIsStringPrim(fd.fnRet) }
+    if !retStr || missTexts.length == 0 {
+      return emitFail(
+        "emitProgram: `as "
+          + e.asTy
+          + "` over a literal-union atom propagates its miss, and this function returns neither a literal union nor a string — write `as!` or `as?`",
+      )
+    }
+  }
+  if emitExpr(body, e.asObj, fnIx) < 0 { return -1 }
+  const s = litAtomCastSlot()
+  fbLocalSet(s)
+  if e.asMode == "null" {
+    fbLocalGet(s)
+    fbI32Const(-1)
+  }
+  let i = 0
+  while i < texts.length {
+    fbLocalGet(s)
+    fbI32Const(internAtom(quoteLex(texts[i])))
+    fbI32Bin(70) // 0x46 i32.eq
+    if i > 0 {
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    i = i + 1
+  }
+  if e.asMode == "null" {
+    fbSelect() // the id on a hit, the sentinel on a miss
+    return 0
+  }
+  fbI32Eqz()
+  fbIf(64)
+  if e.asMode == "trap" {
+    fbUnreachable()
+  } else if retAtom {
+    fbLocalGet(s)
+    fbReturn()
+  } else {
+    if emitAtomToStrChain(body, missTexts, 0, s) < 0 { return -1 }
+    fbReturn()
+  }
+  fbEnd()
+  fbLocalGet(s)
+  0
+}
+
 function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   const obj = e.asObj
   const tgt = e.asTy
@@ -20400,6 +20463,9 @@ function emitAsCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   // A boxed `v128 | null` or union operand takes the union arm below instead.
   if tgt == "v128" && !exprUnion(obj, fnIx) { return emitExpr(body, obj, fnIx) }
   if e.asMode == "wrap" { return emitNumWrapCast(body, e, _exprIx, fnIx) }
+  if asExprLitAtomCast(_exprIx, fnIx) {
+    return emitAsLitAtom(body, e, _exprIx, fnIx)
+  }
   // A numeric union converts at whichever member it holds when no member's conversion fails.
   if numUnionMinted && nodeIsNumUnion(obj, fnIx) {
     const nuTo = njKindOfTy(nodeTyIxOf(_exprIx))
