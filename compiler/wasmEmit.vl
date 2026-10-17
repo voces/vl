@@ -1120,11 +1120,13 @@ import {
   vtKindOfType,
 } from "./emit_nullable_rets"
 import {
+  armRowSharedAtRecv,
   atomNarrowOp,
   boxNarrowAtomFor,
   boxWidenAtomFor,
   exprReReadable,
   isVariantSpellingAtRecv,
+  recvIsTestedRecord,
   sharedFieldArmAtomKind,
   sharedFieldArmConverts,
   sharedFieldArmLitTexts,
@@ -5446,6 +5448,12 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
     isVariantSpellingAtRecv(nd.isVariant, isVarTyIxOf(isIx), nd.isObj),
   )
   if vi < 0 {
+    if recvIsTestedRecord(nd.isObj, isVarTyIxOf(isIx)) {
+      if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+      fbDrop()
+      fbI32Const(1)
+      return 0
+    }
     // A union alias arm has no single variant row because it is a SUBSET of the outer
     // box's tags, so the test is the tag chain `as?` already emits for a sub-union target
     // (D1774). A layout-twin arm is excluded: its tag alone does not settle membership,
@@ -5512,8 +5520,10 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
     )
   }
 
+  // A row holding several members answers from the value's fields after its tag (D5157).
+  const shared = armRowSharedAtRecv(nd.isObj, vi)
   const rvi = exprVariantIndex(nd.isObj, fnIx)
-  if rvi >= 0 {
+  if rvi >= 0 && !shared {
     // The static fold is only sound where the row is the answer (D1023).
     // `exprVariantIndex` resolves an object literal by its field-name set, so where two arms
     // share a shape it names whichever row it matched first — and folding `rvi == vi` would
@@ -5542,7 +5552,7 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
   // A receiver the cross-arm terms re-read is evaluated once when it is not a place.
   let ctSlot = -1
   if (
-    isFitsAcrossTagRows(nd.isVariant, isVarTyIxOf(isIx), nd.isObj)
+    (shared || isFitsAcrossTagRows(nd.isVariant, isVarTyIxOf(isIx), nd.isObj))
     && !unionEqOperandOk(nd.isObj)
   ) {
     ctSlot = sharedFieldRecvSlot()
@@ -5554,6 +5564,22 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
   fbI32Const(uTags[vi])
   fbI32Bin(70)
   if emitVariantDiscrimTest(body, nd.isObj, vi, fnIx) < 0 { return -1 }
+  if shared {
+    fbIf(127)
+    const sf = emitArmFieldsFit(
+      body,
+      nd.isObj,
+      vi,
+      uVarTyIx[vi],
+      isVarTyIxOf(isIx),
+      fnIx,
+      ctSlot,
+    )
+    if sf < 0 { return -1 }
+    fbElse()
+    fbI32Const(0)
+    fbEnd()
+  }
   const ctIs = emitCrossTagFits(
     body,
     nd.isObj,
@@ -9727,7 +9753,12 @@ function emitSharedFieldAssign(body: u8[], memIx: i32, valIx: i32, fnIx: i32) {
       fis,
     )
     if code < 0 || !sharedFieldPlanDispatchable(code, vis, fis) { return 0 }
-    if sharedFieldAnyArmBoxes(code, vis, fis) {
+    // A literal-union field stores at each member's own atoms, which the member's construct
+    // path already lowers (D5158).
+    if (
+      sharedFieldAnyArmBoxes(code, vis, fis)
+      || sharedFieldAnyArmLitUnion(vis, fis)
+    ) {
       return emitSharedFieldAssignPerArm(body, m.memObj, valIx, fnIx, vis, fis)
     }
     if !sharedFieldTysIdentical(vis, fis) { return 0 }
@@ -9819,6 +9850,17 @@ function emitSharedFieldAssignPerArm(
     e = e + 1
   }
   1
+}
+
+// Whether some member stores the field as a literal union or a literal-union list.
+function sharedFieldAnyArmLitUnion(vis: i32[], fis: i32[]): boolean {
+  let i = 0
+  while i < vis.length && i < fis.length {
+    if variantFieldIsLitUnion(vis[i], fis[i]) { return true }
+    if variantFieldIsLitUnionArray(vis[i], fis[i]) { return true }
+    i = i + 1
+  }
+  false
 }
 
 // Whether every member declares the field at one type, with no literal set among them — the
