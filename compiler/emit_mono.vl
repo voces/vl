@@ -106,6 +106,7 @@ import {
   genAppNameOfTy,
   litUnionAliasNameOfTy,
   mkArrayTy,
+  mkFuncTy,
   numLitUnionBaseName,
   structNameOfTy,
   tyArrayElemIx,
@@ -276,6 +277,7 @@ import {
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
+  fnFlowDeclPathPinCalls,
   fnFlowDeclPathPinFns,
   fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
@@ -461,6 +463,7 @@ import {
   unNameBound,
   unRowOfCanon,
   unionArmsOf,
+  unionSetMemberCount,
 } from "./emit_union_registry"
 import {
   argNichePinTyOf,
@@ -8891,7 +8894,8 @@ function monoMakeInstanceRetAnn(
       // literal, while every other producer of that key softens it to `i32|string`.
       // A grouped union (`(T | string)`) keys the union itself, as the direct spelling does.
       let rsG = rs
-      if unionMemberCount(peelGroupParens(rs)) > 1 { rsG = peelGroupParens(rs) }
+      const rsP = peelGroupParens(rs)
+      if unionSetMemberCount(rsP) > 1 { rsG = rsP }
       const rsC = monoPinUnionName(rsG)
       nret = synthTypeRefTy(rsC, -1, retTy)
       // And register it: `collectU`, the only pass that mints union rows, runs before
@@ -15592,9 +15596,74 @@ function monoBindingAtPin(lf: i32[], nDecl: i32): i32 {
     if monoRenameInitAt(lf[1], lf[0], pins[0] + ";", nDecl) < 0 {
       return monoBindSigFail(d.letName, lf[1])
     }
-    return 0
+    return monoRetypePinCalls(lf[1], path)
   }
-  monoDeliverAtPin(iv, monoSlotPinName(lf[1], path, lf[0]), lf[0])
+  if monoDeliverAtPin(iv, monoSlotPinName(lf[1], path, lf[0]), lf[0]) < 0 {
+    return -1
+  }
+  if pins.length == 1 { monoRetypePinCalls(lf[1], path) }
+  0
+}
+
+// For the binding `d` held at its one pin: each call taking that pin whose callee the checker left
+// an open type, as one past an inferred return is, is typed at its own arguments and result,
+// which are the pin's (D5062). A call in a generic's body is left alone, since instances share it.
+function monoRetypePinCalls(d: i32, path: string[]): i32 {
+  for cx in fnFlowDeclPathPinCalls(d, path) {
+    const c = P.nodes[cx]
+    if c is Call {
+      const cf = unwrapParen(c.callFn)
+      const ct = nodeTyIxOf(cf)
+      const rt = nodeTyIxOf(cx)
+      const fx = monoTopFrameOf(cx)
+      if (
+        cf >= 0
+        && ct >= 0
+        && ct < T.tys.length
+        && T.tys[ct] is TyFunc
+        && tyHasTyVar(ct)
+        && rt >= 0
+        && !tyHasTyVar(rt)
+        && !(fx >= 0 && monoFrameIsGenericInstance(fx))
+      ) {
+        const ps: i32[] = []
+        for a in c.callArgs {
+          const at = nodeTyIxOf(a)
+          if at >= 0 && !tyHasTyVar(at) { ps.push(at) }
+        }
+        if ps.length == c.callArgs.length && monoWritesTypedAt(d, ps) {
+          nodeTyRecord(cf, mkFuncTy(ps, rt))
+        }
+      }
+    }
+  }
+  0
+}
+
+// Whether every write of the binding `d` the checker gave a closed function type takes the
+// parameters `ps`; one typed at another call's arguments would be delivered at the wrong
+// signature, so the call is left open and refused.
+function monoWritesTypedAt(d: i32, ps: i32[]): boolean {
+  for key in ["n:", "c:"] {
+    for i in monoWritesOf(key, d) {
+      const nd = P.nodes[i]
+      if nd is BinExpr {
+        const wt = nodeTyIxOf(nd.binRight)
+        if wt >= 0 && wt < T.tys.length && !tyHasTyVar(wt) {
+          const w = T.tys[wt]
+          if w is TyFunc {
+            if w.fnParamTypes.length != ps.length { return false }
+            let j = 0
+            while j < ps.length {
+              if !tyEq(w.fnParamTypes[j], ps[j]) { return false }
+              j = j + 1
+            }
+          }
+        }
+      }
+    }
+  }
+  true
 }
 
 // Whether frame `wf`, at or below frame `top`, is a function nothing names below `top` — so
