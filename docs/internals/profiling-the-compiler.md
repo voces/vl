@@ -621,7 +621,12 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   injected whole-arena scan per emitted function (a quarter of them) read +57% and red, while
   a weaker injection read +34% and passed — as it also would have on the CPU row. It catches
   the D1090 class, a many-fold blowup; the shape family is what sees a smaller multiplier, and
-  says where.
+  says where. In `gate.sh` it grades the stage 4 of `scripts/self-compile-pair.sh` (`--pair`),
+  the build that also carries the native fixpoint and the survey's profile: the `--names`
+  compiler running it and the profiler's epoch ticks add no fuel (89,463,711,270 under plain,
+  `VL_GC_STATS=1` and the profiler alike, 2026-10-17), while the build that EMITS `--names`
+  costs +5.5% (it writes the name and source sections), so the fuel is never read off the
+  `names` half of the pair.
 * **`scripts/plumb-shape-cost.vl`** — what one `vl build --names -O --import-memory` of a 2 MB
   plumb-shaped unit costs, against `scripts/plumb-shape-baseline.json`. The unit is written by
   `scripts/perf/gen-plumb-shape.vl` (fixed seed; its hash is in the baseline, so a seed that
