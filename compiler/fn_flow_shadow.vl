@@ -90,6 +90,14 @@ let ffDeclNode: {[i32]: i32} = Map()
 let ffDeclFnOf: {[i32]: i32} = Map()
 let ffDeclWrites: {[i32]: i32[]} = Map()
 let ffCellWrites: {[i32]: i32[]} = Map()
+// Calls through an un-annotated `let` lambda, by call: the lambda, the binding, the walk context
+// and function that meet each, and their argument slots (`ffLetLamCall`).
+let ffLetLamAt: i32[] = []
+let ffLetLamFn: i32[] = []
+let ffLetLamDecl: i32[] = []
+let ffLetLamCtx: i32[] = []
+let ffLetLamIn: i32[] = []
+let ffLetLamArgs: i32[][] = []
 let ufPar: i32[] = []
 let ufSrc: i32[][] = []
 let ufPin: i32[][] = []
@@ -181,6 +189,12 @@ export function fnFlowShadowBegin() {
   ffDeclFnOf = Map()
   ffDeclWrites = Map()
   ffCellWrites = Map()
+  ffLetLamAt = []
+  ffLetLamFn = []
+  ffLetLamDecl = []
+  ffLetLamCtx = []
+  ffLetLamIn = []
+  ffLetLamArgs = []
   ufPar = []
   ufSrc = []
   ufPin = []
@@ -997,8 +1011,10 @@ function ffCall(ix: i32, fnIx: i32): i32 {
       if dn is FuncDecl { return ffDirect(ix, c, d) }
     }
     if d == IDENT_BUILTIN || d < 0 { return ffOpaque(ix, cn.identName) }
-    const lam = ffConstGenLamOf(d)
+    const lam = ffGenLamOf(d, "const")
     if lam >= 0 { return ffConstLamCall(ix, ffCalleeSlot(c), lam) }
+    const lLam = ffGenLamOf(d, "let")
+    if lLam >= 0 { return ffLetLamCall(ix, ffCalleeSlot(c), lLam, d) }
   }
   if cn is Member {
     const rt = nodeTyIxOf(cn.memObj)
@@ -1024,13 +1040,13 @@ function ffCall(ix: i32, fnIx: i32): i32 {
 // Any other callee is a value: its slot is the one the call reads a function from.
 function ffCalleeSlot(c: i32): i32 { ffFlow(c, "callee") }
 
-// The lambda an un-annotated `const` declaration `d` binds when that lambda is generic or has a
-// hole, as mono instances it per call; -1 otherwise.
-function ffConstGenLamOf(d: i32): i32 {
+// The lambda an un-annotated declaration `d` with keyword `kw` binds when that lambda is generic
+// or has a hole, as mono instances it per call; -1 otherwise.
+function ffGenLamOf(d: i32, kw: string): i32 {
   const t = ffLetOf(d)
   if t < 0 { return -1 }
   const n = P.nodes[t]
-  if !(n is LetDecl) || n.letKw != "const" || n.letType >= 0 || n.letInit < 0 {
+  if !(n is LetDecl) || n.letKw != kw || n.letType >= 0 || n.letInit < 0 {
     return -1
   }
   const iv = P.nodes[n.letInit]
@@ -1049,16 +1065,60 @@ function ffConstGenLamOf(d: i32): i32 {
 function ffConstLamCall(ix: i32, s: i32, lam: i32): i32 {
   const fl: i32[] = []
   const res = ffSlotCall(ix, s, fl)
+  ffLamInstWalk(ix, lam, fl)
+  res
+}
+
+// Walks the instance of lambda `lam` that call `ix` makes, flowing the argument slots `fl` into
+// its parameters; nothing when the call binds no hole.
+function ffLamInstWalk(ix: i32, lam: i32, fl: i32[]) {
   const ctx = ffInstCtx(ix, lam)
   const fd = P.nodes[lam]
-  if ctx == (fnCtx[lam] ?? 0) || !(fd is FuncDecl) { return res }
+  if ctx == (fnCtx[lam] ?? 0) || !(fd is FuncDecl) { return 0 }
   ffEnsureWalked(lam, ctx)
   let i = 0
   while i < fl.length && i < fd.fnParams.length {
     ffEdge(fl[i], ffSlot(ffDeclKey(fd.fnParams[i], ctx)))
     i = i + 1
   }
+  0
+}
+
+// `ffConstLamCall` for a `let` binding `d`, whose instance is walked only once the build has seen
+// every write: a written `let` may hold another lambda at the call (D5791).
+function ffLetLamCall(ix: i32, s: i32, lam: i32, d: i32): i32 {
+  const fl: i32[] = []
+  const res = ffSlotCall(ix, s, fl)
+  ffLetLamAt.push(ix)
+  ffLetLamFn.push(lam)
+  ffLetLamDecl.push(d)
+  ffLetLamCtx.push(ffCtx)
+  ffLetLamIn.push(ffFn)
+  ffLetLamArgs.push(fl)
   res
+}
+
+// Walks each deferred `let` lambda call whose binding no `=` writes, in the context that met it.
+function ffLetLamFinish() {
+  const svCtx = ffCtx
+  const svFn = ffFn
+  let k = 0
+  while k < ffLetLamAt.length {
+    const d = ffLetLamDecl[k]
+    const o = ffOrigDecl(d)
+    const wr = (ffDeclWr[d] ?? false)
+      || (ffDeclWrites[o] ?? []).length > 0
+      || (ffCellWrites[o] ?? []).length > 0
+    if !wr {
+      ffCtx = ffLetLamCtx[k]
+      ffFn = ffLetLamIn[k]
+      ffLamInstWalk(ffLetLamAt[k], ffLetLamFn[k], ffLetLamArgs[k])
+    }
+    k = k + 1
+  }
+  ffCtx = svCtx
+  ffFn = svFn
+  0
 }
 
 // A call through a slot pins the slot's class at the argument types, wherever the callee's own
@@ -1974,6 +2034,7 @@ function ffBuild(stmts: i32[]) {
       ffEnsureWalked(fe, 1)
     }
   }
+  ffLetLamFinish()
   ffBuilt = true
   0
 }
