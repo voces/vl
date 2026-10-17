@@ -626,28 +626,10 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
   let num = mant
   let den: i32[] = []
   den.push(1)
-  let fk = 0
-  // Four decimal digits a step where they remain: `limb * 10^4` still fits an i32.
   if dexp < 0 {
-    while fk < 0 - dexp {
-      if fk + 4 <= 0 - dexp {
-        den = bigMulSmall(den, 10000)
-        fk = fk + 4
-      } else {
-        den = bigMulSmall(den, 10)
-        fk = fk + 1
-      }
-    }
+    den = ieeeMulPow10(den, 0 - dexp)
   } else {
-    while fk < dexp {
-      if fk + 4 <= dexp {
-        num = bigMulSmall(num, 10000)
-        fk = fk + 4
-      } else {
-        num = bigMulSmall(num, 10)
-        fk = fk + 1
-      }
-    }
+    num = ieeeMulPow10(num, dexp)
   }
   // value = `(num/den) * 2^exp`. Aligns so `floor(num/den)` has exactly `sigBits + 1`
   // bits, then rounds the guard bit plus the sticky remainder to `sigBits` bits.
@@ -681,22 +663,7 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
   let qs: i32[] = []
   let biased = 0
   if preBiased <= 0 {
-    // Gradual underflow: too small for a normal, so round at the subnormal precision
-    // (fixed exponent `Emin = 1 - bias`). Computes `floor(2f)` from the num/den ratio
-    // (extra low bit = round guard, remainder = sticky) and rounds once at the target
-    // precision — a value below half the smallest subnormal yields `qs = 0`, packing as ±0.
-    den = bigShlK(den, 1 - preBiased)
-    const q2 = bigDivmod(num, den) // floor(2f)
-    const sGuard = q2[0] & 1
-    let sSticky = 0
-    if gDivRemNonzero { sSticky = 1 }
-    qs = bigShr1(q2) // floor(f)
-    let sRoundUp = false
-    if sGuard == 1 {
-      if sSticky == 1 { sRoundUp = true }
-      else if (qs[0] & 1) == 1 { sRoundUp = true }
-    }
-    if sRoundUp { qs = bigAddSmall(qs, 1) }
+    qs = ieeeRoundSubnormal(num, den, preBiased)
     // `biased` stays 0 (subnormal) unless rounding carries all the way up to
     // `1.0 * 2^Emin`, the smallest normal value (fraction 0, biased exponent 1).
     // The shared packing below masks off the implicit-1 bit either way.
@@ -738,6 +705,46 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
       biased = maxBiased
     }
   }
+  ieeePack(qs, biased, neg, nbytes)
+}
+// `x * 10^k` for `k >= 0`, four decimal digits a step where they remain: `limb * 10^4`
+// still fits an i32.
+function ieeeMulPow10(x: i32[], k: i32): i32[] {
+  let r = x
+  let fk = 0
+  while fk < k {
+    if fk + 4 <= k {
+      r = bigMulSmall(r, 10000)
+      fk = fk + 4
+    } else {
+      r = bigMulSmall(r, 10)
+      fk = fk + 1
+    }
+  }
+  r
+}
+// Gradual underflow: too small for a normal, so round at the subnormal precision
+// (fixed exponent `Emin = 1 - bias`). Computes `floor(2f)` from the num/den ratio
+// (extra low bit = round guard, remainder = sticky) and rounds once at the target
+// precision — a value below half the smallest subnormal yields `qs = 0`, packing as ±0.
+function ieeeRoundSubnormal(num: i32[], den0: i32[], preBiased: i32): i32[] {
+  const den = bigShlK(den0, 1 - preBiased)
+  const q2 = bigDivmod(num, den) // floor(2f)
+  const sGuard = q2[0] & 1
+  let sSticky = 0
+  if gDivRemNonzero { sSticky = 1 }
+  let qs = bigShr1(q2) // floor(f)
+  let sRoundUp = false
+  if sGuard == 1 {
+    if sSticky == 1 { sRoundUp = true }
+    else if (qs[0] & 1) == 1 { sRoundUp = true }
+  }
+  if sRoundUp { qs = bigAddSmall(qs, 1) }
+  qs
+}
+// Packs the rounded significand `qs` and biased exponent into `nbytes` (8 or 4)
+// little-endian IEEE-754 bytes, the sign from `neg`.
+function ieeePack(qs: i32[], biased: i32, neg: boolean, nbytes: i32): i32[] {
   // Read the low 16-bit limbs of the significand.
   let m0 = 0
   let m1 = 0
