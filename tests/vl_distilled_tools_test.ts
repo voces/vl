@@ -21,6 +21,8 @@
 //   5. redistil's manifest note and closing hint name `redistil.vl` and `regress.vl`, and a
 //      history where every block is skipped exits 1 with a sentence, not a ZeroDivisionError.
 //   6. Paths resolve against the working directory, not the script's own location.
+//   7. A stored message erases a backtrace frame's module offset (`0: 0xN - `) and a
+//      `<wasm function N>` index, which move with any emitter change (a000005, a000007).
 //
 // @test-timing native
 
@@ -50,14 +52,17 @@ const CELLS: Record<string, [string, string]> = {
   ],
   a000004: ['run-out: it\'s "q" ü\\n', "x"],
   a000005: [
-    "run-rc: 70\nrun-err: error: wasm trap: out of bounds array access\\n\nbuilt: 1",
+    "run-rc: 70\nrun-err: error: wasm trap: out of bounds array access\\n    0:    0x14b - vl!inner\\n\nbuilt: 1",
     "2",
   ],
   a000006: [
     "run-rc: 1\nrun-err: [wasm] Invalid input WebAssembly code at offset 77: type mismatch\\n",
     "7",
   ],
-  a000007: ["run-rc: 70\nrun-err: error: wasm trap: unreachable\\n", "8"],
+  a000007: [
+    "run-rc: 70\nrun-err: error: wasm trap: unreachable\\n    0:   0x2a - <wasm function 12>\\n",
+    "8",
+  ],
 };
 const NAMED: Record<string, [string, string]> = {
   fx_runs: ["run-out: é\\n\ncached: 1", "é"],
@@ -72,9 +77,9 @@ const BASELINE = [
   `{"cell": "a000002", "class": "loud check reject", "msg": "[ERROR]: type mismatch: expected i32, found string"}`,
   `{"cell": "a000003", "class": "loud emit reject", "msg": "Error: Error: emit error  emitProgram: a range step of i32's minimum has no negation"}`,
   `{"cell": "a000004", "class": "runs but wrong value", "msg": "want 'x' got 'it\\\\'s \\"q\\" \\u00fc'"}`,
-  `{"cell": "a000005", "class": "trap_loads", "msg": "error: wasm trap: out of bounds array access"}`,
+  `{"cell": "a000005", "class": "trap_loads", "msg": "error: wasm trap: out of bounds array access 0: 0xN - vl!inner"}`,
   `{"cell": "a000006", "class": "check-clean invalid wasm", "msg": "[wasm] Invalid input WebAssembly code at offset N: type mismatch"}`,
-  `{"cell": "a000007", "class": "compiler trap", "msg": "error: wasm trap: unreachable"}`,
+  `{"cell": "a000007", "class": "compiler trap", "msg": "error: wasm trap: unreachable 0: 0xN - <wasm function N>"}`,
   `{"cell": "fx_reject", "class": "loud check reject", "msg": "[ERROR]: undefined name \`undefinedName\`"}`,
   `{"cell": "fx_runs", "class": "runs", "msg": ""}`,
   `{"cell": "fx_wrong", "class": "runs but wrong value", "msg": "want '1' got '1\\\\n2'"}`,
