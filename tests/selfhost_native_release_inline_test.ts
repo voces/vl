@@ -176,8 +176,10 @@ for (const [fx, want] of FIXTURES) {
                 } rc=${r.code} ${r.err.trim()}`,
             );
           }
-          const n = allocations((await run(WASM_DIS, [out, ...features])).out);
-          return { n, inlined: exists(dump), flat: exists(flatDump) };
+          // Disassembled only for the kinds that grade the count.
+          const count = async () =>
+            allocations((await run(WASM_DIS, [out, ...features])).out);
+          return { count, inlined: exists(dump), flat: exists(flatDump) };
         };
         for (const rung of RUNGS) {
           const step = await built(rung, "step", {});
@@ -185,17 +187,19 @@ for (const [fx, want] of FIXTURES) {
             if (!step.inlined) {
               throw new Error(`${fx} ${rung}: the step inlined no field`);
             }
-            if (step.n !== allocs) {
+            const n = await step.count();
+            if (n !== allocs) {
               throw new Error(
-                `${fx} ${rung}: ${step.n} struct.new left in function bodies\n` +
+                `${fx} ${rung}: ${n} struct.new left in function bodies\n` +
                   `  want: ${allocs} — every store and read here is of a record held inline`,
               );
             }
             const off = await built(rung, "off", { VL_OPT_NO_INLINE: "1" });
-            if (off.n <= step.n) {
+            const offN = await off.count();
+            if (offN <= n) {
               throw new Error(
-                `${fx} ${rung}: with the step off ${off.n} struct.new are left, not more than ` +
-                  `with it (${step.n}): the fixture no longer exercises the step`,
+                `${fx} ${rung}: with the step off ${offN} struct.new are left, not more than ` +
+                  `with it (${n}): the fixture no longer exercises the step`,
               );
             }
           }
@@ -244,17 +248,19 @@ for (const [fx, want] of FIXTURES) {
             if (!step.flat) {
               throw new Error(`${fx} ${rung}: the step flattened no list`);
             }
-            if (step.n !== allocs) {
+            const n = await step.count();
+            if (n !== allocs) {
               throw new Error(
-                `${fx} ${rung}: ${step.n} struct.new left in function bodies\n` +
+                `${fx} ${rung}: ${n} struct.new left in function bodies\n` +
                   `  want: ${allocs} — every list here holds its elements' fields`,
               );
             }
             const off = await built(rung, "off", { VL_OPT_NO_FLAT: "1" });
-            if (off.n <= step.n) {
+            const offN = await off.count();
+            if (offN <= n) {
               throw new Error(
-                `${fx} ${rung}: with no list flattened ${off.n} struct.new are left, not ` +
-                  `more than with it (${step.n}): the fixture no longer exercises the step`,
+                `${fx} ${rung}: with no list flattened ${offN} struct.new are left, not ` +
+                  `more than with it (${n}): the fixture no longer exercises the step`,
               );
             }
           }
