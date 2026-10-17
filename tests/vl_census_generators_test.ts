@@ -12,6 +12,7 @@
 //
 // @test-timing native
 
+import { createHash } from "node:crypto";
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -22,7 +23,6 @@ if (GATED && !ENABLED) {
 
 const FIX = `${ROOT}/tests/fixtures/census-generators/expected.json`;
 const dec = new TextDecoder();
-const enc = new TextEncoder();
 
 type Case = {
   tool: string;
@@ -32,23 +32,18 @@ type Case = {
   stdout: string;
 };
 
-const hex = async (bytes: Uint8Array): Promise<string> =>
-  Array.from(
-    new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
-    (b) => b.toString(16).padStart(2, "0"),
-  ).join("");
+// `node:crypto` hashes synchronously: block B's 28,591 files through `crypto.subtle`, one
+// awaited digest each, cost more than generating them.
+const sha256 = (data: Uint8Array | string): string =>
+  createHash("sha256").update(data).digest("hex");
 
-const treeHash = async (
-  dir: string,
-): Promise<{ files: number; tree: string }> => {
+const treeHash = (dir: string): { files: number; tree: string } => {
   const names: string[] = [];
-  for await (const e of Deno.readDir(dir)) names.push(e.name);
+  for (const e of Deno.readDirSync(dir)) names.push(e.name);
   names.sort((a, b) => a < b ? -1 : a > b ? 1 : 0);
   let lines = "";
-  for (const n of names) {
-    lines += `${await hex(await Deno.readFile(`${dir}/${n}`))}  ${n}\n`;
-  }
-  return { files: names.length, tree: await hex(enc.encode(lines)) };
+  for (const n of names) lines += `${sha256(Deno.readFileSync(`${dir}/${n}`))}  ${n}\n`;
+  return { files: names.length, tree: sha256(lines) };
 };
 
 Deno.test({
@@ -82,7 +77,7 @@ Deno.test({
           );
           continue;
         }
-        const t = await treeHash(out);
+        const t = treeHash(out);
         if (t.files !== c.files || t.tree !== c.tree) {
           bad.push(
             `[${name}] want ${c.files} files, tree ${c.tree}; got ${t.files} files, tree ${t.tree}`,

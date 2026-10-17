@@ -12,7 +12,7 @@
 // row (LIVE, FELL, DRIFT, GONE, NOPROBE), red and green, the fan-out and in-process paths, a
 // named `--compiler` and an empty probe directory. A one-word mutation of the grader must red.
 //
-// The two TIMEOUT probes grade in a tree of their own under a 10 s bound; the rest under 60 s,
+// The two TIMEOUT probes grade in a tree of their own under a 3 s bound; the rest under 60 s,
 // which only a starved machine could reach, so load cannot turn an answering probe into one.
 //
 // Where they could not agree, pinned below rather than left as prose:
@@ -142,7 +142,7 @@ const TIMEOUTS: Record<string, string> = {
   "p-timeout-check.vl":
     "//! run-rc: 1\n//! run-out: partial\\n\n//! check-sleep: 600\n",
 };
-const SLOW = "10";
+const SLOW = "3";
 const FAST = "60";
 
 // Probes no green run can hold: dropped for the green cases.

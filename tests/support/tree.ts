@@ -25,13 +25,14 @@ export const COMPILER = `${ROOT}/build/vl-compiler.wasm`;
  * binaries, the same version as package.json's) when set, else from
  * `node_modules/.bin`, which is not on PATH. npm's build is binaryen compiled to
  * JS/wasm under node: the modules it writes are byte-identical, but each call pays
- * node's start-up and `-O` runs about 5x slower. `wasm-dis` always comes from npm:
- * the native one prints `\r\n` on Windows, and the shape suites match text by line.
- * On Windows npm's spawnable shim is `<tool>.cmd`. */
+ * node's start-up and `-O` runs about 5x slower. ci-native has no `node_modules`, so
+ * there `$VL_BINARYEN` is the only binaryen. On Windows `wasm-dis` comes from npm: the
+ * native one prints `\r\n` there, and the shape suites match text by line; npm's
+ * spawnable shim is `<tool>.cmd`. */
 export const binaryen = (tool: string): string => {
   const win = Deno.build.os === "windows";
   const native = Deno.env.get("VL_BINARYEN");
-  if (native && tool !== "wasm-dis") {
+  if (native && !(win && tool === "wasm-dis")) {
     return `${native}/${tool}${win ? ".exe" : ""}`;
   }
   return `${ROOT}/node_modules/.bin/${tool}${win ? ".cmd" : ""}`;
