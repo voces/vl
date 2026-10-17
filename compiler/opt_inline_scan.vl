@@ -4075,6 +4075,178 @@ function flatRewrite(spill: boolean, fault: boolean): u8[] {
   assemble(types, bodies, moves, hdr)
 }
 
+// Plans each store site's value local in `hTv`, and in `hAt` where it is set: 0 right after
+// its producer (so a producer call is left `call; local.set` for the multi-value step), 1 at the
+// store, 2 at the store behind a cast.
+function flatPlanStores(
+  sites: i32[],
+  spill: boolean,
+  hTv: {[i32]: i32},
+  hAt: {[i32]: i32},
+) {
+  for s in sites {
+    if fsKind[s] == AK_SET {
+      const a = fsTy[s]
+      const tv = newLocal(refT(false, arrRec[a]))
+      const o = fsOLo[s]
+      const q = foProd[o]
+      if fsReach[s] && q != NONE && !spill && !rwAft.has(q) {
+        const c: u8[] = []
+        castIf(c, foCast[o])
+        localOp(c, 0x21, tv)
+        rwAft[q] = keep(c)
+        bump(stAtProd, a)
+        hAt[fsK[s]] = 0
+      } else {
+        bump(stSpilled, a)
+        hAt[fsK[s]] = if foCast[o] { 2 } else { 1 }
+      }
+      hTv[fsK[s]] = tv
+    }
+  }
+}
+
+// The code of get site `s` at op `k` over array type `a` of record `v` with `n` fields: one
+// field read when the use is a field, else a reboxed record. Records in `consume` how many ops
+// the rewrite replaces when it is more than one.
+function flatGetCode(
+  code: u8[],
+  s: i32,
+  k: i32,
+  a: i32,
+  v: i32,
+  n: i32,
+  ti: i32,
+  consume: {[i32]: i32},
+) {
+  let field = fsUse[s] == AU_FIELD && !rwAft.has(k)
+  let q = k + 1
+  while field && q <= fsUA[s] {
+    if rwAft.has(q) { field = false }
+    q = q + 1
+  }
+  if field {
+    scale(code, n, ti)
+    plus(code, fsUB[s])
+    gcOp(code, 11, a, -1)
+    consume[k] = fsUA[s] - k + 1
+    bump(stFieldReads, a)
+  } else {
+    const tb = newLocal(0x7f)
+    const tarr = newLocal(refT(true, a))
+    scale(code, n, ti)
+    localOp(code, 0x21, tb)
+    localOp(code, 0x21, tarr)
+    let j = 0
+    while j < n {
+      localOp(code, 0x20, tarr)
+      localOp(code, 0x20, tb)
+      plus(code, j)
+      gcOp(code, 11, a, -1)
+      j = j + 1
+    }
+    gcOp(code, 0, v, -1)
+    bump(stReboxed, a)
+    // The box is non-null already; a cast after it would hide the allocation from the
+    // multi-value step.
+    if fsCast[s] && !rwAft.has(k) && !rwAft.has(k + 1) { consume[k] = 2 }
+  }
+}
+
+// The code of fixed-array site `s` over array type `a` of record `v` with `n` fields: its
+// elements held in locals, then their fields side by side in one `array.new_fixed`. Nothing
+// for an empty literal.
+function flatFixedCode(code: u8[], s: i32, a: i32, v: i32, n: i32) {
+  const m = fsOHi[s] - fsOLo[s]
+  if m > 0 {
+    const tvs: i32[] = []
+    let i = 0
+    while i < m {
+      tvs.push(newLocal(refT(false, v)))
+      i = i + 1
+    }
+    i = m - 1
+    while i >= 0 {
+      castIf(code, foCast[fsOLo[s] + i])
+      localOp(code, 0x21, tvs[i])
+      i = i - 1
+    }
+    for tv in tvs {
+      let j = 0
+      while j < n {
+        localOp(code, 0x20, tv)
+        gcOp(code, 2, v, j)
+        j = j + 1
+      }
+    }
+    code.push(0xfb)
+    wnPutLeb(code, 8)
+    wnPutLeb(code, a)
+    wnPutLeb(code, m * n)
+    stSpilled[a] = (stSpilled[a] ?? 0) + m
+  }
+}
+
+// The code of an `array.copy` over array type `a` with `n` fields: both offsets and the length
+// scaled by `n`.
+function flatCopyCode(code: u8[], a: i32, n: i32, ti: i32) {
+  const tl = newLocal(0x7f)
+  const ts = newLocal(0x7f)
+  const td = newLocal(0x7f)
+  const tsrc = newLocal(refT(true, a))
+  localOp(code, 0x21, tl)
+  localOp(code, 0x21, ts)
+  localOp(code, 0x21, tsrc)
+  localOp(code, 0x21, td)
+  localOp(code, 0x20, td)
+  scale(code, n, ti)
+  localOp(code, 0x20, tsrc)
+  localOp(code, 0x20, ts)
+  scale(code, n, ti)
+  localOp(code, 0x20, tl)
+  scale(code, n, ti)
+  code.push(0xfb)
+  wnPutLeb(code, 17)
+  wnPutLeb(code, a)
+  wnPutLeb(code, a)
+}
+
+// Body `bi`'s decoded ops with each rewrite in place of the ops it consumes and each after-code
+// behind its op, finished with the header at `h0`; `mv` gets its moves.
+function flatSpliceOps(
+  bi: i32,
+  h0: i32,
+  consume: {[i32]: i32},
+  fault: boolean,
+  mv: i32[],
+): u8[] {
+  const out: u8[] = []
+  const moved: i32[] = []
+  const nOps = opOff.length
+  let i = 0
+  while i < nOps {
+    moved.push(opOff[i])
+    moved.push(out.length)
+    const rep = rwRep[i] ?? -1
+    if rep >= 0 {
+      putBytes(out, rwCodes[rep])
+    } else {
+      copyBytes(out, B, opOff[i], opEnd[i] - opOff[i])
+    }
+    const consumed = consume[i] ?? 1
+    const aft = rwAft[i] ?? -1
+    if aft >= 0 { putBytes(out, rwCodes[aft]) }
+    let q = 1
+    while q < consumed && i + q < nOps {
+      moved.push(opOff[i + q])
+      moved.push(out.length)
+      q = q + 1
+    }
+    i = i + consumed
+  }
+  finishBody(bi, h0, out, moved, fault, mv)
+}
+
 // Body `bi`, whose header starts at `h0`, with each of its flattened arrays' `sites` rewritten
 // to index the fields side by side; `mv` gets its moves.
 function flatBody(
@@ -4096,26 +4268,7 @@ function flatBody(
   // (so a producer call is left `call; local.set` for the multi-value step), else at the store.
   const hTv: {[i32]: i32} = Map()
   const hAt: {[i32]: i32} = Map()
-  for s in sites {
-    if fsKind[s] == AK_SET {
-      const a = fsTy[s]
-      const tv = newLocal(refT(false, arrRec[a]))
-      const o = fsOLo[s]
-      const q = foProd[o]
-      if fsReach[s] && q != NONE && !spill && !rwAft.has(q) {
-        const c: u8[] = []
-        castIf(c, foCast[o])
-        localOp(c, 0x21, tv)
-        rwAft[q] = keep(c)
-        bump(stAtProd, a)
-        hAt[fsK[s]] = 0
-      } else {
-        bump(stSpilled, a)
-        hAt[fsK[s]] = if foCast[o] { 2 } else { 1 }
-      }
-      hTv[fsK[s]] = tv
-    }
-  }
+  flatPlanStores(sites, spill, hTv, hAt)
   const consume: {[i32]: i32} = Map()
   for s in sites {
     const k = fsK[s]
@@ -4125,38 +4278,7 @@ function flatBody(
     const kind = fsKind[s]
     const code: u8[] = []
     if kind == AK_GET {
-      let field = fsUse[s] == AU_FIELD && !rwAft.has(k)
-      let q = k + 1
-      while field && q <= fsUA[s] {
-        if rwAft.has(q) { field = false }
-        q = q + 1
-      }
-      if field {
-        scale(code, n, ti)
-        plus(code, fsUB[s])
-        gcOp(code, 11, a, -1)
-        consume[k] = fsUA[s] - k + 1
-        bump(stFieldReads, a)
-      } else {
-        const tb = newLocal(0x7f)
-        const tarr = newLocal(refT(true, a))
-        scale(code, n, ti)
-        localOp(code, 0x21, tb)
-        localOp(code, 0x21, tarr)
-        let j = 0
-        while j < n {
-          localOp(code, 0x20, tarr)
-          localOp(code, 0x20, tb)
-          plus(code, j)
-          gcOp(code, 11, a, -1)
-          j = j + 1
-        }
-        gcOp(code, 0, v, -1)
-        bump(stReboxed, a)
-        // The box is non-null already; a cast after it would hide the allocation from the
-        // multi-value step.
-        if fsCast[s] && !rwAft.has(k) && !rwAft.has(k + 1) { consume[k] = 2 }
-      }
+      flatGetCode(code, s, k, a, v, n, ti, consume)
     } else if kind == AK_SET {
       const tb = newLocal(0x7f)
       const tarr = newLocal(refT(true, a))
@@ -4187,34 +4309,7 @@ function flatBody(
       scale(code, n, ti)
       gcOp(code, 7, a, -1)
     } else if kind == AK_FIXED {
-      const m = fsOHi[s] - fsOLo[s]
-      if m > 0 {
-        const tvs: i32[] = []
-        let i = 0
-        while i < m {
-          tvs.push(newLocal(refT(false, v)))
-          i = i + 1
-        }
-        i = m - 1
-        while i >= 0 {
-          castIf(code, foCast[fsOLo[s] + i])
-          localOp(code, 0x21, tvs[i])
-          i = i - 1
-        }
-        for tv in tvs {
-          let j = 0
-          while j < n {
-            localOp(code, 0x20, tv)
-            gcOp(code, 2, v, j)
-            j = j + 1
-          }
-        }
-        code.push(0xfb)
-        wnPutLeb(code, 8)
-        wnPutLeb(code, a)
-        wnPutLeb(code, m * n)
-        stSpilled[a] = (stSpilled[a] ?? 0) + m
-      }
+      flatFixedCode(code, s, a, v, n)
     } else if kind == AK_LEN {
       code.push(0xfb)
       wnPutLeb(code, 15)
@@ -4223,25 +4318,7 @@ function flatBody(
         code.push(0x6e)
       }
     } else if kind == AK_COPY {
-      const tl = newLocal(0x7f)
-      const ts = newLocal(0x7f)
-      const td = newLocal(0x7f)
-      const tsrc = newLocal(refT(true, a))
-      localOp(code, 0x21, tl)
-      localOp(code, 0x21, ts)
-      localOp(code, 0x21, tsrc)
-      localOp(code, 0x21, td)
-      localOp(code, 0x20, td)
-      scale(code, n, ti)
-      localOp(code, 0x20, tsrc)
-      localOp(code, 0x20, ts)
-      scale(code, n, ti)
-      localOp(code, 0x20, tl)
-      scale(code, n, ti)
-      code.push(0xfb)
-      wnPutLeb(code, 17)
-      wnPutLeb(code, a)
-      wnPutLeb(code, a)
+      flatCopyCode(code, a, n, ti)
     } else {
       rwErr = "a site of an unknown kind"
       return none
@@ -4255,31 +4332,7 @@ function flatBody(
     }
   }
   if !decodeOps(bi) { return none }
-  const out: u8[] = []
-  const moved: i32[] = []
-  const nOps = opOff.length
-  let i = 0
-  while i < nOps {
-    moved.push(opOff[i])
-    moved.push(out.length)
-    const rep = rwRep[i] ?? -1
-    if rep >= 0 {
-      putBytes(out, rwCodes[rep])
-    } else {
-      copyBytes(out, B, opOff[i], opEnd[i] - opOff[i])
-    }
-    const consumed = consume[i] ?? 1
-    const aft = rwAft[i] ?? -1
-    if aft >= 0 { putBytes(out, rwCodes[aft]) }
-    let q = 1
-    while q < consumed && i + q < nOps {
-      moved.push(opOff[i + q])
-      moved.push(out.length)
-      q = q + 1
-    }
-    i = i + consumed
-  }
-  finishBody(bi, h0, out, moved, fault, mv)
+  flatSpliceOps(bi, h0, consume, fault, mv)
 }
 
 // `x` on the stack becomes `x * n`, or `-n` when that would wrap: every index it gives, plus
