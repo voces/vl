@@ -72,7 +72,7 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `comment-measurement-uncited` | INTERNAL | `comment-style.md` rule 1; `comment-budget-baseline.json` | not `std/` — **fired on consumer files** | `compiler/` only |
 | `comment-shouting` | INTERNAL | `comment-style.md` rule 5; `comment-budget-baseline.json` | not `std/` — **fired on consumer files** | `compiler/` only |
 | `comment-history` | INTERNAL | `comment-style.md` rule 3; `comment-budget-baseline.json` | not `std/` — **fired on consumer files** | `compiler/` only |
-| `arena-scan-outside-pass` | INTERNAL | `profiling-the-compiler.md` §Guards; `scripts/scan-budget-baseline.json` (targets: `compiler`, `std`); names the compiler's pass list `asPasses` | **none** | `compiler/` and `std/` |
+| `arena-scan-outside-pass` | INTERNAL | `profiling-the-compiler.md` §Guards; `scripts/scan-budget-baseline.json` (targets: `compiler/entry.vl`, `std`); names the compiler's pass list `asPasses` | **none** | `compiler/` and `std/` |
 | `kind-ladder-incomplete` | INTERNAL | `docs/internals/kind-ladder-lint.md`; `scripts/ladder-budget-baseline.json` (`vl check --budget`, targets `compiler`); closed sets are the compiler's `Node`/`VKind`/… | **none** | `compiler/` only |
 | `kind-ladder-split` | INTERNAL | as above | **none** | `compiler/` only |
 | `sentinel-index-unguarded` | INTERNAL | `docs/internals/sentinel-index-lint.md`; `scripts/sentinel-budget-baseline.json` (`vl check --budget`, targets `compiler`) | **none** | `compiler/` only |
