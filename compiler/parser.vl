@@ -1176,6 +1176,201 @@ function parseMethodMemberTail(fname: string, fm: i32) {
   fname + "(" + inner + "):" + retName
 }
 
+// A `(`-led type atom, through the `)` and any `=> ret`: a function type, told apart by the
+// `=>` after the `)`, or a parenthesized group, kept in the name so the checker's `|` and `&`
+// splitters honour it. Returns the synthetic name; `tm` is the atom's spelling mark.
+function parseParenTypeAtom(tm: i32): string {
+  let name = ""
+  advance() // "("
+  skipNewlines() // a long list may break after `(`, after each `,` and before `)`
+  let inner = ""
+  const pnames: string[] = []
+  const ptoks: i32[] = []
+  if peekKind() != "RPAREN" {
+    inner = parseFnTypeParam(pnames, ptoks)
+    skipNewlines()
+    let pmore = peekKind() == "COMMA"
+    while pmore {
+      advance() // ","
+      skipNewlines()
+      if peekKind() == "RPAREN" {
+        pmore = false // tolerated trailing comma
+      } else {
+        inner = inner + "," + parseFnTypeParam(pnames, ptoks)
+        skipNewlines()
+        pmore = peekKind() == "COMMA"
+      }
+    }
+  }
+  expectClose("RPAREN")
+  const isFunc = peekKind() == "EQUAL" && peek2Kind() == "GT"
+  const pnameText = fnTypeParamNamesText(pnames, ptoks, isFunc)
+  if isFunc {
+    advance() // "="
+    advance() // ">"
+    // The return type extends as far right as it can: `(i32) => i32 | null` is a function
+    // returning `i32 | null`, not a nullable function — parenthesize the function for
+    // that. This grouping is `nameToTy`'s, not a choice: the checker takes a top-level
+    // `=>` as binding looser than `|` and `&` (`parser-notes.md` §"function-type return").
+    const retName = parseTypeName()
+    name = "(" + inner + ")=>" + retName
+    // Kids = the parameter list in order, then the return atom last (it is the
+    // one child every function spelling has; a zero-param `() => T` has only it).
+    // Written parameter names ride `tsText` alone and never reach `name`.
+    tsMk(TS_FUNC, pnameText, tm)
+    if pnameText != "" { tsNoteParamNames() }
+  } else {
+    name = "(" + inner + ")"
+    tsMk(TS_PAREN, "", tm)
+  }
+  name
+}
+
+// A `{`-led type atom, from the `{` through the `}`: an index-signature map `{[K]: V}` or an
+// inline object type whose members may be methods. Returns the synthetic name; `tm` is the
+// atom's spelling mark, closed here as one `TS_MAP` or `TS_OBJ` node.
+function parseBraceTypeAtom(tm: i32): string {
+  let name = ""
+  advance() // "{"
+  if peekKind() == "LBRACK" {
+    // An index-signature map type `{ [K]: V }` (e.g. `{[string]: i32}`). Encoded
+    // as the synthetic name `"{[K]:V}"` — the emitter discriminates a map
+    // annotation by that brace/bracket shape, mirroring how `i32[]` carries its
+    // `[]` suffix, so no separate annotation node is needed.
+    advance() // "["
+    let keyName = ""
+    if peekKind() == "IDENT" {
+      keyName = advance().text
+    } else {
+      expect("IDENT")
+    }
+    expectClose("RBRACK")           // "]"
+    expect("COLON")                 // ":"
+    const valName = parseTypeName() // the value type's name (recurses for nesting)
+    expectClose("RBRACE")           // "}"
+    name = "{[" + keyName + "]:" + valName + "}"
+    // The key is a bare identifier token, not a parsed type, so it stays text
+    // on the node; the one kid is the value spelling.
+    tsMk(TS_MAP, keyName, tm)
+  } else {
+    // An inline object type `{ x: i32, y: string }`, encoded as the synthetic name
+    // `"{x:i32,y:string}"` which the checker splits back into a `TyObj`. A member may also
+    // be a method (`{ toString(): string }`) — the same production, discriminated by the
+    // `(` where a `:` would be. Only a bound can consume one; value position is refused.
+    name = "{"
+    let first = true
+    let fgoing = peekKind() != "RBRACE"
+    const seenNames: string[] = []
+    const seenStarts: i32[] = []
+    while fgoing {
+      const fm = tsMark()
+      const fs0 = peekTok().start
+      let fname = ""
+      if atFieldName() { fname = advance().text } else { expect("IDENT") }
+      let ftyName = ""
+      if peekKind() != "LPAREN" {
+        recFieldSeen(seenNames, seenStarts, fname, fs0)
+      }
+      if peekKind() == "LPAREN" {
+        if !first { name = name + "," }
+        name = name + parseMethodMemberTail(fname, fm)
+        first = false
+        if peekKind() == "COMMA" {
+          advance()
+          fgoing = peekKind() != "RBRACE"
+        } else {
+          fgoing = false
+        }
+        continue
+      }
+      expect("COLON")
+      ftyName = parseTypeName()
+      tsMk(TS_FIELD, fname, fm)
+      if !first { name = name + "," }
+      name = name + fname + ":" + ftyName
+      first = false
+      if peekKind() == "COMMA" {
+        advance()
+        fgoing = peekKind() != "RBRACE"
+      } else {
+        fgoing = false
+      }
+    }
+    expectClose("RBRACE")
+    name = name + "}"
+    tsMk(TS_OBJ, "", tm)
+  }
+  name
+}
+
+// A named type atom: a bare name, a generic application `Box<i32>`, or a body-scoped `type`
+// resolved to its minted base. `inAs` says the atom is a cast target, where a `<` may have
+// meant a comparison. Returns the synthetic name; `tm` is the atom's spelling mark.
+function parseNamedTypeAtom(inAs: boolean, tm: i32): string {
+  let name = ""
+  name = advance().text
+  // D1045 — a block-scoped `type` name resolves here, and this is the only site that has
+  // to: every type-position identifier reaches this atom, so the substitution is total by
+  // the grammar rather than by a list of positions. An unbound name is returned unchanged
+  // and resolves module-wide, keeping an outer `P` visible until a local one shadows it.
+  const btRow = btLookup(name)
+  let capt = ""
+  if btRow >= 0 {
+    name = btBases[btRow]
+    capt = btArgs[btRow]
+  }
+  const head = name // the identifier alone — the name grows a `<…>` below
+  if peekKind() == "LT" && (!inAs || asTargetTakesTypeArgs(head)) {
+    const gtDiag = P.diags.length
+    // A generic-alias application `Box<i32>`; type position has no comparison, so `<` opens
+    // it. One trailing comma is tolerated. `>>`/`>>>` close nested applications through
+    // `expectTypeGt`; while a `>` is banked this list is closed, so the comma after it
+    // belongs to the enclosing list (D2534).
+    advance() // "<"
+    name = name + "<" + parseTypeName()
+    let gmore = atTypeCont("COMMA")
+    while gmore {
+      advance() // ","
+      const gk = peekKind()
+      if gk == "GT" || gk == "SHR" || gk == "USHR" {
+        gmore = false // trailing comma — the `>` closes the list
+      } else {
+        name = name + "," + parseTypeName()
+        gmore = atTypeCont("COMMA")
+      }
+    }
+    expectTypeGt() // ">"
+    // In a cast the `<` may have been meant as a comparison; say how to write that.
+    if inAs && P.diags.length > gtDiag {
+      const gd = P.diags[gtDiag]
+      P.diags[gtDiag] = {
+        msg: gd.msg
+          + " — if `<` compares the cast, parenthesize it: `(x as "
+          + head
+          + ") < y`",
+        at: gd.at,
+      }
+    }
+    // A body-scoped generic alias that also captured the enclosing function's
+    // type parameters takes them as trailing arguments, after its own.
+    if capt != "" {
+      name = name + "," + capt
+      btPushCaptureLeaves(capt)
+    }
+    name = name + ">"
+    tsMk(TS_APP, head, tm)
+  } else if capt != "" {
+    // A body-scoped `type` naming the enclosing `T` is minted as the generic alias
+    // `P$b7<T>`; every reference to it is that application.
+    btPushCaptureLeaves(capt)
+    name = name + "<" + capt + ">"
+    tsMk(TS_APP, head, tm)
+  } else {
+    tsMk(TS_NAME, head, tm)
+  }
+  name
+}
+
 // One type atom: a map `{[K]:V}`, the `null` type, a literal type (`"a"`, `0`, `1.5`), a
 // parenthesized group `(A | B)`, a prefix negation `!A`, or a bare name — each with any
 // number of trailing `[]` suffixes. The union and intersection chains belong to the callers.
@@ -1219,187 +1414,15 @@ function parseTypeAtom() {
     name = advance().text
     tsMk(TS_LITNUM, name, tm)
   } else if peekKind() == "LPAREN" {
-    // Either a function type `(params) => ret`, disambiguated by an `=>` after the `)`, or
-    // a parenthesized group `(A | B)`, kept in the synthetic name so the checker's `|` and
-    // `&` splitters honour the grouping. The paren contents parse as a comma-separated type
-    // list either way.
-    advance() // "("
-    skipNewlines() // a long list may break after `(`, after each `,` and before `)`
-    let inner = ""
-    const pnames: string[] = []
-    const ptoks: i32[] = []
-    if peekKind() != "RPAREN" {
-      inner = parseFnTypeParam(pnames, ptoks)
-      skipNewlines()
-      let pmore = peekKind() == "COMMA"
-      while pmore {
-        advance() // ","
-        skipNewlines()
-        if peekKind() == "RPAREN" {
-          pmore = false // tolerated trailing comma
-        } else {
-          inner = inner + "," + parseFnTypeParam(pnames, ptoks)
-          skipNewlines()
-          pmore = peekKind() == "COMMA"
-        }
-      }
-    }
-    expectClose("RPAREN")
-    const isFunc = peekKind() == "EQUAL" && peek2Kind() == "GT"
-    const pnameText = fnTypeParamNamesText(pnames, ptoks, isFunc)
-    if isFunc {
-      advance() // "="
-      advance() // ">"
-      // The return type extends as far right as it can: `(i32) => i32 | null` is a function
-      // returning `i32 | null`, not a nullable function — parenthesize the function for
-      // that. This grouping is `nameToTy`'s, not a choice: the checker takes a top-level
-      // `=>` as binding looser than `|` and `&` (`parser-notes.md` §"function-type return").
-      const retName = parseTypeName()
-      name = "(" + inner + ")=>" + retName
-      // Kids = the parameter list in order, then the return atom last (it is the
-      // one child every function spelling has; a zero-param `() => T` has only it).
-      // Written parameter names ride `tsText` alone and never reach `name`.
-      tsMk(TS_FUNC, pnameText, tm)
-      if pnameText != "" { tsNoteParamNames() }
-    } else {
-      name = "(" + inner + ")"
-      tsMk(TS_PAREN, "", tm)
-    }
+    name = parseParenTypeAtom(tm)
   } else if peekKind() == "LBRACE" {
-    advance() // "{"
-    if peekKind() == "LBRACK" {
-      // An index-signature map type `{ [K]: V }` (e.g. `{[string]: i32}`). Encoded
-      // as the synthetic name `"{[K]:V}"` — the emitter discriminates a map
-      // annotation by that brace/bracket shape, mirroring how `i32[]` carries its
-      // `[]` suffix, so no separate annotation node is needed.
-      advance() // "["
-      let keyName = ""
-      if peekKind() == "IDENT" {
-        keyName = advance().text
-      } else {
-        expect("IDENT")
-      }
-      expectClose("RBRACK")           // "]"
-      expect("COLON")                 // ":"
-      const valName = parseTypeName() // the value type's name (recurses for nesting)
-      expectClose("RBRACE")           // "}"
-      name = "{[" + keyName + "]:" + valName + "}"
-      // The key is a bare identifier token, not a parsed type, so it stays text
-      // on the node; the one kid is the value spelling.
-      tsMk(TS_MAP, keyName, tm)
-    } else {
-      // An inline object type `{ x: i32, y: string }`, encoded as the synthetic name
-      // `"{x:i32,y:string}"` which the checker splits back into a `TyObj`. A member may also
-      // be a method (`{ toString(): string }`) — the same production, discriminated by the
-      // `(` where a `:` would be. Only a bound can consume one; value position is refused.
-      name = "{"
-      let first = true
-      let fgoing = peekKind() != "RBRACE"
-      const seenNames: string[] = []
-      const seenStarts: i32[] = []
-      while fgoing {
-        const fm = tsMark()
-        const fs0 = peekTok().start
-        let fname = ""
-        if atFieldName() { fname = advance().text } else { expect("IDENT") }
-        let ftyName = ""
-        if peekKind() != "LPAREN" {
-          recFieldSeen(seenNames, seenStarts, fname, fs0)
-        }
-        if peekKind() == "LPAREN" {
-          if !first { name = name + "," }
-          name = name + parseMethodMemberTail(fname, fm)
-          first = false
-          if peekKind() == "COMMA" {
-            advance()
-            fgoing = peekKind() != "RBRACE"
-          } else {
-            fgoing = false
-          }
-          continue
-        }
-        expect("COLON")
-        ftyName = parseTypeName()
-        tsMk(TS_FIELD, fname, fm)
-        if !first { name = name + "," }
-        name = name + fname + ":" + ftyName
-        first = false
-        if peekKind() == "COMMA" {
-          advance()
-          fgoing = peekKind() != "RBRACE"
-        } else {
-          fgoing = false
-        }
-      }
-      expectClose("RBRACE")
-      name = name + "}"
-      tsMk(TS_OBJ, "", tm)
-    }
+    name = parseBraceTypeAtom(tm)
   } else if peekKind() == "NULL" {
     advance() // `null` is a valid union member type
     name = "null"
     tsMk(TS_NULL, "null", tm)
   } else if peekKind() == "IDENT" {
-    name = advance().text
-    // D1045 — a block-scoped `type` name resolves here, and this is the only site that has
-    // to: every type-position identifier reaches this atom, so the substitution is total by
-    // the grammar rather than by a list of positions. An unbound name is returned unchanged
-    // and resolves module-wide, keeping an outer `P` visible until a local one shadows it.
-    const btRow = btLookup(name)
-    let capt = ""
-    if btRow >= 0 {
-      name = btBases[btRow]
-      capt = btArgs[btRow]
-    }
-    const head = name // the identifier alone — the name grows a `<…>` below
-    if peekKind() == "LT" && (!inAs || asTargetTakesTypeArgs(head)) {
-      const gtDiag = P.diags.length
-      // A generic-alias application `Box<i32>`; type position has no comparison, so `<` opens
-      // it. One trailing comma is tolerated. `>>`/`>>>` close nested applications through
-      // `expectTypeGt`; while a `>` is banked this list is closed, so the comma after it
-      // belongs to the enclosing list (D2534).
-      advance() // "<"
-      name = name + "<" + parseTypeName()
-      let gmore = atTypeCont("COMMA")
-      while gmore {
-        advance() // ","
-        const gk = peekKind()
-        if gk == "GT" || gk == "SHR" || gk == "USHR" {
-          gmore = false // trailing comma — the `>` closes the list
-        } else {
-          name = name + "," + parseTypeName()
-          gmore = atTypeCont("COMMA")
-        }
-      }
-      expectTypeGt() // ">"
-      // In a cast the `<` may have been meant as a comparison; say how to write that.
-      if inAs && P.diags.length > gtDiag {
-        const gd = P.diags[gtDiag]
-        P.diags[gtDiag] = {
-          msg: gd.msg
-            + " — if `<` compares the cast, parenthesize it: `(x as "
-            + head
-            + ") < y`",
-          at: gd.at,
-        }
-      }
-      // A body-scoped generic alias that also captured the enclosing function's
-      // type parameters takes them as trailing arguments, after its own.
-      if capt != "" {
-        name = name + "," + capt
-        btPushCaptureLeaves(capt)
-      }
-      name = name + ">"
-      tsMk(TS_APP, head, tm)
-    } else if capt != "" {
-      // A body-scoped `type` naming the enclosing `T` is minted as the generic alias
-      // `P$b7<T>`; every reference to it is that application.
-      btPushCaptureLeaves(capt)
-      name = name + "<" + capt + ">"
-      tsMk(TS_APP, head, tm)
-    } else {
-      tsMk(TS_NAME, head, tm)
-    }
+    name = parseNamedTypeAtom(inAs, tm)
   } else {
     expect("IDENT")
     // The recovery leaf for the `""` name this arm returns — pushed so the atom
@@ -2537,6 +2560,97 @@ function parseLet() {
   ix
 }
 
+// A generic alias's parameter list after its `<`, through the `>`: each name is pushed onto
+// `gpNames`, and the result is `base` with the list folded in (`Box<T>`).
+function parseTypeDeclTyParams(base: string, gpNames: string[]): string {
+  let name = base
+  name = name + "<"
+  let tfirst = true
+  let tgoing = peekKind() == "IDENT"
+  while tgoing {
+    if !tfirst { name = name + "," }
+    const tpn = advance().text
+    name = name + tpn
+    gpNames.push(tpn)
+    tfirst = false
+    if peekKind() == "COMMA" {
+      advance()
+      tgoing = peekKind() == "IDENT"
+    } else {
+      tgoing = false
+    }
+  }
+  expectClose("GT") // ">"
+  name = name + ">"
+  name
+}
+
+// A body-scoped declaration's generic name: the captured parameters `caps` are appended to
+// `gpNames` after the declaration's own, and the result is `mangled<…>` over all of them.
+function btCapturedGenericName(
+  mangled: string,
+  caps: string[],
+  gpNames: string[],
+): string {
+  let ci = 0
+  while ci < caps.length {
+    gpNames.push(caps[ci])
+    ci = ci + 1
+  }
+  let name = mangled + "<"
+  let ni = 0
+  while ni < gpNames.length {
+    if ni > 0 { name = name + "," }
+    name = name + gpNames[ni]
+    ni = ni + 1
+  }
+  name + ">"
+}
+
+// The recovery for a bodyless `type N`: reported once at the name, and minted as the sentinel
+// `TypeDecl` (`tdFields == [-1]`) the checker registers as an error type. Returns its index.
+function parseTypeDeclBodyless(
+  name: string,
+  nameTok: i32,
+  p0: i32,
+  gpBase: string,
+  gpNames: string[],
+): i32 {
+  P.diags.push(
+    {
+      msg: "A type alias requires a body; write `type "
+        + name
+        + " = …` to define `"
+        + name
+        + "`",
+      at: nameTok,
+    },
+  )
+  const bodyless: i32[] = []
+  bodyless.push(-1)
+  const blix = mkTypeDecl(name, bodyless, p0, 0, 0)
+  if gpBase != "" { setDeclGp(blix, gpBase, gpNames) }
+  mkDeclNameTok(blix, nameTok)
+  btNoteDecl(blix)
+  blix
+}
+
+// The contextual `new` after a type declaration's `=`: 1 when the body is a nominal newtype
+// (`= new i32`), else 0. Only a `new` followed by a token a body can start with counts.
+function parseTypeDeclNewMarker(): i32 {
+  let isNew = 0
+  if peekKind() == "IDENT" {
+    if peekTok().text == "new" {
+      const k2 = peek2Kind()
+      if k2 == "IDENT" || k2 == "LBRACE" || k2 == "LPAREN" {
+        advance()
+        isNew = 1
+      }
+    }
+  }
+  isNew
+}
+
 // A struct type declaration `type N = { field: type, … }`; fields are comma-separated with a
 // tolerated trailing comma, and `tdFields` are the `FieldDef` indices in order. `flatAt` is
 // the source offset of a preceding `flat` modifier, or -1, and doubles as the declaration's
@@ -2563,24 +2677,7 @@ function parseTypeDecl(flatAt: i32) {
   if peekKind() == "LT" {
     advance() // "<"
     gpBase = name
-    name = name + "<"
-    let tfirst = true
-    let tgoing = peekKind() == "IDENT"
-    while tgoing {
-      if !tfirst { name = name + "," }
-      const tpn = advance().text
-      name = name + tpn
-      gpNames.push(tpn)
-      tfirst = false
-      if peekKind() == "COMMA" {
-        advance()
-        tgoing = peekKind() == "IDENT"
-      } else {
-        tgoing = false
-      }
-    }
-    expectClose("GT") // ">"
-    name = name + ">"
+    name = parseTypeDeclTyParams(name, gpNames)
   }
   // D1045 — a body-scoped declaration is minted unique, and the scope row goes in before the
   // body is parsed. `btDepth > 0` is "inside a block", the parser's own nesting rather than a
@@ -2597,20 +2694,8 @@ function parseTypeDecl(flatAt: i32) {
       // Declared generic, or made generic by capture: the captured parameters are
       // appended after the declaration's own, which is the order every reference
       // spells them in (`parseTypeAtom`).
-      let ci = 0
-      while ci < caps.length {
-        gpNames.push(caps[ci])
-        ci = ci + 1
-      }
       gpBase = mangled
-      name = mangled + "<"
-      let ni = 0
-      while ni < gpNames.length {
-        if ni > 0 { name = name + "," }
-        name = name + gpNames[ni]
-        ni = ni + 1
-      }
-      name = name + ">"
+      name = btCapturedGenericName(mangled, caps, gpNames)
     } else {
       name = mangled
     }
@@ -2626,23 +2711,7 @@ function parseTypeDecl(flatAt: i32) {
   // does not cascade either.
   const eqHere = peekKind() == "EQUAL"
   if !eqHere {
-    P.diags.push(
-      {
-        msg: "A type alias requires a body; write `type "
-          + name
-          + " = …` to define `"
-          + name
-          + "`",
-        at: nameTok,
-      },
-    )
-    const bodyless: i32[] = []
-    bodyless.push(-1)
-    const blix = mkTypeDecl(name, bodyless, p0, 0, 0)
-    if gpBase != "" { setDeclGp(blix, gpBase, gpNames) }
-    mkDeclNameTok(blix, nameTok)
-    btNoteDecl(blix)
-    return blix
+    return parseTypeDeclBodyless(name, nameTok, p0, gpBase, gpNames)
   }
   expect("EQUAL")
   // A long body may start on the next line (`type Tag =` then the members, one per line).
@@ -2651,16 +2720,7 @@ function parseTypeDecl(flatAt: i32) {
   // the checker and erased at emit. `new` is a contextual keyword recognized only here, one
   // token of lookahead, so it stays a legal identifier everywhere else. The guard is the
   // second token: `type N = new` alone still means an alias of the type named `new`.
-  let isNew = 0
-  if peekKind() == "IDENT" {
-    if peekTok().text == "new" {
-      const k2 = peek2Kind()
-      if k2 == "IDENT" || k2 == "LBRACE" || k2 == "LPAREN" {
-        advance()
-        isNew = 1
-      }
-    }
-  }
+  const isNew = parseTypeDeclNewMarker()
   // D1045: mark the scope row as having a value-position spelling, so a `TV.size`
   // fold renames with its annotation (`btValueName`). Read here rather than at the
   // push because `new` sits after the `=`, and the row has to exist before the

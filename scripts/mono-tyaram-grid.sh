@@ -20,6 +20,12 @@
 # alias-application cells used a SCALAR-bodied alias (`{ v: X }`) where the hole needs an
 # ARRAY-bodied one (`{ v: X[] }`), so it was blind to the very bug it was written for.
 #
+# THE GATE NO LONGER RUNS THIS SCRIPT. Its 261 cells are the distilled corpus's
+# `mono-tyaram` named set (`scripts/silent-sweep/distilled/named/mty_*.vl`), a FLOOR set in
+# `regress.vl`: a runs cell that stops running blocks, and so does a loud cell that goes
+# silent, which is this grid's BAD and slightly more (a wrong value, any compiler trap).
+# This script stays as the on-demand and sabotage instrument for the class.
+#
 # The constructor list GREW once, and should grow again the same way: the original twelve
 # reported 0 BAD while `{[string]: T}` — a map whose VALUE is a type parameter — was
 # check-clean invalid wasm and had been since long before the programme. A grid is only ever
