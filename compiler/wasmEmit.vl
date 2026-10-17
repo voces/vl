@@ -77,6 +77,7 @@ import {
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
   tyIsNulValueUnionBox,
+  tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyIsPrimIx,
   tyIsRecord,
@@ -867,6 +868,7 @@ import {
   letIsNulString,
   letMapShapeOf,
   letNulBool,
+  letNulLitUnion,
   letNulMapReadUnionBox,
   letUnionNameOf,
   listIsRecvTyOf,
@@ -1001,6 +1003,7 @@ import {
   printUnionPlan,
 } from "./emit_fn_scans"
 import {
+  chainHasPrelude,
   exprIsNullLike,
   ifChainAllBareNull,
   ifLinkYieldsNull,
@@ -1375,7 +1378,6 @@ import {
 } from "./emit_mono"
 import {
   armPreludeBindChain,
-  chainHasPrelude,
   declSlotPinned,
   firstLocalDeclIn,
   rvPairOf,
@@ -18650,6 +18652,11 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
       return emitIfExprAs(body, wideIx, fnIx, 127)
     }
   }
+  // …and its nullable twin: a `K | null` place held as a nullable string reaches the niche as
+  // `-1` or the present string's id (D5431).
+  if pendingNulLitUnion && nulStrReppedNulLitPlace(exprIx, fnIx) {
+    return emitNulStrToNulAtom(body, unwrapParen(exprIx), fnIx)
+  }
   // …and a `K | null` read out of a wider box, reaching the atom niche (D3118).
   if pendingNulLitUnion {
     const nlk = narrowedNulLitBoxKey(exprIx, fnIx)
@@ -18841,14 +18848,17 @@ function ifJoinLeavesAtomic(ix: i32, fnIx: i32): boolean {
   false
 }
 
-// Whether arm value `ix` is `null`, a string literal, or of literal-union type; an arm whose
-// value is another `if` is one when that join's leaves are.
+// Whether arm value `ix` is `null`, a string literal, of literal-union type, or a nullable string
+// typed `K | null`, which converts to the niche; an arm whose value is another `if` is one when
+// that join's leaves are.
 function atomicJoinLeaf(ix: i32, fnIx: i32): boolean {
   const u = unwrapParen(ix)
   if u < 0 { return false }
   if exprIsNullLike(u) || P.nodes[u] is StrLit { return true }
   if P.nodes[u] is IfStmt { return ifJoinLeavesAtomic(u, fnIx) }
-  exprIsLitAtom(u, fnIx) || strReppedLitUnionAt(u, fnIx)
+  exprIsLitAtom(u, fnIx)
+    || strReppedLitUnionAt(u, fnIx)
+    || nulStrReppedNulLitPlace(u, fnIx)
 }
 
 // Whether any arm of the if-expression at `ifIx` binds a local its tail could name; when so,
@@ -28686,6 +28696,9 @@ function letInitCtxOf(s: LetDecl, stmtIx: i32, fnIx: i32, slot: i32): ExpCtx {
   const ctx = expCtxHere()
   ctx.listKind = letLb.lbKind
   ctx.listSlot = letLb.lbSlot
+  // The `K | null` niche is the binding's own (seeded on the plain path), never that of a join
+  // whose arm prelude this binding is (D5430).
+  ctx.nulLitUnion = false
   // a kind-18 nullable ref-array binding: the list seeds above build the non-null list,
   // this seeds the null arm — the #964 seed-leak gate at the binding boundary.
   if localIsRef[slot] == "nulreflist" {
@@ -28819,7 +28832,10 @@ function emitLetPlainInit(
       valCtx.litUnion = 1
       valCtx.nulLitUnion = true
     }
-  } else if narrowedNulLitBoxKey(s.letInit, fnIx) != "" {
+  } else if (
+    narrowedNulLitBoxKey(s.letInit, fnIx) != ""
+    || letNulLitUnion(stmtIx, fnIx)
+  ) {
     // The un-annotated twin: the niche cell `letNulLitUnion` gave it converts the box (D3118).
     valCtx.litUnion = 1
     valCtx.nulLitUnion = true
@@ -32785,6 +32801,61 @@ function emitStrToAtomChain(
   if emitStrToAtomChain(body, ix, texts, i + 1, fnIx) < 0 { return -1 }
   // cond = (the value string-equals this member)
   if emitExpr(body, ix, fnIx) < 0 { return -1 }
+  if emitStrEqLit(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
+  fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
+  0
+}
+
+// Whether `ix` is a re-readable place typed `K | null`, for string literals `K`, whose value
+// is held as a nullable string rather than the atom niche.
+function nulStrReppedNulLitPlace(ix: i32, fnIx: i32): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || !unionEqOperandOk(u) { return false }
+  if P.nodes[u] is StrLit || exprIsLitAtom(u, fnIx) { return false }
+  if !tyIsNullableLitUnion(nodeUnwidenedTyOf(u)) { return false }
+  if exprNulLitUnion(u, fnIx) { return false }
+  exprNullableString(u, fnIx)
+}
+
+// The `K | null` niche of nullable-string place `ix`: `-1` when it is null, else the id of the
+// member it string-equals, the last member the default.
+function emitNulStrToNulAtom(body: u8[], ix: i32, fnIx: i32) {
+  const texts = nulLitMemberTexts(nodeUnwidenedTyOf(ix))
+  if texts.length == 0 {
+    return emitFail("emitProgram: literal-union atom narrowing with no members")
+  }
+  const outer = expCtxHere()
+  const raw = expCtxHere()
+  raw.litUnion = 0
+  raw.nulLitUnion = false
+  raw.nulString = true
+  expCtxApply(raw)
+  let rc = emitExpr(body, ix, fnIx)
+  if rc >= 0 {
+    fbRefIsNull()
+    fbIf(127) // if (result i32)
+    fbI32Const(-1)
+    fbElse()
+    rc = emitNulStrToAtomChain(body, ix, texts, 0, fnIx)
+    fbEnd()
+  }
+  expCtxApply(outer)
+  rc
+}
+
+// `emitStrToAtomChain` over a nullable-string place already tested non-null.
+function emitNulStrToAtomChain(
+  body: u8[],
+  ix: i32,
+  texts: string[],
+  i: i32,
+  fnIx: i32,
+) {
+  fbI32Const(internAtom(quoteLex(texts[i])))
+  if i >= texts.length - 1 { return 0 }
+  if emitNulStrToAtomChain(body, ix, texts, i + 1, fnIx) < 0 { return -1 }
+  if emitExpr(body, ix, fnIx) < 0 { return -1 }
+  fbRefAsNonNull()
   if emitStrEqLit(body, mkStr(quoteLex(texts[i]), -1), fnIx) < 0 { return -1 }
   fbSelect() // 0x1b select — val1 if cond else val2 (both i32)
   0
