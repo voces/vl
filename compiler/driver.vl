@@ -226,6 +226,8 @@ import {
   ovSiteAdd,
   paramDefaultIsCallsite,
   paramDefaultTablesReset,
+  parseFlagsMerge,
+  parseFlagsTake,
   recDupField,
   setCallSiteLoc,
   setDeclGpBase,
@@ -1726,6 +1728,35 @@ export function cwdCommit(): i32 {
   0
 }
 let vlCwd = ""
+
+// Each module's project root, as the host found it from the module's own path (the nearest
+// ancestor holding `deno.json`, `package.json` or `.git`), keyed by the module key the host
+// read. "" when no ancestor holds one. `modIdKeyOf` hashes the path relative to it (D5760).
+// Kept across `modReset`: a file's root does not depend on the graph it is read into.
+const mrKeyAcc = cpAccNew()
+const mrDirAcc = cpAccNew()
+const modRootOfKey: {[string]: string} = Map()
+export function modRootKeyPush(c: i32): i32 {
+  cpAccPush(mrKeyAcc, c)
+  0
+}
+export function modRootKeyLoad(count: i32): i32 {
+  cpAccLoad(mrKeyAcc, count)
+  0
+}
+export function modRootDirPush(c: i32): i32 {
+  cpAccPush(mrDirAcc, c)
+  0
+}
+export function modRootDirLoad(count: i32): i32 {
+  cpAccLoad(mrDirAcc, count)
+  0
+}
+export function modRootCommit(): i32 {
+  const key = cpAccTake(mrKeyAcc)
+  modRootOfKey[key] = cpAccTake(mrDirAcc)
+  0
+}
 
 // The file being checked, RAW (not relativized) — a bare compile with no imports never
 // populates `modKeys`, so this is the only way `checkMemSharedOrigin` (D2355) learns
@@ -3857,16 +3888,18 @@ function modNormalize(path: string): string {
   if absolute { return "/" + out }
   out
 }
-// The key a module's stable id hashes: a `std:` key as written, else the normalised path,
-// relative to the staged working directory when it lies under it, so one file named absolute
-// or relative gets one id.
+// The key a module's stable id hashes: a `std:` key as written, else the normalised path
+// relative to the module's staged project root, or absolute when it has none. A host that
+// stages no root gets the path relative to the staged working directory.
 function modIdKeyOf(key: string): string {
   if modKeyIsStd(key) { return key }
   let abs = key
   if !modSpecAbsolute(key) && vlCwd.length > 0 { abs = vlCwd + "/" + key }
   abs = modNormalize(abs)
-  if vlCwd.length == 0 { return abs }
+  const root = modRootOfKey[key]
   let p = vlCwd
+  if root != null { p = root }
+  if p.length == 0 { return abs }
   if p[p.length - 1] != '/' { p = p + "/" }
   if abs.length > p.length && abs.slice(0, p.length) == p {
     return abs.slice(p.length, abs.length)
@@ -4770,8 +4803,11 @@ function modCompile(emit: i32): i32 {
     // banked outside the arena, so it cannot carry a token the merge could read it off later.
     externSetMod(m)
     vcLoadToksMod(m)
+    // A module's image carries the parse flags it set itself; the earlier modules' merge back after.
+    const flagsBefore = parseFlagsTake()
     roots.push(parseProgram())
     if piSpan.length > 0 { parseImageClose(piSpan, modIdKeyOf(modKeys[m])) }
+    parseFlagsMerge(flagsBefore)
     o = o + 1
   }
   vcLoadMod = 0
