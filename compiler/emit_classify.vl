@@ -1090,9 +1090,10 @@ import {
   sidText,
 } from "./symbols"
 import { arrElemNameRaw, nameIsArray, peelGroupParens } from "./tyname"
-import { substTyDeep, tvWriteLandTy } from "./check_relate_core"
+import { assignable, substTyDeep, tvWriteLandTy } from "./check_relate_core"
 import {
   flattenVariantsInto,
+  isNullTy,
   nonNullTy,
   tyEmitPrimOf,
   tyHasTyVar,
@@ -7682,6 +7683,9 @@ function narrowIsElse(
   // claim the narrow, leaving no atom to unbox to. An `Ident` receiver reaches this rung
   // either way, so the order only decides a place's answer (D1729).
   if litElseNarrow(isObj, variant) { return true }
+  // A literal that alone holds its scalar rules that scalar out of the box (D5890).
+  const latom = litElseAtom(isObj, variant)
+  if latom != "" { return narrowIsElse(isObj, latom, condIx, fnIx) }
   // The index dual of the member complement below: the else of `xs[0] is T` subtracts
   // `T` from the cell's set, unboxing `match xs[0] { null => … T => … }`'s second arm.
   if mrecv is Index {
@@ -8137,6 +8141,38 @@ function litElseNarrow(objIx: i32, variant: string): boolean {
     }
   }
   false
+}
+
+// The scalar a failed `x is L` rules out of a bare name's box, or "": `L` is a member of the
+// declared type that no other member admits and the only one lowering to its scalar, so
+// `"a" | i32 | null` keeps `i32 | null` and `"a" | "b" | i32` keeps its set (D5890).
+function litElseAtom(objIx: i32, variant: string): string {
+  const ox = unwrapParen(objIx)
+  if !(P.nodes[ox] is Ident) { return "" }
+  let uty = nodeTyIxOf(ox)
+  if uty < 0 { return "" }
+  const puty = pinnedHoleTyOf(uty)
+  if puty >= 0 { uty = puty }
+  const vars: i32[] = []
+  flattenVariantsInto(uty, vars)
+  let hit = -1
+  for m in vars {
+    const lex = tyLitSetMemberLexes(m)
+    if lex.length == 1 && lex[0] == variant && T.tys[m] is TyLit {
+      if hit >= 0 { return "" }
+      hit = m
+    }
+  }
+  if hit < 0 { return "" }
+  const atom = primNameStr(tyEmitPrimOf(hit))
+  if atom == "" { return "" }
+  for m in vars {
+    if m != hit && !isNullTy(m) {
+      if assignable(hit, m) { return "" }
+      if primNameStr(tyEmitPrimOf(m)) == atom { return "" }
+    }
+  }
+  atom
 }
 
 // The else-branch dual of `setNarrowFromCond`, for value unions only: on a failed guard,
