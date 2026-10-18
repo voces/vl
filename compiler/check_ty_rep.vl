@@ -164,48 +164,52 @@ function unionArmBoxSafeIn(tyIx: i32, seen: i32[]): boolean {
   while i < ftys.length {
     if ftys[i] < 0 { return false }
     const ft = T.tys[ftys[i]]
-    if ft is TyPrim {
+    match ft {
       // scalar / string / boolean field — boxes cleanly
-    } else if ft is TyObj {
-      if !unionArmBoxSafeIn(ftys[i], seen) { return false }
-    } else if tyIsLitUnion(ftys[i]) {
-      // A literal-union field (`f: K0`) boxes as its interned i32 atom: the variant tables record
-      // the union name (`uFieldElemName`, the `sFieldElemName` twin) and the variant construct path
-      // lowers a member literal as its atom id — the same rep the plain struct field carries.
-    } else if ft is TyLit && ft.litKind == "str" {
-      // A one-member inline literal field (`kind: "circle"`) — the discriminated-union tag, written
-      // the way every other typed language spells it. It is not the litunion arm above, which
-      // requires a `TyUnion`. It boxes as a plain string field rather than an atom, because that is
-      // the rep a bare literal annotation already has, so this arm claims no new emitter capability.
-    } else if numLitUnionHasBase(ftys[i]) {
-      // A numeric literal tag — `kind: 0`, `kind: 1.5`, or a named numeric litunion. The string arm
-      // above admits its family through `tyIsLitUnion`, which is string-only by construction. It
-      // boxes as its base scalar, the same rep a plain `kind: i32` / `kind: f64` field has. Two arms
-      // differing only by a numeric tag arrive distinguished, `variantFieldIdText` recording every `TyLit`.
-    } else if T.tys[ftys[i]] is TyFunc {
+      TyPrim => {}
+      TyObj => {
+        if !unionArmBoxSafeIn(ftys[i], seen) { return false }
+      }
+      TyLit => {
+        // A one-member inline literal field (`kind: "circle"`) is the discriminated-union tag. It
+        // boxes as a plain string field rather than an atom, the rep a bare literal annotation
+        // already has; a numeric tag (`kind: 0`, `kind: 1.5`) boxes as its base scalar.
+        if ft.litKind != "str" && !numLitUnionHasBase(ftys[i]) { return false }
+      }
+      TyUnion => {
+        // A literal-union field (`f: K0`) boxes as its interned i32 atom: the variant tables record
+        // the union name (`uFieldElemName`, the `sFieldElemName` twin) and the variant construct path
+        // lowers a member literal as its atom id — the same rep the plain struct field carries.
+        if tyIsLitUnion(ftys[i]) {
+        } else if numLitUnionHasBase(ftys[i]) {
+          // A named numeric litunion boxes as its base scalar, the same rep a plain `kind: i32` /
+          // `kind: f64` field has. Two arms differing only by a numeric tag arrive distinguished,
+          // `variantFieldIdText` recording every `TyLit`.
+        } else {
+          // A value-union field (`f: i32 | string`) is the field's union box, the same one a plain
+          // struct literal builds; it boxes when every member does (D4601).
+          for m in ft.uMembers { ftys.push(m) }
+        }
+      }
       // A bare function-typed field (`f: (i32) => K0`) boxes as the closure fat-pointer (code 14):
       // the variant construct passes the lambda through and the narrowed member call routes to
       // `call_ref`. A nullable closure field stays out, its arm rep being unproven here.
-    } else if ft is TyNullable {
+      TyFunc => {}
       // A nullable field (`f: i32 | null`, `f: K0 | null`, `f: Bi | null`) has the rep the plain
       // struct field already carries, so it boxes whenever its inner type does (D4601).
-      ftys.push(ft.nInner)
-    } else if ft is TyUnion {
-      // A value-union field (`f: i32 | string`) is the field's union box, the same one a plain
-      // struct literal builds; it boxes when every member does (D4601).
-      for m in ft.uMembers { ftys.push(m) }
-    } else if ft is TyArray {
+      TyNullable => ftys.push(ft.nInner)
       // A list field (`xs: i32[]`, `ps: P[]`, `ss: string[]`): one reference slot in the arm's
       // struct, exactly as a nested `TyObj` field is. The variant box holds a ref to the arm struct
       // and the arm struct a ref to the array, so the element rep is not something the variant needs
       // to know — which is why there is no recursion into `aElem`. An empty hole is still one slot.
-    } else if ft is TyMap {
-      // A map or set field (`m: {[string]: V}`, `m: {[i32]: V}`). Same argument as the list arm
-      // above and graded the same way: the rep is present, and the refusal is the arm-pick's alone.
-      // Neither key spelling has anything to do with it — a plain list field fails identically, all
-      // of them falling to this function's closing `return false`.
-    } else {
-      return false
+      TyArray => {}
+      // A map or set field (`m: {[string]: V}`, `m: {[i32]: V}`): the same argument as the list
+      // arm above; the rep is present, and any refusal is the arm-pick's alone.
+      TyMap => {}
+      // A negation, an unbound parameter or an error type has no box rep.
+      TyNeg | TyVar | TyErr => {
+        return false
+      }
     }
     i = i + 1
   }
@@ -512,29 +516,29 @@ export function elemStoreClassOf(ty: i32, depth: i32): i32 {
   }
   if tyIsLitUnion(ty) { return ESC_ATOM }
   const t = T.tys[ty]
-  if t is TyPrim {
-    const p = t.primName
-    if p == "i32" { return ESC_I32 }
-    if p == "i64" { return ESC_I64 }
-    if p == "f32" { return ESC_F32 }
-    if p == "f64" { return ESC_F64 }
-    if p == "boolean" { return ESC_BOOL }
-    if p == "string" { return ESC_STRING }
-    return ESC_UNKNOWN
+  match t {
+    TyPrim => {
+      const p = t.primName
+      if p == "i32" { return ESC_I32 }
+      if p == "i64" { return ESC_I64 }
+      if p == "f32" { return ESC_F32 }
+      if p == "f64" { return ESC_F64 }
+      if p == "boolean" { return ESC_BOOL }
+      if p == "string" { return ESC_STRING }
+      ESC_UNKNOWN
+    }
+    TyObj | TyArray | TyMap | TyFunc => ESC_REF
+    TyNullable => {
+      if tyPrintsAsRef(t.nInner, 8) { return ESC_REF }
+      ESC_BOX
+    }
+    TyUnion => {
+      if tyPrintsAsRef(ty, 8) { return ESC_REF }
+      ESC_BOX
+    }
+    // No storage class is known for these element types.
+    TyNeg | TyVar | TyLit | TyErr => ESC_UNKNOWN
   }
-  if t is TyObj { return ESC_REF }
-  if t is TyArray { return ESC_REF }
-  if t is TyMap { return ESC_REF }
-  if t is TyFunc { return ESC_REF }
-  if t is TyNullable {
-    if tyPrintsAsRef(t.nInner, 8) { return ESC_REF }
-    return ESC_BOX
-  }
-  if t is TyUnion {
-    if tyPrintsAsRef(ty, 8) { return ESC_REF }
-    return ESC_BOX
-  }
-  ESC_UNKNOWN
 }
 
 // Whether a map value `se` delivered as `de` changes storage though both store as references:
@@ -691,27 +695,27 @@ export function tyBoxesV128(t: i32, d: i32): boolean {
 export function retAtomsCheap(er: i32) {
   if er < 0 { return true }
   const t = T.tys[er]
-  if t is TyUnion {
-    let i = 0
-    while i < t.uMembers.length {
-      if !retAtomsCheap(t.uMembers[i]) { return false }
-      i = i + 1
+  match t {
+    TyUnion => {
+      let i = 0
+      while i < t.uMembers.length {
+        if !retAtomsCheap(t.uMembers[i]) { return false }
+        i = i + 1
+      }
+      true
     }
-    return true
+    TyNullable => retAtomsCheap(t.nInner)
+    TyPrim | TyLit | TyVar | TyErr => true
+    TyArray => {
+      // Only a prim-element list renders short AND can classify (`i32[]`, `string[]`);
+      // a composite-element list (`S[]`, `i32[][]`) renders big and always declines.
+      if t.aElem < 0 { return true }
+      const et = T.tys[t.aElem]
+      et is TyPrim
+    }
+    // A composite leaf renders to a `-1`-kind atom.
+    TyObj | TyFunc | TyMap | TyNeg => false
   }
-  if t is TyNullable { return retAtomsCheap(t.nInner) }
-  if t is TyPrim { return true }
-  if t is TyLit { return true }
-  if t is TyVar { return true }
-  if t is TyErr { return true }
-  if t is TyArray {
-    // Only a prim-element list renders short AND can classify (`i32[]`, `string[]`);
-    // a composite-element list (`S[]`, `i32[][]`) renders big and always declines.
-    if t.aElem < 0 { return true }
-    const et = T.tys[t.aElem]
-    return et is TyPrim
-  }
-  false
 }
 
 // The value-atom kind of one leaf of an inferred return type — the structural dual of
@@ -721,34 +725,37 @@ export function retAtomsCheap(er: i32) {
 function retAtomKindOf(er: i32) {
   if er < 0 { return -1 }
   const t = T.tys[er]
-  if t is TyPrim { return valueAtomKind(t.primName) }
-  if t is TyArray {
-    if t.aElem < 0 { return -1 }
-    const et = T.tys[t.aElem]
-    if et is TyPrim {
-      const en = et.primName
-      // `i32[]` / `boolean[]` are matched by exact name AHEAD of `valueAtomKind`'s
-      // litunion-array arm; the other list atoms sit BEHIND it, so a declared litunion
-      // alias spelled like a primitive would claim them — ask the same question here.
-      if en == "i32" { return 7 }
-      if en == "boolean" { return 17 }
-      if nameIsLitUnionType(en) { return 7 }
-      if en == "f64" { return 8 }
-      if en == "string" { return 9 }
-      if en == "i64" { return 10 }
-      if en == "f32" { return 12 }
+  match t {
+    TyPrim => valueAtomKind(t.primName)
+    TyArray => {
+      if t.aElem < 0 { return -1 }
+      const et = T.tys[t.aElem]
+      if et is TyPrim {
+        const en = et.primName
+        // `i32[]` / `boolean[]` are matched by exact name AHEAD of `valueAtomKind`'s
+        // litunion-array arm; the other list atoms sit BEHIND it, so a declared litunion
+        // alias spelled like a primitive would claim them — ask the same question here.
+        if en == "i32" { return 7 }
+        if en == "boolean" { return 17 }
+        if nameIsLitUnionType(en) { return 7 }
+        if en == "f64" { return 8 }
+        if en == "string" { return 9 }
+        if en == "i64" { return 10 }
+        if en == "f32" { return 12 }
+      }
+      -1
     }
-    return -1
-  }
-  if t is TyVar {
-    // An inference hole renders `any` — never an atom; a declared type param carries its
-    // own source name, which classifies exactly as the rendered atom would.
-    if t.tvName.length > 0 {
-      if t.tvName[0] == '?' { return -1 }
+    TyVar => {
+      // An inference hole renders `any` — never an atom; a declared type param carries its
+      // own source name, which classifies exactly as the rendered atom would.
+      if t.tvName.length > 0 {
+        if t.tvName[0] == '?' { return -1 }
+      }
+      valueAtomKind(t.tvName)
     }
-    return valueAtomKind(t.tvName)
+    // Every other leaf renders to a name `valueAtomKind` rejects.
+    TyFunc | TyObj | TyUnion | TyNullable | TyMap | TyNeg | TyLit | TyErr => -1
   }
-  -1
 }
 
 // Push the value-atom KIND of every leaf of `er`, in `collectRetAtoms` order — `6` (the
@@ -1036,40 +1043,43 @@ export function tyIsI32SentinelNullable(ty: i32): boolean {
 export function nulNumLitUnionBaseName(ty: i32): string {
   if ty < 0 { return "" }
   const t = T.tys[ty]
-  // The two-part spelling: `TyNullable` over a homogeneous numeric litunion.
-  if t is TyNullable { return numLitUnionBaseName(t.nInner) }
-  if t is TyUnion {
-    if t.uMembers.length < 2 { return "" }
-    let sawNull = false
-    let base = -1
-    let i = 0
-    while i < t.uMembers.length {
-      const m = T.tys[t.uMembers[i]]
-      if m is TyPrim {
-        if m.primName != "null" { return "" }
-        sawNull = true
-      } else if m is TyLit {
-        if m.litKind == "str" { return "" }
-        // The per-member soften and one-base requirement mirror `softenLitTy`'s union arm minus
-        // its all-`TyLit` precondition; a mixed-width member set (`1 | 2.5 | null`) answers "".
-        const b = litBaseTy(m)
-        if base < 0 { base = b }
-        else if base != b { return "" }
-      } else {
-        return "" // a non-literal non-null member is an ordinary heterogeneous box
+  match t {
+    // The two-part spelling: `TyNullable` over a homogeneous numeric litunion.
+    TyNullable => numLitUnionBaseName(t.nInner)
+    TyUnion => {
+      if t.uMembers.length < 2 { return "" }
+      let sawNull = false
+      let base = -1
+      let i = 0
+      while i < t.uMembers.length {
+        const m = T.tys[t.uMembers[i]]
+        if m is TyPrim {
+          if m.primName != "null" { return "" }
+          sawNull = true
+        } else if m is TyLit {
+          if m.litKind == "str" { return "" }
+          // The per-member soften and one-base requirement mirror `softenLitTy`'s union arm minus
+          // its all-`TyLit` precondition; a mixed-width member set (`1 | 2.5 | null`) answers "".
+          const b = litBaseTy(m)
+          if base < 0 { base = b }
+          else if base != b { return "" }
+        } else {
+          return "" // a non-literal non-null member is an ordinary heterogeneous box
+        }
+        i = i + 1
       }
-      i = i + 1
+      if !sawNull { return "" }
+      if base < 0 { return "" }
+      const bt = T.tys[base]
+      if bt is TyPrim {
+        const bn = bt.primName
+        if bn == "i32" || bn == "i64" || bn == "f64" { return bn }
+      }
+      ""
     }
-    if !sawNull { return "" }
-    if base < 0 { return "" }
-    const bt = T.tys[base]
-    if bt is TyPrim {
-      const bn = bt.primName
-      if bn == "i32" || bn == "i64" || bn == "f64" { return bn }
-    }
-    return ""
+    // Not a nullable union at all.
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => ""
   }
-  ""
 }
 
 // `nodeTyMapValIsNumLitUnion` over arena type `ty`, the map itself.
@@ -1101,35 +1111,39 @@ export function mapTyValIsNulBool(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if !(t is TyMap) { return false }
+  if t.mVal < 0 { return false }
   const mv = T.tys[t.mVal]
-  if mv is TyNullable { return primNameOf(mv.nInner) == "boolean" }
-  if mv is TyUnion {
-    if mv.uMembers.length != 2 { return false }
-    let sawNull = false
-    let sawBool = false
-    let i = 0
-    while i < mv.uMembers.length {
-      const m = T.tys[mv.uMembers[i]]
-      if m is TyPrim {
-        // Exhaustive over `PrimName` and `_`-less: this pair is the `boolean | null` map value
-        // it looks for; any other prim member leaves both flags, which is a real answer.
-        match m.primName {
-          "null" => {
-            sawNull = true
-          }
-          "boolean" => {
-            sawBool = true
-          }
-          "i32" | "i64" | "f32" | "f64" | "string" | "void" | "never" | "u8" | "v128" => {
-            // Neither half of `boolean | null`.
+  match mv {
+    TyNullable => primNameOf(mv.nInner) == "boolean"
+    TyUnion => {
+      if mv.uMembers.length != 2 { return false }
+      let sawNull = false
+      let sawBool = false
+      let i = 0
+      while i < mv.uMembers.length {
+        const m = T.tys[mv.uMembers[i]]
+        if m is TyPrim {
+          // Exhaustive over `PrimName` and `_`-less: this pair is the `boolean | null` map value
+          // it looks for; any other prim member leaves both flags, which is a real answer.
+          match m.primName {
+            "null" => {
+              sawNull = true
+            }
+            "boolean" => {
+              sawBool = true
+            }
+            "i32" | "i64" | "f32" | "f64" | "string" | "void" | "never" | "u8" | "v128" => {
+              // Neither half of `boolean | null`.
+            }
           }
         }
+        i = i + 1
       }
-      i = i + 1
+      sawNull && sawBool
     }
-    return sawNull && sawBool
+    // No other value type is `boolean | null`.
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => false
   }
-  false
 }
 
 // Whether arena type `ty` is a map whose value is the `null` unit type: the mono i32 map, every
@@ -1157,8 +1171,10 @@ export function mapTyValLitUnionTexts(ty: i32) {
   if t is TyMap {
     if !tyIsLitUnion(t.mVal) && !tyIsNullableLitUnion(t.mVal) { return out }
     let mv = t.mVal
+    if mv < 0 { return out }
     const mvN = T.tys[mv]
     if mvN is TyNullable { mv = mvN.nInner }
+    if mv < 0 { return out }
     const v = T.tys[mv]
     if v is TyUnion {
       let i = 0
@@ -1198,10 +1214,13 @@ export function mapTyValName(ty: i32) {
 export function tyMapKeyKindSpan(ty: i32): i32 {
   if ty < 0 { return MAP_KEY_STR }
   const t = T.tys[ty]
-  if t is TyMap { return mapKeyKindOfTy(t.mKey) }
-  if t is TyNullable { return tyMapKeyKindSpan(t.nInner) }
-  if t is TyArray { return tyMapKeyKindSpan(t.aElem) }
-  MAP_KEY_STR
+  match t {
+    TyMap => mapKeyKindOfTy(t.mKey)
+    TyNullable => tyMapKeyKindSpan(t.nInner)
+    TyArray => tyMapKeyKindSpan(t.aElem)
+    // No map key below: the string key is the default.
+    TyPrim | TyFunc | TyObj | TyUnion | TyNeg | TyVar | TyLit | TyErr => MAP_KEY_STR
+  }
 }
 
 // Whether arena type `ty` is the `null` unit type, the type-taking twin of `nodeTyIsNullType`.
@@ -1348,54 +1367,59 @@ export function valueAtomKind(name: string) {
 export function valueRowKind(ty: i32): i32 {
   if ty < 0 { return -2 }
   const t = T.tys[ty]
-  if t is TyPrim {
-    const pn = t.primName
-    if pn == "i32" { return 0 }
-    if pn == "boolean" { return 1 }
-    if pn == "string" { return 2 }
-    if pn == "i64" { return 3 }
-    if pn == "f64" { return 4 }
-    if pn == "f32" { return 5 }
-    if pn == "null" { return 6 }
-    if pn == "v128" { return 14 }
-    return -1 // void / never — not a value atom
+  match t {
+    TyPrim => {
+      const pn = t.primName
+      if pn == "i32" { return 0 }
+      if pn == "boolean" { return 1 }
+      if pn == "string" { return 2 }
+      if pn == "i64" { return 3 }
+      if pn == "f64" { return 4 }
+      if pn == "f32" { return 5 }
+      if pn == "null" { return 6 }
+      if pn == "v128" { return 14 }
+      -1 // void / never — not a value atom
+    }
+    // A closure member rides the box's anyref `value` directly (kind 11).
+    TyFunc => 11
+    TyArray => valueRowListKind(t.aElem)
+    // A struct / map is not a value atom; a union row here is an alias arm (`K0` in
+    // `K0 | i64`), which `valueAtomKind` answers -1 for by name as well.
+    TyObj | TyMap | TyLit | TyUnion => -1
+    // Shapes this twin does not claim.
+    TyNullable | TyNeg | TyVar | TyErr => -2
   }
-  // A closure member rides the box's anyref `value` directly (kind 11).
-  if t is TyFunc { return 11 }
-  if t is TyArray { return valueRowListKind(t.aElem) }
-  // A struct / map is not a value atom; a union row here is an alias arm (`K0` in
-  // `K0 | i64`), which `valueAtomKind` answers -1 for by name as well.
-  if t is TyObj { return -1 }
-  if t is TyMap { return -1 }
-  if t is TyLit { return -1 }
-  if t is TyUnion { return -1 }
-  -2
 }
 
 // The list arms of `valueAtomKind`, over the element row rather than the cut spelling.
 function valueRowListKind(elem: i32): i32 {
   if elem < 0 { return -2 }
   const e = T.tys[elem]
-  if e is TyPrim {
-    const en = e.primName
-    if en == "i32" { return 7 }
-    if en == "boolean" { return 17 }
-    if en == "f64" { return 8 }
-    if en == "string" { return 9 }
-    if en == "i64" { return 10 }
-    if en == "f32" { return 12 }
-    // The packed byte list, arm for arm with `valueAtomKind`'s `u8` cut.
-    if en == "u8" { return 13 }
-    return -1
+  match e {
+    TyPrim => {
+      const en = e.primName
+      if en == "i32" { return 7 }
+      if en == "boolean" { return 17 }
+      if en == "f64" { return 8 }
+      if en == "string" { return 9 }
+      if en == "i64" { return 10 }
+      if en == "f32" { return 12 }
+      // The packed byte list, arm for arm with `valueAtomKind`'s `u8` cut.
+      if en == "u8" { return 13 }
+      -1
+    }
+    // A niche-nullable scalar-element list: the null rides in the element rep, so the list IS
+    // its leaf backing's atom — `nulElemListAtomKind`'s arms.
+    TyNullable => valueRowNulElemKind(e.nInner)
+    TyUnion => {
+      // A literal-union ELEMENT list shares the `i32[]` backing (its members are interned
+      // atom ids) — `litUnionArrayElemOf`'s arm.
+      if tyIsLitUnion(elem) { return 7 }
+      valueRowNulElemKind(unionSoleNonNullMember(elem))
+    }
+    // Shapes this twin does not claim.
+    TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => -2
   }
-  // A literal-union ELEMENT list shares the `i32[]` backing (its members are interned
-  // atom ids) — `litUnionArrayElemOf`'s arm.
-  if tyIsLitUnion(elem) { return 7 }
-  // A niche-nullable scalar-element list: the null rides in the element rep, so the list IS
-  // its leaf backing's atom — `nulElemListAtomKind`'s arms.
-  if e is TyNullable { return valueRowNulElemKind(e.nInner) }
-  if e is TyUnion { return valueRowNulElemKind(unionSoleNonNullMember(elem)) }
-  -2
 }
 
 // The non-null leaf of a niche-nullable list element -> the backing's atom kind.
@@ -1417,18 +1441,21 @@ function valueRowNulElemKind(inner: i32): i32 {
 export function isValueUnionTyOr(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
-  if t is TyUnion { return valueUnionVerdict(t.uMembers, false) }
-  // `T | null` is a `TyNullable` wrapper in the arena and two atoms in the spelling — not a
-  // mismatch to work around, since the wrapper carries the same verdict with null as a flag.
-  if t is TyNullable {
-    const inner = t.nInner
-    if inner < 0 { return -1 }
-    const it = T.tys[inner]
-    if it is TyUnion { return valueUnionVerdict(it.uMembers, true) }
-    const one: i32[] = [inner]
-    return valueUnionVerdict(one, true)
+  match t {
+    TyUnion => valueUnionVerdict(t.uMembers, false)
+    // `T | null` is a `TyNullable` wrapper in the arena and two atoms in the spelling — not a
+    // mismatch to work around, since the wrapper carries the same verdict with null as a flag.
+    TyNullable => {
+      const inner = t.nInner
+      if inner < 0 { return -1 }
+      const it = T.tys[inner]
+      if it is TyUnion { return valueUnionVerdict(it.uMembers, true) }
+      const one: i32[] = [inner]
+      valueUnionVerdict(one, true)
+    }
+    // Not a union row: decline, so the name is asked.
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => -1
   }
-  -1
 }
 
 // Appends `ms` to `out` with every nested union member replaced by its own members, as a
