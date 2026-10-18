@@ -95,6 +95,18 @@ FAST=0
 for a in "$@"; do [ "$a" = --fast ] && FAST=1; done
 SLOW_ROWS="|ci-native|scaling shape|filed witnesses|distilled corpus|baseline freshness|self-compile pair|rep-fuzz|plumb-shape cost|"
 SKIPPED=()
+# `GATE_CI_PROOF=<sha>`: a push-event CI run of <sha> already ran some rows on this tree and
+# this seed. scripts/ci-proof.sh checks that every input matches and names the rows; they are
+# reported as `ci` instead of being run again. Any refusal, and no variable, runs every row.
+CI_PROVEN="|"; CI_PROOF_RUN=""
+if [ -n "${GATE_CI_PROOF:-}" ]; then
+  if proven=$(bash scripts/ci-proof.sh verify "$GATE_CI_PROOF" "$SEED" 2>"$LOGS/ci-proof.err"); then
+    while IFS= read -r r; do CI_PROVEN="$CI_PROVEN$r|"; done <<< "$proven"
+    CI_PROOF_RUN=$(cat "$LOGS/ci-proof.err")
+  fi
+  cat "$LOGS/ci-proof.err"
+fi
+CI_SKIPPED=()
 # bash 3.2 (macOS's /bin/bash) has no `wait -n`; there a queued row polls once a second.
 if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 3 ]; }; then
   wait_any() { wait -n 2>/dev/null || true; }
@@ -105,6 +117,7 @@ fi
 if [ "$(date +%N)" != N ]; then now() { date +%s.%N; }
 else now() { perl -MTime::HiRes=time -e 'printf "%.6f\n", time'; }; fi
 run() { if [ "$FAST" = 1 ] && [[ "$SLOW_ROWS" == *"|$1|"* ]]; then SKIPPED+=("$1"); return 0; fi
+        if [[ "$CI_PROVEN" == *"|$1|"* ]]; then CI_SKIPPED+=("$1"); return 0; fi
         if [ "$GATE_MAX_PAR" -gt 0 ]; then
           while [ "$(jobs -rp | wc -l)" -ge "$GATE_MAX_PAR" ]; do wait_any; done
         fi
@@ -156,8 +169,9 @@ DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | pas
 # @warning/@hint/@info. ci-native's selfhost_native_align_test.ts asserts only the host-face
 # subset (the host, wasmtime, the batch CLIs); a cross-face census over 41 archived seeds
 # found no case outside it that native failed and the oracle passed.
-# GATE_V8_CORPUS=0 drops the oracle from row 1.
+# GATE_V8_CORPUS=0 drops the oracle from row 1, and so does a CI proof: checks-suites ran it.
 ORACLE=$(ls tests/cases_wasm_*_test.ts | paste -sd, -)
+if [[ "$CI_PROVEN" == *"|corpus oracle|"* ]]; then GATE_V8_CORPUS=0; CI_SKIPPED+=("corpus oracle"); fi
 [ "${GATE_V8_CORPUS:-1}" = 1 ] && ROW1_IGNORE="$DEDUPE" || ROW1_IGNORE="$DEDUPE,$ORACLE"
 # shellcheck disable=SC2086
 run "deno task test"           deno test -A --no-check --parallel --ignore="$ROW1_IGNORE" tests/
@@ -314,6 +328,8 @@ for i in "${!PIDS[@]}"; do
   if [ $rc -eq 0 ]; then printf '%-22s %7.1fs %7.1fs  ok\n' "${NAMES[$i]}" "$el" "$cpu"
   else FAIL=1; printf '%-22s %7.1fs %7.1fs  FAILED rc=%d   %s\n' "${NAMES[$i]}" "$el" "$cpu" "$rc" "$LOGS/$i.log"; fi
 done
+for r in "${CI_SKIPPED[@]+"${CI_SKIPPED[@]}"}"; do printf '%-22s %8s %8s  ci (proven)\n' "$r" - -; done
+[ -z "$CI_PROOF_RUN" ] || echo "${CI_PROOF_RUN#ci-proof: }"
 
 if [ $FAIL -ne 0 ]; then
   echo; echo "GATE FAILED — logs in $LOGS"; exit 1

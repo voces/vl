@@ -67,6 +67,7 @@ import {
   tyToStr,
 } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
+import { sigKeyOfTy } from "./emit_sig_tokens"
 
 // 0 off, 1 armed, 2 armed with names in each row, 3 armed and keyed by call path instead of by
 // instance (the control the scaling pair must see blow up), 4 named with `trace |` rows.
@@ -1098,27 +1099,56 @@ function ffLetLamCall(ix: i32, s: i32, lam: i32, d: i32): i32 {
   res
 }
 
-// Walks each deferred `let` lambda call whose binding no `=` writes, in the context that met it.
+// Walks each deferred `let` lambda call in the context that met it, through every lambda the
+// binding may hold there: its initializer's and each write's, when every write stores a generic
+// lambda literal; a binding written anything else is not walked.
 function ffLetLamFinish() {
   const svCtx = ffCtx
   const svFn = ffFn
   let k = 0
   while k < ffLetLamAt.length {
     const d = ffLetLamDecl[k]
-    const o = ffOrigDecl(d)
-    const wr = (ffDeclWr[d] ?? false)
-      || (ffDeclWrites[o] ?? []).length > 0
-      || (ffCellWrites[o] ?? []).length > 0
-    if !wr {
+    const lams = ffLetLamsHeld(d, ffLetLamFn[k])
+    if lams.length > 0 {
       ffCtx = ffLetLamCtx[k]
       ffFn = ffLetLamIn[k]
-      ffLamInstWalk(ffLetLamAt[k], ffLetLamFn[k], ffLetLamArgs[k])
+      for lam in lams { ffLamInstWalk(ffLetLamAt[k], lam, ffLetLamArgs[k]) }
     }
     k = k + 1
   }
   ffCtx = svCtx
   ffFn = svFn
   0
+}
+
+// The lambdas the `let` `d` initialized with `init` may hold: `init` alone when nothing writes it,
+// with each write's when every write stores a generic lambda literal, else none.
+function ffLetLamsHeld(d: i32, init: i32): i32[] {
+  const out: i32[] = [init]
+  const o = ffOrigDecl(d)
+  const ws: i32[] = []
+  for w in ffDeclWrites[o] ?? [] { ws.push(w) }
+  for w in ffCellWrites[o] ?? [] { ws.push(w) }
+  if ws.length == 0 {
+    if ffDeclWr[d] ?? false { return [] }
+    return out
+  }
+  for w in ws {
+    const b = P.nodes[w]
+    if !(b is BinExpr) { return [] }
+    const v = unwrapParen(b.binRight)
+    if v < 0 { return [] }
+    const fd = P.nodes[v]
+    if (
+      !(fd is FuncDecl)
+      || !ffIsLambdaName(fd.fnName)
+      || !monoIsGenericDecl(v)
+    ) {
+      return []
+    }
+    if !i32ListHas(out, v) { out.push(v) }
+  }
+  out
 }
 
 // A call through a slot pins the slot's class at the argument types, wherever the callee's own
@@ -1607,7 +1637,7 @@ function ffDeclPathPinKeys(
   }
   if agree { return first }
   if tmpl < 0 || inst < 0 { return decline }
-  const ps = ffParamSpells(inst)
+  const ps = ffInstParamSpells(inst, tmpl)
   let pick = decline
   i = 0
   while i < slots.length && i < ctxs.length {
@@ -1752,8 +1782,13 @@ function ffDirectedPins(s: i32): i32[] {
 }
 
 // Type `t` spelled as a pin: its render with each union bar written `A|B`, the spelling a
-// function type's name and an instance's parameter give the same type (D5170).
+// function type's name and an instance's parameter give the same type (D5170). A function type
+// is spelled `=>` and its signature key, as an instance's function-valued parameter is.
 function ffPinSpell(t: i32): string {
+  if t >= 0 && t < T.tys.length && T.tys[t] is TyFunc {
+    const sk = sigKeyOfTy(t)
+    if sk != "" { return "=>" + sk }
+  }
   const s = normTypeAtom(tyToStr(t))
   if s.indexOf(" | ") < 0 { return s }
   let out = ""
@@ -2165,6 +2200,37 @@ function ffParamSpells(fn: i32): string[] {
         out.push(sp)
       }
     }
+  }
+  out
+}
+
+// The hole binding of the instance the next pin question is asked in, staged by the caller.
+let ffInstHoleN: string[] = []
+let ffInstHoleT: i32[] = []
+
+// Stages the hole binding `n`/`t` of the instance the next pin questions are asked in.
+export function fnFlowStageInstHoles(n: string[], t: i32[]) {
+  ffInstHoleN = n
+  ffInstHoleT = t
+  0
+}
+
+// `ffParamSpells` of instance `inst` of template `tmpl`, an un-annotated parameter spelled at
+// the template's type under the staged hole binding when that closes it.
+function ffInstParamSpells(inst: i32, tmpl: i32): string[] {
+  const out = ffParamSpells(inst)
+  const ft = nodeTyIxOf(tmpl)
+  if ffInstHoleN.length == 0 || ft < 0 || ft >= T.tys.length { return out }
+  const fty = T.tys[ft]
+  if !(fty is TyFunc) || fty.fnParamTypes.length != out.length { return out }
+  let k = 0
+  while k < out.length {
+    let pt = fty.fnParamTypes[k]
+    if out[k] == "?" && pt >= 0 && tyHasTyVar(pt) {
+      pt = substTyDeep(pt, ffInstHoleN, ffInstHoleT)
+      if pt >= 0 && !tyHasTyVar(pt) { out[k] = tyToEmitName(pt) }
+    }
+    k = k + 1
   }
   out
 }

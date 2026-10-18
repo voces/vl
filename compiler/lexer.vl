@@ -792,6 +792,132 @@ export function tplPartStrLex(raw: string): string {
   out + raw.slice(runStart, stop) + q
 }
 
+// A `"` string literal starting at `startPos`: one `STRING` token, or a `TEMPLATE_HEAD` that
+// opens a template when the scan stops at a hole. An unterminated literal is reported at
+// its opening quote.
+function lexStringLit(
+  toks: Tok[],
+  startPos: i32,
+  startLine: i32,
+  startCol: i32,
+) {
+  scanQuoted('"')
+  if gTplStop == 1 {
+    tplOpenPush(startLine, startCol, startPos, '"')
+    toks.push(mkTok("TEMPLATE_HEAD", startPos, startLine, startCol))
+  } else {
+    // Reported at the OPENING quote, spanning its own line: a `"` literal may run to
+    // EOF now, and `diagSpan`'s columns are one pair on one line, so the first line is
+    // the only honest span — and the opening quote is the character to fix.
+    if gTplStop == 2 {
+      diagSpan(
+        "Unterminated string literal",
+        startLine,
+        startCol,
+        tplLineEndCol(startPos, startCol),
+      )
+    }
+    toks.push(mkTok("STRING", startPos, startLine, startCol))
+  }
+}
+
+// A `@name` label at `startPos`, one `LABEL` token; a bare `@` is reported and is an `ERROR`
+// token.
+function lexLabel(toks: Tok[], startPos: i32, startLine: i32, startCol: i32) {
+  advance()
+  if gPos < gSrc.length && isIdStart(peek()) {
+    while gPos < gSrc.length && isIdPart(peek()) { advance() }
+    toks.push(mkTok("LABEL", startPos, startLine, startCol))
+  } else {
+    diagSpan(
+      "`@` starts a label and needs its name: `@outer while …`, `break @outer`",
+      startLine,
+      startCol,
+      gCol,
+    )
+    toks.push(mkTok("ERROR", startPos, startLine, startCol))
+  }
+}
+
+// A `}` at `startPos`: at the innermost open hole's depth it resumes the template as a
+// `TEMPLATE_MID` or `TEMPLATE_TAIL`, else it closes a brace as `RBRACE`.
+function lexRBrace(toks: Tok[], startPos: i32, startLine: i32, startCol: i32) {
+  if atTplHoleDepth() {
+    // Resumed in the mode the run opened in — one form now, but the column stays the
+    // record of which delimiter opened this run rather than an assumption about it.
+    scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
+    if gTplStop == 1 {
+      toks.push(mkTok("TEMPLATE_MID", startPos, startLine, startCol))
+    } else {
+      if gTplStop == 2 { tplOpenDiag() }
+      tplOpenPop()
+      toks.push(mkTok("TEMPLATE_TAIL", startPos, startLine, startCol))
+    }
+    return 0
+  }
+  gBrace = gBrace - 1
+  advance()
+  toks.push(mkTok("RBRACE", startPos, startLine, startCol))
+  0
+}
+
+// The operator or punctuation token starting with `c` at `startPos`, longest match first; a
+// character no table knows is reported, consumed whole and pushed as an `ERROR` token.
+function lexOperator(
+  toks: Tok[],
+  c: i32,
+  startPos: i32,
+  startLine: i32,
+  startCol: i32,
+) {
+  // Three-char operator (`>>>`) — longest match first. The three no-match tests below
+  // run for every token: a `TokKind` is an i32 atom, so `x != ""` is one `i32.ne` against
+  // a constant. (`.length` is not spellable on a `TokKind` — the checker rejects a field
+  // read that is not on every member of the union.)
+  if c == '>' && peek2() == '>' && peekN(2) == '>' && peekN(3) == '=' {
+    advance()
+    advance()
+    advance()
+    advance()
+    toks.push(mkTok("USHREQ", startPos, startLine, startCol))
+    return 0
+  }
+  const three = threeCharKind(c, peek2(), peekN(2))
+  if three != "" {
+    advance()
+    advance()
+    advance()
+    toks.push(mkTok(three, startPos, startLine, startCol))
+    return 0
+  }
+
+  // Two-char operator (longest match first).
+  const two = twoCharKind(c, peek2())
+  if two != "" {
+    advance()
+    advance()
+    toks.push(mkTok(two, startPos, startLine, startCol))
+    return 0
+  }
+
+  // One-char operator / punctuation.
+  const one = oneCharKind(c)
+  if one != "" {
+    advance()
+    toks.push(mkTok(one, startPos, startLine, startCol))
+    return 0
+  }
+
+  // Unknown character — record a diagnostic naming the offender (positioned
+  // AT the char, not one past it), emit an ERROR token, make progress. A non-ASCII
+  // character is named whole and consumed whole, not as its first UTF-8 byte.
+  diag("Unexpected character " + charDesc(gSrc.cpAt(gPos)))
+  advance()
+  while gPos < gSrc.length && (gSrc[gPos] & 0xC0) == 0x80 { advance() }
+  toks.push(mkTok("ERROR", startPos, startLine, startCol))
+  0
+}
+
 // ---- main scanner --------------------------------------------------------
 // Tokenize `source`, returning the tokens in order terminated by an EOF token, plus any
 // diagnostics. Whitespace is skipped, NEWLINE is emitted as a real token, and `//` / `///`
@@ -867,43 +993,14 @@ export function tokenize(source: string): LexResult {
     // downstream changes for it; one with a hole opens a `TEMPLATE_HEAD` and rides
     // the split-run machinery.
     if c == '"' {
-      scanQuoted('"')
-      if gTplStop == 1 {
-        tplOpenPush(startLine, startCol, startPos, '"')
-        toks.push(mkTok("TEMPLATE_HEAD", startPos, startLine, startCol))
-      } else {
-        // Reported at the OPENING quote, spanning its own line: a `"` literal may run to
-        // EOF now, and `diagSpan`'s columns are one pair on one line, so the first line is
-        // the only honest span — and the opening quote is the character to fix.
-        if gTplStop == 2 {
-          diagSpan(
-            "Unterminated string literal",
-            startLine,
-            startCol,
-            tplLineEndCol(startPos, startCol),
-          )
-        }
-        toks.push(mkTok("STRING", startPos, startLine, startCol))
-      }
+      lexStringLit(toks, startPos, startLine, startCol)
       continue
     }
 
     // `@name` is a label, one token spelled the same where it is declared (`@outer while …`)
     // and where a jump names it (`break @outer`). A bare `@` names nothing.
     if c == '@' {
-      advance()
-      if gPos < gSrc.length && isIdStart(peek()) {
-        while gPos < gSrc.length && isIdPart(peek()) { advance() }
-        toks.push(mkTok("LABEL", startPos, startLine, startCol))
-      } else {
-        diagSpan(
-          "`@` starts a label and needs its name: `@outer while …`, `break @outer`",
-          startLine,
-          startCol,
-          gCol,
-        )
-        toks.push(mkTok("ERROR", startPos, startLine, startCol))
-      }
+      lexLabel(toks, startPos, startLine, startCol)
       continue
     }
 
@@ -931,70 +1028,11 @@ export function tokenize(source: string): LexResult {
       continue
     }
     if c == '}' {
-      if atTplHoleDepth() {
-        // Resumed in the mode the run opened in — one form now, but the column stays the
-        // record of which delimiter opened this run rather than an assumption about it.
-        scanQuoted(gTplQuote[gTplQuote.length - 1]) // the `}` is this part's opener
-        if gTplStop == 1 {
-          toks.push(mkTok("TEMPLATE_MID", startPos, startLine, startCol))
-        } else {
-          if gTplStop == 2 { tplOpenDiag() }
-          tplOpenPop()
-          toks.push(mkTok("TEMPLATE_TAIL", startPos, startLine, startCol))
-        }
-        continue
-      }
-      gBrace = gBrace - 1
-      advance()
-      toks.push(mkTok("RBRACE", startPos, startLine, startCol))
+      lexRBrace(toks, startPos, startLine, startCol)
       continue
     }
 
-    // Three-char operator (`>>>`) — longest match first. The three no-match tests below
-    // run for every token: a `TokKind` is an i32 atom, so `x != ""` is one `i32.ne` against
-    // a constant. (`.length` is not spellable on a `TokKind` — the checker rejects a field
-    // read that is not on every member of the union.)
-    if c == '>' && peek2() == '>' && peekN(2) == '>' && peekN(3) == '=' {
-      advance()
-      advance()
-      advance()
-      advance()
-      toks.push(mkTok("USHREQ", startPos, startLine, startCol))
-      continue
-    }
-    const three = threeCharKind(c, peek2(), peekN(2))
-    if three != "" {
-      advance()
-      advance()
-      advance()
-      toks.push(mkTok(three, startPos, startLine, startCol))
-      continue
-    }
-
-    // Two-char operator (longest match first).
-    const two = twoCharKind(c, peek2())
-    if two != "" {
-      advance()
-      advance()
-      toks.push(mkTok(two, startPos, startLine, startCol))
-      continue
-    }
-
-    // One-char operator / punctuation.
-    const one = oneCharKind(c)
-    if one != "" {
-      advance()
-      toks.push(mkTok(one, startPos, startLine, startCol))
-      continue
-    }
-
-    // Unknown character — record a diagnostic naming the offender (positioned
-    // AT the char, not one past it), emit an ERROR token, make progress. A non-ASCII
-    // character is named whole and consumed whole, not as its first UTF-8 byte.
-    diag("Unexpected character " + charDesc(gSrc.cpAt(gPos)))
-    advance()
-    while gPos < gSrc.length && (gSrc[gPos] & 0xC0) == 0x80 { advance() }
-    toks.push(mkTok("ERROR", startPos, startLine, startCol))
+    lexOperator(toks, c, startPos, startLine, startCol)
   }
 
   // Input ran out inside a hole (`` `a${x ``): no part ever scanned to EOF, so

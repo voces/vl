@@ -119,9 +119,9 @@ import {
   mvCanonValName,
   mvSlotOfMapNameTy,
   mvValArmOfShape,
-  mvValKindOfName,
+  mvValKindOfNameTy,
   nameIsRefArray,
-  nulRefMapValInnerOf,
+  nulRefMapValInnerOfTy,
   refArrElemKind,
   refArrElemName,
   refArrElemNameIf,
@@ -248,14 +248,14 @@ import { i32ListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
 import { nameIsArray, nameIsMapOpen, nameIsParenOpen } from "./tyname"
-import { isNullTy, tyMapValOf } from "./tyquery"
+import { isNullTy, tyMapValOf, tyMapValOfHeld } from "./tyquery"
 
 // The mv shape of a bare map spelling — `mvShapeOfValName` of the map's value. One home, so
 // that getting from `{[string]: V}` to its value rep is decided once rather than at each call
 // site. This is also the one place the key enters the mv layer: every other resolver takes it
 // as an argument, so an i32-keyed map's value interns against the i32 key rep untaught.
 export function mvShapeOfMapName(mapName: string) {
-  mvShapeOfMapNameArmTy(mapName, -1)
+  mvShapeOfMapNameTys(mapName, -1, -1)
 }
 
 // `mvShapeOfMapName` plus the map value's arena type as the caller's node recorded it (D34).
@@ -263,8 +263,15 @@ export function mvShapeOfMapName(mapName: string) {
 // resolve to: a RECURSIVE alias reaches here already rendered, so slicing its value out of the
 // spelling mints an unrolled anonymous twin of the declared type instead of finding it (D1865).
 export function mvShapeOfMapNameArmTy(mapName: string, armTy: i32) {
+  mvShapeOfMapNameTys(mapName, armTy, armTy)
+}
+
+// `mvShapeOfMapNameArmTy` with the value's arena type `valTy` held apart from the arm hint:
+// `valTy` only classifies the value (whether it admits `null`), so it never changes the key a
+// slot is found or minted under. -1 when the caller holds no type.
+export function mvShapeOfMapNameTys(mapName: string, armTy: i32, valTy: i32) {
   const ki = mapNameKeyKind(mapName)
-  const sh = mvShapeOfValNameArmTy(mapValNameOf(mapName), ki, armTy, armTy)
+  const sh = mvShapeOfValNameTys(mapValNameOf(mapName), ki, armTy, armTy, valTy)
   // A mono value — i32, boolean, a literal-union atom or a nullable atom — rides the shared
   // i32 `vals` list and needs no per-value struct, so it is the `-1` string-keyed or `-4`
   // i32-keyed sentinel every value-blind classifier already reads as the mono rep.
@@ -331,13 +338,27 @@ export function mvShapeOfValNameArmTy(
   rowTy: i32,
   armTy: i32,
 ) {
+  let kindTy = armTy
+  if kindTy < 0 { kindTy = rowTy }
+  mvShapeOfValNameTys(valNameInRaw, keyK, rowTy, armTy, kindTy)
+}
+
+// `mvShapeOfValNameArmTy` with the value's arena type `kindTy`, or -1, as its own input: it
+// classifies the value and splits off a niche's member, and is never a find or mint key.
+export function mvShapeOfValNameTys(
+  valNameInRaw: string,
+  keyK: i32,
+  rowTy: i32,
+  armTy: i32,
+  kindTy: i32,
+) {
   // A self-referential map value has no finite shape walk: this function, its caller and
   // `mvValRowOfShape` form a cycle stepping through `mapValNameOf`, and each lap expands the
   // spelling rather than repeating it, so a name-keyed re-entry guard cannot see it (D984).
   // `-1` degrades to the caller's mono shape, which is what an unenumerable value should get.
   if mvShapeNest > 32 { return -1 }
   mvShapeNest = mvShapeNest + 1
-  const mvR = mvShapeOfValNameArmTyGo(valNameInRaw, keyK, rowTy, armTy)
+  const mvR = mvShapeOfValNameArmTyGo(valNameInRaw, keyK, rowTy, armTy, kindTy)
   mvShapeNest = mvShapeNest - 1
   return mvR
 }
@@ -347,10 +368,11 @@ function mvShapeOfValNameArmTyGo(
   keyK: i32,
   rowTy: i32,
   armTy: i32,
+  kindTy: i32,
 ) {
   const valNameIn = mvArmKeyName(valNameInRaw, armTy)
   let valName = mvCanonValName(valNameIn)
-  const kind = mvValKindOfName(valName)
+  const kind = mvValKindOfNameTy(valName, kindTy)
   if kind == MVK_MONO { return -1 }
   if kind < 0 { return -3 }
   // An inferred value union can arrive spelled structurally (`{x:i32}[]|i32[]` for a write of
@@ -364,7 +386,7 @@ function mvShapeOfValNameArmTyGo(
   // ref-list slot — through the single non-null member, so the slot shares the vals rep and
   // the heap-type dedup with its non-null twin.
   let bare = valName
-  const nin = nulRefMapValInnerOf(valName)
+  const nin = nulRefMapValInnerOfTy(valName, kindTy)
   if nin != "" { bare = nin }
   let vsi = -1
   if kind == MVK_STRUCT {
@@ -408,7 +430,7 @@ function mvShapeOfValNameArmTyGo(
     aUsed = true
     if nameIsMap(bare) {
       mUsed = true
-      mvShapeOfMapName(bare)
+      mvShapeOfMapNameTys(bare, -1, tyMapValOfHeld(kindTy))
     }
     // A non-i32 list value forces its inner list's type so the element wrapper heap exists.
     if nameIsStringArray(bare) { slUsed = true }
@@ -523,7 +545,9 @@ export function rlElemMapShape(slot: i32): i32 {
   let en = rlElemName[slot]
   const enn = nulMapInnerName(en)
   if enn != "" { en = enn }
-  mvShapeOfMapName(en)
+  let ety = -1
+  if slot >= 0 && slot < rlElemTyIx.length { ety = rlElemTyIx[slot] }
+  mvShapeOfMapNameTys(en, -1, tyMapValOfHeld(ety))
 }
 
 // Intern the ref-list slot whose element type is `elemName`, recursively interning a
@@ -577,7 +601,11 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32) {
     // The element's own arena row carries the map value, so a RECURSIVE alias element
     // resolves to the declared type rather than the unrolled anonymous twin its rendered
     // spelling would mint (D1865). `-1` in, `-1` through: the unhinted call is unmoved.
-    mvShapeOfMapNameArmTy(mve, tyMapValOf(unMemPeelAliasWrapper(ty)))
+    mvShapeOfMapNameTys(
+      mve,
+      tyMapValOf(unMemPeelAliasWrapper(ty)),
+      tyMapValOfHeld(ty),
+    )
     // The one home that also sets `mI32Used` for an i32-keyed map reached only through a
     // map-typed ref-list element — every other map-forcing site sets `mUsed`/`lUsed`/`aUsed`
     // alone. Without it the key temporary aliases the map-ref temporary at the same local
@@ -684,7 +712,7 @@ export function rlInternNameTy(name: string, kind: i32, tyIn: i32) {
     let men = stored
     const min = nulMapInnerName(men)
     if min != "" { men = min }
-    mvShapeOfMapName(men)
+    mvShapeOfMapNameTys(men, -1, tyMapValOfHeld(rlTy))
   }
   rlElemName.length - 1
 }
@@ -1041,7 +1069,9 @@ function markMapUnionArmsOf(atoms: string[], mems: i32[], cov: boolean) {
       mUsed = true
       lUsed = true
       aUsed = true
-      const sh = mvShapeOfMapName(a)
+      let aTy = -1
+      if cov { aTy = tyMapValOfHeld(mems[i]) }
+      const sh = mvShapeOfMapNameTys(a, -1, aTy)
       if sh < 0 && mapShapeKeyKind(sh) != MAP_KEY_STR {
         markMapKeyUsed(mapShapeKeyKind(sh))
         mIntMonoArmUsed = true

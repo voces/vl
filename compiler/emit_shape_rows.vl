@@ -347,7 +347,7 @@ import {
   nameIsShapeOpen,
   peelGroupParens,
 } from "./tyname"
-import { nonNullTy, tyHasTyVar } from "./tyquery"
+import { flattenVariantsInto, nonNullTy, tyHasTyVar } from "./tyquery"
 
 // Resolve a value type-name to a struct table index: a declared struct by name, or an inline
 // object type matched against the table by field set, since `collectAnonShapes` interns
@@ -362,7 +362,13 @@ export function structIndexByValName(name: string) {
 // non-null member of a kind the nullable-value map rep covers. The chokepoints strip through
 // it, so the slot shares its vals rep with the non-null twin.
 export function nulRefMapValInnerOf(valName: string): string {
-  if !unionSetHasNull(valName) { return "" }
+  nulRefMapValInnerOfTy(valName, -1)
+}
+
+// `nulRefMapValInnerOf` for a caller that also holds the value's arena type `ty`, or -1: a type
+// that cannot carry a top-level `null` answers "" without the spelling being split.
+export function nulRefMapValInnerOfTy(valName: string, ty: i32): string {
+  if !mvValHasNull(valName, ty) { return "" }
   const atoms: string[] = []
   unionArmsOf(valName, atoms)
   let nonNull = 0
@@ -405,7 +411,7 @@ export function mvSlotNullable(slot: i32) {
   if slot < 0 { return false }
   const ar = mvValNulRefNicheAt(slot)
   if ar >= 0 { return ar == 1 }
-  nulRefMapValInnerOf(mvValName[slot]) != ""
+  nulRefMapValInnerOfTy(mvValName[slot], mvValTyIxAt(slot)) != ""
 }
 
 // True if the bare map spelling `mapName` has a value type the mv layer can lower —
@@ -468,11 +474,144 @@ export function mapNodeValKindLowerable(ix: i32) {
   mapTyValKindLowerable(nodeTyIxOf(ix))
 }
 
+// Whether map value `valName`, of arena type `ty` (-1 when unknown), admits `null`. The arena
+// answers unless the type is a hole, an error, a negation or a recursive union; those ask the
+// spelling. A type variable holds no `null` of its own.
+function mvValHasNull(valName: string, ty: i32): boolean {
+  const a = mvValNullOfTy(ty)
+  if a >= 0 { return a == 1 }
+  unionSetHasNull(valName)
+}
+
+// 1 when type `ty` admits a top-level `null`, 0 when it cannot, -1 when the arena cannot say:
+// a union is answered from its flattened members, and declines on a member it cannot answer.
+function mvValNullOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = T.tys[ty]
+  // Exhaustive over `Ty` and `_`-less: a new variant must say whether it can hold `null`.
+  match t {
+    TyObj | TyMap | TyArray | TyFunc | TyLit | TyVar => {
+      return 0
+    }
+    TyPrim => {
+      if t.primName == "null" { return 1 }
+      return 0
+    }
+    TyNullable => {
+      if tyReachesItself(ty) { return -1 }
+      return 1
+    }
+    TyUnion => {
+      if tyReachesItself(ty) { return -1 }
+      const flat: i32[] = []
+      flattenVariantsInto(ty, flat)
+      let ans = 0
+      let i = 0
+      while i < flat.length {
+        const m = mvValNullOfTy(flat[i])
+        if m == 1 { return 1 }
+        if m < 0 { ans = -1 }
+        i = i + 1
+      }
+      return ans
+    }
+    TyErr | TyNeg => {
+      return -1
+    }
+  }
+}
+
+// Whether union or nullable `root` is recursive: a list, map, record or function inside it reaches
+// back to `root` or to a union or nullable layer of it. A walk past 64 types answers true too.
+function tyReachesItself(root: i32): boolean {
+  // The union's own layers, which a recursive alias may name in place of `root` itself.
+  const top: i32[] = []
+  const rest: i32[] = []
+  const todo: i32[] = [root]
+  while todo.length > 0 {
+    if top.length > 64 { return true }
+    const cur = todo.pop()
+    if cur >= 0 && cur < T.tys.length && !tyIdIn(top, cur) {
+      const t = T.tys[cur]
+      if t is TyUnion {
+        top.push(cur)
+        tyKidsAdd(todo, t.uMembers)
+      } else if t is TyNullable {
+        top.push(cur)
+        todo.push(t.nInner)
+      } else {
+        tyKidsOf(cur, rest)
+      }
+    }
+  }
+  const seen: i32[] = []
+  while rest.length > 0 {
+    if seen.length > 64 { return true }
+    const cur = rest.pop()
+    if tyIdIn(top, cur) { return true }
+    if cur >= 0 && cur < T.tys.length && !tyIdIn(seen, cur) {
+      seen.push(cur)
+      const t = T.tys[cur]
+      if t is TyUnion { tyKidsAdd(rest, t.uMembers) }
+      else if t is TyNullable { rest.push(t.nInner) }
+      else { tyKidsOf(cur, rest) }
+    }
+  }
+  false
+}
+
+// Pushes the types a list, map, record or function `ty` is built from onto `out`. A union or
+// nullable layer is walked by the caller, and every other type is a leaf.
+function tyKidsOf(ty: i32, out: i32[]) {
+  const t = T.tys[ty]
+  match t {
+    TyArray => {
+      out.push(t.aElem)
+    }
+    TyMap => {
+      out.push(t.mKey)
+      out.push(t.mVal)
+    }
+    TyObj => {
+      tyKidsAdd(out, t.objFieldTypes)
+    }
+    TyFunc => {
+      tyKidsAdd(out, t.fnParamTypes)
+      out.push(t.fnRet)
+    }
+    TyPrim | TyUnion | TyNullable | TyVar | TyLit | TyErr | TyNeg => {}
+  }
+}
+
+function tyKidsAdd(kids: i32[], src: i32[]) {
+  let i = 0
+  while i < src.length {
+    kids.push(src[i])
+    i = i + 1
+  }
+}
+
+function tyIdIn(xs: i32[], x: i32): boolean {
+  let i = 0
+  while i < xs.length {
+    if xs[i] == x { return true }
+    i = i + 1
+  }
+  false
+}
+
 // The mv value kind of a map value type-name — the one enumeration of which value types a
 // string-keyed map supports: `-1` a mono i32 value riding the shared `$mapStruct`, `-3`
 // unsupported, else the per-slot kind. Read by both `mvShapeOfValName`, the slot interner, and
 // `retMapFlag`, the param and return valtype gate, so the two cannot drift.
 export function mvValKindOfName(valName: string): i32 {
+  mvValKindOfNameTy(valName, -1)
+}
+
+// `mvValKindOfName` for a caller that also holds the value's arena type `ty`, or -1. A record,
+// map, list, function or primitive type answers whether the value admits `null` without the
+// spelling being split; any other type, or -1, asks the spelling.
+export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
   if valName == "i32" || valName == "boolean" { return MVK_MONO }
   // The `null` unit value stores the `boolean | null` sentinel, so it is the mono map too (D4671).
   if valName == "null" { return MVK_MONO }
@@ -489,8 +628,8 @@ export function mvValKindOfName(valName: string): i32 {
   // map or list member plus null — riding the same vals rep as its non-null twin; a pure
   // scalar nullable value-union, which boxes; and one with two or more non-null members, which
   // falls to the union arm. The remainder is a list element the kind-6 pair does not name.
-  if unionSetHasNull(valName) {
-    const nin = nulRefMapValInnerOf(valName)
+  if mvValHasNull(valName, ty) {
+    const nin = nulRefMapValInnerOfTy(valName, ty)
     if nin != "" {
       if nin == "string" { return MVK_STR }
       if nameIsMap(nin) { return MVK_REF }
@@ -3735,7 +3874,7 @@ export function rlSlotsLayoutTwin(a: i32, b: i32): i32 {
 // its vals ref-list slot through the single non-null member, so the identity must share that
 // peel too, or the comparator refuses a pair whose vals slot it already made identical.
 function mvValTwinCanonId(slot: i32): i32 {
-  const nin = nulRefMapValInnerOf(mvValName[slot])
+  const nin = nulRefMapValInnerOfTy(mvValName[slot], mvValTyIxAt(slot))
   if nin != "" { return repNameCanonId(nin) }
   mvValCanonId(slot)
 }
@@ -4380,11 +4519,26 @@ export function mvSlotOfMapName(mapName: string): i32 {
 // holds the node, else -1. There is deliberately NO intern-side twin of this — the intern
 // path is `mvShapeOfMapName`, and its header says why it does not get one.
 export function mvSlotOfMapNameTy(mapName: string, valTy: i32): i32 {
+  mvSlotOfMapNameTys(mapName, valTy, valTy)
+}
+
+// `mvSlotOfMapNameTy` with the value's arena type `kindTy`, or -1, held apart from the find key
+// `valTy`: it only classifies the value, so it never changes which slot is found.
+export function mvSlotOfMapNameTys(
+  mapName: string,
+  valTy: i32,
+  kindTy: i32,
+): i32 {
   // The KEY comes off the map spelling, exactly as on the intern side
   // (`mvShapeOfMapName`); a MONO value needs no slot on either key rep, so it is the
   // `-1`/`-4` sentinel pair.
   const ki = mapNameKeyKind(mapName)
-  const sl = mvSlotOfMapValNameOrMonoKTy(mapValNameOf(mapName), ki, valTy)
+  const sl = mvSlotOfMapValNameOrMonoKTys(
+    mapValNameOf(mapName),
+    ki,
+    valTy,
+    kindTy,
+  )
   if sl == -1 { return mapMonoShapeOfKey(ki) }
   sl
 }
@@ -4404,11 +4558,20 @@ function mvSlotOfMapValNameOrMonoK(ivIn: string, keyK: i32): i32 {
 // type comes from the caller's node when it banked one, and every other rung (the mono
 // early-out, the name scan, the loud `-3`) is unmoved.
 function mvSlotOfMapValNameOrMonoKTy(ivIn: string, keyK: i32, valTy: i32): i32 {
+  mvSlotOfMapValNameOrMonoKTys(ivIn, keyK, valTy, valTy)
+}
+
+function mvSlotOfMapValNameOrMonoKTys(
+  ivIn: string,
+  keyK: i32,
+  valTy: i32,
+  kindTy: i32,
+): i32 {
   // The same key rewrite the mint applies (D47/D93): `mvArmKeyName` is a pure function of
   // (rendered name, recorded value type), so the op find keys exactly what the mint keyed.
   const ivK = mvArmKeyName(ivIn, valTy)
   const iv = mvCanonValName(ivK)
-  if mvValKindOfName(iv) == MVK_MONO { return -1 }
+  if mvValKindOfNameTy(iv, kindTy) == MVK_MONO { return -1 }
   // The find's half of the arm component (D48) — the same tri-state the mint threads,
   // answering nominally when `valTy` is known, else via `MV_ARM_NOHINT`.
   const armMo = mvArmHintOfTyName(valTy, iv)

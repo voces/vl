@@ -1815,24 +1815,7 @@ export function retireNarrowingsForWrite(
         hit = true
       }
     }
-    // A write to a prefix of the key replaces the object the key reads through, so the key is
-    // unknown after it on this path, whatever the write stored and whether or not a sibling arm
-    // already ended the narrowing in place (D3319).
-    if (
-      i >= crFnNpBase()
-      && (keyHasPrefix(npKeys[i], tgtKey + ".")
-        || keyHasPrefix(npKeys[i], tgtKey + "["))
-    ) {
-      let kprev = -1
-      if npInvBy[i] < 0 { kprev = npTys[i] }
-      narClobKeysPush(npKeys[i])
-      narClobTysPush(-1)
-      narClobPrevPush(kprev)
-      narClobDepthsPush(T.scopes.length)
-      narClobRetiredPush(2)
-      narClobBindPush(-1)
-      narClobDeclPush(-1)
-    }
+    narClobUnderWrite(i, tgtKey)
     if hit {
       narSetInv(i, atIx)
       noteKillSure(atIx, npKeys[i])
@@ -1899,6 +1882,54 @@ export function retireNarrowingsForWrite(
     npCapByPush(-1)
     if pathReAsg { npAsgPush(1) } else { npAsgPush(0) }
   }
+  narClobPathWrite(
+    tgtIx,
+    tgtKey,
+    rt,
+    preSlot,
+    prePathTy,
+    pathReTy,
+    pathReAsg,
+    pathRetired,
+  )
+  retireNameNarrowing(tgtIx, rt, atIx, preAsgTy)
+  0
+}
+
+// A write to a prefix of narrowing `i`'s key replaces the object the key reads through, so the
+// key is unknown after it on this path, whatever the write stored and whether or not a sibling
+// arm already ended the narrowing in place (D3319). Pushes that clobber row.
+function narClobUnderWrite(i: i32, tgtKey: string) {
+  if (
+    i >= crFnNpBase()
+    && (keyHasPrefix(npKeys[i], tgtKey + ".")
+      || keyHasPrefix(npKeys[i], tgtKey + "["))
+  ) {
+    let kprev = -1
+    if npInvBy[i] < 0 { kprev = npTys[i] }
+    narClobKeysPush(npKeys[i])
+    narClobTysPush(-1)
+    narClobPrevPush(kprev)
+    narClobDepthsPush(T.scopes.length)
+    narClobRetiredPush(2)
+    narClobBindPush(-1)
+    narClobDeclPush(-1)
+  }
+}
+
+// The join row of a write over path `tgtKey`: `prePathTy` is the path's live fact before it,
+// `pathReTy` the member it re-narrows to (-1 for none), `pathReAsg` that a null strip made it,
+// and `pathRetired` that the write retired the path's own narrowing. Pushes at most one row.
+function narClobPathWrite(
+  tgtIx: i32,
+  tgtKey: string,
+  rt: i32,
+  preSlot: i32,
+  prePathTy: i32,
+  pathReTy: i32,
+  pathReAsg: boolean,
+  pathRetired: boolean,
+) {
   // Every write over a narrowed path joins, retiring or not — the first arm's retirement is
   // what makes the second arm's flip look admitted, exactly as for a bare name. The row also
   // carries the post-guard residual's veto, which reads the retiring ones (D1846, D1849).
@@ -1951,8 +1982,6 @@ export function retireNarrowingsForWrite(
       narClobDeclPush(narKeyBind(tgtKey))
     }
   }
-  retireNameNarrowing(tgtIx, rt, atIx, preAsgTy)
-  0
 }
 
 // The variable-index arm of `retireNarrowingsForWrite`: a write `atIx` of type `rt` to index
@@ -3378,8 +3407,8 @@ function pushLitEqFact(
 }
 
 // The fact `place == lit` gives on side `holds`; false when it gives none. A union narrows when
-// every member is a literal, or when `lit` is a member no other member of a non-nullable union
-// admits (D5714); a plain `string` or `i32` stays as is.
+// every member is a literal, or when `lit` is a member no other member admits, with or without
+// a `null` beside them (D5890); a plain `string` or `i32` stays as is.
 function pushLitEqFactAt(
   place: i32,
   lit: i32,
@@ -3394,9 +3423,7 @@ function pushLitEqFactAt(
   let base = cur
   const ct = T.tys[cur]
   if ct is TyNullable { base = ct.nInner }
-  if !allLitMembers(base) && !(base == cur && litSoleHolderIn(base, lit)) {
-    return false
-  }
+  if !allLitMembers(base) && !litSoleHolderIn(base, lit) { return false }
   if isWideLitJoin(base) { return false }
   if holds {
     const meet = litSetMeetTy(cur, lit)

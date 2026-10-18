@@ -901,8 +901,8 @@ import {
   markMapUnionArmsRow,
   markValueUnionAtoms,
   markValueUnionAtomsRow,
-  mvShapeOfMapName,
   mvShapeOfMapNameArmTy,
+  mvShapeOfMapNameTys,
   mvShapeOfMapNodeTy,
   mvShapeOfValNameRowTy,
   registerValueUnionName,
@@ -1306,6 +1306,14 @@ export function synthEmptyListAnn(letIx: i32) {
 function initNullableIsBoxScalar(initIx: i32) {
   if initIx < 0 { return false }
   mapReadScalarBoxKindTy(initIx) >= 0
+}
+
+// Whether `initIx` is a bare name read the checker typed as a value-union box.
+function initIsNarrowedBoxRead(initIx: i32): boolean {
+  const ri = unwrapParen(initIx)
+  if ri < 0 || !(P.nodes[ri] is Ident) { return false }
+  const ty = nodeTyIxOf(ri)
+  ty >= 0 && tyIsValueUnionBox(ty) && !tyIsLitUnion(ty)
 }
 
 // Synthesize the `T | null` annotation of an un-annotated binding whose initializer is
@@ -2454,15 +2462,17 @@ export function synthCaptureEmptyListAnns() {
 }
 
 // Does a captured copy of a value of recorded type `ty` need its type written down: a nullable
-// list, a value union's box, or a string or list narrowed off a nullable source (D2606).
-// Each is a ref whose rep the copied name's cell resolves only through frame locals.
+// list or boolean, a value union's box, or a string or list narrowed off a nullable source
+// (D2606, D5960). Each has a rep the copied name's cell resolves only through frame locals.
 function captureCopyAnnotates(ty: i32) {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   match t {
     TyNullable => {
       if t.nInner < 0 || t.nInner >= T.tys.length { return false }
-      return T.tys[t.nInner] is TyArray
+      const it = T.tys[t.nInner]
+      if it is TyPrim { return it.primName == "boolean" }
+      return it is TyArray
     }
     TyUnion => {
       return tyIsValueUnionBox(ty) && !tyIsLitUnion(ty)
@@ -7182,7 +7192,7 @@ function collectATypeRef(i: i32, nd: TypeRef) {
     } else {
       markMapKeyUsed(mapNameKeyKind(nd.tyName))
     }
-    mvShapeOfMapName(nulMapInnerName(nd.tyName))
+    mvShapeOfMapNameTys(nulMapInnerName(nd.tyName), -1, nodeMapValTyIx(i))
   } else if nameIsStringArray(nd.tyName) {
     // Stays on the name, and the reason is the chain rather than the predicate. The arena
     // form is wider — it also answers for a `(string | null)[]` element sharing this backing
@@ -13309,6 +13319,16 @@ function collectInlineUnionsIn(stmts: i32[], walk: i32[]) {
       // An unannotated binding still has a type that can be a union (`const v = m["k"]` infers
       // `i32 | null`), so this mints the box here; idempotent, since an annotated binding just no-ops the second walk.
       if letTy < 0 {
+        // A name read narrowed to a smaller box binds that box, which no declaration
+        // registers (D5921).
+        if initIsNarrowedBoxRead(s.letInit) {
+          if (
+            collectTyReachRegister(stmts, nodeTyIxOf(s.letInit), 16, false)
+            < 0
+          ) {
+            return -1
+          }
+        }
         if initNullableIsBoxScalar(s.letInit) {
           if (
             collectTyReachRegister(stmts, nodeTyPinIxOf(s.letInit), 16, false)

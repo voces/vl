@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # `vl-queue/**`: the merge queue pushes the exact tree it is gating, and the run's
+  # `ci-proof` job lets scripts/gate.sh skip the rows this workflow already ran on it.
   push:
-    branches: [master]
+    branches: [master, "vl-queue/**"]
   pull_request:
   # Nightly: the `ci-cost` job runs only off pull requests.
   schedule:
@@ -52,7 +54,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version-file: .dvmrc
 
       # Every *.md is read by one of these (vl_doc_script_paths walks them all), so a
       # docs-only change is not unchecked; none of them needs the seed.
@@ -159,6 +161,7 @@ jobs:
       gated: ${{ steps.verdict.outputs.gated }}
       seed_key: ${{ steps.keys.outputs.seed }}
       bin_key: ${{ steps.keys.outputs.bin }}
+      rustc: ${{ steps.keys.outputs.rustc }}
     steps:
       # Blobless full history: the docs-only diff needs the merge-base's TREES, not every
       # past blob, and the full-blob fetch was 18 s of this job's critical path.
@@ -310,7 +313,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version-file: .dvmrc
 
       - name: Cache Deno modules
         uses: actions/cache@v5
@@ -408,7 +411,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version-file: .dvmrc
 
       - name: Cache Deno modules
         uses: actions/cache@v5
@@ -530,7 +533,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version-file: .dvmrc
 
       - name: Cache Deno modules
         uses: actions/cache@v5
@@ -641,7 +644,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version-file: .dvmrc
 
       - uses: actions/setup-node@v5
         with:
@@ -811,7 +814,7 @@ jobs:
 
       - uses: denoland/setup-deno@v2
         with:
-          deno-version: v2.x
+          deno-version-file: .dvmrc
 
       - name: Cache Deno modules
         uses: actions/cache@v5
@@ -1048,3 +1051,43 @@ jobs:
             exit 1
           fi
           echo "a released vl: std out of the binary from $probe, dump round-trips, CWD ignored"
+
+  # ---------------------------------------------------------------------------
+  # ci-proof — on a merge queue push only, the line scripts/ci-proof.sh reads to let
+  # scripts/gate.sh skip the rows this run covered on the same tree: the tree, the sha256 of
+  # the seed every job restored, and the rustc that built the host. It prints nothing unless
+  # every job it needs passed, and a run that skipped a job (docs-only, gated) proves nothing.
+  # tests/ci_proof_test.ts holds `needs` to every other job in this file.
+  # ---------------------------------------------------------------------------
+  ci-proof:
+    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, fuel-sidecars, ci-cost, ci-embed-seed]
+    if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job this proof covers passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          HEAVY: ${{ needs.seed.outputs.heavy }}
+          GATED: ${{ needs.seed.outputs.gated }}
+        run: |
+          bad=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"' <<< "$NEEDS")
+          [ -z "$bad" ] || { echo "no proof: $bad"; exit 1; }
+          [ "$HEAVY" = true ] && [ "$GATED" != true ] || { echo "no proof: heavy=$HEAVY gated=$GATED"; exit 1; }
+
+      - uses: actions/checkout@v5
+
+      - name: Restore the proven seed
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            build/vl-compiler.wasm
+            build/vl-compiler.wasm.src
+            build/vl-compiler.wasm.*.cwasm
+          key: ${{ needs.seed.outputs.seed_key }}
+          fail-on-cache-miss: true
+
+      - name: Proof line
+        env:
+          RUSTC: ${{ needs.seed.outputs.rustc }}
+        run: |
+          echo "ci-proof: tree $(git rev-parse HEAD^{tree}) seed $(sha256sum build/vl-compiler.wasm | cut -d' ' -f1) rustc $RUSTC"

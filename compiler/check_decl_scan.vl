@@ -151,6 +151,14 @@ export function cBoundDeclsSetAt(k: string, v: i32) { cBoundDecls[k] = v }
 export let letDeclFn: {[i32]: i32} = Map()
 export function letDeclFnPut(k: i32, v: i32) { letDeclFn.set(k, v) }
 
+// The function each function body is checked inside, -1 at module scope, -2 when two checks of
+// the body disagreed.
+export let fnDeclParent: {[i32]: i32} = Map()
+export function fnDeclParentPut(k: i32, v: i32) {
+  const was = fnDeclParent.get(k) ?? v
+  if was != v { fnDeclParent.set(k, -2) } else { fnDeclParent.set(k, v) }
+}
+
 export let wrDstDecl: {[i32]: i32} = Map()
 export function wrDstDeclPut(k: i32, v: i32) { wrDstDecl.set(k, v) }
 
@@ -388,6 +396,14 @@ export function lbiNoteRead(ix: i32, name: string) {
 // (`emit_rep.declTyIxOfName`) asks it directly, and the answers are the arena's seeded indices, so
 // the emit-side rung and this resolver's leaf are the same value by construction.
 export function primTyOfName(name: string) {
+  const t = primTyIxOfName(name)
+  if t == TY_V128 { v128Seen = true }
+  t
+}
+
+// `primTyOfName` with no side effect: a spelling's seeded primitive index, or -1. A `v128` is
+// not noted as used, so a caller asking only whether a spelling is a primitive may ask it.
+export function primTyIxOfName(name: string): i32 {
   if name == "i32" { return TY_I32 }
   if name == "i64" { return TY_I64 }
   if name == "f64" { return TY_F64 }
@@ -399,10 +415,7 @@ export function primTyOfName(name: string) {
   // named "null"); union members spell it through the `|`-split / `TS_NULL`.
   if name == "null" { return TY_NULL }
   // The SIMD substrate, spelled so `std:simd` can brand it (`type F32x4 = new v128`).
-  if name == "v128" {
-    v128Seen = true
-    return TY_V128
-  }
+  if name == "v128" { return TY_V128 }
   -1
 }
 
@@ -488,7 +501,12 @@ export function wrUnreachedBy(ci: i32, c: i32, calleeFn: i32): boolean {
   if !(dn is LetDecl) { return false }
   const cn = P.nodes[c]
   if !(cn is Call) { return false }
-  if identNameAt(cn.callFn) == dn.letName { return false }
+  // A call through this binding reaches it; one through another binding of the same name does
+  // not (D5972). An unresolved callee of the name counts as this one's.
+  if identNameAt(cn.callFn) == dn.letName {
+    const cr = identDeclOf(cn.callFn)
+    if cr == d || cr < 0 { return false }
+  }
   const fx = letDeclFn.get(d) ?? -1
   if fx < 0 || fx >= P.nodes.length { return false }
   const fd = P.nodes[fx]
@@ -511,8 +529,22 @@ export function wrUnreachedBy(ci: i32, c: i32, calleeFn: i32): boolean {
       for k in nodeChildren(at) { stack.push(k) }
     }
   }
-  // Elsewhere, a call instantiates the binding's body only if that body is generic.
-  inside || (wrFnClosed(fx) && wrFnClosed(letCstr.fn[ci]))
+  // Elsewhere, a call instantiates the binding's body only if that body or one around it is
+  // generic; a row no top-level function owns is a lambda's at module scope (D5972).
+  const ow = letCstr.fn[ci]
+  inside || (wrFnChainClosed(fx) && (ow < 0 || wrFnClosed(ow)))
+}
+
+// Whether `fx` and every function its body is checked inside are closed (`wrFnClosed`).
+function wrFnChainClosed(fx: i32): boolean {
+  let p = fx
+  let hops = 0
+  while p != -1 {
+    if !wrFnClosed(p) || hops > P.nodes.length { return false }
+    p = fnDeclParent.get(p) ?? -2
+    hops = hops + 1
+  }
+  true
 }
 
 // Whether declaration `fx` is a function with no type parameter and no un-annotated parameter.
@@ -764,6 +796,7 @@ export function matchPatNamesType(nm: string) {
 export function declScanReset() {
   cBoundDecls = Map()
   letDeclFn = Map()
+  fnDeclParent = Map()
   wrDstDecl = Map()
   moduleConstIntInit = Map()
   annUnionAtoms = Map()
