@@ -309,6 +309,7 @@ import {
   unionArmsOfTy,
   unionMemberCountOfName,
   unionSetAtomsOf,
+  unionSetAtomsOfTy,
   unionSetHasNullTy,
   unionSetMemberCount,
 } from "./emit_union_registry"
@@ -759,6 +760,11 @@ export function mvValArmOfShape(name: string): i32 {
 // resolve the wrong twin's struct. The canon is a descent, not a widening: it reaches litunion
 // atoms nested under `[]` and `{…}`, and a litunion-alias atom is preserved at every depth.
 export function mvCanonValName(valName: string) {
+  mvCanonValNameTy(valName, -1)
+}
+// `mvCanonValName` for a caller holding `ty`, the arena type `valName` renders, or -1: a
+// top-level union's atoms are read off `ty` before any split.
+export function mvCanonValNameTy(valName: string, ty: i32) {
   // Runaway cap: a value spelling this long is never a legitimate mv key, so pass it through
   // untouched and let the kind classifier's `-3` path fail loudly instead of rendering it.
   if valName.length > 4096 { return valName }
@@ -766,23 +772,21 @@ export function mvCanonValName(valName: string) {
   // `rlInternName` keys the vals ref-list slot on. Without it an annotation spelling and a
   // self-inferred factory-return lambda mint twin mv and map structs, a cast trap at the
   // returned-map read. Func-type element arrays are left untouched inside.
-  if nameIsElemArray(valName) { return rlCanonLitUnionAtoms(valName) }
+  if nameIsElemArray(valName) { return rlCanonLitUnionAtoms(valName, ty) }
   // A struct or nested-map value: canon its field and value unions through the shape, the
   // struct sibling of the `[]` arm above; what it reconciles is the nesting, not the alias.
   // The wide brace-endpoint span is deliberate — this arm must see a map value as well as a
   // struct one, so it is neither `nameIsShapeSpanEnds` nor `nameIsWholeSpanShape`.
-  if nameIsBraceSpanEnds(valName) { return rlCanonLitUnionAtoms(valName) }
+  if nameIsBraceSpanEnds(valName) { return rlCanonLitUnionAtoms(valName, ty) }
   if unionSetMemberCount(valName) < 2 { return valName }
-  canonLitUnionArms(valName)
+  canonLitUnionArms(valName, ty)
 }
 
-// The litunion-arm canon, written once: `mvCanonValName` and `rlCanonLitUnionAtoms` would
-// otherwise each carry this split, niche guard and descent loop, and two copies of a union
-// grammar are two copies of the split inside it. There is no widening leg — the preserve
-// ruling, `docs/internals/litunion-compact-rep-design.md`. What survives is the descent.
-function canonLitUnionArms(name: string): string {
-  const atoms: string[] = []
-  unionSetAtomsOf(name, atoms)
+// The litunion-arm canon of `name`, whose arena type is `ty` or -1, shared by `mvCanonValName`
+// and `rlCanonLitUnionAtoms`. It never widens an atom: the preserve ruling,
+// `docs/internals/litunion-compact-rep-design.md`.
+function canonLitUnionArms(name: string, ty: i32): string {
+  const atoms = canonAtomsOfTy(name, ty)
   let hasOther = false
   let h = 0
   while h < atoms.length {
@@ -800,7 +804,7 @@ function canonLitUnionArms(name: string): string {
     // union registry under a spelling no row is minted with, so registration and query would
     // stop agreeing.
     if !nameIsLitUnionType(a) && a != "null" {
-      const ra = rlCanonLitUnionAtoms(a)
+      const ra = rlCanonLitUnionAtoms(a, -1)
       if ra != a {
         a = ra
         changed = true
@@ -812,6 +816,17 @@ function canonLitUnionArms(name: string): string {
   }
   if changed { return canon }
   name
+}
+
+// The atoms of `name` read off `ty` while they number as many as the spelling's members, else
+// its split: a caller's type can be a join (`f64` for `i32|f64`) the spelling does not render.
+function canonAtomsOfTy(name: string, ty: i32): string[] {
+  const atoms: string[] = []
+  unionSetAtomsOfTy(name, ty, atoms)
+  if ty < 0 || atoms.length == unionSetMemberCount(name) { return atoms }
+  const split: string[] = []
+  unionSetAtomsOf(name, split)
+  split
 }
 
 // The map shape of the map type the checker recorded on node `ix` — the find-side twin of the
@@ -3579,17 +3594,17 @@ export function rlElemNicheNullable(kind: i32, name: string) {
 }
 
 // Canonicalizes an element name's unions to the one spelling every producer uses, descending
-// through array-of-union, paren grouping, inline shapes, and map values so a nested union
-// keys the same slot as a flat one. A closure element or top-level function type is left
-// untouched, since its `=>`-result litunion is not a slot-key union.
-function rlCanonLitUnionAtoms(name: string): string {
+// through arrays, parens, inline shapes and map values so a nested union keys the same slot as
+// a flat one; a function type is left untouched. `ty` is the arena type `name` renders, or -1,
+// and only a top-level union reads it.
+function rlCanonLitUnionAtoms(name: string, ty: i32): string {
   const n = name.length
   if n == 0 { return name }
   if isTopLevelFuncTypeName(name) { return name }
   // A trailing `[]`: canon the element, re-grouping a union element with parens
   // (`(K0|i32)[]`), exactly as `canonEmitName` re-wraps.
   if nameIsElemArray(name) {
-    const core = rlCanonLitUnionAtoms(arrElemNameRaw(name))
+    const core = rlCanonLitUnionAtoms(arrElemNameRaw(name), -1)
     if unionSetMemberCount(core) > 1 { return "(" + core + ")[]" }
     if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
     return core + "[]"
@@ -3601,7 +3616,7 @@ function rlCanonLitUnionAtoms(name: string): string {
   if nameIsParenSpanEnds(name) {
     const inner = groupInnerOf(name)
     if isTopLevelFuncTypeName(inner) { return name }
-    return rlCanonLitUnionAtoms(inner)
+    return rlCanonLitUnionAtoms(inner, ty)
   }
   // An inline shape: soften litunion-alias atoms inside its field or value types, the struct
   // sibling of the array descent above — without it a map value canon-softened on the
@@ -3612,7 +3627,7 @@ function rlCanonLitUnionAtoms(name: string): string {
     if nameIsMapOpen(name) {
       const mv = mapValNameOf(name)
       if mv == "" { return name }
-      const cmv = rlCanonLitUnionAtoms(mv)
+      const cmv = rlCanonLitUnionAtoms(mv, -1)
       if cmv == mv { return name }
       // `name` = `{[` + key + `]:` + mv + `}` — replace only the value tail.
       return name.slice(0, n - mv.length - 1) + cmv + "}"
@@ -3627,7 +3642,7 @@ function rlCanonLitUnionAtoms(name: string): string {
     let sfi = 0
     while sfi < fNames.length {
       if sfi > 0 { sOut = sOut + "," }
-      const ct = rlCanonLitUnionAtoms(fTypes[sfi])
+      const ct = rlCanonLitUnionAtoms(fTypes[sfi], -1)
       if ct != fTypes[sfi] { sChanged = true }
       sOut = sOut + fNames[sfi] + ":" + ct
       sfi = sfi + 1
@@ -3640,16 +3655,16 @@ function rlCanonLitUnionAtoms(name: string): string {
   // nullable struct value carries the litunion one level down). Softens a litunion atom
   // only when a genuine non-null, non-litunion sibling exists: a pure `K0 | null` is the
   // -1-sentinel mono niche, and widening it would re-rep the niche and break its values.
-  if unionSetMemberCount(name) > 1 { return canonLitUnionArms(name) }
+  if unionSetMemberCount(name) > 1 { return canonLitUnionArms(name, ty) }
   name
 }
 
-// The ref-list element's stored name normalizer. The slot key is `repElemKey` (structural);
-// this produces the canonical name several not-yet-destringified consumers still read, which
-// is why it keeps a litunion-alias atom. A future change here must also update the arm
-// scanner's closed probe vocabulary, or a preserved atom silently loses its ref-array arm.
-export function rlElemStoredName(name: string): string {
-  const c = rlCanonLitUnionAtoms(name)
+// The ref-list element's stored name for `name`, whose arena type is `ty` or -1. The slot key
+// is `repElemKey`; this canonical name, which keeps a litunion-alias atom, is what unconverted
+// consumers read. A change here must also update the arm scanner's closed probe vocabulary,
+// or a preserved atom silently loses its ref-array arm.
+export function rlElemStoredName(name: string, ty: i32): string {
+  const c = rlCanonLitUnionAtoms(name, ty)
   if nameIsI32Array(c) { return "i32[]" }
   if nameIsStringArray(c) { return "string[]" }
   c
@@ -4570,7 +4585,7 @@ function mvSlotOfMapValNameOrMonoKTys(
   // The same key rewrite the mint applies (D47/D93): `mvArmKeyName` is a pure function of
   // (rendered name, recorded value type), so the op find keys exactly what the mint keyed.
   const ivK = mvArmKeyName(ivIn, valTy)
-  const iv = mvCanonValName(ivK)
+  const iv = mvCanonValNameTy(ivK, kindTy)
   if mvValKindOfNameTy(iv, kindTy) == MVK_MONO { return -1 }
   // The find's half of the arm component (D48) — the same tri-state the mint threads,
   // answering nominally when `valTy` is known, else via `MV_ARM_NOHINT`.
