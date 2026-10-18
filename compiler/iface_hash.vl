@@ -8,6 +8,7 @@
 // a test or a probe; the build never reads it.
 import {
   AsExpr,
+  FieldDef,
   FuncDecl,
   IsExpr,
   LetDecl,
@@ -22,7 +23,7 @@ import { nodeToks } from "./ast"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { TokKind } from "./lexer"
 import { lookup } from "./check_scopes"
-import { tyMayHoldFn, tyToStr } from "./check_types"
+import { T, TyObj, tyMayHoldFn, tyToStr } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 
 let ihArmed = false
@@ -47,6 +48,11 @@ const IH_NO_LIVE = 32768
 const IH_NO_FRESH = 65536
 const IH_NO_DECOR = 131072
 const IH_NO_IMPORT_MAP = 262144
+const IH_NO_AMB_FIELDS = 524288
+const IH_NO_AMB_NAMES = 1048576
+const IH_NO_AMB_RECV = 2097152
+const IH_NO_AMB_RENDER = 4194304
+const IH_NO_AMB_GENERIC = 8388608
 
 // Statement kinds.
 const IH_ST_ROOT = 0
@@ -94,16 +100,30 @@ let ihStFull: i32[] = []
 let ihStAmb: boolean[] = []
 let ihStWrites: boolean[] = []
 let ihStRefParam: boolean[] = []
+// Ambient keys, per statement `ihAkSt[k]`: a declared name, a method's or getter's name, or one
+// record level's field names, as `ihAkW[ihAkLo[k], ihAkHi[k])`. An ambient statement that no
+// key bounds is wild. `ihDeclsOf` holds each type name's declarations, `ihFv` the words
+// `ihAmbientFv` read.
+const IH_AK_NAME = 0
+const IH_AK_RECV = 1
+const IH_AK_FIELDS = 2
+let ihStWild: boolean[] = []
+let ihAkSt: i32[] = []
+let ihAkKind: i32[] = []
+let ihAkLo: i32[] = []
+let ihAkHi: i32[] = []
+let ihAkW: string[] = []
+let ihDeclsOf: {[string]: i32[]} = Map()
+let ihFv: {[string]: boolean} = Map()
 // Import rows: module `ihImpMod[k]` binds `ihImpLocal[k]` to `ihImpOName[k]` of module
 // `ihImpOMod[k]`, the declaring one; an empty name is a namespace import.
 let ihImpMod: i32[] = []
 let ihImpLocal: string[] = []
 let ihImpOMod: i32[] = []
 let ihImpOName: string[] = []
-// Per module: the digest of its ambient statements and their count, the digest of every
+// Per module: the digest of its ambient statements, the digest of every
 // top-level declaration with bodies cut, and the digest of its import rows.
 let ihAmb: i32[] = []
-let ihAmbN: i32[] = []
 let ihDecor: i32[] = []
 let ihImpMap: i32[] = []
 // From the last `ihFinish`: each statement's rendered type, and statements by module and name.
@@ -215,7 +235,6 @@ export function ihBegin(keys: string[]): i32 {
   ihImpOMod = []
   ihImpOName = []
   ihAmb = []
-  ihAmbN = []
   ihDecor = []
   ihImpMap = []
   ihShown = []
@@ -233,7 +252,6 @@ export function ihBegin(keys: string[]): i32 {
     ihFns.push(0)
     ihExposedFns.push(0)
     ihAmb.push(IH_SEED)
-    ihAmbN.push(0)
     ihDecor.push(IH_SEED)
     ihImpMap.push(IH_SEED)
     i = i + 1
@@ -568,28 +586,153 @@ function ihScalarSpelling(s: string): boolean {
   true
 }
 
-// Whether a type spelling holds a record, which a literal in another module's check can adopt.
-function ihAmbSpelling(s: string): boolean {
+function ihAkRow(at: i32, kind: i32, ws: string[]): void {
+  ihAkSt.push(at)
+  ihAkKind.push(kind)
+  ihAkLo.push(ihAkW.length)
+  for w in ws { ihAkW.push(w) }
+  ihAkHi.push(ihAkW.length)
+}
+
+// A declared type's name without its parameters or its block-scope suffix.
+function ihDeclBase(name: string): string {
   let i = 0
-  while i < s.length {
-    if s[i] == '{' { return true }
+  while i < name.length {
+    if name[i] == '<' || name[i] == '$' { return name.slice(0, i) }
     i = i + 1
   }
-  false
+  name
+}
+
+// The keys a generic application of `head` adds to statement `at`: every record level of every
+// declaration of that name, or wild when none is declared.
+function ihHeadKeys(head: string, at: i32, seen: string[]): void {
+  for h in seen {
+    if h == head { return }
+  }
+  seen.push(head)
+  const ds = ihDeclsOf[ihDeclBase(head)] ?? []
+  if ds.length == 0 { ihStWild[at] = true }
+  for d in ds { ihDeclKeys(d, at, seen) }
+}
+
+// Declaration `x`'s record levels as keys of statement `at`.
+function ihDeclKeys(x: i32, at: i32, seen: string[]): void {
+  const nd = P.nodes[x]
+  if nd is TypeDecl {
+    const ws: string[] = []
+    let ok = true
+    for f in nd.tdFields {
+      let typed = false
+      if f >= 0 {
+        const fd = P.nodes[f]
+        if fd is FieldDef {
+          ws.push(fd.fdName)
+          if fd.fdType >= 0 {
+            const ft = P.nodes[fd.fdType]
+            if ft is TypeRef {
+              ihSpellKeys(ft.tyName, at, seen)
+              typed = true
+            }
+          }
+        }
+      }
+      if !typed { ok = false }
+    }
+    if ok { ihAkRow(at, IH_AK_FIELDS, ws) } else { ihMarkWild(at) }
+  } else if nd is UnionDecl {
+    for v in nd.udVariants { ihSpellKeys(v, at, seen) }
+  } else {
+    ihMarkWild(at)
+  }
+}
+
+// A statement no key bounds: any check may read it.
+function ihMarkWild(at: i32): void { ihStWild[at] = true }
+
+// The index past the quoted literal opening at `s[i]`.
+function ihSkipQuoted(s: string, i: i32): i32 {
+  const q = s[i]
+  let j = i + 1
+  while j < s.length && s[j] != q {
+    if s[j] == '\\' { j = j + 1 }
+    j = j + 1
+  }
+  j + 1
+}
+
+// Whether a type spelling holds a record level or a generic application, which a literal in
+// another module's check can adopt; each record level's field names become a key of `at`.
+function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
+  let amb = false
+  const kinds: boolean[] = []
+  const words: string[][] = []
+  let i = 0
+  while i < s.length {
+    const c = s[i]
+    if ihWordCode(c) {
+      let j = i
+      while j < s.length && (ihWordCode(s[j]) || s[j] == '$') { j = j + 1 }
+      let k = j
+      while k < s.length && (s[k] == ' ' || s[k] == '?') { k = k + 1 }
+      const top = kinds.length - 1
+      if k < s.length && s[k] == ':' && top >= 0 && kinds[top] {
+        words[top].push(s.slice(i, j))
+      } else if j < s.length && s[j] == '<' && !ihOn(IH_NO_AMB_GENERIC) {
+        amb = true
+        ihHeadKeys(s.slice(i, j), at, seen)
+      }
+      i = j
+    } else if c == '"' || c == '\'' {
+      i = ihSkipQuoted(s, i)
+    } else if c == '=' && i + 1 < s.length && s[i + 1] == '>' {
+      i = i + 2
+    } else if c == '{' || c == '(' || c == '[' || c == '<' {
+      let k = i + 1
+      while k < s.length && s[k] == ' ' { k = k + 1 }
+      const rec = c == '{' && !(k < s.length && s[k] == '[')
+      if rec { amb = true }
+      kinds.push(rec)
+      const none: string[] = []
+      words.push(none)
+      i = i + 1
+    } else if c == '}' || c == ')' || c == ']' || c == '>' {
+      const rec = kinds.pop() ?? false
+      const ws = words.pop() ?? []
+      if rec { ihAkRow(at, IH_AK_FIELDS, ws) }
+      i = i + 1
+    } else {
+      i = i + 1
+    }
+  }
+  amb
 }
 
 // Whether `fd` is found by a call that does not name it through an import: a method on its
-// first parameter `self`, a getter, or an operator.
-function ihReceiverFn(fd: FuncDecl): boolean {
-  const nm = ihSourceName(fd.fnName)
+// first parameter `self`, a getter, or an operator. A method's or getter's name becomes a key
+// of `at`; an operator makes `at` wild.
+function ihReceiverFn(fd: FuncDecl, at: i32): boolean {
+  let nm = ihSourceName(fd.fnName)
+  let recv = false
   let i = 0
   while i < nm.length {
-    if !ihWordCode(nm[i]) { return true }
-    i = i + 1
+    if nm[i] == '.' {
+      recv = true
+      nm = nm.slice(i + 1, nm.length)
+      i = 0
+    } else if !ihWordCode(nm[i]) {
+      if at >= 0 { ihStWild[at] = true }
+      return true
+    } else {
+      i = i + 1
+    }
   }
-  if fd.fnParams.length == 0 { return false }
-  const pn = P.nodes[fd.fnParams[0]]
-  pn is Param && pn.parName == "self"
+  if !recv && fd.fnParams.length > 0 {
+    const pn = P.nodes[fd.fnParams[0]]
+    recv = pn is Param && pn.parName == "self"
+  }
+  if recv && at >= 0 { ihAkRow(at, IH_AK_RECV, [nm]) }
+  recv
 }
 
 // The statement row holding token `t`, or -1.
@@ -607,31 +750,147 @@ function ihStAt(t: i32): i32 {
 }
 
 // After every module's rows: mark the statements that hold a type declaration, a structural
-// type spelling, or a receiver-found function, anywhere in their tokens, bodies included.
+// type spelling, or a receiver-found function, anywhere in their tokens, bodies included, and
+// key each by the names and record levels a check reading it unimported could match.
 export function ihAmbientScan(): i32 {
   ihStAmb = []
+  ihStWild = []
+  ihAkSt = []
+  ihAkKind = []
+  ihAkLo = []
+  ihAkHi = []
+  ihAkW = []
+  ihDeclsOf = Map()
   let s = 0
   while s < ihStMod.length {
     ihStAmb.push(ihStKind[s] == IH_ST_TYPE)
+    ihStWild.push(false)
     s = s + 1
   }
   let x = 0
   while x < P.nodes.length {
     const nd = P.nodes[x]
-    let amb = false
-    if nd is TypeRef { amb = ihAmbSpelling(nd.tyName) }
-    if nd is IsExpr { amb = ihAmbSpelling(nd.isVariant) }
-    if nd is AsExpr { amb = ihAmbSpelling(nd.asTy) }
-    if nd is TypeDecl { amb = true }
-    if nd is UnionDecl { amb = true }
-    if nd is FuncDecl { amb = ihReceiverFn(nd) }
-    if amb {
-      const at = ihStAt(nodeLastTok(x))
-      if at >= 0 { ihStAmb[at] = true }
+    let nm = ""
+    if nd is TypeDecl { nm = ihDeclBase(nd.tdName) }
+    if nd is UnionDecl { nm = ihDeclBase(nd.udName) }
+    if nm != "" {
+      const prev = ihDeclsOf[nm] ?? []
+      prev.push(x)
+      ihDeclsOf[nm] = prev
     }
     x = x + 1
   }
+  x = 0
+  while x < P.nodes.length {
+    const nd = P.nodes[x]
+    const at = ihStAt(nodeLastTok(x))
+    const seen: string[] = []
+    let amb = false
+    if at >= 0 {
+      if nd is TypeRef { amb = ihSpellKeys(nd.tyName, at, seen) }
+      if nd is IsExpr { amb = ihSpellKeys(nd.isVariant, at, seen) }
+      if nd is AsExpr { amb = ihSpellKeys(nd.asTy, at, seen) }
+      if nd is TypeDecl {
+        amb = true
+        ihAkRow(at, IH_AK_NAME, [ihDeclBase(nd.tdName)])
+        ihDeclKeys(x, at, seen)
+      }
+      if nd is UnionDecl {
+        amb = true
+        ihAkRow(at, IH_AK_NAME, [ihDeclBase(nd.udName)])
+        ihDeclKeys(x, at, seen)
+      }
+      if nd is FuncDecl { amb = ihReceiverFn(nd, at) }
+      if amb { ihStAmb[at] = true }
+    }
+    x = x + 1
+  }
+  ihWildUnkeyed()
+}
+
+// Every ambient statement that holds no key is wild.
+function ihWildUnkeyed(): i32 {
+  const keyed: boolean[] = []
+  let s = 0
+  while s < ihStMod.length {
+    keyed.push(false)
+    s = s + 1
+  }
+  for a in ihAkSt { keyed[a] = true }
+  s = 0
+  while s < ihStMod.length {
+    if ihStAmb[s] && !keyed[s] { ihMarkWild(s) }
+    s = s + 1
+  }
   0
+}
+
+// Before `ihAmbientMeets`: the words a check of the modules `inS` can match an ambient key with,
+// every token they spell and every field name the check's arena holds.
+export function ihAmbientFv(inS: boolean[]): i32 {
+  ihFv = Map()
+  let s = 0
+  while s < ihStMod.length {
+    const m = ihStMod[s]
+    if m >= 0 && m < inS.length && inS[m] {
+      let t = ihStLo[s]
+      while t < ihStHi[s] && t < P.toks.length {
+        const w = P.toks[t].text
+        ihFv[w] = true
+        if w.length >= 2 && (w[0] == '"' || w[0] == '\'') {
+          ihFv[w.slice(1, w.length - 1)] = true
+        }
+        t = t + 1
+      }
+    }
+    s = s + 1
+  }
+  for ty in T.tys {
+    if ty is TyObj {
+      for f in ty.objFieldNames { ihFv[f] = true }
+    }
+  }
+  0
+}
+
+// Per module: whether one of its ambient statements may change a check of the modules
+// `ihAmbientFv` read, which then holds diagnostics when `diags`. A statement may when it is
+// wild, when the check spells its name, or when the check spells every field of a level.
+export function ihAmbientMeets(diags: boolean): boolean[] {
+  const out: boolean[] = []
+  let d = 0
+  while d < ihKeys.length {
+    out.push(false)
+    d = d + 1
+  }
+  if ihOn(IH_NO_AMBIENT) { return out }
+  let s = 0
+  while s < ihStMod.length {
+    const m = ihStMod[s]
+    if ihStAmb[s] && m >= 0 && m < out.length {
+      if ihStWild[s] || (diags && !ihOn(IH_NO_AMB_RENDER)) { out[m] = true }
+    }
+    s = s + 1
+  }
+  let k = 0
+  while k < ihAkSt.length {
+    const m = ihStMod[ihAkSt[k]]
+    if m >= 0 && m < out.length && !out[m] {
+      const kind = ihAkKind[k]
+      let all = true
+      let w = ihAkLo[k]
+      while w < ihAkHi[k] {
+        if !ihFv.has(ihAkW[w]) { all = false }
+        w = w + 1
+      }
+      if kind == IH_AK_NAME && ihOn(IH_NO_AMB_NAMES) { all = false }
+      if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
+      if kind == IH_AK_FIELDS && ihOn(IH_NO_AMB_FIELDS) { all = false }
+      if all { out[m] = true }
+    }
+    k = k + 1
+  }
+  out
 }
 
 function ihTokHash(a: i32, b: i32): i32 {
@@ -1007,7 +1266,6 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
   let d = 0
   while d < ihKeys.length {
     ihAmb[d] = IH_SEED
-    ihAmbN[d] = 0
     ihDecor[d] = IH_SEED
     ihImpMap[d] = IH_SEED
     const none: i32[] = []
@@ -1034,7 +1292,6 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
     }
     if s < ihStAmb.length && ihStAmb[s] && !ihOn(IH_NO_AMBIENT) {
       ihAmb[m] = ihMixInt(ihAmb[m], ihStFull[s])
-      ihAmbN[m] = ihAmbN[m] + 1
     }
     if !ihOn(IH_NO_DECOR) {
       let ex = 0
@@ -1386,12 +1643,6 @@ export function ihReachOf(i: i32, o: i32): i32 {
 }
 
 export function ihReachFresh(): boolean { ihFreshHit }
-
-// How many of module `m`'s statements another module's check may read without importing them.
-export function ihAmbientCount(m: i32): i32 {
-  if m < 0 || m >= ihAmbN.length { return 0 }
-  ihAmbN[m]
-}
 
 // Readers over the last armed module compile, by module table index (0 is the entry).
 export function ifaceHashCount(): i32 { ihOwn.length }

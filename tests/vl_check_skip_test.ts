@@ -570,6 +570,15 @@ const CASES: Case[] = [
     uses: "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nconst xj: J = idn({ f: 4 })\nprint(xj.f ?? 0)\n",
   },
   {
+    name: "a lib generic application spells main's literal record",
+    want: "decline",
+    why: "ambient",
+    from: "function quiet",
+    to: "function bq(b: Bx<i32>): void { print(b.f) }\nfunction quiet",
+    libUses: "export type J = { f: i32 | null }\ntype Bx<T> = { f: T }\n",
+    uses: 'import { J } from "./lib"\nfunction idn<T>(v: T): T { v }\nconst xj: J = idn({ f: 4 })\nprint(xj.f ?? 0)\n',
+  },
+  {
     name: "a private lib self-function main's typo is near",
     want: "decline",
     why: "ambient",
@@ -584,6 +593,42 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "type Shapez = { w: i32 }\nfunction quiet",
     uses: "const tq: Shapy = 1\n",
+  },
+  {
+    // Lib's own error may suggest a name main declares, so a lib diagnostic meets every
+    // served ambient statement.
+    name: "a lib method typo is near a private main self-function",
+    want: "decline",
+    why: "ambient",
+    from: "n * 2",
+    to: "n * 3",
+    libUses: 'const sq = "abc"\nconst sr = sq.zzz()\n',
+    uses: "function zzq(self: string): i32 { 1 }\n",
+  },
+  {
+    // A getter is found from its receiver without an import, so its name is a key.
+    name: "main declares a getter on a lib type lib reads",
+    want: "decline",
+    why: "ambient",
+    from: "n * 2",
+    to: "n * 3",
+    libUses: "export type Cq = new i32\nfunction qv(): void {\n  const c = 3 as! Cq\n  print(c.zzg)\n}\n",
+    uses: 'import { Cq } from "./lib"\nget zzg(self: Cq): i32 { 1 }\n',
+  },
+  {
+    // Lib spells none of the fields, so no lib literal can adopt main's record.
+    name: "main's private record has fields lib never spells",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses: "type Mq = { zqa: i32, zqb: i32 }\nconst mq: Mq = { zqa: 1, zqb: 2 }\nprint(mq.zqa)\n",
+  },
+  {
+    name: "main's private self-function has a name lib never spells",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses: 'function zzm(self: string): i32 { 1 }\nprint("a".zzm())\n',
   },
   {
     name: "main's private type spells a lib body literal's record",
@@ -817,6 +862,13 @@ Deno.test({
       ["a lib body annotation spells main's literal record", 16384],
       ["a private lib type spells main's literal record", 16384],
       ["main's private type spells a lib body literal's record", 16384],
+      // Each narrowing of `IH_NO_AMBIENT` loses its own case when its key is dropped:
+      // `IH_NO_AMB_FIELDS`, `IH_NO_AMB_GENERIC`, `IH_NO_AMB_RENDER`, and
+      // `IH_NO_AMB_RECV | IH_NO_AMB_RENDER` (the getter's read is itself a lib diagnostic).
+      ["main's private type spells a lib body literal's record", 524288],
+      ["a lib generic application spells main's literal record", 8388608],
+      ["a lib method typo is near a private main self-function", 4194304],
+      ["main declares a getter on a lib type lib reads", 2097152 | 4194304],
       // `IH_NO_LIVE` cuts a writing body to its mentions, which miss the field it writes.
       ["a callee's write moves to the narrowed field", 32768],
       ["a callee's helper write moves to the narrowed field", 32768],
@@ -929,4 +981,3 @@ export function noise(): void { quiet() }
     }
   },
 });
-

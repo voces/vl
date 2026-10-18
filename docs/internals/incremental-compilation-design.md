@@ -1292,7 +1292,8 @@ reads S, and names what covers it.
   - a function-valued inferred binding;
   - a namespace import of an S module.
 - `ambient`: every R1 and F2 case. R1 is the bar the compiler graph hits, because nearly
-  every compiler module declares a type.
+  every compiler module declares a type. Step 8 narrows R1 to statements whose keys S's
+  check can match.
 - `fresh` and `decor`: conservative guards. Neither has a mutation witness. Dropping decor
   (`IH_NO_DECOR`) gives 0 unsound, and master's per-module hash served two of the fresh
   cases soundly. Those two now decline. They are kept because the argument for serving them is not written, and the bar is
@@ -1370,6 +1371,147 @@ On diderven, the served commits serve 180–183 modules. The declines there are 
   - master's seed on this branch's source: 104,587,959,877.
 
   The unarmed path therefore costs nothing, and the +0.63% is the size of the added source.
+
+**S5 step 8: R1 is keyed, so an ambient statement declines only the checks that can match it**
+(`ihAmbientScan`, `ihAmbientFv` and `ihAmbientMeets` in `compiler/iface_hash.vl`; `skSettle`
+in `compiler/driver.vl`). Through step 7, R1 declined a served module that held *any*
+ambient statement whenever S was non-empty. Nearly every compiler module declares a type, so
+the compiler graph never served. Now each ambient statement carries *key rows*, and R1
+declines a served module only when one of its statements *meets* the check of S.
+
+*The keys.* `ihAmbientScan` gives each ambient statement one or more rows:
+- **NAME**: a type or union declaration's base name.
+- **RECV**: a receiver-found function's name, for a `self` method or a getter.
+- **FIELDS**: the field-name set of one record level. It is taken from a `{ … }` spelling in
+  a `TypeRef`, `is` or `as`; from a type declaration's fields; and from a union's variants.
+  Field types are followed into nested levels.
+- **Generic heads**: a spelling that applies `Head<…>` adds the FIELDS rows of every
+  declaration named `Head`, followed transitively. Through step 7 such a spelling was not
+  ambient at all (see the hole below).
+- **WILD**: no key bounds the statement. This covers:
+  - operators;
+  - a field whose type is not a `TypeRef`;
+  - a generic head with no declaration in the graph;
+  - an ambient statement that no rule keys.
+
+*When a statement meets the check of S.* `ihAmbientFv` collects FV(S):
+- every token text of S's statements, and each quoted token with its quotes stripped;
+- every field name of every `TyObj` in the check's arena.
+
+The statement meets when any of the following holds:
+- it is WILD;
+- S's check holds any diagnostic (RENDER);
+- every word of one of its key rows is in FV(S).
+
+F2 is unchanged.
+
+*The soundness argument.* R1 exists because S is checked without the served modules merged,
+and a whole check of S could read a served module's statement that S never imports. The
+argument lists each way that read can happen, and shows the key it needs is in FV(S).
+1. **Record adoption.** A literal adopts a declared record only on an exact field-name set
+   (`recBuiltAtDeclared` → `objFieldNameSetsEq`).
+   - The literal's fields are tokens of S, or field names of a `TyObj` S's check built, so
+     they are all in FV(S).
+   - An adopted level's FIELDS row is therefore a subset of FV(S). Subset is weaker than set
+     equality, so the test is conservative.
+2. **Generic applications.** A spelling `Box<{…}>` or `Pair<Head>` instantiates the head's
+   declarations, and a literal can adopt any record level they reach.
+   - The head's FIELDS rows are keyed the same way as a direct spelling.
+   - A head the graph does not declare is WILD.
+3. **Receiver calls.** `x.name(…)` and a getter `x.name` are found from the receiver's type,
+   in any module. A getter is global: main's getter on lib's type changes lib's diagnostic.
+   - The call spells `name`, so the RECV row is in FV(S).
+   - An operator is found from no spelled name, so it is WILD.
+4. **Type names.** A NAME row is kept, but a private type is module-scoped, so no witness
+   reads it unimported (see the table below). It is a conservative guard, not a narrowing
+   this step claims.
+5. **Diagnostic text.** A diagnostic can suggest a near name from any module, for a type or
+   a receiver function. A near name is not in FV(S) by construction, so any diagnostic in S
+   meets every ambient statement (RENDER). A clean check of S suggests nothing.
+6. **Anything not keyed** is WILD, and declines as in step 7.
+
+*The generic-application hole on master.* In step 7, a spelling holding `<` but no `{` was
+not ambient. A lib annotation `Box<Rec>` beside a main literal that adopts `Rec`'s level
+through the instance served wrongly. The case "a lib generic application spells main's
+literal record" is the witness. It is served wrongly on master's seed, and the armed LSP
+ships that path.
+
+*`fresh` and `decor`.* Both stay guarded, and neither has a mutation witness.
+- Dropping fresh (65536), decor (131072) or both gives 0 unsound over the suite. The fresh
+  drop serves "a served call is a second site…" and "a lib call stops delivering…", and the
+  decor drop serves the five "bad" variants, all correctly.
+- They are kept because the argument for serving them is not written. A fresh builder's
+  check joins its call sites, and the served sites are missing from S's check. A decor change
+  can rename what a served diagnostic spells, and F2 covers only the ambient part of that.
+- Neither fires on the diderven replay. On the compiler, `fresh` is the next decline once
+  R1 is dropped.
+
+*Mutation witnesses* (`ifaceHashDrop`). Each mask serves its witness unsoundly:
+
+| mask | channel dropped | witness |
+| --- | --- | --- |
+| 524288 | FIELDS | main's private type spells a lib body literal's record |
+| 8388608 | generic heads | a lib generic application spells main's literal record |
+| 4194304 | RENDER | a lib method typo is near a private main self-function |
+| 2097152 \| 4194304 | RECV, RENDER | main declares a getter on a lib type lib reads |
+| 1048576 | NAME | none: a private type is module-scoped, so it is kept as a guard only |
+
+RECV has no witness alone, because every RECV case that changes a result also holds a
+diagnostic, and RENDER declines it.
+
+*Differential suite* (`tests/vl_check_skip_test.ts`): 61 edits. 20 must serve, 38 must decline,
+and 3 may do either (step 7: 18, 35 and 3). The new cases are:
+- must decline: the generic application, the method typo and the getter above;
+- must serve: "main's private record has fields lib never spells" and "main's private
+  self-function has a name lib never spells". On step 7's seed both declined `ambient`.
+
+*Replays.* `met` is the number of served modules R1 declines; `moved` is the number of S
+modules F2 declines.
+
+| graph | step 7 | this step | unsound |
+| --- | --- | --- | --- |
+| `compiler/entry.vl`, last 30 commits (217–218 modules) | 28 ambient, 2 all | 27 ambient, 2 all, 1 graph | 0 |
+| same, FIELDS and generic heads dropped (8912896) | — | 21 fresh, 6 ambient, 2 all, 1 graph | 0 |
+| diderven `src/game.vl`, last 30 commits (read-only copy, 178–183 modules) | 3 served, 14 demand, 10 graph, 3 all | 15 served, 5 demand, 10 graph | 0 |
+
+The diderven rows are not the same 30 commits: its history moved on between the two runs.
+
+- **The compiler graph** still serves 0 of 30, but R1 now meets 1–8 of the 217 modules,
+  where step 7 met nearly all of them.
+  - The meets that remain are FIELDS and generic-head matches. Dropping NAME, RECV or
+    RENDER does not change them.
+  - With FIELDS and generic heads dropped, R1 meets nothing on 27 of the 30 commits. The
+    6 commits still `ambient` each have an S module whose ambient digest moved (F2).
+  - Behind R1, `fresh` declines. Step 7 measured the reaches moving behind `fresh`.
+- **On diderven**, all 15 served commits leave the game graph's sources unchanged (|S| = 0).
+  - **`demand`** (5 commits): S's downward closure grows to a module with a defaulted
+    parameter, and a served importer imports that function. Examples are
+    `newLevel(…, wall: i32 = 0)` in `tiles.vl`, `newDrop(fx: ShotFx = "skill")`,
+    `setDist(channel: i32 = 0)`, `setFloor(foam: i32 = 0)` and `key(t: f64 = 0.0)`.
+    `skClosed` reads any defaulted parameter as `SK_OPEN`.
+  - **`graph`** (10 commits): the module count changed. Most are a merge-interleaved
+    history replayed linearly, and the module count goes 182 → 183 and back. Most of them also
+    edit `game.vl`, so they would decline `all` anyway.
+  - **The cheapest next narrowing** is `demand`: read an annotated parameter whose default is
+    a scalar literal as closed in `skClosed`. Its call checks no instance, so the default
+    cannot reach the origin's diagnostics. `graph` needs the bank to survive a module
+    being added, which is a larger change.
+- **Next for the compiler**:
+  - Match FIELDS rows exactly, against the field-name sets of S's own literal `TyObj`s,
+    instead of as a subset of FV(S). This is what adoption tests.
+  - Then write the argument for serving `fresh`.
+
+- **Cost.**
+  - The seed is 6,233,522 bytes, against 6,221,833 for master's source built by the same
+    seed (+11,689, +0.19%).
+  - L2 self-compile guest fuel:
+    - master's seed on master's source: 105,425,008,859;
+    - this branch's seed on its own source: 105,868,558,135 (+0.42%).
+  - The unarmed path runs none of the new code.
+  - An armed check that declines on the compiler graph pays for the check of S and then
+    the whole check, about 1.5–2× an unarmed check (for example 7.2 s against 3.7 s).
+    Through step 7 the same decline came at the same point.
+  - A served diderven check takes 83–160 ms against 294–379 ms unarmed.
 
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
