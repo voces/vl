@@ -1060,7 +1060,7 @@ axis(
 // CALLED CAPTURED NARROWED LOCALS. `n` closures over narrowed nullable locals, each called once,
 // split over `fns` functions: the many arm puts all of them in one frame, the other spreads them
 // twenty to a function. Same statements either way, so only work per frame per closure moves —
-// each call re-asking about every narrowing and closure the frame holds (D5950). Fuel reads 1.09;
+// each call re-asking about every narrowing and closure the frame holds (D5950). Fuel reads 1.14;
 // master before the fix read 41.3.
 const genCalledNarrowedCaptures = (n: number, fns: number): string => {
   const o: string[] = ["let acc = 0"];

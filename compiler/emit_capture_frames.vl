@@ -13,7 +13,6 @@ import {
   Program,
   WhileStmt,
   elseIfLink,
-  i32ToStr,
   nodeSpineChildren,
 } from "./ast"
 import { nodeTyIxOf } from "./check_node_tys"
@@ -55,34 +54,25 @@ export function nestedFnDeclaredIn(name: string, pp: i32) {
   if fnChildHead.length != fnStmts.length { buildFnChildIndex() }
   if pp < 0 || pp >= fnChildHead.length { return -1 }
   if nfdWalkDepth > 0 { return nfdIndexedIn(name, pp) }
-  let i = fnChildHead[pp]
-  while i >= 0 {
-    const s = P.nodes[fnStmts[i]]
-    if s is FuncDecl {
-      if s.fnName == name { return i }
-    }
-    i = fnChildNext[i]
-  }
-  -1
+  nfdScan(name, pp)
 }
 
-// Inside a capture walk, `nestedFnDeclaredIn` reads each frame's children once into a name
-// index: `nfdStamp[pp]` is the walk that indexed frame `pp`, `nfdFirst` its first child per
-// name. A walk renames no function and moves no `fnStmts` row, so the index answers as the
-// scan does; without it a frame of `n` called closures costs `n` squared per walk (D5950).
+// Inside a capture walk, `nestedFnDeclaredIn` scans a frame the first time the walk asks about
+// it and indexes its children by name the second: `nfdAsked`/`nfdBuilt` stamp the walk that did
+// each, `nfdMaps[pp]` is the index. A walk renames no function and moves no `fnStmts` row, so the
+// index answers as the scan does; without it `n` called closures in a frame cost `n` squared (D5950).
 let nfdWalkDepth: i32 = 0
 let nfdGen: i32 = 0
-let nfdStamp: i32[] = []
-let nfdFirst: {[string]: i32} = Map()
+let nfdAsked: i32[] = []
+let nfdBuilt: i32[] = []
+let nfdMaps: {[string]: i32}[] = []
 let nfdFnLen: i32 = -1
 let nfdNodeLen: i32 = -1
+const nfdNoMap: {[string]: i32} = Map()
 
 // Brackets a capture walk; a nested walk shares the outermost one's index.
 export function nfdWalkEnter() {
-  if nfdWalkDepth == 0 {
-    nfdGen = nfdGen + 1
-    nfdFirst = Map()
-  }
+  if nfdWalkDepth == 0 { nfdGen = nfdGen + 1 }
   nfdWalkDepth = nfdWalkDepth + 1
   0
 }
@@ -96,36 +86,56 @@ export function nfdWalkLeave() {
 export function nfdReset() {
   nfdWalkDepth = 0
   nfdGen = 0
-  nfdStamp = []
-  nfdFirst = Map()
+  nfdAsked = []
+  nfdBuilt = []
+  nfdMaps = []
   nfdFnLen = -1
   nfdNodeLen = -1
   0
+}
+
+// The first child of frame `pp` named `name`, by a walk of its children.
+function nfdScan(name: string, pp: i32): i32 {
+  let i = fnChildHead[pp]
+  while i >= 0 {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      if s.fnName == name { return i }
+    }
+    i = fnChildNext[i]
+  }
+  -1
 }
 
 // A row pushed to `fnStmts` or the arena mid-walk starts a fresh index rather than trust this one.
 function nfdIndexedIn(name: string, pp: i32): i32 {
   if fnStmts.length != nfdFnLen || P.nodes.length != nfdNodeLen {
     nfdGen = nfdGen + 1
-    nfdFirst = Map()
     nfdFnLen = fnStmts.length
     nfdNodeLen = P.nodes.length
   }
-  while nfdStamp.length <= pp { nfdStamp.push(0) }
-  const pk = i32ToStr(pp) + ":"
-  if nfdStamp[pp] != nfdGen {
-    nfdStamp[pp] = nfdGen
-    let i = fnChildHead[pp]
-    while i >= 0 {
-      const s = P.nodes[fnStmts[i]]
-      if s is FuncDecl {
-        const k = pk + s.fnName
-        if !nfdFirst.has(k) { nfdFirst[k] = i }
-      }
-      i = fnChildNext[i]
-    }
+  while nfdAsked.length <= pp {
+    nfdAsked.push(0)
+    nfdBuilt.push(0)
+    nfdMaps.push(nfdNoMap)
   }
-  nfdFirst[pk + name] ?? -1
+  if nfdBuilt[pp] == nfdGen { return nfdMaps[pp][name] ?? -1 }
+  if nfdAsked[pp] != nfdGen {
+    nfdAsked[pp] = nfdGen
+    return nfdScan(name, pp)
+  }
+  const m: {[string]: i32} = Map()
+  let i = fnChildHead[pp]
+  while i >= 0 {
+    const s = P.nodes[fnStmts[i]]
+    if s is FuncDecl {
+      if !m.has(s.fnName) { m[s.fnName] = i }
+    }
+    i = fnChildNext[i]
+  }
+  nfdMaps[pp] = m
+  nfdBuilt[pp] = nfdGen
+  m[name] ?? -1
 }
 
 // The pass, the node count and the reported edits; then a slot replaced or a name rewritten in
