@@ -35,6 +35,7 @@ import {
   fsbNoteCall,
   genFnValueCstrs,
   holeDeclCstrsAt,
+  holeDeclCstrsBind,
   holeLambdaDefers,
   holeLambdaSeedTy,
   validateArgCstrs,
@@ -219,6 +220,7 @@ import {
   genFnHoleCalled,
   genFnHoleInstance,
   holeRetTyOf,
+  judgeHoleCallBinOps,
   substTyDeep,
   tErr,
   tErrUnsupported,
@@ -1765,6 +1767,7 @@ function judgeFnArgHoleCalls(
           if insts.length > 1 && !noSplit {
             holeFnSplitAt(calleeFn, dhNames[j])
           }
+          if insts.length > 1 { judgeHoleCallBinOps(calleeFn, vNames, wTys, a) }
           const d0 = T.diags.length
           for inst in insts {
             if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
@@ -1814,22 +1817,25 @@ function pinHoleLambdaVals(
       // whether it arrives as a literal or by name (D6112).
       const unread = how == 1 || (how < 0 && holeArgNamedAt(ix, lx))
       const dflt = inst == GEN_FN_HOLE_UNCALLED && unread
-      if dflt { inst = holeLambdaAtI32(vt) }
-      if inst >= 0 {
+      if dflt {
+        inst = holeLambdaDefault(vt, vNames, vTys, ix)
+      } else if inst >= 0 {
         const nm: string[] = []
         const ty: i32[] = []
         for v in vNames { nm.push(v) }
         for t in vTys { ty.push(t) }
         holeLambdaBinds(vt, inst, nm, ty)
-        const d0 = T.diags.length
         judgeHoleLambdaAt(vt, inst, nm, ty, ix)
-        if dflt && T.diags.length > d0 {
-          while T.diags.length > d0 { T.diags.pop() }
-          inst = -1
-        }
       }
-      if inst >= 0 { vTys[k] = inst }
-      else if how >= 0 { holeLambdaUninferable(lx) }
+      if inst >= 0 {
+        vTys[k] = inst
+      } else if how >= 0 {
+        holeLambdaUninferable(lx)
+      } else {
+        const insts: i32[] = []
+        genFnHoleCallInsts(vNames, vTys, k, vt, calleeFn, insts)
+        if insts.length > 1 { judgeHoleCallBinOps(calleeFn, vNames, vTys, ix) }
+      }
     }
     k = k + 1
   }
@@ -1862,7 +1868,7 @@ function callLeavesDefault(n: Call, calleeFn: i32): boolean {
 }
 
 // A declared generic handed by name to a parameter `calleeFn`'s body never reads is never called,
-// so it takes an `i32` default where its body checks clean there, as a lambda does (D6213).
+// so it takes the first unread default its body checks clean at, as a lambda does (D6213).
 function pinUnreadGenFnArgs(
   vNames: string[],
   vTys: i32[],
@@ -1883,12 +1889,27 @@ function pinUnreadGenFnArgs(
       const vt = vTys[k]
       const open = tyIsForeignGenericSig(vt) || tyIsHoleGenericSig(vt)
       if d >= 0 && open && holeParamUnreadAt(calleeFn, dhNames[j]) {
-        const inst = genFnAtI32(vt)
-        if inst >= 0 {
-          const d0 = T.diags.length
-          holeDeclCstrsAt(a, d, nodeTyOf(a), inst)
-          if T.diags.length == d0 { vTys[k] = inst }
-          while T.diags.length > d0 { T.diags.pop() }
+        let di = 0
+        while di < UNREAD_HOLE_DEFAULTS {
+          const inst = unreadHoleDefault(vt, di, false)
+          if inst >= 0 {
+            const d0 = T.diags.length
+            const bNames: string[] = []
+            const bTys: i32[] = []
+            genFnValueCstrs(a, nodeTyOf(a), inst)
+            if T.diags.length == d0 {
+              holeDeclCstrsBind(a, d, nodeTyOf(a), inst, bNames, bTys)
+            }
+            const ok = T.diags.length == d0
+            while T.diags.length > d0 { T.diags.pop() }
+            // A result its parameters leave open is the one the body derives there.
+            const at = substTyDeep(inst, bNames, bTys)
+            if ok && at >= 0 && !tyHasTyVar(at) {
+              vTys[k] = at
+              di = UNREAD_HOLE_DEFAULTS
+            }
+          }
+          di = di + 1
         }
       }
     }
@@ -1911,43 +1932,72 @@ function holeParamUnreadAt(fn: i32, hole: string): boolean {
   false
 }
 
-// Function type `ft` with each parameter that is a type variable at `i32`; -1 when that leaves
-// one open.
-function genFnAtI32(ft: i32): i32 {
+// The types an unread hole's default is tried at, in order: whichever the body admits first
+// is taken, and as nothing calls it no caller can observe which (D6301).
+const UNREAD_HOLE_DEFAULTS = 3
+
+// Function type `ft` with each parameter type variable (only the lambda's own holes when `lam`)
+// at the `di`th unread default; -1 past the last or when that leaves a parameter open, or for a
+// lambda its result.
+function unreadHoleDefault(ft: i32, di: i32, lam: boolean): i32 {
+  if di < 0 || di >= UNREAD_HOLE_DEFAULTS || ft < 0 || ft >= T.tys.length {
+    return -1
+  }
   const lf = T.tys[ft]
   if !(lf is TyFunc) { return -1 }
+  let at = TY_I32
+  if di == 1 { at = mkArrayTy(TY_I32) }
+  if di == 2 { at = TY_STR }
   const nm: string[] = []
   const ty: i32[] = []
   for p in lf.fnParamTypes {
     const pv = T.tys[p]
     if pv is TyVar {
-      nm.push(pv.tvName)
-      ty.push(TY_I32)
-    }
-  }
-  const inst = substTyDeep(ft, nm, ty)
-  if inst < 0 || tyHasTyVar(inst) { return -1 }
-  inst
-}
-
-// `lam` with each of its lambda parameter holes at `i32`; -1 when that leaves a hole open.
-function holeLambdaAtI32(lam: i32): i32 {
-  const lf = T.tys[lam]
-  if !(lf is TyFunc) { return -1 }
-  const nm: string[] = []
-  const ty: i32[] = []
-  for p in lf.fnParamTypes {
-    const pv = T.tys[p]
-    if pv is TyVar {
-      if tyIsHole(p) && pv.tvName.slice(0, 3) == "?#L" {
+      if !lam || (tyIsHole(p) && pv.tvName.slice(0, 3) == "?#L") {
+        // An indexed or pushed hole is judged at the call, not by a deferred constraint.
+        if rowIsArrayDemanded(p) && tyRefusesArrayDemand(at) { return -1 }
         nm.push(pv.tvName)
-        ty.push(TY_I32)
+        ty.push(at)
       }
     }
   }
-  const inst = substTyDeep(lam, nm, ty)
-  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  const inst = substTyDeep(ft, nm, ty)
+  if inst < 0 { return -1 }
+  const f = T.tys[inst]
+  if !(f is TyFunc) { return -1 }
+  if lam && tyHasTyVar(inst) { return -1 }
+  for p in f.fnParamTypes {
+    if tyHasTyVar(p) { return -1 }
+  }
   inst
+}
+
+// The first unread default hole lambda `lam` judges clean at under the call's bindings, with
+// every trial's diagnostics dropped; -1 when none does.
+function holeLambdaDefault(
+  lam: i32,
+  vNames: string[],
+  vTys: i32[],
+  ix: i32,
+): i32 {
+  let di = 0
+  while di < UNREAD_HOLE_DEFAULTS {
+    const inst = unreadHoleDefault(lam, di, true)
+    if inst >= 0 {
+      const nm: string[] = []
+      const ty: i32[] = []
+      for v in vNames { nm.push(v) }
+      for t in vTys { ty.push(t) }
+      holeLambdaBinds(lam, inst, nm, ty)
+      const d0 = T.diags.length
+      judgeHoleLambdaAt(lam, inst, nm, ty, ix)
+      const ok = T.diags.length == d0
+      while T.diags.length > d0 { T.diags.pop() }
+      if ok { return inst }
+    }
+    di = di + 1
+  }
+  -1
 }
 
 // The refusal an argument lambda takes when its pin decides none of its parameters.
