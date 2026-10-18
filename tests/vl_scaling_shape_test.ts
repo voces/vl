@@ -1037,9 +1037,9 @@ axis(
 // closure captures the first. Both arms make the same closures in one frame, so the emitter's
 // per-frame cost cancels and only the per-name capture question moves: a walk of the frame per
 // captured name is quadratic in the many arm (D2529). The closures are never called: calling
-// each one costs both arms alike and super-quadratically (D5950), which drowned the walk and
-// read 1.02 with `crFrameDeclares` re-walking per name. Fuel reads 1.06; re-walking per name in
-// `crFrameDeclares` reads 1.51, in `crCaptureByRef` 2.19.
+// each one cost both arms alike and super-quadratically (D5950), which drowned the walk and
+// read 1.02 with `crFrameDeclares` re-walking per name; the pair below grades the calls. Fuel
+// reads 1.10; re-walking per name in `crFrameDeclares` reads 1.51, in `crCaptureByRef` 2.19.
 const genNarrowedCaptures = (n: number, distinct: boolean): string => {
   const o: string[] = ["function m() {"];
   for (let i = 0; i < n; i++) {
@@ -1055,6 +1055,33 @@ axis(
   1.3,
   "A closure is re-walking its frame per captured name (D2529).",
   (d) => twoFiles(d, genNarrowedCaptures(800, true), genNarrowedCaptures(800, false)),
+);
+
+// CALLED CAPTURED NARROWED LOCALS. `n` closures over narrowed nullable locals, each called once,
+// split over `fns` functions: the many arm puts all of them in one frame, the other spreads them
+// twenty to a function. Same statements either way, so only work per frame per closure moves —
+// each call re-asking about every narrowing and closure the frame holds (D5950). Fuel reads 1.14;
+// master before the fix read 41.3.
+const genCalledNarrowedCaptures = (n: number, fns: number): string => {
+  const o: string[] = ["let acc = 0"];
+  const per = n / fns;
+  for (let f = 0; f < fns; f++) {
+    o.push(`function m${f}() {`);
+    for (let i = 0; i < per; i++) {
+      o.push(`  let g${i}: i32 | null = null`, `  g${i} = ${i % 13}`);
+      o.push(`  const h${i} = () => (g${i} ?? 0) + 1`, `  acc = acc + h${i}()`);
+    }
+    o.push("}", `m${f}()`);
+  }
+  o.push("print(acc)");
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "called captured narrowed locals",
+  1.5,
+  "A call of a closure in one frame is re-scanning every narrowing or closure the frame holds (D5950).",
+  (d) => twoFiles(d, genCalledNarrowedCaptures(400, 1), genCalledNarrowedCaptures(400, 20)),
 );
 
 // `n` calls handing one record to a function that reads a parameter field `n` times. `wide`

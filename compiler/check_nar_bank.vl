@@ -29,6 +29,18 @@ export let asgDeclEpochs: i32[] = []
 // block that declares a binding, rather than a narrowing layer over an outer one.
 export let asgDeclOver: boolean[] = []
 export let asgDeclFrames: i32[] = []
+// Each row's push number, ascending along the bank and never reused, so a reader can tell
+// which prefix of the bank is the one it last saw.
+export let asgDeclStamps: i32[] = []
+let narBankStampNext = 1
+// Each name's bank rows, in bank order, so a question about one name reads only its own rows.
+let asgDeclRowsOf: {[string]: i32[]} = Map()
+const asgNoRows: i32[] = []
+
+// The bank rows of `name`, oldest first; the caller must not change the list.
+export function narBankRowsOf(name: string): i32[] {
+  asgDeclRowsOf[name] ?? asgNoRows
+}
 
 // The declared type banked for narrowed `name`, or -1 when no live entry of a matching kind
 // still shadows the name. `kind` is `NAR_KIND_ASG` / `NAR_KIND_GUARD`, or -1 for either. Entries
@@ -37,12 +49,14 @@ export let asgDeclFrames: i32[] = []
 export function narDeclaredTy(name: string, kind: i32) {
   const d = lookupDepth(name)
   if d < 0 { return -1 }
-  let i = asgDeclKeys.length - 1
-  while i >= 0 {
-    if asgDeclKeys[i] == name && asgDeclDepths[i] == d {
+  const rows = narBankRowsOf(name)
+  let k = rows.length - 1
+  while k >= 0 {
+    const i = rows[k]
+    if asgDeclDepths[i] == d {
       if kind < 0 || asgDeclKinds[i] == kind { return asgDeclTys[i] }
     }
-    i = i - 1
+    k = k - 1
   }
   -1
 }
@@ -57,18 +71,22 @@ export function asgDeclaredTy(name: string) {
 // already-narrowed type as the declaration.
 export function noteNarShadow(name: string, declTy: i32, kind: i32) {
   const d = T.scopes.length - 1
-  let i = asgDeclKeys.length - 1
-  while i >= 0 {
-    if (
-      asgDeclKeys[i] == name
-      && asgDeclDepths[i] == d
-      && asgDeclKinds[i] == kind
-    ) {
-      return 0
-    }
-    i = i - 1
+  const rows = narBankRowsOf(name)
+  let k = rows.length - 1
+  while k >= 0 {
+    const i = rows[k]
+    if asgDeclDepths[i] == d && asgDeclKinds[i] == kind { return 0 }
+    k = k - 1
+  }
+  const own = asgDeclRowsOf[name]
+  if own == null {
+    asgDeclRowsOf[name] = [asgDeclKeys.length]
+  } else {
+    own.push(asgDeclKeys.length)
   }
   asgDeclKeys.push(name)
+  asgDeclStamps.push(narBankStampNext)
+  narBankStampNext = narBankStampNext + 1
   asgDeclTys.push(declTy)
   asgDeclDepths.push(d)
   asgDeclKinds.push(kind)
@@ -80,12 +98,14 @@ export function noteNarShadow(name: string, declTy: i32, kind: i32) {
 // Clear the bank and the body count, once per program.
 export function narBankReset() {
   asgDeclKeys = []
+  asgDeclStamps = []
   asgDeclTys = []
   asgDeclDepths = []
   asgDeclKinds = []
   asgDeclEpochs = []
   asgDeclOver = []
   asgDeclFrames = []
+  asgDeclRowsOf = Map()
   narFnEpoch = 0
   0
 }
@@ -102,7 +122,10 @@ export function narBankPopFrame() {
   const abase = asgDeclFrames[asgDeclFrames.length - 1]
   asgDeclFrames.pop()
   while asgDeclKeys.length > abase {
+    const own = asgDeclRowsOf[asgDeclKeys[asgDeclKeys.length - 1]]
+    if own != null { own.pop() }
     asgDeclKeys.pop()
+    asgDeclStamps.pop()
     asgDeclTys.pop()
     asgDeclDepths.pop()
     asgDeclKinds.pop()
