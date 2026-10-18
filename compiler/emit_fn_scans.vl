@@ -7,26 +7,40 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
   arithRegionSeen,
   callIsNever,
@@ -261,6 +275,7 @@ function pushKindBitsOf(objIx: i32, fnIx: i32) {
 export function callPushBits(callIx: i32, fnIx: i32) {
   const s = P.nodes[callIx]
   if s is Call {
+    if s.callFn < 0 { return 0 }
     const callee = P.nodes[s.callFn]
     if callee is Member {
       if callee.memProp == "push" {
@@ -304,6 +319,7 @@ function listOpRecvStages(objIx: i32, fnIx: i32): boolean {
 function callPopBits(callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
+    if c.callFn < 0 { return 0 }
     const callee = P.nodes[c.callFn]
     if callee is Member {
       // `.clear()` resolves its receiver the way `.pop()` does, and since D1281 so does
@@ -381,63 +397,82 @@ export function exprPopBits(exprIx: i32, fnIx: i32) {
 function exprPopBitsGo(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
-  if e is Call {
-    // A `.push` in value position (D1592) runs the same grow sequence a statement one does and
-    // needs the same scratch frame. This walk is the one that descends value positions, so it
-    // asks for both here rather than growing a second walker whose node set could drift.
-    let bits = callPopBits(exprIx, fnIx) | callPushBits(exprIx, fnIx)
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      bits = bits | exprPopBits(args[i], fnIx)
-      i = i + 1
+  match e {
+    Call => {
+      // A `.push` in value position (D1592) runs the same grow sequence a statement one does and
+      // needs the same scratch frame. This walk is the one that descends value positions, so it
+      // asks for both here rather than growing a second walker whose node set could drift.
+      let bits = callPopBits(exprIx, fnIx) | callPushBits(exprIx, fnIx)
+      const args = e.callArgs
+      let i = 0
+      while i < args.length {
+        bits = bits | exprPopBits(args[i], fnIx)
+        i = i + 1
+      }
+      return bits
     }
-    return bits
-  }
-  if e is BinExpr {
-    return exprPopBits(e.binLeft, fnIx) | exprPopBits(e.binRight, fnIx)
-  }
-  if e is Member { return exprPopBits(e.memObj, fnIx) }
-  // The `?.` receiver, walked like the `.` one above (D1667).
-  if e is OptMember { return exprPopBits(e.omObj, fnIx) }
-  if e is Index {
-    return exprPopBits(e.idxArr, fnIx) | exprPopBits(e.idxIndex, fnIx)
-  }
-  if e is Unary { return exprPopBits(e.unArg, fnIx) }
-  if e is Paren { return exprPopBits(e.parInner, fnIx) }
-  // An if-EXPRESSION's arms are value positions too: `if c { xs.push(1) } else { 0 }` runs
-  // the grow sequence inside the arm and needs the frame reserved (D1992).
-  if e is IfStmt {
-    return ifChainPushPopBits(exprIx, fnIx) | ifChainArmValueBits(exprIx, fnIx)
-  }
-  // The four remaining value positions, taught from this file's own sibling walker
-  // `exprHasMapOp`. `emitExpr` lowers all four into `emitPop` and `emitPopOr`, which test no
-  // `fnUses*Push` flag, so a `.pop()` in an array-literal element, an object-literal field
-  // value or an `as`-cast operand would stage into a frame `fbBeginFunc` never reserved.
-  if e is AsExpr { return exprPopBits(e.asObj, fnIx) }
-  if e is IsExpr { return exprPopBits(e.isObj, fnIx) }
-  // A spread's source is an operand like any other (D2334).
-  if e is Spread { return exprPopBits(e.spdArg, fnIx) }
-  if e is ObjLit {
-    let bits = 0
-    const fields = e.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit { bits = bits | exprPopBits(f.fiValue, fnIx) }
-      i = i + 1
+    BinExpr => {
+      return exprPopBits(e.binLeft, fnIx) | exprPopBits(e.binRight, fnIx)
     }
-    return bits
-  }
-  if e is ArrayLit {
-    let bits = 0
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      bits = bits | exprPopBits(elems[i], fnIx)
-      i = i + 1
+    Member => {
+      return exprPopBits(e.memObj, fnIx)
     }
-    return bits
+    // The `?.` receiver, walked like the `.` one above (D1667).
+    OptMember => {
+      return exprPopBits(e.omObj, fnIx)
+    }
+    Index => {
+      return exprPopBits(e.idxArr, fnIx) | exprPopBits(e.idxIndex, fnIx)
+    }
+    Unary => {
+      return exprPopBits(e.unArg, fnIx)
+    }
+    Paren => {
+      return exprPopBits(e.parInner, fnIx)
+    }
+    // An if-EXPRESSION's arms are value positions too: `if c { xs.push(1) } else { 0 }` runs
+    // the grow sequence inside the arm and needs the frame reserved (D1992).
+    IfStmt => {
+      return ifChainPushPopBits(exprIx, fnIx)
+        | ifChainArmValueBits(exprIx, fnIx)
+    }
+    // The four remaining value positions, taught from this file's own sibling walker
+    // `exprHasMapOp`. `emitExpr` lowers all four into `emitPop` and `emitPopOr`, which test no
+    // `fnUses*Push` flag, so a `.pop()` in an array-literal element, an object-literal field
+    // value or an `as`-cast operand would stage into a frame `fbBeginFunc` never reserved.
+    AsExpr => {
+      return exprPopBits(e.asObj, fnIx)
+    }
+    IsExpr => {
+      return exprPopBits(e.isObj, fnIx)
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return exprPopBits(e.spdArg, fnIx)
+    }
+    ObjLit => {
+      let bits = 0
+      const fields = e.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit { bits = bits | exprPopBits(f.fiValue, fnIx) }
+        i = i + 1
+      }
+      return bits
+    }
+    ArrayLit => {
+      let bits = 0
+      const elems = e.arrElems
+      let i = 0
+      while i < elems.length {
+        bits = bits | exprPopBits(elems[i], fnIx)
+        i = i + 1
+      }
+      return bits
+    }
+    // Any other node holds no value position a pop can reach.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {}
   }
   0
 }
@@ -522,6 +557,7 @@ function pushWidensAtomToStr(callIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const c = P.nodes[callIx]
   if c is Call {
+    if c.callFn < 0 { return false }
     const callee = P.nodes[c.callFn]
     if callee is Member {
       if callee.memProp == "push" {
@@ -545,6 +581,7 @@ function callWidensAtomToStr(callIx: i32, fnIx: i32) {
   if gLitUnionUsed == 0 { return false }
   const c = P.nodes[callIx]
   if c is Call {
+    if c.callFn < 0 { return false }
     const callee = P.nodes[c.callFn]
     if callee is Ident {
       const target = fnIndexOfNode(c.callFn)
@@ -1254,6 +1291,7 @@ export function cloEqNoteBin(binIx: i32, fnIx: i32) {
 export function exprIsStrIndexOf(callIx: i32, fnIx: i32) {
   const c = P.nodes[callIx]
   if c is Call {
+    if c.callFn < 0 { return false }
     const callee = P.nodes[c.callFn]
     if callee is Member {
       if callee.memProp == "indexOf" || callee.memProp == "includes" {
@@ -1284,170 +1322,185 @@ function readsGlobalAtomCell(ix: i32, fnIx: i32): boolean {
 export function exprHasStrOp(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
-  if e is BinExpr {
-    if arithRegionSeen && e.binRegion != 0 && !bcOpen {
-      return exprHasStrOpHeld(exprIx, fnIx)
+  match e {
+    BinExpr => {
+      if arithRegionSeen && e.binRegion != 0 && !bcOpen {
+        return exprHasStrOpHeld(exprIx, fnIx)
+      }
+      if exprIsStrConcat(exprIx, fnIx) { return true }
+      if exprIsStrEq(exprIx, fnIx) { return true }
+      // A string ordering rides the same lexicographic compare loop.
+      if exprIsStrOrder(exprIx, fnIx) { return true }
+      // A union-box `==` whose value compare can hit the string arm stages its payloads in the
+      // same frame.
+      if exprIsUnionStrEq(exprIx, fnIx) { return true }
+      // A struct `==` stages its string and array field compares in the same frame.
+      if exprIsStructEq(exprIx, fnIx) { return true }
+      // An assignment of a literal-union atom into a `string` target widens, which stages the
+      // atom id in the string-op scratch frame.
+      if assignWidensAtomToStr(exprIx, fnIx) { return true }
+      if gLitUnionUsed != 0 && e.binOp == "??" {
+        if coalesceNulAtomToStr(exprIx, fnIx) { return true }
+        // A literal-union atom default of a `string | null` operand widens through the same
+        // frame (`emitCoalesceAtomStrDefault`); over-reserving costs only locals.
+        if exprIsLitAtom(e.binRight, fnIx) { return true }
+        if coalesceRetypedAtomToStr(exprIx, fnIx) { return true }
+      }
+      if exprHasStrOp(e.binLeft, fnIx) { return true }
+      return exprHasStrOp(e.binRight, fnIx)
     }
-    if exprIsStrConcat(exprIx, fnIx) { return true }
-    if exprIsStrEq(exprIx, fnIx) { return true }
-    // A string ordering rides the same lexicographic compare loop.
-    if exprIsStrOrder(exprIx, fnIx) { return true }
-    // A union-box `==` whose value compare can hit the string arm stages its payloads in the
-    // same frame.
-    if exprIsUnionStrEq(exprIx, fnIx) { return true }
-    // A struct `==` stages its string and array field compares in the same frame.
-    if exprIsStructEq(exprIx, fnIx) { return true }
-    // An assignment of a literal-union atom into a `string` target widens, which stages the
-    // atom id in the string-op scratch frame.
-    if assignWidensAtomToStr(exprIx, fnIx) { return true }
-    if gLitUnionUsed != 0 && e.binOp == "??" {
-      if coalesceNulAtomToStr(exprIx, fnIx) { return true }
-      // A literal-union atom default of a `string | null` operand widens through the same
-      // frame (`emitCoalesceAtomStrDefault`); over-reserving costs only locals.
-      if exprIsLitAtom(e.binRight, fnIx) { return true }
-      if coalesceRetypedAtomToStr(exprIx, fnIx) { return true }
-    }
-    if exprHasStrOp(e.binLeft, fnIx) { return true }
-    return exprHasStrOp(e.binRight, fnIx)
-  }
-  if e is Call {
-    if exprIsStrMethod(exprIx, fnIx, "slice") { return true }
-    // A literal-union atom argument flowing into a `string` param widens, which stages the
-    // atom id in the string-op scratch frame.
-    if callWidensAtomToStr(exprIx, fnIx) { return true }
-    // `xs.push(atom)` into a `string[]` widens the same way — its twin emit arm is in
-    // `emitPush`.
-    if pushWidensAtomToStr(exprIx, fnIx) { return true }
-    // `s.indexOf(sub)` and `s.includes(sub)` stage their receiver, needle and loop counters in
-    // the same string scratch frame. `charCodeAt` is a bare `array.get` and needs no frame; its
-    // operands recurse below.
-    if exprIsStrIndexOf(exprIx, fnIx) { return true }
-    // `print(<string>)` rides the string-op scratch frame: the streaming loop's string ref,
-    // cursor and length live there.
-    const pcal = P.nodes[e.callFn]
-    if pcal is Ident {
-      if pcal.identName == "print" {
-        if e.callArgs.length == 1 {
-          if exprString(e.callArgs[0], fnIx) { return true }
-          // `print(<literal-union atom>)` widens to its member string, and its per-member
-          // print chain rides the same string-op scratch frame.
-          if exprIsLitAtom(e.callArgs[0], fnIx) { return true }
-          if identShadowMayBeLitAtom(e.callArgs[0], fnIx) { return true }
-          // `print(<string | null>)` streams through `emitPrintNulString`, which `local.set`s
-          // the ref it recovers into the same frame. The two ends of one decision must ask the
-          // same question: `exprNullableString` is strictly wider than `exprString`, so where
-          // the handler claims a value the scan does not, the frame is never reserved.
-          if exprNullableString(e.callArgs[0], fnIx) { return true }
-          // `print(<value-union box>)` with a string arm streams that arm through the same
-          // tail, out of the same frame. Asked through the shared plan, which is what the
-          // handler dispatches on, so reservation and lowering cannot disagree about the arm.
-          if printUnionHasStrArm(e.callArgs[0], fnIx) { return true }
+    Call => {
+      if exprIsStrMethod(exprIx, fnIx, "slice") { return true }
+      // A literal-union atom argument flowing into a `string` param widens, which stages the
+      // atom id in the string-op scratch frame.
+      if callWidensAtomToStr(exprIx, fnIx) { return true }
+      // `xs.push(atom)` into a `string[]` widens the same way — its twin emit arm is in
+      // `emitPush`.
+      if pushWidensAtomToStr(exprIx, fnIx) { return true }
+      // `s.indexOf(sub)` and `s.includes(sub)` stage their receiver, needle and loop counters in
+      // the same string scratch frame. `charCodeAt` is a bare `array.get` and needs no frame; its
+      // operands recurse below.
+      if exprIsStrIndexOf(exprIx, fnIx) { return true }
+      // `print(<string>)` rides the string-op scratch frame: the streaming loop's string ref,
+      // cursor and length live there.
+      if e.callFn < 0 { return false }
+      const pcal = P.nodes[e.callFn]
+      if pcal is Ident {
+        if pcal.identName == "print" {
+          if e.callArgs.length == 1 {
+            if exprString(e.callArgs[0], fnIx) { return true }
+            // `print(<literal-union atom>)` widens to its member string, and its per-member
+            // print chain rides the same string-op scratch frame.
+            if exprIsLitAtom(e.callArgs[0], fnIx) { return true }
+            if identShadowMayBeLitAtom(e.callArgs[0], fnIx) { return true }
+            // `print(<string | null>)` streams through `emitPrintNulString`, which `local.set`s
+            // the ref it recovers into the same frame. The two ends of one decision must ask the
+            // same question: `exprNullableString` is strictly wider than `exprString`, so where
+            // the handler claims a value the scan does not, the frame is never reserved.
+            if exprNullableString(e.callArgs[0], fnIx) { return true }
+            // `print(<value-union box>)` with a string arm streams that arm through the same
+            // tail, out of the same frame. Asked through the shared plan, which is what the
+            // handler dispatches on, so reservation and lowering cannot disagree about the arm.
+            if printUnionHasStrArm(e.callArgs[0], fnIx) { return true }
+          }
         }
-      }
-      // `__trap__(<string>)` prints its reason through the same string streaming loop before
-      // the abort, so it rides the string-op scratch frame too.
-      if pcal.identName == "__trap__" {
-        if e.callArgs.length == 1 {
-          if exprString(e.callArgs[0], fnIx) { return true }
+        // `__trap__(<string>)` prints its reason through the same string streaming loop before
+        // the abort, so it rides the string-op scratch frame too.
+        if pcal.identName == "__trap__" {
+          if e.callArgs.length == 1 {
+            if exprString(e.callArgs[0], fnIx) { return true }
+          }
         }
+        // `fromCodePoints(xs)` stages its length and result there too.
+        if pcal.identName == "fromCodePoints" { return true }
       }
-      // `fromCodePoints(xs)` stages its length and result there too.
-      if pcal.identName == "fromCodePoints" { return true }
-    }
-    if exprHasStrOp(e.callFn, fnIx) { return true }
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      if exprHasStrOp(args[i], fnIx) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if e is Member {
-    // A `.length` over a literal-union atom widens it, staging the id in this frame.
-    if e.memProp == "length" && memberLenWidensAtom(e.memObj, fnIx) {
-      return true
-    }
-    return exprHasStrOp(e.memObj, fnIx)
-  }
-  // The `?.` receiver, walked like the `.` one above (D1667).
-  if e is OptMember { return exprHasStrOp(e.omObj, fnIx) }
-  if e is Index {
-    if exprHasStrOp(e.idxArr, fnIx) { return true }
-    return exprHasStrOp(e.idxIndex, fnIx)
-  }
-  // An if-expression in value position: a string op in the condition or either arm needs the
-  // frame reserved too.
-  if e is IfStmt {
-    if exprHasStrOp(e.ifCond, fnIx) { return true }
-    // An atom arm under a `string`-typed join widens, staging the atom id in the string-op
-    // frame. Mirrors the emit decision: the join type recorded by the checker, any arm.
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeRepIs(exprIx, "nulstr") {
-      if ifChainHasAtomArm(exprIx, fnIx) { return true }
-    }
-    // A join the generic body shares, typed at a hole: the instance may lower it as a string,
-    // and over-reserving costs only locals.
-    if fnIx >= 0 && nodeTyHasTyVar(exprIx) {
-      if ifChainHasAtomArm(exprIx, fnIx) { return true }
-    }
-    // The same widening reached through the arms, where the join records one arm's type.
-    if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
-    // An atom arm boxed into a join whose union holds it as its string (`K|i32`, D2952).
-    if (
-      gLitUnionUsed != 0
-      && unionTakesAtomAsStr(coalesceResultUnionName(exprIx))
-    ) {
-      if ifChainHasAtomArm(exprIx, fnIx) { return true }
-    }
-    if blockHasStrOp(e.ifThen, fnIx) { return true }
-    if e.ifElse < 0 { return false }
-    // An `else if` link is an if-expression of its own, not a block (D3355).
-    if P.nodes[e.ifElse] is IfStmt { return exprHasStrOp(e.ifElse, fnIx) }
-    return blockHasStrOp(e.ifElse, fnIx)
-  }
-  if e is Unary { return exprHasStrOp(e.unArg, fnIx) }
-  if e is Paren { return exprHasStrOp(e.parInner, fnIx) }
-  if e is IsExpr {
-    // A string-literal `is` (`s is "a"`) lowers through `emitStrEqCore`, so it stages operands
-    // in the string scratch frame like a string `==`. The quoted-leaf test is at its home in
-    // `tyname.nameIsQuotedLeaf`, with the `length > 0` bound in front of it.
-    if e.isVariant.length > 0 && nameIsQuotedLeaf(e.isVariant) { return true }
-    return exprHasStrOp(e.isObj, fnIx)
-  }
-  if e is AsExpr { return exprHasStrOp(e.asObj, fnIx) }
-  if e is ObjLit {
-    const fields = e.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if exprHasStrOp(f.fiValue, fnIx) { return true }
-        // A literal-union atom field value widens to a string for a `string` field. Any atom
-        // field value is destined for one, and a literal-union field is not yet a rep, so this
-        // is a safe over-approximation.
-        if exprIsLitAtom(f.fiValue, fnIx) { return true }
-        if identShadowMayBeLitAtom(f.fiValue, fnIx) { return true }
+      if exprHasStrOp(e.callFn, fnIx) { return true }
+      const args = e.callArgs
+      let i = 0
+      while i < args.length {
+        if exprHasStrOp(args[i], fnIx) { return true }
+        i = i + 1
       }
-      i = i + 1
+      return false
     }
-    return false
-  }
-  // A spread's source is an operand like any other (D2334).
-  if e is Spread { return exprHasStrOp(e.spdArg, fnIx) }
-  if e is ArrayLit {
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      if exprHasStrOp(elems[i], fnIx) { return true }
-      // A literal-union atom element of a string-array literal widens to its member string,
-      // which stages the atom id in the string-op scratch frame — the emit's reservation side.
-      // Deliberately not gated on the literal being a string list: `arrLitIsStr` is an
-      // emit-time classification this scan does not repeat, and over-reserving only costs locals.
-      if exprIsLitAtom(elems[i], fnIx) { return true }
-      if identShadowMayBeLitAtom(elems[i], fnIx) { return true }
-      i = i + 1
+    Member => {
+      // A `.length` over a literal-union atom widens it, staging the id in this frame.
+      if e.memProp == "length" && memberLenWidensAtom(e.memObj, fnIx) {
+        return true
+      }
+      return exprHasStrOp(e.memObj, fnIx)
     }
-    return false
+    // The `?.` receiver, walked like the `.` one above (D1667).
+    OptMember => {
+      return exprHasStrOp(e.omObj, fnIx)
+    }
+    Index => {
+      if exprHasStrOp(e.idxArr, fnIx) { return true }
+      return exprHasStrOp(e.idxIndex, fnIx)
+    }
+    // An if-expression in value position: a string op in the condition or either arm needs the
+    // frame reserved too.
+    IfStmt => {
+      if exprHasStrOp(e.ifCond, fnIx) { return true }
+      // An atom arm under a `string`-typed join widens, staging the atom id in the string-op
+      // frame. Mirrors the emit decision: the join type recorded by the checker, any arm.
+      if tyKindOf(nodeTyIxOf(exprIx)) == TK_STR || nodeRepIs(exprIx, "nulstr") {
+        if ifChainHasAtomArm(exprIx, fnIx) { return true }
+      }
+      // A join the generic body shares, typed at a hole: the instance may lower it as a string,
+      // and over-reserving costs only locals.
+      if fnIx >= 0 && nodeTyHasTyVar(exprIx) {
+        if ifChainHasAtomArm(exprIx, fnIx) { return true }
+      }
+      // The same widening reached through the arms, where the join records one arm's type.
+      if ifJoinAtomMeetsString(exprIx, fnIx) { return true }
+      // An atom arm boxed into a join whose union holds it as its string (`K|i32`, D2952).
+      if (
+        gLitUnionUsed != 0
+        && unionTakesAtomAsStr(coalesceResultUnionName(exprIx))
+      ) {
+        if ifChainHasAtomArm(exprIx, fnIx) { return true }
+      }
+      if blockHasStrOp(e.ifThen, fnIx) { return true }
+      if e.ifElse < 0 { return false }
+      // An `else if` link is an if-expression of its own, not a block (D3355).
+      if P.nodes[e.ifElse] is IfStmt { return exprHasStrOp(e.ifElse, fnIx) }
+      return blockHasStrOp(e.ifElse, fnIx)
+    }
+    Unary => {
+      return exprHasStrOp(e.unArg, fnIx)
+    }
+    Paren => {
+      return exprHasStrOp(e.parInner, fnIx)
+    }
+    IsExpr => {
+      // A string-literal `is` (`s is "a"`) lowers through `emitStrEqCore`, so it stages operands
+      // in the string scratch frame like a string `==`. The quoted-leaf test is at its home in
+      // `tyname.nameIsQuotedLeaf`, with the `length > 0` bound in front of it.
+      if e.isVariant.length > 0 && nameIsQuotedLeaf(e.isVariant) { return true }
+      return exprHasStrOp(e.isObj, fnIx)
+    }
+    AsExpr => {
+      return exprHasStrOp(e.asObj, fnIx)
+    }
+    ObjLit => {
+      const fields = e.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit {
+          if exprHasStrOp(f.fiValue, fnIx) { return true }
+          // A literal-union atom field value widens to a string for a `string` field. Any atom
+          // field value is destined for one, and a literal-union field is not yet a rep, so this
+          // is a safe over-approximation.
+          if exprIsLitAtom(f.fiValue, fnIx) { return true }
+          if identShadowMayBeLitAtom(f.fiValue, fnIx) { return true }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return exprHasStrOp(e.spdArg, fnIx)
+    }
+    ArrayLit => {
+      const elems = e.arrElems
+      let i = 0
+      while i < elems.length {
+        if exprHasStrOp(elems[i], fnIx) { return true }
+        // A literal-union atom element of a string-array literal widens to its member string,
+        // which stages the atom id in the string-op scratch frame — the emit's reservation side.
+        // Deliberately not gated on the literal being a string list: `arrLitIsStr` is an
+        // emit-time classification this scan does not repeat, and over-reserving only costs locals.
+        if exprIsLitAtom(elems[i], fnIx) { return true }
+        if identShadowMayBeLitAtom(elems[i], fnIx) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // Any other node holds no string op this frame must reserve for.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {}
   }
   false
 }
@@ -1473,13 +1526,19 @@ function ifChainHasAtomArm(ifIx: i32, fnIx: i32) {
     }
     if s.ifElse >= 0 {
       const els = P.nodes[s.ifElse]
-      if els is IfStmt { return ifChainHasAtomArm(s.ifElse, fnIx) }
-      if els is Block {
-        const ev = ifArmValueExpr(s.ifElse)
-        if ev >= 0 {
-          if exprIsLitAtom(ev, fnIx) { return true }
-          return identShadowMayBeLitAtom(ev, fnIx)
+      match els {
+        IfStmt => {
+          return ifChainHasAtomArm(s.ifElse, fnIx)
         }
+        Block => {
+          const ev = ifArmValueExpr(s.ifElse)
+          if ev >= 0 {
+            if exprIsLitAtom(ev, fnIx) { return true }
+            return identShadowMayBeLitAtom(ev, fnIx)
+          }
+        }
+        // An else link is only ever an if or a block.
+        NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
       }
     }
   }
@@ -1683,150 +1742,171 @@ export function moduleHasIntMinMax(): boolean {
 export function blockHasCallRef(ix: i32, fnIx: i32) {
   if ix < 0 { return false }
   const n = P.nodes[ix]
-  if n is Call {
-    const callee = P.nodes[n.callFn]
-    let isVal = false
-    // A call by name to a module function with no captures is a plain `call`: no frame.
-    let isDirect = false
-    if callee is Ident {
-      let t = fnIndexOfNode(n.callFn)
-      // A live closure binding of the name is what the call denotes, so the frame needs
-      // the scratch even though a module function carries the name — without it the
-      // `call_ref` spills into a local the vector never declared (D1602).
-      if t >= 0 && identIsBoundClosure(callee.identName, fnIx) { t = -1 }
-      if t < 0 {
-        if exprIsClosure(n.callFn, fnIx) { isVal = true }
-        // `t()` where `t` is a union binding with a bare-closure arm: the `is`-narrowing
-        // that makes `t` a closure isn't active in this pre-pass, so reserve conservatively.
-        if !isVal && calleeIsUnionClosureIdent(n.callFn, fnIx) { isVal = true }
+  match n {
+    Call => {
+      if n.callFn < 0 { return false }
+      const callee = P.nodes[n.callFn]
+      let isVal = false
+      // A call by name to a module function with no captures is a plain `call`: no frame.
+      let isDirect = false
+      if callee is Ident {
+        let t = fnIndexOfNode(n.callFn)
+        // A live closure binding of the name is what the call denotes, so the frame needs
+        // the scratch even though a module function carries the name — without it the
+        // `call_ref` spills into a local the vector never declared (D1602).
+        if t >= 0 && identIsBoundClosure(callee.identName, fnIx) { t = -1 }
+        if t < 0 {
+          if exprIsClosure(n.callFn, fnIx) { isVal = true }
+          // `t()` where `t` is a union binding with a bare-closure arm: the `is`-narrowing
+          // that makes `t` a closure isn't active in this pre-pass, so reserve conservatively.
+          if !isVal && calleeIsUnionClosureIdent(n.callFn, fnIx) {
+            isVal = true
+          }
+        } else {
+          // A direct call to a capturing function is lowered via call_ref too.
+          if captureCountOf(t) > 0 { isVal = true } else { isDirect = true }
+        }
       } else {
-        // A direct call to a capturing function is lowered via call_ref too.
-        if captureCountOf(t) > 0 { isVal = true } else { isDirect = true }
+        if exprIsClosure(n.callFn, fnIx) { isVal = true }
+        // `p[0]()` where `p` is a union with a closure-array arm: the `is`-narrowing needed to
+        // see it isn't active in this pre-pass, so reserve conservatively (a spare local is harmless).
+        if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
+          isVal = true
+        }
+        // `t0.f[0]()` through a union struct-arm's closure-array field: same pre-pass
+        // narrowing gap, reserved conservatively (the indexed-member twin of the arm above).
+        if !isVal && calleeIsUnionArmCloArrayIndex(n.callFn, fnIx) {
+          isVal = true
+        }
+        // `t0.f.f()` through a union struct-arm's closure-field chain: same gap, reserved
+        // conservatively — an unreserved `call_ref` would spill into the next frame's local.
+        if !isVal && calleeIsUnionArmClosureMember(n.callFn, fnIx) {
+          isVal = true
+        }
+        // `t0[0].f()` where `t0`'s union has a ref-array arm whose element struct carries a
+        // closure field — the indexed-element-field twin of the arms above.
+        if !isVal && calleeIsUnionElemFieldClosure(n.callFn, fnIx) {
+          isVal = true
+        }
       }
-    } else {
-      if exprIsClosure(n.callFn, fnIx) { isVal = true }
-      // `p[0]()` where `p` is a union with a closure-array arm: the `is`-narrowing needed to
-      // see it isn't active in this pre-pass, so reserve conservatively (a spare local is harmless).
-      if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
-        isVal = true
+      // The typed-IR net for any callee spelling the syntactic classifiers above miss: the
+      // checker records every callee's own checked type, so one that types as a closure
+      // reserves the scratch regardless of shape or depth — covering narrowed callees the
+      // syntactic union-closure chain above cannot see. Over-reservation is harmless.
+      if !isVal && !isDirect {
+        const cty = nodeTyIxOf(n.callFn)
+        if cty >= 0 {
+          if T.tys[cty] is TyFunc { isVal = true }
+        }
       }
-      // `t0.f[0]()` through a union struct-arm's closure-array field: same pre-pass
-      // narrowing gap, reserved conservatively (the indexed-member twin of the arm above).
-      if !isVal && calleeIsUnionArmCloArrayIndex(n.callFn, fnIx) {
-        isVal = true
+      if isVal { return true }
+      if blockHasCallRef(n.callFn, fnIx) { return true }
+      const args = n.callArgs
+      let i = 0
+      while i < args.length {
+        if blockHasCallRef(args[i], fnIx) { return true }
+        i = i + 1
       }
-      // `t0.f.f()` through a union struct-arm's closure-field chain: same gap, reserved
-      // conservatively — an unreserved `call_ref` would spill into the next frame's local.
-      if !isVal && calleeIsUnionArmClosureMember(n.callFn, fnIx) {
-        isVal = true
+      return false
+    }
+    Block => {
+      const stmts = n.blkStmts
+      let i = 0
+      while i < stmts.length {
+        if blockHasCallRef(stmts[i], fnIx) { return true }
+        i = i + 1
       }
-      // `t0[0].f()` where `t0`'s union has a ref-array arm whose element struct carries a
-      // closure field — the indexed-element-field twin of the arms above.
-      if !isVal && calleeIsUnionElemFieldClosure(n.callFn, fnIx) {
-        isVal = true
+      return false
+    }
+    LetDecl => {
+      if n.letInit >= 0 { return blockHasCallRef(n.letInit, fnIx) }
+      return false
+    }
+    RetStmt => {
+      if n.retArg >= 0 { return blockHasCallRef(n.retArg, fnIx) }
+      return false
+    }
+    IfStmt => {
+      if blockHasCallRef(n.ifCond, fnIx) { return true }
+      if blockHasCallRef(n.ifThen, fnIx) { return true }
+      if n.ifElse >= 0 { return blockHasCallRef(n.ifElse, fnIx) }
+      return false
+    }
+    WhileStmt => {
+      if blockHasCallRef(n.whileCond, fnIx) { return true }
+      return blockHasCallRef(n.whileBody, fnIx)
+    }
+    ForRange => {
+      if blockHasCallRef(n.frFrom, fnIx) { return true }
+      if blockHasCallRef(n.frTo, fnIx) { return true }
+      if n.frStep >= 0 {
+        if blockHasCallRef(n.frStep, fnIx) { return true }
       }
+      return blockHasCallRef(n.frBody, fnIx)
     }
-    // The typed-IR net for any callee spelling the syntactic classifiers above miss: the
-    // checker records every callee's own checked type, so one that types as a closure
-    // reserves the scratch regardless of shape or depth — covering narrowed callees the
-    // syntactic union-closure chain above cannot see. Over-reservation is harmless.
-    if !isVal && !isDirect {
-      const cty = nodeTyIxOf(n.callFn)
-      if cty >= 0 {
-        if T.tys[cty] is TyFunc { isVal = true }
+    ForIn => {
+      if blockHasCallRef(n.fiIter, fnIx) { return true }
+      return blockHasCallRef(n.fiBody, fnIx)
+    }
+    BinExpr => {
+      if blockHasCallRef(n.binLeft, fnIx) { return true }
+      return blockHasCallRef(n.binRight, fnIx)
+    }
+    Unary => {
+      return blockHasCallRef(n.unArg, fnIx)
+    }
+    Paren => {
+      return blockHasCallRef(n.parInner, fnIx)
+    }
+    // An `is` operand (`f(x) is i32`) may itself be a function-value call — without this the
+    // closure scratch slot (`callRefSlot`) goes unreserved and the inline `call_ref` reads a
+    // non-existent local 0.
+    IsExpr => {
+      return blockHasCallRef(n.isObj, fnIx)
+    }
+    AsExpr => {
+      return blockHasCallRef(n.asObj, fnIx)
+    }
+    Member => {
+      return blockHasCallRef(n.memObj, fnIx)
+    }
+    // A `?.` RECEIVER is lowered exactly as a `.` one is (`emitOptChainIsNull` emits it), so a
+    // function-value call under it needs the same slot; without this arm the `call_ref` spills
+    // into a local the vector never declared (D1667).
+    OptMember => {
+      return blockHasCallRef(n.omObj, fnIx)
+    }
+    Index => {
+      if blockHasCallRef(n.idxArr, fnIx) { return true }
+      return blockHasCallRef(n.idxIndex, fnIx)
+    }
+    ObjLit => {
+      const fields = n.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit {
+          if blockHasCallRef(f.fiValue, fnIx) { return true }
+        }
+        i = i + 1
       }
+      return false
     }
-    if isVal { return true }
-    if blockHasCallRef(n.callFn, fnIx) { return true }
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      if blockHasCallRef(args[i], fnIx) { return true }
-      i = i + 1
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return blockHasCallRef(n.spdArg, fnIx)
     }
-    return false
-  }
-  if n is Block {
-    const stmts = n.blkStmts
-    let i = 0
-    while i < stmts.length {
-      if blockHasCallRef(stmts[i], fnIx) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if n is LetDecl {
-    if n.letInit >= 0 { return blockHasCallRef(n.letInit, fnIx) }
-    return false
-  }
-  if n is RetStmt {
-    if n.retArg >= 0 { return blockHasCallRef(n.retArg, fnIx) }
-    return false
-  }
-  if n is IfStmt {
-    if blockHasCallRef(n.ifCond, fnIx) { return true }
-    if blockHasCallRef(n.ifThen, fnIx) { return true }
-    if n.ifElse >= 0 { return blockHasCallRef(n.ifElse, fnIx) }
-    return false
-  }
-  if n is WhileStmt {
-    if blockHasCallRef(n.whileCond, fnIx) { return true }
-    return blockHasCallRef(n.whileBody, fnIx)
-  }
-  if n is ForRange {
-    if blockHasCallRef(n.frFrom, fnIx) { return true }
-    if blockHasCallRef(n.frTo, fnIx) { return true }
-    if n.frStep >= 0 {
-      if blockHasCallRef(n.frStep, fnIx) { return true }
-    }
-    return blockHasCallRef(n.frBody, fnIx)
-  }
-  if n is ForIn {
-    if blockHasCallRef(n.fiIter, fnIx) { return true }
-    return blockHasCallRef(n.fiBody, fnIx)
-  }
-  if n is BinExpr {
-    if blockHasCallRef(n.binLeft, fnIx) { return true }
-    return blockHasCallRef(n.binRight, fnIx)
-  }
-  if n is Unary { return blockHasCallRef(n.unArg, fnIx) }
-  if n is Paren { return blockHasCallRef(n.parInner, fnIx) }
-  // An `is` operand (`f(x) is i32`) may itself be a function-value call — without this the
-  // closure scratch slot (`callRefSlot`) goes unreserved and the inline `call_ref` reads a
-  // non-existent local 0.
-  if n is IsExpr { return blockHasCallRef(n.isObj, fnIx) }
-  if n is AsExpr { return blockHasCallRef(n.asObj, fnIx) }
-  if n is Member { return blockHasCallRef(n.memObj, fnIx) }
-  // A `?.` RECEIVER is lowered exactly as a `.` one is (`emitOptChainIsNull` emits it), so a
-  // function-value call under it needs the same slot; without this arm the `call_ref` spills
-  // into a local the vector never declared (D1667).
-  if n is OptMember { return blockHasCallRef(n.omObj, fnIx) }
-  if n is Index {
-    if blockHasCallRef(n.idxArr, fnIx) { return true }
-    return blockHasCallRef(n.idxIndex, fnIx)
-  }
-  if n is ObjLit {
-    const fields = n.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if blockHasCallRef(f.fiValue, fnIx) { return true }
+    ArrayLit => {
+      const elems = n.arrElems
+      let i = 0
+      while i < elems.length {
+        if blockHasCallRef(elems[i], fnIx) { return true }
+        i = i + 1
       }
-      i = i + 1
+      return false
     }
-    return false
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread { return blockHasCallRef(n.spdArg, fnIx) }
-  if n is ArrayLit {
-    const elems = n.arrElems
-    let i = 0
-    while i < elems.length {
-      if blockHasCallRef(elems[i], fnIx) { return true }
-      i = i + 1
-    }
-    return false
+    // Any other node holds no call this walk descends into.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   false
 }
@@ -1887,93 +1967,111 @@ export function blockHasStash(ix: i32, fnIx: i32, want: StashWant): boolean {
   if ix < 0 { return false }
   if stashHitAt(ix, fnIx, want) { return true }
   const n = P.nodes[ix]
-  if n is Call {
-    if blockHasStash(n.callFn, fnIx, want) { return true }
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      if blockHasStash(args[i], fnIx, want) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if n is Block {
-    const stmts = n.blkStmts
-    let i = 0
-    while i < stmts.length {
-      if blockHasStash(stmts[i], fnIx, want) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if n is LetDecl {
-    if n.letInit >= 0 { return blockHasStash(n.letInit, fnIx, want) }
-    return false
-  }
-  if n is RetStmt {
-    if n.retArg >= 0 { return blockHasStash(n.retArg, fnIx, want) }
-    return false
-  }
-  if n is IfStmt {
-    if blockHasStash(n.ifCond, fnIx, want) { return true }
-    if blockHasStash(n.ifThen, fnIx, want) { return true }
-    if n.ifElse >= 0 { return blockHasStash(n.ifElse, fnIx, want) }
-    return false
-  }
-  if n is WhileStmt {
-    if blockHasStash(n.whileCond, fnIx, want) { return true }
-    return blockHasStash(n.whileBody, fnIx, want)
-  }
-  if n is ForRange {
-    if blockHasStash(n.frFrom, fnIx, want) { return true }
-    if blockHasStash(n.frTo, fnIx, want) { return true }
-    if n.frStep >= 0 {
-      if blockHasStash(n.frStep, fnIx, want) { return true }
-    }
-    return blockHasStash(n.frBody, fnIx, want)
-  }
-  if n is ForIn {
-    if blockHasStash(n.fiIter, fnIx, want) { return true }
-    return blockHasStash(n.fiBody, fnIx, want)
-  }
-  if n is BinExpr {
-    if blockHasStash(n.binLeft, fnIx, want) { return true }
-    return blockHasStash(n.binRight, fnIx, want)
-  }
-  if n is Unary { return blockHasStash(n.unArg, fnIx, want) }
-  if n is Paren { return blockHasStash(n.parInner, fnIx, want) }
-  if n is IsExpr { return blockHasStash(n.isObj, fnIx, want) }
-  if n is AsExpr { return blockHasStash(n.asObj, fnIx, want) }
-  if n is Member { return blockHasStash(n.memObj, fnIx, want) }
-  // A `?.` RECEIVER is lowered exactly as a `.` one is, so a stash needed under it belongs
-  // to the enclosing frame (D1667).
-  if n is OptMember { return blockHasStash(n.omObj, fnIx, want) }
-  if n is Index {
-    if blockHasStash(n.idxArr, fnIx, want) { return true }
-    return blockHasStash(n.idxIndex, fnIx, want)
-  }
-  if n is ObjLit {
-    const fields = n.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if blockHasStash(f.fiValue, fnIx, want) { return true }
+  match n {
+    Call => {
+      if blockHasStash(n.callFn, fnIx, want) { return true }
+      const args = n.callArgs
+      let i = 0
+      while i < args.length {
+        if blockHasStash(args[i], fnIx, want) { return true }
+        i = i + 1
       }
-      i = i + 1
+      return false
     }
-    return false
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread { return blockHasStash(n.spdArg, fnIx, want) }
-  if n is ArrayLit {
-    const elems = n.arrElems
-    let i = 0
-    while i < elems.length {
-      if blockHasStash(elems[i], fnIx, want) { return true }
-      i = i + 1
+    Block => {
+      const stmts = n.blkStmts
+      let i = 0
+      while i < stmts.length {
+        if blockHasStash(stmts[i], fnIx, want) { return true }
+        i = i + 1
+      }
+      return false
     }
-    return false
+    LetDecl => {
+      if n.letInit >= 0 { return blockHasStash(n.letInit, fnIx, want) }
+      return false
+    }
+    RetStmt => {
+      if n.retArg >= 0 { return blockHasStash(n.retArg, fnIx, want) }
+      return false
+    }
+    IfStmt => {
+      if blockHasStash(n.ifCond, fnIx, want) { return true }
+      if blockHasStash(n.ifThen, fnIx, want) { return true }
+      if n.ifElse >= 0 { return blockHasStash(n.ifElse, fnIx, want) }
+      return false
+    }
+    WhileStmt => {
+      if blockHasStash(n.whileCond, fnIx, want) { return true }
+      return blockHasStash(n.whileBody, fnIx, want)
+    }
+    ForRange => {
+      if blockHasStash(n.frFrom, fnIx, want) { return true }
+      if blockHasStash(n.frTo, fnIx, want) { return true }
+      if n.frStep >= 0 {
+        if blockHasStash(n.frStep, fnIx, want) { return true }
+      }
+      return blockHasStash(n.frBody, fnIx, want)
+    }
+    ForIn => {
+      if blockHasStash(n.fiIter, fnIx, want) { return true }
+      return blockHasStash(n.fiBody, fnIx, want)
+    }
+    BinExpr => {
+      if blockHasStash(n.binLeft, fnIx, want) { return true }
+      return blockHasStash(n.binRight, fnIx, want)
+    }
+    Unary => {
+      return blockHasStash(n.unArg, fnIx, want)
+    }
+    Paren => {
+      return blockHasStash(n.parInner, fnIx, want)
+    }
+    IsExpr => {
+      return blockHasStash(n.isObj, fnIx, want)
+    }
+    AsExpr => {
+      return blockHasStash(n.asObj, fnIx, want)
+    }
+    Member => {
+      return blockHasStash(n.memObj, fnIx, want)
+    }
+    // A `?.` RECEIVER is lowered exactly as a `.` one is, so a stash needed under it belongs
+    // to the enclosing frame (D1667).
+    OptMember => {
+      return blockHasStash(n.omObj, fnIx, want)
+    }
+    Index => {
+      if blockHasStash(n.idxArr, fnIx, want) { return true }
+      return blockHasStash(n.idxIndex, fnIx, want)
+    }
+    ObjLit => {
+      const fields = n.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit {
+          if blockHasStash(f.fiValue, fnIx, want) { return true }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return blockHasStash(n.spdArg, fnIx, want)
+    }
+    ArrayLit => {
+      const elems = n.arrElems
+      let i = 0
+      while i < elems.length {
+        if blockHasStash(elems[i], fnIx, want) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // Any other node holds no sub-tree this walk descends into.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   false
 }
@@ -2232,44 +2330,58 @@ export function bodyEndsInReturn(blockIx: i32, fnIx: i32) {
 function retExitCount(stmtIx: i32, fnIx: i32) {
   if stmtIx < 0 { return 0 }
   const s = P.nodes[stmtIx]
-  if s is FuncDecl { return 0 }
-  if s is RetStmt { return retValueExitCount(s.retArg, fnIx) }
-  if s is Block {
-    const stmts = s.blkStmts
-    let n = 0
-    let i = 0
-    while i < stmts.length {
-      const isLast = i == stmts.length - 1
-      if isLast && stmtIsTailValue(stmts[i], fnIx) {
-        n = n + retValueExitCount(stmts[i], fnIx)
-      } else {
-        n = n + retExitCount(stmts[i], fnIx)
-      }
-      i = i + 1
+  match s {
+    FuncDecl => {
+      return 0
     }
-    return n
-  }
-  if s is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-    let total = 0
-    let cur = stmtIx
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        total = total + retExitCount(c.ifThen, fnIx)
-        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
-          cur = c.ifElse
+    RetStmt => {
+      return retValueExitCount(s.retArg, fnIx)
+    }
+    Block => {
+      const stmts = s.blkStmts
+      let n = 0
+      let i = 0
+      while i < stmts.length {
+        const isLast = i == stmts.length - 1
+        if isLast && stmtIsTailValue(stmts[i], fnIx) {
+          n = n + retValueExitCount(stmts[i], fnIx)
         } else {
-          total = total + retExitCount(c.ifElse, fnIx)
+          n = n + retExitCount(stmts[i], fnIx)
+        }
+        i = i + 1
+      }
+      return n
+    }
+    IfStmt => {
+      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+      let total = 0
+      let cur = stmtIx
+      while cur >= 0 {
+        const c = P.nodes[cur]
+        cur = -1
+        if c is IfStmt {
+          total = total + retExitCount(c.ifThen, fnIx)
+          if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            total = total + retExitCount(c.ifElse, fnIx)
+          }
         }
       }
+      return total
     }
-    return total
+    WhileStmt => {
+      return retExitCount(s.whileBody, fnIx)
+    }
+    ForRange => {
+      return retExitCount(s.frBody, fnIx)
+    }
+    ForIn => {
+      return retExitCount(s.fiBody, fnIx)
+    }
+    // Any other statement contributes no value exit.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
-  if s is WhileStmt { return retExitCount(s.whileBody, fnIx) }
-  if s is ForRange { return retExitCount(s.frBody, fnIx) }
-  if s is ForIn { return retExitCount(s.fiBody, fnIx) }
   0
 }
 
@@ -2376,6 +2488,7 @@ export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
     let guard = 0
     while guard < 32 {
       guard = guard + 1
+      if cur < 0 { return false }
       const cn = P.nodes[cur]
       if cn is Member {
         props.push(cn.memProp)
@@ -2426,6 +2539,7 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Index {
     const m = unwrapParen(e.idxArr)
+    if m < 0 { return false }
     if !(P.nodes[m] is Member) { return false }
     // Collect the field chain root-first: `t0.f.g[0]` -> root `t0`, props [f, g]. The
     // root may also be an indexed union ident, whose ref-array arm's element struct
@@ -2596,52 +2710,57 @@ function identRebindUnionArmClosureField(
   if !(d is LetDecl) { return false }
   if d.letInit < 0 { return false }
   const init = P.nodes[unwrapParen(d.letInit)]
-  if init is Ident {
-    return identRebindUnionArmClosureField(init.identName, fnIx, depth - 1)
-  }
-  if init is Member {
-    // Collect the field chain root-first (the `calleeIsUnionArmClosureMember` walk).
-    const props: string[] = []
-    let cur = unwrapParen(d.letInit)
-    let rootName = ""
-    let guard = 0
-    while guard < 32 {
-      guard = guard + 1
-      const cn = P.nodes[cur]
-      if cn is Member {
-        props.push(cn.memProp)
-        cur = unwrapParen(cn.memObj)
-      } else if cn is Ident {
-        rootName = cn.identName
-        break
-      } else {
-        return false
+  match init {
+    Ident => {
+      return identRebindUnionArmClosureField(init.identName, fnIx, depth - 1)
+    }
+    Member => {
+      // Collect the field chain root-first (the `calleeIsUnionArmClosureMember` walk).
+      const props: string[] = []
+      let cur = unwrapParen(d.letInit)
+      let rootName = ""
+      let guard = 0
+      while guard < 32 {
+        guard = guard + 1
+        if cur < 0 { return false }
+        const cn = P.nodes[cur]
+        if cn is Member {
+          props.push(cn.memProp)
+          cur = unwrapParen(cn.memObj)
+        } else if cn is Ident {
+          rootName = cn.identName
+          break
+        } else {
+          return false
+        }
       }
-    }
-    if rootName == "" || props.length == 0 { return false }
-    const path: string[] = []
-    let pr = props.length - 1
-    while pr >= 0 {
-      path.push(props[pr])
-      pr = pr - 1
-    }
-    const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
-    if un == "" { return false }
-    const atoms: string[] = []
-    // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
-    // bare / nullable, or a `TyUnion` with a `TyFunc` member).
-    const mems: i32[] = []
-    // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
-    // second walk over the arms' rendered spellings.
-    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
-    let m = 0
-    while m < mems.length {
-      if atoms[m] != "null" {
-        if tyArmPathHasCloValue(mems[m], path) { return true }
+      if rootName == "" || props.length == 0 { return false }
+      const path: string[] = []
+      let pr = props.length - 1
+      while pr >= 0 {
+        path.push(props[pr])
+        pr = pr - 1
       }
-      m = m + 1
+      const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
+      if un == "" { return false }
+      const atoms: string[] = []
+      // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
+      // bare / nullable, or a `TyUnion` with a `TyFunc` member).
+      const mems: i32[] = []
+      // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
+      // second walk over the arms' rendered spellings.
+      if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
+      let m = 0
+      while m < mems.length {
+        if atoms[m] != "null" {
+          if tyArmPathHasCloValue(mems[m], path) { return true }
+        }
+        m = m + 1
+      }
+      return false
     }
-    return false
+    // Any other init is no rebind and no member chain.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -2663,6 +2782,7 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
     let guard = 0
     while guard < 32 {
       guard = guard + 1
+      if cur < 0 { return false }
       const cn = P.nodes[cur]
       if cn is Member {
         props.push(cn.memProp)
@@ -2719,6 +2839,7 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
       let guard = 0
       while guard < 32 {
         guard = guard + 1
+        if cur < 0 { return false }
         const cn = P.nodes[cur]
         if cn is Member {
           props.push(cn.memProp)
@@ -3026,6 +3147,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
         if nodeTyUnionHasMapArm(lhs.idxArr) { return true }
       }
       if lhs is Call {
+        if lhs.callFn < 0 { return false }
         const lcallee = P.nodes[lhs.callFn]
         if lcallee is Member {
           if lcallee.memProp == "get" {
@@ -3054,6 +3176,7 @@ export function exprHasMapOp(exprIx: i32, fnIx: i32) {
     // `recv.has(k)` map membership / `recv.delete(k)` map removal — both touch a map.
     // `m.keys()` / `m.values()` ITERATION also needs the map scratch frame (slot 0
     // holds the map ref for the tombstone-aware `live[i]` skip in the for-in loop).
+    if e.callFn < 0 { return false }
     const callee = P.nodes[e.callFn]
     if callee is Member {
       if callee.memProp == "has" {

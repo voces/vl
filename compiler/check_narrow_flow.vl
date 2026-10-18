@@ -5,21 +5,45 @@
 
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
+  LetDecl,
+  MatchExpr,
   Member,
   Node,
+  NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
+  Param,
   Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
+  WhileStmt,
   elseIfLink,
   getDeclLabel,
   i32ToStr,
@@ -480,8 +504,10 @@ import {
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
   TyVar,
   mkNullableTy,
@@ -1310,19 +1336,21 @@ function callInvalidatesReal(cn: Call, callIx: i32, key: string) {
   // first because it reaches neither leg below: an intrinsic answers `-2` on the next line, and
   // `callArgPlaces` puts a receiver in the argument list only for a UFCS call. The key argument
   // is read exactly as a write target is — a literal names its cell, anything else may hit any.
-  const rmRecv = P.nodes[cn.callFn]
-  if rmRecv is Member {
-    if cellRemovingMethod(rmRecv.memProp) {
-      const rmRoot = placeKeyOf(rmRecv.memObj)
-      if rmRoot != "" {
-        const rmLit = removedCellKeyText(cn, rmRecv.memProp)
-        if rmLit == "" {
-          if keyHasPrefix(key, rmRoot + "[") { return true }
-        } else {
-          const rmCell = rmRoot + "[" + rmLit + "]"
-          if key == rmCell { return true }
-          if keyHasPrefix(key, rmCell + ".") { return true }
-          if keyHasPrefix(key, rmCell + "[") { return true }
+  if cn.callFn >= 0 {
+    const rmRecv = P.nodes[cn.callFn]
+    if rmRecv is Member {
+      if cellRemovingMethod(rmRecv.memProp) {
+        const rmRoot = placeKeyOf(rmRecv.memObj)
+        if rmRoot != "" {
+          const rmLit = removedCellKeyText(cn, rmRecv.memProp)
+          if rmLit == "" {
+            if keyHasPrefix(key, rmRoot + "[") { return true }
+          } else {
+            const rmCell = rmRoot + "[" + rmLit + "]"
+            if key == rmCell { return true }
+            if keyHasPrefix(key, rmCell + ".") { return true }
+            if keyHasPrefix(key, rmCell + "[") { return true }
+          }
         }
       }
     }
@@ -1409,42 +1437,50 @@ export function writeBarredErr(place: string, at: i32) {
 // declaration; a property path reads the field off the receiver's type. -1 across a barrier.
 export function writeStorageTy(ix: i32) {
   const n = P.nodes[ix]
-  if n is Ident {
-    // A guard's write is bounded by a loop barrier, and a nested function that captured the
-    // narrowing is checked at each call instead (D2402). An assignment narrowing's is not: its
-    // null write in a single-iteration loop is a correct program barring would reject.
-    if narGuardSlot(n.identName) >= 0 { return narWriteStorage(n.identName) }
-    return narDeclaredTy(n.identName, NAR_KIND_ASG)
-  }
-  if n is Member {
-    const key = placeKeyOf(ix)
-    if key == "" { return -1 }
-    const slot = narrowedPathIx(key)
-    if slot < 0 { return -1 }
-    // An already-retired narrowing still answers, and bailing on `npInvBy[slot] >= 0` here is an
-    // ordering bug inside one statement: `lt` is read off the target before the right-hand side is
-    // checked, so a callee that retires the path mid-statement would leave `asgLt` at a type the
-    // storage never had. A retired narrowing means the place reads at its declared type.
-    if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
-    if !npInsideBarrier(slot) { return -1 }
-    const noNames: string[] = []
-    const noTys: i32[] = []
-    return placeFieldTy(placeCurTy(n.memObj, noNames, noTys), n.memProp, false)
-  }
-  // An index cell is storage too, and this arm is not optional once a cell can be narrowed:
-  // `if xs[0] != null { xs[0] = null }` runs when no narrowing covers the target, and without this
-  // it would newly reject `cannot assign null to i32[]` — a working program lost to a rule whose
-  // whole point is that it never shrinks what storage holds. Same three guards as the member arm.
-  if n is Index {
-    const key = placeKeyOf(ix)
-    if key == "" { return -1 }
-    const slot = narrowedPathIx(key)
-    if slot < 0 { return -1 }
-    if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
-    if !npInsideBarrier(slot) { return -1 }
-    const noNames: string[] = []
-    const noTys: i32[] = []
-    return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
+  match n {
+    Ident => {
+      // A guard's write is bounded by a loop barrier, and a nested function that captured the
+      // narrowing is checked at each call instead (D2402). An assignment narrowing's is not: its
+      // null write in a single-iteration loop is a correct program barring would reject.
+      if narGuardSlot(n.identName) >= 0 { return narWriteStorage(n.identName) }
+      return narDeclaredTy(n.identName, NAR_KIND_ASG)
+    }
+    Member => {
+      const key = placeKeyOf(ix)
+      if key == "" { return -1 }
+      const slot = narrowedPathIx(key)
+      if slot < 0 { return -1 }
+      // An already-retired narrowing still answers, and bailing on `npInvBy[slot] >= 0` here is an
+      // ordering bug inside one statement: `lt` is read off the target before the right-hand side is
+      // checked, so a callee that retires the path mid-statement would leave `asgLt` at a type the
+      // storage never had. A retired narrowing means the place reads at its declared type.
+      if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
+      if !npInsideBarrier(slot) { return -1 }
+      const noNames: string[] = []
+      const noTys: i32[] = []
+      return placeFieldTy(
+        placeCurTy(n.memObj, noNames, noTys),
+        n.memProp,
+        false,
+      )
+    }
+    // An index cell is storage too, and this arm is not optional once a cell can be narrowed:
+    // `if xs[0] != null { xs[0] = null }` runs when no narrowing covers the target, and without this
+    // it would newly reject `cannot assign null to i32[]` — a working program lost to a rule whose
+    // whole point is that it never shrinks what storage holds. Same three guards as the member arm.
+    Index => {
+      const key = placeKeyOf(ix)
+      if key == "" { return -1 }
+      const slot = narrowedPathIx(key)
+      if slot < 0 { return -1 }
+      if npEpochs[slot] != narFnEpoch && npAsg[slot] != 1 { return -1 }
+      if !npInsideBarrier(slot) { return -1 }
+      const noNames: string[] = []
+      const noTys: i32[] = []
+      return placeCellStoreTy(placeCurTy(n.idxArr, noNames, noTys))
+    }
+    // Every other kind is not storage a write can land in.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -2732,10 +2768,12 @@ function crCallbackKeeps(fnIx: i32, key: string): boolean {
   const cn = P.nodes[c]
   if cn is Call {
     const d = callDeclFnIx(cn, c)
-    const cf = P.nodes[cn.callFn]
-    if cf is Member {
-      if (cf.memProp == "map" || cf.memProp == "filter") && d == -2 {
-        return true
+    if cn.callFn >= 0 {
+      const cf = P.nodes[cn.callFn]
+      if cf is Member {
+        if (cf.memProp == "map" || cf.memProp == "filter") && d == -2 {
+          return true
+        }
       }
     }
     if d < 0 { return false }
@@ -2973,6 +3011,7 @@ function elemOnlyStoreKeeps(
 // Whether the call `cn` is a `push` of values the element-only entry `key` admits onto a list at
 // its depth (`elemOnlyStoreKeeps`), which keeps the entry.
 function pushKeepsElemOnly(cn: Call, key: string): boolean {
+  if cn.callFn < 0 { return false }
   const cf = P.nodes[cn.callFn]
   if !(cf is Member) || cn.callArgs.length == 0 || cf.memProp != "push" {
     return false
@@ -2994,7 +3033,7 @@ function crFirstElemWritingCall(ix: i32, key: string): i32 {
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const n = P.nodes[ix]
   let own = false
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cf = P.nodes[n.callFn]
     if cf is Member {
       const ro = P.nodes[peelParenIx(cf.memObj)]
@@ -3446,16 +3485,27 @@ function placeCurTy(ix: i32, names: string[], tys: i32[]) {
     const ov = narrowedPathTy(key)
     if ov >= 0 { return ov }
   }
+  if ix < 0 { return -1 }
   const n = P.nodes[ix]
-  if n is Paren { return placeCurTy(n.parInner, names, tys) }
-  if n is Ident { return lookup(n.identName) }
-  if n is Member {
-    return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
+  match n {
+    Paren => {
+      return placeCurTy(n.parInner, names, tys)
+    }
+    Ident => {
+      return lookup(n.identName)
+    }
+    Member => {
+      return placeFieldTy(placeCurTy(n.memObj, names, tys), n.memProp, false)
+    }
+    OptMember => {
+      return placeFieldTy(placeCurTy(n.omObj, names, tys), n.omProp, true)
+    }
+    Index => {
+      return placeElemTy(placeCurTy(n.idxArr, names, tys))
+    }
+    // Every other kind is not a place.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
-  if n is OptMember {
-    return placeFieldTy(placeCurTy(n.omObj, names, tys), n.omProp, true)
-  }
-  if n is Index { return placeElemTy(placeCurTy(n.idxArr, names, tys)) }
   -1
 }
 
@@ -3554,16 +3604,22 @@ function pushDiscrimParentFact(
 // already-narrowed receiver, so the body's regular `x.y` reads resolve. Then branch only.
 function pushOptChainThenFacts(placeIx: i32, names: string[], tys: i32[]) {
   const n = P.nodes[placeIx]
-  if n is Member {
-    pushOptChainThenFacts(n.memObj, names, tys)
-    return 0
-  }
-  if n is OptMember {
-    pushOptChainThenFacts(n.omObj, names, tys)
-    const cur = placeCurTy(n.omObj, names, tys)
-    const inner = nonNullNarrowTy(cur)
-    if inner >= 0 && inner != cur { pushNarrowFact(n.omObj, inner, names, tys) }
-    return 0
+  match n {
+    Member => {
+      pushOptChainThenFacts(n.memObj, names, tys)
+      return 0
+    }
+    OptMember => {
+      pushOptChainThenFacts(n.omObj, names, tys)
+      const cur = placeCurTy(n.omObj, names, tys)
+      const inner = nonNullNarrowTy(cur)
+      if inner >= 0 && inner != cur {
+        pushNarrowFact(n.omObj, inner, names, tys)
+      }
+      return 0
+    }
+    // Every other kind is the chain's root, which carries no hop to narrow.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -3673,120 +3729,126 @@ export function collectThenNarrows(condIx: i32, names: string[], tys: i32[]) {
 
 function collectThenNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
   const cond = P.nodes[condIx]
-  if cond is Paren { return collectThenNarrows(cond.parInner, names, tys) }
-  if cond is Unary {
-    if cond.unOp == "!" { return collectElseNarrows(cond.unArg, names, tys) }
-    return 0
-  }
-  if cond is IsExpr {
-    const isPl = asgTestedPlace(cond.isObj)
-    pushOptChainThenFacts(cond.isObj, names, tys)
-    if cond.isVariant == "null" {
-      pushNarrowFact(isPl, TY_NULL, names, tys)
-    } else {
-      let tIdx = isTypeTyRead(cond.isVariant, condIx)
-      // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
-      const isCur = placeCurTy(isPl, names, tys)
-      let meet = litSetMeetTy(isCur, tIdx)
-      if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
-      if meet >= 0 { tIdx = meet }
-      // A value that passed may be laid out as another arm (D4056): only `null` leaves.
-      if (
-        tIdx >= 0
-        && (recIsFitsAcrossTags(isCur, tIdx) || listIsFitsAcrossReps(isCur, tIdx))
-      ) {
-        const nn = nonNullNarrowTy(isCur)
-        if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
-        // A list that keeps its storage still narrows its element reads (ruling (c), D4928).
-        if (
-          listIsFitsAcrossReps(isCur, tIdx)
-          && recFitNarrowKeepsRep(isCur, tIdx)
-        ) {
-          pushElemReadFact(isPl, isCur, tIdx, names, tys)
-        }
-      } else if tIdx >= 0 && listNarrowsElemsOnly(isCur, tIdx) {
-        // A list keeps its declared type and narrows its element reads (ruling (c), D4945).
-        const nn = nonNullNarrowTy(isCur)
-        if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
-        pushElemReadFact(isPl, isCur, tIdx, names, tys)
-      } else if (
-        tIdx >= 0
-        && recFitNarrowKeepsRep(isCur, tIdx)
-        && listFitNarrowKeepsRep(isCur, tIdx)
-      ) {
-        pushNarrowFact(isPl, tIdx, names, tys)
-        pushDiscrimParentFact(
-          isPl,
-          tIdx,
-          names,
-          tys,
-          condIx,
-          false,
-          "intersect",
-        )
-      } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
-        pushElemReadFact(isPl, isCur, tIdx, names, tys)
-      }
+  match cond {
+    Paren => {
+      return collectThenNarrows(cond.parInner, names, tys)
     }
-    return 0
-  }
-  if cond is BinExpr {
-    if cond.binOp == "&&" {
-      const lmark = names.length
-      collectThenNarrows(cond.binLeft, names, tys)
-      crFilterRhsRetired(condIx, names, tys, lmark)
-      collectThenNarrows(cond.binRight, names, tys)
+    Unary => {
+      if cond.unOp == "!" { return collectElseNarrows(cond.unArg, names, tys) }
       return 0
     }
-    if cond.binOp == "!=" {
-      const placeIx = asgTestedPlace(nullCmpPlace(condIx))
-      if placeIx >= 0 {
-        pushOptChainThenFacts(placeIx, names, tys)
-        const cur = placeCurTy(placeIx, names, tys)
-        const inner = nonNullNarrowTy(cur)
-        if inner >= 0 && inner != cur {
-          pushNarrowFact(placeIx, inner, names, tys)
-        }
-      }
-      pushLitEqFact(condIx, false, names, tys)
-    }
-    // `s.kind == "circle"` — the discriminant in the spelling a user reaches for without
-    // declaring a tag alias first, since `is KC` needs a name to test against. Only the parent is
-    // narrowed, not the tested field: pinning `s.kind` to a bare `TyLit` would put a literal type
-    // where the field's own rep — an interned atom, or a plain string — is what consumers read.
-    if cond.binOp == "==" {
-      const eqPlace = litCmpPlace(condIx)
-      if eqPlace >= 0 {
-        const eqTy = litCmpTy(condIx)
-        if eqTy >= 0 {
+    IsExpr => {
+      const isPl = asgTestedPlace(cond.isObj)
+      pushOptChainThenFacts(cond.isObj, names, tys)
+      if cond.isVariant == "null" {
+        pushNarrowFact(isPl, TY_NULL, names, tys)
+      } else {
+        let tIdx = isTypeTyRead(cond.isVariant, condIx)
+        // An overlapping literal set narrows to the overlap, as `checkIsExprNode` tests it.
+        const isCur = placeCurTy(isPl, names, tys)
+        let meet = litSetMeetTy(isCur, tIdx)
+        if meet < 0 { meet = recFitMeetTy(isCur, tIdx) }
+        if meet >= 0 { tIdx = meet }
+        // A value that passed may be laid out as another arm (D4056): only `null` leaves.
+        if (
+          tIdx >= 0
+          && (recIsFitsAcrossTags(isCur, tIdx) || listIsFitsAcrossReps(isCur, tIdx))
+        ) {
+          const nn = nonNullNarrowTy(isCur)
+          if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
+          // A list that keeps its storage still narrows its element reads (ruling (c), D4928).
+          if (
+            listIsFitsAcrossReps(isCur, tIdx)
+            && recFitNarrowKeepsRep(isCur, tIdx)
+          ) {
+            pushElemReadFact(isPl, isCur, tIdx, names, tys)
+          }
+        } else if tIdx >= 0 && listNarrowsElemsOnly(isCur, tIdx) {
+          // A list keeps its declared type and narrows its element reads (ruling (c), D4945).
+          const nn = nonNullNarrowTy(isCur)
+          if nn >= 0 && nn != isCur { pushNarrowFact(isPl, nn, names, tys) }
+          pushElemReadFact(isPl, isCur, tIdx, names, tys)
+        } else if (
+          tIdx >= 0
+          && recFitNarrowKeepsRep(isCur, tIdx)
+          && listFitNarrowKeepsRep(isCur, tIdx)
+        ) {
+          pushNarrowFact(isPl, tIdx, names, tys)
           pushDiscrimParentFact(
-            eqPlace,
-            eqTy,
+            isPl,
+            tIdx,
             names,
             tys,
             condIx,
             false,
             "intersect",
           )
+        } else if tIdx >= 0 && recFitNarrowKeepsRep(isCur, tIdx) {
+          pushElemReadFact(isPl, isCur, tIdx, names, tys)
         }
       }
-      pushLitEqFact(condIx, true, names, tys)
+      return 0
     }
-    return 0
-  }
-  // Inferred type-guard call: `if present(v)` narrows `v` the way the guard's body narrows its
-  // parameter — non-null here when the guard's non-null branch is the then arm.
-  if cond is Call {
-    const gArg = guardCallPlace(cond, 1)
-    if gArg >= 0 {
-      pushOptChainThenFacts(gArg, names, tys)
-      const gCur = placeCurTy(gArg, names, tys)
-      const gInner = nonNullNarrowTy(gCur)
-      if gInner >= 0 && gInner != gCur {
-        pushNarrowFact(gArg, gInner, names, tys)
+    BinExpr => {
+      if cond.binOp == "&&" {
+        const lmark = names.length
+        collectThenNarrows(cond.binLeft, names, tys)
+        crFilterRhsRetired(condIx, names, tys, lmark)
+        collectThenNarrows(cond.binRight, names, tys)
+        return 0
       }
+      if cond.binOp == "!=" {
+        const placeIx = asgTestedPlace(nullCmpPlace(condIx))
+        if placeIx >= 0 {
+          pushOptChainThenFacts(placeIx, names, tys)
+          const cur = placeCurTy(placeIx, names, tys)
+          const inner = nonNullNarrowTy(cur)
+          if inner >= 0 && inner != cur {
+            pushNarrowFact(placeIx, inner, names, tys)
+          }
+        }
+        pushLitEqFact(condIx, false, names, tys)
+      }
+      // `s.kind == "circle"` — the discriminant in the spelling a user reaches for without
+      // declaring a tag alias first, since `is KC` needs a name to test against. Only the parent is
+      // narrowed, not the tested field: pinning `s.kind` to a bare `TyLit` would put a literal type
+      // where the field's own rep — an interned atom, or a plain string — is what consumers read.
+      if cond.binOp == "==" {
+        const eqPlace = litCmpPlace(condIx)
+        if eqPlace >= 0 {
+          const eqTy = litCmpTy(condIx)
+          if eqTy >= 0 {
+            pushDiscrimParentFact(
+              eqPlace,
+              eqTy,
+              names,
+              tys,
+              condIx,
+              false,
+              "intersect",
+            )
+          }
+        }
+        pushLitEqFact(condIx, true, names, tys)
+      }
+      return 0
     }
-    return 0
+    // Inferred type-guard call: `if present(v)` narrows `v` the way the guard's body narrows its
+    // parameter — non-null here when the guard's non-null branch is the then arm.
+    Call => {
+      const gArg = guardCallPlace(cond, 1)
+      if gArg >= 0 {
+        pushOptChainThenFacts(gArg, names, tys)
+        const gCur = placeCurTy(gArg, names, tys)
+        const gInner = nonNullNarrowTy(gCur)
+        if gInner >= 0 && gInner != gCur {
+          pushNarrowFact(gArg, gInner, names, tys)
+        }
+      }
+      return 0
+    }
+    // Every other kind narrows nothing.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -3822,111 +3884,125 @@ export function collectElseNarrows(condIx: i32, names: string[], tys: i32[]) {
 
 function collectElseNarrowsRaw(condIx: i32, names: string[], tys: i32[]) {
   const cond = P.nodes[condIx]
-  if cond is Paren { return collectElseNarrows(cond.parInner, names, tys) }
-  if cond is Unary {
-    if cond.unOp == "!" { return collectThenNarrows(cond.unArg, names, tys) }
-    return 0
-  }
-  if cond is IsExpr {
-    const isPl = asgTestedPlace(cond.isObj)
-    if placeHasOptionalHop(cond.isObj) { return 0 }
-    const cur = placeCurTy(isPl, names, tys)
-    if cond.isVariant == "null" {
-      // The null face of the same hole (D1243), now the shared reader's — see its header.
-      const inner = nonNullNarrowTy(cur)
-      if inner >= 0 && (inner != cur || narPathHeldNonNull(isPl, inner)) {
-        pushNarrowFact(isPl, inner, names, tys)
-      }
-    } else {
-      const tIdx = isTypeTyRead(cond.isVariant, condIx)
-      if tIdx >= 0 {
-        let sub = elseRemainderTy(cur, tIdx)
-        // A hole has no member list to subtract from, so the remainder is deferred to the pin
-        // rather than lost. Without it the `else` arm of `if a is string` over an un-annotated
-        // parameter reads `a` at the full pinned union and `a * 2` refuses a program whose
-        // annotated twin runs (D1243). `holeElseRemainderOk` says which types it may mint for.
-        if sub < 0 && holeElseRemainderOk(tIdx) {
-          sub = mkDerivedHole(HD_GNOT, "", -1, tIdx, cur)
-        }
-        // On a hole's field, a shape `T` leaves the hole itself as the arm's fact, so a write
-        // or call that ends the remainder the instance narrows to re-asks the reads after it
-        // at the pin (D3420). A bare name keeps no fact, so it reads at its demand.
-        const hk = placeKeyOf(isPl)
-        if sub < 0 && tyIsHole(cur) && hk != "" && isPathKey(hk) {
-          holeElseTestedSetAt(hk + "|" + i32ToStr(cur), tIdx)
-          pushNarrowFact(isPl, cur, names, tys)
-          return 0
-        }
-        pushNarrowFact(isPl, sub, names, tys)
-        // The complement, banked into the else table. `setNarrowFromCondElse` declines to
-        // else-narrow a struct union, so a checker-only complement would type `else { s.w }` clean
-        // for an emitter still seeing the full union — trading an accurate `field 'w' is not on
-        // every member` for an obscure emit reject. Both layers carry it, so they agree.
-        pushDiscrimParentFact(isPl, sub, names, tys, condIx, true, "intersect")
-      }
+  match cond {
+    Paren => {
+      return collectElseNarrows(cond.parInner, names, tys)
     }
-    return 0
-  }
-  if cond is BinExpr {
-    if cond.binOp == "||" {
-      const lmark = names.length
-      collectElseNarrows(cond.binLeft, names, tys)
-      crFilterRhsRetired(condIx, names, tys, lmark)
-      collectElseNarrows(cond.binRight, names, tys)
+    Unary => {
+      if cond.unOp == "!" { return collectThenNarrows(cond.unArg, names, tys) }
       return 0
     }
-    if cond.binOp == "==" {
-      const placeIx = asgTestedPlace(nullCmpPlace(condIx))
-      if placeIx >= 0 {
-        if !placeHasOptionalHop(placeIx) {
-          const cur = placeCurTy(placeIx, names, tys)
-          const inner = nonNullNarrowTy(cur)
-          if (
-            inner >= 0
-            && (inner != cur || narPathHeldNonNull(placeIx, inner))
-          ) {
-            pushNarrowFact(placeIx, inner, names, tys)
-          }
+    IsExpr => {
+      const isPl = asgTestedPlace(cond.isObj)
+      if placeHasOptionalHop(cond.isObj) { return 0 }
+      const cur = placeCurTy(isPl, names, tys)
+      if cond.isVariant == "null" {
+        // The null face of the same hole (D1243), now the shared reader's — see its header.
+        const inner = nonNullNarrowTy(cur)
+        if inner >= 0 && (inner != cur || narPathHeldNonNull(isPl, inner)) {
+          pushNarrowFact(isPl, inner, names, tys)
         }
-      }
-      // `if s.kind == "circle" { … } else { … }` — the else arm of the discriminant. The test
-      // being false rules out exactly the arms whose tag can only be that literal, so the fact is
-      // the literal and the mode is `"exclude"`; see its header for why that is not the positive
-      // test negated.
-      const eqPlace = litCmpPlace(condIx)
-      if eqPlace >= 0 {
-        const eqTy = litCmpTy(condIx)
-        if eqTy >= 0 {
+      } else {
+        const tIdx = isTypeTyRead(cond.isVariant, condIx)
+        if tIdx >= 0 {
+          let sub = elseRemainderTy(cur, tIdx)
+          // A hole has no member list to subtract from, so the remainder is deferred to the pin
+          // rather than lost. Without it the `else` arm of `if a is string` over an un-annotated
+          // parameter reads `a` at the full pinned union and `a * 2` refuses a program whose
+          // annotated twin runs (D1243). `holeElseRemainderOk` says which types it may mint for.
+          if sub < 0 && holeElseRemainderOk(tIdx) {
+            sub = mkDerivedHole(HD_GNOT, "", -1, tIdx, cur)
+          }
+          // On a hole's field, a shape `T` leaves the hole itself as the arm's fact, so a write
+          // or call that ends the remainder the instance narrows to re-asks the reads after it
+          // at the pin (D3420). A bare name keeps no fact, so it reads at its demand.
+          const hk = placeKeyOf(isPl)
+          if sub < 0 && tyIsHole(cur) && hk != "" && isPathKey(hk) {
+            holeElseTestedSetAt(hk + "|" + i32ToStr(cur), tIdx)
+            pushNarrowFact(isPl, cur, names, tys)
+            return 0
+          }
+          pushNarrowFact(isPl, sub, names, tys)
+          // The complement, banked into the else table. `setNarrowFromCondElse` declines to
+          // else-narrow a struct union, so a checker-only complement would type `else { s.w }` clean
+          // for an emitter still seeing the full union — trading an accurate `field 'w' is not on
+          // every member` for an obscure emit reject. Both layers carry it, so they agree.
           pushDiscrimParentFact(
-            eqPlace,
-            eqTy,
+            isPl,
+            sub,
             names,
             tys,
             condIx,
             true,
-            "exclude",
+            "intersect",
           )
         }
       }
-      pushLitEqFact(condIx, false, names, tys)
+      return 0
     }
-    if cond.binOp == "!=" { pushLitEqFact(condIx, true, names, tys) }
-    return 0
-  }
-  // Inferred type-guard call: `if absent(p) { … } else { /* p != null */ }` — non-null in the else
-  // branch when the guard's non-null branch is the else.
-  if cond is Call {
-    const gArg = guardCallPlace(cond, 0)
-    if gArg >= 0 {
-      if !placeHasOptionalHop(gArg) {
-        const gCur = placeCurTy(gArg, names, tys)
-        const gInner = nonNullNarrowTy(gCur)
-        if gInner >= 0 && gInner != gCur {
-          pushNarrowFact(gArg, gInner, names, tys)
+    BinExpr => {
+      if cond.binOp == "||" {
+        const lmark = names.length
+        collectElseNarrows(cond.binLeft, names, tys)
+        crFilterRhsRetired(condIx, names, tys, lmark)
+        collectElseNarrows(cond.binRight, names, tys)
+        return 0
+      }
+      if cond.binOp == "==" {
+        const placeIx = asgTestedPlace(nullCmpPlace(condIx))
+        if placeIx >= 0 {
+          if !placeHasOptionalHop(placeIx) {
+            const cur = placeCurTy(placeIx, names, tys)
+            const inner = nonNullNarrowTy(cur)
+            if (
+              inner >= 0
+              && (inner != cur || narPathHeldNonNull(placeIx, inner))
+            ) {
+              pushNarrowFact(placeIx, inner, names, tys)
+            }
+          }
+        }
+        // `if s.kind == "circle" { … } else { … }` — the else arm of the discriminant. The test
+        // being false rules out exactly the arms whose tag can only be that literal, so the fact is
+        // the literal and the mode is `"exclude"`; see its header for why that is not the positive
+        // test negated.
+        const eqPlace = litCmpPlace(condIx)
+        if eqPlace >= 0 {
+          const eqTy = litCmpTy(condIx)
+          if eqTy >= 0 {
+            pushDiscrimParentFact(
+              eqPlace,
+              eqTy,
+              names,
+              tys,
+              condIx,
+              true,
+              "exclude",
+            )
+          }
+        }
+        pushLitEqFact(condIx, false, names, tys)
+      }
+      if cond.binOp == "!=" { pushLitEqFact(condIx, true, names, tys) }
+      return 0
+    }
+    // Inferred type-guard call: `if absent(p) { … } else { /* p != null */ }` — non-null in the else
+    // branch when the guard's non-null branch is the else.
+    Call => {
+      const gArg = guardCallPlace(cond, 0)
+      if gArg >= 0 {
+        if !placeHasOptionalHop(gArg) {
+          const gCur = placeCurTy(gArg, names, tys)
+          const gInner = nonNullNarrowTy(gCur)
+          if gInner >= 0 && gInner != gCur {
+            pushNarrowFact(gArg, gInner, names, tys)
+          }
         }
       }
+      return 0
     }
-    return 0
+    // Every other kind narrows nothing.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -4194,6 +4270,7 @@ function markChainLastArmProven(ifIx: i32, members: i32[], testedTys: i32[]) {
   const ln = P.nodes[last]
   if ln is IfStmt {
     const cix = condUnderParens(ln.ifCond)
+    if cix < 0 { return 0 }
     const cnd = P.nodes[cix]
     // Only an `is` test is elided: the proof is about member coverage, and a literal `==`
     // arm's operand may be any expression the emitter must still evaluate.
@@ -4224,6 +4301,7 @@ export function ifChainExhausts(ifIx: i32) {
       // contributes to coverage; anything else makes the chain non-coverable.
       // A parenthesized arm (`else if (p is B)`) classifies like the bare one.
       const condIx = condUnderParens(node.ifCond)
+      if condIx < 0 { return false }
       const cond = P.nodes[condIx]
       if cond is IsExpr {
         if cond.isVariant == "null" {
@@ -4313,33 +4391,37 @@ export function ifChainExhausts(ifIx: i32) {
   if pty < 0 { pty = lookup(placeName) }
   if pty < 0 { return false }
   const pt = T.tys[pty]
-  if pt is TyNullable {
-    // A nullable place needs an explicit `is null` (or `else`) arm to be covered;
-    // an else-less `is`-chain over the inner variants always leaves the null path.
-    return false
-  }
-  if pt is TyUnion {
-    // Cover each union member against the tested set; collect the uncovered
-    // ones (rendered) so the diagnostic can name exactly what is missing.
-    const members = pt.uMembers
-    let mi = 0
-    let allCovered = true
-    while mi < members.length {
-      let covered = false
-      let ti = 0
-      while ti < testedTys.length {
-        if assignable(members[mi], testedTys[ti]) { covered = true }
-        ti = ti + 1
-      }
-      if !covered {
-        allCovered = false
-        if chainMissing != "" { chainMissingSet(chainMissing + ", ") }
-        chainMissingSet(chainMissing + tyToStr(members[mi]))
-      }
-      mi = mi + 1
+  match pt {
+    TyNullable => {
+      // A nullable place needs an explicit `is null` (or `else`) arm to be covered;
+      // an else-less `is`-chain over the inner variants always leaves the null path.
+      return false
     }
-    if allCovered { markChainLastArmProven(ifIx, members, testedTys) }
-    return allCovered
+    TyUnion => {
+      // Cover each union member against the tested set; collect the uncovered
+      // ones (rendered) so the diagnostic can name exactly what is missing.
+      const members = pt.uMembers
+      let mi = 0
+      let allCovered = true
+      while mi < members.length {
+        let covered = false
+        let ti = 0
+        while ti < testedTys.length {
+          if assignable(members[mi], testedTys[ti]) { covered = true }
+          ti = ti + 1
+        }
+        if !covered {
+          allCovered = false
+          if chainMissing != "" { chainMissingSet(chainMissing + ", ") }
+          chainMissingSet(chainMissing + tyToStr(members[mi]))
+        }
+        mi = mi + 1
+      }
+      if allCovered { markChainLastArmProven(ifIx, members, testedTys) }
+      return allCovered
+    }
+    // Every other type is a non-union place, which the tail below treats as covered.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   // A non-union place: an `is`-chain over it is degenerate; treat as covered
   // (a single concrete type is "exhausted" by any always-true branch).

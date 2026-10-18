@@ -18,17 +18,23 @@ import {
   BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
   ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -37,11 +43,14 @@ import {
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
   StrLit,
+  TypeDecl,
   TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
   nodeChildren,
 } from "./ast"
@@ -178,8 +187,16 @@ function firstValuedReturnIf(ifIx: i32) {
       if r >= 0 { return r }
       if st.ifElse >= 0 {
         const els = P.nodes[st.ifElse]
-        if els is Block { return firstValuedReturn(st.ifElse) }
-        if els is IfStmt { cur = st.ifElse }
+        match els {
+          Block => {
+            return firstValuedReturn(st.ifElse)
+          }
+          IfStmt => {
+            cur = st.ifElse
+          }
+          // any other else has no valued return
+          NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+        }
       }
     }
   }
@@ -215,25 +232,34 @@ function coalChainHasCallLhs(binIx: i32) {
   const e = P.nodes[binIx]
   if e is BinExpr {
     const lIx = unwrapParen(e.binLeft)
+    if lIx < 0 || lIx >= P.nodes.length { return false }
     const l = P.nodes[lIx]
-    if l is Call { return true }
-    // Two more non-re-readable lhs shapes need this slot reserved too: an if-expression
-    // operand — any rep stashes once, so a side-effecting condition is not evaluated
-    // twice (D1250) — and an `as?` yielding a box, which cannot re-run the exactness
-    // test on `(d as? i32) ?? 0` and so stashes like a call.
-    if l is IfStmt { return true }
-    if l is AsExpr {
-      if tyIsNulValueUnionBox(nodeTyIxOf(lIx)) { return true }
-      // A solo numeric nullable (`i32 | null`) is a box too, but `tyIsNulValueUnionBox`
-      // answers false for it (it counts two-or-more members; a lone nullable is a niche).
-      if nodeTyIsNulScalarBox(lIx) { return true }
-    }
-    if l is BinExpr {
-      if l.binOp == "??" {
-        const m = P.nodes[unwrapParen(l.binRight)]
-        if m is Call { return true }
-        return coalChainHasCallLhs(lIx)
+    match l {
+      Call => {
+        return true
       }
+      // Two more non-re-readable lhs shapes need this slot reserved too: an if-expression
+      // operand — any rep stashes once, so a side-effecting condition is not evaluated
+      // twice (D1250) — and an `as?` yielding a box, which cannot re-run the exactness
+      // test on `(d as? i32) ?? 0` and so stashes like a call.
+      IfStmt => {
+        return true
+      }
+      AsExpr => {
+        if tyIsNulValueUnionBox(nodeTyIxOf(lIx)) { return true }
+        // A solo numeric nullable (`i32 | null`) is a box too, but `tyIsNulValueUnionBox`
+        // answers false for it (it counts two-or-more members; a lone nullable is a niche).
+        if nodeTyIsNulScalarBox(lIx) { return true }
+      }
+      BinExpr => {
+        if l.binOp == "??" {
+          const m = P.nodes[unwrapParen(l.binRight)]
+          if m is Call { return true }
+          return coalChainHasCallLhs(lIx)
+        }
+      }
+      // every other lhs can be re-read
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
   }
   false
@@ -249,66 +275,86 @@ export type ScratchQuery = "arrNew" | "coalesceCall"
 export function exprHasScratch(exprIx: i32, q: ScratchQuery) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
-  if e is Call {
-    if q == "arrNew" {
-      const callee = P.nodes[e.callFn]
-      if callee is Ident {
-        if callee.identName == "__array_new__" { return true }
-        if callee.identName == "__array_new_default__" { return true }
+  match e {
+    Call => {
+      if q == "arrNew" && e.callFn >= 0 && e.callFn < P.nodes.length {
+        const callee = P.nodes[e.callFn]
+        if callee is Ident {
+          if callee.identName == "__array_new__" { return true }
+          if callee.identName == "__array_new_default__" { return true }
+        }
       }
-    }
-    if exprHasScratch(e.callFn, q) { return true }
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      if exprHasScratch(args[i], q) { return true }
-      i = i + 1
-    }
-    return false
-  }
-  if e is BinExpr {
-    if q == "coalesceCall" && e.binOp == "??" {
-      if coalChainHasCallLhs(exprIx) { return true }
-    }
-    if exprHasScratch(e.binLeft, q) { return true }
-    return exprHasScratch(e.binRight, q)
-  }
-  if e is Member { return exprHasScratch(e.memObj, q) }
-  // The `?.` receiver, walked like the `.` one above (D1667).
-  if e is OptMember { return exprHasScratch(e.omObj, q) }
-  if e is Index {
-    if exprHasScratch(e.idxArr, q) { return true }
-    return exprHasScratch(e.idxIndex, q)
-  }
-  if e is Unary { return exprHasScratch(e.unArg, q) }
-  if e is Paren { return exprHasScratch(e.parInner, q) }
-  if e is IsExpr { return exprHasScratch(e.isObj, q) }
-  if e is AsExpr { return exprHasScratch(e.asObj, q) }
-  // An if-expression is an `IfStmt` node in value position; without this arm neither its
-  // allocator length nor its `??` would reach the frame the scan reserves.
-  if e is IfStmt { return ifChainHasScratch(exprIx, q) }
-  if e is ObjLit {
-    const fields = e.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit {
-        if exprHasScratch(f.fiValue, q) { return true }
+      if exprHasScratch(e.callFn, q) { return true }
+      const args = e.callArgs
+      let i = 0
+      while i < args.length {
+        if exprHasScratch(args[i], q) { return true }
+        i = i + 1
       }
-      i = i + 1
+      return false
     }
-    return false
-  }
-  // A spread's source is an operand like any other (D2334).
-  if e is Spread { return exprHasScratch(e.spdArg, q) }
-  if e is ArrayLit {
-    const elems = e.arrElems
-    let i = 0
-    while i < elems.length {
-      if exprHasScratch(elems[i], q) { return true }
-      i = i + 1
+    BinExpr => {
+      if q == "coalesceCall" && e.binOp == "??" {
+        if coalChainHasCallLhs(exprIx) { return true }
+      }
+      if exprHasScratch(e.binLeft, q) { return true }
+      return exprHasScratch(e.binRight, q)
     }
-    return false
+    Member => {
+      return exprHasScratch(e.memObj, q)
+    }
+    // The `?.` receiver, walked like the `.` one above (D1667).
+    OptMember => {
+      return exprHasScratch(e.omObj, q)
+    }
+    Index => {
+      if exprHasScratch(e.idxArr, q) { return true }
+      return exprHasScratch(e.idxIndex, q)
+    }
+    Unary => {
+      return exprHasScratch(e.unArg, q)
+    }
+    Paren => {
+      return exprHasScratch(e.parInner, q)
+    }
+    IsExpr => {
+      return exprHasScratch(e.isObj, q)
+    }
+    AsExpr => {
+      return exprHasScratch(e.asObj, q)
+    }
+    // An if-expression is an `IfStmt` node in value position; without this arm neither its
+    // allocator length nor its `??` would reach the frame the scan reserves.
+    IfStmt => {
+      return ifChainHasScratch(exprIx, q)
+    }
+    ObjLit => {
+      const fields = e.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit {
+          if exprHasScratch(f.fiValue, q) { return true }
+        }
+        i = i + 1
+      }
+      return false
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return exprHasScratch(e.spdArg, q)
+    }
+    ArrayLit => {
+      const elems = e.arrElems
+      let i = 0
+      while i < elems.length {
+        if exprHasScratch(elems[i], q) { return true }
+        i = i + 1
+      }
+      return false
+    }
+    // a leaf or a form whose operands this scan does not reach
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {}
   }
   false
 }
@@ -363,8 +409,16 @@ function ifChainHasScratch(ifIx: i32, q: ScratchQuery) {
       if blockHasScratch(s.ifThen, q) { return true }
       if s.ifElse >= 0 {
         const els = P.nodes[s.ifElse]
-        if els is Block { return blockHasScratch(s.ifElse, q) }
-        if els is IfStmt { cur = s.ifElse }
+        match els {
+          Block => {
+            return blockHasScratch(s.ifElse, q)
+          }
+          IfStmt => {
+            cur = s.ifElse
+          }
+          // any other else holds no scratch
+          NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+        }
       }
     }
   }
@@ -784,35 +838,44 @@ export function globalHasTypeAnn(letIx: i32) {
 export function nliAtomOfExpr(exprIx: i32) {
   if exprIx < 0 { return "" }
   const e = P.nodes[unwrapParen(exprIx)]
-  if e is NumLit {
-    if numLexIsFloat(e.numText) { return "f64" }
-    if !numLexFitsI32(e.numText) { return "i64" }
-    return "i32"
-  }
-  if e is StrLit { return "string" }
-  if e is BoolLit { return "boolean" }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const cn = callee.identName
-      let ti = 0
-      while ti < P.nodes.length {
-        const f = P.nodes[ti]
-        if f is FuncDecl {
-          if f.fnName == cn {
-            let rn = tyNameOf(f.fnRet)
-            // An un-annotated callee is not an unknown callee: `tyNameOf` answers "" both
-            // for "no return type" and for "checker inferred one" (`inferRetIdx`, filled by
-            // `elaborateInferRets`), so falling back to `inferRetNameOf` here recovers the
-            // inferred name — `registerValueUnionName` is name-keyed, so a name is what it needs.
-            if rn == "" { rn = inferRetNameOf(inferRetFnKey(ti, f.fnName)) }
-            if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
-            return ""
+  match e {
+    NumLit => {
+      if numLexIsFloat(e.numText) { return "f64" }
+      if !numLexFitsI32(e.numText) { return "i64" }
+      return "i32"
+    }
+    StrLit => {
+      return "string"
+    }
+    BoolLit => {
+      return "boolean"
+    }
+    Call => {
+      if e.callFn < 0 || e.callFn >= P.nodes.length { return "" }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const cn = callee.identName
+        let ti = 0
+        while ti < P.nodes.length {
+          const f = P.nodes[ti]
+          if f is FuncDecl {
+            if f.fnName == cn {
+              let rn = tyNameOf(f.fnRet)
+              // An un-annotated callee is not an unknown callee: `tyNameOf` answers "" both
+              // for "no return type" and for "checker inferred one" (`inferRetIdx`, filled by
+              // `elaborateInferRets`), so falling back to `inferRetNameOf` here recovers the
+              // inferred name — `registerValueUnionName` is name-keyed, so a name is what it needs.
+              if rn == "" { rn = inferRetNameOf(inferRetFnKey(ti, f.fnName)) }
+              if valueAtomKind(rn) >= 0 && rn != "null" { return rn }
+              return ""
+            }
           }
+          ti = ti + 1
         }
-        ti = ti + 1
       }
     }
+    // not classifiable at collection time
+    CharLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   ""
 }
@@ -831,24 +894,36 @@ export function nliScanStmts(walk: i32[], from: i32, name: string) {
 function nliScanStmt(stmtIx: i32, name: string) {
   if stmtIx < 0 { return "" }
   const s = P.nodes[stmtIx]
-  if s is BinExpr {
-    if s.binOp == "=" {
-      const tgt = P.nodes[s.binLeft]
-      if tgt is Ident {
-        if tgt.identName == name { return nliAtomOfExpr(s.binRight) }
+  match s {
+    BinExpr => {
+      if s.binOp == "=" {
+        const tgt = P.nodes[s.binLeft]
+        if tgt is Ident {
+          if tgt.identName == name { return nliAtomOfExpr(s.binRight) }
+        }
       }
+      return ""
     }
-    return ""
+    IfStmt => {
+      const a = nliScanBlock(s.ifThen, name)
+      if a != "" { return a }
+      return nliScanStmt(s.ifElse, name)
+    }
+    Block => {
+      return nliScanStmts(s.blkStmts, 0, name)
+    }
+    WhileStmt => {
+      return nliScanBlock(s.whileBody, name)
+    }
+    ForRange => {
+      return nliScanBlock(s.frBody, name)
+    }
+    ForIn => {
+      return nliScanBlock(s.fiBody, name)
+    }
+    // no assignment this scan descends into
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
-  if s is IfStmt {
-    const a = nliScanBlock(s.ifThen, name)
-    if a != "" { return a }
-    return nliScanStmt(s.ifElse, name)
-  }
-  if s is Block { return nliScanStmts(s.blkStmts, 0, name) }
-  if s is WhileStmt { return nliScanBlock(s.whileBody, name) }
-  if s is ForRange { return nliScanBlock(s.frBody, name) }
-  if s is ForIn { return nliScanBlock(s.fiBody, name) }
   ""
 }
 function nliScanBlock(blockIx: i32, name: string) {
@@ -946,7 +1021,7 @@ export function letInfStrListByUse(letIx: i32) {
       let i = 0
       while i < P.nodes.length {
         const nd = P.nodes[i]
-        if nd is Call {
+        if nd is Call && nd.callFn >= 0 && nd.callFn < P.nodes.length {
           const callee = P.nodes[nd.callFn]
           if callee is Member {
             if callee.memProp == "push" {
@@ -1004,6 +1079,7 @@ export function letIsSet(letIx: i32) {
     if d.letInit < 0 { return false }
     const init = P.nodes[d.letInit]
     if init is Call {
+      if init.callFn < 0 || init.callFn >= P.nodes.length { return false }
       const callee = P.nodes[init.callFn]
       if callee is Ident { return callee.identName == "Set" }
     }
