@@ -352,79 +352,14 @@ export function checkIndexNode(n: Index, ix: i32) {
   const at = T.tys[arrTy]
   // A map index: the key must match the map's key type; a read yields the nullable value
   // (`V | null`), and an assignment target accepts a plain `V`.
-  if at is TyMap {
-    // A set has no index: membership is `has`, insertion `add`.
-    if at.mSet == 1 {
-      tErr(
-        "a Set has no index — test membership with `.has(x)` and insert with `.add(x)`",
-        ix,
-      )
-      return TY_ERR
-    }
-    // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
-    // literal-union-keyed map is a member of that union, and `checkNode` types a string
-    // literal as the widened `string` with no destination to narrow it against (D1748).
-    if !assignableExpr(n.idxIndex, idxTy, at.mKey) {
-      tErr(
-        "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
-        n.idxIndex,
-      )
-    }
-    return mkNullableTy(at.mVal)
-  }
-  // Indexing a hole constrains it to an array: demand an i32 index and return the element as
-  // a derived hole (`HD_ELEM`), resolved per call site — mirrors `holeMemberTy` for `self.x`.
-  if at is TyVar {
-    if !assignable(idxTy, TY_I32) {
-      // A non-i32 index can only be a map — constrain the hole to its demanded map and pin
-      // the key from the index (the index-spelling twin of the `.set` arm's pin).
-      if mapKeyTySupported(idxTy) {
-        if tyIsWriteLandRead(arrTy) {
-          noteMemCstr(arrTy, MC_NULL_READ_MARK + OP_INDEX_GET, ix, false)
-        }
-        const hmi = holeMapDemandTy(at.tvName, false)
-        const hmt = T.tys[hmi]
-        if hmt is TyMap {
-          if hmt.mKey < 0 {
-            hmt.mKey = idxTy
-            tyMutEpoch = tyMutEpoch + 1 // hole index-read pinned the demanded key in place
-          }
-          return mkNullableTy(hmt.mVal)
-        }
-      }
-      tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
-    }
-    noteArrayDemand(arrayDemandKey(arrTy))
-    // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
-    // receiver and refuses scalars/maps — a record/nullable/function/union pinned reaches the emitter unruled.
-    noteMemCstr(arrTy, OP_INDEX_GET, ix, false)
-    return mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
-  }
+  if at is TyMap { return checkIndexMap(n, at, idxTy, ix) }
+  if at is TyVar { return checkIndexHole(n, at, arrTy, idxTy, ix) }
   // Free index operator (B14): `x[i]` on a non-indexable receiver resolves to a declared
   // `"[]"` function by type. Checked before the closure-field trap, mirroring the `a op b` order.
   if opIdxDeclared() {
     if !tyBuiltinIndexable(arrTy) {
       const rfn = opIdxFnFor(OP_INDEX_GET, arrTy)
-      if rfn != "" {
-        const bNames: string[] = []
-        const bTys: i32[] = []
-        opIdxBindGen(rfn, arrTy, idxTy, bNames, bTys)
-        const kt = opIdxParamTy(rfn, 1)
-        if kt >= 0 {
-          const ktb = substTyDeep(kt, bNames, bTys)
-          if !assignableExpr(n.idxIndex, idxTy, ktb) {
-            tErr(
-              "index: expected " + tyToStr(ktb) + ", got " + tyToStr(idxTy),
-              ix,
-            )
-          }
-        }
-        opIdxBank(ix, rfn)
-        noteCallInvalidations(ix)
-        const rty = opIdxRetTy(rfn)
-        if bNames.length > 0 { return substTyDeep(rty, bNames, bTys) }
-        return rty
-      }
+      if rfn != "" { return checkIndexOperator(n, rfn, arrTy, idxTy, ix) }
       // A write operator with no read operator is not a usable type: the assignment form
       // checks the target as an ordinary index and would name the wrong half — say which is missing.
       const wOnly = opIdxFnFor(OP_INDEX_SET, arrTy)
@@ -443,28 +378,7 @@ export function checkIndexNode(n: Index, ix: i32) {
   }
   // Index trap (B13): a user object declaring `"[]"` handles `o[k]` itself — the key checks
   // against the method's parameter, checked before the native i32-index rule. Write traps use `"[]="`.
-  if at is TyObj {
-    const trap = objFieldType(at, "[]")
-    if trap >= 0 {
-      const tt = T.tys[trap]
-      if tt is TyFunc {
-        if tt.fnParamTypes.length == 1 {
-          if !assignableExpr(n.idxIndex, idxTy, tt.fnParamTypes[0]) {
-            tErr(
-              "index: expected "
-                + tyToStr(tt.fnParamTypes[0])
-                + ", got "
-                + tyToStr(idxTy),
-              ix,
-            )
-          }
-          return tt.fnRet
-        }
-      }
-    }
-    tErr(indexFloorMsg(arrTy), ix)
-    return TY_ERR
-  }
+  if at is TyObj { return checkIndexTrap(n, at, arrTy, idxTy, ix) }
   if !assignable(idxTy, TY_I32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
   } else if tyHasTyVar(idxTy) {
@@ -504,6 +418,110 @@ export function checkIndexNode(n: Index, ix: i32) {
   }
   tErr(indexFloorMsg(arrTy), ix)
   return TY_ERR
+}
+
+// `checkIndexNode`'s map receiver `at` under index type `idxTy`: the key must match the
+// map's key type; a read yields the nullable value (`V | null`). A Set refuses.
+function checkIndexMap(n: Index, at: TyMap, idxTy: i32, ix: i32) {
+  // A set has no index: membership is `has`, insertion `add`.
+  if at.mSet == 1 {
+    tErr(
+      "a Set has no index — test membership with `.has(x)` and insert with `.add(x)`",
+      ix,
+    )
+    return TY_ERR
+  }
+  // The expression form, for the same reason `m.get`'s does: `m["green"]` on a
+  // literal-union-keyed map is a member of that union, and `checkNode` types a string
+  // literal as the widened `string` with no destination to narrow it against (D1748).
+  if !assignableExpr(n.idxIndex, idxTy, at.mKey) {
+    tErr(
+      "map key must be " + tyToStr(at.mKey) + ", got " + tyToStr(idxTy),
+      n.idxIndex,
+    )
+  }
+  mkNullableTy(at.mVal)
+}
+
+// `checkIndexNode`'s hole receiver `at` (arena type `arrTy`): indexing constrains it to an
+// array, demands an i32 index and returns the element as a derived hole (`HD_ELEM`), resolved
+// per call site — mirrors `holeMemberTy` for `self.x`. A map-key index demands a map instead.
+function checkIndexHole(n: Index, at: TyVar, arrTy: i32, idxTy: i32, ix: i32) {
+  if !assignable(idxTy, TY_I32) {
+    // A non-i32 index can only be a map — constrain the hole to its demanded map and pin
+    // the key from the index (the index-spelling twin of the `.set` arm's pin).
+    if mapKeyTySupported(idxTy) {
+      if tyIsWriteLandRead(arrTy) {
+        noteMemCstr(arrTy, MC_NULL_READ_MARK + OP_INDEX_GET, ix, false)
+      }
+      const hmi = holeMapDemandTy(at.tvName, false)
+      const hmt = T.tys[hmi]
+      if hmt is TyMap {
+        if hmt.mKey < 0 {
+          hmt.mKey = idxTy
+          tyMutEpoch = tyMutEpoch + 1 // hole index-read pinned the demanded key in place
+        }
+        return mkNullableTy(hmt.mVal)
+      }
+    }
+    tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
+  }
+  noteArrayDemand(arrayDemandKey(arrTy))
+  // Admitted here and re-asked at the pin (D691): `noteArrayDemand` only reaches a bound
+  // receiver and refuses scalars/maps — a record/nullable/function/union pinned reaches the emitter unruled.
+  noteMemCstr(arrTy, OP_INDEX_GET, ix, false)
+  mkDerivedHole(HD_ELEMV, "", -1, -1, arrTy)
+}
+
+// `checkIndexNode`'s free index operator `rfn` (B14) over receiver `arrTy`: the index checks
+// against its key parameter, the call is banked on the site, and its return type is the read's.
+function checkIndexOperator(
+  n: Index,
+  rfn: string,
+  arrTy: i32,
+  idxTy: i32,
+  ix: i32,
+) {
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  opIdxBindGen(rfn, arrTy, idxTy, bNames, bTys)
+  const kt = opIdxParamTy(rfn, 1)
+  if kt >= 0 {
+    const ktb = substTyDeep(kt, bNames, bTys)
+    if !assignableExpr(n.idxIndex, idxTy, ktb) {
+      tErr("index: expected " + tyToStr(ktb) + ", got " + tyToStr(idxTy), ix)
+    }
+  }
+  opIdxBank(ix, rfn)
+  noteCallInvalidations(ix)
+  const rty = opIdxRetTy(rfn)
+  if bNames.length > 0 { return substTyDeep(rty, bNames, bTys) }
+  rty
+}
+
+// `checkIndexNode`'s index trap (B13) on user object `at`: a `"[]"` method of one parameter
+// handles `o[k]` itself, the key checked against that parameter; any other object refuses.
+function checkIndexTrap(n: Index, at: TyObj, arrTy: i32, idxTy: i32, ix: i32) {
+  const trap = objFieldType(at, "[]")
+  if trap >= 0 {
+    const tt = T.tys[trap]
+    if tt is TyFunc {
+      if tt.fnParamTypes.length == 1 {
+        if !assignableExpr(n.idxIndex, idxTy, tt.fnParamTypes[0]) {
+          tErr(
+            "index: expected "
+              + tyToStr(tt.fnParamTypes[0])
+              + ", got "
+              + tyToStr(idxTy),
+            ix,
+          )
+        }
+        return tt.fnRet
+      }
+    }
+  }
+  tErr(indexFloorMsg(arrTy), ix)
+  TY_ERR
 }
 
 // Extracted from `checkNodeReal`'s `OptMember` arm (C3: thin the dispatcher).
