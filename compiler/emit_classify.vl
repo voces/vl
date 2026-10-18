@@ -87,7 +87,6 @@ import {
   nodeTyMapValIsNulLitUnion,
   nodeTyPinIxOf,
   pinnedHoleTyOf,
-  tyIsNonNullHoleRead,
 } from "./check_hole_pins"
 import { inferRetNameOf, inferRetTyIxOf } from "./check_infer_ret"
 import { isInferLetNulBool, isInferLetNulStr } from "./check_infer_rows"
@@ -2407,23 +2406,6 @@ export function letNulScalarListKind(letIx: i32, fnIx: i32): VKind | null {
   if d is LetDecl {
     if d.letType >= 0 { return nulScalarListKindOfNode(d.letType) }
     return exprNulScalarListKind(d.letInit, fnIx)
-  }
-  null
-}
-
-// The nullable-scalar-list `VKind` of an identifier read under a `!= null` narrowing in a
-// generic body, or null. Every instance shares the read's node, so its recorded type is the
-// deferred `hole minus null` or a type-parameter list (`T[]`); the instance's own binding names
-// the wrapper (D2238, D2244).
-export function narrowedHoleNulScalarListKind(
-  exprIx: i32,
-  fnIx: i32,
-): VKind | null {
-  if !(P.nodes[exprIx] is Ident) { return null }
-  const ty = nodeTyIxOf(exprIx)
-  if tyIsNonNullHoleRead(ty) { return exprNulScalarListKind(exprIx, fnIx) }
-  if ty >= 0 && T.tys[ty] is TyArray && tyHasTyVar(ty) {
-    return exprNulScalarListKind(exprIx, fnIx)
   }
   null
 }
@@ -17109,9 +17091,9 @@ export function exprListRep(exprIx: i32, fnIx: i32): VKind | null {
   k
 }
 
-// The oracle at this surface: the ladder's list rep against the pin-aware column, noted only
-// where they disagree; `unc` is a column the descriptor does not cover. The measurement is
-// §13.10 of docs/internals/rep-descriptor-campaign.md.
+// The oracle at this surface: the ladder's list rep against the pin-aware column (a nullable
+// list's being its list's), noted only where they disagree; `unc` is a column the descriptor
+// does not cover. The measurement is §13.10 of docs/internals/rep-descriptor-campaign.md.
 function repABNoteListRep(exprIx: i32, fnIx: i32, k: VKind | null) {
   let lw = "none"
   if k != null { lw = k }
@@ -17120,21 +17102,20 @@ function repABNoteListRep(exprIx: i32, fnIx: i32, k: VKind | null) {
   if d.rdCovered == 1 {
     cw = "none"
     if vkListClass(d.rdKind) == 1 { cw = d.rdKind }
+    const nb = nulListBase(d.rdKind)
+    if vkListClass(d.rdKind) == 2 && nb != null { cw = nb }
   }
   if lw == cw || (lw == "none" && cw == "unc") { return 0 }
-  repABNote(listRepFamilyOf(exprIx, fnIx, k, d), lw, cw)
+  repABNote(listRepFamilyOf(exprIx, fnIx), lw, cw)
 }
 
 // The family a `listRep` disagreement is noted under: `listRep` where both sides answer the same
 // question, else why they cannot. `/open` is a type no instance binds, `/scope` a local read
-// with no live slot, `/narrowed` a nullable list the ladder reads as its list (§13.13).
-function listRepFamilyOf(exprIx: i32, fnIx: i32, k: VKind | null, d: RepDesc) {
+// with no live slot (§13.13).
+function listRepFamilyOf(exprIx: i32, fnIx: i32) {
   const ty = nodeTyInOf(exprIx, fnIx)
   if ty >= 0 && ty < T.tys.length && tyHasTyVar(ty) { return "listRep/open" }
   if identReadOutOfScope(exprIx, fnIx) { return "listRep/scope" }
-  if d.rdCovered == 1 && vkListClass(d.rdKind) == 2 {
-    if k != null && nulListBase(d.rdKind) == k { return "listRep/narrowed" }
-  }
   "listRep"
 }
 
@@ -17172,6 +17153,12 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   }
   // A nullable map is no list, whatever its binding's declaration spells.
   if tyIsNullableMap(xty) { return null }
+  // A nullable list is stored in its list's wrapper, so its rep is that list's, read off the
+  // type at its instance whatever the read's spelling or slot.
+  if exprIx >= 0 {
+    const nd = repOfNodeAt(exprIx, xty)
+    if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 2 { return nulListBase(nd.rdKind) }
+  }
   // An `is K[]` arm reading an empty list of another element reads the arm's `K[]` (D4993).
   const fat = listFitArmTyOf(exprIx, fnIx)
   if fat >= 0 {
@@ -17403,14 +17390,7 @@ function identListRep(exprIx: i32, fnIx: i32): VKind | null {
     }
     const pk = paramListRep(fnIx, n)
     if pk != null { return pk }
-    const hk = gatedListRep(
-      nulListBase(narrowedHoleNulScalarListKind(exprIx, fnIx)),
-      "narrowed-hole",
-    )
-    if hk != null { return hk }
     const dk = declaredKind(n)
-    if dk == "nullist" { return "list" }
-    if dk == "nulreflist" { return "reflist" }
     const dl = listRepOrNull(dk)
     if dl != null { return dl }
     if capturedRefListSlot(fnIx, n) >= 0 { return "reflist" }
@@ -17432,10 +17412,8 @@ function globalListRep(fnIx: i32, sid: i32, atIx: i32): VKind | null {
   if gli >= 0 {
     if letIsU8Array(gli, -1) { return "u8list" }
   }
-  if globalIsNulRefArraySid(fnIx, sid, atIx) { return "reflist" }
   if globalIsRefArraySid(fnIx, sid, atIx) { return "reflist" }
   if globalIsArraySid(fnIx, sid, atIx) { return "list" }
-  if globalIsNulListSid(fnIx, sid, atIx) { return "list" }
   null
 }
 
@@ -17445,7 +17423,6 @@ function memberListRep(exprIx: i32, fnIx: i32): VKind | null {
   if narrowedRefArrayOfPlace(exprIx) != "" { return "reflist" }
   const fk = gatedListRep(memberFieldListRep(exprIx, fnIx), "member-field")
   if fk != null { return fk }
-  if exprNullableRefArray(exprIx, fnIx) { return "reflist" }
   null
 }
 
@@ -17453,7 +17430,7 @@ function memberListRep(exprIx: i32, fnIx: i32): VKind | null {
 // ref list (5), `string[]` (6), `f64[]` (25), `i64[]` (26) or `f32[]` (27), else null.
 function memberFieldListRep(exprIx: i32, fnIx: i32): VKind | null {
   const c = memFieldTypeCode(exprIx, fnIx)
-  if c == FC_I32_LIST || c == FC_NUL_I32_LIST { return "list" }
+  if c == FC_I32_LIST { return "list" }
   if c == FC_REF_LIST { return "reflist" }
   if c == FC_STR_LIST { return "strlist" }
   if c == FC_F64_LIST { return "f64list" }
