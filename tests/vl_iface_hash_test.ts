@@ -13,7 +13,10 @@
 //     change it, so a hash that is always new (sound and useless) cannot pass.
 //   * MUTATION: with each ingredient dropped (`ifaceHashDrop`), its witness case turns unsound.
 // The hit rate over single-function edits from the compiler's history is printed when
-// `VL_IFACE_HASH_RATE=<n>` asks for `n` edits; it checks the whole compiler graph per edit.
+// `VL_IFACE_HASH_RATE=<n>` asks for `n` edits; it checks the whole compiler graph per edit, or
+// another program's with `VL_IFACE_HASH_REPO` and `VL_IFACE_HASH_ENTRY`.
+// `VL_IFACE_HASH_PROBE=<mask>` prints every case's verdict with that mask dropped
+// (`VL_IFACE_HASH_ONLY=<text>` keeps the cases whose name has it).
 //
 // GATING: needs the seed and binaryen's wasm-dis.
 
@@ -53,10 +56,11 @@ type Exports = {
   ifaceHashKeyLen(i: number): number;
   ifaceHashKeyAt(i: number, j: number): number;
   ifaceHashOf(i: number, which: number): number;
+  ifaceHashRefold(mask: number): number;
 };
 
 const push = (fn: (cp: number) => number, text: string) => {
-  for (const b of new TextEncoder().encode(text)) fn(b);
+  for (const ch of text) fn(ch.codePointAt(0)!);
 };
 const readStr = (len: number, at: (j: number) => number) => {
   const b = new Uint8Array(len);
@@ -168,6 +172,24 @@ const run = (exp: Exports, g: Graph, emit: boolean): Result =>
 
 // Loads the graph rooted at `entryKey` through `dep`, builds it, and keys every table by `name`
 // of the module key.
+// The last armed check's hashes by module key, and the keys in module-table order.
+const hashesOf = (exp: Exports, name: (key: string) => string) => {
+  const hash = new Map<string, Hash>();
+  const keyOf: string[] = [];
+  for (let i = 0; i < exp.ifaceHashCount(); i++) {
+    const k = name(
+      readStr(exp.ifaceHashKeyLen(i), (j) => exp.ifaceHashKeyAt(i, j)),
+    );
+    keyOf.push(k);
+    hash.set(k, {
+      own: exp.ifaceHashOf(i, 0),
+      deep: exp.ifaceHashOf(i, 1),
+      span: exp.ifaceHashOf(i, 2),
+    });
+  }
+  return { hash, keyOf };
+};
+
 const runKeys = (
   exp: Exports,
   entryKey: string,
@@ -199,19 +221,7 @@ const runKeys = (
   exp.srcReset();
   push(exp.srcPush, entry);
   const rc = emit ? exp.compileSrc() : exp.checkSrc();
-  const hash = new Map<string, Hash>();
-  const keyOf: string[] = [];
-  for (let i = 0; i < exp.ifaceHashCount(); i++) {
-    const k = name(
-      readStr(exp.ifaceHashKeyLen(i), (j) => exp.ifaceHashKeyAt(i, j)),
-    );
-    keyOf.push(k);
-    hash.set(k, {
-      own: exp.ifaceHashOf(i, 0),
-      deep: exp.ifaceHashOf(i, 1),
-      span: exp.ifaceHashOf(i, 2),
-    });
-  }
+  const { hash, keyOf } = hashesOf(exp, name);
   const diags = new Map<string, string[]>();
   for (let i = 0; i < exp.diagCount(); i++) {
     const k = keyOf[exp.diagModule(i)] ?? "?";
@@ -257,11 +267,18 @@ function sink(v: i64): void { print(1) }
 function take(w: { x: i64, y: i64 }): void { print(2) }
 function clear(): void { g = null }
 function helper<T>(a: T): T { return a }
+function quiet(): void { print(3) }
+let pv = area(1)
+type Inner = { q: i32 }
+type Unused = { z: i32 }
+function spare(n: i32): i32 { return n }
+export function inner(): Inner { return { q: 1 } }
 export function area(n: i32): i32 {
   return n * 2
 }
 export function bump(): void {
   print(0)
+  quiet()
 }
 export function use(): void {
   sink(5)
@@ -281,7 +298,7 @@ export function size(sh: Shape): i32 { return sh.w * sh.h }
 `;
 
 const MAIN =
-  `import { area, pt, g, bump, counter, s, use, go, head, half, twice, pick, size, mode } from "./lib"
+  `import { area, pt, g, bump, counter, s, use, go, head, half, twice, pick, size, mode, inner } from "./lib"
 print(area(pt.x))
 if g != null {
   bump()
@@ -299,6 +316,7 @@ print(twice(3))
 print(pick(1, 2))
 print(size({ w: 2, h: 3 }))
 print(mode == "a")
+print(inner().q)
 `;
 
 const lib = (name: string, want: Want, from: string, to: string): Case => ({
@@ -357,6 +375,7 @@ export function area(n: i32): i32 {
 `;
 const RE_MID = `import { Shape } from "./lib"
 export { area } from "./lib"
+function pad(n: i32): i32 { return n }
 export function mk(): Shape { return { w: 2, h: 3 } }
 `;
 const reexp = (name: string, want: Want, from: string, to: string): Case => ({
@@ -368,7 +387,298 @@ const reexp = (name: string, want: Want, from: string, to: string): Case => ({
   to,
 });
 
+// Inferred-return bodies a dependent consumes only through their checked type.
+const INF_LIB = `export let s = 0
+let hidden = { x: 1, y: 2 }
+type Box = { w: i32 }
+export function u(b: boolean) { if b { return 1 } return "x" }
+export function k() { 1 }
+export function mk() { return [] }
+export function rec() { { x: 1 } }
+export function md() { "a" }
+export function nul(b: boolean) { if b { return null } return 1 }
+export function gs() { s }
+export function hid() { hidden }
+export function bx() {
+  const b: Box = { w: 1 }
+  return b
+}
+`;
+const INF_MAIN = `import { u, k, mk, rec, md, nul, gs, hid, bx } from "./lib"
+const v = u(true)
+if v is i32 { print(v) } else { print(v) }
+const y: f64 = k()
+print(y)
+const xs = mk()
+xs.push(1)
+print(xs[0])
+function take(p: { x: i64 }): void { print(p.x) }
+take(rec())
+const m = md()
+print(m == "a")
+const n = nul(false)
+if n != null { print(n + 1) }
+function sink(q: i64): void { print(q) }
+sink(gs())
+print(hid().x)
+print(bx().w)
+`;
+const inf = (name: string, want: Want, from: string, to: string): Case => ({
+  name,
+  want,
+  entry: INF_MAIN,
+  mods: { "lib.vl": INF_LIB },
+  from,
+  to,
+});
+
+// Deeper than a rendered type shows; `tyToStr` elides past 64 levels.
+const DEEP = 70;
+
+// One inferred-return function `f` in lib and a main that uses its result.
+const one = (
+  name: string,
+  want: Want,
+  libSrc: string,
+  use: string,
+  from: string,
+  to: string,
+): Case => ({
+  name,
+  want,
+  entry: `import { f } from "./lib"\n${use}\n`,
+  mods: { "lib.vl": libSrc },
+  from,
+  to,
+});
+
 const CASES: Case[] = [
+  one(
+    "rep: value union through an annotated local",
+    "hit",
+    `export function f(b: boolean) {\n  if b { return 1 }\n  return "x"\n}\n`,
+    "const v = f(true)\nif v is i32 { print(v + 1) } else { print(v) }",
+    '  if b { return 1 }\n  return "x"',
+    '  const r: i32 | string = 1\n  if b { return r }\n  return "x"',
+  ),
+  one(
+    "rep: nullable through an annotated local",
+    "hit",
+    `export function f(b: boolean) {\n  if b { return null }\n  return 1\n}\n`,
+    "const v = f(false)\nif v != null { print(v + 1) }",
+    "  if b { return null }\n  return 1",
+    "  const r: i32 | null = 1\n  if b { return null }\n  return r",
+  ),
+  one(
+    "rep: nullable list elements",
+    "hit",
+    `export function f() { [1, null] }\n`,
+    "const v = f()\nconst e = v[0]\nif e != null { print(e + 1) }",
+    "{ [1, null] }",
+    "{\n  const a: (i32 | null)[] = [1, null]\n  a\n}",
+  ),
+  one(
+    "rep: literal union return",
+    "hit",
+    `export function f(b: boolean) {\n  if b { return "a" }\n  return "b"\n}\n`,
+    'const v = f(true)\nprint(v == "a")\nconst w: string = v\nprint(w)',
+    '  if b { return "a" }\n  return "b"',
+    '  const r: "a" | "b" = "a"\n  if b { return r }\n  return "b"',
+  ),
+  one(
+    "rep: literal union vs string",
+    "hit",
+    `export function f(b: boolean) {\n  if b { return "a" }\n  return "b"\n}\n`,
+    'const v = f(true)\nprint(v == "a")\nconst w: string = v\nprint(w)',
+    '  if b { return "a" }\n  return "b"',
+    '  const r: string = "a"\n  if b { return r }\n  return "b"',
+  ),
+  one(
+    "rep: record union",
+    "miss",
+    `type A = { k: "a", n: i32 }\ntype B = { k: "b", s: string }\nexport function f(b: boolean) {\n  if b { return { k: "a", n: 1 } }\n  return { k: "b", s: "x" }\n}\n`,
+    'const v = f(true)\nif v.k == "a" { print(1) }',
+    '  if b { return { k: "a", n: 1 } }',
+    '  const r: A | B = { k: "a", n: 1 }\n  if b { return r }',
+  ),
+  one(
+    "rep: lambda with an untyped parameter",
+    "hit",
+    `export function f() { (x) => x + 1 }\n`,
+    "print(f()(2))",
+    "(x) => x + 1",
+    "(x) => x",
+  ),
+  one(
+    "rep: lambda with an untyped parameter, string",
+    "hit",
+    `export function f() { (x) => x }\n`,
+    'print(f()("s"))',
+    "(x) => x",
+    "(x) => x + x",
+  ),
+  one(
+    "rep: lambda body refused at the dependent's argument",
+    "hit",
+    `export function f() { (x) => x }\n`,
+    'print(f()("s"))',
+    "(x) => x",
+    "(x) => x * 2",
+  ),
+  one(
+    "rep: lambda body member at the dependent's argument",
+    "hit",
+    `export function f() { (x) => x }\n`,
+    "print(f()(1))",
+    "(x) => x",
+    "(x) => x.length",
+  ),
+  one(
+    "rep: lambda result type from the dependent's argument",
+    "miss",
+    `export function f() { (x) => x }\n`,
+    "const r = f()(1.5)\nprint(r / 2.0)",
+    "(x) => x",
+    "(x) => 1",
+  ),
+  one(
+    "rep: an empty map",
+    "hit",
+    `export function f() { Map() }\n`,
+    'const m = f()\nm["a"] = 1\nprint(m["a"] ?? 0)',
+    "{ Map() }",
+    "{\n  const a = Map()\n  a\n}",
+  ),
+  one(
+    "rep: f64 from a literal",
+    "hit",
+    `export function f() { 1 }\n`,
+    "const y: f64 = f()\nprint(y / 2.0)",
+    "{ 1 }",
+    "{ 1 + 1 - 1 }",
+  ),
+  one(
+    "rep: i64 from a literal",
+    "hit",
+    `export function f() { 1 }\n`,
+    "const y: i64 = f()\nprint(y)",
+    "{ 1 }",
+    "{\n  const a = 1\n  a\n}",
+  ),
+  inf(
+    "inferred: union return order",
+    "miss",
+    'if b { return 1 } return "x"',
+    'if !b { return "x" } return 1',
+  ),
+  // An empty body is a cut of no tokens; hashing one once looped forever.
+  one(
+    "annotated: a module holding an empty body",
+    "hit",
+    "function g() {}\nexport function f(): i32 {\n  g()\n  return 1\n}\n",
+    "print(f())",
+    "return 1",
+    "return 2",
+  ),
+  inf("inferred: literal return value", "hit", "{ 1 }", "{ 2 }"),
+  inf(
+    "inferred: literal return through a local",
+    "hit",
+    "{ 1 }",
+    "{ const a = 1\n  a }",
+  ),
+  inf(
+    "inferred: empty list through a local",
+    "hit",
+    "return []",
+    "const a = []\n  return a",
+  ),
+  inf(
+    "inferred: record through a local",
+    "hit",
+    "{ { x: 1 } }",
+    "{ const r = { x: 1 }\n  r }",
+  ),
+  inf("inferred: literal string return", "hit", '{ "a" }', '{ "b" }'),
+  inf(
+    "inferred: nullable return order",
+    "hit",
+    "if b { return null } return 1",
+    "if !b { return 1 } return null",
+  ),
+  inf("inferred: literal let returned", "miss", "{ s }", "{ 0 }"),
+  inf(
+    "inferred: private let returned",
+    "miss",
+    "{ hidden }",
+    "{ { x: 1, y: 2 } }",
+  ),
+  inf(
+    "inferred: private type field",
+    "miss",
+    "type Box = { w: i32 }",
+    "type Box = { w: i64 }",
+  ),
+  inf(
+    "inferred: private let initialiser",
+    "miss",
+    "let hidden = { x: 1, y: 2 }",
+    "let hidden = { x: 1, y: 2.5 }",
+  ),
+  one(
+    "inferred: a type elided past its render depth",
+    "miss",
+    `export function f() { ${"{ a: ".repeat(DEEP)}1${" }".repeat(DEEP)} }\n`,
+    `const r = f()\nprint(r${".a".repeat(DEEP)} / 2)`,
+    "{ a: 1 }",
+    "{ a: 1.5 }",
+  ),
+  // What no dependent can name.
+  lib(
+    "private function signature edit",
+    "hit",
+    "spare(n: i32): i32",
+    "spare(n: i64): i64",
+  ),
+  lib(
+    "private type nobody names",
+    "hit",
+    "type Unused = { z: i32 }",
+    "type Unused = { z: f64 }",
+  ),
+  lib(
+    "private generic body edit",
+    "hit",
+    "helper<T>(a: T): T { return a }",
+    "helper<T>(a: T): T { const b = a\n  return b }",
+  ),
+  lib(
+    "private type in an exported signature",
+    "miss",
+    "type Inner = { q: i32 }",
+    "type Inner = { q: i64 }",
+  ),
+  lib(
+    "private let initialiser edit",
+    "miss",
+    "let pv = area(1)",
+    "let pv = area(2)",
+  ),
+  lib(
+    "private callee writes a narrowed global",
+    "miss",
+    "{ print(3) }",
+    "{ g = null }",
+  ),
+  lib("private callee body edit", "hit", "{ print(3) }", "{ print(30) }"),
+  one(
+    "a private function a generic body calls",
+    "miss",
+    `function pf(y: i32): i32 { return y }\nexport function f<T>(a: T): T {\n  pf(a)\n  return a\n}\n`,
+    "print(f(3))",
+    "pf(y: i32): i32",
+    "pf(y: string): string",
+  ),
   // Bodies no dependent sees.
   lib(
     "annotated export, body edit",
@@ -406,7 +716,12 @@ const CASES: Case[] = [
     "area(n: i32): i64",
   ),
   lib("inferred-return body edit", "miss", "{ n / 2 }", "{ n / 2.0 }"),
-  lib("generic body edit", "miss", "{ return a }", "{ return b }"),
+  lib(
+    "generic body edit",
+    "miss",
+    "b: T): T { return a }",
+    "b: T): T { return b }",
+  ),
   lib("untyped-param body edit", "miss", "{ x * 2 }", "{ x * 2 + 1 }"),
   lib("type decl edit", "miss", "h: i32 }", "h: i32, d: i32 }"),
   lib("global initialiser edit", "miss", "let counter = 0", "let counter = 5"),
@@ -484,6 +799,24 @@ const CASES: Case[] = [
     "area(n: i32): f64",
   ),
   reexp("re-export: lib body edit", "hit", "return n * 2", "return n * 3"),
+  {
+    ...reexp(
+      "re-export: mid's list grows",
+      "miss",
+      "export { area }",
+      "export { area, Shape }",
+    ),
+    at: "mid.vl",
+  },
+  {
+    ...reexp(
+      "re-export: mid's private helper edit",
+      "hit",
+      "pad(n: i32): i32",
+      "pad(n: i64): i64",
+    ),
+    at: "mid.vl",
+  },
   reexp(
     "record through mid: field edit",
     "miss",
@@ -583,6 +916,30 @@ const grade = (exp: Exports, mask: number, c: Case): Verdict => {
   return { hit: ha.own === hb.own, unsound, compared };
 };
 
+const PROBE = Deno.env.get("VL_IFACE_HASH_PROBE");
+Deno.test({
+  name: "iface-hash: PROBE",
+  ignore: !ENABLED || PROBE === undefined,
+  fn: () => {
+    const exp = instance();
+    const mask = Number(PROBE);
+    const only = Deno.env.get("VL_IFACE_HASH_ONLY") ?? "";
+    exp.ifaceHashDrop(mask);
+    for (const c of CASES) {
+      if (only !== "" && !c.name.includes(only)) continue;
+      const v = grade(exp, mask, c);
+      console.log(
+        `[probe ${mask}] ${c.name}: ${
+          v.hit ? "HIT" : "miss"
+        } (${c.want}) cmp ${v.compared}${
+          v.unsound.length > 0 ? "\n  UNSOUND " + v.unsound.join("\n  ") : ""
+        }`,
+      );
+    }
+    exp.ifaceHashDrop(0);
+  },
+});
+
 const gradeAll = (exp: Exports, mask: number) => {
   exp.ifaceHashDrop(mask);
   try {
@@ -629,49 +986,66 @@ Deno.test({
   },
 });
 
-// Each ingredient is load-bearing: dropping it turns its witness case unsound. An inferred
-// return is also carried by the checked binding type, so its body is proven on top of
-// dropping the types (`over`): the witness must be sound with only `over` dropped.
+// Each ingredient is load-bearing: dropping it turns its witness case unsound, and the witness
+// is sound with nothing dropped.
 const INGREDIENTS: {
   what: string;
   mask: number;
-  over: number;
   witness: string;
 }[] = [
   {
     what: "explicit generic bodies",
     mask: 1,
-    over: 0,
     witness: "generic body edit refused at the call",
   },
   {
     what: "untyped-parameter bodies",
     mask: 2,
-    over: 0,
     witness: "untyped-param body edit refused at the call",
   },
   {
-    what: "inferred-return bodies",
-    mask: 4 | 8,
-    over: 8,
+    what: "the checked type of a cut inferred return",
+    mask: 64,
     witness: "inferred-return body edit, a new return type",
+  },
+  {
+    what: "the body of a cut inferred return whose type renders elided",
+    mask: 128,
+    witness: "inferred: a type elided past its render depth",
+  },
+  {
+    what: "exposure through the names a checked type spells",
+    mask: 512,
+    witness: "inferred: private type field",
+  },
+  {
+    what: "top-level lets as exposed",
+    mask: 1024,
+    witness: "private let initialiser edit",
+  },
+  {
+    what: "the mentions of a function a cut body calls",
+    mask: 2048,
+    witness: "private callee writes a narrowed global",
+  },
+  {
+    what: "exposure through the names exposed tokens spell",
+    mask: 4096,
+    witness: "a private function a generic body calls",
   },
   {
     what: "checked binding types",
     mask: 8,
-    over: 0,
     witness: "annotated body delivers a literal let",
   },
   {
     what: "mentions in cut bodies",
     mask: 16,
-    over: 0,
     witness: "annotated body writes a global",
   },
   {
     what: "deep hashes",
     mask: 32,
-    over: 0,
     witness: "re-export: lib signature edit",
   },
 ];
@@ -692,10 +1066,10 @@ Deno.test({
   fn: () => {
     const exp = instance();
     const fails: string[] = [];
-    for (const { what, mask, over, witness } of INGREDIENTS) {
+    for (const { what, mask, witness } of INGREDIENTS) {
       const c = CASES.find((k) => k.name === witness);
       if (!c) throw new Error(`no case ${witness}`);
-      if (gradeOne(exp, over, c).unsound.length > 0) {
+      if (gradeOne(exp, 0, c).unsound.length > 0) {
         fails.push(`CONTROL — ${witness} is unsound before ${what} is dropped`);
       }
       if (gradeOne(exp, mask, c).unsound.length === 0) {
@@ -706,20 +1080,51 @@ Deno.test({
   },
 });
 
-// ── the hit rate over the compiler's own history ────────────────────────────────────────────
+// ── the hit rate over a program's own history ───────────────────────────────────────────────
 //
-// Each edit is one top-level function of `compiler/*.vl` as a first-parent commit changed it,
-// applied ALONE to that commit's parent tree; it is a hit when the edited module's hash stays.
-// An edit that does not check on its own (it used something its commit added) is left out.
+// Each edit is one top-level function of a module under the entry's directory (`compiler/*.vl`
+// by default) as a first-parent commit changed it, applied ALONE to that commit's parent tree;
+// it is a hit when the edited module's hash stays. An edit that does not check on its own (it
+// used something its commit added), or whose module the entry does not reach, is left out.
 
 const RATE = Number(Deno.env.get("VL_IFACE_HASH_RATE") ?? "0");
-// `VL_IFACE_HASH_RATE_DROP=<mask>` measures the rate with ingredients dropped, as `ifaceHashDrop` takes.
-const RATE_DROP = Number(Deno.env.get("VL_IFACE_HASH_RATE_DROP") ?? "0");
+// The masks the rate is read under, each from the same check: the hash as it stands, and the
+// one before the cut of inferred-return bodies and the exposure closure. A further mask can be
+// added with `VL_IFACE_HASH_RATE_DROP=<mask>`, as `ifaceHashDrop` takes.
+const RATE_MASKS: [string, number][] = [["now", 0], ["before", 260]];
+const RATE_DROP = Deno.env.get("VL_IFACE_HASH_RATE_DROP");
+if (RATE_DROP !== undefined) {
+  RATE_MASKS.push([`drop ${RATE_DROP}`, Number(RATE_DROP)]);
+}
+// Another VL program's history instead, read only: `VL_IFACE_HASH_REPO=<checkout>` with
+// `VL_IFACE_HASH_ENTRY=<entry, relative to it>`; edits come from the entry's directory down.
+const REPO = Deno.env.get("VL_IFACE_HASH_REPO") ?? ROOT;
+const ENTRY = Deno.env.get("VL_IFACE_HASH_ENTRY") ?? "compiler/entry.vl";
+const DIR = ENTRY.includes("/")
+  ? ENTRY.slice(0, ENTRY.lastIndexOf("/") + 1)
+  : "";
+const REV = Deno.env.get("VL_IFACE_HASH_REV") ??
+  (REPO === ROOT ? "origin/master" : "HEAD");
+const STD = Deno.env.get("VL_STD") ?? `${ROOT}/std`;
+
+// The repository-relative modules a module imports, `std:` ones left out.
+const importsAt = (file: string, src: string): string[] => {
+  const dir = file.includes("/") ? file.slice(0, file.lastIndexOf("/")) : "";
+  return [...src.matchAll(/from\s+"(\.\.?\/[^"]+)"/g)].map((m) => {
+    const parts = dir === "" ? [] : dir.split("/");
+    for (const p of m[1].split("/")) {
+      if (p === "..") parts.pop();
+      else if (p !== ".") parts.push(p);
+    }
+    const f = parts.join("/");
+    return f.endsWith(".vl") ? f : `${f}.vl`;
+  });
+};
 
 const git = (...args: string[]): string => {
   const out = new Deno.Command("git", {
     args,
-    cwd: ROOT,
+    cwd: REPO,
     stdout: "piped",
     stderr: "piped",
   })
@@ -808,16 +1213,23 @@ const historyEdits = (n: number): Map<string, Edit[]> => {
     "--format=%H",
     "-n",
     "400",
-    "origin/master",
+    REV,
     "--",
-    "compiler/",
+    DIR || ".",
   )
     .trim().split("\n");
   for (const rev of revs) {
     if (total >= n) break;
-    const files = git("diff", "--name-only", `${rev}^`, rev, "--", "compiler/")
-      .trim().split("\n")
-      .filter((f) => /^compiler\/[A-Za-z_]+\.vl$/.test(f));
+    let changed: string;
+    try {
+      changed = git("diff", "--name-only", `${rev}^`, rev, "--", DIR || ".");
+    } catch {
+      continue;
+    }
+    const files = changed.trim().split("\n")
+      .filter((f) =>
+        f.startsWith(DIR) && f.endsWith(".vl") && !f.endsWith(".test.vl")
+      );
     for (const file of files) {
       let before: string;
       let after: string;
@@ -855,23 +1267,47 @@ const historyEdits = (n: number): Map<string, Edit[]> => {
 };
 
 Deno.test({
-  name: "iface-hash: the hit rate over single-function edits to the compiler",
+  name:
+    "iface-hash: the hit rate over single-function edits from a program's history",
   ignore: !ENABLED || RATE <= 0,
   fn: () => {
     const exp = instance();
-    exp.ifaceHashDrop(RATE_DROP);
+    exp.ifaceHashDrop(0);
     const rel = (k: string) =>
-      k.startsWith(`${ROOT}/`) ? k.slice(ROOT.length + 1) : k;
-    const entryKey = `${ROOT}/compiler/entry.vl`;
+      k.startsWith(`${REPO}/`) ? k.slice(REPO.length + 1) : k;
+    const entryKey = `${REPO}/${ENTRY}`;
+    // Every mask's hashes of the check just run, folded again from its rows.
+    const folds = (r: Result): Map<string, Hash>[] => {
+      const out = RATE_MASKS.map(([, mask]) => {
+        exp.ifaceHashRefold(mask);
+        return hashesOf(exp, rel).hash;
+      });
+      exp.ifaceHashDrop(0);
+      // CONTROL: a refold under the check's own mask reproduces its hashes.
+      for (const [k, h] of r.hash) {
+        if (out[0].get(k)?.own !== h.own || out[0].get(k)?.deep !== h.deep) {
+          throw new Error(`CONTROL — a refold changed ${k}'s hash`);
+        }
+      }
+      return out;
+    };
     let edits = 0;
-    let hits = 0;
     let alone = 0;
+    let outside = 0;
     let commits = 0;
-    const missWhy = new Map<string, number>();
-    const unsound: string[] = [];
+    const hits = RATE_MASKS.map(() => 0);
+    const missWhy = RATE_MASKS.map(() => new Map<string, number>());
+    const unsound: string[][] = RATE_MASKS.map(() => []);
+    const stdSrc = new Map<string, string>();
     for (const [rev, list] of historyEdits(RATE)) {
       const tree = new Map<string, string | undefined>();
       const at = (k: string) => {
+        if (k.startsWith("std:")) {
+          if (!stdSrc.has(k)) {
+            stdSrc.set(k, Deno.readTextFileSync(`${STD}/${k.slice(4)}.vl`));
+          }
+          return stdSrc.get(k);
+        }
         const f = rel(k);
         if (!tree.has(f)) {
           try {
@@ -882,50 +1318,80 @@ Deno.test({
         }
         return tree.get(f);
       };
-      const a = runKeys(exp, entryKey, at(entryKey)!, at, false, rel);
-      if (a.rc !== 0) continue;
+      const base = at(entryKey);
+      if (base === undefined) continue;
+      let a: Result;
+      try {
+        a = runKeys(exp, entryKey, base, at, false, rel);
+      } catch (err) {
+        console.log(`[iface-hash base] ${rev.slice(0, 9)}: ${err}`);
+        continue;
+      }
+      if (a.rc !== 0) {
+        const first = [...a.diags].map(([k, d]) => `${k} ${d[0]}`)[0];
+        console.log(
+          `[iface-hash base] ${rev.slice(0, 9)} does not check: ${first}`,
+        );
+        continue;
+      }
+      const fa = folds(a);
       commits++;
       for (const e of list) {
+        // A module the entry does not reach has no hash to keep.
+        if (!a.hash.has(e.file)) {
+          outside++;
+          continue;
+        }
         const dep = (k: string) => rel(k) === e.file ? e.src : at(k);
-        const b = runKeys(exp, entryKey, at(entryKey)!, dep, false, rel);
+        const b = runKeys(exp, entryKey, base, dep, false, rel);
         if (b.rc !== 0) {
           alone++;
           continue;
         }
+        const fb = folds(b);
         edits++;
-        const hit = a.hash.get(e.file)?.own === b.hash.get(e.file)?.own;
-        console.log(
-          `[iface-hash edit] ${rev.slice(0, 9)} ${e.file} ${e.fn}: ${
-            hit ? "hit" : `miss (${e.why || "-"})`
-          }`,
-        );
-        if (!hit) {
-          const why = e.why || "a mention or a checked type";
-          missWhy.set(why, (missWhy.get(why) ?? 0) + 1);
-          continue;
-        }
-        hits++;
-        for (const k of a.hash.keys()) {
-          if (k === e.file) continue;
-          const deps = importsOf(at(`${ROOT}/${k}`) ?? "").map((d) =>
-            `compiler/${d}`
-          );
-          if (!deps.every((d) => a.hash.get(d)?.deep === b.hash.get(d)?.deep)) {
-            continue;
+        const verdicts = RATE_MASKS.map(([name], i) => {
+          const hit = fa[i].get(e.file)?.own === fb[i].get(e.file)?.own;
+          if (!hit) {
+            const why = e.why || "annotated";
+            missWhy[i].set(why, (missWhy[i].get(why) ?? 0) + 1);
+            return `${name} miss`;
           }
-          unsound.push(...differs(k, a, b, false).map((d) => `${e.fn}: ${d}`));
-        }
+          hits[i]++;
+          for (const k of a.hash.keys()) {
+            if (k === e.file || k.startsWith("std:")) continue;
+            const deps = importsAt(k, at(`${REPO}/${k}`) ?? "");
+            if (!deps.every((d) => fa[i].get(d)?.deep === fb[i].get(d)?.deep)) {
+              continue;
+            }
+            unsound[i].push(
+              ...differs(k, a, b, false).map((d) => `${e.fn}: ${d}`),
+            );
+          }
+          return `${name} hit`;
+        });
+        console.log(
+          `[iface-hash edit] ${rev.slice(0, 9)} ${e.file} ${e.fn} (${
+            e.why || "annotated"
+          }): ${verdicts.join(", ")}`,
+        );
       }
     }
-    const pct = edits === 0 ? "0" : (100 * hits / edits).toFixed(1);
-    const why = [...missWhy].map(([w, c]) => `${w} ${c}`).join(", ");
-    console.log(
-      `[iface-hash rate] ${edits} edits from ${commits} commits: ${hits} hits (${pct}%); ` +
-        `misses by what kept the body: ${why}; ${alone} that do not check alone left out; ` +
-        `${unsound.length} unsound`,
-    );
-    if (unsound.length > 0) {
-      throw new Error(`UNSOUND —\n  ${unsound.join("\n  ")}`);
+    RATE_MASKS.forEach(([name, mask], i) => {
+      const pct = edits === 0 ? "0" : (100 * hits[i] / edits).toFixed(1);
+      const why = [...missWhy[i]].map(([w, c]) => `${w} ${c}`).join(", ");
+      console.log(
+        `[iface-hash rate] ${ENTRY}, ${name} (mask ${mask}): ${edits} edits from ${commits} ` +
+          `commits: ${
+            hits[i]
+          } hits (${pct}%); misses by the edited function's header: ${why}; ` +
+          `left out: ${alone} that do not check alone, ${outside} outside the entry's graph; ` +
+          `${unsound[i].length} unsound`,
+      );
+    });
+    // Only the hash as it stands is held sound; a dropped mask may be unsound by design.
+    if (unsound[0].length > 0) {
+      throw new Error(`UNSOUND —\n  ${unsound[0].join("\n  ")}`);
     }
     if (edits === 0) throw new Error("CONTROL — no edit checked");
   },
