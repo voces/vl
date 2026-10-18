@@ -1371,7 +1371,36 @@ export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
   if x >= 0 { return x }
   const s = pinSubOperandTyOf(raw, fnIx)
   if s >= 0 { return s }
+  const c = instanceChainTyOf(raw, fnIx)
+  if c >= 0 { return c }
   nodeTyPinIxOf(ix)
+}
+
+// `ty` read through every instance `fnIx` is, or is lifted inside, innermost first: a type
+// parameter at its instance's pin, then each hole at the first hole instance binding them all.
+// -1 where a variable stays unbound. So a nested function reads its enclosing instance's holes.
+function instanceChainTyOf(ty: i32, fnIx: i32): i32 {
+  if fnIx < 0 || monoHoleSubN.length == 0 { return -1 }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  let cur = ty
+  while pos >= 0 && guard <= fnStmts.length {
+    const pr = monoPinSubRow.get(pos) ?? -1
+    if pr >= 0 && pr < monoPinSubN.length {
+      const st = substTyDeep(cur, monoPinSubN[pr], monoPinSubT[pr])
+      if st < 0 { return -1 }
+      cur = st
+    }
+    const hr = monoHoleSubRow.get(pos) ?? -1
+    if hr >= 0 && hr < monoHoleSubN.length {
+      const h = holeTyRead(cur, monoHoleSubN[hr], monoHoleSubT[hr], 0)
+      if h >= 0 { return h }
+    }
+    if pos >= fnParent.length { return -1 }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  -1
 }
 
 // The union of lists an if or `match` join at `ix` stays at the pins of instance `fnIx`, where
@@ -1422,9 +1451,20 @@ function holeTyRead(ty: i32, bNames: string[], bTys: i32[], depth: i32): i32 {
       if n < 0 { return -1 }
       return mkNullableTyOf(n)
     }
-    TyUnion | TyObj | TyMap | TyFunc | TyNeg => {
-      // A union over a bound hole needs the checker's join, and a record, map, function or
-      // negated type is not rebuilt here: the caller asks its next reader.
+    TyUnion => {
+      // Members that all read as one type are that type; another union needs the checker's join.
+      let one = -1
+      for m in t.uMembers {
+        const mb = holeTyRead(m, bNames, bTys, depth + 1)
+        if mb < 0 { return -1 }
+        if one >= 0 && mb != one && !tySame(mb, one) { return -1 }
+        one = mb
+      }
+      return one
+    }
+    TyObj | TyMap | TyFunc | TyNeg => {
+      // A record, map, function or negated type is not rebuilt here: the caller asks its next
+      // reader.
       return -1
     }
     TyPrim | TyLit | TyErr => {
