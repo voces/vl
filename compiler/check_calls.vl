@@ -149,7 +149,12 @@ import {
   getterFnFor,
 } from "./check_getter_effects"
 import { arrDefCallTy, holeCastParamName } from "./check_hole_links"
-import { HD_PARAM, HD_RET, tyIsNonNullHoleRead } from "./check_hole_pins"
+import {
+  HD_PARAM,
+  HD_RET,
+  tyIsNonNullHoleRead,
+  tyParamsApart,
+} from "./check_hole_pins"
 import {
   arrayDemandKey,
   holeIsArrayWriteDemanded,
@@ -1276,14 +1281,17 @@ function callFtyCheckArg(
       && T.tys[atCstr] is TyUnion
       && tpGradualView(atCstr) != atCstr)
   ) {
-    if !tyIsHole(expected) {
+    if !tyIsHole(expected) || tyParamsApart(atCstr, expected) {
       let ccWho = ""
       if cfn is Ident { ccWho = cfn.identName }
       let acForm = ACF_PLAIN
       if nodeIsTplHole(args[i]) { acForm = ACF_TPL }
       noteArgCstr(atCstr, expected, ccWho, acForm, -1)
     }
-  } else if compArgCstrOk(atCstr, expected) {
+  } else if (
+    compArgCstrOk(atCstr, expected)
+    || tyParamsApart(atCstr, expected)
+  ) {
     let cpWho = ""
     if cfn is Ident { cpWho = cfn.identName }
     noteArgCstr(atCstr, expected, cpWho, ACF_COMP, args[i])
@@ -1443,14 +1451,7 @@ function callFtyPinCstrs(
   const holeArgs = dhNames.length > 0
   if opFn < 0 && holeArgs { opFn = constLambdaOf(cfn, n.callFn) }
   let fnValue = ""
-  if (
-    opFn < 0
-    && holeArgs
-    && cfn is Ident
-    && calleeIsReassignedFnValue(cfn, n.callFn)
-  ) {
-    fnValue = cfn.identName
-  }
+  if opFn < 0 && holeArgs { fnValue = calleeReassignedFnValue(cfn, n.callFn) }
   const noSplit = hasNamedArgs(n.callArgNames)
     || callLeavesDefault(n, cstrCallee)
   judgeFnArgHoleCalls(
@@ -1459,6 +1460,7 @@ function callFtyPinCstrs(
     cstrCallee,
     opFn,
     fnValue,
+    cstrWho,
     dhNames,
     dhArgNode,
     noSplit,
@@ -1764,15 +1766,16 @@ function holeNameOnlyForwardedUnread(
 }
 
 // A function named as an argument to a hole the callee calls is judged at each instance those
-// calls ask for, so a pin its body cannot take is refused here (D6190); two instances mark the
-// parameter for a split unless `noSplit` (D6280). `opFn` is the callee body whose operators are
-// judged (D6330); `fnValue` names a reassigned callee binding, where two instances refuse.
+// calls ask for (D6190); two mark the parameter for a split unless `noSplit` (D6280), and refuse
+// when callee `fnVia` reads reassigned binding `fnValue`. `opFn` is the callee body whose
+// operators are judged (D6330).
 function judgeFnArgHoleCalls(
   vNames: string[],
   vTys: i32[],
   calleeFn: i32,
   opFn: i32,
   fnValue: string,
+  fnVia: string,
   dhNames: string[],
   dhArgNode: i32[],
   noSplit: boolean,
@@ -1808,7 +1811,7 @@ function judgeFnArgHoleCalls(
             if T.diags.length == d0 { holeDeclCstrsAt(a, d, nodeTyOf(a), inst) }
           }
           if insts.length > 1 && fnValue != "" && T.diags.length == d0 {
-            reassignedFnValueErr(fnValue, an.identName, a)
+            reassignedFnValueErr(fnVia, fnValue, an.identName, a)
           }
         }
       }
@@ -1818,16 +1821,25 @@ function judgeFnArgHoleCalls(
   0
 }
 
-// Refuses, at argument `a`, generic function `fnName` handed through binding `held`, which is
-// reassigned: a function value carries one signature, so a parameter its body
-// calls at two types cannot take a generic function (D6351).
-function reassignedFnValueErr(held: string, fnName: string, a: i32) {
+// Refuses, at argument `a`, generic function `fnName` handed through callee `via`, which reads
+// reassigned binding `held`: a function value carries one signature, so a parameter its body
+// calls at two types cannot take a generic function (D6351, D6421).
+function reassignedFnValueErr(
+  via: string,
+  held: string,
+  fnName: string,
+  a: i32,
+) {
+  let what = "it is reassigned"
+  if via != held { what = "it aliases `" + held + "`, which is reassigned" }
   tErr(
     "cannot pass the generic function `"
       + fnName
       + "` through `"
-      + held
-      + "`: it is reassigned, so it holds a function value with one signature, and the parameter this argument meets is called at two types — call a `const` or a declared function, or pass a function of one type",
+      + via
+      + "`: "
+      + what
+      + ", so it holds a function value with one signature, and the parameter this argument meets is called at two types — call a `const` or a declared function, or pass a function of one type",
     a,
   )
 }
@@ -1956,12 +1968,27 @@ function constLambdaOf(cfn: Node, cfnIx: i32): i32 {
   -1
 }
 
-// Whether the callee name at `cfnIx` is a binding that is assigned, so a call through it runs
-// a function value whose one signature no copy of a body can split (D6351).
-function calleeIsReassignedFnValue(cfn: Node, cfnIx: i32): boolean {
-  if !(cfn is Ident) { return false }
-  const fr = covarRootFrame(cfnIx)
-  fr != CW_FR_UNKNOWN && !cwBoundOnce(cfn.identName, fr)
+// The assigned binding the callee name at `cfnIx` reads, itself or through aliases bound once,
+// so a call through it runs a function value whose one signature no copy of a body can split
+// (D6351, D6421); "" when it reads none.
+function calleeReassignedFnValue(cfn: Node, cfnIx: i32): string {
+  if !(cfn is Ident) { return "" }
+  let nm = cfn.identName
+  let at = cfnIx
+  let hops = 0
+  while hops < 8 {
+    const fr = covarRootFrame(at)
+    if fr == CW_FR_UNKNOWN { return "" }
+    if !cwBoundOnce(nm, fr) { return nm }
+    const init = cwBoundInitOf(nm, fr)
+    if init < 0 || init >= P.nodes.length { return "" }
+    const a = P.nodes[init]
+    if !(a is Ident) { return "" }
+    nm = a.identName
+    at = init
+    hops = hops + 1
+  }
+  ""
 }
 
 // The lambda node whose parameter holes `ty` carries, -1 for a type with none.
