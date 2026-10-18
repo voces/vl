@@ -1,0 +1,736 @@
+// Orders the types of an emitted module's first recursion group by how often the module
+// names them, so the most-named take the one-byte indices: below 64 for a heap type, below
+// 128 for a type index. Runs over the finished bytes in `W`, rewrites every type reference
+// and section or body size, and moves the body-span table onto the new offsets.
+// A supertype keeps a lower index than its subtypes. A module the reader cannot decode, or
+// whose order is already the chosen one, is left byte for byte.
+
+import { W, emitFnSpanEnd, emitFnSpanStart } from "./emit_state"
+import { ropePush, ropeReset } from "./emit_bytes"
+import {
+  WasmCursor,
+  wcByte,
+  wcFail,
+  wcNew,
+  wcOp,
+  wcPreamble,
+  wcSkip,
+  wcSkipLeb,
+  wcU32,
+} from "./wasm_read"
+
+// A recorded edit is a type index (u32), a heap or block type index (s33), or a size.
+const EK_IDX = 0
+const EK_HEAP = 1
+const EK_SIZE = 2
+
+// The edits of the module being read, in byte order: where each LEB starts, its width, its
+// kind and its value.
+let ePos: i32[] = []
+let eLen: i32[] = []
+let eKind: i32[] = []
+let eVal: i32[] = []
+// Per entry of the first recursion group: its bytes `[tStart, tEnd)`, its first edit, its
+// declared supertype or -1.
+let tStart: i32[] = []
+let tEnd: i32[] = []
+let tEdit: i32[] = []
+let tSuper: i32[] = []
+let groupSize = 0
+
+// Per new type index, the index the emitter minted; empty when the module kept its order.
+let typeOrderOld: i32[] = []
+
+export function typeOrderReset() {
+  typeOrderOld = []
+  0
+}
+
+// The index the emitter minted for type `idx` of the module as written.
+export function typeOrderOldOf(idx: i32): i32 {
+  if idx >= 0 && idx < typeOrderOld.length { return typeOrderOld[idx] }
+  idx
+}
+
+// Reorders the first recursion group of `W` when it holds more than 64 types; `groupTypes`
+// is how many it holds. Returns 1 when it rewrites the module, else 0.
+export function typeOrderRun(groupTypes: i32): i32 {
+  typeOrderOld = []
+  if groupTypes <= 64 { return 0 }
+  const b = ropeFlat()
+  if !toScan(b) {
+    toClear()
+    return 0
+  }
+  const order = toChoose()
+  const toNew: i32[] = []
+  while toNew.length < groupSize { toNew.push(0) }
+  let same = true
+  let j = 0
+  while j < order.length {
+    const o = order[j]
+    if o >= 0 && o < groupSize { toNew[o] = j }
+    if o != j { same = false }
+    j = j + 1
+  }
+  if same || order.length != groupSize {
+    toClear()
+    return 0
+  }
+  const out = toWrite(b, order, toNew)
+  ropeReset(W)
+  ropePush(W, out)
+  typeOrderOld = order
+  toClear()
+  1
+}
+
+function toClear() {
+  ePos = []
+  eLen = []
+  eKind = []
+  eVal = []
+  tStart = []
+  tEnd = []
+  tEdit = []
+  tSuper = []
+  groupSize = 0
+  0
+}
+
+// The module rope as one buffer.
+function ropeFlat(): u8[] {
+  const out: u8[] = []
+  let c = 0
+  while c < W.chunks.length {
+    const bs = W.chunks[c].b
+    let i = 0
+    while i < bs.length {
+      out.push(bs[i])
+      i = i + 1
+    }
+    c = c + 1
+  }
+  out
+}
+
+function pushEdit(at: i32, len: i32, kind: i32, v: i32) {
+  ePos.push(at)
+  eLen.push(len)
+  eKind.push(kind)
+  eVal.push(v)
+  0
+}
+
+// ── reading ─────────────────────────────────────────────────────────────────
+
+// Records every edit of `b` and the first group's entries; false when `b` does not decode.
+function toScan(b: u8[]): boolean {
+  toClear()
+  const c = wcNew(b, 0, b.length)
+  wcPreamble(c)
+  while c.pos < b.length && !c.failed {
+    const id = wcByte(c)
+    const at = c.pos
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > b.length - c.pos { return false }
+    pushEdit(at, c.pos - at, EK_SIZE, size)
+    const secEnd = c.pos + size
+    c.end = secEnd
+    if id == 1 { scanTypes(c) }
+    else if id == 2 { scanImports(c) }
+    else if id == 3 { scanVecIdx(c) }
+    else if id == 4 { scanTables(c) }
+    else if id == 6 { scanGlobals(c) }
+    else if id == 9 { scanElems(c) }
+    else if id == 10 { scanCode(c) }
+    else if id == 13 { scanTags(c) }
+    else { c.pos = secEnd }
+    if c.failed || c.pos != secEnd { return false }
+    c.end = b.length
+  }
+  !c.failed && groupSize > 0
+}
+
+function siteIdx(c: WasmCursor) {
+  const at = c.pos
+  const v = wcU32(c)
+  if !c.failed { pushEdit(at, c.pos - at, EK_IDX, v) }
+  0
+}
+
+// An s33 that is a type index when it is not negative; an abstract one records nothing.
+function siteS33(c: WasmCursor) {
+  const at = c.pos
+  let v = 0
+  let shift = 0
+  let more = true
+  while more && !c.failed {
+    const byte = wcByte(c)
+    if shift < 32 { v = v | ((byte & 0x7f) << shift) }
+    shift = shift + 7
+    if (byte & 0x80) == 0 {
+      if shift < 32 && (byte & 0x40) != 0 { v = v | (-1 << shift) }
+      more = false
+    } else if shift >= 35 {
+      wcFail(c)
+    }
+  }
+  if !c.failed && v >= 0 { pushEdit(at, c.pos - at, EK_HEAP, v) }
+  0
+}
+
+function siteHeap(c: WasmCursor) {
+  if c.pos < c.end && c.b[c.pos] == 0x62 { c.pos = c.pos + 1 }
+  siteS33(c)
+}
+
+function scanValType(c: WasmCursor) {
+  const t = wcByte(c)
+  if t == 0x63 || t == 0x64 { return siteHeap(c) }
+  if t < 0x68 || t > 0x7f { return wcFail(c) }
+  0
+}
+
+function scanBlockType(c: WasmCursor) {
+  if c.pos < c.end && (c.b[c.pos] == 0x63 || c.b[c.pos] == 0x64) {
+    c.pos = c.pos + 1
+    return siteHeap(c)
+  }
+  siteS33(c)
+}
+
+function scanVecIdx(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    siteIdx(c)
+    i = i + 1
+  }
+  0
+}
+
+function scanLimits(c: WasmCursor) {
+  const f = wcByte(c)
+  wcSkipLeb(c)
+  if (f & 1) != 0 { wcSkipLeb(c) }
+  0
+}
+
+function scanTypes(c: WasmCursor) {
+  const n = wcU32(c)
+  let g = 0
+  while g < n && !c.failed {
+    if c.pos < c.end && c.b[c.pos] == 0x4e {
+      c.pos = c.pos + 1
+      const m = wcU32(c)
+      let i = 0
+      while i < m && !c.failed {
+        scanSubType(c, g == 0)
+        i = i + 1
+      }
+      if g == 0 { groupSize = m }
+    } else {
+      scanSubType(c, false)
+    }
+    g = g + 1
+  }
+  0
+}
+
+// One subtype; `inGroup` records its bytes and supertype as an entry of the first group.
+function scanSubType(c: WasmCursor, inGroup: boolean) {
+  if inGroup {
+    tStart.push(c.pos)
+    tEdit.push(ePos.length)
+    tSuper.push(-1)
+  }
+  let f = wcByte(c)
+  if f == 0x50 || f == 0x4f {
+    const n = wcU32(c)
+    let i = 0
+    while i < n && !c.failed {
+      const at = ePos.length
+      siteIdx(c)
+      if inGroup && at < eVal.length { tSuper[tSuper.length - 1] = eVal[at] }
+      i = i + 1
+    }
+    f = wcByte(c)
+  }
+  if f == 0x60 {
+    let k = 0
+    while k < 2 && !c.failed {
+      const n = wcU32(c)
+      let i = 0
+      while i < n && !c.failed {
+        scanValType(c)
+        i = i + 1
+      }
+      k = k + 1
+    }
+  } else if f == 0x5f {
+    const n = wcU32(c)
+    let i = 0
+    while i < n && !c.failed {
+      scanStorage(c)
+      wcByte(c)
+      i = i + 1
+    }
+  } else if f == 0x5e {
+    scanStorage(c)
+    wcByte(c)
+  } else if f == 0x5d {
+    siteIdx(c)
+  } else {
+    wcFail(c)
+  }
+  if inGroup { tEnd.push(c.pos) }
+  0
+}
+
+function scanStorage(c: WasmCursor) {
+  if c.pos < c.end && (c.b[c.pos] == 0x78 || c.b[c.pos] == 0x77) {
+    c.pos = c.pos + 1
+    return 0
+  }
+  scanValType(c)
+}
+
+function scanImports(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    wcSkip(c, wcU32(c))
+    wcSkip(c, wcU32(c))
+    const k = wcByte(c)
+    if k == 0 {
+      siteIdx(c)
+    } else if k == 1 {
+      scanValType(c)
+      scanLimits(c)
+    } else if k == 2 {
+      scanLimits(c)
+    } else if k == 3 {
+      scanValType(c)
+      wcByte(c)
+    } else if k == 4 {
+      wcByte(c)
+      siteIdx(c)
+    } else {
+      wcFail(c)
+    }
+    i = i + 1
+  }
+  0
+}
+
+function scanTables(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    if c.pos + 1 < c.end && c.b[c.pos] == 0x40 && c.b[c.pos + 1] == 0 {
+      c.pos = c.pos + 2
+      scanValType(c)
+      scanLimits(c)
+      scanConstExpr(c)
+    } else {
+      scanValType(c)
+      scanLimits(c)
+    }
+    i = i + 1
+  }
+  0
+}
+
+function scanGlobals(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    scanValType(c)
+    wcByte(c)
+    scanConstExpr(c)
+    i = i + 1
+  }
+  0
+}
+
+// The eight element-segment forms: flag bit 2 means expressions rather than function
+// indices, bit 1 an explicit table (with bit 0 clear) or a declarative segment.
+function scanElems(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const flags = wcU32(c)
+    if flags < 0 || flags > 7 { return wcFail(c) }
+    if flags == 2 || flags == 6 { wcU32(c) }
+    if (flags & 1) == 0 { scanConstExpr(c) }
+    if (flags & 3) != 0 {
+      if (flags & 4) != 0 { scanValType(c) } else { wcByte(c) }
+    }
+    if (flags & 4) != 0 {
+      const m = wcU32(c)
+      let k = 0
+      while k < m && !c.failed {
+        scanConstExpr(c)
+        k = k + 1
+      }
+    } else {
+      const m = wcU32(c)
+      let k = 0
+      while k < m && !c.failed {
+        wcU32(c)
+        k = k + 1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+function scanTags(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    wcByte(c)
+    siteIdx(c)
+    i = i + 1
+  }
+  0
+}
+
+function scanConstExpr(c: WasmCursor) {
+  while !c.failed {
+    if scanOp(c) == 0x0b { return 0 }
+  }
+  0
+}
+
+function scanCode(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const at = c.pos
+    const size = wcU32(c)
+    if c.failed || size < 0 || size > c.end - c.pos { return wcFail(c) }
+    pushEdit(at, c.pos - at, EK_SIZE, size)
+    const bodyEnd = c.pos + size
+    const locals = wcU32(c)
+    let k = 0
+    while k < locals && !c.failed {
+      wcU32(c)
+      scanValType(c)
+      k = k + 1
+    }
+    while c.pos < bodyEnd && !c.failed { scanOp(c) }
+    if c.pos != bodyEnd { return wcFail(c) }
+    i = i + 1
+  }
+  0
+}
+
+// One instruction, recording the type references in its immediates; the operators that
+// carry none are skipped by `wcOp`. Returns the opcode byte, or -1 when it does not decode.
+function scanOp(c: WasmCursor): i32 {
+  if c.pos >= c.end {
+    wcFail(c)
+    return -1
+  }
+  const op: i32 = c.b[c.pos]
+  if op == 0x02 || op == 0x03 || op == 0x04 || op == 0x06 || op == 0x1f {
+    c.pos = c.pos + 1
+    scanBlockType(c)
+    if op == 0x1f { scanCatches(c) }
+    return op
+  }
+  if op == 0x11 || op == 0x13 || op == 0x14 || op == 0x15 {
+    c.pos = c.pos + 1
+    siteIdx(c)
+    if op == 0x11 || op == 0x13 { wcU32(c) }
+    return op
+  }
+  if op == 0xd0 {
+    c.pos = c.pos + 1
+    siteHeap(c)
+    return op
+  }
+  if op == 0x1c {
+    c.pos = c.pos + 1
+    const n = wcU32(c)
+    let i = 0
+    while i < n && !c.failed {
+      scanValType(c)
+      i = i + 1
+    }
+    return op
+  }
+  if op == 0xfb {
+    c.pos = c.pos + 1
+    scanGc(c)
+    return op
+  }
+  if wcOp(c) < 0 { return -1 }
+  op
+}
+
+// `try_table`'s catch clauses: a kind, a tag for kinds 0 and 1, a label.
+function scanCatches(c: WasmCursor) {
+  const n = wcU32(c)
+  let i = 0
+  while i < n && !c.failed {
+    const kind = wcByte(c)
+    if kind > 3 { return wcFail(c) }
+    if kind <= 1 { wcU32(c) }
+    wcU32(c)
+    i = i + 1
+  }
+  0
+}
+
+// The 0xfb family after its prefix byte.
+function scanGc(c: WasmCursor) {
+  const sub = wcU32(c)
+  if sub <= 1 || sub == 6 || sub == 7 || sub >= 11 && sub <= 14 || sub == 16 {
+    return siteIdx(c)
+  }
+  if sub >= 2 && sub <= 5 || sub >= 8 && sub <= 10 || sub == 18 || sub == 19 {
+    siteIdx(c)
+    wcU32(c)
+    return 0
+  }
+  if sub == 17 {
+    siteIdx(c)
+    siteIdx(c)
+    return 0
+  }
+  if sub == 15 || sub >= 26 && sub <= 30 { return 0 }
+  if sub >= 20 && sub <= 23 { return siteHeap(c) }
+  if sub == 24 || sub == 25 {
+    wcByte(c)
+    wcU32(c)
+    siteHeap(c)
+    siteHeap(c)
+    return 0
+  }
+  wcFail(c)
+}
+
+// ── choosing ────────────────────────────────────────────────────────────────
+
+// The new order, as the old index of each new slot. The 128 most-referenced types take
+// the one-byte type indices, those of them with the most heap-type references the first 64,
+// and every other type keeps its relative order; ties go to the lower old index.
+function toChoose(): i32[] {
+  const nu: i32[] = []
+  const ns: i32[] = []
+  while nu.length < groupSize {
+    nu.push(0)
+    ns.push(0)
+  }
+  let k = 0
+  while k < eVal.length {
+    const v = eVal[k]
+    if v >= 0 && v < groupSize {
+      if eKind[k] == EK_IDX { nu[v] = nu[v] + 1 }
+      else if eKind[k] == EK_HEAP { ns[v] = ns[v] + 1 }
+    }
+    k = k + 1
+  }
+  const picked: boolean[] = []
+  while picked.length < groupSize { picked.push(false) }
+  const top: i32[] = []
+  let want = 128
+  if groupSize < want { want = groupSize }
+  while top.length < want {
+    let best = -1
+    let i = 0
+    while i < groupSize {
+      if !picked[i] && (best < 0 || nu[i] + ns[i] > nu[best] + ns[best]) {
+        best = i
+      }
+      i = i + 1
+    }
+    if best < 0 { return [] }
+    picked[best] = true
+    top.push(best)
+  }
+  // A stable insertion sort by heap-type references keeps the score order among equals.
+  let a = 1
+  while a < top.length {
+    const t = top[a]
+    let p = a - 1
+    while p >= 0 && ns[top[p]] < ns[t] {
+      top[p + 1] = top[p]
+      p = p - 1
+    }
+    top[p + 1] = t
+    a = a + 1
+  }
+  let r = 0
+  while r < groupSize {
+    if !picked[r] { top.push(r) }
+    r = r + 1
+  }
+  toPlaceSupersFirst(top)
+}
+
+// `want` with each type's chain of unplaced supertypes moved directly ahead of it.
+function toPlaceSupersFirst(want: i32[]): i32[] {
+  const placed: boolean[] = []
+  while placed.length < groupSize { placed.push(false) }
+  const out: i32[] = []
+  let i = 0
+  while i < want.length {
+    const chain: i32[] = []
+    let t = want[i]
+    while t >= 0 && t < groupSize && !placed[t] && chain.length <= groupSize {
+      chain.push(t)
+      t = tSuper[t]
+    }
+    let k = chain.length - 1
+    while k >= 0 {
+      placed[chain[k]] = true
+      out.push(chain[k])
+      k = k - 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+// ── writing ─────────────────────────────────────────────────────────────────
+
+function ulebLen(v: i32): i32 {
+  let n = 1
+  let x = v >>> 7
+  while x != 0 {
+    n = n + 1
+    x = x >>> 7
+  }
+  n
+}
+
+// The width of `v >= 0` as a signed LEB.
+function slebLen(v: i32): i32 {
+  let n = 1
+  let x = v
+  while x >= 64 {
+    n = n + 1
+    x = x >> 7
+  }
+  n
+}
+
+// The first edit at or after `from` whose bytes end past `at`.
+function firstEndingPast(at: i32, from: i32): i32 {
+  let lo = from
+  let hi = ePos.length
+  while lo < hi {
+    const mid = (lo + hi) >>> 1
+    if ePos[mid] + eLen[mid] > at { hi = mid } else { lo = mid + 1 }
+  }
+  lo
+}
+
+// `b` with the first group in `order`, every type reference renumbered by `toNew`, and every
+// size recomputed; moves the body spans onto the new offsets.
+function toWrite(b: u8[], order: i32[], toNew: i32[]): u8[] {
+  const n = ePos.length
+  const nv: i32[] = []
+  const suf: i32[] = []
+  while nv.length < n {
+    nv.push(0)
+    suf.push(0)
+  }
+  suf.push(0)
+  // Sizes enclose the edits after them, so walking back measures every inner edit first.
+  let k = n - 1
+  while k >= 0 {
+    let v = eVal[k]
+    let w = 0
+    if eKind[k] == EK_SIZE {
+      const j = firstEndingPast(ePos[k] + eLen[k] + v, k + 1)
+      v = v + suf[k + 1] - suf[j]
+      w = ulebLen(v)
+    } else {
+      if v >= 0 && v < toNew.length { v = toNew[v] }
+      if eKind[k] == EK_IDX { w = ulebLen(v) } else { w = slebLen(v) }
+    }
+    nv[k] = v
+    suf[k] = suf[k + 1] + w - eLen[k]
+    k = k - 1
+  }
+  const out: u8[] = []
+  const at = [0, 0]
+  copyEdited(out, b, nv, at, tStart[0])
+  let j = 0
+  while j < order.length {
+    const o = order[j]
+    if o >= 0 && o < tStart.length {
+      at[0] = tStart[o]
+      at[1] = tEdit[o]
+      copyEdited(out, b, nv, at, tEnd[o])
+    }
+    j = j + 1
+  }
+  at[0] = tEnd[groupSize - 1]
+  at[1] = firstEndingPast(at[0], 0)
+  copyEdited(out, b, nv, at, b.length)
+  let s = 0
+  while s < emitFnSpanStart.length && s < emitFnSpanEnd.length {
+    emitFnSpanStart[s] = movedOffset(emitFnSpanStart[s], suf)
+    emitFnSpanEnd[s] = movedOffset(emitFnSpanEnd[s], suf)
+    s = s + 1
+  }
+  out
+}
+
+// Old offset `x` in the rewritten module: shifted by every edit wholly before it.
+function movedOffset(x: i32, suf: i32[]): i32 {
+  const j = firstEndingPast(x, 0)
+  if j < 0 || j >= suf.length { return x }
+  x + suf[0] - suf[j]
+}
+
+// Copies `b[at[0], to)` to `out` with the edits from `at[1]` on applied, leaving `at` at `to`
+// and the first edit past it.
+function copyEdited(out: u8[], b: u8[], nv: i32[], at: i32[], to: i32) {
+  let cur = at[0]
+  let k = at[1]
+  while k >= 0 && k < ePos.length && ePos[k] < to {
+    while cur < ePos[k] {
+      out.push(b[cur])
+      cur = cur + 1
+    }
+    if eKind[k] == EK_HEAP { putS33(out, nv[k]) } else { putU32(out, nv[k]) }
+    cur = ePos[k] + eLen[k]
+    k = k + 1
+  }
+  while cur < to {
+    out.push(b[cur])
+    cur = cur + 1
+  }
+  at[0] = cur
+  at[1] = k
+  0
+}
+
+function putU32(out: u8[], v: i32) {
+  let x = v
+  while (x >>> 7) != 0 {
+    out.push((x & 0x7f) | 0x80)
+    x = x >>> 7
+  }
+  out.push(x)
+  0
+}
+
+// A signed LEB of `v >= 0`.
+function putS33(out: u8[], v: i32) {
+  let x = v
+  while x >= 64 {
+    out.push((x & 0x7f) | 0x80)
+    x = x >> 7
+  }
+  out.push(x)
+  0
+}
