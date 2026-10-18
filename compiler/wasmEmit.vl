@@ -7261,7 +7261,7 @@ function emitUnionCoerceValueAtom(
 
 // The value-atom box `{ tag, payload }` for `exprIx` entering `unionName`: the atom ladder
 // settles one value-atom code, and the tag, the payload's widening and any list re-encode all
-// follow from it. `bare` is the paren-stripped node at `bareIx`. Returns 0, or -1 once failed.
+// follow from it. `bareIx` is the paren-stripped node. Returns 0, or -1 once failed.
 function emitUnionCoerceAtomBox(
   body: u8[],
   unionName: string,
@@ -7270,6 +7270,44 @@ function emitUnionCoerceAtomBox(
   bareIx: i32,
   fnIx: i32,
 ) {
+  const la = coerceListAtomOf(
+    coerceValueAtomKind(unionName, uSet, exprIx, bareIx, fnIx),
+    unionName,
+    bareIx,
+    fnIx,
+  )
+  const cak = la.cak
+  // `cak` is final at this point: every arm of the ladder above assigns before the
+  // tag is emitted, and the box TAG, the rides-the-anyref test and the scalar value
+  // box below are all projections of it (`scalarTagOf` / `atomIsRefKind` /
+  // `vbHeapIdxOfAtom` each re-derived it from the spelling).
+  if cak == 7 && vbAtomListUsed && exprIsAtomList(bareIx, fnIx) {
+    fbI32Const(atomListArmTag())
+  } else {
+    fbI32Const(scalarTagOfKind(cak))
+  }
+  if emitCoerceAtomPayload(body, cak, la.listKind, exprIx, fnIx) < 0 {
+    return -1
+  }
+  // A `string` / list member is a REF and rides the box's anyref `value` directly; only a
+  // SCALAR atom wraps in its per-rep value box.
+  if !atomIsRefKind(cak) {
+    const vb = vbHeapIdxOfKind(cak)
+    if vb < 0 { return emitFail("emitProgram: union atom has no value box") }
+    fbStructNew(vb) // wrap the scalar payload
+  }
+  fbStructNew(uBoxIdx) // { tag, payload }
+  0
+}
+
+// The value-atom code `exprIx` boxes at entering `unionName`, before any list widening.
+function coerceValueAtomKind(
+  unionName: string,
+  uSet: i32,
+  exprIx: i32,
+  bareIx: i32,
+  fnIx: i32,
+): i32 {
   const bare = P.nodes[bareIx]
   // Classify the value's atom. Order mirrors the print-import ladder (f32 before f64 — a float
   // literal classifies f64 too; string, bool and i64 are disjoint). The default is i32 unless
@@ -7378,6 +7416,24 @@ function emitUnionCoerceAtomBox(
     const fsw = unionStoreAtomKindOfSet(uSet, unionName, 4)
     if fsw >= 0 { cak = fsw }
   }
+  cak
+}
+
+// A coerced value's final atom code and the list backing kind its payload builds with.
+type CoerceListAtom = {
+  cak: i32,
+  listKind: i32,
+}
+
+// The list widening of the atom code `cak0` entering `unionName`: a list literal whose union
+// holds it as a wider or packed list takes that arm's code and build kind.
+function coerceListAtomOf(
+  cak0: i32,
+  unionName: string,
+  bareIx: i32,
+  fnIx: i32,
+): CoerceListAtom {
+  let cak = cak0
   // An int-element list whose union has no `i32[]` member but an `i64[]` or `f64[]` one: the
   // elements are small int literals, so the list classifies `i32[]` while the union demands the
   // wider list. Adopt its atom and thread the element kind, so the backing builds
@@ -7423,15 +7479,19 @@ function emitUnionCoerceAtomBox(
     cak = 12 // "f32[]"
     coerceListKind = LBK_F32_LIST
   }
-  // `cak` is final at this point: every arm of the ladder above assigns before the
-  // tag is emitted, and the box TAG, the rides-the-anyref test and the scalar value
-  // box below are all projections of it (`scalarTagOf` / `atomIsRefKind` /
-  // `vbHeapIdxOfAtom` each re-derived it from the spelling).
-  if cak == 7 && vbAtomListUsed && exprIsAtomList(bareIx, fnIx) {
-    fbI32Const(atomListArmTag())
-  } else {
-    fbI32Const(scalarTagOfKind(cak))
-  }
+  const r: CoerceListAtom = { cak: cak, listKind: coerceListKind }
+  r
+}
+
+// The payload of a value-atom box: `exprIx` widened to the atom `cak`, or built as a list of
+// `listKind`. Returns 0, or -1 once failed.
+function emitCoerceAtomPayload(
+  body: u8[],
+  cak: i32,
+  listKind: i32,
+  exprIx: i32,
+  fnIx: i32,
+) {
   if cak == 3 {
     if emitExprAsI64(body, exprIx, fnIx) < 0 { return -1 }
   } else if cak == 4 {
@@ -7441,22 +7501,14 @@ function emitUnionCoerceAtomBox(
     fc.wantF32 = true
     expCtxApply(fc)
     if emitExprAsF32(body, exprIx, fnIx) < 0 { return -1 }
-  } else if coerceListKind != LBK_I32_LIST {
+  } else if listKind != LBK_I32_LIST {
     const lc = expCtxHere()
-    lc.listKind = coerceListKind
+    lc.listKind = listKind
     expCtxApply(lc)
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   } else {
     if emitExpr(body, exprIx, fnIx) < 0 { return -1 }
   }
-  // A `string` / list member is a REF and rides the box's anyref `value` directly; only a
-  // SCALAR atom wraps in its per-rep value box.
-  if !atomIsRefKind(cak) {
-    const vb = vbHeapIdxOfKind(cak)
-    if vb < 0 { return emitFail("emitProgram: union atom has no value box") }
-    fbStructNew(vb) // wrap the scalar payload
-  }
-  fbStructNew(uBoxIdx) // { tag, payload }
   0
 }
 
@@ -33386,11 +33438,7 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   // three storage gates as the atom arm above (D2590).
   const nNk = nicheReadKindAt(exprIx, e.identName)
   if nNk >= 0 {
-    if (
-      unionNameOfIdentAt(isid, fnIx, exprIx) != ""
-      || capturedIsUnionBox(fnIx, e.identName)
-      || identChainTyBoxedUnion(e.identName, fnIx, 4)
-    ) {
+    if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
       return emitNarrowedNicheRead(body, exprIx, e.identName, nNk, fnIx)
     }
   }
@@ -33399,15 +33447,7 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   // the ref-array analogue of the scalar unbox above, so indexing/`.length` see the list.
   const raNm = narrowedRefArrayOf(e.identName)
   if raNm != "" {
-    if unionNameOfIdentAt(isid, fnIx, exprIx) != "" {
-      return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
-    }
-    // the capture storage class's gate (see the value-atom arm above).
-    if capturedIsUnionBox(fnIx, e.identName) {
-      return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
-    }
-    // the typed-IR net (see the value-atom arm above).
-    if identChainTyBoxedUnion(e.identName, fnIx, 4) {
+    if identReadsUnionBox(isid, e.identName, exprIx, fnIx) {
       return emitRefArrayUnionUnboxRead(body, e.identName, fnIx)
     }
   }
@@ -33416,15 +33456,12 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   // analogue of the ref-array unbox above, so `emitMapPrep` sees the map ref directly.
   const mNm = narrowedMapOf(e.identName)
   if mNm != "" {
-    if unionNameOfIdentAt(isid, fnIx, exprIx) != "" {
-      return emitMapUnionUnboxRead(body, e.identName, fnIx)
-    }
-    // the capture storage class's gate (see the value-atom arm above).
-    if capturedIsUnionBox(fnIx, e.identName) {
-      return emitMapUnionUnboxRead(body, e.identName, fnIx)
-    }
-    // the typed-IR net (see the value-atom arm above), over the map-arm chain.
-    if identChainTyMapArmUnion(e.identName, fnIx, 4) {
+    // the same three gates as the value-atom arm above, the typed-IR net over the map-arm chain.
+    if (
+      unionNameOfIdentAt(isid, fnIx, exprIx) != ""
+      || capturedIsUnionBox(fnIx, e.identName)
+      || identChainTyMapArmUnion(e.identName, fnIx, 4)
+    ) {
       return emitMapUnionUnboxRead(body, e.identName, fnIx)
     }
   }
@@ -33434,42 +33471,71 @@ function emitIdentNode(body: u8[], e: Ident, exprIx: i32, fnIx: i32) {
   if emitCapturedRead(body, e.identName, fnIx, true) == 1 { return 0 }
   // A name resolves to a param (locals 0..p-1) or a declared local (locals p..).
   const idx = localIndexOf(fnIx, e.identName)
-  if idx < 0 {
-    // a bare top-level/lifted function name in value position constructs a function
-    // value (closure fat-pointer): `fnIndexOf` is the function index `emitClosureValue`
-    // expects, passed directly. Scope-aware so a nested function sharing a name with
-    // another maker's nested function resolves to this frame's.
-    const fe = fnIndexOfInScopeAt(isid, e.identName, fnIx, exprIx)
-    if fe >= 0 {
-      // void-coerced value seam: this node's `(P…) => T` is coerced to `(P…) => void`
-      // by the checker (`fnValVoidCoerce`), so build the void twin's closure instead
-      // (`voidTwinForNode`), or the `>v`-sig call signature-checks against the wrong functype.
-      const vtw = voidTwinForNode(exprIx, fe)
-      if vtw >= 0 { return emitClosureValue(body, vtw, fnIx) }
-      if exprIx != stubWriteRhs && !monoStubValueOk(fe, exprIx) {
-        // Handed through an identity call into a binding, the binding can take a slot per type.
-        fsAsk(exprIx)
-        return emitFailAt(
-          "emitProgram: a generic function taken as a value reaches no call that fixes its type "
-            + "— annotate the destination's function type",
-          exprIx,
-        )
-      }
-      // A hole function refused as a value may be one an identity call hands a binding (D6020).
-      if fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe) { fsAsk(exprIx) }
-      return emitClosureValue(body, fe, fnIx)
+  if idx < 0 { return emitIdentNonLocalRead(body, e, isid, exprIx, fnIx) }
+  emitIdentLocalRead(e, idx, fnIx)
+}
+
+// Whether a narrowed read of `name` finds the union box it unboxes: a binding of this frame
+// with a union render, a capture held as a box, or the typed-IR net for a binding with neither.
+function identReadsUnionBox(
+  isid: i32,
+  name: string,
+  exprIx: i32,
+  fnIx: i32,
+): boolean {
+  const r = (unionNameOfIdentAt(isid, fnIx, exprIx) != ""
+    || capturedIsUnionBox(fnIx, name)
+    || identChainTyBoxedUnion(name, fnIx, 4))
+  r
+}
+
+// A read of `e` that is no param or local of this frame: a function value, else a module
+// global. Returns 0, or -1 once failed.
+function emitIdentNonLocalRead(
+  body: u8[],
+  e: Ident,
+  isid: i32,
+  exprIx: i32,
+  fnIx: i32,
+) {
+  // a bare top-level/lifted function name in value position constructs a function
+  // value (closure fat-pointer): `fnIndexOf` is the function index `emitClosureValue`
+  // expects, passed directly. Scope-aware so a nested function sharing a name with
+  // another maker's nested function resolves to this frame's.
+  const fe = fnIndexOfInScopeAt(isid, e.identName, fnIx, exprIx)
+  if fe >= 0 {
+    // void-coerced value seam: this node's `(P…) => T` is coerced to `(P…) => void`
+    // by the checker (`fnValVoidCoerce`), so build the void twin's closure instead
+    // (`voidTwinForNode`), or the `>v`-sig call signature-checks against the wrong functype.
+    const vtw = voidTwinForNode(exprIx, fe)
+    if vtw >= 0 { return emitClosureValue(body, vtw, fnIx) }
+    if exprIx != stubWriteRhs && !monoStubValueOk(fe, exprIx) {
+      // Handed through an identity call into a binding, the binding can take a slot per type.
+      fsAsk(exprIx)
+      return emitFailAt(
+        "emitProgram: a generic function taken as a value reaches no call that fixes its type "
+          + "— annotate the destination's function type",
+        exprIx,
+      )
     }
-    // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
-    const gIdx = globalIndexOfSid(isid)
-    if gIdx >= 0 {
-      if emitUserGlobalGet(gIdx) < 0 { return -1 }
-      emitGlobalReadRecover(isid)
-      return 0
-    }
-    return emitFail(
-      "emitProgram: identifier is not a parameter, local, or global",
-    )
+    // A hole function refused as a value may be one an identity call hands a binding (D6020).
+    if fnHasUnannotatedParam(fe) && !criFnIsAnonLambda(fe) { fsAsk(exprIx) }
+    return emitClosureValue(body, fe, fnIx)
   }
+  // Not a local — a module global? Read it with `global.get` (0x23 <globalidx>).
+  const gIdx = globalIndexOfSid(isid)
+  if gIdx >= 0 {
+    if emitUserGlobalGet(gIdx) < 0 { return -1 }
+    emitGlobalReadRecover(isid)
+    return 0
+  }
+  return emitFail(
+    "emitProgram: identifier is not a parameter, local, or global",
+  )
+}
+
+// A read of `e` from its local `idx`, or an unrolled range variable's constant. Returns 0.
+function emitIdentLocalRead(e: Ident, idx: i32, fnIx: i32) {
   // A fully unrolled range loop's variable reads as its copy's constant.
   const urAt = unrolledSlotAt(idx)
   if urAt >= 0 {
