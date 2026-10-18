@@ -1195,28 +1195,7 @@ function callFtyCheckArg(
   // param type into it so an un-annotated literal param infers from the signature
   // (matching `.map`/`.filter`), substituting type-param bindings from earlier arguments
   // first — `mapArr(xs: T[], f: (T) => R)` called with `[1,2,3]` binds `T = i32` before seeding `f`'s param as `i32`.
-  let seedTy = substTyDeep(params[i], bNames, bTys)
-  // A lambda at a hole takes the function type the callee's body hands it to (D5842).
-  if tyIsHole(seedTy) && P.nodes[parenPeelIx(args[i])] is FuncDecl {
-    let owner = -1
-    if cfn is Ident { owner = fnDeclIx[cfn.identName] ?? -1 }
-    const hs = holeLambdaSeedTy(owner, params[i], bNames, bTys)
-    if hs >= 0 { seedTy = hs }
-    // One the body hands on to a hole of the caller's is pinned with that hole (D5881); one it
-    // calls, or never reads, is instanced at this call's pin (`pinHoleLambdaVals`).
-    const lx = parenPeelIx(args[i])
-    if hs < 0 && !isValBindLambda(lx) {
-      if holeLambdaDefers(owner, params[i], bNames, bTys) {
-        noteValBindLambda(lx)
-      } else {
-        const how = holeParamUse(cfn, owner, params[i], i)
-        if how >= 0 {
-          noteValBindLambda(lx)
-          noteHoleArgLambda(lx, how)
-        }
-      }
-    }
-  }
+  const seedTy = callFtyArgSeedTy(cfn, params, args, i, bNames, bTys)
   seedExpected(args[i], seedTy)
   if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
   const at = checkNodeHook(args[i])
@@ -1267,6 +1246,63 @@ function callFtyCheckArg(
       )
     }
   }
+  callFtyNoteArgCstr(cfn, args, i, at, expected)
+  callFtyHoleParamDemands(n, cfn, params, dParams, args, i, at)
+  // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
+  // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
+  // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
+  if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
+  // Passing an empty-collection argument into a concrete `T[]` / map param pins
+  // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
+  // clearing its uninferred floor — pure downstream-usage inference, no push.
+  constrainEmptyExpr(args[i], at, expected)
+  callFtyArgAssign(n, params, args, i, at, expected)
+  -1
+}
+
+// The type argument `i` of an ordinary call is seeded with: its parameter under the bindings
+// so far, or for a lambda at a hole the function type the callee's body hands it to (D5842).
+function callFtyArgSeedTy(
+  cfn: Node,
+  params: i32[],
+  args: i32[],
+  i: i32,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  let seedTy = substTyDeep(params[i], bNames, bTys)
+  if tyIsHole(seedTy) && P.nodes[parenPeelIx(args[i])] is FuncDecl {
+    let owner = -1
+    if cfn is Ident { owner = fnDeclIx[cfn.identName] ?? -1 }
+    const hs = holeLambdaSeedTy(owner, params[i], bNames, bTys)
+    if hs >= 0 { seedTy = hs }
+    // One the body hands on to a hole of the caller's is pinned with that hole (D5881); one it
+    // calls, or never reads, is instanced at this call's pin (`pinHoleLambdaVals`).
+    const lx = parenPeelIx(args[i])
+    if hs < 0 && !isValBindLambda(lx) {
+      if holeLambdaDefers(owner, params[i], bNames, bTys) {
+        noteValBindLambda(lx)
+      } else {
+        const how = holeParamUse(cfn, owner, params[i], i)
+        if how >= 0 {
+          noteValBindLambda(lx)
+          noteHoleArgLambda(lx, how)
+        }
+      }
+    }
+  }
+  seedTy
+}
+
+// The constraint argument `i` of type `at` leaves for the pin to re-validate against
+// `expected`: a hole, deferred-join or gradual-union argument, or a composite one.
+function callFtyNoteArgCstr(
+  cfn: Node,
+  args: i32[],
+  i: i32,
+  at: i32,
+  expected: i32,
+) {
   // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
   // recorded here and re-validated at the generic call site that pins it under the
   // substituted argument types — without this, `function f(x) { g(x) }` with `g(n: i32)`
@@ -1296,6 +1332,19 @@ function callFtyCheckArg(
     if cfn is Ident { cpWho = cfn.identName }
     noteArgCstr(atCstr, expected, cpWho, ACF_COMP, args[i])
   }
+}
+
+// The demands a hole parameter's body made, asked of argument `i` of type `at`: its fields,
+// an index or a write, and the `as` cast parked on the hole.
+function callFtyHoleParamDemands(
+  n: Call,
+  cfn: Node,
+  params: i32[],
+  dParams: i32[],
+  args: i32[],
+  i: i32,
+  at: i32,
+) {
   // A hole param whose body DEMANDED fields (member access on the hole)
   // checks the argument against the demanded shape, so `getx(5)` rejects
   // when the body read `o.x` (host: the grown `Infer<{x,…}>` pin).
@@ -1328,14 +1377,18 @@ function callFtyCheckArg(
       holeCastParamName(n.callFn, dParams, i, pHole.tvName),
     )
   }
-  // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
-  // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
-  // `expected` is the pre-pin answer rather than a declared demand, and holding the cast to it would refuse a program whose annotated twin runs.
-  if !tyIsHole(params[i]) { noteCastArgDest(args[i], i + 1, expected) }
-  // Passing an empty-collection argument into a concrete `T[]` / map param pins
-  // its element type from the param (`len(empty)` resolves `empty` to `i32[]`),
-  // clearing its uninferred floor — pure downstream-usage inference, no push.
-  constrainEmptyExpr(args[i], at, expected)
+}
+
+// Argument `i` delivered to `expected` under the generic-argument and wider-record flags,
+// a mismatch refused at the argument, and a passing hole-bearing function value parked (D1821).
+function callFtyArgAssign(
+  n: Call,
+  params: i32[],
+  args: i32[],
+  i: i32,
+  at: i32,
+  expected: i32,
+) {
   const savedGenArg = widenRetagGenArg
   widenRetagGenArgSet(tyWideUnionMinted && tyHasTyVar(params[i]))
   const savedLbiGen = lbiNoDest
@@ -1380,7 +1433,6 @@ function callFtyCheckArg(
       }
     }
   }
-  -1
 }
 
 // The pins an ordinary call's type-parameter bindings `vNames`/`vTys` give its callee: every
