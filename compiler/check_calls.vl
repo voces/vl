@@ -311,7 +311,14 @@ import {
   wsSuppress,
 } from "./check_width"
 import { peelParenIx, weDigits } from "./check_write_effects"
-import { fnDeclIx } from "./check_write_scan"
+import {
+  CW_FR_UNKNOWN,
+  covarRootFrame,
+  cwBoundInitOf,
+  cwBoundOnce,
+  cwLambdaDeclOf,
+  fnDeclIx,
+} from "./check_write_scan"
 import { strListHas, strListIndexOf } from "./listutil"
 import {
   isVoidTy,
@@ -1434,7 +1441,17 @@ function callFtyPinCstrs(
   adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
   let opFn = cstrCallee
   if opFn < 0 { opFn = namedFn }
-  if opFn < 0 { opFn = constLambdaOf(cfn) }
+  const holeArgs = dhNames.length > 0
+  if opFn < 0 && holeArgs { opFn = constLambdaOf(cfn, n.callFn) }
+  let fnValue = ""
+  if (
+    opFn < 0
+    && holeArgs
+    && cfn is Ident
+    && calleeIsReassignedFnValue(cfn, n.callFn)
+  ) {
+    fnValue = cfn.identName
+  }
   const noSplit = hasNamedArgs(n.callArgNames)
     || callLeavesDefault(n, cstrCallee)
   judgeFnArgHoleCalls(
@@ -1442,6 +1459,7 @@ function callFtyPinCstrs(
     vTys,
     cstrCallee,
     opFn,
+    fnValue,
     dhNames,
     dhArgNode,
     noSplit,
@@ -1748,13 +1766,14 @@ function holeNameOnlyForwardedUnread(
 
 // A function named as an argument to a hole the callee calls is judged at each instance those
 // calls ask for, so a pin its body cannot take is refused here (D6190); two instances mark the
-// parameter for a split unless `noSplit` (D6280). `opFn` is the body whose operators are judged:
-// the callee's declaration, nested or not, or the lambda a `const` callee holds (D6330).
+// parameter for a split unless `noSplit` (D6280). `opFn` is the callee body whose operators are
+// judged (D6330); `fnValue` names a reassigned callee binding, where two instances refuse.
 function judgeFnArgHoleCalls(
   vNames: string[],
   vTys: i32[],
   calleeFn: i32,
   opFn: i32,
+  fnValue: string,
   dhNames: string[],
   dhArgNode: i32[],
   noSplit: boolean,
@@ -1789,12 +1808,29 @@ function judgeFnArgHoleCalls(
             if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
             if T.diags.length == d0 { holeDeclCstrsAt(a, d, nodeTyOf(a), inst) }
           }
+          if insts.length > 1 && fnValue != "" && T.diags.length == d0 {
+            reassignedFnValueErr(fnValue, an.identName, a)
+          }
         }
       }
     }
     j = j + 1
   }
   0
+}
+
+// Refuses, at argument `a`, generic function `fnName` handed through binding `held`, which is
+// reassigned: a function value carries one signature, so a parameter its body
+// calls at two types cannot take a generic function (D6351).
+function reassignedFnValueErr(held: string, fnName: string, a: i32) {
+  tErr(
+    "cannot pass the generic function `"
+      + fnName
+      + "` through `"
+      + held
+      + "`: it is reassigned, so it holds a function value with one signature, and the parameter this argument meets is called at two types — call a `const` or a declared function, or pass a function of one type",
+    a,
+  )
 }
 
 // Marks the parameter of declared function `fn` whose hole is `hole` as wanting a copy per
@@ -1895,18 +1931,38 @@ function holeLambdaSplit(
   true
 }
 
-// The lambda a callee name's `const` binding holds as its initializer, or -1.
-function constLambdaOf(cfn: Node): i32 {
+// The lambda the callee name at `cfnIx` holds as its initializer, directly or through aliases:
+// a `const`'s, or a `let`'s that is bound once and never assigned (D6351); -1 otherwise.
+function constLambdaOf(cfn: Node, cfnIx: i32): i32 {
   if !(cfn is Ident) { return -1 }
+  let f = -1
   const d = constDeclOf(cfn.identName)
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const l = P.nodes[d]
-  if !(l is LetDecl) || l.letInit < 0 { return -1 }
-  const f = parenPeelIx(l.letInit)
+  if d >= 0 && d < P.nodes.length {
+    const l = P.nodes[d]
+    if l is LetDecl && l.letInit >= 0 { f = parenPeelIx(l.letInit) }
+  } else {
+    f = cwLambdaDeclOf(cfn.identName, covarRootFrame(cfnIx))
+  }
+  // An alias, `const k = lap`, is followed to the binding it names.
+  let hops = 0
+  while f >= 0 && f < P.nodes.length && hops < 8 {
+    const a = P.nodes[f]
+    if !(a is Ident) { break }
+    f = cwBoundInitOf(a.identName, covarRootFrame(f))
+    hops = hops + 1
+  }
   if f < 0 || f >= P.nodes.length { return -1 }
   const fn = P.nodes[f]
   if fn is FuncDecl && fn.fnName == "" { return f }
   -1
+}
+
+// Whether the callee name at `cfnIx` is a binding that is assigned, so a call through it runs
+// a function value whose one signature no copy of a body can split (D6351).
+function calleeIsReassignedFnValue(cfn: Node, cfnIx: i32): boolean {
+  if !(cfn is Ident) { return false }
+  const fr = covarRootFrame(cfnIx)
+  fr != CW_FR_UNKNOWN && !cwBoundOnce(cfn.identName, fr)
 }
 
 // The lambda node whose parameter holes `ty` carries, -1 for a type with none.
