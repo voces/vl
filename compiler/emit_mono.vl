@@ -413,6 +413,7 @@ import {
   fnIndexOfNode,
   fnRetExprOf,
   fnSigKeyOf,
+  globalLetOfIn,
   identClosureFeAt,
   identFnTypeAnnName,
   identIsBoundClosure,
@@ -518,6 +519,7 @@ import {
   tyHasTyVar,
   tyHasTyVarWasCapped,
   tyIsNumericBox,
+  tyReachesHole,
 } from "./tyquery"
 import {
   isValueUnionTyOr,
@@ -13280,6 +13282,74 @@ function monoFnParamAnnRidesTyParam(fe: i32, i: i32) {
   false
 }
 
+// The `fnStmts` slot of the lambda the `let` at the end of call `ix`'s alias chain
+// (`monoAliasLetEnd`) is seeded with, in frame `ctx`; -1 when the callee is no such alias.
+function monoAliasLetLamFe(ix: i32, ctx: i32): i32 {
+  const c = P.nodes[ix]
+  if !(c is Call) { return -1 }
+  const wl = monoAliasLetEnd(c.callFn, ctx)
+  if wl[0] < 0 { return -1 }
+  identClosureFeAt(sidOfNode(wl[0]), wl[1], wl[0])
+}
+
+// Coerces each function named as a positional argument of call `n` at the parameter type the
+// callee value's declared concrete function type gives it, where `dfe`, the callee's slot, declares
+// none; a type naming a type variable or a hole is left to the instance that pins it.
+function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
+  for nm in n.callArgNames {
+    if nm != "" { return 0 }
+  }
+  const ct = nodeTyIxOf(n.callFn)
+  if ct < 0 || ct >= T.tys.length { return 0 }
+  const f = T.tys[ct]
+  if !(f is TyFunc) { return 0 }
+  const parts: string[] = []
+  const ann = tyNameOf(monoCalleeAnnNode(n.callFn, ctx))
+  if !monoFnTypeAnnParamsName(ann, parts) { return 0 }
+  let i = 0
+  while i < n.callArgs.length && i < f.fnParamTypes.length && i < parts.length {
+    const pt = f.fnParamTypes[i]
+    if (
+      pt >= 0
+      && pt < T.tys.length
+      && T.tys[pt] is TyFunc
+      && !tyHasTyVar(pt)
+      && !tyReachesHole(pt, 8)
+      && P.nodes[unwrapParen(n.callArgs[i])] is Ident
+      && monoFnParamTypeAt(dfe, i) < 0
+    ) {
+      if monoCoerceFnValueName(n.callArgs[i], parts[i], ctx, pt) < 0 {
+        return -1
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The annotation node the callee `Ident` at `callee` is declared with, as a parameter or a local
+// of function `fnIx` or as a module global, or -1.
+function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
+  const cx = unwrapParen(callee)
+  if cx < 0 || cx >= P.nodes.length { return -1 }
+  const c = P.nodes[cx]
+  if !(c is Ident) { return -1 }
+  let li = globalLetOfIn(fnIx, c.identName, cx)
+  if fnIx >= 0 {
+    const ptn = paramTypeNode(fnIx, c.identName)
+    if ptn >= 0 { return ptn }
+    const fn = P.nodes[fnIx]
+    if fn is FuncDecl {
+      const fl = parentLetOf(fn.fnBody, c.identName)
+      if fl >= 0 { li = fl }
+    }
+  }
+  if li < 0 { return -1 }
+  const ld = P.nodes[li]
+  if ld is LetDecl { return ld.letType }
+  -1
+}
+
 // The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956).
 function monoGenArgOpenFail(ix: i32): i32 {
   emitFailAt(
@@ -14015,25 +14085,108 @@ function monoFwdFnPinMisfits(
         && n.callFn < P.nodes.length
         && P.nodes[n.callFn] is Ident
         && identDeclOf(n.callFn) == pIx
-        && n.callArgs.length == pf.fnParamTypes.length
+        && monoCallArgsMisfit(n, pf)
       ) {
-        let k = 0
-        while k < n.callArgs.length {
-          const at = nodeTyIxOf(n.callArgs[k])
-          if (
-            at >= 0
-            && !tyHasTyVar(at)
-            && !assignable(at, pf.fnParamTypes[k])
-          ) {
-            return true
-          }
-          k = k + 1
-        }
+        return true
       }
       for c in nodeChildren(ix) { stack.push(c) }
     }
   }
   false
+}
+
+// Whether call `n` passes as many arguments as `pf` takes and one of them, closed, is a type
+// unrelated to `pf`'s parameter at its position (`monoArgRelated`).
+function monoCallArgsMisfit(n: Call, pf: TyFunc): boolean {
+  if n.callArgs.length != pf.fnParamTypes.length { return false }
+  let k = 0
+  while k < n.callArgs.length {
+    const at = nodeTyIxOf(n.callArgs[k])
+    if at >= 0 && !tyHasTyVar(at) && !monoArgRelated(at, pf.fnParamTypes[k]) {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+// Whether argument type `at` fits parameter type `pt` or one of `pt`'s members fits `at`, as a
+// member literal read at its widened type does (`"y"` as `string` against `"x" | "y" | null`).
+function monoArgRelated(at: i32, pt: i32): boolean {
+  if assignable(at, pt) { return true }
+  const ms: i32[] = []
+  flattenVariantsInto(pt, ms)
+  for m in ms {
+    if m >= 0 && assignable(m, at) { return true }
+  }
+  false
+}
+
+// Whether hole parameter `pIx` of `fn`, pinned at function type `pinTy`, is copied (`b = a`,
+// `let b = a`, through further copies) into a binding that `fn`'s body calls with a closed
+// argument the pin does not take; the split plan gives the parameter one per type (D6520).
+function monoHoleCopyCallsMisfit(fn: FuncDecl, pIx: i32, pinTy: i32): boolean {
+  if pinTy < 0 || pinTy >= T.tys.length { return false }
+  const pf = T.tys[pinTy]
+  if !(pf is TyFunc) { return false }
+  const copies: i32[] = [pIx]
+  const nodes: i32[] = []
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      nodes.push(ix)
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  let grew = true
+  let rounds = 0
+  while grew && rounds < MONO_ALIAS_CHAIN_MAX {
+    grew = false
+    rounds = rounds + 1
+    for ix in nodes {
+      const d = monoCopyDeclOf(ix, copies)
+      if d >= 0 && !i32ListHas(copies, d) {
+        copies.push(d)
+        grew = true
+      }
+    }
+  }
+  if copies.length == 1 { return false }
+  for ix in nodes {
+    const n = P.nodes[ix]
+    if n is Call {
+      const f = unwrapParen(n.callFn)
+      if f >= 0 && P.nodes[f] is Ident {
+        const d = identDeclOf(f)
+        if d != pIx && i32ListHas(copies, d) && monoCallArgsMisfit(n, pf) {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+// The `let` node `ix` copies a read of one of `from` into (`b = a`, `let b = a`); -1 otherwise.
+function monoCopyDeclOf(ix: i32, from: i32[]): i32 {
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    const v = unwrapParen(n.letInit)
+    if v >= 0 && P.nodes[v] is Ident && i32ListHas(from, identDeclOf(v)) {
+      return ix
+    }
+    return -1
+  }
+  if !(n is BinExpr) || n.binOp != "=" { return -1 }
+  const v = unwrapParen(n.binRight)
+  if v < 0 || !(P.nodes[v] is Ident) || !i32ListHas(from, identDeclOf(v)) {
+    return -1
+  }
+  if !(P.nodes[n.binLeft] is Ident) { return -1 }
+  const d = identDeclOf(n.binLeft)
+  if d >= 0 && d < P.nodes.length && P.nodes[d] is LetDecl { return d }
+  -1
 }
 
 // Whether argument `argIx` reads a parameter of the function it is in.
@@ -14261,6 +14414,10 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               fsAsk(params[i])
               return monoFwdFnPinFail(p.parName, fn.fnName)
             }
+            if monoHoleCopyCallsMisfit(fn, params[i], anTy) {
+              fsAsk(params[i])
+              return monoHoleManyPinsFail(p.parName, fn.fnName)
+            }
           } else {
             const pr = monoPinAnnotatedParam(
               p,
@@ -14470,6 +14627,10 @@ function monoPinAnnotatedParam(
     if ann == tp && monoFwdFnPinMisfits(fn, params[i], args[i], an2Ty) {
       fsAsk(params[i])
       return monoFwdFnPinFail(p.parName, fn.fnName)
+    }
+    if ann == tp && monoHoleCopyCallsMisfit(fn, params[i], an2Ty) {
+      fsAsk(params[i])
+      return monoHoleManyPinsFail(p.parName, fn.fnName)
     }
     // A parameter handed on keeps its own pin as a generic does (D6202).
     if ann == tp && monoReadsParam(args[i]) { genPin = true }
@@ -15524,6 +15685,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if atn != "" {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
           if byPin { monoLamLitTake(n.binRight, atn, ctx) }
+          if !byPin && monoDeliverCallAt(n.binRight, atn) < 0 { return -1 }
         }
       }
       // A store into an element or a field of a binding delivers at the one signature the flow
@@ -15627,7 +15789,15 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
     }
     ca = ca + 1
   }
-  if dfe < 0 && monoGenArgAtOpenParam(n, ctx) { return monoGenArgOpenFail(ix) }
+  if monoCoerceAtValueParams(n, dfe, ctx) < 0 { return -1 }
+  // An alias of a `let` calls the lambda that `let` is seeded with, as the binding itself does.
+  if (
+    dfe < 0
+    && monoGenArgAtOpenParam(n, ctx)
+    && monoAliasLetLamFe(ix, ctx) < 0
+  ) {
+    return monoGenArgOpenFail(ix)
+  }
   // A call through a written, un-annotated `let` holding generic functions instances each one
   // written at the call's type, which one binding holds one of (D3979).
   if monoCallWrittenLet(ix, ctx) < 0 { return -1 }
@@ -15783,30 +15953,120 @@ function monoWalkFnBody(fnIx: i32) {
 // Each binding function `fn` (node `fnIx`) returns, by `return` or as its body's value, is
 // delivered at its annotated function-typed result (D3862).
 function monoNoteRetDeliveries(fn: FuncDecl, fnIx: i32) {
-  const parts: string[] = []
-  if fn.fnRet < 0 || annFnDecompose(tyNameOf(fn.fnRet), parts) == "" {
-    return 0
+  if fn.fnRet < 0 { return 0 }
+  monoNoteRetDeliveriesAt(fn, fnIx, tyNameOf(fn.fnRet))
+}
+
+// `monoDeliverCallRets` for `at` when it is a call of a function declared by name; 0 otherwise.
+function monoDeliverCallAt(at: i32, ann: string): i32 {
+  const c = unwrapParen(at)
+  if c < 0 { return 0 }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return 0 }
+  const cf = unwrapParen(cn.callFn)
+  if cf < 0 || !(P.nodes[cf] is Ident) { return 0 }
+  const fd = identDeclOf(cf)
+  if fd < 0 { return 0 }
+  monoDeliverCallRets(c, ann, fd)
+}
+
+// Per un-annotated concrete function node, the function type its calls' results are delivered at.
+let monoRetDeliveredAt: {[i32]: i32} = Map()
+
+// A call `at` of un-annotated concrete function `fd` delivered at function type `ann` delivers
+// each of `fd`'s returns there, as an annotated result would, when one of them is a hole lambda;
+// a second type is refused, since the one value `fd` returns has one signature (D6522).
+function monoDeliverCallRets(at: i32, ann: string, fd: i32): i32 {
+  const fn = P.nodes[fd]
+  if !(fn is FuncDecl) || fn.fnRet >= 0 || fn.fnTyParams.length > 0 { return 0 }
+  for p in fn.fnParams {
+    const pn = P.nodes[p]
+    if pn is Param {
+      if pn.parType < 0 { return 0 }
+    }
   }
+  const at2 = nameToTy(ann)
+  if at2 < 0 { return 0 }
+  if !monoRetsReachHoleLam(fd, []) { return 0 }
+  const rets = monoFnRetArgs(fn)
+  const prev = monoRetDeliveredAt[fd] ?? -1
+  if prev == at2 { return 0 }
+  if prev >= 0 {
+    return emitFailAt(
+      "emitProgram: `"
+        + fn.fnName
+        + "` returns one function value and its calls deliver it at "
+        + "two function types, and one function value has one signature — return a separate "
+        + "function for each type",
+      at,
+    )
+  }
+  // arena-tick exempt: a side table keyed by declaration, not an arena scan
+  monoRetDeliveredAt[fd] = at2
+  for r in rets {
+    if monoNoteBindDeliveryCall(r, ann, fd, -1) < 0 { return -1 }
+  }
+  0
+}
+
+// Whether function `fd` returns a hole lambda, directly or through a call of a function that
+// does; `seen` holds the functions already asked.
+function monoRetsReachHoleLam(fd: i32, seen: i32[]): boolean {
+  if fd < 0 || i32ListHas(seen, fd) { return false }
+  const fn = P.nodes[fd]
+  if !(fn is FuncDecl) { return false }
+  seen.push(fd)
+  for r in monoFnRetArgs(fn) {
+    const x = unwrapParen(r)
+    const fe = monoLamValueFe(x, fd)
+    if fe >= 0 && fe < monoGen.length && monoGen[fe] == 1 && monoLamIsHole(fe) {
+      return true
+    }
+    if x >= 0 {
+      const cn = P.nodes[x]
+      if cn is Call {
+        const cf = unwrapParen(cn.callFn)
+        if (
+          cf >= 0
+          && P.nodes[cf] is Ident
+          && monoRetsReachHoleLam(identDeclOf(cf), seen)
+        ) {
+          return true
+        }
+      }
+    }
+  }
+  false
+}
+
+// The values `fn` returns: its body's last statement and each `return`'s argument, a nested
+// function's own excluded.
+function monoFnRetArgs(fn: FuncDecl): i32[] {
+  const out: i32[] = []
   const b = P.nodes[fn.fnBody]
   if b is Block {
-    if b.blkStmts.length > 0 {
-      const tail = b.blkStmts[b.blkStmts.length - 1]
-      if monoNoteBindDelivery(tail, fn.fnRet, fnIx, -1) < 0 { return -1 }
-    }
+    if b.blkStmts.length > 0 { out.push(b.blkStmts[b.blkStmts.length - 1]) }
   }
   const stack: i32[] = [fn.fnBody]
   while stack.length > 0 {
     const ix = stack.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
-      if n is RetStmt {
-        if monoNoteBindDelivery(n.retArg, fn.fnRet, fnIx, -1) < 0 { return -1 }
-      }
-      // A nested function's `return` is its own.
+      if n is RetStmt { out.push(n.retArg) }
       if !(n is FuncDecl) {
         for k in nodeChildren(ix) { stack.push(k) }
       }
     }
+  }
+  out
+}
+
+// `monoNoteRetDeliveries` at the function type spelled `ann` in place of `fn`'s own result.
+function monoNoteRetDeliveriesAt(fn: FuncDecl, fnIx: i32, ann: string) {
+  const parts: string[] = []
+  if annFnDecompose(ann, parts) == "" { return 0 }
+  for r in monoFnRetArgs(fn) {
+    if monoNoteBindDeliveryCall(r, ann, fnIx, -1) < 0 { return -1 }
   }
   0
 }
@@ -16108,7 +16368,10 @@ function monoNoteBindDeliveryCall(at: i32, ann: string, ctx: i32, callIx: i32) {
   if at < 0 { return 0 }
   let name = monoIdentNameOf(at)
   if name == "" { name = monoCellReadName(at) }
-  if name == "" { return monoDeliverLamLit(at, ann, ctx, callIx) }
+  if name == "" {
+    if P.nodes[unwrapParen(at)] is Call { return monoDeliverCallAt(at, ann) }
+    return monoDeliverLamLit(at, ann, ctx, callIx)
+  }
   const parts: string[] = []
   if annFnDecompose(ann, parts) == "" { return 0 }
   let sig = ""
@@ -17400,6 +17663,7 @@ export function monomorphize(stmts: i32[]) {
   monoAnonParamPinTy = Map()
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
+  monoRetDeliveredAt = Map()
   monoCellCoercedSig = Map()
   monoSigCallRet = -2
   monoHoleLamSlots = Map()
