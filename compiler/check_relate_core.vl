@@ -326,6 +326,7 @@ import {
   substBindsNestRow,
   substNestMode,
   tyIsForeignGenericSig,
+  tyIsHoleGenericSig,
   tyRidesVarOf,
 } from "./check_subst"
 import {
@@ -451,7 +452,7 @@ import {
   tyOfMembers,
 } from "./check_union_mint"
 import { isWideLitJoin, wideLitTyIxs } from "./check_wide_lits"
-import { cwPeel, fnDeclIx } from "./check_write_scan"
+import { cwCalleeDeclOf, cwPeel, fnDeclIx } from "./check_write_scan"
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
@@ -3775,6 +3776,10 @@ function genFnHoleCallOwn(
     rat = substTyDeep(rat, gNames, gTys)
   }
   if rat < 0 { return -1 }
+  if tyHasTyVar(rat) {
+    const fi = holeFnArgInst(vf.fnParamTypes[pj], rat, argCstr.node[ci])
+    if fi >= 0 { rat = fi }
+  }
   if tyHasTyVar(rat) { return 0 }
   const oNames: string[] = []
   const oTys: i32[] = []
@@ -3853,6 +3858,36 @@ function holeCallRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
   r
 }
 
+// The result of open signature `f` of a hole function or an un-annotated lambda, read out of a
+// hole (`fs[0](3)`), at hole call `c`'s own arguments under the call's bindings, as a direct call
+// of it types (D6601); -1 when `f` is no such signature or the result stays open.
+function holeOpenFnRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
+  if f < 0 || f >= T.tys.length || c < 0 || c >= P.nodes.length { return -1 }
+  const ft = T.tys[f]
+  const n = P.nodes[c]
+  if !(ft is TyFunc) || !(n is Call) || !tyHasTyVar(ft.fnRet) { return -1 }
+  const np = ft.fnParamTypes.length
+  if np == 0 || n.callArgs.length != np { return -1 }
+  const p0 = T.tys[ft.fnParamTypes[0]]
+  if !(p0 is TyVar) || !tyIsHole(ft.fnParamTypes[0]) { return -1 }
+  const d = holeParamDecl(p0.tvName)
+  if d < 0 || nodeTyOf(d) != f || holeFnArgDepth >= HOLE_CALL_NODE_MAX {
+    return -1
+  }
+  const ats: i32[] = []
+  for a in n.callArgs {
+    const at = substTyDeep(nodeTyOf(a), bNames, bTys)
+    if at < 0 || tyHasTyVar(at) { return -1 }
+    ats.push(widenLitTy(at))
+  }
+  holeFnArgDepth = holeFnArgDepth + 1
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(d, mkFuncTy(ats, TY_I32), noN, noT)
+  holeFnArgDepth = holeFnArgDepth - 1
+  r
+}
+
 // Binds generic function type `ft`'s variables into `gNames`/`gTys` at hole call `c`'s own
 // arguments under the call's bindings, in argument order as the direct call binds them, through
 // argument `upto` (every one when negative); false when `c` is no call of `ft`'s arity or an
@@ -3871,12 +3906,23 @@ function holeCallBindsAt(
   if !(n is Call) || n.callArgs.length != ft.fnParamTypes.length {
     return false
   }
+  const lams: i32[] = []
   let j = 0
   while j < n.callArgs.length && (upto < 0 || j <= upto) {
-    const at = substTyDeep(nodeTyOf(n.callArgs[j]), bNames, bTys)
-    if at < 0 || tyHasTyVar(at) { return false }
-    bindGenWalk(ft.fnParamTypes[j], at, gNames, gTys)
+    if holeArgIsLam(n.callArgs[j]) {
+      lams.push(j)
+    } else {
+      const at = substTyDeep(nodeTyOf(n.callArgs[j]), bNames, bTys)
+      if at < 0 || tyHasTyVar(at) { return false }
+      bindGenWalk(ft.fnParamTypes[j], at, gNames, gTys)
+    }
     j = j + 1
+  }
+  for lj in lams {
+    const p = ft.fnParamTypes[lj]
+    if !holeLamBind(p, n.callArgs[lj], bNames, bTys, gNames, gTys) {
+      return false
+    }
   }
   true
 }
@@ -4052,16 +4098,100 @@ function holeCallInstOf(
   }
   const oNames: string[] = []
   const oTys: i32[] = []
+  // An un-annotated lambda is bound last, at what the other arguments bind (D6543).
+  const lams: i32[] = []
   let j = 0
   while j < n.callArgs.length {
-    const at = holeCallNodeTy(n.callArgs[j], vNames, vTys, calleeFn, depth + 1)
-    if at < 0 { return -1 }
-    bindGenWalk(vf.fnParamTypes[j], at, oNames, oTys)
+    if holeArgIsLam(n.callArgs[j]) {
+      lams.push(j)
+    } else {
+      const at = holeCallNodeTy(
+        n.callArgs[j],
+        vNames,
+        vTys,
+        calleeFn,
+        depth + 1,
+      )
+      if at < 0 { return -1 }
+      bindGenWalk(vf.fnParamTypes[j], at, oNames, oTys)
+    }
     j = j + 1
+  }
+  for lj in lams {
+    const p = vf.fnParamTypes[lj]
+    if !holeLamBind(p, n.callArgs[lj], vNames, vTys, oNames, oTys) { return -1 }
   }
   const inst = substTyDeep(vt, oNames, oTys)
   if inst < 0 || tyHasTyVar(inst) { return -1 }
   inst
+}
+
+// Whether hole call argument `a` is a lambda literal whose type is still open.
+function holeArgIsLam(a: i32): boolean {
+  const ax = parenPeelIx(a)
+  ax >= 0
+    && ax < P.nodes.length
+    && P.nodes[ax] is FuncDecl
+    && tyHasTyVar(nodeTyOf(ax))
+}
+
+// Binds function-typed generic parameter `p` at un-annotated lambda argument `a`: its result at
+// what `gNames`/`gTys` already bind, its captures under `bNames`/`bTys` (D6543); false when the
+// result stays open.
+function holeLamBind(
+  p: i32,
+  a: i32,
+  bNames: string[],
+  bTys: i32[],
+  gNames: string[],
+  gTys: i32[],
+): boolean {
+  if p < 0 || p >= T.tys.length { return false }
+  const pf = T.tys[p]
+  if !(pf is TyFunc) { return false }
+  const r = holeLamRetAt(
+    parenPeelIx(a),
+    substTyDeep(p, gNames, gTys),
+    bNames,
+    bTys,
+  )
+  if r < 0 { return false }
+  bindGenWalk(pf.fnRet, r, gNames, gTys)
+  true
+}
+
+// The result of un-annotated lambda `lx` delivered at function type `pt`: its body's type with
+// its parameters at `pt`'s and its captures under `bNames`/`bTys`, as a direct call's contextual
+// typing gives it; -1 when `pt` is no function type of closed parameters and the lambda's
+// arity, or the result stays open.
+export function holeLamRetAt(
+  lx: i32,
+  pt: i32,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  if lx < 0 || lx >= P.nodes.length || pt < 0 || pt >= T.tys.length {
+    return -1
+  }
+  const lt = nodeTyOf(lx)
+  if lt < 0 || lt >= T.tys.length { return -1 }
+  const pc = T.tys[pt]
+  const lf = T.tys[lt]
+  if !(pc is TyFunc) || !(lf is TyFunc) { return -1 }
+  if pc.fnParamTypes.length != lf.fnParamTypes.length { return -1 }
+  const hN: string[] = []
+  const hT: i32[] = []
+  for nm in bNames { hN.push(nm) }
+  for t in bTys { hT.push(t) }
+  let k = 0
+  while k < pc.fnParamTypes.length {
+    if tyHasTyVar(pc.fnParamTypes[k]) { return -1 }
+    bindGenWalk(lf.fnParamTypes[k], pc.fnParamTypes[k], hN, hT)
+    k = k + 1
+  }
+  const r = holeRetTyOf(lx, hN, hT)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  r
 }
 
 // The call in declared function `calleeFn`'s body whose argument `pj` is node `a`, or -1.
@@ -4131,11 +4261,111 @@ function genFnHoleCallBind(
     rat = substTyDeep(rat, gNames, gTys)
   }
   if rat < 0 { return -1 }
+  if tyHasTyVar(rat) {
+    const fi = holeFnArgInst(vf.fnParamTypes[pj], rat, argCstr.node[ci])
+    if fi >= 0 { rat = fi }
+  }
   if tyHasTyVar(rat) { return 0 }
   bindGenWalk(vf.fnParamTypes[pj], rat, gNames, gTys)
   const want = substTyDeep(vf.fnParamTypes[pj], gNames, gTys)
   if tyHasTyVar(want) || !assignable(rat, want) { return -1 }
   1
+}
+
+// How many open function values `holeFnArgInst` is following, one inside another's callee.
+let holeFnArgDepth = 0
+
+// The instance of open function value `rat`, argument `a` (a generic, a hole function or an
+// un-annotated lambda), handed to hole parameter `p` of another function: what that function's
+// body calls `p` at (D6532); -1 when `p` is no hole of a declared function, or a call stays open.
+function holeFnArgInst(p: i32, rat: i32, a: i32): i32 {
+  if p < 0 || p >= T.tys.length || rat < 0 || rat >= T.tys.length { return -1 }
+  const pv = T.tys[p]
+  const rf = T.tys[rat]
+  if !(pv is TyVar) || !(rf is TyFunc) { return -1 }
+  const lx = holeArgLamDecl(a)
+  if lx < 0 && !tyIsForeignGenericSig(rat) && !tyIsHoleGenericSig(rat) {
+    return -1
+  }
+  const d = holeParamDecl(pv.tvName)
+  if d < 0 || holeFnArgDepth >= HOLE_CALL_NODE_MAX { return -1 }
+  holeFnArgDepth = holeFnArgDepth + 1
+  const names: string[] = [pv.tvName]
+  const tys: i32[] = [rat]
+  // A lambda's result is its body's at the parameter types the calls give it, so the calls are
+  // read first at a placeholder result and the instance is checked against them again.
+  let vt = rat
+  if lx >= 0 { vt = mkFuncTy(rf.fnParamTypes, TY_I32) }
+  let inst = genFnHoleInstance(names, tys, 0, vt, d)
+  if lx >= 0 && inst >= 0 {
+    const at = T.tys[inst]
+    let r = -1
+    if at is TyFunc {
+      const noN: string[] = []
+      const noT: i32[] = []
+      r = holeLamRetAt(lx, inst, noN, noT)
+    }
+    inst = -1
+    if r >= 0 && at is TyFunc {
+      const full = mkFuncTy(at.fnParamTypes, r)
+      inst = genFnHoleInstance(names, tys, 0, full, d)
+    }
+  }
+  holeFnArgDepth = holeFnArgDepth - 1
+  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst
+}
+
+// The open lambda argument `a` is, written in place or named by a `const`, or -1.
+function holeArgLamDecl(a: i32): i32 {
+  const ax = parenPeelIx(a)
+  if ax < 0 || ax >= P.nodes.length { return -1 }
+  let lx = -1
+  if P.nodes[ax] is FuncDecl { lx = ax }
+  else if P.nodes[ax] is Ident { lx = cwCalleeDeclOf(ax) }
+  if lx < 0 || lx >= P.nodes.length { return -1 }
+  const f = P.nodes[lx]
+  if !(f is FuncDecl) || f.fnName != "" || !tyHasTyVar(nodeTyOf(lx)) {
+    return -1
+  }
+  lx
+}
+
+// The function, declared or a lambda, one of whose parameters is the hole `name`, or -1.
+function holeParamDecl(name: string): i32 {
+  if name.length < 4 || name.charCodeAt(0) != 63 { return -1 }
+  let i = name.length - 1
+  while i > 1 && name.charCodeAt(i) != 46 { i = i - 1 }
+  if i <= 1 { return -1 }
+  let d = -1
+  if name.charCodeAt(1) == 35 && name.charCodeAt(2) == 76 {
+    d = holeDigitsOf(name.slice(3, i))
+  } else {
+    d = fnDeclIx[name.slice(1, i)] ?? -1
+  }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const f = P.nodes[d]
+  if !(f is FuncDecl) { return -1 }
+  let pi = 0
+  while pi < f.fnParams.length {
+    if paramHoleName(f.fnName, d, pi) == name { return d }
+    pi = pi + 1
+  }
+  -1
+}
+
+// The non-negative decimal `s` spells, or -1.
+function holeDigitsOf(s: string): i32 {
+  if s.length == 0 || s.length > 9 { return -1 }
+  let v = 0
+  let i = 0
+  while i < s.length {
+    const c = s.charCodeAt(i)
+    if c < 48 || c > 57 { return -1 }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  v
 }
 
 // Whether the body of `calleeFn` calls the hole named `name`, as `genFnHoleInstance` reads it.
@@ -4334,6 +4564,11 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
         if it is TyFunc {
           const own = holeCallRetAt(fi, hdAlt[row], bNames, bTys)
           if own >= 0 { return own }
+          // Only a function read out of a hole (`fs[0]`); a parameter called in place is judged per instance.
+          if hdRowOf(hdBase[row]) >= 0 {
+            const lam = holeOpenFnRetAt(fi, hdAlt[row], bNames, bTys)
+            if lam >= 0 { return lam }
+          }
           return it.fnRet
         }
       }
