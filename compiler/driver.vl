@@ -7,6 +7,7 @@ import {
   cpAccString,
   cpAccTake,
   pushCps,
+  strContains,
 } from "./strutil"
 import {
   mimpAddExport,
@@ -49,8 +50,10 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
   BreakStmt,
   Call,
+  CharLit,
   ContinueStmt,
   FieldDef,
   FieldInit,
@@ -64,6 +67,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  NumLit,
   ObjLit,
   OptMember,
   Param,
@@ -71,6 +75,7 @@ import {
   Program,
   RetStmt,
   Spread,
+  StrLit,
   Tok,
   TypeDecl,
   TypeRef,
@@ -255,10 +260,14 @@ import {
 import { importSpecCharMsg, isStmtKeyword, parseProgram } from "./parser"
 import { parseBankKeep, parseBankOpen, parseBankServe } from "./parse_bank"
 import {
+  ifaceHashArm,
   ifaceHashArmed,
+  ifaceHashOf,
   ihBegin,
+  ihCarry,
   ihEdge,
   ihFinish,
+  ihMask,
   ihModule,
 } from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
@@ -302,7 +311,7 @@ import {
   discLeafTokAt,
 } from "./check_discarded"
 import { isBuiltinCallName } from "./check_getter_effects"
-import { T, demangleMsg } from "./check_types"
+import { T, TDiag, demangleMsg } from "./check_types"
 import {
   fsIntrinsicCount,
   fsIntrinsicNameAt,
@@ -1370,7 +1379,18 @@ export function checkSrc(): i32 {
   symSetEnabled(0)
   pipelineReset()
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
-  if modKeys.length > 0 { return modCompile(0) }
+  if modKeys.length > 0 {
+    const rc = modCompile(0)
+    if rc != SK_RERUN { return rc }
+    // A declined skip has already checked part of the graph into the arena, so the whole
+    // check runs again from the reset, as a check with nothing banked would.
+    skMute = true
+    plusLinksClear()
+    pipelineReset()
+    const again = modCompile(0)
+    skMute = false
+    return again
+  }
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
@@ -2070,7 +2090,10 @@ export function checkSrcSym(): i32 {
   symSetEnabled(1)
   pipelineReset()
   if modKeys.length > 0 {
+    // The symbol tables need every module checked, so a symbol check never serves one.
+    skMute = true
     const mrc = modCompile(0)
+    skMute = false
     return mrc
   }
   vcLoadToksEntry(vcSource())
@@ -4479,6 +4502,12 @@ function modExportsHas(m: i32, name: string): boolean {
 // chain to the declaring module, so `A declares, B re-exports from A, C from B`
 // resolves to A's mangled name rather than an undefined `name$mC`. Bounded by MOD_DEPTH_MAX.
 function modMergedTargetOf(m: i32, name: string): string {
+  const o = modExportOrigin(m, name)
+  o.oName + modSuffixOf(o.oMod)
+}
+// The declaring module and source name behind module `m`'s public `name`, by the same chase.
+type ModOrigin = { oMod: i32, oName: string }
+function modExportOrigin(m: i32, name: string): ModOrigin {
   let cm = m
   let cn = name
   let hops = 0
@@ -4506,12 +4535,12 @@ function modMergedTargetOf(m: i32, name: string): string {
       }
       r = r + 1
     }
-    if nextMod < 0 { return cn + modSuffixOf(cm) }
+    if nextMod < 0 { return { oMod: cm, oName: cn } }
     cm = nextMod
     cn = nextName
     hops = hops + 1
   }
-  cn + modSuffixOf(cm)
+  { oMod: cm, oName: cn }
 }
 // Visits module `m`: resolves and validates its imports (unsupported specifier,
 // unresolvable key, cycle back-edge, name-not-exported), recursing into deps first.
@@ -4927,13 +4956,15 @@ function modAliasRootExports() {
 }
 
 // `modCompile`'s step 5: ONE Program concatenating the modules' statements dependency-first,
-// so a dependency's top-level initializers run before its dependents', as in the host.
-function modMergeRoots(roots: i32[]): i32 {
+// so a dependency's top-level initializers run before its dependents', as in the host. `keep`,
+// when not empty, names by module index the modules a skipping check merges (`skPlan`).
+function modMergeRoots(roots: i32[], keep: boolean[]): i32 {
   const allStmts: i32[] = []
   let o3 = 0
   while o3 < modOrder.length {
     const r = P.nodes[roots[o3]]
-    if r is Program {
+    const kept = keep.length == 0 || keep[modOrder[o3]]
+    if kept && r is Program {
       const ss = r.progStmts
       let q = 0
       while q < ss.length {
@@ -4980,6 +5011,10 @@ function modIfaceBegin(roots: i32[], tokEnd: i32) {
 
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
 function modCompile(emit: i32): i32 {
+  if !skMute {
+    skReason = SK_NO_BANK
+    skServed = 0
+  }
   modIdAssignKeys()
   if ifaceHashArmed() { ihBegin([]) }
   plusLinksClear()
@@ -5005,13 +5040,21 @@ function modCompile(emit: i32): i32 {
   if ifaceHashArmed() { modIfaceBegin(roots, parsedToks) }
   modResolveRootReExports()
   modAliasRootExports()
-  const merged = modMergeRoots(roots)
+  const banking = emit == 0 && skArmed && ifaceHashArmed()
+  let keep: boolean[] = []
+  if banking && !skMute { keep = skPlan(roots) }
+  const merged = modMergeRoots(roots, keep)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   checkProgram(merged)
   if ifaceHashArmed() { ihFinish() }
   checkMemSharedOrigin()
   plusLinksBank()
+  if keep.length > 0 && !skSettle(keep, roots) { return SK_RERUN }
+  if banking {
+    if keep.length == 0 { skGroup() }
+    skBankNow(parsedToks)
+  }
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
   if P.diags.length > 0 { return 1 }
@@ -5031,6 +5074,425 @@ function modCompile(emit: i32): i32 {
     emitSrcSection()
     emitExternBoolSection()
   }
+  0
+}
+
+// ── a module check that serves unchanged dependents from a bank (`checkSkipArm`) ────────────
+// Armed, a module check banks each module's source, hashes, diagnostics and lint sites, and the
+// next checks only S (the edited modules and their imports); a module outside S is served when
+// what it imports from S is closed (`skClosed`) and kept its deep hash. The CLI never arms it.
+const SK_SERVED = 0
+const SK_NO_BANK = 1
+const SK_GRAPH = 2
+const SK_ALL = 3
+const SK_DEMAND = 4
+const SK_REEXPORT = 5
+const SK_IFACE = 6
+const SK_SPAN = 7
+const SK_STRAY = 8
+const SK_PASS = 9
+const SK_RERUN = 99
+const SK_READINGS = 6
+let skArmed = false
+let skMute = false
+let skValid = false
+let skReason = SK_NO_BANK
+let skServed = 0
+let skKeys: string[] = []
+let skKeyIx: {[string]: i32} = Map()
+let skSrcs: string[] = []
+let skHash: i32[] = []
+let skMask = 0
+let skPlus: {[i32]: i32}[] = []
+let skStrIdx: {[i32]: i32}[] = []
+let skScalar: {[i32]: i32}[] = []
+// One row per banked diagnostic: its module, and its end token relative to the module's first.
+let skDgMod: i32[] = []
+let skDgEnd: i32[] = []
+let skDg: TDiag[] = []
+
+// Arm the bank for later `checkSrc` module checks (`on` 1), arming the interface hash with
+// it, or disarm it (0). Either way the bank starts empty.
+export function checkSkipArm(on: i32): i32 {
+  skArmed = on != 0
+  skValid = false
+  if skArmed { ifaceHashArm(1) }
+  0
+}
+
+// The last module check: `which` 0 why it checked what it did (0 when it served some module),
+// 1 how many modules it served from the bank.
+export function checkSkipStat(which: i32): i32 {
+  if which == 0 { return skReason }
+  if which == 1 { return skServed }
+  -1
+}
+
+// The module diagnostic `j` of `T.diags` is anchored in, or -1 when its anchor has no token.
+function skDiagMod(j: i32): i32 {
+  const nd = T.diags[j].tat
+  if nd < 0 || nd >= nodeToks.length { return -1 }
+  const tk = nodeToks[nd]
+  if tk < 0 || tk >= P.toks.length { return -1 }
+  modOfTok(tk)
+}
+
+// Each module's position in `modOrder`, by module index.
+function skPosOf(): i32[] {
+  const pos: i32[] = []
+  for _ in modKeys { pos.push(-1) }
+  let o = 0
+  while o < modOrder.length {
+    pos[modOrder[o]] = o
+    o = o + 1
+  }
+  pos
+}
+
+// Whether every parameter is annotated and none has a default, which a caller's arguments
+// could otherwise pin or clone.
+function skParamsClosed(ps: i32[]): boolean {
+  for p in ps {
+    const n = P.nodes[p]
+    if !(n is Param) { return false }
+    if n.parType < 0 || n.parDefault >= 0 { return false }
+  }
+  true
+}
+
+// Whether node `e` is a number, string, character or boolean literal.
+function skScalarLit(e: i32): boolean {
+  if e < 0 || e >= P.nodes.length { return false }
+  const n = P.nodes[e]
+  n is NumLit || n is StrLit || n is CharLit || skFixedLit(e)
+}
+
+// Whether node `e` is a string or boolean literal, whose binding no store or delivery retypes.
+function skFixedLit(e: i32): boolean {
+  if e < 0 || e >= P.nodes.length { return false }
+  const n = P.nodes[e]
+  n is StrLit || n is BoolLit
+}
+
+// Whether the top-level declaration `merged` of the module rooted at `root` checks the same
+// whatever imports it: a type, an extern, an annotated binding, a string or boolean binding, a
+// constant scalar literal, or one non-generic function with every parameter annotated. Any
+// other binding (a number store retypes it), an overload or a generic answers no.
+function skClosed(root: i32, merged: string): boolean {
+  let fns = 0
+  let typed = false
+  const r = P.nodes[root]
+  if r is Program {
+    for st in r.progStmts {
+      const n = P.nodes[st]
+      if n is LetDecl && n.letName == merged {
+        return n.letType >= 0
+          || skFixedLit(n.letInit)
+          || (n.letKw == "const" && skScalarLit(n.letInit))
+      }
+      if n is FuncDecl && n.fnName == merged {
+        if n.fnTyParams.length > 0 || !skParamsClosed(n.fnParams) {
+          return false
+        }
+        fns = fns + 1
+      }
+      if n is TypeDecl && n.tdName == merged { typed = true }
+      if n is UnionDecl && n.udName == merged { typed = true }
+    }
+  }
+  if fns > 1 { return false }
+  fns == 1 || typed || externLinkOf(merged) >= 0
+}
+
+// Whether the entry's import row `k` is one of its re-exports, which the wasm export surface reads.
+function skReExported(k: i32): boolean {
+  let r = 0
+  while r < reExpMod.length {
+    if reExpMod[r] == 0 && reExpLocal[r] == impLocal[k] { return true }
+    r = r + 1
+  }
+  false
+}
+
+// The modules this check must merge, by module index, or none for a whole check: S is every
+// module whose source the bank does not hold, closed over its imports. `skReason` says why.
+function skPlan(roots: i32[]): boolean[] {
+  const whole: boolean[] = []
+  if !skValid || skMask != ihMask() || fsAsked() || fsModeOf() != FS_COMPILE {
+    return whole
+  }
+  if modKeys.length != skKeys.length {
+    skReason = SK_GRAPH
+    return whole
+  }
+  const inS: boolean[] = []
+  const work: i32[] = []
+  let m = 0
+  while m < modKeys.length {
+    const b = skKeyIx[modKeys[m]] ?? -1
+    if b < 0 {
+      skReason = SK_GRAPH
+      return whole
+    }
+    inS.push(modSrcs[m] != skSrcs[b])
+    if inS[m] { work.push(m) }
+    m = m + 1
+  }
+  let w = 0
+  while w < work.length {
+    let k = 0
+    while k < impMod.length {
+      const d = modIndexOfKey(impKey[k])
+      if impMod[k] == work[w] && d >= 0 && !inS[d] {
+        inS[d] = true
+        work.push(d)
+      }
+      k = k + 1
+    }
+    w = w + 1
+  }
+  if inS[0] {
+    skReason = SK_ALL
+    return whole
+  }
+  const pos = skPosOf()
+  let k = 0
+  while k < impMod.length {
+    const d = modIndexOfKey(impKey[k])
+    if !inS[impMod[k]] && d >= 0 {
+      if impName[k] == "" {
+        if inS[d] {
+          skReason = SK_DEMAND
+          return whole
+        }
+      } else {
+        const o = modExportOrigin(d, impName[k])
+        if inS[o.oMod] {
+          const merged = o.oName + modSuffixOf(o.oMod)
+          if !skClosed(roots[pos[o.oMod]], merged) {
+            skReason = SK_DEMAND
+            return whole
+          }
+          if impMod[k] == 0 && skReExported(k) {
+            skReason = SK_REEXPORT
+            return whole
+          }
+        }
+      }
+    }
+    k = k + 1
+  }
+  inS
+}
+
+// After a check of S alone: keep it only when every import a served module makes into S kept
+// its deep hash, every fresh diagnostic lies in S, and a served diagnostic's S positions held.
+// Then `T.diags` becomes the module-ordered merge of the fresh and the banked diagnostics.
+function skSettle(inS: boolean[], roots: i32[]): boolean {
+  if jwSiteNode.length > 0 {
+    skReason = SK_PASS
+    return false
+  }
+  let k = 0
+  while k < impMod.length {
+    const d = modIndexOfKey(impKey[k])
+    if !inS[impMod[k]] && d >= 0 && inS[d] {
+      const b = skKeyIx[modKeys[d]] ?? -1
+      if b < 0 || ifaceHashOf(d, 1) != skHash[b * SK_READINGS + 1] {
+        skReason = SK_IFACE
+        return false
+      }
+    }
+    k = k + 1
+  }
+  const freshMod: i32[] = []
+  let j = 0
+  while j < T.diags.length {
+    const m = skDiagMod(j)
+    if m < 0 || !inS[m] {
+      skReason = SK_STRAY
+      return false
+    }
+    freshMod.push(m)
+    j = j + 1
+  }
+  let served = false
+  for bm in skDgMod {
+    const m = modIndexOfKey(skKeys[bm])
+    if m >= 0 && !inS[m] { served = true }
+  }
+  if served {
+    let d = 0
+    while d < modKeys.length {
+      const b = skKeyIx[modKeys[d]] ?? -1
+      if inS[d] && (b < 0 || ifaceHashOf(d, 2) != skHash[b * SK_READINGS + 2]) {
+        skReason = SK_SPAN
+        return false
+      }
+      d = d + 1
+    }
+  }
+  const pos = skPosOf()
+  const fresh = T.diags
+  const out: TDiag[] = []
+  for m in modOrder {
+    if inS[m] {
+      let f = 0
+      while f < fresh.length {
+        if freshMod[f] == m { out.push(fresh[f]) }
+        f = f + 1
+      }
+    } else {
+      const b = skKeyIx[modKeys[m]] ?? -1
+      let i = 0
+      while i < skDg.length {
+        if skDgMod[i] == b {
+          const g = skDg[i]
+          let end = -1
+          if skDgEnd[i] >= 0 { end = modLoadStart[pos[m]] + skDgEnd[i] }
+          out.push(
+            {
+              tmsg: g.tmsg,
+              tat: roots[pos[m]],
+              tline: g.tline,
+              tcol: g.tcol,
+              tendTok: end,
+              tcode: g.tcode,
+              tdata: g.tdata,
+            },
+          )
+        }
+        i = i + 1
+      }
+    }
+  }
+  T.diags = out
+  // A served row is anchored at its module's root, which must map back to that module.
+  j = 0
+  while j < T.diags.length {
+    const m = skDiagMod(j)
+    if m < 0 || (!inS[m] && T.diags[j].tat != roots[pos[m]]) {
+      skReason = SK_STRAY
+      return false
+    }
+    j = j + 1
+  }
+  let s = 0
+  let m = 0
+  while m < modKeys.length {
+    const b = skKeyIx[modKeys[m]] ?? -1
+    if !inS[m] && b >= 0 {
+      ihCarry(m, skHash.slice(b * SK_READINGS, (b + 1) * SK_READINGS))
+      if m < plLinks.length && b < skPlus.length {
+        plLinks[m] = skPlus[b]
+        plStrIdx[m] = skStrIdx[b]
+        plScalar[m] = skScalar[b]
+      }
+      s = s + 1
+    }
+    m = m + 1
+  }
+  skServed = s
+  skReason = SK_SERVED
+  true
+}
+
+// A whole check's diagnostics in module order, each module's in the order raised, so a check
+// that serves some modules and one that serves none list the same rows in the same order.
+function skGroup(): i32 {
+  const mods: i32[] = []
+  let j = 0
+  while j < T.diags.length {
+    let m = skDiagMod(j)
+    if m < 0 { m = 0 }
+    mods.push(m)
+    j = j + 1
+  }
+  const all = T.diags
+  const out: TDiag[] = []
+  for m in modOrder {
+    let i = 0
+    while i < all.length {
+      if mods[i] == m { out.push(all[i]) }
+      i = i + 1
+    }
+  }
+  T.diags = out
+  0
+}
+
+// Bank this check for the next one, or leave nothing banked when a diagnostic has no module,
+// or ends outside it, or the check had a pass the bank cannot replay.
+function skBankNow(tokEnd: i32): i32 {
+  skValid = false
+  if P.diags.length > 0 || jwSiteNode.length > 0 { return 0 }
+  const pos = skPosOf()
+  const dgMod: i32[] = []
+  const dgEnd: i32[] = []
+  const dg: TDiag[] = []
+  let j = 0
+  while j < T.diags.length {
+    const m = skDiagMod(j)
+    if m < 0 { return 0 }
+    const o = pos[m]
+    let hi = tokEnd
+    if o + 1 < modLoadStart.length { hi = modLoadStart[o + 1] }
+    const e = T.diags[j].tendTok
+    let rel = -1
+    if e >= 0 {
+      if e < modLoadStart[o] || e >= hi { return 0 }
+      rel = e - modLoadStart[o]
+    }
+    // A message renders against this check's tables, so it is banked rendered, and only when
+    // rendering it again (as every reader does) leaves it unchanged.
+    const g = T.diags[j]
+    const msg = demangleMsg(g.tmsg)
+    if strContains(msg, "#") || strContains(msg, "$") { return 0 }
+    dgMod.push(m)
+    dgEnd.push(rel)
+    dg.push(
+      {
+        tmsg: msg,
+        tat: g.tat,
+        tline: g.tline,
+        tcol: g.tcol,
+        tendTok: g.tendTok,
+        tcode: g.tcode,
+        tdata: g.tdata,
+      },
+    )
+    j = j + 1
+  }
+  skKeys = []
+  skSrcs = []
+  skHash = []
+  skPlus = []
+  skStrIdx = []
+  skScalar = []
+  const ix: {[string]: i32} = Map()
+  let m = 0
+  while m < modKeys.length {
+    ix[modKeys[m]] = m
+    skKeys.push(modKeys[m])
+    skSrcs.push(modSrcs[m])
+    let w = 0
+    while w < SK_READINGS {
+      skHash.push(ifaceHashOf(m, w))
+      w = w + 1
+    }
+    if m < plLinks.length {
+      skPlus.push(plLinks[m])
+      skStrIdx.push(plStrIdx[m])
+      skScalar.push(plScalar[m])
+    }
+    m = m + 1
+  }
+  skKeyIx = ix
+  skMask = ihMask()
+  skDgMod = dgMod
+  skDgEnd = dgEnd
+  skDg = dg
+  skValid = true
   0
 }
 
