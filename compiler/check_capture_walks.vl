@@ -2,7 +2,7 @@
 // or lets escape (`crwEnsure`, `crEscWalk`), whether a capture is by reference (`crCaptureByRef`)
 // and which names are ever assigned a value that may be `null` (`crNulledWalk`). The checker
 // resets the tables and asks the questions; nothing here reads the type arena or the scope chain.
-// This module imports `./ast`, `./check_narrow_ends` and `./check_places`.
+// This module imports `./ast`, `./check_narrow_ends`, `./check_places` and `./listutil`.
 import {
   ArrayLit,
   BinExpr,
@@ -32,21 +32,7 @@ import {
 } from "./ast"
 import { crUnParen } from "./check_narrow_ends"
 import { placeKeyOf } from "./check_places"
-
-// Split a `,`-terminated effect summary into its sub-paths.
-export function weSplit(s: string) {
-  const out: string[] = []
-  let start = 0
-  let i = 0
-  while i < s.length {
-    if s[i] == ',' {
-      if i > start { out.push(s.slice(start, i)) }
-      start = i + 1
-    }
-    i = i + 1
-  }
-  out
-}
+import { i32ListHas, i32ListPlus } from "./listutil"
 
 export const crNoNames: string[] = []
 
@@ -74,12 +60,6 @@ export let crwBindOf: {[i32]: string} = Map()
 let crwAsgInner: {[i32]: boolean} = Map()
 // A lambda written as a call's argument, mapped to that call.
 export let crwArgCall: {[i32]: i32} = Map()
-
-// `names` with `name` appended unless already present; both `,`-joined with a leading `,`.
-export function crwAddName(names: string, name: string): string {
-  if names.indexOf("," + name + ",") >= 0 { return names }
-  names + name + ","
-}
 
 // Build the writer analysis of `root` unless it is the one already built.
 export function crwEnsure(root: i32) {
@@ -297,12 +277,11 @@ function crwVisit(ix: i32) {
   0
 }
 
-// Does `mentions` hold any name of the `,`-joined `handles`?
+// Does `mentions` hold any name of `hs`?
 export function crwMentionsAny(
   mentions: {[string]: boolean},
-  handles: string,
+  hs: string[],
 ): boolean {
-  const hs = weSplit(handles)
   let i = 0
   while i < hs.length {
     if mentions.has(hs[i]) { return true }
@@ -434,7 +413,7 @@ export function crCaptureByRef(
 function crByRefFrame(frame: i32, pre: string) {
   crbrOrd = 0
   crbrFnOrd = -1
-  crbrFnLoops = ","
+  crbrFnLoops = []
   crbrArgFloor = -1
   crbrCapNames = []
   crbrCapOrds = []
@@ -448,17 +427,18 @@ function crByRefFrame(frame: i32, pre: string) {
   let body = frame
   const fd = P.nodes[frame]
   if fd is FuncDecl { body = fd.fnBody }
-  crbrWalk(body, 0, ",")
+  crbrWalk(body, 0, crNoLoops)
   // The first capture of each name, and the loops its captures sit in.
   const firstCap: {[string]: i32} = Map()
-  const capLoops: {[string]: string} = Map()
+  const capLoops: {[string]: i32[]} = Map()
   let c = 0
   while c < crbrCapNames.length {
     const nm = crbrCapNames[c]
     const f0 = firstCap[nm] ?? -1
     if f0 < 0 || crbrCapOrds[c] < f0 { firstCap[nm] = crbrCapOrds[c] }
-    capLoops[nm] = (capLoops[nm] ?? ",")
-      + crbrCapLoops[c].slice(1, crbrCapLoops[c].length)
+    const ls: i32[] = capLoops[nm] ?? []
+    capLoops[nm] = ls
+    for l in crbrCapLoops[c] { ls.push(l) }
     c = c + 1
   }
   let a = 0
@@ -470,9 +450,9 @@ function crByRefFrame(frame: i32, pre: string) {
         crbrAsgNested[a]
         || crbrAsgOrds[a] > f0
         || crbrLoopsMeet(
-          capLoops[nm] ?? ",",
+          capLoops[nm] ?? crNoLoops,
           crbrAsgLoops[a],
-          crbrDeclLoops[nm] ?? ",",
+          crbrDeclLoops[nm] ?? crNoLoops,
         )
       ) {
         crByRefAnyMemo[pre + nm] = true
@@ -487,7 +467,7 @@ function crByRefFrame(frame: i32, pre: string) {
 // One walk of a frame, in the emitter's order: an assignment is ordered after its operands, and a
 // nested function at its start, or at the call's start when it is a named call's argument. Only
 // an assignment that may store `null` is recorded.
-function crbrWalk(ix: i32, depth: i32, loops: string) {
+function crbrWalk(ix: i32, depth: i32, loops: i32[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is Ident {
@@ -509,7 +489,7 @@ function crbrWalk(ix: i32, depth: i32, loops: string) {
   }
   let inner = loops
   if crIsLoop(ix) {
-    inner = loops + i32ToStr(ix) + ","
+    inner = i32ListPlus(loops, ix)
     if depth == 0 { crbrNoteLoopDecl(ix, inner) }
   }
   if depth == 0 { crbrNoteLetDecl(ix, loops) }
@@ -548,7 +528,7 @@ function crAsgRhsNonNull(ix: i32): boolean {
 
 // A frame's own declaration of a name records the loops it sits in; the first one wins, as in
 // the emitter's `cboxDeclare`.
-function crbrNoteLetDecl(ix: i32, loops: string) {
+function crbrNoteLetDecl(ix: i32, loops: i32[]) {
   const n = P.nodes[ix]
   if n is LetDecl {
     if !crbrDeclLoops.has(n.letName) { crbrDeclLoops[n.letName] = loops }
@@ -557,12 +537,12 @@ function crbrNoteLetDecl(ix: i32, loops: string) {
 }
 
 // A loop variable is declared inside its own loop.
-function crbrNoteLoopDecl(ix: i32, inner: string) {
+function crbrNoteLoopDecl(ix: i32, inner: i32[]) {
   crbrNoteRangeDecl(ix, inner)
   crbrNoteForInDecl(ix, inner)
 }
 
-function crbrNoteRangeDecl(ix: i32, inner: string) {
+function crbrNoteRangeDecl(ix: i32, inner: i32[]) {
   const n = P.nodes[ix]
   if n is ForRange {
     if !crbrDeclLoops.has(n.frVar) { crbrDeclLoops[n.frVar] = inner }
@@ -570,7 +550,7 @@ function crbrNoteRangeDecl(ix: i32, inner: string) {
   0
 }
 
-function crbrNoteForInDecl(ix: i32, inner: string) {
+function crbrNoteForInDecl(ix: i32, inner: i32[]) {
   const n = P.nodes[ix]
   if n is ForIn {
     if !crbrDeclLoops.has(n.fiVar) { crbrDeclLoops[n.fiVar] = inner }
@@ -592,14 +572,12 @@ function crIsLoop(ix: i32): boolean {
   n is WhileStmt || n is ForRange || n is ForIn
 }
 
-// Whether two `,`-joined loop paths share a loop that the declaration's own path `decl` does not
-// hold: a loop around the declaration makes a fresh binding each time round.
-function crbrLoopsMeet(a: string, b: string, decl: string): boolean {
-  const ls = weSplit(a)
+// Whether two loop paths share a loop that the declaration's own path `decl` does not hold: a
+// loop around the declaration makes a fresh binding each time round.
+function crbrLoopsMeet(a: i32[], b: i32[], decl: i32[]): boolean {
   let i = 0
-  while i < ls.length {
-    const key = "," + ls[i] + ","
-    if b.indexOf(key) >= 0 && decl.indexOf(key) < 0 { return true }
+  while i < a.length {
+    if i32ListHas(b, a[i]) && !i32ListHas(decl, a[i]) { return true }
     i = i + 1
   }
   false
@@ -613,18 +591,20 @@ export let crNulledNames: {[string]: boolean} = Map()
 export let crNulledBuilt = false
 let crbrOrd = 0
 let crbrFnOrd = -1
-let crbrFnLoops = ","
+// The loops around a node, outermost first, as node indices.
+const crNoLoops: i32[] = []
+let crbrFnLoops: i32[] = []
 let crbrArgFloor = -1
 let crbrCapNames: string[] = []
 let crbrCapOrds: i32[] = []
-let crbrCapLoops: string[] = []
+let crbrCapLoops: i32[][] = []
 let crbrAsgNames: string[] = []
 let crbrAsgOrds: i32[] = []
-let crbrAsgLoops: string[] = []
+let crbrAsgLoops: i32[][] = []
 let crbrAsgNested: boolean[] = []
 let crbrAsgNull: boolean[] = []
 export let crByRefAnyMemo: {[string]: boolean} = Map()
-let crbrDeclLoops: {[string]: string} = Map()
+let crbrDeclLoops: {[string]: i32[]} = Map()
 
 // One walk of a body, adding to `out` every name used other than as that body's own callee: an
 // identifier in any other position, or any identifier inside a nested function.
