@@ -1574,50 +1574,14 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // Transparency doesn't move the name, so this can render at `ctx` rather than at `RC_ROOT`.
   const smt = singleMemberAliasTyIx(name)
   if smt >= 0 {
-    // A declared union of declared structs renders as its member spellings, never as their
-    // shapes (`declaredStructUnionMembers`), reached both from an inline `Shape | null`
-    // annotation and from a `null`-inside-declaration form. Without it the structural render
-    // drops the arm names, so an inline object literal falls to a global field-set scan (D1172).
-    const dsu = declaredStructUnionMembers(name)
-    if dsu != "" {
-      canonAtomsSet(tyNameAtoms)
-      return dsu
-    }
-    const smr = transparentMemberEmitName(smt, ctx)
-    // The emptiness guard the predecessor carried implicitly: it tested its own render for
-    // "" and fell through when the member had no emit name at all. Same test, one render
-    // later, so an unnameable member still reaches the arms that follow.
-    if smr != "" {
-      // The render's own atom width, as its producer reported it — the hand-off the
-      // second renderer needs for exactly this purpose.
-      canonAtomsSet(tyNameAtoms)
-      return smr
-    }
+    const smr = canonSingleMemberAliasName(name, smt, ctx)
+    if smr != "" { return smr }
   }
   // A declared alias for a numeric literal union (`type Z = 0 | 1`) denotes its base scalar
   // here, ahead of the `nameNeedsCanon` early-out that would otherwise return the bare alias
   // name untouched. Untouched, `collectU` registers it in `unNames` so `isUName` claims a
   // union box while every read lowers the plain i32 — silent invalid wasm, `vl check` clean.
-  if annGenAppSpanEnds(name) {
-    const gLt = gaeLtAt(name)
-    const gArgs: string[] = []
-    // Both cuts are `tyname.gaeHeadNameOf`/`gaeArgsTextOf`, writing both halves.
-    tyTopLevelSplit(gaeArgsTextOf(name, gLt), ',', false, gArgs)
-    let gOut = gaeHeadNameOf(name, gLt) + "<"
-    let gi2 = 0
-    while gi2 < gArgs.length {
-      if gi2 > 0 { gOut = gOut + "," }
-      // An argument stands where the parameter it binds stands, a position this rewrite has
-      // no way to know — `RC_ROOT` is what every other whole-annotation entry uses and what
-      // the argument text arrived carrying.
-      gOut = gOut + canonEmitNameAt(gArgs[gi2], RC_ROOT)
-      gi2 = gi2 + 1
-    }
-    // An application is one atom — its separators all sit inside the `<>`. Set explicitly,
-    // since the argument recursions leave their own widths behind.
-    canonAtomsSet(1)
-    return gOut + ">"
-  }
+  if annGenAppSpanEnds(name) { return canonGenAppName(name) }
   const nla = numLitUnionAliasName(name)
   if nla != "" {
     canonAtomsSet(1)
@@ -1640,26 +1604,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // if unrenderable. The fold asks the parser's spelling tree where one is banked for
   // `name` (`annotResolve`), re-parsing only where none is. A recursion enters with `root =
   // -1` and takes the name leg unchanged.
-  if (nameHasSep(name, '&')) {
-    const folded = annotResolve(name, root)
-    if folded >= 0 {
-      // The fold stands exactly where the intersection spelling stood, so the position
-      // passes straight through — `nameToTy` then render, converting by deleting a string
-      // round-trip rather than inventing one.
-      const r = tyToEmitNameAt(folded, ctx)
-      // The fold's render carries its own width — `(0|1|2) & !2` folds to the one-atom
-      // `i32`, but a fold that stays a union renders as one.
-      const ra = tyNameAtoms
-      if r != "" {
-        canonAtomsSet(ra)
-        return r
-      }
-    }
-    // The unchanged name: it reached here with no top-level `|` at all (the union arm
-    // claims every name that has one, bar a top-level function type), so it is one atom.
-    canonAtomsSet(1)
-    return name
-  }
+  if (nameHasSep(name, '&')) { return canonIsectName(name, ctx, root) }
   // The read-only view's marker leaves the vocabulary here: a view and its list are one
   // rep, so the emitter spells only the list and every rep-keyed table holds one row for
   // the pair. The checker raises every refusal the marker buys before this runs.
@@ -1672,21 +1617,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // returning a list, handled by the function-type pass-through, not an array of functions.
   const arrCore = arrElemNameRaw(name)
   if arrCore != "" && !isTopLevelFuncTypeName(name) {
-    const core = canonEmitNameAt(arrCore, RC_ELEM)
-    // The element's own atom width, as the element's producer reported it. A wide element
-    // (more than one top-level atom) is exactly a union element.
-    const coreAtoms = canonAtoms
-    // A list name is one atom in every form — a union element is parenthesized so its
-    // `|`s stop being top-level. Set explicitly, since the element recursion leaves its
-    // width in `canonAtoms`.
-    canonAtomsSet(1)
-    // A union element (`(A|B)[]`) or a function-type element (`((i32) => i32)[]`, distinct
-    // from `(i32) => i32[]`) keeps grouping parens; `canonEmitName` strips a member's own
-    // wrapping parens, so re-add them. Width and `nameHasPipe` disagree on exactly one
-    // shape — a function type whose result is a union — but that shape is claimed by the second test first.
-    if coreAtoms > 1 { return "(" + core + ")[]" }
-    if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
-    return core + "[]"
+    return canonArrayName(arrCore)
   }
   // A parenthesized group wrapping the whole (no top-level `|`/`&`/`[]` left): strip and
   // canon the inside. Not for a top-level function type whose return is parenthesized
@@ -1701,31 +1632,7 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // with the result's grouping parens when it is itself a function. Leaving the interior
   // verbatim forks the two spellings of one closure, since `annRetKind` would make the
   // `$fnsig` result a union box while the declaration's own softened annotation stays a scalar.
-  if isTopLevelFuncTypeName(name) {
-    // The arrow index the guard just scanned for, not a second scan of the same name for
-    // the same position — nothing runs between the predicate's return and this read.
-    // Both cuts are `tyname.fnParamsTextOf`/`fnRetTextOf`, given that banked index.
-    const fa = funcArrowAt
-    const psStr = fnParamsTextOf(name, fa)
-    let out = "("
-    if psStr.length > 0 {
-      const parts: string[] = []
-      tyTopLevelSplit(psStr, ',', false, parts)
-      let pi = 0
-      while pi < parts.length {
-        if pi > 0 { out = out + "," }
-        out = out + canonEmitNameAt(parts[pi], RC_FN_PARAM)
-        pi = pi + 1
-      }
-    }
-    let rc = canonEmitNameAt(fnRetTextOf(name, fa), RC_FN_RES)
-    if isTopLevelFuncTypeName(rc) { rc = "(" + rc + ")" }
-    // A function type is one atom (params parenthesized, result behind the top-level `=>`
-    // where `unionMemberCount` stops). Set explicitly, since the param/result recursions
-    // leave their own widths behind.
-    canonAtomsSet(1)
-    return out + ")=>" + rc
-  }
+  if isTopLevelFuncTypeName(name) { return canonFuncTypeName(name) }
   // A literal member — its base scalar, rendered from the arena rather than by a second
   // spelling rule. Its dual is the checker's own `softenLitTy`; canon lacked a way to get
   // an arena type at a leaf, which `litMemberTy` now supplies. Total here, since
@@ -1751,6 +1658,121 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
     return shp
   }
   name
+}
+
+// The render of the single-member union alias `name` (its member `smt`) at `ctx`, or "" when
+// it has none and the caller's later arms answer.
+function canonSingleMemberAliasName(name: string, smt: i32, ctx: i32): string {
+  // A declared union of declared structs renders as its member spellings, never as their
+  // shapes (`declaredStructUnionMembers`), reached both from an inline `Shape | null`
+  // annotation and from a `null`-inside-declaration form. Without it the structural render
+  // drops the arm names, so an inline object literal falls to a global field-set scan (D1172).
+  const dsu = declaredStructUnionMembers(name)
+  if dsu != "" {
+    canonAtomsSet(tyNameAtoms)
+    return dsu
+  }
+  const smr = transparentMemberEmitName(smt, ctx)
+  // The emptiness guard the predecessor carried implicitly: it tested its own render for
+  // "" and fell through when the member had no emit name at all. Same test, one render
+  // later, so an unnameable member still reaches the arms that follow.
+  if smr != "" {
+    // The render's own atom width, as its producer reported it — the hand-off the
+    // second renderer needs for exactly this purpose.
+    canonAtomsSet(tyNameAtoms)
+    return smr
+  }
+  ""
+}
+
+// A generic alias application `Head<A, B>` with each argument canonicalised; one atom.
+function canonGenAppName(name: string): string {
+  const gLt = gaeLtAt(name)
+  const gArgs: string[] = []
+  // Both cuts are `tyname.gaeHeadNameOf`/`gaeArgsTextOf`, writing both halves.
+  tyTopLevelSplit(gaeArgsTextOf(name, gLt), ',', false, gArgs)
+  let gOut = gaeHeadNameOf(name, gLt) + "<"
+  let gi2 = 0
+  while gi2 < gArgs.length {
+    if gi2 > 0 { gOut = gOut + "," }
+    // An argument stands where the parameter it binds stands, a position this rewrite has
+    // no way to know — `RC_ROOT` is what every other whole-annotation entry uses and what
+    // the argument text arrived carrying.
+    gOut = gOut + canonEmitNameAt(gArgs[gi2], RC_ROOT)
+    gi2 = gi2 + 1
+  }
+  // An application is one atom — its separators all sit inside the `<>`. Set explicitly,
+  // since the argument recursions leave their own widths behind.
+  canonAtomsSet(1)
+  gOut + ">"
+}
+
+// A top-level intersection `name` at `ctx`: the render of its fold, or `name` itself when the
+// fold does not resolve or renders as nothing. `root` is the parser's spelling tree, or -1.
+function canonIsectName(name: string, ctx: i32, root: i32): string {
+  const folded = annotResolve(name, root)
+  if folded >= 0 {
+    // The fold stands exactly where the intersection spelling stood, so the position
+    // passes straight through — `nameToTy` then render, converting by deleting a string
+    // round-trip rather than inventing one.
+    const r = tyToEmitNameAt(folded, ctx)
+    // The fold's render carries its own width — `(0|1|2) & !2` folds to the one-atom
+    // `i32`, but a fold that stays a union renders as one.
+    const ra = tyNameAtoms
+    if r != "" {
+      canonAtomsSet(ra)
+      return r
+    }
+  }
+  // The unchanged name: it reached here with no top-level `|` at all (the union arm
+  // claims every name that has one, bar a top-level function type), so it is one atom.
+  canonAtomsSet(1)
+  name
+}
+
+// A list name over the element spelling `arrCore`, canonicalised at the element position.
+function canonArrayName(arrCore: string): string {
+  const core = canonEmitNameAt(arrCore, RC_ELEM)
+  // The element's own atom width, as the element's producer reported it. A wide element
+  // (more than one top-level atom) is exactly a union element.
+  const coreAtoms = canonAtoms
+  // A list name is one atom in every form — a union element is parenthesized so its
+  // `|`s stop being top-level. Set explicitly, since the element recursion leaves its
+  // width in `canonAtoms`.
+  canonAtomsSet(1)
+  // A union element (`(A|B)[]`) or a function-type element (`((i32) => i32)[]`, distinct
+  // from `(i32) => i32[]`) keeps grouping parens; `canonEmitName` strips a member's own
+  // wrapping parens, so re-add them. Width and `nameHasPipe` disagree on exactly one
+  // shape — a function type whose result is a union — but that shape is claimed by the second test first.
+  if coreAtoms > 1 { return "(" + core + ")[]" }
+  if isTopLevelFuncTypeName(core) { return "(" + core + ")[]" }
+  core + "[]"
+}
+
+// A top-level function type `name` with its params and result canonicalised; one atom. Must be
+// called right after `isTopLevelFuncTypeName(name)`, whose banked arrow index it reads first.
+function canonFuncTypeName(name: string): string {
+  // Both cuts are `tyname.fnParamsTextOf`/`fnRetTextOf`, given that banked index.
+  const fa = funcArrowAt
+  const psStr = fnParamsTextOf(name, fa)
+  let out = "("
+  if psStr.length > 0 {
+    const parts: string[] = []
+    tyTopLevelSplit(psStr, ',', false, parts)
+    let pi = 0
+    while pi < parts.length {
+      if pi > 0 { out = out + "," }
+      out = out + canonEmitNameAt(parts[pi], RC_FN_PARAM)
+      pi = pi + 1
+    }
+  }
+  let rc = canonEmitNameAt(fnRetTextOf(name, fa), RC_FN_RES)
+  if isTopLevelFuncTypeName(rc) { rc = "(" + rc + ")" }
+  // A function type is one atom (params parenthesized, result behind the top-level `=>`
+  // where `unionMemberCount` stops). Set explicitly, since the param/result recursions
+  // leave their own widths behind.
+  canonAtomsSet(1)
+  out + ")=>" + rc
 }
 
 // The last render `canonEmitUnionName` took from a type rather than a spelling, and that type:

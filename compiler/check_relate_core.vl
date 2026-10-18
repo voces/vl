@@ -2865,43 +2865,13 @@ function nameToTyReal(name: string) {
   // (a `null` member makes it nullable). Checked first so a member's `[]`/map shape isn't
   // read as a suffix of the whole union name; duplicate members collapse.
   if nameHasPipe(name) && !isTopLevelFuncTypeName(name) {
-    const parts: string[] = []
-    tyTopLevelSplit(name, '|', false, parts)
-    const members: i32[] = []
-    let hasNull = false
-    let pi = 0
-    while pi < parts.length {
-      const part = parts[pi]
-      if part == "null" {
-        hasNull = true
-      } else if part.length > 0 {
-        // An unresolved member poisons the whole union (-1): pushing it into the member
-        // list would let `assignable` treat the negative sentinel as "accept anything".
-        const m = nameToTy(part)
-        if m < 0 { return -1 }
-        annUnionPushDistinctMember(members, m)
-      }
-      pi = pi + 1
-    }
-    // The litunion flatten and the `null` niche wrap at their shared home — the tree
-    // route's mirror of `tsToTyReal`'s `TS_UNION` arm. Three routes, one rule.
-    return annUnionTy(members, hasNull)
+    return nameUnionTy(name)
   }
   // An intersection `A & B` — fold the operands through `intersectTy` so a finite
   // annotation simplifies to a concrete type (`(0|1|2) & !2` → `0 | 1`). An unresolvable
   // operand poisons the whole name (-1).
   if nameHasSep(name, '&') && !isTopLevelFuncTypeName(name) {
-    const iparts: string[] = []
-    tyTopLevelSplit(name, '&', false, iparts)
-    let acc = -1
-    let ii = 0
-    while ii < iparts.length {
-      const operand = nameIsectOperandTy(iparts[ii])
-      if operand < 0 { return -1 }
-      if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
-      ii = ii + 1
-    }
-    return acc
+    return nameIsectTy(name)
   }
   if name.length > 0 {
     // A prefix negation `!A` written in an annotation — the name route's half of the
@@ -2923,28 +2893,8 @@ function nameToTyReal(name: string) {
     }
     // A function type `(params)=>ret` (the parser's synthetic name for `(i32) => i32`):
     // builds a `TyFunc` so a function-typed binding/param/field type-checks. Matches
-    // `isTopLevelFuncTypeName`; `funcArrowAt` banks the arrow index and must be read
-    // immediately, since the recursion below (`nameToTy`) reaches the predicate again and overwrites it.
-    if isTopLevelFuncTypeName(name) {
-      const arrowAt = funcArrowAt
-      const paramsStr = fnParamsTextOf(name, arrowAt)
-      const retStr = fnRetTextOf(name, arrowAt)
-      const ptys: i32[] = []
-      if paramsStr.length > 0 {
-        const pparts: string[] = []
-        tyTopLevelSplit(paramsStr, ',', false, pparts)
-        let pk = 0
-        while pk < pparts.length {
-          const pt = nameToTy(pparts[pk])
-          if pt < 0 { return -1 }
-          ptys.push(pt)
-          pk = pk + 1
-        }
-      }
-      const rty = nameToTy(retStr)
-      if rty < 0 { return -1 }
-      return mkFuncTy(ptys, rty)
-    }
+    // `isTopLevelFuncTypeName`, whose banked arrow index `nameFuncTy` reads first.
+    if isTopLevelFuncTypeName(name) { return nameFuncTy(name) }
     // A string- or numeric-literal type (`"a"`, `0`, `1.5`), at the lexeme grammar's
     // home — shared with `canonEmitName`'s literal arm.
     const lmt = litMemberTy(name)
@@ -2964,9 +2914,7 @@ function nameToTyReal(name: string) {
     return -1
   }
   // An array type `T[]`: the parser appends a literal `[]` per array suffix to the type
-  // name (`i32[]`, `Tok[]`, `i32[][]`). Strip one suffix and wrap the element.
-  const nlen = name.length
-  // The array-name grammar's test then its cut, both at their home in `tyname.vl`. Not
+  // name (`i32[]`, `Tok[]`, `i32[][]`). Strip one suffix and wrap the element. Not
   // `arrElemNameRaw(name) != ""`: the degenerate `"[]"` is an array whose element is "",
   // and this arm must still enter for it — the one-call form would skip it.
   if nameIsArray(name) {
@@ -2991,50 +2939,8 @@ function nameToTyReal(name: string) {
     if mv < 0 { return -1 }
     return mkMapTy(mk, mv, 0)
   }
-  // An inline object type `{x:T,y:U}` (starts `{` but not `{[`). Split top-level commas
-  // (depth-aware), then each field at its first top-level `:`, and build the structural
-  // `TyObj`. An unresolved field type poisons the whole annotation (-1) — the sentinel stored
-  // in `objFieldTypes` would crash a consumer that assumes resolution succeeded.
-  if nameIsBraceSpanEnds(name) {
-    const fnames: string[] = []
-    const ftys: i32[] = []
-    // Fields are the top-level commas of the brace's interior, scanned from index 1 so
-    // the opening `{` doesn't count; the run ends at the closing brace, not the name's end.
-    let fstart = 1
-    let fgoing = true
-    while fgoing {
-      let fend = tyTopIndexOf(name, ',', 0, fstart)
-      if fend < 0 {
-        fend = nlen - 1
-        fgoing = false
-      }
-      const field = name.slice(fstart, fend)
-      if field.length > 0 {
-        const colonAt = tyTopIndexOf(field, ':', 0, 0)
-        // A method member in value position (`function f(x: { m(): string })`). The
-        // refusal belongs here, not the grammar, since the grammar cannot see which
-        // position it is in — the same rule `declaredTyOfName`'s alias arm applies.
-        if colonAt > 1 {
-          if field[colonAt - 1] == ')' {
-            tErr(methodInValuePosMsg(field), annotDiagAt)
-            // `TyErr`, not -1: this diagnosis already stands, and -1 would make the caller
-            // append a misleading `unknown type` — the type is known, just not a value type.
-            return TY_ERR
-          }
-        }
-        if colonAt > 0 {
-          // Field-colon cut at its home (`tyname.fieldTypeTextOf`/`fieldNameOf`), given the
-          // top-level colon already found; the emitter's own copies use a depth-blind `indexOf(":")`.
-          const fdTy = nameToTy(fieldTypeTextOf(field, colonAt))
-          if fdTy < 0 { return -1 }
-          fnames.push(fieldNameOf(field, colonAt))
-          ftys.push(fdTy)
-        }
-      }
-      fstart = fend + 1
-    }
-    return mkObjTy(fnames, ftys)
-  }
+  // An inline object type `{x:T,y:U}` (starts `{` but not `{[`).
+  if nameIsBraceSpanEnds(name) { return nameObjTy(name) }
   // A live type-parameter binding (a generic function's `<T>` while its annotations
   // resolve via `resolveAnnot`, or a generic alias application's params while its body
   // resolves via `applyGenAlias`) — innermost wins.
@@ -3051,6 +2957,115 @@ function nameToTyReal(name: string) {
   const dvn = declaredTyOfName(name)
   if dvn >= 0 { return dvn }
   builtinCtorTyLeafFail(name)
+}
+
+// The union a `|`-joined name spells, or -1 when a member does not resolve.
+function nameUnionTy(name: string): i32 {
+  const parts: string[] = []
+  tyTopLevelSplit(name, '|', false, parts)
+  const members: i32[] = []
+  let hasNull = false
+  let pi = 0
+  while pi < parts.length {
+    const part = parts[pi]
+    if part == "null" {
+      hasNull = true
+    } else if part.length > 0 {
+      // An unresolved member poisons the whole union (-1): pushing it into the member
+      // list would let `assignable` treat the negative sentinel as "accept anything".
+      const m = nameToTy(part)
+      if m < 0 { return -1 }
+      annUnionPushDistinctMember(members, m)
+    }
+    pi = pi + 1
+  }
+  // The litunion flatten and the `null` niche wrap at their shared home — the tree
+  // route's mirror of `tsToTyReal`'s `TS_UNION` arm. Three routes, one rule.
+  annUnionTy(members, hasNull)
+}
+
+// The intersection an `&`-joined name spells, or -1 when an operand does not resolve.
+function nameIsectTy(name: string): i32 {
+  const iparts: string[] = []
+  tyTopLevelSplit(name, '&', false, iparts)
+  let acc = -1
+  let ii = 0
+  while ii < iparts.length {
+    const operand = nameIsectOperandTy(iparts[ii])
+    if operand < 0 { return -1 }
+    if ii == 0 { acc = operand } else { acc = intersectTy(acc, operand) }
+    ii = ii + 1
+  }
+  acc
+}
+
+// The function type a `(params)=>ret` name spells, or -1 when a part does not resolve. Must be
+// called right after `isTopLevelFuncTypeName(name)`: the arrow index it banks is read first,
+// since the recursion below reaches the predicate again and overwrites it.
+function nameFuncTy(name: string): i32 {
+  const arrowAt = funcArrowAt
+  const paramsStr = fnParamsTextOf(name, arrowAt)
+  const retStr = fnRetTextOf(name, arrowAt)
+  const ptys: i32[] = []
+  if paramsStr.length > 0 {
+    const pparts: string[] = []
+    tyTopLevelSplit(paramsStr, ',', false, pparts)
+    let pk = 0
+    while pk < pparts.length {
+      const pt = nameToTy(pparts[pk])
+      if pt < 0 { return -1 }
+      ptys.push(pt)
+      pk = pk + 1
+    }
+  }
+  const rty = nameToTy(retStr)
+  if rty < 0 { return -1 }
+  mkFuncTy(ptys, rty)
+}
+
+// The structural `TyObj` an inline `{x:T,y:U}` name spells: its top-level commas, then each
+// field at its first top-level `:`. An unresolved field type poisons it (-1), since the
+// sentinel in `objFieldTypes` would crash a consumer; a method member is `TyErr`.
+function nameObjTy(name: string): i32 {
+  const nlen = name.length
+  const fnames: string[] = []
+  const ftys: i32[] = []
+  // Fields are the top-level commas of the brace's interior, scanned from index 1 so
+  // the opening `{` doesn't count; the run ends at the closing brace, not the name's end.
+  let fstart = 1
+  let fgoing = true
+  while fgoing {
+    let fend = tyTopIndexOf(name, ',', 0, fstart)
+    if fend < 0 {
+      fend = nlen - 1
+      fgoing = false
+    }
+    const field = name.slice(fstart, fend)
+    if field.length > 0 {
+      const colonAt = tyTopIndexOf(field, ':', 0, 0)
+      // A method member in value position (`function f(x: { m(): string })`). The
+      // refusal belongs here, not the grammar, since the grammar cannot see which
+      // position it is in — the same rule `declaredTyOfName`'s alias arm applies.
+      if colonAt > 1 {
+        if field[colonAt - 1] == ')' {
+          tErr(methodInValuePosMsg(field), annotDiagAt)
+          // `TyErr`, not -1: this diagnosis already stands, and -1 would make the caller
+          // append a misleading `unknown type` — the type is known, just not a value type.
+          return TY_ERR
+        }
+      }
+      if colonAt > 0 {
+        // Field-colon cut at its home (`tyname.fieldTypeTextOf`/`fieldNameOf`), given the
+        // top-level colon already found; the emitter's own copies use a depth-blind `indexOf(":")`.
+        const fdTy = nameToTy(fieldTypeTextOf(field, colonAt))
+        if fdTy < 0 { return -1 }
+        fnames.push(fieldNameOf(field, colonAt))
+        ftys.push(fdTy)
+      }
+    }
+    fstart = fend + 1
+  }
+  mkObjTy(fnames, ftys)
 }
 
 // How a value of record arm `y` fits record arm `x` when both carry the same field names: 0
