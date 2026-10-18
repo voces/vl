@@ -92,6 +92,12 @@ let paNames: string[][] = []
 let paPars: string[][] = []
 // Split parameters whose type-parameter annotation is dropped.
 let ptPar: i32[] = []
+// Inside the copy minted for `pfSrc[pcCopy]`, the identifier at source offset `pcPos` named
+// `pcFrom` is renamed `pcTo`: a copy is a fresh parse, so its nodes are matched by offset.
+let pcCopy: i32[] = []
+let pcPos: i32[] = []
+let pcFrom: string[] = []
+let pcTo: string[] = []
 
 function fsPlanReset(): i32 {
   pdAnchor = []
@@ -116,6 +122,10 @@ function fsPlanReset(): i32 {
   paNames = []
   paPars = []
   ptPar = []
+  pcCopy = []
+  pcPos = []
+  pcFrom = []
+  pcTo = []
   fsHoleDecline()
   0
 }
@@ -664,9 +674,235 @@ export function fsPlan(root: i32): i32 {
     }
   }
   if holes == 0 { fsPlanHoleRewrites() }
-  if lets == 0 || holes == 0 { return 0 }
-  fns
+  if lets == 0 || holes == 0 || fns == 0 { return 0 }
+  fsPlanInstances()
 }
+
+// An asked maker (the function holding an asked read) or module `const`, read in a function
+// called at two keys, that no other plan splits: a copy of that function per key, each reading
+// a copy of the declaration of its own (D6205, D6206). 1 with no plan.
+function fsPlanInstances(): i32 {
+  fiDeps = []
+  fiClaimed = []
+  fiClaimBy = []
+  for a in fsAsks {
+    let d = -1
+    if a >= 0 && a < fsParseLen && P.nodes[a] is Ident { d = fsEnclosingFn(a) }
+    if a >= 0 && a < fsParseLen && P.nodes[a] is LetDecl { d = a }
+    if fsInstanceDepOk(d) && !hasI32(fiDeps, d) { fiDeps.push(d) }
+    // The emitter stops at the first such read, so every maker of the same generic is one.
+    if a >= 0 && a < fsParseLen && P.nodes[a] is Ident {
+      const k = identDeclOf(a)
+      for r in fsIdents {
+        if k >= 0 && r != k && identDeclOf(r) == k {
+          const m = fsEnclosingFn(r)
+          if m != k && fsInstanceDepOk(m) && !hasI32(fiDeps, m) {
+            fiDeps.push(m)
+          }
+        }
+      }
+    }
+  }
+  // A function reading a dependency, itself called at one key, is a dependency too.
+  let changed = true
+  while changed {
+    changed = false
+    for r in fsIdents {
+      const g = fsInstanceReader(r)
+      if (
+        g >= 0
+        && !hasI32(fiDeps, g)
+        && fsInstanceDepOk(g)
+        && fsInstanceKeys(g).length == 1
+      ) {
+        fiDeps.push(g)
+        changed = true
+      }
+    }
+  }
+  const bodies: i32[] = []
+  for r in fsIdents {
+    const g = fsInstanceReader(r)
+    if g >= 0 && !hasI32(fiDeps, g) && !hasI32(bodies, g) { bodies.push(g) }
+  }
+  let rc = 1
+  for g in bodies {
+    if fsPlanInstanceBody(g) == 0 { rc = 0 }
+  }
+  rc
+}
+
+// The dependencies of the instance plan.
+let fiDeps: i32[] = []
+
+// The function holding read `r` when `r` reads a dependency in a way a copy can rename, else -1.
+function fsInstanceReader(r: i32): i32 {
+  const d = identDeclOf(r)
+  if r == d || !hasI32(fiDeps, d) || !fsInstanceReadOk(r, d) { return -1 }
+  const g = fsEnclosingFn(r)
+  if g == d { return -1 }
+  g
+}
+
+// Whether `d` can take a copy per instance of a function reading it: a named module-scope
+// function, or a never-written un-annotated module `const` whose slot value is a name.
+function fsInstanceDepOk(d: i32): boolean {
+  if d < 0 || d >= fsParseLen || fsParent[d] < 0 { return false }
+  if !(P.nodes[fsParent[d]] is Program) { return false }
+  const n = P.nodes[d]
+  if n is FuncDecl { return n.fnName != "" }
+  if !(n is LetDecl) || n.letKw != "const" || n.letType >= 0 || n.letInit < 0 {
+    return false
+  }
+  P.nodes[fsSlotSrc(n.letInit)] is Ident
+}
+
+// Whether read `r` of dependency `d` can be renamed to a copy: a function is read as a callee.
+function fsInstanceReadOk(r: i32, d: i32): boolean {
+  if !(P.nodes[d] is FuncDecl) { return true }
+  const c = fsParent[r]
+  if c < 0 { return false }
+  const cn = P.nodes[c]
+  cn is Call && cn.callFn == r
+}
+
+// The call keys of named module function `g`; empty unless every read is a call from outside it.
+function fsInstanceKeys(g: i32): string[] {
+  const keys: string[] = []
+  const f = P.nodes[g]
+  if !(f is FuncDecl) || f.fnName == "" || fsParent[g] < 0 { return [] }
+  if !(P.nodes[fsParent[g]] is Program) { return [] }
+  for r in fsIdents {
+    if identDeclOf(r) == g && r != g {
+      const c = fsParent[r]
+      if c < 0 || fsUnder(r, g) { return [] }
+      const cn = P.nodes[c]
+      if !(cn is Call) || cn.callFn != r { return [] }
+      const key = fsReadKey(r)
+      if !hasStr(keys, key) { keys.push(key) }
+    }
+  }
+  keys
+}
+
+// Body `g`'s share: a copy per call key past the first, each call renamed to its key's copy,
+// and every lane's dependency reads renamed to copies of its own, except where lane 0 can claim
+// the original, so no original is left unread. 1 when `g` has fewer than two keys.
+function fsPlanInstanceBody(g: i32): i32 {
+  const f = P.nodes[g]
+  const keys = fsInstanceKeys(g)
+  if keys.length < 2 || hasI32(pfSrc, g) || !(f is FuncDecl) { return 1 }
+  let k = 0
+  while k < keys.length {
+    let copy = -1
+    if k > 0 {
+      copy = pfSrc.length
+      const nm = f.fnName + "$i" + i32ToStr(g) + "_" + i32ToStr(k)
+      pfSrc.push(g)
+      pfAnchor.push(g)
+      pfName.push(nm)
+      for r in fsIdents {
+        if identDeclOf(r) == g && r != g && fsReadKey(r) == keys[k] {
+          fsRename(r, nm)
+        }
+      }
+    }
+    for r in fsIdents {
+      if fsInstanceReader(r) >= 0 && fsUnder(r, g) {
+        const d = identDeclOf(r)
+        if copy >= 0 {
+          fsCopyRename(copy, r, fsInstanceDepCopy(d, g, k))
+        } else if !fsInstanceClaim(d, g) {
+          fsRename(r, fsInstanceDepCopy(d, g, k))
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The dependencies whose original lane 0 of body `fiClaimBy[i]` reads.
+let fiClaimed: i32[] = []
+let fiClaimBy: i32[] = []
+
+// Whether body `g` can read dependency `d` and every dependency it reads as the originals,
+// claiming them when no other body has.
+function fsInstanceClaim(d: i32, g: i32): boolean {
+  const todo: i32[] = [d]
+  const seen: i32[] = []
+  while todo.length > 0 {
+    const x = todo.pop()
+    if !hasI32(seen, x) {
+      seen.push(x)
+      let i = 0
+      while i < fiClaimed.length {
+        if fiClaimed[i] == x && fiClaimBy[i] != g { return false }
+        i = i + 1
+      }
+      for r in fsIdents {
+        if fsInstanceReader(r) >= 0 && fsUnder(r, x) {
+          todo.push(identDeclOf(r))
+        }
+      }
+    }
+  }
+  for x in seen {
+    fiClaimed.push(x)
+    fiClaimBy.push(g)
+  }
+  true
+}
+
+// Inside copy `copy`, the identifier matching parse node `r` is renamed `to`.
+function fsCopyRename(copy: i32, r: i32, to: string): i32 {
+  const n = P.nodes[r]
+  if !(n is Ident) { return 0 }
+  pcCopy.push(copy)
+  pcPos.push(n.pos)
+  pcFrom.push(n.identName)
+  pcTo.push(to)
+  0
+}
+
+// The name of dependency `d`'s copy for lane `k` of body `g`, planned on first use; a function's
+// copy reads the same lane's copies of the dependencies it reads.
+function fsInstanceDepCopy(d: i32, g: i32, k: i32): string {
+  const nm = fsDeclName(d)
+    + "$i"
+    + i32ToStr(d)
+    + "_"
+    + i32ToStr(g)
+    + "_"
+    + i32ToStr(k)
+  if hasStr(pfName, nm) || hasStr(pdName, nm) { return nm }
+  const n = P.nodes[d]
+  if n is FuncDecl {
+    const copy = pfSrc.length
+    pfSrc.push(d)
+    pfAnchor.push(d)
+    pfName.push(nm)
+    for r in fsIdents {
+      if fsInstanceReader(r) >= 0 && fsUnder(r, d) {
+        fsCopyRename(copy, r, fsInstanceDepCopy(identDeclOf(r), g, k))
+      }
+    }
+    return nm
+  }
+  if n is LetDecl {
+    pdAnchor.push(d)
+    pdKw.push(n.letKw)
+    pdName.push(nm)
+    pdTy.push(-1)
+    pdValSrc.push(fsSlotSrc(n.letInit))
+    pdValName.push("")
+    return nm
+  }
+  fsExcludedName(nm, "a dependency that is not a function or a binding")
+}
+
+// `nm`, the answer for the kinds a ladder does not handle, which `why` names.
+function fsExcludedName(nm: string, _why: string): string { nm }
 
 // The result key of call `c` of an asked function: the slot keys of the binding its result
 // initializes when every read of it is a call, the call's own when it is called at once, else
@@ -1593,6 +1829,7 @@ function fsApply(): i32 {
         const fn = P.nodes[f]
         if fn is FuncDecl {
           fn.fnName = pfName[i]
+          fsApplyCopyRenames(i, f)
           rc = fsInsertAfter(pfAnchor[i], f)
         }
       }
@@ -1674,5 +1911,27 @@ function fsApplyArgs(c: i32, a: i32, names: string[], pars: string[]): i32 {
   }
   cn.callArgs = args
   if cn.callArgNames.length > 0 { cn.callArgNames = nms }
+  0
+}
+
+// Applies the renames planned inside copy `i`, minted as parse node `f`.
+function fsApplyCopyRenames(i: i32, f: i32): i32 {
+  let j = 0
+  while j < pcCopy.length {
+    if pcCopy[j] == i {
+      const stack: i32[] = [f]
+      while stack.length > 0 {
+        const x = stack.pop()
+        const n = P.nodes[x]
+        if n is Ident && n.pos == pcPos[j] && n.identName == pcFrom[j] {
+          n.identName = pcTo[j]
+        }
+        for c in nodeChildren(x) {
+          if c >= fsParseLen && c < P.nodes.length { stack.push(c) }
+        }
+      }
+    }
+    j = j + 1
+  }
   0
 }
