@@ -117,7 +117,12 @@ import {
   AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
   FieldDef,
   FieldInit,
   ForIn,
@@ -138,6 +143,7 @@ import {
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
   StrLit,
@@ -1263,6 +1269,7 @@ export function synthEmptyListAnn(letIx: i32) {
     // `fmt` is untouched; a `TyVar` element renders "", which excludes the generic case.
     if s.letType < 0 {
       const synInit = unwrapParen(s.letInit)
+      if synInit < 0 { return 0 }
       const synN = P.nodes[synInit]
       if synN is ArrayLit {
         if synN.arrElems.length == 0 {
@@ -1530,23 +1537,29 @@ function armPinAnnName(tyIx: i32) {
 function armPinLitInit(initIx: i32) {
   if initIx < 0 { return false }
   const iv = P.nodes[unwrapParen(initIx)]
-  if iv is ObjLit { return true }
-  if iv is ArrayLit {
-    if iv.arrElems.length >= 1 {
-      const e0 = P.nodes[unwrapParen(iv.arrElems[0])]
-      if e0 is ObjLit { return true }
+  match iv {
+    ObjLit => {
+      return true
     }
-  }
-  // A bare `Map()` or `Set()` commits no value rep at its initializer, so its slot is chosen
-  // by later use. The constructor name is the test, not `exprMap`: a map-returning call has
-  // already committed its producer's rep.
-  if iv is Call {
-    const mc = P.nodes[unwrapParen(iv.callFn)]
-    if mc is Ident {
-      if mc.identName == "Map" || mc.identName == "Set" {
-        if iv.callArgs.length == 0 { return true }
+    ArrayLit => {
+      if iv.arrElems.length >= 1 {
+        const e0 = P.nodes[unwrapParen(iv.arrElems[0])]
+        if e0 is ObjLit { return true }
       }
     }
+    // A bare `Map()` or `Set()` commits no value rep at its initializer, so its slot is chosen
+    // by later use. The constructor name is the test, not `exprMap`: a map-returning call has
+    // already committed its producer's rep.
+    Call => {
+      const mc = P.nodes[unwrapParen(iv.callFn)]
+      if mc is Ident {
+        if mc.identName == "Map" || mc.identName == "Set" {
+          if iv.callArgs.length == 0 { return true }
+        }
+      }
+    }
+    // Every other initializer already carries its producer's committed rep.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -1831,24 +1844,29 @@ function dstPinElemDepthAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32): i32 {
     if dstPinSrcIs(bodyIx, ex, letIx) { return depth }
   }
   const u = unwrapParen(ex)
+  if u < 0 { return -1 }
   const n = P.nodes[u]
-  if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      const d = dstPinElemDepthAt(bodyIx, n.arrElems[i], letIx, depth + 1)
-      if d > 0 { return d }
-      i = i + 1
+  match n {
+    ArrayLit => {
+      let i = 0
+      while i < n.arrElems.length {
+        const d = dstPinElemDepthAt(bodyIx, n.arrElems[i], letIx, depth + 1)
+        if d > 0 { return d }
+        i = i + 1
+      }
+      return -1
     }
-    return -1
-  }
-  if n is Ident {
-    const li = dstPinUnannListLet(bodyIx, n.identName)
-    if li >= 0 && li != letIx {
-      const ld = P.nodes[li]
-      if ld is LetDecl {
-        return dstPinElemDepthAt(bodyIx, ld.letInit, letIx, depth)
+    Ident => {
+      const li = dstPinUnannListLet(bodyIx, n.identName)
+      if li >= 0 && li != letIx {
+        const ld = P.nodes[li]
+        if ld is LetDecl {
+          return dstPinElemDepthAt(bodyIx, ld.letInit, letIx, depth)
+        }
       }
     }
+    // No other expression is a way down a list level.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -1905,29 +1923,34 @@ function dstPinSrcIsAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32) {
   if depth > 4 { return false }
   if retLocalLetOfBlock(bodyIx, ex) == letIx { return true }
   const u = unwrapParen(ex)
+  if u < 0 { return false }
   const n = P.nodes[u]
-  if n is Call {
-    const j = dstPinFwdArg(u)
-    if j >= 0 && j < n.callArgs.length {
-      return dstPinSrcIsAt(bodyIx, n.callArgs[j], letIx, depth + 1)
+  match n {
+    Call => {
+      const j = dstPinFwdArg(u)
+      if j >= 0 && j < n.callArgs.length {
+        return dstPinSrcIsAt(bodyIx, n.callArgs[j], letIx, depth + 1)
+      }
+      // An ordinary call is transparent to the binding it hands back (D155): the callee's result
+      // is un-annotated, so nothing inside it restates the value's type and the only nominal
+      // claim is at the call site. A declared result is its own destination, not a hop.
+      if dstPinCalleeRetLet(u) == letIx { return true }
     }
-    // An ordinary call is transparent to the binding it hands back (D155): the callee's result
-    // is un-annotated, so nothing inside it restates the value's type and the only nominal
-    // claim is at the call site. A declared result is its own destination, not a hop.
-    if dstPinCalleeRetLet(u) == letIx { return true }
-  }
-  // An element-preserving conduit, read back with an index (D157): `reverse([c])[0]` hands back
-  // the very object `c` holds, through a callee whose result is spelled as one of its
-  // parameters. Only an `Index` may consume it — read without the index, `reverse([c])` is a
-  // `Circle[]`, and pinning one object from that destination would be a different program.
-  if n is Index {
-    const ia = P.nodes[unwrapParen(n.idxArr)]
-    if ia is Call {
-      const ej = dstPinElemFwdArg(unwrapParen(n.idxArr))
-      if ej >= 0 && ej < ia.callArgs.length {
-        return dstPinElemIsAt(bodyIx, ia.callArgs[ej], letIx, depth + 1)
+    // An element-preserving conduit, read back with an index (D157): `reverse([c])[0]` hands back
+    // the very object `c` holds, through a callee whose result is spelled as one of its
+    // parameters. Only an `Index` may consume it — read without the index, `reverse([c])` is a
+    // `Circle[]`, and pinning one object from that destination would be a different program.
+    Index => {
+      const ia = P.nodes[unwrapParen(n.idxArr)]
+      if ia is Call {
+        const ej = dstPinElemFwdArg(unwrapParen(n.idxArr))
+        if ej >= 0 && ej < ia.callArgs.length {
+          return dstPinElemIsAt(bodyIx, ia.callArgs[ej], letIx, depth + 1)
+        }
       }
     }
+    // No other expression forwards the binding.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -1940,20 +1963,27 @@ function dstPinElemIsAt(bodyIx: i32, ex: i32, letIx: i32, depth: i32): boolean {
   if ex < 0 { return false }
   if depth > 4 { return false }
   const u = unwrapParen(ex)
+  if u < 0 { return false }
   const n = P.nodes[u]
-  if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      if dstPinSrcIsAt(bodyIx, n.arrElems[i], letIx, depth + 1) { return true }
-      i = i + 1
+  match n {
+    ArrayLit => {
+      let i = 0
+      while i < n.arrElems.length {
+        if dstPinSrcIsAt(bodyIx, n.arrElems[i], letIx, depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      return false
     }
-    return false
-  }
-  if n is Call {
-    const ej = dstPinElemFwdArg(u)
-    if ej >= 0 && ej < n.callArgs.length {
-      return dstPinElemIsAt(bodyIx, n.callArgs[ej], letIx, depth + 1)
+    Call => {
+      const ej = dstPinElemFwdArg(u)
+      if ej >= 0 && ej < n.callArgs.length {
+        return dstPinElemIsAt(bodyIx, n.callArgs[ej], letIx, depth + 1)
+      }
     }
+    // No other expression is a way down a list level.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -2094,28 +2124,32 @@ function dstPinLocalDest(
   outT: i32[],
 ) {
   const n = P.nodes[ix]
-  if n is BinExpr {
-    if n.binOp == "=" {
-      const tg = P.nodes[unwrapParen(n.binLeft)]
-      if tg is Ident {
-        const lli = parentLetOf(bodyIx, tg.identName)
-        if lli >= 0 {
-          const ld = P.nodes[lli]
-          if ld is LetDecl {
-            dstPinPushAnn(ld.letType, n.binRight, bodyIx, letIx, outN, outT)
+  match n {
+    BinExpr => {
+      if n.binOp == "=" {
+        const tg = P.nodes[unwrapParen(n.binLeft)]
+        if tg is Ident {
+          const lli = parentLetOf(bodyIx, tg.identName)
+          if lli >= 0 {
+            const ld = P.nodes[lli]
+            if ld is LetDecl {
+              dstPinPushAnn(ld.letType, n.binRight, bodyIx, letIx, outN, outT)
+            }
           }
         }
       }
     }
-  }
-  if n is LetDecl {
-    // An un-annotated binding is a link in the chain, not a destination: `retLocalLetOfBlock`
-    // walks through it to the binding that supplies the value, so recording it would push ""
-    // and veto the pin the link exists to carry. The assignment arm above is deliberately not
-    // symmetric — an un-annotated `o` is already committed by its own literal initializer.
-    if ix != letIx && n.letType >= 0 {
-      dstPinPushAnn(n.letType, n.letInit, bodyIx, letIx, outN, outT)
+    LetDecl => {
+      // An un-annotated binding is a link in the chain, not a destination: `retLocalLetOfBlock`
+      // walks through it to the binding that supplies the value, so recording it would push ""
+      // and veto the pin the link exists to carry. The assignment arm above is deliberately not
+      // symmetric — an un-annotated `o` is already committed by its own literal initializer.
+      if ix != letIx && n.letType >= 0 {
+        dstPinPushAnn(n.letType, n.letInit, bodyIx, letIx, outN, outT)
+      }
     }
+    // No other node is a destination.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -2314,49 +2348,54 @@ function alcCommitName(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): string {
   if ex < 0 { return "" }
   if depth > 4 { return "" }
   const u = unwrapParen(ex)
+  if u < 0 { return "" }
   const n = P.nodes[u]
-  if n is Ident {
-    const lli = parentLetOf(bodyIx, n.identName)
-    if lli >= 0 {
-      const ld = P.nodes[lli]
-      if ld is LetDecl {
-        if ld.letType >= 0 { return tyNameOf(ld.letType) }
-        // An un-annotated binding is a link in the chain, not the end of it —
-        // `dstPinLocalDest`'s rule, shared through `retLocalLetOfBlock`: the alias re-names a
-        // value, it does not re-rep one.
-        return alcCommitName(ld.letInit, bodyIx, fnIx, depth + 1)
+  match n {
+    Ident => {
+      const lli = parentLetOf(bodyIx, n.identName)
+      if lli >= 0 {
+        const ld = P.nodes[lli]
+        if ld is LetDecl {
+          if ld.letType >= 0 { return tyNameOf(ld.letType) }
+          // An un-annotated binding is a link in the chain, not the end of it —
+          // `dstPinLocalDest`'s rule, shared through `retLocalLetOfBlock`: the alias re-names a
+          // value, it does not re-rep one.
+          return alcCommitName(ld.letInit, bodyIx, fnIx, depth + 1)
+        }
+        return ""
+      }
+      const pn = alcParamAnnName(fnIx, n.identName)
+      if pn != "" { return pn }
+      const gli = globalLetOf(n.identName)
+      if gli >= 0 {
+        const gd = P.nodes[gli]
+        if gd is LetDecl {
+          if gd.letType >= 0 { return tyNameOf(gd.letType) }
+        }
       }
       return ""
     }
-    const pn = alcParamAnnName(fnIx, n.identName)
-    if pn != "" { return pn }
-    const gli = globalLetOf(n.identName)
-    if gli >= 0 {
-      const gd = P.nodes[gli]
-      if gd is LetDecl {
-        if gd.letType >= 0 { return tyNameOf(gd.letType) }
-      }
-    }
-    return ""
-  }
-  if n is Call {
-    const cf = P.nodes[unwrapParen(n.callFn)]
-    if cf is Ident {
-      const cfe = fnIndexOfNode(unwrapParen(n.callFn))
-      if cfe >= 0 && cfe < fnStmts.length {
-        const cix = fnStmts[cfe]
-        const cfn = P.nodes[cix]
-        if cfn is FuncDecl {
-          // A declared result is the commitment; nothing inside the callee can overrule the
-          // claim it makes about its own result.
-          if cfn.fnRet >= 0 { return tyNameOf(cfn.fnRet) }
-          const crx = fnRetExprOf(cix)
-          if crx < 0 { return "" }
-          return alcCommitName(crx, cfn.fnBody, cix, depth + 1)
+    Call => {
+      const cf = P.nodes[unwrapParen(n.callFn)]
+      if cf is Ident {
+        const cfe = fnIndexOfNode(unwrapParen(n.callFn))
+        if cfe >= 0 && cfe < fnStmts.length {
+          const cix = fnStmts[cfe]
+          const cfn = P.nodes[cix]
+          if cfn is FuncDecl {
+            // A declared result is the commitment; nothing inside the callee can overrule the
+            // claim it makes about its own result.
+            if cfn.fnRet >= 0 { return tyNameOf(cfn.fnRet) }
+            const crx = fnRetExprOf(cix)
+            if crx < 0 { return "" }
+            return alcCommitName(crx, cfn.fnBody, cix, depth + 1)
+          }
         }
       }
+      return ""
     }
-    return ""
+    // No other expression commits to a name.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   ""
 }
@@ -3141,167 +3180,173 @@ function subtreeLo(ix: i32): i32 {
 function liftFnsInExpr(ix: i32, parent: i32) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
-  if n is FuncDecl {
-    if n.fnName == "" {
-      n.fnName = "__lambda_" + i32ToStr(lambdaCtr)
-      lambdaCtr = lambdaCtr + 1
-      // The one in-place `fnName` write that lands after the node is already in the arena, and
-      // `emit_base.nameNamesFunction` folds the arena incrementally, so it may already have read
-      // this node as the anonymous "" it holds until now. The only names this write can add are
-      // `__lambda_<n>`, which nothing asks about today; it is here for the day something can.
-      noteFuncName(n.fnName)
-      // An in-place name write (`compiler/symbols.vl`): `fnIndexOfSid`'s dense array is keyed by
-      // the carrier and `buildFnMap` interns `s.fnName` for every lifted function, so a stale
-      // carrier slot here would key the lambda's row under the anonymous "" it replaced.
-      sidNoteNodeName(ix, ix)
-    }
-    fnStmts.push(ix)
-    fnParent.push(parent)
-    fnDispNames.push("")
-    fnValUsed = true
-    fnNestUsed = true
-    return 0
-  }
-  if n is Block {
-    const stmts = n.blkStmts
-    let i = 0
-    while i < stmts.length {
-      const before = fnStmts.length
-      const sn = P.nodes[stmts[i]]
-      let named = false
-      if sn is FuncDecl { named = sn.fnName != "" }
-      liftFnsInExpr(stmts[i], parent)
-      if named && fnStmts.length > before {
-        const fsid = sidOfNode(stmts[i])
-        // A copy the split plan placed after its source stands in the block where the source
-        // does, since its own nodes lie past the root (D5971).
-        let at = i
-        while at > 0 && fsMinted(stmts[at]) { at = at - 1 }
-        lfNoteBlockLocal(before, fsid, subtreeLo(stmts[at]), stmts[at], ix)
+  match n {
+    FuncDecl => {
+      if n.fnName == "" {
+        n.fnName = "__lambda_" + i32ToStr(lambdaCtr)
+        lambdaCtr = lambdaCtr + 1
+        // The one in-place `fnName` write that lands after the node is already in the arena, and
+        // `emit_base.nameNamesFunction` folds the arena incrementally, so it may already have read
+        // this node as the anonymous "" it holds until now. The only names this write can add are
+        // `__lambda_<n>`, which nothing asks about today; it is here for the day something can.
+        noteFuncName(n.fnName)
+        // An in-place name write (`compiler/symbols.vl`): `fnIndexOfSid`'s dense array is keyed by
+        // the carrier and `buildFnMap` interns `s.fnName` for every lifted function, so a stale
+        // carrier slot here would key the lambda's row under the anonymous "" it replaced.
+        sidNoteNodeName(ix, ix)
       }
-      i = i + 1
+      fnStmts.push(ix)
+      fnParent.push(parent)
+      fnDispNames.push("")
+      fnValUsed = true
+      fnNestUsed = true
+      return 0
     }
-    return 0
-  }
-  if n is LetDecl {
-    if n.letInit >= 0 {
-      const before = fnStmts.length
-      liftFnsInExpr(n.letInit, parent)
-      recordLambdaDispName(before, n.letInit, n.letName)
+    Block => {
+      const stmts = n.blkStmts
+      let i = 0
+      while i < stmts.length {
+        const before = fnStmts.length
+        const sn = P.nodes[stmts[i]]
+        let named = false
+        if sn is FuncDecl { named = sn.fnName != "" }
+        liftFnsInExpr(stmts[i], parent)
+        if named && fnStmts.length > before {
+          const fsid = sidOfNode(stmts[i])
+          // A copy the split plan placed after its source stands in the block where the source
+          // does, since its own nodes lie past the root (D5971).
+          let at = i
+          while at > 0 && fsMinted(stmts[at]) { at = at - 1 }
+          lfNoteBlockLocal(before, fsid, subtreeLo(stmts[at]), stmts[at], ix)
+        }
+        i = i + 1
+      }
+      return 0
     }
-    return 0
-  }
-  if n is RetStmt {
-    if n.retArg >= 0 { liftFnsInExpr(n.retArg, parent) }
-    return 0
-  }
-  if n is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-    let cur = ix
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        liftFnsInExpr(c.ifCond, parent)
-        liftFnsInExpr(c.ifThen, parent)
-        if c.ifElse >= 0 {
-          if P.nodes[c.ifElse] is IfStmt {
-            cur = c.ifElse
-          } else {
-            liftFnsInExpr(c.ifElse, parent)
+    LetDecl => {
+      if n.letInit >= 0 {
+        const before = fnStmts.length
+        liftFnsInExpr(n.letInit, parent)
+        recordLambdaDispName(before, n.letInit, n.letName)
+      }
+      return 0
+    }
+    RetStmt => {
+      if n.retArg >= 0 { liftFnsInExpr(n.retArg, parent) }
+      return 0
+    }
+    IfStmt => {
+      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+      let cur = ix
+      while cur >= 0 {
+        const c = P.nodes[cur]
+        cur = -1
+        if c is IfStmt {
+          liftFnsInExpr(c.ifCond, parent)
+          liftFnsInExpr(c.ifThen, parent)
+          if c.ifElse >= 0 {
+            if P.nodes[c.ifElse] is IfStmt {
+              cur = c.ifElse
+            } else {
+              liftFnsInExpr(c.ifElse, parent)
+            }
           }
         }
       }
+      return 0
     }
-    return 0
-  }
-  if n is WhileStmt {
-    liftFnsInExpr(n.whileCond, parent)
-    liftFnsInExpr(n.whileBody, parent)
-    return 0
-  }
-  if n is ForRange {
-    liftFnsInExpr(n.frFrom, parent)
-    liftFnsInExpr(n.frTo, parent)
-    if n.frStep >= 0 { liftFnsInExpr(n.frStep, parent) }
-    liftFnsInExpr(n.frBody, parent)
-    return 0
-  }
-  if n is ForIn {
-    liftFnsInExpr(n.fiIter, parent)
-    liftFnsInExpr(n.fiBody, parent)
-    return 0
-  }
-  if n is Call {
-    liftFnsInExpr(n.callFn, parent)
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      liftFnsInExpr(args[i], parent)
-      i = i + 1
+    WhileStmt => {
+      liftFnsInExpr(n.whileCond, parent)
+      liftFnsInExpr(n.whileBody, parent)
+      return 0
     }
-    return 0
-  }
-  if n is BinExpr {
-    liftFnsInExpr(n.binLeft, parent)
-    liftFnsInExpr(n.binRight, parent)
-    return 0
-  }
-  if n is Unary {
-    liftFnsInExpr(n.unArg, parent)
-    return 0
-  }
-  if n is Paren {
-    liftFnsInExpr(n.parInner, parent)
-    return 0
-  }
-  // The operand-carrying node kinds this walk must enter (D1085): each wraps an ordinary
-  // expression that may hold a function literal, and a literal this walk does not reach is never
-  // pushed to `fnStmts`. `MatchExpr` is absent because `match` desugars into `IfStmt`/`Block`.
-  if n is AsExpr {
-    liftFnsInExpr(n.asObj, parent)
-    return 0
-  }
-  if n is IsExpr {
-    liftFnsInExpr(n.isObj, parent)
-    return 0
-  }
-  if n is Member {
-    liftFnsInExpr(n.memObj, parent)
-    return 0
-  }
-  // A `?.` RECEIVER, walked like the `.` one above: only the standalone `?.` value path
-  // requires a re-readable receiver, so a call — and a lambda argument inside it — reaches
-  // the null-test lowering, and an unlifted literal there refuses (D1667).
-  if n is OptMember {
-    liftFnsInExpr(n.omObj, parent)
-    return 0
-  }
-  if n is Index {
-    liftFnsInExpr(n.idxArr, parent)
-    liftFnsInExpr(n.idxIndex, parent)
-    return 0
-  }
-  if n is ObjLit {
-    const fields = n.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit { liftFnsInExpr(f.fiValue, parent) }
-      i = i + 1
+    ForRange => {
+      liftFnsInExpr(n.frFrom, parent)
+      liftFnsInExpr(n.frTo, parent)
+      if n.frStep >= 0 { liftFnsInExpr(n.frStep, parent) }
+      liftFnsInExpr(n.frBody, parent)
+      return 0
     }
-    return 0
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread { return liftFnsInExpr(n.spdArg, parent) }
-  if n is ArrayLit {
-    const elems = n.arrElems
-    let i = 0
-    while i < elems.length {
-      liftFnsInExpr(elems[i], parent)
-      i = i + 1
+    ForIn => {
+      liftFnsInExpr(n.fiIter, parent)
+      liftFnsInExpr(n.fiBody, parent)
+      return 0
     }
-    return 0
+    Call => {
+      liftFnsInExpr(n.callFn, parent)
+      const args = n.callArgs
+      let i = 0
+      while i < args.length {
+        liftFnsInExpr(args[i], parent)
+        i = i + 1
+      }
+      return 0
+    }
+    BinExpr => {
+      liftFnsInExpr(n.binLeft, parent)
+      liftFnsInExpr(n.binRight, parent)
+      return 0
+    }
+    Unary => {
+      liftFnsInExpr(n.unArg, parent)
+      return 0
+    }
+    Paren => {
+      liftFnsInExpr(n.parInner, parent)
+      return 0
+    }
+    // The operand-carrying node kinds this walk must enter (D1085): each wraps an ordinary
+    // expression that may hold a function literal, and a literal this walk does not reach is never
+    // pushed to `fnStmts`. `MatchExpr` is absent because `match` desugars into `IfStmt`/`Block`.
+    AsExpr => {
+      liftFnsInExpr(n.asObj, parent)
+      return 0
+    }
+    IsExpr => {
+      liftFnsInExpr(n.isObj, parent)
+      return 0
+    }
+    Member => {
+      liftFnsInExpr(n.memObj, parent)
+      return 0
+    }
+    // A `?.` RECEIVER, walked like the `.` one above: only the standalone `?.` value path
+    // requires a re-readable receiver, so a call — and a lambda argument inside it — reaches
+    // the null-test lowering, and an unlifted literal there refuses (D1667).
+    OptMember => {
+      liftFnsInExpr(n.omObj, parent)
+      return 0
+    }
+    Index => {
+      liftFnsInExpr(n.idxArr, parent)
+      liftFnsInExpr(n.idxIndex, parent)
+      return 0
+    }
+    ObjLit => {
+      const fields = n.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit { liftFnsInExpr(f.fiValue, parent) }
+        i = i + 1
+      }
+      return 0
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return liftFnsInExpr(n.spdArg, parent)
+    }
+    ArrayLit => {
+      const elems = n.arrElems
+      let i = 0
+      while i < elems.length {
+        liftFnsInExpr(elems[i], parent)
+        i = i + 1
+      }
+      return 0
+    }
+    // No other node holds an expression a function literal can sit in.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   0
 }
@@ -3797,26 +3842,28 @@ export function computeRetInference() {
           const savedCapNarrow = capNarrowSeed(i)
           const fnb = P.nodes[fnStmts[i]]
           if fnb is FuncDecl {
-            const fb = P.nodes[fnb.fnBody]
-            if fb is Block {
-              const fbs = fb.blkStmts
-              if fbs.length > 0 {
-                const tailIx = fbs[fbs.length - 1]
-                // A value-yielding member call (`xs.map(…)`) is the tail `computeVoidFns` kept
-                // non-void, so it types the result as `return xs.map(…)` would (D2566).
-                if (
-                  stmtIsTailValue(tailIx, fnStmts[i])
-                  || memberCallYieldsValue(tailIx)
-                ) {
-                  criClassify(tailIx, i)
-                } else {
-                  // A tail value-`if` is not a `stmtIsTailValue` — that predicate has no
-                  // `IfStmt` case — so a named function's inferred struct return through an
-                  // if-join went unclassified. Classify the whole `if` here; `exprStruct` and
-                  // `exprString` see through it and pick up the join's ref.
-                  const tn = P.nodes[tailIx]
-                  if tn is IfStmt {
-                    if tn.ifElse >= 0 { criClassify(tailIx, i) }
+            if fnb.fnBody >= 0 {
+              const fb = P.nodes[fnb.fnBody]
+              if fb is Block {
+                const fbs = fb.blkStmts
+                if fbs.length > 0 {
+                  const tailIx = fbs[fbs.length - 1]
+                  // A value-yielding member call (`xs.map(…)`) is the tail `computeVoidFns` kept
+                  // non-void, so it types the result as `return xs.map(…)` would (D2566).
+                  if (
+                    stmtIsTailValue(tailIx, fnStmts[i])
+                    || memberCallYieldsValue(tailIx)
+                  ) {
+                    criClassify(tailIx, i)
+                  } else {
+                    // A tail value-`if` is not a `stmtIsTailValue` — that predicate has no
+                    // `IfStmt` case — so a named function's inferred struct return through an
+                    // if-join went unclassified. Classify the whole `if` here; `exprStruct` and
+                    // `exprString` see through it and pick up the join's ref.
+                    const tn = P.nodes[tailIx]
+                    if tn is IfStmt {
+                      if tn.ifElse >= 0 { criClassify(tailIx, i) }
+                    }
                   }
                 }
               }
@@ -3967,7 +4014,9 @@ export function declareForInLocals(s: ForIn, fnIx: i32) {
   // element, and a literal-union-keyed MAP, whose bare walk yields its keys. Flagged so the
   // var is recognized as an atom at print widening, `==` and member compare — a loop var is
   // the one storage class `exprNulLitUnion` cannot reach, having no `LetDecl` (D1748).
-  if forInVarIsLitAtom(s.fiIter, fnIx, fiEk) { localLitUnion[fiSlot] = 1 }
+  if forInVarIsLitAtom(s.fiIter, fnIx, fiEk) && fiSlot >= 0 {
+    localLitUnion[fiSlot] = 1
+  }
   markLoopVarIter(fiSlot, s.fiIter)
   scopeBind(s.fiVar, fiSlot)
   addLocalName(s.fiVar + "#i", "i32", -1)
@@ -4102,13 +4151,13 @@ function letLocalSlot(stmtIx: i32, s: LetDecl, fnIx: i32) {
     // as value-union variants; and before `letIsString`, whose `string`-subtype checker
     // type would else pick the kind-3 ref slot and store the atom into a `(ref $array)`.
     slot = addLocalName(s.letName, "i32", -1)
-    localLitUnion[slot] = 1
+    if slot >= 0 { localLitUnion[slot] = 1 }
   } else if letNulLitUnion(stmtIx, fnIx) {
     // A `K | null` niche local (kind 0, plain i32): atom ids >= 0 with the spare `-1` for
     // null. Before `letIsNulString`, since a litunion softens to `string`. Marked
     // `localLitUnion` so reads widen as atoms; the write path seeds `-1` for a `null`.
     slot = addLocalName(s.letName, "i32", -1)
-    localLitUnion[slot] = 1
+    if slot >= 0 { localLitUnion[slot] = 1 }
   } else if letInitJoinsToUnionBox(stmtIx, fnIx) {
     // A `??` whose nullable-ref operand JOINS with a default of another type: the result
     // is the union box, so the slot is the box. Ahead of every arm below, which read the
@@ -4453,6 +4502,7 @@ export function collectLocals(blockIx: i32, fnIx: i32) {
 function collectIfExprLocals(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const bare = unwrapParen(exprIx)
+  if bare < 0 { return 0 }
   const n = P.nodes[bare]
   if n is IfStmt { return collectLocalsIf(bare, fnIx) }
   if !exprArmLocalsAny { return 0 }
@@ -4966,19 +5016,23 @@ function checkExprI32(exprIx: i32) {
     return emitFail("emitProgram: missing local initializer expression")
   }
   const e = P.nodes[exprIx]
-  if e is StrLit {
-    return emitFail("emitProgram: only i32 locals are supported")
-  }
-  if e is NumLit {
-    // A float literal carries a "." in its lexeme — out of scope (i32 only).
-    let i = 0
-    while i < e.numText.length {
-      if e.numText[i] == '.' {
-        return emitFail("emitProgram: only i32 locals are supported")
-      }
-      i = i + 1
+  match e {
+    StrLit => {
+      return emitFail("emitProgram: only i32 locals are supported")
     }
-    return 0
+    NumLit => {
+      // A float literal carries a "." in its lexeme — out of scope (i32 only).
+      let i = 0
+      while i < e.numText.length {
+        if e.numText[i] == '.' {
+          return emitFail("emitProgram: only i32 locals are supported")
+        }
+        i = i + 1
+      }
+      return 0
+    }
+    // Every other initializer is i32 as far as this check sees.
+    CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -4995,7 +5049,7 @@ export function collectRefPushSlots(blockIx: i32, fnIx: i32) {
     while i < stmts.length {
       if callIsPushKind(stmts[i], fnIx, "ref") {
         const s = P.nodes[stmts[i]]
-        if s is Call {
+        if s is Call && s.callFn >= 0 {
           const callee = P.nodes[s.callFn]
           if callee is Member {
             recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
@@ -5069,69 +5123,91 @@ function collectRefPushSlotsIf(ifIx: i32, fnIx: i32) {
 export function collectMemberPopRefSlotsExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
-  if e is Call {
-    // D1592 — a ref-list `.push` in value position needs the same typed frame as the `.pop`
-    // beside it. `fnUsesRefPush` is inert in `fbBeginFunc`, where ref frames come from
-    // `fnRefPushSlots`, so teaching only the kind bits reserves nothing here.
-    if (
-      callIsMemberPopKind(exprIx, fnIx, "ref")
-      || callIsPushKind(exprIx, fnIx, "ref")
-    ) {
-      const callee = P.nodes[e.callFn]
-      if callee is Member {
-        recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
-        recordFitPushSlot(callee.memObj)
+  match e {
+    Call => {
+      // D1592 — a ref-list `.push` in value position needs the same typed frame as the `.pop`
+      // beside it. `fnUsesRefPush` is inert in `fbBeginFunc`, where ref frames come from
+      // `fnRefPushSlots`, so teaching only the kind bits reserves nothing here.
+      if (
+        callIsMemberPopKind(exprIx, fnIx, "ref")
+        || callIsPushKind(exprIx, fnIx, "ref")
+      ) {
+        if e.callFn >= 0 {
+          const callee = P.nodes[e.callFn]
+          if callee is Member {
+            recordRefPushSlot(refListSlotOfExpr(callee.memObj, fnIx))
+            recordFitPushSlot(callee.memObj)
+          }
+        }
       }
+      const args = e.callArgs
+      let i = 0
+      while i < args.length {
+        collectMemberPopRefSlotsExpr(args[i], fnIx)
+        i = i + 1
+      }
+      return 0
     }
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      collectMemberPopRefSlotsExpr(args[i], fnIx)
-      i = i + 1
+    BinExpr => {
+      collectMemberPopRefSlotsExpr(e.binLeft, fnIx)
+      collectMemberPopRefSlotsExpr(e.binRight, fnIx)
+      return 0
     }
-    return 0
-  }
-  if e is BinExpr {
-    collectMemberPopRefSlotsExpr(e.binLeft, fnIx)
-    collectMemberPopRefSlotsExpr(e.binRight, fnIx)
-    return 0
-  }
-  if e is Member { return collectMemberPopRefSlotsExpr(e.memObj, fnIx) }
-  if e is OptMember { return collectMemberPopRefSlotsExpr(e.omObj, fnIx) }
-  if e is Index {
-    collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
-    collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
-    return 0
-  }
-  if e is Unary { return collectMemberPopRefSlotsExpr(e.unArg, fnIx) }
-  if e is Paren { return collectMemberPopRefSlotsExpr(e.parInner, fnIx) }
-  // The node set below is the one `exprHasScratch` (emit_query.vl) carries: a ref-list
-  // `.pop` in an `is` guard, an `as` operand, an array-literal element, an object-literal field
-  // value or an if-expression arm records its slot here. `fnUsesRefPush` is inert in
-  // `fbBeginFunc`, so without this the frame is never reserved and the build fails.
-  if e is IsExpr { return collectMemberPopRefSlotsExpr(e.isObj, fnIx) }
-  if e is AsExpr { return collectMemberPopRefSlotsExpr(e.asObj, fnIx) }
-  if e is IfStmt { return collectMemberPopRefSlotsIf(exprIx, fnIx) }
-  if e is ObjLit {
-    const fs = e.objFields
-    let fi = 0
-    while fi < fs.length {
-      const f = P.nodes[fs[fi]]
-      if f is FieldInit { collectMemberPopRefSlotsExpr(f.fiValue, fnIx) }
-      fi = fi + 1
+    Member => {
+      return collectMemberPopRefSlotsExpr(e.memObj, fnIx)
     }
-    return 0
-  }
-  // A spread's source is an operand like any other (D2334).
-  if e is Spread { return collectMemberPopRefSlotsExpr(e.spdArg, fnIx) }
-  if e is ArrayLit {
-    const es = e.arrElems
-    let ei = 0
-    while ei < es.length {
-      collectMemberPopRefSlotsExpr(es[ei], fnIx)
-      ei = ei + 1
+    OptMember => {
+      return collectMemberPopRefSlotsExpr(e.omObj, fnIx)
     }
-    return 0
+    Index => {
+      collectMemberPopRefSlotsExpr(e.idxArr, fnIx)
+      collectMemberPopRefSlotsExpr(e.idxIndex, fnIx)
+      return 0
+    }
+    Unary => {
+      return collectMemberPopRefSlotsExpr(e.unArg, fnIx)
+    }
+    Paren => {
+      return collectMemberPopRefSlotsExpr(e.parInner, fnIx)
+    }
+    // The node set below is the one `exprHasScratch` (emit_query.vl) carries: a ref-list
+    // `.pop` in an `is` guard, an `as` operand, an array-literal element, an object-literal field
+    // value or an if-expression arm records its slot here. `fnUsesRefPush` is inert in
+    // `fbBeginFunc`, so without this the frame is never reserved and the build fails.
+    IsExpr => {
+      return collectMemberPopRefSlotsExpr(e.isObj, fnIx)
+    }
+    AsExpr => {
+      return collectMemberPopRefSlotsExpr(e.asObj, fnIx)
+    }
+    IfStmt => {
+      return collectMemberPopRefSlotsIf(exprIx, fnIx)
+    }
+    ObjLit => {
+      const fs = e.objFields
+      let fi = 0
+      while fi < fs.length {
+        const f = P.nodes[fs[fi]]
+        if f is FieldInit { collectMemberPopRefSlotsExpr(f.fiValue, fnIx) }
+        fi = fi + 1
+      }
+      return 0
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return collectMemberPopRefSlotsExpr(e.spdArg, fnIx)
+    }
+    ArrayLit => {
+      const es = e.arrElems
+      let ei = 0
+      while ei < es.length {
+        collectMemberPopRefSlotsExpr(es[ei], fnIx)
+        ei = ei + 1
+      }
+      return 0
+    }
+    // No other node holds a value position a pop can sit in.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {}
   }
   0
 }
@@ -5438,67 +5514,87 @@ function leqScanExprHeld(exprIx: i32, fnIx: i32) {
 export function leqScanExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
-  if e is BinExpr {
-    if arithRegionSeen && e.binRegion != 0 && !bcOpen {
-      return leqScanExprHeld(exprIx, fnIx)
+  match e {
+    BinExpr => {
+      if arithRegionSeen && e.binRegion != 0 && !bcOpen {
+        return leqScanExprHeld(exprIx, fnIx)
+      }
+      // Both note functions claim only `==`, `!=` and `+`, and so does every classifier they
+      // ask, so a binary of any other operator reserves nothing. Read the operator once here
+      // rather than re-reading it inside each of the six — a new classifier that claims a
+      // fourth operator has to widen this gate with it.
+      if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
+        leqNoteBin(exprIx, fnIx)
+        cloEqNoteBin(exprIx, fnIx)
+      }
+      leqScanExpr(e.binLeft, fnIx)
+      return leqScanExpr(e.binRight, fnIx)
     }
-    // Both note functions claim only `==`, `!=` and `+`, and so does every classifier they
-    // ask, so a binary of any other operator reserves nothing. Read the operator once here
-    // rather than re-reading it inside each of the six — a new classifier that claims a
-    // fourth operator has to widen this gate with it.
-    if e.binOp == "==" || e.binOp == "!=" || e.binOp == "+" {
-      leqNoteBin(exprIx, fnIx)
-      cloEqNoteBin(exprIx, fnIx)
+    Unary => {
+      return leqScanExpr(e.unArg, fnIx)
     }
-    leqScanExpr(e.binLeft, fnIx)
-    return leqScanExpr(e.binRight, fnIx)
-  }
-  if e is Unary { return leqScanExpr(e.unArg, fnIx) }
-  if e is Paren { return leqScanExpr(e.parInner, fnIx) }
-  if e is Call {
-    leqScanExpr(e.callFn, fnIx)
-    const args = e.callArgs
-    let i = 0
-    while i < args.length {
-      leqScanExpr(args[i], fnIx)
-      i = i + 1
+    Paren => {
+      return leqScanExpr(e.parInner, fnIx)
     }
-    return 0
-  }
-  if e is Member { return leqScanExpr(e.memObj, fnIx) }
-  if e is OptMember { return leqScanExpr(e.omObj, fnIx) }
-  if e is Index {
-    leqScanExpr(e.idxArr, fnIx)
-    return leqScanExpr(e.idxIndex, fnIx)
-  }
-  if e is ArrayLit {
-    const es = e.arrElems
-    let i2 = 0
-    while i2 < es.length {
-      leqScanExpr(es[i2], fnIx)
-      i2 = i2 + 1
+    Call => {
+      leqScanExpr(e.callFn, fnIx)
+      const args = e.callArgs
+      let i = 0
+      while i < args.length {
+        leqScanExpr(args[i], fnIx)
+        i = i + 1
+      }
+      return 0
     }
-    return 0
-  }
-  if e is ObjLit {
-    const fs = e.objFields
-    let i3 = 0
-    while i3 < fs.length {
-      const f = P.nodes[fs[i3]]
-      if f is FieldInit { leqScanExpr(f.fiValue, fnIx) }
-      i3 = i3 + 1
+    Member => {
+      return leqScanExpr(e.memObj, fnIx)
     }
-    return 0
+    OptMember => {
+      return leqScanExpr(e.omObj, fnIx)
+    }
+    Index => {
+      leqScanExpr(e.idxArr, fnIx)
+      return leqScanExpr(e.idxIndex, fnIx)
+    }
+    ArrayLit => {
+      const es = e.arrElems
+      let i2 = 0
+      while i2 < es.length {
+        leqScanExpr(es[i2], fnIx)
+        i2 = i2 + 1
+      }
+      return 0
+    }
+    ObjLit => {
+      const fs = e.objFields
+      let i3 = 0
+      while i3 < fs.length {
+        const f = P.nodes[fs[i3]]
+        if f is FieldInit { leqScanExpr(f.fiValue, fnIx) }
+        i3 = i3 + 1
+      }
+      return 0
+    }
+    IsExpr => {
+      return leqScanExpr(e.isObj, fnIx)
+    }
+    AsExpr => {
+      return leqScanExpr(e.asObj, fnIx)
+    }
+    // A spread's source is lowered in this function's frame like any operand (D2334).
+    Spread => {
+      return leqScanExpr(e.spdArg, fnIx)
+    }
+    // An if-expression (`const b = if c { xs == ys } else { false }`) is an `IfStmt` node in a
+    // value slot, and `emitExpr` lowers its arms through the ordinary path, so a list `==`, `!=`
+    // or `+` in an arm stages operands in `leqIScratchBase` / `leqSScratchBase`. Hand it to the
+    // statement walker, which already covers the condition and both arms.
+    IfStmt => {
+      return leqScanStmt(exprIx, fnIx)
+    }
+    // No other node holds an operand that can stage a list compare.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {}
   }
-  if e is IsExpr { return leqScanExpr(e.isObj, fnIx) }
-  if e is AsExpr { return leqScanExpr(e.asObj, fnIx) }
-  // A spread's source is lowered in this function's frame like any operand (D2334).
-  if e is Spread { return leqScanExpr(e.spdArg, fnIx) }
-  // An if-expression (`const b = if c { xs == ys } else { false }`) is an `IfStmt` node in a
-  // value slot, and `emitExpr` lowers its arms through the ordinary path, so a list `==`, `!=`
-  // or `+` in an arm stages operands in `leqIScratchBase` / `leqSScratchBase`. Hand it to the
-  // statement walker, which already covers the condition and both arms.
-  if e is IfStmt { return leqScanStmt(exprIx, fnIx) }
   0
 }
 
@@ -5507,41 +5603,51 @@ export function leqScanExpr(exprIx: i32, fnIx: i32) {
 export function leqScanStmt(stmtIx: i32, fnIx: i32) {
   if stmtIx < 0 { return 0 }
   const s = P.nodes[stmtIx]
-  if s is LetDecl { return leqScanExpr(s.letInit, fnIx) }
-  if s is RetStmt { return leqScanExpr(s.retArg, fnIx) }
-  if s is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-    let cur = stmtIx
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        leqScanExpr(c.ifCond, fnIx)
-        leqScanBlock(c.ifThen, fnIx)
-        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
-          cur = c.ifElse
-        } else {
-          return leqScanBlock(c.ifElse, fnIx)
+  match s {
+    LetDecl => {
+      return leqScanExpr(s.letInit, fnIx)
+    }
+    RetStmt => {
+      return leqScanExpr(s.retArg, fnIx)
+    }
+    IfStmt => {
+      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+      let cur = stmtIx
+      while cur >= 0 {
+        const c = P.nodes[cur]
+        cur = -1
+        if c is IfStmt {
+          leqScanExpr(c.ifCond, fnIx)
+          leqScanBlock(c.ifThen, fnIx)
+          if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+            cur = c.ifElse
+          } else {
+            return leqScanBlock(c.ifElse, fnIx)
+          }
         }
       }
+      return 0
     }
-    return 0
+    WhileStmt => {
+      leqScanExpr(s.whileCond, fnIx)
+      return leqScanBlock(s.whileBody, fnIx)
+    }
+    ForRange => {
+      leqScanExpr(s.frFrom, fnIx)
+      leqScanExpr(s.frTo, fnIx)
+      leqScanExpr(s.frStep, fnIx)
+      return leqScanBlock(s.frBody, fnIx)
+    }
+    ForIn => {
+      leqScanExpr(s.fiIter, fnIx)
+      return leqScanBlock(s.fiBody, fnIx)
+    }
+    Block => {
+      return leqScanBlock(stmtIx, fnIx)
+    }
+    // Every other node is an expression, scanned below.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
-  if s is WhileStmt {
-    leqScanExpr(s.whileCond, fnIx)
-    return leqScanBlock(s.whileBody, fnIx)
-  }
-  if s is ForRange {
-    leqScanExpr(s.frFrom, fnIx)
-    leqScanExpr(s.frTo, fnIx)
-    leqScanExpr(s.frStep, fnIx)
-    return leqScanBlock(s.frBody, fnIx)
-  }
-  if s is ForIn {
-    leqScanExpr(s.fiIter, fnIx)
-    return leqScanBlock(s.fiBody, fnIx)
-  }
-  if s is Block { return leqScanBlock(stmtIx, fnIx) }
   leqScanExpr(stmtIx, fnIx)
 }
 
@@ -5567,163 +5673,179 @@ export function leqScanBlock(ix: i32, fnIx: i32) {
 export function mfScan(ix: i32, fnIx: i32) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
-  if n is Call {
-    const callee = P.nodes[n.callFn]
-    if callee is Member {
-      if callee.memProp == "map" || callee.memProp == "filter" {
-        if n.callArgs.length == 1 {
-          const rk = mfRecvKindOf(callee.memObj, fnIx)
-          if rk != null {
-            fnUsesMapFilter = true
-            let slot = -1
-            if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
-            mfRecordSrc(rk, slot)
-            const resK = mfResultKindOf(ix, fnIx)
-            if resK != null { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
+  match n {
+    Call => {
+      if n.callFn >= 0 {
+        const callee = P.nodes[n.callFn]
+        if callee is Member {
+          if callee.memProp == "map" || callee.memProp == "filter" {
+            if n.callArgs.length == 1 {
+              const rk = mfRecvKindOf(callee.memObj, fnIx)
+              if rk != null {
+                fnUsesMapFilter = true
+                let slot = -1
+                if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+                mfRecordSrc(rk, slot)
+                const resK = mfResultKindOf(ix, fnIx)
+                if resK != null { mfRecordDst(resK, mfResultSlotOf(ix, fnIx)) }
+              }
+            }
+          }
+          // `xs.slice(start, end?)` builds a new list of the same element type, so it reserves the
+          // same source wrapper and destination backing scratch locals a `.filter` does.
+          // `emitArrSlice` reads the source through `srcL` and writes the range into a fresh `dstL`.
+          if callee.memProp == "slice" {
+            if n.callArgs.length == 1 || n.callArgs.length == 2 {
+              const rk = mfRecvKindOf(callee.memObj, fnIx)
+              if rk != null {
+                fnUsesMapFilter = true
+                let slot = -1
+                if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
+                mfRecordSrc(rk, slot)
+                mfRecordDst(rk, slot)
+              }
+            }
+          }
+          // `m.keys()` builds a fresh LIVE-key string list — reserve its 6-slot frame.
+          if callee.memProp == "keys" {
+            if exprMap(callee.memObj, fnIx) { fnUsesMapKeys = true }
+          }
+          // `m.values()` builds a fresh live-value list. A mono map uses the self-contained
+          // `mapValsBase` frame; an mv-slot map uses its per-slot output backing (`mvValsOutBase`)
+          // plus the key-list frame for live, i, j and count.
+          if callee.memProp == "values" {
+            if exprMap(callee.memObj, fnIx) {
+              const vsh = mapShapeOfExpr(callee.memObj, fnIx)
+              if vsh == -1 {
+                fnUsesMapVals = true
+              } else if vsh == -4 || vsh == -6 {
+                // The i32-keyed map's values are the mono i32 list — the same self-contained
+                // `mapValsBase` frame the string-keyed mono map uses.
+                fnUsesMapVals = true
+              } else if vsh == -5 || vsh == -7 || vsh == -2 {
+                // A `Set`'s `.values()` are its keys, so the bound form is built by the key-list
+                // path and needs that frame, at either key rep. A Set's shape is neither the mono
+                // `-1` nor an mv slot, so the arms either side of this one both miss it.
+                fnUsesMapKeys = true
+              } else if vsh >= 0 {
+                fnUsesMapVals = true
+                fnUsesMapKeys = true
+              }
+            }
           }
         }
       }
-      // `xs.slice(start, end?)` builds a new list of the same element type, so it reserves the
-      // same source wrapper and destination backing scratch locals a `.filter` does.
-      // `emitArrSlice` reads the source through `srcL` and writes the range into a fresh `dstL`.
-      if callee.memProp == "slice" {
-        if n.callArgs.length == 1 || n.callArgs.length == 2 {
-          const rk = mfRecvKindOf(callee.memObj, fnIx)
-          if rk != null {
-            fnUsesMapFilter = true
-            let slot = -1
-            if rk == "ref" { slot = refListSlotOfExpr(callee.memObj, fnIx) }
-            mfRecordSrc(rk, slot)
-            mfRecordDst(rk, slot)
+      mfScan(n.callFn, fnIx)
+      const args = n.callArgs
+      let i = 0
+      while i < args.length {
+        mfScan(args[i], fnIx)
+        i = i + 1
+      }
+      return 0
+    }
+    Block => {
+      const stmts = n.blkStmts
+      let i = 0
+      while i < stmts.length {
+        mfScan(stmts[i], fnIx)
+        i = i + 1
+      }
+      return 0
+    }
+    LetDecl => {
+      if n.letInit >= 0 { mfScan(n.letInit, fnIx) }
+      return 0
+    }
+    RetStmt => {
+      if n.retArg >= 0 { mfScan(n.retArg, fnIx) }
+      return 0
+    }
+    IfStmt => {
+      // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
+      let cur = ix
+      while cur >= 0 {
+        const c = P.nodes[cur]
+        cur = -1
+        if c is IfStmt {
+          mfScan(c.ifCond, fnIx)
+          mfScan(c.ifThen, fnIx)
+          if c.ifElse >= 0 {
+            if P.nodes[c.ifElse] is IfStmt {
+              cur = c.ifElse
+            } else {
+              mfScan(c.ifElse, fnIx)
+            }
           }
         }
       }
-      // `m.keys()` builds a fresh LIVE-key string list — reserve its 6-slot frame.
-      if callee.memProp == "keys" {
-        if exprMap(callee.memObj, fnIx) { fnUsesMapKeys = true }
+      return 0
+    }
+    WhileStmt => {
+      mfScan(n.whileCond, fnIx)
+      mfScan(n.whileBody, fnIx)
+      return 0
+    }
+    ForRange => {
+      mfScan(n.frFrom, fnIx)
+      mfScan(n.frTo, fnIx)
+      if n.frStep >= 0 { mfScan(n.frStep, fnIx) }
+      mfScan(n.frBody, fnIx)
+      return 0
+    }
+    ForIn => {
+      mfScan(n.fiIter, fnIx)
+      mfScan(n.fiBody, fnIx)
+      return 0
+    }
+    BinExpr => {
+      mfScan(n.binLeft, fnIx)
+      mfScan(n.binRight, fnIx)
+      return 0
+    }
+    Unary => {
+      return mfScan(n.unArg, fnIx)
+    }
+    Paren => {
+      return mfScan(n.parInner, fnIx)
+    }
+    Member => {
+      return mfScan(n.memObj, fnIx)
+    }
+    // The `?.` receiver, walked like the `.` one above (D1667).
+    OptMember => {
+      return mfScan(n.omObj, fnIx)
+    }
+    Index => {
+      mfScan(n.idxArr, fnIx)
+      mfScan(n.idxIndex, fnIx)
+      return 0
+    }
+    ObjLit => {
+      const fields = n.objFields
+      let i = 0
+      while i < fields.length {
+        const f = P.nodes[fields[i]]
+        if f is FieldInit { mfScan(f.fiValue, fnIx) }
+        i = i + 1
       }
-      // `m.values()` builds a fresh live-value list. A mono map uses the self-contained
-      // `mapValsBase` frame; an mv-slot map uses its per-slot output backing (`mvValsOutBase`)
-      // plus the key-list frame for live, i, j and count.
-      if callee.memProp == "values" {
-        if exprMap(callee.memObj, fnIx) {
-          const vsh = mapShapeOfExpr(callee.memObj, fnIx)
-          if vsh == -1 {
-            fnUsesMapVals = true
-          } else if vsh == -4 || vsh == -6 {
-            // The i32-keyed map's values are the mono i32 list — the same self-contained
-            // `mapValsBase` frame the string-keyed mono map uses.
-            fnUsesMapVals = true
-          } else if vsh == -5 || vsh == -7 || vsh == -2 {
-            // A `Set`'s `.values()` are its keys, so the bound form is built by the key-list
-            // path and needs that frame, at either key rep. A Set's shape is neither the mono
-            // `-1` nor an mv slot, so the arms either side of this one both miss it.
-            fnUsesMapKeys = true
-          } else if vsh >= 0 {
-            fnUsesMapVals = true
-            fnUsesMapKeys = true
-          }
-        }
+      return 0
+    }
+    ArrayLit => {
+      const elems = n.arrElems
+      let i = 0
+      while i < elems.length {
+        mfScan(elems[i], fnIx)
+        i = i + 1
       }
+      return 0
     }
-    mfScan(n.callFn, fnIx)
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      mfScan(args[i], fnIx)
-      i = i + 1
+    Spread => {
+      return mfScan(n.spdArg, fnIx)
     }
-    return 0
+    // No other node holds a list builder.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl => {}
   }
-  if n is Block {
-    const stmts = n.blkStmts
-    let i = 0
-    while i < stmts.length {
-      mfScan(stmts[i], fnIx)
-      i = i + 1
-    }
-    return 0
-  }
-  if n is LetDecl {
-    if n.letInit >= 0 { mfScan(n.letInit, fnIx) }
-    return 0
-  }
-  if n is RetStmt {
-    if n.retArg >= 0 { mfScan(n.retArg, fnIx) }
-    return 0
-  }
-  if n is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-    let cur = ix
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        mfScan(c.ifCond, fnIx)
-        mfScan(c.ifThen, fnIx)
-        if c.ifElse >= 0 {
-          if P.nodes[c.ifElse] is IfStmt {
-            cur = c.ifElse
-          } else {
-            mfScan(c.ifElse, fnIx)
-          }
-        }
-      }
-    }
-    return 0
-  }
-  if n is WhileStmt {
-    mfScan(n.whileCond, fnIx)
-    mfScan(n.whileBody, fnIx)
-    return 0
-  }
-  if n is ForRange {
-    mfScan(n.frFrom, fnIx)
-    mfScan(n.frTo, fnIx)
-    if n.frStep >= 0 { mfScan(n.frStep, fnIx) }
-    mfScan(n.frBody, fnIx)
-    return 0
-  }
-  if n is ForIn {
-    mfScan(n.fiIter, fnIx)
-    mfScan(n.fiBody, fnIx)
-    return 0
-  }
-  if n is BinExpr {
-    mfScan(n.binLeft, fnIx)
-    mfScan(n.binRight, fnIx)
-    return 0
-  }
-  if n is Unary { return mfScan(n.unArg, fnIx) }
-  if n is Paren { return mfScan(n.parInner, fnIx) }
-  if n is Member { return mfScan(n.memObj, fnIx) }
-  // The `?.` receiver, walked like the `.` one above (D1667).
-  if n is OptMember { return mfScan(n.omObj, fnIx) }
-  if n is Index {
-    mfScan(n.idxArr, fnIx)
-    mfScan(n.idxIndex, fnIx)
-    return 0
-  }
-  if n is ObjLit {
-    const fields = n.objFields
-    let i = 0
-    while i < fields.length {
-      const f = P.nodes[fields[i]]
-      if f is FieldInit { mfScan(f.fiValue, fnIx) }
-      i = i + 1
-    }
-    return 0
-  }
-  if n is ArrayLit {
-    const elems = n.arrElems
-    let i = 0
-    while i < elems.length {
-      mfScan(elems[i], fnIx)
-      i = i + 1
-    }
-    return 0
-  }
-  if n is Spread { return mfScan(n.spdArg, fnIx) }
   0
 }
 
@@ -5763,6 +5885,7 @@ function mvSlotByValNameOrK(vn: string, keyK: i32): i32 {
 function rlMapElemValSlot(slot: i32, canon: boolean): i32 {
   const ar = rlElemMapValMvSlotAt(slot, true)
   if ar >= 0 { return ar }
+  if slot < 0 { return -1 }
   let en = rlElemName[slot]
   const enn = nulMapInnerName(en)
   if enn != "" { en = enn }
@@ -6291,7 +6414,7 @@ function mAssignMapValueStructs() {
   while mvi < mvValName.length {
     const mvRep = mvCanonRepOf(mvi)
     mvTwin.push(mvRep)
-    if mvRep < mvi {
+    if mvRep >= 0 && mvRep < mvi {
       const k6 = mvValKind[mvi]
       if (
         k6 == MVK_STRUCT
@@ -6873,7 +6996,7 @@ function arrNewFrameWalk(ix: i32, fnIx: i32) {
       collectHoleElemListPair(n.arrElems[0], fnIx)
     }
   }
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cf = P.nodes[n.callFn]
     if cf is Ident {
       if (
@@ -7551,60 +7674,62 @@ export function collectA(_stmts: i32[]) {
       // A `fromCodePoint(code)` call (H2) constructs a length-1 VL string — the shared
       // `(array i32)` heap type — so it forces `aUsed` just like a string literal, even
       // in a program with no other string. The callee is a bare `Ident`.
-      const cf = P.nodes[nd.callFn]
-      // `m.keys()` builds a fresh STRING list of the map's keys — force the string-list
-      // wrapper/backing (`mkListIdx`/`mkArrIdx`) + the shared `(array i32)`. `.keys()` is
-      // only valid on a map (checker-enforced), so any such call contributes the type.
-      if cf is Member {
-        if cf.memProp == "keys" {
-          slUsed = true
-          aUsed = true
+      if nd.callFn >= 0 {
+        const cf = P.nodes[nd.callFn]
+        // `m.keys()` builds a fresh STRING list of the map's keys — force the string-list
+        // wrapper/backing (`mkListIdx`/`mkArrIdx`) + the shared `(array i32)`. `.keys()` is
+        // only valid on a map (checker-enforced), so any such call contributes the type.
+        if cf is Member {
+          if cf.memProp == "keys" {
+            slUsed = true
+            aUsed = true
+          }
+          // A set's `.values()` is its keys list too, whatever produced the set.
+          if cf.memProp == "values" {
+            const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
+            if vss == -2 { slUsed = true }
+            if vss == -5 { lUsed = true }
+            if vss == -7 { ia64Used = true }
+            if vss != 0 { aUsed = true }
+          }
         }
-        // A set's `.values()` is its keys list too, whatever produced the set.
-        if cf.memProp == "values" {
-          const vss = setShapeOfTy(nodeTyIxOf(cf.memObj))
-          if vss == -2 { slUsed = true }
-          if vss == -5 { lUsed = true }
-          if vss == -7 { ia64Used = true }
-          if vss != 0 { aUsed = true }
-        }
-      }
-      // Gated on the shared vocabulary, so `collectANoteIdentRename` and this arm cannot
-      // disagree about which of the monomorphizer's in-place callee renames retires the
-      // resumable prefix.
-      if cf is Ident && collectACallIntrinsic(cf.identName) {
-        if cf.identName == "fromCodePoint" { aUsed = true }
-        // `fromCodePoints(xs)` builds a fresh string from an i32 list.
-        if cf.identName == "fromCodePoints" {
-          aUsed = true
-          lUsed = true
-        }
-        // An un-annotated `Map()` (usage-inferred binding) still constructs the map
-        // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
-        // is the same 7-field map struct, so it forces the IDENTICAL types.
-        if cf.identName == "Map" || cf.identName == "Set" {
-          mUsed = true
-          lUsed = true
-          aUsed = true
-          // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
-          // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
-          // arena for the `TypeRef` walk below to read, so the KEY comes off the
-          // constructor call's own recorded type.
-          markMapKeyUsed(nodeTyMapKeyKind(i))
-          // …and so does the value. The `TypeRef` walk's `mvShapeOfMapName` is the only other mv
-          // mint, so without this an un-annotated map with a ref or wide value resolves its type
-          // and never mints its rep. Idempotent: an annotated twin interns the same (key, value)
-          // slot. A `Set()` mints nothing, being boolean-valued, but the node type decides that.
-          mvShapeOfMapNodeTy(i)
-        }
-        // The array-intrinsic allocators construct a list with no literal or annotation in
-        // sight, so the pair its element kind names has to be interned here. `arrNewIntrKind` is
-        // the one home of that kind, so the intern and the lowering cannot disagree about it.
-        if (
-          cf.identName == "__array_new__"
-          || cf.identName == "__array_new_default__"
-        ) {
-          collectArrNewIntr(i)
+        // Gated on the shared vocabulary, so `collectANoteIdentRename` and this arm cannot
+        // disagree about which of the monomorphizer's in-place callee renames retires the
+        // resumable prefix.
+        if cf is Ident && collectACallIntrinsic(cf.identName) {
+          if cf.identName == "fromCodePoint" { aUsed = true }
+          // `fromCodePoints(xs)` builds a fresh string from an i32 list.
+          if cf.identName == "fromCodePoints" {
+            aUsed = true
+            lUsed = true
+          }
+          // An un-annotated `Map()` (usage-inferred binding) still constructs the map
+          // struct — force the same types a `{[string]: i32}` annotation does. `Set()`
+          // is the same 7-field map struct, so it forces the IDENTICAL types.
+          if cf.identName == "Map" || cf.identName == "Set" {
+            mUsed = true
+            lUsed = true
+            aUsed = true
+            // An UN-annotated `Map()`/`Set()` whose key the checker inferred as i32
+            // (`const m = Map()` then `m.set(1, 2)`) has no map spelling anywhere in the
+            // arena for the `TypeRef` walk below to read, so the KEY comes off the
+            // constructor call's own recorded type.
+            markMapKeyUsed(nodeTyMapKeyKind(i))
+            // …and so does the value. The `TypeRef` walk's `mvShapeOfMapName` is the only other mv
+            // mint, so without this an un-annotated map with a ref or wide value resolves its type
+            // and never mints its rep. Idempotent: an annotated twin interns the same (key, value)
+            // slot. A `Set()` mints nothing, being boolean-valued, but the node type decides that.
+            mvShapeOfMapNodeTy(i)
+          }
+          // The array-intrinsic allocators construct a list with no literal or annotation in
+          // sight, so the pair its element kind names has to be interned here. `arrNewIntrKind` is
+          // the one home of that kind, so the intern and the lowering cannot disagree about it.
+          if (
+            cf.identName == "__array_new__"
+            || cf.identName == "__array_new_default__"
+          ) {
+            collectArrNewIntr(i)
+          }
         }
       }
     } else if nd is TypeRef {
@@ -7958,6 +8083,7 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
     return 0
   }
   if lt < 0 || lt >= T.tys.length || !tyHasTyVar(lt) { return 0 }
+  if objIx < 0 { return 0 }
   const o = P.nodes[objIx]
   if !(o is ObjLit) { return 0 }
   // A field at a union holding a type parameter is substituted through the instance's own
@@ -8673,9 +8799,18 @@ function anonLeafIdentAllObjLits(av: i32, plain: i32[]): boolean {
     while li < ws.length {
       const w = ws[li]
       const wn = P.nodes[w]
-      if wn is NullLit { 0 }
-      else if wn is ObjLit { lits.push(w) }
-      else { return false }
+      match wn {
+        NullLit => {
+          0
+        }
+        ObjLit => {
+          lits.push(w)
+        }
+        // Any other write is a value this cannot name.
+        NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
+          return false
+        }
+      }
       li = li + 1
     }
     if lits.length == 0 { return false }
@@ -8695,16 +8830,22 @@ function anonLeafIdentAllObjLits(av: i32, plain: i32[]): boolean {
 function anonLeafMemberLit(av: i32): i32 {
   if av < 0 { return 0 - 1 }
   const avn = P.nodes[av]
-  if avn is ObjLit { return av }
-  if avn is Ident {
-    const ws: i32[] = []
-    anonLeafNameWrites(avn.identName, ws)
-    let li = 0
-    while li < ws.length {
-      const wn = P.nodes[ws[li]]
-      if wn is ObjLit { return ws[li] }
-      li = li + 1
+  match avn {
+    ObjLit => {
+      return av
     }
+    Ident => {
+      const ws: i32[] = []
+      anonLeafNameWrites(avn.identName, ws)
+      let li = 0
+      while li < ws.length {
+        const wn = P.nodes[ws[li]]
+        if wn is ObjLit { return ws[li] }
+        li = li + 1
+      }
+    }
+    // No other argument delivers a literal.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0 - 1
 }
@@ -8747,26 +8888,32 @@ function anonLeafSameFieldNames(a: i32, b: i32): boolean {
 // no write, or one write this cannot name, is not a member.
 function anonLeafDeliversMember(av: i32): boolean {
   const avn = P.nodes[av]
-  if avn is ObjLit { return anonLeafInJoin(av) }
-  if avn is Ident {
-    let hits = 0
-    const ws: i32[] = []
-    anonLeafNameWrites(avn.identName, ws)
-    let li = 0
-    while li < ws.length {
-      const w = ws[li]
-      const wn = P.nodes[w]
-      if wn is NullLit {
-        0
-      } else if wn is ObjLit {
-        if !anonLeafInJoin(w) { return false }
-        hits = hits + 1
-      } else {
-        return false
-      }
-      li = li + 1
+  match avn {
+    ObjLit => {
+      return anonLeafInJoin(av)
     }
-    return hits > 0
+    Ident => {
+      let hits = 0
+      const ws: i32[] = []
+      anonLeafNameWrites(avn.identName, ws)
+      let li = 0
+      while li < ws.length {
+        const w = ws[li]
+        const wn = P.nodes[w]
+        if wn is NullLit {
+          0
+        } else if wn is ObjLit {
+          if !anonLeafInJoin(w) { return false }
+          hits = hits + 1
+        } else {
+          return false
+        }
+        li = li + 1
+      }
+      return hits > 0
+    }
+    // No other argument delivers a member.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -8780,10 +8927,16 @@ function anonLeafNameWrites(nm: string, out: i32[]) {
   while bl >= 0 {
     const n = P.nodes[anonIxLnkNode[bl]]
     let w = 0 - 1
-    if n is LetDecl {
-      if n.letInit >= 0 { w = unwrapParen(n.letInit) }
+    match n {
+      LetDecl => {
+        if n.letInit >= 0 { w = unwrapParen(n.letInit) }
+      }
+      BinExpr => {
+        w = unwrapParen(n.binRight)
+      }
+      // Every other node in the list writes no value.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
-    if n is BinExpr { w = unwrapParen(n.binRight) }
     if w >= 0 { out.push(w) }
     bl = anonIxLnkNext[bl]
   }
@@ -8844,59 +8997,69 @@ function anonLeafJoinedMark() {
 function anonLeafJoinSources(lhs: i32, mem: i32[]) {
   if lhs < 0 { return 0 }
   const ln = P.nodes[lhs]
-  if ln is Index {
-    const base = unwrapParen(ln.idxArr)
-    if base >= 0 {
-      const bn = P.nodes[base]
-      if bn is Ident {
-        let ai = 0
-        while ai < P.nodes.length {
-          const an = P.nodes[ai]
-          if an is BinExpr {
-            if an.binOp == "=" {
-              anonLeafJoinStore(an.binLeft, an.binRight, bn.identName, mem)
+  match ln {
+    Index => {
+      const base = unwrapParen(ln.idxArr)
+      if base >= 0 {
+        const bn = P.nodes[base]
+        if bn is Ident {
+          let ai = 0
+          while ai < P.nodes.length {
+            const an = P.nodes[ai]
+            if an is BinExpr {
+              if an.binOp == "=" {
+                anonLeafJoinStore(an.binLeft, an.binRight, bn.identName, mem)
+              }
             }
+            ai = ai + 1
           }
-          ai = ai + 1
         }
       }
     }
-  }
-  // D842 — a bare identifier left operand (`a ?? { … }`): the literals bound to `a` by name
-  // over the whole program — a same-named binding elsewhere can only add a member, never hide one.
-  // D871 — a call left operand (`src() ?? { … }`): the literals that reach the `??` are the
-  // ones the callee returns, one delivery form further out than the index/ident arms above.
-  if ln is Call { anonLeafJoinCallee(ln.callFn, mem) }
-  if ln is Ident {
-    let li = 0
-    while li < P.nodes.length {
-      const lnn = P.nodes[li]
-      if lnn is LetDecl {
-        if lnn.letName == ln.identName {
-          anonLeafJoinBound(lnn.letInit, mem)
-          // D871 — and where that initializer is a call, the callee's returns, one hop only: a
-          // callee whose own return is another call is declined rather than half-read.
-          anonLeafJoinInitCall(lnn.letInit, mem)
-        }
-      }
-      if lnn is BinExpr {
-        if lnn.binOp == "=" {
-          const tgt = unwrapParen(lnn.binLeft)
-          if tgt >= 0 {
-            const tn = P.nodes[tgt]
-            if tn is Ident {
-              if tn.identName == ln.identName {
-                anonLeafJoinBound(lnn.binRight, mem)
-                // D871 — the same one-hop read as the declaration leg above; skipping it here would make
-                // `a = src()` behave unlike `const a = src()` for what is the same binding question.
-                anonLeafJoinInitCall(lnn.binRight, mem)
+    // D842 — a bare identifier left operand (`a ?? { … }`): the literals bound to `a` by name
+    // over the whole program — a same-named binding elsewhere can only add a member, never hide one.
+    // D871 — a call left operand (`src() ?? { … }`): the literals that reach the `??` are the
+    // ones the callee returns, one delivery form further out than the index/ident arms above.
+    Call => {
+      anonLeafJoinCallee(ln.callFn, mem)
+    }
+    Ident => {
+      let li = 0
+      while li < P.nodes.length {
+        const lnn = P.nodes[li]
+        match lnn {
+          LetDecl => {
+            if lnn.letName == ln.identName {
+              anonLeafJoinBound(lnn.letInit, mem)
+              // D871 — and where that initializer is a call, the callee's returns, one hop only: a
+              // callee whose own return is another call is declined rather than half-read.
+              anonLeafJoinInitCall(lnn.letInit, mem)
+            }
+          }
+          BinExpr => {
+            if lnn.binOp == "=" {
+              const tgt = unwrapParen(lnn.binLeft)
+              if tgt >= 0 {
+                const tn = P.nodes[tgt]
+                if tn is Ident {
+                  if tn.identName == ln.identName {
+                    anonLeafJoinBound(lnn.binRight, mem)
+                    // D871 — the same one-hop read as the declaration leg above; skipping it here would make
+                    // `a = src()` behave unlike `const a = src()` for what is the same binding question.
+                    anonLeafJoinInitCall(lnn.binRight, mem)
+                  }
+                }
               }
             }
           }
+          // No other node binds the name.
+          NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
         }
+        li = li + 1
       }
-      li = li + 1
     }
+    // No other reader is recognized, so it appends nothing.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -8928,54 +9091,58 @@ function anonLeafJoinAnnTy(lhs: i32): i32 {
   const ln = P.nodes[lhs]
   // Licensed by the read above having succeeded: every literal the callee hands back is
   // already a member, so taking the annotation here cannot misroute one.
-  if ln is Call {
-    const rlits: i32[] = []
-    const rfns: string[] = []
-    const rpars: i32[] = []
-    if !anonLeafCalleeRead(ln.callFn, rlits, rfns, rpars, 0) { return 0 - 1 }
-    if rlits.length > 0 { return 0 - 1 }
-    const cf = unwrapParen(ln.callFn)
-    if cf < 0 { return 0 - 1 }
-    const cfn = P.nodes[cf]
-    if cfn is Ident {
-      let chit = 0 - 1
-      let ci2 = 0
-      while ci2 < P.nodes.length {
-        const cd = P.nodes[ci2]
-        if cd is FuncDecl {
-          if cd.fnName == cfn.identName {
-            if cd.fnRet < 0 { return 0 - 1 }
-            if chit >= 0 {
-              if tyNameOf(chit) != tyNameOf(cd.fnRet) { return 0 - 1 }
+  match ln {
+    Call => {
+      const rlits: i32[] = []
+      const rfns: string[] = []
+      const rpars: i32[] = []
+      if !anonLeafCalleeRead(ln.callFn, rlits, rfns, rpars, 0) { return 0 - 1 }
+      if rlits.length > 0 { return 0 - 1 }
+      const cf = unwrapParen(ln.callFn)
+      if cf < 0 { return 0 - 1 }
+      const cfn = P.nodes[cf]
+      if cfn is Ident {
+        let chit = 0 - 1
+        let ci2 = 0
+        while ci2 < P.nodes.length {
+          const cd = P.nodes[ci2]
+          if cd is FuncDecl {
+            if cd.fnName == cfn.identName {
+              if cd.fnRet < 0 { return 0 - 1 }
+              if chit >= 0 {
+                if tyNameOf(chit) != tyNameOf(cd.fnRet) { return 0 - 1 }
+              } else {
+                chit = cd.fnRet
+              }
+            }
+          }
+          ci2 = ci2 + 1
+        }
+        return chit
+      }
+      return 0 - 1
+    }
+    Ident => {
+      let hit = 0 - 1
+      let li = 0
+      while li < P.nodes.length {
+        const lnn = P.nodes[li]
+        if lnn is LetDecl {
+          if lnn.letName == ln.identName {
+            if lnn.letType < 0 { return 0 - 1 }
+            if hit >= 0 {
+              if tyNameOf(hit) != tyNameOf(lnn.letType) { return 0 - 1 }
             } else {
-              chit = cd.fnRet
+              hit = lnn.letType
             }
           }
         }
-        ci2 = ci2 + 1
+        li = li + 1
       }
-      return chit
+      return hit
     }
-    return 0 - 1
-  }
-  if ln is Ident {
-    let hit = 0 - 1
-    let li = 0
-    while li < P.nodes.length {
-      const lnn = P.nodes[li]
-      if lnn is LetDecl {
-        if lnn.letName == ln.identName {
-          if lnn.letType < 0 { return 0 - 1 }
-          if hit >= 0 {
-            if tyNameOf(hit) != tyNameOf(lnn.letType) { return 0 - 1 }
-          } else {
-            hit = lnn.letType
-          }
-        }
-      }
-      li = li + 1
-    }
-    return hit
+    // No other operand carries a declared type.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0 - 1
 }
@@ -9341,19 +9508,25 @@ function anonLeafRetPathOk(
   const a = unwrapParen(argIx)
   if a < 0 { return true }
   const an = P.nodes[a]
-  if an is NullLit { return true }
-  if an is ObjLit {
-    out.push(a)
-    return true
-  }
-  if an is Ident {
-    // D911 — a name-visited set minted here, since an ident chain (`a = b; b = a`) is a cycle
-    // the call-frame depth cap cannot bound.
-    const ids: string[] = []
-    return anonLeafRetIdentOk(an.identName, body, out, fns, pars, depth, ids)
-  }
-  if an is Call {
-    return anonLeafCalleeRead(an.callFn, out, fns, pars, depth + 1)
+  match an {
+    NullLit => {
+      return true
+    }
+    ObjLit => {
+      out.push(a)
+      return true
+    }
+    Ident => {
+      // D911 — a name-visited set minted here, since an ident chain (`a = b; b = a`) is a cycle
+      // the call-frame depth cap cannot bound.
+      const ids: string[] = []
+      return anonLeafRetIdentOk(an.identName, body, out, fns, pars, depth, ids)
+    }
+    Call => {
+      return anonLeafCalleeRead(an.callFn, out, fns, pars, depth + 1)
+    }
+    // Every other returned expression refutes.
+    NumLit | StrLit | CharLit | BoolLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -9635,49 +9808,53 @@ function anonLeafArgIdentSeen(
   let li = 0
   while li < P.nodes.length {
     const lnn = P.nodes[li]
-    if lnn is LetDecl {
-      if lnn.letName == nm {
-        if (
-          !anonLeafBoundValOk(
-            lnn.letInit,
-            anonLeafFrameBodyOf(li),
-            out,
-            hits,
-            fns,
-            pars,
-            depth,
-            ids,
-          )
-        ) {
-          return false
+    match lnn {
+      LetDecl => {
+        if lnn.letName == nm {
+          if (
+            !anonLeafBoundValOk(
+              lnn.letInit,
+              anonLeafFrameBodyOf(li),
+              out,
+              hits,
+              fns,
+              pars,
+              depth,
+              ids,
+            )
+          ) {
+            return false
+          }
         }
       }
-    }
-    if lnn is BinExpr {
-      if lnn.binOp == "=" {
-        const tgt = unwrapParen(lnn.binLeft)
-        if tgt >= 0 {
-          const tn = P.nodes[tgt]
-          if tn is Ident {
-            if tn.identName == nm {
-              if (
-                !anonLeafBoundValOk(
-                  lnn.binRight,
-                  anonLeafFrameBodyOf(li),
-                  out,
-                  hits,
-                  fns,
-                  pars,
-                  depth,
-                  ids,
-                )
-              ) {
-                return false
+      BinExpr => {
+        if lnn.binOp == "=" {
+          const tgt = unwrapParen(lnn.binLeft)
+          if tgt >= 0 {
+            const tn = P.nodes[tgt]
+            if tn is Ident {
+              if tn.identName == nm {
+                if (
+                  !anonLeafBoundValOk(
+                    lnn.binRight,
+                    anonLeafFrameBodyOf(li),
+                    out,
+                    hits,
+                    fns,
+                    pars,
+                    depth,
+                    ids,
+                  )
+                ) {
+                  return false
+                }
               }
             }
           }
         }
       }
+      // No other node writes a binding.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
     li = li + 1
   }
@@ -9822,6 +9999,7 @@ function anonLeafSameFieldFnName(els: i32[], prop: string): string {
   let i = 0
   while i < els.length {
     const ei = unwrapParen(els[i])
+    if ei < 0 { return "" }
     const e = P.nodes[ei]
     if !(e is ObjLit) { return "" }
     const en = anonLeafFnNameOfVal(objFieldVal(ei, prop))
@@ -10022,14 +10200,18 @@ function anonLeafArgFnName(argIx: i32): string {
   const av = unwrapParen(argIx)
   if av < 0 { return "" }
   const avn = P.nodes[av]
-  if avn is Ident {
-    if anonLeafOneDeclNamed(avn.identName) { return avn.identName }
-    return anonLeafFnValueTarget(avn.identName)
-  }
-  if avn is Call {
-    const cnm = anonLeafCalleeFnName(avn.callFn)
-    if cnm == "" { return "" }
-    return anonLeafFnRetFnName(cnm)
+  match avn {
+    Ident => {
+      if anonLeafOneDeclNamed(avn.identName) { return avn.identName }
+      return anonLeafFnValueTarget(avn.identName)
+    }
+    Call => {
+      const cnm = anonLeafCalleeFnName(avn.callFn)
+      if cnm == "" { return "" }
+      return anonLeafFnRetFnName(cnm)
+    }
+    // No other expression names a function.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   ""
 }
@@ -10577,8 +10759,16 @@ function anonLeafNameIsBound(nm: string): boolean {
   let bl = sidArrGet(anonIxBindHead, sidLookup(nm))
   while bl >= 0 {
     const n = P.nodes[anonIxLnkNode[bl]]
-    if n is LetDecl { return true }
-    if n is Param { return true }
+    match n {
+      LetDecl => {
+        return true
+      }
+      Param => {
+        return true
+      }
+      // Every other node in the list is an assignment or a use, not a binding.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    }
     bl = anonIxLnkNext[bl]
   }
   false
@@ -10678,86 +10868,90 @@ function anonLeafBoundValOk(
   const v = unwrapParen(rhs)
   if v < 0 { return false }
   const vn = P.nodes[v]
-  if vn is NullLit {
-    hits.push(v)
-    return true
-  }
-  if vn is ObjLit {
-    out.push(v)
-    hits.push(v)
-    return true
-  }
-  if vn is Call {
-    if !anonLeafCalleeRead(vn.callFn, out, fns, pars, depth + 1) {
-      return false
+  match vn {
+    NullLit => {
+      hits.push(v)
+      return true
     }
-    hits.push(v)
-    return true
-  }
-  // D953 — a field read of a parameter, projected through the parameter's own call sites; the
-  // base literal itself must not be published to `out`, only the projected field value.
-  if vn is Member {
-    const mo = unwrapParen(vn.memObj)
-    if mo >= 0 {
-      const mon = P.nodes[mo]
-      if mon is Ident {
-        const pIx = anonLeafParamNodeOf(body, mon.identName)
-        if pIx >= 0 {
-          // The owners go to a scratch (`bOut`, discarded); the param does not — its slot must follow
-          // the carrier's new row, so it is pushed to the caller's `pars`.
-          const bOut: i32[] = []
-          const bFns: string[] = []
-          if !anonLeafParamArgsOk(body, pIx, bOut, bFns, pars, depth) {
-            return false
-          }
-          pars.push(pIx)
-          let ai2 = 0
-          while ai2 < bOut.length {
-            const al = P.nodes[bOut[ai2]]
-            if al is ObjLit {
-              let found = 0 - 1
-              let fj = 0
-              while fj < al.objFields.length {
-                const fn2 = P.nodes[al.objFields[fj]]
-                if fn2 is FieldInit {
-                  if fn2.fiName == vn.memProp {
-                    found = unwrapParen(fn2.fiValue)
-                  }
-                }
-                fj = fj + 1
-              }
-              if found < 0 { return false }
-              const fv = P.nodes[found]
-              if fv is ObjLit { out.push(found) }
-              else if fv is NullLit { 0 }
-              else { return false }
-            } else {
-              return false
-            }
-            ai2 = ai2 + 1
-          }
-          hits.push(v)
-          return true
-        }
-      }
+    ObjLit => {
+      out.push(v)
+      hits.push(v)
+      return true
     }
-    return false
-  }
-  if vn is Ident {
-    // D934 — a module-scope binding has no frame (which `anonLeafRetIdentOk` needs), so the
-    // by-name whole-arena scan answers here instead of refuting.
-    if body < 0 {
-      if !anonLeafArgIdentSeen(vn.identName, out, fns, pars, depth, ids) {
+    Call => {
+      if !anonLeafCalleeRead(vn.callFn, out, fns, pars, depth + 1) {
         return false
       }
       hits.push(v)
       return true
     }
-    if !anonLeafRetIdentOk(vn.identName, body, out, fns, pars, depth, ids) {
+    // D953 — a field read of a parameter, projected through the parameter's own call sites; the
+    // base literal itself must not be published to `out`, only the projected field value.
+    Member => {
+      const mo = unwrapParen(vn.memObj)
+      if mo >= 0 {
+        const mon = P.nodes[mo]
+        if mon is Ident {
+          const pIx = anonLeafParamNodeOf(body, mon.identName)
+          if pIx >= 0 {
+            // The owners go to a scratch (`bOut`, discarded); the param does not — its slot must follow
+            // the carrier's new row, so it is pushed to the caller's `pars`.
+            const bOut: i32[] = []
+            const bFns: string[] = []
+            if !anonLeafParamArgsOk(body, pIx, bOut, bFns, pars, depth) {
+              return false
+            }
+            pars.push(pIx)
+            let ai2 = 0
+            while ai2 < bOut.length {
+              const al = P.nodes[bOut[ai2]]
+              if al is ObjLit {
+                let found = 0 - 1
+                let fj = 0
+                while fj < al.objFields.length {
+                  const fn2 = P.nodes[al.objFields[fj]]
+                  if fn2 is FieldInit {
+                    if fn2.fiName == vn.memProp {
+                      found = unwrapParen(fn2.fiValue)
+                    }
+                  }
+                  fj = fj + 1
+                }
+                if found < 0 { return false }
+                const fv = P.nodes[found]
+                if fv is ObjLit { out.push(found) }
+                else if fv is NullLit { 0 }
+                else { return false }
+              } else {
+                return false
+              }
+              ai2 = ai2 + 1
+            }
+            hits.push(v)
+            return true
+          }
+        }
+      }
       return false
     }
-    hits.push(v)
-    return true
+    Ident => {
+      // D934 — a module-scope binding has no frame (which `anonLeafRetIdentOk` needs), so the
+      // by-name whole-arena scan answers here instead of refuting.
+      if body < 0 {
+        if !anonLeafArgIdentSeen(vn.identName, out, fns, pars, depth, ids) {
+          return false
+        }
+        hits.push(v)
+        return true
+      }
+      if !anonLeafRetIdentOk(vn.identName, body, out, fns, pars, depth, ids) {
+        return false
+      }
+      hits.push(v)
+      return true
+    }
+    // Every other value refutes.
+    NumLit | StrLit | CharLit | BoolLit | Unary | BinExpr | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -10956,7 +11150,7 @@ function anonGenArgBuild() {
   gi = 0
   while genFns.length > 0 && gi < P.nodes.length {
     const gc = P.nodes[gi]
-    if gc is Call {
+    if gc is Call && gc.callFn >= 0 {
       const gcf = P.nodes[gc.callFn]
       if gcf is Ident {
         if genFns[gcf.identName] ?? false {
@@ -10987,8 +11181,16 @@ function anonGenArgMarkArgs(args: i32[], viaName: {[string]: boolean}) {
     const ax = unwrapParen(args[k])
     if ax >= 0 {
       const a = P.nodes[ax]
-      if a is ObjLit { anonGenArgLit[ax] = true }
-      if a is Ident { viaName[a.identName] = true }
+      match a {
+        ObjLit => {
+          anonGenArgLit[ax] = true
+        }
+        Ident => {
+          viaName[a.identName] = true
+        }
+        // No other argument is an anonymous literal or a name that can carry one.
+        NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+      }
     }
     k = k + 1
   }
@@ -11213,6 +11415,7 @@ function anonNestPolyUnionName(ow: i32, fname: string, inner: i32): string {
 function anonLeafAtomName(valIx: i32): string {
   if valIx < 0 { return "" }
   const vi = unwrapParen(valIx)
+  if vi < 0 { return "" }
   const v = P.nodes[vi]
   if v is NullLit { return "null" }
   const c = anonFieldCode(valIx)
@@ -12012,8 +12215,10 @@ export function collectS(stmts: i32[]) {
               // The field's own spelling, so the refusal can name what it refused (`fieldTypeRefusalMsg`,
               // D734); a non-`TypeRef` annotation takes the general sentence.
               let fdNm = ""
-              const fdT = P.nodes[fnode.fdType]
-              if fdT is TypeRef { fdNm = fdT.tyName }
+              if fnode.fdType >= 0 {
+                const fdT = P.nodes[fnode.fdType]
+                if fdT is TypeRef { fdNm = fdT.tyName }
+              }
               return emitFail(fieldTypeRefusalMsg(fdNm))
             }
             // The recorded elem name is `fieldRefElemName`'s answer at code 16 (neither of
@@ -13115,9 +13320,6 @@ function funcRetUnrepresentable(retIx: i32): boolean {
       return false
     }
     TyUnion => {
-      // The member classifier below stays an `if` chain on purpose: `tyIsLitUnion` is a
-      // PREDICATE rung between two kind rungs, so the chain is not one dispatch and a `match`
-      // cannot spell it.
       const members = t.uMembers
       if members.length < 2 { return false }
       let hasScalar = false
@@ -13125,13 +13327,32 @@ function funcRetUnrepresentable(retIx: i32): boolean {
       let i = 0
       while i < members.length {
         const mt = T.tys[members[i]]
-        if mt is TyPrim { hasScalar = true }
-        else if mt is TyLit { hasScalar = true }
-        else if tyIsLitUnion(members[i]) { hasScalar = true }
-        else if mt is TyObj { hasComposite = true }
-        else if mt is TyArray { hasComposite = true }
-        else if mt is TyMap { hasComposite = true }
-        else if mt is TyFunc { hasComposite = true }
+        match mt {
+          TyPrim => {
+            hasScalar = true
+          }
+          TyLit => {
+            hasScalar = true
+          }
+          // A nested literal union is an atom, so it is a scalar member.
+          TyUnion => {
+            if tyIsLitUnion(members[i]) { hasScalar = true }
+          }
+          TyObj => {
+            hasComposite = true
+          }
+          TyArray => {
+            hasComposite = true
+          }
+          TyMap => {
+            hasComposite = true
+          }
+          TyFunc => {
+            hasComposite = true
+          }
+          // No other member is either.
+          TyErr | TyNullable | TyVar | TyNeg => {}
+        }
         i = i + 1
       }
       return hasScalar && hasComposite
@@ -13662,7 +13883,7 @@ export function collectU(stmts: i32[]) {
   let ipu = 0
   while ipu < P.nodes.length {
     const pn = P.nodes[ipu]
-    if pn is Call {
+    if pn is Call && pn.callFn >= 0 {
       const pcf = P.nodes[pn.callFn]
       if pcf is Member {
         // `.get(i)` is the same unspoken box (D1281): the checker types the checked
@@ -13952,72 +14173,78 @@ export function collectFnValUse() {
   let i = 0
   while i < P.nodes.length {
     const nd = P.nodes[i]
-    if nd is LetDecl {
-      if exprIsBareFnName(nd.letInit) { fnValUsed = true }
-    }
-    if nd is RetStmt {
-      if nd.retArg >= 0 && exprIsBareFnName(unwrapParen(nd.retArg)) {
-        fnValUsed = true
+    match nd {
+      LetDecl => {
+        if exprIsBareFnName(nd.letInit) { fnValUsed = true }
       }
-    }
-    // So is a function body whose value is its last statement (D6370).
-    if nd is FuncDecl && nd.fnBody >= 0 {
-      const fb = P.nodes[nd.fnBody]
-      if fb is Block && fb.blkStmts.length > 0 {
-        const ft = unwrapParen(fb.blkStmts[fb.blkStmts.length - 1])
-        if exprIsBareFnName(ft) { fnValUsed = true }
-      }
-    }
-    if nd is BinExpr {
-      if nd.binOp == "=" || nd.binOp == "==" || nd.binOp == "!=" {
-        if exprIsBareFnName(nd.binLeft) { fnValUsed = true }
-        if exprIsBareFnName(nd.binRight) { fnValUsed = true }
-      }
-    }
-    if nd is FieldInit {
-      if exprIsBareFnName(nd.fiValue) { fnValUsed = true }
-    }
-    // A bare named function as a call argument: a builtin method (`m.set(k, inc)`) has no
-    // annotation to flip the machinery otherwise, unlike a user call's param TypeRef.
-    if nd is Call {
-      const cfvArgs = nd.callArgs
-      let cfv = 0
-      while cfv < cfvArgs.length {
-        if exprIsBareFnName(cfvArgs[cfv]) { fnValUsed = true }
-        cfv = cfv + 1
-      }
-    }
-    // A closure if-value whose arm is a bare named function needs the same flip a lambda arm
-    // gets during lifting; the loop visits every `IfStmt`, so binding/return/argument alike are covered.
-    if nd is IfStmt {
-      if exprIsBareFnName(ifArmValueExpr(nd.ifThen)) { fnValUsed = true }
-      if nd.ifElse >= 0 {
-        const el = P.nodes[nd.ifElse]
-        if el is Block {
-          if exprIsBareFnName(ifArmValueExpr(nd.ifElse)) { fnValUsed = true }
+      RetStmt => {
+        if nd.retArg >= 0 && exprIsBareFnName(unwrapParen(nd.retArg)) {
+          fnValUsed = true
         }
       }
-    }
-    // A source function-type annotation flips the machinery too: the annotated cell is a
-    // closure fat-pointer whose call site `call_ref`s through it, so its signature must intern.
-    if nd is TypeRef {
-      if tyIsFuncType(i) { fnValUsed = true }
-      // A closure-array annotation's elements are closures too, so it flips the machinery on;
-      // without this an array whose only function-type mention is the annotation leaves signatures un-interned.
-      if nameIsClosureArrayTy(i) == 1 { fnValUsed = true }
-      // A nullable-closure annotation is a closure fat-pointer cell too, so its `$fnsig` must
-      // intern even when the value is only ever `null` (no lambda elsewhere flips the machinery).
-      if nodeTyIsNulClosure(i) { fnValUsed = true }
-      // A shape annotation with a closure field needs the same flip, even for a `null`-only value.
-      // `tyReachesClosure` asks directly whether this type reaches a closure through any of those positions.
-      if nodeTyReachesClosure(i) { fnValUsed = true }
-    }
-    // An inferred closure-element array literal needs the same flip as the annotation form,
-    // but only when the element itself constructs a closure — one merely containing one must not.
-    if nd is ArrayLit {
-      // The same arena predicate the three `arrLit*` consumers use; the render is taken only for
-      // its emptiness gate, since "" means the checker declined to name the element, not that it isn't a closure.
-      if arrElemIsClosureTy(i, nodeArrayElemName(i)) { fnValUsed = true }
+      // So is a function body whose value is its last statement (D6370).
+      FuncDecl => {
+        if nd.fnBody >= 0 {
+          const fb = P.nodes[nd.fnBody]
+          if fb is Block && fb.blkStmts.length > 0 {
+            const ft = unwrapParen(fb.blkStmts[fb.blkStmts.length - 1])
+            if exprIsBareFnName(ft) { fnValUsed = true }
+          }
+        }
+      }
+      BinExpr => {
+        if nd.binOp == "=" || nd.binOp == "==" || nd.binOp == "!=" {
+          if exprIsBareFnName(nd.binLeft) { fnValUsed = true }
+          if exprIsBareFnName(nd.binRight) { fnValUsed = true }
+        }
+      }
+      FieldInit => {
+        if exprIsBareFnName(nd.fiValue) { fnValUsed = true }
+      }
+      // A bare named function as a call argument: a builtin method (`m.set(k, inc)`) has no
+      // annotation to flip the machinery otherwise, unlike a user call's param TypeRef.
+      Call => {
+        const cfvArgs = nd.callArgs
+        let cfv = 0
+        while cfv < cfvArgs.length {
+          if exprIsBareFnName(cfvArgs[cfv]) { fnValUsed = true }
+          cfv = cfv + 1
+        }
+      }
+      // A closure if-value whose arm is a bare named function needs the same flip a lambda arm
+      // gets during lifting; the loop visits every `IfStmt`, so binding/return/argument alike are covered.
+      IfStmt => {
+        if exprIsBareFnName(ifArmValueExpr(nd.ifThen)) { fnValUsed = true }
+        if nd.ifElse >= 0 {
+          const el = P.nodes[nd.ifElse]
+          if el is Block {
+            if exprIsBareFnName(ifArmValueExpr(nd.ifElse)) { fnValUsed = true }
+          }
+        }
+      }
+      // A source function-type annotation flips the machinery too: the annotated cell is a
+      // closure fat-pointer whose call site `call_ref`s through it, so its signature must intern.
+      TypeRef => {
+        if tyIsFuncType(i) { fnValUsed = true }
+        // A closure-array annotation's elements are closures too, so it flips the machinery on;
+        // without this an array whose only function-type mention is the annotation leaves signatures un-interned.
+        if nameIsClosureArrayTy(i) == 1 { fnValUsed = true }
+        // A nullable-closure annotation is a closure fat-pointer cell too, so its `$fnsig` must
+        // intern even when the value is only ever `null` (no lambda elsewhere flips the machinery).
+        if nodeTyIsNulClosure(i) { fnValUsed = true }
+        // A shape annotation with a closure field needs the same flip, even for a `null`-only value.
+        // `tyReachesClosure` asks directly whether this type reaches a closure through any of those positions.
+        if nodeTyReachesClosure(i) { fnValUsed = true }
+      }
+      // An inferred closure-element array literal needs the same flip as the annotation form,
+      // but only when the element itself constructs a closure — one merely containing one must not.
+      ArrayLit => {
+        // The same arena predicate the three `arrLit*` consumers use; the render is taken only for
+        // its emptiness gate, since "" means the checker declined to name the element, not that it isn't a closure.
+        if arrElemIsClosureTy(i, nodeArrayElemName(i)) { fnValUsed = true }
+      }
+      // Every other node makes no bare function-value use.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | Paren | ErrExpr | Param | WhileStmt | BreakStmt | ContinueStmt | Block | Program | FieldDef | TypeDecl | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
     i = i + 1
   }
@@ -14029,7 +14256,7 @@ export function collectMapFilterUse() {
   let i = 0
   while i < P.nodes.length {
     const nd = P.nodes[i]
-    if nd is Call {
+    if nd is Call && nd.callFn >= 0 {
       const callee = P.nodes[nd.callFn]
       if callee is Member {
         if callee.memProp == "map" || callee.memProp == "filter" {

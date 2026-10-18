@@ -6,20 +6,30 @@
 // This module imports `./ast`, `./symbols`, `./listutil` and `./check_suggest`.
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
   MatchExpr,
   Member,
+  NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
@@ -28,6 +38,12 @@ import {
   Program,
   RetStmt,
   Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   elseIfLink,
   hasNamedArgs,
   i32ToStr,
@@ -284,21 +300,25 @@ function cwIxNoteIdxWrite(at: i32, l: i32) {
 function cwIxNoteCallWrite(at: i32, cf: i32) {
   if cf < 0 || cf >= P.nodes.length { return 0 }
   const cn = P.nodes[cf]
-  if cn is Member {
-    if cwMutatesList(cn.memProp) {
-      cwIxAnyWrite = 1
-      if covarRootName(cn.memObj) == "" {
-        cwIxWrNode.push(at)
-        cwIxWrRecv.push(cwPeel(cn.memObj))
+  match cn {
+    Member => {
+      if cwMutatesList(cn.memProp) {
+        cwIxAnyWrite = 1
+        if covarRootName(cn.memObj) == "" {
+          cwIxWrNode.push(at)
+          cwIxWrRecv.push(cwPeel(cn.memObj))
+        }
       }
     }
-  }
-  if cn is Ident {
-    if cn.identName == "__array_copy__" {
-      cwIxAnyWrite = 1
-      cwIxWrNode.push(at)
-      cwIxWrRecv.push(-1)
+    Ident => {
+      if cn.identName == "__array_copy__" {
+        cwIxAnyWrite = 1
+        cwIxWrNode.push(at)
+        cwIxWrRecv.push(-1)
+      }
     }
+    // no other callee writes
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -312,105 +332,130 @@ function cwIxNote(at: i32) {
   // arms and spreads — are filed for live nodes only.
   const live = cwIxLive(at)
   if live { cwIxNoteParent(at) }
-  if live && n is MatchExpr {
-    let mb = 0
-    while mb < n.matchBodies.length {
-      cwIxUpSet(rcwBlockTail(n.matchBodies[mb]), at, CW_UP_ARM, 0)
-      mb = mb + 1
-    }
-  }
-  if live && n is Spread { cwIxUpSet(n.spdArg, at, CW_UP_SPREAD, 0) }
-  if live && n is IfStmt {
-    cwIxUpSet(rcwBlockTail(n.ifThen), at, CW_UP_ARM, 0)
-    if n.ifElse >= 0 && n.ifElse < P.nodes.length {
-      const el = P.nodes[n.ifElse]
-      if el is IfStmt {
-        cwIxUpSet(n.ifElse, at, CW_UP_ARM, 0)
-      } else {
-        cwIxUpSet(rcwBlockTail(n.ifElse), at, CW_UP_ARM, 0)
+  match n {
+    MatchExpr => {
+      if live {
+        let mb = 0
+        while mb < n.matchBodies.length {
+          cwIxUpSet(rcwBlockTail(n.matchBodies[mb]), at, CW_UP_ARM, 0)
+          mb = mb + 1
+        }
       }
     }
-  }
-  if n is Ident {
-    cwIxOcc(sidOf(n.identName), at, cwFrameOfUse(at, n.identName), CW_OCC_USE)
-  }
-  if n is Param {
-    cwIxOcc(sidOf(n.parName), at, cwFrameOfDecl(at), CW_OCC_BIND)
-  }
-  if n is Member { cwIxPlace(at, n.memObj) }
-  if n is OptMember { cwIxPlace(at, n.omObj) }
-  if n is Index { cwIxPlace(at, n.idxArr) }
-  if n is ForIn { cwIxUpSet(n.fiIter, at, CW_UP_ITER, 0) }
-  if n is IsExpr { cwIxUpSet(n.isObj, at, CW_UP_IS, 0) }
-  if n is RetStmt {
-    if n.retArg >= 0 { cwIxUpSet(n.retArg, at, CW_UP_RET, 0) }
-  }
-  if n is FuncDecl {
-    if n.fnName != "" {
-      cwIxFn(sidOf(n.fnName), at)
-      cwIxOcc(sidOf(demangleName(n.fnName)), at, CW_FR_UNKNOWN, CW_OCC_FDECL)
+    Spread => {
+      if live { cwIxUpSet(n.spdArg, at, CW_UP_SPREAD, 0) }
     }
-    const tail = cwFnTailStmt(at)
-    if tail >= 0 { cwIxUpSet(tail, at, CW_UP_TAIL, 0) }
-  }
-  if n is ObjLit {
-    let k = 0
-    while k < n.objFields.length {
-      const f = P.nodes[n.objFields[k]]
-      if f is FieldInit {
-        cwIxUpSet(f.fiValue, at, CW_UP_FIELD, n.objFields[k])
-      }
-      k = k + 1
-    }
-  }
-  if n is ArrayLit {
-    let e = 0
-    while e < n.arrElems.length {
-      cwIxUpSet(n.arrElems[e], at, CW_UP_ELEM, e)
-      e = e + 1
-    }
-  }
-  if n is LetDecl {
-    cwIxOcc(sidOf(n.letName), at, cwFrameOfDecl(at), CW_OCC_BIND)
-    if n.letInit >= 0 {
-      cwIxHold(cwPeel(n.letInit))
-      cwIxUpSet(n.letInit, at, CW_UP_LETINIT, 0)
-    }
-  }
-  if n is Call {
-    cwIxUpSet(n.callFn, at, CW_UP_CALLEE, 0)
-    let a = 0
-    while a < n.callArgs.length {
-      cwIxUpSet(n.callArgs[a], at, CW_UP_ARG, a)
-      a = a + 1
-    }
-    cwIxNoteCallWrite(at, cwPeel(n.callFn))
-    const cn = covarRootName(n.callFn)
-    if cn != "" { cwIxOcc(sidOf(cn), at, CW_FR_UNKNOWN, CW_OCC_CALL) }
-    const mcf = P.nodes[cwPeel(n.callFn)]
-    if mcf is Member {
-      cwIxOcc(sidOf(demangleName(mcf.memProp)), at, CW_FR_UNKNOWN, CW_OCC_MCALL)
-    }
-  }
-  if n is BinExpr {
-    if n.binOp == "=" {
-      cwIxUpSet(n.binLeft, at, CW_UP_ASG_LHS, 0)
-      cwIxUpSet(n.binRight, at, CW_UP_ASG_RHS, 0)
-      cwIxNoteIdxWrite(at, cwPeel(n.binLeft))
-      const ln = covarRootName(n.binLeft)
-      if ln != "" {
-        cwIxOcc(sidOf(ln), at, covarRootFrame(n.binLeft), CW_OCC_ASG)
-        cwIxHold(cwPeel(n.binRight))
+    IfStmt => {
+      if live {
+        cwIxUpSet(rcwBlockTail(n.ifThen), at, CW_UP_ARM, 0)
+        if n.ifElse >= 0 && n.ifElse < P.nodes.length {
+          const el = P.nodes[n.ifElse]
+          if el is IfStmt {
+            cwIxUpSet(n.ifElse, at, CW_UP_ARM, 0)
+          } else {
+            cwIxUpSet(rcwBlockTail(n.ifElse), at, CW_UP_ARM, 0)
+          }
+        }
       }
     }
-    if n.binOp == "==" || n.binOp == "!=" {
-      cwIxUpSet(n.binLeft, at, CW_UP_CMP, 0)
-      cwIxUpSet(n.binRight, at, CW_UP_CMP, 0)
+    Ident => {
+      cwIxOcc(sidOf(n.identName), at, cwFrameOfUse(at, n.identName), CW_OCC_USE)
     }
-    if n.binOp == "??" {
-      cwIxUpSet(n.binLeft, at, CW_UP_COAL, 0)
-      cwIxUpSet(n.binRight, at, CW_UP_COAL, 0)
+    Param => {
+      cwIxOcc(sidOf(n.parName), at, cwFrameOfDecl(at), CW_OCC_BIND)
     }
+    Member => {
+      cwIxPlace(at, n.memObj)
+    }
+    OptMember => {
+      cwIxPlace(at, n.omObj)
+    }
+    Index => {
+      cwIxPlace(at, n.idxArr)
+    }
+    ForIn => {
+      cwIxUpSet(n.fiIter, at, CW_UP_ITER, 0)
+    }
+    IsExpr => {
+      cwIxUpSet(n.isObj, at, CW_UP_IS, 0)
+    }
+    RetStmt => {
+      if n.retArg >= 0 { cwIxUpSet(n.retArg, at, CW_UP_RET, 0) }
+    }
+    FuncDecl => {
+      if n.fnName != "" {
+        cwIxFn(sidOf(n.fnName), at)
+        cwIxOcc(sidOf(demangleName(n.fnName)), at, CW_FR_UNKNOWN, CW_OCC_FDECL)
+      }
+      const tail = cwFnTailStmt(at)
+      if tail >= 0 { cwIxUpSet(tail, at, CW_UP_TAIL, 0) }
+    }
+    ObjLit => {
+      let k = 0
+      while k < n.objFields.length {
+        const f = P.nodes[n.objFields[k]]
+        if f is FieldInit {
+          cwIxUpSet(f.fiValue, at, CW_UP_FIELD, n.objFields[k])
+        }
+        k = k + 1
+      }
+    }
+    ArrayLit => {
+      let e = 0
+      while e < n.arrElems.length {
+        cwIxUpSet(n.arrElems[e], at, CW_UP_ELEM, e)
+        e = e + 1
+      }
+    }
+    LetDecl => {
+      cwIxOcc(sidOf(n.letName), at, cwFrameOfDecl(at), CW_OCC_BIND)
+      if n.letInit >= 0 {
+        cwIxHold(cwPeel(n.letInit))
+        cwIxUpSet(n.letInit, at, CW_UP_LETINIT, 0)
+      }
+    }
+    Call => {
+      cwIxUpSet(n.callFn, at, CW_UP_CALLEE, 0)
+      let a = 0
+      while a < n.callArgs.length {
+        cwIxUpSet(n.callArgs[a], at, CW_UP_ARG, a)
+        a = a + 1
+      }
+      cwIxNoteCallWrite(at, cwPeel(n.callFn))
+      const cn = covarRootName(n.callFn)
+      if cn != "" { cwIxOcc(sidOf(cn), at, CW_FR_UNKNOWN, CW_OCC_CALL) }
+      const mcf = P.nodes[cwPeel(n.callFn)]
+      if mcf is Member {
+        cwIxOcc(
+          sidOf(demangleName(mcf.memProp)),
+          at,
+          CW_FR_UNKNOWN,
+          CW_OCC_MCALL,
+        )
+      }
+    }
+    BinExpr => {
+      if n.binOp == "=" {
+        cwIxUpSet(n.binLeft, at, CW_UP_ASG_LHS, 0)
+        cwIxUpSet(n.binRight, at, CW_UP_ASG_RHS, 0)
+        cwIxNoteIdxWrite(at, cwPeel(n.binLeft))
+        const ln = covarRootName(n.binLeft)
+        if ln != "" {
+          cwIxOcc(sidOf(ln), at, covarRootFrame(n.binLeft), CW_OCC_ASG)
+          cwIxHold(cwPeel(n.binRight))
+        }
+      }
+      if n.binOp == "==" || n.binOp == "!=" {
+        cwIxUpSet(n.binLeft, at, CW_UP_CMP, 0)
+        cwIxUpSet(n.binRight, at, CW_UP_CMP, 0)
+      }
+      if n.binOp == "??" {
+        cwIxUpSet(n.binLeft, at, CW_UP_COAL, 0)
+        cwIxUpSet(n.binRight, at, CW_UP_COAL, 0)
+      }
+    }
+    // no fact is filed for these kinds
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | TypeRef | WhileStmt | BreakStmt | ContinueStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | AsExpr | ForRange | ImportDecl => {}
   }
   0
 }
@@ -1322,10 +1367,22 @@ export function cwProjRootNode(ix: i32): i32 {
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length { return -1 }
   const n = P.nodes[p]
-  if n is Ident { return p }
-  if n is Member { return cwProjRootNode(n.memObj) }
-  if n is OptMember { return cwProjRootNode(n.omObj) }
-  if n is Index { return cwProjRootNode(n.idxArr) }
+  match n {
+    Ident => {
+      return p
+    }
+    Member => {
+      return cwProjRootNode(n.memObj)
+    }
+    OptMember => {
+      return cwProjRootNode(n.omObj)
+    }
+    Index => {
+      return cwProjRootNode(n.idxArr)
+    }
+    // any other root names no container
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
   -1
 }
 
@@ -1336,9 +1393,19 @@ function cwProjPath(ix: i32): string {
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length { return "" }
   const n = P.nodes[p]
-  if n is Member { return cwJoinPath(cwProjPath(n.memObj), n.memProp) }
-  if n is OptMember { return cwJoinPath(cwProjPath(n.omObj), n.omProp) }
-  if n is Index { return cwJoinPath(cwProjPath(n.idxArr), CW_ELEM_FLD) }
+  match n {
+    Member => {
+      return cwJoinPath(cwProjPath(n.memObj), n.memProp)
+    }
+    OptMember => {
+      return cwJoinPath(cwProjPath(n.omObj), n.omProp)
+    }
+    Index => {
+      return cwJoinPath(cwProjPath(n.idxArr), CW_ELEM_FLD)
+    }
+    // the root, or a form with no path
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
   ""
 }
 
@@ -2140,13 +2207,17 @@ function cwWriteNodeOf(u: i32): i32 {
   const p = cwIxUp[u]
   if p < 0 || p >= P.nodes.length { return -1 }
   const pn = P.nodes[p]
-  if pn is Index {
-    if cwIxUpKind[p] == CW_UP_ASG_LHS { return cwIxUp[p] }
-  }
-  if pn is Member {
-    if cwMutatesList(pn.memProp) {
-      if cwIxUpKind[p] == CW_UP_CALLEE { return cwIxUp[p] }
+  match pn {
+    Index => {
+      if cwIxUpKind[p] == CW_UP_ASG_LHS { return cwIxUp[p] }
     }
+    Member => {
+      if cwMutatesList(pn.memProp) {
+        if cwIxUpKind[p] == CW_UP_CALLEE { return cwIxUp[p] }
+      }
+    }
+    // no other parent writes through the use
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -2165,14 +2236,18 @@ export function cwElemRead(set: string[], setFr: i32[]): boolean {
     if cwIxUpKind[u] == CW_UP_OBJ {
       const p = cwIxUp[u]
       const pn = P.nodes[p]
-      if pn is Index {
-        // The destination of `xs[i] = v` is not a read; every other index is.
-        if cwIxUpKind[p] != CW_UP_ASG_LHS { return true }
-      }
-      if pn is Member {
-        if pn.memProp == "pop" || pn.memProp == "get" {
-          if cwIxUpKind[p] == CW_UP_CALLEE { return true }
+      match pn {
+        Index => {
+          // The destination of `xs[i] = v` is not a read; every other index is.
+          if cwIxUpKind[p] != CW_UP_ASG_LHS { return true }
         }
+        Member => {
+          if pn.memProp == "pop" || pn.memProp == "get" {
+            if cwIxUpKind[p] == CW_UP_CALLEE { return true }
+          }
+        }
+        // no other parent reads an element
+        NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
       }
     }
     i = i + 1
@@ -2184,8 +2259,16 @@ export function cwElemRead(set: string[], setFr: i32[]): boolean {
 // above read the element storage off.
 export function cwBindAnnOf(ix: i32): i32 {
   const n = P.nodes[ix]
-  if n is LetDecl { return n.letType }
-  if n is Param { return n.parType }
+  match n {
+    LetDecl => {
+      return n.letType
+    }
+    Param => {
+      return n.parType
+    }
+    // no other node carries a binding annotation
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
   -1
 }
 
