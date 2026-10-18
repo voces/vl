@@ -2186,6 +2186,165 @@ function declCallsUnder(ix: i32, out: i32[]) {
   0
 }
 
+// The attribution a pin's refusal of operator `op` opens with: the callee `who` when it is
+// named, a type parameter otherwise.
+function binCstrWho(op: string, who: string): string {
+  if who != "" {
+    return "`" + who + "` compares its type parameter with `" + op + "` here: "
+  }
+  "a type parameter is compared with `" + op + "` here: "
+}
+
+// Whether constraint `ci`'s substituted operands `clt`/`crt` compare as literal-union members.
+// A literal outside the pin's closed set is refused at `ix`, as the direct spelling is (D3158),
+// and answers true so no second refusal follows.
+function binCstrLitHolds(
+  ci: i32,
+  clt: i32,
+  crt: i32,
+  who: string,
+  ix: i32,
+): boolean {
+  let litHolds = eqLitMemberOk(clt, crt) || eqLitMemberOk(crt, clt)
+  if !litHolds && eqLitNonMember(clt, crt) {
+    litHolds = true
+    tErr(
+      binCstrWho(binCstr.op[ci], who)
+        + "cannot compare "
+        + tyToStr(clt)
+        + " with "
+        + tyToStr(crt)
+        + " — not a member of the union",
+      ix,
+    )
+  }
+  litHolds
+}
+
+// The equality refusals of constraint `ci` over `clt`/`crt`, in the direct spelling's own
+// words with the attribution in front (they end on a remedy clause), reported at `ix`.
+// Answers true when it reported one, which then replaces the generic sentence.
+function binCstrEqRefused(
+  ci: i32,
+  clt: i32,
+  crt: i32,
+  who: string,
+  ix: i32,
+): boolean {
+  const pMsgs: string[] = []
+  const pChan: i32[] = []
+  if binCstr.op[ci] == "==" || binCstr.op[ci] == "!=" {
+    eqRefusals(binCstr.op[ci], clt, crt, true, pMsgs, pChan)
+  }
+  if pMsgs.length == 0 { return false }
+  const pWho = binCstrWho(binCstr.op[ci], who)
+  let pm = 0
+  while pm < pMsgs.length {
+    const pTxt = pWho + pMsgs[pm]
+    if pChan[pm] == 1 { tErrUnsupported(pTxt, ix) } else { tErr(pTxt, ix) }
+    pm = pm + 1
+  }
+  true
+}
+
+// The direct spelling's refusal sentence for constraint `ci`, whose operator is undefined for
+// the substituted operands `clt`/`crt`.
+function binCstrRefusalText(ci: i32, clt: i32, crt: i32): string {
+  let refusal = "operator '"
+    + binCstr.op[ci]
+    + "' is not defined for "
+    + tyToStr(clt)
+    + " and "
+    + tyToStr(crt)
+  if binCstr.op[ci] == OP_NEG {
+    refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
+  }
+  if binCstr.op[ci] == OP_BNOT {
+    refusal = "unary '~' expects a numeric type, got " + tyToStr(clt)
+    if isNumeric(clt) {
+      refusal = "operator '~' is integer-only, got " + tyToStr(clt)
+    }
+  }
+  if binCstr.op[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
+  if binCstr.op[ci] == OP_LITFIT {
+    refusal = tyToStr(clt) + " cannot hold the 64-bit operand it meets"
+  }
+  // An ordering over a gradual union is refused in the direct spelling's words.
+  const cop = binCstr.op[ci]
+  if (
+    (cop == "<" || cop == ">" || cop == "<=" || cop == ">=")
+    && (tyIsGradualUnion(binCstr.lt[ci]) || tyIsGradualUnion(binCstr.rt[ci]))
+  ) {
+    refusal = "comparison expects numeric operands, got "
+      + tyToStr(clt)
+      + " and "
+      + tyToStr(crt)
+  }
+  refusal
+}
+
+// The tail naming what the callee's body (`who`, or unnamed) does with operator `op` to the
+// arguments numbered `lNo`/`rNo`, 0 for a side no argument is responsible for.
+function binCstrBodyTail(op: string, who: string, lNo: i32, rNo: i32): string {
+  let bodyWho = "the callee's body"
+  if who != "" { bodyWho = "the body of `" + who + "`" }
+  let tail = " (" + bodyWho + " applies '" + op + "' to this argument)"
+  if lNo != 0 && rNo != 0 {
+    if lNo == rNo {
+      tail = " (" + bodyWho + " uses it on both sides of '" + op + "')"
+    } else {
+      tail = " ("
+        + bodyWho
+        + " applies '"
+        + op
+        + "' to arguments "
+        + i32ToStr(lNo)
+        + " and "
+        + i32ToStr(rNo)
+        + ")"
+    }
+  }
+  if op == OP_NEG { tail = " (" + bodyWho + " negates this argument)" }
+  if op == OP_BNOT { tail = " (" + bodyWho + " flips this argument's bits)" }
+  if op == OP_LITFIT {
+    tail = " (" + bodyWho + " computes with it and a 64-bit value)"
+  }
+  tail
+}
+
+// Refuses constraint `ci`, whose operator is undefined for `clt`/`crt`, in the direct
+// spelling's sentence. The anchor is the responsible argument, not the call's last token, so
+// a one-line call carets correctly; `ix` when no argument node is found.
+function binCstrOpRefusal(
+  ci: i32,
+  clt: i32,
+  crt: i32,
+  who: string,
+  ix: i32,
+  hNames: string[],
+  hArgNo: i32[],
+  hArgNode: i32[],
+) {
+  const lNo = cstrArgNoOf(binCstr.lt[ci], hNames, hArgNo)
+  const rNo = cstrArgNoOf(binCstr.rt[ci], hNames, hArgNo)
+  const lN = cstrArgCountOf(binCstr.lt[ci], hNames)
+  const rN = cstrArgCountOf(binCstr.rt[ci], hNames)
+  const refusal = binCstrRefusalText(ci, clt, crt)
+  let anchorNo = lNo
+  if anchorNo == 0 { anchorNo = rNo }
+  let msg = refusal + " (the call's argument types)"
+  if lN <= 1 && rN <= 1 && anchorNo > 0 {
+    // One argument responsible gets the `argument N:` head every other diagnostic uses; two
+    // get no head (it would blame one) and the tail names both instead.
+    let head = "argument " + i32ToStr(anchorNo) + ": "
+    if lNo != 0 && rNo != 0 && lNo != rNo { head = "" }
+    msg = head + refusal + binCstrBodyTail(binCstr.op[ci], who, lNo, rNo)
+  }
+  const aNode = cstrArgNodeOf(anchorNo, hArgNo, hArgNode)
+  if aNode >= 0 { tErr(msg, aNode) } else { tErr(msg, ix) }
+  0
+}
+
 // Re-validates every deferred binary-op constraint this call resolves: substitutes the holes
 // to the call's concrete argument types and checks the operator is defined for them — the one
 // rule numeric, string and relational operators all reduce to. Re-defers when a hole
@@ -2223,150 +2382,16 @@ export function validateBinCstrs(
       }
       let litHolds = false
       if !tyHasHole(clt) && !tyHasHole(crt) {
-        litHolds = eqLitMemberOk(clt, crt) || eqLitMemberOk(crt, clt)
-        // A literal outside the pin's closed set is refused, as the direct spelling is (D3158).
-        if !litHolds && eqLitNonMember(clt, crt) {
-          litHolds = true
-          let lWho = "a type parameter is compared with `"
-            + binCstr.op[ci]
-            + "` here: "
-          if who != "" {
-            lWho = "`"
-              + who
-              + "` compares its type parameter with `"
-              + binCstr.op[ci]
-              + "` here: "
-          }
-          tErr(
-            lWho
-              + "cannot compare "
-              + tyToStr(clt)
-              + " with "
-              + tyToStr(crt)
-              + " — not a member of the union",
-            ix,
-          )
-        }
+        litHolds = binCstrLitHolds(ci, clt, crt, who, ix)
         clt = softenBareLitTy(clt)
         crt = softenBareLitTy(crt)
       }
-      if !tyHasHole(clt) && !litHolds {
-        if !tyHasHole(crt) {
-          // The equality refusal (in the direct spelling's own words) replaces the generic
-          // sentence here, with the attribution placed in front since it ends on a remedy clause.
-          const pMsgs: string[] = []
-          const pChan: i32[] = []
-          if binCstr.op[ci] == "==" || binCstr.op[ci] == "!=" {
-            eqRefusals(binCstr.op[ci], clt, crt, true, pMsgs, pChan)
-          }
-          if pMsgs.length > 0 {
-            let pWho = "a type parameter is compared with `"
-              + binCstr.op[ci]
-              + "` here: "
-            if who != "" {
-              pWho = "`"
-                + who
-                + "` compares its type parameter with `"
-                + binCstr.op[ci]
-                + "` here: "
-            }
-            let pm = 0
-            while pm < pMsgs.length {
-              const pTxt = pWho + pMsgs[pm]
-              if pChan[pm] == 1 {
-                tErrUnsupported(pTxt, ix)
-              } else {
-                tErr(pTxt, ix)
-              }
-              pm = pm + 1
-            }
-          } else if !binOpDefinedFor(binCstr.op[ci], clt, crt) {
-            // The refusal sentence is the direct spelling's, verbatim; the anchor moves to
-            // the first argument (not the call's last token) so a one-line call carets correctly.
-            const lNo = cstrArgNoOf(binCstr.lt[ci], hNames, hArgNo)
-            const rNo = cstrArgNoOf(binCstr.rt[ci], hNames, hArgNo)
-            const lN = cstrArgCountOf(binCstr.lt[ci], hNames)
-            const rN = cstrArgCountOf(binCstr.rt[ci], hNames)
-            let refusal = "operator '"
-              + binCstr.op[ci]
-              + "' is not defined for "
-              + tyToStr(clt)
-              + " and "
-              + tyToStr(crt)
-            if binCstr.op[ci] == OP_NEG {
-              refusal = "unary '-' expects a numeric type, got " + tyToStr(clt)
-            }
-            if binCstr.op[ci] == OP_BNOT {
-              refusal = "unary '~' expects a numeric type, got " + tyToStr(clt)
-              if isNumeric(clt) {
-                refusal = "operator '~' is integer-only, got " + tyToStr(clt)
-              }
-            }
-            if binCstr.op[ci] == OP_AS { refusal = asPinRefusal(clt, crt) }
-            if binCstr.op[ci] == OP_LITFIT {
-              refusal = tyToStr(clt)
-                + " cannot hold the 64-bit operand it meets"
-            }
-            // An ordering over a gradual union is refused in the direct spelling's words.
-            const cop = binCstr.op[ci]
-            if (
-              (cop == "<" || cop == ">" || cop == "<=" || cop == ">=")
-              && (tyIsGradualUnion(binCstr.lt[ci])
-                || tyIsGradualUnion(binCstr.rt[ci]))
-            ) {
-              refusal = "comparison expects numeric operands, got "
-                + tyToStr(clt)
-                + " and "
-                + tyToStr(crt)
-            }
-            let anchorNo = lNo
-            if anchorNo == 0 { anchorNo = rNo }
-            let msg = refusal + " (the call's argument types)"
-            if lN <= 1 && rN <= 1 && anchorNo > 0 {
-              let bodyWho = "the callee's body"
-              if who != "" { bodyWho = "the body of `" + who + "`" }
-              // One argument responsible gets the `argument N:` head every other diagnostic
-              // uses; two get no head (it would blame one) and the tail names both instead.
-              let head = "argument " + i32ToStr(anchorNo) + ": "
-              let tail = " ("
-                + bodyWho
-                + " applies '"
-                + binCstr.op[ci]
-                + "' to this argument)"
-              if lNo != 0 && rNo != 0 {
-                if lNo == rNo {
-                  tail = " ("
-                    + bodyWho
-                    + " uses it on both sides of '"
-                    + binCstr.op[ci]
-                    + "')"
-                } else {
-                  head = ""
-                  tail = " ("
-                    + bodyWho
-                    + " applies '"
-                    + binCstr.op[ci]
-                    + "' to arguments "
-                    + i32ToStr(lNo)
-                    + " and "
-                    + i32ToStr(rNo)
-                    + ")"
-                }
-              }
-              if binCstr.op[ci] == OP_NEG {
-                tail = " (" + bodyWho + " negates this argument)"
-              }
-              if binCstr.op[ci] == OP_BNOT {
-                tail = " (" + bodyWho + " flips this argument's bits)"
-              }
-              if binCstr.op[ci] == OP_LITFIT {
-                tail = " (" + bodyWho + " computes with it and a 64-bit value)"
-              }
-              msg = head + refusal + tail
-            }
-            const aNode = cstrArgNodeOf(anchorNo, hArgNo, hArgNode)
-            if aNode >= 0 { tErr(msg, aNode) } else { tErr(msg, ix) }
-          }
+      if !tyHasHole(clt) && !litHolds && !tyHasHole(crt) {
+        if (
+          !binCstrEqRefused(ci, clt, crt, who, ix)
+          && !binOpDefinedFor(binCstr.op[ci], clt, crt)
+        ) {
+          binCstrOpRefusal(ci, clt, crt, who, ix, hNames, hArgNo, hArgNode)
         }
       }
     }

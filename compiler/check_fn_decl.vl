@@ -1060,6 +1060,108 @@ function fnDeclDeclareParams(
   checkParamNestedFnClash(n, params)
 }
 
+// Grades the implicit return `tail` (of type `stTy`) against the declared return `ret` through
+// `assignableExpr`, not bare `assignable`, so the coercions a declared-type binding grants
+// apply as they do to an explicit `return <expr>`. A tail `if` grades each arm's value.
+function fnTailGradeAgainstRet(tail: i32, stTy: i32, ret: i32) {
+  if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR { clearTailVerdict(tail) }
+  if ret < 0 { return 0 }
+  // A tail `if` is a statement node, so its arms' `{}` reach no `assignableExpr`.
+  if isStmtNode(tail) { bareBraceDeliver(tail, ret, 8, false) }
+  if !isStmtNode(tail) {
+    // A `never` body is graded whole below, not by its tail's value.
+    if !isVoidTy(ret) && ret != TY_NEVER {
+      if !assignableExpr(tail, stTy, ret) {
+        tErrWant(
+          "expected "
+            + tyToStr(ret)
+            + ", got "
+            + tyToStr(stTy)
+            + boolForNumberNote(stTy, ret)
+            + numUnionLossNote(stTy, ret)
+            + storageListNote(tail, stTy, ret)
+            + litMemberNote(tail, ret, 8),
+          tail,
+          ret,
+        )
+      } else {
+        // The check above is vacuous whenever a side is a hole, exactly as the explicit
+        // `return`'s is, so the implicit return records the same pair for the pin to re-ask
+        // under substitution; without it a generic's tail loses its refusal (D1739).
+        noteRetCstr(coalPinTy(tail, stTy), ret, tail)
+      }
+    }
+  } else if P.nodes[tail] is IfStmt {
+    // A tail `if`/`else` — or the chain a tail `match` desugared to — is a statement
+    // node, but under a non-void return each arm's value is the return (D2234).
+    if !isVoidTy(ret) && ret != TY_NEVER { checkTailArmsAgainst(tail, ret) }
+  }
+  0
+}
+
+// Records the trailing statement `tail` (of type `stTy`) of an inferring body as a return
+// witness, refuses a body-scoped nominal escaping through it, and checks the fall-through of a
+// trailing chain against the join observed so far.
+function fnTailInferWitness(tail: i32, stTy: i32) {
+  // A value-producing trailing expression is a value return POSITION (vs a
+  // bare trailing statement); the redundant-return fixpoint defers only these.
+  if !isStmtNode(tail) { fnSawValueRetSet(true) }
+  // D1045 — the IMPLICIT return of the same rule: the trailing expression
+  // is what a caller receives, so a body-scoped nominal escapes here too.
+  if !isStmtNode(tail) { refuseLocalNomEscape(stTy, tail) }
+  // The IMPLICIT return of the deferred pin, for the reason the explicit one
+  // states: under inference the destination is the join, not this witness (D1591).
+  // A tail `if` with a value-less arm is a statement, so the body has no tail value.
+  if !ifYieldsNoValue(tail) {
+    noteInferRetWitness(tail, stTy)
+    inferRetNextLitSet(armLit(stTy, tail))
+    noteInferredRet(ifTailValTyOf(tail, inferRetTyOf(tail, stTy)))
+  }
+  // The soundness check for an inferred return: `inferObserved` is the join of the
+  // returns just walked (the value type the chain infers), while the tail if-statement's
+  // own type is void for an all-returning chain — so the accumulated join is what the
+  // fall-through is checked against, refused the same as an annotation would (D1902).
+  checkTrailingChainTotal(tail, inferObserved)
+  0
+}
+
+// Witnesses the NATURAL type `stTy` of the trailing statement `tail` of an annotated body for
+// the redundant-return rule, pins an empty collection from `ret`, and checks the fall-through.
+function fnTailNaturalRet(tail: i32, stTy: i32, ret: i32) {
+  // Witnessed before constrainEmpty pins a hole; an annotation-influenced trailing
+  // (empty `[]`/`Map()`, `null`) disqualifies the function.
+  if retInfluencedByAnnot(tail) || retSiteTypedByAnnot(tail, stTy) {
+    retNaturalErrSet(true)
+  }
+  noteNaturalRet(stTy)
+  constrainEmptyExpr(tail, stTy, ret)
+  // Soundness — missing-return / non-exhaustive fall-through: an else-less `is`-chain
+  // that does not cover every variant lets a value fall off the end, refused for a
+  // non-void declared return (D1902).
+  checkTrailingChainTotal(tail, ret)
+  0
+}
+
+// Hover over an un-annotated param: the body has now recorded everything it demands of the
+// param hole, so re-retains the binding's type as that demand (the disjunction the call-arg
+// diagnostic names) instead of the bare hole, which renders as `_`. Holes the body never
+// constrained keep the `TyVar`, still skipped by the inlay-hint scan.
+function fnRetainParamDemands(params: i32[], paramTys: i32[]) {
+  let hp = 0
+  while hp < params.length {
+    const hpNode = P.nodes[params[hp]]
+    if hpNode is Param && paramTys[hp] >= 0 {
+      const hpTy = T.tys[paramTys[hp]]
+      if hpTy is TyVar {
+        const hpDemand = holeDemandTy(hpTy.tvName)
+        if hpDemand >= 0 { symRetainType(params[hp], hpDemand, 1) }
+      }
+    }
+    hp = hp + 1
+  }
+  0
+}
+
 // Checks the statements of the body of declaration `fnIx` under its scope, the last as the
 // implicit return (graded against `ret`, or a witness under inference), and retains hover
 // types. Answers whether the body is total, asked while the scope is still live.
@@ -1125,114 +1227,20 @@ function fnDeclCheckBody(
       // collection (`mk(): i32[] { … inner }`) pins its element from the return
       // type here — before the body scope is popped (and `inner`'s floor checked).
       if s == stmts.length - 1 {
-        // Checked against the return type through `assignableExpr`, not bare `assignable`, so
-        // the same coercions a declared-type binding grants (a literal widening) apply here too,
-        // matching an explicit `return <expr>` — the bare trailing expression, which is the
-        // implicit return, needs the identical check.
         if !inferring && tailIsReturn {
-          if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
-            clearTailVerdict(stmts[s])
-          }
-          if ret >= 0 {
-            // A tail `if` is a statement node, so its arms' `{}` reach no `assignableExpr`.
-            if isStmtNode(stmts[s]) {
-              bareBraceDeliver(stmts[s], ret, 8, false)
-            }
-            if !isStmtNode(stmts[s]) {
-              // A `never` body is graded whole below, not by its tail's value.
-              if !isVoidTy(ret) && ret != TY_NEVER {
-                if !assignableExpr(stmts[s], stTy, ret) {
-                  tErrWant(
-                    "expected "
-                      + tyToStr(ret)
-                      + ", got "
-                      + tyToStr(stTy)
-                      + boolForNumberNote(stTy, ret)
-                      + numUnionLossNote(stTy, ret)
-                      + storageListNote(stmts[s], stTy, ret)
-                      + litMemberNote(stmts[s], ret, 8),
-                    stmts[s],
-                    ret,
-                  )
-                } else {
-                  // The check above is vacuous whenever a side is a hole, exactly as the
-                  // explicit `return`'s is — so the implicit return records the same pair for
-                  // the pin to re-ask under substitution. Without it a generic's TAIL
-                  // expression loses the refusal its `return` spelling makes (D1739).
-                  noteRetCstr(coalPinTy(stmts[s], stTy), ret, stmts[s])
-                }
-              }
-            } else if P.nodes[stmts[s]] is IfStmt {
-              // A tail `if`/`else` — or the chain a tail `match` desugared to — is a statement
-              // node, but under a non-void return each arm's value is the return (D2234).
-              if !isVoidTy(ret) && ret != TY_NEVER {
-                checkTailArmsAgainst(stmts[s], ret)
-              }
-            }
-          }
+          fnTailGradeAgainstRet(stmts[s], stTy, ret)
         }
         if inferring {
-          // A value-producing trailing expression is a value return POSITION (vs a
-          // bare trailing statement); the redundant-return fixpoint defers only these.
-          if !isStmtNode(stmts[s]) { fnSawValueRetSet(true) }
-          // D1045 — the IMPLICIT return of the same rule: the trailing expression
-          // is what a caller receives, so a body-scoped nominal escapes here too.
-          if !isStmtNode(stmts[s]) { refuseLocalNomEscape(stTy, stmts[s]) }
-          // The IMPLICIT return of the deferred pin, for the reason the explicit one
-          // states: under inference the destination is the join, not this witness (D1591).
-          // A tail `if` with a value-less arm is a statement, so the body has no tail value.
-          if !ifYieldsNoValue(stmts[s]) {
-            noteInferRetWitness(stmts[s], stTy)
-            inferRetNextLitSet(armLit(stTy, stmts[s]))
-            noteInferredRet(
-              ifTailValTyOf(stmts[s], inferRetTyOf(stmts[s], stTy)),
-            )
-          }
-          // The soundness check for an inferred return: `inferObserved` is the join of the
-          // returns just walked (the value type the chain infers), while the tail if-statement's
-          // own type is void for an all-returning chain — so the accumulated join is what the
-          // fall-through is checked against, refused the same as an annotation would (D1902).
-          checkTrailingChainTotal(stmts[s], inferObserved)
+          fnTailInferWitness(stmts[s], stTy)
         } else {
-          // Redundant-return rule: witness the trailing expression's NATURAL type
-          // (before constrainEmpty pins a hole); an annotation-influenced trailing
-          // (empty `[]`/`Map()`, `null`) disqualifies the function.
-          if (
-            retInfluencedByAnnot(stmts[s])
-            || retSiteTypedByAnnot(stmts[s], stTy)
-          ) {
-            retNaturalErrSet(true)
-          }
-          noteNaturalRet(stTy)
-          constrainEmptyExpr(stmts[s], stTy, ret)
-          // Soundness — missing-return / non-exhaustive fall-through: an else-less `is`-chain
-          // that does not cover every variant lets a value fall off the end, refused for a
-          // non-void declared return (D1902).
-          checkTrailingChainTotal(stmts[s], ret)
+          fnTailNaturalRet(stmts[s], stTy, ret)
         }
       }
       s = s + 1
     }
   }
   chkStmtBlkSet(savedStmtBlk)
-  // Hover over an un-annotated param: the body has now recorded everything it demands of the
-  // param hole, so re-retains the binding's type as that demand (the same disjunction the
-  // call-arg diagnostic names) instead of the bare hole, which renders as an uninformative `_`.
-  // Holes the body never constrained keep the `TyVar`, still skipped by the inlay-hint scan.
-  if symEnabled != 0 && !inferQuiet {
-    let hp = 0
-    while hp < params.length {
-      const hpNode = P.nodes[params[hp]]
-      if hpNode is Param && paramTys[hp] >= 0 {
-        const hpTy = T.tys[paramTys[hp]]
-        if hpTy is TyVar {
-          const hpDemand = holeDemandTy(hpTy.tvName)
-          if hpDemand >= 0 { symRetainType(params[hp], hpDemand, 1) }
-        }
-      }
-      hp = hp + 1
-    }
-  }
+  if symEnabled != 0 && !inferQuiet { fnRetainParamDemands(params, paramTys) }
   // Capture body TOTALITY (missing-return soundness) while the body scope is still LIVE
   // — `ifCondIsDiscriminating` looks up a discriminated param/local's type, which the
   // `popScope` below would drop. The flag is consumed after `ret` is finalized.
