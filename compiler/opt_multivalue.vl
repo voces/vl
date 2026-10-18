@@ -2750,10 +2750,9 @@ function sameBytes(a: u8[], b: u8[]): boolean {
   true
 }
 
-// Builds the output module from the plans: new types, twin functions and bodies, names, and
-// the body moves. Empty when the step is abandoned.
-function assemble(): u8[] {
-  const none: u8[] = []
+// Resets the signature tables and gives each merged `if`'s result record a block type in
+// `blockType`, one per distinct record. False when a signature cannot be indexed.
+function assembleBlockTypes(): boolean {
   sigEnc = []
   sigHead = Map()
   sigNext = []
@@ -2771,11 +2770,89 @@ function assemble(): u8[] {
     if i == 0 || merged[i] != merged[i - 1] {
       const noParams: i32[] = []
       const ti = sigIndex(noParams, fieldsOf(merged[i]))
-      if ti < 0 { return none }
+      if ti < 0 { return false }
       blockType[merged[i]] = ti
     }
     i = i + 1
   }
+  true
+}
+
+// The code section of the output module from `bodies`: an unchanged body is taken with its size
+// from the input when that size is spelled as `putUleb` spells it, so runs of unchanged bodies
+// stay one piece. Pushes each body's start in the output onto `pairAt`.
+function assembleCodeSection(
+  bodies: u8[][],
+  bodyAt: i32[],
+  bodyLen: i32[],
+  bodyIn: boolean[],
+  pairAt: i32[],
+) {
+  let size = lebWidth(bodies.length)
+  let b = 0
+  while b < bodies.length {
+    size = size + lebWidth(bodyLen[b]) + bodyLen[b]
+    b = b + 1
+  }
+  rpByte(10)
+  rpLeb(size)
+  rpLeb(bodies.length)
+  b = 0
+  while b < bodies.length {
+    const w = lebWidth(bodyLen[b])
+    if bodyIn[b] && minimalLebBefore(bodyAt[b], bodyLen[b]) {
+      pairAt.push(rpSize + w)
+      rpInput(bodyAt[b] - w, w + bodyLen[b])
+    } else {
+      rpLeb(bodyLen[b])
+      pairAt.push(rpSize)
+      if bodyIn[b] {
+        rpInput(bodyAt[b], bodyLen[b])
+      } else {
+        rpRange(bodies[b], bodyAt[b], bodyLen[b])
+      }
+    }
+    b = b + 1
+  }
+}
+
+// `out` with a name for each twin, after its function so a trap in it reads as that function.
+// Empty, with `movesOut` cleared, when `out`'s name section cannot be read.
+function assembleTwinNames(out: u8[]): u8[] {
+  const none: u8[] = []
+  const w = wnRead(out)
+  if !w.ok {
+    movesOut = []
+    return none
+  }
+  const total = nFuncs + twF.length
+  const table = wnTable(w, total)
+  const entries: u8[] = []
+  let count = 0
+  let f = 0
+  while f < total {
+    const r = if f < nFuncs { table[f] } else { table[twF[f - nFuncs]] }
+    if r >= 0 {
+      if f < nFuncs {
+        wnEntry(entries, f, out, w.at[r], w.len[r])
+      } else {
+        const name: u8[] = []
+        copyBytes(name, out, w.at[r], w.len[r])
+        for cp in ".mv" { name.push(cp) }
+        wnEntry(entries, f, name, 0, name.length)
+      }
+      count = count + 1
+    }
+    f = f + 1
+  }
+  wnWrite(out, w, count, entries)
+}
+
+// Builds the output module from the plans: new types, twin functions and bodies, names, and
+// the body moves. Empty when the step is abandoned.
+function assemble(): u8[] {
+  const none: u8[] = []
+  if !assembleBlockTypes() { return none }
   // The bodies (each a range of a buffer), and per output body its pairs and source range.
   const bodies: u8[][] = []
   const bodyAt: i32[] = []
@@ -2836,7 +2913,7 @@ function assemble(): u8[] {
     return none
   }
   const twinTypes: i32[] = []
-  i = 0
+  let i = 0
   while i < twF.length {
     const ti = twinSig(i)
     if ti < 0 { return none }
@@ -2873,34 +2950,7 @@ function assemble(): u8[] {
         saw = saw | 2
       }
     } else if id == 10 {
-      // An unchanged body is taken with its size from the input when that size is spelled
-      // as `putUleb` spells it, so runs of unchanged bodies stay one piece.
-      let size = lebWidth(bodies.length)
-      let b = 0
-      while b < bodies.length {
-        size = size + lebWidth(bodyLen[b]) + bodyLen[b]
-        b = b + 1
-      }
-      rpByte(10)
-      rpLeb(size)
-      rpLeb(bodies.length)
-      b = 0
-      while b < bodies.length {
-        const w = lebWidth(bodyLen[b])
-        if bodyIn[b] && minimalLebBefore(bodyAt[b], bodyLen[b]) {
-          pairAt.push(rpSize + w)
-          rpInput(bodyAt[b] - w, w + bodyLen[b])
-        } else {
-          rpLeb(bodyLen[b])
-          pairAt.push(rpSize)
-          if bodyIn[b] {
-            rpInput(bodyAt[b], bodyLen[b])
-          } else {
-            rpRange(bodies[b], bodyAt[b], bodyLen[b])
-          }
-        }
-        b = b + 1
-      }
+      assembleCodeSection(bodies, bodyAt, bodyLen, bodyIn, pairAt)
       saw = saw | 4
     }
     if id == 1 || id == 3 {
@@ -2934,33 +2984,7 @@ function assemble(): u8[] {
     i = i + 1
   }
   if !hasNames { return out }
-  // A twin is named after its function, so a trap in it reads as that function.
-  const w = wnRead(out)
-  if !w.ok {
-    movesOut = []
-    return none
-  }
-  const total = nFuncs + twF.length
-  const table = wnTable(w, total)
-  const entries: u8[] = []
-  let count = 0
-  let f = 0
-  while f < total {
-    const r = if f < nFuncs { table[f] } else { table[twF[f - nFuncs]] }
-    if r >= 0 {
-      if f < nFuncs {
-        wnEntry(entries, f, out, w.at[r], w.len[r])
-      } else {
-        const name: u8[] = []
-        copyBytes(name, out, w.at[r], w.len[r])
-        for cp in ".mv" { name.push(cp) }
-        wnEntry(entries, f, name, 0, name.length)
-      }
-      count = count + 1
-    }
-    f = f + 1
-  }
-  wnWrite(out, w, count, entries)
+  assembleTwinNames(out)
 }
 
 // Twin `i`'s signature's type index, or -1.

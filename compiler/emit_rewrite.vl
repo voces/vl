@@ -1315,6 +1315,110 @@ function drwOpCall(call: i32, opIx: i32): i32 {
   call
 }
 
+// `drwWalk`'s block arm: walks block `n`'s statements in order, splicing each compound place's
+// spills in ahead of it, with a closure binding's name live from its declaration to the
+// block's end.
+function drwWalkBlock(n: Block, ctx: i32) {
+  const bs = n.blkStmts
+  let i2 = 0
+  // A closure binding opens where it is declared and closes with the block, so the
+  // stack grows as the statements are walked and truncates on the way out.
+  const cloMark = drwCloNames.length
+  while i2 < bs.length {
+    // The spills land ahead of the write and are walked next, as ordinary statements.
+    const cpOut: i32[] = []
+    if spillCompoundPlace(bs[i2], cpOut, ctx) {
+      const cn = cpOut.length
+      let cj = bs.length - 1
+      while bs.length < cj + 1 + cn { bs.push(-1) }
+      while cj >= i2 {
+        bs[cj + cn] = bs[cj]
+        cj = cj - 1
+      }
+      cj = 0
+      while cj < cn {
+        bs[i2 + cj] = cpOut[cj]
+        cj = cj + 1
+      }
+      capMemoNoteEdit()
+      plCacheBust()
+    }
+    const bst = P.nodes[bs[i2]]
+    if bst is LetDecl {
+      if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
+    }
+    drwAtStmt = i2 + 1 < bs.length
+    bs[i2] = drwBareBlock(drwWalk(bs[i2], ctx))
+    i2 = i2 + 1
+  }
+  while drwCloNames.length > cloMark { drwCloNames.pop() }
+}
+
+// `drwWalk`'s `if` arm: walks the condition and branches of the `if` at `ix`, following an
+// `else if` chain along its spine, so its depth costs no stack (D1990).
+function drwWalkIfChain(ix: i32, ctx: i32) {
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    cur = -1
+    if c is IfStmt {
+      c.ifCond = drwWalk(c.ifCond, ctx)
+      c.ifThen = drwWalk(c.ifThen, ctx)
+      if c.ifElse >= 0 {
+        if P.nodes[c.ifElse] is IfStmt {
+          drwAtStmt = false
+          cur = c.ifElse
+        } else {
+          c.ifElse = drwWalk(c.ifElse, ctx)
+        }
+      }
+    }
+  }
+}
+
+// `drwWalk`'s `?.` read arm for `n` at `ix`: walks the receiver, then answers the plain read
+// over a receiver that cannot be null, a record-union field's guarded read, or `ix` itself.
+function drwWalkOptMember(ix: i32, n: OptMember, ctx: i32): i32 {
+  n.omObj = drwWalk(n.omObj, ctx)
+  // A guard over a receiver that cannot be null is the plain read: the null arm is
+  // unreachable, and the standalone `?.` lowering has no rep to build for a result the
+  // guard never widened. Folded here for the reason `x ?? d` over a non-nullable left
+  // operand is (D1815).
+  if nodeTyExcludesNull(n.omObj) {
+    const omFold = mkMember(n.omObj, n.omProp, n.pos)
+    nodeTyCarry(omFold, ix)
+    return omFold
+  }
+  const omFt = recUnionFieldTyOf(nodeTyIxOf(n.omObj), n.omProp, nodeTyIxOf(ix))
+  if omFt >= 0 { return recUnionOptRead(ix, n, omFt) }
+  return ix
+}
+
+// `drwWalk`'s index arm for `n` at `ix`: walks both operands, then answers a free `"[]"`
+// operator's call, a `"[]"` closure field's call on a struct receiver, or `ix` itself.
+function drwWalkIndex(ix: i32, n: Index, ctx: i32): i32 {
+  n.idxArr = drwWalk(n.idxArr, ctx)
+  n.idxIndex = drwWalk(n.idxIndex, ctx)
+  // A free `"[]"` operator function: a direct call, resolved by the checker from
+  // the receiver's type and banked on this node — ahead of the closure-field trap
+  // below, mirroring the `a op b` arm's order.
+  const rOp = opIdxFnAtNode(ix)
+  if rOp != "" {
+    const roargs: i32[] = []
+    roargs.push(n.idxArr)
+    roargs.push(n.idxIndex)
+    return drwOpCall(mkCall(drwFnRef(rOp), roargs, -1), ix)
+  }
+  // The index read trap: a struct receiver carrying a "[]" closure field.
+  const tsi = structIndexOfExpr(n.idxArr, ctx)
+  if drwFieldClosure(tsi, "[]") {
+    const targs: i32[] = []
+    targs.push(n.idxIndex)
+    return drwOpCall(mkCall(mkMember(n.idxArr, "[]", -1), targs, -1), ix)
+  }
+  return ix
+}
+
 // Every node this returns in place of `ix` is freshly minted, except the `??` fold's left
 // operand, which reports itself to the capture memo (D2017).
 function drwWalk(ix: i32, ctx: i32) {
@@ -1350,39 +1454,7 @@ function drwWalk(ix: i32, ctx: i32) {
     return ix
   }
   if n is Block {
-    const bs = n.blkStmts
-    let i2 = 0
-    // A closure binding opens where it is declared and closes with the block, so the
-    // stack grows as the statements are walked and truncates on the way out.
-    const cloMark = drwCloNames.length
-    while i2 < bs.length {
-      // The spills land ahead of the write and are walked next, as ordinary statements.
-      const cpOut: i32[] = []
-      if spillCompoundPlace(bs[i2], cpOut, ctx) {
-        const cn = cpOut.length
-        let cj = bs.length - 1
-        while bs.length < cj + 1 + cn { bs.push(-1) }
-        while cj >= i2 {
-          bs[cj + cn] = bs[cj]
-          cj = cj - 1
-        }
-        cj = 0
-        while cj < cn {
-          bs[i2 + cj] = cpOut[cj]
-          cj = cj + 1
-        }
-        capMemoNoteEdit()
-        plCacheBust()
-      }
-      const bst = P.nodes[bs[i2]]
-      if bst is LetDecl {
-        if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
-      }
-      drwAtStmt = i2 + 1 < bs.length
-      bs[i2] = drwBareBlock(drwWalk(bs[i2], ctx))
-      i2 = i2 + 1
-    }
-    while drwCloNames.length > cloMark { drwCloNames.pop() }
+    drwWalkBlock(n, ctx)
     return ix
   }
   if n is LetDecl {
@@ -1390,24 +1462,7 @@ function drwWalk(ix: i32, ctx: i32) {
     return ix
   }
   if n is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-    let cur = ix
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      cur = -1
-      if c is IfStmt {
-        c.ifCond = drwWalk(c.ifCond, ctx)
-        c.ifThen = drwWalk(c.ifThen, ctx)
-        if c.ifElse >= 0 {
-          if P.nodes[c.ifElse] is IfStmt {
-            drwAtStmt = false
-            cur = c.ifElse
-          } else {
-            c.ifElse = drwWalk(c.ifElse, ctx)
-          }
-        }
-      }
-    }
+    drwWalkIfChain(ix, ctx)
     return ix
   }
   if n is WhileStmt {
@@ -1444,47 +1499,8 @@ function drwWalk(ix: i32, ctx: i32) {
     n.memObj = drwWalk(n.memObj, ctx)
     return ix
   }
-  if n is OptMember {
-    n.omObj = drwWalk(n.omObj, ctx)
-    // A guard over a receiver that cannot be null is the plain read: the null arm is
-    // unreachable, and the standalone `?.` lowering has no rep to build for a result the
-    // guard never widened. Folded here for the reason `x ?? d` over a non-nullable left
-    // operand is (D1815).
-    if nodeTyExcludesNull(n.omObj) {
-      const omFold = mkMember(n.omObj, n.omProp, n.pos)
-      nodeTyCarry(omFold, ix)
-      return omFold
-    }
-    const omFt = recUnionFieldTyOf(
-      nodeTyIxOf(n.omObj),
-      n.omProp,
-      nodeTyIxOf(ix),
-    )
-    if omFt >= 0 { return recUnionOptRead(ix, n, omFt) }
-    return ix
-  }
-  if n is Index {
-    n.idxArr = drwWalk(n.idxArr, ctx)
-    n.idxIndex = drwWalk(n.idxIndex, ctx)
-    // A free `"[]"` operator function: a direct call, resolved by the checker from
-    // the receiver's type and banked on this node — ahead of the closure-field trap
-    // below, mirroring the `a op b` arm's order.
-    const rOp = opIdxFnAtNode(ix)
-    if rOp != "" {
-      const roargs: i32[] = []
-      roargs.push(n.idxArr)
-      roargs.push(n.idxIndex)
-      return drwOpCall(mkCall(drwFnRef(rOp), roargs, -1), ix)
-    }
-    // The index read trap: a struct receiver carrying a "[]" closure field.
-    const tsi = structIndexOfExpr(n.idxArr, ctx)
-    if drwFieldClosure(tsi, "[]") {
-      const targs: i32[] = []
-      targs.push(n.idxIndex)
-      return drwOpCall(mkCall(mkMember(n.idxArr, "[]", -1), targs, -1), ix)
-    }
-    return ix
-  }
+  if n is OptMember { return drwWalkOptMember(ix, n, ctx) }
+  if n is Index { return drwWalkIndex(ix, n, ctx) }
   if n is IsExpr {
     n.isObj = drwWalk(n.isObj, ctx)
     return ix
