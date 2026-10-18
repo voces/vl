@@ -85,7 +85,6 @@ import {
   nameIsMap,
   nameIsU8Array,
   nulCloFlag,
-  nullablePartOf,
   retArrFlag,
   retF32ArrFlag,
   retF32Flag,
@@ -529,52 +528,46 @@ export function retNulRefIndex(tyIx: i32) {
     }
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      const nb = nulBaseStructRow(tyIx, ty.tyName)
+      const nb = nulBaseStructRow(tyIx)
       if nb >= 0 { return nb }
     }
   }
   -1
 }
 
-// The struct/rep row of the base of a nullable-struct annotation (`S | null` -> `S`'s row),
-// or -1. Three rungs: the arena (a `TyNullable`'s peeled inner via `repRowOfTyStruct`,
-// no render), `repRowOfName` (kept for an inline-shape nullable the arena can't resolve),
-// then `structIndexOfTypeName`'s legacy field-set scan.
-export function nulBaseStructRow(tyIx: i32, name: string): i32 {
-  const base = nullablePartOf(name)
-  if base == "" { return -1 }
+// The struct row of the base of a nullable-struct annotation (`S | null` -> `S`'s row), or -1.
+// The canonical row when the type picks one, else the first declared or annotation row whose
+// recorded type is the base: a `??` family's object literal records its context's type while
+// its fields are boxed, so a literal row is never this annotation's layout.
+export function nulBaseStructRow(tyIx: i32): i32 {
   const nt = nodeRepTyIxOf(tyIx)
-  if nt >= 0 {
-    const t = T.tys[nt]
-    if t is TyNullable {
-      const ar = repRowOfTyStruct(t.nInner, sScanLim())
-      if ar >= 0 { return ar }
-    }
+  if nt < 0 { return -1 }
+  const t = T.tys[nt]
+  if !(t is TyNullable) { return -1 }
+  const inner = t.nInner
+  if inner < 0 { return -1 }
+  if !(T.tys[inner] is TyObj) { return -1 }
+  const ar = repRowOfTyStruct(inner, sScanLim())
+  if ar >= 0 { return ar }
+  namedRowOfTy(inner)
+}
+
+// The first struct row not minted for an object literal whose recorded type is `ty`, by
+// identity and then by `tySame`, or -1.
+function namedRowOfTy(ty: i32): i32 {
+  let s = 0
+  while s < sTyIx.length {
+    if sTyIx[s] == ty && !sIsAnonRow(s) { return s }
+    s = s + 1
   }
-  // The arena already answered "not a struct row" whenever the nullable inner isn't an
-  // object row, so the name bridge (`repRowOfName`, which requires `TyObj` too) is never
-  // asked — dual-run confirms it always agrees. A decline with no `TyNullable` in the rep
-  // column at all keeps the full ladder, since there the arena said nothing, not no.
-  let innerIsObj = false
-  let innerKnown = false
-  if nt >= 0 {
-    const t2 = T.tys[nt]
-    if t2 is TyNullable {
-      innerKnown = true
-      if t2.nInner >= 0 {
-        const ti = T.tys[t2.nInner]
-        if ti is TyObj { innerIsObj = true }
-      }
+  let q = 0
+  while q < sTyIx.length {
+    if sTyIx[q] >= 0 && !sIsAnonRow(q) {
+      if tySame(sTyIx[q], ty) { return q }
     }
+    q = q + 1
   }
-  // And the field-set matcher goes with it: a non-object inner (`string`, `i32`, `K`, a
-  // map) has no field set for `structIndexOfTypeName` to match either, dual-run confirmed
-  // to decline the same way `repRowOfName` does — so the whole name tail is skipped and
-  // the arena alone answers -1, the value it would reach anyway one scan later.
-  if innerKnown && !innerIsObj { return -1 }
-  const rr = repRowOfName(base, sScanLim())
-  if rr >= 0 { return rr }
-  structIndexOfTypeName(base)
+  -1
 }
 
 // `1` if the type-annotation node at `tyIx` names the struct, else `0` (i32 / none).
@@ -609,7 +602,7 @@ export function retStructRowIndex(tyIx: i32) {
     // recorded TYPE finds it. Without this the variant-table index answered in its place.
     const rr = repRowOfTyStruct(nodeRepTyIxOf(tyIx), sScanLim())
     if rr >= 0 { return rr }
-    return nulBaseStructRow(tyIx, ty.tyName)
+    return nulBaseStructRow(tyIx)
   }
   -1
 }
@@ -635,7 +628,7 @@ export function retStructIndex(tyIx: i32) {
       // A `S | null` annotation resolves to its BASE struct's index — the single
       // chokepoint the param/local/return struct lookups read, so a nullable-struct
       // binding's member layout resolves without separate plumbing.
-      return nulBaseStructRow(tyIx, ty.tyName)
+      return nulBaseStructRow(tyIx)
     }
   }
   -1
