@@ -150,6 +150,7 @@ import {
 } from "./check_getter_effects"
 import { arrDefCallTy, holeCastParamName } from "./check_hole_links"
 import {
+  HD_ELEM,
   HD_PARAM,
   HD_RET,
   tyIsNonNullHoleRead,
@@ -179,6 +180,7 @@ import {
   OP_CALL_PIN,
   SUBST_DECLARED,
   argIsLitAggregate,
+  bindOf,
   bitcastRetTy,
   holeArgOrigins,
   intIntrWidth,
@@ -298,6 +300,7 @@ import {
   mkNullableTy,
   objFieldType,
   tyArrayElemIx,
+  tyEqSameHoles,
   tyHasHole,
   tyIsDeclaredParam,
   tyIsFuncArena,
@@ -1075,6 +1078,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     if aRet >= 0 { return aRet }
     oi = oi + 1
   }
+  const hNames: string[] = []
+  const hTys: i32[] = []
+  callFtyNoteLateArgCstrs(cfn, params, args, argExp, bNames, bTys, hNames, hTys)
   // A list or record literal holding a generic function, met before a later argument bound the
   // type parameter its element type rides, is delivered again at the bound type (D3923).
   if !inferQuiet {
@@ -1127,6 +1133,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       retTy,
     )
   }
+  if hNames.length > 0 { retTy = substTyDeep(retTy, hNames, hTys) }
   // A deferred join this site cannot decide has no rep, so it collapses to one arm, parked
   // whole for a `return h(w)` relay (`inferRetTyOf`); in a body the gate does not hold, one of
   // that body's own parameters is kept as a union instead, which its pins re-join (D3589).
@@ -1234,6 +1241,118 @@ function callFtyNormArgs(
   }
   ok[0] = true
   args
+}
+
+// Arguments whose turn met a type parameter no earlier argument bound, asked again once every
+// argument has bound what it can; a parameter that only a hole reaches under a list binds to
+// that hole's element, so `g(a, b)` at `T[]` holds `b` to `a`'s instance (D6502).
+function callFtyNoteLateArgCstrs(
+  cfn: Node,
+  params: i32[],
+  args: i32[],
+  argExp: i32[],
+  bNames: string[],
+  bTys: i32[],
+  hNames: string[],
+  hTys: i32[],
+) {
+  const hSrc: i32[] = []
+  let i = 0
+  while i < args.length && i < params.length {
+    if argExp[i] >= 0 && tyHasTyVar(argExp[i]) {
+      const hb: HoleBinds = { names: hNames, tys: hTys, src: hSrc, arg: i }
+      bindHoleElemWalk(params[i], nodeTyOf(args[i]), bNames, bTys, hb, 0)
+    }
+    i = i + 1
+  }
+  let li = 0
+  while li < args.length && li < params.length {
+    if argExp[li] >= 0 && tyHasTyVar(argExp[li]) {
+      const hb: HoleBinds = { names: hNames, tys: hTys, src: hSrc, arg: li }
+      noteLateArgCstr(cfn, params[li], args[li], argExp[li], bNames, bTys, hb)
+    }
+    li = li + 1
+  }
+}
+
+// The type-parameter bindings `bindHoleElemWalk` makes from hole arguments, each with the
+// argument that supplied it; `arg` is the argument being walked or asked.
+type HoleBinds = { names: string[], tys: i32[], src: i32[], arg: i32 }
+
+// Argument `arg` of type parameter `param` asked at the final bindings, leaving out the hole
+// bindings it supplied itself; nothing is noted when that changes nothing it met.
+function noteLateArgCstr(
+  cfn: Node,
+  param: i32,
+  arg: i32,
+  exp: i32,
+  bNames: string[],
+  bTys: i32[],
+  hb: HoleBinds,
+) {
+  let at = inferRetTyOf(arg, nodeTyOf(arg))
+  if coalDefHole.length > 0 { at = coalPinTy(arg, at) }
+  if !tyIsHole(at) && !tyIsDeclaredParam(at) { return 0 }
+  const names: string[] = []
+  const tys: i32[] = []
+  let k = 0
+  while k < bNames.length {
+    names.push(bNames[k])
+    tys.push(bTys[k])
+    k = k + 1
+  }
+  k = 0
+  while k < hb.names.length {
+    if hb.src[k] != hb.arg {
+      names.push(hb.names[k])
+      tys.push(hb.tys[k])
+    }
+    k = k + 1
+  }
+  const fin = substTyDeep(param, names, tys)
+  if fin < 0 || tyIsHole(fin) || tyEqSameHoles(fin, exp) { return 0 }
+  let who = ""
+  if cfn is Ident { who = cfn.identName }
+  noteArgCstr(at, fin, who, ACF_PLAIN, -1)
+}
+
+// Binds each type parameter `exp` holds under a list, and no binding set has yet, to the
+// element of the hole or type parameter `at` holds there, minted as a derived hole. Walks list
+// shapes only; a bare parameter is the ordinary walk's (`bindGenWalk`).
+function bindHoleElemWalk(
+  exp: i32,
+  at: i32,
+  bNames: string[],
+  bTys: i32[],
+  hb: HoleBinds,
+  depth: i32,
+) {
+  if (
+    exp < 0
+    || at < 0
+    || exp >= T.tys.length
+    || at >= T.tys.length
+    || depth > 8
+  ) {
+    return 0
+  }
+  const e = T.tys[exp]
+  if e is TyVar {
+    if depth == 0 { return 0 }
+    if bindOf(bNames, bTys, e.tvName) >= 0 { return 0 }
+    if bindOf(hb.names, hb.tys, e.tvName) >= 0 { return 0 }
+    hb.names.push(e.tvName)
+    hb.tys.push(at)
+    hb.src.push(hb.arg)
+    return 0
+  }
+  const el = tyArrayElemIx(exp)
+  if el < 0 { return 0 }
+  const ael = tyArrayElemIx(at)
+  if ael >= 0 { return bindHoleElemWalk(el, ael, bNames, bTys, hb, depth + 1) }
+  if !(T.tys[at] is TyVar) { return 0 }
+  const elemHole = mkDerivedHole(HD_ELEM, "", -1, -1, at)
+  bindHoleElemWalk(el, elemHole, bNames, bTys, hb, depth + 1)
 }
 
 // Whether an argument and the callee parameter `param` it meets hold type parameters that an
