@@ -42,6 +42,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  litBaseTy,
   tyEqSoftLits,
   tyIsLitUnion,
   tyIxIsFunc,
@@ -945,7 +946,7 @@ function pushValueUnionRow(name: string, tyIx: i32) {
   recordUnMemTys(name) // D-UNION foundation
   unVarStart.push(uVariants.length)
   unVarCount.push(0)
-  markValueUnionAtoms(name)
+  markValueUnionAtoms(name, tyIx)
   0
 }
 
@@ -970,82 +971,120 @@ export function mintValueUnionRowOfTy(ty: i32) {
 }
 
 // Marks the per-rep value-box usage flags for every scalar atom of the value union `name`,
-// at registration time so `mAssignTypeIndices` interns exactly the used reps. The box-tag
-// ABI is order-sensitive: this mints value-box reps in atom order, so the recorded slice is
-// consumed in lock-step behind a length guard, and an uncovered row keeps the legacy name path.
-export function markValueUnionAtoms(name: string) {
+// typed `ty` (-1 when unknown), at registration time so `mAssignTypeIndices` interns exactly
+// the used reps. A row whose members resolved reads them; otherwise the union's own type is
+// walked, and only a union with neither keeps the name path.
+export function markValueUnionAtoms(name: string, ty: i32) {
   const atoms: string[] = []
   const mems: i32[] = []
-  markValueUnionArms(atoms, mems, unionSetArmTys(name, atoms, mems))
+  markValueUnionArms(atoms, mems, unionSetArmTys(name, atoms, mems), ty)
 }
 
 // `markValueUnionAtoms` over registered row `u`'s own members.
 export function markValueUnionAtomsRow(u: i32) {
   const atoms: string[] = []
   const mems: i32[] = []
-  markValueUnionArms(atoms, mems, unionRowArmTys(u, atoms, mems))
+  let ty = -1
+  if u >= 0 && u < unTyIx.length { ty = unTyIx[u] }
+  markValueUnionArms(atoms, mems, unionRowArmTys(u, atoms, mems), ty)
 }
 
-// The marks for one union's `atoms`, read through member types `mems` when `cov`.
-function markValueUnionArms(atoms: string[], mems: i32[], cov: boolean) {
-  let i = 0
-  while i < atoms.length {
-    let k = -1
-    if cov { k = unMemAtomKind(mems[i]) } else { k = valueAtomKind(atoms[i]) }
-    if k == 0 || k == 1 { vbI32Used = true }
-    // A string member rides the box's anyref value as the raw string-array ref, so force that
-    // array type even when the module constructs no string: the narrowed string read's
-    // `ref.cast` is emitted regardless of branch, and must still validate, so the array type
-    // has to exist even when nothing builds one.
-    if k == 2 { aUsed = true }
-    if k == 3 { vbI64Used = true }
-    if k == 4 { vbF64Used = true }
-    if k == 5 { vbF32Used = true }
-    if k == 14 { vbV128Used = true }
-    // A LIST member (codes 7..10, 12, 13) forces its list type so the wrapper heap the box
-    // payload rides exists — the union annotation alone may be the only mention of that
-    // list type.
-    if k == 7 {
-      lUsed = true
-      aUsed = true
-    }
-    // A boolean list (or its `| null` niche) rides the i32 list and lifts the band off code 17.
-    if k == 17 || k == 18 {
-      lUsed = true
-      aUsed = true
-      if vbBoolListTop < 0 { vbBoolListTop = 0 }
-    }
-    if k == 8 { fa64Used = true }
-    if k == 9 {
-      slUsed = true
-      aUsed = true
-    }
-    if k == 10 { ia64Used = true }
-    if k == 12 { fa32Used = true }
-    // A packed byte-list member (code 13) forces the `ba8`/`bl8` pair, and it is the only
-    // arm here that also decides a tag: `uAtomBandTop` reads `ba8Used` to lift the three
-    // slot-keyed bands off code 13's tag. This mark makes that bit true before any tag is
-    // emitted, since a union annotation may be the program's only mention of `u8[]`.
-    if k == 13 { ba8Used = true }
-    // A CLOSURE member (code 11) rides the box anyref as the `$cloStructIdx` fat-pointer —
-    // force the closure rec-group types so that heap type exists (the union annotation may be
-    // the only mention of a function value in the program), the string/list analogue above.
-    if k == 11 { fnValUsed = true }
-    // A litunion-alias member rides the box anyref as its member-string ref, so force the
-    // string array type exactly like a `string` member — the narrowed `is K0` read's
-    // `ref.cast` must validate even when the module constructs no string.
-    if k < 0 {
-      let lit = false
-      if cov {
-        lit = tyIsLitUnion(mems[i])
-      } else {
-        lit = nameIsLitUnionType(atoms[i])
-      }
-      if lit { aUsed = true }
-    }
-    i = i + 1
+// The usage bits one arm of value-atom kind `k` forces; `lit` is a literal-union member, which
+// rides the box as its member string. Bits: 1 i32, 2 string array, 4 i64, 8 f64, 16 f32,
+// 32 v128, 64 i32 list, 128 boolean list, 256 f64 list, 512 string list, 1024 i64 list,
+// 2048 f32 list, 4096 byte list, 8192 closure.
+function armUseBits(k: i32, lit: boolean): i32 {
+  if k == 0 || k == 1 { return 1 }
+  if k == 2 { return 2 }
+  if k == 3 { return 4 }
+  if k == 4 { return 8 }
+  if k == 5 { return 16 }
+  if k == 14 { return 32 }
+  // A list member forces its list type so the wrapper heap the box payload rides exists — the
+  // union annotation alone may be the only mention of that list type.
+  if k == 7 { return 64 | 2 }
+  if k == 17 || k == 18 { return 64 | 2 | 128 }
+  if k == 8 { return 256 }
+  if k == 9 { return 512 | 2 }
+  if k == 10 { return 1024 }
+  if k == 12 { return 2048 }
+  if k == 13 { return 4096 }
+  if k == 11 { return 8192 }
+  if k < 0 && lit { return 2 }
+  0
+}
+
+// The usage bits of every arm of union type `ty`: a literal union is one string-riding arm, a
+// single literal is its scalar, and a nullable contributes its inner's arms.
+function tyArmUseBits(ty: i32): i32 {
+  if ty < 0 { return 0 }
+  if tyIsLitUnion(ty) { return armUseBits(-1, true) }
+  const t = T.tys[ty]
+  if t is TyUnion {
+    let m = 0
+    for x in t.uMembers { m = m | tyArmUseBits(x) }
+    return m
   }
+  if t is TyNullable { return tyArmUseBits(t.nInner) }
+  if t is TyLit { return armUseBits(unMemAtomKind(litBaseTy(t)), false) }
+  armUseBits(unMemAtomKind(ty), false)
+}
+
+// The usage bits of one arm spelled `atom` in a row with no type: its value-atom kind's, with
+// the literal-union test read off the type the spelling declares.
+function atomArmUseBits(atom: string): i32 {
+  if atom == "" { return 0 }
+  const at = declTyIxOfName(atom)
+  armUseBits(valueAtomKind(atom), at >= 0 && tyIsLitUnion(at))
+}
+
+// The marks for one union's `atoms`: read through member types `mems` when `cov`, else through
+// the union's type `ty`, else (`ty` -1) through each atom's declared type.
+function markValueUnionArms(
+  atoms: string[],
+  mems: i32[],
+  cov: boolean,
+  ty: i32,
+) {
+  let m = 0
+  if cov || ty < 0 {
+    let i = 0
+    while i < atoms.length {
+      if cov {
+        m = m | armUseBits(unMemAtomKind(mems[i]), tyIsLitUnion(mems[i]))
+      } else {
+        m = m | atomArmUseBits(atoms[i])
+      }
+      i = i + 1
+    }
+  } else {
+    m = tyArmUseBits(ty)
+  }
+  applyArmUseBits(m)
   if cov && unionMixesAtomList(mems) { vbAtomListUsed = true }
+  0
+}
+
+// Sets the per-rep usage flags `m` names (bits as `armUseBits`). A packed byte-list member is
+// the only arm that also decides a tag: `uAtomBandTop` reads `ba8Used` to lift the three
+// slot-keyed bands off code 13's tag, so the mark lands before any tag is emitted.
+function applyArmUseBits(m: i32) {
+  if (m & 1) != 0 { vbI32Used = true }
+  if (m & 2) != 0 { aUsed = true }
+  if (m & 4) != 0 { vbI64Used = true }
+  if (m & 8) != 0 { vbF64Used = true }
+  if (m & 16) != 0 { vbF32Used = true }
+  if (m & 32) != 0 { vbV128Used = true }
+  if (m & 64) != 0 { lUsed = true }
+  if (m & 128) != 0 && vbBoolListTop < 0 { vbBoolListTop = 0 }
+  if (m & 256) != 0 { fa64Used = true }
+  if (m & 512) != 0 { slUsed = true }
+  if (m & 1024) != 0 { ia64Used = true }
+  if (m & 2048) != 0 { fa32Used = true }
+  if (m & 4096) != 0 { ba8Used = true }
+  // A closure member rides the box anyref as the `$cloStructIdx` fat-pointer, so the closure
+  // rec-group types must exist even when the union is the program's only function value.
+  if (m & 8192) != 0 { fnValUsed = true }
   0
 }
 
