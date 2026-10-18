@@ -38,6 +38,7 @@ import {
   nodeToks,
   orderArgsByParamNames,
 } from "./ast"
+import { a20CollectRets } from "./check_leaf_steps"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
   T,
@@ -682,6 +683,7 @@ function fsTyParamReadSplits(
   out: i32[],
 ): boolean {
   if fsArgOfNamedFn(r) { return true }
+  if fsResultSplits(r, tp, out) { return true }
   const c = fsParent[r]
   if depth <= 0 || c < 0 { return false }
   const cn = P.nodes[c]
@@ -699,6 +701,29 @@ function fsTyParamReadSplits(
   }
   out.push(cn.letType)
   true
+}
+
+// Whether read `r` is a value its function returns, every value it returns reads the same
+// binding, and the result is annotated bare `tp`; the annotation is pushed to `out`, so the
+// result takes the new name with the parameter it returns (D6425).
+function fsResultSplits(r: i32, tp: string, out: i32[]): boolean {
+  const fd = fsEnclosingFn(r)
+  if fd < 0 { return false }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) || f.fnRet < 0 || f.fnBody < 0 { return false }
+  const tn = P.nodes[f.fnRet]
+  if !(tn is TypeRef) || tn.tyName != tp { return false }
+  const vals: i32[] = []
+  a20CollectRets(f.fnBody, vals)
+  const d = identDeclOf(r)
+  let hit = false
+  for v in vals {
+    const u = fsParenPeel(v)
+    if u < 0 || !(P.nodes[u] is Ident) || identDeclOf(u) != d { return false }
+    if u == r { hit = true }
+  }
+  if hit && !hasI32(out, f.fnRet) { out.push(f.fnRet) }
+  hit
 }
 
 // Each asked parameter, annotated with a bare type parameter of its function, takes a type
@@ -850,15 +875,72 @@ function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
       d = c
     }
   }
+  if d < 0 && c >= 0 {
+    const cn = P.nodes[c]
+    // A function's result is read at each of its calls (D6424).
+    if cn is RetStmt && cn.retArg == r {
+      return fsCallsReadSkip(fsEnclosingFn(r), fld, depth - 1)
+    }
+    // An element of an un-annotated `const` list is read at each index of it (D6424).
+    if cn is ArrayLit && hasI32(cn.arrElems, r) {
+      return fsListReadsSkip(c, fld, depth - 1)
+    }
+  }
   if d < 0 { return false }
+  for x in fsIdents {
+    if identDeclOf(x) == d && x != d && !fsReadSkips(x, fld, depth - 1) {
+      return false
+    }
+  }
+  true
+}
+
+// Whether read `x` of a record reads a field other than `fld`, or hands the record on as
+// `fsWholeReadSkips` allows.
+function fsReadSkips(x: i32, fld: string, depth: i32): boolean {
+  const m = fsParent[x]
+  if m < 0 { return false }
+  const mn = P.nodes[m]
+  if mn is Member && mn.memObj == x { return mn.memProp != fld }
+  fsWholeReadSkips(x, fld, depth)
+}
+
+// Whether declared function `fd` is only ever called, and each call's result is a read
+// `fsReadSkips` allows.
+function fsCallsReadSkip(fd: i32, fld: string, depth: i32): boolean {
+  if depth <= 0 || fd < 0 || !(P.nodes[fd] is FuncDecl) { return false }
+  for x in fsIdents {
+    if identDeclOf(x) == fd && x != fd {
+      const c = fsParent[x]
+      if c < 0 || !fsCallsVia(c, x) || !fsReadSkips(c, fld, depth) {
+        return false
+      }
+    }
+  }
+  true
+}
+
+// Whether list literal `lit` initializes an un-annotated `const` every read of which indexes it,
+// each element read being one `fsReadSkips` allows.
+function fsListReadsSkip(lit: i32, fld: string, depth: i32): boolean {
+  if depth <= 0 { return false }
+  const d = fsParent[lit]
+  if d < 0 { return false }
+  const dn = P.nodes[d]
+  if (
+    !(dn is LetDecl)
+    || dn.letInit != lit
+    || dn.letType >= 0
+    || dn.letKw != "const"
+  ) {
+    return false
+  }
   for x in fsIdents {
     if identDeclOf(x) == d && x != d {
       const m = fsParent[x]
       if m < 0 { return false }
       const mn = P.nodes[m]
-      if mn is Member && mn.memObj == x {
-        if mn.memProp == fld { return false }
-      } else if !fsWholeReadSkips(x, fld, depth - 1) {
+      if !(mn is Index) || mn.idxArr != x || !fsReadSkips(m, fld, depth) {
         return false
       }
     }
