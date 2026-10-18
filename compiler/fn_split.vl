@@ -1067,6 +1067,11 @@ export function fsPlan(root: i32): i32 {
         }
       }
     }
+    // A binding written from a hole parameter asks for the parameter, which then takes one
+    // per slot (D6530).
+    if a >= 0 && a < fsParseLen && P.nodes[a] is LetDecl {
+      fsAskWrittenHoles(a)
+    }
     // A maker's result, or a generic name it returns, may be a record field (D6342).
     if fsPlanFieldSlotsOf(a) == 0 || fsPlanMakerFields(a) == 0 { fields = 0 }
     if (
@@ -1710,13 +1715,15 @@ function fsHoleKeys(par: i32): string[] {
           const k = fsReadKey(r)
           if !hasStr(ks, k) { ks.push(k) }
         } else {
-          const ck = fsHoleCopyKey(r)
-          if ck == "!" {
+          const cks = fsHoleCopyKeys(r)
+          if cks.length > 0 && cks[0] == "!" {
             hsBad = true
             return ks
           }
-          if ck != "" {
-            if !hasStr(ks, ck) { ks.push(ck) }
+          if cks.length > 0 {
+            for ck in cks {
+              if !hasStr(ks, ck) { ks.push(ck) }
+            }
           } else {
             const q = fsHoleFwd(r)
             if q < 0 {
@@ -1736,35 +1743,56 @@ function fsHoleKeys(par: i32): string[] {
 // each read a call, a hand-out to a hole or a further copy; "" when `r` is no such copy, "!"
 // when `d` is read at none, at two keys, or in any other way.
 function fsHoleCopyKey(r: i32): string {
+  const ks = fsHoleCopyKeys(r)
+  if ks.length == 0 { return "" }
+  if ks.length > 1 { return "!" }
+  ks[0]
+}
+
+// The binding hole read `r` is copied into (`d = r`, `let d = r`), or -1.
+function fsHoleCopyDecl(r: i32): i32 {
   const p = fsParent[r]
-  if p < 0 { return "" }
+  if p < 0 { return -1 }
   const pn = P.nodes[p]
-  let d = -1
   if pn is BinExpr && pn.binOp == "=" && pn.binRight == r {
-    d = letDeclOfRead(pn.binLeft)
+    return letDeclOfRead(pn.binLeft)
   }
-  if pn is LetDecl && pn.letInit == r { d = p }
-  if d < 0 { return "" }
-  if hsCopyDepth > 4 { return "!" }
+  fsLetInitDecl(p, r)
+}
+
+// `p` when it is a `let` initialised with `r`, else -1: every other parent reads `r` in place.
+function fsLetInitDecl(p: i32, r: i32): i32 {
+  const pn = P.nodes[p]
+  if pn is LetDecl && pn.letInit == r { return p }
+  -1
+}
+
+// The call keys of the binding hole read `r` is copied into, each read of it a call, a
+// hand-out to a hole or a further copy read at one key; empty when `r` is no such copy, ["!"]
+// when the binding is read at none or in any other way. Two keys are a binding the let plan
+// gives a slot per key, each written from the parameter of its key (D6530).
+function fsHoleCopyKeys(r: i32): string[] {
+  const ks: string[] = []
+  const d = fsHoleCopyDecl(r)
+  if d < 0 { return ks }
+  const bad: string[] = ["!"]
+  if hsCopyDepth > 4 { return bad }
   hsCopyDepth = hsCopyDepth + 1
-  let k = ""
+  let ok = true
   for x in fsIdents {
-    if identDeclOf(x) == d && k != "!" {
+    if identDeclOf(x) == d && ok {
       // A further copy (`const c = b`) is read at its own binding's key (D6520).
       let xk = fsHoleCopyKey(x)
       if xk == "" { xk = fsMemberReadKey(x) }
       if xk != "" {
-        if xk.slice(0, 2) != "c:" || (k != "" && xk != k) {
-          k = "!"
-        } else {
-          k = xk
-        }
+        if xk.slice(0, 2) != "c:" { ok = false }
+        else if !hasStr(ks, xk) { ks.push(xk) }
       }
     }
   }
   hsCopyDepth = hsCopyDepth - 1
-  if k == "" { return "!" }
-  k
+  if !ok || ks.length == 0 { return bad }
+  ks
 }
 
 // The keys a read handed to a hole parameter takes: that hole's, through its forwards; empty
@@ -1922,6 +1950,10 @@ function fsPlanHoles(): i32 {
           if identDeclOf(r) == par {
             const q = fsHoleFwd(r)
             if q >= 0 { work.push(q) }
+            const cd = fsHoleCopyDecl(r)
+            if fsHoleCopyKeys(r).length > 1 && !hasI32(fsAsks, cd) {
+              fsAsks.push(cd)
+            }
           }
         }
         for c in fsFnCalls(fsFnOwner(fd)) {
@@ -2008,16 +2040,18 @@ function fsPlanHoleRewrites(): i32 {
         if cn is Call && cn.callFn == r {
           fsRename(r, hsSlot(si, fsReadKey(r)))
         } else {
-          const ck = fsHoleCopyKey(r)
+          const cks = fsHoleCopyKeys(r)
           const q = fsHoleFwd(r)
           const qi = hsIx(q)
-          if ck != "" {
-            fsRename(r, hsSlot(si, ck))
-          } else if qi >= 0 {
+          // A copy read at two keys is the let plan's, which writes each slot from the
+          // parameter of its key.
+          if cks.length == 1 {
+            fsRename(r, hsSlot(si, cks[0]))
+          } else if cks.length == 0 && qi >= 0 {
             const names: string[] = []
             for qk in hsKeys[qi] { names.push(hsSlot(si, qk)) }
             fsHoleHandOut(c, r, names, hsSlotNames(qi))
-          } else {
+          } else if cks.length == 0 {
             const qks = fsHoleKeys(q)
             if qks.length > 0 { fsRename(r, hsSlot(si, qks[0])) }
           }
@@ -2203,6 +2237,29 @@ function fsPlanLets(): i32 {
   0
 }
 
+// Asks every parameter binding `d` is initialized or written from (`let d = p`, `d = p`) that
+// can take a parameter per key and is read at two.
+function fsAskWrittenHoles(d: i32): i32 {
+  for r in fsIdents {
+    const pd = identDeclOf(r)
+    if (
+      pd >= 0
+      && pd < fsParseLen
+      && P.nodes[pd] is Param
+      && fsHoleCopyDecl(r) == d
+      && !hasI32(fsAsks, pd)
+    ) {
+      const was = hsBad
+      hsBad = false
+      const ks = fsHoleKeys(pd)
+      const bad = hsBad
+      hsBad = was
+      if !bad && ks.length > 1 { fsAsks.push(pd) }
+    }
+  }
+  0
+}
+
 // One member's share of the plan: a declaration per extra slot, a slot write after each
 // write, and each read renamed to its slot. 1 declines.
 function fsPlanMember(mi: i32): i32 {
@@ -2217,10 +2274,10 @@ function fsPlanMember(mi: i32): i32 {
   if ip == -2 { return 1 }
   let k = 0
   while k < lanes.length {
-    let vn = ""
-    if ip >= 0 { vn = laneName(ip, lanes[k]) }
+    const vn = fsLaneValName(d.letInit, ip, lanes[k])
+    if vn == "!" { return 1 }
     if k == 0 {
-      if ip >= 0 { fsRename(d.letInit, vn) }
+      if vn != "" { fsRename(d.letInit, vn) }
     } else {
       pdAnchor.push(m)
       pdKw.push(d.letKw)
@@ -2242,10 +2299,10 @@ function fsPlanMember(mi: i32): i32 {
         if vp == -2 { return 1 }
         let wk = 0
         while wk < lanes.length {
-          let vn = ""
-          if vp >= 0 { vn = laneName(vp, lanes[wk]) }
+          const vn = fsLaneValName(wn.binRight, vp, lanes[wk])
+          if vn == "!" { return 1 }
           if wk == 0 {
-            if vp >= 0 { fsRename(wn.binRight, vn) }
+            if vn != "" { fsRename(wn.binRight, vn) }
           } else {
             pwAnchor.push(w)
             pwName.push(laneName(mi, lanes[wk]))
@@ -2260,6 +2317,18 @@ function fsPlanMember(mi: i32): i32 {
     }
   }
   0
+}
+
+// The name slot `lane` of a member reads for value `v` with peer `vp`: the peer's slot, the
+// split hole parameter of that key for a hole read copied at two keys (D6530), or "" for a
+// fresh copy of `v`; "!" when the hole has no parameter of that key.
+function fsLaneValName(v: i32, vp: i32, lane: string): string {
+  if vp >= 0 { return laneName(vp, lane) }
+  if v < 0 || v >= fsParseLen || !(P.nodes[v] is Ident) { return "" }
+  const si = hsIx(identDeclOf(v))
+  if si < 0 || fsHoleCopyKeys(v).length < 2 { return "" }
+  if !hasStr(hsKeys[si], lane) { return "!" }
+  hsSlot(si, lane)
 }
 
 function fsRename(ix: i32, name: string): i32 {
