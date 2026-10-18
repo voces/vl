@@ -1036,22 +1036,25 @@ axis(
 // closure after each; in the many arm each closure captures its own local, in the other every
 // closure captures the first. Both arms make the same closures in one frame, so the emitter's
 // per-frame cost cancels and only the per-name capture question moves: a walk of the frame per
-// captured name is quadratic in the many arm (D2529).
+// captured name is quadratic in the many arm (D2529). The closures are never called: calling
+// each one costs both arms alike and super-quadratically (D5950), which drowned the walk and
+// read 1.02 with `crFrameDeclares` re-walking per name. Fuel reads 1.06; re-walking per name in
+// `crFrameDeclares` reads 1.51, in `crCaptureByRef` 2.19.
 const genNarrowedCaptures = (n: number, distinct: boolean): string => {
-  const o: string[] = ["let acc = 0", "function m() {"];
+  const o: string[] = ["function m() {"];
   for (let i = 0; i < n; i++) {
     o.push(`  let g${i}: i32 | null = null`, `  g${i} = ${i % 13}`);
-    o.push(`  const h${i} = () => (g${distinct ? i : 0} ?? 0) + 1`, `  acc = acc + h${i}()`);
+    o.push(`  const h${i} = () => (g${distinct ? i : 0} ?? 0) + 1`);
   }
-  o.push("}", "m()", "print(acc)");
+  o.push("}", "m()", 'print("ok")');
   return o.join("\n") + "\n";
 };
 
 axis(
   "captured narrowed locals",
-  2.5,
+  1.3,
   "A closure is re-walking its frame per captured name (D2529).",
-  (d) => twoFiles(d, genNarrowedCaptures(400, true), genNarrowedCaptures(400, false)),
+  (d) => twoFiles(d, genNarrowedCaptures(800, true), genNarrowedCaptures(800, false)),
 );
 
 // `n` calls handing one record to a function that reads a parameter field `n` times. `wide`

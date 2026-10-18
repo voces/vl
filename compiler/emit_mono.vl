@@ -83,6 +83,7 @@ import { blockLastStmt } from "./check_if_value"
 import { joinArmIsLit } from "./check_nj_join"
 import {
   callBindTyOf,
+  holeLitCopiesOf,
   holeLitPinOf,
   nodeArrayElemIsNullUnit,
 } from "./check_bind_rows"
@@ -294,6 +295,7 @@ import {
   fnFlowReadGenFn,
   fnFlowReadWritten,
   fnFlowRespellLam,
+  fnFlowStageInstHoles,
   fnFlowTableBuild,
 } from "./fn_flow_shadow"
 import { ifArmValueExpr, paramIndexOf, paramTypeNode } from "./emit_query"
@@ -463,6 +465,7 @@ import {
   monoExactSubRowOf,
   pinSubOperandTyOf,
   tyCanonKey,
+  tySameSpelled,
 } from "./emit_ty_canon"
 import {
   isUName,
@@ -8161,6 +8164,21 @@ function monoSubtreeNamesIdent(ix: i32, name: string, depth: i32): boolean {
   false
 }
 
+// The `Ident` named `name` at source position `pos` in the subtree of `ix`, or -1.
+function monoIdentAtPosIn(ix: i32, name: string, pos: i32, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > 400 { return -1 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    if n.identName == name && n.pos == pos { return ix }
+    return -1
+  }
+  for k in nodeChildren(ix) {
+    const r = monoIdentAtPosIn(k, name, pos, depth + 1)
+    if r >= 0 { return r }
+  }
+  -1
+}
+
 // Whether `ty` is a record type with no type variable left in it.
 function monoConcreteObjTy(ty: i32): boolean {
   if ty < 0 { return false }
@@ -12417,6 +12435,8 @@ function monoCoerceWrittenLetValues(at: i32, ctx: i32, tname: string): boolean {
     const wf = monoLetWriteFrame(lf, i)
     if nd is BinExpr && wf.length == 1 {
       monoCoerceNamedGeneric(nd.binRight, tname, wf[0])
+      // The binding's own call is the type a hole lambda literal written to it is called at.
+      if byCall { monoLamLitTake(nd.binRight, tname, wf[0]) }
     }
   }
   monoWrittenLetBusy.pop()
@@ -12488,7 +12508,15 @@ function monoDeclPathKeys(
   let pins = monoDeclPathKeysIn(lf[1], path, -1, -1, rets, dead)
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const it = monoFrameInstTmpl(lf[0])
+    // A hole instance's parameters are spelled at its hole binding.
+    const hrow = monoHoleSubRow.get(fnStmtsPosOf(it[0])) ?? -1
+    if hrow >= 0 && hrow < monoHoleSubN.length {
+      fnFlowStageInstHoles(monoHoleSubN[hrow], monoHoleSubT[hrow])
+    }
     pins = monoDeclPathKeysIn(lf[1], path, it[0], it[1], rets, dead)
+    const noN: string[] = []
+    const noT: i32[] = []
+    fnFlowStageInstHoles(noN, noT)
   }
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE {
     const none: string[] = []
@@ -12863,6 +12891,11 @@ function monoCellLamTake(lfe: i32, x: i32, tname: string, ctx: i32): i32 {
   if !monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames) {
     return 2
   }
+  monoCellLamTakeAt(lfe, x, pnames, ctx)
+}
+
+// `monoCellLamTake` at the parameter pin names `pnames`.
+function monoCellLamTakeAt(lfe: i32, x: i32, pnames: string[], ctx: i32): i32 {
   let want = ""
   for pn in pnames { want = want + normTypeAtom(pn) + "," }
   const had = monoInstantiatedAny(lfe)
@@ -13787,6 +13820,10 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         ta = ta + 1
       }
       monoPreBindPastUnionRest(params, args, fn.fnTyParams, ctx, tvN, tvV)
+      let oDecl = -1
+      if origFe >= 0 && origFe < monoOrigNode.length {
+        oDecl = monoOrigNode[origFe]
+      }
       let i = 0
       while i < args.length {
         const p = P.nodes[params[i]]
@@ -13802,7 +13839,17 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
               anTy = pinTy[0]
             }
+            if an == "" {
+              const cpTy: i32[] = [0 - 1]
+              an = monoHoleLitCopyPin(callIx, oDecl, args, i, ctx, cpTy)
+              anTy = cpTy[0]
+            }
             if an == "" { an = monoArgPinName(args[i], ctx) }
+            if an == "" {
+              const lamTy: i32[] = [0 - 1]
+              an = monoHoleLamArgPin(oDecl, args, i, ctx, lamTy)
+              if an != "" { anTy = lamTy[0] }
+            }
             if an == "" {
               // A name handed through an identity call into a binding can take a slot per type.
               if P.nodes[args[i]] is Ident { fsAsk(args[i]) }
@@ -15047,10 +15094,16 @@ function monoWalk(ix: i32, ctx: i32) {
       if tgt is Ident {
         let atn = identFnTypeAnnName(tgt.identName, ctx)
         // An un-annotated local's write delivers at the one signature the flow table pins the
-        // binding at in this frame (D3957).
-        if atn == "" { atn = monoPlacePinName(n.binLeft, "", ctx) }
+        // binding at in this frame (D3957), a hole lambda literal written there included; one
+        // written at two types is left to the binding's own two-signature refusal.
+        let byPin = false
+        if atn == "" {
+          atn = monoPlacePinName(n.binLeft, "", ctx)
+          byPin = true
+        }
         if atn != "" {
           if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
+          if byPin { monoLamLitTake(n.binRight, atn, ctx) }
         }
       }
       // A store into an element or a field of a binding delivers at the one signature the flow
@@ -15059,7 +15112,20 @@ function monoWalk(ix: i32, ctx: i32) {
       if tgt is Index {
         let sn = monoPlacePinName(n.binLeft, "", ctx)
         if monoIsCellRead(n.binLeft) { sn = monoCellPinName(n.binLeft, ctx) }
-        if monoDeliverAtPin(n.binRight, sn, ctx) < 0 { return -1 }
+        const wl = unwrapParen(n.binRight)
+        if (
+          monoIsCellRead(n.binLeft)
+          && sn != ""
+          && wl >= 0
+          && P.nodes[wl] is FuncDecl
+        ) {
+          // A lambda written to a captured binding, like one written to a plain one, leaves a
+          // second type to the binding's own refusal.
+          if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
+          monoLamLitTake(n.binRight, sn, ctx)
+        } else if monoDeliverAtPin(n.binRight, sn, ctx) < 0 {
+          return -1
+        }
       }
       if tgt is Member {
         const sn = monoPlacePinName(n.binLeft, "", ctx)
@@ -15540,7 +15606,7 @@ function monoNoteBindDeliveryAt(at: i32, ann: string, ctx: i32) {
   if at < 0 { return 0 }
   let name = monoIdentNameOf(at)
   if name == "" { name = monoCellReadName(at) }
-  if name == "" { return 0 }
+  if name == "" { return monoDeliverLamLit(at, ann, ctx) }
   const parts: string[] = []
   if annFnDecompose(ann, parts) == "" { return 0 }
   let sig = ""
@@ -15573,6 +15639,220 @@ function monoNoteBindDeliveryAt(at: i32, ann: string, ctx: i32) {
     if monoInstanceFor(fe, monoSigPins(sig + ";"), at, -1) < 0 { return -1 }
   }
   monoNoteBindSig(at, ctx, sig + ";", monoSigRetVoid(ann))
+}
+
+// A hole lambda written as a literal where function type `ann` is delivered is pinned there in
+// place, as a capture cell's literal is; one literal wanted at two types is refused (D5881).
+function monoDeliverLamLit(at: i32, ann: string, ctx: i32): i32 {
+  if monoLamLitTake(at, ann, ctx) == 1 {
+    return emitFailAt(
+      "emitProgram: this lambda is handed on at two different function types, and one lambda "
+        + "literal has one signature — bind it once per type, or annotate its parameters",
+      unwrapParen(at),
+    )
+  }
+  0
+}
+
+// `monoCellLamTake` for the hole lambda literal at `at`, or 0 for anything else, including one
+// its context already typed, which keeps that signature and its result.
+function monoLamLitTake(at: i32, ann: string, ctx: i32): i32 {
+  const x = unwrapParen(at)
+  if x < 0 || !(P.nodes[x] is FuncDecl) { return 0 }
+  if monoTyConcreteFn(nodeTyIxOf(x)) { return 0 }
+  const lfe = monoLamValueFe(x, ctx)
+  if lfe < 0 || lfe >= monoGen.length || monoGen[lfe] != 1 { return 0 }
+  if !monoLamIsHole(lfe) { return 0 }
+  monoCellLamTake(lfe, x, ann, ctx)
+}
+
+// The pin of hole lambda `args[i]` handed to un-annotated parameter `i` of generic `decl`: the
+// function type the body hands that parameter to, through a call of another parameter or on
+// through another generic, with the lambda instanced at it in place; "" when none is found.
+function monoHoleLamArgPin(
+  decl: i32,
+  args: i32[],
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  const x = unwrapParen(args[i])
+  if x < 0 || !(P.nodes[x] is FuncDecl) { return "" }
+  const lfe = monoLamValueFe(x, ctx)
+  if (
+    lfe < 0
+    || lfe >= monoGen.length
+    || monoGen[lfe] != 1
+    || !monoLamIsHole(lfe)
+  ) {
+    return ""
+  }
+  const bt = monoHoleArgDemandTy(decl, args, i, ctx)
+  if bt < 0 || !monoTyConcreteFn(bt) { return "" }
+  const sk = sigKeyOfTy(bt)
+  const bf = T.tys[bt]
+  if sk == "" || !(bf is TyFunc) { return "" }
+  const pnames: string[] = []
+  for pt in bf.fnParamTypes {
+    const pn = monoLamPinName(pt, 8)
+    if pn == "" { return "" }
+    pnames.push(pn)
+  }
+  const r = monoCellLamTakeAt(lfe, x, pnames, ctx)
+  if r == 1 {
+    emitFailAt(
+      "emitProgram: this lambda is handed on at two different function types, and one lambda "
+        + "literal has one signature — bind it once per type, or annotate its parameters",
+      x,
+    )
+    return ""
+  }
+  if r != 0 { return "" }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = bt
+  "=>" + sk
+}
+
+// The type the body of generic `decl` hands its un-annotated parameter `i` to, with the other
+// parameters typed by this call's `args`; -1 for none, or two that differ.
+function monoHoleArgDemandTy(decl: i32, args: i32[], i: i32, ctx: i32): i32 {
+  if decl < 0 || decl >= P.nodes.length { return -1 }
+  const dn = P.nodes[decl]
+  if !(dn is FuncDecl) || i >= dn.fnParams.length { return -1 }
+  const pNames: string[] = []
+  const pTys: i32[] = []
+  let j = 0
+  while j < dn.fnParams.length && j < args.length {
+    const pj = P.nodes[dn.fnParams[j]]
+    if pj is Param {
+      pNames.push(pj.parName)
+      if j == i {
+        pTys.push(-1)
+      } else {
+        pTys.push(monoArgPinTyIx(args[j], ctx))
+      }
+    }
+    j = j + 1
+  }
+  if pNames.length != dn.fnParams.length { return -1 }
+  monoHoleLamDemandTy(decl, pNames[i], pNames, pTys, 0)
+}
+
+// The pin of literal `args[i]` of call `callIx` where the checker made it a copy per type a
+// forwarder's callers retyped it at: the copy at the type this instance's body hands it to,
+// which replaces the argument in the instance's own call; "" where no copy answers (D5880).
+function monoHoleLitCopyPin(
+  callIx: i32,
+  decl: i32,
+  args: i32[],
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  const x = unwrapParen(args[i])
+  if x < 0 { return "" }
+  const cps = holeLitCopiesOf(x)
+  if cps.length == 0 { return "" }
+  const d = monoHoleArgDemandTy(decl, args, i, ctx)
+  if d < 0 || tyHasTyVar(d) { return "" }
+  const c = P.nodes[callIx]
+  if !(c is Call) { return "" }
+  let k = 0
+  while k < c.callArgs.length && c.callArgs[k] != args[i] { k = k + 1 }
+  if k >= c.callArgs.length { return "" }
+  for cp in cps {
+    const pt = holeLitPinOf(cp)
+    if pt >= 0 && tySameSpelled(pt, d, TY_WALK_DEPTH) {
+      const nm = monoArgPinName(cp, ctx)
+      if nm == "" { return "" }
+      c.callArgs[k] = cp
+      args[i] = cp
+      monoArenaTouch()
+      // arena-tick exempt: a caller-owned out-parameter, not the arena.
+      tyOut[0] = pt
+      return nm
+    }
+  }
+  ""
+}
+
+// The one function type the body of `decl` hands its parameter `target` to, where `pNames`'
+// parameters have the types `pTys` (-1 unknown); -1 for none, or two that differ.
+function monoHoleLamDemandTy(
+  decl: i32,
+  target: string,
+  pNames: string[],
+  pTys: i32[],
+  depth: i32,
+): i32 {
+  if depth > 4 || decl < 0 { return -1 }
+  const dn = P.nodes[decl]
+  if !(dn is FuncDecl) || dn.fnBody < 0 { return -1 }
+  const got: i32[] = [0 - 1]
+  const stack: i32[] = [dn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    const c = P.nodes[ix]
+    if c is Call {
+      const t = monoHoleLamCallDemand(c, target, pNames, pTys, depth)
+      if t >= 0 {
+        if got[0] >= 0 && !tySameSpelled(got[0], t, TY_WALK_DEPTH) { return -1 }
+        // arena-tick exempt: a local accumulator, not the arena.
+        got[0] = t
+      }
+    }
+    for k in nodeChildren(ix) { stack.push(k) }
+  }
+  got[0]
+}
+
+// What call `c` in a body with parameters `pNames: pTys` hands `target` at, or -1.
+function monoHoleLamCallDemand(
+  c: Call,
+  target: string,
+  pNames: string[],
+  pTys: i32[],
+  depth: i32,
+): i32 {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const cf = P.nodes[c.callFn]
+  if !(cf is Ident) { return -1 }
+  let k = 0
+  while k < c.callArgs.length && monoIdentNameOf(c.callArgs[k]) != target {
+    k = k + 1
+  }
+  if k >= c.callArgs.length { return -1 }
+  let j = 0
+  while j < pNames.length && pNames[j] != cf.identName { j = j + 1 }
+  if j < pNames.length {
+    const pt = pTys[j]
+    if pt < 0 || pt >= T.tys.length { return -1 }
+    const f = T.tys[pt]
+    if !(f is TyFunc) || k >= f.fnParamTypes.length { return -1 }
+    return f.fnParamTypes[k]
+  }
+  const fe = fnIndexOf(cf.identName)
+  if fe < 0 || fe >= monoOrigNode.length { return -1 }
+  const g = P.nodes[monoOrigNode[fe]]
+  if !(g is FuncDecl) || g.fnParams.length != c.callArgs.length { return -1 }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  let q = 0
+  while q < g.fnParams.length {
+    const gp = P.nodes[g.fnParams[q]]
+    if !(gp is Param) { return -1 }
+    gNames.push(gp.parName)
+    const an = monoIdentNameOf(c.callArgs[q])
+    let at = -1
+    let r = 0
+    while r < pNames.length {
+      if pNames[r] == an { at = pTys[r] }
+      r = r + 1
+    }
+    gTys.push(at)
+    q = q + 1
+  }
+  monoHoleLamDemandTy(monoOrigNode[fe], gNames[k], gNames, gTys, depth + 1)
 }
 
 // Each argument of `xs.push(…)`, and the value of `m.set(k, v)`, is delivered at the one signature
@@ -15840,7 +16120,8 @@ function monoBindingAtPin(lf: i32[], nDecl: i32): i32 {
 
 // For the binding `d` held at its one pin: each call taking that pin whose callee the checker left
 // an open type, as one past an inferred return is, is typed at its own arguments and result,
-// which are the pin's (D5062). A call in a generic's body is left alone, since instances share it.
+// which are the pin's (D5062). In a body a generic's instances share, those types are closed, so
+// the signature is every instance's (D5970).
 function monoRetypePinCalls(d: i32, path: string[]): i32 {
   for cx in fnFlowDeclPathPinCalls(d, path) {
     const c = P.nodes[cx]
@@ -15848,7 +16129,6 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
       const cf = unwrapParen(c.callFn)
       const ct = nodeTyIxOf(cf)
       const rt = nodeTyIxOf(cx)
-      const fx = monoTopFrameOf(cx)
       if (
         cf >= 0
         && ct >= 0
@@ -15857,7 +16137,6 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
         && tyHasTyVar(ct)
         && rt >= 0
         && !tyHasTyVar(rt)
-        && !(fx >= 0 && monoFrameIsGenericInstance(fx))
       ) {
         const ps: i32[] = []
         for a in c.callArgs {
@@ -15885,16 +16164,27 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   // An alias of one is pinned at its own binding, which the flow table keys the read by (D5400).
   let d = x
   let fr = ctx
+  const it = monoFrameInstTmpl(ctx)
   const lf = monoReadLetFrame(x, ctx)
   if lf[1] >= 0 {
     d = lf[1]
     fr = lf[0]
+  } else {
+    // A read in an instance body is banked under the template's read, at the same position.
+    const xn = P.nodes[x]
+    if it[1] >= 0 && xn is Ident {
+      const tr = monoIdentAtPosIn(it[1], xn.identName, xn.pos, 0)
+      if tr >= 0 { d = tr }
+    }
   }
   const nm = monoSlotPinName(d, noPath, fr)
   if nm == "" {
     // Two pins past the return ask for a copy of the function per result pin (D5531).
     const lfp = [fr, d]
-    if monoDeclPathPins(lfp, noPath).length > 1 { fsAsk(ctx) }
+    // An instance asks for its template, which is what the plan copies.
+    let asked = ctx
+    if it[0] == ctx && it[1] >= 0 { asked = it[1] }
+    if monoDeclPathPins(lfp, noPath).length > 1 { fsAsk(asked) }
     return 0
   }
   if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }

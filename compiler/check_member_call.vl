@@ -799,6 +799,136 @@ export function checkMemberCallNode(
   -1
 }
 
+// Checks each argument of a list `.push` against `rt`'s element in argument order: a spread
+// appends its source's elements, and the first push onto a bare `[]` pins `rt.aElem` in place.
+// Reports a misfit with `tErr`.
+function checkListPushArgs(
+  margs: i32[],
+  ix: i32,
+  recvIx: i32,
+  recvTy: i32,
+  rt: TyArray,
+) {
+  // `push` is variadic — every argument appends, and a spread argument appends every
+  // element of its source. One loop covers both, so `xs.push(...ys)` needs no case of
+  // its own; the appends happen in argument order.
+  let mi = 0
+  while mi < margs.length {
+    const spd = spreadArgOf(margs[mi])
+    if spd >= 0 {
+      const set = spreadElemTy(margs[mi])
+      if rt.aElem < 0 {
+        if set >= 0 {
+          rt.aElem = set
+          tyMutEpoch = tyMutEpoch + 1 // a spread pinned the element in place
+        }
+      } else if set >= 0 {
+        if !bmArgOk(BM_PUSH, "push", set, rt.aElem, recvTy, spd) {
+          tErr(bmArgMsg(BM_PUSH, "push", set, rt.aElem, recvTy), ix)
+        }
+      }
+    } else {
+      // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
+      // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
+      // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
+      // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
+      if rt.aElem >= 0 { seedExpected(margs[mi], rt.aElem) }
+      const pat = checkNodeHook(margs[mi])
+      // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
+      // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
+      if rt.aElem < 0 { calleeWritePrePin(recvTy, pat) }
+      if rt.aElem < 0 {
+        rt.aElem = cnhPinTy(pat, ix, recvIx, false, false)
+        tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
+      } else {
+        cnhFill(rt.aElem, pat)
+        // The pushed value's own open holes pin from the element slot — the same rule
+        // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
+        constrainEmptyExpr(margs[mi], pat, rt.aElem)
+        // A float literal re-encodes into an `f32` element as at a binding (D582); a hole
+        // lambda takes a concrete function element's type as an element store does, so a
+        // body that cannot is refused here, not lowered at the hole's default (D3867).
+        if pushHoleFnToConcrete(pat, rt.aElem) {
+          if !assignableExpr(margs[mi], pat, rt.aElem) {
+            tErrWant(
+              letAssignMsg(margs[mi], pat, rt.aElem, "", -1),
+              margs[mi],
+              rt.aElem,
+            )
+          }
+        } else if (
+          !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi])
+        ) {
+          tErr(bmPushMsg("push", pat, rt.aElem, recvTy, margs[mi]), ix)
+        }
+      }
+    }
+    mi = mi + 1
+  }
+}
+
+// `.map(fn)` / `.filter(pred)` over `rt`'s element: the callback's arity and parameter are
+// checked, and the answer is the list of its return or the receiver's list type for `filter`.
+// `TY_ERR` after a refusal of the argument count or a non-function callback.
+function memberCallMapFilterTy(
+  n: Call,
+  ix: i32,
+  recvIx: i32,
+  prop: string,
+  recvTy: i32,
+  rt: TyArray,
+): i32 {
+  const cargs = n.callArgs
+  if cargs.length != 1 {
+    tErr(prop + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
+    return TY_ERR
+  }
+  // Seeds the callback's expected param type from the receiver's element type, so an
+  // un-annotated function-literal argument infers its param instead of erroring — only
+  // when the arg is an anonymous literal and the element type is known, else cleared below.
+  const cbArg = P.nodes[cargs[0]]
+  // A named callback is typed by the element, which a refused function value names.
+  if cbArg is Ident && ovSetMod.length > 0 { ovCbElemSetAt(cargs[0], rt.aElem) }
+  if cbArg is FuncDecl {
+    if cbArg.fnName == "" && rt.aElem >= 0 {
+      recordCbExpected(cargs[0], [rt.aElem])
+    }
+    if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
+  }
+  const cbTy = checkNodeHook(cargs[0])
+  const cb = T.tys[cbTy]
+  if cb is TyFunc {
+    const cbParams = cb.fnParamTypes
+    if cbParams.length != 1 {
+      tErr(
+        prop + " callback expects 1 parameter, got " + i32ToStr(cbParams.length),
+        ix,
+      )
+    } else if !assignable(rt.aElem, cbParams[0]) {
+      tErr(
+        prop
+          + " callback: parameter expects "
+          + tyToStr(cbParams[0])
+          + ", got "
+          + tyToStr(rt.aElem),
+        ix,
+      )
+    }
+    if prop == "filter" {
+      if !assignable(cb.fnRet, TY_BOOL) {
+        tErr(
+          "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
+          ix,
+        )
+      }
+      return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+    }
+    return mkArrayTy(cb.fnRet)
+  }
+  tErr(prop + " expects a function, got " + tyToStr(cbTy), ix)
+  return TY_ERR
+}
+
 // The array arm of `checkMemberCallNode`: a builtin list method over `rt`, the receiver's
 // own arena row (a first `.push` pins its element in place), else a `self`-function, else
 // the refusal. Always answers; `TY_ERR` after a reported error.
@@ -824,62 +954,7 @@ function memberCallArrayTy(
     if margs.length < 1 {
       tErr("push expects at least 1 argument, got 0", ix)
     } else {
-      // `push` is variadic — every argument appends, and a spread argument appends every
-      // element of its source. One loop covers both, so `xs.push(...ys)` needs no case of
-      // its own; the appends happen in argument order.
-      let mi = 0
-      while mi < margs.length {
-        const spd = spreadArgOf(margs[mi])
-        if spd >= 0 {
-          const set = spreadElemTy(margs[mi])
-          if rt.aElem < 0 {
-            if set >= 0 {
-              rt.aElem = set
-              tyMutEpoch = tyMutEpoch + 1 // a spread pinned the element in place
-            }
-          } else if set >= 0 {
-            if !bmArgOk(BM_PUSH, "push", set, rt.aElem, recvTy, spd) {
-              tErr(bmArgMsg(BM_PUSH, "push", set, rt.aElem, recvTy), ix)
-            }
-          }
-        } else {
-          // Contextual param inference for a pushed callback: `fs.push((n) => n + 1)` over a
-          // `((i32) => i32)[]` seeds the lambda's param from the element function type, so an
-          // un-annotated lambda infers `n` instead of erroring (mirrors the `.map`/`.filter`
-          // seeding). A non-function element / non-lambda arg is left untouched by `seedExpected`.
-          if rt.aElem >= 0 { seedExpected(margs[mi], rt.aElem) }
-          const pat = checkNodeHook(margs[mi])
-          // The first `.push(v)` on a bare empty `[]` pins its element type to `typeof v` in
-          // place — the usage-driven inference that resolves an un-annotated `const xs = []`; a later conflicting push is then a clean type error.
-          if rt.aElem < 0 { calleeWritePrePin(recvTy, pat) }
-          if rt.aElem < 0 {
-            rt.aElem = cnhPinTy(pat, ix, recvIx, false, false)
-            tyMutEpoch = tyMutEpoch + 1 // `.push` pinned the element in place
-          } else {
-            cnhFill(rt.aElem, pat)
-            // The pushed value's own open holes pin from the element slot — the same rule
-            // `.set` / `m[k] = v` / `xs = e` apply at their own store positions.
-            constrainEmptyExpr(margs[mi], pat, rt.aElem)
-            // A float literal re-encodes into an `f32` element as at a binding (D582); a hole
-            // lambda takes a concrete function element's type as an element store does, so a
-            // body that cannot is refused here, not lowered at the hole's default (D3867).
-            if pushHoleFnToConcrete(pat, rt.aElem) {
-              if !assignableExpr(margs[mi], pat, rt.aElem) {
-                tErrWant(
-                  letAssignMsg(margs[mi], pat, rt.aElem, "", -1),
-                  margs[mi],
-                  rt.aElem,
-                )
-              }
-            } else if (
-              !bmArgOk(BM_PUSH, "push", pat, rt.aElem, recvTy, margs[mi])
-            ) {
-              tErr(bmPushMsg("push", pat, rt.aElem, recvTy, margs[mi]), ix)
-            }
-          }
-        }
-        mi = mi + 1
-      }
+      checkListPushArgs(margs, ix, recvIx, recvTy, rt)
     }
     return TY_I32
   }
@@ -887,57 +962,7 @@ function memberCallArrayTy(
   // element type; map yields an array of the callback's return, filter the
   // same array type (its predicate must yield bool).
   if prop == "map" || prop == "filter" {
-    const cargs = n.callArgs
-    if cargs.length != 1 {
-      tErr(prop + " expects 1 argument, got " + i32ToStr(cargs.length), ix)
-      return TY_ERR
-    }
-    // Seeds the callback's expected param type from the receiver's element type, so an
-    // un-annotated function-literal argument infers its param instead of erroring — only
-    // when the arg is an anonymous literal and the element type is known, else cleared below.
-    const cbArg = P.nodes[cargs[0]]
-    // A named callback is typed by the element, which a refused function value names.
-    if cbArg is Ident && ovSetMod.length > 0 {
-      ovCbElemSetAt(cargs[0], rt.aElem)
-    }
-    if cbArg is FuncDecl {
-      if cbArg.fnName == "" && rt.aElem >= 0 {
-        recordCbExpected(cargs[0], [rt.aElem])
-      }
-      if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
-    }
-    const cbTy = checkNodeHook(cargs[0])
-    const cb = T.tys[cbTy]
-    if cb is TyFunc {
-      const cbParams = cb.fnParamTypes
-      if cbParams.length != 1 {
-        tErr(
-          prop + " callback expects 1 parameter, got " + i32ToStr(cbParams.length),
-          ix,
-        )
-      } else if !assignable(rt.aElem, cbParams[0]) {
-        tErr(
-          prop
-            + " callback: parameter expects "
-            + tyToStr(cbParams[0])
-            + ", got "
-            + tyToStr(rt.aElem),
-          ix,
-        )
-      }
-      if prop == "filter" {
-        if !assignable(cb.fnRet, TY_BOOL) {
-          tErr(
-            "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
-            ix,
-          )
-        }
-        return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
-      }
-      return mkArrayTy(cb.fnRet)
-    }
-    tErr(prop + " expects a function, got " + tyToStr(cbTy), ix)
-    return TY_ERR
+    return memberCallMapFilterTy(n, ix, recvIx, prop, recvTy, rt)
   }
   // `.pop()` / `.get(i)` yield `T | null` (an empty pop / out-of-range get is
   // normal absence); `.clear()` empties in place and yields nothing. The element is
