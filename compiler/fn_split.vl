@@ -25,7 +25,9 @@ import {
   Program,
   RetStmt,
   TypeRef,
+  binderNameAt,
   callHasTyArgs,
+  clearAnnTs,
   declNameTokOf,
   hasNamedArgs,
   i32ToStr,
@@ -102,6 +104,16 @@ let pcCopy: i32[] = []
 let pcPos: i32[] = []
 let pcFrom: string[] = []
 let pcTo: string[] = []
+// Argument `pkArg` of call `pkCall` is dropped, as parameter `pqName` is from copy `pqCopy`
+// and parameter `pzPar` from its own function. Each read of parameter `pkPar` is a call of the
+// function `pkDecl` declares, for the plans of that function's own parameters.
+let pkCall: i32[] = []
+let pkArg: i32[] = []
+let pqCopy: i32[] = []
+let pqName: string[] = []
+let pzPar: i32[] = []
+let pkPar: i32[] = []
+let pkDecl: i32[] = []
 // Call `pmCall`, through a record field, calls function `pmName` directly instead.
 let pmCall: i32[] = []
 let pmName: string[] = []
@@ -115,6 +127,13 @@ let psRetype: i32[] = []
 let psRetypeName: string[] = []
 
 function fsPlanReset(): i32 {
+  pkCall = []
+  pkArg = []
+  pqCopy = []
+  pqName = []
+  pzPar = []
+  pkPar = []
+  pkDecl = []
   pmCall = []
   pmName = []
   psPar = []
@@ -686,6 +705,7 @@ function fsTyParamReadSplits(
   if fsResultSplits(r, tp, out) { return true }
   const c = fsParent[r]
   if depth <= 0 || c < 0 { return false }
+  if fsCallsVia(c, r) && !callHasTyArgs(c) { return true }
   const cn = P.nodes[c]
   if !(cn is LetDecl) || cn.letInit != r || cn.letType < 0 { return false }
   const tn = P.nodes[cn.letType]
@@ -808,6 +828,7 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
   const calls: i32[] = []
   let keep = ""
   let first = -1
+  fsFarCalls = []
   for r in fsIdents {
     if identDeclOf(r) == d && r != d {
       const m = fsParent[r]
@@ -840,6 +861,11 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
       keep = fsReadKey(r)
     }
   }
+  // A call through a handed-on record keeps its receiver, so it must be at the kept types.
+  for c in fsFarCalls {
+    const cn = P.nodes[c]
+    if !(cn is Call) || fsReadKey(cn.callFn) != keep { return 1 }
+  }
   const gn = P.nodes[g]
   if !(gn is Ident) { return 1 }
   for c in calls {
@@ -852,9 +878,9 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
   0
 }
 
-// Whether read `r` of a record hands it on only where field `fld` is never read: to an
+// Whether read `r` of a record hands it on only where field `fld` is at most called: to an
 // un-annotated parameter of a declared function, or as an un-annotated `const`'s initializer,
-// whose reads each read another field or hand it on again, at most `depth` times (D6371).
+// whose reads each read a field or hand it on again, at most `depth` times (D6371, D6473).
 function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
   if depth <= 0 { return false }
   let d = fsHoleFwd(r)
@@ -895,13 +921,22 @@ function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
   true
 }
 
-// Whether read `x` of a record reads a field other than `fld`, or hands the record on as
-// `fsWholeReadSkips` allows.
+// The calls of the planned field made through a record handed on, for `fsPlanFieldSlot`.
+let fsFarCalls: i32[] = []
+
+// Whether read `x` of a record reads a field other than `fld`, calls `fld` (pushed to
+// `fsFarCalls`), or hands the record on as `fsWholeReadSkips` allows.
 function fsReadSkips(x: i32, fld: string, depth: i32): boolean {
   const m = fsParent[x]
   if m < 0 { return false }
   const mn = P.nodes[m]
-  if mn is Member && mn.memObj == x { return mn.memProp != fld }
+  if mn is Member && mn.memObj == x {
+    if mn.memProp != fld { return true }
+    const c = fsParent[m]
+    if c < 0 || !fsCallsVia(c, m) { return false }
+    fsFarCalls.push(c)
+    return true
+  }
   fsWholeReadSkips(x, fld, depth)
 }
 
@@ -1084,6 +1119,13 @@ export function fsPlan(root: i32): i32 {
     }
     ai = ai + 1
   }
+  // By name first, so the holes of the functions it names see the calls it makes.
+  let byName = 1
+  for a in fsAsks {
+    if a >= 0 && a < fsParseLen && P.nodes[a] is Param && fsPlanByName(a) == 0 {
+      byName = 0
+    }
+  }
   const holes = fsPlanHoles()
   let anyLet = false
   for a in fsAsks {
@@ -1122,7 +1164,9 @@ export function fsPlan(root: i32): i32 {
     fsPlanInstances()
     return 0
   }
-  fsPlanInstances()
+  const inst = fsPlanInstances()
+  if byName == 0 { return 0 }
+  inst
 }
 
 // An asked maker (the function holding an asked read) or module `const`, read in a function
@@ -1269,7 +1313,9 @@ function fsInstanceKeys(g: i32): string[] {
 function fsPlanInstanceBody(g: i32): i32 {
   const f = P.nodes[g]
   const keys = fsInstanceKeys(g)
-  if keys.length < 2 || hasI32(pfSrc, g) || !(f is FuncDecl) { return 1 }
+  if keys.length < 2 || hasI32(pfSrc, g) || fsByNameFn(g) || !(f is FuncDecl) {
+    return 1
+  }
   let k = 0
   while k < keys.length {
     let copy = -1
@@ -1471,7 +1517,9 @@ function fsReadsNoLocal(m: i32): boolean {
 // is not a call takes a key of its own. 1 when its reads share one key.
 function fsPlanFn(m: i32): i32 {
   const f = P.nodes[m]
-  if !(f is FuncDecl) || f.fnName == "" || fsParent[m] < 0 { return 1 }
+  if !(f is FuncDecl) || f.fnName == "" || fsParent[m] < 0 || fsByNameFn(m) {
+    return 1
+  }
   let top = fsTopStmt(m)
   if top < 0 { return 1 }
   if top != m {
@@ -1596,7 +1644,7 @@ function fsFnCalls(fd: i32): i32[] {
     const d = decls[di]
     di = di + 1
     for r in fsIdents {
-      if identDeclOf(r) == d && r != d {
+      if identDeclOf(r) == d && r != d && !hasI32(pkArg, r) {
         const c = fsParent[r]
         const cn = P.nodes[c]
         if c < 0 { calls.push(-1) }
@@ -1604,6 +1652,16 @@ function fsFnCalls(fd: i32): i32[] {
         else if fsFnAliasInit(c) == r && !hasI32(decls, c) { decls.push(c) }
         else { calls.push(-1) }
       }
+    }
+    // A parameter planned by name to this function calls it at each of its reads.
+    let i = 0
+    while i < pkPar.length {
+      if pkDecl[i] == d {
+        for r in fsIdents {
+          if identDeclOf(r) == pkPar[i] { calls.push(fsParent[r]) }
+        }
+      }
+      i = i + 1
     }
   }
   calls
@@ -1928,7 +1986,9 @@ function fsPlanHoles(): i32 {
   hsBad = false
   const work: i32[] = []
   for a in fsAsks {
-    if a >= 0 && a < fsParseLen && P.nodes[a] is Param { work.push(a) }
+    if a >= 0 && a < fsParseLen && P.nodes[a] is Param && !hasI32(pkPar, a) {
+      work.push(a)
+    }
   }
   let wi = 0
   while wi < work.length {
@@ -1981,6 +2041,122 @@ function fsPlanHoles(): i32 {
   }
   if hsPar.length == 0 { return 1 }
   0
+}
+
+// A hole parameter of a module function, read only as a callee at one key and handed at every
+// call a module function or `const` lambda by name, is that function: the function, and a copy
+// of it per further name, calls it by name and drops the parameter, as each call does (D6481).
+// 1 when it cannot.
+function fsPlanByName(par: i32): i32 {
+  if par < 0 || par >= fsParseLen || fsParent[par] < 0 { return 1 }
+  const p = P.nodes[par]
+  const fd = fsParent[par]
+  const f = P.nodes[fd]
+  const own = fsFnOwner(fd)
+  if !(p is Param) || !(f is FuncDecl) || own < 0 { return 1 }
+  if hasI32(pfSrc, fd) || fsByNameFn(fd) { return 1 }
+  if p.parType >= 0 || p.parDefault >= 0 || p.parOpt != 0 || p.parRest != 0 {
+    return 1
+  }
+  if fsParent[own] < 0 || !(P.nodes[fsParent[own]] is Program) { return 1 }
+  let j = 0
+  while j < f.fnParams.length && f.fnParams[j] != par { j = j + 1 }
+  const reads: i32[] = []
+  for r in fsIdents {
+    if identDeclOf(r) == par {
+      const cn = P.nodes[fsParent[r]]
+      if !(cn is Call) || cn.callFn != r { return 1 }
+      reads.push(r)
+    }
+  }
+  // A hole called at two keys is the hole plan's.
+  hsBad = false
+  if fsHoleKeys(par).length > 1 { return 1 }
+  const calls = fsFnCalls(own)
+  const args: i32[] = []
+  const names: string[] = []
+  for c in calls {
+    if c < 0 || hasI32(paCall, c) || hasI32(pkCall, c) { return 1 }
+    const cn = P.nodes[c]
+    if !(cn is Call) { return 1 }
+    const a = fsArgOfParam(cn, f, j)
+    const nm = fsFixedFnName(a, own)
+    if nm == "" { return 1 }
+    // A lambda has no declaration a copy can be parsed from, so it takes one name.
+    if f.fnName == "" && names.length > 0 && names[0] != nm { return 1 }
+    args.push(a)
+    names.push(nm)
+  }
+  if calls.length == 0 { return 1 }
+  // The first name takes the function itself, so the plans of the named function's own
+  // parameters see its calls; each further name takes a copy.
+  const seen: string[] = []
+  const copies: string[] = []
+  let i = 0
+  while i < calls.length {
+    let k = 0
+    while k < seen.length && seen[k] != names[i] { k = k + 1 }
+    if k == seen.length {
+      seen.push(names[i])
+      if k == 0 {
+        copies.push("")
+        for r in reads { fsRename(r, names[i]) }
+        pzPar.push(par)
+        pkPar.push(par)
+        pkDecl.push(identDeclOf(fsParenPeel(args[i])))
+      } else {
+        const copy = pfSrc.length
+        copies.push(f.fnName + "$n" + i32ToStr(par) + "_" + i32ToStr(k))
+        pfSrc.push(fd)
+        pfAnchor.push(fd)
+        pfName.push(copies[k])
+        for r in reads { fsCopyRename(copy, r, names[i]) }
+        pqCopy.push(copy)
+        pqName.push(p.parName)
+      }
+    }
+    const cn = P.nodes[calls[i]]
+    if cn is Call && copies[k] != "" { fsRename(cn.callFn, copies[k]) }
+    pkCall.push(calls[i])
+    pkArg.push(args[i])
+    i = i + 1
+  }
+  0
+}
+
+// Whether a parameter of function `fd` is planned by name, so no other plan copies `fd`.
+function fsByNameFn(fd: i32): boolean {
+  for q in pkPar {
+    if fsParent[q] == fd { return true }
+  }
+  for q in pqCopy {
+    if q >= 0 && q < pfSrc.length && pfSrc[q] == fd { return true }
+  }
+  false
+}
+
+// The name argument `a` reads when it is a module function or a module `const` lambda, other
+// than `fd` itself and named nowhere inside `fd`, so a read of it in `fd` means it; else "".
+function fsFixedFnName(a: i32, fd: i32): string {
+  const x = fsParenPeel(a)
+  if x < 0 || x >= fsParseLen { return "" }
+  const n = P.nodes[x]
+  if !(n is Ident) { return "" }
+  const d = identDeclOf(x)
+  if d < 0 || d >= fsParseLen || d == fd || fsParent[d] < 0 { return "" }
+  if !(P.nodes[fsParent[d]] is Program) { return "" }
+  const dn = P.nodes[d]
+  let ok = dn is FuncDecl && dn.fnName == n.identName
+  if dn is LetDecl && dn.letKw == "const" && dn.letName == n.identName {
+    ok = dn.letType < 0 && fsIsLambdaLit(dn.letInit)
+  }
+  if !ok { return "" }
+  let i = 0
+  while i < fsParseLen {
+    if fsUnder(i, fd) && binderNameAt(i) == n.identName { return "" }
+    i = i + 1
+  }
+  n.identName
 }
 
 function fsHoleDecline(): i32 {
@@ -2343,8 +2519,82 @@ function fsRename(ix: i32, name: string): i32 {
 // parse. -1 when the plan does not apply, which abandons that compile.
 export function fsAfterParse(): i32 {
   fsParseLen = P.nodes.length
+  fsConstLets()
   if fsMode != FS_APPLY { return 0 }
   fsApply()
+}
+
+// The names some `=` or an exported `let` writes, how often each name is declared, and the
+// one binding or named function declaring it, for `fsConstLets`.
+let clWritten: {[string]: boolean} = Map()
+let clDecls: {[string]: i32} = Map()
+let clLet: {[string]: i32} = Map()
+
+// An un-annotated, unexported `let` that no `=` anywhere writes by name, holding a lambda or a
+// name that is a function for good, is spelled `const`, so every reader that follows a `const`
+// to a function follows it too (D6472).
+function fsConstLets(): i32 {
+  clWritten = Map()
+  clDecls = Map()
+  clLet = Map()
+  let i = 0
+  while i < fsParseLen {
+    const n = P.nodes[i]
+    if n is BinExpr && n.binOp == "=" {
+      const l = P.nodes[n.binLeft]
+      if l is Ident { clWritten[l.identName] = true }
+    }
+    let nm = ""
+    if n is LetDecl {
+      nm = n.letName
+      clLet[nm] = i
+    } else if n is Param {
+      nm = n.parName
+    } else if n is FuncDecl {
+      nm = n.fnName
+      if nm != "" { clLet[nm] = i }
+    }
+    if nm != "" { clDecls[nm] = (clDecls[nm] ?? 0) + 1 }
+    i = i + 1
+  }
+  let t = 0
+  while t + 2 < P.toks.length {
+    if P.toks[t].kind == "EXPORT" && P.toks[t + 1].kind == "LET" {
+      clWritten[P.toks[t + 2].text] = true
+    }
+    t = t + 1
+  }
+  i = 0
+  while i < fsParseLen {
+    const n = P.nodes[i]
+    if (
+      n is LetDecl
+      && n.letKw == "let"
+      && n.letType < 0
+      && n.letInit >= 0
+      && !(clWritten[n.letName] ?? false)
+      && fsFixedFnValue(n.letInit, 0)
+    ) {
+      n.letKw = "const"
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether value `v` is a lambda, or a name declared once as a named function or as an unwritten
+// binding holding such a value; a copy of a written binding holds whatever the last write stored.
+function fsFixedFnValue(v: i32, depth: i32): boolean {
+  const n = P.nodes[fsParenPeel(v)]
+  if n is FuncDecl { return n.fnName == "" }
+  if !(n is Ident) || depth > 16 { return false }
+  const nm = n.identName
+  if (clDecls[nm] ?? 0) != 1 || (clWritten[nm] ?? false) { return false }
+  const d = clLet[nm] ?? -1
+  if d < 0 { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return true }
+  dn is LetDecl && dn.letInit >= 0 && fsFixedFnValue(dn.letInit, depth + 1)
 }
 
 // The statements of a block or the program; empty for any other node.
@@ -2425,6 +2675,16 @@ function fsValueNode(src: i32, name: string): i32 {
   fsExcluded(-2, "a value that is not a name or a lambda")
 }
 
+// Annotation `t` names type `nm`; the parser's spelling tree for it is dropped, since every
+// resolver reads that tree before the name (D6523). `rc`, or -1 when `t` is not a `TypeRef`.
+function fsRenameTypeRef(t: i32, nm: string, rc: i32): i32 {
+  const tn = P.nodes[t]
+  if !(tn is TypeRef) { return -1 }
+  clearAnnTs(t)
+  tn.tyName = nm
+  rc
+}
+
 function fsApply(): i32 {
   const savedPos = P.pos
   let rc = 0
@@ -2439,8 +2699,7 @@ function fsApply(): i32 {
     const p = P.nodes[psPar[i]]
     const f = P.nodes[psFn[i]]
     if p is Param && p.parType >= 0 && f is FuncDecl {
-      const tn = P.nodes[p.parType]
-      if tn is TypeRef { tn.tyName = psName[i] } else { rc = -1 }
+      rc = fsRenameTypeRef(p.parType, psName[i], rc)
       f.fnTyParams.push(psName[i])
     } else {
       rc = -1
@@ -2449,8 +2708,7 @@ function fsApply(): i32 {
   }
   i = 0
   while i < psRetype.length {
-    const tn = P.nodes[psRetype[i]]
-    if tn is TypeRef { tn.tyName = psRetypeName[i] } else { rc = -1 }
+    rc = fsRenameTypeRef(psRetype[i], psRetypeName[i], rc)
     i = i + 1
   }
   i = 0
@@ -2508,6 +2766,7 @@ function fsApply(): i32 {
         if fn is FuncDecl {
           fn.fnName = pfName[i]
           fsApplyCopyRenames(i, f)
+          fsApplyCopyDrops(i, fn)
           rc = fsInsertAfter(pfAnchor[i], f)
         }
       }
@@ -2530,8 +2789,74 @@ function fsApply(): i32 {
     if rc == 0 { rc = fsApplyArgs(paCall[i], paArg[i], paNames[i], paPars[i]) }
     i = i + 1
   }
+  i = 0
+  while i < pkCall.length {
+    if rc == 0 { rc = fsApplyArgDrop(pkCall[i], pkArg[i]) }
+    i = i + 1
+  }
+  for par in pzPar {
+    if rc == 0 { rc = fsApplyParamDrop(par) }
+  }
   P.pos = savedPos
   rc
+}
+
+// Copy `i`, minted as function `fn`, without the parameters planned dropped from it.
+function fsApplyCopyDrops(i: i32, fn: FuncDecl): i32 {
+  let j = 0
+  while j < pqCopy.length {
+    if pqCopy[j] == i {
+      const out: i32[] = []
+      for q in fn.fnParams {
+        const qn = P.nodes[q]
+        if !(qn is Param && qn.parName == pqName[j]) { out.push(q) }
+      }
+      fn.fnParams = out
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Parameter `par`'s function without it. -1 when it cannot.
+function fsApplyParamDrop(par: i32): i32 {
+  let fd = 0
+  while fd < fsParseLen {
+    const f = P.nodes[fd]
+    if f is FuncDecl && hasI32(f.fnParams, par) {
+      const out: i32[] = []
+      for q in f.fnParams {
+        if q != par { out.push(q) }
+      }
+      f.fnParams = out
+      return 0
+    }
+    fd = fd + 1
+  }
+  -1
+}
+
+// Call `c` without its argument `a`. -1 when it cannot.
+function fsApplyArgDrop(c: i32, a: i32): i32 {
+  const cn = P.nodes[c]
+  if !(cn is Call) { return -1 }
+  const args: i32[] = []
+  const nms: string[] = []
+  let found = false
+  let i = 0
+  while i < cn.callArgs.length {
+    if cn.callArgs[i] == a {
+      found = true
+    } else {
+      args.push(cn.callArgs[i])
+      if i < cn.callArgNames.length { nms.push(cn.callArgNames[i]) }
+    }
+    i = i + 1
+  }
+  if !found { return -1 }
+  cn.callArgs = args
+  if cn.callArgNames.length > 0 { cn.callArgNames = nms }
+  0
 }
 
 // Un-annotated parameters `names` after parameter `par` of its function. -1 when it cannot.
