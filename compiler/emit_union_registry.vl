@@ -250,8 +250,13 @@ export function unionMemberCountOfName(name: string): i32 {
 
 // Whether `null` is a member of `name`, read from a bound row's recorded members.
 export function unionNameHasNull(name: string): boolean {
+  unionNameHasNullTy(name, -1)
+}
+
+// `unionNameHasNull` for a caller that also holds `name`'s arena type `ty`, or -1.
+export function unionNameHasNullTy(name: string, ty: i32): boolean {
   const u = unMemRowOfName(name)
-  if u < 0 { return unionSetHasNull(unionMemberSetOf(name)) }
+  if u < 0 { return unionSetHasNullTy(unionMemberSetOf(name), ty) }
   const st = unMemTyStart[u]
   let i = 0
   while i < unMemTyCount[u] {
@@ -263,8 +268,13 @@ export function unionNameHasNull(name: string): boolean {
 
 // The number of non-`null` members of `name`, read from a bound row's recorded members.
 export function unionNameNonNullCount(name: string): i32 {
+  unionNameNonNullCountTy(name, -1)
+}
+
+// `unionNameNonNullCount` for a caller that also holds `name`'s arena type `ty`, or -1.
+export function unionNameNonNullCountTy(name: string, ty: i32): i32 {
   const u = unMemRowOfName(name)
-  if u < 0 { return unionSetNonNullCount(unionMemberSetOf(name)) }
+  if u < 0 { return unionSetNonNullCountTy(unionMemberSetOf(name), ty) }
   const st = unMemTyStart[u]
   let n = 0
   let i = 0
@@ -1099,6 +1109,31 @@ function msSetOfRow(u: i32): i32 {
   msSetIntern(u, msMaskFull(unMemTyCount[u]))
 }
 
+// The full member set of the union row keyed as arena type `ty`, or -1 when no row carries
+// its key: the set a caller holding the type reads without naming it.
+export function msSetOfTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const u = unRowOfKey(ty)
+  if u < 0 { return -1 }
+  msSetOfRow(u)
+}
+
+// The full member set of union `name` whose arena type is `ty`, or -1: a union or alias name
+// reads its row, else the row keyed by `ty`, else a nullable `ty`'s inner row when `name` spells
+// that row's members. A primitive keyword or "" names no row.
+export function msSetOfNameTy(name: string, ty: i32): i32 {
+  const s = msSetOfUnion(name)
+  if s >= 0 { return s }
+  if name == "" || primTyIxOfName(name) >= 0 { return -1 }
+  const s2 = msSetOfTy(ty)
+  if s2 >= 0 || ty < 0 { return s2 }
+  const t = T.tys[ty]
+  if !(t is TyNullable) { return -1 }
+  const r = msSetOfTy(t.nInner)
+  if r >= 0 && msTextOf(r) == name { return r }
+  -1
+}
+
 // The set id for a member-set string — the bridge for a consumer still holding text. A set
 // the pool already rendered answers from the text index; otherwise the row carrying the
 // string's union key hands over its members; a miss is not banked, since a row can be minted
@@ -1115,14 +1150,6 @@ export function msSetOfText(set: string): i32 {
     if id >= 0 { return id }
   }
   -1
-}
-
-// The set id of `name` by key: its row when `name` is a union or alias name, else the
-// member-set spelling it is (`msSetOfText`). -1 when neither covers it.
-export function msSetOfKey(name: string): i32 {
-  const s = msSetOfUnion(name)
-  if s >= 0 { return s }
-  msSetOfText(name)
 }
 
 // The rendered member set of `s` (see `msRenderSet`).
@@ -1348,10 +1375,27 @@ export function removeAtomFromSetOf(
   set: string,
   removed: string,
 ): string {
+  removeAtomRestOf(removeAtomIdOf(sid, set, removed), set, removed)
+}
+
+// The id of `set` less `removed`, where `sid` is `set`'s id or -1 to resolve `set` by key; -1
+// when neither covers it or `set` is one primitive keyword with no id. A narrowing pushed from
+// the survivors banks this id.
+export function removeAtomIdOf(sid: i32, set: string, removed: string): i32 {
+  if sid < 0 && primTyIxOfName(set) >= 0 { return -1 }
   let s = sid
-  if s < 0 { s = msSetOfKey(set) }
-  const r = msRemoveAtomId(s, removed)
-  if r >= 0 { return msTextOf(r) }
+  if s < 0 { s = msSetOfUnion(set) }
+  msRemoveAtomId(s, removed)
+}
+
+// The rendering of `set` less `removed`, given `rid` from `removeAtomIdOf`: the id's own
+// rendering when it has one, else the subtraction done on the spelling.
+export function removeAtomRestOf(
+  rid: i32,
+  set: string,
+  removed: string,
+): string {
+  if rid >= 0 { return msTextOf(rid) }
   const out = removeAtomFrom(set, removed)
   if out != set { return out }
   const roIn = roListInnerName(removed)
@@ -1421,16 +1465,26 @@ export function printPlanReset() {
 // MEMBERSHIP of `null` in a member set, structurally; a declared type name is one non-null atom,
 // and a primitive keyword is one atom that is `null` only when it is `null` itself.
 export function unionSetHasNull(set: string): boolean {
-  const s = msSetOfKey(set)
+  unionSetHasNullTy(set, -1)
+}
+
+// `unionSetHasNull` for a caller that also holds `set`'s arena type `ty`, or -1.
+export function unionSetHasNullTy(set: string, ty: i32): boolean {
+  if primTyIxOfName(set) >= 0 { return set == "null" }
+  const s = msSetOfNameTy(set, ty)
   if s >= 0 { return msHasNull(s) }
   if (cUserTypes[set] ?? -1) >= 0 { return false }
-  if primTyIxOfName(set) >= 0 { return set == "null" }
   unionHasAtom(set, "null")
 }
 
 // CARDINALITY of a member set's non-`null` members, structurally.
 export function unionSetNonNullCount(set: string): i32 {
-  const s = msSetOfKey(set)
+  unionSetNonNullCountTy(set, -1)
+}
+
+// `unionSetNonNullCount` for a caller that also holds `set`'s arena type `ty`, or -1.
+export function unionSetNonNullCountTy(set: string, ty: i32): i32 {
+  const s = msSetOfNameTy(set, ty)
   if s >= 0 { return msNonNullCount(s) }
   const atoms: string[] = []
   unionSetAtomsOf(set, atoms)
