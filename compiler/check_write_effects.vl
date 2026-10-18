@@ -34,7 +34,7 @@ import {
   nodeIsTplHole,
   nodeSpineChildren,
 } from "./ast"
-import { crNoNames, weSplit } from "./check_capture_walks"
+import { crNoNames } from "./check_capture_walks"
 import { nodeTyOf } from "./check_node_tys"
 import { lookup, lookupFnDeclNode } from "./check_scopes"
 import { crTyHasFn, crTyIsScalar, tyHasTyVar } from "./tyquery"
@@ -65,42 +65,42 @@ import {
   fnDeclIx,
 } from "./check_write_scan"
 
-// A shape summary: its parts (each one `,`-separated entry of the spelling, interned) in first
-// occurrence order, whether one holds an `@`, and `opaque` for the summary spelled `"*"`.
-type WeSet = { parts: i32[], at: boolean, opaque: boolean }
+// A summary: its parts (interned, each a whole sub-path, place key or shape) in first occurrence
+// order, whether one is a call of a parameter (`@i`), and `opaque` when nothing is known.
+export type WeSet = { parts: i32[], at: boolean, opaque: boolean }
 
 const weOpaqueSet: WeSet = { parts: [], at: false, opaque: true }
 const weEmptySet: WeSet = { parts: [], at: false, opaque: false }
 
-// The interned parts: the spelling of each, and whether it holds an `@` (bit 1) or a `*` (bit 2).
+// The interned parts: the spelling of each, and the parameter `i` a part `@i` calls, else -1. A
+// part is never split or scanned, so a string key holding `,`, `@` or `*` is one part (D6400).
 let wePartIx: {[string]: i32} = Map()
 let wePartText: string[] = []
-let wePartFlags: i32[] = []
+let wePartParam: i32[] = []
 
-function wePartOf(text: string): i32 {
+function wePartOf(text: string, param: i32): i32 {
   const hit = wePartIx[text]
   if hit != null { return hit }
   const id = wePartText.length
   wePartIx[text] = id
   wePartText.push(text)
-  let f = 0
-  if text.indexOf("@") >= 0 { f = f | 1 }
-  if text.indexOf("*") >= 0 { f = f | 2 }
-  wePartFlags.push(f)
+  wePartParam.push(param)
   id
 }
 
-// A summary being built: its parts, a bitset of those already in it when `dedupe` keeps each once
-// (a summary is a set, and one that repeats a callee's shapes per call grows with every path
-// through the call graph), and `star` once a part holding a `*` is added, kept or not.
-type WeAcc = { parts: i32[], seen: i32[], dedupe: boolean, star: boolean }
+// The spelling of part `id` of a `WeSet`.
+export function wePartTextOf(id: i32): string { wePartText[id] }
+
+// A summary being built: its parts, and a bitset of those already in it when `dedupe` keeps each
+// once (a summary is a set, and one that repeats a callee's parts per call grows with every path
+// through the call graph).
+type WeAcc = { parts: i32[], seen: i32[], dedupe: boolean }
 
 function weAccNew(dedupe: boolean): WeAcc {
-  { parts: [], seen: [], dedupe: dedupe, star: false }
+  { parts: [], seen: [], dedupe: dedupe }
 }
 
 function weAccId(acc: WeAcc, id: i32) {
-  if (wePartFlags[id] & 2) != 0 { acc.star = true }
   if acc.dedupe {
     const w = id >> 5
     while acc.seen.length <= w { acc.seen.push(0) }
@@ -112,18 +112,16 @@ function weAccId(acc: WeAcc, id: i32) {
   0
 }
 
-// Add the parts of `piece`, a `,`-terminated spelling as the shape writers produce it.
-function weAccPiece(acc: WeAcc, piece: string) {
-  let start = 0
-  let i = 0
-  while i < piece.length {
-    if piece[i] == ',' {
-      if i > start { weAccId(acc, wePartOf(piece.slice(start, i))) }
-      start = i + 1
-    }
-    i = i + 1
-  }
+// Add the part spelled `text`; "" adds nothing.
+function weAccPart(acc: WeAcc, text: string) {
+  if text != "" { weAccId(acc, wePartOf(text, -1)) }
   0
+}
+
+// Add the part `@i`, a call of parameter `i` of the function summarised.
+function weAccParam(acc: WeAcc, i: i32) {
+  // No other part starts with `@`, so the spelling is a key of its own.
+  weAccId(acc, wePartOf("@" + i32ToStr(i), i))
 }
 
 function weAccSet(acc: WeAcc, s: WeSet) {
@@ -142,22 +140,15 @@ function weSetOf(acc: WeAcc): WeSet {
   if acc.parts.length == 0 { return weEmptySet }
   let at = false
   for id in acc.parts {
-    if (wePartFlags[id] & 1) != 0 { at = true }
+    if wePartParam[id] >= 0 { at = true }
   }
   { parts: acc.parts, at: at, opaque: false }
-}
-
-// The `,`-terminated spelling of the parts built in `acc`.
-function weAccText(acc: WeAcc): string {
-  let out = ""
-  for id in acc.parts { out = out + wePartText[id] + "," }
-  out
 }
 
 function weRebindShape(ix: i32, bound: string[]) {
   const t = P.nodes[ix]
   if t is Ident {
-    if !strListHas(bound, t.identName) { return "=" + t.identName + "," }
+    if !strListHas(bound, t.identName) { return "=" + t.identName }
   }
   ""
 }
@@ -347,11 +338,10 @@ function placeSubPath(ix: i32, root: string) {
   sub
 }
 
-// Write-effect summaries for the effect-based invalidation rule, keyed `"<fn-node-ix>#<param-ix>"`.
-// A value is either the opaque token `"*"` — assume the callee writes everything reachable through
-// that parameter — or a `,`-terminated list of the field sub-paths it may write. A recursive cycle
-// answers `"*"`: a summary that guesses must guess closed. `""` is a value, so presence uses `has`.
-let weSums: {[string]: string} = Map()
+// Write-effect summaries for the effect-based invalidation rule, keyed `"<fn-node-ix>#<param-ix>"`
+// and `"<fn-node-ix>#free"`: the field sub-paths a callee may write through that parameter, or the
+// place keys it writes through a free variable, or opaque — assume it writes everything reachable.
+let weSums: {[string]: WeSet} = Map()
 let weOpen: string[] = []
 
 // The shape summaries (`fnWriteShapes`), keyed `"<fn-node-ix>#shape"`.
@@ -386,12 +376,12 @@ let weUnresAny = false
 const ALIAS_CYCLE_OPAQUE = false
 
 // The write-effect summary of parameter `paramIx` of the `FuncDecl` at `fnIx`.
-export function fnWriteEffects(fnIx: i32, paramIx: i32) {
+export function fnWriteEffects(fnIx: i32, paramIx: i32): WeSet {
   const key = i32ToStr(fnIx) + "#" + i32ToStr(paramIx)
   // One probe, not two — see `fnWriteFreePaths` for the note.
   const weHit = weSums[key]
-  if weHit is string { return weHit }
-  if weIsOpen(key) { return weCycleAnswer() }
+  if weHit != null { return weHit }
+  if weIsOpen(key) { return weCycleSet() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     const ps = fd.fnParams
@@ -401,7 +391,9 @@ export function fnWriteEffects(fnIx: i32, paramIx: i32) {
         const cutBefore = weCut
         weOpen.push(key)
         weRoots.push(fd.fnBody)
-        const acc = weScan(fd.fnBody, p.parName)
+        const into = weAccNew(true)
+        let acc = weOpaqueSet
+        if weScan(into, fd.fnBody, p.parName) { acc = weSetOf(into) }
         weRoots.pop()
         weOpen.pop()
         weCache(key, acc, cutBefore)
@@ -409,7 +401,7 @@ export function fnWriteEffects(fnIx: i32, paramIx: i32) {
       }
     }
   }
-  "*"
+  weOpaqueSet
 }
 
 // Whether a summary for `key` is already being computed higher in the recursion.
@@ -422,120 +414,119 @@ function weIsOpen(key: string) {
   false
 }
 
-// What a cut cycle answers: ⊥ for the fixpoint reading, opaque for the strict one.
-function weCycleAnswer() {
+// Whether a cut cycle answers opaque: false for the fixpoint reading (⊥), true for the strict one.
+function weCycleOpaque(): boolean {
   weCut = weCut + 1
-  if ALIAS_CYCLE_OPAQUE { return "*" }
-  ""
+  ALIAS_CYCLE_OPAQUE
+}
+
+function weCycleSet(): WeSet {
+  if weCycleOpaque() { return weOpaqueSet }
+  weEmptySet
 }
 
 // Cache a summary unless it is provisional — computed with a cycle cut while another summary is
 // still open, which is the one case the first pass leaves too small.
-function weCache(key: string, acc: string, cutBefore: i32) {
+function weCache(key: string, acc: WeSet, cutBefore: i32) {
   if weCut != cutBefore && weOpen.length > 0 { return 0 }
   weSums[key] = acc
   0
 }
 
-// Accumulate the field sub-paths a subtree may write through the parameter named `pname`, or `"*"`
-// for opaque: the parameter escaping into a field, an element or a return, an indirect call whose
+// Add the field sub-paths a subtree may write through the parameter named `pname`; false for
+// opaque: the parameter escaping into a field, an element or a return, an indirect call whose
 // target is not statically one `FuncDecl`, or a call whose declaration does not resolve at all.
 // Nested `FuncDecl`s are descended, and one shadowing `pname` over-approximates, the safe direction.
-function weScan(ix: i32, pname: string) {
-  if ix < 0 || ix >= P.nodes.length { return "" }
-  let acc = ""
+function weScan(acc: WeAcc, ix: i32, pname: string): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
   const n = P.nodes[ix]
   if n is BinExpr {
     if n.binOp == "=" {
-      const sub = placeSubPath(n.binLeft, pname)
-      if sub != "" { acc = acc + sub + "," }
+      weAccPart(acc, placeSubPath(n.binLeft, pname))
       // the parameter itself stored into the heap — it escapes
-      if placeKeyOf(n.binRight) == pname { return "*" }
+      if placeKeyOf(n.binRight) == pname { return false }
     }
   } else if n is RetStmt {
     if n.retArg >= 0 {
-      if placeKeyOf(n.retArg) == pname { return "*" }
+      if placeKeyOf(n.retArg) == pname { return false }
     }
   } else if n is Call {
-    const inner = callEffectsOn(ix, pname)
-    if inner == "*" { return "*" }
-    acc = acc + inner
+    if !callEffectsOn(acc, ix, pname) { return false }
   }
-  const opInner = opEffectsOn(ix, pname)
-  if opInner == "*" { return "*" }
-  acc = acc + opInner
+  if !opEffectsOn(acc, ix, pname) { return false }
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
   while cur >= 0 {
     const kids = nodeSpineChildren(cur)
     let i = 0
     while i < kids.length {
-      const sub = weScan(kids[i], pname)
-      if sub == "*" { return "*" }
-      acc = acc + sub
+      if !weScan(acc, kids[i], pname) { return false }
       i = i + 1
     }
     cur = elseIfLink(cur)
   }
-  acc
+  true
 }
 
-// The field sub-paths a call inside a callee body may write through `pname`, by composing the
+// Add the field sub-paths a call inside a callee body may write through `pname`, by composing the
 // nested callee's own summary: passing `pname.a` where the nested callee writes `v` through that
 // parameter is a write of `a.v` here.
-function callEffectsOn(callIx: i32, pname: string) {
+function callEffectsOn(acc: WeAcc, callIx: i32, pname: string): boolean {
   const cn = P.nodes[callIx]
-  if cn is Call { return callEffectsOnReal(cn, callIx, pname) }
-  ""
+  if cn is Call { return callEffectsOnReal(acc, cn, callIx, pname) }
+  true
 }
 
-function callEffectsOnReal(cn: Call, callIx: i32, pname: string) {
+function callEffectsOnReal(
+  acc: WeAcc,
+  cn: Call,
+  callIx: i32,
+  pname: string,
+): boolean {
   const declIx = callDeclFnIx(cn, callIx)
   // An intrinsic cannot write a field of anything handed to it, so a body whose only use of the
   // parameter is `print(p.v)` has no write effect. Distinguishing this from the opaque `-1` keeps
   // a read-only callee from invalidating its caller's narrowings — the false positive that
   // decides whether the rule is usable at all.
-  if declIx == -2 { return "" }
+  if declIx == -2 { return true }
   const args = callArgPlaces(cn, callIx)
   if declIx == -1 {
     const ts = callFnValueDecls(cn)
     if ts.length > 0 {
-      let acc = ""
       let i = 0
       while i < ts.length {
-        const sub = argEffectsOn(ts[i], args, pname)
-        if sub == "*" { return "*" }
-        acc = acc + sub
+        if !argEffectsOn(acc, ts[i], args, pname) { return false }
         i = i + 1
       }
-      return acc
+      return true
     }
   }
-  argEffectsOn(declIx, args, pname)
+  argEffectsOn(acc, declIx, args, pname)
 }
 
 // `callEffectsOn` for an operator site that may dispatch: each declaration it may run, handed
-// the operands. Not a dispatch site answers "".
-function opEffectsOn(ix: i32, pname: string) {
-  if !(P.nodes[ix] is BinExpr || P.nodes[ix] is Index) { return "" }
+// the operands. Not a dispatch site adds nothing.
+function opEffectsOn(acc: WeAcc, ix: i32, pname: string): boolean {
+  if !(P.nodes[ix] is BinExpr || P.nodes[ix] is Index) { return true }
   const ds = opSiteDecls(ix)
-  if ds.length == 0 { return "" }
+  if ds.length == 0 { return true }
   const args = opSiteArgs(ix)
-  let acc = ""
   let i = 0
   while i < ds.length {
-    const sub = argEffectsOn(ds[i], args, pname)
-    if sub == "*" { return "*" }
-    acc = acc + sub
+    if !argEffectsOn(acc, ds[i], args, pname) { return false }
     i = i + 1
   }
-  acc
+  true
 }
 
-// The sub-paths the declaration at `declIx` (-1 opaque) may write through `pname`, handed the
-// argument places `args` in parameter order.
-function argEffectsOn(declIx: i32, args: i32[], pname: string) {
-  let acc = ""
+// Add the sub-paths the declaration at `declIx` (-1 opaque) may write through `pname`, handed the
+// argument places `args` in parameter order; false when opaque.
+function argEffectsOn(
+  acc: WeAcc,
+  declIx: i32,
+  args: i32[],
+  pname: string,
+): boolean {
   let i = 0
   while i < args.length {
     const ak = placeKeyOf(args[i])
@@ -550,20 +541,15 @@ function argEffectsOn(declIx: i32, args: i32[], pname: string) {
     }
     if rooted {
       if declIx < 0 {
-        return "*" // indirect / unresolvable callee
+        return false // indirect / unresolvable callee
       }
       const sum = fnWriteEffects(declIx, i)
-      if sum == "*" { return "*" }
-      const parts = weSplit(sum)
-      let j = 0
-      while j < parts.length {
-        acc = acc + below + parts[j] + ","
-        j = j + 1
-      }
+      if sum.opaque { return false }
+      for id in sum.parts { weAccPart(acc, below + wePartText[id]) }
     }
     i = i + 1
   }
-  acc
+  true
 }
 
 // The names a function binds: its parameters, every `let`/`const` in its body at any depth, both
@@ -601,18 +587,18 @@ export function fnBoundNames(fnIx: i32, out: string[]) {
 }
 
 // The full place keys a function writes through a free variable — a captured local or a
-// module-level binding — `,`-terminated, or `"*"` for opaque. This channel exists because the
-// parameter channel is keyed on arguments, so a callee that takes none is invisible to it:
-// `function zap() { o.v = null }` inside a guard is exactly as falsifying as `clr(o)`.
-export function fnWriteFreePaths(fnIx: i32) {
+// module-level binding — or opaque. This channel exists because the parameter channel is keyed on
+// arguments, so a callee that takes none is invisible to it: `function zap() { o.v = null }` inside
+// a guard is exactly as falsifying as `clr(o)`.
+export function fnWriteFreePaths(fnIx: i32): WeSet {
   const key = i32ToStr(fnIx) + "#free"
   // One probe, not two: a `.has` guard does not narrow a later `m[k]`, since `m[k]` is not a stable
   // place, so the guarded form probes the map twice. Binding once and narrowing the binding is the
   // fix the `map-has-guard-reread` lint names, and this is a memo lookup on the write-effect path,
   // so it is the hot shape rather than an incidental one.
   const weHit = weSums[key]
-  if weHit is string { return weHit }
-  if weIsOpen(key) { return weCycleAnswer() }
+  if weHit != null { return weHit }
+  if weIsOpen(key) { return weCycleSet() }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     const bound: string[] = []
@@ -620,42 +606,37 @@ export function fnWriteFreePaths(fnIx: i32) {
     const cutBefore = weCut
     weOpen.push(key)
     weRoots.push(fd.fnBody)
-    const acc = weScanFree(fd.fnBody, bound)
+    const into = weAccNew(true)
+    let acc = weOpaqueSet
+    if weScanFree(into, fd.fnBody, bound) { acc = weSetOf(into) }
     weRoots.pop()
     weOpen.pop()
     weCache(key, acc, cutBefore)
     return acc
   }
-  "*"
+  weOpaqueSet
 }
 
-// Accumulate the free-variable place keys a subtree writes, composing a nested known
-// callee's own free writes. An opaque nested callee makes the whole answer opaque.
-function weScanFree(ix: i32, bound: string[]) {
-  if ix < 0 || ix >= P.nodes.length { return "" }
-  let acc = ""
+// Add the free-variable place keys a subtree writes, composing a nested known callee's own free
+// writes; false when an opaque nested callee makes the whole answer opaque.
+function weScanFree(acc: WeAcc, ix: i32, bound: string[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
   const n = P.nodes[ix]
   if n is BinExpr {
     if n.binOp == "=" {
       // A bare free name counts too: rebinding `g` replaces every place below it.
       const k = placeKeyOf(n.binLeft)
       if k != "" {
-        if !strListHas(bound, placeRootOf(k)) { acc = acc + k + "," }
+        if !strListHas(bound, placeRootOf(k)) { weAccPart(acc, k) }
       }
     }
   } else if n is Call {
-    const inner = callFreeEffects(ix)
-    if inner == "*" { return "*" }
-    acc = acc + inner
+    if !callFreeEffects(acc, ix) { return false }
   } else if n is Index {
-    const inner = opFreeEffects(ix)
-    if inner == "*" { return "*" }
-    acc = acc + inner
+    if !opFreeEffects(acc, ix) { return false }
   }
   if n is BinExpr {
-    const inner = opFreeEffects(ix)
-    if inner == "*" { return "*" }
-    acc = acc + inner
+    if !opFreeEffects(acc, ix) { return false }
   }
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
@@ -663,55 +644,54 @@ function weScanFree(ix: i32, bound: string[]) {
     const kids = nodeSpineChildren(cur)
     let i = 0
     while i < kids.length {
-      const sub = weScanFree(kids[i], bound)
-      if sub == "*" { return "*" }
-      acc = acc + sub
+      if !weScanFree(acc, kids[i], bound) { return false }
       i = i + 1
     }
     cur = elseIfLink(cur)
   }
-  acc
+  true
 }
 
-// The free-variable writes a nested call contributes. An intrinsic contributes none; an opaque
-// callee makes the answer opaque.
-function callFreeEffects(callIx: i32) {
+// Add the free-variable writes a nested call contributes. An intrinsic contributes none; an opaque
+// callee answers false.
+function callFreeEffects(acc: WeAcc, callIx: i32): boolean {
   const cn = P.nodes[callIx]
   if cn is Call {
     const d = callDeclFnIx(cn, callIx)
-    if d == -2 { return "" }
+    if d == -2 { return true }
     if d == -1 {
       const ts = callFnValueDecls(cn)
-      if ts.length == 0 { return "*" }
-      let acc = ""
+      if ts.length == 0 { return false }
       let i = 0
       while i < ts.length {
-        const sub = fnWriteFreePaths(ts[i])
-        if sub == "*" { return "*" }
-        acc = acc + sub
+        if !weAccOpen(acc, fnWriteFreePaths(ts[i])) { return false }
         i = i + 1
       }
-      return acc
+      return true
     }
-    if d < 0 { return "*" }
-    return fnWriteFreePaths(d)
+    if d < 0 { return false }
+    return weAccOpen(acc, fnWriteFreePaths(d))
   }
-  ""
+  true
 }
 
-// The free-variable writes of every declaration an operator site may run.
-function opFreeEffects(ix: i32) {
+// Add the free-variable writes of every declaration an operator site may run; false when opaque.
+function opFreeEffects(acc: WeAcc, ix: i32): boolean {
   const ds = opSiteDecls(ix)
-  let acc = ""
   let i = 0
   while i < ds.length {
-    if ds[i] < 0 { return "*" }
-    const sub = fnWriteFreePaths(ds[i])
-    if sub == "*" { return "*" }
-    acc = acc + sub
+    if ds[i] < 0 { return false }
+    if !weAccOpen(acc, fnWriteFreePaths(ds[i])) { return false }
     i = i + 1
   }
-  acc
+  true
+}
+
+// Add `s` unless it is opaque; false then.
+function weAccOpen(acc: WeAcc, s: WeSet): boolean {
+  if s.opaque { return false }
+  weAccSet(acc, s)
+  true
 }
 
 // The writes a function may make to an object older than the call, by what they replace, not the
@@ -731,7 +711,7 @@ function fnWriteShapes(fnIx: i32): WeSet {
   const oi = weOpenIndex(key)
   if oi >= 0 {
     if oi < weLow { weLow = oi }
-    if weCycleAnswer() == "*" { return weOpaqueSet }
+    if weCycleOpaque() { return weOpaqueSet }
     return weEmptySet
   }
   const ps = weProvSlot[key] ?? -1
@@ -881,9 +861,7 @@ function weScanShapes(
   if weProbeHit { return false }
   const n = P.nodes[ix]
   if n is BinExpr {
-    if n.binOp == "=" {
-      weAccPiece(acc, weTargetShape(n.binLeft, fresh, bound))
-    }
+    if n.binOp == "=" { weAccPart(acc, weTargetShape(n.binLeft, fresh, bound)) }
   } else if n is Call {
     if !weCallShapes(acc, n, ix, fresh, params, bound) { return false }
   }
@@ -916,7 +894,7 @@ export function weTargetShape(ix: i32, fresh: string[], bound: string[]) {
   const t = P.nodes[tix]
   if t is Member {
     if weIsFreshName(t.memObj, fresh) { return "" }
-    return "." + t.memProp + ","
+    return "." + t.memProp
   }
   weCellShape(tix, fresh, bound)
 }
@@ -926,11 +904,7 @@ function weCellShape(ix: i32, fresh: string[], bound: string[]) {
   const t = P.nodes[ix]
   if t is Index {
     if weIsFreshName(t.idxArr, fresh) { return "" }
-    return "["
-      + subscriptKeyTextOf(t.idxIndex)
-      + "]"
-      + weCellTag(t.idxArr)
-      + ","
+    return "[" + subscriptKeyTextOf(t.idxIndex) + "]" + weCellTag(t.idxArr)
   }
   weRebindShape(ix, bound)
 }
@@ -947,22 +921,22 @@ function weCellTag(ix: i32): string {
 }
 
 // The write shapes the call at `callIx` contributes at a narrowing's own call site, where a
-// function value from outside is opaque: `,`-terminated, or `"*"` opaque.
-export function callWriteShapes(cn: Call, callIx: i32): string {
+// function value from outside is opaque.
+export function callWriteShapes(cn: Call, callIx: i32): WeSet {
   const acc = weAccNew(false)
   if !weCallShapes(acc, cn, callIx, crNoNames, crNoNames, crNoNames) {
-    return "*"
+    return weOpaqueSet
   }
-  weAccText(acc)
+  weSetOf(acc)
 }
 
 // The write shapes a call of the declaration `declIx` handed the argument places `args` makes, at a
-// narrowing's own call site: `,`-terminated, or `"*"` opaque.
-export function declWriteShapes(declIx: i32, args: i32[]): string {
+// narrowing's own call site.
+export function declWriteShapes(declIx: i32, args: i32[]): WeSet {
   const sum = fnWriteShapes(declIx)
   const acc = weAccNew(false)
-  if !weSubstArgs(acc, sum, args, crNoNames, crNoNames) { return "*" }
-  weAccText(acc)
+  if !weSubstArgs(acc, sum, args, crNoNames, crNoNames) { return weOpaqueSet }
+  weSetOf(acc)
 }
 
 // Add the write shapes a call contributes: its declaration's with each `@i` replaced by what
@@ -981,7 +955,7 @@ function weCallShapes(
   if cf is Ident {
     const pj = strListIndexOf(params, cf.identName)
     if pj >= 0 {
-      weAccPiece(acc, "@" + i32ToStr(pj) + ",")
+      weAccParam(acc, pj)
       return true
     }
   }
@@ -992,7 +966,7 @@ function weCallShapes(
     if !weIsFreshName(cf.memObj, fresh) { own = builtinMethodShape(cn, cf) }
   }
   if d >= 0 {
-    weAccPiece(acc, own)
+    weAccPart(acc, own)
     return weDeclCallShapes(acc, d, callArgPlaces(cn, callIx), params, bound)
   }
   if d == -1 && cf is Ident {
@@ -1000,7 +974,7 @@ function weCallShapes(
     const ts = callFnValueDecls(cn)
     if ts.length > 0 {
       const args = callArgPlaces(cn, callIx)
-      weAccPiece(acc, own)
+      weAccPart(acc, own)
       let i = 0
       while i < ts.length {
         if !weDeclCallShapes(acc, ts[i], args, params, bound) { return false }
@@ -1019,7 +993,7 @@ function weCallShapes(
     // A local the summary cannot see through, named like no built-in.
     if strListHas(bound, cf.identName) { return false }
   }
-  weAccPiece(acc, own)
+  weAccPart(acc, own)
   if cf is Member {
     if !builtinMethodRunsArgs(cf.memProp) { return true }
   } else if cf is Ident {
@@ -1042,16 +1016,13 @@ function weDeclCallShapes(
   bound: string[],
 ): boolean {
   // A call back into a summary still being computed (a recursive edge) cannot say which slot
-  // it calls, so every function value it hands on is charged, and a `*` in any of it is opaque.
+  // it calls, so every function value it hands on is charged.
   if weIsOpen(i32ToStr(d) + "#shape") {
     const sum = fnWriteShapes(d)
-    const starBefore = acc.star
-    acc.star = false
     if !sum.opaque { weAccSet(acc, sum) }
+    // Walked even under an opaque summary, for the untyped reads it counts.
     const ok = weCycleArgShapes(acc, d, args, params, bound)
-    if sum.opaque || !ok || acc.star { return false }
-    acc.star = starBefore
-    return true
+    return ok && !sum.opaque
   }
   weSubstArgs(acc, fnWriteShapes(d), args, params, bound)
 }
@@ -1071,10 +1042,9 @@ function weSubstArgs(
     return true
   }
   for id in sum.parts {
-    const w = wePartText[id]
-    if w[0] == '@' {
-      const j = weDigits(w.slice(1, w.length))
-      if j < 0 || j >= args.length { return false }
+    const j = wePartParam[id]
+    if j >= 0 {
+      if j >= args.length { return false }
       if !weArgShapes(acc, args[j], params, bound) { return false }
     } else {
       weAccId(acc, id)
@@ -1127,7 +1097,7 @@ function weArgShapes(
     if crTyIsScalar(at) { return true }
     const pj = strListIndexOf(params, an.identName)
     if pj >= 0 {
-      weAccPiece(acc, "@" + i32ToStr(pj) + ",")
+      weAccParam(acc, pj)
       return true
     }
     const d = lookupFnDeclNode(an.identName)
@@ -1154,7 +1124,7 @@ function builtinMethodShape(cn: Call, cf: Member): string {
   const rt = nodeTyOf(cf.memObj)
   if p == "push" {
     if rt >= 0 && !builtinMethodOn(rt, p) { return "" }
-    return "+[]" + weCellTag(cf.memObj) + ","
+    return "+[]" + weCellTag(cf.memObj)
   }
   if builtinMethodEffect(p) != BME_CELLS { return "" }
   if rt >= 0 && !builtinMethodOn(rt, p) { return "" }
@@ -1167,7 +1137,7 @@ function builtinMethodShape(cn: Call, cf: Member): string {
   if p == "delete" && cn.callArgs.length == 1 {
     lit = subscriptKeyTextOf(cn.callArgs[0])
   }
-  pre + "[" + lit + "]" + weCellTag(cf.memObj) + ","
+  pre + "[" + lit + "]" + weCellTag(cf.memObj)
 }
 
 // The root name of a place key (`"o.a.v"` → `"o"`, `"xs[0].v"` → `"xs"`). Both separators, because
@@ -1250,7 +1220,7 @@ export function weReset() {
   weShapeSums = Map()
   wePartIx = Map()
   wePartText = []
-  wePartFlags = []
+  wePartParam = []
   weUnresSums = Map()
   weUnresWit = Map()
   weUnresWitMax = -1
