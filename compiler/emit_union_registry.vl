@@ -38,7 +38,7 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
-import { narrowVariantFor } from "./emit_narrow_slots"
+import { narrowSlotOf, narrowVariantFor } from "./emit_narrow_slots"
 import {
   declTyIxOfName,
   msAtomIdOf,
@@ -61,7 +61,6 @@ import {
 import {
   msGen,
   msRowChain,
-  msSetByText,
   msSetGen,
   msSetNext,
   msSetRow,
@@ -70,6 +69,7 @@ import {
   msSetWords,
   narrowSets,
   narrowTys,
+  narrowVariants,
   uVariants,
   unKey,
   unMemAtomIds,
@@ -294,10 +294,21 @@ export function msSetOfUnion(name: string): i32 {
 }
 
 // Resolves `name` to its member-set spelling (an alias name to its declared set, else itself)
-// and appends its atoms to `out`: a bound row's recorded members, else the `msMemberAtomsOf`
-// memo, else the spelling split; a declared type name is its own one atom. Returns the
-// member-set spelling.
+// and appends its atoms to `out`: a bound row's recorded members, else the spelling split; a
+// declared type name is its own one atom. Returns the member-set spelling.
 export function unionArmsOf(name: string, out: string[]) {
+  unionArmsOfSet(name, -1, out)
+}
+
+// `unionArmsOf` for a caller holding the arena type `ty` of `name`, or -1: the row keyed by
+// `ty` answers before the spelling is split.
+export function unionArmsOfTy(name: string, ty: i32, out: string[]) {
+  unionArmsOfSet(name, msSetOfTy(ty), out)
+}
+
+// `unionArmsOf` for a caller holding the member set `s` that `name` renders, or -1: the set's
+// members answer before the spelling is split.
+export function unionArmsOfSet(name: string, s: i32, out: string[]) {
   let nm = unionMemberSetOf(name)
   if nm == "" { nm = name }
   const u = unMemRowOfName(name)
@@ -309,7 +320,7 @@ export function unionArmsOf(name: string, out: string[]) {
     out.push(nm)
     return nm
   }
-  if !msMemberAtomsOf(nm, out) { unionSetAtomsOf(nm, out) }
+  if !msMemberAtomsOfSet(s, out) { unionSetAtomsOf(nm, out) }
   nm
 }
 
@@ -1096,9 +1107,6 @@ function msSetIntern(u: i32, mask: i32[]): i32 {
   msSetNext.push(msRowChain[u])
   msSetText.push(txt)
   msRowChain[u] = id
-  if txt != "" {
-    if (msSetByText[txt] ?? -1) < 0 { msSetByText[txt] = id }
-  }
   id
 }
 
@@ -1134,42 +1142,15 @@ export function msSetOfNameTy(name: string, ty: i32): i32 {
   -1
 }
 
-// The set id for a member-set string — the bridge for a consumer still holding text. A set
-// the pool already rendered answers from the text index; otherwise the row carrying the
-// string's union key hands over its members; a miss is not banked, since a row can be minted
-// after it (D5119). -1 = uncovered; an alias name (`N`) stays a one-atom set.
-export function msSetOfText(set: string): i32 {
-  if set == "" { return -1 }
-  const hit = msSetByText[set] ?? -1
-  if hit >= 0 {
-    if msSetGen[hit] == msGen.at { return hit }
-  }
-  const u = unRowOfSetText(set)
-  if u >= 0 {
-    const id = msSetOfRow(u)
-    if id >= 0 { return id }
-  }
-  -1
-}
-
 // The rendered member set of `s` (see `msRenderSet`).
 export function msTextOf(s: i32): string {
   if s < 0 || s >= msSetText.length { return "" }
   msSetText[s]
 }
 
-// Appends the set's member spellings to `out`, in the row's recorded (box-tag ABI) order,
-// without re-splitting anything: the recorded member column is what `splitUnionAtoms` would
-// rebuild, since `msSetOfText` only hands back a set matching the row's own recorded string.
-// False = uncovered, `out` untouched, and the caller splits as before.
-export function msMemberAtomsOf(set: string, out: string[]): boolean {
-  msMemberAtomsOfSet(msSetOfText(set), out)
-}
-
-// `msMemberAtomsOf` for a caller that already holds the set id — the whole point of banking
-// one: `msSetOfText` is a text→set resolution (a map probe, else a key render and a key
-// lookup); a consumer that already has its set from the narrowing table or an
-// earlier resolution has no reason to render it and look it up again.
+// Appends set `s`'s member spellings to `out`, in the row's recorded (box-tag ABI) order,
+// without splitting anything. False = uncovered (`s` is -1 or names no covered row), `out`
+// untouched, and the caller splits the spelling instead.
 export function msMemberAtomsOfSet(s: i32, out: string[]): boolean {
   if s < 0 { return false }
   if s >= msSetRow.length { return false }
@@ -1439,9 +1420,11 @@ export function printNarrowKey(exprIx: i32): string {
 export function printNarrowLiveAtoms(exprIx: i32, live: string[]) {
   const key = printNarrowKey(exprIx)
   if key == "" { return 0 }
-  const nv = narrowVariantFor(key)
+  const slot = narrowSlotOf(key)
+  if slot < 0 { return 0 }
+  const nv = narrowVariants[slot]
   if nv == "" || unionMemberCountOfName(nv) < 2 { return 0 }
-  unionArmsOf(nv, live)
+  unionArmsOfSet(nv, narrowSets[slot], live)
   0
 }
 
