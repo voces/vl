@@ -212,6 +212,8 @@ export const TAG = "t"
 export let flag = false
 export let mode = "a"
 export let count = 0
+export let dbl = (x) => x + x
+function take(w: { x: i64, y: i64 }): void { print(w.x) }
 `;
 
 const MID = `import { area, Shape } from "./lib"
@@ -273,10 +275,27 @@ const CASES: Case[] = [
     to: "print(4)",
   },
   {
+    // Main's diagnostics point into main and spell no number, so they hold wherever lib moves.
     name: "body edit that shifts the lines below it",
-    want: "any",
+    want: "serve",
     from: "  return n * 2\n",
     to: "  const k = 2\n  return n * k\n",
+  },
+  {
+    // A served diagnostic that spells a number may be citing a line, so a moved token declines.
+    name: "line-shifting edit under a diagnostic that spells a number",
+    want: "decline",
+    why: "span",
+    from: "  return n * 2\n",
+    to: "  const k = 2\n  return n * k\n",
+    uses: "const huge: i32 = 3000000000000\n",
+  },
+  {
+    name: "same-length edit under a diagnostic that spells a number",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses: "const huge: i32 = 3000000000000\n",
   },
   {
     name: "signature edit",
@@ -326,10 +345,45 @@ const CASES: Case[] = [
   {
     name: "imported binding edit",
     want: "decline",
-    why: "demand",
+    why: "interface",
     from: "x: 1, y: 2",
     to: "x: 5, y: 2",
     uses: `import { pt } from "./lib"\nprint(pt.x)\n`,
+  },
+  {
+    // An inferred binding is served while its checked type keeps its hash.
+    name: "inferred record binding main reads, lib body edit",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses: `import { pt } from "./lib"\nconst px: i32 = pt.x\nprint(px)\n`,
+  },
+  {
+    name: "a lib body starts adopting an inferred binding main reads",
+    want: "decline",
+    why: "interface",
+    from: "clear(): void { print(0) }",
+    to: "clear(): void { take(pt) }",
+    uses: `import { pt } from "./lib"\nconst px: i32 = pt.x\nprint(px)\n`,
+  },
+  {
+    // The bank holds the type main's delivery adopted; lib checked alone does not adopt it.
+    name: "main adopts an inferred binding, lib body edit",
+    want: "decline",
+    why: "interface",
+    from: "n * 2",
+    to: "n * 3",
+    uses:
+      `import { pt } from "./lib"\nfunction wide(w: { x: i64, y: i64 }): i64 { return w.x }\nprint(wide(pt))\n`,
+  },
+  {
+    // A call of a function-valued binding checks its body at the caller's arguments.
+    name: "function-valued binding main calls, lib body edit",
+    want: "decline",
+    why: "demand",
+    from: "n * 2",
+    to: "n * 3",
+    uses: `import { dbl } from "./lib"\nprint(dbl(2))\n`,
   },
   {
     name: "annotated binding main writes, lib body edit",
@@ -419,12 +473,20 @@ const CASES: Case[] = [
     uses: `import { box, grow } from "./lib"\nconst bw = box.w\ngrow()\nprint(bw + box.w)\n`,
   },
   {
+    // A check reads no export surface, so an entry's re-export is an import like any other.
     name: "re-export of an edited function",
-    want: "decline",
-    why: "re-export",
+    want: "serve",
     from: "n * 2",
     to: "n * 3",
-    uses: `export { area } from "./lib"\n`,
+    uses: `export { area, Shape as Sh } from "./lib"\nexport { size as sz } from "./lib"\n`,
+  },
+  {
+    name: "re-export of a function whose signature changes",
+    want: "decline",
+    why: "interface",
+    from: "area(n: i32)",
+    to: "area(n: string)",
+    uses: `export { area as ar } from "./lib"\n`,
   },
   {
     name: "added export",
@@ -558,6 +620,8 @@ Deno.test({
       // `IH_NO_TYPES | IH_NO_MENTIONS` hides both the widened type of a number binding and the
       // body store that widened it; dropping the type alone still declines.
       ["a lib body starts widening a number binding main reads", 8 | 16],
+      // The same two hide a record binding's adopted type and the body delivery that adopted it.
+      ["a lib body starts adopting an inferred binding main reads", 8 | 16],
     ];
     for (const [name, mask] of witness) {
       const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, mask);

@@ -153,7 +153,7 @@ import {
 } from "./emit_state"
 
 import { extCollect } from "./extents"
-import { nodePos, tokEndCol, tokEndLine } from "./fmt_util"
+import { nodePos, nodeStartTok, tokEndCol, tokEndLine } from "./fmt_util"
 import {
   docCmtLine,
   docCmtMod,
@@ -269,6 +269,8 @@ import {
   ihFinish,
   ihMask,
   ihModule,
+  ihPlainBinding,
+  ihPosHash,
 } from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
 // driver owns two obligations: the per-compile reset (the carrier is keyed by arena
@@ -5051,7 +5053,7 @@ function modCompile(emit: i32): i32 {
   if ifaceHashArmed() { ihFinish() }
   checkMemSharedOrigin()
   plusLinksBank()
-  if keep.length > 0 && !skSettle(keep, roots) { return SK_RERUN }
+  if keep.length > 0 && !skSettle(keep, roots, parsedToks) { return SK_RERUN }
   if banking {
     if keep.length == 0 { skGroup() }
     skBankNow(parsedToks)
@@ -5087,7 +5089,6 @@ const SK_NO_BANK = 1
 const SK_GRAPH = 2
 const SK_ALL = 3
 const SK_DEMAND = 4
-const SK_REEXPORT = 5
 const SK_IFACE = 6
 const SK_SPAN = 7
 const SK_STRAY = 8
@@ -5107,10 +5108,18 @@ let skMask = 0
 let skPlus: {[i32]: i32}[] = []
 let skStrIdx: {[i32]: i32}[] = []
 let skScalar: {[i32]: i32}[] = []
-// One row per banked diagnostic: its module, and its end token relative to the module's first.
+// One row per banked diagnostic: its module, its end token relative to the module's first, and
+// whether it reads the same wherever another module's tokens move (`skRelocatable`).
 let skDgMod: i32[] = []
 let skDgEnd: i32[] = []
+let skDgReloc: boolean[] = []
 let skDg: TDiag[] = []
+// Each module's token positions (`ihPosHash`), banked only when some diagnostic is not
+// relocatable.
+let skPosH: i32[] = []
+// The inferred bindings of S a served module imports, which the plan admits only on a plain
+// checked type (`ihPlainBinding`), read once the check has run.
+let skInferred: string[] = []
 // The entry key the loaded bank belongs to, and the banks of other entries, newest last, so a
 // host checking several entries in turn keeps each one's bank.
 let skEntry = ""
@@ -5126,7 +5135,9 @@ type SkBank = {
   bScalar: {[i32]: i32}[],
   bDgMod: i32[],
   bDgEnd: i32[],
+  bDgReloc: boolean[],
   bDg: TDiag[],
+  bPosH: i32[],
 }
 let skParked: SkBank[] = []
 const SK_PARK_MAX = 4
@@ -5164,7 +5175,9 @@ function skSelect(): i32 {
         bScalar: skScalar,
         bDgMod: skDgMod,
         bDgEnd: skDgEnd,
+        bDgReloc: skDgReloc,
         bDg: skDg,
+        bPosH: skPosH,
       },
     )
   } else {
@@ -5187,7 +5200,9 @@ function skSelect(): i32 {
       skScalar = b.bScalar
       skDgMod = b.bDgMod
       skDgEnd = b.bDgEnd
+      skDgReloc = b.bDgReloc
       skDg = b.bDg
+      skPosH = b.bPosH
       skEntry = entry
       skValid = true
     } else {
@@ -5261,11 +5276,11 @@ function skScalarLit(e: i32): boolean {
   n is NumLit || n is StrLit || n is CharLit || n is BoolLit
 }
 
-// Whether the top-level declaration `merged` of the module rooted at `root` checks the same
-// whatever imports it, given its checked type kept its hash (a retyped number binding does
-// not): a type, an extern, an annotated or scalar-literal binding, or one non-generic function
-// with every parameter annotated. Any other binding, an overload or a generic answers no.
-function skClosed(root: i32, merged: string): boolean {
+// Whether the declaration `merged` of the module rooted at `root` checks the same whatever
+// imports it, given its hash kept: SK_SHUT for a type, an extern, an annotated or scalar-literal
+// binding, or one fully annotated non-generic function; SK_IF_PLAIN for any other binding;
+// SK_OPEN for an overload, a generic, or an unannotated or defaulted parameter.
+function skClosed(root: i32, merged: string): i32 {
   let fns = 0
   let typed = false
   const r = P.nodes[root]
@@ -5273,11 +5288,12 @@ function skClosed(root: i32, merged: string): boolean {
     for st in r.progStmts {
       const n = P.nodes[st]
       if n is LetDecl && n.letName == merged {
-        return n.letType >= 0 || skScalarLit(n.letInit)
+        if n.letType >= 0 || skScalarLit(n.letInit) { return SK_SHUT }
+        return SK_IF_PLAIN
       }
       if n is FuncDecl && n.fnName == merged {
         if n.fnTyParams.length > 0 || !skParamsClosed(n.fnParams) {
-          return false
+          return SK_OPEN
         }
         fns = fns + 1
       }
@@ -5285,19 +5301,14 @@ function skClosed(root: i32, merged: string): boolean {
       if n is UnionDecl && n.udName == merged { typed = true }
     }
   }
-  if fns > 1 { return false }
-  fns == 1 || typed || externLinkOf(merged) >= 0
+  if fns > 1 { return SK_OPEN }
+  if fns == 1 || typed || externLinkOf(merged) >= 0 { SK_SHUT } else { SK_OPEN }
 }
 
-// Whether the entry's import row `k` is one of its re-exports, which the wasm export surface reads.
-function skReExported(k: i32): boolean {
-  let r = 0
-  while r < reExpMod.length {
-    if reExpMod[r] == 0 && reExpLocal[r] == impLocal[k] { return true }
-    r = r + 1
-  }
-  false
-}
+// What `skClosed` answers: the import is open, closed, or closed once its checked type is plain.
+const SK_OPEN = 0
+const SK_SHUT = 1
+const SK_IF_PLAIN = 2
 
 // The modules this check must merge, by module index, or none for a whole check: S is every
 // module whose source the bank does not hold, closed over its imports. `skReason` says why.
@@ -5312,6 +5323,7 @@ function skPlan(roots: i32[]): boolean[] {
   }
   const inS: boolean[] = []
   const work: i32[] = []
+  skInferred = []
   let m = 0
   while m < modKeys.length {
     const b = skKeyIx[modKeys[m]] ?? -1
@@ -5354,14 +5366,12 @@ function skPlan(roots: i32[]): boolean[] {
         const o = modExportOrigin(d, impName[k])
         if inS[o.oMod] {
           const merged = o.oName + modSuffixOf(o.oMod)
-          if !skClosed(roots[pos[o.oMod]], merged) {
+          const shut = skClosed(roots[pos[o.oMod]], merged)
+          if shut == SK_OPEN {
             skReason = SK_DEMAND
             return whole
           }
-          if impMod[k] == 0 && skReExported(k) {
-            skReason = SK_REEXPORT
-            return whole
-          }
+          if shut == SK_IF_PLAIN { skInferred.push(merged) }
         }
       }
     }
@@ -5371,9 +5381,9 @@ function skPlan(roots: i32[]): boolean[] {
 }
 
 // After a check of S alone: keep it only when every import a served module makes into S kept
-// its deep hash, every fresh diagnostic lies in S, and a served diagnostic's S positions held.
+// its deep hash, every fresh diagnostic lies in S, and no served diagnostic cites a moved token.
 // Then `T.diags` becomes the module-ordered merge of the fresh and the banked diagnostics.
-function skSettle(inS: boolean[], roots: i32[]): boolean {
+function skSettle(inS: boolean[], roots: i32[], tokEnd: i32): boolean {
   if jwSiteNode.length > 0 {
     skReason = SK_PASS
     return false
@@ -5390,6 +5400,14 @@ function skSettle(inS: boolean[], roots: i32[]): boolean {
     }
     k = k + 1
   }
+  // An inferred binding's type joins its uses in every module; with the hash kept, the served
+  // modules' uses fit it again, unless the type spells a function or elides part of itself.
+  for name in skInferred {
+    if !ihPlainBinding(name) {
+      skReason = SK_DEMAND
+      return false
+    }
+  }
   const freshMod: i32[] = []
   let j = 0
   while j < T.diags.length {
@@ -5401,23 +5419,30 @@ function skSettle(inS: boolean[], roots: i32[]): boolean {
     freshMod.push(m)
     j = j + 1
   }
-  let served = false
-  for bm in skDgMod {
-    const m = modIndexOfKey(skKeys[bm])
-    if m >= 0 && !inS[m] { served = true }
+  // A served diagnostic that may cite another module's position holds only while every
+  // token of S kept its line and column.
+  const pos = skPosOf()
+  let cites = false
+  let q = 0
+  while q < skDgMod.length {
+    const m = modIndexOfKey(skKeys[skDgMod[q]])
+    if m >= 0 && !inS[m] && !skDgReloc[q] { cites = true }
+    q = q + 1
   }
-  if served {
+  if cites {
     let d = 0
     while d < modKeys.length {
       const b = skKeyIx[modKeys[d]] ?? -1
-      if inS[d] && (b < 0 || ifaceHashOf(d, 2) != skHash[b * SK_READINGS + 2]) {
+      if (
+        inS[d]
+        && (b < 0 || b >= skPosH.length || skPosHashOf(pos[d], tokEnd) != skPosH[b])
+      ) {
         skReason = SK_SPAN
         return false
       }
       d = d + 1
     }
   }
-  const pos = skPosOf()
   const fresh = T.diags
   const out: TDiag[] = []
   for m in modOrder {
@@ -5506,6 +5531,79 @@ function skGroup(): i32 {
   0
 }
 
+// The end of the token range of the module at `modOrder` position `o`.
+function skTokHi(o: i32, tokEnd: i32): i32 {
+  if o + 1 < modLoadStart.length { return modLoadStart[o + 1] }
+  tokEnd
+}
+
+// The token positions of the module at `modOrder` position `o`.
+function skPosHashOf(o: i32, tokEnd: i32): i32 {
+  if o < 0 || o >= modLoadStart.length { return 0 }
+  ihPosHash(modLoadStart[o], skTokHi(o, tokEnd))
+}
+
+// Whether diagnostic `g`, rendered `msg`, reads the same wherever another module's tokens
+// move: its span starts in its own module's tokens `[lo, hi)`, and neither its message nor its
+// data spells a number, as a cited line or column would.
+function skRelocatable(g: TDiag, msg: string, lo: i32, hi: i32): boolean {
+  const first = nodeStartTok(g.tat)
+  if first >= 0 && (first < lo || first >= hi) { return false }
+  !skSpellsNumber(msg) && !skDataSpellsNumber(g.tdata)
+}
+
+// Whether `s` holds a digit outside a primitive width name such as `i32` or `f64`.
+function skSpellsNumber(s: string): boolean {
+  let i = 0
+  while i < s.length {
+    if isDigitCode(s[i]) {
+      let e = i
+      while e < s.length && isDigitCode(s[e]) { e = e + 1 }
+      if !skWidthName(s, i, e) { return true }
+      i = e
+    } else {
+      i = i + 1
+    }
+  }
+  false
+}
+
+// Whether the digits `s[i, e)` end a width name: `i`, `u` or `f` alone before them.
+function skWidthName(s: string, i: i32, e: i32): boolean {
+  if i < 1 || (e < s.length && isWordCode(s[e])) { return false }
+  const p = s[i - 1]
+  if p != 'i' && p != 'u' && p != 'f' { return false }
+  if i >= 2 && isWordCode(s[i - 2]) { return false }
+  const w = s.slice(i, e)
+  w == "8" || w == "16" || w == "32" || w == "64"
+}
+
+// Whether diagnostic data `d`, a run of `len:text,` fields, spells a number in a field, or
+// is not such a run.
+function skDataSpellsNumber(d: string): boolean {
+  let i = 0
+  while i < d.length {
+    let n = 0
+    let j = i
+    while j < d.length && j - i < 7 && isDigitCode(d[j]) {
+      n = n * 10 + (d[j] - '0')
+      j = j + 1
+    }
+    if j == i || j >= d.length || d[j] != ':' { return true }
+    const a = j + 1
+    if a + n >= d.length || d[a + n] != ',' { return true }
+    if skSpellsNumber(d.slice(a, a + n)) { return true }
+    i = a + n + 1
+  }
+  false
+}
+
+function isDigitCode(c: i32): boolean { c >= '0' && c <= '9' }
+
+function isWordCode(c: i32): boolean {
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isDigitCode(c) || c == '_'
+}
+
 // Bank this check for the next one, or leave nothing banked when a diagnostic has no module,
 // or ends outside it, or the check had a pass the bank cannot replay.
 function skBankNow(tokEnd: i32): i32 {
@@ -5514,14 +5612,15 @@ function skBankNow(tokEnd: i32): i32 {
   const pos = skPosOf()
   const dgMod: i32[] = []
   const dgEnd: i32[] = []
+  const dgReloc: boolean[] = []
   const dg: TDiag[] = []
+  let cites = false
   let j = 0
   while j < T.diags.length {
     const m = skDiagMod(j)
     if m < 0 { return 0 }
     const o = pos[m]
-    let hi = tokEnd
-    if o + 1 < modLoadStart.length { hi = modLoadStart[o + 1] }
+    const hi = skTokHi(o, tokEnd)
     const e = T.diags[j].tendTok
     let rel = -1
     if e >= 0 {
@@ -5533,8 +5632,11 @@ function skBankNow(tokEnd: i32): i32 {
     const g = T.diags[j]
     const msg = demangleMsg(g.tmsg)
     if strContains(msg, "#") || strContains(msg, "$") { return 0 }
+    const reloc = skRelocatable(g, msg, modLoadStart[o], hi)
+    if !reloc { cites = true }
     dgMod.push(m)
     dgEnd.push(rel)
+    dgReloc.push(reloc)
     dg.push(
       {
         tmsg: msg,
@@ -5551,6 +5653,7 @@ function skBankNow(tokEnd: i32): i32 {
   skKeys = []
   skSrcs = []
   skHash = []
+  skPosH = []
   skPlus = []
   skStrIdx = []
   skScalar = []
@@ -5565,6 +5668,7 @@ function skBankNow(tokEnd: i32): i32 {
       skHash.push(ifaceHashOf(m, w))
       w = w + 1
     }
+    if cites { skPosH.push(skPosHashOf(pos[m], tokEnd)) }
     if m < plLinks.length {
       skPlus.push(plLinks[m])
       skStrIdx.push(plStrIdx[m])
@@ -5577,6 +5681,7 @@ function skBankNow(tokEnd: i32): i32 {
   skMask = ihMask()
   skDgMod = dgMod
   skDgEnd = dgEnd
+  skDgReloc = dgReloc
   skDg = dg
   skValid = true
   0
