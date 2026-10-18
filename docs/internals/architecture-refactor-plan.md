@@ -23,7 +23,7 @@ restate measurements; follow the links.
 
 | item | state | where |
 | --- | --- | --- |
-| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: a hole instance's binary operator and deferred join read at its bindings, a module-scope argument reads its call's instance, and the oracle asks no type an instance cannot bind, so `/open` falls from 243 notes to 0. Next: the like-for-like `listRep` and `/scope` notes (133), and the syntactic rungs they still need. The value-union elements stay with L6 (29). | [L2 log](#l2-log) |
+| L2 rep from type | stage 1 **done**; stage 2 **partial**; stage 3 **in progress**. Last: an `is K[]`-narrowed read takes its receiver's storage (`listNarrowRecvTyOf`), so `listRep` falls from 133 notes to 29, and `exprListRepOf` reads a covered column first, which deletes the map-read, `.values()`, intrinsic, closure-array-call, `.keys()`, index, operator and eight identifier rungs. Next: the 29 `reflist -> unc` notes are L6's value-union elements. The If, identifier, member, map-filter and callee rungs still answer where the oracle declines, and go when the column covers those nodes. | [L2 log](#l2-log) |
 | L1 per-call binding, banked once | **in progress as lane SC**. Last: D6205 and D6206 closed by a copy of the generic body per call type, each copy reading its own copy of the maker or binding; D6320, D6321 and D6322 filed open. Next: D6200 (F split per position); D6320 (`const q = id`, no refusal asks a split); D6321 (a module read beside the body); D6322 (a block-local maker); `tyVarOwner` and `fnDeclIx` key a generic by function name, so two nested `inner` generics share an owner (D3927); the (c) literal; D4578 and D4579 wait on the interner. | [L1 log](#l1-log) |
 | L3 legality in the checker | families (a)–(c) **done**. (d) waits on SC. Last: an operator ill-typed at one of a hole's instances is a check reject, and the unread-hole default reaches `i32[]` and `string` (D6300, D6301). Next: D6330 (D6300 through a `const` lambda callee), D6331 (a lambda literal at a hole called at two types), D6332 (a string to a pushed parameter passes check). | [L3 log](#l3-log) |
 | L4 one rollback for the quiet probes | A1 and A2 **done**. Last: the follow-up (#3609) widened each leaking site's set; the census leaves only `cstrProbeBefore`'s constraint rows (D3062). | [L4 log](#l4-log) |
@@ -338,6 +338,27 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - `hc` in `hole-pin-element-capture-literal.vl` (`list` 46). Its hole instance binds the hole to a record over itself.
 
   No syntactic rung becomes removable, because the 133 notes left still take them. difftree `--identity` against #4064's seed: the fixpoint identity holds, and of 15,716 files (10,685 built) 4 differ. Those 4 are the `d3125_hole_{J1,K12}_H_P6_{0,4}` cells, whose `loud emit reject` moves from `bare null needs a struct-typed context` to `ref valtype with no interned shape`. The re-folded `e | null` callback join is the cause, and the baseline rows are updated. Guest fuel, master's seed then this head's: main 9,192,669,487 then 9,192,669,640; tail 6,740,459,301 then 6,740,459,454. None filed.
+
+- **2026-10-18, the `listRep` notes, then the rungs the column now answers.** Of the 133 notes left, 104 were `strlist -> list`, all in `unions/inferred-string-list-is-atom-list.vl` (D4916). An `is K[]`-narrowed read now takes its receiver's storage (`listNarrowRecvTyOf`, `emit_classify.vl`), which answers all 104. The other 29 are `reflist -> unc`: value-union elements with no registry row (`allocating-literal-chunked-in-body` 23, `union-element-array-litunion` 4, `closure-value-refarm-value-union-elem-list-result` 2). The descriptor does not cover them, so they stay with L6. Notes: 133 → 29.
+
+  `exprListRepOf` now reads a covered column first, wherever the oracle has a family. Rungs deleted:
+  - the map-read rung and `mapReadListKind`;
+  - `mapValuesResultKind`;
+  - in `callListRep`: the `arrNew` intrinsic, the closure-array call, the `ref` member, `.keys()`, `.values()` and the closure signature key;
+  - `indexListRep` and `binListRep`;
+  - the eight identifier rungs (`uk` 7/8/9/12/17/18, the narrowed ref array, the nullable-view kind, the `snPin` pin) and the capture-ref rung;
+  - the `OptMember` branch;
+  - the gates `map-read`, `closure-array-call` and `coalesce`.
+
+  Kept: the If, identifier, member, map-filter and callee rungs. They answer where the oracle declines. Pointing them at the column moves 48 cells: the alias-shadowing clones, the `z$1` stub, `hc`, the value-union elements and the `d3125` pins. One of the 48, `allocating-literal-chunked-in-body.vl`, stops building. The map-filter rung alone moves 32 `d3125_gen` cells.
+
+  difftree `--identity` against master `2afc964f6`: the fixpoint identity holds, 0 runs → not-runs, and of 15,738 files (10,705 built) 5 differ. Every one is a `loud emit reject` before and after:
+  - `d2915_list_5_idret_bound` moves from `narrowed union atom has no value box` to `monomorphize: unsupported argument type`. The column reads `v1` as `i32` in its else arm.
+  - `d3125_gen_{J1,K12}_H_P6_{0,4}` move from `bare null needs a struct-typed context` to `ref valtype with no interned shape`. The column reads the `(i32|null)[]` iterable as a ref list.
+
+  The baseline rows are updated. D3154's witness moves from check-clean invalid wasm to a loud emit reject (`` `.length` receiver's ref-list element does not resolve ``), and the row is re-filed as clause 2.
+
+  Guest fuel at `368e229bd`, master's seed then this head's: plumb main 9,194,291,809 then 9,212,507,967 (+0.20%), tail 6,741,610,294 then 6,755,076,737 (+0.20%). Self-compile of master's source: 101,838,560,639 then 101,721,626,722. Each compiler on its own source: 101,838,560,639 then 102,037,385,375 (+0.20%). Seed at `2afc964f6`: 6,411,861 → 6,410,455 bytes.
 
 ### L3 log
 
