@@ -1146,6 +1146,141 @@ function checkParams(fnIx: i32) {
 // per local — one run per declared local and per scratch slot — so the run total equals the
 // local count. The run helpers stream straight to `curBuf` (bind it with `wTarget` first); each emits the `1` count then a valtype.
 
+// Clears the per-function scratch flags and slot lists `emitFuncCode` sets before laying out a
+// body; the module-wide ones (`moduleHasUnionAs` and its kin) are recomputed here.
+function resetFnScratchFlags() {
+  fnUsesPush = false
+  fnUsesRefPush = false
+  fnUsesStrPush = false
+  fnUsesNulStrPush = false
+  fnUsesF64Push = false
+  fnUsesI64Push = false
+  fnUsesF32Push = false
+  fnUsesU8Push = false
+  fnUsesU8Push = false
+  fnUsesAtomStage = false
+  fnUsesStrOp = false
+  fnUsesArrNew = false
+  fnUsesCoalesceCall = false
+  fnUsesMap = false
+  // A function-value call (`call_ref`) anywhere in the body reserves the closure
+  // scratch slot. Only detected when a function value exists module-wide (lambdas).
+  fnUsesCallRef = false
+  fnUsesUnionAs = moduleHasUnionAs()
+  // The numeric exact-or-fail staging slots, module-wide for `moduleHasUnionAs`'s reason.
+  fnUsesNumCast = moduleHasNumCast()
+  // The `fromCodePoints` argument spill, module-wide for the same reason.
+  fnUsesFcpSpill = moduleHasFcpSpill()
+  fnUsesIntMinMax = moduleHasIntMinMax()
+  fnUsesVariantRebox = false
+  fnUsesOptRecv = false
+  fnUsesListGet = false
+  // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
+  // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
+  fnRefPushSlots = []
+  refPushBaseBySlot = []
+  // Collect the `.map`/`.filter` HOF sites this body lowers (each reserves the
+  // shared 4-slot frame + one typed src/dst slot per distinct receiver/result type).
+  fnUsesMapFilter = false
+  fnUsesMapKeys = false
+  fnUsesMapVals = false
+  fnUsesMapVals = false
+  mfSrcKinds = []
+  mfSrcSlots = []
+  mfSrcBases = []
+  mfDstKinds = []
+  mfDstSlots = []
+  mfDstBases = []
+  // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
+  // `fnUsesStrOp` (a string-list compare rides the string-op frame), so its scan leads
+  // the sweep and the `fnHasStrOp` leg behind it is skipped once the flag is true.
+  fnUsesListEqI = false
+  fnUsesListEqS = false
+  fnListEqRSlots = []
+  fnListCatKinds = []
+  fnListCatSlots = []
+  fnListEqGKinds = []
+  fnListEqGSlots = []
+  fnUsesCloEq = false
+  // Recomputed unconditionally by `fnDetectScratch` below (never OR'd), so this reset is
+  // defensive rather than load-bearing.
+  fnMemAddrFoldCount = 0
+}
+
+// Resets the emit-time scope stack, the let-slot cursor and the loop control frames, so a
+// previous function's open frames never leak into the next body.
+function emitResetScopeFrames() {
+  // Reset the emit-time scope stack + slot cursor; `emitFuncBody` re-walks the body
+  // in collect's pre-order, so the n-th `LetDecl` it emits re-derives declared-local
+  // slot `n` and binds it for in-scope resolution.
+  scopeNames = []
+  scopeSlots = []
+  scopeFrames = []
+  emitLetCursor = 0
+  // Reset the loop control-frame tracking (`break`/`continue` branch-depth state)
+  // so a previous function's open frames never leak into this one.
+  ctrlDepth = 0
+  loopContDepth = []
+  loopBrkDepth = []
+  loopContLabel = []
+  loopBrkLabel = []
+  if lvFrameDepth.length > 0 { lvFrameDepth = [] }
+  if lvFrameName.length > 0 { lvFrameName = [] }
+}
+
+// Seeds `fbRetExtra` with the local of every capture a lifted function at `fnPos` assigns, so
+// each of its exits hands them back (D3664).
+function fbSeedRetExtra(fnPos: i32) {
+  fbRetExtra = []
+  let rxi = 0
+  while rxi < cloLiftWriteCount(fnPos) {
+    fbRetExtra.push(1 + cloLiftWriteCapAt(fnPos, rxi))
+    rxi = rxi + 1
+  }
+}
+
+// Pads a body that does not end in an explicit `return`/tail value, with the writer bound at
+// `body`: `null` for a nullable return (sunk when the return sink fired), `unreachable` for a
+// non-nullable one, nothing for a void function. Returns 0, or -1 when `emitNullForRet` refuses.
+function emitFallThroughPad(
+  body: u8[],
+  fnBody: i32,
+  fnIx: i32,
+  fnPos: i32,
+): i32 {
+  // If the body does not end in an explicit `return`/tail value, control falls through to the
+  // function `end` with an empty stack, and the validator requires the function's result type
+  // there. A nullable return is a live fall-through path (the checker permits it precisely
+  // because `null` is in the return type), so it emits `null`; a non-nullable return means the checker has proven the fall-through dead, so `unreachable` is sound padding, never run.
+  let isVoidFn = false
+  if fnPos >= 0 {
+    if fRetVoid[fnPos] == 1 { isVoidFn = true }
+  }
+  if !isVoidFn && !bodyEndsInReturn(fnBody, fnIx) {
+    if fnRetNullBearing(fnIx) {
+      if emitNullForRet(body, fnIx) < 0 { return -1 }
+      // Inside the sink's exit block this fall-through value cannot simply be left on
+      // the stack for the function `end` — the block is void. It terminates like any
+      // other exit: sunk when it built a box, a plain `return` otherwise.
+      if uSinkFired > 0 { emitUnionRetSink(fnIx) }
+    } else {
+      fbUnreachable() // 0x00 unreachable (dead padding for the result type)
+    }
+  }
+  0
+}
+
+// Moves the statement span rows banked from `base` on, which are relative to the body
+// expression, onto the code payload: `bodyInOut` past the size prefix, then `exprInBody` in.
+function rebaseStmtSpans(base: i32, bodyInOut: i32, exprInBody: i32) {
+  let ssp = base
+  while ssp < emitFnSpanStart.length {
+    emitFnSpanStart[ssp] = emitFnSpanStart[ssp] + bodyInOut + exprInBody
+    emitFnSpanEnd[ssp] = emitFnSpanEnd[ssp] + bodyInOut + exprInBody
+    ssp = ssp + 1
+  }
+}
+
 // Builds the size-prefixed code-section body for the `FuncDecl` at `fnIx`: the locals vector
 // (declared locals, all i32), the body's statement instructions, then `end`. Framed bytes are
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
@@ -1176,62 +1311,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // `pushScratchBase` is their first wasm index; the inline-push sequence reads
     // `pushScratchBase`+0/+1/+2. Set before `emitStmts` so a `.push` can resolve its scratch
     // slots. One body walk (`blockPushPopBits`) classifies every `.push`/Member-`.pop` receiver once and yields all six kind flags together.
-    fnUsesPush = false
-    fnUsesRefPush = false
-    fnUsesStrPush = false
-    fnUsesNulStrPush = false
-    fnUsesF64Push = false
-    fnUsesI64Push = false
-    fnUsesF32Push = false
-    fnUsesU8Push = false
-    fnUsesU8Push = false
-    fnUsesAtomStage = false
-    fnUsesStrOp = false
-    fnUsesArrNew = false
-    fnUsesCoalesceCall = false
-    fnUsesMap = false
-    // A function-value call (`call_ref`) anywhere in the body reserves the closure
-    // scratch slot. Only detected when a function value exists module-wide (lambdas).
-    fnUsesCallRef = false
-    fnUsesUnionAs = moduleHasUnionAs()
-    // The numeric exact-or-fail staging slots, module-wide for `moduleHasUnionAs`'s reason.
-    fnUsesNumCast = moduleHasNumCast()
-    // The `fromCodePoints` argument spill, module-wide for the same reason.
-    fnUsesFcpSpill = moduleHasFcpSpill()
-    fnUsesIntMinMax = moduleHasIntMinMax()
-    fnUsesVariantRebox = false
-    fnUsesOptRecv = false
-    fnUsesListGet = false
-    // Collect the DISTINCT ref-list element-type slots this function pushes onto (each
-    // gets its own typed 4-slot scratch frame). Empty unless `fnUsesRefPush`.
-    fnRefPushSlots = []
-    refPushBaseBySlot = []
-    // Collect the `.map`/`.filter` HOF sites this body lowers (each reserves the
-    // shared 4-slot frame + one typed src/dst slot per distinct receiver/result type).
-    fnUsesMapFilter = false
-    fnUsesMapKeys = false
-    fnUsesMapVals = false
-    fnUsesMapVals = false
-    mfSrcKinds = []
-    mfSrcSlots = []
-    mfSrcBases = []
-    mfDstKinds = []
-    mfDstSlots = []
-    mfDstBases = []
-    // List `==`/`!=`/`+` frames (collections-design §VL.4/§VL.6). May also flip
-    // `fnUsesStrOp` (a string-list compare rides the string-op frame), so its scan leads
-    // the sweep and the `fnHasStrOp` leg behind it is skipped once the flag is true.
-    fnUsesListEqI = false
-    fnUsesListEqS = false
-    fnListEqRSlots = []
-    fnListCatKinds = []
-    fnListCatSlots = []
-    fnListEqGKinds = []
-    fnListEqGSlots = []
-    fnUsesCloEq = false
-    // Recomputed unconditionally by `fnDetectScratch` below (never OR'd), so this reset is
-    // defensive rather than load-bearing.
-    fnMemAddrFoldCount = 0
+    resetFnScratchFlags()
     dupScanRun(fnIx)
     const nLocals = localNames.length
     // Union-box sink: reserve the shared tag/payload pair when this function's result is the box
@@ -1246,13 +1326,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     tailCallIdx = -1
     tailCallVoid = false
     liftWbEnd = -1
-    // Every exit of a lifted function that assigns captures hands them back (D3664).
-    fbRetExtra = []
-    let rxi = 0
-    while rxi < cloLiftWriteCount(fnPos) {
-      fbRetExtra.push(1 + cloLiftWriteCapAt(fnPos, rxi))
-      rxi = rxi + 1
-    }
+    fbSeedRetExtra(fnPos)
     // Lays out every scratch frame after the params + declared locals via the FuncBuilder cursor,
     // which sets `pushScratchBase`/`refPushScratchBase`/`refPushBaseBySlot`/`strPushScratchBase`/
     // `strScratchBase`/`mapScratchBase` from one running offset in frame order. Scratch frames
@@ -1265,22 +1339,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // `body` arg, so `curBuf == body` throughout and not-yet-converted raw `body.push(...)` sites
     // interleave identically. Restores the previous target afterwards.
     const exprPrev = wTarget(bodyExpr)
-    // Reset the emit-time scope stack + slot cursor; `emitFuncBody` re-walks the body
-    // in collect's pre-order, so the n-th `LetDecl` it emits re-derives declared-local
-    // slot `n` and binds it for in-scope resolution.
-    scopeNames = []
-    scopeSlots = []
-    scopeFrames = []
-    emitLetCursor = 0
-    // Reset the loop control-frame tracking (`break`/`continue` branch-depth state)
-    // so a previous function's open frames never leak into this one.
-    ctrlDepth = 0
-    loopContDepth = []
-    loopBrkDepth = []
-    loopContLabel = []
-    loopBrkLabel = []
-    if lvFrameDepth.length > 0 { lvFrameDepth = [] }
-    if lvFrameName.length > 0 { lvFrameName = [] }
+    emitResetScopeFrames()
     // `emitFuncBody` banks a row per STATEMENT, relative to `bodyExpr`; the rebase below
     // moves them onto the code payload with the rest of this entry (ROADMAP row 22).
     const stmtSpanBase = emitFnSpanStart.length
@@ -1314,25 +1373,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
     const endPrev = wTarget(body)
-    // If the body does not end in an explicit `return`/tail value, control falls through to the
-    // function `end` with an empty stack, and the validator requires the function's result type
-    // there. A nullable return is a live fall-through path (the checker permits it precisely
-    // because `null` is in the return type), so it emits `null`; a non-nullable return means the checker has proven the fall-through dead, so `unreachable` is sound padding, never run.
-    let isVoidFn = false
-    if fnPos >= 0 {
-      if fRetVoid[fnPos] == 1 { isVoidFn = true }
-    }
-    if !isVoidFn && !bodyEndsInReturn(fn.fnBody, fnIx) {
-      if fnRetNullBearing(fnIx) {
-        if emitNullForRet(body, fnIx) < 0 { return -1 }
-        // Inside the sink's exit block this fall-through value cannot simply be left on
-        // the stack for the function `end` — the block is void. It terminates like any
-        // other exit: sunk when it built a box, a plain `return` otherwise.
-        if uSinkFired > 0 { emitUnionRetSink(fnIx) }
-      } else {
-        fbUnreachable() // 0x00 unreachable (dead padding for the result type)
-      }
-    }
+    if emitFallThroughPad(body, fn.fnBody, fnIx, fnPos) < 0 { return -1 }
     // Close the sink's exit block and perform the function's ONE box construction, whose
     // operands every sunk `return` has already written. Falling off the function `end`
     // with it on the stack is the result.
@@ -1354,12 +1395,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // The size prefix is written, so `out.length` is where the body itself begins; `exprInBody`
     // is where `bodyExpr` begins inside it. Same two-step rebase `emitStartFnCode` performs.
     const bodyInOut = out.length
-    let ssp = stmtSpanBase
-    while ssp < emitFnSpanStart.length {
-      emitFnSpanStart[ssp] = emitFnSpanStart[ssp] + bodyInOut + exprInBody
-      emitFnSpanEnd[ssp] = emitFnSpanEnd[ssp] + bodyInOut + exprInBody
-      ssp = ssp + 1
-    }
+    rebaseStmtSpans(stmtSpanBase, bodyInOut, exprInBody)
     wBytes(body)
     wTarget(outPrev)
     restoreNarrow(savedCapNarrow)
@@ -5478,19 +5514,9 @@ function fnLocSuffix(nodeIx: i32, anchorOk: boolean): string {
   "@" + file + ":" + i32ToStr(P.toks[tk].line)
 }
 
-// Emits the wasm "name" custom section (id 0) so a wasmtime trap backtrace shows real
-// function names instead of `<wasm function N>`. Gated on `gEmitNames` — a no-op when off, so
-// the default emit path (goldens + fixpoints) is untouched. `n` is the user-function count and
-// `gImports` the imported-function count; imports occupy indices 0..gImports-1, users after. Indices in the namemap must be strictly increasing, per the name-section appendix.
-function emitNameSection(n: i32) {
-  if gEmitNames == 0 { return 0 }
-
-  // ── function-name subsection (id 1) ──────────────────────────────────────────
-  // Build the namemap (count + entries) into a temp buffer, then frame it as the
-  // subsection payload. The print imports (if present) are named first at their
-  // hardcoded indices 0..3, then each user function at `gImports + i`.
-  const fnameMap: u8[] = []
-  const mapPrev = wTarget(fnameMap)
+// The function-name subsection's entry count for `n` user functions: the imports, the users,
+// the start function when there is one, and each helper the module emits.
+function nameMapCount(n: i32): i32 {
   let count = gImports + n
   if startStmts.length > 0 { count = count + 1 }
   if gHelpStrHash >= 0 { count = count + 6 }
@@ -5510,73 +5536,82 @@ function emitNameSection(n: i32) {
   count = count + rvHelperCount()
   if gHelpAsFail >= 0 { count = count + 1 }
   if gHelpStrFromBytes >= 0 { count = count + 1 }
-  wULEB(count)
-  if gImports > 0 {
-    wULEB(0)
-    wName("__print_i32__")
-    wULEB(1)
-    wName("__print_bool__")
-    wULEB(2)
-    wName("__print_char__")
-    wULEB(3)
-    wName("__print_str_flush__")
-    // The 5th import (index 4) is named only when an i64 program prints.
-    if gNeedsI64Print {
-      wULEB(4)
-      wName("__print_i64__")
-    }
-    // The `__print_f64__` import is named at its computed index (`gF64PrintIdx`, 4 or 5).
-    if gNeedsF64Print {
-      wULEB(gF64PrintIdx)
-      wName("__print_f64__")
-    }
-    // The `__print_f32__` import is named at its computed index (`gF32PrintIdx`, 4/5/6).
-    if gNeedsF32Print {
-      wULEB(gF32PrintIdx)
-      wName("__print_f32__")
-    }
-    // The fs imports, each at the index `scanPrintUse` recorded. They sit between the print family
-    // and the user functions, which is where slot order puts them, so the namemap stays strictly
-    // increasing — the one hard requirement the appendix places on this subsection. `count` above
-    // already includes them, so writing them here is what makes it honest.
-    let fsnm = 0
-    while fsnm < fsIntrinsicCount() {
-      if fsUsedAt(fsnm) {
-        let fsIx = fsIdxAt(fsnm)
-        let fsLbl = fsIntrinsicNameAt(fsnm)
-        if fsIx < 0 || fsLbl == "" {
-          // Same rule as the import section's twin loop: `curBuf` is bound to `fnameMap` here, so
-          // record the failure and write a placeholder rather than returning out from under the
-          // binding. The namemap count is fixed at `gImports + n` before the loop and must still be met.
-          emitFail(
-            "emitProgram: fs import is used but has no index or name — the slot tables have drifted",
-          )
-          fsIx = 0
-          fsLbl = "__fs_unknown__"
-        }
-        wULEB(fsIx)
-        wName(fsLbl)
-      }
-      fsnm = fsnm + 1
-    }
-    // The user externs, after the fs block, which is where manifest order puts them — so the
-    // namemap stays strictly increasing, the appendix's one hard requirement.
-    let exnm = 0
-    while exnm < externCount() {
-      let exIx = externIdxAt(exnm)
-      let exLbl = externNameAt(exnm)
-      if exIx < 0 || exLbl == "" {
-        emitFail(
-          "emitProgram: extern import has no index or name — the manifest and its readers have drifted",
-        )
-        exIx = 0
-        exLbl = "__extern_unknown__"
-      }
-      wULEB(exIx)
-      wName(exLbl)
-      exnm = exnm + 1
-    }
+  count
+}
+
+// The namemap entries of the imports, at their slot indices: the print family, then each used
+// fs import, then the user externs. A slot with no index or name is recorded with `emitFail` and
+// named by a placeholder, so the entry count is still met.
+function nameImports() {
+  wULEB(0)
+  wName("__print_i32__")
+  wULEB(1)
+  wName("__print_bool__")
+  wULEB(2)
+  wName("__print_char__")
+  wULEB(3)
+  wName("__print_str_flush__")
+  // The 5th import (index 4) is named only when an i64 program prints.
+  if gNeedsI64Print {
+    wULEB(4)
+    wName("__print_i64__")
   }
+  // The `__print_f64__` import is named at its computed index (`gF64PrintIdx`, 4 or 5).
+  if gNeedsF64Print {
+    wULEB(gF64PrintIdx)
+    wName("__print_f64__")
+  }
+  // The `__print_f32__` import is named at its computed index (`gF32PrintIdx`, 4/5/6).
+  if gNeedsF32Print {
+    wULEB(gF32PrintIdx)
+    wName("__print_f32__")
+  }
+  // The fs imports, each at the index `scanPrintUse` recorded. They sit between the print family
+  // and the user functions, which is where slot order puts them, so the namemap stays strictly
+  // increasing — the one hard requirement the appendix places on this subsection. `count` above
+  // already includes them, so writing them here is what makes it honest.
+  let fsnm = 0
+  while fsnm < fsIntrinsicCount() {
+    if fsUsedAt(fsnm) {
+      let fsIx = fsIdxAt(fsnm)
+      let fsLbl = fsIntrinsicNameAt(fsnm)
+      if fsIx < 0 || fsLbl == "" {
+        // Same rule as the import section's twin loop: `curBuf` is bound to `fnameMap` here, so
+        // record the failure and write a placeholder rather than returning out from under the
+        // binding. The namemap count is fixed at `gImports + n` before the loop and must still be met.
+        emitFail(
+          "emitProgram: fs import is used but has no index or name — the slot tables have drifted",
+        )
+        fsIx = 0
+        fsLbl = "__fs_unknown__"
+      }
+      wULEB(fsIx)
+      wName(fsLbl)
+    }
+    fsnm = fsnm + 1
+  }
+  // The user externs, after the fs block, which is where manifest order puts them — so the
+  // namemap stays strictly increasing, the appendix's one hard requirement.
+  let exnm = 0
+  while exnm < externCount() {
+    let exIx = externIdxAt(exnm)
+    let exLbl = externNameAt(exnm)
+    if exIx < 0 || exLbl == "" {
+      emitFail(
+        "emitProgram: extern import has no index or name — the manifest and its readers have drifted",
+      )
+      exIx = 0
+      exLbl = "__extern_unknown__"
+    }
+    wULEB(exIx)
+    wName(exLbl)
+    exnm = exnm + 1
+  }
+}
+
+// The namemap entries of the `n` user functions at `gImports + i`, each named by a lambda's
+// display name or its own name, with its location suffix.
+function nameUserFns(n: i32) {
   let fi = 0
   while fi < n {
     const fn = P.nodes[fnStmts[fi]]
@@ -5591,18 +5626,10 @@ function emitNameSection(n: i32) {
     }
     fi = fi + 1
   }
-  // The synthetic start function — a module's top-level statements — at its own index,
-  // between the user functions and the helpers. Without it a trap in top-level code is the
-  // one frame the backtrace still reports as `<wasm function N>`, which is the whole of what
-  // a reader of `print(a[7])` sees.
-  if startStmts.length > 0 {
-    wULEB(gImports + n)
-    // Top-level statements have no declaration of their own, so the start frame names the
-    // ENTRY file at line 1 — the file a reader opens, which is what the frame is for.
-    wName("__start__" + startLocSuffix())
-  }
-  // The shared runtime helpers (module-tail indices — after the start fn and the
-  // `__log__` decoder, so the namemap stays strictly increasing).
+}
+
+// The namemap entries of the shared runtime helpers, at their module-tail indices.
+function nameHelpers() {
   if gHelpStrHash >= 0 {
     wULEB(gHelpStrHash)
     wName("__str_hash__")
@@ -5667,6 +5694,38 @@ function emitNameSection(n: i32) {
     wULEB(gHelpStrFromBytes)
     wName("__str_from_bytes__")
   }
+}
+
+// Emits the wasm "name" custom section (id 0) so a wasmtime trap backtrace shows real
+// function names instead of `<wasm function N>`. Gated on `gEmitNames` — a no-op when off, so
+// the default emit path (goldens + fixpoints) is untouched. `n` is the user-function count and
+// `gImports` the imported-function count; imports occupy indices 0..gImports-1, users after. Indices in the namemap must be strictly increasing, per the name-section appendix.
+function emitNameSection(n: i32) {
+  if gEmitNames == 0 { return 0 }
+
+  // ── function-name subsection (id 1) ──────────────────────────────────────────
+  // Build the namemap (count + entries) into a temp buffer, then frame it as the
+  // subsection payload. The print imports (if present) are named first at their
+  // hardcoded indices 0..3, then each user function at `gImports + i`.
+  const fnameMap: u8[] = []
+  const mapPrev = wTarget(fnameMap)
+  const count = nameMapCount(n)
+  wULEB(count)
+  if gImports > 0 { nameImports() }
+  nameUserFns(n)
+  // The synthetic start function — a module's top-level statements — at its own index,
+  // between the user functions and the helpers. Without it a trap in top-level code is the
+  // one frame the backtrace still reports as `<wasm function N>`, which is the whole of what
+  // a reader of `print(a[7])` sees.
+  if startStmts.length > 0 {
+    wULEB(gImports + n)
+    // Top-level statements have no declaration of their own, so the start frame names the
+    // ENTRY file at line 1 — the file a reader opens, which is what the frame is for.
+    wName("__start__" + startLocSuffix())
+  }
+  // The shared runtime helpers (module-tail indices — after the start fn and the
+  // `__log__` decoder, so the namemap stays strictly increasing).
+  nameHelpers()
   wTarget(mapPrev)
 
   // ── assemble the section payload: wName("name") + the two subsections ─────────
