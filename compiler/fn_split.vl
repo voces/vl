@@ -25,6 +25,7 @@ import {
   Program,
   RetStmt,
   TypeRef,
+  callHasTyArgs,
   declNameTokOf,
   hasNamedArgs,
   i32ToStr,
@@ -60,6 +61,7 @@ let fsMode = FS_COMPILE
 
 // The refused declarations, as parse-arena indices, and whether the last compile added one.
 let fsAsks: i32[] = []
+let fsTpAsks: i32[] = []
 let fsAskGrew = false
 // The parse arena's length in the current compile; a node at or past it is minted by the plan.
 let fsParseLen = 0
@@ -99,8 +101,21 @@ let pcCopy: i32[] = []
 let pcPos: i32[] = []
 let pcFrom: string[] = []
 let pcTo: string[] = []
+// Call `pmCall`, through a record field, calls function `pmName` directly instead.
+let pmCall: i32[] = []
+let pmName: string[] = []
+// Parameter `psPar` of function `psFn` is annotated with type parameter `psName`, which the
+// function declares after its own.
+let psPar: i32[] = []
+let psFn: i32[] = []
+let psName: string[] = []
 
 function fsPlanReset(): i32 {
+  pmCall = []
+  pmName = []
+  psPar = []
+  psFn = []
+  psName = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -135,6 +150,7 @@ function fsPlanReset(): i32 {
 export function fsReset(): i32 {
   fsMode = FS_COMPILE
   fsAsks = []
+  fsTpAsks = []
   fsAskGrew = false
   fsPlanReset()
 }
@@ -148,7 +164,7 @@ export function fsSetMode(m: i32): i32 {
 export function fsModeOf(): i32 { fsMode }
 
 // Whether the compile asked for a split, and whether its asks include a new declaration.
-export function fsAsked(): boolean { fsAsks.length > 0 }
+export function fsAsked(): boolean { fsAsks.length > 0 || fsTpAsks.length > 0 }
 export function fsGrew(): boolean { fsAskGrew }
 
 // Whether parse node `ix` is one the plan minted, in the compile that applies it.
@@ -173,6 +189,17 @@ export function fsAsk(d: i32): i32 {
     if a == o { return 0 }
   }
   fsAsks.push(o)
+  fsAskGrew = true
+  0
+}
+
+// The emitter refuses parameter `par` for binding its type parameter to a second generic
+// instance; records its parse node, which the plan gives a type parameter of its own (D6200).
+export function fsAskTyParam(par: i32): i32 {
+  let o = declOrigOf(par)
+  if o < 0 { o = par }
+  if o < 0 || o >= fsParseLen || hasI32(fsTpAsks, o) { return 0 }
+  fsTpAsks.push(o)
   fsAskGrew = true
   0
 }
@@ -494,25 +521,44 @@ function fsIdentityLetOf(a: i32): i32 {
   -1
 }
 
-// The name node call `c` always evaluates to, or -1: the callee is a declared function whose
-// every return, its last statement among them, reads one module-scope function by a name
-// nothing else in the program declares, so a slot can hold that function without the call.
-function fsConstRet(c: i32): i32 {
+// Whether node `c` is a call whose callee is identifier `r`.
+function fsCallsVia(c: i32, r: i32): boolean {
+  const cn = P.nodes[c]
+  cn is Call && cn.callFn == r
+}
+
+// The function call `c` runs: a declared function, or the lambda a never-written `const`
+// holds; -1 for any other callee.
+function fsCallRunsFn(c: i32): i32 {
   if c < 0 || c >= fsParseLen { return -1 }
   const cn = P.nodes[c]
   if !(cn is Call) { return -1 }
+  const lam = fsConstLambdaOf(cn.callFn)
+  if lam >= 0 { return lam }
   const fd = identDeclOf(cn.callFn)
   if fd < 0 || fd >= fsParseLen { return -1 }
   const f = P.nodes[fd]
   if !(f is FuncDecl) || f.fnName == "" { return -1 }
-  if f.fnBody < 0 || f.fnBody >= P.nodes.length { return -1 }
-  const body = P.nodes[f.fnBody]
-  if !(body is Block) || body.blkStmts.length == 0 { return -1 }
-  const last = P.nodes[body.blkStmts[body.blkStmts.length - 1]]
-  if !(last is RetStmt) || last.retArg < 0 || !(P.nodes[last.retArg] is Ident) {
+  fd
+}
+
+// The name node call `c` always evaluates to, or -1: the callee (`fsCallRunsFn`) has every
+// return, and its body's value, read one module-scope function by a name nothing else in the
+// program declares, so a slot can hold that function without the call.
+function fsConstRet(c: i32): i32 {
+  const fd = fsCallRunsFn(c)
+  if fd < 0 { return -1 }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) || f.fnBody < 0 || f.fnBody >= P.nodes.length {
     return -1
   }
-  const g = identDeclOf(last.retArg)
+  const body = P.nodes[f.fnBody]
+  if !(body is Block) || body.blkStmts.length == 0 { return -1 }
+  let tail = body.blkStmts[body.blkStmts.length - 1]
+  const last = P.nodes[tail]
+  if last is RetStmt { tail = last.retArg }
+  if tail < 0 || !(P.nodes[tail] is Ident) { return -1 }
+  const g = identDeclOf(tail)
   if g < 0 || g >= fsParseLen || fsParent[g] < 0 { return -1 }
   const gn = P.nodes[g]
   if !(gn is FuncDecl) || !(P.nodes[fsParent[g]] is Program) { return -1 }
@@ -531,7 +577,7 @@ function fsConstRet(c: i32): i32 {
     if i != g && fsDeclName(i) == gn.fnName { return -1 }
     i = i + 1
   }
-  last.retArg
+  tail
 }
 
 // The name parse node `i` declares, read from its stamped name token; "" when it declares none.
@@ -606,6 +652,186 @@ function fsLetCallKeys(d: i32): i32 {
   ks.length
 }
 
+// Whether read `r` is an argument of a call, with no type arguments, of a function declaration.
+function fsArgOfNamedFn(r: i32): boolean {
+  const c = fsParent[r]
+  if c < 0 || callHasTyArgs(c) { return false }
+  const cn = P.nodes[c]
+  if !(cn is Call) || cn.callFn == r { return false }
+  let arg = false
+  for x in cn.callArgs {
+    if x == r { arg = true }
+  }
+  const g = identDeclOf(cn.callFn)
+  arg && g >= 0 && g < P.nodes.length && P.nodes[g] is FuncDecl
+}
+
+// Each asked parameter, annotated with a bare type parameter of its function, takes a type
+// parameter of its own; the function's other reads of the old one stay with it (D6200). A
+// function called with type arguments declines. 0 with a plan, 1 with none.
+function fsPlanTyParams(): i32 {
+  let rc = 1
+  for o in fsTpAsks {
+    const p = P.nodes[o]
+    const fd = fsParent[o]
+    let ok = p is Param && p.parType >= 0 && fd >= 0 && P.nodes[fd] is FuncDecl
+    let tp = ""
+    if ok && p is Param {
+      const tn = P.nodes[p.parType]
+      const f = P.nodes[fd]
+      ok = tn is TypeRef && f is FuncDecl && hasStr(f.fnTyParams, tn.tyName)
+      if tn is TypeRef { tp = tn.tyName }
+    }
+    for r in fsIdents {
+      const c = fsParent[r]
+      if (
+        ok
+        && identDeclOf(r) == fd
+        && c >= 0
+        && P.nodes[c] is Call
+        && callHasTyArgs(c)
+      ) {
+        ok = false
+      }
+      // The parameter is read only as a direct argument of a named function, so no read can
+      // meet the old type parameter.
+      if ok && r != o && identDeclOf(r) == o && !fsArgOfNamedFn(r) {
+        ok = false
+      }
+    }
+    if ok && p is Param {
+      psPar.push(o)
+      psFn.push(fd)
+      psName.push(tp + "$t" + i32ToStr(o))
+      rc = 0
+    }
+  }
+  rc
+}
+
+// Value `v` of a field of an un-annotated `const` record, constant call `src` (`fsConstRet`) or
+// a `const` it initializes: when every read of the record reads a field and every read of this
+// one calls it, the field keeps the types the `const` is called at, else its first call's, and
+// a call at any other calls the function directly (D6342). 0 with a plan, 1 with none.
+function fsPlanFieldSlot(v: i32, src: i32): i32 {
+  const g = fsConstRet(src)
+  if g < 0 || v < 0 { return 1 }
+  const fi = fsParent[v]
+  if fi < 0 { return 1 }
+  const fin = P.nodes[fi]
+  if !(fin is FieldInit) || fin.fiValue != v { return 1 }
+  const o = fsParent[fi]
+  if o < 0 || !(P.nodes[o] is ObjLit) { return 1 }
+  const d = fsParent[o]
+  if d < 0 { return 1 }
+  const dn = P.nodes[d]
+  if (
+    !(dn is LetDecl)
+    || dn.letInit != o
+    || dn.letType >= 0
+    || dn.letKw != "const"
+  ) {
+    return 1
+  }
+  const keys: string[] = []
+  const calls: i32[] = []
+  let keep = ""
+  let first = -1
+  for r in fsIdents {
+    if identDeclOf(r) == d && r != d {
+      const m = fsParent[r]
+      if m < 0 { return 1 }
+      const mn = P.nodes[m]
+      if !(mn is Member) || mn.memObj != r { return 1 }
+      if mn.memProp == fin.fiName {
+        const c = fsParent[m]
+        if c < 0 || !fsCallsVia(c, m) { return 1 }
+        const key = fsReadKey(m)
+        if !hasStr(keys, key) { keys.push(key) }
+        calls.push(c)
+        if first < 0 || P.nodes[c].pos < P.nodes[calls[first]].pos {
+          first = calls.length - 1
+          keep = key
+        }
+      }
+    }
+  }
+  if keys.length < 2 { return 1 }
+  const sd = letDeclOfRead(v)
+  for r in fsIdents {
+    if (
+      sd >= 0
+      && identDeclOf(r) == sd
+      && fsParent[r] >= 0
+      && fsCallsVia(fsParent[r], r)
+    ) {
+      keep = fsReadKey(r)
+    }
+  }
+  const gn = P.nodes[g]
+  if !(gn is Ident) { return 1 }
+  for c in calls {
+    const cn = P.nodes[c]
+    if cn is Call && fsReadKey(cn.callFn) != keep {
+      pmCall.push(c)
+      pmName.push(gn.identName)
+    }
+  }
+  0
+}
+
+// The field slots of `const` `d`: each of its fields when it is a record, and each field it is
+// the value of when a constant call initializes it. 0 with a plan, 1 with none.
+function fsPlanFieldSlotsOf(d: i32): i32 {
+  if d < 0 || d >= P.nodes.length { return 1 }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return 1 }
+  let rc = 1
+  // A record `const` plans each of its fields.
+  const o = P.nodes[dn.letInit]
+  if o is ObjLit {
+    for fi in o.objFields {
+      const fin = P.nodes[fi]
+      if fin is FieldInit {
+        let src = fin.fiValue
+        const sd = letDeclOfRead(src)
+        if sd >= 0 {
+          const sn = P.nodes[sd]
+          if sn is LetDecl && sn.letKw == "const" { src = sn.letInit }
+        }
+        if fsPlanFieldSlot(fin.fiValue, src) == 0 { rc = 0 }
+      }
+    }
+  }
+  for q in fsIdents {
+    if identDeclOf(q) == d && q != d && fsPlanFieldSlot(q, dn.letInit) == 0 {
+      rc = 0
+    }
+  }
+  rc
+}
+
+// The field slots of every call of constant maker `fd` that is a record field, or initializes a
+// `const` that is one. 0 with a plan, 1 with none.
+function fsPlanMakerFields(fd: i32): i32 {
+  if fd < 0 || fd >= P.nodes.length || !(P.nodes[fd] is FuncDecl) { return 1 }
+  let rc = 1
+  for r in fsIdents {
+    const c = fsParent[r]
+    if (
+      r != fd
+      && c >= 0
+      && fsCallsVia(c, r)
+      && fsCallRunsFn(c) == fd
+      && fsConstRet(c) >= 0
+    ) {
+      if fsPlanFieldSlot(c, c) == 0 { rc = 0 }
+      if fsPlanFieldSlotsOf(fsParent[c]) == 0 { rc = 0 }
+    }
+  }
+  rc
+}
+
 function fsStmtParentOk(s: i32): boolean {
   const p = fsParent[s]
   if p < 0 { return false }
@@ -617,6 +843,8 @@ function fsStmtParentOk(s: i32): boolean {
 export function fsPlan(root: i32): i32 {
   fsPlanReset()
   fsWalk(root)
+  let fields = 1
+  const tps = fsPlanTyParams()
   // A generic read refused as an identity call's argument asks for the binding it initializes.
   let ai = 0
   while ai < fsAsks.length {
@@ -648,7 +876,13 @@ export function fsPlan(root: i32): i32 {
       for r in fsIdents {
         const c = fsParent[r]
         let d = -1
-        if identDeclOf(r) == a && r != a && c >= 0 && fsConstRet(c) >= 0 {
+        if (
+          r != a
+          && c >= 0
+          && fsCallsVia(c, r)
+          && fsCallRunsFn(c) == a
+          && fsConstRet(c) >= 0
+        ) {
           d = fsParent[c]
         }
         if d >= 0 {
@@ -664,6 +898,16 @@ export function fsPlan(root: i32): i32 {
           }
         }
       }
+    }
+    // A maker's result, or a generic name it returns, may be a record field (D6342).
+    if fsPlanFieldSlotsOf(a) == 0 || fsPlanMakerFields(a) == 0 { fields = 0 }
+    if (
+      a >= 0
+      && a < P.nodes.length
+      && P.nodes[a] is Ident
+      && fsPlanMakerFields(fsEnclosingFn(a)) == 0
+    ) {
+      fields = 0
     }
     ai = ai + 1
   }
@@ -701,7 +945,7 @@ export function fsPlan(root: i32): i32 {
   if holes == 0 || fns == 0 { return 0 }
   // A let plan keeps a read in a body called at two keys to one slot, which the body's copies
   // then split (D6321).
-  if lets == 0 {
+  if lets == 0 || fields == 0 || tps == 0 {
     fsPlanInstances()
     return 0
   }
@@ -983,6 +1227,32 @@ function fsCallResultKey(c: i32): string {
       }
     }
     return k
+  }
+  // A field of a record binding keys by the calls of that field (D6341).
+  const o = fsParent[p]
+  let d = -1
+  if pn is FieldInit && pn.fiValue == c && o >= 0 && P.nodes[o] is ObjLit {
+    d = fsParent[o]
+  }
+  if d >= 0 && pn is FieldInit {
+    const dn = P.nodes[d]
+    if dn is LetDecl && dn.letInit == o && dn.letType < 0 {
+      let k = "l:"
+      for r in fsIdents {
+        if identDeclOf(r) == d && r != d {
+          const m = fsParent[r]
+          if m < 0 { return "u:" + i32ToStr(c) }
+          const mn = P.nodes[m]
+          if !(mn is Member) { return "u:" + i32ToStr(c) }
+          if mn.memProp == pn.fiName {
+            const rk = fsReadKey(m)
+            if rk.slice(0, 2) != "c:" { return "u:" + i32ToStr(c) }
+            if k.indexOf(";" + rk + ";") < 0 { k = k + ";" + rk + ";" }
+          }
+        }
+      }
+      return k
+    }
   }
   "u:" + i32ToStr(c)
 }
@@ -1866,6 +2136,30 @@ function fsApply(): i32 {
   while i < prIdent.length {
     const n = P.nodes[prIdent[i]]
     if n is Ident { n.identName = prName[i] } else { rc = -1 }
+    i = i + 1
+  }
+  i = 0
+  while i < psPar.length {
+    const p = P.nodes[psPar[i]]
+    const f = P.nodes[psFn[i]]
+    if p is Param && p.parType >= 0 && f is FuncDecl {
+      const tn = P.nodes[p.parType]
+      if tn is TypeRef { tn.tyName = psName[i] } else { rc = -1 }
+      f.fnTyParams.push(psName[i])
+    } else {
+      rc = -1
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < pmCall.length {
+    const c = P.nodes[pmCall[i]]
+    if c is Call && c.callFn >= 0 {
+      P.pos = nodeToks[c.callFn] + 1
+      c.callFn = mkIdent(pmName[i], P.nodes[c.callFn].pos)
+    } else {
+      rc = -1
+    }
     i = i + 1
   }
   i = 0
