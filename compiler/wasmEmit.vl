@@ -1275,13 +1275,13 @@ import {
   sharedFieldRecvSlot,
   unionHasAtomK,
   unionHasAtomKindArm,
-  unionStoreAtomKind,
+  unionStoreAtomKindOfSet,
   valueAtomNameOfKind,
 } from "./emit_union_casts"
 import {
   isUNameAB,
+  msHasNull,
   msMemberAtomsOfSet,
-  msSetOfKey,
   msSetOfText,
   msSetOfUnion,
   msSubNull,
@@ -7203,12 +7203,25 @@ function emitUnionCoerceMapElemList(
   )
 }
 
+// The set id of coerce target `unionName`: `uSet` when the caller resolved it, else by name.
+function coerceSetOf(uSet: i32, unionName: string): i32 {
+  if uSet >= 0 { return uSet }
+  msSetOfUnion(unionName)
+}
+
+// Whether coerce target `unionName`, of set id `uSet` (-1 when unresolved), admits `null`.
+function coerceSetHasNull(uSet: i32, unionName: string): boolean {
+  if uSet >= 0 { return msHasNull(uSet) }
+  unionSetHasNull(unionName)
+}
+
 // `emitUnionCoerceUnder`'s value-atom path, past its gate: a scalar map read into a nullable
 // union and an atom widened to its member string box here, every other value through
 // `emitUnionCoerceAtomBox`. Returns 0, or -1 once failed.
 function emitUnionCoerceValueAtom(
   body: u8[],
   unionName: string,
+  uSet: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -7223,7 +7236,7 @@ function emitUnionCoerceValueAtom(
   // unconditional value tag over the rep's empty value. For `i32` that empty value is `0`, a
   // real value. The niche-bearing value types are excluded: their empty value already means absent.
   const mrk = mapReadScalarBoxKind(exprIx, fnIx)
-  if mrk >= 0 && unionSetHasNull(unionName) {
+  if mrk >= 0 && coerceSetHasNull(uSet, unionName) {
     // Only when the map's own value atom is a MEMBER of the target union. A widening
     // consumption (`{[string]: i32}` read into `i64 | null`) has to go through the
     // ladder's promotion rules, which this arm does not replicate — declining leaves it
@@ -7269,7 +7282,7 @@ function emitUnionCoerceValueAtom(
         // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
         if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
       }
-      if !unionSetHasNull(unionName) || !aUsed || nlStrArm || !nlParam {
+      if !coerceSetHasNull(uSet, unionName) || !aUsed || nlStrArm || !nlParam {
         return emitFail(
           "emitProgram: literal-union string widening with no members",
         )
@@ -7299,7 +7312,7 @@ function emitUnionCoerceValueAtom(
     fbStructNew(uBoxIdx) // { tag, member-string ref }
     return 0
   }
-  return emitUnionCoerceAtomBox(body, unionName, exprIx, bareIx, fnIx)
+  return emitUnionCoerceAtomBox(body, unionName, uSet, exprIx, bareIx, fnIx)
 }
 
 // The value-atom box `{ tag, payload }` for `exprIx` entering `unionName`: the atom ladder
@@ -7308,6 +7321,7 @@ function emitUnionCoerceValueAtom(
 function emitUnionCoerceAtomBox(
   body: u8[],
   unionName: string,
+  uSet: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -7332,7 +7346,7 @@ function emitUnionCoerceAtomBox(
   // over a slot whose only numeric arm is `i64` — valid wasm, `is i64` silently false.
   // `unionStoreAtomKind` makes the two sides of the round trip inverses.
   const d209k = memReadUnboxAtomKind(bareIx, fnIx)
-  if d209k >= 0 && unionStoreAtomKind(unionName, d209k) == d209k {
+  if d209k >= 0 && unionStoreAtomKindOfSet(uSet, unionName, d209k) == d209k {
     cak = d209k
   } else if exprString(exprIx, fnIx) {
     cak = 2 // "string"
@@ -7375,7 +7389,7 @@ function emitUnionCoerceAtomBox(
     // `unionStoreAtomKind` in general moved a case it should not have
     // (`d901_fold_f32_dest`, a `{q: f32} | null` whose f32 is a FIELD and not an arm), so
     // the test is spelled out here instead of widening that shared mapper.
-    const f32Set = msSetOfKey(unionName)
+    const f32Set = coerceSetOf(uSet, unionName)
     if !unionHasAtomK(f32Set, unionName, "f32", 5) {
       if unionHasAtomK(f32Set, unionName, "f64", 4) { cak = 4 }
     }
@@ -7387,7 +7401,7 @@ function emitUnionCoerceAtomBox(
     // is the only i64-classified value the checker admits into it (D1890's grant is
     // exactness-gated), and assuming kind 3 asks for an i64 value box the module never minted.
     cak = 3 // "i64"
-    const i64Set = msSetOfKey(unionName)
+    const i64Set = coerceSetOf(uSet, unionName)
     if !unionHasAtomK(i64Set, unionName, "i64", 3) {
       if unionHasAtomK(i64Set, unionName, "f64", 4) { cak = 4 }
       else if unionHasAtomK(i64Set, unionName, "f32", 5) { cak = 5 }
@@ -7404,7 +7418,7 @@ function emitUnionCoerceAtomBox(
     // atom is a float would stay `cak = 0` and box an i32 into the f64 or f32 value box, which
     // is check-clean invalid wasm in the global, local and argument positions. f64 before f32,
     // matching the list arm.
-    const usw = unionStoreAtomKind(unionName, 0)
+    const usw = unionStoreAtomKindOfSet(uSet, unionName, 0)
     if usw >= 0 { cak = usw }
     if bare is NumLit {
       if !numLexFitsI32(bare.numText) {
@@ -7417,7 +7431,7 @@ function emitUnionCoerceAtomBox(
   // box. The same promotion ladder, entered at f64 instead of i32. The `cak == 4` gate is
   // hoisted out of the call below so the set resolution is paid only by a float value.
   if cak == 4 {
-    const fsw = unionStoreAtomKind(unionName, 4)
+    const fsw = unionStoreAtomKindOfSet(uSet, unionName, 4)
     if fsw >= 0 { cak = fsw }
   }
   // An int-element list whose union has no `i32[]` member but an `i64[]` or `f64[]` one: the
@@ -7571,7 +7585,14 @@ function emitUnionCoerceUnder(
   )
   if viaNulNiche < 0 { return -1 }
   if viaNulNiche == 1 { return 0 }
-  emitUnionCoerceRecord(body, unionName, exprIx, bareIx, fnIx)
+  emitUnionCoerceRecord(
+    body,
+    unionName,
+    msSetOfUnion(unionNameIn),
+    exprIx,
+    bareIx,
+    fnIx,
+  )
 }
 
 // `emitUnionCoerceUnder`'s record arms: an object literal, a struct value re-boxed against its
@@ -7580,6 +7601,7 @@ function emitUnionCoerceUnder(
 function emitUnionCoerceRecord(
   body: u8[],
   unionName: string,
+  uSet: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -7643,7 +7665,7 @@ function emitUnionCoerceRecord(
   // union carrying a value atom drops the variant ref into the scalar atom ladder and widens
   // it. A box-typed position routes through `emitUnionBoxArg`, which boxes before deferring.
   if exprVariantIndex(exprIx, fnIx) >= 0 { return emitExpr(body, exprIx, fnIx) }
-  emitUnionCoerceMap(body, unionName, exprIx, bareIx, fnIx)
+  emitUnionCoerceMap(body, unionName, uSet, exprIx, bareIx, fnIx)
 }
 
 // `emitUnionCoerceUnder`'s map arms: a map carrier tagged by its value slot, the loud reject of
@@ -7652,6 +7674,7 @@ function emitUnionCoerceRecord(
 function emitUnionCoerceMap(
   body: u8[],
   unionName: string,
+  uSet: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -7706,7 +7729,7 @@ function emitUnionCoerceMap(
   const d29 = emitUnionMapArmBox(body, unionName, exprIx, fnIx)
   if d29 < 0 { return -1 }
   if d29 == 1 { return 0 }
-  emitUnionCoerceList(body, unionName, exprIx, bareIx, fnIx)
+  emitUnionCoerceList(body, unionName, uSet, exprIx, bareIx, fnIx)
 }
 
 // `emitUnionCoerceUnder`'s list and closure arms, then the value-atom gate: an empty list, a
@@ -7715,6 +7738,7 @@ function emitUnionCoerceMap(
 function emitUnionCoerceList(
   body: u8[],
   unionName: string,
+  uSet: i32,
   exprIx: i32,
   bareIx: i32,
   fnIx: i32,
@@ -7779,7 +7803,7 @@ function emitUnionCoerceList(
   if unionName == "" || !unionHasValueAtom(unionName) {
     return emitExpr(body, exprIx, fnIx)
   }
-  return emitUnionCoerceValueAtom(body, unionName, exprIx, bareIx, fnIx)
+  return emitUnionCoerceValueAtom(body, unionName, uSet, exprIx, bareIx, fnIx)
 }
 
 // Coerce an expression into a union-box position whose wasm rep is `(ref $uBox)` — a call
@@ -8622,7 +8646,7 @@ function emitUnionConcreteEq(
   // band; the two branches below are the only readers, and both consume the code rather than a
   // spelling. `valueAtomNameOfKind` re-derives the spelling for the membership test's decline
   // argument, a bijection over the seven scalar codes and "" above them.
-  const eak = unionEqAtomKindOf(otherIx, unmArms, fnIx)
+  const eak = unionEqAtomKindOf(otherIx, unmArms, usid, fnIx)
   const atom = valueAtomNameOfKind(eak)
   if eak < 0 {
     // The operand has no atom rep — a struct, a map, a shape the arena named. The box can still
@@ -12787,7 +12811,7 @@ function emitScalarMapReadOtherEq(
     // A numeric literal widens to a wide read's own width (`emitUnionEqOther`); any other
     // operand must already have the read's atom kind.
     const olit = P.nodes[unwrapParen(otherIx)]
-    let oOk = unionEqAtomKindOf(otherIx, atom + " | null", fnIx) == k
+    let oOk = unionEqAtomKindOf(otherIx, atom + " | null", -1, fnIx) == k
     if olit is NumLit {
       if k >= 3 { oOk = true }
     }
@@ -23347,6 +23371,13 @@ function emitCallRefArg(
       cuCtx.nulClosure = pkk == "nulclosure"
       cuCtx.nulList = pkk == "nullist"
       cuCtx.nulNone = pkk == "nulnone"
+      // A bare `null` into a nullable ref list is its wrapper's null, by the key's slot (D5882).
+      if pkk == "nulreflist" && P.nodes[unwrapParen(args[i])] is NullLit {
+        const crs = sigParamSlotAt(ckey, i)
+        if crs >= 0 && crs < rlWrapIdx.length {
+          cuCtx.nulRefHeap = rlWrapIdx[crs]
+        }
+      }
       if emitExprExpect(body, args[i], fnIx, cuCtx) < 0 { return -1 }
       // A value narrowed out of a box into a struct parameter is unboxed, as the direct
       // call unboxes it (D1723); the slot is the key's, so the cast agrees with the bytes.
@@ -31999,10 +32030,15 @@ function expCtxSeedValueArg(c: ExpCtx, pk: VKind | null, slot: i32) {
     "reflist" => {
       if slot >= 0 { c.listSlot = slot }
     }
+    "nulreflist" => {
+      // A list literal into a nullable ref list builds as the list itself (D5882).
+      c.listKind = listBuildKindOfVKind("reflist", slot)
+      if slot >= 0 { c.listSlot = slot }
+    }
     "map" => {
       c.mapSlot = slot
     }
-    "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "nulreflist" | "i32" | "str" | "union" | "variant" | "nulvariant" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
+    "strlist" | "f64list" | "i64list" | "f32list" | "u8list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "list" | "nullist" | "i32" | "str" | "union" | "variant" | "nulvariant" | "i64" | "f64" | "f32" | "v128" | "closure" | "nulstr" | "nulbool" | "nulclosure" | "nulmap" | "nulnone" | null => {
       // No other kind carries a container slot a literal argument builds at.
     }
   }
@@ -36239,11 +36275,14 @@ function emitUnionBoxNulNiche(
   fnIx: i32,
 ): i32 {
   if unionName == "" { return 0 }
-  if !unionSetHasNull(unionKey) { return 0 }
   const nnIx = unwrapParen(exprIx)
+  // The value's shape is asked before the union's `null`, so only a niche reads the set.
+  const nnBool = exprNulBool(nnIx, fnIx)
+  if !nnBool && !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
+  if !unionSetHasNull(unionKey) { return 0 }
   // A `boolean | null` is the i32 niche whose null is the value 2, so the null test is on the
   // value, not the ref (D2260).
-  if exprNulBool(nnIx, fnIx) {
+  if nnBool {
     const bvb = vbHeapIdxOfKind(1)
     if bvb < 0 { return 0 }
     const bSlot = widenTmpSlot(4000)
@@ -36263,7 +36302,6 @@ function emitUnionBoxNulNiche(
     fbEnd()
     return 1
   }
-  if !coalesceNulRefNicheOperand(nnIx, fnIx) { return 0 }
   const nnTag = coalNicheBoxTag(
     unionName,
     nnIx,

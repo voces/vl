@@ -6,11 +6,13 @@
 import {
   ArrayLit,
   Block,
+  BoolLit,
   Call,
   FieldInit,
   FuncDecl,
   Ident,
   Node,
+  NullLit,
   NumLit,
   ObjLit,
   P,
@@ -23,8 +25,17 @@ import {
   adoptNodeTok,
   arenaSetNode,
   i32ToStr,
+  mkArrayLit,
+  mkBool,
   mkCall,
+  mkFieldInit,
+  mkNull,
+  mkNum,
+  mkObjLit,
   mkParam,
+  mkParen,
+  mkStr,
+  mkUnary,
   spreadArgOf,
 } from "./ast"
 import {
@@ -60,6 +71,10 @@ import {
   fsbOwnRhs,
   fsbOwnTy,
   fsbOwnerReaches,
+  holeLitClaimSet,
+  holeLitClaimedHas,
+  holeLitCopiesOf,
+  holeLitCopyAdd,
   holeLitMovedHas,
   holeLitMovedSet,
   holeLitPinOf,
@@ -117,6 +132,7 @@ import {
   argCstrErr,
   argFlowErr,
   bareBraceDeliver,
+  holeFnDeliveryDemands,
   monoRecheckEnd,
   pinBmCstrElems,
   validateBinCstrs,
@@ -209,7 +225,13 @@ import {
   njFnIxSet,
 } from "./check_nj_join"
 import { fsbArgsFit, fsbBindParams } from "./check_node_rules"
-import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
+import {
+  nodeTyIx,
+  nodeTyIxOf,
+  nodeTyOf,
+  nodeTyRecord,
+  nodeTySet,
+} from "./check_node_tys"
 import {
   f32LitTailsAdopt,
   f64ExactJoinLeaves,
@@ -251,6 +273,7 @@ import {
   prbLeave,
 } from "./check_rollback"
 import { declare, lookup, lookupFnDeclNode } from "./check_scopes"
+import { valBindLambda } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
   CSTR_ANYFN,
@@ -698,8 +721,10 @@ function tpIfRecheck(
 // bindings that type gives its parameters, as a direct call's are (D3080).
 export function genFnValueCstrs(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A validator re-delivers a recorded value through `assignableExpr`, which must not re-enter.
-  // With no generic declared, or no function type in the destination, there is nothing to bind.
-  if genFnCstrBusy || !cstrCandAny || !tyMayHoldFn(dstTy, 0) { return 0 }
+  // With no generic or hole-typed lambda declared, or no function type at the destination, there
+  // is nothing to bind.
+  const anyCand = cstrCandAny || valBindLambda.length > 0
+  if genFnCstrBusy || !anyCand || !tyMayHoldFn(dstTy, 0) { return 0 }
   genFnCstrBusySet(true)
   genFnValueCstrsAt(srcExpr, srcTy, dstTy, 0)
   genFnCstrBusySet(false)
@@ -752,10 +777,13 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
       nested = true
     }
   }
-  if decl < 0 || decl >= P.nodes.length { return 0 }
+  if decl >= P.nodes.length { return 0 }
+  if decl < 0 { return holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName) }
   const fd = P.nodes[decl]
   if !(fd is FuncDecl) { return 0 }
-  if fd.fnTyParams.length == 0 { return 0 }
+  if fd.fnTyParams.length == 0 {
+    return holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName)
+  }
   let dt = dstTy
   const dn = T.tys[dt]
   if dn is TyNullable { dt = dn.nInner }
@@ -815,6 +843,29 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   cvNow = cvWas
   substNestModeSet(modeWas)
   substNestDeclSet(declWas)
+  0
+}
+
+// A function value `who` whose parameters are inference holes (an un-annotated function, or a
+// lambda bound to an un-annotated `const`) delivered at the concrete function type `dstTy`: its
+// holes take that type's parameters and its body's demands on them are judged there, as a
+// direct call through it would judge them (D5932).
+function holeFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, who: string) {
+  if dstTy < 0 || srcTy < 0 { return 0 }
+  let dt = dstTy
+  const dn = T.tys[dt]
+  if dn is TyNullable { dt = dn.nInner }
+  if dt < 0 || tyHasTyVar(dt) || tyHasHole(dt) { return 0 }
+  const s = T.tys[srcTy]
+  const d = T.tys[dt]
+  if !(s is TyFunc) || !(d is TyFunc) { return 0 }
+  if s.fnParamTypes.length != d.fnParamTypes.length { return 0 }
+  let anyHole = false
+  for pt in s.fnParamTypes {
+    if tyIsHole(pt) { anyHole = true }
+  }
+  if !anyHole { return 0 }
+  holeFnDeliveryDemands(srcTy, dt, srcExpr, "`" + who + "`")
   0
 }
 
@@ -1345,6 +1396,8 @@ function argCstrFitsAt(
     if tyMentionsErr(rat, 8) { return true }
     // A literal already retyped for another of the hole's demands is that type now; it is not
     // rebuilt a second time for this one.
+    // A forwarder's literal some caller copied at this type fits it (D5880).
+    if holeLitCopyOf(parenPeelIx(org), rexp) >= 0 { return true }
     const pinned = holeLitPinOf(parenPeelIx(org))
     if pinned >= 0 {
       return pinned == rexp
@@ -1405,6 +1458,32 @@ export function holeLambdaSeedTy(
     ci = ci + 1
   }
   got
+}
+
+// Whether the callee's body hands the lambda at hole `holeTy` on through a hole this call bound
+// to another hole, so the function type it takes is the enclosing function's pin to decide.
+export function holeLambdaDefers(
+  calleeFn: i32,
+  holeTy: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  if calleeFn < 0 || holeTy < 0 || !tyIsHole(holeTy) { return false }
+  const hv = T.tys[holeTy]
+  if !(hv is TyVar) { return false }
+  let ci = 0
+  while ci < argCstr.at.length {
+    if (
+      argCstr.form[ci] > 0
+      && argCstr.fn[ci] == calleeFn
+      && tyVarNamed(argCstr.at[ci], hv.tvName)
+    ) {
+      const rexp = substTyDeep(argCstr.exp[ci], bNames, bTys)
+      if rexp != argCstr.exp[ci] && hdKindIs(rexp, HD_PARAM) { return true }
+    }
+    ci = ci + 1
+  }
+  false
 }
 
 function tyVarNamed(t: i32, name: string): boolean {
@@ -1540,16 +1619,16 @@ function adoptHoleLitArg(
   if !(hv is TyVar) {
     if calleeFn < 0 { return 0 }
     const mv = argCstr.node[ci]
-    if (
-      mv < 0
-      || holeLitPinOf(parenPeelIx(mv)) >= 0
-      || !holeLitMovedHas(parenPeelIx(mv))
-    ) {
-      return 0
-    }
+    if mv < 0 || !holeLitMovedHas(parenPeelIx(mv)) { return 0 }
     const mvLit = P.nodes[parenPeelIx(mv)]
     if !(mvLit is ArrayLit || mvLit is ObjLit) { return 0 }
+    const lx = parenPeelIx(mv)
+    if holeLitPinOf(lx) >= 0 || holeLitClaimedHas(lx) {
+      holeLitCopyAt(lx, rexp)
+      return 0
+    }
     if holeLitAdopts(mv, at, rexp) { holeLitAdopt(mv, at, rexp) }
+    if !inferQuiet { holeLitClaimSet(lx) }
     return 0
   }
   if strListHas(done, hv.tvName) { return 0 }
@@ -1598,6 +1677,90 @@ function holeLitAdopt(org: i32, rat: i32, rexp: i32) {
   }
   0
 }
+
+// A copy of forwarder literal `lx`, already retyped for one caller, at the type `rexp` another
+// caller hands it to, so each instance of the forwarder passes its own (D5880). Nothing for a
+// probe, a type the literal already has, or a literal holding anything but literals.
+function holeLitCopyAt(lx: i32, rexp: i32) {
+  if inferQuiet || rexp < 0 || tyHasHole(rexp) { return 0 }
+  let pinned = holeLitPinOf(lx)
+  if pinned < 0 { pinned = nodeTyOf(lx) }
+  if pinned < 0 { return 0 }
+  if pinned == rexp || holeLitCopyOf(lx, rexp) >= 0 { return 0 }
+  if assignable(pinned, rexp) && assignable(rexp, pinned) { return 0 }
+  const cp = holeLitDeepCopy(lx)
+  if cp < 0 { return 0 }
+  nodeTyRecord(cp, rexp)
+  const ct = checkNodeHook(cp)
+  if ct < 0 { return 0 }
+  if holeLitAdopts(cp, ct, rexp) {
+    holeLitAdopt(cp, ct, rexp)
+  } else if ct == rexp || assignable(ct, rexp) && assignable(rexp, ct) {
+    nodeTySet(cp, rexp)
+    holeLitPinSet(cp, rexp)
+  } else {
+    return 0
+  }
+  holeLitCopyAdd(lx, cp)
+  0
+}
+
+// The copy of literal `lx` retyped at `ty`, or -1.
+function holeLitCopyOf(lx: i32, ty: i32): i32 {
+  for c in holeLitCopiesOf(lx) {
+    const pt = holeLitPinOf(c)
+    if pt == ty || pt >= 0 && assignable(pt, ty) && assignable(ty, pt) {
+      return c
+    }
+  }
+  -1
+}
+
+// A fresh copy of literal `ix`, every node of which is a literal; -1 when one is not.
+function holeLitDeepCopy(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const n = P.nodes[ix]
+  if n is NumLit { return mkNum(n.numText, n.pos) }
+  if n is StrLit { return mkStr(n.strText, n.pos) }
+  if n is BoolLit { return mkBool(n.boolVal, n.pos) }
+  if n is NullLit { return mkNull(n.nullKw, n.pos) }
+  if n is Unary {
+    if n.unOp != "-" { return -1 }
+    const ua = holeLitDeepCopy(n.unArg)
+    if ua < 0 { return -1 }
+    return mkUnary(n.unOp, ua, n.pos)
+  }
+  if n is Paren {
+    const pi = holeLitDeepCopy(n.parInner)
+    if pi < 0 { return -1 }
+    return mkParen(pi, n.pos)
+  }
+  if n is ArrayLit {
+    const es: i32[] = []
+    for e in n.arrElems {
+      const ce = holeLitDeepCopy(e)
+      if ce < 0 { return -1 }
+      es.push(ce)
+    }
+    return mkArrayLit(es, n.pos)
+  }
+  if n is ObjLit {
+    const fs: i32[] = []
+    for f in n.objFields {
+      const fi = P.nodes[f]
+      if !(fi is FieldInit) { return -1 }
+      const cv = holeLitDeepCopy(fi.fiValue)
+      if cv < 0 { return -1 }
+      fs.push(mkFieldInit(fi.fiName, cv, fi.pos))
+    }
+    return mkObjLit(fs, n.pos)
+  }
+  holeLitNotCopied()
+}
+
+// The answer `holeLitDeepCopy` gives a node of any other kind: it is no literal, so a
+// literal tree holding it is not copied and each caller keeps the shared one (-1).
+function holeLitNotCopied(): i32 { -1 }
 
 // True when record `wide` carries every field of `narrow` at the identical type, so a wider
 // literal already fits by width and needs no retyping (an extra field stays readable).

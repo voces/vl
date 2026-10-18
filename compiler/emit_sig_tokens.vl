@@ -112,7 +112,7 @@ import {
   repSlotOfTy,
 } from "./emit_rep"
 import {
-  mvSlotOfMapName,
+  mvSlotOfMapNameTys,
   nameIsRefArray,
   nulScalarListKind,
   repSigNulVariantTok,
@@ -174,7 +174,7 @@ import {
   nameIsParenSpanEnds,
   peelGroupParens,
 } from "./tyname"
-import { flattenVariantsInto } from "./tyquery"
+import { flattenVariantsInto, tyMapValOfHeld } from "./tyquery"
 
 // The niche twin of `mvListValKind` — the nullable `VKind` a `{[K]: T[] | null}` value binds,
 // or null when the value is not a list. Composed on `mvListValKind` so the element-kind to rep
@@ -565,7 +565,10 @@ export function nulStructRowOfNodeTy(exprIx: i32): i32 {
 // `cloParamTok` (which reads the AST), producing the identical token per valtype so a value
 // call over an annotated higher-order callee resolves the same interned `$fnsig`. "" for a
 // type outside the value-call ABI (the all-i32 arity fallback then applies).
-export function annParamKind(t: string) {
+export function annParamKind(t: string) { annParamKindTy(t, -1) }
+
+// `annParamKind` for a caller that also holds the parameter's arena type `ty`, or -1.
+function annParamKindTy(t: string, ty: i32) {
   if t == "i32" || t == "boolean" { return repSigTokOfKind("i32") }
   if t == "f64" { return repSigTokOfKind("f64") }
   if t == "i64" { return repSigTokOfKind("i64") }
@@ -593,13 +596,16 @@ export function annParamKind(t: string) {
   if vti >= 0 { return repSigVariantTok(vti) }
   // A ref-list param — the recursive dual of `annRetKind`'s ref-list result. Before the arrow
   // case so a closure-element array's nested `=>` isn't misread as a single closure.
-  if nameIsRefArray(t) {
-    const rs = rlSlotOfArrName(t)
-    if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
-  }
+  const rs = annRefListSlot(t)
+  if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
   // A map param, the annotation-string twin of `cloParamTok`'s map arm (D701 wired the AST
   // side) — without it a map-param lambda call keys "" against the closure's interned map sig.
-  if nameIsBareMap(t) { return repSigSlotTokOfKind("map", mvSlotOfMapName(t)) }
+  if nameIsBareMap(t) {
+    return repSigSlotTokOfKind(
+      "map",
+      mvSlotOfMapNameTys(t, -1, tyMapValOfHeld(ty)),
+    )
+  }
   // A function-type param is the shared closure fat-pointer, matching `cloParamTok` — without
   // it a higher-order closure param left its `$fnsig` un-interned (invalid wasm).
   if annArrowAt(t) >= 0 { return repSigTokOfKind("closure") }
@@ -624,7 +630,10 @@ function annNulListKind(t: string): VKind | null {
   nulScalarListKind(t)
 }
 
-function annRetKind(t: string) {
+function annRetKind(t: string) { annRetKindTy(t, -1) }
+
+// `annRetKind` for a caller that also holds the result's arena type `ty`, or -1.
+function annRetKindTy(t: string, ty: i32) {
   if t == "i32" || t == "boolean" { return ">" + repSigTokOfKind("i32") }
   if t == "f64" { return ">" + repSigTokOfKind("f64") }
   // A literal-union (or nullable litunion) result reps as the interned i32 atom, matching
@@ -647,14 +656,16 @@ function annRetKind(t: string) {
   if nsk != null { return ">" + repSigTokOfKind(nsk) }
   // A ref-list return, matching `cloRetKeySuffix` — before the closure case so a closure-
   // element array's nested `=>` isn't misread, keyed by the same `rlSlotByName` the AST side uses.
-  if nameIsRefArray(t) {
-    const rs = rlSlotOfArrName(t)
-    if rs >= 0 { return ">" + repSigSlotTokOfKind("reflist", rs) }
-  }
+  const rs = annRefListSlot(t)
+  if rs >= 0 { return ">" + repSigSlotTokOfKind("reflist", rs) }
   // A map return, matching `cloRetKeySuffix` — a map-member union also starts `{[` but is a
   // union box, excluded so it falls to the `>u` arm instead of mis-keying `>m`.
   if nameIsBareMap(t) {
-    return ">" + repSigSlotTokOfKind("map", mvSlotOfMapName(t))
+    return ">"
+      + repSigSlotTokOfKind(
+      "map",
+      mvSlotOfMapNameTys(t, -1, tyMapValOfHeld(ty)),
+    )
   }
   // A closure return, matching `cloRetKeySuffix` — the result often arrives parenthesized,
   // so peel one fully-wrapping `(...)` before testing for the arrow.
@@ -673,9 +684,17 @@ function annRetKind(t: string) {
   ""
 }
 
+// The ref-list slot of list spelling `t`: -1 when `t` is no ref list, -2 for one with no slot.
+function annRefListSlot(t: string): i32 {
+  if !nameIsRefArray(t) { return -1 }
+  const rs = rlSlotOfArrName(t)
+  if rs < 0 { return -2 }
+  rs
+}
+
 // The value-ABI kind a union or `X | null` spelling `t` reps as in a `$fnsig`, shared by the
-// result and parameter producers: `nulstr`, `nullist`, `nulstruct` or `nulvariant` (its row, or
-// folded variant row, in `slotOut[0]`), `nulclosure`, or `union` for the box. null for a
+// result and parameter producers: `nulstr`, `nullist`, `nulstruct`, `nulvariant` or
+// `nulreflist` (its slot in `slotOut[0]`), `nulclosure`, or `union` for the box. null for a
 // non-union and for a niche outside the ABI.
 function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   const parts: string[] = []
@@ -696,6 +715,13 @@ function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   // A nullable i32-backed list: the i32-list wrapper made nullable, slot-free, matching
   // `cloRetKeySuffix`'s `>o`; distinct-backing nullable lists fall through to null.
   if nameIsI32Array(nonNull[0]) { return "nullist" }
+  // A nullable ref list, keyed by its ref-list slot like `cloParamTok`'s niche arm (D5882).
+  const nrs = annRefListSlot(nonNull[0])
+  if nrs == -2 { return null }
+  if nrs >= 0 {
+    slotOut[0] = nrs
+    return "nulreflist"
+  }
   const msi = structIndexOfTypeName(nonNull[0])
   if msi >= 0 {
     slotOut[0] = msi
@@ -911,7 +937,7 @@ export function sigParamTokOfTy(pty: i32): string {
   if tyIsLitUnion(pty) { return repSigTokOfKind("i32") }
   const pnm = tyToEmitName(pty)
   if pnm == "" { return "" }
-  annParamKind(pnm)
+  annParamKindTy(pnm, pty)
 }
 
 // The result half of `sigKeyOfTy` (`>X`), arena first so a scalar or scalar-list result is
@@ -923,7 +949,7 @@ export function sigRetTokOfTy(rty: i32): string {
   if rs == "" { return "" }
   const rt = T.tys[rty]
   if rt is TyFunc { rs = "(" + rs + ")" }
-  annRetKind(rs)
+  annRetKindTy(rs, rty)
 }
 
 // Whether type `ty` may be something other than the i32 valtype: only a derived `i32` or

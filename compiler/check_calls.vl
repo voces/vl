@@ -32,6 +32,7 @@ import {
   dstBindLitTyParams,
   fsbNoteCall,
   genFnValueCstrs,
+  holeLambdaDefers,
   holeLambdaSeedTy,
   validateArgCstrs,
   validateBmCstrs,
@@ -66,6 +67,7 @@ import {
   rcwBdTp,
 } from "./check_covar_pins"
 import {
+  argCstr,
   compArgCstrOk,
   noteArgCstr,
   noteBinCstr,
@@ -86,6 +88,7 @@ import {
   holeArgViewErr,
   holeCastPinCheck,
   holeDemandOk,
+  holeFnDeliveryDemands,
   instGenFnHolePins,
   memberFloorErr,
   orderNamedCallArgs,
@@ -217,7 +220,9 @@ import {
 } from "./check_scopes"
 import {
   identNoteUse,
+  isValBindLambda,
   noteDeferredJoinNode,
+  noteValBindLambda,
   widenRetagGenArg,
   widenRetagGenArgSet,
 } from "./check_side_rows"
@@ -226,6 +231,7 @@ import {
   SUBST_HOLES,
   SUBST_NESTED,
   argPinPark,
+  cstrOwnedBy,
   nestParentOf,
   substNestDecl,
   substNestDeclSet,
@@ -1159,6 +1165,15 @@ function callFtyCheckArg(
     if cfn is Ident { owner = fnDeclIx[cfn.identName] ?? -1 }
     const hs = holeLambdaSeedTy(owner, params[i], bNames, bTys)
     if hs >= 0 { seedTy = hs }
+    // One the body hands on to a hole of the caller's is pinned with that hole (D5881).
+    const lx = parenPeelIx(args[i])
+    if (
+      hs < 0
+      && !isValBindLambda(lx)
+      && holeLambdaDefers(owner, params[i], bNames, bTys)
+    ) {
+      noteValBindLambda(lx)
+    }
   }
   seedExpected(args[i], seedTy)
   if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
@@ -1428,6 +1443,7 @@ function callFtyPinCstrs(
     dhArgNode,
   )
   validateUfcsCstrs(vNames, vTys, ix, cstrCallee, cstrWho)
+  pinHoleLambdaArgs(vNames, vTys, ix, cstrCallee)
   validateRcwPins(vNames, vTys, cstrCallee)
   if T.diags.length > wsVd { wsNoteInstErr(cstrCallee) }
   substNestModeSet(modeWas)
@@ -1455,6 +1471,84 @@ function callFtyPinCstrs(
     validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
   }
   retTy
+}
+
+// A lambda literal handed to a hole callee is pinned where the call binds that callee: its
+// parameter holes take the parameter types of the function type it is delivered at, and its
+// body's deferred demands are judged there, as a direct call through it would be (D5881).
+function pinHoleLambdaArgs(
+  vNames: string[],
+  vTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+) {
+  const done: string[] = []
+  const n0 = argCstr.at.length
+  let ci = 0
+  while ci < n0 {
+    if argCstr.form[ci] > 0 && cstrOwnedBy(argCstr.fn[ci], calleeFn) {
+      pinHoleLambdaArg(ci, vNames, vTys, ix, done)
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// `pinHoleLambdaArgs` for demand `ci`; `done` holds the lambda holes already judged.
+function pinHoleLambdaArg(
+  ci: i32,
+  vNames: string[],
+  vTys: i32[],
+  ix: i32,
+  done: string[],
+) {
+  const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
+  const rexp = substTyDeep(argCstr.exp[ci], vNames, vTys)
+  if rat < 0 || rexp < 0 || tyHasHole(rexp) { return 0 }
+  const lf = T.tys[rat]
+  const df = T.tys[rexp]
+  if !(lf is TyFunc) || !(df is TyFunc) { return 0 }
+  if lf.fnParamTypes.length != df.fnParamTypes.length { return 0 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  for v in vNames { nm.push(v) }
+  for t in vTys { ty.push(t) }
+  let fresh = 0
+  let pi = 0
+  while pi < lf.fnParamTypes.length {
+    const pv = T.tys[lf.fnParamTypes[pi]]
+    if pv is TyVar {
+      if tyIsHole(lf.fnParamTypes[pi]) && pv.tvName.slice(0, 3) == "?#L" {
+        if !strListHas(done, pv.tvName) {
+          done.push(pv.tvName)
+          fresh = fresh + 1
+        }
+        nm.push(pv.tvName)
+        ty.push(df.fnParamTypes[pi])
+      }
+    }
+    pi = pi + 1
+  }
+  if fresh == 0 { return 0 }
+  const d0 = T.diags.length
+  holeFnDeliveryDemands(rat, rexp, ix, "this lambda")
+  if T.diags.length > d0 { return 0 }
+  const none: string[] = []
+  const noNo: i32[] = []
+  const noNode: i32[] = []
+  const modeWas = substNestMode
+  substNestModeSet(SUBST_ALL)
+  validateBinCstrs(nm, ty, ix, CSTR_NODECL, "", none, noNo, noNode)
+  validatePrintCstrs(nm, ty, ix, CSTR_NODECL, "")
+  validateIsCstrs(nm, ty, ix, CSTR_NODECL, "")
+  validateArgCstrs(nm, ty, ix, CSTR_NODECL, none, noNode)
+  validateRetCstrs(nm, ty, ix, CSTR_NODECL, "")
+  validateLetCstrs(nm, ty, ix, CSTR_NODECL, "")
+  validateBmCstrs(nm, ty, ix, CSTR_NODECL, "")
+  validateMemCstrs(nm, ty, ix, CSTR_NODECL, "", none, noNo, noNode)
+  validateUfcsCstrs(nm, ty, ix, CSTR_NODECL, "")
+  substNestModeSet(modeWas)
+  0
 }
 
 // `p?.f(args)` — one guard over the receiver covers the whole call, so the callee and the
@@ -1576,6 +1670,14 @@ export function checkCallNode(n: Call, ix: i32) {
     if cfn is Ident { hWho = cfn.identName }
     let hj = 0
     while hj < hargs.length {
+      // A lambda handed to the hole types its un-annotated parameters as holes, as one bound
+      // to an un-annotated `const` does; the pin then instances it (D5881).
+      const hln = P.nodes[parenPeelIx(hargs[hj])]
+      if hln is FuncDecl {
+        if hln.fnName == "" && !isValBindLambda(parenPeelIx(hargs[hj])) {
+          noteValBindLambda(parenPeelIx(hargs[hj]))
+        }
+      }
       const hat = checkNodeHook(hargs[hj])
       // What the pinned function takes here, demanded of the argument at the pin (D3225).
       const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)

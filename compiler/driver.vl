@@ -254,6 +254,13 @@ import {
 // a char-quoted specifier adopt the next string literal in the file.
 import { importSpecCharMsg, isStmtKeyword, parseProgram } from "./parser"
 import { parseBankKeep, parseBankOpen, parseBankServe } from "./parse_bank"
+import {
+  ifaceHashArmed,
+  ihBegin,
+  ihEdge,
+  ihFinish,
+  ihModule,
+} from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
 // driver owns two obligations: the per-compile reset (the carrier is keyed by arena
 // index, so a reused index would read the previous program's answer), and three of
@@ -4943,14 +4950,42 @@ function modMergeRoots(roots: i32[]): i32 {
   mkProgram(allStmts, -1) // synthesized merged-module root (no source token)
 }
 
+// The interface hash's token side, per module, between the rewrite and the check (`iface_hash.vl`):
+// each module's token range, the locals its imports bind, and its import edges.
+function modIfaceBegin(roots: i32[], tokEnd: i32) {
+  ihBegin(modKeys)
+  let k = 0
+  while k < impMod.length {
+    const to = modIndexOfKey(impKey[k])
+    if to >= 0 { ihEdge(impMod[k], to) }
+    k = k + 1
+  }
+  let o = 0
+  while o < modOrder.length {
+    const m = modOrder[o]
+    let hi = tokEnd
+    if o + 1 < modLoadStart.length { hi = modLoadStart[o + 1] }
+    const visible: string[] = []
+    let i = 0
+    while i < impMod.length {
+      if impMod[i] == m && impLocal[i] != "" { visible.push(impLocal[i]) }
+      i = i + 1
+    }
+    ihModule(m, roots[o], modLoadStart[o], hi, visible)
+    o = o + 1
+  }
+}
+
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
 function modCompile(emit: i32): i32 {
   modIdAssignKeys()
+  if ifaceHashArmed() { ihBegin([]) }
   plusLinksClear()
   vcEtDrop()
   vcEpDrop()
   if modOrderGraph() != 0 { return 1 }
   const roots = modParseAll()
+  const parsedToks = P.toks.length
   if modOneShot != 0 { modCacheClear() }
   // The same stage-1 rule the single-source paths use, so a file does not lose
   // type feedback merely by gaining an `import` (see `vcParseBlocked`). The
@@ -4965,12 +5000,14 @@ function modCompile(emit: i32): i32 {
   // overlapping declarations share has no answer the checker could improve on.
   modCheckOverloads(roots)
   if vcParseBlocked() { return 1 }
+  if ifaceHashArmed() { modIfaceBegin(roots, parsedToks) }
   modResolveRootReExports()
   modAliasRootExports()
   const merged = modMergeRoots(roots)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   checkProgram(merged)
+  if ifaceHashArmed() { ihFinish() }
   checkMemSharedOrigin()
   plusLinksBank()
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
