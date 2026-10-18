@@ -472,6 +472,7 @@ import {
   unNameBound,
   unRowOfCanon,
   unionArmsOf,
+  unionArmsOfTy,
   unionSetAtomsOf,
   unionSetMemberCount,
 } from "./emit_union_registry"
@@ -981,17 +982,25 @@ function monoNameNarrowsFrom(narrow: string, wide: string) {
 
 // Whether `narrow` is a niche-repped `boolean | null` or `string | null` whose arms are all arms
 // of the union `wide`: the argument's read converts the box to that niche, so the pin is it (D2590).
-function monoNicheNarrowsFrom(narrow: string, wide: string): boolean {
+function monoNicheNarrowsFrom(
+  narrow: string,
+  narrowTy: i32,
+  wide: string,
+): boolean {
   const base = nullablePartOf(narrow)
   if base != "boolean" && base != "string" { return false }
-  monoArmsNarrowFrom(narrow, wide)
+  monoArmsNarrowFrom(narrow, narrowTy, wide)
 }
 
-// Whether every arm of the union `narrow` is an arm of the wider union `wide`.
-function monoArmsNarrowFrom(narrow: string, wide: string): boolean {
+// Whether every arm of the union `narrow` (arena type `narrowTy`) is an arm of the wider `wide`.
+function monoArmsNarrowFrom(
+  narrow: string,
+  narrowTy: i32,
+  wide: string,
+): boolean {
   if narrow == wide { return false }
   const na: string[] = []
-  unionArmsOf(narrow, na)
+  unionArmsOfTy(narrow, narrowTy, na)
   const wa: string[] = []
   unionArmsOf(wide, wa)
   if wa.length <= na.length { return false }
@@ -1034,13 +1043,13 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // that hazard, and a litunion argument's pin is claimed by the litunion rungs anyway.
   if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wide) }
   const n = tyToEmitName(nt)
-  if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, wide) {
+  if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, nt, wide) {
     if monoAnnPinName(n) == n { return n }
     return ""
   }
   // A union narrowed to a smaller union of its own arms, which no row may hold yet (D4965).
   // A type that is no union has one arm, which the membership test above already asked.
-  if monoTyIsUnionShaped(nt) && monoArmsNarrowFrom(n, wide) {
+  if monoTyIsUnionShaped(nt) && monoArmsNarrowFrom(n, nt, wide) {
     const nu = monoInstUnionAnnPin(n, nt)
     if nu != "" { return nu }
   }
@@ -13628,7 +13637,7 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 // The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
 // checker's binding, else the generic instanced at the one flow pin of its read past the call
 // (D5612). Delivered as a concrete function argument, so the callee can forward it on. "" when
-// none closes; `tyOut[0]` takes the pin's type.
+// none closes; `tyOut[0]` takes the pin's type. Two pins ask for a parameter per pin (D5611).
 function monoHoleGenFnPin(
   callIx: i32,
   pIx: i32,
@@ -13639,7 +13648,12 @@ function monoHoleGenFnPin(
   const bt = monoHoleGenFnTy(callIx, pIx, argIx)
   if bt >= 0 { return monoFnPinAt(argIx, ctx, bt, -1, tyOut) }
   const fl = monoHoleGenFnFlowDecl(argIx, ctx)
-  monoFnPinAt(argIx, ctx, monoHoleGenFnFlowTy(argIx, fl), fl[1], tyOut)
+  const ft = monoHoleGenFnFlowTy(argIx, fl)
+  if ft < 0 && fl[1] >= 0 {
+    const noPath: string[] = []
+    if monoDeclPathPins(fl, noPath).length > 1 { fsAsk(pIx) }
+  }
+  monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
 }
 
 // `monoHoleGenFnPin` for any other open function value: a binding holding an un-annotated
@@ -13887,7 +13901,10 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             }
             if an == "" {
               // A name handed through an identity call into a binding can take a slot per type.
-              if P.nodes[args[i]] is Ident { fsAsk(args[i]) }
+              if P.nodes[args[i]] is Ident {
+                fsAsk(args[i])
+                fsAsk(params[i])
+              }
               return emitFail(
                 "emitProgram: monomorphize: unsupported argument type for `"
                   + p.parName
@@ -14107,6 +14124,7 @@ function monoPinAnnotatedParam(
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
     if an2 == "" {
+      if ann == tp && P.nodes[args[i]] is Ident { fsAsk(params[i]) }
       return emitFail(
         "emitProgram: monomorphize: unsupported argument type for `"
           + p.parName

@@ -574,6 +574,57 @@ Source grew 16.8% and 37 modules became 199. Fuel grew 49.2%, so fuel per line g
 The baseline is rewritten with this section, from its own head: the three rows are filed, and
 the rest is source and the fuel unit.
 
+## Measured 2026-10-17 — the L2 self-compile fuel, 90.6G to 128.5G (D6130–D6131)
+
+The baseline was 90.566G at `502f8daa8` (#3917), and master `090237334` read 128.48G (+41.9%;
+the 1.5x trip line is 135.85G). Each sample is the current seed building that commit's
+`compiler/`, then that compiler building the same source under `$VL_FUEL=1`, from the
+checkout root. Both ends are the commit's own fixpoint. One in ten first-parent commits was
+sampled, and every interval that moved more than 1% was bisected to a single commit.
+
+| first-parent | PR | L2 fuel | step |
+| --- | --- | ---: | ---: |
+| `751efe183` | #3917 | 90.566G | |
+| `2132e4c87` | #3927 | 89.970G | |
+| `2d7b95f80` | #3936 | 89.575G | |
+| `455a5ff8f` | #3948 | 89.464G | |
+| `4e7ea1890` | #3957 | 90.142G | |
+| `c955c2299` | #3965 | 90.716G | |
+| `288197b82` | #3966 | 91.641G | +1.02% |
+| `0b84e8c2c` | #3968 | 91.241G | |
+| `eb4f5333a` | #3981 | 91.547G | |
+| `716003854` | #3996 | 92.478G | |
+| `3d78a8854` | #3994 | 92.252G | |
+| `bb4448de7` | #4001 | 115.165G | +24.84% |
+| `265b822b3` | #3999 | 115.438G | |
+| `99d9b571f` | #4011 | 115.360G | |
+| `f05cc1f67` | #4012 | 126.189G | +9.39% |
+| `9718d2888` | #4010 | 126.598G | |
+| `519a09fef` | #4017 | 127.870G | +1.00% |
+| `ba80b13d6` | #4030 | 127.672G | |
+| `70e8ea4d6` | #4039 | 128.557G | |
+| `090237334` | #4047 | 128.481G | |
+
+Source grew from 298,771 to 310,731 lines (+4.0%), and fuel grew 41.9%.
+
+- **(b) D6130, +24.8%.** #4001 (L5, D5593/D5650): the callee-first write-summary probe walks
+  the compiler's largest call cycle again at every probe, because an unsettled cycle caches
+  nothing and each body check drops the unsettled summaries. Without the probe and the
+  reorder, master reads 101.18G; checking every later callee first without the probe reads
+  96.48G. Three local cuts left the fuel where it was (127.76G, 128.60G, 128.66G), so the row
+  is filed and not fixed.
+- **(a) D6131, +9.4%.** #4012 (S5): a module's merge suffix became a stable 31-bit id, so
+  every `$m` name is longer. Most of the added samples are in `weScanShapes`, inside D6130's
+  probe, so the two rows interact.
+- **(a) #4017, +1.0%.** S5's parse image per module, about 750 compiler lines. No profile row
+  moves more than about 0.2 points.
+- **(a) #3966, +1.0%.** Eardstap EV-003 to EV-006, about 440 compiler lines. The cost is spread
+  over `objFieldType`, `tyHasTyVarAt` and `cwDeclSlotOf`, each under 0.4 points.
+- **Unattributed, +5.1%.** The merges after `090237334`, among them #4043 and #4053 (the S5
+  interface hash, computed on every check) and #4044 (L1), are not bisected. Master reads 134.99G at `1cadabfaa`, 0.6% under the 1.5x trip.
+- No other interval moved more than 1%. The baseline is rewritten at `1cadabfaa` (134.99G):
+  the rise is attributed row by row, and D6130 stays open to carry the avoidable part.
+
 ## Guards
 
 Four, and they fire at different moments. Profiling is what you do AFTER one of them does.
