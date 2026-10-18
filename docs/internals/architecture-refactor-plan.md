@@ -423,7 +423,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - D (`msSetOfKey` text leg): 111 / 18
   - E (text leg entered): 2,063 / 317
 
-  D is not zero, so the text leg stays. A trap build traced the 18. Five are a recursive alias's member set under `mvShapeOfValNameArmTyGo`, where the arena declines. Eight are else-branch subtractions (`narrowIsElse`, `pushIndexMapNullNarrow`, `indexCellCurSlot`) over a narrowing slot pushed without a set id. Five come from callers that hold only a spelling: `mvValNamesCompat` (3), `structUnionNullCmpName` and `printUnionPlanCode`. Most of C's 101 are `mvValNamesCompat`, which compares two spellings and has no type for either side. Render-parse holds at 99 / 311. Difftree identity: `15663 files · 10637 built · 0 differ · 0 uncompared`, fixpoint included. Seed 6,178,677 → 6,184,446 bytes (+5,769).
+  D is not zero, so the text leg stays. A trap build traced the 18. Five are a recursive alias's member set under `mvShapeOfValNameArmTyGo`, where the arena declines. Eight are else-branch subtractions (`narrowIsElse`, `pushIndexMapNullNarrow`, `indexCellCurSlot`) over a narrowing slot pushed without a set id. Five come from callers that hold only a spelling: `mvValNamesCompat` (3), `structUnionNullCmpName` and `printUnionPlanCode`. Most of C's 101 are `mvValNamesCompat`, which compares two spellings and has no type for either side. Render-parse holds at 99 / 311. Difftree identity: `15663 files · 10637 built · 0 differ · 0 uncompared`, fixpoint included. Seed 6,178,677 → 6,184,450 bytes (+5,773).
 
 ### L10 log
 
