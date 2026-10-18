@@ -118,6 +118,7 @@ const readSource = (
  * results forever.
  *
  * A `path` rung is re-read when its mtime changes; an `exec` rung is loaded once.
+ * `checkSkip` arms the module-check skip on every instance (`createWasmChecker`).
  */
 export const loadWasmChecker = (
   /**
@@ -129,6 +130,7 @@ export const loadWasmChecker = (
   log: (msg: string) => void,
   getStdDir?: () => string | undefined,
   onOrigin?: (origin: SeedOrigin | undefined) => void,
+  checkSkip = false,
 ): WasmChecker | undefined => {
   const ladder: SeedSource[] = typeof sources === "string"
     ? [{ kind: "path", label: "seed", path: sources, explicit: true }]
@@ -191,5 +193,6 @@ export const loadWasmChecker = (
     (read: ModuleReader) => withStd(read, getStdDir),
     vlRootFor,
     projectRootFor,
+    checkSkip,
   );
 };
