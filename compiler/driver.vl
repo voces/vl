@@ -151,6 +151,7 @@ import {
   uVarHeap,
   uVariants,
 } from "./emit_state"
+import { typeOrderOldOf } from "./emit_type_order"
 
 import { extCollect } from "./extents"
 import { nodePos, nodeStartTok, tokEndCol, tokEndLine } from "./fmt_util"
@@ -263,14 +264,19 @@ import {
   ifaceHashArm,
   ifaceHashArmed,
   ifaceHashOf,
+  ihAmbientCount,
+  ihAmbientScan,
   ihBegin,
   ihCarry,
   ihEdge,
   ihFinish,
+  ihImport,
   ihMask,
   ihModule,
   ihPlainBinding,
   ihPosHash,
+  ihReachFresh,
+  ihReachOf,
 } from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
 // driver owns two obligations: the per-compile reset (the carrier is keyed by arena
@@ -3232,11 +3238,12 @@ function emitFnSpanName(i: i32): string {
   ""
 }
 
-// The VL type wasm heap type `idx` of the module just emitted represents, or "" when it is
+// The VL type wasm heap type `written` of the module just emitted represents, or "" when it is
 // not one this names (a function type, a closure environment) or when several VL types share
 // it. A runtime rep shared by several VL types is named by its rep, never by one of its users.
-function emitTypeLabel(idx: i32): string {
-  if idx < 0 { return "" }
+function emitTypeLabel(written: i32): string {
+  if written < 0 { return "" }
+  const idx = typeOrderOldOf(written)
   const named = emitTypeLabelNamed(idx)
   if named != "" { return named }
   if uDeclared && idx == uBoxIdx { return "union box" }
@@ -4986,7 +4993,15 @@ function modIfaceBegin(roots: i32[], tokEnd: i32) {
   let k = 0
   while k < impMod.length {
     const to = modIndexOfKey(impKey[k])
-    if to >= 0 { ihEdge(impMod[k], to) }
+    if to >= 0 {
+      ihEdge(impMod[k], to)
+      if impName[k] == "" {
+        ihImport(impMod[k], impLocal[k], to, "")
+      } else {
+        const o = modExportOrigin(to, impName[k])
+        ihImport(impMod[k], impLocal[k], o.oMod, o.oName)
+      }
+    }
     k = k + 1
   }
   let o = 0
@@ -5009,6 +5024,7 @@ function modIfaceBegin(roots: i32[], tokEnd: i32) {
     ihModule(m, roots[o], modLoadStart[o], hi, visible, exported)
     o = o + 1
   }
+  ihAmbientScan()
 }
 
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
@@ -5056,7 +5072,7 @@ function modCompile(emit: i32): i32 {
   if keep.length > 0 && !skSettle(keep, roots, parsedToks) { return SK_RERUN }
   if banking {
     if keep.length == 0 { skGroup() }
-    skBankNow(parsedToks)
+    skBankNow(parsedToks, keep)
   }
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
@@ -5093,8 +5109,11 @@ const SK_IFACE = 6
 const SK_SPAN = 7
 const SK_STRAY = 8
 const SK_PASS = 9
+const SK_AMBIENT = 10
+const SK_FRESH = 11
+const SK_DECOR = 12
 const SK_RERUN = 99
-const SK_READINGS = 6
+const SK_READINGS = 9
 let skArmed = false
 let skMute = false
 let skValid = false
@@ -5104,6 +5123,8 @@ let skKeys: string[] = []
 let skKeyIx: {[string]: i32} = Map()
 let skSrcs: string[] = []
 let skHash: i32[] = []
+// Each (importer, origin) pair's reach (`ihReachOf`), keyed by both module keys.
+let skReach: {[string]: i32} = Map()
 let skMask = 0
 let skPlus: {[i32]: i32}[] = []
 let skStrIdx: {[i32]: i32}[] = []
@@ -5129,6 +5150,7 @@ type SkBank = {
   bKeyIx: {[string]: i32},
   bSrcs: string[],
   bHash: i32[],
+  bReach: {[string]: i32},
   bMask: i32,
   bPlus: {[i32]: i32}[],
   bStrIdx: {[i32]: i32}[],
@@ -5169,6 +5191,7 @@ function skSelect(): i32 {
         bKeyIx: skKeyIx,
         bSrcs: skSrcs,
         bHash: skHash,
+        bReach: skReach,
         bMask: skMask,
         bPlus: skPlus,
         bStrIdx: skStrIdx,
@@ -5194,6 +5217,7 @@ function skSelect(): i32 {
       skKeyIx = b.bKeyIx
       skSrcs = b.bSrcs
       skHash = b.bHash
+      skReach = b.bReach
       skMask = b.bMask
       skPlus = b.bPlus
       skStrIdx = b.bStrIdx
@@ -5380,25 +5404,98 @@ function skPlan(roots: i32[]): boolean[] {
   inS
 }
 
-// After a check of S alone: keep it only when every import a served module makes into S kept
-// its deep hash, every fresh diagnostic lies in S, and no served diagnostic cites a moved token.
-// Then `T.diags` becomes the module-ordered merge of the fresh and the banked diagnostics.
+function skDecline(why: i32): boolean {
+  skReason = why
+  false
+}
+
+// Each (importer, origin) pair the import table makes, flattened: an import of a re-exported
+// name pairs with the module declaring it, a namespace import with the module it names.
+function skPairs(): i32[] {
+  const out: i32[] = []
+  const seen: {[string]: boolean} = Map()
+  let k = 0
+  while k < impMod.length {
+    const d = modIndexOfKey(impKey[k])
+    if d >= 0 {
+      let o = d
+      if impName[k] != "" { o = modExportOrigin(d, impName[k]).oMod }
+      const key = modKeys[impMod[k]] + "\n" + modKeys[o]
+      if !seen.has(key) {
+        seen[key] = true
+        out.push(impMod[k])
+        out.push(o)
+      }
+    }
+    k = k + 1
+  }
+  out
+}
+
+// After a check of S alone: keep it only when no module outside S holds a statement S's
+// check may read unimported, every served importer's reach into S is unchanged
+// (`ihReachOf`), every fresh diagnostic lies in S, and no served diagnostic cites a moved
+// token. Then `T.diags` becomes the module-ordered merge of the fresh and the banked ones.
 function skSettle(inS: boolean[], roots: i32[], tokEnd: i32): boolean {
   if jwSiteNode.length > 0 {
     skReason = SK_PASS
     return false
   }
-  let k = 0
-  while k < impMod.length {
-    const d = modIndexOfKey(impKey[k])
-    if !inS[impMod[k]] && d >= 0 && inS[d] {
-      const b = skKeyIx[modKeys[d]] ?? -1
-      if b < 0 || ifaceHashOf(d, 1) != skHash[b * SK_READINGS + 1] {
-        skReason = SK_IFACE
-        return false
+  // A module outside S may hold what the check of S reads without importing it, and S what
+  // theirs does: the first declines, the second unless S's such statements kept their tokens.
+  let anyS = false
+  for x in inS {
+    if x { anyS = true }
+  }
+  let sd = 0
+  while sd < modKeys.length {
+    const b = skKeyIx[modKeys[sd]] ?? -1
+    const base = b * SK_READINGS
+    if b < 0 { return skDecline(SK_IFACE) }
+    if anyS && !inS[sd] && ihAmbientCount(sd) > 0 {
+      return skDecline(SK_AMBIENT)
+    }
+    if inS[sd] && ifaceHashOf(sd, 6) != skHash[base + 6] {
+      return skDecline(SK_AMBIENT)
+    }
+    if !inS[sd] && ifaceHashOf(sd, 8) != skHash[base + 8] {
+      return skDecline(SK_IFACE)
+    }
+    sd = sd + 1
+  }
+  // Each served importer reads of an origin in S only what its reach holds.
+  const pairs = skPairs()
+  let p = 0
+  while p + 1 < pairs.length {
+    const i = pairs[p]
+    const o = pairs[p + 1]
+    if !inS[i] && inS[o] {
+      const now = ihReachOf(i, o)
+      if ihReachFresh() { return skDecline(SK_FRESH) }
+      const was = skReach[modKeys[i] + "\n" + modKeys[o]] ?? 0
+      if !skReach.has(modKeys[i] + "\n" + modKeys[o]) || was != now {
+        return skDecline(SK_IFACE)
       }
     }
-    k = k + 1
+    p = p + 2
+  }
+  // A served diagnostic may name S's declarations, so S keeps every declaration's spelling.
+  let banked = false
+  let q0 = 0
+  while q0 < skDgMod.length {
+    const m = modIndexOfKey(skKeys[skDgMod[q0]])
+    if m >= 0 && !inS[m] { banked = true }
+    q0 = q0 + 1
+  }
+  if banked {
+    sd = 0
+    while sd < modKeys.length {
+      const b = skKeyIx[modKeys[sd]] ?? -1
+      if inS[sd] && ifaceHashOf(sd, 7) != skHash[b * SK_READINGS + 7] {
+        return skDecline(SK_DECOR)
+      }
+      sd = sd + 1
+    }
   }
   // An inferred binding's type joins its uses in every module; with the hash kept, the served
   // modules' uses fit it again, unless the type spells a function or elides part of itself.
@@ -5605,8 +5702,9 @@ function isWordCode(c: i32): boolean {
 }
 
 // Bank this check for the next one, or leave nothing banked when a diagnostic has no module,
-// or ends outside it, or the check had a pass the bank cannot replay.
-function skBankNow(tokEnd: i32): i32 {
+// or ends outside it, or the check had a pass the bank cannot replay. `keep` is S, or empty for
+// a whole check.
+function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
   skValid = false
   if P.diags.length > 0 || jwSiteNode.length > 0 { return 0 }
   const pos = skPosOf()
@@ -5676,6 +5774,26 @@ function skBankNow(tokEnd: i32): i32 {
     }
     m = m + 1
   }
+  // A served origin's reaches are carried: the check did not read it, and its tokens held. An
+  // importer holding an ambient statement is never served beside S, so its reaches are not kept.
+  const reach: {[string]: i32} = Map()
+  const pairs = skPairs()
+  let p = 0
+  while p + 1 < pairs.length {
+    const key = modKeys[pairs[p]] + "\n" + modKeys[pairs[p + 1]]
+    if ihAmbientCount(pairs[p]) > 0 {
+      p = p + 2
+      continue
+    }
+    if keep.length == 0 || keep[pairs[p + 1]] {
+      reach[key] = ihReachOf(pairs[p], pairs[p + 1])
+    } else {
+      const held = skReach[key]
+      if held != null { reach[key] = held }
+    }
+    p = p + 2
+  }
+  skReach = reach
   skKeyIx = ix
   skEntry = modKeys[0]
   skMask = ihMask()
