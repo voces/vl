@@ -265,6 +265,7 @@ import {
   ifaceHashArmed,
   ifaceHashOf,
   ihAmbientFv,
+  ihAmbientFvArena,
   ihAmbientMeets,
   ihAmbientScan,
   ihBegin,
@@ -278,6 +279,7 @@ import {
   ihPosHash,
   ihReachFresh,
   ihReachOf,
+  ihTokDigests,
 } from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
 // driver owns two obligations: the per-compile reset (the carrier is keyed by arena
@@ -5026,6 +5028,7 @@ function modIfaceBegin(roots: i32[], tokEnd: i32) {
     o = o + 1
   }
   ihAmbientScan()
+  ihTokDigests()
 }
 
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
@@ -5035,6 +5038,7 @@ function modCompile(emit: i32): i32 {
     skServed = 0
     skAmbMet = 0
     skAmbMoved = 0
+    skStage = -1
   }
   modIdAssignKeys()
   if ifaceHashArmed() { ihBegin([]) }
@@ -5064,7 +5068,7 @@ function modCompile(emit: i32): i32 {
   const banking = emit == 0 && skArmed && ifaceHashArmed()
   let keep: boolean[] = []
   if banking { skSelect() }
-  if banking && !skMute { keep = skPlan(roots) }
+  if banking && !skMute { keep = skPlan(roots, parsedToks) }
   const merged = modMergeRoots(roots, keep)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
@@ -5072,7 +5076,7 @@ function modCompile(emit: i32): i32 {
   if ifaceHashArmed() { ihFinish() }
   checkMemSharedOrigin()
   plusLinksBank()
-  if keep.length > 0 && !skSettle(keep, roots, parsedToks) { return SK_RERUN }
+  if keep.length > 0 && !skSettle(keep, roots) { return SK_RERUN }
   if banking {
     if keep.length == 0 { skGroup() }
     skBankNow(parsedToks, keep)
@@ -5124,6 +5128,7 @@ let skReason = SK_NO_BANK
 let skServed = 0
 let skAmbMet = 0
 let skAmbMoved = 0
+let skStage = -1
 let skKeys: string[] = []
 let skKeyIx: {[string]: i32} = Map()
 let skSrcs: string[] = []
@@ -5260,12 +5265,14 @@ export function diagOrderKey(i: i32): i32 {
 
 // The last module check: `which` 0 why it checked what it did (0 when it served some module),
 // 1 how many modules it served from the bank, 2 how many served modules hold an ambient statement
-// S's check could read, 3 how many S modules' ambient statements moved.
+// S's check could read, 3 how many S modules' ambient statements moved, 4 whether the guards
+// decided before the check of S (0) or after it (1), or -1 when neither ran.
 export function checkSkipStat(which: i32): i32 {
   if which == 0 { return skReason }
   if which == 1 { return skServed }
   if which == 2 { return skAmbMet }
   if which == 3 { return skAmbMoved }
+  if which == 4 { return skStage }
   -1
 }
 
@@ -5290,15 +5297,25 @@ function skPosOf(): i32[] {
   pos
 }
 
-// Whether every parameter is annotated and none has a default, which a caller's arguments
-// could otherwise pin or clone.
+// Whether every parameter is annotated and any default is a scalar literal: the declaration's
+// check alone types such a default, and a caller reads only its parameter's annotation.
 function skParamsClosed(ps: i32[]): boolean {
   for p in ps {
     const n = P.nodes[p]
     if !(n is Param) { return false }
-    if n.parType < 0 || n.parDefault >= 0 { return false }
+    if n.parType < 0 { return false }
+    if n.parDefault >= 0 && !skSignedLit(n.parDefault) { return false }
   }
   true
+}
+
+// Whether node `e` is a scalar literal, or a number literal under a sign.
+function skSignedLit(e: i32): boolean {
+  if skScalarLit(e) { return true }
+  if e < 0 || e >= P.nodes.length { return false }
+  const n = P.nodes[e]
+  if !(n is Unary) || (n.unOp != "-" && n.unOp != "+") { return false }
+  n.unArg >= 0 && n.unArg < P.nodes.length && P.nodes[n.unArg] is NumLit
 }
 
 // Whether node `e` is a number, string, character or boolean literal.
@@ -5311,7 +5328,7 @@ function skScalarLit(e: i32): boolean {
 // Whether the declaration `merged` of the module rooted at `root` checks the same whatever
 // imports it, given its hash kept: SK_SHUT for a type, an extern, an annotated or scalar-literal
 // binding, or one fully annotated non-generic function; SK_IF_PLAIN for any other binding;
-// SK_OPEN for an overload, a generic, or an unannotated or defaulted parameter.
+// SK_OPEN for an overload, a generic, or a parameter `skParamsClosed` does not close.
 function skClosed(root: i32, merged: string): i32 {
   let fns = 0
   let typed = false
@@ -5344,7 +5361,7 @@ const SK_IF_PLAIN = 2
 
 // The modules this check must merge, by module index, or none for a whole check: S is every
 // module whose source the bank does not hold, closed over its imports. `skReason` says why.
-function skPlan(roots: i32[]): boolean[] {
+function skPlan(roots: i32[], tokEnd: i32): boolean[] {
   const whole: boolean[] = []
   if !skValid || skMask != ihMask() || fsAsked() || fsModeOf() != FS_COMPILE {
     return whole
@@ -5409,7 +5426,75 @@ function skPlan(roots: i32[]): boolean[] {
     }
     k = k + 1
   }
+  if !skEarly(inS, tokEnd) { return whole }
   inS
+}
+
+// Before the check of S, the guards S's tokens decide, cheapest first, so such a decline costs
+// one whole check: every served module's imports resolve as banked and S's ambient statements
+// kept their tokens; no served module holds an ambient statement S's tokens meet; and, when a
+// served module holds a banked diagnostic, S kept every declaration's spelling and token position.
+function skEarly(inS: boolean[], tokEnd: i32): boolean {
+  skStage = 0
+  let anyS = false
+  for x in inS {
+    if x { anyS = true }
+  }
+  let resolved = true
+  let sd = 0
+  while sd < modKeys.length {
+    const base = (skKeyIx[modKeys[sd]] ?? -1) * SK_READINGS
+    if base < 0 { return skDecline(SK_IFACE) }
+    if inS[sd] && ifaceHashOf(sd, 6) != skHash[base + 6] {
+      skAmbMoved = skAmbMoved + 1
+    }
+    if !inS[sd] && ifaceHashOf(sd, 8) != skHash[base + 8] { resolved = false }
+    sd = sd + 1
+  }
+  if skAmbMoved > 0 { return skDecline(SK_AMBIENT) }
+  if !resolved { return skDecline(SK_IFACE) }
+  // A served diagnostic may name S's declarations, and cite S's positions unless relocatable.
+  let banked = false
+  let cites = false
+  let q = 0
+  while q < skDgMod.length {
+    const m = modIndexOfKey(skKeys[skDgMod[q]])
+    if m >= 0 && !inS[m] {
+      banked = true
+      if !skDgReloc[q] { cites = true }
+    }
+    q = q + 1
+  }
+  if banked {
+    sd = 0
+    while sd < modKeys.length {
+      const b = skKeyIx[modKeys[sd]] ?? -1
+      if inS[sd] && ifaceHashOf(sd, 7) != skHash[b * SK_READINGS + 7] {
+        return skDecline(SK_DECOR)
+      }
+      sd = sd + 1
+    }
+  }
+  if anyS {
+    ihAmbientFv(inS)
+    const meets = ihAmbientMeets(false)
+    if skAmbCount(inS, meets) > 0 { return skDecline(SK_AMBIENT) }
+  }
+  if cites {
+    const pos = skPosOf()
+    sd = 0
+    while sd < modKeys.length {
+      const b = skKeyIx[modKeys[sd]] ?? -1
+      if (
+        inS[sd]
+        && (b >= skPosH.length || skPosHashOf(pos[sd], tokEnd) != skPosH[b])
+      ) {
+        return skDecline(SK_SPAN)
+      }
+      sd = sd + 1
+    }
+  }
+  true
 }
 
 function skDecline(why: i32): boolean {
@@ -5440,54 +5525,48 @@ function skPairs(): i32[] {
   out
 }
 
-// Counts, for `checkSkipStat`, the modules each ambient guard in `skSettle` would decline on.
-function skAmbCount(inS: boolean[], anyS: boolean, meets: boolean[]): void {
+// The served modules `meets` says hold an ambient statement the check of S may read, which
+// `checkSkipStat` reports.
+function skAmbCount(inS: boolean[], meets: boolean[]): i32 {
+  let n = 0
   let sd = 0
-  while sd < modKeys.length && sd < inS.length {
-    const b = skKeyIx[modKeys[sd]] ?? -1
-    if b >= 0 && anyS && !inS[sd] && sd < meets.length && meets[sd] {
-      skAmbMet = skAmbMet + 1
-    }
-    if b >= 0 && inS[sd] && ifaceHashOf(sd, 6) != skHash[b * SK_READINGS + 6] {
-      skAmbMoved = skAmbMoved + 1
-    }
+  while sd < modKeys.length && sd < inS.length && sd < meets.length {
+    if !inS[sd] && meets[sd] { n = n + 1 }
     sd = sd + 1
   }
+  skAmbMet = n
+  n
 }
 
-// After a check of S alone: keep it only when no module outside S holds a statement S's
-// check may read unimported, every served importer's reach into S is unchanged
-// (`ihReachOf`), every fresh diagnostic lies in S, and no served diagnostic cites a moved
-// token. Then `T.diags` becomes the module-ordered merge of the fresh and the banked ones.
-function skSettle(inS: boolean[], roots: i32[], tokEnd: i32): boolean {
-  if jwSiteNode.length > 0 {
-    skReason = SK_PASS
-    return false
+// After a check of S alone, the guards only the check decides, cheapest first: pass, stray,
+// demand, R1 against the arena and rendered diagnostics, then each served importer's reach
+// (`ihReachOf`). Then `T.diags` becomes the module-ordered merge of the fresh and banked ones.
+function skSettle(inS: boolean[], roots: i32[]): boolean {
+  skStage = 1
+  if jwSiteNode.length > 0 { return skDecline(SK_PASS) }
+  const freshMod: i32[] = []
+  let j = 0
+  while j < T.diags.length {
+    const m = skDiagMod(j)
+    if m < 0 || !inS[m] { return skDecline(SK_STRAY) }
+    freshMod.push(m)
+    j = j + 1
   }
-  // A module outside S may hold what the check of S reads without importing it, and S what
-  // theirs does: the first declines, the second unless S's such statements kept their tokens.
+  // An inferred binding's type joins its uses in every module; with the hash kept, the served
+  // modules' uses fit it again, unless the type spells a function or elides part of itself.
+  for name in skInferred {
+    if !ihPlainBinding(name) { return skDecline(SK_DEMAND) }
+  }
+  // The words `skEarly` read, with the arena's field names; a diagnostic renders any type.
   let anyS = false
   for x in inS {
     if x { anyS = true }
   }
-  ihAmbientFv(inS)
-  const meets = ihAmbientMeets(T.diags.length > 0)
-  skAmbCount(inS, anyS, meets)
-  let sd = 0
-  while sd < modKeys.length {
-    const b = skKeyIx[modKeys[sd]] ?? -1
-    const base = b * SK_READINGS
-    if b < 0 { return skDecline(SK_IFACE) }
-    if anyS && !inS[sd] && sd < meets.length && meets[sd] {
+  if anyS {
+    ihAmbientFvArena()
+    if skAmbCount(inS, ihAmbientMeets(T.diags.length > 0)) > 0 {
       return skDecline(SK_AMBIENT)
     }
-    if inS[sd] && ifaceHashOf(sd, 6) != skHash[base + 6] {
-      return skDecline(SK_AMBIENT)
-    }
-    if !inS[sd] && ifaceHashOf(sd, 8) != skHash[base + 8] {
-      return skDecline(SK_IFACE)
-    }
-    sd = sd + 1
   }
   // Each served importer reads of an origin in S only what its reach holds.
   const pairs = skPairs()
@@ -5498,74 +5577,14 @@ function skSettle(inS: boolean[], roots: i32[], tokEnd: i32): boolean {
     if !inS[i] && inS[o] {
       const now = ihReachOf(i, o)
       if ihReachFresh() { return skDecline(SK_FRESH) }
-      const was = skReach[modKeys[i] + "\n" + modKeys[o]] ?? 0
-      if !skReach.has(modKeys[i] + "\n" + modKeys[o]) || was != now {
+      const key = modKeys[i] + "\n" + modKeys[o]
+      if !skReach.has(key) || (skReach[key] ?? 0) != now {
         return skDecline(SK_IFACE)
       }
     }
     p = p + 2
   }
-  // A served diagnostic may name S's declarations, so S keeps every declaration's spelling.
-  let banked = false
-  let q0 = 0
-  while q0 < skDgMod.length {
-    const m = modIndexOfKey(skKeys[skDgMod[q0]])
-    if m >= 0 && !inS[m] { banked = true }
-    q0 = q0 + 1
-  }
-  if banked {
-    sd = 0
-    while sd < modKeys.length {
-      const b = skKeyIx[modKeys[sd]] ?? -1
-      if inS[sd] && ifaceHashOf(sd, 7) != skHash[b * SK_READINGS + 7] {
-        return skDecline(SK_DECOR)
-      }
-      sd = sd + 1
-    }
-  }
-  // An inferred binding's type joins its uses in every module; with the hash kept, the served
-  // modules' uses fit it again, unless the type spells a function or elides part of itself.
-  for name in skInferred {
-    if !ihPlainBinding(name) {
-      skReason = SK_DEMAND
-      return false
-    }
-  }
-  const freshMod: i32[] = []
-  let j = 0
-  while j < T.diags.length {
-    const m = skDiagMod(j)
-    if m < 0 || !inS[m] {
-      skReason = SK_STRAY
-      return false
-    }
-    freshMod.push(m)
-    j = j + 1
-  }
-  // A served diagnostic that may cite another module's position holds only while every
-  // token of S kept its line and column.
   const pos = skPosOf()
-  let cites = false
-  let q = 0
-  while q < skDgMod.length {
-    const m = modIndexOfKey(skKeys[skDgMod[q]])
-    if m >= 0 && !inS[m] && !skDgReloc[q] { cites = true }
-    q = q + 1
-  }
-  if cites {
-    let d = 0
-    while d < modKeys.length {
-      const b = skKeyIx[modKeys[d]] ?? -1
-      if (
-        inS[d]
-        && (b < 0 || b >= skPosH.length || skPosHashOf(pos[d], tokEnd) != skPosH[b])
-      ) {
-        skReason = SK_SPAN
-        return false
-      }
-      d = d + 1
-    }
-  }
   const fresh = T.diags
   const out: TDiag[] = []
   for m in modOrder {
@@ -5605,8 +5624,7 @@ function skSettle(inS: boolean[], roots: i32[], tokEnd: i32): boolean {
   while j < T.diags.length {
     const m = skDiagMod(j)
     if m < 0 || (!inS[m] && T.diags[j].tat != roots[pos[m]]) {
-      skReason = SK_STRAY
-      return false
+      return skDecline(SK_STRAY)
     }
     j = j + 1
   }

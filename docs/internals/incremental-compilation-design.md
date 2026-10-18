@@ -1513,6 +1513,132 @@ The diderven rows are not the same 30 commits: its history moved on between the 
     Through step 7 the same decline came at the same point.
   - A served diderven check takes 83–160 ms against 294–379 ms unarmed.
 
+**S5 step 9: guards that S's tokens decide run before the check of S, and FIELDS match
+exactly** (`skEarly` and `skSettle` in `compiler/driver.vl`; `ihAmbientFv`,
+`ihAmbientFvArena`, `ihAmbientMeets` and `ihBuiltinHead` in `compiler/iface_hash.vl`).
+
+*Decline cost.* Through step 8 every guard ran after the check of S, so a decline paid for
+two checks. The guards now split by what decides them, and each half runs cheapest first.
+- **Stage 0** (`skEarly`, at the end of `skPlan`, before any merge) decides on tokens and
+  bank readings alone:
+  - every served module's imports still resolve as banked (`interface`);
+  - no S module's ambient digest moved (F2, `ambient`);
+  - with a banked served diagnostic, S kept every declaration's spelling (`decor`);
+  - no served ambient statement meets S's tokens (R1, `ambient`);
+  - with a banked diagnostic that cites a position, S kept its token positions (`span`).
+- **Stage 1** (`skSettle`) keeps only what the check of S decides:
+  - no un-replayable pass ran (`pass`);
+  - every fresh diagnostic lies in S (`stray`);
+  - S's inferred bindings that a served module imports have a plain type (`demand`);
+  - no served ambient statement meets the arena's record sets, and no fresh diagnostic
+    renders (R1);
+  - every served importer's reach into S is unchanged (`fresh`, `interface`).
+- A stage-0 decline therefore costs one whole check plus the token scans.
+  `checkSkipStat(4)` says which stage decided.
+
+*A scalar-literal default is closed.* `skParamsClosed` now accepts an annotated parameter
+whose default is a number, string, character or boolean literal, or a number literal under a
+sign. The argument: a caller's argument is checked against the parameter's annotation, and
+the default is typed by the declaration's own check. So no call site can reach the default.
+A default that is any other expression still reads as `SK_OPEN`, because its type comes from
+the expression.
+
+*FIELDS rows match exactly.* Step 8 met a FIELDS row when each of its words was somewhere in
+FV(S). Adoption tests set equality (`recBuiltAtDeclared` → `objFieldNameSetsEq`). So a row
+can be adopted only by a record level whose field-name set equals the row.
+- S's record levels come from two places:
+  - before the check, each `ObjLit` in S's statements gives the set of its field names;
+  - after the check, each arena `TyObj` gives its `objFieldNames` (stage 1, mask 33554432).
+- A FIELDS row meets when its set (an order-free key, `ihSetKey`) is one of S's sets.
+- Two cases have no exact key, so they fall back to the conservative reading:
+  - an S set with a repeated name meets every FIELDS row;
+  - a FIELDS row with a repeated name is WILD.
+- NAME and RECV rows keep the step-8 subset test.
+
+*Built-in heads.* `Map<…>` and `Set<…>` name built-ins, which have no FIELDS rows, so a
+spelling that applies them is not a generic-head key. That holds only where no graph module
+declares the base name: by the Q11 ruling a declaration shadows the built-in, and then the
+head is keyed like any other generic head (`ihBuiltinHead`).
+
+*`fresh` is kept.* `fresh` declines when a served importer reaches an S function whose return
+type is inferred and not a scalar. Serving it would need the claim that a served call site
+never changes the builder's own check, and that claim is false:
+```text
+// lib.vl
+type W = { f: f64 }
+export function mk() { { f: 4 } }
+export function usew(): void { const w: W = mk(); print(w.f / 8) }
+// main.vl
+import { mk } from "./lib"
+print(mk().f)
+```
+- lib alone checks clean. With main's call, lib's `const w: W = mk()` refuses: `{f: i32}` is
+  not `W`, because only a fresh record widens.
+- The same refusal follows from `const z: i32 = mk().f`, a field write, or `tk(mk())` in main.
+  Importing `mk` without calling it changes nothing.
+- The S-only check reproduces the refusal today. The suite case "a served call is a second
+  site of a fresh builder" serves correctly with `fresh` dropped (65536). It does because the
+  cross-site pass (`recOwnSrc`, `recFreshOriginDecl` and `cwIxBuild` in
+  `compiler/check_program.vl`) reads the shared parse arena, and that arena still holds the
+  served modules' calls. This is how the pass is built, not a contract. A pass that walks only
+  merged modules would make dropping `fresh` unsound without any change to the skip.
+- So `fresh` stays until that pass reads a banked per-site summary.
+
+*Mutation witnesses.* The step-8 table stands, with two rows added:
+
+| mask | channel dropped | witness |
+| --- | --- | --- |
+| 67108864 | built-in head shadowing | a lib application of a declared Map spells main's literal record |
+| 16777216 | a reach row's signature tokens | a defaulted param loses its default (the checked type renders the same either way) |
+| 33554432 | arena record sets | none: the token sets already hold every literal's set, so it is kept as a guard only |
+
+*Differential suite*: 66 edits. 23 must serve, 40 must decline, and 3 may do either (step 8:
+20, 38 and 3). The changed cases are:
+- must decline:
+  - the declared-`Map` application above (`ambient`);
+  - "a defaulted param loses its default" (`interface`);
+  - "a const-defaulted param body edit" (`demand`: a default that names a binding stays open).
+- must serve:
+  - "main's private record spells lib's words but no lib record's field set";
+  - "main spells the built-in Map";
+  - "defaulted param body edit", which was a must-decline case, now with negative-number,
+    string and boolean defaults too.
+- Seven `interface` cases (six existing and the new one) now name `decor` for their variant
+  where main holds errors. With a banked served diagnostic, stage 0 decides the spelling
+  guard before the check that would find the interface move.
+
+On step 8's seed all three must-serve cases declined: two `ambient`, one `demand`.
+
+*Replays.* All three runs are 0 unsound. A ratio is armed time over unarmed time, summed over
+the commits that decline a guard (not `all` or `graph`).
+
+| graph | step 8 | this step |
+| --- | --- | --- |
+| `compiler/entry.vl`, 30 commits to 2b59a1416 | 27 ambient, 2 all, 1 graph | 19 ambient, 8 fresh, 2 all, 1 graph |
+| decline ratio | 1.84 | 1.41 (stage 0: 1.23 over 19; stage 1: 1.84 over 8) |
+| diderven `src/game.vl`, 30 commits (read-only copy) | 3 served, 14 demand, 10 graph, 3 all | same |
+| decline ratio | 1.17 | 1.23 |
+
+- **On the compiler**, every remaining stage-0 R1 meet is one exact FIELDS row: `{ b }` in
+  `arrLitDataBuild` (`compiler/wasmEmit.vl`, `const parts: { b: u8[] }[]`). S's own `{ b: … }`
+  literals (`ByteChunk` in `emit_state.vl`, and its builders in `emit_bytes.vl` and
+  `emit_base.vl`) have that set, so it is a real adoption candidate, not an over-match. The
+  other `ambient` declines are F2 (`moved`). The 8 that FIELDS-exact clears now decline
+  `fresh` at stage 1. That is why the ratio is above the 1.20 that the stage split alone, with
+  step 8's subset test, gave on the same 27 commits.
+- **On diderven** this window's 14 `demand` declines all come from one import:
+  `indexOf`, a generic in `std:array`. It is in S only by the downward closure, and its source
+  is unchanged. The scalar-literal default narrowing therefore moves none of them; the
+  defaulted parameters step 8 named come from an earlier window.
+- **Next**: serve a generic whose origin module is unchanged and only closed over (diderven's
+  `demand`), and give the cross-site pass a banked summary so `fresh` can be argued.
+
+*Cost.*
+- The seed is 6,242,706 bytes, against 6,240,573 for master's source at its own fixpoint
+  (+2,133, +0.03%).
+- L2 self-compile guest fuel: master 107,577,600,553; this branch 107,732,745,159 (+0.14%).
+- The unarmed path runs none of the new code.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.
