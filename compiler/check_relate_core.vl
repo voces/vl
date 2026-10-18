@@ -3834,24 +3834,79 @@ function holeCallNodeTy(
 // under the call's bindings, so two calls at different types each read their own (D6521); -1
 // when `f` is no open signature of a declared generic, `c` is no call of it, or an argument stays open.
 function holeCallRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
-  if c < 0 || c >= P.nodes.length || f < 0 || f >= T.tys.length { return -1 }
+  if f < 0 || f >= T.tys.length { return -1 }
   const ft = T.tys[f]
   if !(ft is TyFunc) || !tyHasTyVar(ft.fnRet) { return -1 }
   if !tyIsForeignGenericSig(f) { return -1 }
-  const n = P.nodes[c]
-  if !(n is Call) || n.callArgs.length != ft.fnParamTypes.length { return -1 }
   const gNames: string[] = []
   const gTys: i32[] = []
-  let j = 0
-  while j < n.callArgs.length {
-    const at = substTyDeep(nodeTyOf(n.callArgs[j]), bNames, bTys)
-    if at < 0 || tyHasTyVar(at) { return -1 }
-    bindGenWalk(ft.fnParamTypes[j], at, gNames, gTys)
-    j = j + 1
-  }
+  if !holeCallBindsAt(ft, c, -1, bNames, bTys, gNames, gTys) { return -1 }
   const r = substTyDeep(ft.fnRet, gNames, gTys)
   if r < 0 || tyHasTyVar(r) { return -1 }
   r
+}
+
+// Binds generic function type `ft`'s variables into `gNames`/`gTys` at hole call `c`'s own
+// arguments under the call's bindings, in argument order as the direct call binds them, through
+// argument `upto` (every one when negative); false when `c` is no call of `ft`'s arity or an
+// argument stays open.
+function holeCallBindsAt(
+  ft: TyFunc,
+  c: i32,
+  upto: i32,
+  bNames: string[],
+  bTys: i32[],
+  gNames: string[],
+  gTys: i32[],
+): boolean {
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = P.nodes[c]
+  if !(n is Call) || n.callArgs.length != ft.fnParamTypes.length {
+    return false
+  }
+  let j = 0
+  while j < n.callArgs.length && (upto < 0 || j <= upto) {
+    const at = substTyDeep(nodeTyOf(n.callArgs[j]), bNames, bTys)
+    if at < 0 || tyHasTyVar(at) { return false }
+    bindGenWalk(ft.fnParamTypes[j], at, gNames, gTys)
+    j = j + 1
+  }
+  true
+}
+
+// What hole call parameter `exp` asks of argument `rat` (node `arg` in `calleeFn`'s body) when the
+// hole is bound, under the call's bindings, to the open signature of a declared generic: the
+// parameter at the bindings the call's arguments up to it give, as the direct call binds them (D6540);
+// -1 when `exp` is no such parameter or `rat` stays open.
+export function holeGenericParamAt(
+  exp: i32,
+  rat: i32,
+  arg: i32,
+  calleeFn: i32,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  if rat < 0 || rat >= T.tys.length || tyHasTyVar(rat) { return -1 }
+  const row = hdRowOf(exp)
+  if row < 0 || hdKind[row] != HD_PARAM || hdBase[row] < 0 { return -1 }
+  const f = substTyDeep(hdBase[row], bNames, bTys)
+  if f < 0 || !tyIsForeignGenericSig(f) { return -1 }
+  const ft = T.tys[f]
+  if !(ft is TyFunc) { return -1 }
+  const pj = hdInner[row]
+  if pj < 0 || pj >= ft.fnParamTypes.length { return -1 }
+  const p = ft.fnParamTypes[pj]
+  if !tyHasTyVar(p) { return -1 }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  const c = holeCallOfArg(calleeFn, arg, pj)
+  if holeCallBindsAt(ft, c, pj, bNames, bTys, gNames, gTys) {
+    return substTyDeep(p, gNames, gTys)
+  }
+  const oNames: string[] = []
+  const oTys: i32[] = []
+  bindGenWalk(p, rat, oNames, oTys)
+  substTyDeep(p, oNames, oTys)
 }
 
 // Refuses, at argument node `arg`, the first binary operator or `print` in `calleeFn`'s body (a

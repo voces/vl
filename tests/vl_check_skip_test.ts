@@ -48,6 +48,7 @@ type Exports = {
   diagDataLen(i: number): number;
   diagDataByte(i: number, j: number): number;
   diagModule(i: number): number;
+  diagOrderKey(i: number): number;
   ifaceHashArm(on: number): number;
   ifaceHashDrop(mask: number): number;
   ifaceHashCount(): number;
@@ -55,6 +56,17 @@ type Exports = {
   ifaceHashKeyAt(i: number, j: number): number;
   checkSkipArm(on: number): number;
   checkSkipStat(which: number): number;
+  checkGen(): number;
+  lintUseCheck(gen: number): number;
+  lintGraph(): number;
+  lintGraphCount(): number;
+  lintGraphModule(i: number): number;
+  lintGraphLine(i: number): number;
+  lintGraphCol(i: number): number;
+  lintGraphCodeLen(i: number): number;
+  lintGraphCodeByte(i: number, j: number): number;
+  lintGraphMsgLen(i: number): number;
+  lintGraphMsgByte(i: number, j: number): number;
 };
 
 const MODULE = ENABLED
@@ -79,16 +91,22 @@ const readStr = (len: number, at: (j: number) => number) => {
 };
 
 type Graph = Record<string, string>;
-type Result = { rc: number; diags: string[]; reason: number; served: number };
+type Result = {
+  rc: number;
+  diags: string[];
+  canon: string[];
+  reason: number;
+  served: number;
+};
 
-const load = (exp: Exports, g: Graph) => {
+const load = (exp: Exports, g: Graph, entry = "main.vl") => {
   exp.modReset();
   const commit = (key: string, src: string) => {
     push(exp.modKeyPush, key);
     push(exp.modSrcPush, src);
     exp.modCommit(1);
   };
-  commit("/proj/main.vl", g["main.vl"]);
+  commit(`/proj/${entry}`, g[entry]);
   for (;;) {
     const n = exp.modPendingCount();
     if (n === 0) break;
@@ -103,7 +121,7 @@ const load = (exp: Exports, g: Graph) => {
     }
   }
   exp.srcReset();
-  push(exp.srcPush, g["main.vl"]);
+  push(exp.srcPush, g[entry]);
 };
 
 const keysOf = (exp: Exports) => {
@@ -115,12 +133,14 @@ const keysOf = (exp: Exports) => {
   return out;
 };
 
-const check = (exp: Exports, g: Graph): Result => {
-  load(exp, g);
+const check = (exp: Exports, g: Graph, entry = "main.vl"): Result => {
+  load(exp, g, entry);
   const rc = exp.checkSrc();
   const keys = keysOf(exp);
   const diags: string[] = [];
+  const order: number[] = [];
   for (let i = 0; i < exp.diagCount(); i++) {
+    order.push(exp.diagOrderKey(i));
     const msg = readStr(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j));
     const code = readStr(exp.diagCodeLen(i), (j) => exp.diagCodeByte(i, j));
     const data = readStr(exp.diagDataLen(i), (j) => exp.diagDataByte(i, j));
@@ -129,9 +149,14 @@ const check = (exp: Exports, g: Graph): Result => {
         `${exp.diagEndLine(i)}:${exp.diagEndCol(i)} [${code}|${data}] ${msg}`,
     );
   }
+  // The rows listed stably by `diagOrderKey`, the order the LSP publishes.
+  const canon = diags.map((d, i) => ({ d, k: order[i] })).sort((a, b) => a.k - b.k).map((r) =>
+    r.d
+  );
   return {
     rc,
     diags,
+    canon,
     reason: exp.checkSkipStat(0),
     served: exp.checkSkipStat(1),
   };
@@ -330,12 +355,36 @@ const CASES: Case[] = [
       `import { flag, mode } from "./lib"\nflag = true\nmode = "zz"\nconst m: "a" | "zz" = mode\nprint(m)\nif flag { print(mode) }\n`,
   },
   {
+    // An importer's store cannot retype a number binding (it is refused), so this serves.
     name: "number binding main widens, lib body edit",
-    want: "decline",
-    why: "demand",
+    want: "serve",
     from: "n * 2",
     to: "n * 3",
     uses: `import { count } from "./lib"\nconst w: i64 = 5\ncount = w\nprint(count)\n`,
+  },
+  {
+    name: "number binding main stores and delivers wider, lib body edit",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses:
+      `import { count } from "./lib"\nfunction wide(x: i64): i64 { return x }\nconst fl: f64 = count\ncount = count + 1\nprint(wide(count))\nprint(fl)\n`,
+  },
+  {
+    name: "a lib body starts widening a number binding main reads",
+    want: "decline",
+    why: "interface",
+    from: "clear(): void { print(0) }",
+    to: "clear(): void {\n  const z: i64 = 9\n  count = z\n}",
+    uses: `import { count } from "./lib"\nconst k: i32 = count\nprint(k)\n`,
+  },
+  {
+    name: "a number binding's literal edit",
+    want: "decline",
+    why: "interface",
+    from: "count = 0",
+    to: "count = 0.5",
+    uses: `import { count } from "./lib"\nconst k: i32 = count\nprint(k)\n`,
   },
   {
     name: "scalar constant edit",
@@ -417,8 +466,13 @@ const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
 
 const same = (a: string[], b: string[]) => a.join("\n") === b.join("\n");
 
-// The served check against a fresh one and an unarmed one, as failure lines.
-const grade = (c: Case, bad: boolean, drop = 0): { fails: string[]; got: Result } => {
+// The served check against a fresh one and, listed by `diagOrderKey`, an unarmed one, as
+// failure lines; `reordered` when the unarmed rows were in another order before that listing.
+const grade = (
+  c: Case,
+  bad: boolean,
+  drop = 0,
+): { fails: string[]; got: Result; reordered: boolean } => {
   const [before, after] = graphs(c, bad);
   const tag = `${c.name}${bad ? " (main with errors)" : ""}`;
   const fails: string[] = [];
@@ -438,14 +492,12 @@ const grade = (c: Case, bad: boolean, drop = 0): { fails: string[]; got: Result 
       }]`,
     );
   }
-  if (plain.rc !== fresh.rc || !same([...plain.diags].sort(), [...fresh.diags].sort())) {
+  if (plain.rc !== got.rc || !same(plain.canon, got.diags) || !same(got.canon, got.diags)) {
     fails.push(
-      `${tag}: armed whole check [${fresh.diags.join(" | ")}], unarmed [${
-        plain.diags.join(" | ")
-      }]`,
+      `${tag}: served [${got.diags.join(" | ")}], unarmed in order [${plain.canon.join(" | ")}]`,
     );
   }
-  return { fails, got };
+  return { fails, got, reordered: !same(plain.diags, plain.canon) };
 };
 
 Deno.test({
@@ -454,10 +506,12 @@ Deno.test({
   fn() {
     const fails: string[] = [];
     const table: string[] = [];
+    let reordered = 0;
     for (const c of CASES) {
       for (const bad of [false, true]) {
-        const { fails: f, got } = grade(c, bad);
+        const { fails: f, got, reordered: r } = grade(c, bad);
         fails.push(...f);
+        if (r) reordered++;
         const why = REASON[got.reason] ?? `${got.reason}`;
         const tag = `${c.name}${bad ? " (main with errors)" : ""}`;
         table.push(`${tag}: ${why}, ${got.served} served, rc ${got.rc}`);
@@ -483,7 +537,9 @@ Deno.test({
         : a.length === b.length && a.every((x, i) => x === b[i]);
       if (!eq) fails.push(`${c.name}: the build after a served check differs from a fresh build`);
     }
-    if (Deno.env.get("VL_CHECK_SKIP_TABLE")) console.log(table.join("\n"));
+    if (Deno.env.get("VL_CHECK_SKIP_TABLE")) {
+      console.log(`${table.join("\n")}\n${reordered} unarmed checks listed in another order`);
+    }
     if (fails.length > 0) {
       throw new Error(`want every served check sound, got:\n  ${fails.join("\n  ")}`);
     }
@@ -499,6 +555,9 @@ Deno.test({
     const witness: [string, number][] = [
       ["inferred-return change", 64 | 16],
       ["a callee main narrows across starts writing the binding", 16],
+      // `IH_NO_TYPES | IH_NO_MENTIONS` hides both the widened type of a number binding and the
+      // body store that widened it; dropping the type alone still declines.
+      ["a lib body starts widening a number binding main reads", 8 | 16],
     ];
     for (const [name, mask] of witness) {
       const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, mask);
@@ -534,6 +593,76 @@ Deno.test({
           back.diags.join(" | ")
         }], want [${want2.diags.join(" | ")}] / [${want0.diags.join(" | ")}]`,
       );
+    }
+  },
+});
+
+Deno.test({
+  name: "an entry checked between two checks of another keeps the other's bank",
+  ignore: !ENABLED,
+  fn() {
+    const [g0, g1] = graphs(CASES[0], true);
+    const other = `import { area } from "./lib"\nprint(area(2))\nconst no: string = 1\n`;
+    const h0 = { ...g0, "other.vl": other };
+    const h1 = { ...g1, "other.vl": other };
+    const warm = instance(true);
+    check(warm, h0);
+    check(warm, h0, "other.vl");
+    const got: Result[] = [check(warm, h1), check(warm, h1, "other.vl")];
+    const want = [check(instance(true), h1), check(instance(true), h1, "other.vl")];
+    got.forEach((r, i) => {
+      if (r.served === 0 || !same(r.diags, want[i].diags)) {
+        throw new Error(
+          `want entry ${i} served with the whole check's rows, got ${r.served} served,` +
+            ` [${r.diags.join(" | ")}] against [${want[i].diags.join(" | ")}]`,
+        );
+      }
+    });
+  },
+});
+
+// The graph lint after the last check, as `module line:col [code] message` rows.
+const lintRows = (exp: Exports, paired: boolean) => {
+  if (paired) exp.lintUseCheck(exp.checkGen());
+  exp.lintGraph();
+  const out: string[] = [];
+  for (let i = 0; i < exp.lintGraphCount(); i++) {
+    const code = readStr(exp.lintGraphCodeLen(i), (j) => exp.lintGraphCodeByte(i, j));
+    const msg = readStr(exp.lintGraphMsgLen(i), (j) => exp.lintGraphMsgByte(i, j));
+    out.push(
+      `${exp.lintGraphModule(i)} ${exp.lintGraphLine(i)}:${exp.lintGraphCol(i)} [${code}] ${msg}`,
+    );
+  }
+  return out;
+};
+
+Deno.test({
+  name: "a lint paired with a served check reads the served module's typed sites",
+  ignore: !ENABLED,
+  fn() {
+    // `prefer-interpolation` judges a chain opening with a parameter only from the typed `+`
+    // links, so lib's chain is reported by a paired lint and not by an unpaired one.
+    const lib = `export function greet(n: string): string { return n + " a" + " b" + " c" }
+function quiet(): void { print(3) }
+export function noise(): void { quiet() }
+`;
+    const g0: Graph = { "main.vl": `import { greet } from "./lib"\nprint(greet("x"))\n`, "lib.vl": lib };
+    const g1 = { ...g0, "lib.vl": lib.replace("print(3)", "print(4)") };
+    const warm = instance(true);
+    check(warm, g0);
+    const got = check(warm, g1);
+    const served = lintRows(warm, true);
+    const fresh = instance(true);
+    check(fresh, g1);
+    const whole = lintRows(fresh, true);
+    check(fresh, g1);
+    const unpaired = lintRows(fresh, false);
+    if (got.served === 0) throw new Error(`want lib served, got ${REASON[got.reason]}`);
+    if (!same(served, whole)) {
+      throw new Error(`want [${whole.join(" | ")}] after the served check, got [${served.join(" | ")}]`);
+    }
+    if (same(whole, unpaired)) {
+      throw new Error(`want the paired lint to differ from an unpaired one, got [${whole.join(" | ")}] for both`);
     }
   },
 });

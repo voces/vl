@@ -229,6 +229,38 @@ const UNUSED_EXPORT_DEBOUNCE_MS = 3000;
  *
  * Called on document SAVE (immediate) and by the idle debounce timer.
  */
+// Which open buffer changed when, and which module graph each document's published
+// diagnostics were checked over: a document whose graph holds a module edited since
+// is re-checked by the workspace pass, so an importer stops showing what its
+// dependency's previous text implied.
+let editStamp = 0;
+const editedAt = new Map<string, number>();
+const checkedOver = new Map<string, { stamp: number; graph: string[] }>();
+
+// Re-check every open document whose graph holds a module edited after its own last
+// check. The checker banks each check, so a re-check after a body-only edit serves
+// every module the edit did not reach.
+const recheckImporters = async (checker: WasmChecker): Promise<void> => {
+  for (const doc of documents.all()) {
+    const key = entryKeyOf(doc.uri);
+    const was = checkedOver.get(doc.uri);
+    if (was === undefined) continue;
+    const stale = was.graph.some((k) => k !== key && (editedAt.get(k) ?? 0) > was.stamp);
+    if (!stale) continue;
+    const stamp = editStamp;
+    try {
+      const text = doc.getText();
+      const lintDiags = await checker.lintInGraph(text, lintPathFor(doc.uri), key, workspaceReader);
+      const got = await checker.recheck(text, key, workspaceReader);
+      diagnosticsByUri.set(doc.uri, [...got.diagnostics, ...lintDiags]);
+      checkedOver.set(doc.uri, { stamp, graph: got.graph });
+      connection.console.log(`[wasm-checker] re-checked ${key}: ${got.served} modules served`);
+    } catch (err) {
+      connection.console.log(`[wasm-checker] re-check failed: ${err}`);
+    }
+  }
+};
+
 const runUnusedExportPass = async (): Promise<void> => {
   // The pass is driven entirely off the self-hosted checker (the surface scan
   // and local-use counts). A host that couldn't instantiate the seed has no
@@ -242,6 +274,7 @@ const runUnusedExportPass = async (): Promise<void> => {
   // The pass reads the tree off disk, so it is also the moment a baseline JSON may
   // have changed under an open buffer (a branch switch, another editor).
   invalidateRatchetBaselines();
+  await recheckImporters(wasmChecker);
   // Determine the project root (same logic as onReferences).
   const openUris = documents.all().map((d) => d.uri);
   // Use the first open document's key to detect the root; fall back to an
@@ -296,6 +329,8 @@ documents.onDidChangeContent(async (event) => {
   // bump that keeps a hover in an importer from answering with the pre-edit
   // types of the module just edited.
   wasmChecker?.bumpReaderGeneration();
+  const stamp = ++editStamp;
+  editedAt.set(entryKeyOf(event.document.uri), stamp);
 
   // The most-recently-computed unused-export hints (from the last workspace
   // pass). Stale relative to this edit — the debounce timer below refreshes
@@ -351,6 +386,7 @@ documents.onDidChangeContent(async (event) => {
         workspaceReader,
       );
       diagnostics = [...errors, ...lintDiags];
+      checkedOver.set(event.document.uri, { stamp, graph: wasmChecker.lastGraph() });
     } catch (err) {
       connection.console.log(`[wasm-checker] check failed: ${err}`);
     }
@@ -923,6 +959,9 @@ connection.onInitialize((params) => {
           "(The server log lists every location tried.)",
       );
     },
+    // A long-lived instance: its checks bank, so an importer re-checked after a
+    // dependency's body edit is served (`recheckImporters`).
+    true,
   );
   return {
     capabilities: {
