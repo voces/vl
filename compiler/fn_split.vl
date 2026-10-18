@@ -529,6 +529,12 @@ export function fsPlan(root: i32): i32 {
     if a >= 0 && a < P.nodes.length && P.nodes[a] is Ident {
       const d = fsIdentityLetOf(a)
       if d >= 0 && !hasI32(fsAsks, d) { fsAsks.push(d) }
+      // A binding refused as a hole's argument may want a slot per hole it is handed to (D6092).
+      const ld = letDeclOfRead(a)
+      if ld >= 0 && fsHoleFwdKeys(a).length > 0 && !hasI32(fsAsks, ld) {
+        fsAsks.push(ld)
+        fsAskHoleSiblings(a)
+      }
     }
     // A refused function always returning one generic asks for each binding its result
     // initializes that is called at two types.
@@ -567,6 +573,11 @@ export function fsPlan(root: i32): i32 {
     lets = fsPlanLets()
     if lets != 0 && prIdent.length + pdAnchor.length + pwAnchor.length != was {
       return 1
+    }
+    // A declined let plan leaves every binding its own name for the hole rewrites.
+    if lets != 0 {
+      fsMem = []
+      fsLanes = []
     }
   }
   let fns = 1
@@ -792,13 +803,70 @@ function fsHoleKeys(par: i32, seen: i32[]): string[] {
           hsBad = true
           return ks
         }
-        for k in fsHoleKeys(q, inner) {
-          if !hasStr(ks, k) { ks.push(k) }
+        // A recursive call handing the parameter back to itself hands on every slot (D6091).
+        if q != par {
+          for k in fsHoleKeys(q, inner) {
+            if !hasStr(ks, k) { ks.push(k) }
+          }
         }
       }
     }
   }
   ks
+}
+
+// The keys a read handed to a hole parameter takes: that hole's, through its forwards; empty
+// for any other read, or a hole that cannot take a parameter per type.
+function fsHoleFwdKeys(r: i32): string[] {
+  const none: string[] = []
+  const q = fsHoleFwd(r)
+  if q < 0 { return none }
+  const was = hsBad
+  hsBad = false
+  const seen: i32[] = []
+  const ks = fsHoleKeys(q, seen)
+  const bad = hsBad
+  hsBad = was
+  if bad { return none }
+  ks
+}
+
+// Asks every other binding handed to the hole read `a` is handed to whose reads take two slot
+// keys, since the monomorphizer refuses one of them per compile.
+function fsAskHoleSiblings(a: i32): i32 {
+  const q = fsHoleFwd(a)
+  if q < 0 { return 0 }
+  for r in fsIdents {
+    if r != a && fsHoleFwd(r) == q {
+      const d = letDeclOfRead(r)
+      if d >= 0 && !hasI32(fsAsks, d) && fsLetMemberKeys(d) > 1 {
+        fsAsks.push(d)
+      }
+    }
+  }
+  0
+}
+
+// The number of distinct slot keys the reads of binding `d` take.
+function fsLetMemberKeys(d: i32): i32 {
+  const ks: string[] = []
+  for r in fsIdents {
+    if identDeclOf(r) == d {
+      const k = fsMemberReadKey(r)
+      if !hasStr(ks, k) { ks.push(k) }
+    }
+  }
+  ks.length
+}
+
+// The slot key of read `r` of a split binding: a read handed to an unsplit hole takes the one
+// key that hole is called at, any other read `fsReadKey`'s.
+function fsMemberReadKey(r: i32): string {
+  if hsIx(fsHoleFwd(r)) < 0 {
+    const hk = fsHoleFwdKeys(r)
+    if hk.length == 1 { return hk[0] }
+  }
+  fsReadKey(r)
 }
 
 // The split set: every asked parameter called at two types, closed over the holes it forwards
@@ -999,7 +1067,7 @@ function fsPlanLets(): i32 {
     const ks: string[] = []
     for r in fsIdents {
       if identDeclOf(r) == m {
-        const key = fsReadKey(r)
+        const key = fsMemberReadKey(r)
         const hd = hdIx(r)
         if hd >= 0 {
           for k in hdKeys[hd] {
@@ -1076,7 +1144,7 @@ function fsPlanMember(mi: i32): i32 {
   }
   for r in fsIdents {
     if identDeclOf(r) == m {
-      const key = fsReadKey(r)
+      const key = fsMemberReadKey(r)
       if key == "" {
         const w = fsParent[r]
         const wn = P.nodes[w]

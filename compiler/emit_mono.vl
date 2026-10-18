@@ -221,6 +221,7 @@ import {
 import {
   MC_RUNG_BUILTIN,
   PIN_SIGKEY,
+  callHasTyArgs,
   callTyArgEndsOf,
   callTyArgsOf,
   setCallTyArgs,
@@ -287,6 +288,7 @@ import {
   fnFlowDeclPathPinFns,
   fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
+  fnFlowDeclPathPinTysAt,
   fnFlowDeclPathPinTysOf,
   fnFlowDeclPathSrcs,
   fnFlowDeclWritten,
@@ -13344,6 +13346,47 @@ function monoArgIsEmptyLit(ax: i32): boolean {
   false
 }
 
+// Whether pin type `t` is a function type.
+function monoPinIsFnTy(t: i32): boolean {
+  t >= 0 && t < T.tys.length && T.tys[t] is TyFunc
+}
+
+// Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
+// in its return type, another annotation, an `is`/`as` or a call's type arguments.
+function monoTyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
+  const tps: string[] = [tp]
+  const bare: i32[] = []
+  for pIx in fn.fnParams {
+    const p = P.nodes[pIx]
+    if p is Param && p.parType >= 0 { bare.push(p.parType) }
+  }
+  const stack: i32[] = []
+  for pIx in fn.fnParams { stack.push(pIx) }
+  stack.push(fn.fnRet)
+  stack.push(fn.fnBody)
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is TypeRef && monoAnnHasTyParam(n.tyName, tps) {
+        let ok = n.tyName == tp
+        if ok {
+          ok = false
+          for x in bare {
+            if x == ix { ok = true }
+          }
+        }
+        if !ok { return false }
+      }
+      if n is IsExpr && monoAnnHasTyParam(n.isVariant, tps) { return false }
+      if n is AsExpr && monoAnnHasTyParam(n.asTy, tps) { return false }
+      if n is Call && callHasTyArgs(ix) { return false }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  true
+}
+
 // The type parameter a bare `T` or `T[]` parameter annotation rides, or "".
 function monoParamBareTyParam(pIx: i32, typarams: string[]): string {
   const p = P.nodes[pIx]
@@ -13649,10 +13692,9 @@ function monoHoleGenFnPin(
   if bt >= 0 { return monoFnPinAt(argIx, ctx, bt, -1, tyOut) }
   const fl = monoHoleGenFnFlowDecl(argIx, ctx)
   const ft = monoHoleGenFnFlowTy(argIx, fl)
-  if ft < 0 && fl[1] >= 0 {
-    const noPath: string[] = []
-    if monoDeclPathPins(fl, noPath).length > 1 { fsAsk(pIx) }
-  }
+  // The plan decides whether the hole is called at two types; the flow pins may stop at a
+  // recursive forward before they reach both (D6091).
+  if ft < 0 && fl[1] >= 0 { fsAsk(pIx) }
   monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
 }
 
@@ -14122,10 +14164,12 @@ function monoPinAnnotatedParam(
   } else {
     let an2 = ""
     let an2Ty = -1
+    let genPin = false
     if ann == tp {
       const pinTy: i32[] = [0 - 1]
       an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
       an2Ty = pinTy[0]
+      genPin = an2 != ""
       if an2 == "" {
         an2 = monoHoleLeafLitPin(decl, args, i, ctx, pinTy)
         an2Ty = pinTy[0]
@@ -14139,7 +14183,10 @@ function monoPinAnnotatedParam(
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
     if an2 == "" {
-      if ann == tp && P.nodes[args[i]] is Ident { fsAsk(params[i]) }
+      if ann == tp && P.nodes[args[i]] is Ident {
+        fsAsk(args[i])
+        fsAsk(params[i])
+      }
       return emitFail(
         "emitProgram: monomorphize: unsupported argument type for `"
           + p.parName
@@ -14169,6 +14216,20 @@ function monoPinAnnotatedParam(
     if b == "" {
       tvN.push(tp)
       tvV.push(bind)
+    } else if genPin && b != an2 && monoPinIsFnTy(an2Ty) {
+      // A generic handed to a second `T` parameter called at another type keeps its own pin
+      // when `T` is read nowhere else, and is refused when it is (D6090).
+      if !monoTyParamOnlyBareParams(fn, tp) {
+        return emitFail(
+          "emitProgram: monomorphize: a generic function handed to two parameters of type `"
+            + tp
+            + "` in a call to `"
+            + fn.fnName
+            + "` is called at two types, and `"
+            + tp
+            + "` takes one",
+        )
+      }
     } else {
       bind = b
     }
@@ -16324,20 +16385,56 @@ function monoRetypePinCalls(d: i32, path: string[]): i32 {
         && T.tys[ct] is TyFunc
         && tyHasTyVar(ct)
         && rt >= 0
-        && !tyHasTyVar(rt)
       ) {
-        const ps: i32[] = []
+        let ps: i32[] = []
         for a in c.callArgs {
           const at = nodeTyIxOf(a)
           if at >= 0 && !tyHasTyVar(at) { ps.push(at) }
         }
-        if ps.length == c.callArgs.length && monoWritesTypedAt(d, ps) {
-          nodeTyRecord(cf, mkFuncTy(ps, rt))
+        let r = rt
+        // A call at the enclosing generic's own type parameter takes the pin's closed types
+        // when every walk agrees on them (D6003).
+        if ps.length != c.callArgs.length || tyHasTyVar(r) {
+          ps = fnFlowDeclPathPinTysAt(d, path, cx)
+          r = monoPinCallRet(c.callArgs, ps, rt)
+        }
+        if (
+          r >= 0
+          && ps.length == c.callArgs.length
+          && monoWritesTypedAt(d, ps)
+        ) {
+          nodeTyRecord(cf, mkFuncTy(ps, r))
         }
       }
     }
   }
   0
+}
+
+// Result type `rt` of a call with arguments `args` pinned at the closed parameter types `pt`: each
+// argument typed by a bare type variable binds it to its pin. -1 when `pt` does not cover the
+// arguments, an argument disagrees with its pin, or the result stays open.
+function monoPinCallRet(args: i32[], pt: i32[], rt: i32): i32 {
+  if pt.length != args.length { return -1 }
+  const bN: string[] = []
+  const bT: i32[] = []
+  let i = 0
+  while i < args.length {
+    const at = nodeTyIxOf(args[i])
+    if at < 0 || at >= T.tys.length || pt[i] < 0 { return -1 }
+    const a = T.tys[at]
+    if a is TyVar {
+      bN.push(a.tvName)
+      bT.push(pt[i])
+    } else if tyHasTyVar(at) || at != pt[i] {
+      return -1
+    }
+    i = i + 1
+  }
+  let r = rt
+  if tyHasTyVar(r) { r = substTyDeep(r, bN, bT) }
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  r
 }
 
 // For a value `v` an un-annotated function returns in frame `ctx`: a declared generic is delivered
