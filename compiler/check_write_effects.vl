@@ -651,12 +651,13 @@ function opFreeEffects(ix: i32) {
 // `,`-terminated, or `"*"` opaque. Keyed on the shape, it sees a write through any alias, argument
 // or receiver (D2461).
 export function fnWriteShapes(fnIx: i32) {
+  if weProbeHit { return "*" }
   const key = i32ToStr(fnIx) + "#shape"
   const hit = weSums[key]
   if hit is string { return hit }
   const uhit = weUnresSums[key]
   if uhit is string {
-    weUnres = weUnres + 1
+    weUnresAt(weUnresWit[key] ?? -1)
     return uhit
   }
   const oi = weOpenIndex(key)
@@ -669,6 +670,13 @@ export function fnWriteShapes(fnIx: i32) {
     if weProvLows[ps] < weLow { weLow = weProvLows[ps] }
     weCut = weCut + 1
     return weProvSums[ps]
+  }
+  if weProbing {
+    const w = weUnresWit[key] ?? -1
+    if weWitLive(w) {
+      weUnresAt(w)
+      return "*"
+    }
   }
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
@@ -691,12 +699,16 @@ export function fnWriteShapes(fnIx: i32) {
     const depth = weOpen.length
     const lowBefore = weLow
     const provMark = weProvKeys.length
+    const witBefore = weUnresWitMax
+    weUnresWitMax = -1
     weLow = WE_NO_LOW
     weOpen.push(key)
     weRoots.push(fd.fnBody)
     const acc = weDedupe(weScanShapes(fd.fnBody, fresh, params, bound))
     weRoots.pop()
     weOpen.pop()
+    const wit = weUnresWitMax
+    if witBefore > wit { weUnresWitMax = witBefore }
     const low = weLow
     weLow = lowBefore
     const settled = weUnres == unresBefore
@@ -709,12 +721,15 @@ export function fnWriteShapes(fnIx: i32) {
       weProvLows.push(low)
       return acc
     }
-    weSettleCycle(provMark, acc, settled)
+    weSettleCycle(provMark, acc, settled, wit)
     if settled {
       weSums[key] = acc
     } else {
-      weUnresSums[key] = acc
-      weUnresAny = true
+      weUnresWit[key] = wit
+      if !weProbing {
+        weUnresSums[key] = acc
+        weUnresAny = true
+      }
     }
     return acc
   }
@@ -725,13 +740,15 @@ export function fnWriteShapes(fnIx: i32) {
 // whose summary is `acc`. Every function on one cycle reaches every other, so without a parameter
 // call (`@i`) on either side each one's summary is `acc` itself; any other is dropped, to be asked
 // again.
-function weSettleCycle(mark: i32, acc: string, settled: boolean) {
+function weSettleCycle(mark: i32, acc: string, settled: boolean, wit: i32) {
   while weProvKeys.length > mark {
     const k = weProvKeys.pop() ?? ""
     const pv = weProvSums.pop() ?? "@"
     weProvLows.pop()
     if settled && pv.indexOf("@") < 0 && acc.indexOf("@") < 0 {
       weSums[k] = acc
+    } else if !settled {
+      weUnresWit[k] = wit
     }
   }
   0
@@ -751,6 +768,33 @@ function weOpenIndex(key: string): i32 {
 // its body is checked is not cached.
 let weUnres = 0
 
+// The largest witness counted in the summary being computed: a node `n` read with no type yet is
+// `2n`, an index site `n` whose receiver has none is `2n + 1`.
+let weUnresWitMax = -1
+
+// A witness per unsettled shape summary, kept across `weUnresDrop`. While it is still untyped, a
+// walk would count it again, so a probe answers from it instead of walking (D6130).
+let weUnresWit: {[string]: i32} = Map()
+
+// A probe (`weSummaryUnsettled`) is running, and has counted an untyped read: it ends there.
+let weProbing = false
+let weProbeHit = false
+
+function weUnresAt(w: i32) {
+  weUnres = weUnres + 1
+  if w > weUnresWitMax { weUnresWitMax = w }
+  if weProbing { weProbeHit = true }
+  0
+}
+
+// Whether witness `w` is still untyped.
+function weWitLive(w: i32): boolean {
+  if w < 0 { return false }
+  const n = w / 2
+  if w % 2 == 1 { return opSiteRecvUntyped(n) }
+  nodeTyOf(n) < 0
+}
+
 // Accumulate the write shapes of a subtree, nested functions included, since one written here may
 // run during the call. A write one step below a name in `fresh` is left out: that object is new
 // to this call. A call of parameter `i` of the function summarised (`params`) is `@i`, which a call
@@ -762,6 +806,7 @@ function weScanShapes(
   bound: string[],
 ) {
   if ix < 0 || ix >= P.nodes.length { return "" }
+  if weProbeHit { return "*" }
   let acc = ""
   const n = P.nodes[ix]
   if n is BinExpr {
@@ -772,7 +817,7 @@ function weScanShapes(
     acc = inner
   }
   const ds = opSiteDecls(ix)
-  if opSiteRecvUntyped(ix) { weUnres = weUnres + 1 }
+  if opSiteRecvUntyped(ix) { weUnresAt(ix * 2 + 1) }
   let d = 0
   while d < ds.length {
     if ds[d] < 0 { return "*" }
@@ -828,7 +873,7 @@ function weCellShape(ix: i32, fresh: string[], bound: string[]) {
 function weCellTag(ix: i32): string {
   const t = nodeTyOf(ix)
   if t < 0 {
-    weUnres = weUnres + 1
+    weUnresAt(ix * 2)
     return ""
   }
   cellTagOfTy(t)
@@ -879,7 +924,7 @@ export function callWriteShapes(
   }
   if d == -1 {
     if cf is Member {
-      if nodeTyOf(cf.memObj) < 0 { weUnres = weUnres + 1 }
+      if nodeTyOf(cf.memObj) < 0 { weUnresAt(cf.memObj * 2) }
     }
     return "*"
   }
@@ -986,7 +1031,7 @@ function weArgShapes(a: i32, params: string[], bound: string[]) {
     // A scalar is no function value, whatever the call hands it to (`clz(m)`, `max(v, i)`); an
     // argument not typed yet may still be one, so that answer is not cached.
     const at = nodeTyOf(a)
-    if at < 0 { weUnres = weUnres + 1 }
+    if at < 0 { weUnresAt(a * 2) }
     if crTyIsScalar(at) { return "" }
     const pj = strListIndexOf(params, an.identName)
     if pj >= 0 { return "@" + i32ToStr(pj) + "," }
@@ -1065,10 +1110,16 @@ export function weFnRefs(fnIx: i32): i32[] {
 }
 
 // Whether the write summary of function `d` still reads an untyped node, so checking its body
-// first sharpens what a call to it may write (D5593).
+// first sharpens what a call to it may write (D5593). A live witness answers without a walk; a walk
+// stops at its first untyped read and keeps no unsettled summary, since its value is not used.
 export function weSummaryUnsettled(d: i32): boolean {
+  if weWitLive(weUnresWit[i32ToStr(d) + "#shape"] ?? -1) { return true }
   const before = weUnres
+  weProbing = true
+  weProbeHit = false
   fnWriteShapes(d)
+  weProbing = false
+  weProbeHit = false
   weUnres != before
 }
 
@@ -1103,6 +1154,10 @@ export function weUnresDrop() {
 export function weReset() {
   weSums = Map()
   weUnresSums = Map()
+  weUnresWit = Map()
+  weUnresWitMax = -1
+  weProbing = false
+  weProbeHit = false
   weUnresAny = false
   weProvSlot = Map()
   weProvKeys = []
