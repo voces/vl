@@ -1,0 +1,942 @@
+// Duplicate-code census: how much of a tree repeats, at every length, from one suffix array.
+//
+//     vl run scripts/dup-census.vl -- [PATH...] [--mode exact|param|blind|all]
+//                                     [--min N] [--top N] [--json]
+//
+// PATH defaults to `compiler`; a directory is walked for *.vl. Units are the compiler
+// lexer's tokens with comments, newlines and import declarations dropped. `exact` matches
+// tokens, `param` matches up to consistent renaming (Baker's p-strings), `blind` maps every
+// identifier to one placeholder. It prints a coverage curve, then the top left-maximal
+// blocks whose copies do not overlap, ranked by `length * (copies - 1)`. A discovery
+// instrument, not a gate: docs/internals/dup-census.md.
+
+import { IoError, listDir, pathKind, readTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { parseI32 } from "std:fmt"
+import { endsWith, join, padStart } from "std:str"
+import { filled, sort } from "std:array"
+import { tokenize } from "../compiler/lexer"
+import { die, jsonStr, pyFixed } from "./lib/common"
+import { sortStrings } from "./lib/corpus"
+import { pathJoin } from "./lib/census-read"
+
+const USAGE = "usage: vl run scripts/dup-census.vl -- [PATH...] [--mode exact|param|blind|all] [--min N] [--top N] [--json]"
+const CURVE = [10, 25, 50, 100, 200, 400]
+const SKIP_DIRS = [
+  ".git", "node_modules", "dist", "build", "target", ".cache", ".deno",
+]
+
+// ---- the token stream ---------------------------------------------------------------
+// One row per kept token, files concatenated in path order.
+const files: string[] = []
+const tokFile: i32[] = []
+const tokLine: i32[] = []
+const tokText: string[] = []
+const tokExact: i32[] = []
+const tokBlind: i32[] = []
+// Distance back to the previous occurrence of the same identifier in the same file, 0 for
+// a first occurrence, -1 for a token that is not an identifier.
+const tokDist: i32[] = []
+// The global id of each token's source line, and per line id its token count.
+const tokLineId: i32[] = []
+const lineToks: i32[] = []
+
+const interned: Map<string, i32> = Map()
+let nInterned = 0
+const identLast: Map<string, i32> = Map()
+
+function intern(key: string): i32 {
+  const known = interned[key]
+  if known != null { return known }
+  interned[key] = nInterned
+  nInterned = nInterned + 1
+  nInterned - 1
+}
+
+function isLiteral(kind: string): boolean {
+  kind == "NUMBER"
+    || kind == "STRING"
+    || kind == "CHAR"
+    || kind == "TEMPLATE"
+    || kind == "TEMPLATE_HEAD"
+    || kind == "TEMPLATE_MID"
+    || kind == "TEMPLATE_TAIL"
+}
+
+// Lexes one file onto the stream. An `import` or `export { … }` statement is dropped from
+// its first token to the newline that ends it at bracket depth 0.
+function addFile(path: string, src: string) {
+  const f = files.length
+  files.push(path)
+  const toks = tokenize(src).tokens
+  let atStmt = true
+  let skipping = false
+  let depth = 0
+  let lastLine = -1
+  let i = 0
+  while i < toks.length {
+    const t = toks[i]
+    const kind = "\{t.kind}"
+    i = i + 1
+    if kind == "EOF" { break }
+    if kind == "NEWLINE" {
+      if skipping && depth <= 0 { skipping = false }
+      atStmt = !skipping
+      continue
+    }
+    if atStmt && !skipping {
+      const nextKind = if i < toks.length { "\{toks[i].kind}" } else { "" }
+      if kind == "IMPORT" || (kind == "EXPORT" && nextKind == "LBRACE") {
+        skipping = true
+        depth = 0
+      }
+    }
+    atStmt = false
+    if skipping {
+      if kind == "LBRACE" || kind == "LPAREN" || kind == "LBRACK" {
+        depth = depth + 1
+      }
+      if kind == "RBRACE" || kind == "RPAREN" || kind == "RBRACK" {
+        depth = depth - 1
+      }
+      continue
+    }
+    const pos = tokFile.length
+    tokFile.push(f)
+    tokLine.push(t.line)
+    tokText.push(t.text)
+    if t.line != lastLine {
+      lineToks.push(0)
+      lastLine = t.line
+    }
+    const lid = lineToks.length - 1
+    tokLineId.push(lid)
+    lineToks[lid] = lineToks[lid] + 1
+    tokExact.push(intern(kind + " " + t.text))
+    if kind == "IDENT" || kind == "LABEL" {
+      tokBlind.push(intern("$ident"))
+      const key = t.text
+      const prev = identLast[key]
+      if prev != null && tokFile[prev] == f {
+        tokDist.push(pos - prev)
+      } else {
+        tokDist.push(0)
+      }
+      identLast[key] = pos
+    } else if isLiteral(kind) {
+      tokBlind.push(intern("$" + kind))
+      tokDist.push(-1)
+    } else {
+      tokBlind.push(tokExact[pos])
+      tokDist.push(-1)
+    }
+  }
+}
+
+function isSkipped(name: string): boolean {
+  for s in SKIP_DIRS {
+    if s == name { return true }
+  }
+  false
+}
+
+function collect(path: string, out: string[]) {
+  const kind = pathKind(path)
+  if kind is IoError {
+    die("dup-census: cannot read \{path} (\{kind.msg})", 2)
+    return
+  }
+  if kind == "file" {
+    out.push(path)
+    return
+  }
+  const names = listDir(path)
+  if names is IoError {
+    die("dup-census: cannot list \{path} (\{names.msg})", 2)
+    return
+  }
+  for n in sortStrings(names) {
+    const p = pathJoin(path, n)
+    const k = pathKind(p)
+    if k is IoError { continue }
+    if k == "dir" {
+      if !isSkipped(n) { collect(p, out) }
+    } else if endsWith(n, ".vl") {
+      out.push(p)
+    }
+  }
+}
+
+// ---- the sequence a mode sorts --------------------------------------------------------
+// `seq` is the stream with a sentinel after each file: sentinel `f` is the value `f`, unique
+// and below every token value, so no common prefix crosses a file boundary. `seqTok` maps a
+// position to its token row, or -1 at a sentinel.
+let seq: i32[] = []
+let seqTok: i32[] = []
+let nFiles = 0
+// In `param` mode an identifier at distance d is `idBase + d`; a first occurrence, and any
+// occurrence whose previous one lies before the suffix being read, is `idFirst`.
+let idBase = 0
+let idFirst = 0
+
+function buildSeq(mode: string): i32 {
+  seq = []
+  seqTok = []
+  nFiles = files.length
+  idFirst = nFiles + intern("$ident")
+  idBase = nFiles + nInterned
+  let alpha = idBase
+  let i = 0
+  let f = 0
+  while i <= tokFile.length {
+    while f < nFiles && (i == tokFile.length || tokFile[i] != f) {
+      seq.push(f)
+      seqTok.push(-1)
+      f = f + 1
+    }
+    if i == tokFile.length { break }
+    let v = nFiles + tokExact[i]
+    if mode != "exact" { v = nFiles + tokBlind[i] }
+    if mode == "param" && tokDist[i] > 0 {
+      v = idBase + tokDist[i]
+      if v + 1 > alpha { alpha = v + 1 }
+    }
+    seq.push(v)
+    seqTok.push(i)
+    i = i + 1
+  }
+  alpha
+}
+
+// ---- suffix array by prefix doubling, LCP by Kasai -----------------------------------
+let sa: i32[] = []
+let rnk: i32[] = []
+let lcp: i32[] = []
+
+function buildSA(s: i32[], alpha: i32) {
+  const n = s.length
+  const size = if alpha > n { alpha } else { n }
+  const cnt = filled(size + 1, 0)
+  sa = filled(n, 0)
+  rnk = filled(n, 0)
+  const tmp = filled(n, 0)
+  const nr = filled(n, 0)
+  let i = 0
+  while i < n {
+    cnt[s[i]] = cnt[s[i]] + 1
+    i = i + 1
+  }
+  let c = 0
+  i = 0
+  while i < size {
+    const x = cnt[i]
+    cnt[i] = c
+    c = c + x
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    sa[cnt[s[i]]] = i
+    cnt[s[i]] = cnt[s[i]] + 1
+    i = i + 1
+  }
+  // Dense ranks of the length-1 prefixes.
+  let r = 0
+  i = 0
+  while i < n {
+    if i > 0 && s[sa[i]] != s[sa[i - 1]] { r = r + 1 }
+    rnk[sa[i]] = r
+    i = i + 1
+  }
+  let k = 1
+  while r < n - 1 {
+    // Order by the second key: suffixes with no second half first, then by sa.
+    let p = 0
+    i = n - k
+    while i < n {
+      tmp[p] = i
+      p = p + 1
+      i = i + 1
+    }
+    i = 0
+    while i < n {
+      if sa[i] >= k {
+        tmp[p] = sa[i] - k
+        p = p + 1
+      }
+      i = i + 1
+    }
+    // Stable counting sort by the first key.
+    i = 0
+    while i <= r {
+      cnt[i] = 0
+      i = i + 1
+    }
+    i = 0
+    while i < n {
+      cnt[rnk[i]] = cnt[rnk[i]] + 1
+      i = i + 1
+    }
+    c = 0
+    i = 0
+    while i <= r {
+      const x = cnt[i]
+      cnt[i] = c
+      c = c + x
+      i = i + 1
+    }
+    i = 0
+    while i < n {
+      const j = tmp[i]
+      sa[cnt[rnk[j]]] = j
+      cnt[rnk[j]] = cnt[rnk[j]] + 1
+      i = i + 1
+    }
+    nr[sa[0]] = 0
+    r = 0
+    i = 1
+    while i < n {
+      const a = sa[i - 1]
+      const b = sa[i]
+      const a2 = if a + k < n { rnk[a + k] } else { -1 }
+      const b2 = if b + k < n { rnk[b + k] } else { -1 }
+      if rnk[a] != rnk[b] || a2 != b2 { r = r + 1 }
+      nr[b] = r
+      i = i + 1
+    }
+    i = 0
+    while i < n {
+      rnk[i] = nr[i]
+      i = i + 1
+    }
+    k = k * 2
+  }
+}
+
+// `lcp[r]` is the common prefix of the suffixes at ranks r-1 and r; `lcp[0]` is 0.
+function kasai(s: i32[]) {
+  const n = s.length
+  lcp = filled(n + 1, 0)
+  let h = 0
+  let i = 0
+  while i < n {
+    const r = rnk[i]
+    if r > 0 {
+      const j = sa[r - 1]
+      while i + h < n && j + h < n && s[i + h] == s[j + h] { h = h + 1 }
+      lcp[r] = h
+      if h > 0 { h = h - 1 }
+    } else {
+      h = 0
+    }
+    i = i + 1
+  }
+}
+
+// ---- param mode: p-string comparison over the sequence's own suffix array ---------------
+// The param encoding of a suffix depends on where it starts, so its order is a merge sort
+// whose comparator jumps between mismatches of the raw sequence with an LCE query.
+let xRank: i32[] = []
+let xLcp: i32[] = []
+let blockMin: i32[] = []
+let sparse: i32[] = []
+let nBlocks = 0
+const BLK = 32
+let gSign = 0
+
+function minOf(a: i32, b: i32): i32 {
+  if a < b { a } else { b }
+}
+
+function buildRmq() {
+  const n = xLcp.length
+  nBlocks = (n + BLK - 1) / BLK
+  blockMin = filled(nBlocks, 0)
+  let b = 0
+  while b < nBlocks {
+    let m = xLcp[b * BLK]
+    let i = b * BLK + 1
+    const end = minOf(n, (b + 1) * BLK)
+    while i < end {
+      if xLcp[i] < m { m = xLcp[i] }
+      i = i + 1
+    }
+    blockMin[b] = m
+    b = b + 1
+  }
+  let levels = 1
+  while (1 << levels) <= nBlocks { levels = levels + 1 }
+  sparse = filled(levels * nBlocks, 0)
+  b = 0
+  while b < nBlocks {
+    sparse[b] = blockMin[b]
+    b = b + 1
+  }
+  let j = 1
+  while j < levels {
+    const half = 1 << (j - 1)
+    b = 0
+    while b + (1 << j) <= nBlocks {
+      sparse[j * nBlocks + b] = minOf(
+        sparse[(j - 1) * nBlocks + b],
+        sparse[(j - 1) * nBlocks + b + half],
+      )
+      b = b + 1
+    }
+    j = j + 1
+  }
+}
+
+function scanMin(lo: i32, hi: i32): i32 {
+  let m = xLcp[lo]
+  let i = lo + 1
+  while i <= hi {
+    if xLcp[i] < m { m = xLcp[i] }
+    i = i + 1
+  }
+  m
+}
+
+// The minimum of `xLcp[lo..=hi]`.
+function rmq(lo: i32, hi: i32): i32 {
+  const bl = lo / BLK
+  const bh = hi / BLK
+  if bh - bl <= 1 { return scanMin(lo, hi) }
+  let m = minOf(scanMin(lo, (bl + 1) * BLK - 1), scanMin(bh * BLK, hi))
+  const a = bl + 1
+  const b = bh - 1
+  let j = 0
+  while (1 << (j + 1)) <= b - a + 1 { j = j + 1 }
+  m = minOf(m, sparse[j * nBlocks + a])
+  minOf(m, sparse[j * nBlocks + b - (1 << j) + 1])
+}
+
+// The longest common prefix of the raw sequence at positions a and b.
+function lceX(a: i32, b: i32): i32 {
+  if a == b { return seq.length - a }
+  const ra = xRank[a]
+  const rb = xRank[b]
+  if ra < rb { return rmq(ra + 1, rb) }
+  rmq(rb + 1, ra)
+}
+
+// The param value of raw value `v` read at offset k into a suffix.
+function penc(v: i32, k: i32): i32 {
+  if v > idBase && v - idBase > k { return idFirst }
+  v
+}
+
+// The param common prefix of the suffixes at s and t (s != t); `gSign` gets their order.
+function plce(s: i32, t: i32): i32 {
+  let k = 0
+  while k < 12 {
+    const a = seq[s + k]
+    const b = seq[t + k]
+    if a != b {
+      const ea = penc(a, k)
+      const eb = penc(b, k)
+      if ea != eb {
+        gSign = if ea < eb { -1 } else { 1 }
+        return k
+      }
+    }
+    k = k + 1
+  }
+  while true {
+    k = k + lceX(s + k, t + k)
+    const ea = penc(seq[s + k], k)
+    const eb = penc(seq[t + k], k)
+    if ea != eb {
+      gSign = if ea < eb { -1 } else { 1 }
+      return k
+    }
+    k = k + 1
+  }
+  0
+}
+
+function buildParamSA() {
+  const n = seq.length
+  xRank = rnk
+  xLcp = lcp
+  buildRmq()
+  let a = filled(n, 0)
+  let b = filled(n, 0)
+  let i = 0
+  while i < n {
+    a[i] = sa[i]
+    i = i + 1
+  }
+  let w = 1
+  while w < n {
+    let lo = 0
+    while lo < n {
+      const mid = minOf(lo + w, n)
+      const hi = minOf(lo + 2 * w, n)
+      let p = lo
+      let q = mid
+      let o = lo
+      while p < mid && q < hi {
+        plce(a[p], a[q])
+        if gSign <= 0 {
+          b[o] = a[p]
+          p = p + 1
+        } else {
+          b[o] = a[q]
+          q = q + 1
+        }
+        o = o + 1
+      }
+      while p < mid {
+        b[o] = a[p]
+        p = p + 1
+        o = o + 1
+      }
+      while q < hi {
+        b[o] = a[q]
+        q = q + 1
+        o = o + 1
+      }
+      lo = hi
+    }
+    const t = a
+    a = b
+    b = t
+    w = w * 2
+  }
+  sa = a
+  rnk = filled(n, 0)
+  lcp = filled(n + 1, 0)
+  i = 0
+  while i < n {
+    rnk[sa[i]] = i
+    if i > 0 { lcp[i] = plce(sa[i - 1], sa[i]) }
+    i = i + 1
+  }
+}
+
+// The value at offset k of the suffix at s, read without any jump.
+function naiveAt(mode: string, s: i32, k: i32): i32 {
+  if mode == "param" { return penc(seq[s + k], k) }
+  seq[s + k]
+}
+
+// `--verify`: every adjacent pair of the suffix array is in order and its LCP is the one a
+// token-by-token comparison finds. Answers the number of pairs that fail.
+function verify(mode: string): i32 {
+  let bad = 0
+  let r = 1
+  while r < seq.length {
+    const a = sa[r - 1]
+    const b = sa[r]
+    let k = 0
+    while naiveAt(mode, a, k) == naiveAt(mode, b, k) { k = k + 1 }
+    if k != lcp[r] || naiveAt(mode, a, k) > naiveAt(mode, b, k) {
+      if bad < 5 {
+        print("verify \{mode}: ranks \{r - 1}/\{r} lcp \{lcp[r]}, naive \{k}")
+      }
+      bad = bad + 1
+    }
+    r = r + 1
+  }
+  bad
+}
+
+// ---- coverage --------------------------------------------------------------------------
+type Point = {
+  len: i32,
+  toks: i32,
+  lines: i32,
+}
+
+// For each L, the tokens inside an occurrence of a repeat of at least L tokens whose other
+// occurrence does not overlap it, and the lines all of whose tokens are.
+function curve(): Point[] {
+  const n = seq.length
+  const best = filled(n, 0)
+  let r = 1
+  while r < n {
+    const a = sa[r - 1]
+    const b = sa[r]
+    const d = if a < b { b - a } else { a - b }
+    const h = minOf(lcp[r], d)
+    if h > best[a] { best[a] = h }
+    if h > best[b] { best[b] = h }
+    r = r + 1
+  }
+  const out: Point[] = []
+  for L in CURVE {
+    let reach = 0
+    let toks = 0
+    const lineCov = filled(lineToks.length, 0)
+    let p = 0
+    while p < n {
+      if best[p] >= L && p + best[p] > reach { reach = p + best[p] }
+      if p < reach && seqTok[p] >= 0 {
+        toks = toks + 1
+        const lid = tokLineId[seqTok[p]]
+        lineCov[lid] = lineCov[lid] + 1
+      }
+      p = p + 1
+    }
+    let lines = 0
+    let l = 0
+    while l < lineToks.length {
+      if lineCov[l] == lineToks[l] { lines = lines + 1 }
+      l = l + 1
+    }
+    out.push({ len: L, toks: toks, lines: lines })
+  }
+  out
+}
+
+// ---- blocks ----------------------------------------------------------------------------
+type Block = {
+  len: i32,
+  copies: i32[],
+  score: i32,
+}
+
+// Whether every occurrence also matches one token further left, so the block is not
+// left-maximal.
+function extendsLeft(mode: string, occ: i32[], len: i32): boolean {
+  const s0 = occ[0]
+  if s0 == 0 || seqTok[s0 - 1] < 0 { return false }
+  let i = 1
+  while i < occ.length {
+    const s = occ[i]
+    if s == 0 || seqTok[s - 1] < 0 { return false }
+    if mode == "param" {
+      if plce(s0 - 1, s - 1) < len + 1 { return false }
+    } else if seq[s0 - 1] != seq[s - 1] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+function insertionSort(xs: i32[]) {
+  let i = 1
+  while i < xs.length {
+    const v = xs[i]
+    let j = i - 1
+    while j >= 0 && xs[j] > v {
+      xs[j + 1] = xs[j]
+      j = j - 1
+    }
+    xs[j + 1] = v
+    i = i + 1
+  }
+}
+
+function sortInts(xs: i32[]) {
+  if xs.length < 32 {
+    insertionSort(xs)
+    return
+  }
+  let a = xs
+  let b = filled(xs.length, 0)
+  const n = xs.length
+  let w = 1
+  while w < n {
+    let lo = 0
+    while lo < n {
+      const mid = minOf(lo + w, n)
+      const hi = minOf(lo + 2 * w, n)
+      let p = lo
+      let q = mid
+      let o = lo
+      while o < hi {
+        if q >= hi || (p < mid && a[p] <= a[q]) {
+          b[o] = a[p]
+          p = p + 1
+        } else {
+          b[o] = a[q]
+          q = q + 1
+        }
+        o = o + 1
+      }
+      lo = hi
+    }
+    const t = a
+    a = b
+    b = t
+    w = w * 2
+  }
+  let i = 0
+  while i < n {
+    xs[i] = a[i]
+    i = i + 1
+  }
+}
+
+// Every LCP interval of at least `minLen` tokens that is left-maximal and whose copies in
+// one file never overlap (a run that repeats itself is reported at most at its period).
+function blocks(mode: string, minLen: i32): Block[] {
+  const n = seq.length
+  const out: Block[] = []
+  const stH = filled(n + 2, 0)
+  const stLb = filled(n + 2, 0)
+  let sp = 1
+  let r = 1
+  while r <= n {
+    const h = if r < n { lcp[r] } else { 0 }
+    let lb = r - 1
+    while h < stH[sp - 1] {
+      sp = sp - 1
+      const ih = stH[sp]
+      lb = stLb[sp]
+      if ih >= minLen {
+        const occ: i32[] = []
+        let k = lb
+        while k <= r - 1 {
+          occ.push(sa[k])
+          k = k + 1
+        }
+        sortInts(occ)
+        let overlaps = false
+        k = 1
+        while k < occ.length {
+          if occ[k] - occ[k - 1] < ih { overlaps = true }
+          k = k + 1
+        }
+        if !overlaps && !extendsLeft(mode, occ, ih) {
+          out.push({ len: ih, copies: occ, score: ih * (occ.length - 1) })
+        }
+      }
+    }
+    if h > stH[sp - 1] {
+      stH[sp] = h
+      stLb[sp] = lb
+      sp = sp + 1
+    }
+    r = r + 1
+  }
+  out
+}
+
+function blockBefore(a: Block, b: Block): boolean {
+  if a.score != b.score { return a.score > b.score }
+  if a.len != b.len { return a.len > b.len }
+  a.copies[0] < b.copies[0]
+}
+
+// The best `top` blocks by score, skipping one whose copies lie at least half inside the
+// copies of a block already taken: nested intervals of one repeat would otherwise fill
+// the list with the same code.
+function topBlocks(all: Block[], top: i32): Block[] {
+  sort(all, blockBefore)
+  const out: Block[] = []
+  const claimed = filled(seq.length, false)
+  let i = 0
+  while i < all.length && out.length < top {
+    const b = all[i]
+    i = i + 1
+    let inside = 0
+    for p in b.copies {
+      let k = 0
+      while k < b.len {
+        if claimed[p + k] { inside = inside + 1 }
+        k = k + 1
+      }
+    }
+    if inside * 2 >= b.len * b.copies.length { continue }
+    for p in b.copies {
+      let k = 0
+      while k < b.len {
+        claimed[p + k] = true
+        k = k + 1
+      }
+    }
+    out.push(b)
+  }
+  out
+}
+
+function where(p: i32): string {
+  const t = seqTok[p]
+  "\{files[tokFile[t]]}:\{tokLine[t]}"
+}
+
+function spanLines(p: i32, len: i32): i32 {
+  tokLine[seqTok[p + len - 1]] - tokLine[seqTok[p]] + 1
+}
+
+function preview(p: i32, len: i32): string {
+  const parts: string[] = []
+  let k = 0
+  while k < len && k < 10 {
+    parts.push(tokText[seqTok[p + k]])
+    k = k + 1
+  }
+  let s = join(parts, " ")
+  if len > 10 { s = s + " …" }
+  let flat = ""
+  for c in s {
+    if c == '\n' || c == '\t' {
+      flat = flat + " "
+    } else {
+      flat = flat + fromCodePoint(c)
+    }
+  }
+  flat
+}
+
+// ---- report ----------------------------------------------------------------------------
+function pct(a: i32, b: i32): string {
+  if b == 0 { return "0.0" }
+  pyFixed(100.0 * (a as f64) / (b as f64), 1)
+}
+
+function totalLines(): i32 { lineToks.length }
+
+function perLine(): f64 {
+  if lineToks.length == 0 { return 1.0 }
+  (tokFile.length as f64) / (lineToks.length as f64)
+}
+
+function approxLines(L: i32): string { pyFixed((L as f64) / perLine(), 1) }
+
+function printMode(mode: string, pts: Point[], top: Block[]) {
+  print("")
+  print("== mode \{mode}")
+  print("  min tokens   ~lines   tokens covered      lines covered")
+  for p in pts {
+    const a = ("\{p.len}").padStart(10, " ")
+    const b = approxLines(p.len).padStart(8, " ")
+    const c = ("\{pct(p.toks, tokFile.length)}%").padStart(17, " ")
+    const d = ("\{pct(p.lines, totalLines())}%").padStart(18, " ")
+    print("\{a} \{b} \{c} \{d}")
+  }
+  print("")
+  print("  top \{top.length} blocks (score = tokens x (copies - 1))")
+  let i = 0
+  while i < top.length {
+    const b = top[i]
+    const lines = spanLines(b.copies[0], b.len)
+    print(
+      "  #\{i + 1}  score \{b.score}  \{b.len} tokens  ~\{lines} lines  x\{b.copies.length}  \{preview(b.copies[0], b.len)}",
+    )
+    for p in b.copies { print("      \{where(p)}") }
+    i = i + 1
+  }
+}
+
+function jsonMode(mode: string, pts: Point[], top: Block[]): string {
+  const cs: string[] = []
+  for p in pts {
+    cs.push(
+      "{\"min\":\{p.len},\"approxLines\":\{approxLines(p.len)},\"tokens\":\{p.toks},\"tokenPct\":\{pct(p.toks, tokFile.length)},\"lines\":\{p.lines},\"linePct\":\{pct(p.lines, totalLines())}}",
+    )
+  }
+  const bs: string[] = []
+  for b in top {
+    const at: string[] = []
+    for p in b.copies { at.push(jsonStr(where(p))) }
+    bs.push(
+      "{\"tokens\":\{b.len},\"lines\":\{spanLines(b.copies[0], b.len)},\"copies\":\{b.copies.length},\"score\":\{b.score},\"at\":[\{join(at, ",")}]}",
+    )
+  }
+  "{\"mode\":\{jsonStr(mode)},\"curve\":[\{join(cs, ",")}],\"blocks\":[\{join(bs, ",")}]}"
+}
+
+function intArg(args: string[], i: i32, flag: string): i32 {
+  if i >= args.length { die("dup-census: \{flag} takes a number\n\{USAGE}", 2) }
+  const v = parseI32(args[i])
+  if v == null {
+    die("dup-census: \{flag} takes a number, got \{args[i]}\n\{USAGE}", 2)
+    return 0
+  }
+  v
+}
+
+function main() {
+  const got = programArgs()
+  if got is Utf8Error {
+    die("dup-census: arguments are not UTF-8", 2)
+    return
+  }
+  let mode = "all"
+  let minLen = 50
+  let top = 15
+  let asJson = false
+  let check = false
+  const paths: string[] = []
+  let i = 0
+  while i < got.length {
+    const a = got[i]
+    if a == "--mode" {
+      i = i + 1
+      if i >= got.length { die(USAGE, 2) }
+      mode = got[i]
+    } else if a == "--min" {
+      i = i + 1
+      minLen = intArg(got, i, "--min")
+    } else if a == "--top" {
+      i = i + 1
+      top = intArg(got, i, "--top")
+    } else if a == "--verify" {
+      check = true
+    } else if a == "--json" {
+      asJson = true
+    } else if a == "-h" || a == "--help" {
+      print(USAGE)
+      return
+    } else if a.length > 1 && a[0] == '-' {
+      die("dup-census: unknown flag \{a}\n\{USAGE}", 2)
+    } else {
+      paths.push(a)
+    }
+    i = i + 1
+  }
+  if mode != "all" && mode != "exact" && mode != "param" && mode != "blind" {
+    die("dup-census: --mode is exact, param, blind or all\n\{USAGE}", 2)
+  }
+  if minLen < 1 { die("dup-census: --min must be at least 1", 2) }
+  if paths.length == 0 { paths.push("compiler") }
+  const list: string[] = []
+  for p in paths { collect(p, list) }
+  for p in list {
+    const src = readTextFile(p)
+    if src is IoError {
+      die("dup-census: cannot read \{p} (\{src.msg})", 2)
+      return
+    }
+    addFile(p, src)
+  }
+  const modes = if mode == "all" { ["exact", "param", "blind"] } else { [mode] }
+  if !asJson {
+    print(
+      "dup-census: \{files.length} files, \{tokFile.length} tokens, \{totalLines()} code lines (\{pyFixed(perLine(), 2)} tokens/line)",
+    )
+  }
+  const js: string[] = []
+  for m in modes {
+    const alpha = buildSeq(m)
+    buildSA(seq, alpha)
+    kasai(seq)
+    if m == "param" { buildParamSA() }
+    if check {
+      const bad = verify(m)
+      if bad > 0 {
+        die(
+          "verify \{m}: \{bad} adjacent pairs out of order or with a wrong LCP",
+          1,
+        )
+      }
+      if !asJson { print("verify \{m}: \{seq.length - 1} adjacent pairs ok") }
+    }
+    const pts = curve()
+    const tb = topBlocks(blocks(m, minLen), top)
+    if asJson { js.push(jsonMode(m, pts, tb)) } else { printMode(m, pts, tb) }
+  }
+  if asJson {
+    print(
+      "{\"files\":\{files.length},\"tokens\":\{tokFile.length},\"lines\":\{totalLines()},\"modes\":[\{join(js, ",")}]}",
+    )
+  }
+}
+
+main()
