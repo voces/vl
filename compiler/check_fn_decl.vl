@@ -493,11 +493,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   const inferring = mode.inferring
   const bareRetVoid = mode.bareRetVoid
   const ucVoided = mode.ucVoided
-  // The infer-stack key: a named function uses its name (so self-recursion is detected); an
-  // anonymous lambda has no name and keys by node index instead — else two nested anonymous
-  // lambdas would both key on "" and the inner would falsely trip the recursive-cycle guard, mis-inferring its return as `void`.
-  let inferKey = n.fnName
-  if inferKey == "" { inferKey = "#L" + i32ToStr(fnIx) }
+  const inferKey = fnDeclInferKey(n, fnIx)
   // Already inferred on demand (a forward call checked this body before pass 2
   // reached it)? Skip the re-check so diagnostics aren't duplicated.
   if inferring {
@@ -524,25 +520,10 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   // Parameter DEFAULTS (`a: i32 = 0`, and the `a?: T` spelling the parser
   // desugars into one), checked once the annotations have resolved.
   checkParamDefaults(n, params, paramTys)
-  if n.fnName != "" && params.length > 0 {
-    const sp0 = P.nodes[params[0]]
-    if sp0 is Param {
-      if sp0.parName == "self" && sp0.parType >= 0 {
-        checkSelfFnReachable(demangleName(n.fnName), paramTys[0], fnIx)
-      }
-    }
-  }
+  fnDeclCheckSelfParam(n, fnIx, params, paramTys)
   // Resolve the return-type annotation (or the pending sentinel when inferring).
   let ret = fnDeclResolveRet(n, fnIx, inferring, paramTys)
-  // A generic nested in another function owns its parameter rows (D3853).
-  const nestedDecl = n.fnName != ""
-    && n.fnTyParams.length > 0
-    && (fnDeclIx[n.fnName] ?? -1) != fnIx
-  if nestedDecl {
-    nestParentOfPut(fnIx, curFnDeclIx)
-    for pt in paramTys { markNestRows(pt, n.fnTyParams, fnIx, 0) }
-    markNestRows(ret, n.fnTyParams, fnIx, 0)
-  }
+  const nestedDecl = fnDeclMarkNested(n, fnIx, paramTys, ret)
   // Save the inference accumulators (a demand-inference can nest inside another
   // function's body check) and the enclosing return type.
   const savedObserved = inferObserved
@@ -557,15 +538,7 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
   const savedRetNatural = retNatural
   const savedRetNaturalErr = retNaturalErr
   const pinnedReads0 = lbiPinnedReads
-  retNaturalSet(-1)
-  retNaturalErrSet(false)
-  if inferring {
-    inferStack.push(inferKey)
-    inferObservedSet(-1)
-    inferObservedLitSet(true)
-    inferSawErrSet(false)
-    fnSawValueRetSet(false)
-  }
+  fnDeclResetInference(inferring, inferKey)
   // A function body checked here can capture whatever narrowings are live around it, and
   // it runs later — so a narrowing installed before this point and retired after it would
   // be retired behind the capture's back. `narFnEpoch` is how the write side tells the two
@@ -594,6 +567,112 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
     ret,
     ucVoided,
   )
+  fnDeclLeaveBody(
+    n,
+    fnIx,
+    savedFrame,
+    daSavedUnassigned,
+    fsbCallsAt,
+    cstrOwnerPushed,
+    savedClob,
+  )
+  fnDeclJoinDropped(inferring, savedDroppedLen)
+  inferObservedSet(inferRetF32Join(inferring, inferObserved))
+  if inferring {
+    ret = fnDeclInferredRet(
+      n,
+      fnIx,
+      paramTys,
+      paramUninferable || bareBraceCount > bbBefore,
+      cbBefore,
+      savedObserved,
+      savedObservedLit,
+      savedSawErr,
+      savedValueRet,
+      bodyTotalForRet,
+    )
+  }
+  refuseVoidRetsFrom(savedVoidRetLen, ret)
+  inferRetLogTruncate(savedRetLogLen)
+  fnDeclRefuseFallOff(n, ret, bodyTotalForRet)
+  fnDeclNoteRedundantRet(n, fnIx, ret, inferring, pinnedReads0)
+  retNaturalSet(savedRetNatural)
+  retNaturalErrSet(savedRetNaturalErr)
+  fnDeclRegisterGuard(n, params)
+  // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
+  // named function referenced as a value) evaluates to it.
+  mkFuncTy(paramTys, ret)
+}
+
+// The infer-stack key of declaration `n` at node `fnIx`: its name, so self-recursion is
+// detected, or `#L<fnIx>` for an anonymous lambda, so two nested lambdas never share one.
+function fnDeclInferKey(n: FuncDecl, fnIx: i32): string {
+  if n.fnName == "" { return "#L" + i32ToStr(fnIx) }
+  n.fnName
+}
+
+// A named `self`-first declaration is checked as reachable from its receiver type.
+function fnDeclCheckSelfParam(
+  n: FuncDecl,
+  fnIx: i32,
+  params: i32[],
+  paramTys: i32[],
+) {
+  if n.fnName != "" && params.length > 0 {
+    const sp0 = P.nodes[params[0]]
+    if sp0 is Param {
+      if sp0.parName == "self" && sp0.parType >= 0 {
+        checkSelfFnReachable(demangleName(n.fnName), paramTys[0], fnIx)
+      }
+    }
+  }
+  0
+}
+
+// Whether `n` is a generic nested in another function, which owns its parameter rows (D3853);
+// when it is, its parameter and return types `paramTys` and `ret` are marked as its own.
+function fnDeclMarkNested(
+  n: FuncDecl,
+  fnIx: i32,
+  paramTys: i32[],
+  ret: i32,
+): boolean {
+  const nestedDecl = n.fnName != ""
+    && n.fnTyParams.length > 0
+    && (fnDeclIx[n.fnName] ?? -1) != fnIx
+  if nestedDecl {
+    nestParentOfPut(fnIx, curFnDeclIx)
+    for pt in paramTys { markNestRows(pt, n.fnTyParams, fnIx, 0) }
+    markNestRows(ret, n.fnTyParams, fnIx, 0)
+  }
+  nestedDecl
+}
+
+// Starts this body's return accumulators empty; an inferring body is pushed on the infer stack under `inferKey`.
+function fnDeclResetInference(inferring: boolean, inferKey: string) {
+  retNaturalSet(-1)
+  retNaturalErrSet(false)
+  if inferring {
+    inferStack.push(inferKey)
+    inferObservedSet(-1)
+    inferObservedLitSet(true)
+    inferSawErrSet(false)
+    fnSawValueRetSet(false)
+  }
+  0
+}
+
+// Closes the body of declaration `n` at node `fnIx`: the frames, type parameters, scope and
+// ledger the caller opened are put back, and a top-level declaration is marked checked.
+function fnDeclLeaveBody(
+  n: FuncDecl,
+  fnIx: i32,
+  savedFrame: FnBodyFrame,
+  daSavedUnassigned: i32[],
+  fsbCallsAt: i32,
+  cstrOwnerPushed: boolean,
+  savedClob: NarClobLedger,
+) {
   fnDeclLeaveBodyFrame(savedFrame)
   daLeaveFrame(daSavedUnassigned)
   // A write after a call in source order (a loop's back edge) is re-asked here, inside this body,
@@ -618,41 +697,50 @@ function checkFuncDeclNodeReal(n: FuncDecl, fnIx: i32) {
       bodyChecked[n.fnName] = true
     }
   }
-  fnDeclJoinDropped(inferring, savedDroppedLen)
-  inferObservedSet(inferRetF32Join(inferring, inferObserved))
-  if inferring {
-    ret = finishInferredReturn(
-      n,
-      fnIx,
-      paramTys,
-      paramUninferable || bareBraceCount > bbBefore,
-      cbBefore,
-      savedObserved,
-      savedSawErr,
-      savedValueRet,
-      bodyTotalForRet,
-    )
-    inferObservedLitSet(savedObservedLit)
-    // Inferred non-void after all: the tail's value arms return (`clearTailVerdict`).
-    if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
-      clearTailVerdict(blockLastStmt(n.fnBody))
-    }
+  0
+}
+
+// The return type inferred for declaration `n` once its body is checked; the `saved*`
+// accumulators are the enclosing inference's, and the observed-literal one is put back.
+function fnDeclInferredRet(
+  n: FuncDecl,
+  fnIx: i32,
+  paramTys: i32[],
+  causeReported: boolean,
+  cbBefore: i32,
+  savedObserved: i32,
+  savedObservedLit: boolean,
+  savedSawErr: boolean,
+  savedValueRet: boolean,
+  bodyTotalForRet: boolean,
+): i32 {
+  const ret = finishInferredReturn(
+    n,
+    fnIx,
+    paramTys,
+    causeReported,
+    cbBefore,
+    savedObserved,
+    savedSawErr,
+    savedValueRet,
+    bodyTotalForRet,
+  )
+  inferObservedLitSet(savedObservedLit)
+  // Inferred non-void after all: the tail's value arms return (`clearTailVerdict`).
+  if ret >= 0 && !isVoidTy(ret) && ret != TY_ERR {
+    clearTailVerdict(blockLastStmt(n.fnBody))
   }
-  refuseVoidRetsFrom(savedVoidRetLen, ret)
-  // This body's witnesses belong to its own inference, not to an enclosing `if`'s replay.
-  while inferRetLogTy.length > savedRetLogLen {
+  ret
+}
+
+// Drops the return witnesses logged past `len`: they belong to the body just checked, not to an enclosing `if`'s replay.
+function inferRetLogTruncate(len: i32) {
+  while inferRetLogTy.length > len {
     inferRetLogTy.pop()
     inferRetLogSeed.pop()
     inferRetLogLit.pop()
   }
-  fnDeclRefuseFallOff(n, ret, bodyTotalForRet)
-  fnDeclNoteRedundantRet(n, fnIx, ret, inferring, pinnedReads0)
-  retNaturalSet(savedRetNatural)
-  retNaturalErrSet(savedRetNaturalErr)
-  fnDeclRegisterGuard(n, params)
-  // The function's own type — a FuncDecl in EXPRESSION position (a lambda, or a
-  // named function referenced as a value) evaluates to it.
-  mkFuncTy(paramTys, ret)
+  0
 }
 
 // How `checkFuncDeclNodeReal` treats a declaration's return: `inferring` when it is solved from
