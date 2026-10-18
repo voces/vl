@@ -272,7 +272,6 @@ import {
   moduleBindsLoopVar,
   moduleLocalLetOf,
   moduleLocalLetOfAt,
-  monoIsGenericDecl,
   nameIsBareMap,
   nameIsF32Array,
   nameIsF64Array,
@@ -399,8 +398,6 @@ import {
   popUnionBoxElem,
 } from "./emit_fn_ret_kinds"
 import {
-  armTailValue,
-  exprIsNullLike,
   exprIsNullLit,
   ifChainYieldsNull,
   ifElseValueIx,
@@ -539,7 +536,6 @@ import {
 } from "./emit_narrow_slots"
 import {
   annIsNulStrListDeep,
-  annIsU8Array,
   annValtypeSlotOf,
   anonLeafParamRowOf,
   arrNewFillAnnKind,
@@ -653,7 +649,6 @@ import {
   dsgReady,
   emptyArrHoleKind,
   fnParamKindListSlot,
-  fnRetAnnF32ArraySid,
   fnTyParamKindListSlot,
   letAnnRefListKind,
   letAnnStructIdx,
@@ -6135,31 +6130,6 @@ export function spreadDestRow(elems: i32[], fnIx: i32) {
     i = i + 1
   }
   0
-}
-
-// Whether every arm of the if-join at `ifIx` that has a list rep of its own has `k`: a `null` or
-// empty `[]` arm takes the join's, and any other disagreement is a join of two list types, which
-// the if-join gate keeps apart from either (D2831).
-function ifArmsAgreeOnListRep(ifIx: i32, k: VKind, fnIx: i32): boolean {
-  let cur = ifIx
-  while cur >= 0 {
-    const s = P.nodes[cur]
-    cur = -1
-    if s is IfStmt {
-      if !armAgreesOnListRep(s.ifThen, k, fnIx) { return false }
-      if s.ifElse >= 0 {
-        if P.nodes[s.ifElse] is IfStmt { cur = s.ifElse }
-        else if !armAgreesOnListRep(s.ifElse, k, fnIx) { return false }
-      }
-    }
-  }
-  true
-}
-
-function armAgreesOnListRep(blockIx: i32, k: VKind, fnIx: i32): boolean {
-  const tv = armTailValue(blockIx)
-  if tv < 0 || exprIsNullLike(tv) || emptyArrLitIxOf(tv) >= 0 { return true }
-  exprListRep(tv, fnIx) == k
 }
 
 // True when one arm of the join at `ifIx` holds an interned atom and the other a string: the
@@ -17337,29 +17307,14 @@ function tyMayInstUnion(raw: i32): boolean {
 }
 
 // `exprListRep`'s answer from the expression's shape alone, for a node the column does not
-// cover or whose instance is still being chosen.
+// cover or whose instance is still being chosen. A name or field read keeps its declaration's
+// rung: its node can be typed at a type parameter its instance does not bind, with no column.
 function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   if e is ArrayLit { return arrLitListRep(exprIx, fnIx) }
   // A parenthesised read falls back to the column, as the rungs below do.
   if e is Paren {
     return exprListRep(e.parInner, fnIx) ?? columnListRep(exprIx, fnIx)
-  }
-  // An if-expression is its join's rep, read off the arm that decides it (D2210).
-  if e is IfStmt {
-    const ik = ifExprRefKind(exprIx, fnIx)
-    // Where the join's type does not decide its rep, arms that agree give it: a type parameter, an
-    // instance-rebuilt join, or a literal-union list, an atom or string list by its arms (D5280).
-    const jt = nodeTyIxOf(exprIx)
-    if jt < 0 || tyHasTyVar(jt) || tyIsLitUnionArray(jt) {
-      const tk = listRepOrNull(ik)
-      if tk != null {
-        // Arms that disagree join two list types, which no one list rep holds (D2832).
-        if ifArmsAgreeOnListRep(exprIx, tk, fnIx) { return tk }
-        return null
-      }
-    }
-    return gatedListRep(ik, "if-join")
   }
   if e is Ident {
     const ik = identListRep(exprIx, fnIx)
@@ -17369,18 +17324,8 @@ function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
   if e is Member {
     return memberListRep(exprIx, fnIx) ?? columnListRep(exprIx, fnIx)
   }
-  if e is Call {
-    // A `.map`/`.filter`/`.slice` result is its element's list, or none where that is unknown.
-    if callIsMapFilter(exprIx, fnIx) || callIsArrSlice(exprIx, fnIx) {
-      return gatedListRep(
-        listRepOfMf(mfResultKindOf(exprIx, fnIx)),
-        "map-filter",
-      )
-    }
-    return calleeListRep(exprIx, fnIx) ?? columnListRep(exprIx, fnIx)
-  }
-  // An index, operator or `?.` read has no shape rung: it reads the column.
-  if e is Index || e is BinExpr || e is OptMember {
+  // An if-expression, call, index, operator or `?.` read has no shape rung: it reads the column.
+  if e is IfStmt || e is Call || e is Index || e is BinExpr || e is OptMember {
     return columnListRep(exprIx, fnIx)
   }
   null
@@ -17413,38 +17358,6 @@ function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
     if nk == ALK_I64 { return "i64list" }
     if nk == ALK_F64 { return "f64list" }
     return "list"
-  }
-  null
-}
-
-// The list rep a call of a named callee returns: its resolved return rep (the i64 list is left
-// to the recorded type), an annotated `f32[]` or `u8[]` return, or a closure value's signature.
-// A generic callee answers nothing, a hole function included: its row is the template's, not
-// this call's instance.
-function calleeListRep(exprIx: i32, fnIx: i32): VKind | null {
-  const e = P.nodes[exprIx]
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const sid = sidOfNode(e.callFn)
-      const cfi = fnIndexOfAt(sid, fnIx, e.callFn)
-      if cfi >= 0 && monoIsGenericDecl(fnStmts[cfi]) { return null }
-      const rk = gatedListRep(
-        repOfNameResult(sid, callee.identName, fnIx, e.callFn).rdKind,
-        "callee-return",
-      )
-      if rk != null { return rk }
-      if fnRetAnnF32ArraySid(sid, callee.identName, fnIx, e.callFn) {
-        return "f32list"
-      }
-      if cfi >= 0 {
-        const fd = P.nodes[fnStmts[cfi]]
-        if fd is FuncDecl {
-          if annIsU8Array(fd.fnRet) { return "u8list" }
-        }
-      }
-      return gatedListRep(calleeRetKindAt(sid, fnIx, e.callFn), "callee-value")
-    }
   }
   null
 }
