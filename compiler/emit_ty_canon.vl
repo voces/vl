@@ -102,6 +102,7 @@ import {
   mTwinExtra,
   mTwinShapes,
   mTwinTys,
+  monoArgInstFe,
   monoExactSubN,
   monoExactSubRow,
   monoExactSubT,
@@ -132,7 +133,12 @@ import {
   unionSetMemberCount,
 } from "./emit_union_registry"
 import { i32ListHas } from "./listutil"
-import { bindGenWalk, substTyDeep, tyProvesNonNull } from "./check_relate_core"
+import {
+  bindGenWalk,
+  holeJoinRefoldOf,
+  substTyDeep,
+  tyProvesNonNull,
+} from "./check_relate_core"
 import {
   flattenVariantsInto,
   numLitUnionHasBase,
@@ -1373,7 +1379,29 @@ export function nodeTyInOf(ix: i32, fnIx: i32): i32 {
   if s >= 0 { return s }
   const c = instanceChainTyOf(raw, fnIx)
   if c >= 0 { return c }
+  const a = argInstTyOf(ix, raw)
+  if a >= 0 { return a }
   nodeTyPinIxOf(ix)
+}
+
+// A module-scope call argument whose type `raw` names the callee's type variables, read at the
+// pins (then the exact bindings) of the instance that call reaches; -1 where none closes it.
+function argInstTyOf(ix: i32, raw: i32): i32 {
+  if monoArgInstFe.length == 0 || !monoArgInstFe.has(ix) { return -1 }
+  const pos = monoArgInstFe.get(ix) ?? -1
+  let cur = raw
+  const pr = monoPinSubRow.get(pos) ?? -1
+  if pr >= 0 && pr < monoPinSubN.length {
+    cur = substTyDeep(cur, monoPinSubN[pr], monoPinSubT[pr])
+    if cur < 0 { return -1 }
+  }
+  const xr = monoExactSubRow.get(pos) ?? -1
+  if tyHasTyVar(cur) && xr >= 0 && xr < monoExactSubN.length {
+    cur = substTyDeep(cur, monoExactSubN[xr], monoExactSubT[xr])
+    if cur < 0 { return -1 }
+  }
+  if cur >= T.tys.length || tyHasTyVar(cur) { return -1 }
+  cur
 }
 
 // `ty` read through every instance `fnIx` is, or is lifted inside, innermost first: a type
@@ -1401,6 +1429,44 @@ function instanceChainTyOf(ty: i32, fnIx: i32): i32 {
     guard = guard + 1
   }
   -1
+}
+
+// Whether an open `ty` inside `fnIx` has no instance binding to be read at: `fnIx`'s chain holds
+// no instance row, a hole instance on it binds a hole to an open type, or its rows bind `ty`'s
+// variables only to types that are themselves open.
+export function instanceBindsNothingClosed(ty: i32, fnIx: i32): boolean {
+  if fnIx < 0 { return true }
+  let pos = fnStmtsPosOf(fnIx)
+  let guard = 0
+  let cur = ty
+  let rows = 0
+  while pos >= 0 && guard <= fnStmts.length {
+    const pr = monoPinSubRow.get(pos) ?? -1
+    if pr >= 0 && pr < monoPinSubN.length {
+      rows = rows + 1
+      cur = substTyDeep(cur, monoPinSubN[pr], monoPinSubT[pr])
+      if cur < 0 { return false }
+    }
+    const xr = monoExactSubRow.get(pos) ?? -1
+    if xr >= 0 && xr < monoExactSubN.length {
+      rows = rows + 1
+      cur = substTyDeep(cur, monoExactSubN[xr], monoExactSubT[xr])
+      if cur < 0 { return false }
+    }
+    const hr = monoHoleSubRow.get(pos) ?? -1
+    if hr >= 0 && hr < monoHoleSubN.length {
+      rows = rows + 1
+      for b in monoHoleSubT[hr] {
+        if b >= 0 && b < T.tys.length && tyHasTyVar(b) { return true }
+      }
+      cur = substTyDeep(cur, monoHoleSubN[hr], monoHoleSubT[hr])
+      if cur < 0 { return false }
+    }
+    if pos >= fnParent.length { break }
+    pos = fnParent[pos]
+    guard = guard + 1
+  }
+  rows == 0 || (cur != ty && tyHasTyVar(cur))
 }
 
 // The union of lists an if or `match` join at `ix` stays at the pins of instance `fnIx`, where
@@ -1452,15 +1518,22 @@ function holeTyRead(ty: i32, bNames: string[], bTys: i32[], depth: i32): i32 {
       return mkNullableTyOf(n)
     }
     TyUnion => {
-      // Members that all read as one type are that type; another union needs the checker's join.
+      // Members that all read as one type are that type; a deferred join re-joins as the
+      // checker re-folds it, and any other union is not rebuilt here.
       let one = -1
+      let apart = false
+      const reads: i32[] = []
       for m in t.uMembers {
         const mb = holeTyRead(m, bNames, bTys, depth + 1)
         if mb < 0 { return -1 }
-        if one >= 0 && mb != one && !tySame(mb, one) { return -1 }
+        if one >= 0 && mb != one && !tySame(mb, one) { apart = true }
         one = mb
+        reads.push(mb)
       }
-      return one
+      if !apart { return one }
+      const rj = holeJoinRefoldOf(ty, reads)
+      if rj < 0 || rj >= T.tys.length || tyHasTyVar(rj) { return -1 }
+      return rj
     }
     TyObj | TyMap | TyFunc | TyNeg => {
       // A record, map, function or negated type is not rebuilt here: the caller asks its next
