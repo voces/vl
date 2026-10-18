@@ -83,7 +83,6 @@ import {
   mapValNameOf,
   nameIsClosureArrayTy,
   nameIsMap,
-  nameIsNulStrList,
   nameIsU8Array,
   nulCloFlag,
   nullablePartOf,
@@ -103,7 +102,6 @@ import {
   tyIsFuncType,
   tyIsNulBareMap,
   tyIsNulBool,
-  tyNameOf,
   unwrapParen,
 } from "./emit_base"
 import { listRepOfFieldCode } from "./emit_list_rep"
@@ -325,9 +323,16 @@ export function inferNullFallsThrough(fnIx: i32): boolean {
 // cannot resolve different rows (D1220).
 export function inferRetNulPinned(irk: string): boolean {
   if inferRetIsNulList(irk) { return true }
-  const part = nullablePartOf(inferRetNameOf(irk))
-  if part == "" { return false }
-  structIndexOfTypeName(part) >= 0
+  const itx = inferRetTyIxOf(irk)
+  if itx < 0 { return false }
+  const it = T.tys[itx]
+  if !(it is TyNullable) { return false }
+  const inner = it.nInner
+  if inner < 0 { return false }
+  // A union arm with no struct row of its own is the `nulvariant` kind, never pinned here.
+  const vr = variantRowOfTy(inner)
+  if vr >= 0 && structIndexOfTypeName(uVariants[vr]) < 0 { return false }
+  structRowOfTy(inner) >= 0 || repRowOfTyStruct(inner, sScanLim()) >= 0
 }
 
 // True if the arm at `blockIx` is a BLOCK with no statements — the shape that has no tail to
@@ -455,39 +460,25 @@ export function fnMvValsOutLocal(slot: i32) { mvValsOutBase + slot }
 
 export function retNulRefFlag(tyIx: i32) {
   if tyIx >= 0 {
-    // STRUCTURAL fast-path (C1): the checker recorded this node's type as a nullable declared
-    // struct (`S | null`). Confirms only; `string | null` and everything else fall to the name path.
+    // The checker recorded this node's type as a nullable declared struct (`S | null`).
     if nodeTyIsNulStruct(tyIx) { return 1 }
     const ty = P.nodes[tyIx]
     if ty is TypeRef {
-      const base = nullablePartOf(ty.tyName)
-      // `string` is the raw i32 array, NOT a struct — `string | null` is the kind-16
-      // nullable-string ref (`retNulStringFlag`), never a nullable struct. Exclude it
-      // here so it isn't mis-claimed as kind 9 (which would read the box as a struct).
-      if base == "string" { return 0 }
       // A union variant with no struct row is `nulvariant`, not kind 9 (`retNulVariantFlag`
       // is the positive answer) — excluded here, at the one producer: `collectS` refuses a
       // variant its own struct row, so every `nulstruct` answer pairs a real struct index.
-      if base != "" {
-        if variantIndexOf(base) >= 0 && structIndexOfTypeName(base) < 0 {
-          return 0
-        }
-      }
-      if base != "" {
-        // The `structIndexOfTypeName` half is load-bearing: a name can be both a variant and
-        // a declared struct (`std/fs.vl`'s `IoResult`), which keeps its real struct row.
-        const nrt = nodeRepTyIxOf(tyIx)
-        if nrt >= 0 {
-          const tn = T.tys[nrt]
-          if tn is TyNullable {
-            if tn.nInner >= 0 {
-              const ti2 = T.tys[tn.nInner]
-              if ti2 is TyObj { return 1 }
-            }
-            return 0
+      if nulVariantIndexOf(tyIx) >= 0 { return 0 }
+      // Otherwise the rep column answers: a nullable object is kind 9, and `string | null`
+      // (the kind-16 ref) or a node with no nullable rep is not.
+      const nrt = nodeRepTyIxOf(tyIx)
+      if nrt >= 0 {
+        const tn = T.tys[nrt]
+        if tn is TyNullable {
+          if tn.nInner >= 0 {
+            const ti2 = T.tys[tn.nInner]
+            if ti2 is TyObj { return 1 }
           }
         }
-        if structIndexOfTypeName(base) >= 0 { return 1 }
       }
     }
   }
@@ -495,8 +486,7 @@ export function retNulRefFlag(tyIx: i32) {
 }
 
 // A nullable union variant annotation or expression (`Circle | null`, `x as? Circle`) — `1`,
-// else `0`. Disjoint from `retNulRefFlag` by construction: that flag returns 0 for exactly
-// what this one claims, since a variant has no struct row for the arena to ask about.
+// else `0`. Disjoint from `retNulRefFlag`, which returns 0 wherever this index answers.
 // Defined in terms of the index (`nulVariantIndexOf`), so the kind/slot pair can't disagree.
 export function retNulVariantFlag(tyIx: i32) {
   if nulVariantIndexOf(tyIx) >= 0 { return 1 }
@@ -504,23 +494,11 @@ export function retNulVariantFlag(tyIx: i32) {
 }
 
 // The variant table index behind a `Circle | null` annotation or expression at `tyIx`, or
-// -1 — the `nulvariant` half of `annValtypeSlotOf`'s kind/slot pairing. Two rungs: the name
-// answers an annotation, the arena an expression with a recorded type and no spelling
-// (`mk(a) as? Circle`), since `variantRowOfTy` matches only by arena-index identity.
+// -1 — the `nulvariant` half of `annValtypeSlotOf`'s kind/slot pairing, read off the recorded
+// type, so a context-typed lambda parameter spelled by shape (`{r:i32}|null`) finds the row
+// its declared twin does. A variant that also has a struct row keeps kind 9.
 export function nulVariantIndexOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
-  const ty = P.nodes[tyIx]
-  if ty is TypeRef {
-    const base = nullablePartOf(ty.tyName)
-    if base != "" {
-      const nvn = variantIndexOf(base)
-      // ONLY where the struct table refused a row — see `retNulRefFlag`'s matching gate.
-      // A name that is both a variant and a declared struct keeps the kind-9 niche it
-      // already lowers with, so this kind never takes a position that works today.
-      if nvn >= 0 && structIndexOfTypeName(base) < 0 { return nvn }
-      return -1
-    }
-  }
   const nvt = nodeTyIxOf(tyIx)
   if nvt >= 0 {
     const nvty = T.tys[nvt]
@@ -984,9 +962,9 @@ function tyIsNulStrArr(ty: i32) {
   false
 }
 
-// `nameIsNulStrListDeep` asked of a type-annotation node, with the atom-niche element
-// ruled out structurally first: an inline `(("a" | "b") | null)[]` renders `(string |
-// null)[]` after canon, so the name predicate alone would mis-route it to the string backing.
+// True if the type-annotation node at `tyIx` is a `(string | null)[]`, also through one
+// `| null` wrapper (the form a `!= null` narrow leaves). An inline `(("a" | "b") | null)[]` is
+// the atom niche, not the string backing. A node with no recorded type answers false.
 export function annIsNulStrListDeep(tyIx: i32) {
   if tyIx < 0 { return false }
   let ty = nodeTyIxOf(tyIx)
@@ -995,11 +973,8 @@ export function annIsNulStrListDeep(tyIx: i32) {
     if t is TyNullable { ty = t.nInner }
   }
   if tyIsNulLitUnionArr(ty) { return false }
-  // The arena answers the positive half too, so this predicate doesn't render a type and
-  // pattern-match the render.
   if ty >= 0 { return tyIsNulStrArr(ty) }
-  // A node the checker did not record still falls back to the spelling.
-  nameIsNulStrListDeep(tyNameOf(tyIx))
+  false
 }
 
 export function vtKindOfType(tyIx: i32): VKind {
@@ -1432,17 +1407,6 @@ export function structIdxOfElemName(name: string) {
   const rr = repRowOfName(n, sScanLim())
   if rr >= 0 { return rr }
   structIndexOfTypeName(n)
-}
-
-// True if `name` is a `(string | null)[]`, also through one `| null` wrapper
-// (`(string | null)[] | null`, the form a `!= null` narrow leaves behind). The one home for
-// a block three sibling classifiers carried verbatim, so they cannot drift on whether the
-// wrapper counts.
-function nameIsNulStrListDeep(name: string) {
-  if nameIsNulStrList(name) { return true }
-  const p = nullablePartOf(name)
-  if p != "" { return nameIsNulStrList(p) }
-  false
 }
 
 // The ladder↔descriptor agreement oracle: per (family, ladder answer, descriptor answer)
