@@ -2726,11 +2726,11 @@ in-language GC knobs.
   a generic function value crosses — an annotated binding, a concrete function-typed call
   ARGUMENT, an annotated RETURN, an ARRAY element, a struct FIELD (declared alias or inline shape)
   — and a binding used only as a direct-call callee monomorphizes per call site at FUNCTION and
-  MODULE scope alike. REMAINING: a generic passed to a HOF whose CALLBACK PARAMETER is itself
-  un-annotated (`function apply(g, x, y) { return g(x, y) }`) — nothing declares a type to
-  materialize against, so it needs the callback's type inferred from the HOF's own BODY. The
-  reject names the function, the un-annotated parameters, and the signatures the program's own
-  call sites already pin (`error-generic-fn-value-inferred-hof.vl`). What a nested CAPTURING
+  MODULE scope alike. A generic passed to a HOF whose CALLBACK PARAMETER is itself un-annotated
+  runs too, at each type the HOF calls it at (D5611, `generic-fn-value-inferred-hof.vl`).
+  REMAINING: the same through an EXPORTED HOF or a recursive one (D6091), where the reject
+  names the function, the un-annotated parameters, and the signatures the program's own call
+  sites already pin (`error-generic-fn-value-inferred-hof-exported.vl`). What a nested CAPTURING
   function owed this entry was filed as exactly ONE loud arm — a nested function whose OWN
   parameter is un-annotated, lowered through the value ABI at the i32 default and refused even
   though it is only ever called directly by name (`function o(n) { function k(x) x + n; k(1) }`
