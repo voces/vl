@@ -473,28 +473,7 @@ export function criClassify(rx0: i32, i: i32) {
     return 0
   }
   if retKindIsList(fRetKind[i]) { criJoinedListKind(i, rx0) }
-  // An assignment's value is its target cell, not the rhs expression, and that is a property
-  // of the function rather than of this return node — so it answers for every node of such a
-  // function and returns, letting no expression fact touch the slot afterwards. The cell kind
-  // is a direct write, so leaving the eager writes beside it would never reach a fixed point.
-  const ark = fnAssignRetKind(i)
-  if ark != null {
-    if fRetKind[i] != ark {
-      fRetKind[i] = ark
-      criChanged = true
-    }
-    // The per-kind payload columns the result valtype needs beside the kind;
-    // `emit_sections`' inferred-return arm reads exactly these.
-    if ark == "struct" || ark == "nulstruct" {
-      fRetStructIdx[i] = fnAssignRetSlot(i)
-    }
-    if ark == "reflist" {
-      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
-        fRetRArrElem[i] = fnAssignRetElemName(i)
-      }
-    }
-    return 0
-  }
+  if criClassifyAssignRet(i) { return 0 }
   // A tail assignment yields its rhs, so the function's return kind is the rhs's kind; a
   // literal the target's type built (`c[0] = [3.5, 4]` over `(i32 | f64)[][]`) is the target's (D2395).
   const rxe = P.nodes[rx]
@@ -521,8 +500,66 @@ export function criClassify(rx0: i32, i: i32) {
       criSetRetKind(i, "map")
     }
   }
-  // A returned element of a local ref list (`c[0]` over `(i32 | f64)[][]`), whose collected
-  // kind this pass does not have: the arena type names the ref-list row (D2396).
+  criClassifyArenaRefList(rx, i)
+  // The not-a-list guard is what separates i32 and f64 lists here: `exprArray`'s array-literal
+  // case is `!arrLitIsRef` and an f64 element is not a ref, so it also claims `[1.5, 2.5]`.
+  // The f64-list arm above has already set the kind, so this one skips it.
+  if !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
+    criSetRetKind(i, "list")
+  }
+  criClassifyUnionNul(rx, i)
+  criClassifyStruct(rx, i)
+  // A returned nested-struct field read whose chain roots at a local — the member twin of the
+  // returned-local rungs below, blind for the identical reason (D131). `"nulstruct"` and not
+  // `"struct"`: the lowering codes fold `inner: S` and `inner: S | null` onto one code-15 hop
+  // and the slot is `(ref null $S)` either way. Ahead of that block; it fills holes only.
+  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
+    const rnf = criRetNestedFieldStructIdx(rx, i)
+    if rnf >= 0 {
+      if criSetRetKind(i, "nulstruct") { fRetStructIdx[i] = rnf }
+    }
+  }
+  criClassifyLocalLet(rx, i)
+  // The nullable-closure niche, decided by the arena rather than a rendered name: a
+  // `TyNullable` over a `TyFunc`. The non-null closure never reaches this column — its
+  // channel is `fnReturnsClosure`, a boolean read ahead of the inferred kind — so this arm
+  // and that one cannot both claim one return (D1622).
+  if fRetKind[i] != "nulclosure" && nodeTyIsNulFunc(rx) {
+    criSetRetKind(i, "nulclosure")
+  }
+  criClassifyScalarTail(rx, i)
+  0
+}
+
+// `criClassify`'s assignment-valued function: an assignment's value is its target cell, not
+// the rhs expression, so the cell kind answers for every return node of function `i` and no
+// expression fact may touch the slot afterwards (a direct write beside the eager ones would
+// never reach a fixed point). True when it answered.
+function criClassifyAssignRet(i: i32) {
+  const ark = fnAssignRetKind(i)
+  if ark != null {
+    if fRetKind[i] != ark {
+      fRetKind[i] = ark
+      criChanged = true
+    }
+    // The per-kind payload columns the result valtype needs beside the kind;
+    // `emit_sections`' inferred-return arm reads exactly these.
+    if ark == "struct" || ark == "nulstruct" {
+      fRetStructIdx[i] = fnAssignRetSlot(i)
+    }
+    if ark == "reflist" {
+      if i < fRetRArrElem.length && fRetRArrElem[i] == "" {
+        fRetRArrElem[i] = fnAssignRetElemName(i)
+      }
+    }
+    return true
+  }
+  false
+}
+
+// `criClassify`'s returned element of a local ref list (`c[0]` over `(i32 | f64)[][]`), whose
+// collected kind this pass does not have: the arena type names the ref-list row (D2396).
+function criClassifyArenaRefList(rx: i32, i: i32) {
   if !retKindIsList(fRetKind[i]) {
     const rrTy = nodeTyIxOf(rx)
     if rrTy >= 0 && T.tys[rrTy] is TyArray {
@@ -536,12 +573,10 @@ export function criClassify(rx0: i32, i: i32) {
       }
     }
   }
-  // The not-a-list guard is what separates i32 and f64 lists here: `exprArray`'s array-literal
-  // case is `!arrLitIsRef` and an f64 element is not a ref, so it also claims `[1.5, 2.5]`.
-  // The f64-list arm above has already set the kind, so this one skips it.
-  if !retKindIsList(fRetKind[i]) && exprArray(rx, fnStmts[i]) {
-    criSetRetKind(i, "list")
-  }
+}
+
+// `criClassify`'s union and nullable-struct rungs for the return expression `rx` of function `i`.
+function criClassifyUnionNul(rx: i32, i: i32) {
   if fRetKind[i] != "union" && exprUnion(rx, fnStmts[i]) {
     // A union return subsumes a per-arm struct classification: a value-if join has one arm a
     // union-variant object literal, which `exprStruct` would also claim as a plain struct, and
@@ -566,6 +601,11 @@ export function criClassify(rx0: i32, i: i32) {
       fRetStructIdx[i] = structIndexOfExpr(rx, fnStmts[i])
     }
   }
+}
+
+// `criClassify`'s concrete-variant and plain-struct rungs for the return expression `rx` of
+// function `i`, each filling the kind and its struct row only while no record kind is set.
+function criClassifyStruct(rx: i32, i: i32) {
   // A return expression that already yields a concrete variant — the expression-level twin of
   // the annotated-local rung below. Safe by `exprVariantIndex`'s own property, not by
   // inspection here: every arm of it is rep-authoritative rather than a shape match, and it
@@ -612,24 +652,11 @@ export function criClassify(rx0: i32, i: i32) {
       }
     }
   }
-  // A returned nested-struct field read whose chain roots at a local — the member twin of the
-  // returned-local rungs below, blind for the identical reason (D131). `"nulstruct"` and not
-  // `"struct"`: the lowering codes fold `inner: S` and `inner: S | null` onto one code-15 hop
-  // and the slot is `(ref null $S)` either way. Ahead of that block; it fills holes only.
-  if fRetKind[i] == "i32" && fRetBool[i] == 0 {
-    const rnf = criRetNestedFieldStructIdx(rx, i)
-    if rnf >= 0 {
-      if criSetRetKind(i, "nulstruct") { fRetStructIdx[i] = rnf }
-    }
-  }
-  criClassifyLocalLet(rx, i)
-  // The nullable-closure niche, decided by the arena rather than a rendered name: a
-  // `TyNullable` over a `TyFunc`. The non-null closure never reaches this column — its
-  // channel is `fnReturnsClosure`, a boolean read ahead of the inferred kind — so this arm
-  // and that one cannot both claim one return (D1622).
-  if fRetKind[i] != "nulclosure" && nodeTyIsNulFunc(rx) {
-    criSetRetKind(i, "nulclosure")
-  }
+}
+
+// `criClassify`'s last rungs for the return expression `rx` of function `i`: the
+// boolean flag, the wide scalars and the returned local's own kind.
+function criClassifyScalarTail(rx: i32, i: i32) {
   if fRetBool[i] == 0 && exprIsBool(rx, fnStmts[i]) {
     fRetBool[i] = 1
     criChanged = true
@@ -657,7 +684,6 @@ export function criClassify(rx0: i32, i: i32) {
     const lk = retLocalCellKind(rx, i)
     if lk != null { criSetRetKind(i, lk) }
   }
-  0
 }
 
 // `criClassify`'s list rungs for the return expression `rx` of function `i`: the ref, string,

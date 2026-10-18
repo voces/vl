@@ -11195,28 +11195,8 @@ function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
   // field site that threaded a ref-list annotation (`pendingListKind` 1 or 2, and
   // `pendingListSlot` the element slot) is authoritative: its declared element type wins over
   // the first-element field-shape guess. An un-annotated literal types itself from element 0.
-  const annKind = pendingListKind
-  const annSlot = pendingListSlot
-  let rslot = 0
-  if (
-    annKind == LBK_REF
-    || annKind == LBK_UNION
-    || annKind == LBK_REF_AT_SLOT
-  ) {
-    rslot = annSlot
-  } else if elems.length >= 1 {
-    rslot = rlSlotByName(arrLitElemNameIn(arrIx, fnIx))
-  } else {
-    rslot = annSlot
-  }
-  if rslot < 0 {
-    if rlElemName.length < 1 {
-      return emitFail(
-        "emitProgram: ref array literal with no interned element type",
-      )
-    }
-    rslot = 0
-  }
+  const rslot = arrRefSlotOf(arrIx, elems, fnIx)
+  if rslot < 0 { return -1 }
   // A STRUCT-element list (kind 1, NOT a union box) types each element literal as the
   // list's declared element struct — seed `pendingStructIdx` (consumed by `emitObj`)
   // so a same-field-name sibling struct does not win the field-shape match. A union
@@ -11297,68 +11277,20 @@ function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
       expCtxApply(ubc)
       if emitUnionBoxArg(body, elemUnionNm, elems[i], fnIx) < 0 { return -1 }
     } else {
-      // Reset the `listKind`/`listSlot` context to the INNER list's kind so the element
-      // builds the right list, NOT the outer ref-list kind it would inherit. Scalar inner
-      // lists seed kind 0/3/4/6; a ref inner list (kind 9) seeds kind 5 + the inner slot, so
-      // the element builds as that ref list — which may itself be kind 9 (nesting falls out).
-      const elCtx = expCtxHere()
-      const elLK = refElemListBuildKind(rslot)
-      if elLK >= 0 { elCtx.listKind = elLK }
-      if elemNest == RLK_REF_LIST { elCtx.listSlot = nestInnerSlot }
-      // A map element (kind 3): a `Map()` element builds this element's map struct — the
-      // literal twin of the `.push` and indexed-assign seed in `refElemValueCtx`, and the
-      // site the whole list-of-maps family runs through. Unseeded, the element `Map()` builds
-      // the mono map struct into a backing typed to the element's own struct.
-      if elemNest == RLK_MAP { elCtx.mapSlot = rlElemMapShape(rslot) }
-      // A nullable-niche element may be a bare `null`: kind 4 gives `ref.null $lTypeIdx`,
-      // kind 9 the inner wrapper, and the distinct-backing kinds 6/7/8/10 the leaf-list
-      // wrapper singleton. These are whole-value null seeds, so the seed-leak gate applies
-      // one level down: a nested list element's own nulls would consume the leaked heap.
-      const elIsBareNull = P.nodes[unwrapParen(elems[i])] is NullLit
-      if elIsBareNull {
-        if elemNest == RLK_I32_LIST && rlElemNullable[rslot] == 1 {
-          elCtx.nulList = true
-        }
-        if (
-          elemNest == RLK_REF_LIST
-          && rlElemNullable[rslot] == 1
-          && nestInnerSlot >= 0
-        ) {
-          elCtx.nulRefHeap = rlWrapIdx[nestInnerSlot]
-        }
-        if rlElemNullable[rslot] == 1 {
-          if elemNest == RLK_STR_LIST { elCtx.nulRefHeap = mkListIdx }
-          if elemNest == RLK_F64_LIST { elCtx.nulRefHeap = fl64TypeIdx }
-          if elemNest == RLK_I64_LIST { elCtx.nulRefHeap = il64TypeIdx }
-          if elemNest == RLK_F32_LIST { elCtx.nulRefHeap = fl32TypeIdx }
-          if elemNest == RLK_U8_LIST { elCtx.nulRefHeap = bl8TypeIdx }
-          // A `({[string]: V} | null)[]` element (kind 3 nullable niche) → `ref.null` of
-          // the element's map struct (the slot heap, resolved by the kind-3 passes).
-          if elemNest == RLK_MAP { elCtx.nulRefHeap = rlElemHeap[rslot] }
-          // A `((...) => ...) | null` element (kind 5 nullable niche) → `ref.null` of the
-          // shared closure fat-pointer (the slot heap, `cloStructIdx`).
-          if elemNest == RLK_CLOSURE { elCtx.nulRefHeap = rlElemHeap[rslot] }
-        }
+      if (
+        emitArrRefElem(
+          body,
+          elems[i],
+          fnIx,
+          rslot,
+          elemNest,
+          nestInnerSlot,
+          elemVariantIdx,
+        )
+        < 0
+      ) {
+        return -1
       }
-      if elemVariantIdx >= 0 && rlElemNullable[rslot] != 1 {
-        // A non-null ARM element takes every value through `emitVariantCoerce`, a join
-        // included; the coerce owns the narrowed unbox (D4639).
-        if emitVariantCoerce(body, elemVariantIdx, elems[i], fnIx) < 0 {
-          return -1
-        }
-      } else {
-        const elArmOwed = narrowedArmNeedsUnbox(elems[i], fnIx)
-        if emitExprExpect(body, elems[i], fnIx, elCtx) < 0 { return -1 }
-        // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
-        // `if s is Circle`. The slot's own element heap is the destination, the same one
-        // `rlBackIdx` types the backing array with.
-        if elArmOwed {
-          emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), elems[i])
-        }
-      }
-      // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
-      // `(readonly Shape[])[]`.
-      emitNestedListWidenSite(body, elems[i], fnIx, rslot)
     }
     i = i + 1
     if dstRef >= 0 {
@@ -11382,6 +11314,114 @@ function emitArrRef(body: u8[], arrIx: i32, elems: i32[], fnIx: i32) {
   fbI32Const(elems.length)      // 0x41 i32.const (cap)
   fbStructNew(rlWrapIdx[rslot]) // 0xfb 0x00 <this slot's ref-list wrapper>
   return 0
+}
+
+// `emitArrRef`'s ref-list slot: a threaded ref-list annotation's slot, else element 0's, else
+// slot 0 when the literal names none. -1 when no element type is interned at all.
+function arrRefSlotOf(arrIx: i32, elems: i32[], fnIx: i32) {
+  const annKind = pendingListKind
+  const annSlot = pendingListSlot
+  let rslot = 0
+  if (
+    annKind == LBK_REF
+    || annKind == LBK_UNION
+    || annKind == LBK_REF_AT_SLOT
+  ) {
+    rslot = annSlot
+  } else if elems.length >= 1 {
+    rslot = rlSlotByName(arrLitElemNameIn(arrIx, fnIx))
+  } else {
+    rslot = annSlot
+  }
+  if rslot < 0 {
+    if rlElemName.length < 1 {
+      return emitFail(
+        "emitProgram: ref array literal with no interned element type",
+      )
+    }
+    rslot = 0
+  }
+  rslot
+}
+
+// One non-union element `e` of `emitArrRef`'s list at slot `rslot`, built under its inner
+// list's context (`elemNest`, `nestInnerSlot`) or coerced into the arm `elemVariantIdx`.
+// Returns 0 once the element is on the stack, -1 on failure.
+function emitArrRefElem(
+  body: u8[],
+  e: i32,
+  fnIx: i32,
+  rslot: i32,
+  elemNest: i32,
+  nestInnerSlot: i32,
+  elemVariantIdx: i32,
+) {
+  // Reset the `listKind`/`listSlot` context to the INNER list's kind so the element
+  // builds the right list, NOT the outer ref-list kind it would inherit. Scalar inner
+  // lists seed kind 0/3/4/6; a ref inner list (kind 9) seeds kind 5 + the inner slot, so
+  // the element builds as that ref list — which may itself be kind 9 (nesting falls out).
+  const elCtx = expCtxHere()
+  const elLK = refElemListBuildKind(rslot)
+  if elLK >= 0 { elCtx.listKind = elLK }
+  if elemNest == RLK_REF_LIST { elCtx.listSlot = nestInnerSlot }
+  // A map element (kind 3): a `Map()` element builds this element's map struct — the
+  // literal twin of the `.push` and indexed-assign seed in `refElemValueCtx`, and the
+  // site the whole list-of-maps family runs through. Unseeded, the element `Map()` builds
+  // the mono map struct into a backing typed to the element's own struct.
+  if elemNest == RLK_MAP { elCtx.mapSlot = rlElemMapShape(rslot) }
+  const elIsBareNull = P.nodes[unwrapParen(e)] is NullLit
+  if elIsBareNull { arrRefNullSeed(elCtx, rslot, elemNest, nestInnerSlot) }
+  if elemVariantIdx >= 0 && rlElemNullable[rslot] != 1 {
+    // A non-null ARM element takes every value through `emitVariantCoerce`, a join
+    // included; the coerce owns the narrowed unbox (D4639).
+    if emitVariantCoerce(body, elemVariantIdx, e, fnIx) < 0 { return -1 }
+  } else {
+    const elArmOwed = narrowedArmNeedsUnbox(e, fnIx)
+    if emitExprExpect(body, e, fnIx, elCtx) < 0 { return -1 }
+    // The narrowed-arm unbox at a ref-list element (D1031) — `[s]` of a `Circle[]` under
+    // `if s is Circle`. The slot's own element heap is the destination, the same one
+    // `rlBackIdx` types the backing array with.
+    if elArmOwed { emitNarrowedArmUnboxTo(rlElemArmHeapOf(rslot), e) }
+  }
+  // Read-only covariance at a nested-list element (D791, D965) — `[lv1]` of a
+  // `(readonly Shape[])[]`.
+  emitNestedListWidenSite(body, e, fnIx, rslot)
+  0
+}
+
+// A bare `null` element's seed in `elCtx` for a nullable-niche list at slot `rslot`: kind 4
+// gives `ref.null $lTypeIdx`, kind 9 the inner wrapper, the distinct-backing kinds 6/7/8/10
+// the leaf-list wrapper singleton. Whole-value seeds, so the seed-leak gate applies one level
+// down: a nested list element's own nulls would consume the leaked heap.
+function arrRefNullSeed(
+  elCtx: ExpCtx,
+  rslot: i32,
+  elemNest: i32,
+  nestInnerSlot: i32,
+) {
+  if elemNest == RLK_I32_LIST && rlElemNullable[rslot] == 1 {
+    elCtx.nulList = true
+  }
+  if (
+    elemNest == RLK_REF_LIST
+    && rlElemNullable[rslot] == 1
+    && nestInnerSlot >= 0
+  ) {
+    elCtx.nulRefHeap = rlWrapIdx[nestInnerSlot]
+  }
+  if rlElemNullable[rslot] == 1 {
+    if elemNest == RLK_STR_LIST { elCtx.nulRefHeap = mkListIdx }
+    if elemNest == RLK_F64_LIST { elCtx.nulRefHeap = fl64TypeIdx }
+    if elemNest == RLK_I64_LIST { elCtx.nulRefHeap = il64TypeIdx }
+    if elemNest == RLK_F32_LIST { elCtx.nulRefHeap = fl32TypeIdx }
+    if elemNest == RLK_U8_LIST { elCtx.nulRefHeap = bl8TypeIdx }
+    // A `({[string]: V} | null)[]` element (kind 3 nullable niche) → `ref.null` of
+    // the element's map struct (the slot heap, resolved by the kind-3 passes).
+    if elemNest == RLK_MAP { elCtx.nulRefHeap = rlElemHeap[rslot] }
+    // A `((...) => ...) | null` element (kind 5 nullable niche) → `ref.null` of the
+    // shared closure fat-pointer (the slot heap, `cloStructIdx`).
+    if elemNest == RLK_CLOSURE { elCtx.nulRefHeap = rlElemHeap[rslot] }
+  }
 }
 
 // The default i32-list arm of `emitArrUnder`, including literal-union, nullable-boolean and
@@ -17758,86 +17798,19 @@ function emitStructEqFieldAt(
     return emitStrEqCore(body)
   }
   if code == FC_STRUCT {
-    // Nested struct: recurse one level deeper along the chain, under an unconditional null
-    // guard (D1180) — `next: Node` and `next: Node | null` are both code 15 over the same
-    // `(ref null $S)` slot, indistinguishable, so the guard must always run (a constant-false
-    // `ref.is_null` on a never-null field). Chain reads stay raw inside it; a deeper field has its own guard.
-    const nsi = eqRowTgtStructIdx(si, fi)
-    if nsi < 0 {
-      return emitFail(
-        "emitProgram: nested struct field equality with no interned shape",
-      )
-    }
-    if emitNulFieldGuardOpen(body, lRoot, rRoot, pathSi, pathFi, fnIx) < 0 {
-      return -1
-    }
-    if emitStructEqRec(body, lRoot, rRoot, nsi, pathSi, pathFi, fnIx) < 0 {
-      return -1
-    }
-    return emitNulFieldGuardClose()
+    return emitStructEqNestedField(
+      body,
+      lRoot,
+      rRoot,
+      si,
+      fi,
+      pathSi,
+      pathFi,
+      fnIx,
+    )
   }
   if code == FC_I32_LIST {
-    // `i32[]` list: lengths equal and element-wise equal — `len` from the wrapper (field
-    // 1, the logical size; the backing may be longer), elements read off backings stashed
-    // in two fresh `(ref null $aTypeIdx)` lazy-frame slots (`listBackStashSlot`, typed for
-    // this rep). The i32 counters below still ride the string-op frame: plain i32 slots carrying no rep, safe to share.
-    if !lUsed {
-      return emitFail(
-        "emitProgram: i32[] field equality but list type not collected",
-      )
-    }
-    // lenL != lenR → 0, else the element loop.
-    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    fbStructGet(lTypeIdx, 1) // wrapper field 1: len
-    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    fbStructGet(lTypeIdx, 1)
-    fbI32Bin(71)             // 0x47 i32.ne
-    fbIf(127)                // 0x04 if, 0x7f i32 blocktype
-    fbI32Const(0)            // length mismatch → 0
-    fbElse()                 // 0x05 else — the element loop, like emitStrEqCore
-    // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
-    const eqBkA = listBackStashSlot("i32", 0)
-    const eqBkB = listBackStashSlot("i32", 0)
-    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    fbStructGet(lTypeIdx, 0) // backing
-    fbLocalSet(eqBkA)
-    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    fbStructGet(lTypeIdx, 0)
-    fbLocalSet(eqBkB)
-    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
-    fbStructGet(lTypeIdx, 1) // len
-    setStrScrI(body, 0)
-    fbBlock(127)             // 0x02 block, 0x7f i32 — yields the 0/1 result
-    fbI32Const(0)
-    setStrScrI(body, 1)      // I1 = 0
-    fbLoop(64)               // 0x03 loop, void
-    pushStrScrI(body, 1)
-    pushStrScrI(body, 0)
-    fbI32Bin(78)             // 0x4e i32.ge_s — done?
-    fbIf(64)                 // then: fall through (all matched)
-    fbElse()
-    fbLocalGet(eqBkA)
-    pushStrScrI(body, 1)
-    fbArrayGet(aTypeIdx)
-    fbLocalGet(eqBkB)
-    pushStrScrI(body, 1)
-    fbArrayGet(aTypeIdx)
-    fbI32Bin(71)             // 0x47 i32.ne
-    fbIf(64)                 // mismatch → 0, exit the result block
-    fbI32Const(0)
-    fbBr(3)                  // depths: if(0)·else(1)·loop(2)·block(3)
-    fbEnd()
-    pushStrScrI(body, 1)
-    fbI32Const(1)
-    fbI32Bin(106)            // i32.add
-    setStrScrI(body, 1)
-    fbBr(1)                  // continue the loop
-    fbEnd()                  // end (else's if)
-    fbEnd()                  // end (loop)
-    fbI32Const(1)            // every element matched
-    fbEnd()                  // end (result block)
-    fbEnd()                  // end (length if/else)
-    return 0
+    return emitStructEqI32ListField(body, lRoot, rRoot, pathSi, pathFi, fnIx)
   }
   if code == FC_CLOSURE {
     // Function-valued field: identity compare (id + env) via the closure-eq frame.
@@ -17898,6 +17871,106 @@ function emitStructEqFieldAt(
     return emitListEqAnyRep(body, eqSk, 0, fnIx)
   }
   emitFail("emitProgram: unsupported struct field type in equality")
+}
+
+// `emitStructEqFieldAt`'s nested-struct field `fi` of row `si`: recurse one level deeper along
+// the chain under an unconditional null guard (D1180) — `next: Node` and `next: Node | null`
+// share code 15 over one `(ref null $S)` slot, so the guard always runs. Chain reads stay raw
+// inside it; a deeper field has its own guard. Returns 0, or -1 on failure.
+function emitStructEqNestedField(
+  body: u8[],
+  lRoot: i32,
+  rRoot: i32,
+  si: i32,
+  fi: i32,
+  pathSi: i32[],
+  pathFi: i32[],
+  fnIx: i32,
+) {
+  const nsi = eqRowTgtStructIdx(si, fi)
+  if nsi < 0 {
+    return emitFail(
+      "emitProgram: nested struct field equality with no interned shape",
+    )
+  }
+  if emitNulFieldGuardOpen(body, lRoot, rRoot, pathSi, pathFi, fnIx) < 0 {
+    return -1
+  }
+  if emitStructEqRec(body, lRoot, rRoot, nsi, pathSi, pathFi, fnIx) < 0 {
+    return -1
+  }
+  emitNulFieldGuardClose()
+}
+
+// `emitStructEqFieldAt`'s `i32[]` field: lengths equal and element-wise equal — `len` from the
+// wrapper's field 1 (the backing may be longer), elements off backings stashed in two fresh
+// `listBackStashSlot` slots. The i32 counters ride the string-op frame: plain i32 slots
+// carrying no rep, safe to share. Returns 0, or -1 on failure.
+function emitStructEqI32ListField(
+  body: u8[],
+  lRoot: i32,
+  rRoot: i32,
+  pathSi: i32[],
+  pathFi: i32[],
+  fnIx: i32,
+) {
+  if !lUsed {
+    return emitFail(
+      "emitProgram: i32[] field equality but list type not collected",
+    )
+  }
+  // lenL != lenR → 0, else the element loop.
+  if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  fbStructGet(lTypeIdx, 1) // wrapper field 1: len
+  if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  fbStructGet(lTypeIdx, 1)
+  fbI32Bin(71)             // 0x47 i32.ne
+  fbIf(127)                // 0x04 if, 0x7f i32 blocktype
+  fbI32Const(0)            // length mismatch → 0
+  fbElse()                 // 0x05 else — the element loop, like emitStrEqCore
+  // A = backing(L.f); B = backing(R.f); I0 = len; I1 = 0
+  const eqBkA = listBackStashSlot("i32", 0)
+  const eqBkB = listBackStashSlot("i32", 0)
+  if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  fbStructGet(lTypeIdx, 0) // backing
+  fbLocalSet(eqBkA)
+  if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  fbStructGet(lTypeIdx, 0)
+  fbLocalSet(eqBkB)
+  if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+  fbStructGet(lTypeIdx, 1) // len
+  setStrScrI(body, 0)
+  fbBlock(127)             // 0x02 block, 0x7f i32 — yields the 0/1 result
+  fbI32Const(0)
+  setStrScrI(body, 1)      // I1 = 0
+  fbLoop(64)               // 0x03 loop, void
+  pushStrScrI(body, 1)
+  pushStrScrI(body, 0)
+  fbI32Bin(78)             // 0x4e i32.ge_s — done?
+  fbIf(64)                 // then: fall through (all matched)
+  fbElse()
+  fbLocalGet(eqBkA)
+  pushStrScrI(body, 1)
+  fbArrayGet(aTypeIdx)
+  fbLocalGet(eqBkB)
+  pushStrScrI(body, 1)
+  fbArrayGet(aTypeIdx)
+  fbI32Bin(71)             // 0x47 i32.ne
+  fbIf(64)                 // mismatch → 0, exit the result block
+  fbI32Const(0)
+  fbBr(3)                  // depths: if(0)·else(1)·loop(2)·block(3)
+  fbEnd()
+  pushStrScrI(body, 1)
+  fbI32Const(1)
+  fbI32Bin(106)            // i32.add
+  setStrScrI(body, 1)
+  fbBr(1)                  // continue the loop
+  fbEnd()                  // end (else's if)
+  fbEnd()                  // end (loop)
+  fbI32Const(1)            // every element matched
+  fbEnd()                  // end (result block)
+  fbEnd()                  // end (length if/else)
+  0
 }
 
 // Emit `clamp(idx, len)` where `idx` is in i32 temp `idxSlot` and `len` in temp
