@@ -66,7 +66,6 @@ import {
   crCapWidenBank,
   crCondDropBank,
   crCondDropN,
-  crEscNames,
   crFnBases,
   crFnIxs,
   crFnNpBases,
@@ -99,14 +98,16 @@ import {
 } from "./check_capture_rows"
 import {
   crCaptureByRef,
-  crEscWalk,
   crFirstAssignOf,
   crNameFacedLater,
   crNoNames,
   crwAddName,
+  crwAnyWriteBase,
   crwArgCall,
   crwBindOf,
   crwEnsure,
+  crwGen,
+  crwRoot,
   weSplit,
 } from "./check_capture_walks"
 import {
@@ -147,6 +148,7 @@ import {
 import {
   crCondRetired,
   crDeclFrameOf,
+  crEscapesIn,
   crFilterRhsRetired,
   crInHoleTemplate,
   crLambdaEscapes,
@@ -279,6 +281,7 @@ import {
   asgDeclDepths,
   asgDeclKeys,
   asgDeclKinds,
+  asgDeclStamps,
   narBankPopFrame,
   narDeclaredTy,
   narFnEpoch,
@@ -408,6 +411,7 @@ import {
   lookup,
   lookupDepth,
   lookupFnDeclNode,
+  scopeDeclLog,
   scopeDepthsOf,
 } from "./check_scopes"
 import {
@@ -2199,12 +2203,7 @@ function crFnEscapesAt(lv: i32, key: string): boolean {
     const pf = P.nodes[crFnIxs[lv - 1]]
     if pf is FuncDecl { body = pf.fnBody }
   }
-  let esc = crEscNames[body] ?? ""
-  if esc == "" {
-    esc = crEscWalk(body, false, ",")
-    crEscNames[body] = esc
-  }
-  esc.indexOf("," + h + ",") >= 0
+  crEscapesIn(body, h)
 }
 
 // A call that ends a path narrowing a nested function already read under is refused: that
@@ -2704,7 +2703,7 @@ export function crNoteCallBare(callIx: i32) {
   // A body checked with no statement of its own open (a monomorphization re-check) banks
   // nothing: the open statement is its caller's.
   if crStmtFns[crStmtFns.length - 1] != crFnBases.length { return 0 }
-  const names = crLiveNames()
+  const names = crCallCandidates()
   let i = 0
   while i < names.length {
     if callMayWrite(callIx, names[i]) {
@@ -2713,6 +2712,162 @@ export function crNoteCallBare(callIx: i32) {
     crRetireShadowed(names[i], callIx, -1)
     i = i + 1
   }
+  0
+}
+
+// `crLiveNames` less names no call can retire, which `callMayWrite` and `crRetireShadowed`
+// leave alone: a bare name no nested function of the root writes, bound once, inside the
+// function. Kept per nesting level across calls, so a call costs what changed since the last.
+function crCallCandidates(): string[] {
+  const root = crCurRoot()
+  if crwRoot != root { return crLiveNames() }
+  let fb0 = -1
+  if crFnBases.length > 0 && root != crProgRoot { fb0 = crFnBases[0] }
+  const base = crFnBase()
+  const lv = crFnBases.length
+  while ccLevels.length <= lv { ccLevels.push(ccFresh(-2, -1, -1, 0)) }
+  let c = ccLevels[lv]
+  if (
+    c.root != root
+    || c.gen != crwGen
+    || c.fb0 != fb0
+    || c.base != base
+    || c.log > scopeDeclLog.length
+  ) {
+    c = ccFresh(root, fb0, base, ccFrameStart(base))
+    ccLevels[lv] = c
+  }
+  ccTruncate(c)
+  let i = c.rows
+  while i < asgDeclKeys.length {
+    const nm = asgDeclKeys[i]
+    if asgDeclDepths[i] >= base && (c.first[nm] ?? -1) < 0 {
+      c.first[nm] = i
+      c.names.push(nm)
+      c.nameRows.push(i)
+      if ccKeeps(nm, fb0) { ccAddCand(c, nm, i) }
+    }
+    i = i + 1
+  }
+  c.rows = asgDeclKeys.length
+  if c.rows > 0 { c.stamp = asgDeclStamps[c.rows - 1] }
+  // A name declared again since may have become one a call retires.
+  let g = c.log
+  while g < scopeDeclLog.length {
+    const nm = scopeDeclLog[g]
+    const r = c.first[nm] ?? -1
+    if r >= 0 && !(c.isCand[nm] ?? false) && ccKeeps(nm, fb0) {
+      ccAddCand(c, nm, r)
+    }
+    g = g + 1
+  }
+  c.log = scopeDeclLog.length
+  const out: string[] = []
+  for nm in c.cands { out.push(nm) }
+  out
+}
+
+// One level's `crCallCandidates` state: its key, the bank prefix it has read (`rows`, whose
+// last row's stamp is `stamp`) and the log prefix, each frame name's first row, and the
+// candidates among them in row order.
+type CallCands = {
+  root: i32,
+  gen: i32,
+  fb0: i32,
+  base: i32,
+  rows: i32,
+  stamp: i32,
+  log: i32,
+  first: {[string]: i32},
+  names: string[],
+  nameRows: i32[],
+  isCand: {[string]: boolean},
+  cands: string[],
+  candRows: i32[],
+}
+
+const ccLevels: CallCands[] = []
+
+function ccFresh(root: i32, fb0: i32, base: i32, rows: i32): CallCands {
+  let stamp = 0
+  if rows > 0 && rows <= asgDeclStamps.length {
+    stamp = asgDeclStamps[rows - 1]
+  }
+  {
+    root,
+    gen: crwGen,
+    fb0,
+    base,
+    rows,
+    stamp,
+    log: scopeDeclLog.length,
+    first: Map(),
+    names: [],
+    nameRows: [],
+    isCand: Map(),
+    cands: [],
+    candRows: [],
+  }
+}
+
+// The first bank row at depth `base` or deeper; the bank's depths never fall along it.
+function ccFrameStart(base: i32): i32 {
+  let i = asgDeclKeys.length
+  while i > 0 && asgDeclDepths[i - 1] >= base { i = i - 1 }
+  i
+}
+
+// Drop what `c` read from bank rows popped since: the rows it saw that remain are those
+// stamped no later than its last one.
+function ccTruncate(c: CallCands) {
+  if c.rows == 0 { return 0 }
+  let keep = c.rows
+  if keep > asgDeclKeys.length || asgDeclStamps[keep - 1] != c.stamp {
+    let lo = 0
+    let hi = keep
+    if hi > asgDeclKeys.length { hi = asgDeclKeys.length }
+    while lo < hi {
+      const mid = (lo + hi) / 2
+      if asgDeclStamps[mid] <= c.stamp { lo = mid + 1 } else { hi = mid }
+    }
+    keep = lo
+  }
+  while c.names.length > 0 && c.nameRows[c.nameRows.length - 1] >= keep {
+    c.first[c.names[c.names.length - 1]] = -1
+    c.names.pop()
+    c.nameRows.pop()
+  }
+  while c.cands.length > 0 && c.candRows[c.candRows.length - 1] >= keep {
+    c.isCand[c.cands[c.cands.length - 1]] = false
+    c.cands.pop()
+    c.candRows.pop()
+  }
+  c.rows = keep
+  c.stamp = 0
+  if keep > 0 { c.stamp = asgDeclStamps[keep - 1] }
+  0
+}
+
+// Whether a call can retire live name `nm`.
+function ccKeeps(nm: string, fb0: i32): boolean {
+  const ds = scopeDepthsOf[nm]
+  const keep = ds != null && (ds.length >= 2 || (ds.length == 1 && ds[0] < fb0))
+  keep || crwAnyWriteBase.has(nm) || isPathKey(nm)
+}
+
+// Add `nm`, first banked at row `r`, to `c`'s candidates in row order.
+function ccAddCand(c: CallCands, nm: string, r: i32) {
+  c.isCand[nm] = true
+  c.cands.push(nm)
+  c.candRows.push(r)
+  let j = c.cands.length - 1
+  while j > 0 && c.candRows[j - 1] > r {
+    c.cands[j] = c.cands[j - 1]
+    c.candRows[j] = c.candRows[j - 1]
+    j = j - 1
+  }
+  c.cands[j] = nm
+  c.candRows[j] = r
   0
 }
 

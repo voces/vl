@@ -22,6 +22,7 @@ import {
   Param,
   Spread,
   hasNamedArgs,
+  i32ToStr,
   nodeChildren,
 } from "./ast"
 import { emitFail } from "./emit_bytes"
@@ -53,19 +54,9 @@ import { fnHasUnannotatedParam } from "./emit_atom_kinds"
 import { fnStmtsPosOf } from "./emit_capture_frames"
 import { captureNamesOf } from "./emit_classify"
 
-// Where the walk stands: the declaring frame's own code, the candidate's own body, or any
-// other nested function (where a use is a capture, so an escape).
-const CL_HOST = 0
-const CL_SELF = 1
-const CL_NESTED = 2
-
+// The candidate's name and the `const` binding it, as `clSyntax` last read them.
 let clName = ""
-let clSelf = -1
 let clLet = -1
-let clIsLocalFn = false
-let clOk = true
-let clCaps: string[] = []
-let clCapDecls: i32[] = []
 // The owning frame of each candidate declaration, and the declarations two frames reach: a
 // callback specialization or a clone shares its host's statements (D3713).
 let clOwner: {[i32]: i32} = Map()
@@ -79,6 +70,7 @@ export function cloLiftScan() {
   cloLiftFe = []
   cloLiftedFes = []
   clOwner = Map()
+  clIndexReset()
   clShared = Map()
   cloLiftWrStart = []
   cloLiftWrN = []
@@ -164,6 +156,7 @@ export function cloUnboxPick(
   candTys: i32[],
 ): string[] {
   const out: string[] = []
+  clIndexReset()
   if !fnNestUsed || cands.length == 0 || !cuChainOk(fe) { return out }
   const host = P.nodes[fnStmts[fe]]
   if !(host is FuncDecl) { return out }
@@ -447,129 +440,163 @@ function clSyntax(fe: i32): i32 {
   const hostNode = P.nodes[fnStmts[host]]
   if !(hostNode is FuncDecl) { return -1 }
   clName = ""
-  clSelf = self
   clLet = -1
-  clIsLocalFn = false
+  let localFn = false
+  const hk = clIndexHost(host, hostNode)
   const selfNode = P.nodes[self]
   if lfBlockOf(fe) >= 0 {
     if selfNode is FuncDecl {
       clName = selfNode.fnName
-      clIsLocalFn = true
+      localFn = true
     }
   } else {
-    clFindBinding(hostNode.fnBody)
+    const at = clhBind[hk + i32ToStr(self)] ?? -1
+    if at >= 0 {
+      const ld = P.nodes[at]
+      if ld is LetDecl {
+        clName = ld.letName
+        clLet = at
+      }
+    }
   }
   if clName == "" { return -1 }
-  clCaps = captureNamesOf(fe)
-  clCapDecls = []
+  const caps = captureNamesOf(fe)
   let ci = 0
-  while ci < clCaps.length {
-    if clCaps[ci] == clName { return -1 }
-    clCapDecls.push(0)
+  while ci < caps.length {
+    if caps[ci] == clName { return -1 }
     ci = ci + 1
   }
-  clOk = true
+  const nk = hk + clName
+  if clhIdentUse.has(nk) || clhProp.has(nk) { return -1 }
+  const decls = clhDecls[nk] ?? clNoRows
+  let di = 0
+  while di < decls.length {
+    if decls[di] != clLet && decls[di] != self { return -1 }
+    di = di + 1
+  }
+  const encs = clhCallEnc[nk] ?? clNoRows
+  const named = clhCallNamed[nk] ?? clNoRows
+  let k = 0
+  while k < encs.length {
+    if encs[k] >= 0 && (encs[k] != self || !localFn) { return -1 }
+    if named[k] != 0 && !localFn { return -1 }
+    k = k + 1
+  }
+  ci = 0
+  while ci < caps.length {
+    if (clhDecls[hk + caps[ci]] ?? clNoRows).length > 1 { return -1 }
+    ci = ci + 1
+  }
+  caps.length
+}
+
+// Per host frame, read once from its parameters and body, keyed `<host>:<name>`: each
+// declaration of a name, each non-callee identifier and member property, and each call by a
+// bare name with its innermost enclosing function (-1 for the host's own code) and whether it
+// names arguments. `clhBind` keys `<host>:<lambda>` to the first host-level `const` bound to it.
+let clhDone: {[i32]: boolean} = Map()
+let clhBind: {[string]: i32} = Map()
+let clhDecls: {[string]: i32[]} = Map()
+let clhIdentUse: {[string]: boolean} = Map()
+let clhProp: {[string]: boolean} = Map()
+let clhCallEnc: {[string]: i32[]} = Map()
+let clhCallNamed: {[string]: i32[]} = Map()
+const clNoRows: i32[] = []
+
+// Drops every host index; each scan reads a tree no earlier scan saw.
+function clIndexReset() {
+  clhDone = Map()
+  clhBind = Map()
+  clhDecls = Map()
+  clhIdentUse = Map()
+  clhProp = Map()
+  clhCallEnc = Map()
+  clhCallNamed = Map()
+  0
+}
+
+// Indexes host frame `host` once, returning its key prefix.
+function clIndexHost(host: i32, hostNode: FuncDecl): string {
+  const hk = i32ToStr(host) + ":"
+  if clhDone.has(host) { return hk }
+  clhDone[host] = true
   const hps = hostNode.fnParams
   let pi = 0
   while pi < hps.length {
-    clWalk(hps[pi], CL_HOST)
+    clIndexWalk(hk, hps[pi], -1, false)
     pi = pi + 1
   }
-  clWalk(hostNode.fnBody, CL_HOST)
-  if !clOk { return -1 }
-  ci = 0
-  while ci < clCapDecls.length {
-    if clCapDecls[ci] > 1 { return -1 }
-    ci = ci + 1
-  }
-  clCaps.length
+  clIndexWalk(hk, hostNode.fnBody, -1, true)
+  hk
 }
 
-// Finds the `const` in the host body whose initializer is the lambda `clSelf`. Nested
-// frames are not searched, since a binding there belongs to that frame.
-function clFindBinding(ix: i32) {
-  if ix < 0 || ix >= P.nodes.length || clName != "" { return 0 }
-  const n = P.nodes[ix]
-  if n is LetDecl {
-    if (
-      n.letKw == "const"
-      && n.letInit >= 0
-      && unwrapParen(n.letInit) == clSelf
-    ) {
-      clName = n.letName
-      clLet = ix
-      return 0
-    }
-  }
-  if n is FuncDecl { return 0 }
-  const kids = nodeChildren(ix)
-  let k = 0
-  while k < kids.length {
-    clFindBinding(kids[k])
-    k = k + 1
-  }
+function clIndexDecl(key: string, ix: i32) {
+  const ds = clhDecls[key]
+  if ds == null { clhDecls[key] = [ix] } else { ds.push(ix) }
   0
 }
 
-// Counts a declaration of `nm`: another binding of the candidate's name refuses, and a
-// capture's name declared twice refuses, since a call site reads captures by name.
-function clNoteDecl(nm: string, ix: i32) {
-  if nm == clName && ix != clLet && ix != clSelf { clOk = false }
-  let ci = 0
-  while ci < clCaps.length {
-    if clCaps[ci] == nm { clCapDecls[ci] = clCapDecls[ci] + 1 }
-    ci = ci + 1
-  }
-  0
-}
-
-// Walks `ix`, refusing on any use of the candidate's name that is not the callee of a call
-// in the host frame (or in its own body, for a block-local function).
-function clWalk(ix: i32, where: i32) {
-  if !clOk || ix < 0 || ix >= P.nodes.length { return 0 }
+// Records `ix`'s subtree under `hk`; `enc` is the innermost function around it, and `inBody`
+// says it is in the host's body rather than its parameters.
+function clIndexWalk(hk: string, ix: i32, enc: i32, inBody: boolean) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is Ident {
-    if n.identName == clName { clOk = false }
+    clhIdentUse[hk + n.identName] = true
     return 0
   }
   if n is Call {
     const callee = P.nodes[n.callFn]
     if callee is Ident {
-      if callee.identName == clName {
-        if where == CL_NESTED { clOk = false }
-        if where == CL_SELF && !clIsLocalFn { clOk = false }
-        if hasNamedArgs(n.callArgNames) && !clIsLocalFn { clOk = false }
-        let ai = 0
-        while ai < n.callArgs.length {
-          clWalk(n.callArgs[ai], where)
-          ai = ai + 1
-        }
-        return 0
+      const key = hk + callee.identName
+      const es = clhCallEnc[key]
+      const nm = if hasNamedArgs(n.callArgNames) { 1 } else { 0 }
+      if es == null {
+        clhCallEnc[key] = [enc]
+        clhCallNamed[key] = [nm]
+      } else {
+        es.push(enc)
+        const ns = clhCallNamed[key]
+        if ns != null { ns.push(nm) }
       }
+      let ai = 0
+      while ai < n.callArgs.length {
+        clIndexWalk(hk, n.callArgs[ai], enc, inBody)
+        ai = ai + 1
+      }
+      return 0
     }
   }
-  if n is Member {
-    if n.memProp == clName { clOk = false }
+  if n is Member { clhProp[hk + n.memProp] = true }
+  if n is OptMember { clhProp[hk + n.omProp] = true }
+  if n is LetDecl {
+    clIndexDecl(hk + n.letName, ix)
+    if (
+      inBody
+      && enc < 0
+      && n.letKw == "const"
+      && n.letInit >= 0
+      && n.letName != ""
+    ) {
+      const bk = hk + i32ToStr(unwrapParen(n.letInit))
+      if !clhBind.has(bk) { clhBind[bk] = ix }
+    }
   }
-  if n is OptMember {
-    if n.omProp == clName { clOk = false }
-  }
-  if n is LetDecl { clNoteDecl(n.letName, ix) }
-  if n is Param { clNoteDecl(n.parName, ix) }
-  if n is ForRange { clNoteDecl(n.frVar, ix) }
+  if n is Param { clIndexDecl(hk + n.parName, ix) }
+  if n is ForRange { clIndexDecl(hk + n.frVar, ix) }
   if n is ForIn {
-    clNoteDecl(n.fiVar, ix)
-    if n.fiVar2 != "" { clNoteDecl(n.fiVar2, ix) }
+    clIndexDecl(hk + n.fiVar, ix)
+    if n.fiVar2 != "" { clIndexDecl(hk + n.fiVar2, ix) }
   }
-  let inner = where
+  let inner = enc
   if n is FuncDecl {
-    clNoteDecl(n.fnName, ix)
-    if ix == clSelf { inner = CL_SELF } else { inner = CL_NESTED }
+    clIndexDecl(hk + n.fnName, ix)
+    inner = ix
   }
   const kids = nodeChildren(ix)
   let k = 0
   while k < kids.length {
-    clWalk(kids[k], inner)
+    clIndexWalk(hk, kids[k], inner, inBody)
     k = k + 1
   }
   0
