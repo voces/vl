@@ -13821,6 +13821,72 @@ function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
   bt
 }
 
+// Whether parameter `pIx` of `fn`, handed the parameter read `argIx` pinned at function type
+// `pinTy`, is called in `fn`'s body with a closed argument the pin's parameter does not take, as
+// a recursion handing two such parameters back in swapped positions does (D6202).
+function monoFwdFnPinMisfits(
+  fn: FuncDecl,
+  pIx: i32,
+  argIx: i32,
+  pinTy: i32,
+): boolean {
+  if !monoReadsParam(argIx) || pinTy < 0 || pinTy >= T.tys.length {
+    return false
+  }
+  const pf = T.tys[pinTy]
+  if !(pf is TyFunc) { return false }
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if (
+        n is Call
+        && n.callFn >= 0
+        && n.callFn < P.nodes.length
+        && P.nodes[n.callFn] is Ident
+        && identDeclOf(n.callFn) == pIx
+        && n.callArgs.length == pf.fnParamTypes.length
+      ) {
+        let k = 0
+        while k < n.callArgs.length {
+          const at = nodeTyIxOf(n.callArgs[k])
+          if (
+            at >= 0
+            && !tyHasTyVar(at)
+            && !assignable(at, pf.fnParamTypes[k])
+          ) {
+            return true
+          }
+          k = k + 1
+        }
+      }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  false
+}
+
+// Whether argument `argIx` reads a parameter of the function it is in.
+function monoReadsParam(argIx: i32): boolean {
+  const ax = unwrapParen(argIx)
+  if ax < 0 || !(P.nodes[ax] is Ident) { return false }
+  const d = identDeclOf(ax)
+  d >= 0 && d < P.nodes.length && P.nodes[d] is Param
+}
+
+// The refusal `monoFwdFnPinMisfits` answers when the split plan cannot give the parameter a
+// slot per type.
+function monoFwdFnPinFail(par: string, callee: string): i32 {
+  emitFail(
+    "emitProgram: monomorphize: a function parameter handed on to `"
+      + par
+      + "` in a call to `"
+      + callee
+      + "` is called there at a type it does not take",
+  )
+}
+
 // Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
 let monoDestPinOff = false
 
@@ -13973,6 +14039,11 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             pinned.push(an)
             if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
             pinTys.push(anTy)
+            if monoFwdFnPinMisfits(fn, params[i], args[i], anTy) {
+              // The plan gives the parameter one per type its calls take (D6202).
+              fsAsk(params[i])
+              return monoFwdFnPinFail(p.parName, fn.fnName)
+            }
           } else {
             const pr = monoPinAnnotatedParam(
               p,
@@ -14195,6 +14266,12 @@ function monoPinAnnotatedParam(
           + "`",
       )
     }
+    if ann == tp && monoFwdFnPinMisfits(fn, params[i], args[i], an2Ty) {
+      fsAsk(params[i])
+      return monoFwdFnPinFail(p.parName, fn.fnName)
+    }
+    // A parameter handed on keeps its own pin as a generic does (D6202).
+    if ann == tp && monoReadsParam(args[i]) { genPin = true }
     let bind = an2
     if ann != tp {
       // `T[]` param: the argument must be an array, and its element binds
