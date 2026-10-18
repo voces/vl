@@ -620,8 +620,10 @@ Source grew from 298,771 to 310,731 lines (+4.0%), and fuel grew 41.9%.
   moves more than about 0.2 points.
 - **(a) #3966, +1.0%.** Eardstap EV-003 to EV-006, about 440 compiler lines. The cost is spread
   over `objFieldType`, `tyHasTyVarAt` and `cwDeclSlotOf`, each under 0.4 points.
-- No other interval moved more than 1%. A rebaseline at master would record 128.48G at
-  `090237334`. It is not written here, because D6130 is an avoidable cost.
+- **Unattributed, +5.1%.** The merges after `090237334`, among them #4043 and #4053 (the S5
+  interface hash, computed on every check) and #4044 (L1), are not bisected. Master reads 134.99G at `1cadabfaa`, 0.6% under the 1.5x trip.
+- No other interval moved more than 1%. The baseline is rewritten at `1cadabfaa` (134.99G):
+  the rise is attributed row by row, and D6130 stays open to carry the avoidable part.
 
 ## Guards
 
