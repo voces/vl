@@ -65,17 +65,23 @@ import {
   BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
   CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -85,10 +91,13 @@ import {
   Param,
   Paren,
   Program,
+  RetStmt,
+  Spread,
   StrLit,
   TypeDecl,
   TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
   i32ToStr,
   nodeChildren,
@@ -1864,13 +1873,27 @@ export function isLitVariantName(name: string) {
 export function unionEqOperandOk(exprIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
-  if e is Ident { return true }
-  if e is NumLit { return true }
-  if e is StrLit { return true }
-  if e is Member { return unionEqOperandOk(e.memObj) }
-  if e is OptMember { return unionEqOperandOk(e.omObj) }
-  if e is Index {
-    return unionEqOperandOk(e.idxArr) && unionEqOperandOk(e.idxIndex)
+  match e {
+    Ident => {
+      return true
+    }
+    NumLit => {
+      return true
+    }
+    StrLit => {
+      return true
+    }
+    Member => {
+      return unionEqOperandOk(e.memObj)
+    }
+    OptMember => {
+      return unionEqOperandOk(e.omObj)
+    }
+    Index => {
+      return unionEqOperandOk(e.idxArr) && unionEqOperandOk(e.idxIndex)
+    }
+    // A call, an operator or any other expression may have an effect, so it is not re-read.
+    CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -1892,18 +1915,23 @@ function memberPathKeyAt(memIx: i32, thruIndex: boolean): string {
   const m = P.nodes[unwrapParen(memIx)]
   if m is Member {
     const r = P.nodes[unwrapParen(m.memObj)]
-    if r is Ident { return r.identName + "." + m.memProp }
-    // A nested path (`n.a.b`) keys through its receiver's own path key — a non-`Ident`,
-    // non-`Member`, non-`Index` link (a call) stays un-narrowable either way.
-    if r is Member {
-      const inner = memberPathKeyAt(m.memObj, thruIndex)
-      if inner != "" { return inner + "." + m.memProp }
-    }
-    if r is Index {
-      if thruIndex {
-        const iinner = indexPathKeyOf(m.memObj)
-        if iinner != "" { return iinner + "." + m.memProp }
+    match r {
+      Ident => {
+        return r.identName + "." + m.memProp
       }
+      // A nested path (`n.a.b`) keys through its receiver's own path key.
+      Member => {
+        const inner = memberPathKeyAt(m.memObj, thruIndex)
+        if inner != "" { return inner + "." + m.memProp }
+      }
+      Index => {
+        if thruIndex {
+          const iinner = indexPathKeyOf(m.memObj)
+          if iinner != "" { return iinner + "." + m.memProp }
+        }
+      }
+      // Any other receiver link (a call) stays un-narrowable.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
   }
   ""
@@ -1915,17 +1943,23 @@ function memberPathKeyAt(memIx: i32, thruIndex: boolean): string {
 export function subscriptKeyLexemeOf(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[unwrapParen(ix)]
-  if n is NumLit {
-    const t = n.numText
-    if t.length < 1 { return "" }
-    let i = 0
-    while i < t.length {
-      if t[i] < '0' || t[i] > '9' { return "" }
-      i = i + 1
+  match n {
+    NumLit => {
+      const t = n.numText
+      if t.length < 1 { return "" }
+      let i = 0
+      while i < t.length {
+        if t[i] < '0' || t[i] > '9' { return "" }
+        i = i + 1
+      }
+      return t
     }
-    return t
+    StrLit => {
+      return n.strText
+    }
+    // Any other subscript is not a literal key.
+    CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
-  if n is StrLit { return n.strText }
   ""
 }
 // The narrowing-stack key of an index place (`xs[0]`, `o.xs[0]`) — the emitter's twin of
@@ -1938,18 +1972,24 @@ export function indexPathKeyOf(idxIx: i32) {
     const lit = subscriptKeyLexemeOf(n.idxIndex)
     if lit == "" { return "" }
     const r = P.nodes[unwrapParen(n.idxArr)]
-    if r is Ident { return r.identName + "[" + lit + "]" }
-    if r is Member {
-      const inner = memberKeyThroughIndex(n.idxArr)
-      if inner != "" { return inner + "[" + lit + "]" }
-    }
-    // A NESTED cell (`ys[0][0]`, `mm["a"]["b"]`), keyed through this function's own answer
-    // exactly as `placeKeyOf` recurses through its own. The write side has to retire by
-    // PREFIX for this to be sound, since a write to `ys[0]` says nothing about the cell
-    // under it and an exact-key retire would leave the inner narrowing live (D1722).
-    if r is Index {
-      const iinner = indexPathKeyOf(n.idxArr)
-      if iinner != "" { return iinner + "[" + lit + "]" }
+    match r {
+      Ident => {
+        return r.identName + "[" + lit + "]"
+      }
+      Member => {
+        const inner = memberKeyThroughIndex(n.idxArr)
+        if inner != "" { return inner + "[" + lit + "]" }
+      }
+      // A NESTED cell (`ys[0][0]`, `mm["a"]["b"]`), keyed through this function's own answer
+      // exactly as `placeKeyOf` recurses through its own. The write side has to retire by
+      // PREFIX for this to be sound, since a write to `ys[0]` says nothing about the cell
+      // under it and an exact-key retire would leave the inner narrowing live (D1722).
+      Index => {
+        const iinner = indexPathKeyOf(n.idxArr)
+        if iinner != "" { return iinner + "[" + lit + "]" }
+      }
+      // Any other receiver is not a place.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
   }
   ""
@@ -1961,8 +2001,16 @@ export function indexPathKeyOf(idxIx: i32) {
 export function placeNarrowKeyOf(exprIx: i32): string {
   if exprIx < 0 || exprIx >= P.nodes.length { return "" }
   const e = P.nodes[unwrapParen(exprIx)]
-  if e is Member { return memberPathKeyOf(exprIx) }
-  if e is Index { return indexPathKeyOf(exprIx) }
+  match e {
+    Member => {
+      return memberPathKeyOf(exprIx)
+    }
+    Index => {
+      return indexPathKeyOf(exprIx)
+    }
+    // An identifier is keyed by name elsewhere, and any other node is not a place.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
   ""
 }
 // Decodes the raw string lexeme `raw` (with its surrounding quotes) into the i32 vector of
@@ -2536,6 +2584,7 @@ function tyIsNulClosureArrayNode(tyIx: i32) {
     if e >= 0 {
       const et = T.tys[e]
       if et is TyNullable {
+        if et.nInner < 0 || et.nInner >= T.tys.length { return false }
         const inner = T.tys[et.nInner]
         if inner is TyFunc { return true }
       }
@@ -2658,35 +2707,49 @@ function arrLitElemIsScalarLit(ix: i32): boolean {
 export function isConstInit(exprIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
-  if e is NumLit { return true }
-  if e is CharLit { return true }
-  if e is BoolLit { return true }
-  if e is StrLit { return e.strText.length <= NEW_FIXED_MAX + 2 }
-  if e is Paren { return isConstInit(e.parInner) }
-  if e is ArrayLit {
-    if e.arrElems.length > NEW_FIXED_MAX { return false }
-    if e.arrElems.length > ALLOC_LIT_CHUNK && !arrLitBuildsScalar(exprIx) {
-      return false
+  match e {
+    NumLit => {
+      return true
     }
-    let i = 0
-    while i < e.arrElems.length {
-      if !isConstInit(e.arrElems[i]) { return false }
-      i = i + 1
+    CharLit => {
+      return true
     }
-    return true
-  }
-  if e is ObjLit {
-    let i = 0
-    while i < e.objFields.length {
-      const f = P.nodes[e.objFields[i]]
-      if f is FieldInit {
-        if !isConstInit(f.fiValue) { return false }
-      } else {
+    BoolLit => {
+      return true
+    }
+    StrLit => {
+      return e.strText.length <= NEW_FIXED_MAX + 2
+    }
+    Paren => {
+      return isConstInit(e.parInner)
+    }
+    ArrayLit => {
+      if e.arrElems.length > NEW_FIXED_MAX { return false }
+      if e.arrElems.length > ALLOC_LIT_CHUNK && !arrLitBuildsScalar(exprIx) {
         return false
       }
-      i = i + 1
+      let i = 0
+      while i < e.arrElems.length {
+        if !isConstInit(e.arrElems[i]) { return false }
+        i = i + 1
+      }
+      return true
     }
-    return true
+    ObjLit => {
+      let i = 0
+      while i < e.objFields.length {
+        const f = P.nodes[e.objFields[i]]
+        if f is FieldInit {
+          if !isConstInit(f.fiValue) { return false }
+        } else {
+          return false
+        }
+        i = i + 1
+      }
+      return true
+    }
+    // `null`, a name, a call, an operator or any other node routes through the start function.
+    NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }

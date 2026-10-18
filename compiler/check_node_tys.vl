@@ -24,13 +24,16 @@ import {
   PrimName,
   T,
   TyArray,
+  TyErr,
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
   cStructTyIxSet,
   cTyIxSetHas,
   cVariantMemberTyIxSet,
@@ -253,7 +256,7 @@ export function nodeTyWidenedRepName(ix: i32) {
   // A single literal or homogeneous numeric literal union widens to its base scalar here too,
   // matching `canonEmitName`'s softening — a mixed `"a"|7` stays the value-union box instead.
   const soft = softenLitTy(ty)
-  if soft != ty {
+  if soft != ty && soft >= 0 {
     const st = T.tys[soft]
     if st is TyPrim { return st.primName }
   }
@@ -324,21 +327,27 @@ export function nodeTyIsNulI32List(ix: i32) {
       const e = it.aElem
       if e >= 0 {
         const et = T.tys[e]
-        if et is TyPrim {
-          return et.primName == "i32"
-            || et.primName == "boolean"
-            || et.primName == "null"
-        }
-        // A literal-union element (`K[] | null`) shares the i32-list backing exactly like
-        // `i32[]` (the arena dual of `nameIsI32Array`'s litunion arm).
-        if tyIsLitUnion(e) { return true }
-        // A niche-nullable i32-backed element (`(K | null)[] | null`) rides its null in the
-        // same i32 sentinel and the outer `| null` is the same niche, matching the non-null case.
-        if tyIsNullableLitUnion(e) { return true }
-        if et is TyNullable {
-          if et.nInner < 0 || et.nInner >= T.tys.length { return false }
-          const ei = T.tys[et.nInner]
-          if ei is TyPrim { return ei.primName == "boolean" }
+        match et {
+          TyPrim => {
+            return et.primName == "i32"
+              || et.primName == "boolean"
+              || et.primName == "null"
+          }
+          TyNullable => {
+            // A literal-union element (`K[] | null`) shares the i32-list backing exactly like
+            // `i32[]`, and a niche-nullable i32-backed element (`(K | null)[] | null`) rides its
+            // null in the same i32 sentinel as the outer `| null`.
+            if tyIsLitUnion(e) { return true }
+            if tyIsNullableLitUnion(e) { return true }
+            if et.nInner < 0 || et.nInner >= T.tys.length { return false }
+            const ei = T.tys[et.nInner]
+            if ei is TyPrim { return ei.primName == "boolean" }
+          }
+          TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+            // The same two literal-union element shapes, outside a nullable element.
+            if tyIsLitUnion(e) { return true }
+            if tyIsNullableLitUnion(e) { return true }
+          }
         }
       }
     }
@@ -371,14 +380,20 @@ export function nodeTyIsStruct(ix: i32) {
   if cTyIxSetHas(cVariantMemberTyIxSet, ty) { return false }
   if cTyIxSetHas(cStructTyIxSet, ty) { return true }
   const t = T.tys[ty]
-  if t is TyObj { return true }
-  if t is TyUnion {
-    // A struct-alias union — a canonicalized `{a} & {b}` intersection wraps its merged object
-    // shape in a one-member union; the emitter interns it as a struct (`isSName`), so match it.
-    if t.uMembers.length == 1 {
-      const m = T.tys[t.uMembers[0]]
-      if m is TyObj { return true }
+  match t {
+    TyObj => {
+      return true
     }
+    TyUnion => {
+      // A struct-alias union — a canonicalized `{a} & {b}` intersection wraps its merged object
+      // shape in a one-member union; the emitter interns it as a struct (`isSName`), so match it.
+      if t.uMembers.length == 1 {
+        const m = T.tys[t.uMembers[0]]
+        if m is TyObj { return true }
+      }
+    }
+    // No other row is a struct.
+    TyPrim | TyErr | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   false
 }
@@ -408,17 +423,23 @@ export function nodeTyIsUnionish(ix: i32): boolean {
   if ty < 0 { return false }
   if tyIsLitUnion(ty) { return false }
   const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length > 1 { return true }
-    // The same one-member wrapper `nodeTyIsUnionAlias` unwraps: a self-referential union with a
-    // `null` arm. The gate and the lowering must agree, or the parameter lowers as `i32` (invalid wasm).
-    if t.uMembers.length == 1 {
-      const m = T.tys[t.uMembers[0]]
-      if m is TyNullable { return true }
+  match t {
+    TyUnion => {
+      if t.uMembers.length > 1 { return true }
+      // The same one-member wrapper `nodeTyIsUnionAlias` unwraps: a self-referential union with a
+      // `null` arm. The gate and the lowering must agree, or the parameter lowers as `i32` (invalid wasm).
+      if t.uMembers.length == 1 {
+        const m = T.tys[t.uMembers[0]]
+        if m is TyNullable { return true }
+      }
+      return false
     }
-    return false
+    TyNullable => {
+      return true
+    }
+    // No other row is a union box.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
-  if t is TyNullable { return true }
   false
 }
 
@@ -487,8 +508,13 @@ export function nodeTyIsNulLitUnion(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyNullable { return tyIsNullableLitUnion(ty) }
-  if t is TyUnion { return tyIsNullableLitUnion(ty) }
+  match t {
+    TyNullable | TyUnion => {
+      return tyIsNullableLitUnion(ty)
+    }
+    // No other row can be a nullable literal union.
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+  }
   false
 }
 
@@ -581,19 +607,29 @@ export function nodeTyName(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return "" }
   const t = T.tys[ty]
-  if t is TyPrim {
-    if t.primName == "void" { return "" }
-    return tyToStructStr(ty)
+  match t {
+    TyPrim => {
+      if t.primName == "void" { return "" }
+      return tyToStructStr(ty)
+    }
+    // A struct type renders its inline shape; `synthParamAnnots` resolves that to the declared
+    // struct's nominal name, so an un-annotated struct-element callback param gets the same annotation.
+    TyObj => {
+      return tyToStructStr(ty)
+    }
+    // A FUNCTION type renders its closure-annotation name (`(i32) => i32`) so an un-annotated
+    // closure VALUE from a call result (`const g = f(4)`) recovers a sig-keyable name.
+    TyFunc => {
+      return tyToEmitName(ty)
+    }
+    // A ref-list type renders its recursive emit name so an un-annotated ref-list callback param
+    // recovers a name `synthParamAnnots` resolves — without it the param defaulted silently to i32.
+    TyArray => {
+      return tyToEmitName(ty)
+    }
+    // A union, nullable, map or unresolved type has no name here.
+    TyErr | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
   }
-  // A struct type renders its inline shape; `synthParamAnnots` resolves that to the declared
-  // struct's nominal name, so an un-annotated struct-element callback param gets the same annotation.
-  if t is TyObj { return tyToStructStr(ty) }
-  // A FUNCTION type renders its closure-annotation name (`(i32) => i32`) so an un-annotated
-  // closure VALUE from a call result (`const g = f(4)`) recovers a sig-keyable name.
-  if t is TyFunc { return tyToEmitName(ty) }
-  // A ref-list type renders its recursive emit name so an un-annotated ref-list callback param
-  // recovers a name `synthParamAnnots` resolves — without it the param defaulted silently to i32.
-  if t is TyArray { return tyToEmitName(ty) }
   ""
 }
 
@@ -796,13 +832,19 @@ export function nodeTyMapKeyKind(ix: i32): i32 {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return MAP_KEY_STR }
   const t = T.tys[ty]
-  if t is TyNullable {
-    if t.nInner < 0 || t.nInner >= T.tys.length { return MAP_KEY_STR }
-    const it = T.tys[t.nInner]
-    if it is TyMap { return mapKeyKindOfTy(it.mKey) }
-    return MAP_KEY_STR
+  match t {
+    TyNullable => {
+      if t.nInner < 0 || t.nInner >= T.tys.length { return MAP_KEY_STR }
+      const it = T.tys[t.nInner]
+      if it is TyMap { return mapKeyKindOfTy(it.mKey) }
+      return MAP_KEY_STR
+    }
+    TyMap => {
+      return mapKeyKindOfTy(t.mKey)
+    }
+    // Any other row has no map type.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyArray | TyVar | TyLit | TyNeg => {}
   }
-  if t is TyMap { return mapKeyKindOfTy(t.mKey) }
   MAP_KEY_STR
 }
 

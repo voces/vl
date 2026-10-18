@@ -9,9 +9,11 @@
 import {
   AsExpr,
   FieldDef,
+  FieldInit,
   FuncDecl,
   IsExpr,
   LetDecl,
+  ObjLit,
   P,
   Param,
   Program,
@@ -53,6 +55,9 @@ const IH_NO_AMB_NAMES = 1048576
 const IH_NO_AMB_RECV = 2097152
 const IH_NO_AMB_RENDER = 4194304
 const IH_NO_AMB_GENERIC = 8388608
+const IH_NO_REACH_TOKENS = 16777216
+const IH_NO_AMB_ARENA = 33554432
+const IH_NO_AMB_SHADOW = 67108864
 
 // Statement kinds.
 const IH_ST_ROOT = 0
@@ -113,8 +118,17 @@ let ihAkKind: i32[] = []
 let ihAkLo: i32[] = []
 let ihAkHi: i32[] = []
 let ihAkW: string[] = []
+let ihAkSet: i32[] = []
 let ihDeclsOf: {[string]: i32[]} = Map()
 let ihFv: {[string]: boolean} = Map()
+// The field-name sets the check of S builds, by `ihSetKey`; `ihSetsAny` when one repeats a name.
+let ihSets: {[i32]: boolean} = Map()
+let ihSetsAny = false
+// Object literals: statement `ihLitSt[k]` builds one whose field-name set has key `ihLitKey[k]`,
+// with `ihLitRep[k]` when it repeats a name.
+let ihLitSt: i32[] = []
+let ihLitKey: i32[] = []
+let ihLitRep: boolean[] = []
 // Import rows: module `ihImpMod[k]` binds `ihImpLocal[k]` to `ihImpOName[k]` of module
 // `ihImpOMod[k]`, the declaring one; an empty name is a namespace import.
 let ihImpMod: i32[] = []
@@ -137,6 +151,8 @@ let ihStamp = 0
 let ihFreshHit = false
 let ihImpAt: {[string]: i32} = Map()
 let ihImpRowsOf: i32[][] = []
+// The mask `ihTokDigests` last folded under, or -1 before it runs.
+let ihDigMask = -1
 // Per statement, built on first reach: its exposed and callee successors as ranges of
 // `ihSucc`, and its exposed row with whether that row is a fresh builder.
 let ihSucc: i32[] = []
@@ -243,6 +259,8 @@ export function ihBegin(keys: string[]): i32 {
   ihExpStamp = []
   ihCalStamp = []
   ihImpAt = Map()
+  ihImpRowsOf = []
+  ihDigMask = -1
   let i = 0
   while i < keys.length {
     ihOwn.push(IH_SEED)
@@ -592,6 +610,35 @@ function ihAkRow(at: i32, kind: i32, ws: string[]): void {
   ihAkLo.push(ihAkW.length)
   for w in ws { ihAkW.push(w) }
   ihAkHi.push(ihAkW.length)
+  ihAkSet.push(ihSetKey(ws))
+  if kind == IH_AK_FIELDS && ihHasRepeat(ws) { ihMarkWild(at) }
+}
+
+// An order-free key of a set of names: equal sets give equal keys, and a collision only adds
+// a meet.
+function ihSetKey(ws: string[]): i32 {
+  let sum = 0
+  for w in ws { sum = sum + ihMixStr(IH_SEED, w) }
+  ihMixInt(sum, ws.length)
+}
+
+function ihHasRepeat(ws: string[]): boolean {
+  let i = 0
+  while i < ws.length {
+    let j = i + 1
+    while j < ws.length {
+      if ws[i] == ws[j] { return true }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  false
+}
+
+// Adds one field-name set the check of S builds.
+function ihSetAdd(ws: string[]): void {
+  if ihHasRepeat(ws) { ihSetsAny = true }
+  ihSets[ihSetKey(ws)] = true
 }
 
 // A declared type's name without its parameters or its block-scope suffix.
@@ -647,6 +694,14 @@ function ihDeclKeys(x: i32, at: i32, seen: string[]): void {
   }
 }
 
+// Whether `head` is the built-in `Map` or `Set` and no module declares that name. Its instance
+// holds no record level of its own, and its arguments are keyed where they are spelled.
+function ihBuiltinHead(head: string): boolean {
+  const base = ihDeclBase(head)
+  if base != "Map" && base != "Set" { return false }
+  ihOn(IH_NO_AMB_SHADOW) || !ihDeclsOf.has(base)
+}
+
 // A statement no key bounds: any check may read it.
 function ihMarkWild(at: i32): void { ihStWild[at] = true }
 
@@ -679,8 +734,11 @@ function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
       if k < s.length && s[k] == ':' && top >= 0 && kinds[top] {
         words[top].push(s.slice(i, j))
       } else if j < s.length && s[j] == '<' && !ihOn(IH_NO_AMB_GENERIC) {
-        amb = true
-        ihHeadKeys(s.slice(i, j), at, seen)
+        const head = s.slice(i, j)
+        if !ihBuiltinHead(head) {
+          amb = true
+          ihHeadKeys(head, at, seen)
+        }
       }
       i = j
     } else if c == '"' || c == '\'' {
@@ -760,6 +818,10 @@ export function ihAmbientScan(): i32 {
   ihAkLo = []
   ihAkHi = []
   ihAkW = []
+  ihAkSet = []
+  ihLitSt = []
+  ihLitKey = []
+  ihLitRep = []
   ihDeclsOf = Map()
   let s = 0
   while s < ihStMod.length {
@@ -801,6 +863,12 @@ export function ihAmbientScan(): i32 {
         ihDeclKeys(x, at, seen)
       }
       if nd is FuncDecl { amb = ihReceiverFn(nd, at) }
+      if nd is ObjLit {
+        const ws = ihLitNames(nd.objFields)
+        ihLitSt.push(at)
+        ihLitKey.push(ihSetKey(ws))
+        ihLitRep.push(ihHasRepeat(ws))
+      }
       if amb { ihStAmb[at] = true }
     }
     x = x + 1
@@ -825,10 +893,21 @@ function ihWildUnkeyed(): i32 {
   0
 }
 
-// Before `ihAmbientMeets`: the words a check of the modules `inS` can match an ambient key with,
-// every token they spell and every field name the check's arena holds.
+// Before `ihAmbientMeets`, from the modules `inS`: the words their statements spell, every token
+// and the text of every quoted one, and the field-name set of each of their object literals.
 export function ihAmbientFv(inS: boolean[]): i32 {
   ihFv = Map()
+  ihSets = Map()
+  ihSetsAny = false
+  let k = 0
+  while k < ihLitSt.length {
+    const m = ihStMod[ihLitSt[k]]
+    if m >= 0 && m < inS.length && inS[m] {
+      if ihLitRep[k] { ihSetsAny = true }
+      ihSets[ihLitKey[k]] = true
+    }
+    k = k + 1
+  }
   let s = 0
   while s < ihStMod.length {
     const m = ihStMod[s]
@@ -845,17 +924,34 @@ export function ihAmbientFv(inS: boolean[]): i32 {
     }
     s = s + 1
   }
-  for ty in T.tys {
-    if ty is TyObj {
-      for f in ty.objFieldNames { ihFv[f] = true }
+  0
+}
+
+function ihLitNames(fs: i32[]): string[] {
+  const ws: string[] = []
+  for f in fs {
+    if f >= 0 && f < P.nodes.length {
+      const fi = P.nodes[f]
+      if fi is FieldInit { ws.push(fi.fiName) }
     }
+  }
+  ws
+}
+
+// After the check, to the sets `ihAmbientFv` read: the field-name set of every record type the
+// check's arena holds.
+export function ihAmbientFvArena(): i32 {
+  if ihOn(IH_NO_AMB_ARENA) { return 0 }
+  for ty in T.tys {
+    if ty is TyObj { ihSetAdd(ty.objFieldNames) }
   }
   0
 }
 
 // Per module: whether one of its ambient statements may change a check of the modules
 // `ihAmbientFv` read, which then holds diagnostics when `diags`. A statement may when it is
-// wild, when the check spells its name, or when the check spells every field of a level.
+// wild, when the check spells its name, or when the check builds a record with exactly the
+// field names of one of its levels.
 export function ihAmbientMeets(diags: boolean): boolean[] {
   const out: boolean[] = []
   let d = 0
@@ -878,10 +974,14 @@ export function ihAmbientMeets(diags: boolean): boolean[] {
     if m >= 0 && m < out.length && !out[m] {
       const kind = ihAkKind[k]
       let all = true
-      let w = ihAkLo[k]
-      while w < ihAkHi[k] {
-        if !ihFv.has(ihAkW[w]) { all = false }
-        w = w + 1
+      if kind == IH_AK_FIELDS {
+        all = ihSetsAny || ihSets.has(ihAkSet[k])
+      } else {
+        let w = ihAkLo[k]
+        while w < ihAkHi[k] {
+          if !ihFv.has(ihAkW[w]) { all = false }
+          w = w + 1
+        }
       }
       if kind == IH_AK_NAME && ihOn(IH_NO_AMB_NAMES) { all = false }
       if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
@@ -1240,8 +1340,7 @@ function ihDeepVisit(m: i32, done: boolean[]): i32 {
   ihDeepOf[m]
 }
 
-// Keep what `ihReachOf` reads, and fold each module's token-side digests: its ambient
-// statements, every statement's kind, name and tokens, and where its imports resolve.
+// Keep what `ihReachOf` reads, folding the token-side digests again only under a new mask.
 function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
   const n = ihStMod.length
   ihByName = byName
@@ -1262,16 +1361,7 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
   ihExpFresh = []
   ihAdj = []
   ihDownMemo = []
-  ihImpRowsOf = []
-  let d = 0
-  while d < ihKeys.length {
-    ihAmb[d] = IH_SEED
-    ihDecor[d] = IH_SEED
-    ihImpMap[d] = IH_SEED
-    const none: i32[] = []
-    ihImpRowsOf.push(none)
-    d = d + 1
-  }
+  if ihDigMask != ihDrop { ihTokDigests() }
   let s = 0
   while s < n {
     ihExpStamp.push(0)
@@ -1284,12 +1374,35 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
     ihExpDone.push(false)
     ihExpMemo.push(0)
     ihExpFresh.push(false)
-    const m = ihStMod[s]
     if ihStKind[s] != IH_ST_ROOT {
       const prev = ihByAny[ihStName[s]] ?? []
       prev.push(s)
       ihByAny[ihStName[s]] = prev
     }
+    s = s + 1
+  }
+  0
+}
+
+// After `ihAmbientScan`, before the check: fold each module's token-side digests, its ambient
+// statements, every statement's kind, name and tokens, and where its imports resolve.
+export function ihTokDigests(): i32 {
+  const n = ihStMod.length
+  ihDigMask = ihDrop
+  ihImpAt = Map()
+  ihImpRowsOf = []
+  let d = 0
+  while d < ihKeys.length {
+    ihAmb[d] = IH_SEED
+    ihDecor[d] = IH_SEED
+    ihImpMap[d] = IH_SEED
+    const none: i32[] = []
+    ihImpRowsOf.push(none)
+    d = d + 1
+  }
+  let s = 0
+  while s < n {
+    const m = ihStMod[s]
     if s < ihStAmb.length && ihStAmb[s] && !ihOn(IH_NO_AMBIENT) {
       ihAmb[m] = ihMixInt(ihAmb[m], ihStFull[s])
     }
@@ -1537,11 +1650,8 @@ function ihExpRow(x: i32): i32 {
   }
   const m = ihStMod[x]
   let h = ihMixStr(ihMixStr(IH_SEED, ihKeys[m]), ihStName[x])
-  if ihLive(x) {
-    h = ihMixInt(h, ihStFull[x])
-  } else {
-    h = ihMixInt(h, ihStTok[x])
-  }
+  if ihLive(x) { h = ihMixInt(h, ihStFull[x]) }
+  else if !ihOn(IH_NO_REACH_TOKENS) { h = ihMixInt(h, ihStTok[x]) }
   const shown = ihShown[x]
   const keepTy = !ihOn(IH_NO_TYPES)
     && !(ihStCutRet[x] && ihOn(IH_NO_INFERRED_TYPE))

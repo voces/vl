@@ -211,6 +211,8 @@ export let box: Shape = { w: 1, h: 1 }
 export function clear(): void { print(0) }
 export function grow(): void { box.w = box.w + 1 }
 export const N = 16
+export function cdflt(n: i32 = N): i32 { return n }
+export function sdflt(n: i32, k: f64 = -0.5, s: string = "x", b: boolean = true): f64 { return k }
 export const TAG = "t"
 export let flag = false
 export let mode = "a"
@@ -307,6 +309,7 @@ const CASES: Case[] = [
     name: "signature edit",
     want: "decline",
     why: "interface",
+    badWhy: "decor",
     from: "area(n: i32)",
     to: "area(n: string)",
   },
@@ -364,17 +367,36 @@ const CASES: Case[] = [
     uses: `import { twice } from "./lib"\nprint(twice(2))\n`,
   },
   {
+    // A scalar-literal default is typed by the declaration's check; a caller reads its annotation.
     name: "defaulted param body edit",
-    want: "decline",
-    why: "demand",
+    want: "serve",
     from: "return n }\nexport let",
     to: "return n + 1 }\nexport let",
+    uses: `import { dflt, sdflt } from "./lib"\nprint(dflt())\nprint(sdflt(2))\n`,
+  },
+  {
+    name: "a defaulted param loses its default",
+    want: "decline",
+    why: "interface",
+    badWhy: "decor",
+    from: "dflt(n: i32 = 1)",
+    to: "dflt(n: i32)",
     uses: `import { dflt } from "./lib"\nprint(dflt())\n`,
+  },
+  {
+    // A default naming a binding is not a literal, so the plan does not close it.
+    name: "a const-defaulted param body edit",
+    want: "decline",
+    why: "demand",
+    from: "n * 2",
+    to: "n * 3",
+    uses: `import { cdflt } from "./lib"\nprint(cdflt())\n`,
   },
   {
     name: "imported binding edit",
     want: "decline",
     why: "interface",
+    badWhy: "decor",
     from: "x: 1, y: 2",
     to: "x: 5, y: 2",
     uses: `import { pt } from "./lib"\nprint(pt.x)\n`,
@@ -465,6 +487,7 @@ const CASES: Case[] = [
     name: "a number binding's literal edit",
     want: "decline",
     why: "interface",
+    badWhy: "decor",
     from: "count = 0",
     to: "count = 0.5",
     uses: `import { count } from "./lib"\nconst k: i32 = count\nprint(k)\n`,
@@ -473,14 +496,16 @@ const CASES: Case[] = [
     name: "scalar constant edit",
     want: "decline",
     why: "interface",
+    badWhy: "decor",
     from: "N = 16",
     to: "N = 300",
-    uses: `import { N } from "./lib"\nconst u: u8 = N\nprint(u)\n`,
+    uses: `import { N } from "./lib"\nconst u: u8[] = [N]\nprint(u[0])\n`,
   },
   {
     name: "annotated binding initialiser edit",
     want: "decline",
     why: "interface",
+    badWhy: "decor",
     from: "level: i32 = 0",
     to: "level: i32 = 7",
     uses: `import { level } from "./lib"\nlevel = 2\nprint(level)\n`,
@@ -513,6 +538,7 @@ const CASES: Case[] = [
     name: "re-export of a function whose signature changes",
     want: "decline",
     why: "interface",
+    badWhy: "decor",
     from: "area(n: i32)",
     to: "area(n: string)",
     uses: `export { area as ar } from "./lib"\n`,
@@ -629,6 +655,30 @@ const CASES: Case[] = [
     from: "n * 2",
     to: "n * 3",
     uses: 'function zzm(self: string): i32 { 1 }\nprint("a".zzm())\n',
+  },
+  {
+    // Lib spells `x` and `n`, but builds no record of exactly those fields, so none adopts it.
+    name: "main's private record spells lib's words but no lib record's field set",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses: "type Iq = { x: i32, n: i32 }\nconst iq: Iq = { x: 1, n: 2 }\nprint(iq.n)\n",
+  },
+  {
+    name: "main spells the built-in Map",
+    want: "serve",
+    from: "n * 2",
+    to: "n * 3",
+    uses: 'const mq: Map<string, i32> = Map()\nmq["a"] = 1\nprint(mq["a"] ?? 0)\n',
+  },
+  {
+    name: "a lib application of a declared Map spells main's literal record",
+    want: "decline",
+    why: "ambient",
+    from: "function quiet",
+    to: "function bq(b: Map<i32>): void { print(b.f) }\nfunction quiet",
+    libUses: "export type J = { f: i32 | null }\ntype Map<T> = { f: T }\n",
+    uses: 'import { J } from "./lib"\nfunction idn<T>(v: T): T { v }\nconst xj: J = idn({ f: 4 })\nprint(xj.f ?? 0)\n',
   },
   {
     name: "main's private type spells a lib body literal's record",
@@ -867,12 +917,17 @@ Deno.test({
       // `IH_NO_AMB_RECV | IH_NO_AMB_RENDER` (the getter's read is itself a lib diagnostic).
       ["main's private type spells a lib body literal's record", 524288],
       ["a lib generic application spells main's literal record", 8388608],
+      // `IH_NO_AMB_SHADOW` reads `Map<…>` as the built-in even where a module declares `Map`.
+      ["a lib application of a declared Map spells main's literal record", 67108864],
       ["a lib method typo is near a private main self-function", 4194304],
       ["main declares a getter on a lib type lib reads", 2097152 | 4194304],
       // `IH_NO_LIVE` cuts a writing body to its mentions, which miss the field it writes.
       ["a callee's write moves to the narrowed field", 32768],
       ["a callee's helper write moves to the narrowed field", 32768],
       ["a callee's alias write moves to the narrowed field", 32768],
+      // `IH_NO_REACH_TOKENS` drops a reach row's signature tokens, which alone spell a default:
+      // the checked type renders the same with it or without.
+      ["a defaulted param loses its default", 16777216],
     ];
     for (const [name, mask] of witness) {
       const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, mask);
