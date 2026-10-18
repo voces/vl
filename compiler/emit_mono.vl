@@ -83,6 +83,7 @@ import { blockLastStmt } from "./check_if_value"
 import { joinArmIsLit } from "./check_nj_join"
 import {
   callBindTyOf,
+  holeFnSplitHas,
   holeLitCopiesOf,
   holeLitPinOf,
   nodeArrayElemIsNullUnit,
@@ -330,6 +331,7 @@ import {
   lfNoteClone,
   lfNoteMinted,
   monoAnonParamPinTy,
+  monoArgInstFe,
   monoExactSubN,
   monoExactSubRow,
   monoExactSubT,
@@ -1157,10 +1159,25 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
   const nt = nodeTyIxOf(ax)
   if nt < 0 { return "" }
   const n = tyToEmitName(nt)
+  if n == "" { return monoElemlessNulListPinName(nt, chosen) }
   if n == chosen { return "" }
   if nullablePartOf(n) != chosen { return "" }
   if monoAnnPinName(n) != n { return "" }
   n
+}
+
+// The widened pin of an element-less `[] | null`, which has no render: nothing decided its
+// element, so the ladder `chosen` is the default `i32[]` and the pin keeps the `null` (D6120).
+function monoElemlessNulListPinName(nt: i32, chosen: string): string {
+  if nt < 0 || nt >= T.tys.length || chosen != "i32[]" { return "" }
+  const t = T.tys[nt]
+  if !(t is TyNullable) || t.nInner < 0 || t.nInner >= T.tys.length {
+    return ""
+  }
+  const l = T.tys[t.nInner]
+  if !(l is TyArray) || l.aElem >= 0 { return "" }
+  if monoAnnPinName("i32[]|null") != "i32[]|null" { return "" }
+  "i32[]|null"
 }
 
 // The pin an un-annotated list binding takes from the declared union-element destination its
@@ -8721,6 +8738,30 @@ export function monoSubTablesReset() {
   monoPinSubRow = Map()
   monoPinSubN = []
   monoPinSubT = []
+  monoArgInstFe = Map()
+  monoOpenArgCall = 0 - 1
+  monoOpenArgCallee = 0 - 1
+  0
+}
+
+// The module-scope call being instantiated and its callee, whose open-typed arguments are read
+// at the instance the callee reaches (`monoArgInstFe`); -1 for none.
+let monoOpenArgCall = 0 - 1
+let monoOpenArgCallee = 0 - 1
+
+// Records each argument of `monoOpenArgCall` whose recorded type names a type variable as read
+// at instance slot `instFe`, when `calleeIx` is that call's callee; consumes the call.
+function monoNoteOpenArgs(calleeIx: i32, instFe: i32) {
+  if monoOpenArgCall < 0 || calleeIx != monoOpenArgCallee { return 0 }
+  const c = P.nodes[monoOpenArgCall]
+  monoOpenArgCall = 0 - 1
+  monoOpenArgCallee = 0 - 1
+  if c is Call {
+    for a in c.callArgs {
+      const t = nodeTyIxOf(a)
+      if t >= 0 && tyHasTyVar(t) { monoArgInstFe.set(a, instFe) }
+    }
+  }
   0
 }
 
@@ -8829,6 +8870,7 @@ function monoMakeInstanceHit(
   while k < monoKeys.length {
     if monoKeys[k] == key {
       monoLastInstFe = monoInstFe[k]
+      monoNoteOpenArgs(calleeIx, monoInstFe[k])
       monoPoisonSharedPins(monoInstFe[k], pinTys)
       const cal = P.nodes[calleeIx]
       if cal is Ident {
@@ -10427,6 +10469,7 @@ function monoMakeInstanceGo(
       instHoleN,
       instHoleT,
     )
+    monoNoteOpenArgs(calleeIx, instFe)
     if monoRebuild() < 0 { return -1 }
     return monoMakeInstanceWalk(fn, origFe, nfn, calleeIx, lamClones)
   }
@@ -13620,7 +13663,14 @@ function monoAtomsCover(outer: string, inner: string): boolean {
 function monoInstantiate(origFe: i32, callIx: i32, ctx: i32) {
   const saved = monoDestPinOff
   monoDestPinOff = monoCalleeHasTyParamArrow(origFe)
+  const c = P.nodes[callIx]
+  if ctx < 0 && c is Call {
+    monoOpenArgCall = callIx
+    monoOpenArgCallee = c.callFn
+  }
   const r = monoInstantiateCall(origFe, callIx, ctx)
+  monoOpenArgCall = 0 - 1
+  monoOpenArgCallee = 0 - 1
   monoDestPinOff = saved
   r
 }
@@ -13991,6 +14041,19 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
             // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
             let an = recordedParamPinName(params[i])
             let anTy = -1
+            // One copy of the parameter cannot hold a generic its body calls at two instances;
+            // the split plan gives it one per instance (D6210). The walk goes on, so every such
+            // parameter is asked in one compile.
+            if an == "" && holeFnSplitHas(params[i]) {
+              fsAsk(params[i])
+              emitFail(
+                "emitProgram: monomorphize: `"
+                  + p.parName
+                  + "` is called at two instances of the function handed to it in a call to `"
+                  + fn.fnName
+                  + "`",
+              )
+            }
             if an == "" {
               const pinTy: i32[] = [0 - 1]
               an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
