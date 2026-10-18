@@ -1045,6 +1045,79 @@ parse), and merges the slot's flags. The parse is skipped.
   replayed module could skip. The rest of the check (74% of the samples fall outside every
   phase the script names) waits on the hash.
 
+**S5 step 4: a per-module interface hash** (`compiler/iface_hash.vl`). The hash only records
+what a module's dependents can observe of it. Nothing reads it yet to skip work. A test or a
+probe arms it with `ifaceHashArm`, and `modCompile` then fills it in two halves:
+- **Before the pins** (`ihModule`, from `modIfaceBegin` after the parse): the module's tokens,
+  with the body of each fully annotated, non-generic function cut out. A body stays in the
+  hash when callers can see it. Under Q4 (A) no annotation is assumed, so the hash keeps:
+  - a generic body, because the checker checks it at the call's types and its error lands in
+    the importer;
+  - a body with an untyped parameter, because the parameter takes its type from the body and
+    the error lands at the importer's call (D3817);
+  - an inferred-return body.
+
+  For each cut body, the hash adds how the body mentions each top-level name, import local
+  and parameter: write, call, member, declaration or read. A read counts too, because a global
+  that only `__start__` reads is demoted to a local of start.
+- **After the check** (`ihFinish`): the checked type of every top-level binding (`lookup` and
+  `tyToStr`). This half carries Q1 (B) adoption, a record taking a wider type through an
+  importer, and every inferred signature. It also builds a deep hash over each module's
+  imports, which carries re-exports and records reached through a middle module. A separate
+  span hash covers the line and column of every token outside the cuts.
+- **Soundness.** `tests/vl_iface_hash_test.ts` compiles 30 single-edit pairs over five graphs.
+  When an edited module's hash is unchanged and its imports' deep hashes are too, it requires
+  every dependent's diagnostics and wasm functions (`wasm-dis`, by name) to be identical.
+  - Result: 8 of the 30 edits keep the hash, and 0 are unsound.
+  - Not compared: untagged generic instances and std helpers. An instance is built from the
+    generic's own body in the edited module, which is not a dependent.
+  - Controls: the hits must be exactly the cases filed as hits.
+- **Mutation.** The mask `ifaceHashDrop` takes removes one ingredient at a time. Each removal
+  turns its witness case unsound:
+
+  | ingredient dropped | witness case |
+  | --- | --- |
+  | generic body | a generic body edit refused at the call |
+  | untyped-param body | an untyped-param body edit refused at the call |
+  | inferred-return body | an inferred-return body edit with a new return type |
+  | checked types | an annotated body that delivers a literal `let` |
+  | mentions | an annotated body that writes a global |
+  | deep hash | a re-exported signature edit |
+
+  The checked binding type also carries an inferred return, so that ingredient is dropped
+  together with the types. Its witness must stay sound with the types alone dropped.
+- **Hit rate: 2 of 15 single-function edits from the compiler's history (13.3%), 0 unsound.**
+  `VL_IFACE_HASH_RATE=40` walks first-parent commits to `compiler/`. Each function a commit
+  changed in code is applied alone to the parent tree, and the edit is graded on one instance
+  against that parent's check.
+  - Left out: 25 edits that do not check when applied alone, since they depend on another
+    change in the same commit. Edits that use a name added to their own file, and edits to
+    comments only, are skipped without a compile.
+  - The misses, labelled by the edited function's header: 9 have an inferred return and 4 are
+    annotated. The 4 annotated ones change a mention or a checked type, such as a body that
+    now calls a helper it did not call before.
+  - With inferred-return bodies cut and their checked type left to carry them
+    (`VL_IFACE_HASH_RATE_DROP=4`), the same 15 edits give 4 hits (26.7%), also 0 unsound.
+    The other 7 inferred-return misses stay misses for a mention or a type.
+  - The compiler is an adverse population. About 43% of its single-line function headers have
+    an inferred return, and every top-level binding enters the hash, private or exported.
+- **Cost.** The hash is armed only by the suite. Seed 6,168,691 → 6,181,799 bytes (+0.21%).
+  The emitter is untouched.
+- **What remains before a dependent's re-check is skipped.**
+  - The hash proves that a dependent's result is unchanged. It does not yet prove that the
+    edited module's own check can be served from a bank. That check consumes its importers'
+    demands: Q1 (B) adoption, D3817's inferred parameters and generic instantiations. A skip
+    has to key on those demands as well.
+  - Function and type index assignment is still global, which is S6.
+  - Mentions are per body, not transitive. That is sound because every helper's body is in
+    the same module's hash, but a body edit that changes a private helper's write set is a
+    miss.
+  - Two refinements the rate points at, each needing its own soundness case:
+    - cut an inferred-return body and rely on the checked type, which doubles the hits on
+      this population;
+    - hash only what a dependent can name (exports and what they reach) rather than every
+      top-level binding.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.
