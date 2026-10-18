@@ -6,6 +6,7 @@ import {
   Call,
   FuncDecl,
   Ident,
+  LetDecl,
   Member,
   Node,
   OptMember,
@@ -220,7 +221,7 @@ import {
   genFnHoleCalled,
   genFnHoleInstance,
   holeRetTyOf,
-  judgeHoleCallBinOps,
+  judgeHoleCallOps,
   substTyDeep,
   tErr,
   tErrUnsupported,
@@ -228,6 +229,7 @@ import {
 import { valueUnionRetName } from "./check_ret_names"
 import {
   calleeDeclParams,
+  constDeclOf,
   lookup,
   lookupDepth,
   lookupFnAliasNode,
@@ -253,6 +255,7 @@ import {
   argPinPark,
   cstrOwnedBy,
   nestParentOf,
+  noteArrayWriteDemand,
   substNestDecl,
   substNestDeclSet,
   substNestMode,
@@ -297,6 +300,7 @@ import {
   tyIxIsView,
   tyPrintsAsRef,
   tyRefusesArrayDemand,
+  tyRefusesArrayWrite,
   tyToStr,
   tyWideUnionMinted,
 } from "./check_types"
@@ -1296,6 +1300,12 @@ function callFtyCheckArg(
     }
     if holeIsArrayWriteDemanded(calleeIdentName(cfn), pHole.tvName) {
       if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
+      if tyRefusesArrayWrite(at) { holeArgArrayErr(i + 1, at, args[i]) }
+      // A hole of the caller's handed in is written by it too, so its own callers are asked.
+      if at >= 0 && at < T.tys.length {
+        const aw = T.tys[at]
+        if aw is TyVar { noteArrayWriteDemand(aw.tvName) }
+      }
     }
     // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
     holeCastPinCheck(
@@ -1400,11 +1410,12 @@ function callFtyPinCstrs(
   const modeWas = substNestMode
   const declWas = substNestDecl
   let nestCallee = -1
+  let namedFn = -1
   if cfn is Ident {
     // The declaration the callee names, directly or through an alias.
-    nestCallee = lookupFnDeclNode(cfn.identName)
-    if nestCallee < 0 { nestCallee = lookupFnAliasNode(cfn.identName) }
-    if !nestParentOf.has(nestCallee) { nestCallee = -1 }
+    namedFn = lookupFnDeclNode(cfn.identName)
+    if namedFn < 0 { namedFn = lookupFnAliasNode(cfn.identName) }
+    if nestParentOf.has(namedFn) { nestCallee = namedFn }
   }
   if nestCallee >= 0 {
     // A nested generic, named directly or through an alias, owns no constraint: they are its
@@ -1421,17 +1432,23 @@ function callFtyPinCstrs(
   }
   const wsVd = T.diags.length
   adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
+  let opFn = cstrCallee
+  if opFn < 0 { opFn = namedFn }
+  if opFn < 0 { opFn = constLambdaOf(cfn) }
+  const noSplit = hasNamedArgs(n.callArgNames)
+    || callLeavesDefault(n, cstrCallee)
   judgeFnArgHoleCalls(
     vNames,
     vTys,
     cstrCallee,
+    opFn,
     dhNames,
     dhArgNode,
-    hasNamedArgs(n.callArgNames) || callLeavesDefault(n, cstrCallee),
+    noSplit,
   )
   instGenFnHolePins(vNames, vTys, cstrCallee)
   pinUnreadGenFnArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
-  pinHoleLambdaVals(vNames, vTys, ix, cstrCallee)
+  pinHoleLambdaVals(vNames, vTys, ix, cstrCallee, opFn, noSplit)
   if fsbName.length > 0 {
     fsbGenFnHolePins(fsbDeclAtNode(n.callFn), vNames, vTys, cstrCallee)
   }
@@ -1729,14 +1746,15 @@ function holeNameOnlyForwardedUnread(
   true
 }
 
-// A declared function named as an argument to a hole the callee's body calls is judged at the
-// instance each of those calls asks for, as a delivery at that type is, so a pin its body
-// cannot take is refused here and not at emit (D6190). Two instances mark the parameter for a
-// split unless `noSplit`: a named call, or one leaving a parameter to its default (D6280).
+// A function named as an argument to a hole the callee calls is judged at each instance those
+// calls ask for, so a pin its body cannot take is refused here (D6190); two instances mark the
+// parameter for a split unless `noSplit` (D6280). `opFn` is the body whose operators are judged:
+// the callee's declaration, nested or not, or the lambda a `const` callee holds (D6330).
 function judgeFnArgHoleCalls(
   vNames: string[],
   vTys: i32[],
   calleeFn: i32,
+  opFn: i32,
   dhNames: string[],
   dhArgNode: i32[],
   noSplit: boolean,
@@ -1764,10 +1782,8 @@ function judgeFnArgHoleCalls(
           }
           const insts: i32[] = []
           genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
-          if insts.length > 1 && !noSplit {
-            holeFnSplitAt(calleeFn, dhNames[j])
-          }
-          if insts.length > 1 { judgeHoleCallBinOps(calleeFn, vNames, wTys, a) }
+          if insts.length > 1 && !noSplit { holeFnSplitAt(opFn, dhNames[j]) }
+          if insts.length > 1 { judgeHoleCallOps(opFn, vNames, wTys, a) }
           const d0 = T.diags.length
           for inst in insts {
             if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
@@ -1799,12 +1815,15 @@ function holeFnSplitAt(fn: i32, hole: string) {
 
 // A lambda with hole parameters bound to a hole the callee's body calls is instanced at the
 // arguments of those calls, as a generic function there is (`instGenFnHolePins`), and its
-// body's demands are judged at that instance (D5935).
+// body's demands are judged at that instance (D5935); `opFn` and `noSplit` as
+// `judgeFnArgHoleCalls` takes them.
 function pinHoleLambdaVals(
   vNames: string[],
   vTys: i32[],
   ix: i32,
   calleeFn: i32,
+  opFn: i32,
+  noSplit: boolean,
 ) {
   let k = 0
   while k < vNames.length {
@@ -1830,16 +1849,64 @@ function pinHoleLambdaVals(
       if inst >= 0 {
         vTys[k] = inst
       } else if how >= 0 {
-        holeLambdaUninferable(lx)
+        if noSplit || !holeLambdaSplit(vNames, vTys, k, ix, calleeFn, opFn) {
+          holeLambdaUninferable(lx)
+        }
       } else {
         const insts: i32[] = []
         genFnHoleCallInsts(vNames, vTys, k, vt, calleeFn, insts)
-        if insts.length > 1 { judgeHoleCallBinOps(calleeFn, vNames, vTys, ix) }
+        if insts.length > 1 { judgeHoleCallOps(opFn, vNames, vTys, ix) }
       }
     }
     k = k + 1
   }
   0
+}
+
+// A lambda literal handed to hole `vNames[k]`, which `opFn`'s body calls at several instances,
+// is judged at each and the parameter marked for the split plan, which hands it one copy per
+// instance (D6331). False when the calls ask for fewer than two.
+function holeLambdaSplit(
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  ix: i32,
+  calleeFn: i32,
+  opFn: i32,
+): boolean {
+  if opFn < 0 || k < 0 || k >= vTys.length { return false }
+  const vt = vTys[k]
+  const insts: i32[] = []
+  genFnHoleCallInsts(vNames, vTys, k, vt, calleeFn, insts)
+  if insts.length < 2 { return false }
+  const d0 = T.diags.length
+  judgeHoleCallOps(opFn, vNames, vTys, ix)
+  for inst in insts {
+    if T.diags.length == d0 {
+      const nm: string[] = []
+      const ty: i32[] = []
+      for v in vNames { nm.push(v) }
+      for t in vTys { ty.push(t) }
+      holeLambdaBinds(vt, inst, nm, ty)
+      judgeHoleLambdaAt(vt, inst, nm, ty, ix)
+    }
+  }
+  holeFnSplitAt(opFn, vNames[k])
+  true
+}
+
+// The lambda a callee name's `const` binding holds as its initializer, or -1.
+function constLambdaOf(cfn: Node): i32 {
+  if !(cfn is Ident) { return -1 }
+  const d = constDeclOf(cfn.identName)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const l = P.nodes[d]
+  if !(l is LetDecl) || l.letInit < 0 { return -1 }
+  const f = parenPeelIx(l.letInit)
+  if f < 0 || f >= P.nodes.length { return -1 }
+  const fn = P.nodes[f]
+  if fn is FuncDecl && fn.fnName == "" { return f }
+  -1
 }
 
 // The lambda node whose parameter holes `ty` carries, -1 for a type with none.
