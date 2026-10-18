@@ -29,8 +29,10 @@ import {
   RetStmt,
   Spread,
   TypeRef,
+  hasNamedArgs,
   i32ToStr,
   nodeChildren,
+  orderArgsByParamNames,
 } from "./ast"
 import { callBindShadowCount, fnFlowSigFails } from "./call_bind_shadow"
 import { monoIsGenericDecl, normTypeAtom, unwrapParen } from "./emit_base"
@@ -1276,16 +1278,39 @@ function ffMethod(ix: i32, recv: i32, name: string): i32 {
   -1
 }
 
+// The arguments of call `n` to `fd`, one per parameter in parameter order, a -1 for one it does
+// not pass, then any it cannot place; a call naming no argument keeps its own order (D6281).
+function ffArgsInParamOrder(n: Call, fd: FuncDecl): i32[] {
+  if !hasNamedArgs(n.callArgNames) { return n.callArgs }
+  const names: string[] = []
+  for q in fd.fnParams {
+    const qn = P.nodes[q]
+    if qn is Param { names.push(qn.parName) } else { return n.callArgs }
+  }
+  orderArgsByParamNames(names, n.callArgs, n.callArgNames)
+}
+
+// The parameter index of argument `a` in `ord` (`ffArgsInParamOrder`) among `nPar`, or -1.
+function ffParamIxIn(ord: i32[], a: i32, nPar: i32): i32 {
+  let j = 0
+  while j < ord.length && j < nPar {
+    if ord[j] == a { return j }
+    j = j + 1
+  }
+  -1
+}
+
 // The closed type the argument in `args` to a parameter of generic `fn` annotated as the bare type
 // variable `tp` has, for a binding `t` the checker left open (it binds from the first argument
 // that names `tp`, which may be a generic function's own); `t` when no such argument is closed.
+// `args` is in parameter order, a -1 for a parameter the call does not pass.
 function ffBareParamArgTy(fn: i32, args: i32[], tp: string, t: i32): i32 {
   const fd = P.nodes[fn]
   if !(fd is FuncDecl) { return t }
   let i = 0
   while i < fd.fnParams.length && i < args.length {
     const p = P.nodes[fd.fnParams[i]]
-    if p is Param {
+    if p is Param && args[i] >= 0 {
       const pt = ffAnnTy(p.parType)
       if pt >= 0 && pt < T.tys.length {
         const pv = T.tys[pt]
@@ -1321,14 +1346,11 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
         ffRecord(callee, 2, -1, "direct call", fn, ctx)
       }
       ffEnsureWalked(fn, ctx)
-      let i = 0
-      while i < n.callArgs.length {
-        const a = n.callArgs[i]
+      const ord = ffArgsInParamOrder(n, fd)
+      for a in n.callArgs {
         const f = ffFlow(a, "argument")
-        if i < fd.fnParams.length {
-          ffInto(ffSlot(ffDeclKey(fd.fnParams[i], ctx)), f)
-        }
-        i = i + 1
+        const j = ffParamIxIn(ord, a, fd.fnParams.length)
+        if j >= 0 { ffInto(ffSlot(ffDeclKey(fd.fnParams[j], ctx)), f) }
       }
     }
   }
@@ -1347,21 +1369,22 @@ function ffInstCtx(ix: i32, fn: i32): i32 {
         const bN: string[] = []
         const bT: i32[] = []
         let key = "F" + i32ToStr(fn) + "<"
+        const ord = ffArgsInParamOrder(n, fd)
         for tp in fd.fnTyParams {
           let t = ffSubst(callBindTyOf(ix, tp))
           if t < 0 || tyHasTyVar(t) {
-            t = ffBareParamArgTy(fn, n.callArgs, tp, t)
+            t = ffBareParamArgTy(fn, ord, tp, t)
           }
           bN.push(tp)
           bT.push(t)
           key = key + ffTyKey(t) + "," + ffOpenSigSiteKey(t, ix)
         }
         let i = 0
-        while i < fd.fnParams.length && i < n.callArgs.length {
+        while i < fd.fnParams.length && i < ord.length {
           const p = P.nodes[fd.fnParams[i]]
-          if p is Param {
+          if p is Param && ord[i] >= 0 {
             if p.parType < 0 {
-              const t = ffSubst(nodeTyIxOf(n.callArgs[i]))
+              const t = ffSubst(nodeTyIxOf(ord[i]))
               bN.push(ffHoleName(fd.fnName, fn, i))
               bT.push(t)
               key = key + ffTyKey(t) + "," + ffOpenSigSiteKey(t, ix)

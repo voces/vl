@@ -13730,7 +13730,9 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 // The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
 // checker's binding, else the generic instanced at the one flow pin of its read past the call
 // (D5612). Delivered as a concrete function argument, so the callee can forward it on. "" when
-// none closes; `tyOut[0]` takes the pin's type. Two pins ask for a parameter per pin (D5611).
+// none closes; `tyOut[0]` takes the pin's type. Two pins ask for a parameter per pin (D5611),
+// and set `monoHoleGenTwoPins`, since no one signature serves the hole then (D6280).
+let monoHoleGenTwoPins = false
 function monoHoleGenFnPin(
   callIx: i32,
   pIx: i32,
@@ -13738,13 +13740,18 @@ function monoHoleGenFnPin(
   ctx: i32,
   tyOut: i32[],
 ): string {
+  monoHoleGenTwoPins = false
   const bt = monoHoleGenFnTy(callIx, pIx, argIx)
   if bt >= 0 { return monoFnPinAt(argIx, ctx, bt, -1, tyOut) }
   const fl = monoHoleGenFnFlowDecl(argIx, ctx)
   const ft = monoHoleGenFnFlowTy(argIx, fl)
   // The plan decides whether the hole is called at two types; the flow pins may stop at a
   // recursive forward before they reach both (D6091).
-  if ft < 0 && fl[1] >= 0 { fsAsk(pIx) }
+  if ft < 0 && fl[1] >= 0 {
+    fsAsk(pIx)
+    const noPath: string[] = []
+    monoHoleGenTwoPins = monoDeclPathPins(fl, noPath).length > 1
+  }
   monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
 }
 
@@ -13937,6 +13944,30 @@ function monoFwdFnPinFail(par: string, callee: string): i32 {
   )
 }
 
+// The refusal for a parameter `par` of `callee` no argument pin closes.
+function monoArgTyFail(par: string, callee: string): i32 {
+  emitFail(
+    "emitProgram: monomorphize: unsupported argument type for `"
+      + par
+      + "` in a call to `"
+      + callee
+      + "`",
+  )
+}
+
+// The refusal for generic `argIx` handed to a hole its calls use at two types, where no split
+// gave the hole a parameter per type: the value floor's, naming the signatures (D6280).
+function monoHoleTwoPinsFail(argIx: i32, par: string, callee: string): i32 {
+  const ax = unwrapParen(argIx)
+  let fe = monoReadGenFnFe(ax)
+  if fe < 0 && ax >= 0 && P.nodes[ax] is Ident {
+    const d = identDeclOf(ax)
+    if d >= 0 && P.nodes[d] is FuncDecl { fe = fnStmtsPosOf(d) }
+  }
+  if fe < 0 { return monoArgTyFail(par, callee) }
+  emitFailAt(genericFnValueRejectMsg(fe), ax)
+}
+
 // Set while the call being instantiated has such a parameter (`monoCalleeHasTyParamArrow`).
 let monoDestPinOff = false
 
@@ -14058,6 +14089,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               const pinTy: i32[] = [0 - 1]
               an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
               anTy = pinTy[0]
+              if an == "" && monoHoleGenTwoPins {
+                return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
+              }
             }
             if an == "" {
               const cpTy: i32[] = [0 - 1]
@@ -14091,13 +14125,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
                 fsAsk(args[i])
                 fsAsk(params[i])
               }
-              return emitFail(
-                "emitProgram: monomorphize: unsupported argument type for `"
-                  + p.parName
-                  + "` in a call to `"
-                  + fn.fnName
-                  + "`",
-              )
+              return monoArgTyFail(p.parName, fn.fnName)
             }
             pinned.push(an)
             if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
@@ -14235,13 +14263,7 @@ function monoPinAnnotatedParam(
         }
       }
       if anC == "" {
-        return emitFail(
-          "emitProgram: monomorphize: unsupported argument type for `"
-            + p.parName
-            + "` in a call to `"
-            + fn.fnName
-            + "`",
-        )
+        return monoArgTyFail(p.parName, fn.fnName)
       }
       monoBindFromAnn(
         ann,
@@ -14271,13 +14293,7 @@ function monoPinAnnotatedParam(
         pinC = monoSubstAnonShapes(ann, fn.fnTyParams, tvN, tvV, pinC)
       }
       if pinC == "" {
-        return emitFail(
-          "emitProgram: monomorphize: unsupported argument type for `"
-            + p.parName
-            + "` in a call to `"
-            + fn.fnName
-            + "`",
-        )
+        return monoArgTyFail(p.parName, fn.fnName)
       }
       // The coercion `monoWalk` deferred, since at that point the pin names
       // would be the type variables themselves. `pinC` is the substituted
@@ -14303,6 +14319,9 @@ function monoPinAnnotatedParam(
       const pinTy: i32[] = [0 - 1]
       an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
       an2Ty = pinTy[0]
+      if an2 == "" && monoHoleGenTwoPins {
+        return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
+      }
       genPin = an2 != ""
       if an2 == "" {
         an2 = monoHoleLeafLitPin(decl, args, i, ctx, pinTy)
@@ -14321,13 +14340,7 @@ function monoPinAnnotatedParam(
         fsAsk(args[i])
         fsAsk(params[i])
       }
-      return emitFail(
-        "emitProgram: monomorphize: unsupported argument type for `"
-          + p.parName
-          + "` in a call to `"
-          + fn.fnName
-          + "`",
-      )
+      return monoArgTyFail(p.parName, fn.fnName)
     }
     if ann == tp && monoFwdFnPinMisfits(fn, params[i], args[i], an2Ty) {
       fsAsk(params[i])
@@ -15729,6 +15742,74 @@ export function monoInstantiatedAny(origFe: i32) {
     k = k + 1
   }
   false
+}
+
+// The value-floor reject text for the generic function at lifted position `fe`: names the
+// function and its un-annotated parameters, and — from `monoPinnedSigsOf` — the concrete
+// signatures the program's own call sites already pin it at, the annotation to write.
+export function genericFnValueRejectMsg(fe: i32) {
+  let nm = "<anonymous>"
+  let holes = ""
+  let nHoles = 0
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    if fn.fnName != "" { nm = fn.fnName }
+    const ps = fn.fnParams
+    let i = 0
+    while i < ps.length {
+      const p = P.nodes[ps[i]]
+      if p is Param {
+        if p.parType < 0 {
+          if holes != "" { holes = holes + ", " }
+          holes = holes + "`" + p.parName + "`"
+          nHoles = nHoles + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+  let head = "emitProgram: cannot take the generic function `"
+    + nm
+    + "` as a value — a function value carries ONE signature, and "
+  if nHoles == 1 {
+    head = head
+      + "parameter "
+      + holes
+      + " is un-annotated (it would default to i32). "
+  } else {
+    head = head
+      + "parameters "
+      + holes
+      + " are un-annotated (they would default to i32). "
+  }
+  const sigs = monoPinnedSigsOf(fe)
+  if sigs == "" {
+    return head
+      + "No call site pins `"
+      + nm
+      + "`, so there is no inferred signature to adopt — annotate the parameter"
+      + pluralS(nHoles)
+      + ", or call `"
+      + nm
+      + "` directly by name"
+  }
+  head
+    + "Call sites pin `"
+    + nm
+    + "` at "
+    + sigs
+    + " — annotate the parameter"
+    + pluralS(nHoles)
+    + " with the signature this value needs, or call `"
+    + nm
+    + "` directly by name"
+}
+
+// `"s"` for a plural count, `""` for exactly one — kept out of the message builder so the
+// two branches cannot disagree about the diagnostic's own agreement.
+function pluralS(n: i32) {
+  if n == 1 { return "" }
+  "s"
 }
 
 // The distinct concrete parameter spellings every instance pinned for the generic
