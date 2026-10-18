@@ -25,6 +25,7 @@ import {
   RetStmt,
   TypeRef,
   declNameTokOf,
+  hasNamedArgs,
   i32ToStr,
   mkBinary,
   mkIdent,
@@ -33,6 +34,7 @@ import {
   mkTypeRef,
   nodeChildren,
   nodeToks,
+  orderArgsByParamNames,
 } from "./ast"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
@@ -801,8 +803,8 @@ function hsIx(par: i32): i32 {
 
 // Whether parameter `par` can take a parameter per type: an un-annotated or bare type-parameter
 // parameter of a named function, exported or not (D6204), every read of which is a call, by its
-// name or through a `const` alias (D6261), passing every argument in parameter order, named
-// or not (D6260).
+// name or through a `const` alias (D6261), passing every parameter one argument, by position or
+// by name in any order (D6260, D6281).
 function fsHoleParamOk(par: i32): boolean {
   if par < 0 || par >= fsParseLen || fsParent[par] < 0 { return false }
   const p = P.nodes[par]
@@ -819,10 +821,10 @@ function fsHoleParamOk(par: i32): boolean {
     if c < 0 { return false }
     const cn = P.nodes[c]
     if !(cn is Call) || cn.callArgs.length != f.fnParams.length { return false }
-    let i = 0
-    while i < cn.callArgs.length {
-      if fsParamOfArg(cn, f, i) != i { return false }
-      i = i + 1
+    const ord = fsArgsInParamOrder(cn, f)
+    if ord.length != f.fnParams.length { return false }
+    for a in ord {
+      if a < 0 { return false }
     }
   }
   true
@@ -886,23 +888,25 @@ function fsCalleeFn(f: i32): i32 {
   -1
 }
 
-// The name argument `i` of call `cn` is passed by, "" for a positional one.
-function fsArgName(cn: Call, i: i32): string {
-  if i < cn.callArgNames.length { return cn.callArgNames[i] }
-  ""
+// The arguments of call `cn` in `f`'s parameter order, -1 for a parameter it does not pass, then
+// any it cannot place.
+function fsArgsInParamOrder(cn: Call, f: FuncDecl): i32[] {
+  if !hasNamedArgs(cn.callArgNames) { return cn.callArgs }
+  const names: string[] = []
+  for q in f.fnParams {
+    const qn = P.nodes[q]
+    if qn is Param { names.push(qn.parName) } else { names.push("") }
+  }
+  orderArgsByParamNames(names, cn.callArgs, cn.callArgNames)
 }
 
 // The index among `f`'s parameters that argument `i` of call `cn` passes, or -1.
 function fsParamOfArg(cn: Call, f: FuncDecl, i: i32): i32 {
-  const nm = fsArgName(cn, i)
-  if nm == "" {
-    if i < f.fnParams.length { return i }
-    return -1
-  }
+  if i < 0 || i >= cn.callArgs.length { return -1 }
+  const ord = fsArgsInParamOrder(cn, f)
   let j = 0
-  while j < f.fnParams.length {
-    const q = P.nodes[f.fnParams[j]]
-    if q is Param && q.parName == nm { return j }
+  while j < ord.length && j < f.fnParams.length {
+    if ord[j] == cn.callArgs[i] { return j }
     j = j + 1
   }
   -1
@@ -910,12 +914,9 @@ function fsParamOfArg(cn: Call, f: FuncDecl, i: i32): i32 {
 
 // The argument of call `cn` that passes `f`'s parameter `j`, or -1.
 function fsArgOfParam(cn: Call, f: FuncDecl, j: i32): i32 {
-  let i = 0
-  while i < cn.callArgs.length {
-    if fsParamOfArg(cn, f, i) == j { return cn.callArgs[i] }
-    i = i + 1
-  }
-  -1
+  const ord = fsArgsInParamOrder(cn, f)
+  if j < 0 || j >= ord.length || j >= f.fnParams.length { return -1 }
+  ord[j]
 }
 
 // The parameter read `r` is handed to as an argument of a call of a declared function, or -1.
@@ -1651,6 +1652,8 @@ function fsApplyArgs(c: i32, a: i32, names: string[], pars: string[]): i32 {
   const at = P.nodes[a].pos
   const args: i32[] = []
   const nms: string[] = []
+  // In a call naming any argument, a positional one inserted could take another's slot.
+  const named = hasNamedArgs(cn.callArgNames)
   let i = 0
   while i < cn.callArgs.length {
     args.push(cn.callArgs[i])
@@ -1658,12 +1661,12 @@ function fsApplyArgs(c: i32, a: i32, names: string[], pars: string[]): i32 {
     if i < cn.callArgNames.length { nm0 = cn.callArgNames[i] }
     nms.push(nm0)
     if cn.callArgs[i] == a {
-      if nm0 != "" && pars.length != names.length { return -1 }
+      if named && pars.length != names.length { return -1 }
       let j = 0
       while j < names.length {
         P.pos = nodeToks[a] + 1
         args.push(mkIdent(names[j], at))
-        if nm0 != "" { nms.push(pars[j]) } else { nms.push("") }
+        if named { nms.push(pars[j]) } else { nms.push("") }
         j = j + 1
       }
     }
