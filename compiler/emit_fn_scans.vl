@@ -43,12 +43,8 @@ import {
 } from "./check_node_tys"
 import { inferRetFnKey } from "./check_side_rows"
 import { EqCmpKind, EqCore, eqCoreKindOfTyToken } from "./check_ty_relate"
-import {
-  isValueUnionName,
-  nameIsLitUnionType,
-  valueAtomKind,
-} from "./check_ty_rep"
-import { T, TyFunc } from "./check_types"
+import { isValueUnionName, valueAtomKind } from "./check_ty_rep"
+import { T, TyFunc, TyUnion, tyIsLitUnion, tyNulInnerTy } from "./check_types"
 import {
   listGetStagesOperand,
   optChainStagesRecv,
@@ -220,6 +216,7 @@ import {
 import {
   isUNameAB,
   msMemberAtomsOfSet,
+  msMemberTysOfSet,
   msSetOfNameTy,
   printNarrowKeepsBox,
   printNarrowKey,
@@ -2808,6 +2805,29 @@ export function printUnionRecvIsBox(exprIx: i32, fnIx: i32): boolean {
   printNarrowKeepsBox(key)
 }
 
+// Appends the member leaves of union type `ty` in its spelled order: a literal union is one
+// leaf, a nested union is walked, and a nullable is its inner's leaves then a `null` slot (-1).
+function printPlanLeafTys(ty: i32, out: i32[]) {
+  if ty < 0 || ty >= T.tys.length { return 0 }
+  const t = T.tys[ty]
+  if tyIsLitUnion(ty) {
+    out.push(ty)
+    return 0
+  }
+  if t is TyUnion {
+    for m in t.uMembers { printPlanLeafTys(m, out) }
+    return 0
+  }
+  const inner = tyNulInnerTy(ty)
+  if inner >= 0 {
+    printPlanLeafTys(inner, out)
+    out.push(-1)
+    return 0
+  }
+  out.push(ty)
+  0
+}
+
 function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   // A read narrowed to `null` is printed from its box's tag, so the reservation scan and the
   // handler both plan the whole box with the narrowing lifted (D2801).
@@ -2830,6 +2850,16 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
   const atoms: string[] = []
   if !msMemberAtomsOfSet(sid, atoms) { unionMemberAtomsOf(nm, atoms) }
   if atoms.length < 2 { return 0 }
+  // The member types, index-parallel to `atoms`: the set's own, else the declared type's
+  // leaves. Left empty when neither lines up, so no member reads as a literal union.
+  const mtys: i32[] = []
+  if !msMemberTysOfSet(sid, mtys) || mtys.length != atoms.length {
+    while mtys.length > 0 { mtys.pop() }
+    printPlanLeafTys(dty, mtys)
+    if mtys.length != atoms.length {
+      while mtys.length > 0 { mtys.pop() }
+    }
+  }
   const kinds: i32[] = []
   // The BANKED codes when the row has them (`unMemValKind` is index-parallel to the atom
   // column and is literally `valueAtomKind` per member), else the per-atom derivation.
@@ -2867,7 +2897,7 @@ function printUnionPlanCode(exprIx: i32, fnIx: i32, out: i32[]): i32 {
     }
     // A literal-union arm (`K0 | i64`) is not a value atom but boxes as one under the string
     // tag (`emitUnionCoerce`'s `unionTakesAtomAsStr`), so it prints as the string arm here.
-    if k < 0 && nameIsLitUnionType(atoms[i]) { k = 2 }
+    if k < 0 && i < mtys.length && tyIsLitUnion(mtys[i]) { k = 2 }
     if k < 0 && printPlanNullPinned {
       pinSkipped = pinSkipped + 1
       i = i + 1

@@ -2614,109 +2614,11 @@ export function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
   // field's initializer unevaluated. The container-element wording instead names what
   // changed: how the element is stored — not a capability gap, since a struct field is WasmGC-invariant (D938).
   if shapeAdaptWidthField {
-    tErr(
-      "an object of type "
-        + tyToStr(sT)
-        + " cannot flow into "
-        + tyToStr(dT)
-        + through
-        + ": they agree on field names but differ INSIDE a field, and a struct field is "
-        + "mutable — writing through the narrower view would leave the original holding a "
-        + "value of the wrong type, so the two are unrelated by design and not by a missing "
-        + "lowering. Give the source exactly "
-        + tyToStr(dT)
-        + "'s field types, or read the field out and rebuild",
-      srcExpr,
-    )
+    objShapeWidthFieldErr(srcExpr, sT, dT, through)
     return 0
   }
-  // A design rule, not a missing lowering (DECISIONS.md §"No implicit container widening").
-  // A mutable list pair `readonly` would accept names both fixes; a readonly copy pair is
-  // refused only because the source is written, so that message names the write.
   if shapeAdaptElemPair {
-    let rule = ": a container never widens implicitly. Its elements would have to be stored "
-      + "differently, which takes a copy, and a write through the copy would no longer reach "
-      + "the original."
-    let hint = containerWidenCopyHint(sT, dT)
-    // The whole delivered value built at the type it flows into, as its own declaration
-    // spells it — every fix names a type the author can write at the source.
-    const buildFix = " Build the source as `"
-      + tyToStr(sourceBuildTy(dst))
-      + "`"
-    // An inner list spelled in the source (a literal's element or field) can still be copied
-    // with `.map`; one reached only through a type is built at the outer type instead.
-    const innerNamed = !(through != "" && sX < 0)
-    if !innerNamed { hint = "" }
-    const pairNote = tyToStr(sT) + " is not " + tyToStr(dT) + through
-    let copyFix = buildFix
-    if hint != "" { copyFix = " Copy it" + hint.slice(12, hint.length) }
-    if shapeAdaptNulCopy || shapeAdaptNestedCopy {
-      tErr(pairNote + containerCopyGapWhy(shapeAdaptNulCopy) + copyFix, srcExpr)
-      return 0
-    }
-    if shapeAdaptMapShared {
-      tErr(
-        pairNote
-          + ": a map never widens a list it holds, and it has no read-only view, so every handle "
-          + "would share entries of two types."
-          + buildFix,
-        srcExpr,
-      )
-      return 0
-    }
-    if shapeAdaptRecField {
-      tErr(
-        pairNote
-          + ": a record is shared, not rebuilt, so its list field would have to change type in "
-          + "place, which no delivery does, readonly or not (D2100)."
-          + buildFix,
-        srcExpr,
-      )
-      return 0
-    }
-    if containerWidenReadonlyServes(sT, dT) {
-      // The `readonly` fix is offered only when this checker accepts it for this delivery.
-      const ro = readonlyFixOf(srcExpr, src, dst, sT, dT)
-      let fix = ""
-      if ro >= 0 {
-        fix = " Declare the destination `"
-          + tyToStr(ro)
-          + "` for a read-only view"
-        if hint != "" { fix = fix + hint }
-      } else {
-        fix = copyFix
-      }
-      tErr(
-        pairNote
-          + ": a container never widens implicitly, and only a readonly list is covariant. "
-          + containerWidenWhy(sT, dT)
-          + fix,
-        srcExpr,
-      )
-      return 0
-    }
-    if through == "" && containerWidenServed(sT, dT) {
-      const wAt = covarValueWriteAt(covarRootName(sX), covarRootFrame(sX))
-      let written = "nothing shows this list is never written, and a container that may be "
-        + "written"
-      if wAt >= 0 {
-        written = "this list is written (line "
-          + i32ToStr(nodeLineOf(wAt))
-          + "), and a written container"
-      }
-      rule = " here: "
-        + written
-        + " never widens implicitly. Its elements would have to be stored differently, which "
-        + "takes a copy, and a write would not reach both."
-    }
-    // A pair reached through a literal spelled in the source is fixed at that inner value.
-    let fixes = buildFix
-    if through != "" && hint != "" { fixes = copyFix }
-    else if hint != "" { fixes = fixes + hint }
-    tErr(
-      tyToStr(sT) + " is not " + tyToStr(dT) + through + rule + fixes,
-      srcExpr,
-    )
+    objShapeElemPairErr(srcExpr, src, dst, sT, dT, sX, through)
     return 0
   }
   if litShapeDropSrcExpr(sX) {
@@ -2741,6 +2643,138 @@ export function objShapeAdapterlessErr(srcExpr: i32, src: i32, dstIn: i32) {
       srcExpr,
     )
   }
+}
+
+// The width-field refusal: `sT` and `dT` agree on field names but differ inside a field,
+// which a mutable struct field cannot reconcile. `through` names the carrying pair, or is "".
+function objShapeWidthFieldErr(
+  srcExpr: i32,
+  sT: i32,
+  dT: i32,
+  through: string,
+) {
+  tErr(
+    "an object of type "
+      + tyToStr(sT)
+      + " cannot flow into "
+      + tyToStr(dT)
+      + through
+      + ": they agree on field names but differ INSIDE a field, and a struct field is "
+      + "mutable — writing through the narrower view would leave the original holding a "
+      + "value of the wrong type, so the two are unrelated by design and not by a missing "
+      + "lowering. Give the source exactly "
+      + tyToStr(dT)
+      + "'s field types, or read the field out and rebuild",
+    srcExpr,
+  )
+  0
+}
+
+// The container-element refusal for `sT` into `dT`, delivered as `src` into `dst`.
+// A design rule, not a missing lowering (DECISIONS.md §"No implicit container widening").
+// A mutable list pair `readonly` would accept names both fixes; a readonly copy pair is
+// refused only because the source is written, so that message names the write.
+function objShapeElemPairErr(
+  srcExpr: i32,
+  src: i32,
+  dst: i32,
+  sT: i32,
+  dT: i32,
+  sX: i32,
+  through: string,
+) {
+  let rule = ": a container never widens implicitly. Its elements would have to be stored "
+    + "differently, which takes a copy, and a write through the copy would no longer reach "
+    + "the original."
+  let hint = containerWidenCopyHint(sT, dT)
+  // The whole delivered value built at the type it flows into, as its own declaration
+  // spells it — every fix names a type the author can write at the source.
+  const buildFix = " Build the source as `" + tyToStr(sourceBuildTy(dst)) + "`"
+  // An inner list spelled in the source (a literal's element or field) can still be copied
+  // with `.map`; one reached only through a type is built at the outer type instead.
+  const innerNamed = !(through != "" && sX < 0)
+  if !innerNamed { hint = "" }
+  const pairNote = tyToStr(sT) + " is not " + tyToStr(dT) + through
+  let copyFix = buildFix
+  if hint != "" { copyFix = " Copy it" + hint.slice(12, hint.length) }
+  if shapeAdaptNulCopy || shapeAdaptNestedCopy {
+    tErr(pairNote + containerCopyGapWhy(shapeAdaptNulCopy) + copyFix, srcExpr)
+    return 0
+  }
+  if shapeAdaptMapShared {
+    tErr(
+      pairNote
+        + ": a map never widens a list it holds, and it has no read-only view, so every handle "
+        + "would share entries of two types."
+        + buildFix,
+      srcExpr,
+    )
+    return 0
+  }
+  if shapeAdaptRecField {
+    tErr(
+      pairNote
+        + ": a record is shared, not rebuilt, so its list field would have to change type in "
+        + "place, which no delivery does, readonly or not (D2100)."
+        + buildFix,
+      srcExpr,
+    )
+    return 0
+  }
+  if containerWidenReadonlyServes(sT, dT) {
+    objShapeReadonlyFixErr(srcExpr, src, dst, sT, dT, pairNote, hint, copyFix)
+    return 0
+  }
+  if through == "" && containerWidenServed(sT, dT) {
+    const wAt = covarValueWriteAt(covarRootName(sX), covarRootFrame(sX))
+    let written = "nothing shows this list is never written, and a container that may be "
+      + "written"
+    if wAt >= 0 {
+      written = "this list is written (line "
+        + i32ToStr(nodeLineOf(wAt))
+        + "), and a written container"
+    }
+    rule = " here: "
+      + written
+      + " never widens implicitly. Its elements would have to be stored differently, which "
+      + "takes a copy, and a write would not reach both."
+  }
+  // A pair reached through a literal spelled in the source is fixed at that inner value.
+  let fixes = buildFix
+  if through != "" && hint != "" { fixes = copyFix }
+  else if hint != "" { fixes = fixes + hint }
+  tErr(tyToStr(sT) + " is not " + tyToStr(dT) + through + rule + fixes, srcExpr)
+  0
+}
+
+// The container-element refusal where a `readonly` destination is covariant: offers that
+// destination when this checker accepts it for this delivery, else `copyFix`.
+function objShapeReadonlyFixErr(
+  srcExpr: i32,
+  src: i32,
+  dst: i32,
+  sT: i32,
+  dT: i32,
+  pairNote: string,
+  hint: string,
+  copyFix: string,
+) {
+  const ro = readonlyFixOf(srcExpr, src, dst, sT, dT)
+  let fix = ""
+  if ro >= 0 {
+    fix = " Declare the destination `" + tyToStr(ro) + "` for a read-only view"
+    if hint != "" { fix = fix + hint }
+  } else {
+    fix = copyFix
+  }
+  tErr(
+    pairNote
+      + ": a container never widens implicitly, and only a readonly list is covariant. "
+      + containerWidenWhy(sT, dT)
+      + fix,
+    srcExpr,
+  )
+  0
 }
 
 // The record storage rule's refusal: names the pair, the field stored differently, and both
