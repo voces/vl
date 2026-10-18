@@ -1063,7 +1063,8 @@ import {
   msKeepTy,
   msMemberAtomsOfSet,
   msRemoveAtomId,
-  msSetOfKey,
+  msSetOfNameTy,
+  msSetOfTy,
   msSetOfUnion,
   msSoleMemberTy,
   msSubAtomOrView,
@@ -1073,14 +1074,16 @@ import {
   narrowSlotTy,
   removeAtomFromSet,
   removeAtomFromSetOf,
+  removeAtomIdOf,
+  removeAtomRestOf,
   unMemIsRefElemArray,
   unRowOfCanon,
   unionArmsOf,
   unionHasAtomAB,
   unionMemberSetOf,
   unionMemberTysOfAB,
-  unionNameHasNull,
-  unionNameNonNullCount,
+  unionNameHasNullTy,
+  unionNameNonNullCountTy,
   unionRowOf,
   unionSetAtomsOf,
   unionSetHasNull,
@@ -4685,6 +4688,34 @@ function pushNarrow(name: string, variant: string) {
   pushNarrowRep(name, variant, -1, -1)
 }
 
+// Push `name` narrowed to `set` less `removed`, where `sid` is `set`'s id or -1 to resolve it by
+// key; the survivors' id rides along when one resolves. Returns the survivors' rendering, pushed
+// unless it is "" or, when `changed` is true, `set` itself.
+function pushNarrowLess(
+  name: string,
+  sid: i32,
+  set: string,
+  removed: string,
+  changed: boolean,
+): string {
+  const rid = removeAtomIdOf(sid, set, removed)
+  const rest = removeAtomRestOf(rid, set, removed)
+  if rest == "" { return "" }
+  if changed && rest == set { return "" }
+  pushNarrowRest(name, rid, rest)
+  rest
+}
+
+// Push `name` narrowed to the survivors `rest` of a subtraction, banking their id `rid` when it is
+// not -1.
+function pushNarrowRest(name: string, rid: i32, rest: string) {
+  if rid >= 0 {
+    pushNarrowRep(name, rest, -1, rid)
+  } else {
+    pushNarrow(name, rest)
+  }
+}
+
 // Whether `ty` is a union of two or more records and nothing else.
 function tyIsRecordUnion(ty: i32): boolean {
   const arms: i32[] = []
@@ -4723,7 +4754,24 @@ function pushNarrowIs(name: string, variant: string, condIx: i32) {
     if txt == "" { return narrowTop }
     return pushNarrowRep(name, txt, -1, r)
   }
-  pushNarrowRep(name, sp, ity, -1)
+  pushNarrowRep(name, sp, ity, isSurvivorSetOf(name, sp, ity, recv))
+}
+
+// The id of the set an `is` test leaves `name` (receiver node `recv`) holding, rendered `sp` at
+// arena type `ity`: the row keyed by `ity`, else the receiver's set kept to `ity` when
+// `recv` is a node. -1 when neither renders as `sp`.
+function isSurvivorSetOf(name: string, sp: string, ity: i32, recv: i32): i32 {
+  if ity < 0 || sp == "" { return -1 }
+  let r = msSetOfTy(ity)
+  if r < 0 && recv >= 0 {
+    const rv = P.nodes[unwrapParen(recv)]
+    if rv is Ident || narrowSlotOf(name) >= 0 {
+      const cs = currentNarrowSetIdAt(name, emitCurFnIx, unwrapParen(recv))
+      r = msKeepTy(cs, ity)
+    }
+  }
+  if r >= 0 && msTextOf(r) == sp { return r }
+  -1
 }
 
 // True when `name` read in lifted frame `fnIx` is one of its captures, so the read is an env
@@ -7383,10 +7431,7 @@ function pushIndexStructComplement(
   ) {
     return true
   }
-  const rest = removeAtomFromSet(cur, sVar)
-  if rest == "" || rest == cur { return false }
-  pushNarrow(ik, rest)
-  true
+  pushNarrowLess(ik, -1, cur, sVar, true) != ""
 }
 
 // Push the narrowing for an index place whose cell is a niche — a nullable reference the
@@ -7521,10 +7566,7 @@ function pushIndexMapComplement(
     if pushNarrowComplement(ik, narrowSets[slot], variant, -1) != "" {
       return true
     }
-    const rest = removeAtomFromSetOf(narrowSets[slot], cur, variant)
-    if rest == "" || rest == cur { return false }
-    pushNarrow(ik, rest)
-    return true
+    return pushNarrowLess(ik, narrowSets[slot], cur, variant, true) != ""
   }
   const e = P.nodes[unwrapParen(idxIx)]
   if e is Index {
@@ -7535,10 +7577,15 @@ function pushIndexMapComplement(
     let rest = removeAtomFromSetOf(vs, vset, variant)
     if rest == "" || rest == vset { return false }
     const rs = msRemoveAtomId(vs, variant)
+    let rid = rs
+    // The read's own type carries the missing key's `null`, so its row's set less `variant` is
+    // the id of the survivors spelled with `|null` added.
     if rest != "null" && removeAtomFromSetOf(rs, rest, "null") == rest {
       rest = rest + "|null"
+      rid = msRemoveAtomId(msSetOfTy(nodeTyIxOf(unwrapParen(idxIx))), variant)
+      if rid >= 0 && msTextOf(rid) != rest { rid = -1 }
     }
-    pushNarrow(ik, rest)
+    pushNarrowRest(ik, rid, rest)
     return true
   }
   false
@@ -7558,9 +7605,7 @@ function pushIndexMapNullNarrow(idxIx: i32, fnIx: i32) {
   if vslot >= 0 && mvValKind[mrs] == MVK_UNION {
     const vcur = narrowVariants[vslot]
     if vcur != "" && vcur != "null" {
-      const vrest = removeAtomFromSetOf(narrowSets[vslot], vcur, "null")
-      if vrest != "" && vrest != vcur {
-        pushNarrow(ik, vrest)
+      if pushNarrowLess(ik, narrowSets[vslot], vcur, "null", true) != "" {
         return true
       }
     }
@@ -7740,9 +7785,7 @@ function narrowIsElse(
         ) {
           return true
         }
-        const eirst = removeAtomFromSetOf(eisid, eicur, variant)
-        if eirst != "" {
-          pushNarrow(eik, eirst)
+        if pushNarrowLess(eik, eisid, eicur, variant, false) != "" {
           return true
         }
       }
@@ -7778,11 +7821,7 @@ function narrowIsElse(
         if pushNarrowComplement(mk, msid, variant, isVarTyIxOf(condIx)) != "" {
           return true
         }
-        const mrest = removeAtomFromSetOf(msid, mcur, variant)
-        if mrest != "" {
-          pushNarrow(mk, mrest)
-          return true
-        }
+        if pushNarrowLess(mk, msid, mcur, variant, false) != "" { return true }
       }
     }
   }
@@ -7804,17 +7843,12 @@ function narrowIsElse(
           if pushNarrowComplement(recv.identName, esid, variant, -1) != "" {
             return true
           }
-          const rest = removeAtomFromSetOf(
-            esid,
-            currentNarrowSetAt(
-              recv.identName,
-              fnIx,
-              unwrapParen(isObj),
-            ),
-            variant,
+          const ecur = currentNarrowSetAt(
+            recv.identName,
+            fnIx,
+            unwrapParen(isObj),
           )
-          if rest != "" {
-            pushNarrow(recv.identName, rest)
+          if pushNarrowLess(recv.identName, esid, ecur, variant, false) != "" {
             return true
           }
         }
@@ -7867,17 +7901,12 @@ function narrowIsElse(
       ) {
         return true
       }
-      const srest = removeAtomFromSetOf(
-        ssid,
-        currentStructNarrowSetAt(
-          srecv.identName,
-          fnIx,
-          unwrapParen(isObj),
-        ),
-        sVar,
+      const scur = currentStructNarrowSetAt(
+        srecv.identName,
+        fnIx,
+        unwrapParen(isObj),
       )
-      if srest != "" {
-        pushNarrow(srecv.identName, srest)
+      if pushNarrowLess(srecv.identName, ssid, scur, sVar, false) != "" {
         return true
       }
     }
@@ -7958,13 +7987,16 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
       const nsid = currentNarrowSetIdAt(nm, fnIx, condIx)
       const npushed = pushNarrowComplement(nm, nsid, "null", -1) != ""
       let rest = ""
+      let rid = -1
       if !npushed {
-        rest = removeAtomFromSet(currentNarrowSetAt(nm, fnIx, condIx), "null")
+        const ncur = currentNarrowSetAt(nm, fnIx, condIx)
+        rid = removeAtomIdOf(-1, ncur, "null")
+        rest = removeAtomRestOf(rid, ncur, "null")
       }
       unmaskNarrow(nlift)
       if npushed { return true }
       if rest != "" {
-        pushNarrow(nm, rest)
+        pushNarrowRest(nm, rid, rest)
         return true
       }
     }
@@ -7985,9 +8017,10 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
               pushNarrow(mk, "null")
               return true
             }
-            const mrest = removeAtomFromSet(unionMemberSetOf(mfn), "null")
-            if mrest != "" {
-              pushNarrow(mk, mrest)
+            if (
+              pushNarrowLess(mk, -1, unionMemberSetOf(mfn), "null", false)
+              != ""
+            ) {
               return true
             }
           }
@@ -8010,13 +8043,9 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
               pushNarrow(ik, "null")
               return true
             }
-            const irest = removeAtomFromSetOf(
-              indexCellCurSetId(ik, ifn),
-              indexCellCurSet(ik, ifn),
-              "null",
-            )
-            if irest != "" {
-              pushNarrow(ik, irest)
+            const isid = indexCellCurSetId(ik, ifn)
+            const icur = indexCellCurSet(ik, ifn)
+            if pushNarrowLess(ik, isid, icur, "null", false) != "" {
               return true
             }
           }
@@ -8051,16 +8080,16 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
       const ssid = currentStructNarrowSetIdAt(snm, fnIx, condIx)
       const spushed = pushNarrowComplement(snm, ssid, "null", -1) != ""
       let srest = ""
+      let srid = -1
       if !spushed {
-        srest = removeAtomFromSet(
-          currentStructNarrowSetAt(snm, fnIx, condIx),
-          "null",
-        )
+        const scur = currentStructNarrowSetAt(snm, fnIx, condIx)
+        srid = removeAtomIdOf(-1, scur, "null")
+        srest = removeAtomRestOf(srid, scur, "null")
       }
       unmaskNarrow(slift)
       if spushed { return true }
       if srest != "" {
-        pushNarrow(snm, srest)
+        pushNarrowRest(snm, srid, srest)
         return true
       }
     }
@@ -8083,7 +8112,11 @@ function structUnionNullCmpName(condIx: i32, fnIx: i32) {
           const un = unionNameOfIdentAt(sidOfNode(refIx), fnIx, refIx)
           if un != "" {
             if !isValueUnionName(un) {
-              if unionNameHasNull(un) && unionNameNonNullCount(un) >= 2 {
+              const uty = unionDeclTyIxOfExpr(refIx, fnIx)
+              if (
+                unionNameHasNullTy(un, uty)
+                && unionNameNonNullCountTy(un, uty) >= 2
+              ) {
                 return r.identName
               }
             }
@@ -8288,13 +8321,16 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
       const nsid = currentNarrowSetIdAt(nm, fnIx, condIx)
       const npushed = pushNarrowComplement(nm, nsid, "null", -1) != ""
       let rest = ""
+      let rid = -1
       if !npushed {
-        rest = removeAtomFromSet(currentNarrowSetAt(nm, fnIx, condIx), "null")
+        const ncur = currentNarrowSetAt(nm, fnIx, condIx)
+        rid = removeAtomIdOf(-1, ncur, "null")
+        rest = removeAtomRestOf(rid, ncur, "null")
       }
       unmaskNarrow(nlift)
       if npushed { return true }
       if rest != "" {
-        pushNarrow(nm, rest)
+        pushNarrowRest(nm, rid, rest)
         return true
       }
     }
@@ -8315,9 +8351,10 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
               pushNarrow(emk, "null")
               return true
             }
-            const emrest = removeAtomFromSet(unionMemberSetOf(emfn), "null")
-            if emrest != "" {
-              pushNarrow(emk, emrest)
+            if (
+              pushNarrowLess(emk, -1, unionMemberSetOf(emfn), "null", false)
+              != ""
+            ) {
               return true
             }
           }
@@ -8339,13 +8376,9 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
               pushNarrow(eik, "null")
               return true
             }
-            const eirest = removeAtomFromSetOf(
-              indexCellCurSetId(eik, eifn),
-              indexCellCurSet(eik, eifn),
-              "null",
-            )
-            if eirest != "" {
-              pushNarrow(eik, eirest)
+            const eisid = indexCellCurSetId(eik, eifn)
+            const eicur = indexCellCurSet(eik, eifn)
+            if pushNarrowLess(eik, eisid, eicur, "null", false) != "" {
               return true
             }
           }
@@ -8377,16 +8410,16 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
       const ssid = currentStructNarrowSetIdAt(snm, fnIx, condIx)
       const spushed = pushNarrowComplement(snm, ssid, "null", -1) != ""
       let srest = ""
+      let srid = -1
       if !spushed {
-        srest = removeAtomFromSet(
-          currentStructNarrowSetAt(snm, fnIx, condIx),
-          "null",
-        )
+        const scur = currentStructNarrowSetAt(snm, fnIx, condIx)
+        srid = removeAtomIdOf(-1, scur, "null")
+        srest = removeAtomRestOf(srid, scur, "null")
       }
       unmaskNarrow(slift)
       if spushed { return true }
       if srest != "" {
-        pushNarrow(snm, srest)
+        pushNarrowRest(snm, srid, srest)
         return true
       }
     }
@@ -8552,9 +8585,9 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
           && unionSetHasNull(un)
           && !asgKeepsNarrowOf(stmtIx)
         ) {
-          const asid = msSetOfKey(un)
+          const asid = msSetOfUnion(un)
           if pushNarrowComplement(tgt.identName, asid, "null", -1) == "" {
-            pushNarrow(tgt.identName, removeAtomFromSet(un, "null"))
+            pushNarrowLess(tgt.identName, asid, un, "null", false)
           }
         }
       }
@@ -8674,9 +8707,9 @@ function tvWriteNarrow(tgtIx: i32, rhsIx: i32, dcl: i32, fnIx: i32) {
     && unionSetHasNull(un)
     && land == nonNullTy(dcl)
   ) {
-    const asid = msSetOfKey(un)
+    const asid = msSetOfUnion(un)
     if pushNarrowComplement(key, asid, "null", -1) == "" {
-      pushNarrow(key, removeAtomFromSet(un, "null"))
+      pushNarrowLess(key, asid, un, "null", false)
     }
     return 0
   }
@@ -14519,7 +14552,9 @@ function pushNarrowWrittenTy(name: string, ty: i32) {
   let sp = ""
   if pn != null { sp = pn } else { sp = isVariantSpellingOfShape("", ty) }
   if sp == "" { return 0 }
-  pushNarrowRep(name, sp, ty, -1)
+  let s = msSetOfTy(ty)
+  if s >= 0 && msTextOf(s) != sp { s = -1 }
+  pushNarrowRep(name, sp, ty, s)
   0
 }
 
@@ -14530,7 +14565,8 @@ function pushNarrowWrittenTy(name: string, ty: i32) {
 export function currentNarrowSetIdAt(name: string, fnIx: i32, atIx: i32): i32 {
   const i = narrowSlotOf(name)
   if i >= 0 { return narrowSets[i] }
-  msSetOfKey(unionNameOfIdentAt(sidOf(name), fnIx, atIx))
+  const un = unionNameOfIdentAt(sidOf(name), fnIx, atIx)
+  msSetOfNameTy(un, unionDeclTyIxOfExpr(atIx, fnIx))
 }
 
 // The struct-union dual of `currentNarrowSetIdAt` (`currentStructNarrowSetAt`'s set): an
@@ -14539,7 +14575,8 @@ export function currentNarrowSetIdAt(name: string, fnIx: i32, atIx: i32): i32 {
 function currentStructNarrowSetIdAt(name: string, fnIx: i32, atIx: i32): i32 {
   const i = narrowSlotOf(name)
   if i >= 0 { return narrowSets[i] }
-  msSetOfUnion(unionNameOfIdentAt(sidOf(name), fnIx, atIx))
+  const un = unionNameOfIdentAt(sidOf(name), fnIx, atIx)
+  msSetOfNameTy(un, unionDeclTyIxOfExpr(atIx, fnIx))
 }
 
 // The CURRENT narrowed variant set of a STRUCT-union binding `name`: its innermost active

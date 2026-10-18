@@ -13628,7 +13628,7 @@ function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
 // The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
 // checker's binding, else the generic instanced at the one flow pin of its read past the call
 // (D5612). Delivered as a concrete function argument, so the callee can forward it on. "" when
-// none closes; `tyOut[0]` takes the pin's type.
+// none closes; `tyOut[0]` takes the pin's type. Two pins ask for a parameter per pin (D5611).
 function monoHoleGenFnPin(
   callIx: i32,
   pIx: i32,
@@ -13636,17 +13636,47 @@ function monoHoleGenFnPin(
   ctx: i32,
   tyOut: i32[],
 ): string {
-  let bt = monoHoleGenFnTy(callIx, pIx, argIx)
-  let flowDecl = -1
-  if bt < 0 {
-    const fl = monoHoleGenFnFlowDecl(argIx, ctx)
-    bt = monoHoleGenFnFlowTy(argIx, fl)
-    if bt >= 0 { flowDecl = fl[1] }
+  const bt = monoHoleGenFnTy(callIx, pIx, argIx)
+  if bt >= 0 { return monoFnPinAt(argIx, ctx, bt, -1, tyOut) }
+  const fl = monoHoleGenFnFlowDecl(argIx, ctx)
+  const ft = monoHoleGenFnFlowTy(argIx, fl)
+  if ft < 0 && fl[1] >= 0 {
+    const noPath: string[] = []
+    if monoDeclPathPins(fl, noPath).length > 1 { fsAsk(pIx) }
   }
+  monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
+}
+
+// `monoHoleGenFnPin` for any other open function value: a binding holding an un-annotated
+// lambda or a value typed at a hole function's signature, or a call returning one, at the one
+// closed pin the flow table gives it past the call (D6002). "" when none closes.
+function monoOpenFnFlowPin(argIx: i32, ctx: i32, tyOut: i32[]): string {
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
+  const vt = nodeTyIxOf(ax)
+  if vt < 0 || vt >= T.tys.length || !(T.tys[vt] is TyFunc) || !tyHasTyVar(vt) {
+    return ""
+  }
+  let fl = monoReadLetFrame(ax, ctx)
+  if fl[1] < 0 {
+    if !(P.nodes[ax] is Call) { return "" }
+    fl = [ctx, ax]
+  }
+  monoFnPinAt(argIx, ctx, monoHoleGenFnFlowTy(argIx, fl), fl[1], tyOut)
+}
+
+// `argIx` delivered at the concrete function type `bt`, and its pin name; each call taking the
+// flow pin of `flowDecl` (-1 for none) whose callee the checker left open is typed at it.
+function monoFnPinAt(
+  argIx: i32,
+  ctx: i32,
+  bt: i32,
+  flowDecl: i32,
+  tyOut: i32[],
+): string {
   const nm = monoConcreteFnTyName(bt)
   if nm == "" { return "" }
   if monoCoerceFnValueName(argIx, nm, ctx, bt) < 0 { return "" }
-  // A call taking the flow pin whose callee the checker left open is typed at it.
   if flowDecl >= 0 {
     const noPath: string[] = []
     monoRetypePinCalls(flowDecl, noPath)
@@ -13844,15 +13874,28 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               an = monoHoleLitCopyPin(callIx, oDecl, args, i, ctx, cpTy)
               anTy = cpTy[0]
             }
+            if an == "" {
+              const llTy: i32[] = [0 - 1]
+              an = monoHoleLeafLitPin(oDecl, args, i, ctx, llTy)
+              anTy = llTy[0]
+            }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
               const lamTy: i32[] = [0 - 1]
-              an = monoHoleLamArgPin(oDecl, args, i, ctx, lamTy)
+              an = monoHoleLamArgPin(callIx, oDecl, args, i, ctx, lamTy)
               if an != "" { anTy = lamTy[0] }
             }
             if an == "" {
+              const pinTy: i32[] = [0 - 1]
+              an = monoOpenFnFlowPin(args[i], ctx, pinTy)
+              anTy = pinTy[0]
+            }
+            if an == "" {
               // A name handed through an identity call into a binding can take a slot per type.
-              if P.nodes[args[i]] is Ident { fsAsk(args[i]) }
+              if P.nodes[args[i]] is Ident {
+                fsAsk(args[i])
+                fsAsk(params[i])
+              }
               return emitFail(
                 "emitProgram: monomorphize: unsupported argument type for `"
                   + p.parName
@@ -13877,6 +13920,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               tvV,
               pinned,
               pinTys,
+              oDecl,
             )
             if pr < 0 { return pr }
           }
@@ -13930,7 +13974,8 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
 
 // `monoInstantiateCall`'s pin for the annotated parameter `p`, the `i`th of `fn`'s, given
 // argument `args[i]`: binds the type parameters the annotation rides into `tvN`/`tvV` and pushes
-// the parameter's pin onto `pinned` and its arena type onto `pinTys`. Returns 0, or the failure.
+// the parameter's pin onto `pinned` and its arena type onto `pinTys`, `decl` the declaration whose
+// body is read for a literal argument's demand. Returns 0, or the failure.
 function monoPinAnnotatedParam(
   p: Param,
   fn: FuncDecl,
@@ -13943,6 +13988,7 @@ function monoPinAnnotatedParam(
   tvV: string[],
   pinned: string[],
   pinTys: i32[],
+  decl: i32,
 ) {
   // The declared spelling where the annotation is a type parameter, the
   // arena's canon'd one everywhere else. Without it a parameter whose name
@@ -14056,10 +14102,20 @@ function monoPinAnnotatedParam(
       const pinTy: i32[] = [0 - 1]
       an2 = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
       an2Ty = pinTy[0]
+      if an2 == "" {
+        an2 = monoHoleLeafLitPin(decl, args, i, ctx, pinTy)
+        an2Ty = pinTy[0]
+      }
     }
     if an2 == "" { an2 = monoArgPinName(args[i], ctx) }
+    if an2 == "" && ann == tp {
+      const pinTy: i32[] = [0 - 1]
+      an2 = monoOpenFnFlowPin(args[i], ctx, pinTy)
+      an2Ty = pinTy[0]
+    }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
     if an2 == "" {
+      if ann == tp && P.nodes[args[i]] is Ident { fsAsk(params[i]) }
       return emitFail(
         "emitProgram: monomorphize: unsupported argument type for `"
           + p.parName
@@ -15050,7 +15106,7 @@ function monoWalk(ix: i32, ctx: i32) {
       }
     }
     monoInstanceExactRet = false
-    if monoNoteBindDelivery(n.letInit, n.letType, ctx) < 0 { return -1 }
+    if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
     return monoWalk(n.letInit, ctx)
   }
   if n is IfStmt {
@@ -15202,7 +15258,7 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
     if pty >= 0 {
       if !monoFnParamAnnRidesTyParam(dfe, ca) {
         if monoCoerceFnValue(pargs[ca], pty, ctx) < 0 { return -1 }
-        if monoNoteBindDelivery(pargs[ca], pty, ctx) < 0 { return -1 }
+        if monoNoteBindDelivery(pargs[ca], pty, ctx, ix) < 0 { return -1 }
       }
     }
     ca = ca + 1
@@ -15363,7 +15419,7 @@ function monoNoteRetDeliveries(fn: FuncDecl, fnIx: i32) {
   if b is Block {
     if b.blkStmts.length > 0 {
       const tail = b.blkStmts[b.blkStmts.length - 1]
-      if monoNoteBindDelivery(tail, fn.fnRet, fnIx) < 0 { return -1 }
+      if monoNoteBindDelivery(tail, fn.fnRet, fnIx, -1) < 0 { return -1 }
     }
   }
   const stack: i32[] = [fn.fnBody]
@@ -15372,7 +15428,7 @@ function monoNoteRetDeliveries(fn: FuncDecl, fnIx: i32) {
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
       if n is RetStmt {
-        if monoNoteBindDelivery(n.retArg, fn.fnRet, fnIx) < 0 { return -1 }
+        if monoNoteBindDelivery(n.retArg, fn.fnRet, fnIx, -1) < 0 { return -1 }
       }
       // A nested function's `return` is its own.
       if !(n is FuncDecl) {
@@ -15595,18 +15651,24 @@ function monoNoteBindCall(at: i32, ctx: i32, ix: i32) {
 
 // A binding read at `at` in frame `ctx` and delivered where annotation `tyNode` is a function
 // type with concrete parameters is called at that signature by whoever receives it (D3862).
-function monoNoteBindDelivery(at: i32, tyNode: i32, ctx: i32) {
+// `callIx` is the call it is an argument of, or -1 for any other position.
+function monoNoteBindDelivery(at: i32, tyNode: i32, ctx: i32, callIx: i32) {
   if tyNode < 0 { return 0 }
-  monoNoteBindDeliveryAt(at, tyNameOf(tyNode), ctx)
+  monoNoteBindDeliveryCall(at, tyNameOf(tyNode), ctx, callIx)
 }
 
 // `monoNoteBindDelivery` at the function type spelled `ann`: a list's element type, for a
 // `push` or an element store, has a type and no annotation node (D3867).
 function monoNoteBindDeliveryAt(at: i32, ann: string, ctx: i32) {
+  monoNoteBindDeliveryCall(at, ann, ctx, -1)
+}
+
+// `monoNoteBindDeliveryAt` where the delivery is an argument of call `callIx`, or -1.
+function monoNoteBindDeliveryCall(at: i32, ann: string, ctx: i32, callIx: i32) {
   if at < 0 { return 0 }
   let name = monoIdentNameOf(at)
   if name == "" { name = monoCellReadName(at) }
-  if name == "" { return monoDeliverLamLit(at, ann, ctx) }
+  if name == "" { return monoDeliverLamLit(at, ann, ctx, callIx) }
   const parts: string[] = []
   if annFnDecompose(ann, parts) == "" { return 0 }
   let sig = ""
@@ -15642,9 +15704,20 @@ function monoNoteBindDeliveryAt(at: i32, ann: string, ctx: i32) {
 }
 
 // A hole lambda written as a literal where function type `ann` is delivered is pinned there in
-// place, as a capture cell's literal is; one literal wanted at two types is refused (D5881).
-function monoDeliverLamLit(at: i32, ann: string, ctx: i32): i32 {
+// place, as a capture cell's literal is. One literal wanted at two types takes an instance per
+// type where it is an argument of call `callIx`, and is refused elsewhere (D5881, D5931).
+function monoDeliverLamLit(at: i32, ann: string, ctx: i32, callIx: i32): i32 {
   if monoLamLitTake(at, ann, ctx) == 1 {
+    const x = unwrapParen(at)
+    const pnames: string[] = []
+    const lfe = monoLamValueFe(x, ctx)
+    if (
+      callIx >= 0
+      && monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(ann)), pnames)
+      && monoHoleLamArgAgain(callIx, lfe, x, pnames) >= 0
+    ) {
+      return 0
+    }
     return emitFailAt(
       "emitProgram: this lambda is handed on at two different function types, and one lambda "
         + "literal has one signature — bind it once per type, or annotate its parameters",
@@ -15668,8 +15741,10 @@ function monoLamLitTake(at: i32, ann: string, ctx: i32): i32 {
 
 // The pin of hole lambda `args[i]` handed to un-annotated parameter `i` of generic `decl`: the
 // function type the body hands that parameter to, through a call of another parameter or on
-// through another generic, with the lambda instanced at it in place; "" when none is found.
+// through another generic, with the lambda instanced at it in place, or an instance of its own
+// replacing the argument of call `callIx` where another type pinned it first; "" for none (D5931).
 function monoHoleLamArgPin(
+  callIx: i32,
   decl: i32,
   args: i32[],
   i: i32,
@@ -15698,7 +15773,15 @@ function monoHoleLamArgPin(
     if pn == "" { return "" }
     pnames.push(pn)
   }
-  const r = monoCellLamTakeAt(lfe, x, pnames, ctx)
+  let r = monoCellLamTakeAt(lfe, x, pnames, ctx)
+  if r == 1 {
+    const nx = monoHoleLamArgAgain(callIx, lfe, x, pnames)
+    if nx >= 0 {
+      args[i] = nx
+      monoArenaTouch()
+      r = 0
+    }
+  }
   if r == 1 {
     emitFailAt(
       "emitProgram: this lambda is handed on at two different function types, and one lambda "
@@ -15711,6 +15794,30 @@ function monoHoleLamArgPin(
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = bt
   "=>" + sk
+}
+
+// Hole lambda `lfe`, the literal `x` among the arguments of call `callIx`, instanced at the
+// parameter pins `pnames` beside the instance another type took first: that instance's node,
+// which replaces the argument, or -1 when none could be made.
+function monoHoleLamArgAgain(
+  callIx: i32,
+  lfe: i32,
+  x: i32,
+  pnames: string[],
+): i32 {
+  if callIx < 0 || callIx >= P.nodes.length { return -1 }
+  const c = P.nodes[callIx]
+  if !(c is Call) { return -1 }
+  let k = 0
+  while k < c.callArgs.length && unwrapParen(c.callArgs[k]) != x { k = k + 1 }
+  if k >= c.callArgs.length { return -1 }
+  monoLastInstFe = -1
+  const r = monoInstanceFor(lfe, pnames, x, -1)
+  const fe = monoLastInstFe
+  if r < 0 || fe < 0 || fe >= fnStmts.length || fe == lfe { return -1 }
+  c.callArgs[k] = fnStmts[fe]
+  monoArenaTouch()
+  fnStmts[fe]
 }
 
 // The type the body of generic `decl` hands its un-annotated parameter `i` to, with the other
@@ -15776,6 +15883,44 @@ function monoHoleLitCopyPin(
   ""
 }
 
+// The pin of a list or record literal `args[i]` the checker did not retype, a hole among its
+// leaves: the type of another rep the body of generic `decl` hands that parameter to, so the
+// instance takes it there as the direct call does; "" otherwise (D5930).
+function monoHoleLeafLitPin(
+  decl: i32,
+  args: i32[],
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  const x = unwrapParen(args[i])
+  if x < 0 || !(P.nodes[x] is ArrayLit || P.nodes[x] is ObjLit) { return "" }
+  if holeLitPinOf(x) >= 0 || holeLitCopiesOf(x).length > 0 { return "" }
+  const d = monoHoleArgDemandTy(decl, args, i, ctx)
+  if d < 0 || tyHasTyVar(d) { return "" }
+  let dv = T.tys[d]
+  if dv is TyNullable {
+    if dv.nInner < 0 { return "" }
+    dv = T.tys[dv.nInner]
+  }
+  if P.nodes[x] is ArrayLit && !(dv is TyArray) { return "" }
+  if P.nodes[x] is ObjLit && !(dv is TyObj) { return "" }
+  const own = nodeTyIxOf(x)
+  if (
+    own >= 0
+    && !tyHasTyVar(own)
+    && assignable(own, d)
+    && assignable(d, own)
+  ) {
+    return ""
+  }
+  const nm = monoI32AtomPinName(d)
+  if nm == "" { return "" }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = d
+  nm
+}
+
 // The one function type the body of `decl` hands its parameter `target` to, where `pNames`'
 // parameters have the types `pTys` (-1 unknown); -1 for none, or two that differ.
 function monoHoleLamDemandTy(
@@ -15792,6 +15937,8 @@ function monoHoleLamDemandTy(
   const stack: i32[] = [dn.fnBody]
   while stack.length > 0 {
     const ix = stack.pop() ?? -1
+    // An absent child (an `if` with no `else`, a bare `return`) is -1.
+    if ix < 0 || ix >= P.nodes.length { continue }
     const c = P.nodes[ix]
     if c is Call {
       const t = monoHoleLamCallDemand(c, target, pNames, pTys, depth)

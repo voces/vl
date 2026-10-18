@@ -20,14 +20,17 @@ import {
   Member,
   ObjLit,
   P,
+  Param,
   Program,
   RetStmt,
   TypeRef,
+  declExported,
   declNameTokOf,
   i32ToStr,
   mkBinary,
   mkIdent,
   mkLet,
+  mkParam,
   mkTypeRef,
   nodeChildren,
   nodeToks,
@@ -78,6 +81,13 @@ let prName: string[] = []
 let pfSrc: i32[] = []
 let pfAnchor: i32[] = []
 let pfName: string[] = []
+// Parameter `ppAfter` is followed by parameters `ppNames`, and argument `paArg` of call
+// `paCall` by arguments reading `paNames`.
+let ppAfter: i32[] = []
+let ppNames: string[][] = []
+let paCall: i32[] = []
+let paArg: i32[] = []
+let paNames: string[][] = []
 
 function fsPlanReset(): i32 {
   pdAnchor = []
@@ -95,6 +105,12 @@ function fsPlanReset(): i32 {
   pfSrc = []
   pfAnchor = []
   pfName = []
+  ppAfter = []
+  ppNames = []
+  paCall = []
+  paArg = []
+  paNames = []
+  fsHoleDecline()
   0
 }
 
@@ -117,6 +133,11 @@ export function fsModeOf(): i32 { fsMode }
 // Whether the compile asked for a split, and whether its asks include a new declaration.
 export function fsAsked(): boolean { fsAsks.length > 0 }
 export function fsGrew(): boolean { fsAskGrew }
+
+// Whether parse node `ix` is one the plan minted, in the compile that applies it.
+export function fsMinted(ix: i32): boolean {
+  fsMode == FS_APPLY && fsParseLen > 0 && ix >= fsParseLen
+}
 
 // The emitter finds no signature for a call of function value `callee`; asks for the binding
 // it reads, which may want a slot per type.
@@ -534,6 +555,7 @@ export function fsPlan(root: i32): i32 {
     }
     ai = ai + 1
   }
+  const holes = fsPlanHoles()
   let anyLet = false
   for a in fsAsks {
     if a >= 0 && a < P.nodes.length && P.nodes[a] is LetDecl { anyLet = true }
@@ -558,7 +580,8 @@ export function fsPlan(root: i32): i32 {
       fns = 0
     }
   }
-  if lets == 0 { return 0 }
+  if holes == 0 { fsPlanHoleRewrites() }
+  if lets == 0 || holes == 0 { return 0 }
   fns
 }
 
@@ -620,16 +643,17 @@ function fsReadsNoLocal(m: i32): boolean {
 }
 
 // Function `m`, asked for returning a generic its results call at two types: one copy of it per
-// result key past the first, placed after its module statement, with each read of that key
-// renamed to its copy (D5531). A read that is not a call takes a key of its own. 1 when its
-// reads share one key.
+// result key past the first, placed after its module statement, or after `m` in its block when
+// it reads a local, with each read of that key renamed to its copy (D5971). A read that
+// is not a call takes a key of its own. 1 when its reads share one key.
 function fsPlanFn(m: i32): i32 {
   const f = P.nodes[m]
   if !(f is FuncDecl) || f.fnName == "" || fsParent[m] < 0 { return 1 }
-  const top = fsTopStmt(m)
+  let top = fsTopStmt(m)
   if top < 0 { return 1 }
-  if top != m && !(P.nodes[fsParent[m]] is Block && fsReadsNoLocal(m)) {
-    return 1
+  if top != m {
+    if !(P.nodes[fsParent[m]] is Block) { return 1 }
+    if !fsReadsNoLocal(m) { top = m }
   }
   const keys: string[] = []
   const calls: i32[] = []
@@ -662,6 +686,277 @@ function fsPlanFn(m: i32): i32 {
     }
     k = k + 1
   }
+  0
+}
+
+// A hole parameter whose reads call a generic function at two argument types takes a parameter
+// per type (D5611): each call hands the value once per parameter, each read takes its call's,
+// and a forward into another function's hole splits that hole too. The split parameters, their
+// keys, and the call arguments handed once per key.
+let hsPar: i32[] = []
+let hsKeys: string[][] = []
+let hdRead: i32[] = []
+let hdKeys: string[][] = []
+let hsBad = false
+
+function hdIx(r: i32): i32 {
+  let i = 0
+  while i < hdRead.length {
+    if hdRead[i] == r { return i }
+    i = i + 1
+  }
+  -1
+}
+
+function hsIx(par: i32): i32 {
+  let i = 0
+  while i < hsPar.length {
+    if hsPar[i] == par { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Whether parameter `par` can take a parameter per type: an un-annotated or bare type-parameter
+// parameter of a named, unexported function every read of which is a call passing each argument
+// by position.
+function fsHoleParamOk(par: i32): boolean {
+  if par < 0 || par >= fsParseLen || fsParent[par] < 0 { return false }
+  const p = P.nodes[par]
+  const fd = fsParent[par]
+  const f = P.nodes[fd]
+  if !(p is Param) || !(f is FuncDecl) || f.fnName == "" { return false }
+  if p.parDefault >= 0 || p.parOpt != 0 || p.parRest != 0 { return false }
+  if p.parType >= 0 {
+    const tn = P.nodes[p.parType]
+    if !(tn is TypeRef) || !hasStr(f.fnTyParams, tn.tyName) { return false }
+  }
+  if declExported(fd) || !fsStmtParentOk(fd) { return false }
+  for r in fsIdents {
+    if identDeclOf(r) == fd {
+      const c = fsParent[r]
+      if c < 0 { return false }
+      const cn = P.nodes[c]
+      if (
+        !(cn is Call)
+        || cn.callFn != r
+        || cn.callArgs.length != f.fnParams.length
+      ) {
+        return false
+      }
+      for nm in cn.callArgNames {
+        if nm != "" { return false }
+      }
+    }
+  }
+  true
+}
+
+// The parameter read `r` is handed to as an argument of a call of a declared function, or -1.
+function fsHoleFwd(r: i32): i32 {
+  const c = fsParent[r]
+  if c < 0 { return -1 }
+  const cn = P.nodes[c]
+  if !(cn is Call) || cn.callFn == r { return -1 }
+  const f = cn.callFn
+  if f < 0 || f >= P.nodes.length || !(P.nodes[f] is Ident) { return -1 }
+  const g = identDeclOf(f)
+  if g < 0 || g >= fsParseLen { return -1 }
+  const gn = P.nodes[g]
+  if !(gn is FuncDecl) { return -1 }
+  let j = 0
+  while j < cn.callArgs.length && cn.callArgs[j] != r { j = j + 1 }
+  if j >= gn.fnParams.length { return -1 }
+  gn.fnParams[j]
+}
+
+// The argument-type keys parameter `par` is called at, through the holes it is forwarded to;
+// sets `hsBad` when a read is neither a call nor a forward, or the forwards cycle.
+function fsHoleKeys(par: i32, seen: i32[]): string[] {
+  const ks: string[] = []
+  if hasI32(seen, par) || !fsHoleParamOk(par) {
+    hsBad = true
+    return ks
+  }
+  const inner: i32[] = [par]
+  for x in seen { inner.push(x) }
+  for r in fsIdents {
+    if identDeclOf(r) == par {
+      const cn = P.nodes[fsParent[r]]
+      if cn is Call && cn.callFn == r {
+        const k = fsReadKey(r)
+        if !hasStr(ks, k) { ks.push(k) }
+      } else {
+        const q = fsHoleFwd(r)
+        if q < 0 {
+          hsBad = true
+          return ks
+        }
+        for k in fsHoleKeys(q, inner) {
+          if !hasStr(ks, k) { ks.push(k) }
+        }
+      }
+    }
+  }
+  ks
+}
+
+// The split set: every asked parameter called at two types, closed over the holes it forwards
+// to and the parameters forwarded into it. 0 with a split, 1 with none or one it cannot make.
+function fsPlanHoles(): i32 {
+  fsHoleDecline()
+  hsBad = false
+  const work: i32[] = []
+  for a in fsAsks {
+    if a >= 0 && a < fsParseLen && P.nodes[a] is Param { work.push(a) }
+  }
+  const none: i32[] = []
+  let wi = 0
+  while wi < work.length {
+    const par = work[wi]
+    wi = wi + 1
+    if hsIx(par) < 0 && fsParent[par] >= 0 {
+      const ks = fsHoleKeys(par, none)
+      if hsBad { return fsHoleDecline() }
+      if ks.length > 1 {
+        hsPar.push(par)
+        hsKeys.push(ks)
+        const fd = fsParent[par]
+        const f = P.nodes[fd]
+        let j = 0
+        if f is FuncDecl {
+          while j < f.fnParams.length && f.fnParams[j] != par { j = j + 1 }
+        }
+        for r in fsIdents {
+          if identDeclOf(r) == par {
+            const q = fsHoleFwd(r)
+            if q >= 0 { work.push(q) }
+          }
+          if identDeclOf(r) == fd {
+            const cn = P.nodes[fsParent[r]]
+            if cn is Call {
+              const a = cn.callArgs[j]
+              if !(P.nodes[a] is Ident) { return fsHoleDecline() }
+              const ad = identDeclOf(a)
+              if ad >= 0 && ad < fsParseLen && P.nodes[ad] is Param {
+                work.push(ad)
+              } else {
+                hdRead.push(a)
+                hdKeys.push(ks)
+                fsHoleAskLet(a)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if hsPar.length == 0 { return 1 }
+  0
+}
+
+function fsHoleDecline(): i32 {
+  hsPar = []
+  hsKeys = []
+  hdRead = []
+  hdKeys = []
+  1
+}
+
+// A written binding handed once per type takes a slot per type through the let plan.
+function fsHoleAskLet(a: i32): i32 {
+  const d = letDeclOfRead(a)
+  if d < 0 || hasI32(fsAsks, d) { return 0 }
+  for r in fsIdents {
+    if identDeclOf(r) == d && fsReadKey(r) == "" {
+      fsAsks.push(d)
+      return 0
+    }
+  }
+  0
+}
+
+// Split parameter `si`'s name for key `k`: its own for the first key, a fresh one past it.
+function hsSlot(si: i32, k: string): string {
+  const par = hsPar[si]
+  const p = P.nodes[par]
+  let nm = ""
+  if p is Param { nm = p.parName }
+  let i = 0
+  while i < hsKeys[si].length && hsKeys[si][i] != k { i = i + 1 }
+  if i == 0 { return nm }
+  nm + "$h" + i32ToStr(par) + "_" + i32ToStr(i)
+}
+
+// The split set's share of the plan, once the let slots are known: the parameters, each read
+// renamed to its parameter, and each call handing its argument once per parameter.
+function fsPlanHoleRewrites(): i32 {
+  let si = 0
+  while si < hsPar.length {
+    const par = hsPar[si]
+    const ks = hsKeys[si]
+    const extra: string[] = []
+    let k = 1
+    while k < ks.length {
+      extra.push(hsSlot(si, ks[k]))
+      k = k + 1
+    }
+    ppAfter.push(par)
+    ppNames.push(extra)
+    for r in fsIdents {
+      if identDeclOf(r) == par {
+        const c = fsParent[r]
+        const cn = P.nodes[c]
+        if cn is Call && cn.callFn == r {
+          fsRename(r, hsSlot(si, fsReadKey(r)))
+        } else {
+          const q = fsHoleFwd(r)
+          const qi = hsIx(q)
+          if qi >= 0 {
+            const names: string[] = []
+            for qk in hsKeys[qi] { names.push(hsSlot(si, qk)) }
+            fsHoleHandOut(c, r, names)
+          } else {
+            const none: i32[] = []
+            const qks = fsHoleKeys(q, none)
+            if qks.length > 0 { fsRename(r, hsSlot(si, qks[0])) }
+          }
+        }
+      }
+    }
+    si = si + 1
+  }
+  let hi = 0
+  while hi < hdRead.length {
+    const a = hdRead[hi]
+    const an = P.nodes[a]
+    const names: string[] = []
+    const d = letDeclOfRead(a)
+    let mi = -1
+    if d >= 0 { mi = memIx(d) }
+    for k in hdKeys[hi] {
+      if mi >= 0 { names.push(laneName(mi, k)) }
+      else if an is Ident { names.push(an.identName) }
+    }
+    fsHoleHandOut(fsParent[a], a, names)
+    hi = hi + 1
+  }
+  0
+}
+
+// Argument `a` of call `c` reads `names[0]`, and the rest follow it.
+function fsHoleHandOut(c: i32, a: i32, names: string[]): i32 {
+  if names.length == 0 { return 0 }
+  fsRename(a, names[0])
+  const rest: string[] = []
+  let i = 1
+  while i < names.length {
+    rest.push(names[i])
+    i = i + 1
+  }
+  paCall.push(c)
+  paArg.push(a)
+  paNames.push(rest)
   0
 }
 
@@ -705,9 +1000,16 @@ function fsPlanLets(): i32 {
     for r in fsIdents {
       if identDeclOf(r) == m {
         const key = fsReadKey(r)
-        // A delivery into a type that does not fix one instantiation keeps the refusal.
-        if key.slice(0, 2) == "u:" && !fsDestFixed(r) { return 1 }
-        if key != "" && key != "=" && !hasStr(ks, key) { ks.push(key) }
+        const hd = hdIx(r)
+        if hd >= 0 {
+          for k in hdKeys[hd] {
+            if !hasStr(ks, k) { ks.push(k) }
+          }
+        } else {
+          // A delivery into a type that does not fix one instantiation keeps the refusal.
+          if key.slice(0, 2) == "u:" && !fsDestFixed(r) { return 1 }
+          if key != "" && key != "=" && !hasStr(ks, key) { ks.push(key) }
+        }
       }
     }
     fsLanes.push(ks)
@@ -795,7 +1097,7 @@ function fsPlanMember(mi: i32): i32 {
           }
           wk = wk + 1
         }
-      } else if key != "=" {
+      } else if key != "=" && hdIx(r) < 0 {
         fsRename(r, laneName(mi, key))
       }
     }
@@ -955,6 +1257,70 @@ function fsApply(): i32 {
     }
     i = i + 1
   }
+  i = 0
+  while i < ppAfter.length {
+    if rc == 0 { rc = fsApplyParams(ppAfter[i], ppNames[i]) }
+    i = i + 1
+  }
+  i = 0
+  while i < paCall.length {
+    if rc == 0 { rc = fsApplyArgs(paCall[i], paArg[i], paNames[i]) }
+    i = i + 1
+  }
   P.pos = savedPos
   rc
+}
+
+// Un-annotated parameters `names` after parameter `par` of its function. -1 when it cannot.
+function fsApplyParams(par: i32, names: string[]): i32 {
+  let fd = 0
+  while fd < fsParseLen {
+    const f = P.nodes[fd]
+    if f is FuncDecl && hasI32(f.fnParams, par) {
+      const at = P.nodes[par].pos
+      const out: i32[] = []
+      for x in f.fnParams {
+        out.push(x)
+        if x == par {
+          for nm in names {
+            P.pos = nodeToks[par] + 1
+            out.push(mkParam(nm, -1, -1, 0, 0, at))
+          }
+        }
+      }
+      f.fnParams = out
+      return 0
+    }
+    fd = fd + 1
+  }
+  -1
+}
+
+// Arguments reading `names` after argument `a` of call `c`. -1 when it cannot.
+function fsApplyArgs(c: i32, a: i32, names: string[]): i32 {
+  const cn = P.nodes[c]
+  if !(cn is Call) || a < 0 || a >= P.nodes.length || a >= nodeToks.length {
+    return -1
+  }
+  const at = P.nodes[a].pos
+  const args: i32[] = []
+  const nms: string[] = []
+  let i = 0
+  while i < cn.callArgs.length {
+    args.push(cn.callArgs[i])
+    let nm0 = ""
+    if i < cn.callArgNames.length { nm0 = cn.callArgNames[i] }
+    nms.push(nm0)
+    if cn.callArgs[i] == a {
+      for nm in names {
+        P.pos = nodeToks[a] + 1
+        args.push(mkIdent(nm, at))
+        nms.push("")
+      }
+    }
+    i = i + 1
+  }
+  cn.callArgs = args
+  if cn.callArgNames.length > 0 { cn.callArgNames = nms }
+  0
 }
