@@ -22,6 +22,7 @@ import {
   hasNamedArgs,
   hasSpreadItem,
   i32ToStr,
+  nodeChildren,
   nodeIsTplHole,
   restParamIndex,
   ufcsAliasInScope,
@@ -33,6 +34,7 @@ import {
   dstBindLitTyParams,
   fsbNoteCall,
   genFnValueCstrs,
+  holeDeclCstrsAt,
   holeLambdaDefers,
   holeLambdaSeedTy,
   validateArgCstrs,
@@ -213,6 +215,7 @@ import {
   bindExplicitTyArgs,
   bindGenUnionArm,
   bindGenWalk,
+  genFnHoleCallInsts,
   genFnHoleCalled,
   genFnHoleInstance,
   substTyDeep,
@@ -300,7 +303,7 @@ import {
 } from "./check_width"
 import { peelParenIx, weDigits } from "./check_write_effects"
 import { fnDeclIx } from "./check_write_scan"
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import {
   isVoidTy,
   nonNullTy,
@@ -1413,6 +1416,7 @@ function callFtyPinCstrs(
   }
   const wsVd = T.diags.length
   adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
+  judgeFnArgHoleCalls(vNames, vTys, cstrCallee, dhNames, dhArgNode)
   instGenFnHolePins(vNames, vTys, cstrCallee)
   pinHoleLambdaVals(vNames, vTys, ix, cstrCallee)
   if fsbName.length > 0 {
@@ -1656,8 +1660,114 @@ function holeParamUse(cfn: Node, owner: i32, holeTy: i32, i: i32): i32 {
   if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
   const pn = P.nodes[dn.fnParams[i]]
   if !(pn is Param) || pn.parRest != 0 { return -1 }
-  if crSubtreeMentions(dn.fnBody, pn.parName) { return -1 }
+  if !holeParamUnreadIn(decl, i, 0) { return -1 }
   1
+}
+
+// How many declared functions a hole parameter is handed on through before it counts as read.
+const HOLE_FWD_UNREAD_MAX = 8
+
+// Whether function `decl`'s un-annotated `i`th parameter is never read, or only handed on bare
+// to an un-annotated parameter of a declared function that never reads it, `depth` hops in (D6191).
+function holeParamUnreadIn(decl: i32, i: i32, depth: i32): boolean {
+  if decl < 0 || decl >= P.nodes.length || depth > HOLE_FWD_UNREAD_MAX {
+    return false
+  }
+  const dn = P.nodes[decl]
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return false }
+  const pn = P.nodes[dn.fnParams[i]]
+  if !(pn is Param) || pn.parRest != 0 || (depth > 0 && pn.parType >= 0) {
+    return false
+  }
+  if !crSubtreeMentions(dn.fnBody, pn.parName) { return true }
+  holeNameOnlyForwardedUnread(dn.fnBody, pn.parName, depth)
+}
+
+// Whether every read of `name` under `ix` is a bare positional argument of a call of a declared
+// function whose parameter there is unread (`holeParamUnreadIn`).
+function holeNameOnlyForwardedUnread(
+  ix: i32,
+  name: string,
+  depth: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is Ident { return n.identName != name }
+  if n is FuncDecl {
+    for p in n.fnParams {
+      const pp = P.nodes[p]
+      if pp is Param {
+        if pp.parName == name { return false }
+      }
+    }
+  }
+  if n is Call {
+    if n.callFn < 0 || n.callFn >= P.nodes.length { return false }
+    const cf = P.nodes[n.callFn]
+    let g = -1
+    if cf is Ident { g = fnDeclIx[cf.identName] ?? -1 }
+    const named = hasNamedArgs(n.callArgNames)
+    if !holeNameOnlyForwardedUnread(n.callFn, name, depth) { return false }
+    let j = 0
+    while j < n.callArgs.length {
+      const a = n.callArgs[j]
+      const av = P.nodes[a]
+      let fwd = false
+      if av is Ident { fwd = av.identName == name }
+      if fwd {
+        if g < 0 || named || !holeParamUnreadIn(g, j, depth + 1) {
+          return false
+        }
+      } else if !holeNameOnlyForwardedUnread(a, name, depth) {
+        return false
+      }
+      j = j + 1
+    }
+    return true
+  }
+  for c in nodeChildren(ix) {
+    if !holeNameOnlyForwardedUnread(c, name, depth) { return false }
+  }
+  true
+}
+
+// A declared function named as an argument to a hole the callee's body calls is judged at the
+// instance each of those calls asks for, as a delivery at that type is, so a pin its body
+// cannot take is refused here and not at emit (D6190).
+function judgeFnArgHoleCalls(
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  dhNames: string[],
+  dhArgNode: i32[],
+) {
+  if inferQuiet { return 0 }
+  let j = 0
+  while j < dhNames.length {
+    const a = parenPeelIx(dhArgNode[j])
+    if a < 0 || a >= P.nodes.length {
+      j = j + 1
+      continue
+    }
+    const an = P.nodes[a]
+    if an is Ident {
+      const d = fnDeclIx[an.identName] ?? -1
+      if d >= 0 && d < P.nodes.length && P.nodes[d] is FuncDecl {
+        const k = strListIndexOf(vNames, dhNames[j])
+        if k >= 0 {
+          const insts: i32[] = []
+          genFnHoleCallInsts(vNames, vTys, k, vTys[k], calleeFn, insts)
+          const d0 = T.diags.length
+          for inst in insts {
+            if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
+            if T.diags.length == d0 { holeDeclCstrsAt(a, d, nodeTyOf(a), inst) }
+          }
+        }
+      }
+    }
+    j = j + 1
+  }
+  0
 }
 
 // A lambda with hole parameters bound to a hole the callee's body calls is instanced at the

@@ -3637,6 +3637,113 @@ export function genFnHoleInstance(
   inst
 }
 
+// Each distinct instance of `vt` the calls of hole `vNames[k]` in `calleeFn`'s body ask for,
+// one per call, into `out`. A call taking the hole's own result is asked under the first
+// call's bindings, as `genFnHoleInstance` asks it (D6190).
+export function genFnHoleCallInsts(
+  vNames: string[],
+  vTys: i32[],
+  k: i32,
+  vt: i32,
+  calleeFn: i32,
+  out: i32[],
+) {
+  if vt < 0 || vt >= T.tys.length { return 0 }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) { return 0 }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  let open: i32[] = []
+  let ci = 0
+  while ci < argCstr.at.length {
+    if cstrOwnedBy(argCstr.fn[ci], calleeFn) && argCstr.form[ci] > 0 {
+      const row = hdRowOf(argCstr.exp[ci])
+      if row >= 0 && hdKind[row] == HD_PARAM && hdBase[row] >= 0 {
+        const bt = T.tys[hdBase[row]]
+        if bt is TyVar && bt.tvName == vNames[k] {
+          const r = genFnHoleCallOwn(
+            vf,
+            vt,
+            row,
+            ci,
+            vNames,
+            vTys,
+            gNames,
+            gTys,
+            out,
+          )
+          if r < 0 { return 0 }
+          if r == 0 { open.push(ci) }
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  while open.length > 0 {
+    const still: i32[] = []
+    for oc in open {
+      const row = hdRowOf(argCstr.exp[oc])
+      const r = genFnHoleCallOwn(
+        vf,
+        vt,
+        row,
+        oc,
+        vNames,
+        vTys,
+        gNames,
+        gTys,
+        out,
+      )
+      if r < 0 { return 0 }
+      if r == 0 { still.push(oc) }
+    }
+    if still.length == open.length { return 0 }
+    open = still
+  }
+  0
+}
+
+// Call `ci`'s own instance of `vt`, pushed to `out` when new; the first call to close also
+// binds the shared `gNames`/`gTys`. 1 when closed, 0 while open, -1 when it cannot be read.
+function genFnHoleCallOwn(
+  vf: TyFunc,
+  vt: i32,
+  row: i32,
+  ci: i32,
+  vNames: string[],
+  vTys: i32[],
+  gNames: string[],
+  gTys: i32[],
+  out: i32[],
+): i32 {
+  if ci < 0 || ci >= argCstr.at.length || row < 0 || row >= hdInner.length {
+    return -1
+  }
+  const pj = hdInner[row]
+  if pj < 0 || pj >= vf.fnParamTypes.length { return -1 }
+  let rat = substTyDeep(argCstr.at[ci], vNames, vTys)
+  if rat < 0 || tyIsDeferredJoin(rat) { return -1 }
+  if tyHasTyVar(rat) && gNames.length > 0 {
+    rat = substTyDeep(rat, gNames, gTys)
+  }
+  if rat < 0 { return -1 }
+  if tyHasTyVar(rat) { return 0 }
+  const oNames: string[] = []
+  const oTys: i32[] = []
+  bindGenWalk(vf.fnParamTypes[pj], rat, oNames, oTys)
+  if gNames.length == 0 {
+    for nm in oNames { gNames.push(nm) }
+    for t in oTys { gTys.push(t) }
+  }
+  const inst = substTyDeep(vt, oNames, oTys)
+  if inst < 0 || tyHasTyVar(inst) { return 1 }
+  for o in out {
+    if tySame(o, inst) { return 1 }
+  }
+  out.push(inst)
+  1
+}
+
 // One call `ci` of a hole typed `vf`, at parameter row `row`: binds `vf`'s variables from its
 // argument into `gNames`/`gTys`. 1 when bound, 0 while the argument is open under them, -1 when
 // it cannot fit.
