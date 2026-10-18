@@ -4123,94 +4123,17 @@ function gwWalk(ix: i32) {
     gwWalk(n.asObj)
     return gwTypeOk(ix)
   }
-  if n is Member {
-    const gFn = getSiteFnOf(ix)
-    if gFn != "" {
-      const to = getRowOf(gFn)
-      if to >= 0 {
-        getEdgeFromPush(gwRow)
-        getEdgeToPush(to)
-      }
-    }
-    gwWalk(n.memObj)
-    return gwTypeOk(ix)
-  }
+  if n is Member { return gwMember(n, ix) }
   if n is OptMember {
     gwWalk(n.omObj)
     return gwTypeOk(ix)
   }
-  if n is Index {
-    const idxOp = opIdxFnAtNode(ix)
-    if idxOp != "" {
-      const args: i32[] = [n.idxArr, n.idxIndex]
-      gwOperatorCall(idxOp, args, "calls a user `\"[]\"` operator", ix)
-    } else if gwErasedIs(nodeTyIxOf(n.idxArr)) == "map" {
-      getterContractErr(
-        "indexes the map `"
-          + tyToStr(nodeTyIxOf(n.idxArr))
-          + "`, which hashes and probes in a loop",
-        GW_LOOP,
-        ix,
-      )
-      // The read's `V | null` result would be refused too; the map index is the one fact.
-      gwWalk(n.idxArr)
-      gwWalk(n.idxIndex)
-      return 0
-    }
-    gwWalk(n.idxArr)
-    gwWalk(n.idxIndex)
-    return gwTypeOk(ix)
-  }
+  if n is Index { return gwIndex(n, ix) }
   if n is BinExpr { return gwBinExpr(n, ix) }
   if n is Call { return gwCall(n, ix) }
-  if n is LetDecl {
-    const lty = getLetTyOf(ix)
-    // A closure initializer is refused as the allocation it is; its type would say it twice.
-    let initIsFn = false
-    if n.letInit >= 0 {
-      const li = P.nodes[n.letInit]
-      if li is FuncDecl { initIsFn = true }
-    }
-    if lty >= 0 && !initIsFn && !getterRepOk(lty) && gwBoxedFirst(lty) {
-      getterContractErr(
-        "declares the local `"
-          + n.letName
-          + "` of type `"
-          + tyToStr(lty)
-          + "`, which is allocated",
-        GW_ALLOC,
-        ix,
-      )
-    }
-    gwWalk(n.letInit)
-    gwLocalsPush(n.letName)
-    return 0
-  }
-  if n is Block {
-    // A block's locals end with it, so a later read of the same name is the outer binding's.
-    const mark = gwLocals.length
-    const blockDiscarded = gwDiscarded(ix)
-    let i = 0
-    while i < n.blkStmts.length {
-      if i < n.blkStmts.length - 1 || blockDiscarded {
-        gwDiscardPush(n.blkStmts[i])
-      }
-      gwWalk(n.blkStmts[i])
-      i = i + 1
-    }
-    while gwLocals.length > mark { gwLocalsPop() }
-    return gwTypeOk(ix)
-  }
-  if n is IfStmt {
-    if gwDiscarded(ix) {
-      gwDiscardPush(n.ifThen)
-      gwDiscardPush(n.ifElse)
-    }
-    gwWalk(n.ifCond)
-    gwWalk(n.ifThen)
-    gwWalk(n.ifElse)
-    return gwTypeOk(ix)
-  }
+  if n is LetDecl { return gwLetDecl(n, ix) }
+  if n is Block { return gwBlock(n, ix) }
+  if n is IfStmt { return gwIf(n, ix) }
   if n is MatchExpr { return gwMatch(n, ix) }
   if n is RetStmt { return gwWalk(n.retArg) }
   if n is WhileStmt || n is ForRange || n is ForIn {
@@ -4245,6 +4168,102 @@ function gwWalk(ix: i32) {
     GW_OTHER,
     ix,
   )
+}
+
+// A field read `n` at `ix`: a read through another getter records the edge between the two
+// getters' rows, and the object is walked.
+function gwMember(n: Member, ix: i32) {
+  const gFn = getSiteFnOf(ix)
+  if gFn != "" {
+    const to = getRowOf(gFn)
+    if to >= 0 {
+      getEdgeFromPush(gwRow)
+      getEdgeToPush(to)
+    }
+  }
+  gwWalk(n.memObj)
+  gwTypeOk(ix)
+}
+
+// An index read `n` at `ix`: a user `"[]"` operator is a call, and a map index is refused as
+// the hash-and-probe loop it is.
+function gwIndex(n: Index, ix: i32) {
+  const idxOp = opIdxFnAtNode(ix)
+  if idxOp != "" {
+    const args: i32[] = [n.idxArr, n.idxIndex]
+    gwOperatorCall(idxOp, args, "calls a user `\"[]\"` operator", ix)
+  } else if gwErasedIs(nodeTyIxOf(n.idxArr)) == "map" {
+    getterContractErr(
+      "indexes the map `"
+        + tyToStr(nodeTyIxOf(n.idxArr))
+        + "`, which hashes and probes in a loop",
+      GW_LOOP,
+      ix,
+    )
+    // The read's `V | null` result would be refused too; the map index is the one fact.
+    gwWalk(n.idxArr)
+    gwWalk(n.idxIndex)
+    return 0
+  }
+  gwWalk(n.idxArr)
+  gwWalk(n.idxIndex)
+  gwTypeOk(ix)
+}
+
+// A local declaration `n` at `ix`: an allocated local type is refused, the initializer is
+// walked, and the name joins the getter's locals.
+function gwLetDecl(n: LetDecl, ix: i32) {
+  const lty = getLetTyOf(ix)
+  // A closure initializer is refused as the allocation it is; its type would say it twice.
+  let initIsFn = false
+  if n.letInit >= 0 {
+    const li = P.nodes[n.letInit]
+    if li is FuncDecl { initIsFn = true }
+  }
+  if lty >= 0 && !initIsFn && !getterRepOk(lty) && gwBoxedFirst(lty) {
+    getterContractErr(
+      "declares the local `"
+        + n.letName
+        + "` of type `"
+        + tyToStr(lty)
+        + "`, which is allocated",
+      GW_ALLOC,
+      ix,
+    )
+  }
+  gwWalk(n.letInit)
+  gwLocalsPush(n.letName)
+  0
+}
+
+// A block `n` at `ix`: every statement but a value-bearing last one is discarded, and the
+// block's locals end with it.
+function gwBlock(n: Block, ix: i32) {
+  // A block's locals end with it, so a later read of the same name is the outer binding's.
+  const mark = gwLocals.length
+  const blockDiscarded = gwDiscarded(ix)
+  let i = 0
+  while i < n.blkStmts.length {
+    if i < n.blkStmts.length - 1 || blockDiscarded {
+      gwDiscardPush(n.blkStmts[i])
+    }
+    gwWalk(n.blkStmts[i])
+    i = i + 1
+  }
+  while gwLocals.length > mark { gwLocalsPop() }
+  gwTypeOk(ix)
+}
+
+// An `if` `n` at `ix`: a discarded `if` discards both arms, and the condition and arms are walked.
+function gwIf(n: IfStmt, ix: i32) {
+  if gwDiscarded(ix) {
+    gwDiscardPush(n.ifThen)
+    gwDiscardPush(n.ifElse)
+  }
+  gwWalk(n.ifCond)
+  gwWalk(n.ifThen)
+  gwWalk(n.ifElse)
+  gwTypeOk(ix)
 }
 
 // A binary expression: an assignment may write only the getter's own `let` locals, a string

@@ -412,6 +412,19 @@ function checkMatchBindDecls(bIx: i32) {
   0
 }
 
+// What a match's pattern pass settles: whether a `_` arm stands in for the unnamed members,
+// and whether some pattern named no member, which suppresses the exhaustiveness report.
+type MatchPatScan = {
+  hasWild: boolean,
+  sawBadPat: boolean,
+}
+
+// A match's joined arm value type (-1 while no arm has joined) and its value tally.
+type MatchArmJoin = {
+  ty: i32,
+  valAcc: i32,
+}
+
 function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
   // `uMems` is the scrutinee's variant list (a nullable contributes its inner variants plus
   // `null`) — a data structure, never a re-split of a rendered spelling. `covered` is parallel.
@@ -421,17 +434,65 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     covered.push(0)
     ci = ci + 1
   }
-  let hasWild = false
-  let wildArm = -1
-  // A pattern that names no member covers nothing — report it at the pattern and suppress the
-  // exhaustiveness report below (the bad pattern is the root cause; don't cascade).
-  let sawBadPat = false
   // A union with a literal member takes that literal as a value pattern too (D5714); `valMem`
   // maps each such pattern to the member it names.
   const litMems = unionHasLitMember(uMems)
   const valMem: {[i32]: i32} = Map()
+  const scan = matchPatScan(n, st, uMems, covered, litMems, valMem)
+  const hasWild = scan.hasWild
+  // Whether every member is named (or a `_` stands in for the rest) — settled by pass 1, and
+  // read by pass 3 as well as by the exhaustiveness report at the end.
+  let exhaustive = hasWild
+  if !hasWild { exhaustive = matchAllCovered(covered) }
+  // Pass 2 (chain order): the progressive else narrowings, folded into `accNames`/`accTys`.
+  const elseArm = matchElseArmOf(n.matchPats, n.matchArmStart, n.matchArmCount)
+  const accNames: string[] = []
+  const accTys: i32[] = []
+  const armAcc = matchElseArmAcc(n, elseArm, valMem, accNames, accTys)
+  const matchArmTys: i32[] = []
+  const mValArms: i32[] = []
+  const mValTys: i32[] = []
+  const join = matchArmsJoin(
+    n,
+    ix,
+    elseArm,
+    exhaustive,
+    valMem,
+    armAcc,
+    accNames,
+    accTys,
+    matchArmTys,
+    mValArms,
+    mValTys,
+  )
+  const matchTy = matchTypeJoinEnd(ix, join, matchArmTys, mValArms, mValTys)
+  // Exhaustiveness: `_` is allowed but never required — a match naming every member is
+  // complete without one. Missing members render from the arena types, not a re-split spelling.
+  if !hasWild && !scan.sawBadPat { matchTypeExhaustive(ix, uMems, covered) }
+  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
+  if !inferQuiet {
+    matchLower(ix)
+    if litMems { matchBankValTests(ix, n.matchScrut) }
+  }
+  matchTy
+}
+
+// Pass 1 (source order): resolves and validates every pattern of `n`, banks its check type
+// and marks the member it covers in `covered` (a value pattern's member in `valMem`).
+function matchPatScan(
+  n: MatchExpr,
+  st: i32,
+  uMems: i32[],
+  covered: i32[],
+  litMems: boolean,
+  valMem: {[i32]: i32},
+): MatchPatScan {
+  let hasWild = false
+  let wildArm = -1
+  // A pattern that names no member covers nothing — report it at the pattern and suppress the
+  // exhaustiveness report (the bad pattern is the root cause; don't cascade).
+  let sawBadPat = false
   const nArms = n.matchArmStart.length
-  // ── pass 1 (SOURCE order): resolve + validate every pattern, bank its check type, mark cover.
   let ai = 0
   while ai < nArms {
     let pj = 0
@@ -472,23 +533,30 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     checkMatchArmBinds(n, ai)
     ai = ai + 1
   }
-  // Whether every member is named (or a `_` stands in for the rest) — settled by pass 1, and
-  // read by pass 3 as well as by the exhaustiveness report at the end.
-  let exhaustive = hasWild
-  if !hasWild { exhaustive = matchAllCovered(covered) }
-  // Pass 2 (chain order): the progressive else narrowings, folded into `accNames`/`accTys`.
-  const elseArm = matchElseArmOf(n.matchPats, n.matchArmStart, n.matchArmCount)
-  const accNames: string[] = []
-  const accTys: i32[] = []
-  const armAcc = matchElseArmAcc(n, elseArm, valMem, accNames, accTys)
-  // Pass 3 (source order): check each arm body under its branch's narrowing, joining arm value
-  // types. -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
+  const r: MatchPatScan = { hasWild: hasWild, sawBadPat: sawBadPat }
+  r
+}
+
+// Pass 3 (source order): checks each arm body under its branch's narrowing and joins the arm
+// value types, pushing each joined arm onto the three caller-owned lists.
+function matchArmsJoin(
+  n: MatchExpr,
+  ix: i32,
+  elseArm: i32,
+  exhaustive: boolean,
+  valMem: {[i32]: i32},
+  armAcc: i32[],
+  accNames: string[],
+  accTys: i32[],
+  matchArmTys: i32[],
+  mValArms: i32[],
+  mValTys: i32[],
+): MatchArmJoin {
+  // -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
   let matchTy = -1
-  const matchArmTys: i32[] = []
-  const mValArms: i32[] = []
-  const mValTys: i32[] = []
   let matchValAcc = matchTallyBegin(ix)
   let mArmsLit = true
+  const nArms = n.matchArmStart.length
   let bi = 0
   while bi < nArms {
     const nmz: string[] = []
@@ -512,18 +580,8 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
         }
       }
     }
-    // The scope is pushed for the payload clause too, not just the narrowing — an arm can
-    // bind without narrowing, and its `const`s must still be arm-local.
-    const bindIx = matchArmBindsOf(n, bi)
-    const scoped = nmz.length > 0 || bindIx >= 0
-    if scoped {
-      pushScope(-1)
-      applyNarrows(nmz, tyz)
-      checkMatchBindDecls(bindIx)
-    }
+    const armTy = matchArmScopedBodyTy(n, bi, nmz, tyz)
     const body = n.matchBodies[bi]
-    const armTy = matchArmBodyTy(body)
-    if scoped { popScope() }
     if !matchArmExits(ix, body, armTy) {
       const bodyLit = armLit(armTy, body)
       matchTy = joinArmLit(
@@ -547,6 +605,43 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     }
     bi = bi + 1
   }
+  const r: MatchArmJoin = { ty: matchTy, valAcc: matchValAcc }
+  r
+}
+
+// Checks arm `bi`'s body under the narrowing `nmz`/`tyz` and its payload `const`s, and
+// returns the body's type.
+function matchArmScopedBodyTy(
+  n: MatchExpr,
+  bi: i32,
+  nmz: string[],
+  tyz: i32[],
+): i32 {
+  // The scope is pushed for the payload clause too, not just the narrowing — an arm can
+  // bind without narrowing, and its `const`s must still be arm-local.
+  const bindIx = matchArmBindsOf(n, bi)
+  const scoped = nmz.length > 0 || bindIx >= 0
+  if scoped {
+    pushScope(-1)
+    applyNarrows(nmz, tyz)
+    checkMatchBindDecls(bindIx)
+  }
+  const armTy = matchArmBodyTy(n.matchBodies[bi])
+  if scoped { popScope() }
+  armTy
+}
+
+// The match's type from its arms' join: void when no arm joined, else the f32 or literal
+// join where one applies, else the join with its type-parameter row noted. Closes the tally.
+function matchTypeJoinEnd(
+  ix: i32,
+  join: MatchArmJoin,
+  matchArmTys: i32[],
+  mValArms: i32[],
+  mValTys: i32[],
+): i32 {
+  let matchTy = join.ty
+  let matchValAcc = join.valAcc
   if matchTy < 0 { matchTy = TY_VOID }
   const mf32 = matchF32Join(ix, matchTy)
   const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
@@ -560,14 +655,6 @@ function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
     noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
   }
   matchTallyEnd(ix, matchValAcc)
-  // Exhaustiveness: `_` is allowed but never required — a match naming every member is
-  // complete without one. Missing members render from the arena types, not a re-split spelling.
-  if !hasWild && !sawBadPat { matchTypeExhaustive(ix, uMems, covered) }
-  // Lower to an if/else chain in place (real pass only) so lint + emit see only if-chains.
-  if !inferQuiet {
-    matchLower(ix)
-    if litMems { matchBankValTests(ix, n.matchScrut) }
-  }
   matchTy
 }
 
