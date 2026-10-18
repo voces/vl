@@ -199,6 +199,7 @@ import {
   nullTestOp,
   rebaseDerivedHole,
   rejoinDropSubsumed,
+  softenBareLitTy,
   storageTyLeafFail,
   substListTwin,
   substNullableOver,
@@ -3824,6 +3825,54 @@ function holeCallNodeTy(
   const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
   if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
   t
+}
+
+// Refuses, at argument node `arg`, the first binary operator in `calleeFn`'s body that a hole
+// call operand leaves open under the call's bindings and that is undefined once every hole call
+// takes its own instance (`holeCallNodeTy`), as the direct spelling is (D6300).
+export function judgeHoleCallBinOps(
+  calleeFn: i32,
+  vNames: string[],
+  vTys: i32[],
+  arg: i32,
+) {
+  if calleeFn < 0 || calleeFn >= P.nodes.length { return 0 }
+  const f = P.nodes[calleeFn]
+  if !(f is FuncDecl) { return 0 }
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is BinExpr {
+        const l0 = substTyDeep(nodeTyOf(n.binLeft), vNames, vTys)
+        const r0 = substTyDeep(nodeTyOf(n.binRight), vNames, vTys)
+        if l0 >= 0 && r0 >= 0 && (tyHasTyVar(l0) || tyHasTyVar(r0)) {
+          const lt = holeCallNodeTy(n.binLeft, vNames, vTys, calleeFn, 0)
+          const rt = holeCallNodeTy(n.binRight, vNames, vTys, calleeFn, 0)
+          if lt >= 0 && rt >= 0 && !binOpDefinedFor(n.binOp, lt, rt) {
+            tErr(
+              "operator '"
+                + n.binOp
+                + "' is not defined for "
+                + tyToStr(softenBareLitTy(lt))
+                + " and "
+                + tyToStr(softenBareLitTy(rt))
+                + " (in `"
+                + f.fnName
+                + "`, at one of the instances it calls a function argument at)",
+              arg,
+            )
+            return 0
+          }
+        }
+      }
+      if !(n is FuncDecl) || ix == f.fnBody {
+        for ch in nodeChildren(ix) { todo.push(ch) }
+      }
+    }
+  }
+  0
 }
 
 // The result of a call of declared function `calleeFn` with no declared return, read off its
