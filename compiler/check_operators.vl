@@ -1260,11 +1260,9 @@ function binNumUnionOpTy(
   numUnionBinTy(n, ix, lt, rt)
 }
 
-// Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
-function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
-  const op = n.binOp
-  if op == "in" { return checkInOpNode(n, ix) }
-  if op == "&&" || op == "||" { return checkLogicalBinNode(n, ix) }
+// Checks the left operand of `n` under operator `op`, marking a bare-name or member `=` target
+// as a pure write for its length, and answers its type as the operator reads it.
+function binCheckLeftOperand(n: BinExpr, op: string): i32 {
   // Definite-assignment: a plain `=` with a bare-name target is a pure write — flag it so
   // the `Ident` arm skips use-before-assign. A compound `x += ...` desugars, so its read isn't the target.
   const savedWriteTarget = daWriteTarget
@@ -1275,7 +1273,6 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     if wtgt is Member { getWriteTargetSet(n.binLeft) }
     if wtgt is Index || wtgt is Member { luWriteTgtPut(n.binLeft, true) }
   }
-  const savedLbiTgt = lbiWriteTgt
   if op == "=" { lbiWriteTgt = n.binLeft }
   let lt = checkNodeHook(n.binLeft)
   daWriteTarget = savedWriteTarget
@@ -1292,7 +1289,18 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     // decides once both sides are known (`eqKeepsWideLit`).
     if op != "==" && op != "!=" { lt = widenLitTy(lt) }
   }
-  ltOut.push(lt)
+  lt
+}
+
+// Checks the right operand of `n` (at `ix`) against the left's type `lt`, seeded as its expected
+// type under `=` and `??`, and restores the write target to `savedLbiTgt`; answers its type.
+function binCheckRightOperand(
+  n: BinExpr,
+  ix: i32,
+  op: string,
+  lt: i32,
+  savedLbiTgt: i32,
+): i32 {
   // Contextual typing for an assignment RHS: seed the LHS type so an un-annotated lambda
   // param infers from the target, matching let-init/arg/return seeding.
   if op == "=" { seedExpected(n.binRight, lt) }
@@ -1315,65 +1323,117 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     nlCmpdInner = parenPeelIx(n.binRight)
     nlCmpdTgt = n.binLeft
   }
-  let rt = checkNodeHook(n.binRight)
+  const rt = checkNodeHook(n.binRight)
   lbiWriteTgt = savedLbiTgt
   nlCmpdInner = savedCmpdInner
   nlCmpdTgt = savedCmpdTgt
   asgOpenElemRowSet(savedAsgRow)
   lbiNoteOperands(n, ix)
+  rt
+}
+
+// Refines a non-assignment operator's operand pair `sides` (`[lt, rt]`, updated in place): the
+// right element default, the compare's literal widening, and a store value's pin of the place it
+// reads, which `ltOut[0]` follows. True when a compare's literal never meets, decided `boolean`.
+function binRefineOperands(
+  n: BinExpr,
+  ix: i32,
+  op: string,
+  sides: i32[],
+  ltOut: i32[],
+): boolean {
+  let lt = sides[0]
+  let rt = sides[1]
   // The right operand takes the same answer, for the same reason: without it, an operator's
   // annotated face runs while the un-annotated one is check-clean invalid wasm (D1566).
-  if op != "=" {
-    if rt < 0 {
-      const peekR = arrDefOperandElemPeek(n.binRight)
-      if peekR >= 0 { rt = peekR }
+  if rt < 0 {
+    const peekR = arrDefOperandElemPeek(n.binRight)
+    if peekR >= 0 { rt = peekR }
+  }
+  if op == "==" || op == "!=" {
+    if constLitNeverMeets(n.binLeft, lt, n.binRight, rt, op, ix) { return true }
+    const keepL = eqKeepsWideLit(lt, rt)
+    const keepR = eqKeepsWideLit(rt, lt)
+    if !keepL {
+      lt = widenLitTy(lt)
+      ltOut[0] = lt
     }
-    if op == "==" || op == "!=" {
-      if constLitNeverMeets(n.binLeft, lt, n.binRight, rt, op, ix) {
-        return TY_BOOL
-      }
-      const keepL = eqKeepsWideLit(lt, rt)
-      const keepR = eqKeepsWideLit(rt, lt)
-      if !keepL {
-        lt = widenLitTy(lt)
-        ltOut[0] = lt
-      }
-      if !keepR { rt = widenLitTy(rt) }
-    } else {
-      rt = widenLitTy(rt)
-    }
-    // A store's value reading the place it writes: the value is what the program said the
-    // element is, and the read has no answer of its own until this pins one.
-    if lt < 0 {
-      const asgPin = asgReadElemPin(n.binLeft, rt)
-      if asgPin >= 0 {
-        lt = asgPin
-        ltOut[0] = asgPin // the out-column is the left operand's exact type, pin included
-      }
+    if !keepR { rt = widenLitTy(rt) }
+  } else {
+    rt = widenLitTy(rt)
+  }
+  // A store's value reading the place it writes: the value is what the program said the
+  // element is, and the read has no answer of its own until this pins one.
+  if lt < 0 {
+    const asgPin = asgReadElemPin(n.binLeft, rt)
+    if asgPin >= 0 {
+      lt = asgPin
+      ltOut[0] = asgPin // the out-column is the left operand's exact type, pin included
     }
   }
+  sides[0] = lt
+  sides[1] = rt
+  false
+}
+
+// Grades the `??` default of `n` (at `ix`, type `rt`) against the LHS's non-null shape `lt`;
+// answers the default's type, `TY_ERR` for a `void` default.
+function binCoalesceDefaultTy(n: BinExpr, ix: i32, lt: i32, rt0: i32): i32 {
+  let rt = rt0
   // The `??` default is the value produced when the LHS is null, so a `void` default leaves
   // nothing to produce — the other operators reject void through their own shape-demanding arms.
-  if op == "??" {
-    if voidValueSlotErr(rt, n.binRight, "`??` default", ix) { rt = TY_ERR }
-    // The default's destination is the LHS's non-null shape — the one position where a typed
-    // slot sits on the LEFT of the operator, which is why this needed its own pin (D1591).
-    constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
-    if lt >= 0 { lbiNoteCoalDefault(n.binRight, nonNullTy(lt)) }
+  if voidValueSlotErr(rt, n.binRight, "`??` default", ix) { rt = TY_ERR }
+  // The default's destination is the LHS's non-null shape — the one position where a typed
+  // slot sits on the LEFT of the operator, which is why this needed its own pin (D1591).
+  constrainEmptyExpr(n.binRight, rt, nonNullTy(lt))
+  if lt >= 0 { lbiNoteCoalDefault(n.binRight, nonNullTy(lt)) }
+  rt
+}
+
+// A radix literal operand of `n` takes the other side's width (the ruled literal rule), and an
+// `i32` literal tree beside an `i64` adopts it; updates the pair `sides` (`[lt, rt]`) in place.
+function binRadixAdoptSides(n: BinExpr, op: string, sides: i32[]) {
+  let lt = sides[0]
+  let rt = sides[1]
+  if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
+  if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
+  if lt == TY_I32 && rt == TY_I64 && op != "??" {
+    const lpa = litTreeAdoptDst(n.binLeft, rt)
+    if lpa >= 0 { lt = lpa }
   }
-  // A radix literal operand takes the other side's width (the ruled literal rule). Assignment is
-  // excluded: its destination is `assignableExpr`'s, which pins the narrowing direction too.
+  if rt == TY_I32 && lt == TY_I64 {
+    const rpa = litTreeAdoptDst(n.binRight, lt)
+    if rpa >= 0 { rt = rpa }
+  }
+  sides[0] = lt
+  sides[1] = rt
+  0
+}
+
+// Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
+function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
+  const op = n.binOp
+  if op == "in" { return checkInOpNode(n, ix) }
+  if op == "&&" || op == "||" { return checkLogicalBinNode(n, ix) }
+  const savedLbiTgt = lbiWriteTgt
+  let lt = binCheckLeftOperand(n, op)
+  ltOut.push(lt)
+  let rt = binCheckRightOperand(n, ix, op, lt, savedLbiTgt)
+  const sides: i32[] = [lt, rt]
+  if op != "=" {
+    if binRefineOperands(n, ix, op, sides, ltOut) { return TY_BOOL }
+    lt = sides[0]
+    rt = sides[1]
+  }
+  if op == "??" { rt = binCoalesceDefaultTy(n, ix, lt, rt) }
+  // Assignment is excluded: its destination is `assignableExpr`'s, which pins the narrowing
+  // direction too.
   if op != "=" && op != "&&" && op != "||" {
-    if radixLitAdoptPeer64(n.binLeft, rt) == 1 { lt = TY_I64 }
-    if radixLitAdoptPeer64(n.binRight, lt) == 1 { rt = TY_I64 }
-    if lt == TY_I32 && rt == TY_I64 && op != "??" {
-      const lpa = litTreeAdoptDst(n.binLeft, rt)
-      if lpa >= 0 { lt = lpa }
-    }
-    if rt == TY_I32 && lt == TY_I64 {
-      const rpa = litTreeAdoptDst(n.binRight, lt)
-      if rpa >= 0 { rt = rpa }
-    }
+    sides[0] = lt
+    sides[1] = rt
+    binRadixAdoptSides(n, op, sides)
+    lt = sides[0]
+    rt = sides[1]
   }
   // A re-check pushes the node again; `checkShiftCounts` grades each once.
   if binShiftOp(op) && intLitLexemeOf(n.binRight) != "" {

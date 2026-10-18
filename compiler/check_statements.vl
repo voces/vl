@@ -800,6 +800,65 @@ function ifEnterElseArm(
   0
 }
 
+// Checks the condition of `n`, refusing one that is not boolean, and collects the narrows it
+// makes in the then arm (`tnNames`/`tnTys`) and the else arm (`enNames`/`enTys`).
+function ifCheckCondNarrows(
+  n: IfStmt,
+  tnNames: string[],
+  tnTys: i32[],
+  enNames: string[],
+  enTys: i32[],
+) {
+  const condTy = checkNodeHook(n.ifCond)
+  if !assignable(condTy, TY_BOOL) {
+    tErr("if-condition must be boolean, got " + tyToStr(condTy), n.ifCond)
+  }
+  // Narrowing over a simple identifier: `is T` refines to the variant, `!= null`/`== null`
+  // refine a nullable. Union-complement narrowing after `is T` is deliberately excluded — it missed real errors.
+  collectThenNarrows(n.ifCond, tnNames, tnTys)
+  collectElseNarrows(n.ifCond, enNames, enTys)
+  0
+}
+
+// Enters the then arm of one link: its narrows `tnNames`/`tnTys` in a fresh scope and the
+// return-tail position `ifTail`. True when the last of `guardRows` now guards its returns.
+function ifEnterThenArm(
+  ifTail: boolean,
+  tnNames: string[],
+  tnTys: i32[],
+  guardRows: i32[],
+): boolean {
+  if tnNames.length > 0 {
+    pushScope(-1)
+    applyNarrows(tnNames, tnTys)
+  }
+  retTailPosSet(ifTail)
+  // Every `return` under this branch is reached only by an argument satisfying the guard's
+  // alternative — mark the branch so `noteInferredRet` records it as a guarded member.
+  const guardedRet = guardRows.length > 0
+  if guardedRet { guardAltStackPush(guardRows[guardRows.length - 1]) }
+  guardedRet
+}
+
+// Checks the then arm of `n` (at `ix`) as the value arm, or discarded with the `if`, on the
+// chain spine and under the condition's non-null facts, restoring all three after.
+function ifCheckThenBody(n: IfStmt, ix: i32) {
+  const thenArm = valueArmAt
+  if valDiscarded(ix) {
+    markValDiscard(n.ifThen)
+  } else {
+    valueArmAtSet(n.ifThen)
+  }
+  const thenSpine = spineAt
+  if ifChainSpine { spineAtSet(n.ifThen) }
+  const neMark = neEnter(n.ifCond, curFnDeclIx)
+  checkNodeHook(n.ifThen)
+  neLeave(neMark)
+  spineAtSet(thenSpine)
+  valueArmAtSet(thenArm)
+  0
+}
+
 // The head of one link: everything up to checking its else arm.
 function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // Am I the else arm of an enclosing `if`? Read and cleared here, so the flag reaches
@@ -822,18 +881,11 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   const seedLogMark = inferRetLogTy.length
   const seedObsMark = inferObserved
   const seedObsLit = inferObservedLit
-  const condTy = checkNodeHook(n.ifCond)
-  if !assignable(condTy, TY_BOOL) {
-    tErr("if-condition must be boolean, got " + tyToStr(condTy), n.ifCond)
-  }
-  // Narrowing over a simple identifier: `is T` refines to the variant, `!= null`/`== null`
-  // refine a nullable. Union-complement narrowing after `is T` is deliberately excluded — it missed real errors.
   const tnNames: string[] = []
   const tnTys: i32[] = []
-  collectThenNarrows(n.ifCond, tnNames, tnTys)
   const enNames: string[] = []
   const enTys: i32[] = []
-  collectElseNarrows(n.ifCond, enNames, enTys)
+  ifCheckCondNarrows(n, tnNames, tnTys, enNames, enTys)
   // What each tested place held on entry, before either arm's fact: the arm join's start for a
   // path that carries no fact of its own.
   const tnEnt = narKeysNowTys(tnNames)
@@ -848,32 +900,12 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // guarded-return marking must fire on every pass, since the real pass witnesses the call site.
   const guardRows: i32[] = []
   ifNoteGuardAlts(tnNames, tnTys, altRows, guardRows)
-  if tnNames.length > 0 {
-    pushScope(-1)
-    applyNarrows(tnNames, tnTys)
-  }
-  retTailPosSet(ifTail)
-  // Every `return` under this branch is reached only by an argument satisfying the guard's
-  // alternative — mark the branch so `noteInferredRet` records it as a guarded member.
-  const guardedRet = guardRows.length > 0
-  if guardedRet { guardAltStackPush(guardRows[guardRows.length - 1]) }
+  const guardedRet = ifEnterThenArm(ifTail, tnNames, tnTys, guardRows)
   // The arm's OWN statement depth: its block pushes one scope, so a write recorded at exactly
   // this depth runs whenever the arm does and a deeper one is conditional (D1846).
   const thenOwnDepth = T.scopes.length + 1
   const thenLo = narClobKeys.length
-  const thenArm = valueArmAt
-  if valDiscarded(ix) {
-    markValDiscard(n.ifThen)
-  } else {
-    valueArmAtSet(n.ifThen)
-  }
-  const thenSpine = spineAt
-  if ifChainSpine { spineAtSet(n.ifThen) }
-  const neMark = neEnter(n.ifCond, curFnDeclIx)
-  checkNodeHook(n.ifThen)
-  neLeave(neMark)
-  spineAtSet(thenSpine)
-  valueArmAtSet(thenArm)
+  ifCheckThenBody(n, ix)
   const thenHi = narClobKeys.length
   // The guard-clause divergence test, asked once the arm is checked so a `never` call in it is
   // marked (D1972): the post-guard leg, the `else if` hand-up and the emitter's
