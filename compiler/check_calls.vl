@@ -10,6 +10,7 @@ import {
   Node,
   OptMember,
   P,
+  Param,
   callHasTyArgs,
   callIsRestPacked,
   fillArgDefaults,
@@ -41,6 +42,7 @@ import {
   validateTpIfJoins,
 } from "./check_assignable"
 import { callBindNote, fsbDeclAtNode, fsbName } from "./check_bind_rows"
+import { crSubtreeMentions } from "./check_capture_walks"
 import { strLitRecvTy } from "./check_builtin_methods"
 import { builtinMethodNamesOf } from "./check_callee"
 import {
@@ -74,7 +76,12 @@ import {
   noteMemCstr,
   notePrintCstr,
 } from "./check_cstr_rows"
-import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
+import {
+  cstrOwnerStack,
+  inferQuiet,
+  tpEnvNames,
+  tpEnvTys,
+} from "./check_cursor"
 import {
   boundObjRootOf,
   memOffsetCheckedValue,
@@ -200,11 +207,14 @@ import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
 import { getSiteFnOf, parenPeelIx, placeKeyOf } from "./check_places"
 import { rcwKey } from "./check_record_writes"
 import {
+  GEN_FN_HOLE_UNCALLED,
   argMismatchErr,
   assignable,
   bindExplicitTyArgs,
   bindGenUnionArm,
   bindGenWalk,
+  genFnHoleCalled,
+  genFnHoleInstance,
   substTyDeep,
   tErr,
   tErrUnsupported,
@@ -219,9 +229,11 @@ import {
   numIntrShadowed,
 } from "./check_scopes"
 import {
+  holeArgLambdaHowOf,
   identNoteUse,
   isValBindLambda,
   noteDeferredJoinNode,
+  noteHoleArgLambda,
   noteValBindLambda,
   widenRetagGenArg,
   widenRetagGenArgSet,
@@ -284,9 +296,9 @@ import {
   wsNotePending,
   wsSuppress,
 } from "./check_width"
-import { peelParenIx } from "./check_write_effects"
+import { peelParenIx, weDigits } from "./check_write_effects"
 import { fnDeclIx } from "./check_write_scan"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 import {
   isVoidTy,
   nonNullTy,
@@ -1165,14 +1177,19 @@ function callFtyCheckArg(
     if cfn is Ident { owner = fnDeclIx[cfn.identName] ?? -1 }
     const hs = holeLambdaSeedTy(owner, params[i], bNames, bTys)
     if hs >= 0 { seedTy = hs }
-    // One the body hands on to a hole of the caller's is pinned with that hole (D5881).
+    // One the body hands on to a hole of the caller's is pinned with that hole (D5881); one it
+    // calls, or never reads, is instanced at this call's pin (`pinHoleLambdaVals`).
     const lx = parenPeelIx(args[i])
-    if (
-      hs < 0
-      && !isValBindLambda(lx)
-      && holeLambdaDefers(owner, params[i], bNames, bTys)
-    ) {
-      noteValBindLambda(lx)
+    if hs < 0 && !isValBindLambda(lx) {
+      if holeLambdaDefers(owner, params[i], bNames, bTys) {
+        noteValBindLambda(lx)
+      } else {
+        const how = holeParamUse(cfn, owner, params[i], i)
+        if how >= 0 {
+          noteValBindLambda(lx)
+          noteHoleArgLambda(lx, how)
+        }
+      }
     }
   }
   seedExpected(args[i], seedTy)
@@ -1384,6 +1401,10 @@ function callFtyPinCstrs(
   const wsVd = T.diags.length
   adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
   instGenFnHolePins(vNames, vTys, cstrCallee)
+  pinHoleLambdaVals(vNames, vTys, ix, cstrCallee)
+  if fsbName.length > 0 {
+    fsbGenFnHolePins(fsbDeclAtNode(n.callFn), vNames, vTys, cstrCallee)
+  }
   callBindNote(ix, vNames, vTys)
   pinBmCstrElems(vNames, vTys, ix, cstrCallee, args)
   if fsbName.length > 0 {
@@ -1530,8 +1551,20 @@ function pinHoleLambdaArg(
     pi = pi + 1
   }
   if fresh == 0 { return 0 }
+  judgeHoleLambdaAt(rat, rexp, nm, ty, ix)
+}
+
+// A lambda typed `lam` with hole parameters, delivered at the concrete function type `want`
+// with its holes bound in `nm`/`ty`: its body's demands are judged at that type.
+function judgeHoleLambdaAt(
+  lam: i32,
+  want: i32,
+  nm: string[],
+  ty: i32[],
+  ix: i32,
+) {
   const d0 = T.diags.length
-  holeFnDeliveryDemands(rat, rexp, ix, "this lambda")
+  holeFnDeliveryDemands(lam, want, ix, "this lambda")
   if T.diags.length > d0 { return 0 }
   const none: string[] = []
   const noNo: i32[] = []
@@ -1548,6 +1581,182 @@ function pinHoleLambdaArg(
   validateMemCstrs(nm, ty, ix, CSTR_NODECL, "", none, noNo, noNode)
   validateUfcsCstrs(nm, ty, ix, CSTR_NODECL, "")
   substNestModeSet(modeWas)
+  0
+}
+
+// A hole-generic function delivered to a hole of a marked written binding takes the instance the
+// calls its written lambdas make on that hole, so mono pins it rather than refusing (D5933).
+function fsbGenFnHolePins(
+  decl: i32,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+) {
+  if decl < 0 { return 0 }
+  const mode = substNestMode
+  if mode == SUBST_HOLES { substNestModeSet(SUBST_DECLARED) }
+  let k = 0
+  while k < vNames.length {
+    const vt = vTys[k]
+    if !tyIsForeignGenericSig(vt) && tyIsHoleGenericSig(vt) {
+      const own = genFnHoleInstance(vNames, vTys, k, vt, calleeFn)
+      if own >= 0 { vTys[k] = own }
+    }
+    k = k + 1
+  }
+  substNestModeSet(mode)
+  0
+}
+
+// Whether function type `ty` is the open signature of a top-level function with un-annotated
+// parameters whose body is not being checked: its first parameter hole is that function's.
+function tyIsHoleGenericSig(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const f = T.tys[ty]
+  if !(f is TyFunc) || f.fnParamTypes.length == 0 { return false }
+  const p0 = f.fnParamTypes[0]
+  const pv = T.tys[p0]
+  if !(pv is TyVar) || !tyIsHole(p0) { return false }
+  const nm = pv.tvName
+  const dot = nm.indexOf(".")
+  if nm.slice(0, 2) == "?#" || dot < 2 { return false }
+  const d = fnDeclIx[nm.slice(1, dot)] ?? -1
+  if d < 0 || d >= P.nodes.length || i32ListHas(cstrOwnerStack, d) {
+    return false
+  }
+  P.nodes[d] is FuncDecl
+}
+
+// How the callee's body uses its hole parameter `holeTy`, the `i`th: 0 when it calls it, 1 when
+// it never reads it, -1 otherwise or for a callee with no declaration in reach.
+function holeParamUse(cfn: Node, owner: i32, holeTy: i32, i: i32): i32 {
+  if holeTy < 0 || !tyIsHole(holeTy) { return -1 }
+  const hv = T.tys[holeTy]
+  if !(hv is TyVar) { return -1 }
+  let decl = owner
+  if decl < 0 && cfn is Ident { decl = lookupFnAliasNode(cfn.identName) }
+  let scope = CSTR_NODECL
+  if owner >= 0 { scope = owner }
+  if genFnHoleCalled(hv.tvName, scope) { return 0 }
+  if decl < 0 || decl >= P.nodes.length { return -1 }
+  const dn = P.nodes[decl]
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return -1 }
+  const pn = P.nodes[dn.fnParams[i]]
+  if !(pn is Param) || pn.parRest != 0 { return -1 }
+  if crSubtreeMentions(dn.fnBody, pn.parName) { return -1 }
+  1
+}
+
+// A lambda with hole parameters bound to a hole the callee's body calls is instanced at the
+// arguments of those calls, as a generic function there is (`instGenFnHolePins`), and its
+// body's demands are judged at that instance (D5935).
+function pinHoleLambdaVals(
+  vNames: string[],
+  vTys: i32[],
+  ix: i32,
+  calleeFn: i32,
+) {
+  let k = 0
+  while k < vNames.length {
+    const vt = vTys[k]
+    const lx = holeLambdaNodeOf(vt)
+    if lx >= 0 {
+      const how = holeArgLambdaHowOf(lx)
+      let inst = genFnHoleInstance(vNames, vTys, k, vt, calleeFn)
+      // One the body never reads is never called, so the default is unobservable (D5934).
+      const dflt = inst == GEN_FN_HOLE_UNCALLED && how == 1
+      if dflt { inst = holeLambdaAtI32(vt) }
+      if inst >= 0 {
+        const nm: string[] = []
+        const ty: i32[] = []
+        for v in vNames { nm.push(v) }
+        for t in vTys { ty.push(t) }
+        holeLambdaBinds(vt, inst, nm, ty)
+        const d0 = T.diags.length
+        judgeHoleLambdaAt(vt, inst, nm, ty, ix)
+        if dflt && T.diags.length > d0 {
+          while T.diags.length > d0 { T.diags.pop() }
+          inst = -1
+        }
+      }
+      if inst >= 0 { vTys[k] = inst }
+      else if how >= 0 { holeLambdaUninferable(lx) }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The lambda node whose parameter holes `ty` carries, -1 for a type with none.
+function holeLambdaNodeOf(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const f = T.tys[ty]
+  if !(f is TyFunc) { return -1 }
+  for p in f.fnParamTypes {
+    const pv = T.tys[p]
+    if pv is TyVar {
+      if tyIsHole(p) && pv.tvName.slice(0, 3) == "?#L" {
+        const dot = pv.tvName.indexOf(".")
+        if dot > 3 { return weDigits(pv.tvName.slice(3, dot)) }
+      }
+    }
+  }
+  -1
+}
+
+// `lam` with each of its lambda parameter holes at `i32`; -1 when that leaves a hole open.
+function holeLambdaAtI32(lam: i32): i32 {
+  const lf = T.tys[lam]
+  if !(lf is TyFunc) { return -1 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  for p in lf.fnParamTypes {
+    const pv = T.tys[p]
+    if pv is TyVar {
+      if tyIsHole(p) && pv.tvName.slice(0, 3) == "?#L" {
+        nm.push(pv.tvName)
+        ty.push(TY_I32)
+      }
+    }
+  }
+  const inst = substTyDeep(lam, nm, ty)
+  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst
+}
+
+// The refusal an argument lambda takes when its pin decides none of its parameters.
+function holeLambdaUninferable(lx: i32) {
+  if lx < 0 || lx >= P.nodes.length { return 0 }
+  const fd = P.nodes[lx]
+  if !(fd is FuncDecl) { return 0 }
+  for p in fd.fnParams {
+    const pn = P.nodes[p]
+    if pn is Param {
+      if pn.parType < 0 {
+        tErr("cannot infer a type for parameter `" + pn.parName + "`", p)
+        return 0
+      }
+    }
+  }
+  0
+}
+
+// Pushes onto `nm`/`ty` each lambda parameter hole of `lam` with the parameter type of `inst`.
+function holeLambdaBinds(lam: i32, inst: i32, nm: string[], ty: i32[]) {
+  const lf = T.tys[lam]
+  const xf = T.tys[inst]
+  if !(lf is TyFunc) || !(xf is TyFunc) { return 0 }
+  let pi = 0
+  while pi < lf.fnParamTypes.length && pi < xf.fnParamTypes.length {
+    const pv = T.tys[lf.fnParamTypes[pi]]
+    if pv is TyVar {
+      if tyIsHole(lf.fnParamTypes[pi]) && pv.tvName.slice(0, 3) == "?#L" {
+        nm.push(pv.tvName)
+        ty.push(xf.fnParamTypes[pi])
+      }
+    }
+    pi = pi + 1
+  }
   0
 }
 
