@@ -19,12 +19,7 @@ import {
 import { nodeRepTyIxOf } from "./check_core_state"
 import { isVarTyIxOf } from "./check_list_union"
 import { nodeTyIxOf } from "./check_node_tys"
-import {
-  nameIsLitUnionType,
-  nomErasedTyIx,
-  valueAtomKind,
-  valueRowKind,
-} from "./check_ty_rep"
+import { nomErasedTyIx, valueAtomKind, valueRowKind } from "./check_ty_rep"
 import {
   PrimName,
   T,
@@ -55,7 +50,6 @@ import {
   tyToEmitName,
 } from "./check_types"
 import {
-  nameIsLitUnionArray,
   objFieldVal,
   placeNarrowKeyOf,
   unionEqOperandOk,
@@ -91,8 +85,10 @@ import {
   sTyIx,
   uFieldElemName,
   uFieldElemTyIx,
+  uFieldNames,
   uFieldStart,
   uFieldTypes,
+  uVarTyIx,
 } from "./emit_state"
 import { memoKeyNew } from "./memo"
 import { strContains } from "./strutil"
@@ -197,56 +193,63 @@ export function sFieldTgtStructIdx(si: i32, fi: i32): i32 {
   structIndexByName(sFieldElemNameAt(si, fi))
 }
 
-// True if struct `si`'s field `fi` is a literal-union atom field (code 0 whose recorded
-// elem name is a literal union) — construction/read/assign seed the atom rep for it.
+// The arena type struct `si` declares for its field `fi`, read off the row's own type
+// (`sTyIx`, else an anonymous row's `sAnonOwnTy`); -1 when the row carries no object type.
+function sFieldRowTyAt(si: i32, fi: i32): i32 {
+  if si < 0 || si >= sTyIx.length { return -1 }
+  const nm = sFieldNames[sFieldStart[si] + fi]
+  const t = tyFieldTyOf(sTyIx[si], nm)
+  if t >= 0 { return t }
+  tyFieldTyOf(sAnonOwnTy.get(si) ?? -1, nm)
+}
+
+// `sFieldRowTyAt`'s variant twin, off the variant's own arena type (`uVarTyIx`).
+function uFieldRowTyAt(vi: i32, fj: i32): i32 {
+  if vi < 0 || vi >= uVarTyIx.length { return -1 }
+  tyFieldTyOf(uVarTyIx[vi], uFieldNames[uFieldStart[vi] + fj])
+}
+
+// True if struct `si`'s field `fi` is a literal-union atom field: code 0 whose element sidecar,
+// else the row's own field type, is a literal set. Tests `tyIsLitUnionOrLit` — a one-member set
+// is atom material at both of its spellings (D1460). False when neither type is known.
 export function sFieldIsLitUnion(si: i32, fi: i32) {
   if sFieldTypeAt(si, fi) != FC_I32 { return false }
-  // Arena leg: the sidecar records the arena type the field's element name denotes, so
-  // this answers structurally instead of re-classifying the rendered spelling. Tests
-  // `tyIsLitUnionOrLit`, not `tyIsLitUnion` — a one-member set is atom material at both
-  // of its spellings (D1460), reachable here only through `promoteLitFieldToAtom`.
   const ety = sFieldElemTyIxAt(si, fi)
   if ety >= 0 { return tyIsLitUnionOrLit(ety) }
-  const r = nameIsLitUnionType(sFieldElemNameAt(si, fi))
-  r
+  const fty = sFieldRowTyAt(si, fi)
+  fty >= 0 && tyIsLitUnionOrLit(fty)
 }
 
-// True if struct `si`'s field `fi` is an atom-array field (`f: K[]` — code 4 whose recorded
-// elem name is a litunion array). The field IS the i32 list; construction/assign seed the
-// atom-element context so member literals build the i32 backing (not a string list whose
-// wrapper ref would mismatch the field type).
+// True if struct `si`'s field `fi` is an atom-array field (`f: K[]`, code 4 over a literal
+// set), read off the same two types as `sFieldIsLitUnion`. The field IS the i32 list, so
+// construction and assignment seed the atom-element context for member literals.
 export function sFieldIsLitUnionArray(si: i32, fi: i32) {
   if sFieldTypeAt(si, fi) != FC_I32_LIST { return false }
-  // Arena leg (`sFieldIsLitUnion`'s array sibling): a code-4 field records its array
-  // type name, so `tyIsLitUnionArray` reads the `TyArray` structurally.
   const ety = sFieldElemTyIxAt(si, fi)
   if ety >= 0 { return tyIsLitUnionArray(ety) }
-  const r = nameIsLitUnionArray(sFieldElemNameAt(si, fi))
-  r
+  const fty = sFieldRowTyAt(si, fi)
+  fty >= 0 && tyIsLitUnionArray(fty)
 }
 
-// The union-variant twin of `sFieldIsLitUnionArray`: variant `vi`'s field `fj` is an
-// atom-array field (`f: K[]`, code 4 with a recorded litunion-array element name) — the
-// variant payload build seeds the atom context so the literal builds the i32 list of
-// atom ids, not a string list.
+// The variant twin of `sFieldIsLitUnionArray`: variant `vi`'s field `fj` is an atom-array
+// field, so the variant payload build seeds the atom context for its literal.
 export function variantFieldIsLitUnionArray(vi: i32, fj: i32) {
   if variantFieldTypeAt(vi, fj) != FC_I32_LIST { return false }
-  // Arena leg, off the `uFieldElemTyIx` sidecar (the struct twin above).
   const ety = uFieldElemTyIxAt(vi, fj)
   if ety >= 0 { return tyIsLitUnionArray(ety) }
-  nameIsLitUnionArray(variantFieldElemName(vi, fj))
+  const fty = uFieldRowTyAt(vi, fj)
+  fty >= 0 && tyIsLitUnionArray(fty)
 }
 
-// The union-variant twin of `sFieldIsLitUnion`: variant `vi`'s field `fj` is a
-// literal-union atom field (code 0 with a recorded litunion element name), so the
-// variant payload build and the atom-read classifier seed the atom rep for it — the
-// chokepoint for `emitVariantStruct`'s construct arm and `exprIsLitAtom`'s member read.
+// The variant twin of `sFieldIsLitUnion`: variant `vi`'s field `fj` is a literal-union atom
+// field, so `emitVariantStruct`'s construct arm and `exprIsLitAtom`'s member read seed the
+// atom rep for it.
 export function variantFieldIsLitUnion(vi: i32, fj: i32) {
   if variantFieldTypeAt(vi, fj) != FC_I32 { return false }
-  // `tyIsLitUnionOrLit`, for `sFieldIsLitUnion`'s reason (D1460).
   const ety = uFieldElemTyIxAt(vi, fj)
   if ety >= 0 { return tyIsLitUnionOrLit(ety) }
-  nameIsLitUnionType(variantFieldElemName(vi, fj))
+  const fty = uFieldRowTyAt(vi, fj)
+  fty >= 0 && tyIsLitUnionOrLit(fty)
 }
 
 // ── the struct-row name index ────────────────────────────────────────────────
