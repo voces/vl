@@ -109,6 +109,9 @@ let pmName: string[] = []
 let psPar: i32[] = []
 let psFn: i32[] = []
 let psName: string[] = []
+// Annotation `psRetype` of a binding a split parameter initializes takes `psRetypeName` with it.
+let psRetype: i32[] = []
+let psRetypeName: string[] = []
 
 function fsPlanReset(): i32 {
   pmCall = []
@@ -116,6 +119,8 @@ function fsPlanReset(): i32 {
   psPar = []
   psFn = []
   psName = []
+  psRetype = []
+  psRetypeName = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -666,6 +671,36 @@ function fsArgOfNamedFn(r: i32): boolean {
   arg && g >= 0 && g < P.nodes.length && P.nodes[g] is FuncDecl
 }
 
+// Whether read `r` of a split parameter meets no use of type parameter `tp` but its own: a
+// direct argument of a named function, or a binding annotated bare `tp` whose reads each are,
+// at most `depth` deep; a write to the binding is a use that declines. Each such annotation
+// is pushed to `out`, to take the new name (D6372).
+function fsTyParamReadSplits(
+  r: i32,
+  tp: string,
+  depth: i32,
+  out: i32[],
+): boolean {
+  if fsArgOfNamedFn(r) { return true }
+  const c = fsParent[r]
+  if depth <= 0 || c < 0 { return false }
+  const cn = P.nodes[c]
+  if !(cn is LetDecl) || cn.letInit != r || cn.letType < 0 { return false }
+  const tn = P.nodes[cn.letType]
+  if !(tn is TypeRef) || tn.tyName != tp { return false }
+  for x in fsIdents {
+    if (
+      x != c
+      && identDeclOf(x) == c
+      && !fsTyParamReadSplits(x, tp, depth - 1, out)
+    ) {
+      return false
+    }
+  }
+  out.push(cn.letType)
+  true
+}
+
 // Each asked parameter, annotated with a bare type parameter of its function, takes a type
 // parameter of its own; the function's other reads of the old one stay with it (D6200). A
 // function called with type arguments declines. 0 with a plan, 1 with none.
@@ -674,6 +709,7 @@ function fsPlanTyParams(): i32 {
   for o in fsTpAsks {
     const p = P.nodes[o]
     const fd = fsParent[o]
+    const retype: i32[] = []
     let ok = p is Param && p.parType >= 0 && fd >= 0 && P.nodes[fd] is FuncDecl
     let tp = ""
     if ok && p is Param {
@@ -693,16 +729,26 @@ function fsPlanTyParams(): i32 {
       ) {
         ok = false
       }
-      // The parameter is read only as a direct argument of a named function, so no read can
-      // meet the old type parameter.
-      if ok && r != o && identDeclOf(r) == o && !fsArgOfNamedFn(r) {
+      // The parameter is read only as a direct argument of a named function or into a binding
+      // retyped with it, so no read can meet the old type parameter.
+      if (
+        ok
+        && r != o
+        && identDeclOf(r) == o
+        && !fsTyParamReadSplits(r, tp, 4, retype)
+      ) {
         ok = false
       }
     }
     if ok && p is Param {
+      const nm = tp + "$t" + i32ToStr(o)
       psPar.push(o)
       psFn.push(fd)
-      psName.push(tp + "$t" + i32ToStr(o))
+      psName.push(nm)
+      for t in retype {
+        psRetype.push(t)
+        psRetypeName.push(nm)
+      }
       rc = 0
     }
   }
@@ -742,8 +788,9 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
       const m = fsParent[r]
       if m < 0 { return 1 }
       const mn = P.nodes[m]
-      if !(mn is Member) || mn.memObj != r { return 1 }
-      if mn.memProp == fin.fiName {
+      const whole = !(mn is Member) || mn.memObj != r
+      if whole && !fsWholeReadSkips(r, fin.fiName, 4) { return 1 }
+      if mn is Member && !whole && mn.memProp == fin.fiName {
         const c = fsParent[m]
         if c < 0 || !fsCallsVia(c, m) { return 1 }
         const key = fsReadKey(m)
@@ -778,6 +825,45 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
     }
   }
   0
+}
+
+// Whether read `r` of a record hands it on only where field `fld` is never read: to an
+// un-annotated parameter of a declared function, or as an un-annotated `const`'s initializer,
+// whose reads each read another field or hand it on again, at most `depth` times (D6371).
+function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
+  if depth <= 0 { return false }
+  let d = fsHoleFwd(r)
+  // A declared parameter type is a delivery this plan does not convert.
+  if d >= 0 {
+    const pn = P.nodes[d]
+    if pn is Param && pn.parType >= 0 { return false }
+  }
+  const c = fsParent[r]
+  if d < 0 && c >= 0 {
+    const cn = P.nodes[c]
+    if (
+      cn is LetDecl
+      && cn.letInit == r
+      && cn.letType < 0
+      && cn.letKw == "const"
+    ) {
+      d = c
+    }
+  }
+  if d < 0 { return false }
+  for x in fsIdents {
+    if identDeclOf(x) == d && x != d {
+      const m = fsParent[x]
+      if m < 0 { return false }
+      const mn = P.nodes[m]
+      if mn is Member && mn.memObj == x {
+        if mn.memProp == fld { return false }
+      } else if !fsWholeReadSkips(x, fld, depth - 1) {
+        return false
+      }
+    }
+  }
+  true
 }
 
 // The field slots of `const` `d`: each of its fields when it is a record, and each field it is
@@ -2149,6 +2235,12 @@ function fsApply(): i32 {
     } else {
       rc = -1
     }
+    i = i + 1
+  }
+  i = 0
+  while i < psRetype.length {
+    const tn = P.nodes[psRetype[i]]
+    if tn is TypeRef { tn.tyName = psRetypeName[i] } else { rc = -1 }
     i = i + 1
   }
   i = 0
