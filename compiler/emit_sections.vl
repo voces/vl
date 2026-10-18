@@ -5893,12 +5893,7 @@ function emitModule(_stmts: i32[]) {
   // inline in the global section: its cell is zero-initialized there, and a single synthetic
   // start function (the last function index, so no user index shifts) runs every such init via `global.set` first. `computeGlobalPromotion` runs here so it sees the arena every pass left behind, before any section reads a global index.
   computeGlobalPromotion()
-  let nNonConst = 0
-  let gci = 0
-  while gci < globalStmts.length {
-    if globalRunsInStartFn(gci) { nNonConst = nNonConst + 1 }
-    gci = gci + 1
-  }
+  const nNonConst = nonConstGlobalCount()
   let hasStart = 0
   if nNonConst > 0 { hasStart = 1 }
   if startStmts.length > 0 { hasStart = 1 }
@@ -5932,31 +5927,7 @@ function emitModule(_stmts: i32[]) {
   // counter inside `mAssignTypeIndices`, which returns the functype base index (`typeOffset`); the heap types and the closure-signature pool emit inside one recursion group, so one may reference another that lands later.
   const typeOffset = mAssignTypeIndices(n)
 
-  // Each type's byte form lives at its emit site in `emitTypeSection`, which is also where the
-  // standalone-vs-rec-group split for the print functypes is explained. `nPrintTypes` is
-  // counted here, in the coordinator, because two sections need it: the type section (whose
-  // rec-group count excludes the standalone print functypes) and the function section (whose `__log__` functype index sits past them). A print-free program counts 0.
-  let nPrintTypes = 0
-  if gImports > 0 {
-    nPrintTypes = 2 // (i32)->() and ()->() for the print imports
-  }
-  if gNeedsI64Print {
-    nPrintTypes = nPrintTypes + 1 // + (i64)->() for __print_i64__
-  }
-  if gNeedsF64Print {
-    nPrintTypes = nPrintTypes + 1 // + (f64)->() for __print_f64__
-  }
-  if gNeedsF32Print {
-    nPrintTypes = nPrintTypes + 1 // + (f32)->() for __print_f32__
-  }
-  // One standalone functype per used fs import, folded into `nPrintTypes` rather than threaded
-  // as a seventh parameter — every downstream index (the `__log__` functype, `helpTyBase`, the
-  // export-wrapper block, the rectype count) is already expressed in terms of this number. One
-  // per used import, not one per distinct shape: sharing would make slot k's functype depend on which other slots the program uses, the coupling the append-only slot order exists to avoid.
-  nPrintTypes = nPrintTypes + fsImportCount()
-  // …and one per declared extern, on the same terms and trailing the fs block, so an extern
-  // added to a program moves no earlier functype index.
-  nPrintTypes = nPrintTypes + externCount()
+  const nPrintTypes = printFnTypeCount()
 
   emitTypeSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
@@ -5964,47 +5935,15 @@ function emitModule(_stmts: i32[]) {
 
   emitFunctionSection(n, typeOffset, hasStart, memFn, nPrintTypes, nHelpers)
 
-  // Table section (id 4, between function (3) and memory (5)): the one `funcref` table function
-  // values dispatch through, sized to cover every user function at its own wasm index (`gImports
-  // + i`), so the id a closure already stores is the table slot. Sized for all of them, not for
-  // the filled ones: the size is written four sections before the bodies decide which those are.
-  if fnValUsed {
-    const tabPayload: u8[] = []
-    const tabPrev = wTarget(tabPayload)
-    wULEB(1)            // 1 table
-    wU8(112)            // 0x70 funcref element type
-    wU8(0)              // limits flag 0x00: min only
-    wULEB(gImports + n) // min: every user function, at its own index
-    wTarget(tabPrev)
-    wSection(4, tabPayload)
-  }
+  if fnValUsed { emitTableSection(n) }
 
-  // Memory section (id 5, between function (3) and global (6)): one module-defined memory, its
-  // limits from `emitMemoryLimits`. Emitted only when a memory intrinsic is used, and not at all when the
-  // host opted into importing it (`memImported`) — the import section then carries it.
-  if memUsed && !memImported() {
-    const memPayload: u8[] = []
-    const memPrev = wTarget(memPayload)
-    wULEB(1) // 1 memory
-    emitMemoryLimits()
-    wTarget(memPrev)
-    wSection(5, memPayload)
-  }
+  if memUsed && !memImported() { emitMemorySection() }
 
   emitGlobalSection()
 
   emitExportSection(n)
 
-  // Start section (id 8): names the function the runtime invokes once at instantiation, before
-  // any export is callable — here the synthetic start fn that runs the non-const global
-  // initializers. Sits after the export section (7) and before the code section (10); omitted entirely when no non-const global exists.
-  if hasStart == 1 {
-    const startPayload: u8[] = []
-    const stPrev = wTarget(startPayload)
-    wULEB(startFnIdx)
-    wTarget(stPrev)
-    wSection(8, startPayload)
-  }
+  if hasStart == 1 { emitStartSection(startFnIdx) }
 
   // The code payload is BUILT here and framed below, after the element section it feeds:
   // lowering a function value is what marks `fnAddrTaken`, so building first is what lets the
@@ -6024,34 +5963,7 @@ function emitModule(_stmts: i32[]) {
   frameGlobalSection()
   frameFunctionSection()
 
-  // Element section (id 9): one active segment per run of address-taken functions, filling
-  // entry `gImports + i` with function `i`, or its thunk when `i` has no env param, so
-  // `call_indirect` needs no translation. Other entries stay null: `markFnAddrTaken`
-  // records the one site that mints an id, so no expression can call them.
-  if fnValUsed {
-    const elemRuns = fnAddrTakenRuns(n)
-    if elemRuns > 0 {
-      const elemPayload: u8[] = []
-      const elPrev = wTarget(elemPayload)
-      wULEB(elemRuns)
-      let di = elemNextTaken(0, n)
-      while di < n {
-        const de = elemRunEnd(di, n)
-        wU8(0)         // flags 0x00: active, table 0, offset expr + func-index vec
-        wU8(65)        // 0x41 i32.const — the offset expr
-        wSLEB(gImports + di)
-        wU8(11)        // 0x0b end
-        wULEB(de - di) // count of table entries this run writes
-        while di < de {
-          wULEB(tableEntryFnIdx(di)) // func index (imports occupy 0..gImports-1)
-          di = di + 1
-        }
-        di = elemNextTaken(di, n)
-      }
-      wTarget(elPrev)
-      wSection(9, elemPayload)
-    }
-  }
+  if fnValUsed { emitElementSection(n) }
 
   emitDataCountSection()
   if writeCodeSection(codePayload) < 0 { return -1 }
@@ -6067,6 +5979,107 @@ function emitModule(_stmts: i32[]) {
     )
   }
   0
+}
+
+// How many module globals run their initializer in the synthetic start function.
+function nonConstGlobalCount() {
+  let nNonConst = 0
+  let gci = 0
+  while gci < globalStmts.length {
+    if globalRunsInStartFn(gci) { nNonConst = nNonConst + 1 }
+    gci = gci + 1
+  }
+  nNonConst
+}
+
+// The standalone functypes ahead of the rec group: the print imports', then one per used fs
+// import and one per declared extern, each block trailing the last, so adding one moves no
+// earlier functype index. The type and function sections both read it; a print-free program
+// counts 0. `emitTypeSection` explains the standalone-vs-rec-group split.
+function printFnTypeCount() {
+  let nPrintTypes = 0
+  if gImports > 0 {
+    nPrintTypes = 2 // (i32)->() and ()->() for the print imports
+  }
+  if gNeedsI64Print {
+    nPrintTypes = nPrintTypes + 1 // + (i64)->() for __print_i64__
+  }
+  if gNeedsF64Print {
+    nPrintTypes = nPrintTypes + 1 // + (f64)->() for __print_f64__
+  }
+  if gNeedsF32Print {
+    nPrintTypes = nPrintTypes + 1 // + (f32)->() for __print_f32__
+  }
+  // One per used import, not one per distinct shape: sharing would make slot k's functype
+  // depend on which other slots the program uses, the coupling the append-only slot order
+  // exists to avoid.
+  nPrintTypes = nPrintTypes + fsImportCount()
+  nPrintTypes = nPrintTypes + externCount()
+  nPrintTypes
+}
+
+// The table section (id 4): the one `funcref` table function values dispatch through, sized
+// to every user function at its own wasm index (`gImports + i`), so a closure's stored id is
+// its table slot — all of them, since the size is written before the bodies decide which fill.
+function emitTableSection(n: i32) {
+  const tabPayload: u8[] = []
+  const tabPrev = wTarget(tabPayload)
+  wULEB(1)            // 1 table
+  wU8(112)            // 0x70 funcref element type
+  wU8(0)              // limits flag 0x00: min only
+  wULEB(gImports + n) // min: every user function, at its own index
+  wTarget(tabPrev)
+  wSection(4, tabPayload)
+}
+
+// The memory section (id 5): one module-defined memory, its limits from `emitMemoryLimits`.
+// Emitted only when a memory intrinsic is used and the host does not import the memory.
+function emitMemorySection() {
+  const memPayload: u8[] = []
+  const memPrev = wTarget(memPayload)
+  wULEB(1) // 1 memory
+  emitMemoryLimits()
+  wTarget(memPrev)
+  wSection(5, memPayload)
+}
+
+// The start section (id 8): names `startFnIdx`, the synthetic start function that runs the
+// non-const global initializers once at instantiation, before any export is callable.
+function emitStartSection(startFnIdx: i32) {
+  const startPayload: u8[] = []
+  const stPrev = wTarget(startPayload)
+  wULEB(startFnIdx)
+  wTarget(stPrev)
+  wSection(8, startPayload)
+}
+
+// The element section (id 9): one active segment per run of address-taken functions, filling
+// entry `gImports + i` with function `i`, or its thunk when `i` has no env param, so
+// `call_indirect` needs no translation. Other entries stay null: `markFnAddrTaken` records the
+// one site that mints an id, so no expression can call them. Omitted when none is taken.
+function emitElementSection(n: i32) {
+  const elemRuns = fnAddrTakenRuns(n)
+  if elemRuns > 0 {
+    const elemPayload: u8[] = []
+    const elPrev = wTarget(elemPayload)
+    wULEB(elemRuns)
+    let di = elemNextTaken(0, n)
+    while di < n {
+      const de = elemRunEnd(di, n)
+      wU8(0)         // flags 0x00: active, table 0, offset expr + func-index vec
+      wU8(65)        // 0x41 i32.const — the offset expr
+      wSLEB(gImports + di)
+      wU8(11)        // 0x0b end
+      wULEB(de - di) // count of table entries this run writes
+      while di < de {
+        wULEB(tableEntryFnIdx(di)) // func index (imports occupy 0..gImports-1)
+        di = di + 1
+      }
+      di = elemNextTaken(di, n)
+    }
+    wTarget(elPrev)
+    wSection(9, elemPayload)
+  }
 }
 
 // `emitModule`'s shared-helper index assignment: resets every `gHelp*` index, then gives each
