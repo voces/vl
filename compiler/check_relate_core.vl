@@ -307,6 +307,7 @@ import {
   argPinNode,
   argPinWant,
   cstrOwnedBy,
+  joinClashMsg,
   joinClashMsgSet,
   shMemo,
   shMemoPut,
@@ -1938,6 +1939,33 @@ function refoldJoinUnion(
     i = i + 1
   }
   if !anyDead && !changed { return tyIx }
+  const res = refoldJoinLive(tyIx, subst, orig, bNames, bTys)
+  // Every arm proven dead is not a type — keep the union rather than invent one.
+  if res < 0 { return mkUnionTy(subst) }
+  res
+}
+
+// `refoldJoinUnion`'s re-join of deferred join `tyIx` at member types `subst`, every member live:
+// what a hole instance's join reads as once each member is read at its bindings. -1 where the
+// members clash. Reads, noting no pin (D2921).
+export function holeJoinRefoldOf(tyIx: i32, subst: i32[]): i32 {
+  if !isJoinHoleUnion(tyIx) { return -1 }
+  const savedClash = joinClashMsg
+  const res = refoldJoinLive(tyIx, subst, [], [], [])
+  joinClashMsgSet(savedClash)
+  if res == TY_ERR { return -1 }
+  res
+}
+
+// The re-join of `subst`'s members `orig` does not prove dead at `bNames`/`bTys` (every member,
+// where `orig` is empty); -1 when none is live.
+function refoldJoinLive(
+  tyIx: i32,
+  subst: i32[],
+  orig: i32[],
+  bNames: string[],
+  bTys: i32[],
+): i32 {
   let res = -1
   let live = 0
   let j = 0
@@ -1945,8 +1973,8 @@ function refoldJoinUnion(
   lamCheckDepth = lamCheckDepth + 1
   lamRefoldDepth = lamRefoldDepth + 1
   const apart = apartHoleJoins.get(tyIx) ?? false
-  while j < orig.length {
-    if !holeMemberDeadAt(orig[j], bNames, bTys) {
+  while j < subst.length {
+    if orig.length == 0 || !holeMemberDeadAt(orig[j], bNames, bTys) {
       njApartRetSet(apart)
       res = joinRetTys(res, subst[j])
       njApartRetSet(false)
@@ -1956,8 +1984,7 @@ function refoldJoinUnion(
   }
   lamCheckDepth = lamCheckDepth - 1
   lamRefoldDepth = lamRefoldDepth - 1
-  // Every arm proven dead is not a type — keep the union rather than invent one.
-  if live == 0 || res < 0 { return mkUnionTy(subst) }
+  if live == 0 || res < 0 { return -1 }
   // The null `paramNullJoin` kept stays: re-joined here, outside the body that declared the
   // holes, the caller's holes would absorb it (D3497).
   if paramNullJoins.has(tyIx) && !isNullTy(res) && !tyBearsNull(res) {
