@@ -1191,6 +1191,186 @@ work. Under Q4 (A) neither asks a user to annotate anything.
 - **Still open** from step 4: banking the edited module's importer demands, and global index
   assignment (S6).
 
+**S5 step 7: a per-imported-name reach replaces the per-module deep hash** (`ihReachOf` in
+`compiler/iface_hash.vl`, `skSettle` and `skBankNow` in `compiler/driver.vl`). Through step 6,
+a served module declined whenever the deep hash of any S module it imports moved. That hash
+covers everything the S module exposes, so an edit to an export the importer never names
+still declined it. Now each (importer, origin) pair banks a reach hash. The check declines
+only when that reach hash changed, or when one of the global conditions below holds.
+
+*What a reach is.* `ihReachOf(i, o)` covers what importer `i`'s check can observe of origin
+`o` and of the modules below `o`. It is the sum of:
+- one row per import from `o`: the local name, the origin name, and how many of `o`'s
+  statements carry that name;
+- a closure over statement rows. It starts from the statements those imports name, then
+  follows every identifier their hashed tokens spell, every type name their checked type
+  renders, and every cross-module import those identifiers resolve through. Only modules
+  below `o` are followed;
+- a callee closure: each function that a reached body calls gives its mention rows. A *live*
+  function gives its whole tokens instead. A live function's body assigns or calls a method,
+  and it is handed a reference or names a top-level binding.
+
+The sum does not depend on order. The successor lists and the downward module sets are built
+once per statement and per module. A reach therefore costs its own closure, not the table.
+
+*The pairs.* `skPairs` pairs an import of a re-exported name with the module that declares
+the name (`modExportOrigin`). A namespace import is paired with the module it names. After a
+check of S, every pair whose importer is served and whose origin is in S has its reach
+recomputed. A reach that moved, or one the bank does not hold, declines with `interface`.
+
+*The soundness argument.* A served module's banked result equals a whole check when nothing
+its check reads has changed. The argument lists each way the check of a served importer `i`
+reads S, and names what covers it.
+
+1. **The names `i` imports.**
+   - *What it reads:* their declared and inferred interfaces, and the types those mention.
+   - *What covers it:* the start of the closure. A cut body's mention rows stand in for the
+     body. An inferred return carries its checked type, and an elided type folds in the body's
+     tokens (step 4b).
+2. **Inferred-binding joins.** An un-annotated binding's type is a join over every module's
+   uses of it.
+   - *What it reads:* the joined type.
+   - *What covers it:* the binding's rendered checked type is in the reach, and `skInferred`
+     with `ihPlainBinding` admits it only when the check of S alone renders the same plain
+     type. The served modules' unchanged uses then fit that type again (the step-6
+     argument). A function type stays open, because a call re-checks the lambda at the
+     caller's types. An elided type also stays open.
+   - *Witnesses:* a lib body that starts widening or adopting a binding `main` reads.
+3. **Record adoption.** A literal can adopt a record type that another module spells without
+   importing it. Adoption therefore reads statements that no import names.
+   - *Ambient statements* (`ihAmbientScan`) are the statements no import can see: type and
+     union declarations; any statement whose `TypeRef`, `is` or `as` spelling holds `{`; and
+     every receiver-found function (`self` methods, getters, operators).
+   - *R1:* when S is non-empty, a served module that holds an ambient statement declines with
+     `ambient`. S is checked without the served modules merged, and a whole check of S could
+     have read that statement unimported.
+   - *F2:* an S module whose ambient digest (reading 6) moved declines with `ambient`, because
+     a served module's banked check read that digest.
+   - *Witnesses:* three cases, adoption in each direction plus a private type.
+4. **Global writes through called functions, and narrowing invalidation.** Under D2390 (a), a
+   call that may write a narrowed binding or field ends the narrowing. So `i`'s diagnostics
+   depend on whether a callee in S writes.
+   - *What covers it:* a live body gives its whole tokens, which include the writes. The
+     callee closure carries a write made in a helper, through an alias, or through an
+     argument.
+   - *Witnesses:* a callee's write, a helper's write and an alias write that each move to the
+     narrowed field; and a callee that starts calling a writer.
+5. **Resolution that a new export could change.**
+   - *Overloads:* an import row holds the number of statements in `o` that carry the name. A
+     second overload therefore moves the reach, and `skClosed` reads a name with more than one
+     function as `SK_OPEN`, which declines with `demand` at plan time.
+   - *Receiver calls:* a receiver-found function is ambient, so adding one moves S's ambient
+     digest (F2).
+   - *Near-name suggestions:* a suggestion that reaches into another module names a type or
+     a receiver function, and both are ambient. An undeclared plain call suggests nothing
+     from an unimported module. A probe calling `helper()` beside a lib that declares
+     `helpr` and exports `helpz` reads only `undeclared identifier 'helper'`.
+   - *Other names:* any other new export is invisible to an importer that does not name it.
+     The `added export` and `removed export` cases now serve.
+6. **Re-exports.**
+   - *Pairing:* each pair runs from the importer to the module that declares the name, so a
+     reach follows the declaration and not the re-exporting module.
+   - *Served re-exporters:* a served module whose own import resolution (reading 8) moved
+     declines with `interface`. That covers a re-export list in S that grows or drops a name.
+7. **Diagnostic text and positions.**
+   - *Text:* a served diagnostic may name S's declarations. Whenever a served diagnostic is
+     banked, an S module whose every-statement digest (reading 7) moved declines with
+     `decor`.
+   - *Positions:* the span rule is unchanged from step 6.
+8. **Fresh builders.** An inferred non-scalar return that a served importer reaches declines
+   with `fresh`. The check of a fresh record built at several call sites joins those sites,
+   and the served sites would be missing from S's check.
+9. **Missing ingredients.** Anything the check reads that is not in the reach or the readings
+   is a decline by default. A bank with no entry for the module declines with `interface`. A
+   changed module set declines with `graph`. An edit to the entry declines with `all`. A fresh
+   diagnostic outside S declines with `stray`.
+
+*What stays declined.*
+- At plan time, as `demand`:
+  - an import of a generic, overloaded, hole-parameter or defaulted function from S, since
+    its call re-checks an instance and can reach the origin's own diagnostics;
+  - a function-valued inferred binding;
+  - a namespace import of an S module.
+- `ambient`: every R1 and F2 case. R1 is the bar the compiler graph hits, because nearly
+  every compiler module declares a type.
+- `fresh` and `decor`: conservative guards. Neither has a mutation witness. Dropping decor
+  (`IH_NO_DECOR`) gives 0 unsound, and master's per-module hash served two of the fresh
+  cases soundly. Those two now decline. They are kept because the argument for serving them is not written, and the bar is
+  "a served result must equal a full check".
+- `all`, `graph`, `stray`, `span`: as in step 6.
+
+*Differential suite* (`tests/vl_check_skip_test.ts`): 56 edits. Each is graded with `main`
+clean and with errors, against an unarmed check, row for row, with a byte-identical build.
+- **Counts:** 18 must serve, 35 must decline, and 3 may do either (master's suite: 15, 18 and 3).
+- **`badWhy`:** a must-serve case can name the decline it takes when `main` holds errors. The
+  three new must-serve cases decline with `decor` then, because a served diagnostic may spell
+  the edited signature.
+- **Master against this branch:** master's seed run over the same suite serves **8 edits
+  wrongly**. Each is wrong in both faces, and each loses a diagnostic the whole check gives.
+  Master's shipped skip (#4107, armed in the LSP by #4102) is therefore unsound on these
+  shapes:
+
+| edit | master | now |
+| --- | --- | --- |
+| a lib body annotation spells main's literal record | served, **wrong** | ambient |
+| main's private type spells a lib body literal's record | served, **wrong** | ambient |
+| field write moves | served, **wrong** | ambient |
+| alias write moves | served, **wrong** | ambient |
+| a callee's write moves to the narrowed field | served, **wrong** | interface |
+| a callee's helper write moves to the narrowed field | served, **wrong** | interface |
+| a callee's alias write moves to the narrowed field | served, **wrong** | interface |
+| a callee's argument write moves to the narrowed field | served, **wrong** | ambient |
+| signature edit of an export main does not import | interface | **served** |
+| signature edit of a private callee only an unimported export calls | interface | **served** |
+| type edit of a binding main does not import | interface | **served** |
+| added export | interface | **served** |
+| removed export | interface | **served** |
+| a served call is a second site of a fresh builder | served | fresh |
+| a lib call stops delivering a fresh builder to a wider record | served | fresh |
+| a lib call starts delivering a fresh builder to a wider record | interface | fresh |
+| a lib call becomes a second site of a fresh builder | interface | ambient |
+| record type edit; main adopts an inferred binding; four private-type and typo cases | interface | ambient |
+
+Every other edit gives the same answer on both seeds.
+
+*Mutation witnesses* (`ifaceHashDrop`). Each mask serves its witness unsoundly:
+
+| mask | ingredient dropped | witness |
+| --- | --- | --- |
+| 64 \| 16 | inferred return type, mentions | inferred-return change |
+| 32768 \| 16 | live bodies, mentions | a callee main narrows across starts writing the binding |
+| 8 \| 16 | types, mentions | a lib body starts widening a number binding main reads |
+| 8 \| 16 | types, mentions | a lib body starts adopting an inferred binding main reads |
+| 16384 | ambient statements | the three adoption cases |
+| 32768 | live bodies | the callee, helper and alias write cases |
+
+*Replays.* Each commit is an edit to the previous tree. The armed re-check is graded against
+an unarmed one.
+
+| graph | master's seed | this branch | unsound |
+| --- | --- | --- | --- |
+| `compiler/entry.vl`, last 30 commits (217 modules) | 28 interface, 2 all | 28 ambient, 2 all | 0 |
+| same, ambient dropped (16384) | — | 28 fresh, 2 all | 0 |
+| same, ambient and fresh dropped (81920), first 12 | — | 10 interface, 2 all | 0 |
+| diderven `src/game.vl`, last 30 commits (read-only copy) | 3 served, 14 demand, 10 graph, 3 all | the same, commit for commit | 0 |
+
+The compiler graph is still served 0 of 30 times. The three conditions line up as follows:
+- R1 declines first.
+- With R1 dropped, `fresh` declines next.
+- With both dropped, the reaches really move, because a refactor commit edits the names its
+  importers call.
+
+On diderven, the served commits serve 180–183 modules. The declines there are plan-time
+`demand` (un-annotated parameters) and graph changes, which a reach cannot move.
+
+- **Cost.** The seed is 6,489,382 → 6,519,180 bytes (+29,798, +0.46%), and it is a fixpoint.
+  L2 self-compile guest fuel:
+  - master's seed on master's source: 103,933,023,919;
+  - this branch's seed on its own source: 104,587,960,144 (+0.63%);
+  - master's seed on this branch's source: 104,587,959,877.
+
+  The unarmed path therefore costs nothing, and the +0.63% is the size of the added source.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.
