@@ -1209,58 +1209,135 @@ fn parse_byte_size(v: &str) -> Option<u64> {
     (bytes <= 1 << 32).then_some(bytes)
 }
 
-/// Copying-collector cycles in the current process, counted only while
-/// `$VL_GC_STATS=1` (`maybe_install_gc_stats`). A debug facility for the C1
-/// regression guard (`tests/vl_gc_heap_shape_test.ts`,
-/// `bench/collections/live-set-churn`): this wasmtime version exposes no public
-/// per-collection counter, so the count comes from its own trace log, which
-/// prints "Begin copying collection" once per cycle at `log::Level::Trace`.
+/// Copying-collector cycles in the current process, from wasmtime's trace log ("Begin copying
+/// collection", once per cycle): this version exposes no public counter. Printed under
+/// `$VL_GC_STATS=1` for the C1 regression guard (`tests/vl_gc_heap_shape_test.ts`).
 static GC_COLLECTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// The largest heap occupancy any collection left behind, from the same trace log
-/// ("After collection, GC heap's allocated bytes = 0x…"): the peak live set as seen at a
-/// collection. `vl build` prints it under `$VL_GC_STATS=1` next to the count.
+/// The largest heap occupancy any collection left behind ("After collection, GC heap's
+/// allocated bytes = 0x…"): the peak live set as seen at a collection.
 static GC_MAX_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// What this thread's collections last reported, for `SeedGcHeadroom`: how many there
+/// were, the live bytes the latest left, and the heap's size before and after its latest
+/// growth. Per thread because a store collects on the thread that runs it.
+#[derive(Clone, Copy, Default)]
+struct GcSeen {
+    collections: u64,
+    live: u64,
+    grown_from: u64,
+    grown_to: u64,
+}
+
+thread_local! {
+    static GC_SEEN: std::cell::Cell<GcSeen> = const {
+        std::cell::Cell::new(GcSeen { collections: 0, live: 0, grown_from: 0, grown_to: 0 })
+    };
+}
 
 struct GcStatsLog;
 
+/// The log targets carrying the three messages `GcStatsLog` reads.
+const GC_LOG_TARGETS: [&str; 3] = [
+    "wasmtime::runtime::vm::gc",
+    "wasmtime::runtime::vm::gc::enabled::copying",
+    "wasmtime::runtime::store::gc",
+];
+
+/// A `fmt::Write` keeping the first 96 bytes of a message, so reading one allocates nothing.
+struct LogPrefix {
+    buf: [u8; 96],
+    len: usize,
+}
+
+impl std::fmt::Write for LogPrefix {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+/// The hex number at the start of `s`, up to its first non-hex byte.
+fn leading_hex(s: &str) -> Option<u64> {
+    let end = s.find(|c: char| !c.is_ascii_hexdigit()).unwrap_or(s.len());
+    u64::from_str_radix(&s[..end], 16).ok()
+}
+
 impl log::Log for GcStatsLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() == log::Level::Trace && metadata.target().starts_with("wasmtime")
+        metadata.level() == log::Level::Trace && GC_LOG_TARGETS.contains(&metadata.target())
     }
     fn log(&self, record: &log::Record) {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let msg = record.args().to_string();
+        let mut p = LogPrefix {
+            buf: [0; 96],
+            len: 0,
+        };
+        let _ = std::fmt::write(&mut p, *record.args());
+        // A cut inside a multi-byte character loses only the tail, which no prefix reads.
+        let msg = match std::str::from_utf8(&p.buf[..p.len]) {
+            Ok(s) => s,
+            Err(e) => std::str::from_utf8(&p.buf[..e.valid_up_to()]).unwrap_or(""),
+        };
+        let mut seen = GC_SEEN.get();
         if msg.starts_with("Begin copying collection") {
             GC_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
-        } else if let Some(rest) =
-            msg.strip_prefix("After collection, GC heap's allocated bytes = 0x")
+        } else if let Some(n) = msg
+            .strip_prefix("After collection, GC heap's allocated bytes = 0x")
+            .and_then(leading_hex)
         {
-            let hex = rest.split(' ').next().unwrap_or("");
-            if let Ok(n) = u64::from_str_radix(hex, 16) {
-                GC_MAX_LIVE.fetch_max(n, Ordering::Relaxed);
+            GC_MAX_LIVE.fetch_max(n, Ordering::Relaxed);
+            seen.collections += 1;
+            seen.live = n;
+        } else if let Some(rest) = msg.strip_prefix("  -> grew GC heap by 0x") {
+            let delta = leading_hex(rest);
+            let size = rest
+                .split_once("new size is 0x")
+                .and_then(|(_, s)| leading_hex(s));
+            if let (Some(delta), Some(size)) = (delta, size) {
+                seen.grown_from = size.saturating_sub(delta);
+                seen.grown_to = size;
             }
         }
+        GC_SEEN.set(seen);
     }
     fn flush(&self) {}
 }
 
 static GC_STATS_LOG: GcStatsLog = GcStatsLog;
 
-/// Installs `GC_STATS_LOG` and returns whether it did, so the caller knows to
-/// print the count when the run finishes. `$VL_GC_STATS` is undocumented in `vl
-/// help run` on purpose — like `$VL_COMPILE_GC_TRACE`, it is a measurement
-/// facility, not a tuning knob. `log::set_logger` is one-shot per process, which
-/// `run_cmd` and `build_cmd`, each at most once per process, never exceed.
+/// Installs `GC_STATS_LOG`, once per process: the seed's heap-growth policy reads it, and
+/// so does `$VL_GC_STATS`. `log::set_logger` is one-shot, hence the `Once`.
+fn install_gc_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::set_max_level(log::LevelFilter::Trace);
+        let _ = log::set_logger(&GC_STATS_LOG);
+    });
+}
+
+/// Whether `$VL_GC_STATS=1` asks for the collection count when the run finishes; installs
+/// the log that counts them. Undocumented on purpose: a measurement facility, like
+/// `$VL_COMPILE_GC_TRACE`, not a tuning knob.
 fn maybe_install_gc_stats() -> bool {
     if std::env::var("VL_GC_STATS").ok().as_deref() != Some("1") {
         return false;
     }
-    log::set_max_level(log::LevelFilter::Trace);
-    let _ = log::set_logger(&GC_STATS_LOG);
+    install_gc_log();
     true
+}
+
+/// The compiler's collections and peak live set on stderr, for `vl build` and the CLI pump.
+fn print_compile_gc_stats() {
+    eprintln!(
+        "vl: compile gc collections: {}, peak live after a collection: {} KiB",
+        GC_COLLECTIONS.load(Ordering::Relaxed),
+        GC_MAX_LIVE.load(Ordering::Relaxed) >> 10
+    );
 }
 
 /// Prints the collection count on stderr when `gc_stats` asked for it — after the
@@ -1278,11 +1355,11 @@ fn finish_gc_stats(gc_stats: bool, result: Result<()>) -> Result<()> {
 
 /// The engine for a store that drives the COMPILER SEED (`build`'s one-shot compile,
 /// the CLI pump's command loop, `run`'s and `--batch`'s compile phase). Identical to
-/// `gc_engine` except that a profiled run (`$VL_PROFILE_GUEST`) adds EPOCH
-/// INTERRUPTION, the sampler's clock.
+/// `gc_engine` except that a profiled run (`$VL_PROFILE_GUEST`) and the copying collector
+/// add EPOCH INTERRUPTION, the clock of the sampler and of `SeedGcHeadroom`.
 ///
 /// Split from `gc_engine` rather than folded into it because every store on such an
-/// engine MUST arm a deadline callback before it runs anything (`arm_guest_profile`):
+/// engine MUST arm a deadline callback before it runs anything (`arm_seed_store`):
 /// the default deadline is 0 and the default action is a TRAP, so an unarmed store
 /// dies in the module's start function. The user-program engine therefore stays
 /// plain, and the profile covers the compiler rather than the program it emitted.
@@ -1306,7 +1383,8 @@ fn seed_engine_sized(collector: Collector, initial: Option<u64>) -> Result<Engin
     if let Some(bytes) = initial {
         cfg.gc_heap_initial_size(bytes);
     }
-    if guest_profile_path().is_some() {
+    // The copying seed's heap-growth policy (`SeedGcHeadroom`) runs on the same clock.
+    if guest_profile_path().is_some() || matches!(collector, Collector::Copying) {
         cfg.epoch_interruption(true);
     }
     if guest_fuel_on() {
@@ -1370,10 +1448,130 @@ fn compile_engine(source_len: usize) -> Result<Engine> {
 /// GC heap size among them, so giving both the same heap makes them one configuration with
 /// one `.cwasm` sidecar instead of two copies of the same code.
 fn copying_seed_engine() -> Result<Engine> {
-    seed_engine_sized(
-        Collector::Copying,
-        Some(compile_heap_initial(COPYING_COMPILE_HEAP_INITIAL)?),
-    )
+    let initial = compile_heap_initial(COPYING_COMPILE_HEAP_INITIAL)?;
+    let engine = seed_engine_sized(Collector::Copying, Some(initial))?;
+    register_seed_gc_engine(&engine, initial, seed_gc_grow_percent()?);
+    Ok(engine)
+}
+
+/// wasmtime 49's copying collector grows only when one allocation cannot fit after a
+/// collection, so a live set just under a semispace collects every few KiB allocated. The
+/// seed grows the heap itself once a collection leaves more than this percentage of a
+/// semispace live. docs/internals/perf/gc-heap-policy-2026-09.md §"The seed's headroom".
+const SEED_GC_GROW_PERCENT: u64 = 75;
+
+/// `$VL_COMPILE_GC_GROW`: the percentage `SeedGcHeadroom` grows past, `off` to leave
+/// wasmtime's own policy alone. A measurement knob; a bad value is a hard error.
+fn seed_gc_grow_percent() -> Result<Option<u64>> {
+    match std::env::var("VL_COMPILE_GC_GROW").ok().as_deref() {
+        None | Some("") => Ok(Some(SEED_GC_GROW_PERCENT)),
+        Some("off") => Ok(None),
+        Some(v) => match v.parse::<u64>() {
+            Ok(p) if (1..=99).contains(&p) => Ok(Some(p)),
+            _ => bail!("unknown $VL_COMPILE_GC_GROW `{v}` (a percentage 1 to 99, or off)"),
+        },
+    }
+}
+
+/// The copying seed engines whose epoch `SEED_GC_TICK` advances, with each one's first GC
+/// heap size and grow percentage (`None`: the policy is off, the callback only returns).
+static SEED_GC_ENGINES: Mutex<Vec<(EngineWeak, u64, Option<u64>)>> = Mutex::new(Vec::new());
+
+/// How often a running seed store checks its last collection.
+const SEED_GC_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Registers `engine` with the headroom clock, starting the clock's thread the first time.
+/// A profiled run is clocked by the sampler's own thread instead.
+fn register_seed_gc_engine(engine: &Engine, initial: u64, grow: Option<u64>) {
+    install_gc_log();
+    let mut list = SEED_GC_ENGINES.lock().unwrap();
+    list.push((engine.weak(), initial, grow));
+    static CLOCK: std::sync::Once = std::sync::Once::new();
+    if guest_profile_path().is_none() {
+        CLOCK.call_once(|| {
+            std::thread::spawn(|| loop {
+                std::thread::sleep(SEED_GC_TICK);
+                SEED_GC_ENGINES
+                    .lock()
+                    .unwrap()
+                    .retain(|(weak, _, _)| match weak.upgrade() {
+                        Some(engine) => {
+                            engine.increment_epoch();
+                            true
+                        }
+                        None => false,
+                    });
+            });
+        });
+    }
+}
+
+/// The headroom policy `arm_seed_store` gives a store on a registered engine: its first
+/// GC heap size and grow percentage, or `None` for any other engine.
+fn seed_gc_policy(engine: &Engine) -> Option<(u64, Option<u64>)> {
+    SEED_GC_ENGINES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(weak, _, _)| weak.upgrade().is_some_and(|e| Engine::same(&e, engine)))
+        .map(|&(_, initial, grow)| (initial, grow))
+}
+
+/// One seed store's view of its GC heap: its size as the log last showed it, and how many
+/// collections this thread had seen when the store last looked.
+struct SeedGcHeadroom {
+    capacity: u64,
+    seen: u64,
+    grow_percent: u64,
+}
+
+impl SeedGcHeadroom {
+    fn new(initial: u64, grow_percent: u64) -> Self {
+        SeedGcHeadroom {
+            capacity: initial,
+            seen: GC_SEEN.get().collections,
+            grow_percent,
+        }
+    }
+
+    /// After a new collection whose live set fills more than `grow_percent` of a semispace,
+    /// doubles the heap. The heap has no public grow, so this allocates a garbage array too
+    /// big for the space left: wasmtime then grows before it collects, and the array dies.
+    fn check(&mut self, cx: &mut StoreContextMut<'_, ()>) {
+        let seen = GC_SEEN.get();
+        if seen.collections == self.seen {
+            return;
+        }
+        self.seen = seen.collections;
+        self.note_growth(seen);
+        let semi = self.capacity / 2;
+        if self.capacity >= 1 << 32
+            || seen.live > semi
+            || seen.live * 100 <= semi * self.grow_percent
+        {
+            return;
+        }
+        // At least the space left after the live set, so it cannot fit; and with the live
+        // set at least a semispace, so wasmtime's predicate picks growth over collection.
+        let bytes = (semi - seen.live + (1 << 20)) as usize;
+        let mut scope = RootScope::new(&mut *cx);
+        let ty = ArrayType::new(
+            scope.as_context().engine(),
+            FieldType::new(Mutability::Var, StorageType::I8),
+        );
+        let pre = ArrayRefPre::new(&mut scope, ty);
+        let _ = ArrayRef::new_from_i8_slice(&mut scope, &pre, &vec![0u8; bytes]);
+        drop(scope);
+        self.note_growth(GC_SEEN.get());
+    }
+
+    /// Adopts the log's latest growth when it started at or past this store's size; a
+    /// growth of some other store's heap can then only overstate this one's.
+    fn note_growth(&mut self, seen: GcSeen) {
+        if seen.grown_from >= self.capacity && seen.grown_to > self.capacity {
+            self.capacity = seen.grown_to;
+        }
+    }
 }
 
 /// The copying seed store's first GC heap, 128 MiB per semispace; the heap doubles from
@@ -2308,7 +2506,7 @@ fn instantiate_compiler(
     source: &CompilerSource,
 ) -> Result<(Store<()>, Instance)> {
     let mut store = Store::new(engine, ());
-    arm_guest_profile(&mut store);
+    arm_seed_store(&mut store);
     arm_guest_fuel(&mut store)?;
     let linker = Linker::new(engine);
     let inst = from_compiler(linker.instantiate(&mut store, module))?;
@@ -3811,7 +4009,7 @@ fn report_guest_alloc(resident0: u64) {
 }
 
 /// Give a store on a fuel engine all the fuel there is, so metering never traps. A NO-OP
-/// without `$VL_FUEL`; like `arm_guest_profile` it must run before the store runs anything.
+/// without `$VL_FUEL`; like `arm_seed_store` it must run before the store runs anything.
 fn arm_guest_fuel(store: &mut Store<()>) -> Result<()> {
     if guest_fuel_on() {
         store.set_fuel(u64::MAX)?;
@@ -3902,31 +4100,43 @@ fn resident_bytes() -> u64 {
         .map_or(0, |pages| pages * 4096)
 }
 
-/// Arm `store` so each epoch bump takes a sample. A NO-OP on an unprofiled run.
+/// Arm a seed `store` so each epoch bump takes a profile sample, on a profiled run, and
+/// checks the heap's headroom, on a copying engine. A NO-OP for a store needing neither.
 ///
 /// Must run BEFORE the store executes anything: with epoch interruption enabled the
 /// default deadline is 0 and the default action is a trap, so an unarmed store dies
 /// inside the module's start function.
-fn arm_guest_profile(store: &mut Store<()>) {
-    let guard = GUEST_PROFILE.lock().unwrap();
-    let Some(g) = guard.as_ref() else {
+fn arm_seed_store(store: &mut Store<()>) {
+    let prof = GUEST_PROFILE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|g| g.profiler.clone());
+    let policy = seed_gc_policy(store.engine());
+    if prof.is_none() && policy.is_none() {
         return;
-    };
+    }
     store.set_epoch_deadline(1);
-    let prof = g.profiler.clone();
+    let mut headroom = policy
+        .and_then(|(initial, grow)| Some(SeedGcHeadroom::new(initial, grow?)));
     let alloc = std::env::var("VL_PROFILE_GUEST_ALLOC").is_ok_and(|v| v == "1");
     let mut last = resident_bytes();
-    store.epoch_deadline_callback(move |cx| {
-        if let Some(p) = prof.lock().unwrap().as_mut() {
-            let delta = if alloc {
-                let now = resident_bytes();
-                let grew = now.saturating_sub(last);
-                last = now;
-                std::time::Duration::from_nanos(grew)
-            } else {
-                GUEST_SAMPLE_INTERVAL
-            };
-            p.sample(&cx, delta);
+    store.epoch_deadline_callback(move |mut cx| {
+        if let Some(p) = prof.as_ref() {
+            if let Some(p) = p.lock().unwrap().as_mut() {
+                let delta = if alloc {
+                    let now = resident_bytes();
+                    let grew = now.saturating_sub(last);
+                    last = now;
+                    std::time::Duration::from_nanos(grew)
+                } else {
+                    GUEST_SAMPLE_INTERVAL
+                };
+                p.sample(&cx, delta);
+            }
+        }
+        if let Some(h) = headroom.as_mut() {
+            h.check(&mut cx);
         }
         Ok(UpdateDeadline::Continue(1))
     });
@@ -6055,7 +6265,7 @@ fn run_batch(args: &[String]) -> Result<()> {
     start_guest_profile(&compile_engine, &module)?;
     {
         let mut probe = Store::new(&compile_engine, ());
-        arm_guest_profile(&mut probe);
+        arm_seed_store(&mut probe);
         arm_guest_fuel(&mut probe)?;
         let inst = from_compiler(pre.instantiate(&mut probe))?;
         check_seed_abi(&mut probe, &inst, &compiler)?;
@@ -6089,7 +6299,7 @@ fn run_batch(args: &[String]) -> Result<()> {
                     ))
                 })?;
                 let mut store = Store::new(&compile_engine, ());
-                arm_guest_profile(&mut store);
+                arm_seed_store(&mut store);
                 arm_guest_fuel(&mut store)?;
                 let inst = from_compiler(pre.instantiate(&mut store))?;
                 compile_vl_instance(
@@ -8573,6 +8783,7 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // with the FILE COUNT; under the null collector the heap only ever grows and a walk
     // of a few dozen files dies with `wasm trap: allocation size too large`. Two copies
     // of this repo's own `compiler/` (54 files) were enough.
+    let gc_stats = maybe_install_gc_stats();
     let engine = match std::env::var("VL_PUMP_GC").ok().as_deref() {
         Some("null") => seed_engine(Collector::Null)?,
         Some("refcount") => seed_engine(Collector::DeferredReferenceCounting)?,
@@ -8996,6 +9207,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // `finish_guest_profile` from ever running on this path.
     let mut code = exit_code.call(&mut store, ())?;
     finish_guest_profile();
+    if gc_stats {
+        print_compile_gc_stats();
+    }
     if let Some(msg) = unused_defines_error() {
         eprintln!("vl test: {msg}");
         code = code.max(1);
@@ -10476,11 +10690,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
         inject_fault(f, &mut bytes)?;
     }
     if gc_stats {
-        eprintln!(
-            "vl: compile gc collections: {}, peak live after a collection: {} KiB",
-            GC_COLLECTIONS.load(Ordering::Relaxed),
-            GC_MAX_LIVE.load(Ordering::Relaxed) >> 10
-        );
+        print_compile_gc_stats();
     }
     // `--source-map`: the map is made from the rows here, while they still describe these
     // bytes. Both sections it borrowed are appended after the code, so dropping them moves no
