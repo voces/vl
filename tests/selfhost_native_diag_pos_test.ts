@@ -119,9 +119,9 @@ Deno.test({
   name: "native-diag-pos: corpus lambda-uninferable-param pins the parameter token",
   ignore: !ENABLED,
   fn: async () => {
-    // The real corpus file: a lambda passed to an un-annotated HOF param, `apply((n) => n * 2)` on
-    // line 11 — the uninferable parameter `n` sits at col 13 (0-based), shown 1-based as [11:14].
-    // (A `const`-bound lambda now value-flow-monomorphizes; this non-binding form stays uninferable.)
+    // The real corpus file: a lambda passed to an un-annotated HOF param its callee only returns,
+    // `ident((n) => n * 2)` on line 11 — the uninferable parameter `n` sits at col 13 (0-based),
+    // shown 1-based as [11:14].
     const path = `${ROOT}/tests/cases/functions/lambda-uninferable-param.vl`;
     const r = await check(path);
     if (r.code === 0) throw new Error("expected rejection, vl check exited 0");
