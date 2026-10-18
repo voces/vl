@@ -2728,7 +2728,7 @@ in-language GC knobs.
   — and a binding used only as a direct-call callee monomorphizes per call site at FUNCTION and
   MODULE scope alike. A generic passed to a HOF whose CALLBACK PARAMETER is itself un-annotated
   runs too, at each type the HOF calls it at (D5611, `generic-fn-value-inferred-hof.vl`).
-  REMAINING: the same through an EXPORTED HOF or a recursive one (D6091), where the reject
+  REMAINING: the same through an EXPORTED HOF (D6204) or one recursing through another function (D6203), where the reject
   names the function, the un-annotated parameters, and the signatures the program's own call
   sites already pin (`error-generic-fn-value-inferred-hof-exported.vl`). What a nested CAPTURING
   function owed this entry was filed as exactly ONE loud arm — a nested function whose OWN
