@@ -43,7 +43,12 @@ import {
   validateRetCstrs,
   validateTpIfJoins,
 } from "./check_assignable"
-import { callBindNote, fsbDeclAtNode, fsbName } from "./check_bind_rows"
+import {
+  callBindNote,
+  fsbDeclAtNode,
+  fsbName,
+  holeFnSplitSet,
+} from "./check_bind_rows"
 import { crSubtreeMentions } from "./check_capture_walks"
 import { strLitRecvTy } from "./check_builtin_methods"
 import { builtinMethodNamesOf } from "./check_callee"
@@ -78,12 +83,7 @@ import {
   noteMemCstr,
   notePrintCstr,
 } from "./check_cstr_rows"
-import {
-  cstrOwnerStack,
-  inferQuiet,
-  tpEnvNames,
-  tpEnvTys,
-} from "./check_cursor"
+import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
 import {
   boundObjRootOf,
   memOffsetCheckedValue,
@@ -255,9 +255,11 @@ import {
   substNestMode,
   substNestModeSet,
   tyIsForeignGenericSig,
+  tyIsHoleGenericSig,
 } from "./check_subst"
 import {
   keptParamUnion,
+  paramHoleName,
   tpGradualView,
   tpIfFn,
   tpIfReFn,
@@ -303,7 +305,7 @@ import {
 } from "./check_width"
 import { peelParenIx, weDigits } from "./check_write_effects"
 import { fnDeclIx } from "./check_write_scan"
-import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
+import { strListHas, strListIndexOf } from "./listutil"
 import {
   isVoidTy,
   nonNullTy,
@@ -1625,25 +1627,6 @@ function fsbGenFnHolePins(
   0
 }
 
-// Whether function type `ty` is the open signature of a top-level function with un-annotated
-// parameters whose body is not being checked: its first parameter hole is that function's.
-function tyIsHoleGenericSig(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const f = T.tys[ty]
-  if !(f is TyFunc) || f.fnParamTypes.length == 0 { return false }
-  const p0 = f.fnParamTypes[0]
-  const pv = T.tys[p0]
-  if !(pv is TyVar) || !tyIsHole(p0) { return false }
-  const nm = pv.tvName
-  const dot = nm.indexOf(".")
-  if nm.slice(0, 2) == "?#" || dot < 2 { return false }
-  const d = fnDeclIx[nm.slice(1, dot)] ?? -1
-  if d < 0 || d >= P.nodes.length || i32ListHas(cstrOwnerStack, d) {
-    return false
-  }
-  P.nodes[d] is FuncDecl
-}
-
 // How the callee's body uses its hole parameter `holeTy`, the `i`th: 0 when it calls it, 1 when
 // it never reads it, -1 otherwise or for a callee with no declaration in reach.
 function holeParamUse(cfn: Node, owner: i32, holeTy: i32, i: i32): i32 {
@@ -1757,6 +1740,7 @@ function judgeFnArgHoleCalls(
         if k >= 0 {
           const insts: i32[] = []
           genFnHoleCallInsts(vNames, vTys, k, vTys[k], calleeFn, insts)
+          if insts.length > 1 { holeFnSplitAt(calleeFn, dhNames[j]) }
           const d0 = T.diags.length
           for inst in insts {
             if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
@@ -1766,6 +1750,22 @@ function judgeFnArgHoleCalls(
       }
     }
     j = j + 1
+  }
+  0
+}
+
+// Marks the parameter of declared function `fn` whose hole is `hole` as wanting a copy per
+// instance its body calls it at.
+function holeFnSplitAt(fn: i32, hole: string) {
+  if fn < 0 || fn >= P.nodes.length { return 0 }
+  const f = P.nodes[fn]
+  if !(f is FuncDecl) { return 0 }
+  let pi = 0
+  while pi < f.fnParams.length {
+    if paramHoleName(f.fnName, fn, pi) == hole {
+      holeFnSplitSet(f.fnParams[pi])
+    }
+    pi = pi + 1
   }
   0
 }
