@@ -4653,11 +4653,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if b >= 0 { return b }
     return tyIx
   }
-  let si = stSeenStack.length - 1
-  while si >= 0 {
-    if stSeenStack[si] == tyIx { return tyIx }
-    si = si - 1
-  }
+  if substOnSeenStack(tyIx) { return tyIx }
   stSeenStackPush(tyIx)
   let res = tyIx
   if t is TyArray {
@@ -4667,138 +4663,13 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
       if t.aRead == 1 { res = mkArrayViewTy(e2) } else { res = mkArrayTy(e2) }
     }
   } else if t is TyNullable {
-    let n2 = substTyDeep(t.nInner, bNames, bTys)
-    if (
-      n2 != t.nInner
-      && t.nInner >= 0
-      && tpJoinUnions.has(tyIx)
-      && T.tys[t.nInner] is TyUnion
-    ) {
-      // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
-      let key = tyIx
-      if !tpRetJoinTys.has(tyIx) { key = t.nInner }
-      let nms: i32[] = []
-      let nFixed: boolean[] = []
-      const vals: i32[] = []
-      const recorded = retJoinMembersAt(key, bNames, bTys, nms, nFixed, vals)
-      if !recorded {
-        nms = []
-        nFixed = []
-        flattenVariantsInto(n2, nms)
-        for _ in nms { nFixed.push(true) }
-      }
-      const tpSaved = tpApartConcrete
-      tpApartConcreteSet(true)
-      njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
-      n2 = rejoinMembers(nms, nFixed)
-      tpApartConcreteSet(tpSaved)
-      if recorded { carryRetJoin(n2, key, vals) }
-    }
-    if n2 != t.nInner { res = mkNullableTy(nullableFlatInner(n2)) }
+    res = substNullableTy(tyIx, t, bNames, bTys)
   } else if t is TyObj {
-    const onames = t.objFieldNames
-    const otys = t.objFieldTypes
-    const out: i32[] = []
-    let changed = false
-    let i = 0
-    while i < otys.length {
-      const f2 = substTyDeep(otys[i], bNames, bTys)
-      if f2 != otys[i] { changed = true }
-      out.push(f2)
-      i = i + 1
-    }
-    if changed {
-      const nn: string[] = []
-      let j = 0
-      while j < onames.length {
-        nn.push(onames[j])
-        j = j + 1
-      }
-      res = mkObjTy(nn, out)
-    }
+    res = substObjTy(tyIx, t, bNames, bTys)
   } else if t is TyFunc {
-    const ps = t.fnParamTypes
-    const out2: i32[] = []
-    let changed2 = false
-    let k = 0
-    while k < ps.length {
-      const p2 = substTyDeep(ps[k], bNames, bTys)
-      if p2 != ps[k] { changed2 = true }
-      out2.push(p2)
-      k = k + 1
-    }
-    const r2 = substTyDeep(t.fnRet, bNames, bTys)
-    if r2 != t.fnRet { changed2 = true }
-    if changed2 { res = mkFuncTy(out2, r2) }
+    res = substFuncTy(tyIx, t, bNames, bTys)
   } else if t is TyUnion {
-    const ms = t.uMembers
-    const out3: i32[] = []
-    let changed3 = false
-    let u = 0
-    while u < ms.length {
-      const m2 = substTyDeep(ms[u], bNames, bTys)
-      if m2 != ms[u] { changed3 = true }
-      out3.push(m2)
-      u = u + 1
-    }
-    // A deferred join re-folds: every provably dead member drops and the rest re-joins,
-    // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
-    if isJoinHoleUnion(tyIx) {
-      res = refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
-    } else if changed3 && tpJoinUnions.has(tyIx) {
-      // A union the return-set join kept apart re-joins under the same rule (D2784).
-      let ums: i32[] = []
-      let uFixed: boolean[] = []
-      const vals: i32[] = []
-      const recorded = retJoinMembersAt(tyIx, bNames, bTys, ums, uFixed, vals)
-      if !recorded {
-        ums = out3
-        uFixed = []
-        for _ in out3 { uFixed.push(true) }
-      }
-      const tpSaved = tpApartConcrete
-      tpApartConcreteSet(true)
-      njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
-      res = rejoinMembers(ums, uFixed)
-      tpApartConcreteSet(tpSaved)
-      if recorded { carryRetJoin(res, tyIx, vals) }
-    } else if changed3 {
-      // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
-      // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
-      const src = substUnionNullFolded(tyIx, ms, out3)
-      const wrapNull = src.length > 0
-      // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
-      // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
-      let dms = out3
-      if wrapNull { dms = src }
-      const uniq: i32[] = []
-      let q = 0
-      while q < dms.length {
-        let seen = false
-        let w = 0
-        while w < uniq.length {
-          if uniq[w] == dms[q] { seen = true }
-          // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
-          if !wrapNull && substListTwin(uniq[w], dms[q]) { seen = true }
-          if wrapNull && substListTwinNominal(uniq[w], dms[q]) { seen = true }
-          w = w + 1
-        }
-        if !seen { uniq.push(dms[q]) }
-        q = q + 1
-      }
-      // The third union-construction site needing the same subsumed-arm collapse
-      // (`unionArmSubsumedBy`) as `annUnionInnerTy` and `fillTypeDeclAt`'s `UnionDecl` arm —
-      // the index dedup above cannot see a value-level duplicate like `T | "err"` at `T :=
-      // string`. `out` is read unconditionally; treating it as optional would double the member list.
-      const kept3: i32[] = []
-      unionDropSubsumedArms(uniq, kept3)
-      // A type argument can make a set and a same-rep map meet in one union (D2673); the
-      // node whose check substituted reports it (`checkNodeDone`).
-      const sclash = setMapUnionClashMsg(kept3, false)
-      if sclash != "" { joinClashMsgSet(sclash) }
-      if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
-      if wrapNull { res = substNullableOver(out3, res) }
-    }
+    res = substUnionTy(tyIx, t, bNames, bTys)
   } else if t is TyMap {
     const k2 = substTyDeep(t.mKey, bNames, bTys)
     const v2 = substTyDeep(t.mVal, bNames, bTys)
@@ -4811,6 +4682,183 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // Carries the application provenance across substitution (D949): the rebuilt type is a
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
+  res
+}
+
+// Whether `tyIx` is already being substituted further up this walk (a recursive named type).
+function substOnSeenStack(tyIx: i32): boolean {
+  let si = stSeenStack.length - 1
+  while si >= 0 {
+    if stSeenStack[si] == tyIx { return true }
+    si = si - 1
+  }
+  false
+}
+
+// Re-joins the members of a union the return-set join kept apart at `tyIx`, under the rule
+// that kept them apart. The members come from row `key`'s return set, or from `fallback`
+// (each stored as built) when the row records none.
+function substRejoinApart(
+  tyIx: i32,
+  key: i32,
+  fallback: i32[],
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  let ms: i32[] = []
+  let fixed: boolean[] = []
+  const vals: i32[] = []
+  const recorded = retJoinMembersAt(key, bNames, bTys, ms, fixed, vals)
+  if !recorded {
+    ms = fallback
+    fixed = []
+    for _ in fallback { fixed.push(true) }
+  }
+  const tpSaved = tpApartConcrete
+  tpApartConcreteSet(true)
+  njRejoinApartSet((tpJoinUnions.get(tyIx) ?? 0) == 2)
+  const res = rejoinMembers(ms, fixed)
+  tpApartConcreteSet(tpSaved)
+  if recorded { carryRetJoin(res, key, vals) }
+  res
+}
+
+// `substTyDeep` over nullable `t` at `tyIx`: the inner type substituted, rebuilt only when it changed.
+function substNullableTy(
+  tyIx: i32,
+  t: TyNullable,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  let n2 = substTyDeep(t.nInner, bNames, bTys)
+  if (
+    n2 != t.nInner
+    && t.nInner >= 0
+    && tpJoinUnions.has(tyIx)
+    && T.tys[t.nInner] is TyUnion
+  ) {
+    // A kept-apart join's null wraps its union: the members re-join as one set (D3267).
+    let key = tyIx
+    if !tpRetJoinTys.has(tyIx) { key = t.nInner }
+    const flat: i32[] = []
+    flattenVariantsInto(n2, flat)
+    n2 = substRejoinApart(tyIx, key, flat, bNames, bTys)
+  }
+  if n2 != t.nInner { return mkNullableTy(nullableFlatInner(n2)) }
+  tyIx
+}
+
+// `substTyDeep` over record `t` at `tyIx`: each field substituted, rebuilt only when one changed.
+function substObjTy(tyIx: i32, t: TyObj, bNames: string[], bTys: i32[]): i32 {
+  const onames = t.objFieldNames
+  const otys = t.objFieldTypes
+  const out: i32[] = []
+  let changed = false
+  let i = 0
+  while i < otys.length {
+    const f2 = substTyDeep(otys[i], bNames, bTys)
+    if f2 != otys[i] { changed = true }
+    out.push(f2)
+    i = i + 1
+  }
+  if !changed { return tyIx }
+  const nn: string[] = []
+  let j = 0
+  while j < onames.length {
+    nn.push(onames[j])
+    j = j + 1
+  }
+  mkObjTy(nn, out)
+}
+
+// `substTyDeep` over function type `t` at `tyIx`: parameters, then the return, rebuilt only when one changed.
+function substFuncTy(tyIx: i32, t: TyFunc, bNames: string[], bTys: i32[]): i32 {
+  const ps = t.fnParamTypes
+  const out2: i32[] = []
+  let changed2 = false
+  let k = 0
+  while k < ps.length {
+    const p2 = substTyDeep(ps[k], bNames, bTys)
+    if p2 != ps[k] { changed2 = true }
+    out2.push(p2)
+    k = k + 1
+  }
+  const r2 = substTyDeep(t.fnRet, bNames, bTys)
+  if r2 != t.fnRet { changed2 = true }
+  if changed2 { return mkFuncTy(out2, r2) }
+  tyIx
+}
+
+// `substTyDeep` over union `t` at `tyIx`: each member substituted, then re-folded (a deferred
+// join), re-joined (a kept-apart join) or rebuilt (any other union whose members changed).
+function substUnionTy(
+  tyIx: i32,
+  t: TyUnion,
+  bNames: string[],
+  bTys: i32[],
+): i32 {
+  const ms = t.uMembers
+  const out3: i32[] = []
+  let changed3 = false
+  let u = 0
+  while u < ms.length {
+    const m2 = substTyDeep(ms[u], bNames, bTys)
+    if m2 != ms[u] { changed3 = true }
+    out3.push(m2)
+    u = u + 1
+  }
+  // A deferred join re-folds: every provably dead member drops and the rest re-joins,
+  // checked even when nothing changed — an unresolved member is dead precisely because it did not resolve.
+  if isJoinHoleUnion(tyIx) {
+    return refoldJoinUnion(tyIx, ms, out3, changed3, bNames, bTys)
+  }
+  if !changed3 { return tyIx }
+  // A union the return-set join kept apart re-joins under the same rule (D2784).
+  if tpJoinUnions.has(tyIx) {
+    return substRejoinApart(tyIx, tyIx, out3, bNames, bTys)
+  }
+  substUnionRebuild(tyIx, ms, out3)
+}
+
+// The union at `tyIx` rebuilt over its substituted members `out3` (`ms` before substitution):
+// duplicates dropped, subsumed arms collapsed, and a null the substitution put inside folded out.
+function substUnionRebuild(tyIx: i32, ms: i32[], out3: i32[]): i32 {
+  // A null the substitution put inside the union (`(A | null) | B`, or `A | B` at `A := T |
+  // null`) folds out to one nullable wrapper over the rest, in member order (D3504, D3502).
+  const src = substUnionNullFolded(tyIx, ms, out3)
+  const wrapNull = src.length > 0
+  // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
+  // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
+  let dms = out3
+  if wrapNull { dms = src }
+  const uniq: i32[] = []
+  let q = 0
+  while q < dms.length {
+    let seen = false
+    let w = 0
+    while w < uniq.length {
+      if uniq[w] == dms[q] { seen = true }
+      // `T[] | i32[]` at `T := i32` is one list; the substituted `T[]` is a fresh index (D2818).
+      if !wrapNull && substListTwin(uniq[w], dms[q]) { seen = true }
+      if wrapNull && substListTwinNominal(uniq[w], dms[q]) { seen = true }
+      w = w + 1
+    }
+    if !seen { uniq.push(dms[q]) }
+    q = q + 1
+  }
+  // The third union-construction site needing the same subsumed-arm collapse
+  // (`unionArmSubsumedBy`) as `annUnionInnerTy` and `fillTypeDeclAt`'s `UnionDecl` arm —
+  // the index dedup above cannot see a value-level duplicate like `T | "err"` at `T :=
+  // string`. `out` is read unconditionally; treating it as optional would double the member list.
+  const kept3: i32[] = []
+  unionDropSubsumedArms(uniq, kept3)
+  // A type argument can make a set and a same-rep map meet in one union (D2673); the
+  // node whose check substituted reports it (`checkNodeDone`).
+  const sclash = setMapUnionClashMsg(kept3, false)
+  if sclash != "" { joinClashMsgSet(sclash) }
+  let res = 0
+  if kept3.length == 1 { res = kept3[0] } else { res = mkUnionTy(kept3) }
+  if wrapNull { res = substNullableOver(out3, res) }
   res
 }
 

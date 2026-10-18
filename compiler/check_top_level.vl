@@ -605,6 +605,26 @@ function progHoistFnSig(s: FuncDecl, six: i32) {
     // reads back as `"[]" for F32View` rather than as its minted spelling.
     tErr("redeclared " + getDeclLabel(opDeclLabel(s.fnName)), six)
   }
+  const hpt = progHoistParamTys(s, six)
+  const hret = progHoistRetTy(s, six)
+  declare(s.fnName, mkFuncTy(hpt, hret))
+  fnDeclIx[s.fnName] = six
+  declareFnDeclNode(s.fnName, six)
+  progRegisterGetter(s, six, hpt)
+  progRegisterOpDecl(s, six, hpt)
+  progCheckBinOpSelf(s, six, hpt)
+  // Collect un-annotated returns (hoisted as the `-2` pending sentinel) for the
+  // return-inference pre-pass.
+  if hret == (-2) { topUnannotFns.push(six) }
+  // Completion visibility: a top-level function is global. Stamped here (only
+  // the global scope is open) so it wins over any later demand-inference
+  // re-entry, which would run the body from a deeper stack (see `symStampVis`).
+  if symEnabled != 0 { symStampVis(s.fnName, six, 2, scopeSL.length - 1) }
+}
+
+// The hoisted parameter types of top-level function `s` at `six`, one per parameter;
+// `TY_ERR` where an annotation does not resolve.
+function progHoistParamTys(s: FuncDecl, six: i32): i32[] {
   const hp = s.fnParams
   const hpt: i32[] = []
   let k = 0
@@ -634,6 +654,12 @@ function progHoistFnSig(s: FuncDecl, six: i32) {
     hpt.push(t)
     k = k + 1
   }
+  hpt
+}
+
+// The hoisted return type of top-level function `s` at `six`: its annotation, `void` when
+// that does not resolve or no caller reads the result, else the pending `-2`.
+function progHoistRetTy(s: FuncDecl, six: i32): i32 {
   // An UN-ANNOTATED return hoists as the PENDING sentinel (-2): the real type
   // is inferred from the body in pass 2 (or on demand at a forward call site),
   // then PATCHED into this same TyFunc in place.
@@ -651,10 +677,11 @@ function progHoistFnSig(s: FuncDecl, six: i32) {
   }
   // A result no caller reads is not returned: hoisted as the `: void` it is checked as.
   if hret == (-2) && fnResultUnconsumed(six) { hret = TY_VOID }
-  declare(s.fnName, mkFuncTy(hpt, hret))
-  fnDeclIx[s.fnName] = six
-  declareFnDeclNode(s.fnName, six)
-  // A getter registers under its receiver type, the only route by which a read finds it.
+  hret
+}
+
+// A getter `s` at `six` registers under its receiver type `hpt[0]`, the only route by which a read finds it.
+function progRegisterGetter(s: FuncDecl, six: i32, hpt: i32[]) {
   const gProp = getDeclPropOf(s.fnName)
   if gProp != "" && hpt.length == 1 {
     getFns.push(s.fnName)
@@ -662,6 +689,13 @@ function progHoistFnSig(s: FuncDecl, six: i32) {
     getDecls.push(six)
     getSelfTys.push(hpt[0])
   }
+  0
+}
+
+// An index or binary operator declaration `s` at `six`, with hoisted parameter types `hpt`,
+// enters the operator table, or an index operator of the wrong arity or receiver is refused.
+function progRegisterOpDecl(s: FuncDecl, six: i32, hpt: i32[]) {
+  const hp = s.fnParams
   // REGISTER a free index operator (B14). Its ARITY is fixed by the operator
   // — `"[]"` is (self, index), `"[]="` is (self, index, value) — and checking
   // it here means a malformed declaration is reported once, at itself, rather
@@ -709,8 +743,15 @@ function progHoistFnSig(s: FuncDecl, six: i32) {
     opIdxOps.push(binSym)
     opIdxFns.push(s.fnName)
   }
+  0
+}
+
+// A binary operator declaration `s` at `six` whose `self` can never be an object is refused;
+// one whose `self` is a hole is banked for the whole-program check (D491).
+function progCheckBinOpSelf(s: FuncDecl, six: i32, hpt: i32[]) {
+  const hp = s.fnParams
   // The swallow at the binary operators, said out loud (D425) — the twin of the index
-  // gate above: `checkBinary` reaches `opSelfFnTy` only when the left operand is an
+  // gate in `progRegisterOpDecl`: `checkBinary` reaches `opSelfFnTy` only when the left operand is an
   // object, so a declaration whose `self` is not one is not a dispatch that fails, it is
   // one the language already decided will never happen. Disjoint from D471's first-parameter-name gate (checked in the parser), so a declaration failing both gets the name diagnostic only.
   if isBinOpDecl(s.fnName) {
@@ -757,13 +798,7 @@ function progHoistFnSig(s: FuncDecl, six: i32) {
       }
     }
   }
-  // Collect un-annotated returns (hoisted as the `-2` pending sentinel) for the
-  // return-inference pre-pass.
-  if hret == (-2) { topUnannotFns.push(six) }
-  // Completion visibility: a top-level function is global. Stamped here (only
-  // the global scope is open) so it wins over any later demand-inference
-  // re-entry, which would run the body from a deeper stack (see `symStampVis`).
-  if symEnabled != 0 { symStampVis(s.fnName, six, 2, scopeSL.length - 1) }
+  0
 }
 
 // Pass 1.5 of `checkProgramNode`: every top-level value binding is declared with its
