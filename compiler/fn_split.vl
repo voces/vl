@@ -358,7 +358,9 @@ function fsValuePeer(v: i32): i32 {
   }
   if n is FuncDecl && n.fnName == "" { return -1 }
   const ia = fsIdentityArg(v)
-  if ia >= 0 && letDeclOfRead(ia) < 0 { return -1 }
+  if ia >= 0 && (letDeclOfRead(ia) < 0 || fsConstLambdaOf(ia) >= 0) {
+    return -1
+  }
   if fsConstRet(v) >= 0 { return -1 }
   fsExcluded(
     -2,
@@ -493,10 +495,33 @@ function fsDeclName(i: i32): string {
 // function a constant call returns, else `v`.
 function fsSlotSrc(v: i32): i32 {
   const a = fsIdentityArg(v)
+  const lam = fsConstLambdaOf(a)
+  if lam >= 0 { return lam }
   if a >= 0 { return a }
   const r = fsConstRet(v)
   if r >= 0 { return r }
   v
+}
+
+// The lambda an un-annotated `const` read by identifier `a` holds, when the lambda reads only its
+// own and module-scope bindings, so a slot can hold a fresh copy of it (D6201); else -1.
+function fsConstLambdaOf(a: i32): i32 {
+  const d = letDeclOfRead(a)
+  if d < 0 { return -1 }
+  const dn = P.nodes[d]
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit < 0
+  ) {
+    return -1
+  }
+  const f = P.nodes[dn.letInit]
+  if !(f is FuncDecl) || f.fnName != "" || !fsReadsNoLocal(dn.letInit) {
+    return -1
+  }
+  dn.letInit
 }
 
 // How many argument types the calls through binding `d` take.
@@ -781,33 +806,33 @@ function fsHoleFwd(r: i32): i32 {
   gn.fnParams[j]
 }
 
-// The argument-type keys parameter `par` is called at, through the holes it is forwarded to;
-// sets `hsBad` when a read is neither a call nor a forward, or the forwards cycle.
-function fsHoleKeys(par: i32, seen: i32[]): string[] {
+// The argument-type keys parameter `par` is called at, through every hole it reaches by
+// forwards, a cycle among them included (D6091, D6202, D6203); sets `hsBad` when a reached hole
+// cannot take a parameter per type, or a read of one is neither a call nor a forward.
+function fsHoleKeys(par: i32): string[] {
   const ks: string[] = []
-  if hasI32(seen, par) || !fsHoleParamOk(par) {
-    hsBad = true
-    return ks
-  }
-  const inner: i32[] = [par]
-  for x in seen { inner.push(x) }
-  for r in fsIdents {
-    if identDeclOf(r) == par {
-      const cn = P.nodes[fsParent[r]]
-      if cn is Call && cn.callFn == r {
-        const k = fsReadKey(r)
-        if !hasStr(ks, k) { ks.push(k) }
-      } else {
-        const q = fsHoleFwd(r)
-        if q < 0 {
-          hsBad = true
-          return ks
-        }
-        // A recursive call handing the parameter back to itself hands on every slot (D6091).
-        if q != par {
-          for k in fsHoleKeys(q, inner) {
-            if !hasStr(ks, k) { ks.push(k) }
+  const seen: i32[] = [par]
+  let si = 0
+  while si < seen.length {
+    const h = seen[si]
+    si = si + 1
+    if !fsHoleParamOk(h) {
+      hsBad = true
+      return ks
+    }
+    for r in fsIdents {
+      if identDeclOf(r) == h {
+        const cn = P.nodes[fsParent[r]]
+        if cn is Call && cn.callFn == r {
+          const k = fsReadKey(r)
+          if !hasStr(ks, k) { ks.push(k) }
+        } else {
+          const q = fsHoleFwd(r)
+          if q < 0 {
+            hsBad = true
+            return ks
           }
+          if !hasI32(seen, q) { seen.push(q) }
         }
       }
     }
@@ -823,8 +848,7 @@ function fsHoleFwdKeys(r: i32): string[] {
   if q < 0 { return none }
   const was = hsBad
   hsBad = false
-  const seen: i32[] = []
-  const ks = fsHoleKeys(q, seen)
+  const ks = fsHoleKeys(q)
   const bad = hsBad
   hsBad = was
   if bad { return none }
@@ -878,13 +902,12 @@ function fsPlanHoles(): i32 {
   for a in fsAsks {
     if a >= 0 && a < fsParseLen && P.nodes[a] is Param { work.push(a) }
   }
-  const none: i32[] = []
   let wi = 0
   while wi < work.length {
     const par = work[wi]
     wi = wi + 1
     if hsIx(par) < 0 && fsParent[par] >= 0 {
-      const ks = fsHoleKeys(par, none)
+      const ks = fsHoleKeys(par)
       if hsBad { return fsHoleDecline() }
       if ks.length > 1 {
         hsPar.push(par)
@@ -985,8 +1008,7 @@ function fsPlanHoleRewrites(): i32 {
             for qk in hsKeys[qi] { names.push(hsSlot(si, qk)) }
             fsHoleHandOut(c, r, names)
           } else {
-            const none: i32[] = []
-            const qks = fsHoleKeys(q, none)
+            const qks = fsHoleKeys(q)
             if qks.length > 0 { fsRename(r, hsSlot(si, qks[0])) }
           }
         }
