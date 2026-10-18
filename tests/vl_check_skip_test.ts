@@ -183,6 +183,9 @@ const REASON = [
   "span",
   "stray",
   "pass",
+  "ambient",
+  "fresh",
+  "decor",
 ];
 
 // ── the graph ────────────────────────────────────────────────────────────────
@@ -223,9 +226,8 @@ export function edge(s: Shape): i32 { return s.w }
 
 const MAIN = `import { area, bump, size, Shape, half } from "./lib"
 import { mid, edge } from "./mid"
-type Box = { w: i32, h: i32 }
 const sh: Shape = { w: 2, h: 3 }
-const bx: Box = { w: 4, h: 5 }
+const bx: Shape = { w: 4, h: 5 }
 print(area(2))
 bump()
 print(size(sh))
@@ -247,11 +249,15 @@ type Case = {
   want: Want;
   // The reason a decline must give; any decline when absent.
   why?: string;
+  // With main holding errors, a decline for this reason instead of `want`.
+  badWhy?: string;
   at?: string;
   from: string;
   to: string;
   // Added to main's imports and body on both sides, for an edit main must reach.
   uses?: string;
+  // Added to lib's head on both sides.
+  libUses?: string;
 };
 
 const CASES: Case[] = [
@@ -305,6 +311,29 @@ const CASES: Case[] = [
     to: "area(n: string)",
   },
   {
+    // A served diagnostic may spell any of S's declarations, so main's errors keep them all.
+    name: "signature edit of an export main does not import",
+    want: "serve",
+    badWhy: "decor",
+    from: "spare(n: i32): i32 { return n }",
+    to: "spare(n: string): string { return n }",
+  },
+  {
+    name: "signature edit of a private callee only an unimported export calls",
+    want: "serve",
+    badWhy: "decor",
+    from: "lone(n: i32): i32 { return n }",
+    to: "lone(k: i32): i32 { return k + 1 }",
+    libUses: "function lone(n: i32): i32 { return n }\nexport function user(): i32 { return lone(1) }\n",
+  },
+  {
+    name: "type edit of a binding main does not import",
+    want: "serve",
+    badWhy: "decor",
+    from: 'export let mode = "a"',
+    to: "export let mode = 1",
+  },
+  {
     name: "inferred-return change",
     want: "decline",
     why: "interface",
@@ -314,7 +343,7 @@ const CASES: Case[] = [
   {
     name: "record type edit",
     want: "decline",
-    why: "interface",
+    why: "ambient",
     from: "{ w: i32, h: i32 }",
     to: "{ w: i32, h: i64 }",
   },
@@ -370,7 +399,7 @@ const CASES: Case[] = [
     // The bank holds the type main's delivery adopted; lib checked alone does not adopt it.
     name: "main adopts an inferred binding, lib body edit",
     want: "decline",
-    why: "interface",
+    why: "ambient",
     from: "n * 2",
     to: "n * 3",
     uses:
@@ -516,11 +545,171 @@ const CASES: Case[] = [
     to: "print(hv + 1)",
   },
   { name: "no edit", want: "serve", from: "", to: "" },
+  {
+    name: "a private literal-union alias main's diagnostic can spell",
+    want: "decline",
+    why: "ambient",
+    from: "function quiet",
+    to: 'type AB = "a" | "b"\nfunction quiet',
+    uses: 'const e: "a" | "b" = "a"\nconst b2: boolean = e\n',
+  },
+  {
+    name: "a lib body annotation spells main's literal record",
+    want: "decline",
+    why: "ambient",
+    from: "print(3)",
+    to: "const qq: { f: i32 } = { f: 1 }\n  print(qq.f)",
+    uses: "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nconst xj: J = idn({ f: 4 })\nprint(xj.f ?? 0)\n",
+  },
+  {
+    name: "a private lib type spells main's literal record",
+    want: "decline",
+    why: "ambient",
+    from: "function quiet",
+    to: "type II = { f: i32 }\nfunction quiet",
+    uses: "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nconst xj: J = idn({ f: 4 })\nprint(xj.f ?? 0)\n",
+  },
+  {
+    name: "a private lib self-function main's typo is near",
+    want: "decline",
+    why: "ambient",
+    from: "function quiet",
+    to: "function zzq(self: string): i32 { 1 }\nfunction quiet",
+    uses: 'const sq = "abc"\nprint(sq.zzz())\n',
+  },
+  {
+    name: "a private lib type main's unknown type is near",
+    want: "decline",
+    why: "ambient",
+    from: "function quiet",
+    to: "type Shapez = { w: i32 }\nfunction quiet",
+    uses: "const tq: Shapy = 1\n",
+  },
+  {
+    name: "main's private type spells a lib body literal's record",
+    want: "decline",
+    why: "ambient",
+    from: "n * 2",
+    to: "n * 3",
+    libUses:
+      "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nfunction jj(): void {\n  const xj: J = idn({ f: 4 })\n  print(xj.f ?? 0)\n}\n",
+    uses: "type II = { f: i32 }\n",
+  },
+  {
+    name: "field write moves",
+    want: "decline",
+    why: "ambient",
+    from: "b.h = 2",
+    to: "b.w = null",
+    libUses: "export function setf(b: { w: i32 | null, h: i32 }): void { b.h = 2 }\n",
+    uses: 'import { setf } from "./lib"\nconst rw: { w: i32, h: i32 } = { w: 1, h: 2 }\nsetf(rw)\nprint(rw.h)\n',
+  },
+  {
+    name: "alias write moves",
+    want: "decline",
+    why: "ambient",
+    from: "c.h = 2",
+    to: "c.w = null",
+    libUses: "export function seta(b: { w: i32 | null, h: i32 }): void {\n  const c = b\n  c.h = 2\n}\n",
+    uses: 'import { seta } from "./lib"\nconst ra: { w: i32, h: i32 } = { w: 1, h: 2 }\nseta(ra)\nprint(ra.h)\n',
+  },
+  {
+    name: "a callee's write moves to the narrowed field",
+    want: "decline",
+    why: "interface",
+    from: "b2.h = 1",
+    to: "b2.w = null",
+    libUses:
+      "export let b2: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nexport function g2(): void { b2.h = 1 }\n",
+    uses:
+      'import { b2, g2 } from "./lib"\nif b2.w != null {\n  g2()\n  const k2: i32 = b2.w\n  print(k2)\n}\n',
+  },
+  {
+    name: "a callee's helper write moves to the narrowed field",
+    want: "decline",
+    why: "interface",
+    from: "b3.h = 1",
+    to: "b3.w = null",
+    libUses:
+      "export let b3: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nfunction h3(): void { b3.h = 1 }\nexport function g3(): void { h3() }\n",
+    uses:
+      'import { b3, g3 } from "./lib"\nif b3.w != null {\n  g3()\n  const k3: i32 = b3.w\n  print(k3)\n}\n',
+  },
+  {
+    name: "a callee's alias write moves to the narrowed field",
+    want: "decline",
+    why: "interface",
+    from: "c5.h = 1",
+    to: "c5.w = null",
+    libUses:
+      "export let b5: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nexport function g5(): void {\n  const c5 = b5\n  c5.h = 1\n}\n",
+    uses:
+      'import { b5, g5 } from "./lib"\nif b5.w != null {\n  g5()\n  const k5: i32 = b5.w\n  print(k5)\n}\n',
+  },
+  {
+    name: "a callee's argument write moves to the narrowed field",
+    want: "decline",
+    why: "ambient",
+    from: "p6.h = 1",
+    to: "p6.w = null",
+    libUses:
+      "export let b6: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nfunction s6(p6: { w: i32 | null, h: i32 }): void { p6.h = 1 }\nexport function g6(): void { s6(b6) }\n",
+    uses:
+      'import { b6, g6 } from "./lib"\nif b6.w != null {\n  g6()\n  const k6: i32 = b6.w\n  print(k6)\n}\n',
+  },
+  {
+    name: "a callee starts calling a writer",
+    want: "decline",
+    why: "interface",
+    from: "print(3)",
+    to: "w4()",
+    libUses:
+      "export let b4: i32 | null = 1\nfunction w4(): void { b4 = null }\n",
+    uses:
+      'import { b4, bump } from "./lib"\nif b4 != null {\n  bump()\n  const k4: i32 = b4\n  print(k4)\n}\n',
+  },
+  {
+    name: "a served call is a second site of a fresh builder",
+    want: "decline",
+    why: "fresh",
+    from: "n * 2",
+    to: "n * 3",
+    libUses:
+      "type W = { f: f64 }\nexport function mk() { { f: 4 } }\nfunction usew(): void {\n  const w: W = mk()\n  print(w.f / 8)\n}\n",
+    uses: 'import { mk } from "./lib"\nprint(mk().f)\n',
+  },
+  {
+    name: "a lib call becomes a second site of a fresh builder",
+    want: "decline",
+    why: "ambient",
+    from: "print(3)",
+    to: "print(mk().f)",
+    libUses: "export function mk() { { f: 4 } }\n",
+    uses: 'import { mk } from "./lib"\nconst w: { f: f64 } = mk()\nprint(w.f / 8)\n',
+  },
+  {
+    name: "a lib call starts delivering a fresh builder to a wider record",
+    want: "decline",
+    why: "fresh",
+    from: "print(3)",
+    to: "takeW(mk())",
+    libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\n",
+    uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
+  },
+  {
+    name: "a lib call stops delivering a fresh builder to a wider record",
+    want: "decline",
+    why: "fresh",
+    from: "takeW(mk())",
+    to: "print(3)",
+    libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
+    uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
   const main = (c.uses ?? "") + MAIN + (bad ? MAIN_BAD : "");
-  const g: Graph = { "main.vl": main, "lib.vl": LIB, "mid.vl": MID };
+  const g: Graph = { "main.vl": main, "lib.vl": (c.libUses ?? "") + LIB, "mid.vl": MID };
   const at = c.at ?? "lib.vl";
   if (!g[at].includes(c.from)) throw new Error(`${c.name}: no \`${c.from}\` in ${at}`);
   return [g, { ...g, [at]: g[at].replace(c.from, c.to) }];
@@ -577,14 +766,16 @@ Deno.test({
         const why = REASON[got.reason] ?? `${got.reason}`;
         const tag = `${c.name}${bad ? " (main with errors)" : ""}`;
         table.push(`${tag}: ${why}, ${got.served} served, rc ${got.rc}`);
-        if (c.want === "serve" && got.served === 0) {
+        const want = bad && c.badWhy ? "decline" : c.want;
+        const wantWhy = bad && c.badWhy ? c.badWhy : c.why;
+        if (want === "serve" && got.served === 0) {
           fails.push(`${tag}: want served, got declined (${why})`);
         }
-        if (c.want === "decline" && got.served !== 0) {
+        if (want === "decline" && got.served !== 0) {
           fails.push(`${tag}: want declined, got ${got.served} served`);
         }
-        if (c.want === "decline" && c.why && why !== c.why) {
-          fails.push(`${tag}: want declined for ${c.why}, got ${why}`);
+        if (want === "decline" && wantWhy && why !== wantWhy) {
+          fails.push(`${tag}: want declined for ${wantWhy}, got ${why}`);
         }
       }
       // A build after the served check is the build a fresh instance makes.
@@ -612,16 +803,24 @@ Deno.test({
   name: "a hash missing an ingredient serves an edit it must not",
   ignore: !ENABLED,
   fn() {
-    // `IH_NO_INFERRED_TYPE | IH_NO_MENTIONS` hides a cut return's type, `IH_NO_MENTIONS` what a
-    // callee writes.
+    // `IH_NO_INFERRED_TYPE | IH_NO_MENTIONS` hides a cut return's type, `IH_NO_LIVE |
+    // IH_NO_MENTIONS` what a callee writes.
     const witness: [string, number][] = [
       ["inferred-return change", 64 | 16],
-      ["a callee main narrows across starts writing the binding", 16],
+      ["a callee main narrows across starts writing the binding", 32768 | 16],
       // `IH_NO_TYPES | IH_NO_MENTIONS` hides both the widened type of a number binding and the
       // body store that widened it; dropping the type alone still declines.
       ["a lib body starts widening a number binding main reads", 8 | 16],
       // The same two hide a record binding's adopted type and the body delivery that adopted it.
       ["a lib body starts adopting an inferred binding main reads", 8 | 16],
+      // `IH_NO_AMBIENT` hides a record spelling one module's literal can adopt in another's check.
+      ["a lib body annotation spells main's literal record", 16384],
+      ["a private lib type spells main's literal record", 16384],
+      ["main's private type spells a lib body literal's record", 16384],
+      // `IH_NO_LIVE` cuts a writing body to its mentions, which miss the field it writes.
+      ["a callee's write moves to the narrowed field", 32768],
+      ["a callee's helper write moves to the narrowed field", 32768],
+      ["a callee's alias write moves to the narrowed field", 32768],
     ];
     for (const [name, mask] of witness) {
       const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, mask);
@@ -730,3 +929,4 @@ export function noise(): void { quiet() }
     }
   },
 });
+
