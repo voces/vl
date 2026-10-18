@@ -325,6 +325,7 @@ import {
   stSeenStackPush,
   substBindsNestRow,
   substNestMode,
+  tyIsForeignGenericSig,
   tyRidesVarOf,
 } from "./check_subst"
 import {
@@ -3829,6 +3830,30 @@ function holeCallNodeTy(
   t
 }
 
+// The result of generic function type `f`, bound to a hole, at hole call `c`'s own arguments
+// under the call's bindings, so two calls at different types each read their own (D6521); -1
+// when `f` is no open signature of a declared generic, `c` is no call of it, or an argument stays open.
+function holeCallRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
+  if c < 0 || c >= P.nodes.length || f < 0 || f >= T.tys.length { return -1 }
+  const ft = T.tys[f]
+  if !(ft is TyFunc) || !tyHasTyVar(ft.fnRet) { return -1 }
+  if !tyIsForeignGenericSig(f) { return -1 }
+  const n = P.nodes[c]
+  if !(n is Call) || n.callArgs.length != ft.fnParamTypes.length { return -1 }
+  const gNames: string[] = []
+  const gTys: i32[] = []
+  let j = 0
+  while j < n.callArgs.length {
+    const at = substTyDeep(nodeTyOf(n.callArgs[j]), bNames, bTys)
+    if at < 0 || tyHasTyVar(at) { return -1 }
+    bindGenWalk(ft.fnParamTypes[j], at, gNames, gTys)
+    j = j + 1
+  }
+  const r = substTyDeep(ft.fnRet, gNames, gTys)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  r
+}
+
 // Refuses, at argument node `arg`, the first binary operator or `print` in `calleeFn`'s body (a
 // declaration or a lambda) that a hole call operand leaves open under the call's bindings and that
 // is undefined once every hole call takes its own instance (`holeCallNodeTy`), as the direct
@@ -4244,7 +4269,11 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
       const fi = callPinFnTy(inner)
       if fi >= 0 {
         const it = T.tys[fi]
-        if it is TyFunc { return it.fnRet }
+        if it is TyFunc {
+          const own = holeCallRetAt(fi, hdAlt[row], bNames, bTys)
+          if own >= 0 { return own }
+          return it.fnRet
+        }
       }
       return rebaseDerivedHole(row, inner)
     }
