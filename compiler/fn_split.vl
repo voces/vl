@@ -21,6 +21,7 @@ import {
   ObjLit,
   P,
   Param,
+  Paren,
   Program,
   RetStmt,
   TypeRef,
@@ -550,6 +551,26 @@ function fsSlotSrc(v: i32): i32 {
   const r = fsConstRet(v)
   if r >= 0 { return r }
   v
+}
+
+// Whether parse node `a` is a lambda literal, parenthesised or not, which a call can hand again
+// as a fresh copy.
+function fsIsLambdaLit(a: i32): boolean {
+  const l = fsParenPeel(a)
+  if l < 0 || l >= fsParseLen { return false }
+  const f = P.nodes[l]
+  f is FuncDecl && f.fnName == ""
+}
+
+// `a` with its parentheses removed.
+function fsParenPeel(a: i32): i32 {
+  let x = a
+  while x >= 0 && x < P.nodes.length {
+    const n = P.nodes[x]
+    if !(n is Paren) { return x }
+    x = n.parInner
+  }
+  x
 }
 
 // The lambda an un-annotated `const` read by identifier `a` holds, when the lambda reads only its
@@ -1424,8 +1445,11 @@ function fsPlanHoles(): i32 {
           const cn = P.nodes[c]
           if cn is Call && f is FuncDecl {
             const a = fsArgOfParam(cn, f, j)
-            if a < 0 || !(P.nodes[a] is Ident) { return fsHoleDecline() }
-            const ad = identDeclOf(a)
+            if a < 0 { return fsHoleDecline() }
+            const lam = fsIsLambdaLit(a)
+            if !lam && !(P.nodes[a] is Ident) { return fsHoleDecline() }
+            let ad = -1
+            if !lam { ad = identDeclOf(a) }
             if ad >= 0 && ad < fsParseLen && P.nodes[ad] is Param {
               work.push(ad)
             } else {
@@ -1523,9 +1547,11 @@ function fsPlanHoleRewrites(): i32 {
     const d = letDeclOfRead(a)
     let mi = -1
     if d >= 0 { mi = memIx(d) }
+    // A lambda literal is handed as itself and then a fresh copy per further key.
     for k in hdKeys[hi] {
       if mi >= 0 { names.push(laneName(mi, k)) }
       else if an is Ident { names.push(an.identName) }
+      else { names.push("") }
     }
     fsHoleHandOut(fsParent[a], a, names, hsSlotNames(hsIx(hdPar[hi])))
     hi = hi + 1
@@ -1566,10 +1592,11 @@ function fsStripTyParam(par: i32): i32 {
 }
 
 // Argument `a` of call `c` reads `names[0]`, and the rest follow it, each passed by the matching
-// name in `pars` when `a` is passed by name.
+// name in `pars` when `a` is passed by name. A name "" is `a` itself, a lambda literal, or a
+// fresh copy of it.
 function fsHoleHandOut(c: i32, a: i32, names: string[], pars: string[]): i32 {
   if names.length == 0 { return 0 }
-  fsRename(a, names[0])
+  if names[0] != "" { fsRename(a, names[0]) }
   const rest: string[] = []
   const restPars: string[] = []
   let i = 1
@@ -1935,13 +1962,12 @@ function fsApplyParams(par: i32, names: string[]): i32 {
 }
 
 // Arguments reading `names` after argument `a` of call `c`, each passed by its name in `pars`
-// when `a` is named. -1 when it cannot.
+// when `a` is named; a name "" is a fresh copy of the lambda literal `a`. -1 when it cannot.
 function fsApplyArgs(c: i32, a: i32, names: string[], pars: string[]): i32 {
   const cn = P.nodes[c]
   if !(cn is Call) || a < 0 || a >= P.nodes.length || a >= nodeToks.length {
     return -1
   }
-  const at = P.nodes[a].pos
   const args: i32[] = []
   const nms: string[] = []
   // In a call naming any argument, a positional one inserted could take another's slot.
@@ -1957,7 +1983,9 @@ function fsApplyArgs(c: i32, a: i32, names: string[], pars: string[]): i32 {
       let j = 0
       while j < names.length {
         P.pos = nodeToks[a] + 1
-        args.push(mkIdent(names[j], at))
+        const v = fsValueNode(fsParenPeel(a), names[j])
+        if v < 0 { return -1 }
+        args.push(v)
         if named { nms.push(pars[j]) } else { nms.push("") }
         j = j + 1
       }

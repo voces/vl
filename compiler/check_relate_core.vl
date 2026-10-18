@@ -109,7 +109,7 @@ import {
   recordJoinMinted,
   recordJoinMintedSet,
 } from "./check_core_state"
-import { argCstr, binCstr, cvNow } from "./check_cstr_rows"
+import { argCstr, binCstr, cvNow, printCstr } from "./check_cstr_rows"
 import {
   inferQuiet,
   lamCheckDepth,
@@ -123,6 +123,7 @@ import {
   TY_ARG_READ_HINT,
   cvViaNote,
   methodInValuePosMsg,
+  printRefRefusal,
   tyArgUnknownText,
   tyParamListText,
   unknownTyTextIn,
@@ -424,6 +425,7 @@ import {
   tyIsHole,
   tyIsLitUnion,
   tyMutEpoch,
+  tyPrintsAsRef,
   tySame,
   tyToStr,
 } from "./check_types"
@@ -3827,10 +3829,11 @@ function holeCallNodeTy(
   t
 }
 
-// Refuses, at argument node `arg`, the first binary operator in `calleeFn`'s body that a hole
-// call operand leaves open under the call's bindings and that is undefined once every hole call
-// takes its own instance (`holeCallNodeTy`), as the direct spelling is (D6300).
-export function judgeHoleCallBinOps(
+// Refuses, at argument node `arg`, the first binary operator or `print` in `calleeFn`'s body (a
+// declaration or a lambda) that a hole call operand leaves open under the call's bindings and that
+// is undefined once every hole call takes its own instance (`holeCallNodeTy`), as the direct
+// spelling is (D6300, D6350).
+export function judgeHoleCallOps(
   calleeFn: i32,
   vNames: string[],
   vTys: i32[],
@@ -3839,11 +3842,31 @@ export function judgeHoleCallBinOps(
   if calleeFn < 0 || calleeFn >= P.nodes.length { return 0 }
   const f = P.nodes[calleeFn]
   if !(f is FuncDecl) { return 0 }
+  let where = "the lambda"
+  if f.fnName != "" { where = "`" + f.fnName + "`" }
+  const printed: {[i32]: boolean} = Map()
+  for pa in printCstr.ix { printed.set(pa, true) }
   const todo: i32[] = [f.fnBody]
   while todo.length > 0 {
     const ix = todo.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
+      if (
+        printed.has(ix)
+        && tyHasTyVar(substTyDeep(nodeTyOf(ix), vNames, vTys))
+      ) {
+        const pt = holeCallNodeTy(ix, vNames, vTys, calleeFn, 0)
+        if pt >= 0 && tyPrintsAsRef(pt, 24) {
+          tErr(
+            printRefRefusal(pt)
+              + " (in "
+              + where
+              + ", at one of the instances it calls a function argument at)",
+            arg,
+          )
+          return 0
+        }
+      }
       if n is BinExpr {
         const l0 = substTyDeep(nodeTyOf(n.binLeft), vNames, vTys)
         const r0 = substTyDeep(nodeTyOf(n.binRight), vNames, vTys)
@@ -3858,9 +3881,9 @@ export function judgeHoleCallBinOps(
                 + tyToStr(softenBareLitTy(lt))
                 + " and "
                 + tyToStr(softenBareLitTy(rt))
-                + " (in `"
-                + f.fnName
-                + "`, at one of the instances it calls a function argument at)",
+                + " (in "
+                + where
+                + ", at one of the instances it calls a function argument at)",
               arg,
             )
             return 0
