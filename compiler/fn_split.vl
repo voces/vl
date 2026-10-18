@@ -677,7 +677,13 @@ export function fsPlan(root: i32): i32 {
     }
   }
   if holes == 0 { fsPlanHoleRewrites() }
-  if lets == 0 || holes == 0 || fns == 0 { return 0 }
+  if holes == 0 || fns == 0 { return 0 }
+  // A let plan keeps a read in a body called at two keys to one slot, which the body's copies
+  // then split (D6321).
+  if lets == 0 {
+    fsPlanInstances()
+    return 0
+  }
   fsPlanInstances()
 }
 
@@ -728,6 +734,21 @@ function fsPlanInstances(): i32 {
     const g = fsInstanceReader(r)
     if g >= 0 && !hasI32(fiDeps, g) && !hasI32(bodies, g) { bodies.push(g) }
   }
+  // An ask inside a module function called at two keys is copied with that body (D6322).
+  for a in fsAsks {
+    if a >= 0 && a < fsParseLen && !fsInstanceDepOk(a) {
+      const g = fsTopStmt(a)
+      if (
+        g >= 0
+        && g != a
+        && P.nodes[g] is FuncDecl
+        && !hasI32(fiDeps, g)
+        && !hasI32(bodies, g)
+      ) {
+        bodies.push(g)
+      }
+    }
+  }
   let rc = 1
   for g in bodies {
     if fsPlanInstanceBody(g) == 0 { rc = 0 }
@@ -748,16 +769,32 @@ function fsInstanceReader(r: i32): i32 {
 }
 
 // Whether `d` can take a copy per instance of a function reading it: a named module-scope
-// function, or a never-written un-annotated module `const` whose slot value is a name.
+// function, or a never-written un-annotated module binding whose slot value is a name.
 function fsInstanceDepOk(d: i32): boolean {
   if d < 0 || d >= fsParseLen || fsParent[d] < 0 { return false }
   if !(P.nodes[fsParent[d]] is Program) { return false }
   const n = P.nodes[d]
   if n is FuncDecl { return n.fnName != "" }
-  if !(n is LetDecl) || n.letKw != "const" || n.letType >= 0 || n.letInit < 0 {
-    return false
-  }
+  if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return false }
+  if n.letKw != "const" && fsBindingWritten(d) { return false }
   P.nodes[fsSlotSrc(n.letInit)] is Ident
+}
+
+// Whether an assignment or compound assignment writes binding `d`.
+function fsBindingWritten(d: i32): boolean {
+  for r in fsIdents {
+    if identDeclOf(r) == d && fsParent[r] >= 0 {
+      const w = P.nodes[fsParent[r]]
+      if (
+        w is BinExpr
+        && w.binLeft == r
+        && (w.binOp == "=" || w.binCompound != "")
+      ) {
+        return true
+      }
+    }
+  }
+  false
 }
 
 // Whether read `r` of dependency `d` can be renamed to a copy: a function is read as a callee.
