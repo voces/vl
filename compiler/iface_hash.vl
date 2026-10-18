@@ -1,0 +1,406 @@
+// A module's interface hash: what its dependents can observe of it, so a module whose hash and
+// whose imports' hashes are unchanged leaves every dependent's check and emit unchanged (S5 in
+// incremental-compilation-design.md, step 4). Three ingredients: the module's tokens with the
+// body of each fully annotated, non-generic function cut out; the names each cut body mentions
+// and how; and the checked type of every top-level binding after the pins. Armed only by a test
+// or a probe; the build never reads it.
+import { FuncDecl, LetDecl, P, Param, Program } from "./ast"
+import { nodeToks } from "./ast"
+import { TokKind } from "./lexer"
+import { lookup } from "./check_scopes"
+import { tyToStr } from "./check_types"
+
+let ihArmed = false
+// Ingredients a mutation check removes, one bit each (see `ifaceHashDrop`).
+let ihDrop = 0
+const IH_KEEP_GENERIC = 1
+const IH_KEEP_UNTYPED_PARAM = 2
+const IH_KEEP_INFERRED_RET = 4
+const IH_NO_TYPES = 8
+const IH_NO_MENTIONS = 16
+const IH_NO_DEEP = 32
+
+// Per module table index, filled by one compile.
+let ihKeys: string[] = []
+let ihOwn: i32[] = []
+let ihDeepOf: i32[] = []
+let ihSpan: i32[] = []
+let ihCut: i32[] = []
+let ihFns: i32[] = []
+// The top-level binding names each module declares, as merged (`name$mN`), flattened.
+let ihNameMod: i32[] = []
+let ihName: string[] = []
+// Import edges: module `ihEdgeFrom[e]` reads module `ihEdgeTo[e]`.
+let ihEdgeFrom: i32[] = []
+let ihEdgeTo: i32[] = []
+
+// Arm the hash for later module compiles (`on` 1), or disarm it (0).
+export function ifaceHashArm(on: i32): i32 {
+  ihArmed = on != 0
+  0
+}
+
+export function ifaceHashArmed(): boolean { ihArmed }
+
+// Drop ingredients from later hashes, a bit mask; the soundness suite's mutation check.
+export function ifaceHashDrop(mask: i32): i32 {
+  ihDrop = mask
+  0
+}
+
+function ihMixByte(h: i32, b: i32): i32 { (h ^ b) * 16777619 }
+
+function ihMixInt(h: i32, v: i32): i32 {
+  let x = ihMixByte(h, v & 255)
+  x = ihMixByte(x, (v >> 8) & 255)
+  x = ihMixByte(x, (v >> 16) & 255)
+  ihMixByte(x, (v >> 24) & 255)
+}
+
+function ihMixStr(h: i32, s: string): i32 {
+  let x = ihMixInt(h, s.length)
+  let i = 0
+  while i < s.length {
+    x = ihMixByte(x, s[i])
+    i = i + 1
+  }
+  x
+}
+
+const IH_SEED = -2128831035
+
+// Forget the previous graph and size the tables to `keys`, the module table.
+export function ihBegin(keys: string[]): i32 {
+  ihKeys = keys
+  ihOwn = []
+  ihDeepOf = []
+  ihSpan = []
+  ihCut = []
+  ihFns = []
+  ihNameMod = []
+  ihName = []
+  ihEdgeFrom = []
+  ihEdgeTo = []
+  let i = 0
+  while i < keys.length {
+    ihOwn.push(IH_SEED)
+    ihDeepOf.push(IH_SEED)
+    ihSpan.push(IH_SEED)
+    ihCut.push(0)
+    ihFns.push(0)
+    i = i + 1
+  }
+  0
+}
+
+export function ihEdge(from: i32, to: i32): i32 {
+  ihEdgeFrom.push(from)
+  ihEdgeTo.push(to)
+  0
+}
+
+// Whether the function's callers see its body: true unless it has no type parameter, every
+// parameter is annotated and its return type is written.
+function ihBodyVisible(fd: FuncDecl): boolean {
+  if fd.fnTyParams.length > 0 && (ihDrop & IH_KEEP_GENERIC) == 0 { return true }
+  if fd.fnRet < 0 && (ihDrop & IH_KEEP_INFERRED_RET) == 0 { return true }
+  let i = 0
+  while i < fd.fnParams.length {
+    const pn = P.nodes[fd.fnParams[i]]
+    if pn is Param {
+      if pn.parType < 0 && (ihDrop & IH_KEEP_UNTYPED_PARAM) == 0 { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// The token index of the `{` that opens the block whose `}` is token `close`, or -1.
+function ihOpenOf(close: i32, lo: i32): i32 {
+  if close < lo || close >= P.toks.length { return -1 }
+  if P.toks[close].kind != "RBRACE" { return -1 }
+  let depth = 0
+  let i = close
+  while i >= lo {
+    const k = P.toks[i].kind
+    const closes = k == "RBRACE"
+    const opens = k == "LBRACE"
+    if closes { depth = depth + 1 }
+    if opens {
+      depth = depth - 1
+      if depth == 0 { return i }
+    }
+    i = i - 1
+  }
+  -1
+}
+
+function ihIsAssignOp(k: TokKind): boolean {
+  k == "EQUAL"
+    || k == "PLUSEQ"
+    || k == "MINUSEQ"
+    || k == "STAREQ"
+    || k == "SLASHEQ"
+    || k == "PERCENTEQ"
+    || k == "AMPEQ"
+    || k == "PIPEEQ"
+    || k == "CARETEQ"
+    || k == "SHLEQ"
+    || k == "SHREQ"
+    || k == "USHREQ"
+    || k == "PLUSPLUS"
+    || k == "MINUSMINUS"
+}
+
+// How the mention at token `i` uses its name: `w` written through, `c` called, `m` a method
+// called on it, `d` a member of something else, `r` read.
+function ihMentionKind(i: i32, hi: i32): string {
+  if i > 0 {
+    const pk = P.toks[i - 1].kind
+    if pk == "DOT" || pk == "QUESTION_DOT" { return "d" }
+  }
+  let j = i + 1
+  let path = 0
+  let more = true
+  while more && j < hi {
+    const k = P.toks[j].kind
+    if (
+      (k == "DOT" || k == "QUESTION_DOT")
+      && j + 1 < hi
+      && P.toks[j + 1].kind == "IDENT"
+    ) {
+      j = j + 2
+      path = path + 1
+    } else if k == "LBRACK" {
+      let depth = 0
+      let stop = false
+      while !stop && j < hi {
+        const bk = P.toks[j].kind
+        if bk == "LBRACK" { depth = depth + 1 }
+        if bk == "RBRACK" {
+          depth = depth - 1
+          if depth == 0 { stop = true }
+        }
+        j = j + 1
+      }
+      path = path + 1
+    } else {
+      more = false
+    }
+  }
+  if j >= hi { return "r" }
+  const nk = P.toks[j].kind
+  if ihIsAssignOp(nk) { return "w" }
+  if nk == "LPAREN" {
+    if path == 0 { return "c" }
+    return "m"
+  }
+  "r"
+}
+
+function ihHasName(names: string[], name: string): boolean {
+  let i = 0
+  while i < names.length {
+    if names[i] == name { return true }
+    i = i + 1
+  }
+  false
+}
+
+// The order-free hash of the names a cut body `[lo, hi)` mentions out of `seen` and its own
+// parameters `ps`, with how.
+function ihMentions(
+  lo: i32,
+  hi: i32,
+  seen: {[string]: boolean},
+  ps: string[],
+): i32 {
+  const got: {[string]: boolean} = Map()
+  let sum = 0
+  let i = lo
+  while i < hi {
+    const t = P.toks[i]
+    if t.kind == "IDENT" && (seen.has(t.text) || ihHasName(ps, t.text)) {
+      const row = ihMentionKind(i, hi) + ":" + t.text
+      if !got.has(row) {
+        got[row] = true
+        sum = sum + ihMixStr(IH_SEED, row)
+      }
+    }
+    i = i + 1
+  }
+  sum
+}
+
+// The source spelling of a merged top-level name: `name$mN` without its suffix.
+function ihSourceName(name: string): string {
+  let i = name.length - 1
+  while i > 0 {
+    if name[i] == '$' && i + 1 < name.length && name[i + 1] == 'm' {
+      return name.slice(0, i)
+    }
+    i = i - 1
+  }
+  name
+}
+
+// Module `m`'s token-side ingredients, from its parse `root` (tokens `[lo, hi)`) before the
+// check pins anything; `visible` holds the local names its imports bind.
+export function ihModule(
+  m: i32,
+  root: i32,
+  lo: i32,
+  hi: i32,
+  visible: string[],
+): i32 {
+  if m < 0 || m >= ihOwn.length { return 0 }
+  const seen: {[string]: boolean} = Map()
+  let v = 0
+  while v < visible.length {
+    seen[visible[v]] = true
+    v = v + 1
+  }
+  const cutLo: i32[] = []
+  const cutHi: i32[] = []
+  const cutParams: string[][] = []
+  const cutName: string[] = []
+  const rn = P.nodes[root]
+  if rn is Program {
+    const ss = rn.progStmts
+    let si = 0
+    while si < ss.length {
+      const st = P.nodes[ss[si]]
+      if st is FuncDecl {
+        ihNameMod.push(m)
+        ihName.push(st.fnName)
+        seen[ihSourceName(st.fnName)] = true
+        ihFns[m] = ihFns[m] + 1
+        if !ihBodyVisible(st) && st.fnBody >= 0 && st.fnBody < nodeToks.length {
+          const close = nodeToks[st.fnBody]
+          const open = ihOpenOf(close, lo)
+          if open >= lo && close < hi {
+            cutLo.push(open + 1)
+            cutHi.push(close)
+            cutName.push(st.fnName)
+            const ps: string[] = []
+            let pi = 0
+            while pi < st.fnParams.length {
+              const pn = P.nodes[st.fnParams[pi]]
+              if pn is Param { ps.push(pn.parName) }
+              pi = pi + 1
+            }
+            cutParams.push(ps)
+          }
+        }
+      }
+      if st is LetDecl {
+        ihNameMod.push(m)
+        ihName.push(st.letName)
+        seen[ihSourceName(st.letName)] = true
+      }
+      si = si + 1
+    }
+  }
+  ihCut[m] = cutLo.length
+  // The tokens outside every cut body, and their positions as a separate hash.
+  let h = IH_SEED
+  let sp = IH_SEED
+  let c = 0
+  let i = lo
+  while i < hi {
+    if c < cutLo.length && i == cutLo[c] {
+      h = ihMixStr(h, "{cut}")
+      i = cutHi[c]
+      c = c + 1
+    } else {
+      const t = P.toks[i]
+      h = ihMixStr(h, t.text)
+      sp = ihMixInt(ihMixInt(sp, t.line), t.col)
+      i = i + 1
+    }
+  }
+  if (ihDrop & IH_NO_MENTIONS) == 0 {
+    let sum = 0
+    let k = 0
+    while k < cutLo.length {
+      const ms = ihMentions(cutLo[k], cutHi[k], seen, cutParams[k])
+      sum = sum + ihMixInt(ihMixStr(IH_SEED, cutName[k]), ms)
+      k = k + 1
+    }
+    h = ihMixInt(h, sum)
+  }
+  ihOwn[m] = h
+  ihSpan[m] = sp
+  0
+}
+
+// After the check: fold each top-level binding's checked type into its module's hash, then the
+// deep hash of every module over its imports'. A cycle-free graph is the driver's invariant.
+export function ihFinish(): i32 {
+  if (ihDrop & IH_NO_TYPES) == 0 {
+    let n = 0
+    while n < ihName.length {
+      const m = ihNameMod[n]
+      const ty = lookup(ihName[n])
+      let shown = "?"
+      if ty >= 0 { shown = tyToStr(ty) }
+      ihOwn[m] = ihMixStr(ihMixStr(ihOwn[m], ihName[n]), shown)
+      n = n + 1
+    }
+  }
+  const done: boolean[] = []
+  let d = 0
+  while d < ihOwn.length {
+    done.push(false)
+    ihDeepOf[d] = ihOwn[d]
+    d = d + 1
+  }
+  if (ihDrop & IH_NO_DEEP) != 0 { return 0 }
+  let m = 0
+  while m < ihOwn.length {
+    ihDeepVisit(m, done)
+    m = m + 1
+  }
+  0
+}
+
+function ihDeepVisit(m: i32, done: boolean[]): i32 {
+  if done[m] { return ihDeepOf[m] }
+  done[m] = true
+  let sum = 0
+  let e = 0
+  while e < ihEdgeFrom.length {
+    if ihEdgeFrom[e] == m && ihEdgeTo[e] != m {
+      sum = sum + ihMixInt(IH_SEED, ihDeepVisit(ihEdgeTo[e], done))
+    }
+    e = e + 1
+  }
+  ihDeepOf[m] = ihMixInt(ihOwn[m], sum)
+  ihDeepOf[m]
+}
+
+// Readers over the last armed module compile, by module table index (0 is the entry).
+export function ifaceHashCount(): i32 { ihOwn.length }
+
+export function ifaceHashKeyLen(i: i32): i32 {
+  if i < 0 || i >= ihKeys.length { return 0 }
+  ihKeys[i].length
+}
+
+export function ifaceHashKeyAt(i: i32, j: i32): i32 {
+  if i < 0 || i >= ihKeys.length { return 0 }
+  if j < 0 || j >= ihKeys[i].length { return 0 }
+  ihKeys[i][j]
+}
+
+// `which` 0 the module's own hash, 1 its deep hash over its imports, 2 its declaration
+// positions, 3 its count of cut bodies, 4 its count of top-level functions.
+export function ifaceHashOf(i: i32, which: i32): i32 {
+  if i < 0 || i >= ihOwn.length { return 0 }
+  if which == 0 { return ihOwn[i] }
+  if which == 1 { return ihDeepOf[i] }
+  if which == 2 { return ihSpan[i] }
+  if which == 3 { return ihCut[i] }
+  if which == 4 { return ihFns[i] }
+  0
+}
