@@ -910,6 +910,97 @@ export function iisReset() {
   0
 }
 
+// The element name and row of field `pi` of the shape being interned, by its code: a ref-list
+// field its element, a nullable one its non-null part's, and any other code the shape-text
+// table's answer.
+function iisPushFieldElem(
+  tyIx: i32,
+  names: string[],
+  codes: i32[],
+  texts: string[],
+  pi: i32,
+  fkK: i32,
+) {
+  if codes[pi] == FC_REF_LIST {
+    // A ref-list field records its canonical ref-array element name (parens stripped for
+    // a value-union element, so it keys the same slot every other union position uses),
+    // so `sFieldRefSlot` finds the element's interned slot. Without this an inline-shape
+    // ref-list field stored "" and the read failed to resolve the element.
+    let e5 = refArrElemName(texts[pi])
+    // A ref-list element that is itself an inline shape is invisible to `refArrElemName`
+    // until the shape is interned, so it returns "". Pre-interned by
+    // `collectNestedFieldShapes`, so here just key it by its stripped text. A nominal,
+    // union, or scalar element keeps `refArrElemName`.
+    if e5 == "" {
+      // The trailing-`[]` cut at its home (`tyname.arrElemNameRaw`). The guard is
+      // dischargeable: `codes[pi] == 5` implies `nameFieldCode(texts[pi]) == 5`, since the
+      // code and text are pushed together and `fieldCodeOfSpelling`'s single `return 5` is
+      // inside `if nameIsArray(t)`.
+      const raw5 = arrElemNameRaw(texts[pi])
+      if structIndexByName(raw5) >= 0 { e5 = raw5 }
+      // A grouping-paren element spelling carries no semantic meaning, but
+      // `refArrElemName` keys the paren-free spelling, so peel the grouping pair to key
+      // the same slot. Without this the field recorded "" and either failed loudly or,
+      // with a same-fieldset twin in scope, fieldset-collided onto its own row — invalid wasm.
+      if e5 == "" {
+        const uw5 = normTypeAtom(raw5)
+        if uw5.length != raw5.length {
+          if structIndexByName(uw5) >= 0 { e5 = uw5 }
+        }
+      }
+      // The two rungs above both ask the struct table, which a nested inline shape is
+      // classified BEFORE, so a struct element with no row yet leaves them both empty. The
+      // deferred key is what the declared field and the anonymous mint record for the same
+      // element, and an unkeyed ref-list field cannot resolve its slot at emit (D1692).
+      if e5 == "" { e5 = shapeFieldElemName(texts[pi], FC_REF_LIST) }
+    }
+    sFieldElemName.push(e5)
+    recordSFieldElemRow(e5, fkK) // D5 + B6b
+    if isValueUnionName(e5) { registerValueUnionName(e5) }
+  } else if codes[pi] == FC_NUL_REF_LIST {
+    // A nullable ref-list field's element name is the ref-array element of the non-null
+    // part; the element shape or union is pre-interned in the parse loop.
+    let e28 = refArrElemName(nullablePartOf(texts[pi]))
+    if e28 == "" {
+      // The same cut home (`tyname.arrElemNameRaw`) and the same discharge: `codes[pi] ==
+      // 28` is reachable only through `fieldCodeOfSpelling`'s single `return 28`, which is
+      // `nameIsRefArray(nullablePartOf(t))`, and `nameIsRefArray` implies `nameIsArray` —
+      // so the guard is dischargeable and the routing stays legal.
+      const raw28 = arrElemNameRaw(nullablePartOf(texts[pi]))
+      if structIndexByName(raw28) >= 0 { e28 = raw28 }
+      // The code-5 arm's deferred fallback, for the same reason: the struct table cannot
+      // answer for an element declared after the shape that lists it (D1692).
+      if e28 == "" { e28 = shapeFieldElemName(texts[pi], FC_NUL_REF_LIST) }
+    }
+    sFieldElemName.push(e28)
+    recordSFieldElemRow(e28, fkK) // D5 + B6b
+    if isValueUnionName(e28) { registerValueUnionName(e28) }
+  } else {
+    // Every other code is recorded identically from the field's spelling, so the
+    // shape-text table answers: code 16 the union name, 15 the nested-struct target,
+    // 19/29 the map's value name, 0/4 the litunion atom name, 30 the niche's union. Only
+    // codes 5 and 28 above stay local, resolving through the already-interned tables.
+    const en = shapeFieldElemName(texts[pi], codes[pi])
+    // The field's own row, projected per code, where the name it accompanies is not
+    // one `repElemKey` keys nominally and not a literal union.
+    let enTy = -1
+    if en != "" {
+      if !elemNameIsNominal(en) {
+        if !nameIsLitUnionType(en) && !nameIsLitUnionArray(en) {
+          enTy = shapeFieldElemRow(shapeFieldRowOf(tyIx, names[pi]), codes[pi])
+        }
+      }
+    }
+    sFieldElemName.push(en)
+    recordSFieldElemRowTy(en, fkK, enTy) // D5 + B6b
+    // The union FIELD's name keys its atom set; registering it interns the shared
+    // box + the value-box reps it needs (this runs after `collectU`, but before any
+    // type-index math).
+    if codes[pi] == FC_UNION { registerValueUnionName(en) }
+  }
+  0
+}
+
 function internInlineShapeTyGo(nm: string, tyIx: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
@@ -1015,86 +1106,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
     // whose element is a map. `nameIsI32KeyedMap`'s key cut needs only the `{[K]:` prefix,
     // so it answers correctly for a map spelling's list and `| null` widths too.
     const fkK = mapNameKeyKind(texts[pi])
-    if codes[pi] == FC_REF_LIST {
-      // A ref-list field records its canonical ref-array element name (parens stripped for
-      // a value-union element, so it keys the same slot every other union position uses),
-      // so `sFieldRefSlot` finds the element's interned slot. Without this an inline-shape
-      // ref-list field stored "" and the read failed to resolve the element.
-      let e5 = refArrElemName(texts[pi])
-      // A ref-list element that is itself an inline shape is invisible to `refArrElemName`
-      // until the shape is interned, so it returns "". Pre-interned by
-      // `collectNestedFieldShapes`, so here just key it by its stripped text. A nominal,
-      // union, or scalar element keeps `refArrElemName`.
-      if e5 == "" {
-        // The trailing-`[]` cut at its home (`tyname.arrElemNameRaw`). The guard is
-        // dischargeable: `codes[pi] == 5` implies `nameFieldCode(texts[pi]) == 5`, since the
-        // code and text are pushed together and `fieldCodeOfSpelling`'s single `return 5` is
-        // inside `if nameIsArray(t)`.
-        const raw5 = arrElemNameRaw(texts[pi])
-        if structIndexByName(raw5) >= 0 { e5 = raw5 }
-        // A grouping-paren element spelling carries no semantic meaning, but
-        // `refArrElemName` keys the paren-free spelling, so peel the grouping pair to key
-        // the same slot. Without this the field recorded "" and either failed loudly or,
-        // with a same-fieldset twin in scope, fieldset-collided onto its own row — invalid wasm.
-        if e5 == "" {
-          const uw5 = normTypeAtom(raw5)
-          if uw5.length != raw5.length {
-            if structIndexByName(uw5) >= 0 { e5 = uw5 }
-          }
-        }
-        // The two rungs above both ask the struct table, which a nested inline shape is
-        // classified BEFORE, so a struct element with no row yet leaves them both empty. The
-        // deferred key is what the declared field and the anonymous mint record for the same
-        // element, and an unkeyed ref-list field cannot resolve its slot at emit (D1692).
-        if e5 == "" { e5 = shapeFieldElemName(texts[pi], FC_REF_LIST) }
-      }
-      sFieldElemName.push(e5)
-      recordSFieldElemRow(e5, fkK) // D5 + B6b
-      if isValueUnionName(e5) { registerValueUnionName(e5) }
-    } else if codes[pi] == FC_NUL_REF_LIST {
-      // A nullable ref-list field's element name is the ref-array element of the non-null
-      // part; the element shape or union is pre-interned in the parse loop.
-      let e28 = refArrElemName(nullablePartOf(texts[pi]))
-      if e28 == "" {
-        // The same cut home (`tyname.arrElemNameRaw`) and the same discharge: `codes[pi] ==
-        // 28` is reachable only through `fieldCodeOfSpelling`'s single `return 28`, which is
-        // `nameIsRefArray(nullablePartOf(t))`, and `nameIsRefArray` implies `nameIsArray` —
-        // so the guard is dischargeable and the routing stays legal.
-        const raw28 = arrElemNameRaw(nullablePartOf(texts[pi]))
-        if structIndexByName(raw28) >= 0 { e28 = raw28 }
-        // The code-5 arm's deferred fallback, for the same reason: the struct table cannot
-        // answer for an element declared after the shape that lists it (D1692).
-        if e28 == "" { e28 = shapeFieldElemName(texts[pi], FC_NUL_REF_LIST) }
-      }
-      sFieldElemName.push(e28)
-      recordSFieldElemRow(e28, fkK) // D5 + B6b
-      if isValueUnionName(e28) { registerValueUnionName(e28) }
-    } else {
-      // Every other code is recorded identically from the field's spelling, so the
-      // shape-text table answers: code 16 the union name, 15 the nested-struct target,
-      // 19/29 the map's value name, 0/4 the litunion atom name, 30 the niche's union. Only
-      // codes 5 and 28 above stay local, resolving through the already-interned tables.
-      const en = shapeFieldElemName(texts[pi], codes[pi])
-      // The field's own row, projected per code, where the name it accompanies is not
-      // one `repElemKey` keys nominally and not a literal union.
-      let enTy = -1
-      if en != "" {
-        if !elemNameIsNominal(en) {
-          if !nameIsLitUnionType(en) && !nameIsLitUnionArray(en) {
-            enTy = shapeFieldElemRow(
-              shapeFieldRowOf(tyIx, names[pi]),
-              codes[pi],
-            )
-          }
-        }
-      }
-      sFieldElemName.push(en)
-      recordSFieldElemRowTy(en, fkK, enTy) // D5 + B6b
-      // The union FIELD's name keys its atom set; registering it interns the shared
-      // box + the value-box reps it needs (this runs after `collectU`, but before any
-      // type-index math).
-      if codes[pi] == FC_UNION { registerValueUnionName(en) }
-    }
+    iisPushFieldElem(tyIx, names, codes, texts, pi, fkK)
     pj = pj + 1
   }
   sNames.length - 1

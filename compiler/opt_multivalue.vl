@@ -2517,6 +2517,87 @@ function nullableOf(v: i32): i32 {
   v
 }
 
+// The `A_PICK` rewrite of op `op` at `[off, end)`: drops the members past `b`, and keeps member
+// `a` of a struct read through a scratch local. Returns the next free local, or -1 when it will
+// not encode.
+function emitPickOp(
+  code: u8[],
+  op: i32,
+  off: i32,
+  end: i32,
+  a: i32,
+  b: i32,
+  nextLocal0: i32,
+  extra: i32[],
+): i32 {
+  let nextLocal = nextLocal0
+  if b == 0 || a >= b { return -1 }
+  let i = a + 1
+  while i < b {
+    code.push(0x1a)
+    i = i + 1
+  }
+  if a > 0 {
+    if op != 0xfb0002 { return -1 }
+    const d = wcNew(mB, off + 1, end)
+    wcU32(d)
+    const fs = fieldsOf(wcU32(d))
+    if a >= fs.length { return -1 }
+    const fnum = fs[a]
+    let sl = scratchNum[fnum] ?? -1
+    if sl < 0 {
+      sl = nextLocal
+      nextLocal = nextLocal + 1
+      extra.push(fnum)
+      scratchNum[fnum] = sl
+    }
+    code.push(0x21)
+    putUleb(code, sl)
+    i = 0
+    while i < a {
+      code.push(0x1a)
+      i = i + 1
+    }
+    code.push(0x20)
+    putUleb(code, sl)
+  }
+  nextLocal
+}
+
+// The local header of body `bi`, its old entries then the `extra` locals in runs, followed by
+// `code`, into `eOut`; `eNew` is shifted past the header. False when a local cannot be spelled.
+function emitBodyHeader(bi: i32, extra: i32[], code: u8[]): boolean {
+  const hc = wcNew(mB, bR0[bi], bOps[bi])
+  const nEntries = wcU32(hc)
+  const entriesStart = hc.pos
+  const gN: i32[] = []
+  const gV: i32[] = []
+  for v in extra {
+    if gV.length > 0 && gV[gV.length - 1] == v {
+      gN[gN.length - 1] = gN[gN.length - 1] + 1
+    } else {
+      gN.push(1)
+      gV.push(v)
+    }
+  }
+  putUleb(eOut, nEntries + gV.length)
+  copyBytes(eOut, mB, entriesStart, bOps[bi] - entriesStart)
+  let g = 0
+  while g < gV.length {
+    putUleb(eOut, gN[g])
+    if !putVal(eOut, gV[g]) { return false }
+    g = g + 1
+  }
+  const header = eOut.length
+  copyBytes(eOut, code, 0, code.length)
+  let i = 0
+  while i < eNew.length {
+    eNew[i] = eNew[i] + header
+    i = i + 1
+  }
+  true
+}
+
 // Body `f` rewritten by plan `plan` for the context `(f, mask, r)`, into `eOut`, with each op's
 // module offset beside its body offset in `eOld`/`eNew`; false when it will not encode.
 function emitBody(f: i32, slo: i32, shi: i32, plan: i32): boolean {
@@ -2613,36 +2694,8 @@ function emitBody(f: i32, slo: i32, shi: i32, plan: i32): boolean {
         i = i - 1
       }
     } else if act == A_PICK {
-      if b == 0 || a >= b { return false }
-      let i = a + 1
-      while i < b {
-        code.push(0x1a)
-        i = i + 1
-      }
-      if a > 0 {
-        if op != 0xfb0002 { return false }
-        const d = wcNew(mB, off + 1, end)
-        wcU32(d)
-        const fs = fieldsOf(wcU32(d))
-        if a >= fs.length { return false }
-        const fnum = fs[a]
-        let sl = scratchNum[fnum] ?? -1
-        if sl < 0 {
-          sl = nextLocal
-          nextLocal = nextLocal + 1
-          extra.push(fnum)
-          scratchNum[fnum] = sl
-        }
-        code.push(0x21)
-        putUleb(code, sl)
-        i = 0
-        while i < a {
-          code.push(0x1a)
-          i = i + 1
-        }
-        code.push(0x20)
-        putUleb(code, sl)
-      }
+      nextLocal = emitPickOp(code, op, off, end, a, b, nextLocal, extra)
+      if nextLocal < 0 { return false }
     } else if act == A_EXTRACT {
       let sl = scratchRef[a] ?? -1
       if sl < 0 {
@@ -2675,36 +2728,7 @@ function emitBody(f: i32, slo: i32, shi: i32, plan: i32): boolean {
     }
     k = k + 1
   }
-  // The header: the old entries, then the new locals in runs.
-  const hc = wcNew(mB, bR0[bi], bOps[bi])
-  const nEntries = wcU32(hc)
-  const entriesStart = hc.pos
-  const gN: i32[] = []
-  const gV: i32[] = []
-  for v in extra {
-    if gV.length > 0 && gV[gV.length - 1] == v {
-      gN[gN.length - 1] = gN[gN.length - 1] + 1
-    } else {
-      gN.push(1)
-      gV.push(v)
-    }
-  }
-  putUleb(eOut, nEntries + gV.length)
-  copyBytes(eOut, mB, entriesStart, bOps[bi] - entriesStart)
-  let g = 0
-  while g < gV.length {
-    putUleb(eOut, gN[g])
-    if !putVal(eOut, gV[g]) { return false }
-    g = g + 1
-  }
-  const header = eOut.length
-  copyBytes(eOut, code, 0, code.length)
-  let i = 0
-  while i < eNew.length {
-    eNew[i] = eNew[i] + header
-    i = i + 1
-  }
-  true
+  emitBodyHeader(bi, extra, code)
 }
 
 function getField(code: u8[], base: i32, fs: i32[], decl: boolean, i: i32) {

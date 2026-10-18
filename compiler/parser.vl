@@ -2651,6 +2651,57 @@ function parseTypeDeclNewMarker(): i32 {
   isNew
 }
 
+// A body-scoped declaration's minted name, and its generic base ("" when not generic).
+type TypeDeclScoped = {
+  name: string,
+  gpBase: string,
+}
+
+// Mints the unique name of a declaration `name` inside a block and pushes its scope row; a
+// declaration made generic by capture appends the captured parameters to `gpNames`.
+function parseTypeDeclScopeRow(
+  name0: string,
+  gpBase0: string,
+  gpNames: string[],
+): TypeDeclScoped {
+  let name = name0
+  let gpBase = gpBase0
+  let srcName = name
+  if gpBase != "" { srcName = gpBase }
+  btSeq = btSeq + 1
+  const mangled = srcName + "$b" + i32ToStr(btSeq)
+  const caps = btCaptureScan()
+  if caps.length > 0 || gpBase != "" {
+    // Declared generic, or made generic by capture: the captured parameters are
+    // appended after the declaration's own, which is the order every reference
+    // spells them in (`parseTypeAtom`).
+    gpBase = mangled
+    name = btCapturedGenericName(mangled, caps, gpNames)
+  } else {
+    name = mangled
+  }
+  btNames.push(srcName)
+  btBases.push(mangled)
+  btArgs.push(btCaptureText(caps))
+  btIsNew.push(false)
+  btPendingBase = mangled
+  const r: TypeDeclScoped = { name: name, gpBase: gpBase }
+  r
+}
+
+// The count of `[]` suffixes on a `{ … }` type body, consumed from the stream.
+function parseTypeDeclArrSuffix(): i32 {
+  let arrSuffix = 0
+  let asGoing = atTypeCont("LBRACK")
+  while asGoing {
+    advance()             // "["
+    expectClose("RBRACK") // "]"
+    arrSuffix = arrSuffix + 1
+    asGoing = atTypeCont("LBRACK")
+  }
+  arrSuffix
+}
+
 // A struct type declaration `type N = { field: type, … }`; fields are comma-separated with a
 // tolerated trailing comma, and `tdFields` are the `FieldDef` indices in order. `flatAt` is
 // the source offset of a preceding `flat` modifier, or -1, and doubles as the declaration's
@@ -2685,25 +2736,9 @@ function parseTypeDecl(flatAt: i32) {
   // name, and popped by the enclosing block's `btTrimTo`, not here.
   btPendingBase = ""
   if btDepth > 0 {
-    let srcName = name
-    if gpBase != "" { srcName = gpBase }
-    btSeq = btSeq + 1
-    const mangled = srcName + "$b" + i32ToStr(btSeq)
-    const caps = btCaptureScan()
-    if caps.length > 0 || gpBase != "" {
-      // Declared generic, or made generic by capture: the captured parameters are
-      // appended after the declaration's own, which is the order every reference
-      // spells them in (`parseTypeAtom`).
-      gpBase = mangled
-      name = btCapturedGenericName(mangled, caps, gpNames)
-    } else {
-      name = mangled
-    }
-    btNames.push(srcName)
-    btBases.push(mangled)
-    btArgs.push(btCaptureText(caps))
-    btIsNew.push(false)
-    btPendingBase = mangled
+    const scoped = parseTypeDeclScopeRow(name, gpBase, gpNames)
+    name = scoped.name
+    gpBase = scoped.gpBase
   }
   // A bodyless `type Bar` is reported once, at the declaration, instead of cascading
   // "expected EQUAL" from mis-parsing the following line as the body. Recovery is a sentinel
@@ -2803,14 +2838,7 @@ function parseTypeDecl(flatAt: i32) {
   // `]` still on the stream and, unclaimed, would complete as the plain struct `{n: i32}`.
   // It is consumed here rather than in a continuation arm because it binds tighter than `&`
   // and `|`, and no newline is skipped ahead of it — a `[` on the next line is a statement.
-  let arrSuffix = 0
-  let asGoing = atTypeCont("LBRACK")
-  while asGoing {
-    advance()             // "["
-    expectClose("RBRACK") // "]"
-    arrSuffix = arrSuffix + 1
-    asGoing = atTypeCont("LBRACK")
-  }
+  const arrSuffix = parseTypeDeclArrSuffix()
   // Object-type structural intersection `type AB = { … } & { … }`, or a union whose first
   // variant is an inline object: the struct body is only the first operand. The right side
   // re-encodes as a `UnionDecl` over synthetic names, which `nameToTy` folds. Newlines are
