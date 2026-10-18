@@ -9,6 +9,7 @@ import {
   ArrayLit,
   BinExpr,
   Block,
+  Call,
   FieldDef,
   FieldInit,
   FuncDecl,
@@ -25,6 +26,7 @@ import {
   P,
   Param,
   Paren,
+  RetStmt,
   StrLit,
   TS_APP,
   TS_ARR,
@@ -51,6 +53,8 @@ import {
   callTyArgsOf,
   declNameTokOf,
   i32ToStr,
+  nodeChildren,
+  stmtAlwaysExits,
   tsKidCount,
   tsKidStart,
   tsKids,
@@ -332,6 +336,7 @@ import {
   joinTyParamNull,
   markTpJoinApart,
   noteHoleTpJoin,
+  paramHoleName,
   paramJoinDropsNull,
   sameDeclaredTyParam,
   tpArmJoinDepth,
@@ -453,6 +458,7 @@ import {
   mimpNoteMiss,
   mimpSpecsFor,
 } from "./missing_import"
+import { identDeclOf } from "./symbols"
 import {
   annGenAppSpanEnds,
   arrElemNameRaw,
@@ -3698,6 +3704,7 @@ export function genFnHoleCallInsts(
             gNames,
             gTys,
             out,
+            calleeFn,
           )
           if r < 0 { return 0 }
           if r == 0 { open.push(ci) }
@@ -3720,6 +3727,7 @@ export function genFnHoleCallInsts(
         gNames,
         gTys,
         out,
+        calleeFn,
       )
       if r < 0 { return 0 }
       if r == 0 { still.push(oc) }
@@ -3742,6 +3750,7 @@ function genFnHoleCallOwn(
   gNames: string[],
   gTys: i32[],
   out: i32[],
+  calleeFn: i32,
 ): i32 {
   if ci < 0 || ci >= argCstr.at.length || row < 0 || row >= hdInner.length {
     return -1
@@ -3750,6 +3759,10 @@ function genFnHoleCallOwn(
   if pj < 0 || pj >= vf.fnParamTypes.length { return -1 }
   let rat = substTyDeep(argCstr.at[ci], vNames, vTys)
   if rat < 0 || tyIsDeferredJoin(rat) { return -1 }
+  if tyHasTyVar(rat) {
+    const own = holeCallNodeTy(argCstr.node[ci], vNames, vTys, calleeFn, 0)
+    if own >= 0 { rat = own }
+  }
   if tyHasTyVar(rat) && gNames.length > 0 {
     rat = substTyDeep(rat, gNames, gTys)
   }
@@ -3762,13 +3775,178 @@ function genFnHoleCallOwn(
     for nm in oNames { gNames.push(nm) }
     for t in oTys { gTys.push(t) }
   }
-  const inst = substTyDeep(vt, oNames, oTys)
+  let inst = substTyDeep(vt, oNames, oTys)
+  // A function of several parameters takes its instance from the whole call.
+  if inst >= 0 && tyHasTyVar(inst) && vf.fnParamTypes.length > 1 {
+    const c = holeCallOfArg(calleeFn, argCstr.node[ci], pj)
+    if c >= 0 { inst = holeCallInstOf(c, vNames, vTys, calleeFn, 0) }
+  }
   if inst < 0 || tyHasTyVar(inst) { return 1 }
   for o in out {
     if tySame(o, inst) { return 1 }
   }
   out.push(inst)
   1
+}
+
+// How deep `holeCallNodeTy` follows calls nested in calls.
+const HOLE_CALL_NODE_MAX = 8
+
+// The type of argument node `a` in `calleeFn`'s body under the call's bindings, where a call of
+// one of its hole parameters takes that function's own instance at that call's arguments
+// (`h(g(x))`, D6250); -1 when it stays open.
+function holeCallNodeTy(
+  a: i32,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  const ix = parenPeelIx(a)
+  if ix < 0 || ix >= P.nodes.length || depth > HOLE_CALL_NODE_MAX { return -1 }
+  const n = P.nodes[ix]
+  if n is Ident {
+    const d = identDeclOf(ix)
+    if d >= 0 && d < P.nodes.length {
+      const l = P.nodes[d]
+      if l is LetDecl && l.letType < 0 && l.letInit >= 0 {
+        return holeCallNodeTy(l.letInit, vNames, vTys, calleeFn, depth + 1)
+      }
+    }
+  }
+  if n is Call && holeParamIndexOfCall(n, vNames, calleeFn) >= 0 {
+    const inst = holeCallInstOf(ix, vNames, vTys, calleeFn, depth)
+    if inst < 0 { return -1 }
+    const f = T.tys[inst]
+    if f is TyFunc { return f.fnRet }
+    return -1
+  }
+  const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
+  if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
+  t
+}
+
+// The result of a call of declared function `calleeFn` with no declared return, read off its
+// `return`s and tail values under the call's bindings (`holeCallNodeTy`), where a returned hole
+// call takes its own instance (`return g(g(x))`, D6251); -1 when one stays open, two disagree,
+// or the body can end with no value.
+export function holeRetTyOf(calleeFn: i32, vNames: string[], vTys: i32[]): i32 {
+  if calleeFn < 0 || calleeFn >= P.nodes.length { return -1 }
+  const f = P.nodes[calleeFn]
+  if !(f is FuncDecl) || f.fnRet >= 0 { return -1 }
+  let got = -1
+  const tw: i32[] = [f.fnBody]
+  while tw.length > 0 {
+    const at = parenPeelIx(tw.pop() ?? -1)
+    if at < 0 || at >= P.nodes.length { return -1 }
+    const an = P.nodes[at]
+    if an is IfStmt && an.ifElse < 0 { return -1 }
+    if (
+      !tailPushIfArms(at, tw)
+      && !tailPushMatchArms(at, tw)
+      && !tailPushBlockTail(at, tw)
+      && !stmtAlwaysExits(at)
+    ) {
+      if an is LetDecl { return -1 }
+      const t = holeCallNodeTy(at, vNames, vTys, calleeFn, 0)
+      if t < 0 || t == TY_VOID || (got >= 0 && !tySame(got, t)) { return -1 }
+      got = t
+    }
+  }
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is RetStmt {
+        if n.retArg < 0 { return -1 }
+        const t = holeCallNodeTy(n.retArg, vNames, vTys, calleeFn, 0)
+        if t < 0 || (got >= 0 && !tySame(got, t)) { return -1 }
+        got = t
+      } else if !(n is FuncDecl) {
+        for ch in nodeChildren(ix) { todo.push(ch) }
+      }
+    }
+  }
+  got
+}
+
+// The instance of the function bound to the hole parameter call `c` calls, at `c`'s own
+// arguments (`holeCallNodeTy`); -1 when one stays open or `c` calls no hole parameter.
+function holeCallInstOf(
+  c: i32,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  if c < 0 || c >= P.nodes.length { return -1 }
+  const n = P.nodes[c]
+  if !(n is Call) { return -1 }
+  const k = holeParamIndexOfCall(n, vNames, calleeFn)
+  if k < 0 || k >= vTys.length { return -1 }
+  const vt = vTys[k]
+  if vt < 0 || vt >= T.tys.length { return -1 }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) || vf.fnParamTypes.length != n.callArgs.length {
+    return -1
+  }
+  const oNames: string[] = []
+  const oTys: i32[] = []
+  let j = 0
+  while j < n.callArgs.length {
+    const at = holeCallNodeTy(n.callArgs[j], vNames, vTys, calleeFn, depth + 1)
+    if at < 0 { return -1 }
+    bindGenWalk(vf.fnParamTypes[j], at, oNames, oTys)
+    j = j + 1
+  }
+  const inst = substTyDeep(vt, oNames, oTys)
+  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst
+}
+
+// The call in declared function `calleeFn`'s body whose argument `pj` is node `a`, or -1.
+function holeCallOfArg(calleeFn: i32, a: i32, pj: i32): i32 {
+  if calleeFn < 0 || calleeFn >= P.nodes.length || a < 0 { return -1 }
+  const f = P.nodes[calleeFn]
+  if !(f is FuncDecl) { return -1 }
+  const todo: i32[] = [f.fnBody]
+  while todo.length > 0 {
+    const ix = todo.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call && pj < n.callArgs.length && n.callArgs[pj] == a {
+        return ix
+      }
+      for ch in nodeChildren(ix) { todo.push(ch) }
+    }
+  }
+  -1
+}
+
+// The index in `vNames` of the hole parameter of declared function `calleeFn` that call `n`
+// calls by name, or -1.
+function holeParamIndexOfCall(n: Call, vNames: string[], calleeFn: i32): i32 {
+  if calleeFn < 0 || calleeFn >= P.nodes.length || n.callFn < 0 { return -1 }
+  if n.callFn >= P.nodes.length { return -1 }
+  const f = P.nodes[calleeFn]
+  const cf = P.nodes[n.callFn]
+  if !(f is FuncDecl) || !(cf is Ident) { return -1 }
+  let pi = 0
+  while pi < f.fnParams.length {
+    const p = P.nodes[f.fnParams[pi]]
+    if p is Param && p.parName == cf.identName && p.parType < 0 {
+      let i = 0
+      const hn = paramHoleName(f.fnName, calleeFn, pi)
+      while i < vNames.length {
+        if vNames[i] == hn { return i }
+        i = i + 1
+      }
+      return -1
+    }
+    pi = pi + 1
+  }
+  -1
 }
 
 // One call `ci` of a hole typed `vf`, at parameter row `row`: binds `vf`'s variables from its

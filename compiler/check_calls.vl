@@ -218,6 +218,7 @@ import {
   genFnHoleCallInsts,
   genFnHoleCalled,
   genFnHoleInstance,
+  holeRetTyOf,
   substTyDeep,
   tErr,
   tErrUnsupported,
@@ -1418,8 +1419,16 @@ function callFtyPinCstrs(
   }
   const wsVd = T.diags.length
   adoptHoleLitArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
-  judgeFnArgHoleCalls(vNames, vTys, cstrCallee, dhNames, dhArgNode)
+  judgeFnArgHoleCalls(
+    vNames,
+    vTys,
+    cstrCallee,
+    dhNames,
+    dhArgNode,
+    hasNamedArgs(n.callArgNames) || callLeavesDefault(n, cstrCallee),
+  )
   instGenFnHolePins(vNames, vTys, cstrCallee)
+  pinUnreadGenFnArgs(vNames, vTys, cstrCallee, dhNames, dhArgNode)
   pinHoleLambdaVals(vNames, vTys, ix, cstrCallee)
   if fsbName.length > 0 {
     fsbGenFnHolePins(fsbDeclAtNode(n.callFn), vNames, vTys, cstrCallee)
@@ -1501,6 +1510,10 @@ function callFtyPinCstrs(
     validateEscJoins(bNames, bTys, cstrCallee)
   }
   retTy = substTyDeep(retTy, vNames, vTys)
+  if tyHasTyVar(retTy) {
+    const hr = holeRetTyOf(cstrCallee, vNames, vTys)
+    if hr >= 0 { retTy = hr }
+  }
   if tpIfFn.length > 0 || tpIfReFn.length > 0 {
     const pinTys: i32[] = []
     let pp = 0
@@ -1716,15 +1729,20 @@ function holeNameOnlyForwardedUnread(
 
 // A declared function named as an argument to a hole the callee's body calls is judged at the
 // instance each of those calls asks for, as a delivery at that type is, so a pin its body
-// cannot take is refused here and not at emit (D6190).
+// cannot take is refused here and not at emit (D6190). Two instances mark the parameter for a
+// split unless `noSplit`: a named call, or one leaving a parameter to its default (D6280).
 function judgeFnArgHoleCalls(
   vNames: string[],
   vTys: i32[],
   calleeFn: i32,
   dhNames: string[],
   dhArgNode: i32[],
+  noSplit: boolean,
 ) {
   if inferQuiet { return 0 }
+  // Read under the other holes' own instances, so a call taking another hole parameter's
+  // result asks for its own instance (D6250).
+  const wTys: i32[] = []
   let j = 0
   while j < dhNames.length {
     const a = parenPeelIx(dhArgNode[j])
@@ -1738,9 +1756,15 @@ function judgeFnArgHoleCalls(
       if d >= 0 && d < P.nodes.length && P.nodes[d] is FuncDecl {
         const k = strListIndexOf(vNames, dhNames[j])
         if k >= 0 {
+          if wTys.length == 0 {
+            for t in vTys { wTys.push(t) }
+            instGenFnHolePins(vNames, wTys, calleeFn)
+          }
           const insts: i32[] = []
-          genFnHoleCallInsts(vNames, vTys, k, vTys[k], calleeFn, insts)
-          if insts.length > 1 { holeFnSplitAt(calleeFn, dhNames[j]) }
+          genFnHoleCallInsts(vNames, wTys, k, vTys[k], calleeFn, insts)
+          if insts.length > 1 && !noSplit {
+            holeFnSplitAt(calleeFn, dhNames[j])
+          }
           const d0 = T.diags.length
           for inst in insts {
             if T.diags.length == d0 { genFnValueCstrs(a, nodeTyOf(a), inst) }
@@ -1827,6 +1851,83 @@ function holeLambdaNodeOf(ty: i32): i32 {
     }
   }
   -1
+}
+
+// Whether call `n` of declared function `calleeFn` passes fewer arguments than it has parameters.
+function callLeavesDefault(n: Call, calleeFn: i32): boolean {
+  if calleeFn < 0 || calleeFn >= P.nodes.length { return false }
+  const f = P.nodes[calleeFn]
+  if f is FuncDecl { return n.callArgs.length < f.fnParams.length }
+  false
+}
+
+// A declared generic handed by name to a parameter `calleeFn`'s body never reads is never called,
+// so it takes an `i32` default where its body checks clean there, as a lambda does (D6213).
+function pinUnreadGenFnArgs(
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  dhNames: string[],
+  dhArgNode: i32[],
+) {
+  if inferQuiet || calleeFn < 0 || calleeFn >= P.nodes.length { return 0 }
+  if !(P.nodes[calleeFn] is FuncDecl) { return 0 }
+  let j = 0
+  while j < dhNames.length {
+    const a = parenPeelIx(dhArgNode[j])
+    const k = strListIndexOf(vNames, dhNames[j])
+    if a >= 0 && a < P.nodes.length && k >= 0 {
+      const an = P.nodes[a]
+      let d = -1
+      if an is Ident { d = fnDeclIx[an.identName] ?? -1 }
+      const vt = vTys[k]
+      const open = tyIsForeignGenericSig(vt) || tyIsHoleGenericSig(vt)
+      if d >= 0 && open && holeParamUnreadAt(calleeFn, dhNames[j]) {
+        const inst = genFnAtI32(vt)
+        if inst >= 0 {
+          const d0 = T.diags.length
+          holeDeclCstrsAt(a, d, nodeTyOf(a), inst)
+          if T.diags.length == d0 { vTys[k] = inst }
+          while T.diags.length > d0 { T.diags.pop() }
+        }
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Whether the parameter of declared function `fn` whose hole is `hole` is never read.
+function holeParamUnreadAt(fn: i32, hole: string): boolean {
+  const f = P.nodes[fn]
+  if !(f is FuncDecl) { return false }
+  let pi = 0
+  while pi < f.fnParams.length {
+    if paramHoleName(f.fnName, fn, pi) == hole {
+      return holeParamUnreadIn(fn, pi, 0)
+    }
+    pi = pi + 1
+  }
+  false
+}
+
+// Function type `ft` with each parameter that is a type variable at `i32`; -1 when that leaves
+// one open.
+function genFnAtI32(ft: i32): i32 {
+  const lf = T.tys[ft]
+  if !(lf is TyFunc) { return -1 }
+  const nm: string[] = []
+  const ty: i32[] = []
+  for p in lf.fnParamTypes {
+    const pv = T.tys[p]
+    if pv is TyVar {
+      nm.push(pv.tvName)
+      ty.push(TY_I32)
+    }
+  }
+  const inst = substTyDeep(ft, nm, ty)
+  if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst
 }
 
 // `lam` with each of its lambda parameter holes at `i32`; -1 when that leaves a hole open.
