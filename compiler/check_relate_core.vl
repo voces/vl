@@ -3588,8 +3588,9 @@ function argCstrsHold(bNames: string[], bTys: i32[]) {
 export const GEN_FN_HOLE_UNCALLED = -2
 
 // `vt` instantiated at every argument the callee's body passes when calling hole `vNames[k]`;
-// `GEN_FN_HOLE_UNCALLED` when there is no such call, -1 when an argument is still open or two
-// calls disagree.
+// `GEN_FN_HOLE_UNCALLED` when there is no such call, -1 when an argument stays open or two
+// calls disagree. An argument that is the hole's own result closes once the other calls have
+// bound `vt`'s variables, so it is asked again after them (D6111).
 export function genFnHoleInstance(
   vNames: string[],
   vTys: i32[],
@@ -3602,6 +3603,7 @@ export function genFnHoleInstance(
   const gNames: string[] = []
   const gTys: i32[] = []
   let seen = false
+  let open: i32[] = []
   let ci = 0
   while ci < argCstr.at.length {
     if cstrOwnedBy(argCstr.fn[ci], calleeFn) && argCstr.form[ci] > 0 {
@@ -3609,13 +3611,9 @@ export function genFnHoleInstance(
       if row >= 0 && hdKind[row] == HD_PARAM && hdBase[row] >= 0 {
         const bt = T.tys[hdBase[row]]
         if bt is TyVar && bt.tvName == vNames[k] {
-          const pj = hdInner[row]
-          if pj < 0 || pj >= vf.fnParamTypes.length { return -1 }
-          const rat = substTyDeep(argCstr.at[ci], vNames, vTys)
-          if rat < 0 || tyHasTyVar(rat) || tyIsDeferredJoin(rat) { return -1 }
-          bindGenWalk(vf.fnParamTypes[pj], rat, gNames, gTys)
-          const want = substTyDeep(vf.fnParamTypes[pj], gNames, gTys)
-          if tyHasTyVar(want) || !assignable(rat, want) { return -1 }
+          const r = genFnHoleCallBind(vf, row, ci, vNames, vTys, gNames, gTys)
+          if r < 0 { return -1 }
+          if r == 0 { open.push(ci) }
           seen = true
         }
       }
@@ -3623,9 +3621,47 @@ export function genFnHoleInstance(
     ci = ci + 1
   }
   if !seen { return GEN_FN_HOLE_UNCALLED }
+  while open.length > 0 {
+    const still: i32[] = []
+    for oc in open {
+      const row = hdRowOf(argCstr.exp[oc])
+      const r = genFnHoleCallBind(vf, row, oc, vNames, vTys, gNames, gTys)
+      if r < 0 { return -1 }
+      if r == 0 { still.push(oc) }
+    }
+    if still.length == open.length { return -1 }
+    open = still
+  }
   const inst = substTyDeep(vt, gNames, gTys)
   if inst < 0 || tyHasTyVar(inst) { return -1 }
   inst
+}
+
+// One call `ci` of a hole typed `vf`, at parameter row `row`: binds `vf`'s variables from its
+// argument into `gNames`/`gTys`. 1 when bound, 0 while the argument is open under them, -1 when
+// it cannot fit.
+function genFnHoleCallBind(
+  vf: TyFunc,
+  row: i32,
+  ci: i32,
+  vNames: string[],
+  vTys: i32[],
+  gNames: string[],
+  gTys: i32[],
+): i32 {
+  const pj = hdInner[row]
+  if pj < 0 || pj >= vf.fnParamTypes.length { return -1 }
+  let rat = substTyDeep(argCstr.at[ci], vNames, vTys)
+  if rat < 0 || tyIsDeferredJoin(rat) { return -1 }
+  if tyHasTyVar(rat) && gNames.length > 0 {
+    rat = substTyDeep(rat, gNames, gTys)
+  }
+  if rat < 0 { return -1 }
+  if tyHasTyVar(rat) { return 0 }
+  bindGenWalk(vf.fnParamTypes[pj], rat, gNames, gTys)
+  const want = substTyDeep(vf.fnParamTypes[pj], gNames, gTys)
+  if tyHasTyVar(want) || !assignable(rat, want) { return -1 }
+  1
 }
 
 // Whether the body of `calleeFn` calls the hole named `name`, as `genFnHoleInstance` reads it.
