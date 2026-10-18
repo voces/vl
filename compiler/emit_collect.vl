@@ -926,6 +926,7 @@ import {
   unVarSliceAdoptKeySibling,
   unionMemberAtomsOf,
   unionSetAtomsOf,
+  unionSetAtomsOfTy,
   unionSetHasNull,
   unionSetMemberCount,
 } from "./emit_union_registry"
@@ -954,7 +955,15 @@ import {
   strListIndexOf,
 } from "./listutil"
 import { strContains } from "./strutil"
-import { primNameOf, tyHasTyVar, tyIsLitSet, tyStepRet } from "./tyquery"
+import {
+  primNameOf,
+  tyHasTyVar,
+  tyIsLitSet,
+  tyMapValOf,
+  tyStepElem,
+  tyStepNulInner,
+  tyStepRet,
+} from "./tyquery"
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
@@ -12487,14 +12496,14 @@ function sigRankOrder(keys: string[], ord: i32[]) {
 // The six single-shape tests below call `emit_classify.nameIsWholeSpanShape` directly — no
 // local wrapper is needed now that the walk it once required is gone.
 
-// The one home of "a bare map's value union needs registering too" — the same rule four
-// call sites in `registerInlineUnionAt` each spelled out separately. Returns -2 when the map
-// has no value name (since `0` is `registerInlineUnion`'s success), else its `0`/`-1`; three
-// callers test `!= -2` to know whether it fired, the fourth ignores the result.
-function registerMapValUnion(stmts: i32[], mapName: string) {
+// Registers the value union of bare map `mapName` (of arena type `mapTy`, or -1), the rule four
+// call sites in `registerInlineUnionAt` share. Returns -2 when the map has no value name (`0` is
+// `registerInlineUnion`'s success), else its `0`/`-1`; three callers test `!= -2` to know
+// whether it fired, the fourth ignores the result.
+function registerMapValUnion(stmts: i32[], mapName: string, mapTy: i32) {
   const mv = mapValNameOf(mapName)
   if mv == "" { return -2 }
-  registerInlineUnionAt(stmts, mv, 29, -1)
+  registerInlineUnionAt(stmts, mv, 29, -1, tyMapValOf(mapTy))
 }
 
 // The one home of "the result atom of a closure spelling": strips grouping parens, takes the
@@ -12509,14 +12518,20 @@ function cloResultAtomOf(name: string) {
 // as `collectU` registers a `UnionDecl`. A no-op if `name` is already registered or is not an
 // inline struct-variant union. Returns 0, or -1 (via `emitFail`).
 export function registerInlineUnion(stmts: i32[], name: string) {
-  registerInlineUnionAt(stmts, name, 46, -1)
+  registerInlineUnionAt(stmts, name, 46, -1, -1)
 }
 
-// Told which call site it is (`site`) and what identity that site can offer (`ty`, an arena
-// type where the caller holds one, else -1). The recursions below hand -1 since a cut
-// substring has no node; the key is obtained from canon for the sub-spelling instead
-// (`docs/internals/registry-by-type-id.md` §5 step 4b), so an unarmed compile is byte-identical.
-function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
+// Told which call site it is (`site`), the identity that site offers (`ty`, an arena type or
+// -1; a cut substring offers none, `docs/internals/registry-by-type-id.md` §5 step 4b), and the
+// type `name` is a render of (`sty`, or -1), which each recursion steps to its cut's subtype so
+// the atoms are read off the type rather than split from the spelling.
+function registerInlineUnionAt(
+  stmts: i32[],
+  name: string,
+  site: i32,
+  ty: i32,
+  sty: i32,
+) {
   // A spelling that names a row skips the mint, and so does one a switched key adopts.
   if isUNameKeyAB(site, name, ty) && unNameAdoptKeyRow(name, ty) { return 0 }
   // A value union (`i32 | null`, `i32 | f64`) registers the name alone: its members are scalar
@@ -12527,54 +12542,57 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   // A map member of a 2+-member union rides the variant box, registered via `isVariantBoxUnion`
   // below and returned early, or the map-value recursion further down would swallow the name.
   const matoms: string[] = []
-  unionSetAtomsOf(name, matoms)
+  unionSetAtomsOfTy(name, sty, matoms)
   if matoms.length >= 2 {
     if registerInlineUnionAtoms(stmts, matoms) < 0 { return -1 }
   }
   // A union used only as a collection element (`(C|S)[]`, `{[string]: C|S}`) still needs its
   // inner union registered, or a union appearing only inside a collection is never interned.
   const pun = parenUnionArrElemName(name)
-  if pun != "" { return registerInlineUnionAt(stmts, pun, 31, -1) }
+  if pun != "" {
+    return registerInlineUnionAt(stmts, pun, 31, -1, tyStepElem(sty))
+  }
   // A nullable ref array's `| null` niche is owned elsewhere, but its inner element union still
   // needs registering — strip the `| null` and recurse on the ref-array name, hitting the `pun` path above.
   const rnp = nullablePartOf(name)
   if rnp != "" && nameIsRefArray(rnp) {
-    return registerInlineUnionAt(stmts, rnp, 32, -1)
+    return registerInlineUnionAt(stmts, rnp, 32, -1, tyStepNulInner(sty))
   }
   // A nullable inline shape's `| null` is owned elsewhere, but its field unions still need
   // registering — strip the `| null` and take the single-shape descent below.
   if rnp != "" && nameIsWholeSpanShape(rnp) {
-    return registerInlineUnionAt(stmts, rnp, 33, -1)
+    return registerInlineUnionAt(stmts, rnp, 33, -1, tyStepNulInner(sty))
   }
   // A nullable map's `| null` is owned elsewhere, but its value union still needs
   // registering — the nullable twin of the bare-map value recursion below.
   if rnp != "" && nameIsBareMap(rnp) {
-    const nmr = registerMapValUnion(stmts, rnp)
+    const nmr = registerMapValUnion(stmts, rnp, tyStepNulInner(sty))
     if nmr != -2 { return nmr }
   }
   // A nullable closure's inner value-union result still needs registration, gated to a pure
   // value union or a map-member union; any other composite result stays loud (would mis-lower).
   if rnp != "" && nameIsNulClosure(name) {
     const ncRes = cloResultAtomOf(rnp)
+    const ncTy = tyStepRet(tyStepNulInner(sty))
     if ncRes != "" {
       if isValueUnionName(ncRes) || nameIsMapMemberUnion(ncRes) {
-        return registerInlineUnionAt(stmts, ncRes, 34, -1)
+        return registerInlineUnionAt(stmts, ncRes, 34, -1, ncTy)
       }
       // A variant-box union result: the contextual pin covers it once registered, so the
       // annotated named-fn path lowers it; an arm `isVariantBoxUnion` still rejects stays loud.
       if isVariantBoxUnion(stmts, ncRes) {
-        return registerInlineUnionAt(stmts, ncRes, 35, -1)
+        return registerInlineUnionAt(stmts, ncRes, 35, -1, ncTy)
       }
       // A bare-map result needs no registration itself, but its value union does — the sibling
       // of the bare-map value recursion below and the map-atom walk above.
       if nameIsBareMap(ncRes) {
-        const ncMr = registerMapValUnion(stmts, ncRes)
+        const ncMr = registerMapValUnion(stmts, ncRes, ncTy)
         if ncMr != -2 { return ncMr }
       }
       // An array result's element union needs registration even though the array itself does
       // not; the non-nullable closure result reaches this via the function-type arm below instead.
       if nameIsRefArray(ncRes) {
-        return registerInlineUnionAt(stmts, ncRes, 36, -1)
+        return registerInlineUnionAt(stmts, ncRes, 36, -1, ncTy)
       }
     }
   }
@@ -12583,18 +12601,20 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   if nameIsArray(name) {
     // The cut is `arrElemNameRaw`'s (#1175); the test half already belongs to the home.
     const inner = arrElemNameRaw(name)
-    if nameIsArray(inner) { return registerInlineUnionAt(stmts, inner, 37, -1) }
+    if nameIsArray(inner) {
+      return registerInlineUnionAt(stmts, inner, 37, -1, tyStepElem(sty))
+    }
     // A 1D array-of-inline-shape element's field unions are registered by
     // `collectTyReachRegister`'s structural walk instead; this call is a self-gated no-op for a
     // single shape, kept as the peel twin of `internShapeDeep`'s single-`[]` shape peel.
     if nameIsWholeSpanShape(inner) {
-      return registerInlineUnionAt(stmts, inner, 38, -1)
+      return registerInlineUnionAt(stmts, inner, 38, -1, tyStepElem(sty))
     }
   }
   // A bare map's union value registers here; `matoms.length < 2` restricts this to a bare map
   // so a map-member union (which also matches `nameIsMap`) falls to the box path instead.
   if nameIsMap(name) && matoms.length < 2 {
-    const mvr = registerMapValUnion(stmts, name)
+    const mvr = registerMapValUnion(stmts, name, sty)
     if mvr != -2 { return mvr }
   }
   // A function-type annotation's return union registers here so a value call's result narrows;
@@ -12602,14 +12622,20 @@ function registerInlineUnionAt(stmts: i32[], name: string, site: i32, ty: i32) {
   if nameIsParenOpen(name) {
     const fnRes = annRetNameOf(name)
     if fnRes != "" {
-      return registerInlineUnionAt(stmts, normTypeAtom(fnRes), 39, -1)
+      return registerInlineUnionAt(
+        stmts,
+        normTypeAtom(fnRes),
+        39,
+        -1,
+        tyStepRet(sty),
+      )
     }
   }
   // An inline struct-shape annotation's unions live in its fields, interned before this call by
   // `collectTyReachRegister`'s structural walk — a single shape has none to register here.
   if nameIsWholeSpanShape(name) { return 0 }
-  // The atom form again: `matoms` is still `unionSetAtomsOf(name)` here — nothing between
-  // the split at the top of this function and this line rewrites either `name` or `matoms`.
+  // The atom form again: `matoms` is still the read at the top of this function, since nothing
+  // between there and this line rewrites either `name` or `matoms`.
   if !isVariantBoxUnionAtoms(stmts, matoms) { return 0 }
   mintInlineUnion(stmts, name, ty)
 }
@@ -12649,11 +12675,11 @@ function registerInlineUnionAtoms(stmts: i32[], matoms: string[]): i32 {
   while ak < matoms.length {
     const aa = matoms[ak]
     if aa != "null" && nameIsArray(aa) {
-      registerInlineUnionAt(stmts, aa, 30, -1)
+      registerInlineUnionAt(stmts, aa, 30, -1, -1)
     }
     // A map atom's value union is a separate rep from the map arm (registered via
     // `isVariantBoxUnion`) and needs registering here too, the sibling of the ref-array recursion above.
-    if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa) }
+    if aa != "null" && nameIsBareMap(aa) { registerMapValUnion(stmts, aa, -1) }
     ak = ak + 1
   }
   0
@@ -12764,7 +12790,7 @@ function registerRefArrayArmUnions(
     ) {
       const ren = refArrElemName(raa)
       if ren != "" && unionSetMemberCount(ren) > 1 {
-        if registerInlineUnionAt(stmts, ren, 40, -1) < 0 { return -1 }
+        if registerInlineUnionAt(stmts, ren, 40, -1, -1) < 0 { return -1 }
       }
     }
     rai = rai + 1
@@ -12886,7 +12912,7 @@ function collectTyReachRegister(
       // inner type misses it (`AB|null`'s inner registers `A|B`, not the outer name `isUName` looks up).
       const nn = reachRegisterName(tyIx, underFunc)
       if nn != "" {
-        if registerInlineUnionAt(stmts, nn, 41, tyIx) < 0 { return -1 }
+        if registerInlineUnionAt(stmts, nn, 41, tyIx, tyIx) < 0 { return -1 }
       }
       return collectTyReachRegister(stmts, t.nInner, depth - 1, underFunc)
     }
@@ -12930,7 +12956,7 @@ function collectTyReachRegister(
       // still covers those, since this walk only adds coverage.
       const nm = reachRegisterName(tyIx, underFunc)
       if nm != "" {
-        if registerInlineUnionAt(stmts, nm, 42, tyIx) < 0 { return -1 }
+        if registerInlineUnionAt(stmts, nm, 42, tyIx, tyIx) < 0 { return -1 }
       }
       return 0
     }
@@ -13192,7 +13218,7 @@ function registerCollapsedUnionName(stmts: i32[], node: i32) {
     // Two-plus top-level atoms means the source spelled a union that collapsed to this struct;
     // the count is read from `canonEmitTypeNames`'s own bank (`annUnionAtomsOf`), never re-derived.
     if annUnionAtomsOf(node) >= 2 {
-      return registerInlineUnionAt(stmts, tyNameOf(node), 43, -1)
+      return registerInlineUnionAt(stmts, tyNameOf(node), 43, -1, -1)
     }
   }
   0
@@ -13226,7 +13252,7 @@ function registerInferredUnionTy(stmts: i32[], ity: i32) {
   if tyNomNameCycled() { return 0 }
   if isUNameAB(46, inm, ity) && unNameAdoptKeyRow(inm, ity) { return 0 }
   if collectTyMembersReach(stmts, ity, 15, false) < 0 { return -1 }
-  registerInlineUnionAt(stmts, inm, 46, ity)
+  registerInlineUnionAt(stmts, inm, 46, ity, ity)
 }
 
 // The inferred-return twin of the same-shape annotation fallback above: an un-annotated
@@ -13238,7 +13264,7 @@ function registerInferRetNominalUnion(stmts: i32[], nm: string, row: i32) {
   // A genuine union spelling the arena walk left unregistered is the anonymous-nominal
   // residual; a single-atom name has no top-level union to register.
   if inferRetAtomCountAt(row) >= 2 {
-    return registerInlineUnionAt(stmts, nm, 44, -1)
+    return registerInlineUnionAt(stmts, nm, 44, -1, -1)
   }
   0
 }
@@ -13562,7 +13588,7 @@ export function collectU(stmts: i32[]) {
         const aety = arrLitElemTyIxOf(iau)
         if !(isUNameAB(24, aeu, aety) && unNameAdoptKeyRow(aeu, aety)) {
           if collectTyMembersReach(stmts, aety, 15, false) < 0 { return -1 }
-          if registerInlineUnionAt(stmts, aeu, 45, -1) < 0 { return -1 }
+          if registerInlineUnionAt(stmts, aeu, 45, -1, -1) < 0 { return -1 }
         }
       }
       // The NULLABLE spelling of the same box. `i32 | null` is recorded as `TyNullable`, so
