@@ -12,25 +12,45 @@
 // the narrowed value is one converted copy. Each test closes `} else { return <fail> }`.
 
 import {
+  ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   Node,
+  NullLit,
   NumLit,
+  ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
   Program,
+  RetStmt,
+  Spread,
   StrLit,
+  TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
   arenaSetNode,
   elseIfLink,
@@ -59,11 +79,16 @@ import {
   PrimName,
   T,
   TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
   tyToStr,
 } from "./check_types"
 import { isNullTy } from "./tyquery"
@@ -117,31 +142,33 @@ function jwDefault(ty: i32): string {
   if ty < 0 { return "null" }
   if jsonSelfRef(ty, jwRecvTy) { return "null" }
   const t = T.tys[ty]
-  if t is TyPrim {
-    const p = t.primName
-    if p == "string" { return "\"\"" }
-    if p == "boolean" { return "false" }
-    if p == "f64" { return "0.0" }
-    if p == "i32" { return "0" }
-    if p == "i64" { return "0" }
-    return "null"
-  }
-  if t is TyNullable { return "null" }
-  if t is TyArray { return "[]" }
-  if t is TyMap { return "Map()" }
-  if t is TyObj {
-    const fn = t.objFieldNames
-    const ft = t.objFieldTypes
-    let s = "{"
-    let i = 0
-    while i < fn.length {
-      if i > 0 { s = s + ", " }
-      s = s + fn[i] + ": " + jwDefault(ft[i])
-      i = i + 1
+  match t {
+    TyPrim => {
+      const p = t.primName
+      if p == "string" { return "\"\"" }
+      if p == "boolean" { return "false" }
+      if p == "f64" { return "0.0" }
+      if p == "i32" { return "0" }
+      if p == "i64" { return "0" }
+      "null"
     }
-    return s + "}"
+    TyArray => "[]"
+    TyMap => "Map()"
+    TyObj => {
+      const fn = t.objFieldNames
+      const ft = t.objFieldTypes
+      let s = "{"
+      let i = 0
+      while i < fn.length {
+        if i > 0 { s = s + ", " }
+        s = s + fn[i] + ": " + jwDefault(ft[i])
+        i = i + 1
+      }
+      s + "}"
+    }
+    // A nullable defaults to null; the checker refuses every other shape before here.
+    TyNullable | TyFunc | TyUnion | TyNeg | TyVar | TyLit | TyErr => "null"
   }
-  "null"
 }
 
 // The nullable inner of `ty` when `ty` is `X | null`, else -1. The checker's shape
@@ -150,15 +177,19 @@ function jwDefault(ty: i32): string {
 function jwNullableInner(ty: i32): i32 {
   if ty < 0 { return -1 }
   const t = T.tys[ty]
-  if t is TyNullable { return t.nInner }
-  if t is TyUnion {
-    const ms = t.uMembers
-    if ms.length == 2 {
-      if isNullTy(ms[0]) { return ms[1] }
-      if isNullTy(ms[1]) { return ms[0] }
+  match t {
+    TyNullable => t.nInner
+    TyUnion => {
+      const ms = t.uMembers
+      if ms.length == 2 {
+        if isNullTy(ms[0]) { return ms[1] }
+        if isNullTy(ms[1]) { return ms[0] }
+      }
+      -1
     }
+    // Not `X | null`.
+    TyPrim | TyFunc | TyObj | TyArray | TyMap | TyNeg | TyVar | TyLit | TyErr => -1
   }
-  -1
 }
 
 function jwAppend(dst: string[], src: string[]) {
@@ -214,17 +245,19 @@ function jwWalk(ty: i32, src: string, out: string[]): string {
     return ""
   }
   const t = T.tys[ty]
-  if t is TyPrim { return jwWalkPrim(t.primName, ty, src, out) }
-  if t is TyArray { return jwWalkArray(ty, t.aElem, src, out) }
-  if t is TyMap { return jwWalkMap(ty, t.mVal, src, out) }
-  if t is TyObj {
-    return jwWalkObj(ty, t.objFieldNames, t.objFieldTypes, src, out)
+  match t {
+    TyPrim => jwWalkPrim(t.primName, ty, src, out)
+    TyArray => jwWalkArray(ty, t.aElem, src, out)
+    TyMap => jwWalkMap(ty, t.mVal, src, out)
+    TyObj => jwWalkObj(ty, t.objFieldNames, t.objFieldTypes, src, out)
+    // Unreachable: `jsonShapeBad` refuses every other arena shape at the `is` site, so
+    // the generator is never asked for one. A `return <fail>` rather than silence, so a
+    // shape that slips past the checker fails loudly.
+    TyNullable | TyFunc | TyUnion | TyNeg | TyVar | TyLit | TyErr => {
+      out.push("return " + jwFail)
+      ""
+    }
   }
-  // Unreachable: `jsonShapeBad` refuses every other arena shape at the `is` site, so
-  // the generator is never asked for one. A `return <fail>` rather than silence, so a
-  // shape that slips past the checker fails loudly.
-  out.push("return " + jwFail)
-  ""
 }
 
 function jwWildcard(src: string): string {
@@ -482,30 +515,36 @@ export function jwRestoreMangling(from: i32): i32 {
 function jwPlaceKey(ix: i32): string {
   if ix < 0 { return "" }
   const n = P.nodes[ix]
-  if n is Ident { return n.identName }
-  if n is Paren { return jwPlaceKey(n.parInner) }
-  if n is Member {
-    const b = jwPlaceKey(n.memObj)
-    if b == "" { return "" }
-    return b + "." + n.memProp
+  match n {
+    Ident => n.identName
+    Paren => jwPlaceKey(n.parInner)
+    Member => {
+      const b = jwPlaceKey(n.memObj)
+      if b == "" { return "" }
+      b + "." + n.memProp
+    }
+    Index => {
+      const b = jwPlaceKey(n.idxArr)
+      if b == "" { return "" }
+      const k = jwIndexKey(n.idxIndex)
+      if k == "" { return "" }
+      b + "[" + k + "]"
+    }
+    // Not a stable place.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => ""
   }
-  if n is Index {
-    const b = jwPlaceKey(n.idxArr)
-    if b == "" { return "" }
-    const k = jwIndexKey(n.idxIndex)
-    if k == "" { return "" }
-    return b + "[" + k + "]"
-  }
-  ""
 }
 
 function jwIndexKey(ix: i32): string {
   if ix < 0 { return "" }
   const n = P.nodes[ix]
-  if n is NumLit { return n.numText }
-  if n is StrLit { return "\"" + n.strText + "\"" }
-  if n is Ident { return n.identName }
-  ""
+  match n {
+    NumLit => n.numText
+    StrLit => "\"" + n.strText + "\""
+    Ident => n.identName
+    // Not a literal or name index.
+    CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => ""
+  }
 }
 
 // The root identifier of a place key — what a shadowing declaration would have to be
@@ -533,30 +572,36 @@ function jwSetTok(ix: i32, tok: i32): i32 {
 function jwCopyPlace(ix: i32, tok: i32): i32 {
   if ix < 0 { return -1 }
   const n = P.nodes[ix]
-  if n is Ident { return jwSetTok(mkIdent(n.identName, n.pos), tok) }
-  if n is Paren { return jwCopyPlace(n.parInner, tok) }
-  if n is Member {
-    const b = jwCopyPlace(n.memObj, tok)
-    if b < 0 { return -1 }
-    return jwSetTok(mkMember(b, n.memProp, n.pos), tok)
+  match n {
+    Ident => jwSetTok(mkIdent(n.identName, n.pos), tok)
+    Paren => jwCopyPlace(n.parInner, tok)
+    Member => {
+      const b = jwCopyPlace(n.memObj, tok)
+      if b < 0 { return -1 }
+      jwSetTok(mkMember(b, n.memProp, n.pos), tok)
+    }
+    Index => {
+      const a = jwCopyPlace(n.idxArr, tok)
+      if a < 0 { return -1 }
+      const i = jwCopyIndex(n.idxIndex, tok)
+      if i < 0 { return -1 }
+      jwSetTok(mkIndex(a, i, n.pos), tok)
+    }
+    // Not a place `jwPlaceKey` spells.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => -1
   }
-  if n is Index {
-    const a = jwCopyPlace(n.idxArr, tok)
-    if a < 0 { return -1 }
-    const i = jwCopyIndex(n.idxIndex, tok)
-    if i < 0 { return -1 }
-    return jwSetTok(mkIndex(a, i, n.pos), tok)
-  }
-  -1
 }
 
 function jwCopyIndex(ix: i32, tok: i32): i32 {
   if ix < 0 { return -1 }
   const n = P.nodes[ix]
-  if n is NumLit { return jwSetTok(mkNum(n.numText, n.pos), tok) }
-  if n is StrLit { return jwSetTok(mkStr(n.strText, n.pos), tok) }
-  if n is Ident { return jwSetTok(mkIdent(n.identName, n.pos), tok) }
-  -1
+  match n {
+    NumLit => jwSetTok(mkNum(n.numText, n.pos), tok)
+    StrLit => jwSetTok(mkStr(n.strText, n.pos), tok)
+    Ident => jwSetTok(mkIdent(n.identName, n.pos), tok)
+    // Not an index `jwIndexKey` spells.
+    CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => -1
+  }
 }
 
 // Replace every occurrence of the place `key` under `ix` with `name`, in place. A
@@ -635,25 +680,28 @@ function jwPolarity(c0: i32, siteIx: i32): i32 {
   if c0 < 0 { return 0 }
   if c0 == siteIx { return 1 }
   const c = P.nodes[c0]
-  if c is Paren { return jwPolarity(c.parInner, siteIx) }
-  if c is Unary {
-    if c.unOp == "!" {
-      const p = jwPolarity(c.unArg, siteIx)
-      if p == 1 { return -1 }
-      if p == -1 { return 1 }
-      return 0
+  match c {
+    Paren => jwPolarity(c.parInner, siteIx)
+    Unary => {
+      if c.unOp == "!" {
+        const p = jwPolarity(c.unArg, siteIx)
+        if p == 1 { return -1 }
+        if p == -1 { return 1 }
+        return 0
+      }
+      0
     }
-    return 0
-  }
-  if c is BinExpr {
-    if c.binOp == "&&" {
-      if jwPolarity(c.binLeft, siteIx) == 1 { return 1 }
-      if jwPolarity(c.binRight, siteIx) == 1 { return 1 }
-      return 0
+    BinExpr => {
+      if c.binOp == "&&" {
+        if jwPolarity(c.binLeft, siteIx) == 1 { return 1 }
+        if jwPolarity(c.binRight, siteIx) == 1 { return 1 }
+        return 0
+      }
+      0
     }
-    return 0
+    // No other condition shape carries the narrowing to an arm.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => 0
   }
-  0
 }
 
 // Prepend `stmt` to `blk`'s statement list, in place. The list is mutated through
