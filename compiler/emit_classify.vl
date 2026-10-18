@@ -197,6 +197,7 @@ import {
   tyIsNewtypeBrand,
   tyIsRecord,
   tyLitMemberTexts,
+  tyMutEpoch,
   tyNumScalarBaseName,
   tyPrimNameOf,
   tyReachesUnion,
@@ -710,6 +711,7 @@ import {
   nodeRepIsAtom,
   nodeRepIsNulAtom,
   nodeTyMapKeyIsLitUnion,
+  repOfNodeAt,
   repOfTy,
   repRowOfTyStruct,
   repShadowOn,
@@ -1085,7 +1087,13 @@ import {
 } from "./emit_union_registry"
 import { isFitsAcrossTagRows, variantFieldIndex } from "./emit_variant_sig"
 import { strListHas } from "./listutil"
-import { memoGenAdvance, memoMoved, memoPassMoved } from "./memo"
+import {
+  memoGenAdvance,
+  memoGenNew,
+  memoKeyNew,
+  memoMoved,
+  memoPassMoved,
+} from "./memo"
 import {
   identDeclOf,
   sidArrGet,
@@ -17111,15 +17119,16 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   // A node recorded at a type variable has the column's rep at its instance's bindings. Before
   // `monomorphize` binds one, a node still open there has no rep.
   const xraw = nodeTyIxOf(exprIx)
-  if xraw >= 0 && xraw < T.tys.length && tyHasTyVar(xraw) {
-    const od = nodeRepIn(exprIx, fnIx)
+  let xty = xraw
+  if exprIx >= 0 && xraw >= 0 && xraw < T.tys.length && lrRawHasTyVar(xraw) {
+    xty = nodeTyInOf(exprIx, fnIx)
+    const od = repOfNodeAt(exprIx, xty)
     if od.rdCovered == 1 && vkListClass(od.rdKind) == 1 { return od.rdKind }
-    const xty = nodeTyInOf(exprIx, fnIx)
     const open = xty < 0 || xty >= T.tys.length || tyHasTyVar(xty)
     if open && !emitPhaseReached("monomorphizing") { return null }
   }
   // A nullable map is no list, whatever its binding's declaration spells.
-  if tyIsNullableMap(nodeTyInOf(exprIx, fnIx)) { return null }
+  if tyIsNullableMap(xty) { return null }
   // An `is K[]` arm reading an empty list of another element reads the arm's `K[]` (D4993).
   const fat = listFitArmTyOf(exprIx, fnIx)
   if fat >= 0 {
@@ -17171,6 +17180,34 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   if a == "list" && s == null { return a }
   s
 }
+
+// `tyHasTyVar` of arena type `ty`, kept while the arena neither grows nor is written in place.
+// `exprListRepOf` asks it of every node it is asked about, most of them the same few types.
+function lrRawHasTyVar(ty: i32): boolean {
+  let moved = memoMoved(lrTvKey, 0, tyMutEpoch)
+  moved = memoMoved(lrTvKey, 1, T.tys.length) || moved
+  if moved { memoGenAdvance(lrTvGen) }
+  if ty < lrTvStamp.length && lrTvStamp[ty] == lrTvGen.at {
+    return lrTvAns[ty] == 1
+  }
+  const r = tyHasTyVar(ty)
+  while lrTvStamp.length <= ty {
+    lrTvStamp.push(-1)
+    lrTvAns.push(0)
+  }
+  lrTvStamp[ty] = lrTvGen.at
+  lrTvAns[ty] = 0
+  if r { lrTvAns[ty] = 1 }
+  r
+}
+
+const lrTvKey = memoKeyNew(2)
+
+const lrTvGen = memoGenNew(0)
+
+const lrTvStamp: i32[] = []
+
+const lrTvAns: i32[] = []
 
 // Whether arena type `ty` is `M | null` for a map or Set `M`.
 function tyIsNullableMap(ty: i32): boolean {
