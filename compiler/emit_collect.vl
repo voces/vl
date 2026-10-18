@@ -869,7 +869,7 @@ import {
   letAnnIsUninternedShape,
   nameFreeToModule,
   sigKeyOfTy,
-  unionArmSigKey,
+  unionArmSigKeyTy,
 } from "./emit_sig_tokens"
 import {
   ArrNewKind,
@@ -966,6 +966,7 @@ import {
   tyHasTyVar,
   tyIsLitSet,
   tyMapValOf,
+  tyPeelNul,
   tyStepElem,
   tyStepNulInner,
   tyStepRet,
@@ -1023,7 +1024,7 @@ function markInferredJoinAtoms(ty: i32) {
   const nm = arenaEmitName(ty)
   if nm == "" { return 0 }
   uDeclared = true
-  markValueUnionAtoms(nm)
+  markValueUnionAtoms(nm, ty)
 }
 
 // The value-union half, read from the rung `recordInferRet` banked rather than re-derived
@@ -2724,19 +2725,20 @@ function internCloSigKey(key: string, rep: i32) {
   0
 }
 
-// The one home of "intern the `$fnsig` of this type-atom spelling, synthesized". Key the atom
-// with `unionArmSigKey`, which byte-matches the key a value call site derives; skip a mixed
-// scalar-plus-composite union result, whose synthesized sig would satisfy the call's floor
-// while the un-pinned producer keeps its own functype and the cast traps; intern at rep -1.
-function internCloSigOfAtom(atom: string) { internCloSigOfAtomTy(atom, "") }
+// Interns the `$fnsig` of type-atom `atom` of arena type `ty` (-1 when unknown) at rep -1, keyed
+// by `unionArmSigKeyTy` to match the call site's key. A mixed scalar-plus-composite union result
+// is skipped: its synthesized sig would pass the call's floor while the un-pinned producer keeps
+// its own functype, and the cast traps.
+function internCloSigOfAtom(atom: string, ty: i32) {
+  internCloSigOfAtomTy(atom, "", ty)
+}
 
-// `internCloSigOfAtom` with the key already in hand; `kIn` of "" parses the atom instead. The
-// guard still runs: `nulCloMixedUnionUnregistered(atom)` is a deliberate reject, evaluated here
-// on the atom whether or not the key came from the arena, so the hint answers only the key and
-// leaves the guard in the path.
-function internCloSigOfAtomTy(atom: string, kIn: string) {
+// `internCloSigOfAtom` with the key already in hand; `kIn` of "" keys the atom off `ty`
+// instead. The guard still runs: `nulCloMixedUnionUnregistered(atom)` is a deliberate reject,
+// evaluated on the atom whether or not the key came from the arena.
+function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
   let k = kIn
-  if k == "" { k = unionArmSigKey(atom) }
+  if k == "" { k = unionArmSigKeyTy(atom, ty) }
   if k == "" { return 0 }
   if nulCloMixedUnionUnregistered(atom) { return 0 }
   internCloSigKey(k, -1)
@@ -2783,13 +2785,14 @@ function internCloResultSpineTy(ty: i32) {
   0
 }
 
-// The one home of the closure result-spine walk on a name, with one caller: the
-// nulclosure-annotation entry, off the annotation's `| null` inner. The checker-type entry
-// walks the arena instead (`internCloResultSpineTy`), because this one is fed an author's
-// spelling where a litunion alias survives. `wideShape` is the disjunct the arena twin lacks.
-function internCloResultSpine(tn: string, wideShape: boolean) {
+// The closure result-spine walk on a name, for the nulclosure-annotation entry's `| null` inner,
+// where an author's litunion alias survives (the checker-type entry walks the arena instead,
+// `internCloResultSpineTy`). `ty` is the spelling's arena type (-1 when unknown), stepped down
+// the spine beside it; `wideShape` is the disjunct the arena twin lacks.
+function internCloResultSpine(tn: string, ty: i32, wideShape: boolean) {
   if tn == "" { return 0 }
   let cur = normTypeAtom(tn)
+  let curTy = ty
   let guard = 0
   while guard < 64 {
     guard = guard + 1
@@ -2808,10 +2811,11 @@ function internCloResultSpine(tn: string, wideShape: boolean) {
     // No `nulCloMixedUnionUnregistered` guard, and it is inert here rather than missing:
     // `takes` already restricts this level's result to a nested closure, a plain scalar or a
     // whole-span shape — never a union — so the guard's mix test cannot fire on `cur`.
-    if takes { internCloSigKey(unionArmSigKey(cur), -1) }
+    if takes { internCloSigKey(unionArmSigKeyTy(cur, curTy), -1) }
     // Descend only through a nested-closure result; a scalar or composite result ends the spine.
     if !retIsClosure { return 0 }
     cur = ret
+    curTy = tyStepRet(curTy)
   }
   0
 }
@@ -2820,7 +2824,9 @@ function internCloResultSpine(tn: string, wideShape: boolean) {
 // reachable through the result chain of a nullable closure annotation's inner function type.
 // The annotation may be the program's only spelling of these types — the value only ever
 // `null`, narrowed and called — so no concrete lambda ever mints them.
-function internNulCloResultSpine(tn: string) { internCloResultSpine(tn, true) }
+function internNulCloResultSpine(tn: string, ty: i32) {
+  internCloResultSpine(tn, ty, true)
+}
 
 // Collect the distinct `$fnsig` env-leading functypes — one per distinct eligible signature key
 // across all lifted functions, in `fnStmts` order. Runs after `computeRetInference`, whose
@@ -2907,7 +2913,7 @@ export function collectCloSigs() {
   }
   // Closure-arm union signatures: a union with a function-type arm whose program has no
   // concrete closure of that arm's type still needs the arm's `$fnsig` interned, since the
-  // narrowed call `call_indirect`s at it. `unionArmSigKey` normalizes to the same key
+  // narrowed call `call_indirect`s at it. `unionArmSigKeyTy` normalizes to the same key
   // `narrowedClosureOf` yields at the call site; rep -1, and gated by `fnValUsed`.
   let ui = 0
   while ui < unMemberSet.length {
@@ -2939,7 +2945,7 @@ export function collectCloSigs() {
   // Nullable-closure annotations whose value is only ever `null` — narrowed and called, with no
   // concrete lambda anywhere to intern the closure's `$fnsig`. The nullable dual of the
   // closure-arm union pass above: walk every TypeRef and intern the inner closure key, which
-  // `unionArmSigKey` normalizes to the call site's, at rep -1. Idempotent via `cloSigPosOfKey`.
+  // `unionArmSigKeyTy` normalizes to the call site's, at rep -1. Idempotent via `cloSigPosOfKey`.
   let ni = 0
   while ni < P.nodes.length {
     const nn = P.nodes[ni]
@@ -2950,19 +2956,22 @@ export function collectCloSigs() {
         // scan of `nm` and nothing between the three former call sites writes `nm`, so the
         // hoist is total by construction.
         const nInner = nullablePartOf(nm)
+        const nInnerTy = tyPeelNul(nodeTyIxOf(ni))
         // The nulclosure annotation's inner closure sig.
-        internCloSigOfAtom(nInner)
+        internCloSigOfAtom(nInner, nInnerTy)
         // A nulclosure whose result is itself a closure: the intern above mints only the outer
         // sig, its result collapsed to the shared `>c` fat pointer, so a chained value call on
         // the narrowed result finds no sig for the inner closure. Walk the result spine.
-        internNulCloResultSpine(nInner)
+        internNulCloResultSpine(nInner, nInnerTy)
       }
       // A closure-element array annotation, plain or nullable-element, whose value may carry no
       // concrete lambda of the element type: the narrowed indexed or rebound call still
       // `ref.cast`s to the element's `$fnsig`, so intern it from the annotation. The array dual
-      // of the nulclosure pass above; `unionArmSigKey` peels to the call site's own key.
+      // of the nulclosure pass above; `unionArmSigKeyTy` peels to the call site's own key.
       const cael = cloArrElemNameOf(nm)
-      if cael != "" { internCloSigOfAtom(cael) }
+      if cael != "" {
+        internCloSigOfAtom(cael, tyPeelNul(tyStepElem(nodeTyIxOf(ni))))
+      }
     }
     ni = ni + 1
   }
@@ -3005,7 +3014,7 @@ function collectLiftedCloSig(fe: i32, sx: i32) {
   internCloSigKey(key, fe)
   // A nullable-closure result (key `…>C`): intern the inner closure's `$fnsig` too, since the
   // inner closure is never constructed and a narrowed value call would find no interned sig.
-  // The inner type rides the lambda's pinned `fnRet` nullable part, and `unionArmSigKey`
+  // The inner type rides the lambda's pinned `fnRet` nullable part, and `unionArmSigKeyTy`
   // yields the same key the narrowed call site derives. Usage-gated by `fnValUsed`.
   if cloRetValKind(fe) == "nulclosure" {
     const rfn = P.nodes[sx]
@@ -3015,7 +3024,7 @@ function collectLiftedCloSig(fe: i32, sx: i32) {
       // type parameter, which counts as the composite side of the mix test and is registered
       // by nothing. Unguarded, such a template steals a concrete lambda's rep for its key.
       const inm = nullablePartOf(tyNameOf(rfn.fnRet))
-      if inm != "" { internCloSigOfAtom(inm) }
+      if inm != "" { internCloSigOfAtom(inm, tyPeelNul(nodeTyIxOf(rfn.fnRet))) }
     }
   }
   0
@@ -3035,13 +3044,15 @@ function collectUnionArmCloSigs(atoms: string[], atomTys: i32[]) {
     if uj < atomTys.length { armRow = atomTys[uj] }
     if armRow >= 0 {
       const armT = T.tys[armRow]
-      if armT is TyFunc { internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow)) }
+      if armT is TyFunc {
+        internCloSigOfAtomTy(atoms[uj], sigKeyOfTy(armRow), armRow)
+      }
     } else {
-      internCloSigOfAtom(atoms[uj])
+      internCloSigOfAtom(atoms[uj], -1)
     }
     // A closure-array arm, plain or nullable-element: the element closure sig is interned by
     // neither the function-arm branch above nor the TypeRef pass below, which sees only a
-    // top-level closure-array annotation. Same `unionArmSigKey` element-key normalization the
+    // top-level closure-array annotation. Same `unionArmSigKeyTy` element-key normalization the
     // call site derives; the row says whether there is a closure element at all.
     let uCaRow = -1
     if uj < atomTys.length {
@@ -3065,10 +3076,10 @@ function collectUnionArmCloSigs(atoms: string[], atomTys: i32[]) {
     }
     if uCaRow >= 0 {
       const uCael = cloArrElemNameOf(atoms[uj])
-      if uCael != "" { internCloSigOfAtomTy(uCael, sigKeyOfTy(uCaRow)) }
+      if uCael != "" { internCloSigOfAtomTy(uCael, sigKeyOfTy(uCaRow), uCaRow) }
     } else if uj >= atomTys.length {
       const uCael = cloArrElemNameOf(atoms[uj])
-      if uCael != "" { internCloSigOfAtom(uCael) }
+      if uCael != "" { internCloSigOfAtom(uCael, -1) }
     }
     uj = uj + 1
   }
@@ -12789,7 +12800,7 @@ function mintInlineUnion(stmts: i32[], name: string, ty: i32): i32 {
   }
   // A mixed union's scalar members box like a value union's — interns their per-rep value
   // boxes (a no-op for an all-struct union).
-  markValueUnionAtoms(name)
+  markValueUnionAtoms(name, mintTyIx)
   // A ref-array arm interns its element shape and reflist slot, the twin of the value-atom
   // marking above; this early call ensures the element struct is in `sNames` before heap assignment.
   markRefArrayArms(name)
@@ -13204,7 +13215,7 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
           internCloSigKey(kAr, -1)
         } else {
           const nm = arenaEmitName(tyIx)
-          if nm != "" { internCloSigOfAtomTy(nm, kAr) }
+          if nm != "" { internCloSigOfAtomTy(nm, kAr, tyIx) }
         }
       }
       // Descend params + result to reach closures nested inside them (a result struct's
@@ -13847,7 +13858,7 @@ function collectDeclaredUnion(stmts: i32[], stmtIx: i32, s: UnionDecl) {
   }
   // A MIXED union's scalar members intern their per-rep value boxes (no-op for an
   // all-struct union).
-  markValueUnionAtoms(udSet)
+  markValueUnionAtoms(udSet, declTyIxOfName(s.udName))
   // A ref-array arm of a named union interns its element shape + reflist slot, the same as
   // the inline path — so the two spellings register identically.
   markRefArrayArms(udSet)

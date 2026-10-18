@@ -19,7 +19,6 @@ import {
 import { nodeRepTyIxOf } from "./check_core_state"
 import { annUnionAtomsOf } from "./check_decl_scan"
 import { nodeTyIsLitUnionAlias, nodeTyIxOf } from "./check_node_tys"
-import { nameIsLitUnionType } from "./check_ty_rep"
 import {
   T,
   TyArray,
@@ -36,6 +35,7 @@ import {
   litUnionAliasNameOfTy,
   tyEq,
   tyIsLitUnion,
+  tyIsNullableLitUnion,
   tySame,
   tyToEmitName,
 } from "./check_types"
@@ -50,7 +50,6 @@ import {
   nameIsI32Array,
   nameIsNulClosure,
   nameIsNulI32List,
-  nameIsNulLitUnion,
   nameIsShapeSpanEnds,
   nameIsString,
   normTypeAtom,
@@ -174,7 +173,7 @@ import {
   nameIsParenSpanEnds,
   peelGroupParens,
 } from "./tyname"
-import { flattenVariantsInto, tyMapValOfHeld } from "./tyquery"
+import { flattenVariantsInto, tyMapValOfHeld, tyPeelNul } from "./tyquery"
 
 // The niche twin of `mvListValKind` — the nullable `VKind` a `{[K]: T[] | null}` value binds,
 // or null when the value is not a list. Composed on `mvListValKind` so the element-kind to rep
@@ -220,7 +219,7 @@ export function rlElemCloSigKeyAt(slot: i32): string {
 }
 
 // The `$fnsig` key of a closure-element ref-list slot: the arena keys the `TyFunc`
-// spine directly (`sigKeyOfTy`), so the grouping-paren strip and `annSigKey` re-parse
+// spine directly (`sigKeyOfTy`), so the grouping-paren strip and `annSigKeyTy` re-parse
 // of the rendered element name is the fall-through only (D5-final).
 export function rlElemCloSigKey(slot: i32): string {
   const ar = rlElemCloSigKeyAt(slot)
@@ -231,7 +230,7 @@ export function rlElemCloSigKey(slot: i32): string {
   if !nameIsParenSpanEnds(nm) { return "" }
   // `groupInnerOf` is the paired cut; it has no endpoint test of its own, so the span
   // check above must run first (the brace-shaped call sites below share this cut).
-  annSigKey(groupInnerOf(nm))
+  annSigKeyTy(groupInnerOf(nm), -1)
 }
 
 // The emitter-format name of the list union `ty`, a record element spelled by its row
@@ -561,14 +560,17 @@ export function nulStructRowOfNodeTy(exprIx: i32): i32 {
   -1
 }
 
-// The closure-ABI param-kind code for a type name — the annotation-string analogue of
-// `cloParamTok` (which reads the AST), producing the identical token per valtype so a value
-// call over an annotated higher-order callee resolves the same interned `$fnsig`. "" for a
-// type outside the value-call ABI (the all-i32 arity fallback then applies).
-export function annParamKind(t: string) { annParamKindTy(t, -1) }
+// Whether arena type `ty` is a string literal union, bare or nullable, aliased or inline — the
+// interned i32 atom in a `$fnsig`. False for -1.
+function annTyIsLitUnion(ty: i32): boolean {
+  ty >= 0 && (tyIsLitUnion(ty) || tyIsNullableLitUnion(ty))
+}
 
-// `annParamKind` for a caller that also holds the parameter's arena type `ty`, or -1.
-function annParamKindTy(t: string, ty: i32) {
+// The closure-ABI param-kind code for type name `t` with arena type `ty` (-1 when unknown) —
+// the annotation-string analogue of `cloParamTok` (which reads the AST), producing the
+// identical token per valtype so a value call over an annotated higher-order callee resolves
+// the same interned `$fnsig`. "" for a type outside the value-call ABI.
+export function annParamKindTy(t: string, ty: i32) {
   if t == "i32" || t == "boolean" { return repSigTokOfKind("i32") }
   if t == "f64" { return repSigTokOfKind("f64") }
   if t == "i64" { return repSigTokOfKind("i64") }
@@ -576,14 +578,12 @@ function annParamKindTy(t: string, ty: i32) {
   if t == "v128" { return repSigTokOfKind("v128") }
   // A string literal union, bare or nullable, aliased or inline, is the interned i32 atom —
   // before the string test, which would read an inline spelling as `str`.
-  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
-    return repSigTokOfKind("i32")
-  }
+  if annTyIsLitUnion(ty) { return repSigTokOfKind("i32") }
   // Any other registered union name is the `{tag, value}` box.
   if isUName(t) { return repSigTokOfKind("union") }
   if nameIsString(t) { return repSigTokOfKind("str") }
   // The scalar-element list backings, via the one home `scalarListRepOfName` — the same
-  // enumeration `annRetKind` reads, so the two `$fnsig` producers cannot drift.
+  // enumeration `annRetKindTy` reads, so the two `$fnsig` producers cannot drift.
   const sk = scalarListRepOfName(t)
   if sk != null { return repSigTokOfKind(sk) }
   // A nullable scalar-element list, the dual of `cloParamTok`'s niche tokens (D2399).
@@ -594,7 +594,7 @@ function annParamKindTy(t: string, ty: i32) {
   // A concrete-variant name (`Cat`), keyed by the variant index (matches `cloParamTok`).
   const vti = variantIndexOf(t)
   if vti >= 0 { return repSigVariantTok(vti) }
-  // A ref-list param — the recursive dual of `annRetKind`'s ref-list result. Before the arrow
+  // A ref-list param — the recursive dual of `annRetKindTy`'s ref-list result. Before the arrow
   // case so a closure-element array's nested `=>` isn't misread as a single closure.
   const rs = annRefListSlot(t)
   if rs >= 0 { return repSigSlotTokOfKind("reflist", rs) }
@@ -630,18 +630,14 @@ function annNulListKind(t: string): VKind | null {
   nulScalarListKind(t)
 }
 
-function annRetKind(t: string) { annRetKindTy(t, -1) }
-
-// `annRetKind` for a caller that also holds the result's arena type `ty`, or -1.
+// `annParamKindTy`'s result twin: the `>X` token of result name `t` with arena type `ty`.
 function annRetKindTy(t: string, ty: i32) {
   if t == "i32" || t == "boolean" { return ">" + repSigTokOfKind("i32") }
   if t == "f64" { return ">" + repSigTokOfKind("f64") }
   // A literal-union (or nullable litunion) result reps as the interned i32 atom, matching
   // `cloRetKeySuffix`'s `>i` — checked before the union split below, which would mis-key it.
-  if nameIsLitUnionType(t) || nameIsNulLitUnion(t) {
-    return ">" + repSigTokOfKind("i32")
-  }
-  // The numeric half of that subtraction is unreachable here, as in `annParamKind`: #1273
+  if annTyIsLitUnion(ty) { return ">" + repSigTokOfKind("i32") }
+  // The numeric half of that subtraction is unreachable here, as in `annParamKindTy`: #1273
   // canons a function type's interior, so this producer never sees a numeric alias.
   if t == "void" { return ">v" }
   if t == "string" { return ">" + repSigTokOfKind("str") }
@@ -749,34 +745,44 @@ function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   null
 }
 
-// The `$fnsig` KEY of a SOURCE function-type annotation `(params)=>ret` — the SAME
-// encoding `fnSigKeyOf` produces for a function (`"i>i"`, `"d>d"`, `"s3;>i"`), so a value
-// call over an annotated callee resolves the interned signature. "" if any param/return
-// type is outside the value-call ABI (the all-i32 arity fallback then applies).
-export function annSigKey(name: string) {
-  // `annFnDecompose` (#1144) IS this whole preamble — the three gates, the param-list
-  // slice, the `length > 0`-guarded `annSplitParams` and the return slice. The home's ""
-  // sentinel covers all three of this copy's own `return ""` legs.
+// The `$fnsig` KEY of a SOURCE function-type annotation `(params)=>ret` whose arena type is
+// `fty` (a `TyFunc`, or -1) — the SAME encoding `fnSigKeyOf` produces for a function (`"i>i"`,
+// `"s3;>i"`). Each part reads its own arena type when `fty` has the spelling's arity. "" if
+// any param or the return is outside the value-call ABI.
+export function annSigKeyTy(name: string, fty: i32) {
   const parts: string[] = []
   const retStr = annFnDecompose(name, parts)
   if retStr == "" { return "" }
+  let pts: i32[] = []
+  let rty = -1
+  if fty >= 0 {
+    const ft = T.tys[fty]
+    if ft is TyFunc {
+      if ft.fnParamTypes.length == parts.length {
+        pts = ft.fnParamTypes
+        rty = ft.fnRet
+      }
+    }
+  }
   let key = ""
   let i = 0
   while i < parts.length {
-    const pc = annParamKind(parts[i])
+    let pty = -1
+    if i < pts.length { pty = pts[i] }
+    const pc = annParamKindTy(parts[i], pty)
     if pc == "" { return "" }
     key = key + pc
     i = i + 1
   }
-  const rc = annRetKind(retStr)
+  const rc = annRetKindTy(retStr, rty)
   if rc == "" { return "" }
   key + rc
 }
 
 // The `$fnsig` key of a function-type arena type `funcTyIx` (a `TyFunc`) — the destringify-D3
-// dual of `annSigKey(nodeTyName(node))`: walks the arena spine (`fnParamTypes`, `fnRet`)
+// dual of `annSigKeyTy` over `nodeTyName(node)`: walks the arena spine (`fnParamTypes`, `fnRet`)
 // directly instead of rendering to a name and re-parsing, classifying leaves with the same
-// `annParamKind`/`annRetKind` the string path uses. "" for a non-function type or leaf outside the ABI.
+// `annParamKindTy`/`annRetKindTy` the string path uses. "" for a non-function type or leaf outside the ABI.
 function paramTokOfTy(ty: i32) {
   if ty < 0 { return "" }
   const t = T.tys[ty]
@@ -827,7 +833,7 @@ function paramTokOfTy(ty: i32) {
 }
 
 // The return-side twin of `paramTokOfTy` — same partition, same declines, and one extra
-// decline of its own: the litunion arms. `annRetKind` keys `>i` for a litunion alias name
+// decline of its own: the litunion arms. `annRetKindTy` keys `>i` for a litunion alias name
 // while a raw render softens an inline litunion to `string` (`>S`), so the name arm stays
 // authoritative there. Dual-written inside `sigKeyOfTy`.
 function retTokOfTy(ty: i32) {
@@ -859,7 +865,7 @@ function retTokOfTy(ty: i32) {
         if en == "i64" { return ">" + repSigTokOfKind("i64list") }
         if en == "f32" { return ">" + repSigTokOfKind("f32list") }
       }
-      // The ref-array arm: the arena twin of `annRetKind`'s `nameIsRefArray` path, resolved
+      // The ref-array arm: the arena twin of `annRetKindTy`'s `nameIsRefArray` path, resolved
       // through the element's own ref-list slot via `repElemId` — the same key the name resolver ends at.
       const rslot = rlSlotOfTy(t.aElem)
       if rslot >= 0 { return ">" + repSigSlotTokOfKind("reflist", rslot) }
@@ -960,16 +966,14 @@ export function cloArityRepIsWide(ty: i32): boolean {
   d.rdKind != "i32" && d.rdKind != "nulbool"
 }
 
-// The `$fnsig` key of a union member-set arm (a `splitUnionAtoms` atom), or "" for a
-// non-closure arm or a signature outside the value-call ABI. A closure arm arrives wrapped
-// in its disambiguating parens and may carry `| `-split whitespace, neither peeled by
-// `annSigKey` — normalized here so the key byte-matches the narrowed call site's.
-export function unionArmSigKey(arm: string) {
-  // Trim then peel one fully-wrapping `(...)` — the same steps as `emit_base.normTypeAtom`,
-  // kept as a separate copy here and dual-run against it with no disagreement. #1150.
+// The `$fnsig` key of a union member-set arm (a `splitUnionAtoms` atom) whose arena type is
+// `ty` (-1 when unknown), or "" for a non-closure arm or a signature outside the value-call
+// ABI. A closure arm arrives wrapped in its disambiguating parens and may carry `| `-split
+// whitespace — normalized here so the key byte-matches the narrowed call site's.
+export function unionArmSigKeyTy(arm: string, ty: i32) {
   const t = normTypeAtom(arm)
   if annArrowAt(t) < 0 { return "" }
-  annSigKey(t)
+  annSigKeyTy(t, ty)
 }
 
 // The annotation node behind `identFnTypeAnnNameSid`'s first arm — a `LetDecl` whose
@@ -992,15 +996,15 @@ export function identFnTypeAnnNodeAt(sid: i32, fnIx: i32, atIx: i32) {
   -1
 }
 
-// The `$fnsig` key of a function-type name that may be a plain closure or a nullable one
-// (kind 19, its arrow nested one paren-depth down, invisible to `annArrowAt`) — peeled to
-// the bare closure first. "" when neither resolves, so the call keeps its all-i32 arity
-// fallback; otherwise it recovers the result token so a narrowed nullable-closure call classifies correctly.
-export function cloNameSigKey(nm: string) {
-  if annArrowAt(nm) >= 0 { return annSigKey(nm) }
+// The `$fnsig` key of a function-type name `nm` with arena type `ty` (-1 when unknown) that
+// may be a plain closure or a nullable one (kind 19, its arrow nested one paren-depth down,
+// invisible to `annArrowAt`) — peeled to the bare closure first. "" when neither resolves, so
+// the call keeps its all-i32 arity fallback.
+export function cloNameSigKeyTy(nm: string, ty: i32) {
+  if annArrowAt(nm) >= 0 { return annSigKeyTy(nm, ty) }
   if nameIsNulClosure(nm) {
     const clo = peelGroupParens(nullablePartOf(nm))
-    if annArrowAt(clo) >= 0 { return annSigKey(clo) }
+    if annArrowAt(clo) >= 0 { return annSigKeyTy(clo, tyPeelNul(ty)) }
   }
   ""
 }
