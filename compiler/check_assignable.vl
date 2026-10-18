@@ -132,6 +132,7 @@ import {
   argCstrErr,
   argFlowErr,
   bareBraceDeliver,
+  holeFnDeliveryDemands,
   monoRecheckEnd,
   pinBmCstrElems,
   validateBinCstrs,
@@ -272,6 +273,7 @@ import {
   prbLeave,
 } from "./check_rollback"
 import { declare, lookup, lookupFnDeclNode } from "./check_scopes"
+import { valBindLambda } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import {
   CSTR_ANYFN,
@@ -719,8 +721,10 @@ function tpIfRecheck(
 // bindings that type gives its parameters, as a direct call's are (D3080).
 export function genFnValueCstrs(srcExpr: i32, srcTy: i32, dstTy: i32) {
   // A validator re-delivers a recorded value through `assignableExpr`, which must not re-enter.
-  // With no generic declared, or no function type in the destination, there is nothing to bind.
-  if genFnCstrBusy || !cstrCandAny || !tyMayHoldFn(dstTy, 0) { return 0 }
+  // With no generic or hole-typed lambda declared, or no function type at the destination, there
+  // is nothing to bind.
+  const anyCand = cstrCandAny || valBindLambda.length > 0
+  if genFnCstrBusy || !anyCand || !tyMayHoldFn(dstTy, 0) { return 0 }
   genFnCstrBusySet(true)
   genFnValueCstrsAt(srcExpr, srcTy, dstTy, 0)
   genFnCstrBusySet(false)
@@ -773,10 +777,13 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
       nested = true
     }
   }
-  if decl < 0 || decl >= P.nodes.length { return 0 }
+  if decl >= P.nodes.length { return 0 }
+  if decl < 0 { return holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName) }
   const fd = P.nodes[decl]
   if !(fd is FuncDecl) { return 0 }
-  if fd.fnTyParams.length == 0 { return 0 }
+  if fd.fnTyParams.length == 0 {
+    return holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName)
+  }
   let dt = dstTy
   const dn = T.tys[dt]
   if dn is TyNullable { dt = dn.nInner }
@@ -836,6 +843,29 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   cvNow = cvWas
   substNestModeSet(modeWas)
   substNestDeclSet(declWas)
+  0
+}
+
+// A function value `who` whose parameters are inference holes (an un-annotated function, or a
+// lambda bound to an un-annotated `const`) delivered at the concrete function type `dstTy`: its
+// holes take that type's parameters and its body's demands on them are judged there, as a
+// direct call through it would judge them (D5932).
+function holeFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, who: string) {
+  if dstTy < 0 || srcTy < 0 { return 0 }
+  let dt = dstTy
+  const dn = T.tys[dt]
+  if dn is TyNullable { dt = dn.nInner }
+  if dt < 0 || tyHasTyVar(dt) || tyHasHole(dt) { return 0 }
+  const s = T.tys[srcTy]
+  const d = T.tys[dt]
+  if !(s is TyFunc) || !(d is TyFunc) { return 0 }
+  if s.fnParamTypes.length != d.fnParamTypes.length { return 0 }
+  let anyHole = false
+  for pt in s.fnParamTypes {
+    if tyIsHole(pt) { anyHole = true }
+  }
+  if !anyHole { return 0 }
+  holeFnDeliveryDemands(srcTy, dt, srcExpr, "`" + who + "`")
   0
 }
 
