@@ -1221,6 +1221,7 @@ import {
   holePinProvesNonNull,
   indexPlaceNonNull,
   instancePinnedMaps,
+  instanceTyOf,
   mapArmShapeOfTy,
   mapNicheLacks,
   mapNicheNeedsPin,
@@ -1344,7 +1345,7 @@ import {
   isFitsAcrossTagRows,
   variantFieldIndex,
 } from "./emit_variant_sig"
-import { sidOfNode } from "./symbols"
+import { identDeclOf, sidOfNode } from "./symbols"
 import {
   i32ListHas,
   i32ListIndexOf,
@@ -1364,6 +1365,7 @@ import {
   nullValKind,
   repIsRowMatchTy,
   repOfNode,
+  repOfTy,
   repScanLim,
   scalarTagOfKind,
   tyDenotesFunc,
@@ -1372,6 +1374,7 @@ import {
 } from "./emit_rep"
 import {
   genericFnValueRejectMsg,
+  monoAliasDeclOf,
   monoArgPinTyIx,
   monoArgTyName,
   monoInstantiatedAny,
@@ -23339,6 +23342,56 @@ function emitCallRefArg(
   0
 }
 
+// The first argument whose type at frame `fnIx` is a scalar or string other than the one
+// parameter `i` of function `fe` takes, which no coercion bridges; -1 when every argument fits.
+function directCallInstanceArgMisfit(args: i32[], fe: i32, fnIx: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fn = P.nodes[fnStmts[fe]]
+  if fn is FuncDecl {
+    let i = 0
+    while i < args.length && i < fn.fnParams.length {
+      if cloArgInstanceMisfits(args[i], vtKindOfParam(fn.fnParams[i]), fnIx) {
+        return i
+      }
+      i = i + 1
+    }
+  }
+  -1
+}
+
+// Does argument `argIx`, typed by a type variable that instance `fnIx` binds to a scalar or
+// string, meet a parameter of another such kind `pk`? A null `pk` never misfits.
+function cloArgInstanceMisfits(
+  argIx: i32,
+  pk: VKind | null,
+  fnIx: i32,
+): boolean {
+  if pk == null || !cloArgKindIsPlain(pk) { return false }
+  const own = nodeTyIxOf(unwrapParen(argIx))
+  if own < 0 || !tyHasTyVar(own) { return false }
+  if exprString(argIx, fnIx) { return pk != "str" }
+  if exprIsF64(argIx, fnIx) { return pk != "f64" }
+  if exprIsI64(argIx, fnIx) { return pk != "i64" }
+  // An i32 widens into a numeric parameter, so only a string parameter refuses it.
+  const it = instanceTyOf(own, fnIx)
+  if it < 0 || tyIsLitUnion(it) { return false }
+  const d = repOfTy(it)
+  d.rdCovered != 0 && d.rdKind == "i32" && pk == "str"
+}
+
+// The `let`/`const` callee `ix` reads, also when the monomorphizer renamed it to an
+// instance; -1 when it names a function.
+function callFnBindingOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || !(P.nodes[ix] is Ident) { return -1 }
+  const d = identDeclOf(ix)
+  if d >= 0 && d < P.nodes.length && P.nodes[d] is LetDecl { return d }
+  monoAliasDeclOf(ix)
+}
+
+function cloArgKindIsPlain(k: VKind): boolean {
+  k == "i32" || k == "i64" || k == "f64" || k == "f32" || k == "str"
+}
+
 // `emitCallRef`'s body: each argument applies its parameter's context and leaves it for the
 // wrapper's exit to undo.
 function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
@@ -35161,6 +35214,29 @@ function emitBinNumeric(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
 // under its parameter's context with the full coercion suite, then `call`. The caller's
 // context is restored before the `call`, and on every failure exit.
 function emitDirectCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
+  // A binding's one callee, called in an instance that binds an argument to another type,
+  // asks for a copy of the body and the binding per instance (D6320).
+  const dc = P.nodes[callIx]
+  if dc is Call {
+    const bd = callFnBindingOf(dc.callFn)
+    if (
+      bd >= 0
+      && !hasNamedArgs(dc.callArgNames)
+      && directCallInstanceArgMisfit(dc.callArgs, target, fnIx) >= 0
+    ) {
+      fsAsk(bd)
+      let bn = ""
+      const bdn = P.nodes[bd]
+      if bdn is LetDecl { bn = bdn.letName }
+      // An instance body's nodes carry the instantiating call's position, so the binding anchors.
+      return emitFailAt(
+        "emitProgram: the function binding `"
+          + bn
+          + "` is called in a body instanced at two types, and one binding names one function",
+        bd,
+      )
+    }
+  }
   const saved = expCtxHere()
   if (
     expCtxLeave(saved, emitDirectCallArgsUnder(body, callIx, fnIx, target))
