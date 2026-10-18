@@ -825,24 +825,8 @@ function tyToStrAt(ix: i32, nominal: boolean) {
 }
 
 function tyToStrGo(ix: i32, nominal: boolean) {
-  // A nominal newtype renders as its name — the only renderer that must, since "cannot
-  // assign i32 to i32" for `const e: EntityId = n` hides the very distinction the type
-  // exists to draw. The emit renderers (`tyToEmitName`, `canonEmitName`) deliberately lack
-  // this arm: a newtype must be erased in the emitter's vocabulary (`newtype-design.md` §3).
-  const nwn = nomNameOfTy(ix)
-  if nwn != "" { return nwn }
-  // Nominal-first, in the same order `tyToNameGo`/`transparentMemberEmitName` use:
-  // declared struct, generic application, declared union alias — application before union,
-  // since an application expands to the `TyObj`/`TyUnion` this exists to replace. Each leg
-  // declines with "" for a type it cannot name, so an unnamed type still renders structurally.
-  if nominal {
-    const sdn = structNameOfTy(ix)
-    if sdn != "" { return sdn }
-    const gan = genAppNameOfTy(ix)
-    if gan != "" { return gan }
-    const udn = unionAliasDeclNameOfTy(ix)
-    if udn != "" { return udn }
-  }
+  const nn = tyToStrNameOf(ix, nominal)
+  if nn != "" { return nn }
   const t = T.tys[ix]
   // Exhaustive over `Ty`, deliberately without a `_` arm: a new variant breaks the
   // self-compile here instead of silently printing `<?>` in a diagnostic.
@@ -854,108 +838,22 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       return "<error>"
     }
     TyObj => {
-      // `.length`/index chained directly on an array field of an `is`-narrowed value
-      // miscompiles, so the array fields are bound to locals first.
-      const names = t.objFieldNames
-      const ftys = t.objFieldTypes
-      let s = "{"
-      let i = 0
-      while i < names.length {
-        if i > 0 { s = s + ", " }
-        s = s + names[i] + ": " + tyToStrAt(ftys[i], nominal)
-        i = i + 1
-      }
-      // Every field separator sits inside the braces — one atom. Set explicitly rather
-      // than inherited, since a field's own render leaves its last width behind.
-      tyStrAtoms = 1
-      return s + "}"
+      return tyToStrObj(t, nominal)
     }
     TyFunc => {
-      const ptys = t.fnParamTypes
-      let s = "("
-      let i = 0
-      while i < ptys.length {
-        if i > 0 { s = s + ", " }
-        s = s + tyToStrAt(ptys[i], nominal)
-        i = i + 1
-      }
-      let rs = tyToStrAt(t.fnRet, nominal)
-      // A function type is one atom: params are parenthesized and everything after the
-      // top-level arrow belongs to the result. Set explicitly, since the param/result
-      // renders leave their own widths behind.
-      tyStrAtoms = 1
-      // VL writes a function type `(params) => ret`. A function result that is itself a
-      // function keeps grouping parens — the same rule `arrElemRender` carries for array
-      // elements.
-      if tyIxIsFunc(t.fnRet) { rs = "(" + rs + ")" }
-      return s + ") => " + rs
+      return tyToStrFunc(t, nominal)
     }
     TyUnion => {
-      const members = t.uMembers
-      let s = ""
-      // The render's atom count, accumulated as members join: a member is not always one
-      // atom (a nullable member renders `X | null`), so this is summed rather than read
-      // off `members.length`.
-      let psum = 0
-      let i = 0
-      while i < members.length {
-        if i > 0 { s = s + " | " }
-        let ms = tyToStrAt(members[i], nominal)
-        let mw = tyStrAtoms
-        // A function-type member renders parenthesized (`((i32) => f64) | string`) —
-        // bare, the closure's result would swallow the union's sibling members
-        // (`(i32) => f64 | string` returns `f64 | string`, a different type).
-        if tyIxIsFunc(members[i]) {
-          ms = "(" + ms + ")"
-          mw = 1
-        }
-        s = s + ms
-        psum = psum + mw
-        i = i + 1
-      }
-      tyStrAtoms = psum
-      return s
+      return tyToStrUnion(t, nominal)
     }
     TyNullable => {
-      const inner = tyToStrAt(t.nInner, nominal)
-      const innerAtoms = tyStrAtoms
-      // VL has no `T?` suffix — a nullable is written `T | null`. A nullable function
-      // type keeps grouping parens (`((i32) => string) | null`), else ` | null` binds
-      // into the closure's result and spells a different type.
-      if tyIxIsFunc(t.nInner) {
-        // The grouped closure is one atom; `null` is the second.
-        tyStrAtoms = 2
-        return "(" + inner + ") | null"
-      }
-      // A union inner keeps its own top-level `|`s (`A | B | null`), so the `null` arm
-      // adds to the inner render's width rather than making the whole render two atoms.
-      tyStrAtoms = innerAtoms + 1
-      return inner + " | null"
+      return tyToStrNullable(t, nominal)
     }
     TyArray => {
-      const el = tyToStrAt(t.aElem, nominal)
-      const elw = tyStrAtoms
-      // A list render is one atom in every form — a wide element is parenthesized so its
-      // `|`s stop being top-level. Set explicitly, since the element render left its own width behind.
-      tyStrAtoms = 1
-      // A view element is grouped: `readonly T[][]` spells a view of `T[][]` (D2195).
-      let row = arrElemRender(el, t.aElem, elw)
-      if tyIxIsView(t.aElem) { row = "(" + el + ")[]" }
-      if t.aRead == 1 { return "readonly " + row }
-      return row
+      return tyToStrArray(t, nominal)
     }
     TyMap => {
-      const mk = tyToStrAt(t.mKey, nominal)
-      // A set is its own type and reads as one; the structural render keeps the index
-      // signature the emitter's name tables are keyed by.
-      if t.mSet == 1 && nominal {
-        tyStrAtoms = 1
-        return "Set<" + mk + ">"
-      }
-      const mv = tyToStrAt(t.mVal, nominal)
-      // The key/value separators sit inside the braces — one atom.
-      tyStrAtoms = 1
-      return "{[" + mk + "]: " + mv + "}"
+      return tyToStrMap(t, nominal)
     }
     TyVar => {
       // An inference hole (`?fn.N`) renders as the blank `_` — deliberately not an
@@ -979,6 +877,146 @@ function tyToStrGo(ix: i32, nominal: boolean) {
       return "!" + ns
     }
   }
+}
+
+// The name type `ix` renders as before any structural render: a newtype's name always, and
+// under `nominal` a declared struct, generic application or union alias. "" when none applies.
+function tyToStrNameOf(ix: i32, nominal: boolean): string {
+  // A nominal newtype renders as its name — the only renderer that must, since "cannot
+  // assign i32 to i32" for `const e: EntityId = n` hides the very distinction the type
+  // exists to draw. The emit renderers (`tyToEmitName`, `canonEmitName`) deliberately lack
+  // this arm: a newtype must be erased in the emitter's vocabulary (`newtype-design.md` §3).
+  const nwn = nomNameOfTy(ix)
+  if nwn != "" { return nwn }
+  // Nominal-first, in the same order `tyToNameGo`/`transparentMemberEmitName` use:
+  // declared struct, generic application, declared union alias — application before union,
+  // since an application expands to the `TyObj`/`TyUnion` this exists to replace. Each leg
+  // declines with "" for a type it cannot name, so an unnamed type still renders structurally.
+  if nominal {
+    const sdn = structNameOfTy(ix)
+    if sdn != "" { return sdn }
+    const gan = genAppNameOfTy(ix)
+    if gan != "" { return gan }
+    const udn = unionAliasDeclNameOfTy(ix)
+    if udn != "" { return udn }
+  }
+  ""
+}
+
+// A record type's render, `{a: A, b: B}`, one atom.
+function tyToStrObj(t: TyObj, nominal: boolean): string {
+  // `.length`/index chained directly on an array field of an `is`-narrowed value
+  // miscompiles, so the array fields are bound to locals first.
+  const names = t.objFieldNames
+  const ftys = t.objFieldTypes
+  let s = "{"
+  let i = 0
+  while i < names.length {
+    if i > 0 { s = s + ", " }
+    s = s + names[i] + ": " + tyToStrAt(ftys[i], nominal)
+    i = i + 1
+  }
+  // Every field separator sits inside the braces — one atom. Set explicitly rather
+  // than inherited, since a field's own render leaves its last width behind.
+  tyStrAtoms = 1
+  s + "}"
+}
+
+// A function type's render, `(params) => ret`, one atom; a function result keeps its parens.
+function tyToStrFunc(t: TyFunc, nominal: boolean): string {
+  const ptys = t.fnParamTypes
+  let s = "("
+  let i = 0
+  while i < ptys.length {
+    if i > 0 { s = s + ", " }
+    s = s + tyToStrAt(ptys[i], nominal)
+    i = i + 1
+  }
+  let rs = tyToStrAt(t.fnRet, nominal)
+  // A function type is one atom: params are parenthesized and everything after the
+  // top-level arrow belongs to the result. Set explicitly, since the param/result
+  // renders leave their own widths behind.
+  tyStrAtoms = 1
+  // VL writes a function type `(params) => ret`. A function result that is itself a
+  // function keeps grouping parens — the same rule `arrElemRender` carries for array
+  // elements.
+  if tyIxIsFunc(t.fnRet) { rs = "(" + rs + ")" }
+  s + ") => " + rs
+}
+
+// A union's render, its members joined by ` | `, with `tyStrAtoms` set to their summed width.
+function tyToStrUnion(t: TyUnion, nominal: boolean): string {
+  const members = t.uMembers
+  let s = ""
+  // The render's atom count, accumulated as members join: a member is not always one
+  // atom (a nullable member renders `X | null`), so this is summed rather than read
+  // off `members.length`.
+  let psum = 0
+  let i = 0
+  while i < members.length {
+    if i > 0 { s = s + " | " }
+    let ms = tyToStrAt(members[i], nominal)
+    let mw = tyStrAtoms
+    // A function-type member renders parenthesized (`((i32) => f64) | string`) —
+    // bare, the closure's result would swallow the union's sibling members
+    // (`(i32) => f64 | string` returns `f64 | string`, a different type).
+    if tyIxIsFunc(members[i]) {
+      ms = "(" + ms + ")"
+      mw = 1
+    }
+    s = s + ms
+    psum = psum + mw
+    i = i + 1
+  }
+  tyStrAtoms = psum
+  s
+}
+
+// A nullable's render, `T | null`, one atom wider than its inner's.
+function tyToStrNullable(t: TyNullable, nominal: boolean): string {
+  const inner = tyToStrAt(t.nInner, nominal)
+  const innerAtoms = tyStrAtoms
+  // VL has no `T?` suffix — a nullable is written `T | null`. A nullable function
+  // type keeps grouping parens (`((i32) => string) | null`), else ` | null` binds
+  // into the closure's result and spells a different type.
+  if tyIxIsFunc(t.nInner) {
+    // The grouped closure is one atom; `null` is the second.
+    tyStrAtoms = 2
+    return "(" + inner + ") | null"
+  }
+  // A union inner keeps its own top-level `|`s (`A | B | null`), so the `null` arm
+  // adds to the inner render's width rather than making the whole render two atoms.
+  tyStrAtoms = innerAtoms + 1
+  inner + " | null"
+}
+
+// A list's render, `T[]` or `readonly T[]`, one atom; a wide or view element is grouped.
+function tyToStrArray(t: TyArray, nominal: boolean): string {
+  const el = tyToStrAt(t.aElem, nominal)
+  const elw = tyStrAtoms
+  // A list render is one atom in every form — a wide element is parenthesized so its
+  // `|`s stop being top-level. Set explicitly, since the element render left its own width behind.
+  tyStrAtoms = 1
+  // A view element is grouped: `readonly T[][]` spells a view of `T[][]` (D2195).
+  let row = arrElemRender(el, t.aElem, elw)
+  if tyIxIsView(t.aElem) { row = "(" + el + ")[]" }
+  if t.aRead == 1 { return "readonly " + row }
+  row
+}
+
+// A map's render, `{[K]: V}`, or under `nominal` a set's `Set<K>`; one atom.
+function tyToStrMap(t: TyMap, nominal: boolean): string {
+  const mk = tyToStrAt(t.mKey, nominal)
+  // A set is its own type and reads as one; the structural render keeps the index
+  // signature the emitter's name tables are keyed by.
+  if t.mSet == 1 && nominal {
+    tyStrAtoms = 1
+    return "Set<" + mk + ">"
+  }
+  const mv = tyToStrAt(t.mVal, nominal)
+  // The key/value separators sit inside the braces — one atom.
+  tyStrAtoms = 1
+  "{[" + mk + "]: " + mv + "}"
 }
 
 // Is arena type `ix` a nullable value-union box — a `TyUnion` with a `null` member and two
