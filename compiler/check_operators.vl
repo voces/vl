@@ -1203,6 +1203,63 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
   return lt
 }
 
+// Records the deferred constraint of operator `op` over a hole operand `lt`/`rt` of `n`, whose
+// form cannot be decided until the call binds the hole, and the width each side meets.
+function binNoteHoleCstr(n: BinExpr, op: string, lt: i32, rt: i32) {
+  noteBinCstr(
+    eqCstrOperandTy(op, n.binLeft, lt),
+    op,
+    eqCstrOperandTy(op, n.binRight, rt),
+  )
+  cexNoteHoleWidth(lt, rt)
+  cexNoteHoleWidth(rt, lt)
+  0
+}
+
+// Refuses operator `op` (at `ix`) over operands `lt`/`rt` carrying different newtype brands.
+// A null test against a non-null brand is recorded as dead instead; answers the op's type.
+function binNomMixRefusal(
+  n: BinExpr,
+  ix: i32,
+  op: string,
+  lt: i32,
+  rt: i32,
+): i32 {
+  if op == "==" || op == "!=" {
+    // A null test of a newtype over a base with no `null` is dead, as for any type.
+    if isNullTy(rt) && tyProvesNonNull(lt) {
+      recordDeadNullTest(ix, n.binLeft, lt, op)
+      return TY_BOOL
+    }
+    if isNullTy(lt) && tyProvesNonNull(rt) {
+      recordDeadNullTest(ix, n.binRight, rt, op)
+      return TY_BOOL
+    }
+    tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+    return TY_BOOL
+  }
+  tErr("operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt), ix)
+  TY_ERR
+}
+
+// The type of operator `op` over a numeric-union operand `lt`/`rt`. Beside a type parameter
+// the pairs are the pin's to check (`numUnionPinOk`), so the constraint is deferred.
+function binNumUnionOpTy(
+  n: BinExpr,
+  ix: i32,
+  op: string,
+  lt: i32,
+  rt: i32,
+): i32 {
+  if tyHasTyVar(lt) || tyHasTyVar(rt) {
+    noteBinCstr(lt, op, rt)
+    if numCmpOp(op) { return TY_BOOL }
+    if tyIsNumUnion(lt) { return lt }
+    return rt
+  }
+  numUnionBinTy(n, ix, lt, rt)
+}
+
 // Extracted from `checkNodeReal`'s `BinExpr` arm (C3: thin the dispatcher).
 function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   const op = n.binOp
@@ -1325,38 +1382,13 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // A binary op with a hole operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
   if op != "=" && op != "&&" && op != "||" {
-    if tyHasHole(lt) || tyHasHole(rt) {
-      noteBinCstr(
-        eqCstrOperandTy(op, n.binLeft, lt),
-        op,
-        eqCstrOperandTy(op, n.binRight, rt),
-      )
-      cexNoteHoleWidth(lt, rt)
-      cexNoteHoleWidth(rt, lt)
-    }
+    if tyHasHole(lt) || tyHasHole(rt) { binNoteHoleCstr(n, op, lt, rt) }
   }
   // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the
   // same brand — structural rules can't see it (`sameNumeric` compares `primName`, ordering skips `assignable`).
   if op != "=" && op != "&&" && op != "||" && op != "??" {
     if nomBinMixes(lt, rt, n.binLeft, n.binRight) {
-      if op == "==" || op == "!=" {
-        // A null test of a newtype over a base with no `null` is dead, as for any type.
-        if isNullTy(rt) && tyProvesNonNull(lt) {
-          recordDeadNullTest(ix, n.binLeft, lt, op)
-          return TY_BOOL
-        }
-        if isNullTy(lt) && tyProvesNonNull(rt) {
-          recordDeadNullTest(ix, n.binRight, rt, op)
-          return TY_BOOL
-        }
-        tErr("cannot compare " + tyToStr(lt) + " and " + tyToStr(rt), ix)
-        return TY_BOOL
-      }
-      tErr(
-        "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
-        ix,
-      )
-      return TY_ERR
+      return binNomMixRefusal(n, ix, op, lt, rt)
     }
   }
   if (
@@ -1366,17 +1398,9 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
     && !nullTestOp(op, lt, rt)
     && !njExprHeld(n.binLeft)
     && !njExprHeld(n.binRight)
+    && !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt)))
   ) {
-    if !(op == "+" && (concatsAsStr(lt) || concatsAsStr(rt))) {
-      // Beside a type parameter the pairs are the pin's to check (`numUnionPinOk`).
-      if tyHasTyVar(lt) || tyHasTyVar(rt) {
-        noteBinCstr(lt, op, rt)
-        if numCmpOp(op) { return TY_BOOL }
-        if tyIsNumUnion(lt) { return lt }
-        return rt
-      }
-      return numUnionBinTy(n, ix, lt, rt)
-    }
+    return binNumUnionOpTy(n, ix, op, lt, rt)
   }
   // Assignment: RHS must be assignable to the LHS's (already-bound) type.
   if op == "=" { return checkAssignBinNode(n, ix, lt, rt) }
@@ -1426,6 +1450,21 @@ export function checkCastNode(n: AsExpr, ix: i32) {
   }
   // Union-operand `as` is the ruled propagation cast: `x as T` over `x: A|B|...` names the arm
   // wanted, everything else is the error. A nullable operand is a union operand — one arm, no second ladder.
+  const argU = castUnionOperandOf(arg)
+  // `as%` picks no arm — it is the wrap cast over two integer widths, so a union operand is
+  // simply not a number and takes the numeric ladder's own refusal below.
+  if argU >= 0 && n.asMode != "wrap" {
+    const argT = T.tys[argU]
+    if argT is TyUnion {
+      return checkCastUnionArm(n, ix, argU, argT, target, isU8Cast)
+    }
+  }
+  return checkCastScalar(n, ix, arg, target)
+}
+
+// The operand type `arg` as the union-operand arm of a cast reads it: a nullable is its inner
+// type joined with `null`; anything else, or a join that mints no row, is `arg` itself.
+function castUnionOperandOf(arg: i32): i32 {
   let argU = arg
   if arg >= 0 {
     const argN = T.tys[arg]
@@ -1436,74 +1475,79 @@ export function checkCastNode(n: AsExpr, ix: i32) {
       }
     }
   }
-  // `as%` picks no arm — it is the wrap cast over two integer widths, so a union operand is
-  // simply not a number and takes the numeric ladder's own refusal below.
-  if argU >= 0 && n.asMode != "wrap" {
-    const argT = T.tys[argU]
-    if argT is TyUnion {
-      // `as u8` narrows a number, it does not pick an arm (D1587) — a union operand taking
-      // the arm ladder would hand back the arm's own `i32` with no range test.
-      if isU8Cast {
-        tErr(
-          "`as u8` narrows a number into 0..255, and "
-            + tyToStr(argU)
-            + " is a union — take the numeric arm first, then the range (`(x as! i32) as! u8`)",
-          ix,
-        )
-        return TY_ERR
-      }
-      // A numeric union converts at whichever member it holds when no member's conversion
-      // can fail, as each member alone would.
-      if numUnionAsConverts(argU, target) && !njExprHeld(n.asObj) {
-        return target
-      }
-      if !unionCoversTy(argT, target) {
-        // A gradual union's parameter may hold the target at a pin: the cast is parked on the
-        // parameter and re-asked there, as over a bare one (D2906).
-        if unionHasDeclaredParam(argT.uMembers) {
-          noteBinCstr(argU, OP_AS, target)
-          if n.asMode == "null" { return mkNullableTy(target) }
-          return target
-        }
-        tErr(
-          "`as "
-            + n.asTy
-            + "` names a type that is not a member of "
-            + tyToStr(argU),
-          ix,
-        )
-        return TY_ERR
-      }
-      const twin = mapTwinTestMsg([argU], target, "`as`")
-      if twin != "" {
-        tErr(twin, ix)
-        return TY_ERR
-      }
-      const rest = subtractTy(argU, target)
-      // An operand wholly of the target leaves no remainder: the cast cannot miss (D5285).
-      if rest < 0 && assignable(argU, target) {
-        if n.asMode == "null" { return mkNullableTy(target) }
-        return target
-      }
-      if rest < 0 {
-        tErr(
-          "`as` cannot compute the propagated remainder of " + tyToStr(argU),
-          ix,
-        )
-        return TY_ERR
-      }
-      // `as!` traps on a miss, so nothing is propagated and the enclosing return is not
-      // consulted at all — that is the whole point of the form.
-      if n.asMode == "trap" { return target }
-      // `as?` coalesces to null, so the expression is `T | null` — again nothing propagates.
-      // Whether `T | null` has a rep at all is the emitter's question, not this checker's.
+  argU
+}
+
+// The ruled propagation cast over union operand `argU` (`argT`) to `target`: it names the arm
+// wanted, and the remainder propagates to the enclosing return unless `as!`/`as?` keeps it
+// local. Answers the cast's type, `TY_ERR` once refused at `ix`.
+function checkCastUnionArm(
+  n: AsExpr,
+  ix: i32,
+  argU: i32,
+  argT: TyUnion,
+  target: i32,
+  isU8Cast: boolean,
+): i32 {
+  // `as u8` narrows a number, it does not pick an arm (D1587) — a union operand taking
+  // the arm ladder would hand back the arm's own `i32` with no range test.
+  if isU8Cast {
+    tErr(
+      "`as u8` narrows a number into 0..255, and "
+        + tyToStr(argU)
+        + " is a union — take the numeric arm first, then the range (`(x as! i32) as! u8`)",
+      ix,
+    )
+    return TY_ERR
+  }
+  // A numeric union converts at whichever member it holds when no member's conversion
+  // can fail, as each member alone would.
+  if numUnionAsConverts(argU, target) && !njExprHeld(n.asObj) { return target }
+  if !unionCoversTy(argT, target) {
+    // A gradual union's parameter may hold the target at a pin: the cast is parked on the
+    // parameter and re-asked there, as over a bare one (D2906).
+    if unionHasDeclaredParam(argT.uMembers) {
+      noteBinCstr(argU, OP_AS, target)
       if n.asMode == "null" { return mkNullableTy(target) }
-      // The propagated remainder must fit the enclosing return, because that is where it
-      // goes. A pending return (-2) is refused rather than joined into.
-      if !castPropagationFits(rest, n.asTy, ix, T.curRet, -1) { return TY_ERR }
       return target
     }
+    tErr(
+      "`as " + n.asTy + "` names a type that is not a member of " + tyToStr(argU),
+      ix,
+    )
+    return TY_ERR
   }
+  const twin = mapTwinTestMsg([argU], target, "`as`")
+  if twin != "" {
+    tErr(twin, ix)
+    return TY_ERR
+  }
+  const rest = subtractTy(argU, target)
+  // An operand wholly of the target leaves no remainder: the cast cannot miss (D5285).
+  if rest < 0 && assignable(argU, target) {
+    if n.asMode == "null" { return mkNullableTy(target) }
+    return target
+  }
+  if rest < 0 {
+    tErr("`as` cannot compute the propagated remainder of " + tyToStr(argU), ix)
+    return TY_ERR
+  }
+  // `as!` traps on a miss, so nothing is propagated and the enclosing return is not
+  // consulted at all — that is the whole point of the form.
+  if n.asMode == "trap" { return target }
+  // `as?` coalesces to null, so the expression is `T | null` — again nothing propagates.
+  // Whether `T | null` has a rep at all is the emitter's question, not this checker's.
+  if n.asMode == "null" { return mkNullableTy(target) }
+  // The propagated remainder must fit the enclosing return, because that is where it
+  // goes. A pending return (-2) is refused rather than joined into.
+  if !castPropagationFits(rest, n.asTy, ix, T.curRet, -1) { return TY_ERR }
+  target
+}
+
+// A cast of the non-union operand `arg` to `target`: a v128 re-brand, a boolean, or a numeric
+// conversion with its constant, bound and can-fail answers. Answers the cast's type,
+// `TY_ERR` once refused at `ix`.
+function checkCastScalar(n: AsExpr, ix: i32, arg: i32, target: i32): i32 {
   // A v128 to a v128 (a `new v128` brand on either side, or both) re-brands the same 128 bits:
   // no conversion, cannot fail, so every mode but `as%` answers the target itself.
   if primNameOf(target) == "v128" && arg >= 0 && primNameOf(arg) == "v128" {

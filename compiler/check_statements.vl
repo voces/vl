@@ -284,23 +284,18 @@ import {
 
 // ── let declaration ────────────────────────────────────────────────────────
 
-export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
-  if curFnDeclIx >= 0 { letDeclFnPut(ix, curFnDeclIx) }
-  if n.letInit >= 0 { wrDstDeclPut(n.letInit, ix) }
-  if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
-    const lp = cwPeel(n.letInit)
-    if lp >= 0 {
-      const li = P.nodes[lp]
-      if li is IfStmt { letJoinCandidates.push(ix) }
-      if li is BinExpr {
-        if li.binOp == "??" { letJoinCandidates.push(ix) }
-      }
-    }
-  }
-  // Resolve the annotation (if any) by reading the TypeRef child inline.
+// A `let`'s resolved annotation: its type (-1 when it has none, `TY_ERR` once refused) and
+// whether resolving it collapsed a subsumed literal arm (D1048's second hint).
+type LetAnnot = {
+  ty: i32,
+  collapsedHere: boolean,
+}
+
+// Resolves the annotation of `n` by reading its TypeRef child inline, refusing an unknown type
+// (or a map key with no hash) and recording the resolved type on the annotation node.
+function letDeclResolveAnnot(n: LetDecl): LetAnnot {
   let annot = -1
-  // D1048's second hint: did the annotation collapse a subsumed literal arm? Read immediately
-  // after resolution and compared against THIS annotation's own answer.
+  // Read immediately after resolution and compared against THIS annotation's own answer.
   let annotCollapsedHere = false
   if n.letType >= 0 {
     const tn = P.nodes[n.letType]
@@ -337,6 +332,110 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
       }
     }
   }
+  const r: LetAnnot = { ty: annot, collapsedHere: annotCollapsedHere }
+  r
+}
+
+// Grades the initializer of `n`, of type `initTy`, against its annotation `annot`: refuses one
+// that does not fit, and otherwise records the pair (and a literal's slots) for the pin.
+function letDeclGradeAnnotated(n: LetDecl, annot: i32, initTy: i32) {
+  // An annotated empty-collection initializer pins the source binding's open holes from
+  // the annotation (`const ys: i32[] = zs` resolves `zs`'s element) in place.
+  constrainEmptyExpr(n.letInit, initTy, annot)
+  // A `never`-typed annotation is already reported at its declaration — don't cascade a
+  // second "cannot assign ... of type <empty>" at every use site.
+  const neverAnnot = isNeverTy(annot)
+  if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
+    // Three sentences, one home: `letAssignMsg` picks between the object-literal-into-a-map,
+    // lossy-numeric and opaque forms; the pin calls the same function on the substituted pair.
+    tErrWant(
+      letAssignMsg(n.letInit, initTy, annot, n.letName, n.letType),
+      n.letInit,
+      annot,
+    )
+  } else if !neverAnnot {
+    // The check above is vacuous whenever a side is a hole — record the pair for the pin to
+    // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
+    noteLetCstr(coalPinTy(n.letInit, initTy), annot, n.letInit, n.letName)
+    // And the slots of a literal source too, but only when the pair above carried no hole —
+    // that is exactly when the literal's own element join dropped one, so nothing is recorded.
+    if !tyHasHole(initTy) {
+      if !tyHasHole(annot) { noteLitElemCstrs(n.letInit, annot, 6) }
+    }
+  }
+  0
+}
+
+// Marks the binding of `n` when its type came from a spelling
+// that collapsed a subsumed literal arm: its own annotation (`annotCollapsedHere`), or a bare
+// call initializer to a function whose return collapsed one, deliberately narrow.
+function letDeclMarkCollapsed(n: LetDecl, annotCollapsedHere: boolean) {
+  if annotCollapsedHere {
+    markCollapsedBinding(n.letName)
+  } else if n.letType < 0 && n.letInit >= 0 {
+    const cInit = P.nodes[n.letInit]
+    if cInit is Call {
+      const cFn = P.nodes[cInit.callFn]
+      if cFn is Ident {
+        const cDecl = fnDeclIx[cFn.identName] ?? lookupFnDeclNode(cFn.identName)
+        if fnRetCollapsed(cDecl) { markCollapsedBinding(n.letName) }
+      }
+    }
+  }
+  0
+}
+
+// `const f = addT` — records which declaration the binding of `n` aliases, for
+// deferred-constraint ownership alone. A bare Ident initializer naming a declared function, or
+// a binding that aliases one, is the whole rung: a copy of an alias owns what it owns (D5160).
+function letDeclNoteFnAlias(n: LetDecl) {
+  if n.letInit >= 0 {
+    const aInit = P.nodes[parenPeelIx(n.letInit)]
+    if aInit is Ident {
+      let aDecl = fnDeclIx[aInit.identName] ?? lookupFnDeclNode(aInit.identName)
+      if aDecl < 0 { aDecl = lookupFnAliasNode(aInit.identName) }
+      if aDecl >= 0 {
+        const atop = fnAliasScopes.length - 1
+        if atop >= 0 { fnAliasScopes[atop][n.letName] = aDecl }
+      }
+    }
+  }
+  0
+}
+
+// The literal-binding marks of a `let` the module hoist did not already record at depth 0
+// (D1609): an un-annotated object or container literal, a numeric literal, the literal-binding
+// index and a function literal, each at the innermost scope.
+function letDeclMarkLitBindings(n: LetDecl, ix: i32, bound: i32) {
+  if letDeclIsUnannotObjLit(ix) {
+    markObjLitBinding(n.letName, T.scopes.length - 1)
+  }
+  if letDeclIsUnannotCtnLit(ix) {
+    markCtnLitBinding(n.letName, T.scopes.length - 1, n.letInit)
+  }
+  if numLitBindCandidateTy(bound) {
+    markNumLitBinding(n.letName, T.scopes.length - 1, ix)
+  }
+  lbiMark(n.letName, T.scopes.length - 1, ix, bound)
+  markFnLitBinding(n.letName, T.scopes.length - 1, ix)
+  0
+}
+
+export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
+  if curFnDeclIx >= 0 { letDeclFnPut(ix, curFnDeclIx) }
+  if n.letInit >= 0 { wrDstDeclPut(n.letInit, ix) }
+  if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
+    const lp = cwPeel(n.letInit)
+    if lp >= 0 {
+      const li = P.nodes[lp]
+      if li is IfStmt { letJoinCandidates.push(ix) }
+      if li is BinExpr {
+        if li.binOp == "??" { letJoinCandidates.push(ix) }
+      }
+    }
+  }
+  const la = letDeclResolveAnnot(n)
+  const annot = la.ty
   let initTy = -1
   // Bidirectional: an annotated `const f: (i32) => i32 = (x) => ...` infers each un-annotated
   // lambda param from the annotation before the initializer is checked.
@@ -358,32 +457,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   let bound = TY_ERR
   if annot >= 0 {
     bound = annot
-    if initTy >= 0 {
-      // An annotated empty-collection initializer pins the source binding's open holes from
-      // the annotation (`const ys: i32[] = zs` resolves `zs`'s element) in place.
-      constrainEmptyExpr(n.letInit, initTy, annot)
-      // A `never`-typed annotation is already reported at its declaration — don't cascade a
-      // second "cannot assign ... of type <empty>" at every use site.
-      const neverAnnot = isNeverTy(annot)
-      if !neverAnnot && !assignableExpr(n.letInit, initTy, annot) {
-        // Three sentences, one home: `letAssignMsg` picks between the object-literal-into-a-map,
-        // lossy-numeric and opaque forms; the pin calls the same function on the substituted pair.
-        tErrWant(
-          letAssignMsg(n.letInit, initTy, annot, n.letName, n.letType),
-          n.letInit,
-          annot,
-        )
-      } else if !neverAnnot {
-        // The check above is vacuous whenever a side is a hole — record the pair for the pin to
-        // re-ask under substitution, only on the PASSING side (a failing one already reported, D572).
-        noteLetCstr(coalPinTy(n.letInit, initTy), annot, n.letInit, n.letName)
-        // And the slots of a literal source too, but only when the pair above carried no hole —
-        // that is exactly when the literal's own element join dropped one, so nothing is recorded.
-        if !tyHasHole(initTy) {
-          if !tyHasHole(annot) { noteLitElemCstrs(n.letInit, annot, 6) }
-        }
-      }
-    }
+    if initTy >= 0 { letDeclGradeAnnotated(n, annot, initTy) }
   } else if initTy >= 0 {
     bound = letDeclInferredBound(n, ix, initTy)
   } else {
@@ -410,48 +484,10 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if npKeys.length > 0 { narShadowPaths(n.letName, ix) }
   crNoteSoleRef(n)
   getLetBank(ix, bound)
-  // The module hoist already recorded a global's row at depth 0; a second one would say the
-  // same thing at the same depth (D1609).
-  if !preHoisted && letDeclIsUnannotObjLit(ix) {
-    markObjLitBinding(n.letName, T.scopes.length - 1)
-  }
-  if !preHoisted && letDeclIsUnannotCtnLit(ix) {
-    markCtnLitBinding(n.letName, T.scopes.length - 1, n.letInit)
-  }
-  if !preHoisted && numLitBindCandidateTy(bound) {
-    markNumLitBinding(n.letName, T.scopes.length - 1, ix)
-  }
-  if !preHoisted { lbiMark(n.letName, T.scopes.length - 1, ix, bound) }
-  if !preHoisted { markFnLitBinding(n.letName, T.scopes.length - 1, ix) }
+  if !preHoisted { letDeclMarkLitBindings(n, ix, bound) }
   fsbMark(n.letName, T.scopes.length - 1, ix, bound)
-  // D1048's second hint: marks a binding whose type came from a spelling that collapsed a
-  // subsumed literal arm. A bare call initializer is the whole rung, deliberately narrow.
-  if annotCollapsedHere {
-    markCollapsedBinding(n.letName)
-  } else if n.letType < 0 && n.letInit >= 0 {
-    const cInit = P.nodes[n.letInit]
-    if cInit is Call {
-      const cFn = P.nodes[cInit.callFn]
-      if cFn is Ident {
-        const cDecl = fnDeclIx[cFn.identName] ?? lookupFnDeclNode(cFn.identName)
-        if fnRetCollapsed(cDecl) { markCollapsedBinding(n.letName) }
-      }
-    }
-  }
-  // `const f = addT` — records which declaration this binding aliases, for deferred-constraint
-  // ownership alone. A bare Ident initializer naming a declared function, or a binding that
-  // aliases one, is the whole rung: a copy of an alias owns what the alias owns (D5160).
-  if n.letInit >= 0 {
-    const aInit = P.nodes[parenPeelIx(n.letInit)]
-    if aInit is Ident {
-      let aDecl = fnDeclIx[aInit.identName] ?? lookupFnDeclNode(aInit.identName)
-      if aDecl < 0 { aDecl = lookupFnAliasNode(aInit.identName) }
-      if aDecl >= 0 {
-        const atop = fnAliasScopes.length - 1
-        if atop >= 0 { fnAliasScopes[atop][n.letName] = aDecl }
-      }
-    }
-  }
+  letDeclMarkCollapsed(n, la.collapsedHere)
+  letDeclNoteFnAlias(n)
   symDecl(n.letName, ix, bound, 0)
   if n.letKw == "const" {
     const ctop = constScopes.length - 1
@@ -684,6 +720,86 @@ export function checkIfStmtNode(ix: i32) {
   res
 }
 
+// Registers the `is`-guard alternatives of the then-narrows `tnNames`/`tnTys` that refine a
+// hole: a new row goes to both `altRows` and `guardRows`, one a previous pass registered to
+// `guardRows` alone, since the guarded-return marking must fire on every pass.
+function ifNoteGuardAlts(
+  tnNames: string[],
+  tnTys: i32[],
+  altRows: i32[],
+  guardRows: i32[],
+) {
+  let ai = 0
+  while ai < tnNames.length {
+    if !isPathKey(tnNames[ai]) {
+      const curIx = lookup(tnNames[ai])
+      if curIx >= 0 {
+        const cur = T.tys[curIx]
+        if cur is TyVar {
+          const row = noteHoleAlt(curIx, cur.tvName, tnTys[ai])
+          if row >= 0 {
+            altRows.push(row)
+            guardRows.push(row)
+          } else {
+            const seen = holeAltRowOf(cur.tvName, tnTys[ai])
+            if seen >= 0 { guardRows.push(seen) }
+          }
+        }
+      }
+    }
+    ai = ai + 1
+  }
+  0
+}
+
+// Seeds the inferred return from the then-arm value `thenTy` (tail node `thenIx`) of a value
+// `if`, guarded by the last of `guardRows` exactly like an explicit `return` inside the arm.
+function ifSeedThenRet(n: IfStmt, guardRows: i32[], thenIx: i32, thenTy: i32) {
+  const guardedRet = guardRows.length > 0
+  if guardedRet { guardAltStackPush(guardRows[guardRows.length - 1]) }
+  // The arm, not the arms' join: a tail `if`/`else` whose one arm is an open `[]` needs
+  // the sibling arm's shape, and the join is a third arena row (D1591).
+  noteInferRetWitness(thenIx, thenTy)
+  const seedThen = ifArmValTy(n.ifThen, thenTy)
+  noteInferredSeed(seedThen, armLit(seedThen, n.ifThen))
+  if guardedRet { guardAltStackPop() }
+  0
+}
+
+// Splits what the arm checked since the definite-assignment fork `daFork` made into the ids
+// it assigned (`adds`) and the ids it declared and left unwritten (`rems`), then rolls back.
+function ifDaArmDelta(daFork: i32, adds: i32[], rems: i32[]) {
+  const sid: i32[] = []
+  const was: i32[] = []
+  daTouchedSince(daFork, sid, was)
+  daRollbackTo(daFork)
+  daSplitDelta(sid, was, adds, rems)
+  0
+}
+
+// Enters the else arm of `n`: its else-narrows `enNames`/`enTys` in a fresh scope, the
+// chain-link mark for an `else if`, and the return-tail position `ifTail`.
+function ifEnterElseArm(
+  n: IfStmt,
+  ifTail: boolean,
+  enNames: string[],
+  enTys: i32[],
+) {
+  if n.ifElse < 0 { return 0 }
+  if enNames.length > 0 {
+    pushScope(-1)
+    applyNarrows(enNames, enTys)
+  }
+  // An `else if` chain: the else node's VALUE is its own branch join, since `blockTailTy`
+  // holds only the innermost block's tail and under-joins a mixed chain.
+  const enElse = P.nodes[n.ifElse]
+  // A chain link post-narrows the PARENT's fall-through, not its own — marked so its own
+  // `checkIfStmtNode` banks into `pgUpKeys` instead of a scope that is about to be popped.
+  if enElse is IfStmt { pgUpArmIxSet(n.ifElse) }
+  retTailPosSet(ifTail)
+  0
+}
+
 // The head of one link: everything up to checking its else arm.
 function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // Am I the else arm of an enclosing `if`? Read and cleared here, so the flag reaches
@@ -731,26 +847,7 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // The rows this guard tests, including ones a previous pass already registered — the
   // guarded-return marking must fire on every pass, since the real pass witnesses the call site.
   const guardRows: i32[] = []
-  let ai = 0
-  while ai < tnNames.length {
-    if !isPathKey(tnNames[ai]) {
-      const curIx = lookup(tnNames[ai])
-      if curIx >= 0 {
-        const cur = T.tys[curIx]
-        if cur is TyVar {
-          const row = noteHoleAlt(curIx, cur.tvName, tnTys[ai])
-          if row >= 0 {
-            altRows.push(row)
-            guardRows.push(row)
-          } else {
-            const seen = holeAltRowOf(cur.tvName, tnTys[ai])
-            if seen >= 0 { guardRows.push(seen) }
-          }
-        }
-      }
-    }
-    ai = ai + 1
-  }
+  ifNoteGuardAlts(tnNames, tnTys, altRows, guardRows)
   if tnNames.length > 0 {
     pushScope(-1)
     applyNarrows(tnNames, tnTys)
@@ -791,43 +888,21 @@ function checkIfHead(n: IfStmt, ix: i32): IfChk {
   // recursive call in the else resolves against the base case — only from a genuine value-`if`.
   if ifTail && n.ifElse >= 0 {
     if thenTy != TY_VOID && thenTy != TY_ERR {
-      // The then-arm's implicit-return value is guarded exactly like an explicit
-      // `return` inside it (`if v is T { v.foo } else { v.bar }`).
-      if guardedRet { guardAltStackPush(guardRows[guardRows.length - 1]) }
-      // The arm, not the arms' join: a tail `if`/`else` whose one arm is an open `[]` needs
-      // the sibling arm's shape, and the join is a third arena row (D1591).
-      noteInferRetWitness(thenIx, thenTy)
-      const seedThen = ifArmValTy(n.ifThen, thenTy)
-      noteInferredSeed(seedThen, armLit(seedThen, n.ifThen))
-      if guardedRet { guardAltStackPop() }
+      ifSeedThenRet(n, guardRows, thenIx, thenTy)
     }
   }
   // Surviving paths' end-states, each as the DELTA its arm made against the fork point: the
   // ids it assigned and the ids it declared and left unwritten.
-  const daThenSid: i32[] = []
-  const daThenWas: i32[] = []
-  daTouchedSince(daFork, daThenSid, daThenWas)
-  daRollbackTo(daFork)
   const daThenAdds: i32[] = []
   const daThenRems: i32[] = []
-  daSplitDelta(daThenSid, daThenWas, daThenAdds, daThenRems)
+  ifDaArmDelta(daFork, daThenAdds, daThenRems)
   // The else arm's own depth and row range, read by the arm join below. An absent else leaves
   // them at their no-rows defaults, which is what says the fall-through wrote nothing.
   let elseOwnDepth = -1
   let elseLo = 0
   const daHasElse = n.ifElse >= 0
   if daHasElse {
-    if enNames.length > 0 {
-      pushScope(-1)
-      applyNarrows(enNames, enTys)
-    }
-    // An `else if` chain: the else node's VALUE is its own branch join, since `blockTailTy`
-    // holds only the innermost block's tail and under-joins a mixed chain.
-    const enElse = P.nodes[n.ifElse]
-    // A chain link post-narrows the PARENT's fall-through, not its own — marked so its own
-    // `checkIfStmtNode` banks into `pgUpKeys` instead of a scope that is about to be popped.
-    if enElse is IfStmt { pgUpArmIxSet(n.ifElse) }
-    retTailPosSet(ifTail)
+    ifEnterElseArm(n, ifTail, enNames, enTys)
     elseOwnDepth = T.scopes.length + 1
     elseLo = narClobKeys.length
   }
