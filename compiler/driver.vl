@@ -264,7 +264,8 @@ import {
   ifaceHashArm,
   ifaceHashArmed,
   ifaceHashOf,
-  ihAmbientCount,
+  ihAmbientFv,
+  ihAmbientMeets,
   ihAmbientScan,
   ihBegin,
   ihCarry,
@@ -5032,6 +5033,8 @@ function modCompile(emit: i32): i32 {
   if !skMute {
     skReason = SK_NO_BANK
     skServed = 0
+    skAmbMet = 0
+    skAmbMoved = 0
   }
   modIdAssignKeys()
   if ifaceHashArmed() { ihBegin([]) }
@@ -5119,6 +5122,8 @@ let skMute = false
 let skValid = false
 let skReason = SK_NO_BANK
 let skServed = 0
+let skAmbMet = 0
+let skAmbMoved = 0
 let skKeys: string[] = []
 let skKeyIx: {[string]: i32} = Map()
 let skSrcs: string[] = []
@@ -5254,10 +5259,13 @@ export function diagOrderKey(i: i32): i32 {
 }
 
 // The last module check: `which` 0 why it checked what it did (0 when it served some module),
-// 1 how many modules it served from the bank.
+// 1 how many modules it served from the bank, 2 how many served modules hold an ambient statement
+// S's check could read, 3 how many S modules' ambient statements moved.
 export function checkSkipStat(which: i32): i32 {
   if which == 0 { return skReason }
   if which == 1 { return skServed }
+  if which == 2 { return skAmbMet }
+  if which == 3 { return skAmbMoved }
   -1
 }
 
@@ -5432,6 +5440,21 @@ function skPairs(): i32[] {
   out
 }
 
+// Counts, for `checkSkipStat`, the modules each ambient guard in `skSettle` would decline on.
+function skAmbCount(inS: boolean[], anyS: boolean, meets: boolean[]): void {
+  let sd = 0
+  while sd < modKeys.length && sd < inS.length {
+    const b = skKeyIx[modKeys[sd]] ?? -1
+    if b >= 0 && anyS && !inS[sd] && sd < meets.length && meets[sd] {
+      skAmbMet = skAmbMet + 1
+    }
+    if b >= 0 && inS[sd] && ifaceHashOf(sd, 6) != skHash[b * SK_READINGS + 6] {
+      skAmbMoved = skAmbMoved + 1
+    }
+    sd = sd + 1
+  }
+}
+
 // After a check of S alone: keep it only when no module outside S holds a statement S's
 // check may read unimported, every served importer's reach into S is unchanged
 // (`ihReachOf`), every fresh diagnostic lies in S, and no served diagnostic cites a moved
@@ -5447,12 +5470,15 @@ function skSettle(inS: boolean[], roots: i32[], tokEnd: i32): boolean {
   for x in inS {
     if x { anyS = true }
   }
+  ihAmbientFv(inS)
+  const meets = ihAmbientMeets(T.diags.length > 0)
+  skAmbCount(inS, anyS, meets)
   let sd = 0
   while sd < modKeys.length {
     const b = skKeyIx[modKeys[sd]] ?? -1
     const base = b * SK_READINGS
     if b < 0 { return skDecline(SK_IFACE) }
-    if anyS && !inS[sd] && ihAmbientCount(sd) > 0 {
+    if anyS && !inS[sd] && sd < meets.length && meets[sd] {
       return skDecline(SK_AMBIENT)
     }
     if inS[sd] && ifaceHashOf(sd, 6) != skHash[base + 6] {
@@ -5774,17 +5800,12 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
     }
     m = m + 1
   }
-  // A served origin's reaches are carried: the check did not read it, and its tokens held. An
-  // importer holding an ambient statement is never served beside S, so its reaches are not kept.
+  // A served origin's reaches are carried: the check did not read it, and its tokens held.
   const reach: {[string]: i32} = Map()
   const pairs = skPairs()
   let p = 0
   while p + 1 < pairs.length {
     const key = modKeys[pairs[p]] + "\n" + modKeys[pairs[p + 1]]
-    if ihAmbientCount(pairs[p]) > 0 {
-      p = p + 2
-      continue
-    }
     if keep.length == 0 || keep[pairs[p + 1]] {
       reach[key] = ihReachOf(pairs[p], pairs[p + 1])
     } else {
