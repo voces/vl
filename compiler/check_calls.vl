@@ -299,9 +299,11 @@ import {
   objFieldType,
   tyArrayElemIx,
   tyHasHole,
+  tyIsDeclaredParam,
   tyIsFuncArena,
   tyIsHole,
   tyIxIsView,
+  tyMentionsTyVarNamed,
   tyPrintsAsRef,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
@@ -320,7 +322,11 @@ import {
   covarRootFrame,
   cwBoundInitOf,
   cwBoundOnce,
+  cwFnDeclOf,
+  cwFrameOfDecl,
   cwLambdaDeclOf,
+  cwPeel,
+  cwSoleBinderOf,
   fnDeclIx,
 } from "./check_write_scan"
 import { strListHas, strListIndexOf } from "./listutil"
@@ -929,6 +935,62 @@ function checkArrayCopyCall(n: Call, ix: i32): i32 {
   return TY_VOID
 }
 
+// A call through a binding whose type an annotation or a lambda's parameters wrote binds each
+// enclosing type parameter that type names to itself, since `k: (x: T) => void` takes the body's
+// `T`; an argument of another type parameter is then judged at each instance (D6483).
+function bindCalleeScopeTyParams(
+  cfn: Node,
+  cfnIx: i32,
+  ft: TyFunc,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if tpEnvNames.length == 0 || !calleeTyIsScoped(cfn, cfnIx) { return 0 }
+  let i = tpEnvNames.length - 1
+  while i >= 0 {
+    const nm = tpEnvNames[i]
+    if !strListHas(bNames, nm) && ftParamsMentionTyVar(ft, nm) {
+      bNames.push(nm)
+      bTys.push(tpEnvTys[i])
+    }
+    i = i - 1
+  }
+  0
+}
+
+// Whether a parameter of `ft` names type variable `nm`; a result alone does not, since a
+// lambda's inferred result names the body's parameters without taking them.
+function ftParamsMentionTyVar(ft: TyFunc, nm: string): boolean {
+  for p in ft.fnParamTypes {
+    if tyMentionsTyVarNamed(p, nm, 8) { return true }
+  }
+  false
+}
+
+// Whether the callee name at `cfnIx` is a binding or parameter declared with a type, one bound
+// to a lambda, or a function declaring no type parameters, so its type variables are the
+// enclosing scope's and not its own.
+function calleeTyIsScoped(cfn: Node, cfnIx: i32): boolean {
+  if !(cfn is Ident) { return false }
+  const fr = covarRootFrame(cfnIx)
+  const b = cwSoleBinderOf(cfn.identName, fr)
+  if b < 0 {
+    const d = cwFnDeclOf(cfn.identName)
+    if d < 0 || d >= P.nodes.length { return false }
+    if fr != CW_FR_UNKNOWN && cwFrameOfDecl(d) != fr { return false }
+    const dn = P.nodes[d]
+    return dn is FuncDecl && dn.fnTyParams.length == 0
+  }
+  const bn = P.nodes[b]
+  if bn is Param { return bn.parType >= 0 }
+  if !(bn is LetDecl) { return false }
+  if bn.letType >= 0 { return true }
+  const init = cwPeel(bn.letInit)
+  if init < 0 || init >= P.nodes.length { return false }
+  const ln = P.nodes[init]
+  ln is FuncDecl && ln.fnTyParams.length == 0
+}
+
 // The ordinary call: the callee evaluates to a function type, so the arguments are checked
 // against its parameter list — named arguments reordered, an omitted trailing one filled
 // from the declaration default, and type-parameter bindings solved from the argument types.
@@ -984,6 +1046,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   if explicitTa {
     if !bindExplicitTyArgs(cfn, ix, bNames, bTys) { return TY_ERR }
   }
+  bindCalleeScopeTyParams(cfn, n.callFn, ft, bNames, bTys)
   let dstNames = NO_DST_NAMES
   if !explicitTa && callDstTyOf(ix) >= 0 {
     dstNames = []
@@ -1173,6 +1236,13 @@ function callFtyNormArgs(
   args
 }
 
+// Whether an argument and the callee parameter `param` it meets hold type parameters that an
+// instance may bind apart; a hole callee's parameter is no type parameter of its own, so a
+// function value called on its own result keeps its instances (D6251, D6482).
+function argParamsApart(at: i32, exp: i32, param: i32): boolean {
+  (!tyIsHole(param) || tyIsDeclaredParam(param)) && tyParamsApart(at, exp)
+}
+
 // Argument `i` of an ordinary call: seeded from its parameter under the bindings so far,
 // checked, and bound into `bNames`/`bTys` and `uNames`/`uTys`, its expected type kept in
 // `argExp[i]`. -1 to go on; otherwise the call's own answer (a handled template hole, or
@@ -1246,7 +1316,7 @@ function callFtyCheckArg(
       )
     }
   }
-  callFtyNoteArgCstr(cfn, args, i, at, expected)
+  callFtyNoteArgCstr(cfn, args, i, at, expected, params[i])
   callFtyHoleParamDemands(n, cfn, params, dParams, args, i, at)
   // The cast this argument itself is (`id(a as? i32)`), whose destination the pin has to
   // re-ask (D1371) — but only when the parameter is not a hole: for a hole parameter,
@@ -1295,13 +1365,15 @@ function callFtyArgSeedTy(
 }
 
 // The constraint argument `i` of type `at` leaves for the pin to re-validate against
-// `expected`: a hole, deferred-join or gradual-union argument, or a composite one.
+// `expected`: a hole, deferred-join or gradual-union argument, or a composite one. `param`
+// is the callee's own parameter type the argument meets.
 function callFtyNoteArgCstr(
   cfn: Node,
   args: i32[],
   i: i32,
   at: i32,
   expected: i32,
+  param: i32,
 ) {
   // A hole or deferred-join argument passes `assignable` vacuously, so the demand is
   // recorded here and re-validated at the generic call site that pins it under the
@@ -1317,7 +1389,7 @@ function callFtyNoteArgCstr(
       && T.tys[atCstr] is TyUnion
       && tpGradualView(atCstr) != atCstr)
   ) {
-    if !tyIsHole(expected) || tyParamsApart(atCstr, expected) {
+    if !tyIsHole(expected) || argParamsApart(atCstr, expected, param) {
       let ccWho = ""
       if cfn is Ident { ccWho = cfn.identName }
       let acForm = ACF_PLAIN
@@ -1326,7 +1398,7 @@ function callFtyNoteArgCstr(
     }
   } else if (
     compArgCstrOk(atCstr, expected)
-    || tyParamsApart(atCstr, expected)
+    || argParamsApart(atCstr, expected, param)
   ) {
     let cpWho = ""
     if cfn is Ident { cpWho = cfn.identName }
