@@ -182,10 +182,12 @@ import {
   tyEq,
   tyFieldTyOf,
   tyHasHole,
+  tyIsNonIndexableScalar,
   tyIsPrimNamed,
   tyIxIsView,
   tyMutEpoch,
   tyRefusesArrayDemand,
+  tyRefusesArrayWrite,
   tyToStr,
 } from "./check_types"
 import { argLitAt } from "./check_width"
@@ -297,9 +299,11 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
 
 // The receiver's argument-seam verdict at `self`: the dispatch gate asked bare `assignable`,
 // which misses the refusals the seam holds, such as a container widened into a differently
-// stored element (D2165). A receiver that is still a hole is re-asked at the pin.
+// stored element (D2165), or a `self` hole the body indexes or writes (D6352). A receiver that
+// is still a hole is re-asked at the pin.
 function ufcsCheckRecvSeam(
   n: Call,
+  name: string,
   recvTy: i32,
   params: i32[],
   bNames: string[],
@@ -309,6 +313,9 @@ function ufcsCheckRecvSeam(
   const selfTy = substSelfTy(params[0], bNames, bTys)
   // A receiver that is an observed parameter is delivered to `self` here, not at the seam.
   if expObsFn >= 0 { expObsPin(recvTy, selfTy, recvX) }
+  if params.length > 0 && ufcsRecvDemandErr(name, recvTy, params[0], recvX) {
+    return 0
+  }
   if recvX >= 0 && !tyHasHole(recvTy) && !tyHasHole(selfTy) {
     if !assignableExpr(recvX, recvTy, selfTy) {
       tErr(
@@ -317,6 +324,29 @@ function ufcsCheckRecvSeam(
       )
     }
   }
+}
+
+// Refuses a receiver the `self` hole at row `sRow` cannot take: a scalar the body indexes, or
+// one it writes as a list, as the same argument at a direct call is (D6352). A map receiver
+// is taken. True when it refused.
+function ufcsRecvDemandErr(
+  name: string,
+  recvTy: i32,
+  sRow: i32,
+  recvX: i32,
+): boolean {
+  if recvX < 0 || sRow < 0 || sRow >= T.tys.length { return false }
+  const sHole = T.tys[sRow]
+  if !(sHole is TyVar) { return false }
+  let bad = rowIsArrayDemanded(sRow) && tyIsNonIndexableScalar(recvTy)
+  if (
+    holeIsArrayWriteDemanded(name, sHole.tvName)
+    && tyRefusesArrayWrite(recvTy)
+  ) {
+    bad = true
+  }
+  if bad { tErr("receiver: expected an array, got " + tyToStr(recvTy), recvX) }
+  bad
 }
 
 // The explicit arguments of the UFCS call to `name`, checked in the direct call's order and
@@ -348,6 +378,7 @@ function ufcsCheckArgs(
       }
       if holeIsArrayWriteDemanded(name, pHole.tvName) {
         if tyIxIsView(at) { holeArgViewErr(i + 1, at, args[i]) }
+        if tyRefusesArrayWrite(at) { holeArgArrayErr(i + 1, at, args[i]) }
       }
       // The `as` cast the body parked on this hole, re-asked under the argument. D1342.
       holeCastPinCheck(pHole.tvName, at, declParamNameAt(uDecl, i))
@@ -539,7 +570,7 @@ function ufcsCallTy(plainName: string, recvTy: i32, n: Call, ix: i32) {
         }
       }
     }
-    ufcsCheckRecvSeam(n, recvTy, params, bNames, bTys)
+    ufcsCheckRecvSeam(n, name, recvTy, params, bNames, bTys)
     ufcsCheckArgs(name, params, args, uDecl, bNames, bTys)
     if uDst.length > 0 && !inferQuiet {
       dstRetypeLitArgs(uDst, params, uArgs, bNames, bTys)
