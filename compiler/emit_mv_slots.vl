@@ -38,7 +38,11 @@ import {
 import { emitFail } from "./emit_bytes"
 import { fnStmtsPosOf } from "./emit_capture_frames"
 import { rlElemListRep } from "./emit_list_rep"
-import { narrowShadowSlot, variantIndexOf } from "./emit_narrow_slots"
+import {
+  narrowLiveSlotsUnder,
+  narrowShadowSlot,
+  variantIndexOf,
+} from "./emit_narrow_slots"
 import {
   MV_ARM_NOHINT,
   mvSlotArmMatches,
@@ -98,28 +102,71 @@ export function capNarrowRecord(
   const fe = fnStmtsPosOf(fnIx)
   if fe < 0 { return 0 }
   const widened = capWidenOf(fnIx)
-  let i = 0
-  while i < narrowTop {
+  const slots = capNarrowSlotsOf(ifree, iglob)
+  let k = 0
+  while k < slots.length {
+    const i = slots[k]
     const nm = narrowNames[i]
-    const root = narrowKeyRoot(nm)
     // A retired entry is not a declaration-site fact: the closure below the write reads its
     // capture at the declared rep, the same as the live stack answers for it. Nor is one the
     // checker widened in this body, since a writer may run before it does (D2402).
-    if (
-      (strListHas(ifree, root) || (iglob[root] ?? 0) == 1)
-      && narrowRetired[i] == 0
-      && !capWidened(widened, nm)
-      && narrowShadowSlot(root) < i
-    ) {
+    if !capWidened(widened, nm) && narrowShadowSlot(narrowKeyRoot(nm)) < i {
       cnFe.push(fe)
       cnName.push(nm)
       cnVariant.push(narrowVariants[i])
       cnTy.push(narrowTys[i])
       cnSet.push(narrowSets[i])
     }
-    i = i + 1
+    k = k + 1
   }
   0
+}
+
+// The unretired stack slots whose key's root is in `ifree` or set in `iglob`, ascending: from
+// the stack's key indexes while they are few, so a closure costs its own captures' narrowings
+// rather than the whole stack a long frame grows (D5950).
+function capNarrowSlotsOf(ifree: string[], iglob: {[string]: i32}): i32[] {
+  const slots: i32[] = []
+  const seen: {[string]: boolean} = Map()
+  for r in ifree {
+    if !seen.has(r) {
+      seen[r] = true
+      narrowLiveSlotsUnder(r, slots)
+    }
+  }
+  for r in iglob.keys() {
+    if (iglob[r] ?? 0) == 1 && !seen.has(r) {
+      seen[r] = true
+      narrowLiveSlotsUnder(r, slots)
+    }
+  }
+  if slots.length * slots.length <= narrowTop * 4 {
+    let a = 1
+    while a < slots.length {
+      const v = slots[a]
+      let b = a
+      while b > 0 && slots[b - 1] > v {
+        slots[b] = slots[b - 1]
+        b = b - 1
+      }
+      slots[b] = v
+      a = a + 1
+    }
+    return slots
+  }
+  const all: i32[] = []
+  let i = 0
+  while i < narrowTop {
+    const root = narrowKeyRoot(narrowNames[i])
+    if (
+      (strListHas(ifree, root) || (iglob[root] ?? 0) == 1)
+      && narrowRetired[i] == 0
+    ) {
+      all.push(i)
+    }
+    i = i + 1
+  }
+  all
 }
 
 // The module-scope `for` variables whose body the recording walk is inside, innermost last:
