@@ -94,7 +94,7 @@ let paCall: i32[] = []
 let paArg: i32[] = []
 let paNames: string[][] = []
 let paPars: string[][] = []
-// Split parameters whose type-parameter annotation is dropped.
+// Split parameters, and bindings, whose type-parameter annotation is dropped.
 let ptPar: i32[] = []
 // Inside the copy minted for `pfSrc[pcCopy]`, the identifier at source offset `pcPos` named
 // `pcFrom` is renamed `pcTo`: a copy is a fresh parse, so its nodes are matched by offset.
@@ -1517,6 +1517,7 @@ let hdRead: i32[] = []
 let hdKeys: string[][] = []
 let hdPar: i32[] = []
 let hsBad = false
+let hsCopyDepth = 0
 
 function hdIx(r: i32): i32 {
   let i = 0
@@ -1689,7 +1690,8 @@ function fsHoleFwd(r: i32): i32 {
 
 // The argument-type keys parameter `par` is called at, through every hole it reaches by
 // forwards, a cycle among them included (D6091, D6202, D6203); sets `hsBad` when a reached hole
-// cannot take a parameter per type, or a read of one is neither a call nor a forward.
+// cannot take a parameter per type, or a read of one is neither a call, a forward nor a copy
+// into a binding read at one key (D6470).
 function fsHoleKeys(par: i32): string[] {
   const ks: string[] = []
   const seen: i32[] = [par]
@@ -1708,17 +1710,59 @@ function fsHoleKeys(par: i32): string[] {
           const k = fsReadKey(r)
           if !hasStr(ks, k) { ks.push(k) }
         } else {
-          const q = fsHoleFwd(r)
-          if q < 0 {
+          const ck = fsHoleCopyKey(r)
+          if ck == "!" {
             hsBad = true
             return ks
           }
-          if !hasI32(seen, q) { seen.push(q) }
+          if ck != "" {
+            if !hasStr(ks, ck) { ks.push(ck) }
+          } else {
+            const q = fsHoleFwd(r)
+            if q < 0 {
+              hsBad = true
+              return ks
+            }
+            if !hasI32(seen, q) { seen.push(q) }
+          }
         }
       }
     }
   }
   ks
+}
+
+// The one key binding `d` that hole read `r` is copied into (`d = r`, `let d = r`) is read at,
+// each read a call or a hand-out to a hole; "" when `r` is no such copy, "!" when `d` is read
+// at none, at two keys, or in any other way.
+function fsHoleCopyKey(r: i32): string {
+  const p = fsParent[r]
+  if p < 0 { return "" }
+  const pn = P.nodes[p]
+  let d = -1
+  if pn is BinExpr && pn.binOp == "=" && pn.binRight == r {
+    d = letDeclOfRead(pn.binLeft)
+  }
+  if pn is LetDecl && pn.letInit == r { d = p }
+  if d < 0 { return "" }
+  if hsCopyDepth > 4 { return "!" }
+  hsCopyDepth = hsCopyDepth + 1
+  let k = ""
+  for x in fsIdents {
+    if identDeclOf(x) == d && k != "!" {
+      const xk = fsMemberReadKey(x)
+      if xk != "" {
+        if xk.slice(0, 2) != "c:" || (k != "" && xk != k) {
+          k = "!"
+        } else {
+          k = xk
+        }
+      }
+    }
+  }
+  hsCopyDepth = hsCopyDepth - 1
+  if k == "" { return "!" }
+  k
 }
 
 // The keys a read handed to a hole parameter takes: that hole's, through its forwards; empty
@@ -1962,9 +2006,12 @@ function fsPlanHoleRewrites(): i32 {
         if cn is Call && cn.callFn == r {
           fsRename(r, hsSlot(si, fsReadKey(r)))
         } else {
+          const ck = fsHoleCopyKey(r)
           const q = fsHoleFwd(r)
           const qi = hsIx(q)
-          if qi >= 0 {
+          if ck != "" {
+            fsRename(r, hsSlot(si, ck))
+          } else if qi >= 0 {
             const names: string[] = []
             for qk in hsKeys[qi] { names.push(hsSlot(si, qk)) }
             fsHoleHandOut(c, r, names, hsSlotNames(qi))
@@ -1997,9 +2044,9 @@ function fsPlanHoleRewrites(): i32 {
   0
 }
 
-// Split parameter `par`'s type-parameter annotation is dropped, with every other parameter's
-// that names it, when its function names that type parameter nowhere but in those bare
-// annotations; each such parameter is then a hole of its own, as D6202's spelling is (D6240).
+// Split parameter `par`'s type-parameter annotation is dropped, with every other parameter's and
+// read body binding's that names it, when its function names that type parameter nowhere but in
+// those bare annotations; each is then a hole of its own, as D6202's spelling is (D6240, D6470).
 function fsStripTyParam(par: i32): i32 {
   const p = P.nodes[par]
   if !(p is Param) || p.parType < 0 { return 0 }
@@ -2013,6 +2060,16 @@ function fsStripTyParam(par: i32): i32 {
     if qn is Param && qn.parType >= 0 {
       const qt = P.nodes[qn.parType]
       if qt is TypeRef && qt.tyName == tn.tyName { named.push(q) }
+    }
+  }
+  for r in fsIdents {
+    const d = identDeclOf(r)
+    if d >= 0 && d < fsParseLen && !hasI32(named, d) && fsUnder(d, fd) {
+      const dn = P.nodes[d]
+      if dn is LetDecl && dn.letType >= 0 {
+        const dt = P.nodes[dn.letType]
+        if dt is TypeRef && dt.tyName == tn.tyName { named.push(d) }
+      }
     }
   }
   let uses = 1 + named.length
@@ -2393,7 +2450,9 @@ function fsApply(): i32 {
   }
   for par in ptPar {
     const p = P.nodes[par]
-    if p is Param { p.parType = -1 } else { rc = -1 }
+    if p is Param { p.parType = -1 }
+    else if p is LetDecl { p.letType = -1 }
+    else { rc = -1 }
   }
   i = 0
   while i < paCall.length {

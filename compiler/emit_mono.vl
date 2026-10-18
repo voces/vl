@@ -69,6 +69,7 @@ import { tyIsForeignGenericSig } from "./check_subst"
 import {
   assignable,
   bindGenWalk,
+  nameToTy,
   substTyDeep,
   subtractTy,
   tyProvesNonNull,
@@ -11159,11 +11160,28 @@ function monoListInitHoldsGeneric(v: i32, ctx: i32): boolean {
   const lit = P.nodes[v]
   if !(lit is ArrayLit) || lit.pos < 0 { return false }
   for e in lit.arrElems {
-    if monoListElemGenFe(e, ctx) >= 0 || monoWrittenLetSeedFe(e, ctx) >= 0 {
+    if (
+      monoListElemGenFe(e, ctx) >= 0
+      || monoWrittenLetSeedFe(e, ctx) >= 0
+      || monoListElemHoleLamFe(e, ctx) >= 0
+    ) {
       return true
     }
   }
   false
+}
+
+// The hole lambda list element `e` names in frame `ctx` through never-written un-annotated
+// bindings, as a slot; -1 for a literal, an annotated binding on the way, or anything else.
+function monoListElemHoleLamFe(e: i32, ctx: i32): i32 {
+  const x = unwrapParen(e)
+  if x < 0 || monoIdentNameOf(x) == "" { return -1 }
+  const fe = monoLamValueFe(x, ctx)
+  if fe < 0 || fe >= monoGen.length || monoGen[fe] != 1 || !monoLamIsHole(fe) {
+    return -1
+  }
+  if !monoWriteNamesLam(x, fe, ctx) { return -1 }
+  fe
 }
 
 // The declared generic function list element `e` names in frame `ctx`, as a slot; -1 otherwise.
@@ -12103,12 +12121,20 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   let ft = -1
   for e in lit.arrElems {
     monoLastInstFe = -1
+    const holeLam = monoListElemHoleLamFe(e, ctx) >= 0
+    const et0 = nodeTyIxOf(e)
     if monoCoerceFnValueName(e, ann, ctx, -1) < 0 { return -1 }
+    if holeLam && monoLastInstFe < 0 {
+      if monoNoteBindDeliveryAt(e, ann, ctx) < 0 { return -1 }
+    }
     if ft < 0 && monoLastInstFe >= 0 {
-      ft = monoPinSubTyOf(nodeTyIxOf(e), fnStmts[monoLastInstFe])
+      const st = monoPinSubTyOf(nodeTyIxOf(e), fnStmts[monoLastInstFe])
+      if monoTyConcreteFn(st) { ft = st }
     }
     const et = nodeTyIxOf(e)
     if ft < 0 && monoTyConcreteFn(et) { ft = et }
+    // An instance whose pins bind none of the holes its recorded type names: read `ann`'s parameters.
+    if ft < 0 && holeLam { ft = monoHoleLamAtAnnTy(et0, ann) }
   }
   if !monoTyConcreteFn(ft) { return 0 }
   const fty = T.tys[ft]
@@ -12139,6 +12165,23 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     }
   }
   0
+}
+
+// The function type a hole lambda typed `et` takes when instanced at the parameters `ann` spells:
+// those parameters and `et`'s own result, or -1 when that result is still open.
+function monoHoleLamAtAnnTy(et: i32, ann: string): i32 {
+  if et < 0 || et >= T.tys.length { return -1 }
+  const f = T.tys[et]
+  if !(f is TyFunc) || f.fnRet < 0 || tyHasTyVar(f.fnRet) { return -1 }
+  const at = nameToTy(ann)
+  if at < 0 || at >= T.tys.length { return -1 }
+  const a = T.tys[at]
+  if !(a is TyFunc) || a.fnParamTypes.length != f.fnParamTypes.length {
+    return -1
+  }
+  const ft = mkFuncTy(a.fnParamTypes, f.fnRet)
+  if !monoTyConcreteFn(ft) { return -1 }
+  ft
 }
 
 // Pins a lambda literal `v` with an un-annotated parameter, written in frame `wf` into a list
@@ -12177,6 +12220,7 @@ function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
       if (
         monoListElemGenFe(f.fiValue, ctx) >= 0
         || monoWrittenLetSeedFe(f.fiValue, ctx) >= 0
+        || monoListElemHoleLamFe(f.fiValue, ctx) >= 0
       ) {
         if monoPinRecordField(at, f.fiName, f.fiValue, ctx) < 0 { return -1 }
       }
@@ -12283,9 +12327,15 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   if pins.length != 1 { return 0 }
   const ann = monoSigFnTyName(pins[0] + ";")
   monoLastInstFe = -1
+  const holeLam = monoListElemHoleLamFe(val, ctx) >= 0
+  const vt0 = nodeTyIxOf(val)
   if monoCoerceFnValueName(val, ann, ctx, -1) < 0 { return -1 }
+  if holeLam && monoLastInstFe < 0 {
+    if monoNoteBindDeliveryAt(val, ann, ctx) < 0 { return -1 }
+  }
   if monoLastInstFe < 0 { return 0 }
-  const ft = monoPinSubTyOf(nodeTyIxOf(val), fnStmts[monoLastInstFe])
+  let ft = monoPinSubTyOf(nodeTyIxOf(val), fnStmts[monoLastInstFe])
+  if !monoTyConcreteFn(ft) && holeLam { ft = monoHoleLamAtAnnTy(vt0, ann) }
   if !monoTyConcreteFn(ft) { return 0 }
   const vt = nodeTyIxOf(val)
   // A generic's instances share `val`, so its type stays open there (D5079).
