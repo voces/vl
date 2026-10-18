@@ -1118,6 +1118,79 @@ probe arms it with `ifaceHashArm`, and `modCompile` then fills it in two halves:
     - hash only what a dependent can name (exports and what they reach) rather than every
       top-level binding.
 
+**S5 step 4b: the two refinements.** Both are still inert, and nothing reads the hash to skip
+work. Under Q4 (A) neither asks a user to annotate anything.
+- **An inferred-return body is cut.** Its checked type (`lookup` and `tyToStr`) carries the
+  signature, and its mention rows are hashed like any cut body's. A rendered type is elided past
+  its render depth (`…`). When the cut function's type is elided, the cut body's own token hash
+  is folded in, because the render no longer distinguishes two different returns.
+- **Only what a dependent can reach is hashed.** `ihModule` keeps one row per top-level
+  statement, with its tokens, its checked type, the identifiers it spells and the names its body
+  calls. `ihFinish` closes an exposed set over those rows.
+  - Roots are: every export, every top-level `let` (`__start__` runs its initialiser), every
+    statement that is not a declaration, and the tokens outside every statement (imports and
+    re-export lists).
+  - The closure follows each name that an exposed row's hashed tokens or its rendered checked
+    type spell, within the same module. That covers a private record an export returns and a
+    private binding reached through an inferred type.
+  - A function that is not exposed but is called from an exposed body gives only its mention
+    rows. Those reach transitively from callee to callee, because what a private callee writes
+    reaches its callers' wasm.
+  - Any other statement gives nothing. Examples are a private type nobody names and an edit to
+    a private function's signature.
+- **Soundness.** The suite has 67 single-edit pairs over the five graphs, and 32 of them keep
+  the hash, with 0 unsound. Under mask 260, which is the step-4 hash (bodies of inferred returns
+  shown, every statement exposed), the same 67 give 10 hits. The new cases are:
+  - a private `let` initialiser;
+  - a type elided past its render depth;
+  - a private function signature edit;
+  - a private type nobody names;
+  - a private generic body;
+  - a private type in an exported signature;
+  - a private `let` initialised by a call;
+  - a private callee that writes a narrowed global;
+  - a private callee's body;
+  - a private function called from a generic body;
+  - a re-export list that grows;
+  - a re-exporting module's private helper.
+- **Mutation.** With each new ingredient dropped, its witness turns unsound:
+
+  | mask | ingredient dropped | witness case |
+  | --- | --- | --- |
+  | 64 | an inferred return's checked type | an inferred-return body edit with a new return type |
+  | 128 | the elided-type guard | a type elided past its render depth |
+  | 512 | names spelled by a checked type | a private type field reached through an inferred type |
+  | 1024 | top-level `let` as a root | a private `let` initialised by a call |
+  | 2048 | the callee closure | a private callee that writes a narrowed global |
+  | 4096 | names spelled by tokens | a private function a generic body calls |
+
+  The step-4 masks 1, 2, 8, 16 and 32 keep their witnesses. Mask 4 now folds every cut
+  inferred-return body back in, which restores step 4's behaviour.
+- **Hit rate.** One check yields every mask's hashes: `ifaceHashRefold` folds the last check's
+  rows again under another mask, and a control requires the refold under the check's own mask to
+  reproduce its hashes. The rate test therefore reads "now" (mask 0) and "before" (mask 260) off
+  the same edits:
+
+  | population | edits graded | now (mask 0) | before (mask 260) | unsound | left out |
+  | --- | --- | --- | --- | --- | --- |
+  | the suite | 67 pairs | 32 | 10 | 0 | — |
+  | the compiler, last 40 commits | 16 | 4 (25.0%) | 2 (12.5%) | 0 | 24 do not check alone |
+  | diderven `src/game.vl`, last 120 | 21 | 16 (76.2%) | 10 (47.6%) | 0 | 92 alone, 7 outside |
+  | eardstap `src/main.vl`, last 120 | 42 | 28 (66.7%) | 23 (54.8%) | 0 | 65 alone, 13 outside |
+  | sunpa `src/game.vl`, last 120 | 91 | 82 (90.1%) | 73 (80.2%) | 0 | 28 alone, 1 outside |
+
+  The gain is the inferred-return misses: sunpa's fall from 13 to 4, the compiler's from 9 to 7.
+  The misses on annotated functions are unchanged, and each is a new mention: the edited body
+  names something it did not name before, such as a global it now reads.
+  - The compiler row was read before the test pushed code points rather than UTF-8 bytes. The
+    compiler's non-ASCII text is all in strings and comments, which both sides push alike.
+  - An empty function body is a cut of no tokens. Hashing one looped forever, which is why
+    sunpa never finished a check until that was fixed; a suite pair now holds it.
+
+- **Cost.** Seed 6,199,146 → 6,212,449 bytes (+0.21%). The emitter is untouched.
+- **Still open** from step 4: banking the edited module's importer demands, and global index
+  assignment (S6).
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.
