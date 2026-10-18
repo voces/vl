@@ -7,13 +7,19 @@ import {
   BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
   FieldDef,
   FieldInit,
   ForIn,
+  ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
@@ -27,12 +33,18 @@ import {
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
+  Spread,
+  StrLit,
   TS_APP,
   TS_NAME,
   TS_NULL,
+  TypeDecl,
   TypeRef,
   Unary,
+  UnionDecl,
+  WhileStmt,
   braceNameStmts,
   elseIfLink,
   fnRequiredArity,
@@ -359,9 +371,12 @@ export function narIfIsStmt(ix: i32): boolean {
 export function unresolvedHole(ty: i32) {
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyArray { return t.aElem < 0 }
-  if t is TyMap { return t.mKey < 0 || t.mVal < 0 }
-  false
+  match t {
+    TyArray => t.aElem < 0
+    TyMap => t.mKey < 0 || t.mVal < 0
+    // Every other row holds no collection hole of its own.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyVar | TyLit | TyNeg => false
+  }
 }
 
 // Open the deferred-pin frame for one function body (D1591). Pushed and popped with the
@@ -963,16 +978,27 @@ export function exprNegatedArg(p: i32): i32 {
 export function retInfluencedByAnnot(ix: i32) {
   if ix < 0 { return false }
   const nd = P.nodes[ix]
-  if nd is ArrayLit { return nd.arrElems.length == 0 }
-  if nd is ObjLit { return nd.objFields.length == 0 }
-  if nd is NullLit { return true }
-  if nd is Call {
-    const cn = P.nodes[nd.callFn]
-    if cn is Ident {
-      if cn.identName == "Map" || cn.identName == "Set" {
-        return nd.callArgs.length == 0
+  match nd {
+    ArrayLit => {
+      return nd.arrElems.length == 0
+    }
+    ObjLit => {
+      return nd.objFields.length == 0
+    }
+    NullLit => {
+      return true
+    }
+    Call => {
+      if nd.callFn < 0 { return false }
+      const cn = P.nodes[nd.callFn]
+      if cn is Ident {
+        if cn.identName == "Map" || cn.identName == "Set" {
+          return nd.callArgs.length == 0
+        }
       }
     }
+    // Every other expression types on its own, without the annotation.
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -1062,9 +1088,12 @@ export function dropLitsBesideBase(kept: i32[]) {
 export function isBoolLitExpr(ix: i32) {
   if ix < 0 { return false }
   const e = P.nodes[ix]
-  if e is Paren { return isBoolLitExpr(e.parInner) }
-  if e is BoolLit { return true }
-  false
+  match e {
+    Paren => isBoolLitExpr(e.parInner)
+    BoolLit => true
+    // Any other expression is not a bare boolean literal.
+    NumLit | StrLit | CharLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => false
+  }
 }
 
 // A literal container's slot-by-slot constraints, for the one case where a container-level
@@ -1178,10 +1207,16 @@ export function joinMayAdoptF32(a: i32, b: i32): boolean {
 export function isNegI32MinLit(ix: i32) {
   if ix < 0 { return false }
   const e = P.nodes[ix]
-  if e is Paren { return isNegI32MinLit(e.parInner) }
-  if e is NumLit {
-    if numLexIsFloat(e.numText) { return false }
-    return numLexIs2Pow31(e.numText)
+  match e {
+    Paren => {
+      return isNegI32MinLit(e.parInner)
+    }
+    NumLit => {
+      if numLexIsFloat(e.numText) { return false }
+      return numLexIs2Pow31(e.numText)
+    }
+    // Any other expression is not an integer literal.
+    StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -1253,6 +1288,7 @@ export function initMapCtorName(initIx: i32) {
   if initIx < 0 { return "Map" }
   const inode = P.nodes[initIx]
   if inode is Call {
+    if inode.callFn < 0 { return "Map" }
     const cn = P.nodes[inode.callFn]
     if cn is Ident {
       if cn.identName == "Set" { return "Set" }
@@ -1465,6 +1501,7 @@ export function shapeAdaptRecStorageFieldSet(v: string) {
 export function recCallResultInferred(ix: i32): boolean {
   const e = P.nodes[ix]
   if e is Call {
+    if e.callFn < 0 { return false }
     const cn = P.nodes[e.callFn]
     if cn is Ident {
       if cn.identName == "__array_new__" { return true }
@@ -1934,6 +1971,7 @@ export function mkGuardedRetTy(t: i32) {
 // inside a generic body survive the hop out and be re-validated when the caller's hole pins.
 export function rebaseDerivedHole(row: i32, innerTy: i32) {
   if innerTy < 0 { return -1 }
+  if row < 0 || row >= hdKind.length { return -1 }
   const it = T.tys[innerTy]
   if it is TyVar {
     if hdDepthOf(innerTy) >= HOLE_REBASE_MAX { return -1 }
@@ -2590,14 +2628,21 @@ export function anyLitUnionUsed() {
 export function fusedMapReadRecvIx(lhsIx: i32) {
   if lhsIx < 0 { return -1 }
   const l = P.nodes[lhsIx]
-  if l is Index { return l.idxArr }
-  if l is Call {
-    const c = P.nodes[l.callFn]
-    if c is Member {
-      if c.memProp == "get" {
-        if l.callArgs.length == 1 { return c.memObj }
+  match l {
+    Index => {
+      return l.idxArr
+    }
+    Call => {
+      if l.callFn < 0 { return -1 }
+      const c = P.nodes[l.callFn]
+      if c is Member {
+        if c.memProp == "get" {
+          if l.callArgs.length == 1 { return c.memObj }
+        }
       }
     }
+    // Any other left-hand side is not a fused map read.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -2730,10 +2775,15 @@ export function matchBodyDeclares(bodyIx: i32, name: string) {
     let i = 0
     while i < b.blkStmts.length {
       const st = P.nodes[b.blkStmts[i]]
-      if st is LetDecl {
-        if st.letName == name { return true }
-      } else if st is FuncDecl {
-        if st.fnName == name { return true }
+      match st {
+        LetDecl => {
+          if st.letName == name { return true }
+        }
+        FuncDecl => {
+          if st.fnName == name { return true }
+        }
+        // Any other statement declares no name in the arm's scope.
+        NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
       }
       i = i + 1
     }
@@ -2787,9 +2837,12 @@ export function castWrapNote(asTy: string, src: i32): string {
 export function castOperandIdent(ix: i32): string {
   if ix < 0 || ix >= P.nodes.length { return "" }
   const n = P.nodes[ix]
-  if n is Paren { return castOperandIdent(n.parInner) }
-  if n is Ident { return n.identName }
-  ""
+  match n {
+    Paren => castOperandIdent(n.parInner)
+    Ident => n.identName
+    // Any other operand names no binding.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => ""
+  }
 }
 
 // D1341 — `as?` yields `T | null` exactly when the cast can fail, and at a hole operand
@@ -2938,7 +2991,7 @@ export function cbPendAdd(cbIx: i32, listTy: i32, bound: string[]) {
 export function cbPendCollect(ix: i32, bound: string[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cf = P.nodes[n.callFn]
     if cf is Member && n.callArgs.length == 1 {
       if cf.memProp == "map" || cf.memProp == "filter" {
