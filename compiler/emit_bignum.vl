@@ -521,12 +521,17 @@ function ieeeInfBytes(neg: boolean, nbytes: i32) {
   }
   z
 }
-// Encodes decimal literal `text` into IEEE-754 form, little-endian, as an `i32[]`.
-// Shared by `f64Bytes`/`f32Bytes` via `sigBits`/`bias`/`nbytes` (53/1023/8 for f64,
-// 24/127/4 for f32): the parse, align, divmod and round live once here, and only
-// the final byte packing branches on width, so the value rounds exactly once.
-function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
-  gIeeeOverflow = false
+// A float lexeme as an exact decimal: value = `mant * 10^dexp` with sign `neg`, and `sig`
+// significant digits counted from the first nonzero one.
+type IeeeDecimal = {
+  neg: boolean,
+  mant: i32[],
+  sig: i32,
+  dexp: i32,
+}
+
+// Parses the sign, radix prefix, digits and exponent of float lexeme `text`.
+function ieeeParseDecimal(text: string): IeeeDecimal {
   let neg = false
   let i = 0
   if text.length > 0 {
@@ -604,14 +609,29 @@ function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
       i = i + 1
     }
   }
+  // The literal's decimal exponent: value = `mant * 10^dexp`, `mant` an integer. The
+  // plain spelling is the `expv == 0` case (`dexp = -frac`), so both spellings reach
+  // the same num/den.
+  let dexp = 0 - frac
+  if expNeg { dexp = dexp - expv } else { dexp = dexp + expv }
+  const r: IeeeDecimal = { neg: neg, mant: mant, sig: sig, dexp: dexp }
+  r
+}
+
+// Encodes decimal literal `text` into IEEE-754 form, little-endian, as an `i32[]`.
+// Shared by `f64Bytes`/`f32Bytes` via `sigBits`/`bias`/`nbytes` (53/1023/8 for f64,
+// 24/127/4 for f32): the parse, align, divmod and round live once here, and only
+// the final byte packing branches on width, so the value rounds exactly once.
+function ieeeBytes(text: string, sigBits: i32, bias: i32, nbytes: i32) {
+  gIeeeOverflow = false
+  const lit = ieeeParseDecimal(text)
+  const neg = lit.neg
+  const mant = lit.mant
+  const sig = lit.sig
+  const dexp = lit.dexp
   // +/- zero: `0`, `0.000`, and `0e999999` alike — the exponent cannot rescue a zero
   // mantissa, so this stays ahead of the range clamp.
   if bigIsZero(mant) { return ieeeZeroBytes(neg, nbytes) }
-  // The literal's decimal exponent: value = `mant * 10^dexp`, `mant` an integer. The
-  // plain spelling is the `expv == 0` case (`dexp = -frac`), so both spellings reach
-  // the same num/den below.
-  let dexp = 0 - frac
-  if expNeg { dexp = dexp - expv } else { dexp = dexp + expv }
   // Range clamp: a magnitude no format can reach, decided without building `10^|dexp|`.
   // At or past `10^400` every format overflows; at or below `10^-400` every format
   // rounds to zero. Deliberately slack — everything between is decided exactly by the

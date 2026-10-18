@@ -3206,6 +3206,84 @@ function cboxByRef(name: string, alam: string[]) {
   false
 }
 
+// `cboxScan`'s `if` arm: each link of an `else if` chain, its arms opened in turn at depth 0.
+function cboxScanIf(ix: i32, depth: i32, dlets: string[], alam: string[]) {
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); each
+  // link's condition and arms sit in the else arm of the link before it.
+  const armMark = cboxArmAt
+  let cur = ix
+  while cur >= 0 {
+    const c = P.nodes[cur]
+    const at = cur
+    cur = -1
+    if c is IfStmt {
+      cboxScan(c.ifCond, depth, dlets, alam)
+      const up = cboxArmAt
+      if depth == 0 { cboxArmOpen(at, 0) }
+      cboxScan(c.ifThen, depth, dlets, alam)
+      cboxArmAt = up
+      if c.ifElse >= 0 {
+        if depth == 0 { cboxArmOpen(at, 1) }
+        if P.nodes[c.ifElse] is IfStmt {
+          cur = c.ifElse
+        } else {
+          cboxScan(c.ifElse, depth, dlets, alam)
+        }
+      }
+    }
+  }
+  cboxArmAt = armMark
+  0
+}
+
+// `cboxScan`'s range-loop arm: the bounds, then the body with the loop variable declared at
+// depth 0 or shadowing below it.
+function cboxScanForRange(
+  ix: i32,
+  n: ForRange,
+  depth: i32,
+  dlets: string[],
+  alam: string[],
+) {
+  cboxScan(n.frFrom, depth, dlets, alam)
+  cboxScan(n.frTo, depth, dlets, alam)
+  cboxScan(n.frStep, depth, dlets, alam)
+  const rmark = cboxShTrail.length
+  if depth > 0 {
+    cboxShadowPush(n.frVar)
+  } else {
+    cboxLoopOpen()
+    cboxDeclare(n.frVar, CBOX_FORRANGE, ix, dlets)
+  }
+  cboxScan(n.frBody, depth, dlets, alam)
+  if depth == 0 { cboxLoopClose() }
+  cboxShadowTrim(rmark)
+}
+
+// `cboxScan`'s for-in arm: the iterable, then the body with its one or two variables declared at
+// depth 0 or shadowing below it.
+function cboxScanForIn(
+  ix: i32,
+  n: ForIn,
+  depth: i32,
+  dlets: string[],
+  alam: string[],
+) {
+  cboxScan(n.fiIter, depth, dlets, alam)
+  const imark = cboxShTrail.length
+  if depth > 0 {
+    cboxShadowPush(n.fiVar)
+    if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
+  } else {
+    cboxLoopOpen()
+    cboxDeclare(n.fiVar, CBOX_FORIN, ix, dlets)
+    if n.fiVar2 != "" { cboxDeclare(n.fiVar2, CBOX_FORIN, ix, dlets) }
+  }
+  cboxScan(n.fiBody, depth, dlets, alam)
+  if depth == 0 { cboxLoopClose() }
+  cboxShadowTrim(imark)
+}
+
 // One scan of a frame body at nesting `depth` (0 is the frame's own code): lists the frame's
 // bindings in `dlets`, the names a nested function assigns (unshadowed) in `alam`, and the
 // captures, assignments and loops `cboxByRef` compares.
@@ -3269,34 +3347,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     }
     return 0
   }
-  if n is IfStmt {
-    // An `else if` chain is walked along its spine, so its depth costs no stack (D1990); each
-    // link's condition and arms sit in the else arm of the link before it.
-    const armMark = cboxArmAt
-    let cur = ix
-    while cur >= 0 {
-      const c = P.nodes[cur]
-      const at = cur
-      cur = -1
-      if c is IfStmt {
-        cboxScan(c.ifCond, depth, dlets, alam)
-        const up = cboxArmAt
-        if depth == 0 { cboxArmOpen(at, 0) }
-        cboxScan(c.ifThen, depth, dlets, alam)
-        cboxArmAt = up
-        if c.ifElse >= 0 {
-          if depth == 0 { cboxArmOpen(at, 1) }
-          if P.nodes[c.ifElse] is IfStmt {
-            cur = c.ifElse
-          } else {
-            cboxScan(c.ifElse, depth, dlets, alam)
-          }
-        }
-      }
-    }
-    cboxArmAt = armMark
-    return 0
-  }
+  if n is IfStmt { return cboxScanIf(ix, depth, dlets, alam) }
   if n is WhileStmt {
     if depth == 0 { cboxLoopOpen() }
     cboxScan(n.whileCond, depth, dlets, alam)
@@ -3304,36 +3355,8 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     if depth == 0 { cboxLoopClose() }
     return 0
   }
-  if n is ForRange {
-    cboxScan(n.frFrom, depth, dlets, alam)
-    cboxScan(n.frTo, depth, dlets, alam)
-    cboxScan(n.frStep, depth, dlets, alam)
-    const rmark = cboxShTrail.length
-    if depth > 0 {
-      cboxShadowPush(n.frVar)
-    } else {
-      cboxLoopOpen()
-      cboxDeclare(n.frVar, CBOX_FORRANGE, ix, dlets)
-    }
-    cboxScan(n.frBody, depth, dlets, alam)
-    if depth == 0 { cboxLoopClose() }
-    return cboxShadowTrim(rmark)
-  }
-  if n is ForIn {
-    cboxScan(n.fiIter, depth, dlets, alam)
-    const imark = cboxShTrail.length
-    if depth > 0 {
-      cboxShadowPush(n.fiVar)
-      if n.fiVar2 != "" { cboxShadowPush(n.fiVar2) }
-    } else {
-      cboxLoopOpen()
-      cboxDeclare(n.fiVar, CBOX_FORIN, ix, dlets)
-      if n.fiVar2 != "" { cboxDeclare(n.fiVar2, CBOX_FORIN, ix, dlets) }
-    }
-    cboxScan(n.fiBody, depth, dlets, alam)
-    if depth == 0 { cboxLoopClose() }
-    return cboxShadowTrim(imark)
-  }
+  if n is ForRange { return cboxScanForRange(ix, n, depth, dlets, alam) }
+  if n is ForIn { return cboxScanForIn(ix, n, depth, dlets, alam) }
   if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam) }
   if n is Unary { return cboxScan(n.unArg, depth, dlets, alam) }
   if n is Paren { return cboxScan(n.parInner, depth, dlets, alam) }
