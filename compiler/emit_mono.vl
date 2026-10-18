@@ -350,6 +350,7 @@ import {
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
+  monoInertCalled,
   monoInertValues,
   monoInstFe,
   monoInstName,
@@ -11234,6 +11235,7 @@ let mfrValsState: {[i32]: i32} = Map()
 let mfrDirty: {[i32]: boolean} = Map()
 let mfrAnnLits: {[i32]: i32[]} = Map()
 let mfrAnnLets: i32[] = []
+let mfrCalled: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -11247,6 +11249,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrDirty = Map()
   mfrAnnLits = Map()
   mfrAnnLets = []
+  mfrCalled = []
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -11356,20 +11359,52 @@ function monoFlowDirectSet(x: i32, host: i32, el: i32) {
     return 0
   }
   monoFlowReadSet(x, g)
+  0
 }
 
-// Whether `s` declares a generic function by type parameters alone: an un-annotated parameter
-// would leave the literal's own unpinned occurrence of it refused once its reads name it.
+// Whether `s` declares a named function whose value has no one signature: type parameters, or an
+// un-annotated parameter (a hole function, D6603).
 function monoFlowTyParamGen(s: i32): boolean {
   const fn = P.nodes[s]
-  if !(fn is FuncDecl) || fn.fnTyParams.length == 0 { return false }
+  if !(fn is FuncDecl) || fn.fnName == "" { return false }
+  fn.fnTyParams.length > 0 || monoFlowHasHoleParam(s)
+}
+
+// Whether function declaration `s` has an un-annotated parameter.
+function monoFlowHasHoleParam(s: i32): boolean {
+  const fn = P.nodes[s]
+  if !(fn is FuncDecl) { return false }
   for pi in fn.fnParams {
     const p = P.nodes[pi]
     if p is Param {
-      if p.parType < 0 { return false }
+      if p.parType < 0 { return true }
     }
   }
-  true
+  false
+}
+
+// The un-annotated `const` holding hole lambda `v` as its whole initializer, when no other
+// declaration shares its name; -1 otherwise (D6603).
+function monoFlowLamLeaf(v: i32): i32 {
+  const n = P.nodes[v]
+  if !(n is FuncDecl) || !monoFlowHasHoleParam(v) { return -1 }
+  let p = mfrParent[v] ?? -1
+  while p >= 0 && P.nodes[p] is Paren { p = mfrParent[p] ?? -1 }
+  if p < 0 { return -1 }
+  const pd = P.nodes[p]
+  if !(pd is LetDecl) || pd.letKw != "const" || pd.letType >= 0 { return -1 }
+  if unwrapParen(pd.letInit) != v { return -1 }
+  if (mfrNameCount[pd.letName] ?? 0) != 1 { return -1 }
+  p
+}
+
+// The name a read rewritten to leaf `g` (`monoFlowLeafGen`) spells: a function's or a `const`'s.
+function monoFlowLeafName(g: i32): string {
+  const gd = P.nodes[g]
+  if gd is FuncDecl { return gd.fnName }
+  if gd is LetDecl { return gd.letName }
+  emitFail("monoFlowLeafName: a flow leaf is a function or a `const` lambda")
+  ""
 }
 
 // Banks node `ix` for `monoFlowReads`: a name read, a declared name, a candidate binding, a
@@ -11429,7 +11464,7 @@ function monoFlowLeafGen(v: i32): i32 {
   const n = P.nodes[v]
   if n is FuncDecl {
     const cf = monoAdapterCallee(v)
-    if cf < 0 { return -1 }
+    if cf < 0 { return monoFlowLamLeaf(v) }
     const c = unwrapParen(cf)
     if c < 0 || !(P.nodes[c] is Ident) { return -1 }
     return monoFlowLeafGen(c)
@@ -11452,6 +11487,7 @@ function monoFlowLeafGen(v: i32): i32 {
     if ad.letKw != "const" || ad.letType >= 0 || ad.letInit < 0 { return -1 }
     r = unwrapParen(ad.letInit)
     if r < 0 { return -1 }
+    if P.nodes[r] is FuncDecl { return monoFlowLamLeaf(r) }
     hops = hops + 1
   }
   -1
@@ -11709,6 +11745,7 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
   const pr: i32[] = []
   const pl: i32[] = []
   const ps: i32[] = []
+  const planned: i32[] = []
   for d in lets {
     const vals = monoFlowDeclVals(d)
     if vals.length > 0 {
@@ -11722,6 +11759,7 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
         }
       }
       if ok {
+        planned.push(d)
         monoFlowTagPairs(pr, d, reads)
         monoFlowTagPairs(pl, d, loops)
         monoFlowTagPairs(ps, d, spreads)
@@ -11731,16 +11769,28 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
       }
     }
   }
+  // A binding some read, loop or spread of which keeps reading through the literal.
+  const through: i32[] = []
   let i = 0
   while i < pr.length {
-    if monoFlowDeclClean(pr[i]) { monoFlowReadSet(pr[i + 1], pr[i + 2]) }
+    if monoFlowDeclClean(pr[i]) && !monoFlowReadSet(pr[i + 1], pr[i + 2]) {
+      through.push(pr[i])
+    }
     i = i + 3
   }
   i = 0
   while i < pl.length {
-    if monoFlowDeclClean(pl[i]) { monoFlowLoopSet(pl[i + 1], pl[i + 2]) }
+    if monoFlowDeclClean(pl[i]) && !monoFlowLoopSet(pl[i + 1], pl[i + 2]) {
+      through.push(pl[i])
+    }
     i = i + 3
   }
+  i = 0
+  while i < ps.length {
+    through.push(ps[i])
+    i = i + 3
+  }
+  monoFlowNoteInert(planned, through)
   i = 0
   const hosts: i32[] = []
   while i < ps.length {
@@ -12043,25 +12093,97 @@ function monoFlowInScope(x: i32, g: i32): boolean {
   y == o
 }
 
-// Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope.
-function monoFlowReadSet(x: i32, g: i32) {
-  const gd = P.nodes[g]
-  if !(gd is FuncDecl) || !monoFlowInScope(x, g) { return 0 }
-  const n: Node = { identName: gd.fnName, pos: nodePos(x) }
+// Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope;
+// false when it is not.
+function monoFlowReadSet(x: i32, g: i32): boolean {
+  const nm = monoFlowLeafName(g)
+  if nm == "" || !monoFlowInScope(x, g) { return false }
+  const n: Node = { identName: nm, pos: nodePos(x) }
+  if monoFlowCalledAt(x) && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
   arenaSetNode(x, n)
   sidNoteNodeName(x, g)
   monoArenaTouch()
+  true
+}
+
+// Notes as inert each name of a generic in the literals the clean bindings of `planned` hold,
+// unless a binding in `through` holds the same literal tree: every read of the rest now names
+// the generic itself, so no call reaches one of those names (D6661).
+function monoFlowNoteInert(planned: i32[], through: i32[]) {
+  const kept: i32[] = []
+  for d in through {
+    for v in mfrVals[d] ?? [] { kept.push(monoFlowLitRoot(v)) }
+  }
+  for d in planned {
+    if monoFlowDeclClean(d) {
+      for v in mfrVals[d] ?? [] {
+        if !i32ListHas(kept, monoFlowLitRoot(v)) { monoFlowNoteInertIn(v, 0) }
+      }
+    }
+  }
   0
 }
 
-// Rewrites each read of loop `fl`'s binding to generic `g`, unless a read writes it.
-function monoFlowLoopSet(fl: i32, g: i32) {
+// Whether read `u` is the callee of the call holding it.
+function monoFlowCalledAt(u: i32): boolean {
+  const c = mfrParent[u] ?? -1
+  if c < 0 { return false }
+  const cn = P.nodes[c]
+  cn is Call && unwrapParen(cn.callFn) == u
+}
+
+// Whether generic `g` is called by name, as written or through a rewritten read: an uncalled
+// one has only its default body, which need not be valid (D6660).
+function monoFlowGenCalled(g: i32): boolean {
+  if i32ListHas(mfrCalled, g) { return true }
+  for u in mfrUses[g] ?? [] {
+    if monoFlowCalledAt(u) { return true }
+  }
+  false
+}
+
+// Notes each element or field of a literal `v`, through nested literals, that names a called generic.
+function monoFlowNoteInertIn(v: i32, depth: i32) {
+  const x = unwrapParen(v)
+  if x < 0 || depth > 8 { return 0 }
+  const n = P.nodes[x]
+  if n is ArrayLit {
+    for e in n.arrElems { monoFlowNoteInertIn(e, depth + 1) }
+    return 0
+  }
+  if n is ObjLit {
+    for fi in n.objFields {
+      const f = P.nodes[fi]
+      if f is FieldInit { monoFlowNoteInertIn(f.fiValue, depth + 1) }
+    }
+    return 0
+  }
+  monoFlowNoteInertLeaf(x)
+}
+
+// Notes value `x` inert when it names a called generic; any other value is left as it is.
+function monoFlowNoteInertLeaf(x: i32) {
+  if !(P.nodes[x] is Ident) { return 0 }
+  const g = monoFlowLeafGen(x)
+  if g >= 0 && monoFlowGenCalled(g) && !i32ListHas(monoInertCalled, x) {
+    if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
+    monoInertCalled.push(x)
+  }
+  0
+}
+
+// Rewrites each read of loop `fl`'s binding to generic `g`, unless a read writes it; false when
+// a read is left reading the loop's element.
+function monoFlowLoopSet(fl: i32, g: i32): boolean {
   const us = mfrUses[fl] ?? []
   for u in us {
-    if monoFlowIsWrite(u) { return 0 }
+    if monoFlowIsWrite(u) { return false }
   }
-  for u in us { monoFlowReadSet(u, g) }
-  0
+  let all = true
+  for u in us {
+    if !monoFlowReadSet(u, g) { all = false }
+  }
+  all
 }
 
 // Replaces spread `sp` in its host list literal by one name read per element of list literal
@@ -12083,9 +12205,9 @@ function monoFlowSpreadSet(sp: i32, v: i32): i32 {
         const x = unwrapParen(se)
         const g = monoFlowLeafGen(x)
         if g >= 0 {
-          const gd = P.nodes[g]
-          if gd is FuncDecl {
-            const nx = mkIdent(gd.fnName, nodePos(sp))
+          const gnm = monoFlowLeafName(g)
+          if gnm != "" {
+            const nx = mkIdent(gnm, nodePos(sp))
             sidNoteNodeName(nx, g)
             nodeTyRecord(nx, nodeTyIxOf(x))
             // arena-tick exempt: a side table of this pass, not the arena
@@ -12145,17 +12267,11 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if !monoTyConcreteFn(ft) { return 0 }
   const fty = T.tys[ft]
   if !(fty is TyFunc) { return 0 }
-  const arrow = ann.indexOf("=>")
+  // The pin's own parameter spelling, from which each instance is built, in the canonical
+  // `(p)=>r` form a pin spelling is compared in (D6602).
   const lt = mkArrayTy(ft)
-  d.letType = synthTypeRefTy(
-    "("
-      + ann.slice(0, arrow)
-      + "=> "
-      + tyToEmitName(fty.fnRet)
-      + ")[]",
-    -1,
-    lt,
-  )
+  const fnm = monoSigFnTyNameRet(pins[0] + ";", tyToEmitName(fty.fnRet))
+  d.letType = synthTypeRefTy("(" + fnm + ")[]", -1, lt)
   monoArenaTouch()
   nodeTyRecord(d.letInit, lt)
   for e in lit.arrElems {
@@ -17955,6 +18071,7 @@ export function monomorphize(stmts: i32[]) {
   monoDeliveredArgs = []
   monoStubSlots = []
   monoInertValues = []
+  monoInertCalled = []
   monoFieldReadTys = Map()
   monoLastInstFe = -1
   monoFnFieldTwinRow = Map()
