@@ -69,6 +69,7 @@ import { tyIsForeignGenericSig } from "./check_subst"
 import {
   assignable,
   bindGenWalk,
+  holeLamRetAt,
   nameToTy,
   substTyDeep,
   subtractTy,
@@ -287,6 +288,8 @@ import {
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
+  fnFlowDeclPathAgreedPinTys,
+  fnFlowDeclPathOnlyPinCall,
   fnFlowDeclPathPinCalls,
   fnFlowDeclPathPinFns,
   fnFlowDeclPathPinRets,
@@ -13884,8 +13887,14 @@ function monoHoleGenFnPin(
   monoHoleGenTwoPins = false
   monoHoleGenManyPins = false
   const bt = monoHoleGenFnTy(callIx, pIx, argIx)
-  if bt >= 0 { return monoFnPinAt(argIx, ctx, bt, -1, tyOut) }
   const fl = monoHoleGenFnFlowDecl(argIx, ctx)
+  if bt >= 0 {
+    // The checker's binding stands; the open function values its pin call hands on still take
+    // that binding's parameter types (D6532).
+    const an = monoFnPinAt(argIx, ctx, bt, -1, tyOut)
+    if an != "" && fl[1] >= 0 { monoPinOpenCallLams(fl[1], bt) }
+    return an
+  }
   const ft = monoHoleGenFnFlowTy(argIx, fl)
   // The plan decides whether the hole is called at two types; the flow pins may stop at a
   // recursive forward before they reach both (D6091).
@@ -13981,6 +13990,7 @@ function monoFnPinAt(
   if flowDecl >= 0 {
     const noPath: string[] = []
     monoRetypePinCalls(flowDecl, noPath)
+    monoPinOpenCallLams(flowDecl, bt)
   }
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = bt
@@ -13989,6 +13999,52 @@ function monoFnPinAt(
   const an = monoArgFnTypeName(argIx, ctx)
   if an != "" { return an }
   nm
+}
+
+// Each hole lambda literal handed to the one call pinning the slot of `d` open takes the parameter
+// type of `bt`, the concrete function type that call is delivered at (D6543).
+function monoPinOpenCallLams(d: i32, bt: i32) {
+  const noPath: string[] = []
+  const tys: i32[] = []
+  const cx = fnFlowDeclPathOnlyPinCall(d, noPath, tys)
+  if cx < 0 || bt < 0 || bt >= T.tys.length { return 0 }
+  const c = P.nodes[cx]
+  const bf = T.tys[bt]
+  if !(c is Call) || !(bf is TyFunc) { return 0 }
+  if bf.fnParamTypes.length != c.callArgs.length { return 0 }
+  const fns = fnFlowDeclPathPinFns(d, noPath)
+  if fns.length != 1 { return 0 }
+  let j = 0
+  while j < c.callArgs.length {
+    const nm = monoConcreteFnTyName(bf.fnParamTypes[j])
+    const ax = unwrapParen(c.callArgs[j])
+    if (
+      nm != ""
+      && ax >= 0
+      && P.nodes[ax] is Ident
+      && monoOpenFnArgDecl(ax) >= 0
+    ) {
+      monoCoerceFnValueName(ax, nm, fns[0], bf.fnParamTypes[j])
+    } else if nm != "" {
+      monoLamLitTake(c.callArgs[j], nm, fns[0])
+    }
+    j = j + 1
+  }
+  // A callee the checker left open takes `bt`, so a hole function named as an argument is
+  // delivered at that parameter type (D6532).
+  const cf = unwrapParen(c.callFn)
+  const ct = nodeTyIxOf(cf)
+  if (
+    cf >= 0
+    && ct >= 0
+    && ct < T.tys.length
+    && T.tys[ct] is TyFunc
+    && tyHasTyVar(ct)
+    && monoWritesTypedAt(d, bf.fnParamTypes)
+  ) {
+    nodeTyRecord(cf, bt)
+  }
+  0
 }
 
 // The frame and binding (`monoReadLetFrame`) whose flow-table slot holds generic `argIx` read in
@@ -14011,16 +14067,24 @@ function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
   out
 }
 
-// Generic `argIx`'s signature instanced at the parameter types of the one closed pin the flow
-// table gives slot `lf` (`monoHoleGenFnFlowDecl`), bound as the direct call binds them: closed
-// arguments first, then an empty list's element at `i32` where nothing else binds it (D6542).
-// -1 for no pin, two, a parameter that does not fit, or a type variable left open.
+// Generic `argIx`'s signature instanced at slot `lf`'s one closed flow pin as the direct call
+// binds it: closed arguments, then an empty list's element at `i32` (D6542); with no closed pin,
+// the call's un-annotated lambdas at what the rest bind (D6543). -1 for no pin, two, a parameter
+// that does not fit, or a type variable left open.
 function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
   if lf[1] < 0 { return -1 }
   const noPath: string[] = []
   const pins = monoDeclPathPins(lf, noPath)
-  if pins.length != 1 { return -1 }
-  const ps = fnFlowDeclPathPinTysOf(lf[1], noPath, pins[0])
+  let ps: i32[] = []
+  let cx = -1
+  if pins.length == 1 {
+    ps = fnFlowDeclPathPinTysOf(lf[1], noPath, pins[0])
+  } else if pins.length == 0 {
+    cx = fnFlowDeclPathOnlyPinCall(lf[1], noPath, ps)
+    if cx < 0 { return -1 }
+  } else {
+    return -1
+  }
   const vt = nodeTyIxOf(unwrapParen(argIx))
   if vt < 0 || vt >= T.tys.length || ps.length == 0 || !tyHasTyVar(vt) {
     return -1
@@ -14046,6 +14110,10 @@ function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
     }
     j = j + 1
   }
+  if cx >= 0 {
+    monoHoleGenBindLamArgs(vf, cx, ps, gN, gT)
+    monoHoleGenBindFnArgs(argIx, vf, cx, ps, gN, gT)
+  }
   j = 0
   while j < ps.length {
     if tyHasTyVar(ps[j]) { bindGenWalk(vf.fnParamTypes[j], ps[j], gN, gT) }
@@ -14054,6 +14122,183 @@ function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
   const inst = substTyDeep(vt, gN, gT)
   if !monoTyConcreteFn(inst) { return -1 }
   inst
+}
+
+// Binds, into `gN`/`gT`, each un-annotated lambda argument of pin call `cx` (pinned open at `ps`)
+// at the result its body gives under the other arguments' bindings (`holeLamRetAt`, D6543).
+function monoHoleGenBindLamArgs(
+  vf: TyFunc,
+  cx: i32,
+  ps: i32[],
+  gN: string[],
+  gT: i32[],
+) {
+  const c = P.nodes[cx]
+  if !(c is Call) || c.callArgs.length != ps.length { return 0 }
+  let j = 0
+  while j < ps.length {
+    const lx = unwrapParen(c.callArgs[j])
+    const p = vf.fnParamTypes[j]
+    const pf = T.tys[p]
+    if lx >= 0 && P.nodes[lx] is FuncDecl && pf is TyFunc && tyHasTyVar(ps[j]) {
+      const noN: string[] = []
+      const noT: i32[] = []
+      const r = holeLamRetAt(lx, substTyDeep(p, gN, gT), noN, noT)
+      if r >= 0 { bindGenWalk(pf.fnRet, r, gN, gT) }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// Binds, into `gN`/`gT`, each parameter of hole function `argIx` that pin call `cx` hands an open
+// function (a hole function's name, or an un-annotated lambda) at the type its own body calls it
+// with: the one closed pin of that parameter's slot, returning what the argument's body gives
+// there (D6532).
+function monoHoleGenBindFnArgs(
+  argIx: i32,
+  vf: TyFunc,
+  cx: i32,
+  ps: i32[],
+  gN: string[],
+  gT: i32[],
+) {
+  const c = P.nodes[cx]
+  const ax = unwrapParen(argIx)
+  if !(c is Call) || c.callArgs.length != ps.length || ax < 0 { return 0 }
+  if !(P.nodes[ax] is Ident) { return 0 }
+  const dx = monoOpenFnArgDecl(ax)
+  if dx < 0 { return 0 }
+  const fd = P.nodes[dx]
+  if !(fd is FuncDecl) || fd.fnParams.length != ps.length { return 0 }
+  let j = 0
+  while j < ps.length {
+    const pv = vf.fnParamTypes[j]
+    const lx = monoOpenFnArgDecl(c.callArgs[j])
+    if lx >= 0 && tyHasTyVar(ps[j]) && monoTyLeftOpen(pv, gN, gT) {
+      const qs: i32[] = []
+      const noPath: string[] = []
+      let closed = fnFlowDeclPathAgreedPinTys(fd.fnParams[j], noPath, qs)
+      for q in qs {
+        if tyHasTyVar(q) { closed = false }
+      }
+      if closed {
+        const r = monoFnDeclRetAt(lx, qs)
+        if r >= 0 { bindGenWalk(pv, mkFuncTy(qs, r), gN, gT) }
+      }
+    }
+    j = j + 1
+  }
+  0
+}
+
+// The pin of a list literal of open function values (`[h]`) handed to
+// un-annotated parameter `i` of `decl`: a list of the function type its body calls an element at,
+// the one agreed pin of the parameter's element slot, with the elements' own result there; ""
+// when the list, the pin or the result does not close (D6601).
+function monoOpenFnListPin(
+  decl: i32,
+  argIx: i32,
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  if decl < 0 || decl >= P.nodes.length { return "" }
+  const dn = P.nodes[decl]
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return "" }
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
+  const at = nodeTyIxOf(ax)
+  if at < 0 || at >= T.tys.length { return "" }
+  const la = T.tys[at]
+  if !(la is TyArray) || la.aElem < 0 || la.aElem >= T.tys.length { return "" }
+  if !(T.tys[la.aElem] is TyFunc) || !tyHasTyVar(la.aElem) { return "" }
+  const al = P.nodes[ax]
+  if !(al is ArrayLit) || al.arrElems.length == 0 { return "" }
+  const qs: i32[] = []
+  const ePath: string[] = ["e"]
+  if !fnFlowDeclPathAgreedPinTys(dn.fnParams[i], ePath, qs) { return "" }
+  for q in qs {
+    if tyHasTyVar(q) { return "" }
+  }
+  let ft = -1
+  for el in al.arrElems {
+    const ex = monoOpenFnArgDecl(el)
+    if ex < 0 { return "" }
+    const r = monoFnDeclRetAt(ex, qs)
+    if r < 0 { return "" }
+    const et = mkFuncTy(qs, r)
+    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return "" }
+    ft = et
+  }
+  if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
+  // Each element is delivered at that type, a hole function's name as a direct argument is
+  // (`monoFnPinAt`).
+  const nm = monoConcreteFnTyName(ft)
+  if nm != "" {
+    for el in al.arrElems {
+      const ex = unwrapParen(el)
+      if ex < 0 { return "" }
+      if P.nodes[ex] is Ident {
+        if monoCoerceFnValueName(ex, nm, ctx, ft) < 0 { return "" }
+      } else {
+        monoLamLitTake(ex, nm, ctx)
+      }
+    }
+  }
+  const lt = mkArrayTy(ft)
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = lt
+  monoConcreteFnPinName(lt)
+}
+
+// The closed result of function declaration `lx` called at the closed parameter types `qs`: its
+// body's result for an un-annotated return, its declared return under the parameters' binding
+// otherwise; -1 when either stays open.
+function monoFnDeclRetAt(lx: i32, qs: i32[]): i32 {
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(lx, mkFuncTy(qs, i32TyIx()), noN, noT)
+  if r >= 0 { return r }
+  const lt = nodeTyIxOf(lx)
+  if lt < 0 || lt >= T.tys.length { return -1 }
+  const lf = T.tys[lt]
+  if !(lf is TyFunc) || lf.fnParamTypes.length != qs.length || lf.fnRet < 0 {
+    return -1
+  }
+  const hN: string[] = []
+  const hT: i32[] = []
+  let k = 0
+  while k < qs.length {
+    bindGenWalk(lf.fnParamTypes[k], qs[k], hN, hT)
+    k = k + 1
+  }
+  const dr = substTyDeep(lf.fnRet, hN, hT)
+  if dr < 0 || tyHasTyVar(dr) { return -1 }
+  dr
+}
+
+// Whether `pv` still has a type variable `gN`/`gT` leave unbound.
+function monoTyLeftOpen(pv: i32, gN: string[], gT: i32[]): boolean {
+  tyHasTyVar(substTyDeep(pv, gN, gT))
+}
+
+// The function declaration an open function argument `a` names: an un-annotated lambda, or an
+// identifier naming a hole function or a `const` holding a lambda; -1 for anything else.
+function monoOpenFnArgDecl(a: i32): i32 {
+  const x = unwrapParen(a)
+  if x < 0 { return -1 }
+  const n = P.nodes[x]
+  if n is FuncDecl { return x }
+  if !(n is Ident) { return -1 }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = P.nodes[d]
+  if dn is FuncDecl { return d }
+  if !(dn is LetDecl) || dn.letKw != "const" { return -1 }
+  const lx = unwrapParen(dn.letInit)
+  if lx < 0 || !(P.nodes[lx] is FuncDecl) { return -1 }
+  lx
 }
 
 // Whether flow pin `t` is a list whose element is an inference hole, as `[]` pins.
@@ -14408,6 +14653,11 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               const llTy: i32[] = [0 - 1]
               an = monoHoleLeafLitPin(oDecl, args, i, ctx, llTy)
               anTy = llTy[0]
+            }
+            if an == "" {
+              const flTy: i32[] = [0 - 1]
+              an = monoOpenFnListPin(oDecl, args[i], i, ctx, flTy)
+              anTy = flTy[0]
             }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
@@ -16841,9 +17091,16 @@ function monoSlotPinName(d: i32, path: string[], ctx: i32): string {
 
 // The spelling of `ty` when it is a function type with no hole, else "".
 function monoConcreteFnTyName(ty: i32): string {
-  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyFunc) || tyHasTyVar(ty) {
-    return ""
-  }
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyFunc) { return "" }
+  monoConcreteFnPinName(ty)
+}
+
+// The pin spelling of `ty` when it is a function type or a list of one, with no hole, else "".
+function monoConcreteFnPinName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return "" }
+  const t = T.tys[ty]
+  if t is TyArray && !monoPinIsFnTy(t.aElem) { return "" }
+  if !(t is TyArray) && !(t is TyFunc) { return "" }
   tyToEmitName(ty)
 }
 
