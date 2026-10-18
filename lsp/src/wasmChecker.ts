@@ -789,6 +789,22 @@ export type WasmChecker = {
    * graph after an edit to the entry must push exactly one module.
    */
   stagingCounts: () => { pushed: number; cached: number };
+  /**
+   * Diagnostics for `source` as the entry at `entryKey` from a plain module check,
+   * which a checker built with `checkSkip` serves from the entry's last check for
+   * every module an edit did not reach. The rows are `check`'s; `served` is how many
+   * modules came from that bank (0 on a seed or a checker without the skip), `reason`
+   * the seed's `checkSkipStat(0)` (-1 without one), and
+   * `graph` the module keys of the checked program, entry first. Leaves no symbol
+   * tables behind, so the next symbol query on any document re-checks.
+   */
+  recheck: (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ) => Promise<{ diagnostics: VLDiagnostic[]; served: number; reason: number; graph: string[] }>;
+  /** The module keys of the program the last check staged, entry first. */
+  lastGraph: () => string[];
 };
 
 /** A native 1-based line as an LSP 0-based one; 0 means "no position". */
@@ -863,13 +879,21 @@ const readBytes = (len: number, at: (j: number) => number): Uint8Array => {
  * `resolveModuleRoot` answers a module key's project root ("" for none), staged per
  * module (`modRootKeyPush`/`modRootDirPush`/`modRootCommit`) so its stable id is the
  * one the CLI gives it (D5760). The Node loader passes `projectRootFor` (`vlRoot.ts`).
+ *
+ * `checkSkip` arms the seed's module-check skip (`checkSkipArm`) on every instance
+ * this checker stages into, so each check banks its result per entry and a
+ * {@link WasmChecker.recheck} serves the modules an edit did not reach. Only a
+ * long-lived host passes it (the Node server); the playground does not.
  */
 export const createWasmChecker = (
   instantiate: () => Exports | undefined,
   wrapReader?: (read: ModuleReader) => ModuleReader,
   resolveVlRoot?: (entryKey: string) => string | undefined,
   resolveModuleRoot?: (key: string) => string,
+  checkSkip = false,
 ): WasmChecker => {
+  // The instance the skip was last armed on: a replaced seed starts unarmed.
+  let armedExp: Exports | undefined;
   /**
    * What the instance's per-module scan cache holds, AS THE HOST LAST WROTE IT:
    * module key → the exact source pushed for it, and that source's UTF-8 length.
@@ -910,6 +934,10 @@ export const createWasmChecker = (
     entryKey: string,
     read: ModuleReader,
   ): Promise<void> => {
+    if (checkSkip && armedExp !== exp && typeof exp.checkSkipArm === "function") {
+      exp.checkSkipArm(1);
+      armedExp = exp;
+    }
     exp.modReset();
     // Re-staged every call (cheap, and memoized in `vlRootFor` itself): an older
     // seed lacks the two exports and every path-scoped rule just declines, as
@@ -2013,7 +2041,22 @@ export const createWasmChecker = (
     // there is one absent-payload path and not two.
     const hasData = typeof exp.diagDataLen === "function" &&
       typeof exp.diagDataByte === "function";
-    for (let i = 0; i < count; i++) {
+    // Type diagnostics in module order, each module's in the order raised: the order a
+    // check that served some modules lists them in, so an armed and an unarmed check of
+    // one program publish the same list. A seed without `diagOrderKey` keeps its own.
+    // A row with no key (-1, not a type diagnostic) keeps its place.
+    const rows = [...Array(count).keys()];
+    if (typeof exp.diagOrderKey === "function") {
+      const key = rows.map((i) => exp.diagOrderKey(i));
+      for (let lo = 0; lo < count;) {
+        let hi = lo;
+        while (hi < count && key[hi] >= 0) hi++;
+        const run = rows.slice(lo, hi).sort((a, b) => key[a] - key[b] || a - b);
+        rows.splice(lo, run.length, ...run);
+        lo = hi + 1;
+      }
+    }
+    for (const i of rows) {
       const message = readString(exp.diagMsgLen(i), (j) => exp.diagMsgAt(i, j));
       const line = exp.diagLine(i); // 1-based; 0 = positionless
       const col = exp.diagCol(i); // 0-based
@@ -2084,6 +2127,40 @@ export const createWasmChecker = (
     exp.checkSrc();
     s.checked = false; // ran with the symbol table off — the sym tables are gone
     return readDiags(exp, source);
+  };
+
+  const recheck = async (
+    source: string,
+    entryKey: string,
+    read: ModuleReader,
+  ): Promise<{ diagnostics: VLDiagnostic[]; served: number; reason: number; graph: string[] }> => {
+    const exp = instantiate();
+    if (exp === undefined) {
+      throw new Error("wasm checker became unavailable (seed removed?)");
+    }
+    if (!speaksAbi(exp)) return { diagnostics: abiMismatchDiag(exp), served: 0, reason: -1, graph: [] };
+    const s = await ensureStaged(exp, source, entryKey, read);
+    graphChecks++;
+    exp.checkSrc();
+    s.checked = false;
+    const served = typeof exp.checkSkipStat === "function" ? exp.checkSkipStat(1) : 0;
+    const reason = typeof exp.checkSkipStat === "function" ? exp.checkSkipStat(0) : -1;
+    return { diagnostics: readDiags(exp, source), served, reason, graph: graphOf(exp) };
+  };
+
+  // The module keys the instance holds, entry first; none for a single-source check.
+  const graphOf = (exp: Exports): string[] => {
+    const graph: string[] = [];
+    const n = typeof exp.modKeyCount === "function" ? exp.modKeyCount() : 0;
+    for (let m = 0; m < n; m++) {
+      graph.push(readString(exp.modKeyAtLen(m), (j) => exp.modKeyAtCharAt(m, j)));
+    }
+    return graph;
+  };
+
+  const lastGraph = (): string[] => {
+    const exp = instantiate();
+    return exp === undefined || staged?.exp !== exp ? [] : graphOf(exp);
   };
 
   // Whole-program codegen (the playground's Run path): compile `source` (as the
@@ -2448,6 +2525,8 @@ export const createWasmChecker = (
     bumpReaderGeneration,
     graphCheckCount,
     stagingCounts,
+    recheck,
+    lastGraph,
   };
 };
 

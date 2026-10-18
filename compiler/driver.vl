@@ -5042,6 +5042,7 @@ function modCompile(emit: i32): i32 {
   modAliasRootExports()
   const banking = emit == 0 && skArmed && ifaceHashArmed()
   let keep: boolean[] = []
+  if banking { skSelect() }
   if banking && !skMute { keep = skPlan(roots) }
   const merged = modMergeRoots(roots, keep)
   csPreMintLocs()
@@ -5110,14 +5111,107 @@ let skScalar: {[i32]: i32}[] = []
 let skDgMod: i32[] = []
 let skDgEnd: i32[] = []
 let skDg: TDiag[] = []
+// The entry key the loaded bank belongs to, and the banks of other entries, newest last, so a
+// host checking several entries in turn keeps each one's bank.
+let skEntry = ""
+type SkBank = {
+  bEntry: string,
+  bKeys: string[],
+  bKeyIx: {[string]: i32},
+  bSrcs: string[],
+  bHash: i32[],
+  bMask: i32,
+  bPlus: {[i32]: i32}[],
+  bStrIdx: {[i32]: i32}[],
+  bScalar: {[i32]: i32}[],
+  bDgMod: i32[],
+  bDgEnd: i32[],
+  bDg: TDiag[],
+}
+let skParked: SkBank[] = []
+const SK_PARK_MAX = 4
 
 // Arm the bank for later `checkSrc` module checks (`on` 1), arming the interface hash with
 // it, or disarm it (0). Either way the bank starts empty.
 export function checkSkipArm(on: i32): i32 {
   skArmed = on != 0
   skValid = false
+  skParked = []
   if skArmed { ifaceHashArm(1) }
   0
+}
+
+// Load the bank made for this graph's entry, parking the loaded one when it belongs to another.
+function skSelect(): i32 {
+  let entry = ""
+  if modKeys.length > 0 { entry = modKeys[0] }
+  if skValid && skEntry == entry { return 0 }
+  const kept: SkBank[] = []
+  if skValid {
+    for b in skParked {
+      if b.bEntry != skEntry { kept.push(b) }
+    }
+    kept.push(
+      {
+        bEntry: skEntry,
+        bKeys: skKeys,
+        bKeyIx: skKeyIx,
+        bSrcs: skSrcs,
+        bHash: skHash,
+        bMask: skMask,
+        bPlus: skPlus,
+        bStrIdx: skStrIdx,
+        bScalar: skScalar,
+        bDgMod: skDgMod,
+        bDgEnd: skDgEnd,
+        bDg: skDg,
+      },
+    )
+  } else {
+    for b in skParked { kept.push(b) }
+  }
+  skValid = false
+  skParked = []
+  let i = 0
+  if kept.length > SK_PARK_MAX { i = kept.length - SK_PARK_MAX }
+  while i < kept.length {
+    const b = kept[i]
+    if b.bEntry == entry {
+      skKeys = b.bKeys
+      skKeyIx = b.bKeyIx
+      skSrcs = b.bSrcs
+      skHash = b.bHash
+      skMask = b.bMask
+      skPlus = b.bPlus
+      skStrIdx = b.bStrIdx
+      skScalar = b.bScalar
+      skDgMod = b.bDgMod
+      skDgEnd = b.bDgEnd
+      skDg = b.bDg
+      skEntry = entry
+      skValid = true
+    } else {
+      skParked.push(b)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The position in dependency order of the module type diagnostic `i` is anchored in (the
+// entry's when it has no anchor), or -1 for any other diagnostic or a single-source check.
+// Listing type diagnostics stably by it gives the same rows whether or not a check served.
+export function diagOrderKey(i: i32): i32 {
+  const j = i - P.diags.length
+  if j < 0 || j >= T.diags.length || modKeys.length == 0 { return -1 }
+  let m = skDiagMod(j)
+  if m < 0 { m = 0 }
+  let o = 0
+  while o < modOrder.length {
+    if modOrder[o] == m { return o }
+    o = o + 1
+  }
+  -1
 }
 
 // The last module check: `which` 0 why it checked what it did (0 when it served some module),
@@ -5164,20 +5258,13 @@ function skParamsClosed(ps: i32[]): boolean {
 function skScalarLit(e: i32): boolean {
   if e < 0 || e >= P.nodes.length { return false }
   const n = P.nodes[e]
-  n is NumLit || n is StrLit || n is CharLit || skFixedLit(e)
-}
-
-// Whether node `e` is a string or boolean literal, whose binding no store or delivery retypes.
-function skFixedLit(e: i32): boolean {
-  if e < 0 || e >= P.nodes.length { return false }
-  const n = P.nodes[e]
-  n is StrLit || n is BoolLit
+  n is NumLit || n is StrLit || n is CharLit || n is BoolLit
 }
 
 // Whether the top-level declaration `merged` of the module rooted at `root` checks the same
-// whatever imports it: a type, an extern, an annotated binding, a string or boolean binding, a
-// constant scalar literal, or one non-generic function with every parameter annotated. Any
-// other binding (a number store retypes it), an overload or a generic answers no.
+// whatever imports it, given its checked type kept its hash (a retyped number binding does
+// not): a type, an extern, an annotated or scalar-literal binding, or one non-generic function
+// with every parameter annotated. Any other binding, an overload or a generic answers no.
 function skClosed(root: i32, merged: string): boolean {
   let fns = 0
   let typed = false
@@ -5186,9 +5273,7 @@ function skClosed(root: i32, merged: string): boolean {
     for st in r.progStmts {
       const n = P.nodes[st]
       if n is LetDecl && n.letName == merged {
-        return n.letType >= 0
-          || skFixedLit(n.letInit)
-          || (n.letKw == "const" && skScalarLit(n.letInit))
+        return n.letType >= 0 || skScalarLit(n.letInit)
       }
       if n is FuncDecl && n.fnName == merged {
         if n.fnTyParams.length > 0 || !skParamsClosed(n.fnParams) {
@@ -5488,6 +5573,7 @@ function skBankNow(tokEnd: i32): i32 {
     m = m + 1
   }
   skKeyIx = ix
+  skEntry = modKeys[0]
   skMask = ihMask()
   skDgMod = dgMod
   skDgEnd = dgEnd
