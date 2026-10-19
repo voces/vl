@@ -1,7 +1,7 @@
 // `emit_narrow_slots.vl` — the emitter's narrowing slots: which binding a narrow is
 // recorded against, when it is masked or retired, and the push/pop bits a scope carries.
 
-import { Ident, IfStmt, P, StrLit } from "./ast"
+import { Ident, IfStmt, P, StrLit, stmtAlwaysExits } from "./ast"
 import { nominalStructNameOfTy } from "./check_emit_queries"
 import { narrowKeyRoot } from "./check_getter_effects"
 import { nodeTyIxOf } from "./check_node_tys"
@@ -252,9 +252,9 @@ export function unmaskNarrow(slots: i32[]) {
 }
 
 // ── the else complement's starting state ──────────────────────────────────
-// The checker derives an else arm's complement from the narrowing standing at its condition, so
-// a retirement the then arm made is not seen by it, though it still holds in the arm (D6650).
-// Retirements are journaled so the complement can be pushed with the then arm's lifted.
+// No path reaches an else arm, or the code after a then arm that exits, through the then arm,
+// so the checker lifts what the then arm retired there (D6650, D6690). Retirements are journaled
+// so the emitter can lift the same slots.
 
 // The slots a retirement flipped from live, oldest first.
 let narrowRetireLog: i32[] = []
@@ -278,9 +278,28 @@ export function narrowThenOpen(condIx: i32) {
   0
 }
 
-// The else arm of `condIx` opens here: lift what its then arm retired below the depth it opened
-// at and return those slots, for `narrowElseRelift`; empty when its then arm has not opened.
+// The else arm of `condIx` opens here: lift what the then arm retired below the depth it opened
+// at. Returns the slots to retire again when the else arm closes (`narrowElseHold`); empty when
+// the then arm retired nothing or exits, which makes the lift last past the `if`.
 export function narrowElseLift(condIx: i32): i32[] {
+  const out = armRetired(condIx)
+  if out.length == 0 { return out }
+  unmaskNarrow(out)
+  if thenArmExits(condIx) { return [] }
+  out
+}
+
+// The code after `condIx`'s then arm, which has no else, opens here: when that arm exits, lift
+// for good what it retired below the depth it opened at.
+export function narrowExitLift(condIx: i32) {
+  const out = armRetired(condIx)
+  if out.length > 0 && thenArmExits(condIx) { unmaskNarrow(out) }
+  0
+}
+
+// The slots the then arm of `condIx` retired below the depth it opened at, consuming its open
+// mark; empty when it did not open at this depth.
+function armRetired(condIx: i32): i32[] {
   const out: i32[] = []
   if condIx < 0 { return out }
   const lm = armOpenLog[condIx] ?? -1
@@ -293,14 +312,51 @@ export function narrowElseLift(condIx: i32): i32[] {
     if s < top && narrowRetired[s] == 1 && !i32ListHas(out, s) { out.push(s) }
     i = i + 1
   }
-  unmaskNarrow(out)
   out
 }
 
-// Retire again the slots `narrowElseLift` lifted.
-export function narrowElseRelift(slots: i32[]) {
-  for s in slots { narrowRetireSlot(s) }
+function thenArmExits(condIx: i32): boolean {
+  const ifIx = ifStmtOfCond(condIx)
+  if ifIx < 0 { return false }
+  const st = P.nodes[ifIx]
+  if st is IfStmt { return stmtAlwaysExits(st.ifThen) }
+  false
+}
+
+// The else arm that lifted `slots` holds stack slot `at`: rewinding the stack to `at` or below
+// closes the arm and retires them again.
+export function narrowElseHold(at: i32, slots: i32[]) {
+  elseHoldAt.push(at)
+  elseHoldSlots.push(slots)
   0
+}
+
+// The stack rewinds to depth `n`: close every held else arm at or above it.
+export function narrowElseRestore(n: i32) {
+  while elseHoldAt.length > 0 && elseHoldAt[elseHoldAt.length - 1] >= n {
+    elseHoldAt.pop()
+    const slots = elseHoldSlots.pop() ?? []
+    for s in slots {
+      if s < n { narrowRetireSlot(s) }
+    }
+  }
+  0
+}
+
+// The held else arms, innermost last: the slot each holds and the slots it lifted.
+let elseHoldAt: i32[] = []
+let elseHoldSlots: i32[][] = []
+// Per `if` statement's condition node, the statement, from a scan of the arena up to `ifScanned`.
+let ifOfCond: {[i32]: i32} = Map()
+let ifScanned = 0
+
+function ifStmtOfCond(condIx: i32): i32 {
+  while ifScanned < P.nodes.length {
+    const n = P.nodes[ifScanned]
+    if n is IfStmt { ifOfCond[n.ifCond] = ifScanned }
+    ifScanned = ifScanned + 1
+  }
+  ifOfCond[condIx] ?? -1
 }
 
 // Forget the journal with the stack it describes.
@@ -308,6 +364,10 @@ function narrowArmReset() {
   narrowRetireLog = []
   armOpenLog = Map()
   armOpenTop = Map()
+  elseHoldAt = []
+  elseHoldSlots = []
+  ifOfCond = Map()
+  ifScanned = 0
   0
 }
 
