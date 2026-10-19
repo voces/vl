@@ -11,7 +11,7 @@ import {
 } from "./check_nj_join"
 import { primTyIxOfName } from "./check_decl_scan"
 import { canonUnionMemberTysOf } from "./check_program"
-import { valueAtomKind } from "./check_ty_rep"
+import { canonUnionKeyAtomOfTy, valueAtomKind } from "./check_ty_rep"
 import {
   T,
   TyArray,
@@ -26,6 +26,7 @@ import {
   TyUnion,
   TyVar,
   cUserTypes,
+  tyIsLitUnionOrLit,
   tySame,
 } from "./check_types"
 import {
@@ -93,7 +94,7 @@ import {
   tyTopIndexOf,
   unionMemberCount,
 } from "./tyname"
-import { primNameOf } from "./tyquery"
+import { flattenVariantsInto, primNameOf } from "./tyquery"
 
 // The arena type the narrowing at stack slot `i` binds — see `narrowSlotTy`. Exported for the
 // emitter's narrowed-arm consumers, which ask it of the slot `narrowSlotOf` returned.
@@ -314,6 +315,25 @@ export function unionTakesAtomAsStrOf(name: string): boolean {
   const atoms: string[] = []
   unionMemberAtomsOf(name, atoms)
   atomsTakeAtomAsStr(atoms)
+}
+
+// `unionTakesAtomAsStr` asked of union type `ty`'s canonical members rather than a spelling, so
+// an alias arm counts at every depth: a literal-union or `string` member answers true, and a lone
+// member or a literal union beside `null` alone (the atom niche) answers false.
+export function tyTakesAtomAsStr(ty: i32): boolean {
+  const tys: i32[] = []
+  if !canonUnionMemberTysOf(ty, tys) { return false }
+  let str = false
+  let nul = false
+  let lits = 0
+  for m in tys {
+    if m < 0 { nul = true }
+    else if tyIsLitUnionOrLit(m) { lits = lits + 1 }
+    else if primNameOf(m) == "string" { str = true }
+  }
+  if tys.length == 1 { return str }
+  if tys.length == 2 && nul && lits == 1 { return false }
+  str || lits > 0
 }
 
 // The number of members of `name`: a bound row's recorded count, else the members `name`
@@ -633,8 +653,60 @@ export function isUNameABAt(
   if ty >= 0 { d = unRowOfTyAB(site, ty) }
   if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, ty) }
   if ty < 0 { return nameKeyRow(name) >= 0 }
-  if d >= 0 || unSiteWideHit(site, ty) { return true }
+  if d >= 0 || unSiteWideHit(site, ty) || unRowOfCanonMembers(ty) >= 0 {
+    return true
+  }
   own && canonUnionKeyOfTy(ty) < 0 && nameKeyRow(name) >= 0
+}
+
+// The row keyed by the sequence of union `ty`'s canonical members, or -1: the spelling canon
+// gives the type, which its own nominal key misses when it nests a union (`K | (L | i32)`
+// keys apart from the `string | i32` row its canon spelling minted). A repeated member declines,
+// since a positional member set (`i32 | string | string`) is never folded onto a deduplicated row.
+function unRowOfCanonMembers(ty: i32): i32 {
+  if !tyNestsValueUnion(ty) { return -1 }
+  const tys: i32[] = []
+  if !canonUnionMemberTysOf(ty, tys) || tys.length < 2 { return -1 }
+  const own: i32[] = []
+  flattenVariantsInto(ty, own)
+  let i = 0
+  while i < own.length {
+    let j = i + 1
+    while j < own.length {
+      if tySame(own[i], own[j]) { return -1 }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  let s = ""
+  for m in tys {
+    let a = "null"
+    if m >= 0 { a = canonUnionKeyAtomOfTy(m) }
+    if a == "" { return -1 }
+    if s != "" { s = s + "|" }
+    s = s + a
+  }
+  unRowOfKeyId(canonUnionKeyOfName(s))
+}
+
+// Whether union `ty` has a direct member that is itself a union other than a literal union, or
+// two literal-union members, which canon spells as one run.
+function tyNestsValueUnion(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  let litUnions = 0
+  if t is TyUnion {
+    for m in t.uMembers {
+      if m >= 0 && m < T.tys.length {
+        const mt = T.tys[m]
+        if mt is TyUnion || mt is TyNullable {
+          if !tyIsLitUnionOrLit(m) { return true }
+          litUnions = litUnions + 1
+        }
+      }
+    }
+  }
+  litUnions >= 2
 }
 
 // One union member against another in the same position: the same type, or two records or
