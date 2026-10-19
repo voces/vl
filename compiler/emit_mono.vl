@@ -100,6 +100,7 @@ import { substNullFoldOffFor, substNullFoldRestore } from "./check_subst_fold"
 import { uniqueGenericDeclNamed } from "./check_generic_args"
 import {
   T,
+  TY_VOID,
   TyArray,
   TyErr,
   TyFunc,
@@ -11029,6 +11030,41 @@ function monoSigFnTyNameRet(sig: string, ret: string): string {
   out + ")=>" + ret
 }
 
+// `monoSigFnTyNameRet` with each function-value pin (`=>k`, which names only a wasm signature)
+// spelled as function type `fty`'s parameter at its position, so the spelling parses as a type;
+// the result is `fty`'s.
+function monoSigFnTyNameAt(sig: string, fty: TyFunc): string {
+  const pins = monoSigPins(sig)
+  const ps = fty.fnParamTypes
+  // The rendered result, then each function-value pin's parameter type, through one render.
+  const names: string[] = []
+  let k = -1
+  while k < ps.length {
+    let s = ""
+    if k < 0 || (pins.length == ps.length && monoPinIsFnSig(pins[k])) {
+      s = tyToEmitName(if k < 0 { fty.fnRet } else { ps[k] })
+    }
+    names.push(s)
+    k = k + 1
+  }
+  if pins.length != ps.length { return monoSigFnTyNameRet(sig, names[0]) }
+  let out = "("
+  k = 0
+  while k < pins.length {
+    if k > 0 { out = out + "," }
+    let pn = pins[k]
+    if names[k + 1] != "" { pn = "(" + names[k + 1] + ")" }
+    out = out + pn
+    k = k + 1
+  }
+  out + ")=>" + names[0]
+}
+
+// Whether pin `pn` is a function value's, which names only a wasm signature (`=>k`).
+function monoPinIsFnSig(pn: string): boolean {
+  pn.length >= 2 && pn.slice(0, 2) == "=>"
+}
+
 // For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
 // after their initializer ends at a capture cell's read (`const r = k[0]`): coerces that cell at
 // `tname` as `monoCoerceWrittenCell` does, and answers true when it finds one.
@@ -12306,20 +12342,24 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     }
     if ft < 0 && monoLastInstFe >= 0 {
       const st = monoPinSubTyOf(nodeTyIxOf(e), fnStmts[monoLastInstFe])
-      if monoTyConcreteFn(st) { ft = st }
+      if monoTyClosedFn(st) { ft = st }
     }
     const et = nodeTyIxOf(e)
-    if ft < 0 && monoTyConcreteFn(et) { ft = et }
+    if ft < 0 && monoTyClosedFn(et) { ft = et }
     // An instance whose pins bind none of the holes its recorded type names: read `ann`'s parameters.
     if ft < 0 && holeLam { ft = monoHoleLamAtAnnTy(et0, ann) }
   }
-  if !monoTyConcreteFn(ft) { return 0 }
+  // A pin that is itself a function value names only a wasm signature, so a hole function's
+  // instance there keeps its hole: the slot's pinned parameter types and the element's result
+  // at them give the type, as a list literal handed to the parameter gets it (D6886).
+  if ft < 0 { ft = monoListSlotPinnedFnTy(at, lit.arrElems) }
+  if !monoTyClosedFn(ft) { return 0 }
   const fty = T.tys[ft]
   if !(fty is TyFunc) { return 0 }
   // The pin's own parameter spelling, from which each instance is built, in the canonical
   // `(p)=>r` form a pin spelling is compared in (D6602).
   const lt = mkArrayTy(ft)
-  const fnm = monoSigFnTyNameRet(pins[0] + ";", tyToEmitName(fty.fnRet))
+  const fnm = monoSigFnTyNameAt(pins[0] + ";", fty)
   d.letType = synthTypeRefTy("(" + fnm + ")[]", -1, lt)
   monoArenaTouch()
   nodeTyRecord(d.letInit, lt)
@@ -12336,6 +12376,34 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     }
   }
   0
+}
+
+// Whether `t` is a function type reaching neither a type variable nor an inference hole.
+function monoTyClosedFn(t: i32): boolean {
+  monoTyConcreteFn(t) && !tyReachesHole(t, 16)
+}
+
+// The function type every element of `elems` takes at the closed parameter types the flow table
+// pins slot `e` of declaration `at` at, with the elements' one result there; -1 when the pins,
+// an element or the results do not close or agree.
+function monoListSlotPinnedFnTy(at: i32, elems: i32[]): i32 {
+  const qs: i32[] = []
+  const ePath: string[] = ["e"]
+  if !fnFlowDeclPathAgreedPinTys(at, ePath, qs) { return -1 }
+  for q in qs {
+    if tyHasTyVar(q) { return -1 }
+  }
+  let ft = -1
+  for el in elems {
+    const ex = monoOpenFnArgDecl(el)
+    if ex < 0 { return -1 }
+    const r = monoFnDeclRetAt(ex, qs)
+    if r < 0 { return -1 }
+    const et = mkFuncTy(qs, r)
+    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return -1 }
+    ft = et
+  }
+  ft
 }
 
 // The function type a hole lambda typed `et` takes when instanced at the parameters `ann` spells:
@@ -12547,6 +12615,125 @@ function monoNoteInertInit(d: LetDecl, at: i32, ctx: i32) {
   0
 }
 
+// Records the generic function names in value `v` that function `fx` returns when its result is
+// inert at every call (`monoFnResultIsInert`), as `monoNoteInertInit` does a binding's (D6882).
+function monoNoteInertRet(v: i32, fx: i32) {
+  if v < 0 { return 0 }
+  const xs: i32[] = []
+  monoGenericValuesIn(v, xs, 0)
+  if xs.length == 0 || !monoFnResultIsInert(fx, 0) { return 0 }
+  for x in xs {
+    if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
+  }
+  0
+}
+
+// Whether every read of un-annotated-result function declaration `fx` is the callee of a call
+// whose result is dropped by a statement that is not a block's last, initializes an un-annotated
+// binding whose uses are inert (`monoBindingUsesAreInert`), or is returned by a function whose
+// result is inert in turn. An exported function's host reads it.
+function monoFnResultIsInert(fx: i32, depth: i32): boolean {
+  if depth > 8 || fx < 0 || fx >= P.nodes.length { return false }
+  const f = P.nodes[fx]
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnName == "" { return false }
+  if monoNameIsExported(f.fnName) { return false }
+  const stack: i32[] = []
+  const ok: i32[] = []
+  for st in monoProgStmts {
+    stack.push(st)
+    monoDroppedCallee(st, ok)
+  }
+  const none: string[] = []
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Block {
+        let k = 0
+        while k + 1 < n.blkStmts.length {
+          monoDroppedCallee(n.blkStmts[k], ok)
+          k = k + 1
+        }
+      }
+      if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
+        const c = monoCallCalleeOf(n.letInit)
+        if (
+          monoNamesDecl(c, f.fnName, fx)
+          && monoBindingUsesAreInert(
+            monoTopFrameOf(ix),
+            n.letName,
+            ix,
+            none,
+            depth + 1,
+          )
+        ) {
+          ok.push(c)
+        }
+      }
+      if n is RetStmt {
+        const c = monoCallCalleeOf(n.retArg)
+        if (
+          monoNamesDecl(c, f.fnName, fx)
+          && monoFnResultIsInert(monoTopFrameOf(ix), depth + 1)
+        ) {
+          ok.push(c)
+        }
+      }
+      if n is FuncDecl && n.fnBody >= 0 {
+        const b = P.nodes[n.fnBody]
+        if b is Block && b.blkStmts.length > 0 {
+          const c = monoCallCalleeOf(b.blkStmts[b.blkStmts.length - 1])
+          if (
+            monoNamesDecl(c, f.fnName, fx)
+            && monoFnResultIsInert(ix, depth + 1)
+          ) {
+            ok.push(c)
+          }
+        }
+      }
+      if n is Ident {
+        if (
+          n.identName == f.fnName
+          && identDeclOf(ix) == fx
+          && !i32ListHas(ok, ix)
+        ) {
+          return false
+        }
+      }
+      const body = monoNestedBodyOf(ix)
+      if body >= 0 { stack.push(body) }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  true
+}
+
+// Whether `c` is an identifier `name` that resolves to declaration `decl`.
+function monoNamesDecl(c: i32, name: string, decl: i32): boolean {
+  if c < 0 || c >= P.nodes.length { return false }
+  const n = P.nodes[c]
+  n is Ident && n.identName == name && identDeclOf(c) == decl
+}
+
+// Appends to `out` the callee name of statement `st` when it is a call by name.
+function monoDroppedCallee(st: i32, out: i32[]) {
+  const c = monoCallCalleeOf(st)
+  if c >= 0 { out.push(c) }
+  0
+}
+
+// The callee identifier of call `v`, through parentheses, or -1.
+function monoCallCalleeOf(v: i32): i32 {
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const x = unwrapParen(v)
+  if x < 0 { return -1 }
+  const n = P.nodes[x]
+  if !(n is Call) { return -1 }
+  const c = unwrapParen(n.callFn)
+  if c < 0 || !(P.nodes[c] is Ident) { return -1 }
+  c
+}
+
 // The properties of value `v` whose read cannot reach a generic function in it: a list's
 // `length`, or a record literal's fields that hold none. A record's `length` is a field (D4123).
 function monoInertProps(v: i32): string[] {
@@ -12625,6 +12812,16 @@ function monoBindingUsesAreInert(
     const b = monoNestedBodyOf(fx)
     if b < 0 { return false }
     stack.push(b)
+    const bn = P.nodes[b]
+    if bn is Block && bn.blkStmts.length > 0 {
+      monoInertRetLeaves(
+        bn.blkStmts[bn.blkStmts.length - 1],
+        name,
+        fx,
+        lens,
+        depth,
+      )
+    }
   } else {
     for st in monoProgStmts { stack.push(st) }
   }
@@ -12638,7 +12835,13 @@ function monoBindingUsesAreInert(
       if n is BinExpr {
         if n.binOp == "=" { lens.push(n.binLeft) }
       }
-      if n is Call { monoFnlessArgsOf(n, lens) }
+      if n is Call {
+        monoFnlessArgsOf(n, lens)
+        monoInertParamArgsOf(n, name, lens, depth + 1)
+      }
+      if n is RetStmt && fx >= 0 && monoTopFrameOf(ix) == fx {
+        monoInertRetLeaves(n.retArg, name, fx, lens, depth)
+      }
       if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
         const held: i32[] = []
         monoNameLeavesIn(n.letInit, name, held, 0)
@@ -12654,7 +12857,7 @@ function monoBindingUsesAreInert(
         if (
           n.identName == name
           && !i32ListHas(lens, ix)
-          && monoReadIsBinding(ix, fx, decl)
+          && (monoReadIsBinding(ix, fx, decl) || identDeclOf(ix) == decl)
         ) {
           return false
         }
@@ -12665,6 +12868,23 @@ function monoBindingUsesAreInert(
     }
   }
   true
+}
+
+// Appends to `out` each read of `name` in value `v` that function `fx` returns, when every caller
+// of `fx` drops or inertly holds its result (`monoFnResultIsInert`).
+function monoInertRetLeaves(
+  v: i32,
+  name: string,
+  fx: i32,
+  out: i32[],
+  depth: i32,
+) {
+  if v < 0 || v >= P.nodes.length { return 0 }
+  const held: i32[] = []
+  monoNameLeavesIn(v, name, held, 0)
+  if held.length == 0 || !monoFnResultIsInert(fx, depth + 1) { return 0 }
+  for h in held { out.push(h) }
+  0
 }
 
 // Appends to `out` each read of `name` in value `v`, through parentheses, list elements and
@@ -12701,6 +12921,55 @@ function monoFnlessArgsOf(n: Call, out: i32[]) {
     i = i + 1
   }
   0
+}
+
+// Appends to `out` each argument of call `n` reading `name`, delivered to an un-annotated
+// parameter of the function declaration its callee names, when every use of that parameter in
+// the callee is inert in turn (`monoBindingUsesAreInert`): the callee never reads a function out
+// of it (D6881).
+function monoInertParamArgsOf(n: Call, name: string, out: i32[], depth: i32) {
+  if depth > 8 || hasNamedArgs(n.callArgNames) { return 0 }
+  const cd = monoCalleeDeclOf(n)
+  if cd < 0 { return 0 }
+  let i = 0
+  while i < n.callArgs.length {
+    const a = unwrapParen(n.callArgs[i])
+    if (
+      a >= 0
+      && monoIsIdentNamed(a, name)
+      && monoParamUsesAreInert(cd, i, depth)
+    ) {
+      out.push(a)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Whether node `a` is an identifier spelled `name`.
+function monoIsIdentNamed(a: i32, name: string): boolean {
+  const n = P.nodes[a]
+  n is Ident && n.identName == name
+}
+
+// The function declaration call `n`'s callee names directly, or -1.
+function monoCalleeDeclOf(n: Call): i32 {
+  const f = unwrapParen(n.callFn)
+  if f < 0 || !(P.nodes[f] is Ident) { return -1 }
+  const d = identDeclOf(f)
+  if d < 0 || d >= P.nodes.length || !(P.nodes[d] is FuncDecl) { return -1 }
+  d
+}
+
+// Whether parameter `i` of function declaration `fd` is un-annotated, has no default, and every
+// use of it in `fd`'s body is inert (`monoBindingUsesAreInert`).
+function monoParamUsesAreInert(fd: i32, i: i32, depth: i32): boolean {
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
+  const p = P.nodes[f.fnParams[i]]
+  if !(p is Param) || p.parType >= 0 || p.parDefault >= 0 { return false }
+  const none: string[] = []
+  monoBindingUsesAreInert(fd, p.parName, f.fnParams[i], none, depth)
 }
 
 // The refusal for a list of generic functions whose calls give it no one function type.
@@ -14504,22 +14773,7 @@ function monoOpenFnListPin(
   if !(T.tys[la.aElem] is TyFunc) || !tyHasTyVar(la.aElem) { return "" }
   const al = P.nodes[ax]
   if !(al is ArrayLit) || al.arrElems.length == 0 { return "" }
-  const qs: i32[] = []
-  const ePath: string[] = ["e"]
-  if !fnFlowDeclPathAgreedPinTys(dn.fnParams[i], ePath, qs) { return "" }
-  for q in qs {
-    if tyHasTyVar(q) { return "" }
-  }
-  let ft = -1
-  for el in al.arrElems {
-    const ex = monoOpenFnArgDecl(el)
-    if ex < 0 { return "" }
-    const r = monoFnDeclRetAt(ex, qs)
-    if r < 0 { return "" }
-    const et = mkFuncTy(qs, r)
-    if ft >= 0 && sigKeyOfTy(et) != sigKeyOfTy(ft) { return "" }
-    ft = et
-  }
+  const ft = monoListSlotPinnedFnTy(dn.fnParams[i], al.arrElems)
   if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
   // Each element is delivered at that type, a hole function's name as a direct argument is
   // (`monoFnPinAt`).
@@ -14785,6 +15039,91 @@ function monoHoleManyPinsFail(par: string, callee: string): i32 {
   )
 }
 
+// The pin for parameter `i` of template `oDecl` handed `argIx`, a hole function by name no call
+// instances and whose `i32` default cannot build (it calls a hole parameter), when every use
+// of the parameter is inert: the `() -> void` of the stub the function prunes to (D6881). ""
+// otherwise; `tyOut[0]` takes the type.
+function monoInertParamStubPin(
+  oDecl: i32,
+  argIx: i32,
+  i: i32,
+  tyOut: i32[],
+): string {
+  const a = unwrapParen(argIx)
+  if oDecl < 0 || a < 0 || !(P.nodes[a] is Ident) || !monoCalleeIsGeneric(a) {
+    return ""
+  }
+  const fe = fnIndexOfNode(a)
+  if fe < 0 || fe >= monoOrigNode.length || monoInstantiatedAny(fe) {
+    return ""
+  }
+  if !monoCallsHoleParam(monoOrigNode[fe]) { return "" }
+  if !monoParamUsesAreInert(oDecl, i, 0) { return "" }
+  const noPs: i32[] = []
+  const st = mkFuncTy(noPs, TY_VOID)
+  const k = sigKeyOfTy(st)
+  if k == "" { return "" }
+  if !i32ListHas(monoInertValues, a) { monoInertValues.push(a) }
+  monoInertArgAt.push(a)
+  monoInertArgFe.push(fe)
+  tyOut[0] = st
+  "=>" + k
+}
+
+// Whether function declaration `fd`'s body calls one of its un-annotated parameters.
+function monoCallsHoleParam(fd: i32): boolean {
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) || f.fnBody < 0 { return false }
+  const stack: i32[] = [f.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop() ?? -1
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is Call {
+        const c = unwrapParen(n.callFn)
+        const nm = monoIdentNameOf(c)
+        for pi in f.fnParams {
+          const p = P.nodes[pi]
+          if p is Param {
+            if p.parType < 0 && p.parName == nm && identDeclOf(c) == pi {
+              return true
+            }
+          }
+        }
+      }
+      for ch in nodeChildren(ix) { stack.push(ch) }
+    }
+  }
+  false
+}
+
+// Each argument `monoInertParamStubPin` pinned at the stub, and the function it names.
+let monoInertArgAt: i32[] = []
+let monoInertArgFe: i32[] = []
+
+// The refusal for each `monoInertParamStubPin` argument whose function the prune did not stub:
+// another use instanced or read it, so the pinned `() -> void` is not its signature.
+function monoInertArgsStubbed(): i32 {
+  let i = 0
+  while i < monoInertArgAt.length {
+    if !i32ListHas(monoStubSlots, monoInertArgFe[i]) {
+      const n = P.nodes[monoInertArgAt[i]]
+      let nm = ""
+      if n is Ident { nm = n.identName }
+      return emitFailAt(
+        "emitProgram: monomorphize: `"
+          + nm
+          + "` is handed to a parameter nothing calls and is also used where it needs a "
+          + "signature, so the two uses have no one type — annotate its parameters",
+        monoInertArgAt[i],
+      )
+    }
+    i = i + 1
+  }
+  0
+}
+
 // The refusal for a parameter `par` of `callee` no argument pin closes.
 function monoArgTyFail(par: string, callee: string): i32 {
   emitFail(
@@ -14949,6 +15288,11 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               const flTy: i32[] = [0 - 1]
               an = monoOpenFnListPin(oDecl, args[i], i, ctx, flTy)
               anTy = flTy[0]
+            }
+            if an == "" {
+              const inTy: i32[] = [0 - 1]
+              an = monoInertParamStubPin(oDecl, args[i], i, inTy)
+              anTy = inTy[0]
             }
             if an == "" { an = monoArgPinName(args[i], ctx) }
             if an == "" {
@@ -16234,6 +16578,7 @@ function monoWalk(ix: i32, ctx: i32) {
       if cf is FuncDecl {
         if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
         if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
+        if cf.fnRet < 0 { monoNoteInertRet(n.retArg, ctx) }
       }
     }
     return monoWalk(n.retArg, ctx)
@@ -16515,6 +16860,7 @@ function monoWalkFnBody(fnIx: i32) {
       if b is Block && b.blkStmts.length > 0 {
         const tail = b.blkStmts[b.blkStmts.length - 1]
         if monoCoerceRetAtPin(tail, fnIx) < 0 { return -1 }
+        monoNoteInertRet(tail, fnIx)
       }
     }
     return monoWalk(fn.fnBody, fnIx)
@@ -18262,6 +18608,8 @@ export function monomorphize(stmts: i32[]) {
   monoStubSlots = []
   monoInertValues = []
   monoInertCalled = []
+  monoInertArgAt = []
+  monoInertArgFe = []
   monoFieldReadTys = Map()
   monoLastInstFe = -1
   monoFnFieldTwinRow = Map()
@@ -18561,7 +18909,7 @@ function monoPruneTemplates(nDecl: i32) {
     }
     gp = gp + 1
   }
-  0
+  monoInertArgsStubbed()
 }
 
 // Whether the nested function or `const`-bound lambda in slot `gp` is never called: it, or a
