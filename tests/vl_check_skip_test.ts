@@ -215,6 +215,7 @@ export function grow(): void { box.w = box.w + 1 }
 export const N = 16
 export function cdflt(n: i32 = N): i32 { return n }
 export function sdflt(n: i32, k: f64 = -0.5, s: string = "x", b: boolean = true): f64 { return k }
+export function ndflt(sh: Shape | null = null): i32 { return 1 }
 export const TAG = "t"
 export let flag = false
 export let mode = "a"
@@ -390,6 +391,14 @@ const CASES: Case[] = [
     from: "return n }\nexport let",
     to: "return n + 1 }\nexport let",
     uses: `import { dflt, sdflt } from "./lib"\nprint(dflt())\nprint(sdflt(2))\n`,
+  },
+  {
+    // A `null` default is typed by the declaration's check as well.
+    name: "a null-defaulted param body edit",
+    want: "serve",
+    from: "Shape | null = null): i32 { return 1 }",
+    to: "Shape | null = null): i32 { return 2 }",
+    uses: `import { ndflt } from "./lib"\nprint(ndflt())\n`,
   },
   {
     name: "a defaulted param loses its default",
@@ -781,9 +790,9 @@ const CASES: Case[] = [
       'import { b4, bump } from "./lib"\nif b4 != null {\n  bump()\n  const k4: i32 = b4\n  print(k4)\n}\n',
   },
   {
+    // Nothing the adoption reads moved: no occurrence of `mk` in S, nor its body.
     name: "a served call is a second site of a fresh builder",
-    want: "decline",
-    why: "fresh",
+    want: "serve",
     from: "n * 2",
     to: "n * 3",
     libUses:
@@ -802,7 +811,7 @@ const CASES: Case[] = [
   {
     name: "a lib call starts delivering a fresh builder to a wider record",
     want: "decline",
-    why: "fresh",
+    why: "interface",
     from: "print(3)",
     to: "takeW(mk())",
     libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\n",
@@ -810,15 +819,14 @@ const CASES: Case[] = [
   },
   {
     name: "a lib call stops delivering a fresh builder to a wider record",
-    want: "decline",
-    why: "fresh",
+    want: "serve",
     from: "takeW(mk())",
     to: "print(3)",
     libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
     uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
   },
   {
-    // `mk`'s site count is read by every site's check, so lib losing a site moves main's result.
+    // Main's refusal read `mk`'s site count, which lib's occurrences move.
     name: "a lib call stops being a second site of a fresh builder",
     want: "decline",
     why: "fresh",
@@ -827,6 +835,45 @@ const CASES: Case[] = [
     libUses: "export function mk() { { f: 4 } }\nexport function other(): void { const b = mk(); print(b.f + 1) }\n",
     uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
     also: ["lib.vl", "const b = mk(); print(b.f + 1)", "print(5)"],
+  },
+  {
+    name: "lib edits elsewhere while main keeps lib's builder",
+    want: "serve",
+    from: "print(3)",
+    to: "print(4)",
+    libUses: "export function mk() { { f: 4 } }\n",
+    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+  },
+  {
+    // The builder's declaring statement is an input: a leaf that becomes a binding is kept.
+    name: "lib's builder leaf becomes a binding",
+    want: "decline",
+    why: "fresh",
+    from: "{ { f: 4 } }",
+    to: "{ const t = { f: 4 }; t }",
+    libUses: "export function mk() { { f: 4 } }\n",
+    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+  },
+  {
+    // D6750: an occurrence named like the builder is a site count S's check reads.
+    name: "lib gains a value use named like lib2's builder",
+    want: "decline",
+    why: "fresh",
+    from: "function quiet",
+    to: "function zz(mk: i32): void { print(mk) }\nfunction quiet",
+    extra: { "lib2.vl": "export function mk() { { f: 4 } }\n" },
+    uses: 'import { mk } from "./lib2"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+  },
+  {
+    // D6751: lib starts handing on, at its own type, a binding main's delivery keeps.
+    name: "lib hands on a kept binding main delivers to a wider record",
+    want: "decline",
+    why: "fresh",
+    badWhy: "decor",
+    from: "function quiet",
+    to: "export function hand(): void { let w = { f: 1, g: { h: 1, k: 2 } }; w = q2; print(w.f) }\nfunction quiet",
+    libUses: "export const pk = { f: 4, g: { h: 1, k: 2 } }\nconst q2 = pk\n",
+    uses: 'import { pk } from "./lib"\nlet vk = { f: 1.5, g: { h: 1 } }\nvk = pk\nprint(vk.f)\n',
   },
   {
     // Lib is in S only as mid's import, and a generic main calls from it closes over nothing moved.
@@ -1043,8 +1090,12 @@ Deno.test({
       // `IH_NO_REACH_TOKENS` drops a reach row's signature tokens, which alone spell a default:
       // the checked type renders the same with it or without.
       ["a defaulted param loses its default", 16777216],
-      // `IH_NO_FRESH` hides the builder whose site count every site's check reads.
-      ["a lib call stops being a second site of a fresh builder", 65536],
+      // `SK_NO_FRESH_BODY` drops a builder's declaring statement, `SK_NO_FRESH_OCC` its
+      // occurrences in S, and `SK_NO_FRESH_SPLIT` the kept-or-own split of its deliveries.
+      ["lib's builder leaf becomes a binding", 65536],
+      ["lib gains a value use named like lib2's builder", 1073741824],
+      ["a lib call stops being a second site of a fresh builder", 1073741824],
+      ["lib hands on a kept binding main delivers to a wider record", -2147483648],
       // `SK_NO_KEPT_SRC | IH_NO_CROSS` keeps a bank across a generic whose closure moved, with
       // the reach below the origin dropped; dropping the reach alone still declines `demand`.
       ["a generic called from a module S only imports, over a moved closure", 134217728 | 8192],

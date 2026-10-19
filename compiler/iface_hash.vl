@@ -47,7 +47,6 @@ const IH_NO_TOKEN_NAMES = 4096
 const IH_NO_CROSS = 8192
 const IH_NO_AMBIENT = 16384
 const IH_NO_LIVE = 32768
-const IH_NO_FRESH = 65536
 const IH_NO_DECOR = 131072
 const IH_NO_IMPORT_MAP = 262144
 const IH_NO_AMB_FIELDS = 524288
@@ -148,13 +147,12 @@ let ihByAny: {[string]: i32[]} = Map()
 let ihExpStamp: i32[] = []
 let ihCalStamp: i32[] = []
 let ihStamp = 0
-let ihFreshHit = false
 let ihImpAt: {[string]: i32} = Map()
 let ihImpRowsOf: i32[][] = []
 // The mask `ihTokDigests` last folded under, or -1 before it runs.
 let ihDigMask = -1
 // Per statement, built on first reach: its exposed and callee successors as ranges of
-// `ihSucc`, and its exposed row with whether that row is a fresh builder.
+// `ihSucc`, and its exposed row.
 let ihSucc: i32[] = []
 let ihSuccMark: i32[] = []
 let ihSuccGen = 0
@@ -164,7 +162,6 @@ let ihCalLo: i32[] = []
 let ihCalHi: i32[] = []
 let ihExpDone: boolean[] = []
 let ihExpMemo: i32[] = []
-let ihExpFresh: boolean[] = []
 // Per module, the import adjacency and, built on first reach, the modules below it.
 let ihAdj: i32[][] = []
 let ihDownMemo: boolean[][] = []
@@ -435,7 +432,7 @@ function ihMentions(
 }
 
 // The source spelling of a merged top-level name: `name$mN` without its suffix.
-function ihSourceName(name: string): string {
+export function ihSourceName(name: string): string {
   let i = name.length - 1
   while i > 0 {
     if name[i] == '$' && i + 1 < name.length && name[i + 1] == 'm' {
@@ -1359,7 +1356,6 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
   ihCalHi = []
   ihExpDone = []
   ihExpMemo = []
-  ihExpFresh = []
   ihAdj = []
   ihDownMemo = []
   if ihDigMask != ihDrop { ihTokDigests() }
@@ -1374,7 +1370,6 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
     ihCalHi.push(-1)
     ihExpDone.push(false)
     ihExpMemo.push(0)
-    ihExpFresh.push(false)
     if ihStKind[s] != IH_ST_ROOT {
       const prev = ihByAny[ihStName[s]] ?? []
       prev.push(s)
@@ -1446,23 +1441,6 @@ export function ihTokDigests(): i32 {
 function ihLive(s: i32): boolean {
   if ihOn(IH_NO_LIVE) || !ihStWrites[s] { return false }
   ihStRefParam[s] || ihStCallHi[s] > ihStCallLo[s]
-}
-
-// Whether a rendered function type returns something other than a scalar.
-function ihFreshRet(shown: string): boolean {
-  let depth = 0
-  let i = 0
-  while i + 1 < shown.length {
-    const c = shown[i]
-    if c == '(' || c == '{' || c == '[' || c == '<' { depth = depth + 1 }
-    if c == ')' || c == '}' || c == ']' { depth = depth - 1 }
-    if c == '>' && (i == 0 || shown[i - 1] != '=') { depth = depth - 1 }
-    if depth == 0 && c == '=' && shown[i + 1] == '>' {
-      return !ihScalarSpelling(shown.slice(i + 2, shown.length))
-    }
-    i = i + 1
-  }
-  false
 }
 
 // The modules `o` reaches through its imports, itself included, kept per `o`.
@@ -1645,10 +1623,7 @@ function ihSuccOf(x: i32) {
 
 // The row an exposed statement gives an importer's reach, kept per statement.
 function ihExpRow(x: i32): i32 {
-  if ihExpDone[x] {
-    if ihExpFresh[x] { ihFreshHit = true }
-    return ihExpMemo[x]
-  }
+  if ihExpDone[x] { return ihExpMemo[x] }
   const m = ihStMod[x]
   let h = ihMixStr(ihMixStr(IH_SEED, ihKeys[m]), ihStName[x])
   if ihLive(x) { h = ihMixInt(h, ihStFull[x]) }
@@ -1662,11 +1637,8 @@ function ihExpRow(x: i32): i32 {
     h = ihMixInt(h, ihStBody[x])
   }
   if ihStCutAny[x] && !ihOn(IH_NO_MENTIONS) { h = ihMixInt(h, ihStMen[x]) }
-  const fresh = ihStCutRet[x] && !ihOn(IH_NO_FRESH) && ihFreshRet(shown)
   ihExpDone[x] = true
   ihExpMemo[x] = h
-  ihExpFresh[x] = fresh
-  if fresh { ihFreshHit = true }
   h
 }
 
@@ -1696,10 +1668,8 @@ function ihCalRow(x: i32): i32 {
 
 // What importer `i`'s check can observe of origin `o` and the modules below it: the
 // statements its imports from `o` name, closed over the names their tokens and checked types
-// spell, then over what their bodies call. `ihReachFresh` after it says whether it met an
-// inferred return that is not a scalar.
+// spell, then over what their bodies call.
 export function ihReachOf(i: i32, o: i32): i32 {
-  ihFreshHit = false
   if i < 0 || o < 0 || i >= ihKeys.length || o >= ihKeys.length { return 0 }
   if ihExpStamp.length != ihStMod.length { return 0 }
   ihStamp = ihStamp + 1
@@ -1753,7 +1723,71 @@ export function ihReachOf(i: i32, o: i32): i32 {
   sum
 }
 
-export function ihReachFresh(): boolean { ihFreshHit }
+// For each builder key (a declaring module's key, a newline, a top-level source name): its
+// declaring statement's tokens at `key + "\n"`, and at `key + "\n" + module key` a digest of
+// the statements of that module (of the modules `only` selects, all when empty) whose tokens
+// spell the name, merged or plain, other than its declaration. A key the tables lack is left out.
+export function ihOccDigests(
+  builders: string[],
+  only: boolean[],
+): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  const want: {[string]: i32[]} = Map()
+  const declOf: i32[] = []
+  const at: {[string]: i32} = Map()
+  let x = 0
+  while x < ihStMod.length {
+    if ihStKind[x] != IH_ST_ROOT {
+      at[ihKeys[ihStMod[x]] + "\n" + ihStName[x]] = x
+    }
+    x = x + 1
+  }
+  let b = 0
+  while b < builders.length {
+    const d = at[builders[b]] ?? -1
+    declOf.push(d)
+    if d >= 0 {
+      out[builders[b] + "\n"] = ihStFull[d]
+      const names = [ihStMerged[d], ihStName[d]]
+      let n = 0
+      while n < names.length {
+        if n == 0 || names[1] != names[0] {
+          const prev = want[names[n]] ?? []
+          prev.push(b)
+          want[names[n]] = prev
+        }
+        n = n + 1
+      }
+    }
+    b = b + 1
+  }
+  x = 0
+  while x < ihStMod.length {
+    const m = ihStMod[x]
+    if only.length == 0 || (m < only.length && only[m]) {
+      const met: {[i32]: boolean} = Map()
+      const skipped: {[i32]: boolean} = Map()
+      let i = ihStLo[x]
+      while i < ihStHi[x] && i < P.toks.length {
+        const t = P.toks[i]
+        if t.kind == "IDENT" {
+          for w in want[t.text] ?? [] {
+            if declOf[w] == x && !skipped.has(w) {
+              skipped[w] = true
+            } else if !met.has(w) {
+              met[w] = true
+              const key = builders[w] + "\n" + ihKeys[m]
+              out[key] = ihMixInt(out[key] ?? IH_SEED, ihStFull[x])
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    x = x + 1
+  }
+  out
+}
 
 // Readers over the last armed module compile, by module table index (0 is the entry).
 export function ifaceHashCount(): i32 { ihOwn.length }

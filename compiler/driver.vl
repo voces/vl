@@ -67,6 +67,7 @@ import {
   LetDecl,
   MatchExpr,
   Member,
+  NullLit,
   NumLit,
   ObjLit,
   OptMember,
@@ -262,6 +263,13 @@ import {
 import { importSpecCharMsg, isStmtKeyword, parseProgram } from "./parser"
 import { parseBankKeep, parseBankOpen, parseBankServe } from "./parse_bank"
 import {
+  recDelivArm,
+  recDelivAt,
+  recDelivDecl,
+  recDelivFlag,
+  recDelivName,
+} from "./check_rec_rows"
+import {
   ifaceHashArm,
   ifaceHashArmed,
   ifaceHashOf,
@@ -276,10 +284,11 @@ import {
   ihImport,
   ihMask,
   ihModule,
+  ihOccDigests,
   ihPlainBinding,
   ihPosHash,
-  ihReachFresh,
   ihReachOf,
+  ihSourceName,
   ihTokDigests,
 } from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
@@ -5074,6 +5083,7 @@ function modCompile(emit: i32): i32 {
   const merged = modMergeRoots(roots, keep)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
+  recDelivArm(banking)
   checkProgram(merged)
   if ifaceHashArmed() { ihFinish() }
   checkMemSharedOrigin()
@@ -5137,8 +5147,12 @@ let skSrcs: string[] = []
 let skHash: i32[] = []
 // Each (importer, origin) pair's reach (`ihReachOf`), keyed by both module keys.
 let skReach: {[string]: i32} = Map()
-// The pairs whose reach met an inferred non-scalar return when banked (`ihReachFresh`).
-let skFresh: {[string]: boolean} = Map()
+// Each fresh value a check delivered, by its declaring module's key and source name
+// (`SK_UNATTRIBUTED` for a delivery it could not place): every module delivering it, with
+// SK_KEPT when one delivery builds it at another storage, SK_OWN when one hands it on at
+// its own, and 4 when one's judgement read its site count. `skOcc` is `ihOccDigests` of those values over every module.
+let skDeliv: {[string]: {[string]: i32}} = Map()
+let skOcc: {[string]: i32} = Map()
 let skMask = 0
 let skPlus: {[i32]: i32}[] = []
 let skStrIdx: {[i32]: i32}[] = []
@@ -5165,7 +5179,8 @@ type SkBank = {
   bSrcs: string[],
   bHash: i32[],
   bReach: {[string]: i32},
-  bFresh: {[string]: boolean},
+  bDeliv: {[string]: {[string]: i32}},
+  bOcc: {[string]: i32},
   bMask: i32,
   bPlus: {[i32]: i32}[],
   bStrIdx: {[i32]: i32}[],
@@ -5207,7 +5222,8 @@ function skSelect(): i32 {
         bSrcs: skSrcs,
         bHash: skHash,
         bReach: skReach,
-        bFresh: skFresh,
+        bDeliv: skDeliv,
+        bOcc: skOcc,
         bMask: skMask,
         bPlus: skPlus,
         bStrIdx: skStrIdx,
@@ -5234,7 +5250,8 @@ function skSelect(): i32 {
       skSrcs = b.bSrcs
       skHash = b.bHash
       skReach = b.bReach
-      skFresh = b.bFresh
+      skDeliv = b.bDeliv
+      skOcc = b.bOcc
       skMask = b.bMask
       skPlus = b.bPlus
       skStrIdx = b.bStrIdx
@@ -5304,14 +5321,21 @@ function skPosOf(): i32[] {
   pos
 }
 
-// Whether every parameter is annotated and any default is a scalar literal: the declaration's
-// check alone types such a default, and a caller reads only its parameter's annotation.
+// Whether every parameter is annotated and any default is a scalar literal or `null`: the
+// declaration's check alone types such a default, and a caller reads only its annotation.
 function skParamsClosed(ps: i32[]): boolean {
   for p in ps {
     const n = P.nodes[p]
     if !(n is Param) { return false }
     if n.parType < 0 { return false }
-    if n.parDefault >= 0 && !skSignedLit(n.parDefault) { return false }
+    const d = n.parDefault
+    if (
+      d >= 0
+      && !skSignedLit(d)
+      && !(d < P.nodes.length && P.nodes[d] is NullLit)
+    ) {
+      return false
+    }
   }
   true
 }
@@ -5381,6 +5405,12 @@ const SK_IF_KEPT = 3
 const SK_NO_KEPT_SRC = 134217728
 const SK_NO_KEPT_DIAG = 268435456
 const SK_NO_KEPT_CALL = 536870912
+const SK_NO_FRESH_BODY = 65536
+const SK_NO_FRESH_OCC = 1073741824
+const SK_NO_FRESH_SPLIT = -2147483648
+const SK_KEPT = 1
+const SK_OWN = 2
+const SK_UNATTRIBUTED = "?"
 
 // Whether a served module rooted at `root` may keep its banked check across an import of generic
 // `merged` from `o`: no module `o`'s check reads moved (`moved`, by module index), the bank holds no
@@ -5578,18 +5608,128 @@ function skEarly(inS: boolean[], tokEnd: i32): boolean {
   true
 }
 
-// Whether a served importer's banked reach into an S module met an inferred non-scalar return, so
-// the check of S would most likely decline `fresh` after it: deciding it here saves that check.
+// Whether S's tokens may move the adoption of a fresh value a served module delivers: its
+// declaration, when in S, or S's statements that spell its name, which the site count reads.
 function skFreshBanked(inS: boolean[]): boolean {
-  const pairs = skPairs()
-  let p = 0
-  while p + 1 < pairs.length {
-    const i = pairs[p]
-    const o = pairs[p + 1]
-    if !inS[i] && inS[o] && skFresh.has(modKeys[i] + "\n" + modKeys[o]) {
+  if skDeliv.has(SK_UNATTRIBUTED) { return true }
+  const mask = ihMask()
+  const watch: string[] = []
+  for key in skDeliv.keys() {
+    const row = skDeliv[key] ?? Map()
+    let served = false
+    for mk in row.keys() {
+      const m = modIndexOfKey(mk)
+      if m < 0 { return true }
+      if !inS[m] { served = true }
+    }
+    if served { watch.push(key) }
+  }
+  if watch.length == 0 { return false }
+  const now = ihOccDigests(watch, inS)
+  for key in watch {
+    const d = modIndexOfKey(key.slice(0, key.indexOf("\n")))
+    const body = key + "\n"
+    if (
+      (mask & SK_NO_FRESH_BODY) == 0
+      && d >= 0
+      && inS[d]
+      && (now.has(body) != skOcc.has(body)
+        || (now[body] ?? 0) != (skOcc[body] ?? 0))
+    ) {
       return true
     }
-    p = p + 2
+    if (mask & SK_NO_FRESH_OCC) == 0 {
+      let m = 0
+      while m < modKeys.length {
+        const k = key + "\n" + modKeys[m]
+        if (
+          inS[m]
+          && (now.has(k) != skOcc.has(k) || (now[k] ?? 0) != (skOcc[k] ?? 0))
+        ) {
+          return true
+        }
+        m = m + 1
+      }
+    }
+  }
+  false
+}
+
+// The module (table index) of node `nd`'s last token, or -1.
+function skNodeMod(nd: i32): i32 {
+  if nd < 0 || nd >= nodeToks.length { return -1 }
+  const tk = nodeToks[nd]
+  if tk < 0 || tk >= P.toks.length { return -1 }
+  modOfTok(tk)
+}
+
+// This check's deliveries of fresh values, keyed as `skDeliv` is.
+function skDelivNow(): {[string]: {[string]: i32}} {
+  const out: {[string]: {[string]: i32}} = Map()
+  let k = 0
+  while k < recDelivDecl.length {
+    const dm = skNodeMod(recDelivDecl[k])
+    const am = skNodeMod(recDelivAt[k])
+    let key = SK_UNATTRIBUTED
+    let at = ""
+    if dm >= 0 && am >= 0 && recDelivName[k] != "" {
+      key = modKeys[dm] + "\n" + ihSourceName(recDelivName[k])
+      at = modKeys[am]
+    }
+    const row: {[string]: i32} = out[key] ?? Map()
+    row[at] = (row[at] ?? 0) | recDelivFlag[k]
+    out[key] = row
+    k = k + 1
+  }
+  out
+}
+
+// After the check of S: whether a fresh value S delivers is also delivered or spelled in a served
+// module, so that S's check counted its sites short, or judged a kept delivery against part of
+// the deliveries that share its record.
+function skFreshSplit(inS: boolean[]): boolean {
+  const mask = ihMask()
+  const now = skDelivNow()
+  if now.has(SK_UNATTRIBUTED) { return true }
+  const counted: string[] = []
+  const keys: string[] = []
+  for key in now.keys() { keys.push(key) }
+  for key in skDeliv.keys() {
+    if !now.has(key) { keys.push(key) }
+  }
+  for key in keys {
+    const cur = now[key] ?? Map()
+    const old = skDeliv[key] ?? Map()
+    let sNow = 0
+    for mk in cur.keys() { sNow = sNow | (cur[mk] ?? 0) }
+    let sOld = 0
+    let sv = 0
+    for mk in old.keys() {
+      const m = modIndexOfKey(mk)
+      if m < 0 { return true }
+      if inS[m] {
+        sOld = sOld | (old[mk] ?? 0)
+      } else {
+        sv = sv | (old[mk] ?? 0)
+      }
+    }
+    if (mask & SK_NO_FRESH_SPLIT) == 0 {
+      const keptMoved = (sOld & SK_KEPT) != (sNow & SK_KEPT)
+      if (sv & SK_KEPT) != 0 && (sNow != 0 || keptMoved) { return true }
+      if (sv & SK_OWN) != 0 && keptMoved { return true }
+    }
+    if (sNow & SK_KEPT) != 0 { counted.push(key) }
+  }
+  if counted.length == 0 || (mask & SK_NO_FRESH_OCC) != 0 { return false }
+  const served: boolean[] = []
+  for x in inS { served.push(!x) }
+  const occ = ihOccDigests(counted, served)
+  for key in counted {
+    let m = 0
+    while m < modKeys.length {
+      if !inS[m] && occ.has(key + "\n" + modKeys[m]) { return true }
+      m = m + 1
+    }
   }
   false
 }
@@ -5674,7 +5814,6 @@ function skSettle(inS: boolean[], roots: i32[]): boolean {
     const o = pairs[p + 1]
     if !inS[i] && inS[o] {
       const now = ihReachOf(i, o)
-      if ihReachFresh() { return skDecline(SK_FRESH) }
       const key = modKeys[i] + "\n" + modKeys[o]
       if !skReach.has(key) || (skReach[key] ?? 0) != now {
         return skDecline(SK_IFACE)
@@ -5682,6 +5821,7 @@ function skSettle(inS: boolean[], roots: i32[]): boolean {
     }
     p = p + 2
   }
+  if skFreshSplit(inS) { return skDecline(SK_FRESH) }
   const pos = skPosOf()
   const fresh = T.diags
   const out: TDiag[] = []
@@ -5918,23 +6058,38 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
   }
   // A served origin's reaches are carried: the check did not read it, and its tokens held.
   const reach: {[string]: i32} = Map()
-  const fresh: {[string]: boolean} = Map()
   const pairs = skPairs()
   let p = 0
   while p + 1 < pairs.length {
     const key = modKeys[pairs[p]] + "\n" + modKeys[pairs[p + 1]]
     if keep.length == 0 || keep[pairs[p + 1]] {
       reach[key] = ihReachOf(pairs[p], pairs[p + 1])
-      if ihReachFresh() { fresh[key] = true }
     } else {
       const held = skReach[key]
       if held != null { reach[key] = held }
-      if skFresh.has(key) { fresh[key] = true }
     }
     p = p + 2
   }
+  // A served module's deliveries are carried: the check did not read it, and its tokens held.
+  const deliv = skDelivNow()
+  if keep.length > 0 {
+    for key in skDeliv.keys() {
+      const old = skDeliv[key] ?? Map()
+      for mk in old.keys() {
+        const om = modIndexOfKey(mk)
+        if om < 0 || !keep[om] {
+          const row: {[string]: i32} = deliv[key] ?? Map()
+          row[mk] = (row[mk] ?? 0) | (old[mk] ?? 0)
+          deliv[key] = row
+        }
+      }
+    }
+  }
+  const watch: string[] = []
+  for key in deliv.keys() { watch.push(key) }
   skReach = reach
-  skFresh = fresh
+  skDeliv = deliv
+  skOcc = ihOccDigests(watch, [])
   skKeyIx = ix
   skEntry = modKeys[0]
   skMask = ihMask()
