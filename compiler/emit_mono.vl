@@ -26,7 +26,7 @@ import {
   nodeTyName,
   nodeTyNestedElemIsBoolPrim,
   nodeTyRecord,
-  nodeTyWidenedRepName,
+  nodeTyWidenedRepTy,
 } from "./check_node_tys"
 import { nodePos } from "./fmt_util"
 import {
@@ -116,6 +116,7 @@ import {
   mixedLitRunAliasOf,
   mkArrayTy,
   mkFuncTy,
+  mkObjTy,
   numLitUnionBaseName,
   structNameOfTy,
   tyArrayElemIx,
@@ -384,6 +385,8 @@ import {
   sFieldElemNameAt,
   sFieldTypeAt,
   structIndexByName,
+  structTyAliasableReset,
+  structTyMarkAliasable,
 } from "./emit_atom_kinds"
 import {
   capMemoNoteEdit,
@@ -2259,19 +2262,17 @@ function monoCloPinTyOfExpr(ix: i32): i32 {
   -1
 }
 
-// One field's type spelling for the shape annotation below: the pinned closure where the
-// value reads one, else the type the checker recorded. "" declines the whole annotation,
-// since a shape missing one field's spelling is not a shape.
-function monoCloPinFieldTyName(ix: i32): string {
+// One field's type for the shape annotation below: the pinned closure where the value reads
+// one, else the type the checker recorded. -1 declines the whole annotation, since a shape
+// missing one field's type is not a shape.
+function monoCloPinFieldTy(ix: i32): i32 {
   const pt = monoCloPinTyOfExpr(ix)
-  if pt >= 0 { return tyToEmitName(pt) }
+  if pt >= 0 { return pt }
   // A literal-typed value widens to its base scalar, the rep the field stores: an annotation
-  // spelling the literal itself names a type the field's own value does not lower as.
-  const wn = nodeTyWidenedRepName(ix)
-  if wn != "" { return wn }
-  const rt = nodeTyIxOf(ix)
-  if rt < 0 { return "" }
-  tyToEmitName(rt)
+  // naming the literal itself is a type the field's own value does not lower as.
+  const wt = nodeTyWidenedRepTy(ix)
+  if wt >= 0 { return wt }
+  nodeTyIxOf(ix)
 }
 
 // The initializer node a container rung may read, or -1: this instance must bind a pin at
@@ -2320,22 +2321,33 @@ function monoCloPinShapeAnn(initIx: i32): i32 {
     if e.objFields.length < 1 { return -1 }
     let anyPin = false
     let txt = "{"
+    const fns: string[] = []
+    const fts: i32[] = []
     let j = 0
     while j < e.objFields.length {
       const f = P.nodes[e.objFields[j]]
       if f is FieldInit {
         if monoCloPinTyOfExpr(f.fiValue) >= 0 { anyPin = true }
-        const ftn = monoCloPinFieldTyName(f.fiValue)
+        const fty = monoCloPinFieldTy(f.fiValue)
+        if fty < 0 { return -1 }
+        const ftn = tyToEmitName(fty)
         if ftn == "" { return -1 }
         if j > 0 { txt = txt + ", " }
         txt = txt + f.fiName + ": " + ftn
+        fns.push(f.fiName)
+        fts.push(fty)
       } else {
         return -1
       }
       j = j + 1
     }
     if !anyPin { return -1 }
-    return synthTypeRef(txt + "}", 0 - 1)
+    // The shape's type is handed over with its spelling, so its closure fields keep their
+    // signatures rather than resolving through a parse of the text. The type is minted
+    // here, so it may share the row of a rep-equal shape interned first.
+    const sty = mkObjTy(fns, fts)
+    structTyMarkAliasable(sty)
+    return synthTypeRefTy(txt + "}", 0 - 1, sty)
   }
   -1
 }
@@ -8750,6 +8762,7 @@ export function monoStateReset() {
   monoPinLetReaches = false
   monoSigCallRet = 0 - 2
   monoTailIf = -1
+  structTyAliasableReset()
   0
 }
 
