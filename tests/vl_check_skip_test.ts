@@ -188,6 +188,7 @@ const REASON = [
   "ambient",
   "fresh",
   "decor",
+  "writer",
 ];
 
 // ── the graph ────────────────────────────────────────────────────────────────
@@ -539,7 +540,7 @@ const CASES: Case[] = [
   {
     name: "a callee main narrows across starts writing the binding",
     want: "decline",
-    why: "interface",
+    why: "writer",
     from: "clear(): void { print(0) }",
     to: "clear(): void { g = null }",
     uses: `import { g, clear } from "./lib"\nconst gv = g\nif g != null {\n  clear()\n  const k: i32 = g\n  print(k)\n}\nprint(gv)\n`,
@@ -781,13 +782,73 @@ const CASES: Case[] = [
   {
     name: "a callee starts calling a writer",
     want: "decline",
-    why: "interface",
+    why: "writer",
     from: "print(3)",
     to: "w4()",
     libUses:
       "export let b4: i32 | null = 1\nfunction w4(): void { b4 = null }\n",
     uses:
       'import { b4, bump } from "./lib"\nif b4 != null {\n  bump()\n  const k4: i32 = b4\n  print(k4)\n}\n',
+  },
+  {
+    // The write questions main asked of `g7` answer as banked.
+    name: "a callee main narrows across keeps its writes",
+    want: "serve",
+    from: "b7.h = 1",
+    to: "b7.h = 2",
+    libUses:
+      "export let b7: { w: i32 | null, h: i32 } = { w: 1, h: 1 }\nexport function g7(): void { b7.h = 1 }\n",
+    uses:
+      'import { b7, g7 } from "./lib"\nif b7.w != null {\n  g7()\n  const k7: i32 = b7.w\n  print(k7)\n}\n',
+  },
+  {
+    name: "a callee main narrows across keeps writing nothing",
+    want: "serve",
+    from: "clear(): void { print(0) }",
+    to: "clear(): void { print(5) }",
+    uses: `import { g, clear } from "./lib"\nif g != null {\n  clear()\n  const k: i32 = g\n  print(k)\n}\n`,
+  },
+  {
+    // D6780: an escaping lib lambda starts writing the binding main narrows across a call.
+    name: "a private lib lambda starts writing a binding main narrows",
+    want: "decline",
+    why: "writer",
+    from: "run8(() => { print(0) })",
+    to: "run8(() => { g = null })",
+    libUses:
+      "function run8(f: () => void): void { f() }\nfunction zz8(): void { run8(() => { print(0) }) }\nexport function noop8(): void { print(1) }\n",
+    uses: `import { g, noop8 } from "./lib"\nif g != null {\n  noop8()\n  const k: i32 = g\n  print(k)\n}\n`,
+  },
+  {
+    name: "a private lib lambda keeps writing nothing main narrows",
+    want: "serve",
+    from: "run8(() => { print(0) })",
+    to: "run8(() => { print(2) })",
+    libUses:
+      "function run8(f: () => void): void { f() }\nfunction zz8(): void { run8(() => { print(0) }) }\nexport function noop8(): void { print(1) }\n",
+    uses: `import { g, noop8 } from "./lib"\nif g != null {\n  noop8()\n  const k: i32 = g\n  print(k)\n}\n`,
+  },
+  {
+    // D6781: lib starts narrowing across a call while a served main function writes and escapes.
+    name: "lib starts narrowing a binding a served escaping function writes",
+    want: "decline",
+    why: "writer",
+    badWhy: "decor",
+    from: "export function noop9(): void { print(1) }\n",
+    to: "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
+    libUses:
+      "export function noop9(): void { print(1) }\nexport function reg9(h: () => void): void { h() }\n",
+    uses: `import { g, reg9 } from "./lib"\nfunction w9(): void { g = null }\nreg9(w9)\n`,
+  },
+  {
+    name: "lib starts narrowing a binding no served function writes",
+    want: "serve",
+    badWhy: "decor",
+    from: "export function noop9(): void { print(1) }\n",
+    to: "export function noop9(): void { print(1) }\nfunction f9(): i32 {\n  if g != null {\n    noop9()\n    const k: i32 = g\n    return k\n  }\n  0\n}\n",
+    libUses:
+      "export function noop9(): void { print(1) }\nexport function reg9(h: () => void): void { h() }\n",
+    uses: `import { g, reg9 } from "./lib"\nfunction w9(): void {\n  let q9 = 1\n  q9 = 2\n  print(q9 + (g ?? 0))\n}\nreg9(w9)\n`,
   },
   {
     // Nothing the adoption reads moved: no occurrence of `mk` in S, nor its body.
@@ -809,9 +870,9 @@ const CASES: Case[] = [
     uses: 'import { mk } from "./lib"\nconst w: { f: f64 } = mk()\nprint(w.f / 8)\n',
   },
   {
+    // Lib's own delivery refuses; main's read of `mk` keeps the type it had.
     name: "a lib call starts delivering a fresh builder to a wider record",
-    want: "decline",
-    why: "interface",
+    want: "serve",
     from: "print(3)",
     to: "takeW(mk())",
     libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\n",
@@ -1060,11 +1121,11 @@ Deno.test({
   name: "a hash missing an ingredient serves an edit it must not",
   ignore: !ENABLED,
   fn() {
-    // `IH_NO_INFERRED_TYPE | IH_NO_MENTIONS` hides a cut return's type, `IH_NO_LIVE |
-    // IH_NO_MENTIONS` what a callee writes.
+    // `IH_NO_INFERRED_TYPE | IH_NO_MENTIONS` hides a cut return's type, `SK_NO_EFFECT` what a
+    // callee writes (the banked write questions are not asked again).
     const witness: [string, number][] = [
       ["inferred-return change", 64 | 16],
-      ["a callee main narrows across starts writing the binding", 32768 | 16],
+      ["a callee main narrows across starts writing the binding", 2048 | 16],
       // `IH_NO_TYPES | IH_NO_MENTIONS` hides both the widened type of a number binding and the
       // body store that widened it; dropping the type alone still declines.
       ["a lib body starts widening a number binding main reads", 8 | 16],
@@ -1083,10 +1144,13 @@ Deno.test({
       ["a lib application of a declared Map spells main's literal record", 67108864],
       ["a lib method typo is near a private main self-function", 4194304],
       ["main declares a getter on a lib type lib reads", 2097152 | 4194304],
-      // `IH_NO_LIVE` cuts a writing body to its mentions, which miss the field it writes.
-      ["a callee's write moves to the narrowed field", 32768],
-      ["a callee's helper write moves to the narrowed field", 32768],
-      ["a callee's alias write moves to the narrowed field", 32768],
+      // `SK_NO_EFFECT` keeps a bank whose write questions about a callee answer differently.
+      ["a callee's write moves to the narrowed field", 2048],
+      ["a callee's helper write moves to the narrowed field", 2048],
+      ["a callee's alias write moves to the narrowed field", 2048],
+      // `SK_NO_WRITER` drops the writer closure of a name a whole-program question asked about.
+      ["a private lib lambda starts writing a binding main narrows", 16],
+      ["lib starts narrowing a binding a served escaping function writes", 16],
       // `IH_NO_REACH_TOKENS` drops a reach row's signature tokens, which alone spell a default:
       // the checked type renders the same with it or without.
       ["a defaulted param loses its default", 16777216],

@@ -47,7 +47,6 @@ const IH_NO_CALLEES = 2048
 const IH_NO_TOKEN_NAMES = 4096
 const IH_NO_CROSS = 8192
 const IH_NO_AMBIENT = 16384
-const IH_NO_LIVE = 32768
 const IH_NO_DECOR = 131072
 const IH_NO_IMPORT_MAP = 262144
 const IH_NO_AMB_FIELDS = 524288
@@ -97,14 +96,13 @@ let ihCalls: string[] = []
 let ihEdgeFrom: i32[] = []
 let ihEdgeTo: i32[] = []
 // A statement's whole token range and its hash, whether it declares something another
-// module's check reads without importing it (`ihAmbientScan`), whether its body assigns or
-// calls a method, and whether a parameter's declared type may hold a reference.
+// module's check reads without importing it (`ihAmbientScan`).
 let ihStLo: i32[] = []
 let ihStHi: i32[] = []
+let ihStCutLo: i32[] = []
+let ihStCutHi: i32[] = []
 let ihStFull: i32[] = []
 let ihStAmb: boolean[] = []
-let ihStWrites: boolean[] = []
-let ihStRefParam: boolean[] = []
 // Ambient keys, per statement `ihAkSt[k]`: a declared name, a method's or getter's name, or one
 // record level's field names, as `ihAkW[ihAkLo[k], ihAkHi[k])`. An ambient statement that no
 // key bounds is wild. `ihDeclsOf` holds each type name's declarations, `ihFv` the words
@@ -146,23 +144,20 @@ let ihByName: {[string]: i32[]} = Map()
 let ihByAny: {[string]: i32[]} = Map()
 // `ihReachOf`'s marks, stamped per call so a call costs its closure, not the table.
 let ihExpStamp: i32[] = []
-let ihCalStamp: i32[] = []
 let ihStamp = 0
 let ihImpAt: {[string]: i32} = Map()
 let ihImpRowsOf: i32[][] = []
 // The mask `ihTokDigests` last folded under, or -1 before it runs.
 let ihDigMask = -1
-// Per statement, built on first reach: its exposed and callee successors as ranges of
-// `ihSucc`, and its exposed row.
+// Per statement, built on first reach: its exposed successors as a range of `ihSucc`, and its
+// exposed row.
 let ihSucc: i32[] = []
 let ihSuccMark: i32[] = []
 let ihSuccGen = 0
-let ihExpLo: i32[] = []
-let ihExpHi: i32[] = []
-let ihCalLo: i32[] = []
-let ihCalHi: i32[] = []
-let ihExpDone: boolean[] = []
-let ihExpMemo: i32[] = []
+let ihQLo: i32[] = []
+let ihQHi: i32[] = []
+let ihQDone: boolean[] = []
+let ihQMemo: i32[] = []
 // Per module, the import adjacency and, built on first reach, the modules below it.
 let ihAdj: i32[][] = []
 let ihDownMemo: boolean[][] = []
@@ -196,6 +191,13 @@ function ihMixInt(h: i32, v: i32): i32 {
   x = ihMixByte(x, (v >> 8) & 255)
   x = ihMixByte(x, (v >> 16) & 255)
   ihMixByte(x, (v >> 24) & 255)
+}
+
+// An order-free digest of a set of texts: its size and the sum of their hashes.
+export function ihTextSetHash(xs: string[]): i32 {
+  let sum = 0
+  for x in xs { sum = sum + ihMixStr(IH_SEED, x) }
+  ihMixInt(sum, xs.length)
 }
 
 function ihMixStr(h: i32, s: string): i32 {
@@ -240,10 +242,10 @@ export function ihBegin(keys: string[]): i32 {
   ihEdgeTo = []
   ihStLo = []
   ihStHi = []
+  ihStCutLo = []
+  ihStCutHi = []
   ihStFull = []
   ihStAmb = []
-  ihStWrites = []
-  ihStRefParam = []
   ihImpMod = []
   ihImpLocal = []
   ihImpOMod = []
@@ -255,7 +257,6 @@ export function ihBegin(keys: string[]): i32 {
   ihByName = Map()
   ihByAny = Map()
   ihExpStamp = []
-  ihCalStamp = []
   ihImpAt = Map()
   ihImpRowsOf = []
   ihDigMask = -1
@@ -466,6 +467,8 @@ function ihTokens(
   ihStSpan.push(sp)
   ihStLo.push(a)
   ihStHi.push(b)
+  ihStCutLo.push(cutLo)
+  ihStCutHi.push(cutHi)
   ihStFull.push(ihTokHash(a, b))
 }
 
@@ -480,16 +483,7 @@ function ihStOpen(m: i32, kind: i32, merged: string, exported: boolean) {
   ihStCallLo.push(ihCalls.length)
 }
 
-function ihStClose(
-  cutRet: boolean,
-  cutAny: boolean,
-  body: i32,
-  men: i32,
-  writes: boolean,
-  refParam: boolean,
-) {
-  ihStWrites.push(writes)
-  ihStRefParam.push(refParam)
+function ihStClose(cutRet: boolean, cutAny: boolean, body: i32, men: i32) {
   ihStCutRet.push(cutRet)
   ihStCutAny.push(cutAny)
   ihStBody.push(body)
@@ -503,88 +497,8 @@ function ihOrphans(m: i32, a: i32, b: i32, tops: {[string]: boolean}) {
   if a >= b { return 0 }
   ihStOpen(m, IH_ST_ROOT, "", false)
   ihTokens(a, b, -1, -1, tops)
-  ihStClose(false, false, IH_SEED, 0, false, false)
+  ihStClose(false, false, IH_SEED, 0)
   0
-}
-
-// Whether body tokens `[lo, hi)` assign or call a method, the two ways a body writes through
-// a reference it is handed or reads.
-function ihBodyWrites(lo: i32, hi: i32): boolean {
-  let i = lo
-  while i < hi {
-    const k = P.toks[i].kind
-    if ihIsAssignOp(k) { return true }
-    if (
-      (k == "DOT" || k == "QUESTION_DOT")
-      && i + 2 < hi
-      && P.toks[i + 1].kind == "IDENT"
-      && P.toks[i + 2].kind == "LPAREN"
-    ) {
-      return true
-    }
-    i = i + 1
-  }
-  false
-}
-
-// Whether a parameter of `fd` is declared at a type that may hold a reference.
-function ihRefParam(fd: FuncDecl): boolean {
-  for p in fd.fnParams {
-    const pn = P.nodes[p]
-    if pn is Param && pn.parType >= 0 {
-      const tn = P.nodes[pn.parType]
-      if !(tn is TypeRef) || !ihScalarSpelling(tn.tyName) { return true }
-    }
-  }
-  false
-}
-
-function ihScalarName(w: string): boolean {
-  w == "i8"
-    || w == "i16"
-    || w == "i32"
-    || w == "i64"
-    || w == "u8"
-    || w == "u16"
-    || w == "u32"
-    || w == "u64"
-    || w == "f32"
-    || w == "f64"
-    || w == "boolean"
-    || w == "string"
-    || w == "null"
-    || w == "void"
-    || w == "true"
-    || w == "false"
-}
-
-// Whether a type spelling names only scalars and literals: no record, list, map, function or
-// named type, so nothing of that type is shared by reference.
-function ihScalarSpelling(s: string): boolean {
-  let i = 0
-  while i < s.length {
-    const c = s[i]
-    if c == 34 || c == 39 {
-      let j = i + 1
-      while j < s.length && s[j] != c {
-        if s[j] == 92 { j = j + 1 }
-        j = j + 1
-      }
-      i = j + 1
-    } else if isIdPart(c) {
-      let j = i + 1
-      while j < s.length && (isIdPart(s[j]) || s[j] == '$') { j = j + 1 }
-      const w = ihSourceName(s.slice(i, j))
-      const digit = c >= '0' && c <= '9'
-      if !digit && !ihScalarName(w) { return false }
-      i = j
-    } else if c == '{' || c == '[' || c == '(' || c == '<' || c == '=' {
-      return false
-    } else {
-      i = i + 1
-    }
-  }
-  true
 }
 
 function ihAkRow(at: i32, kind: i32, ws: string[]): void {
@@ -1089,14 +1003,8 @@ export function ihModule(
           }
         }
       }
-      let writes = false
-      let refParam = false
-      if st is FuncDecl && cutLo >= 0 {
-        writes = ihBodyWrites(cutLo, cutHi)
-        refParam = ihRefParam(st)
-      }
       ihTokens(start, end, cutLo, cutHi, tops)
-      ihStClose(cutRet, cutLo >= 0, body, men, writes, refParam)
+      ihStClose(cutRet, cutLo >= 0, body, men)
       at = end
       si = si + 1
     }
@@ -1330,31 +1238,25 @@ function ihKeep(byName: {[string]: i32[]}, shown: string[]) {
   ihShown = shown
   ihByAny = Map()
   ihExpStamp = []
-  ihCalStamp = []
   ihStamp = 0
   ihSucc = []
   ihSuccMark = []
   ihSuccGen = 0
-  ihExpLo = []
-  ihExpHi = []
-  ihCalLo = []
-  ihCalHi = []
-  ihExpDone = []
-  ihExpMemo = []
+  ihQLo = []
+  ihQHi = []
+  ihQDone = []
+  ihQMemo = []
   ihAdj = []
   ihDownMemo = []
   if ihDigMask != ihDrop { ihTokDigests() }
   let s = 0
   while s < n {
     ihExpStamp.push(0)
-    ihCalStamp.push(0)
     ihSuccMark.push(0)
-    ihExpLo.push(-1)
-    ihExpHi.push(-1)
-    ihCalLo.push(-1)
-    ihCalHi.push(-1)
-    ihExpDone.push(false)
-    ihExpMemo.push(0)
+    ihQLo.push(-1)
+    ihQHi.push(-1)
+    ihQDone.push(false)
+    ihQMemo.push(0)
     if ihStKind[s] != IH_ST_ROOT {
       const prev = ihByAny[ihStName[s]] ?? []
       prev.push(s)
@@ -1419,13 +1321,6 @@ export function ihTokDigests(): i32 {
     r = r + 1
   }
   0
-}
-
-// Whether a statement's body may write through a reference: it writes or calls a method, and
-// it is handed a reference or names a top-level binding.
-function ihLive(s: i32): boolean {
-  if ihOn(IH_NO_LIVE) || !ihStWrites[s] { return false }
-  ihStRefParam[s] || ihStCallHi[s] > ihStCallLo[s]
 }
 
 // The modules `o` reaches through its imports, itself included, kept per `o`.
@@ -1551,13 +1446,11 @@ function ihSuccRef(m: i32, t: string) {
   0
 }
 
-// Build statement `x`'s successor lists once: what its tokens and checked type name, and
-// what its body calls. A reach filters them by the modules below its origin.
-function ihSuccOf(x: i32) {
-  if ihExpLo[x] >= 0 { return 0 }
+// Append what statement `x`'s tokens and checked type name to the successor list being built;
+// a cut body's names never: the driver banks what a body writes by its answers.
+function ihExpSucc(x: i32) {
   const m = ihStMod[x]
   ihSuccGen = ihSuccGen + 1
-  ihExpLo[x] = ihSucc.length
   if !ihOn(IH_NO_TOKEN_NAMES) {
     let k = ihStIdLo[x]
     while k < ihStIdHi[x] {
@@ -1567,8 +1460,12 @@ function ihSuccOf(x: i32) {
     if !ihOn(IH_NO_CROSS) {
       let t = ihStLo[x]
       while t < ihStHi[x] {
-        if P.toks[t].kind == "IDENT" { ihSuccRef(m, P.toks[t].text) }
-        t = t + 1
+        if t == ihStCutLo[x] && ihStCutHi[x] > t {
+          t = ihStCutHi[x]
+        } else {
+          if P.toks[t].kind == "IDENT" { ihSuccRef(m, P.toks[t].text) }
+          t = t + 1
+        }
       }
     }
   }
@@ -1585,34 +1482,26 @@ function ihSuccOf(x: i32) {
       k = k + 1
     }
   }
-  ihExpHi[x] = ihSucc.length
-  ihSuccGen = ihSuccGen + 1
-  ihCalLo[x] = ihSucc.length
-  if !ihOn(IH_NO_CALLEES) {
-    let k = ihStCallLo[x]
-    while k < ihStCallHi[x] {
-      ihSuccRef(m, ihCalls[k])
-      k = k + 1
-    }
-    if ihStKind[x] == IH_ST_LET {
-      k = ihStIdLo[x]
-      while k < ihStIdHi[x] {
-        ihSuccName(m, ihIds[k])
-        k = k + 1
-      }
-    }
-  }
-  ihCalHi[x] = ihSucc.length
   0
 }
 
-// The row an exposed statement gives an importer's reach, kept per statement.
+// Build statement `x`'s exposed successors once, as if its body wrote nothing. A reach filters
+// them by the modules below its origin.
+function ihSuccOf(x: i32) {
+  if ihQLo[x] >= 0 { return 0 }
+  ihQLo[x] = ihSucc.length
+  ihExpSucc(x)
+  ihQHi[x] = ihSucc.length
+  0
+}
+
+// The row an exposed statement gives an importer's reach, kept per statement: its name, tokens
+// and type, without what only a question about its body's writes reads.
 function ihExpRow(x: i32): i32 {
-  if ihExpDone[x] { return ihExpMemo[x] }
+  if ihQDone[x] { return ihQMemo[x] }
   const m = ihStMod[x]
   let h = ihMixStr(ihMixStr(IH_SEED, ihKeys[m]), ihStName[x])
-  if ihLive(x) { h = ihMixInt(h, ihStFull[x]) }
-  else if !ihOn(IH_NO_REACH_TOKENS) { h = ihMixInt(h, ihStTok[x]) }
+  if !ihOn(IH_NO_REACH_TOKENS) { h = ihMixInt(h, ihStTok[x]) }
   const shown = ihShown[x]
   const keepTy = !ihOn(IH_NO_TYPES)
     && !(ihStCutRet[x] && ihOn(IH_NO_INFERRED_TYPE))
@@ -1621,39 +1510,34 @@ function ihExpRow(x: i32): i32 {
   if ihStCutRet[x] && (guard || ihOn(IH_SHOW_INFERRED_RET)) {
     h = ihMixInt(h, ihStBody[x])
   }
-  if ihStCutAny[x] && !ihOn(IH_NO_MENTIONS) { h = ihMixInt(h, ihStMen[x]) }
-  ihExpDone[x] = true
-  ihExpMemo[x] = h
+  ihQDone[x] = true
+  ihQMemo[x] = h
   h
 }
 
-function ihHasArrow(s: string): boolean {
-  let i = 0
-  while i + 1 < s.length {
-    if s[i] == '=' && s[i + 1] == '>' { return true }
-    i = i + 1
+// Close `queue` over exposed successors below the origin (`down`), summing each statement's
+// row once.
+function ihClose(queue: i32[], down: boolean[]): i32 {
+  let sum = 0
+  let q = 0
+  while q < queue.length {
+    const x = queue[q]
+    sum = sum + ihExpRow(x)
+    ihSuccOf(x)
+    let k = ihQLo[x]
+    while k < ihQHi[x] {
+      const s = ihSucc[k]
+      if down[ihStMod[s]] { ihVisit(s, ihExpStamp, queue) }
+      k = k + 1
+    }
+    q = q + 1
   }
-  false
+  sum
 }
 
-// The row a statement only a body calls gives: a function's mentions, or its whole tokens
-// when it may write; a function-valued binding's whole tokens.
-function ihCalRow(x: i32): i32 {
-  const h = ihMixStr(ihMixStr(IH_SEED, ihKeys[ihStMod[x]]), ihStName[x])
-  if ihStKind[x] == IH_ST_FN {
-    if ihLive(x) { return ihMixInt(h, ihStFull[x]) }
-    if ihOn(IH_NO_MENTIONS) { return h }
-    return ihMixInt(h, ihStMen[x])
-  }
-  if ihStKind[x] == IH_ST_LET && ihHasArrow(ihShown[x]) {
-    return ihMixInt(h, ihStFull[x])
-  }
-  h
-}
-
-// What importer `i`'s check can observe of origin `o` and the modules below it: the
-// statements its imports from `o` name, closed over the names their tokens and checked types
-// spell, then over what their bodies call.
+// What importer `i`'s check can observe of origin `o` and the modules below it through what
+// they expose: the statements its imports from `o` name, closed over the names their tokens
+// and checked types spell. What a call's body writes the driver banks by its answers.
 export function ihReachOf(i: i32, o: i32): i32 {
   if i < 0 || o < 0 || i >= ihKeys.length || o >= ihKeys.length { return 0 }
   if ihExpStamp.length != ihStMod.length { return 0 }
@@ -1672,40 +1556,40 @@ export function ihReachOf(i: i32, o: i32): i32 {
     }
     r = r + 1
   }
-  let q = 0
-  while q < queue.length {
-    const x = queue[q]
-    sum = sum + ihExpRow(x)
-    ihSuccOf(x)
-    let k = ihExpLo[x]
-    while k < ihExpHi[x] {
-      const s = ihSucc[k]
-      if down[ihStMod[s]] { ihVisit(s, ihExpStamp, queue) }
-      k = k + 1
+  sum + ihClose(queue, down)
+}
+
+// The key of the top-level statement holding each token of `toks`, in order: its module's key, a
+// newline and its source name, behind a "!" when that name is not one statement's; "" for none.
+export function ihStKeysOf(toks: i32[]): string[] {
+  const owner: i32[] = []
+  let t = 0
+  while t < P.toks.length {
+    owner.push(-1)
+    t = t + 1
+  }
+  let s = 0
+  while s < ihStMod.length {
+    t = ihStLo[s]
+    while t < ihStHi[s] && t < owner.length {
+      owner[t] = s
+      t = t + 1
     }
-    q = q + 1
+    s = s + 1
   }
-  // A body the exposed statements do not show still runs at the importer's call.
-  const cq: i32[] = []
-  q = 0
-  while q < queue.length {
-    ihVisit(queue[q], ihCalStamp, cq)
-    q = q + 1
-  }
-  q = 0
-  while q < cq.length {
-    const x = cq[q]
-    if q >= queue.length { sum = sum + ihCalRow(x) }
-    ihSuccOf(x)
-    let k = ihCalLo[x]
-    while k < ihCalHi[x] {
-      const s = ihSucc[k]
-      if down[ihStMod[s]] { ihVisit(s, ihCalStamp, cq) }
-      k = k + 1
+  const out: string[] = []
+  for k in toks {
+    let key = ""
+    if k >= 0 && k < owner.length && owner[k] >= 0 {
+      const x = owner[k]
+      key = ihKeys[ihStMod[x]] + "\n" + ihStName[x]
+      if ihStName[x] == "" || (ihByName[key] ?? []).length != 1 {
+        key = "!" + key
+      }
     }
-    q = q + 1
+    out.push(key)
   }
-  sum
+  out
 }
 
 // For each builder key (a declaring module's key, a newline, a top-level source name): its
@@ -1770,6 +1654,167 @@ export function ihOccDigests(
       }
     }
     x = x + 1
+  }
+  out
+}
+
+// Whether the identifier at token `i` of tokens `[lo, hi)` is rebound there: assigned or
+// stepped by name, not through a member and not declared.
+function ihRebindsAt(i: i32, lo: i32, hi: i32): boolean {
+  if i > lo {
+    const pk = P.toks[i - 1].kind
+    if pk == "PLUSPLUS" || pk == "MINUSMINUS" { return true }
+    if (pk == "DOT" || pk == "QUESTION_DOT" || pk == "LET" || pk == "CONST") {
+      return false
+    }
+  }
+  i + 1 < hi && ihIsAssignOp(P.toks[i + 1].kind)
+}
+
+// The spellings, as `module key + "\n" + text`, that may name top-level `name` of module `m`:
+// its own, each import binding it, and its source name in each module importing all of `m`.
+function ihSpellings(m: i32, name: string): string[] {
+  const out = [ihKeys[m] + "\n" + name]
+  let r = 0
+  while r < ihImpMod.length {
+    const im = ihImpMod[r]
+    if ihImpOMod[r] == m && im >= 0 && im < ihKeys.length {
+      if ihImpOName[r] == name { out.push(ihKeys[im] + "\n" + ihImpLocal[r]) }
+      else if ihImpOName[r] == "" { out.push(ihKeys[im] + "\n" + name) }
+    }
+    r = r + 1
+  }
+  out
+}
+
+// Whether statement `x` is a run of imports or re-exports rather than code.
+function ihImportRun(x: i32): boolean {
+  if ihStKind[x] != IH_ST_ROOT || ihStLo[x] >= P.toks.length { return false }
+  const k = P.toks[ihStLo[x]].kind
+  k == "IMPORT" || k == "EXPORT"
+}
+
+// Per key (module key, newline, source name): `\nW` digests its writer closure and `\nE` the
+// statements naming it, `\nw`/`\ne` mark one (not an import) in a module `only` selects.
+// `"\nO"` digests every top-level `let` and root statement, `"\no"` marks one in a module
+// `before` selects. A key the tables lack is left out.
+export function ihWriterDigests(
+  keys: string[],
+  only: boolean[],
+  before: boolean[],
+): {[string]: i32} {
+  const out: {[string]: i32} = Map()
+  const kix: {[string]: i32} = Map()
+  let m = 0
+  while m < ihKeys.length {
+    kix[ihKeys[m]] = m
+    m = m + 1
+  }
+  // Only a top-level name or an import binding can be a spelling, so other tokens are skipped.
+  const named: {[string]: boolean} = Map()
+  let x = 0
+  while x < ihStName.length {
+    if ihStName[x] != "" { named[ihStName[x]] = true }
+    if ihStKind[x] == IH_ST_LET {
+      let k = ihStIdLo[x]
+      while k < ihStIdHi[x] {
+        named[ihIds[k]] = true
+        k = k + 1
+      }
+    }
+    x = x + 1
+  }
+  for l in ihImpLocal { named[l] = true }
+  const men: {[string]: i32[]} = Map()
+  const wr: {[string]: i32[]} = Map()
+  let ord = IH_SEED
+  x = 0
+  while x < ihStMod.length {
+    const sm = ihStMod[x]
+    if ihStKind[x] == IH_ST_ROOT || ihStKind[x] == IH_ST_LET {
+      ord = ord + ihStFull[x]
+      if sm < before.length && before[sm] && !ihImportRun(x) { out["\no"] = 1 }
+    }
+    const lo = ihStLo[x]
+    const hi = ihStHi[x]
+    let i = lo
+    while i < hi && i < P.toks.length {
+      const t = P.toks[i]
+      if t.kind == "IDENT" && named.has(t.text) {
+        const k = ihKeys[sm] + "\n" + t.text
+        const prev = men[k] ?? []
+        if prev.length == 0 || prev[prev.length - 1] != x {
+          prev.push(x)
+          men[k] = prev
+        }
+        if ihRebindsAt(i, lo, hi) {
+          const pw = wr[k] ?? []
+          if pw.length == 0 || pw[pw.length - 1] != x {
+            pw.push(x)
+            wr[k] = pw
+          }
+        }
+      }
+      i = i + 1
+    }
+    x = x + 1
+  }
+  out["\nO"] = ord
+  for key in keys {
+    const nl = key.indexOf("\n")
+    const d = kix[key.slice(0, nl)] ?? -1
+    if nl > 0 && d >= 0 {
+      const seeds = ihSpellings(d, key.slice(nl + 1, key.length))
+      const inSet: {[i32]: boolean} = Map()
+      const set: i32[] = []
+      for s in seeds {
+        for y in wr[s] ?? [] {
+          if !inSet.has(y) {
+            inSet[y] = true
+            set.push(y)
+          }
+        }
+      }
+      let q = 0
+      while q < set.length {
+        const y = set[q]
+        if ihStKind[y] != IH_ST_ROOT && ihStName[y] != "" {
+          for s in ihSpellings(ihStMod[y], ihStName[y]) {
+            for z in men[s] ?? [] {
+              if !inSet.has(z) {
+                inSet[z] = true
+                set.push(z)
+              }
+            }
+          }
+        }
+        q = q + 1
+      }
+      let w = IH_SEED
+      for y in set {
+        w = w + ihStFull[y]
+        const ym = ihStMod[y]
+        if ym < only.length && only[ym] && !ihImportRun(y) {
+          out[key + "\nw"] = 1
+        }
+      }
+      out[key + "\nW"] = w
+      const seen: {[i32]: boolean} = Map()
+      let e = IH_SEED
+      for s in seeds {
+        for y in men[s] ?? [] {
+          if !seen.has(y) {
+            seen[y] = true
+            e = e + ihStFull[y]
+            const ym = ihStMod[y]
+            if ym < only.length && only[ym] && !ihImportRun(y) {
+              out[key + "\ne"] = 1
+            }
+          }
+        }
+      }
+      out[key + "\nE"] = e
+    }
   }
   out
 }
