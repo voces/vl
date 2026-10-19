@@ -245,9 +245,24 @@ Deno.test({
   },
 });
 
+// rc 3 is an emit refusal: the audit has run by then, and a later pass that reads the dropped
+// identity may decline rather than answer without it. M04's cell holds a generic function the
+// value-flow question follows through the cell's reads; with the read unresolved it answers
+// "not inert" and the emitter refuses, where answering "inert" printed `1` for `true`.
+const compilesOrEmitRefuses = (name: string, a: Audit) => {
+  if (a.rc !== 0 && a.rc !== 3) {
+    throw new Error(`${name}: want compileSrc rc 0 or 3, got ${a.rc}`);
+  }
+};
+
 /** Every row of `a` names `pass`, and there is at least one. */
-const firesAt = (name: string, a: Audit, pass: string) => {
-  compiles(name, a);
+const firesAt = (
+  name: string,
+  a: Audit,
+  pass: string,
+  ran: (name: string, a: Audit) => void = compiles,
+) => {
+  ran(name, a);
   if (a.unresolved === 0) {
     throw new Error(
       `${name}: want the dropped site to leave identifiers unresolved, got 0`,
@@ -267,7 +282,12 @@ Deno.test({
   ignore,
   fn() {
     firesAt("m02", audit(M02, DROP_CBOX_READ), "captureBoxRewrite");
-    firesAt("m04", audit(M04, DROP_CBOX_READ), "captureBoxRewrite");
+    firesAt(
+      "m04",
+      audit(M04, DROP_CBOX_READ),
+      "captureBoxRewrite",
+      compilesOrEmitRefuses,
+    );
   },
 });
 
