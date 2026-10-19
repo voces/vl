@@ -12542,7 +12542,7 @@ function monoNoteInertInit(d: LetDecl, at: i32, ctx: i32) {
   monoGenericValuesIn(d.letInit, xs, 0)
   if xs.length == 0 { return 0 }
   const cold = monoInertProps(d.letInit)
-  if !monoBindingUsesAreInert(ctx, d.letName, at, cold) { return 0 }
+  if !monoBindingUsesAreInert(ctx, d.letName, at, cold, 0) { return 0 }
   for x in xs { monoInertValues.push(x) }
   0
 }
@@ -12609,13 +12609,16 @@ function monoGenericFieldValuesIn(x: i32, out: i32[], depth: i32) {
 }
 
 // Whether every use in frame `fx`'s body of the binding `name` declared at `decl` is `name.p` for
-// a `p` in `cold`, or the target of a write.
+// a `p` in `cold`, the target of a write, or held in the initializer of an un-annotated binding
+// whose own uses are inert in turn.
 function monoBindingUsesAreInert(
   fx: i32,
   name: string,
   decl: i32,
   cold: string[],
+  depth: i32,
 ): boolean {
+  if depth > 8 { return false }
   const stack: i32[] = []
   const lens: i32[] = []
   if fx >= 0 {
@@ -12636,6 +12639,17 @@ function monoBindingUsesAreInert(
         if n.binOp == "=" { lens.push(n.binLeft) }
       }
       if n is Call { monoFnlessArgsOf(n, lens) }
+      if n is LetDecl && n.letType < 0 && n.letInit >= 0 {
+        const held: i32[] = []
+        monoNameLeavesIn(n.letInit, name, held, 0)
+        const inner = monoInertProps(n.letInit)
+        if (
+          held.length > 0
+          && monoBindingUsesAreInert(fx, n.letName, ix, inner, depth + 1)
+        ) {
+          for h in held { lens.push(h) }
+        }
+      }
       if n is Ident {
         if (
           n.identName == name
@@ -12651,6 +12665,25 @@ function monoBindingUsesAreInert(
     }
   }
   true
+}
+
+// Appends to `out` each read of `name` in value `v`, through parentheses, list elements and
+// record fields: the places `monoGenericValuesIn` finds a generic function.
+function monoNameLeavesIn(v: i32, name: string, out: i32[], depth: i32) {
+  const x = unwrapParen(v)
+  if x < 0 || depth > 8 { return 0 }
+  const n = P.nodes[x]
+  if n is Ident {
+    if n.identName == name { out.push(x) }
+  } else if n is ArrayLit {
+    for e in n.arrElems { monoNameLeavesIn(e, name, out, depth + 1) }
+  } else if n is ObjLit {
+    for fi in n.objFields {
+      const f = P.nodes[fi]
+      if f is FieldInit { monoNameLeavesIn(f.fiValue, name, out, depth + 1) }
+    }
+  }
+  0
 }
 
 // Appends to `out` each argument of call `n` delivered to a parameter declared as a closed record
@@ -16792,9 +16825,9 @@ export function monoPinnedSigsOf(origFe: i32) {
 }
 
 // Which of `names` is referenced as a function value — an `Ident` that is not some
-// `Call`'s callee — anywhere in the node arena. Returns an `i32[]` parallel to `names`.
-// One arena pass however many names are asked about. This is the soundness gate the
-// un-annotated-param prune needs: such a function is an ordinary first-class value.
+// `Call`'s callee — anywhere in the node arena: 1 when a reference is not in
+// `monoInertValues`, 2 when every one is, else 0. Parallel to `names`, one arena pass. This
+// is the soundness gate the un-annotated-param prune needs: such a function is a value.
 function monoNamesUsedAsValue(names: string[]): i32[] {
   const hit: i32[] = []
   let h = 0
@@ -16817,17 +16850,27 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
       // arena-tick exempt: `isCallee` is a local declared in this function.
       if cf >= 0 && cf < isCallee.length { isCallee[cf] = 1 }
     }
+    // A name write's value: the written-binding passes instance it or refuse it (D3939).
+    if cn is BinExpr && cn.binOp == "=" && P.nodes[cn.binLeft] is Ident {
+      const rv = unwrapParen(cn.binRight)
+      // arena-tick exempt: `isCallee` is a local declared in this function.
+      if rv >= 0 && rv < isCallee.length { isCallee[rv] = 2 }
+    }
     j = j + 1
   }
   let k = 0
   while k < P.nodes.length {
-    if isCallee[k] == 0 {
+    if isCallee[k] != 1 {
       const idn = P.nodes[k]
       if idn is Ident {
         let m = 0
         while m < names.length {
-          // arena-tick exempt: `hit` is this function's own out-parameter list.
-          if names[m] == idn.identName { hit[m] = 1 }
+          if names[m] == idn.identName && hit[m] != 1 {
+            let mark = 1
+            if isCallee[k] == 2 || i32ListHas(monoInertValues, k) { mark = 2 }
+            // arena-tick exempt: `hit` is this function's own out-parameter list.
+            hit[m] = mark
+          }
           m = m + 1
         }
       }
@@ -16853,7 +16896,7 @@ export function monoGenericAliasFe(letIx: i32) {
     const one: string[] = []
     one.push(d.letName)
     const used = monoNamesUsedAsValue(one)
-    if used[0] == 1 { return -1 }
+    if used[0] != 0 { return -1 }
     return fe
   }
   -1
@@ -18460,6 +18503,11 @@ function monoPruneTemplates(nDecl: i32) {
           let ci = 0
           while ci < cndFe.length {
             if cndFe[ci] == gp && cndVal[ci] == 0 { prune = true }
+            // Every value of a hole function no call instances is one nothing calls, so the
+            // stub serves it as it does an uncalled `<T>` generic's (D6830).
+            if cndFe[ci] == gp && cndVal[ci] == 2 && !monoInstantiatedAny(gp) {
+              prune = true
+            }
             ci = ci + 1
           }
           // A hole lambda no call pinned and no read reaches has nothing to lower at (D3832).
