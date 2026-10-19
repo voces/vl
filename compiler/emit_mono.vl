@@ -1441,33 +1441,8 @@ function monoIdentReadsValue(ix: i32): boolean {
 // argument's own recorded type, then the collection, union, record and scalar cascades.
 // `cax` is `ix` with its grouping parens peeled. "" is the loud floor, `"i32"` the last rung.
 function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
-  // A declared litunion argument pins the parameter to the alias, ahead of the string and
-  // scalar arms. For a litunion the spelling is the rep: an alias is an interned i32 atom,
-  // an inline member set softens to the string ref, and `litUnionAliasNameOfTy` is the one
-  // home of that distinction. Without this arm the pin loses the type entirely.
-  const luAl = litUnionAliasNameOfTy(nodeTyIxOf(unwrapParen(ix)))
-  if luAl != "" { return luAl }
-  // The other half of that distinction, which the alias arm cannot name: an INLINE member
-  // set has no alias and reps as the softened `string`. `unionParamPinName` already answers
-  // this question that way; without the rung here the ladder falls to its `i32` catch-all and
-  // the hole parameter carries the atom's raw width instead of a rep (D1545).
-  const luInlTy = nodeTyIxOf(unwrapParen(ix))
-  if tyIsLitUnion(luInlTy) {
-    const luInl = tyToEmitName(luInlTy)
-    if luInl != "" { return luInl }
-  }
-  // The array sibling of the arm above, and it has to sit here: the collection arms spell a
-  // litunion array by its rep and `nameIsI32Array` accepts a litunion `K[]`, so `exprArray`
-  // pins `i32[]` and binds every `T` mentioning the element to plain i32. See
-  // `monoAnnPinName`'s litunion-array arm — the two channels must claim the same shape.
-  const luArrTy = nodeTyIxOf(unwrapParen(ix))
-  if tyIsLitUnionArray(luArrTy) {
-    const luArrT = T.tys[luArrTy]
-    if luArrT is TyArray {
-      const luElAl = litUnionAliasNameOfTy(luArrT.aElem)
-      if luElAl != "" { return luElAl + "[]" }
-    }
-  }
+  const lup = monoArgLitUnionPin(ix)
+  if lup != "" { return lup }
   // An empty list literal has no element for the collection arms to read; the body's pushes
   // pinned its recorded row at the call (D2218). A record element no spelling names takes the
   // row its field set matches, and a pinned element neither names is the loud floor, since
@@ -1624,6 +1599,38 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   if exprNullableVariant(ix, fnIx) { return "" }
   if exprNullableRefArray(ix, fnIx) { return "" }
   "i32"
+}
+
+// The pin a litunion or litunion-list argument `ix` takes, "" for any other argument.
+function monoArgLitUnionPin(ix: i32): string {
+  // A declared litunion argument pins the parameter to the alias, ahead of the string and
+  // scalar arms. For a litunion the spelling is the rep: an alias is an interned i32 atom,
+  // an inline member set softens to the string ref, and `litUnionAliasNameOfTy` is the one
+  // home of that distinction. Without this arm the pin loses the type entirely.
+  const luAl = litUnionAliasNameOfTy(nodeTyIxOf(unwrapParen(ix)))
+  if luAl != "" { return luAl }
+  // The other half of that distinction, which the alias arm cannot name: an INLINE member
+  // set has no alias and reps as the softened `string`. `unionParamPinName` already answers
+  // this question that way; without the rung here the ladder falls to its `i32` catch-all and
+  // the hole parameter carries the atom's raw width instead of a rep (D1545).
+  const luInlTy = nodeTyIxOf(unwrapParen(ix))
+  if tyIsLitUnion(luInlTy) {
+    const luInl = tyToEmitName(luInlTy)
+    if luInl != "" { return luInl }
+  }
+  // The array sibling of the arm above, and it has to sit here: the collection arms spell a
+  // litunion array by its rep and `nameIsI32Array` accepts a litunion `K[]`, so `exprArray`
+  // pins `i32[]` and binds every `T` mentioning the element to plain i32. See
+  // `monoAnnPinName`'s litunion-array arm — the two channels must claim the same shape.
+  const luArrTy = nodeTyIxOf(unwrapParen(ix))
+  if tyIsLitUnionArray(luArrTy) {
+    const luArrT = T.tys[luArrTy]
+    if luArrT is TyArray {
+      const luElAl = litUnionAliasNameOfTy(luArrT.aElem)
+      if luElAl != "" { return luElAl + "[]" }
+    }
+  }
+  ""
 }
 
 // A projected union's pin at the name of the union row its canon matches, the spelling an
@@ -2057,23 +2064,56 @@ function monoJoinBinding(
   0
 }
 
-// Build the type-level binding column (`T` ⇒ this instance's concrete type) the way the
-// checker does: `bindGenWalk` over each parameter's declared type against the type the
-// instance pinned that position at. `tyCol` is positional over `params`, -1 meaning
-// "nothing known"; an all -1 column binds nothing and the caller falls back to the names.
-function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
+// The type-level binding column (`T` ⇒ concrete type), built as the checker does: `bindGenWalk`
+// of each signature type (`declTys`, positional) against its pin (`tyCol`, -1 = nothing known).
+// A hole binds only at a closed pin that can hold a function and no literal: its pin name
+// cannot key such a call's result, and softens a literal.
+function monoBindCols(
+  params: i32[],
+  declTys: i32[],
+  tyCol: i32[],
+  bN: string[],
+  bT: i32[],
+) {
   let bi = 0
   while bi < params.length {
     const pp = P.nodes[params[bi]]
     if pp is Param {
       let at = -1
       if bi < tyCol.length { at = tyCol[bi] }
-      bindGenWalk(nodeTyIxOf(pp.parType), at, bN, bT)
-      bindGenUnionShapedArmInto(nodeTyIxOf(pp.parType), at, bN, bT)
+      let decl = nodeTyIxOf(pp.parType)
+      if bi < declTys.length && declTys[bi] >= 0 && !tyHasTyVar(decl) {
+        decl = declTys[bi]
+      }
+      if pp.parType < 0 {
+        if (
+          at >= 0
+          && (!tyMayHoldFn(at, 0) || tyHasLitDeep(at, 8) || tyHasTyVar(at))
+        ) {
+          at = -1
+        }
+      }
+      bindGenWalk(decl, at, bN, bT)
+      bindGenUnionShapedArmInto(decl, at, bN, bT)
     }
     bi = bi + 1
   }
   0
+}
+
+// The parameter types generic `origFe`'s signature declares, where the checker typed it as a
+// function of `n` parameters; else empty. A shared annotation node is re-typed by canon's
+// scope-blind rename and by a diagonal instance, so a type parameter shadowing a declared
+// name reads as one only here.
+function monoDeclParamTys(origFe: i32, n: i32): i32[] {
+  const out: i32[] = []
+  if origFe < 0 || origFe >= monoOrigNode.length { return out }
+  const sig = nodeTyIxOf(monoOrigNode[origFe])
+  if sig < 0 || sig >= T.tys.length { return out }
+  const ft = T.tys[sig]
+  if !(ft is TyFunc) || ft.fnParamTypes.length != n { return out }
+  for pt in ft.fnParamTypes { out.push(pt) }
+  out
 }
 
 // Whether the generic being instantiated declares a lambda. A lambda reading a `(T | null)[]`
@@ -3491,42 +3531,18 @@ function monoCloneBodyRaw(
     return mkBlock(ns, n.pos)
   }
   if n is LetDecl {
-    let nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
-    // The inferred-list-return local (`const out = []`): annotate its empty build with the
-    // pinned element type, per instance. Clones only this `LetDecl` and its enclosing
-    // Block, never the shared original.
-    if nt < 0 {
-      if outName != "" {
-        if n.letName == outName {
-          // The out type row is threaded down beside its spelling, so the substituted
-          // annotation is minted from the type. Every spelling reaching here is a
-          // composite, and `nameToTy` does not hash-cons one.
-          nt = synthTypeRefTy(outType, -1, outTyIx)
-        }
-      }
-    }
-    // The closure-pin rungs, for the same reason and at the same moment: an un-annotated
-    // container over a pinned parameter has no other source for its element type (D1664).
-    if nt < 0 { nt = monoCollCtorAnn(n.letInit, typarams, tvN, tvV) }
-    if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
-    if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
-    if nt < 0 && monoInitListsLitMixed(n.letInit, bN, bT) {
-      emitFailAt(
-        "emitProgram: a join of lists with a literal-union element and another element has no lowering at this instance",
-        n.letInit,
-      )
-    }
-    if nt < 0 { nt = monoApartJoinAnn(n.letInit, bN, bT) }
-    if nt < 0 { nt = monoTpJoinListLitAnn(n.letInit, bN, bT) }
-    if nt < 0 { nt = monoTpJoinBindAnn(n.letInit, bN, bT) }
-    if nt < 0 { nt = monoPushedListAnn(n.letInit, bN, bT) }
-    let ninit = n.letInit
-    if nt < 0 {
-      nt = monoHoleListLitAnn(n.letInit)
-      if nt >= 0 { ninit = monoHoleListLitCopy(n.letInit) }
-    }
-    if nt == n.letType { return ix }
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
+    return monoCloneLetDecl(
+      n,
+      ix,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      outTyIx,
+      bN,
+      bT,
+    )
   }
   if n is WhileStmt {
     const cb = monoCloneBody(
@@ -3544,46 +3560,16 @@ function monoCloneBodyRaw(
     return mkWhileAs(n, n.whileCond, cb)
   }
   if n is IfStmt {
-    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
-    const links = monoIfChainLinks(ix)
-    const ccs: i32[] = []
-    const cts: i32[] = []
-    let k = 0
-    while k < links.length {
-      const c = P.nodes[links[k]]
-      if c is IfStmt {
-        ccs.push(c.ifCond)
-        cts.push(
-          monoCloneBody(
-            c.ifThen,
-            typarams,
-            tvN,
-            tvV,
-            outName,
-            outType,
-            outTyIx,
-            bN,
-            bT,
-          ),
-        )
-      }
-      k = k + 1
-    }
-    return monoIfChainRebuild(
-      links,
-      ccs,
-      cts,
-      monoCloneBody(
-        monoIfChainElse(links),
-        typarams,
-        tvN,
-        tvV,
-        outName,
-        outType,
-        outTyIx,
-        bN,
-        bT,
-      ),
+    return monoCloneIfChain(
+      ix,
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      outTyIx,
+      bN,
+      bT,
     )
   }
   if n is ForRange {
@@ -3659,6 +3645,112 @@ function monoCloneBodyRaw(
   }
   // A pure expression / other statement carries no `LetDecl` annotation to rewrite — share.
   ix
+}
+
+// `monoCloneBodyRaw`'s arm for the binding `n` at `ix`: its instance annotation.
+function monoCloneLetDecl(
+  n: LetDecl,
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  outName: string,
+  outType: string,
+  outTyIx: i32,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  let nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+  // The inferred-list-return local (`const out = []`): annotate its empty build with the
+  // pinned element type, per instance. Clones only this `LetDecl` and its enclosing
+  // Block, never the shared original.
+  if nt < 0 {
+    if outName != "" {
+      if n.letName == outName {
+        // The out type row is threaded down beside its spelling, so the substituted
+        // annotation is minted from the type. Every spelling reaching here is a
+        // composite, and `nameToTy` does not hash-cons one.
+        nt = synthTypeRefTy(outType, -1, outTyIx)
+      }
+    }
+  }
+  // The closure-pin rungs, for the same reason and at the same moment: an un-annotated
+  // container over a pinned parameter has no other source for its element type (D1664).
+  if nt < 0 { nt = monoCollCtorAnn(n.letInit, typarams, tvN, tvV) }
+  if nt < 0 { nt = monoCloPinListAnn(n.letInit) }
+  if nt < 0 { nt = monoCloPinShapeAnn(n.letInit) }
+  if nt < 0 && monoInitListsLitMixed(n.letInit, bN, bT) {
+    emitFailAt(
+      "emitProgram: a join of lists with a literal-union element and another element has no lowering at this instance",
+      n.letInit,
+    )
+  }
+  if nt < 0 { nt = monoApartJoinAnn(n.letInit, bN, bT) }
+  if nt < 0 { nt = monoTpJoinListLitAnn(n.letInit, bN, bT) }
+  if nt < 0 { nt = monoTpJoinBindAnn(n.letInit, bN, bT) }
+  if nt < 0 { nt = monoPushedListAnn(n.letInit, bN, bT) }
+  let ninit = n.letInit
+  if nt < 0 {
+    nt = monoHoleListLitAnn(n.letInit)
+    if nt >= 0 { ninit = monoHoleListLitCopy(n.letInit) }
+  }
+  if nt == n.letType { return ix }
+  return monoCopyOf(ix, mkLet(n.letKw, n.letName, nt, ninit, n.pos))
+}
+
+// `monoCloneBodyRaw`'s arm for the `if` chain at `ix`.
+function monoCloneIfChain(
+  ix: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  outName: string,
+  outType: string,
+  outTyIx: i32,
+  bN: string[],
+  bT: i32[],
+): i32 {
+  // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+  const links = monoIfChainLinks(ix)
+  const ccs: i32[] = []
+  const cts: i32[] = []
+  let k = 0
+  while k < links.length {
+    const c = P.nodes[links[k]]
+    if c is IfStmt {
+      ccs.push(c.ifCond)
+      cts.push(
+        monoCloneBody(
+          c.ifThen,
+          typarams,
+          tvN,
+          tvV,
+          outName,
+          outType,
+          outTyIx,
+          bN,
+          bT,
+        ),
+      )
+    }
+    k = k + 1
+  }
+  return monoIfChainRebuild(
+    links,
+    ccs,
+    cts,
+    monoCloneBody(
+      monoIfChainElse(links),
+      typarams,
+      tvN,
+      tvV,
+      outName,
+      outType,
+      outTyIx,
+      bN,
+      bT,
+    ),
+  )
 }
 
 // Whether an inline `.map` callback PRESERVES the element type — its tail expression is
@@ -7423,30 +7515,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
     if fi == n.fiIter && fbi == n.fiBody { return ix }
     return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
   }
-  if n is BinExpr {
-    // A compound assignment desugars to `target = (target op value)` with the target node
-    // shared between the read and the write, so its limbs cannot be rebuilt independently:
-    // re-synthesize the whole form through the maker that re-establishes that sharing. The
-    // prefix `++`/`--` form has no value limb but does have a target, so it is rebuilt too.
-    if n.binCompound != "" {
-      const ct = monoCloneGenericCalls(n.binLeft)
-      if n.binCompound == "++" || n.binCompound == "--" {
-        if ct == n.binLeft { return ix }
-        return mkPreIncr(n.binCompound, ct, n.pos)
-      }
-      const inner = P.nodes[n.binRight]
-      if inner is BinExpr {
-        const iv = monoCloneGenericCalls(inner.binRight)
-        if iv == inner.binRight && ct == n.binLeft { return ix }
-        return mkCompoundAssign(n.binCompound, ct, iv, n.pos)
-      }
-      return ix
-    }
-    const bl = monoCloneGenericCalls(n.binLeft)
-    const br = monoCloneGenericCalls(n.binRight)
-    if bl == n.binLeft && br == n.binRight { return ix }
-    return mkBinary(n.binOp, bl, br, n.pos)
-  }
+  if n is BinExpr { return monoCloneGenericBinArm(ix, n) }
   if n is Unary {
     // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is the
     // mutated target — left whole for the compound form's reason. Nothing to clone in it
@@ -7506,26 +7575,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
     if !echanged { return ix }
     return monoCopyOf(ix, mkArrayLit(es, n.pos))
   }
-  if n is ObjLit {
-    const fl: i32[] = []
-    let ochanged = false
-    let oi = 0
-    while oi < n.objFields.length {
-      let nf = n.objFields[oi]
-      const f = P.nodes[nf]
-      if f is FieldInit {
-        const cv = monoCloneGenericCalls(f.fiValue)
-        if cv != f.fiValue {
-          nf = mkFieldInit(f.fiName, cv, f.pos)
-          ochanged = true
-        }
-      }
-      fl.push(nf)
-      oi = oi + 1
-    }
-    if !ochanged { return ix }
-    return monoCopyOf(ix, mkObjLit(fl, n.pos))
-  }
+  if n is ObjLit { return monoCloneGenericObjArm(ix, n) }
   // A generic function read as a value (a list element, a field, a binding) is renamed to
   // its instance per enclosing instance, so it gets its own node, typed at this instance (D3909).
   if n is Ident {
@@ -7543,6 +7593,54 @@ function monoCloneGenericCallsRaw(ix: i32) {
     }
   }
   ix
+}
+
+// `monoCloneGenericCallsRaw`'s arm for the binary or assignment `n` at `ix`.
+function monoCloneGenericBinArm(ix: i32, n: BinExpr): i32 {
+  // A compound assignment desugars to `target = (target op value)` with the target node
+  // shared between the read and the write, so its limbs cannot be rebuilt independently:
+  // re-synthesize the whole form through the maker that re-establishes that sharing. The
+  // prefix `++`/`--` form has no value limb but does have a target, so it is rebuilt too.
+  if n.binCompound != "" {
+    const ct = monoCloneGenericCalls(n.binLeft)
+    if n.binCompound == "++" || n.binCompound == "--" {
+      if ct == n.binLeft { return ix }
+      return mkPreIncr(n.binCompound, ct, n.pos)
+    }
+    const inner = P.nodes[n.binRight]
+    if inner is BinExpr {
+      const iv = monoCloneGenericCalls(inner.binRight)
+      if iv == inner.binRight && ct == n.binLeft { return ix }
+      return mkCompoundAssign(n.binCompound, ct, iv, n.pos)
+    }
+    return ix
+  }
+  const bl = monoCloneGenericCalls(n.binLeft)
+  const br = monoCloneGenericCalls(n.binRight)
+  if bl == n.binLeft && br == n.binRight { return ix }
+  mkBinary(n.binOp, bl, br, n.pos)
+}
+
+// `monoCloneGenericCallsRaw`'s arm for the object literal `n` at `ix`.
+function monoCloneGenericObjArm(ix: i32, n: ObjLit): i32 {
+  const fl: i32[] = []
+  let ochanged = false
+  let oi = 0
+  while oi < n.objFields.length {
+    let nf = n.objFields[oi]
+    const f = P.nodes[nf]
+    if f is FieldInit {
+      const cv = monoCloneGenericCalls(f.fiValue)
+      if cv != f.fiValue {
+        nf = mkFieldInit(f.fiName, cv, f.pos)
+        ochanged = true
+      }
+    }
+    fl.push(nf)
+    oi = oi + 1
+  }
+  if !ochanged { return ix }
+  monoCopyOf(ix, mkObjLit(fl, n.pos))
 }
 
 // ── the per-instance layout fold: `T.size` / `T.<field>` ─────────────────────
@@ -8111,20 +8209,7 @@ function monoFoldTyParamLayout(
     if fi == n.fiIter && fbi == n.fiBody { return ix }
     return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
   }
-  if n is Call {
-    const cf = monoFoldTyParamLayout(n.callFn, typarams, tvN, tvV)
-    let changed = cf != n.callFn
-    const nargs: i32[] = []
-    let ai = 0
-    while ai < n.callArgs.length {
-      const ca2 = monoFoldTyParamLayout(n.callArgs[ai], typarams, tvN, tvV)
-      nargs.push(ca2)
-      if ca2 != n.callArgs[ai] { changed = true }
-      ai = ai + 1
-    }
-    if !changed { return ix }
-    return monoRemintCallTpl(ix, cf, nargs)
-  }
+  if n is Call { return monoFoldLayoutCall(ix, n, typarams, tvN, tvV) }
   if n is BinExpr { return monoFoldLayoutBin(ix, n, typarams, tvN, tvV) }
   if n is Unary {
     // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is
@@ -8189,27 +8274,58 @@ function monoFoldTyParamLayout(
     nodeTyCarry(nl, ix)
     return nl
   }
-  if n is ObjLit {
-    const fl: i32[] = []
-    let ochanged = false
-    let oi = 0
-    while oi < n.objFields.length {
-      let nf = n.objFields[oi]
-      const f = P.nodes[nf]
-      if f is FieldInit {
-        const cv = monoFoldTyParamLayout(f.fiValue, typarams, tvN, tvV)
-        if cv != f.fiValue {
-          nf = mkFieldInit(f.fiName, cv, f.pos)
-          ochanged = true
-        }
-      }
-      fl.push(nf)
-      oi = oi + 1
-    }
-    if !ochanged { return ix }
-    return mkObjLit(fl, n.pos)
-  }
+  if n is ObjLit { return monoFoldLayoutObj(ix, n, typarams, tvN, tvV) }
   ix
+}
+
+// `monoFoldTyParamLayout`'s arm for the call `n` at `ix`.
+function monoFoldLayoutCall(
+  ix: i32,
+  n: Call,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+): i32 {
+  const cf = monoFoldTyParamLayout(n.callFn, typarams, tvN, tvV)
+  let changed = cf != n.callFn
+  const nargs: i32[] = []
+  let ai = 0
+  while ai < n.callArgs.length {
+    const ca2 = monoFoldTyParamLayout(n.callArgs[ai], typarams, tvN, tvV)
+    nargs.push(ca2)
+    if ca2 != n.callArgs[ai] { changed = true }
+    ai = ai + 1
+  }
+  if !changed { return ix }
+  monoRemintCallTpl(ix, cf, nargs)
+}
+
+// `monoFoldTyParamLayout`'s arm for the object literal `n` at `ix`.
+function monoFoldLayoutObj(
+  ix: i32,
+  n: ObjLit,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+): i32 {
+  const fl: i32[] = []
+  let ochanged = false
+  let oi = 0
+  while oi < n.objFields.length {
+    let nf = n.objFields[oi]
+    const f = P.nodes[nf]
+    if f is FieldInit {
+      const cv = monoFoldTyParamLayout(f.fiValue, typarams, tvN, tvV)
+      if cv != f.fiValue {
+        nf = mkFieldInit(f.fiName, cv, f.pos)
+        ochanged = true
+      }
+    }
+    fl.push(nf)
+    oi = oi + 1
+  }
+  if !ochanged { return ix }
+  mkObjLit(fl, n.pos)
 }
 
 // Whether a specialization callback is baked for any param — gates the body rewrite and
@@ -9079,6 +9195,15 @@ function monoMakeInstanceParams(
       // column is what the re-check windows declare the parameters as.
       const anonTy = anonHandleTyIx(pinned[pj])
       if anonTy >= 0 { pinTy = anonTy }
+      // A row first typed through a hole keeps it; the argument's closed type binds it instead.
+      if (
+        anonTy >= 0
+        && tyHasTyVar(anonTy)
+        && pinTys[pj] >= 0
+        && !tyHasTyVar(pinTys[pj])
+      ) {
+        pinTy = pinTys[pj]
+      }
       // The row keeps one function type per field, so a record differing only there (the
       // instance key already tells them apart) binds its own, or every callee typed from
       // the binding reads the row's first signature (D3110).
@@ -9230,45 +9355,15 @@ function monoMakeInstanceRetExpr(
       if rxe is Call {
         const rcal = P.nodes[rxe.callFn]
         if rcal is Ident {
-          let pq = 0
-          while pq < params.length {
-            const pp = P.nodes[params[pq]]
-            if pp is Param {
-              if pp.parName == rcal.identName {
-                const pn = pinned[pq]
-                // The bound is the paren arm's own: a `(…)`-opening function-type
-                // spelling is never two characters. The pin arm beside it reads the
-                // column rather than the name's first two.
-                if pn.length > 2 {
-                  if pinKinds[pq] == PIN_SIGKEY {
-                    // An un-annotated closure param's sig-key pin: only its
-                    // f64 result kind has no expression-form return inference.
-                    // The payload decodes through `sigKeyRetKind`.
-                    if sigKeyRetKind(pinPays[pq]) == "f64" {
-                      nret = synthTypeRef("f64", -1)
-                    }
-                  } else if nameIsParenOpen(pn) {
-                    // An annotated function-type param pin: the un-annotated
-                    // HOF return flows through the callback, so it is the
-                    // callback's return type. A closure result stays `nret = -1`.
-                    const retName = normTypeAtom(annRetNameOf(pn))
-                    // The return row comes off the pin's own type, not from a
-                    // second parse of the name cut out of `pn`. The gate is
-                    // unchanged; only the recorded row is.
-                    let retTyIx = -1
-                    if pinTys[pq] >= 0 {
-                      const pft = T.tys[pinTys[pq]]
-                      if pft is TyFunc { retTyIx = pft.fnRet }
-                    }
-                    if retName != "" && annArrowAt(retName) < 0 {
-                      nret = synthTypeRefTy(retName, -1, retTyIx)
-                    }
-                  }
-                }
-              }
-            }
-            pq = pq + 1
-          }
+          nret = monoRetOfClosureCall(
+            rcal,
+            params,
+            pinned,
+            pinKinds,
+            pinPays,
+            pinTys,
+            nret,
+          )
         }
         // `return <param>.map/filter(<lambda>)` over a param pinned to a non-i32
         // array: type the return as the concrete result list. `.filter` preserves the
@@ -9278,29 +9373,15 @@ function monoMakeInstanceRetExpr(
             if rxe.callArgs.length == 1 {
               const mrecv = P.nodes[rcal.memObj]
               if mrecv is Ident {
-                let pqm = 0
-                while pqm < params.length {
-                  const ppm = P.nodes[params[pqm]]
-                  if ppm is Param {
-                    if ppm.parName == mrecv.identName {
-                      // `listElemNameOf` adds one naive grouping-paren strip
-                      // over the cut this site wants: a `(…)`-wrapped element
-                      // is the only shape the two disagree on.
-                      const srcElem = listElemNameOf(pinned[pqm])
-                      if srcElem != "" && srcElem != "i32" {
-                        // Both arms produce the receiver's own list type, so
-                        // `srcElem + "[]"` is `pinned[pqm]` cut apart and put
-                        // back together, landing on a fresh arena row each time.
-                        if rcal.memProp == "filter" {
-                          nret = synthTypeRefTy(srcElem + "[]", -1, pinTys[pqm])
-                        } else if monoLambdaPreservesElem(rxe.callArgs[0]) {
-                          nret = synthTypeRefTy(srcElem + "[]", -1, pinTys[pqm])
-                        }
-                      }
-                    }
-                  }
-                  pqm = pqm + 1
-                }
+                nret = monoRetOfListMethod(
+                  rxe,
+                  rcal.memProp,
+                  mrecv,
+                  params,
+                  pinned,
+                  pinTys,
+                  nret,
+                )
               }
             }
           }
@@ -9415,6 +9496,94 @@ function monoMakeInstanceRetExpr(
     pinnedTyIx,
     twoOut,
   )
+}
+
+// The return a value-call through the closure-pinned param `rcal` takes; else `nret`.
+function monoRetOfClosureCall(
+  rcal: Ident,
+  params: i32[],
+  pinned: string[],
+  pinKinds: i32[],
+  pinPays: string[],
+  pinTys: i32[],
+  nret: i32,
+): i32 {
+  let pq = 0
+  while pq < params.length {
+    const pp = P.nodes[params[pq]]
+    if pp is Param {
+      if pp.parName == rcal.identName {
+        const pn = pinned[pq]
+        // The bound is the paren arm's own: a `(…)`-opening function-type
+        // spelling is never two characters. The pin arm beside it reads the
+        // column rather than the name's first two.
+        if pn.length > 2 {
+          if pinKinds[pq] == PIN_SIGKEY {
+            // An un-annotated closure param's sig-key pin: only its
+            // f64 result kind has no expression-form return inference.
+            // The payload decodes through `sigKeyRetKind`.
+            if sigKeyRetKind(pinPays[pq]) == "f64" {
+              nret = synthTypeRef("f64", -1)
+            }
+          } else if nameIsParenOpen(pn) {
+            // An annotated function-type param pin: the un-annotated
+            // HOF return flows through the callback, so it is the
+            // callback's return type. A closure result stays `nret = -1`.
+            const retName = normTypeAtom(annRetNameOf(pn))
+            // The return row comes off the pin's own type, not from a
+            // second parse of the name cut out of `pn`. The gate is
+            // unchanged; only the recorded row is.
+            let retTyIx = -1
+            if pinTys[pq] >= 0 {
+              const pft = T.tys[pinTys[pq]]
+              if pft is TyFunc { retTyIx = pft.fnRet }
+            }
+            if retName != "" && annArrowAt(retName) < 0 {
+              nret = synthTypeRefTy(retName, -1, retTyIx)
+            }
+          }
+        }
+      }
+    }
+    pq = pq + 1
+  }
+  nret
+}
+
+// The list type `rxe`, a `.map`/`.filter` over the param `recv`, returns; else `nret`.
+function monoRetOfListMethod(
+  rxe: Call,
+  prop: string,
+  recv: Ident,
+  params: i32[],
+  pinned: string[],
+  pinTys: i32[],
+  nret: i32,
+): i32 {
+  let pqm = 0
+  while pqm < params.length {
+    const ppm = P.nodes[params[pqm]]
+    if ppm is Param {
+      if ppm.parName == recv.identName {
+        // `listElemNameOf` adds one naive grouping-paren strip
+        // over the cut this site wants: a `(…)`-wrapped element
+        // is the only shape the two disagree on.
+        const srcElem = listElemNameOf(pinned[pqm])
+        if srcElem != "" && srcElem != "i32" {
+          // Both arms produce the receiver's own list type, so
+          // `srcElem + "[]"` is `pinned[pqm]` cut apart and put
+          // back together, landing on a fresh arena row each time.
+          if prop == "filter" {
+            nret = synthTypeRefTy(srcElem + "[]", -1, pinTys[pqm])
+          } else if monoLambdaPreservesElem(rxe.callArgs[0]) {
+            nret = synthTypeRefTy(srcElem + "[]", -1, pinTys[pqm])
+          }
+        }
+      }
+    }
+    pqm = pqm + 1
+  }
+  nret
 }
 
 // The return rungs read off the template's return expressions: the tail expression's own
@@ -10300,6 +10469,149 @@ function monoMakeInstanceFirst(
   0
 }
 
+// An instance's registry key, and the type-parameter bindings the key names.
+type MonoInstKey = {
+  key: string,
+  tps: string[],
+  exBN: string[],
+  exBT: i32[],
+  exSubN: string[],
+  exSubT: i32[],
+  argLit: boolean[],
+}
+
+// The key of `fn`'s instance at these pins, taking over the staged explicit bindings.
+function monoMakeInstanceKeyOf(
+  fn: FuncDecl,
+  origFe: i32,
+  callFrame: i32,
+  pinned: string[],
+  pinTys: i32[],
+  tvN: string[],
+  tvV: string[],
+  cbFnNames: string[],
+): MonoInstKey {
+  // A nested generic's instance binds what its enclosing instance binds too, so a signature
+  // or a capture naming the enclosing type parameter lowers at that pin (D3829, D3831).
+  const tps: string[] = []
+  for tp in fn.fnTyParams { tps.push(tp) }
+  const outerN: string[] = []
+  const outerT: i32[] = []
+  monoEnclosingPinRow(origFe, callFrame, fn.fnTyParams, outerN, outerT)
+  monoCurHasLam = monoFnDeclaresLambda(origFe)
+  let key = monoMakeInstanceKeyHead(origFe, callFrame)
+  const exBN = monoExplicitBN
+  const exBT = monoExplicitBT
+  key = key + monoBindEnclosingPins(outerN, outerT, tps, exBN, exBT, tvN, tvV)
+  const argLit = monoPinArgLit
+  monoExplicitBN = []
+  monoExplicitBT = []
+  monoPinArgLit = []
+  // The exact-type binding the key names, read again by the body rewrite.
+  const exSubN: string[] = []
+  const exSubT: i32[] = []
+  key = monoMakeInstanceKey(
+    key,
+    origFe,
+    fn.fnParams,
+    pinned,
+    pinTys,
+    tps,
+    exBN,
+    exBT,
+    exSubN,
+    exSubT,
+    cbFnNames,
+  )
+  const k: MonoInstKey = {
+    key: key,
+    tps: tps,
+    exBN: exBN,
+    exBT: exBT,
+    exSubN: exSubN,
+    exSubT: exSubT,
+    argLit: argLit,
+  }
+  k
+}
+
+// Binds each enclosing pin that has a spelling, and returns the key text naming them.
+function monoBindEnclosingPins(
+  outerN: string[],
+  outerT: i32[],
+  tps: string[],
+  exBN: string[],
+  exBT: i32[],
+  tvN: string[],
+  tvV: string[],
+): string {
+  let key = ""
+  let on = 0
+  while on < outerN.length {
+    const osp = monoPinAnnSpelling(outerT[on])
+    if osp != "" {
+      tps.push(outerN[on])
+      exBN.push(outerN[on])
+      exBT.push(outerT[on])
+      tvN.push(outerN[on])
+      tvV.push(osp)
+      key = key + "|" + outerN[on] + "=" + tyCanonKey(outerT[on], TY_WALK_DEPTH)
+    }
+    on = on + 1
+  }
+  key
+}
+
+// The instance `FuncDecl` of `fn` named `instName`, over params `nps` and body `instBody`.
+function monoMakeInstanceFunc(
+  fn: FuncDecl,
+  origFe: i32,
+  nret: i32,
+  instBody: i32,
+  instName: string,
+  nps: i32[],
+): i32 {
+  const noTyParams: string[] = []
+  const instRet = monoMakeInstanceRetIx(fn, origFe, nret)
+  if instBody != fn.fnBody { bodyRebuiltFrom.set(instBody, fn.fnBody) }
+  const nfn = mkFunc(instName, noTyParams, nps, instRet, instBody, -1)
+  // D926 — the return-row twin of the param mark. `monoOrigNode[origFe]` is the template's
+  // own `FuncDecl`, which is what `anonLeafMarkRetMoved` marked.
+  anonLeafCarryRetMark(monoOrigNode[origFe], nfn)
+  nfn
+}
+
+// Installs instance `nfn` and returns its function slot, -1 on a refusal.
+function monoMakeInstanceInstall(
+  fn: FuncDecl,
+  nfn: i32,
+  origFe: i32,
+  calleeIx: i32,
+  callFrame: i32,
+  instName: string,
+  first: boolean,
+): i32 {
+  if first {
+    monoMakeInstanceFirst(origFe, nfn, calleeIx, instName)
+    return origFe
+  }
+  monoMakeInstanceLater(fn, nfn, origFe, calleeIx, callFrame, instName)
+}
+
+// Refuses a pin type column not parallel to the pins: -1, else 0.
+function monoPinColsMisalignedFail(pinned: string[], pinTys: i32[]): i32 {
+  // The pin columns are positional and nothing downstream can tell a misaligned one from a
+  // correct one — param j would silently read param k's type. Checked once, loudly, here
+  // rather than bounds-guarding each read: a guard turns misalignment into a silently wrong
+  // type, and a short-but-nonempty column is exactly what a bounds guard cannot see.
+  if pinTys.length != pinned.length {
+    return emitFail(
+      "emitProgram: monomorphize: pin type column is not parallel to the pins",
+    )
+  }
+  0
+}
+
 // `monoMakeInstance` itself.
 function monoMakeInstanceGo(
   origFe: i32,
@@ -10315,72 +10627,28 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
-  // The pin columns are positional and nothing downstream can tell a misaligned one from a
-  // correct one — param j would silently read param k's type. Checked once, loudly, here
-  // rather than bounds-guarding each read: a guard turns misalignment into a silently wrong
-  // type, and a short-but-nonempty column is exactly what a bounds guard cannot see.
-  if pinTys.length != pinned.length {
-    return emitFail(
-      "emitProgram: monomorphize: pin type column is not parallel to the pins",
-    )
-  }
+  if monoPinColsMisalignedFail(pinned, pinTys) < 0 { return -1 }
   // `origFe` needs no bound of its own: every caller reaches here past `fe < monoGen.length`,
   // and `monomorphize` pushes `monoGen` and `monoOrigNode` in one loop and never appends to
   // either again, so that test is `monoOrigNode`'s length wearing another name.
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
-    // A nested generic's instance binds what its enclosing instance binds too, so a signature
-    // or a capture naming the enclosing type parameter lowers at that pin (D3829, D3831).
-    const tps: string[] = []
-    for tp in fn.fnTyParams { tps.push(tp) }
-    const outerN: string[] = []
-    const outerT: i32[] = []
-    monoEnclosingPinRow(origFe, callFrame, fn.fnTyParams, outerN, outerT)
-    monoCurHasLam = monoFnDeclaresLambda(origFe)
     const params = fn.fnParams
-    let key = monoMakeInstanceKeyHead(origFe, callFrame)
-    const exBN = monoExplicitBN
-    const exBT = monoExplicitBT
-    let on = 0
-    while on < outerN.length {
-      const osp = monoPinAnnSpelling(outerT[on])
-      if osp != "" {
-        tps.push(outerN[on])
-        exBN.push(outerN[on])
-        exBT.push(outerT[on])
-        tvN.push(outerN[on])
-        tvV.push(osp)
-        key = key
-          + "|"
-          + outerN[on]
-          + "="
-          + tyCanonKey(outerT[on], TY_WALK_DEPTH)
-      }
-      on = on + 1
-    }
-    const argLit = monoPinArgLit
-    monoExplicitBN = []
-    monoExplicitBT = []
-    monoPinArgLit = []
-    // The exact-type binding the key names, read again by the body rewrite.
-    const exSubN: string[] = []
-    const exSubT: i32[] = []
-    key = monoMakeInstanceKey(
-      key,
+    const k = monoMakeInstanceKeyOf(
+      fn,
       origFe,
-      params,
+      callFrame,
       pinned,
       pinTys,
-      tps,
-      exBN,
-      exBT,
-      exSubN,
-      exSubT,
+      tvN,
+      tvV,
       cbFnNames,
     )
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
-    if monoMakeInstanceHit(key, origFe, pinned, pinTys, calleeIx, annotateI32) {
+    if (
+      monoMakeInstanceHit(k.key, origFe, pinned, pinTys, calleeIx, annotateI32)
+    ) {
       return 0
     }
     // New shape: clone the original declaration with pinned annotations. An un-annotated
@@ -10398,13 +10666,13 @@ function monoMakeInstanceGo(
       pinned,
       pinKinds,
       pinTys,
-      tps,
+      k.tps,
       tvN,
       tvV,
-      exBN,
-      exBT,
+      k.exBN,
+      k.exBT,
       annotateI32,
-      argLit,
+      k.argLit,
       nps,
       pinnedTyIx,
     )
@@ -10416,10 +10684,17 @@ function monoMakeInstanceGo(
       pinTys,
       pinnedTyIx,
     )
-    const letBN: string[] = exBN
-    const letBT: i32[] = exBT
-    monoBindCols(params, letTyCol, letBN, letBT)
+    const letBN: string[] = k.exBN
+    const letBT: i32[] = k.exBT
+    monoBindCols(
+      params,
+      monoDeclParamTys(origFe, params.length),
+      letTyCol,
+      letBN,
+      letBT,
+    )
     monoShAliasBind(origFe, letBN, letBT)
+    // The hole-built return local the body clone annotates (name, type, row) and the two-list type.
     const retOutS: string[] = []
     const retOutIx: i32[] = []
     const nret = monoMakeInstanceRet(
@@ -10432,7 +10707,7 @@ function monoMakeInstanceGo(
       pinTys,
       pinnedTyIx,
       letTyCol,
-      tps,
+      k.tps,
       tvN,
       tvV,
       letBN,
@@ -10441,20 +10716,14 @@ function monoMakeInstanceGo(
       retOutIx,
     )
     if nret < -1 { return -1 }
-    // The hole-built return local the body clone annotates, "" for none.
-    const monoOutName = retOutS[0]
-    const monoOutType = retOutS[1]
-    const monoOutTypeIx = retOutIx[0]
     const twoListTy = retOutIx[1]
     let instName = fn.fnName
-    let instFe = origFe
     // A frame-keyed instance never takes the template's slot, whose frame is the template's.
     const slotFree = count == (monoFramedPushes.get(origFe) ?? 0)
     const first = slotFree && callFrame < 0
     if !first {
       instName = monoMakeInstanceLaterName(fn, origFe, count, slotFree)
     }
-    const noTyParams: string[] = []
     monoMakeInstanceCloPins(params, pinKinds, pinTys)
     // Substitute type-param annotations in the body's `LetDecl`s for this instance (a
     // `const out: T[]` becomes `const out: f64[]`); shares the body wholesale when it has
@@ -10469,16 +10738,16 @@ function monoMakeInstanceGo(
       nret,
       params,
       letTyCol,
-      tps,
+      k.tps,
       tvN,
       tvV,
       letBN,
       letBT,
       instHoleN,
       instHoleT,
-      monoOutName,
-      monoOutType,
-      monoOutTypeIx,
+      retOutS[0],
+      retOutS[1],
+      retOutIx[0],
     )
     const lamClones = monoLamCloneSlots
     monoLamCloneSlots = []
@@ -10490,43 +10759,35 @@ function monoMakeInstanceGo(
       pinTys,
       pinnedTyIx,
       cbFnNames,
-      tps,
+      k.tps,
       tvN,
       tvV,
-      exSubN,
-      exSubT,
+      k.exSubN,
+      k.exSubT,
       letBN,
       letBT,
     )
-    const instRet = monoMakeInstanceRetIx(fn, origFe, nret)
-    if instBody != fn.fnBody { bodyRebuiltFrom.set(instBody, fn.fnBody) }
-    const nfn = mkFunc(instName, noTyParams, nps, instRet, instBody, -1)
-    // D926 — the return-row twin of the param mark above. `monoOrigNode[origFe]` is the
-    // template's own `FuncDecl`, which is what `anonLeafMarkRetMoved` marked.
-    anonLeafCarryRetMark(monoOrigNode[origFe], nfn)
-    if first {
-      monoMakeInstanceFirst(origFe, nfn, calleeIx, instName)
-    } else {
-      instFe = monoMakeInstanceLater(
-        fn,
-        nfn,
-        origFe,
-        calleeIx,
-        callFrame,
-        instName,
-      )
-      if instFe < 0 { return -1 }
-    }
+    const nfn = monoMakeInstanceFunc(fn, origFe, nret, instBody, instName, nps)
+    const instFe = monoMakeInstanceInstall(
+      fn,
+      nfn,
+      origFe,
+      calleeIx,
+      callFrame,
+      instName,
+      first,
+    )
+    if instFe < 0 { return -1 }
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
     monoMakeInstanceRegister(
-      key,
+      k.key,
       origFe,
       instName,
       instFe,
       twoListTy,
-      exSubN,
-      exSubT,
+      k.exSubN,
+      k.exSubT,
       letBN,
       letBT,
       instHoleN,
@@ -10641,6 +10902,9 @@ function monoInstanceFor(
       }
       if normTypeAtom(rs) != monoInstanceRetName { return 0 }
     }
+    // A type parameter the boundary binds nothing defaults as at an inferred call, so the
+    // binding's instance is the direct call's.
+    monoDefaultUnboundTyParams(fn.fnTyParams, params, tvN, tvV, fn.fnBody)
     const pinned: string[] = []
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, where it has one, so an exact instance keys on them (D2755).
@@ -15374,53 +15638,10 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       // The gate keeps the order change inert: where the argument is a concrete function
       // the two orders agree, so they differ only when one answer is a type variable.
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
-        let pb = 0
-        while pb < args.length {
-          const pbp = P.nodes[params[pb]]
-          if pbp is Param {
-            if pbp.parType >= 0 {
-              const pbAnn = monoDeclAnnName(
-                pbp.parType,
-                tyNameOf(pbp.parType),
-                fn.fnTyParams,
-              )
-              // The ARROW parameters are the ones whose binding is in question; every other
-              // annotation reads its type off the argument the call actually passes.
-              if annArrowAt(pbAnn) < 1 {
-                if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
-                  const pbConc = monoArgPinName(args[pb], ctx)
-                  if pbConc != "" {
-                    monoBindFromAnn(pbAnn, pbConc, fn.fnTyParams, tvN, tvV)
-                  }
-                }
-              }
-            }
-          }
-          pb = pb + 1
-        }
+        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV)
       }
       monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
-      // A value of two list types handed to a parameter a type parameter spells binds no one
-      // `T`, as the same function spelled without a type parameter cannot (D2766).
-      let ta = 0
-      while ta < args.length {
-        const tat = twoListValueTy(args[ta], ctx)
-        if (
-          tat >= 0
-          && ta < params.length
-          && monoParamIsTyParamList(params[ta], fn.fnTyParams)
-        ) {
-          return emitFailAt(
-            "argument "
-              + i32ToStr(ta + 1)
-              + ": "
-              + tyToStr(tat)
-              + " is two list types, not one list — narrow with `is` first",
-            args[ta],
-          )
-        }
-        ta = ta + 1
-      }
+      if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
       monoPreBindPastUnionRest(params, args, fn.fnTyParams, ctx, tvN, tvV)
       let oDecl = -1
       if origFe >= 0 && origFe < monoOrigNode.length {
@@ -15431,89 +15652,19 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         const p = P.nodes[params[i]]
         if p is Param {
           if p.parType < 0 {
-            // A parameter the checker already decided is not a hole, so the instance
-            // pins the parameter's own type. `recordedParamPinName` is that one answer,
-            // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
-            let an = recordedParamPinName(params[i])
-            let anTy = -1
-            // One copy of the parameter cannot hold a generic its body calls at two instances;
-            // the split plan gives it one per instance (D6210). The walk goes on, so every such
-            // parameter is asked in one compile.
-            if an == "" && holeFnSplitHas(params[i]) {
-              fsAsk(params[i])
-              emitFailAt(
-                "emitProgram: monomorphize: `"
-                  + p.parName
-                  + "` is called at two instances of the function handed to it in a call to `"
-                  + fn.fnName
-                  + "`",
-                args[i],
-              )
-            }
-            if an == "" {
-              const pinTy: i32[] = [0 - 1]
-              an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
-              anTy = pinTy[0]
-              if an == "" && monoHoleGenTwoPins {
-                return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
-              }
-            }
-            if an == "" {
-              const cpTy: i32[] = [0 - 1]
-              an = monoHoleLitCopyPin(callIx, oDecl, args, i, ctx, cpTy)
-              anTy = cpTy[0]
-            }
-            if an == "" {
-              const llTy: i32[] = [0 - 1]
-              an = monoHoleLeafLitPin(oDecl, args, i, ctx, llTy)
-              anTy = llTy[0]
-            }
-            if an == "" {
-              const flTy: i32[] = [0 - 1]
-              an = monoOpenFnListPin(oDecl, args[i], i, ctx, flTy)
-              anTy = flTy[0]
-            }
-            if an == "" {
-              const inTy: i32[] = [0 - 1]
-              an = monoInertParamStubPin(oDecl, args[i], i, inTy)
-              anTy = inTy[0]
-            }
-            if an == "" { an = monoArgPinName(args[i], ctx) }
-            if an == "" {
-              const lamTy: i32[] = [0 - 1]
-              an = monoHoleLamArgPin(callIx, oDecl, args, i, ctx, lamTy)
-              if an != "" { anTy = lamTy[0] }
-            }
-            if an == "" {
-              const pinTy: i32[] = [0 - 1]
-              an = monoOpenFnFlowPin(
-                args[i],
-                ctx,
-                monoHoleParamBindTy(callIx, oDecl, i),
-                pinTy,
-              )
-              anTy = pinTy[0]
-            }
-            if an == "" {
-              // A name handed through an identity call into a binding can take a slot per type.
-              if P.nodes[args[i]] is Ident {
-                fsAsk(args[i])
-                fsAsk(params[i])
-              }
-              return monoArgTyFail(p.parName, fn.fnName)
-            }
-            pinned.push(an)
-            if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
-            pinTys.push(anTy)
-            if monoFwdFnPinMisfits(fn, params[i], args[i], anTy) {
-              // The plan gives the parameter one per type its calls take (D6202).
-              fsAsk(params[i])
-              return monoFwdFnPinFail(p.parName, fn.fnName)
-            }
-            if monoHoleCopyCallsMisfit(fn, params[i], anTy) {
-              fsAsk(params[i])
-              return monoHoleManyPinsFail(p.parName, fn.fnName)
-            }
+            const hr = monoPinHoleParam(
+              p,
+              fn,
+              params,
+              args,
+              i,
+              callIx,
+              ctx,
+              oDecl,
+              pinned,
+              pinTys,
+            )
+            if hr < 0 { return hr }
           } else {
             const pr = monoPinAnnotatedParam(
               p,
@@ -15580,6 +15731,171 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
   0
 }
 
+// Binds `fn`'s type parameters from the concrete arguments at its non-arrow annotations.
+function monoPreBindNonArrowArgs(
+  fn: FuncDecl,
+  params: i32[],
+  args: i32[],
+  ctx: i32,
+  tvN: string[],
+  tvV: string[],
+) {
+  let pb = 0
+  while pb < args.length {
+    const pbp = P.nodes[params[pb]]
+    if pbp is Param {
+      if pbp.parType >= 0 {
+        const pbAnn = monoDeclAnnName(
+          pbp.parType,
+          tyNameOf(pbp.parType),
+          fn.fnTyParams,
+        )
+        // The ARROW parameters are the ones whose binding is in question; every other
+        // annotation reads its type off the argument the call actually passes.
+        if annArrowAt(pbAnn) < 1 {
+          if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
+            const pbConc = monoArgPinName(args[pb], ctx)
+            if pbConc != "" {
+              monoBindFromAnn(pbAnn, pbConc, fn.fnTyParams, tvN, tvV)
+            }
+          }
+        }
+      }
+    }
+    pb = pb + 1
+  }
+}
+
+// Refuses an argument of two list types at a type-parameter list parameter of `fn`: -1, else 0.
+function monoTwoListArgFail(
+  fn: FuncDecl,
+  params: i32[],
+  args: i32[],
+  ctx: i32,
+): i32 {
+  // A value of two list types handed to a parameter a type parameter spells binds no one
+  // `T`, as the same function spelled without a type parameter cannot (D2766).
+  let ta = 0
+  while ta < args.length {
+    const tat = twoListValueTy(args[ta], ctx)
+    if (
+      tat >= 0
+      && ta < params.length
+      && monoParamIsTyParamList(params[ta], fn.fnTyParams)
+    ) {
+      return emitFailAt(
+        "argument "
+          + i32ToStr(ta + 1)
+          + ": "
+          + tyToStr(tat)
+          + " is two list types, not one list — narrow with `is` first",
+        args[ta],
+      )
+    }
+    ta = ta + 1
+  }
+  0
+}
+
+// Pins un-annotated `p`, `fn`'s `i`th parameter, into `pinned`/`pinTys`: -1 on a refusal, else 0.
+function monoPinHoleParam(
+  p: Param,
+  fn: FuncDecl,
+  params: i32[],
+  args: i32[],
+  i: i32,
+  callIx: i32,
+  ctx: i32,
+  oDecl: i32,
+  pinned: string[],
+  pinTys: i32[],
+): i32 {
+  // A parameter the checker already decided is not a hole, so the instance
+  // pins the parameter's own type. `recordedParamPinName` is that one answer,
+  // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
+  let an = recordedParamPinName(params[i])
+  let anTy = -1
+  // One copy of the parameter cannot hold a generic its body calls at two instances;
+  // the split plan gives it one per instance (D6210). The walk goes on, so every such
+  // parameter is asked in one compile.
+  if an == "" && holeFnSplitHas(params[i]) {
+    fsAsk(params[i])
+    emitFailAt(
+      "emitProgram: monomorphize: `"
+        + p.parName
+        + "` is called at two instances of the function handed to it in a call to `"
+        + fn.fnName
+        + "`",
+      args[i],
+    )
+  }
+  if an == "" {
+    const pinTy: i32[] = [0 - 1]
+    an = monoHoleGenFnPin(callIx, params[i], args[i], ctx, pinTy)
+    anTy = pinTy[0]
+    if an == "" && monoHoleGenTwoPins {
+      return monoHoleTwoPinsFail(args[i], p.parName, fn.fnName)
+    }
+  }
+  if an == "" {
+    const cpTy: i32[] = [0 - 1]
+    an = monoHoleLitCopyPin(callIx, oDecl, args, i, ctx, cpTy)
+    anTy = cpTy[0]
+  }
+  if an == "" {
+    const llTy: i32[] = [0 - 1]
+    an = monoHoleLeafLitPin(oDecl, args, i, ctx, llTy)
+    anTy = llTy[0]
+  }
+  if an == "" {
+    const flTy: i32[] = [0 - 1]
+    an = monoOpenFnListPin(oDecl, args[i], i, ctx, flTy)
+    anTy = flTy[0]
+  }
+  if an == "" {
+    const inTy: i32[] = [0 - 1]
+    an = monoInertParamStubPin(oDecl, args[i], i, inTy)
+    anTy = inTy[0]
+  }
+  if an == "" { an = monoArgPinName(args[i], ctx) }
+  if an == "" {
+    const lamTy: i32[] = [0 - 1]
+    an = monoHoleLamArgPin(callIx, oDecl, args, i, ctx, lamTy)
+    if an != "" { anTy = lamTy[0] }
+  }
+  if an == "" {
+    const pinTy: i32[] = [0 - 1]
+    an = monoOpenFnFlowPin(
+      args[i],
+      ctx,
+      monoHoleParamBindTy(callIx, oDecl, i),
+      pinTy,
+    )
+    anTy = pinTy[0]
+  }
+  if an == "" {
+    // A name handed through an identity call into a binding can take a slot per type.
+    if P.nodes[args[i]] is Ident {
+      fsAsk(args[i])
+      fsAsk(params[i])
+    }
+    return monoArgTyFail(p.parName, fn.fnName)
+  }
+  pinned.push(an)
+  if anTy < 0 { anTy = monoArgPinTyIx(args[i], ctx) }
+  pinTys.push(anTy)
+  if monoFwdFnPinMisfits(fn, params[i], args[i], anTy) {
+    // The plan gives the parameter one per type its calls take (D6202).
+    fsAsk(params[i])
+    return monoFwdFnPinFail(p.parName, fn.fnName)
+  }
+  if monoHoleCopyCallsMisfit(fn, params[i], anTy) {
+    fsAsk(params[i])
+    return monoHoleManyPinsFail(p.parName, fn.fnName)
+  }
+  0
+}
+
 // `monoInstantiateCall`'s pin for the annotated parameter `p`, the `i`th of `fn`'s, given
 // argument `args[i]`: binds the type parameters the annotation rides into `tvN`/`tvV` and pushes
 // the parameter's pin onto `pinned` and its arena type onto `pinTys`, `decl` the declaration whose
@@ -15608,81 +15924,21 @@ function monoPinAnnotatedParam(
     // matching the pattern against the argument's concrete type name, then
     // pin the substituted annotation. A concrete annotation pins unchanged.
     if monoAnnHasTyParam(ann, fn.fnTyParams) {
-      // A function-type param (`f: (A, T) => A`) binds from the closure
-      // argument's function-type name; any other composite (`Box<T>`, `{a:T}`)
-      // from its concrete value-type name.
-      let anC = ""
-      // The argument's own `#anonN` row, kept as the parameter's pin where its spelled
-      // shape would resolve to a declared record sharing the field names.
-      let anRowPin = ""
-      if annArrowAt(ann) >= 1 {
-        anC = monoArgFnTypeName(args[i], ctx)
-        // A generic function value takes the type the value arguments bound (D3913).
-        if monoCalleeIsGeneric(unwrapParen(args[i])) {
-          const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
-          if pre != "" { anC = pre }
-        }
-      } else {
-        anC = monoArgPinName(args[i], ctx)
-        // An anonymous row's `#anonN` has no fields to match the pattern against;
-        // the checker's spelled shape does, unless the render softens a literal (D3123).
-        const anTy = nodeTyIxOf(unwrapParen(args[i]))
-        if (
-          anC.length >= 5
-          && anC.slice(0, 5) == "#anon"
-          && !monoAnonArgSoftens(args[i], anTy)
-        ) {
-          const anSp = monoAnnPinName(tyToEmitName(anTy))
-          if anSp != "" {
-            if !monoSpelledShapeStaysAnon(anSp) { anRowPin = anC }
-            anC = anSp
-          }
-        }
-        if anC == "" && monoLitHoldsGenericFn(args[i], 0) {
-          anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
-        }
-      }
-      if anC == "" { return monoArgTyFail(p.parName, fn.fnName) }
-      monoBindFromAnn(
+      const cr = monoPinTyParamComposite(
+        p,
+        fn,
         ann,
-        monoArgBindSpelling(ann, anC, args[i]),
-        fn.fnTyParams,
+        params,
+        args,
+        i,
+        callIx,
+        ctx,
         tvN,
         tvV,
+        pinned,
+        pinTys,
       )
-      if monoAnnIsUnion(p.parType) {
-        monoDefaultAnnTyParams(
-          ann,
-          fn.fnTyParams,
-          tvN,
-          tvV,
-          fn.fnBody,
-          params,
-          i,
-          callIx,
-        )
-      }
-      let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
-      if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
-        pinC = monoUnionRestPin[i]
-      }
-      if anRowPin != "" && pinC != "" { pinC = anRowPin }
-      if anRowPin == "" && pinC != "" {
-        pinC = monoSubstAnonShapes(ann, fn.fnTyParams, tvN, tvV, pinC)
-      }
-      if pinC == "" { return monoArgTyFail(p.parName, fn.fnName) }
-      // The coercion `monoWalk` deferred, since at that point the pin names
-      // would be the type variables themselves. `pinC` is the substituted
-      // spelling, the concrete function type that parameter takes.
-      if annArrowAt(ann) >= 1 || nameIsClosureArray(pinC) {
-        if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 { return -1 }
-      }
-      pinned.push(pinC)
-      // A generic function value's own type still rides its type variables, so
-      // it names no row this pin denotes; the substituted spelling is the answer.
-      let pinCTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
-      if pinCTy >= 0 && tyHasTyVar(pinCTy) { pinCTy = -1 }
-      pinTys.push(pinCTy)
+      if cr < 0 { return cr }
     } else {
       pinned.push(ann)
       pinTys.push(monoArgPinTyIx(args[i], ctx))
@@ -15786,6 +16042,99 @@ function monoPinAnnotatedParam(
       pinTys.push(an2Ty)
     }
   }
+  0
+}
+
+// Pins parameter `p`'s composite annotation `ann` riding type params: -1 on a refusal, else 0.
+function monoPinTyParamComposite(
+  p: Param,
+  fn: FuncDecl,
+  ann: string,
+  params: i32[],
+  args: i32[],
+  i: i32,
+  callIx: i32,
+  ctx: i32,
+  tvN: string[],
+  tvV: string[],
+  pinned: string[],
+  pinTys: i32[],
+): i32 {
+  // A function-type param (`f: (A, T) => A`) binds from the closure
+  // argument's function-type name; any other composite (`Box<T>`, `{a:T}`)
+  // from its concrete value-type name.
+  let anC = ""
+  // The argument's own `#anonN` row, kept as the parameter's pin where its spelled
+  // shape would resolve to a declared record sharing the field names.
+  let anRowPin = ""
+  if annArrowAt(ann) >= 1 {
+    anC = monoArgFnTypeName(args[i], ctx)
+    // A generic function value takes the type the value arguments bound (D3913).
+    if monoCalleeIsGeneric(unwrapParen(args[i])) {
+      const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+      if pre != "" { anC = pre }
+    }
+  } else {
+    anC = monoArgPinName(args[i], ctx)
+    // An anonymous row's `#anonN` has no fields to match the pattern against;
+    // the checker's spelled shape does, unless the render softens a literal (D3123).
+    const anTy = nodeTyIxOf(unwrapParen(args[i]))
+    if (
+      anC.length >= 5
+      && anC.slice(0, 5) == "#anon"
+      && !monoAnonArgSoftens(args[i], anTy)
+    ) {
+      const anSp = monoAnnPinName(tyToEmitName(anTy))
+      if anSp != "" {
+        if !monoSpelledShapeStaysAnon(anSp) { anRowPin = anC }
+        anC = anSp
+      }
+    }
+    if anC == "" && monoLitHoldsGenericFn(args[i], 0) {
+      anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+    }
+  }
+  if anC == "" { return monoArgTyFail(p.parName, fn.fnName) }
+  monoBindFromAnn(
+    ann,
+    monoArgBindSpelling(ann, anC, args[i]),
+    fn.fnTyParams,
+    tvN,
+    tvV,
+  )
+  if monoAnnIsUnion(p.parType) {
+    monoDefaultAnnTyParams(
+      ann,
+      fn.fnTyParams,
+      tvN,
+      tvV,
+      fn.fnBody,
+      params,
+      i,
+      callIx,
+    )
+  }
+  let pinC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+  if i < monoUnionRestPin.length && monoUnionRestPin[i] != "" {
+    pinC = monoUnionRestPin[i]
+  }
+  if anRowPin != "" && pinC != "" { pinC = anRowPin }
+  if anRowPin == "" && pinC != "" {
+    pinC = monoSubstAnonShapes(ann, fn.fnTyParams, tvN, tvV, pinC)
+  }
+  if pinC == "" { return monoArgTyFail(p.parName, fn.fnName) }
+  // The coercion `monoWalk` deferred, since at that point the pin names
+  // would be the type variables themselves. `pinC` is the substituted
+  // spelling, the concrete function type that parameter takes.
+  if annArrowAt(ann) >= 1 || nameIsClosureArray(pinC) {
+    if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 { return -1 }
+  }
+  pinned.push(pinC)
+  // A generic function value's own type still rides its type variables, so
+  // it names no row this pin denotes; the substituted spelling is the answer.
+  let pinCTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
+  if pinCTy >= 0 && tyHasTyVar(pinCTy) { pinCTy = -1 }
+  pinTys.push(pinCTy)
   0
 }
 
@@ -16695,50 +17044,7 @@ function monoWalk(ix: i32, ctx: i32) {
     }
     return 0
   }
-  if n is LetDecl {
-    // A list holding an alias of a capture cell's read is followed only where every read of it
-    // is a call of one element (`fs[0](…)`), which is taken through the cell.
-    if monoListInitHoldsCellAlias(n.letInit, ctx) {
-      if (
-        n.letKw != "const"
-        || !monoListOnlyCalled(ctx, n.letName, ix, monoListLitLength(n.letInit))
-      ) {
-        return monoCellAliasListFail(n.letInit)
-      }
-      monoCellAliasListOk = n.letInit
-    }
-    // A list of generic functions called only through its elements takes the type the calls give
-    // it, as an annotation would (D3977).
-    if monoListInitHoldsGeneric(n.letInit, ctx) && n.letType < 0 {
-      if monoPinListElems(n, ix, ctx) < 0 { return -1 }
-    }
-    if (
-      n.letType < 0
-      && n.letKw == "const"
-      && n.letInit >= 0
-      && P.nodes[n.letInit] is ObjLit
-    ) {
-      if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
-    }
-    monoNoteInertInit(n, ix, ctx)
-    // An annotated function-typed binding to a generic named function: materialize the
-    // instance for the annotation's param types and point the binding at it, so the value
-    // carries that concrete type independent of any call — it may escape where call-driven
-    // monomorphization cannot reach.
-    if monoCoerceFnValue(n.letInit, n.letType, ctx) < 0 { return -1 }
-    // So is each literal a call in the initializer returns (`monoFlowAnnLits`).
-    // Each instance there must return the slot's own type, since nothing adapts it on the way.
-    monoInstanceExactRet = true
-    for lit in monoFlowAnnLitsOf(ix) {
-      if monoCoerceFnValue(lit, n.letType, monoTopFrameOf(lit)) < 0 {
-        monoInstanceExactRet = false
-        return -1
-      }
-    }
-    monoInstanceExactRet = false
-    if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
-    return monoWalk(n.letInit, ctx)
-  }
+  if n is LetDecl { return monoWalkLetDecl(n, ix, ctx) }
   if n is IfStmt {
     if monoWalk(n.ifCond, ctx) < 0 { return -1 }
     if monoWalk(n.ifThen, ctx) < 0 { return -1 }
@@ -16875,6 +17181,52 @@ function monoWalk(ix: i32, ctx: i32) {
   // reaches here: the checker lowers every exhaustive `match` to an if/else chain and
   // overwrites the arena slot in place, so by emit time its arms sit in `IfStmt` limbs.
   0
+}
+
+// `monoWalk`'s arm for the binding `n` at node `ix` in frame `ctx`.
+function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
+  // A list holding an alias of a capture cell's read is followed only where every read of it
+  // is a call of one element (`fs[0](…)`), which is taken through the cell.
+  if monoListInitHoldsCellAlias(n.letInit, ctx) {
+    if (
+      n.letKw != "const"
+      || !monoListOnlyCalled(ctx, n.letName, ix, monoListLitLength(n.letInit))
+    ) {
+      return monoCellAliasListFail(n.letInit)
+    }
+    monoCellAliasListOk = n.letInit
+  }
+  // A list of generic functions called only through its elements takes the type the calls give
+  // it, as an annotation would (D3977).
+  if monoListInitHoldsGeneric(n.letInit, ctx) && n.letType < 0 {
+    if monoPinListElems(n, ix, ctx) < 0 { return -1 }
+  }
+  if (
+    n.letType < 0
+    && n.letKw == "const"
+    && n.letInit >= 0
+    && P.nodes[n.letInit] is ObjLit
+  ) {
+    if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
+  }
+  monoNoteInertInit(n, ix, ctx)
+  // An annotated function-typed binding to a generic named function: materialize the
+  // instance for the annotation's param types and point the binding at it, so the value
+  // carries that concrete type independent of any call — it may escape where call-driven
+  // monomorphization cannot reach.
+  if monoCoerceFnValue(n.letInit, n.letType, ctx) < 0 { return -1 }
+  // So is each literal a call in the initializer returns (`monoFlowAnnLits`).
+  // Each instance there must return the slot's own type, since nothing adapts it on the way.
+  monoInstanceExactRet = true
+  for lit in monoFlowAnnLitsOf(ix) {
+    if monoCoerceFnValue(lit, n.letType, monoTopFrameOf(lit)) < 0 {
+      monoInstanceExactRet = false
+      return -1
+    }
+  }
+  monoInstanceExactRet = false
+  if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
+  return monoWalk(n.letInit, ctx)
 }
 
 // `monoWalk`'s arm for a call `n` (node `ix`, in frame `ctx`) whose callee is the identifier
