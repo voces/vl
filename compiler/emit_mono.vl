@@ -280,6 +280,7 @@ import {
   parentLetOf,
   parentLetOfAt,
   pushUniqueAtom,
+  retVoidAnnFlag,
   tyIsFuncType,
   tyNameOf,
   unwrapParen,
@@ -12947,11 +12948,8 @@ function monoDiscardedStmtsIn(st: i32, out: i32[], depth: i32) {
   const n = P.nodes[st]
   match n {
     IfStmt => {
-      monoDiscardedTailIn(n.ifThen, out, depth)
-      if n.ifElse >= 0 && P.nodes[n.ifElse] is IfStmt {
-        return monoDiscardedStmtsIn(n.ifElse, out, depth + 1)
-      }
-      return monoDiscardedTailIn(n.ifElse, out, depth)
+      for t in monoIfArmValuesOf(n) { monoDiscardedStmtsIn(t, out, depth + 1) }
+      return 0
     }
     WhileStmt => {
       return monoDiscardedTailIn(n.whileBody, out, depth)
@@ -12970,10 +12968,10 @@ function monoDiscardedStmtsIn(st: i32, out: i32[], depth: i32) {
 
 // The block arm of `monoDiscardedStmtsIn`: block `b`'s last statement, discarded in turn.
 function monoDiscardedTailIn(b: i32, out: i32[], depth: i32) {
-  if b < 0 || b >= P.nodes.length { return 0 }
-  const n = P.nodes[b]
-  if !(n is Block) || n.blkStmts.length == 0 { return 0 }
-  monoDiscardedStmtsIn(n.blkStmts[n.blkStmts.length - 1], out, depth + 1)
+  const t: i32[] = []
+  monoBlockTailInto(b, t)
+  for s in t { monoDiscardedStmtsIn(s, out, depth + 1) }
+  0
 }
 
 // The generic function names in value `v` (`monoGenericValuesIn`).
@@ -13218,7 +13216,7 @@ function monoInertLetHits(
 }
 
 // Appends to `lens` the uses of `name` in the value function `fd`'s body ends with, when its
-// result is inert.
+// result is inert or declared `void`, which discards that value.
 function monoInertTailHits(
   fd: i32,
   name: string,
@@ -13230,14 +13228,11 @@ function monoInertTailHits(
   if !(f is FuncDecl) || f.fnBody < 0 { return 0 }
   const b = P.nodes[f.fnBody]
   if !(b is Block) || b.blkStmts.length == 0 { return 0 }
-  monoInertRetHits(
-    b.blkStmts[b.blkStmts.length - 1],
-    fd,
-    name,
-    mode,
-    lens,
-    depth,
-  )
+  const tail = b.blkStmts[b.blkStmts.length - 1]
+  if retVoidAnnFlag(f.fnRet) != 0 {
+    return monoDiscardedHitsOf(tail, name, mode, lens)
+  }
+  monoInertRetHits(tail, fd, name, mode, lens, depth)
 }
 
 // Appends to `lens` the uses of `name` in value `v` function `fx` returns, when every call of
@@ -13260,8 +13255,8 @@ function monoPushAll(out: i32[], xs: i32[]) {
   0
 }
 
-// The uses of `name` value `v` is, through parentheses, list elements and record fields (the
-// places `monoGenericValuesIn` finds a generic function): each read of it under
+// The uses of `name` value `v` is, through parentheses, list elements, record fields and `if`
+// branches (the places `monoGenericValuesIn` finds a generic function): each read of it under
 // `MONO_INERT_READS`, the callee of each call of it under `MONO_INERT_CALLS`.
 function monoInertHitsOf(v: i32, name: string, mode: i32): i32[] {
   const out: i32[] = []
@@ -13296,6 +13291,35 @@ function monoInertHitsIn(
         monoInertHitsIn(f.fiValue, name, mode, out, depth + 1)
       }
     }
+  } else if n is IfStmt {
+    for t in monoIfArmValuesOf(n) {
+      monoInertHitsIn(t, name, mode, out, depth + 1)
+    }
+  }
+  0
+}
+
+// The values `if` expression `n` hands on: the last statement of each branch, an `else if`
+// being one (D6981). The `null` an else-less `if` also hands on holds no function.
+function monoIfArmValuesOf(n: IfStmt): i32[] {
+  const out: i32[] = []
+  monoBlockTailInto(n.ifThen, out)
+  if n.ifElse >= 0 && n.ifElse < P.nodes.length {
+    if P.nodes[n.ifElse] is IfStmt {
+      out.push(n.ifElse)
+    } else {
+      monoBlockTailInto(n.ifElse, out)
+    }
+  }
+  out
+}
+
+// Appends block `b`'s last statement to `out`; nothing for an empty block or a non-block.
+function monoBlockTailInto(b: i32, out: i32[]) {
+  if b < 0 || b >= P.nodes.length { return 0 }
+  const n = P.nodes[b]
+  if n is Block {
+    if n.blkStmts.length > 0 { out.push(n.blkStmts[n.blkStmts.length - 1]) }
   }
   0
 }
@@ -13351,7 +13375,7 @@ function monoColdFieldsOf(x: i32, name: string, mode: i32, out: string[]) {
 }
 
 // Appends to `out` each name of a generic function in value `v`, through parentheses, list
-// elements and record fields.
+// elements, record fields and the branches of an `if` (`monoIfArmValuesOf`).
 function monoGenericValuesIn(v: i32, out: i32[], depth: i32) {
   const x = unwrapParen(v)
   if x < 0 || depth > 8 { return 0 }
@@ -13367,7 +13391,8 @@ function monoGenericValuesIn(v: i32, out: i32[], depth: i32) {
   monoGenericFieldValuesIn(x, out, depth)
 }
 
-// The record-literal arm of `monoGenericValuesIn`; every other kind holds no function by name.
+// The record-literal and `if` arms of `monoGenericValuesIn`; every other kind holds no function
+// by name.
 function monoGenericFieldValuesIn(x: i32, out: i32[], depth: i32) {
   const n = P.nodes[x]
   if n is ObjLit {
@@ -13375,6 +13400,8 @@ function monoGenericFieldValuesIn(x: i32, out: i32[], depth: i32) {
       const f = P.nodes[fi]
       if f is FieldInit { monoGenericValuesIn(f.fiValue, out, depth + 1) }
     }
+  } else if n is IfStmt {
+    for t in monoIfArmValuesOf(n) { monoGenericValuesIn(t, out, depth + 1) }
   }
   0
 }
@@ -17510,6 +17537,12 @@ function monoWalkFnBody(fnIx: i32) {
         const tail = b.blkStmts[b.blkStmts.length - 1]
         if monoCoerceRetAtPin(tail, fnIx) < 0 { return -1 }
         monoNoteInertRet(tail, fnIx)
+      }
+    } else if retVoidAnnFlag(fn.fnRet) != 0 && fn.fnBody >= 0 {
+      // A `void` body's last statement is discarded like any other.
+      const b = P.nodes[fn.fnBody]
+      if b is Block && b.blkStmts.length > 0 {
+        monoNoteInertStmt(b.blkStmts[b.blkStmts.length - 1])
       }
     }
     return monoWalk(fn.fnBody, fnIx)
