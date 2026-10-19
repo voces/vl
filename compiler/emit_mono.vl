@@ -11339,23 +11339,32 @@ function monoCallIfBound(ix: i32, ctx: i32): i32 {
   monoRetypeIfInit(d.letInit, g0, n.callFn, lf[0])
 }
 
-// For read `at` in frame `ctx` of an `if`-bound binding (`monoIfBindingOf`) delivered past a
-// return: instances each arm at the one signature the flow table pins the binding at, and types
-// each call taking that pin at it (D7001). No pin leaves the value to the emitter's refusal.
+// For value `at` in frame `ctx` delivered past a return that is an `if` naming generic functions
+// in every arm, or a read of an `if`-bound binding (`monoIfBindingOf`): instances each arm at the
+// one signature the flow table pins the binding, or the first arm's read, at, and types each call
+// taking that pin at it (D7001, D7011). No pin leaves the value to the emitter's refusal.
 function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
+  if at < 0 { return 0 }
   const lf = monoIfBindingOf(at, ctx)
-  if lf[1] < 0 { return 0 }
-  const d = P.nodes[lf[1]]
-  if !(d is LetDecl) { return 0 }
-  const iv = unwrapParen(d.letInit)
-  const g0 = monoFirstArmGenName(iv, lf[0], 0)
+  let init = at
+  if lf[1] >= 0 {
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) { return 0 }
+    init = d.letInit
+  } else if !(P.nodes[at] is IfStmt) || !monoValueNamesGenerics(at, ctx, 0) {
+    return 0
+  }
+  const iv = unwrapParen(init)
+  const fr = if lf[1] >= 0 { lf[0] } else { ctx }
+  const g0 = monoFirstArmGenName(iv, fr, 0)
   if g0 < 0 { return 0 }
+  const key = if lf[1] >= 0 { lf[1] } else { g0 }
   const noPath: string[] = []
-  const ct = monoSlotPinName(lf[1], noPath, lf[0])
-  if ct == "" { return 0 }
-  if monoCoerceFnValueName(iv, ct, lf[0], -1) < 0 { return -1 }
-  monoRetypeIfInit(d.letInit, g0, at, lf[0])
-  monoRetypePinCalls(lf[1], noPath)
+  const ct = monoSlotPinName(key, noPath, fr)
+  if ct == "" { return monoAskRetCopies(fr, key, ctx) }
+  if monoCoerceFnValueName(iv, ct, fr, -1) < 0 { return -1 }
+  monoRetypeIfInit(init, g0, at, fr)
+  monoRetypePinCalls(key, noPath)
 }
 
 // The frame and declaration `[fr, d]` of the binding read `rd` in frame `ctx` names, through a
@@ -18825,7 +18834,12 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   if v < 0 { return 0 }
   const x = unwrapParen(v)
   if x < 0 { return 0 }
-  if monoIfBindingOf(x, ctx)[1] >= 0 { return monoIfBoundRetAtPin(x, ctx) }
+  if (
+    monoIfBindingOf(x, ctx)[1] >= 0
+    || P.nodes[x] is IfStmt && monoValueNamesGenerics(x, ctx, 0)
+  ) {
+    return monoIfBoundRetAtPin(x, ctx)
+  }
   if !monoNamesDeclaredGeneric(x, ctx) && monoReadGenFnFe(x) < 0 { return 0 }
   const noPath: string[] = []
   // An alias of one is pinned at its own binding, which the flow table keys the read by (D5400).
@@ -18845,17 +18859,21 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     }
   }
   const nm = monoSlotPinName(d, noPath, fr)
-  if nm == "" {
-    // Two pins past the return ask for a copy of the function per result pin (D5531).
-    const lfp = [fr, d]
-    // An instance asks for its template, which is what the plan copies.
-    let asked = ctx
-    if it[0] == ctx && it[1] >= 0 { asked = it[1] }
-    if monoDeclPathPins(lfp, noPath).length > 1 { fsAsk(asked) }
-    return 0
-  }
+  if nm == "" { return monoAskRetCopies(fr, d, ctx) }
   if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
   monoRetypePinCalls(d, noPath)
+}
+
+// For a value keyed `d` in frame `fr` that frame `ctx` returns with no one pin: two pins past
+// the return ask for a copy of the function per result pin (D5531). An instance asks for its
+// template, which is what the plan copies.
+function monoAskRetCopies(fr: i32, d: i32, ctx: i32): i32 {
+  const noPath: string[] = []
+  const it = monoFrameInstTmpl(ctx)
+  let asked = ctx
+  if it[0] == ctx && it[1] >= 0 { asked = it[1] }
+  if monoDeclPathPins([fr, d], noPath).length > 1 { fsAsk(asked) }
+  0
 }
 
 // Whether every write of the binding `d` the checker gave a closed function type takes the

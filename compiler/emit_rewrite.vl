@@ -404,6 +404,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
     return -1
   }
   if loop is WhileStmt && lvBlockIsOwnValue(x, ty) {
+    lvTailBreaks(loop.whileBody, loop.whileLabel, ty, true)
     lvIfAt(x, loop.whileBody, ty, atStmt)
     return x
   }
@@ -458,15 +459,101 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   y
 }
 
-// Whether node `x` is a labelled block no `break` leaves whose value, of type `ty`, holds a
-// function of an open signature: it is its own value, since a carrier's annotation could not
-// spell that signature (D6990).
+// Whether node `x` is a labelled block whose value, of type `ty`, holds a function of an open
+// signature, and every `break` leaving it ends a branch its value takes: it is its own value,
+// since a carrier's annotation could not spell that signature (D6990, D7010).
 function lvBlockIsOwnValue(x: i32, ty: i32): boolean {
   if x < 0 || x >= P.nodes.length || ty < 0 { return false }
   const n = P.nodes[x]
   if !(n is WhileStmt) || n.whileBlk != 1 { return false }
   if !tyHasTyVar(ty) || !tyMayHoldFn(ty, 0) { return false }
-  lvRewriteBreaks(n.whileBody, n.whileLabel, "", -1, ty, 0, false) == 0
+  const all = lvRewriteBreaks(n.whileBody, n.whileLabel, "", -1, ty, 0, false)
+  all == lvTailBreaks(n.whileBody, n.whileLabel, ty, false)
+}
+
+// The `break`s leaving the block labelled `label` that end block `b` or, through an `if` ending
+// it, an arm; with `strip` each is removed, so its value ends the branch.
+function lvTailBreaks(b: i32, label: string, ty: i32, strip: boolean): i32 {
+  if b < 0 || b >= P.nodes.length { return 0 }
+  const n = P.nodes[b]
+  if n is IfStmt {
+    if n.ifElse < 0 { return 0 }
+    const k = lvTailBreaks(n.ifThen, label, ty, strip)
+      + lvTailBreaks(n.ifElse, label, ty, strip)
+    if strip && k > 0 {
+      nodeTyRecord(b, ty)
+      valueIfAdd(b)
+    }
+    return k
+  }
+  if !(n is Block) { return 0 }
+  lvTailFrom(b, 0, label, ty, strip)
+}
+
+// `lvTailBreaks` over block `b`'s statements from `from`. An `if` with no `else` whose arm ends
+// in such a `break` guards the rest, which `strip` moves into that `if`'s `else`.
+function lvTailFrom(
+  b: i32,
+  from: i32,
+  label: string,
+  ty: i32,
+  strip: boolean,
+): i32 {
+  const n = P.nodes[b]
+  if !(n is Block) { return 0 }
+  const st = n.blkStmts
+  let k = st.length
+  if k <= from { return 0 }
+  let i = from
+  while i < k - 1 {
+    const s = P.nodes[st[i]]
+    if (
+      s is IfStmt
+      && s.ifElse < 0
+      && lvTailBreaks(s.ifThen, label, ty, false) > 0
+    ) {
+      if !strip {
+        return lvTailBreaks(s.ifThen, label, ty, false)
+          + lvTailFrom(b, i + 1, label, ty, false)
+      }
+      const rest: i32[] = []
+      let j = i + 1
+      while j < k {
+        rest.push(st[j])
+        j = j + 1
+      }
+      while st.length > i + 1 { st.pop() }
+      s.ifElse = mkBlock(rest, s.pos)
+      return lvTailFrom(b, i, label, ty, true)
+    }
+    i = i + 1
+  }
+  // An arm that exits ends in the `__trap__` `exitArmsEndNever` appended after its `break`.
+  const tl = P.nodes[st[k - 1]]
+  const trapped = k - from > 1
+    && tl is Call
+    && isIdentNamed(tl.callFn, "__trap__")
+    && P.nodes[st[k - 2]] is BreakStmt
+  if trapped { k = k - 1 }
+  const last = P.nodes[st[k - 1]]
+  if last is BreakStmt {
+    if (
+      k - from < 2
+      || last.brkHasVal != 1
+      || !lvLeaves(last.brkLabel, label, 0, false)
+    ) {
+      return 0
+    }
+    if strip {
+      if trapped { st.pop() }
+      st.pop()
+      nodeTyRecord(b, ty)
+    }
+    return 1
+  }
+  const r = lvTailBreaks(st[k - 1], label, ty, strip)
+  if strip && r > 0 { nodeTyRecord(b, ty) }
+  r
 }
 
 // Writes at `x` the if-expression `if true { thenB } else { __trap__() }` of type `ty`, in a
