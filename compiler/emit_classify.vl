@@ -1707,12 +1707,6 @@ function globalIsF64ArraySid(fnIx: i32, sid: i32, atIx: i32) {
   letIsF64Array(li, -1)
 }
 
-function globalIsNulRefSid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsNulRef(li, -1)
-}
-
 function globalIsNulListSid(fnIx: i32, sid: i32, atIx: i32) {
   const li = globalLetOfSidIn(fnIx, sid, atIx)
   if li < 0 { return false }
@@ -2783,7 +2777,14 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
     // above speaks for a storage class this one does not.
     const fns = frameLetOf(fnIx, e.identName, exprIx)
     if fns >= 0 && letIsNulRef(fns, fnIx) { return true }
-    return globalIsNulRefSid(fnIx, sidOfNode(exprIx), exprIx)
+    const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx)
+    if gli >= 0 { return letIsNulRef(gli, -1) }
+    // The module frame's block `let`, which is neither a frame's nor a global: a capture's env
+    // field is typed with no frame current, so only this rung sees its niche (D6730).
+    if frameChainBindsName(fnIx, e.identName) { return false }
+    const mli = moduleLocalLetOfAt(emitRootIx, e.identName, exprIx)
+    if mli >= 0 { return letIsNulRef(mli, -1) }
+    return false
   }
   // A nested-struct field read (code 15) is stored `(ref null $S)`: an `S | null` field
   // genuinely carries null, and a plain `inner: S` field shares the nullable storage, so
@@ -3146,6 +3147,23 @@ function letInitTyIsNarrowedNulStr(letIx: i32, fnIx: i32): boolean {
   false
 }
 
+// The scalar cell of an un-annotated binding whose initializer is narrowed to a number or a
+// boolean out of a wider box, or null. The narrowed read unboxes, so the cell is the scalar;
+// asked of the checker's type so a capture's env field agrees with the frame (D6771).
+function letInitTyNarrowedScalarKind(letIx: i32, fnIx: i32): VKind | null {
+  const d = P.nodes[letIx]
+  if d is LetDecl {
+    if d.letType >= 0 || d.letInit < 0 { return null }
+    const ty = nodeTyInOf(d.letInit, fnIx)
+    const pn = tyPrimNameOf(ty)
+    if pn == null || pn == "string" || pn == "void" { return null }
+    if !letInitIsBox(d.letInit, fnIx) { return null }
+    const rd = repOfTy(ty)
+    if rd.rdCovered == 1 { return rd.rdKind }
+  }
+  null
+}
+
 // Does the binding at `letIx` take its value from a `??` whose niche operand joins to the
 // union box? The binding-side twin of the lowering's own gate, so the slot and the value
 // agree about the rep.
@@ -3184,6 +3202,8 @@ function letInitCellKind(letIx: i32, fnIx: i32): VKind {
   if letInitTyIsNarrowedNulArm(letIx, fnIx) { return "nulvariant" }
   if letInitTyIsNarrowedLit(letIx, fnIx) { return "str" }
   if letInitTyIsNarrowedNulStr(letIx, fnIx) { return "nulstr" }
+  const nsk = letInitTyNarrowedScalarKind(letIx, fnIx)
+  if nsk != null { return nsk }
   // A nullable map, before `letIsMap`, whose `(ref $mapStruct)` cell cannot hold null.
   if letIsNulMap(letIx, fnIx) { return "nulmap" }
   // A bare `const t = m[k]` read of a list- or nested-map-valued map binds the value's
@@ -4484,7 +4504,14 @@ export function captureValStructIdx(fe: i32, name: string) {
       }
       if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
       if letIsNulVariant(b, pf) { return nulVariantIdxOfLet(b, pf) }
-      if letIsNulRef(b, pf) { return nulRefStructIdxOfLet(b, pf) }
+      if letIsNulRef(b, pf) {
+        const nri = nulRefStructIdxOfLet(b, pf)
+        if nri >= 0 { return nri }
+        // A copy of a narrowed module-block binding has no syntactic row; the checker's recorded
+        // type names the row its cell is declared at (D6730).
+        if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
+        return nulStructRowOfNodeTy(bn.letInit)
+      }
       if letIsNulRefArray(b, pf) { return nulRefArrayInnerSlotOfLet(b, pf) }
       if letIsRefArray(b, pf) && !letIsUnion(b, pf) {
         return letRefListSlot(b, pf)
@@ -10339,6 +10366,8 @@ export function arrLitUnionElemName(arrIx: i32): string {
   const ety = nodeArrayElemTyIx(arrIx)
   // A numeric literal union keys to its own row but reps as its base scalar: no union element.
   if tyNumScalarBaseName(ety) != "" { return "" }
+  // A union of lists that all spell one list is that list, never a box (D6732).
+  if oneListUnionRender(ety) != "" { return "" }
   if !isUNameAB(16, cen, ety) { return "" }
   if arrLitIsStr(arrIx, -1) { return "" }
   if arrLitNumKind(arrIx, -1) != ALK_NONE { return "" }
@@ -12435,7 +12464,7 @@ export function exprNullableVariant(exprIx: i32, fnIx: i32) {
     // The predicate the CELL takes its kind from, both faces: an annotated global whose
     // annotation names the non-null arm still holds the niche when its initializer is one,
     // and reading the annotation alone here makes the kind and its reader disagree (D1672).
-    // The struct twin shares `letIsNulRef` through `globalIsNulRefSid` for that reason.
+    // The struct twin asks `letIsNulRef` of the global for that reason.
     const gi = globalLetOfIn(fnIx, e.identName, exprIx)
     if gi >= 0 { return letIsNulVariant(gi, -1) }
     // The frame's own `let` and the module frame's, arm for arm with `nulVariantIdxOfExpr`'s
@@ -15227,6 +15256,19 @@ export function refListElemNameOfExpr(exprIx: i32, fnIx: i32) {
   ""
 }
 
+// The ref-list row of the bare list annotation on the return of the function `name` read at
+// `calleeIx` resolves to, or -1. The arena's row, which is the one the signature declares.
+function calleeAnnRetRefListSlot(name: string, calleeIx: i32, fnIx: i32): i32 {
+  const fe = fnIndexOfInScopeAt(sidOfNode(calleeIx), name, fnIx, calleeIx)
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const fd = P.nodes[fnStmts[fe]]
+  if fd is FuncDecl {
+    if fd.fnRet < 0 { return -1 }
+    return annBareRefArrSlot(fd.fnRet)
+  }
+  -1
+}
+
 // The ref-list element name a call `e` returns: an `__array_new__` fill, a named or
 // closure callee's result slot, `m.values()`, or a `.map`/`.filter` result. "" when the
 // result is not a ref list.
@@ -15256,6 +15298,9 @@ function refListElemNameOfCall(e: Call, exprIx: i32, fnIx: i32): string {
   }
   const callee = P.nodes[e.callFn]
   if callee is Ident {
+    // A declared list return's element is the row its signature's result names (D6731).
+    const asl = calleeAnnRetRefListSlot(callee.identName, e.callFn, fnIx)
+    if asl >= 0 && asl < rlElemName.length { return rlElemName[asl] }
     const fn = fnRetRefArrayNameSid(
       sidOfNode(e.callFn),
       callee.identName,
@@ -15464,7 +15509,18 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
     }
   }
   const outer = refListElemNameOfExpr(e.idxArr, fnIx)
-  if outer != "" && nameIsArray(outer) { return refArrElemName(outer) }
+  if outer != "" && nameIsArray(outer) {
+    // The outer row's own inner row, ahead of cutting a `[]` off its name: a structural name
+    // can key a same-layout record declared earlier than the one the items are built at (D6731).
+    const os = rlSlotByName(outer)
+    if rlSlotIsKindList(os, RLK_REF_LIST) {
+      const ins = rlElemInnerSlot(os)
+      if ins >= 0 && ins < rlElemName.length {
+        if rlSlotByName(rlElemName[ins]) == ins { return rlElemName[ins] }
+      }
+    }
+    return refArrElemName(outer)
+  }
   // A `(S[] | null)[]` cell read UN-narrowed: the element is a nullable ref list, so the
   // row it produces is the inner list's, the same answer the kind-18 arms above give a
   // narrowed read. Without this the name is not an array and the walk falls off its end.
