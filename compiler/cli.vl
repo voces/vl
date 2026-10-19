@@ -91,6 +91,12 @@ import {
   vcDiagData,
   vcDiagMsg,
   vcFmtOut,
+  wiArm,
+  wiBankedCount,
+  wiBankedKey,
+  wiBankedMod,
+  wiServed,
+  wiTargetAdd,
 } from "./driver"
 import {
   mimpExtraSet,
@@ -229,6 +235,7 @@ const ST_BUDGET_FINDINGS = 25 // got the `--findings` report's source
 const ST_CHECK_ENQUEUED = 26  // the host queued one root for the root pool
 const ST_CHECK_POOLED = 27    // the host committed every queued root's outcome
 const ST_CHECK_NEXT = 28      // a worker awaits its next root (`cliCheckNextRoot`)
+const ST_WI_READ = 29         // got a root's source, read for its imports before the pool
 
 // ── protocol state ────────────────────────────────────────────────────────────
 let cliArgs: string[] = []      // committed argv (cliArgs[0] = the subcommand)
@@ -1388,6 +1395,7 @@ function cliCheckCurFile() {
     rc = compileSrc()
   } else {
     rc = checkSrc()
+    cliWiBankRows()
   }
   cliFixPassRc = rc
   cliLastStage = ""
@@ -1673,43 +1681,101 @@ function cliAddReportStreams() {
     )
     fd = fd + 1
   }
-  // Redundant explicit type annotations (a `hint`): `let x: T = e` where the
-  // initializer already infers to exactly `T`. Entry module only — a graph compile
-  // merges every module's AST, but only the entry's findings carry positions that map
-  // onto the file being reported or rewritten. The span is `cliRedunEndCol`'s.
+  // The checker's hints and warnings for the entry module: an importer's when a bank served
+  // this check, else this check's own (`cliStreamRows`).
+  let rows = cliStreamRows(0)
+  if wiServed() { rows = cliWiRows[cliCurFile] ?? cliRowsNew() }
+  let ri = 0
+  while ri < rows.sev.length {
+    cliAddDiagSpan(
+      rows.sev[ri],
+      "type",
+      rows.code[ri],
+      rows.line[ri],
+      rows.col[ri],
+      rows.endLine[ri],
+      rows.endc[ri],
+      rows.msg[ri],
+      0,
+    )
+    ri = ri + 1
+  }
+}
+
+// The checker's rows of one module, in report order, as `cliStreamRows` reads them.
+type CliRows = {
+  sev: string[],
+  code: string[],
+  line: i32[],
+  col: i32[],
+  endLine: i32[],
+  endc: i32[],
+  msg: string[],
+}
+// Per target key, the rows an importer's check read for it (`cliWiBankRows`).
+let cliWiRows: {[string]: CliRows} = Map()
+
+function cliRowsNew(): CliRows {
+  { sev: [], code: [], line: [], col: [], endLine: [], endc: [], msg: [] }
+}
+
+function cliRowAdd(
+  r: CliRows,
+  sev: string,
+  code: string,
+  line: i32,
+  col: i32,
+  endLine: i32,
+  endc: i32,
+  msg: string,
+) {
+  r.sev.push(sev)
+  r.code.push(code)
+  r.line.push(line)
+  r.col.push(col)
+  r.endLine.push(endLine)
+  r.endc.push(endc)
+  r.msg.push(msg)
+  0
+}
+
+// Module `mod`'s rows of the checker's report streams. Only the entry's are reported, since a
+// graph check merges every module and only the entry's positions map onto the reported file.
+function cliStreamRows(mod: i32): CliRows {
+  const r = cliRowsNew()
+  // Redundant explicit type annotations (a `hint`): `let x: T = e` where the initializer
+  // already infers to exactly `T`. The span is `cliRedunEndCol`'s.
   let ri = 0
   while ri < redunCount() {
-    if redunModuleAt(ri) == 0 {
-      cliAddDiagSpan(
+    if redunModuleAt(ri) == mod {
+      cliRowAdd(
+        r,
         "hint",
-        "type",
         "redundant-type",
         redunSLineAt(ri),
         redunSColAt(ri),
         redunELineAt(ri),
         cliRedunEndCol(ri),
         redunMsgAt(ri),
-        0,
       )
     }
     ri = ri + 1
   }
-  // Dead `??` defaults (a `warning`): `x ?? d` where `x`'s type admits no null. Same
-  // stream discipline as the hint above — entry module only, one spelling of the
-  // message (`rcoalMsgAt`). The severity matches the lint pass's `constant-condition`,
-  // the same family of a branch never taken.
+  // Dead `??` defaults (a `warning`): `x ?? d` where `x`'s type admits no null. The severity
+  // matches the lint pass's `constant-condition`, the same family of a branch never taken.
   let ci = 0
   while ci < rcoalCount() {
-    if rcoalModuleAt(ci) == 0 {
-      cliAddDiag(
+    if rcoalModuleAt(ci) == mod {
+      const ln = rcoalLineAt(ci)
+      cliRowAdd(
+        r,
         "warning",
-        "type",
         rcoalCodeAt(ci),
-        rcoalLineAt(ci),
+        ln,
         rcoalColAt(ci),
+        ln,
         rcoalEndAt(ci),
         rcoalMsgAt(ci),
-        0,
       )
     }
     ci = ci + 1
@@ -1718,40 +1784,53 @@ function cliAddReportStreams() {
   // the program runs, and the advice is to freeze the host-facing signature.
   let ei = 0
   while ei < expInfCount() {
-    if expInfModuleAt(ei) == 0 {
-      cliAddDiag(
+    if expInfModuleAt(ei) == mod {
+      const ln = expInfLineAt(ei)
+      cliRowAdd(
+        r,
         "hint",
-        "type",
         "inferred-export-param",
-        expInfLineAt(ei),
+        ln,
         expInfColAt(ei),
+        ln,
         expInfEndAt(ei),
         expInfMsgAt(ei),
-        0,
       )
     }
     ei = ei + 1
   }
-  // `is <literal>` over an operand whose union collapsed (a `hint`): the subsumed-arm
-  // ruling makes `string | "err"` the type `string`, so the test is a value compare.
-  // Same stream discipline as the two above. A `hint` and not a warning: the program is
-  // correct, and the advice is about the design of the author's error channel.
+  // `is <literal>` over an operand whose union collapsed (a `hint`): the subsumed-arm ruling
+  // makes `string | "err"` the type `string`, so the test is a value compare. A `hint`, since
+  // the program is correct and the advice is about the author's error channel.
   let vi = 0
   while vi < isvalCount() {
-    if isvalModuleAt(vi) == 0 {
-      cliAddDiag(
+    if isvalModuleAt(vi) == mod {
+      const ln = isvalLineAt(vi)
+      cliRowAdd(
+        r,
         "hint",
-        "type",
         isvalCodeAt(vi),
-        isvalLineAt(vi),
+        ln,
         isvalColAt(vi),
+        ln,
         isvalEndAt(vi),
         isvalMsgAt(vi),
-        0,
       )
     }
     vi = vi + 1
   }
+  r
+}
+
+// After a check that banked targets for serving (`wiBankedCount`), read each one's rows now,
+// while the check's streams still name its modules.
+function cliWiBankRows() {
+  let i = 0
+  while i < wiBankedCount() {
+    cliWiRows[wiBankedKey(i)] = cliStreamRows(wiBankedMod(i))
+    i = i + 1
+  }
+  0
 }
 
 // `--budget`: note this file's findings of every budgeted code, at any severity, that the
@@ -2042,6 +2121,7 @@ function cliTestWorkerDone(code: CliExit, msg: string) {
 // pool first. `--fix` writes files and `--codegen` hands each module to the engine, so
 // both keep every root in this instance. A worker checks each root the host hands it.
 function cliCheckStart() {
+  cliWiStart()
   if cliCheckPoolMode == 2 { return cliCheckWorkerBegin() }
   if (
     cliCheckPoolMode == 1
@@ -2050,9 +2130,130 @@ function cliCheckStart() {
     && cliCodegen == 0
   ) {
     cliCheckEnqIdx = 0
+    if cliWiOn {
+      cliWiReadIdx = 0
+      cliWiImports = []
+      return cliWiReadNext()
+    }
     return cliCheckEnqueueNext()
   }
   cliStartFile()
+}
+
+// ── serving a root from an importer's check (`wiArm`) ─────────────────────────
+// A plain check of two or more roots arms the driver to serve a root whose whole check an
+// earlier root's check already holds. The pool queues importers first, so a worker meets a
+// root's importer before the root; the report keeps the walk's order either way.
+let cliWiOn = false
+let cliWiReadIdx = 0
+// Per root, the module keys its source imports directly.
+let cliWiImports: string[][] = []
+// The queue order, as indices into `cliFiles`, and how many outcomes the pool has committed.
+let cliWiPerm: i32[] = []
+let cliWiCommits = 0
+
+function cliWiStart() {
+  cliWiOn = cliFiles.length >= 2
+    && cliFix == 0
+    && cliCodegen == 0
+    && cliBudget == 0
+  cliWiPerm = []
+  cliWiCommits = 0
+  cliWiRows = Map()
+  if !cliWiOn {
+    wiArm(0, 0)
+    return 0
+  }
+  wiArm(1, 0)
+  for f in cliFiles { wiTargetAdd(f) }
+  0
+}
+
+// Read the next root for its imports, or — all read — queue the roots importers first.
+function cliWiReadNext() {
+  while cliWiReadIdx < cliFiles.length {
+    const path = cliFiles[cliWiReadIdx]
+    const ci = cliSrcCacheGet(path)
+    if ci < 0 {
+      cliCmdPath = path
+      cliState = ST_WI_READ
+      return CMD_READ_FILE
+    }
+    cliWiImports.push(
+      cliWiImportsOf(path, cliSrcCacheSrcs[ci], cliSrcCacheFound[ci]),
+    )
+    cliWiReadIdx = cliWiReadIdx + 1
+  }
+  cliWiPerm = cliWiOrder()
+  cliCheckEnqueueNext()
+}
+
+// The module keys source `src` of root `path` imports, as its own check resolves them.
+function cliWiImportsOf(path: string, src: string, found: i32): string[] {
+  const out: string[] = []
+  if found == 0 || cliNeedsModules(src) == 0 { return out }
+  modReset()
+  cliModCommitOne(path, src, 1)
+  let k = 0
+  while k < modPendingCount() {
+    out.push(cliPendingKey(k))
+    k = k + 1
+  }
+  modReset()
+  out
+}
+
+// The roots ordered by how many other roots each reaches through roots' imports, most
+// first, the walk's order breaking ties.
+function cliWiOrder(): i32[] {
+  const ix: {[string]: i32} = Map()
+  let f = 0
+  while f < cliFiles.length {
+    ix[cliFiles[f]] = f
+    f = f + 1
+  }
+  const reach: i32[] = []
+  f = 0
+  while f < cliFiles.length {
+    const seen: boolean[] = []
+    for _ in cliFiles { seen.push(false) }
+    seen[f] = true
+    const work: i32[] = [f]
+    let w = 0
+    while w < work.length {
+      const row = if work[w] < cliWiImports.length { cliWiImports[work[w]] } else { [] }
+      for key in row {
+        const d = ix[key] ?? -1
+        if d >= 0 && !seen[d] {
+          seen[d] = true
+          work.push(d)
+        }
+      }
+      w = w + 1
+    }
+    reach.push(work.length - 1)
+    f = f + 1
+  }
+  const perm: i32[] = []
+  const done: boolean[] = []
+  for _ in cliFiles { done.push(false) }
+  while perm.length < cliFiles.length {
+    let best = -1
+    let g = 0
+    while g < cliFiles.length {
+      if !done[g] && (best < 0 || reach[g] > reach[best]) { best = g }
+      g = g + 1
+    }
+    done[best] = true
+    perm.push(best)
+  }
+  perm
+}
+
+// The root the pool's `j`th queue slot holds.
+function cliWiSlot(j: i32): i32 {
+  if j < cliWiPerm.length { return cliWiPerm[j] }
+  j
 }
 
 // A worker begins root `cliCheckPick`, baselining the report so its payload is that
@@ -2092,8 +2293,13 @@ function cliCheckEnqueueNext() {
     cliState = ST_CHECK_POOLED
     return CMD_CHECK_POOL
   }
-  cliCmdPath = cliFiles[cliCheckEnqIdx]
-  cliCmdData = i32ToStr(cliFileFromDir[cliCheckEnqIdx])
+  const root = cliWiSlot(cliCheckEnqIdx)
+  if root < 0 || root >= cliFiles.length || root >= cliFileFromDir.length {
+    cliState = ST_CHECK_POOLED
+    return CMD_CHECK_POOL
+  }
+  cliCmdPath = cliFiles[root]
+  cliCmdData = i32ToStr(cliFileFromDir[root])
   cliCheckEnqIdx = cliCheckEnqIdx + 1
   cliState = ST_CHECK_ENQUEUED
   CMD_CHECK_ENQUEUE
@@ -2516,8 +2722,25 @@ export function cliCheckNextRoot(pick: i32) {
 // different root (the tree changed under the walk) is checked here too.
 export function cliCheckPooledCommit(status: i32) {
   const payload = cpAccTake(cliResultAcc)
-  const f = cliPoolStatus.length
-  if f >= cliFiles.length { return 0 }
+  // Queued importers first, the slots name roots out of order: every root starts as
+  // checked here, and each outcome fills its own.
+  if cliWiCommits == 0 {
+    while cliPoolStatus.length < cliFiles.length {
+      cliPoolStatus.push(1)
+      cliPoolPayload.push("")
+    }
+  }
+  const j = cliWiCommits
+  cliWiCommits = cliWiCommits + 1
+  const f = cliWiSlot(j)
+  if (
+    f < 0
+    || f >= cliFiles.length
+    || f >= cliPoolStatus.length
+    || f >= cliPoolPayload.length
+  ) {
+    return 0
+  }
   let st = 1
   if status == 0 {
     cliPpSrc = payload
@@ -2525,8 +2748,8 @@ export function cliCheckPooledCommit(status: i32) {
     if cliPpStr() == cliFiles[f] { st = 0 }
     cliPpSrc = ""
   }
-  cliPoolStatus.push(st)
-  if st == 0 { cliPoolPayload.push(payload) } else { cliPoolPayload.push("") }
+  cliPoolStatus[f] = st
+  if st == 0 { cliPoolPayload[f] = payload }
   0
 }
 // A test name, one code point at a time (the `cliDirNamePush` idiom).
@@ -4208,6 +4431,10 @@ export function cliNext() {
   }
   if st == ST_TEST_ENQUEUED { return cliTestEnqueueNext() }
   if st == ST_CHECK_ENQUEUED { return cliCheckEnqueueNext() }
+  if st == ST_WI_READ {
+    cliSrcCachePut(cliFiles[cliWiReadIdx], cliFileSrc, cliFileFound)
+    return cliWiReadNext()
+  }
   if st == ST_CHECK_NEXT { return cliCheckWorkerBegin() }
   if st == ST_CHECK_POOLED {
     cliFileIdx = 0
