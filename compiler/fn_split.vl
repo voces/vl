@@ -398,6 +398,7 @@ function fsDestTy(r: i32): i32 {
     for nm in pn.callArgNames {
       if nm != "" { return -1 }
     }
+    if pn.callFn < 0 { return -1 }
     const cf = P.nodes[pn.callFn]
     if cf is Member && nodeTyIxOf(cf.memObj) >= 0 {
       const rv = T.tys[nodeTyIxOf(cf.memObj)]
@@ -837,13 +838,23 @@ function fsPlanTyParams(): i32 {
     const p = P.nodes[o]
     const fd = fsParent[o]
     const retype: i32[] = []
-    let ok = p is Param && p.parType >= 0 && fd >= 0 && P.nodes[fd] is FuncDecl
+    let ok = p is Param && fd >= 0 && P.nodes[fd] is FuncDecl
     let tp = ""
     if ok && p is Param {
-      const tn = P.nodes[p.parType]
       const f = P.nodes[fd]
-      ok = tn is TypeRef && f is FuncDecl && hasStr(f.fnTyParams, tn.tyName)
-      if tn is TypeRef { tp = tn.tyName }
+      if p.parType < 0 {
+        // An un-annotated one stands for a type parameter of its function the bindings it
+        // seeds name (D6760).
+        ok = f is FuncDecl
+          && f.fnTyParams.length > 0
+          && p.parDefault < 0
+          && p.parRest == 0
+        if ok && f is FuncDecl { tp = f.fnTyParams[0] }
+      } else {
+        const tn = P.nodes[p.parType]
+        ok = tn is TypeRef && f is FuncDecl && hasStr(f.fnTyParams, tn.tyName)
+        if tn is TypeRef { tp = tn.tyName }
+      }
     }
     for r in fsIdents {
       const c = fsParent[r]
@@ -1889,10 +1900,17 @@ function fsFnCalls(fd: i32): i32[] {
       if identDeclOf(r) == d && r != d && !hasI32(pkArg, r) {
         const c = fsParent[r]
         const cn = P.nodes[c]
-        if c < 0 { calls.push(-1) }
-        else if cn is Call && cn.callFn == r { calls.push(c) }
-        else if fsFnAliasInit(c) == r && !hasI32(decls, c) { decls.push(c) }
-        else { calls.push(-1) }
+        if c < 0 {
+          calls.push(-1)
+        } else if cn is Call && cn.callFn == r {
+          calls.push(c)
+        } else if fsFnAliasInit(c) == r && !hasI32(decls, c) {
+          decls.push(c)
+        } else if cn is ArrayLit {
+          for lc in fsListCalls(c) { calls.push(lc) }
+        } else {
+          calls.push(-1)
+        }
         while cps.length < calls.length { cps.push(-1) }
       }
     }
@@ -1924,6 +1942,40 @@ function fsFnCalls(fd: i32): i32[] {
     }
   }
   fsFnCallsCopy = cps
+  calls
+}
+
+// The calls through one-element list literal `arr` that an un-annotated `const` binding holds,
+// each `xs[0](...)`; [-1] when the list is read any other way (D6764).
+function fsListCalls(arr: i32): i32[] {
+  const an = P.nodes[arr]
+  const d = fsParent[arr]
+  if d < 0 || !(an is ArrayLit) || an.arrElems.length != 1 { return [-1] }
+  const dn = P.nodes[d]
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit != arr
+  ) {
+    return [-1]
+  }
+  const calls: i32[] = []
+  for r in fsIdents {
+    if identDeclOf(r) == d && r != d {
+      const x = fsParent[r]
+      if x < 0 { return [-1] }
+      const xn = P.nodes[x]
+      if !(xn is Index) || xn.idxArr != r { return [-1] }
+      const ix = P.nodes[xn.idxIndex]
+      if !(ix is NumLit) || ix.numText != "0" { return [-1] }
+      const c = fsParent[x]
+      if c < 0 { return [-1] }
+      const cn = P.nodes[c]
+      if !(cn is Call) || cn.callFn != x { return [-1] }
+      calls.push(c)
+    }
+  }
   calls
 }
 
@@ -2123,9 +2175,62 @@ function fsHoleCopyKeys(r: i32): string[] {
       }
     }
   }
+  if ok && ks.length == 0 {
+    const tk = fsTyParamCopyKey(d)
+    if tk != "" { ks.push(tk) }
+  }
   hsCopyDepth = hsCopyDepth - 1
   if !ok || ks.length == 0 { return bad }
   ks
+}
+
+// The one key of the parameter annotated bare with the type parameter unread binding `d` is
+// annotated with, which fixes the instance the binding holds (D6762); "" when there is none.
+function fsTyParamCopyKey(d: i32): string {
+  const dn = P.nodes[d]
+  // A binding the type-parameter plan retypes holds the instance of its own parameter.
+  if !(dn is LetDecl) || dn.letType < 0 || hasI32(psRetype, dn.letType) {
+    return ""
+  }
+  const tn = P.nodes[dn.letType]
+  const fd = fsEnclosingFn(d)
+  if fd < 0 || !(tn is TypeRef) { return "" }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) || !hasStr(f.fnTyParams, tn.tyName) { return "" }
+  let own = -1
+  for q in f.fnParams {
+    const qn = P.nodes[q]
+    if qn is Param && qn.parType >= 0 {
+      const qt = P.nodes[qn.parType]
+      if qt is TypeRef && qt.tyName == tn.tyName {
+        if own >= 0 { return "" }
+        own = q
+      }
+    }
+  }
+  if own < 0 { return "" }
+  const ks = fsQuietHoleKeys(own)
+  if ks.length != 1 { return "" }
+  ks[0]
+}
+
+// Hole parameter `q`'s keys, through its forwards, with `hsBad` untouched; empty when it
+// cannot take a parameter per type.
+function fsQuietHoleKeys(q: i32): string[] {
+  const none: string[] = []
+  const was = hsBad
+  hsBad = false
+  const ks = fsHoleKeys(q)
+  const bad = hsBad
+  hsBad = was
+  if bad { return none }
+  ks
+}
+
+// Whether asked parameter `a` joins the split set: one the type-parameter plan annotates only
+// when its reads take two keys, so a plan that can hold it whole is not declined for it.
+function fsHoleOverTyParam(a: i32): boolean {
+  !hasI32(psPar, a) || fsQuietHoleKeys(a).length > 1
 }
 
 // The keys a read handed to a hole parameter takes: that hole's, through its forwards; empty
@@ -2134,13 +2239,7 @@ function fsHoleFwdKeys(r: i32): string[] {
   const none: string[] = []
   const q = fsHoleFwd(r)
   if q < 0 { return none }
-  const was = hsBad
-  hsBad = false
-  const ks = fsHoleKeys(q)
-  const bad = hsBad
-  hsBad = was
-  if bad { return none }
-  ks
+  fsQuietHoleKeys(q)
 }
 
 // Asks every other binding handed to the hole read `a` is handed to whose reads take two slot
@@ -2203,12 +2302,16 @@ function fsLetMemberKeys(d: i32): i32 {
 }
 
 // The slot key of read `r` of a split binding: a read handed to an unsplit hole takes the one
-// key that hole is called at, any other read `fsReadKey`'s.
+// key that hole is called at, a read handed to a closed function type that type's call key
+// (D6761), any other read `fsReadKey`'s.
 function fsMemberReadKey(r: i32): string {
-  if hsIx(fsHoleFwd(r)) < 0 {
+  const q = fsHoleFwd(r)
+  if hsIx(q) < 0 {
     const hk = fsHoleFwdKeys(r)
     if hk.length == 1 { return hk[0] }
   }
+  const dk = fsFixedDeliveryKey(r, q)
+  if dk != "" { return dk }
   const ik = fsIdentityReadKey(r)
   if ik != "" { return ik }
   fsReadKey(r)
@@ -2261,7 +2364,13 @@ function fsPlanHoles(): i32 {
   hsBad = false
   const work: i32[] = []
   for a in fsAsks {
-    if a >= 0 && a < fsParseLen && P.nodes[a] is Param && !hasI32(pkPar, a) {
+    if (
+      a >= 0
+      && a < fsParseLen
+      && P.nodes[a] is Param
+      && !hasI32(pkPar, a)
+      && fsHoleOverTyParam(a)
+    ) {
       work.push(a)
     }
   }
@@ -2374,7 +2483,10 @@ function fsPlanByName(par: i32): i32 {
   for c in calls {
     if c < 0 || hasI32(paCall, c) || (hasI32(pkCall, c) && !again) { return 1 }
     const cn = P.nodes[c]
-    if !(cn is Call) { return 1 }
+    // A copy is called by renaming the callee, which only a name can take.
+    if !(cn is Call) || cn.callFn < 0 || !(P.nodes[cn.callFn] is Ident) {
+      return 1
+    }
     const a = fsArgOfParam(cn, f, j)
     const nm = fsFixedFnName(a, own)
     if nm == "" { return 1 }
@@ -2517,6 +2629,7 @@ function fsPlanHoleRewrites(): i32 {
     }
     ppAfter.push(par)
     ppNames.push(extra)
+    fsDropTyParamPlan(par)
     fsStripTyParam(par)
     for r in fsIdents {
       if identDeclOf(r) == par {
@@ -2588,6 +2701,95 @@ function fsPlanHoleRewrites(): i32 {
     hi = hi + 1
   }
   0
+}
+
+// An un-annotated split parameter gives up the type parameter its plan gave it, and a binding
+// it seeds annotated with a type parameter no parameter names goes bare, as do the bindings
+// that plan retyped: each is then a copy of the parameter per slot (D6760).
+function fsDropTyParamPlan(par: i32): i32 {
+  const p = P.nodes[par]
+  const fd = fsParent[par]
+  if fd < 0 || !(p is Param) || p.parType >= 0 { return 0 }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) { return 0 }
+  for r in fsIdents {
+    const c = fsParent[r]
+    const cn = P.nodes[c]
+    if (
+      identDeclOf(r) == par
+      && cn is LetDecl
+      && cn.letInit == r
+      && cn.letType >= 0
+    ) {
+      const tn = P.nodes[cn.letType]
+      if (
+        tn is TypeRef
+        && hasStr(f.fnTyParams, tn.tyName)
+        && !fsParamsName(f, tn.tyName)
+        && !hasI32(ptPar, c)
+      ) {
+        ptPar.push(c)
+      }
+    }
+  }
+  let nm = ""
+  const keepPar: i32[] = []
+  const keepFn: i32[] = []
+  const keepName: string[] = []
+  let i = 0
+  while i < psPar.length {
+    if psPar[i] == par {
+      nm = psName[i]
+    } else {
+      keepPar.push(psPar[i])
+      keepFn.push(psFn[i])
+      keepName.push(psName[i])
+    }
+    i = i + 1
+  }
+  if nm == "" { return 0 }
+  psPar = keepPar
+  psFn = keepFn
+  psName = keepName
+  const keepRe: i32[] = []
+  const keepReName: string[] = []
+  i = 0
+  while i < psRetype.length {
+    const d = fsLetOfType(psRetype[i])
+    if psRetypeName[i] == nm && d >= 0 {
+      if !hasI32(ptPar, d) { ptPar.push(d) }
+    } else {
+      keepRe.push(psRetype[i])
+      keepReName.push(psRetypeName[i])
+    }
+    i = i + 1
+  }
+  psRetype = keepRe
+  psRetypeName = keepReName
+  0
+}
+
+// Whether a parameter of `f` is annotated bare with type name `nm`.
+function fsParamsName(f: FuncDecl, nm: string): boolean {
+  for q in f.fnParams {
+    const qn = P.nodes[q]
+    if qn is Param && qn.parType >= 0 {
+      const qt = P.nodes[qn.parType]
+      if qt is TypeRef && qt.tyName == nm { return true }
+    }
+  }
+  false
+}
+
+// The parsed binding annotated with type node `t`, else -1.
+function fsLetOfType(t: i32): i32 {
+  let i = 0
+  while i < fsParseLen {
+    const n = P.nodes[i]
+    if n is LetDecl && n.letType == t { return i }
+    i = i + 1
+  }
+  -1
 }
 
 // Split parameter `par`'s type-parameter annotation is dropped, with every other parameter's and
@@ -2759,12 +2961,7 @@ function fsAskWrittenHoles(d: i32): i32 {
       && fsHoleCopyDecl(r) == d
       && !hasI32(fsAsks, pd)
     ) {
-      const was = hsBad
-      hsBad = false
-      const ks = fsHoleKeys(pd)
-      const bad = hsBad
-      hsBad = was
-      if !bad && ks.length > 1 { fsAsks.push(pd) }
+      if fsQuietHoleKeys(pd).length > 1 { fsAsks.push(pd) }
     }
   }
   0
@@ -3064,7 +3261,11 @@ function fsApply(): i32 {
   while i < psPar.length {
     const p = P.nodes[psPar[i]]
     const f = P.nodes[psFn[i]]
-    if p is Param && p.parType >= 0 && f is FuncDecl {
+    if p is Param && p.parType < 0 && f is FuncDecl {
+      P.pos = nodeToks[psPar[i]] + 1
+      p.parType = mkTypeRef(psName[i], p.pos)
+      f.fnTyParams.push(psName[i])
+    } else if p is Param && f is FuncDecl {
       rc = fsRenameTypeRef(p.parType, psName[i], rc)
       f.fnTyParams.push(psName[i])
     } else {
@@ -3129,7 +3330,8 @@ function fsApply(): i32 {
       P.pos = nodeToks[a] + 1
       const v = fsValueNode(pdValSrc[i], pdValName[i])
       let ty = -1
-      if pdTy[i] >= 0 {
+      // A lane of a binding whose type parameter is stripped is un-annotated too (D6761).
+      if pdTy[i] >= 0 && !hasI32(ptPar, a) {
         const tn = P.nodes[pdTy[i]]
         if tn is TypeRef { ty = mkTypeRef(tn.tyName, tn.pos) } else { rc = -1 }
       }
@@ -3179,6 +3381,7 @@ function fsApply(): i32 {
     if rc == 0 { rc = fsApplyParams(ppAfter[i], ppNames[i]) }
     i = i + 1
   }
+
   for par in ptPar {
     const p = P.nodes[par]
     if p is Param { p.parType = -1 }
