@@ -2064,23 +2064,56 @@ function monoJoinBinding(
   0
 }
 
-// Build the type-level binding column (`T` ⇒ this instance's concrete type) the way the
-// checker does: `bindGenWalk` over each parameter's declared type against the type the
-// instance pinned that position at. `tyCol` is positional over `params`, -1 meaning
-// "nothing known"; an all -1 column binds nothing and the caller falls back to the names.
-function monoBindCols(params: i32[], tyCol: i32[], bN: string[], bT: i32[]) {
+// The type-level binding column (`T` ⇒ concrete type), built as the checker does: `bindGenWalk`
+// of each signature type (`declTys`, positional) against its pin (`tyCol`, -1 = nothing known).
+// A hole binds only at a closed pin that can hold a function and no literal: its pin name
+// cannot key such a call's result, and softens a literal.
+function monoBindCols(
+  params: i32[],
+  declTys: i32[],
+  tyCol: i32[],
+  bN: string[],
+  bT: i32[],
+) {
   let bi = 0
   while bi < params.length {
     const pp = P.nodes[params[bi]]
     if pp is Param {
       let at = -1
       if bi < tyCol.length { at = tyCol[bi] }
-      bindGenWalk(nodeTyIxOf(pp.parType), at, bN, bT)
-      bindGenUnionShapedArmInto(nodeTyIxOf(pp.parType), at, bN, bT)
+      let decl = nodeTyIxOf(pp.parType)
+      if bi < declTys.length && declTys[bi] >= 0 && !tyHasTyVar(decl) {
+        decl = declTys[bi]
+      }
+      if pp.parType < 0 {
+        if (
+          at >= 0
+          && (!tyMayHoldFn(at, 0) || tyHasLitDeep(at, 8) || tyHasTyVar(at))
+        ) {
+          at = -1
+        }
+      }
+      bindGenWalk(decl, at, bN, bT)
+      bindGenUnionShapedArmInto(decl, at, bN, bT)
     }
     bi = bi + 1
   }
   0
+}
+
+// The parameter types generic `origFe`'s signature declares, where the checker typed it as a
+// function of `n` parameters; else empty. A shared annotation node is re-typed by canon's
+// scope-blind rename and by a diagonal instance, so a type parameter shadowing a declared
+// name reads as one only here.
+function monoDeclParamTys(origFe: i32, n: i32): i32[] {
+  const out: i32[] = []
+  if origFe < 0 || origFe >= monoOrigNode.length { return out }
+  const sig = nodeTyIxOf(monoOrigNode[origFe])
+  if sig < 0 || sig >= T.tys.length { return out }
+  const ft = T.tys[sig]
+  if !(ft is TyFunc) || ft.fnParamTypes.length != n { return out }
+  for pt in ft.fnParamTypes { out.push(pt) }
+  out
 }
 
 // Whether the generic being instantiated declares a lambda. A lambda reading a `(T | null)[]`
@@ -9162,6 +9195,15 @@ function monoMakeInstanceParams(
       // column is what the re-check windows declare the parameters as.
       const anonTy = anonHandleTyIx(pinned[pj])
       if anonTy >= 0 { pinTy = anonTy }
+      // A row first typed through a hole keeps it; the argument's closed type binds it instead.
+      if (
+        anonTy >= 0
+        && tyHasTyVar(anonTy)
+        && pinTys[pj] >= 0
+        && !tyHasTyVar(pinTys[pj])
+      ) {
+        pinTy = pinTys[pj]
+      }
       // The row keeps one function type per field, so a record differing only there (the
       // instance key already tells them apart) binds its own, or every callee typed from
       // the binding reads the row's first signature (D3110).
@@ -10644,7 +10686,13 @@ function monoMakeInstanceGo(
     )
     const letBN: string[] = k.exBN
     const letBT: i32[] = k.exBT
-    monoBindCols(params, letTyCol, letBN, letBT)
+    monoBindCols(
+      params,
+      monoDeclParamTys(origFe, params.length),
+      letTyCol,
+      letBN,
+      letBT,
+    )
     monoShAliasBind(origFe, letBN, letBT)
     // The hole-built return local the body clone annotates (name, type, row) and the two-list type.
     const retOutS: string[] = []
@@ -10854,6 +10902,9 @@ function monoInstanceFor(
       }
       if normTypeAtom(rs) != monoInstanceRetName { return 0 }
     }
+    // A type parameter the boundary binds nothing defaults as at an inferred call, so the
+    // binding's instance is the direct call's.
+    monoDefaultUnboundTyParams(fn.fnTyParams, params, tvN, tvV, fn.fnBody)
     const pinned: string[] = []
     // No argument node on this path: the pins are the parameter types of the function type the
     // checker recorded for the value, where it has one, so an exact instance keys on them (D2755).
