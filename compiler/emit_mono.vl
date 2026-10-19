@@ -11071,7 +11071,16 @@ function monoWrittenGenLetFrame(at: i32, ctx: i32): i32[] {
   const d = P.nodes[lf[1]]
   if !(d is LetDecl) || d.letType >= 0 || d.letKw != "let" { return none }
   if !monoLetWrittenIn(lf) { return none }
-  if !monoNamesDeclaredGeneric(d.letInit, lf[0]) { return none }
+  if d.letInit < 0 { return none }
+  // An `if` seed is each of its arms, the first of which seeds the binding's signature.
+  if (
+    !monoNamesDeclaredGeneric(d.letInit, lf[0])
+    && !(P.nodes[unwrapParen(d.letInit)] is IfStmt
+      && monoValueNamesGenerics(d.letInit, lf[0], 0)
+      && monoLetSeedGenFe(d.letInit, lf[0]) >= 0)
+  ) {
+    return none
+  }
   for w in monoWritesOf("n:", lf[1]) {
     const wn = P.nodes[w]
     if wn is BinExpr {
@@ -11131,6 +11140,119 @@ function monoAdapterCallee(v: i32): i32 {
   c.callFn
 }
 
+// For call `ix` in frame `ctx` through an un-annotated binding never written, or a chain of such
+// copies, whose initializer is an `if` naming generic functions in every arm: instances each arm
+// at the one signature the flow table pins the binding at, else at the one this call takes the
+// first arm at (D6991).
+function monoCallIfBound(ix: i32, ctx: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is Call) || n.callFn < 0 || !(P.nodes[n.callFn] is Ident) { return 0 }
+  let rd = n.callFn
+  let lf = monoReadLetFrame(rd, ctx)
+  let hops = 0
+  while lf[1] >= 0 && hops < MONO_ALIAS_CHAIN_MAX {
+    const ld = P.nodes[lf[1]]
+    if !(ld is LetDecl) || ld.letType >= 0 || ld.letInit < 0 { return 0 }
+    if fnFlowDeclWritten(rd) { return 0 }
+    if !(P.nodes[ld.letInit] is Ident) { break }
+    rd = ld.letInit
+    lf = monoReadLetFrame(rd, lf[0])
+    hops = hops + 1
+  }
+  if lf[1] < 0 { return 0 }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return 0 }
+  const iv = unwrapParen(d.letInit)
+  if iv < 0 || !(P.nodes[iv] is IfStmt) { return 0 }
+  if !monoValueNamesGenerics(iv, lf[0], 0) { return 0 }
+  const g0 = monoFirstArmGenName(iv, lf[0], 0)
+  if g0 < 0 { return 0 }
+  let ct = monoSlotPinName(lf[1], [], lf[0])
+  if ct == "" {
+    ct = monoSeedCallSig(
+      monoFnFeOfIdent(g0, monoIdentNameOf(g0), lf[0]),
+      ix,
+      ctx,
+    )
+    if ct == "!" { return -1 }
+    if ct == "" { return 0 }
+  }
+  if monoCoerceFnValueName(iv, ct, lf[0], -1) < 0 { return -1 }
+  monoRetypeIfInit(d.letInit, g0, n.callFn, lf[0])
+}
+
+// For call `n` (node `ix`, in frame `ctx`) of an `if` naming generic functions in every arm:
+// instances each arm at the type this call takes the first arm at, as a call through a binding
+// of it does.
+function monoCallIfValue(n: Call, ix: i32, ctx: i32): i32 {
+  const iv = unwrapParen(n.callFn)
+  if iv < 0 || !(P.nodes[iv] is IfStmt) { return 0 }
+  if !monoValueNamesGenerics(iv, ctx, 0) { return 0 }
+  const g0 = monoFirstArmGenName(iv, ctx, 0)
+  if g0 < 0 { return 0 }
+  const ct = monoSeedCallSig(
+    monoFnFeOfIdent(g0, monoIdentNameOf(g0), ctx),
+    ix,
+    ctx,
+  )
+  if ct == "!" { return -1 }
+  if ct == "" { return 0 }
+  if monoCoerceFnValueName(iv, ct, ctx, -1) < 0 { return -1 }
+  monoRetypeIfInit(n.callFn, g0, n.callFn, ctx)
+}
+
+// The function type call `ix` in frame `ctx` takes an instance of seed `g` at, the call never
+// renamed to it; "" when it takes none, and "!" once a refusal is recorded.
+function monoSeedCallSig(g: i32, ix: i32, ctx: i32): string {
+  const n = P.nodes[ix]
+  if g < 0 || !(n is Call) { return "" }
+  monoNoRename.push(n.callFn)
+  monoLastInstFe = -1
+  monoWrittenLetSigCall = true
+  const ir = monoInstantiate(g, ix, ctx)
+  monoWrittenLetSigCall = false
+  if ir < 0 { return "!" }
+  if monoLastInstFe < 0 { return "" }
+  monoSigFnTyName(monoSlotSig(monoLastInstFe))
+}
+
+// Records on the `if` initializer `init` of a binding, and on its read `at`, the concrete type
+// of the instance its first arm's name `g0` (`monoFirstArmGenName`) now names in frame `ctx`,
+// where the checker left either open.
+function monoRetypeIfInit(init: i32, g0: i32, at: i32, ctx: i32): i32 {
+  if g0 < 0 { return 0 }
+  const inst = monoFnFeOfIdent(g0, monoIdentNameOf(g0), ctx)
+  if inst < 0 || inst >= fnStmts.length { return 0 }
+  const it = monoPinSubTyOf(nodeTyIxOf(g0), fnStmts[inst])
+  if !monoTyConcreteFn(it) { return 0 }
+  const iv = unwrapParen(init)
+  if iv >= 0 { nodeTyRecord(iv, it) }
+  nodeTyRecord(init, it)
+  const rt = nodeTyIxOf(at)
+  if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(at, it) }
+  0
+}
+
+// The name node of the declared generic the first arm of value `v` names, through nested `if`
+// arms and the checker's adapter lambda; -1 when it names none.
+function monoFirstArmGenName(v: i32, ctx: i32, depth: i32): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return -1 }
+  const n = P.nodes[x]
+  if n is IfStmt {
+    const tv = ifArmValueExpr(n.ifThen)
+    return monoFirstArmGenName(
+      if tv >= 0 { tv } else { n.ifThen },
+      ctx,
+      depth + 1,
+    )
+  }
+  let g = x
+  if !monoNamesDeclaredGeneric(g, ctx) { g = unwrapParen(monoAdapterCallee(x)) }
+  if g < 0 || !monoNamesDeclaredGeneric(g, ctx) { return -1 }
+  g
+}
+
 // For call `ix` in frame `ctx` through a written, un-annotated `let`: coerces the generic
 // functions its initializer and writes name at the one signature the flow table pins the binding
 // at, else at the instance this call takes; -1 when another call takes another type (refused).
@@ -11141,20 +11263,13 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   if lf[1] < 0 { return 0 }
   const d = P.nodes[lf[1]]
   if !(d is LetDecl) { return 0 }
+  const g0 = monoFirstArmGenName(d.letInit, lf[0], 0)
   let ct = monoSlotPinName(lf[1], [], lf[0])
   // With no single pin the call takes the instance its arguments make of the seed; the call is
   // never renamed to it, since a write may have replaced the value.
   if ct == "" {
-    const g = monoListElemGenFe(d.letInit, lf[0])
-    if g < 0 { return 0 }
-    monoNoRename.push(n.callFn)
-    monoLastInstFe = -1
-    monoWrittenLetSigCall = true
-    const ir = monoInstantiate(g, ix, ctx)
-    monoWrittenLetSigCall = false
-    if ir < 0 { return -1 }
-    if monoLastInstFe < 0 { return 0 }
-    ct = monoSigFnTyName(monoSlotSig(monoLastInstFe))
+    ct = monoSeedCallSig(monoLetSeedGenFe(d.letInit, lf[0]), ix, ctx)
+    if ct == "!" { return -1 }
     if ct == "" { return 0 }
   }
   const prev = monoSigCallRet
@@ -11163,6 +11278,10 @@ function monoCallWrittenLet(ix: i32, ctx: i32): i32 {
   monoCoerceWrittenLetValues(n.callFn, ctx, ct)
   monoCellSigByCall = false
   monoSigCallRet = prev
+  // An `if` seed leaves the binding's type open, as a name seed does not.
+  if P.nodes[unwrapParen(d.letInit)] is IfStmt {
+    monoRetypeIfInit(d.letInit, g0, n.callFn, lf[0])
+  }
   0
 }
 
@@ -11554,7 +11673,19 @@ function monoWrittenLetSeedFe(e: i32, ctx: i32): i32 {
   if lf[1] < 0 { return -1 }
   const d = P.nodes[lf[1]]
   if !(d is LetDecl) { return -1 }
-  monoListElemGenFe(d.letInit, lf[0])
+  monoLetSeedGenFe(d.letInit, lf[0])
+}
+
+// The declared generic function seed `v` of a written `let` names in frame `ctx`, or the one its
+// first `if` arm names, as a slot; -1 otherwise.
+function monoLetSeedGenFe(v: i32, ctx: i32): i32 {
+  const fe = monoListElemGenFe(v, ctx)
+  if fe >= 0 { return fe }
+  const x = unwrapParen(v)
+  if x < 0 || !(P.nodes[x] is IfStmt) { return -1 }
+  const g = monoFirstArmGenName(x, ctx, 0)
+  if g < 0 { return -1 }
+  monoFnFeOfIdent(g, monoIdentNameOf(g), ctx)
 }
 
 // ── reads of a literal slot that holds one generic ──────────────────────────────────────────
@@ -14936,7 +15067,7 @@ function monoHoleGenFnPin(
 ): string {
   monoHoleGenTwoPins = false
   monoHoleGenManyPins = false
-  const bt = monoHoleGenFnTy(callIx, pIx, argIx)
+  const bt = monoHoleGenFnTy(callIx, pIx, argIx, ctx)
   const fl = monoHoleGenFnFlowDecl(argIx, ctx)
   if bt >= 0 {
     // The checker's binding stands; the open function values its pin call hands on still take
@@ -15345,15 +15476,17 @@ function monoPinIsEmptyListHole(t: i32): boolean {
 }
 
 // The concrete function type the checker bound hole parameter `pIx` to at call `callIx`, when
-// `argIx` is a generic function: named, through never-written aliases, or a value typed at a
-// foreign generic's open signature, as a call returning one is (D5401); -1 otherwise.
-function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
+// `argIx` (in frame `ctx`) is a generic function: named, through never-written aliases, an `if`
+// naming one in every arm, or a value typed at a foreign generic's open signature, as a call
+// returning one is (D5401); -1 otherwise.
+function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32, ctx: i32): i32 {
   const ax = unwrapParen(argIx)
   if ax < 0 { return -1 }
   if (
     !monoCalleeIsGeneric(ax)
     && monoReadGenFnFe(ax) < 0
     && !tyIsForeignGenericSig(nodeTyIxOf(ax))
+    && !(P.nodes[ax] is IfStmt && monoValueNamesGenerics(ax, ctx, 0))
   ) {
     return -1
   }
@@ -15582,8 +15715,8 @@ function monoInertParamStubPin(
 
 // Appends to `fes` each hole function value `v` can be, and to `at` the name reading it: `v`
 // names one, is a `const` binding whose every use is inert and whose initializer can only be
-// such, or calls a function whose result is inert and whose every returned value can (D6911,
-// D6913). False when some value it can be is none of those.
+// such, is an `if` whose arms can only be such, or calls a function whose result is inert and
+// whose every returned value can (D6911). False when some value it can be is none of those.
 function monoInertArgFns(v: i32, fes: i32[], at: i32[], depth: i32): boolean {
   if v < 0 || v >= P.nodes.length { return false }
   const x = unwrapParen(v)
@@ -15593,6 +15726,15 @@ function monoInertArgFns(v: i32, fes: i32[], at: i32[], depth: i32): boolean {
     const cd = monoCalleeDeclOf(n)
     if cd < 0 || !monoFnResultIsInert(cd, depth + 1) { return false }
     return monoRetValueFns(cd, fes, at, depth + 1)
+  }
+  // An `if` is each of its arms' values.
+  if n is IfStmt {
+    const arms = monoIfArmValuesOf(n)
+    if n.ifElse < 0 || arms.length != 2 { return false }
+    for a in arms {
+      if !monoInertArgFns(a, fes, at, depth + 1) { return false }
+    }
+    return true
   }
   if !(n is Ident) { return false }
   if monoCalleeIsGeneric(x) {
@@ -17162,6 +17304,7 @@ function monoWalk(ix: i32, ctx: i32) {
       if cr < 0 { return -1 }
       if cr == 1 { return 0 }
     }
+    if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
     if monoWalk(n.callFn, ctx) < 0 { return -1 }
     monoTypeCallOfCall(ix, ctx)
     return 0
@@ -17394,6 +17537,7 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
   // A call through a written, un-annotated `let` holding generic functions instances each one
   // written at the call's type, which one binding holds one of (D3979).
   if monoCallWrittenLet(ix, ctx) < 0 { return -1 }
+  if monoCallIfBound(ix, ctx) < 0 { return -1 }
   // A call through an alias of a capture cell's read is a call through that cell (D3948).
   if dfe < 0 {
     const ar = monoAliasCellRead(n.callFn, ctx)
