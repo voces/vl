@@ -296,7 +296,7 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "vl_budget_findings_" });
     try {
       const baselinePath = `${ROOT}/scripts/sentinel-budget-baseline.json`;
-      const file = "compiler/emit_classify.vl";
+      const file = "compiler/emit_mono.vl";
       const was = base.files[file][code];
       const ok = `${dir}/ok.json`;
       await Deno.writeTextFile(
