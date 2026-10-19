@@ -84,6 +84,7 @@ import { isVarTyIxOf, recordClonedIsVarTyIx } from "./check_list_union"
 import { blockLastStmt } from "./check_if_value"
 import { joinArmIsLit } from "./check_nj_join"
 import {
+  callBindHas,
   callBindTyOf,
   holeFnSplitHas,
   holeLitCopiesOf,
@@ -3173,8 +3174,23 @@ function monoCloneBody(
   // A rebuilt statement keeps the narrowings its original's calls ended (D2390).
   if r != ix { recordClonedCallRetire(ix, r) }
   monoKeepTplHole(ix, r)
+  monoNoteCallTpl(ix, r)
   r
 }
+
+// The template call each cloned call copies, followed back to the first, so a clone reads the
+// checker's binding of the call it stands for (D6743).
+let monoCallTpl: {[i32]: i32} = Map()
+
+function monoNoteCallTpl(ix: i32, nx: i32) {
+  if nx != ix && ix >= 0 && nx >= 0 && P.nodes[nx] is Call {
+    monoCallTpl[nx] = monoCallTplOf(ix)
+  }
+  0
+}
+
+// The call whose bind row answers for call `ix`: `ix`, or the template a clone of it copies.
+function monoCallTplOf(ix: i32): i32 { monoCallTpl[ix] ?? ix }
 
 // A rebuilt interpolation hole stays one, which is what renders an atom by its member (D2984).
 function monoKeepTplHole(ix: i32, nx: i32) {
@@ -7099,6 +7115,7 @@ function monoCloneGenericCalls(ix: i32) {
   // A rebuilt node keeps the narrowings its original's calls ended (D2390).
   if nx != ix { recordClonedCallRetire(ix, nx) }
   monoKeepTplHole(ix, nx)
+  monoNoteCallTpl(ix, nx)
   if nx == ix || ix < 0 || nx < 0 { return nx }
   if P.nodes[nx] is ArrayLit && monoLitReachesPinDefaultClash(ix, nx) {
     monoClashLits.push(nx)
@@ -14541,7 +14558,9 @@ function monoHoleGenFnTy(callIx: i32, pIx: i32, argIx: i32): i32 {
   if pt < 0 || pt >= T.tys.length { return -1 }
   const pv = T.tys[pt]
   if !(pv is TyVar) { return -1 }
-  const bt = callBindTyOf(callIx, pv.tvName)
+  let bc = callIx
+  if !callBindHas(callIx) { bc = monoCallTplOf(callIx) }
+  const bt = callBindTyOf(bc, pv.tvName)
   if bt < 0 || bt >= T.tys.length || tyHasTyVar(bt) { return -1 }
   if !(T.tys[bt] is TyFunc) { return -1 }
   bt
@@ -15100,6 +15119,8 @@ function monoPinAnnotatedParam(
         an2Ty = pinTy[0]
       }
       if an2 == "" && monoHoleGenManyPins {
+        // The plan gives a parameter handed to closed function types one per type (D6741).
+        fsAsk(params[i])
         monoHoleManyPinsFail(p.parName, fn.fnName)
       }
     }
@@ -18148,6 +18169,7 @@ function monoSlotParamPins(fe: i32, out: string[]) {
 export function monomorphize(stmts: i32[]) {
   monoArenaTick = 0
   monoClashLits = []
+  monoCallTpl = Map()
   monoLamCallCallees = []
   monoProgLamNames = []
   monoRebuiltStamp = 0 - 1
