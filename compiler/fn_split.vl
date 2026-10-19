@@ -61,6 +61,7 @@ import {
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { reparseArrowLambdaAt, reparseFuncDeclAt } from "./parser"
 import { declOrigOf, identDeclOf } from "./symbols"
+import { vrCalls, vrIndex, vrLostIn, vrReset } from "./value_reach"
 
 // The pass the driver is running: an ordinary compile, the planning check, or the compile
 // that applies the plan.
@@ -302,6 +303,9 @@ function letDeclOfRead(ix: i32): i32 {
 // Walk state of one planning check: each reachable node's parent, and the identifiers reached.
 let fsParent: i32[] = []
 let fsIdents: i32[] = []
+// The `let` declarations whose reads keep their own slot: written by a closure other than their
+// own or with a lambda literal, closed over copies (`fsReachIndex`).
+let fsReachOwn: i32[] = []
 
 function fsWalk(root: i32): i32 {
   fsParent = []
@@ -330,11 +334,7 @@ function fsReadKeyAt(r: i32, depth: i32): string {
   const p = fsParent[r]
   if p < 0 { return "u:" + i32ToStr(r) }
   const pn = P.nodes[p]
-  if pn is Call && pn.callFn == r {
-    let k = "c:"
-    for a in pn.callArgs { k = k + fsArgKey(a, depth) + "," }
-    return k
-  }
+  if pn is Call && pn.callFn == r { return fsCallKey(pn, depth) }
   if pn is BinExpr {
     if pn.binOp == "=" && pn.binLeft == r { return "" }
     if pn.binOp == "=" && pn.binRight == r && letDeclOfRead(pn.binLeft) >= 0 {
@@ -343,7 +343,32 @@ function fsReadKeyAt(r: i32, depth: i32): string {
     if pn.binOp == "==" || pn.binOp == "!=" { return "eq" }
   }
   if pn is LetDecl && pn.letInit == r && pn.letType < 0 { return "=" }
-  "u:" + i32ToStr(r)
+  fsReachKey(r, depth)
+}
+
+// The one call key every call read `r`'s value reaches shares (`vrCalls`), else its own slot;
+// a binding in `fsReachOwn` keeps its own slot, since the let plan cannot rename its writes.
+function fsReachKey(r: i32, depth: i32): string {
+  const own = "u:" + i32ToStr(r)
+  if hasI32(fsReachOwn, letDeclOfRead(r)) { return own }
+  const cs = vrCalls(r, "")
+  if cs.length == 0 || vrLostIn(cs) { return own }
+  let k = ""
+  for c in cs {
+    const cn = P.nodes[c]
+    if !(cn is Call) { return own }
+    const ck = fsCallKey(cn, depth)
+    if k != "" && ck != k { return own }
+    k = ck
+  }
+  k
+}
+
+// The key of call `c`: its arguments' types.
+function fsCallKey(c: Call, depth: i32): string {
+  let k = "c:"
+  for a in c.callArgs { k = k + fsArgKey(a, depth) + "," }
+  k
 }
 
 // Argument `a`'s part of a call key: its type, or, while that is open, the key of the parameter
@@ -599,6 +624,16 @@ function fsCallsVia(c: i32, r: i32): boolean {
   cn is Call && cn.callFn == r
 }
 
+// Whether read `r`'s value reaches a call, and only calls with no type arguments (`vrCalls`).
+function fsReachesUntypedCalls(r: i32): boolean {
+  const cs = vrCalls(r, "")
+  if cs.length == 0 || vrLostIn(cs) { return false }
+  for c in cs {
+    if callHasTyArgs(c) { return false }
+  }
+  true
+}
+
 // The function call `c` runs: a declared function, or the lambda a never-written `const`
 // holds; -1 for any other callee.
 function fsCallRunsFn(c: i32): i32 {
@@ -760,9 +795,9 @@ function fsArgOfNamedFn(r: i32): boolean {
 }
 
 // Whether read `r` of a split parameter meets no use of type parameter `tp` but its own: a
-// named function's direct argument, or a binding annotated bare `tp` or another of the
-// function's type parameters whose reads each are, at most `depth` deep; a write declines.
-// Each such annotation is pushed to `out`, to take the new name (D6703).
+// named function's direct argument, a value only calls without type arguments run, or a binding
+// annotated bare `tp` or another of its type parameters whose reads each are, at most `depth`
+// deep; a write declines. Each such annotation is pushed to `out`, to take the new name (D6703).
 function fsTyParamReadSplits(
   r: i32,
   tp: string,
@@ -773,7 +808,7 @@ function fsTyParamReadSplits(
   if fsResultSplits(r, tp, out) { return true }
   const c = fsParent[r]
   if depth <= 0 || c < 0 { return false }
-  if fsCallsVia(c, r) && !callHasTyArgs(c) { return true }
+  if fsReachesUntypedCalls(r) { return true }
   const cn = P.nodes[c]
   if !(cn is LetDecl) || cn.letInit != r || cn.letType < 0 { return false }
   const tn = P.nodes[cn.letType]
@@ -1261,11 +1296,76 @@ function fsStmtParentOk(s: i32): boolean {
   P.nodes[p] is Block || P.nodes[p] is Program
 }
 
+// Indexes program `root` for `vrCalls` in exact mode: a call it answers runs the value alone.
+function fsReachIndex(root: i32) {
+  const stmts: i32[] = []
+  if root >= 0 && root < P.nodes.length {
+    const rn = P.nodes[root]
+    if rn is Program {
+      for s in rn.progStmts { stmts.push(s) }
+    }
+  }
+  vrReset(stmts, false, true)
+  const cands: i32[] = []
+  vrIndex(stmts, cands)
+  fsReachOwn = []
+  for r in fsIdents {
+    const p = fsParent[r]
+    const d = letDeclOfRead(r)
+    if p >= 0 && d >= 0 {
+      const pn = P.nodes[p]
+      if (
+        pn is BinExpr
+        && pn.binOp == "="
+        && pn.binLeft == r
+        && (fsEnclosingFn(r) != fsEnclosingFn(d) || fsIsLambdaLit(pn.binRight))
+        && !hasI32(fsReachOwn, d)
+      ) {
+        fsReachOwn.push(d)
+      }
+    }
+  }
+  // Closed over copies in either direction, as the let plan closes its members.
+  let changed = fsReachOwn.length > 0
+  while changed {
+    changed = false
+    for r in fsIdents {
+      const src = letDeclOfRead(r)
+      const dst = fsCopyDecl(r)
+      if (
+        src >= 0
+        && dst >= 0
+        && hasI32(fsReachOwn, src) != hasI32(fsReachOwn, dst)
+      ) {
+        if hasI32(fsReachOwn, src) {
+          fsReachOwn.push(dst)
+        } else {
+          fsReachOwn.push(src)
+        }
+        changed = true
+      }
+    }
+  }
+}
+
+// The binding read `r` is copied into (`let d = r`, `const d = r`, `d = r`), or -1.
+function fsCopyDecl(r: i32): i32 {
+  const p = fsParent[r]
+  if p < 0 { return -1 }
+  const pn = P.nodes[p]
+  if pn is LetDecl && pn.letInit == r { return p }
+  if pn is BinExpr && pn.binOp == "=" && pn.binRight == r {
+    return letDeclOfRead(pn.binLeft)
+  }
+  fsExcluded(-1, "a parent that copies the read into no binding")
+}
+
 // Plans the slots of every asked declaration over the checked tree under `root`; 0 with a
 // plan, 1 when there is nothing it can split.
 export function fsPlan(root: i32): i32 {
   fsPlanReset()
   fsWalk(root)
+  fsReachIndex(root)
   let fields = 1
   const tps = fsPlanTyParams()
   // A generic read refused as an identity call's argument asks for the binding it initializes.
@@ -1907,10 +2007,8 @@ function fsFnCalls(fd: i32): i32[] {
         } else if fsFnAliasInit(c) == r && !hasI32(decls, c) {
           decls.push(c)
         } else if cn is ArrayLit || cn is FieldInit {
-          for lc in fsHolderCalls(r) { calls.push(lc) }
-          for al in fsHolderAliases {
-            if !hasI32(decls, al) { decls.push(al) }
-          }
+          // A list element or record field is called through the literal's reads (D6791).
+          for lc in vrCalls(r, "") { calls.push(lc) }
         } else {
           calls.push(-1)
         }
@@ -1946,100 +2044,6 @@ function fsFnCalls(fd: i32): i32[] {
   }
   fsFnCallsCopy = cps
   calls
-}
-
-// The calls of the function name `r` places in a list element or record field, when an
-// un-annotated `const` binding holds that literal: each `xs[k](...)` or `o.f(...)` reading
-// `r`'s own slot (D6791). An un-annotated `const` initialized by such a read goes in
-// `fsHolderAliases`. [-1] when the literal is read any other way or written.
-let fsHolderAliases: i32[] = []
-function fsHolderCalls(r: i32): i32[] {
-  fsHolderAliases = []
-  const lit = fsParent[r]
-  if lit < 0 { return [-1] }
-  let at = -1
-  let fld = ""
-  const ln = P.nodes[lit]
-  let host = lit
-  if ln is ArrayLit {
-    let i = 0
-    while i < ln.arrElems.length {
-      if ln.arrElems[i] == r { at = i }
-      i = i + 1
-    }
-  } else if ln is FieldInit && ln.fiValue == r {
-    fld = ln.fiName
-    host = fsParent[lit]
-    if host < 0 || !(P.nodes[host] is ObjLit) { return [-1] }
-  }
-  if at < 0 && fld == "" { return [-1] }
-  const d = fsParent[host]
-  if d < 0 { return [-1] }
-  const dn = P.nodes[d]
-  if (
-    !(dn is LetDecl)
-    || dn.letKw != "const"
-    || dn.letType >= 0
-    || dn.letInit != host
-  ) {
-    return [-1]
-  }
-  const calls: i32[] = []
-  for u in fsIdents {
-    if identDeclOf(u) == d && u != d {
-      const x = fsParent[u]
-      if x < 0 { return [-1] }
-      const xn = P.nodes[x]
-      let mine = false
-      if at >= 0 {
-        if !(xn is Index) || xn.idxArr != u { return [-1] }
-        const k = fsLitIndex(xn.idxIndex)
-        if k < 0 { return [-1] }
-        mine = k == at
-      } else {
-        if !(xn is Member) || xn.memObj != u { return [-1] }
-        mine = xn.memProp == fld
-      }
-      const c = fsParent[x]
-      if c < 0 { return [-1] }
-      const cn = P.nodes[c]
-      if cn is BinExpr && cn.binLeft == x {
-        return fsHolderUnfollowed()
-      } else if mine {
-        if cn is Call && cn.callFn == x {
-          calls.push(c)
-        } else if (
-          cn is LetDecl
-          && cn.letKw == "const"
-          && cn.letType < 0
-          && cn.letInit == x
-        ) {
-          fsHolderAliases.push(c)
-        } else {
-          return fsHolderUnfollowed()
-        }
-      }
-    }
-  }
-  calls
-}
-
-// The answer for a holder slot written, or read other than by a call or a `const` alias: the
-// split cannot follow the function out of it.
-function fsHolderUnfollowed(): i32[] { [-1] }
-
-// The value of index node `ix` when it is a decimal integer literal, else -1.
-function fsLitIndex(ix: i32): i32 {
-  const n = P.nodes[ix]
-  if !(n is NumLit) || n.numText.length == 0 || n.numText.length > 6 {
-    return -1
-  }
-  let v = 0
-  for ch in n.numText {
-    if ch < "0"[0] || ch > "9"[0] { return -1 }
-    v = v * 10 + (ch - "0"[0])
-  }
-  v
 }
 
 // The initializer of `d` when it is an un-annotated `const` binding initialized by a name, else -1.
