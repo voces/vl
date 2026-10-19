@@ -7,14 +7,60 @@ import {
   numLexIsFloat,
   parseI32,
 } from "./emit_bignum"
-import { ArrayLit, FieldInit, NumLit, ObjLit, P, Paren, Unary } from "./ast"
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+} from "./ast"
 import {
   T,
   TyArray,
+  TyErr,
+  TyFunc,
   TyLit,
+  TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
+  TyVar,
   cUnionTyIxs,
   litBaseTy,
   luPosOfTexts,
@@ -108,78 +154,88 @@ export function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
   if dtix < 0 { return 0 }
   const d = T.tys[dtix]
   const e = P.nodes[srcExpr]
-  if e is Paren {
-    // Record on the wrapping `Paren` too, not only the inner literal: the emitter's typed-IR fast
-    // paths (`exprStringArray` and siblings) consult whichever node a consumer holds, and a Paren
-    // keeping its stale pre-adoption record would re-claim the wrong rep at classification.
-    if recordElemRepArrayLit(e.parInner, dtix, depth) == 1 {
-      while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-      nodeTySet(srcExpr, dtix)
-      return 1
-    }
-    return 0
-  }
-  if d is TyArray {
-    if tyIsNicheNulScalarElem(d.aElem) {
-      if e is ArrayLit {
+  match e {
+    Paren => {
+      // Record on the wrapping `Paren` too, not only the inner literal: the emitter's typed-IR fast
+      // paths (`exprStringArray` and siblings) consult whichever node a consumer holds, and a Paren
+      // keeping its stale pre-adoption record would re-claim the wrong rep at classification.
+      if recordElemRepArrayLit(e.parInner, dtix, depth) == 1 {
         while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
         nodeTySet(srcExpr, dtix)
         return 1
       }
+      return 0
     }
-    // The other direction of the same disagreement: a `string[]` destination over a literal whose
-    // own element is a literal union (`const ys: string[] = [k]`). The two reps genuinely differ —
-    // an atom is an interned i32 id, the destination's element a `(ref $array)` — and it belongs on
-    // this side of the short-circuit, `K[]` being covariantly assignable. Gated on the disagreement.
-    if tyIsPrimNamed(d.aElem, "string") {
-      if e is ArrayLit {
-        if tyIsLitUnionArray(nodeTyIxOf(srcExpr)) {
-          while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
-          nodeTySet(srcExpr, dtix)
-          return 1
-        }
-      }
-    }
-    // The element-wise descent, the `TyObj` arm below written for the sibling container. An array
-    // destination has the identical short-circuit, so `const c: (K | null)[][] = [[null]]` would
-    // leave the inner `[null]` at its self-inferred `null[]`, and every emitter probe that seeds a
-    // niche element reads that type (D117). Only the elements re-stamp; `depth - 1` bounds the walk.
-    if e is ArrayLit {
-      if !tyDeeperThan(dtix, 16) {
-        let ai = 0
-        while ai < e.arrElems.length {
-          recordElemRepArrayLit(e.arrElems[ai], d.aElem, depth - 1)
-          ai = ai + 1
-        }
-      }
-    }
-    return 0
-  }
-  // A niche-nul-elem array nested in a struct-field literal value (`{f: [null]}` against
-  // `{f: (K | null)[] | null}`): the whole ObjLit is covariantly `assignable`, so
-  // `assignableExpr`'s field-wise recursion is never reached — descend here, mirroring
-  // `recordNullHoleObjAdopt`. Only the inner niche array re-stamps; `tyDeeperThan` guards recursion.
-  if d is TyObj {
-    if e is ObjLit {
-      if tyDeeperThan(dstTy, 16) { return 0 }
-      const dfn = d.objFieldNames
-      const dft = d.objFieldTypes
-      let k = 0
-      while k < e.objFields.length {
-        const f = P.nodes[e.objFields[k]]
-        if f is FieldInit {
-          let dj = -1
-          let j = 0
-          while j < dfn.length {
-            if dfn[j] == f.fiName { dj = j }
-            j = j + 1
+    ArrayLit => {
+      match d {
+        TyArray => {
+          if tyIsNicheNulScalarElem(d.aElem) {
+            while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+            nodeTySet(srcExpr, dtix)
+            return 1
           }
-          if dj >= 0 { recordElemRepArrayLit(f.fiValue, dft[dj], depth - 1) }
+          // The other direction of the same disagreement: a `string[]` destination over a literal whose
+          // own element is a literal union (`const ys: string[] = [k]`). The two reps genuinely differ —
+          // an atom is an interned i32 id, the destination's element a `(ref $array)` — and it belongs on
+          // this side of the short-circuit, `K[]` being covariantly assignable. Gated on the disagreement.
+          if tyIsPrimNamed(d.aElem, "string") {
+            if tyIsLitUnionArray(nodeTyIxOf(srcExpr)) {
+              while nodeTyIx.length <= srcExpr { nodeTyIx.push(-1) }
+              nodeTySet(srcExpr, dtix)
+              return 1
+            }
+          }
+          // The element-wise descent, the `TyObj` arm below written for the sibling container. An array
+          // destination has the identical short-circuit, so `const c: (K | null)[][] = [[null]]` would
+          // leave the inner `[null]` at its self-inferred `null[]`, and every emitter probe that seeds a
+          // niche element reads that type (D117). Only the elements re-stamp; `depth - 1` bounds the walk.
+          if !tyDeeperThan(dtix, 16) {
+            let ai = 0
+            while ai < e.arrElems.length {
+              recordElemRepArrayLit(e.arrElems[ai], d.aElem, depth - 1)
+              ai = ai + 1
+            }
+          }
         }
-        k = k + 1
+        // an array literal re-stamps only against an array destination
+        TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
       }
+      return 0
     }
-    return 0
+    ObjLit => {
+      match d {
+        // A niche-nul-elem array nested in a struct-field literal value (`{f: [null]}` against
+        // `{f: (K | null)[] | null}`): the whole ObjLit is covariantly `assignable`, so
+        // `assignableExpr`'s field-wise recursion is never reached — descend here, mirroring
+        // `recordNullHoleObjAdopt`. Only the inner niche array re-stamps; `tyDeeperThan` guards recursion.
+        TyObj => {
+          if tyDeeperThan(dstTy, 16) { return 0 }
+          const dfn = d.objFieldNames
+          const dft = d.objFieldTypes
+          let k = 0
+          while k < e.objFields.length {
+            const f = P.nodes[e.objFields[k]]
+            if f is FieldInit {
+              let dj = -1
+              let j = 0
+              while j < dfn.length {
+                if dfn[j] == f.fiName { dj = j }
+                j = j + 1
+              }
+              if dj >= 0 {
+                recordElemRepArrayLit(f.fiValue, dft[dj], depth - 1)
+              }
+            }
+            k = k + 1
+          }
+        }
+        // an object literal descends only into a struct destination
+        TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+      }
+      return 0
+    }
+    // no other source literal carries an element rep
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }

@@ -189,46 +189,52 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
     if fty < 0 { return false }
     const ft = T.tys[fty]
     let ok = false
-    if ft is TyPrim { ok = true }
     if tyIsLitUnion(fty) { ok = true }
-    if ft is TyObj {
-      if structElemFieldsPlain(fty, depth - 1) { ok = true }
-    }
-    // A map field admits when its value is emit-representable — the annotated form lowers a
-    // string-keyed map field, and un-admitted the whole struct loses the canon record.
-    if ft is TyMap {
-      if tyIsEmitRepresentable(fty) { ok = true }
-    }
-    // A closure field admits the same way (emit-representable), for the same reason: without
-    // it, a sibling composite field on an un-pinned struct can mis-code as invalid wasm.
-    if ft is TyFunc {
-      if tyIsEmitRepresentable(fty) { ok = true }
-    }
-    if ft is TyArray {
-      // A plain-struct-element list field (`f: {...}[]`) admits recursively, using the same
-      // annotated-form argument as the outer element — checked only after `feIx >= 0`.
-      const feIx = tyArrayElemIx(fty)
-      if feIx >= 0 {
-        const aet = T.tys[feIx]
-        if aet is TyPrim { ok = true }
-        if !ok {
-          if tyIsLitUnion(feIx) { ok = true }
-          if aet is TyObj {
-            if structElemFieldsPlain(feIx, depth - 1) { ok = true }
-          }
-          // A box-element-union list field (`f: (i64|string|{q:i64})[]`) rides the same union
-          // box as a bare `(...)[]` return, so it admits through the same two predicates.
+    match ft {
+      TyPrim => {
+        ok = true
+      }
+      TyObj => {
+        if structElemFieldsPlain(fty, depth - 1) { ok = true }
+      }
+      // A map field admits when its value is emit-representable — the annotated form lowers a
+      // string-keyed map field, and un-admitted the whole struct loses the canon record.
+      TyMap => {
+        if tyIsEmitRepresentable(fty) { ok = true }
+      }
+      // A closure field admits the same way (emit-representable), for the same reason: without
+      // it, a sibling composite field on an un-pinned struct can mis-code as invalid wasm.
+      TyFunc => {
+        if tyIsEmitRepresentable(fty) { ok = true }
+      }
+      TyArray => {
+        // A plain-struct-element list field (`f: {...}[]`) admits recursively, using the same
+        // annotated-form argument as the outer element — checked only after `feIx >= 0`.
+        const feIx = tyArrayElemIx(fty)
+        if feIx >= 0 {
+          const aet = T.tys[feIx]
+          if aet is TyPrim { ok = true }
           if !ok {
-            if elemValueUnionListRetName(fty) != "" { ok = true }
-            if !ok && elemVariantBoxListRetName(fty) != "" { ok = true }
-          }
-          // A map-element list field admits when its value is emit-representable — the kind-3
-          // map-element ref-list rep the annotated form already lowers.
-          if !ok && aet is TyMap {
-            if tyIsEmitRepresentable(ft.aElem) { ok = true }
+            if tyIsLitUnion(feIx) { ok = true }
+            if aet is TyObj {
+              if structElemFieldsPlain(feIx, depth - 1) { ok = true }
+            }
+            // A box-element-union list field (`f: (i64|string|{q:i64})[]`) rides the same union
+            // box as a bare `(...)[]` return, so it admits through the same two predicates.
+            if !ok {
+              if elemValueUnionListRetName(fty) != "" { ok = true }
+              if !ok && elemVariantBoxListRetName(fty) != "" { ok = true }
+            }
+            // A map-element list field admits when its value is emit-representable — the kind-3
+            // map-element ref-list rep the annotated form already lowers.
+            if !ok && aet is TyMap {
+              if tyIsEmitRepresentable(ft.aElem) { ok = true }
+            }
           }
         }
       }
+      // every other field type declines the struct
+      TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
     }
     if !ok { return false }
     i = i + 1
@@ -305,6 +311,7 @@ export function nestedElemUnionListRetName(er: i32) {
   let leafArr = t.aElem
   let done = false
   while !done {
+    if leafArr < 0 || leafArr >= T.tys.length { return "" }
     const la = T.tys[leafArr]
     if la is TyArray {
       if la.aElem < 0 { return "" }
@@ -436,88 +443,92 @@ export function variantBoxUnionRetName(er: i32) {
   const t = T.tys[er]
   // A nullable variant-box union normalizes to `TyNullable` over the union — the box already
   // carries a null member atom, so render the inner union and append `|null`.
-  if t is TyNullable {
-    const inner = variantBoxUnionRetName(t.nInner)
-    // The inner union keeps its own top-level `|`s, so `null` adds one atom to the width
-    // the recursion just reported (#1115).
-    if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
-    return ""
-  }
-  if t is TyUnion {
-    // A self-referential declared union (`type Node = {next: Node | null} | {e: i32}`) is
-    // named by its alias, the spelling its annotation lowers: an arm field spells the union
-    // itself, so the field-wise render below has no finite answer.
-    const selfAlias = selfRefUnionAliasName(er)
-    if selfAlias != "" { return irAtoms(selfAlias, 1) }
-    const members = t.uMembers
-    if members.length < 2 { return "" }
-    // A litunion-alias member's literals flatten into sibling `TyLit` members, so no single
-    // member names the alias — regroup them and resolve as one alias by exact member-set match.
-    const litTexts: string[] = []
-    let i0 = 0
-    while i0 < members.length {
-      const m0 = T.tys[members[i0]]
-      if m0 is TyLit {
-        if m0.litKind != "str" { return "" }
-        litTexts.push(m0.litText)
-      }
-      i0 = i0 + 1
+  match t {
+    TyNullable => {
+      const inner = variantBoxUnionRetName(t.nInner)
+      // The inner union keeps its own top-level `|`s, so `null` adds one atom to the width
+      // the recursion just reported (#1115).
+      if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
+      return ""
     }
-    let litAlias = ""
-    if litTexts.length > 0 {
-      litAlias = litUnionAliasOfLitTexts(litTexts)
-      if litAlias == "" { return "" }
-    }
-    let hasComposite = litAlias != ""
-    let hasClo = false
-    let hasObj = false
-    let name = ""
-    // The append count, not `members.length`: the litunion regroup below contracts a run of
-    // `TyLit` members into one alias atom, so iteration count and atom count differ (#1115).
-    let psum = 0
-    let litDone = false
-    let i = 0
-    while i < members.length {
-      const m = T.tys[members[i]]
-      let mn = ""
-      if m is TyLit {
-        if litDone {
-          i = i + 1
-          continue
+    TyUnion => {
+      // A self-referential declared union (`type Node = {next: Node | null} | {e: i32}`) is
+      // named by its alias, the spelling its annotation lowers: an arm field spells the union
+      // itself, so the field-wise render below has no finite answer.
+      const selfAlias = selfRefUnionAliasName(er)
+      if selfAlias != "" { return irAtoms(selfAlias, 1) }
+      const members = t.uMembers
+      if members.length < 2 { return "" }
+      // A litunion-alias member's literals flatten into sibling `TyLit` members, so no single
+      // member names the alias — regroup them and resolve as one alias by exact member-set match.
+      const litTexts: string[] = []
+      let i0 = 0
+      while i0 < members.length {
+        const m0 = T.tys[members[i0]]
+        if m0 is TyLit {
+          if m0.litKind != "str" { return "" }
+          litTexts.push(m0.litText)
         }
-        litDone = true
-        mn = litAlias
-      } else if m is TyFunc {
-        // A closure arm beside a struct arm rides the box anyref as the kind-11 ref atom — at
-        // most one closure arm; a struct sibling routes it through this same sound box.
-        if hasClo { return "" }
-        const cn = tyToEmitName(members[i])
-        if cn == "" { return "" }
-        mn = "(" + cn + ")"
-        hasClo = true
-        hasComposite = true
-      } else {
-        mn = vbUnionMemberName(members[i])
-        if mn == "" { return "" }
-        // A bare `null` member declines here on purpose — the `TyNullable` arm above owns
-        // null and appends it itself; un-excluded this would render a false two-atom niche.
-        if mn == "null" { return "" }
-        if m is TyObj { hasObj = true }
-        if mn != "i32" && mn != "i64" && mn != "f64" && mn != "f32" {
-          if mn != "boolean" && mn != "string" { hasComposite = true }
-        }
+        i0 = i0 + 1
       }
-      if name != "" { name = name + "|" }
-      name = name + mn
-      psum = psum + 1
-      i = i + 1
+      let litAlias = ""
+      if litTexts.length > 0 {
+        litAlias = litUnionAliasOfLitTexts(litTexts)
+        if litAlias == "" { return "" }
+      }
+      let hasComposite = litAlias != ""
+      let hasClo = false
+      let hasObj = false
+      let name = ""
+      // The append count, not `members.length`: the litunion regroup below contracts a run of
+      // `TyLit` members into one alias atom, so iteration count and atom count differ (#1115).
+      let psum = 0
+      let litDone = false
+      let i = 0
+      while i < members.length {
+        const m = T.tys[members[i]]
+        let mn = ""
+        if m is TyLit {
+          if litDone {
+            i = i + 1
+            continue
+          }
+          litDone = true
+          mn = litAlias
+        } else if m is TyFunc {
+          // A closure arm beside a struct arm rides the box anyref as the kind-11 ref atom — at
+          // most one closure arm; a struct sibling routes it through this same sound box.
+          if hasClo { return "" }
+          const cn = tyToEmitName(members[i])
+          if cn == "" { return "" }
+          mn = "(" + cn + ")"
+          hasClo = true
+          hasComposite = true
+        } else {
+          mn = vbUnionMemberName(members[i])
+          if mn == "" { return "" }
+          // A bare `null` member declines here on purpose — the `TyNullable` arm above owns
+          // null and appends it itself; un-excluded this would render a false two-atom niche.
+          if mn == "null" { return "" }
+          if m is TyObj { hasObj = true }
+          if mn != "i32" && mn != "i64" && mn != "f64" && mn != "f32" {
+            if mn != "boolean" && mn != "string" { hasComposite = true }
+          }
+        }
+        if name != "" { name = name + "|" }
+        name = name + mn
+        psum = psum + 1
+        i = i + 1
+      }
+      // One atom is not a union: a pure literal union contracts to a single alias atom here,
+      // which is the i32-atom rep, not this box — `psum` (post-contraction) catches it.
+      if psum < 2 { return "" }
+      if hasClo && !hasObj { return "" }
+      if !hasComposite { return "" }
+      return irAtoms(name, psum)
     }
-    // One atom is not a union: a pure literal union contracts to a single alias atom here,
-    // which is the i32-atom rep, not this box — `psum` (post-contraction) catches it.
-    if psum < 2 { return "" }
-    if hasClo && !hasObj { return "" }
-    if !hasComposite { return "" }
-    return irAtoms(name, psum)
+    // no other type is a variant-box union
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   ""
 }
@@ -530,127 +541,133 @@ function vbUnionMemberName(mIx: i32): string {
   const alias = litUnionAliasNameOfTy(mIx)
   if alias != "" { return alias }
   const m = T.tys[mIx]
-  if m is TyPrim { return m.primName }
-  // A scalar-leaf array member (`i64[] | boolean`) rides the box as a plain wrapper ref, the
-  // same rep the annotated form lowers fully — an object-element array member stays declined.
-  if m is TyArray {
-    let leaf = m.aElem
-    let vguard = 0
-    let scalarLeaf = false
-    while vguard < 8 {
-      vguard = vguard + 1
-      if leaf < 0 { break }
-      const lt = T.tys[leaf]
-      if lt is TyArray {
-        leaf = lt.aElem
-      } else {
-        let leafPrim = leaf
-        // A nullable-scalar element leaf (`(i64 | null)[]`) admits too — the annotated
-        // named-fn spelling of such a union lowers fully, both arms round-tripping.
-        if lt is TyNullable { leafPrim = lt.nInner }
-        const lp = T.tys[leafPrim]
-        if lp is TyPrim {
-          const pn = lp.primName
-          if (
-            pn == "i32"
-            || pn == "i64"
-            || pn == "f64"
-            || pn == "f32"
-            || pn == "boolean"
-            || pn == "string"
-          ) {
-            scalarLeaf = true
-          }
-        }
-        break
-      }
+  match m {
+    TyPrim => {
+      return m.primName
     }
-    if scalarLeaf {
-      const en = tyToEmitName(mIx)
-      if en != "" { return en }
-    }
-    return ""
-  }
-  if m is TyObj {
-    // A nominal struct arm renders its declared type name so the registered variant matches
-    // the annotation; falls through to the inline field-wise render when no type matches.
-    const nom = nominalNameOfObj(mIx, gRootStmts)
-    if nom != "" { return nom }
-    const names = m.objFieldNames
-    const ftys = m.objFieldTypes
-    let out = "{"
-    let fi = 0
-    while fi < names.length {
-      let fs = litUnionAliasNameOfTy(ftys[fi])
-      if fs == "" {
-        const ft = T.tys[ftys[fi]]
-        // Exhaustive over `Ty`, deliberately without a `_` arm: a new arena variant must break
-        // the self-compile here rather than silently decline the whole union arm.
-        match ft {
-          TyPrim => {
-            fs = ft.primName
+    // A scalar-leaf array member (`i64[] | boolean`) rides the box as a plain wrapper ref, the
+    // same rep the annotated form lowers fully — an object-element array member stays declined.
+    TyArray => {
+      let leaf = m.aElem
+      let vguard = 0
+      let scalarLeaf = false
+      while vguard < 8 {
+        vguard = vguard + 1
+        if leaf < 0 { break }
+        const lt = T.tys[leaf]
+        if lt is TyArray {
+          leaf = lt.aElem
+        } else {
+          let leafPrim = leaf
+          // A nullable-scalar element leaf (`(i64 | null)[]`) admits too — the annotated
+          // named-fn spelling of such a union lowers fully, both arms round-tripping.
+          if lt is TyNullable { leafPrim = lt.nInner }
+          const lp = T.tys[leafPrim]
+          if lp is TyPrim {
+            const pn = lp.primName
+            if (
+              pn == "i32"
+              || pn == "i64"
+              || pn == "f64"
+              || pn == "f32"
+              || pn == "boolean"
+              || pn == "string"
+            ) {
+              scalarLeaf = true
+            }
           }
-          TyMap => {
-            // A map field renders canonically (`tyToEmitName`): the annotated spelling of a
-            // union carrying such an arm lowers fully, so the pin routes through the same path.
-            fs = tyToEmitName(ftys[fi])
-            if fs == "" { return "" }
-          }
-          TyObj => {
-            // A nested-struct field (code 15) admits the same way — the annotated spelling
-            // lowers it, and un-admitted the whole arm would leave the lambda un-pinned.
-            fs = tyToEmitName(ftys[fi])
-            if fs == "" { return "" }
-          }
-          TyNullable => {
-            // A nullable field admits the same way: every nullable spelling the annotation
-            // grammar allows has a field code, and the annotated union lowers it fully.
-            fs = tyToEmitName(ftys[fi])
-            if fs == "" { return "" }
-          }
-          TyArray => {
-            // A list field admits the same way — the annotated spelling lowers it, and
-            // un-admitted the whole arm would leave the lambda un-pinned to a raw scalar.
-            fs = tyToEmitName(ftys[fi])
-            if fs == "" { return "" }
-          }
-          TyFunc => {
-            // A closure field admits the same way, rendered as the bare arrow — a field
-            // position carries no trailing `|` ambiguity, since fields split at commas.
-            fs = tyToEmitName(ftys[fi])
-            if fs == "" { return "" }
-          }
-          TyUnion => {
-            // A value-union field admits the same way: `tyToEmitName` preserves member order
-            // and litunion aliases, with the inner `|` brace-scoped like the nullable arm's.
-            fs = tyToEmitName(ftys[fi])
-            if fs == "" { return "" }
-          }
-          TyErr => {
-            // The error/unknown hole has no field code — decline the whole arm.
-            return ""
-          }
-          TyVar => {
-            // An unsolved type parameter has no field code — decline the whole arm.
-            return ""
-          }
-          TyLit => {
-            // A lone literal field is stored at its base scalar, as the annotated union's row
-            // stores it (D5156).
-            const lb = T.tys[litBaseTy(ft)]
-            if lb is TyPrim { fs = lb.primName } else { return "" }
-          }
-          TyNeg => {
-            // A residual negation has no field code — decline the whole arm.
-            return ""
-          }
+          break
         }
       }
-      if fi > 0 { out = out + "," }
-      out = out + names[fi] + ":" + fs
-      fi = fi + 1
+      if scalarLeaf {
+        const en = tyToEmitName(mIx)
+        if en != "" { return en }
+      }
+      return ""
     }
-    return out + "}"
+    TyObj => {
+      // A nominal struct arm renders its declared type name so the registered variant matches
+      // the annotation; falls through to the inline field-wise render when no type matches.
+      const nom = nominalNameOfObj(mIx, gRootStmts)
+      if nom != "" { return nom }
+      const names = m.objFieldNames
+      const ftys = m.objFieldTypes
+      let out = "{"
+      let fi = 0
+      while fi < names.length {
+        let fs = litUnionAliasNameOfTy(ftys[fi])
+        if fs == "" {
+          const ft = T.tys[ftys[fi]]
+          // Exhaustive over `Ty`, deliberately without a `_` arm: a new arena variant must break
+          // the self-compile here rather than silently decline the whole union arm.
+          match ft {
+            TyPrim => {
+              fs = ft.primName
+            }
+            TyMap => {
+              // A map field renders canonically (`tyToEmitName`): the annotated spelling of a
+              // union carrying such an arm lowers fully, so the pin routes through the same path.
+              fs = tyToEmitName(ftys[fi])
+              if fs == "" { return "" }
+            }
+            TyObj => {
+              // A nested-struct field (code 15) admits the same way — the annotated spelling
+              // lowers it, and un-admitted the whole arm would leave the lambda un-pinned.
+              fs = tyToEmitName(ftys[fi])
+              if fs == "" { return "" }
+            }
+            TyNullable => {
+              // A nullable field admits the same way: every nullable spelling the annotation
+              // grammar allows has a field code, and the annotated union lowers it fully.
+              fs = tyToEmitName(ftys[fi])
+              if fs == "" { return "" }
+            }
+            TyArray => {
+              // A list field admits the same way — the annotated spelling lowers it, and
+              // un-admitted the whole arm would leave the lambda un-pinned to a raw scalar.
+              fs = tyToEmitName(ftys[fi])
+              if fs == "" { return "" }
+            }
+            TyFunc => {
+              // A closure field admits the same way, rendered as the bare arrow — a field
+              // position carries no trailing `|` ambiguity, since fields split at commas.
+              fs = tyToEmitName(ftys[fi])
+              if fs == "" { return "" }
+            }
+            TyUnion => {
+              // A value-union field admits the same way: `tyToEmitName` preserves member order
+              // and litunion aliases, with the inner `|` brace-scoped like the nullable arm's.
+              fs = tyToEmitName(ftys[fi])
+              if fs == "" { return "" }
+            }
+            TyErr => {
+              // The error/unknown hole has no field code — decline the whole arm.
+              return ""
+            }
+            TyVar => {
+              // An unsolved type parameter has no field code — decline the whole arm.
+              return ""
+            }
+            TyLit => {
+              // A lone literal field is stored at its base scalar, as the annotated union's row
+              // stores it (D5156).
+              const lb = T.tys[litBaseTy(ft)]
+              if lb is TyPrim { fs = lb.primName } else { return "" }
+            }
+            TyNeg => {
+              // A residual negation has no field code — decline the whole arm.
+              return ""
+            }
+          }
+        }
+        if fi > 0 { out = out + "," }
+        out = out + names[fi] + ":" + fs
+        fi = fi + 1
+      }
+      return out + "}"
+    }
+    // a map, closure, union, nullable or hole member stays on its own path
+    TyErr | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
   }
   ""
 }

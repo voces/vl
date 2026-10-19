@@ -128,30 +128,34 @@ const slotsIn = (body: string): string[] => {
   return out;
 };
 
-// Every `if n is <Kind> { … }` arm of a ladder body, plus the tail after the last one.
+// Every arm of a ladder body, plus the tail after the last one. An arm is either
+// `if n is <Kind> { … }` or a `match n` arm `<Kind> | <Kind> => { … }`.
 const ladder = (body: string): { arms: Map<string, string[]>; tail: string } => {
   const lines = body.split("\n");
   const arms = new Map<string, string[]>();
   let i = 0;
   let lastArmEnd = 0;
   while (i < lines.length) {
-    const head = lines[i].match(/^\s*if n is (\w+) \{(.*)$/);
+    const head = lines[i].match(/^\s*(?:if n is (\w+)|(\w+(?: \| \w+)*) =>) \{(.*)$/);
     if (!head) {
       i++;
       continue;
     }
+    const kinds = head[1] !== undefined ? [head[1]] : head[2].split(" | ");
+    const rest = head[3];
     let depth = 1;
-    const collected: string[] = [head[2]];
+    const collected: string[] = [rest];
     let j = i;
     while (depth > 0 && j < lines.length) {
       if (j > i) collected.push(lines[j]);
-      for (const ch of j === i ? head[2] : lines[j]) {
+      for (const ch of j === i ? rest : lines[j]) {
         if (ch === "{") depth++;
         else if (ch === "}") depth--;
       }
       j++;
     }
-    arms.set(head[1], slotsIn(collected.join("\n")));
+    const slots = slotsIn(collected.join("\n"));
+    for (const k of kinds) arms.set(k, slots);
     lastArmEnd = j;
     i = j;
   }

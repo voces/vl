@@ -488,7 +488,7 @@ export function ovUnpinnedReport() {
     if !i32ListHas(ovInstSite, s) && ufcsModOfNode(s) <= 0 {
       const c = P.nodes[s]
       let prop = ""
-      if c is Call {
+      if c is Call && c.callFn >= 0 {
         const cf = P.nodes[c.callFn]
         if cf is Member { prop = cf.memProp }
       }
@@ -598,65 +598,77 @@ export function nodeArrayElemName(ix: i32) {
   if t is TyArray {
     if t.aElem >= 0 {
       const el = T.tys[t.aElem]
-      if el is TyVar { return "" }
-      if el is TyPrim { return tyToStructStr(t.aElem) }
-      // A STRUCT element renders its inline shape name (`{v: i32}`), which
-      // `structIndexOfTypeName` matches to the interned struct by field-set.
-      if el is TyObj { return tyToStructStr(t.aElem) }
-      // A map element renders the emit name (spaceless `{[K]:V}`), matching the annotated
-      // spelling so both intern the same kind-3 ref-list row; the key rides this spelling.
-      if el is TyMap { return tyToEmitName(t.aElem) }
-      // A value-union element renders the nominal composite (the `unNames` key), so an
-      // un-annotated literal of union elements recovers the same box slot; a literal union is excluded.
-      if el is TyUnion {
-        const aeMems = el.uMembers
-        if aeMems.length >= 2 {
-          if !tyIsLitUnion(t.aElem) {
-            const aeu = tyToNominalName(t.aElem)
-            if unionAliasDeclNameOfTy(t.aElem) == "" {
-              if structNameOfTy(aeMems[0]) == "" {
-                const aer = structUnionRetName(t.aElem, gRootStmts)
-                if aer != "" { return aer }
+      match el {
+        TyVar => {
+          return ""
+        }
+        TyPrim => {
+          return tyToStructStr(t.aElem)
+        }
+        // A STRUCT element renders its inline shape name (`{v: i32}`), which
+        // `structIndexOfTypeName` matches to the interned struct by field-set.
+        TyObj => {
+          return tyToStructStr(t.aElem)
+        }
+        // A map element renders the emit name (spaceless `{[K]:V}`), matching the annotated
+        // spelling so both intern the same kind-3 ref-list row; the key rides this spelling.
+        TyMap => {
+          return tyToEmitName(t.aElem)
+        }
+        // A value-union element renders the nominal composite (the `unNames` key), so an
+        // un-annotated literal of union elements recovers the same box slot; a literal union is excluded.
+        TyUnion => {
+          const aeMems = el.uMembers
+          if aeMems.length >= 2 {
+            if !tyIsLitUnion(t.aElem) {
+              const aeu = tyToNominalName(t.aElem)
+              if unionAliasDeclNameOfTy(t.aElem) == "" {
+                if structNameOfTy(aeMems[0]) == "" {
+                  const aer = structUnionRetName(t.aElem, gRootStmts)
+                  if aer != "" { return aer }
+                }
               }
+              return aeu
             }
-            return aeu
           }
         }
-      }
-      // A function element renders the closure-element table key (wrapped in parens), matching
-      // `refArrElemName`'s form so an un-annotated literal of function values recovers the same slot.
-      if el is TyFunc {
-        let fn = tyToEmitName(t.aElem)
-        // A closure element riding the enclosing frame's hole renders as nothing at all, since
-        // the recorded type is the one the checker saw; the element at this instance is that
-        // signature at the hole's pin (D1794).
-        if fn == "" {
-          const pinEl = pinResolvedFnTy(t.aElem)
-          if pinEl >= 0 { fn = tyToEmitName(pinEl) }
+        // A function element renders the closure-element table key (wrapped in parens), matching
+        // `refArrElemName`'s form so an un-annotated literal of function values recovers the same slot.
+        TyFunc => {
+          let fn = tyToEmitName(t.aElem)
+          // A closure element riding the enclosing frame's hole renders as nothing at all, since
+          // the recorded type is the one the checker saw; the element at this instance is that
+          // signature at the hole's pin (D1794).
+          if fn == "" {
+            const pinEl = pinResolvedFnTy(t.aElem)
+            if pinEl >= 0 { fn = tyToEmitName(pinEl) }
+          }
+          // A generic function's own signature that no call pins to one answer: nothing calls
+          // through the element at it, so the element is the opaque stub signature (D4123).
+          if fn == "" && tyHasTyVar(t.aElem) {
+            fn = tyToEmitName(mkFuncTy([], TY_VOID))
+          }
+          if fn == "" { return "" }
+          return "(" + fn + ")"
         }
-        // A generic function's own signature that no call pins to one answer: nothing calls
-        // through the element at it, so the element is the opaque stub signature (D4123).
-        if fn == "" && tyHasTyVar(t.aElem) {
-          fn = tyToEmitName(mkFuncTy([], TY_VOID))
+        // A nullable-closure element renders the full `(<fn>)|null` table key via
+        // `nullableRetName`, matching `refArrElemName`'s annotated form for the same niche slot.
+        TyNullable => {
+          if el.nInner < 0 || el.nInner >= T.tys.length { return "" }
+          const ni = T.tys[el.nInner]
+          if ni is TyFunc {
+            const stmts: i32[] = []
+            return nullableRetName(t.aElem, stmts)
+          }
         }
-        if fn == "" { return "" }
-        return "(" + fn + ")"
-      }
-      // A nullable-closure element renders the full `(<fn>)|null` table key via
-      // `nullableRetName`, matching `refArrElemName`'s annotated form for the same niche slot.
-      if el is TyNullable {
-        if el.nInner < 0 || el.nInner >= T.tys.length { return "" }
-        const ni = T.tys[el.nInner]
-        if ni is TyFunc {
-          const stmts: i32[] = []
-          return nullableRetName(t.aElem, stmts)
+        // A nested-array element renders the inner array's emit name — without it, pushing an
+        // array into an inferred empty `[]` stores a ref into an i32 element: check-clean invalid wasm.
+        TyArray => {
+          if !tyNestedArrLeafRenders(t.aElem) { return "" }
+          return tyToEmitName(t.aElem)
         }
-      }
-      // A nested-array element renders the inner array's emit name — without it, pushing an
-      // array into an inferred empty `[]` stores a ref into an i32 element: check-clean invalid wasm.
-      if el is TyArray {
-        if !tyNestedArrLeafRenders(t.aElem) { return "" }
-        return tyToEmitName(t.aElem)
+        // an error, literal or negated element has no recorded name
+        TyErr | TyLit | TyNeg => {}
       }
     }
   }
@@ -676,56 +688,60 @@ export function nodeUnionName(ix: i32) {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return "" }
   const t = T.tys[ty]
-  if t is TyUnion {
-    if t.uMembers.length >= 2 {
-      // Cheaply gates to a value union (all members scalar/literal atoms) before rendering, so
-      // a struct union (object members) declines without paying the #494 render cost for nothing.
-      let allValue = true
-      let i = 0
-      while i < t.uMembers.length {
-        const mt = T.tys[t.uMembers[i]]
-        if !(mt is TyPrim) {
-          if !(mt is TyLit) { allValue = false }
+  match t {
+    TyUnion => {
+      if t.uMembers.length >= 2 {
+        // Cheaply gates to a value union (all members scalar/literal atoms) before rendering, so
+        // a struct union (object members) declines without paying the #494 render cost for nothing.
+        let allValue = true
+        let i = 0
+        while i < t.uMembers.length {
+          const mt = T.tys[t.uMembers[i]]
+          if !(mt is TyPrim) {
+            if !(mt is TyLit) { allValue = false }
+          }
+          i = i + 1
         }
-        i = i + 1
-      }
-      if allValue { return valueUnionRetName(ty) }
-      // A ref-arm value union (`T[] | {w: i32}`): render its nominal name so a binding narrowed
-      // from this fallback unboxes like any annotated union — declines for an anonymous-element arm.
-      const ran = refArmUnionRetName(ty, gRootStmts)
-      if ran != "" { return ran }
-      // A map-member union: render the same spelling `mapUnionRetName` pins on an adopted
-      // lambda, so a narrowed map-arm read unboxes exactly like the annotated-binding path.
-      const mun = mapUnionRetName(ty)
-      if mun != "" { return mun }
-      // A mixed variant-box union (>=1 non-object arm): render the same spelling
-      // `variantBoxUnionRetName` pins, so a narrowed read unboxes like the annotated path.
-      if mixedVariantBoxGate(t.uMembers) {
-        const vbn = variantBoxUnionRetName(ty)
-        if vbn != "" { return vbn }
-        // A closure-arm value union: render the same spelling `cloArmValueUnionRetName` pins,
-        // so a narrowed read unboxes exactly like the annotated-binding path.
-        const can = cloArmValueUnionRetName(ty)
-        if can != "" { return can }
-      }
-    }
-  }
-  // A nullable value scalar (`i32 | null`) is a `TyNullable`, not a `TyUnion`, yet reps as the
-  // value-union box — `isValueUnionName` admits only the numeric nullables, so niches stay "".
-  if t is TyNullable {
-    const nvn = valueUnionRetName(ty)
-    if nvn != "" { return nvn }
-    // A nullable variant-box union (`{a,f,z} | i32 | null`): render the same spelling
-    // `variantBoxUnionRetName` pins, so the narrowed read unboxes like the annotated path.
-    if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
-    const nit = T.tys[t.nInner]
-    if nit is TyUnion {
-      if mixedVariantBoxGate(nit.uMembers) {
-        const nvb = variantBoxUnionRetName(ty)
-        if nvb != "" { return nvb }
+        if allValue { return valueUnionRetName(ty) }
+        // A ref-arm value union (`T[] | {w: i32}`): render its nominal name so a binding narrowed
+        // from this fallback unboxes like any annotated union — declines for an anonymous-element arm.
+        const ran = refArmUnionRetName(ty, gRootStmts)
+        if ran != "" { return ran }
+        // A map-member union: render the same spelling `mapUnionRetName` pins on an adopted
+        // lambda, so a narrowed map-arm read unboxes exactly like the annotated-binding path.
+        const mun = mapUnionRetName(ty)
+        if mun != "" { return mun }
+        // A mixed variant-box union (>=1 non-object arm): render the same spelling
+        // `variantBoxUnionRetName` pins, so a narrowed read unboxes like the annotated path.
+        if mixedVariantBoxGate(t.uMembers) {
+          const vbn = variantBoxUnionRetName(ty)
+          if vbn != "" { return vbn }
+          // A closure-arm value union: render the same spelling `cloArmValueUnionRetName` pins,
+          // so a narrowed read unboxes exactly like the annotated-binding path.
+          const can = cloArmValueUnionRetName(ty)
+          if can != "" { return can }
+        }
       }
     }
-    return ""
+    // A nullable value scalar (`i32 | null`) is a `TyNullable`, not a `TyUnion`, yet reps as the
+    // value-union box — `isValueUnionName` admits only the numeric nullables, so niches stay "".
+    TyNullable => {
+      const nvn = valueUnionRetName(ty)
+      if nvn != "" { return nvn }
+      // A nullable variant-box union (`{a,f,z} | i32 | null`): render the same spelling
+      // `variantBoxUnionRetName` pins, so the narrowed read unboxes like the annotated path.
+      if t.nInner < 0 || t.nInner >= T.tys.length { return "" }
+      const nit = T.tys[t.nInner]
+      if nit is TyUnion {
+        if mixedVariantBoxGate(nit.uMembers) {
+          const nvb = variantBoxUnionRetName(ty)
+          if nvb != "" { return nvb }
+        }
+      }
+      return ""
+    }
+    // no other type is a union
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   ""
 }

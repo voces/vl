@@ -20,6 +20,8 @@ import {
   CharLit,
   ContinueStmt,
   ErrExpr,
+  FieldDef,
+  FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
@@ -321,127 +323,166 @@ function checkNodeReal(ix: i32) {
   const n = P.nodes[ix]
 
   // ── literals & identifiers ────────────────────────────────────────────────
-  if n is NumLit {
-    return checkNumLitNode(n, ix)
-  } else if n is StrLit {
-    return TY_STR
-  } else if n is CharLit {
-    // A char literal `'x'` is its i32 code point (composes with arithmetic / `==` /
-    // string indexing exactly like a bare int literal), not a string.
-    return TY_I32
-  } else if n is BoolLit {
-    return TY_BOOL
-  } else if n is NullLit {
-    return TY_NULL
-  } else if n is Ident {
-    return checkIdentNode(n, ix)
-  } else if n is Paren {
-    return checkNode(n.parInner)
-    // ── explicit numeric cast `x as T` ──────────────────────────────────────────
-  } else if n is AsExpr {
-    return checkCastNode(n, ix)
-    // ── unary ─────────────────────────────────────────────────────────────────
-  } else if n is Unary {
-    if n.unOp == "-" || n.unOp == "~" {
-      const uf = cexTryFold(ix)
-      if uf == 1 { return checkNodeReal(ix) }
-      if uf == 2 { return TY_ERR }
-      if n.unOp == "-" { cexNoteNegOperand(n.unArg) }
+  match n {
+    NumLit => {
+      return checkNumLitNode(n, ix)
     }
-    return checkUnaryNode(n, ix)
-  } else if n is BinExpr {
-    if n.binCompound.length == 0 && cexOp(n.binOp) {
-      const bf = cexTryFoldBin(n, ix)
-      if bf == 1 { return checkNodeReal(ix) }
-      if bf == 2 { return TY_ERR }
+    StrLit => {
+      return TY_STR
     }
-    const bt = checkBinExprNode(n, ix)
-    if neKeys.length > 0 && n.binOp == "=" { neAssigned(n, curFnDeclIx) }
-    return bt
-  } else if n is Call {
-    // Named arguments run in parameter order, so no fact may reach a pop among them (D3558).
-    if neKeys.length > 0 && crIsNamedCall(ix) { neKill("", curFnDeclIx) }
-    const callTy = checkCallNode(n, ix)
-    if numUnionMinted { njNoteHeldCall(n, ix, callTy) }
-    // A call is where a path narrowing can be falsified by a write the guarded
-    // scope never spells. Asked after the arguments are checked so the call's own
-    // operands still read under the narrowing that holds at their own evaluation.
-    noteCallInvalidations(ix)
-    return callTy
-    // ── member access ───────────────────────────────────────────────────────────
-  } else if n is Member {
-    return checkMemberNode(n, ix)
-  } else if n is ArrayLit {
-    return checkArrayLitNode(n, ix)
-  } else if n is Spread {
-    // A spread the call and list-literal paths both declined — nothing here can unpack it.
-    // The operand is still checked, so an error inside it is reported rather than swallowed.
-    checkNode(n.spdArg)
-    tErr(spreadNoRestMsg(""), ix)
-    return TY_ERR
-  } else if n is Index {
-    return checkIndexNode(n, ix)
-  } else if n is ObjLit {
-    return checkObjLitNode(n, ix)
-  } else if n is IsExpr {
-    return checkIsExprNode(n, ix)
-  } else if n is OptMember {
-    return checkOptMemberNode(n, ix)
-  } else if n is ErrExpr {
-    return TY_ERR
-    // ── let / const ─────────────────────────────────────────────────────────────
-  } else if n is LetDecl {
-    const lr = checkLetDeclNodeIn(n, ix)
-    if neKeys.length > 0 { neKill(n.letName, curFnDeclIx) }
-    if lpOn || exitFirstAt.length > 0 { noteExitFirstLet(n, ix) }
-    return lr
-  } else if n is FuncDecl {
-    return checkFuncDeclNode(n, ix)
-    // ── while ─────────────────────────────────────────────────────────────────
-  } else if n is WhileStmt {
-    // A loop re-runs what a fact proved once (D3558), and so does a for loop below.
-    if neKeys.length > 0 { neKill("", curFnDeclIx) }
-    return checkWhileStmtNode(n, ix)
-    // A `break` joins its value into the loop or block it leaves; a misplaced one is the
-    // parser's and the emitter's to report.
-  } else if n is BreakStmt {
-    return checkBreakNode(n, ix)
-  } else if n is ContinueStmt {
-    return TY_VOID
-    // ── for v in A to B [step S] ────────────────────────────────────────────────
-    // A numeric range loop: the bounds (and step, if present) must be i32; the loop
-    // variable is i32 in the body's scope.
-  } else if n is ForRange {
-    if neKeys.length > 0 { neKill("", curFnDeclIx) }
-    return checkForRangeNode(n, ix)
-  } else if n is ForIn {
-    if neKeys.length > 0 { neKill("", curFnDeclIx) }
-    return checkForInNode(n, ix)
-  } else if n is MatchExpr {
-    return checkMatchExprNode(n, ix)
-  } else if n is IfStmt {
-    return checkIfStmtNode(ix)
-  } else if n is RetStmt {
-    return checkRetStmtNode(n, ix)
-  } else if n is Block {
-    return checkBlockNode(n, ix)
-  } else if n is Program {
-    return checkProgramNode(n)
-  } else if n is Param {
-    return TY_VOID
-  } else if n is TypeRef {
-    return TY_VOID
-  } else if n is TypeDecl {
-    // Registered by the Program pass-0 pre-pass; nothing to do when visited.
-    return TY_VOID
-  } else if n is UnionDecl {
-    // Registered by the Program pass-0 pre-pass; nothing to do when visited.
-    return TY_VOID
-  } else if n is ImportDecl {
-    // A tooling node (the lint tier reads it): import binding/resolution
-    // happened in the module front end (the driver's token-level `modScan` +
-    // merge), so the checker has nothing to verify here.
-    return TY_VOID
+    CharLit => {
+      // A char literal `'x'` is its i32 code point (composes with arithmetic / `==` /
+      // string indexing exactly like a bare int literal), not a string.
+      return TY_I32
+    }
+    BoolLit => {
+      return TY_BOOL
+    }
+    NullLit => {
+      return TY_NULL
+    }
+    Ident => {
+      return checkIdentNode(n, ix)
+    }
+    Paren => {
+      return checkNode(n.parInner)
+      // ── explicit numeric cast `x as T` ──────────────────────────────────────────
+    }
+    AsExpr => {
+      return checkCastNode(n, ix)
+      // ── unary ─────────────────────────────────────────────────────────────────
+    }
+    Unary => {
+      if n.unOp == "-" || n.unOp == "~" {
+        const uf = cexTryFold(ix)
+        if uf == 1 { return checkNodeReal(ix) }
+        if uf == 2 { return TY_ERR }
+        if n.unOp == "-" { cexNoteNegOperand(n.unArg) }
+      }
+      return checkUnaryNode(n, ix)
+    }
+    BinExpr => {
+      if n.binCompound.length == 0 && cexOp(n.binOp) {
+        const bf = cexTryFoldBin(n, ix)
+        if bf == 1 { return checkNodeReal(ix) }
+        if bf == 2 { return TY_ERR }
+      }
+      const bt = checkBinExprNode(n, ix)
+      if neKeys.length > 0 && n.binOp == "=" { neAssigned(n, curFnDeclIx) }
+      return bt
+    }
+    Call => {
+      // Named arguments run in parameter order, so no fact may reach a pop among them (D3558).
+      if neKeys.length > 0 && crIsNamedCall(ix) { neKill("", curFnDeclIx) }
+      const callTy = checkCallNode(n, ix)
+      if numUnionMinted { njNoteHeldCall(n, ix, callTy) }
+      // A call is where a path narrowing can be falsified by a write the guarded
+      // scope never spells. Asked after the arguments are checked so the call's own
+      // operands still read under the narrowing that holds at their own evaluation.
+      noteCallInvalidations(ix)
+      return callTy
+      // ── member access ───────────────────────────────────────────────────────────
+    }
+    Member => {
+      return checkMemberNode(n, ix)
+    }
+    ArrayLit => {
+      return checkArrayLitNode(n, ix)
+    }
+    Spread => {
+      // A spread the call and list-literal paths both declined — nothing here can unpack it.
+      // The operand is still checked, so an error inside it is reported rather than swallowed.
+      checkNode(n.spdArg)
+      tErr(spreadNoRestMsg(""), ix)
+      return TY_ERR
+    }
+    Index => {
+      return checkIndexNode(n, ix)
+    }
+    ObjLit => {
+      return checkObjLitNode(n, ix)
+    }
+    IsExpr => {
+      return checkIsExprNode(n, ix)
+    }
+    OptMember => {
+      return checkOptMemberNode(n, ix)
+    }
+    ErrExpr => {
+      return TY_ERR
+      // ── let / const ─────────────────────────────────────────────────────────────
+    }
+    LetDecl => {
+      const lr = checkLetDeclNodeIn(n, ix)
+      if neKeys.length > 0 { neKill(n.letName, curFnDeclIx) }
+      if lpOn || exitFirstAt.length > 0 { noteExitFirstLet(n, ix) }
+      return lr
+    }
+    FuncDecl => {
+      return checkFuncDeclNode(n, ix)
+      // ── while ─────────────────────────────────────────────────────────────────
+    }
+    WhileStmt => {
+      // A loop re-runs what a fact proved once (D3558), and so does a for loop below.
+      if neKeys.length > 0 { neKill("", curFnDeclIx) }
+      return checkWhileStmtNode(n, ix)
+      // A `break` joins its value into the loop or block it leaves; a misplaced one is the
+      // parser's and the emitter's to report.
+    }
+    BreakStmt => {
+      return checkBreakNode(n, ix)
+    }
+    ContinueStmt => {
+      return TY_VOID
+      // ── for v in A to B [step S] ────────────────────────────────────────────────
+      // A numeric range loop: the bounds (and step, if present) must be i32; the loop
+      // variable is i32 in the body's scope.
+    }
+    ForRange => {
+      if neKeys.length > 0 { neKill("", curFnDeclIx) }
+      return checkForRangeNode(n, ix)
+    }
+    ForIn => {
+      if neKeys.length > 0 { neKill("", curFnDeclIx) }
+      return checkForInNode(n, ix)
+    }
+    MatchExpr => {
+      return checkMatchExprNode(n, ix)
+    }
+    IfStmt => {
+      return checkIfStmtNode(ix)
+    }
+    RetStmt => {
+      return checkRetStmtNode(n, ix)
+    }
+    Block => {
+      return checkBlockNode(n, ix)
+    }
+    Program => {
+      return checkProgramNode(n)
+    }
+    Param => {
+      return TY_VOID
+    }
+    TypeRef => {
+      return TY_VOID
+    }
+    TypeDecl => {
+      // Registered by the Program pass-0 pre-pass; nothing to do when visited.
+      return TY_VOID
+    }
+    UnionDecl => {
+      // Registered by the Program pass-0 pre-pass; nothing to do when visited.
+      return TY_VOID
+    }
+    ImportDecl => {
+      // A tooling node (the lint tier reads it): import binding/resolution
+      // happened in the module front end (the driver's token-level `modScan` +
+      // merge), so the checker has nothing to verify here.
+      return TY_VOID
+    }
+    // a field row is checked by its owning literal or declaration
+    FieldDef | FieldInit => {}
   }
   TY_ERR
 }

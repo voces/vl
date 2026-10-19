@@ -60,6 +60,7 @@ import {
   Call,
   CharLit,
   ContinueStmt,
+  ErrExpr,
   FieldDef,
   FieldInit,
   ForIn,
@@ -67,6 +68,7 @@ import {
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
@@ -8232,145 +8234,164 @@ function modRwIsType(ix: i32): i32 {
 function modRwExpr(ix: i32): i32 {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
-  if n is Ident {
-    if modRwCalleeIx != ix { modOvNoteUse(ix, -1, n.identName) }
-    n.identName = modRenamed(n.identName)
-    // R4: the in-place name write the self-compile exercises hardest — the merge
-    // renames every colliding top-level reference in every compiler module. The checker,
-    // which runs after the merge, resolves the read.
-    sidNoteNodeName(ix, -1)
-    return 0
-  }
-  if n is Call {
-    // A UFCS member-call `recv.prop(args)` whose `prop` names a mangled free
-    // `self`-function. The property string on the `Member` is not rewritten, since a
-    // callable field of the same name keeps precedence; records the plain→mangled
-    // alias instead, banked on this node (D1120), not under the plain name.
-    const cf = P.nodes[n.callFn]
-    if cf is Member {
-      if !modOvMemberSite(ix, cf.memProp) {
-        const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
-        if target != "" { ufcsSiteAdd(ix, target) }
-      }
-    }
-    if cf is Ident {
-      modOvNoteUse(n.callFn, ix, cf.identName)
-      modRwCalleeIx = n.callFn
-    }
-    modRwExpr(n.callFn)
-    modRwCalleeIx = -1
-    // Written type arguments are annotations in the caller's scope and rename like one (D2527).
-    const tas = callTyArgsOf(ix)
-    let ti = 0
-    while ti < tas.length {
-      modRwType(tas[ti])
-      ti = ti + 1
-    }
-    let i = 0
-    while i < n.callArgs.length {
-      modRwExpr(n.callArgs[i])
-      i = i + 1
-    }
-    return 0
-  }
-  if n is Member {
-    // The property is a field label, never a top-level binding — receiver only.
-    modRwExpr(n.memObj)
-    return 0
-  }
-  if n is OptMember {
-    modRwExpr(n.omObj)
-    return 0
-  }
-  if n is Index {
-    modRwExpr(n.idxArr)
-    modRwExpr(n.idxIndex)
-    return 0
-  }
-  if n is BinExpr {
-    modRwExpr(n.binLeft)
-    modRwExpr(n.binRight)
-    return 0
-  }
-  if n is Unary {
-    modRwExpr(n.unArg)
-    return 0
-  }
-  if n is Paren {
-    modRwExpr(n.parInner)
-    return 0
-  }
-  if n is ObjLit {
-    let i = 0
-    while i < n.objFields.length {
-      const f = P.nodes[n.objFields[i]]
-      if f is FieldInit { modRwExpr(f.fiValue) }
-      i = i + 1
-    }
-    return 0
-  }
-  if n is ArrayLit {
-    let i = 0
-    while i < n.arrElems.length {
-      modRwExpr(n.arrElems[i])
-      i = i + 1
-    }
-    return 0
-  }
-  // A spread's source names a binding like any operand, in a literal or a call (D2334).
-  if n is Spread { return modRwExpr(n.spdArg) }
-  if n is IsExpr {
-    modRwExpr(n.isObj)
-    return modRwIsType(ix)
-  }
-  if n is AsExpr {
-    modRwExpr(n.asObj)
-    // The cast target is renamable: the checker requires it resolve to a numeric
-    // scalar, and a user alias (`type Id = i32`, `x as Id`) does — leaving the cast
-    // spelling alone while the declaration renamed to `Id$mN` failed every module
-    // program casting to a named alias.
-    const asRoot = annTsOf(ix)
-    if asRoot >= 0 {
-      modRwTsName(asRoot)
-      n.asTy = tsToName(asRoot)
+  match n {
+    Ident => {
+      if modRwCalleeIx != ix { modOvNoteUse(ix, -1, n.identName) }
+      n.identName = modRenamed(n.identName)
+      // R4: the in-place name write the self-compile exercises hardest — the merge
+      // renames every colliding top-level reference in every compiler module. The checker,
+      // which runs after the merge, resolves the read.
+      sidNoteNodeName(ix, -1)
       return 0
     }
-    n.asTy = modTypeRenamed(n.asTy)
-    return 0
-  }
-  // D981 — an if-expression (the same `IfStmt` node in value position: a `return`,
-  // initializer, assignment RHS, call argument, or nested arm). Routes to
-  // `modRwStmt`'s own arm, so a nested arm keeps `modRwBlock`'s shadow handling
-  // instead of a drifting second copy.
-  if n is IfStmt { return modRwStmt(ix) }
-  // A loop or labelled block whose value is used stands in value position too (D3406).
-  if n is WhileStmt || n is ForRange || n is ForIn { return modRwStmt(ix) }
-
-  // A `match` (value- or statement-position). The merge rename descends into the
-  // scrutinee and every arm body, else an arm's name keeps its bare spelling after
-  // the export's rename. A type pattern's check type takes `modRwIsType`, not
-  // `modRwExpr`, which would re-walk the shared scrutinee and rename it n+1 times over.
-  if n is MatchExpr {
-    modRwExpr(n.matchScrut)
-    let p = 0
-    while p < n.matchPats.length {
-      modRwMatchPat(n.matchPats[p])
-      p = p + 1
+    Call => {
+      // A UFCS member-call `recv.prop(args)` whose `prop` names a mangled free
+      // `self`-function. The property string on the `Member` is not rewritten, since a
+      // callable field of the same name keeps precedence; records the plain→mangled
+      // alias instead, banked on this node (D1120), not under the plain name.
+      if n.callFn >= 0 {
+        const cf = P.nodes[n.callFn]
+        if cf is Member {
+          if !modOvMemberSite(ix, cf.memProp) {
+            const target = modSelfFnTarget(cf.memProp, n.callArgs.length)
+            if target != "" { ufcsSiteAdd(ix, target) }
+          }
+        }
+        if cf is Ident {
+          modOvNoteUse(n.callFn, ix, cf.identName)
+          modRwCalleeIx = n.callFn
+        }
+      }
+      modRwExpr(n.callFn)
+      modRwCalleeIx = -1
+      // Written type arguments are annotations in the caller's scope and rename like one (D2527).
+      const tas = callTyArgsOf(ix)
+      let ti = 0
+      while ti < tas.length {
+        modRwType(tas[ti])
+        ti = ti + 1
+      }
+      let i = 0
+      while i < n.callArgs.length {
+        modRwExpr(n.callArgs[i])
+        i = i + 1
+      }
+      return 0
     }
-    let i = 0
-    while i < n.matchBodies.length {
-      // Payload bindings hold nothing this pass renames — the initializer is a
-      // `Member` over the shared scrutinee (renamed once, above) and `letName` is
-      // arm-local. But they must shadow: the desugar later prepends them to this
-      // body, so a module-level `const x` would otherwise capture the body's own `x`.
-      const saved = modShadow.length
-      modShadowMatchBinds(n, i)
-      modRwStmt(n.matchBodies[i])
-      modShadowTrim(saved)
-      i = i + 1
+    Member => {
+      // The property is a field label, never a top-level binding — receiver only.
+      modRwExpr(n.memObj)
+      return 0
     }
-    return 0
+    OptMember => {
+      modRwExpr(n.omObj)
+      return 0
+    }
+    Index => {
+      modRwExpr(n.idxArr)
+      modRwExpr(n.idxIndex)
+      return 0
+    }
+    BinExpr => {
+      modRwExpr(n.binLeft)
+      modRwExpr(n.binRight)
+      return 0
+    }
+    Unary => {
+      modRwExpr(n.unArg)
+      return 0
+    }
+    Paren => {
+      modRwExpr(n.parInner)
+      return 0
+    }
+    ObjLit => {
+      let i = 0
+      while i < n.objFields.length {
+        const f = P.nodes[n.objFields[i]]
+        if f is FieldInit { modRwExpr(f.fiValue) }
+        i = i + 1
+      }
+      return 0
+    }
+    ArrayLit => {
+      let i = 0
+      while i < n.arrElems.length {
+        modRwExpr(n.arrElems[i])
+        i = i + 1
+      }
+      return 0
+    }
+    // A spread's source names a binding like any operand, in a literal or a call (D2334).
+    Spread => {
+      return modRwExpr(n.spdArg)
+    }
+    IsExpr => {
+      modRwExpr(n.isObj)
+      return modRwIsType(ix)
+    }
+    AsExpr => {
+      modRwExpr(n.asObj)
+      // The cast target is renamable: the checker requires it resolve to a numeric
+      // scalar, and a user alias (`type Id = i32`, `x as Id`) does — leaving the cast
+      // spelling alone while the declaration renamed to `Id$mN` failed every module
+      // program casting to a named alias.
+      const asRoot = annTsOf(ix)
+      if asRoot >= 0 {
+        modRwTsName(asRoot)
+        n.asTy = tsToName(asRoot)
+        return 0
+      }
+      n.asTy = modTypeRenamed(n.asTy)
+      return 0
+    }
+    // D981 — an if-expression (the same `IfStmt` node in value position: a `return`,
+    // initializer, assignment RHS, call argument, or nested arm). Routes to
+    // `modRwStmt`'s own arm, so a nested arm keeps `modRwBlock`'s shadow handling
+    // instead of a drifting second copy.
+    IfStmt => {
+      return modRwStmt(ix)
+    }
+    // A loop or labelled block whose value is used stands in value position too (D3406).
+    WhileStmt => {
+      return modRwStmt(ix)
+    }
+    ForRange => {
+      return modRwStmt(ix)
+    }
+    ForIn => {
+      return modRwStmt(ix)
+    }
+    // A `match` (value- or statement-position). The merge rename descends into the
+    // scrutinee and every arm body, else an arm's name keeps its bare spelling after
+    // the export's rename. A type pattern's check type takes `modRwIsType`, not
+    // `modRwExpr`, which would re-walk the shared scrutinee and rename it n+1 times over.
+    MatchExpr => {
+      modRwExpr(n.matchScrut)
+      let p = 0
+      while p < n.matchPats.length {
+        modRwMatchPat(n.matchPats[p])
+        p = p + 1
+      }
+      let i = 0
+      while i < n.matchBodies.length {
+        // Payload bindings hold nothing this pass renames — the initializer is a
+        // `Member` over the shared scrutinee (renamed once, above) and `letName` is
+        // arm-local. But they must shadow: the desugar later prepends them to this
+        // body, so a module-level `const x` would otherwise capture the body's own `x`.
+        const saved = modShadow.length
+        modShadowMatchBinds(n, i)
+        modRwStmt(n.matchBodies[i])
+        modShadowTrim(saved)
+        i = i + 1
+      }
+      return 0
+    }
+    FuncDecl => {
+      return modRwFunc(ix)
+    }
+    // a literal, declaration or statement-only node names no binding here
+    NumLit | StrLit | CharLit | BoolLit | NullLit | ErrExpr | LetDecl | Param | TypeRef | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ImportDecl => {}
   }
-  if n is FuncDecl { return modRwFunc(ix) }
   0
 }

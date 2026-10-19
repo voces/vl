@@ -1,4 +1,4 @@
-// THE OWNER-FACING READING: `compiler/typecheck.vl` opened in the editor.
+// THE OWNER-FACING READING: `compiler/emit_mono.vl` opened in the editor.
 //
 // Every `kind-ladder-incomplete`, `sentinel-index-unguarded` and
 // `arena-scan-outside-pass` finding in that file is debt the committed ratchets already
@@ -19,10 +19,10 @@ if (!ENABLED) {
 }
 
 const logs: string[] = [];
-const TARGET = `${ROOT}/compiler/typecheck.vl`;
+const TARGET = `${ROOT}/compiler/emit_mono.vl`;
 // checkout-root-relative — the spelling `lint()`'s `path` argument wants, and the
 // spelling `scaIsCompiler` (compiler/lint.vl) prefix-matches.
-const REL = "compiler/typecheck.vl";
+const REL = "compiler/emit_mono.vl";
 const HELD_CODES = [
   "kind-ladder-incomplete",
   "sentinel-index-unguarded",
@@ -53,13 +53,13 @@ const rawFindings = async () => {
 };
 
 Deno.test({
-  name: "ratchet-hold: typecheck.vl's ratcheted findings all sit at or under baseline",
+  name: "ratchet-hold: emit_mono.vl's ratcheted findings all sit at or under baseline",
   ignore: !ENABLED,
   fn: async () => {
     invalidateRatchetBaselines();
     const { diags } = await rawFindings();
     const held = diags.filter((d) => HELD_CODES.includes(String(d.code)));
-    // Non-vacuity only: the typecheck.vl carves move findings out, so no size floor.
+    // Non-vacuity only: paying the ratchets moves findings out, so no size floor.
     if (held.length === 0) {
       throw new Error(
         `the premise of this test is that the file carries a held backlog; ` +
@@ -70,7 +70,7 @@ Deno.test({
     const stillHeld = out.filter((d) => HELD_CODES.includes(String(d.code)));
     if (stillHeld.length !== 0) {
       throw new Error(
-        `want 0 ratcheted findings published for typecheck.vl, got ${stillHeld.length}: ` +
+        `want 0 ratcheted findings published for emit_mono.vl, got ${stillHeld.length}: ` +
           JSON.stringify(stillHeld.slice(0, 3).map((d) => d.message)),
       );
     }
