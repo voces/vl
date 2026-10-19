@@ -50,7 +50,8 @@ import {
   nodeChildren,
 } from "./ast"
 import { wsOrigTyOf } from "./check_demands"
-import { tyMayHoldFn } from "./check_types"
+import { nodeTyIxOf } from "./check_node_tys"
+import { T, TyFunc, mkFuncTy, tyEq, tyMayHoldFn } from "./check_types"
 import {
   monoAnnHasTyParam,
   monoDeclAnnName,
@@ -81,6 +82,8 @@ let vrMemoState: {[string]: i32} = Map()
 let vrMemoVal: {[string]: i32[]} = Map()
 let vrSeen: {[i32]: boolean} = Map()
 let vrStmts: i32[] = []
+// The list and record literals the index holds, in the order it reached them.
+export let vrLits: i32[] = []
 let vrInst = false
 let vrExact = false
 
@@ -95,6 +98,7 @@ export function vrReset(stmts: i32[], inst: boolean, exact: boolean) {
   vrMemoState = Map()
   vrMemoVal = Map()
   vrStmts = stmts
+  vrLits = []
   vrInst = inst
   vrExact = exact
   0
@@ -112,6 +116,7 @@ export function vrIndex(roots: i32[], cands: i32[]) {
       if ix >= 0 && ix < P.nodes.length && !(vrSeen[ix] ?? false) {
         // arena-tick exempt: a side table of this pass, not the arena
         vrSeen[ix] = true
+        if P.nodes[ix] is ArrayLit || P.nodes[ix] is ObjLit { vrLits.push(ix) }
         vrNoteRead(ix, cands)
         for ch in nodeChildren(ix) {
           if ch >= 0 && (vrParent[ch] ?? -1) < 0 {
@@ -177,6 +182,55 @@ export function vrCalls(x: i32, path: string): i32[] {
   r
 }
 
+// The one function type with no type variable every call value `x` reaches at `path` makes;
+// -1 when it reaches no call, a place the question does not follow, or calls of more than one type.
+export function vrCalleeTy(x: i32, path: string): i32 {
+  const cs = vrCalls(x, path)
+  if cs.length == 0 || vrLostIn(cs) { return -1 }
+  let out = -1
+  for c in cs {
+    const cn = P.nodes[c]
+    if !(cn is Call) { return -1 }
+    const t = vrCallTy(cn, c)
+    if t < 0 || (out >= 0 && !tyEq(out, t)) { return -1 }
+    out = t
+  }
+  out
+}
+
+// The function type call `n` at node `c` makes: its callee's, or where that names a type variable,
+// at each such parameter its argument's type and at such a result its own; -1 when one still does.
+function vrCallTy(n: Call, c: i32): i32 {
+  const t = nodeTyIxOf(n.callFn)
+  if t < 0 || t >= T.tys.length { return -1 }
+  const ft = T.tys[t]
+  if !(ft is TyFunc) { return -1 }
+  if !tyHasTyVar(t) { return t }
+  if (
+    hasNamedArgs(n.callArgNames)
+    || n.callArgs.length != ft.fnParamTypes.length
+  ) {
+    return -1
+  }
+  const ps: i32[] = []
+  let i = 0
+  while i < n.callArgs.length {
+    let pt = ft.fnParamTypes[i]
+    if tyHasTyVar(pt) {
+      const a = n.callArgs[i]
+      if P.nodes[a] is Spread { return -1 }
+      pt = nodeTyIxOf(a)
+      if pt < 0 || tyHasTyVar(pt) { return -1 }
+    }
+    ps.push(pt)
+    i = i + 1
+  }
+  let r = ft.fnRet
+  if tyHasTyVar(r) { r = nodeTyIxOf(c) }
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  mkFuncTy(ps, r)
+}
+
 // Whether call list `cs` holds a place the question does not follow.
 export function vrLostIn(cs: i32[]): boolean { cs.length > 0 && cs[0] < 0 }
 
@@ -219,6 +273,7 @@ function vrStep(x: i32, path: string): i32[] {
     }
     ForIn => {
       if x == pn.fiBody { return none }
+      if x == pn.fiIter { return vrForVar(pn, p, path) }
     }
     FuncDecl => {
       if x == pn.fnBody && !vrExact { return vrFnValue(p, path) }
@@ -319,6 +374,21 @@ function vrIndexRead(ix: i32, p: i32, path: string): i32[] {
   vrCalls(p, rest)
 }
 
+// The `ForIn` arm of `vrStep` for the list `p` iterates: each element is bound to the loop
+// variable, whose reads reach what the element does; with `exact` only an unread one answers.
+function vrForVar(n: ForIn, p: i32, path: string): i32[] {
+  const out: i32[] = []
+  if vrElemOf(path) == -2 { return vrLost() }
+  const rest = vrPathRest
+  for u in vrUses[p] ?? [] {
+    const un = P.nodes[u]
+    if un is Ident && un.identName == n.fiVar {
+      if vrExact || !vrJoin(out, vrCalls(u, rest)) { return vrLost() }
+    }
+  }
+  out
+}
+
 // The function declaration holding node `ix`, or -1 at module scope.
 export function vrFrameOf(ix: i32): i32 {
   let o = vrParent[ix] ?? -1
@@ -371,12 +441,14 @@ function vrFnValue(f0: i32, path: string): i32[] {
 }
 
 // The calls every read of the binding or parameter declared at `d`, no export, reaches at
-// `path`; a write's target is no read. With `exact` only a `const` binding answers.
+// `path`; a write's target is no read. With `exact` only a binding nothing writes answers.
 function vrDecl(d: i32, path: string): i32[] {
   const out: i32[] = []
   const dn = P.nodes[d]
   let nm = ""
-  if dn is LetDecl && (dn.letKw == "const" || !vrExact) { nm = dn.letName }
+  if dn is LetDecl && (dn.letKw == "const" || !vrExact || !vrWritten(d)) {
+    nm = dn.letName
+  }
   if dn is Param && !vrExact { nm = dn.parName }
   if (
     nm == ""
@@ -391,6 +463,23 @@ function vrDecl(d: i32, path: string): i32[] {
     if !vrJoin(out, vrCalls(u, path)) { return vrLost() }
   }
   out
+}
+
+// Whether some read of the binding declared at `d` is an assignment's target.
+function vrWritten(d: i32): boolean {
+  for u in vrUses[d] ?? [] {
+    let t = u
+    let p = vrParent[u] ?? -1
+    while p >= 0 && P.nodes[p] is Paren {
+      t = p
+      p = vrParent[p] ?? -1
+    }
+    if p >= 0 {
+      const pn = P.nodes[p]
+      if pn is BinExpr && pn.binOp == "=" && pn.binLeft == t { return true }
+    }
+  }
+  false
 }
 
 // The `BinExpr` arm of `vrStep`: a plain write's target is not read, and its value reaches what
