@@ -17,7 +17,7 @@
 //
 // GATING: needs the seed.
 
-import { COMPILER, exists } from "./support/tree.ts";
+import { COMPILER, exists, STD } from "./support/tree.ts";
 
 const ENABLED = exists(COMPILER);
 if (!ENABLED) console.warn("[check-skip] skipped — missing the seed");
@@ -115,7 +115,9 @@ const load = (exp: Exports, g: Graph, entry = "main.vl") => {
       keys.push(readStr(exp.modPendingLen(i), (j) => exp.modPendingAt(i, j)));
     }
     for (const k of keys) {
-      const src = g[k.slice(k.lastIndexOf("/") + 1)];
+      const src = k.startsWith("std:")
+        ? g[k] ?? Deno.readTextFileSync(`${STD}/${k.slice(4)}.vl`)
+        : g[k.slice(k.lastIndexOf("/") + 1)];
       if (src === undefined) throw new Error(`no source for ${k}`);
       commit(k, src);
     }
@@ -245,6 +247,17 @@ const MAIN_BAD = `const bad: string = bx
 const worse: boolean = area(1)
 `;
 
+// Main calls a generic from gen, which hub also imports, so an edit to hub puts gen in S.
+const HUB: Graph = {
+  "gen.vl": 'import { keep } from "./base"\nexport function gp<T>(x: T): T {\n  keep(x)\n  return x\n}\n',
+  "base.vl": "export function keep(x: i32): void { print(x) }\n",
+  "hub.vl": 'import { gp } from "./gen"\nexport function hub(): i32 { return 1 }\n',
+};
+const HUB_USES = 'import { gp } from "./gen"\nimport { hub } from "./hub"\nprint(gp(1))\nprint(hub())\n';
+
+// std:fmt's own source, for an edit to the template renderer.
+const FMT = ENABLED ? Deno.readTextFileSync(`${STD}/fmt.vl`) : "";
+
 type Want = "serve" | "decline" | "any";
 type Case = {
   name: string;
@@ -260,6 +273,10 @@ type Case = {
   uses?: string;
   // Added to lib's head on both sides.
   libUses?: string;
+  // More modules, on both sides.
+  extra?: Graph;
+  // A second edit, as [module, from, to].
+  also?: [string, string, string];
 };
 
 const CASES: Case[] = [
@@ -776,7 +793,7 @@ const CASES: Case[] = [
   {
     name: "a lib call becomes a second site of a fresh builder",
     want: "decline",
-    why: "ambient",
+    why: "fresh",
     from: "print(3)",
     to: "print(mk().f)",
     libUses: "export function mk() { { f: 4 } }\n",
@@ -800,14 +817,112 @@ const CASES: Case[] = [
     libUses: "type W = { f: f64 }\nfunction takeW(w: W): void { print(w.f) }\nexport function mk() { { f: 4 } }\nfunction qq(): void { takeW(mk()) }\n",
     uses: 'import { mk } from "./lib"\nconst z: i32 = mk().f\nprint(z)\n',
   },
+  {
+    // `mk`'s site count is read by every site's check, so lib losing a site moves main's result.
+    name: "a lib call stops being a second site of a fresh builder",
+    want: "decline",
+    why: "fresh",
+    from: "print(3)",
+    to: "print(4)",
+    libUses: "export function mk() { { f: 4 } }\nexport function other(): void { const b = mk(); print(b.f + 1) }\n",
+    uses: 'import { mk } from "./lib"\nlet v = { f: 1.5 }\nv = mk()\nprint(v.f)\n',
+    also: ["lib.vl", "const b = mk(); print(b.f + 1)", "print(5)"],
+  },
+  {
+    // Lib is in S only as mid's import, and a generic main calls from it closes over nothing moved.
+    name: "a generic called from a module S only imports",
+    want: "serve",
+    at: "mid.vl",
+    from: "area(n) + 1",
+    to: "area(n) + 2",
+    uses: 'import { pick } from "./lib"\nprint(pick(1, 2))\n',
+  },
+  {
+    name: "a generic called from a module S only imports, over an unmoved closure",
+    want: "serve",
+    at: "hub.vl",
+    from: "return 1",
+    to: "return 2",
+    extra: HUB,
+    uses: HUB_USES,
+  },
+  {
+    name: "a generic called from a module S only imports, over a moved closure",
+    want: "decline",
+    why: "demand",
+    at: "hub.vl",
+    from: "return 1",
+    to: "return 2",
+    extra: HUB,
+    uses: HUB_USES,
+    also: ["base.vl", "x: i32", "x: string"],
+  },
+  {
+    name: "a generic called from a module S only imports, over a banked diagnostic",
+    want: "decline",
+    why: "demand",
+    at: "hub.vl",
+    from: "return 1",
+    to: "return 2",
+    extra: { ...HUB, "gen.vl": HUB["gen.vl"] + "const gbad: string = 1\n" },
+    uses: HUB_USES,
+  },
+  {
+    name: "a generic main takes as a value from a module S only imports",
+    want: "decline",
+    why: "demand",
+    at: "hub.vl",
+    from: "return 1",
+    to: "return 2",
+    extra: HUB,
+    uses: HUB_USES + "const gh: (x: i32) => i32 = gp\nprint(gh(3))\n",
+  },
+  {
+    // A hole's renderer is the one export std:fmt's injected import names.
+    name: "a template hole beside an edit to a lib template",
+    want: "serve",
+    from: '"v',
+    to: '"w',
+    libUses: 'export function tl(n: i32): string { return "v\\{n}" }\n',
+    uses: 'const tm = 3\nprint("m\\{tm}")\n',
+  },
+  {
+    name: "the template renderer narrows its parameter",
+    want: "decline",
+    why: "ambient",
+    at: "std:fmt",
+    from: "export function toString(self: i32 | i64 | boolean | f64)",
+    to: "export function toString(self: boolean)",
+    extra: { "std:fmt": FMT },
+    uses: 'const tm = 3\nprint("m\\{tm}")\n',
+  },
+  {
+    name: "a bare import of std:fmt beside an edit to a lib template",
+    want: "decline",
+    why: "demand",
+    from: '"v',
+    to: '"w',
+    libUses: 'export function tl(n: i32): string { return "v\\{n}" }\n',
+    uses: 'import "std:fmt"\nconst tm = 3\nprint("m\\{tm}")\n',
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
   const main = (c.uses ?? "") + MAIN + (bad ? MAIN_BAD : "");
-  const g: Graph = { "main.vl": main, "lib.vl": (c.libUses ?? "") + LIB, "mid.vl": MID };
-  const at = c.at ?? "lib.vl";
-  if (!g[at].includes(c.from)) throw new Error(`${c.name}: no \`${c.from}\` in ${at}`);
-  return [g, { ...g, [at]: g[at].replace(c.from, c.to) }];
+  const g: Graph = {
+    "main.vl": main,
+    "lib.vl": (c.libUses ?? "") + LIB,
+    "mid.vl": MID,
+    ...c.extra,
+  };
+  const edits: [string, string, string][] = [[c.at ?? "lib.vl", c.from, c.to]];
+  if (c.also) edits.push(c.also);
+  const h: Graph = { ...g };
+  for (const [at, from, to] of edits) {
+    if (!h[at].includes(from)) throw new Error(`${c.name}: no \`${from}\` in ${at}`);
+    h[at] = h[at].replace(from, to);
+  }
+  return [g, h];
 };
 
 const same = (a: string[], b: string[]) => a.join("\n") === b.join("\n");
@@ -928,6 +1043,11 @@ Deno.test({
       // `IH_NO_REACH_TOKENS` drops a reach row's signature tokens, which alone spell a default:
       // the checked type renders the same with it or without.
       ["a defaulted param loses its default", 16777216],
+      // `IH_NO_FRESH` hides the builder whose site count every site's check reads.
+      ["a lib call stops being a second site of a fresh builder", 65536],
+      // `SK_NO_KEPT_SRC | IH_NO_CROSS` keeps a bank across a generic whose closure moved, with
+      // the reach below the origin dropped; dropping the reach alone still declines `demand`.
+      ["a generic called from a module S only imports, over a moved closure", 134217728 | 8192],
     ];
     for (const [name, mask] of witness) {
       const { fails, got } = grade(CASES.find((c) => c.name === name)!, false, mask);
@@ -937,6 +1057,11 @@ Deno.test({
             ` and ${fails.length} differences`,
         );
       }
+    }
+    const moved = CASES.find((c) => c.name.endsWith("over a moved closure"))!;
+    const alone = grade(moved, false, 8192).got;
+    if (alone.served !== 0 || REASON[alone.reason] !== "demand") {
+      throw new Error(`want IH_NO_CROSS alone to decline \`demand\`, got ${REASON[alone.reason]}`);
     }
   },
 });
