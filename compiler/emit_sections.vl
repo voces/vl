@@ -561,6 +561,7 @@ import {
   fbI32Const,
   fbI32Eqz,
   fbI32Load,
+  fbI32Rel,
   fbI64Const,
   fbIf,
   fbIfRefNul,
@@ -613,6 +614,21 @@ import {
   wU8,
   wULEB,
 } from "./emit_bytes"
+import {
+  RELOC_ARMED,
+  RS_GUARD,
+  RS_SLOT,
+  RS_TAG,
+  relCopy,
+  relCount,
+  relFoldBank,
+  relOffAt,
+  relPlace,
+  relRebase,
+  relReset,
+  relSpAt,
+  relValAt,
+} from "./emit_reloc"
 import {
   anonLeafSupersedeOf,
   sFieldTypeAt,
@@ -758,6 +774,7 @@ import {
   moduleHasUnionAs,
 } from "./emit_union_casts"
 import { printPlanReset, unionRegistryABSweep } from "./emit_union_registry"
+import { unTyKeyShadowSweep } from "./emit_union_tykey"
 import {
   auditRecordJoinLeaves,
   capNarrowBuild,
@@ -1370,6 +1387,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // Where `bodyExpr` lands INSIDE the body: the locals vector, plus the sink's block
     // opener when there is one. The start function computes the same offset.
     const exprInBody = body.length
+    relCopy(bodyExpr, body, exprInBody)
     appendAll(body, bodyExpr)
     // Bind the writer at `body` (the framed code entry) for the trailing padding/end
     // opcodes emitted via the `fb*` methods.
@@ -2375,7 +2393,7 @@ function emitStartFnCode(out: u8[]) {
       // A guarded global's initializer has run (a folded one, at its declaration): advance the
       // progress cell past it.
       if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
-        fbI32Const(gi + 1)
+        fbI32Rel(RS_GUARD, gi + 1)
         fbGlobalSet(gInitProgIdx)
       }
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
@@ -2418,6 +2436,7 @@ function emitStartFnCode(out: u8[]) {
   if fbEmitLocalsVec(body, nStartLocals) < 0 { return -1 }
   // Where `bodyExpr` lands INSIDE the body — everything before it is the locals vector.
   const exprInBody = body.length
+  relCopy(bodyExpr, body, exprInBody)
   appendAll(body, bodyExpr)
   const endPrev = wTarget(body)
   fbEnd() // 0x0b end (void → void: stack already empty)
@@ -5203,17 +5222,17 @@ function rvBoxElem(p: i32, sL: i32, idx: i32, guard: boolean) {
     rvSrcElem(p, sL, idx, guard)
     wU8(209) // 0xd1 ref.is_null
     fbIfRefNul(uBoxIdx, false)
-    fbI32Const(nullBoxTag())
+    fbI32Rel(RS_TAG, nullBoxTag())
     fbRefNullNone()
     fbStructNew(uBoxIdx)
     fbElse()
-    fbI32Const(uTags[rvVariant[p]])
+    fbI32Rel(RS_TAG, uTags[rvVariant[p]])
     rvSrcElem(p, sL, idx, guard)
     fbStructNew(uBoxIdx)
     fbEnd()
     return 0
   }
-  fbI32Const(uTags[rvVariant[p]])
+  fbI32Rel(RS_TAG, uTags[rvVariant[p]])
   rvSrcElem(p, sL, idx, guard)
   fbStructNew(uBoxIdx)
   0
@@ -5752,6 +5771,25 @@ function emitNameSection(n: i32) {
   0
 }
 
+// The armed recorder's rows as the `vl.reloc` custom section: a ULEB count, then per row its
+// module offset (ULEB), space (one byte) and value (SLEB). Written last, so no offset moves.
+function emitRelocSection() {
+  if !RELOC_ARMED { return 0 }
+  const payload: u8[] = []
+  const prev = wTarget(payload)
+  wName("vl.reloc")
+  wULEB(relCount())
+  let k = 0
+  while k < relCount() {
+    wULEB(relOffAt(k))
+    wU8(relSpAt(k))
+    wSLEB(relValAt(k))
+    k = k + 1
+  }
+  wTarget(prev)
+  wSection(0, payload)
+}
+
 // Collects the string-literal pool: every distinct `StrLit` lexeme in the arena (first-seen
 // arena order, deterministic per program) whose decoded length fits one `array.new_fixed` (an
 // over-cap literal keeps the inline chunked build), then every literal an `is` compares with
@@ -5881,6 +5919,7 @@ function emitDataSection() {
 function emitModule(_stmts: i32[]) {
   emitReset()
   typeOrderReset()
+  relReset()
   // The collect passes are done, so this is the last moment before any section indexes a
   // variant: prove the field-span tables cover every `uVariants` row, or fail loudly and pad
   // them, since a short table turns the next thirty reads into a compiler trap. Deliberately not
@@ -5977,6 +6016,7 @@ function emitModule(_stmts: i32[]) {
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
   // unchanged for every golden.
   emitNameSection(n)
+  emitRelocSection()
   if wStray.length > 0 {
     return emitFail(
       "emitProgram: a module byte was written outside any section",
@@ -7331,6 +7371,7 @@ export function emitProgram(rootIx: i32) {
     // The union registry's own equivalence sweep (SPIKE, same arming, same once-per-program
     // window — see `unionRegistryABSweep`). A no-op unless the harness is armed.
     unionRegistryABSweep()
+    unTyKeyShadowSweep()
     // The ladder-vs-descriptor agreement oracle, same arming and window: what every converted
     // classifier site answered beside what `repOfTy` would have. A no-op unless armed.
     repLadderABSweep()
@@ -8917,7 +8958,7 @@ function frameGlobalSection() {
       wBytes(gSynthInit[i])
     } else {
       fbRefNullStruct()
-      fbI32Const(gImports + gSynthArg[i])
+      fbI32Rel(RS_SLOT, gImports + gSynthArg[i])
       fbStructNew(ty)
     }
     fbEnd()
@@ -9055,6 +9096,7 @@ function captureFoldedConsts(): i32 {
       if rc < 0 { return -1 }
       if wIsOneScalarConst(one) {
         gFoldOk[gi] = 1
+        relFoldBank(one, gi)
         gFoldAt[gi] = gFoldPool.length
         gFoldLen[gi] = one.length
         let k = 0
@@ -9476,6 +9518,7 @@ function rewriteCodeCount(codePayload: ByteRope, count: i32, rowsAt: i32) {
   const delta = head.length - codePayload.chunks[0].b.length
   codePayload.chunks[0] = { b: head }
   codePayload.len = codePayload.len + delta
+  relRebase(delta)
   let r = rowsAt
   while r < emitFnSpanStart.length {
     emitFnSpanStart[r] = emitFnSpanStart[r] + delta
@@ -9503,6 +9546,7 @@ function placeCodeEntry(
     emitFnSpanEnd[r] = emitFnSpanEnd[r] + at
     r = r + 1
   }
+  relPlace(entry, at)
   ropePush(code, entry)
   bankFnSpan(node, pos, at, at + entry.length, kind, tag)
 }
@@ -9515,6 +9559,7 @@ function writeCodeSection(codePayload: ByteRope) {
   // the payload to the module rope, so `W.len - codePayload.len` is where it starts — a
   // module offset being exactly the coordinate the engine's validator reports. Derived from the length, not the section header's own width, so the ULEB size prefix cannot be counted wrong.
   const codeBase = W.len - codePayload.len
+  relRebase(codeBase)
   let sp = 0
   while sp < emitFnSpanStart.length {
     emitFnSpanStart[sp] = emitFnSpanStart[sp] + codeBase

@@ -489,6 +489,7 @@ import {
 } from "./emit_ty_canon"
 import {
   isUName,
+  unABOn,
   unNameBound,
   unRowOfCanon,
   unionArmsOf,
@@ -496,6 +497,15 @@ import {
   unionSetAtomsOf,
   unionSetMemberCount,
 } from "./emit_union_registry"
+import {
+  unTyKeyShadow,
+  unTyKeyTagArm,
+  unTyKeyTagLet,
+  unTyKeyTagParam,
+  unTyKeyTagParamList,
+  unTyKeyTagRet,
+  unTyKeyTagTpSub,
+} from "./emit_union_tykey"
 import {
   argNichePinTyOf,
   holeOperandI32PinTyOf,
@@ -523,7 +533,7 @@ import {
 // names)` and registered before the body is walked so a recursive self-call at the
 // same shape hits the registry.
 
-import { i32ListHas, strListHas } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import { strContains } from "./strutil"
 import {
   flattenVariantsInto,
@@ -534,6 +544,7 @@ import {
   tyHasTyVarWasCapped,
   tyIsNumericBox,
   tyReachesHole,
+  tyStepElem,
 } from "./tyquery"
 import {
   isValueUnionTyOr,
@@ -2197,7 +2208,7 @@ function monoSubstLetType(
             if !tyHasTyVar(s2) { sty = s2 }
           }
         }
-        const subC = monoPinMintedUnion(sub, sty)
+        const subC = monoPinMintedUnion(sub, sty, unTyKeyTagLet())
         // A union takes the type its registered spelling names, the one an assignment's
         // `letUnionNameOf` resolves against the registry, not the substitution's own row (D2676).
         const subAtoms: string[] = []
@@ -8488,13 +8499,14 @@ function monoPinUnionName(rs: string): string {
 // The spelling a parameter or local annotation of type `ty` takes when a pin substitutes into a
 // union holding a map or a record (`V | {[K]: i32}` at `V := {[K]: boolean}`): registered under
 // the canon key a direct spelling reuses, as a return's is, since `collectU` ran before this pass.
-// Unboxed, the binding would be the bare member of its initializer (D2657, D2676).
-function monoPinMintedUnion(name: string, ty: i32): string {
+// Unboxed, the binding would be the bare member (D2657, D2676). `shTag` names the shadow root.
+function monoPinMintedUnion(name: string, ty: i32, shTag: i32): string {
   if !monoTyHoldsRefArm(ty) || unNameBound(name) { return name }
   // A list of such a union registers its element union, as a direct `(A | B)[]` does (D2678).
   const pun = parenUnionArrElemName(name)
   if pun != "" {
     const pc = monoPinUnionName(pun)
+    monoShStage(unTyKeyTagParamList(), tyStepElem(ty))
     if monoRegisterPinUnion(pc, -1) < 0 { return name }
     return "(" + pc + ")[]"
   }
@@ -8502,8 +8514,132 @@ function monoPinMintedUnion(name: string, ty: i32): string {
   unionSetAtomsOf(name, atoms)
   if atoms.length < 2 { return name }
   const c = monoPinUnionName(name)
+  monoShStage(shTag, ty)
   if monoRegisterPinUnion(c, -1) < 0 { return name }
   c
+}
+
+// The type-key shadow's stage for the next `monoRegisterPinUnion`: the root's tag (0 for none)
+// and the type that root hands over. Written only while the shadow is armed.
+let monoShTag = 0
+let monoShTy = -1
+
+function monoShStage(tag: i32, ty: i32) {
+  if unABOn() == 0 { return 0 }
+  monoShTag = tag
+  monoShTy = ty
+  0
+}
+
+// A parameter's pins are classified once the instance's binding is whole: while
+// `monoShParNode` names the annotation being pinned, each pin is held here instead.
+let monoShParNode = -1
+const monoShPendTag: i32[] = []
+const monoShPendName: string[] = []
+const monoShPendNode: i32[] = []
+
+// Hands the pins held since `from` to the shadow, then drops them. Each is typed by its
+// annotation under `monoShBindingOf`'s binding of `params` at `pinTys`; a list pin by that
+// type's element.
+function monoShPendFlush(
+  from: i32,
+  params: i32[],
+  pinTys: i32[],
+  bN: string[],
+  bT: i32[],
+) {
+  const xN: string[] = []
+  const xT: i32[] = []
+  if monoShPendTag.length > from {
+    monoShBindingOf(params, pinTys, bN, bT, xN, xT)
+  }
+  let i = from
+  while i < monoShPendTag.length {
+    let ty = substTyDeep(nodeTyIxOf(monoShPendNode[i]), xN, xT)
+    if ty >= 0 && tyHasTyVar(ty) { ty = -1 }
+    if monoShPendTag[i] == unTyKeyTagParamList() { ty = tyStepElem(ty) }
+    unTyKeyShadow(monoShPendTag[i], monoShPendName[i], ty)
+    i = i + 1
+  }
+  while monoShPendTag.length > from {
+    monoShPendTag.pop()
+    monoShPendName.pop()
+    monoShPendNode.pop()
+  }
+  0
+}
+
+// Fills `xN`/`xT` with `bN`/`bT` completed by the union-arm binding each argument in `pinTys`
+// gives its parameter's one open member (`T` of `T | i32 | null`), which the instance's own
+// binding leaves unbound when that member is a bare type parameter.
+function monoShBindingOf(
+  params: i32[],
+  pinTys: i32[],
+  bN: string[],
+  bT: i32[],
+  xN: string[],
+  xT: i32[],
+) {
+  let j = 0
+  while j < bN.length && j < bT.length {
+    xN.push(bN[j])
+    xT.push(bT[j])
+    j = j + 1
+  }
+  let i = 0
+  while i < params.length && i < pinTys.length {
+    const pp = P.nodes[params[i]]
+    if pp is Param {
+      let d = nodeTyIxOf(pp.parType)
+      if d >= 0 && d < T.tys.length {
+        const dt = T.tys[d]
+        if dt is TyNullable { d = dt.nInner }
+      }
+      bindGenUnionArmInto(d, pinTys[i], xN, xT)
+    }
+    i = i + 1
+  }
+  0
+}
+
+// The return type the shadow is handed: `retTy`, or where that is -1 the declared `origRet`
+// under `monoShBindingOf`'s binding; -1 when a type variable is still open. Armed only.
+function monoShRetTy(
+  retTy: i32,
+  origRet: i32,
+  params: i32[],
+  pinTys: i32[],
+  bN: string[],
+  bT: i32[],
+): i32 {
+  if unABOn() == 0 || retTy >= 0 || origRet < 0 { return retTy }
+  const xN: string[] = []
+  const xT: i32[] = []
+  monoShBindingOf(params, pinTys, bN, bT, xN, xT)
+  const t = substTyDeep(origRet, xN, xT)
+  if t < 0 || tyHasTyVar(t) { return -1 }
+  t
+}
+
+// Offers the row `name` names to the shadow under root `shTag` (0 for none): held while a
+// parameter is being pinned, else compared with the staged type `ty` at once. Returns 0.
+function monoShOffer(shTag: i32, name: string, ty: i32) {
+  if shTag <= 0 { return 0 }
+  if monoShParNode >= 0 {
+    monoShPendTag.push(shTag)
+    monoShPendName.push(name)
+    monoShPendNode.push(monoShParNode)
+    return 0
+  }
+  unTyKeyShadow(shTag, name, ty)
+}
+
+// The type binding `bN`/`bT` gives type parameter `tp`, or -1.
+function monoBoundTyOf(tp: string, bN: string[], bT: i32[]): i32 {
+  if unABOn() == 0 { return -1 }
+  const i = strListIndexOf(bN, tp)
+  if i < 0 || i >= bT.length { return -1 }
+  bT[i]
 }
 
 // Whether union `ty` has a literal-union arm beside a non-literal one (`K | i32`), as a member
@@ -8621,12 +8757,17 @@ function monoTyIsRefElem(e: i32): boolean {
 // concrete `T` has no row and every consumer of the box hits its floor. The registration self-gates
 // on the union key's row, which keeps one row per union — a box's tags are that row's, positionally.
 function monoRegisterPinUnion(name: string, ty: i32) {
+  const shTag = monoShTag
+  monoShTag = 0
+  const shTy = monoShTy
+  monoShTy = -1
   const atoms: string[] = []
   unionSetAtomsOf(name, atoms)
   if atoms.length < 2 { return 0 }
-  if unNameBound(name) { return 0 }
+  if unNameBound(name) { return monoShOffer(shTag, name, shTy) }
   const before = uVariants.length
   if registerInlineUnionOfTy(monoProgStmts, name, ty) < 0 { return -1 }
+  monoShOffer(shTag, name, shTy)
   // Re-rank only when a variant is pushed: `assignTags` ranks variants globally and a value
   // union pushes none, so unconditional re-ranking would be quadratic.
   if uVariants.length != before { return assignTags() }
@@ -9156,13 +9297,20 @@ function monoMakeInstanceParams(
             const pst = substTyDeep(nodeTyIxOf(p3.parType), exBN, exBT)
             if pst >= 0 && !tyHasTyVar(pst) { gateTy = pst }
           }
-          const pinName = monoPinMintedUnion(pinned[pj], gateTy)
+          if unABOn() > 0 { monoShParNode = p3.parType }
+          const pinName = monoPinMintedUnion(
+            pinned[pj],
+            gateTy,
+            unTyKeyTagParam(),
+          )
           nt = synthTypeRefFb(pinName, -1, pinTys[pj])
           // A literal-union arm beside a scalar (`T | i32` at `T := K`) boxes under a row too,
           // and no direct spelling minted one (D5310).
           if monoTyHoldsLitUnionArm(nodeTyIxOf(nt)) {
+            monoShStage(unTyKeyTagArm(), nodeTyIxOf(nt))
             monoRegisterPinUnion(pinName, -1)
           }
+          monoShParNode = -1
           if pinTys[pj] >= 0 { monoParamPinTy.set(nt, pinTys[pj]) }
           synthed = true
         }
@@ -9255,7 +9403,7 @@ function monoMakeInstanceParams(
 
 // The return annotation substituted through the binding where it names a type parameter,
 // first of the return rungs. Takes and returns `nret` (-1 for none); -2 when a return type
-// parameter is unbound or the pinned union could not be registered.
+// parameter is unbound or the pinned union could not be registered. `pinTys` feeds only the shadow.
 function monoMakeInstanceRetAnn(
   fn: FuncDecl,
   nret: i32,
@@ -9264,6 +9412,7 @@ function monoMakeInstanceRetAnn(
   tvV: string[],
   letBN: string[],
   letBT: i32[],
+  pinTys: i32[],
 ) {
   if fn.fnRet >= 0 {
     // The parameter pin's rule, applied to the RETURN for the same reason: a shadowed
@@ -9310,6 +9459,10 @@ function monoMakeInstanceRetAnn(
       // And register it: `collectU`, the only pass that mints union rows, runs before
       // this one. Registering under the canon'd key reuses the row a direct spelling
       // minted — a union's box tags are positional over its member set.
+      monoShStage(
+        unTyKeyTagRet(),
+        monoShRetTy(retTy, origRet, fn.fnParams, pinTys, letBN, letBT),
+      )
       if monoRegisterPinUnion(rsC, -1) < 0 { return -2 }
     }
   }
@@ -9750,6 +9903,7 @@ function monoMakeInstanceRetChecked(
       const tpSub = monoSubstAnn(tpRet, tps, tvN, tvV)
       if tpSub != "" && tpSub != tpRet {
         const tpName = monoPinUnionName(tpSub)
+        monoShStage(unTyKeyTagTpSub(), monoBoundTyOf(tpRet, letBN, letBT))
         if monoRegisterPinUnion(tpName, -1) < 0 { return -2 }
         nret = synthTypeRefTy(tpName, -1, -1)
       }
@@ -10191,7 +10345,7 @@ function monoMakeInstanceRet(
   // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
   let nret = fn.fnRet
   if nret >= 0 { monoNicheNulListCheck(tyNameOf(nret), tps, tvN, tvV) }
-  nret = monoMakeInstanceRetAnn(fn, nret, tps, tvN, tvV, letBN, letBT)
+  nret = monoMakeInstanceRetAnn(fn, nret, tps, tvN, tvV, letBN, letBT, pinTys)
   if nret < -1 { return -2 }
   const twoOut: i32[] = []
   nret = monoMakeInstanceRetExpr(
@@ -10662,6 +10816,7 @@ function monoMakeInstanceGo(
     // resolvable type). This is the column the speculative-inference windows below take:
     // the pin is resolved once, here at the clone, and never re-resolved from its spelling.
     const pinnedTyIx: i32[] = []
+    const shAt = monoShPendTag.length
     const paramsOk = monoMakeInstanceParams(
       fn,
       params,
@@ -10678,7 +10833,10 @@ function monoMakeInstanceGo(
       nps,
       pinnedTyIx,
     )
-    if paramsOk < 0 { return -1 }
+    if paramsOk < 0 {
+      monoShPendFlush(shAt, [], [], [], [])
+      return -1
+    }
     const letTyCol = monoMakeInstanceLetTyCol(
       params,
       pinned,
@@ -10696,6 +10854,7 @@ function monoMakeInstanceGo(
       letBT,
     )
     monoShAliasBind(origFe, letBN, letBT)
+    monoShPendFlush(shAt, params, pinTys, letBN, letBT)
     // The hole-built return local the body clone annotates (name, type, row) and the two-list type.
     const retOutS: string[] = []
     const retOutIx: i32[] = []
