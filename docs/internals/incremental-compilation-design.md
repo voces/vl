@@ -1639,6 +1639,134 @@ the commits that decline a guard (not `all` or `graph`).
 - L2 self-compile guest fuel: master 107,577,600,553; this branch 107,732,745,159 (+0.14%).
 - The unarmed path runs none of the new code.
 
+**S5 step 10: a generic from a module S only imports is served, the template renderer's
+import is named, and `fresh` is kept and decided before the check of S** (`skClosed`,
+`skKept`, `skImportName` and `skFreshBanked` in `compiler/driver.vl`; `ihScalarName` in
+`compiler/iface_hash.vl`).
+
+*A kept generic.* Through step 9, `skClosed` read every generic as `SK_OPEN`, so a served
+module importing one from an S module declined `demand`. A generic whose parameters
+`skParamsClosed` closes now reads as `SK_IF_KEPT`. It is served when `skKept` holds all three
+of the following:
+- **no module in the origin's import closure moved** (mask 134217728). A served call `g(a)`
+  checks `g`'s body at `a`'s type, and that body reads the declarations of its own closure.
+  If none of them moved, the instance checks as it did when banked.
+- **the bank holds no diagnostic in that closure** (268435456). A diagnostic raised inside
+  an instance could depend on which instances exist. Measured, a hole-pin diagnostic anchors
+  at the caller, so this is a guard with no witness.
+- **the served module names the generic only as a callee** (536870912). A generic taken as a
+  value is instantiated from its destination's type, which a call's reach does not hold
+  (`const gh: (x: i32) => i32 = gp`).
+
+The argument for serving: the served module's own call sites are unchanged, because it is
+not in S. So the instances it makes are the same ones, at argument types its reach holds, and
+`interface` still declines when that reach moves. The origin is in S only through the
+downward closure, so its source is the banked one.
+
+*The template renderer is named.* The parser injects a `std:fmt` import row for template
+holes. It has an empty name and no specifier span, so `skPlan` read it as a bare import and
+declined `demand` whenever `std:fmt` was in S's closure. `skImportName` now names that row
+`toString` (`TPL_RENDER_EXPORT`). The argument: `tplHoleHandled` reads only the renderer's
+parameter type, so a hole depends on nothing else `std:fmt` exports. The row then takes the
+same path as any named import: `skClosed`, the reach and `interface`. An edit to the
+renderer's own parameter declines `ambient`, or `interface` with ambient dropped, under every
+reach mask tried. That case is covered by the reach and has no mask witness.
+
+*`void` is a scalar.* `ihScalarName` now treats `void` like `null`. A function with an
+inferred `void` return builds no record, so it cannot be a fresh builder. Before this change,
+`std:str`'s `pushStr`, reached through `toString`, declined `fresh` on every template hole.
+
+*`fresh` stays (decision (b)).* Step 9 argued that `fresh` is held up only by the cross-site
+pass reading the shared parse arena. Making that dependency explicit would need a banked
+per-site summary, and a second witness shows it would need more than that. A builder's result
+depends on how many sites it has across the whole program, and removing a site in S moves a
+served module's check:
+```text
+// lib.vl, in S
+export function mk() { { f: 4 } }
+export function other(): void { const b = mk(); print(b.f + 1) }   // edited to print(5)
+// main.vl, served
+import { mk } from "./lib"
+let v = { f: 1.5 }
+v = mk()
+print(v.f)
+```
+- Before the edit, main refuses at `v = mk()`: `{f: i32}` is not `{f: f64}`.
+- After it, `mk` has one site, is built at main's destination, and main checks clean.
+- With `fresh` dropped (65536), the skip serves main's stale refusal. `recFnBuiltAtDst`
+  counts the builder's sites syntactically, so the count belongs to S's statements as much as
+  to the served module's.
+- A banked summary would therefore have to bank every builder's site count and decline when
+  S changes it. That is `fresh`'s own test (the reach meets an inferred non-scalar return),
+  so `fresh` stays as it is.
+
+*`fresh` is decided before the check of S.* `skBankNow` banks, per (importer, origin) pair,
+whether the reach met an inferred non-scalar return (`skFresh`). `skEarly` then declines
+`fresh` at stage 0 when a served importer's banked reach into an S module was fresh
+(`skFreshBanked`), after the `interface` resolution test and before R1. A decline is always
+sound. The prediction can lose a serve only when S's edit turned a fresh return into a scalar
+or annotated one, and the next bank then records the pair as not fresh.
+
+*Mutation witnesses.* The step-9 table stands, with these rows added:
+
+| mask | channel dropped | witness |
+| --- | --- | --- |
+| 134217728 \| 8192 | a kept generic's moved closure, and the reach | "…, over a moved closure": base's `keep(x: i32)` becomes `x: string`, so main's `gp(1)` instance refuses inside `gen` |
+| 65536 | `fresh` | "a lib call stops being a second site of a fresh builder" (above) |
+| 268435456 | a banked diagnostic in a kept generic's closure | none: kept as a guard |
+| 536870912 | a kept generic named other than as a callee | none: kept as a guard |
+
+With 8192 alone the moved-closure case still declines `demand`, and the suite asserts it, so
+the `skKept` source test is reached without the reach.
+
+*Differential suite*: 75 edits. 26 must serve, 46 must decline, and 3 may do either (step 9:
+23, 40 and 3). The new cases are:
+- must serve:
+  - "a generic called from a module S only imports" (`std:`-free, `pick` through `mid.vl`);
+  - "…, over an unmoved closure";
+  - "a template hole beside an edit to a lib template".
+- must decline:
+  - "…, over a moved closure" and "…, over a banked diagnostic" (`demand`);
+  - "a generic main takes as a value from a module S only imports" (`demand`);
+  - "the template renderer narrows its parameter", at `std:fmt` (`ambient`);
+  - "a bare import of std:fmt beside an edit to a lib template" (`demand`);
+  - "a lib call stops being a second site of a fresh builder" (`fresh`).
+- "a lib call becomes a second site of a fresh builder" now names `fresh`.
+
+The suite reads a `std:` module from the tree unless the case's graph overrides it.
+
+*Replays.* All six runs are 0 unsound. A ratio is armed time over unarmed time, summed over
+the commits that decline a guard (not `all` or `graph`).
+
+| graph | master's seed | this step |
+| --- | --- | --- |
+| diderven `src/game.vl`, 30 commits to fa7a8be (read-only copy) | 20 served, 7 demand, 3 graph | 20 served, 5 fresh, 1 demand, 1 ambient, 3 graph |
+| decline ratio | 1.08 | 1.17 (stage 0: 1.15) |
+| diderven, a second 30-commit window to fa7a8be (read-only copy) | 15 served, 5 demand, 10 graph | 15 served, 4 fresh, 1 ambient, 10 graph |
+| decline ratio | 0.98 | 1.04 (stage 0: 1.04) |
+| `compiler/entry.vl`, 30 commits | 19 ambient, 8 fresh, 2 all, 1 graph | 20 fresh, 7 ambient, 2 all, 1 graph |
+| decline ratio | 1.24 (stage 1: 1.67) | 1.09 (all stage 0) |
+
+- **On diderven** the generic and renderer narrowings move 6 of 7 and 5 of 5 `demand`
+  declines past `demand`, and each then declines `fresh` or `ambient`. No edit commit is newly
+  served: the 20 and 15 served commits are the ones that change no module. The remaining
+  `demand` (commit ddbf958) imports from a module that itself moved, which `skKept` does not
+  cover. With ambient dropped (16384), the first window reads 6 `fresh` and still serves no
+  edit.
+- **On the compiler** every decline is now at stage 0. `skFreshBanked` runs before R1, so 12
+  of the 19 `ambient` declines decline `fresh` first. The post-check decline cost (stage 1,
+  1.84 at step 9) has no commit left in either window.
+- **Next**: `fresh` is now the lane's largest reason on both graphs. Serving it needs the
+  builder's site count banked per builder, with a decline when S changes that count or the
+  destinations it adopts from.
+
+*Cost.*
+- The seed is 6,267,060 bytes, against 6,262,880 for master's source at its own fixpoint
+  (+4,180, +0.07%).
+- L2 self-compile guest fuel: master 108,773,953,362; this branch 109,198,411,501 (+0.39%).
+  Master's seed compiling this branch's source reads 109,198,411,468, so the cost is the new
+  source, and the unarmed path runs none of the new code.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.

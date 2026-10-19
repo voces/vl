@@ -618,6 +618,33 @@ export function cwIxFrNext(r: i32, fr: i32): i32 {
   cwIxPNext[r]
 }
 
+// A walk of the rows of (`nm`, `fr`) over both cursors, the larger row first, so newest first.
+export type CwOccWalk = { a: i32, u: i32, fr: i32, row: i32 }
+
+export function cwOccWalk(nm: string, fr: i32): CwOccWalk {
+  const w: CwOccWalk = {
+    a: cwIxFrHead(nm, fr),
+    u: cwIxUnkHead(nm, fr),
+    fr: fr,
+    row: -1,
+  }
+  w
+}
+
+// Moves walk `w` to its next row, left in `w.row`; false when no row is left.
+export function cwOccNext(w: CwOccWalk): boolean {
+  if w.a < 0 && w.u < 0 { return false }
+  if w.u > w.a {
+    w.row = w.u
+    w.u = -1
+    if w.row < cwIxPNext.length { w.u = cwIxPNext[w.row] }
+    return true
+  }
+  w.row = w.a
+  w.a = cwIxFrNext(w.row, w.fr)
+  true
+}
+
 // The first row from `r` down the name chain that `cwSameFrame` matches with `fr`, or -1.
 function cwIxFrSkip(r: i32, fr: i32): i32 {
   let at = r
@@ -634,16 +661,9 @@ export function cwSetOccs(set: string[], setFr: i32[], kind: i32, out: i32[]) {
   cwIxBuild()
   let i = 0
   while i < set.length {
-    let ixA = cwIxFrHead(set[i], setFr[i])
-    let ixU = cwIxUnkHead(set[i], setFr[i])
-    while ixA >= 0 || ixU >= 0 {
-      let r = ixA
-      if ixU > ixA {
-        r = ixU
-        ixU = cwIxPNext[ixU]
-      } else {
-        ixA = cwIxFrNext(ixA, setFr[i])
-      }
+    const ow = cwOccWalk(set[i], setFr[i])
+    while cwOccNext(ow) {
+      const r = ow.row
       if cwIxKind[r] == kind { out.push(cwIxNode[r]) }
     }
     i = i + 1
@@ -1034,16 +1054,9 @@ export function cwBoundInitOf(nm: string, fr: i32): i32 {
   if nm == "" { return -1 }
   cwIxBuild()
   if !cwBoundOnce(nm, fr) { return -1 }
-  let ixA = cwIxFrHead(nm, fr)
-  let ixU = cwIxUnkHead(nm, fr)
-  while ixA >= 0 || ixU >= 0 {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
+  const ow = cwOccWalk(nm, fr)
+  while cwOccNext(ow) {
+    const r = ow.row
     if cwIxKind[r] == CW_OCC_BIND {
       const b = P.nodes[cwIxNode[r]]
       if b is LetDecl {
@@ -1062,16 +1075,9 @@ export function cwSoleBinderOf(nm: string, fr: i32): i32 {
   cwIxBuild()
   const sid = sidLookup(nm)
   if sid < 0 || cwFrameDeclCount(fr, sid) != 1 { return -1 }
-  let ixA = cwIxFrHead(nm, fr)
-  let ixU = cwIxUnkHead(nm, fr)
-  while ixA >= 0 || ixU >= 0 {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
+  const ow = cwOccWalk(nm, fr)
+  while cwOccNext(ow) {
+    const r = ow.row
     if cwIxKind[r] == CW_OCC_BIND && cwIxFr[r] == fr { return cwIxNode[r] }
   }
   -1
@@ -1108,16 +1114,9 @@ function cwFvCollect(nm: string, fr: i32, out: i32[]): boolean {
   const sid = sidLookup(nm)
   if sid < 0 { return false }
   let binds = 0
-  let ixA = cwIxFrHead(nm, fr)
-  let ixU = cwIxUnkHead(nm, fr)
-  while ixA >= 0 || ixU >= 0 {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
+  const ow = cwOccWalk(nm, fr)
+  while cwOccNext(ow) {
+    const r = ow.row
     const at = cwIxNode[r]
     const n = P.nodes[at]
     if cwIxKind[r] == CW_OCC_BIND {
@@ -1311,17 +1310,6 @@ export function cwParamFrameAt(callFnIx: i32): i32 {
   dIx
 }
 
-// A call with named arguments binds by name, not by position, so the positional
-// argument->parameter edge below would read the wrong parameter. Decline instead.
-export function cwCallNamed(names: string[]): boolean {
-  let i = 0
-  while i < names.length {
-    if names[i] != "" { return true }
-    i = i + 1
-  }
-  false
-}
-
 // The parameter an expression consumed as a call ARGUMENT is delivered to, or "" where the
 // consuming call names no callee this can read a parameter list off. The closure's edge and
 // the claim's own test read this one resolver, so neither can outrun the other. D1658.
@@ -1332,7 +1320,7 @@ export function cwArgParamName(x: i32): string {
   if up < 0 || up >= P.nodes.length { return "" }
   const n = P.nodes[up]
   if n is Call {
-    if cwCallNamed(n.callArgNames) { return "" }
+    if hasNamedArgs(n.callArgNames) { return "" }
     return cwParamNameAt(n.callFn, cwIxUpAux[x])
   }
   ""
@@ -1462,16 +1450,9 @@ function cwContainerAliases(
     // The set grows by at least one name per name visited or the walk ends, so the bound is
     // the number of names in the program; a surprise past it declines rather than hangs.
     if names.length > 256 { return false }
-    let ixA = cwIxFrHead(names[i], frs[i])
-    let ixU = cwIxUnkHead(names[i], frs[i])
-    while ixA >= 0 || ixU >= 0 {
-      let r = ixA
-      if ixU > ixA {
-        r = ixU
-        ixU = cwIxPNext[ixU]
-      } else {
-        ixA = cwIxFrNext(ixA, frs[i])
-      }
+    const ow = cwOccWalk(names[i], frs[i])
+    while cwOccNext(ow) {
+      const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
         if !cwAliasUse(cwIxNode[r], names, frs) { ok = false }
       }
@@ -1758,16 +1739,9 @@ export function cwEscapedHandleNodes(
   cwIxBuild()
   let i = 0
   while i < owners.length {
-    let ixA = cwIxFrHead(owners[i], ownerFrs[i])
-    let ixU = cwIxUnkHead(owners[i], ownerFrs[i])
-    while ixA >= 0 || ixU >= 0 {
-      let r = ixA
-      if ixU > ixA {
-        r = ixU
-        ixU = cwIxPNext[ixU]
-      } else {
-        ixA = cwIxFrNext(ixA, ownerFrs[i])
-      }
+    const ow = cwOccWalk(owners[i], ownerFrs[i])
+    while cwOccNext(ow) {
+      const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
         cwHandleUpChain(cwIxNode[r], flds[i], out)
       }
@@ -1811,16 +1785,9 @@ function cwBoundOnceSealed(nm: string, fr: i32): i32 {
   let proj = 0
   // Each projection has one object and each identifier one parent, so counting the two sides
   // is the same answer as marking them, and it fits the one chain walk.
-  let ixA = cwIxFrHead(nm, fr)
-  let ixU = cwIxUnkHead(nm, fr)
-  while ixA >= 0 || ixU >= 0 {
-    let r = ixA
-    if ixU > ixA {
-      r = ixU
-      ixU = cwIxPNext[ixU]
-    } else {
-      ixA = cwIxFrNext(ixA, fr)
-    }
+  const ow = cwOccWalk(nm, fr)
+  while cwOccNext(ow) {
+    const r = ow.row
     if cwIxKind[r] == CW_OCC_ASG { return 0 }
     if cwIxKind[r] == CW_OCC_BIND { binds = binds + 1 }
     if cwIxKind[r] == CW_OCC_USE {
@@ -2009,16 +1976,9 @@ function cwContainerSealed(nm: string, fr: i32, path: string): boolean {
   if !cwContainerAliases(nm, fr, names, frs) { return false }
   let i = 0
   while i < names.length {
-    let ixA = cwIxFrHead(names[i], frs[i])
-    let ixU = cwIxUnkHead(names[i], frs[i])
-    while ixA >= 0 || ixU >= 0 {
-      let r = ixA
-      if ixU > ixA {
-        r = ixU
-        ixU = cwIxPNext[ixU]
-      } else {
-        ixA = cwIxFrNext(ixA, frs[i])
-      }
+    const ow = cwOccWalk(names[i], frs[i])
+    while cwOccNext(ow) {
+      const r = ow.row
       if cwIxKind[r] == CW_OCC_USE {
         if !cwChainSealed(cwIxNode[r], path) { return false }
       }

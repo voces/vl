@@ -65,9 +65,9 @@ import {
   recordFitIsStagesRecv,
 } from "./emit_atom_kinds"
 import {
+  fnLetInitOf,
   nulCloFlag,
   parenUnionArrElemName,
-  parentLetOf,
   tyNameOf,
   unionTakesAtomAsStr,
   unwrapParen,
@@ -2472,6 +2472,34 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
   false
 }
 
+// Fills `path` with the field names of the member chain at `ix`, root first (`t0.f.g` gives
+// [f, g]), and returns the ident node at its root; -1 when the chain is not fields over an
+// ident or has more than 31 fields.
+function memberChainPath(ix: i32, path: string[]): i32 {
+  const props: string[] = []
+  let cur = ix
+  let more = true
+  while more && cur >= 0 && props.length < 31 {
+    const cn = P.nodes[cur]
+    if cn is Member {
+      props.push(cn.memProp)
+      cur = unwrapParen(cn.memObj)
+    } else {
+      more = false
+    }
+  }
+  if cur < 0 || props.length == 0 { return -1 }
+  const root = P.nodes[cur]
+  if !(root is Ident) { return -1 }
+  if root.identName == "" { return -1 }
+  let pr = props.length - 1
+  while pr >= 0 {
+    path.push(props[pr])
+    pr = pr - 1
+  }
+  cur
+}
+
 // True if `exprIx` is a member read whose object is an ident declared as a union with a
 // struct arm whose field is a map — the receiver shape the frame pre-pass must reserve the
 // map scratch for, narrowing-blind like the list-element sibling above. Probes both field
@@ -2479,35 +2507,9 @@ export function unionListElemMapFieldMember(exprIx: i32, fnIx: i32) {
 export function unionStructArmMapFieldMember(exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Member {
-    // Collect the field chain root-first: `t0.f.g` -> root `t0`, props [f, g] — the same
-    // walk `calleeIsUnionArmClosureMember` performs, so a map field reached through
-    // code-15 nested-struct hops is spotted, not just the single-hop `t0.f[k]`.
-    const props: string[] = []
-    let cur = unwrapParen(exprIx)
-    let rootName = ""
-    let guard = 0
-    while guard < 32 {
-      guard = guard + 1
-      if cur < 0 { return false }
-      const cn = P.nodes[cur]
-      if cn is Member {
-        props.push(cn.memProp)
-        cur = unwrapParen(cn.memObj)
-      } else if cn is Ident {
-        rootName = cn.identName
-        break
-      } else {
-        return false
-      }
-    }
-    if rootName == "" || props.length == 0 { return false }
-    // props collected leaf-first — reverse into walk order.
     const path: string[] = []
-    let pr = props.length - 1
-    while pr >= 0 {
-      path.push(props[pr])
-      pr = pr - 1
-    }
+    const cur = memberChainPath(unwrapParen(exprIx), path)
+    if cur < 0 { return false }
     const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
     if un == "" { return false }
     const atoms: string[] = []
@@ -2701,46 +2703,18 @@ function identRebindUnionArmClosureField(
   fnIx: i32,
   depth: i32,
 ): boolean {
-  if depth <= 0 || fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
-  if !(fn is FuncDecl) { return false }
-  const li = parentLetOf(fn.fnBody, name)
-  if li < 0 { return false }
-  const d = P.nodes[li]
-  if !(d is LetDecl) { return false }
-  if d.letInit < 0 { return false }
-  const init = P.nodes[unwrapParen(d.letInit)]
+  if depth <= 0 { return false }
+  const initIx = fnLetInitOf(fnIx, name)
+  if initIx < 0 { return false }
+  const init = P.nodes[initIx]
   match init {
     Ident => {
       return identRebindUnionArmClosureField(init.identName, fnIx, depth - 1)
     }
     Member => {
-      // Collect the field chain root-first (the `calleeIsUnionArmClosureMember` walk).
-      const props: string[] = []
-      let cur = unwrapParen(d.letInit)
-      let rootName = ""
-      let guard = 0
-      while guard < 32 {
-        guard = guard + 1
-        if cur < 0 { return false }
-        const cn = P.nodes[cur]
-        if cn is Member {
-          props.push(cn.memProp)
-          cur = unwrapParen(cn.memObj)
-        } else if cn is Ident {
-          rootName = cn.identName
-          break
-        } else {
-          return false
-        }
-      }
-      if rootName == "" || props.length == 0 { return false }
       const path: string[] = []
-      let pr = props.length - 1
-      while pr >= 0 {
-        path.push(props[pr])
-        pr = pr - 1
-      }
+      const cur = memberChainPath(initIx, path)
+      if cur < 0 { return false }
       const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
       if un == "" { return false }
       const atoms: string[] = []
@@ -2775,33 +2749,9 @@ export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
   }
   const e = P.nodes[unwrapParen(exprIx)]
   if e is Member {
-    // Collect the field chain root-first: `t0.f.g` → root `t0`, props [f, g].
-    const props: string[] = []
-    let cur = unwrapParen(exprIx)
-    let rootName = ""
-    let guard = 0
-    while guard < 32 {
-      guard = guard + 1
-      if cur < 0 { return false }
-      const cn = P.nodes[cur]
-      if cn is Member {
-        props.push(cn.memProp)
-        cur = unwrapParen(cn.memObj)
-      } else if cn is Ident {
-        rootName = cn.identName
-        break
-      } else {
-        return false
-      }
-    }
-    if rootName == "" || props.length == 0 { return false }
-    // props collected leaf-first — reverse into walk order.
     const path: string[] = []
-    let pr = props.length - 1
-    while pr >= 0 {
-      path.push(props[pr])
-      pr = pr - 1
-    }
+    const cur = memberChainPath(unwrapParen(exprIx), path)
+    if cur < 0 { return false }
     const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
     if un == "" { return false }
     const atoms: string[] = []
@@ -2833,31 +2783,9 @@ export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
   if e is Index {
     const m = P.nodes[unwrapParen(e.idxArr)]
     if m is Member {
-      const props: string[] = []
-      let cur = unwrapParen(e.idxArr)
-      let rootName = ""
-      let guard = 0
-      while guard < 32 {
-        guard = guard + 1
-        if cur < 0 { return false }
-        const cn = P.nodes[cur]
-        if cn is Member {
-          props.push(cn.memProp)
-          cur = unwrapParen(cn.memObj)
-        } else if cn is Ident {
-          rootName = cn.identName
-          break
-        } else {
-          return false
-        }
-      }
-      if rootName == "" || props.length == 0 { return false }
       const path: string[] = []
-      let pr = props.length - 1
-      while pr >= 0 {
-        path.push(props[pr])
-        pr = pr - 1
-      }
+      const cur = memberChainPath(unwrapParen(e.idxArr), path)
+      if cur < 0 { return false }
       const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
       if un == "" { return false }
       const atoms: string[] = []
