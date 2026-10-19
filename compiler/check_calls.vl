@@ -12,6 +12,8 @@ import {
   OptMember,
   P,
   Param,
+  TypeRef,
+  annTsOf,
   callHasTyArgs,
   callIsRestPacked,
   fillArgDefaults,
@@ -26,6 +28,7 @@ import {
   nodeChildren,
   nodeIsTplHole,
   restParamIndex,
+  tsMentionsAnyName,
   ufcsAliasInScope,
 } from "./ast"
 import { collCtorTyArgsTy } from "./check_annot_resolve"
@@ -2277,7 +2280,11 @@ function pinUnreadGenFnArgs(
     if a >= 0 && a < P.nodes.length && k >= 0 {
       const an = P.nodes[a]
       let d = -1
-      if an is Ident { d = fnDeclIx[an.identName] ?? -1 }
+      if an is Ident {
+        // Named directly, or through a `const` alias of the declaration.
+        d = fnDeclIx[an.identName] ?? lookupFnAliasNode(an.identName)
+        if d >= 0 && !(P.nodes[d] is FuncDecl) { d = -1 }
+      }
       const vt = vTys[k]
       const open = tyIsForeignGenericSig(vt) || tyIsHoleGenericSig(vt)
       if d >= 0 && open && holeParamUnreadAt(calleeFn, dhNames[j]) {
@@ -2310,7 +2317,9 @@ function pinUnreadGenFnArgs(
   0
 }
 
-// Whether the parameter of declared function `fn` whose hole is `hole` is never read.
+// Whether the parameter of declared function `fn` whose hole is `hole` is never read, or every
+// parameter naming type parameter `hole` is typed `hole` bare and never read, and the result
+// does not name it (D6763).
 function holeParamUnreadAt(fn: i32, hole: string): boolean {
   const f = P.nodes[fn]
   if !(f is FuncDecl) { return false }
@@ -2321,7 +2330,29 @@ function holeParamUnreadAt(fn: i32, hole: string): boolean {
     }
     pi = pi + 1
   }
-  false
+  if !strListHas(f.fnTyParams, hole) || annNamesTyName(f.fnRet, hole) {
+    return false
+  }
+  let seen = false
+  pi = 0
+  while pi < f.fnParams.length {
+    const pn = P.nodes[f.fnParams[pi]]
+    if pn is Param {
+      if pn.parType >= 0 && annNamesTyName(pn.parType, hole) {
+        const tn = P.nodes[pn.parType]
+        if !(tn is TypeRef) || tn.tyName != hole { return false }
+        if !holeParamUnreadIn(fn, pi, 0) { return false }
+        seen = true
+      }
+    }
+    pi = pi + 1
+  }
+  seen
+}
+
+// Whether the annotation at `ix` names the type `name` anywhere in it.
+function annNamesTyName(ix: i32, name: string): boolean {
+  ix >= 0 && tsMentionsAnyName(annTsOf(ix), [name])
 }
 
 // The types an unread hole's default is tried at, in order: whichever the body admits first
