@@ -97,7 +97,6 @@ import { pushScope } from "./check_narrow_paths"
 import { armLit } from "./check_nj_join"
 import { checkMatchBindNames, refuseNestedExitFirst } from "./check_node_rules"
 import { nodeTyIx, nodeTySet } from "./check_node_tys"
-import { lpColAt } from "./check_null_holes"
 import { matchPatIntNumOf } from "./check_num_lits"
 import { assignable, joinArmLit, tErr } from "./check_relate_core"
 import { mapTwinTestMsg } from "./check_ty_relate"
@@ -123,6 +122,7 @@ import {
   tyIsIntMatchScrut,
   unionHasLitMember,
 } from "./tyquery"
+import { i32ListAt } from "./listutil"
 
 // ── match ──────────────────────────────────────────────────────────────────
 
@@ -248,14 +248,10 @@ function checkMatchIntArms(
   // A pattern that is not an integer literal covers nothing — report it at the pattern and
   // suppress the missing-`_` report below, which would mis-blame coverage for it.
   let sawBadPat = false
-  // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
-  // sentinel would poison the join, so never seed with it.
-  let matchTy = -1
   const matchArmTys: i32[] = []
   const mValArms: i32[] = []
   const mValTys: i32[] = []
-  let matchValAcc = matchTallyBegin(ix)
-  let mArmsLit = true
+  const join = matchJoinBegin(ix)
   const nArms = n.matchArmStart.length
   let ai = 0
   while ai < nArms {
@@ -321,42 +317,10 @@ function checkMatchIntArms(
     }
     const armTy = matchArmBodyTy(body)
     if restNm.length > 0 { popScope() }
-    if !matchArmExits(ix, body, armTy) {
-      const bodyLit = armLit(armTy, body)
-      matchTy = joinArmLit(
-        matchTy,
-        mArmsLit,
-        f32ArmPlainTy(body, armTy),
-        bodyLit,
-      )
-      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-      mValArms.push(body)
-      mValTys.push(f32ArmPlainTy(body, armTy))
-      matchValAcc = matchArmTally(
-        ix,
-        body,
-        armTy,
-        matchValAcc,
-        mArmsLit,
-        bodyLit,
-      )
-      mArmsLit = mArmsLit && bodyLit
-    }
+    matchArmJoinStep(ix, body, armTy, join, matchArmTys, mValArms, mValTys)
     ai = ai + 1
   }
-  if matchTy < 0 { matchTy = TY_VOID }
-  const mf32 = matchF32Join(ix, matchTy)
-  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
-  if mf32 >= 0 {
-    matchTy = mf32
-    matchValAcc = mf32
-  } else if mlj >= 0 {
-    matchTy = mlj
-    matchValAcc = mlj
-  } else {
-    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
-  }
-  matchTallyEnd(ix, matchValAcc)
+  const matchTy = matchTypeJoinEnd(ix, join, matchArmTys, mValArms, mValTys)
   // Exhaustiveness over a bare integer is the wildcard, and it is required — it has no closed
   // member set, so there is no arm list that could stand in for one. A literal set has one.
   if !hasWild && !sawBadPat {
@@ -419,10 +383,40 @@ type MatchPatScan = {
   sawBadPat: boolean,
 }
 
-// A match's joined arm value type (-1 while no arm has joined) and its value tally.
+// A match's joined arm value type (-1 while no arm has joined), its value tally, and whether
+// every arm joined so far is a literal.
 type MatchArmJoin = {
   ty: i32,
   valAcc: i32,
+  lit: boolean,
+}
+
+// The join of match `ix` before any arm: unset (-1, which `joinTys` treats as the other
+// operand; the positive TY_ERR would poison the join), with its value tally begun.
+function matchJoinBegin(ix: i32): MatchArmJoin {
+  const j: MatchArmJoin = { ty: -1, valAcc: matchTallyBegin(ix), lit: true }
+  j
+}
+
+// Joins arm `body` of type `armTy` into `j` unless the arm exits, pushing it onto the three
+// caller-owned lists.
+function matchArmJoinStep(
+  ix: i32,
+  body: i32,
+  armTy: i32,
+  j: MatchArmJoin,
+  matchArmTys: i32[],
+  mValArms: i32[],
+  mValTys: i32[],
+) {
+  if matchArmExits(ix, body, armTy) { return }
+  const bodyLit = armLit(armTy, body)
+  j.ty = joinArmLit(j.ty, j.lit, f32ArmPlainTy(body, armTy), bodyLit)
+  if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
+  mValArms.push(body)
+  mValTys.push(f32ArmPlainTy(body, armTy))
+  j.valAcc = matchArmTally(ix, body, armTy, j.valAcc, j.lit, bodyLit)
+  j.lit = j.lit && bodyLit
 }
 
 function checkMatchTypeArms(n: MatchExpr, ix: i32, st: i32, uMems: i32[]) {
@@ -552,10 +546,7 @@ function matchArmsJoin(
   mValArms: i32[],
   mValTys: i32[],
 ): MatchArmJoin {
-  // -1 is the "unset" join seed; the positive TY_ERR sentinel would poison the join.
-  let matchTy = -1
-  let matchValAcc = matchTallyBegin(ix)
-  let mArmsLit = true
+  const join = matchJoinBegin(ix)
   const nArms = n.matchArmStart.length
   let bi = 0
   while bi < nArms {
@@ -582,31 +573,10 @@ function matchArmsJoin(
     }
     const armTy = matchArmScopedBodyTy(n, bi, nmz, tyz)
     const body = n.matchBodies[bi]
-    if !matchArmExits(ix, body, armTy) {
-      const bodyLit = armLit(armTy, body)
-      matchTy = joinArmLit(
-        matchTy,
-        mArmsLit,
-        f32ArmPlainTy(body, armTy),
-        bodyLit,
-      )
-      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-      mValArms.push(body)
-      mValTys.push(f32ArmPlainTy(body, armTy))
-      matchValAcc = matchArmTally(
-        ix,
-        body,
-        armTy,
-        matchValAcc,
-        mArmsLit,
-        bodyLit,
-      )
-      mArmsLit = mArmsLit && bodyLit
-    }
+    matchArmJoinStep(ix, body, armTy, join, matchArmTys, mValArms, mValTys)
     bi = bi + 1
   }
-  const r: MatchArmJoin = { ty: matchTy, valAcc: matchValAcc }
-  r
+  join
 }
 
 // Checks arm `bi`'s body under the narrowing `nmz`/`tyz` and its payload `const`s, and
@@ -935,7 +905,7 @@ export function checkMatchExprNode(n: MatchExpr, ix: i32) {
   matchValuedSet(!valDiscarded(ix))
   matchOnSpineSet(spineAt == ix || !matchValued)
   const r = checkMatchExprNodeIn(n, ix)
-  if lpColAt(nestedExitFirstAt, ix) == 1 { refuseNestedExitFirst(ix, r) }
+  if i32ListAt(nestedExitFirstAt, ix) == 1 { refuseNestedExitFirst(ix, r) }
   matchOnSpineSet(savedOnSpine)
   matchValuedSet(savedValued)
   spineAtSet(savedSpine)
@@ -1083,14 +1053,10 @@ function checkMatchLitUnionArms(
   // A pattern that is neither a member string literal nor the `_` wildcard covers nothing —
   // report it at the pattern and suppress the exhaustiveness error below (don't cascade).
   let sawBadPat = false
-  // -1 is the "unset" join seed (`joinTys` returns the other operand); the positive TY_ERR
-  // sentinel would poison the join (every arm joins back to error), so never seed with it.
-  let matchTy = -1
   const matchArmTys: i32[] = []
   const mValArms: i32[] = []
   const mValTys: i32[] = []
-  let matchValAcc = matchTallyBegin(ix)
-  let mArmsLit = true
+  const join = matchJoinBegin(ix)
   let ai = 0
   while ai < n.matchArmStart.length {
     // Patterns of arm `ai`.
@@ -1164,44 +1130,10 @@ function checkMatchLitUnionArms(
     }
     const armTy = matchArmBodyTy(body)
     if restNm.length > 0 { popScope() }
-    if !matchArmExits(ix, body, armTy) {
-      const bodyLit = armLit(armTy, body)
-      matchTy = joinArmLit(
-        matchTy,
-        mArmsLit,
-        f32ArmPlainTy(body, armTy),
-        bodyLit,
-      )
-      if tpEnvNames.length > 0 { matchArmTys.push(f32ArmPlainTy(body, armTy)) }
-      mValArms.push(body)
-      mValTys.push(f32ArmPlainTy(body, armTy))
-      matchValAcc = matchArmTally(
-        ix,
-        body,
-        armTy,
-        matchValAcc,
-        mArmsLit,
-        bodyLit,
-      )
-      mArmsLit = mArmsLit && bodyLit
-    }
+    matchArmJoinStep(ix, body, armTy, join, matchArmTys, mValArms, mValTys)
     ai = ai + 1
   }
-  // A void-armed match leaves the join unset (-1) or void; normalize to void so the function-
-  // body-tail seeding (`noteInferredRet`) does not mistake it for the error sentinel.
-  if matchTy < 0 { matchTy = TY_VOID }
-  const mf32 = matchF32Join(ix, matchTy)
-  const mlj = litJoinOf(ix, matchTy, mValArms, mValTys)
-  if mf32 >= 0 {
-    matchTy = mf32
-    matchValAcc = mf32
-  } else if mlj >= 0 {
-    matchTy = mlj
-    matchValAcc = mlj
-  } else {
-    noteTpJoinRow(ix, tpApartJoinOf(matchArmTys), matchTy, tpMatchOk)
-  }
-  matchTallyEnd(ix, matchValAcc)
+  const matchTy = matchTypeJoinEnd(ix, join, matchArmTys, mValArms, mValTys)
   // Exhaustiveness: every member covered, or a wildcard. Skipped after an invalid pattern —
   // that arm covers nothing, so a missing-member report would mis-blame what the pattern already explained.
   if !hasWild && !sawBadPat {
