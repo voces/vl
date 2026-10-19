@@ -13672,6 +13672,73 @@ function monoPinIsFnTy(t: i32): boolean {
   t >= 0 && t < T.tys.length && T.tys[t] is TyFunc
 }
 
+// A binding of `fn`'s body annotated with one type parameter and seeded from a parameter of
+// another, where the two bind different function instances, asks the split to give the
+// binding the parameter's type (D6703), and fails; 0 when no binding does.
+function monoLetTyParamMisfit(
+  fn: FuncDecl,
+  params: i32[],
+  tvN: string[],
+  tvV: string[],
+  pinTys: i32[],
+): i32 {
+  const stack: i32[] = [fn.fnBody]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is LetDecl && n.letType >= 0 && n.letInit >= 0 {
+        let j = 0
+        while j < params.length && j < pinTys.length {
+          if monoLetSeedMisfits(fn, n, params[j], pinTys[j], tvN, tvV) {
+            fsAskTyParam(params[j])
+            return emitFail(
+              "emitProgram: monomorphize: `"
+                + n.letName
+                + "` is seeded from a parameter of another type parameter, and the two take"
+                + " different instances in a call to `"
+                + fn.fnName
+                + "`",
+            )
+          }
+          j += 1
+        }
+      }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  0
+}
+
+// Whether binding `n`, annotated bare with a type parameter of `fn`, is seeded by a read of
+// parameter `pd`, annotated bare with another, pinned at function type `pinTy`, and the two
+// type parameters bind different instances.
+function monoLetSeedMisfits(
+  fn: FuncDecl,
+  n: LetDecl,
+  pd: i32,
+  pinTy: i32,
+  tvN: string[],
+  tvV: string[],
+): boolean {
+  const v = unwrapParen(n.letInit)
+  if v < 0 || !(P.nodes[v] is Ident) || identDeclOf(v) != pd { return false }
+  if n.letType < 0 || n.letType >= P.nodes.length { return false }
+  const tn = P.nodes[n.letType]
+  const pn = P.nodes[pd]
+  if !(tn is TypeRef) || !(pn is Param) || pn.parType < 0 { return false }
+  const pt = P.nodes[pn.parType]
+  if !(pt is TypeRef) || pt.tyName == tn.tyName { return false }
+  if (
+    !strListHas(fn.fnTyParams, tn.tyName)
+    || !strListHas(fn.fnTyParams, pt.tyName)
+  ) {
+    return false
+  }
+  const x = monoBindOf(tvN, tvV, tn.tyName)
+  x != "" && x != monoBindOf(tvN, tvV, pt.tyName) && monoPinIsFnTy(pinTy)
+}
+
 // Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
 // in its return type, another annotation, an `is`/`as` or a call's type arguments.
 function monoTyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
@@ -14866,6 +14933,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         tvV,
         fn.fnBody,
       )
+      if monoLetTyParamMisfit(fn, params, tvN, tvV, pinTys) < 0 { return -1 }
       callBindShadowNote(callIx, fn.fnName, fn.fnTyParams, tvN, tvV)
       monoExactPinTys(pinTys, ctx)
       const pinKinds: i32[] = []
@@ -15042,6 +15110,7 @@ function monoPinAnnotatedParam(
     }
     if ann == tp && monoHoleCopyCallsMisfit(fn, params[i], an2Ty) {
       fsAsk(params[i])
+      fsAskTyParam(params[i])
       return monoHoleManyPinsFail(p.parName, fn.fnName)
     }
     // A parameter handed on keeps its own pin as a generic does (D6202).
