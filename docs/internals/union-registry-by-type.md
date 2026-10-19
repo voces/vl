@@ -276,6 +276,12 @@ root agrees by type key. Two roots still disagree, both assigned to later steps:
 literal-union arm pin `K | L | null` (one call, step 3), and site 43 (14 calls in the 9 files,
 step 4).
 
+**Status: step 4 is done for records** (L6 log, 2026-10-19). Site 43 and the `TyObj` arm of
+`nodeTyIsUnionAlias` are deleted, and a twin record union is the record at every position,
+generic instances included (`substRecordTwin`). The shadow's site-43 disagreements are 0. Twin
+LISTS still take a box: substitution keeps `Rec[]` and `Rec2[]` apart on purpose
+(`substListTwinNominal`, D3503), so the nullable-fold fixture is unchanged.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a
