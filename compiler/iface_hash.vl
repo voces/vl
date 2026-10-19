@@ -111,6 +111,8 @@ const IH_AK_NAME = 0
 const IH_AK_RECV = 1
 const IH_AK_FIELDS = 2
 let ihStWild: boolean[] = []
+// Per statement: whether it declares a type a render may name another type by.
+let ihStNames: boolean[] = []
 let ihAkSt: i32[] = []
 let ihAkKind: i32[] = []
 let ihAkLo: i32[] = []
@@ -710,6 +712,7 @@ function ihStAt(t: i32): i32 {
 export function ihAmbientScan(): i32 {
   ihStAmb = []
   ihStWild = []
+  ihStNames = []
   ihAkSt = []
   ihAkKind = []
   ihAkLo = []
@@ -724,6 +727,7 @@ export function ihAmbientScan(): i32 {
   while s < ihStMod.length {
     ihStAmb.push(ihStKind[s] == IH_ST_TYPE)
     ihStWild.push(false)
+    ihStNames.push(false)
     s = s + 1
   }
   let x = 0
@@ -753,9 +757,13 @@ export function ihAmbientScan(): i32 {
         amb = true
         ihAkRow(at, IH_AK_NAME, [ihDeclBase(nd.tdName)])
         ihDeclKeys(x, at, seen)
+        ihStNames[at] = nd.tdNew != 0
+          || nd.tdFlat != 0
+          || nd.tdName.indexOf("<") >= 0
       }
       if nd is UnionDecl {
         amb = true
+        ihStNames[at] = true
         ihAkRow(at, IH_AK_NAME, [ihDeclBase(nd.udName)])
         ihDeclKeys(x, at, seen)
       }
@@ -877,6 +885,171 @@ export function ihAmbientMeets(diags: boolean): boolean[] {
         let w = ihAkLo[k]
         while w < ihAkHi[k] {
           if !ihFv.has(ihAkW[w]) { all = false }
+          w = w + 1
+        }
+      }
+      if kind == IH_AK_NAME && ihOn(IH_NO_AMB_NAMES) { all = false }
+      if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
+      if kind == IH_AK_FIELDS && ihOn(IH_NO_AMB_FIELDS) { all = false }
+      if all { out[m] = true }
+    }
+    k = k + 1
+  }
+  out
+}
+
+// The words, literal field sets and record types of the whole check, by module, so many module
+// sets can each be asked `ihAmbientMeets`'s question without reading their tokens again.
+type IhIndex = {
+  xWord: {[string]: i32[]},
+  xLit: {[i32]: i32[]},
+  xRep: i32[],
+  xArena: {[i32]: i32[]},
+  xArenaW: string[][],
+  xArenaRep: i32[],
+  xWild: boolean[],
+  xNames: boolean[],
+}
+let ihIx: IhIndex = ihIndexEmpty()
+
+function ihIndexEmpty(): IhIndex {
+  const ix: IhIndex = {
+    xWord: Map(),
+    xLit: Map(),
+    xRep: [],
+    xArena: Map(),
+    xArenaW: [],
+    xArenaRep: [],
+    xWild: [],
+    xNames: [],
+  }
+  ix
+}
+
+function ihIxPush(rows: i32[], m: i32): void {
+  if rows.length == 0 || rows[rows.length - 1] != m { rows.push(m) }
+}
+
+// After the check: index it for `ihAmbientMeetsIn`.
+export function ihAmbientIndex(): i32 {
+  const ix = ihIndexEmpty()
+  let d = 0
+  while d < ihKeys.length {
+    ix.xWild.push(false)
+    ix.xNames.push(false)
+    d = d + 1
+  }
+  let k = 0
+  while k < ihLitSt.length {
+    const m = ihStMod[ihLitSt[k]]
+    if m >= 0 {
+      if ihLitRep[k] { ihIxPush(ix.xRep, m) }
+      const rows = ix.xLit[ihLitKey[k]] ?? []
+      ihIxPush(rows, m)
+      ix.xLit[ihLitKey[k]] = rows
+    }
+    k = k + 1
+  }
+  let s = 0
+  while s < ihStMod.length {
+    const m = ihStMod[s]
+    if m >= 0 {
+      if ihStAmb[s] && m < ix.xWild.length {
+        if ihStWild[s] { ix.xWild[m] = true }
+        if ihStNames[s] { ix.xNames[m] = true }
+      }
+      let t = ihStLo[s]
+      while t < ihStHi[s] && t < P.toks.length {
+        const w = P.toks[t].text
+        ihIxWord(ix, w, m)
+        if w.length >= 2 && (w[0] == '"' || w[0] == '\'') {
+          ihIxWord(ix, w.slice(1, w.length - 1), m)
+        }
+        t = t + 1
+      }
+    }
+    s = s + 1
+  }
+  if !ihOn(IH_NO_AMB_ARENA) {
+    for ty in T.tys {
+      if ty is TyObj {
+        const a = ix.xArenaW.length
+        ix.xArenaW.push(ty.objFieldNames)
+        if ihHasRepeat(ty.objFieldNames) { ix.xArenaRep.push(a) }
+        const key = ihSetKey(ty.objFieldNames)
+        const rows = ix.xArena[key] ?? []
+        rows.push(a)
+        ix.xArena[key] = rows
+      }
+    }
+  }
+  ihIx = ix
+  0
+}
+
+function ihIxWord(ix: IhIndex, w: string, m: i32): void {
+  const rows = ix.xWord[w] ?? []
+  ihIxPush(rows, m)
+  ix.xWord[w] = rows
+}
+
+function ihIxIn(rows: i32[], inS: boolean[]): boolean {
+  for m in rows {
+    if m >= 0 && m < inS.length && inS[m] { return true }
+  }
+  false
+}
+
+function ihIxSpells(ws: string[], inS: boolean[]): boolean {
+  for w in ws {
+    if !ihIxIn(ihIx.xWord[w] ?? [], inS) { return false }
+  }
+  true
+}
+
+// `ihAmbientFv(inS)` then `ihAmbientMeets(false)`, from the last `ihAmbientIndex`. With `arena`,
+// a record type of the check also counts when `inS` spells all its fields; with `rows`, a type
+// declaration that may name another type in a rendered report row meets.
+export function ihAmbientMeetsIn(
+  inS: boolean[],
+  arena: boolean,
+  rows: boolean,
+): boolean[] {
+  const out: boolean[] = []
+  let d = 0
+  while d < ihKeys.length {
+    out.push(false)
+    d = d + 1
+  }
+  if ihOn(IH_NO_AMBIENT) { return out }
+  let any = ihIxIn(ihIx.xRep, inS)
+  if arena && !any {
+    for a in ihIx.xArenaRep {
+      if ihIxSpells(ihIx.xArenaW[a], inS) { any = true }
+    }
+  }
+  d = 0
+  while d < out.length && d < ihIx.xWild.length {
+    if ihIx.xWild[d] || (rows && ihIx.xNames[d]) { out[d] = true }
+    d = d + 1
+  }
+  let k = 0
+  while k < ihAkSt.length {
+    const m = ihStMod[ihAkSt[k]]
+    if m >= 0 && m < out.length && !out[m] {
+      const kind = ihAkKind[k]
+      let all = true
+      if kind == IH_AK_FIELDS {
+        all = any || ihIxIn(ihIx.xLit[ihAkSet[k]] ?? [], inS)
+        if !all && arena {
+          for a in ihIx.xArena[ihAkSet[k]] ?? [] {
+            if ihIxSpells(ihIx.xArenaW[a], inS) { all = true }
+          }
+        }
+      } else {
+        let w = ihAkLo[k]
+        while w < ihAkHi[k] {
+          if !ihIxIn(ihIx.xWord[ihAkW[w]] ?? [], inS) { all = false }
           w = w + 1
         }
       }

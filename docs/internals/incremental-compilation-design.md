@@ -1937,6 +1937,153 @@ self-compile fuel is 108,197,779,443 for master's seed on master's source, and 1
 for this step's seed on this step's source (+1.97%). Master's seed on this step's source reads
 110,331,300,457, so the rise comes with the source.
 
+**S5 step 13: one invocation's targets are served from an importer's check** (`wiArm`,
+driver.vl; `cliWiStart`, cli.vl)
+
+`vl check <dir>` checks each file's whole import graph on its own. A 60-module chain costs
+1.6 s of CPU for the directory, against 69 ms for its last file alone. The commit-to-commit
+skip (steps 5–12) serves nothing across the targets of one invocation. Its bank is selected
+per entry, so every target declines `NO_BANK`. An entry-agnostic bank would decline `GRAPH`
+instead, because the module counts differ.
+
+*Mechanism.* A plain check of two or more roots arms the driver. `--fix`, `--codegen` and
+`--budget` do not arm it. The CLI reads each root's direct imports and queues importers first,
+ordered by closure size; the report keeps the walk's order. After a whole check U that
+passes, `wiBankWhole` looks at every pending target T that U's graph holds as a module other
+than the entry. With G = T's import closure, `wiGuard` asks whether T's own check could differ
+from U's reading of G. If it could not, T is banked: its closure's keys and sources, and each
+module's lint sites. A later check of T over the same sources is served with no diagnostics
+and the banked lint sites. Otherwise the reason is kept for `wiStat`. The reasons are
+`unseen` (no importer's check held T), `dirty` (U did not pass), the six guards below, and
+`graph` (a banked source moved).
+
+*Guards*, each a statement about what outside G can reach G's check:
+
+- `entry`: an entry-only rule would read T. Each exported function must be closed and not
+  generic, so no uncalled export is inferred or refused (`expUncalledExports`). No overloaded
+  call may wait on a receiver only a caller would give.
+- `demand`: every import into G from outside G must name a declaration `skClosed` shuts. An
+  un-annotated `let xs = []` that an importer pushes into is open.
+- `demand`, adoption half (`wiAdopted`): a shut declaration is still open if this check's
+  record adoption retyped it. **`recAdPinLet`/`recAdPinFn` write the adopted annotation into
+  the syntax tree** (`recAdOrigDecl` lists the rewrites). A `skClosed` that runs after the
+  check therefore reads `export let pt = { x: 1, y: 2 }` as annotated with the importer's
+  `P`. Without this half, mask 0 served the adoption case unsoundly. The step-5 skip calls
+  `skClosed` before the check, so master is not exposed.
+- `fresh`: a fresh value crosses G's edge in either direction, or the check could not place it.
+- `writer`: a name G asked about is written, or has a statement in its writer closure, outside
+  G (`skWriterMoved`). The witness is a callback an importer registers that nulls a global G
+  narrows across a call.
+- `ambient`: a statement outside G holds a type, a structural spelling or a receiver function
+  that meets G's words (step 8's FIELDS/NAME rows). Its render half also declines when T holds a
+  row of a report stream, whose message may render a type declared outside G.
+- `asks`: a statement of G asked a write question about a declaration outside G.
+
+The step-5 `std` guard was removed because nothing can reach it. Target keys are paths and std
+imports use `std:` keys. What an entry-std check changes (uncalled-export inference) is already
+covered by `entry`, and `__memory_shared__` only makes the merged check stricter.
+
+*Suite* (`tests/vl_check_within_test.ts`). Each case checks main then lib on one armed
+instance. It asserts lib's reason, and that lib's diagnostics and stream rows equal a fresh
+instance's check of lib alone. A case with a mask asserts that the mask serves lib and that the
+served rows then differ, so the guard is load-bearing. There are 2 must-serve cases, 7
+must-decline cases and 6 mask witnesses: entry 1, demand 2, writer 8, ambient 16, render 128
+and adopted 256. `fresh`, `asks` and the ambient arena half (64) have no witness. Dropping them
+changed no served answer on any graph, so they are defensive. `fresh` keeps a must-decline case.
+
+*Byte identity.* `vl check` stdout and exit code were compared against master's seed on the
+chain, the chain with 12 tests, both with unique field names, a read-only copy of heregeat
+`src`, and `compiler std scripts`: identical in all six. `difftree.sh --identity` gives 0 of
+15,861 files differing and 0 uncompared, and its fixpoint is identical.
+
+*Served and declined* (wi2: one armed instance, importers first, each target against its own
+fresh check; 0 unsound in every row). Importer-dependent means a guard declined the target.
+The measured count is different: it is the number of targets whose fresh check actually
+differs under some importer. Task 1 found 0 of those on chain (60), tests (72) and heregeat
+(77). The one dependence it found was an entry-role witness, which `entry` catches.
+
+| graph | targets | served | unseen | importer-dependent (guard) |
+| --- | --- | --- | --- | --- |
+| chain | 60 | 0 | 1 | 59 ambient |
+| chain + 12 tests | 72 | 0 | 12 | 60 ambient |
+| chain, unique fields | 60 | 59 | 1 | 0 |
+| same + 12 tests | 72 | 59 | 12 | 1 ambient |
+| heregeat `src` (copy) | 77 | 22 | 21 | 34 (26 demand, 8 ambient) |
+| heregeat, last 10 commits | 77–80 | 22–25 | 21–22 | 33–35 (22–28 demand, 7–11 ambient) |
+| `compiler` (each file a target) | 218 | 65 | 1 | 152 (124 demand, 28 ambient) |
+| `std` | 18 | 0 | 18 | 0 |
+| `scripts` | 11,288 | 9 | 11,269 | 10 (1 demand, 9 ambient) |
+
+On `scripts` the replay first read 12 unsound targets, none of them served: a harness artifact.
+Each is a matrix template with a parse error in its entry, and `lintSrc` re-attributes such a
+check's diagnostics to the last module parsed (`std:array`); master's seed does the same. The
+harness read the shared rows after lint and the fresh rows before it. In the CLI, lint comes after the
+diagnostics are printed, so its output is unaffected.
+
+The chain declines because every module declares `type P<i> = { x: i32, y: i32, tag: string }`.
+Same-shape records are one type (D3870), so an importer's declaration meets G's words, and the
+render half is what the ambient witness shows. Single masks on heregeat: no `demand` gives 30
+served, no `ambient` 31, and no arena or render half 24, all at 0 unsound. No other mask moves
+a count.
+
+*Cost.* `vl check` user CPU, master's seed → this step's (median of 3):
+
+| graph | master | this step |
+| --- | --- | --- |
+| chain | 0.21 s | 0.30 s |
+| chain + 12 tests | 0.37 s | 0.47 s |
+| chain, unique fields | 0.22 s | 0.04 s |
+| same + 12 tests | 0.34 s | 0.23 s |
+| heregeat `src` | 2.74 s | 2.84 s |
+| `compiler std scripts` (2 runs) | 188–198 s | 202–204 s |
+
+A target that declines still pays for the recording (`recDelivArm`, `crAskArm`) and for the
+interface hashes' statement table. That is why the chain and `compiler std scripts` lose.
+Peak RSS on `compiler std scripts` is 4.29 → 4.79 GB. The seed is 6,369,605 → 6,442,773 bytes
+(+1.15%) and is its own fixpoint. L2 fuel is 110,911,819,799 → 111,654,195,366 (+0.67%), and
+this seed on master's source reads 110,911,820,216, so the unarmed path costs nothing.
+
+*What a per-module compile artifact needs from codegen.* `VL_COMPILE_CACHE=1` keys a build
+on its entry's whole closure, so 12 test files over one graph share nothing. A per-module
+artifact keyed on (own source, imports' interface hashes, banked demands) cannot be the
+module's bytes today. Every index a function body encodes is assigned over the merged
+program:
+
+- Function indices are `gImports + position` in `fnStmts` (`collectFns`), and `gImports`
+  depends on what the whole program prints or reads.
+- Type indices come from one counter over every module's structs, unions, lists, maps and
+  closures (`mAssignTypeIndices`). Same-shape records share the earliest row
+  (`buildStructTwins`). Everything sits in one rec group, which `typeOrderRun` reorders after
+  emission by module-wide use.
+- A union variant's tag is its rank among every variant in the program.
+- String-pool globals come before user globals (`collectStrPool`), and
+  `computeGlobalPromotion` renumbers globals over the program.
+- An importer's call creates an instance of an imported generic (`monoInstantiate`, keyed on
+  `fnStmts` position and canonical types). The first instance takes the template's slot and
+  later ones go at the tail. `monoPruneTemplates` stubs templates nobody instantiates.
+- The start function runs every module's initialisers in merged order. `-O` (`opt_pipe.vl`,
+  `opt_escape.vl`) works over the whole module.
+
+So the artifact needs five things from codegen:
+
+1. **Symbolic references.** Calls, type uses, globals and string data must name a module-stable
+   symbol (the `name$m<id>` names already are), not an index. A link step assigns the indices.
+2. **Program-owned types.** Record types are interned by canonical structure into a table the
+   link owns, and union tags by member set. A module records the shapes it uses, and the link
+   assigns the indices and the rec group.
+3. **Instances in the demand bank.** Generic instances are emitted by the instantiating module,
+   or keyed by (template's interface hash, canonical type arguments) and deduplicated at link.
+   The instances a module needs are part of its banked demands, as instantiations already are
+   for the check.
+4. **Per-module whole-program facts.** Every whole-program analysis the module's bytes read
+   (return inference, `fn_flow` classes, closure lifting, global promotion, dispatch rewrite)
+   must become either a per-module fact computed from its key, or a link-time decision.
+5. **Optimisation after link.** `-O` runs after link, over the linked module. The artifact is
+   unoptimised code, so `opt_escape`'s growth-budget decision stays global.
+
+None of this exists yet. Items 1 and 2 are the precondition for caching anything, and §3.2's
+per-phase table names which phases are importer-independent.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.

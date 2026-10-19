@@ -12,7 +12,9 @@ import {
 import {
   mimpAddExport,
   mimpBegin,
+  mimpClear,
   mimpExportedByNote,
+  mimpMissed,
   mimpNearMisses,
   mimpNoteMoved,
   mimpSpecsFor,
@@ -32,6 +34,7 @@ import {
 import { modIdAssign, modIdReset, modIxOfId, modSuffixOf } from "./modid"
 import { crAskAnswer } from "./check_call_retire"
 import { crAskArm, crAskHold, crAskKeys, crAskQs } from "./check_capture_rows"
+import { recAdOrigDecl } from "./check_rec_adopt_rows"
 import {
   parseImageArmed,
   parseImageBegin,
@@ -277,7 +280,9 @@ import {
   ifaceHashOf,
   ihAmbientFv,
   ihAmbientFvArena,
+  ihAmbientIndex,
   ihAmbientMeets,
+  ihAmbientMeetsIn,
   ihAmbientScan,
   ihBegin,
   ihCarry,
@@ -329,6 +334,8 @@ import { esDumpText, esTextOfDecl } from "./check_program"
 import { checkNotIntrinsicName } from "./check_node_rules"
 import { tErr, tErrBuiltinTyDecl } from "./check_relate_core"
 import { jwSiteNode } from "./check_side_rows"
+import { declIsExportedFn } from "./check_exp_obs"
+import { ovHoleSites } from "./check_call_resolve"
 import { printDomainStr } from "./check_diag_text"
 import { canonRestoreSpellings } from "./check_canon_raw"
 import {
@@ -352,12 +359,16 @@ import {
   jwSplice,
 } from "./json_walk"
 import {
+  expInfCount,
   expInfMsgAt,
   expInfTokAt,
+  isvalCount,
   isvalMsgAt,
   isvalTokAt,
+  rcoalCount,
   rcoalMsgAt,
   rcoalTokAt,
+  redunCount,
   redunMsgAt,
   redunRetAt,
   redunTokAt,
@@ -1406,6 +1417,7 @@ export function checkSrc(): i32 {
   pipelineReset()
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
   if modKeys.length > 0 {
+    if wiServe() { return 0 }
     const rc = modCompile(0)
     if rc != SK_RERUN { return rc }
     // A declined skip has already checked part of the graph into the arena, so the whole
@@ -5044,7 +5056,7 @@ function modIfaceBegin(roots: i32[], tokEnd: i32) {
     o = o + 1
   }
   ihAmbientScan()
-  ihTokDigests()
+  if !wiOwnsIh || skArmed { ihTokDigests() }
 }
 
 // The whole module pipeline behind `compileSrc` (emit = 1) / `checkSrc` (0).
@@ -5062,6 +5074,7 @@ function modCompile(emit: i32): i32 {
   vcEtDrop()
   vcEpDrop()
   if modOrderGraph() != 0 { return 1 }
+  wiLiveNow = wiLive()
   const roots = modParseAll()
   const parsedToks = P.toks.length
   if modOneShot != 0 { modCacheClear() }
@@ -5078,7 +5091,7 @@ function modCompile(emit: i32): i32 {
   // overlapping declarations share has no answer the checker could improve on.
   modCheckOverloads(roots)
   if vcParseBlocked() { return 1 }
-  if ifaceHashArmed() { modIfaceBegin(roots, parsedToks) }
+  if ifaceHashArmed() && wiIhWanted() { modIfaceBegin(roots, parsedToks) }
   modResolveRootReExports()
   modAliasRootExports()
   const banking = emit == 0 && skArmed && ifaceHashArmed()
@@ -5088,10 +5101,10 @@ function modCompile(emit: i32): i32 {
   const merged = modMergeRoots(roots, keep)
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
-  recDelivArm(banking)
-  crAskArm(banking)
+  recDelivArm(banking || wiLiveNow)
+  crAskArm(banking || wiLiveNow)
   checkProgram(merged)
-  if ifaceHashArmed() { ihFinish() }
+  if ifaceHashArmed() && (!wiOwnsIh || skArmed) { ihFinish() }
   checkMemSharedOrigin()
   plusLinksBank()
   if keep.length > 0 && !skSettle(keep, roots) { return SK_RERUN }
@@ -5111,6 +5124,7 @@ function modCompile(emit: i32): i32 {
   if jwRc != 0 { return jwRc }
   if P.diags.length > 0 { return 1 }
   if T.diags.length > 0 { return 2 }
+  if wiLiveNow && emit == 0 && keep.length == 0 { wiBankWhole(roots) }
   if fsModeOf() == FS_PLAN { return fsPlan(merged) }
   if emit != 0 {
     const rc = emitProgram(merged)
@@ -6411,6 +6425,481 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
   skDgReloc = dgReloc
   skDg = dg
   skValid = true
+  0
+}
+
+// ── serving one invocation's targets from an importer's check (`wiArm`) ─────────────────────
+// A clean check of an importer banks each target in its graph whose own check cannot differ:
+// nothing outside the target's import closure G reaches G (`wiGuard`). A later check of that
+// target over the same sources is served with no diagnostics and the banked lint sites.
+const WI_SERVED = 0
+const WI_UNSEEN = 1
+const WI_DIRTY = 2
+const WI_ENTRY = 3
+const WI_DEMAND = 4
+const WI_FRESH = 5
+const WI_WRITER = 6
+const WI_AMBIENT = 7
+const WI_ASKS = 8
+const WI_GRAPH = 9
+const WI_REASONS = 10
+type WiBank = {
+  wKeys: {[string]: i32},
+  wSrcs: string[],
+  wPlus: {[i32]: i32}[],
+  wStrIdx: {[i32]: i32}[],
+  wScalar: {[i32]: i32}[],
+}
+let wiOn = false
+let wiMask = 0
+// Whether `wiArm` armed the interface hashes, so a check needs only their statement table.
+let wiOwnsIh = false
+// Whether the current check may bank a target (`wiLive`).
+let wiLiveNow = false
+// Per target key: 1 while unchecked, 0 once checked.
+let wiPending: {[string]: i32} = Map()
+let wiBanks: {[string]: WiBank} = Map()
+// Per target key, why the last importer's check did not bank it.
+let wiWhy: {[string]: i32} = Map()
+let wiStats: i32[] = []
+let wiServedLast = false
+let wiBankedKeys: string[] = []
+let wiBankedMods: i32[] = []
+// Read once per bank pass, for every guard of it: each module's direct imports, the check's
+// fresh deliveries and its write questions.
+let wiDeps: i32[][] = []
+let wiNow: {[string]: {[string]: i32}} = Map()
+let wiAsksAll: string[] = []
+// Per import row of the check: the module it reads (-1 unresolved), the origin module of the
+// name it binds (-1 for a namespace import), and whether `skClosed` shuts it (-1 not yet asked).
+let wiImpTo: i32[] = []
+let wiImpOrigin: i32[] = []
+let wiImpMerged: string[] = []
+let wiImpShut: i32[] = []
+// Mask bits that each drop one guard, for the suite's mask witnesses.
+const WI_NO_ENTRY = 1
+const WI_NO_DEMAND = 2
+const WI_NO_FRESH = 4
+const WI_NO_WRITER = 8
+const WI_NO_AMBIENT = 16
+const WI_NO_ASKS = 32
+const WI_NO_ARENA = 64
+const WI_NO_RENDER = 128
+const WI_NO_ADOPTED = 256
+// The delivery flags whose judgement reads every site of the value: kept, or site-counted.
+const WI_COUNTED = 5
+
+// Arm serving across the targets `wiTargetAdd` names (`on` 1, with guard mask `mask`), or
+// disarm it (0). Either way the bank and the counts start empty.
+export function wiArm(on: i32, mask: i32): i32 {
+  if wiOwnsIh && on == 0 { ifaceHashArm(0) }
+  wiOwnsIh = wiOwnsIh && on != 0 || on != 0 && !ifaceHashArmed()
+  wiOn = on != 0
+  wiMask = mask
+  wiLiveNow = false
+  wiPending = Map()
+  wiBanks = Map()
+  wiWhy = Map()
+  wiStats = []
+  let r = 0
+  while r < WI_REASONS {
+    wiStats.push(0)
+    r = r + 1
+  }
+  wiServedLast = false
+  wiBankedKeys = []
+  wiBankedMods = []
+  if wiOn { ifaceHashArm(1) }
+  0
+}
+
+// Whether this check needs the interface hashes' statement table: when something other than
+// serving armed them, or when a target it may bank is in the graph.
+function wiIhWanted(): boolean { !wiOwnsIh || skArmed || wiLiveNow }
+
+// Whether the graph just ordered holds, beside its entry, a target that may still be banked.
+function wiLive(): boolean {
+  if !wiOn { return false }
+  let m = 1
+  while m < modKeys.length {
+    const key = modKeys[m]
+    if ((wiPending[key] ?? 0) == 1 && !wiBanks.has(key)) { return true }
+    m = m + 1
+  }
+  false
+}
+
+// Name `key` (a module key, as the target's own check commits it) a target of this invocation.
+export function wiTargetAdd(key: string): i32 {
+  wiPending[key] = 1
+  0
+}
+
+const wiKeyAcc = cpAccNew()
+// The host's spelling of `wiTargetAdd`: push the key's bytes, then commit them.
+export function wiTargetPush(c: i32): i32 {
+  cpAccPush(wiKeyAcc, c)
+  0
+}
+export function wiTargetCommit(): i32 { wiTargetAdd(cpAccTake(wiKeyAcc)) }
+
+// Of the targets checked since `wiArm`: how many it served (`which` 0), or declined for reason
+// `which` (`WI_UNSEEN` when no importer's graph holds it before its turn).
+export function wiStat(which: i32): i32 {
+  if which < 0 || which >= wiStats.length { return -1 }
+  wiStats[which]
+}
+
+// Whether an importer's bank served the last check.
+export function wiServed(): boolean { wiServedLast }
+
+// The targets the last check banked: how many, and each one's key and module index in it.
+export function wiBankedCount(): i32 { wiBankedKeys.length }
+export function wiBankedKey(i: i32): string { wiBankedKeys[i] }
+export function wiBankedMod(i: i32): i32 { wiBankedMods[i] }
+
+// Before a module check: serve the entry from its bank when that bank holds exactly this graph.
+function wiServe(): boolean {
+  wiServedLast = false
+  wiBankedKeys = []
+  wiBankedMods = []
+  if !wiOn || modKeys.length == 0 { return false }
+  const key = modKeys[0]
+  if (wiPending[key] ?? 0) == 0 { return false }
+  wiPending[key] = 0
+  const b = wiBanks[key]
+  let ok = b != null
+  if b != null {
+    if b.wSrcs.length != modKeys.length { ok = false }
+    let m = 0
+    while ok && m < modKeys.length {
+      const i = b.wKeys[modKeys[m]] ?? -1
+      if i < 0 || b.wSrcs[i] != modSrcs[m] || modFound[m] == 0 { ok = false }
+      m = m + 1
+    }
+  }
+  if !ok {
+    let why = wiWhy[key] ?? WI_UNSEEN
+    if b != null { why = WI_GRAPH }
+    wiStats[why] = wiStats[why] + 1
+    return false
+  }
+  if b != null {
+    plSrcs = []
+    plLinks = []
+    plStrIdx = []
+    plScalar = []
+    let m = 0
+    while m < modKeys.length {
+      const i = b.wKeys[modKeys[m]] ?? -1
+      plSrcs.push(modSrcs[m])
+      plLinks.push(b.wPlus[i])
+      plStrIdx.push(b.wStrIdx[i])
+      plScalar.push(b.wScalar[i])
+      m = m + 1
+    }
+    plBankGen = plGen
+  }
+  mimpClear()
+  vcEpDrop()
+  wiStats[WI_SERVED] = wiStats[WI_SERVED] + 1
+  wiServedLast = true
+  true
+}
+
+// After a whole module check that passed: bank every pending target the graph holds as a
+// module other than the entry, when `wiGuard` finds its own check could not differ.
+function wiBankWhole(roots: i32[]): i32 {
+  const clean = P.diags.length == 0
+    && T.diags.length == 0
+    && jwSiteNode.length == 0
+    && mimpMissed.length == 0
+    && !fsAsked()
+    && fsModeOf() == FS_COMPILE
+  const pos = skPosOf()
+  let ready = false
+  let m = 1
+  while m < modKeys.length {
+    const key = modKeys[m]
+    if ((wiPending[key] ?? 0) == 1 && !wiBanks.has(key)) {
+      let why = WI_DIRTY
+      if clean && !ready {
+        wiPrep()
+        ready = true
+      }
+      if clean { why = wiGuard(m, roots, pos) }
+      if why == WI_SERVED { wiBankOne(m) } else { wiWhy[key] = why }
+    }
+    m = m + 1
+  }
+  0
+}
+
+// The per-check reads every guard of one bank pass shares.
+function wiPrep(): i32 {
+  wiDeps = []
+  for _ in modKeys {
+    const none: i32[] = []
+    wiDeps.push(none)
+  }
+  let k = 0
+  while k < impMod.length {
+    const d = modIndexOfKey(impKey[k])
+    const f = impMod[k]
+    if d >= 0 && f >= 0 && f < wiDeps.length { wiDeps[f].push(d) }
+    k = k + 1
+  }
+  wiImpTo = []
+  wiImpOrigin = []
+  wiImpMerged = []
+  wiImpShut = []
+  k = 0
+  while k < impMod.length {
+    const d = modIndexOfKey(impKey[k])
+    let om = -1
+    let merged = ""
+    if d >= 0 {
+      const nm = skImportName(k)
+      if nm != "" {
+        const o = modExportOrigin(d, nm)
+        om = o.oMod
+        merged = o.oName + modSuffixOf(o.oMod)
+      }
+    }
+    wiImpTo.push(d)
+    wiImpOrigin.push(om)
+    wiImpMerged.push(merged)
+    wiImpShut.push(-1)
+    k = k + 1
+  }
+  wiNow = skDelivNow()
+  wiAsksAll = skAsksNow([])
+  ihAmbientIndex()
+  0
+}
+
+// The modules target `t` imports, closed, with `t` itself.
+function wiClosure(t: i32): boolean[] {
+  const inG: boolean[] = []
+  for _ in modKeys { inG.push(false) }
+  inG[t] = true
+  const work: i32[] = [t]
+  let w = 0
+  while w < work.length {
+    const f = work[w]
+    if f >= 0 && f < wiDeps.length {
+      for d in wiDeps[f] {
+        if !inG[d] {
+          inG[d] = true
+          work.push(d)
+        }
+      }
+    }
+    w = w + 1
+  }
+  inG
+}
+
+// Why module `t`'s own check may differ from this check's reading of its closure G, or `WI_SERVED`:
+// an entry-only rule reads it; an import into G is not shut (`wiDemandShut`); a fresh
+// value of G crosses its edge; a name G asked about is written or used outside it; an ambient
+// statement outside meets G's words; or G asked about a body outside it.
+function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
+  const inG = wiClosure(t)
+  if (wiMask & WI_NO_ENTRY) == 0 && !wiEntryNeutral(t, roots[pos[t]]) {
+    return WI_ENTRY
+  }
+  if (wiMask & WI_NO_DEMAND) == 0 && !wiDemandShut(inG, roots, pos) {
+    return WI_DEMAND
+  }
+  if (wiMask & WI_NO_FRESH) == 0 && wiFreshCrosses(inG) { return WI_FRESH }
+  if ((wiMask & WI_NO_WRITER) == 0 && skWriterMoved(inG, wiAsksAll, false)) {
+    return WI_WRITER
+  }
+  if (wiMask & WI_NO_AMBIENT) == 0 {
+    const meets = ihAmbientMeetsIn(
+      inG,
+      (wiMask & WI_NO_ARENA) == 0,
+      (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(t),
+    )
+    let m = 0
+    while m < modKeys.length && m < meets.length {
+      if !inG[m] && meets[m] { return WI_AMBIENT }
+      m = m + 1
+    }
+  }
+  if (wiMask & WI_NO_ASKS) == 0 && wiAsksOut(inG) { return WI_ASKS }
+  WI_SERVED
+}
+
+// Whether module `t` holds a row of the report streams, whose message may render any type.
+function wiRowsIn(t: i32): boolean {
+  let i = 0
+  while i < redunCount() {
+    if redunModuleAt(i) == t { return true }
+    i = i + 1
+  }
+  i = 0
+  while i < rcoalCount() {
+    if rcoalModuleAt(i) == t { return true }
+    i = i + 1
+  }
+  i = 0
+  while i < isvalCount() {
+    if isvalModuleAt(i) == t { return true }
+    i = i + 1
+  }
+  i = 0
+  while i < expInfCount() {
+    if expInfModuleAt(i) == t { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether module `t` (rooted at `root`) reads the same as an entry: each exported function is
+// closed and not generic, so no uncalled export is inferred or refused, and no overloaded call
+// in it waits on a receiver only a caller would give.
+function wiEntryNeutral(t: i32, root: i32): boolean {
+  const r = P.nodes[root]
+  if r is Program {
+    for st in r.progStmts {
+      const n = P.nodes[st]
+      if n is FuncDecl && declIsExportedFn(st) {
+        if n.fnTyParams.length > 0 || !skParamsClosed(n.fnParams) {
+          return false
+        }
+      }
+    }
+  }
+  for s in ovHoleSites {
+    if skNodeMod(s) == t { return false }
+  }
+  true
+}
+
+// Whether every import from outside G of a declaration in G names one `skClosed` shuts and
+// this check's adoption did not retype (`wiAdopted`).
+function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
+  let k = 0
+  while k < impMod.length && k < wiImpTo.length {
+    const d = wiImpTo[k]
+    if !inG[impMod[k]] && d >= 0 {
+      const om = wiImpOrigin[k]
+      if om < 0 {
+        if inG[d] { return false }
+      } else if inG[om] {
+        if wiImpShut[k] < 0 {
+          const root = roots[pos[om]]
+          const nm = wiImpMerged[k]
+          wiImpShut[k] = if skClosed(root, nm) == SK_SHUT
+            && ((wiMask & WI_NO_ADOPTED) != 0 || !wiAdopted(root, nm)) { 1 } else { 0 }
+        }
+        if wiImpShut[k] == 0 { return false }
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
+// Whether declaration `merged` of the module rooted at `root` carries a type this check's
+// adoption wrote over it: an importer outside G may have chosen it, so its spelling is not its own.
+function wiAdopted(root: i32, merged: string): boolean {
+  if recAdOrigDecl.length == 0 { return false }
+  const r = P.nodes[root]
+  if r is Program {
+    for st in r.progStmts {
+      const n = P.nodes[st]
+      if (
+        (n is LetDecl && n.letName == merged)
+        || (n is FuncDecl && n.fnName == merged)
+      ) {
+        for d in recAdOrigDecl {
+          if d == st { return true }
+        }
+      }
+    }
+  }
+  false
+}
+
+// Whether a fresh value crosses G's edge: one the check could not place, one of G delivered
+// outside G or the reverse, or one of G a delivery judged that is spelled outside G.
+function wiFreshCrosses(inG: boolean[]): boolean {
+  const now = wiNow
+  if now.has(SK_UNATTRIBUTED) { return true }
+  const counted: string[] = []
+  for key in now.keys() {
+    const dm = modIndexOfKey(key.slice(0, key.indexOf("\n")))
+    if dm < 0 { return true }
+    const row = now[key] ?? Map()
+    let flags = 0
+    for mk in row.keys() {
+      const am = modIndexOfKey(mk)
+      if am < 0 || inG[am] != inG[dm] { return true }
+      flags = flags | (row[mk] ?? 0)
+    }
+    if inG[dm] && (flags & WI_COUNTED) != 0 { counted.push(key) }
+  }
+  if counted.length == 0 { return false }
+  const out: boolean[] = []
+  for x in inG { out.push(!x) }
+  const occ = ihOccDigests(counted, out)
+  for key in counted {
+    let m = 0
+    while m < modKeys.length {
+      if !inG[m] && occ.has(key + "\n" + modKeys[m]) { return true }
+      m = m + 1
+    }
+  }
+  false
+}
+
+// Whether a statement of G asked a write question about a declaration outside G, or one the
+// check could not place.
+function wiAsksOut(inG: boolean[]): boolean {
+  const qs = crAskQs
+  let j = 0
+  while j + 3 < qs.length {
+    const at = qs[j]
+    if at >= 0 && at < P.toks.length {
+      const am = modOfTok(at)
+      if am >= 0 && am < inG.length && inG[am] {
+        const dm = skNodeMod(qs[j + 2])
+        if dm < 0 || dm >= inG.length || !inG[dm] { return true }
+      }
+    }
+    j = j + 4
+  }
+  false
+}
+
+// Bank target module `t`: its closure's keys and sources, and each one's lint sites.
+function wiBankOne(t: i32): i32 {
+  const inG = wiClosure(t)
+  const b: WiBank = {
+    wKeys: Map(),
+    wSrcs: [],
+    wPlus: [],
+    wStrIdx: [],
+    wScalar: [],
+  }
+  let m = 0
+  while m < modKeys.length {
+    if inG[m] {
+      if m >= plLinks.length { return 0 }
+      b.wKeys[modKeys[m]] = b.wSrcs.length
+      b.wSrcs.push(modSrcs[m])
+      b.wPlus.push(plLinks[m])
+      b.wStrIdx.push(plStrIdx[m])
+      b.wScalar.push(plScalar[m])
+    }
+    m = m + 1
+  }
+  wiBanks[modKeys[t]] = b
+  wiBankedKeys.push(modKeys[t])
+  wiBankedMods.push(t)
   0
 }
 
