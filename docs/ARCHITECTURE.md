@@ -38,8 +38,8 @@ refusal. Progress is counted in programs that **run**, by the instruments named 
 
 ```
 source ─► lexer ─► parser ─► node arena ─► checker ─────────────────► emitter ─────────► module bytes ─► host
-          tokens   AST                     (solve loops, canon)       (pass table:            (-O: binaryen
-                                           types, diagnostics         46 ordered rows,         + host passes)
+          tokens   AST                     (solve loops, canon)       (pass table:            (-O: opt_pipe
+                                           types, diagnostics         46 ordered rows,         + wasm-opt)
                                                                       mono among them;
                                                                       then sections)
 ```
@@ -209,12 +209,12 @@ The native host:
 
 - **In:** the module bytes. **Out:** a validated, optionally optimised module, run under the host
   ABI.
-- **Contract:** without `-O`, the host runs exactly what the compiler emitted. With `-O`, it runs
-  binaryen's `wasm-opt` and its own passes (inlining, multi-value, flattening); each `-O` pass
-  preserves the module's observable behaviour and is graded on that.
-- **Must not:** parse or type VL. A host pass is a wasm-to-wasm transform. It must not depend on
-  VL source facts that are not in the module; if it needs one, the emitter writes it into a named
-  custom section.
+- **Contract:** without `-O`, the host runs exactly what the compiler emitted. With `-O`, the
+  compiler runs every pass itself (`compiler/opt_pipe.vl`: escape, inline-record, flattening,
+  multi-value) and the host only answers its validate, print and `wasm-opt` requests; each `-O`
+  step preserves the module's observable behaviour and is graded on that.
+- **Must not:** parse, type or transform VL. The host has no optimisation passes of its own; a
+  `wasm-opt` request is binaryen over the bytes the compiler hands it.
 
 The two JavaScript hosts cannot run `-O`, so an `-O` build runs only natively
 ([§7](#7-known-deviations)).
