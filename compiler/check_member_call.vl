@@ -255,7 +255,7 @@ function ovHoleCallTy(row: i32, prop: string, recvTy: i32, n: Call, ix: i32) {
   for c in ovSetCands[row] {
     if why == "" && declFirstParamIsSelf(c) {
       const fty = lookup(c)
-      if ufcsInferCallee(c, fty) {
+      if fty >= 0 && fty < T.tys.length && ufcsInferCallee(c, fty) {
         const ft = T.tys[fty]
         if ft is TyFunc {
           const req = fnRequiredArity(fnDeclParamsOf(c))
@@ -583,9 +583,11 @@ function ufcsNoteRecv(
 ) {
   // D2060 — the receiver is delivered to `self` like an argument, so a wider `self` field
   // the body writes is refused here as it is at the argument seam.
-  const rcwRecv = P.nodes[n.callFn]
-  if rcwRecv is Member {
-    if !inferQuiet { rcwPend(rcwRecv.memObj, recvTy, selfTy) }
+  if n.callFn >= 0 {
+    const rcwRecv = P.nodes[n.callFn]
+    if rcwRecv is Member {
+      if !inferQuiet { rcwPend(rcwRecv.memObj, recvTy, selfTy) }
+    }
   }
   // The vacuous half of that gate, deferred: `assignable` answers true for a `TyVar` on
   // either side, so this row makes a hole receiver's pass mean something once resolved (see `ufcsCstr.ty`'s header).
@@ -723,8 +725,10 @@ function ufcsRevalidatePins(
   // same symmetry (D582).
   validateBmCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
   // After the pins above, as the direct spelling does; the receiver is an argument too.
-  const rcvN = P.nodes[n.callFn]
-  if rcvN is Member { refuseOpenNullHoleArg(rcvN.memObj, plainName) }
+  if n.callFn >= 0 {
+    const rcvN = P.nodes[n.callFn]
+    if rcvN is Member { refuseOpenNullHoleArg(rcvN.memObj, plainName) }
+  }
   let oua = 0
   while oua < args.length {
     refuseOpenNullHoleArg(args[oua], plainName)
@@ -801,6 +805,7 @@ export function checkMemberCallNode(
       recvTy = holeMapDemandTy(rt.tvName, prop == "add")
     }
   }
+  if recvTy < 0 || recvTy >= T.tys.length { return -1 }
   rt = T.tys[recvTy]
   // Banked for the emitter's rewrite, which must take the rung this call took (D2476).
   if builtinMethodClaims(recvTy, prop) {
@@ -999,34 +1004,36 @@ function memberCallMapFilterTy(
     if !cbElemNarrowFor(recvIx, cargs[0]) { efLeaf[cargs[0]] = -1 }
   }
   const cbTy = checkNodeHook(cargs[0])
-  const cb = T.tys[cbTy]
-  if cb is TyFunc {
-    const cbParams = cb.fnParamTypes
-    if cbParams.length != 1 {
-      tErr(
-        prop + " callback expects 1 parameter, got " + i32ToStr(cbParams.length),
-        ix,
-      )
-    } else if !assignable(rt.aElem, cbParams[0]) {
-      tErr(
-        prop
-          + " callback: parameter expects "
-          + tyToStr(cbParams[0])
-          + ", got "
-          + tyToStr(rt.aElem),
-        ix,
-      )
-    }
-    if prop == "filter" {
-      if !assignable(cb.fnRet, TY_BOOL) {
+  if cbTy >= 0 && cbTy < T.tys.length {
+    const cb = T.tys[cbTy]
+    if cb is TyFunc {
+      const cbParams = cb.fnParamTypes
+      if cbParams.length != 1 {
         tErr(
-          "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
+          prop + " callback expects 1 parameter, got " + i32ToStr(cbParams.length),
+          ix,
+        )
+      } else if !assignable(rt.aElem, cbParams[0]) {
+        tErr(
+          prop
+            + " callback: parameter expects "
+            + tyToStr(cbParams[0])
+            + ", got "
+            + tyToStr(rt.aElem),
           ix,
         )
       }
-      return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+      if prop == "filter" {
+        if !assignable(cb.fnRet, TY_BOOL) {
+          tErr(
+            "filter predicate must yield boolean, got " + tyToStr(cb.fnRet),
+            ix,
+          )
+        }
+        return listBuiltResultTy(recvTy, rt.aElem, rt.aRead)
+      }
+      return mkArrayTy(cb.fnRet)
     }
-    return mkArrayTy(cb.fnRet)
   }
   tErr(prop + " expects a function, got " + tyToStr(cbTy), ix)
   return TY_ERR

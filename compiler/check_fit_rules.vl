@@ -5,28 +5,47 @@
 
 import {
   ArrayLit,
+  AsExpr,
   BinExpr,
   Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
   MatchExpr,
+  Member,
+  NullLit,
   NumLit,
   ObjLit,
+  OptMember,
   P,
+  Param,
   Paren,
+  Program,
+  RetStmt,
   Spread,
   StrLit,
   TS_FIELD,
   TS_METHOD,
   TS_NAME,
   TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
+  WhileStmt,
   annTsOf,
   arenaSetNode,
   i32ToStr,
@@ -1019,6 +1038,7 @@ function radixLitAdoptWidth(litIx: i32, width: i32) {
 export function radixLitAdoptDst(srcExpr: i32, dstTy: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 { return 0 }
   const lix = parenPeelIx(srcExpr)
+  if lix < 0 || lix >= P.nodes.length { return 0 }
   const e = P.nodes[lix]
   if e is NumLit {
     if numLexRadixBits(e.numText) < 0 { return 0 }
@@ -2217,87 +2237,129 @@ function objShapeAdapterless(
   const s = T.tys[src]
   const d = T.tys[dst]
   // Nullable pairs peel exactly as `assignableGo`'s nullable arm does, and in its order.
-  if d is TyNullable {
-    if s is TyNullable {
-      return objShapeAdapterless(-1, s.nInner, d.nInner, depth - 1, direct)
+  match d {
+    TyNullable => {
+      match s {
+        TyNullable => {
+          return objShapeAdapterless(-1, s.nInner, d.nInner, depth - 1, direct)
+        }
+        // a non-nullable source peels the destination alone
+        TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+      }
+      return objShapeAdapterless(srcExpr, src, d.nInner, depth - 1, direct)
     }
-    return objShapeAdapterless(srcExpr, src, d.nInner, depth - 1, direct)
+    // every other destination is decided below
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   // A union source is assignable when every member is, so any member needing an adapter
   // makes the whole flow one.
-  if s is TyUnion {
-    const sms = s.uMembers
-    let si = 0
-    while si < sms.length {
-      if objShapeAdapterless(-1, sms[si], dst, depth - 1, false) { return true }
-      si = si + 1
+  match s {
+    TyUnion => {
+      const sms = s.uMembers
+      let si = 0
+      while si < sms.length {
+        if objShapeAdapterless(-1, sms[si], dst, depth - 1, false) {
+          return true
+        }
+        si = si + 1
+      }
+      return false
     }
-    return false
+    // every other source is decided below
+    TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
-  if d is TyUnion {
-    return objShapeUnionDstAdapts(srcExpr, src, d.uMembers, depth)
+  match d {
+    TyUnion => {
+      return objShapeUnionDstAdapts(srcExpr, src, d.uMembers, depth)
+    }
+    // every other destination pairs with its source's kind below
+    TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   const cx = ctorExprOf(srcExpr)
-  if s is TyObj {
-    if d is TyObj {
-      // A cost early-out, not a decision: `tyEq` is render-equality, so two equal object
-      // types have equal ordered field-name lists, which `objFieldNameSetsEq` declines
-      // anyway. Here because the identical pair is the overwhelmingly common one.
-      if tyEq(src, dst) { return false }
-      // A pair reaching an inference hole is not a pair of shapes yet. An un-annotated
-      // parameter used only as `o.x` demands `{x: _}`, which looks like a width-subtyped
-      // destination beside a two-field argument and is not one — the solve pins it from the
-      // argument and it lowers.
-      if objSrcReachesHoleFor(s, dst, 8) || tyReachesHole(dst, 8) {
-        return false
-      }
-      if cx >= 0 {
-        const ce = P.nodes[cx]
-        if ce is ObjLit {
-          if objShapeLitFieldsAdapt(ce, s, d, depth) { return true }
-          // Falls through to the dropped-field decision: the exemption covers what "built
-          // at the destination shape" buys, and a field the destination does not declare is
-          // not in it. `emitObj` walks the destination's field list, so a lacked field is
-          // never visited — its initializer never runs, a silently wrong evaluation count.
+  match s {
+    TyObj => {
+      match d {
+        TyObj => {
+          // A cost early-out, not a decision: `tyEq` is render-equality, so two equal object
+          // types have equal ordered field-name lists, which `objFieldNameSetsEq` declines
+          // anyway. Here because the identical pair is the overwhelmingly common one.
+          if tyEq(src, dst) { return false }
+          // A pair reaching an inference hole is not a pair of shapes yet. An un-annotated
+          // parameter used only as `o.x` demands `{x: _}`, which looks like a width-subtyped
+          // destination beside a two-field argument and is not one — the solve pins it from the
+          // argument and it lowers.
+          if objSrcReachesHoleFor(s, dst, 8) || tyReachesHole(dst, 8) {
+            return false
+          }
+          if cx >= 0 {
+            const ce = P.nodes[cx]
+            if ce is ObjLit {
+              if objShapeLitFieldsAdapt(ce, s, d, depth) { return true }
+              // Falls through to the dropped-field decision: the exemption covers what "built
+              // at the destination shape" buys, and a field the destination does not declare is
+              // not in it. `emitObj` walks the destination's field list, so a lacked field is
+              // never visited — its initializer never runs, a silently wrong evaluation count.
+            }
+          }
+          // Agreeing field names, differing through a field — still adapterless, and one case
+          // is worse than a hole: a field width pair (`{n: Wide}` into `{n: Narrow}`) is unsound
+          // rather than unsupported, since a struct field is mutable. Not withdrawn here, since
+          // the identical pair is correct for an un-annotated literal — the verdict turns on the source's provenance (D622).
+          if objFieldNameSetsEq(src, dst) {
+            return objShapeSameNamesAdapts(srcExpr, src, dst, cx)
+          }
+          // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
+          // of `Wide`'s, in the canonical layout order with identical types, needs no
+          // conversion — `emitTypeSection` declares a `(sub)` edge, only at a `direct` position.
+          // An object literal is not lifted: `emitObj` builds it at the destination's field list, so an excess field's initializer never runs.
+          if direct && !litShapeDropSrcExpr(cx) && objWidthPrefix(src, dst) {
+            return false
+          }
+          return objShapeAdaptNote(src, dst, cx, false, false)
         }
+        // a source pairs only with a destination of its own kind
+        TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
       }
-      // Agreeing field names, differing through a field — still adapterless, and one case
-      // is worse than a hole: a field width pair (`{n: Wide}` into `{n: Narrow}`) is unsound
-      // rather than unsupported, since a struct field is mutable. Not withdrawn here, since
-      // the identical pair is correct for an un-annotated literal — the verdict turns on the source's provenance (D622).
-      if objFieldNameSetsEq(src, dst) {
-        return objShapeSameNamesAdapts(srcExpr, src, dst, cx)
-      }
-      // The width lift (D622): a `Wide` flowing into a `Narrow` whose fields are the first
-      // of `Wide`'s, in the canonical layout order with identical types, needs no
-      // conversion — `emitTypeSection` declares a `(sub)` edge, only at a `direct` position.
-      // An object literal is not lifted: `emitObj` builds it at the destination's field list, so an excess field's initializer never runs.
-      if direct && !litShapeDropSrcExpr(cx) && objWidthPrefix(src, dst) {
-        return false
-      }
-      return objShapeAdaptNote(src, dst, cx, false, false)
+      return false
     }
-    return false
-  }
-  if s is TyArray {
-    if d is TyArray {
-      if cx >= 0 {
-        const ae = P.nodes[cx]
-        if ae is ArrayLit {
-          return objShapeListLitAdapts(ae, dst, d.aElem, depth, direct)
+    TyArray => {
+      match d {
+        TyArray => {
+          if cx >= 0 {
+            const ae = P.nodes[cx]
+            if ae is ArrayLit {
+              return objShapeListLitAdapts(ae, dst, d.aElem, depth, direct)
+            }
+          }
+          return objShapeListElemAdapts(src, dst, s, d, cx, depth)
         }
+        // a source pairs only with a destination of its own kind
+        TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
       }
-      return objShapeListElemAdapts(src, dst, s, d, cx, depth)
+      return false
     }
-    return false
-  }
-  if s is TyMap {
-    if d is TyMap { return objShapeMapPairAdapts(src, dst, s, d, cx, depth) }
-    return false
-  }
-  if s is TyFunc {
-    if d is TyFunc { return objShapeFuncPairAdapts(s, d, depth) }
-    return false
+    TyMap => {
+      match d {
+        TyMap => {
+          return objShapeMapPairAdapts(src, dst, s, d, cx, depth)
+        }
+        // a source pairs only with a destination of its own kind
+        TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {}
+      }
+      return false
+    }
+    TyFunc => {
+      match d {
+        TyFunc => {
+          return objShapeFuncPairAdapts(s, d, depth)
+        }
+        // a source pairs only with a destination of its own kind
+        TyPrim | TyErr | TyObj | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+      }
+      return false
+    }
+    // a union source returned above; no other source has an adapter
+    TyPrim | TyErr | TyUnion | TyNullable | TyVar | TyLit | TyNeg => {}
   }
   false
 }
@@ -3386,6 +3448,7 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
   let dtix = dstTy
   let peel = true
   while peel {
+    if dtix < 0 || dtix >= T.tys.length { return 0 }
     const dN = T.tys[dtix]
     if dN is TyNullable {
       if dN.nInner < 0 { return 0 }
@@ -3394,71 +3457,84 @@ export function recordRepTyAdopt(srcExpr: i32, dstTy: i32, depth: i32) {
       peel = false
     }
   }
+  if dtix >= T.tys.length { return 0 }
   const d = T.tys[dtix]
   const e = P.nodes[srcExpr]
-  if e is Paren {
-    recordRepTyAdopt(e.parInner, dtix, depth)
-    while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
-    nodeRepTyIx[srcExpr] = dtix
-    return 1
-  }
-  if e is ObjLit {
-    if d is TyObj {
-      const dfn = d.objFieldNames
-      const dft = d.objFieldTypes
-      let k = 0
-      while k < e.objFields.length {
-        const f = P.nodes[e.objFields[k]]
-        if f is FieldInit {
-          let j = 0
-          while j < dfn.length {
-            if dfn[j] == f.fiName {
-              recordRepTyAdopt(f.fiValue, dft[j], depth - 1)
+  match e {
+    Paren => {
+      recordRepTyAdopt(e.parInner, dtix, depth)
+      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+      nodeRepTyIx[srcExpr] = dtix
+      return 1
+    }
+    ObjLit => {
+      match d {
+        TyObj => {
+          const dfn = d.objFieldNames
+          const dft = d.objFieldTypes
+          let k = 0
+          while k < e.objFields.length {
+            const f = P.nodes[e.objFields[k]]
+            if f is FieldInit {
+              let j = 0
+              while j < dfn.length {
+                if dfn[j] == f.fiName {
+                  recordRepTyAdopt(f.fiValue, dft[j], depth - 1)
+                }
+                j = j + 1
+              }
             }
-            j = j + 1
+            k = k + 1
           }
+          while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+          nodeRepTyIx[srcExpr] = dtix
+          return 1
         }
-        k = k + 1
-      }
-      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
-      nodeRepTyIx[srcExpr] = dtix
-      return 1
-    }
-    // An `ObjLit` whose destination is a union: recurse against the first member whose
-    // field-name set corresponds and that the literal's own type fits, else the first whose
-    // names correspond — arms may share every field name and differ in a field's type.
-    if d is TyUnion {
-      const am = objLitUnionArm(e, nodeTyIxOf(srcExpr), d.uMembers)
-      if am >= 0 { return recordRepTyAdopt(srcExpr, am, depth) }
-      return 0
-    }
-    return 0
-  }
-  if e is ArrayLit {
-    if d is TyArray {
-      let i = 0
-      while i < e.arrElems.length {
-        recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
-        i = i + 1
-      }
-      while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
-      nodeRepTyIx[srcExpr] = dtix
-      return 1
-    }
-    // An array literal boxed into a union arm — recurse against the first array member.
-    if d is TyUnion {
-      const members = d.uMembers
-      let mi = 0
-      while mi < members.length {
-        const mt = T.tys[members[mi]]
-        if mt is TyArray {
-          return recordRepTyAdopt(srcExpr, members[mi], depth)
+        // An `ObjLit` whose destination is a union: recurse against the first member whose
+        // field-name set corresponds and that the literal's own type fits, else the first whose
+        // names correspond — arms may share every field name and differ in a field's type.
+        TyUnion => {
+          const am = objLitUnionArm(e, nodeTyIxOf(srcExpr), d.uMembers)
+          if am >= 0 { return recordRepTyAdopt(srcExpr, am, depth) }
+          return 0
         }
-        mi = mi + 1
+        // no other destination adopts an object literal
+        TyPrim | TyErr | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
       }
       return 0
     }
-    return 0
+    ArrayLit => {
+      match d {
+        TyArray => {
+          let i = 0
+          while i < e.arrElems.length {
+            recordRepTyAdopt(e.arrElems[i], d.aElem, depth - 1)
+            i = i + 1
+          }
+          while nodeRepTyIx.length <= srcExpr { nodeRepTyIx.push(-1) }
+          nodeRepTyIx[srcExpr] = dtix
+          return 1
+        }
+        // An array literal boxed into a union arm — recurse against the first array member.
+        TyUnion => {
+          const members = d.uMembers
+          let mi = 0
+          while mi < members.length {
+            const mt = T.tys[members[mi]]
+            if mt is TyArray {
+              return recordRepTyAdopt(srcExpr, members[mi], depth)
+            }
+            mi = mi + 1
+          }
+          return 0
+        }
+        // no other destination adopts an array literal
+        TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
+      }
+      return 0
+    }
+    // no other source is a literal shape to stamp
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }

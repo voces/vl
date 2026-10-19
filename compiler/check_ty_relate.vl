@@ -112,11 +112,27 @@ export type EqCore = "none"
 // `i32 → f32` and `i64 → f64` are rejected as lossy, as is every narrowing and float-to-integer.
 export function numWidensName(sn: PrimName | null, dn: PrimName | null) {
   if sn == dn { return false }
-  if sn == "i32" {
-    if dn == "i64" || dn == "f64" { return true }
-  }
-  if sn == "f32" {
-    if dn == "f64" { return true }
+  match sn {
+    "i32" => {
+      match dn {
+        "i64" | "f64" => {
+          return true
+        }
+        // every other destination is lossy or not numeric
+        "i32" | "f32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" | null => {}
+      }
+    }
+    "f32" => {
+      match dn {
+        "f64" => {
+          return true
+        }
+        // every other destination is lossy or not numeric
+        "i32" | "i64" | "f32" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" | null => {}
+      }
+    }
+    // no other source widens
+    "i64" | "f64" | "boolean" | "string" | "void" | "null" | "never" | "u8" | "v128" | null => {}
   }
   false
 }
@@ -286,59 +302,73 @@ function joinStoreTy(ty: i32): i32 {
 function isEquatable(ty: i32, seen: i32[]) {
   if ty < 0 { return true }
   const t = T.tys[ty]
-  if t is TyPrim {
-    // Every scalar primitive (incl. string, bool) is value-comparable; `void`/`null`
-    // never reach a structural compare (a nullness test short-circuits earlier).
-    return true
-  }
-  if t is TyErr { return true }
-  if t is TyVar { return true }
-  if t is TyFunc { return true }
-  if t is TyArray { return isEquatable(t.aElem, seen) }
-  if t is TyObj {
-    let si = 0
-    while si < seen.length {
-      if seen[si] == ty { return true }
-      si = si + 1
+  match t {
+    TyPrim => {
+      // Every scalar primitive (incl. string, bool) is value-comparable; `void`/`null`
+      // never reach a structural compare (a nullness test short-circuits earlier).
+      return true
     }
-    seen.push(ty)
-    const ftys = t.objFieldTypes
-    let i = 0
-    let ok = true
-    while i < ftys.length {
-      if !isEquatable(ftys[i], seen) { ok = false }
-      i = i + 1
+    TyErr => {
+      return true
     }
-    seen.pop()
-    return ok
+    TyVar => {
+      return true
+    }
+    TyFunc => {
+      return true
+    }
+    TyArray => {
+      return isEquatable(t.aElem, seen)
+    }
+    TyObj => {
+      let si = 0
+      while si < seen.length {
+        if seen[si] == ty { return true }
+        si = si + 1
+      }
+      seen.push(ty)
+      const ftys = t.objFieldTypes
+      let i = 0
+      let ok = true
+      while i < ftys.length {
+        if !isEquatable(ftys[i], seen) { ok = false }
+        i = i + 1
+      }
+      seen.pop()
+      return ok
+    }
+    // A literal union is value-comparable: `type K = "a" | "b"` reps as one interned i32 atom
+    // and `type N = 1 | 2` as its base scalar — a single cell with nothing to be
+    // non-comparable about (D45). Narrower than the `+` home's predicate, which also accepts
+    // a mixed-base union (a value-union box, not one cell). An i32-sentinel nullable is value-comparable the same way (D101).
+    TyNullable => {
+      if tyIsI32SentinelNullable(ty) { return true }
+      // Every other `T | null` is comparable exactly when `T` is: `null == null` is true,
+      // one-sided null is false, otherwise it is `T`'s own compare — nothing needs
+      // discriminating first. A genuinely undefined inner still refuses through the
+      // recursion: a map, a struct union, a mixed-base union (D1180).
+      return isEquatable(t.nInner, seen)
+    }
+    // The emitter-capability half is separate: `eqCmpKindOfArrayElem` decides whether a list
+    // of these has a compare core (an i64/f64-based numeric union has none). This gate
+    // answers only the soundness question.
+    TyUnion => {
+      if tyUnionIsOneLitCell(ty) { return true }
+      // The expanded sentinel spelling — `"a" | "b" | null` written inline or through an
+      // alias is a `TyUnion` with a null member rather than a `TyNullable`, and it is the
+      // same one i32 cell. An un-annotated `["a", null]` is not this shape (it infers as
+      // `string | null`, the ref niche).
+      if tyIsI32SentinelNullable(ty) { return true }
+    }
+    // A single literal type (`type S = "a"`) reps as its base scalar, so it is
+    // value-comparable for the same reason its union is, and cannot be mixed-base since it
+    // has one member.
+    TyLit => {
+      return true
+    }
+    // a map or a negation is not value-comparable
+    TyMap | TyNeg => {}
   }
-  // A literal union is value-comparable: `type K = "a" | "b"` reps as one interned i32 atom
-  // and `type N = 1 | 2` as its base scalar — a single cell with nothing to be
-  // non-comparable about (D45). Narrower than the `+` home's predicate, which also accepts
-  // a mixed-base union (a value-union box, not one cell). An i32-sentinel nullable is value-comparable the same way (D101).
-  if t is TyNullable {
-    if tyIsI32SentinelNullable(ty) { return true }
-    // Every other `T | null` is comparable exactly when `T` is: `null == null` is true,
-    // one-sided null is false, otherwise it is `T`'s own compare — nothing needs
-    // discriminating first. A genuinely undefined inner still refuses through the
-    // recursion: a map, a struct union, a mixed-base union (D1180).
-    return isEquatable(t.nInner, seen)
-  }
-  // The emitter-capability half is separate: `eqCmpKindOfArrayElem` decides whether a list
-  // of these has a compare core (an i64/f64-based numeric union has none). This gate
-  // answers only the soundness question.
-  if t is TyUnion {
-    if tyUnionIsOneLitCell(ty) { return true }
-    // The expanded sentinel spelling — `"a" | "b" | null` written inline or through an
-    // alias is a `TyUnion` with a null member rather than a `TyNullable`, and it is the
-    // same one i32 cell. An un-annotated `["a", null]` is not this shape (it infers as
-    // `string | null`, the ref niche).
-    if tyIsI32SentinelNullable(ty) { return true }
-  }
-  // A single literal type (`type S = "a"`) reps as its base scalar, so it is
-  // value-comparable for the same reason its union is, and cannot be mixed-base since it
-  // has one member.
-  if t is TyLit { return true }
   // TyUnion / TyNullable / TyMap: not structurally value-comparable.
   false
 }
@@ -414,25 +444,33 @@ const eqFlatPath: i32[] = []
 function eqStructFieldFlatTy(ty: i32, depth: i32): boolean {
   if ty < 0 { return false }
   const t = T.tys[ty]
-  if t is TyPrim {
-    if t.primName == "i32" { return true }
-    if t.primName == "boolean" { return true }
-    if t.primName == "f64" { return true }
-    if t.primName == "i64" { return true }
-    if t.primName == "f32" { return true }
-    if t.primName == "string" { return true }
-    return false
-  }
-  if t is TyUnion { return tyLitUnionIsI32Backed(ty) }
-  if t is TyObj { return eqStructElemFlatTy(ty, depth) }
-  if t is TyArray {
-    const el = t.aElem
-    if el < 0 { return false }
-    const et = T.tys[el]
-    if et is TyObj { return eqStructElemFlatTy(el, depth + 1) }
-    if et is TyArray { return false }
-    const k = eqCmpKindOfArrayElem(el)
-    return k == "list" || k == "strlist" || k == "glist"
+  match t {
+    TyPrim => {
+      if t.primName == "i32" { return true }
+      if t.primName == "boolean" { return true }
+      if t.primName == "f64" { return true }
+      if t.primName == "i64" { return true }
+      if t.primName == "f32" { return true }
+      if t.primName == "string" { return true }
+      return false
+    }
+    TyUnion => {
+      return tyLitUnionIsI32Backed(ty)
+    }
+    TyObj => {
+      return eqStructElemFlatTy(ty, depth)
+    }
+    TyArray => {
+      const el = t.aElem
+      if el < 0 { return false }
+      const et = T.tys[el]
+      if et is TyObj { return eqStructElemFlatTy(el, depth + 1) }
+      if et is TyArray { return false }
+      const k = eqCmpKindOfArrayElem(el)
+      return k == "list" || k == "strlist" || k == "glist"
+    }
+    // no other field type is flat
+    TyErr | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
   }
   false
 }
@@ -440,85 +478,93 @@ function eqStructFieldFlatTy(ty: i32, depth: i32): boolean {
 function eqCmpKindOfArrayElem(elem: i32): EqCmpKind {
   if elem < 0 { return "list" }
   const e = T.tys[elem]
-  if e is TyVar { return "" }
-  if e is TyErr { return "" }
-  if e is TyPrim {
-    if e.primName == "i32" { return "list" }
-    if e.primName == "boolean" { return "list" }
-    // `null[]` rides the i32 list with every element the same sentinel (D4671).
-    if e.primName == "null" { return "list" }
-    if e.primName == "string" { return "strlist" }
-    // The wide-scalar backings: `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of
-    // one scalar each, exactly as `i32[]` is — lacking only a core, since
-    // `emitListEqICore` is hard-wired to `i32.ne`. `emitListEqGCore` takes the wrapper,
-    // backing and opcode as arguments, so the element axis decides only with what (D751).
-    if e.primName == "f64" { return "glist" }
-    if e.primName == "i64" { return "glist" }
-    if e.primName == "f32" { return "glist" }
-    if e.primName == "u8" { return "glist" }
-    return "none"
-  }
-  if e is TyArray {
-    const ie = e.aElem
-    if ie < 0 { return "reflist" }
-    const i2 = T.tys[ie]
-    // A hole one hop down is unanswered, not refused — this arm answered "none" while the
-    // element arm one level up answers "" for the same `TyVar`, a false reject:
-    // `function eqT<T>(a: T[][], b: T[][])` at `T = i32` refused naming a type variable to a
-    // caller who wrote neither. "" defers to the pin, where the substituted type lives (D422).
-    if i2 is TyVar { return "" }
-    if i2 is TyErr { return "" }
-    if i2 is TyPrim {
-      if i2.primName == "i32" { return "reflist" }
-      if i2.primName == "boolean" { return "reflist" }
+  match e {
+    TyVar => {
+      return ""
     }
-    // `K[][]` is a ref list of i32 lists — the same shape `i32[][]` is, since the atom /
-    // i32-base backing makes the inner `K[]` that very list. Asked with the same two tests as `i32`/`boolean`.
-    if i2 is TyUnion {
-      if tyLitUnionIsI32Backed(ie) { return "reflist" }
-      // The expanded `("a" | "b" | null)[][]` spelling, whose inner element is a `TyUnion`
-      // with a null member rather than a `TyNullable`.
-      if tyIsI32SentinelNullable(ie) { return "reflist" }
+    TyErr => {
+      return ""
     }
-    // `(K | null)[][]` and `(boolean | null)[][]` are ref lists of i32 lists for the same
-    // reason `K[][]` is — the sentinel niche makes the inner list that very i32 list (D101).
-    if i2 is TyNullable {
-      if tyIsI32SentinelNullable(ie) { return "reflist" }
+    TyPrim => {
+      if e.primName == "i32" { return "list" }
+      if e.primName == "boolean" { return "list" }
+      // `null[]` rides the i32 list with every element the same sentinel (D4671).
+      if e.primName == "null" { return "list" }
+      if e.primName == "string" { return "strlist" }
+      // The wide-scalar backings: `f64[]`, `i64[]`, `f32[]` and `u8[]` are one wasm array of
+      // one scalar each, exactly as `i32[]` is — lacking only a core, since
+      // `emitListEqICore` is hard-wired to `i32.ne`. `emitListEqGCore` takes the wrapper,
+      // backing and opcode as arguments, so the element axis decides only with what (D751).
+      if e.primName == "f64" { return "glist" }
+      if e.primName == "i64" { return "glist" }
+      if e.primName == "f32" { return "glist" }
+      if e.primName == "u8" { return "glist" }
+      return "none"
     }
-    // Every other nested list, by recursion: the arms above cover exactly the shapes
-    // `emitListEqRCore` happens to handle, a ref list whose element is an i32 list.
-    // Everything else nested answers "none" for no reason but that. Asked of `ie`, not of `e`:
-    // `e` here is the element `ie[]`, so what decides a list of `e` is whether `e` itself can be compared.
-    const inner = eqCmpKindOfArrayElem(ie)
-    if inner == "" { return "" }
-    if inner != "none" { return "glist" }
-    return "none"
-  }
-  // An i32-sentinel nullable element rides the same i32 list its base does (D101):
-  // `tyScalarBackedListKind` has answered `"list"` for `K[]`, `(K | null)[]` and
-  // `(boolean | null)[]` all along. The box- and ref-niche nullables stay "none". A struct
-  // element, field-wise, is the flat subset D752 answers.
-  if e is TyObj {
-    if eqStructElemFlatTy(elem, 0) { return "glist" }
-    return "none"
-  }
-  if e is TyNullable {
-    if tyIsI32SentinelNullable(elem) { return "list" }
-    return "none"
-  }
-  // A literal-union element rides the same i32 list `i32[]`/`boolean[]` do — a string union
-  // as its interned atom id, a numeric one as its base scalar — so `emitListEqICore` is its
-  // core (D45). Only the `i32` base rides that list; an `i64`/`f64` base rides its own
-  // wrapper with no core. No `f32` arm, and it is unreachable: `litBaseTy` never answers `f32`.
-  if e is TyUnion {
-    if tyLitUnionIsI32Backed(elem) { return "list" }
-    // The expanded `("a" | "b" | null)[]` spelling of the sentinel niche (D101).
-    if tyIsI32SentinelNullable(elem) { return "list" }
-    // A numeric literal union on a wide base reps as that base's list, and now has that
-    // base's core: `type F = 1.5 | 2.5` is one f64 cell per element and `F[]` is the f64
-    // list — the honest half stays, though: a mixed-base union is a value-union box, not one cell (D751).
-    if numLitUnionHasBase(elem) { return "glist" }
-    return "none"
+    TyArray => {
+      const ie = e.aElem
+      if ie < 0 { return "reflist" }
+      const i2 = T.tys[ie]
+      // A hole one hop down is unanswered, not refused — this arm answered "none" while the
+      // element arm one level up answers "" for the same `TyVar`, a false reject:
+      // `function eqT<T>(a: T[][], b: T[][])` at `T = i32` refused naming a type variable to a
+      // caller who wrote neither. "" defers to the pin, where the substituted type lives (D422).
+      if i2 is TyVar { return "" }
+      if i2 is TyErr { return "" }
+      if i2 is TyPrim {
+        if i2.primName == "i32" { return "reflist" }
+        if i2.primName == "boolean" { return "reflist" }
+      }
+      // `K[][]` is a ref list of i32 lists — the same shape `i32[][]` is, since the atom /
+      // i32-base backing makes the inner `K[]` that very list. Asked with the same two tests as `i32`/`boolean`.
+      if i2 is TyUnion {
+        if tyLitUnionIsI32Backed(ie) { return "reflist" }
+        // The expanded `("a" | "b" | null)[][]` spelling, whose inner element is a `TyUnion`
+        // with a null member rather than a `TyNullable`.
+        if tyIsI32SentinelNullable(ie) { return "reflist" }
+      }
+      // `(K | null)[][]` and `(boolean | null)[][]` are ref lists of i32 lists for the same
+      // reason `K[][]` is — the sentinel niche makes the inner list that very i32 list (D101).
+      if i2 is TyNullable {
+        if tyIsI32SentinelNullable(ie) { return "reflist" }
+      }
+      // Every other nested list, by recursion: the arms above cover exactly the shapes
+      // `emitListEqRCore` happens to handle, a ref list whose element is an i32 list.
+      // Everything else nested answers "none" for no reason but that. Asked of `ie`, not of `e`:
+      // `e` here is the element `ie[]`, so what decides a list of `e` is whether `e` itself can be compared.
+      const inner = eqCmpKindOfArrayElem(ie)
+      if inner == "" { return "" }
+      if inner != "none" { return "glist" }
+      return "none"
+    }
+    // An i32-sentinel nullable element rides the same i32 list its base does (D101):
+    // `tyScalarBackedListKind` has answered `"list"` for `K[]`, `(K | null)[]` and
+    // `(boolean | null)[]` all along. The box- and ref-niche nullables stay "none". A struct
+    // element, field-wise, is the flat subset D752 answers.
+    TyObj => {
+      if eqStructElemFlatTy(elem, 0) { return "glist" }
+      return "none"
+    }
+    TyNullable => {
+      if tyIsI32SentinelNullable(elem) { return "list" }
+      return "none"
+    }
+    // A literal-union element rides the same i32 list `i32[]`/`boolean[]` do — a string union
+    // as its interned atom id, a numeric one as its base scalar — so `emitListEqICore` is its
+    // core (D45). Only the `i32` base rides that list; an `i64`/`f64` base rides its own
+    // wrapper with no core. No `f32` arm, and it is unreachable: `litBaseTy` never answers `f32`.
+    TyUnion => {
+      if tyLitUnionIsI32Backed(elem) { return "list" }
+      // The expanded `("a" | "b" | null)[]` spelling of the sentinel niche (D101).
+      if tyIsI32SentinelNullable(elem) { return "list" }
+      // A numeric literal union on a wide base reps as that base's list, and now has that
+      // base's core: `type F = 1.5 | 2.5` is one f64 cell per element and `F[]` is the f64
+      // list — the honest half stays, though: a mixed-base union is a value-union box, not one cell (D751).
+      if numLitUnionHasBase(elem) { return "glist" }
+      return "none"
+    }
+    // a closure, map, literal or negation element has no list compare
+    TyFunc | TyMap | TyLit | TyNeg => {}
   }
   "none"
 }
@@ -1511,14 +1557,20 @@ function widenScanFinds(
   if chkTy == ty { return true }
   if cn == primNameOf(ty) { return true }
   const t = T.tys[ty]
-  if t is TyNullable { return widenScanFinds(cn, chkTy, t.nInner, depth - 1) }
-  if t is TyUnion {
-    const ms = t.uMembers
-    let i = 0
-    while i < ms.length {
-      if widenScanFinds(cn, chkTy, ms[i], depth - 1) { return true }
-      i = i + 1
+  match t {
+    TyNullable => {
+      return widenScanFinds(cn, chkTy, t.nInner, depth - 1)
     }
+    TyUnion => {
+      const ms = t.uMembers
+      let i = 0
+      while i < ms.length {
+        if widenScanFinds(cn, chkTy, ms[i], depth - 1) { return true }
+        i = i + 1
+      }
+    }
+    // no other type holds a member to scan
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   false
 }

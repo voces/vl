@@ -6,20 +6,42 @@ import {
   ArrayLit,
   AsExpr,
   BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
+  IsExpr,
   LetDecl,
   MatchExpr,
   Member,
   NullLit,
+  NumLit,
   ObjLit,
   OptMember,
   P,
+  Param,
+  Paren,
   Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   elseIfLink,
   nodeSpineChildren,
 } from "./ast"
@@ -697,6 +719,7 @@ function callIsIntegralFloatIntr(exprIx: i32, fnIx: i32): boolean {
   const e = P.nodes[unwrapParen(exprIx)]
   if !(e is Call) { return false }
   if e.callArgs.length != 1 { return false }
+  if e.callFn < 0 { return false }
   const callee = P.nodes[e.callFn]
   if !(callee is Ident) { return false }
   const nm = callee.identName
@@ -1618,92 +1641,96 @@ export function exprEmittedRefListSlot(exprIx: i32, fnIx: i32): i32 {
   const inner = unwrapParen(exprIx)
   if inner < 0 || inner >= P.nodes.length { return -1 }
   const e = P.nodes[inner]
-  if e is Ident {
-    const sl = declaredSlotOf(e.identName)
-    if sl >= 0 {
-      if declaredKind(e.identName) != "reflist" { return -1 }
-      if sl >= localStructIdx.length { return -1 }
-      return localStructIdx[sl]
+  match e {
+    Ident => {
+      const sl = declaredSlotOf(e.identName)
+      if sl >= 0 {
+        if declaredKind(e.identName) != "reflist" { return -1 }
+        if sl >= localStructIdx.length { return -1 }
+        return localStructIdx[sl]
+      }
+      const pn = paramRefArrayName(fnIx, e.identName)
+      if pn != "" && paramReadAt(fnIx, e.identName, inner) {
+        return rlSlotByName(pn)
+      }
+      // A closure's capture reads the row its env field is typed with (D3058).
+      const cs = capturedRefListSlot(fnIx, e.identName)
+      if cs >= 0 { return cs }
+      const g = globalLetOfIn(fnIx, e.identName, inner)
+      if g >= 0 {
+        if globalCellKind(g) != "reflist" { return -1 }
+        return globalRefListSlot(g)
+      }
     }
-    const pn = paramRefArrayName(fnIx, e.identName)
-    if pn != "" && paramReadAt(fnIx, e.identName, inner) {
-      return rlSlotByName(pn)
-    }
-    // A closure's capture reads the row its env field is typed with (D3058).
-    const cs = capturedRefListSlot(fnIx, e.identName)
-    if cs >= 0 { return cs }
-    const g = globalLetOfIn(fnIx, e.identName, inner)
-    if g >= 0 {
-      if globalCellKind(g) != "reflist" { return -1 }
-      return globalRefListSlot(g)
-    }
-  }
-  // A call result's row is the callee's own declared return, not the "spelling" this function
-  // otherwise refuses — a callee's return annotation is what its own emit is typed from. The
-  // same lookup (`rlSlotByName` off `fRetRArrElem`) the parameter arm above already trusts,
-  // for the identical reason: a param's row comes from its annotation too. D794.
-  if e is Call {
-    const callee = P.nodes[unwrapParen(e.callFn)]
-    if callee is Ident {
-      const cn = fnRetRefArrayNameSid(
-        sidOfNode(e.callFn),
-        callee.identName,
-        fnIx,
-        e.callFn,
-      )
-      if cn != "" { return rlSlotByName(cn) }
-    }
-    // A call through a function value returns at the row its function type's result keys.
-    const cft = nodeTyIxOf(e.callFn)
-    if cft >= 0 && cft < T.tys.length {
-      const cf = T.tys[cft]
-      if cf is TyFunc && cf.fnRet >= 0 && cf.fnRet < T.tys.length {
-        const crt = T.tys[cf.fnRet]
-        if crt is TyArray {
-          const crs = rlSlotOfTy(crt.aElem)
-          if crs >= 0 { return crs }
+    // A call result's row is the callee's own declared return, not the "spelling" this function
+    // otherwise refuses — a callee's return annotation is what its own emit is typed from. The
+    // same lookup (`rlSlotByName` off `fRetRArrElem`) the parameter arm above already trusts,
+    // for the identical reason: a param's row comes from its annotation too. D794.
+    Call => {
+      const callee = P.nodes[unwrapParen(e.callFn)]
+      if callee is Ident {
+        const cn = fnRetRefArrayNameSid(
+          sidOfNode(e.callFn),
+          callee.identName,
+          fnIx,
+          e.callFn,
+        )
+        if cn != "" { return rlSlotByName(cn) }
+      }
+      // A call through a function value returns at the row its function type's result keys.
+      const cft = nodeTyIxOf(e.callFn)
+      if cft >= 0 && cft < T.tys.length {
+        const cf = T.tys[cft]
+        if cf is TyFunc && cf.fnRet >= 0 && cf.fnRet < T.tys.length {
+          const crt = T.tys[cf.fnRet]
+          if crt is TyArray {
+            const crs = rlSlotOfTy(crt.aElem)
+            if crs >= 0 { return crs }
+          }
         }
       }
     }
-  }
-  // A field read's row is the struct table's, from the field's own storage slot — inlined here
-  // since `sFieldRefSlot` lives downstream in the emitter. A union-ARM receiver has no struct
-  // row, so its field's element is read off the variant tables first (D1963).
-  if e is Member {
-    const avi9 = memRecvArmVariantIndex(e.memObj, fnIx)
-    if avi9 >= 0 {
-      const en9 = variantFieldElemNameOr(avi9, e.memProp)
-      if en9 != "" { return rlSlotByName(en9) }
-    }
-    const msi = structIndexOfExpr(e.memObj, fnIx)
-    if msi >= 0 {
-      const mfi = sFieldIndex(msi, e.memProp)
-      if mfi >= 0 {
-        const mty = sFieldElemTyIxAt(msi, mfi)
-        const ma = rlSlotOfTy(mty)
-        if ma >= 0 { return ma }
-        return rlSlotByNameTy(sFieldElemNameAt(msi, mfi), mty)
+    // A field read's row is the struct table's, from the field's own storage slot — inlined here
+    // since `sFieldRefSlot` lives downstream in the emitter. A union-ARM receiver has no struct
+    // row, so its field's element is read off the variant tables first (D1963).
+    Member => {
+      const avi9 = memRecvArmVariantIndex(e.memObj, fnIx)
+      if avi9 >= 0 {
+        const en9 = variantFieldElemNameOr(avi9, e.memProp)
+        if en9 != "" { return rlSlotByName(en9) }
+      }
+      const msi = structIndexOfExpr(e.memObj, fnIx)
+      if msi >= 0 {
+        const mfi = sFieldIndex(msi, e.memProp)
+        if mfi >= 0 {
+          const mty = sFieldElemTyIxAt(msi, mfi)
+          const ma = rlSlotOfTy(mty)
+          if ma >= 0 { return ma }
+          return rlSlotByNameTy(sFieldElemNameAt(msi, mfi), mty)
+        }
       }
     }
-  }
-  // The `?.` twin of the field read above, resolved through the chain (D1676).
-  if e is OptMember {
-    const osi = optChainStructIdxOf(e.omObj, fnIx)
-    if osi >= 0 {
-      const ofi = sFieldIndex(osi, e.omProp)
-      if ofi >= 0 {
-        const oty = sFieldElemTyIxAt(osi, ofi)
-        const oa = rlSlotOfTy(oty)
-        if oa >= 0 { return oa }
-        return rlSlotByNameTy(sFieldElemNameAt(osi, ofi), oty)
+    // The `?.` twin of the field read above, resolved through the chain (D1676).
+    OptMember => {
+      const osi = optChainStructIdxOf(e.omObj, fnIx)
+      if osi >= 0 {
+        const ofi = sFieldIndex(osi, e.omProp)
+        if ofi >= 0 {
+          const oty = sFieldElemTyIxAt(osi, ofi)
+          const oa = rlSlotOfTy(oty)
+          if oa >= 0 { return oa }
+          return rlSlotByNameTy(sFieldElemNameAt(osi, ofi), oty)
+        }
       }
     }
-  }
-  // An indexed read's row is the outer list's element slot, read strictly (not clamped) since
-  // a bare-scalar array answering nothing must not fall back to a real, unrelated slot. D1500.
-  if e is Index {
-    const osl = refListSlotOfExprStrict(e.idxArr, fnIx)
-    if osl >= 0 { return rlElemInnerSlot(osl) }
+    // An indexed read's row is the outer list's element slot, read strictly (not clamped) since
+    // a bare-scalar array answering nothing must not fall back to a real, unrelated slot. D1500.
+    Index => {
+      const osl = refListSlotOfExprStrict(e.idxArr, fnIx)
+      if osl >= 0 { return rlElemInnerSlot(osl) }
+    }
+    // no other expression is emitted at a ref-list row
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }

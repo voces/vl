@@ -5,22 +5,45 @@
 
 import {
   ArrayLit,
+  AsExpr,
+  BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
   Node,
   NullLit,
   NumLit,
   ObjLit,
+  OptMember,
   P,
   Param,
   Paren,
+  Program,
+  RetStmt,
   Spread,
   StrLit,
+  TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
+  WhileStmt,
   addNode,
   adoptNodeTok,
   arenaSetNode,
@@ -328,9 +351,14 @@ import {
   TY_NULL,
   TY_VOID,
   TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
   TyVar,
   mkFuncTy,
@@ -979,21 +1007,53 @@ function assignableLitExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   // bare literal can match a literal-union field (`{tag: "circle", r: 5}` against
   // `{tag: "circle" | "square", r: i32}`).
   const e = P.nodes[srcExpr]
-  if e is Paren {
-    const pok = assignableExpr(e.parInner, srcTy, dstTy)
-    // A wrapping paren takes the f32 list its literal adopted, so both nodes read alike.
-    if pok && !inferQuiet && f32ListUnder(srcExpr, e.parInner) {
-      nodeTySet(srcExpr, nodeTyIxOf(e.parInner))
+  match e {
+    Paren => {
+      const pok = assignableExpr(e.parInner, srcTy, dstTy)
+      // A wrapping paren takes the f32 list its literal adopted, so both nodes read alike.
+      if pok && !inferQuiet && f32ListUnder(srcExpr, e.parInner) {
+        nodeTySet(srcExpr, nodeTyIxOf(e.parInner))
+      }
+      return pok
     }
-    return pok
-  }
-  if e is ObjLit {
-    const s = T.tys[srcTy]
-    if s is TyObj {
-      // A nullable struct target (`S | null`, or a `V?` map value) peels its wrapper so an object
-      // literal still adapts field-wise into the inner struct — the ObjLit dual of the ArrayLit
-      // peel below. The peel iterates: a nullable-value map slot stacks two wrappers, and a
-      // single unwrap leaves the literal against `S | null`.
+    ObjLit => {
+      const s = T.tys[srcTy]
+      if s is TyObj {
+        // A nullable struct target (`S | null`, or a `V?` map value) peels its wrapper so an object
+        // literal still adapts field-wise into the inner struct — the ObjLit dual of the ArrayLit
+        // peel below. The peel iterates: a nullable-value map slot stacks two wrappers, and a
+        // single unwrap leaves the literal against `S | null`.
+        let dtix = dstTy
+        let dPeel = true
+        while dPeel {
+          const dNW = T.tys[dtix]
+          if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
+        }
+        const d = T.tys[dtix]
+        match d {
+          TyObj => {
+            return assignableObjLitFields(srcExpr, srcTy, dstTy, e, s, dtix, d)
+          }
+          // A struct literal flowing into a union adopts the first struct arm it adapts into
+          // field-wise (`{f: 97.5}` into `{f: f32} | {w: i32}`). The emitter already boxes a struct
+          // literal into a union slot at a direct binding; this is the checker seam that lets a
+          // widening field reach that same rep. The concrete arm is recorded on the literal node.
+          TyUnion => {
+            return assignableObjLitUnion(srcExpr, srcTy, dstTy, e)
+          }
+          // no other target adapts an object literal
+          TyPrim | TyErr | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+        }
+      }
+    }
+    // An array literal checks element-wise against the target's element type, so a bare element
+    // adapts exactly as it would at a binding — the array analogue of the ObjLit recursion above.
+    // This subsumes the scalar float-literal into `f32[]` rule at any element type and nesting
+    // depth. An empty `[]` fits any element; a non-literal element still rejects a lossy demote.
+    ArrayLit => {
+      // A map value or niche slot is `V?` (`{[string]: f32[]}` seeds `f32[]?`) — peel the nullable
+      // wrappers so a literal array still adapts into the inner element type; a nullable-value map
+      // slot stacks two, so the peel iterates like the ObjLit one above.
       let dtix = dstTy
       let dPeel = true
       while dPeel {
@@ -1001,39 +1061,23 @@ function assignableLitExpr(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
         if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
       }
       const d = T.tys[dtix]
-      if d is TyObj {
-        return assignableObjLitFields(srcExpr, srcTy, dstTy, e, s, dtix, d)
+      match d {
+        TyArray => {
+          return assignableArrLitElems(srcExpr, srcTy, dstTy, e, dtix, d)
+        }
+        // An array literal flowing into a union adopts the first array arm it adapts into
+        // element-wise (`["a"]` into `K0[] | {w: i32}`, `[1.5]` into `f32[] | i64`) — the array dual
+        // of the ObjLit union-arm adoption above. The concrete arm is recorded on the literal node so
+        // the emitter classifies the list with the arm's element rep, not the literal's softened one.
+        TyUnion => {
+          return assignableArrLitUnion(srcExpr, srcTy, d)
+        }
+        // no other target adapts an array literal
+        TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
       }
-      // A struct literal flowing into a union adopts the first struct arm it adapts into
-      // field-wise (`{f: 97.5}` into `{f: f32} | {w: i32}`). The emitter already boxes a struct
-      // literal into a union slot at a direct binding; this is the checker seam that lets a
-      // widening field reach that same rep. The concrete arm is recorded on the literal node.
-      if d is TyUnion { return assignableObjLitUnion(srcExpr, srcTy, dstTy, e) }
     }
-  }
-  // An array literal checks element-wise against the target's element type, so a bare element
-  // adapts exactly as it would at a binding — the array analogue of the ObjLit recursion above.
-  // This subsumes the scalar float-literal into `f32[]` rule at any element type and nesting
-  // depth. An empty `[]` fits any element; a non-literal element still rejects a lossy demote.
-  if e is ArrayLit {
-    // A map value or niche slot is `V?` (`{[string]: f32[]}` seeds `f32[]?`) — peel the nullable
-    // wrappers so a literal array still adapts into the inner element type; a nullable-value map
-    // slot stacks two, so the peel iterates like the ObjLit one above.
-    let dtix = dstTy
-    let dPeel = true
-    while dPeel {
-      const dNW = T.tys[dtix]
-      if dNW is TyNullable { dtix = dNW.nInner } else { dPeel = false }
-    }
-    const d = T.tys[dtix]
-    if d is TyArray {
-      return assignableArrLitElems(srcExpr, srcTy, dstTy, e, dtix, d)
-    }
-    // An array literal flowing into a union adopts the first array arm it adapts into
-    // element-wise (`["a"]` into `K0[] | {w: i32}`, `[1.5]` into `f32[] | i64`) — the array dual
-    // of the ObjLit union-arm adoption above. The concrete arm is recorded on the literal node so
-    // the emitter classifies the list with the arm's element rep, not the literal's softened one.
-    if d is TyUnion { return assignableArrLitUnion(srcExpr, srcTy, d) }
+    // no other expression has a literal rule
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -2280,6 +2324,7 @@ export function monoRecheckBegin(
   if declIx < 0 { return null }
   const dn = P.nodes[declIx]
   if !(dn is FuncDecl) { return null }
+  if dn.fnBody < 0 { return null }
   const body = P.nodes[dn.fnBody]
   if !(body is Block) { return null }
   if prbArmed { prbEnter() }
