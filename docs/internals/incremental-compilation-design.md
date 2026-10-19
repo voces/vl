@@ -1866,6 +1866,77 @@ and 108,646,351,087 for this step's seed on this step's source (−0.95%). Maste
 step's source reads 108,646,351,013, so the change in fuel comes from the source, and the
 unarmed path runs none of the new code.
 
+**S5 step 12: `interface` banks the questions a check asked, not the bodies it could reach**
+(`skAsksNow`, `skWriterMoved`, `skQsNow` and `skQsMoved` in `compiler/driver.vl`; `crAskProg`
+and `crAskDecl` in `compiler/check_capture_rows.vl`; `ihWriterDigests` in
+`compiler/iface_hash.vl`).
+
+*What a served module reads of S.* The interface hash folded in the bodies a served module's
+calls could reach (the callee and live channels). Read from the checker, a served module's
+diagnostics depend on those bodies through two kinds of question only, and the check now
+records both:
+- **a whole-program question about a name** (`crAskProg`): does anything write it (`w`), does
+  a statement name it (`e`), is it a top-level `let` (`o`). Its answer moves with the name's
+  writer closure, its naming statements and the top-level statements (`ihWriterDigests`).
+- **a write question about a declaration** (`crAskDecl`): what a function writes, through
+  which parameter, and what it captures free. The bank keeps each question with its answer,
+  keyed by the declaration's statement key (`skDeclKeys`).
+
+The reach is now quiet-only: a body edit that no question asked about leaves the hash alone.
+
+*The rules.* All three decline, at the stage named:
+- **Writer, stage 0** (mask 16, reason `writer`): a banked whole-program question about a name
+  declared in S has a writer digest that moved.
+- **Effect, stage 1** (mask 2048, reason `interface`): a question a served module asked about a
+  declaration in S answers differently from S's check, or its declaration's module is unknown.
+- **Writer, stage 1** (mask 16, reason `writer`): a whole-program question S's check asked has
+  a served statement in its writer closure. An S-only check cannot see that statement.
+
+*Witnesses.*
+
+| question | must serve | must decline | mask witness |
+| --- | --- | --- | --- |
+| a served call's writes | "a callee main narrows across keeps its writes"; "… keeps writing nothing" | "a callee's write moves to the narrowed field", with the helper and alias twins | 2048 |
+| writer closure, banked | "a private lib lambda keeps writing nothing main narrows" | "a private lib lambda starts writing a binding main narrows" (D6780) | 16 |
+| writer closure, asked by S | "lib starts narrowing a binding no served function writes" | "lib starts narrowing a binding a served escaping function writes" (D6781) | 16 |
+
+- D6780 and D6781 were unsound serves on master, found while ablating the `interface` declines.
+- "a callee main narrows across starts writing the binding" and "a callee starts calling a
+  writer" now decline `writer`. "a lib call starts delivering a fresh builder to a wider
+  record" now serves: lib's own delivery refuses, and main's read of `mk` keeps its type.
+
+*Differential suite*: 86 edits. 35 must serve, 48 must decline, and 3 may do either (step 11:
+30, 47 and 3).
+
+*Replays.* All runs are 0 unsound. Same graphs and windows as step 11; the compiler rows ran one
+seed at a time.
+
+| graph | master's seed | this step |
+| --- | --- | --- |
+| diderven `src/game.vl` | 1 served, 14 ambient, 5 all, 10 graph | 1 served, 14 ambient, 5 all, 10 graph |
+| decline ratio | 1.18 | 1.19 |
+| `compiler/entry.vl` | 7 interface, 20 ambient, 2 all, 1 graph | 1 served, 6 interface, 20 ambient, 2 all, 1 graph |
+| decline ratio | 1.43 (stage 0 1.31, stage 1 1.74) | 1.56 (stage 0 1.42, stage 1 2.07) |
+
+- **The compiler graph serves e66b664d1** (28 modules served). Its 6 remaining `interface`
+  declines are all the effect rule. An S-only settle answers a write question differently from
+  the whole check, because a served module's dispatch writes S's globals, and the summary S
+  computes alone lacks those writes. That needs S's answers, so no stage-0 rule can decide
+  it. Under mask 2048 all 7 serve at 0 unsound on this window; the suite's 2048 witnesses are
+  what the rule defends.
+- **No decline moved to stage 0, and the ratio did not fall.** The held writer rule was
+  already at stage 0. The stage-1 ratio rises because every effect decline now runs S's
+  check first. The box was shared, and identical runs move by about 0.1.
+- **`ambient` stays.** With NAME keys dropped (1048576), the compiler reads 8 interface and 18
+  ambient, and diderven 5 interface and 9 ambient. With FIELDS keys dropped (524288), the
+  compiler reads 15 interface and 11 ambient, and diderven is unchanged. No commit is served
+  under either mask, so narrowing `ambient` serves nothing until the effect rule does.
+
+*Cost.* The seed grows by 37,664 bytes over master's at cbd8ffec5 (+0.60%). The L2
+self-compile fuel is 108,197,779,443 for master's seed on master's source, and 110,332,419,163
+for this step's seed on this step's source (+1.97%). Master's seed on this step's source reads
+110,331,300,457, so the rise comes with the source.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.

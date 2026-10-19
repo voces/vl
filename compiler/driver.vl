@@ -29,7 +29,9 @@ import {
   fsReset,
   fsSetMode,
 } from "./fn_split"
-import { modIdAssign, modIdReset, modSuffixOf } from "./modid"
+import { modIdAssign, modIdReset, modIxOfId, modSuffixOf } from "./modid"
+import { crAskAnswer } from "./check_call_retire"
+import { crAskArm, crAskHold, crAskKeys, crAskQs } from "./check_capture_rows"
 import {
   parseImageArmed,
   parseImageBegin,
@@ -289,7 +291,10 @@ import {
   ihPosHash,
   ihReachOf,
   ihSourceName,
+  ihStKeysOf,
+  ihTextSetHash,
   ihTokDigests,
+  ihWriterDigests,
 } from "./iface_hash"
 // The identifier-intern table (`docs/internals/identifier-interning-design.md`). The
 // driver owns two obligations: the per-compile reset (the carrier is keyed by arena
@@ -5084,6 +5089,7 @@ function modCompile(emit: i32): i32 {
   csPreMintLocs()
   expInfSetEntryStd(entryIsStdModule())
   recDelivArm(banking)
+  crAskArm(banking)
   checkProgram(merged)
   if ifaceHashArmed() { ihFinish() }
   checkMemSharedOrigin()
@@ -5131,6 +5137,7 @@ const SK_PASS = 9
 const SK_AMBIENT = 10
 const SK_FRESH = 11
 const SK_DECOR = 12
+const SK_WRITER = 13
 const SK_RERUN = 99
 const SK_READINGS = 9
 let skArmed = false
@@ -5153,6 +5160,13 @@ let skReach: {[string]: i32} = Map()
 // its own, and 4 when one's judgement read its site count. `skOcc` is `ihOccDigests` of those values over every module.
 let skDeliv: {[string]: {[string]: i32}} = Map()
 let skOcc: {[string]: i32} = Map()
+// Each name a whole-program question asked about, as its kind letter and builder key (`crAskProg`),
+// unioned over the checks since a whole one, and `ihWriterDigests` of those names.
+let skAsk: string[] = []
+let skWr: {[string]: i32} = Map()
+// Each write question a summary answered (`crAskQs`), with its answer (`crAskAnswer`), unioned
+// like `skAsk`.
+let skQs: SkQ[] = []
 let skMask = 0
 let skPlus: {[i32]: i32}[] = []
 let skStrIdx: {[i32]: i32}[] = []
@@ -5181,6 +5195,9 @@ type SkBank = {
   bReach: {[string]: i32},
   bDeliv: {[string]: {[string]: i32}},
   bOcc: {[string]: i32},
+  bAsk: string[],
+  bWr: {[string]: i32},
+  bQs: SkQ[],
   bMask: i32,
   bPlus: {[i32]: i32}[],
   bStrIdx: {[i32]: i32}[],
@@ -5224,6 +5241,9 @@ function skSelect(): i32 {
         bReach: skReach,
         bDeliv: skDeliv,
         bOcc: skOcc,
+        bAsk: skAsk,
+        bWr: skWr,
+        bQs: skQs,
         bMask: skMask,
         bPlus: skPlus,
         bStrIdx: skStrIdx,
@@ -5252,6 +5272,9 @@ function skSelect(): i32 {
       skReach = b.bReach
       skDeliv = b.bDeliv
       skOcc = b.bOcc
+      skAsk = b.bAsk
+      skWr = b.bWr
+      skQs = b.bQs
       skMask = b.bMask
       skPlus = b.bPlus
       skStrIdx = b.bStrIdx
@@ -5408,6 +5431,10 @@ const SK_NO_KEPT_CALL = 536870912
 const SK_NO_FRESH_BODY = 65536
 const SK_NO_FRESH_OCC = 1073741824
 const SK_NO_FRESH_SPLIT = -2147483648
+// Shared with the interface hash's mentions bit: the writer-closure guard (`skWriterMoved`).
+const SK_NO_WRITER = 16
+// Mask bit: the bodies a served module's call may run are not compared (shares IH_NO_CALLEES).
+const SK_NO_EFFECT = 2048
 const SK_KEPT = 1
 const SK_OWN = 2
 const SK_UNATTRIBUTED = "?"
@@ -5564,6 +5591,7 @@ function skEarly(inS: boolean[], tokEnd: i32): boolean {
   if skAmbMoved > 0 { return skDecline(SK_AMBIENT) }
   if !resolved { return skDecline(SK_IFACE) }
   if skFreshBanked(inS) { return skDecline(SK_FRESH) }
+  if skWriterMoved(inS, skAsk, true) { return skDecline(SK_WRITER) }
   // A served diagnostic may name S's declarations, and cite S's positions unless relocatable.
   let banked = false
   let cites = false
@@ -5650,6 +5678,279 @@ function skFreshBanked(inS: boolean[]): boolean {
         }
         m = m + 1
       }
+    }
+  }
+  false
+}
+
+// The builder key of merged top-level name `name` (`modKeys[m] + "\n" + source name`), or ""
+// for a name no module suffix marks.
+function skOriginKey(name: string): string {
+  const src = ihSourceName(name)
+  if src == name || name.length <= src.length + 2 { return "" }
+  const digits = name.slice(src.length + 2, name.length)
+  let i = 0
+  while i < digits.length {
+    if digits[i] < '0' || digits[i] > '9' { return "" }
+    i = i + 1
+  }
+  const m = modIxOfId(digits)
+  if m < 0 || m >= modKeys.length { return "" }
+  modKeys[m] + "\n" + src
+}
+
+// This check's asks (`crAskKeys`) as kind letter plus builder key, each once, after `held`.
+function skAsksNow(held: string[]): string[] {
+  const out: string[] = []
+  const seen: {[string]: boolean} = Map()
+  for a in held {
+    if !seen.has(a) {
+      seen[a] = true
+      out.push(a)
+    }
+  }
+  for a in crAskKeys {
+    const key = skOriginKey(a.slice(1, a.length))
+    if key != "" {
+      const k = a.slice(0, 1) + key
+      if !seen.has(k) {
+        seen[k] = true
+        out.push(k)
+      }
+    }
+  }
+  out
+}
+
+// A write question: the module of the statement that asked ("" for none), the declaration's
+// key (`skDeclKeys`), the kind and parameter, and the answer ("!" for none to compare).
+type SkQ = { qAsk: string, qDecl: string, qKind: i32, qP: i32, qAns: string }
+
+type SkDecls = { byFn: {[i32]: string}, byKey: {[string]: i32} }
+
+function skQKey(q: SkQ): string {
+  q.qDecl + "\t" + i32ToStr(q.qKind) + "\t" + i32ToStr(q.qP)
+}
+
+// The module key a statement or declaration key starts with, past a "!".
+function skKeyMod(key: string): string {
+  let k = key
+  if k.slice(0, 1) == "!" { k = k.slice(1, k.length) }
+  const nl = k.indexOf("\n")
+  if nl < 0 { return k }
+  k.slice(0, nl)
+}
+
+// Each function declaration's key: its statement's (`ihStKeysOf`), its rank among that
+// statement's functions from the last, and its rank among the nodes sharing its token. A key
+// behind "!", or of a statement with no name, does not name one declaration.
+function skDeclKeys(): SkDecls {
+  const fnAt: {[i32]: i32[]} = Map()
+  let n = 0
+  while n < P.nodes.length && n < nodeToks.length {
+    const t = nodeToks[n]
+    if t >= 0 {
+      const nd = P.nodes[n]
+      if nd is FuncDecl {
+        const row = fnAt[t] ?? []
+        row.push(n)
+        fnAt[t] = row
+      }
+    }
+    n = n + 1
+  }
+  const toks: i32[] = []
+  let t = P.toks.length - 1
+  while t >= 0 {
+    if fnAt.has(t) { toks.push(t) }
+    t = t - 1
+  }
+  const keys = ihStKeysOf(toks)
+  const rank: {[string]: i32} = Map()
+  const out: SkDecls = { byFn: Map(), byKey: Map() }
+  let k = 0
+  while k < toks.length && k < keys.length {
+    const r = rank[keys[k]] ?? 0
+    rank[keys[k]] = r + 1
+    const row = fnAt[toks[k]] ?? []
+    let c = 0
+    while c < row.length {
+      const key = keys[k] + "\n" + i32ToStr(r) + "\n" + i32ToStr(c)
+      out.byFn[row[c]] = key
+      out.byKey[key] = row[c]
+      c = c + 1
+    }
+    k = k + 1
+  }
+  out
+}
+
+// Whether a declaration key names no one declaration: empty, behind "!", or of a nameless statement.
+function skDeclUnnamed(key: string): boolean {
+  if key == "" || key.slice(0, 1) == "!" { return true }
+  const pfx = skKeyMod(key) + "\n\n"
+  key.slice(0, pfx.length) == pfx
+}
+
+// The answer to `q` now, or "!" when its key names no one declaration.
+function skQAnswer(q: SkQ, dks: SkDecls): string {
+  if skDeclUnnamed(q.qDecl) { return "!" }
+  const fn = dks.byKey[q.qDecl] ?? -1
+  if fn < 0 { return "!" }
+  const a = crAskAnswer(q.qKind, fn, q.qP)
+  if a.length < 2 { return a[0] }
+  a[0] + i32ToStr(ihTextSetHash(a.slice(1, a.length)))
+}
+
+// The banked questions of the modules this check served (`keep` false), then its own, each
+// answered again when its declaration's module is checked and otherwise as banked.
+function skQsNow(keep: boolean[]): SkQ[] {
+  const dks = skDeclKeys()
+  const held: {[string]: string} = Map()
+  const asked: SkQ[] = []
+  const seen: {[string]: boolean} = Map()
+  if keep.length > 0 {
+    for q in skQs {
+      held[skQKey(q)] = q.qAns
+      const am = modIndexOfKey(q.qAsk)
+      const k = q.qAsk + "\t" + skQKey(q)
+      if (am < 0 || !keep[am]) && !seen.has(k) {
+        seen[k] = true
+        asked.push(q)
+      }
+    }
+  }
+  const qs = crAskQs
+  const at: i32[] = []
+  let j = 0
+  while j + 3 < qs.length {
+    at.push(qs[j])
+    j = j + 4
+  }
+  const askers = ihStKeysOf(at)
+  j = 0
+  let w = 0
+  while j + 3 < qs.length && w < askers.length {
+    const q: SkQ = {
+      qAsk: skKeyMod(askers[w]),
+      qDecl: dks.byFn[qs[j + 2]] ?? "",
+      qKind: qs[j + 1],
+      qP: qs[j + 3],
+      qAns: "!",
+    }
+    const k = q.qAsk + "\t" + skQKey(q)
+    if !seen.has(k) {
+      seen[k] = true
+      asked.push(q)
+    }
+    j = j + 4
+    w = w + 1
+  }
+  crAskHold(true)
+  const ans: {[string]: string} = Map()
+  const out: SkQ[] = []
+  for q in asked {
+    const qk = skQKey(q)
+    if !ans.has(qk) {
+      const dm = modIndexOfKey(skKeyMod(q.qDecl))
+      if keep.length == 0 || (dm >= 0 && dm < keep.length && keep[dm]) {
+        ans[qk] = skQAnswer(q, dks)
+      } else {
+        ans[qk] = held[qk] ?? "!"
+      }
+    }
+    out.push(
+      {
+        qAsk: q.qAsk,
+        qDecl: q.qDecl,
+        qKind: q.qKind,
+        qP: q.qP,
+        qAns: ans[qk] ?? "!",
+      },
+    )
+  }
+  crAskHold(false)
+  out
+}
+
+// Whether a question a served module asked of a declaration in S answers differently now; one
+// whose declaration's module is unknown always does.
+function skQsMoved(inS: boolean[]): boolean {
+  const dks = skDeclKeys()
+  const done: {[string]: boolean} = Map()
+  let moved = false
+  crAskHold(true)
+  for q in skQs {
+    const am = modIndexOfKey(q.qAsk)
+    const dm = modIndexOfKey(skKeyMod(q.qDecl))
+    const asks = am < 0 || am >= inS.length || !inS[am]
+    const reads = dm < 0 || dm >= inS.length || inS[dm]
+    const qk = skQKey(q)
+    if !moved && asks && reads && !done.has(qk) {
+      done[qk] = true
+      if q.qAns == "!" || skQAnswer(q, dks) != q.qAns { moved = true }
+    }
+  }
+  crAskHold(false)
+  moved
+}
+
+// Whether a whole-program question about a name declared in S may answer differently once
+// served modules join (D6780, D6781). With `held` the asks are banked, and a served module that
+// names the name may have asked: its answer moves with the name's writer closure, uses, or the
+// top-level statements. Otherwise S asked, and is blind to a served statement in the closure.
+function skWriterMoved(inS: boolean[], all: string[], held: boolean): boolean {
+  if all.length == 0 || (ihMask() & SK_NO_WRITER) != 0 { return false }
+  const asks: string[] = []
+  const keys: string[] = []
+  for a in all {
+    const key = a.slice(1, a.length)
+    const d = modIndexOfKey(key.slice(0, key.indexOf("\n")))
+    if d < 0 { return true }
+    if inS[d] {
+      asks.push(a)
+      keys.push(key)
+    }
+  }
+  if asks.length == 0 { return false }
+  const pos = skPosOf()
+  let last = -1
+  let m = 0
+  while m < modKeys.length {
+    if inS[m] && pos[m] > last { last = pos[m] }
+    m = m + 1
+  }
+  const served: boolean[] = []
+  const before: boolean[] = []
+  m = 0
+  while m < modKeys.length {
+    served.push(!inS[m])
+    before.push(!inS[m] && pos[m] < last)
+    m = m + 1
+  }
+  const now = ihWriterDigests(keys, served, before)
+  for a in asks {
+    const key = a.slice(1, a.length)
+    if a[0] == 'o' {
+      if !held && now.has("\no") { return true }
+      if (
+        held
+        && now.has(key + "\ne")
+        && (now["\nO"] ?? 0) != (skWr["\nO"] ?? 0)
+      ) {
+        return true
+      }
+    } else if held {
+      const w = key + "\nW"
+      const e = key + "\nE"
+      if (
+        now.has(key + "\ne")
+        && ((now[w] ?? 0) != (skWr[w] ?? 0) || (now[e] ?? 0) != (skWr[e] ?? 0))
+      ) {
+        return true
+      }
+    } else if now.has(key + "\nw") || (a[0] == 'e' && now.has(key + "\ne")) {
+      return true
     }
   }
   false
@@ -5821,7 +6122,12 @@ function skSettle(inS: boolean[], roots: i32[]): boolean {
     }
     p = p + 2
   }
+  // And what a served module asked of a body in S, answered again.
+  if (ihMask() & SK_NO_EFFECT) == 0 && skQsMoved(inS) {
+    return skDecline(SK_IFACE)
+  }
   if skFreshSplit(inS) { return skDecline(SK_FRESH) }
+  if skWriterMoved(inS, skAsksNow([]), false) { return skDecline(SK_WRITER) }
   const pos = skPosOf()
   const fresh = T.diags
   const out: TDiag[] = []
@@ -6090,6 +6396,13 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
   skReach = reach
   skDeliv = deliv
   skOcc = ihOccDigests(watch, [])
+  let held: string[] = []
+  if keep.length > 0 { held = skAsk }
+  skAsk = skAsksNow(held)
+  const askKeys: string[] = []
+  for a in skAsk { askKeys.push(a.slice(1, a.length)) }
+  skWr = ihWriterDigests(askKeys, [], [])
+  skQs = skQsNow(keep)
   skKeyIx = ix
   skEntry = modKeys[0]
   skMask = ihMask()
