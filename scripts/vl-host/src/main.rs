@@ -7300,6 +7300,38 @@ struct TestRegistry {
     /// "" unless the module failed to load or its top level trapped during
     /// registration — then this file contributes no tests and one failure.
     error: String,
+    /// The instance collection ran the top level in. The run phase takes it, so a file's
+    /// top level runs once per `vl test` rather than once per phase; reading the registry
+    /// changes no state, so it is still registered-but-untouched when the first test runs.
+    /// `None` when the file is re-instantiated for its run instead (`test_keep_instance`).
+    live: Mutex<Option<(Store<()>, Instance)>>,
+    /// Where `live` and every re-instantiation print (`TestSink`).
+    sink: TestSink,
+}
+
+/// A test file's output capture. Closed while collecting, since registration output
+/// belongs to no test, and opened by the run phase, which clears it before each test.
+#[derive(Clone, Default)]
+struct TestSink {
+    buf: Arc<Mutex<String>>,
+    on: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TestSink {
+    fn open(&self) {
+        self.on.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn writer(&self) -> impl Fn(&str) + Send + Sync + Clone + 'static {
+        let sink = self.clone();
+        move |line: &str| {
+            if sink.on.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut b = sink.buf.lock().unwrap();
+                b.push_str(line);
+                b.push('\n');
+            }
+        }
+    }
 }
 
 /// The outcome of one planned test. `status`: 0 passed, 1 failed, 2 skipped.
@@ -7404,8 +7436,19 @@ fn read_test_str(
     read_guest_str(n, |j| Ok(at.call(&mut *store, (i, j))?))
 }
 
+/// The memory a kept collection instance must leave free. Every file's kept instance
+/// stays live until its run, so a suite whose top levels hold large data would hold all
+/// of it at once; below this headroom a file is re-instantiated for its run instead.
+const TEST_KEEP_HEADROOM: u64 = 4 << 30;
+
+/// Whether collection may keep this file's instance for the run (`TEST_KEEP_HEADROOM`).
+/// Kept when the headroom cannot be read, as on a host with no `/proc/meminfo`.
+fn test_keep_instance() -> bool {
+    memory_headroom().is_none_or(|bytes| bytes >= TEST_KEEP_HEADROOM)
+}
+
 /// Collect one file's registry: load the module, instantiate it (which RUNS the
-/// registrations), and read the `vlt*` exports back.
+/// registrations), and read the `vlt*` exports back. The instance is kept for the run.
 ///
 /// Registration output is discarded — a test file's top level is meant to declare
 /// tests and nothing else, and anything it prints belongs to no test.
@@ -7416,6 +7459,8 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
         names: Vec::new(),
         skips: Vec::new(),
         error,
+        live: Mutex::new(None),
+        sink: TestSink::default(),
     };
     let module = match user_module(engine, &file.bytes) {
         Ok(m) => m,
@@ -7429,11 +7474,12 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
             ))
         }
     };
-    // Collection DISCARDS output (the registration pass should print nothing), so
-    // there is no stream to colour.
+    // The sink stays closed until the run opens it, so registration output is
+    // dropped; `Palette::OFF` because this is the instance tests run in (`run_test_file`).
     let ext_bools = extern_bool_names(&file.bytes);
+    let sink = TestSink::default();
     let (mut store, inst) =
-        match instantiate_program(engine, &module, &ext_bools, |_| {}, Palette::OFF) {
+        match instantiate_program(engine, &module, &ext_bools, sink.writer(), Palette::OFF) {
             Ok(pair) => pair,
             Err(e) => return failed(trap_text(&e)),
         };
@@ -7453,6 +7499,8 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
                 names: Vec::new(),
                 skips: Vec::new(),
                 error: String::new(),
+                live: Mutex::new(None),
+                sink,
             }
         }
     };
@@ -7473,6 +7521,8 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
             names,
             skips,
             error: String::new(),
+            live: Mutex::new(test_keep_instance().then_some((store, inst))),
+            sink,
         },
         Err(e) => failed(format!("reading the test registry: {}", trap_text(&e))),
     }
@@ -7480,7 +7530,8 @@ fn collect_test_file(engine: &Engine, file: &TestFile) -> TestRegistry {
 
 /// Run one file's selected tests, in one instance, one at a time — the design's
 /// "files parallel, tests within a file serial", which is what lets a file's tests
-/// share `beforeAll`-style setup and closure-captured state.
+/// share `beforeAll`-style setup and closure-captured state. The first test runs in
+/// the instance collection left (`TestRegistry::live`), so the top level runs once.
 ///
 /// A TRAP fails that test and nothing else: the call unwinds, `vltFail*` still
 /// reads the message the matcher recorded, and the module is RE-INSTANTIATED so the
@@ -7512,15 +7563,15 @@ fn run_test_file(
     let Some(module) = &reg.module else {
         return bail_all(&reg.error);
     };
-    let captured: Arc<Mutex<String>> = Arc::default();
-    let sink = {
-        let buf = captured.clone();
-        move |line: &str| {
-            let mut b = buf.lock().unwrap();
-            b.push_str(line);
-            b.push('\n');
-        }
-    };
+    // Collection's instance, whose top level has already run; a file none of whose
+    // tests was selected just drops it.
+    let kept = reg.live.lock().unwrap().take();
+    if selected.is_empty() {
+        return Vec::new();
+    }
+    let captured = reg.sink.buf.clone();
+    let sink = reg.sink.writer();
+    reg.sink.open();
     // `Palette::OFF` IS LOAD-BEARING, not a default. A failing test's captured
     // output is pushed CHARACTER BY CHARACTER into a VL string (`out_push`, at
     // CMD_TEST_RUN) for the VL reporter to lay out — so an escape here would be an
@@ -7528,11 +7579,15 @@ fn run_test_file(
     // would land inside the reporter's own styling rather than beside it. The
     // runner's summary colours itself from the host-resolved `--color` the pump
     // injects; program output stays plain text.
-    let mut live =
-        match instantiate_program(engine, module, &reg.ext_bools, sink.clone(), Palette::OFF) {
-            Ok(pair) => pair,
-            Err(e) => return bail_all(&trap_text(&e)),
-        };
+    let mut live = match kept {
+        Some(pair) => pair,
+        None => {
+            match instantiate_program(engine, module, &reg.ext_bools, sink.clone(), Palette::OFF) {
+                Ok(pair) => pair,
+                Err(e) => return bail_all(&trap_text(&e)),
+            }
+        }
+    };
     let mut out = Vec::with_capacity(selected.len());
     for &(plan_idx, local) in selected {
         captured.lock().unwrap().clear();
