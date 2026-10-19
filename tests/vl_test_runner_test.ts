@@ -988,3 +988,15 @@ Deno.test({
     }
   },
 });
+
+Deno.test({
+  name: "vl-test: toBeCloseTo is jest's tolerance over every numeric receiver",
+  ignore: !ENABLED,
+  fn: async () => {
+    const r = await runTest(`${ROOT}/tests/fixtures/vl-test-close`);
+    if (r.code !== 1) throw new Error(`want the two failing cases red, got ${r.code}:\n${r.err}`);
+    expectHas(r.err, "1 file · 8 passed · 2 failed");
+    expectHas(r.err, "expected <f64> to be close to <f64> to 3 digits");
+    expectHas(r.err, 'expected "1" to be close to <f64> to 2 digits');
+  },
+});

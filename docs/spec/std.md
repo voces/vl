@@ -159,7 +159,7 @@ marked *(type)* is a type; *(re)* means the module re-exports it from the module
 | `std:seed` | a smoke module for `std:` resolution | `stdSmoke` |
 | `std:simd` | four f32 lanes in one 128-bit value | `F32x4`, `Mask32x4`, `Lane4` *(types)*; `splatF32`, `f32x4`, `loadF32x4`, `storeF32x4`, `lane`, `withLane`; `add`, `sub`, `mul`, `div`, `min`, `max`, `abs`, `sqrt` with the suffix `F32x4`; `reduceAddF32x4`; `lt`, `le`, `gt`, `ge`, `eq`, `ne` with the suffix `F32x4`; `selectF32x4`, `dot`, `cross`, `normalize`; getters `x`, `y`, `z`, `w` |
 | `std:str` | string operations the core does not have | `startsWith`, `endsWith`, `lastIndexOf`, `split`, `join`, `replace`, `replaceAll`, `trimStart`, `trimEnd`, `trim`, `repeat`, `padStart`, `padEnd`, `toUpperAscii`, `toLowerAscii`, `toUpperLatin1`, `backwards`, `codePoints` |
-| `std:test` | the in-language test surface, driven by `vl test` | `CallerLoc` *(type)*, `describe`, `it`, `itSkip`, `beforeEach`, `afterEach`, `expect`, `not`, `toEqual`, `toBeTrue`, `toBeFalse`, `fail`, `done`; `vltCount`, `vltNameLen`, `vltNameAt`, `vltSkipped`, `vltRun`, `vltFailLen`, `vltFailAt` |
+| `std:test` | the in-language test surface, driven by `vl test` | `CallerLoc` *(type)*, `describe`, `it`, `itSkip`, `beforeEach`, `afterEach`, `expect`, `not`, `toEqual`, `toBeCloseTo`, `toBeTrue`, `toBeFalse`, `fail`, `done`; `vltCount`, `vltNameLen`, `vltNameAt`, `vltSkipped`, `vltRun`, `vltFailLen`, `vltFailAt` |
 | `std:utf16` | strings as UTF-16 code units, and back | `Utf16Error` *(type)*, `utf16Length`, `encodeUtf16`, `decodeUtf16`, `decodeUtf16Lossy` |
 | `std:utf8` | strings as UTF-8 bytes, and back | `Utf8Error` *(type)*, `utf8Length`, `encodeUtf8`, `decodeUtf8`, `decodeUtf8At`, `decodeUtf8Lossy` |
 
