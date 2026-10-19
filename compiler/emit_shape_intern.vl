@@ -14,9 +14,11 @@ import {
   T,
   TyArray,
   TyNullable,
+  TyVar,
   tyFieldTyOf,
   tyToEmitName,
 } from "./check_types"
+import { declAnnTyOf } from "./check_gen_alias_anns"
 import {
   sFieldElemNameAt,
   sFieldTypeAt,
@@ -126,6 +128,7 @@ import {
   gaeFieldNames,
   gaeFieldStart,
   gaeFieldTyNames,
+  gaeFieldTyNodes,
   gaeParams,
   genTyParamNames,
   raUsed,
@@ -1425,31 +1428,35 @@ function annShapeIndexOf(
   -1
 }
 
-// The index of the alias's own parameter `P` that declared field spelling `ft` lists as
-// `(P | null)[]`, or -1. Read off the spelling: the field's TypeRef node records the type of
-// the instance checked last, not `P`.
-function gaeNulParamIxOf(ft: string, pnames: string[]): i32 {
-  if !nameIsArray(ft) { return -1 }
-  const tp = nullablePartOf(normTypeAtom(arrElemNameRaw(ft)))
-  if tp == "" { return -1 }
+// The index of the alias's own parameter `P` whose field, declared at annotation node `fnode`,
+// is `(P | null)[]`, or -1. Read off the declared type (`declAnnTyOf`): the node's own
+// `nodeTyIx` records the instance checked last, not `P`.
+function gaeNulParamIxOf(fnode: i32, pnames: string[]): i32 {
+  const dt = declAnnTyOf(fnode)
+  if dt < 0 { return -1 }
+  const at = T.tys[dt]
+  if !(at is TyArray) || at.aElem < 0 { return -1 }
+  const nt = T.tys[at.aElem]
+  if !(nt is TyNullable) || nt.nInner < 0 { return -1 }
+  const vt = T.tys[nt.nInner]
+  if !(vt is TyVar) { return -1 }
   let i = 0
   while i < pnames.length {
-    if pnames[i] == tp { return i }
+    if pnames[i] == vt.tvName { return i }
     i = i + 1
   }
   -1
 }
 
-// The argument index whose application (`Box<GB<i32>>`) fills a `(P | null)[]` field `ft`, or
-// -1. The row's field resolves no ref-list slot of its own (`sFieldRefSlot` answers another
+// The argument index whose application (`Box<GB<i32>>`) fills a `(P | null)[]` field, or -1. The row's field resolves no ref-list slot of its own (`sFieldRefSlot` answers another
 // list's), so a list literal holding `null` builds at a union box; the application is refused
 // until that slot is interned (D2525's boundary).
 function gaeNulParamListAtApp(
-  ft: string,
+  fnode: i32,
   pnames: string[],
   args: string[],
 ): i32 {
-  const p = gaeNulParamIxOf(ft, pnames)
+  const p = gaeNulParamIxOf(fnode, pnames)
   if p < 0 || p >= args.length { return -1 }
   if annGenAppSpanEnds(normTypeAtom(args[p])) { return p }
   -1
@@ -1466,7 +1473,7 @@ export function gaeAppHasNulParamListField(name: string) {
   gaeSplitArgs(gaeParams[gi], pnames)
   let fi = 0
   while fi < gaeFieldCount[gi] {
-    if gaeNulParamIxOf(gaeFieldTyNames[gaeFieldStart[gi] + fi], pnames) >= 0 {
+    if gaeNulParamIxOf(gaeFieldTyNodes[gaeFieldStart[gi] + fi], pnames) >= 0 {
       return true
     }
     fi = fi + 1
@@ -1518,7 +1525,7 @@ export function gaeEnsure(name: string) {
   let fi = 0
   while fi < fc {
     const tn = gaeApplyFieldTy(gaeFieldTyNames[fs + fi], pnames, args)
-    const nulArg = gaeNulParamListAtApp(gaeFieldTyNames[fs + fi], pnames, args)
+    const nulArg = gaeNulParamListAtApp(gaeFieldTyNodes[fs + fi], pnames, args)
     if nulArg >= 0 {
       return emitFail(
         "emitProgram: a nullable-"

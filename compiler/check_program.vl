@@ -144,6 +144,9 @@ import {
   cnhNames,
   cnhTys,
   extFnTyMark,
+  gaParamCount,
+  gaParamNames,
+  gaParamStart,
   inferJoinListIdx,
   isParentElseTyIxSet,
   isParentTyIxSet,
@@ -228,6 +231,10 @@ import {
 import {
   builtinCollNorm,
   collectGenAliasFieldAnns,
+  declAnnTyClear,
+  declAnnTyPush,
+  gaDeclIxs,
+  gaNames,
   nameIsGenAppOfDecl,
 } from "./check_gen_alias_anns"
 import { annotateTyArgLambdas } from "./check_generic_args"
@@ -387,6 +394,7 @@ import {
   nluAtoms,
   numLitFnReadNamed,
   numLitNotesDisagree,
+  numLitNotesDropFrom,
 } from "./check_num_lit_state"
 import {
   cexCountBelow,
@@ -698,6 +706,8 @@ import {
 } from "./tyname"
 import { assignableExpr, fsbRecheckFrom } from "./check_assignable"
 import { checkNode } from "./typecheck"
+import { inferQuiet, tpEnvNames, tpEnvTruncate, tpEnvTys } from "./check_cursor"
+import { mkTyVarOwned } from "./check_subst"
 import { resolveAnnot } from "./check_annot_resolve"
 import {
   nullableRetName,
@@ -1969,6 +1979,53 @@ function canonSameShapeNullable(kept: string[]): string {
   rec + "|null"
 }
 
+// Banks the type each generic alias's field annotation declares, its parameters bound to their
+// own type variables (`declAnnTy`). Resolved quietly, after the check and before canon rewrites
+// the spelling, so it records no node type and raises no diagnostic.
+function bankGenAliasDeclTys() {
+  declAnnTyClear()
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  const diagsBefore = T.diags.length
+  const envBefore = tpEnvNames.length
+  let gi = 0
+  while gi < gaNames.length {
+    const decl = P.nodes[gaDeclIxs[gi]]
+    if decl is TypeDecl {
+      let bi = 0
+      while bi < gaParamCount[gi] {
+        const pn = gaParamNames[gaParamStart[gi] + bi]
+        tpEnvNames.push(pn)
+        tpEnvTys.push(mkTyVarOwned(pn, ""))
+        bi = bi + 1
+      }
+      const fields = decl.tdFields
+      let fi = 0
+      while fi < fields.length {
+        if fields[fi] >= 0 {
+          const fd = P.nodes[fields[fi]]
+          if fd is FieldDef {
+            if fd.fdType >= 0 {
+              const ftn = P.nodes[fd.fdType]
+              if ftn is TypeRef {
+                const r = annotResolve(ftn.tyName, annTsOf(fd.fdType))
+                if r >= 0 { declAnnTyPush(fd.fdType, r) }
+              }
+            }
+          }
+        }
+        fi = fi + 1
+      }
+      tpEnvTruncate(envBefore)
+    }
+    gi = gi + 1
+  }
+  while T.diags.length > diagsBefore { T.diags.pop() }
+  numLitNotesDropFrom(diagsBefore)
+  inferQuiet = savedQuiet
+  0
+}
+
 export function canonEmitTypeNames() {
   // Reset with `annUnionAtoms`, for the same reason: a second program on this instance
   // must not inherit the first one's node indices.
@@ -1981,6 +2038,7 @@ export function canonEmitTypeNames() {
   // Before the rewrite loop — the bank holds the declared spellings, which is the whole
   // point of it.
   collectGenAliasFieldAnns()
+  bankGenAliasDeclTys()
   let i = 0
   while i < P.nodes.length {
     // The atom-count bank: a `TypeRef` banks the count `canonEmitName` reported directly, not
