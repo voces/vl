@@ -6,6 +6,7 @@ import {
   cpAccTake,
   pushCps,
   strContains,
+  topPathSeg,
 } from "./strutil"
 import { engineFailOffset } from "./engine_msg"
 import { strListHas } from "./listutil"
@@ -368,59 +369,72 @@ let cliSibSkipped: string[] = []           // candidates that do not lex, named 
 // is compiled (emit plus engine validation, not just `check`) before it reaches the
 // disk, and an edit that breaks a file that built is dropped. The phases run inside
 // the per-file check loop, so a trial costs one compile and no host read.
-const FIXP_OFF = 0                // not verifying: the report path
-const FIXP_ALL = 1                // trial = every computed edit at once (the fast path)
-const FIXP_BASE = 2               // trial = the ORIGINAL source (did it build before?)
-const FIXP_ONE = 3                // trial = the accepted set plus edit `cliFixTrial`
+const FIXP_OFF = 0   // not verifying: the report path
+const FIXP_ALL = 1   // trial = every computed edit at once (the fast path)
+const FIXP_BASE = 2  // trial = the ORIGINAL source (did it build before?)
+const FIXP_ONE = 3   // trial = the accepted set plus edit `cliFixTrial`
 let cliFixPhase = 0
-let cliFixTrial = 0               // index under trial in FIXP_ONE
-let cliFixOrig = ""               // the file's source before any edit
-let cliFixPassRc = 0              // compileSrc's rc for the trial just run
-let cliFixEditPos: i32[] = []
-let cliFixEditLen: i32[] = []
-let cliFixEditTxt: string[] = []
-let cliFixEditWhat: string[] = [] // the lint/hint the edit came from, for the report
-let cliFixEditLine: i32[] = []
-let cliFixEditCol: i32[] = []
-let cliFixKeep: i32[] = []        // 1 = this edit is in the current candidate
-// One row per edit verify-and-revert declined, drained into an `info` diagnostic by
-// the report pass. A declined edit is a site where the finding that offered it is
-// wrong, and a count alone cannot be worked on — this is the standing worklist of
-// annotations inference cannot yet do without (D1091).
-let cliFixDeclinedAt: string[] = []
-let cliFixDeclinedLine: i32[] = []
-let cliFixDeclinedCol: i32[] = []
+let cliFixTrial = 0  // index under trial in FIXP_ONE
+let cliFixOrig = ""  // the file's source before any edit
+let cliFixPassRc = 0 // compileSrc's rc for the trial just run
+// One row per auto-fix edit: `len` code units at `pos` become `txt`; `what` is the lint or
+// hint it came from, and `line`/`col` place it for the report.
+type CliFixEditCols = {
+  pos: i32[],
+  len: i32[],
+  txt: string[],
+  what: string[],
+  line: i32[],
+  col: i32[],
+}
+const cliFixEdit: CliFixEditCols = {
+  pos: [],
+  len: [],
+  txt: [],
+  what: [],
+  line: [],
+  col: [],
+}
+let cliFixKeep: i32[] = [] // 1 = this edit is in the current candidate
+// A 1-based line, a 0-based column and a text, one row per site.
+type CliSiteCols = { line: i32[], col: i32[], text: string[] }
+// One row per edit verify-and-revert declined, with the fix's name as the text, drained into
+// an `info` diagnostic by the report pass. A declined edit is a site where the finding that
+// offered it is wrong, and a count alone cannot be worked on (D1091).
+const cliFixDecl: CliSiteCols = { line: [], col: [], text: [] }
 // The imports this file's own errors ask for, one exporter each (`cliNoteImportFix`): the
-// specifier text to add and the module to add it to.
-let cliImpItem: string[] = []
-let cliImpSpec: string[] = []
+// specifier text to add, the module to add it to, and whether a method call asked for it.
+type CliImpAskCols = { item: string[], spec: string[], method: boolean[] }
+const cliImpAsk: CliImpAskCols = { item: [], spec: [], method: [] }
 let cliImpClash: string[] = []
-// Whether a method call (not a plain use) asked for each `cliImpItem` row (`cliImpAdd`).
-let cliImpMethod: boolean[] = []
-// The spans of this file's `filled(n, 0)` calls refused into a `u8[]` (`cliNoteZeroBytesFix`):
-// 1-based start line and column, then end line and exclusive end column.
-let cliZbLine: i32[] = []
-let cliZbCol: i32[] = []
-let cliZbEndLine: i32[] = []
-let cliZbEndCol: i32[] = []
+// A source span per row: 1-based start line and column, then end line and exclusive end column.
+type CliSpanCols = { line: i32[], col: i32[], endLine: i32[], endCol: i32[] }
+// The spans of this file's `filled(n, 0)` calls refused into a `u8[]` (`cliNoteZeroBytesFix`).
+const cliZb: CliSpanCols = { line: [], col: [], endLine: [], endCol: [] }
 // The spans this file's fixes shorten to a prefix (`cliNoteCastFix`, `cliNoteStrictEqFix`), as
-// `cliZb*`: how many characters from each span's start the fix keeps, and the fix's name.
-let cliRcLine: i32[] = []
-let cliRcCol: i32[] = []
-let cliRcEndLine: i32[] = []
-let cliRcEndCol: i32[] = []
-let cliRcKeep: i32[] = []
-let cliRcWhat: string[] = []
+// `CliSpanCols`: how many characters from each span's start the fix keeps, and the fix's name.
+type CliCutCols = {
+  line: i32[],
+  col: i32[],
+  endLine: i32[],
+  endCol: i32[],
+  keep: i32[],
+  what: string[],
+}
+const cliRc: CliCutCols = {
+  line: [],
+  col: [],
+  endLine: [],
+  endCol: [],
+  keep: [],
+  what: [],
+}
 // The annotations to insert after a binding's name, from refusals of a concrete function written
-// to a generic `let` (`cliNoteGenBindFix`): 1-based line, 0-based column, and the type text.
-let cliGbLine: i32[] = []
-let cliGbCol: i32[] = []
-let cliGbAnnot: string[] = []
+// to a generic `let` (`cliNoteGenBindFix`), with the type as the text.
+const cliGb: CliSiteCols = { line: [], col: [], text: [] }
 // The parameter names to write before positional arguments that follow a misplaced named one
-// (`cliNoteNamedOrderFix`): 1-based line, 0-based column of the argument, and the name.
-let cliNoLine: i32[] = []
-let cliNoCol: i32[] = []
-let cliNoName: string[] = []
+// (`cliNoteNamedOrderFix`), with the name as the text.
+const cliNo: CliSiteCols = { line: [], col: [], text: [] }
 // ── `vl test` (cliCmd == 2) ────────────────────────────────────────────────────
 // Flags.
 let cliTestFilter = "" // -t <substring>: keep tests whose scope-path contains it
@@ -636,16 +650,9 @@ export function cliArgReset() {
   cliFixTrial = 0
   cliFixOrig = ""
   cliFixPassRc = 0
-  cliFixEditPos = []
-  cliFixEditLen = []
-  cliFixEditTxt = []
-  cliFixEditWhat = []
-  cliFixEditLine = []
-  cliFixEditCol = []
+  cliFixEditClear()
   cliFixKeep = []
-  cliFixDeclinedAt = []
-  cliFixDeclinedLine = []
-  cliFixDeclinedCol = []
+  cliSitesClear(cliFixDecl)
   cliDirNames = []
   cliDirIsDirs = []
   cliDirNameAcc = []
@@ -1481,10 +1488,10 @@ function cliCheckCurFileRest() {
   // the next round. Fixing after imports resolve is what makes it safe.
   if cliFix != 0 && cliFileFixed == 0 {
     cliCollectFixes(cliEntrySrc)
-    if cliFixEditPos.length > 0 && cliFixRound >= FIX_ROUND_CAP {
+    if cliFixEdit.pos.length > 0 && cliFixRound >= FIX_ROUND_CAP {
       cliFixCapHit = cliFixCapHit + 1
       cliFixFileDone()
-    } else if cliFixEditPos.length == 0 {
+    } else if cliFixEdit.pos.length == 0 {
       cliFixFileDone()
     } else {
       cliFixOrig = cliEntrySrc
@@ -1492,7 +1499,7 @@ function cliCheckCurFileRest() {
       // holds, and then verification costs exactly one compile.
       cliFixKeep = []
       let fk = 0
-      while fk < cliFixEditPos.length {
+      while fk < cliFixEdit.pos.length {
         cliFixKeep.push(1)
         fk = fk + 1
       }
@@ -1579,26 +1586,22 @@ function cliCheckCurFileRest() {
 // fixable ones when `--fix` is on.
 function cliCaptureErrorDiags() {
   cliClearDiags()
-  cliImpItem = []
-  cliImpSpec = []
+  cliImpAsk.item = []
+  cliImpAsk.spec = []
   cliImpClash = []
-  cliImpMethod = []
-  cliZbLine = []
-  cliZbCol = []
-  cliZbEndLine = []
-  cliZbEndCol = []
-  cliRcLine = []
-  cliRcCol = []
-  cliRcEndLine = []
-  cliRcEndCol = []
-  cliRcKeep = []
-  cliRcWhat = []
-  cliGbLine = []
-  cliGbCol = []
-  cliGbAnnot = []
-  cliNoLine = []
-  cliNoCol = []
-  cliNoName = []
+  cliImpAsk.method = []
+  cliZb.line = []
+  cliZb.col = []
+  cliZb.endLine = []
+  cliZb.endCol = []
+  cliRc.line = []
+  cliRc.col = []
+  cliRc.endLine = []
+  cliRc.endCol = []
+  cliRc.keep = []
+  cliRc.what = []
+  cliSitesClear(cliGb)
+  cliSitesClear(cliNo)
   const n = diagCount()
   let i = 0
   while i < n {
@@ -1655,16 +1658,16 @@ function cliAddReportStreams() {
   // so the diagnostic that offered it is wrong about this site. Reported per site and
   // not as a count, because a count cannot be worked on (D1091).
   let fd = 0
-  while fd < cliFixDeclinedAt.length {
+  while fd < cliFixDecl.text.length {
     cliAddDiag(
       "info",
       "fix",
       "fix-declined",
-      cliFixDeclinedLine[fd],
-      cliFixDeclinedCol[fd],
-      cliFixDeclinedCol[fd] + 1,
+      cliFixDecl.line[fd],
+      cliFixDecl.col[fd],
+      cliFixDecl.col[fd] + 1,
       "`--fix` left this alone: applying the "
-        + cliFixDeclinedAt[fd]
+        + cliFixDecl.text[fd]
         + " fix stops this file building, so the finding that offers it is wrong here",
       0,
     )
@@ -1756,14 +1759,14 @@ function cliAddReportStreams() {
 // inside the trees the baseline's targets name.
 function cliBudgetCollect() {
   const tops: string[] = []
-  for t in budgetTargets() { tops.push(cliTopSeg(cliPathKey(t))) }
+  for t in budgetTargets() { tops.push(topPathSeg(cliPathKey(t))) }
   let d = 0
   while d < dgSev.length {
     if budgetWants(dgCode[d]) && cliDiagWithheld(d) == "shown" {
       const rel = cliPathKey(cliDiagFile(d))
       let inside = false
       for t in tops {
-        if t == cliTopSeg(rel) { inside = true }
+        if t == topPathSeg(rel) { inside = true }
       }
       const lines = cliDiagSrcLines(d)
       let text = ""
@@ -1783,12 +1786,6 @@ function cliBudgetCollect() {
     d = d + 1
   }
   0
-}
-// The first `/`-separated segment of `path`.
-function cliTopSeg(path: string): string {
-  let i = 0
-  while i < path.length && path[i] != '/' { i = i + 1 }
-  path.slice(0, i)
 }
 // `--budget`'s verdict, or `--budget-why`'s names, as the run's stdout.
 function cliBudgetFinish() {
@@ -2780,16 +2777,9 @@ function cliStartFile() {
   cliFixRound = 0
   cliFixPhase = FIXP_OFF
   cliFixOrig = ""
-  cliFixEditPos = []
-  cliFixEditLen = []
-  cliFixEditTxt = []
-  cliFixEditWhat = []
-  cliFixEditLine = []
-  cliFixEditCol = []
+  cliFixEditClear()
   cliFixKeep = []
-  cliFixDeclinedAt = []
-  cliFixDeclinedLine = []
-  cliFixDeclinedCol = []
+  cliSitesClear(cliFixDecl)
   // Already read this run as another file's dependency? Check it from the cache, with
   // no host round-trip. A cached miss (found = 0) falls through to a real read.
   const ci = cliSrcCacheGet(cliCurFile)
@@ -2940,17 +2930,12 @@ function cliSibScan(key: string, src: string, found: i32) {
 
 // ── check --fix ──────────────────────────────────────────────────────────────
 
-// Collect the auto-fix edits for `src` into `cliFixEdit*`, ordered by start offset,
+// Collect the auto-fix edits for `src` into `cliFixEdit`, ordered by start offset,
 // from the safe fixes: prefer-const, a redundant annotation's `: T ` span becoming one
 // space, and an unused import's specifier removed. Unused-variable is not fixed — the `_`
 // prefix silences a warning. Precondition: the module-aware check and lint ran over `src`.
 function cliCollectFixes(src: string) {
-  cliFixEditPos = []
-  cliFixEditLen = []
-  cliFixEditTxt = []
-  cliFixEditWhat = []
-  cliFixEditLine = []
-  cliFixEditCol = []
+  cliFixEditClear()
   const n = cliLintCount()
   // The absolute offset where each 0-based line begins.
   const starts = [0]
@@ -2959,12 +2944,12 @@ function cliCollectFixes(src: string) {
     if src[s] == '\n' { starts.push(s + 1) }
     s = s + 1
   }
-  const pos = cliFixEditPos
-  const len = cliFixEditLen
-  const txt = cliFixEditTxt
-  const what = cliFixEditWhat
-  const eln = cliFixEditLine
-  const ecl = cliFixEditCol
+  const pos = cliFixEdit.pos
+  const len = cliFixEdit.len
+  const txt = cliFixEdit.txt
+  const what = cliFixEdit.what
+  const eln = cliFixEdit.line
+  const ecl = cliFixEdit.col
   // The `{` of each import clause holding an unused-import finding, and every finding's offset.
   const impLb: i32[] = []
   const impOff: i32[] = []
@@ -3219,12 +3204,31 @@ function cliImportFixEdits(
   0
 }
 
-// Append one deletion of `len` code units at `off` to the `cliFixEdit*` rows.
+// Empty every `cliFixEdit` column.
+function cliFixEditClear() {
+  cliFixEdit.pos = []
+  cliFixEdit.len = []
+  cliFixEdit.txt = []
+  cliFixEdit.what = []
+  cliFixEdit.line = []
+  cliFixEdit.col = []
+  0
+}
+
+// Empty every column of `t`.
+function cliSitesClear(t: CliSiteCols) {
+  t.line = []
+  t.col = []
+  t.text = []
+  0
+}
+
+// Append one deletion of `len` code units at `off` to the `cliFixEdit` rows.
 function cliPushFixEdit(off: i32, len: i32, what: string, starts: i32[]) {
   cliPushFixRepl(off, len, "", what, starts)
 }
 
-// Append one replacement of `len` code units at `off` by `txt` to the `cliFixEdit*` rows.
+// Append one replacement of `len` code units at `off` by `txt` to the `cliFixEdit` rows.
 function cliPushFixRepl(
   off: i32,
   len: i32,
@@ -3233,12 +3237,12 @@ function cliPushFixRepl(
   starts: i32[],
 ) {
   const ln = cliLineOfOff(starts, off)
-  cliFixEditPos.push(off)
-  cliFixEditLen.push(len)
-  cliFixEditTxt.push(txt)
-  cliFixEditWhat.push(what)
-  cliFixEditLine.push(ln)
-  cliFixEditCol.push(off - starts[ln - 1])
+  cliFixEdit.pos.push(off)
+  cliFixEdit.len.push(len)
+  cliFixEdit.txt.push(txt)
+  cliFixEdit.what.push(what)
+  cliFixEdit.line.push(ln)
+  cliFixEdit.col.push(off - starts[ln - 1])
   0
 }
 
@@ -3252,12 +3256,12 @@ function cliNoteCastFix(i: i32) {
     if c < '0' || c > '9' { return 0 }
     keep = keep * 10 + (c - '0')
   }
-  cliRcLine.push(diagLine(i))
-  cliRcCol.push(diagCol(i))
-  cliRcEndLine.push(diagEndLine(i))
-  cliRcEndCol.push(diagEndCol(i))
-  cliRcKeep.push(keep)
-  cliRcWhat.push("redundant cast")
+  cliRc.line.push(diagLine(i))
+  cliRc.col.push(diagCol(i))
+  cliRc.endLine.push(diagEndLine(i))
+  cliRc.endCol.push(diagEndCol(i))
+  cliRc.keep.push(keep)
+  cliRc.what.push("redundant cast")
   0
 }
 
@@ -3268,35 +3272,35 @@ function cliNoteStrictEqFix(i: i32) {
   if diagLine(i) != diagEndLine(i) || diagEndCol(i) - diagCol(i) != 3 {
     return 0
   }
-  cliRcLine.push(diagLine(i))
-  cliRcCol.push(diagCol(i))
-  cliRcEndLine.push(diagEndLine(i))
-  cliRcEndCol.push(diagEndCol(i))
-  cliRcKeep.push(2)
-  cliRcWhat.push("strict equality")
+  cliRc.line.push(diagLine(i))
+  cliRc.col.push(diagCol(i))
+  cliRc.endLine.push(diagEndLine(i))
+  cliRc.endCol.push(diagEndCol(i))
+  cliRc.keep.push(2)
+  cliRc.what.push("strict equality")
   0
 }
 
 // The edits shortening each noted span to the prefix it keeps: a cast to its operand, `!==` to `!=`.
 function cliCastEdits(src: string, starts: i32[]) {
   let k = 0
-  while k < cliRcLine.length {
-    const sl = cliRcLine[k] - 1
-    const el = cliRcEndLine[k] - 1
+  while k < cliRc.line.length {
+    const sl = cliRc.line[k] - 1
+    const el = cliRc.endLine[k] - 1
     if sl >= 0 && sl < starts.length && el >= 0 && el < starts.length {
-      const so = starts[sl] + cliRcCol[k]
-      const eo = starts[el] + cliRcEndCol[k]
+      const so = starts[sl] + cliRc.col[k]
+      const eo = starts[el] + cliRc.endCol[k]
       if (
         so >= 0
         && eo <= src.length
-        && cliRcKeep[k] > 0
-        && so + cliRcKeep[k] < eo
+        && cliRc.keep[k] > 0
+        && so + cliRc.keep[k] < eo
       ) {
         cliPushFixRepl(
           so,
           eo - so,
-          src.slice(so, so + cliRcKeep[k]),
-          cliRcWhat[k],
+          src.slice(so, so + cliRc.keep[k]),
+          cliRc.what[k],
           starts,
         )
       }
@@ -3324,10 +3328,10 @@ function cliNoteImportFix(i: i32) {
 // Diagnostic `i` refuses a `filled(n, 0)` delivered into a `u8[]`: note the call's span.
 function cliNoteZeroBytesFix(i: i32) {
   if vcDiagCode(i) != "filled-zero-bytes" { return 0 }
-  cliZbLine.push(diagLine(i))
-  cliZbCol.push(diagCol(i))
-  cliZbEndLine.push(diagEndLine(i))
-  cliZbEndCol.push(diagEndCol(i))
+  cliZb.line.push(diagLine(i))
+  cliZb.col.push(diagCol(i))
+  cliZb.endLine.push(diagEndLine(i))
+  cliZb.endCol.push(diagEndCol(i))
   0
 }
 
@@ -3343,13 +3347,13 @@ function cliNoteGenBindFix(i: i32) {
   const ln = cliDecI32(line[0])
   const cl = cliDecI32(col[0])
   let k = 0
-  while k < cliGbLine.length {
-    if cliGbLine[k] == ln && cliGbCol[k] == cl { return 0 }
+  while k < cliGb.line.length {
+    if cliGb.line[k] == ln && cliGb.col[k] == cl { return 0 }
     k = k + 1
   }
-  cliGbLine.push(ln)
-  cliGbCol.push(cl)
-  cliGbAnnot.push(annot[0])
+  cliGb.line.push(ln)
+  cliGb.col.push(cl)
+  cliGb.text.push(annot[0])
   0
 }
 
@@ -3366,15 +3370,15 @@ function cliDecI32(t: string): i32 {
 // The edits for the noted generic bindings: `: <type>` after each one's name.
 function cliGenBindEdits(starts: i32[], srcLen: i32) {
   let k = 0
-  while k < cliGbLine.length {
-    const l = cliGbLine[k] - 1
+  while k < cliGb.line.length {
+    const l = cliGb.line[k] - 1
     if l >= 0 && l < starts.length {
-      const off = starts[l] + cliGbCol[k]
+      const off = starts[l] + cliGb.col[k]
       if off >= 0 && off <= srcLen {
         cliPushFixRepl(
           off,
           0,
-          ": " + cliGbAnnot[k],
+          ": " + cliGb.text[k],
           "annotate the binding",
           starts,
         )
@@ -3400,14 +3404,14 @@ function cliNoteNamedOrderFix(i: i32) {
     const cl = cliDecI32(cols[a])
     let seen = false
     let k = 0
-    while k < cliNoLine.length {
-      if cliNoLine[k] == ln && cliNoCol[k] == cl { seen = true }
+    while k < cliNo.line.length {
+      if cliNo.line[k] == ln && cliNo.col[k] == cl { seen = true }
       k = k + 1
     }
     if !seen {
-      cliNoLine.push(ln)
-      cliNoCol.push(cl)
-      cliNoName.push(names[a])
+      cliNo.line.push(ln)
+      cliNo.col.push(cl)
+      cliNo.text.push(names[a])
     }
     a = a + 1
   }
@@ -3417,12 +3421,18 @@ function cliNoteNamedOrderFix(i: i32) {
 // The edits for the noted positional arguments: `<name>: ` before each one.
 function cliNamedOrderEdits(starts: i32[], srcLen: i32) {
   let k = 0
-  while k < cliNoLine.length {
-    const l = cliNoLine[k] - 1
+  while k < cliNo.line.length {
+    const l = cliNo.line[k] - 1
     if l >= 0 && l < starts.length {
-      const off = starts[l] + cliNoCol[k]
+      const off = starts[l] + cliNo.col[k]
       if off >= 0 && off <= srcLen {
-        cliPushFixRepl(off, 0, cliNoName[k] + ": ", "name the argument", starts)
+        cliPushFixRepl(
+          off,
+          0,
+          cliNo.text[k] + ": ",
+          "name the argument",
+          starts,
+        )
       }
     }
     k = k + 1
@@ -3434,12 +3444,12 @@ function cliNamedOrderEdits(starts: i32[], srcLen: i32) {
 // is asked of `std:bytes`. A span whose text is not `filled(<n>, <fill>)` is left alone.
 function cliZeroBytesEdits(src: string, starts: i32[]) {
   let k = 0
-  while k < cliZbLine.length {
-    const sl = cliZbLine[k] - 1
-    const el = cliZbEndLine[k] - 1
+  while k < cliZb.line.length {
+    const sl = cliZb.line[k] - 1
+    const el = cliZb.endLine[k] - 1
     if sl >= 0 && sl < starts.length && el >= 0 && el < starts.length {
-      const so = starts[sl] + cliZbCol[k]
-      const eo = starts[el] + cliZbEndCol[k]
+      const so = starts[sl] + cliZb.col[k]
+      const eo = starts[el] + cliZb.endCol[k]
       const comma = cliZbCountEnd(src, so, eo)
       if comma > 0 {
         let a = so + 7
@@ -3509,19 +3519,19 @@ function cliZbCountEnd(src: string, so: i32, eo: i32) {
 function cliImpAdd(item: string, spec: string, method: boolean) {
   const local = cliImpLocal(item)
   let k = 0
-  while k < cliImpItem.length {
-    if cliImpLocal(cliImpItem[k]) == local {
-      if cliImpSpec[k] == spec { return 0 }
-      if !method || !cliImpMethod[k] {
+  while k < cliImpAsk.item.length {
+    if cliImpLocal(cliImpAsk.item[k]) == local {
+      if cliImpAsk.spec[k] == spec { return 0 }
+      if !method || !cliImpAsk.method[k] {
         cliImpClash.push(local)
         return 0
       }
     }
     k = k + 1
   }
-  cliImpMethod.push(method)
-  cliImpItem.push(item)
-  cliImpSpec.push(spec)
+  cliImpAsk.method.push(method)
+  cliImpAsk.item.push(item)
+  cliImpAsk.spec.push(spec)
   0
 }
 
@@ -3656,19 +3666,19 @@ function cliMissingImportEdits(src: string, starts: i32[]) {
   let fresh = ""
   const done: string[] = []
   let k = 0
-  while k < cliImpSpec.length {
-    const spec = cliImpSpec[k]
+  while k < cliImpAsk.spec.length {
+    const spec = cliImpAsk.spec[k]
     if !strListHas(done, spec) {
       done.push(spec)
       let list = ""
       let j = k
-      while j < cliImpSpec.length {
+      while j < cliImpAsk.spec.length {
         if (
-          cliImpSpec[j] == spec
-          && !strListHas(cliImpClash, cliImpLocal(cliImpItem[j]))
+          cliImpAsk.spec[j] == spec
+          && !strListHas(cliImpClash, cliImpLocal(cliImpAsk.item[j]))
         ) {
           if list != "" { list = list + ", " }
-          list = list + cliImpItem[j]
+          list = list + cliImpAsk.item[j]
         }
         j = j + 1
       }
@@ -3751,14 +3761,14 @@ function cliApplyFixEdits(src: string, keep: i32[]) {
   const buf: i32[] = []
   let cur = 0
   let e = 0
-  while e < cliFixEditPos.length {
-    const p = cliFixEditPos[e]
+  while e < cliFixEdit.pos.length {
+    const p = cliFixEdit.pos[e]
     if keep[e] != 0 && p >= cur {
       // The gap and the replacement both go in as code points: `buf.push(src[g])` would
       // push bytes into a code-point buffer, and `src.slice` is an O(1) view.
       pushCps(buf, src.slice(cur, p))
-      pushCps(buf, cliFixEditTxt[e])
-      cur = p + cliFixEditLen[e]
+      pushCps(buf, cliFixEdit.txt[e])
+      cur = p + cliFixEdit.len[e]
     }
     e = e + 1
   }
@@ -3773,7 +3783,7 @@ function cliApplyFixEdits(src: string, keep: i32[]) {
 // whether the file built at all; `BASE` broken commits everything, since no edit can
 // have broken it; `BASE` ok starts greedy from the empty set; `ONE` records one edit.
 function cliFixVerdict(ok: i32) {
-  const n = cliFixEditPos.length
+  const n = cliFixEdit.pos.length
   if cliFixPhase == FIXP_ALL {
     if ok != 0 { return cliFixCommit() }
     cliFixPhase = FIXP_BASE
@@ -3832,7 +3842,7 @@ function cliFixTally(what: string) {
 // its round count into the run's totals.
 function cliFixFileDone() {
   cliFileFixed = 1
-  cliFixDeclined = cliFixDeclined + cliFixDeclinedAt.length
+  cliFixDeclined = cliFixDeclined + cliFixDecl.text.length
   if cliFixRound > cliFixRoundsMax { cliFixRoundsMax = cliFixRound }
   0
 }
@@ -3841,18 +3851,16 @@ function cliFixFileDone() {
 // result to the report path — writing the file only when it actually changed.
 function cliFixCommit() {
   let kept = 0
-  cliFixDeclinedAt = []
-  cliFixDeclinedLine = []
-  cliFixDeclinedCol = []
+  cliSitesClear(cliFixDecl)
   let ki = 0
   while ki < cliFixKeep.length {
     if cliFixKeep[ki] != 0 {
       kept = kept + 1
-      cliFixTally(cliFixEditWhat[ki])
-    } else if ki < cliFixEditWhat.length {
-      cliFixDeclinedAt.push(cliFixEditWhat[ki])
-      cliFixDeclinedLine.push(cliFixEditLine[ki])
-      cliFixDeclinedCol.push(cliFixEditCol[ki])
+      cliFixTally(cliFixEdit.what[ki])
+    } else if ki < cliFixEdit.what.length {
+      cliFixDecl.text.push(cliFixEdit.what[ki])
+      cliFixDecl.line.push(cliFixEdit.line[ki])
+      cliFixDecl.col.push(cliFixEdit.col[ki])
     }
     ki = ki + 1
   }
@@ -3866,9 +3874,7 @@ function cliFixCommit() {
     return cliBeginCheck()
   }
   cliFixRound = cliFixRound + 1
-  cliFixDeclinedAt = []
-  cliFixDeclinedLine = []
-  cliFixDeclinedCol = []
+  cliSitesClear(cliFixDecl)
   // Keep the per-run source cache coherent with the rewrite the host is
   // about to perform, so later files that import this one see the fix.
   cliSrcCachePut(cliCurFile, out, 1)

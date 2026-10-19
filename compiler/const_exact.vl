@@ -3,6 +3,8 @@
 // base-2^16 `i32[]` limbs, trimmed, zero written `[0]`. An integer is capped at
 // `CEX_INT_BITS` and a fraction's numerator and denominator at `CEX_FRAC_BITS`. A leaf.
 
+import { bigCmp, bigIsZero, numLexBaseAt } from "./emit_bignum"
+
 // One constant value. `cxErr` non-empty: the expression is a check error saying so. `cxNo`: not
 // a constant this fold computes, left to the ordinary check. `cxPat`: a radix literal, or a
 // negation, bitwise operator or shift over one, a bit pattern of its use's width; arithmetic
@@ -33,25 +35,7 @@ function cxmTrim(a: i32[]): i32[] {
   a
 }
 
-function cxmIsZero(a: i32[]): boolean { a.length == 1 && a[0] == 0 }
-
 function cxmIsOne(a: i32[]): boolean { a.length == 1 && a[0] == 1 }
-
-function cxmCmp(a: i32[], b: i32[]): i32 {
-  if a.length != b.length {
-    if a.length < b.length { return -1 }
-    return 1
-  }
-  let i = a.length - 1
-  while i >= 0 {
-    if a[i] != b[i] {
-      if a[i] < b[i] { return -1 }
-      return 1
-    }
-    i = i - 1
-  }
-  0
-}
 
 function cxmAdd(a: i32[], b: i32[]): i32[] {
   const out: i32[] = []
@@ -93,7 +77,7 @@ function cxmSub(a: i32[], b: i32[]): i32[] {
 
 // Each partial sum stays below 2^32, so it is read unsigned through `&` and `>>>`.
 function cxmMul(a: i32[], b: i32[]): i32[] {
-  if cxmIsZero(a) || cxmIsZero(b) { return [0] }
+  if bigIsZero(a) || bigIsZero(b) { return [0] }
   const out: i32[] = []
   let k = 0
   while k < a.length + b.length {
@@ -141,7 +125,7 @@ function cxmMulSmallAdd(a: i32[], m: i32, add: i32): i32[] {
 }
 
 function cxmShl(a: i32[], k: i32): i32[] {
-  if cxmIsZero(a) { return [0] }
+  if bigIsZero(a) { return [0] }
   const out: i32[] = []
   let z = 0
   while z < (k >>> 4) {
@@ -179,7 +163,7 @@ function cxmShr(a: i32[], k: i32): i32[] {
 }
 
 function cxmBitLen(a: i32[]): i32 {
-  if cxmIsZero(a) { return 0 }
+  if bigIsZero(a) { return 0 }
   let top = a[a.length - 1]
   let bits = (a.length - 1) * 16
   while top != 0 {
@@ -192,7 +176,7 @@ function cxmBitLen(a: i32[]): i32 {
 // Quotient and remainder of `n / d` for `d` nonzero, as `[q, r]`.
 function cxmDivmod(n: i32[], d: i32[]): i32[][] {
   if d.length == 1 && d[0] < 0x8000 { return cxmDivmodSmall(n, d[0]) }
-  if cxmCmp(n, d) < 0 { return [[0], n] }
+  if bigCmp(n, d) < 0 { return [[0], n] }
   const shift = cxmBitLen(n) - cxmBitLen(d)
   let rem = n
   let dd = cxmShl(d, shift)
@@ -200,7 +184,7 @@ function cxmDivmod(n: i32[], d: i32[]): i32[][] {
   let s = shift
   while s >= 0 {
     q = cxmShl(q, 1)
-    if cxmCmp(rem, dd) >= 0 {
+    if bigCmp(rem, dd) >= 0 {
       rem = cxmSub(rem, dd)
       q = cxmAdd(q, cxmOne())
     }
@@ -232,7 +216,7 @@ function cxmDivmodSmall(n: i32[], d: i32): i32[][] {
 function cxmGcd(a: i32[], b: i32[]): i32[] {
   let x = a
   let y = b
-  while !cxmIsZero(y) {
+  while !bigIsZero(y) {
     const r = cxmDivmod(x, y)[1]
     x = y
     y = r
@@ -255,10 +239,10 @@ function cxmPow10(e: i32): i32[] {
 }
 
 function cxmToDec(a: i32[]): string {
-  if cxmIsZero(a) { return "0" }
+  if bigIsZero(a) { return "0" }
   const groups: i32[] = []
   let x = a
-  while !cxmIsZero(x) {
+  while !bigIsZero(x) {
     const qr = cxmDivmodSmall(x, 10000)
     groups.push(qr[1][0])
     x = qr[0]
@@ -349,7 +333,7 @@ function cexMake(
     cxNo: false,
     cxFloat: f,
     cxPat: pat,
-    cxNeg: neg && (f || !cxmIsZero(num)),
+    cxNeg: neg && (f || !bigIsZero(num)),
     cxNum: num,
     cxDen: den,
   }
@@ -398,7 +382,7 @@ function cexInt(neg: boolean, mag: i32[], pat: boolean): Cex {
 function cexFrac(neg: boolean, num: i32[], den: i32[]): Cex {
   let n = num
   let d = den
-  if cxmIsZero(n) {
+  if bigIsZero(n) {
     d = cxmOne()
   } else if !cxmIsOne(d) {
     const g = cxmGcd(n, d)
@@ -420,15 +404,9 @@ function cexFrac(neg: boolean, num: i32[], den: i32[]): Cex {
 // The value of numeric-literal lexeme `t` (no sign): a radix or decimal integer, or a decimal
 // float. A float whose exponent is far outside every float's range is left to the literal check.
 export function cexOfLexeme(t: string): Cex {
-  let base = 10
+  const base = numLexBaseAt(t, 0)
   let i = 0
-  if t.length >= 2 && t[0] == '0' {
-    const p = t[1]
-    if p == 'x' || p == 'X' { base = 16 }
-    else if p == 'b' || p == 'B' { base = 2 }
-    else if p == 'o' || p == 'O' { base = 8 }
-    if base != 10 { i = 2 }
-  }
+  if base != 10 { i = 2 }
   let mag: i32[] = [0]
   let frac = 0
   let inFrac = false
@@ -492,14 +470,14 @@ function cexToFloat(v: Cex): Cex {
 // Signed `(an, am) + (bn, bm)` over magnitudes, as a sign and a magnitude.
 function cxsAddNeg(an: boolean, am: i32[], bn: boolean, bm: i32[]): boolean {
   if an == bn { return an }
-  const c = cxmCmp(am, bm)
+  const c = bigCmp(am, bm)
   if c >= 0 { return an }
   bn
 }
 
 function cxsAddMag(an: boolean, am: i32[], bn: boolean, bm: i32[]): i32[] {
   if an == bn { return cxmAdd(am, bm) }
-  if cxmCmp(am, bm) >= 0 { return cxmSub(am, bm) }
+  if bigCmp(am, bm) >= 0 { return cxmSub(am, bm) }
   cxmSub(bm, am)
 }
 
@@ -528,7 +506,7 @@ export function cexAdd(a: Cex, b: Cex, sub: boolean): Cex {
     const m = cxsAddMag(x.cxNeg, l, bneg, r)
     // A zero sum is `-0` only when both addends are, as IEEE rounds it.
     let neg = cxsAddNeg(x.cxNeg, l, bneg, r)
-    if cxmIsZero(m) { neg = x.cxNeg && bneg }
+    if bigIsZero(m) { neg = x.cxNeg && bneg }
     return cexFrac(neg, m, cxmMul(x.cxDen, y.cxDen))
   }
   cexInt(
@@ -554,10 +532,10 @@ export function cexDiv(a: Cex, b: Cex): Cex {
   if a.cxPat || b.cxPat { return cexNotConst() }
   const neg = a.cxNeg != b.cxNeg
   if a.cxFloat || b.cxFloat {
-    if cxmIsZero(b.cxNum) { return cexNotConst() }
+    if bigIsZero(b.cxNum) { return cexNotConst() }
     return cexFrac(neg, cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))
   }
-  if cxmIsZero(b.cxNum) {
+  if bigIsZero(b.cxNum) {
     return cexError("division by zero in a constant expression")
   }
   cexInt(neg, cxmDivmod(a.cxNum, b.cxNum)[0], false)
@@ -568,14 +546,14 @@ export function cexRem(a: Cex, b: Cex): Cex {
   if cexBad(a, b) { return cexPass(a, b) }
   if a.cxPat || b.cxPat { return cexNotConst() }
   if a.cxFloat || b.cxFloat {
-    if cxmIsZero(b.cxNum) { return cexNotConst() }
+    if bigIsZero(b.cxNum) { return cexNotConst() }
     const q = cxmDivmod(cxmMul(a.cxNum, b.cxDen), cxmMul(a.cxDen, b.cxNum))[0]
     const qb = cexMul(cexMake(true, false, a.cxNeg != b.cxNeg, q, cxmOne()), b)
     const r = cexAdd(cexToFloat(a), qb, true)
-    if !cexOk(r) || !cxmIsZero(r.cxNum) { return r }
+    if !cexOk(r) || !bigIsZero(r.cxNum) { return r }
     return cexMake(true, false, a.cxNeg, r.cxNum, r.cxDen)
   }
-  if cxmIsZero(b.cxNum) {
+  if bigIsZero(b.cxNum) {
     return cexError("division by zero in a constant expression")
   }
   cexInt(a.cxNeg, cxmDivmod(a.cxNum, b.cxNum)[1], false)
@@ -658,7 +636,7 @@ export function cexShift(a: Cex, b: Cex, op: string): Cex {
   let k = 0
   if !big { k = b.cxNum[0] }
   if op == "<<" {
-    if cxmIsZero(a.cxNum) {
+    if bigIsZero(a.cxNum) {
       return cexMake(false, a.cxPat, false, [0], cxmOne())
     }
     if big || k > CEX_INT_BITS {
@@ -699,7 +677,7 @@ function cexAmbiguous(v: Cex): boolean {
 // Whether `v`, an integer, needs at most `bits` bits as a signed number.
 export function cexFitsSigned(v: Cex, bits: i32): boolean {
   const lim = cxmShl(cxmOne(), bits - 1)
-  const c = cxmCmp(v.cxNum, lim)
+  const c = bigCmp(v.cxNum, lim)
   if c < 0 { return true }
   c == 0 && v.cxNeg
 }
@@ -725,7 +703,7 @@ export function cexScaleBits(v: Cex): i32 {
 // Whether the integer `v` is exact in a binary float of `sigBits` significand bits whose
 // magnitude stays below 2^`maxWidth`.
 export function cexIntExactAt(v: Cex, sigBits: i32, maxWidth: i32): boolean {
-  if cxmIsZero(v.cxNum) { return true }
+  if bigIsZero(v.cxNum) { return true }
   if cxmBitLen(v.cxNum) > maxWidth { return false }
   let m = v.cxNum
   while (m[0] & 1) == 0 { m = cxmShr(m, 1) }
@@ -746,7 +724,7 @@ export function cexLexeme(v: Cex): string {
     if v.cxPat { return cxmToHex(v.cxNum) }
     return cxmToDec(v.cxNum)
   }
-  if cxmIsZero(v.cxNum) { return "0.0" }
+  if bigIsZero(v.cxNum) { return "0.0" }
   const exact = cexFloatExact(v)
   if exact != "" { return exact }
   cexFloatSci(v)
@@ -756,14 +734,14 @@ export function cexLexeme(v: Cex): string {
 function cexFloatExact(v: Cex): string {
   let d = v.cxDen
   let twos = 0
-  while (d[0] & 1) == 0 && !cxmIsZero(d) {
+  while (d[0] & 1) == 0 && !bigIsZero(d) {
     d = cxmShr(d, 1)
     twos = twos + 1
   }
   let fives = 0
   while !cxmIsOne(d) {
     const qr = cxmDivmodSmall(d, 5)
-    if !cxmIsZero(qr[1]) { return "" }
+    if !bigIsZero(qr[1]) { return "" }
     d = qr[0]
     fives = fives + 1
     if fives > CEX_DEC_MAX { return "" }
@@ -796,6 +774,6 @@ function cexFloatSci(v: Cex): string {
   let digits = cxmToDec(qr[0])
   // A nonzero remainder is a sticky digit: the value lies strictly above the digits written.
   const e = digits.length - 1 - s
-  if !cxmIsZero(qr[1]) { digits = digits + "1" }
+  if !bigIsZero(qr[1]) { digits = digits + "1" }
   digits.slice(0, 1) + "." + digits.slice(1, digits.length) + "e" + cxI32Str(e)
 }
