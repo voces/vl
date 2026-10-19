@@ -603,81 +603,103 @@ function constrainEmptyD(srcTy: i32, dstTy: i32, depth: i32) {
   if srcTy < 0 || dstTy < 0 || depth <= 0 { return 0 }
   const s = T.tys[srcTy]
   const d = T.tys[dstTy]
-  // A container null hole delivered to a nullable slot takes the slot's `T` (D2506).
-  if d is TyNullable {
-    if d.nInner >= 0 && cnhIsOpen(srcTy) { return cnhFill(srcTy, dstTy) }
+  match d {
+    TyNullable => {
+      // A container null hole delivered to a nullable slot takes the slot's `T` (D2506).
+      if d.nInner >= 0 && cnhIsOpen(srcTy) { return cnhFill(srcTy, dstTy) }
+      // A nullable destination pins the same holes its inner shape does: a `string[] | null`
+      // field or map value accepts a non-null `[]`, and the hole behind it needs the element
+      // rep either way.
+      return constrainEmptyD(srcTy, d.nInner, depth - 1)
+    }
+    // Every other destination is lined up against the source's shape below.
+    TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
-  // A nullable destination pins the same holes its inner shape does: a `string[] | null` field
-  // or map value accepts a non-null `[]`, and the hole behind it needs the element rep either
-  // way. Unwrapped on the source side too, so a nullable producer flowing into a nullable slot
-  // lines its inner shapes up rather than stopping at the wrapper.
-  if d is TyNullable { return constrainEmptyD(srcTy, d.nInner, depth - 1) }
-  if s is TyNullable { return constrainEmptyD(s.nInner, dstTy, depth - 1) }
-  // An open `[]` delivered to a union is built as its first list member, the arm
-  // `recordRepTyAdopt` records for a literal, so a call returning one pins the same way.
-  if s is TyArray {
-    if s.aElem < 0 {
-      if d is TyUnion {
-        let ui = 0
-        while ui < d.uMembers.length {
-          const um = T.tys[d.uMembers[ui]]
-          if um is TyArray {
-            return constrainEmptyD(srcTy, d.uMembers[ui], depth - 1)
+  match s {
+    TyNullable => {
+      // Unwrapped on the source side too, so a nullable producer flowing into a nullable slot
+      // lines its inner shapes up rather than stopping at the wrapper.
+      return constrainEmptyD(s.nInner, dstTy, depth - 1)
+    }
+    TyArray => {
+      match d {
+        TyUnion => {
+          // An open `[]` delivered to a union is built as its first list member, the arm
+          // `recordRepTyAdopt` records for a literal, so a call returning one pins the same way.
+          if s.aElem < 0 {
+            let ui = 0
+            while ui < d.uMembers.length {
+              const um = T.tys[d.uMembers[ui]]
+              if um is TyArray {
+                return constrainEmptyD(srcTy, d.uMembers[ui], depth - 1)
+              }
+              ui = ui + 1
+            }
           }
-          ui = ui + 1
         }
-        return 0
-      }
-    }
-  }
-  if s is TyArray {
-    if d is TyArray {
-      if s.aElem < 0 {
-        // Both sides open is not a pin but a link — `s.aElem = d.aElem` would write the `-1`
-        // back and lose the fact that these two rows must agree, which `arrDefHoleToI32` needs
-        // once an unpinned hole acquires a default. D1470.
-        if d.aElem < 0 {
-          noteHoleLink(srcTy, dstTy)
-        } else {
-          s.aElem = d.aElem
-          tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+        TyArray => {
+          if s.aElem < 0 {
+            // Both sides open is not a pin but a link — `s.aElem = d.aElem` would write the `-1`
+            // back and lose the fact that these two rows must agree, which `arrDefHoleToI32` needs
+            // once an unpinned hole acquires a default. D1470.
+            if d.aElem < 0 {
+              noteHoleLink(srcTy, dstTy)
+            } else {
+              s.aElem = d.aElem
+              tyMutEpoch = tyMutEpoch + 1 // in-place element pin — canonical keys change
+            }
+          } else {
+            constrainEmptyD(s.aElem, d.aElem, depth - 1)
+          }
         }
-      } else {
-        constrainEmptyD(s.aElem, d.aElem, depth - 1)
+        // A list pins only into a list, or into a union's first list member.
+        TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
       }
+      return 0
     }
-    return 0
-  }
-  if s is TyMap {
-    if d is TyMap {
-      if s.mKey < 0 {
-        s.mKey = d.mKey
-        tyMutEpoch = tyMutEpoch + 1 // in-place key pin
-      }
-      if s.mVal < 0 {
-        s.mVal = d.mVal
-        tyMutEpoch = tyMutEpoch + 1 // in-place value pin
-      } else {
-        constrainEmptyD(s.mVal, d.mVal, depth - 1)
-      }
-    }
-    return 0
-  }
-  // A struct destination pins field-wise, by name. The source is an object literal's own
-  // inferred shape, so its field order is the literal's, not the declaration's — matching
-  // positionally would pin `{ b: fq(), a: [1] }` from the wrong field.
-  if s is TyObj {
-    if d is TyObj {
-      let i = 0
-      while i < s.objFieldNames.length {
-        if i < s.objFieldTypes.length {
-          const dft = objFieldType(d, s.objFieldNames[i])
-          if dft >= 0 { constrainEmptyD(s.objFieldTypes[i], dft, depth - 1) }
+    TyMap => {
+      match d {
+        TyMap => {
+          if s.mKey < 0 {
+            s.mKey = d.mKey
+            tyMutEpoch = tyMutEpoch + 1 // in-place key pin
+          }
+          if s.mVal < 0 {
+            s.mVal = d.mVal
+            tyMutEpoch = tyMutEpoch + 1 // in-place value pin
+          } else {
+            constrainEmptyD(s.mVal, d.mVal, depth - 1)
+          }
         }
-        i = i + 1
+        // A map pins only into a map.
+        TyPrim | TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyArray | TyVar | TyLit | TyNeg => {}
       }
+      return 0
     }
-    return 0
+    TyObj => {
+      match d {
+        TyObj => {
+          // A struct destination pins field-wise, by name. The source is an object literal's own
+          // inferred shape, so its field order is the literal's, not the declaration's — matching
+          // positionally would pin `{ b: fq(), a: [1] }` from the wrong field.
+          let i = 0
+          while i < s.objFieldNames.length {
+            if i < s.objFieldTypes.length {
+              const dft = objFieldType(d, s.objFieldNames[i])
+              if dft >= 0 {
+                constrainEmptyD(s.objFieldTypes[i], dft, depth - 1)
+              }
+            }
+            i = i + 1
+          }
+        }
+        // A struct pins only into a struct.
+        TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+      }
+      return 0
+    }
+    // No other source carries an open hole to pin.
+    TyPrim | TyErr | TyFunc | TyUnion | TyVar | TyLit | TyNeg => {}
   }
   0
 }
@@ -5683,7 +5705,13 @@ export function fillTypeDeclAt(sx: i32) {
     if declIx >= 0 && !fillDone(declIx) {
       markFillDone(declIx)
       const pt = T.tys[declIx]
-      if pt is TyObj { fillObjDeclFields(sd, pt) }
+      match pt {
+        TyObj => {
+          fillObjDeclFields(sd, pt)
+        }
+        // Only a record placeholder has fields to fill.
+        TyPrim | TyErr | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+      }
     }
   } else if sd is UnionDecl {
     // A union's variants are type NAMES; resolve each into the member
@@ -5692,7 +5720,13 @@ export function fillTypeDeclAt(sx: i32) {
     if declIx >= 0 && !fillDone(declIx) {
       markFillDone(declIx)
       const pt = T.tys[declIx]
-      if pt is TyUnion { fillUnionDeclMembers(sx, sd, pt.uMembers) }
+      match pt {
+        TyUnion => {
+          fillUnionDeclMembers(sx, sd, pt.uMembers)
+        }
+        // Only a union placeholder has members to fill.
+        TyPrim | TyErr | TyObj | TyFunc | TyNullable | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
+      }
     }
   }
   0

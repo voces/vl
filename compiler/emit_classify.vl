@@ -15,18 +15,24 @@ import {
   BinExpr,
   Block,
   BoolLit,
+  BreakStmt,
   Call,
   CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
   MC_RUNG_PER_INSTANCE,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -35,11 +41,14 @@ import {
   P,
   Param,
   Paren,
+  Program,
   RetStmt,
   Spread,
   StrLit,
+  TypeDecl,
   TypeRef,
   Unary,
+  UnionDecl,
   WhileStmt,
   arenaEpochNow,
   arenaRefWritesNow,
@@ -1148,8 +1157,13 @@ export function fnSigKeyOf(fe: i32) {
     // coarser answer, so the value-ABI key is minted only where the two agree.
     const r = cloRetKindOf(fe)
     const vk = cloRetValKind(fe)
-    if r == "i32" && vk == "i32" { return key + ">" + repSigTokOfKind("i32") }
-    if r == "f64" && vk == "f64" { return key + ">" + repSigTokOfKind("f64") }
+    match r {
+      "i32" | "f64" => {
+        if vk == r { return key + ">" + repSigTokOfKind(r) }
+      }
+      // Every other result kind is out of the value ABI, and void has no result.
+      "struct" | "list" | "str" | "union" | "reflist" | "map" | "strlist" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" | null => {}
+    }
     return ""
   }
   ""
@@ -1196,46 +1210,52 @@ export function fieldValueFeOf(valIx: i32) { fieldValueFeOfIn(valIx, -1) }
 export function fieldValueFeOfIn(valIx: i32, fnIx: i32) {
   if valIx < 0 { return -1 }
   const v = P.nodes[valIx]
-  if v is FuncDecl { return fnStmtsPosOf(valIx) }
-  if v is Ident {
-    const fe = fnIndexOfInScopeAt(sidOfNode(valIx), v.identName, fnIx, valIx)
-    if fe >= 0 { return fe }
-    // A module-scope `const` bound to a lambda literal (D3847). A function's own bindings keep
-    // the scope chain's answer, which the alias resolvers refine.
-    const li = identLetOfAt(sidOfNode(valIx), fnIx, valIx)
-    if li >= 0 && fnIx >= 0 {
-      const fn = P.nodes[fnIx]
-      if fn is FuncDecl {
-        if bodyLetReadAtSid(fn.fnBody, sidOfNode(valIx), valIx) == li {
-          return -1
+  match v {
+    FuncDecl => {
+      return fnStmtsPosOf(valIx)
+    }
+    Ident => {
+      const fe = fnIndexOfInScopeAt(sidOfNode(valIx), v.identName, fnIx, valIx)
+      if fe >= 0 { return fe }
+      // A module-scope `const` bound to a lambda literal (D3847). A function's own bindings keep
+      // the scope chain's answer, which the alias resolvers refine.
+      const li = identLetOfAt(sidOfNode(valIx), fnIx, valIx)
+      if li >= 0 && fnIx >= 0 {
+        const fn = P.nodes[fnIx]
+        if fn is FuncDecl {
+          if bodyLetReadAtSid(fn.fnBody, sidOfNode(valIx), valIx) == li {
+            return -1
+          }
         }
       }
-    }
-    if li >= 0 {
-      const d = P.nodes[li]
-      if d is LetDecl {
-        // Un-annotated only: an annotation (a union with a function arm) is the binding's rep.
-        if (
-          d.letKw == "const"
-          && d.letType < 0
-          && d.letInit >= 0
-          && P.nodes[d.letInit] is FuncDecl
-        ) {
-          return fnStmtsPosOf(d.letInit)
-        }
-        // A `let` bound once and never assigned holds its lambda like a `const` (D6390).
-        if (
-          d.letKw == "let"
-          && d.letType < 0
-          && d.letInit >= 0
-          && P.nodes[d.letInit] is FuncDecl
-        ) {
-          const lam = cwLambdaDeclOf(v.identName, covarRootFrame(valIx))
-          if lam >= 0 && lam == d.letInit { return fnStmtsPosOf(lam) }
+      if li >= 0 {
+        const d = P.nodes[li]
+        if d is LetDecl {
+          // Un-annotated only: an annotation (a union with a function arm) is the binding's rep.
+          if (
+            d.letKw == "const"
+            && d.letType < 0
+            && d.letInit >= 0
+            && P.nodes[d.letInit] is FuncDecl
+          ) {
+            return fnStmtsPosOf(d.letInit)
+          }
+          // A `let` bound once and never assigned holds its lambda like a `const` (D6390).
+          if (
+            d.letKw == "let"
+            && d.letType < 0
+            && d.letInit >= 0
+            && P.nodes[d.letInit] is FuncDecl
+          ) {
+            const lam = cwLambdaDeclOf(v.identName, covarRootFrame(valIx))
+            if lam >= 0 && lam == d.letInit { return fnStmtsPosOf(lam) }
+          }
         }
       }
+      return -1
     }
-    return -1
+    // No other field value names a function.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -1324,30 +1344,32 @@ export function cloRetValSlot(fe: i32) {
     const srk = fRetKind[fe]
     // D911 — the same redirect on the inferred half: the two halves of one signature must
     // not learn the merge separately.
-    if srk == "struct" {
-      return anonLeafRetRowOf(fnStmts[fe], fRetStructIdx[fe])
+    match srk {
+      "struct" | "nulstruct" => {
+        return anonLeafRetRowOf(fnStmts[fe], fRetStructIdx[fe])
+      }
+      // The inferred concrete-variant result, from the same companion column — the twin of
+      // `emitOneFuncType`'s inferred `variant` arm — and its nullable twin (D1562): every
+      // caller reads the kind and this slot as a pair, and (`"nulvariant"`, -1) trips
+      // `fbValtype`'s bounds guard with `ref valtype with no interned shape`.
+      "variant" | "nulvariant" => {
+        return fRetStructIdx[fe]
+      }
+      // An inferred map return — the map shape from the return expression
+      // (`mapRetExprShape`, capture-aware), so the `$fnsig` result matches the returned
+      // map value's own `$mapStruct`.
+      "map" => {
+        const mrx = fnRetExprOf(fnStmts[fe])
+        if mrx >= 0 { return mapRetExprShape(mrx, fe) }
+      }
+      // An inferred ref-list return — its element name (`fRetRArrElem`, set by the
+      // return-classify scan) resolves the ref-list slot.
+      "reflist" => {
+        return rlSlotByName(fRetRArrElem[fe])
+      }
+      // Every other inferred kind carries no slot.
+      "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
     }
-    if srk == "nulstruct" {
-      return anonLeafRetRowOf(fnStmts[fe], fRetStructIdx[fe])
-    }
-    // The inferred concrete-variant result, from the same companion column — the twin of
-    // `emitOneFuncType`'s inferred `variant` arm. Without it the `$fnsig` and the
-    // function's own functype are minted from two different facts.
-    if srk == "variant" { return fRetStructIdx[fe] }
-    // D1562 — the nullable twin, same column and index space. Every caller reads the kind
-    // and this slot as a pair; without the arm the pair is (`"nulvariant"`, -1) and
-    // `fbValtype`'s bounds guard fires with `ref valtype with no interned shape`.
-    if srk == "nulvariant" { return fRetStructIdx[fe] }
-    // An inferred map return — the map shape from the return expression
-    // (`mapRetExprShape`, capture-aware), so the `$fnsig` result matches the returned
-    // map value's own `$mapStruct`.
-    if srk == "map" {
-      const mrx = fnRetExprOf(fnStmts[fe])
-      if mrx >= 0 { return mapRetExprShape(mrx, fe) }
-    }
-    // An inferred ref-list return — its element name (`fRetRArrElem`, set by the
-    // return-classify scan) resolves the ref-list slot.
-    if srk == "reflist" { return rlSlotByName(fRetRArrElem[fe]) }
   }
   -1
 }
@@ -1588,23 +1610,28 @@ function fieldClosureFeOfRecvRaw(recvIx: i32, prop: string, fnIx: i32) {
 function fieldClosureFeOfInit(initIx: i32, prop: string, fnIx: i32) {
   if initIx < 0 { return -1 }
   const e = P.nodes[unwrapParen(initIx)]
-  if e is ObjLit {
-    return fieldValueFeOfIn(objFieldVal(unwrapParen(initIx), prop), fnIx)
-  }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const t = fnIndexOfNode(e.callFn)
-      if t >= 0 {
-        const rx = fnRetExprOf(fnStmts[t])
-        if rx >= 0 {
-          const re = P.nodes[unwrapParen(rx)]
-          if re is ObjLit {
-            return fieldValueFeOf(objFieldVal(unwrapParen(rx), prop))
+  match e {
+    ObjLit => {
+      return fieldValueFeOfIn(objFieldVal(unwrapParen(initIx), prop), fnIx)
+    }
+    Call => {
+      if e.callFn < 0 { return -1 }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const t = fnIndexOfNode(e.callFn)
+        if t >= 0 {
+          const rx = fnRetExprOf(fnStmts[t])
+          if rx >= 0 {
+            const re = P.nodes[unwrapParen(rx)]
+            if re is ObjLit {
+              return fieldValueFeOf(objFieldVal(unwrapParen(rx), prop))
+            }
           }
         }
       }
     }
+    // No other initializer has a field to read a function from.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -1804,102 +1831,115 @@ function capturedVariantIndex(fnIx: i32, name: string) {
 export function nulVariantIdxOfExpr(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
-  if e is Paren { return nulVariantIdxOfExpr(e.parInner, fnIx) }
-  // The index half of `exprNullableVariant`'s if-expression rung (D1560) — the row comes
-  // from the arm that carries the rep, which is the arm the kind comes from.
-  if e is IfStmt { return nulVariantIdxOfExpr(ifRepArmValueIx(exprIx), fnIx) }
-  // The index half of the two map rungs in `exprNullableVariant` (D34) — a bare `m[k]` and
-  // an `m[k] ?? d` over an arm-valued map. Same slot and column, so the kind and its
-  // companion index come from one fact.
-  if e is Index {
-    // The index half of the nullable variant-element list arm (D851) — same slot, same
-    // kind gate, the column that names the row.
-    if exprRefArray(e.idxArr, fnIx) {
-      const irls = refListSlotOfExpr(e.idxArr, fnIx)
-      if irls >= 0 && irls < rlElemKindTbl.length {
-        if rlElemKindTbl[irls] == RLK_STRUCT {
-          if rlElemIsNulNiche(irls) {
-            const irlv = rlElemVariantRow(irls)
-            if irlv >= 0 { return irlv }
+  match e {
+    Paren => {
+      return nulVariantIdxOfExpr(e.parInner, fnIx)
+    }
+    // The index half of `exprNullableVariant`'s if-expression rung (D1560) — the row comes
+    // from the arm that carries the rep, which is the arm the kind comes from.
+    IfStmt => {
+      return nulVariantIdxOfExpr(ifRepArmValueIx(exprIx), fnIx)
+    }
+    // The index half of the two map rungs in `exprNullableVariant` (D34) — a bare `m[k]` and
+    // an `m[k] ?? d` over an arm-valued map. Same slot and column, so the kind and its
+    // companion index come from one fact.
+    Index => {
+      // The index half of the nullable variant-element list arm (D851) — same slot, same
+      // kind gate, the column that names the row.
+      if exprRefArray(e.idxArr, fnIx) {
+        const irls = refListSlotOfExpr(e.idxArr, fnIx)
+        if irls >= 0 && irls < rlElemKindTbl.length {
+          if rlElemKindTbl[irls] == RLK_STRUCT {
+            if rlElemIsNulNiche(irls) {
+              const irlv = rlElemVariantRow(irls)
+              if irlv >= 0 { return irlv }
+            }
+          }
+        }
+      }
+      const mri = mapReadMvSlot(exprIx, fnIx)
+      if mri >= 0 { return mvValVariantOf(mri) }
+    }
+    BinExpr => {
+      const cri = coalesceMvSlot(exprIx, fnIx)
+      if cri >= 0 { return mvValVariantOf(cri) }
+      // The index half of `exprNullableVariant`'s `??` rung: the left niche's row.
+      if e.binOp == "??" {
+        if !coalesceResultIsBox(exprIx) {
+          if exprNullableVariant(e.binLeft, fnIx) {
+            return nulVariantIdxOfExpr(e.binLeft, fnIx)
           }
         }
       }
     }
-    const mri = mapReadMvSlot(exprIx, fnIx)
-    if mri >= 0 { return mvValVariantOf(mri) }
-  }
-  if e is BinExpr {
-    const cri = coalesceMvSlot(exprIx, fnIx)
-    if cri >= 0 { return mvValVariantOf(cri) }
-    // The index half of `exprNullableVariant`'s `??` rung: the left niche's row.
-    if e.binOp == "??" {
-      if !coalesceResultIsBox(exprIx) {
-        if exprNullableVariant(e.binLeft, fnIx) {
-          return nulVariantIdxOfExpr(e.binLeft, fnIx)
-        }
-      }
+    AsExpr => {
+      return nulVariantIndexOf(exprIx)
     }
-  }
-  if e is AsExpr { return nulVariantIndexOf(exprIx) }
-  // The index half of the nested-shape field arm — same field, same column, one fact
-  // (D1150).
-  if e is Member { return memberNulVariantRow(exprIx, fnIx) }
-  // A call of a `: Circle | null`-returning function — the callee's own annotation owns the
-  // index, which is what an inferred binding has to read: it has no annotation of its own,
-  // and its slot is declared from this answer.
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const cfe = fnIndexOfNode(e.callFn)
-      if cfe >= 0 {
-        if cloRetValKind(cfe) == "nulvariant" { return cloRetValSlot(cfe) }
+    // The index half of the nested-shape field arm — same field, same column, one fact
+    // (D1150).
+    Member => {
+      return memberNulVariantRow(exprIx, fnIx)
+    }
+    // A call of a `: Circle | null`-returning function — the callee's own annotation owns the
+    // index, which is what an inferred binding has to read: it has no annotation of its own,
+    // and its slot is declared from this answer.
+    Call => {
+      if e.callFn < 0 { return -1 }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const cfe = fnIndexOfNode(e.callFn)
+        if cfe >= 0 {
+          if cloRetValKind(cfe) == "nulvariant" { return cloRetValSlot(cfe) }
+          return -1
+        }
+        // A closure-value callee (`const f = mk; f()`), which `fnIndexOfSid` misses.
+        // `calleeCloSigKeySid` is the key the kind comes from and `sigKeyRetSlot` that same
+        // key's slot digit, so the pair stays one fact.
+        const nvck = calleeCloSigKeyAt(sidOfNode(e.callFn), fnIx, e.callFn)
+        if sigKeyRetKind(nvck) == "nulvariant" { return sigKeyRetSlot(nvck) }
         return -1
       }
-      // A closure-value callee (`const f = mk; f()`), which `fnIndexOfSid` misses.
-      // `calleeCloSigKeySid` is the key the kind comes from and `sigKeyRetSlot` that same
-      // key's slot digit, so the pair stays one fact.
-      const nvck = calleeCloSigKeyAt(sidOfNode(e.callFn), fnIx, e.callFn)
-      if sigKeyRetKind(nvck) == "nulvariant" { return sigKeyRetSlot(nvck) }
-      return -1
-    }
-    if callee is Member {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 {
-        if cloRetValKind(ffe) == "nulvariant" { return cloRetValSlot(ffe) }
+      if callee is Member {
+        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if ffe >= 0 {
+          if cloRetValKind(ffe) == "nulvariant" { return cloRetValSlot(ffe) }
+        }
       }
+      return popArmElemVariantRow(exprIx, fnIx)
     }
-    return popArmElemVariantRow(exprIx, fnIx)
-  }
-  if e is Ident {
-    // A declared local carries its variant index in the slot's parallel column, put there
-    // by the `declareLocals` ladder — read it back rather than re-deriving from the
-    // annotation, which an inferred binding (`const c = x as? Circle`) does not have.
-    const dsl = declaredSlotOf(e.identName)
-    if dsl >= 0 {
-      if localIsRef[dsl] == "nulvariant" { return localStructIdx[dsl] }
+    Ident => {
+      // A declared local carries its variant index in the slot's parallel column, put there
+      // by the `declareLocals` ladder — read it back rather than re-deriving from the
+      // annotation, which an inferred binding (`const c = x as? Circle`) does not have.
+      const dsl = declaredSlotOf(e.identName)
+      if dsl >= 0 {
+        if localIsRef[dsl] == "nulvariant" { return localStructIdx[dsl] }
+      }
+      const pt = paramTypeNodeAt(fnIx, e.identName, exprIx)
+      if pt >= 0 {
+        const pa = nulVariantIndexOf(pt)
+        if pa >= 0 { return pa }
+      }
+      // The capture arm of the twin: a `Circle | null` cell read from an enclosing frame's
+      // env is the same `(ref null $uVarHeap[vi])` niche.
+      const cnv = capturedNulVariantIdx(fnIx, e.identName)
+      if cnv >= 0 { return cnv }
+      // The row half of the kind above, from the same let-level resolver: annotation first,
+      // then the initializer, so an annotated global whose niche comes from its init still
+      // names its row (D1672).
+      const gi = globalLetOfIn(fnIx, e.identName, exprIx)
+      if gi >= 0 { return nulVariantIdxOfLet(gi, -1) }
+      // The frame's own `let`, and the module frame's, last for the reason the rung above them
+      // is not enough: neither storage class is a global, and the declared-locals table that
+      // would answer speaks only while that frame's body is emitted (D1635). Read in the frame
+      // that OWNS the binding, so a nested initialiser resolves where it is written.
+      const fli = frameLetOf(fnIx, e.identName, exprIx)
+      if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
+      const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
+      if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
     }
-    const pt = paramTypeNodeAt(fnIx, e.identName, exprIx)
-    if pt >= 0 {
-      const pa = nulVariantIndexOf(pt)
-      if pa >= 0 { return pa }
-    }
-    // The capture arm of the twin: a `Circle | null` cell read from an enclosing frame's
-    // env is the same `(ref null $uVarHeap[vi])` niche.
-    const cnv = capturedNulVariantIdx(fnIx, e.identName)
-    if cnv >= 0 { return cnv }
-    // The row half of the kind above, from the same let-level resolver: annotation first,
-    // then the initializer, so an annotated global whose niche comes from its init still
-    // names its row (D1672).
-    const gi = globalLetOfIn(fnIx, e.identName, exprIx)
-    if gi >= 0 { return nulVariantIdxOfLet(gi, -1) }
-    // The frame's own `let`, and the module frame's, last for the reason the rung above them
-    // is not enough: neither storage class is a global, and the declared-locals table that
-    // would answer speaks only while that frame's body is emitted (D1635). Read in the frame
-    // that OWNS the binding, so a nested initialiser resolves where it is written.
-    const fli = frameLetOf(fnIx, e.identName, exprIx)
-    if fli >= 0 { return nulVariantIdxOfLetIn(fli, fnIx) }
-    const mli = moduleLocalLetSeenFrom(fnIx, e.identName)
-    if mli >= 0 { return nulVariantIdxOfLetIn(mli, -1) }
+    // No other expression carries a nullable variant row.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -1928,14 +1968,31 @@ export function letNulMapReadValKind(letIx: i32, fnIx: i32): VKind | null {
   const mrs = mapReadMvSlot(d.letInit, fnIx)
   if mrs < 0 { return null }
   if mvValKind[mrs] != MVK_REF { return null }
-  const lvk = mvListValKind(mrs)
-  if lvk == "list" { return "nullist" }
-  if lvk == "strlist" { return "nulstrlist" }
-  if lvk == "f64list" { return "nulf64list" }
-  if lvk == "i64list" { return "nuli64list" }
-  if lvk == "f32list" { return "nulf32list" }
-  if lvk == "u8list" { return "nulu8list" }
-  if lvk == "reflist" { return "nulreflist" }
+  match mvListValKind(mrs) {
+    "list" => {
+      return "nullist"
+    }
+    "strlist" => {
+      return "nulstrlist"
+    }
+    "f64list" => {
+      return "nulf64list"
+    }
+    "i64list" => {
+      return "nuli64list"
+    }
+    "f32list" => {
+      return "nulf32list"
+    }
+    "u8list" => {
+      return "nulu8list"
+    }
+    "reflist" => {
+      return "nulreflist"
+    }
+    // A value that is not a list has no nullable-list twin.
+    "i32" | "struct" | "str" | "union" | "map" | "variant" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "v128" | null => {}
+  }
   // A nested-map value (`{[string]: {[string]: V}}`, vals element kind 3, the inner map
   // struct): the read binds the nullable-map local.
   if rlElemKindTbl[mvRlSlot[mrs]] == RLK_MAP { return "nulmap" }
@@ -2011,16 +2068,23 @@ function popRefElemKind(exprIx: i32, fnIx: i32): i32 {
 function popRefRecvSlot(exprIx: i32, fnIx: i32): i32 {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
-  if e is Paren { return popRefRecvSlot(e.parInner, fnIx) }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Member {
-      if callee.memProp == "pop" || callee.memProp == "get" {
-        if exprRefArray(callee.memObj, fnIx) {
-          return refListSlotOfExpr(callee.memObj, fnIx)
+  match e {
+    Paren => {
+      return popRefRecvSlot(e.parInner, fnIx)
+    }
+    Call => {
+      if e.callFn < 0 { return -1 }
+      const callee = P.nodes[e.callFn]
+      if callee is Member {
+        if callee.memProp == "pop" || callee.memProp == "get" {
+          if exprRefArray(callee.memObj, fnIx) {
+            return refListSlotOfExpr(callee.memObj, fnIx)
+          }
         }
       }
     }
+    // No other expression is a ref-list pop or get.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -2110,6 +2174,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
     // `xs.pop()` over an `i32[][]` — the member callee the Ident and closure legs below
     // cannot see (D1210).
     if popRefElemKind(exprIx, fnIx) == RLK_I32_LIST { return true }
+    if e.callFn < 0 { return false }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfNode(e.callFn)
@@ -2218,6 +2283,7 @@ export function exprNullableRefArray(exprIx: i32, fnIx: i32) {
   if e is Call {
     // `g.pop()` over an `S[][]` — the nested-ref sibling of `exprNullableList`'s pop leg (D1210).
     if popRefElemKind(exprIx, fnIx) == RLK_REF_LIST { return true }
+    if e.callFn < 0 { return false }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       if (
@@ -2327,6 +2393,7 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
     // receiver slot's inner one — the same answer the `Index` arm gives (D1210).
     const pes = popRefRecvSlot(exprIx, fnIx)
     if pes >= 0 && pes < rlElemName.length { return rlElemInnerSlot(pes) }
+    if e.callFn < 0 { return -1 }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const rn = fnRetNulRefArrayNameSid(
@@ -2396,6 +2463,7 @@ export function nulRefArrayInnerSlotOfLet(letIx: i32, fnIx: i32) {
 // context. Mirrors `letIsNulString`'s init fallback for nullable strings.
 export function letIsNulListInfer(letIx: i32, fnIx: i32) {
   if letIsNulList(letIx, fnIx) { return true }
+  if letIx < 0 { return false }
   const d = P.nodes[letIx]
   if d is LetDecl {
     if d.letType < 0 { return exprNullableList(d.letInit, fnIx) }
@@ -2484,6 +2552,7 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
     if isScalarBackedListRep(pek) {
       if pek != null { return vkNulNicheOf(pek) }
     }
+    if e.callFn < 0 { return null }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       const target = fnIndexOfNode(e.callFn)
@@ -2588,100 +2657,114 @@ export function exprNullableString(exprIx: i32, fnIx: i32) {
     if exprNullableString(nlIfStr, fnIx) { return true }
   }
   const e = P.nodes[unwrapParen(exprIx)]
-  if e is AsExpr { return nodeRepIs(unwrapParen(exprIx), "nulstr") }
-  // A string join any link of which can yield `null` is the `(ref null)` block `emitIfExprRef`
-  // builds, as a generic's `a ?? d` joined with a `K | null` pin is (D3281).
-  if e is IfStmt {
-    if e.ifElse < 0 { return false }
-    if !ifChainYieldsNull(unwrapParen(exprIx), fnIx) { return false }
-    return ifExprRefKind(unwrapParen(exprIx), fnIx) == "str"
-  }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if (
-        fnRetNulStringSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn)
-      ) {
-        return true
-      }
-      // A `string | null`-returning function value (a binding, or a `(…) => string | null`
-      // param callee) — its result is the nullable raw array, `>N`.
-      return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulstr"
+  match e {
+    AsExpr => {
+      return nodeRepIs(unwrapParen(exprIx), "nulstr")
     }
-    // A `string | null`-returning field-closure call.
-    if callee is Member {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulstr" }
+    // A string join any link of which can yield `null` is the `(ref null)` block `emitIfExprRef`
+    // builds, as a generic's `a ?? d` joined with a `K | null` pin is (D3281).
+    IfStmt => {
+      if e.ifElse < 0 { return false }
+      if !ifChainYieldsNull(unwrapParen(exprIx), fnIx) { return false }
+      return ifExprRefKind(unwrapParen(exprIx), fnIx) == "str"
     }
-    // Fallback, scoped to a call: a `string | null`-returning closure value call whose callee
-    // the cases above miss, such as an indexed closure-array element, read off its checked rep.
-    return nodeRepIs(exprIx, "nulstr")
-  }
-  if e is Ident {
-    if (
-      paramNulString(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, unwrapParen(exprIx))
-    ) {
-      return true
-    }
-    if declaredNulString(e.identName) { return true }
-    // A captured `string | null`: the env field is the same `(ref null $array)` cell, so it
-    // classifies like the param or local. This is what reconciles the classifier with
-    // `emitCapturedReadRecover`, which recovers off that field under the same gates.
-    if capturedKindOf(fnIx, e.identName) == "nulstr" { return true }
-    return globalIsNulStringSid(
-      fnIx,
-      sidOfNode(unwrapParen(exprIx)),
-      unwrapParen(exprIx),
-    )
-  }
-  // A `string | null` struct field read (`a.v`, code 20) yields a nullable string ref.
-  if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_STR }
-  // A `?.` over a nullable struct whose leaf field is a string — plain or already nullable —
-  // is `string | null`, the same niche `emitOptMemberValue`'s `nulstr` arm builds. Saying so
-  // here routes `(x?.y) ?? "z"` through the string-niche `??` core and gives `print` and an
-  // un-annotated binding the string rep (D802).
-  if e is OptMember {
-    const occ = optChainLeafFieldCode(exprIx, fnIx)
-    return occ == FC_STR || occ == FC_NUL_STR
-  }
-  // A bare `m[k]` over a string-valued map is `string | null` — `emitMapGet` yields the
-  // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
-  if e is Index {
-    const mrs = mapReadMvSlot(exprIx, fnIx)
-    if mrs >= 0 { return mvValKind[mrs] == MVK_STR }
-    // A `(string | null)[]` element read yields `string | null` — the string-ref niche kept
-    // `(ref null $aTypeIdx)` by the dedicated `emitIndex` arm — so `const t = p[i]` binds the
-    // nullable-string kind and `t != null` narrows against it.
-    if exprNulStrArray(e.idxArr, fnIx) { return true }
-  }
-  // A chained `a ?? b` over nullable strings is itself nullable-string when the default `b`
-  // is also nullable — the left-associative `(f() ?? g()) ?? d` shape, where the classifier
-  // sees the nested `??` as `binLeft` before `emitExpr` re-associates it. Keeps print
-  // routing and `exprString` consistent with the emitted rep.
-  if e is BinExpr {
-    if e.binOp == "??" {
-      // A fused read over a nullable-string-valued map stays `string | null` only when the
-      // default is itself nullable — a non-null default coalesces every null, stored
-      // included, to a non-null string.
-      const cns = coalesceMvSlot(exprIx, fnIx)
-      if cns >= 0 {
+    Call => {
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
         if (
-          mvValKind[cns] == MVK_STR
-          && coalesceStaysNullable(exprIx, cns, fnIx)
+          fnRetNulStringSid(
+            sidOfNode(e.callFn),
+            callee.identName,
+            fnIx,
+            e.callFn,
+          )
         ) {
           return true
         }
+        // A `string | null`-returning function value (a binding, or a `(…) => string | null`
+        // param callee) — its result is the nullable raw array, `>N`.
+        return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulstr"
       }
-      if exprNullableString(e.binLeft, fnIx) {
-        if exprNullableString(e.binRight, fnIx) { return true }
-        // A bare `null` default is nullable too (D801): `exprNullableString` alone answers
-        // only for a default that is itself a nullable string, so `s ?? null` reads as
-        // non-null and the lowering declares a `(ref $aTypeIdx)` block.
-        // `coalesceDefaultNullable` is the one nullability decision every other `??` arm takes.
-        return coalesceDefaultNullable(e.binRight, fnIx)
+      // A `string | null`-returning field-closure call.
+      if callee is Member {
+        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "nulstr" }
+      }
+      // Fallback, scoped to a call: a `string | null`-returning closure value call whose callee
+      // the cases above miss, such as an indexed closure-array element, read off its checked rep.
+      return nodeRepIs(exprIx, "nulstr")
+    }
+    Ident => {
+      if (
+        paramNulString(fnIx, e.identName)
+        && paramReadAt(fnIx, e.identName, unwrapParen(exprIx))
+      ) {
+        return true
+      }
+      if declaredNulString(e.identName) { return true }
+      // A captured `string | null`: the env field is the same `(ref null $array)` cell, so it
+      // classifies like the param or local. This is what reconciles the classifier with
+      // `emitCapturedReadRecover`, which recovers off that field under the same gates.
+      if capturedKindOf(fnIx, e.identName) == "nulstr" { return true }
+      return globalIsNulStringSid(
+        fnIx,
+        sidOfNode(unwrapParen(exprIx)),
+        unwrapParen(exprIx),
+      )
+    }
+    // A `string | null` struct field read (`a.v`, code 20) yields a nullable string ref.
+    Member => {
+      return memberFieldCode(exprIx, fnIx) == FC_NUL_STR
+    }
+    // A `?.` over a nullable struct whose leaf field is a string — plain or already nullable —
+    // is `string | null`, the same niche `emitOptMemberValue`'s `nulstr` arm builds. Saying so
+    // here routes `(x?.y) ?? "z"` through the string-niche `??` core and gives `print` and an
+    // un-annotated binding the string rep (D802).
+    OptMember => {
+      const occ = optChainLeafFieldCode(exprIx, fnIx)
+      return occ == FC_STR || occ == FC_NUL_STR
+    }
+    // A bare `m[k]` over a string-valued map is `string | null` — `emitMapGet` yields the
+    // `(ref null)` value unrecovered, the string dual of the bare struct-map read.
+    Index => {
+      const mrs = mapReadMvSlot(exprIx, fnIx)
+      if mrs >= 0 { return mvValKind[mrs] == MVK_STR }
+      // A `(string | null)[]` element read yields `string | null` — the string-ref niche kept
+      // `(ref null $aTypeIdx)` by the dedicated `emitIndex` arm — so `const t = p[i]` binds the
+      // nullable-string kind and `t != null` narrows against it.
+      if exprNulStrArray(e.idxArr, fnIx) { return true }
+    }
+    // A chained `a ?? b` over nullable strings is itself nullable-string when the default `b`
+    // is also nullable — the left-associative `(f() ?? g()) ?? d` shape, where the classifier
+    // sees the nested `??` as `binLeft` before `emitExpr` re-associates it. Keeps print
+    // routing and `exprString` consistent with the emitted rep.
+    BinExpr => {
+      if e.binOp == "??" {
+        // A fused read over a nullable-string-valued map stays `string | null` only when the
+        // default is itself nullable — a non-null default coalesces every null, stored
+        // included, to a non-null string.
+        const cns = coalesceMvSlot(exprIx, fnIx)
+        if cns >= 0 {
+          if (
+            mvValKind[cns] == MVK_STR
+            && coalesceStaysNullable(exprIx, cns, fnIx)
+          ) {
+            return true
+          }
+        }
+        if exprNullableString(e.binLeft, fnIx) {
+          if exprNullableString(e.binRight, fnIx) { return true }
+          // A bare `null` default is nullable too (D801): `exprNullableString` alone answers
+          // only for a default that is itself a nullable string, so `s ?? null` reads as
+          // non-null and the lowering declares a `(ref $aTypeIdx)` block.
+          // `coalesceDefaultNullable` is the one nullability decision every other `??` arm takes.
+          return coalesceDefaultNullable(e.binRight, fnIx)
+        }
       }
     }
+    // No other expression is a nullable string.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -2711,13 +2794,19 @@ export function nulRefStructIdxOfLet(letIx: i32, fnIx: i32) {
 export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return false }
   const e = P.nodes[exprIx]
-  if e is Paren { return exprNullableStruct(e.parInner, fnIx) }
-  // An assignment's value is its target cell, as `exprUnion` states it (D2602).
-  if e is BinExpr {
-    if e.binOp == "=" {
-      const ar = asgReadNode(exprIx, fnIx)
-      if ar != exprIx { return exprNullableStruct(ar, fnIx) }
+  match e {
+    Paren => {
+      return exprNullableStruct(e.parInner, fnIx)
     }
+    // An assignment's value is its target cell, as `exprUnion` states it (D2602).
+    BinExpr => {
+      if e.binOp == "=" {
+        const ar = asgReadNode(exprIx, fnIx)
+        if ar != exprIx { return exprNullableStruct(ar, fnIx) }
+      }
+    }
+    // Any other expression is classified below.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   // An `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560). Asked
   // first because the rung below returns whatever its non-null predicate says, and a
@@ -2732,132 +2821,139 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
   // `x as? S` over a union yields `S | null`, the nullable struct ref. The `AsExpr` twin of
   // the `exprNullableString` arm; both read the cast's own recorded type, which for the
   // coalescing member is the nullable result.
-  if e is AsExpr {
-    if nodeRepIs(exprIx, "nulstruct") { return true }
-    return asNulStructRow(exprIx) >= 0
-  }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      if fnRetNulRefSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn) {
+  match e {
+    AsExpr => {
+      if nodeRepIs(exprIx, "nulstruct") { return true }
+      return asNulStructRow(exprIx) >= 0
+    }
+    Call => {
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        if (
+          fnRetNulRefSid(sidOfNode(e.callFn), callee.identName, fnIx, e.callFn)
+        ) {
+          return true
+        }
+        // An `S | null`-returning function value (a binding, or a `(…) => S | null` param
+        // callee) — its result is the nullable struct ref, `>nN;`.
+        if calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulstruct" {
+          return true
+        }
+      }
+      // An `S | null`-returning field-closure call.
+      if callee is Member {
+        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if ffe >= 0 && repOfFnSlot(ffe).rdKind == "nulstruct" { return true }
+      }
+      // `xs.pop()` and `xs.get(i)` over a struct-element ref list yield `S | null` — a pop of
+      // an empty list and an out-of-range get are both null.
+      if structListPopGetElem(exprIx, fnIx) >= 0 { return true }
+      // Fallback, scoped to a call: a nullable-struct-returning closure value call whose callee
+      // the cases above miss, such as an indexed closure-array element. Either object niche
+      // counts, a union arm's included, so `letIsNulRef` classifies such a binding nullable
+      // and its `!= null` narrow gets context.
+      return nodeRepIs(exprIx, "nulstruct") || nodeRepIs(exprIx, "nulvariant")
+    }
+    Ident => {
+      if (
+        paramNulRef(fnIx, e.identName)
+        && paramReadAt(fnIx, e.identName, exprIx)
+      ) {
         return true
       }
-      // An `S | null`-returning function value (a binding, or a `(…) => S | null` param
-      // callee) — its result is the nullable struct ref, `>nN;`.
-      if calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulstruct" {
-        return true
+      if declaredNulRef(e.identName) { return true }
+      // A captured nullable struct: the env field is `(ref null $S)`, so classify it nullable,
+      // else `p != null` reads as struct equality. The struct index resolves through
+      // `capturedStructIndex`.
+      if capturedKindOf(fnIx, e.identName) == "nulstruct" { return true }
+      // The frame's own `let`, last for the reason the map arms take it last: every resolver
+      // above speaks for a storage class this one does not.
+      const fns = frameLetOf(fnIx, e.identName, exprIx)
+      if fns >= 0 && letIsNulRef(fns, fnIx) { return true }
+      const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx)
+      if gli >= 0 { return letIsNulRef(gli, -1) }
+      // The module frame's block `let`, which is neither a frame's nor a global: a capture's env
+      // field is typed with no frame current, so only this rung sees its niche (D6730).
+      if frameChainBindsName(fnIx, e.identName) { return false }
+      const mli = moduleLocalLetOfAt(emitRootIx, e.identName, exprIx)
+      if mli >= 0 { return letIsNulRef(mli, -1) }
+      return false
+    }
+    // A nested-struct field read (code 15) is stored `(ref null $S)`: an `S | null` field
+    // genuinely carries null, and a plain `inner: S` field shares the nullable storage, so
+    // the read is nullable-classified and the consumer inserts `ref.as_non_null` before a
+    // chained field access.
+    Member => {
+      if memberFieldCode(exprIx, fnIx) != FC_STRUCT { return false }
+      // A code-15 field whose target is a union arm stores `(ref null $uVarHeap[vi])`, not
+      // `(ref null $S)`, and the variant twin owns it. Declining here keeps the two twins
+      // from both answering yes about one read (D1150).
+      return memberNulVariantRow(exprIx, fnIx) < 0
+    }
+    // The `?.` spelling of the same read (D1084): `o?.f` over a code-15 field is `S | null`
+    // for the second reason as well as the first — the chain itself can be null — so it is
+    // nullable-classified wherever `o.f` is, which is what makes the un-annotated spelling
+    // work. `optChainStructIdxOf` is the resolver the emitter uses at this node.
+    OptMember => {
+      const oNsi = optChainStructIdxOf(e.omObj, fnIx)
+      if oNsi >= 0 {
+        const oNfi = sFieldIndex(oNsi, e.omProp)
+        if oNfi >= 0 { return sFieldTypeAt(oNsi, oNfi) == FC_STRUCT }
       }
+      return false
     }
-    // An `S | null`-returning field-closure call.
-    if callee is Member {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 && repOfFnSlot(ffe).rdKind == "nulstruct" { return true }
-    }
-    // `xs.pop()` and `xs.get(i)` over a struct-element ref list yield `S | null` — a pop of
-    // an empty list and an out-of-range get are both null.
-    if structListPopGetElem(exprIx, fnIx) >= 0 { return true }
-    // Fallback, scoped to a call: a nullable-struct-returning closure value call whose callee
-    // the cases above miss, such as an indexed closure-array element. Either object niche
-    // counts, a union arm's included, so `letIsNulRef` classifies such a binding nullable
-    // and its `!= null` narrow gets context.
-    return nodeRepIs(exprIx, "nulstruct") || nodeRepIs(exprIx, "nulvariant")
-  }
-  if e is Ident {
-    if (
-      paramNulRef(fnIx, e.identName)
-      && paramReadAt(fnIx, e.identName, exprIx)
-    ) {
-      return true
-    }
-    if declaredNulRef(e.identName) { return true }
-    // A captured nullable struct: the env field is `(ref null $S)`, so classify it nullable,
-    // else `p != null` reads as struct equality. The struct index resolves through
-    // `capturedStructIndex`.
-    if capturedKindOf(fnIx, e.identName) == "nulstruct" { return true }
-    // The frame's own `let`, last for the reason the map arms take it last: every resolver
-    // above speaks for a storage class this one does not.
-    const fns = frameLetOf(fnIx, e.identName, exprIx)
-    if fns >= 0 && letIsNulRef(fns, fnIx) { return true }
-    const gli = globalLetOfSidIn(fnIx, sidOfNode(exprIx), exprIx)
-    if gli >= 0 { return letIsNulRef(gli, -1) }
-    // The module frame's block `let`, which is neither a frame's nor a global: a capture's env
-    // field is typed with no frame current, so only this rung sees its niche (D6730).
-    if frameChainBindsName(fnIx, e.identName) { return false }
-    const mli = moduleLocalLetOfAt(emitRootIx, e.identName, exprIx)
-    if mli >= 0 { return letIsNulRef(mli, -1) }
-    return false
-  }
-  // A nested-struct field read (code 15) is stored `(ref null $S)`: an `S | null` field
-  // genuinely carries null, and a plain `inner: S` field shares the nullable storage, so
-  // the read is nullable-classified and the consumer inserts `ref.as_non_null` before a
-  // chained field access.
-  if e is Member {
-    if memberFieldCode(exprIx, fnIx) != FC_STRUCT { return false }
-    // A code-15 field whose target is a union arm stores `(ref null $uVarHeap[vi])`, not
-    // `(ref null $S)`, and the variant twin owns it. Declining here keeps the two twins
-    // from both answering yes about one read (D1150).
-    return memberNulVariantRow(exprIx, fnIx) < 0
-  }
-  // The `?.` spelling of the same read (D1084): `o?.f` over a code-15 field is `S | null`
-  // for the second reason as well as the first — the chain itself can be null — so it is
-  // nullable-classified wherever `o.f` is, which is what makes the un-annotated spelling
-  // work. `optChainStructIdxOf` is the resolver the emitter uses at this node.
-  if e is OptMember {
-    const oNsi = optChainStructIdxOf(e.omObj, fnIx)
-    if oNsi >= 0 {
-      const oNfi = sFieldIndex(oNsi, e.omProp)
-      if oNfi >= 0 { return sFieldTypeAt(oNsi, oNfi) == FC_STRUCT }
-    }
-    return false
-  }
-  // An index into a nullable-struct array (`(P | null)[]`) yields `P | null` — the element
-  // legitimately holds null, so the read is not recovered to non-null as a `P[]` element
-  // is. `const e = xs[i]` binds the nullable-struct niche.
-  if e is Index {
-    if exprRefArray(e.idxArr, fnIx) {
-      // Guard the slot: a narrowed union-arm rebind receiver classifies `exprRefArray` true
-      // while the slot resolver can still miss, and an unguarded `rlElemKindTbl[-1]` is an
-      // out-of-bounds crash in the compiler itself.
-      const slot = refListSlotOfExpr(e.idxArr, fnIx)
-      if slot >= 0 && slot < rlElemKindTbl.length {
-        if rlElemKindTbl[slot] == RLK_STRUCT {
-          // The element must be a struct row, not a union arm (D851): a `(Circle | null)[]`
-          // whose `Circle` is a declared union's member also interns kind 1, and its element
-          // heap is `uVarHeap[vi]` rather than `sHeapIdx`, so claiming it here binds the read
-          // to a `nulstruct` local whose struct row does not exist.
-          if rlElemVariantRow(slot) < 0 {
-            if rlElemIsNulNiche(slot) { return true }
+    // An index into a nullable-struct array (`(P | null)[]`) yields `P | null` — the element
+    // legitimately holds null, so the read is not recovered to non-null as a `P[]` element
+    // is. `const e = xs[i]` binds the nullable-struct niche.
+    Index => {
+      if exprRefArray(e.idxArr, fnIx) {
+        // Guard the slot: a narrowed union-arm rebind receiver classifies `exprRefArray` true
+        // while the slot resolver can still miss, and an unguarded `rlElemKindTbl[-1]` is an
+        // out-of-bounds crash in the compiler itself.
+        const slot = refListSlotOfExpr(e.idxArr, fnIx)
+        if slot >= 0 && slot < rlElemKindTbl.length {
+          if rlElemKindTbl[slot] == RLK_STRUCT {
+            // The element must be a struct row, not a union arm (D851): a `(Circle | null)[]`
+            // whose `Circle` is a declared union's member also interns kind 1, and its element
+            // heap is `uVarHeap[vi]` rather than `sHeapIdx`, so claiming it here binds the read
+            // to a `nulstruct` local whose struct row does not exist.
+            if rlElemVariantRow(slot) < 0 {
+              if rlElemIsNulNiche(slot) { return true }
+            }
           }
         }
       }
+      // A bare `m[k]` over a struct-valued map is `S | null`: the `vals` slot is
+      // `(ref null $S)` and `emitMapGet` yields it unrecovered, a miss being `ref.null`. So
+      // `const v = m[k]` binds the nullable-struct niche; a `?? d` read over a non-null value
+      // stays the non-null struct, which the `BinExpr` arm settles.
+      const mrs = mapReadMvSlot(exprIx, fnIx)
+      if mrs >= 0 { return mvValKind[mrs] == MVK_STRUCT }
     }
-    // A bare `m[k]` over a struct-valued map is `S | null`: the `vals` slot is
-    // `(ref null $S)` and `emitMapGet` yields it unrecovered, a miss being `ref.null`. So
-    // `const v = m[k]` binds the nullable-struct niche; a `?? d` read over a non-null value
-    // stays the non-null struct, which the `BinExpr` arm settles.
-    const mrs = mapReadMvSlot(exprIx, fnIx)
-    if mrs >= 0 { return mvValKind[mrs] == MVK_STRUCT }
-  }
-  // A `m[k] ?? d` read over a nullable-struct-valued map stays `S | null` only when the
-  // default is itself nullable; a non-null default coalesces every null, stored included,
-  // to the non-null struct, which `exprStruct` claims.
-  if e is BinExpr {
-    const cns = coalesceMvSlot(exprIx, fnIx)
-    if cns >= 0 {
-      return mvValKind[cns] == MVK_STRUCT
-        && coalesceStaysNullable(exprIx, cns, fnIx)
-    }
-    // The non-map `??` over the same niche obeys the identical rule — the consumer half of
-    // the decision `emitCoalesce`'s nullable-struct arm makes. Without it an un-annotated
-    // `const nv = p ?? q` binds a non-null struct cell and its `nv != null` lowers as struct
-    // equality, while an annotated consumer takes the `(ref null $S)` cell.
-    if e.binOp == "??" {
-      // A join to a default of another type is the union box, never the operand's niche.
-      if coalesceResultIsBox(exprIx) { return false }
-      if exprNullableStruct(e.binLeft, fnIx) {
-        return coalesceDefaultNullable(e.binRight, fnIx)
+    // A `m[k] ?? d` read over a nullable-struct-valued map stays `S | null` only when the
+    // default is itself nullable; a non-null default coalesces every null, stored included,
+    // to the non-null struct, which `exprStruct` claims.
+    BinExpr => {
+      const cns = coalesceMvSlot(exprIx, fnIx)
+      if cns >= 0 {
+        return mvValKind[cns] == MVK_STRUCT
+          && coalesceStaysNullable(exprIx, cns, fnIx)
+      }
+      // The non-map `??` over the same niche obeys the identical rule — the consumer half of
+      // the decision `emitCoalesce`'s nullable-struct arm makes. Without it an un-annotated
+      // `const nv = p ?? q` binds a non-null struct cell and its `nv != null` lowers as struct
+      // equality, while an annotated consumer takes the `(ref null $S)` cell.
+      if e.binOp == "??" {
+        // A join to a default of another type is the union box, never the operand's niche.
+        if coalesceResultIsBox(exprIx) { return false }
+        if exprNullableStruct(e.binLeft, fnIx) {
+          return coalesceDefaultNullable(e.binRight, fnIx)
+        }
       }
     }
+    // No other expression is a nullable struct.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -2868,6 +2964,7 @@ export function exprNullableStruct(exprIx: i32, fnIx: i32) {
 export function fnRetExprOf(fnIx: i32) {
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
+    if fn.fnBody < 0 { return -1 }
     const b = P.nodes[fn.fnBody]
     if b is Block {
       const stmts = b.blkStmts
@@ -2914,6 +3011,7 @@ export function mapRetExprShape(rx: i32, fe: i32) {
     }
   }
   if e is Call {
+    if e.callFn < 0 { return -1 }
     const callee = P.nodes[e.callFn]
     if callee is Ident {
       // A bare `Map()` or `Set()`, and a call through a function-typed parameter or local
@@ -2982,6 +3080,7 @@ function fnAssignRetTarget(fe: i32): i32 {
   if fn is FuncDecl {
     // An annotated return already drives the functype from its annotation — leave it alone.
     if fn.fnRet >= 0 { return -1 }
+    if fn.fnBody < 0 { return -1 }
     const b = P.nodes[fn.fnBody]
     if b is Block {
       const st = b.blkStmts
@@ -3377,6 +3476,7 @@ function fnAssignCellSlot(fnIx: i32, tx: i32) {
 function fnAssignCellMapShape(fnIx: i32, tx: i32, k: VKind) {
   if tx < 0 { return -1 }
   const nm = identNameOrEmpty(tx)
+  if fnIx < 0 { return -1 }
   const fn = P.nodes[fnIx]
   if fn is FuncDecl {
     const li = bodyLetReadAt(fn.fnBody, nm, tx)
@@ -3566,9 +3666,11 @@ export function fnAssignRetSlot(fe: i32) {
   // shape points the cell at the mono map, so this arm has to sit beside the `map` and
   // `nulmap` kinds rather than after them.
   if k == "map" || k == "nulmap" {
+    if fe < 0 { return -1 }
     return fnAssignCellMapShape(fnStmts[fe], fnAssignRetTarget(fe), k)
   }
   if k != "struct" && k != "nulstruct" { return -1 }
+  if fe < 0 { return -1 }
   fnAssignCellSlot(fnStmts[fe], fnAssignRetTarget(fe))
 }
 
@@ -3586,6 +3688,7 @@ export function inferredRetMapSlot(ti: i32) {
 function inferredRetMapSlotCore(ti: i32) {
   const ark = fnAssignRetKind(ti)
   if ark == "map" || ark == "nulmap" { return fnAssignRetSlot(ti) }
+  if ti < 0 { return -1 }
   const mrx = fnRetExprOf(fnStmts[ti])
   if mrx >= 0 { return mapRetExprShape(mrx, ti) }
   -1
@@ -4004,114 +4107,118 @@ function capSiblingFrees(
 export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
-  if n is FuncDecl {
-    capScanFunc(ix, n, bound, caps)
-    return 0
-  }
-  if n is Block {
-    const stmts = n.blkStmts
-    let i = 0
-    const savedBlkTop = narrowTop
-    const mark = capTrailName.length
-    while i < stmts.length {
-      if cnRecording { preStmtNarrow(stmts[i]) }
-      capScan(stmts[i], bound, caps)
-      // A guard `if` with no else whose then-branch always leaves narrows the rest of the
-      // block, so a closure written below the guard is inside that narrowing exactly as one
-      // written in an else-arm is.
-      if cnRecording { cnPostGuard(stmts[i]) }
-      i = i + 1
+  match n {
+    FuncDecl => {
+      capScanFunc(ix, n, bound, caps)
+      return 0
     }
-    if capTrailName.length > mark { capTrim(bound, mark) }
-    if cnRecording { restoreNarrow(savedBlkTop) }
-    return 0
-  }
-  if n is LetDecl {
-    if n.letInit >= 0 { capScan(n.letInit, bound, caps) }
-    capBind(bound, n.letName)
-    return 0
-  }
-  if n is RetStmt {
-    if n.retArg >= 0 { capScan(n.retArg, bound, caps) }
-    return 0
-  }
-  if n is IfStmt {
-    capScanIf(ix, bound, caps)
-    return 0
-  }
-  if n is WhileStmt {
-    capScan(n.whileCond, bound, caps)
-    capScan(n.whileBody, bound, caps)
-    return 0
-  }
-  if n is ForRange {
-    capScan(n.frFrom, bound, caps)
-    capScan(n.frTo, bound, caps)
-    if n.frStep >= 0 { capScan(n.frStep, bound, caps) }
-    const rmark = capTrailName.length
-    capBind(bound, n.frVar)
-    capScan(n.frBody, bound, caps)
-    capTrim(bound, rmark)
-    return 0
-  }
-  if n is ForIn {
-    capScanForIn(n, bound, caps)
-    return 0
-  }
-  if n is Ident {
-    capRecord(n.identName, bound, caps, ix)
-    return 0
-  }
-  if n is Call {
-    if !capCalleeExempt(ix, n, bound) { capScan(n.callFn, bound, caps) }
-    capScanEach(n.callArgs, bound, caps)
-    return 0
-  }
-  if n is BinExpr {
-    capScan(n.binLeft, bound, caps)
-    capScan(n.binRight, bound, caps)
-    return 0
-  }
-  if n is Unary {
-    capScan(n.unArg, bound, caps)
-    return 0
-  }
-  if n is Paren {
-    capScan(n.parInner, bound, caps)
-    return 0
-  }
-  if n is Member {
-    capScan(n.memObj, bound, caps)
-    return 0
-  }
-  if n is OptMember {
-    capScan(n.omObj, bound, caps)
-    return 0
-  }
-  if n is Index {
-    capScan(n.idxArr, bound, caps)
-    capScan(n.idxIndex, bound, caps)
-    return 0
-  }
-  if n is IsExpr {
-    capScan(n.isObj, bound, caps)
-    return 0
-  }
-  if n is AsExpr {
-    capScan(n.asObj, bound, caps)
-    return 0
-  }
-  if n is ObjLit {
-    capScanFields(n.objFields, bound, caps)
-    return 0
-  }
-  if n is ArrayLit {
-    capScanEach(n.arrElems, bound, caps)
-    return 0
-  }
-  if n is Spread {
-    capScan(n.spdArg, bound, caps)
-    return 0
+    Block => {
+      const stmts = n.blkStmts
+      let i = 0
+      const savedBlkTop = narrowTop
+      const mark = capTrailName.length
+      while i < stmts.length {
+        if cnRecording { preStmtNarrow(stmts[i]) }
+        capScan(stmts[i], bound, caps)
+        // A guard `if` with no else whose then-branch always leaves narrows the rest of the
+        // block, so a closure written below the guard is inside that narrowing exactly as one
+        // written in an else-arm is.
+        if cnRecording { cnPostGuard(stmts[i]) }
+        i = i + 1
+      }
+      if capTrailName.length > mark { capTrim(bound, mark) }
+      if cnRecording { restoreNarrow(savedBlkTop) }
+      return 0
+    }
+    LetDecl => {
+      if n.letInit >= 0 { capScan(n.letInit, bound, caps) }
+      capBind(bound, n.letName)
+      return 0
+    }
+    RetStmt => {
+      if n.retArg >= 0 { capScan(n.retArg, bound, caps) }
+      return 0
+    }
+    IfStmt => {
+      capScanIf(ix, bound, caps)
+      return 0
+    }
+    WhileStmt => {
+      capScan(n.whileCond, bound, caps)
+      capScan(n.whileBody, bound, caps)
+      return 0
+    }
+    ForRange => {
+      capScan(n.frFrom, bound, caps)
+      capScan(n.frTo, bound, caps)
+      if n.frStep >= 0 { capScan(n.frStep, bound, caps) }
+      const rmark = capTrailName.length
+      capBind(bound, n.frVar)
+      capScan(n.frBody, bound, caps)
+      capTrim(bound, rmark)
+      return 0
+    }
+    ForIn => {
+      capScanForIn(n, bound, caps)
+      return 0
+    }
+    Ident => {
+      capRecord(n.identName, bound, caps, ix)
+      return 0
+    }
+    Call => {
+      if !capCalleeExempt(ix, n, bound) { capScan(n.callFn, bound, caps) }
+      capScanEach(n.callArgs, bound, caps)
+      return 0
+    }
+    BinExpr => {
+      capScan(n.binLeft, bound, caps)
+      capScan(n.binRight, bound, caps)
+      return 0
+    }
+    Unary => {
+      capScan(n.unArg, bound, caps)
+      return 0
+    }
+    Paren => {
+      capScan(n.parInner, bound, caps)
+      return 0
+    }
+    Member => {
+      capScan(n.memObj, bound, caps)
+      return 0
+    }
+    OptMember => {
+      capScan(n.omObj, bound, caps)
+      return 0
+    }
+    Index => {
+      capScan(n.idxArr, bound, caps)
+      capScan(n.idxIndex, bound, caps)
+      return 0
+    }
+    IsExpr => {
+      capScan(n.isObj, bound, caps)
+      return 0
+    }
+    AsExpr => {
+      capScan(n.asObj, bound, caps)
+      return 0
+    }
+    ObjLit => {
+      capScanFields(n.objFields, bound, caps)
+      return 0
+    }
+    ArrayLit => {
+      capScanEach(n.arrElems, bound, caps)
+      return 0
+    }
+    Spread => {
+      capScan(n.spdArg, bound, caps)
+      return 0
+    }
+    // Literals, declarations and a match (lowered to an if before emit) reach no capture.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   0
 }
@@ -4409,53 +4516,62 @@ export function captureValKind(fe: i32, name: string): VKind {
     return "i32"
   }
   const bn = P.nodes[b]
-  if bn is Param { return vtKindOfType(bn.parType) }
-  if bn is LetDecl {
-    if bn.letType >= 0 {
-      const annK = vtKindOfType(bn.letType)
-      // An uninitialized function-typed local is the nullable closure cell (`letIsNulClosure`).
-      if bn.letInit < 0 && annK == "closure" { return "nulclosure" }
-      // The env field must match the LOCAL's own cell, not re-derive from the annotation:
-      // a narrowed nullable initialiser keeps its niche through the binding, because the
-      // narrowing is type-level and the rep is not. Reading the annotation alone declares a
-      // non-null field over a value that arrives nullable (D1632).
-      if bn.letInit >= 0 {
-        const nicheK = vkNulNicheOf(annK)
-        if nicheK != null {
-          const initK = letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
-          if initK == nicheK { return nicheK }
-          // …and a walk variable over niche elements, whose cell only the loop knows (D3139).
-          if (
-            letInitLoopElemKind(b, parentBindingFrameArenaOf(fe, name))
-            == nicheK
-          ) {
-            return nicheK
+  match bn {
+    Param => {
+      return vtKindOfType(bn.parType)
+    }
+    LetDecl => {
+      if bn.letType >= 0 {
+        const annK = vtKindOfType(bn.letType)
+        // An uninitialized function-typed local is the nullable closure cell (`letIsNulClosure`).
+        if bn.letInit < 0 && annK == "closure" { return "nulclosure" }
+        // The env field must match the LOCAL's own cell, not re-derive from the annotation:
+        // a narrowed nullable initialiser keeps its niche through the binding, because the
+        // narrowing is type-level and the rep is not. Reading the annotation alone declares a
+        // non-null field over a value that arrives nullable (D1632).
+        if bn.letInit >= 0 {
+          const nicheK = vkNulNicheOf(annK)
+          if nicheK != null {
+            const initK = letInitCellKind(
+              b,
+              parentBindingFrameArenaOf(fe, name),
+            )
+            if initK == nicheK { return nicheK }
+            // …and a walk variable over niche elements, whose cell only the loop knows (D3139).
+            if (
+              letInitLoopElemKind(b, parentBindingFrameArenaOf(fe, name))
+              == nicheK
+            ) {
+              return nicheK
+            }
+            // The rung above reads the frame, and a MODULE-frame block binding has none, so a
+            // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
+            // one is frame-blind: the field's storage decides it, not the scope (D1759).
+            if initIsNestedStructFieldRead(b) { return nicheK }
           }
-          // The rung above reads the frame, and a MODULE-frame block binding has none, so a
-          // field read's nullable slot goes unseen exactly where the ladder cannot ask. This
-          // one is frame-blind: the field's storage decides it, not the scope (D1759).
-          if initIsNestedStructFieldRead(b) { return nicheK }
+          // An initialiser committing a literal-union ATOM decides the env field whatever the
+          // annotation renders: an INLINE member set softens to `string` while a litunion array
+          // element arrives as the interned i32. Frame-blind, like the niche rung above (D1768).
+          if letInitIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) {
+            return "i32"
+          }
         }
-        // An initialiser committing a literal-union ATOM decides the env field whatever the
-        // annotation renders: an INLINE member set softens to `string` while a litunion array
-        // element arrives as the interned i32. Frame-blind, like the niche rung above (D1768).
-        if letInitIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) {
-          return "i32"
-        }
+        return annK
       }
-      return annK
+      // Un-annotated local: classify the initializer through `letInitCellKind`, the same ladder
+      // `collectLocals` types the binding with, resolved in the owning frame, so a captured
+      // list, string or struct env field carries its real ref valtype. The frame is an arena
+      // index and not an `fnStmts` position — `parentBindingFrameArenaOf` is that one home.
+      if bn.letInit >= 0 {
+        const askWas = capInitAsk
+        capInitAsk = true
+        const ck = letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
+        capInitAsk = askWas
+        return ck
+      }
     }
-    // Un-annotated local: classify the initializer through `letInitCellKind`, the same ladder
-    // `collectLocals` types the binding with, resolved in the owning frame, so a captured
-    // list, string or struct env field carries its real ref valtype. The frame is an arena
-    // index and not an `fnStmts` position — `parentBindingFrameArenaOf` is that one home.
-    if bn.letInit >= 0 {
-      const askWas = capInitAsk
-      capInitAsk = true
-      const ck = letInitCellKind(b, parentBindingFrameArenaOf(fe, name))
-      capInitAsk = askWas
-      return ck
-    }
+    // No other binding has a captured kind.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   "i32"
 }
@@ -4485,66 +4601,72 @@ export function captureValStructIdx(fe: i32, name: string) {
   const bn = P.nodes[b]
   // D891 — a captured parameter whose slot the `??` merge moved reads its env field at the
   // merged row too. The third resolver of the same owner; see `anonLeafParamRowOf`.
-  if bn is Param { return anonLeafParamRowOf(b, annValtypeSlotOf(bn.parType)) }
-  if bn is LetDecl {
-    if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
-    if bn.letInit >= 0 {
-      // The owning frame as an arena index — the same conversion `captureValKind`'s
-      // un-annotated arm makes, and for the same reason: `letIsMap`, `letIsNulRef` and
-      // `letIsRefArray` all forward `pf` to `P.nodes[pf]`.
-      const pf = parentBindingFrameArenaOf(fe, name)
-      // The kind-specific companion index, arm for arm with `letInitCellKind` and with the
-      // slot arguments `collectLocals` passes `addLocalName` for the same bindings. A kind
-      // without its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard
-      // turns a -1 on any ref kind into `ref valtype with no interned shape` (D21).
-      if letInitTyIsNarrowedArm(b, pf) { return letInitTyVariantRow(b) }
-      if letInitTyIsNarrowedNulArm(b, pf) { return letInitTyNulArmRow(b) }
-      if letIsNulMap(b, pf) { return nulMapShapeOf(b, pf) }
-      if letNulMapReadValKind(b, pf) != null {
-        return letNulMapReadSlotArg(b, pf)
-      }
-      if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
-      if letIsNulVariant(b, pf) { return nulVariantIdxOfLet(b, pf) }
-      if letIsNulRef(b, pf) {
-        const nri = nulRefStructIdxOfLet(b, pf)
-        if nri >= 0 { return nri }
-        // A copy of a narrowed module-block binding has no syntactic row; the checker's recorded
-        // type names the row its cell is declared at (D6730).
-        if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
-        return nulStructRowOfNodeTy(bn.letInit)
-      }
-      if letIsNulRefArray(b, pf) { return nulRefArrayInnerSlotOfLet(b, pf) }
-      if letIsRefArray(b, pf) && !letIsUnion(b, pf) {
-        return letRefListSlot(b, pf)
-      }
-      if letIsVariant(b, pf) { return variantIndexOfLet(b, pf) }
-      // The struct rung is a `letIs*` classifier like every rung above it (D731):
-      // `letInitCellKind` types this env field `"struct"` for every struct-valued initializer,
-      // so a slot column answering only for a bare object literal leaves the pair
-      // (`"struct"`, -1). `structIndexOfLet` is the ladder `collectLocals` runs one class over.
-      if letIsStruct(b, pf) {
-        const csi = structIndexOfLet(b, pf)
-        if csi < 0 {
-          const cov = letObjLitVariantIdx(b, pf)
-          if cov >= 0 { return cov }
-        }
-        return csi
-      }
-      // The arena rung's companion, paired with `letInitCellKind`'s: a projection
-      // initialiser's struct row comes from the type the checker recorded, since
-      // `structIndexOfLet` reads a spelling the projection does not carry (D1476).
-      if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
-      // The NULLABLE twin of that rung, paired with `letInitProjKind`'s `nulstruct` answer: a
-      // `box.f: S | null` projection whose receiver no syntactic rung resolves (an un-annotated
-      // module-block binding, D1636) takes its inner row from the recorded `S | null` type.
-      // Without it the kind is `nulstruct` and its slot stays -1 — half a pair (D1933).
-      const nsr = nulStructRowOfNodeTy(bn.letInit)
-      if nsr >= 0 { return nsr }
-      // Its map twin, paired with `letInitProjKind`'s own map arm: a `"map"` cell whose
-      // shape stays -1 is the mono map, which is a different layout and not half a fix.
-      const pms = letInitProjMapShape(b)
-      if pms != -1 { return pms }
+  match bn {
+    Param => {
+      return anonLeafParamRowOf(b, annValtypeSlotOf(bn.parType))
     }
+    LetDecl => {
+      if bn.letType >= 0 { return annValtypeSlotOf(bn.letType) }
+      if bn.letInit >= 0 {
+        // The owning frame as an arena index — the same conversion `captureValKind`'s
+        // un-annotated arm makes, and for the same reason: `letIsMap`, `letIsNulRef` and
+        // `letIsRefArray` all forward `pf` to `P.nodes[pf]`.
+        const pf = parentBindingFrameArenaOf(fe, name)
+        // The kind-specific companion index, arm for arm with `letInitCellKind` and with the
+        // slot arguments `collectLocals` passes `addLocalName` for the same bindings. A kind
+        // without its slot is a loud reject and not a fallback: `fbValtype`'s bounds guard
+        // turns a -1 on any ref kind into `ref valtype with no interned shape` (D21).
+        if letInitTyIsNarrowedArm(b, pf) { return letInitTyVariantRow(b) }
+        if letInitTyIsNarrowedNulArm(b, pf) { return letInitTyNulArmRow(b) }
+        if letIsNulMap(b, pf) { return nulMapShapeOf(b, pf) }
+        if letNulMapReadValKind(b, pf) != null {
+          return letNulMapReadSlotArg(b, pf)
+        }
+        if letIsMap(b, pf) { return letMapShapeOf(b, pf) }
+        if letIsNulVariant(b, pf) { return nulVariantIdxOfLet(b, pf) }
+        if letIsNulRef(b, pf) {
+          const nri = nulRefStructIdxOfLet(b, pf)
+          if nri >= 0 { return nri }
+          // A copy of a narrowed module-block binding has no syntactic row; the checker's recorded
+          // type names the row its cell is declared at (D6730).
+          if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
+          return nulStructRowOfNodeTy(bn.letInit)
+        }
+        if letIsNulRefArray(b, pf) { return nulRefArrayInnerSlotOfLet(b, pf) }
+        if letIsRefArray(b, pf) && !letIsUnion(b, pf) {
+          return letRefListSlot(b, pf)
+        }
+        if letIsVariant(b, pf) { return variantIndexOfLet(b, pf) }
+        // The struct rung is a `letIs*` classifier like every rung above it (D731):
+        // `letInitCellKind` types this env field `"struct"` for every struct-valued initializer,
+        // so a slot column answering only for a bare object literal leaves the pair
+        // (`"struct"`, -1). `structIndexOfLet` is the ladder `collectLocals` runs one class over.
+        if letIsStruct(b, pf) {
+          const csi = structIndexOfLet(b, pf)
+          if csi < 0 {
+            const cov = letObjLitVariantIdx(b, pf)
+            if cov >= 0 { return cov }
+          }
+          return csi
+        }
+        // The arena rung's companion, paired with `letInitCellKind`'s: a projection
+        // initialiser's struct row comes from the type the checker recorded, since
+        // `structIndexOfLet` reads a spelling the projection does not carry (D1476).
+        if letInitTyIsStruct(b) { return letInitTyStructRow(b) }
+        // The NULLABLE twin of that rung, paired with `letInitProjKind`'s `nulstruct` answer: a
+        // `box.f: S | null` projection whose receiver no syntactic rung resolves (an un-annotated
+        // module-block binding, D1636) takes its inner row from the recorded `S | null` type.
+        // Without it the kind is `nulstruct` and its slot stays -1 — half a pair (D1933).
+        const nsr = nulStructRowOfNodeTy(bn.letInit)
+        if nsr >= 0 { return nsr }
+        // Its map twin, paired with `letInitProjKind`'s own map arm: a `"map"` cell whose
+        // shape stays -1 is the mono map, which is a different layout and not half a fix.
+        const pms = letInitProjMapShape(b)
+        if pms != -1 { return pms }
+      }
+    }
+    // No other binding has a captured slot.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -4947,6 +5069,7 @@ export function catSameKind(e: BinExpr, lk: i32, rk: i32, fnIx: i32) {
 export function exprIsStrMethod(callIx: i32, fnIx: i32, prop: string) {
   const c = P.nodes[callIx]
   if c is Call {
+    if c.callFn < 0 { return false }
     const callee = P.nodes[c.callFn]
     if callee is Member {
       if callee.memProp == prop { return exprString(callee.memObj, fnIx) }
@@ -4958,6 +5081,7 @@ export function exprIsStrMethod(callIx: i32, fnIx: i32, prop: string) {
 export function arrNewIntrKind(callIx: i32, fnIx: i32): ArrNewKind {
   const c = P.nodes[callIx]
   if c is Call {
+    if c.callFn < 0 { return "none" }
     const callee = P.nodes[c.callFn]
     if callee is Ident {
       if callee.identName == "__array_new__" {
@@ -5927,6 +6051,7 @@ export function memReadBoxedAtomKind(memIx: i32, fnIx: i32): i32 {
 export function asExprIsUnionCastIn(ix: i32, fnIx: i32): boolean {
   if asExprIsUnionCast(ix) { return true }
   if !asExprOperandIsHole(ix) { return false }
+  if ix < 0 { return false }
   const n = P.nodes[ix]
   if n is AsExpr { return exprUnion(n.asObj, fnIx) }
   false
@@ -6334,43 +6459,49 @@ export function ifExprRefSlot(ifIx: i32, fnIx: i32, kind: VKind) {
   // The arm that carries the rep (D1560) — the same one `ifExprRefKind` classified from, so
   // a kind and its slot are never read off two different arms.
   const tv = ifRepArmValueIx(ifIx)
-  // A nullable-variant join: the row is the arm's own `uVarHeap` index. Without it the
-  // struct arm below would claim the value and `fbValtype` would floor with no interned shape.
-  if kind == "variant" {
-    // The non-null resolver first: `nulVariantIdxOfExpr` answers only for a `T | null` arm,
-    // and the two rungs of `ifExprRefKind` that ask for this kind are exactly those two cases.
-    const dvi = exprVariantIndex(tv, fnIx)
-    if dvi >= 0 { return dvi }
-    return nulVariantIdxOfExpr(tv, fnIx)
-  }
-  if kind == "struct" {
-    // An object-literal arm under a struct destination builds at the destination's row, as
-    // the literal does outside an `if`; its own shape can name an anonymous twin whose
-    // union-valued field (`{ f: A | B }` for `Sx = { f: B | string }`) is stored differently.
-    if pendingStructIdx >= 0 && P.nodes[unwrapParen(tv)] is ObjLit {
+  match kind {
+    // A nullable-variant join: the row is the arm's own `uVarHeap` index. Without it the
+    // struct arm below would claim the value and `fbValtype` would floor with no interned shape.
+    "variant" => {
+      // The non-null resolver first: `nulVariantIdxOfExpr` answers only for a `T | null` arm,
+      // and the two rungs of `ifExprRefKind` that ask for this kind are exactly those two cases.
+      const dvi = exprVariantIndex(tv, fnIx)
+      if dvi >= 0 { return dvi }
+      return nulVariantIdxOfExpr(tv, fnIx)
+    }
+    "struct" => {
+      // An object-literal arm under a struct destination builds at the destination's row, as
+      // the literal does outside an `if`; its own shape can name an anonymous twin whose
+      // union-valued field (`{ f: A | B }` for `Sx = { f: B | string }`) is stored differently.
+      if pendingStructIdx >= 0 && P.nodes[unwrapParen(tv)] is ObjLit {
+        return pendingStructIdx
+      }
+      // With no destination, a join of records into a wider one builds at the join's own row.
+      const jrow = joinedRecordRowOf(ifIx)
+      if jrow >= 0 { return jrow }
+      const si = structIndexOfExpr(tv, fnIx)
+      if si >= 0 { return si }
+      if pendingStructIdx >= 0 { return pendingStructIdx }
+      // Then arm is `null` with no binding seed — resolve the struct from the checker's
+      // nullable join type instead, so the arm rep and nullable blocktype find the layout.
+      const inn = nodeNulStructInnerName(ifIx)
+      if inn != "" { return structIndexOfTypeName(inn) }
       return pendingStructIdx
     }
-    // With no destination, a join of records into a wider one builds at the join's own row.
-    const jrow = joinedRecordRowOf(ifIx)
-    if jrow >= 0 { return jrow }
-    const si = structIndexOfExpr(tv, fnIx)
-    if si >= 0 { return si }
-    if pendingStructIdx >= 0 { return pendingStructIdx }
-    // Then arm is `null` with no binding seed — resolve the struct from the checker's
-    // nullable join type instead, so the arm rep and nullable blocktype find the layout.
-    const inn = nodeNulStructInnerName(ifIx)
-    if inn != "" { return structIndexOfTypeName(inn) }
-    return pendingStructIdx
+    "reflist" => {
+      if pendingListKind == LBK_REF_AT_SLOT { return pendingListSlot }
+      const hs = emptyArrHoleElemSlot(tv)
+      if hs >= 0 { return hs }
+      return refListSlotOfExpr(tv, fnIx)
+    }
+    // A map join's slot is the map shape (mv slot / -1 mono / -2 set), the value every other
+    // map valtype site passes to `mapTypeIdxOf`.
+    "map" => {
+      return mapShapeFoldSet(mapShapeOfExpr(tv, fnIx))
+    }
+    // Every other kind carries no slot here.
+    "i32" | "list" | "str" | "union" | "strlist" | "nulvariant" | "nulstruct" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
   }
-  if kind == "reflist" {
-    if pendingListKind == LBK_REF_AT_SLOT { return pendingListSlot }
-    const hs = emptyArrHoleElemSlot(tv)
-    if hs >= 0 { return hs }
-    return refListSlotOfExpr(tv, fnIx)
-  }
-  // A map join's slot is the map shape (mv slot / -1 mono / -2 set), the value every other
-  // map valtype site passes to `mapTypeIdxOf`.
-  if kind == "map" { return mapShapeFoldSet(mapShapeOfExpr(tv, fnIx)) }
   -1
 }
 
@@ -6438,129 +6569,149 @@ export function exprIsI64(exprIx: i32, fnIx: i32) {
   }
   const e = P.nodes[exprIx]
   // An explicit `x as T` cast has exactly its target rep (see exprIsF64).
-  if e is AsExpr { return e.asTy == "i64" }
-  if e is Paren { return exprIsI64(e.parInner, fnIx) }
-  // A field read `s.x` whose struct field is an i64 slot (code 23) yields an i64.
-  if e is Member {
-    return memFieldTypeCode(exprIx, fnIx) == FC_I64
-      && memReadNarrowOp(exprIx, fnIx) < 0
-  }
-  // A bare `m[k]` read over an i64-valued map yields an i64.
-  if e is Index {
-    // A union-box cell narrowed to one atom reads as that atom (see `indexUnionReadKind`).
-    const iuk = indexUnionReadKind(exprIx, fnIx)
-    if iuk != -3 { return iuk == 3 }
-    // An indexed read of an i64 list (`xs[i]` over `i64[]`) is an i64 — the syntactic dual of
-    // `exprIsF64`'s Index case. Needed for a synthetic `c[0]` (e.g. a captured-mutation box) that
-    // carries no checker-recorded type for the typed-IR fast path above.
-    if exprI64Array(e.idxArr, fnIx) { return true }
-    const mri = mapReadMvSlot(exprIx, fnIx)
-    if mri >= 0 {
-      if mvValKind[mri] == MVK_I64 { return true }
+  match e {
+    AsExpr => {
+      return e.asTy == "i64"
     }
-  }
-  // A bare integer literal past the i32 range is typed i64 by the checker (the host's
-  // `defaultIntegerType` magnitude rule) and lowers as `i64.const`, so it classifies as
-  // i64 here too (a float `.` literal is f64, never i64).
-  if e is NumLit {
-    if numLexIsFloat(e.numText) { return false }
-    return !numLexFitsI32(e.numText)
-  }
-  if e is Ident {
-    // A value-union ident classifies by its narrowed atom (the read unboxes to that rep);
-    // an un-narrowed union ident is the box, never a scalar.
-    const uk = unionIdentReadKind(exprIx, fnIx)
-    if uk != -3 { return uk == 3 }
-    if paramIsI64(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
-      return true
+    Paren => {
+      return exprIsI64(e.parInner, fnIx)
     }
-    if declaredI64(e.identName) { return true }
-    // A captured i64 — same field/read agreement `exprIsF64`'s arm carries: without it
-    // the read widens through `i64.extend_i32_s` over a slot the env already types i64.
-    if capturedKindOf(fnIx, e.identName) == "i64" { return true }
-    return globalIsI64Sid(fnIx, sidOfNode(exprIx), exprIx)
-  }
-  // An arithmetic/bitwise/shift op yields i64 when either operand is i64 (the i32 side
-  // widens). Comparisons and logical connectives produce an i32 bool even over i64
-  // operands, so they are not i64.
-  if e is BinExpr {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    const op = e.binOp
-    if (
-      op == "+"
-      || op == "-"
-      || op == "*"
-      || op == "/"
-      || op == "%"
-      || op == "&"
-      || op == "|"
-      || op == "^"
-      || op == "<<"
-      || op == ">>"
-      || op == ">>>"
-    ) {
-      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_I64) } else { -2 }
-      if m >= 0 { return m == 1 }
-      const r = exprIsI64(e.binLeft, fnIx) || exprIsI64(e.binRight, fnIx)
-      if m != -2 { bcPutB(m, exprIx, fnIx, BC_I64, r) }
-      return r
+    // A field read `s.x` whose struct field is an i64 slot (code 23) yields an i64.
+    Member => {
+      return memFieldTypeCode(exprIx, fnIx) == FC_I64
+        && memReadNarrowOp(exprIx, fnIx) < 0
     }
-    return false
-  }
-  // Unary negation `-x` / bitwise NOT `~x` preserve the operand's i64-ness (`!` is a bool,
-  // never i64; `p+`/`p-` ride their operand but are statement-level).
-  if e is Unary {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    if e.unOp == "-" || e.unOp == "~" {
-      // Except `-2147483648`: the host folds the sign into the literal before defaulting,
-      // so a negated magnitude-2^31 literal is i32 (at I32_MIN) even though the bare
-      // operand literal classifies i64 above.
-      if e.unOp == "-" {
-        const negInner = P.nodes[unwrapParen(e.unArg)]
-        if negInner is NumLit {
-          if !numLexIsFloat(negInner.numText) {
-            if numLexIs2Pow31(negInner.numText) { return false }
+    // A bare `m[k]` read over an i64-valued map yields an i64.
+    Index => {
+      // A union-box cell narrowed to one atom reads as that atom (see `indexUnionReadKind`).
+      const iuk = indexUnionReadKind(exprIx, fnIx)
+      if iuk != -3 { return iuk == 3 }
+      // An indexed read of an i64 list (`xs[i]` over `i64[]`) is an i64 — the syntactic dual of
+      // `exprIsF64`'s Index case. Needed for a synthetic `c[0]` (e.g. a captured-mutation box) that
+      // carries no checker-recorded type for the typed-IR fast path above.
+      if exprI64Array(e.idxArr, fnIx) { return true }
+      const mri = mapReadMvSlot(exprIx, fnIx)
+      if mri >= 0 {
+        if mvValKind[mri] == MVK_I64 { return true }
+      }
+    }
+    // A bare integer literal past the i32 range is typed i64 by the checker (the host's
+    // `defaultIntegerType` magnitude rule) and lowers as `i64.const`, so it classifies as
+    // i64 here too (a float `.` literal is f64, never i64).
+    NumLit => {
+      if numLexIsFloat(e.numText) { return false }
+      return !numLexFitsI32(e.numText)
+    }
+    Ident => {
+      // A value-union ident classifies by its narrowed atom (the read unboxes to that rep);
+      // an un-narrowed union ident is the box, never a scalar.
+      const uk = unionIdentReadKind(exprIx, fnIx)
+      if uk != -3 { return uk == 3 }
+      if (
+        paramIsI64(fnIx, e.identName)
+        && paramReadAt(fnIx, e.identName, exprIx)
+      ) {
+        return true
+      }
+      if declaredI64(e.identName) { return true }
+      // A captured i64 — same field/read agreement `exprIsF64`'s arm carries: without it
+      // the read widens through `i64.extend_i32_s` over a slot the env already types i64.
+      if capturedKindOf(fnIx, e.identName) == "i64" { return true }
+      return globalIsI64Sid(fnIx, sidOfNode(exprIx), exprIx)
+    }
+    // An arithmetic/bitwise/shift op yields i64 when either operand is i64 (the i32 side
+    // widens). Comparisons and logical connectives produce an i32 bool even over i64
+    // operands, so they are not i64.
+    BinExpr => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      const op = e.binOp
+      if (
+        op == "+"
+        || op == "-"
+        || op == "*"
+        || op == "/"
+        || op == "%"
+        || op == "&"
+        || op == "|"
+        || op == "^"
+        || op == "<<"
+        || op == ">>"
+        || op == ">>>"
+      ) {
+        const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_I64) } else { -2 }
+        if m >= 0 { return m == 1 }
+        const r = exprIsI64(e.binLeft, fnIx) || exprIsI64(e.binRight, fnIx)
+        if m != -2 { bcPutB(m, exprIx, fnIx, BC_I64, r) }
+        return r
+      }
+      return false
+    }
+    // Unary negation `-x` / bitwise NOT `~x` preserve the operand's i64-ness (`!` is a bool,
+    // never i64; `p+`/`p-` ride their operand but are statement-level).
+    Unary => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      if e.unOp == "-" || e.unOp == "~" {
+        // Except `-2147483648`: the host folds the sign into the literal before defaulting,
+        // so a negated magnitude-2^31 literal is i32 (at I32_MIN) even though the bare
+        // operand literal classifies i64 above.
+        if e.unOp == "-" {
+          const negInner = P.nodes[unwrapParen(e.unArg)]
+          if negInner is NumLit {
+            if !numLexIsFloat(negInner.numText) {
+              if numLexIs2Pow31(negInner.numText) { return false }
+            }
           }
         }
+        return exprIsI64(e.unArg, fnIx)
       }
-      return exprIsI64(e.unArg, fnIx)
+      return false
     }
-    return false
-  }
-  // A call to an i64-returning function yields i64.
-  if e is Call {
-    // An indexed closure call `fs[i](x)` whose element signature returns i64.
-    if cloArrCallRetKind(exprIx, fnIx) == "i64" { return true }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const target = fnIndexOfInScopeAt(
-        sidOfNode(e.callFn),
-        callee.identName,
-        fnIx,
-        e.callFn,
-      )
-      if target >= 0 { return repOfFnSlot(target).rdKind == "i64" }
-      // An i64-returning function value (a binding / `(…) => i64` param callee).
-      if calleeReturnsI64At(sidOfNode(e.callFn), fnIx, e.callFn) { return true }
-      // A value the generic body shares, typed at a hole this instance pins (D3117).
-      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64
+    // A call to an i64-returning function yields i64.
+    Call => {
+      // An indexed closure call `fs[i](x)` whose element signature returns i64.
+      if cloArrCallRetKind(exprIx, fnIx) == "i64" { return true }
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const target = fnIndexOfInScopeAt(
+          sidOfNode(e.callFn),
+          callee.identName,
+          fnIx,
+          e.callFn,
+        )
+        if target >= 0 { return repOfFnSlot(target).rdKind == "i64" }
+        // An i64-returning function value (a binding / `(…) => i64` param callee).
+        if calleeReturnsI64At(sidOfNode(e.callFn), fnIx, e.callFn) {
+          return true
+        }
+        // A value the generic body shares, typed at a hole this instance pins (D3117).
+        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64
+      }
+      // An i64-returning field-closure call (`o.f(x)` over an `(…) => i64` field).
+      if callee is Member {
+        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "i64" }
+        // Through a field no closure literal of that signature reaches (D3203).
+        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64
+      }
+      return false
     }
-    // An i64-returning field-closure call (`o.f(x)` over an `(…) => i64` field).
-    if callee is Member {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "i64" }
-      // Through a field no closure literal of that signature reaches (D3203).
-      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_I64
+    // A value-position if-expression is i64 when either arm's value is i64.
+    IfStmt => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      return ifExprArmIsKind(exprIx, fnIx, "i64")
     }
-    return false
-  }
-  // A value-position if-expression is i64 when either arm's value is i64.
-  if e is IfStmt {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    return ifExprArmIsKind(exprIx, fnIx, "i64")
+    // No other expression yields an i64.
+    StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -6719,92 +6870,110 @@ export function exprIsF32(exprIx: i32, fnIx: i32) {
   if coalesceAtomKind(exprIx, fnIx) == 5 { return true }
   const e = P.nodes[exprIx]
   // An explicit `x as T` cast has exactly its target rep (see exprIsF64).
-  if e is AsExpr { return e.asTy == "f32" }
-  if e is Paren { return exprIsF32(e.parInner, fnIx) }
-  // An index read `xs[i]` over an `f32[]` yields an f32 element.
-  if e is Index {
-    const iuk = indexUnionReadKind(exprIx, fnIx)
-    if iuk != -3 { return iuk == 5 }
-    if exprF32Array(e.idxArr, fnIx) { return true }
-  }
-  // A field read `s.x` whose struct field is an f32 slot (code 24) yields an f32.
-  if e is Member {
-    return memFieldTypeCode(exprIx, fnIx) == FC_F32
-      && memReadNarrowOp(exprIx, fnIx) < 0
-  }
-  if e is Ident {
-    // A value-union ident classifies by its narrowed atom (see exprIsI64).
-    const uk = unionIdentReadKind(exprIx, fnIx)
-    if uk != -3 { return uk == 5 }
-    if paramIsF32(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
-      return true
+  match e {
+    AsExpr => {
+      return e.asTy == "f32"
     }
-    if declaredF32(e.identName) { return true }
-    // A captured f32 — same field/read agreement `exprIsF64`'s arm carries.
-    if capturedKindOf(fnIx, e.identName) == "f32" { return true }
-    return globalIsF32Sid(fnIx, sidOfNode(exprIx), exprIx)
-  }
-  // Arithmetic yields f32 when either operand is f32. Comparisons and logical connectives
-  // produce an i32 bool even over f32 operands, so they are not f32. `%` is here for the
-  // reason `exprIsF64`'s arm gives (D1586).
-  if e is BinExpr {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    const op = e.binOp
-    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-      // f32 arithmetic yields f32 only when no operand is a genuine f64 — a genuine f64 side
-      // makes the op f64 (the f32 side widens). A float literal does not count.
-      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F32) } else { -2 }
-      if m >= 0 { return m == 1 }
-      const r = !binMixHardF64(e.binLeft, e.binRight, fnIx)
-        && (exprIsF32(e.binLeft, fnIx) || exprIsF32(e.binRight, fnIx))
-      if m != -2 { bcPutB(m, exprIx, fnIx, BC_F32, r) }
-      return r
+    Paren => {
+      return exprIsF32(e.parInner, fnIx)
     }
-    return false
-  }
-  if e is Unary {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    if e.unOp == "-" { return exprIsF32(e.unArg, fnIx) }
-    return false
-  }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const target = fnIndexOfInScopeAt(
-        sidOfNode(e.callFn),
-        callee.identName,
-        fnIx,
-        e.callFn,
-      )
-      if target >= 0 { return repOfFnSlot(target).rdKind == "f32" }
-      // A function-value (closure) callee returning f32, as `exprIsF64`'s arm reads it: a
-      // lambda a hole instance lifts records the hole as its call's type (D2932).
-      if calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "f32" {
+    // An index read `xs[i]` over an `f32[]` yields an f32 element.
+    Index => {
+      const iuk = indexUnionReadKind(exprIx, fnIx)
+      if iuk != -3 { return iuk == 5 }
+      if exprF32Array(e.idxArr, fnIx) { return true }
+    }
+    // A field read `s.x` whose struct field is an f32 slot (code 24) yields an f32.
+    Member => {
+      return memFieldTypeCode(exprIx, fnIx) == FC_F32
+        && memReadNarrowOp(exprIx, fnIx) < 0
+    }
+    Ident => {
+      // A value-union ident classifies by its narrowed atom (see exprIsI64).
+      const uk = unionIdentReadKind(exprIx, fnIx)
+      if uk != -3 { return uk == 5 }
+      if (
+        paramIsF32(fnIx, e.identName)
+        && paramReadAt(fnIx, e.identName, exprIx)
+      ) {
         return true
       }
-      // A value the generic body shares, typed at a hole this instance pins (D3117).
-      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F32
+      if declaredF32(e.identName) { return true }
+      // A captured f32 — same field/read agreement `exprIsF64`'s arm carries.
+      if capturedKindOf(fnIx, e.identName) == "f32" { return true }
+      return globalIsF32Sid(fnIx, sidOfNode(exprIx), exprIx)
     }
-    // An f32-returning field-closure call the typed-IR fast path can't see: the emitter's own
-    // `dispatchRewrite` mints a `Call` with no arena entry for `x[i]` over a `"[]"` closure
-    // field, so without this arm the f32 result bound into an i32 slot and failed validation.
-    if callee is Member {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "f32" }
-      // Through a field no closure literal of that signature reaches (D3203).
-      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F32
+    // Arithmetic yields f32 when either operand is f32. Comparisons and logical connectives
+    // produce an i32 bool even over f32 operands, so they are not f32. `%` is here for the
+    // reason `exprIsF64`'s arm gives (D1586).
+    BinExpr => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      const op = e.binOp
+      if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+        // f32 arithmetic yields f32 only when no operand is a genuine f64 — a genuine f64 side
+        // makes the op f64 (the f32 side widens). A float literal does not count.
+        const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F32) } else { -2 }
+        if m >= 0 { return m == 1 }
+        const r = !binMixHardF64(e.binLeft, e.binRight, fnIx)
+          && (exprIsF32(e.binLeft, fnIx) || exprIsF32(e.binRight, fnIx))
+        if m != -2 { bcPutB(m, exprIx, fnIx, BC_F32, r) }
+        return r
+      }
+      return false
     }
-    return false
-  }
-  // A value-position if-expression is f32 when either arm's value is f32, unless the checker
-  // joined it at f64, which the f32 arm widens to (D2773).
-  if e is IfStmt {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_F64 { return false }
-    return ifExprArmIsKind(exprIx, fnIx, "f32")
+    Unary => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      if e.unOp == "-" { return exprIsF32(e.unArg, fnIx) }
+      return false
+    }
+    Call => {
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const target = fnIndexOfInScopeAt(
+          sidOfNode(e.callFn),
+          callee.identName,
+          fnIx,
+          e.callFn,
+        )
+        if target >= 0 { return repOfFnSlot(target).rdKind == "f32" }
+        // A function-value (closure) callee returning f32, as `exprIsF64`'s arm reads it: a
+        // lambda a hole instance lifts records the hole as its call's type (D2932).
+        if calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "f32" {
+          return true
+        }
+        // A value the generic body shares, typed at a hole this instance pins (D3117).
+        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F32
+      }
+      // An f32-returning field-closure call the typed-IR fast path can't see: the emitter's own
+      // `dispatchRewrite` mints a `Call` with no arena entry for `x[i]` over a `"[]"` closure
+      // field, so without this arm the f32 result bound into an i32 slot and failed validation.
+      if callee is Member {
+        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if ffe >= 0 { return repOfFnSlot(ffe).rdKind == "f32" }
+        // Through a field no closure literal of that signature reaches (D3203).
+        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F32
+      }
+      return false
+    }
+    // A value-position if-expression is f32 when either arm's value is f32, unless the checker
+    // joined it at f64, which the f32 arm widens to (D2773).
+    IfStmt => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      if tyKindOf(nodeTyIxOf(exprIx)) == TK_F64 { return false }
+      return ifExprArmIsKind(exprIx, fnIx, "f32")
+    }
+    // No other expression yields an f32.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -6866,111 +7035,134 @@ export function exprIsF64(exprIx: i32, fnIx: i32) {
   const e = P.nodes[exprIx]
   // An explicit `x as T` cast has exactly its target rep — classify syntactically
   // (robust where `nodeTyIx` is absent, e.g. a monomorphized body).
-  if e is AsExpr { return e.asTy == "f64" }
-  if e is NumLit { return numLexIsFloat(e.numText) }
-  if e is Paren { return exprIsF64(e.parInner, fnIx) }
-  // An index read into an `f64[]` yields an f64 element — so it routes to `__print_f64__`
-  // and participates in f64 arithmetic. A bare `m[k]` read over an f64-valued map likewise yields an f64.
-  if e is Index {
-    const iuk = indexUnionReadKind(exprIx, fnIx)
-    if iuk != -3 { return iuk == 4 }
-    if exprF64Array(e.idxArr, fnIx) { return true }
-    const mrs = mapReadMvSlot(exprIx, fnIx)
-    if mrs >= 0 {
-      if mvValKind[mrs] == MVK_F64 { return true }
+  match e {
+    AsExpr => {
+      return e.asTy == "f64"
     }
-    return false
-  }
-  if e is Ident {
-    // A value-union ident classifies by its narrowed atom (see exprIsI64).
-    const uk = unionIdentReadKind(exprIx, fnIx)
-    if uk != -3 { return uk == 4 }
-    if paramIsF64(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
-      return true
+    NumLit => {
+      return numLexIsFloat(e.numText)
     }
-    if declaredF64(e.identName) { return true }
-    // A captured f64: the env field is typed by `captureValKind`, so the read must classify
-    // by the same answer or the two disagree and widen through `f64.convert_i32_s` over a
-    // slot that already holds an f64 (`vl check`-clean invalid wasm).
-    if capturedKindOf(fnIx, e.identName) == "f64" { return true }
-    return globalIsF64Sid(fnIx, sidOfNode(exprIx), exprIx)
-  }
-  // Arithmetic yields f64 when either operand is f64. Comparisons and logical connectives
-  // produce an i32 bool even over f64 operands, so they are not f64. `%` is here because
-  // float remainder has a form (D1586) and its result is the dividend's width.
-  if e is BinExpr {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    const op = e.binOp
-    if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
-      const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F64) } else { -2 }
-      if m >= 0 { return m == 1 }
-      const r = exprIsF64(e.binLeft, fnIx) || exprIsF64(e.binRight, fnIx)
-      if m != -2 { bcPutB(m, exprIx, fnIx, BC_F64, r) }
-      return r
+    Paren => {
+      return exprIsF64(e.parInner, fnIx)
     }
-    // `xs.get(i) ?? d` over an f64 list yields an f64 (the fused checked read);
-    // the default `d` shares the element type, so classify by the right side.
-    if op == "??" {
-      const lhs = P.nodes[unwrapParen(e.binLeft)]
-      if lhs is Call {
-        const lcallee = P.nodes[lhs.callFn]
-        if lcallee is Member {
-          if lcallee.memProp == "get" || lcallee.memProp == "pop" {
-            if exprF64Array(lcallee.memObj, fnIx) { return true }
-          }
-        }
+    // An index read into an `f64[]` yields an f64 element — so it routes to `__print_f64__`
+    // and participates in f64 arithmetic. A bare `m[k]` read over an f64-valued map likewise yields an f64.
+    Index => {
+      const iuk = indexUnionReadKind(exprIx, fnIx)
+      if iuk != -3 { return iuk == 4 }
+      if exprF64Array(e.idxArr, fnIx) { return true }
+      const mrs = mapReadMvSlot(exprIx, fnIx)
+      if mrs >= 0 {
+        if mvValKind[mrs] == MVK_F64 { return true }
       }
       return false
     }
-    return false
-  }
-  // Unary negation `-x` preserves f64-ness (`~` is integer-only; `!` is bool).
-  if e is Unary {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    if e.unOp == "-" { return exprIsF64(e.unArg, fnIx) }
-    return false
-  }
-  if e is Call {
-    // An indexed closure call `fs[i](x)` whose element signature returns f64.
-    if cloArrCallRetKind(exprIx, fnIx) == "f64" { return true }
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const target = fnIndexOfInScopeAt(
-        sidOfNode(e.callFn),
-        callee.identName,
-        fnIx,
-        e.callFn,
-      )
-      if target >= 0 { return repOfFnSlot(target).rdKind == "f64" }
-      // A function-value (closure) callee returning f64 — its result routes as f64.
-      if calleeReturnsF64At(sidOfNode(e.callFn), fnIx, e.callFn) { return true }
-      // A value the generic body shares, typed at a hole this instance pins to `f64` (D3117).
-      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
+    Ident => {
+      // A value-union ident classifies by its narrowed atom (see exprIsI64).
+      const uk = unionIdentReadKind(exprIx, fnIx)
+      if uk != -3 { return uk == 4 }
+      if (
+        paramIsF64(fnIx, e.identName)
+        && paramReadAt(fnIx, e.identName, exprIx)
+      ) {
+        return true
+      }
+      if declaredF64(e.identName) { return true }
+      // A captured f64: the env field is typed by `captureValKind`, so the read must classify
+      // by the same answer or the two disagree and widen through `f64.convert_i32_s` over a
+      // slot that already holds an f64 (`vl check`-clean invalid wasm).
+      if capturedKindOf(fnIx, e.identName) == "f64" { return true }
+      return globalIsF64Sid(fnIx, sidOfNode(exprIx), exprIx)
     }
-    // A field-closure call `t.op(x)` whose field function returns f64.
-    if callee is Member {
-      const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
-      if ffe >= 0 { return cloRetKindOf(ffe) == "f64" }
-      // Through a field no closure literal of that signature reaches (D3203).
-      return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
+    // Arithmetic yields f64 when either operand is f64. Comparisons and logical connectives
+    // produce an i32 bool even over f64 operands, so they are not f64. `%` is here because
+    // float remainder has a form (D1586) and its result is the dividend's width.
+    BinExpr => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      const op = e.binOp
+      if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+        const m = if arithRegionSeen && (bcOpen || e.binRegion != 0) { bcGet(exprIx, fnIx, BC_F64) } else { -2 }
+        if m >= 0 { return m == 1 }
+        const r = exprIsF64(e.binLeft, fnIx) || exprIsF64(e.binRight, fnIx)
+        if m != -2 { bcPutB(m, exprIx, fnIx, BC_F64, r) }
+        return r
+      }
+      // `xs.get(i) ?? d` over an f64 list yields an f64 (the fused checked read);
+      // the default `d` shares the element type, so classify by the right side.
+      if op == "??" {
+        const lhs = P.nodes[unwrapParen(e.binLeft)]
+        if lhs is Call {
+          if lhs.callFn < 0 { return false }
+          const lcallee = P.nodes[lhs.callFn]
+          if lcallee is Member {
+            if lcallee.memProp == "get" || lcallee.memProp == "pop" {
+              if exprF64Array(lcallee.memObj, fnIx) { return true }
+            }
+          }
+        }
+        return false
+      }
+      return false
     }
-    return false
-  }
-  // A field read `p.x` whose struct field is an f64 slot (code 17) yields an f64.
-  if e is Member {
-    return memFieldTypeCode(exprIx, fnIx) == FC_F64
-      && memReadNarrowOp(exprIx, fnIx) < 0
-  }
-  // A value-position if-expression is f64 when either arm's value is f64 (the branch-join
-  // widens to f64); an `else if` chain recurses through the else slot. A join the checker typed
-  // `f32` is one whose float literal arms adopted an f32 destination, and stays f32 (D2619).
-  if e is IfStmt {
-    // A numeric union is a box whatever its members, never one scalar width.
-    if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) { return false }
-    if tyKindOf(nodeTyIxOf(exprIx)) == TK_F32 { return false }
-    return ifExprArmIsKind(exprIx, fnIx, "f64")
+    // Unary negation `-x` preserves f64-ness (`~` is integer-only; `!` is bool).
+    Unary => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      if e.unOp == "-" { return exprIsF64(e.unArg, fnIx) }
+      return false
+    }
+    Call => {
+      // An indexed closure call `fs[i](x)` whose element signature returns f64.
+      if cloArrCallRetKind(exprIx, fnIx) == "f64" { return true }
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const target = fnIndexOfInScopeAt(
+          sidOfNode(e.callFn),
+          callee.identName,
+          fnIx,
+          e.callFn,
+        )
+        if target >= 0 { return repOfFnSlot(target).rdKind == "f64" }
+        // A function-value (closure) callee returning f64 — its result routes as f64.
+        if calleeReturnsF64At(sidOfNode(e.callFn), fnIx, e.callFn) {
+          return true
+        }
+        // A value the generic body shares, typed at a hole this instance pins to `f64` (D3117).
+        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
+      }
+      // A field-closure call `t.op(x)` whose field function returns f64.
+      if callee is Member {
+        const ffe = fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx)
+        if ffe >= 0 { return cloRetKindOf(ffe) == "f64" }
+        // Through a field no closure literal of that signature reaches (D3203).
+        return tyKindOf(holeOperandTyOf(exprIx, fnIx)) == TK_F64
+      }
+      return false
+    }
+    // A field read `p.x` whose struct field is an f64 slot (code 17) yields an f64.
+    Member => {
+      return memFieldTypeCode(exprIx, fnIx) == FC_F64
+        && memReadNarrowOp(exprIx, fnIx) < 0
+    }
+    // A value-position if-expression is f64 when either arm's value is f64 (the branch-join
+    // widens to f64); an `else if` chain recurses through the else slot. A join the checker typed
+    // `f32` is one whose float literal arms adopted an f32 destination, and stays f32 (D2619).
+    IfStmt => {
+      // A numeric union is a box whatever its members, never one scalar width.
+      if numUnionMinted && numBoxExpr(exprIx, nodeTyIxOf(exprIx)) {
+        return false
+      }
+      if tyKindOf(nodeTyIxOf(exprIx)) == TK_F32 { return false }
+      return ifExprArmIsKind(exprIx, fnIx, "f64")
+    }
+    // No other expression yields an f64.
+    StrLit | CharLit | BoolLit | NullLit | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -6993,6 +7185,7 @@ export function localCloPinFieldTail(callFnIx: i32, fnIx: i32): i32 {
   const lf = P.nodes[lam]
   if !(lf is FuncDecl) { return -1 }
   if lf.fnRet >= 0 { return -1 }
+  if lf.fnBody < 0 { return -1 }
   const lb = P.nodes[lf.fnBody]
   if !(lb is Block) { return -1 }
   if lb.blkStmts.length != 1 { return -1 }
@@ -7163,6 +7356,7 @@ export function cloCallSigKey(callIx: i32, fnIx: i32) {
     // resolvers `v(m)` does. Unpeeled, a parenthesised callee reaches only the arena fallback
     // below, which answers "" for a callee the checker left an inference hole (D1626).
     const cfx = unwrapParen(c.callFn)
+    if cfx < 0 { return "" }
     const cre = P.nodes[cfx]
     // A field read a generic's instances share holds its pinned type per instance (D5079).
     const pk = sigKeyOfTy(monoFieldReadTyAt(cfx, fnIx))
@@ -7470,6 +7664,7 @@ export function indexElemUnionName(idxIx: i32, fnIx: i32) {
 // only under the narrowing guard, not off the bare name.
 function indexElemNulRefArrayName(idxIx: i32, fnIx: i32) {
   const ix = unwrapParen(idxIx)
+  if ix < 0 { return "" }
   const e = P.nodes[ix]
   if e is Index {
     if exprNullableRefArray(ix, fnIx) {
@@ -8071,6 +8266,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   // emitter narrows every branch the checker proved narrowed. Every matcher below
   // (including the `&&`-conjunct recursion) sees the bare condition shape.
   const condIx = unwrapParen(condIx0)
+  if condIx < 0 { return false }
   const c = P.nodes[condIx]
   // An `is T` test pins a variant. A loop body pins one too: narrowing is a rule about
   // READS, and the write that flips the variant is checked against the declaration (D1736).
@@ -8121,6 +8317,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   // `x` to the `null` member; `!=` strips `null` from the current set.
   const nm = valueUnionNullCmpName(condIx, fnIx)
   if nm != "" {
+    if condIx < 0 { return false }
     const cn = P.nodes[condIx]
     if cn is BinExpr {
       if cn.binOp == "==" {
@@ -8140,6 +8337,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
       if mfn != "" && nullCmpBoxUnion(mfn) {
         const mk = memberPathKeyOf(mnull)
         if mk != "" {
+          if condIx < 0 { return false }
           const mcn = P.nodes[condIx]
           if mcn is BinExpr {
             if mcn.binOp == "==" {
@@ -8166,6 +8364,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
       if ifn != "" && nullCmpBoxUnion(ifn) {
         const ik = indexPathKeyOf(mnull)
         if ik != "" {
+          if condIx < 0 { return false }
           const icn = P.nodes[condIx]
           if icn is BinExpr {
             if icn.binOp == "==" {
@@ -8182,6 +8381,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
       }
       // The nullable-ref-array cell (`(i32[][][] | null)[]`) — a niche, so only the `!=`
       // sense narrows anything the reads can use.
+      if condIx < 0 { return false }
       const incn = P.nodes[condIx]
       if incn is BinExpr {
         if incn.binOp == "!=" {
@@ -8199,6 +8399,7 @@ function setNarrowFromCondRaw(condIx0: i32, fnIx: i32) {
   // The 1-struct niche (`S | null`) is excluded — a nullable ref, not a box.
   const snm = structUnionNullCmpName(condIx, fnIx)
   if snm != "" {
+    if condIx < 0 { return false }
     const scn = P.nodes[condIx]
     if scn is BinExpr {
       if scn.binOp == "==" {
@@ -8270,6 +8471,7 @@ function valueUnionNullCmpName(condIx: i32, fnIx: i32) {
 // member whose lexeme is the tested literal, narrows only when exactly one survives (value-atom only).
 function litElseNarrow(objIx: i32, variant: string): boolean {
   const ox = unwrapParen(objIx)
+  if ox < 0 { return false }
   const recv = P.nodes[ox]
   // The stack key: a bare name, else the place key its cell narrows under. An `Ident` keys
   // nothing through `placeNarrowKeyOf`, and a receiver that is neither keys "" and declines
@@ -8379,6 +8581,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   // Peel `Paren` exactly like `setNarrowFromCond` — the else-arm of `if (x is A)`
   // complement-narrows the same as the bare spelling.
   const condIx = unwrapParen(condIx0)
+  if condIx < 0 { return false }
   const c = P.nodes[condIx]
   // The else of `x is null` strips null (that is how `!(e is null)` narrows); the else of
   // `x is T` subtracts `T`, which pins a variant. A loop body takes both (D1736).
@@ -8427,6 +8630,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   }
   const nm = valueUnionNullCmpName(condIx, fnIx)
   if nm != "" {
+    if condIx < 0 { return false }
     const cn = P.nodes[condIx]
     if cn is BinExpr {
       if cn.binOp == "!=" {
@@ -8446,6 +8650,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
       if emfn != "" && nullCmpBoxUnion(emfn) {
         const emk = memberPathKeyOf(emnull)
         if emk != "" {
+          if condIx < 0 { return false }
           const emcn = P.nodes[condIx]
           if emcn is BinExpr {
             if emcn.binOp == "!=" {
@@ -8471,6 +8676,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
       if eifn != "" && nullCmpBoxUnion(eifn) {
         const eik = indexPathKeyOf(emnull)
         if eik != "" {
+          if condIx < 0 { return false }
           const eicn = P.nodes[condIx]
           if eicn is BinExpr {
             if eicn.binOp == "!=" {
@@ -8485,6 +8691,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
           }
         }
       }
+      if condIx < 0 { return false }
       const eincn = P.nodes[condIx]
       if eincn is BinExpr {
         if eincn.binOp == "==" {
@@ -8501,6 +8708,7 @@ function setNarrowFromCondElseRaw(condIx0: i32, fnIx: i32) {
   // else of `v == null` it is the non-null variant set.
   const snm = structUnionNullCmpName(condIx, fnIx)
   if snm != "" {
+    if condIx < 0 { return false }
     const scn = P.nodes[condIx]
     if scn is BinExpr {
       if scn.binOp == "!=" {
@@ -8561,7 +8769,13 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   // join or residual below re-narrows it (D2390).
   retireNarrowNames(callRetireAfterOf(stmtIx))
   if narrowTop > 0 {
-    if s is LetDecl { shadowNarrowFor(s.letName) }
+    match s {
+      LetDecl => {
+        shadowNarrowFor(s.letName)
+      }
+      // Only a declaration shadows a name; the loops shadow theirs below.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    }
     forInShadow(stmtIx, false)
     forRangeShadow(stmtIx, false)
   }
@@ -8572,13 +8786,19 @@ export function pushPostGuardNarrow(stmtIx: i32, fnIx: i32) {
   // and the checker dropped it there — push nothing, or the reads after the chain lower at
   // an arm the value left (D1736).
   if pgResidualVoidOf(stmtIx) { return 0 }
-  if s is IfStmt { pgGuardIfNarrow(s, fnIx) }
-  // Assignment narrowing (the host's `assignmentNarrowing`): a straight-line
-  // `x = <non-null expr>` over a null-bearing value union makes `x` provably non-null for
-  // the rest of the block, restored at block exit. The same statement also retires any
-  // narrowing the write invalidates, so the checker and the emitter agree on the rep.
-  if s is BinExpr {
-    if s.binOp == "=" { pgAssignNarrow(s, stmtIx, fnIx) }
+  match s {
+    IfStmt => {
+      pgGuardIfNarrow(s, fnIx)
+    }
+    // Assignment narrowing (the host's `assignmentNarrowing`): a straight-line
+    // `x = <non-null expr>` over a null-bearing value union makes `x` provably non-null for
+    // the rest of the block, restored at block exit. The same statement also retires any
+    // narrowing the write invalidates, so the checker and the emitter agree on the rep.
+    BinExpr => {
+      if s.binOp == "=" { pgAssignNarrow(s, stmtIx, fnIx) }
+    }
+    // No other statement narrows what follows it.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -8667,22 +8887,26 @@ function pgAssignNarrow(s: BinExpr, stmtIx: i32, fnIx: i32) {
     tvWriteNarrow(s.binLeft, s.binRight, asgNarTy, fnIx)
     return 0
   }
-  if tgt is Ident {
-    pgAssignIdentNarrow(tgt, stmtIx, s.binLeft, rhsNullable, asgNarTy, fnIx)
-  }
-  // The member target: `w.f = maybeNull()` retires the `w.f` path narrowing exactly as
-  // `x = maybeNull()` retires a bare name's, sharing one stack and `retireNarrowFor`.
-  // No complement push, unlike the Ident arm: a member path isn't a
-  // `narrowBareIdentOnly` name, so `pushNarrowRep` would decline it anyway.
-  if tgt is Member {
-    pgAssignMemberNarrow(s.binLeft, rhsNullable, asgNarTy, fnIx)
-  }
-  // The index target: a literal subscript names its cell, so the exact key retires on a
-  // write the narrowing does not admit and everything BELOW it retires either way — a
-  // nested cell keys now (D1722). A variable subscript names no cell and may have hit any
-  // of them, so it retires the receiver's whole family, as the checker's `tgtKey == ""` does.
-  if tgt is Index {
-    pgAssignIndexNarrow(tgt, stmtIx, s.binLeft, rhsNullable, asgNarTy, fnIx)
+  match tgt {
+    Ident => {
+      pgAssignIdentNarrow(tgt, stmtIx, s.binLeft, rhsNullable, asgNarTy, fnIx)
+    }
+    // The member target: `w.f = maybeNull()` retires the `w.f` path narrowing exactly as
+    // `x = maybeNull()` retires a bare name's, sharing one stack and `retireNarrowFor`.
+    // No complement push, unlike the Ident arm: a member path isn't a
+    // `narrowBareIdentOnly` name, so `pushNarrowRep` would decline it anyway.
+    Member => {
+      pgAssignMemberNarrow(s.binLeft, rhsNullable, asgNarTy, fnIx)
+    }
+    // The index target: a literal subscript names its cell, so the exact key retires on a
+    // write the narrowing does not admit and everything BELOW it retires either way — a
+    // nested cell keys now (D1722). A variable subscript names no cell and may have hit any
+    // of them, so it retires the receiver's whole family, as the checker's `tgtKey == ""` does.
+    Index => {
+      pgAssignIndexNarrow(tgt, stmtIx, s.binLeft, rhsNullable, asgNarTy, fnIx)
+    }
+    // No other target carries a narrowing to retire.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -8787,9 +9011,15 @@ function pgAssignIndexNarrow(
     }
   } else {
     const iroot = P.nodes[unwrapParen(tgt.idxArr)]
-    if iroot is Ident { retireNarrowForIndexCells(iroot.identName) }
-    if iroot is Member {
-      retireNarrowForIndexCells(memberKeyThroughIndex(tgt.idxArr))
+    match iroot {
+      Ident => {
+        retireNarrowForIndexCells(iroot.identName)
+      }
+      Member => {
+        retireNarrowForIndexCells(memberKeyThroughIndex(tgt.idxArr))
+      }
+      // No other root names cells to retire.
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
     }
   }
   0
@@ -8895,6 +9125,7 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
   }
   const e = P.nodes[iterIx]
   if e is Call {
+    if e.callFn < 0 { return null }
     const callee = P.nodes[e.callFn]
     if callee is Member {
       if exprMap(callee.memObj, fnIx) {
@@ -9054,6 +9285,7 @@ export function forInElemKind(iterIx: i32, fnIx: i32): VKind | null {
 export function forInMapWalksVals(iterIx: i32, fnIx: i32) {
   const e = P.nodes[iterIx]
   if e is Call {
+    if e.callFn < 0 { return false }
     const callee = P.nodes[e.callFn]
     if callee is Member {
       if callee.memProp == "values" {
@@ -9206,27 +9438,29 @@ export function forInRefArrayVariantIdx(iterIx: i32, fnIx: i32) {
 // var needs the same pair for its closure env field). -1 for every kind needing no slot —
 // the scalars, the leaf scalar lists, `str`/`nulstr`/`list`/`u8list`/`union`/`closure`.
 export function forInVarStructIdx(iterIx: i32, fnIx: i32): i32 {
-  const ek = forInElemKind(iterIx, fnIx)
-  if ek == null { return -1 }
-  if ek == "struct" || ek == "nulstruct" {
-    return forInRefArrayStructIdx(iterIx, fnIx)
-  }
-  if ek == "variant" || ek == "nulvariant" {
-    return forInRefArrayVariantIdx(iterIx, fnIx)
-  }
-  if ek == "reflist" || ek == "nulreflist" {
+  match forInElemKind(iterIx, fnIx) {
+    "struct" | "nulstruct" => {
+      return forInRefArrayStructIdx(iterIx, fnIx)
+    }
+    "variant" | "nulvariant" => {
+      return forInRefArrayVariantIdx(iterIx, fnIx)
+    }
     // A nested ref array (`S[][]`): the loop var is the inner ref list, off the outer
     // list's element slot.
-    return rlElemInnerSlot(refListSlotOfExpr(iterIx, fnIx))
-  }
-  if ek == "map" || ek == "nulmap" {
+    "reflist" | "nulreflist" => {
+      return rlElemInnerSlot(refListSlotOfExpr(iterIx, fnIx))
+    }
     // A map element or a nested-map value: the loop var's map shape, off the vals slot of a
     // `.values()` walk or the element slot of a map list.
-    const mvs = forInMapValsSlot(iterIx, fnIx)
-    if mvs >= 0 { return mvInnerMapShape(mvs) }
-    const rs = refListSlotOfExpr(iterIx, fnIx)
-    if rs < 0 || rs >= rlElemKindTbl.length { return -1 }
-    return rlElemMapShape(rs)
+    "map" | "nulmap" => {
+      const mvs = forInMapValsSlot(iterIx, fnIx)
+      if mvs >= 0 { return mvInnerMapShape(mvs) }
+      const rs = refListSlotOfExpr(iterIx, fnIx)
+      if rs < 0 || rs >= rlElemKindTbl.length { return -1 }
+      return rlElemMapShape(rs)
+    }
+    // Every other element kind, and no element kind, carries no row.
+    "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulnone" | "u8list" | "v128" | null => {}
   }
   -1
 }
@@ -9247,67 +9481,72 @@ function mapIsSetExpr(exprIx: i32, fnIx: i32) {
 function mapReadMvSlot(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return -1 }
   const e = P.nodes[exprIx]
-  if e is Index {
-    if exprMap(e.idxArr, fnIx) {
-      const sl = mapShapeOfExpr(e.idxArr, fnIx)
-      if sl >= 0 { return sl }
+  match e {
+    Index => {
+      if exprMap(e.idxArr, fnIx) {
+        const sl = mapShapeOfExpr(e.idxArr, fnIx)
+        if sl >= 0 { return sl }
+        return -1
+      }
+      // Narrowing-blind fallback: `t0[k]` where `t0` is a union ident with a map arm. In the
+      // frame pre-pass the `is`-narrow that would make `t0` a map isn't active, so `exprMap`
+      // misses — resolve the arm's value mv slot directly.
+      const ax = P.nodes[unwrapParen(e.idxArr)]
+      if ax is Ident {
+        // …but blind is not the same as wrong: when an `is` narrow is active and says the
+        // receiver is the union's array arm, `exprMap` missing above is correct, not a
+        // pre-pass artefact — claiming the map arm anyway would reach a receiver that isn't
+        // one (D1012).
+        const d12v = narrowVariantFor(ax.identName)
+        if nameIsArray(d12v) { return -1 }
+        // The same answer when the narrow banked an ALIAS the name test cannot read through
+        // (`type JsonArr = Json[]`): render the slot's own arena row and re-ask, so an alias
+        // and its spelled-out twin classify the receiver alike (D1822).
+        const d12i = narrowSlotOf(ax.identName)
+        if d12i >= 0 {
+          const d12t = narrowSlotTy(d12i)
+          if d12t >= 0 {
+            if tyIsArray(d12t) { return -1 }
+          }
+        }
+        // …and the same for a `string` narrow (D1033): `k[0]` over `k` narrowed to the
+        // union's string arm is a char read, not a map read (the index yields an i32) — and
+        // claiming the map arm skipped the argument boundary's box.
+        if d12v == "string" { return -1 }
+        const aun = unionNameOfIdentAt(
+          sidOfNode(unwrapParen(e.idxArr)),
+          fnIx,
+          unwrapParen(e.idxArr),
+        )
+        if aun != "" {
+          // The arm's arena type comes back with its spelling: the value slot resolves off
+          // the `TyMap` the member scan already read, rather than re-slicing `V` from the render.
+          const armTy: i32[] = []
+          const ma = unionMapArmNameTy(aun, armTy)
+          if ma != "" {
+            let maVt = -1
+            if armTy.length > 0 { maVt = tyMapValOf(armTy[0]) }
+            const msl = mvSlotOfMapNameTy(ma, maVt)
+            if msl >= 0 { return msl }
+          }
+        }
+      }
       return -1
     }
-    // Narrowing-blind fallback: `t0[k]` where `t0` is a union ident with a map arm. In the
-    // frame pre-pass the `is`-narrow that would make `t0` a map isn't active, so `exprMap`
-    // misses — resolve the arm's value mv slot directly.
-    const ax = P.nodes[unwrapParen(e.idxArr)]
-    if ax is Ident {
-      // …but blind is not the same as wrong: when an `is` narrow is active and says the
-      // receiver is the union's array arm, `exprMap` missing above is correct, not a
-      // pre-pass artefact — claiming the map arm anyway would reach a receiver that isn't
-      // one (D1012).
-      const d12v = narrowVariantFor(ax.identName)
-      if nameIsArray(d12v) { return -1 }
-      // The same answer when the narrow banked an ALIAS the name test cannot read through
-      // (`type JsonArr = Json[]`): render the slot's own arena row and re-ask, so an alias
-      // and its spelled-out twin classify the receiver alike (D1822).
-      const d12i = narrowSlotOf(ax.identName)
-      if d12i >= 0 {
-        const d12t = narrowSlotTy(d12i)
-        if d12t >= 0 {
-          if tyIsArray(d12t) { return -1 }
-        }
-      }
-      // …and the same for a `string` narrow (D1033): `k[0]` over `k` narrowed to the
-      // union's string arm is a char read, not a map read (the index yields an i32) — and
-      // claiming the map arm skipped the argument boundary's box.
-      if d12v == "string" { return -1 }
-      const aun = unionNameOfIdentAt(
-        sidOfNode(unwrapParen(e.idxArr)),
-        fnIx,
-        unwrapParen(e.idxArr),
-      )
-      if aun != "" {
-        // The arm's arena type comes back with its spelling: the value slot resolves off
-        // the `TyMap` the member scan already read, rather than re-slicing `V` from the render.
-        const armTy: i32[] = []
-        const ma = unionMapArmNameTy(aun, armTy)
-        if ma != "" {
-          let maVt = -1
-          if armTy.length > 0 { maVt = tyMapValOf(armTy[0]) }
-          const msl = mvSlotOfMapNameTy(ma, maVt)
-          if msl >= 0 { return msl }
+    Call => {
+      if e.callFn < 0 { return -1 }
+      const callee = P.nodes[e.callFn]
+      if callee is Member {
+        if callee.memProp == "get" {
+          if exprMap(callee.memObj, fnIx) {
+            const sl = mapShapeOfExpr(callee.memObj, fnIx)
+            if sl >= 0 { return sl }
+          }
         }
       }
     }
-    return -1
-  }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Member {
-      if callee.memProp == "get" {
-        if exprMap(callee.memObj, fnIx) {
-          const sl = mapShapeOfExpr(callee.memObj, fnIx)
-          if sl >= 0 { return sl }
-        }
-      }
-    }
+    // No other expression is a map read.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -9351,10 +9590,17 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
 export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   if defIx < 0 { return false }
   const dix = unwrapParen(defIx)
+  if dix < 0 { return false }
   const d = P.nodes[dix]
-  if d is NullLit { return true }
-  if d is BinExpr {
-    if d.binOp == "??" { return coalesceDefaultNullable(d.binRight, fnIx) }
+  match d {
+    NullLit => {
+      return true
+    }
+    BinExpr => {
+      if d.binOp == "??" { return coalesceDefaultNullable(d.binRight, fnIx) }
+    }
+    // Any other default is nullable only by its type or its union, read below.
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   if nodeTyIsNullable(dix) { return true }
   const un = unionNameOfExpr(dix, fnIx)
@@ -9381,6 +9627,7 @@ function coalesceNicheStaysNullable(exprIx: i32, fnIx: i32) {
 function coalesceLitUnionDefaultIsAtom(defIx: i32, texts: string[], fnIx: i32) {
   if defIx < 0 { return false }
   const dix = unwrapParen(defIx)
+  if dix < 0 { return false }
   const d = P.nodes[dix]
   if d is NullLit { return true }
   if d is StrLit { return litLexIsMember(d.strText, texts) }
@@ -9473,6 +9720,7 @@ export function coalesceOperandPinNonNull(exprIx: i32, fnIx: i32): boolean {
 export function forInMapRecv(iterIx: i32, fnIx: i32) {
   const e = P.nodes[iterIx]
   if e is Call {
+    if e.callFn < 0 { return -1 }
     const callee = P.nodes[e.callFn]
     if callee is Member {
       if callee.memProp == "keys" || callee.memProp == "values" {
@@ -9493,15 +9741,22 @@ export function assignTargetReReads(asgIx: i32, fnIx: i32): boolean {
   if !(a is BinExpr) { return false }
   if a.binOp != "=" { return false }
   const tgt = P.nodes[a.binLeft]
-  if tgt is Ident { return true }
   let recv = -1
-  if tgt is Index {
-    if !(P.nodes[tgt.idxIndex] is NumLit) { return false }
-    recv = tgt.idxArr
-  } else if tgt is Member {
-    recv = tgt.memObj
-  } else {
-    return false
+  match tgt {
+    Ident => {
+      return true
+    }
+    Index => {
+      if !(P.nodes[tgt.idxIndex] is NumLit) { return false }
+      recv = tgt.idxArr
+    }
+    Member => {
+      recv = tgt.memObj
+    }
+    // No other target is a place to re-read.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {
+      return false
+    }
   }
   if !(P.nodes[recv] is Ident) { return false }
   if exprMap(recv, fnIx) { return false }
@@ -9550,106 +9805,144 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
   // A bare lambda tail `(a) => (b) => …` is an implicit-return VALUE (a closure), so the
   // outer arrow's body — `(b) => …` — emits as the function's result. Without this the tail
   // is mis-read as a statement, the body emits nothing, and the function is just `unreachable`.
-  if s is FuncDecl { return true }
-  if s is NumLit { return true }
-  // A trailing `null` is an implicit-return value (the function returns null) — seeded
-  // per the return type by `emitReturnValue`, the same as `return null`.
-  if s is NullLit { return true }
-  if s is StrLit { return true }
-  if s is CharLit { return true }
-  if s is BoolLit { return true }
-  if s is Ident { return true }
-  if s is Unary { return true }
-  // A parenthesised call is that call, which may be a void statement (D2637).
-  if s is Paren {
-    if P.nodes[unwrapParen(stmtIx)] is Call {
-      return stmtIsTailValue(unwrapParen(stmtIx), fnIx)
+  match s {
+    FuncDecl => {
+      return true
     }
-    return true
-  }
-  if s is Member { return true }
-  // A `?.` read yields its field or null, so it is a value wherever it ends an arm.
-  if s is OptMember { return true }
-  if s is Index { return true }
-  if s is IsExpr { return true }
-  if s is AsExpr { return true }
-  if s is ObjLit { return true }
-  if s is ArrayLit { return true }
-  if s is BinExpr {
-    if s.binOp == "=" {
-      // A trailing assignment is a tail value — assignment yields its right side (DECISIONS:
-      // assignment-as-expression): re-read where `assignTargetReReads` can, and any other
-      // field or element write is rewritten by `spillTail` to yield its spilled value (D2496).
-      if assignTargetReReads(stmtIx, fnIx) { return true }
-      return assignTargetSpills(stmtIx)
+    NumLit => {
+      return true
     }
-    return true
-  }
-  if s is Call {
-    // A value-returning call `f(..)` is a tail value; a `recv.push(x)` member-call,
-    // a `print(...)`, and a call to a VOID function (`fRetVoid`) are statements.
-    const callee = P.nodes[s.callFn]
-    if callee is Ident {
-      if callee.identName == "print" { return false }
-      // The void memory/array intrinsics (`__store_*__`, the bulk pair, `__log__`,
-      // `__array_copy__`, `__trap__`) are statements: classifying one as the body's value
-      // would emit a function promising a result it never produces.
-      if callee.identName == "__store_i32__" { return false }
-      if nameIsMemStoreIntrinsic(callee.identName) { return false }
-      if nameIsMemBulkIntrinsic(callee.identName) { return false }
-      if callee.identName == "__store_v128__" { return false }
-      if atomicIntrinsicIsVoid(callee.identName) { return false }
-      if callee.identName == "__log__" { return false }
-      if callee.identName == "__array_copy__" { return false }
-      if callee.identName == "__trap__" { return false }
-      // A void HOST import is a statement for the same reason. Asked through the slot
-      // table rather than by spelling, so a diverging slot added there cannot be missed
-      // here — every other entry above is a name, which a new slot would not carry.
-      if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { return false }
-      if calleeIsVoidExtern(callee.identName, fnIx) { return false }
-      if tailSelfFnIx >= 0 && tailCallsSelf(s.callFn, fnIx) { return false }
-      const target = fnIndexOfAt(sidOfNode(s.callFn), fnIx, s.callFn)
-      // A live closure binding of the name is what the tail denotes, so the voidness is
-      // that closure's and the module function of the name settles nothing (D1602).
-      if target >= 0 && !identIsBoundClosure(callee.identName, fnIx) {
-        return fRetVoid[target] == 0
-      }
-      // A closure-value callee (invisible to `fnIndexOf`): a void one yields nothing, so
-      // it's a statement tail, letting `run(g: () => void) { g() }` infer void.
-      if fnIx >= 0 && calleeReturnsVoidAt(sidOfNode(s.callFn), fnIx, s.callFn) {
-        return false
+    // A trailing `null` is an implicit-return value (the function returns null) — seeded
+    // per the return type by `emitReturnValue`, the same as `return null`.
+    NullLit => {
+      return true
+    }
+    StrLit => {
+      return true
+    }
+    CharLit => {
+      return true
+    }
+    BoolLit => {
+      return true
+    }
+    Ident => {
+      return true
+    }
+    Unary => {
+      return true
+    }
+    // A parenthesised call is that call, which may be a void statement (D2637).
+    Paren => {
+      if P.nodes[unwrapParen(stmtIx)] is Call {
+        return stmtIsTailValue(unwrapParen(stmtIx), fnIx)
       }
       return true
     }
-    // A member call left to each instance (D2517) is a value exactly when the `self`-function
-    // call it stands for is, so the template's return is inferred from it; the pin holds a
-    // built-in that takes the call to the same type.
-    if callee is Member {
-      if memberCallRungOf(stmtIx) == MC_RUNG_PER_INSTANCE {
-        const sfe = fnIndexOf(ufcsAliasAtSite(stmtIx, callee.memProp))
-        if sfe >= 0 && sfe < fRetVoid.length { return fRetVoid[sfe] == 0 }
-      }
+    Member => {
+      return true
     }
-    // D980 — a closure-field call in tail position is a value: without this arm,
-    // `function p(x: {f: () => string}): string { x.f() }` lowered its tail as a
-    // statement and trapped. Narrow on purpose: widening to every non-void member call
-    // would wrongly claim `xs.push(1)` as a value inside a void function.
-    if callee is Member {
-      if fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx) >= 0 {
-        // A field whose function the checker typed `void` yields nothing, so the tail is a
-        // statement: claiming it typed the enclosing function's result `i32` (D3917).
-        const ct = nodeTyIxOf(stmtIx)
-        if ct >= 0 && tyPrimNameOf(ct) == "void" { return false }
+    // A `?.` read yields its field or null, so it is a value wherever it ends an arm.
+    OptMember => {
+      return true
+    }
+    Index => {
+      return true
+    }
+    IsExpr => {
+      return true
+    }
+    AsExpr => {
+      return true
+    }
+    ObjLit => {
+      return true
+    }
+    ArrayLit => {
+      return true
+    }
+    BinExpr => {
+      if s.binOp == "=" {
+        // A trailing assignment is a tail value — assignment yields its right side (DECISIONS:
+        // assignment-as-expression): re-read where `assignTargetReReads` can, and any other
+        // field or element write is rewritten by `spillTail` to yield its spilled value (D2496).
+        if assignTargetReReads(stmtIx, fnIx) { return true }
+        return assignTargetSpills(stmtIx)
+      }
+      return true
+    }
+    Call => {
+      // A value-returning call `f(..)` is a tail value; a `recv.push(x)` member-call,
+      // a `print(...)`, and a call to a VOID function (`fRetVoid`) are statements.
+      if s.callFn < 0 { return false }
+      const callee = P.nodes[s.callFn]
+      if callee is Ident {
+        if callee.identName == "print" { return false }
+        // The void memory/array intrinsics (`__store_*__`, the bulk pair, `__log__`,
+        // `__array_copy__`, `__trap__`) are statements: classifying one as the body's value
+        // would emit a function promising a result it never produces.
+        if callee.identName == "__store_i32__" { return false }
+        if nameIsMemStoreIntrinsic(callee.identName) { return false }
+        if nameIsMemBulkIntrinsic(callee.identName) { return false }
+        if callee.identName == "__store_v128__" { return false }
+        if atomicIntrinsicIsVoid(callee.identName) { return false }
+        if callee.identName == "__log__" { return false }
+        if callee.identName == "__array_copy__" { return false }
+        if callee.identName == "__trap__" { return false }
+        // A void HOST import is a statement for the same reason. Asked through the slot
+        // table rather than by spelling, so a diverging slot added there cannot be missed
+        // here — every other entry above is a name, which a new slot would not carry.
+        if fsRetIsVoid(fsIntrinsicSlot(callee.identName)) { return false }
+        if calleeIsVoidExtern(callee.identName, fnIx) { return false }
+        if tailSelfFnIx >= 0 && tailCallsSelf(s.callFn, fnIx) { return false }
+        const target = fnIndexOfAt(sidOfNode(s.callFn), fnIx, s.callFn)
+        // A live closure binding of the name is what the tail denotes, so the voidness is
+        // that closure's and the module function of the name settles nothing (D1602).
+        if target >= 0 && !identIsBoundClosure(callee.identName, fnIx) {
+          return fRetVoid[target] == 0
+        }
+        // A closure-value callee (invisible to `fnIndexOf`): a void one yields nothing, so
+        // it's a statement tail, letting `run(g: () => void) { g() }` infer void.
+        if (
+          fnIx >= 0
+          && calleeReturnsVoidAt(sidOfNode(s.callFn), fnIx, s.callFn)
+        ) {
+          return false
+        }
         return true
       }
+      // A member call left to each instance (D2517) is a value exactly when the `self`-function
+      // call it stands for is, so the template's return is inferred from it; the pin holds a
+      // built-in that takes the call to the same type.
+      if callee is Member {
+        if memberCallRungOf(stmtIx) == MC_RUNG_PER_INSTANCE {
+          const sfe = fnIndexOf(ufcsAliasAtSite(stmtIx, callee.memProp))
+          if sfe >= 0 && sfe < fRetVoid.length { return fRetVoid[sfe] == 0 }
+        }
+      }
+      // D980 — a closure-field call in tail position is a value: without this arm,
+      // `function p(x: {f: () => string}): string { x.f() }` lowered its tail as a
+      // statement and trapped. Narrow on purpose: widening to every non-void member call
+      // would wrongly claim `xs.push(1)` as a value inside a void function.
+      if callee is Member {
+        if fieldClosureFeOfRecv(callee.memObj, callee.memProp, fnIx) >= 0 {
+          // A field whose function the checker typed `void` yields nothing, so the tail is a
+          // statement: claiming it typed the enclosing function's result `i32` (D3917).
+          const ct = nodeTyIxOf(stmtIx)
+          if ct >= 0 && tyPrimNameOf(ct) == "void" { return false }
+          return true
+        }
+      }
+      // Every OTHER callee shape that is a function value — an element read, a call result, a
+      // parenthesised value, one delivered through an un-annotated parameter. The RESOLVED
+      // `$fnsig` is the whole warrant: an unresolved key lowers the call at the all-i32 arity
+      // sig inside `emitCallRef` instead of refusing, so claiming a tail on one is wrong (D1623).
+      const tvKey = cloCallSigKey(stmtIx, fnIx)
+      if tvKey == "" { return false }
+      return !sigKeyRetIsVoid(tvKey)
     }
-    // Every OTHER callee shape that is a function value — an element read, a call result, a
-    // parenthesised value, one delivered through an un-annotated parameter. The RESOLVED
-    // `$fnsig` is the whole warrant: an unresolved key lowers the call at the all-i32 arity
-    // sig inside `emitCallRef` instead of refusing, so claiming a tail on one is wrong (D1623).
-    const tvKey = cloCallSigKey(stmtIx, fnIx)
-    if tvKey == "" { return false }
-    return !sigKeyRetIsVoid(tvKey)
+    // Every other statement is not a value.
+    ErrExpr | LetDecl | Param | TypeRef | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -9725,84 +10018,95 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
   }
   const e = P.nodes[unwrapParen(exprIx)]
   // A CALL of a function annotated `: boolean | null` — its result is the niche i32.
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const lct = localCloPinFieldTail(e.callFn, fnIx)
-      if lct >= 0 && exprNulBool(lct, fnIx) { return true }
-      const t = fnIndexOfNode(e.callFn)
-      if t >= 0 {
-        const cfn = P.nodes[fnStmts[t]]
-        if cfn is FuncDecl {
-          if tyIsNulBool(cfn.fnRet) { return true }
-          // …or an un-annotated function whose return infers to `boolean | null`. Not a type
-          // spelling (D-CLASSGRAM census note): `inferNicheNullByName` publishes a
-          // three-valued tag (`""` / `"boolean|null"` / `"string|null"`), compared by provenance, not shape.
-          if cfn.fnRet < 0 {
-            if (
-              inferNicheNullByName(inferRetFnKey(fnStmts[t], callee.identName))
-              == "boolean|null"
-            ) {
-              return true
+  match e {
+    Call => {
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const lct = localCloPinFieldTail(e.callFn, fnIx)
+        if lct >= 0 && exprNulBool(lct, fnIx) { return true }
+        const t = fnIndexOfNode(e.callFn)
+        if t >= 0 {
+          const cfn = P.nodes[fnStmts[t]]
+          if cfn is FuncDecl {
+            if tyIsNulBool(cfn.fnRet) { return true }
+            // …or an un-annotated function whose return infers to `boolean | null`. Not a type
+            // spelling (D-CLASSGRAM census note): `inferNicheNullByName` publishes a
+            // three-valued tag (`""` / `"boolean|null"` / `"string|null"`), compared by provenance, not shape.
+            if cfn.fnRet < 0 {
+              if (
+                inferNicheNullByName(
+                  inferRetFnKey(fnStmts[t], callee.identName),
+                )
+                == "boolean|null"
+              ) {
+                return true
+              }
             }
+            return false
           }
-          return false
+        }
+        // A call of a closure-typed VALUE (`p()` where `p: () => boolean | null`) — a
+        // param / local / global `fnIndexOf` can't see: read its return-type annotation.
+        if nameIsNulBool(calleeCloRetName(callee.identName, fnIx)) {
+          return true
         }
       }
-      // A call of a closure-typed VALUE (`p()` where `p: () => boolean | null`) — a
-      // param / local / global `fnIndexOf` can't see: read its return-type annotation.
-      if nameIsNulBool(calleeCloRetName(callee.identName, fnIx)) { return true }
+      return false
     }
-    return false
-  }
-  if e is Ident {
-    if fnIx >= 0 {
-      const fn = P.nodes[fnIx]
-      if fn is FuncDecl {
-        const params = fn.fnParams
-        let i = 0
-        while i < params.length {
-          const p = P.nodes[params[i]]
-          if p is Param {
-            if p.parName == e.identName { return tyIsNulBool(p.parType) }
+    Ident => {
+      if fnIx >= 0 {
+        const fn = P.nodes[fnIx]
+        if fn is FuncDecl {
+          const params = fn.fnParams
+          let i = 0
+          while i < params.length {
+            const p = P.nodes[params[i]]
+            if p is Param {
+              if p.parName == e.identName { return tyIsNulBool(p.parType) }
+            }
+            i = i + 1
           }
-          i = i + 1
+          const li = parentLetOf(fn.fnBody, e.identName)
+          if li >= 0 { return letNulBool(li, fnIx) }
         }
-        const li = parentLetOf(fn.fnBody, e.identName)
-        if li >= 0 { return letNulBool(li, fnIx) }
+      }
+      const gi = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
+      if gi >= 0 { return letNulBool(gi, -1) }
+      return false
+    }
+    // A bare map read `m[k]` over a `boolean | null`-valued map yields the niche i32 (0/1
+    // with sentinel 2), so an un-annotated `const b = m[k]` narrows with `!= null` against 2.
+    Index => {
+      const nbMt = mapRecvTyIn(e.idxArr, fnIx)
+      if mapTyValIsNulBool(nbMt) { return true }
+      // A plain `boolean` map's read is `boolean | null` too, its miss the same sentinel.
+      if (mapTyValIsBool(nbMt) && !indexPlaceNonNull(unwrapParen(exprIx))) {
+        return true
+      }
+      // A `(boolean | null)[]` element no recorded type covers, the capture cell's read, is the
+      // niche until a narrowing excludes null (D2397).
+      if (
+        nodeArrayElemIsNulBool(e.idxArr)
+        && !indexPlaceNonNull(unwrapParen(exprIx))
+      ) {
+        return true
       }
     }
-    const gi = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
-    if gi >= 0 { return letNulBool(gi, -1) }
-    return false
-  }
-  // A bare map read `m[k]` over a `boolean | null`-valued map yields the niche i32 (0/1
-  // with sentinel 2), so an un-annotated `const b = m[k]` narrows with `!= null` against 2.
-  if e is Index {
-    const nbMt = mapRecvTyIn(e.idxArr, fnIx)
-    if mapTyValIsNulBool(nbMt) { return true }
-    // A plain `boolean` map's read is `boolean | null` too, its miss the same sentinel.
-    if (mapTyValIsBool(nbMt) && !indexPlaceNonNull(unwrapParen(exprIx))) {
-      return true
+    // A `boolean | null` struct FIELD read (`a.v`, code 21) is the niche i32 sentinel.
+    Member => {
+      return memberFieldCode(exprIx, fnIx) == FC_NUL_BOOL
     }
-    // A `(boolean | null)[]` element no recorded type covers, the capture cell's read, is the
-    // niche until a narrowing excludes null (D2397).
-    if (
-      nodeArrayElemIsNulBool(e.idxArr)
-      && !indexPlaceNonNull(unwrapParen(exprIx))
-    ) {
-      return true
+    // A chained `a ?? b` over `boolean | null` is itself `boolean | null` when the default
+    // `b` is also nullable — the left-associative `(f() ?? g()) ?? d` shape (see the
+    // `exprNullableString` companion). Keeps `??` print-routing consistent with the rep.
+    BinExpr => {
+      if e.binOp == "??" {
+        if exprNulBool(e.binLeft, fnIx) { return exprNulBool(e.binRight, fnIx) }
+      }
     }
-  }
-  // A `boolean | null` struct FIELD read (`a.v`, code 21) is the niche i32 sentinel.
-  if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_BOOL }
-  // A chained `a ?? b` over `boolean | null` is itself `boolean | null` when the default
-  // `b` is also nullable — the left-associative `(f() ?? g()) ?? d` shape (see the
-  // `exprNullableString` companion). Keeps `??` print-routing consistent with the rep.
-  if e is BinExpr {
-    if e.binOp == "??" {
-      if exprNulBool(e.binLeft, fnIx) { return exprNulBool(e.binRight, fnIx) }
-    }
+    // No other expression reads a nullable-boolean niche.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -9881,125 +10185,134 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   }
   // A `(K | null)[]` element read `p[i]` — the niche i32 (a member id or `-1`). Recovered
   // from the array's element type so `p[i] != null` narrows against `-1`, not a bare null.
-  if e is Index {
-    if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
-    if (
-      monoHoleSubN.length > 0
-      && tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx))
-    ) {
-      return true
-    }
-    // A bare map read `m[k]` over `{[string]: K | null}` yields the niche i32 (a member id
-    // or `-1`), so `const t = m[k]` narrows with `!= null` against `-1`.
-    const nlMt = mapRecvTyIn(e.idxArr, fnIx)
-    if mapTyValIsNulLitUnion(nlMt) { return true }
-    // …and the non-nullable spelling `{[string]: K}` reads the same niche: a bare `m[k]`
-    // is `K | null` there too (a missing key is null), via the same `-1` miss value.
-    if mapTyValIsLitUnion(nlMt) { return true }
-  }
-  // A fused `m[k] ?? d` read over `{[string]: K | null}` yields the niche i32, so
-  // `const t = m[k] ?? d` narrows with `!= null` — the same fused-read home `m.get(k) ?? d` shares.
-  if e is BinExpr {
-    if e.binOp == "??" {
-      const nblRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-      if nblRecv >= 0 {
-        if coalMapReadForeignDefault(nblRecv, e.binRight, fnIx) { return false }
-        if mapTyValIsNulLitUnion(mapRecvTyIn(nblRecv, fnIx)) { return true }
-      }
-      // The non-map `p ?? d` over the same niche keeps it `K | null` exactly when the
-      // default can still be null — the consumer half of `emitCoalesce`'s litunion arm.
-      // `coalesceLitUnionFits` makes the same claim the emit arm does, so both decline together.
-      if coalesceLitUnionFits(exprIx, fnIx) {
-        return coalesceDefaultNullable(e.binRight, fnIx)
-      }
-    }
-  }
-  if e is Call {
-    const callee = P.nodes[e.callFn]
-    if callee is Ident {
-      const t = fnIndexOfNode(e.callFn)
-      if t >= 0 {
-        const cfn = P.nodes[fnStmts[t]]
-        if cfn is FuncDecl {
-          if cfn.fnRet >= 0 { return nodeRepIsNulAtom(cfn.fnRet) }
-        }
-      }
-      // A call of a closure-typed VALUE (`p()` where `p: () => K | null`) — a param /
-      // local / global whose `K | null` niche return `fnIndexOf` can't see.
-      if nameIsNulLitUnion(calleeCloRetName(callee.identName, fnIx)) {
+  match e {
+    Index => {
+      if nodeArrayElemIsNulLitUnion(e.idxArr) { return true }
+      if (
+        monoHoleSubN.length > 0
+        && tyIsNulLitUnionNiche(holeNulLitElemTy(e.idxArr, fnIx))
+      ) {
         return true
       }
+      // A bare map read `m[k]` over `{[string]: K | null}` yields the niche i32 (a member id
+      // or `-1`), so `const t = m[k]` narrows with `!= null` against `-1`.
+      const nlMt = mapRecvTyIn(e.idxArr, fnIx)
+      if mapTyValIsNulLitUnion(nlMt) { return true }
+      // …and the non-nullable spelling `{[string]: K}` reads the same niche: a bare `m[k]`
+      // is `K | null` there too (a missing key is null), via the same `-1` miss value.
+      if mapTyValIsLitUnion(nlMt) { return true }
     }
-    // An INDEXED closure-array call (`p[i]()` where `p: (() => K | null)[]`): the element's
-    // closure result is the `K | null` niche. `cloArrSlotRetName` reads it off the ref-list slot,
-    // the indexed dual of the Ident `calleeCloRetName` above — so `const t0 = p[i]()` binds the
-    // kind-0 litunion niche (an i32) instead of mis-inferring the softened `string | null` ref.
-    if callee is Index {
-      if exprRefArray(callee.idxArr, fnIx) {
-        const rn = cloArrSlotRetName(refListSlotOfExpr(callee.idxArr, fnIx))
-        if nameIsNulLitUnion(rn) { return true }
-      }
-    }
-    // Fallback, scoped to a call: a `K | null`-returning closure value call whose callee the
-    // cases above miss — a chained closure call (`v(1)()` where `v: (i32) => (() => K | null)`).
-    // The checked-rep column reads the checker's per-node type, mirroring
-    // `exprNullableString`'s fallback, which structurally excludes the litunion niche.
-    if !nodeRepIsNulAtom(exprIx) { return false }
-    // The callee's `$fnsig` decides the rep: a closure keyed with a boxed result hands back the
-    // box whatever the checker's type says (D2535).
-    const nlk = cloCallSigKey(unwrapParen(exprIx), fnIx)
-    return nlk == "" || sigKeyRetKind(nlk) != "union"
-  }
-  if e is Ident {
-    // A CAPTURED variable, resolved against the enclosing frame's binding — the niche twin of
-    // `exprIsLitAtom`'s capture channel, and the same node `captureValKind` sizes the env
-    // field from. Checked first: a capture is none of the three channels below.
-    if capturedIsNulLitUnion(fnIx, e.identName) { return true }
-    if fnIx >= 0 {
-      const fn = P.nodes[fnIx]
-      if fn is FuncDecl {
-        const params = fn.fnParams
-        let i = 0
-        while i < params.length {
-          const p = P.nodes[params[i]]
-          if p is Param {
-            if p.parName == e.identName { return nodeRepIsNulAtom(p.parType) }
+    // A fused `m[k] ?? d` read over `{[string]: K | null}` yields the niche i32, so
+    // `const t = m[k] ?? d` narrows with `!= null` — the same fused-read home `m.get(k) ?? d` shares.
+    BinExpr => {
+      if e.binOp == "??" {
+        const nblRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
+        if nblRecv >= 0 {
+          if coalMapReadForeignDefault(nblRecv, e.binRight, fnIx) {
+            return false
           }
-          i = i + 1
+          if mapTyValIsNulLitUnion(mapRecvTyIn(nblRecv, fnIx)) { return true }
         }
-        const li = parentLetOf(fn.fnBody, e.identName)
-        if li >= 0 { return letNulLitUnion(li, fnIx) }
+        // The non-map `p ?? d` over the same niche keeps it `K | null` exactly when the
+        // default can still be null — the consumer half of `emitCoalesce`'s litunion arm.
+        // `coalesceLitUnionFits` makes the same claim the emit arm does, so both decline together.
+        if coalesceLitUnionFits(exprIx, fnIx) {
+          return coalesceDefaultNullable(e.binRight, fnIx)
+        }
       }
     }
-    const gi = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
-    if gi >= 0 { return letNulLitUnion(gi, -1) }
-    // A for-in loop var over a `(K | null)[]` — the one storage class the channels above
-    // can't reach (no declaration node for an annotation). `declareForInLocals` flags its
-    // slot as the atom; nullability comes from the checker's per-read recorded type.
-    const nluSlot = declaredSlotOf(e.identName)
-    if nluSlot >= 0 && nluSlot < localLitUnion.length {
-      if localLitUnion[nluSlot] == 1 {
+    Call => {
+      if e.callFn < 0 { return false }
+      const callee = P.nodes[e.callFn]
+      if callee is Ident {
+        const t = fnIndexOfNode(e.callFn)
+        if t >= 0 {
+          const cfn = P.nodes[fnStmts[t]]
+          if cfn is FuncDecl {
+            if cfn.fnRet >= 0 { return nodeRepIsNulAtom(cfn.fnRet) }
+          }
+        }
+        // A call of a closure-typed VALUE (`p()` where `p: () => K | null`) — a param /
+        // local / global whose `K | null` niche return `fnIndexOf` can't see.
+        if nameIsNulLitUnion(calleeCloRetName(callee.identName, fnIx)) {
+          return true
+        }
+      }
+      // An INDEXED closure-array call (`p[i]()` where `p: (() => K | null)[]`): the element's
+      // closure result is the `K | null` niche. `cloArrSlotRetName` reads it off the ref-list slot,
+      // the indexed dual of the Ident `calleeCloRetName` above — so `const t0 = p[i]()` binds the
+      // kind-0 litunion niche (an i32) instead of mis-inferring the softened `string | null` ref.
+      if callee is Index {
+        if exprRefArray(callee.idxArr, fnIx) {
+          const rn = cloArrSlotRetName(refListSlotOfExpr(callee.idxArr, fnIx))
+          if nameIsNulLitUnion(rn) { return true }
+        }
+      }
+      // Fallback, scoped to a call: a `K | null`-returning closure value call whose callee the
+      // cases above miss — a chained closure call (`v(1)()` where `v: (i32) => (() => K | null)`).
+      // The checked-rep column reads the checker's per-node type, mirroring
+      // `exprNullableString`'s fallback, which structurally excludes the litunion niche.
+      if !nodeRepIsNulAtom(exprIx) { return false }
+      // The callee's `$fnsig` decides the rep: a closure keyed with a boxed result hands back the
+      // box whatever the checker's type says (D2535).
+      const nlk = cloCallSigKey(unwrapParen(exprIx), fnIx)
+      return nlk == "" || sigKeyRetKind(nlk) != "union"
+    }
+    Ident => {
+      // A CAPTURED variable, resolved against the enclosing frame's binding — the niche twin of
+      // `exprIsLitAtom`'s capture channel, and the same node `captureValKind` sizes the env
+      // field from. Checked first: a capture is none of the three channels below.
+      if capturedIsNulLitUnion(fnIx, e.identName) { return true }
+      if fnIx >= 0 {
+        const fn = P.nodes[fnIx]
+        if fn is FuncDecl {
+          const params = fn.fnParams
+          let i = 0
+          while i < params.length {
+            const p = P.nodes[params[i]]
+            if p is Param {
+              if p.parName == e.identName { return nodeRepIsNulAtom(p.parType) }
+            }
+            i = i + 1
+          }
+          const li = parentLetOf(fn.fnBody, e.identName)
+          if li >= 0 { return letNulLitUnion(li, fnIx) }
+        }
+      }
+      const gi = globalLetOfIn(fnIx, e.identName, unwrapParen(exprIx))
+      if gi >= 0 { return letNulLitUnion(gi, -1) }
+      // A for-in loop var over a `(K | null)[]` — the one storage class the channels above
+      // can't reach (no declaration node for an annotation). `declareForInLocals` flags its
+      // slot as the atom; nullability comes from the checker's per-read recorded type.
+      const nluSlot = declaredSlotOf(e.identName)
+      if nluSlot >= 0 && nluSlot < localLitUnion.length {
+        if localLitUnion[nluSlot] == 1 {
+          return nodeRepIsNulAtom(exprIx)
+            || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
+        }
+      }
+      // …and one asked outside its frame's emission, found by its loop (D3169).
+      if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
         return nodeRepIsNulAtom(exprIx)
-          || tyIsNulLitUnionNiche(loopVarPinTyOf(exprIx, fnIx))
       }
+      return false
     }
-    // …and one asked outside its frame's emission, found by its loop (D3169).
-    if readLoopVarIsLitAtom(unwrapParen(exprIx), e.identName, fnIx) {
-      return nodeRepIsNulAtom(exprIx)
+    // A `K | null` struct field read (`a.f`, code 30) is the niche i32 with the `-1`
+    // sentinel — the litunion dual of `exprNulBool`'s Member arm. Covers the plain struct
+    // receiver and the `is`-narrowed variant receiver (`memberFieldCode` resolves both), so
+    // `const t0 = v.f` binds the niche and its `!= null` narrows against `-1`.
+    Member => {
+      return memberFieldCode(exprIx, fnIx) == FC_NUL_LIT_UNION
     }
-    return false
-  }
-  // A `K | null` struct field read (`a.f`, code 30) is the niche i32 with the `-1`
-  // sentinel — the litunion dual of `exprNulBool`'s Member arm. Covers the plain struct
-  // receiver and the `is`-narrowed variant receiver (`memberFieldCode` resolves both), so
-  // `const t0 = v.f` binds the niche and its `!= null` narrows against `-1`.
-  if e is Member { return memberFieldCode(exprIx, fnIx) == FC_NUL_LIT_UNION }
-  // A `?.` whose leaf is a literal-union atom field, nullable or not, is the same niche:
-  // `emitOptMemberValue` yields the field's atom or `-1` (D3457).
-  if e is OptMember {
-    const olc = optChainLeafFieldCode(exprIx, fnIx)
-    if olc == FC_NUL_LIT_UNION { return true }
-    return olc == FC_I32 && nodeRepIsNulAtom(exprIx)
+    // A `?.` whose leaf is a literal-union atom field, nullable or not, is the same niche:
+    // `emitOptMemberValue` yields the field's atom or `-1` (D3457).
+    OptMember => {
+      const olc = optChainLeafFieldCode(exprIx, fnIx)
+      if olc == FC_NUL_LIT_UNION { return true }
+      return olc == FC_I32 && nodeRepIsNulAtom(exprIx)
+    }
+    // No other expression reads a literal-union niche.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
