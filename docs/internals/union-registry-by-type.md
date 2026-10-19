@@ -282,6 +282,12 @@ generic instances included (`substRecordTwin`). The shadow's site-43 disagreemen
 LISTS still take a box: substitution keeps `Rec[]` and `Rec2[]` apart on purpose
 (`substListTwinNominal`, D3503), so the nullable-fold fixture is unchanged.
 
+**Status: step 3 is done** (L6 log, 2026-10-19). Canon keeps an inline string-literal set whole
+under `null` and in a mixed union, and `K | L | null` is the nullable literal atom at the direct
+spelling and in a generic instance. The arm pin `K | L | null` is no longer reached, so the shadow
+has no disagreement left. The prediction held: D6950 is closed, and `identListRep`'s and
+`globalListRep`'s rungs are deleted.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a

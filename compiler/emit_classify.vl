@@ -441,7 +441,6 @@ import {
   isScalarBackedListRep,
   letMapKeyKind,
   listRepOfMf,
-  listRepOrNull,
   lrGen,
   lrMemoFn,
   lrMemoGen,
@@ -598,7 +597,6 @@ import {
   emptyArrHoleElemSlot,
   fieldNamesSig,
   fnRetNulRefArrayNameSid,
-  identShadowedByFrame,
   instAnnTyNameOfExpr,
   isVariantSpellingAtRecv,
   nodeTyIsUnionRow,
@@ -609,7 +607,6 @@ import {
   objNestedFieldCompat,
   ovnFirst,
   ovnNextOf,
-  paramListRep,
   paramNulRefArray,
   paramRefArrayName,
   recordListSlotOfNode,
@@ -1683,17 +1680,6 @@ function globalIsStructSid(fnIx: i32, sid: i32, atIx: i32) {
   letIsStruct(li, -1)
 }
 
-function globalIsArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  // A nullable ref-array cell is never the i32 list, whatever `letIsArray` says: that
-  // falls through to the initializer when the annotation is not an i32 array, and an empty
-  // `[]` answers "i32 list". Only a global re-derives its kind per read, so only a global
-  // lets the initializer leak in; `buildLocals` files a local's kind once.
-  if globalIsNulRefArraySid(fnIx, sid, atIx) { return false }
-  letIsArray(li, -1)
-}
-
 // True if the module global holds a nullable ref-array cell (`let g: S[] | null`) — the
 // storage-class twin of `declaredKind == "nulreflist"` and `paramNulRefArray`. Keyed on
 // `globalCellKind`, the cell's own answer, so a read can never disagree with the cell.
@@ -1711,28 +1697,10 @@ function globalIsStringSid(fnIx: i32, sid: i32, atIx: i32) {
   globalReadAsk(sid, li, 2)
 }
 
-function globalIsRefArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsRefArray(li, -1)
-}
-
-function globalIsStringArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsStringArray(li, -1)
-}
-
 function globalIsMapSid(fnIx: i32, sid: i32, atIx: i32) {
   const li = globalLetOfSidIn(fnIx, sid, atIx)
   if li < 0 { return false }
   letIsMap(li, -1)
-}
-
-function globalIsF64ArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsF64Array(li, -1)
 }
 
 function globalIsNulListSid(fnIx: i32, sid: i32, atIx: i32) {
@@ -17653,12 +17621,6 @@ export function exprF64Array(exprIx: i32, fnIx: i32) {
 // the syntactic f32 rungs in `exprListRep`. A bare `[1.5]` literal stays f64; a value is f32[]
 // only when a declared type or an f32 element says so.
 
-function globalIsF32ArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsF32Array(li, -1)
-}
-
 // True if the `let`/`const` at `letIx` binds a `u8[]` — the packed byte list, cell
 // `(ref $bl8TypeIdx)` over `(array (mut i8))`. Annotation-only, unlike its f32/f64/i64
 // siblings: a bare array literal always types `i32[]`, so there is no un-annotated
@@ -18017,8 +17979,8 @@ function tyMayInstUnion(raw: i32): boolean {
 }
 
 // `exprListRep`'s answer from the expression's shape alone, for a node the column does not
-// cover or whose instance is still being chosen. A name or field read keeps its declaration's
-// rung: its node can be typed at a type parameter its instance does not bind, with no column.
+// cover or whose instance is still being chosen. A name reads the column; a field read keeps its
+// declaration's rung, since its node can be typed at a parameter its instance does not bind.
 function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
   const e = P.nodes[exprIx]
   match e {
@@ -18030,8 +17992,6 @@ function syntacticListRep(exprIx: i32, fnIx: i32): VKind | null {
       return exprListRep(e.parInner, fnIx) ?? columnListRep(exprIx, fnIx)
     }
     Ident => {
-      const ik = identListRep(exprIx, fnIx)
-      if ik != null { return ik }
       return columnListRep(exprIx, fnIx)
     }
     Member => {
@@ -18075,39 +18035,6 @@ function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
     if nk == ALK_F64 { return "f64list" }
     return "list"
   }
-  null
-}
-
-// The list rep of the name read at `exprIx`: the binding's own declaration — a parameter, a
-// local, a capture, a module global.
-function identListRep(exprIx: i32, fnIx: i32): VKind | null {
-  const e = P.nodes[exprIx]
-  if e is Ident {
-    const n = e.identName
-    const pk = paramListRep(fnIx, n)
-    if pk != null { return pk }
-    const dl = listRepOrNull(declaredKind(n))
-    if dl != null { return dl }
-    const ck = gatedListRep(capturedKindOf(fnIx, n), "capture")
-    if ck != null { return ck }
-    if identShadowedByFrame(fnIx, n) { return null }
-    return globalListRep(fnIx, sidOfNode(exprIx), exprIx)
-  }
-  null
-}
-
-// The list rep of the module global the name at `sid` resolves to from frame `fnIx`.
-function globalListRep(fnIx: i32, sid: i32, atIx: i32): VKind | null {
-  if globalIsStringArraySid(fnIx, sid, atIx) { return "strlist" }
-  if globalIsF64ArraySid(fnIx, sid, atIx) { return "f64list" }
-  if globalIsI64ArraySid(fnIx, sid, atIx) { return "i64list" }
-  if globalIsF32ArraySid(fnIx, sid, atIx) { return "f32list" }
-  const gli = globalLetOfSidIn(fnIx, sid, atIx)
-  if gli >= 0 {
-    if letIsU8Array(gli, -1) { return "u8list" }
-  }
-  if globalIsRefArraySid(fnIx, sid, atIx) { return "reflist" }
-  if globalIsArraySid(fnIx, sid, atIx) { return "list" }
   null
 }
 
@@ -18160,12 +18087,6 @@ export function letIsI64Array(letIx: i32, fnIx: i32) {
     return exprI64Array(d.letInit, fnIx)
   }
   false
-}
-
-function globalIsI64ArraySid(fnIx: i32, sid: i32, atIx: i32) {
-  const li = globalLetOfSidIn(fnIx, sid, atIx)
-  if li < 0 { return false }
-  letIsI64Array(li, -1)
 }
 
 // True if `exprIx` evaluates to an `i64[]`: a projection of `exprListRep`.
