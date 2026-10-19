@@ -2,7 +2,7 @@
 // panel, through the same `docMarkdown` layout hover uses.
 //
 // This surface differs from the other three in a way worth stating: `scopeResTok` and
-// `ufcTok` bank a DECLARATION node's name token, and a `TyObj` has none. It is
+// `ufc.tok` bank a DECLARATION node's name token, and a `TyObj` has none. It is
 // `{objFieldNames, objFieldTypes}` — structural, with no back-link — so two identical
 // `type`s share one arena entry and the receiver's declaration is recoverable only from the
 // RECEIVER, which is in hand during the scan and not at read time. Banking is therefore not
