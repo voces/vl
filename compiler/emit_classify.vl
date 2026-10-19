@@ -147,6 +147,7 @@ import {
   nodePinPayloadOf,
   pgResidualVoidOf,
 } from "./check_side_rows"
+import { tyVarRowsMinted } from "./check_subst"
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
@@ -17299,12 +17300,6 @@ function identReadOutOfScope(exprIx: i32, fnIx: i32) {
 // initializer is asked once per list kind its declaration is tested for; without the memo a
 // chain of global aliases costs that many times more per link. `lrMemoNul` 1 marks a null.
 let lrDepth = 0
-// Whether arena type `ty` (in bounds) can rep as a nullable list: only a nullable or a union
-// can, so every other shape skips the descriptor query.
-function lrMayBeNulList(ty: i32): boolean {
-  const t = T.tys[ty]
-  t is TyNullable || t is TyUnion
-}
 
 // `exprListRep` unmemoised. A recorded scalar, object, function or map type is no list, a call
 // included: its record is this call's result. A recorded array over a primitive is
@@ -17315,21 +17310,34 @@ function exprListRepOf(exprIx: i32, fnIx: i32): VKind | null {
   // `monomorphize` binds one, a node still open there has no rep.
   const xraw = nodeTyIxOf(exprIx)
   let xty = xraw
-  if exprIx >= 0 && xraw >= 0 && xraw < T.tys.length && lrRawHasTyVar(xraw) {
+  if (
+    tyVarRowsMinted > 0
+    && xraw >= 0
+    && xraw < T.tys.length
+    && lrRawHasTyVar(xraw)
+  ) {
     xty = nodeTyInOf(exprIx, fnIx)
     const od = repOfNodeAt(exprIx, xty)
     if od.rdCovered == 1 && vkListClass(od.rdKind) == 1 { return od.rdKind }
     const open = xty < 0 || xty >= T.tys.length || tyHasTyVar(xty)
     if open && !emitPhaseReached("monomorphizing") { return null }
   }
-  // A nullable map is no list, whatever its binding's declaration spells.
-  if tyIsNullableMap(xty) { return null }
-  // A nullable list is stored in its list's wrapper, so its rep is that list's, read off the
-  // type at its instance whatever the read's spelling or slot.
-  if exprIx >= 0 && xty >= 0 && xty < T.tys.length && lrMayBeNulList(xty) {
-    const nd = repOfNodeAt(exprIx, xty)
-    if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 2 {
-      return nulListBase(nd.rdKind)
+  if exprIx >= 0 && xty >= 0 && xty < T.tys.length {
+    const xt = T.tys[xty]
+    // A nullable map is no list, whatever its binding's declaration spells.
+    if xt is TyNullable {
+      const inner = xt.nInner
+      if inner >= 0 && inner < T.tys.length && T.tys[inner] is TyMap {
+        return null
+      }
+    }
+    // A nullable list is stored in its list's wrapper, so its rep is that list's, read off the
+    // type at its instance whatever the read's spelling or slot.
+    if xt is TyNullable || xt is TyUnion {
+      const nd = repOfNodeAt(exprIx, xty)
+      if nd.rdCovered == 1 && vkListClass(nd.rdKind) == 2 {
+        return nulListBase(nd.rdKind)
+      }
     }
   }
   // An `is K[]` arm reading an empty list of another element reads the arm's `K[]` (D4993).
@@ -17423,14 +17431,6 @@ const lrTvGen = memoGenNew(0)
 const lrTvStamp: i32[] = []
 
 const lrTvAns: i32[] = []
-
-// Whether arena type `ty` is `M | null` for a map or Set `M`.
-function tyIsNullableMap(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
-  if !(t is TyNullable) { return false }
-  t.nInner >= 0 && t.nInner < T.tys.length && T.tys[t.nInner] is TyMap
-}
 
 // Whether the node at `exprIx` is a list whose element type at its instance is a union the
 // checked-rep column boxes. Every element is then a box, so the list is the ref list whatever
