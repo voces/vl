@@ -1,0 +1,300 @@
+// `emit_union_tykey.vl` — the union registry's type key: an order-independent identity for a
+// row, minted beside its name key, and the shadow that compares it with the type each untyped
+// registration root could hand over. Nothing but the shadow reads it.
+
+import { i32ToStr } from "./ast"
+import { canonUnionMemberTysOf } from "./check_program"
+import { T, TyArray, tyToStructStr } from "./check_types"
+import { structIndexByName } from "./emit_atom_kinds"
+import { strLess } from "./emit_base"
+import { repShadowAddReason } from "./emit_rep"
+import {
+  sTyIx,
+  unKey,
+  unMemAtoms,
+  unMemKinds,
+  unMemTyCount,
+  unMemTyStart,
+  unMemTys,
+  unTyIx,
+  unTyKey,
+} from "./emit_state"
+import { TY_WALK_DEPTH } from "./emit_ty_canon"
+import {
+  unABOn,
+  unMemPeelAliasWrapper,
+  unRowOfName,
+} from "./emit_union_registry"
+import { flattenVariantsInto } from "./tyquery"
+
+// Key texts to ids. Pure text identities, so the table lives across programs.
+const utkIds: {[string]: i32} = Map()
+const utkTexts: string[] = []
+
+// The id of key text `s`, interning it when new.
+function utkIdOf(s: string): i32 {
+  const hit = utkIds[s] ?? -1
+  if hit >= 0 { return hit }
+  const id = utkTexts.length
+  utkTexts.push(s)
+  utkIds[s] = id
+  id
+}
+
+// One member's key text: `null` for -1; a union or a list keyed by its members' texts, sorted;
+// any other type its structural render, which keeps literals and spells a record as its shape.
+// A union or list already on the walk's path keys as `^k`, k steps up it, so a recursive
+// alias keys in time linear in its size.
+function utkMemberText(ty: i32): string {
+  const path: i32[] = []
+  utkTyText(ty, path)
+}
+
+function utkTyText(ty: i32, path: i32[]): string {
+  if ty < 0 { return "null" }
+  if ty >= T.tys.length || path.length >= TY_WALK_DEPTH {
+    return tyToStructStr(ty)
+  }
+  const p = unMemPeelAliasWrapper(ty)
+  let k = path.length - 1
+  while k >= 0 {
+    if path[k] == p { return "^" + i32ToStr(path.length - 1 - k) }
+    k = k - 1
+  }
+  const xs: i32[] = []
+  flattenVariantsInto(p, xs)
+  if xs.length > 1 {
+    path.push(p)
+    const texts: string[] = []
+    for x in xs { texts.push(utkTyText(x, path)) }
+    path.pop()
+    return "(" + utkTextOf(texts) + ")"
+  }
+  const t = T.tys[ty]
+  if t is TyArray {
+    path.push(p)
+    const e = utkTyText(t.aElem, path)
+    path.pop()
+    return "[" + e + "]"
+  }
+  tyToStructStr(ty)
+}
+
+// The key text of a member multiset: the member texts sorted, never deduped.
+function utkTextOf(texts: string[]): string {
+  const ks: string[] = []
+  for t in texts {
+    let at = 0
+    while at < ks.length && !strLess(t, ks[at]) { at = at + 1 }
+    ks.push(t)
+    let m = ks.length - 1
+    while m > at {
+      ks[m] = ks[m - 1]
+      m = m - 1
+    }
+    ks[at] = t
+  }
+  let out = ""
+  let j = 0
+  while j < ks.length {
+    if j > 0 { out = out + " ; " }
+    out = out + ks[j]
+    j = j + 1
+  }
+  out
+}
+
+// The key text of the members row `u` recorded. A row with an atom no member type resolves is
+// keyed by the row's own type (`unTyIx`); failing that, the atom keys as `?` plus its spelling.
+function utkRowText(u: i32): string {
+  if u < 0 || u >= unMemTyStart.length || u >= unMemTyCount.length { return "" }
+  const s = unMemTyStart[u]
+  if s < 0 { return "" }
+  const texts: string[] = []
+  let open = false
+  let i = 0
+  while i < unMemTyCount[u] {
+    const m = s + i
+    if m >= unMemTys.length || m >= unMemKinds.length { return "" }
+    if unMemKinds[m] == 0 {
+      texts.push("null")
+    } else if unMemTys[m] < 0 {
+      const at = utkAtomText(unMemAtoms[m])
+      texts.push(at)
+      if at.slice(0, 1) == "?" { open = true }
+    } else {
+      texts.push(utkMemberText(unMemTys[m]))
+    }
+    i = i + 1
+  }
+  if open && u < unTyIx.length && unTyIx[u] >= 0 {
+    const t = utkTyKeyText(unTyIx[u])
+    if t != "" { return t }
+  }
+  utkTextOf(texts)
+}
+
+// The key text of an atom no member type resolves: a struct row's name, under any number of
+// `[]`, keys as that row's recorded type (`#anon0[]`); any other is `?` plus its spelling.
+function utkAtomText(a: string): string {
+  let base = a
+  let lists = 0
+  while base.length > 2 && base.slice(base.length - 2, base.length) == "[]" {
+    base = base.slice(0, base.length - 2)
+    lists = lists + 1
+  }
+  const si = structIndexByName(base)
+  if si < 0 || si >= sTyIx.length || sTyIx[si] < 0 { return "?" + a }
+  let out = utkMemberText(sTyIx[si])
+  while lists > 0 {
+    out = "[" + out + "]"
+    lists = lists - 1
+  }
+  out
+}
+
+// The key text of type `ty`'s canonical members, or "" when it has none.
+function utkTyKeyText(ty: i32): string {
+  const mems: i32[] = []
+  if ty < 0 || !canonUnionMemberTysOf(ty, mems) { return "" }
+  const texts: string[] = []
+  for m in mems { texts.push(utkMemberText(m)) }
+  utkTextOf(texts)
+}
+
+// Appends the type key of the row just minted, so `unTyKey` stays parallel to `unKey`.
+export function unTyKeyPushRow() {
+  while unTyKey.length + 1 < unKey.length { unTyKey.push(-1) }
+  const t = utkRowText(unMemTyStart.length - 1)
+  let id = -1
+  if t != "" { id = utkIdOf(t) }
+  unTyKey.push(id)
+  0
+}
+
+// The shadow's roots, by tag. Each is a registration that holds a name and no type.
+const UTK_PARAM = 1
+const UTK_PARAM_LIST = 2
+const UTK_RET = 3
+const UTK_TPSUB = 4
+const UTK_ARM = 5
+const UTK_LET = 6
+const UTK_SITE43 = 7
+const UTK_SITE32 = 8
+const UTK_SITE33 = 9
+const UTK_SITE37 = 10
+const UTK_N = 11
+// Outcomes: the type's key equals the name row's, differs, the name has no row, no type.
+const UTK_EQ = 0
+const UTK_NE = 1
+const UTK_NOROW = 2
+const UTK_NOTY = 3
+const UTK_K = 4
+
+// Emit-time tallies, `utkCnt[tag * UTK_K + outcome]`, and one line per disagreement; the
+// sweep reports them after `repShadowSweep` resets the reason table.
+let utkCnt: i32[] = []
+let utkNe: string[] = []
+
+// The shadow tag of `registerInlineUnionAt`'s untyped recursion `site`, or 0 for one it does not watch.
+export function unTyKeySiteTag(site: i32): i32 {
+  if site == 32 { return UTK_SITE32 }
+  if site == 33 { return UTK_SITE33 }
+  if site == 37 { return UTK_SITE37 }
+  0
+}
+
+// The mono roots' tags, for the callers that stage one.
+export function unTyKeyTagParam(): i32 { UTK_PARAM }
+export function unTyKeyTagParamList(): i32 { UTK_PARAM_LIST }
+export function unTyKeyTagRet(): i32 { UTK_RET }
+export function unTyKeyTagTpSub(): i32 { UTK_TPSUB }
+export function unTyKeyTagArm(): i32 { UTK_ARM }
+export function unTyKeyTagLet(): i32 { UTK_LET }
+export function unTyKeyTagSite43(): i32 { UTK_SITE43 }
+
+function utkTagName(t: i32): string {
+  if t == UTK_PARAM { return "monoPin/param" }
+  if t == UTK_PARAM_LIST { return "monoPin/listElem" }
+  if t == UTK_RET { return "rsC" }
+  if t == UTK_TPSUB { return "tpSub" }
+  if t == UTK_ARM { return "armPin" }
+  if t == UTK_LET { return "monoPin/let" }
+  if t == UTK_SITE43 { return "site43" }
+  if t == UTK_SITE32 { return "site32" }
+  if t == UTK_SITE33 { return "site33" }
+  if t == UTK_SITE37 { return "site37" }
+  "tag?"
+}
+
+function utkOutName(k: i32): string {
+  if k == UTK_EQ { return "eq" }
+  if k == UTK_NE { return "ne" }
+  if k == UTK_NOROW { return "no-row" }
+  "no-ty"
+}
+
+function utkBump(tag: i32, k: i32) {
+  const at = tag * UTK_K + k
+  while utkCnt.length <= at { utkCnt.push(0) }
+  utkCnt[at] = utkCnt[at] + 1
+  0
+}
+
+// Compares the key of type `ty`'s canonical members with the key of the row `name` names, for
+// root `tag`. Armed only; a disagreement is kept as a line naming both keys.
+export function unTyKeyShadow(tag: i32, name: string, ty: i32) {
+  if unABOn() == 0 || tag <= 0 { return 0 }
+  const u = unRowOfName(name)
+  if u < 0 { return utkBump(tag, UTK_NOROW) }
+  const tt = utkTyKeyText(ty)
+  if tt == "" {
+    let tr = "-"
+    if ty >= 0 && ty < T.tys.length { tr = tyToStructStr(ty) }
+    utkNe.push(
+      "unTyKey/" + utkTagName(tag) + "/NOTY " + name + " TY[" + tr + "]",
+    )
+    return utkBump(tag, UTK_NOTY)
+  }
+  let rk = -1
+  if u < unTyKey.length { rk = unTyKey[u] }
+  if rk >= 0 && utkIdOf(tt) == rk { return utkBump(tag, UTK_EQ) }
+  let rt = "-"
+  if rk >= 0 { rt = utkTexts[rk] }
+  utkNe.push(
+    "unTyKey/"
+      + utkTagName(tag)
+      + "/NE "
+      + name
+      + " ROW["
+      + rt
+      + "] TY["
+      + tt
+      + "]",
+  )
+  utkBump(tag, UTK_NE)
+}
+
+// Reports the tallies and the disagreement lines, then empties them. A no-op unless armed.
+export function unTyKeyShadowSweep() {
+  if unABOn() == 0 { return 0 }
+  let t = 1
+  while t < UTK_N {
+    let k = 0
+    while k < UTK_K {
+      const at = t * UTK_K + k
+      if at < utkCnt.length {
+        repShadowAddReason(
+          "unTyKey/" + utkTagName(t) + "/" + utkOutName(k),
+          utkCnt[at],
+        )
+      }
+      k = k + 1
+    }
+    t = t + 1
+  }
+  for l in utkNe { repShadowAddReason(l, 1) }
+  utkCnt = []
+  utkNe = []
+  0
+}
