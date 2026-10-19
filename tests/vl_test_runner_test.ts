@@ -1000,3 +1000,36 @@ Deno.test({
     expectHas(r.err, 'expected "1" to be close to <f64> to 2 digits');
   },
 });
+
+const ONCE = `${ROOT}/tests/fixtures/vl-test-once`;
+
+Deno.test({
+  name: "vl-test: a file's top level runs once — the run reuses collection's instance",
+  ignore: !ENABLED,
+  fn: async () => {
+    // heregeat: collection instantiated each file and the run instantiated it again,
+    // so top-level setup was paid twice. The fixture's top level appends one line to
+    // a log per run, and `-t` selecting none of its tests must not add a second.
+    const dir = await Deno.makeTempDir({ prefix: "vl-test-once-" });
+    try {
+      const log = `${dir}/log`;
+      const r = await runTest(ONCE, [], { VL_TOP_LOG: log });
+      if (r.code !== 0) throw new Error(`want both tests green, got ${r.code}:\n${r.err}`);
+      expectHas(r.err, "1 file · 2 passed · 0 failed");
+      const got = await Deno.readTextFile(log);
+      if (got !== "top\n") {
+        throw new Error(`want the top level run once, got the log ${JSON.stringify(got)}`);
+      }
+      await Deno.remove(log);
+      const none = await runTest(ONCE, ["-t", "no such test"], { VL_TOP_LOG: log });
+      const ran = await Deno.readTextFile(log);
+      if (ran !== "top\n") {
+        throw new Error(
+          `-t selecting nothing: want one top-level run, got ${JSON.stringify(ran)}\n${none.err}`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

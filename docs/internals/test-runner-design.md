@@ -111,6 +111,12 @@ compiled `Module` is reused; instantiation is cheap and the start function
 re-registers deterministically), resume at the next test. Re-instantiation is
 also the better-isolation fallback if post-trap stores misbehave.
 
+Execute runs in the instance Collect left, so a file's top level runs once per
+`vl test` and not once per phase (heregeat: 0.7 s of top-level setup cost 1.4 s).
+Reading the registry changes no state. A file is re-instantiated for its run
+only after a trap, or when memory headroom is under 4 GiB at collection, since
+every kept instance stays live until its file runs.
+
 ## Parallelism + isolation — instances, not threads
 
 Wasm instances are single-threaded and share nothing; that maps the jest
