@@ -1767,6 +1767,105 @@ the commits that decline a guard (not `all` or `graph`).
   Master's seed compiling this branch's source reads 109,198,411,468, so the cost is the new
   source, and the unarmed path runs none of the new code.
 
+**S5 step 11: `fresh` banks what the adoption reads, and a `null` default is closed**
+(`skFreshBanked`, `skFreshSplit` and `skParamsClosed` in `compiler/driver.vl`; `recDelivPush`
+in `compiler/check_rec_rows.vl`; `ihOccDigests` in `compiler/iface_hash.vl`).
+
+*What the adoption reads.* `recFnBuiltAtDst` builds a fresh value (a builder with an inferred
+record return, or a literal-only binding) at its one destination's type. Read from the code,
+the judgement has three inputs, and each is now banked per value, per module:
+- **the value's occurrences in every module**, since `rcwCallSites` counts them syntactically;
+- **the value's declaring statement**, since every leaf has to be an object literal;
+- **which deliveries keep it**: a kept delivery adopts the destination's type, an own one
+  hands the value on at its own type, and `recKeptConflicts` refuses a mixed pair only when one
+  check sees both.
+
+A judgement that fails also reads the site count, and it pushes no kept row. So the bank
+records every judgement as a delivery: `REC_DELIV_KEPT` (1), `REC_DELIV_OWN` (2), and
+`REC_DELIV_READ` (4) for a judgement that read the count, whatever it decided.
+
+*The rules.* All four decline `fresh`, and each has its own mask:
+- **R1, stage 0** (mask 1073741824): a served module has a delivery of the value, and the
+  value's occurrence digest moved in a module of S.
+- **R4, stage 0** (65536): a served module has a delivery of the value, the declaring
+  statement's hash moved, and its module is in S.
+- **R2, stage 1** (1073741824): S's check keeps the value, and a served module holds an
+  occurrence of it.
+- **Split, stage 1** (-2147483648): a served module keeps the value, and S's check delivers it
+  at all, or S's kept deliveries moved. Or a served module hands it on at its own type and S's
+  kept deliveries moved.
+- A delivery the bank cannot attribute to a module declines at either stage.
+
+A served value whose inputs did not move is served. Before this step it declined whenever the
+reach met an inferred non-scalar return.
+
+*Witnesses.* Each input has a case that must serve, a case that must decline, and a mask
+under which the declining case serves wrongly:
+
+| input | must serve | must decline | mask witness |
+| --- | --- | --- | --- |
+| occurrences in S | "a served call is a second site of a fresh builder" | "a lib call stops being a second site of a fresh builder"; "lib gains a value use named like lib2's builder" (D6750) | 1073741824 on both |
+| declaring statement | "lib edits elsewhere while main keeps lib's builder" | "lib's builder leaf becomes a binding" | 65536 |
+| kept and own split | "a lib call stops delivering a fresh builder to a wider record" | "lib hands on a kept binding main delivers to a wider record" (D6751) | -2147483648 |
+
+- D6750 is an occurrence that only shares the builder's name. The site count is syntactic, so
+  it moves the count.
+- D6751 was unsound on master: a kept delivery in main and an own one in lib, with lib's
+  interface unchanged.
+- The `READ` flag is not a mask. Without it, "a lib call stops being a second site" served
+  main's stale refusal, because the refusal kept nothing.
+- "a lib call starts delivering a fresh builder to a wider record" now declines `interface`
+  first, and "a lib call becomes a second site" still declines `fresh`.
+
+*A `null` default is closed.* `skParamsClosed` now accepts an annotated parameter whose
+default is `null`. The argument is the scalar-literal one: `null` has one type whatever
+imports the function, the declaration's own check types it, and a caller reads only the
+annotation. `skScalarLit` is unchanged, so an un-annotated `let x = null` is still not
+`SK_SHUT`, because the Q3 ruling types it from its first use. This is the remaining `demand`:
+all three of the diderven window's `demand` declines (cf669be, 339ef4c, ddbf958) are one
+declaration, `sigFire(on: On, a: Actor | null = null, …)` in `src/sim/signatures.vl`, imported
+by served modules. It is not `skKept`: the three `skKept` masks together moved none of them.
+The suite adds "a null-defaulted param body edit" (must serve), and "a const-defaulted param
+body edit" still declines `demand`.
+
+*Differential suite*: 80 edits. 30 must serve, 47 must decline, and 3 may do either (step 10:
+26, 46 and 3).
+
+*Replays.* All runs are 0 unsound. A ratio is armed time over unarmed time, summed over the
+commits that decline a guard (not `all` or `graph`). The box was shared with other agents, so
+ratios move by about 0.1 between identical runs.
+
+| graph | master's seed | this step |
+| --- | --- | --- |
+| diderven `src/game.vl`, 30 commits to fa7a8be (read-only copy) | 3 served, 8 fresh, 3 demand, 3 ambient, 3 all, 10 graph | 3 served, 14 ambient, 3 all, 10 graph |
+| decline ratio | 1.06 | 1.12 |
+| `compiler/entry.vl`, 30 commits to 89cdf67 | 19 fresh, 8 ambient, 2 all, 1 graph | 20 ambient, 7 interface, 2 all, 1 graph |
+| decline ratio | 1.13 | 1.36 |
+
+- **No guard but `ambient`, `interface`, `all` and `graph` declines on either graph.** Every
+  `fresh` and `demand` decline moved past its guard. The served diderven commits are the same
+  three edit commits (06f6175, c3108a2, 9d99be3, each a check of S serving 180 or more
+  modules), so no edit commit is newly served.
+- **The compiler ratio rises, from 1.13 to 1.36.** Its 7 `interface` declines are at stage 1,
+  after the check of S, where every `fresh` decline on master's seed was at stage 0. A decline
+  that gets further costs more armed work. The unarmed path is unchanged (see *Cost*).
+- **`ambient` is what stands next.** On diderven, 11 of the 14 are met (a served ambient
+  statement's key is in S's words) and 3 moved (S's own ambient statements changed). With
+  NAME keys dropped (1048576), 6 of the met ones decline `interface` instead, and the rest
+  still decline `ambient`. No other single key kind (FIELDS, RECV, render, generic, arena)
+  moves any. So narrowing NAME keys would serve no diderven commit until `interface` is
+  narrowed too.
+- **On the compiler graph the same holds.** With FIELDS keys dropped (524288), `interface`
+  goes from 7 to 16 and `ambient` from 20 to 11. With NAME keys dropped, `interface` is 9 and
+  `ambient` 18. RECV, render, generic and arena keys move none. No commit is served under any
+  single mask, so `interface` is the guard to narrow before `ambient`.
+
+*Cost.* The seed grows by 14,443 bytes (+0.23%; `seed-size --check` reads +1.7% against its
+baseline). The L2 self-compile fuel is 109,683,089,008 for master's seed on master's source,
+and 108,646,351,087 for this step's seed on this step's source (−0.95%). Master's seed on this
+step's source reads 108,646,351,013, so the change in fuel comes from the source, and the
+unarmed path runs none of the new code.
+
 **Why this order.**
 - S1 is the only stage whose soundness argument fits in one paragraph, and it serves sunpa's
   most frequent loop with no compiler change.
