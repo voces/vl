@@ -42,7 +42,7 @@ import {
   peelGroupParens,
   unionMemberCount,
 } from "./tyname"
-import { njSetPinFn } from "./check_core_state"
+import { njSetPinFn, pinResolvedFnTy } from "./check_core_state"
 import {
   bindGenUnionArmInto,
   bindGenUnionShapedArmInto,
@@ -101,6 +101,7 @@ import { uniqueGenericDeclNamed } from "./check_generic_args"
 import {
   T,
   TY_VOID,
+  Ty,
   TyArray,
   TyErr,
   TyFunc,
@@ -291,10 +292,13 @@ import {
   monoNameIsExported,
   monoParamBareTyParam,
   monoTyParamOnlyBareParams,
+  vrCalleeTy,
+  vrCalls,
   vrFrameOf,
   vrIndex,
   vrIndexed,
   vrInert,
+  vrLits,
   vrReadsInert,
   vrReset,
 } from "./value_reach"
@@ -13236,6 +13240,71 @@ function monoInertReach(stmts: i32[]) {
   monoReachIndex(roots)
 }
 
+// Types each list or record literal whose function element or field the walk left open at the
+// one call type the value reaches (`vrCalleeTy`), so its slot's signature is the one those calls
+// make (D7103).
+function monoReachLitTys() {
+  for a in vrLits {
+    const at = nodeTyIxOf(a)
+    if at >= 0 && at < T.tys.length {
+      monoReachListTy(a, T.tys[at])
+      monoReachRecTy(a, T.tys[at])
+    }
+  }
+  0
+}
+
+// The list half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a list.
+function monoReachListTy(a: i32, t: Ty) {
+  if t is TyArray {
+    const ct = monoReachSlotTy(a, t.aElem, "e,")
+    if ct >= 0 { nodeTyRecord(a, mkArrayTy(ct)) }
+  }
+  0
+}
+
+// The record half of `monoReachLitTys`: literal `a` of type `t`, when `t` is a record.
+function monoReachRecTy(a: i32, t: Ty) {
+  if t is TyObj {
+    const fts: i32[] = []
+    let moved = false
+    let i = 0
+    while i < t.objFieldTypes.length {
+      const ct = monoReachSlotTy(
+        a,
+        t.objFieldTypes[i],
+        "f:" + t.objFieldNames[i] + ",",
+      )
+      if ct >= 0 {
+        fts.push(ct)
+        moved = true
+      } else {
+        fts.push(t.objFieldTypes[i])
+      }
+      i = i + 1
+    }
+    if moved { nodeTyRecord(a, mkObjTy(t.objFieldNames, fts)) }
+  }
+  0
+}
+
+// The call type literal `a`'s slot at `path`, of open function type `st`, reaches, recorded on
+// each reached callee still open; -1 when the slot is no such function or reaches no one type.
+function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
+  if st < 0 || st >= T.tys.length || !(T.tys[st] is TyFunc) { return -1 }
+  if !tyHasTyVar(st) || pinResolvedFnTy(st) >= 0 { return -1 }
+  const ct = vrCalleeTy(a, path)
+  if ct < 0 { return -1 }
+  for c in vrCalls(a, path) {
+    const cn = P.nodes[c]
+    if cn is Call {
+      const ft = nodeTyIxOf(cn.callFn)
+      if ft >= 0 && tyHasTyVar(ft) { nodeTyRecord(cn.callFn, ct) }
+    }
+  }
+  ct
+}
+
 // Adds to `monoInertReach`'s index the subtrees under `roots` not yet in it, such as an
 // instance's body the walk is about to enter, and notes their inert names (D6930).
 function monoReachIndex(roots: i32[]) {
@@ -19193,6 +19262,7 @@ export function monomorphize(stmts: i32[]) {
     }
     fe3 = fe3 + 1
   }
+  monoReachLitTys()
   // Settled before the prune, as the walk left it, and again after, in case the prune minted.
   monoRetSettle()
   const prc = monoPruneTemplates(nDecl)
