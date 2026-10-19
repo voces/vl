@@ -12881,10 +12881,15 @@ function monoNoteInertInit(d: LetDecl, at: i32, ctx: i32) {
 
 // Records the generic function names in value `v` that function `fx` returns when its result is
 // inert at every call (`monoFnResultIsInert`), as `monoNoteInertInit` does a binding's (D6882).
+// An instance answers by its template, whose calls are the program's (D6930).
 function monoNoteInertRet(v: i32, fx: i32) {
   if v < 0 { return 0 }
   const xs = monoGenericValuesOf(v)
-  if xs.length == 0 || !monoFnResultIsInert(fx, 0) { return 0 }
+  if xs.length == 0 { return 0 }
+  let fr = fx
+  const it = monoFrameInstTmpl(fx)
+  if it[0] == fx && it[1] >= 0 { fr = it[1] }
+  if !monoFnResultIsInert(fr, 0) { return 0 }
   monoNoteInertAll(xs)
 }
 
@@ -12910,9 +12915,12 @@ function monoGenericValuesOf(v: i32): i32[] {
   xs
 }
 
+// Notes each name in `xs` inert; one naming a function called by name elsewhere is also served
+// by that function's own closure, which nothing calls here (D6660, D6931).
 function monoNoteInertAll(xs: i32[]) {
   for x in xs {
     if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
+    monoFlowNoteInertLeaf(x)
   }
   0
 }
@@ -15431,10 +15439,21 @@ function monoInertParamStubPin(
   const fes: i32[] = []
   const at: i32[] = []
   if !monoInertArgFns(argIx, fes, at, 0) { return "" }
-  for fe in fes {
-    if monoInstantiatedAny(fe) { return "" }
-    const d = monoOrigNode[fe]
-    if !monoCallsHoleParam(d) && !monoGenReadsAreInert(d) { return "" }
+  // A function called by name keeps its instance, whose closure the parameter takes unread: a
+  // closure's representation is one for every signature (D6931).
+  const stubbed: boolean[] = []
+  let j = 0
+  while j < fes.length {
+    const fe = fes[j]
+    const g = monoFlowLeafGen(at[j])
+    const byName = g >= 0 && monoFlowGenCalled(g)
+    stubbed.push(!byName)
+    if !byName {
+      if monoInstantiatedAny(fe) { return "" }
+      const d = monoOrigNode[fe]
+      if !monoCallsHoleParam(d) && !monoGenReadsAreInert(d) { return "" }
+    }
+    j = j + 1
   }
   if !monoParamUsesAreInert(oDecl, i, 0) { return "" }
   const noPs: i32[] = []
@@ -15442,8 +15461,14 @@ function monoInertParamStubPin(
   const k = sigKeyOfTy(st)
   if k == "" { return "" }
   monoNoteInertAll(at)
-  for x in at { monoInertArgAt.push(x) }
-  for fe in fes { monoInertArgFe.push(fe) }
+  j = 0
+  while j < fes.length {
+    if stubbed[j] {
+      monoInertArgAt.push(at[j])
+      monoInertArgFe.push(fes[j])
+    }
+    j = j + 1
+  }
   // arena-tick exempt: the caller's out-parameter, not an arena row any pass reads.
   tyOut[0] = st
   "=>" + k
@@ -17748,6 +17773,7 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
     }
     j = j + 1
   }
+  let dead: i32[] = []
   let k = 0
   while k < P.nodes.length {
     if isCallee[k] != 1 {
@@ -17758,6 +17784,9 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
           if names[m] == idn.identName && hit[m] != 1 {
             let mark = 1
             if isCallee[k] == 2 || i32ListHas(monoInertValues, k) { mark = 2 }
+            // A template body no slot emits holds no use (D6930); built on the first such read.
+            if mark == 1 && dead.length == 0 { dead = monoUnemittedNodes() }
+            if mark == 1 && dead[k] == 1 { mark = hit[m] }
             // arena-tick exempt: `hit` is this function's own out-parameter list.
             hit[m] = mark
           }
@@ -17768,6 +17797,65 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
     k = k + 1
   }
   hit
+}
+
+// Per node, 1 when only the body of a generic template no slot emits holds it: one whose first
+// instance replaced its slot, or an unreplaced `<T>` template the prune stubs. 0 for every node
+// an emitted slot or a module statement reaches, and for every node no template holds.
+function monoUnemittedNodes(): i32[] {
+  const mark: i32[] = []
+  while mark.length < P.nodes.length { mark.push(0) }
+  const slots: {[i32]: i32} = Map()
+  // arena-tick exempt: `slots` is this function's own count, not the arena.
+  for f in fnStmts { slots[f] = (slots[f] ?? 0) + 1 }
+  const roots: i32[] = []
+  let gc = 0
+  while gc < monoOrigNode.length && gc < monoGen.length && gc < fnStmts.length {
+    const o = monoOrigNode[gc]
+    if monoGen[gc] == 1 && o >= 0 && o < P.nodes.length {
+      const f = P.nodes[o]
+      if f is FuncDecl {
+        const n = slots[o] ?? 0
+        if n == 0 || (n == 1 && fnStmts[gc] == o && f.fnTyParams.length > 0) {
+          roots.push(o)
+        }
+      }
+    }
+    gc = gc + 1
+  }
+  if roots.length == 0 { return mark }
+  // arena-tick exempt: `mark` is this function's own table, not the arena.
+  for o in roots { mark[o] = 3 }
+  for o in roots { monoMarkReach(mark, o, 1) }
+  for f in fnStmts { monoMarkReach(mark, f, 2) }
+  for st in monoProgStmts { monoMarkReach(mark, st, 2) }
+  let i = 0
+  while i < mark.length {
+    // arena-tick exempt: `mark` is this function's own table, not the arena.
+    if mark[i] == 3 { mark[i] = 1 }
+    i = i + 1
+  }
+  mark
+}
+
+// Marks `v` every node `root` reaches, entering function bodies, that holds a lower mark; a dead
+// template root (3) is entered only as its own root.
+function monoMarkReach(mark: i32[], root: i32, v: i32) {
+  if root < 0 || root >= mark.length || (mark[root] == 3 && v == 2) { return 0 }
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const cur = stack.pop() ?? -1
+    if cur >= 0 && cur < mark.length && (cur == root || mark[cur] < v) {
+      if mark[cur] != 3 || cur == root {
+        // arena-tick exempt: `mark` is the caller's own table, not the arena.
+        if mark[cur] != 3 { mark[cur] = v }
+        const b = monoNestedBodyOf(cur)
+        if b >= 0 { stack.push(b) }
+        for ch in nodeChildren(cur) { stack.push(ch) }
+      }
+    }
+  }
+  0
 }
 
 // The lifted-function position of the generic named function the module-level binding at
