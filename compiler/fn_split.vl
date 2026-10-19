@@ -1906,8 +1906,11 @@ function fsFnCalls(fd: i32): i32[] {
           calls.push(c)
         } else if fsFnAliasInit(c) == r && !hasI32(decls, c) {
           decls.push(c)
-        } else if cn is ArrayLit {
-          for lc in fsListCalls(c) { calls.push(lc) }
+        } else if cn is ArrayLit || cn is FieldInit {
+          for lc in fsHolderCalls(r) { calls.push(lc) }
+          for al in fsHolderAliases {
+            if !hasI32(decls, al) { decls.push(al) }
+          }
         } else {
           calls.push(-1)
         }
@@ -1945,38 +1948,98 @@ function fsFnCalls(fd: i32): i32[] {
   calls
 }
 
-// The calls through one-element list literal `arr` that an un-annotated `const` binding holds,
-// each `xs[0](...)`; [-1] when the list is read any other way (D6764).
-function fsListCalls(arr: i32): i32[] {
-  const an = P.nodes[arr]
-  const d = fsParent[arr]
-  if d < 0 || !(an is ArrayLit) || an.arrElems.length != 1 { return [-1] }
+// The calls of the function name `r` places in a list element or record field, when an
+// un-annotated `const` binding holds that literal: each `xs[k](...)` or `o.f(...)` reading
+// `r`'s own slot (D6791). An un-annotated `const` initialized by such a read goes in
+// `fsHolderAliases`. [-1] when the literal is read any other way or written.
+let fsHolderAliases: i32[] = []
+function fsHolderCalls(r: i32): i32[] {
+  fsHolderAliases = []
+  const lit = fsParent[r]
+  if lit < 0 { return [-1] }
+  let at = -1
+  let fld = ""
+  const ln = P.nodes[lit]
+  let host = lit
+  if ln is ArrayLit {
+    let i = 0
+    while i < ln.arrElems.length {
+      if ln.arrElems[i] == r { at = i }
+      i = i + 1
+    }
+  } else if ln is FieldInit && ln.fiValue == r {
+    fld = ln.fiName
+    host = fsParent[lit]
+    if host < 0 || !(P.nodes[host] is ObjLit) { return [-1] }
+  }
+  if at < 0 && fld == "" { return [-1] }
+  const d = fsParent[host]
+  if d < 0 { return [-1] }
   const dn = P.nodes[d]
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
     || dn.letType >= 0
-    || dn.letInit != arr
+    || dn.letInit != host
   ) {
     return [-1]
   }
   const calls: i32[] = []
-  for r in fsIdents {
-    if identDeclOf(r) == d && r != d {
-      const x = fsParent[r]
+  for u in fsIdents {
+    if identDeclOf(u) == d && u != d {
+      const x = fsParent[u]
       if x < 0 { return [-1] }
       const xn = P.nodes[x]
-      if !(xn is Index) || xn.idxArr != r { return [-1] }
-      const ix = P.nodes[xn.idxIndex]
-      if !(ix is NumLit) || ix.numText != "0" { return [-1] }
+      let mine = false
+      if at >= 0 {
+        if !(xn is Index) || xn.idxArr != u { return [-1] }
+        const k = fsLitIndex(xn.idxIndex)
+        if k < 0 { return [-1] }
+        mine = k == at
+      } else {
+        if !(xn is Member) || xn.memObj != u { return [-1] }
+        mine = xn.memProp == fld
+      }
       const c = fsParent[x]
       if c < 0 { return [-1] }
       const cn = P.nodes[c]
-      if !(cn is Call) || cn.callFn != x { return [-1] }
-      calls.push(c)
+      if cn is BinExpr && cn.binLeft == x {
+        return fsHolderUnfollowed()
+      } else if mine {
+        if cn is Call && cn.callFn == x {
+          calls.push(c)
+        } else if (
+          cn is LetDecl
+          && cn.letKw == "const"
+          && cn.letType < 0
+          && cn.letInit == x
+        ) {
+          fsHolderAliases.push(c)
+        } else {
+          return fsHolderUnfollowed()
+        }
+      }
     }
   }
   calls
+}
+
+// The answer for a holder slot written, or read other than by a call or a `const` alias: the
+// split cannot follow the function out of it.
+function fsHolderUnfollowed(): i32[] { [-1] }
+
+// The value of index node `ix` when it is a decimal integer literal, else -1.
+function fsLitIndex(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is NumLit) || n.numText.length == 0 || n.numText.length > 6 {
+    return -1
+  }
+  let v = 0
+  for ch in n.numText {
+    if ch < "0"[0] || ch > "9"[0] { return -1 }
+    v = v * 10 + (ch - "0"[0])
+  }
+  v
 }
 
 // The initializer of `d` when it is an un-annotated `const` binding initialized by a name, else -1.
@@ -2374,13 +2437,46 @@ function fsPlanHoles(): i32 {
       work.push(a)
     }
   }
+  // Functions sharing a list take one parameter list, so each splits its parameter at the
+  // keys all of them call it at, in one order (D6832).
+  const gPar: i32[] = []
+  const gKeys: string[][] = []
   let wi = 0
   while wi < work.length {
     const par = work[wi]
     wi = wi + 1
     if hsIx(par) < 0 && fsParent[par] >= 0 {
-      const ks = fsHoleKeys(par)
+      let gi = 0
+      while gi < gPar.length && gPar[gi] != par { gi = gi + 1 }
+      let ks = fsHoleKeys(par)
       if hsBad { return fsHoleDecline() }
+      if gi < gPar.length {
+        for k in ks {
+          if !hasStr(gKeys[gi], k) { return fsHoleDecline() }
+        }
+        ks = gKeys[gi]
+      } else {
+        const grp = fsListGroupPars(par)
+        if hasI32(grp, -1) { return fsHoleDecline() }
+        if grp.length > 1 {
+          for q in grp {
+            for k in fsHoleKeys(q) {
+              if !hasStr(ks, k) { ks.push(k) }
+            }
+            if hsBad { return fsHoleDecline() }
+          }
+          for q in grp {
+            if q != par {
+              if hsIx(q) >= 0 || !fsHoleOverTyParam(q) {
+                return fsHoleDecline()
+              }
+              gPar.push(q)
+              gKeys.push(ks)
+              work.push(q)
+            }
+          }
+        }
+      }
       if ks.length > 1 {
         hsPar.push(par)
         hsKeys.push(ks)
@@ -2439,6 +2535,45 @@ function fsPlanHoles(): i32 {
   }
   if hsPar.length == 0 { return 1 }
   0
+}
+
+// The parameters at `par`'s position of every function sharing a list literal with `par`'s
+// function, through further lists, `par` first; [-1] when an element is not a function name.
+function fsListGroupPars(par: i32): i32[] {
+  const grp: i32[] = [par]
+  let gi = 0
+  while gi < grp.length {
+    const fd = fsParent[grp[gi]]
+    gi = gi + 1
+    const f = P.nodes[fd]
+    if !(f is FuncDecl) { return [-1] }
+    let j = 0
+    while j < f.fnParams.length && f.fnParams[j] != grp[gi - 1] { j = j + 1 }
+    const own = fsFnOwner(fd)
+    for r in fsIdents {
+      const lit = fsParent[r]
+      if (
+        identDeclOf(r) == own
+        && r != own
+        && lit >= 0
+        && P.nodes[lit] is ArrayLit
+      ) {
+        const ln = P.nodes[lit]
+        if ln is ArrayLit {
+          for e in ln.arrElems {
+            const en = P.nodes[e]
+            const ed = identDeclOf(e)
+            if !(en is Ident) || ed < 0 || ed >= fsParseLen { return [-1] }
+            const edn = P.nodes[ed]
+            if !(edn is FuncDecl) || edn.fnParams.length <= j { return [-1] }
+            const q = edn.fnParams[j]
+            if !hasI32(grp, q) { grp.push(q) }
+          }
+        }
+      }
+    }
+  }
+  grp
 }
 
 // A hole parameter of a module function, read only as a callee at one key and handed at every
