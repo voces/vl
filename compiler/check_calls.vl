@@ -844,13 +844,15 @@ function checkFromCodePointsCall(n: Call, ix: i32): i32 {
     tErr("fromCodePoints expects 1 argument, got " + i32ToStr(pargs.length), ix)
   } else {
     const p0 = checkNodeHook(pargs[0])
-    const p0t = T.tys[p0]
     let pOk = false
-    if p0t is TyArray {
-      // An empty `[]` literal's element hole (-1) pins to i32 here.
-      if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
+    if p0 >= 0 && p0 < T.tys.length {
+      const p0t = T.tys[p0]
+      if p0t is TyArray {
+        // An empty `[]` literal's element hole (-1) pins to i32 here.
+        if p0t.aElem < 0 || assignable(p0t.aElem, TY_I32) { pOk = true }
+      }
+      if p0t is TyErr { pOk = true }
     }
-    if p0t is TyErr { pOk = true }
     if !pOk { tErr("fromCodePoints expects an i32[], got " + tyToStr(p0), ix) }
   }
   return TY_STR
@@ -926,10 +928,12 @@ function checkArrayCopyCall(n: Call, ix: i32): i32 {
   while acI < 5 {
     const acT = checkNodeHook(acArgs[acI])
     if acI == 0 || acI == 2 {
-      const acTy = T.tys[acT]
       let acOk = false
-      if acTy is TyArray { acOk = true }
-      if acTy is TyErr { acOk = true }
+      if acT >= 0 && acT < T.tys.length {
+        const acTy = T.tys[acT]
+        if acTy is TyArray { acOk = true }
+        if acTy is TyErr { acOk = true }
+      }
       if !acOk { tErr("__array_copy__ expects a T[], got " + tyToStr(acT), ix) }
     } else {
       if !assignable(acT, TY_I32) {
@@ -2518,6 +2522,7 @@ function checkOptCallNode(n: Call, ix: i32, cfn: OptMember): i32 {
 // `checkBuiltinIdentCall`, a function-typed value to `checkCallOnFuncTy`. The type-answering
 // three return `-1` for "no arm claimed it"; an unclaimed callee is reported here as `TY_ERR`.
 export function checkCallNode(n: Call, ix: i32) {
+  if n.callFn < 0 { return TY_ERR }
   const cfn = P.nodes[n.callFn]
   if callHasTyArgs(ix) {
     if !callTyArgsCalleeOk(cfn, ix) { return TY_ERR }
@@ -2558,49 +2563,51 @@ export function checkCallNode(n: Call, ix: i32) {
   ckCalleeIxSet(n.callFn)
   const fnTy = checkNodeHook(n.callFn)
   ckCalleeIxSet(savedCallee)
-  const ft = T.tys[fnTy]
-  if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
-  if ft is TyErr {
-    // A module global called above its declaration, which the hoist could not type: its
-    // arguments are still checked on their own, as a hole callee's are (D3899).
-    if cfn is Ident && globalBeforeDecl(cfn.identName) {
-      for ga in n.callArgs { checkNodeHook(ga) }
+  if fnTy >= 0 && fnTy < T.tys.length {
+    const ft = T.tys[fnTy]
+    if ft is TyFunc { return checkCallOnFuncTy(n, ix, cfn, ft) }
+    if ft is TyErr {
+      // A module global called above its declaration, which the hoist could not type: its
+      // arguments are still checked on their own, as a hole callee's are (D3899).
+      if cfn is Ident && globalBeforeDecl(cfn.identName) {
+        for ga in n.callArgs { checkNodeHook(ga) }
+      }
+      return TY_ERR
     }
-    return TY_ERR
-  }
-  if ft is TyVar {
-    // Calling an inference-hole value — an un-annotated parameter used as a function inside
-    // its own generic body (`function apply(fn, a, b) { fn(a, b) }`): the arguments are
-    // checked on their own and the call yields a fresh hole, resolved once an outer call
-    // binds the generic signature (the emitter compiles each instance concretely).
-    const hargs = n.callArgs
-    let hWho = ""
-    if cfn is Ident { hWho = cfn.identName }
-    let hj = 0
-    while hj < hargs.length {
-      // A lambda handed to the hole types its un-annotated parameters as holes, as one bound
-      // to an un-annotated `const` does; the pin then instances it (D5881).
-      const hln = P.nodes[parenPeelIx(hargs[hj])]
-      if hln is FuncDecl {
-        if hln.fnName == "" && !isValBindLambda(parenPeelIx(hargs[hj])) {
-          noteValBindLambda(parenPeelIx(hargs[hj]))
+    if ft is TyVar {
+      // Calling an inference-hole value — an un-annotated parameter used as a function inside
+      // its own generic body (`function apply(fn, a, b) { fn(a, b) }`): the arguments are
+      // checked on their own and the call yields a fresh hole, resolved once an outer call
+      // binds the generic signature (the emitter compiles each instance concretely).
+      const hargs = n.callArgs
+      let hWho = ""
+      if cfn is Ident { hWho = cfn.identName }
+      let hj = 0
+      while hj < hargs.length {
+        // A lambda handed to the hole types its un-annotated parameters as holes, as one bound
+        // to an un-annotated `const` does; the pin then instances it (D5881).
+        const hln = P.nodes[parenPeelIx(hargs[hj])]
+        if hln is FuncDecl {
+          if hln.fnName == "" && !isValBindLambda(parenPeelIx(hargs[hj])) {
+            noteValBindLambda(parenPeelIx(hargs[hj]))
+          }
         }
+        const hat = checkNodeHook(hargs[hj])
+        // What the pinned function takes here, demanded of the argument at the pin (D3225).
+        const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)
+        if hat >= 0 && hexp >= 0 {
+          noteArgCstr(hat, hexp, hWho, hj + 1, hargs[hj])
+        }
+        hj = hj + 1
       }
-      const hat = checkNodeHook(hargs[hj])
-      // What the pinned function takes here, demanded of the argument at the pin (D3225).
-      const hexp = mkDerivedHole(HD_PARAM, i32ToStr(hj), hj, -1, fnTy)
-      if hat >= 0 && hexp >= 0 {
-        noteArgCstr(hat, hexp, hWho, hj + 1, hargs[hj])
+      if tyIsNonNullHoleRead(fnTy) {
+        noteMemCstr(fnTy, OP_CALL_GUARDED_PIN, ix, false)
+      } else {
+        noteMemCstr(fnTy, OP_CALL_PIN, ix, false)
       }
-      hj = hj + 1
+      // The call rides the derivation, so a generic pinned here is read at its own arguments.
+      return mkDerivedHole(HD_RET, "", -1, ix, fnTy)
     }
-    if tyIsNonNullHoleRead(fnTy) {
-      noteMemCstr(fnTy, OP_CALL_GUARDED_PIN, ix, false)
-    } else {
-      noteMemCstr(fnTy, OP_CALL_PIN, ix, false)
-    }
-    // The call rides the derivation, so a generic pinned here is read at its own arguments.
-    return mkDerivedHole(HD_RET, "", -1, ix, fnTy)
   }
   // `v.d()` over a getter reads `v.d` and calls the result: say which getter it read.
   let calledGetter = getSiteFnOf(n.callFn)

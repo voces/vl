@@ -17,13 +17,16 @@ import {
 import {
   T,
   TyArray,
+  TyErr,
   TyFunc,
   TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
   litUnionAliasNameOfTy,
   primNameStr,
   tyArrayElemIx,
@@ -228,6 +231,7 @@ export function structFieldBoxRetName(er: i32) {
       // annotated form already lowers. Recorded as box-bearing (so the pin fires) when the
       // inner is a prim/literal/object; an unlowerable inner (closure/map/list) declines the
       // whole struct as before, so the lambda takes the proven annotated-form path.
+      if ft.nInner < 0 { return "" }
       const nin = T.tys[ft.nInner]
       if !(nin is TyPrim) && !(nin is TyLit) && !(nin is TyObj) {
         // A nullable struct-element-list field (`{f: {f: string}[] | null}` — the code-28
@@ -529,52 +533,56 @@ export function cloArmValueUnionRetName(er: i32) {
   const t = T.tys[er]
   // A nullable closure-arm value union normalizes to `TyNullable` over the union — the box
   // already carries a null member atom, so render the inner union and append `|null`.
-  if t is TyNullable {
-    const inner = cloArmValueUnionRetName(t.nInner)
-    // The inner union keeps its own top-level `|`s, so `null` adds one atom to the width
-    // the recursion just reported (#1115).
-    if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
-    return ""
-  }
-  if t is TyUnion {
-    const members = t.uMembers
-    if members.length < 2 { return "" }
-    let hasClo = false
-    let name = ""
-    let i = 0
-    while i < members.length {
-      const m = T.tys[members[i]]
-      let mn = ""
-      if m is TyFunc {
-        let ips = ""
-        const pts = m.fnParamTypes
-        let pj = 0
-        while pj < pts.length {
-          const pn = tyToEmitName(pts[pj])
-          if pn == "" { return "" }
-          if pj > 0 { ips = ips + "," }
-          ips = ips + pn
-          pj = pj + 1
-        }
-        let irs = litUnionAliasNameOfTy(m.fnRet)
-        if irs == "" { irs = tyToEmitName(m.fnRet) }
-        if irs == "" { return "" }
-        mn = "((" + ips + ")=>" + irs + ")"
-        hasClo = true
-      } else if m is TyPrim {
-        mn = m.primName
-      } else {
-        return ""
-      }
-      if i > 0 { name = name + "|" }
-      name = name + mn
-      i = i + 1
+  match t {
+    TyNullable => {
+      const inner = cloArmValueUnionRetName(t.nInner)
+      // The inner union keeps its own top-level `|`s, so `null` adds one atom to the width
+      // the recursion just reported (#1115).
+      if inner != "" { return irAtoms(inner + "|null", inferRetNameAtoms + 1) }
+      return ""
     }
-    if !hasClo { return "" }
-    // Every member render is ONE atom — a prim's own name, or a closure PARENTHESIZED
-    // (which puts its separators and its `=>` inside a grouper) — so the join's width is
-    // the member count (#1115).
-    if isValueUnionName(name) { return irAtoms(name, members.length) }
+    TyUnion => {
+      const members = t.uMembers
+      if members.length < 2 { return "" }
+      let hasClo = false
+      let name = ""
+      let i = 0
+      while i < members.length {
+        const m = T.tys[members[i]]
+        let mn = ""
+        if m is TyFunc {
+          let ips = ""
+          const pts = m.fnParamTypes
+          let pj = 0
+          while pj < pts.length {
+            const pn = tyToEmitName(pts[pj])
+            if pn == "" { return "" }
+            if pj > 0 { ips = ips + "," }
+            ips = ips + pn
+            pj = pj + 1
+          }
+          let irs = litUnionAliasNameOfTy(m.fnRet)
+          if irs == "" { irs = tyToEmitName(m.fnRet) }
+          if irs == "" { return "" }
+          mn = "((" + ips + ")=>" + irs + ")"
+          hasClo = true
+        } else if m is TyPrim {
+          mn = m.primName
+        } else {
+          return ""
+        }
+        if i > 0 { name = name + "|" }
+        name = name + mn
+        i = i + 1
+      }
+      if !hasClo { return "" }
+      // Every member render is ONE atom — a prim's own name, or a closure PARENTHESIZED
+      // (which puts its separators and its `=>` inside a grouper) — so the join's width is
+      // the member count (#1115).
+      if isValueUnionName(name) { return irAtoms(name, members.length) }
+    }
+    // no other type is a closure-arm value union
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {}
   }
   ""
 }
@@ -592,18 +600,22 @@ export function nestedLeafListRetName(er: i32) {
     if et is TyArray {
       if et.aElem < 0 { return "" }
       const lt = T.tys[et.aElem]
-      if lt is TyPrim {
-        const pn = lt.primName
-        if pn == "i64" || pn == "f64" || pn == "f32" || pn == "string" {
-          return irRendered(tyToEmitName(er))
+      match lt {
+        TyPrim => {
+          const pn = lt.primName
+          if pn == "i64" || pn == "f64" || pn == "f32" || pn == "string" {
+            return irRendered(tyToEmitName(er))
+          }
+          return ""
         }
-        return ""
-      }
-      if lt is TyArray {
-        // Deeper nesting: the leaf decides — recurse on the inner array.
-        if nestedLeafListRetName(t.aElem) != "" {
-          return irRendered(tyToEmitName(er))
+        TyArray => {
+          // Deeper nesting: the leaf decides — recurse on the inner array.
+          if nestedLeafListRetName(t.aElem) != "" {
+            return irRendered(tyToEmitName(er))
+          }
         }
+        // any other leaf is not a nested scalar list
+        TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyLit | TyNeg => {}
       }
     }
   }

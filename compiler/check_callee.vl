@@ -6,16 +6,47 @@
 // site, which the emitter's dispatch rewrite reads back. The checker fills the operator tables
 // and pushes `weRoots`; `calleeReset` clears every table per program.
 import {
+  ArrayLit,
+  AsExpr,
   BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
   Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
   Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
   Member,
+  NullLit,
+  NumLit,
   OP_INDEX_GET,
   OP_INDEX_SET,
+  ObjLit,
+  OptMember,
   P,
+  Param,
   Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
   elseIfLink,
   i32ToStr,
   isBinOpFuncName,
@@ -135,9 +166,11 @@ function findFnDeclWalk(rootIx: i32, name: string) {
 // argument list.
 export function callArgPlaces(cn: Call, callIx: i32) {
   const out: i32[] = []
-  const cf = P.nodes[cn.callFn]
-  if cf is Member {
-    if callDeclFnIx(cn, callIx) >= 0 { out.push(cf.memObj) }
+  if cn.callFn >= 0 {
+    const cf = P.nodes[cn.callFn]
+    if cf is Member {
+      if callDeclFnIx(cn, callIx) >= 0 { out.push(cf.memObj) }
+    }
   }
   let i = 0
   while i < cn.callArgs.length {
@@ -182,41 +215,46 @@ export function recvTyOf(ix: i32): i32 {
 // a struct field holding one, or an unresolved receiver — so assume it writes anything reachable;
 // `-2` is an intrinsic, which writes no field of an object handed to it.
 export function callDeclFnIx(cn: Call, callIx: i32) {
+  if cn.callFn < 0 { return -1 }
   const cf = P.nodes[cn.callFn]
-  if cf is Ident {
-    const d = lookupFnDeclNode(cf.identName)
-    if d >= 0 { return d }
-    const nd = findFnDeclInRoots(cf.identName)
-    if nd >= 0 { return nd }
-    if lookup(cf.identName) >= 0 {
-      // A binding bound once to a lambda, never re-pointed, calls that lambda's body; the write
-      // shapes see a write through an alias of a captured object (D2461). Anything else stays
-      // opaque.
-      const lfr = covarRootFrame(cn.callFn)
-      if cwFramedNode(cn.callFn) && lfr != CW_FR_UNKNOWN {
-        const ld = cwLambdaDeclOf(cf.identName, lfr)
-        if ld >= 0 { return ld }
+  match cf {
+    Ident => {
+      const d = lookupFnDeclNode(cf.identName)
+      if d >= 0 { return d }
+      const nd = findFnDeclInRoots(cf.identName)
+      if nd >= 0 { return nd }
+      if lookup(cf.identName) >= 0 {
+        // A binding bound once to a lambda, never re-pointed, calls that lambda's body; the write
+        // shapes see a write through an alias of a captured object (D2461). Anything else stays
+        // opaque.
+        const lfr = covarRootFrame(cn.callFn)
+        if cwFramedNode(cn.callFn) && lfr != CW_FR_UNKNOWN {
+          const ld = cwLambdaDeclOf(cf.identName, lfr)
+          if ld >= 0 { return ld }
+        }
+        return -1 // a function VALUE: target unknown
       }
-      return -1 // a function VALUE: target unknown
+      return -2 // an intrinsic named by a bare identifier
     }
-    return -2 // an intrinsic named by a bare identifier
-  }
-  if cf is Member {
-    // A built-in of the receiver's type runs whatever `self`-function shares its name.
-    if builtinMethodOn(recvTyOf(cf.memObj), cf.memProp) { return -2 }
-    const d = lookupFnDeclNode(cf.memProp)
-    if d >= 0 { return d }
-    // A `self`-function merged from another module, by the name this site resolved to.
-    if callIx >= 0 {
-      const al = ufcsAliasAtSite(callIx, cf.memProp)
-      if al != cf.memProp {
-        const ad = lookupFnDeclNode(al)
-        if ad >= 0 { return ad }
+    Member => {
+      // A built-in of the receiver's type runs whatever `self`-function shares its name.
+      if builtinMethodOn(recvTyOf(cf.memObj), cf.memProp) { return -2 }
+      const d = lookupFnDeclNode(cf.memProp)
+      if d >= 0 { return d }
+      // A `self`-function merged from another module, by the name this site resolved to.
+      if callIx >= 0 {
+        const al = ufcsAliasAtSite(callIx, cf.memProp)
+        if al != cf.memProp {
+          const ad = lookupFnDeclNode(al)
+          if ad >= 0 { return ad }
+        }
       }
+      const nd = findFnDeclInRoots(cf.memProp)
+      if nd >= 0 { return nd }
+      return memberCalleeKind(cf)
     }
-    const nd = findFnDeclInRoots(cf.memProp)
-    if nd >= 0 { return nd }
-    return memberCalleeKind(cf)
+    // any other callee is a value: target unknown
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   -1
 }
@@ -497,9 +535,18 @@ export function calleeReset() {
 export function calleeNameOf(callIx: i32) {
   const cn = P.nodes[callIx]
   if cn is Call {
+    if cn.callFn < 0 { return "?" }
     const cf = P.nodes[cn.callFn]
-    if cf is Ident { return cf.identName }
-    if cf is Member { return cf.memProp }
+    match cf {
+      Ident => {
+        return cf.identName
+      }
+      Member => {
+        return cf.memProp
+      }
+      // a parenthesised or computed callee has no written name
+      NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    }
   }
   "?"
 }

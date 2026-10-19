@@ -6,18 +6,39 @@ import { cexPastF64, cexRootShape, lbiNameKey } from "./check_num_lits"
 import { declare, isModuleScopeConst, lookupDepth } from "./check_scopes"
 import { cexOk } from "./const_exact"
 import {
+  ArrayLit,
+  AsExpr,
   BinExpr,
+  Block,
   BoolLit,
+  BreakStmt,
   Call,
   CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
+  ObjLit,
+  OptMember,
   P,
   Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
   StrLit,
   TS_ARR,
   TS_ISECT,
@@ -25,7 +46,11 @@ import {
   TS_NAME,
   TS_OBJ,
   TS_UNION,
+  TypeDecl,
+  TypeRef,
   Unary,
+  UnionDecl,
+  WhileStmt,
   annTsOf,
   markDefaultGlobalRef,
   nodeChildren,
@@ -52,12 +77,16 @@ import {
   TY_V128,
   TY_VOID,
   TyArray,
+  TyErr,
   TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
   TyPrim,
   TyUnion,
+  TyVar,
   cUserTypes,
   mkFuncTy,
   nomNameOfTy,
@@ -415,6 +444,9 @@ export function primTyIxOfName(name: string): i32 {
   if name == "null" { return TY_NULL }
   // The SIMD substrate, spelled so `std:simd` can brand it (`type F32x4 = new v128`).
   if name == "v128" { return TY_V128 }
+  // `never` and the storage type `u8` are not spellings a declaration seeds.
+  if name == "never" { return -1 }
+  if name == "u8" { return -1 }
   -1
 }
 
@@ -456,11 +488,13 @@ export function tsMapKeyNodeOf(root: i32) {
 export function callKillSure(callIx: i32, key: string): boolean {
   const cn = P.nodes[callIx]
   if !(cn is Call) { return false }
-  const rmRecv = P.nodes[cn.callFn]
-  if rmRecv is Member {
-    if cellRemovingMethod(rmRecv.memProp) {
-      const rmRoot = placeKeyOf(rmRecv.memObj)
-      if rmRoot != "" && keyHasPrefix(key, rmRoot + "[") { return true }
+  if cn.callFn >= 0 {
+    const rmRecv = P.nodes[cn.callFn]
+    if rmRecv is Member {
+      if cellRemovingMethod(rmRecv.memProp) {
+        const rmRoot = placeKeyOf(rmRecv.memObj)
+        if rmRoot != "" && keyHasPrefix(key, rmRoot + "[") { return true }
+      }
     }
   }
   const declIx = callDeclFnIx(cn, callIx)
@@ -562,28 +596,42 @@ function wrFnClosed(fx: i32): boolean {
 export function paramDefaultIsLiteral(dIx: i32) {
   if dIx < 0 { return false }
   const d = P.nodes[dIx]
-  if d is NumLit { return true }
-  if d is StrLit { return true }
-  if d is CharLit { return true }
-  if d is BoolLit { return true }
-  if d is NullLit { return true }
-  if d is Unary {
-    // A SIGNED numeric literal (`-1`): the sign is a `Unary` over the literal,
-    // and it is still name-free.
-    if d.unOp == "-" || d.unOp == "+" {
-      // Bound-tested: `unArg` is a node index, and an unbounded `P.nodes[…]` read on one is a
-      // compiler trap rather than a diagnostic (D1440's shape).
-      if d.unArg >= 0 && d.unArg < P.nodes.length {
-        const inner = P.nodes[d.unArg]
-        if inner is NumLit { return true }
-      }
-    }
-  }
-  if d is Ident {
-    if isModuleScopeConst(d.identName) {
-      markDefaultGlobalRef(dIx)
+  match d {
+    NumLit => {
       return true
     }
+    StrLit => {
+      return true
+    }
+    CharLit => {
+      return true
+    }
+    BoolLit => {
+      return true
+    }
+    NullLit => {
+      return true
+    }
+    Unary => {
+      // A SIGNED numeric literal (`-1`): the sign is a `Unary` over the literal,
+      // and it is still name-free.
+      if d.unOp == "-" || d.unOp == "+" {
+        // Bound-tested: `unArg` is a node index, and an unbounded `P.nodes[…]` read on one is a
+        // compiler trap rather than a diagnostic (D1440's shape).
+        if d.unArg >= 0 && d.unArg < P.nodes.length {
+          const inner = P.nodes[d.unArg]
+          if inner is NumLit { return true }
+        }
+      }
+    }
+    Ident => {
+      if isModuleScopeConst(d.identName) {
+        markDefaultGlobalRef(dIx)
+        return true
+      }
+    }
+    // any other default needs evaluating inside the callee
+    BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   false
 }
@@ -672,42 +720,50 @@ export function localNomEscapeAt(tyIx: i32, depth: i32): string {
     if nwBodyScopedNames.has(nwn) { return demangleName(nwn) }
   }
   const t = T.tys[tyIx]
-  if t is TyArray { return localNomEscapeAt(t.aElem, depth + 1) }
-  if t is TyNullable { return localNomEscapeAt(t.nInner, depth + 1) }
-  if t is TyMap {
-    const k = localNomEscapeAt(t.mKey, depth + 1)
-    if k != "" { return k }
-    return localNomEscapeAt(t.mVal, depth + 1)
-  }
-  if t is TyObj {
-    const ofts = t.objFieldTypes
-    let i = 0
-    while i < ofts.length {
-      const f = localNomEscapeAt(ofts[i], depth + 1)
-      if f != "" { return f }
-      i = i + 1
+  match t {
+    TyArray => {
+      return localNomEscapeAt(t.aElem, depth + 1)
     }
-    return ""
-  }
-  if t is TyUnion {
-    const ums = t.uMembers
-    let u = 0
-    while u < ums.length {
-      const m = localNomEscapeAt(ums[u], depth + 1)
-      if m != "" { return m }
-      u = u + 1
+    TyNullable => {
+      return localNomEscapeAt(t.nInner, depth + 1)
     }
-    return ""
-  }
-  if t is TyFunc {
-    const ps = t.fnParamTypes
-    let p = 0
-    while p < ps.length {
-      const a = localNomEscapeAt(ps[p], depth + 1)
-      if a != "" { return a }
-      p = p + 1
+    TyMap => {
+      const k = localNomEscapeAt(t.mKey, depth + 1)
+      if k != "" { return k }
+      return localNomEscapeAt(t.mVal, depth + 1)
     }
-    return localNomEscapeAt(t.fnRet, depth + 1)
+    TyObj => {
+      const ofts = t.objFieldTypes
+      let i = 0
+      while i < ofts.length {
+        const f = localNomEscapeAt(ofts[i], depth + 1)
+        if f != "" { return f }
+        i = i + 1
+      }
+      return ""
+    }
+    TyUnion => {
+      const ums = t.uMembers
+      let u = 0
+      while u < ums.length {
+        const m = localNomEscapeAt(ums[u], depth + 1)
+        if m != "" { return m }
+        u = u + 1
+      }
+      return ""
+    }
+    TyFunc => {
+      const ps = t.fnParamTypes
+      let p = 0
+      while p < ps.length {
+        const a = localNomEscapeAt(ps[p], depth + 1)
+        if a != "" { return a }
+        p = p + 1
+      }
+      return localNomEscapeAt(t.fnRet, depth + 1)
+    }
+    // a leaf type names no nominal
+    TyPrim | TyErr | TyVar | TyLit | TyNeg => {}
   }
   ""
 }
