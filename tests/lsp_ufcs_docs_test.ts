@@ -1,7 +1,7 @@
 // D9.11, UFCS half (ROADMAP row 32) — the `///` block of a free `self`-function reaches
 // the method-completion panel, through the same `docMarkdown` layout hover uses.
 //
-// `symUfcsScanAt` already banked the declaration token per candidate (`ufcTok`), so the doc
+// `symUfcsScanAt` already banked the declaration token per candidate (`ufc.tok`), so the doc
 // is `docForDeclTok` over it — the one home the hover and scope queries also go through, so
 // a second surface cannot answer a different question about the same declaration.
 //
