@@ -1,0 +1,1064 @@
+// Per-module artifact census: every program-global index a wasm module's code bodies and
+// global initialisers carry, by index space, from decoding the bytes.
+//
+//     vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...]
+//     vl run scripts/s5-relocs.vl -- consts A.wasm B.wasm
+//
+// `census` prints one row per space (sites, LEB widths) and per opcode. `consts` aligns two
+// builds of one program instruction by instruction and counts the `i32.const` immediates
+// that differ, which is how a perturbed compiler shows where an index travels as a value
+// (union tags). A discovery instrument: docs/internals/s5-per-module-artifacts.md.
+
+import { IoError, listDir, pathExists, pathKind, readFile } from "std:fs"
+import { Utf8Error, programArgs } from "std:args"
+import { endsWith, padStart } from "std:str"
+import { sort } from "std:array"
+import { die } from "./lib/common"
+
+const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED]"
+
+const SP_FUNC = 0
+const SP_TYPE = 1
+const SP_FIELD = 2
+const SP_GLOBAL = 3
+const SP_TABLE = 4
+const SP_DATA = 5
+const SP_ELEM = 6
+const SP_TAG = 7
+const SP_MEM = 8
+const SP_CONST = 9
+const SPACE_NAMES = [
+  "function", "type", "field", "global", "table", "data", "elem", "tag",
+  "memory", "i32.const",
+]
+
+// One row per index immediate decoded: its space, module offset, LEB width, value, the
+// opcode carrying it, the body it sits in (-1 for a global initialiser), and the body's
+// running instruction ordinal (for aligning two builds).
+const rSpace: i32[] = []
+const rOff: i32[] = []
+const rWidth: i32[] = []
+const rVal: i32[] = []
+const rOp: i32[] = []
+const rFn: i32[] = []
+const rIns: i32[] = []
+// One row per decoded instruction: its opcode and body, so two builds can be aligned.
+const iOp: i32[] = []
+const iFn: i32[] = []
+const rSub: i32[] = []
+// Whether the row's LEB is signed (a heap or block type, a constant), for re-encoding it.
+const rSigned: boolean[] = []
+let recSigned = false
+let funcImports = 0
+let globImports = 0
+let poolEnd = 0
+let curFn = -1
+let curIns = 0
+let curOp = 0
+let failedAt = -1
+
+function bytesOf(path: string): u8[] {
+  const b = readFile(path)
+  if b is IoError {
+    die("s5-relocs: cannot read \{path} (\{b.msg})", 2)
+    return []
+  }
+  b
+}
+
+type Cur = { b: u8[], pos: i32, end: i32 }
+
+function fail(c: Cur): i32 {
+  if failedAt < 0 { failedAt = c.pos }
+  c.pos = c.end
+  0
+}
+
+function byte(c: Cur): i32 {
+  if c.pos >= c.end { return fail(c) }
+  const v: i32 = c.b[c.pos]
+  c.pos = c.pos + 1
+  v
+}
+
+// An unsigned LEB of at most 32 bits.
+function u32(c: Cur): i32 {
+  let result = 0
+  let shift = 0
+  while c.pos < c.end {
+    const v = byte(c)
+    if shift < 32 { result = result | ((v & 0x7f) << shift) }
+    if (v & 0x80) == 0 { return result }
+    shift = shift + 7
+    if shift > 63 { return fail(c) }
+  }
+  fail(c)
+}
+
+// A signed LEB read as an i32 (s33 block types and heap types fit for every index here).
+function s32(c: Cur): i32 {
+  let result = 0
+  let shift = 0
+  while c.pos < c.end {
+    const v = byte(c)
+    if shift < 32 { result = result | ((v & 0x7f) << shift) }
+    shift = shift + 7
+    if (v & 0x80) == 0 {
+      if shift < 32 && (v & 0x40) != 0 { result = result | (-1 << shift) }
+      return result
+    }
+    if shift > 63 { return fail(c) }
+  }
+  fail(c)
+}
+
+// What a function or global index names: 1 an import, 2 a string-pool global, else 0.
+function subOf(space: i32, val: i32): i32 {
+  if space == SP_FUNC && val < funcImports { return 1 }
+  if space == SP_GLOBAL && val < globImports { return 1 }
+  if space == SP_GLOBAL && val < poolEnd { return 2 }
+  0
+}
+
+function rec(space: i32, off: i32, width: i32, val: i32): i32 {
+  rSigned.push(recSigned)
+  rSub.push(subOf(space, val))
+  rSpace.push(space)
+  rOff.push(off)
+  rWidth.push(width)
+  rVal.push(val)
+  rOp.push(curOp)
+  rFn.push(curFn)
+  rIns.push(curIns)
+  0
+}
+
+function signedRec(space: i32, off: i32, width: i32, val: i32): i32 {
+  recSigned = true
+  rec(space, off, width, val)
+  recSigned = false
+  0
+}
+
+// An unsigned index immediate in `space`.
+function idx(c: Cur, space: i32): i32 {
+  const at = c.pos
+  const v = u32(c)
+  rec(space, at, c.pos - at, v)
+  v
+}
+
+// A heap type: abstract shorthands carry nothing; a concrete one is a type index.
+function heap(c: Cur): i32 {
+  if c.pos < c.end && c.b[c.pos] == 0x62 { c.pos = c.pos + 1 }
+  const at = c.pos
+  const v = s32(c)
+  if v >= 0 { signedRec(SP_TYPE, at, c.pos - at, v) }
+  0
+}
+
+function valtype(c: Cur): i32 {
+  const b = byte(c)
+  if b == 0x63 || b == 0x64 { return heap(c) }
+  if b < 0x68 || b > 0x7f { return fail(c) }
+  0
+}
+
+function blocktype(c: Cur): i32 {
+  if c.pos >= c.end { return fail(c) }
+  const b: i32 = c.b[c.pos]
+  if b == 0x63 || b == 0x64 {
+    c.pos = c.pos + 1
+    return heap(c)
+  }
+  if b == 0x40 || b >= 0x68 && b <= 0x7f {
+    c.pos = c.pos + 1
+    return 0
+  }
+  const at = c.pos
+  const v = s32(c)
+  if v >= 0 { signedRec(SP_TYPE, at, c.pos - at, v) }
+  0
+}
+
+function memarg(c: Cur): i32 {
+  const flags = u32(c)
+  if (flags & 0x40) != 0 { idx(c, SP_MEM) }
+  u32(c)
+}
+
+function skipLeb(c: Cur): i32 {
+  while c.pos < c.end {
+    if (byte(c) & 0x80) == 0 { return 0 }
+  }
+  fail(c)
+}
+
+function opGc(c: Cur): i32 {
+  const sub = u32(c)
+  curOp = (0xfb << 16) | sub
+  if sub <= 1 || sub == 6 || sub == 7 || sub >= 11 && sub <= 14 || sub == 16 {
+    return idx(c, SP_TYPE)
+  }
+  if sub >= 2 && sub <= 5 {
+    idx(c, SP_TYPE)
+    return idx(c, SP_FIELD)
+  }
+  if sub == 8 {
+    idx(c, SP_TYPE)
+    return u32(c)
+  }
+  if sub == 9 || sub == 18 {
+    idx(c, SP_TYPE)
+    return idx(c, SP_DATA)
+  }
+  if sub == 10 || sub == 19 {
+    idx(c, SP_TYPE)
+    return idx(c, SP_ELEM)
+  }
+  if sub == 17 {
+    idx(c, SP_TYPE)
+    return idx(c, SP_TYPE)
+  }
+  if sub == 15 || sub >= 26 && sub <= 30 { return 0 }
+  if sub >= 20 && sub <= 23 { return heap(c) }
+  if sub == 24 || sub == 25 {
+    byte(c)
+    u32(c)
+    heap(c)
+    return heap(c)
+  }
+  fail(c)
+}
+
+function opMisc(c: Cur): i32 {
+  const sub = u32(c)
+  curOp = (0xfc << 16) | sub
+  if sub <= 7 { return 0 }
+  if sub == 8 {
+    idx(c, SP_DATA)
+    return idx(c, SP_MEM)
+  }
+  if sub == 9 { return idx(c, SP_DATA) }
+  if sub == 10 {
+    idx(c, SP_MEM)
+    return idx(c, SP_MEM)
+  }
+  if sub == 11 { return idx(c, SP_MEM) }
+  if sub == 12 {
+    idx(c, SP_ELEM)
+    return idx(c, SP_TABLE)
+  }
+  if sub == 13 { return idx(c, SP_ELEM) }
+  if sub == 14 {
+    idx(c, SP_TABLE)
+    return idx(c, SP_TABLE)
+  }
+  if sub >= 15 && sub <= 17 { return idx(c, SP_TABLE) }
+  fail(c)
+}
+
+function opSimd(c: Cur): i32 {
+  const sub = u32(c)
+  curOp = (0xfd << 16) | sub
+  if sub <= 11 || sub == 92 || sub == 93 { return memarg(c) }
+  if sub == 12 || sub == 13 {
+    c.pos = c.pos + 16
+    return 0
+  }
+  if sub >= 21 && sub <= 34 { return byte(c) }
+  if sub >= 84 && sub <= 91 {
+    memarg(c)
+    return byte(c)
+  }
+  0
+}
+
+function opAtomic(c: Cur): i32 {
+  const sub = u32(c)
+  curOp = (0xfe << 16) | sub
+  if sub == 3 { return byte(c) }
+  memarg(c)
+}
+
+// Decodes one instruction, recording its index immediates. Returns the opcode byte.
+function op(c: Cur): i32 {
+  const o = byte(c)
+  curOp = o
+  iOp.push(o)
+  iFn.push(curFn)
+  if o == 0x10 || o == 0x12 || o == 0xd2 {
+    idx(c, SP_FUNC)
+  } else if o == 0x11 || o == 0x13 {
+    idx(c, SP_TYPE)
+    idx(c, SP_TABLE)
+  } else if o == 0x14 || o == 0x15 {
+    idx(c, SP_TYPE)
+  } else if o == 0x23 || o == 0x24 {
+    idx(c, SP_GLOBAL)
+  } else if o == 0x25 || o == 0x26 {
+    idx(c, SP_TABLE)
+  } else if o >= 0x20 && o <= 0x22 {
+    u32(c)
+  } else if o >= 0x02 && o <= 0x04 || o == 0x06 {
+    blocktype(c)
+  } else if o == 0x07 || o == 0x08 {
+    idx(c, SP_TAG)
+  } else if (
+    o == 0x09
+    || o == 0x0c
+    || o == 0x0d
+    || o == 0x18
+    || o == 0xd5
+    || o == 0xd6
+  ) {
+    u32(c)
+  } else if o == 0x0e {
+    const n = u32(c)
+    let i = 0
+    while i <= n && c.pos < c.end {
+      u32(c)
+      i = i + 1
+    }
+  } else if o == 0x1c {
+    const n = u32(c)
+    let i = 0
+    while i < n && c.pos < c.end {
+      valtype(c)
+      i = i + 1
+    }
+  } else if o == 0x1f {
+    blocktype(c)
+    const n = u32(c)
+    let i = 0
+    while i < n && c.pos < c.end {
+      const kind = byte(c)
+      if kind <= 1 { idx(c, SP_TAG) }
+      u32(c)
+      i = i + 1
+    }
+  } else if o >= 0x28 && o <= 0x3e {
+    memarg(c)
+  } else if o == 0x3f || o == 0x40 {
+    idx(c, SP_MEM)
+  } else if o == 0x41 {
+    const at = c.pos
+    const v = s32(c)
+    signedRec(SP_CONST, at, c.pos - at, v)
+  } else if o == 0x42 {
+    skipLeb(c)
+  } else if o == 0x43 {
+    c.pos = c.pos + 4
+  } else if o == 0x44 {
+    c.pos = c.pos + 8
+  } else if o == 0xd0 {
+    heap(c)
+  } else if o == 0xfb {
+    opGc(c)
+  } else if o == 0xfc {
+    opMisc(c)
+  } else if o == 0xfd {
+    opSimd(c)
+  } else if o == 0xfe {
+    opAtomic(c)
+  } else if (
+    !(o <= 0x01
+      || o == 0x05
+      || o == 0x0a
+      || o == 0x0b
+      || o == 0x0f
+      || o == 0x19
+      || o == 0x1a
+      || o == 0x1b
+      || o >= 0x45 && o <= 0xc4
+      || o == 0xd1
+      || o == 0xd3
+      || o == 0xd4)
+  ) {
+    fail(c)
+  }
+  curIns = curIns + 1
+  o
+}
+
+// Decodes instructions until the `end` that closes the expression started at depth 0.
+function expr(c: Cur): i32 {
+  let depth = 0
+  while c.pos < c.end {
+    const o = op(c)
+    if o >= 0x02 && o <= 0x04 || o == 0x06 || o == 0x1f { depth = depth + 1 }
+    if o == 0x0b {
+      if depth == 0 { return 0 }
+      depth = depth - 1
+    }
+  }
+  0
+}
+
+function codeSection(c: Cur): i32 {
+  const n = u32(c)
+  let f = 0
+  while f < n && c.pos < c.end {
+    const size = u32(c)
+    const bodyEnd = c.pos + size
+    curFn = f
+    curIns = 0
+    curOp = -1
+    const groups = u32(c)
+    let g = 0
+    while g < groups && c.pos < bodyEnd {
+      u32(c)
+      valtype(c)
+      g = g + 1
+    }
+    const bc: Cur = { b: c.b, pos: c.pos, end: bodyEnd }
+    while bc.pos < bc.end { op(bc) }
+    c.pos = bodyEnd
+    f = f + 1
+  }
+  0
+}
+
+// The defined globals open with the string-literal pool: a run of immutable non-null refs
+// each built by `array.new_fixed` then `struct.new` from constants. Its end is `poolEnd`.
+function globalSection(c: Cur): i32 {
+  const n = u32(c)
+  let g = 0
+  let inPool = true
+  while g < n && c.pos < c.end {
+    curFn = -1
+    curOp = -2
+    const vt: i32 = c.b[c.pos]
+    valtype(c)
+    const mut = byte(c)
+    const from = iOp.length
+    expr(c)
+    let gcOps = 0
+    let other = false
+    let k = from
+    while k < iOp.length {
+      if iOp[k] == 0xfb { gcOps = gcOps + 1 }
+      else if iOp[k] != 0x41 && iOp[k] != 0x0b { other = true }
+      k = k + 1
+    }
+    if inPool && vt == 0x64 && mut == 0 && gcOps == 2 && !other {
+      poolEnd = globImports + g + 1
+    } else {
+      inPool = false
+    }
+    g = g + 1
+  }
+  0
+}
+
+function skipLimits(c: Cur): i32 {
+  const flags = byte(c)
+  u32(c)
+  if (flags & 1) != 0 { u32(c) }
+  0
+}
+
+function importSection(c: Cur): i32 {
+  const n = u32(c)
+  let i = 0
+  while i < n && c.pos < c.end {
+    const modLen = u32(c)
+    c.pos = c.pos + modLen
+    const fieldLen = u32(c)
+    c.pos = c.pos + fieldLen
+    const kind = byte(c)
+    if kind == 0 {
+      u32(c)
+      funcImports = funcImports + 1
+    } else if kind == 1 {
+      valtype(c)
+      skipLimits(c)
+    } else if kind == 2 {
+      skipLimits(c)
+    } else if kind == 3 {
+      valtype(c)
+      byte(c)
+      globImports = globImports + 1
+    } else if kind == 4 {
+      byte(c)
+      u32(c)
+    } else {
+      fail(c)
+    }
+    i = i + 1
+  }
+  0
+}
+
+function decodeModule(b: u8[]): i32 {
+  funcImports = 0
+  globImports = 0
+  poolEnd = 0
+  curIns = 0
+  const c: Cur = { b: b, pos: 8, end: b.length }
+  while c.pos < c.end {
+    const id = byte(c)
+    const size = u32(c)
+    const secEnd = c.pos + size
+    const sc: Cur = { b: b, pos: c.pos, end: secEnd }
+    if id == 2 { importSection(sc) }
+    if id == 10 { codeSection(sc) }
+    if id == 6 { globalSection(sc) }
+    c.pos = secEnd
+  }
+  0
+}
+
+function resetRows() {
+  rSpace.clear()
+  rSub.clear()
+  rSigned.clear()
+  rOff.clear()
+  rWidth.clear()
+  rVal.clear()
+  rOp.clear()
+  rFn.clear()
+  rIns.clear()
+  iOp.clear()
+  iFn.clear()
+  failedAt = -1
+}
+
+function opName(o: i32): string {
+  if o == -2 { return "(global type)" }
+  if o == -1 { return "(locals)" }
+  if o > 0xffff {
+    const pre = o >> 16
+    const sub = o & 0xffff
+    return "0x\{hex(pre)} \{sub}"
+  }
+  "0x\{hex(o)}"
+}
+
+function hex(v: i32): string {
+  const d = "0123456789abcdef"
+  let s = ""
+  let x = v
+  if x == 0 { return "00" }
+  while x > 0 {
+    s = d.slice(x & 15, (x & 15) + 1) + s
+    x = x >> 4
+  }
+  if s.length == 1 { s = "0" + s }
+  s
+}
+
+function census(paths: string[]): i32 {
+  resetRows()
+  let p = 0
+  while p < paths.length {
+    failedAt = -1
+    decodeModule(bytesOf(paths[p]))
+    if failedAt >= 0 {
+      print("s5-relocs: \{paths[p]}: decode failed at offset \{failedAt}")
+    }
+    p = p + 1
+  }
+  print("== \{paths.length} modules, \{iOp.length} instructions")
+  print(
+    "space       body sites  init sites  w1      w2      w3      w4      w5",
+  )
+  let s = 0
+  while s < SP_CONST {
+    let body = 0
+    let init = 0
+    const w = [0, 0, 0, 0, 0, 0]
+    let i = 0
+    while i < rSpace.length {
+      if rSpace[i] == s {
+        if rFn[i] >= 0 { body = body + 1 } else { init = init + 1 }
+        if rWidth[i] <= 5 { w[rWidth[i]] = w[rWidth[i]] + 1 }
+      }
+      i = i + 1
+    }
+    if body + init > 0 {
+      print(
+        padEnd(SPACE_NAMES[s], 12)
+          + padStart("\{body}", 10, " ")
+          + padStart("\{init}", 12, " ")
+          + "  "
+          + padEnd("\{w[1]}", 8)
+          + padEnd("\{w[2]}", 8)
+          + padEnd("\{w[3]}", 8)
+          + padEnd("\{w[4]}", 8)
+          + "\{w[5]}",
+      )
+    }
+    s = s + 1
+  }
+  const subs = [0, 0, 0, 0, 0, 0]
+  let si = 0
+  while si < rSpace.length {
+    if rSpace[si] == SP_FUNC { subs[rSub[si]] = subs[rSub[si]] + 1 }
+    if rSpace[si] == SP_GLOBAL { subs[3 + rSub[si]] = subs[3 + rSub[si]] + 1 }
+    si = si + 1
+  }
+  print(
+    "function sites: \{subs[1]} name an import, \{subs[0]} a defined function",
+  )
+  print(
+    "global sites: \{subs[4]} name an import, \{subs[5]} a string-pool global, \{subs[3]} another",
+  )
+  // Per (space, opcode).
+  const keys: string[] = []
+  const counts: { [string]: i32 } = Map()
+  let i = 0
+  while i < rSpace.length {
+    if rSpace[i] < SP_CONST {
+      let where = "body "
+      if rFn[i] < 0 { where = "init " }
+      const k = where + padEnd(SPACE_NAMES[rSpace[i]], 10) + opName(rOp[i])
+      if !counts.has(k) {
+        keys.push(k)
+        counts[k] = 0
+      }
+      counts[k] = (counts[k] ?? 0) + 1
+    }
+    i = i + 1
+  }
+  sort(keys, (x: string, y: string): boolean => x < y)
+  let k = 0
+  while k < keys.length {
+    print(
+      "  " + padEnd(keys[k], 28) + padStart("\{counts[keys[k]] ?? 0}", 9, " "),
+    )
+    k = k + 1
+  }
+  0
+}
+
+function padEnd(s: string, n: i32): string {
+  let r = s
+  while r.length < n { r = r + " " }
+  r
+}
+
+// Running totals of `consts` over every pair it is given.
+let cTotal = 0
+let cDiff = 0
+let cMisaligned = 0
+let cBodies = 0
+const cDeltas: { [string]: i32 } = Map()
+const cKeys: string[] = []
+
+// Aligns two builds of one program instruction by instruction and adds the `i32.const`
+// immediates that differ, keyed by their difference, to the running totals.
+function constsPair(a: string, b: string): i32 {
+  resetRows()
+  decodeModule(bytesOf(a))
+  const aOps = iOp.slice(0, iOp.length)
+  const aFn = iFn.slice(0, iFn.length)
+  const aSp = rSpace.slice(0, rSpace.length)
+  const aVal = rVal.slice(0, rVal.length)
+  const aRFn = rFn.slice(0, rFn.length)
+  const aIns = rIns.slice(0, rIns.length)
+  resetRows()
+  decodeModule(bytesOf(b))
+  if aOps.length != iOp.length {
+    print(
+      "consts: \{a}: instruction counts differ (\{aOps.length} vs \{iOp.length})",
+    )
+  }
+  let j = 0
+  while j < aOps.length && j < iOp.length {
+    if aOps[j] != iOp[j] || aFn[j] != iFn[j] { cMisaligned = cMisaligned + 1 }
+    j = j + 1
+  }
+  const fnsHit: { [string]: boolean } = Map()
+  let i = 0
+  while i < aSp.length && i < rSpace.length {
+    if aSp[i] == SP_CONST && rSpace[i] == SP_CONST {
+      cTotal = cTotal + 1
+      if aVal[i] != rVal[i] {
+        cDiff = cDiff + 1
+        let where = "body"
+        if aRFn[i] < 0 { where = "init" }
+        const d = "\{where} \{rVal[i] - aVal[i]}"
+        if !cDeltas.has(d) {
+          cKeys.push(d)
+          cDeltas[d] = 0
+        }
+        cDeltas[d] = (cDeltas[d] ?? 0) + 1
+        fnsHit["\{aRFn[i]}"] = true
+      }
+    } else if aSp[i] != rSpace[i] || aIns[i] != rIns[i] {
+      print("consts: \{a}: index rows stop aligning at row \{i}")
+      i = aSp.length
+    }
+    i = i + 1
+  }
+  cBodies = cBodies + fnsHit.length
+  0
+}
+
+// `consts A B`: two files, or two directories whose same-named `.wasm` files pair up.
+function consts(a: string, b: string): i32 {
+  const ka = pathKind(a)
+  if ka is IoError { return die2("consts: cannot read \{a}") }
+  if ka == "dir" {
+    const names = listDir(a)
+    if names is IoError { return die2("consts: cannot list \{a}") }
+    sort(names, (x: string, y: string): boolean => x < y)
+    let n = 0
+    let i = 0
+    while i < names.length {
+      if endsWith(names[i], ".wasm") && pathExists(b + "/" + names[i]) == true {
+        constsPair(a + "/" + names[i], b + "/" + names[i])
+        n = n + 1
+      }
+      i = i + 1
+    }
+    print("\{n} pairs")
+  } else {
+    constsPair(a, b)
+  }
+  print("instructions misaligned: \{cMisaligned}")
+  print("i32.const: \{cTotal} compared, \{cDiff} differ, in \{cBodies} bodies")
+  sort(cKeys, (x: string, y: string): boolean => x < y)
+  let k = 0
+  while k < cKeys.length && k < 40 {
+    print("  \{cKeys[k]}: \{cDeltas[cKeys[k]] ?? 0}")
+    k = k + 1
+  }
+  0
+}
+
+// ── proof: an armed build's `vl.reloc` rows against its own bytes and a perturbed build ──
+
+const RS_NAMES = ["", "union tag", "literal atom", "closure slot", "init guard"]
+// The rows of the module's `vl.reloc` section: module offset, space, value.
+const xOff: i32[] = []
+const xSp: i32[] = []
+const xVal: i32[] = []
+
+// Reads the `vl.reloc` custom section of `b` into the `x*` rows; false when it has none.
+function readRelocs(b: u8[]): boolean {
+  xOff.clear()
+  xSp.clear()
+  xVal.clear()
+  const c: Cur = { b: b, pos: 8, end: b.length }
+  while c.pos < c.end {
+    const id = byte(c)
+    const size = u32(c)
+    const secEnd = c.pos + size
+    if id == 0 {
+      const sc: Cur = { b: b, pos: c.pos, end: secEnd }
+      const nlen = u32(sc)
+      const want = [118, 108, 46, 114, 101, 108, 111, 99]
+      let named = nlen == want.length
+      let i = 0
+      while named && i < nlen {
+        if b[sc.pos + i] != want[i] { named = false }
+        i = i + 1
+      }
+      sc.pos = sc.pos + nlen
+      if named {
+        const n = u32(sc)
+        let k = 0
+        while k < n && sc.pos < sc.end {
+          xOff.push(u32(sc))
+          xSp.push(byte(sc))
+          xVal.push(s32(sc))
+          k = k + 1
+        }
+        return true
+      }
+    }
+    c.pos = secEnd
+  }
+  false
+}
+
+function putLeb(out: u8[], v: i32, signed: boolean) {
+  let x = v
+  let more = true
+  while more {
+    const byte = x & 0x7f
+    if signed { x = x >> 7 } else { x = x >>> 7 }
+    const done = if signed { x == 0 && (byte & 0x40) == 0 || x == -1 && (byte & 0x40) != 0 } else { x == 0 }
+    if done {
+      out.push(byte)
+      more = false
+    } else {
+      out.push(byte | 0x80)
+    }
+  }
+  0
+}
+
+// Running totals of `proof` over every module it is given.
+let pModules = 0
+let pRows = 0
+let pMatched = 0
+let pBad = 0
+let pRebuildDiff = 0
+let pRelinked = 0
+let pPertDiff = 0
+let pPertCovered = 0
+let pInitDiff = 0
+const pBySpace = [0, 0, 0, 0, 0]
+const pUnperturbed = [0, 0, 0, 0, 0]
+const pDecoded = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+const pMissKeys: string[] = []
+const pMiss: { [string]: i32 } = Map()
+let pShown = 0
+
+// Proves one armed build `a` (and, when `p` is not "", its perturbed twin): every row names an
+// `i32.const` carrying its value; the module re-linked from a skeleton with every relocated LEB
+// removed equals the module; and every body constant the perturbation moved has a row.
+function proofPair(a: string, p: string): i32 {
+  const bytes = bytesOf(a)
+  resetRows()
+  if !readRelocs(bytes) {
+    print("proof: \{a}: no vl.reloc section (not an armed build)")
+    return 1
+  }
+  decodeModule(bytes)
+  if failedAt >= 0 { print("proof: \{a}: decode failed at offset \{failedAt}") }
+  pModules = pModules + 1
+  // Row k of the module's decoded consts at offset `off` → recorded row index, by a merge.
+  const order: i32[] = []
+  let k = 0
+  while k < xOff.length {
+    order.push(k)
+    k = k + 1
+  }
+  sort(order, (x: i32, y: i32): boolean => xOff[x] < xOff[y])
+  const rowRec: i32[] = []
+  let i = 0
+  while i < rSpace.length {
+    rowRec.push(-1)
+    i = i + 1
+  }
+  let o = 0
+  i = 0
+  while o < order.length {
+    const r = order[o]
+    while i < rOff.length && rOff[i] < xOff[r] { i = i + 1 }
+    pRows = pRows + 1
+    if xSp[r] >= 0 && xSp[r] < pBySpace.length {
+      pBySpace[xSp[r]] = pBySpace[xSp[r]] + 1
+    }
+    if (
+      i < rOff.length
+      && rOff[i] == xOff[r]
+      && rSpace[i] == SP_CONST
+      && rFn[i] >= 0
+    ) {
+      if rVal[i] == xVal[r] {
+        pMatched = pMatched + 1
+        rowRec[i] = r
+      } else {
+        pBad = pBad + 1
+        print(
+          "proof: \{a}: row at \{xOff[r]} says \{xVal[r]}, the constant is \{rVal[i]}",
+        )
+      }
+    } else {
+      pBad = pBad + 1
+      if pBad <= 10 {
+        print("proof: \{a}: row at \{xOff[r]} names no body constant")
+      }
+    }
+    o = o + 1
+  }
+  // Re-link: drop every relocated LEB (each decoded index, each recorded constant), then write
+  // each value back in its minimal encoding, and compare with the module.
+  const skel: u8[] = []
+  const at: i32[] = []
+  const vals: i32[] = []
+  const sgn: boolean[] = []
+  let cur = 0
+  i = 0
+  while i < rSpace.length {
+    const keep = rSpace[i] != SP_CONST || rowRec[i] >= 0
+    if keep {
+      if rSpace[i] != SP_CONST { pDecoded[rSpace[i]] = pDecoded[rSpace[i]] + 1 }
+      while cur < rOff[i] {
+        skel.push(bytes[cur])
+        cur = cur + 1
+      }
+      at.push(skel.length)
+      vals.push(rVal[i])
+      sgn.push(rSigned[i])
+      cur = rOff[i] + rWidth[i]
+    }
+    i = i + 1
+  }
+  while cur < bytes.length {
+    skel.push(bytes[cur])
+    cur = cur + 1
+  }
+  const out: u8[] = []
+  let s = 0
+  let j = 0
+  while j <= at.length {
+    let to = skel.length
+    if j < at.length { to = at[j] }
+    while s < to {
+      out.push(skel[s])
+      s = s + 1
+    }
+    if j < at.length { putLeb(out, vals[j], sgn[j]) }
+    j = j + 1
+  }
+  pRelinked = pRelinked + at.length
+  let same = out.length == bytes.length
+  let d = 0
+  while same && d < out.length {
+    if out[d] != bytes[d] { same = false }
+    d = d + 1
+  }
+  if !same {
+    pRebuildDiff = pRebuildDiff + 1
+    print("proof: \{a}: the re-linked module differs from the module")
+  }
+  if p != "" { proofPert(a, p, rowRec) }
+  0
+}
+
+// Pairs `a`'s decoded constants with the perturbed build `p`'s, instruction for instruction:
+// a body constant that moved and has no row is an unrecorded value-borne index.
+function proofPert(a: string, p: string, rowRec: i32[]): i32 {
+  const aSp = rSpace.slice(0, rSpace.length)
+  const aVal = rVal.slice(0, rVal.length)
+  const aFn = rFn.slice(0, rFn.length)
+  const aIns = rIns.slice(0, rIns.length)
+  const aOp = rOp.slice(0, rOp.length)
+  resetRows()
+  decodeModule(bytesOf(p))
+  let i = 0
+  while i < aSp.length && i < rSpace.length {
+    if aSp[i] != rSpace[i] || aIns[i] != rIns[i] {
+      print("proof: \{p}: rows stop aligning at row \{i}")
+      return 1
+    }
+    if aSp[i] == SP_CONST {
+      const moved = aVal[i] != rVal[i]
+      if moved && aFn[i] < 0 { pInitDiff = pInitDiff + 1 }
+      if moved && aFn[i] >= 0 {
+        pPertDiff = pPertDiff + 1
+        if rowRec[i] >= 0 {
+          pPertCovered = pPertCovered + 1
+        } else {
+          const key = "delta \{rVal[i] - aVal[i]}"
+          if !pMiss.has(key) {
+            pMissKeys.push(key)
+            pMiss[key] = 0
+          }
+          pMiss[key] = (pMiss[key] ?? 0) + 1
+          if pShown < 30 {
+            pShown = pShown + 1
+            print(
+              "  unrecorded: \{a} body \{aFn[i]} ins \{aIns[i]} value \{aVal[i]} \{key} after \{opName(aOp[max(i - 1, 0)])} \{opName(aOp[max(i - 2, 0)])}",
+            )
+          }
+        }
+      }
+      if !moved && aFn[i] >= 0 && rowRec[i] >= 0 {
+        const sp = xSp[rowRec[i]]
+        if sp >= 0 && sp < pUnperturbed.length {
+          pUnperturbed[sp] = pUnperturbed[sp] + 1
+          if pUnperturbed[sp] <= 12 {
+            print(
+              "  unmoved: \{a} body \{aFn[i]} value \{aVal[i]} space \{sp} after \{opName(aOp[max(i - 1, 0)])} \{opName(aOp[max(i - 2, 0)])}",
+            )
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  0
+}
+
+// `proof A [P]`: an armed build (or a directory of them), and optionally its perturbed twin.
+function proof(a: string, p: string): i32 {
+  const ka = pathKind(a)
+  if ka is IoError { return die2("proof: cannot read \{a}") }
+  if ka == "dir" {
+    const names = listDir(a)
+    if names is IoError { return die2("proof: cannot list \{a}") }
+    sort(names, (x: string, y: string): boolean => x < y)
+    let i = 0
+    while i < names.length {
+      if endsWith(names[i], ".wasm") {
+        let twin = ""
+        if p != "" && pathExists(p + "/" + names[i]) == true {
+          twin = p + "/" + names[i]
+        }
+        proofPair(a + "/" + names[i], twin)
+      }
+      i = i + 1
+    }
+  } else {
+    proofPair(a, p)
+  }
+  print("== \{pModules} modules")
+  print(
+    "recorded rows: \{pRows}, \{pMatched} name their constant, \{pBad} do not",
+  )
+  let s = 1
+  while s < pBySpace.length {
+    print(
+      "  "
+        + padEnd(RS_NAMES[s], 14)
+        + padStart("\{pBySpace[s]}", 9, " ")
+        + "   unmoved by the perturbation: \{pUnperturbed[s]}",
+    )
+    s = s + 1
+  }
+  print("decoded index sites re-linked by decode:")
+  s = 0
+  while s < SP_CONST {
+    if pDecoded[s] > 0 {
+      print(
+        "  " + padEnd(SPACE_NAMES[s], 14) + padStart("\{pDecoded[s]}", 9, " "),
+      )
+    }
+    s = s + 1
+  }
+  print(
+    "re-linked \{pRelinked} LEBs from a skeleton: \{pRebuildDiff} modules differ from their bytes",
+  )
+  if p != "" {
+    print(
+      "perturbed body constants: \{pPertDiff}, recorded \{pPertCovered}, unrecorded \{pPertDiff - pPertCovered}",
+    )
+    print(
+      "perturbed initialiser constants (not recorded by step 1): \{pInitDiff}",
+    )
+    sort(pMissKeys, (x: string, y: string): boolean => x < y)
+    let k = 0
+    while k < pMissKeys.length {
+      print("  unrecorded \{pMissKeys[k]}: \{pMiss[pMissKeys[k]] ?? 0}")
+      k = k + 1
+    }
+  }
+  if pBad > 0 || pRebuildDiff > 0 { return 1 }
+  if p != "" && pPertDiff != pPertCovered { return 1 }
+  0
+}
+
+function die2(msg: string): i32 {
+  die(msg, 2)
+  2
+}
+
+function main(): i32 {
+  const args = programArgs()
+  if args is Utf8Error { return die2(USAGE) }
+  if args.length < 2 { return die2(USAGE) }
+  if args[0] == "census" { return census(args.slice(1, args.length)) }
+  if args[0] == "consts" && args.length == 3 { return consts(args[1], args[2]) }
+  if args[0] == "proof" && args.length == 2 { return proof(args[1], "") }
+  if args[0] == "proof" && args.length == 3 { return proof(args[1], args[2]) }
+  die2(USAGE)
+}
+
+main()
