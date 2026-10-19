@@ -263,6 +263,19 @@ A step that changes bytes is graded on the corpus and the capability matrices in
 Steps 1 and 2 can land as one PR. Steps 3 and 4 are independent of each other and both come
 before 5, because 5 is byte-identical only for rows whose type and name already agree.
 
+**Status: steps 1 and 2 are done** (`emit_union_tykey.vl`; L6 log, 2026-10-19). The key
+renders each member structurally (`tyToStructStr`, a nested union or list by its sorted
+members), so a record and its alias, or `Set<i32>` and `{[i32]: boolean}`, are one member, as
+D3870 makes them. A union or list already on the walk's path keys as a back-reference
+(`^k`), so a recursive alias keys in time linear in its size. A row whose atom no member type resolves is keyed by its struct row's
+recorded type, or else by the type it was minted for. The mono pins are typed at the instance:
+a parameter's pins wait until its binding is whole, and a bare `T` member of a union parameter
+(`T | string`, `T | i32 | null`) is bound from the argument by `bindGenUnionArmInto`, which
+the instance's own binding does not do. Over `tests/cases` and `distilled/named`, every mono
+root agrees by type key. Two roots still disagree, both assigned to later steps: the
+literal-union arm pin `K | L | null` (one call, step 3), and site 43 (14 calls in the 9 files,
+step 4).
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a

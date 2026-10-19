@@ -1,0 +1,180 @@
+// Records where a body writes an index a decoder cannot tell from a constant: a union tag, a
+// literal-union atom, a closure's table slot or an init-guard row, each an `i32.const`. Armed
+// only when `RELOC_ARMED` is flipped in a scratch build; disarmed, every entry point returns at
+// once and the module is unchanged. An armed compile appends a `vl.reloc` custom section of
+// (module offset, space, value) rows. docs/internals/s5-per-module-artifacts.md.
+
+import { curBuf } from "./emit_state"
+
+export const RELOC_ARMED = false
+
+// The spaces a row names; the decodable spaces are found by reading the body instead.
+export const RS_TAG = 1
+export const RS_ATOM = 2
+export const RS_SLOT = 3
+export const RS_GUARD = 4
+
+// The buffers holding a pending row, told apart by an alias probe since a list has no identity.
+let rbBuf: u8[][] = []
+// Pending rows of the body being written: owning buffer, offset in it, space and value.
+let pEnt: i32[] = []
+let pOff: i32[] = []
+let pSp: i32[] = []
+let pVal: i32[] = []
+// Placed rows: code-payload offsets until `relRebase`, module offsets after it.
+let relOff: i32[] = []
+let relSp: i32[] = []
+let relVal: i32[] = []
+// The row a folded const's banked bytes carry, by global: its space (0 for none) and value.
+let foldSp: i32[] = []
+let foldVal: i32[] = []
+
+export function relReset() {
+  rbBuf = []
+  pEnt = []
+  pOff = []
+  pSp = []
+  pVal = []
+  relOff = []
+  relSp = []
+  relVal = []
+  foldSp = []
+  foldVal = []
+  0
+}
+
+// The registry slot of `buf`, or -1. A byte pushed onto `buf` lengthens exactly the entries it aliases.
+function rbFind(buf: u8[]) {
+  let i = rbBuf.length - 1
+  while i >= 0 {
+    const n = rbBuf[i].length
+    buf.push(0)
+    const hit = rbBuf[i].length != n
+    buf.pop()
+    if hit { return i }
+    i = i - 1
+  }
+  -1
+}
+
+function rbOf(buf: u8[]) {
+  const i = rbFind(buf)
+  if i >= 0 { return i }
+  rbBuf.push(buf)
+  rbBuf.length - 1
+}
+
+function pendPush(e: i32, off: i32, sp: i32, v: i32) {
+  pEnt.push(e)
+  pOff.push(off)
+  pSp.push(sp)
+  pVal.push(v)
+  0
+}
+
+// Notes that the LEB starting `ahead` bytes past the current buffer's end carries `v` of `sp`.
+export function relNote(sp: i32, ahead: i32, v: i32) {
+  if !RELOC_ARMED { return 0 }
+  pendPush(rbOf(curBuf), curBuf.length + ahead, sp, v)
+}
+
+// Copies the rows of `src` onto `dst`, whose byte `at` is where `src`'s first byte lands.
+export function relCopy(src: u8[], dst: u8[], at: i32) {
+  if !RELOC_ARMED || pEnt.length == 0 { return 0 }
+  const s = rbFind(src)
+  if s < 0 { return 0 }
+  const d = rbOf(dst)
+  const n = pEnt.length
+  let k = 0
+  while k < n {
+    if pEnt[k] == s && pOff[k] < src.length {
+      pendPush(d, pOff[k] + at, pSp[k], pVal[k])
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Forgets the current buffer's rows past its end, once `wDropBack` has shortened it.
+export function relTrim() {
+  if !RELOC_ARMED || pEnt.length == 0 { return 0 }
+  const e = rbFind(curBuf)
+  if e < 0 { return 0 }
+  let k = 0
+  while k < pEnt.length {
+    if pEnt[k] == e && pOff[k] >= curBuf.length { pEnt[k] = -1 }
+    k = k + 1
+  }
+  0
+}
+
+// Places the rows of code entry `entry`, which starts at payload offset `at`, and forgets the
+// rest: a row in any other buffer belonged to a probe or a rendering no body kept.
+export function relPlace(entry: u8[], at: i32) {
+  if !RELOC_ARMED { return 0 }
+  const e = rbFind(entry)
+  if e >= 0 {
+    let k = 0
+    while k < pEnt.length {
+      if pEnt[k] == e && pOff[k] < entry.length {
+        relOff.push(pOff[k] + at)
+        relSp.push(pSp[k])
+        relVal.push(pVal[k])
+      }
+      k = k + 1
+    }
+  }
+  rbBuf = []
+  pEnt = []
+  pOff = []
+  pSp = []
+  pVal = []
+  0
+}
+
+// Moves every placed row by `base`, once the code payload's place in the module is known.
+export function relRebase(base: i32) {
+  let k = 0
+  while k < relOff.length {
+    relOff[k] = relOff[k] + base
+    k = k + 1
+  }
+  0
+}
+
+// Banks the row at byte 1 of `one`, the single `*.const` global `gi` folds to.
+export function relFoldBank(one: u8[], gi: i32) {
+  if !RELOC_ARMED { return 0 }
+  while foldSp.length <= gi {
+    foldSp.push(0)
+    foldVal.push(0)
+  }
+  const e = rbFind(one)
+  let k = 0
+  while e >= 0 && k < pEnt.length {
+    if pEnt[k] == e && pOff[k] == 1 {
+      foldSp[gi] = pSp[k]
+      foldVal[gi] = pVal[k]
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Notes the banked row of global `gi` for the fold about to be written at the buffer's end.
+export function relFoldNote(gi: i32) {
+  if !RELOC_ARMED || gi < 0 || gi >= foldSp.length || foldSp[gi] == 0 {
+    return 0
+  }
+  relNote(foldSp[gi], 1, foldVal[gi])
+}
+
+// The placed rows, read by index; the tables stay private to this module.
+export function relCount() { relOff.length }
+export function relOffAt(k: i32) { relOff[k] }
+export function relSpAt(k: i32) { relSp[k] }
+export function relValAt(k: i32) { relVal[k] }
+export function relSetOff(k: i32, off: i32) {
+  relOff[k] = off
+  0
+}
