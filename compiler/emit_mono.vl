@@ -183,6 +183,7 @@ import {
   WhileStmt,
   annTsOf,
   arenaSetNode,
+  callIsNever,
   declExported,
   elseIfLink,
   hasNamedArgs,
@@ -11101,7 +11102,8 @@ function monoWrittenGenLetFrame(at: i32, ctx: i32): i32[] {
 }
 
 // Whether value `v`, read in frame `ctx`, names a declared generic function, directly, through
-// the checker's adapter lambda, or in every arm of an `if` expression (D4013).
+// the checker's adapter lambda, or in every arm of an `if` expression that hands on a value: an
+// arm ending in a call that never returns hands on none (D4013, D6990).
 function monoValueNamesGenerics(v: i32, ctx: i32, depth: i32): boolean {
   if v < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
   if monoNamesDeclaredGeneric(v, ctx) { return true }
@@ -11110,8 +11112,19 @@ function monoValueNamesGenerics(v: i32, ctx: i32, depth: i32): boolean {
   if x < 0 { return false }
   const n = P.nodes[x]
   if !(n is IfStmt) { return false }
-  monoArmNamesGenerics(n.ifThen, ctx, depth + 1)
-    && monoArmNamesGenerics(n.ifElse, ctx, depth + 1)
+  const tn = monoArmEndsNever(n.ifThen)
+  const en = monoArmEndsNever(n.ifElse)
+  if tn && en { return false }
+  (tn || monoArmNamesGenerics(n.ifThen, ctx, depth + 1))
+    && (en || monoArmNamesGenerics(n.ifElse, ctx, depth + 1))
+}
+
+// Whether `if` arm block `arm` ends in a call that never returns.
+function monoArmEndsNever(arm: i32): boolean {
+  if arm < 0 || arm >= P.nodes.length { return false }
+  const b = P.nodes[arm]
+  if !(b is Block) || b.blkStmts.length == 0 { return false }
+  callIsNever(b.blkStmts[b.blkStmts.length - 1])
 }
 
 // Whether `if` arm `arm` (a block, or an `else if`) names declared generics in its value.
@@ -11140,31 +11153,17 @@ function monoAdapterCallee(v: i32): i32 {
   c.callFn
 }
 
-// For call `ix` in frame `ctx` through an un-annotated binding never written, or a chain of such
-// copies, whose initializer is an `if` naming generic functions in every arm: instances each arm
-// at the one signature the flow table pins the binding at, else at the one this call takes the
-// first arm at (D6991).
+// For call `ix` in frame `ctx` through an un-annotated binding of an `if` naming generic
+// functions in every arm (`monoIfBindingOf`): instances each arm at the one signature the flow
+// table pins the binding at, else at the one this call takes the first arm at (D6991).
 function monoCallIfBound(ix: i32, ctx: i32): i32 {
   const n = P.nodes[ix]
   if !(n is Call) || n.callFn < 0 || !(P.nodes[n.callFn] is Ident) { return 0 }
-  let rd = n.callFn
-  let lf = monoReadLetFrame(rd, ctx)
-  let hops = 0
-  while lf[1] >= 0 && hops < MONO_ALIAS_CHAIN_MAX {
-    const ld = P.nodes[lf[1]]
-    if !(ld is LetDecl) || ld.letType >= 0 || ld.letInit < 0 { return 0 }
-    if fnFlowDeclWritten(rd) { return 0 }
-    if !(P.nodes[ld.letInit] is Ident) { break }
-    rd = ld.letInit
-    lf = monoReadLetFrame(rd, lf[0])
-    hops = hops + 1
-  }
+  const lf = monoIfBindingOf(n.callFn, ctx)
   if lf[1] < 0 { return 0 }
   const d = P.nodes[lf[1]]
-  if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return 0 }
+  if !(d is LetDecl) { return 0 }
   const iv = unwrapParen(d.letInit)
-  if iv < 0 || !(P.nodes[iv] is IfStmt) { return 0 }
-  if !monoValueNamesGenerics(iv, lf[0], 0) { return 0 }
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
   if g0 < 0 { return 0 }
   let ct = monoSlotPinName(lf[1], [], lf[0])
@@ -11179,6 +11178,52 @@ function monoCallIfBound(ix: i32, ctx: i32): i32 {
   }
   if monoCoerceFnValueName(iv, ct, lf[0], -1) < 0 { return -1 }
   monoRetypeIfInit(d.letInit, g0, n.callFn, lf[0])
+}
+
+// For read `at` in frame `ctx` of an `if`-bound binding (`monoIfBindingOf`) delivered past a
+// return: instances each arm at the one signature the flow table pins the binding at, and types
+// each call taking that pin at it (D7001). No pin leaves the value to the emitter's refusal.
+function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
+  const lf = monoIfBindingOf(at, ctx)
+  if lf[1] < 0 { return 0 }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) { return 0 }
+  const iv = unwrapParen(d.letInit)
+  const g0 = monoFirstArmGenName(iv, lf[0], 0)
+  if g0 < 0 { return 0 }
+  const noPath: string[] = []
+  const ct = monoSlotPinName(lf[1], noPath, lf[0])
+  if ct == "" { return 0 }
+  if monoCoerceFnValueName(iv, ct, lf[0], -1) < 0 { return -1 }
+  monoRetypeIfInit(d.letInit, g0, at, lf[0])
+  monoRetypePinCalls(lf[1], noPath)
+}
+
+// The frame and declaration `[fr, d]` of the binding read `rd` in frame `ctx` names, through a
+// chain of copies, when each is un-annotated and never written and the last one's initializer is
+// an `if` naming generic functions in every arm; `[-1, -1]` otherwise.
+function monoIfBindingOf(rd: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  if rd < 0 || !(P.nodes[rd] is Ident) { return none }
+  let r = rd
+  let lf = monoReadLetFrame(r, ctx)
+  let hops = 0
+  while lf[1] >= 0 && hops < MONO_ALIAS_CHAIN_MAX {
+    const ld = P.nodes[lf[1]]
+    if !(ld is LetDecl) || ld.letType >= 0 || ld.letInit < 0 { return none }
+    if fnFlowDeclWritten(r) { return none }
+    if !(P.nodes[ld.letInit] is Ident) { break }
+    r = ld.letInit
+    lf = monoReadLetFrame(r, lf[0])
+    hops = hops + 1
+  }
+  if lf[1] < 0 { return none }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return none }
+  const iv = unwrapParen(d.letInit)
+  if iv < 0 || !(P.nodes[iv] is IfStmt) { return none }
+  if !monoValueNamesGenerics(iv, lf[0], 0) { return none }
+  lf
 }
 
 // For call `n` (node `ix`, in frame `ctx`) of an `if` naming generic functions in every arm:
@@ -12998,174 +13043,327 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   0
 }
 
-// Records the generic function names in binding `d`'s initializer, directly or as list elements
-// or record fields, when `d` is un-annotated and every use of it is inert (`monoUsesAreInert`).
-function monoNoteInertInit(d: LetDecl, at: i32, ctx: i32) {
-  if d.letType >= 0 { return 0 }
-  const xs = monoGenericValuesOf(d.letInit)
-  if xs.length == 0 { return 0 }
-  const cold = monoInertProps(d.letInit, "", MONO_INERT_READS)
-  if !monoUsesAreInert(ctx, d.letName, at, cold, MONO_INERT_READS, 0) {
-    return 0
-  }
-  monoNoteInertAll(xs)
+// ── where a generic function value can reach ────────────────────────────────────────────────
+// One question, asked of the tree before the walk rewrites it: can a value reach a place that
+// calls it or observes its signature? A value whose every destination drops it, holds it where
+// no function is read back, or hands it to such a place is inert (D6881, D7000, D7002).
+let mriParent: {[i32]: i32} = Map()
+let mriUses: {[i32]: i32[]} = Map()
+let mriUnres: {[string]: boolean} = Map()
+let mriMemo: {[string]: i32} = Map()
+let mriSeen: {[i32]: boolean} = Map()
+
+// Notes inert each name of a generic function in the program `stmts` and the bodies in
+// `fnStmts` whose value reaches nothing that calls or observes it (`monoReachInert`).
+function monoInertReach(stmts: i32[]) {
+  mriParent = Map()
+  mriUses = Map()
+  mriUnres = Map()
+  mriSeen = Map()
+  const roots: i32[] = []
+  for s in stmts { roots.push(s) }
+  for f in fnStmts { roots.push(f) }
+  monoReachIndex(roots)
 }
 
-// Records the generic function names in value `v` that function `fx` returns when its result is
-// inert at every call (`monoFnResultIsInert`), as `monoNoteInertInit` does a binding's (D6882).
-// An instance answers by its template, whose calls are the program's (D6930).
-function monoNoteInertRet(v: i32, fx: i32) {
-  if v < 0 { return 0 }
-  const xs = monoGenericValuesOf(v)
-  if xs.length == 0 { return 0 }
-  let fr = fx
-  const it = monoFrameInstTmpl(fx)
-  if it[0] == fx && it[1] >= 0 { fr = it[1] }
-  if !monoFnResultIsInert(fr, 0) { return 0 }
-  monoNoteInertAll(xs)
-}
-
-// Records the generic function names in the object member `n` reads when its property reaches
-// none of them (`monoInertProps`), as `[f].length` does not (D6914).
-function monoNoteInertMember(n: Member) {
-  const o = unwrapParen(n.memObj)
-  if o < 0 { return 0 }
-  const xs = monoGenericValuesOf(o)
-  if (
-    xs.length == 0
-    || !strListHas(monoInertProps(o, "", MONO_INERT_READS), n.memProp)
-  ) {
-    return 0
-  }
-  monoNoteInertAll(xs)
-}
-
-// Records the generic function names held by the statements whose value nothing reads once
-// statement `st`'s is discarded (`monoDiscardedStmtsOf`): a bare name, a parenthesized one, or a
-// list or record literal of them (D6960).
-function monoNoteInertStmt(st: i32) {
-  for d in monoDiscardedStmtsOf(st) {
-    const x = unwrapParen(d)
-    if x >= 0 {
-      const n = P.nodes[x]
-      if n is Ident || n is ArrayLit || n is ObjLit {
-        monoNoteInertAll(monoGenericValuesOf(x))
+// Adds to `monoInertReach`'s tables the subtrees under `roots` not yet in them, such as an
+// instance's body the walk is about to enter, and notes their inert names (D6930).
+function monoReachIndex(roots: i32[]) {
+  mriMemo = Map()
+  const cands: i32[] = []
+  for root in roots {
+    const stack: i32[] = [root]
+    while stack.length > 0 {
+      const ix = stack.pop()
+      if ix >= 0 && ix < P.nodes.length && !(mriSeen[ix] ?? false) {
+        // arena-tick exempt: a side table of this pass, not the arena
+        mriSeen[ix] = true
+        monoReachNoteRead(ix, cands)
+        for ch in nodeChildren(ix) {
+          if ch >= 0 && (mriParent[ch] ?? -1) < 0 {
+            // arena-tick exempt: a side table of this pass, not the arena
+            mriParent[ch] = ix
+          }
+          stack.push(ch)
+        }
       }
     }
   }
+  for x in cands {
+    if monoCalleeIsGeneric(x) && monoReachInert(x, "") {
+      monoReachNote(x, false)
+    }
+  }
   0
 }
 
-// Whether statement `k` of block statements `bs` has its value discarded: it is not the last, or
-// it is a loop, which has none.
-function monoStmtIsDiscarded(bs: i32[], k: i32): boolean {
-  if k + 1 < bs.length { return true }
-  if k < 0 || k >= bs.length { return false }
-  const n = P.nodes[bs[k]]
-  n is WhileStmt || n is ForRange || n is ForIn
+// Banks node `ix` for `monoInertReach`: a read under its declaration, a name no declaration
+// answers for, and a read that may name a function as a candidate.
+function monoReachNoteRead(ix: i32, cands: i32[]) {
+  const n = P.nodes[ix]
+  if !(n is Ident) { return 0 }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length {
+    // arena-tick exempt: a side table of this pass, not the arena
+    mriUnres[n.identName] = true
+    cands.push(ix)
+    return 0
+  }
+  const us = mriUses[d] ?? []
+  us.push(ix)
+  // arena-tick exempt: a side table of this pass, not the arena
+  mriUses[d] = us
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    cands.push(ix)
+  } else if dn is LetDecl && dn.letInit >= 0 {
+    const iv = unwrapParen(dn.letInit)
+    if iv >= 0 && P.nodes[iv] is FuncDecl { cands.push(ix) }
+  }
+  0
 }
 
-// The statements whose value nothing reads when statement `st`'s is discarded: `st` itself and,
-// through an `if` or a loop, the last statement of each block it runs.
-function monoDiscardedStmtsOf(st: i32): i32[] {
-  const out: i32[] = []
-  monoDiscardedStmtsIn(st, out, 0)
-  out
+// Notes value `x` inert, and with `kept` served by its function's own closure, which nothing
+// here calls (D6660, D6931).
+function monoReachNote(x: i32, kept: boolean) {
+  if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
+  if kept && !i32ListHas(monoInertCalled, x) { monoInertCalled.push(x) }
+  monoFlowNoteInertLeaf(x)
 }
 
-function monoDiscardedStmtsIn(st: i32, out: i32[], depth: i32) {
-  if st < 0 || st >= P.nodes.length || depth > 8 { return 0 }
-  out.push(st)
-  const n = P.nodes[st]
-  match n {
+// Whether value `x`, holding a function at `path` ("" the value itself, `e,` a list element,
+// `f:<name>,` a record field), reaches nothing that calls or observes that function. A cycle
+// answers false.
+function monoReachInert(x: i32, path: string): boolean {
+  if x < 0 || x >= P.nodes.length || path.length > 256 { return false }
+  const key = i32ToStr(x) + "|" + path
+  const m = mriMemo[key] ?? 0
+  if m != 0 { return m == 2 }
+  // arena-tick exempt: a side table of this pass, not the arena
+  mriMemo[key] = 1
+  const r = monoReachStep(x, path)
+  let v = 3
+  if r { v = 2 }
+  // arena-tick exempt: a side table of this pass, not the arena
+  mriMemo[key] = v
+  r
+}
+
+// The step of `monoReachInert` the node holding `x` decides.
+function monoReachStep(x: i32, path: string): boolean {
+  const p = mriParent[x] ?? -1
+  // A module statement's value is dropped.
+  if p < 0 { return i32ListHas(monoProgStmts, x) }
+  const pn = P.nodes[p]
+  match pn {
+    Block => {
+      const k = pn.blkStmts.length
+      if k == 0 || pn.blkStmts[k - 1] != x { return true }
+      return monoReachInert(p, path)
+    }
     IfStmt => {
-      for t in monoIfArmValuesOf(n) { monoDiscardedStmtsIn(t, out, depth + 1) }
-      return 0
+      if x == pn.ifCond { return false }
+      return monoReachInert(p, path)
     }
     WhileStmt => {
-      return monoDiscardedTailIn(n.whileBody, out, depth)
+      return x == pn.whileBody
     }
     ForRange => {
-      return monoDiscardedTailIn(n.frBody, out, depth)
+      return x == pn.frBody
     }
     ForIn => {
-      return monoDiscardedTailIn(n.fiBody, out, depth)
+      return x == pn.fiBody
     }
-    // runs no block whose last statement's value it hands on
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
+    FuncDecl => {
+      if x != pn.fnBody { return false }
+      return monoReachFnValue(p, path)
+    }
+    RetStmt => {
+      return monoReachFnValue(monoReachFrameOf(p), path)
+    }
+    Paren => {
+      return monoReachInert(p, path)
+    }
+    ObjLit => {
+      return monoReachInert(p, path)
+    }
+    ArrayLit => {
+      return monoReachInert(p, "e," + path)
+    }
+    FieldInit => {
+      return monoReachInert(p, "f:" + pn.fiName + "," + path)
+    }
+    LetDecl => {
+      if x != pn.letInit || pn.letType >= 0 { return false }
+      return monoReachDecl(p, path)
+    }
+    BinExpr => {
+      return monoReachBin(pn, p, x, path)
+    }
+    Call => {
+      return monoReachArg(pn, x, path)
+    }
+    Member => {
+      return monoReachProp(pn.memProp, p, path)
+    }
+    OptMember => {
+      return monoReachProp(pn.omProp, p, path)
+    }
+    Index => {
+      if x != pn.idxArr || path.slice(0, 2) != "e," { return false }
+      return monoReachInert(p, path.slice(2, path.length))
+    }
+    // reads the value, or holds it where the question does not follow
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
-  0
+  false
 }
 
-// The block arm of `monoDiscardedStmtsIn`: block `b`'s last statement, discarded in turn.
-function monoDiscardedTailIn(b: i32, out: i32[], depth: i32) {
-  const t: i32[] = []
-  monoBlockTailInto(b, t)
-  for s in t { monoDiscardedStmtsIn(s, out, depth + 1) }
-  0
+// The function declaration holding node `ix`, or -1 at module scope.
+function monoReachFrameOf(ix: i32): i32 {
+  let o = mriParent[ix] ?? -1
+  while o >= 0 && !(P.nodes[o] is FuncDecl) { o = mriParent[o] ?? -1 }
+  o
 }
 
-// The generic function names in value `v` (`monoGenericValuesIn`).
-function monoGenericValuesOf(v: i32): i32[] {
-  const xs: i32[] = []
-  monoGenericValuesIn(v, xs, 0)
-  xs
+// The template instance declaration `fd` copies, whose reads are the program's (D6930), or `fd`.
+function monoReachTmplOf(fd: i32): i32 {
+  if fd < 0 { return fd }
+  const it = monoFrameInstTmpl(fd)
+  if it[0] == fd && it[1] >= 0 { return it[1] }
+  fd
 }
 
-// Notes each name in `xs` inert; one naming a function called by name elsewhere is also served
-// by that function's own closure, which nothing calls here (D6660, D6931).
-function monoNoteInertAll(xs: i32[]) {
-  for x in xs {
-    if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
-    monoFlowNoteInertLeaf(x)
-  }
-  0
-}
-
-// The two questions `monoUsesAreInert` asks of a declaration: whether every read of it is
-// inert, or whether every read of it is the callee of a call whose result is.
-const MONO_INERT_READS = 0
-const MONO_INERT_CALLS = 1
-
-// The results and parameters `monoUsesAreInert` is deciding, so a cycle through them answers
-// false instead of recursing.
-const monoInertBusy: i32[] = []
-
-// Whether un-annotated-result function declaration `fx` is no export and every call of it drops
-// or inertly holds its result. A function the walk cloned has no call in the program's tree.
-function monoFnResultIsInert(fx: i32, depth: i32): boolean {
-  if depth > 8 || fx < 0 || fx >= P.nodes.length { return false }
-  const f = P.nodes[fx]
-  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnName == "" { return false }
+// Whether the value function declaration `f0` returns reaches nothing at `path`: it is declared
+// `void`, or its result is inferred, it is no export, and every read of it is a call whose
+// result reaches nothing. An instance answers by its template.
+function monoReachFnValue(f0: i32, path: string): boolean {
+  if f0 < 0 { return false }
+  const f = monoReachTmplOf(f0)
+  if f < 0 || !(mriSeen[f] ?? false) { return false }
+  const fn = P.nodes[f]
+  if !(fn is FuncDecl) { return false }
+  if fn.fnRet >= 0 { return retVoidAnnFlag(fn.fnRet) != 0 }
   if (
-    monoNameIsExported(f.fnName)
-    || declExported(fx)
-    || monoProgTopOf(fx) == -2
+    fn.fnName == ""
+    || monoNameIsExported(fn.fnName)
+    || declExported(f)
+    || (mriUnres[fn.fnName] ?? false)
   ) {
     return false
   }
-  if i32ListHas(monoInertBusy, fx) { return false }
-  monoInertBusy.push(fx)
-  const none: string[] = []
-  const r = monoUsesAreInert(-1, f.fnName, fx, none, MONO_INERT_CALLS, depth)
-  monoInertBusy.pop()
-  r
+  for u in mriUses[f] ?? [] {
+    let callee = u
+    let c = mriParent[u] ?? -1
+    while c >= 0 && P.nodes[c] is Paren {
+      callee = c
+      c = mriParent[c] ?? -1
+    }
+    if c < 0 { return false }
+    const cn = P.nodes[c]
+    if !(cn is Call) || cn.callFn != callee { return false }
+    if !monoReachInert(c, path) { return false }
+  }
+  true
 }
 
-// Whether parameter `i` of function declaration `fd` takes its argument's own type
-// (`monoParamIsOpen`), has no default and is no rest, and every use of it in `fd`'s body is inert.
-function monoParamUsesAreInert(fd: i32, i: i32, depth: i32): boolean {
-  const f = P.nodes[fd]
-  if !(f is FuncDecl) || i < 0 || i >= f.fnParams.length { return false }
+// Whether every read of the binding or parameter declared at `d`, no export, reaches nothing
+// at `path`; a write's target is no read.
+function monoReachDecl(d: i32, path: string): boolean {
+  const dn = P.nodes[d]
+  let nm = ""
+  if dn is LetDecl { nm = dn.letName }
+  if dn is Param { nm = dn.parName }
+  if (
+    nm == ""
+    || declExported(d)
+    || (mriUnres[nm] ?? false)
+    || !(mriSeen[d] ?? false)
+  ) {
+    return false
+  }
+  if (mriParent[d] ?? -1) < 0 && monoNameIsExported(nm) { return false }
+  for u in mriUses[d] ?? [] {
+    if !monoReachInert(u, path) { return false }
+  }
+  true
+}
+
+// The `BinExpr` arm of `monoReachStep`: a plain write's target is not read, and its value
+// reaches what the binding it writes does, an un-annotated one or a labelled block's carrier.
+function monoReachBin(n: BinExpr, p: i32, x: i32, path: string): boolean {
+  if n.binOp != "=" { return false }
+  if x == n.binLeft { return true }
+  const t = unwrapParen(n.binLeft)
+  if t < 0 || !(P.nodes[t] is Ident) { return false }
+  const d = identDeclOf(t)
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 && dn.letName.slice(0, 3) != "$lv" { return false }
+  } else if dn is Param {
+    if dn.parType >= 0 { return false }
+  } else {
+    return false
+  }
+  monoReachDecl(d, path) && monoReachInert(p, path)
+}
+
+// The `Call` arm of `monoReachStep`: an argument reaches nothing when its parameter is declared
+// a closed type no function fits (D6471) or takes its argument's own type (D6881), and a named
+// callee reads it nowhere that reaches one. Named arguments and a spread before it pair by no
+// position.
+function monoReachArg(n: Call, x: i32, path: string): boolean {
+  if n.callFn == x || hasNamedArgs(n.callArgNames) { return false }
+  let i = 0
+  while i < n.callArgs.length && n.callArgs[i] != x {
+    if P.nodes[n.callArgs[i]] is Spread { return false }
+    i = i + 1
+  }
+  if i >= n.callArgs.length { return false }
+  const t = wsOrigTyOf(n, i)
+  const closed = t >= 0 && !tyHasTyVar(t) && !tyMayHoldFn(t, 0)
+  const cd = monoReachTmplOf(monoCalleeDeclOf(n))
+  if cd < 0 { return closed }
+  const f = P.nodes[cd]
+  if !(f is FuncDecl) || i >= f.fnParams.length { return closed }
   const pIx = f.fnParams[i]
-  const p = P.nodes[pIx]
-  if !(p is Param) || p.parDefault >= 0 || p.parRest != 0 { return false }
-  if !monoParamIsOpen(f, pIx) || i32ListHas(monoInertBusy, pIx) { return false }
-  monoInertBusy.push(pIx)
-  const none: string[] = []
-  const r = monoUsesAreInert(fd, p.parName, pIx, none, MONO_INERT_READS, depth)
-  monoInertBusy.pop()
-  r
+  const pp = P.nodes[pIx]
+  if !(pp is Param) || pp.parDefault >= 0 || pp.parRest != 0 { return closed }
+  // A closed parameter type still yields the function to an `is` that widens it (D6701)
+  if !closed && !monoParamIsOpen(f, pIx) { return false }
+  monoReachDecl(pIx, path)
+}
+
+// The member arms of `monoReachStep`: a list's `length` reads no element, and a record's other
+// fields read none of the one holding the function.
+function monoReachProp(prop: string, p: i32, path: string): boolean {
+  if path.slice(0, 2) == "e," { return prop == "length" }
+  if path.slice(0, 2) != "f:" { return false }
+  let k = 2
+  while k < path.length && path.slice(k, k + 1) != "," { k = k + 1 }
+  if path.slice(2, k) != prop { return true }
+  monoReachInert(p, path.slice(k + 1, path.length))
+}
+
+// Whether generic function declaration `fd` is no export and every read of it reaches nothing
+// (`monoReachInert`), so nothing calls it or observes its signature (D6912).
+function monoReachReadsInert(fd: i32): boolean {
+  const f = P.nodes[fd]
+  if (
+    !(f is FuncDecl)
+    || f.fnName == ""
+    || monoNameIsExported(f.fnName)
+    || declExported(fd)
+    || (mriUnres[f.fnName] ?? false)
+    || !(mriSeen[fd] ?? false)
+  ) {
+    return false
+  }
+  for u in mriUses[fd] ?? [] {
+    if !monoReachInert(u, "") { return false }
+  }
+  true
 }
 
 // Whether parameter `pIx` of `f` takes its argument's own type: un-annotated, or annotated by a
@@ -13185,266 +13383,6 @@ function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
   monoTyParamOnlyBareParams(f, tp)
 }
 
-// Whether generic function declaration `fd` is no export and every read of it is inert, so
-// nothing calls it or observes its signature (D6912).
-function monoGenReadsAreInert(fd: i32): boolean {
-  const f = P.nodes[fd]
-  if (
-    !(f is FuncDecl)
-    || f.fnName == ""
-    || monoNameIsExported(f.fnName)
-    || declExported(fd)
-  ) {
-    return false
-  }
-  const none: string[] = []
-  monoUsesAreInert(-1, f.fnName, fd, none, MONO_INERT_READS, 1)
-}
-
-// Whether every use of `name` declared at `decl` in frame `fx`'s body (the program's for -1) is
-// inert, a use being a read under `MONO_INERT_READS` and a call under `MONO_INERT_CALLS`, with
-// `cold` the properties of the value that reach no function. The positions are
-// `monoInertPositions`'.
-function monoUsesAreInert(
-  fx: i32,
-  name: string,
-  decl: i32,
-  cold: string[],
-  mode: i32,
-  depth: i32,
-): boolean {
-  if depth > 8 { return false }
-  const stack: i32[] = []
-  const lens: i32[] = []
-  if fx >= 0 {
-    const b = monoNestedBodyOf(fx)
-    if b < 0 { return false }
-    stack.push(b)
-    monoInertTailHits(fx, name, mode, lens, depth)
-  } else {
-    for st in monoProgStmts {
-      stack.push(st)
-      monoDiscardedHitsOf(st, name, mode, lens)
-    }
-  }
-  while stack.length > 0 {
-    const ix = stack.pop()
-    if ix >= 0 && ix < P.nodes.length {
-      monoInertPositions(ix, fx, name, cold, mode, lens, depth)
-      const n = P.nodes[ix]
-      if n is Ident {
-        if (
-          n.identName == name
-          && !i32ListHas(lens, ix)
-          && monoInertIsUse(ix, fx, decl, mode)
-        ) {
-          return false
-        }
-      }
-      const body = monoNestedBodyOf(ix)
-      if body >= 0 { stack.push(body) }
-      for ch in nodeChildren(ix) { stack.push(ch) }
-    }
-  }
-  true
-}
-
-// Whether identifier `ix` in frame `fx` is a use of declaration `decl` `monoUsesAreInert` asks
-// about.
-function monoInertIsUse(ix: i32, fx: i32, decl: i32, mode: i32): boolean {
-  if identDeclOf(ix) == decl { return true }
-  mode == MONO_INERT_READS && monoReadIsBinding(ix, fx, decl)
-}
-
-// Appends to `lens` the uses of `name` node `ix` holds in an inert position: a statement that is
-// not its block's last, a write's target, a member read at a property in `cold` or one its
-// literal holds no function at, an argument a parameter never observes, a value an inert result
-// returns, or the initializer of an un-annotated binding whose own uses are inert.
-function monoInertPositions(
-  ix: i32,
-  fx: i32,
-  name: string,
-  cold: string[],
-  mode: i32,
-  lens: i32[],
-  depth: i32,
-) {
-  const n = P.nodes[ix]
-  if n is Member {
-    const o = unwrapParen(n.memObj)
-    if o >= 0 && P.nodes[o] is Ident {
-      if strListHas(cold, n.memProp) { lens.push(o) }
-      return 0
-    }
-    const held = monoInertHitsOf(o, name, mode)
-    if held.length > 0 && strListHas(monoInertProps(o, name, mode), n.memProp) {
-      monoPushAll(lens, held)
-    }
-    return 0
-  }
-  if n is BinExpr {
-    if n.binOp == "=" { lens.push(n.binLeft) }
-    return 0
-  }
-  if n is Call {
-    monoFnlessArgsOf(n, name, mode, lens)
-    monoInertParamArgsOf(n, name, mode, lens, depth + 1)
-    return 0
-  }
-  if n is Block {
-    let k = 0
-    while k < n.blkStmts.length {
-      if monoStmtIsDiscarded(n.blkStmts, k) {
-        monoDiscardedHitsOf(n.blkStmts[k], name, mode, lens)
-      }
-      k = k + 1
-    }
-    return 0
-  }
-  if n is RetStmt {
-    if monoInertHitsOf(n.retArg, name, mode).length == 0 { return 0 }
-    const fr = monoTopFrameOf(ix)
-    if fr >= 0 { monoInertRetHits(n.retArg, fr, name, mode, lens, depth) }
-    return 0
-  }
-  if n is FuncDecl {
-    if ix != fx { monoInertTailHits(ix, name, mode, lens, depth) }
-    return 0
-  }
-  monoInertLetHits(ix, fx, name, mode, lens, depth)
-}
-
-// Appends to `lens` the uses of `name` held by the statements whose value nothing reads when
-// statement `st`'s is discarded (`monoDiscardedStmtsOf`).
-function monoDiscardedHitsOf(st: i32, name: string, mode: i32, lens: i32[]) {
-  for d in monoDiscardedStmtsOf(st) {
-    monoPushAll(lens, monoInertHitsOf(d, name, mode))
-  }
-  0
-}
-
-// The binding arm of `monoInertPositions`: the uses in an un-annotated `LetDecl`'s initializer
-// when every read of the binding, in `fx` or the frame holding it, is inert in turn.
-function monoInertLetHits(
-  ix: i32,
-  fx: i32,
-  name: string,
-  mode: i32,
-  lens: i32[],
-  depth: i32,
-) {
-  const n = P.nodes[ix]
-  if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return 0 }
-  const held = monoInertHitsOf(n.letInit, name, mode)
-  if held.length == 0 { return 0 }
-  let fr = fx
-  if mode == MONO_INERT_CALLS || fx < 0 { fr = monoTopFrameOf(ix) }
-  const inner = monoInertProps(n.letInit, name, mode)
-  if monoUsesAreInert(fr, n.letName, ix, inner, MONO_INERT_READS, depth + 1) {
-    monoPushAll(lens, held)
-  }
-  0
-}
-
-// Appends to `lens` the uses of `name` in the value function `fd`'s body ends with, when its
-// result is inert or declared `void`, which discards that value.
-function monoInertTailHits(
-  fd: i32,
-  name: string,
-  mode: i32,
-  lens: i32[],
-  depth: i32,
-) {
-  const f = P.nodes[fd]
-  if !(f is FuncDecl) || f.fnBody < 0 { return 0 }
-  const b = P.nodes[f.fnBody]
-  if !(b is Block) || b.blkStmts.length == 0 { return 0 }
-  const tail = b.blkStmts[b.blkStmts.length - 1]
-  if retVoidAnnFlag(f.fnRet) != 0 {
-    return monoDiscardedHitsOf(tail, name, mode, lens)
-  }
-  monoInertRetHits(tail, fd, name, mode, lens, depth)
-}
-
-// Appends to `lens` the uses of `name` in value `v` function `fx` returns, when every call of
-// `fx` drops or inertly holds its result (`monoFnResultIsInert`).
-function monoInertRetHits(
-  v: i32,
-  fx: i32,
-  name: string,
-  mode: i32,
-  lens: i32[],
-  depth: i32,
-) {
-  const held = monoInertHitsOf(v, name, mode)
-  if held.length == 0 || !monoFnResultIsInert(fx, depth + 1) { return 0 }
-  monoPushAll(lens, held)
-}
-
-function monoPushAll(out: i32[], xs: i32[]) {
-  for x in xs { out.push(x) }
-  0
-}
-
-// The uses of `name` value `v` is, through parentheses, list elements, record fields and `if`
-// branches (the places `monoGenericValuesIn` finds a generic function): each read of it under
-// `MONO_INERT_READS`, the callee of each call of it under `MONO_INERT_CALLS`.
-function monoInertHitsOf(v: i32, name: string, mode: i32): i32[] {
-  const out: i32[] = []
-  monoInertHitsIn(v, name, mode, out, 0)
-  out
-}
-
-function monoInertHitsIn(
-  v: i32,
-  name: string,
-  mode: i32,
-  out: i32[],
-  depth: i32,
-) {
-  if v < 0 || v >= P.nodes.length { return 0 }
-  const x = unwrapParen(v)
-  if x < 0 || depth > 8 { return 0 }
-  const n = P.nodes[x]
-  if n is Ident {
-    if mode == MONO_INERT_READS && n.identName == name { out.push(x) }
-  } else if n is Call {
-    const c = monoCallCalleeOf(x)
-    if mode == MONO_INERT_CALLS && c >= 0 && monoIsIdentNamed(c, name) {
-      out.push(c)
-    }
-  } else if n is ArrayLit {
-    for e in n.arrElems { monoInertHitsIn(e, name, mode, out, depth + 1) }
-  } else if n is ObjLit {
-    for fi in n.objFields {
-      const f = P.nodes[fi]
-      if f is FieldInit {
-        monoInertHitsIn(f.fiValue, name, mode, out, depth + 1)
-      }
-    }
-  } else if n is IfStmt {
-    for t in monoIfArmValuesOf(n) {
-      monoInertHitsIn(t, name, mode, out, depth + 1)
-    }
-  }
-  0
-}
-
-// The values `if` expression `n` hands on: the last statement of each branch, an `else if`
-// being one (D6981). The `null` an else-less `if` also hands on holds no function.
-function monoIfArmValuesOf(n: IfStmt): i32[] {
-  const out: i32[] = []
-  monoBlockTailInto(n.ifThen, out)
-  if n.ifElse >= 0 && n.ifElse < P.nodes.length {
-    if P.nodes[n.ifElse] is IfStmt {
-      out.push(n.ifElse)
-    } else {
-      monoBlockTailInto(n.ifElse, out)
-    }
-  }
-  out
-}
-
 // Appends block `b`'s last statement to `out`; nothing for an empty block or a non-block.
 function monoBlockTailInto(b: i32, out: i32[]) {
   if b < 0 || b >= P.nodes.length { return 0 }
@@ -13453,137 +13391,6 @@ function monoBlockTailInto(b: i32, out: i32[]) {
     if n.blkStmts.length > 0 { out.push(n.blkStmts[n.blkStmts.length - 1]) }
   }
   0
-}
-
-// The callee identifier of call `v`, through parentheses, or -1.
-function monoCallCalleeOf(v: i32): i32 {
-  if v < 0 || v >= P.nodes.length { return -1 }
-  const x = unwrapParen(v)
-  if x < 0 { return -1 }
-  const n = P.nodes[x]
-  if !(n is Call) { return -1 }
-  const c = unwrapParen(n.callFn)
-  if c < 0 || !(P.nodes[c] is Ident) { return -1 }
-  c
-}
-
-// The properties of value `v` whose read cannot reach a use of `name` (`monoInertHitsOf`) in it,
-// or with `name` "" any generic function: a list's `length`, or a record literal's fields that
-// hold none. A record's `length` is a field (D4123).
-function monoInertProps(v: i32, name: string, mode: i32): string[] {
-  const out: string[] = []
-  if v < 0 || v >= P.nodes.length { return out }
-  const x = unwrapParen(v)
-  if x < 0 { return out }
-  const t = nodeTyIxOf(x)
-  if t >= 0 && t < T.tys.length && T.tys[t] is TyArray {
-    out.push("length")
-    return out
-  }
-  monoColdFieldsOf(x, name, mode, out)
-  out
-}
-
-// The record-literal arm of `monoInertProps`: appends each field of `x` holding no use of `name`
-// (no generic function for ""); every other kind has no field a read could name.
-function monoColdFieldsOf(x: i32, name: string, mode: i32, out: string[]) {
-  const n = P.nodes[x]
-  if n is ObjLit {
-    for fi in n.objFields {
-      const f = P.nodes[fi]
-      if f is FieldInit {
-        let hot: i32[] = []
-        if name == "" {
-          monoGenericValuesIn(f.fiValue, hot, 1)
-        } else {
-          hot = monoInertHitsOf(f.fiValue, name, mode)
-        }
-        if hot.length == 0 { out.push(f.fiName) }
-      }
-    }
-  }
-  0
-}
-
-// Appends to `out` each name of a generic function in value `v`, through parentheses, list
-// elements, record fields and the branches of an `if` (`monoIfArmValuesOf`).
-function monoGenericValuesIn(v: i32, out: i32[], depth: i32) {
-  const x = unwrapParen(v)
-  if x < 0 || depth > 8 { return 0 }
-  const n = P.nodes[x]
-  if n is Ident {
-    if monoCalleeIsGeneric(x) { out.push(x) }
-    return 0
-  }
-  if n is ArrayLit {
-    for e in n.arrElems { monoGenericValuesIn(e, out, depth + 1) }
-    return 0
-  }
-  monoGenericFieldValuesIn(x, out, depth)
-}
-
-// The record-literal and `if` arms of `monoGenericValuesIn`; every other kind holds no function
-// by name.
-function monoGenericFieldValuesIn(x: i32, out: i32[], depth: i32) {
-  const n = P.nodes[x]
-  if n is ObjLit {
-    for fi in n.objFields {
-      const f = P.nodes[fi]
-      if f is FieldInit { monoGenericValuesIn(f.fiValue, out, depth + 1) }
-    }
-  } else if n is IfStmt {
-    for t in monoIfArmValuesOf(n) { monoGenericValuesIn(t, out, depth + 1) }
-  }
-  0
-}
-
-// Appends to `out` the uses of `name` in each argument of call `n` delivered to a parameter
-// declared as a closed record type holding no function and widened to the argument's own
-// (`wsOrigTyOf`): the callee cannot read a function out of it (D6471).
-function monoFnlessArgsOf(n: Call, name: string, mode: i32, out: i32[]) {
-  if hasNamedArgs(n.callArgNames) { return 0 }
-  let i = 0
-  while i < n.callArgs.length {
-    const t = wsOrigTyOf(n, i)
-    if t >= 0 && !tyHasTyVar(t) && !tyMayHoldFn(t, 0) {
-      monoPushAll(out, monoInertHitsOf(n.callArgs[i], name, mode))
-    }
-    i = i + 1
-  }
-  0
-}
-
-// Appends to `out` the uses of `name` in each argument of call `n` delivered to a parameter of
-// the function declaration its callee names whose every use is inert (`monoParamUsesAreInert`):
-// the callee never reads a function out of it (D6881). Stops at a spread, past which arguments
-// and parameters do not pair by position.
-function monoInertParamArgsOf(
-  n: Call,
-  name: string,
-  mode: i32,
-  out: i32[],
-  depth: i32,
-) {
-  if depth > 8 || hasNamedArgs(n.callArgNames) { return 0 }
-  const cd = monoCalleeDeclOf(n)
-  if cd < 0 { return 0 }
-  let i = 0
-  while i < n.callArgs.length {
-    const a = n.callArgs[i]
-    if P.nodes[a] is Spread { return 0 }
-    const held = monoInertHitsOf(a, name, mode)
-    if held.length > 0 && monoParamUsesAreInert(cd, i, depth) {
-      monoPushAll(out, held)
-    }
-    i = i + 1
-  }
-  0
-}
-
-// Whether node `a` is an identifier spelled `name`.
-function monoIsIdentNamed(a: i32, name: string): boolean {
-  const n = P.nodes[a]
-  n is Ident && n.identName == name
 }
 
 // The function declaration call `n`'s callee names directly, or -1.
@@ -15664,45 +15471,61 @@ function monoHoleManyPinsFail(par: string, callee: string): i32 {
   )
 }
 
-// The pin for parameter `i` of template `oDecl` handed `argIx`, when every use of the parameter
-// is inert and the argument can only be hole functions no call instances (`monoInertArgFns`),
-// each one whose `i32` default cannot build or that nothing else observes: the `() -> void` of
-// the stub they prune to (D6881). "" otherwise; `tyOut[0]` takes the type.
+// The pin for parameter `i` of template `oDecl` handed `argIx`, when the argument, or each
+// element of a list literal of them, can only be hole functions whose value there reaches
+// nothing (`monoReachInert`): the `() -> void` of the stub they prune to (D6881, D7002). A
+// function another use calls or observes keeps its instance, and the parameter takes its closure
+// unread: a closure's representation is one for every signature (D6931, D7000). "" otherwise;
+// `tyOut[0]` takes the type.
 function monoInertParamStubPin(
   oDecl: i32,
   argIx: i32,
   i: i32,
   tyOut: i32[],
 ): string {
-  if oDecl < 0 { return "" }
+  if oDecl < 0 || argIx < 0 || argIx >= P.nodes.length { return "" }
   const fes: i32[] = []
   const at: i32[] = []
-  if !monoInertArgFns(argIx, fes, at, 0) { return "" }
-  // A function called by name keeps its instance, whose closure the parameter takes unread: a
-  // closure's representation is one for every signature (D6931).
-  const stubbed: boolean[] = []
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
+  const al = P.nodes[ax]
+  let list = false
+  if al is ArrayLit {
+    if al.arrElems.length == 0 { return "" }
+    for e in al.arrElems {
+      if !monoInertArgFns(e, fes, at, 0) { return "" }
+    }
+    list = true
+  } else if !monoInertArgFns(argIx, fes, at, 0) {
+    return ""
+  }
+  if fes.length == 0 { return "" }
+  const kept: boolean[] = []
   let j = 0
   while j < fes.length {
-    const fe = fes[j]
+    if !monoReachInert(at[j], "") { return "" }
     const g = monoFlowLeafGen(at[j])
-    const byName = g >= 0 && monoFlowGenCalled(g)
-    stubbed.push(!byName)
-    if !byName {
-      if monoInstantiatedAny(fe) { return "" }
-      const d = monoOrigNode[fe]
-      if !monoCallsHoleParam(d) && !monoGenReadsAreInert(d) { return "" }
-    }
+    const k = (g >= 0 && monoFlowGenCalled(g))
+      || !monoReachReadsInert(monoOrigNode[fes[j]])
+    if !k && monoInstantiatedAny(fes[j]) { return "" }
+    kept.push(k)
     j = j + 1
   }
-  if !monoParamUsesAreInert(oDecl, i, 0) { return "" }
   const noPs: i32[] = []
-  const st = mkFuncTy(noPs, TY_VOID)
-  const k = sigKeyOfTy(st)
-  if k == "" { return "" }
-  monoNoteInertAll(at)
+  let st = mkFuncTy(noPs, TY_VOID)
+  let nm = ""
+  if list {
+    st = mkArrayTy(st)
+    nm = monoConcreteFnPinName(st)
+  } else {
+    const sk = sigKeyOfTy(st)
+    if sk != "" { nm = "=>" + sk }
+  }
+  if nm == "" { return "" }
   j = 0
   while j < fes.length {
-    if stubbed[j] {
+    monoReachNote(at[j], kept[j])
+    if !kept[j] {
       monoInertArgAt.push(at[j])
       monoInertArgFe.push(fes[j])
     }
@@ -15710,13 +15533,13 @@ function monoInertParamStubPin(
   }
   // arena-tick exempt: the caller's out-parameter, not an arena row any pass reads.
   tyOut[0] = st
-  "=>" + k
+  nm
 }
 
 // Appends to `fes` each hole function value `v` can be, and to `at` the name reading it: `v`
-// names one, is a `const` binding whose every use is inert and whose initializer can only be
-// such, is an `if` whose arms can only be such, or calls a function whose result is inert and
-// whose every returned value can (D6911). False when some value it can be is none of those.
+// names one, is an un-annotated `const` binding whose initializer can only be such, is an `if`
+// whose arms can only be such, or calls a function every value it returns can be (D6911). False
+// when some value it can be is none of those.
 function monoInertArgFns(v: i32, fes: i32[], at: i32[], depth: i32): boolean {
   if v < 0 || v >= P.nodes.length { return false }
   const x = unwrapParen(v)
@@ -15724,13 +15547,22 @@ function monoInertArgFns(v: i32, fes: i32[], at: i32[], depth: i32): boolean {
   const n = P.nodes[x]
   if n is Call {
     const cd = monoCalleeDeclOf(n)
-    if cd < 0 || !monoFnResultIsInert(cd, depth + 1) { return false }
+    if cd < 0 { return false }
     return monoRetValueFns(cd, fes, at, depth + 1)
   }
-  // An `if` is each of its arms' values.
+  // An `if` is each of its arms' values; an arm ending in a call that never returns has none.
   if n is IfStmt {
-    const arms = monoIfArmValuesOf(n)
-    if n.ifElse < 0 || arms.length != 2 { return false }
+    if n.ifElse < 0 { return false }
+    const tn = monoArmEndsNever(n.ifThen)
+    const en = monoArmEndsNever(n.ifElse)
+    if tn && en { return false }
+    const arms: i32[] = []
+    if !tn { monoBlockTailInto(n.ifThen, arms) }
+    if P.nodes[n.ifElse] is IfStmt { arms.push(n.ifElse) }
+    else if !en { monoBlockTailInto(n.ifElse, arms) }
+    let want = 2
+    if tn || en { want = 1 }
+    if arms.length != want { return false }
     for a in arms {
       if !monoInertArgFns(a, fes, at, depth + 1) { return false }
     }
@@ -15747,20 +15579,12 @@ function monoInertArgFns(v: i32, fes: i32[], at: i32[], depth: i32): boolean {
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return false }
   const ld = P.nodes[d]
-  // The arena-wide `monoProgTopOf` table comes last: it rebuilds after every minted instance.
   if (
     !(ld is LetDecl)
     || ld.letKw != "const"
     || ld.letType >= 0
     || ld.letInit < 0
-    || declExported(d)
-    || monoProgTopOf(d) == -2
   ) {
-    return false
-  }
-  const none: string[] = []
-  const fr = monoTopFrameOf(d)
-  if !monoUsesAreInert(fr, ld.letName, d, none, MONO_INERT_READS, depth + 1) {
     return false
   }
   monoInertArgFns(ld.letInit, fes, at, depth + 1)
@@ -15782,41 +15606,13 @@ function monoRetValueFns(fd: i32, fes: i32[], at: i32[], depth: i32): boolean {
     const ix = stack.pop()
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
-      if n is RetStmt && monoTopFrameOf(ix) == fd {
+      if n is RetStmt && monoReachFrameOf(ix) == fd {
         if !monoInertArgFns(n.retArg, fes, at, depth) { return false }
       }
       for ch in nodeChildren(ix) { stack.push(ch) }
     }
   }
   true
-}
-
-// Whether function declaration `fd`'s body calls one of its un-annotated parameters.
-function monoCallsHoleParam(fd: i32): boolean {
-  if fd < 0 || fd >= P.nodes.length { return false }
-  const f = P.nodes[fd]
-  if !(f is FuncDecl) || f.fnBody < 0 { return false }
-  const stack: i32[] = [f.fnBody]
-  while stack.length > 0 {
-    const ix = stack.pop() ?? -1
-    if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
-      if n is Call {
-        const c = unwrapParen(n.callFn)
-        const nm = monoIdentNameOf(c)
-        for pi in f.fnParams {
-          const p = P.nodes[pi]
-          if p is Param {
-            if p.parType < 0 && p.parName == nm && identDeclOf(c) == pi {
-              return true
-            }
-          }
-        }
-      }
-      for ch in nodeChildren(ix) { stack.push(ch) }
-    }
-  }
-  false
 }
 
 // Each argument `monoInertParamStubPin` pinned at the stub, and the function it names.
@@ -17313,7 +17109,6 @@ function monoWalk(ix: i32, ctx: i32) {
     const bs = n.blkStmts
     let i2 = 0
     while i2 < bs.length {
-      if monoStmtIsDiscarded(bs, i2) { monoNoteInertStmt(bs[i2]) }
       if monoWalk(bs[i2], ctx) < 0 { return -1 }
       i2 = i2 + 1
     }
@@ -17348,7 +17143,6 @@ function monoWalk(ix: i32, ctx: i32) {
       if cf is FuncDecl {
         if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
         if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
-        if cf.fnRet < 0 { monoNoteInertRet(n.retArg, ctx) }
       }
     }
     return monoWalk(n.retArg, ctx)
@@ -17408,10 +17202,7 @@ function monoWalk(ix: i32, ctx: i32) {
   }
   if n is Unary { return monoWalk(n.unArg, ctx) }
   if n is Paren { return monoWalk(n.parInner, ctx) }
-  if n is Member {
-    monoNoteInertMember(n)
-    return monoWalk(n.memObj, ctx)
-  }
+  if n is Member { return monoWalk(n.memObj, ctx) }
   if n is OptMember { return monoWalk(n.omObj, ctx) }
   if n is Index {
     if monoWalk(n.idxArr, ctx) < 0 { return -1 }
@@ -17484,7 +17275,6 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   ) {
     if monoPinRecordFields(n, ix, ctx) < 0 { return -1 }
   }
-  monoNoteInertInit(n, ix, ctx)
   // An annotated function-typed binding to a generic named function: materialize the
   // instance for the annotation's param types and point the binding at it, so the value
   // carries that concrete type independent of any call — it may escape where call-driven
@@ -17671,6 +17461,10 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
 // which is what `monoCoerceFnValueName`'s `Block` arm walks to.
 function monoWalkFnBody(fnIx: i32) {
   const fn = P.nodes[fnIx]
+  if !(mriSeen[fnIx] ?? false) {
+    const one: i32[] = [fnIx]
+    monoReachIndex(one)
+  }
   if fn is FuncDecl {
     if monoCoerceFnValue(fn.fnBody, fn.fnRet, fnIx) < 0 { return -1 }
     if monoNoteRetDeliveries(fn, fnIx) < 0 { return -1 }
@@ -17680,13 +17474,6 @@ function monoWalkFnBody(fnIx: i32) {
       if b is Block && b.blkStmts.length > 0 {
         const tail = b.blkStmts[b.blkStmts.length - 1]
         if monoCoerceRetAtPin(tail, fnIx) < 0 { return -1 }
-        monoNoteInertRet(tail, fnIx)
-      }
-    } else if retVoidAnnFlag(fn.fnRet) != 0 && fn.fnBody >= 0 {
-      // A `void` body's last statement is discarded like any other.
-      const b = P.nodes[fn.fnBody]
-      if b is Block && b.blkStmts.length > 0 {
-        monoNoteInertStmt(b.blkStmts[b.blkStmts.length - 1])
       }
     }
     return monoWalk(fn.fnBody, fnIx)
@@ -18886,6 +18673,7 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   if v < 0 { return 0 }
   const x = unwrapParen(v)
   if x < 0 { return 0 }
+  if monoIfBindingOf(x, ctx)[1] >= 0 { return monoIfBoundRetAtPin(x, ctx) }
   if !monoNamesDeclaredGeneric(x, ctx) && monoReadGenFnFe(x) < 0 { return 0 }
   const noPath: string[] = []
   // An alias of one is pinned at its own binding, which the flow table keys the read by (D5400).
@@ -19576,6 +19364,7 @@ export function monomorphize(stmts: i32[]) {
   fnFlowTableBuild(stmts)
   if monoShadowRename(fnStmts.length) < 0 { return -1 }
   monoFlowReads(stmts)
+  monoInertReach(stmts)
   // Top-level statements first, in source order (global inits + start stmts).
   let i = 0
   while i < stmts.length {
@@ -19589,7 +19378,6 @@ export function monomorphize(stmts: i32[]) {
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
     } else {
-      monoNoteInertStmt(stmts[i])
       if monoWalk(stmts[i], -1) < 0 { return -1 }
     }
     i = i + 1

@@ -94,6 +94,7 @@ import {
   tyIsMap,
   tyIsNulValueUnionBox,
   tyIsRecord,
+  tyMayHoldFn,
   tyPrimNameOf,
   tySame,
   tyToEmitName,
@@ -402,6 +403,10 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
     emitFailAt("emitProgram: a loop value's type has no spelling", x)
     return -1
   }
+  if loop is WhileStmt && lvBlockIsOwnValue(x, ty) {
+    lvIfAt(x, loop.whileBody, ty, atStmt)
+    return x
+  }
   // The loop moves to a fresh node, and the if-expression takes its place.
   const y = addNode(loop)
   identFrom(y, x)
@@ -449,6 +454,25 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   thenSt.push(y)
   thenSt.push(rd)
   const thenB = mkBlock(thenSt, pos)
+  lvIfAt(x, thenB, ty, atStmt)
+  y
+}
+
+// Whether node `x` is a labelled block no `break` leaves whose value, of type `ty`, holds a
+// function of an open signature: it is its own value, since a carrier's annotation could not
+// spell that signature (D6990).
+function lvBlockIsOwnValue(x: i32, ty: i32): boolean {
+  if x < 0 || x >= P.nodes.length || ty < 0 { return false }
+  const n = P.nodes[x]
+  if !(n is WhileStmt) || n.whileBlk != 1 { return false }
+  if !tyHasTyVar(ty) || !tyMayHoldFn(ty, 0) { return false }
+  lvRewriteBreaks(n.whileBody, n.whileLabel, "", -1, ty, 0, false) == 0
+}
+
+// Writes at `x` the if-expression `if true { thenB } else { __trap__() }` of type `ty`, in a
+// value position unless `atStmt`.
+function lvIfAt(x: i32, thenB: i32, ty: i32, atStmt: boolean) {
+  const pos = P.nodes[x].pos
   nodeTyRecord(thenB, ty)
   const trapFn = mkIdent("__trap__", pos)
   identFromDecl(trapFn, IDENT_BUILTIN)
@@ -464,7 +488,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
   arenaSetNode(x, w)
   nodeTyRecord(x, ty)
   if !atStmt { valueIfAdd(x) }
-  y
+  0
 }
 
 // The annotation spelling of type `ty` for a synthesized binding, or "" when it has none: a
@@ -522,6 +546,14 @@ function exitFirstLetsAnnotate() {
       const d = P.nodes[li]
       if d is LetDecl {
         let ty = nodeTyIxOf(d.letInit)
+        if (
+          lvBlockIsOwnValue(
+            unwrapParen(d.letInit),
+            loopValTyOf(unwrapParen(d.letInit)),
+          )
+        ) {
+          ty = -1
+        }
         if letNullHoleUnfilled(li) { ty = -1 }
         const filled = letNullHoleFilledTy(li)
         if filled >= 0 { ty = filled }
@@ -567,8 +599,9 @@ function lvRewriteTail(body: i32, tail: i32, name: string, decl: i32, ty: i32) {
 }
 
 // Rewrites each `break v` under `ix` that leaves the loop labelled `label` (`depth` 0 while no
-// loop or block lies between them) so its value statement stores into `name`. A labelled
-// `break` leaves it only while no nearer loop or block takes the same label (`shadow`).
+// loop or block lies between them) so its value statement stores into `name`, and counts them;
+// `name` "" only counts. A labelled `break` leaves it only while no nearer loop or block takes
+// the same label (`shadow`).
 function lvRewriteBreaks(
   root: i32,
   label: string,
@@ -581,12 +614,14 @@ function lvRewriteBreaks(
   const todo: i32[] = [root]
   const todoDepth: i32[] = [depth0]
   const todoShadow: boolean[] = [shadow0]
+  let found = 0
   while todo.length > 0 {
     const ix = todo.pop() ?? -1
     const depth = todoDepth.pop() ?? 0
     const shadow = todoShadow.pop() ?? false
     if ix >= 0 && ix < P.nodes.length && !(P.nodes[ix] is FuncDecl) {
-      lvRewriteBlockBreaks(ix, label, name, decl, ty, depth, shadow)
+      found = found
+        + lvRewriteBlockBreaks(ix, label, name, decl, ty, depth, shadow)
       let d = depth
       let sh = shadow
       const inner = lvLabelOf(ix)
@@ -604,7 +639,7 @@ function lvRewriteBreaks(
       }
     }
   }
-  0
+  found
 }
 
 // What `lvLabelOf` answers for a node no `break` can leave: `%` spells no label.
@@ -622,7 +657,8 @@ function lvLabelOf(ix: i32): string {
 // Every other kind: an expression, a declaration or a statement no `break` leaves.
 function lvNotALoop(_ix: i32): string { LV_NOT_A_LOOP }
 
-// `lvRewriteBreaks` for the statement list of one block `ix`, `depth` loops inside the target.
+// `lvRewriteBreaks` for the statement list of one block `ix`, `depth` loops inside the target;
+// the number of `break`s it found.
 function lvRewriteBlockBreaks(
   ix: i32,
   label: string,
@@ -633,6 +669,7 @@ function lvRewriteBlockBreaks(
   shadow: boolean,
 ) {
   const n = P.nodes[ix]
+  let found = 0
   if n is Block {
     const st = n.blkStmts
     let j = 1
@@ -641,14 +678,15 @@ function lvRewriteBlockBreaks(
         const b = P.nodes[st[j]]
         if b is BreakStmt {
           if b.brkHasVal == 1 && lvLeaves(b.brkLabel, label, depth, shadow) {
-            st[j - 1] = lvAssign(name, decl, st[j - 1], ty)
+            if name != "" { st[j - 1] = lvAssign(name, decl, st[j - 1], ty) }
+            found = found + 1
           }
         }
       }
       j = j + 1
     }
   }
-  0
+  found
 }
 
 // Whether a `break` labelled `brk` leaves the loop labelled `label` from `depth` loops inside it.
