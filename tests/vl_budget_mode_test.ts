@@ -31,7 +31,7 @@ const NARROW = ["std", "scripts/seed-size.vl"];
 const DOCTORED_FILE = "std/fs.vl";
 // The sentinel write's population: one compiler file. The committed baseline over the whole
 // tree is lint-self.sh's hold; this test owns the writer's layout and sentences.
-const SENTINEL_NARROW = "compiler/parser.vl";
+const SENTINEL_NARROW = "compiler/emit_union_registry.vl";
 
 type Run = { code: number; out: string; err: string };
 
