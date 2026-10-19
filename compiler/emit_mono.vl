@@ -75,7 +75,7 @@ import {
   subtractTy,
   tyProvesNonNull,
 } from "./check_relate_core"
-import { ovPickFor, wsOrigTyOf } from "./check_demands"
+import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
 import { tyLeavesDisjoint } from "./check_type_shape"
 import { inferRetFnKey } from "./check_side_rows"
@@ -184,7 +184,6 @@ import {
   annTsOf,
   arenaSetNode,
   callIsNever,
-  declExported,
   elseIfLink,
   hasNamedArgs,
   i32ToStr,
@@ -231,7 +230,6 @@ import {
 import {
   MC_RUNG_BUILTIN,
   PIN_SIGKEY,
-  callHasTyArgs,
   callTyArgEndsOf,
   callTyArgsOf,
   setCallTyArgs,
@@ -281,13 +279,25 @@ import {
   parentLetOf,
   parentLetOfAt,
   pushUniqueAtom,
-  retVoidAnnFlag,
   tyIsFuncType,
   tyNameOf,
   unwrapParen,
 } from "./emit_base"
 import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
 import { fsAsk, fsAskTyParam } from "./fn_split"
+import {
+  monoCalleeDeclOf,
+  monoFrameInstTmpl,
+  monoNameIsExported,
+  monoParamBareTyParam,
+  monoTyParamOnlyBareParams,
+  vrFrameOf,
+  vrIndex,
+  vrIndexed,
+  vrInert,
+  vrReadsInert,
+  vrReset,
+} from "./value_reach"
 import {
   FF_CHAIN_LONG,
   FF_PIN_DECLINE,
@@ -13212,81 +13222,27 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
 }
 
 // ── where a generic function value can reach ────────────────────────────────────────────────
-// One question, asked of the tree before the walk rewrites it: can a value reach a place that
-// calls it or observes its signature? A value whose every destination drops it, holds it where
-// no function is read back, or hands it to such a place is inert (D6881, D7000, D7002).
-let mriParent: {[i32]: i32} = Map()
-let mriUses: {[i32]: i32[]} = Map()
-let mriUnres: {[string]: boolean} = Map()
-let mriMemo: {[string]: i32} = Map()
-let mriSeen: {[i32]: boolean} = Map()
+// One question, asked of the tree before the walk rewrites it (`value_reach.vl`): a value whose
+// every destination drops it, holds it where no function is read back, or hands it to such a
+// place is inert (D6881, D7000, D7002).
 
 // Notes inert each name of a generic function in the program `stmts` and the bodies in
-// `fnStmts` whose value reaches nothing that calls or observes it (`monoReachInert`).
+// `fnStmts` whose value reaches nothing that calls or observes it (`vrInert`).
 function monoInertReach(stmts: i32[]) {
-  mriParent = Map()
-  mriUses = Map()
-  mriUnres = Map()
-  mriSeen = Map()
+  vrReset(stmts, true, false)
   const roots: i32[] = []
   for s in stmts { roots.push(s) }
   for f in fnStmts { roots.push(f) }
   monoReachIndex(roots)
 }
 
-// Adds to `monoInertReach`'s tables the subtrees under `roots` not yet in them, such as an
+// Adds to `monoInertReach`'s index the subtrees under `roots` not yet in it, such as an
 // instance's body the walk is about to enter, and notes their inert names (D6930).
 function monoReachIndex(roots: i32[]) {
-  mriMemo = Map()
   const cands: i32[] = []
-  for root in roots {
-    const stack: i32[] = [root]
-    while stack.length > 0 {
-      const ix = stack.pop()
-      if ix >= 0 && ix < P.nodes.length && !(mriSeen[ix] ?? false) {
-        // arena-tick exempt: a side table of this pass, not the arena
-        mriSeen[ix] = true
-        monoReachNoteRead(ix, cands)
-        for ch in nodeChildren(ix) {
-          if ch >= 0 && (mriParent[ch] ?? -1) < 0 {
-            // arena-tick exempt: a side table of this pass, not the arena
-            mriParent[ch] = ix
-          }
-          stack.push(ch)
-        }
-      }
-    }
-  }
+  vrIndex(roots, cands)
   for x in cands {
-    if monoCalleeIsGeneric(x) && monoReachInert(x, "") {
-      monoReachNote(x, false)
-    }
-  }
-  0
-}
-
-// Banks node `ix` for `monoInertReach`: a read under its declaration, a name no declaration
-// answers for, and a read that may name a function as a candidate.
-function monoReachNoteRead(ix: i32, cands: i32[]) {
-  const n = P.nodes[ix]
-  if !(n is Ident) { return 0 }
-  const d = identDeclOf(ix)
-  if d < 0 || d >= P.nodes.length {
-    // arena-tick exempt: a side table of this pass, not the arena
-    mriUnres[n.identName] = true
-    cands.push(ix)
-    return 0
-  }
-  const us = mriUses[d] ?? []
-  us.push(ix)
-  // arena-tick exempt: a side table of this pass, not the arena
-  mriUses[d] = us
-  const dn = P.nodes[d]
-  if dn is FuncDecl {
-    cands.push(ix)
-  } else if dn is LetDecl && dn.letInit >= 0 {
-    const iv = unwrapParen(dn.letInit)
-    if iv >= 0 && P.nodes[iv] is FuncDecl { cands.push(ix) }
+    if monoCalleeIsGeneric(x) && vrInert(x, "") { monoReachNote(x, false) }
   }
   0
 }
@@ -13299,258 +13255,6 @@ function monoReachNote(x: i32, kept: boolean) {
   monoFlowNoteInertLeaf(x)
 }
 
-// Whether value `x`, holding a function at `path` ("" the value itself, `e,` a list element,
-// `f:<name>,` a record field), reaches nothing that calls or observes that function. A cycle
-// answers false.
-function monoReachInert(x: i32, path: string): boolean {
-  if x < 0 || x >= P.nodes.length || path.length > 256 { return false }
-  const key = i32ToStr(x) + "|" + path
-  const m = mriMemo[key] ?? 0
-  if m != 0 { return m == 2 }
-  // arena-tick exempt: a side table of this pass, not the arena
-  mriMemo[key] = 1
-  const r = monoReachStep(x, path)
-  let v = 3
-  if r { v = 2 }
-  // arena-tick exempt: a side table of this pass, not the arena
-  mriMemo[key] = v
-  r
-}
-
-// The step of `monoReachInert` the node holding `x` decides.
-function monoReachStep(x: i32, path: string): boolean {
-  const p = mriParent[x] ?? -1
-  // A module statement's value is dropped.
-  if p < 0 { return i32ListHas(monoProgStmts, x) }
-  const pn = P.nodes[p]
-  match pn {
-    Block => {
-      const k = pn.blkStmts.length
-      if k == 0 || pn.blkStmts[k - 1] != x { return true }
-      return monoReachInert(p, path)
-    }
-    IfStmt => {
-      if x == pn.ifCond { return false }
-      return monoReachInert(p, path)
-    }
-    WhileStmt => {
-      return x == pn.whileBody
-    }
-    ForRange => {
-      return x == pn.frBody
-    }
-    ForIn => {
-      return x == pn.fiBody
-    }
-    FuncDecl => {
-      if x != pn.fnBody { return false }
-      return monoReachFnValue(p, path)
-    }
-    RetStmt => {
-      return monoReachFnValue(monoReachFrameOf(p), path)
-    }
-    Paren => {
-      return monoReachInert(p, path)
-    }
-    ObjLit => {
-      return monoReachInert(p, path)
-    }
-    ArrayLit => {
-      return monoReachInert(p, "e," + path)
-    }
-    FieldInit => {
-      return monoReachInert(p, "f:" + pn.fiName + "," + path)
-    }
-    LetDecl => {
-      if x != pn.letInit || pn.letType >= 0 { return false }
-      return monoReachDecl(p, path)
-    }
-    BinExpr => {
-      return monoReachBin(pn, p, x, path)
-    }
-    Call => {
-      return monoReachArg(pn, x, path)
-    }
-    Member => {
-      return monoReachProp(pn.memProp, p, path)
-    }
-    OptMember => {
-      return monoReachProp(pn.omProp, p, path)
-    }
-    Index => {
-      if x != pn.idxArr || path.slice(0, 2) != "e," { return false }
-      return monoReachInert(p, path.slice(2, path.length))
-    }
-    // reads the value, or holds it where the question does not follow
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
-  }
-  false
-}
-
-// The function declaration holding node `ix`, or -1 at module scope.
-function monoReachFrameOf(ix: i32): i32 {
-  let o = mriParent[ix] ?? -1
-  while o >= 0 && !(P.nodes[o] is FuncDecl) { o = mriParent[o] ?? -1 }
-  o
-}
-
-// The template instance declaration `fd` copies, whose reads are the program's (D6930), or `fd`.
-function monoReachTmplOf(fd: i32): i32 {
-  if fd < 0 { return fd }
-  const it = monoFrameInstTmpl(fd)
-  if it[0] == fd && it[1] >= 0 { return it[1] }
-  fd
-}
-
-// Whether the value function declaration `f0` returns reaches nothing at `path`: it is declared
-// `void`, or its result is inferred, it is no export, and every read of it is a call whose
-// result reaches nothing. An instance answers by its template.
-function monoReachFnValue(f0: i32, path: string): boolean {
-  if f0 < 0 { return false }
-  const f = monoReachTmplOf(f0)
-  if f < 0 || !(mriSeen[f] ?? false) { return false }
-  const fn = P.nodes[f]
-  if !(fn is FuncDecl) { return false }
-  if fn.fnRet >= 0 { return retVoidAnnFlag(fn.fnRet) != 0 }
-  if (
-    fn.fnName == ""
-    || monoNameIsExported(fn.fnName)
-    || declExported(f)
-    || (mriUnres[fn.fnName] ?? false)
-  ) {
-    return false
-  }
-  for u in mriUses[f] ?? [] {
-    let callee = u
-    let c = mriParent[u] ?? -1
-    while c >= 0 && P.nodes[c] is Paren {
-      callee = c
-      c = mriParent[c] ?? -1
-    }
-    if c < 0 { return false }
-    const cn = P.nodes[c]
-    if !(cn is Call) || cn.callFn != callee { return false }
-    if !monoReachInert(c, path) { return false }
-  }
-  true
-}
-
-// Whether every read of the binding or parameter declared at `d`, no export, reaches nothing
-// at `path`; a write's target is no read.
-function monoReachDecl(d: i32, path: string): boolean {
-  const dn = P.nodes[d]
-  let nm = ""
-  if dn is LetDecl { nm = dn.letName }
-  if dn is Param { nm = dn.parName }
-  if (
-    nm == ""
-    || declExported(d)
-    || (mriUnres[nm] ?? false)
-    || !(mriSeen[d] ?? false)
-  ) {
-    return false
-  }
-  if (mriParent[d] ?? -1) < 0 && monoNameIsExported(nm) { return false }
-  for u in mriUses[d] ?? [] {
-    if !monoReachInert(u, path) { return false }
-  }
-  true
-}
-
-// The `BinExpr` arm of `monoReachStep`: a plain write's target is not read, and its value
-// reaches what the binding it writes does, an un-annotated one or a labelled block's carrier.
-function monoReachBin(n: BinExpr, p: i32, x: i32, path: string): boolean {
-  if n.binOp != "=" { return false }
-  if x == n.binLeft { return true }
-  const t = unwrapParen(n.binLeft)
-  if t < 0 || !(P.nodes[t] is Ident) { return false }
-  const d = identDeclOf(t)
-  if d < 0 || d >= P.nodes.length { return false }
-  const dn = P.nodes[d]
-  if dn is LetDecl {
-    if dn.letType >= 0 && dn.letName.slice(0, 3) != "$lv" { return false }
-  } else if dn is Param {
-    if dn.parType >= 0 { return false }
-  } else {
-    return false
-  }
-  monoReachDecl(d, path) && monoReachInert(p, path)
-}
-
-// The `Call` arm of `monoReachStep`: an argument reaches nothing when its parameter is declared
-// a closed type no function fits (D6471) or takes its argument's own type (D6881), and a named
-// callee reads it nowhere that reaches one. Named arguments and a spread before it pair by no
-// position.
-function monoReachArg(n: Call, x: i32, path: string): boolean {
-  if n.callFn == x || hasNamedArgs(n.callArgNames) { return false }
-  let i = 0
-  while i < n.callArgs.length && n.callArgs[i] != x {
-    if P.nodes[n.callArgs[i]] is Spread { return false }
-    i = i + 1
-  }
-  if i >= n.callArgs.length { return false }
-  const t = wsOrigTyOf(n, i)
-  const closed = t >= 0 && !tyHasTyVar(t) && !tyMayHoldFn(t, 0)
-  const cd = monoReachTmplOf(monoCalleeDeclOf(n))
-  if cd < 0 { return closed }
-  const f = P.nodes[cd]
-  if !(f is FuncDecl) || i >= f.fnParams.length { return closed }
-  const pIx = f.fnParams[i]
-  const pp = P.nodes[pIx]
-  if !(pp is Param) || pp.parDefault >= 0 || pp.parRest != 0 { return closed }
-  // A closed parameter type still yields the function to an `is` that widens it (D6701)
-  if !closed && !monoParamIsOpen(f, pIx) { return false }
-  monoReachDecl(pIx, path)
-}
-
-// The member arms of `monoReachStep`: a list's `length` reads no element, and a record's other
-// fields read none of the one holding the function.
-function monoReachProp(prop: string, p: i32, path: string): boolean {
-  if path.slice(0, 2) == "e," { return prop == "length" }
-  if path.slice(0, 2) != "f:" { return false }
-  let k = 2
-  while k < path.length && path.slice(k, k + 1) != "," { k = k + 1 }
-  if path.slice(2, k) != prop { return true }
-  monoReachInert(p, path.slice(k + 1, path.length))
-}
-
-// Whether generic function declaration `fd` is no export and every read of it reaches nothing
-// (`monoReachInert`), so nothing calls it or observes its signature (D6912).
-function monoReachReadsInert(fd: i32): boolean {
-  const f = P.nodes[fd]
-  if (
-    !(f is FuncDecl)
-    || f.fnName == ""
-    || monoNameIsExported(f.fnName)
-    || declExported(fd)
-    || (mriUnres[f.fnName] ?? false)
-    || !(mriSeen[fd] ?? false)
-  ) {
-    return false
-  }
-  for u in mriUses[fd] ?? [] {
-    if !monoReachInert(u, "") { return false }
-  }
-  true
-}
-
-// Whether parameter `pIx` of `f` takes its argument's own type: un-annotated, or annotated by a
-// type parameter that no other parameter, the result, an `is`/`as` or a type argument names (D6910).
-function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
-  const p = P.nodes[pIx]
-  if !(p is Param) { return false }
-  if p.parType < 0 { return true }
-  const tp = monoParamBareTyParam(pIx, f.fnTyParams)
-  if tp == "" { return false }
-  if monoDeclAnnName(p.parType, tyNameOf(p.parType), f.fnTyParams) != tp {
-    return false
-  }
-  for q in f.fnParams {
-    if q != pIx && monoParamBareTyParam(q, f.fnTyParams) == tp { return false }
-  }
-  monoTyParamOnlyBareParams(f, tp)
-}
-
 // Appends block `b`'s last statement to `out`; nothing for an empty block or a non-block.
 function monoBlockTailInto(b: i32, out: i32[]) {
   if b < 0 || b >= P.nodes.length { return 0 }
@@ -13559,15 +13263,6 @@ function monoBlockTailInto(b: i32, out: i32[]) {
     if n.blkStmts.length > 0 { out.push(n.blkStmts[n.blkStmts.length - 1]) }
   }
   0
-}
-
-// The function declaration call `n`'s callee names directly, or -1.
-function monoCalleeDeclOf(n: Call): i32 {
-  const f = unwrapParen(n.callFn)
-  if f < 0 || !(P.nodes[f] is Ident) { return -1 }
-  const d = identDeclOf(f)
-  if d < 0 || d >= P.nodes.length || !(P.nodes[d] is FuncDecl) { return -1 }
-  d
 }
 
 // The refusal for a list of generic functions whose calls give it no one function type.
@@ -13747,34 +13442,6 @@ function monoDeclPathKeysIn(
 ): string[] {
   if rets { return fnFlowDeclPathPinRets(d, path, inst, tmpl) }
   fnFlowDeclPathPinSigs(d, path, inst, tmpl, dead)
-}
-
-// `[instance, template]` for the generic instance frame `fx` is, or the nearest enclosing frame
-// that is one; `[-1, -1]` at module scope or outside any instance.
-function monoFrameInstTmpl(fx: i32): i32[] {
-  const none: i32[] = [0 - 1, 0 - 1]
-  let f = fx
-  let hops = 0
-  while f >= 0 && hops < 8 {
-    const fe = fnStmtsPosOf(f)
-    if fe < 0 || fe >= fnStmts.length { return none }
-    let k = 0
-    while k < monoInstFe.length && k < monoInstOrig.length {
-      if monoInstFe[k] == fe {
-        const o = monoInstOrig[k]
-        if o < 0 || o >= monoOrigNode.length { return none }
-        const out: i32[] = [f, monoOrigNode[o]]
-        return out
-      }
-      k = k + 1
-    }
-    if fe >= fnParent.length { return none }
-    const ps = fnParent[fe]
-    if ps < 0 || ps >= fnStmts.length { return none }
-    f = fnStmts[ps]
-    hops = hops + 1
-  }
-  none
 }
 
 // The frame and declaration (`monoReadLetFrame`) of the `let` read at `at` in frame `ctx`, when
@@ -14693,53 +14360,6 @@ function monoLetSeedMisfits(
   x != "" && x != monoBindOf(tvN, tvV, pt.tyName) && monoPinIsFnTy(pinTy)
 }
 
-// Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
-// in its return type, another annotation, an `is`/`as` or a call's type arguments.
-function monoTyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
-  const tps: string[] = [tp]
-  const bare: i32[] = []
-  for pIx in fn.fnParams {
-    const p = P.nodes[pIx]
-    if p is Param && p.parType >= 0 { bare.push(p.parType) }
-  }
-  const stack: i32[] = []
-  for pIx in fn.fnParams { stack.push(pIx) }
-  stack.push(fn.fnRet)
-  stack.push(fn.fnBody)
-  while stack.length > 0 {
-    const ix = stack.pop()
-    if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
-      if n is TypeRef && monoAnnHasTyParam(n.tyName, tps) {
-        let ok = n.tyName == tp
-        if ok {
-          ok = false
-          for x in bare {
-            if x == ix { ok = true }
-          }
-        }
-        if !ok { return false }
-      }
-      if n is IsExpr && monoAnnHasTyParam(n.isVariant, tps) { return false }
-      if n is AsExpr && monoAnnHasTyParam(n.asTy, tps) { return false }
-      if n is Call && callHasTyArgs(ix) { return false }
-      for c in nodeChildren(ix) { stack.push(c) }
-    }
-  }
-  true
-}
-
-// The type parameter a bare `T` or `T[]` parameter annotation rides, or "".
-function monoParamBareTyParam(pIx: i32, typarams: string[]): string {
-  const p = P.nodes[pIx]
-  if p is Param {
-    if p.parType < 0 { return "" }
-    const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-    return monoTyParamOf(ann, typarams)
-  }
-  ""
-}
-
 // Binds, ahead of `monoInstantiate`'s first-use loop, each type parameter whose first use is
 // an empty list literal (`f([], d)`), from its first use that names an element: that loop
 // would bind it to the literal's `i32[]` default, which the checker never inferred (D2607).
@@ -15640,7 +15260,7 @@ function monoHoleManyPinsFail(par: string, callee: string): i32 {
 }
 
 // The pin for the parameter of template `oDecl` handed `argIx` when the argument, or each element
-// of its list literal, is hole functions whose value reaches nothing (`monoReachInert`): the
+// of its list literal, is hole functions whose value reaches nothing (`vrInert`): the
 // stub's `() -> void` (D6881, D7002), a called one's closure taken unread (D6931, D7000). ""
 // otherwise; `tyOut[0]` takes the type.
 function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
@@ -15664,10 +15284,10 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   const kept: boolean[] = []
   let j = 0
   while j < fes.length {
-    if !monoReachInert(at[j], "") { return "" }
+    if !vrInert(at[j], "") { return "" }
     const g = monoFlowLeafGen(at[j])
     const k = (g >= 0 && monoFlowGenCalled(g))
-      || !monoReachReadsInert(monoOrigNode[fes[j]])
+      || !vrReadsInert(monoOrigNode[fes[j]])
     if !k && monoInstantiatedAny(fes[j]) { return "" }
     kept.push(k)
     j = j + 1
@@ -15767,7 +15387,7 @@ function monoRetValueFns(fd: i32, fes: i32[], at: i32[], depth: i32): boolean {
     const ix = stack.pop()
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
-      if n is RetStmt && monoReachFrameOf(ix) == fd {
+      if n is RetStmt && vrFrameOf(ix) == fd {
         if !monoInertArgFns(n.retArg, fes, at, depth) { return false }
       }
       for ch in nodeChildren(ix) { stack.push(ch) }
@@ -17622,7 +17242,7 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
 // which is what `monoCoerceFnValueName`'s `Block` arm walks to.
 function monoWalkFnBody(fnIx: i32) {
   const fn = P.nodes[fnIx]
-  if !(mriSeen[fnIx] ?? false) {
+  if !vrIndexed(fnIx) {
     const one: i32[] = [fnIx]
     monoReachIndex(one)
   }
@@ -17761,24 +17381,6 @@ function monoNoteRetDeliveriesAt(fn: FuncDecl, fnIx: i32, ann: string) {
     if monoNoteBindDeliveryCall(r, ann, fnIx, -1) < 0 { return -1 }
   }
   0
-}
-
-// Is `name` part of the module's wasm ABI — the public name, or the internal target of a
-// staged export alias? The driver fills `reExpName`/`reExpTarget` before `emitProgram`
-// runs, so both are populated by the time the prune reads them. Both are consulted: the
-// module path's public name may differ from its mangled target.
-function monoNameIsExported(name: string) {
-  let i = 0
-  while i < reExpTarget.length {
-    if reExpTarget[i] == name { return true }
-    i = i + 1
-  }
-  let j = 0
-  while j < reExpName.length {
-    if reExpName[j] == name { return true }
-    j = j + 1
-  }
-  false
 }
 
 // The `fnStmts` position `emitExportSection` would resolve `name` to: the first slot

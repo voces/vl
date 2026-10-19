@@ -1,0 +1,603 @@
+// `value_reach.vl` — where a function value flows: the calls that run it, through the bindings,
+// literals, fields, returns and parameters that hold it. The monomorphizer asks it whether a
+// value is inert (it reaches no call and nothing that observes its signature), and the split
+// plan of `fn_split.vl` asks it which calls a slot serves, so both read one answer (D6880).
+
+import {
+  ArrayLit,
+  AsExpr,
+  BinExpr,
+  Block,
+  BoolLit,
+  BreakStmt,
+  Call,
+  CharLit,
+  ContinueStmt,
+  ErrExpr,
+  FieldDef,
+  FieldInit,
+  ForIn,
+  ForRange,
+  FuncDecl,
+  Ident,
+  IfStmt,
+  ImportDecl,
+  Index,
+  IsExpr,
+  LetDecl,
+  MatchExpr,
+  Member,
+  NullLit,
+  NumLit,
+  ObjLit,
+  OptMember,
+  P,
+  Param,
+  Paren,
+  Program,
+  RetStmt,
+  Spread,
+  StrLit,
+  TypeDecl,
+  TypeRef,
+  Unary,
+  UnionDecl,
+  WhileStmt,
+  callHasTyArgs,
+  declExported,
+  hasNamedArgs,
+  i32ToStr,
+  nodeChildren,
+} from "./ast"
+import { wsOrigTyOf } from "./check_demands"
+import { tyMayHoldFn } from "./check_types"
+import {
+  monoAnnHasTyParam,
+  monoDeclAnnName,
+  monoTyParamOf,
+  retVoidAnnFlag,
+  tyNameOf,
+  unwrapParen,
+} from "./emit_base"
+import { fnStmtsPosOf } from "./emit_capture_frames"
+import {
+  fnParent,
+  fnStmts,
+  monoInstFe,
+  monoInstOrig,
+  monoOrigNode,
+  reExpName,
+  reExpTarget,
+} from "./emit_state"
+import { i32ListHas } from "./listutil"
+
+import { identDeclOf } from "./symbols"
+import { tyHasTyVar } from "./tyquery"
+
+let vrParent: {[i32]: i32} = Map()
+let vrUses: {[i32]: i32[]} = Map()
+let vrUnres: {[string]: boolean} = Map()
+let vrMemoState: {[string]: i32} = Map()
+let vrMemoVal: {[string]: i32[]} = Map()
+let vrSeen: {[i32]: boolean} = Map()
+let vrStmts: i32[] = []
+let vrInst = false
+let vrExact = false
+
+// Starts a new question over the module statements `stmts`, whose values are dropped. With
+// `inst` an instance function answers by its template's reads; with `exact` every call answered
+// runs this value alone, so a join, a write, a parameter or an unnamed element position is lost.
+export function vrReset(stmts: i32[], inst: boolean, exact: boolean) {
+  vrParent = Map()
+  vrUses = Map()
+  vrUnres = Map()
+  vrSeen = Map()
+  vrMemoState = Map()
+  vrMemoVal = Map()
+  vrStmts = stmts
+  vrInst = inst
+  vrExact = exact
+  0
+}
+
+// Adds the subtrees under `roots` not yet indexed, and pushes to `cands` each read in them that
+// may name a function: a declared function, a binding a lambda initializes, or an unknown name.
+export function vrIndex(roots: i32[], cands: i32[]) {
+  vrMemoState = Map()
+  vrMemoVal = Map()
+  for root in roots {
+    const stack: i32[] = [root]
+    while stack.length > 0 {
+      const ix = stack.pop()
+      if ix >= 0 && ix < P.nodes.length && !(vrSeen[ix] ?? false) {
+        // arena-tick exempt: a side table of this pass, not the arena
+        vrSeen[ix] = true
+        vrNoteRead(ix, cands)
+        for ch in nodeChildren(ix) {
+          if ch >= 0 && (vrParent[ch] ?? -1) < 0 {
+            // arena-tick exempt: a side table of this pass, not the arena
+            vrParent[ch] = ix
+          }
+          stack.push(ch)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Whether node `ix` is in the index.
+export function vrIndexed(ix: i32): boolean { vrSeen[ix] ?? false }
+
+function vrNoteRead(ix: i32, cands: i32[]) {
+  const n = P.nodes[ix]
+  if !(n is Ident) { return 0 }
+  const d = identDeclOf(ix)
+  if d < 0 || d >= P.nodes.length {
+    // arena-tick exempt: a side table of this pass, not the arena
+    vrUnres[n.identName] = true
+    cands.push(ix)
+    return 0
+  }
+  const us = vrUses[d] ?? []
+  us.push(ix)
+  // arena-tick exempt: a side table of this pass, not the arena
+  vrUses[d] = us
+  const dn = P.nodes[d]
+  if dn is FuncDecl {
+    cands.push(ix)
+  } else if dn is LetDecl && dn.letInit >= 0 {
+    const iv = unwrapParen(dn.letInit)
+    if iv >= 0 && P.nodes[iv] is FuncDecl { cands.push(ix) }
+  }
+  0
+}
+
+// Whether value `x`, holding a function at `path`, reaches no call and nothing that observes it.
+export function vrInert(x: i32, path: string): boolean {
+  vrCalls(x, path).length == 0
+}
+
+// The calls value `x` reaches with the function it holds at `path` ("" the value itself, `e,` or
+// `e<k>,` a list element, `f:<name>,` a record field) at their callee position; [-1] when it
+// reaches a place the question does not follow. A cycle answers [-1].
+export function vrCalls(x: i32, path: string): i32[] {
+  if x < 0 || x >= P.nodes.length || path.length > 256 { return vrLost() }
+  const key = i32ToStr(x) + "|" + path
+  const m = vrMemoState[key] ?? 0
+  if m == 1 { return vrLost() }
+  if m == 2 { return vrMemoVal[key] ?? vrLost() }
+  // arena-tick exempt: a side table of this pass, not the arena
+  vrMemoState[key] = 1
+  const r = vrStep(x, path)
+  // arena-tick exempt: a side table of this pass, not the arena
+  vrMemoVal[key] = r
+  // arena-tick exempt: a side table of this pass, not the arena
+  vrMemoState[key] = 2
+  r
+}
+
+// Whether call list `cs` holds a place the question does not follow.
+export function vrLostIn(cs: i32[]): boolean { cs.length > 0 && cs[0] < 0 }
+
+function vrLost(): i32[] { [-1] }
+
+// Adds the calls `add` to `acc`; false when `add` is lost, which loses `acc` too.
+function vrJoin(acc: i32[], add: i32[]): boolean {
+  if vrLostIn(add) { return false }
+  for c in add {
+    if !i32ListHas(acc, c) { acc.push(c) }
+  }
+  true
+}
+
+// The step of `vrCalls` the node holding `x` decides.
+function vrStep(x: i32, path: string): i32[] {
+  const none: i32[] = []
+  const p = vrParent[x] ?? -1
+  // A module statement's value is dropped.
+  if p < 0 {
+    if i32ListHas(vrStmts, x) { return none }
+    return vrLost()
+  }
+  const pn = P.nodes[p]
+  match pn {
+    Block => {
+      const k = pn.blkStmts.length
+      if k == 0 || pn.blkStmts[k - 1] != x { return none }
+      return vrCalls(p, path)
+    }
+    IfStmt => {
+      if x == pn.ifCond || vrExact { return vrLost() }
+      return vrCalls(p, path)
+    }
+    WhileStmt => {
+      if x == pn.whileBody { return none }
+    }
+    ForRange => {
+      if x == pn.frBody { return none }
+    }
+    ForIn => {
+      if x == pn.fiBody { return none }
+    }
+    FuncDecl => {
+      if x == pn.fnBody && !vrExact { return vrFnValue(p, path) }
+    }
+    RetStmt => {
+      if !vrExact { return vrFnValue(vrFrameOf(p), path) }
+    }
+    Paren => {
+      return vrCalls(p, path)
+    }
+    ObjLit => {
+      return vrCalls(p, path)
+    }
+    ArrayLit => {
+      return vrCalls(p, vrElemToken(pn.arrElems, x) + path)
+    }
+    FieldInit => {
+      return vrCalls(p, "f:" + pn.fiName + "," + path)
+    }
+    LetDecl => {
+      if x == pn.letInit && pn.letType < 0 { return vrDecl(p, path) }
+    }
+    BinExpr => {
+      if !vrExact { return vrBin(pn, p, x, path) }
+    }
+    Call => {
+      if pn.callFn == x {
+        if path != "" { return vrLost() }
+        const one: i32[] = [p]
+        return one
+      }
+      if !vrExact { return vrArg(pn, x, path) }
+    }
+    Member => {
+      return vrProp(pn.memProp, p, path)
+    }
+    OptMember => {
+      return vrProp(pn.omProp, p, path)
+    }
+    Index => {
+      if x == pn.idxArr { return vrIndexRead(pn.idxIndex, p, path) }
+    }
+    // reads the value, or holds it where the question does not follow
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
+  }
+  vrLost()
+}
+
+// The path token of element `x` of a list literal with elements `es`: `e<k>,` at a position no
+// spread before it moves, else `e,`.
+function vrElemToken(es: i32[], x: i32): string {
+  let i = 0
+  while i < es.length && es[i] != x {
+    if P.nodes[es[i]] is Spread { return "e," }
+    i = i + 1
+  }
+  "e" + i32ToStr(i) + ","
+}
+
+// The element position a path starting `e<k>,` names, -1 for `e,`, -2 for no element path; the
+// rest of the path after the token goes to `vrPathRest`.
+let vrPathRest = ""
+function vrElemOf(path: string): i32 {
+  if path.slice(0, 1) != "e" { return -2 }
+  let k = 1
+  while k < path.length && path.slice(k, k + 1) != "," { k = k + 1 }
+  if k >= path.length { return -2 }
+  vrPathRest = path.slice(k + 1, path.length)
+  if k == 1 { return -1 }
+  vrLitIndex(path.slice(1, k))
+}
+
+// The value of decimal digits `s`, or -1.
+function vrLitIndex(s: string): i32 {
+  if s.length == 0 || s.length > 6 { return -1 }
+  let v = 0
+  for ch in s {
+    if ch < "0"[0] || ch > "9"[0] { return -1 }
+    v = v * 10 + (ch - "0"[0])
+  }
+  v
+}
+
+// The `Index` arm of `vrStep`: an element is read, and with `exact` only by a literal index,
+// which reads none of the elements at other positions.
+function vrIndexRead(ix: i32, p: i32, path: string): i32[] {
+  const at = vrElemOf(path)
+  if at == -2 { return vrLost() }
+  const rest = vrPathRest
+  if vrExact {
+    const n = P.nodes[ix]
+    if at < 0 || !(n is NumLit) || vrLitIndex(n.numText) < 0 { return vrLost() }
+    if vrLitIndex(n.numText) != at {
+      const none: i32[] = []
+      return none
+    }
+  }
+  vrCalls(p, rest)
+}
+
+// The function declaration holding node `ix`, or -1 at module scope.
+export function vrFrameOf(ix: i32): i32 {
+  let o = vrParent[ix] ?? -1
+  while o >= 0 && !(P.nodes[o] is FuncDecl) { o = vrParent[o] ?? -1 }
+  o
+}
+
+// The template instance declaration `fd` copies, whose reads are the program's (D6930), or `fd`.
+function vrTmplOf(fd: i32): i32 {
+  if fd < 0 || !vrInst { return fd }
+  const it = monoFrameInstTmpl(fd)
+  if it[0] == fd && it[1] >= 0 { return it[1] }
+  fd
+}
+
+// The calls the value function declaration `f0` returns reaches at `path`: none when it is
+// declared `void`; else, when its result is inferred and it is no export, those each of its
+// calls' results reaches. Every other read of it is lost. An instance answers by its template.
+function vrFnValue(f0: i32, path: string): i32[] {
+  const out: i32[] = []
+  const f = vrTmplOf(f0)
+  if f < 0 || !(vrSeen[f] ?? false) { return vrLost() }
+  const fn = P.nodes[f]
+  if !(fn is FuncDecl) { return vrLost() }
+  if fn.fnRet >= 0 {
+    if retVoidAnnFlag(fn.fnRet) != 0 { return out }
+    return vrLost()
+  }
+  if (
+    fn.fnName == ""
+    || monoNameIsExported(fn.fnName)
+    || declExported(f)
+    || (vrUnres[fn.fnName] ?? false)
+  ) {
+    return vrLost()
+  }
+  for u in vrUses[f] ?? [] {
+    let callee = u
+    let c = vrParent[u] ?? -1
+    while c >= 0 && P.nodes[c] is Paren {
+      callee = c
+      c = vrParent[c] ?? -1
+    }
+    if c < 0 { return vrLost() }
+    const cn = P.nodes[c]
+    if !(cn is Call) || cn.callFn != callee { return vrLost() }
+    if !vrJoin(out, vrCalls(c, path)) { return vrLost() }
+  }
+  out
+}
+
+// The calls every read of the binding or parameter declared at `d`, no export, reaches at
+// `path`; a write's target is no read. With `exact` only a `const` binding answers.
+function vrDecl(d: i32, path: string): i32[] {
+  const out: i32[] = []
+  const dn = P.nodes[d]
+  let nm = ""
+  if dn is LetDecl && (dn.letKw == "const" || !vrExact) { nm = dn.letName }
+  if dn is Param && !vrExact { nm = dn.parName }
+  if (
+    nm == ""
+    || declExported(d)
+    || (vrUnres[nm] ?? false)
+    || !(vrSeen[d] ?? false)
+  ) {
+    return vrLost()
+  }
+  if (vrParent[d] ?? -1) < 0 && monoNameIsExported(nm) { return vrLost() }
+  for u in vrUses[d] ?? [] {
+    if !vrJoin(out, vrCalls(u, path)) { return vrLost() }
+  }
+  out
+}
+
+// The `BinExpr` arm of `vrStep`: a plain write's target is not read, and its value reaches what
+// the binding it writes does, an un-annotated one or a labelled block's carrier.
+function vrBin(n: BinExpr, p: i32, x: i32, path: string): i32[] {
+  const out: i32[] = []
+  if n.binOp != "=" { return vrLost() }
+  if x == n.binLeft { return out }
+  const t = unwrapParen(n.binLeft)
+  if t < 0 || !(P.nodes[t] is Ident) { return vrLost() }
+  const d = identDeclOf(t)
+  if d < 0 || d >= P.nodes.length { return vrLost() }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 && dn.letName.slice(0, 3) != "$lv" { return vrLost() }
+  } else if dn is Param {
+    if dn.parType >= 0 { return vrLost() }
+  } else {
+    return vrLost()
+  }
+  if !vrJoin(out, vrDecl(d, path)) || !vrJoin(out, vrCalls(p, path)) {
+    return vrLost()
+  }
+  out
+}
+
+// The `Call` arm of `vrStep` for an argument: none when its parameter is declared a closed type
+// no function fits (D6471); the calls its reads reach when it takes its argument's own type
+// (D6881). Named arguments and a spread before it pair by no position.
+function vrArg(n: Call, x: i32, path: string): i32[] {
+  const none: i32[] = []
+  if hasNamedArgs(n.callArgNames) { return vrLost() }
+  let i = 0
+  while i < n.callArgs.length && n.callArgs[i] != x {
+    if P.nodes[n.callArgs[i]] is Spread { return vrLost() }
+    i = i + 1
+  }
+  if i >= n.callArgs.length { return vrLost() }
+  const t = wsOrigTyOf(n, i)
+  const closed = t >= 0 && !tyHasTyVar(t) && !tyMayHoldFn(t, 0)
+  const cd = vrTmplOf(monoCalleeDeclOf(n))
+  if cd >= 0 && cd < P.nodes.length {
+    const f = P.nodes[cd]
+    if f is FuncDecl && i < f.fnParams.length {
+      const pIx = f.fnParams[i]
+      const pp = P.nodes[pIx]
+      if pp is Param && pp.parDefault < 0 && pp.parRest == 0 {
+        // A closed parameter type still yields the function to an `is` that widens it (D6701)
+        if !closed && !monoParamIsOpen(f, pIx) { return vrLost() }
+        return vrDecl(pIx, path)
+      }
+    }
+  }
+  if closed { return none }
+  vrLost()
+}
+
+// The member arms of `vrStep`: a list's `length` reads no element, and a record's other fields
+// read none of the one holding the function.
+function vrProp(prop: string, p: i32, path: string): i32[] {
+  const none: i32[] = []
+  if vrElemOf(path) != -2 {
+    if prop == "length" { return none }
+    return vrLost()
+  }
+  if path.slice(0, 2) != "f:" { return vrLost() }
+  let k = 2
+  while k < path.length && path.slice(k, k + 1) != "," { k = k + 1 }
+  if path.slice(2, k) != prop { return none }
+  vrCalls(p, path.slice(k + 1, path.length))
+}
+
+// Whether function declaration `fd` is no export and every read of it reaches nothing
+// (`vrInert`), so nothing calls it or observes its signature (D6912).
+export function vrReadsInert(fd: i32): boolean {
+  const f = P.nodes[fd]
+  if (
+    !(f is FuncDecl)
+    || f.fnName == ""
+    || monoNameIsExported(f.fnName)
+    || declExported(fd)
+    || (vrUnres[f.fnName] ?? false)
+    || !(vrSeen[fd] ?? false)
+  ) {
+    return false
+  }
+  for u in vrUses[fd] ?? [] {
+    if !vrInert(u, "") { return false }
+  }
+  true
+}
+
+// Whether parameter `pIx` of `f` takes its argument's own type: un-annotated, or annotated by a
+// type parameter that no other parameter, the result, an `is`/`as` or a type argument names (D6910).
+function monoParamIsOpen(f: FuncDecl, pIx: i32): boolean {
+  const p = P.nodes[pIx]
+  if !(p is Param) { return false }
+  if p.parType < 0 { return true }
+  const tp = monoParamBareTyParam(pIx, f.fnTyParams)
+  if tp == "" { return false }
+  if monoDeclAnnName(p.parType, tyNameOf(p.parType), f.fnTyParams) != tp {
+    return false
+  }
+  for q in f.fnParams {
+    if q != pIx && monoParamBareTyParam(q, f.fnTyParams) == tp { return false }
+  }
+  monoTyParamOnlyBareParams(f, tp)
+}
+
+// The function declaration call `n`'s callee names directly, or -1.
+export function monoCalleeDeclOf(n: Call): i32 {
+  const f = unwrapParen(n.callFn)
+  if f < 0 || !(P.nodes[f] is Ident) { return -1 }
+  const d = identDeclOf(f)
+  if d < 0 || d >= P.nodes.length || !(P.nodes[d] is FuncDecl) { return -1 }
+  d
+}
+
+// `[instance, template]` for the generic instance frame `fx` is, or the nearest enclosing frame
+// that is one; `[-1, -1]` at module scope or outside any instance.
+export function monoFrameInstTmpl(fx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  let f = fx
+  let hops = 0
+  while f >= 0 && hops < 8 {
+    const fe = fnStmtsPosOf(f)
+    if fe < 0 || fe >= fnStmts.length { return none }
+    let k = 0
+    while k < monoInstFe.length && k < monoInstOrig.length {
+      if monoInstFe[k] == fe {
+        const o = monoInstOrig[k]
+        if o < 0 || o >= monoOrigNode.length { return none }
+        const out: i32[] = [f, monoOrigNode[o]]
+        return out
+      }
+      k = k + 1
+    }
+    if fe >= fnParent.length { return none }
+    const ps = fnParent[fe]
+    if ps < 0 || ps >= fnStmts.length { return none }
+    f = fnStmts[ps]
+    hops = hops + 1
+  }
+  none
+}
+
+// Whether `fn` names type parameter `tp` only as the whole annotation of some parameters: not
+// in its return type, another annotation, an `is`/`as` or a call's type arguments.
+export function monoTyParamOnlyBareParams(fn: FuncDecl, tp: string): boolean {
+  const tps: string[] = [tp]
+  const bare: i32[] = []
+  for pIx in fn.fnParams {
+    const p = P.nodes[pIx]
+    if p is Param && p.parType >= 0 { bare.push(p.parType) }
+  }
+  const stack: i32[] = []
+  for pIx in fn.fnParams { stack.push(pIx) }
+  stack.push(fn.fnRet)
+  stack.push(fn.fnBody)
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 && ix < P.nodes.length {
+      const n = P.nodes[ix]
+      if n is TypeRef && monoAnnHasTyParam(n.tyName, tps) {
+        let ok = n.tyName == tp
+        if ok {
+          ok = false
+          for x in bare {
+            if x == ix { ok = true }
+          }
+        }
+        if !ok { return false }
+      }
+      if n is IsExpr && monoAnnHasTyParam(n.isVariant, tps) { return false }
+      if n is AsExpr && monoAnnHasTyParam(n.asTy, tps) { return false }
+      if n is Call && callHasTyArgs(ix) { return false }
+      for c in nodeChildren(ix) { stack.push(c) }
+    }
+  }
+  true
+}
+
+// The type parameter a bare `T` or `T[]` parameter annotation rides, or "".
+export function monoParamBareTyParam(pIx: i32, typarams: string[]): string {
+  const p = P.nodes[pIx]
+  if p is Param {
+    if p.parType < 0 { return "" }
+    const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
+    return monoTyParamOf(ann, typarams)
+  }
+  ""
+}
+
+// Is `name` part of the module's wasm ABI — the public name, or the internal target of a
+// staged export alias? The driver fills `reExpName`/`reExpTarget` before `emitProgram`
+// runs, so both are populated by the time the prune reads them. Both are consulted: the
+// module path's public name may differ from its mangled target.
+export function monoNameIsExported(name: string) {
+  let i = 0
+  while i < reExpTarget.length {
+    if reExpTarget[i] == name { return true }
+    i = i + 1
+  }
+  let j = 0
+  while j < reExpName.length {
+    if reExpName[j] == name { return true }
+    j = j + 1
+  }
+  false
+}
