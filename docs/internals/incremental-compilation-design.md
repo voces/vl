@@ -2043,6 +2043,108 @@ Peak RSS on `compiler std scripts` is 4.29 → 4.79 GB. The seed is 6,369,605 �
 (+1.15%) and is its own fixpoint. L2 fuel is 110,911,819,799 → 111,654,195,366 (+0.67%), and
 this seed on master's source reads 110,911,820,216, so the unarmed path costs nothing.
 
+*Step 13, second round: cost, two widenings, and a served flag that leaked.*
+
+The byte-identity claim above was wrong for the pool. `vl check compiler` under
+`VL_JOBS>1` dropped 9 hint rows nondeterministically, on the round-one seed as well. A root
+with no imports is checked as a single source (`modKeys.length == 0`) and never reaches
+`wiServe`. The served flag and banked keys are reset inside `wiServe`, so they survived from
+the worker's previous root, and the CLI printed that root's empty served rows in place of the
+import-free root's own. The reset now runs in `checkSrc` after `pipelineReset`, for every
+check. The test "an import-free check after a served one is its own" fails on the old code.
+After the fix, stdout matches master's `VL_JOBS=1` output on `compiler` at 2 jobs (3 runs)
+and 6 jobs, `compiler std scripts` at 6 jobs (2 runs), and heregeat `src` at 6 jobs (3 runs).
+The chain and chain-with-tests graphs also match.
+
+Cost cuts:
+
+- The full interface hash is lazy (`ihSetLean`, `ihFullOf`). A check that only arms the
+  within-invocation bank, and not the commit skip, hashes a statement fully only when a
+  guard reads it.
+- `ihAmbientIndex` is built on the first ambient read of a bank pass (`wiIndexed`). Before,
+  `wiPrep` built it on every pass.
+- `modIfaceBegin` buckets the visible and exported names per module in one pass over the
+  import and export rows. Before, it rescanned them per module.
+- Culprit memo (`wiCulprits`, `wiNever`, `wiTry`). A decline records the module its guard
+  named: the ambient statement's module, or every graph for `entry`. A later graph that
+  holds that module does not try the target again.
+
+Widenings, each with a must-decline control in `tests/vl_check_within_test.ts`:
+
+- `ambient`, twin half (`ihTwinShape`, mask 512). A plain record declaration outside G whose
+  fields are all built-in scalars hashes to a shape. When G declares the same shape and T
+  holds no stream row, the declaration adds no meet. Same-shape records are one type
+  (D3870), so the outside declaration names a type G already has.
+  - Must serve: an importer's `Q = { x: i32, tag: string }` beside G's
+    `P = { x: i32, tag: string }`.
+  - Must decline: the same graph where T reads `(p ?? p).x`, a stream row that could render
+    either name.
+  - Must decline: `Q` with `x: f64`.
+  - Dropping the scalar test changed nothing on any graph, so lists stay out.
+- `demand`, kept half (`skCallsOnly`, mask 1024). An import of a closed generic is admitted
+  when the importer names it only as the callee of a call. Its instances are then made at
+  argument types G's own check holds.
+  - Must serve: `wrap<T>` called by both the importer and G.
+  - Must decline: the importer binds `const f = wrap`.
+
+Single masks on heregeat after these widenings:
+
+| mask dropped | served | unsound |
+| --- | --- | --- |
+| render (128) | 42 | 0 |
+| arena (64) | 40 | 0 |
+| ambient (16) | 56 | 2 |
+
+The two unsound targets under mask 16 are `cast.vl` and `packs.vl`: their rows reorder,
+because an outside declaration changes which name a message renders. FIELDS rows dropped
+(`--ih 524288`) serve 46 at 0 unsound, so the arena and FIELDS halves are where further
+widening is, behind a witness for each.
+
+*Served and declined* (wi2, one armed instance, 0 unsound in every row; a heregeat copy
+taken 2026-10-19 has 80 targets):
+
+| graph | targets | served | unseen | ambient | demand |
+| --- | --- | --- | --- | --- | --- |
+| chain | 60 | 59 | 1 | 0 | 0 |
+| chain + 12 tests | 72 | 59 | 13 | 0 | 0 |
+| chain, unique fields | 60 | 59 | 1 | 0 | 0 |
+| same + 12 tests | 72 | 59 | 13 | 0 | 0 |
+| heregeat `src` (copy) | 80 | 34 | 22 | 22 | 2 |
+| `compiler` | 218 | 65 | 1 | 30 | 122 |
+| `compiler std scripts` | 11,524 | 75 | 11,288 | 39 | 122 |
+
+Round one on the same heregeat copy served 23, with 7 `ambient` and 28 `demand`. With two
+instances, as the pool runs `compiler`, the replay reads 37 served, 144 `demand`, 34
+`ambient` and 3 `unseen`. A target is served only when its importer ran earlier on the same
+worker.
+
+*Cost, second round.* `vl check` user CPU and peak RSS, master's seed → this seed, median
+of 3 (the `compiler` rows run under the default pool):
+
+| graph | master CPU | this CPU | master RSS | this RSS |
+| --- | --- | --- | --- | --- |
+| chain | 0.11 s | 0.03 s | 159 MB | 92 MB |
+| chain + 12 tests | 0.17 s | 0.10 s | 207 MB | 141 MB |
+| chain, unique fields | 0.11 s | 0.03 s | 159 MB | 92 MB |
+| same + 12 tests | 0.16 s | 0.10 s | 208 MB | 141 MB |
+| heregeat `src` | 3.68 s | 2.80 s | 588 MB | 604 MB |
+| `compiler` | 182.78 s | 185.39 s | 4.26 GB | 4.52 GB |
+| `compiler`, `VL_JOBS=1` (1 run) | 175.83 s | 172.58 s | 2.16 GB | 2.16 GB |
+| `compiler std scripts` | 221.17 s | 212.36 s | 4.29 GB | 4.79 GB |
+
+The runs alternated seeds at load averages of 3 to 30, so the `compiler` rows differ within
+their spread:
+
+- `compiler`: master 177.6–184.7 s, this seed 180.3–244.0 s (the high run at load 29).
+- `compiler std scripts`: master 194.5–232.0 s, this seed 201.5–287.5 s.
+
+The RSS growth is not the banks. Serially, peak RSS is equal to the kilobyte. Under the pool
+it grows, and the likely cause is that importers-first order puts a large graph on every
+worker. That cause is inferred, not measured. Cutting it is a scheduling change, and it is
+not in this round. The seed is 6,449,066 bytes against master's 6,369,605 (+1.25%) and is
+its own fixpoint. L2 fuel is 110,998,273,062 → 111,577,168,627 (+0.52%). This seed on
+master's source reads 110,998,273,602, so the unarmed path still costs nothing.
+
 *What a per-module compile artifact needs from codegen.* `VL_COMPILE_CACHE=1` keys a build
 on its entry's whole closure, so 12 test files over one graph share nothing. A per-module
 artifact keyed on (own source, imports' interface hashes, banked demands) cannot be the

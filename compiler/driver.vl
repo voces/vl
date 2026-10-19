@@ -295,6 +295,7 @@ import {
   ihPlainBinding,
   ihPosHash,
   ihReachOf,
+  ihSetLean,
   ihSourceName,
   ihStKeysOf,
   ihTextSetHash,
@@ -1415,6 +1416,10 @@ export function checkSrc(): i32 {
   plusLinksClear()
   symSetEnabled(0)
   pipelineReset()
+  // Every check starts unserved and unbanked, an import-free one included.
+  wiServedLast = false
+  wiBankedKeys = []
+  wiBankedMods = []
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
   if modKeys.length > 0 {
     if wiServe() { return 0 }
@@ -5020,7 +5025,28 @@ function modMergeRoots(roots: i32[], keep: boolean[]): i32 {
 // each module's token range, the locals its imports bind, its exports, and its import edges.
 function modIfaceBegin(roots: i32[], tokEnd: i32) {
   ihBegin(modKeys)
+  ihSetLean(wiOwnsIh && !skArmed)
+  const visibleOf: string[][] = []
+  const exportedOf: string[][] = []
+  for _ in modKeys {
+    visibleOf.push([])
+    exportedOf.push([])
+  }
   let k = 0
+  while k < impMod.length {
+    const im = impMod[k]
+    if im >= 0 && im < visibleOf.length && impLocal[k] != "" {
+      visibleOf[im].push(impLocal[k])
+    }
+    k = k + 1
+  }
+  k = 0
+  while k < expMod.length {
+    const em = expMod[k]
+    if em >= 0 && em < exportedOf.length { exportedOf[em].push(expName[k]) }
+    k = k + 1
+  }
+  k = 0
   while k < impMod.length {
     const to = modIndexOfKey(impKey[k])
     if to >= 0 {
@@ -5040,17 +5066,11 @@ function modIfaceBegin(roots: i32[], tokEnd: i32) {
     const m = modOrder[o]
     let hi = tokEnd
     if o + 1 < modLoadStart.length { hi = modLoadStart[o + 1] }
-    const visible: string[] = []
-    let i = 0
-    while i < impMod.length {
-      if impMod[i] == m && impLocal[i] != "" { visible.push(impLocal[i]) }
-      i = i + 1
-    }
-    const exported: string[] = []
-    let e = 0
-    while e < expMod.length {
-      if expMod[e] == m { exported.push(expName[e]) }
-      e = e + 1
+    let visible: string[] = []
+    let exported: string[] = []
+    if m >= 0 && m < visibleOf.length {
+      visible = visibleOf[m]
+      exported = exportedOf[m]
     }
     ihModule(m, roots[o], modLoadStart[o], hi, visible, exported)
     o = o + 1
@@ -5485,6 +5505,11 @@ function skKept(o: i32, merged: string, moved: boolean[], root: i32): boolean {
     }
   }
   if (mask & SK_NO_KEPT_CALL) != 0 { return true }
+  skCallsOnly(root, merged)
+}
+
+// Whether the module rooted at `root` names `merged` only as the callee of a call.
+function skCallsOnly(root: i32, merged: string): boolean {
   const stack: i32[] = [root]
   while stack.length > 0 {
     const ix = stack.pop() ?? -1
@@ -6461,6 +6486,13 @@ let wiPending: {[string]: i32} = Map()
 let wiBanks: {[string]: WiBank} = Map()
 // Per target key, why the last importer's check did not bank it.
 let wiWhy: {[string]: i32} = Map()
+// Per target key, the modules outside its closure a guard named when it declined; a graph
+// holding one of them does not try the target again. A target in `wiNever` is never tried.
+let wiCulprits: {[string]: string[]} = Map()
+let wiNever: {[string]: boolean} = Map()
+// The module the last `wiGuard` decline named (-1 none, `WI_ANY` every graph).
+let wiCulprit = -1
+const WI_ANY = -2
 let wiStats: i32[] = []
 let wiServedLast = false
 let wiBankedKeys: string[] = []
@@ -6470,6 +6502,8 @@ let wiBankedMods: i32[] = []
 let wiDeps: i32[][] = []
 let wiNow: {[string]: {[string]: i32}} = Map()
 let wiAsksAll: string[] = []
+// Whether this bank pass has built the ambient index (`ihAmbientIndex`), on its first ambient read.
+let wiIndexed = false
 // Per import row of the check: the module it reads (-1 unresolved), the origin module of the
 // name it binds (-1 for a namespace import), and whether `skClosed` shuts it (-1 not yet asked).
 let wiImpTo: i32[] = []
@@ -6486,6 +6520,8 @@ const WI_NO_ASKS = 32
 const WI_NO_ARENA = 64
 const WI_NO_RENDER = 128
 const WI_NO_ADOPTED = 256
+const WI_NO_TWIN = 512
+const WI_NO_KEPT = 1024
 // The delivery flags whose judgement reads every site of the value: kept, or site-counted.
 const WI_COUNTED = 5
 
@@ -6500,6 +6536,8 @@ export function wiArm(on: i32, mask: i32): i32 {
   wiPending = Map()
   wiBanks = Map()
   wiWhy = Map()
+  wiCulprits = Map()
+  wiNever = Map()
   wiStats = []
   let r = 0
   while r < WI_REASONS {
@@ -6522,11 +6560,22 @@ function wiLive(): boolean {
   if !wiOn { return false }
   let m = 1
   while m < modKeys.length {
-    const key = modKeys[m]
-    if ((wiPending[key] ?? 0) == 1 && !wiBanks.has(key)) { return true }
+    if wiTry(modKeys[m]) { return true }
     m = m + 1
   }
   false
+}
+
+// Whether this graph may bank target `key`: it is pending, not banked, and the graph holds no
+// module an earlier decline of it named.
+function wiTry(key: string): boolean {
+  if (wiPending[key] ?? 0) != 1 || wiBanks.has(key) || wiNever.has(key) {
+    return false
+  }
+  for c in wiCulprits[key] ?? [] {
+    if modIndexOfKey(c) >= 0 { return false }
+  }
+  true
 }
 
 // Name `key` (a module key, as the target's own check commits it) a target of this invocation.
@@ -6560,9 +6609,6 @@ export function wiBankedMod(i: i32): i32 { wiBankedMods[i] }
 
 // Before a module check: serve the entry from its bank when that bank holds exactly this graph.
 function wiServe(): boolean {
-  wiServedLast = false
-  wiBankedKeys = []
-  wiBankedMods = []
   if !wiOn || modKeys.length == 0 { return false }
   const key = modKeys[0]
   if (wiPending[key] ?? 0) == 0 { return false }
@@ -6621,17 +6667,30 @@ function wiBankWhole(roots: i32[]): i32 {
   let m = 1
   while m < modKeys.length {
     const key = modKeys[m]
-    if ((wiPending[key] ?? 0) == 1 && !wiBanks.has(key)) {
+    if wiTry(key) {
       let why = WI_DIRTY
       if clean && !ready {
         wiPrep()
         ready = true
       }
+      wiCulprit = -1
       if clean { why = wiGuard(m, roots, pos) }
-      if why == WI_SERVED { wiBankOne(m) } else { wiWhy[key] = why }
+      if why == WI_SERVED { wiBankOne(m) } else { wiBlame(key, why) }
     }
     m = m + 1
   }
+  0
+}
+
+// Record the reason a guard declined target `key` and the module it named, so no later graph
+// holding that module tries it again.
+function wiBlame(key: string, why: i32): i32 {
+  wiWhy[key] = why
+  if wiCulprit == WI_ANY { wiNever[key] = true }
+  if wiCulprit < 0 || wiCulprit >= modKeys.length { return 0 }
+  const cs = wiCulprits[key] ?? []
+  cs.push(modKeys[wiCulprit])
+  wiCulprits[key] = cs
   0
 }
 
@@ -6674,7 +6733,7 @@ function wiPrep(): i32 {
   }
   wiNow = skDelivNow()
   wiAsksAll = skAsksNow([])
-  ihAmbientIndex()
+  wiIndexed = false
   0
 }
 
@@ -6707,6 +6766,7 @@ function wiClosure(t: i32): boolean[] {
 function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
   const inG = wiClosure(t)
   if (wiMask & WI_NO_ENTRY) == 0 && !wiEntryNeutral(t, roots[pos[t]]) {
+    wiCulprit = WI_ANY
     return WI_ENTRY
   }
   if (wiMask & WI_NO_DEMAND) == 0 && !wiDemandShut(inG, roots, pos) {
@@ -6717,14 +6777,23 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
     return WI_WRITER
   }
   if (wiMask & WI_NO_AMBIENT) == 0 {
+    if !wiIndexed {
+      ihAmbientIndex()
+      wiIndexed = true
+    }
+    const rows = (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(t)
     const meets = ihAmbientMeetsIn(
       inG,
       (wiMask & WI_NO_ARENA) == 0,
-      (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(t),
+      rows,
+      !rows && (wiMask & WI_NO_TWIN) == 0,
     )
     let m = 0
     while m < modKeys.length && m < meets.length {
-      if !inG[m] && meets[m] { return WI_AMBIENT }
+      if !inG[m] && meets[m] {
+        wiCulprit = m
+        return WI_AMBIENT
+      }
       m = m + 1
     }
   }
@@ -6778,8 +6847,8 @@ function wiEntryNeutral(t: i32, root: i32): boolean {
   true
 }
 
-// Whether every import from outside G of a declaration in G names one `skClosed` shuts and
-// this check's adoption did not retype (`wiAdopted`).
+// Whether every import from outside G of a declaration in G names one `skClosed` shuts, or a
+// closed generic the importer only calls, and this check's adoption did not retype (`wiAdopted`).
 function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
   let k = 0
   while k < impMod.length && k < wiImpTo.length {
@@ -6787,15 +6856,25 @@ function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
     if !inG[impMod[k]] && d >= 0 {
       const om = wiImpOrigin[k]
       if om < 0 {
-        if inG[d] { return false }
+        if inG[d] {
+          wiCulprit = impMod[k]
+          return false
+        }
       } else if inG[om] {
         if wiImpShut[k] < 0 {
           const root = roots[pos[om]]
           const nm = wiImpMerged[k]
-          wiImpShut[k] = if skClosed(root, nm) == SK_SHUT
+          const c = skClosed(root, nm)
+          const kept = c == SK_IF_KEPT
+            && (wiMask & WI_NO_KEPT) == 0
+            && skCallsOnly(roots[pos[impMod[k]]], nm)
+          wiImpShut[k] = if (c == SK_SHUT || kept)
             && ((wiMask & WI_NO_ADOPTED) != 0 || !wiAdopted(root, nm)) { 1 } else { 0 }
         }
-        if wiImpShut[k] == 0 { return false }
+        if wiImpShut[k] == 0 {
+          wiCulprit = impMod[k]
+          return false
+        }
       }
     }
     k = k + 1
@@ -6837,6 +6916,9 @@ function wiFreshCrosses(inG: boolean[]): boolean {
     let flags = 0
     for mk in row.keys() {
       const am = modIndexOfKey(mk)
+      if am >= 0 && inG[am] != inG[dm] {
+        wiCulprit = if inG[am] { dm } else { am }
+      }
       if am < 0 || inG[am] != inG[dm] { return true }
       flags = flags | (row[mk] ?? 0)
     }
@@ -6849,7 +6931,10 @@ function wiFreshCrosses(inG: boolean[]): boolean {
   for key in counted {
     let m = 0
     while m < modKeys.length {
-      if !inG[m] && occ.has(key + "\n" + modKeys[m]) { return true }
+      if !inG[m] && occ.has(key + "\n" + modKeys[m]) {
+        wiCulprit = m
+        return true
+      }
       m = m + 1
     }
   }
@@ -6867,6 +6952,7 @@ function wiAsksOut(inG: boolean[]): boolean {
       const am = modOfTok(at)
       if am >= 0 && am < inG.length && inG[am] {
         const dm = skNodeMod(qs[j + 2])
+        if dm >= 0 && dm < inG.length && !inG[dm] { wiCulprit = dm }
         if dm < 0 || dm >= inG.length || !inG[dm] { return true }
       }
     }

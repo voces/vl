@@ -198,12 +198,23 @@ const NARROW = 'import { g, poke } from "./st"\n' +
   "export function f(): i32 {\n  if g != null {\n    poke()\n    const k = g\n" +
   "    const j = k ?? 0\n    return j\n  }\n  0\n}\n";
 
+// `Q` declared beside the importer, with `x` of type `xTy`; G declares `P = { x: i32, tag }`.
+const TWIN_MAIN = (xTy: string) =>
+  `import { mk } from "./lib"\nexport type Q = { x: ${xTy}, tag: string }\n` +
+  'const q: Q = { x: 3, tag: "b" }\nprint(mk())\nprint(q.tag)\n';
+const TWIN_LIB = (read: string) =>
+  "export type P = { x: i32, tag: string }\nexport function mk(): i32 {\n" +
+  `  const p: P = { x: 1, tag: "a" }\n  ${read}\n}\n`;
+const WRAP = "export function wrap<T>(v: T): T[] { [v] }\n";
+const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(1)[0] }\n';
+
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
 const NO_ADOPTED = 256;
 
 // The fresh guard, the asks guard and the ambient guard's arena half have no mask witness: no
 // graph found shows a served answer that differs once they are dropped, so they are defensive.
+// The twin and called-generic widenings carry must-decline controls in their place.
 const CASES: Case[] = [
   {
     name: "a closed function import is served",
@@ -293,6 +304,55 @@ const CASES: Case[] = [
     want: "served",
   },
   {
+    name: "a same-shape record declared outside G is one type with G's own",
+    graph: {
+      "main.vl": TWIN_MAIN("i32"),
+      "lib.vl": TWIN_LIB("p.x"),
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a same-shape record outside G declines a target whose rows could name either",
+    graph: {
+      "main.vl": TWIN_MAIN("i32"),
+      "lib.vl": TWIN_LIB("(p ?? p).x"),
+    },
+    target: "lib.vl",
+    want: "ambient",
+  },
+  {
+    name: "a record outside G that differs in one field type is not a twin",
+    graph: {
+      "main.vl": TWIN_MAIN("f64"),
+      "lib.vl": TWIN_LIB("p.x"),
+    },
+    target: "lib.vl",
+    want: "ambient",
+  },
+  {
+    name: "a closed generic an importer only calls is served",
+    graph: {
+      "main.vl": 'import { wrap } from "./lib"\nimport { m } from "./mid"\n' +
+        'print(wrap("s")[0])\nprint(m())\n',
+      "mid.vl": WRAP_MID,
+      "lib.vl": WRAP,
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "a closed generic an importer takes as a value declines its callers",
+    graph: {
+      "main.vl": 'import { wrap } from "./lib"\nimport { m } from "./mid"\n' +
+        'const f = wrap\nprint(f("s")[0])\nprint(m())\n',
+      "mid.vl": WRAP_MID,
+      "lib.vl": WRAP,
+    },
+    target: "mid.vl",
+    want: "demand",
+  },
+  {
     name: "a fresh record G builds is delivered into a wider type outside G",
     graph: {
       "main.vl": 'import { mk } from "./lib"\nconst ys: { f: f64 } = mk()\nprint(ys.f / 8)\n',
@@ -330,3 +390,32 @@ Deno.test({
   },
 });
 
+// A root with no imports checks as a single source, which never consults the banks; it must
+// still read as unserved and unbanked after a served root, or the CLI prints the served
+// root's rows (none) in place of its own.
+Deno.test({
+  name: "check-within: an import-free check after a served one is its own",
+  ignore: !ENABLED,
+  fn() {
+    const g: Graph = { "main.vl": TWIN_MAIN("i32"), "lib.vl": TWIN_LIB("p.x") };
+    const sh = fresh();
+    sh.wiArm(1, 0);
+    for (const f of [...Object.keys(g), "leaf.vl"]) {
+      push(sh.wiTargetPush, KEY(f));
+      sh.wiTargetCommit();
+    }
+    for (const t of order(g)) {
+      load(sh, g, t);
+      sh.checkSrc();
+    }
+    if (!sh.wiServed()) throw new Error("want lib.vl served, got its own check");
+    sh.modReset();
+    sh.srcReset();
+    push(sh.srcPush, "export function f(): i32 { const n: i32 = 1\n  n }\n");
+    sh.checkSrc();
+    const got = `served=${sh.wiServed()} banked=${sh.wiBankedCount()}`;
+    if (got !== "served=0 banked=0") {
+      throw new Error(`want served=0 banked=0, got ${got}`);
+    }
+  },
+});

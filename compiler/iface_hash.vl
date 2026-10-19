@@ -102,6 +102,10 @@ let ihStHi: i32[] = []
 let ihStCutLo: i32[] = []
 let ihStCutHi: i32[] = []
 let ihStFull: i32[] = []
+let ihStFullOk: boolean[] = []
+// Whether this run keeps only what the ambient and write-question reads use: no statement text or
+// position hash, and each statement's full-token hash on first read (`ihFullOf`).
+let ihLean = false
 let ihStAmb: boolean[] = []
 // Ambient keys, per statement `ihAkSt[k]`: a declared name, a method's or getter's name, or one
 // record level's field names, as `ihAkW[ihAkLo[k], ihAkHi[k])`. An ambient statement that no
@@ -119,6 +123,9 @@ let ihAkLo: i32[] = []
 let ihAkHi: i32[] = []
 let ihAkW: string[] = []
 let ihAkSet: i32[] = []
+// Per key: the ordered field names and built-in field types of the record a plain declaration
+// declares, or 0 when the key is not such a declaration's (`ihTwinShape`).
+let ihAkShape: i32[] = []
 let ihDeclsOf: {[string]: i32[]} = Map()
 let ihFv: {[string]: boolean} = Map()
 // The field-name sets the check of S builds, by `ihSetKey`; `ihSetsAny` when one repeats a name.
@@ -247,6 +254,7 @@ export function ihBegin(keys: string[]): i32 {
   ihStCutLo = []
   ihStCutHi = []
   ihStFull = []
+  ihStFullOk = []
   ihStAmb = []
   ihImpMod = []
   ihImpLocal = []
@@ -451,6 +459,11 @@ function ihTokens(
   let sp = IH_SEED
   let cut = cutLo
   let i = a
+  while i < b && ihLean {
+    const t = P.toks[i]
+    if t.kind == "IDENT" && tops.has(t.text) { ihIds.push(t.text) }
+    i = i + 1
+  }
   while i < b {
     // The cut fires once: an empty body has `cutLo == cutHi`, and the jump lands on it again.
     if i == cut {
@@ -471,7 +484,23 @@ function ihTokens(
   ihStHi.push(b)
   ihStCutLo.push(cutLo)
   ihStCutHi.push(cutHi)
-  ihStFull.push(ihTokHash(a, b))
+  ihStFull.push(if ihLean { 0 } else { ihTokHash(a, b) })
+  ihStFullOk.push(!ihLean)
+}
+
+// Statement `s`'s full-token hash, hashed on first read under `ihLean`.
+function ihFullOf(s: i32): i32 {
+  if !ihStFullOk[s] {
+    ihStFull[s] = ihTokHash(ihStLo[s], ihStHi[s])
+    ihStFullOk[s] = true
+  }
+  ihStFull[s]
+}
+
+// Keep only what the ambient and write-question reads use, from the next `ihModule` on.
+export function ihSetLean(on: boolean): i32 {
+  ihLean = on
+  0
 }
 
 // Open a statement row of module `m`; `ihTokens` and `ihStClose` complete it.
@@ -510,6 +539,7 @@ function ihAkRow(at: i32, kind: i32, ws: string[]): void {
   for w in ws { ihAkW.push(w) }
   ihAkHi.push(ihAkW.length)
   ihAkSet.push(ihSetKey(ws))
+  ihAkShape.push(0)
   if kind == IH_AK_FIELDS && ihHasRepeat(ws) { ihMarkWild(at) }
 }
 
@@ -591,6 +621,35 @@ function ihDeclKeys(x: i32, at: i32, seen: string[]): void {
   } else {
     ihMarkWild(at)
   }
+}
+
+// A hash of a plain record declaration's ordered field names and field types when every type is
+// a built-in scalar no module redeclares, else 0. Two declarations of one shape are one type.
+function ihTwinShape(nd: TypeDecl): i32 {
+  if nd.tdNew != 0 || nd.tdFlat != 0 || nd.tdName.indexOf("<") >= 0 { return 0 }
+  let h = IH_SEED
+  for f in nd.tdFields {
+    if f < 0 { return 0 }
+    const fd = P.nodes[f]
+    if !(fd is FieldDef) || fd.fdType < 0 { return 0 }
+    const ft = P.nodes[fd.fdType]
+    if !(ft is TypeRef) || !ihScalarName(ft.tyName) { return 0 }
+    h = ihMixStr(ihMixStr(h, fd.fdName), ft.tyName)
+  }
+  if h == 0 { 1 } else { h }
+}
+
+function ihScalarName(n: string): boolean {
+  const scalar = n == "i32"
+    || n == "i64"
+    || n == "f32"
+    || n == "f64"
+    || n == "u8"
+    || n == "u32"
+    || n == "u64"
+    || n == "boolean"
+    || n == "string"
+  scalar && !ihDeclsOf.has(n)
 }
 
 // Whether `head` is the built-in `Map` or `Set` and no module declares that name. Its instance
@@ -719,6 +778,7 @@ export function ihAmbientScan(): i32 {
   ihAkHi = []
   ihAkW = []
   ihAkSet = []
+  ihAkShape = []
   ihLitSt = []
   ihLitKey = []
   ihLitRep = []
@@ -756,7 +816,9 @@ export function ihAmbientScan(): i32 {
       if nd is TypeDecl {
         amb = true
         ihAkRow(at, IH_AK_NAME, [ihDeclBase(nd.tdName)])
+        const sh = ihTwinShape(nd)
         ihDeclKeys(x, at, seen)
+        if sh != 0 { ihAkShape[ihAkShape.length - 1] = sh }
         ihStNames[at] = nd.tdNew != 0
           || nd.tdFlat != 0
           || nd.tdName.indexOf("<") >= 0
@@ -909,6 +971,7 @@ type IhIndex = {
   xArenaRep: i32[],
   xWild: boolean[],
   xNames: boolean[],
+  xShape: {[i32]: i32[]},
 }
 let ihIx: IhIndex = ihIndexEmpty()
 
@@ -922,6 +985,7 @@ function ihIndexEmpty(): IhIndex {
     xArenaRep: [],
     xWild: [],
     xNames: [],
+    xShape: Map(),
   }
   ix
 }
@@ -940,6 +1004,16 @@ export function ihAmbientIndex(): i32 {
     d = d + 1
   }
   let k = 0
+  while k < ihAkSt.length {
+    const m = ihStMod[ihAkSt[k]]
+    if ihAkShape[k] != 0 && m >= 0 {
+      const rows = ix.xShape[ihAkShape[k]] ?? []
+      ihIxPush(rows, m)
+      ix.xShape[ihAkShape[k]] = rows
+    }
+    k = k + 1
+  }
+  k = 0
   while k < ihLitSt.length {
     const m = ihStMod[ihLitSt[k]]
     if m >= 0 {
@@ -1009,11 +1083,13 @@ function ihIxSpells(ws: string[], inS: boolean[]): boolean {
 
 // `ihAmbientFv(inS)` then `ihAmbientMeets(false)`, from the last `ihAmbientIndex`. With `arena`,
 // a record type of the check also counts when `inS` spells all its fields; with `rows`, a type
-// declaration that may name another type in a rendered report row meets.
+// declaration that may name another type in a rendered report row meets. With `twin`, a record
+// declaration adds nothing when `inS` declares its shape, since the two are one type.
 export function ihAmbientMeetsIn(
   inS: boolean[],
   arena: boolean,
   rows: boolean,
+  twin: boolean,
 ): boolean[] {
   const out: boolean[] = []
   let d = 0
@@ -1056,6 +1132,9 @@ export function ihAmbientMeetsIn(
       if kind == IH_AK_NAME && ihOn(IH_NO_AMB_NAMES) { all = false }
       if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
       if kind == IH_AK_FIELDS && ihOn(IH_NO_AMB_FIELDS) { all = false }
+      if all && twin && ihAkShape[k] != 0 {
+        if ihIxIn(ihIx.xShape[ihAkShape[k]] ?? [], inS) { all = false }
+      }
       if all { out[m] = true }
     }
     k = k + 1
@@ -1460,7 +1539,7 @@ export function ihTokDigests(): i32 {
   while s < n {
     const m = ihStMod[s]
     if s < ihStAmb.length && ihStAmb[s] && !ihOn(IH_NO_AMBIENT) {
-      ihAmb[m] = ihMixInt(ihAmb[m], ihStFull[s])
+      ihAmb[m] = ihMixInt(ihAmb[m], ihFullOf(s))
     }
     if !ihOn(IH_NO_DECOR) {
       let ex = 0
@@ -1789,7 +1868,7 @@ export function ihOccDigests(
     const d = at[builders[b]] ?? -1
     declOf.push(d)
     if d >= 0 {
-      out[builders[b] + "\n"] = ihStFull[d]
+      out[builders[b] + "\n"] = ihFullOf(d)
       const names = [ihStMerged[d], ihStName[d]]
       let n = 0
       while n < names.length {
@@ -1819,7 +1898,7 @@ export function ihOccDigests(
             } else if !met.has(w) {
               met[w] = true
               const key = builders[w] + "\n" + ihKeys[m]
-              out[key] = ihMixInt(out[key] ?? IH_SEED, ihStFull[x])
+              out[key] = ihMixInt(out[key] ?? IH_SEED, ihFullOf(x))
             }
           }
         }
@@ -1905,7 +1984,7 @@ export function ihWriterDigests(
   while x < ihStMod.length {
     const sm = ihStMod[x]
     if ihStKind[x] == IH_ST_ROOT || ihStKind[x] == IH_ST_LET {
-      ord = ord + ihStFull[x]
+      ord = ord + ihFullOf(x)
       if sm < before.length && before[sm] && !ihImportRun(x) { out["\no"] = 1 }
     }
     const lo = ihStLo[x]
@@ -1965,7 +2044,7 @@ export function ihWriterDigests(
       }
       let w = IH_SEED
       for y in set {
-        w = w + ihStFull[y]
+        w = w + ihFullOf(y)
         const ym = ihStMod[y]
         if ym < only.length && only[ym] && !ihImportRun(y) {
           out[key + "\nw"] = 1
@@ -1978,7 +2057,7 @@ export function ihWriterDigests(
         for y in men[s] ?? [] {
           if !seen.has(y) {
             seen[y] = true
-            e = e + ihStFull[y]
+            e = e + ihFullOf(y)
             const ym = ihStMod[y]
             if ym < only.length && only[ym] && !ihImportRun(y) {
               out[key + "\ne"] = 1
