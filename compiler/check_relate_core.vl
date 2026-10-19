@@ -367,7 +367,6 @@ import {
 } from "./check_ty_relate"
 import { mapKeyTySupported, nomBaseTyIx, nomErasedTyIx } from "./check_ty_rep"
 import {
-  allStrLitArms,
   fnTyHasHole,
   numericVariantUncovered,
   operandKind,
@@ -2630,6 +2629,17 @@ function annUnionPushDistinctMember(members: i32[], m: i32) {
 // `tsToTyReal` (the tree route) and `nameToTyReal` (the string route) build the same union
 // from the same members, through one shared home per rule rather than a copy per route.
 
+// Whether every type in `ms` denotes string literals only: a string literal, or a literal
+// union over `string`.
+function allStrLitSetArms(ms: i32[]): boolean {
+  for m in ms {
+    if m < 0 || m >= T.tys.length || armLiteralBaseTy(m) != TY_STR {
+      return false
+    }
+  }
+  ms.length > 0
+}
+
 // The union type an annotation's kept `members` denote, with the literal-union flatten: a
 // union of literal unions is a literal union, so without flattening `is K` const-folds to a
 // guard that can never fire (`litunion-compact-rep-design.md` §8.3). Shares
@@ -2655,9 +2665,9 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
     if collapsed >= 0 { collapsedTySet(collapsed) }
     return collapsed
   }
-  // An inline string-literal union under `| null` is the same hidden alias as without it, so
-  // `"a" | "b" | null` and `K | null` name one inner type (D3198).
-  if hasNull && !allStrLitArms(members) {
+  // A string-literal member set under `| null` is the same literal union as without it, so
+  // `"a" | "b" | null`, `K | null` and `K | L | null` each name one inner type (D3198).
+  if hasNull && !allStrLitSetArms(members) {
     annRegisterVariantMembers(members)
     return mkUnionTy(members)
   }
@@ -2686,6 +2696,12 @@ function annUnionInnerTy(members: i32[], hasNull: boolean): i32 {
   fresh
 }
 
+// Whether `m` is a nullable string-literal set (`L | null`, `"a" | null`).
+function annNulStrLitSet(m: i32): boolean {
+  if m < 0 || m >= T.tys.length || !(T.tys[m] is TyNullable) { return false }
+  armLiteralBaseTy(nonNullTy(m)) == TY_STR
+}
+
 // The whole union type an `A | B | null` spelling denotes: `annUnionInnerTy` over the
 // non-`null` members, wrapped in the null niche when `null` is present (a poisoned -1
 // propagates unwrapped, since `mkNullableTy(-1)` would lose the sentinel). A declared union
@@ -2699,13 +2715,26 @@ function annUnionTy(members: i32[], hasNull: boolean): i32 {
   }
   // A member that is itself `null` (`null | null`, `N | null` over `type N = null`) is the
   // niche, not an inner type; with no other member the union is the `null` type (D4673).
+  // A nullable string-literal member lifts its `null` the same way, so `K | (L | null)` is
+  // the `K | L | null` niche.
   const nonNull: i32[] = []
   let anyNull = hasNull
+  let lifted = false
   for m in members {
-    if isNullTy(m) { anyNull = true } else { nonNull.push(m) }
+    if isNullTy(m) {
+      anyNull = true
+    } else if annNulStrLitSet(m) {
+      anyNull = true
+      lifted = true
+      annUnionPushDistinctMember(nonNull, nonNullTy(m))
+    } else {
+      nonNull.push(m)
+    }
   }
   if nonNull.length == 0 && anyNull { return TY_NULL }
-  if nonNull.length < members.length { return annUnionTy(nonNull, anyNull) }
+  if lifted || nonNull.length < members.length {
+    return annUnionTy(nonNull, anyNull)
+  }
   const inner = annUnionInnerTy(members, hasNull)
   if inner < 0 { return -1 }
   // arena-tick exempt: a per-program mark on an annotation's row.
