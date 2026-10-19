@@ -12908,6 +12908,74 @@ function monoNoteInertMember(n: Member) {
   monoNoteInertAll(xs)
 }
 
+// Records the generic function names held by the statements whose value nothing reads once
+// statement `st`'s is discarded (`monoDiscardedStmtsOf`): a bare name, a parenthesized one, or a
+// list or record literal of them (D6960).
+function monoNoteInertStmt(st: i32) {
+  for d in monoDiscardedStmtsOf(st) {
+    const x = unwrapParen(d)
+    if x >= 0 {
+      const n = P.nodes[x]
+      if n is Ident || n is ArrayLit || n is ObjLit {
+        monoNoteInertAll(monoGenericValuesOf(x))
+      }
+    }
+  }
+  0
+}
+
+// Whether statement `k` of block statements `bs` has its value discarded: it is not the last, or
+// it is a loop, which has none.
+function monoStmtIsDiscarded(bs: i32[], k: i32): boolean {
+  if k + 1 < bs.length { return true }
+  if k < 0 || k >= bs.length { return false }
+  const n = P.nodes[bs[k]]
+  n is WhileStmt || n is ForRange || n is ForIn
+}
+
+// The statements whose value nothing reads when statement `st`'s is discarded: `st` itself and,
+// through an `if` or a loop, the last statement of each block it runs.
+function monoDiscardedStmtsOf(st: i32): i32[] {
+  const out: i32[] = []
+  monoDiscardedStmtsIn(st, out, 0)
+  out
+}
+
+function monoDiscardedStmtsIn(st: i32, out: i32[], depth: i32) {
+  if st < 0 || st >= P.nodes.length || depth > 8 { return 0 }
+  out.push(st)
+  const n = P.nodes[st]
+  match n {
+    IfStmt => {
+      monoDiscardedTailIn(n.ifThen, out, depth)
+      if n.ifElse >= 0 && P.nodes[n.ifElse] is IfStmt {
+        return monoDiscardedStmtsIn(n.ifElse, out, depth + 1)
+      }
+      return monoDiscardedTailIn(n.ifElse, out, depth)
+    }
+    WhileStmt => {
+      return monoDiscardedTailIn(n.whileBody, out, depth)
+    }
+    ForRange => {
+      return monoDiscardedTailIn(n.frBody, out, depth)
+    }
+    ForIn => {
+      return monoDiscardedTailIn(n.fiBody, out, depth)
+    }
+    // runs no block whose last statement's value it hands on
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
+  }
+  0
+}
+
+// The block arm of `monoDiscardedStmtsIn`: block `b`'s last statement, discarded in turn.
+function monoDiscardedTailIn(b: i32, out: i32[], depth: i32) {
+  if b < 0 || b >= P.nodes.length { return 0 }
+  const n = P.nodes[b]
+  if !(n is Block) || n.blkStmts.length == 0 { return 0 }
+  monoDiscardedStmtsIn(n.blkStmts[n.blkStmts.length - 1], out, depth + 1)
+}
+
 // The generic function names in value `v` (`monoGenericValuesIn`).
 function monoGenericValuesOf(v: i32): i32[] {
   const xs: i32[] = []
@@ -13027,7 +13095,7 @@ function monoUsesAreInert(
   } else {
     for st in monoProgStmts {
       stack.push(st)
-      monoPushAll(lens, monoInertHitsOf(st, name, mode))
+      monoDiscardedHitsOf(st, name, mode, lens)
     }
   }
   while stack.length > 0 {
@@ -13096,8 +13164,10 @@ function monoInertPositions(
   }
   if n is Block {
     let k = 0
-    while k + 1 < n.blkStmts.length {
-      monoPushAll(lens, monoInertHitsOf(n.blkStmts[k], name, mode))
+    while k < n.blkStmts.length {
+      if monoStmtIsDiscarded(n.blkStmts, k) {
+        monoDiscardedHitsOf(n.blkStmts[k], name, mode, lens)
+      }
       k = k + 1
     }
     return 0
@@ -13113,6 +13183,15 @@ function monoInertPositions(
     return 0
   }
   monoInertLetHits(ix, fx, name, mode, lens, depth)
+}
+
+// Appends to `lens` the uses of `name` held by the statements whose value nothing reads when
+// statement `st`'s is discarded (`monoDiscardedStmtsOf`).
+function monoDiscardedHitsOf(st: i32, name: string, mode: i32, lens: i32[]) {
+  for d in monoDiscardedStmtsOf(st) {
+    monoPushAll(lens, monoInertHitsOf(d, name, mode))
+  }
+  0
 }
 
 // The binding arm of `monoInertPositions`: the uses in an un-annotated `LetDecl`'s initializer
@@ -17064,6 +17143,7 @@ function monoWalk(ix: i32, ctx: i32) {
     const bs = n.blkStmts
     let i2 = 0
     while i2 < bs.length {
+      if monoStmtIsDiscarded(bs, i2) { monoNoteInertStmt(bs[i2]) }
       if monoWalk(bs[i2], ctx) < 0 { return -1 }
       i2 = i2 + 1
     }
@@ -19332,6 +19412,7 @@ export function monomorphize(stmts: i32[]) {
     } else if nodeIsTypeDecl(stmts[i]) {
     } else if s is UnionDecl {
     } else {
+      monoNoteInertStmt(stmts[i])
       if monoWalk(stmts[i], -1) < 0 { return -1 }
     }
     i = i + 1
