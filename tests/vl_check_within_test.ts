@@ -87,7 +87,18 @@ const diagRows = (e: Exports, keys: string[]): string[] => {
   const o: string[] = [];
   for (let i = 0; i < e.diagCount(); i++) {
     const msg = readStr(e.diagMsgLen(i), (j) => e.diagMsgAt(i, j));
-    o.push(`${keys[e.diagModule(i)] ?? "?"} ${e.diagLine(i)}:${e.diagCol(i)} ${msg}`);
+    const span = `${e.diagLine(i)}:${e.diagCol(i)}-${e.diagEndLine(i)}:${e.diagEndCol(i)}`;
+    o.push(`${keys[e.diagModule(i)] ?? "?"} ${span} ${msg}`);
+  }
+  return o;
+};
+// A served check's banked type diagnostics, in the same form.
+const servedDiagRows = (e: Exports, keys: string[]): string[] => {
+  const o: string[] = [];
+  for (let i = 0; i < e.wiDiagCount(); i++) {
+    const msg = readStr(e.wiDiagMsgLen(i), (j) => e.wiDiagMsgAt(i, j));
+    const span = `${e.wiDiagLine(i)}:${e.wiDiagCol(i)}-${e.wiDiagEndLine(i)}:${e.wiDiagEndCol(i)}`;
+    o.push(`${keys[e.wiDiagMod(i)] ?? "?"} ${span} ${msg}`);
   }
   return o;
 };
@@ -158,11 +169,12 @@ const run = (g: Graph, mask = 0): Record<string, Verdict> => {
   for (const t of order(g)) {
     const before = REASON.map((_, r) => sh.wiStat(r));
     const keys = load(sh, g, t);
-    sh.checkSrc();
+    const rc = sh.checkSrc();
     const served = sh.wiServed();
     const reason = REASON.find((_, r) => sh.wiStat(r) !== before[r]) ?? "?";
     const mine = {
-      diags: served ? [] : diagRows(sh, keys),
+      rc,
+      diags: served ? servedDiagRows(sh, keys) : diagRows(sh, keys),
       streams: served ? banked[KEY(t)] ?? ["<no rows banked>"] : streamRows(sh, 0),
       lint: [] as string[],
     };
@@ -172,8 +184,12 @@ const run = (g: Graph, mask = 0): Record<string, Verdict> => {
     mine.lint = lintRows(sh);
     const f = fresh();
     const fk = load(f, g, t);
-    f.checkSrc();
-    const own = { diags: diagRows(f, fk), streams: streamRows(f, 0), lint: lintRows(f) };
+    const own = {
+      rc: f.checkSrc(),
+      diags: diagRows(f, fk),
+      streams: streamRows(f, 0),
+      lint: lintRows(f),
+    };
     const a = JSON.stringify(mine), b = JSON.stringify(own);
     out[t] = { reason, sound: a === b, why: a === b ? "" : `served ${a}\nown    ${b}` };
   }
@@ -212,7 +228,7 @@ const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(
 
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
-const NO_ADOPTED = 256;
+const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096;
 
 // The fresh guard, the asks guard and the ambient guard's arena half have no mask witness: no
 // graph found shows a served answer that differs once they are dropped, so they are defensive.
@@ -381,14 +397,14 @@ const CASES: Case[] = [
     mask: NO_AMBIENT,
   },
   {
-    name: "a push G makes on a list an outside body types leaves no clean check to serve",
+    name: "a push G makes on a list an outside body types declines its target on demand",
     graph: {
       "main.vl": 'import { add, xs } from "./lib"\nimport { u } from "./use"\nprint(add("a") + u())\n',
       "lib.vl": "export let xs = []\nexport function add(s: string): i32 {\n  xs.push(s)\n  0\n}\n",
       "use.vl": 'import { xs } from "./lib"\nexport function u(): i32 {\n  xs.push(1)\n  0\n}\n',
     },
     target: "use.vl",
-    want: "unseen",
+    want: "demand",
   },
   {
     name: "a closed generic an importer only calls is served",
@@ -529,6 +545,121 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "ambient",
+  },
+  {
+    name: "an error in a function body of G is served with the error",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 {\n' +
+        "  const s: string = x\n  f(x) * 2\n}\n",
+      "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "an error in an imported body is served to every target whose G holds it",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
+      "lib.vl": "export function f(x: i32): i32 {\n  const s: string = x\n  x + 1\n}\n",
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "an error that changes an exported type is served with the error",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
+      "lib.vl": 'export function f(x: i32) { x * "a" }\n',
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "an unknown type name an importer's sibling might declare is not banked",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
+      "lib.vl": "export function f(x: i32): Strng { x + 1 }\n",
+    },
+    target: "mid.vl",
+    want: "dirty",
+  },
+  {
+    name: "an error outside G declines the target",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nconst s: string = g(1)\nprint(s)\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
+      "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
+    },
+    target: "mid.vl",
+    want: "dirty",
+  },
+  {
+    name: "a warning-only target is served with its rows",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nprint(g(1))\n',
+      "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 {\n' +
+        "  const k: i32 = 2\n  const u = 3\n  f(x) * k\n}\n",
+      "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "an importer's instance of a generic reports its error at the importer's call",
+    graph: {
+      "main.vl": 'import { dbl } from "./lib"\nimport { m } from "./mid"\n' +
+        'print(dbl("s"))\nprint(m())\n',
+      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { dbl(1) }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
+    },
+    target: "mid.vl",
+    want: "dirty",
+  },
+  {
+    name: "an error in G that renders a union by an outside declaration's name is not banked",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\ntype U = "a" | "b"\nconst u: U = "a"\nprint(g())\n',
+      "mid.vl": 'export function g(): i32 {\n  const v: "a" | "b" = "a"\n  const t: i32 = v\n  0\n}\n',
+    },
+    target: "mid.vl",
+    want: "ambient",
+    mask: NO_DIAG_NAMES,
+  },
+  {
+    name: "an error in G whose message names no outside type is banked beside one",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\ntype U = "a" | "b"\nconst u: U = "a"\nprint(g())\n',
+      "mid.vl": 'export function g(): i32 {\n  const t: i32 = "s"\n  0\n}\n',
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "an instance made through a generic in G reports at the importer's outermost call",
+    graph: {
+      "main.vl": 'import { w } from "./mid"\nimport { m } from "./mid2"\n' +
+        'print(w("s"))\nprint(m())\n',
+      "mid2.vl": 'import { w } from "./mid"\nexport function m(): i32 { w(1) }\n',
+      "mid.vl": 'import { dbl } from "./lib"\nexport function w<T>(v: T): i32 { dbl(v) }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
+    },
+    target: "mid2.vl",
+    want: "dirty",
+  },
+  {
+    name: "an instance error at a call inside G is G's own and is served",
+    graph: {
+      "main.vl": 'import { dbl } from "./lib"\nimport { m } from "./mid"\n' +
+        'print(dbl("s"))\nprint(m())\n',
+      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { dbl(1) }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { v.length }\n",
+    },
+    target: "mid.vl",
+    want: "served",
   },
   {
     name: "a fresh record G builds is delivered into a wider type outside G",
