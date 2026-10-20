@@ -311,8 +311,13 @@ its subtypes hold by descending its arena type (`registerInlineUnionChildOf`), a
 type reaching itself again stops (`riuOpenTys`). No module changes. The record split the
 type-key guard works around is filed as [D7220](inventory/D7220.md).
 
-Left: `mintInlineUnion` still mints under `canonUnionKeyOfName`, until D7220 gives one record
-type one struct row. The adopt with no type is live: an `i64 | i32` mixed-width literal-union
+Then D7220's close (L6 log, 2026-10-19). A one-member string literal set reps as its literal
+at a record field, so `{kind: "circle"}` and `{kind: KC}` have one struct row. The type-key
+guard (`utkStructText`) still holds: the union box site resolves a member by name against the
+adopted row, so a row shared by type is safe only where the member names agree.
+
+Left: `mintInlineUnion` still mints under `canonUnionKeyOfName`, and the guard stays, until
+the type reaches the box site. The adopt with no type is live: an `i64 | i32` mixed-width literal-union
 alias has a literal-preserving type key that finds no row. `isUName`, `unionRowOf`,
 `registerValueUnionNameTy` and `pushValueUnionRow` are asked with a name only. So
 `unRowOfSetText`, `unKeyPush`, `unKeyAliasRow`, `isUNameKeyAB` and that fallback still call
