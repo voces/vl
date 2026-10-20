@@ -379,3 +379,10 @@ Two controls must red, and do:
 
 Disarmed, every entry point returns at once: difftree `--identity` reads 0 of 10,940 builds
 differing, and the candidate compiling master's source equals master's fixpoint.
+
+Cost: seed 6,517,047 → 6,571,947 bytes (+0.84%). L2 guest fuel on master at #4186: the master
+seed on its own source 108,435,078,638, on this source 109,250,016,253 (+0.75%), and the new
+seed on this source 109,250,019,312 (+0.000003%), so the compiler is no slower on a given
+program and the cost is its own larger source. Before #4186 mixed the write scan's key, the
+same source read +2.32%, and ablations of it did not add up: linear probing over a clustered
+key made a few added declarations cost out of proportion.
