@@ -190,7 +190,7 @@ import {
 import { getterDemandNote } from "./check_getter_effects"
 import { getterNarrowNote } from "./check_getter_walk"
 import { arrDefRowServed, holeCastNames } from "./check_hole_links"
-import { HD_ELEM, hdBase, hdKind, hdRowOf } from "./check_hole_pins"
+import { HD_ELEM, HD_RET, hdBase, hdKind, hdRowOf } from "./check_hole_pins"
 import {
   calleeWriteAt,
   calleeWriteGot,
@@ -340,6 +340,7 @@ import {
   eqLitMemberOk,
   eqLitNonMember,
   genFnHoleInstance,
+  holeCallResultAt,
   joinTys,
   opSelfFnKeyFor,
   substHoleTy,
@@ -3391,6 +3392,46 @@ export function noteCastDemand(name: string, n: AsExpr, ix: i32, target: i32) {
     if holeCastIx[i] == ix { return 0 }
     i = i + 1
   }
+  holeCastRowPush(name, n, vn, ix, target)
+  0
+}
+
+// Parks a propagating `as` cast whose operand is a call of a hole parameter (`g(x) as i32`, the
+// operand typed `arg`), on that parameter's hole: the pin types the call at its own arguments
+// and judges the cast there, as a direct read of the hole is judged (D8060).
+export function noteHoleCallCastDemand(
+  arg: i32,
+  n: AsExpr,
+  ix: i32,
+  target: i32,
+) {
+  if n.asMode != "prop" { return 0 }
+  const row = hdRowOf(arg)
+  if row < 0 || hdKind[row] != HD_RET || hdBase[row] < 0 { return 0 }
+  const bt = T.tys[hdBase[row]]
+  if !(bt is TyVar) || hdRowOf(hdBase[row]) >= 0 { return 0 }
+  const c = parenPeelIx(n.asObj)
+  if c < 0 || c >= P.nodes.length { return 0 }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return 0 }
+  const vn = castOperandIdent(cn.callFn)
+  if vn == "" || castClobbered(bt.tvName + "." + vn) { return 0 }
+  if holeHasIsAlt(bt.tvName) { return 0 }
+  for k in holeCastIx {
+    if k == ix { return 0 }
+  }
+  holeCastRowPush(bt.tvName, n, vn, ix, target)
+  0
+}
+
+// One parked cast row, its argument destination not yet recorded.
+function holeCastRowPush(
+  name: string,
+  n: AsExpr,
+  vn: string,
+  ix: i32,
+  target: i32,
+) {
   holeCastNames.push(name)
   holeCastModePush(n.asMode)
   holeCastVarPush(vn)
@@ -3416,11 +3457,30 @@ export function holeCastPinCheck(name: string, at: i32, pName: string) {
   let k = 0
   while k < holeCastNames.length {
     if holeCastNames[k] == name && holeCastVar[k] == pName {
-      castPinAdjudicate(k, at)
+      const opTy = holeCastOperandAt(k, name, at)
+      if opTy >= 0 { castPinAdjudicate(k, opTy) }
     }
     k = k + 1
   }
   0
+}
+
+// The operand type of parked cast `k` when hole `name` is pinned at `at`: `at` for a read of
+// the hole, the call's own result for a call of it; -1 when that result stays open.
+function holeCastOperandAt(k: i32, name: string, at: i32): i32 {
+  const c = parenPeelIx(asObjOf(holeCastIx[k]))
+  if c < 0 || c >= P.nodes.length || !(P.nodes[c] is Call) { return at }
+  const r = holeCallResultAt(c, name, at)
+  if r < 0 || tyIsHole(r) || tyHasTyVar(r) { return -1 }
+  r
+}
+
+// The operand of `as` cast node `ix`, or -1.
+function asObjOf(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is AsExpr { return n.asObj }
+  -1
 }
 
 // One parked cast, adjudicated against the pinned operand type `at`. The ladder is
