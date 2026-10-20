@@ -288,6 +288,14 @@ spelling and in a generic instance. The arm pin `K | L | null` is no longer reac
 has no disagreement left. The prediction held: D6950 is closed, and `identListRep`'s and
 `globalListRep`'s rungs are deleted.
 
+**Status: step 5 is in progress** (L6 log, 2026-10-19). An unregistered spelling with a type is
+adopted by the row its type keys to, confirmed by where `null` sits in the type's members and
+in the row's atoms; its name is no longer parsed (`unNameAdoptTyKeyRow`). `unNameAdoptKeyRow`
+is deleted. One row merges, `unions/inferred-return-self-union-nullable.vl`, whose unrolled
+`Node | null` adopts the `Node | null` row; the output is unchanged. `ord.vl` builds
+byte-identical. Left: an adopt with no type, `mintInlineUnion`'s find, `registerInlineUnionAt`'s
+name dispatch, and the other `canonUnionKeyOfName` callers.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a
