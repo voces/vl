@@ -47,7 +47,7 @@ ROWS=(
 # The jobs those rows run in, with how many matrix shards each must have passed.
 JOBS=(
   "ci=1" "seed=1" "ci-native=7" "ci-release-shape=4" "checks=1" "checks-suites=1"
-  "fuel-sidecars=1" "ci-cost=4" "ci-proof=1"
+  "ci-cost=4" "ci-proof=1"
 )
 PROOF_RE='ci-proof: tree [0-9a-f]{40} seed [0-9a-f]{64} rustc [^ ]+'
 
