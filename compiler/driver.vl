@@ -709,6 +709,13 @@ const modRenameFirstBySid: i32[] = []
 const modRenameLastBySid: i32[] = []
 // The sids `modRenamePush` has set a slot of since the last `modRenameClear`.
 let modRenameSids: i32[] = []
+// The interned `from` of each row, parallel to `modRenameFrom`.
+let modRenameRowSid: i32[] = []
+// The collect pass's map of the o-th module in merge order, kept so the rewrite pass replays
+// it rather than building it again; live only inside `modRewriteAll`.
+let modRenameKeptTo: string[][] = []
+let modRenameKeptFrom: string[][] = []
+let modRenameKeptSid: i32[][] = []
 // One string per merged name for the whole program, so every module's references to a
 // declaration share one string and later compares answer by identity.
 let modCanonTo: {[string]: string} = Map()
@@ -4974,7 +4981,7 @@ function modRewriteAll(roots: i32[]) {
   modCollectSelfFns(roots)
   let o2 = 0
   while o2 < modOrder.length {
-    modBuildRename(modOrder[o2], roots[o2])
+    modRenameReplay(o2)
     // D1191 — the module's own UFCS SCOPE, and its arena boundary. Both are read
     // where a UFCS name is resolved away from a banked call site, so a candidate
     // is one the CALLER binds rather than one any module happened to bank.
@@ -4990,6 +4997,9 @@ function modRewriteAll(roots: i32[]) {
     o2 = o2 + 1
   }
   modRwMod = -1
+  modRenameKeptTo = []
+  modRenameKeptFrom = []
+  modRenameKeptSid = []
 }
 
 // `modCompile`'s step 4b: resolves each of the root module's re-exports to its merged target,
@@ -7464,6 +7474,7 @@ function modRenameClear() {
   modRenameSids = []
   modRenameTo = []
   modRenameFrom = []
+  modRenameRowSid = []
   0
 }
 // Appends one row to the rename map and indexes it under its interned `from`.
@@ -7478,11 +7489,44 @@ function modRenamePush(from: string, to: string): i32 {
   }
   modRenameFrom.push(from)
   const s = sidOf(from)
+  modRenameRowSid.push(s)
+  modRenameIndexRow(s, row)
+}
+// Files row `row`, whose `from` interns to `s`, in the two sid views.
+function modRenameIndexRow(s: i32, row: i32): i32 {
   if sidArrGet(modRenameFirstBySid, s) < 0 {
     modRenameSids.push(s)
     sidArrPut(modRenameFirstBySid, s, row)
   }
   sidArrPut(modRenameLastBySid, s, row)
+  0
+}
+// Keeps the live map as the o-th module's, for `modRenameReplay`. The arrays are kept by
+// reference: `modRenameClear` replaces them rather than emptying them.
+function modRenameKeep(o: i32): i32 {
+  while modRenameKeptTo.length <= o {
+    modRenameKeptTo.push([])
+    modRenameKeptFrom.push([])
+    modRenameKeptSid.push([])
+  }
+  modRenameKeptTo[o] = modRenameTo
+  modRenameKeptFrom[o] = modRenameFrom
+  modRenameKeptSid[o] = modRenameRowSid
+  0
+}
+// Makes the o-th module's kept map the live one, rows and sid views as `modBuildRename` left
+// them. Its inputs (the module's declarations, its imports, the export tables) are fixed
+// between the collect pass that kept it and the rewrite of that module.
+function modRenameReplay(o: i32): i32 {
+  modRenameClear()
+  modRenameTo = modRenameKeptTo[o]
+  modRenameFrom = modRenameKeptFrom[o]
+  modRenameRowSid = modRenameKeptSid[o]
+  let row = 0
+  while row < modRenameRowSid.length {
+    modRenameIndexRow(modRenameRowSid[row], row)
+    row = row + 1
+  }
   0
 }
 function modBuildRename(m: i32, root: i32): i32 {
@@ -7576,6 +7620,7 @@ function modCollectSelfFns(roots: i32[]): i32 {
   while o < roots.length {
     const m = modOrder[o]
     modBuildRename(m, roots[o])
+    modRenameKeep(o)
     modShadow = []
     modShadowTo = []
     const r = P.nodes[roots[o]]
