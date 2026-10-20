@@ -26081,9 +26081,9 @@ function refListRowRefused(exprIx: i32): i32 {
 }
 
 // `xs.pop()` and `xs.get(i)` — the two checked list reads, typed identically (`T | null`),
-// differing only in the condition, element index and whether the length decrements
-// (`pushTakeCond`/`pushTakeElem`). `getIdx` is the `.get` index node, or -1 for `.pop`;
-// serving both from one body keeps `.get` reaching every rep `.pop` reaches (D1281).
+// differing only in the condition, index and length decrement (`pushTakeCond`/`pushTakeElem`);
+// one body keeps `.get` at every rep `.pop` reaches (D1281). `getIdx` is the `.get` index or
+// -1. Returns 0 with the value on the stack, 1 when a statement pop left none, or -1.
 function emitPop(
   body: u8[],
   callIx: i32,
@@ -26241,8 +26241,17 @@ function emitPopGo(
           opNm,
         )
       }
-      // the unchecked tail: a `.pop` statement (value dropped) and the reps with no
-      // `T | null` cell of their own — the `K[]` atom list, whose nullable rides the `-1` sentinel.
+      // A numeric `.pop` statement has no null cell to answer with, so it pops under the
+      // length test and drops the element itself: an empty list is left as it is (D8360).
+      if !nulBox && getIdx < 0 {
+        if pushTakeCond(body, lIdx, lTy, getIdx, fnIx) < 0 { return -1 }
+        fbIf(64) // 0x40 void
+        if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
+        fbDrop() // 0x1a drop
+        fbEnd()  // 0x0b end
+        return 1
+      }
+      // the unchecked tail: the reps with no `T | null` cell of their own.
       if pushTakeElem(body, lIdx, lTy, aTy, getIdx, fnIx) < 0 { return -1 }
       return 0
     }
@@ -30224,11 +30233,14 @@ function emitCallStmt(body: u8[], s: Call, stmtIx: i32, fnIx: i32) {
     // rather than emitting one and dropping it.
     if callee.memProp == "push" { return emitPush(body, stmtIx, fnIx, false) }
     // A `.pop()` STATEMENT discards the popped element — emit the pop, then `drop`
-    // the value it leaves on the stack.
+    // the value it leaves on the stack, unless `emitPop` answered 1 (it dropped it already).
     if callee.memProp == "pop" {
       if popRecvIsList(callee.memObj, fnIx) {
-        if emitPop(body, stmtIx, fnIx, false, -1) < 0 { return -1 }
-        fbDrop() // 0x1a drop
+        const popR = emitPop(body, stmtIx, fnIx, false, -1)
+        if popR < 0 { return -1 }
+        if popR == 0 {
+          fbDrop() // 0x1a drop
+        }
         return 0
       }
     }
