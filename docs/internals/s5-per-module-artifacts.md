@@ -16,7 +16,7 @@ This doc covers:
 6. the cache key;
 7. the ordered steps and the gate on each.
 
-Step 1, the relocation recorder, has landed. §8 holds its proof.
+Step 1, the relocation recorder, has landed (§8). Step 2, symbolic value rows, is in review (§9).
 
 ## 1. What a body encodes: the census
 
@@ -50,8 +50,15 @@ the self-build, 18,650 constants moved:
 | self-build | 12,634 | 6,014 | 2 | 0 |
 | tests/cases sample, body · init | 1,689 · 35 | 342 · 1 | 24 · 242 | 0 |
 
-Union tags are `uVariants.length + k`, the variant's rank across the whole program. Atoms
-are numbered across the program in the order they are met. A closure slot is
+A union box tag comes from one of three bands, all numbered across the whole program:
+
+- a struct variant's tag is `uTags[vi]`, the count of variant signatures that sort below
+  its own, so equal signatures share a tag;
+- a scalar kind's tag is `uVariants.length + k` (`scalarTagOfKind`);
+- above that sits a slot band, three residues interleaved, for a ref-list element type, a
+  map's key kind and value, and a closure signature.
+
+Atoms are numbered across the program in the order they are met. A closure slot is
 `gImports + fe`. None of these is local to a module.
 
 ## 2. The artifact
@@ -63,11 +70,11 @@ An artifact is the module's bodies plus enough to place them:
   and its globals and strings.
 - **Symbol tables, one per space**, mapping each local index to a module-stable symbol.
   Functions and globals use the `name$m<id>` names already emitted. Types use a canonical
-  shape key (§3), tags use a member-set key, atoms use their literal text, and strings use
-  their bytes.
-- **Value relocations**: (body, offset, space, local value) rows for the constants a decoder
-  cannot see. This is what step 1 records, as a `vl.reloc` custom section of ULEB offset, u8
-  space and SLEB value.
+  shape key (§3), tags use the key of what decides them (§3), atoms use their literal text,
+  and strings use their bytes.
+- **Value relocations**: (body, offset, symbol) rows for the constants a decoder cannot see.
+  Step 2 writes them as a `vl.reloc` custom section (§9): a symbol table of (space, key,
+  value), then each row's module offset and symbol.
 - **Initialisers**: each global's init expression and the module's share of the start
   function, as separate entries so the link can order them by import order.
 - **Demands**: the generic instances the module calls but does not own (§4).
@@ -86,9 +93,11 @@ The link owns every table that spans modules. A module never fixes one of their 
   bodies. The reorder then sees exactly the input it sees today, so the type section can be
   byte-identical to a whole-program build.
 - **Union tags.** A union's member set is its ABI, and box tags are positional. **A member
-  set is never deduplicated or reordered**. The link assigns a tag to each (union key,
-  member position) pair in the order the whole-program build would. A tag row in an artifact
-  names its union key and member position, never a number.
+  set is never deduplicated or reordered**. A tag is not a (union, member position) pair: it
+  is a rank in one of the program-wide bands of §1. A tag row therefore names what decides
+  the rank: a struct variant's signature (`variantTagKey`), a scalar kind's code, or the
+  slot band's element type, map key and value, or closure signature. The link collects every
+  module's keys, ranks them as the whole-program build does, and writes each tag.
 - **Literal atoms.** These are keyed by literal text. The link numbers them in first-meeting
   order over the linked program.
 - **Strings.** The string pool (`collectStrPool`) is placed by the link before user globals,
@@ -148,11 +157,11 @@ on program behaviour instead.
    `vl.reloc` rows for every value-borne index. The gates are identity, the fixpoint, and the
    proof that reapplying the rows plus decode re-links each module byte for byte. Seed and L2
    fuel are measured.
-2. **Symbolic value rows.** Replace each row's value with its symbol: union key and member
-   position, atom text, closure function symbol, guard global symbol. Record global
-   initialiser constants and data-segment contents as well (the gaps in §8). Gates: identity,
-   the fixpoint, and the proof with every row resolved through its symbol rather than its
-   number.
+2. **Symbolic value rows.** (In review, §9.) Name each row's value by its symbol: the
+   tag's deciding key (§3), atom text, the closure function's name, the guarded global.
+   Record global initialiser constants too; data segments carry no relocated value (§9).
+   Gates: identity, the fixpoint, and the proof with every row resolved through its symbol
+   rather than its number.
 3. **A link pass inside one compile.** Emit the whole program, then rebuild it through a link
    step that reads only per-module bodies, symbol tables and rows. Types, tags, atoms,
    strings, functions and globals are assigned at link. Gates: identity, the fixpoint, and
@@ -218,7 +227,7 @@ The proof found two unrecorded writes, and both are fixed:
 - the shared-field `is` across record arms (`yes[j]`), witness
   `tests/cases/unions/record-arms-same-field-over-generic.vl`.
 
-**Named gaps, left for step 2:**
+**Named gaps, left for step 2** (all three are answered in §9):
 
 - **Global initialiser constants.** These are the 44, 318 and 13 moved init constants above,
   which step 1 does not record.
@@ -241,3 +250,78 @@ All of the fuel growth comes from compiling the recorder's own source. An earlie
 cost +2.17%. It exported the placed-row tables as mutable module globals and read them in
 two other modules, and that alone was most of the cost. They are now private, behind
 accessors.
+
+## 9. Step 2: symbolic value rows
+
+Each row now names a **symbol** as well as a value. `fbI32RelOf(space, subject, v)`
+(emit_bytes.vl) notes the subject the symbol is named from, and `relSymKey`
+(emit_reloc_keys.vl) renders the key when the section is written:
+
+| space | key | named from |
+| --- | --- | --- |
+| union tag | `v:<signature>`, `k:<code>`, `rl:<elem>`, `map:<key kind>:<value>` / `map:mono`, `clo:<sig>` | the band of §1 the tag falls in |
+| literal atom | `a:<text>` | the text interned as that id (`litAtomTextOf`) |
+| closure slot | `f:<name>` then `#n` for the nth function of that name | the name section's name; clones of one declaration and namesake lambdas share a name, so the ordinal is needed |
+| guard progress, guard global | `g:<quoted name><where>` | the guarded global (`initGuardGlobalText`) |
+| guard reader | `r:<reader>` | `gInitReaders` |
+
+A value no table explains would key as `?:<number>`. None does, in either population.
+
+**Format, version 2.** `vl.reloc` holds a version byte, then the symbols (u8 space, key as
+length-prefixed UTF-8, SLEB value), then per row its ULEB module offset and ULEB symbol
+index. A row has no width: every relocated value is an `i32.const` LEB.
+
+**Global initialiser constants** are recorded. A global's initialiser buffer keeps its
+rows past body placement (`relHold`), the global section notes them with its payload parts
+(`relSectionParts`), and `relPlaceSections` places them once the module rope is final.
+The init-guard writes split into three spaces (progress, global, reader), since their
+subjects differ.
+
+**Data segments carry no relocated value, measured.** An array-literal data segment holds
+only elements `arrLitElemIsConst` admits, a number or a boolean literal (`arrLitLeafIsNum`,
+`arrLitLeafIsBool`), and a string segment holds only the string's bytes. Neither can hold
+a tag, atom, slot or guard row. The cross re-link compares every data section between the
+build and its twin byte for byte: 4 of 4 in tests/cases are equal.
+
+**Proof.** `proof ARMED PERTURBED` adds four checks to step 1's:
+
+- every key names one value in its module (`0 name two values`);
+- each key of the build is a key of the twin, and the reverse;
+- every moved constant has a row, now in initialisers as well as bodies;
+- **the cross re-link**: each global initialiser, code body and data section of the build,
+  with every row's value replaced by the value the *twin* gives the same key, must equal the
+  twin's region byte for byte. This resolves each row through its symbol, not its number.
+
+The twin adds 1000 to struct and scalar tags, 2000 to closure slots, 3000 to atom ids,
+4000 to guard progress values, 5000 to guard global rows and 6000 to guard reader rows,
+and 1000 times the space to the init-failure pick's arm values.
+
+| population | rows | tag | atom | slot | guard progress · global · reader | LEBs re-linked, 0 differ | moved body constants recorded | moved init constants recorded | regions cross re-linked, 0 differ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| self-build | 18,708 | 12,707 | 5,999 | 2 | 0 · 0 · 0 | 1,212,587 | 18,664 of 18,664 | 44 of 44 | 22,293 (9,108 init, 13,185 body) |
+| tests/cases, every module both compilers build (4,654 of 5,778) | 44,478 | 32,072 | 6,818 | 5,387 | 58 · 85 · 58 | 2,480,564 | 37,776 of 37,776 | 5,438 of 5,438 | 117,611 (35,437 init, 82,170 body, 4 data) |
+
+1,264 recorded tags in tests/cases do not move under the twin: they are slot-band tags,
+which the twin does not shift. They are re-linked through their keys all the same.
+
+**Controls**, each run before the clean result was trusted:
+
+- `proof-drop 97` drops every 97th row of the self-build: 193 rows dropped, 193 moved
+  constants unrecorded, 192 body regions differ, exit 1;
+- a build whose `relHold` returns at once: 42 of 44 initialiser constants unrecorded, 3
+  global regions differ, exit 1.
+
+**Cost**, against master's fixpoint at `966471462`:
+
+| measure | master | candidate | change |
+| --- | --- | --- | --- |
+| seed size, bytes | 6,504,377 | 6,513,138 | +8,761 (+0.13%) |
+| L2 fuel, each seed compiling its own source | 113,757,976,554 | 112,573,402,848 | −1.04% |
+| L2 fuel, each seed compiling the candidate source | 112,573,379,250 | 112,573,402,848 | +0.00002% |
+
+Both readings come from one scratch path; fuel depends on the path the source is read
+from. The disarmed recorder costs nothing at run time. The −1.04% belongs to the candidate
+source and has not been attributed to a file.
+
+Disarmed, every entry point returns at once: difftree `--identity` reads 0 of 10,936
+builds differing, and the candidate compiling master's source equals master's fixpoint.

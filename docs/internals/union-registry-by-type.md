@@ -303,10 +303,21 @@ literal `kind` field against its alias's atom, as in `Ca | Ra` beside `C | R`. O
 spelling takes the canon row of its type, as before. Every merge is in the L6 log. Each one is
 a member reorder of the same multiset, a union alias of the same members, or an inline record
 beside its transparent alias (`{x: i32} | i32` and `P | i32`). `ord.vl` prints the same in both
-orders. Left: `mintInlineUnion` still mints under `canonUnionKeyOfName`.
-`registerInlineUnionAt` still dispatches on the name; its 20 call sites recurse through the
-name's parts. `isUName`, `unRowOfSetText`, `unKeyPush`, `unKeyAliasRow` and `isUNameKeyAB`
-still call `canonUnionKeyOfName`, and so does the canon-key fallback in `unNameAdoptTyKeyRow`.
+orders.
+
+Then the descent (L6 log, 2026-10-19, step 5's third slice). `registerInlineUnionAt` no longer
+recurses through its name's parts. A list, a `| null`, a closure or a map registers the unions
+its subtypes hold by descending its arena type (`registerInlineUnionChildOf`), and a recursive
+type reaching itself again stops (`riuOpenTys`). No module changes. The record split the
+type-key guard works around is filed as [D7220](inventory/D7220.md).
+
+Left: `mintInlineUnion` still mints under `canonUnionKeyOfName`, until D7220 gives one record
+type one struct row. The adopt with no type is live: an `i64 | i32` mixed-width literal-union
+alias has a literal-preserving type key that finds no row. `isUName`, `unionRowOf`,
+`registerValueUnionNameTy` and `pushValueUnionRow` are asked with a name only. So
+`unRowOfSetText`, `unKeyPush`, `unKeyAliasRow`, `isUNameKeyAB` and that fallback still call
+`canonUnionKeyOfName`. They move once a softened type key at the `tyCanonKey` grain exists, or
+once the type reaches `registerValueUnionName`'s callers.
 
 ## 6. The risks
 
