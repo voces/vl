@@ -42,7 +42,9 @@ when three agents each ran a FULL CENSUS sweep, and with 6 agents running on 202
 another lane while the 5-minute load is under 0.75 × `nproc`, more than 15 GiB is available, and
 there is independent work that touches no running lane's files. Stop refilling above load
 `nproc` or under 10 GiB available (`earlyoom` SIGTERMs at 10%). Builds stay at `JOBS=6` /
-`DENO_JOBS=4`, and the full census still runs alone.
+`DENO_JOBS=4`, and the full census still runs alone. Start new agents ONE AT A TIME and re-read
+the load first: each runs two self-builds at setup, and four started together on top of six
+running took available memory from 32 GiB to 3 GiB on 2026-10-19.
 
 **CPU is the binding resource, and process spends more of it than compiler speed does.** A
 builder re-running proof that the merge queue re-proves on the merged tree is the first thing
