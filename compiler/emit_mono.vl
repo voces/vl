@@ -4000,11 +4000,32 @@ function monoLamParamPinAnn(
     if pi >= lt.fnParamTypes.length { return -1 }
     const pty = lt.fnParamTypes[pi]
     if pty < 0 || !tyHasTyVar(pty) { return -1 }
-    const st = substTyDeep(pty, bN, bT)
+    let st = substTyDeep(pty, bN, bT)
+    // A type variable of another declaration (the generic initializing the binding) is
+    // pinned by the calls the lambda's value reaches in this instance (D7181).
+    if st >= 0 && tyHasTyVar(st) && !tyIsParamHole(pty) {
+      st = monoLamReachParamTy(fnIx, pi, bN, bT)
+    }
     if st < 0 || tyHasTyVar(st) { return -1 }
     const nm = monoPinAnnSpelling(st)
     if nm == "" { return -1 }
     return synthTypeRefTy(nm, -1, st)
+  }
+  -1
+}
+
+// Parameter `pi`'s type, or with `pi` -1 the result's, in the one call type lambda `fnIx`'s
+// value reaches at instance binding `bN`/`bT` (`vrCalleeTy`); -1 when it reaches no one type.
+function monoLamReachParamTy(fnIx: i32, pi: i32, bN: string[], bT: i32[]): i32 {
+  if !vrIndexed(fnIx) { return -1 }
+  const ct = vrCalleeTy(fnIx, "", bN)
+  if ct < 0 || ct >= T.tys.length { return -1 }
+  const f = T.tys[ct]
+  if f is TyFunc {
+    if pi < 0 { return substTyDeep(f.fnRet, bN, bT) }
+    if pi < f.fnParamTypes.length {
+      return substTyDeep(f.fnParamTypes[pi], bN, bT)
+    }
   }
   -1
 }
@@ -4251,6 +4272,10 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
   if keptJoin { rty = kept }
   if rty >= 0 && tyHasTyVar(rty) {
     let rs = substTyDeep(rty, bN, bT)
+    if rs >= 0 && tyHasTyVar(rs) && !tyIsParamHole(rty) {
+      const rr = monoLamReachParamTy(fnIx, -1, bN, bT)
+      if rr >= 0 { rs = rr }
+    }
     if monoRetReadsHoleParam(rex, fnIx) { rs = monoHoleTy(rs) }
     if rs >= 0 && rs != rty {
       const litGate = rex < 0 && monoTyHasLitMember(rs) && !keptJoin
@@ -11727,11 +11752,18 @@ let monoCellAliasListOk = 0 - 1
 function monoListInitHoldsCellAlias(v: i32, ctx: i32): boolean {
   if v < 0 { return false }
   const lit = P.nodes[v]
-  if !(lit is ArrayLit) || lit.pos < 0 { return false }
+  if !(lit is ArrayLit) || lit.pos < 0 || !monoListMayHoldFn(v) { return false }
   for e in lit.arrElems {
     if monoNamesCellAlias(e, ctx) { return true }
   }
   false
+}
+
+// Whether the list literal at `v` may hold a function at this instance: its type is open or
+// names one. A list of a closed non-function type holds no binding a call could follow.
+function monoListMayHoldFn(v: i32): boolean {
+  const t = nodeTyIxOf(v)
+  t < 0 || tyHasTyVar(t) || tyMayHoldFn(t, 0)
 }
 
 // The element a literal index spelled `text` names in a list of `len` elements, by value in any
@@ -13321,8 +13353,9 @@ function monoReachRecTy(a: i32, t: Ty) {
 // each reached callee still open; -1 when the slot is no such function or reaches no one type.
 function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
   if st < 0 || st >= T.tys.length || !(T.tys[st] is TyFunc) { return -1 }
-  if !tyHasTyVar(st) || pinResolvedFnTy(st) >= 0 { return -1 }
-  const ct = vrCalleeTy(a, path)
+  const pr = pinResolvedFnTy(st)
+  if !tyHasTyVar(st) || (pr >= 0 && !tyHasTyVar(pr)) { return -1 }
+  const ct = vrCalleeTy(a, path, monoFrameTyParamsOf(a))
   if ct < 0 { return -1 }
   for c in vrCalls(a, path) {
     const cn = P.nodes[c]
@@ -13334,6 +13367,20 @@ function monoReachSlotTy(a: i32, st: i32, path: string): i32 {
     }
   }
   ct
+}
+
+// The type parameters the generic frames enclosing node `a` declare, which each instance binds.
+function monoFrameTyParamsOf(a: i32): string[] {
+  const out: string[] = []
+  let f = vrFrameOf(a)
+  while f >= 0 {
+    const fn = P.nodes[f]
+    if fn is FuncDecl {
+      for tp in fn.fnTyParams { out.push(tp) }
+    }
+    f = vrFrameOf(f)
+  }
+  out
 }
 
 // Adds to `monoInertReach`'s index the subtrees under `roots` not yet in it, such as an
@@ -17107,6 +17154,7 @@ function monoWalk(ix: i32, ctx: i32) {
       if (
         n.pos >= 0
         && ix != monoCellAliasListOk
+        && monoListMayHoldFn(ix)
         && monoNamesCellAlias(es[i3], ctx)
       ) {
         return monoCellAliasListFail(es[i3])
