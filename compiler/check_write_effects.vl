@@ -16,10 +16,12 @@ import {
   ForRange,
   FuncDecl,
   Ident,
+  IfStmt,
   Index,
   IsExpr,
   LetDecl,
   Member,
+  Node,
   NullLit,
   NumLit,
   ObjLit,
@@ -31,6 +33,7 @@ import {
   Unary,
   elseIfLink,
   i32ToStr,
+  nodeChildren,
   nodeIsTplHole,
   nodeSpineChildren,
 } from "./ast"
@@ -220,26 +223,62 @@ function weNeverFnLeaf(a: i32): boolean {
     || n is ArrayLit
 }
 
-// The names a body binds only by a `const` holding an object, list or map it builds there.
-function weFreshNames(ix: i32, bound: string[], out: string[]) {
-  if ix < 0 || ix >= P.nodes.length { return 0 }
+// `fnBoundNames` of the function at `fnIx` into `bound`, and from the same walk the names its
+// body binds only by a `const` holding an object, list or map it builds there, into `fresh`.
+function weBoundAndFresh(
+  fnIx: i32,
+  body: i32,
+  bound: string[],
+  fresh: string[],
+) {
+  const cand: string[] = []
+  weBoundWalk(fnIx, body, fnIx == body, bound, cand)
+  for nm in cand {
+    if weBoundOnce(bound, nm) { fresh.push(nm) }
+  }
+  0
+}
+
+// The walk of `fnBoundNames`, also adding to `cand` each `const` holding a fresh object, list or
+// map at or below node `body` (`inBody` once there), in source order.
+function weBoundWalk(
+  ix: i32,
+  body: i32,
+  inBody: boolean,
+  out: string[],
+  cand: string[],
+) {
   const n = P.nodes[ix]
-  if n is LetDecl {
-    if (
-      n.letKw == "const"
-      && weInitIsFresh(n.letInit)
-      && weBoundOnce(bound, n.letName)
-    ) {
-      out.push(n.letName)
+  if n is FuncDecl {
+    let i = 0
+    while i < n.fnParams.length {
+      const p = P.nodes[n.fnParams[i]]
+      if p is Param { out.push(p.parName) }
+      i = i + 1
     }
   }
+  if n is LetDecl {
+    out.push(n.letName)
+    if inBody && n.letKw == "const" && weInitIsFresh(n.letInit) {
+      cand.push(n.letName)
+    }
+  }
+  if n is ForRange { out.push(n.frVar) }
+  if n is ForIn {
+    out.push(n.fiVar)
+    if n.fiVar2 != "" { out.push(n.fiVar2) }
+  }
+  if !(n is IfStmt) {
+    for k in nodeChildren(ix) {
+      if k >= 0 { weBoundWalk(k, body, inBody || k == body, out, cand) }
+    }
+    return 0
+  }
+  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
   while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      weFreshNames(kids[i], bound, out)
-      i = i + 1
+    for k in nodeSpineChildren(cur) {
+      if k >= 0 { weBoundWalk(k, body, inBody || k == body, out, cand) }
     }
     cur = elseIfLink(cur)
   }
@@ -566,34 +605,11 @@ function argEffectsOn(
 // is local business; a write rooted at anything else is a write through a free variable, which is
 // the caller's binding.
 export function fnBoundNames(fnIx: i32, out: string[]) {
-  const n = P.nodes[fnIx]
-  if n is FuncDecl {
-    let i = 0
-    while i < n.fnParams.length {
-      const p = P.nodes[n.fnParams[i]]
-      if p is Param { out.push(p.parName) }
-      i = i + 1
-    }
-  }
-  if n is LetDecl { out.push(n.letName) }
-  if n is ForRange { out.push(n.frVar) }
-  if n is ForIn {
-    out.push(n.fiVar)
-    if n.fiVar2 != "" { out.push(n.fiVar2) }
-  }
-  // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
-  let cur = fnIx
-  while cur >= 0 {
-    const kids = nodeSpineChildren(cur)
-    let k = 0
-    while k < kids.length {
-      if kids[k] >= 0 { fnBoundNames(kids[k], out) }
-      k = k + 1
-    }
-    cur = elseIfLink(cur)
-  }
-  0
+  // With no body to be inside, the walk adds no candidate, so the shared empty list stays empty.
+  weBoundWalk(fnIx, -1, false, out, weNoNames)
 }
+
+const weNoNames: string[] = []
 
 // The full place keys a function writes through a free variable — a captured local or a
 // module-level binding — or opaque. This channel exists because the parameter channel is keyed on
@@ -741,9 +757,8 @@ export function fnWriteShapes(fnIx: i32): WeSet {
   const fd = P.nodes[fnIx]
   if fd is FuncDecl {
     const bound: string[] = []
-    fnBoundNames(fnIx, bound)
     const fresh: string[] = []
-    weFreshNames(fd.fnBody, bound, fresh)
+    weBoundAndFresh(fnIx, fd.fnBody, bound, fresh)
     const params: string[] = []
     let pi = 0
     while pi < fd.fnParams.length {
@@ -876,13 +891,15 @@ function weScanShapes(
   } else if n is Call {
     if !weCallShapes(acc, n, ix, fresh, params, bound) { return false }
   }
-  const ds = opSiteDecls(ix)
-  if opSiteRecvUntyped(ix) { weUnresAt(ix * 2 + 1) }
-  let d = 0
-  while d < ds.length {
-    if ds[d] < 0 { return false }
-    if !weAccClosed(acc, fnWriteShapes(ds[d])) { return false }
-    d = d + 1
+  if weMayDispatch(n) {
+    const ds = opSiteDecls(ix)
+    if opSiteRecvUntyped(ix) { weUnresAt(ix * 2 + 1) }
+    let d = 0
+    while d < ds.length {
+      if ds[d] < 0 { return false }
+      if !weAccClosed(acc, fnWriteShapes(ds[d])) { return false }
+      d = d + 1
+    }
   }
   let cur = ix
   while cur >= 0 {
@@ -1203,11 +1220,19 @@ function weRefsIn(ix: i32, out: i32[]) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   const n = P.nodes[ix]
   if n is Ident {
+    // A name has no children.
     const d = fnDeclIx[n.identName] ?? -1
     if d >= 0 && !i32ListHas(out, d) { out.push(d) }
+    return 0
   }
-  for d in opSiteDecls(ix) {
-    if d >= 0 && !i32ListHas(out, d) { out.push(d) }
+  if weMayDispatch(n) {
+    for d in opSiteDecls(ix) {
+      if d >= 0 && !i32ListHas(out, d) { out.push(d) }
+    }
+  }
+  if !(n is IfStmt) {
+    for k in nodeChildren(ix) { weRefsIn(k, out) }
+    return 0
   }
   let cur = ix
   while cur >= 0 {
@@ -1216,6 +1241,10 @@ function weRefsIn(ix: i32, out: i32[]) {
   }
   0
 }
+
+// Whether node `n` can be an operator site that dispatches: only an operator or an index is, so
+// `opSiteDecls` answers nothing and `opSiteRecvUntyped` false for every other kind.
+function weMayDispatch(n: Node): boolean { n is BinExpr || n is Index }
 
 // Drop the summaries that read a node with no type yet, once a body is entered or left: another
 // body checked since may have typed it.
