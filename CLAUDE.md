@@ -33,15 +33,20 @@ with an earlier version of the file — leaves std for `docs/internals/std-notes
 mechanical half (module-scoped to `std/`, **no baseline**: it landed at zero and stays
 there); the rest is the review's, and the full rubric is `std-api-review.md` §4.
 
-## Agent concurrency — the cap was calibrated against a run nobody makes any more
+## Agent concurrency — no fixed cap; refill on measured load, memory and token spend
 
-**Up to 6 concurrent worktree agents at `JOBS=6` / `DENO_JOBS=4`.** The old cap of 3 came from an
-`earlyoom` kill measured when three agents each ran a FULL CENSUS sweep (~20 GiB in 64 s on
-`nproc=24`). No agent runs the census now — every brief forbids it and the distilled corpus is
-~35 s (2026-09-05) — so that measurement no longer describes the workload. Measured
-2026-08-28 with agents running: **78% of 47 GiB available, largest process 1.4 GB**.
-`earlyoom` still SIGTERMs at 10% available, so check `free` before going wide, and drop back
-to 3 for anything that does run a full census block.
+**There is no fixed number of concurrent worktree agents** (owner, 2026-10-19). Each fixed cap so far
+(3, then 6) was a measurement of a workload that later changed: 3 came from an `earlyoom` kill
+when three agents each ran a FULL CENSUS sweep, and with 6 agents running on 2026-10-19 the
+5-minute load was 11 on `nproc=24`, so half the box sat idle. At each agent completion, start
+another lane while the 5-minute load is under 0.75 × `nproc`, more than 15 GiB is available, and
+there is independent work that touches no running lane's files. Stop refilling above load
+`nproc` or under 10 GiB available (`earlyoom` SIGTERMs at 10%). Builds stay at `JOBS=6` /
+`DENO_JOBS=4`, and the full census still runs alone.
+
+**CPU is the binding resource, and process spends more of it than compiler speed does.** A
+builder re-running proof that the merge queue re-proves on the merged tree is the first thing
+to cut: the full identity diff, the three-run L2 fuel comparison, the whole `vl_*` shard.
 
 ## Disk — every tree, target and temp dir is removed by whoever made it
 
