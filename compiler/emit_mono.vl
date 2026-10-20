@@ -42,7 +42,7 @@ import {
   peelGroupParens,
   unionMemberCount,
 } from "./tyname"
-import { njSetPinFn, pinResolvedFnTy } from "./check_core_state"
+import { njSetPinFn, nodeRepTyIxOf, pinResolvedFnTy } from "./check_core_state"
 import {
   bindGenUnionArmInto,
   bindGenUnionShapedArmInto,
@@ -78,7 +78,7 @@ import {
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
-import { tyLeavesDisjoint } from "./check_type_shape"
+import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
 import { isVarTyIxOf, recordClonedIsVarTyIx } from "./check_list_union"
@@ -472,6 +472,7 @@ import {
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
 import { variantIndexOf } from "./emit_narrow_slots"
+import { variantRowOfTy } from "./emit_mv_slots"
 import {
   isSName,
   monoRetRowName,
@@ -1615,6 +1616,14 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   // rep from the locals table, which mid-mono has none, and would pin `i32` (D3139).
   const wrp = monoLoopVarRecordPin(cax, fnIx)
   if wrp != "" { return wrp }
+  // An object literal the checker built as a union member pins that member's row (D8021).
+  if P.nodes[cax] is ObjLit {
+    const ovr = variantRowOfTy(nodeRepTyIxOf(cax))
+    if ovr >= 0 && ovr < uVariants.length {
+      const ovn = monoAnnPinName(uVariants[ovr])
+      if ovn != "" { return ovn }
+    }
+  }
   // The variant table, asked before the struct one. `collectS` skips a `type X = {…}` that
   // is a union member, so `type Shape = Circle | Sq` deletes `Circle`'s `sNames` row and
   // mints a variant row. `exprVariantIndex` is `structIndexOfExpr`'s storage-class twin,
@@ -1787,6 +1796,23 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
   monoArgTyNameRep(ix, fnIx, cax)
 }
 
+// The row an inferred-result function's object literals are built at, by the record its one
+// call delivers to, where every value it hands back is such a literal and all share that row,
+// else "". The checked result still names the literal's own type, which is not the build (D8020).
+function monoRebuiltLitRetName(fd: i32): string {
+  let row = -1
+  for lf in recFnValueLeaves(fd) {
+    const lp = unwrapParen(lf)
+    if lp < 0 || lp >= P.nodes.length || !(P.nodes[lp] is ObjLit) { return "" }
+    const rt = nodeRepTyIxOf(lp)
+    if rt < 0 || rt == nodeTyIxOf(lp) || !(T.tys[rt] is TyObj) { return "" }
+    if row >= 0 && rt != row { return "" }
+    row = rt
+  }
+  if row < 0 { return "" }
+  monoRetRowName(row)
+}
+
 // The binding rungs of `monoArgTyName`: a call argument's callee return, then an `Ident`
 // argument's local, captured, parameter or module binding. "" refuses; falls to
 // `monoArgTyNameProjected` where none answers.
@@ -1824,6 +1850,8 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
               return arn
             }
           } else {
+            const lrn = monoRebuiltLitRetName(fnStmts[acfe])
+            if lrn != "" { return lrn }
             // …and an inferred return is as good a pin as an annotated one:
             // `inferRetNameOf` is the checker's own record, routed through
             // `monoAnnPinName` so the pin is one that ladder claims.
