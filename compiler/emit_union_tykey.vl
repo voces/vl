@@ -1,13 +1,30 @@
 // `emit_union_tykey.vl` — the union registry's type key: an order-independent identity for a
-// row, minted beside its name key, and the shadow that compares it with the type each untyped
-// registration root could hand over. Nothing but the shadow reads it.
+// row, minted beside its name key; the adopt that binds an unregistered spelling to the row its
+// type keys to; and the shadow that compares the key with the type each untyped registration
+// root could hand over.
 
 import { i32ToStr } from "./ast"
 import { canonUnionMemberTysOf } from "./check_program"
-import { T, TyArray, tyToStructStr } from "./check_types"
+import { canonUnionKeyOfName } from "./check_nj_join"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cUserTypes,
+  tyToStructStr,
+} from "./check_types"
 import { structIndexByName } from "./emit_atom_kinds"
 import { strLess } from "./emit_base"
-import { repShadowAddReason } from "./emit_rep"
+import { repShadowAddReason, unRowOfKey, unRowOfKeyId } from "./emit_rep"
 import {
   sTyIx,
   unKey,
@@ -16,6 +33,7 @@ import {
   unMemTyCount,
   unMemTyStart,
   unMemTys,
+  unRowBySid,
   unTyIx,
   unTyKey,
 } from "./emit_state"
@@ -23,8 +41,10 @@ import { TY_WALK_DEPTH } from "./emit_ty_canon"
 import {
   unABOn,
   unMemPeelAliasWrapper,
+  unNameBound,
   unRowOfName,
 } from "./emit_union_registry"
+import { sidArrPut, sidOf } from "./symbols"
 import { flattenVariantsInto } from "./tyquery"
 
 // Key texts to ids. Pure text identities, so the table lives across programs.
@@ -294,4 +314,84 @@ export function unTyKeyShadowSweep() {
   utkCnt = []
   utkNe = []
   0
+}
+
+// True when `name` names a row, after binding an unregistered spelling to a row: with `ty`, the
+// row `ty` keys to when the two place `null` alike; with none, the row `name`'s canon key finds.
+// A declared alias name or a union type of one member stays unbound and answers false.
+export function unNameAdoptTyKeyRow(name: string, ty: i32): boolean {
+  if unNameBound(name) { return true }
+  if name == "" || (cUserTypes[name] ?? -1) >= 0 { return false }
+  let r = -1
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyUnion {
+      if t.uMembers.length < 2 { return false }
+    }
+    r = unRowOfKey(ty)
+    if r < 0 || r >= unKey.length { return false }
+    if utkTyNullShape(ty) != utkRowNullShape(r) { return false }
+  } else {
+    const k = canonUnionKeyOfName(name)
+    if k < 0 { return false }
+    r = unRowOfKeyId(k)
+    if r < 0 || r >= unKey.length || unKey[r] != k { return false }
+  }
+  sidArrPut(unRowBySid, sidOf(name), r)
+  true
+}
+
+// Where `null` sits among the members of union `ty`, in its name's order: "n" for null, "m"
+// otherwise; "?" when a member has no render.
+function utkTyNullShape(ty: i32): string {
+  const mems: i32[] = []
+  if !canonUnionMemberTysOf(ty, mems) { return "?" }
+  let out = ""
+  for m in mems {
+    if m < 0 { out = out + "n" } else { out = out + "m" }
+  }
+  out
+}
+
+// Where `null` sits among the members of row `r`: "n" for null, "m" otherwise, a declared union
+// atom expanded through its type; "" for a row with no member slice.
+function utkRowNullShape(r: i32): string {
+  if (
+    r >= unMemTyStart.length
+    || r >= unMemTyCount.length
+    || unMemTyStart[r] < 0
+  ) {
+    return ""
+  }
+  const s = unMemTyStart[r]
+  let out = ""
+  let i = 0
+  while i < unMemTyCount[r] && s + i < unMemAtoms.length {
+    const a = unMemAtoms[s + i]
+    const di = cUserTypes[a] ?? -1
+    if a == "null" { out = out + "n" }
+    else if di >= 0 { out = out + utkNullShapeOfTy(di, 0) }
+    else { out = out + "m" }
+    i = i + 1
+  }
+  out
+}
+
+// `utkRowNullShape` of declared type `ty`, a nullable placing its `null` last.
+function utkNullShapeOfTy(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth > TY_WALK_DEPTH { return "m" }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return utkNullShapeOfTy(t.nInner, depth + 1) + "n"
+    }
+    TyUnion => {
+      let out = ""
+      for m in t.uMembers { out = out + utkNullShapeOfTy(m, depth + 1) }
+      return out
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return "m"
+    }
+  }
 }
