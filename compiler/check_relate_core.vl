@@ -3977,12 +3977,84 @@ function holeCallNodeTy(
     if f is TyFunc { return f.fnRet }
     return -1
   }
+  // A direct call of an un-annotated function takes its body's result at the bound arguments,
+  // as it does outside a body (D8220).
+  if n is Call {
+    const dc = cwCalleeDeclOf(n.callFn)
+    const dr = holeDirectCallRetAt(n, dc, vNames, vTys, calleeFn, depth)
+    if dr >= 0 { return dr }
+  }
   if n is BinExpr {
     return holeArithNodeTy(n, ix, vNames, vTys, calleeFn, depth)
   }
   const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
   if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
   t
+}
+
+// The result of direct call `n` of un-annotated function `decl` as its body gives it at the bound
+// arguments, as a hole call of it takes (D8161): `half(3)` over `a / 2.0` is `f64`. `retTy` when
+// `decl` declares its result or has no hole parameter, or an argument stays open.
+export function directHoleBodyRet(
+  n: Call,
+  decl: i32,
+  vNames: string[],
+  vTys: i32[],
+  retTy: i32,
+): i32 {
+  if !directHoleDecl(decl) { return retTy }
+  const vt = nodeTyOf(n.callFn)
+  if vt < 0 || vt >= T.tys.length { return retTy }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) || !tyHasTyVar(vf.fnRet) { return retTy }
+  const inst = substTyDeep(vt, vNames, vTys)
+  if inst < 0 || tyHasTyVar(inst) { return retTy }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(decl, inst, noN, noT)
+  if r < 0 || tySame(r, retTy) { return retTy }
+  r
+}
+
+// Whether `decl` is a function with no declared result or type parameters and a hole parameter,
+// whose call's result is its body's at the call's arguments.
+function directHoleDecl(decl: i32): boolean {
+  if decl < 0 || decl >= P.nodes.length { return false }
+  const f = P.nodes[decl]
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnTyParams.length > 0 {
+    return false
+  }
+  for pi in f.fnParams {
+    const p = P.nodes[pi]
+    if p is Param && p.parType < 0 { return true }
+  }
+  false
+}
+
+// `holeCallNodeTy` for direct call `n` of un-annotated function `decl` in a body: the result the
+// callee's body gives at the call's own arguments under the bindings (D8220); -1 when `decl` is
+// no such function or an argument or the result stays open.
+function holeDirectCallRetAt(
+  n: Call,
+  decl: i32,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  if !directHoleDecl(decl) || holeFnArgDepth >= HOLE_CALL_NODE_MAX { return -1 }
+  const ats: i32[] = []
+  for a in n.callArgs {
+    const at = holeCallNodeTy(a, vNames, vTys, calleeFn, depth + 1)
+    if at < 0 { return -1 }
+    ats.push(widenLitTy(at))
+  }
+  holeFnArgDepth = holeFnArgDepth + 1
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(decl, mkFuncTy(ats, TY_I32), noN, noT)
+  holeFnArgDepth = holeFnArgDepth - 1
+  r
 }
 
 // The result of generic function type `f`, bound to a hole, at hole call `c`'s own arguments
