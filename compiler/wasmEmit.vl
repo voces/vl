@@ -27,6 +27,7 @@ import {
   nodeTyRecord,
 } from "./check_node_tys"
 import { fsAsk, fsAskCallee } from "./fn_split"
+import { keyHasPrefix } from "./check_places"
 import { numCastCanFail, numUnionMembersOf } from "./check_num_lits"
 import { intMatchHeadAt, matchScrutAt } from "./check_match_heads"
 import {
@@ -358,6 +359,7 @@ import {
   capNamesFlat,
   capStartTbl,
   cboxReadTy,
+  cloAdapterCanon,
   cloEqScratchBase,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
@@ -851,6 +853,7 @@ import {
   fnAssignRetKind,
   fnHasEnvParam,
   fnIndexOf,
+  fnIndexOfAt,
   fnIndexOfNode,
   fnRetExprOf,
   fnReturnsLitAtom,
@@ -2026,6 +2029,14 @@ function emitObj(body: u8[], objIx: i32, fnIx: i32) {
   emitFail("emitProgram: expected an object literal")
 }
 
+// Whether `ix` is a read of `name`, through parentheses.
+function nameIsBareIn(name: string, ix: i32): boolean {
+  const x = unwrapParen(ix)
+  if x < 0 { return false }
+  const n = P.nodes[x]
+  n is Ident && n.identName == name
+}
+
 // Does `name` appear as a value — any position other than the callee of a direct
 // `name(...)` call — in the subtree at `ix`? A generic function bound to `name` is sound
 // only when every use is a direct call, since `monomorphize` rewrites each call to its
@@ -2089,7 +2100,18 @@ function nameUsedAsValueIn(name: string, ix: i32) {
     RetStmt => {
       return nameUsedAsValueIn(name, n.retArg)
     }
+    // A compared name is read for its identity, which calls nothing (D7383).
     BinExpr => {
+      if n.binOp == "==" || n.binOp == "!=" {
+        if (
+          !nameIsBareIn(name, n.binLeft)
+          && nameUsedAsValueIn(name, n.binLeft)
+        ) {
+          return true
+        }
+        return !nameIsBareIn(name, n.binRight)
+          && nameUsedAsValueIn(name, n.binRight)
+      }
       if nameUsedAsValueIn(name, n.binLeft) { return true }
       return nameUsedAsValueIn(name, n.binRight)
     }
@@ -2184,6 +2206,57 @@ export function emitClosureValueCore(body: u8[], fe: i32, fnIx: i32) {
     )
   }
 
+  return emitClosureValueOf(body, cloAdapterCanonOf(fe), fnIx)
+}
+
+// The function a function-value adapter `fe` calls (`fvaAdapt` in check_assignable.vl): it takes
+// at least one parameter, all named `$fp<k>`, and its body is one call of a declared function
+// passing them in order; this returns that function's position. -1 for any other function.
+function fvaAdapterCallee(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const d = P.nodes[fnStmts[fe]]
+  if !(d is FuncDecl) { return -1 }
+  if d.fnName != "" && !keyHasPrefix(d.fnName, "__lambda_") { return -1 }
+  const ps = d.fnParams
+  if ps.length == 0 || d.fnBody < 0 || d.fnBody >= P.nodes.length { return -1 }
+  const b = P.nodes[d.fnBody]
+  if !(b is Block) || b.blkStmts.length != 1 { return -1 }
+  const c = P.nodes[unwrapParen(b.blkStmts[0])]
+  if !(c is Call) || c.callArgs.length != ps.length { return -1 }
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  if !(P.nodes[c.callFn] is Ident) { return -1 }
+  let i = 0
+  while i < ps.length {
+    const p = P.nodes[ps[i]]
+    if !(p is Param) || p.parName != "$fp" + i32ToStr(i) { return -1 }
+    if !nameIsBareIn(p.parName, c.callArgs[i]) { return -1 }
+    i = i + 1
+  }
+  fnIndexOfAt(sidOfNode(c.callFn), fnStmts[fe], c.callFn)
+}
+
+// The function whose closure id stands for capture-free adapter `fe`: its callee when the callee
+// has the adapter's closure signature, else the first adapter emitted of the same callee at that
+// signature; `fe` itself for any other function (D7382).
+function cloAdapterCanonOf(fe: i32): i32 {
+  if fnEnvIdxOf(fe) >= 0 { return fe }
+  const callee = fvaAdapterCallee(fe)
+  if callee < 0 { return fe }
+  const sk = cloSigKeyExt(fe)
+  if callee < fnStmts.length && fnEnvIdxOf(callee) < 0 && !cloLifted(callee) {
+    if !fnHasUnannotatedParam(callee) && cloSigKeyExt(callee) == sk {
+      return callee
+    }
+  }
+  const key = i32ToStr(callee) + "|" + sk
+  const have = cloAdapterCanon[key] ?? -1
+  if have >= 0 { return have }
+  cloAdapterCanon[key] = fe
+  fe
+}
+
+// `emitClosureValueCore` for a function already checked to have a closure signature.
+function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
   const envIdx = fnEnvIdxOf(fe)
   if envIdx < 0 {
     // Capture-free: the module's one constant closure of `fe`. Equality reads the id and the
@@ -33917,6 +33990,10 @@ function emitIdentNonLocalRead(
     }
     // A value nothing can call has no signature to keep, so a hole function may be one (D6660).
     if i32ListHas(monoInertCalled, exprIx) {
+      return emitClosureValueCore(body, fe, fnIx)
+    }
+    // So may one whose template a call instanced, called only through an alias (D7383).
+    if i32ListHas(monoInertValues, exprIx) && monoInstantiatedAny(fe) {
       return emitClosureValueCore(body, fe, fnIx)
     }
     // A hole function refused as a value may be one an identity call hands a binding (D6020).
