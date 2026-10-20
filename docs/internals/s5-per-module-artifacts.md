@@ -16,7 +16,8 @@ This doc covers:
 6. the cache key;
 7. the ordered steps and the gate on each.
 
-Step 1, the relocation recorder, has landed (§8). Step 2, symbolic value rows, is in review (§9).
+Step 1, the relocation recorder, has landed (§8), and so has step 2, symbolic value rows (§9).
+Step 3a, a link pass inside one compile, is in review (§10).
 
 ## 1. What a body encodes: the census
 
@@ -157,15 +158,22 @@ on program behaviour instead.
    `vl.reloc` rows for every value-borne index. The gates are identity, the fixpoint, and the
    proof that reapplying the rows plus decode re-links each module byte for byte. Seed and L2
    fuel are measured.
-2. **Symbolic value rows.** (In review, §9.) Name each row's value by its symbol: the
+2. **Symbolic value rows.** (Landed, §9.) Name each row's value by its symbol: the
    tag's deciding key (§3), atom text, the closure function's name, the guarded global.
    Record global initialiser constants too; data segments carry no relocated value (§9).
    Gates: identity, the fixpoint, and the proof with every row resolved through its symbol
    rather than its number.
 3. **A link pass inside one compile.** Emit the whole program, then rebuild it through a link
-   step that reads only per-module bodies, symbol tables and rows. Types, tags, atoms,
-   strings, functions and globals are assigned at link. Gates: identity, the fixpoint, and
-   linked output equal to direct output on the self-build and every case.
+   step that reads only per-module bodies, symbol tables and rows. Gates: identity, the
+   fixpoint, and linked output equal to direct output on the self-build and every case.
+   The step is taken in two halves:
+   - **3a.** (In review, §10.) Functions, globals, pooled strings, atoms, closure slots and
+     init guards are assigned at link from their symbols, and union tags are resolved from
+     their keys against the program's band tables. The type, import, memory, tag and data
+     sections pass through as program-level input.
+   - **3b.** The type section and the tag band tables are built at link from per-module
+     demands, so that no section passes through whole. This is where step 4's local
+     numbering starts to be possible.
 4. **Per-module emission.** Emit each module's bodies against local numbering, with
    instances as demands (§4), still inside one compile and still linked at once. Gates:
    identity and the fixpoint, plus a **key-coverage test**. One module compiled under two
@@ -325,3 +333,56 @@ source and has not been attributed to a file.
 
 Disarmed, every entry point returns at once: difftree `--identity` reads 0 of 10,936
 builds differing, and the candidate compiling master's source equals master's fixpoint.
+
+## 10. Step 3a: a link pass inside one compile
+
+Under `RELOC_ARMED`, `emitLinkSection` (`compiler/emit_link.vl`) runs once after the module is
+finished. It cuts the module into one artifact per source module plus program-level input,
+rebuilds the module through `link()` (`compiler/link.vl`), and compares the result with what
+the emitter wrote, section by section and body by body. It writes the outcome as a `vl.link`
+custom section, which `scripts/s5-relocs.vl link <dir> [<twin dir>]` reads.
+
+An artifact holds its functions (body bytes plus references by symbol), its global cells and
+definitions, its initialiser constants, its init guards, and its pooled and `is` strings.
+`link()` reads only artifacts and the program input. It assigns:
+
+- **function indices** from symbols: every artifact's functions in load order, then the
+  program's tail (lifted lambdas, rewrite twins and instances that no source module owns, in
+  emission order), then the runtime's;
+- **global indices**: imports, pooled strings first met, cells, then definitions in the
+  order a body first names them;
+- **atoms, guard names and guard readers**, numbered first met over initialisers and bodies;
+- **union tags**, from each tag's key against the program's band tables: a variant's rank
+  among the variant keys, a scalar code above them, and a slot-band arm by its position.
+
+The type, import, memory, tag, data and datacount sections still pass through whole, and so
+do the band tables. Step 3b builds them at link from per-module demands.
+
+| build | rows | sections differ | bodies differ | unconsumed rows | exit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| self-build | 18,724 | 0 | 0 | 0 | 0 |
+| self-build, skewed twin | 18,724 | 0 | 0 | 0 | 0 |
+| tests/cases, 4,658 modules | 44,496 | 0 | 0 | 0 | 0 |
+| tests/cases, skewed twin | 44,496 | 0 | 0 | 0 | 0 |
+
+The self-build is 224 artifacts, 13,268 functions and 167,495 body references; tests/cases is
+5,657 artifacts and 77,816 functions. Nothing is unresolved, defined twice, encoded with a
+non-minimal LEB, or undecodable. The twin (`RELOC_SKEW = 1`) moves every relocated value at
+its source; its artifacts equal the plain build's in all 4,659 pairs, so no artifact carries
+a program-dependent value outside a row.
+
+Two controls must red, and do:
+
+- dropping every 97th row: self-build 2 sections and 428 bodies differ with 193 rows no
+  reference consumed; tests/cases 39 modules differ (45 rows unconsumed);
+- `relHold` returning 0 at once: self-build 992 bodies differ; tests/cases 70 modules differ.
+
+Disarmed, every entry point returns at once: difftree `--identity` reads 0 of 10,940 builds
+differing, and the candidate compiling master's source equals master's fixpoint.
+
+Cost: seed 6,517,047 → 6,571,947 bytes (+0.84%). L2 guest fuel on master at #4186: the master
+seed on its own source 108,435,078,638, on this source 109,250,016,253 (+0.75%), and the new
+seed on this source 109,250,019,312 (+0.000003%), so the compiler is no slower on a given
+program and the cost is its own larger source. Before #4186 mixed the write scan's key, the
+same source read +2.32%, and ablations of it did not add up: linear probing over a clustered
+key made a few added declarations cost out of proportion.
