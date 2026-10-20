@@ -93,6 +93,7 @@ import {
 } from "./check_emit_queries"
 import { isNumIntrinsicName } from "./check_getter_effects"
 import {
+  mapPinReadTy,
   nodeTyMapValIsLitUnion,
   nodeTyMapValIsNulLitUnion,
   nodeTyPinIxOf,
@@ -599,6 +600,7 @@ import {
   boxNarrowAtomFor,
   declaredRefArrayName,
   emptyArrHoleElemSlot,
+  exprReReadable,
   fieldNamesSig,
   fnRetNulRefArrayNameSid,
   instAnnTyNameOfExpr,
@@ -833,6 +835,7 @@ import {
   narrowedRefArrayOfPlace,
   narrowedValueAtomOf,
   nicheReadKindAt,
+  nodeJoinRowName,
   nodeMixedUnionName,
   nodeRegisteredUnionName,
   nodeTyIsNumLitUnion,
@@ -9677,6 +9680,8 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
     NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   if nodeTyIsNullable(dix) { return true }
+  // A hole the instance binds to a nullable type is nullable there.
+  if tyBearsNull(holeOperandTyOf(dix, fnIx)) { return true }
   const un = unionNameOfExpr(dix, fnIx)
   if un != "" { return unionSetHasNull(un) }
   false
@@ -11777,6 +11782,20 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   // A `??` over such a read keeps the `-1` when its default can be null.
   const cmv = coalMapReadNulAtomTexts(ix, fnIx)
   if cmv.length > 0 { return cmv }
+  // So does a `??` over a nullable atom whose nullable default holds that same atom.
+  if (
+    e is BinExpr
+    && e.binOp == "??"
+    && coalesceDefaultNullable(e.binRight, fnIx)
+  ) {
+    const cl = nulLitAtomTextsAt(e.binLeft, fnIx, depth)
+    if (
+      cl.length > 0
+      && textsInOrder(cl, nulLitAtomTextsAt(e.binRight, fnIx, depth))
+    ) {
+      return cl
+    }
+  }
   // A call of a named function, whose return annotation `exprNulLitUnion` claimed it by.
   if e is Call && e.callFn >= 0 && P.nodes[e.callFn] is Ident {
     const t = fnIndexOfNode(e.callFn)
@@ -11908,6 +11927,17 @@ function holeNulLitElemTy(arrIx: i32, fnIx: i32): i32 {
   const rt = holeOperandTyOf(arrIx, fnIx)
   if rt < 0 { return holeArrElemPinTyOf(arrIx, fnIx) }
   tyStepElem(rt)
+}
+
+// True when `a` and `b` hold the same texts in the same order, so their atom ids agree.
+function textsInOrder(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
 }
 
 // The member texts of a `??` at `ix` over a read off an atom-valued map whose default can be
@@ -14527,9 +14557,60 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
   false
 }
 
+// True for `m[k] ?? d` in an instance whose map `m` is a hole read there as holding a nullable
+// number, beside a default that is `null` or that same nullable number: the result is that
+// number's box and the read is its arm.
+export function coalHoleNulNumRead(e: BinExpr, fnIx: i32): boolean {
+  coalHoleNulNumTy(e, fnIx) >= 0
+}
+
+// The nullable number `coalHoleNulNumRead` keeps, the instance's map value type, or -1.
+export function coalHoleNulNumTy(e: BinExpr, fnIx: i32): i32 {
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 || !exprReReadable(lhsIx) { return -1 }
+  const rd = P.nodes[lhsIx]
+  if !(rd is Index) { return -1 }
+  const own = nodeTyIxOf(unwrapParen(rd.idxArr))
+  if own < 0 || own >= T.tys.length || !(T.tys[own] is TyVar) { return -1 }
+  const mt = mapRecvTyIn(rd.idxArr, fnIx)
+  if mt < 0 { return -1 }
+  const vt = tyMapValOf(mt)
+  if (
+    !(tyIsNulPrim(vt, "i32")
+      || tyIsNulPrim(vt, "i64")
+      || tyIsNulPrim(vt, "f64")
+      || tyIsNulPrim(vt, "f32"))
+  ) {
+    return -1
+  }
+  const dix = unwrapParen(e.binRight)
+  if dix < 0 { return -1 }
+  const d = P.nodes[dix]
+  if d is NullLit { return vt }
+  let dt = holeOperandTyOf(dix, fnIx)
+  if d is BinExpr {
+    // An inner link that is no such read may drop the null, so only its own answer counts.
+    if d.binOp == "??" {
+      const it = coalHoleNulNumTy(d, fnIx)
+      if it < 0 || !tySame(it, vt) { return -1 }
+      return vt
+    }
+  }
+  // A map read is its value or `null`, so a plain number map's read is that nullable number.
+  if dt < 0 && d is Index {
+    const dm = mapRecvTyIn(d.idxArr, fnIx)
+    if dm >= 0 { dt = mapPinReadTy(dm) }
+  }
+  if dt < 0 { dt = nodeTyIxOf(dix) }
+  if dt < 0 || !tySame(dt, vt) { return -1 }
+  vt
+}
+
 // True if a binary `e` (other than an operator over a numeric union) yields the union box:
 // a `??` over a union-valued map or a nullable box, or an assignment whose target is one.
 function exprUnionBin(e: BinExpr, exprIx: i32, fnIx: i32): boolean {
+  // A hole's map read of a nullable number beside a nullable default stays that number's box.
+  if e.binOp == "??" && coalHoleNulNumRead(e, fnIx) { return true }
   const cmu = coalesceMvSlot(exprIx, fnIx)
   if cmu >= 0 {
     if mvValKind[cmu] == MVK_UNION && !mvUnionIsScalarNull(cmu) { return true }
@@ -14889,6 +14970,9 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         // the same rung or the box arm declines and the consumer's cell is not the box (D1764).
         const cvn = nodeVariantUnionName(exprIx)
         if cvn != "" { return cvn }
+        // A scalar joined to a literal union is the box the lowering builds (`nodeJoinRowName`).
+        const cjn = nodeJoinRowName(exprIx, fnIx)
+        if cjn != "" { return cjn }
       }
       // `m[k] ?? d` over a UNION-valued map yields the value union's box — resolve its name (the
       // mv slot's value name) so an un-annotated `const v = m[k] ?? d` narrows/unboxes.

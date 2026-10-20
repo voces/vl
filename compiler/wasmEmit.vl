@@ -71,12 +71,14 @@ import {
   TyArray,
   TyObj,
   TyUnion,
+  TyVar,
   listArmFitAcrossReps,
   numLitUnionBaseName,
   numLitUnionBaseTy,
   oneListUnionRender,
   primNameStr,
   tyArrayElemIx,
+  tyBearsNull,
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
@@ -214,8 +216,12 @@ import {
   isDefaultGlobalRef,
   mkArrayLit,
   mkBinary,
+  mkBlock,
   mkCallN,
   mkIdent,
+  mkIf,
+  mkIndex,
+  mkMember,
   mkNull,
   mkStr,
   nodeChildren,
@@ -811,6 +817,7 @@ import {
   catWidenSideOfBin,
   cloCallSigKey,
   cloSigKeyExt,
+  coalHoleNulNumRead,
   coalMapReadForeignDefault,
   coalesceDefaultNullable,
   coalesceLitUnionFits,
@@ -1221,6 +1228,7 @@ import {
 } from "./emit_sig_tokens"
 import {
   NICHE_NUL_LIT,
+  coalesceResultIsBox,
   coalesceResultUnionName,
   ifJoinUnionNameIn,
   narrowDropsNull,
@@ -1232,6 +1240,7 @@ import {
   narrowedValueAtomOf,
   nicheReadKindAt,
   nicheReadStashSlot,
+  nodeJoinRowName,
   nodeMixedUnionName,
   nulLitMemberTexts,
   tyIsUnionShaped,
@@ -1475,6 +1484,7 @@ import {
   tyIntLitWideTexts,
   tyIsNumericBox,
   tyLitSetMemberLexes,
+  tyMapValOf,
   tyNulLitUnionMemberTexts,
   tyNumLitMemberTexts,
   tyPeelNul,
@@ -1492,6 +1502,7 @@ import {
   mapTyValLitUnionTexts,
   nameIsLitUnionArmValueUnion,
   nameIsLitUnionType,
+  tyIsNulLitUnionNiche,
   tyIsNulStrBoxUnion,
   valueAtomKind,
 } from "./check_ty_rep"
@@ -7589,6 +7600,21 @@ function emitUnionCoerceValueAtom(
         }
         // A capture whose env field holds the atom is the atom, as a parameter is (D3358).
         if capturedKindOf(fnIx, nlArg.identName) == "i32" { nlParam = true }
+      }
+      // A declared `K | null` field or an atom-valued map read is the niche, outside an instance
+      // or where the instance's own type for the read is that niche.
+      if (
+        (nlArg is Member || nlArg is Index)
+        && ((!fnInPinnedInstance(fnIx) && !nodeTyHasTyVar(unwrapParen(exprIx)))
+          || tyIsNulLitUnionNiche(holeOperandTyOf(exprIx, fnIx)))
+        && exprNulLitUnion(exprIx, fnIx)
+      ) {
+        nlParam = true
+      }
+      if nlArg is Index && fnInPinnedInstance(fnIx) {
+        if tyIsLitUnion(tyMapValOf(mapRecvTyIn(nlArg.idxArr, fnIx))) {
+          nlParam = true
+        }
       }
       if !coerceSetHasNull(uSet, unionName) || !aUsed || nlStrArm || !nlParam {
         return emitFail(
@@ -37843,6 +37869,101 @@ function emitCoalArmRecv(body: u8[], recvIx: i32, cast: i32, fnIx: i32) {
   0
 }
 
+// The `if lhs != null { lhs } else { d }` node for `lhs ?? d` when `lhs` reads a map off a hole
+// whose pin's value excludes null and is no literal union, and the default is nullable at the
+// pin; -1 otherwise. The node carries the `??`'s type.
+function coalHoleMapReadNullTest(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  const rd = P.nodes[lhsIx]
+  if !(rd is Index) || !exprReReadable(lhsIx) { return -1 }
+  const own = nodeTyIxOf(unwrapParen(rd.idxArr))
+  if own < 0 || own >= T.tys.length || !(T.tys[own] is TyVar) { return -1 }
+  const mt = mapRecvTyIn(rd.idxArr, fnIx)
+  if mt < 0 { return -1 }
+  const vt = tyMapValOf(mt)
+  // A nullable number's box is the join's own rep, so its read is the `then` arm as is.
+  // Typed at that box, since a re-associated chain's inner link carries no type of its own.
+  if coalHoleNulNumRead(e, fnIx) {
+    const nnIf = coalNullTestIf(e, exprIx, fnIx)
+    nodeTyRecord(nnIf, vt)
+    return nnIf
+  }
+  if vt < 0 || tyBearsNull(vt) || tyIsLitUnion(vt) { return -1 }
+  const dix = unwrapParen(e.binRight)
+  if dix < 0 { return -1 }
+  if (!coalesceDefaultNullable(dix, fnIx) && !tyBearsNull(nodeTyPinIxOf(dix))) {
+    return -1
+  }
+  const ifIx = coalNullTestIf(e, exprIx, fnIx)
+  // Typed at the instance's join, which the shared `??` records only as its hole.
+  let rt = holeOperandTyOf(exprIx, fnIx)
+  if rt < 0 { rt = nodeTyPinIxOf(exprIx) }
+  if rt >= 0 && rt < T.tys.length && !(T.tys[rt] is TyVar) {
+    nodeTyRecord(ifIx, rt)
+  }
+  ifIx
+}
+
+// The `if lhs != null { lhs } else { d }` node for a re-readable map read `lhs ?? d` that joins
+// into a box the fused read cannot build, a boxed or atom value beside another arm; -1 otherwise.
+function coalMapReadJoinNullTest(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  const rd = P.nodes[lhsIx]
+  if !(rd is Index) || !exprReReadable(lhsIx) { return -1 }
+  if !exprMap(rd.idxArr, fnIx) || mapRecvScalarBoxKindIn(rd.idxArr, fnIx) >= 0 {
+    return -1
+  }
+  const vt = tyMapValOf(mapRecvTyIn(rd.idxArr, fnIx))
+  if !tyIsLitUnion(vt) && !tyIsUnionShaped(vt) && !tyBearsNull(vt) { return -1 }
+  coalNullTestIf(e, exprIx, fnIx)
+}
+
+// `if l != null { l } else { d }` for `l ?? d`, carrying the `??`'s type. A declared atom niche's
+// arm re-reads `l` at its non-null set, the narrowing the checker would have recorded.
+function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
+  const thenS: i32[] = []
+  thenS.push(coalNarrowedReRead(unwrapParen(e.binLeft), fnIx))
+  const elseS: i32[] = []
+  elseS.push(e.binRight)
+  const pos = e.pos
+  const ifIx = mkIf(
+    mkBinary("!=", e.binLeft, mkNull("null", pos), pos),
+    mkBlock(thenS, pos),
+    mkBlock(elseS, pos),
+    pos,
+  )
+  nodeTyCarry(ifIx, exprIx)
+  ifIx
+}
+
+// A copy of the name, field or map read `ix` typed at its literal union without `null`, or `ix`
+// itself when its type, an instance's own for a hole, is no declared `K | null` atom niche.
+function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
+  let lt = nodeTyIxOf(ix)
+  if lt >= 0 && lt < T.tys.length && T.tys[lt] is TyVar {
+    lt = holeOperandTyOf(ix, fnIx)
+  }
+  if lt < 0 || lt >= T.tys.length || T.tys[lt] is TyVar { return ix }
+  const nn = tyPeelNul(lt)
+  if nn == lt || !tyIsLitUnion(nn) { return ix }
+  const l = P.nodes[ix]
+  let cp = -1
+  if l is Member { cp = mkMember(l.memObj, l.memProp, l.pos) }
+  if l is Index { cp = mkIndex(l.idxArr, l.idxIndex, l.pos) }
+  if l is Ident { cp = mkIdent(l.identName, l.pos) }
+  if cp < 0 { return ix }
+  nodeTyRecord(cp, nn)
+  cp
+}
+
 function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // Unwrap a parenthesized lhs so `(m[k]) ?? d` / `(m.get(k)) ?? d` take the same fused
   // map-get path as the bare forms — parens must not change `??` semantics. `lhsIx` is the
@@ -37922,6 +38043,10 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if popTakesElem(lhsIx) && nodeTyIxOf(lhsIx) == nodeTyIxOf(exprIx) {
     return emitExpr(body, lhsIx, fnIx)
   }
+  // A hole's map read with a nullable default is the null test the rewrite makes of the direct
+  // spelling (D2248), decided here because only the instance knows the map and the default.
+  const holeIf = coalHoleMapReadNullTest(e, lhsIx, exprIx, fnIx)
+  if holeIf >= 0 { return emitExpr(body, holeIf, fnIx) }
   // A default that is another arm of the result's union reads the map as a nullable operand,
   // through the join arms below.
   const mapFused = !coalesceMapReadJoins(exprIx, fnIx)
@@ -37929,6 +38054,8 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     const msj = emitMapGetOrScalarJoin(body, e, exprIx, fnIx)
     if msj < 0 { return -1 }
     if msj > 0 { return 0 }
+    const mjIf = coalMapReadJoinNullTest(e, lhsIx, exprIx, fnIx)
+    if mjIf >= 0 { return emitExpr(body, mjIf, fnIx) }
   }
   if lhs is Index {
     if mapFused && exprMap(lhs.idxArr, fnIx) {
@@ -38231,6 +38358,21 @@ function coalValUnionResidualKind(
   cak
 }
 
+// The union the `??` at `exprIx` boxes its result as, or "" when the checker typed it a scalar.
+// A MIXED union (`i32 | A`) and a scalar joined to a literal union (`i32 | "a" | "b"`) are boxes
+// too, named off the registry since their render is no value-union name. Tags are
+// program-global, so a box operand stands in the join unchanged (D1703).
+function coalResultBoxName(exprIx: i32, fnIx: i32): string {
+  let rt = nodeTyPinIxOf(exprIx)
+  const held = holeOperandTyOf(exprIx, fnIx)
+  if held >= 0 { rt = held }
+  const rn = tyToEmitName(rt)
+  if rn != "" && isValueUnionName(rn) { return rn }
+  const mn = nodeMixedUnionName(exprIx)
+  if mn != "" { return mn }
+  nodeJoinRowName(exprIx, fnIx)
+}
+
 // `x ?? d` over binding `name` of nullable value union `cunm`, whose residual member is kind
 // `cak`: a box when the checker typed the `??` as a union, else the scalar at the result's
 // kind. Returns 0, or -1 when an operand fails or the residual is a string.
@@ -38252,16 +38394,8 @@ function emitCoalesceValUnionIdent(
   // nullable default keeps `T | null`, another type joins to `T | U`. The default is
   // coerced into the RESULT union, not the operand's, which has no tag for it; the
   // operand's own box needs none, tags being global atom codes (D1699).
-  let cResN = ""
+  const cResN = coalResultBoxName(exprIx, fnIx)
   const cResEmit = tyToEmitName(nodeTyPinIxOf(exprIx))
-  if cResEmit != "" {
-    if isValueUnionName(cResEmit) { cResN = cResEmit }
-  }
-  // A MIXED union (`i32 | A`) is a union the language has, so its `??` result is a box
-  // too — `isValueUnionName` declines it because a struct is not a value ATOM, and the
-  // render is structural, so the name comes off the canon index. Tags are
-  // program-global, so the operand's own box stands in the join unchanged (D1703).
-  if cResN == "" { cResN = nodeMixedUnionName(exprIx) }
   if cResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
     let cCoerceN = cResN
     if cCoerceN == "" { cCoerceN = cunm }
@@ -38445,13 +38579,8 @@ function emitCoalesceCallStash(
           // The result rep is the CHECKER's, read exactly as the re-evaluating ident arm reads
           // it: a union result is a box whatever made it one, a wider default widens the whole
           // expression. Both arms are one lowering over one rep and must decide alike (D1701).
-          let kResN = ""
+          const kResN = coalResultBoxName(exprIx, fnIx)
           const kResTy = nodeTyPinIxOf(exprIx)
-          const kResEmit = tyToEmitName(kResTy)
-          if kResEmit != "" {
-            if isValueUnionName(kResEmit) { kResN = kResEmit }
-          }
-          if kResN == "" { kResN = nodeMixedUnionName(exprIx) }
           let kRk = kak
           const kRkN = valueAtomKindOfTy(kResTy)
           if kRkN >= 0 && kRkN != nullValKind() { kRk = kRkN }
@@ -38624,10 +38753,13 @@ function emitCoalesceUnionField(
               "emitProgram: `??` over a string|null union field is not supported yet",
             )
           }
-          // A NULLABLE default keeps the result boxed — the SAME decision the ident
-          // and call arms make (`coalesceDefaultNullable`); the else arm re-reads the
-          // field's own box rather than unboxing it.
-          if coalesceDefaultNullable(e.binRight, fnIx) {
+          // A union result or a NULLABLE default keeps the result boxed — the SAME decision
+          // the ident and call arms make; the else arm re-reads the field's own box rather
+          // than unboxing it, and the default is coerced into the result's union.
+          const mResN = coalResultBoxName(exprIx, fnIx)
+          if mResN != "" || coalesceDefaultNullable(e.binRight, fnIx) {
+            let mCoerceN = mResN
+            if mCoerceN == "" { mCoerceN = munm }
             if emitCoalArmRecv(body, lhs.memObj, mCast, fnIx) < 0 { return -1 }
             fbStructGet(mHeap, mfi) // the union box
             fbStructGet(uBoxIdx, 0) // field 0: tag
@@ -38636,7 +38768,7 @@ function emitCoalesceUnionField(
             fbIfRef(uBoxIdx)        // 0x04 if, (ref $uBoxIdx) blocktype
             // THROUGH `emitUnionCoerce` — the D801 seed, the third of the three
             // boxed-union `??` spellings that share this lowering.
-            if emitUnionCoerce(body, munm, e.binRight, fnIx) < 0 {
+            if emitUnionCoerce(body, mCoerceN, e.binRight, fnIx) < 0 {
               return -1 // d, its own box
             }
             fbElse() // 0x05 else — present → re-read the field
@@ -39045,6 +39177,17 @@ function emitCoalesceNullableRefs(
   // not a map index get", which is what this said while the overwhelming majority of its
   // firings are a non-nullable operand. Those fold to the left operand in `emit_rewrite.vl`
   // and never reach the emitter as a `??` at all, so the message can finally name the actual residue.
+
+  // A re-readable atom niche joining into a box is the null test it spells.
+  const lhsIx = unwrapParen(e.binLeft)
+  if (
+    lhsIx >= 0
+    && exprReReadable(lhsIx)
+    && exprNulLitUnion(lhsIx, fnIx)
+    && coalesceResultIsBox(exprIx)
+  ) {
+    return emitExpr(body, coalNullTestIf(e, exprIx, fnIx), fnIx)
+  }
   emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )
