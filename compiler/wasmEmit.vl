@@ -360,6 +360,7 @@ import {
   capStartTbl,
   cboxReadTy,
   cloAdapterCanon,
+  cloDeclAt,
   cloEqScratchBase,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
@@ -375,6 +376,9 @@ import {
   emitLetCursor,
   emitPhaseReached,
   emitRootIx,
+  envCacheBase,
+  envCacheFes,
+  envCacheTys,
   externIdxAt,
   f32PushScratchBase,
   f64PushScratchBase,
@@ -1412,13 +1416,19 @@ import {
   stmtArmScopeClose,
   stmtArmScopeOpen,
 } from "./emit_collect"
-import { cboxIsWriteLet, voidTwinForNode } from "./emit_rewrite"
+import {
+  cboxIsWriteLet,
+  voidTwinForNode,
+  voidTwinTargetOf,
+} from "./emit_rewrite"
 import { nameIsQuotedLeaf } from "./tyname"
 import {
   exprArmLocalsAny,
   monoGradualAsScalar,
   monoInertCalled,
   monoInertValues,
+  monoInstFe,
+  monoInstOrig,
   monoOrigNode,
   monoStubValueOk,
   unTyIx,
@@ -2180,10 +2190,10 @@ function emitClosureValue(body: u8[], fe: i32, fnIx: i32) {
   return emitClosureValueCore(body, fe, fnIx)
 }
 
-// The closure-value fat pointer for lifted function `fe`: `struct.new $cloStruct [ env, id ]`.
-// The env is `ref.null struct` for a non-capturing function, else a `struct.new $envStruct`
-// of the enclosing frame's captured values; `id` is the lifted wasm index (imports occupy
-// 0..gImports-1), the `==` identity token and the `call_indirect` operand.
+// The closure-value fat pointer for lifted function `fe`: `struct.new $cloStruct [ env, id,
+// decl ]`. The env is `ref.null struct` for a non-capturing function, else a `struct.new
+// $envStruct` of the enclosing frame's captured values; `id` is the lifted wasm index, the
+// `call_indirect` operand; `decl` is the `==` identity token (`cloDeclOf`).
 export function emitClosureValueCore(body: u8[], fe: i32, fnIx: i32) {
   if fe < 0 || fe >= fnStmts.length {
     return emitFail("emitProgram: function value with no lifted function")
@@ -2255,19 +2265,72 @@ function cloAdapterCanonOf(fe: i32): i32 {
   fe
 }
 
+// A bound on `cloDeclOf`'s walk, which takes one hop per void twin or adapter layer; a chain
+// is a few layers deep, so the bound only guards against a cycle.
+const CLO_DECL_MAX_HOPS = 16
+
+// The function a closure of `fe` names in its identity field: the one standing for `fe`'s source
+// declaration, reached through adapters, void twins and generic instances, so every delivery of
+// one declaration compares equal at whatever signature it is delivered (D7180).
+function cloDeclOf(fe: i32): i32 {
+  const have = cloDeclAt[fe] ?? -1
+  if have >= 0 { return have }
+  let cur = fe
+  let hops = 0
+  while hops < CLO_DECL_MAX_HOPS {
+    let next = voidTwinTargetOf(cur)
+    if next < 0 { next = fvaAdapterCallee(cur) }
+    if next < 0 || next == cur { break }
+    cur = next
+    hops = hops + 1
+  }
+  if cur >= monoOrigNode.length {
+    let q = 0
+    while q < monoInstFe.length && q < monoInstOrig.length {
+      if monoInstFe[q] == cur {
+        cur = monoInstOrig[q]
+        break
+      }
+      q = q + 1
+    }
+  }
+  cloDeclAt[fe] = cur
+  cur
+}
+
+// The local holding the env of capturing function `fe` in the frame being emitted, or -1 when
+// that frame does not declare `fe` (`envCacheFes`).
+function envCacheSlotOf(fe: i32): i32 {
+  let k = 0
+  while k < envCacheFes.length {
+    if envCacheFes[k] == fe { return envCacheBase + k }
+    k = k + 1
+  }
+  -1
+}
+
 // `emitClosureValueCore` for a function already checked to have a closure signature.
 function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
   const envIdx = fnEnvIdxOf(fe)
   if envIdx < 0 {
-    // Capture-free: the module's one constant closure of `fe`. Equality reads the id and the
-    // (null) env, never the struct, so sharing it is unobservable from VL.
+    // Capture-free: the module's one constant closure of `fe`. Equality reads the identity
+    // field and the (null) env, never the struct, so sharing it is unobservable from VL.
     const g = synthGlobalIdx(SYNTH_CLOSURE, fe)
     if g >= 0 {
       markFnAddrTaken(fe)
+      cloDeclOf(fe)
       return fbGlobalGet(g)
     }
     fbRefNullStruct()
   } else {
+    // In the frame that declares `fe`, the env is built once per activation and kept in the
+    // frame's cache slot, so two reads of the function compare equal (D7480).
+    const ck = envCacheSlotOf(fe)
+    if ck >= 0 {
+      fbLocalGet(ck)
+      fbRefIsNull()
+      fbIf(64) // 0x40 void
+    }
     const caps = captureNamesOf(fe)
     let ci = 0
     while ci < caps.length {
@@ -2275,6 +2338,11 @@ function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
       ci = ci + 1
     }
     fbStructNew(envIdx)
+    if ck >= 0 {
+      fbLocalSet(ck)
+      fbEnd()
+      fbLocalGet(ck)
+    }
   }
 
   // The one place a wasm function index becomes a closure id, so the one place the
@@ -2282,6 +2350,8 @@ function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
   // id no expression here produces cannot reach a `call_indirect`.
   markFnAddrTaken(fe)
   fbI32RelOf(RS_SLOT, fe, gImports + fe + relSkew(RS_SLOT))
+  const decl = cloDeclOf(fe)
+  fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
   fbStructNew(cloStructIdx)
   0
 }
@@ -17592,16 +17662,16 @@ function emitChainRead(
 }
 
 // Compare two closure fat-pointers already on the stack (left below right), leaving a
-// 0/1 i32 for function identity: the same lifted function (field 1) and the same
+// 0/1 i32 for function identity: the same source declaration (field 2) and the same
 // captured env (`ref.eq` over field 0 — two null envs are equal, two separately created
-// envs of the same function are not). Mirrors the host's function-identity `==`.
+// envs of the same function are not).
 function emitCloEqCore(_body: u8[]) {
   fbLocalSet(cloEqScratchBase + 1) // B = right operand
   fbLocalSet(cloEqScratchBase + 0) // A = left operand
   fbLocalGet(cloEqScratchBase + 0)
-  fbStructGet(cloStructIdx, 1)     // A.id
+  fbStructGet(cloStructIdx, 2)     // A.decl
   fbLocalGet(cloEqScratchBase + 1)
-  fbStructGet(cloStructIdx, 1)     // B.id
+  fbStructGet(cloStructIdx, 2)     // B.decl
   fbI32Bin(70)                     // 0x46 i32.eq
   fbLocalGet(cloEqScratchBase + 0)
   fbStructGet(cloStructIdx, 0)     // A.env
@@ -29019,7 +29089,14 @@ function emitStmtGo(body: u8[], stmtIx: i32, fnIx: i32) {
   if s is FuncDecl {
     // a nested function declaration statement (`function add(x) x + n`) is lifted to a
     // top-level wasm function by `collectFns`, so it emits no inline code here — just a
-    // no-op in its enclosing body. Its name resolves as a closure value when referenced.
+    // no-op in its enclosing body. Its name resolves as a closure value when referenced; a
+    // cached env is dropped here, so each execution of the declaration is a new function value.
+    let ck = -1
+    if envCacheFes.length > 0 { ck = envCacheSlotOf(fnStmtsPosOf(stmtIx)) }
+    if ck >= 0 {
+      fbRefNull(envCacheTys[ck - envCacheBase])
+      fbLocalSet(ck)
+    }
     return 0
   }
   // D1045 — a body-scoped `type` declaration, one statement over: the parser hoisted the
