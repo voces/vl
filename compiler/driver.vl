@@ -35,6 +35,7 @@ import { modIdAssign, modIdReset, modIxOfId, modSuffixOf } from "./modid"
 import { crAskAnswer } from "./check_call_retire"
 import { crAskArm, crAskHold, crAskKeys, crAskQs } from "./check_capture_rows"
 import { recAdOrigDecl } from "./check_rec_adopt_rows"
+import { fnDeclIx } from "./check_write_scan"
 import {
   parseImageArmed,
   parseImageBegin,
@@ -347,7 +348,8 @@ import {
   discLeafTokAt,
 } from "./check_discarded"
 import { isBuiltinCallName } from "./check_getter_effects"
-import { T, TDiag, demangleMsg } from "./check_types"
+import { T, TDiag, demangleMsg, tyIsPrimIx } from "./check_types"
+import { lookup } from "./check_scopes"
 import {
   fsIntrinsicCount,
   fsIntrinsicNameAt,
@@ -1436,6 +1438,7 @@ export function checkSrc(): i32 {
     skMute = false
     return again
   }
+  wiCountSingle()
   vcLoadToksEntry(vcSource())
   const root = parseProgram()
   if vcParseBlocked() { return 1 }
@@ -5425,9 +5428,9 @@ function skImportName(k: i32): string {
 }
 
 // Whether declaration `merged` of the module rooted at `root` checks the same whatever imports it,
-// given its hash kept: SK_SHUT for a type, an extern, an annotated or scalar-literal binding or one
-// closed non-generic function; SK_IF_PLAIN for another binding; SK_IF_KEPT for one closed generic;
-// SK_OPEN for an overload or a parameter `skParamsClosed` does not close.
+// given its hash kept: SK_SHUT for a type, an extern, an annotated or (signed) scalar-literal
+// binding or one closed non-generic function; SK_IF_PLAIN for another binding; SK_IF_KEPT for one
+// closed generic; SK_OPEN for an overload or a parameter `skParamsClosed` does not close.
 function skClosed(root: i32, merged: string): i32 {
   let fns = 0
   let gen = false
@@ -5437,7 +5440,7 @@ function skClosed(root: i32, merged: string): i32 {
     for st in r.progStmts {
       const n = P.nodes[st]
       if n is LetDecl && n.letName == merged {
-        if n.letType >= 0 || skScalarLit(n.letInit) { return SK_SHUT }
+        if n.letType >= 0 || skSignedLit(n.letInit) { return SK_SHUT }
         return SK_IF_PLAIN
       }
       if n is FuncDecl && n.fnName == merged {
@@ -6496,6 +6499,14 @@ let wiNever: {[string]: boolean} = Map()
 let wiCulprit = -1
 const WI_ANY = -2
 let wiStats: i32[] = []
+// Module checks per `wiStats` reason: a declined target adds its graph's module count, a served
+// one the count it skipped. Slot `WI_REASONS` counts import-free checks, one module each.
+let wiMods: i32[] = []
+// One row per declined target check: its reason, its key, its graph's module count, and the
+// module (and imported name) the last guard to decline it named.
+let wiTrace: string[] = []
+let wiWhyBy: {[string]: string} = Map()
+let wiCulpritName = ""
 let wiServedLast = false
 let wiBankedKeys: string[] = []
 let wiBankedMods: i32[] = []
@@ -6524,6 +6535,7 @@ const WI_NO_RENDER = 128
 const WI_NO_ADOPTED = 256
 const WI_NO_TWIN = 512
 const WI_NO_KEPT = 1024
+const WI_NO_CALLED = 2048
 // The delivery flags whose judgement reads every site of the value: kept, or site-counted.
 const WI_COUNTED = 5
 
@@ -6541,9 +6553,13 @@ export function wiArm(on: i32, mask: i32): i32 {
   wiCulprits = Map()
   wiNever = Map()
   wiStats = []
+  wiMods = [0]
+  wiTrace = []
+  wiWhyBy = Map()
   let r = 0
   while r < WI_REASONS {
     wiStats.push(0)
+    wiMods.push(0)
     r = r + 1
   }
   wiServedLast = false
@@ -6601,6 +6617,32 @@ export function wiStat(which: i32): i32 {
   wiStats[which]
 }
 
+// The module checks behind `wiStat(which)`'s targets (`which` `WI_REASONS`: import-free checks).
+export function wiModStat(which: i32): i32 {
+  if which < 0 || which >= wiMods.length { return -1 }
+  wiMods[which]
+}
+
+// The declined target checks since `wiArm`: how many, and row `i`'s length and byte `j`. A row
+// is the reason's index, the key, the graph's module count, and the module and name a guard named.
+export function wiTraceCount(): i32 { wiTrace.length }
+export function wiTraceLen(i: i32): i32 {
+  if i < 0 || i >= wiTrace.length { return 0 }
+  wiTrace[i].length
+}
+export function wiTraceAt(i: i32, j: i32): i32 {
+  if i < 0 || i >= wiTrace.length { return 0 }
+  wiTrace[i][j]
+}
+
+// The import-free check that just started, counted when serving is armed.
+function wiCountSingle(): i32 {
+  if wiOn && WI_REASONS < wiMods.length {
+    wiMods[WI_REASONS] = wiMods[WI_REASONS] + 1
+  }
+  0
+}
+
 // Whether an importer's bank served the last check.
 export function wiServed(): boolean { wiServedLast }
 
@@ -6630,6 +6672,16 @@ function wiServe(): boolean {
     let why = wiWhy[key] ?? WI_UNSEEN
     if b != null { why = WI_GRAPH }
     wiStats[why] = wiStats[why] + 1
+    wiMods[why] = wiMods[why] + modKeys.length
+    wiTrace.push(
+      i32ToStr(why)
+        + " "
+        + key
+        + " "
+        + i32ToStr(modKeys.length)
+        + " "
+        + (wiWhyBy[key] ?? "-"),
+    )
     return false
   }
   if b != null {
@@ -6651,6 +6703,7 @@ function wiServe(): boolean {
   mimpClear()
   vcEpDrop()
   wiStats[WI_SERVED] = wiStats[WI_SERVED] + 1
+  wiMods[WI_SERVED] = wiMods[WI_SERVED] + modKeys.length
   wiServedLast = true
   true
 }
@@ -6688,6 +6741,10 @@ function wiBankWhole(roots: i32[]): i32 {
 // holding that module tries it again.
 function wiBlame(key: string, why: i32): i32 {
   wiWhy[key] = why
+  let by = "*"
+  if wiCulprit >= 0 && wiCulprit < modKeys.length { by = modKeys[wiCulprit] }
+  wiWhyBy[key] = by + " " + wiCulpritName
+  wiCulpritName = ""
   if wiCulprit == WI_ANY { wiNever[key] = true }
   if wiCulprit < 0 || wiCulprit >= modKeys.length { return 0 }
   const cs = wiCulprits[key] ?? []
@@ -6860,6 +6917,7 @@ function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
       if om < 0 {
         if inG[d] {
           wiCulprit = impMod[k]
+          wiCulpritName = "(namespace)"
           return false
         }
       } else if inG[om] {
@@ -6870,11 +6928,15 @@ function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
           const kept = c == SK_IF_KEPT
             && (wiMask & WI_NO_KEPT) == 0
             && skCallsOnly(roots[pos[impMod[k]]], nm)
-          wiImpShut[k] = if (c == SK_SHUT || kept)
+          const called = c == SK_IF_PLAIN
+            && (wiMask & WI_NO_CALLED) == 0
+            && wiInitShut(root, nm)
+          wiImpShut[k] = if (c == SK_SHUT || kept || called)
             && ((wiMask & WI_NO_ADOPTED) != 0 || !wiAdopted(root, nm)) { 1 } else { 0 }
         }
         if wiImpShut[k] == 0 {
           wiCulprit = impMod[k]
+          wiCulpritName = wiImpMerged[k]
           return false
         }
       }
@@ -6882,6 +6944,64 @@ function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
     k = k + 1
   }
   true
+}
+
+// Whether the un-annotated binding `merged` of the module rooted at `root` has a type its own
+// initialiser fixes, so no importer's use can choose it: a non-empty list of scalar literals and
+// names of a primitive type, or a call of a closed, non-generic, non-overloaded function with a
+// declared return type.
+function wiInitShut(root: i32, merged: string): boolean {
+  const r = P.nodes[root]
+  if r is Program {
+    for st in r.progStmts {
+      const n = P.nodes[st]
+      if n is LetDecl && n.letName == merged {
+        return wiScalarList(n.letInit) || wiClosedCall(n.letInit)
+      }
+    }
+  }
+  false
+}
+
+// Whether node `e` is a non-empty list literal of scalar literals and names of a primitive type.
+function wiScalarList(e: i32): boolean {
+  if e < 0 || e >= P.nodes.length { return false }
+  const c = P.nodes[e]
+  if !(c is ArrayLit) || c.arrElems.length == 0 { return false }
+  for x in c.arrElems {
+    if !skSignedLit(x) && !wiPrimName(x) { return false }
+  }
+  true
+}
+
+// Whether node `x` is a name whose checked type is a primitive.
+function wiPrimName(x: i32): boolean {
+  if x < 0 || x >= P.nodes.length { return false }
+  const n = P.nodes[x]
+  n is Ident && tyIsPrimIx(lookup(n.identName))
+}
+
+// Whether node `e` calls, by name, one closed, non-generic function with a declared return type
+// and no overload set.
+function wiClosedCall(e: i32): boolean {
+  if e < 0 || e >= P.nodes.length { return false }
+  const c = P.nodes[e]
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const f = P.nodes[c.callFn]
+  if !(f is Ident) { return false }
+  for cs in ovSetCands {
+    for cand in cs {
+      if cand == f.identName { return false }
+    }
+  }
+  const d = fnDeclIx[f.identName] ?? -1
+  if d < 0 || d >= P.nodes.length { return false }
+  const fd = P.nodes[d]
+  fd is FuncDecl
+    && fd.fnName == f.identName
+    && fd.fnRet >= 0
+    && fd.fnTyParams.length == 0
+    && skParamsClosed(fd.fnParams)
 }
 
 // Whether declaration `merged` of the module rooted at `root` carries a type this check's
