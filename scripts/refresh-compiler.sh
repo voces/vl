@@ -42,6 +42,11 @@
 # seed climbs exactly as far as the classic ladder needed. Whatever rung proves
 # out is what ships, so the artifact downstream consumers use IS the proven
 # fixed point.
+#
+# --fuel-stash=<dir>: also warm the two `$VL_FUEL=1` sidecars of the seed that SHIPS, and leave
+# them in <dir> rather than beside it, so a cache of the seed alone stays lean. Each rung's
+# candidate is warmed in the background while the next compile runs (single-threaded past its
+# own JIT), and only the shipped rung's pair is kept; the others cost CPU, never a sidecar.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -55,12 +60,14 @@ OUT="${OUT:-build/vl-compiler.wasm}"
 FALLBACK=1
 PROVE=0
 WARM_FUEL=--fuel
+FUEL_STASH=""
 for arg in "$@"; do
   case "$arg" in
     --no-fallback) FALLBACK=0 ;;
     --prove-fixpoint) PROVE=1 ;;
     --no-fuel-sidecars) WARM_FUEL="" ;;
-    *) echo "usage: refresh-compiler.sh [--no-fallback] [--prove-fixpoint] [--no-fuel-sidecars]" >&2; exit 2 ;;
+    --fuel-stash=*) FUEL_STASH="${arg#--fuel-stash=}" ;;
+    *) echo "usage: refresh-compiler.sh [--no-fallback] [--prove-fixpoint] [--no-fuel-sidecars] [--fuel-stash=<dir>]" >&2; exit 2 ;;
   esac
 done
 
@@ -68,7 +75,21 @@ WORK="$(mktemp -d)"
 # A background warm (the fixpoint ladder's, below) is WAITED for, never killed: killing the
 # shell would orphan the `vl` it launched, still writing into $WORK.
 EARLY_WARM=""
-trap '[ -z "$EARLY_WARM" ] || wait "$EARLY_WARM" 2>/dev/null; rm -rf "$WORK"' EXIT
+FUEL_WARMS=""
+trap '[ -z "$EARLY_WARM$FUEL_WARMS" ] || wait $EARLY_WARM $FUEL_WARMS 2>/dev/null; rm -rf "$WORK"' EXIT
+
+# --fuel-stash: warm the fuel pair of candidate <wasm> as rung <n>, on a link to it named like
+# $OUT in its own directory, so each sidecar already carries the name it will have beside $OUT.
+fuel_warm() {
+  [ -n "$FUEL_STASH" ] || return 0
+  local dir="$WORK/fuel-$2" name
+  name="$(basename "$OUT")"
+  mkdir -p "$dir"
+  ln -f "$1" "$dir/$name" 2>/dev/null || cp -f "$1" "$dir/$name"
+  VL="$VL" nice -n 10 scripts/warm-seed.sh --fuel-only "$dir/$name" &
+  FUEL_WARMS="$FUEL_WARMS $!"
+}
+FUEL_RUNG=next
 
 [ -x "$VL" ] || { echo "missing vl binary: $VL (cd scripts/vl-host && cargo build --release)"; exit 1; }
 # Missing seed: fetch the rolling `seed-latest` release, then fall through to the
@@ -91,6 +112,8 @@ echo "== self-compile current compiler source with the seed =="
 # re-enter the TS stage-0 path. The fix is an explicit break-glass re-mint.
 selfcompile() { "$VL" build compiler/entry.vl -o "$WORK/next.wasm" --compiler "$SEED"; }
 
+# With --prove-fixpoint the seed itself is the one-compile rung's ship.
+if [ "$PROVE" = 1 ] && [ -s "$SEED" ]; then fuel_warm "$SEED" seed; fi
 ok=0
 if selfcompile; then ok=1; fi
 # STALE CACHED SEED: a WARM seed (a pre-existing build/vl-compiler.wasm, e.g. a CI
@@ -145,12 +168,14 @@ fi
 # one-compile rung ships the on-disk seed itself, keeping its mtime — so the
 # `.cwasm` sidecar wasmtime cache beside it stays fresh for every later run).
 SHIP="$WORK/next.wasm"
+if [ "$PROVE" = 0 ]; then fuel_warm "$SHIP" next; fi
 
 if [ "$PROVE" = 1 ]; then
   echo "== fixpoint ladder: find the first self-reproducing stage =="
   if cmp -s "$WORK/next.wasm" "$SEED"; then
     echo "compile(seed) == seed — the seed IS the fixpoint (1 compile)"
     SHIP="$SEED"
+    FUEL_RUNG=seed
   else
     # The likely ship is `next` (the two-compile rung), so its other engine tags are warmed
     # NOW, at low priority, while it compiles the compiler: the build is single-threaded
@@ -159,6 +184,7 @@ if [ "$PROVE" = 1 ]; then
     # shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
     VL="$VL" nice -n 10 scripts/warm-seed.sh $WARM_FUEL "$WORK/next.wasm" &
     EARLY_WARM=$!
+    fuel_warm "$WORK/next.wasm" next
     echo "== next compiles the compiler =="
     "$VL" build compiler/entry.vl -o "$WORK/next2.wasm" --compiler "$WORK/next.wasm"
     if cmp -s "$WORK/next2.wasm" "$WORK/next.wasm"; then
@@ -169,6 +195,7 @@ if [ "$PROVE" = 1 ]; then
       # shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
       VL="$VL" nice -n 10 scripts/warm-seed.sh $WARM_FUEL "$WORK/next2.wasm" &
       EARLY_WARM=$!
+      fuel_warm "$WORK/next2.wasm" next2
       echo "== next2 compiles the compiler =="
       "$VL" build compiler/entry.vl -o "$WORK/next3.wasm" --compiler "$WORK/next2.wasm"
       if ! cmp "$WORK/next3.wasm" "$WORK/next2.wasm"; then
@@ -180,6 +207,7 @@ if [ "$PROVE" = 1 ]; then
       fi
       echo "compile(next2) == next2 — next2 is the fixpoint (3 compiles)"
       SHIP="$WORK/next2.wasm"
+      FUEL_RUNG=next2
     fi
   fi
   if [ -n "$EARLY_WARM" ]; then
@@ -249,6 +277,18 @@ fi
 # (docs/internals/perf-opportunities-2026-09.md §A5, item 3). scripts/warm-seed.sh owns the list.
 # shellcheck disable=SC2086  # an empty $WARM_FUEL is no argument
 VL="$VL" scripts/warm-seed.sh $WARM_FUEL "$OUT"
+if [ -n "$FUEL_STASH" ]; then
+  # shellcheck disable=SC2086  # one pid per word
+  wait $FUEL_WARMS || true
+  FUEL_WARMS=""
+  mkdir -p "$FUEL_STASH"
+  for side in "$WORK/fuel-$FUEL_RUNG"/*.cwasm; do
+    if [ -f "$side" ]; then
+      mv "$side" "$FUEL_STASH/"
+      echo "stashed $(basename "$side") in $FUEL_STASH"
+    fi
+  done
+fi
 sidecars=0
 for side in "$OUT".*.cwasm; do
   if [ -f "$side" ]; then sidecars=$((sidecars + 1)); fi
