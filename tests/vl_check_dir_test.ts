@@ -215,3 +215,58 @@ Deno.test({
     }
   },
 });
+
+// The pool keeps a root with the roots its check can serve (`cliCheckParentOf`): z.vl reaches
+// a.vl, which reaches b.vl, so the three form one tree a worker checks in order, and a.vl
+// meets z.vl's check on the same instance. An idle worker may steal a.vl's subtree instead,
+// which the trace marks; either way a.vl is served or stolen, never just re-checked, and the
+// report is the in-process one.
+Deno.test({
+  name: "vl-check-dir: the root pool checks an importee after its importer, on one worker",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_tree_" });
+    try {
+      const files: Record<string, string> = {
+        "a.vl": 'import { g } from "./b"\nexport function f(): i32 { g() }\n',
+        "b.vl": "export function g(): i32 { 1 }\n",
+        "m1.vl": "print(1)\n",
+        "m2.vl": "print(2)\n",
+        "m3.vl": "print(3)\n",
+        "z.vl": 'import { f } from "./a"\nprint(f())\n',
+      };
+      for (const [name, src] of Object.entries(files)) {
+        await Deno.writeTextFile(`${dir}/${name}`, src);
+      }
+      const run = async (jobs: string) => {
+        const r = await new Deno.Command(VL, {
+          args: ["check", dir, "--compiler", COMPILER],
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: jobs, VL_TEST_TRACE: "1", VL_CHECK_STATS: "1" }),
+        }).output();
+        return { code: r.code, err: new TextDecoder().decode(r.stderr) };
+      };
+      const pooled = await run("2");
+      const err = pooled.err;
+      if (!err.includes("vl-test-trace check trees=4 sizes=3,1,1,1")) {
+        throw new Error(`want z.vl, a.vl and b.vl in one tree of four, got:\n${err}`);
+      }
+      if (!err.includes("[check] served: roots=1 ") && !/check root=1 ms=\d+ \w+ stolen/.test(err)) {
+        throw new Error(`want a.vl served from z.vl's check, or stolen, got:\n${err}`);
+      }
+      const report = (s: string) =>
+        s.split("\n").filter((l) => !l.startsWith("vl-test-trace") && !l.startsWith("[check]"))
+          .join("\n");
+      const serial = await run("1");
+      if (pooled.code !== serial.code || report(pooled.err) !== report(serial.err)) {
+        throw new Error(`want the in-process report, got:\n${pooled.err}\nwant:\n${serial.err}`);
+      }
+      if (pooled.code !== 0 || !err.includes("Checked 6 files, no errors.")) {
+        throw new Error(`want a clean check of 6 files, got ${pooled.code}:\n${err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

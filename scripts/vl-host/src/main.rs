@@ -8169,36 +8169,147 @@ impl CheckWorker {
     }
 }
 
-/// Check the `n` queued roots on `workers` threads, each keeping one `CheckWorker` for as
-/// many roots as it can. A root whose worker deferred or failed comes back `None`, so the
-/// parent checks it and a compiler fault surfaces exactly as it would have; only after a
-/// failure does the thread start a fresh instance for its next root.
+/// The queued slots as a forest in preorder, where slot `i`'s parent is `parents[i]` (the
+/// earlier slot whose check can serve it, `cliCheckParentOf`): the slots in that order, the
+/// end of each position's subtree, and the `(start, end)` range of each tree. A parent that
+/// is not an earlier slot makes `i` a tree of its own. Trees keep the order of their roots.
+fn check_pool_forest(parents: &[Option<usize>]) -> (Vec<usize>, Vec<usize>, Vec<(usize, usize)>) {
+    let n = parents.len();
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut tops: Vec<usize> = Vec::new();
+    for (i, p) in parents.iter().enumerate() {
+        match p {
+            Some(p) if *p < i => kids[*p].push(i),
+            _ => tops.push(i),
+        }
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut end: Vec<usize> = vec![0; n];
+    let mut trees: Vec<(usize, usize)> = Vec::with_capacity(tops.len());
+    for &top in &tops {
+        let start = order.len();
+        // (slot, its position, whether its subtree is done)
+        let mut stack: Vec<(usize, usize, bool)> = vec![(top, 0, false)];
+        while let Some((s, at, done)) = stack.pop() {
+            if done {
+                end[at] = order.len();
+                continue;
+            }
+            let at = order.len();
+            order.push(s);
+            stack.push((s, at, true));
+            for &k in kids[s].iter().rev() {
+                stack.push((k, 0, false));
+            }
+        }
+        trees.push((start, order.len()));
+    }
+    (order, end, trees)
+}
+
+/// The parent of each of the `n` queued slots, from the brain's `cliCheckParentOf`; none when
+/// the compiler has no such export.
+fn check_pool_parents(store: &mut Store<()>, inst: &Instance, n: usize) -> Vec<Option<usize>> {
+    let Ok(parent_of) = inst.get_typed_func::<i32, i32>(&mut *store, "cliCheckParentOf") else {
+        return vec![None; n];
+    };
+    (0..n)
+        .map(|i| match parent_of.call(&mut *store, i as i32) {
+            Ok(p) if p >= 0 => Some(p as usize),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The pool's queue: the forest of `check_pool_forest` as ranges of `order`, each owned by
+/// at most one thread, and the next tree no thread has taken.
+struct CheckSched {
+    order: Vec<usize>,
+    end: Vec<usize>,
+    units: Vec<(usize, usize)>,
+    trees: usize,
+    cursor: usize,
+}
+
+impl CheckSched {
+    /// The next slot for the thread owning unit `own`, and whether it tops a stolen range:
+    /// that unit's front, else the next untaken tree's, else the outermost subtree at the end
+    /// of the longest unit left. Only that stolen top is checked without the parent that could
+    /// serve it, since the rest of its subtree moves with it.
+    fn next(&mut self, own: &mut usize) -> Option<(usize, bool)> {
+        if let Some((a, b)) = self.units.get_mut(*own) {
+            if *a < *b {
+                *a += 1;
+                return Some((self.order[*a - 1], false));
+            }
+        }
+        while self.cursor < self.trees {
+            let u = self.cursor;
+            self.cursor += 1;
+            let (a, b) = &mut self.units[u];
+            if *a < *b {
+                *own = u;
+                *a += 1;
+                return Some((self.order[*a - 1], false));
+            }
+        }
+        let (u, _) = self
+            .units
+            .iter()
+            .enumerate()
+            .filter(|(_, (a, b))| a < b)
+            .max_by_key(|(u, (a, b))| (b - a, std::cmp::Reverse(*u)))?;
+        let (a, b) = self.units[u];
+        // A position whose subtree reaches `b` has every ancestor already taken.
+        let p = (a..b).find(|&p| self.end[p] >= b).unwrap_or(b - 1);
+        self.units[u].1 = p;
+        self.units.push((p + 1, b));
+        *own = self.units.len() - 1;
+        Some((self.order[p], true))
+    }
+}
+
+/// Check the `n` queued roots on `workers` threads, keeping one `CheckWorker` per thread for
+/// as many roots as it can. A thread takes a tree of `check_pool_forest` and checks it in
+/// preorder, so a root follows the importer check that can serve it on the same instance; a
+/// thread with no tree left steals from `CheckSched::next`. A root whose worker deferred or
+/// failed comes back `None`, so the parent checks it and a compiler fault surfaces exactly as
+/// it would have; only after a failure does the thread start a fresh instance for its next root.
 fn check_roots_pooled(
     engine: &Engine,
     module: &Module,
     source: &CompilerSource,
     argv: &[String],
     roots: &[(String, i32)],
+    parents: &[Option<usize>],
     workers: usize,
 ) -> Vec<Option<String>> {
     let n = roots.len();
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let cursor = AtomicUsize::new(0);
+    let (order, end, trees) = check_pool_forest(parents);
+    if test_trace_on() {
+        let sizes: Vec<String> = trees.iter().map(|(a, b)| (b - a).to_string()).collect();
+        let k = trees.len();
+        eprintln!("vl-test-trace check trees={k} sizes={}", sizes.join(","));
+    }
+    let k = trees.len();
+    let sched = Mutex::new(CheckSched { order, end, units: trees, trees: k, cursor: 0 });
     let slots: Vec<Mutex<Option<String>>> = (0..n).map(|_| Mutex::new(None)).collect();
     let work = || {
         let mut worker: Option<CheckWorker> = None;
+        let mut own = usize::MAX;
         loop {
-            let i = cursor.fetch_add(1, Ordering::Relaxed);
-            if i >= n {
+            let Some((i, stolen)) = sched.lock().unwrap().next(&mut own) else {
                 break;
-            }
+            };
             let t0 = std::time::Instant::now();
             let outcome = (|| -> Result<(Option<String>, bool)> {
                 match worker.as_mut() {
                     Some(w) => {
                         w.next_root.call(&mut w.store, i as i32)?;
                     }
-                    None => worker = Some(CheckWorker::start(engine, module, source, argv, roots, i)?),
+                    None => {
+                        worker = Some(CheckWorker::start(engine, module, source, argv, roots, i)?)
+                    }
                 }
                 match worker.as_mut() {
                     Some(w) => w.run_root(),
@@ -8213,7 +8324,9 @@ fn check_roots_pooled(
             }
             if test_trace_on() {
                 let how = if payload.is_some() { "pooled" } else { "deferred" };
-                eprintln!("vl-test-trace check root={i} ms={} {how}", t0.elapsed().as_millis());
+                let took = if stolen { " stolen" } else { "" };
+                let ms = t0.elapsed().as_millis();
+                eprintln!("vl-test-trace check root={i} ms={ms} {how}{took}");
             }
             *slots[i].lock().unwrap() = payload;
         }
@@ -9205,12 +9318,14 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 let outcomes: Vec<Option<String>> = if workers <= 1 {
                     queue.iter().map(|_| None).collect()
                 } else {
+                    let parents = check_pool_parents(&mut store, &inst, queue.len());
                     check_roots_pooled(
                         &engine,
                         &compiler_module,
                         &compiler,
                         &argv,
                         &queue,
+                        &parents,
                         workers,
                     )
                 };
