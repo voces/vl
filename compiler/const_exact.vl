@@ -177,21 +177,86 @@ function cxmBitLen(a: i32[]): i32 {
 function cxmDivmod(n: i32[], d: i32[]): i32[][] {
   if d.length == 1 && d[0] < 0x8000 { return cxmDivmodSmall(n, d[0]) }
   if bigCmp(n, d) < 0 { return [[0], n] }
-  const shift = cxmBitLen(n) - cxmBitLen(d)
-  let rem = n
-  let dd = cxmShl(d, shift)
-  let q: i32[] = [0]
-  let s = shift
-  while s >= 0 {
-    q = cxmShl(q, 1)
-    if bigCmp(rem, dd) >= 0 {
-      rem = cxmSub(rem, dd)
-      q = cxmAdd(q, cxmOne())
-    }
-    dd = cxmShr(dd, 1)
-    s = s - 1
+  cxmDivmodLong(n, d)
+}
+
+// Long division a limb at a time (Knuth's algorithm D). Both operands are first shifted so the
+// divisor's top limb has its high bit set, which keeps each estimated quotient limb at most one
+// above the true one after the two-limb test; `d` is at least 0x8000.
+function cxmDivmodLong(n: i32[], d: i32[]): i32[][] {
+  let s = 0
+  let top = d[d.length - 1]
+  while top < 0x8000 {
+    top = top << 1
+    s = s + 1
   }
-  [q, rem]
+  const v = cxmShl(d, s)
+  const u = cxmShl(n, s)
+  u.push(0)
+  const m = v.length
+  const q: i32[] = []
+  let k = 0
+  while k < u.length - m {
+    q.push(0)
+    k = k + 1
+  }
+  const vt = v[m - 1] as i64
+  let vs = 0 as i64
+  if m > 1 { vs = v[m - 2] as i64 }
+  let j = u.length - m - 1
+  while j >= 0 {
+    const num = (u[j + m] as i64) * 65536 + (u[j + m - 1] as i64)
+    let qhat = num / vt
+    let rhat = num - qhat * vt
+    let u2 = 0 as i64
+    if m > 1 { u2 = u[j + m - 2] as i64 }
+    while rhat < 65536 && (qhat >= 65536 || qhat * vs > rhat * 65536 + u2) {
+      qhat = qhat - 1
+      rhat = rhat + vt
+    }
+    let carry = 0 as i64
+    let borrow = 0 as i64
+    let i = 0
+    while i < m {
+      const p = qhat * (v[i] as i64) + carry
+      carry = p >> 16
+      const t = (u[i + j] as i64) - (p & 0xffff) - borrow
+      if t < 0 {
+        u[i + j] = (t + 65536) as% i32
+        borrow = 1 as i64
+      } else {
+        u[i + j] = t as% i32
+        borrow = 0 as i64
+      }
+      i = i + 1
+    }
+    const t = (u[j + m] as i64) - carry - borrow
+    if t < 0 {
+      // A negative top limb means the estimate is one too large: add the divisor back once.
+      u[j + m] = (t + 65536) as% i32
+      qhat = qhat - 1
+      let c = 0
+      let a = 0
+      while a < m {
+        const w = u[a + j] + v[a] + c
+        u[a + j] = w & 0xffff
+        c = w >>> 16
+        a = a + 1
+      }
+      u[j + m] = (u[j + m] + c) & 0xffff
+    } else {
+      u[j + m] = t as% i32
+    }
+    q[j] = qhat as% i32
+    j = j - 1
+  }
+  const r: i32[] = []
+  k = 0
+  while k < m {
+    r.push(u[k])
+    k = k + 1
+  }
+  [cxmTrim(q), cxmShr(cxmTrim(r), s)]
 }
 
 // A divisor below 2^15 keeps every running remainder times 2^16 inside the signed range.
