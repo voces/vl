@@ -79,6 +79,8 @@ import {
   crProgRoot,
   crSoleDepths,
   crSoleNames,
+  crSoleRoots,
+  crSoleTys,
   crValUseDyn,
   crValUseGetProps,
   crValUseNames,
@@ -94,6 +96,7 @@ import {
   cvuSlotOf,
 } from "./check_capture_rows"
 import { crCurRoot } from "./check_capture_widen"
+import { crSoleRefBinding } from "./check_cr_walk"
 import { inferQuiet } from "./check_cursor"
 import {
   ES_UNBOUNDED,
@@ -245,24 +248,85 @@ export function crNoteSoleRef(n: LetDecl) {
   let root = crCurRoot()
   if crFnBases.length == 0 { root = crProgRoot }
   if root < 0 { return 0 }
+  if root == crProgRoot {
+    // Most top-level records are never asked about, and grading one walks the whole program.
+    crValUseRoot = root
+    crSolePush(n.letName, d, root, lookup(n.letName))
+    return 0
+  }
   if root != crValUseRoot {
     crValUseEnter(root)
     crValUseRoot = root
   }
-  if crValUseNames[n.letName] ?? false { return 0 }
-  if crValUseDyn[n.letName] ?? false { return 0 }
-  const gps = crValUseGetProps[n.letName] ?? []
+  if crSoleUsesOk(n.letName, CR_SOLE_TY_LATER) {
+    crSolePush(n.letName, d, -1, -1)
+  }
+  0
+}
+
+// `crSoleUsesOk`'s type argument when the binding's type is looked up only if a getter needs it.
+const CR_SOLE_TY_LATER = -2
+
+function crSolePush(name: string, d: i32, root: i32, lt: i32) {
+  crSoleNames.push(name)
+  crSoleDepths.push(d)
+  crSoleRoots.push(root)
+  crSoleTys.push(lt)
+  0
+}
+
+// Whether the root `crValUseNames` describes uses `name`, declared at type `lt`, only as a
+// receiver no getter or operator hands on.
+function crSoleUsesOk(name: string, lt: i32) {
+  if crValUseNames[name] ?? false { return false }
+  if crValUseDyn[name] ?? false { return false }
+  const gps = crValUseGetProps[name] ?? []
   if gps.length > 0 {
-    const lt = lookup(n.letName)
+    let t = lt
+    if t == CR_SOLE_TY_LATER { t = lookup(name) }
     let k = 0
     while k < gps.length {
-      if crTyMayReadGetter(lt, gps[k]) { return 0 }
+      if crTyMayReadGetter(t, gps[k]) { return false }
       k = k + 1
     }
   }
-  crSoleNames.push(n.letName)
-  crSoleDepths.push(d)
-  0
+  true
+}
+
+// Whether `name`, resolved at this point, names a binding `crNoteSoleRef` recorded; a record
+// still waiting on its root is graded first, and dropped when that root uses it as a value.
+export function crSoleRefHolds(name: string): boolean {
+  if name == "" || crSoleNames.length == 0 { return false }
+  const d = lookupDepth(name)
+  if d < 0 { return false }
+  let i = crSoleNames.length - 1
+  while i >= 0 && crSoleDepths[i] >= d {
+    if crSoleNames[i] == name && crSoleDepths[i] == d {
+      const root = crSoleRoots[i]
+      if root >= 0 {
+        crSoleRoots[i] = -1
+        if !crSoleGradeAt(root, name, crSoleTys[i]) { crSoleNames[i] = "" }
+      }
+      return crSoleRefBinding(name)
+    }
+    i = i - 1
+  }
+  false
+}
+
+// `crSoleUsesOk` against `root`; the root `crValUseNames` describes is restored after.
+function crSoleGradeAt(root: i32, name: string, lt: i32) {
+  const kRoot = crValUseRoot
+  const kNames = crValUseNames
+  const kDyn = crValUseDyn
+  const kGets = crValUseGetProps
+  crValUseEnter(root)
+  const ok = crSoleUsesOk(name, lt)
+  crValUseRoot = kRoot
+  crValUseNames = kNames
+  crValUseDyn = kDyn
+  crValUseGetProps = kGets
+  ok
 }
 
 // Whether a read `.prop` of a value typed `t` may run a getter: `t` or a member of it has one,
