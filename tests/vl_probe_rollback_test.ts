@@ -30,12 +30,14 @@ const compiled = ignore
   ? undefined
   : new WebAssembly.Module(Deno.readFileSync(COMPILER));
 
-// An un-annotated return puts `f` through `inferReturnsPrePass`, whose quiet check of the body
-// records the mismatch and then drops it.
+// An un-annotated return in a recursion group puts `f` through `inferReturnsPrePass`, whose
+// quiet check of the body records the mismatch and then drops it.
 const ERR_IN_INFERRED = `function f(x: i32) {
   const s: string = x
+  if x > 0 { return g(x - 1) }
   return 1
 }
+function g(x: i32) { f(x) }
 print(f(1))
 `;
 
