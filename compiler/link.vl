@@ -1,0 +1,703 @@
+// The link step of a per-module build: rebuilds a wasm module from per-module artifacts, whose
+// function bodies and global initialisers carry no program-numbered function, global or
+// value-borne index, only a symbol naming each, plus the program-level sections this stage still
+// passes through. Every such index is assigned here from the symbols. Reads no emitter state.
+// docs/internals/s5-per-module-artifacts.md §10.
+
+import {
+  RS_ATOM,
+  RS_GNAME,
+  RS_GREAD,
+  RS_GUARD,
+  RS_SLOT,
+  RS_TAG,
+  relSkew,
+} from "./emit_reloc"
+
+// A reference's kind: a function index, a global index, or a value of row space 1 to 6.
+export const LK_FUNC = 0
+export const LK_GLOBAL = 7
+
+// A cut-out LEB: where it goes in its piece's bytes, its kind and the symbol it names.
+export type LinkRef = { at: i32, kind: i32, key: string }
+// Bytes with every reference cut out, the references in byte order.
+export type LinkPiece = { b: u8[], refs: LinkRef[] }
+// A function: its symbol, its function-section entry, its body, whether its address is taken,
+// and the table thunk it carries when it is taken without an env parameter.
+export type LinkFn = {
+  key: string,
+  ty: u8[],
+  body: LinkPiece,
+  taken: boolean,
+  thunk: boolean,
+  thunkTy: u8[],
+  thunkBody: LinkPiece,
+}
+// A defined global: its symbol and its whole entry (type, mutability, initialiser).
+export type LinkGlobal = { key: string, entry: LinkPiece }
+// An export: its name bytes, its kind, and its target's symbol ("" keeps index 0).
+export type LinkExport = { name: u8[], kind: i32, key: string }
+// One module's artifact. `consts` are its immutable bindings' initialisers in declaration
+// order, folded or not, which the link numbers first; `defs` the shared globals it names
+// (pooled strings, synthetic constants); `guards` every top-level binding in declaration
+// order; `pool` and `poolIs` the literals it pools in source order.
+export type LinkArt = {
+  path: string,
+  fns: LinkFn[],
+  cells: LinkGlobal[],
+  consts: LinkPiece[],
+  defs: LinkGlobal[],
+  guards: string[],
+  pool: string[],
+  poolIs: string[],
+  exports: LinkExport[],
+}
+export type LinkSec = { id: i32, b: u8[] }
+// The program-level input: the sections passed through, the imports, whether the table
+// exists, the functions placed after every module's own (lifted functions, later instances),
+// the runtime's functions and globals, the start function, and the tag-band tables.
+export type LinkProg = {
+  secs: LinkSec[],
+  fnImports: string[],
+  globImports: string[],
+  table: boolean,
+  tail: LinkFn[],
+  runtime: LinkArt,
+  startKey: string,
+  vKeys: string[],
+  atomTop: i32,
+  rl: string[],
+  mvKind: i32[],
+  mvVal: string[],
+  clo: string[],
+}
+// The linked module, how many references name no symbol (the first few by key), and how many
+// symbols are defined twice.
+export type LinkOut = { b: u8[], unresolved: i32, miss: string[], dup: i32 }
+
+let fIdx: { [string]: i32 } = Map()
+let gIdx: { [string]: i32 } = Map()
+let vals: { [string]: i32 } = Map()
+let vNext: i32[] = []
+let tagMemo: { [string]: i32 } = Map()
+let lkUnresolved = 0
+let lkMissKeys: string[] = []
+let lkDup = 0
+// How many defined globals precede the synthetic constants.
+let lkFixedGlobals = 0
+
+// Links `arts`, in load order, against `p`.
+export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
+  fIdx = Map()
+  gIdx = Map()
+  vals = Map()
+  vNext = [0, 0, 0, 0, 0, 0, 0]
+  tagMemo = Map()
+  lkUnresolved = 0
+  lkMissKeys = []
+  lkDup = 0
+  const fns: LinkFn[] = []
+  let fi = 0
+  while fi < p.fnImports.length {
+    lkPut(fIdx, p.fnImports[fi], fi)
+    fi = fi + 1
+  }
+  for a in arts {
+    for f in a.fns {
+      lkPut(fIdx, f.key, fi)
+      fns.push(f)
+      fi = fi + 1
+    }
+  }
+  for f in p.tail {
+    lkPut(fIdx, f.key, fi)
+    fns.push(f)
+    fi = fi + 1
+  }
+  const nUser = fns.length
+  for f in p.runtime.fns {
+    lkPut(fIdx, f.key, fi)
+    fns.push(f)
+    fi = fi + 1
+  }
+  const thunks: LinkFn[] = []
+  let ui = 0
+  while ui < nUser {
+    if fns[ui].thunk {
+      lkPut(fIdx, "t:" + fns[ui].key, fi)
+      thunks.push(fns[ui])
+      fi = fi + 1
+    }
+    ui = ui + 1
+  }
+  const globals = lkGlobals(p, arts, fns, thunks)
+  lkValues(arts, globals, fns, thunks)
+  {
+    b: lkModule(p, arts, fns, nUser, thunks, globals),
+    unresolved: lkUnresolved,
+    miss: lkMissKeys,
+    dup: lkDup,
+  }
+}
+
+function lkMiss(key: string) {
+  lkUnresolved = lkUnresolved + 1
+  if lkMissKeys.length < 8 { lkMissKeys.push(key) }
+  0
+}
+
+function lkPut(m: { [string]: i32 }, key: string, v: i32) {
+  if (m[key] ?? -1) >= 0 {
+    lkDup = lkDup + 1
+    return 0
+  }
+  m[key] = v
+  0
+}
+
+// The defined globals in index order: the pooled strings, the cells by module, the runtime's,
+// then each synthetic constant where a body in function order first names it.
+function lkGlobals(
+  p: LinkProg,
+  arts: LinkArt[],
+  fns: LinkFn[],
+  thunks: LinkFn[],
+): LinkPiece[] {
+  const defs: { [string]: i32 } = Map()
+  const defAt: LinkGlobal[] = []
+  for a in lkWithRuntime(p, arts) {
+    for d in a.defs {
+      if (defs[d.key] ?? -1) < 0 {
+        defs[d.key] = defAt.length
+        defAt.push(d)
+      }
+    }
+  }
+  const out: LinkPiece[] = []
+  let gi = p.globImports.length
+  let k = 0
+  while k < p.globImports.length {
+    lkPut(gIdx, p.globImports[k], k)
+    k = k + 1
+  }
+  const lexes: string[] = []
+  const seen: { [string]: boolean } = Map()
+  for a in arts { lkAddNew(a.pool, lexes, seen) }
+  for a in arts { lkAddNew(a.poolIs, lexes, seen) }
+  for lex in lexes {
+    const key = "s:" + lex
+    const d = defs[key] ?? -1
+    lkPut(gIdx, key, gi)
+    if d >= 0 { out.push(defAt[d].entry) } else { lkMiss(key) }
+    gi = gi + 1
+  }
+  for a in arts {
+    for c in a.cells {
+      lkPut(gIdx, c.key, gi)
+      out.push(c.entry)
+      gi = gi + 1
+    }
+  }
+  for c in p.runtime.cells {
+    lkPut(gIdx, c.key, gi)
+    out.push(c.entry)
+    gi = gi + 1
+  }
+  lkFixedGlobals = out.length
+  const order: LinkPiece[] = []
+  for f in fns { order.push(f.body) }
+  for t in thunks { order.push(t.thunkBody) }
+  for b in order {
+    for r in b.refs {
+      if (
+        r.kind == LK_GLOBAL
+        && lkHasPrefix(r.key, "y:")
+        && (gIdx[r.key] ?? -1) < 0
+      ) {
+        const d = defs[r.key] ?? -1
+        gIdx[r.key] = gi
+        if d >= 0 { out.push(defAt[d].entry) } else { lkMiss(r.key) }
+        gi = gi + 1
+      }
+    }
+  }
+  out
+}
+
+function lkAddNew(src: string[], dst: string[], seen: { [string]: boolean }) {
+  for s in src {
+    if !(seen[s] ?? false) {
+      seen[s] = true
+      dst.push(s)
+    }
+  }
+  0
+}
+
+// Numbers the first-met value spaces (atoms, guard names, guard readers) in the order the
+// module carries them: global initialisers, then bodies in function order.
+function lkValues(
+  arts: LinkArt[],
+  globals: LinkPiece[],
+  fns: LinkFn[],
+  thunks: LinkFn[],
+) {
+  let ord = 1
+  for a in arts {
+    for g in a.guards {
+      lkPut(vals, lkValKey(RS_GUARD, g), ord)
+      ord = ord + 1
+    }
+  }
+  for a in arts {
+    for c in a.consts { lkMeet(c) }
+  }
+  let gi = 0
+  while gi < lkFixedGlobals {
+    lkMeet(globals[gi])
+    gi = gi + 1
+  }
+  for f in fns { lkMeet(f.body) }
+  for t in thunks { lkMeet(t.thunkBody) }
+  while gi < globals.length {
+    lkMeet(globals[gi])
+    gi = gi + 1
+  }
+  0
+}
+
+function lkWithRuntime(p: LinkProg, arts: LinkArt[]): LinkArt[] {
+  const all: LinkArt[] = []
+  for a in arts { all.push(a) }
+  all.push(p.runtime)
+  all
+}
+
+function lkMeet(b: LinkPiece) {
+  for r in b.refs {
+    const numbered = r.kind == RS_ATOM
+      || r.kind == RS_GNAME
+      || r.kind == RS_GREAD
+    if numbered && r.kind < vNext.length {
+      if lkClaim(lkValKey(r.kind, r.key), vNext[r.kind]) {
+        vNext[r.kind] = vNext[r.kind] + 1
+      }
+    }
+  }
+  0
+}
+
+// Numbers value `key` as `v` unless it is numbered already; true when it is new.
+function lkClaim(key: string, v: i32): boolean {
+  if (vals[key] ?? -1) >= 0 { return false }
+  vals[key] = v
+  true
+}
+
+function lkValKey(sp: i32, key: string): string {
+  if sp == RS_GUARD { return "1" + key }
+  if sp == RS_GNAME { return "2" + key }
+  if sp == RS_GREAD { return "3" + key }
+  "0" + key
+}
+
+// The value reference `r` resolves to, before its space's skew.
+function lkRefVal(p: LinkProg, r: LinkRef): i32 {
+  let v = -1
+  if r.kind == LK_FUNC || r.kind == RS_SLOT { v = fIdx[r.key] ?? -1 }
+  else if r.kind == LK_GLOBAL { v = gIdx[r.key] ?? -1 }
+  else if r.kind == RS_TAG { v = lkTag(p, r.key) }
+  else { v = vals[lkValKey(r.kind, r.key)] ?? -1 }
+  if v < 0 {
+    lkMiss(r.key)
+    return 0
+  }
+  v
+}
+
+// A union box tag from its key: a variant's rank among every variant key, a value-atom code
+// above them, or a slot-band arm by its table position. -1 for a key no table names.
+function lkTag(p: LinkProg, key: string): i32 {
+  const memo = tagMemo[key] ?? -2
+  if memo != -2 { return memo }
+  const k0 = p.vKeys.length
+  const base = k0 + p.atomTop
+  let t = -1
+  if lkHasPrefix(key, "v:") {
+    const sig = key.slice(2, key.length)
+    let below = 0
+    let hit = false
+    for s in p.vKeys {
+      if lkLess(s, sig) { below = below + 1 }
+      if s == sig { hit = true }
+    }
+    if hit { t = below }
+  } else if lkHasPrefix(key, "k:") {
+    t = k0 + lkInt(key.slice(2, key.length))
+  } else if lkHasPrefix(key, "rl:") {
+    const i = lkFind(p.rl, key.slice(3, key.length), 0)
+    if i >= 0 { t = base + 3 * i }
+  } else if key == "map:mono" {
+    t = base + 1
+  } else if lkHasPrefix(key, "map:") {
+    t = lkMapTag(p, key.slice(4, key.length), base)
+  } else if lkHasPrefix(key, "clo:") {
+    const i = lkFind(p.clo, key.slice(4, key.length), 1)
+    if i >= 1 { t = base + 2 + 3 * (i - 1) }
+  }
+  tagMemo[key] = t
+  t
+}
+
+// A map arm's tag from `kind:value`, the first value slot with that key kind and value name.
+function lkMapTag(p: LinkProg, kv: string, base: i32): i32 {
+  let c = 0
+  while c < kv.length && kv[c] != ':' { c = c + 1 }
+  if c >= kv.length { return -1 }
+  const kind = lkInt(kv.slice(0, c))
+  const val = kv.slice(c + 1, kv.length)
+  let s = 0
+  while s < p.mvKind.length && s < p.mvVal.length {
+    if p.mvKind[s] == kind && p.mvVal[s] == val { return base + 4 + 3 * s }
+    s = s + 1
+  }
+  -1
+}
+
+function lkFind(xs: string[], x: string, from: i32): i32 {
+  let i = from
+  while i < xs.length {
+    if xs[i] == x { return i }
+    i = i + 1
+  }
+  -1
+}
+
+// Code-unit order, a proper prefix first: the order the emitter ranks variant keys by.
+function lkLess(a: string, b: string): boolean {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] < b[i] }
+    i = i + 1
+  }
+  a.length < b.length
+}
+
+function lkHasPrefix(s: string, pre: string): boolean {
+  s.length >= pre.length && s.slice(0, pre.length) == pre
+}
+
+function lkInt(s: string): i32 {
+  let v = 0
+  let i = 0
+  let neg = false
+  if s.length > 0 && s[0] == '-' {
+    neg = true
+    i = 1
+  }
+  while i < s.length {
+    v = v * 10 + (s[i] - '0')
+    i = i + 1
+  }
+  if neg { return 0 - v }
+  v
+}
+
+// The module: each section in wasm order, rebuilt from the artifacts or passed through.
+function lkModule(
+  p: LinkProg,
+  arts: LinkArt[],
+  fns: LinkFn[],
+  nUser: i32,
+  thunks: LinkFn[],
+  globals: LinkPiece[],
+): u8[] {
+  const out: u8[] = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+  const nImp = p.fnImports.length
+  // The function and code sections are written even when empty, as the emitter writes them.
+  for id in [1, 2, 3, 4, 5, 13, 6, 7, 8, 9, 12, 10, 11] {
+    const s: u8[] = []
+    let have = false
+    if id == 3 {
+      have = true
+      lkU(s, fns.length + thunks.length)
+      for f in fns { lkBytes(s, f.ty) }
+      for t in thunks { lkBytes(s, t.thunkTy) }
+    } else if id == 4 {
+      have = p.table
+      if have {
+        s.push(1)
+        s.push(0x70)
+        s.push(0)
+        lkU(s, nImp + nUser)
+      }
+    } else if id == 6 && globals.length > 0 {
+      have = true
+      lkU(s, globals.length)
+      for g in globals { lkPiece(p, s, g) }
+    } else if id == 7 {
+      have = lkExports(lkWithRuntime(p, arts), s)
+    } else if id == 8 && p.startKey != "" {
+      have = true
+      lkU(s, fIdx[p.startKey] ?? 0)
+    } else if id == 9 {
+      have = lkElements(fns, nUser, nImp, s)
+    } else if id == 10 {
+      have = true
+      lkU(s, fns.length + thunks.length)
+      for f in fns { lkBody(p, s, f.body) }
+      for t in thunks { lkBody(p, s, t.thunkBody) }
+    } else if id != 3 && id != 6 && id != 8 && id != 10 {
+      for ps in p.secs {
+        if ps.id == id {
+          have = true
+          lkBytes(s, ps.b)
+        }
+      }
+    }
+    if have {
+      out.push(id)
+      lkU(out, s.length)
+      lkBytes(out, s)
+    }
+  }
+  out
+}
+
+function lkExports(arts: LinkArt[], s: u8[]): boolean {
+  let n = 0
+  for a in arts { n = n + a.exports.length }
+  if n == 0 { return false }
+  lkU(s, n)
+  for a in arts {
+    for e in a.exports {
+      lkU(s, e.name.length)
+      lkBytes(s, e.name)
+      s.push(e.kind)
+      let ix = 0
+      if e.kind == 0 { ix = fIdx[e.key] ?? -1 }
+      if e.kind == 3 { ix = gIdx[e.key] ?? -1 }
+      if ix < 0 {
+        lkMiss(e.key)
+        ix = 0
+      }
+      lkU(s, ix)
+    }
+  }
+  true
+}
+
+// One active segment per run of address-taken user functions, a run crossing a gap only while
+// filling it costs fewer bytes than a second segment's header.
+function lkElements(fns: LinkFn[], nUser: i32, nImp: i32, s: u8[]): boolean {
+  const runs: i32[] = []
+  let i = lkNextTaken(fns, 0, nUser)
+  while i < nUser {
+    let e = i + 1
+    let open = true
+    while open && e < nUser {
+      const nxt = lkNextTaken(fns, e, nUser)
+      if nxt >= nUser || (nxt - e) * lkUWidth(nImp + nxt) > 5 {
+        open = false
+      } else {
+        e = nxt + 1
+      }
+    }
+    runs.push(i)
+    runs.push(e)
+    i = lkNextTaken(fns, e, nUser)
+  }
+  if runs.length == 0 { return false }
+  lkU(s, runs.length / 2)
+  let r = 0
+  while r < runs.length {
+    s.push(0)
+    s.push(0x41)
+    lkS(s, nImp + runs[r])
+    s.push(0x0b)
+    lkU(s, runs[r + 1] - runs[r])
+    let di = runs[r]
+    while di < runs[r + 1] {
+      if fns[di].thunk {
+        lkU(s, fIdx["t:" + fns[di].key] ?? 0)
+      } else {
+        lkU(s, nImp + di)
+      }
+      di = di + 1
+    }
+    r = r + 2
+  }
+  true
+}
+
+function lkNextTaken(fns: LinkFn[], from: i32, n: i32): i32 {
+  let k = from
+  while k < n && !fns[k].taken { k = k + 1 }
+  k
+}
+
+function lkUWidth(v: i32): i32 {
+  let w = 1
+  let x = v
+  while x >= 128 {
+    x = x >> 7
+    w = w + 1
+  }
+  w
+}
+
+function lkBody(p: LinkProg, s: u8[], b: LinkPiece) {
+  const body: u8[] = []
+  lkPiece(p, body, b)
+  lkU(s, body.length)
+  lkBytes(s, body)
+}
+
+// Writes `b` with each reference's LEB filled in: an index unsigned, a value signed and skewed.
+function lkPiece(p: LinkProg, s: u8[], b: LinkPiece) {
+  let from = 0
+  for r in b.refs {
+    while from < r.at {
+      s.push(b.b[from])
+      from = from + 1
+    }
+    const v = lkRefVal(p, r)
+    if r.kind == LK_FUNC || r.kind == LK_GLOBAL {
+      lkU(s, v)
+    } else {
+      lkS(s, v + relSkew(r.kind))
+    }
+  }
+  while from < b.b.length {
+    s.push(b.b[from])
+    from = from + 1
+  }
+  0
+}
+
+function lkBytes(s: u8[], b: u8[]) {
+  for x in b { s.push(x) }
+  0
+}
+
+export function lkU(s: u8[], value: i32) {
+  let v = value
+  let more = true
+  while more {
+    const byte = v & 0x7f
+    v = v >>> 7
+    if v == 0 {
+      s.push(byte)
+      more = false
+    } else {
+      s.push(byte | 0x80)
+    }
+  }
+  0
+}
+
+export function lkS(s: u8[], value: i32) {
+  let v = value
+  let more = true
+  while more {
+    const byte = v & 0x7f
+    v = v >> 7
+    if v == 0 && (byte & 0x40) == 0 || v == -1 && (byte & 0x40) != 0 {
+      s.push(byte)
+      more = false
+    } else {
+      s.push(byte | 0x80)
+    }
+  }
+  0
+}
+
+// An FNV-1a digest of artifact `a`: every byte, reference and symbol it carries, so two
+// artifacts agree only when nothing in them depends on how the rest of the program numbered.
+export function linkArtHash(a: LinkArt): i32 {
+  let h = lkHS(-2128831035, a.path)
+  for f in a.fns { h = lkHF(h, f) }
+  for g in a.cells {
+    h = lkHS(h, g.key)
+    h = lkHP(h, g.entry)
+  }
+  for c in a.consts { h = lkHP(h, c) }
+  for g in a.defs {
+    h = lkHS(h, g.key)
+    h = lkHP(h, g.entry)
+  }
+  for s in a.guards { h = lkHS(h, s) }
+  for s in a.pool { h = lkHS(h, s) }
+  for s in a.poolIs { h = lkHS(h, s) }
+  for e in a.exports {
+    h = lkHB(h, e.name)
+    h = lkH(h, e.kind)
+    h = lkHS(h, e.key)
+  }
+  h
+}
+
+function lkHF(h0: i32, f: LinkFn): i32 {
+  let h = lkHS(h0, f.key)
+  h = lkHB(h, f.ty)
+  h = lkHP(h, f.body)
+  if f.taken { h = lkH(h, 1) } else { h = lkH(h, 0) }
+  if f.thunk {
+    h = lkH(h, 2)
+    h = lkHB(h, f.thunkTy)
+    h = lkHP(h, f.thunkBody)
+  }
+  h
+}
+
+// The digest of the program-level input, the runtime artifact included.
+export function linkProgHash(p: LinkProg): i32 {
+  let h = linkArtHash(p.runtime)
+  for f in p.tail { h = lkHF(h, f) }
+  for s in p.secs {
+    h = lkH(h, s.id)
+    h = lkHB(h, s.b)
+  }
+  for s in p.fnImports { h = lkHS(h, s) }
+  for s in p.globImports { h = lkHS(h, s) }
+  if p.table { h = lkH(h, 1) }
+  h = lkHS(h, p.startKey)
+  for s in p.vKeys { h = lkHS(h, s) }
+  h = lkH(h, p.atomTop)
+  for s in p.rl { h = lkHS(h, s) }
+  for k in p.mvKind { h = lkH(h, k) }
+  for s in p.mvVal { h = lkHS(h, s) }
+  for s in p.clo { h = lkHS(h, s) }
+  h
+}
+
+// The digest of one piece, for a symbol named by its contents.
+export function linkPieceHash(b: LinkPiece): i32 { lkHP(-2128831035, b) }
+
+function lkH(h: i32, x: i32): i32 { (h ^ x) * 16777619 }
+
+function lkHS(h: i32, s: string): i32 {
+  let r = lkH(h, s.length)
+  let i = 0
+  while i < s.length {
+    r = lkH(r, s[i])
+    i = i + 1
+  }
+  r
+}
+
+function lkHB(h: i32, b: u8[]): i32 {
+  let r = lkH(h, b.length)
+  for x in b { r = lkH(r, x) }
+  r
+}
+
+function lkHP(h: i32, b: LinkPiece): i32 {
+  let r = lkHB(h, b.b)
+  for x in b.refs {
+    r = lkH(r, x.at)
+    r = lkH(r, x.kind)
+    r = lkHS(r, x.key)
+  }
+  r
+}
