@@ -185,6 +185,7 @@ import {
   SYNTH_CONST_LIST,
   SYNTH_EMPTY_BACKING,
   TSK_CLOSURE,
+  TSK_CLO_CELL,
   TSK_CLO_ENV,
   TSK_CLO_SIG,
   TSK_F32_ARRAY,
@@ -240,6 +241,8 @@ import {
   caSeenVariants,
   capMemoArmed,
   cloAdapterCanon,
+  cloCellIdx,
+  cloCellTarget,
   cloDeclAt,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
@@ -593,6 +596,7 @@ import {
   fbLoop,
   fbMapSlotOf,
   fbMapTagOfI64,
+  fbMutRefNullField,
   fbPushRetExtra,
   fbRefAsNonNull,
   fbRefCast,
@@ -600,6 +604,7 @@ import {
   fbRefNullForKind,
   fbRefNullNone,
   fbRefNullStruct,
+  fbRefNullValtype,
   fbRetExtra,
   fbReturn,
   fbReturnCall,
@@ -613,6 +618,7 @@ import {
   fbStructGet,
   fbStructNew,
   fbStructSet,
+  fbStructTypeHead,
   fbUnreachable,
   fbV128ConstZero,
   fbValtype,
@@ -671,6 +677,7 @@ import {
 import { capMemoEditsReset, fnEnvIdxOf, nfdReset } from "./emit_capture_frames"
 import { bcReset } from "./emit_closure_callee"
 import {
+  capCellTargetOf,
   captureNamesOf,
   captureValKind,
   captureValStructIdx,
@@ -1361,7 +1368,12 @@ function envCacheOpen(fnPos: i32) {
     const ty = fnEnvIdxOf(kid)
     if ty >= 0 && !cloLifted(kid) && !criFnIsAnonLambda(kid) {
       envCacheFes.push(kid)
-      envCacheTys.push(ty)
+      // A function another frame reads keeps its cell here instead of its env (D7700).
+      if kid < cloCellTarget.length && cloCellTarget[kid] == 1 {
+        envCacheTys.push(cloCellIdx)
+      } else {
+        envCacheTys.push(ty)
+      }
     }
   }
   0
@@ -8389,6 +8401,15 @@ function tsClosure() {
   0
 }
 
+// The function-value cell `{ v: (mut (ref null $closure)) }` a declaring frame and every frame
+// reading its function as a value share (`cloCellTarget`).
+function tsCloCell() {
+  tsEntryAt(cloCellIdx, "function-value cell")
+  fbStructTypeHead(1)
+  fbMutRefNullField(cloStructIdx)
+  0
+}
+
 // One env-leading `$fnsig` functype per distinct eligible signature, in `cloSigKeys` order,
 // and — as each is written — the pool's twin column: the smallest earlier entry with
 // identical bytes (D351). Compared over the section buffer just rendered into, so every
@@ -8423,7 +8444,11 @@ function tsCloEnv(fe: i32) {
   wULEB(caps.length)
   let ci = 0
   while ci < caps.length {
-    fbValtype(captureValKind(fe, caps[ci]), captureValStructIdx(fe, caps[ci]))
+    if capCellTargetOf(caps[ci]) >= 0 {
+      fbRefNullValtype(cloCellIdx) // the shared function-value cell
+    } else {
+      fbValtype(captureValKind(fe, caps[ci]), captureValStructIdx(fe, caps[ci]))
+    }
     wU8(0) // immutable
     ci = ci + 1
   }
@@ -8498,6 +8523,7 @@ function tsEmitEntry(kind: i32, slot: i32) {
   if kind == TSK_CLO_SIG { return tsCloSig(slot) }
   if kind == TSK_CLO_ENV { return tsCloEnv(slot) }
   if kind == TSK_MV_MAP { return tsMvMap(slot) }
+  if kind == TSK_CLO_CELL { return tsCloCell() }
   emitFail(
     "emitProgram: the type section has no writer for allocation kind "
       + i32ToStr(kind),
