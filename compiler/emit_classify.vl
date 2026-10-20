@@ -9671,16 +9671,7 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
       if d.binOp == "??" { return coalesceDefaultNullable(d.binRight, fnIx) }
     }
     Index => {
-      const dt = nodeTyIxOf(dix)
-      if (
-        dt >= 0
-        && dt < T.tys.length
-        && T.tys[dt] is TyVar
-        && !indexPlaceNonNull(dix)
-        && mapRecvTyIn(d.idxArr, fnIx) >= 0
-      ) {
-        return true
-      }
+      if coalHoleMapReadIx(dix, fnIx) { return true }
     }
     // Any other default is nullable only by its type or its union, read below.
     NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
@@ -9689,6 +9680,30 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   const un = unionNameOfExpr(dix, fnIx)
   if un != "" { return unionSetHasNull(un) }
   false
+}
+
+// Whether `ix` is a hole's read off a map its instance pins, `V | null` whatever the template
+// recorded; false for any other node.
+function coalHoleMapReadIx(ix: i32, fnIx: i32): boolean {
+  if ix < 0 { return false }
+  const d = P.nodes[ix]
+  if !(d is Index) || indexPlaceNonNull(ix) { return false }
+  const dt = nodeTyIxOf(ix)
+  if dt < 0 || dt >= T.tys.length || !(T.tys[dt] is TyVar) { return false }
+  mapRecvTyIn(d.idxArr, fnIx) >= 0
+}
+
+// Whether the last default of the `??` chain at `defIx` is a hole's map read
+// (`coalHoleMapReadIx`), whose own union name is no evidence of its set.
+function coalDefaultEndsInHoleMapRead(defIx: i32, fnIx: i32): boolean {
+  const dix = unwrapParen(defIx)
+  if dix < 0 { return false }
+  const d = P.nodes[dix]
+  if d is BinExpr {
+    if d.binOp == "??" { return coalDefaultEndsInHoleMapRead(d.binRight, fnIx) }
+    return false
+  }
+  coalHoleMapReadIx(dix, fnIx)
 }
 
 // The HALF a non-map `??` result lands in — `true` the NULLABLE half, `false` the non-null one
@@ -14896,7 +14911,11 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         const cln = unionNameOfExpr(e.binLeft, fnIx)
         if cln != "" && coalesceDefaultNullable(e.binRight, fnIx) {
           const crn = unionNameOfExpr(e.binRight, fnIx)
-          if crn == "" || crn == cln { return cln }
+          // A hole's map read default names no set, so it keeps `cln` only by naming it.
+          if crn == cln { return cln }
+          if crn == "" && !coalDefaultEndsInHoleMapRead(e.binRight, fnIx) {
+            return cln
+          }
         }
         // A `?.` LHS over a value-union LEAF stays a BOX past the `??` even with a NON-null
         // default: peeling `null` off `i32 | string | null` leaves TWO atoms, which have no
