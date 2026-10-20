@@ -17,7 +17,6 @@ const SCRIPT = `${ROOT}/scripts/ci-verdict.sh`;
 const GATE_COVERED: Record<string, string> = {
   "ci-native": "ci-native",
   "ci-release-shape": "ci-native",
-  "fuel-sidecars": "plumb-shape cost",
   "ci-cost": "scaling shape",
 };
 

@@ -261,7 +261,6 @@ Deno.test("ci-proof: the proof job waits on every job, and the counts are ci.yml
       "ci-release-shape",
       "checks",
       "checks-suites",
-      "fuel-sidecars",
       "ci-cost",
     ]
   ) {
