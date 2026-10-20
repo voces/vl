@@ -207,6 +207,8 @@ run "lsp lint"                 deno lint --config lsp/deno.json lsp/src/
 #
 # NOT SKIPPED UNDER GATE_FIXPOINT_PROVEN. The fuel and the profile need the pair's builds
 # anyway, and the fixpoint is a `cmp` of two files they leave, so re-proving it costs nothing.
+# A caller that built the pair as its own fixpoint rungs passes `SELF_COMPILE_PAIR=<dir>`, and
+# the row grades that pair instead of compiling it again, when its stage 4 is this seed.
 run "self-compile pair"        bash scripts/self-compile-pair.sh
 run "lint-self + fmt"          bash scripts/lint-self.sh
 # The comment-budget, kind-ladder, sentinel-index, arena-scan and prefer-interpolation

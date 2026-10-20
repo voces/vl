@@ -18,6 +18,11 @@
 #
 #   scripts/self-compile-pair.sh               # build the pair, run all three graders
 #   scripts/self-compile-pair.sh --build <dir> # build the pair into <dir> and stop
+#   SELF_COMPILE_PAIR=<dir> scripts/self-compile-pair.sh   # grade a --build pair whose stage 4 is $SEED
+#
+# A caller holding a candidate's rung 1 can build the pair from it (`SEED=c1 --build`) as its
+# fixpoint rungs: `names` is rung 2 plus custom sections and stage 4 is rung 3, so `names`'
+# plain bytes == stage 4 is the c2 == c3 proof, and stage 4 is the seed the gate then grades.
 set -u
 cd "$(dirname "$0")/.."
 VL="${VL:-scripts/vl-host/target/release/vl}"
@@ -42,9 +47,19 @@ if [ "${1:-}" = "--build" ]; then
   exit $?
 fi
 
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
-if ! build_pair "$WORK"; then
+# `SELF_COMPILE_PAIR=<dir>`: grade a pair a caller already built with `--build` (the merge
+# audit builds it as its fixpoint rungs, so building it again here is two self-compiles spent
+# twice). It is used only if its stage 4 IS the seed being graded; anything else is rebuilt.
+OWN="$(mktemp -d)"
+trap 'rm -rf "$OWN"' EXIT
+WORK="$OWN"; PRE="${SELF_COMPILE_PAIR:-}"
+if [ -n "$PRE" ] && [ -s "$PRE/names.wasm" ] && [ -s "$PRE/stage4.time" ] && cmp -s "$PRE/stage4.wasm" "$SEED"; then
+  echo "self-compile pair: grading the pair prebuilt in $PRE (its stage 4 is the seed)"
+  WORK="$PRE"
+elif [ -n "$PRE" ]; then
+  echo "self-compile pair: SELF_COMPILE_PAIR=$PRE is not this seed's pair; building one"
+fi
+if [ "$WORK" = "$OWN" ] && ! build_pair "$WORK"; then
   # No verdict can be read without the pair; the fixpoint is red by definition (the compiler
   # did not rebuild itself), and the other two have nothing to grade.
   echo
