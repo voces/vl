@@ -73,7 +73,7 @@ import {
 import { i32ListHas } from "./listutil"
 
 import { identDeclOf } from "./symbols"
-import { tyHasTyVar } from "./tyquery"
+import { tyHasTyVar, tyIsArray, tyReachesHole } from "./tyquery"
 
 let vrParent: {[i32]: i32} = Map()
 let vrUses: {[i32]: i32[]} = Map()
@@ -89,7 +89,8 @@ let vrExact = false
 
 // Starts a new question over the module statements `stmts`, whose values are dropped. With
 // `inst` an instance function answers by its template's reads; with `exact` every call answered
-// runs this value alone, so a join, a write, a parameter or an unnamed element position is lost.
+// runs this value or a loop variable over its list, so a join, a write, a parameter or an
+// unnamed element position is lost.
 export function vrReset(stmts: i32[], inst: boolean, exact: boolean) {
   vrParent = Map()
   vrUses = Map()
@@ -182,7 +183,10 @@ export function vrCalls(x: i32, path: string): i32[] {
   r
 }
 
-// The one function type with no type variable every call value `x` reaches at `path` makes;
+// Whether type `t` names a type variable or reaches an inference hole.
+function vrOpen(t: i32): boolean { tyHasTyVar(t) || tyReachesHole(t, 16) }
+
+// The one closed function type every call value `x` reaches at `path` makes;
 // -1 when it reaches no call, a place the question does not follow, or calls of more than one type.
 export function vrCalleeTy(x: i32, path: string): i32 {
   const cs = vrCalls(x, path)
@@ -198,14 +202,14 @@ export function vrCalleeTy(x: i32, path: string): i32 {
   out
 }
 
-// The function type call `n` at node `c` makes: its callee's, or where that names a type variable,
-// at each such parameter its argument's type and at such a result its own; -1 when one still does.
+// The function type call `n` at node `c` makes: its callee's, or where that is open (`vrOpen`),
+// at each open parameter its argument's type and at an open result its own; -1 when one still is.
 function vrCallTy(n: Call, c: i32): i32 {
   const t = nodeTyIxOf(n.callFn)
   if t < 0 || t >= T.tys.length { return -1 }
   const ft = T.tys[t]
   if !(ft is TyFunc) { return -1 }
-  if !tyHasTyVar(t) { return t }
+  if !vrOpen(t) { return t }
   if (
     hasNamedArgs(n.callArgNames)
     || n.callArgs.length != ft.fnParamTypes.length
@@ -216,18 +220,18 @@ function vrCallTy(n: Call, c: i32): i32 {
   let i = 0
   while i < n.callArgs.length {
     let pt = ft.fnParamTypes[i]
-    if tyHasTyVar(pt) {
+    if vrOpen(pt) {
       const a = n.callArgs[i]
       if P.nodes[a] is Spread { return -1 }
       pt = nodeTyIxOf(a)
-      if pt < 0 || tyHasTyVar(pt) { return -1 }
+      if pt < 0 || vrOpen(pt) { return -1 }
     }
     ps.push(pt)
     i = i + 1
   }
   let r = ft.fnRet
-  if tyHasTyVar(r) { r = nodeTyIxOf(c) }
-  if r < 0 || tyHasTyVar(r) { return -1 }
+  if vrOpen(r) { r = nodeTyIxOf(c) }
+  if r < 0 || vrOpen(r) { return -1 }
   mkFuncTy(ps, r)
 }
 
@@ -305,7 +309,11 @@ function vrStep(x: i32, path: string): i32[] {
         const one: i32[] = [p]
         return one
       }
-      if !vrExact { return vrArg(pn, x, path) }
+      if !vrExact {
+        const pr = vrPushRecv(pn)
+        if pr >= 0 { return vrPushed(pn, pr, x, path) }
+        return vrArg(pn, x, path)
+      }
     }
     Member => {
       return vrProp(pn.memProp, p, path)
@@ -375,7 +383,7 @@ function vrIndexRead(ix: i32, p: i32, path: string): i32[] {
 }
 
 // The `ForIn` arm of `vrStep` for the list `p` iterates: each element is bound to the loop
-// variable, whose reads reach what the element does; with `exact` only an unread one answers.
+// variable, whose reads reach what the element does, in either mode.
 function vrForVar(n: ForIn, p: i32, path: string): i32[] {
   const out: i32[] = []
   if vrElemOf(path) == -2 { return vrLost() }
@@ -383,7 +391,7 @@ function vrForVar(n: ForIn, p: i32, path: string): i32[] {
   for u in vrUses[p] ?? [] {
     const un = P.nodes[u]
     if un is Ident && un.identName == n.fiVar {
-      if vrExact || !vrJoin(out, vrCalls(u, rest)) { return vrLost() }
+      if !vrJoin(out, vrCalls(u, rest)) { return vrLost() }
     }
   }
   out
@@ -537,12 +545,37 @@ function vrArg(n: Call, x: i32, path: string): i32[] {
   vrLost()
 }
 
-// The member arms of `vrStep`: a list's `length` reads no element, and a record's other fields
-// read none of the one holding the function.
+// The receiver of call `n` when it is `xs.push(…)` on a list, else -1.
+function vrPushRecv(n: Call): i32 {
+  if n.callFn < 0 { return -1 }
+  const m = P.nodes[n.callFn]
+  if !(m is Member) || m.memProp != "push" { return -1 }
+  if !tyIsArray(nodeTyIxOf(m.memObj)) { return -1 }
+  m.memObj
+}
+
+// The `Call` arm of `vrStep` for value `x` pushed onto list `recv` by call `n`: it is an element
+// of the binding `recv` names, at no known position; lost for any other receiver or a spread.
+function vrPushed(n: Call, recv: i32, x: i32, path: string): i32[] {
+  if P.nodes[x] is Spread || hasNamedArgs(n.callArgNames) { return vrLost() }
+  const r = unwrapParen(recv)
+  if r < 0 || !(P.nodes[r] is Ident) { return vrLost() }
+  const d = identDeclOf(r)
+  if d < 0 || d >= P.nodes.length { return vrLost() }
+  vrDecl(d, "e," + path)
+}
+
+// The member arms of `vrStep`: a list's `length` reads no element, nor does a `push` onto it,
+// and a record's other fields read none of the one holding the function.
 function vrProp(prop: string, p: i32, path: string): i32[] {
   const none: i32[] = []
   if vrElemOf(path) != -2 {
     if prop == "length" { return none }
+    const c = vrParent[p] ?? -1
+    if c >= 0 {
+      const cn = P.nodes[c]
+      if cn is Call && cn.callFn == p && vrPushRecv(cn) >= 0 { return none }
+    }
     return vrLost()
   }
   if path.slice(0, 2) != "f:" { return vrLost() }
