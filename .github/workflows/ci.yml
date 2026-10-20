@@ -133,7 +133,7 @@ jobs:
   #   seed ──┬── ci-native (5)        the auto-discovered native suites, split by weight
   #          ├── checks               ratchets, probes, self-lint, corpus oracle, editor suites
   #          ├── ci-release-shape (4) the binaryen-backed suites, split by weight
-  #          └── fuel-sidecars ── ci-cost (4)   fuel/RSS cost ratchets — master pushes and nightly only
+  #          └── ci-cost (4)         fuel/RSS cost ratchets — master pushes and nightly only
   #
   # `seed` is the only job that builds anything: the vl-host binary (on a binary-cache miss)
   # and the seed, which it refreshes AND proves a self-compilation fixed point before saving
@@ -143,8 +143,8 @@ jobs:
   #
   # `seed` outputs `heavy` (false for a docs-only or an inherited run, which skip every
   # downstream job) and `gated`. `gated` is true only on a master push of a tree the merge
-  # queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the four
-  # jobs gate.sh runs whole: ci-native, ci-release-shape, fuel-sidecars, ci-cost.
+  # queue's scripts/gate.sh already passed (scripts/ci-verdict.sh), and skips just the three
+  # jobs gate.sh runs whole: ci-native, ci-release-shape, ci-cost.
   # tests/ci_verdict_test.ts holds that list to what gate.sh covers.
   # ---------------------------------------------------------------------------
   seed:
@@ -264,14 +264,31 @@ jobs:
       # `compile(X, source) == X` byte-equality. An exact cache hit proves out in ONE
       # self-compile; a stale seed climbs two or three rungs. Whatever rung proves out is
       # what the cache entry above saves, so every downstream job runs the proven fixpoint.
-      # The two FUEL sidecars are left to the jobs that meter fuel (`ci-cost`, and a native
-      # shard whose files read `$VL_FUEL`), which share them through their own `vl-fuel-`
-      # cache: each is a whole-seed JIT, and warming them here put both on the critical path.
+      # The two FUEL sidecars stay out of that entry (every downstream job restores it) and
+      # get their own `vl-fuel-` cache, which `ci-cost` and the native shard whose files read
+      # `$VL_FUEL` restore. Where `ci-cost` runs they are warmed HERE, in the background of
+      # the ladder's single-threaded compiles (`--fuel-stash`): a job of their own sat in
+      # series between `seed` and `ci-cost`, and a warm AFTER the ladder would delay every
+      # downstream job instead.
+      - name: Cache the fuel sidecars
+        id: fuelcache
+        if: steps.verdict.outputs.heavy == 'true' && github.event_name != 'pull_request' && steps.verdict.outputs.gated != 'true'
+        uses: actions/cache@v5
+        with:
+          path: build/fuel-sidecars
+          key: vl-fuel-${{ steps.keys.outputs.seed }}
+          lookup-only: true
+
       - name: Refresh seed + native fixpoint (self-reproduction ladder)
         if: steps.verdict.outputs.heavy == 'true'
-        run: ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars
+        run: |
+          grep -m1 'model name' /proc/cpuinfo
+          fuel=()
+          if [ "$WANT_FUEL" = true ]; then fuel=(--fuel-stash=build/fuel-sidecars); fi
+          ./scripts/refresh-compiler.sh --prove-fixpoint --no-fuel-sidecars "${fuel[@]}"
         env:
           GH_TOKEN: ${{ github.token }}
+          WANT_FUEL: ${{ steps.fuelcache.outcome == 'success' && steps.fuelcache.outputs.cache-hit != 'true' }}
 
       # The handoff to master's run of the same seed key (see "Reuse a seed" above). A fork's
       # run uploads nothing; the reader refuses one anyway.
@@ -760,50 +777,11 @@ jobs:
   # correctness failure, and these two were a fifth of the native suites' CPU. `scripts/gate.sh`
   # still runs both on every local gate. Split four ways so the slowest part, not their sum,
   # follows `seed`: plumb-shape alone, and the scaling-shape file in thirds
-  # (`$VL_SCALING_SHARD`), each pair still graded whole inside one job.
-  #
-  # `fuel-sidecars` warms the two fuel sidecars ONCE and saves them under `vl-fuel-<seed key>`;
-  # every `ci-cost` part restores them. Each part warming its own was four whole-seed JITs of
-  # the same bytes in parallel, the larger part of every part's runtime.
+  # (`$VL_SCALING_SHARD`), each pair still graded whole inside one job. `seed` warms the two
+  # fuel sidecars once, beside its ladder, and every part restores them.
   # ---------------------------------------------------------------------------
-  fuel-sidecars:
-    needs: seed
-    if: github.event_name != 'pull_request' && needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Restore vl-host binary
-        uses: actions/cache/restore@v5
-        with:
-          path: scripts/vl-host/target/release/vl
-          key: ${{ needs.seed.outputs.bin_key }}
-          fail-on-cache-miss: true
-
-      - name: Restore the proven seed
-        uses: actions/cache/restore@v5
-        with:
-          path: |
-            build/vl-compiler.wasm
-            build/vl-compiler.wasm.src
-            build/vl-compiler.wasm.*.cwasm
-          key: ${{ needs.seed.outputs.seed_key }}
-          fail-on-cache-miss: true
-
-      # The writer of the key `ci-cost` restores; `ci-native`'s fuel shard shares it.
-      - name: Cache the fuel sidecars
-        uses: actions/cache@v5
-        with:
-          path: build/fuel-sidecars
-          key: vl-fuel-${{ needs.seed.outputs.seed_key }}
-
-      - name: Warm the fuel sidecars
-        run: |
-          grep -m1 'model name' /proc/cpuinfo
-          bash scripts/warm-seed.sh --fuel --stash build/fuel-sidecars
-
   ci-cost:
-    needs: [seed, fuel-sidecars]
+    needs: seed
     if: github.event_name != 'pull_request' && needs.seed.outputs.heavy == 'true' && needs.seed.outputs.gated != 'true'
     runs-on: ubuntu-latest
     strategy:
@@ -842,7 +820,7 @@ jobs:
           key: ${{ needs.seed.outputs.seed_key }}
           fail-on-cache-miss: true
 
-      # Restore-only: `fuel-sidecars` wrote this key, so the two fuel JITs become links. Not
+      # Restore-only: `seed` wrote this key, so the two fuel JITs become links. Not
       # `fail-on-cache-miss`: a sidecar is a cache, so a miss costs the warm below, never a grade.
       - name: Restore the fuel sidecars
         uses: actions/cache/restore@v5
@@ -1061,7 +1039,7 @@ jobs:
   # tests/ci_proof_test.ts holds `needs` to every other job in this file.
   # ---------------------------------------------------------------------------
   ci-proof:
-    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, fuel-sidecars, ci-cost, ci-embed-seed]
+    needs: [ci, seed, ci-native, checks, checks-suites, ci-release-shape, ci-cost, ci-embed-seed]
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/vl-queue/')
     runs-on: ubuntu-latest
     steps:
