@@ -9643,9 +9643,12 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
   const e = P.nodes[ix]
   if !(e is BinExpr) || e.binOp != "??" { return false }
   const recv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-  if recv < 0 || !exprMap(recv, fnIx) || !coalesceResultIsBox(ix) {
-    return false
+  if recv < 0 || !exprMap(recv, fnIx) { return false }
+  // A default an atom-valued map's read cannot hold joins it to `string` (D7448).
+  if nodeTyIsMap(recv) && coalMapReadForeignDefault(recv, e.binRight, fnIx) {
+    return true
   }
+  if !coalesceResultIsBox(ix) { return false }
   const vt = tyPeelNul(tyMapValOf(mapRecvTyIn(recv, fnIx)))
   if vt < 0 { return false }
   !tySameSet(vt, tyPeelNul(nodeTyPinIxOf(ix)), TY_WALK_DEPTH)
@@ -9709,16 +9712,13 @@ function coalesceLitUnionDefaultIsAtom(defIx: i32, texts: string[], fnIx: i32) {
 }
 
 // True when `defIx`, the default of a `??` over a read off the atom-valued map `recvIx`, is a
-// value that read's atom rep cannot hold, where a hole instance reads the map at its pin. The
-// direct spelling refuses such a default at check; the instance keeps the template's reading,
-// under which the read is not an atom.
+// value that read's atom rep cannot hold, so the result is not an atom: the read is a nullable
+// operand whose member decodes to its string, and a hole instance reads the map at its pin.
 export function coalMapReadForeignDefault(
   recvIx: i32,
   defIx: i32,
   fnIx: i32,
 ): boolean {
-  const rt = nodeTyIxOf(recvIx)
-  if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyMap { return false }
   const texts = mapTyValLitUnionTexts(mapRecvTyIn(recvIx, fnIx))
   if texts.length == 0 { return false }
   !coalesceLitUnionDefaultIsAtom(defIx, texts, fnIx)
@@ -9773,7 +9773,10 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
     if d is StrLit { return !litLexIsMember(d.strText, texts) }
   }
   if rt < 0 || rt >= T.tys.length { return false }
-  const r = T.tys[rt]
+  // A nullable `string` default leaves the join `string | null` (D7448).
+  const pr = tyPeelNul(rt)
+  if pr < 0 { return false }
+  const r = T.tys[pr]
   if r is TyPrim { return r.primName == "string" }
   false
 }
