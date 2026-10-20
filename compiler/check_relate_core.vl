@@ -2096,8 +2096,14 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
       // No `retCstrsHold` rung here, and its absence is deliberate. A function value names no
       // declaration, so `cstrOwnedBy`'s fallback puts every generic's return constraint in scope,
       // and `substTyDeep` matches TyVars by name, so it can refuse an unrelated instantiation.
-      // The `assignable` on the next line already compares the instance's return to the target's.
-      return assignable(substTyDeep(s.fnRet, bNames, bTys), d.fnRet)
+      // The `assignable` below compares the instance's return as its body gives it (D8160).
+      let ret = substTyDeep(s.fnRet, bNames, bTys)
+      const inst = substTyDeep(srcTy, bNames, bTys)
+      if inst >= 0 && !tyHasTyVar(inst) {
+        const bi = T.tys[genFnHoleBodyRet(srcTy, inst)]
+        if bi is TyFunc { ret = bi.fnRet }
+      }
+      return assignable(ret, d.fnRet)
     }
   }
   false
@@ -3756,10 +3762,35 @@ export function genFnHoleInstance(
     if still.length == open.length { return -1 }
     open = still
   }
-  const inst = substTyDeep(vt, gNames, gTys)
+  let inst = substTyDeep(vt, gNames, gTys)
   if inst < 0 || tyHasTyVar(inst) { return -1 }
+  inst = genFnHoleBodyRet(vt, inst)
   if genFnHoleDeliveryMisfits(vNames[k], inst, calleeFn) { return -1 }
   inst
+}
+
+// Instance `inst` of the hole function typed `vt`, with the result its body gives at `inst`'s
+// parameters when `vt`'s result rides them: the body's arithmetic is typed as its operand hole,
+// which `a / 2.0` at `i32` is not (D8100). `inst` when the body does not say.
+export function genFnHoleBodyRet(vt: i32, inst: i32): i32 {
+  if vt < 0 || vt >= T.tys.length { return inst }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) || !tyHasTyVar(vf.fnRet) || vf.fnParamTypes.length == 0 {
+    return inst
+  }
+  const p0 = T.tys[vf.fnParamTypes[0]]
+  if !(p0 is TyVar) { return inst }
+  const d = holeParamDecl(p0.tvName)
+  if d < 0 || holeFnArgDepth >= HOLE_CALL_NODE_MAX { return inst }
+  const at = T.tys[inst]
+  if !(at is TyFunc) { return inst }
+  const noN: string[] = []
+  const noT: i32[] = []
+  holeFnArgDepth = holeFnArgDepth + 1
+  const r = holeLamRetAt(d, inst, noN, noT)
+  holeFnArgDepth = holeFnArgDepth - 1
+  if r < 0 || tySame(r, at.fnRet) { return inst }
+  mkFuncTy(at.fnParamTypes, r)
 }
 
 // Whether `calleeFn`'s body hands a value of type variable `tv` to a closed function type that
@@ -3945,6 +3976,9 @@ function holeCallNodeTy(
     const f = T.tys[inst]
     if f is TyFunc { return f.fnRet }
     return -1
+  }
+  if n is BinExpr {
+    return holeArithNodeTy(n, ix, vNames, vTys, calleeFn, depth)
   }
   const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
   if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
@@ -4183,6 +4217,32 @@ export function holeRetTyOf(calleeFn: i32, vNames: string[], vTys: i32[]): i32 {
     }
   }
   got
+}
+
+// `holeCallNodeTy` for a binary operator `n` at `ix`: a hole's arithmetic is typed as the hole
+// in the body, so at two scalar operands it takes the pair's own rule (`a / 2.0` at `i32` is
+// `f64`, D8100); any other operand pair keeps the body's type under the bindings.
+function holeArithNodeTy(
+  n: BinExpr,
+  ix: i32,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
+  if t < 0 || tyIsDeferredJoin(t) { return -1 }
+  const own = nodeTyOf(ix)
+  if own >= 0 && tyHasTyVar(own) && !numCmpOp(n.binOp) {
+    const lt = holeCallNodeTy(n.binLeft, vNames, vTys, calleeFn, depth + 1)
+    const rt = holeCallNodeTy(n.binRight, vNames, vTys, calleeFn, depth + 1)
+    if isNumericPrimTy(lt) && isNumericPrimTy(rt) {
+      const p = numPairTy(n, lt, rt)
+      if p >= 0 { return p }
+    }
+  }
+  if tyHasTyVar(t) { return -1 }
+  t
 }
 
 // The instance of the function bound to the hole parameter call `c` calls, at `c`'s own
@@ -4468,7 +4528,8 @@ function holeParamDecl(name: string): i32 {
   while i > 1 && name.charCodeAt(i) != 46 { i = i - 1 }
   if i <= 1 { return -1 }
   let d = -1
-  if name.charCodeAt(1) == 35 && name.charCodeAt(2) == 76 {
+  const lam = name.charCodeAt(1) == 35 && name.charCodeAt(2) == 76
+  if lam {
     d = holeDigitsOf(name.slice(3, i))
   } else {
     d = fnDeclIx[name.slice(1, i)] ?? -1
@@ -4476,9 +4537,12 @@ function holeParamDecl(name: string): i32 {
   if d < 0 || d >= P.nodes.length { return -1 }
   const f = P.nodes[d]
   if !(f is FuncDecl) { return -1 }
+  // A lambda keeps its `#L` hole names after emit names it `__lambda_<n>`.
+  let own = f.fnName
+  if lam { own = "" }
   let pi = 0
   while pi < f.fnParams.length {
-    if paramHoleName(f.fnName, d, pi) == name { return d }
+    if paramHoleName(own, d, pi) == name { return d }
     pi = pi + 1
   }
   -1
