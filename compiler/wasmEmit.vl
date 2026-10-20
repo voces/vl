@@ -36300,10 +36300,11 @@ function emitDirectCallArgsUnder(
     }
   }
   // Every argument starts from the caller's context with the wide-scalar, litunion, struct,
-  // list and map seeds cleared: each is its parameter's, never the enclosing position's, or
-  // an integer literal lowers as `f32.const` into an i32 parameter, or a bare `Map()` builds
-  // an outer destination's shape (D1223). The parameter's own seeds are applied below.
+  // list, map and null-heap seeds cleared: each is its parameter's, never the enclosing
+  // position's, or an i32 literal lowers as `f32.const`, a bare `Map()` builds an outer shape
+  // (D1223), or a `null` read takes a map value's heap. The parameter's seeds follow below.
   const argBase = expCtxHere()
+  argBase.nulRefHeap = -1
   argBase.wantF32 = false
   argBase.wantF64 = false
   argBase.litUnion = 0
@@ -38066,6 +38067,11 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   if fnInPinnedInstance(fnIx) && coalRetypedDead(exprIx, lhsIx) {
     return emitExpr(body, lhsIx, fnIx)
   }
+  // A field the receiver's stored row holds flat cannot be null, whatever row a narrowing
+  // typed the read at, so the default is dead (D8342).
+  if coalFieldStoredFlat(exprIx, lhsIx, fnIx) {
+    return emitExpr(body, lhsIx, fnIx)
+  }
   if coalesceRetypedAtomToStr(exprIx, fnIx) {
     return emitAtomToStr(body, lhsIx, fnIx)
   }
@@ -39249,6 +39255,29 @@ function emitCoalesceNullableRefs(
   emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )
+}
+
+// Whether the `??` at `exprIx` reads the field `lhsIx` of a record whose stored row holds that
+// field at a non-null scalar, the same scalar as the `??` and its default. False for any other
+// operand, a receiver with no struct row, or a field stored at a nullable code.
+function coalFieldStoredFlat(exprIx: i32, lhsIx: i32, fnIx: i32): boolean {
+  const m = P.nodes[lhsIx]
+  if !(m is Member) { return false }
+  const e = P.nodes[unwrapParen(exprIx)]
+  if !(e is BinExpr) { return false }
+  if !nodeTyIsNullable(lhsIx) { return false }
+  const si = structIndexOfExpr(m.memObj, fnIx)
+  const fj = sFieldIndex(si, m.memProp)
+  if fj < 0 { return false }
+  const fc = sFieldTypeAt(si, fj)
+  const pn = tyPrimNameOf(nodeTyPinIxOf(exprIx))
+  if pn == null || tyPrimNameOf(nodeTyIxOf(e.binRight)) != pn { return false }
+  if fc == FC_I32 { return pn == "i32" }
+  if fc == FC_I64 { return pn == "i64" }
+  if fc == FC_F64 { return pn == "f64" }
+  if fc == FC_F32 { return pn == "f32" }
+  if fc == FC_STR { return pn == "string" }
+  false
 }
 
 // Whether the `??` at `exprIx` over `lhsIx` reads at its operand's type, a type without `null`.
