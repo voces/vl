@@ -548,7 +548,7 @@ testOpt("-O3: an explain variable bypasses the chain, stores nothing", async () 
 const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   checkEntryPathCommit: "input", checkEntryPathPush: "input", cliArgCommit: "input",
   cliArgPush: "input", cliArgReset: "input", cliCheckNextRoot: "uncached",
-  cliCheckPoolStage: "uncached", cliCheckPooledCommit: "uncached",
+  cliCheckParentOf: "uncached", cliCheckPoolStage: "uncached", cliCheckPooledCommit: "uncached",
   cliCheckPresetRoot: "uncached", cliCmdData: "output", cliCmdPath: "output",
   cliDirCommit: "input", cliDirEntryPush: "uncached", cliDirNamePush: "uncached",
   cliExitCode: "output", cliFileCommit: "input", cliNext: "output", cliResult: "input",
