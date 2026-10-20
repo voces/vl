@@ -353,6 +353,54 @@ const CASES: Case[] = [
     want: "demand",
   },
   {
+    name: "a signed literal binding an importer delivers into a wider number is served",
+    graph: {
+      "main.vl": 'import { NONE } from "./lib"\nconst x: i64 = NONE\nconst y: f64 = NONE\n' +
+        "print(x)\nprint(y / 8)\n",
+      "lib.vl": "export const NONE = -1\nexport function f(): i32 { NONE }\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a list of scalar literals and primitive names an importer pushes to is served",
+    graph: {
+      "main.vl": 'import { ks, ns, ws } from "./lib"\nks.push(2.0)\nws.push("c")\nns.push(3)\n' +
+        "print(ks[2] / 8)\nprint(ws.length)\n",
+      "lib.vl": 'let B = 2\nexport let ks = [0.5, -0.25]\nexport let ws = ["a", "b"]\n' +
+        "export let ns = [1, B]\nexport function f(): f64 { ks[0] }\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a closed call's result an importer delivers onward is served",
+    graph: {
+      "main.vl": 'import { C } from "./lib"\nconst x: i32 | null = C\nprint(x ?? 0)\n',
+      "lib.vl": "export function mk(a: f64): i32 { 1 }\nexport const C = mk(0.5)\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a call of a function with no declared return still declines its binding",
+    graph: {
+      "main.vl": 'import { xs } from "./lib"\nxs.push("a")\nprint(xs.length)\n',
+      "lib.vl": "function mk() { [] }\nexport let xs = mk()\n",
+    },
+    target: "lib.vl",
+    want: "demand",
+  },
+  {
+    name: "a list holding a name of a non-primitive type still declines its binding",
+    graph: {
+      "main.vl": 'import { xs } from "./lib"\nxs[0].push("a")\nprint(xs.length)\n',
+      "lib.vl": "const e = []\nexport let xs = [e]\n",
+    },
+    target: "lib.vl",
+    want: "demand",
+  },
+  {
     name: "a fresh record G builds is delivered into a wider type outside G",
     graph: {
       "main.vl": 'import { mk } from "./lib"\nconst ys: { f: f64 } = mk()\nprint(ys.f / 8)\n',
