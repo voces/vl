@@ -393,6 +393,8 @@ import {
   rlElemTyIx,
   sNames,
   sTyIx,
+  startStmtOrd,
+  startStmts,
   uVariants,
   unNames,
 } from "./emit_state"
@@ -11898,24 +11900,6 @@ function monoListElemOf(callee: i32, ctx: i32): i32[] {
   out
 }
 
-// Whether node `v` is a program's list literal one of whose elements names a declared generic
-// function, by name or through never-written aliases.
-function monoListInitHoldsGeneric(v: i32, ctx: i32): boolean {
-  if v < 0 { return false }
-  const lit = P.nodes[v]
-  if !(lit is ArrayLit) || lit.pos < 0 { return false }
-  for e in lit.arrElems {
-    if (
-      monoListElemGenFe(e, ctx) >= 0
-      || monoWrittenLetSeedFe(e, ctx) >= 0
-      || monoListElemHoleLamFe(e, ctx) >= 0
-    ) {
-      return true
-    }
-  }
-  false
-}
-
 // The hole lambda list element `e` names in frame `ctx` through never-written un-annotated
 // bindings, as a slot; -1 for a literal, an annotated binding on the way, or anything else.
 function monoListElemHoleLamFe(e: i32, ctx: i32): i32 {
@@ -11947,18 +11931,6 @@ function monoListElemGenFe(e: i32, ctx: i32): i32 {
   monoReadGenFnFe(x)
 }
 
-// The declared generic function seeding the written `let` of generics that value node `e` names
-// in frame `ctx` (see `monoWrittenGenLetFrame`), as a slot; -1 otherwise.
-function monoWrittenLetSeedFe(e: i32, ctx: i32): i32 {
-  const x = unwrapParen(e)
-  if x < 0 { return -1 }
-  const lf = monoWrittenGenLetFrame(x, ctx)
-  if lf[1] < 0 { return -1 }
-  const d = P.nodes[lf[1]]
-  if !(d is LetDecl) { return -1 }
-  monoLetSeedGenFe(d.letInit, lf[0])
-}
-
 // The declared generic function seed `v` of a written `let` names in frame `ctx`, or the one its
 // first `if` arm names, as a slot; -1 otherwise.
 function monoLetSeedGenFe(v: i32, ctx: i32): i32 {
@@ -11986,6 +11958,8 @@ let mfrDirty: {[i32]: boolean} = Map()
 let mfrAnnLits: {[i32]: i32[]} = Map()
 let mfrAnnLets: i32[] = []
 let mfrCalled: i32[] = []
+let mfrKeptIndex: i32[] = []
+let mfrKeptTop: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -12000,6 +11974,8 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrAnnLits = Map()
   mfrAnnLets = []
   mfrCalled = []
+  mfrKeptIndex = []
+  mfrKeptTop = []
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -12626,7 +12602,8 @@ function monoFlowUsePlan(
     } else if pn is Index && pn.idxArr == cur {
       const next: i32[] = []
       for v in cv {
-        const el = monoFlowElemAt(v, pn.idxIndex)
+        let el = monoFlowElemAt(v, pn.idxIndex)
+        if el < 0 { el = monoFlowKeptIndexElem(v, p) }
         if el < 0 { return false }
         next.push(el)
       }
@@ -12858,11 +12835,90 @@ function monoFlowInScope(x: i32, g: i32): boolean {
   y == o
 }
 
+// The element of list literal `v` that computed-index read `ix` gives, when every element names
+// one generic and `ix` is the callee of a call standing as a statement, so a copy of the read
+// can run first for its index and its bounds check (D7182); -1 otherwise.
+function monoFlowKeptIndexElem(v: i32, ix: i32): i32 {
+  if v < 0 || ix < 0 { return -1 }
+  const xn = P.nodes[ix]
+  if !(xn is Index) || P.nodes[unwrapParen(xn.idxIndex)] is NumLit { return -1 }
+  const ln = P.nodes[v]
+  if !(ln is ArrayLit) || monoFlowElemsGen(v) < 0 { return -1 }
+  for e in ln.arrElems {
+    if P.nodes[e] is Spread { return -1 }
+  }
+  if monoFlowCallStmtOf(ix) < 0 { return -1 }
+  if !i32ListHas(mfrKeptIndex, ix) { mfrKeptIndex.push(ix) }
+  unwrapParen(ln.arrElems[0])
+}
+
+// The call whose callee is read `ix`, when that call is a statement of a block or of the
+// start function; -1 otherwise.
+function monoFlowCallStmtOf(ix: i32): i32 {
+  let c = mfrParent[ix] ?? -1
+  while c >= 0 && P.nodes[c] is Paren { c = mfrParent[c] ?? -1 }
+  if c < 0 { return -1 }
+  const cn = P.nodes[c]
+  if !(cn is Call) || unwrapParen(cn.callFn) != ix { return -1 }
+  if monoFlowPosIn(monoFlowStmtListOf(c), c) < 0 { return -1 }
+  c
+}
+
+// The statement list a statement `c` would sit in: its block's, or at module scope the start
+// function's `startStmts`, whose ordinals are source positions, so the program's own list is
+// left alone; empty when the parent is neither.
+function monoFlowStmtListOf(c: i32): i32[] {
+  const o = mfrParent[c] ?? -1
+  if o < 0 { return startStmts }
+  const on = P.nodes[o]
+  if !(on is Block) { return [] }
+  on.blkStmts
+}
+
+// The position of `c` in `xs`, or -1.
+function monoFlowPosIn(xs: i32[], c: i32): i32 {
+  let at = xs.length - 1
+  while at >= 0 && xs[at] != c { at = at - 1 }
+  at
+}
+
+// Runs a copy of computed-index read `x` as the statement before the call it is the callee of;
+// false when that call is not a statement. A module-scope copy is walked from `mfrKeptTop`.
+function monoFlowKeepIndex(x: i32): boolean {
+  const c = monoFlowCallStmtOf(x)
+  if c < 0 { return false }
+  const xn = P.nodes[x]
+  if !(xn is Index) { return false }
+  const xs = monoFlowStmtListOf(c)
+  const at = monoFlowPosIn(xs, c)
+  if at < 0 { return false }
+  const kept = mkIndex(xn.idxArr, xn.idxIndex, xn.pos)
+  monoFlowInsertAt(xs, at, kept)
+  if (mfrParent[c] ?? -1) < 0 {
+    monoFlowInsertAt(startStmtOrd, at, startStmtOrd[at])
+    mfrKeptTop.push(kept)
+  }
+  true
+}
+
+// Inserts `v` into `xs` in place at position `at`, which is in range.
+function monoFlowInsertAt(xs: i32[], at: i32, v: i32) {
+  xs.push(xs[xs.length - 1])
+  let k = xs.length - 2
+  while k > at {
+    xs[k] = xs[k - 1]
+    k = k - 1
+  }
+  xs[at] = v
+  monoArenaTouch()
+}
+
 // Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope;
 // false when it is not.
 function monoFlowReadSet(x: i32, g: i32): boolean {
   const nm = monoFlowLeafName(g)
   if nm == "" || !monoFlowInScope(x, g) { return false }
+  if i32ListHas(mfrKeptIndex, x) && !monoFlowKeepIndex(x) { return false }
   const n: Node = { identName: nm, pos: nodePos(x) }
   if monoFlowCalledAt(x) && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
   arenaSetNode(x, n)
@@ -13010,6 +13066,11 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     return monoGenericListFail(d.letInit)
   }
   if pins.length != 1 { return 0 }
+  // A pin taken at this instance's own template is this instance's alone, and a generic's
+  // instances share `d`: each instance's reads of the list are typed at its own instance there.
+  if monoFrameIsGenericInstance(ctx) && monoDeclPathPinsPerInstance(at, path) {
+    return 0
+  }
   const ann = monoSigFnTyName(pins[0] + ";")
   let ft = -1
   for e in lit.arrElems {
@@ -13141,13 +13202,7 @@ function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
   for fi in lit.objFields {
     const f = P.nodes[fi]
     if f is FieldInit {
-      if (
-        monoListElemGenFe(f.fiValue, ctx) >= 0
-        || monoWrittenLetSeedFe(f.fiValue, ctx) >= 0
-        || monoListElemHoleLamFe(f.fiValue, ctx) >= 0
-      ) {
-        if monoPinRecordField(at, f.fiName, f.fiValue, ctx) < 0 { return -1 }
-      }
+      if monoPinRecordField(at, f.fiName, f.fiValue, ctx) < 0 { return -1 }
     }
   }
   0
@@ -13178,20 +13233,29 @@ function monoRetypeFieldReads(fx: i32, at: i32, name: string, ft: i32) {
       }
     }
     if shared && n is LetDecl {
-      if n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
-        aliases.push(ix)
+      if n.letType < 0 && n.letInit >= 0 {
+        if n.letKw == "const" || !monoLetWrittenIn([fx, ix]) {
+          aliases.push(ix)
+        }
       }
     }
   }
-  // A call through a `const` alias of such a read is the read's call (D5079).
-  for al in aliases {
-    const ad = P.nodes[al]
-    if ad is LetDecl && monoFieldReadTyIn(unwrapParen(ad.letInit), fx) >= 0 {
-      for ix in nodes {
-        const c = P.nodes[ix]
-        if c is Call {
-          if monoReadsBinding(c.callFn, ad.letName, fx, al) {
-            monoNoteFieldReadTy(unwrapParen(c.callFn), fx, ft)
+  // A read of a never-written alias of such a read, or of an alias of that, is the read
+  // (D5079, D7283).
+  const done: i32[] = []
+  let grew = true
+  while grew {
+    grew = false
+    for al in aliases {
+      const ad = P.nodes[al]
+      if ad is LetDecl && !i32ListHas(done, al) {
+        if monoFieldReadTyIn(unwrapParen(ad.letInit), fx) >= 0 {
+          done.push(al)
+          grew = true
+          for ix in nodes {
+            if monoReadsBinding(ix, ad.letName, fx, al) {
+              monoNoteFieldReadTy(ix, fx, ft)
+            }
           }
         }
       }
@@ -13577,6 +13641,14 @@ function monoDeclPathKeys(
     return none
   }
   pins
+}
+
+// Whether the flow table pins slot `path` of declaration `d` only at an instance's own template,
+// so the pin `monoDeclPathPins` gives differs from one instance to another.
+function monoDeclPathPinsPerInstance(d: i32, path: string[]): boolean {
+  const dead: {[i32]: boolean} = Map()
+  const pins = monoDeclPathKeysIn(d, path, -1, -1, false, dead)
+  pins.length == 1 && pins[0] == FF_PIN_DECLINE
 }
 
 function monoDeclPathKeysIn(
@@ -17202,9 +17274,9 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
     }
     monoCellAliasListOk = n.letInit
   }
-  // A list of generic functions called only through its elements takes the type the calls give
-  // it, as an annotation would (D3977).
-  if monoListInitHoldsGeneric(n.letInit, ctx) && n.letType < 0 {
+  // An un-annotated list of function values takes the one type the calls through its elements
+  // give it, as an annotation would (D3977).
+  if n.letType < 0 {
     if monoPinListElems(n, ix, ctx) < 0 { return -1 }
   }
   if (
@@ -19312,6 +19384,9 @@ export function monomorphize(stmts: i32[]) {
       if monoWalk(stmts[i], -1) < 0 { return -1 }
     }
     i = i + 1
+  }
+  for k in mfrKeptTop {
+    if monoWalk(k, -1) < 0 { return -1 }
   }
   // Then every non-generic lifted function's body. A generic original's body is only ever
   // walked through an instance; an instance appended during this loop extends `fnStmts`,
