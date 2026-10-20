@@ -293,8 +293,20 @@ adopted by the row its type keys to, confirmed by where `null` sits in the type'
 in the row's atoms; its name is no longer parsed (`unNameAdoptTyKeyRow`). `unNameAdoptKeyRow`
 is deleted. One row merges, `unions/inferred-return-self-union-nullable.vl`, whose unrolled
 `Node | null` adopts the `Node | null` row; the output is unchanged. `ord.vl` builds
-byte-identical. Left: an adopt with no type, `mintInlineUnion`'s find, `registerInlineUnionAt`'s
-name dispatch, and the other `canonUnionKeyOfName` callers.
+byte-identical.
+
+Then the find (L6 log, 2026-10-19, step 5's second slice). `registerInlineUnionGo` asks the
+row its type keys to (`unRowOfTyKey`, the first row per key) before it mints, and an inferred
+nominal return adopts with its type. A type-key row serves another spelling only where both
+name the same record atoms. One D3870 record type can have two struct rows that rep apart: a
+literal `kind` field against its alias's atom, as in `Ca | Ra` beside `C | R`. Otherwise the
+spelling takes the canon row of its type, as before. Every merge is in the L6 log. Each one is
+a member reorder of the same multiset, a union alias of the same members, or an inline record
+beside its transparent alias (`{x: i32} | i32` and `P | i32`). `ord.vl` prints the same in both
+orders. Left: `mintInlineUnion` still mints under `canonUnionKeyOfName`.
+`registerInlineUnionAt` still dispatches on the name; its 20 call sites recurse through the
+name's parts. `isUName`, `unRowOfSetText`, `unKeyPush`, `unKeyAliasRow` and `isUNameKeyAB`
+still call `canonUnionKeyOfName`, and so does the canon-key fallback in `unNameAdoptTyKeyRow`.
 
 ## 6. The risks
 
