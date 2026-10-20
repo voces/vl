@@ -698,6 +698,7 @@ import {
   nulRefStructIdxOfLet,
   nulVariantIdxOfLet,
   objVariantName,
+  objVariantNameCtx,
   pinnedValTyOf,
   preStmtNarrow,
   pushPostGuardNarrow,
@@ -708,6 +709,7 @@ import {
   stmtIsTailValue,
   structIndexOfLet,
   structIndexOfObj,
+  structIndexOfObjCtx,
   unionNameOfExpr,
   variantIndexOfLet,
 } from "./emit_classify"
@@ -7988,23 +7990,52 @@ function mintGradualObjLitRows() {
 
 // Every generic instance's record literals with a field at a type parameter get the row of
 // their type at that instance's pins, which the collect pass could not mint from the template's
-// type (D3032). A literal whose pins do not all resolve mints nothing and refuses at emit. Not
-// in a constructor, whose record leaves the instance and is built where it is delivered (D2850).
+// type (D3032). A literal whose pins do not all resolve mints nothing and refuses at emit. In a
+// constructor, whose record leaves the instance, only a literal no row serves at the instance
+// mints, so a record a sibling row already builds keeps that row (D2850).
 function mintPinnedObjLitRows() {
+  let ctorRows = false
   let k = 0
   while k < monoInstFe.length && k < monoInstOrig.length {
     const fe = monoInstFe[k]
-    if (
-      fe >= 0
-      && fe < fnStmts.length
-      && instRetKeepsRecordsIn(monoInstOrig[k])
-    ) {
+    if fe >= 0 && fe < fnStmts.length {
       const fd = P.nodes[fnStmts[fe]]
       if fd is FuncDecl {
+        pinCtorUnserved = !instRetKeepsRecordsIn(monoInstOrig[k])
+        const before = sNames.length
         mintPinnedObjLitsIn(fd.fnBody, fnStmts[fe], fd.fnBody, 0)
+        if pinCtorUnserved && sNames.length > before { ctorRows = true }
+        pinCtorUnserved = false
       }
     }
     k = k + 1
+  }
+  if ctorRows { mintCtorHolderRows() }
+  0
+}
+
+// Whether `mintPinnedObjLit` is minting a constructor's literal, which mints only when unserved.
+let pinCtorUnserved = false
+
+// Every concrete record literal left without a row because a field holds a constructor's
+// record, whose row exists only once its instance mints it (D2850).
+function mintCtorHolderRows() {
+  const nLim = P.nodes.length
+  let li = 0
+  while li < nLim {
+    if P.nodes[li] is ObjLit {
+      const lt = nodeTyIxOf(li)
+      if (
+        lt >= 0
+        && lt < T.tys.length
+        && !tyHasTyVar(lt)
+        && structIndexOfObj(li) < 0
+        && objVariantName(li) == ""
+      ) {
+        internShapeDeepOfTy(lt)
+      }
+    }
+    li = li + 1
   }
   0
 }
@@ -8102,6 +8133,10 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
       internShapeDeepOfTy(lt)
     }
     return 0
+  }
+  if pinCtorUnserved {
+    if structIndexOfObjCtx(objIx, fnIx) >= 0 { return 0 }
+    if objVariantNameCtx(objIx, fnIx) != "" { return 0 }
   }
   // A field at a union holding a type parameter is substituted through the instance's own
   // bindings, since no one value's pin names the parameter (D2906).
