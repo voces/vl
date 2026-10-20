@@ -160,6 +160,12 @@ let gComments: Comment[] = []
 let gInKey: i32[] = []
 let gInVal: string[] = []
 let gInUsed = 0
+// The long-identifier intern table (`lexIdText`): open addressing, a power-of-two size,
+// keyed by source bytes. `gIdAt` is the slot's lexeme start in `gSrc`, -1 while empty.
+let gIdAt: i32[] = []
+let gIdHash: i32[] = []
+let gIdVal: string[] = []
+let gIdUsed = 0
 
 // An interpolated literal is context-sensitive: the `}` that ends a hole is spelled like
 // the one that closes a block, and the `{` depth (`gBrace`) against the depth each open
@@ -510,6 +516,85 @@ function lexInternReset(srcLen: i32) {
   gInKey = keys
   gInVal = vals
   gInUsed = 0
+  lexIdTableSized(64)
+}
+
+// The identifier `gSrc[a, b)`, one string per spelling for the rest of this lex, so every
+// later comparison of two occurrences short-circuits on identity instead of walking bytes.
+// A lexeme of four bytes or fewer goes through `lexText`'s table.
+function lexIdText(a: i32, b: i32): string {
+  const n = b - a
+  if n <= 4 { return lexText(a, b) }
+  let h = 0
+  let i = a
+  while i < b {
+    h = (h ^ gSrc[i]) * 16777619
+    i = i + 1
+  }
+  h = h ^ (h >>> 15)
+  const mask = gIdAt.length - 1
+  let s = h & mask
+  while gIdAt[s] >= 0 {
+    if gIdHash[s] == h && gIdVal[s].length == n && lexIdSame(gIdAt[s], a, n) {
+      return gIdVal[s]
+    }
+    s = (s + 1) & mask
+  }
+  const text = gSrc.slice(a, b)
+  if (gIdUsed + 1) * 2 > gIdAt.length { lexIdGrow() }
+  lexIdPlace(h, a, text)
+  text
+}
+
+// Whether `gSrc[x, x + n)` and `gSrc[y, y + n)` hold the same bytes.
+function lexIdSame(x: i32, y: i32, n: i32): boolean {
+  let i = 0
+  while i < n {
+    if gSrc[x + i] != gSrc[y + i] { return false }
+    i = i + 1
+  }
+  true
+}
+
+// Store `text`, which starts at `a` and hashes to `h`, in the first empty slot of its run.
+function lexIdPlace(h: i32, a: i32, text: string) {
+  const mask = gIdAt.length - 1
+  let s = h & mask
+  while gIdAt[s] >= 0 { s = (s + 1) & mask }
+  gIdAt[s] = a
+  gIdHash[s] = h
+  gIdVal[s] = text
+  gIdUsed = gIdUsed + 1
+  0
+}
+
+function lexIdTableSized(cap: i32) {
+  const at: i32[] = []
+  const hs: i32[] = []
+  const vals: string[] = []
+  while at.length < cap {
+    at.push(-1)
+    hs.push(0)
+    vals.push("")
+  }
+  gIdAt = at
+  gIdHash = hs
+  gIdVal = vals
+  gIdUsed = 0
+}
+
+// Doubles the identifier table, re-placing every filled slot by its stored hash.
+function lexIdGrow() {
+  const oldAt = gIdAt
+  const oldHash = gIdHash
+  const oldVal = gIdVal
+  lexIdTableSized(oldAt.length * 2)
+  let i = 0
+  while i < oldAt.length {
+    if oldAt[i] >= 0 { lexIdPlace(oldHash[i], oldAt[i], oldVal[i]) }
+    i = i + 1
+  }
+  0
 }
 
 // Scan the digit run of a base-prefixed integer (`0x`/`0b`/`0o`), the prefix already
@@ -966,7 +1051,7 @@ export function tokenize(source: string): LexResult {
     // Identifier / keyword.
     if isIdStart(c) {
       while gPos < gSrc.length && isIdPart(peek()) { advance() }
-      const text = lexText(startPos, gPos)
+      const text = lexIdText(startPos, gPos)
       toks.push(
         mkTokText(keywordKind(text), text, startPos, startLine, startCol),
       )
