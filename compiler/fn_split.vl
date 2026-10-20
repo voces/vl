@@ -2613,8 +2613,9 @@ function fsAskOpenCallPars(): i32 {
   0
 }
 
-// The parameters at `par`'s position of every function sharing a list literal with `par`'s
-// function, through further lists, `par` first; [-1] when an element is not a function name.
+// The parameters at `par`'s position of every function sharing a list literal or a `const`'s
+// `if` join with `par`'s function, through further ones, `par` first; [-1] when a value there
+// is not a function name.
 function fsListGroupPars(par: i32): i32[] {
   const grp: i32[] = [par]
   let gi = 0
@@ -2627,29 +2628,65 @@ function fsListGroupPars(par: i32): i32[] {
     while j < f.fnParams.length && f.fnParams[j] != grp[gi - 1] { j = j + 1 }
     const own = fsFnOwner(fd)
     for r in fsIdents {
-      const lit = fsParent[r]
-      if (
-        identDeclOf(r) == own
-        && r != own
-        && lit >= 0
-        && P.nodes[lit] is ArrayLit
-      ) {
-        const ln = P.nodes[lit]
-        if ln is ArrayLit {
-          for e in ln.arrElems {
-            const en = P.nodes[e]
-            const ed = identDeclOf(e)
-            if !(en is Ident) || ed < 0 || ed >= fsParseLen { return [-1] }
-            const edn = P.nodes[ed]
-            if !(edn is FuncDecl) || edn.fnParams.length <= j { return [-1] }
-            const q = edn.fnParams[j]
-            if !hasI32(grp, q) { grp.push(q) }
-          }
+      if identDeclOf(r) == own && r != own {
+        const vals: i32[] = []
+        let ok = true
+        const lit = fsParent[r]
+        const arm = fsIfArmOf(r)
+        if lit >= 0 && P.nodes[lit] is ArrayLit {
+          ok = fsPushListVals(lit, vals)
+        } else if fsIfArmElemOf(r) >= 0 {
+          ok = fsPushListVals(fsParent[arm], vals)
+        } else if fsIfJoinLetOf(r) >= 0 {
+          ok = fsPushArmVals(arm, vals)
+        }
+        if !ok { return [-1] }
+        for e in vals {
+          const ed = identDeclOf(e)
+          if ed < 0 || ed >= fsParseLen { return [-1] }
+          const edn = P.nodes[ed]
+          if !(edn is FuncDecl) || edn.fnParams.length <= j { return [-1] }
+          const q = edn.fnParams[j]
+          if !hasI32(grp, q) { grp.push(q) }
         }
       }
     }
   }
   grp
+}
+
+// Pushes the value of each element of list literal `lit`, each arm's for an `if`, onto `out`;
+// false when one is not a name.
+function fsPushListVals(lit: i32, out: i32[]): boolean {
+  const ln = P.nodes[lit]
+  if !(ln is ArrayLit) { return false }
+  for e in ln.arrElems {
+    if !fsPushArmVals(e, out) { return false }
+  }
+  true
+}
+
+// Pushes `v` when it is a name, or each arm's value for an `if` with an `else`, onto `out`;
+// false otherwise.
+function fsPushArmVals(v: i32, out: i32[]): boolean {
+  const x = fsParenPeel(v)
+  if x < 0 || x >= fsParseLen { return false }
+  const n = P.nodes[x]
+  if n is Ident {
+    out.push(x)
+    return true
+  }
+  if !(n is IfStmt) || n.ifElse < 0 { return false }
+  for a in [n.ifThen, n.ifElse] {
+    const an = P.nodes[a]
+    let last = a
+    if an is Block {
+      if an.blkStmts.length == 0 { return false }
+      last = an.blkStmts[an.blkStmts.length - 1]
+    }
+    if !fsPushArmVals(last, out) { return false }
+  }
+  true
 }
 
 // A hole parameter of a module function, read only as a callee at one key and handed at every
@@ -2684,6 +2721,11 @@ function fsPlanByName(par: i32): i32 {
   // A hole called at two keys is the hole plan's.
   hsBad = false
   if fsHoleKeys(par).length > 1 { return 1 }
+  // So is one sharing a list with a function whose parameter there the hole plan splits, since
+  // the two take one parameter list (D7841).
+  for q in fsListGroupPars(par) {
+    if q >= 0 && q != par && fsQuietHoleKeys(q).length > 1 { return 1 }
+  }
   const calls = fsFnCalls(own)
   // A call made in a copy has no node of its own to drop an argument from.
   for cp in fsFnCallsCopy {
