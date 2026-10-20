@@ -571,6 +571,7 @@ import {
   fbI32Eqz,
   fbI32Load,
   fbI32Rel,
+  fbI32RelOf,
   fbI64Const,
   fbIf,
   fbIfRefNul,
@@ -608,6 +609,7 @@ import {
   mvValElemHeapOf,
   mvValsBackOf,
   pushFieldStorage,
+  ropeAt,
   ropePush,
   ropeReset,
   wBytes,
@@ -625,19 +627,27 @@ import {
 } from "./emit_bytes"
 import {
   RELOC_ARMED,
+  RELOC_VERSION,
+  RS_GNAME,
+  RS_GREAD,
   RS_GUARD,
   RS_SLOT,
   RS_TAG,
   relCopy,
   relCount,
   relFoldBank,
+  relHold,
   relOffAt,
   relPlace,
+  relPlaceSection,
   relRebase,
   relReset,
+  relSectionParts,
   relSpAt,
+  relSubAt,
   relValAt,
 } from "./emit_reloc"
+import { relSymKey } from "./emit_reloc_keys"
 import {
   anonLeafSupersedeOf,
   sFieldTypeAt,
@@ -2432,7 +2442,7 @@ function emitStartFnCode(out: u8[]) {
       // A guarded global's initializer has run (a folded one, at its declaration): advance the
       // progress cell past it.
       if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
-        fbI32Rel(RS_GUARD, gi + 1)
+        fbI32RelOf(RS_GUARD, gi, gi + 1)
         fbGlobalSet(gInitProgIdx)
       }
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
@@ -4578,11 +4588,12 @@ function mapCompactMove(mapTy: i32, field: i32, wrap: i32, back: i32) {
 }
 
 // Prints `strs[k]` when local `param` equals `k`, for every row: one `if` per row.
-function emitInitFailPick(param: i32, strs: string[]) {
+// Each `k` is a guard row of space `sp`, its symbol named from `subs[k]`.
+function emitInitFailPick(param: i32, strs: string[], sp: i32, subs: i32[]) {
   let k = 0
   while k < strs.length {
     fbLocalGet(param)
-    fbI32Const(k)
+    fbI32RelOf(sp, subs[k], k)
     fbI32Bin(70) // 0x46 i32.eq
     fbIf(64)
     emitInitFailText(strs[k])
@@ -4608,7 +4619,7 @@ function emitInitFailFnCode(out: u8[]) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(0) // no locals
-  emitInitFailPick(0, gInitGNames)
+  emitInitFailPick(0, gInitGNames, RS_GNAME, gInitGIdx)
   fbLocalGet(1)
   fbIf(64)
   emitInitFailText("written")
@@ -4616,8 +4627,10 @@ function emitInitFailFnCode(out: u8[]) {
   emitInitFailText("read")
   fbEnd()
   emitInitFailText(" before its initializer ran")
-  emitInitFailPick(0, gInitGLocs)
-  emitInitFailPick(2, gInitReaders)
+  emitInitFailPick(0, gInitGLocs, RS_GNAME, gInitGIdx)
+  const readers: i32[] = []
+  while readers.length < gInitReaders.length { readers.push(readers.length) }
+  emitInitFailPick(2, gInitReaders, RS_GREAD, readers)
   fbCall(3) // __print_str_flush__ (import 3)
   fbUnreachable()
   fbEnd() // end (function)
@@ -5676,15 +5689,25 @@ function nameUserFns(n: i32) {
     const fn = P.nodes[fnStmts[fi]]
     if fn is FuncDecl {
       wULEB(gImports + fi)
-      // Prefer a lambda's DEBUG display name (its binding, `const foo = …` → "foo")
-      // over the synthesized `__lambda_N`, so a trap backtrace reads `foo`.
-      const disp = fnDispNames[fi]
-      // A display name means a lambda, whose anchor token IS its declaration.
-      const loc = fnLocSuffix(fnStmts[fi], disp.length > 0)
-      if disp.length > 0 { wName(disp + loc) } else { wName(fn.fnName + loc) }
+      wName(fnSymName(fi))
     }
     fi = fi + 1
   }
+}
+
+// User function `fi`'s name-section name. A lambda's debug display name (its binding,
+// `const foo = …` → "foo") wins over the synthesized `__lambda_N`, so a backtrace reads `foo`.
+function fnSymName(fi: i32): string {
+  if fi < 0 || fi >= fnStmts.length { return "#" + i32ToStr(fi) }
+  const fn = P.nodes[fnStmts[fi]]
+  if fn is FuncDecl {
+    const disp = fnDispNames[fi]
+    // A display name means a lambda, whose anchor token IS its declaration.
+    const loc = fnLocSuffix(fnStmts[fi], disp.length > 0)
+    if disp.length > 0 { return disp + loc }
+    return fn.fnName + loc
+  }
+  "#" + i32ToStr(fi)
 }
 
 // The namemap entries of the shared runtime helpers, at their module-tail indices.
@@ -5810,19 +5833,106 @@ function emitNameSection(n: i32) {
   0
 }
 
-// The armed recorder's rows as the `vl.reloc` custom section: a ULEB count, then per row its
-// module offset (ULEB), space (one byte) and value (SLEB). Written last, so no offset moves.
-function emitRelocSection() {
+// Places the recorder's global-section rows once every section is in the module rope: their
+// offsets are relative to a payload whose place only the finished rope knows.
+function relPlaceSections() {
   if !RELOC_ARMED { return 0 }
+  let pos = 8
+  while pos < W.len {
+    const id = ropeAt(W, pos)
+    let size = 0
+    let shift = 0
+    let q = pos + 1
+    let more = true
+    while more && q < W.len {
+      const b = ropeAt(W, q)
+      size = size | ((b & 0x7f) << shift)
+      shift = shift + 7
+      q = q + 1
+      more = (b & 0x80) != 0
+    }
+    if id == 6 { relPlaceSection(id, q) }
+    pos = q + size
+  }
+  0
+}
+
+// The slot key of each of the first `n` user functions: its name-section name, then `#k` when
+// `k` earlier functions carry that name too (clones of one declaration, or namesake lambdas).
+function fnSymKeys(n: i32): string[] {
+  const seen: { [string]: i32 } = Map()
+  const out: string[] = []
+  let fi = 0
+  while fi < n {
+    const nm = fnSymName(fi)
+    const dup = seen[nm] ?? 0
+    seen[nm] = dup + 1
+    if dup == 0 {
+      out.push("f:" + nm)
+    } else {
+      out.push("f:" + nm + "#" + i32ToStr(dup))
+    }
+    fi = fi + 1
+  }
+  out
+}
+
+// The armed recorder's rows as the `vl.reloc` custom section: version 2, the symbols (space,
+// UTF-8 key, value) and then per row its module offset and symbol. Written last, so no
+// offset moves.
+function emitRelocSection(n: i32) {
+  if !RELOC_ARMED { return 0 }
+  const symAt: { [string]: i32 } = Map()
+  const symSp: i32[] = []
+  const symKey: string[] = []
+  const symVal: i32[] = []
+  const rowSym: i32[] = []
+  const fnKeys = fnSymKeys(n)
+  let k = 0
+  while k < relCount() {
+    const sp = relSpAt(k)
+    const id = i32ToStr(sp)
+      + "/"
+      + i32ToStr(relSubAt(k))
+      + "/"
+      + i32ToStr(relValAt(k))
+    let s = symAt[id] ?? -1
+    if s < 0 {
+      s = symKey.length
+      symAt[id] = s
+      symSp.push(sp)
+      symVal.push(relValAt(k))
+      const fe = relSubAt(k)
+      if sp == RS_SLOT && fe >= 0 && fe < fnKeys.length {
+        symKey.push(fnKeys[fe])
+      } else if sp == RS_SLOT {
+        symKey.push("f#" + i32ToStr(fe))
+      } else {
+        symKey.push(relSymKey(sp, relSubAt(k), relValAt(k)))
+      }
+    }
+    rowSym.push(s)
+    k = k + 1
+  }
   const payload: u8[] = []
   const prev = wTarget(payload)
   wName("vl.reloc")
+  wU8(RELOC_VERSION)
+  wULEB(symKey.length)
+  k = 0
+  while k < symKey.length {
+    wU8(symSp[k])
+    const bs = cpsToUtf8(strToCps(symKey[k]))
+    wULEB(bs.length)
+    for b in bs { wU8(b) }
+    wSLEB(symVal[k])
+    k = k + 1
+  }
   wULEB(relCount())
-  let k = 0
+  k = 0
   while k < relCount() {
     wULEB(relOffAt(k))
-    wU8(relSpAt(k))
-    wSLEB(relValAt(k))
+    wULEB(rowSym[k])
     k = k + 1
   }
   wTarget(prev)
@@ -6048,6 +6158,7 @@ function emitModule(_stmts: i32[]) {
   emitDataCountSection()
   if writeCodeSection(codePayload) < 0 { return -1 }
   emitDataSection()
+  relPlaceSections()
   // Every section that names a type is written, so the first group can take its final order.
   if !emitFailed { typeOrderRun(typeOffset) }
 
@@ -6055,7 +6166,7 @@ function emitModule(_stmts: i32[]) {
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
   // unchanged for every golden.
   emitNameSection(n)
-  emitRelocSection()
+  emitRelocSection(n)
   if wStray.length > 0 {
     return emitFail(
       "emitProgram: a module byte was written outside any section",
@@ -8970,6 +9081,7 @@ function emitGlobalSection() {
       fbEnd()
     }
     wTarget(gPrev)
+    relHold(globalPayload)
   }
   0
 }
@@ -8997,13 +9109,14 @@ function frameGlobalSection() {
       wBytes(gSynthInit[i])
     } else {
       fbRefNullStruct()
-      fbI32Rel(RS_SLOT, gImports + gSynthArg[i])
+      fbI32RelOf(RS_SLOT, gSynthArg[i], gImports + gSynthArg[i])
       fbStructNew(ty)
     }
     fbEnd()
     i = i + 1
   }
   wTarget(prev)
+  relSectionParts(6, [countBuf, gGlobalEntries, synthBuf])
   wSectionPartsAt(gGlobalRopeAt, 6, [countBuf, gGlobalEntries, synthBuf])
 }
 

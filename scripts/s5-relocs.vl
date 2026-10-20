@@ -12,10 +12,13 @@
 import { IoError, listDir, pathExists, pathKind, readFile } from "std:fs"
 import { Utf8Error, programArgs } from "std:args"
 import { endsWith, padStart } from "std:str"
+import { decodeUtf8Lossy } from "std:utf8"
+import { parseI32 } from "std:fmt"
+import { exit } from "std:process"
 import { sort } from "std:array"
 import { die } from "./lib/common"
 
-const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED]"
+const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED] | proof-drop N ARMED PERTURBED"
 
 const SP_FUNC = 0
 const SP_TYPE = 1
@@ -411,6 +414,7 @@ function codeSection(c: Cur): i32 {
       valtype(c)
       g = g + 1
     }
+    region(1, c.pos, bodyEnd)
     const bc: Cur = { b: c.b, pos: c.pos, end: bodyEnd }
     while bc.pos < bc.end { op(bc) }
     c.pos = bodyEnd
@@ -429,10 +433,12 @@ function globalSection(c: Cur): i32 {
     curFn = -1
     curOp = -2
     const vt: i32 = c.b[c.pos]
+    const start = c.pos
     valtype(c)
     const mut = byte(c)
     const from = iOp.length
     expr(c)
+    region(0, start, c.pos)
     let gcOps = 0
     let other = false
     let k = from
@@ -495,6 +501,9 @@ function decodeModule(b: u8[]): i32 {
   globImports = 0
   poolEnd = 0
   curIns = 0
+  regK.clear()
+  regS.clear()
+  regE.clear()
   const c: Cur = { b: b, pos: 8, end: b.length }
   while c.pos < c.end {
     const id = byte(c)
@@ -504,9 +513,22 @@ function decodeModule(b: u8[]): i32 {
     if id == 2 { importSection(sc) }
     if id == 10 { codeSection(sc) }
     if id == 6 { globalSection(sc) }
+    if id == 11 { region(2, c.pos, secEnd) }
     c.pos = secEnd
   }
   0
+}
+
+// The module's relinkable regions, in module order: a global entry (0), a code body after
+// its size (1), the data section's payload (2). Each is compared whole by `proof`.
+const regK: i32[] = []
+const regS: i32[] = []
+const regE: i32[] = []
+
+function region(k: i32, s: i32, e: i32) {
+  regK.push(k)
+  regS.push(s)
+  regE.push(e)
 }
 
 function resetRows() {
@@ -730,17 +752,35 @@ function consts(a: string, b: string): i32 {
 
 // ── proof: an armed build's `vl.reloc` rows against its own bytes and a perturbed build ──
 
-const RS_NAMES = ["", "union tag", "literal atom", "closure slot", "init guard"]
-// The rows of the module's `vl.reloc` section: module offset, space, value.
+const RS_NAMES = [
+  "", "union tag", "literal atom", "closure slot", "guard progress",
+  "guard global", "guard reader",
+]
+// The rows of the module's `vl.reloc` section: module offset, space, value and the key of the
+// symbol the value is named by.
 const xOff: i32[] = []
 const xSp: i32[] = []
 const xVal: i32[] = []
+const xKey: string[] = []
+// The section's symbols, `space:key` → value.
+const xSym: { [string]: i32 } = Map()
+const xSymKeys: string[] = []
+// The control: drop every `dropEvery`th row of the armed build before proving it.
+let dropEvery = 0
+let pDropped = 0
+let pInject = 0
+let pUnnamed = 0
+let curPath = ""
 
-// Reads the `vl.reloc` custom section of `b` into the `x*` rows; false when it has none.
-function readRelocs(b: u8[]): boolean {
+// Reads the version-2 `vl.reloc` custom section of `b` into the `x*` rows; false when it has
+// none. Two symbols of one space with one key and two values are counted in `pInject`.
+function readRelocs(b: u8[], drop: i32): boolean {
   xOff.clear()
   xSp.clear()
   xVal.clear()
+  xKey.clear()
+  xSym.clear()
+  xSymKeys.clear()
   const c: Cur = { b: b, pos: 8, end: b.length }
   while c.pos < c.end {
     const id = byte(c)
@@ -758,12 +798,54 @@ function readRelocs(b: u8[]): boolean {
       }
       sc.pos = sc.pos + nlen
       if named {
-        const n = u32(sc)
+        const ver = byte(sc)
+        if ver != 2 {
+          print("proof: vl.reloc version \{ver}, this reader takes 2")
+          return false
+        }
+        const sSp: i32[] = []
+        const sKey: string[] = []
+        const sVal: i32[] = []
+        const ns = u32(sc)
         let k = 0
+        while k < ns && sc.pos < sc.end {
+          const sp = byte(sc)
+          const len = u32(sc)
+          const key = decodeUtf8Lossy(b.slice(sc.pos, sc.pos + len))
+          sc.pos = sc.pos + len
+          const v = s32(sc)
+          sSp.push(sp)
+          sKey.push(key)
+          sVal.push(v)
+          if key.length >= 2 && key[0] == 63 && key[1] == 58 {
+            pUnnamed = pUnnamed + 1
+          }
+          const full = "\{sp}:\{key}"
+          const had = xSym[full]
+          if had == null {
+            xSym[full] = v
+            xSymKeys.push(full)
+          } else if had != v {
+            pInject = pInject + 1
+            if pInject <= 10 {
+              print("proof: \{curPath}: key \{full} names both \{had} and \{v}")
+            }
+          }
+          k = k + 1
+        }
+        const n = u32(sc)
+        k = 0
         while k < n && sc.pos < sc.end {
-          xOff.push(u32(sc))
-          xSp.push(byte(sc))
-          xVal.push(s32(sc))
+          const off = u32(sc)
+          const s = u32(sc)
+          if drop > 0 && k % drop == 0 {
+            pDropped = pDropped + 1
+          } else {
+            xOff.push(off)
+            xSp.push(sSp[s])
+            xVal.push(sVal[s])
+            xKey.push(sKey[s])
+          }
           k = k + 1
         }
         return true
@@ -791,6 +873,13 @@ function putLeb(out: u8[], v: i32, signed: boolean) {
   0
 }
 
+// The byte length of the LEB at `off`.
+function lebLen(b: u8[], off: i32): i32 {
+  let n = 1
+  while (b[off + n - 1] & 0x80) != 0 { n = n + 1 }
+  n
+}
+
 // Running totals of `proof` over every module it is given.
 let pModules = 0
 let pRows = 0
@@ -801,27 +890,37 @@ let pRelinked = 0
 let pPertDiff = 0
 let pPertCovered = 0
 let pInitDiff = 0
-const pBySpace = [0, 0, 0, 0, 0]
-const pUnperturbed = [0, 0, 0, 0, 0]
+let pInitCovered = 0
+let pKeyMissA = 0
+let pKeyMissP = 0
+let pRegions = 0
+let pRegionDiff = 0
+let pRowMiss = 0
+let pOutside = 0
+const pRegionKinds = [0, 0, 0]
+const pRegionDiffKinds = [0, 0, 0]
+const pBySpace = [0, 0, 0, 0, 0, 0, 0]
+const pUnperturbed = [0, 0, 0, 0, 0, 0, 0]
 const pDecoded = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 const pMissKeys: string[] = []
 const pMiss: { [string]: i32 } = Map()
 let pShown = 0
+const REGION_NAMES = ["global initialiser", "code body", "data section"]
 
-// Proves one armed build `a` (and, when `p` is not "", its perturbed twin): every row names an
-// `i32.const` carrying its value; the module re-linked from a skeleton with every relocated LEB
-// removed equals the module; and every body constant the perturbation moved has a row.
+// Proves one armed build `a` (and, when `p` is not "", its perturbed twin): every row names
+// the `i32.const` it records; the module re-linked from a skeleton with every relocated LEB
+// removed equals the module.
 function proofPair(a: string, p: string): i32 {
   const bytes = bytesOf(a)
   resetRows()
-  if !readRelocs(bytes) {
+  curPath = a
+  if !readRelocs(bytes, dropEvery) {
     print("proof: \{a}: no vl.reloc section (not an armed build)")
     return 1
   }
   decodeModule(bytes)
   if failedAt >= 0 { print("proof: \{a}: decode failed at offset \{failedAt}") }
   pModules = pModules + 1
-  // Row k of the module's decoded consts at offset `off` → recorded row index, by a merge.
   const order: i32[] = []
   let k = 0
   while k < xOff.length {
@@ -844,12 +943,7 @@ function proofPair(a: string, p: string): i32 {
     if xSp[r] >= 0 && xSp[r] < pBySpace.length {
       pBySpace[xSp[r]] = pBySpace[xSp[r]] + 1
     }
-    if (
-      i < rOff.length
-      && rOff[i] == xOff[r]
-      && rSpace[i] == SP_CONST
-      && rFn[i] >= 0
-    ) {
+    if i < rOff.length && rOff[i] == xOff[r] && rSpace[i] == SP_CONST {
       if rVal[i] == xVal[r] {
         pMatched = pMatched + 1
         rowRec[i] = r
@@ -862,7 +956,7 @@ function proofPair(a: string, p: string): i32 {
     } else {
       pBad = pBad + 1
       if pBad <= 10 {
-        print("proof: \{a}: row at \{xOff[r]} names no body constant")
+        print("proof: \{a}: row at \{xOff[r]} names no constant")
       }
     }
     o = o + 1
@@ -876,8 +970,7 @@ function proofPair(a: string, p: string): i32 {
   let cur = 0
   i = 0
   while i < rSpace.length {
-    const keep = rSpace[i] != SP_CONST || rowRec[i] >= 0
-    if keep {
+    if rSpace[i] != SP_CONST || rowRec[i] >= 0 {
       if rSpace[i] != SP_CONST { pDecoded[rSpace[i]] = pDecoded[rSpace[i]] + 1 }
       while cur < rOff[i] {
         skel.push(bytes[cur])
@@ -918,20 +1011,55 @@ function proofPair(a: string, p: string): i32 {
     pRebuildDiff = pRebuildDiff + 1
     print("proof: \{a}: the re-linked module differs from the module")
   }
-  if p != "" { proofPert(a, p, rowRec) }
+  if p != "" { proofPert(a, p, rowRec, bytes, order) }
   0
 }
 
-// Pairs `a`'s decoded constants with the perturbed build `p`'s, instruction for instruction:
-// a body constant that moved and has no row is an unrecorded value-borne index.
-function proofPert(a: string, p: string, rowRec: i32[]): i32 {
+// Against the perturbed build `p`: a constant that moved and has no row is an unrecorded
+// value-borne index; and every region of `a`, its rows rewritten to the values `p`'s
+// symbols name under the same keys, must equal `p`'s region byte for byte.
+function proofPert(
+  a: string,
+  p: string,
+  rowRec: i32[],
+  aBytes: u8[],
+  order: i32[],
+): i32 {
   const aSp = rSpace.slice(0, rSpace.length)
   const aVal = rVal.slice(0, rVal.length)
   const aFn = rFn.slice(0, rFn.length)
   const aIns = rIns.slice(0, rIns.length)
   const aOp = rOp.slice(0, rOp.length)
+  const aRegK = regK.slice(0, regK.length)
+  const aRegS = regS.slice(0, regS.length)
+  const aRegE = regE.slice(0, regE.length)
+  const aXOff = xOff.slice(0, xOff.length)
+  const aXSp = xSp.slice(0, xSp.length)
+  const aXVal = xVal.slice(0, xVal.length)
+  const aXKey = xKey.slice(0, xKey.length)
+  const aSymKeys = xSymKeys.slice(0, xSymKeys.length)
+  const aSym: { [string]: i32 } = Map()
+  for kk in aSymKeys { aSym[kk] = xSym[kk] ?? 0 }
+  const pBytes = bytesOf(p)
   resetRows()
-  decodeModule(bytesOf(p))
+  curPath = p
+  if !readRelocs(pBytes, 0) {
+    print("proof: \{p}: no vl.reloc section")
+    return 1
+  }
+  decodeModule(pBytes)
+  for kk in aSymKeys {
+    if !xSym.has(kk) {
+      pKeyMissP = pKeyMissP + 1
+      if pKeyMissP <= 10 { print("proof: \{p}: has no symbol \{kk}") }
+    }
+  }
+  for kk in xSymKeys {
+    if !aSym.has(kk) {
+      pKeyMissA = pKeyMissA + 1
+      if pKeyMissA <= 10 { print("proof: \{a}: has no symbol \{kk}") }
+    }
+  }
   let i = 0
   while i < aSp.length && i < rSpace.length {
     if aSp[i] != rSpace[i] || aIns[i] != rIns[i] {
@@ -940,40 +1068,93 @@ function proofPert(a: string, p: string, rowRec: i32[]): i32 {
     }
     if aSp[i] == SP_CONST {
       const moved = aVal[i] != rVal[i]
-      if moved && aFn[i] < 0 { pInitDiff = pInitDiff + 1 }
-      if moved && aFn[i] >= 0 {
-        pPertDiff = pPertDiff + 1
-        if rowRec[i] >= 0 {
-          pPertCovered = pPertCovered + 1
-        } else {
-          const key = "delta \{rVal[i] - aVal[i]}"
-          if !pMiss.has(key) {
-            pMissKeys.push(key)
-            pMiss[key] = 0
-          }
-          pMiss[key] = (pMiss[key] ?? 0) + 1
-          if pShown < 30 {
-            pShown = pShown + 1
-            print(
-              "  unrecorded: \{a} body \{aFn[i]} ins \{aIns[i]} value \{aVal[i]} \{key} after \{opName(aOp[max(i - 1, 0)])} \{opName(aOp[max(i - 2, 0)])}",
-            )
-          }
+      if moved && aFn[i] < 0 {
+        pInitDiff = pInitDiff + 1
+        if rowRec[i] >= 0 { pInitCovered = pInitCovered + 1 }
+      }
+      if moved && aFn[i] >= 0 { pPertDiff = pPertDiff + 1 }
+      if moved && rowRec[i] >= 0 && aFn[i] >= 0 {
+        pPertCovered = pPertCovered + 1
+      }
+      if moved && rowRec[i] < 0 {
+        const where = if aFn[i] >= 0 { "body \{aFn[i]}" } else { "initialiser" }
+        const key = "delta \{rVal[i] - aVal[i]}"
+        if !pMiss.has(key) {
+          pMissKeys.push(key)
+          pMiss[key] = 0
+        }
+        pMiss[key] = (pMiss[key] ?? 0) + 1
+        if pShown < 30 {
+          pShown = pShown + 1
+          print(
+            "  unrecorded: \{a} \{where} ins \{aIns[i]} value \{aVal[i]} \{key} after \{opName(aOp[max(i - 1, 0)])} \{opName(aOp[max(i - 2, 0)])}",
+          )
         }
       }
-      if !moved && aFn[i] >= 0 && rowRec[i] >= 0 {
-        const sp = xSp[rowRec[i]]
+      if !moved && rowRec[i] >= 0 {
+        const sp = aXSp[rowRec[i]]
         if sp >= 0 && sp < pUnperturbed.length {
           pUnperturbed[sp] = pUnperturbed[sp] + 1
-          if pUnperturbed[sp] <= 12 {
-            print(
-              "  unmoved: \{a} body \{aFn[i]} value \{aVal[i]} space \{sp} after \{opName(aOp[max(i - 1, 0)])} \{opName(aOp[max(i - 2, 0)])}",
-            )
-          }
         }
       }
     }
     i = i + 1
   }
+  if aRegK.length != regK.length {
+    print("proof: \{p}: \{regK.length} regions, \{a} has \{aRegK.length}")
+    pRegionDiff = pRegionDiff + 1
+    return 1
+  }
+  // Cross re-link, region by region, rows taken in offset order.
+  let o = 0
+  let g = 0
+  while g < aRegK.length {
+    const s = aRegS[g]
+    const e = aRegE[g]
+    while o < order.length && aXOff[order[o]] < s {
+      pOutside = pOutside + 1
+      o = o + 1
+    }
+    const out: u8[] = []
+    let cur = s
+    while o < order.length && aXOff[order[o]] < e {
+      const r = order[o]
+      while cur < aXOff[r] {
+        out.push(aBytes[cur])
+        cur = cur + 1
+      }
+      const full = "\{aXSp[r]}:\{aXKey[r]}"
+      let v = aXVal[r]
+      const sv = xSym[full]
+      if sv == null { pRowMiss = pRowMiss + 1 } else { v = sv }
+      putLeb(out, v, true)
+      cur = cur + lebLen(aBytes, cur)
+      o = o + 1
+    }
+    while cur < e {
+      out.push(aBytes[cur])
+      cur = cur + 1
+    }
+    pRegions = pRegions + 1
+    pRegionKinds[aRegK[g]] = pRegionKinds[aRegK[g]] + 1
+    let same = aRegK[g] == regK[g] && out.length == regE[g] - regS[g]
+    let d = 0
+    while same && d < out.length {
+      if out[d] != pBytes[regS[g] + d] { same = false }
+      d = d + 1
+    }
+    if !same {
+      pRegionDiff = pRegionDiff + 1
+      pRegionDiffKinds[aRegK[g]] = pRegionDiffKinds[aRegK[g]] + 1
+      if pRegionDiff <= 10 {
+        print(
+          "proof: \{a}: \{REGION_NAMES[aRegK[g]]} \{g} re-linked to \{p}'s symbols differs",
+        )
+      }
+    }
+    g = g + 1
+  }
+  pOutside = pOutside + order.length - o
   0
 }
 
@@ -1000,6 +1181,9 @@ function proof(a: string, p: string): i32 {
     proofPair(a, p)
   }
   print("== \{pModules} modules")
+  if dropEvery > 0 {
+    print("control: dropped every \{dropEvery}th row, \{pDropped} rows")
+  }
   print(
     "recorded rows: \{pRows}, \{pMatched} name their constant, \{pBad} do not",
   )
@@ -1007,12 +1191,13 @@ function proof(a: string, p: string): i32 {
   while s < pBySpace.length {
     print(
       "  "
-        + padEnd(RS_NAMES[s], 14)
+        + padEnd(RS_NAMES[s], 15)
         + padStart("\{pBySpace[s]}", 9, " ")
         + "   unmoved by the perturbation: \{pUnperturbed[s]}",
     )
     s = s + 1
   }
+  print("symbol keys: \{pInject} name two values, \{pUnnamed} name none (`?:`)")
   print("decoded index sites re-linked by decode:")
   s = 0
   while s < SP_CONST {
@@ -1024,14 +1209,14 @@ function proof(a: string, p: string): i32 {
     s = s + 1
   }
   print(
-    "re-linked \{pRelinked} LEBs from a skeleton: \{pRebuildDiff} modules differ from their bytes",
+    "re-linked \{pRelinked} sites from a skeleton: \{pRebuildDiff} modules differ from their bytes",
   )
   if p != "" {
     print(
       "perturbed body constants: \{pPertDiff}, recorded \{pPertCovered}, unrecorded \{pPertDiff - pPertCovered}",
     )
     print(
-      "perturbed initialiser constants (not recorded by step 1): \{pInitDiff}",
+      "perturbed initialiser constants: \{pInitDiff}, recorded \{pInitCovered}, unrecorded \{pInitDiff - pInitCovered}",
     )
     sort(pMissKeys, (x: string, y: string): boolean => x < y)
     let k = 0
@@ -1039,9 +1224,36 @@ function proof(a: string, p: string): i32 {
       print("  unrecorded \{pMissKeys[k]}: \{pMiss[pMissKeys[k]] ?? 0}")
       k = k + 1
     }
+    print(
+      "keys absent from the twin: \{pKeyMissP}; twin keys absent here: \{pKeyMissA}",
+    )
+    print(
+      "cross re-link to the twin's symbols: \{pRegions} regions, \{pRegionDiff} differ, \{pRowMiss} rows unkeyed, \{pOutside} rows outside every region",
+    )
+    k = 0
+    while k < REGION_NAMES.length {
+      print(
+        "  "
+          + padEnd(REGION_NAMES[k], 19)
+          + padStart("\{pRegionKinds[k]}", 9, " ")
+          + "   differ: \{pRegionDiffKinds[k]}",
+      )
+      k = k + 1
+    }
   }
-  if pBad > 0 || pRebuildDiff > 0 { return 1 }
-  if p != "" && pPertDiff != pPertCovered { return 1 }
+  if pBad > 0 || pRebuildDiff > 0 || pInject > 0 { return 1 }
+  if p != "" {
+    if pPertDiff != pPertCovered || pInitDiff != pInitCovered { return 1 }
+    if (
+      pRegionDiff > 0
+      || pRowMiss > 0
+      || pOutside > 0
+      || pKeyMissA > 0
+      || pKeyMissP > 0
+    ) {
+      return 1
+    }
+  }
   0
 }
 
@@ -1058,7 +1270,12 @@ function main(): i32 {
   if args[0] == "consts" && args.length == 3 { return consts(args[1], args[2]) }
   if args[0] == "proof" && args.length == 2 { return proof(args[1], "") }
   if args[0] == "proof" && args.length == 3 { return proof(args[1], args[2]) }
+  if args[0] == "proof-drop" && args.length == 4 {
+    dropEvery = parseI32(args[1]) ?? 0
+    if dropEvery <= 0 { return die2(USAGE) }
+    return proof(args[2], args[3])
+  }
   die2(USAGE)
 }
 
-main()
+exit(main())
