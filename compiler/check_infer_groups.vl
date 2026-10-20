@@ -1,0 +1,148 @@
+// The recursion groups among a module's un-annotated top-level functions: the strongly connected
+// components of the graph whose edges are the names a body mentions. Demand inference settles an
+// acyclic callee by checking it first; a function that reaches itself again has no callee to
+// check first, so only these members need the return-inference fixpoint.
+
+import {
+  FuncDecl,
+  Ident,
+  Member,
+  OptMember,
+  P,
+  elseIfLink,
+  getDeclPropOf,
+  nodeSpineChildren,
+} from "./ast"
+import { opSiteDecls } from "./check_callee"
+import { demangleName } from "./check_suggest"
+
+let igPos: {[i32]: i32} = Map()
+let igByName: {[string]: i32[]} = Map()
+let igAdj: i32[][] = []
+let igIdx: i32[] = []
+let igLow: i32[] = []
+let igOn: boolean[] = []
+let igStack: i32[] = []
+let igNext = 0
+let igCyc: boolean[] = []
+
+// The members of `fns` (declaration nodes) that lie on a cycle of the mention graph, in their
+// order. A mention is over-approximated: any identifier, member or getter name a body spells
+// that some member is declared under, and every declaration an operator site may dispatch to.
+export function inferCycleMembers(fns: i32[]): i32[] {
+  igPos = Map()
+  igByName = Map()
+  igAdj = []
+  igIdx = []
+  igLow = []
+  igOn = []
+  igStack = []
+  igNext = 0
+  igCyc = []
+  let i = 0
+  while i < fns.length {
+    igPos[fns[i]] = i
+    const d = P.nodes[fns[i]]
+    if d is FuncDecl {
+      igNameAdd(d.fnName, i)
+      igNameAdd(demangleName(d.fnName), i)
+      igNameAdd(getDeclPropOf(d.fnName), i)
+    }
+    igIdx.push(-1)
+    igLow.push(0)
+    igOn.push(false)
+    igCyc.push(false)
+    i = i + 1
+  }
+  for f in fns {
+    const out: i32[] = []
+    const d = P.nodes[f]
+    if d is FuncDecl { igMentions(d.fnBody, out) }
+    igAdj.push(out)
+  }
+  let v = 0
+  while v < fns.length {
+    if igIdx[v] < 0 { igVisit(v) }
+    v = v + 1
+  }
+  const res: i32[] = []
+  let k = 0
+  while k < fns.length {
+    if igCyc[k] { res.push(fns[k]) }
+    k = k + 1
+  }
+  igAdj = []
+  res
+}
+
+function igNameAdd(name: string, at: i32) {
+  if name == "" { return 0 }
+  const l = igByName[name] ?? []
+  if l.length == 0 { igByName[name] = [at] }
+  else if l[l.length - 1] != at { l.push(at) }
+  0
+}
+
+function igEdge(name: string, out: i32[]) {
+  for at in igByName[name] ?? [] {
+    if !igHas(out, at) { out.push(at) }
+  }
+  0
+}
+
+function igHas(xs: i32[], x: i32) {
+  for y in xs {
+    if y == x { return true }
+  }
+  false
+}
+
+function igMentions(ix: i32, out: i32[]) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is Ident { igEdge(n.identName, out) }
+  if n is Member { igEdge(n.memProp, out) }
+  if n is OptMember { igEdge(n.omProp, out) }
+  for d in opSiteDecls(ix) {
+    const at = igPos[d] ?? -1
+    if at >= 0 && !igHas(out, at) { out.push(at) }
+  }
+  let cur = ix
+  while cur >= 0 {
+    for k in nodeSpineChildren(cur) { igMentions(k, out) }
+    cur = elseIfLink(cur)
+  }
+  0
+}
+
+// Tarjan's walk from member `v` (an index into the `inferCycleMembers` input).
+function igVisit(v: i32) {
+  igIdx[v] = igNext
+  igLow[v] = igNext
+  igNext = igNext + 1
+  igStack.push(v)
+  igOn[v] = true
+  for w in igAdj[v] {
+    if w == v {
+      igCyc[v] = true
+    } else if igIdx[w] < 0 {
+      igVisit(w)
+      if igLow[w] < igLow[v] { igLow[v] = igLow[w] }
+    } else if igOn[w] && igIdx[w] < igLow[v] {
+      igLow[v] = igIdx[w]
+    }
+  }
+  if igLow[v] == igIdx[v] {
+    const comp: i32[] = []
+    let w = -1
+    while w != v {
+      w = igStack.pop() ?? v
+      igOn[w] = false
+      comp.push(w)
+    }
+    if comp.length > 1 {
+      for c in comp { igCyc[c] = true }
+    }
+  }
+  0
+}
