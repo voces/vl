@@ -1,10 +1,12 @@
-// Orders the types of an emitted module's first recursion group by how often the module
-// names them, so the most-named take the one-byte indices: below 64 for a heap type, below
-// 128 for a type index. Runs over the finished bytes in `W`, rewrites every type reference
-// and section or body size, and moves the body-span table onto the new offsets.
-// A supertype keeps a lower index than its subtypes. A module the reader cannot decode, or
-// whose order is already the chosen one, is left byte for byte.
+// Orders the types of an emitted module's first recursion group canonically: by a key read
+// from each type's own definition and what it reaches, then, past 64 types, by how often the
+// module names them, so the most-named take the one-byte indices. Runs over the finished
+// bytes in `W`, rewrites every type reference and section or body size, and moves the
+// body-span table onto the new offsets. A supertype keeps a lower index than its subtypes.
+// A module the reader cannot decode, or whose order is already the chosen one, is left byte
+// for byte. docs/internals/s5-per-module-artifacts.md §12.
 
+import { i32ToStr } from "./ast"
 import { W, emitFnSpanEnd, emitFnSpanStart } from "./emit_state"
 import { ropePush, ropeReset } from "./emit_bytes"
 import { relCount, relOffAt, relSetOff } from "./emit_reloc"
@@ -44,9 +46,14 @@ let aEnd: i32[] = []
 
 // Per new type index, the index the emitter minted; empty when the module kept its order.
 let typeOrderOld: i32[] = []
+// Per new type index, its canonical key; empty when the module did not decode.
+let typeOrderKey: string[] = []
+let typeOrderKeyMint: string[] = []
 
 export function typeOrderReset() {
   typeOrderOld = []
+  typeOrderKey = []
+  typeOrderKeyMint = []
   0
 }
 
@@ -56,17 +63,41 @@ export function typeOrderOldOf(idx: i32): i32 {
   idx
 }
 
-// Reorders the first recursion group of `W` when it holds more than 64 types; `groupTypes`
-// is how many it holds. Returns 1 when it rewrites the module, else 0.
-export function typeOrderRun(groupTypes: i32): i32 {
+// The canonical key of type `idx` of the module as written, or "" past the group.
+export function typeOrderKeyOf(idx: i32): string {
+  if idx >= 0 && idx < typeOrderKey.length { return typeOrderKey[idx] }
+  ""
+}
+
+// The canonical key of the type the emitter minted as `old`, or "" past the group.
+export function typeOrderMintedKey(old: i32): string {
+  if old >= 0 && old < typeOrderKeyMint.length { return typeOrderKeyMint[old] }
+  ""
+}
+
+// Reorders the first recursion group of `W`, of `groupTypes` types; `seeds[k]` names what
+// minted type `k` stands for beyond its bytes. Returns 1 when it rewrites the module, else 0.
+export function typeOrderRun(groupTypes: i32, seeds: string[]): i32 {
   typeOrderOld = []
-  if groupTypes <= 64 { return 0 }
+  typeOrderKey = []
+  typeOrderKeyMint = []
+  if groupTypes <= 0 { return 0 }
   const b = ropeFlat()
   if !toScan(b) {
     toClear()
     return 0
   }
-  const order = toChoose()
+  const keys = toKeys(b, seeds)
+  typeOrderKeyMint = keys
+  const order = typeOrderCanon(
+    keys,
+    toCounts(EK_IDX),
+    toCounts(EK_HEAP),
+    tSuper,
+  )
+  if order.length == groupSize {
+    for o in order { typeOrderKey.push(keys[o]) }
+  }
   const toNew: i32[] = []
   while toNew.length < groupSize { toNew.push(0) }
   let same = true
@@ -568,26 +599,210 @@ function scanGc(c: WasmCursor) {
 
 // ── choosing ────────────────────────────────────────────────────────────────
 
-// The new order, as the old index of each new slot. The 128 most-referenced types take
-// the one-byte type indices, those of them with the most heap-type references the first 64,
-// and every other type keeps its relative order; ties go to the lower old index.
-function toChoose(): i32[] {
-  const nu: i32[] = []
-  const ns: i32[] = []
-  while nu.length < groupSize {
-    nu.push(0)
-    ns.push(0)
-  }
+// Per group type, how many references of edit kind `kind` the module makes to it.
+function toCounts(kind: i32): i32[] {
+  const out: i32[] = []
+  while out.length < groupSize { out.push(0) }
   let k = 0
   while k < eVal.length {
     const v = eVal[k]
-    if v >= 0 && v < groupSize {
-      if eKind[k] == EK_IDX { nu[v] = nu[v] + 1 }
-      else if eKind[k] == EK_HEAP { ns[v] = ns[v] + 1 }
-    }
+    if v >= 0 && v < groupSize && eKind[k] == kind { out[v] = out[v] + 1 }
     k = k + 1
   }
-  typeOrderChoose(nu, ns, tSuper)
+  out
+}
+
+function toMix1(h: i32, x: i32): i32 { (h ^ x) * 16777619 }
+
+function toMix2(h: i32, x: i32): i32 {
+  const m = (h ^ x) * 1540483477
+  m ^ (m >>> 15)
+}
+
+// Per group type, a key that depends only on its seed, its bytes with every type it names
+// cut, and the same of each group type it reaches, visited breadth first in byte order. Two
+// types whose keys agree are told apart by a `#k` suffix in mint order.
+function toKeys(b: u8[], seeds: string[]): string[] {
+  const g = groupSize
+  const l1: i32[] = []
+  const l2: i32[] = []
+  const edgeAt: i32[] = []
+  const edges: i32[] = []
+  let u = 0
+  while u < g {
+    let h1 = -2128831035
+    let h2 = 374761393
+    if u < seeds.length {
+      const s = seeds[u]
+      let i = 0
+      while i < s.length {
+        h1 = toMix1(h1, s[i])
+        h2 = toMix2(h2, s[i])
+        i = i + 1
+      }
+    }
+    h1 = toMix1(h1, -7)
+    h2 = toMix2(h2, -7)
+    edgeAt.push(edges.length)
+    let k = tEdit[u]
+    let cur = tStart[u]
+    while cur < tEnd[u] {
+      if k < ePos.length && ePos[k] == cur {
+        let mark = -1 - eKind[k]
+        const v = eVal[k]
+        if v >= 0 && v < g { edges.push(v) } else { mark = -9 }
+        h1 = toMix1(h1, mark)
+        h2 = toMix2(h2, mark)
+        cur = cur + eLen[k]
+        k = k + 1
+      } else {
+        h1 = toMix1(h1, b[cur])
+        h2 = toMix2(h2, b[cur])
+        cur = cur + 1
+      }
+    }
+    l1.push(h1)
+    l2.push(h2)
+    u = u + 1
+  }
+  edgeAt.push(edges.length)
+  const stamp: i32[] = []
+  const num: i32[] = []
+  const q: i32[] = []
+  while stamp.length < g {
+    stamp.push(-1)
+    num.push(0)
+    q.push(0)
+  }
+  const raw: string[] = []
+  let t = 0
+  while t < g {
+    let h1 = 0
+    let h2 = 0
+    let qn = 1
+    q[0] = t
+    stamp[t] = t
+    num[t] = 0
+    let qi = 0
+    while qi < qn {
+      const x = q[qi]
+      h1 = toMix1(h1, l1[x])
+      h2 = toMix2(h2, l2[x])
+      let e = edgeAt[x]
+      while e < edgeAt[x + 1] {
+        const v = edges[e]
+        if stamp[v] != t {
+          stamp[v] = t
+          num[v] = qn
+          q[qn] = v
+          qn = qn + 1
+        }
+        h1 = toMix1(h1, num[v])
+        h2 = toMix2(h2, num[v])
+        e = e + 1
+      }
+      qi = qi + 1
+    }
+    raw.push("T" + i32ToStr(h1) + "." + i32ToStr(h2))
+    t = t + 1
+  }
+  const seen: { [string]: i32 } = Map()
+  const out: string[] = []
+  for r in raw {
+    const d = seen[r] ?? 0
+    seen[r] = d + 1
+    if d == 0 { out.push(r) } else { out.push(r + "#" + i32ToStr(d)) }
+  }
+  out
+}
+
+// The order of a group whose type `t` has key `keys[t]`, `nu[t]` index and `ns[t]` heap
+// references and supertype `sup[t]` (-1 for none), as the input index of each new slot:
+// key order, then past 64 types the most-referenced first as `typeOrderChoose` places
+// them. Empty when the lists disagree in length.
+export function typeOrderCanon(
+  keys: string[],
+  nu: i32[],
+  ns: i32[],
+  sup: i32[],
+): i32[] {
+  const g = keys.length
+  if nu.length != g || ns.length != g || sup.length != g { return [] }
+  const base: i32[] = []
+  while base.length < g { base.push(base.length) }
+  toSortByKey(base, keys)
+  if g <= 64 { return toPlaceSupersFirst(base, sup) }
+  const at: i32[] = []
+  while at.length < g { at.push(0) }
+  let j = 0
+  while j < g {
+    at[base[j]] = j
+    j = j + 1
+  }
+  const pnu: i32[] = []
+  const pns: i32[] = []
+  const psup: i32[] = []
+  for o in base {
+    pnu.push(nu[o])
+    pns.push(ns[o])
+    if sup[o] >= 0 && sup[o] < g {
+      psup.push(at[sup[o]])
+    } else {
+      psup.push(-1)
+    }
+  }
+  const ch = typeOrderChoose(pnu, pns, psup)
+  if ch.length != g { return [] }
+  const out: i32[] = []
+  for c in ch { out.push(base[c]) }
+  out
+}
+
+// Sorts the indices `xs` by `keys`, comparing code units; a merge sort, so equal keys keep
+// their order.
+function toSortByKey(xs: i32[], keys: string[]) {
+  const tmp: i32[] = []
+  for x in xs { tmp.push(x) }
+  let w = 1
+  while w < xs.length {
+    let lo = 0
+    while lo < xs.length {
+      let mid = lo + w
+      if mid > xs.length { mid = xs.length }
+      let hi = lo + 2 * w
+      if hi > xs.length { hi = xs.length }
+      let a = lo
+      let c = mid
+      let o = lo
+      while o < hi {
+        if c >= hi || a < mid && !toLess(keys[xs[c]], keys[xs[a]]) {
+          tmp[o] = xs[a]
+          a = a + 1
+        } else {
+          tmp[o] = xs[c]
+          c = c + 1
+        }
+        o = o + 1
+      }
+      lo = hi
+    }
+    let k = 0
+    while k < xs.length {
+      xs[k] = tmp[k]
+      k = k + 1
+    }
+    w = w * 2
+  }
+  0
+}
+
+function toLess(a: string, b: string): boolean {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] < b[i] }
+    i = i + 1
+  }
+  a.length < b.length
 }
 
 // The reorder of a group whose type `t` has `nu[t]` index and `ns[t]` heap references and

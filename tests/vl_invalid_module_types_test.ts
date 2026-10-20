@@ -146,11 +146,23 @@ const CASES: Case[] = [
   },
 ];
 
+// A body sweep's `ref.null` type is any type other than the struct the fault reads, so it is
+// type 0 unless type 0 is the module's only struct with a field (the emitter's order decides).
+let bodyTy = 0;
 const faultOf = (c: Case, i: number) =>
-  c.sweep === "type" ? `wrong-ref:${i}` : `wrong-ref:0:${i}`;
+  c.sweep === "type" ? `wrong-ref:${i}` : `wrong-ref:${bodyTy}:${i}`;
 
 // How many types (or bodies) the emitted module has: the fault's own refusal says.
 const countOf = async (c: Case, dir: string): Promise<number> => {
+  bodyTy = 0;
+  if (c.sweep === "body") {
+    const r0 = await run(
+      ["check", "--codegen", c.entry],
+      dir,
+      faultOf(c, 100000),
+    );
+    if (r0.out.includes("other than type 0")) bodyTy = 1;
+  }
   const r = await run(["check", "--codegen", c.entry], dir, faultOf(c, 100000));
   const word = c.sweep === "type" ? "types" : "bodies";
   const m = r.out.match(new RegExp(`has (\\d+) ${word}`));
