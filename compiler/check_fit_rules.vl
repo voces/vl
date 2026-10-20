@@ -238,6 +238,7 @@ import {
   recAdWidth,
 } from "./check_rec_adopt_rows"
 import {
+  recBindOrigin,
   recFreshDeclOf,
   recInferredFnOf,
   recOriginExpr,
@@ -426,9 +427,12 @@ import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin, mkWideStrLitTy } from "./check_wide_lits"
 import { placeRootOf, weDigits } from "./check_write_effects"
 import {
+  CW_UP_ARG,
   covarRootFrame,
   covarRootName,
   cwIxBuild,
+  cwIxUp,
+  cwIxUpKind,
   cwPeel,
   cwPeelValue,
 } from "./check_write_scan"
@@ -1567,11 +1571,11 @@ export function objShapeAdapterlessAt(
 // record spelled inline in an annotation is declared too (D3430). True when it refused.
 function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
   const own = nonNulTyOf(srcTy)
-  const dst = nonNulTyOf(dstTy)
+  const dst = recLandingOf(srcTy, dstTy)
   if own < 0 || dst < 0 || !(T.tys[own] is TyObj) || !(T.tys[dst] is TyObj) {
     return false
   }
-  if recAtPinnedArg(at) { return false }
+  if recAtPinnedArg(at) && !recAtStoreArg(at) { return false }
   let found = false
   for k in cUserTypes.keys() {
     if !found && nameIsBareIdent(demangleName(k)) {
@@ -1593,6 +1597,34 @@ function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
   objShapeAdapterlessErr(at, own, dst)
   shapeAdaptRecStorageSet(false)
   true
+}
+
+// Is `at` the value handed to a list's `push` or a map's `set`, whose type the receiver fixes
+// rather than the argument (D8144)?
+function recAtStoreArg(at: i32): boolean {
+  cwIxBuild()
+  if at < 0 || at >= cwIxUp.length || cwIxUpKind[at] != CW_UP_ARG {
+    return false
+  }
+  const cn = P.nodes[cwIxUp[at]]
+  if !(cn is Call) || cn.callFn < 0 { return false }
+  const f = P.nodes[cn.callFn]
+  if !(f is Member) || (f.memProp != "push" && f.memProp != "set") {
+    return false
+  }
+  const rt = nonNulTyOf(nodeTyIxOf(f.memObj))
+  rt >= 0 && rt < T.tys.length && (T.tys[rt] is TyArray || T.tys[rt] is TyMap)
+}
+
+// The record of `dstTy` a record of `srcTy` lands on, past null and through a union
+// (`recAdLanding`); -1 when either is -1.
+function recLandingOf(srcTy: i32, dstTy: i32): i32 {
+  const own = nonNulTyOf(srcTy)
+  const dst = nonNulTyOf(dstTy)
+  if own < 0 || dst < 0 || own >= T.tys.length || dst >= T.tys.length {
+    return -1
+  }
+  recAdLanding(own, dst)
 }
 
 // A record a function built, or an element of a list binding, delivered where a field it holds as
@@ -1633,11 +1665,58 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   }
   const leaves = recFnValueLeaves(fd)
   if leaves.length == 0 { return false }
+  const lits: i32[] = []
+  const calls: i32[] = []
   for lf in leaves {
-    if !(P.nodes[cwPeel(lf)] is ObjLit) { return false }
+    const lp = cwPeel(lf)
+    const ll = recLeafLitOf(lp, dst)
+    if ll >= 0 {
+      lits.push(ll)
+    } else if (
+      lp != call
+      && recInferredFnOf(lp) >= 0
+      && recInferredFnOf(lp) != fd
+    ) {
+      calls.push(lp)
+    } else {
+      return false
+    }
   }
-  for lf in leaves { recordRepTyAdopt(cwPeel(lf), dst, 6) }
+  for ll in lits { recordRepTyAdopt(ll, dst, 6) }
+  // A leaf calling another such function hands the destination on to it (D8143).
+  for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
   true
+}
+
+// Does the inferred function `fd` hand back an object literal, directly or through a call to
+// another inferred function that a generic identity may hand back, within `depth` calls (D8143)?
+function recBuildsLit(fd: i32, depth: i32): boolean {
+  if fd < 0 || depth <= 0 { return false }
+  if recHasLitLeaf(fd) { return true }
+  for lf in recFnValueLeaves(fd) {
+    const lo = recOriginExpr(cwPeel(lf))
+    const g = if lo >= 0 { recInferredFnOf(lo) } else { -1 }
+    if g >= 0 && g != fd && recBuildsLit(g, depth - 1) { return true }
+  }
+  false
+}
+
+// The object literal the function result leaf `lf` is, or hands back through generic identities
+// that only it pins and that fits `dst` (D8021). -1 otherwise.
+function recLeafLitOf(lf: i32, dst: i32): i32 {
+  if lf < 0 || lf >= P.nodes.length { return -1 }
+  if P.nodes[lf] is ObjLit { return lf }
+  let x = lf
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 && recSolePinArg(x) >= 0 {
+    x = cwPeelValue(recSolePinArg(x))
+    hops = hops + 1
+  }
+  if hops == 0 || x < 0 || x >= P.nodes.length || !(P.nodes[x] is ObjLit) {
+    return -1
+  }
+  if !recLitFits(x, dst, REC_STORE_DEPTH) { return -1 }
+  x
 }
 
 // Does the object literal `lit` fit the record `dst` field by field, where only an integer
@@ -1698,6 +1777,11 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if pd >= 0 {
         return recAdPushDecl(pd, srcTy, nonNulTyOf(dstTy), false, p)
       }
+      // One holding a call is delivered as the call is (D8140).
+      const oc = recBindOrigin(p)
+      if oc >= 0 && oc != p && P.nodes[oc] is Call {
+        return recAdoptNote(oc, nodeTyIxOf(oc), dstTy)
+      }
       return 0
     }
     const iv = P.nodes[parenPeelIx(recDeclInit(decl))]
@@ -1728,18 +1812,36 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
   if e is Call {
     const fd = recInferredFnOf(p)
     if fd >= 0 {
+      // A union member has no adoption of a call result, so one built at a declared row is
+      // refused there (D8141).
+      if (
+        recLandingOf(srcTy, dstTy) != nonNulTyOf(dstTy)
+        && recBuildsLit(fd, 8)
+        && recBuiltAtDeclared(p, srcTy, dstTy)
+      ) {
+        return 0
+      }
       if recFnBuiltAtDst(fd, p, srcTy, dstTy) {
         return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
       }
       // A union destination keeps master's delivery, which boxes the record it builds.
       if recFloatBuiltElsewhere(p, srcTy, nonNulTyOf(dstTy)) { return 0 }
-      if recHasLitLeaf(fd) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+      if recBuildsLit(fd, 8) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
       return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
     }
     const pa = recPassThroughArg(p)
     if pa >= 0 {
       // A generic identity hands its argument back, so a literal binding there adopts (D3442).
       const pp = cwPeelValue(pa)
+      // A fresh call under nested identities is judged here, since the inner ones sit at a
+      // pinned argument (D8142).
+      if pp >= 0 && recPassThroughArg(pp) >= 0 {
+        const po = recOriginExpr(pp)
+        const pi = if po >= 0 { recInferredFnOf(po) } else { -1 }
+        if pi >= 0 && recHasLitLeaf(pi) && recBuiltAtDeclared(p, srcTy, dstTy) {
+          return 0
+        }
+      }
       if (
         pp >= 0
         && ((P.nodes[pp] is Ident && recFreshDeclOf(pp) >= 0)
@@ -1776,7 +1878,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // records the program declares (D7941); one pinned elsewhere is built at its own row.
       const po = recOriginExpr(pa)
       if po >= 0 && P.nodes[po] is ObjLit {
-        const pd = nonNulTyOf(dstTy)
+        const pd = recLandingOf(srcTy, dstTy)
         if recSolePinArg(p) >= 0 && recLitFits(po, pd, REC_STORE_DEPTH) {
           recordRepTyAdopt(po, pd, 6)
           return 0
