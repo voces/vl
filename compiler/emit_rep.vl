@@ -74,6 +74,7 @@ import {
   vbV128Idx,
   vbV128Used,
 } from "./emit_state"
+import { RS_TAG, relSkew } from "./emit_reloc"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { resolveAnnot } from "./check_annot_resolve"
 import { nodeTyIsUnionAlias, primTyOfName } from "./check_decl_scan"
@@ -410,6 +411,19 @@ function repCanonFieldTy(ty: i32): i32 {
   ty
 }
 
+// A bare string literal at a record field keys as its one-member set: both rep as the atom, so
+// `{k: "a"}` and `{k: KC}` share one row and neither shares `{k: string}`'s (D7220).
+function repFieldLitAsSet(ty: i32): i32[] {
+  const out: i32[] = []
+  if ty >= 0 && ty < T.tys.length {
+    const t = T.tys[ty]
+    if t is TyLit {
+      if t.litKind == "str" { out.push(ty) }
+    }
+  }
+  out
+}
+
 // Which equivalence a rep key renders. `canon` is the full structural key; `elem` is the
 // ref-list element key, which folds the i32- and string-backed leaf lists to one token each and
 // keeps a declared struct nominal; `mv` is the map-value key, nominal like `elem` but with no
@@ -540,7 +554,9 @@ function repKeyGo(ty: i32, mode: RepKeyMode): string {
       while i < t.objFieldNames.length {
         let ft = t.objFieldTypes[i]
         if canon { ft = repCanonFieldTy(ft) }
-        s = s + t.objFieldNames[i] + ":" + repKeyOf(ft, mode) + ","
+        const asSet = repFieldLitAsSet(ft)
+        const fk = if canon && asSet.length > 0 { repKeyUnion(asSet, mode) } else { repKeyOf(ft, mode) }
+        s = s + t.objFieldNames[i] + ":" + fk + ","
         i = i + 1
       }
       return s + "}"
@@ -1476,7 +1492,9 @@ function hcCanonObjId(t: TyObj): i32 {
   let i = 0
   while i < sortedIx.length {
     const fx = sortedIx[i]
-    const c = repIdOf(repCanonFieldTy(t.objFieldTypes[fx]), "canon")
+    const ft = repCanonFieldTy(t.objFieldTypes[fx])
+    const asSet = repFieldLitAsSet(ft)
+    const c = if asSet.length > 0 { hcUnionId(asSet, "canon") } else { repIdOf(ft, "canon") }
     a.push(sortedSid[i])
     a.push(c)
     len = len + t.objFieldNames[fx].length + 1 + hcLenOf(c) + 1
@@ -1929,7 +1947,9 @@ export function msIsValueUnion(s: i32): i32 {
 // kind→tag table. `emit_classify`'s `scalarTagOf(atom)` delegates here over
 // `valueAtomKind(atom)`. Struct variants take the dense ranks below; atom kinds claim
 // the fixed slots above them.
-export function scalarTagOfKind(k: i32): i32 { uVariants.length + k }
+export function scalarTagOfKind(k: i32): i32 {
+  uVariants.length + k + relSkew(RS_TAG)
+}
 
 // The value-atom kind of the `null` member — a constant of the box ABI, not a
 // question about a spelling. `null` is a keyword, never a rendered type, and

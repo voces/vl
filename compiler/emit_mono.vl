@@ -129,6 +129,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionArray,
   tyIsMap,
+  tyIsOneStrLit,
   tyIsParamHole,
   tyMayHoldFn,
   tyPrimNameOf,
@@ -1647,6 +1648,9 @@ function monoArgLitUnionPin(ix: i32): string {
     const luInl = tyToEmitName(luInlTy)
     if luInl != "" { return luInl }
   }
+  // A lone string literal with no alias is a string value, so an atom-repped one (a literal
+  // field read) pins the `string` instance and widens at the call (D7440).
+  if tyIsOneStrLit(luInlTy) { return "string" }
   // The array sibling of the arm above, and it has to sit here: the collection arms spell a
   // litunion array by its rep and `nameIsI32Array` accepts a litunion `K[]`, so `exprArray`
   // pins `i32[]` and binds every `T` mentioning the element to plain i32. See
@@ -12836,7 +12840,7 @@ function monoFlowInScope(x: i32, g: i32): boolean {
 }
 
 // The element of list literal `v` that computed-index read `ix` gives, when every element names
-// one generic and `ix` is the callee of a call standing as a statement, so a copy of the read
+// one generic and `ix` is the callee of a call `monoFlowCallStmtOf` places, so a copy of the read
 // can run first for its index and its bounds check (D7182); -1 otherwise.
 function monoFlowKeptIndexElem(v: i32, ix: i32): i32 {
   if v < 0 || ix < 0 { return -1 }
@@ -12852,16 +12856,68 @@ function monoFlowKeptIndexElem(v: i32, ix: i32): i32 {
   unwrapParen(ln.arrElems[0])
 }
 
-// The call whose callee is read `ix`, when that call is a statement of a block or of the
-// start function; -1 otherwise.
+// The statement holding the call whose callee is read `ix`, when nothing in that statement runs
+// before the call but reads of names and literals, so a copy of the read can run as the
+// statement before it (D7385); -1 otherwise. A block's or the start function's statement.
 function monoFlowCallStmtOf(ix: i32): i32 {
   let c = mfrParent[ix] ?? -1
   while c >= 0 && P.nodes[c] is Paren { c = mfrParent[c] ?? -1 }
   if c < 0 { return -1 }
   const cn = P.nodes[c]
   if !(cn is Call) || unwrapParen(cn.callFn) != ix { return -1 }
-  if monoFlowPosIn(monoFlowStmtListOf(c), c) < 0 { return -1 }
-  c
+  let x = c
+  while monoFlowPosIn(monoFlowStmtListOf(x), x) < 0 {
+    const p = mfrParent[x] ?? -1
+    if p < 0 || !monoFlowRunsFirstIn(p, x) { return -1 }
+    x = p
+  }
+  x
+}
+
+// Whether child `x` of node `p` is evaluated, every time `p` is, after only reads of names and
+// literals among `p`'s other operands.
+function monoFlowRunsFirstIn(p: i32, x: i32): boolean {
+  const pn = P.nodes[p]
+  if pn is Paren { return true }
+  if pn is LetDecl { return pn.letInit == x }
+  if pn is RetStmt { return pn.retArg == x }
+  if pn is IfStmt { return pn.ifCond == x }
+  if pn is Unary { return pn.unArg == x }
+  if pn is BinExpr {
+    if pn.binLeft == x { return true }
+    const op = pn.binOp
+    if op == "&&" || op == "||" || op == "??" { return false }
+    return pn.binRight == x && monoFlowNameOrLit(pn.binLeft)
+  }
+  monoFlowArgRunsFirst(p, x)
+}
+
+// `monoFlowRunsFirstIn` for the one parent kind left, a call `p` with `x` among its arguments;
+// false for every other parent, whose operands are not all known to run before `x`.
+function monoFlowArgRunsFirst(p: i32, x: i32): boolean {
+  const pn = P.nodes[p]
+  if !(pn is Call) { return false }
+  if hasNamedArgs(pn.callArgNames) || !monoFlowNameOrLit(pn.callFn) {
+    return false
+  }
+  for a in pn.callArgs {
+    if a == x { return true }
+    if !monoFlowNameOrLit(a) { return false }
+  }
+  false
+}
+
+// Whether `e` is a name read or a literal, which no other evaluation can change or trap.
+function monoFlowNameOrLit(e: i32): boolean {
+  const u = unwrapParen(e)
+  if u < 0 { return false }
+  const n = P.nodes[u]
+  n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
 }
 
 // The statement list a statement `c` would sit in: its block's, or at module scope the start
@@ -12882,8 +12938,8 @@ function monoFlowPosIn(xs: i32[], c: i32): i32 {
   at
 }
 
-// Runs a copy of computed-index read `x` as the statement before the call it is the callee of;
-// false when that call is not a statement. A module-scope copy is walked from `mfrKeptTop`.
+// Runs a copy of computed-index read `x` as the statement before the one holding its call;
+// false when `monoFlowCallStmtOf` finds none. A module-scope copy is walked from `mfrKeptTop`.
 function monoFlowKeepIndex(x: i32): boolean {
   const c = monoFlowCallStmtOf(x)
   if c < 0 { return false }
@@ -17777,11 +17833,11 @@ export function monoPinnedSigsOf(origFe: i32) {
   out
 }
 
-// Which of `names` is referenced as a function value — an `Ident` that is not some
-// `Call`'s callee — anywhere in the node arena: 1 when a reference is not in
-// `monoInertValues`, 2 when every one is, else 0. Parallel to `names`, one arena pass. This
-// is the soundness gate the un-annotated-param prune needs: such a function is a value.
-function monoNamesUsedAsValue(names: string[]): i32[] {
+// Which of `names` is referenced as a function value (an `Ident` that is not a `Call`'s callee)
+// in the arena: 1 when a reference is not in `monoInertValues`, 2 when every one is, else 0,
+// parallel to `names`; the un-annotated-param prune needs it. With `cmpCalls`, an `==`/`!=`
+// operand counts as no use, since a comparison calls nothing.
+function monoNamesUsedAsValue(names: string[], cmpCalls: boolean): i32[] {
   const hit: i32[] = []
   let h = 0
   while h < names.length {
@@ -17808,6 +17864,14 @@ function monoNamesUsedAsValue(names: string[]): i32[] {
       const rv = unwrapParen(cn.binRight)
       // arena-tick exempt: `isCallee` is a local declared in this function.
       if rv >= 0 && rv < isCallee.length { isCallee[rv] = 2 }
+    }
+    if cmpCalls && cn is BinExpr && (cn.binOp == "==" || cn.binOp == "!=") {
+      const lo = unwrapParen(cn.binLeft)
+      const ro = unwrapParen(cn.binRight)
+      // arena-tick exempt: `isCallee` is a local declared in this function.
+      if lo >= 0 && lo < isCallee.length { isCallee[lo] = 1 }
+      // arena-tick exempt: `isCallee` is a local declared in this function.
+      if ro >= 0 && ro < isCallee.length { isCallee[ro] = 1 }
     }
     j = j + 1
   }
@@ -17911,7 +17975,7 @@ export function monoGenericAliasFe(letIx: i32) {
     if !monoInstantiatedAny(fe) { return -1 }
     const one: string[] = []
     one.push(d.letName)
-    const used = monoNamesUsedAsValue(one)
+    const used = monoNamesUsedAsValue(one, true)
     if used[0] != 0 { return -1 }
     return fe
   }
@@ -19467,7 +19531,7 @@ function monoPruneTemplates(nDecl: i32) {
     }
     gc = gc + 1
   }
-  const cndVal = monoNamesUsedAsValue(cndNm)
+  const cndVal = monoNamesUsedAsValue(cndNm, false)
   const deadLams = monoUnreadLamSlots(nDecl)
   // A capture cell an instantiated hole lambda seeds takes the instance's function type. One no
   // call or peer pinned, stored as a list element or in such a cell, has no type for the element

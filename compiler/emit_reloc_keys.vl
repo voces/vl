@@ -3,10 +3,16 @@
 // trusting this module's numbering. docs/internals/s5-per-module-artifacts.md §8.
 
 import { i32ToStr } from "./ast"
-import { uAtomBandTop } from "./emit_map_twins"
+import { atomCodeName, uAtomBandTop } from "./emit_map_twins"
 import { litAtomTextOf } from "./emit_lit_atoms"
-import { RS_ATOM, RS_GNAME, RS_GREAD, RS_GUARD, RS_TAG } from "./emit_reloc"
-import { scalarTagOfKind } from "./emit_rep"
+import {
+  RS_ATOM,
+  RS_GNAME,
+  RS_GREAD,
+  RS_GUARD,
+  RS_TAG,
+  relSkew,
+} from "./emit_reloc"
 import {
   cloSigTagNames,
   gInitReaders,
@@ -14,9 +20,11 @@ import {
   mvValName,
   rlElemName,
   uTags,
+  uVarHeap,
   uVariants,
 } from "./emit_state"
-import { variantTagKey } from "./emit_variant_sig"
+import { typeOrderMintedKey } from "./emit_type_order"
+import { variantSig } from "./emit_variant_sig"
 import { initGuardGlobalText } from "./wasmEmit"
 
 // The key of value `v` of space `sp`, named from `sub`; a closure slot is the caller's, since
@@ -34,16 +42,59 @@ export function relSymKey(sp: i32, sub: i32, v: i32): string {
   "?:" + i32ToStr(v)
 }
 
-// A union box tag: a struct variant by its signature, a value-atom code, or a slot band's arm
-// by the type its slot interns (residue 0 a ref list, 1 a map, 2 a closure signature).
-function relTagKey(t: i32): string {
+// Per variant row, the tag key `variantKeyOf` returns; empty until first asked.
+let vKeyMemo: string[] = []
+
+export function relKeysReset() {
+  vKeyMemo = []
+  0
+}
+
+// The key of the tag variant row `vi` takes, alike in every program that holds the row: its
+// signature and the canonical key of its tag's first row's heap type, numbered past the first
+// when two tags of one program would otherwise share it. "" past the rows.
+export function variantKeyOf(vi: i32): string {
+  if vKeyMemo.length != uTags.length {
+    vKeyMemo = []
+    const firstOf: { [i32]: i32 } = Map()
+    const seen: { [string]: i32 } = Map()
+    let r = 0
+    while r < uTags.length {
+      const f = firstOf[uTags[r]] ?? -1
+      if f >= 0 {
+        vKeyMemo.push(vKeyMemo[f])
+      } else {
+        firstOf[uTags[r]] = r
+        let h = ""
+        if r < uVarHeap.length { h = typeOrderMintedKey(uVarHeap[r]) }
+        const base = variantSig(r) + "|" + h
+        const d = seen[base] ?? 0
+        seen[base] = d + 1
+        if d == 0 {
+          vKeyMemo.push(base)
+        } else {
+          vKeyMemo.push(base + "#" + i32ToStr(d))
+        }
+      }
+      r = r + 1
+    }
+  }
+  if vi < 0 || vi >= vKeyMemo.length { return "" }
+  vKeyMemo[vi]
+}
+
+// A union box tag: a struct variant by `variantKeyOf`, a value-atom code by its name, or a
+// slot band's arm by the type its slot interns (residue 0 a ref list, 1 a map, 2 a closure
+// signature).
+function relTagKey(v: i32): string {
   let vi = 0
   while vi < uTags.length {
-    if uTags[vi] == t { return "v:" + variantTagKey(vi) }
+    if uTags[vi] == v { return "v:" + variantKeyOf(vi) }
     vi = vi + 1
   }
-  const k0 = scalarTagOfKind(0)
-  if t >= k0 && t < k0 + uAtomBandTop() { return "k:" + i32ToStr(t - k0) }
+  const t = v - relSkew(RS_TAG)
+  const k0 = uVariants.length
+  if t >= k0 && t < k0 + uAtomBandTop() { return "k:" + atomCodeName(t - k0) }
   const off = t - uVariants.length - uAtomBandTop()
   if off < 0 { return "?:" + i32ToStr(t) }
   const r = off % 3

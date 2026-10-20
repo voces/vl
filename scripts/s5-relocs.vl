@@ -3,11 +3,13 @@
 //
 //     vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...]
 //     vl run scripts/s5-relocs.vl -- consts A.wasm B.wasm
+//     vl run scripts/s5-relocs.vl -- invariance A.wasm B.wasm [...]
 //
 // `census` prints one row per space (sites, LEB widths) and per opcode. `consts` aligns two
 // builds of one program instruction by instruction and counts the `i32.const` immediates
 // that differ, which is how a perturbed compiler shows where an index travels as a value
-// (union tags). A discovery instrument: docs/internals/s5-per-module-artifacts.md.
+// (union tags). `invariance` asks every module two armed builds share for one artifact
+// digest. A discovery instrument: docs/internals/s5-per-module-artifacts.md.
 
 import { IoError, listDir, pathExists, pathKind, readFile } from "std:fs"
 import { Utf8Error, programArgs } from "std:args"
@@ -18,7 +20,7 @@ import { exit } from "std:process"
 import { sort } from "std:array"
 import { die } from "./lib/common"
 
-const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED] | proof-drop N ARMED PERTURBED"
+const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED] | proof-drop N ARMED PERTURBED | link ARMED [TWIN] | invariance ARMED ARMED [...]"
 
 const SP_FUNC = 0
 const SP_TYPE = 1
@@ -1257,6 +1259,237 @@ function proof(a: string, p: string): i32 {
   0
 }
 
+// The armed link proof's `vl.link` section, per module: the counters `emitLinkSection` writes,
+// the sections the linked module differs in, the program digest and each artifact's.
+type LinkRead = {
+  n: i32[],
+  diffs: i32[],
+  miss: string[],
+  refDiffs: string[],
+  prog: i32,
+  paths: string[],
+  hashes: i32[],
+}
+
+const LINK_FIELDS = [
+  "artifacts", "functions", "body references", "rows", "sections",
+  "sections differ", "bodies differ", "first differing body + 1", "unresolved",
+  "defined twice", "non-minimal LEBs", "rows no reference consumed",
+  "undecodable pieces",
+]
+
+function readLink(b: u8[]): LinkRead | null {
+  const c: Cur = { b: b, pos: 8, end: b.length }
+  while c.pos < c.end {
+    const id = byte(c)
+    const size = u32(c)
+    const secEnd = c.pos + size
+    if id == 0 {
+      const sc: Cur = { b: b, pos: c.pos, end: secEnd }
+      const nlen = u32(sc)
+      const name = decodeUtf8Lossy(b.slice(sc.pos, sc.pos + nlen))
+      sc.pos = sc.pos + nlen
+      if name == "vl.link" {
+        if byte(sc) != 1 { return null }
+        const out: LinkRead = {
+          n: [],
+          diffs: [],
+          miss: [],
+          refDiffs: [],
+          prog: 0,
+          paths: [],
+          hashes: [],
+        }
+        let k = 0
+        while k < LINK_FIELDS.length {
+          out.n.push(u32(sc))
+          k = k + 1
+        }
+        const nd = u32(sc)
+        k = 0
+        while k < nd * 4 {
+          out.diffs.push(u32(sc))
+          k = k + 1
+        }
+        const nm = u32(sc)
+        k = 0
+        while k < nm {
+          const len = u32(sc)
+          out.miss.push(decodeUtf8Lossy(b.slice(sc.pos, sc.pos + len)))
+          sc.pos = sc.pos + len
+          k = k + 1
+        }
+        const nr = u32(sc)
+        k = 0
+        while k < nr {
+          const len = u32(sc)
+          out.refDiffs.push(decodeUtf8Lossy(b.slice(sc.pos, sc.pos + len)))
+          sc.pos = sc.pos + len
+          k = k + 1
+        }
+        out.prog = s32(sc)
+        k = 0
+        while k < out.n[0] {
+          const len = u32(sc)
+          out.paths.push(decodeUtf8Lossy(b.slice(sc.pos, sc.pos + len)))
+          sc.pos = sc.pos + len
+          u32(sc)
+          out.hashes.push(s32(sc))
+          k = k + 1
+        }
+        return out
+      }
+    }
+    c.pos = secEnd
+  }
+  null
+}
+
+let lModules = 0
+let lMissing = 0
+let lDiffMods = 0
+let lTwinPaired = 0
+let lHashDiff = 0
+const lTot: i32[] = []
+
+function linkPair(a: string, t: string): i32 {
+  const r = readLink(bytesOf(a))
+  if r == null {
+    lMissing = lMissing + 1
+    print("link: \{a}: no vl.link section (not an armed build)")
+    return 1
+  }
+  lModules = lModules + 1
+  while lTot.length < r.n.length { lTot.push(0) }
+  let k = 0
+  while k < r.n.length {
+    if k != 7 { lTot[k] = lTot[k] + r.n[k] }
+    k = k + 1
+  }
+  if r.n[5] > 0 || r.n[8] > 0 || r.n[9] > 0 || r.n[11] > 0 || r.n[12] > 0 {
+    lDiffMods = lDiffMods + 1
+    if lDiffMods <= 20 {
+      let d = ""
+      k = 0
+      while k + 3 < r.diffs.length {
+        d = d
+          + " sec \{r.diffs[k]} @\{r.diffs[k + 1]} (\{r.diffs[k + 2]} vs \{r.diffs[k + 3]})"
+        k = k + 4
+      }
+      print(
+        "link: \{a}: \{r.n[5]} sections differ\{d}; bodies \{r.n[6]} (first \{r.n[7] - 1}); unresolved \{r.n[8]}, twice \{r.n[9]}, unconsumed rows \{r.n[11]}, undecodable \{r.n[12]}",
+      )
+      for m in r.miss { print("  unresolved: \{m}") }
+      for m in r.refDiffs { print("  differs: \{m}") }
+    }
+  }
+  if t != "" {
+    const q = readLink(bytesOf(t))
+    if q == null {
+      print("link: \{t}: no vl.link section in the twin")
+      return 1
+    }
+    lTwinPaired = lTwinPaired + 1
+    let bad = q.prog != r.prog || q.hashes.length != r.hashes.length
+    k = 0
+    while !bad && k < r.hashes.length {
+      if q.hashes[k] != r.hashes[k] || q.paths[k] != r.paths[k] { bad = true }
+      k = k + 1
+    }
+    if bad {
+      lHashDiff = lHashDiff + 1
+      if lHashDiff <= 20 {
+        let which = ""
+        k = 0
+        while k < r.hashes.length && k < q.hashes.length {
+          if q.hashes[k] != r.hashes[k] { which = which + " " + r.paths[k] }
+          k = k + 1
+        }
+        if q.prog != r.prog { which = which + " (program)" }
+        print("link: \{a}: artifacts differ from the twin's:\{which}")
+      }
+    }
+  }
+  0
+}
+
+function linkProof(a: string, t: string): i32 {
+  const ka = pathKind(a)
+  if ka is IoError { return die2("link: cannot read \{a}") }
+  if ka == "dir" {
+    const names = listDir(a)
+    if names is IoError { return die2("link: cannot list \{a}") }
+    sort(names, (x: string, y: string): boolean => x < y)
+    for nm in names {
+      if endsWith(nm, ".wasm") {
+        let twin = ""
+        if t != "" && pathExists(t + "/" + nm) == true { twin = t + "/" + nm }
+        linkPair(a + "/" + nm, twin)
+      }
+    }
+  } else {
+    linkPair(a, t)
+  }
+  print("== \{lModules} modules linked, \{lMissing} without a vl.link section")
+  let k = 0
+  while k < lTot.length {
+    if k != 7 {
+      print("  " + padEnd(LINK_FIELDS[k], 28) + padStart("\{lTot[k]}", 12, " "))
+    }
+    k = k + 1
+  }
+  print("modules whose link differs or left a hole: \{lDiffMods}")
+  if t != "" {
+    print(
+      "paired with the twin: \{lTwinPaired}, artifacts differ: \{lHashDiff}",
+    )
+  }
+  if lMissing > 0 || lDiffMods > 0 || lHashDiff > 0 { return 1 }
+  if t != "" && lTwinPaired != lModules { return 1 }
+  0
+}
+
+// Per-module invariance: every module path two or more armed builds both hold must carry one
+// artifact digest in all of them, whatever else each program held.
+function invariance(ws: string[]): i32 {
+  const first: { [string]: i32 } = Map()
+  const firstIn: { [string]: string } = Map()
+  const counted: { [string]: boolean } = Map()
+  let shared = 0
+  let differ = 0
+  for w in ws {
+    const r = readLink(bytesOf(w))
+    if r == null {
+      return die2("invariance: \{w}: no vl.link section (not an armed build)")
+    }
+    let k = 0
+    while k < r.paths.length {
+      const p = r.paths[k]
+      const h = r.hashes[k]
+      const was = firstIn[p] ?? ""
+      if was == "" {
+        firstIn[p] = w
+        first[p] = h
+      } else {
+        if !(counted[p] ?? false) {
+          counted[p] = true
+          shared = shared + 1
+        }
+        if (first[p] ?? 0) != h {
+          differ = differ + 1
+          if differ <= 20 { print("invariance: \{p}: \{was} and \{w} differ") }
+        }
+      }
+      k = k + 1
+    }
+  }
+  print(
+    "== \{ws.length} builds, \{shared} modules held by two or more, \{differ} pairs differ",
+  )
+  if differ > 0 || shared == 0 { return 1 }
+  0
+}
+
 function die2(msg: string): i32 {
   die(msg, 2)
   2
@@ -1267,7 +1500,14 @@ function main(): i32 {
   if args is Utf8Error { return die2(USAGE) }
   if args.length < 2 { return die2(USAGE) }
   if args[0] == "census" { return census(args.slice(1, args.length)) }
+  if args[0] == "invariance" && args.length >= 3 {
+    return invariance(args.slice(1, args.length))
+  }
   if args[0] == "consts" && args.length == 3 { return consts(args[1], args[2]) }
+  if args[0] == "link" && args.length == 2 { return linkProof(args[1], "") }
+  if args[0] == "link" && args.length == 3 {
+    return linkProof(args[1], args[2])
+  }
   if args[0] == "proof" && args.length == 2 { return proof(args[1], "") }
   if args[0] == "proof" && args.length == 3 { return proof(args[1], args[2]) }
   if args[0] == "proof-drop" && args.length == 4 {

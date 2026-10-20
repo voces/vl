@@ -964,6 +964,8 @@ export function ihAmbientMeets(diags: boolean): boolean[] {
 // sets can each be asked `ihAmbientMeets`'s question without reading their tokens again.
 type IhIndex = {
   xWord: {[string]: i32[]},
+  xMember: {[string]: i32[]},
+  xField: {[string]: i32[]},
   xLit: {[i32]: i32[]},
   xRep: i32[],
   xArena: {[i32]: i32[]},
@@ -978,6 +980,8 @@ let ihIx: IhIndex = ihIndexEmpty()
 function ihIndexEmpty(): IhIndex {
   const ix: IhIndex = {
     xWord: Map(),
+    xMember: Map(),
+    xField: Map(),
     xLit: Map(),
     xRep: [],
     xArena: Map(),
@@ -1032,12 +1036,38 @@ export function ihAmbientIndex(): i32 {
         if ihStWild[s] { ix.xWild[m] = true }
         if ihStNames[s] { ix.xNames[m] = true }
       }
+      // The open brackets around token `t`, so a name inside `(` or `[` is not read as a field.
+      const open: TokKind[] = []
       let t = ihStLo[s]
       while t < ihStHi[s] && t < P.toks.length {
         const w = P.toks[t].text
         ihIxWord(ix, w, m)
+        let pk: TokKind = ""
+        if t > ihStLo[s] { pk = P.toks[t - 1].kind }
+        let nk: TokKind = ""
+        if t + 1 < ihStHi[s] && t + 1 < P.toks.length {
+          nk = P.toks[t + 1].kind
+        }
+        const member = pk == "DOT" || pk == "QUESTION_DOT"
+        if member { ihIxRow(ix.xMember, w, m) }
+        let inBrace = true
+        if open.length > 0 { inBrace = open[open.length - 1] == "LBRACE" }
+        const lead = pk == "LBRACE" || pk == "COMMA"
+        const ends = nk == "RBRACE" || nk == "COMMA" || nk == "EQUAL"
+        const named = nk == "COLON" || nk == "QUESTION" || lead && ends
+        const field = member || (inBrace && named)
+        if field { ihIxRow(ix.xField, w, m) }
+        const tk = P.toks[t].kind
+        if tk == "LBRACE" || tk == "LPAREN" || tk == "LBRACK" { open.push(tk) }
+        if (
+          (tk == "RBRACE" || tk == "RPAREN" || tk == "RBRACK")
+          && open.length > 0
+        ) {
+          open.pop()
+        }
         if w.length >= 2 && (w[0] == '"' || w[0] == '\'') {
           ihIxWord(ix, w.slice(1, w.length - 1), m)
+          if field { ihIxRow(ix.xField, w.slice(1, w.length - 1), m) }
         }
         t = t + 1
       }
@@ -1062,9 +1092,13 @@ export function ihAmbientIndex(): i32 {
 }
 
 function ihIxWord(ix: IhIndex, w: string, m: i32): void {
-  const rows = ix.xWord[w] ?? []
+  ihIxRow(ix.xWord, w, m)
+}
+
+function ihIxRow(tab: {[string]: i32[]}, w: string, m: i32): void {
+  const rows = tab[w] ?? []
   ihIxPush(rows, m)
-  ix.xWord[w] = rows
+  tab[w] = rows
 }
 
 function ihIxIn(rows: i32[], inS: boolean[]): boolean {
@@ -1074,17 +1108,19 @@ function ihIxIn(rows: i32[], inS: boolean[]): boolean {
   false
 }
 
+// Whether `inS` spells every name of `ws` where a field is named: after `.`, or inside `{` before
+// `:` or `?`, or alone between `{` or `,` and `}`, `,` or `=`.
 function ihIxSpells(ws: string[], inS: boolean[]): boolean {
   for w in ws {
-    if !ihIxIn(ihIx.xWord[w] ?? [], inS) { return false }
+    if !ihIxIn(ihIx.xField[w] ?? [], inS) { return false }
   }
   true
 }
 
-// `ihAmbientFv(inS)` then `ihAmbientMeets(false)`, from the last `ihAmbientIndex`. With `arena`,
-// a record type of the check also counts when `inS` spells all its fields; with `rows`, a type
-// declaration that may name another type in a rendered report row meets. With `twin`, a record
-// declaration adds nothing when `inS` declares its shape, since the two are one type.
+// `ihAmbientFv(inS)` then `ihAmbientMeets(false)` over a clean check, where a method or getter meets
+// only where `inS` names it after `.` or `?.`. With `arena`, a record type also counts when `inS`
+// spells its fields; with `rows`, a type that may name another in a rendered report row meets;
+// with `twin`, a record declaration adds nothing when `inS` declares its shape (one type).
 export function ihAmbientMeetsIn(
   inS: boolean[],
   arena: boolean,
@@ -1125,7 +1161,9 @@ export function ihAmbientMeetsIn(
       } else {
         let w = ihAkLo[k]
         while w < ihAkHi[k] {
-          if !ihIxIn(ihIx.xWord[ihAkW[w]] ?? [], inS) { all = false }
+          let hits = ihIx.xWord[ihAkW[w]] ?? []
+          if kind == IH_AK_RECV { hits = ihIx.xMember[ihAkW[w]] ?? [] }
+          if !ihIxIn(hits, inS) { all = false }
           w = w + 1
         }
       }
