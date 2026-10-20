@@ -393,6 +393,8 @@ import {
   rlElemTyIx,
   sNames,
   sTyIx,
+  startStmtOrd,
+  startStmts,
   uVariants,
   unNames,
 } from "./emit_state"
@@ -11956,6 +11958,9 @@ let mfrDirty: {[i32]: boolean} = Map()
 let mfrAnnLits: {[i32]: i32[]} = Map()
 let mfrAnnLets: i32[] = []
 let mfrCalled: i32[] = []
+let mfrKeptIndex: i32[] = []
+let mfrTop: i32[] = []
+let mfrKeptTop: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -11970,6 +11975,9 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrAnnLits = Map()
   mfrAnnLets = []
   mfrCalled = []
+  mfrKeptIndex = []
+  mfrTop = stmts
+  mfrKeptTop = []
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -12596,7 +12604,8 @@ function monoFlowUsePlan(
     } else if pn is Index && pn.idxArr == cur {
       const next: i32[] = []
       for v in cv {
-        const el = monoFlowElemAt(v, pn.idxIndex)
+        let el = monoFlowElemAt(v, pn.idxIndex)
+        if el < 0 { el = monoFlowKeptIndexElem(v, p) }
         if el < 0 { return false }
         next.push(el)
       }
@@ -12828,11 +12837,92 @@ function monoFlowInScope(x: i32, g: i32): boolean {
   y == o
 }
 
+// The element of list literal `v` that computed-index read `ix` gives, when every element names
+// one generic and `ix` is the callee of a call standing as a statement, so a copy of the read
+// can run first for its index and its bounds check (D7182); -1 otherwise.
+function monoFlowKeptIndexElem(v: i32, ix: i32): i32 {
+  const xn = P.nodes[ix]
+  if !(xn is Index) || P.nodes[unwrapParen(xn.idxIndex)] is NumLit { return -1 }
+  const ln = P.nodes[v]
+  if !(ln is ArrayLit) || monoFlowElemsGen(v) < 0 { return -1 }
+  for e in ln.arrElems {
+    if P.nodes[e] is Spread { return -1 }
+  }
+  if monoFlowCallStmtOf(ix) < 0 { return -1 }
+  if !i32ListHas(mfrKeptIndex, ix) { mfrKeptIndex.push(ix) }
+  unwrapParen(ln.arrElems[0])
+}
+
+// The call whose callee is read `ix`, when that call is a statement of a block or of the
+// program; -1 otherwise.
+function monoFlowCallStmtOf(ix: i32): i32 {
+  let c = mfrParent[ix] ?? -1
+  while c >= 0 && P.nodes[c] is Paren { c = mfrParent[c] ?? -1 }
+  if c < 0 { return -1 }
+  const cn = P.nodes[c]
+  if !(cn is Call) || unwrapParen(cn.callFn) != ix { return -1 }
+  if monoFlowStmtListOf(c).length > 0 { return c }
+  -1
+}
+
+// The statement list holding statement `c`: its block's, or the program's; empty for none.
+function monoFlowStmtListOf(c: i32): i32[] {
+  const o = mfrParent[c] ?? -1
+  if o < 0 {
+    if i32ListHas(mfrTop, c) { return mfrTop }
+    return []
+  }
+  const on = P.nodes[o]
+  if on is Block && i32ListHas(on.blkStmts, c) { return on.blkStmts }
+  if on is Program && i32ListHas(on.progStmts, c) { return on.progStmts }
+  []
+}
+
+// Runs a copy of computed-index read `x` as the statement before the call it is the callee of,
+// inserting into the list in place; false when that call is no longer a statement.
+function monoFlowKeepIndex(x: i32): boolean {
+  const c = monoFlowCallStmtOf(x)
+  if c < 0 { return false }
+  const xn = P.nodes[x]
+  if !(xn is Index) { return false }
+  const xs = monoFlowStmtListOf(c)
+  let at = xs.length - 1
+  while at >= 0 && xs[at] != c { at = at - 1 }
+  if at < 0 { return false }
+  const kept = mkIndex(xn.idxArr, xn.idxIndex, xn.pos)
+  if (mfrParent[c] ?? -1) < 0 {
+    // A top-level statement runs from `startStmts`, filled before this pass, whose ordinals
+    // are source positions; the copy joins that list at the call's ordinal, and the walk
+    // reaches it through `mfrKeptTop`.
+    let s = startStmts.length - 1
+    while s >= 0 && startStmts[s] != c { s = s - 1 }
+    if s < 0 { return false }
+    monoFlowInsertAt(startStmts, s, kept)
+    monoFlowInsertAt(startStmtOrd, s, startStmtOrd[s])
+    mfrKeptTop.push(kept)
+    return true
+  }
+  monoFlowInsertAt(xs, at, kept)
+  true
+}
+
+// Inserts `v` into `xs` in place at position `at`, which is in range.
+function monoFlowInsertAt(xs: i32[], at: i32, v: i32) {
+  xs.push(xs[xs.length - 1])
+  let k = xs.length - 2
+  while k > at {
+    xs[k] = xs[k - 1]
+    k = k - 1
+  }
+  xs[at] = v
+}
+
 // Rewrites read node `x` in place to a name read of generic `g`, where that name is in scope;
 // false when it is not.
 function monoFlowReadSet(x: i32, g: i32): boolean {
   const nm = monoFlowLeafName(g)
   if nm == "" || !monoFlowInScope(x, g) { return false }
+  if i32ListHas(mfrKeptIndex, x) && !monoFlowKeepIndex(x) { return false }
   const n: Node = { identName: nm, pos: nodePos(x) }
   if monoFlowCalledAt(x) && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
   arenaSetNode(x, n)
@@ -19294,6 +19384,9 @@ export function monomorphize(stmts: i32[]) {
       if monoWalk(stmts[i], -1) < 0 { return -1 }
     }
     i = i + 1
+  }
+  for k in mfrKeptTop {
+    if monoWalk(k, -1) < 0 { return -1 }
   }
   // Then every non-generic lifted function's body. A generic original's body is only ever
   // walked through an instance; an instance appended during this loop extends `fnStmts`,
