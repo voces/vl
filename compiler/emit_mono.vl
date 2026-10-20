@@ -78,6 +78,8 @@ import {
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
+import { recSolePinArg } from "./check_record_origins"
+import { recFnDeclByName } from "./check_scopes"
 import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
 import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
@@ -1796,21 +1798,60 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
   monoArgTyNameRep(ix, fnIx, cax)
 }
 
-// The row an inferred-result function's object literals are built at, by the record its one
-// call delivers to, where every value it hands back is such a literal and all share that row,
-// else "". The checked result still names the literal's own type, which is not the build (D8020).
+// The row an inferred-result function's object literals are built at, by the record its calls
+// deliver to, where every value it hands back is such a literal, a sole-pin identity over one,
+// or an argument-free call of a function answering here, and all share that row, else "". The
+// checked result still names the literal's own type, which is not the build (D8020, D8202).
 function monoRebuiltLitRetName(fd: i32): string {
-  let row = -1
-  for lf in recFnValueLeaves(fd) {
-    const lp = unwrapParen(lf)
-    if lp < 0 || lp >= P.nodes.length || !(P.nodes[lp] is ObjLit) { return "" }
-    const rt = nodeRepTyIxOf(lp)
-    if rt < 0 || rt == nodeTyIxOf(lp) || !(T.tys[rt] is TyObj) { return "" }
-    if row >= 0 && rt != row { return "" }
-    row = rt
-  }
+  const row = monoRebuiltLitRetRow(fd, MONO_REBUILT_DEPTH)
   if row < 0 { return "" }
   monoRetRowName(row)
+}
+
+const MONO_REBUILT_DEPTH = 8
+
+// `monoRebuiltLitRetName`'s row, or -1.
+function monoRebuiltLitRetRow(fd: i32, depth: i32): i32 {
+  let row = -1
+  for lf in recFnValueLeaves(fd) {
+    const rt = monoRebuiltLeafRow(lf, depth)
+    if rt < 0 || (row >= 0 && rt != row) { return -1 }
+    row = rt
+  }
+  row
+}
+
+// The row value `lf` is built at when it is a rebuilt literal, an identity over one, or an
+// argument-free call of an inferred function whose results are; -1 otherwise.
+function monoRebuiltLeafRow(lf: i32, depth: i32): i32 {
+  const lp = unwrapParen(lf)
+  if lp < 0 || lp >= P.nodes.length || depth <= 0 { return -1 }
+  const n = P.nodes[lp]
+  if n is ObjLit {
+    const rt = nodeRepTyIxOf(lp)
+    if rt < 0 || rt == nodeTyIxOf(lp) || !(T.tys[rt] is TyObj) { return -1 }
+    return rt
+  }
+  const sp = recSolePinArg(lp)
+  if sp >= 0 { return monoRebuiltLeafRow(sp, depth - 1) }
+  if (
+    n is Call
+    && n.callArgs.length == 0
+    && n.callFn >= 0
+    && n.callFn < P.nodes.length
+  ) {
+    const cn = P.nodes[n.callFn]
+    if cn is Ident {
+      const cd = recFnDeclByName(cn.identName)
+      if cd >= 0 && cd < P.nodes.length {
+        const f = P.nodes[cd]
+        if f is FuncDecl && f.fnRet < 0 && f.fnTyParams.length == 0 {
+          return monoRebuiltLitRetRow(cd, depth - 1)
+        }
+      }
+    }
+  }
+  -1
 }
 
 // The binding rungs of `monoArgTyName`: a call argument's callee return, then an `Ident`

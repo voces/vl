@@ -1610,6 +1610,11 @@ function plusLinksFor(m: i32, src: string): i32 {
 // lint run, in one pass over the import entries; `only` >= 0 limits it to that importer.
 let ilMaps: {[string]: i32}[] = []
 let ilFns: {[string]: i32}[] = []
+// Each module's two global scans by key, kept with the source they read: both are pure
+// functions of it, so one check run walks a module shared by many roots once.
+const ilGlobSrc: {[string]: string} = Map()
+const ilGlobMaps: {[string]: {[string]: i32}} = Map()
+const ilGlobFns: {[string]: {[string]: i32}} = Map()
 
 function importedNamesBuild(only: i32): i32 {
   ilMaps = []
@@ -1644,8 +1649,23 @@ function importedNamesBuild(only: i32): i32 {
       && to < globals.length
     ) {
       if !scanned[to] {
-        globals[to] = lintMapGlobalsOf(modSrcs[to])
-        fns[to] = lintFnGlobalsOf(modSrcs[to])
+        const key = modKeys[to]
+        const keptMaps = ilGlobMaps[key]
+        const keptFns = ilGlobFns[key]
+        if (
+          keptMaps != null
+          && keptFns != null
+          && (ilGlobSrc[key] ?? "") == modSrcs[to]
+        ) {
+          globals[to] = keptMaps
+          fns[to] = keptFns
+        } else {
+          globals[to] = lintMapGlobalsOf(modSrcs[to])
+          fns[to] = lintFnGlobalsOf(modSrcs[to])
+          ilGlobSrc[key] = modSrcs[to]
+          ilGlobMaps[key] = globals[to]
+          ilGlobFns[key] = fns[to]
+        }
         scanned[to] = true
       }
       if (globals[to][impName[k]] ?? 0) == 1 { ilMaps[from][impLocal[k]] = 1 }
@@ -2269,15 +2289,15 @@ function csStrLexeme(s: string): string {
   fromCodePoints(buf)
 }
 
-// The module KEY owning the token at `tok` — the merged program's name for the
-// file. A single-source compile has no module table and answers "", which is the
-// honest reading: nothing in that pipeline knows the entry's path (the CLI
-// prints one it holds host-side, and never tells the compiler).
-function csFileOfTok(tok: i32): string {
-  if modKeys.length == 0 { return "" }
+// The module whose KEY names the token at `tok`'s file, or -1 for the file "". A
+// single-source compile has no module table and answers -1, which is the honest
+// reading: nothing in that pipeline knows the entry's path (the CLI prints one it
+// holds host-side, and never tells the compiler).
+function csFileOfTok(tok: i32): i32 {
+  if modKeys.length == 0 { return -1 }
   const m = modOfTok(tok)
-  if m < 0 || m >= modKeys.length { return "" }
-  modKeys[m]
+  if m < 0 || m >= modKeys.length { return -1 }
+  m
 }
 
 export function csPreMintLocs(): i32 {
@@ -2286,13 +2306,17 @@ export function csPreMintLocs(): i32 {
   // Snapshot the length FIRST — minting appends, and the nodes appended are not
   // themselves calls.
   const n0 = P.nodes.length
+  // Each module's key as a lexeme, built once per module rather than once per call.
+  const lexOfMod: string[] = []
+  for _ in modKeys { lexOfMod.push("") }
+  const noFileLex = csStrLexeme("")
   let i = 0
   while i < n0 {
     const n = P.nodes[i]
     if n is Call {
       let ln = 0
       let co = 0
-      let file = ""
+      let fileLex = noFileLex
       // The callee's own anchor token — `where` in `where(1)`, `f` in `x.f(1)` —
       // what a reader means by "the call site". Not `tokIndexAt(n.pos)`: that binary
       // search assumes `P.toks[i].start` ascends, which fails across a module
@@ -2305,10 +2329,16 @@ export function csPreMintLocs(): i32 {
       if tk >= 0 && tk < P.toks.length {
         ln = P.toks[tk].line
         co = P.toks[tk].col + 1
-        file = csFileOfTok(tk)
+        const fm = csFileOfTok(tk)
+        if fm >= 0 {
+          if lexOfMod[fm].length == 0 {
+            lexOfMod[fm] = csStrLexeme(modKeys[fm])
+          }
+          fileLex = lexOfMod[fm]
+        }
       }
       const fields: i32[] = []
-      fields.push(mkFieldInit("file", mkStr(csStrLexeme(file), -1), -1))
+      fields.push(mkFieldInit("file", mkStr(fileLex, -1), -1))
       fields.push(mkFieldInit("line", mkNum(i32ToStr(ln), -1), -1))
       fields.push(mkFieldInit("col", mkNum(i32ToStr(co), -1), -1))
       // The `ObjLit` keeps the CALL's position so a type error on this argument
@@ -4908,6 +4938,7 @@ function modParseAll(): i32[] {
 // in the pre-rename window — after `modBuildRename` a declared name is `f64$mN` and there is
 // nothing left to recognise. Duplicate bindings are `modCheckOverloads`'s, after the rewrite.
 function modCheckReservedAll(roots: i32[]) {
+  modImpRowsBuild()
   let dc = 0
   while dc < modOrder.length {
     modCheckReservedDecls(roots[dc])
@@ -7369,10 +7400,9 @@ function modCheckReservedDecls(root: i32): i32 {
 // in the module would silently reach the import. Anchored at the local's own token, found in
 // the module's token range `[t0, t1)` by the position `modScan` recorded for the source name.
 function modCheckReservedImports(m: i32, root: i32, t0: i32, t1: i32): i32 {
-  let ii = 0
-  while ii < impMod.length {
+  for ii in modImpRowsOf(m) {
     const local = impLocal[ii]
-    if impMod[ii] == m && impName[ii] != "" && isReservedIntrinsicName(local) {
+    if impName[ii] != "" && isReservedIntrinsicName(local) {
       let tk = -1
       let t = t0
       while t < t1 && tk < 0 {
@@ -7390,9 +7420,27 @@ function modCheckReservedImports(m: i32, root: i32, t0: i32, t1: i32): i32 {
       }
       checkNotIntrinsicImportLocal(local, root, tk)
     }
-    ii = ii + 1
   }
   0
+}
+// Each module's rows of the `imp*` tables, ascending, built once per `modCompile` before the
+// per-module passes, so each walks its own imports rather than every module's.
+let modImpRows: i32[][] = []
+function modImpRowsBuild(): i32 {
+  modImpRows = []
+  for _ in modKeys { modImpRows.push([]) }
+  let k = 0
+  while k < impMod.length {
+    const m = impMod[k]
+    if m >= 0 && m < modImpRows.length { modImpRows[m].push(k) }
+    k = k + 1
+  }
+  0
+}
+// Module `m`'s import rows, or none for an index outside the table.
+function modImpRowsOf(m: i32): i32[] {
+  if m < 0 || m >= modImpRows.length { return [] }
+  modImpRows[m]
 }
 // A type-position name only a `type` row may rename: a built-in type, or `Map`/`Set`, whose
 // value of the same name (an ambient function) a declaration may shadow without taking the type.
@@ -7482,10 +7530,9 @@ function modRenameReplay(o: i32): i32 {
 function modBuildRename(m: i32, root: i32): i32 {
   modRenameClear()
   const impLocals: string[] = []
-  let ii = 0
-  while ii < impMod.length {
-    if impMod[ii] == m && impLocal[ii] != "" { impLocals.push(impLocal[ii]) }
-    ii = ii + 1
+  const rows = modImpRowsOf(m)
+  for ii in rows {
+    if impLocal[ii] != "" { impLocals.push(impLocal[ii]) }
   }
   const suffix = modSuffixOf(m)
   const r = P.nodes[root]
@@ -7537,9 +7584,8 @@ function modBuildRename(m: i32, root: i32): i32 {
     }
     xd = xd + 1
   }
-  let ij = 0
-  while ij < impMod.length {
-    if impMod[ij] == m && impLocal[ij] != "" {
+  for ij in rows {
+    if impLocal[ij] != "" {
       const dd = modIndexOfKey(impKey[ij])
       // The dep may only RE-EXPORT this name rather than declare it, so the
       // target is the chased declaration, not the flat `impName[ij]$mdd` (which
@@ -7548,7 +7594,6 @@ function modBuildRename(m: i32, root: i32): i32 {
         modRenamePush(impLocal[ij], modMergedTargetOf(dd, impName[ij]))
       }
     }
-    ij = ij + 1
   }
   // The template renderer's row — the far half of the injected import. An ordinary
   // rename row, taking the identical path an author's own import would; what makes

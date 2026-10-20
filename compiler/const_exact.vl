@@ -106,24 +106,6 @@ function cxmMul(a: i32[], b: i32[]): i32[] {
   cxmTrim(out)
 }
 
-// `a * m + add` for `m` and `add` at most 0xffff.
-function cxmMulSmallAdd(a: i32[], m: i32, add: i32): i32[] {
-  const out: i32[] = []
-  let carry = add
-  let i = 0
-  while i < a.length {
-    const t = a[i] * m + carry
-    out.push(t & 0xffff)
-    carry = t >>> 16
-    i = i + 1
-  }
-  while carry != 0 {
-    out.push(carry & 0xffff)
-    carry = carry >>> 16
-  }
-  cxmTrim(out)
-}
-
 function cxmShl(a: i32[], k: i32): i32[] {
   if bigIsZero(a) { return [0] }
   const out: i32[] = []
@@ -289,28 +271,62 @@ function cxmGcd(a: i32[], b: i32[]): i32[] {
   x
 }
 
+// `a * m + add` for `m` in [1, 10^9] and `add` below 2^31: each partial product stays below 2^47,
+// so it is taken in `i64`.
+function cxmMulWide(a: i32[], m: i64, add: i64): i32[] {
+  const out: i32[] = []
+  let carry = add
+  let i = 0
+  while i < a.length {
+    const t = (a[i] as i64) * m + carry
+    out.push((t & 0xffff) as% i32)
+    carry = t >> 16
+    i = i + 1
+  }
+  while carry != 0 {
+    out.push((carry & 0xffff) as% i32)
+    carry = carry >> 16
+  }
+  cxmTrim(out)
+}
+
+// Nine decimal digits a step, the most whose power stays below 2^31.
 function cxmPow10(e: i32): i32[] {
   let r: i32[] = [1]
   let i = 0
-  while i + 4 <= e {
-    r = cxmMulSmallAdd(r, 10000, 0)
-    i = i + 4
+  while i + 9 <= e {
+    r = cxmMulWide(r, 1000000000 as i64, 0 as i64)
+    i = i + 9
   }
+  let m = 1 as i64
   while i < e {
-    r = cxmMulSmallAdd(r, 10, 0)
+    m = m * 10
     i = i + 1
   }
+  if m > 1 { r = cxmMulWide(r, m, 0 as i64) }
   r
 }
 
+// Nine digits a pass, dividing a working copy in place and dropping its zero top limbs.
 function cxmToDec(a: i32[]): string {
   if bigIsZero(a) { return "0" }
+  const x: i32[] = []
+  for v in a { x.push(v) }
+  let len = x.length
+  while len > 0 && x[len - 1] == 0 { len = len - 1 }
   const groups: i32[] = []
-  let x = a
-  while !bigIsZero(x) {
-    const qr = cxmDivmodSmall(x, 10000)
-    groups.push(qr[1][0])
-    x = qr[0]
+  const d = 1000000000 as i64
+  while len > 0 {
+    let rem = 0 as i64
+    let i = len - 1
+    while i >= 0 {
+      const cur = rem * 65536 + (x[i] as i64)
+      x[i] = (cur / d) as% i32
+      rem = cur % d
+      i = i - 1
+    }
+    groups.push(rem as% i32)
+    while len > 0 && x[len - 1] == 0 { len = len - 1 }
   }
   const cps: i32[] = []
   let g = groups.length - 1
@@ -323,7 +339,7 @@ function cxmToDec(a: i32[]): string {
   fromCodePoints(cps)
 }
 
-// The decimal digits of `v` (below 10000), padded to four when `pad`.
+// The decimal digits of `v` (below 10^9), padded to nine when `pad`.
 function cxDigitsPush(cps: i32[], v: i32, pad: boolean) {
   const ds: i32[] = []
   let x = v
@@ -332,7 +348,7 @@ function cxDigitsPush(cps: i32[], v: i32, pad: boolean) {
     x = x / 10
   }
   if pad {
-    while ds.length < 4 { ds.push(48) }
+    while ds.length < 9 { ds.push(48) }
   } else if ds.length == 0 {
     ds.push(48)
   }
@@ -473,6 +489,10 @@ export function cexOfLexeme(t: string): Cex {
   let i = 0
   if base != 10 { i = 2 }
   let mag: i32[] = [0]
+  // Digits gather in `chunk` (scale `mult`) and fold into `mag` once `mult` would pass 10^9.
+  let chunk = 0 as i64
+  let mult = 1 as i64
+  const b = base as i64
   let frac = 0
   let inFrac = false
   let isFloat = false
@@ -488,6 +508,7 @@ export function cexOfLexeme(t: string): Cex {
       isFloat = true
       const ex = cxParseExp(t, i + 1)
       if ex < -1400 || ex > 1400 { return cexNotConst() }
+      if mult > 1 { mag = cxmMulWide(mag, mult, chunk) }
       return cexScale10(mag, ex - frac)
     } else {
       let d = 0
@@ -495,11 +516,18 @@ export function cexOfLexeme(t: string): Cex {
       else if c >= 'a' && c <= 'f' { d = c - 'a' + 10 }
       else if c >= 'A' && c <= 'F' { d = c - 'A' + 10 }
       else { return cexNotConst() }
-      mag = cxmMulSmallAdd(mag, base, d)
+      if mult * b > 1000000000 {
+        mag = cxmMulWide(mag, mult, chunk)
+        chunk = 0 as i64
+        mult = 1 as i64
+      }
+      chunk = chunk * b + (d as i64)
+      mult = mult * b
       if inFrac { frac = frac + 1 }
       i = i + 1
     }
   }
+  if mult > 1 { mag = cxmMulWide(mag, mult, chunk) }
   if isFloat { return cexScale10(mag, 0 - frac) }
   cexInt(false, mag, base != 10)
 }
@@ -770,9 +798,9 @@ export function cexScaleBits(v: Cex): i32 {
 export function cexIntExactAt(v: Cex, sigBits: i32, maxWidth: i32): boolean {
   if bigIsZero(v.cxNum) { return true }
   if cxmBitLen(v.cxNum) > maxWidth { return false }
-  let m = v.cxNum
-  while (m[0] & 1) == 0 { m = cxmShr(m, 1) }
-  cxmBitLen(m) <= sigBits
+  let tz = 0
+  while ((v.cxNum[tz >>> 4] >>> (tz & 15)) & 1) == 0 { tz = tz + 1 }
+  cxmBitLen(v.cxNum) - tz <= sigBits
 }
 
 // Whether the fraction `v` is a whole number.
@@ -799,9 +827,9 @@ export function cexLexeme(v: Cex): string {
 function cexFloatExact(v: Cex): string {
   let d = v.cxDen
   let twos = 0
-  while (d[0] & 1) == 0 && !bigIsZero(d) {
-    d = cxmShr(d, 1)
-    twos = twos + 1
+  if !bigIsZero(d) {
+    while ((d[twos >>> 4] >>> (twos & 15)) & 1) == 0 { twos = twos + 1 }
+    d = cxmShr(d, twos)
   }
   let fives = 0
   while !cxmIsOne(d) {
