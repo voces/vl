@@ -270,3 +270,55 @@ Deno.test({
     }
   },
 });
+
+// A root walked from `.` is spelled `./b.vl`, while a.vl's check keys the module it imports
+// `b.vl`. Serving compares the two in one spelling, so `vl check .` and a bare `vl check` reuse
+// a.vl's check for b.vl as `vl check <dir>` does, and still print b.vl's own report as `./b.vl`,
+// its warning included, exactly as checking it alone does.
+Deno.test({
+  name: "vl-check-dir: `vl check .` and a bare `vl check` serve a root from its importer's check",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_dot_" });
+    try {
+      await Deno.writeTextFile(`${dir}/a.vl`, 'import { g } from "./b"\nprint(g())\n');
+      await Deno.writeTextFile(
+        `${dir}/b.vl`,
+        'import { h } from "./c"\nexport function g(): i32 { h() }\nconst bad: string = 1\n',
+      );
+      await Deno.writeTextFile(`${dir}/c.vl`, "export function h(): i32 { 1 }\n");
+      const run = async (args: string[]) => {
+        const r = await new Deno.Command(VL, {
+          args: ["check", ...args, "--concise", "--compiler", COMPILER],
+          cwd: dir,
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: "1", VL_CHECK_STATS: "1" }),
+        }).output();
+        return { code: r.code, err: new TextDecoder().decode(r.stderr) };
+      };
+      const alone = await run(["./b.vl"]);
+      const own = alone.err.split("\n").filter((l) => l.startsWith("./b.vl: "));
+      if (alone.code !== 1 || own.length !== 2) {
+        throw new Error(`want ./b.vl's error and warning, got ${alone.code}:\n${alone.err}`);
+      }
+      for (const args of [["."], []]) {
+        const r = await run(args);
+        const shape = args.length === 0 ? "bare" : args.join(" ");
+        if (!r.err.includes("[check] served: roots=1 ")) {
+          throw new Error(`${shape}: want b.vl served from a.vl's check, got:\n${r.err}`);
+        }
+        for (const line of [...own, "b.vl: error [3:21] cannot assign i32 to 'bad' of type string"]) {
+          if (!r.err.split("\n").includes(line)) {
+            throw new Error(`${shape}: want the line ${JSON.stringify(line)}, got:\n${r.err}`);
+          }
+        }
+        if (r.code !== 1 || !r.err.includes("Found 2 errors, 1 warning.")) {
+          throw new Error(`${shape}: want 2 errors and 1 warning, got ${r.code}:\n${r.err}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
