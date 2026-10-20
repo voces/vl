@@ -12,6 +12,7 @@ import { globalCellIsImmutable } from "./emit_query"
 import {
   RELOC_ARMED,
   RS_SLOT,
+  RS_TAG,
   relCount,
   relFoldSpAt,
   relFoldSubAt,
@@ -40,17 +41,22 @@ import {
   gStrPoolTexts,
   gSynthBase,
   globalStmts,
+  mAllocKind,
   mvKeyKind,
   mvValName,
   rlElemName,
   topFnNodes,
   uVariants,
 } from "./emit_state"
+import { TypeSites, typeOrderOldOf, typeSitesOf } from "./emit_type_order"
 import { variantTagKey } from "./emit_variant_sig"
 import {
   LK_FUNC,
   LK_GLOBAL,
+  LK_HEAP,
+  LK_TYPE,
   LinkArt,
+  LinkBand,
   LinkFn,
   LinkOut,
   LinkPiece,
@@ -105,6 +111,17 @@ let gIxOf: { [string]: i32 } = Map()
 let defSeen: { [string]: boolean } = Map()
 let nonMin = 0
 let opFail = 0
+// Where the module names a type, and each type index's symbol.
+let tyS: TypeSites = {
+  at: [],
+  len: [],
+  heap: [],
+  val: [],
+  entS: [],
+  entE: [],
+  group: 0,
+}
+let tyKey: string[] = []
 
 // Splits, links and compares the module in `W`; `n` user functions keyed `fnKeys`, and the
 // table thunks of `thunkFes` in order.
@@ -146,12 +163,7 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
     tail: [],
     runtime: elArt(""),
     startKey: "",
-    vKeys: [],
     atomTop: uAtomBandTop(),
-    rl: [],
-    mvKind: [],
-    mvVal: [],
-    clo: [],
   }
   let nfImp = 0
   let ngImp = 0
@@ -163,22 +175,11 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
       ngImp = cnt[1]
     }
     if ids[si] == 4 { prog.table = true }
-    if (
-      ids[si] == 1
-      || ids[si] == 2
-      || ids[si] == 5
-      || ids[si] == 11
-      || ids[si] == 12
-      || ids[si] == 13
-    ) {
-      prog.secs.push({ id: ids[si], b: mb.slice(st[si], en[si]) })
-    }
     si = si + 1
   }
   // Function index keys: imports, users, the runtime, then the thunks.
-  const fnTys = elFnTypes(ids, st, en)
   const nThunk = thunkFes.length
-  const nRt = fnTys.length - n - nThunk
+  const nRt = elFnCount(ids, st, en) - n - nThunk
   fKey = []
   k = 0
   while k < nfImp {
@@ -193,6 +194,18 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
     k = k + 1
   }
   for fe in thunkFes { fKey.push("t:" + fnKeys[fe]) }
+  tyS = typeSitesOf(mb)
+  elTyKeys(n)
+  const fnTys = elFnTypes(ids, st, en)
+  si = 0
+  while si < ids.length {
+    if ids[si] == 2 || ids[si] == 5 || ids[si] == 11 || ids[si] == 12 {
+      prog.secs.push({ id: ids[si], b: elSpan(st[si], en[si]) })
+    }
+    if ids[si] == 13 { elTags(st[si], en[si], prog.runtime) }
+    si = si + 1
+  }
+  const g = tyS.group
   // Global index keys; a synthetic constant's waits for its own entry.
   gKey = []
   k = 0
@@ -249,6 +262,9 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
     const a = arts[artOf[elFnMod(fi)] ?? 0]
     const f = elFn(fKey[nfImp + fi], fnTys[fi], bodies[fi])
     f.taken = fnAddrTakenAt(fi)
+    if g + fi < tyS.entS.length {
+      f.sig = elSpan(tyS.entS[g + fi], tyS.entE[g + fi])
+    }
     if fi < topFnNodes.length { a.fns.push(f) } else { prog.tail.push(f) }
     byFe.push(f)
     elNoteDefs(a, f.body, gEntries, ngImp)
@@ -338,15 +354,12 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
     }
     si = si + 1
   }
-  k = 0
-  while k < uVariants.length {
-    prog.vKeys.push(variantTagKey(k))
+  k = g + n
+  while k < tyS.entS.length {
+    prog.runtime.sigs.push(elSpan(tyS.entS[k], tyS.entE[k]))
     k = k + 1
   }
-  for s in rlElemName { prog.rl.push(s) }
-  for x in mvKeyKind { prog.mvKind.push(x) }
-  for s in mvValName { prog.mvVal.push(s) }
-  for s in cloSigTagNames { prog.clo.push(s) }
+  elDemands(prog, arts)
   const out = link(prog, arts)
   elWrite(out, ids, st, en, prog, arts)
 }
@@ -362,6 +375,10 @@ function elArt(path: string): LinkArt {
     pool: [],
     poolIs: [],
     exports: [],
+    tys: [],
+    bands: [],
+    sigs: [],
+    tags: [],
   }
 }
 
@@ -483,9 +500,16 @@ function elLimits(c: WasmCursor) {
   0
 }
 
-// Each function-section entry's bytes.
-function elFnTypes(ids: i32[], st: i32[], en: i32[]): u8[][] {
-  const out: u8[][] = []
+// The function section's entry count.
+function elFnCount(ids: i32[], st: i32[], en: i32[]): i32 {
+  const si = elSecOf(ids, 3)
+  if si < 0 { return 0 }
+  wcU32(wcNew(mb, st[si], en[si]))
+}
+
+// Each function-section entry, its type cut.
+function elFnTypes(ids: i32[], st: i32[], en: i32[]): LinkPiece[] {
+  const out: LinkPiece[] = []
   let si = 0
   while si < ids.length {
     if ids[si] == 3 {
@@ -495,7 +519,7 @@ function elFnTypes(ids: i32[], st: i32[], en: i32[]): u8[][] {
       while i < cnt {
         const at = c.pos
         wcU32(c)
-        out.push(mb.slice(at, c.pos))
+        out.push(elSpan(at, c.pos))
         i = i + 1
       }
     }
@@ -503,6 +527,153 @@ function elFnTypes(ids: i32[], st: i32[], en: i32[]): u8[][] {
   }
   out
 }
+
+// The bytes `[from, to)` as a piece, every type they name cut.
+function elSpan(from: i32, to: i32): LinkPiece {
+  const p: LinkPiece = { b: [], refs: [] }
+  elCopy(p, from, to)
+  p
+}
+
+// Appends `mb[from, to)` to `p`, each type LEB in it cut out.
+function elCopy(p: LinkPiece, from: i32, to: i32) {
+  let s = elSiteFrom(from)
+  let i = from
+  while i < to {
+    if s < tyS.at.length && tyS.at[s] == i {
+      let kind = LK_TYPE
+      if tyS.heap[s] { kind = LK_HEAP }
+      const v = tyS.val[s]
+      p.refs.push({ at: p.b.length, kind: kind, key: elTyKeyOf(v) })
+      if tyS.len[s] != elLebWidth(v, tyS.heap[s]) { nonMin = nonMin + 1 }
+      i = i + tyS.len[s]
+      s = s + 1
+    } else {
+      p.b.push(mb[i])
+      i = i + 1
+    }
+  }
+  0
+}
+
+// The first type site at or after offset `at`.
+function elSiteFrom(at: i32): i32 {
+  let lo = 0
+  let hi = tyS.at.length
+  while lo < hi {
+    const mid = (lo + hi) >>> 1
+    if tyS.at[mid] < at { lo = mid + 1 } else { hi = mid }
+  }
+  lo
+}
+
+function elTyKeyOf(v: i32): string {
+  if v >= 0 && v < tyKey.length { return tyKey[v] }
+  "?t" + i32ToStr(v)
+}
+
+// Each type index's symbol. A heap type of the first group is named by its family and the
+// structure it has, refined until two types share a name only when they are alike all the
+// way down, then numbered by mint order among the alike; a function's own signature by its
+// function; a runtime signature by its position.
+function elTyKeys(n: i32) {
+  tyKey = []
+  const g = tyS.group
+  const h0: i32[] = []
+  const refs: i32[][] = []
+  let t = 0
+  while t < g {
+    const old = typeOrderOldOf(t)
+    let h = elH(-2128831035, elAt(mAllocKind, old))
+    const rs: i32[] = []
+    let s = elSiteFrom(tyS.entS[t])
+    let i = tyS.entS[t]
+    while i < tyS.entE[t] {
+      if s < tyS.at.length && tyS.at[s] == i {
+        if tyS.heap[s] { h = elH(h, -1) } else { h = elH(h, -2) }
+        rs.push(tyS.val[s])
+        i = i + tyS.len[s]
+        s = s + 1
+      } else {
+        h = elH(h, mb[i])
+        i = i + 1
+      }
+    }
+    h0.push(h)
+    refs.push(rs)
+    t = t + 1
+  }
+  let cur = h0
+  let classes = elDistinct(cur)
+  let round = 0
+  let more = g > 0
+  while more && round <= g {
+    const nxt: i32[] = []
+    t = 0
+    while t < g {
+      let h = h0[t]
+      for r in refs[t] {
+        if r >= 0 && r < g { h = elH(h, cur[r]) } else { h = elH(h, r) }
+      }
+      nxt.push(h)
+      t = t + 1
+    }
+    const c = elDistinct(nxt)
+    cur = nxt
+    more = c > classes
+    classes = c
+    round = round + 1
+  }
+  while tyKey.length < g { tyKey.push("") }
+  const seen: { [string]: i32 } = Map()
+  const newOf = elNewOrder(g)
+  let o = 0
+  while o < g {
+    t = newOf[o]
+    const base = "T" + i32ToStr(elAt(mAllocKind, o)) + ":" + i32ToStr(cur[t])
+    const k = seen[base] ?? 0
+    seen[base] = k + 1
+    if k == 0 { tyKey[t] = base } else { tyKey[t] = base + "#" + i32ToStr(k) }
+    o = o + 1
+  }
+  let r = 0
+  while g + r < tyS.entS.length {
+    if r < n {
+      tyKey.push("F:" + fKey[gImports + r])
+    } else {
+      tyKey.push("F:rt#" + i32ToStr(r - n))
+    }
+    r = r + 1
+  }
+  0
+}
+
+// Per mint position of the first group, the index the order pass gave it.
+function elNewOrder(g: i32): i32[] {
+  const out: i32[] = []
+  while out.length < g { out.push(0) }
+  let t = 0
+  while t < g {
+    const o = typeOrderOldOf(t)
+    if o >= 0 && o < g { out[o] = t }
+    t = t + 1
+  }
+  out
+}
+
+function elDistinct(xs: i32[]): i32 {
+  const m: { [i32]: boolean } = Map()
+  let c = 0
+  for x in xs {
+    if !(m[x] ?? false) {
+      m[x] = true
+      c = c + 1
+    }
+  }
+  c
+}
+
+function elH(h: i32, x: i32): i32 { (h ^ x) * 16777619 }
 
 // Each defined global's entry, cut; a synthetic constant takes its key from its contents.
 function elGlobals(ids: i32[], st: i32[], en: i32[], ngImp: i32): LinkPiece[] {
@@ -572,13 +743,9 @@ let firstBody = -1
 // The bytes `[from, end)` with every function, global and row LEB cut out, decoding from
 // `code` on. A constant expression stops after its closing `end`, which `elCutEnd` reports.
 function elCut(from: i32, code: i32, end: i32, constExpr: boolean): LinkPiece {
-  const refs: LinkRef[] = []
-  const b: u8[] = []
-  let i = from
-  while i < code {
-    b.push(mb[i])
-    i = i + 1
-  }
+  const p = elSpan(from, code)
+  const b = p.b
+  const refs = p.refs
   const c = wcNew(mb, code, end)
   let depth = 0
   let open = true
@@ -609,15 +776,9 @@ function elCut(from: i32, code: i32, end: i32, constExpr: boolean): LinkPiece {
     if kind >= 0 {
       if at >= 0 && at < mb.length { b.push(mb[at]) }
       refs.push({ at: b.length, kind: kind, key: key })
-      if c.pos - at - 1 != elLebWidth(v, kind != LK_FUNC && kind != LK_GLOBAL) {
-        nonMin = nonMin + 1
-      }
+      if c.pos - at - 1 != elLebWidth(v, elSigned(kind)) { nonMin = nonMin + 1 }
     } else {
-      let j = at
-      while j < c.pos {
-        b.push(mb[j])
-        j = j + 1
-      }
+      elCopy(p, at, c.pos)
     }
     if constExpr {
       if op >= 0x02 && op <= 0x04 || op == 0x06 || op == 0x1f {
@@ -630,7 +791,7 @@ function elCut(from: i32, code: i32, end: i32, constExpr: boolean): LinkPiece {
   }
   if c.failed { opFail = opFail + 1 }
   elCutEnd = c.pos
-  { b: b, refs: refs }
+  p
 }
 
 function elRowKey(r: i32): string {
@@ -644,6 +805,11 @@ function elSymKey(sp: i32, sub: i32, v: i32): string {
     return "f#" + i32ToStr(sub)
   }
   relSymKey(sp, sub, v)
+}
+
+// Whether a reference of `kind` is written as a signed LEB.
+function elSigned(kind: i32): boolean {
+  kind != LK_FUNC && kind != LK_GLOBAL && kind != LK_TYPE
 }
 
 function elLebWidth(value: i32, signed: boolean): i32 {
@@ -663,14 +829,15 @@ function elLebWidth(value: i32, signed: boolean): i32 {
   w
 }
 
-function elFn(key: string, ty: u8[], body: LinkPiece): LinkFn {
+function elFn(key: string, ty: LinkPiece, body: LinkPiece): LinkFn {
   {
     key: key,
     ty: ty,
+    sig: { b: [], refs: [] },
     body: body,
     taken: false,
     thunk: false,
-    thunkTy: [],
+    thunkTy: { b: [], refs: [] },
     thunkBody: { b: [], refs: [] },
   }
 }
@@ -887,7 +1054,7 @@ function elRefDiff(p: LinkPiece, w0: i32, lb: u8[], l0: i32) {
     wo = wo + r.at - from
     lo = lo + r.at - from
     from = r.at
-    const signed = r.kind != LK_FUNC && r.kind != LK_GLOBAL
+    const signed = elSigned(r.kind)
     const wv = elLeb(mb, wo, signed)
     const ww = lebW
     const lv = elLeb(lb, lo, signed)
@@ -959,4 +1126,169 @@ function elBodyDiff(a0: i32, a1: i32, lb: u8[], bs: i32, be: i32): i32 {
     i = i + 1
   }
   d
+}
+
+// Each tag-section entry of `[from, to)` onto `a`, its type cut.
+function elTags(from: i32, to: i32, a: LinkArt) {
+  const c = wcNew(mb, from, to)
+  const cnt = wcU32(c)
+  let i = 0
+  while i < cnt && !c.failed {
+    const at = c.pos
+    wcByte(c)
+    wcU32(c)
+    a.tags.push(elSpan(at, c.pos))
+    i = i + 1
+  }
+  0
+}
+
+// The group types and tag-band entries each artifact's pieces name, a type's own definition
+// followed. The runtime takes those of the tail and of the sections, then every one no
+// artifact names, so each still holds its index.
+function elDemands(prog: LinkProg, arts: LinkArt[]) {
+  const g = tyS.group
+  const defs: LinkPiece[] = []
+  const ixOf: { [string]: i32 } = Map()
+  let t = 0
+  while t < g {
+    defs.push(elSpan(tyS.entS[t], tyS.entE[t]))
+    ixOf[tyKey[t]] = t
+    t = t + 1
+  }
+  const table = elBandTable()
+  const bandOf = elBandRanks(table)
+  const tyDone: boolean[] = []
+  while tyDone.length < g { tyDone.push(false) }
+  const bandDone: { [string]: boolean } = Map()
+  for a in arts {
+    elDemand(a, elArtPieces(a), defs, ixOf, bandOf, tyDone, bandDone)
+  }
+  const rt = prog.runtime
+  const ps = elArtPieces(rt)
+  for f in prog.tail { elFnPieces(f, ps) }
+  for x in rt.sigs { ps.push(x) }
+  for x in rt.tags { ps.push(x) }
+  for x in prog.secs { ps.push(x.b) }
+  elDemand(rt, ps, defs, ixOf, bandOf, tyDone, bandDone)
+  t = 0
+  while t < g {
+    if !tyDone[t] {
+      rt.tys.push({ key: tyKey[t], rank: typeOrderOldOf(t), def: defs[t] })
+    }
+    t = t + 1
+  }
+  for e in table {
+    if !(bandDone[e.key + "@" + i32ToStr(e.rank)] ?? false) { rt.bands.push(e) }
+  }
+  0
+}
+
+function elArtPieces(a: LinkArt): LinkPiece[] {
+  const ps: LinkPiece[] = []
+  for f in a.fns { elFnPieces(f, ps) }
+  for c in a.cells { ps.push(c.entry) }
+  for c in a.consts { ps.push(c) }
+  for c in a.defs { ps.push(c.entry) }
+  ps
+}
+
+function elFnPieces(f: LinkFn, ps: LinkPiece[]) {
+  ps.push(f.ty)
+  ps.push(f.sig)
+  ps.push(f.body)
+  ps.push(f.thunkTy)
+  ps.push(f.thunkBody)
+  0
+}
+
+// Notes on `a` every group type `ps` names, in first-reference order with each definition's
+// own references followed, and every tag-band entry; marks each as named somewhere.
+function elDemand(
+  a: LinkArt,
+  ps: LinkPiece[],
+  defs: LinkPiece[],
+  ixOf: { [string]: i32 },
+  bandOf: { [string]: i32 },
+  tyDone: boolean[],
+  bandDone: { [string]: boolean },
+) {
+  const seen: boolean[] = []
+  while seen.length < defs.length { seen.push(false) }
+  const bandSeen: { [string]: boolean } = Map()
+  const stack: LinkPiece[] = []
+  let pi = ps.length - 1
+  while pi >= 0 {
+    stack.push(ps[pi])
+    pi = pi - 1
+  }
+  while stack.length > 0 {
+    const b = stack.pop()
+    const next: LinkPiece[] = []
+    for r in b.refs {
+      if r.kind == LK_TYPE || r.kind == LK_HEAP {
+        const t = ixOf[r.key] ?? -1
+        if t >= 0 && !seen[t] {
+          seen[t] = true
+          tyDone[t] = true
+          a.tys.push({ key: r.key, rank: typeOrderOldOf(t), def: defs[t] })
+          next.push(defs[t])
+        }
+      } else if r.kind == RS_TAG {
+        const rk = bandOf[r.key] ?? -1
+        const id = r.key + "@" + i32ToStr(rk)
+        if rk >= 0 && !(bandSeen[id] ?? false) {
+          bandSeen[id] = true
+          bandDone[id] = true
+          a.bands.push({ key: r.key, rank: rk })
+        }
+      }
+    }
+    let ni = next.length - 1
+    while ni >= 0 {
+      stack.push(next[ni])
+      ni = ni - 1
+    }
+  }
+  0
+}
+
+// Every tag-band entry, by key and rank: each variant, ref-list slot, map value slot and
+// closure signature the program holds.
+function elBandTable(): LinkBand[] {
+  const out: LinkBand[] = []
+  let vi = 0
+  for _v in uVariants {
+    out.push({ key: "v:" + variantTagKey(vi), rank: vi })
+    vi = vi + 1
+  }
+  let ri = 0
+  for nm in rlElemName {
+    out.push({ key: "rl:" + nm, rank: ri })
+    ri = ri + 1
+  }
+  let mi = 0
+  for nm in mvValName {
+    out.push(
+      { key: "map:" + i32ToStr(elAt(mvKeyKind, mi)) + ":" + nm, rank: mi },
+    )
+    mi = mi + 1
+  }
+  let ci = 0
+  for nm in cloSigTagNames {
+    out.push({ key: "clo:" + nm, rank: ci })
+    ci = ci + 1
+  }
+  out
+}
+
+// The rank a tag key resolves through: the first entry of its band with that key, a closure
+// signature's past slot 0. A value-atom code or the mono map arm has none.
+function elBandRanks(table: LinkBand[]): { [string]: i32 } {
+  const out: { [string]: i32 } = Map()
+  for e in table {
+    const clo0 = e.rank == 0 && elHasPrefix(e.key, "clo:")
+    if !clo0 && (out[e.key] ?? -1) < 0 { out[e.key] = e.rank }
+  }
+  out
 }

@@ -38,6 +38,9 @@ let tEnd: i32[] = []
 let tEdit: i32[] = []
 let tSuper: i32[] = []
 let groupSize = 0
+// Every subtype of the type section, the first group's and the standalone ones, by its bytes.
+let aStart: i32[] = []
+let aEnd: i32[] = []
 
 // Per new type index, the index the emitter minted; empty when the module kept its order.
 let typeOrderOld: i32[] = []
@@ -96,6 +99,8 @@ function toClear() {
   tEdit = []
   tSuper = []
   groupSize = 0
+  aStart = []
+  aEnd = []
   0
 }
 
@@ -126,7 +131,9 @@ function pushEdit(at: i32, len: i32, kind: i32, v: i32) {
 // ── reading ─────────────────────────────────────────────────────────────────
 
 // Records every edit of `b` and the first group's entries; false when `b` does not decode.
-function toScan(b: u8[]): boolean {
+function toScan(b: u8[]): boolean { toScanAll(b) && groupSize > 0 }
+
+function toScanAll(b: u8[]): boolean {
   toClear()
   const c = wcNew(b, 0, b.length)
   wcPreamble(c)
@@ -150,7 +157,49 @@ function toScan(b: u8[]): boolean {
     if c.failed || c.pos != secEnd { return false }
     c.end = b.length
   }
-  !c.failed && groupSize > 0
+  !c.failed
+}
+
+// Where module `b` names a type: each LEB's offset, width, whether it is a heap or block
+// type (an s33) rather than a type index, and its value; then each subtype's byte span and
+// how many of them the first recursion group holds. Empty when `b` does not decode.
+export type TypeSites = {
+  at: i32[],
+  len: i32[],
+  heap: boolean[],
+  val: i32[],
+  entS: i32[],
+  entE: i32[],
+  group: i32,
+}
+
+export function typeSitesOf(b: u8[]): TypeSites {
+  const out: TypeSites = {
+    at: [],
+    len: [],
+    heap: [],
+    val: [],
+    entS: [],
+    entE: [],
+    group: 0,
+  }
+  if toScanAll(b) {
+    let k = 0
+    while k < ePos.length {
+      if eKind[k] != EK_SIZE {
+        out.at.push(ePos[k])
+        out.len.push(eLen[k])
+        out.heap.push(eKind[k] == EK_HEAP)
+        out.val.push(eVal[k])
+      }
+      k = k + 1
+    }
+    out.entS = aStart
+    out.entE = aEnd
+    out.group = groupSize
+  }
+  toClear()
+  out
 }
 
 function siteIdx(c: WasmCursor) {
@@ -241,6 +290,7 @@ function scanTypes(c: WasmCursor) {
 
 // One subtype; `inGroup` records its bytes and supertype as an entry of the first group.
 function scanSubType(c: WasmCursor, inGroup: boolean) {
+  aStart.push(c.pos)
   if inGroup {
     tStart.push(c.pos)
     tEdit.push(ePos.length)
@@ -286,6 +336,7 @@ function scanSubType(c: WasmCursor, inGroup: boolean) {
     wcFail(c)
   }
   if inGroup { tEnd.push(c.pos) }
+  aEnd.push(c.pos)
   0
 }
 
@@ -536,15 +587,24 @@ function toChoose(): i32[] {
     }
     k = k + 1
   }
+  typeOrderChoose(nu, ns, tSuper)
+}
+
+// The reorder of a group whose type `t` has `nu[t]` index and `ns[t]` heap references and
+// supertype `sup[t]` (-1 for none), as the old index of each new slot; empty when the three
+// lists disagree in length.
+export function typeOrderChoose(nu: i32[], ns: i32[], sup: i32[]): i32[] {
+  const g = nu.length
+  if ns.length != g || sup.length != g { return [] }
   const picked: boolean[] = []
-  while picked.length < groupSize { picked.push(false) }
+  while picked.length < g { picked.push(false) }
   const top: i32[] = []
   let want = 128
-  if groupSize < want { want = groupSize }
+  if g < want { want = g }
   while top.length < want {
     let best = -1
     let i = 0
-    while i < groupSize {
+    while i < g {
       if !picked[i] && (best < 0 || nu[i] + ns[i] > nu[best] + ns[best]) {
         best = i
       }
@@ -567,25 +627,26 @@ function toChoose(): i32[] {
     a = a + 1
   }
   let r = 0
-  while r < groupSize {
+  while r < g {
     if !picked[r] { top.push(r) }
     r = r + 1
   }
-  toPlaceSupersFirst(top)
+  toPlaceSupersFirst(top, sup)
 }
 
 // `want` with each type's chain of unplaced supertypes moved directly ahead of it.
-function toPlaceSupersFirst(want: i32[]): i32[] {
+function toPlaceSupersFirst(want: i32[], sup: i32[]): i32[] {
+  const g = sup.length
   const placed: boolean[] = []
-  while placed.length < groupSize { placed.push(false) }
+  while placed.length < g { placed.push(false) }
   const out: i32[] = []
   let i = 0
   while i < want.length {
     const chain: i32[] = []
     let t = want[i]
-    while t >= 0 && t < groupSize && !placed[t] && chain.length <= groupSize {
+    while t >= 0 && t < g && !placed[t] && chain.length <= g {
       chain.push(t)
-      t = tSuper[t]
+      t = sup[t]
     }
     let k = chain.length - 1
     while k >= 0 {

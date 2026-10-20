@@ -167,13 +167,13 @@ on program behaviour instead.
    step that reads only per-module bodies, symbol tables and rows. Gates: identity, the
    fixpoint, and linked output equal to direct output on the self-build and every case.
    The step is taken in two halves:
-   - **3a.** (In review, §10.) Functions, globals, pooled strings, atoms, closure slots and
+   - **3a.** (Landed, §10.) Functions, globals, pooled strings, atoms, closure slots and
      init guards are assigned at link from their symbols, and union tags are resolved from
      their keys against the program's band tables. The type, import, memory, tag and data
      sections pass through as program-level input.
-   - **3b.** The type section and the tag band tables are built at link from per-module
-     demands, so that no section passes through whole. This is where step 4's local
-     numbering starts to be possible.
+   - **3b.** (In review, §11.) The type section and the tag band tables are built at link
+     from per-module demands, so that no section passes through whole. This is where step
+     4's local numbering starts to be possible.
 4. **Per-module emission.** Emit each module's bodies against local numbering, with
    instances as demands (§4), still inside one compile and still linked at once. Gates:
    identity and the fixpoint, plus a **key-coverage test**. One module compiled under two
@@ -356,7 +356,8 @@ definitions, its initialiser constants, its init guards, and its pooled and `is`
   among the variant keys, a scalar code above them, and a slot-band arm by its position.
 
 The type, import, memory, tag, data and datacount sections still pass through whole, and so
-do the band tables. Step 3b builds them at link from per-module demands.
+do the band tables. Step 3b (§11) builds the type and tag sections and the band tables at
+link from per-module demands.
 
 | build | rows | sections differ | bodies differ | unconsumed rows | exit |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -386,3 +387,71 @@ seed on this source 109,250,019,312 (+0.000003%), so the compiler is no slower o
 program and the cost is its own larger source. Before #4186 mixed the write scan's key, the
 same source read +2.32%, and ablations of it did not add up: linear probing over a clustered
 key made a few added declarations cost out of proportion.
+
+## 11. Step 3b: types and tag bands from demands
+
+Under `RELOC_ARMED`, no section that names a type passes through whole any more. The split
+cuts every type site (`typeSitesOf`, `emit_type_order.vl`) into a reference by key, and each
+artifact records what it demands:
+
+- **group types** (`LinkArt.tys`): every heap type of the recursion group that its pieces
+  name, closed over the definitions those types name, each with its key, its rank in mint
+  order and its definition with every type it names cut;
+- **band entries** (`LinkArt.bands`): every variant, ref-list slot, map value slot and
+  closure signature that one of its tag rows names, with its rank in its band;
+- **signatures**: a function's own standalone signature travels on the function
+  (`LinkFn.sig`). The runtime artifact carries the runtime's signatures and the tag
+  section's entries.
+
+The runtime artifact also takes every group type and band entry that no module names, so
+each still holds its index. In the self-build, 39 ref-list and 16 map slots are named by no
+tag row, and they still occupy band positions.
+
+`link()` dedupes the demands by key. A key met twice with a different rank or definition
+counts as defined twice. The link then:
+
+- places the group in mint-rank order, and when it holds more than 64 types, reorders it by
+  reference counts over the linked module (`typeOrderChoose`, the choice `typeOrderRun`
+  makes, now shared);
+- numbers the standalone signatures after the group: the functions' own in function order,
+  then the runtime's;
+- builds the variant, ref-list, map and closure bands by rank, and resolves every tag
+  against them.
+
+Only the import, memory and data sections pass through.
+
+**What stays whole-program.** The mint rank and the value-atom band's top
+(`uAtomBandTop`) are still read from the whole-program build. A probe of first-demand order
+showed that the mint order cannot be recovered from the artifacts. Taken in first-demand
+order over the self-build, the mint rank falls 69 times among 152 struct types, 12 times
+among the 36 of each ref wrapper and 3 times among 8 variants. Step 4 has to settle both facts, for example by keying the rank on
+canonical structure.
+
+| build | rows | sections differ | bodies differ | unconsumed rows | exit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| self-build | 18,742 | 0 | 0 | 0 | 0 |
+| self-build, skewed twin | 18,742 | 0 | 0 | 0 | 0 |
+| tests/cases, 4,669 modules | 44,524 | 0 | 0 | 0 | 0 |
+| tests/cases, skewed twin | 44,524 | 0 | 0 | 0 | 0 |
+
+The artifacts equal the twin's in every pair: 1 in the self-build and 4,669 in tests/cases.
+Nothing is unresolved, defined twice or undecodable.
+
+Three new controls must red, and do (self-build):
+
+- **dropping one group type's demand** (type index 5): 37,767 references
+  unresolved, 4 sections and 7,832 bodies differ;
+- **reversing the link's type-index assignment**: 4 sections and all 13,312 bodies differ;
+- **dropping the demand for one band entry** (rank 1): the code section and 4,217 bodies
+  differ, every tag above it one lower.
+
+Disarmed, output is unchanged: difftree `--identity` reads 0 of 10,951 builds differing, and
+the candidate compiling master's source equals master's fixpoint.
+
+Cost: seed 6,580,170 → 6,607,976 bytes (+0.42%). L2 guest fuel at #4190:
+
+- the master seed on its own source: 109,478,870,859;
+- the master seed on this source: 109,862,407,810 (+0.35%);
+- the new seed on this source: 109,863,131,568 (+0.0007%).
+
+The compiler is no slower on a given program, and the cost is its own larger source.
