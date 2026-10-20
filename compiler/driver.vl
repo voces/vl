@@ -168,6 +168,7 @@ import {
   docCmtLine,
   docCmtMod,
   docCmtText,
+  redunHeldSwap,
   scopeResConst,
   scopeResKind,
   scopeResName,
@@ -325,9 +326,12 @@ import {
   checkProgram,
   checkProgramResumed,
   expInfSetEntryStd,
+  pinAdoptUndid,
 } from "./check_pins"
+import { wsRefusalUndid } from "./check_width"
 import { demangleSpelling, nameIdentChar, skipQuotedName } from "./tyname"
 import {
+  diagKeyDrops,
   initChecker,
   memSharedCalls,
   plusLinkCount,
@@ -1449,6 +1453,7 @@ export function checkSrc(): i32 {
   wiServedLast = false
   wiBankedKeys = []
   wiBankedMods = []
+  wiBankedHolds = []
   wiSrvDiags = []
   wiSrvRc = 0
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
@@ -6508,9 +6513,9 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
 }
 
 // ── serving one invocation's targets from an importer's check (`wiArm`) ─────────────────────
-// An importer's check banks each target whose own check cannot differ: nothing outside its
-// import closure G reaches G (`wiGuard`), and G holds every type error (D7801). A later check
-// of that target over the same sources is served the banked diagnostics, rc and lint sites.
+// An importer's check banks each target whose own check cannot differ (`wiGuard`, D7940), and a
+// later check of that target over the same sources is served the banked diagnostics, rc and
+// lint sites.
 const WI_SERVED = 0
 const WI_UNSEEN = 1
 const WI_DIRTY = 2
@@ -6548,6 +6553,9 @@ let wiSrvRc = 0
 let wiDirtyNow = false
 let wiDiagMods: i32[] = []
 let wiDiagMsgs: string[] = []
+// Why this pass serves no target an error lies outside of, or "": an error-driven undo of a
+// rewrite, or a refusal dropped as the repeat of one keyed beyond its module.
+let wiOutsideWhy = ""
 let wiOn = false
 let wiMask = 0
 // Whether `wiArm` armed the interface hashes, so a check needs only their statement table.
@@ -6578,6 +6586,9 @@ let wiCulpritName = ""
 let wiServedLast = false
 let wiBankedKeys: string[] = []
 let wiBankedMods: i32[] = []
+// Per banked target: true when it is clean and its check had errors, so its redundant-annotation
+// rows are the withheld ones (`wiBankedHeld`).
+let wiBankedHolds: boolean[] = []
 // Read once per bank pass, for every guard of it: each module's direct imports, the check's
 // fresh deliveries and its write questions.
 let wiDeps: i32[][] = []
@@ -6605,6 +6616,7 @@ const WI_NO_TWIN = 512
 const WI_NO_KEPT = 1024
 const WI_NO_CALLED = 2048
 const WI_NO_DIAG_NAMES = 4096
+const WI_NO_OUTSIDE = 8192
 // The delivery flags whose judgement reads every site of the value: kept, or site-counted.
 const WI_COUNTED = 5
 
@@ -6719,6 +6731,10 @@ export function wiServed(): boolean { wiServedLast }
 export function wiBankedCount(): i32 { wiBankedKeys.length }
 export function wiBankedKey(i: i32): string { wiBankedKeys[i] }
 export function wiBankedMod(i: i32): i32 { wiBankedMods[i] }
+// Whether banked target `i` reads its redundant-annotation rows through `wiHeldSwap`.
+export function wiBankedHeld(i: i32): boolean { wiBankedHolds[i] }
+// Trade the reported redundant-annotation rows with the withheld ones; call it again to undo.
+export function wiHeldSwap(): i32 { redunHeldSwap() }
 
 // The served check's type diagnostics, in its own check's order: how many, and row `i`'s
 // module index in this graph, span and message.
@@ -6793,10 +6809,15 @@ function wiServe(): boolean {
 
 // After a whole module check with no parse errors: bank every pending target the graph holds
 // as a module other than the entry, when `wiGuard` finds its own check could not differ. A
-// check with type errors never runs the deep-`is` pass, and neither does the target's own.
+// check with type errors never runs the deep-`is` pass, and neither does a target's own check
+// when its closure holds one of them (`wiDeepIsIn`).
 function wiBankWhole(roots: i32[]): i32 {
   wiDirtyNow = T.diags.length > 0
   wiDiagMods = []
+  wiOutsideWhy = ""
+  if pinAdoptUndid { wiOutsideWhy = "(adoption undone)" }
+  if wsRefusalUndid { wiOutsideWhy = "(width rewrite undone)" }
+  if diagKeyDrops > 0 { wiOutsideWhy = "(repeat refusal dropped)" }
   const placed = !wiDirtyNow || wiDiagsPlaced()
   const clean = P.diags.length == 0
     && (wiDirtyNow || jwSiteNode.length == 0)
@@ -6855,7 +6876,11 @@ function wiDiagsPlaced(): boolean {
 // Whether an error message names a type declared outside `inG`, the one way an outside
 // declaration reaches the text of an error placed in G: a type renders by a declared name.
 function wiDiagNamesOut(inG: boolean[]): boolean {
-  for msg in wiDiagMsgs {
+  let k = 0
+  while k < wiDiagMsgs.length {
+    const msg = wiDiagMsgs[k]
+    k = k + 1
+    if !inG[wiDiagMods[k - 1]] { continue }
     let i = 0
     while i < msg.length {
       let j = i
@@ -6964,14 +6989,22 @@ function wiClosure(t: i32): boolean[] {
 }
 
 // Why module `t`'s own check may differ from this check's reading of its closure G, or `WI_SERVED`:
-// an entry-only rule reads it; an import into G is not shut (`wiDemandShut`); a fresh
-// value of G crosses its edge; a name G asked about is written or used outside it; an ambient
-// statement outside meets G's words; or G asked about a body outside it.
+// an error outside G may have changed G (`wiOutsideWhy`); an entry-only rule reads it; an import is
+// not shut; a fresh value crosses G's edge; a name G asked about is written or used outside it; an
+// ambient statement outside meets G's words; or G asked about a body outside it.
 function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
   const inG = wiClosure(t)
+  let mine = 0
   for m in wiDiagMods {
-    if !inG[m] {
-      wiCulpritName = "(error in " + modKeys[m] + ")"
+    if inG[m] { mine = mine + 1 }
+  }
+  if mine < wiDiagMods.length && (wiMask & WI_NO_OUTSIDE) == 0 {
+    if wiOutsideWhy != "" {
+      wiCulpritName = wiOutsideWhy
+      return WI_DIRTY
+    }
+    if mine == 0 && wiDeepIsIn(inG) {
+      wiCulpritName = "(deep is)"
       return WI_DIRTY
     }
   }
@@ -7037,6 +7070,16 @@ function wiRowsIn(t: i32): boolean {
   while i < expInfCount() {
     if expInfModuleAt(i) == t { return true }
     i = i + 1
+  }
+  false
+}
+
+// Whether a deep-`is` site lies in `inG`: a check with errors never runs that pass, and a
+// closure with none of them would.
+function wiDeepIsIn(inG: boolean[]): boolean {
+  for nd in jwSiteNode {
+    const m = skNodeMod(nd)
+    if m < 0 || m >= inG.length || inG[m] { return true }
   }
   false
 }
@@ -7269,7 +7312,8 @@ function wiAsksOut(inG: boolean[]): boolean {
   false
 }
 
-// Bank target module `t`: its closure's keys and sources, and each one's lint sites.
+// Bank target module `t`: its closure's keys and sources, each one's lint sites, and the errors
+// placed in the closure, with rc 2 when there are any.
 function wiBankOne(t: i32): i32 {
   const inG = wiClosure(t)
   const b: WiBank = {
@@ -7281,22 +7325,24 @@ function wiBankOne(t: i32): i32 {
     wDiags: [],
     wRc: 0,
   }
-  if wiDirtyNow { b.wRc = 2 }
   let j = 0
   while wiDirtyNow && j < T.diags.length {
     const i = P.diags.length + j
-    b.wDiags.push(
-      {
-        dKey: modKeys[wiDiagMods[j]],
-        dLine: diagLine(i),
-        dCol: diagCol(i),
-        dEndLine: diagEndLine(i),
-        dEndCol: diagEndCol(i),
-        dMsg: wiDiagMsgs[j],
-      },
-    )
+    if inG[wiDiagMods[j]] {
+      b.wDiags.push(
+        {
+          dKey: modKeys[wiDiagMods[j]],
+          dLine: diagLine(i),
+          dCol: diagCol(i),
+          dEndLine: diagEndLine(i),
+          dEndCol: diagEndCol(i),
+          dMsg: wiDiagMsgs[j],
+        },
+      )
+    }
     j = j + 1
   }
+  if b.wDiags.length > 0 { b.wRc = 2 }
   let m = 0
   while m < modKeys.length {
     if inG[m] {
@@ -7312,6 +7358,7 @@ function wiBankOne(t: i32): i32 {
   wiBanks[modKeys[t]] = b
   wiBankedKeys.push(modKeys[t])
   wiBankedMods.push(t)
+  wiBankedHolds.push(wiDirtyNow && b.wRc == 0)
   0
 }
 

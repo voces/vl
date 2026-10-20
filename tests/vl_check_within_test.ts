@@ -179,7 +179,12 @@ const run = (g: Graph, mask = 0): Record<string, Verdict> => {
       lint: [] as string[],
     };
     for (let i = 0; i < sh.wiBankedCount(); i++) {
+      // As the CLI reads them: a target banked clean from a check with errors swaps in the
+      // redundant-annotation rows that check withheld.
+      const held = Boolean(sh.wiBankedHeld(i));
+      if (held) sh.wiHeldSwap();
       banked[keys[sh.wiBankedMod(i)]] = streamRows(sh, sh.wiBankedMod(i));
+      if (held) sh.wiHeldSwap();
     }
     mine.lint = lintRows(sh);
     const f = fresh();
@@ -228,10 +233,11 @@ const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(
 
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
-const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096;
+const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096, NO_OUTSIDE = 8192;
 
-// The fresh guard, the asks guard and the ambient guard's arena half have no mask witness: no
-// graph found shows a served answer that differs once they are dropped, so they are defensive.
+// The fresh guard, the asks guard, the ambient guard's arena half and the outside guard's undo
+// halves have no mask witness: no graph found shows a served answer that differs once they are
+// dropped, so they are defensive.
 // The twin, called-generic and narrowed ambient keys carry must-serve and must-decline controls.
 const CASES: Case[] = [
   {
@@ -588,14 +594,67 @@ const CASES: Case[] = [
     want: "dirty",
   },
   {
-    name: "an error outside G declines the target",
+    name: "an error outside G is not the target's and is served without it",
     graph: {
       "main.vl": 'import { g } from "./mid"\nconst s: string = g(1)\nprint(s)\n',
       "mid.vl": 'import { f } from "./lib"\nexport function g(x: i32): i32 { f(x) * 2 }\n',
       "lib.vl": "export function f(x: i32): i32 { x + 1 }\n",
     },
     target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "a redundant annotation in G beside an error outside it is served with its hint",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nconst s: string = g(1)\nprint(s)\n',
+      "mid.vl": "export function g(x: i32): i32 {\n  const k: i32 = 2\n  x * k\n}\n",
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "a generic instance G shares with an erroring call outside it is served",
+    graph: {
+      "main.vl": 'import { dbl } from "./lib"\nimport { m } from "./mid"\n' +
+        'print(dbl("s"))\nprint(m())\n',
+      "mid.vl": 'import { dbl } from "./lib"\nexport function m(): i32 { dbl("t") }\n',
+      "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
+    },
+    target: "mid.vl",
+    want: "served",
+  },
+  {
+    name: "a refusal G repeats, reported once from outside G, declines the target",
+    graph: {
+      "main.vl": 'import { z } from "./a"\nimport { g } from "./mid"\nprint(z + g())\n',
+      "a.vl": "type U = Set<string> | {[string]: boolean}\nexport const z = 1\n",
+      "mid.vl": "type U = Set<string> | {[string]: boolean}\nexport function g(): i32 { 1 }\n",
+    },
+    target: "mid.vl",
     want: "dirty",
+    mask: NO_OUTSIDE,
+  },
+  {
+    name: "an adoption an outside error undoes declines the target",
+    graph: {
+      "main.vl": 'import { g } from "./mid"\nconst s: string = g()\nprint(s)\n',
+      "mid.vl": "type B = { r: i32 | null }\nconst q = { r: 7 }\nconst d: B | string = q\n" +
+        "export function g(): i32 { q.r ?? 0 }\n",
+    },
+    target: "mid.vl",
+    want: "dirty",
+  },
+  {
+    name: "a deep-is site in a clean G beside an error outside it declines the target",
+    graph: {
+      "main.vl": 'import { d } from "./mid"\nconst s: string = d(null)\nprint(s)\n',
+      "mid.vl": "type Json = null | boolean | f64 | string | Json[] | { [string]: Json }\n" +
+        "export function d(r: Json): i32 {\n  if r is string[] {\n    const n = r[0].length\n" +
+        "    r = null\n    return n\n  }\n  0\n}\n",
+    },
+    target: "mid.vl",
+    want: "dirty",
+    mask: NO_OUTSIDE,
   },
   {
     name: "a warning-only target is served with its rows",
@@ -617,7 +676,7 @@ const CASES: Case[] = [
       "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
     },
     target: "mid.vl",
-    want: "dirty",
+    want: "served",
   },
   {
     name: "an error in G that renders a union by an outside declaration's name is not banked",
@@ -648,7 +707,7 @@ const CASES: Case[] = [
       "lib.vl": "export function dbl<T>(v: T): i32 { v * 2 }\n",
     },
     target: "mid2.vl",
-    want: "dirty",
+    want: "served",
   },
   {
     name: "an instance error at a call inside G is G's own and is served",
