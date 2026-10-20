@@ -1,55 +1,59 @@
-// Records where a body writes an index a decoder cannot tell from a constant: a union tag, a
-// literal-union atom, a closure's table slot or an init-guard row, each an `i32.const`. Armed
-// only when `RELOC_ARMED` is flipped in a scratch build; disarmed, every entry point returns at
-// once and the module is unchanged. An armed compile appends a `vl.reloc` custom section of
-// (module offset, space, value) rows. docs/internals/s5-per-module-artifacts.md.
+// Records where the module writes an index a decoder cannot tell from a constant: a union tag, a
+// literal-union atom, a closure's table slot or an init-guard row, as an `i32.const` in a body or
+// a global initialiser. Armed only when `RELOC_ARMED` is flipped in a scratch build; disarmed,
+// every entry point returns at once and the module is unchanged. An armed compile appends a
+// `vl.reloc` custom section. docs/internals/s5-per-module-artifacts.md.
 
 import { curBuf } from "./emit_state"
 
 export const RELOC_ARMED = false
+// The `vl.reloc` layout written: a symbol table, then rows naming a symbol each.
+export const RELOC_VERSION = 2
 
 // The spaces a row names; the decodable spaces are found by reading the body instead.
 export const RS_TAG = 1
 export const RS_ATOM = 2
 export const RS_SLOT = 3
 export const RS_GUARD = 4
+export const RS_GNAME = 5
+export const RS_GREAD = 6
+
+// One row: who holds it (a buffer, held buffer or section id, by table), its offset there, its
+// space, the subject its symbol is named from, and its value.
+type RelRow = { ent: i32, off: i32, sp: i32, sub: i32, val: i32 }
 
 // The buffers holding a pending row, told apart by an alias probe since a list has no identity.
 let rbBuf: u8[][] = []
-// Pending rows of the body being written: owning buffer, offset in it, space and value.
-let pEnt: i32[] = []
-let pOff: i32[] = []
-let pSp: i32[] = []
-let pVal: i32[] = []
+// Rows of the body being written, by `rbBuf` entry.
+let pend: RelRow[] = []
+// Buffers whose rows outlive body placement (global initialisers), and their rows.
+let hBuf: u8[][] = []
+let held: RelRow[] = []
+// Rows of a section framed out of order, by section id and payload offset.
+let secRows: RelRow[] = []
 // Placed rows: code-payload offsets until `relRebase`, module offsets after it.
-let relOff: i32[] = []
-let relSp: i32[] = []
-let relVal: i32[] = []
-// The row a folded const's banked bytes carry, by global: its space (0 for none) and value.
-let foldSp: i32[] = []
-let foldVal: i32[] = []
+let placed: RelRow[] = []
+// The row a folded const's banked bytes carry, by global (space 0 for none).
+let fold: RelRow[] = []
 
 export function relReset() {
   rbBuf = []
-  pEnt = []
-  pOff = []
-  pSp = []
-  pVal = []
-  relOff = []
-  relSp = []
-  relVal = []
-  foldSp = []
-  foldVal = []
+  pend = []
+  hBuf = []
+  held = []
+  secRows = []
+  placed = []
+  fold = []
   0
 }
 
-// The registry slot of `buf`, or -1. A byte pushed onto `buf` lengthens exactly the entries it aliases.
-function rbFind(buf: u8[]) {
-  let i = rbBuf.length - 1
+// The slot of `buf` in `bufs`, or -1. A byte pushed onto `buf` lengthens exactly the entries it aliases.
+function bufFind(bufs: u8[][], buf: u8[]) {
+  let i = bufs.length - 1
   while i >= 0 {
-    const n = rbBuf[i].length
+    const n = bufs[i].length
     buf.push(0)
-    const hit = rbBuf[i].length != n
+    const hit = bufs[i].length != n
     buf.pop()
     if hit { return i }
     i = i - 1
@@ -58,38 +62,53 @@ function rbFind(buf: u8[]) {
 }
 
 function rbOf(buf: u8[]) {
-  const i = rbFind(buf)
+  const i = bufFind(rbBuf, buf)
   if i >= 0 { return i }
   rbBuf.push(buf)
   rbBuf.length - 1
 }
 
-function pendPush(e: i32, off: i32, sp: i32, v: i32) {
-  pEnt.push(e)
-  pOff.push(off)
-  pSp.push(sp)
-  pVal.push(v)
+function rowAt(r: RelRow, ent: i32, off: i32): RelRow {
+  { ent: ent, off: off, sp: r.sp, sub: r.sub, val: r.val }
+}
+
+// Notes that the LEB starting `ahead` bytes past the current buffer's end carries `v` of `sp`,
+// whose symbol is named from `sub`.
+export function relNote(sp: i32, ahead: i32, sub: i32, v: i32) {
+  if !RELOC_ARMED { return 0 }
+  pend.push(
+    { ent: rbOf(curBuf), off: curBuf.length + ahead, sp: sp, sub: sub, val: v },
+  )
   0
 }
 
-// Notes that the LEB starting `ahead` bytes past the current buffer's end carries `v` of `sp`.
-export function relNote(sp: i32, ahead: i32, v: i32) {
-  if !RELOC_ARMED { return 0 }
-  pendPush(rbOf(curBuf), curBuf.length + ahead, sp, v)
+// The rows of `buf`, pending or held, at their offsets in it.
+function rowsOf(buf: u8[]): RelRow[] {
+  const out: RelRow[] = []
+  const s = bufFind(rbBuf, buf)
+  let k = 0
+  while s >= 0 && k < pend.length {
+    if pend[k].ent == s && pend[k].off < buf.length { out.push(pend[k]) }
+    k = k + 1
+  }
+  const h = bufFind(hBuf, buf)
+  k = 0
+  while h >= 0 && k < held.length {
+    if held[k].ent == h { out.push(held[k]) }
+    k = k + 1
+  }
+  out
 }
 
 // Copies the rows of `src` onto `dst`, whose byte `at` is where `src`'s first byte lands.
 export function relCopy(src: u8[], dst: u8[], at: i32) {
-  if !RELOC_ARMED || pEnt.length == 0 { return 0 }
-  const s = rbFind(src)
-  if s < 0 { return 0 }
+  if !RELOC_ARMED || pend.length + held.length == 0 { return 0 }
+  const rs = rowsOf(src)
+  if rs.length == 0 { return 0 }
   const d = rbOf(dst)
-  const n = pEnt.length
   let k = 0
-  while k < n {
-    if pEnt[k] == s && pOff[k] < src.length {
-      pendPush(d, pOff[k] + at, pSp[k], pVal[k])
-    }
+  while k < rs.length {
+    pend.push(rowAt(rs[k], d, rs[k].off + at))
     k = k + 1
   }
   0
@@ -97,46 +116,91 @@ export function relCopy(src: u8[], dst: u8[], at: i32) {
 
 // Forgets the current buffer's rows past its end, once `wDropBack` has shortened it.
 export function relTrim() {
-  if !RELOC_ARMED || pEnt.length == 0 { return 0 }
-  const e = rbFind(curBuf)
+  if !RELOC_ARMED || pend.length == 0 { return 0 }
+  const e = bufFind(rbBuf, curBuf)
   if e < 0 { return 0 }
   let k = 0
-  while k < pEnt.length {
-    if pEnt[k] == e && pOff[k] >= curBuf.length { pEnt[k] = -1 }
+  while k < pend.length {
+    if pend[k].ent == e && pend[k].off >= curBuf.length { pend[k].ent = -1 }
+    k = k + 1
+  }
+  0
+}
+
+// Keeps the pending rows of `buf` past body placement, for a global initialiser framed later.
+export function relHold(buf: u8[]) {
+  if !RELOC_ARMED { return 0 }
+  const e = bufFind(rbBuf, buf)
+  if e < 0 { return 0 }
+  let h = bufFind(hBuf, buf)
+  if h < 0 {
+    hBuf.push(buf)
+    h = hBuf.length - 1
+  }
+  let k = 0
+  while k < pend.length {
+    if pend[k].ent == e && pend[k].off < buf.length {
+      held.push(rowAt(pend[k], h, pend[k].off))
+      pend[k].ent = -1
+    }
     k = k + 1
   }
   0
 }
 
 // Places the rows of code entry `entry`, which starts at payload offset `at`, and forgets the
-// rest: a row in any other buffer belonged to a probe or a rendering no body kept.
+// other pending rows: a row in any other buffer belonged to a probe or a rendering no body kept.
 export function relPlace(entry: u8[], at: i32) {
   if !RELOC_ARMED { return 0 }
-  const e = rbFind(entry)
-  if e >= 0 {
-    let k = 0
-    while k < pEnt.length {
-      if pEnt[k] == e && pOff[k] < entry.length {
-        relOff.push(pOff[k] + at)
-        relSp.push(pSp[k])
-        relVal.push(pVal[k])
-      }
-      k = k + 1
+  const e = bufFind(rbBuf, entry)
+  let k = 0
+  while e >= 0 && k < pend.length {
+    if pend[k].ent == e && pend[k].off < entry.length {
+      placed.push(rowAt(pend[k], 0, pend[k].off + at))
     }
+    k = k + 1
   }
   rbBuf = []
-  pEnt = []
-  pOff = []
-  pSp = []
-  pVal = []
+  pend = []
   0
 }
 
 // Moves every placed row by `base`, once the code payload's place in the module is known.
 export function relRebase(base: i32) {
   let k = 0
-  while k < relOff.length {
-    relOff[k] = relOff[k] + base
+  while k < placed.length {
+    placed[k].off = placed[k].off + base
+    k = k + 1
+  }
+  0
+}
+
+// Notes the rows of `parts`, the payload of section `sec` in order, for `relPlaceSection`.
+export function relSectionParts(sec: i32, parts: u8[][]) {
+  if !RELOC_ARMED { return 0 }
+  let at = 0
+  let i = 0
+  while i < parts.length {
+    const rs = rowsOf(parts[i])
+    let k = 0
+    while k < rs.length {
+      secRows.push(rowAt(rs[k], sec, rs[k].off + at))
+      k = k + 1
+    }
+    at = at + parts[i].length
+    i = i + 1
+  }
+  0
+}
+
+// Places the rows of section `sec`, whose payload starts at module offset `at`.
+export function relPlaceSection(sec: i32, at: i32) {
+  if !RELOC_ARMED { return 0 }
+  let k = 0
+  while k < secRows.length {
+    if secRows[k].ent == sec {
+      placed.push(rowAt(secRows[k], 0, secRows[k].off + at))
+    }
     k = k + 1
   }
   0
@@ -145,17 +209,13 @@ export function relRebase(base: i32) {
 // Banks the row at byte 1 of `one`, the single `*.const` global `gi` folds to.
 export function relFoldBank(one: u8[], gi: i32) {
   if !RELOC_ARMED { return 0 }
-  while foldSp.length <= gi {
-    foldSp.push(0)
-    foldVal.push(0)
+  while fold.length <= gi {
+    fold.push({ ent: 0, off: 0, sp: 0, sub: 0, val: 0 })
   }
-  const e = rbFind(one)
+  const rs = rowsOf(one)
   let k = 0
-  while e >= 0 && k < pEnt.length {
-    if pEnt[k] == e && pOff[k] == 1 {
-      foldSp[gi] = pSp[k]
-      foldVal[gi] = pVal[k]
-    }
+  while k < rs.length {
+    if rs[k].off == 1 { fold[gi] = rs[k] }
     k = k + 1
   }
   0
@@ -163,18 +223,19 @@ export function relFoldBank(one: u8[], gi: i32) {
 
 // Notes the banked row of global `gi` for the fold about to be written at the buffer's end.
 export function relFoldNote(gi: i32) {
-  if !RELOC_ARMED || gi < 0 || gi >= foldSp.length || foldSp[gi] == 0 {
+  if !RELOC_ARMED || gi < 0 || gi >= fold.length || fold[gi].sp == 0 {
     return 0
   }
-  relNote(foldSp[gi], 1, foldVal[gi])
+  relNote(fold[gi].sp, 1, fold[gi].sub, fold[gi].val)
 }
 
 // The placed rows, read by index; the tables stay private to this module.
-export function relCount() { relOff.length }
-export function relOffAt(k: i32) { relOff[k] }
-export function relSpAt(k: i32) { relSp[k] }
-export function relValAt(k: i32) { relVal[k] }
+export function relCount() { placed.length }
+export function relOffAt(k: i32) { placed[k].off }
+export function relSpAt(k: i32) { placed[k].sp }
+export function relSubAt(k: i32) { placed[k].sub }
+export function relValAt(k: i32) { placed[k].val }
 export function relSetOff(k: i32, off: i32) {
-  relOff[k] = off
+  placed[k].off = off
   0
 }
