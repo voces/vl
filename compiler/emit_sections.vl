@@ -239,6 +239,8 @@ import {
   caSeenUnSets,
   caSeenVariants,
   capMemoArmed,
+  cloAdapterCanon,
+  cloDeclAt,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
   cloSigBase,
@@ -268,6 +270,8 @@ import {
   emitPhase,
   emitRootIx,
   emitStateReset,
+  envCacheFes,
+  envCacheTys,
   externIdxAt,
   fRetRArrElem,
   fRetStructIdx,
@@ -582,6 +586,7 @@ import {
   fbI64Const,
   fbIf,
   fbIfRefNul,
+  fbImmutI32Field,
   fbLocalGet,
   fbLocalSet,
   fbLocalTee,
@@ -819,6 +824,7 @@ import {
   fnFlowShadowSweep,
 } from "./fn_flow_shadow"
 import { cloLiftScan, cloLifted } from "./emit_lift"
+import { criFnIsAnonLambda } from "./emit_local_scope"
 import { identAuditBegin, identAuditMark, identAuditRun } from "./ident_audit"
 import {
   armScopeOpenOver,
@@ -1327,6 +1333,40 @@ function rebaseStmtSpans(base: i32, bodyInOut: i32, exprInBody: i32) {
   }
 }
 
+// The functions each function declares directly, by enclosing function; built at the first body.
+let envCacheKids: {[i32]: i32[]} = Map()
+let envCacheKidsBuilt = false
+
+// Fills `envCacheFes`/`envCacheTys` for the body of function `fnPos`: the functions it declares
+// by statement that capture and are not lambda-lifted. A lambda is excluded, since each
+// evaluation of its expression is a new function value.
+function envCacheOpen(fnPos: i32) {
+  envCacheFes = []
+  envCacheTys = []
+  if !fnNestUsed || fnPos < 0 { return 0 }
+  if !envCacheKidsBuilt {
+    envCacheKidsBuilt = true
+    let fe = 0
+    while fe < fnParent.length && fe < fnStmts.length {
+      const p = fnParent[fe]
+      if p >= 0 {
+        const have = envCacheKids[p] ?? []
+        have.push(fe)
+        envCacheKids[p] = have
+      }
+      fe = fe + 1
+    }
+  }
+  for kid in envCacheKids[fnPos] ?? [] {
+    const ty = fnEnvIdxOf(kid)
+    if ty >= 0 && !cloLifted(kid) && !criFnIsAnonLambda(kid) {
+      envCacheFes.push(kid)
+      envCacheTys.push(ty)
+    }
+  }
+  0
+}
+
 // Builds the size-prefixed code-section body for the `FuncDecl` at `fnIx`: the locals vector
 // (declared locals, all i32), the body's statement instructions, then `end`. Framed bytes are
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
@@ -1339,6 +1379,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // the offending function; `fnPos` is the caller's own `fnStmts` loop index, which `fnStmtsPosOf` reads instead of scanning.
     emitCurFnIx = fnIx
     emitCurFnPos = fnPos
+    envCacheOpen(fnPos)
     // Replays the narrowing this frame's closure sits inside, for the whole body —
     // locals collection included, since a `const t = <captured narrowed read>` is typed from it.
     // Only a value-union-box capture is seeded, so a function capturing nothing narrowed emits
@@ -2388,6 +2429,7 @@ function emitStartFnCode(out: u8[]) {
   fnUsesUnionSink = false
   fnUsesUnionLetSink = false
   uSinkFired = 0
+  envCacheOpen(-1)
   fbBeginFunc(0, nStartLocals)
 
   const bodyExpr: u8[] = []
@@ -6231,6 +6273,10 @@ function emitModule(_stmts: i32[]) {
   gSynthArg = []
   gSynthInit = []
   gSynthAt = Map()
+  cloAdapterCanon = Map()
+  cloDeclAt = Map()
+  envCacheKids = Map()
+  envCacheKidsBuilt = false
 
   // Heap-type indices, in type-section order: standalone structs, then (for the union path)
   // the variant structs + box, the i32 array/list pair, each ref-list pair, the string-list
@@ -8328,18 +8374,18 @@ function tsU8List() {
 }
 
 function tsClosure() {
-  // The closure fat-pointer struct `{ env: (ref null struct), id: i32 }` — field 0 a nullable
-  // `structref` env (null when non-capturing), field 1 the lifted function's wasm index, both
-  // immutable. One closure struct serves every arity since the id is untyped; a call site
-  // supplies the concrete env-leading `$fnsig` as `call_indirect`'s type operand, trapping on mismatch. No `funcref` field: reading one back out of the GC heap is a costly host libcall, where an i32 field is a plain load.
+  // The closure fat-pointer struct `{ env: (ref null struct), id: i32, decl: i32 }`, all
+  // immutable: the env (null when non-capturing), the wasm index `call_indirect` dispatches on,
+  // and the index of the function standing for the source declaration, which with the env is
+  // the `==` identity. No `funcref` field: reading one back out of the GC heap is a host libcall.
   tsEntryAt(cloStructIdx, "closure")
-  wU8(95)  // 0x5f struct
-  wU8(2)   // 2 fields
-  wU8(99)  // field 0 env: 0x63 (ref null ht)
-  wU8(107) // ...to the abstract `struct` heaptype (structref)
-  wU8(0)   // immutable
-  wU8(127) // field 1 id: 0x7f i32 — identity token AND dispatch index
-  wU8(0)   // immutable
+  wU8(95)           // 0x5f struct
+  wU8(3)            // 3 fields
+  wU8(99)           // field 0 env: 0x63 (ref null ht)
+  wU8(107)          // ...to the abstract `struct` heaptype (structref)
+  wU8(0)            // immutable
+  fbImmutI32Field() // field 1 id, the dispatch index
+  fbImmutI32Field() // field 2 decl, the identity token
   0
 }
 
@@ -9238,6 +9284,8 @@ function frameGlobalSection() {
         gSynthArg[i],
         gImports + gSynthArg[i] + relSkew(RS_SLOT),
       )
+      const decl = cloDeclAt[gSynthArg[i]] ?? gSynthArg[i]
+      fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
       fbStructNew(ty)
     }
     fbEnd()

@@ -78,6 +78,7 @@ BEFORE column is `origin/master` at 9f11c9c9f; CORRECT SCOPE is what this change
 | `sentinel-index-unguarded` | INTERNAL | `docs/internals/sentinel-index-lint.md`; `scripts/sentinel-budget-baseline.json` (`vl check --budget`, targets `compiler`) | **none** | `compiler/` only |
 | `sentinel-index-strict-untested` | INTERNAL | as above (the `*Strict` naming convention is the compiler's) | **none** | `compiler/` only |
 | `literal-byte-write` | INTERNAL | `scripts/byte-budget-baseline.json` (`vl check --budget`, targets `compiler/entry.vl`); the `wU8` writer and `emit_bytes.vl` are the compiler's | **none** | `compiler/` only, not `compiler/emit_bytes.vl` |
+| `arena-slot-write` | INTERNAL | a direct `P.nodes[i] = n` skips the arena edit log that the write scan and the parse bank read (`arenaSetNode`/`arenaReplaceNode` in `ast.vl`); no baseline, it landed at zero | n/a (new) | `compiler/` only, not `compiler/ast.vl` |
 | `dead-export` | INTERNAL | `scripts/dead-exports.vl`; not emitted by `vl check` at all — the script writes a report that `vl check --budget --findings` counts | n/a | n/a (script-only) |
 | `unused-export` | LANGUAGE | editor workspace pass (`lsp/src/moduleGraph.ts`) | n/a | everywhere |
 | `redundant-export` | LANGUAGE | editor workspace pass | n/a | everywhere |
