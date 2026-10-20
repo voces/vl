@@ -1,30 +1,54 @@
 // `emit_union_tykey.vl` — the union registry's type key: an order-independent identity for a
-// row, minted beside its name key, and the shadow that compares it with the type each untyped
-// registration root could hand over. Nothing but the shadow reads it.
+// row, minted beside its name key; the adopt that binds an unregistered spelling to the row its
+// type keys to; and the shadow that compares the key with the type each untyped registration
+// root could hand over.
 
 import { i32ToStr } from "./ast"
 import { canonUnionMemberTysOf } from "./check_program"
-import { T, TyArray, tyToStructStr } from "./check_types"
+import { canonUnionKeyOfName } from "./check_nj_join"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  cUserTypes,
+  tyToStructStr,
+} from "./check_types"
 import { structIndexByName } from "./emit_atom_kinds"
 import { strLess } from "./emit_base"
-import { repShadowAddReason } from "./emit_rep"
+import { repShadowAddReason, unRowOfKey, unRowOfKeyId } from "./emit_rep"
 import {
   sTyIx,
   unKey,
+  unKeyAliasRow,
   unMemAtoms,
   unMemKinds,
   unMemTyCount,
   unMemTyStart,
   unMemTys,
+  unNames,
+  unRowBySid,
   unTyIx,
   unTyKey,
+  unTyKeyFirstRow,
 } from "./emit_state"
 import { TY_WALK_DEPTH } from "./emit_ty_canon"
 import {
   unABOn,
   unMemPeelAliasWrapper,
+  unNameBound,
   unRowOfName,
+  unionSetAtomsOfTy,
 } from "./emit_union_registry"
+import { sidArrPut, sidOf } from "./symbols"
 import { flattenVariantsInto } from "./tyquery"
 
 // Key texts to ids. Pure text identities, so the table lives across programs.
@@ -169,7 +193,20 @@ export function unTyKeyPushRow() {
   let id = -1
   if t != "" { id = utkIdOf(t) }
   unTyKey.push(id)
+  if id >= 0 {
+    while unTyKeyFirstRow.length <= id { unTyKeyFirstRow.push(-1) }
+    if unTyKeyFirstRow[id] < 0 { unTyKeyFirstRow[id] = unTyKey.length - 1 }
+  }
   0
+}
+
+// The first row whose type key is the key of type `ty`'s canonical members, or -1.
+export function unRowOfTyKey(ty: i32): i32 {
+  const t = utkTyKeyText(ty)
+  if t == "" { return -1 }
+  const id = utkIds[t] ?? -1
+  if id < 0 || id >= unTyKeyFirstRow.length { return -1 }
+  unTyKeyFirstRow[id]
 }
 
 // The shadow's roots, by tag. Each is a registration that holds a name and no type.
@@ -294,4 +331,142 @@ export function unTyKeyShadowSweep() {
   utkCnt = []
   utkNe = []
   0
+}
+
+// True when `name` names a row, after binding an unregistered spelling to a row: with `ty`, the
+// row its type key finds (aliased under `name`'s canon key) when the two place `null` alike;
+// with none, the row `name`'s canon key finds.
+// A declared alias name or a union type of one member stays unbound and answers false.
+export function unNameAdoptTyKeyRow(name: string, ty: i32): boolean {
+  if unNameBound(name) { return true }
+  if name == "" || (cUserTypes[name] ?? -1) >= 0 { return false }
+  let r = -1
+  if ty >= 0 {
+    const t = T.tys[ty]
+    if t is TyUnion {
+      if t.uMembers.length < 2 { return false }
+    }
+    // The type key's row, unless it names other record atoms than `name` and the canon row
+    // of `ty` stands: the two can be one structural type whose struct rows rep apart.
+    const nk = canonUnionKeyOfName(name)
+    const rk = unRowOfKey(ty)
+    r = unRowOfTyKey(ty)
+    if r >= 0 && r != rk && r != unRowOfKeyId(nk) {
+      if utkNameStructText(name, ty) != utkRowStructText(r) {
+        r = rk
+      } else if unABOn() > 0 {
+        utkNe.push("unTyKey/merge " + name + " => " + unNames[r])
+      }
+    }
+    if r < 0 { r = rk }
+    if r < 0 || r >= unKey.length { return false }
+    if utkTyNullShape(ty) != utkRowNullShape(r) { return false }
+    if r != rk { unKeyAliasRow(nk, r) }
+  } else {
+    const k = canonUnionKeyOfName(name)
+    if k < 0 { return false }
+    r = unRowOfKeyId(k)
+    if r < 0 || r >= unKey.length || unKey[r] != k { return false }
+  }
+  sidArrPut(unRowBySid, sidOf(name), r)
+  true
+}
+
+// The named and literal record atoms of a member list, sorted. One record type can have two
+// struct rows whose fields rep apart (a literal field against its alias's atom), so a row
+// serves another spelling only when both name the same ones.
+function utkStructText(atoms: string[]): string {
+  const texts: string[] = []
+  for a in atoms {
+    let base = a
+    while base.length > 2 && base.slice(base.length - 2, base.length) == "[]" {
+      base = base.slice(0, base.length - 2)
+    }
+    if base.slice(0, 1) == "{" || (cUserTypes[base] ?? -1) >= 0 {
+      texts.push(a)
+    }
+  }
+  utkTextOf(texts)
+}
+
+// The record atoms spelling `name` (of type `ty`) names.
+function utkNameStructText(name: string, ty: i32): string {
+  const atoms: string[] = []
+  unionSetAtomsOfTy(name, ty, atoms)
+  utkStructText(atoms)
+}
+
+// The record atoms row `r` recorded, or "?" for a row with no recorded members.
+function utkRowStructText(r: i32): string {
+  if (
+    r < 0
+    || r >= unMemTyStart.length
+    || r >= unMemTyCount.length
+    || unMemTyStart[r] < 0
+  ) {
+    return "?"
+  }
+  const atoms: string[] = []
+  let i = 0
+  while i < unMemTyCount[r] {
+    const m = unMemTyStart[r] + i
+    if m < unMemAtoms.length { atoms.push(unMemAtoms[m]) }
+    i = i + 1
+  }
+  utkStructText(atoms)
+}
+
+// Where `null` sits among the members of union `ty`, in its name's order: "n" for null, "m"
+// otherwise; "?" when a member has no render.
+function utkTyNullShape(ty: i32): string {
+  const mems: i32[] = []
+  if !canonUnionMemberTysOf(ty, mems) { return "?" }
+  let out = ""
+  for m in mems {
+    if m < 0 { out = out + "n" } else { out = out + "m" }
+  }
+  out
+}
+
+// Where `null` sits among the members of row `r`: "n" for null, "m" otherwise, a declared union
+// atom expanded through its type; "" for a row with no member slice.
+function utkRowNullShape(r: i32): string {
+  if (
+    r >= unMemTyStart.length
+    || r >= unMemTyCount.length
+    || unMemTyStart[r] < 0
+  ) {
+    return ""
+  }
+  const s = unMemTyStart[r]
+  let out = ""
+  let i = 0
+  while i < unMemTyCount[r] && s + i < unMemAtoms.length {
+    const a = unMemAtoms[s + i]
+    const di = cUserTypes[a] ?? -1
+    if a == "null" { out = out + "n" }
+    else if di >= 0 { out = out + utkNullShapeOfTy(di, 0) }
+    else { out = out + "m" }
+    i = i + 1
+  }
+  out
+}
+
+// `utkRowNullShape` of declared type `ty`, a nullable placing its `null` last.
+function utkNullShapeOfTy(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth > TY_WALK_DEPTH { return "m" }
+  const t = T.tys[ty]
+  match t {
+    TyNullable => {
+      return utkNullShapeOfTy(t.nInner, depth + 1) + "n"
+    }
+    TyUnion => {
+      let out = ""
+      for m in t.uMembers { out = out + utkNullShapeOfTy(m, depth + 1) }
+      return out
+    }
+    TyPrim | TyErr | TyObj | TyFunc | TyArray | TyMap | TyVar | TyLit | TyNeg => {
+      return "m"
+    }
+  }
 }
