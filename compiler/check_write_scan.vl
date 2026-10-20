@@ -44,6 +44,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  arenaEpochNow,
   elseIfLink,
   hasNamedArgs,
   i32ToStr,
@@ -96,11 +97,20 @@ let cwFramesBuilt = false
 // walk reaches, for the record rule's end-of-check pass, which then needs no occurrence index.
 export let cwFrJoins: i32[] = []
 export let cwFrRets: i32[] = []
+// Each node's parent as the frame walk saw it — `cwIxParent`'s answer, filed by the walk that
+// already reads every edge — and the arena epoch of that walk, -1 before a build.
+let cwFrParent: i32[] = []
+let cwFrParentEpoch = -1
+// Whether this compilation has built an index; until it has, a frame build keeps no parents,
+// since a program whose checks never ask for the index would only hold the column.
+let cwIxWanted = false
 
 export function cwFrameReset() {
   cwFrJoins = []
   cwFrRets = []
   cwFrameOf = []
+  cwFrParent = []
+  cwFrParentEpoch = -1
   cwDeclFr = []
   cwDeclSid = []
   cwDeclSlotFr = []
@@ -184,6 +194,8 @@ let cwIxWrRecv: i32[] = []
 // program with nothing to separate.
 let cwIxAnyWrite = 0
 let cwIxBuilt = false
+// Whether `cwIxParent` is the frame walk's column, so the note pass files no parent itself.
+let cwIxParentFiled = false
 // The same rows chained per (name, frame), built for a name on its first frame-keyed query: the
 // next row of each row's pair, and an open-addressed table from the pair to its newest and
 // oldest row. A reader keyed on one frame walks its own pair and the `CW_FR_UNKNOWN` pair, not
@@ -228,6 +240,7 @@ function cwIxReset() {
   cwIxWrRecv = []
   cwIxAnyWrite = 0
   cwIxBuilt = false
+  cwIxParentFiled = false
   cwFvSlot = Map()
   cwFvSets = []
   0
@@ -333,7 +346,7 @@ function cwIxNote(at: i32) {
   // The facts only the record rule (D2060) reads — parents and the value edges of `if`/`match`
   // arms and spreads — are filed for live nodes only.
   const live = cwIxLive(at)
-  if live { cwIxNoteParent(at) }
+  if live && !cwIxParentFiled { cwIxNoteParent(at) }
   // The arms run in descending kind frequency: a `match` tests them in order.
   match n {
     Ident => {
@@ -491,6 +504,13 @@ function cwIxNoteParent(at: i32) {
   0
 }
 
+// Whether the frame walk's parents describe an arena of `len` nodes with no slot rewritten
+// since the walk ran, so the index may take them as its own.
+function cwFrParentCurrent(len: i32): boolean {
+  if cwFrParent.length != len { return false }
+  cwFrParentEpoch == arenaEpochNow()
+}
+
 // Build the index once for this arena: every per-node column is sized before the note loop,
 // so a note may file a fact about a node it has not reached — a parent naming its own child,
 // which arena order does not promise.
@@ -502,7 +522,13 @@ export function cwIxBuild() {
   cwIxIsObj = __array_new__(len, 0)
   cwIxHeld = __array_new__(len, 0)
   cwIxUp = __array_new__(len, -1)
-  cwIxParent = __array_new__(len, -1)
+  cwIxParentFiled = cwFrParentCurrent(len)
+  cwIxWanted = true
+  if cwIxParentFiled {
+    cwIxParent = cwFrParent
+  } else {
+    cwIxParent = __array_new__(len, -1)
+  }
   cwIxUpKind = __array_new__(len, CW_UP_NONE)
   cwIxUpAux = __array_new__(len, 0)
   while cwIxNoted.length < P.nodes.length {
@@ -756,6 +782,7 @@ function cwFrameWalk(ix: i32, fr: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   cwFrameOf[ix] = fr
   const n = P.nodes[ix]
+  let chain = false
   // The record rule's join sites and `return`s, gathered by the walk that reaches them. The
   // arms run in descending kind frequency, and a leaf returns before the child loop.
   match n {
@@ -765,7 +792,11 @@ function cwFrameWalk(ix: i32, fr: i32) {
     BinExpr => {
       if n.binOp == "??" || n.binOp == "+" { cwFrJoins.push(ix) }
     }
-    IfStmt | ArrayLit | MatchExpr => {
+    IfStmt => {
+      cwFrJoins.push(ix)
+      chain = true
+    }
+    ArrayLit | MatchExpr => {
       cwFrJoins.push(ix)
     }
     RetStmt => {
@@ -789,6 +820,7 @@ function cwFrameWalk(ix: i32, fr: i32) {
       let p = 0
       while p < n.fnParams.length {
         const pix = n.fnParams[p]
+        cwFrParentNote(pix, ix)
         if pix >= 0 && pix < P.nodes.length {
           const pn = P.nodes[pix]
           if pn is Param { cwDeclare(ix, pn.parName) }
@@ -796,6 +828,8 @@ function cwFrameWalk(ix: i32, fr: i32) {
         }
         p = p + 1
       }
+      cwFrParentNote(n.fnRet, ix)
+      cwFrParentNote(n.fnBody, ix)
       cwFrameWalk(n.fnBody, ix)
       return 0
     }
@@ -813,11 +847,28 @@ function cwFrameWalk(ix: i32, fr: i32) {
     const k = nodeSpineChildrenPush(cur, cwKids)
     let i = 0
     while i < k {
-      cwFrameWalk(cwKids[base + i], fr)
+      const kid = cwKids[base + i]
+      cwFrParentNote(kid, cur)
+      cwFrameWalk(kid, fr)
       i = i + 1
     }
     cwKidsPop(k)
-    cur = elseIfLink(cur)
+    if chain {
+      const link = elseIfLink(cur)
+      cwFrParentNote(link, cur)
+      cur = link
+    } else {
+      cur = -1
+    }
+  }
+  0
+}
+
+// File `at` as a parent of `k`. The note pass filed each live node's children in arena order,
+// so the parent that stands is the highest-numbered one, whatever order the walk meets it in.
+function cwFrParentNote(k: i32, at: i32) {
+  if k >= 0 && k < cwFrParent.length && cwFrParent[k] < at {
+    cwFrParent[k] = at
   }
   0
 }
@@ -850,8 +901,12 @@ export function cwBuildFrames() {
     if P.nodes[at] is Program { roots.push(at) }
     at = at + 1
   }
-  // A merged root lists each module's statements again; one walk declares them once.
-  const topSeen = __array_new__(len, false)
+  // A merged root lists each module's statements again; one walk declares them once. Each
+  // root files itself as its statements' parent first, so a statement already holding one
+  // is a repeat listing, and the latest root is the parent that stands.
+  cwFrParent = __array_new__(len, -1)
+  cwFrParentEpoch = arenaEpochNow()
+  const tops: i32[] = []
   let r = 0
   while r < roots.length {
     const pn = P.nodes[roots[r]]
@@ -860,14 +915,23 @@ export function cwBuildFrames() {
       while s < pn.progStmts.length {
         const st = pn.progStmts[s]
         // an index outside the arena walks nothing
-        if st >= 0 && st < len && !topSeen[st] {
-          topSeen[st] = true
-          cwFrameWalk(st, CW_FR_MOD)
+        if st >= 0 && st < len {
+          if cwFrParent[st] < 0 { tops.push(st) }
+          cwFrParent[st] = roots[r]
         }
         s = s + 1
       }
     }
     r = r + 1
+  }
+  if !cwIxWanted {
+    cwFrParent = []
+    cwFrParentEpoch = -1
+  }
+  let t = 0
+  while t < tops.length {
+    cwFrameWalk(tops[t], CW_FR_MOD)
+    t = t + 1
   }
   cwDeclIndex()
   cwFramesBuilt = true
