@@ -360,6 +360,9 @@ import {
   capStartTbl,
   cboxReadTy,
   cloAdapterCanon,
+  cloCellIdx,
+  cloCellTarget,
+  cloCellUsed,
   cloDeclAt,
   cloEqScratchBase,
   cloLiftWriteCapAt,
@@ -797,6 +800,8 @@ import {
   callIsMapFilter,
   calleeIsVoidExtern,
   calleeReturnsVoidAt,
+  capCellName,
+  capCellTargetOf,
   capComputeNamesOf,
   captureCountOf,
   captureNamesOf,
@@ -1515,6 +1520,22 @@ export function capCacheBuild() {
       ci = ci + 1
     }
     fe = fe + 1
+  }
+  cloCellTarget = []
+  cloCellUsed = false
+  while cloCellTarget.length < fnStmts.length { cloCellTarget.push(0) }
+  for name in capNamesFlat {
+    const t = capCellTargetOf(name)
+    if t >= 0 {
+      // A cell stands for an env its declaring frame keeps, so its function must capture.
+      if t >= capCountTbl.length || capCountTbl[t] == 0 {
+        return emitFail(
+          "emitProgram: a function-value cell names a function with no env",
+        )
+      }
+      cloCellTarget[t] = 1
+      cloCellUsed = true
+    }
   }
   0
 }
@@ -2323,6 +2344,22 @@ function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
       return fbGlobalGet(g)
     }
     fbRefNullStruct()
+  } else if cloCellReaches(fe, fnIx) {
+    // Every frame that reads `fe` as a value reaches one cell, so the first read fills it and
+    // every later one, in any frame, is the same function value (D7700).
+    if emitCloCellRef(body, fe, fnIx) < 0 { return -1 }
+    fbStructGet(cloCellIdx, 0)
+    fbRefIsNull()
+    fbIf(64) // 0x40 void
+    if emitCloCellRef(body, fe, fnIx) < 0 { return -1 }
+    if emitClosureEnvOf(body, fe, fnIx, envIdx) < 0 { return -1 }
+    emitClosureIds(fe)
+    fbStructSet(cloCellIdx, 0)
+    fbEnd()
+    if emitCloCellRef(body, fe, fnIx) < 0 { return -1 }
+    fbStructGet(cloCellIdx, 0)
+    fbRefAsNonNull()
+    return 0
   } else {
     // In the frame that declares `fe`, the env is built once per activation and kept in the
     // frame's cache slot, so two reads of the function compare equal (D7480).
@@ -2332,20 +2369,30 @@ function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
       fbRefIsNull()
       fbIf(64) // 0x40 void
     }
-    const caps = captureNamesOf(fe)
-    let ci = 0
-    while ci < caps.length {
-      if emitCaptureRead(body, caps[ci], fnIx) < 0 { return -1 }
-      ci = ci + 1
-    }
-    fbStructNew(envIdx)
+    if emitClosureEnvOf(body, fe, fnIx, envIdx) < 0 { return -1 }
     if ck >= 0 {
       fbLocalSet(ck)
       fbEnd()
       fbLocalGet(ck)
     }
   }
+  emitClosureIds(fe)
+}
 
+// Builds a fresh env of capturing function `fe` from frame `fnIx`: one read per capture.
+function emitClosureEnvOf(body: u8[], fe: i32, fnIx: i32, envIdx: i32) {
+  const caps = captureNamesOf(fe)
+  let ci = 0
+  while ci < caps.length {
+    if emitCaptureRead(body, caps[ci], fnIx) < 0 { return -1 }
+    ci = ci + 1
+  }
+  fbStructNew(envIdx)
+  0
+}
+
+// Completes a closure of `fe` over the env on the stack: its id and declaration, then the struct.
+function emitClosureIds(fe: i32) {
   // The one place a wasm function index becomes a closure id, so the one place the
   // address-taken set is recorded: the element section lists exactly these entries, and an
   // id no expression here produces cannot reach a `call_indirect`.
@@ -2355,6 +2402,42 @@ function emitClosureValueOf(body: u8[], fe: i32, fnIx: i32) {
   fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
   fbStructNew(cloStructIdx)
   0
+}
+
+// Whether frame `fnIx` reaches `fe`'s cell: it declares `fe`, or its env carries the cell.
+function cloCellReaches(fe: i32, fnIx: i32): boolean {
+  if (
+    !cloCellUsed
+    || fe < 0
+    || fe >= cloCellTarget.length
+    || cloCellTarget[fe] == 0
+  ) {
+    return false
+  }
+  if envCacheSlotOf(fe) >= 0 { return true }
+  const at = fnStmtsPosOf(fnIx)
+  at >= 0 && strListHas(captureNamesOf(at), capCellName(fe))
+}
+
+// Pushes `fe`'s cell as frame `fnIx` reaches it: the frame's own slot, allocated at its first
+// use in an activation, when the frame declares `fe`, else the field the frame's env carries.
+function emitCloCellRef(body: u8[], fe: i32, fnIx: i32) {
+  const ck = envCacheSlotOf(fe)
+  if ck >= 0 {
+    fbLocalGet(ck)
+    fbRefIsNull()
+    fbIf(64) // 0x40 void
+    fbRefNull(cloStructIdx)
+    fbStructNew(cloCellIdx)
+    fbLocalSet(ck)
+    fbEnd()
+    fbLocalGet(ck)
+    return 0
+  }
+  if emitCapturedRead(body, capCellName(fe), fnIx, false) == 1 { return 0 }
+  emitFail(
+    "emitProgram: a function-value cell is not reachable from this frame",
+  )
 }
 
 // The rep recovery an env-field read owes after its `struct.get`, decided by
@@ -2430,6 +2513,8 @@ function emitCaptureSlotRead(fe: i32, envIdx: i32, fi: i32) {
 // enclosing frame is itself a lifted closure re-capturing `name`) reads that frame's own
 // env, so the value flows env-to-env down any nesting depth.
 function emitCaptureRead(_body: u8[], name: string, fnIx: i32) {
+  const cellOf = capCellTargetOf(name)
+  if cellOf >= 0 { return emitCloCellRef(_body, cellOf, fnIx) }
   const idx = localIndexOf(fnIx, name)
   if idx >= 0 {
     fbLocalGet(idx)
@@ -9288,9 +9373,56 @@ function emitUnionBoxEqStaged(
     e = e + 1
   }
   fbElse() // tags differ
-  fbI32Const(0)
+  if unionCloArmCount(aks) >= 2 {
+    // A function value's identity is its declaration, whichever function-type arm holds it.
+    emitUnionCloTagIn(sl, vis, aks, uname, arms)
+    fbIf(127)
+    emitUnionCloTagIn(sr, vis, aks, uname, arms)
+    fbIf(127)
+    if emitUnionArmEq(body, sl, sr, -1, 11, fnIx) < 0 { return -1 }
+    fbElse()
+    fbI32Const(0)
+    fbEnd()
+    fbElse()
+    fbI32Const(0)
+    fbEnd()
+  } else {
+    fbI32Const(0)
+  }
   fbEnd()
   if isNe { fbI32Eqz() }
+  0
+}
+
+// How many of a union's arms are function values (atom kind 11).
+function unionCloArmCount(aks: i32[]): i32 {
+  let n = 0
+  for ak in aks {
+    if ak == 11 { n = n + 1 }
+  }
+  n
+}
+
+// Pushes whether the box parked in `slot` sits in one of the union's function-value arms.
+function emitUnionCloTagIn(
+  slot: i32,
+  vis: i32[],
+  aks: i32[],
+  uname: string,
+  arms: string[],
+) {
+  fbI32Const(0)
+  let a = 0
+  while a < aks.length {
+    if aks[a] == 11 {
+      fbLocalGet(slot)
+      fbStructGet(uBoxIdx, 0)
+      fbI32Rel(RS_TAG, unionArmTagOf(vis[a], aks[a], uname, arms[a]))
+      fbI32Bin(70)  // 0x46 i32.eq
+      fbI32Bin(114) // 0x72 i32.or
+    }
+    a = a + 1
+  }
   0
 }
 
@@ -9735,28 +9867,54 @@ function emitUnionUnionEq(
       "emitProgram: union string `==` but array type not collected",
     )
   }
+  // The READ half of the banked-kind pair: the arm's recorded code, or a per-atom derivation
+  // where the bank did not cover the row. Both sides read the LEFT union's arm type — the
+  // intersection above matched the two arms by verbatim SPELLING, so they render the same
+  // signature and claim the same slot.
+  const armKs: i32[] = []
+  const armTys: i32[] = []
+  const cloTags: i32[] = []
+  let ki = 0
+  while ki < arms.length {
+    let armK = armKinds[ki]
+    if armK == -2 { armK = valueAtomKind(arms[ki]) }
+    const armTy = unionArmTyOfAtom(lname, arms[ki])
+    armK = boxArmKindOfTy(armK, armTy)
+    armKs.push(armK)
+    armTys.push(armTy)
+    if armK == 11 { cloTags.push(unionEqTagOfArmTy(armK, armTy)) }
+    ki = ki + 1
+  }
   // Outermost `if` is the LAST arm (the host wraps its chain in arm order).
   let k = arms.length - 1
   while k >= 0 {
-    // The READ half of the banked-kind pair: the arm's recorded code, or a per-atom
-    // derivation where the bank did not cover the row.
-    let armK = armKinds[k]
-    if armK == -2 { armK = valueAtomKind(arms[k]) }
-    // Both sides read the LEFT union's arm type — the intersection above matched the two arms
-    // by verbatim SPELLING, so they render the same signature and claim the same slot.
-    const armTy = unionArmTyOfAtom(lname, arms[k])
-    armK = boxArmKindOfTy(armK, armTy)
+    const armK = armKs[k]
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
     // The arm's TAG, not `scalarTagOfKind(armK)`: a closure arm tags by SIGNATURE.
-    const armTag = unionEqTagOfArmTy(armK, armTy)
+    const armTag = unionEqTagOfArmTy(armK, armTys[k])
     fbStructGet(uBoxIdx, 0) // left tag
     fbI32Rel(RS_TAG, armTag)
     fbI32Bin(70)            // 0x46 i32.eq
     fbIf(127)               // left holds this arm
-    if emitExpr(body, rIx, fnIx) < 0 { return -1 }
-    fbStructGet(uBoxIdx, 0) // right tag
-    fbI32Rel(RS_TAG, armTag)
-    fbI32Bin(70)            // 0x46 i32.eq
+    // A function value's identity is its declaration, whichever function-type arm holds it, so
+    // a closure arm admits the right operand in any closure arm; the payload rep is shared.
+    const rightTags: i32[] = []
+    if armK == 11 {
+      for t in cloTags { rightTags.push(t) }
+    } else {
+      rightTags.push(armTag)
+    }
+    let ti = 0
+    while ti < rightTags.length {
+      if emitExpr(body, rIx, fnIx) < 0 { return -1 }
+      fbStructGet(uBoxIdx, 0) // right tag
+      fbI32Rel(RS_TAG, rightTags[ti])
+      fbI32Bin(70) // 0x46 i32.eq
+      if ti > 0 {
+        fbI32Bin(114) // 0x72 i32.or
+      }
+      ti = ti + 1
+    }
     fbIf(127)               // right holds it too → payload value-compare
     if emitExpr(body, lIx, fnIx) < 0 { return -1 }
     fbStructGet(uBoxIdx, 1) // left payload (anyref)
