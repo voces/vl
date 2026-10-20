@@ -192,6 +192,7 @@ import {
   annTsOf,
   arenaEpochBump,
   arenaEpochNow,
+  callHasTyArgs,
   callNever,
   callRestPacked,
   callTyArgsOf,
@@ -216,6 +217,7 @@ import {
   fnRequiredArity,
   fnTpBoundOf,
   getDeclReset,
+  hasNamedArgs,
   i32ToStr,
   isBodyTyDecl,
   markNeverCallsByDecl,
@@ -5421,8 +5423,9 @@ function skPosOf(): i32[] {
   pos
 }
 
-// Whether every parameter is annotated and any default is a scalar literal or `null`: the
-// declaration's check alone types such a default, and a caller reads only its annotation.
+// Whether every parameter is annotated and any default is a scalar literal, `null` or
+// `__callsite__`: the declaration's check alone types such a default, and a caller reads only
+// its annotation.
 function skParamsClosed(ps: i32[]): boolean {
   for p in ps {
     const n = P.nodes[p]
@@ -5433,6 +5436,7 @@ function skParamsClosed(ps: i32[]): boolean {
       d >= 0
       && !skSignedLit(d)
       && !(d < P.nodes.length && P.nodes[d] is NullLit)
+      && !paramDefaultIsCallsite(d)
     ) {
       return false
     }
@@ -6953,7 +6957,7 @@ function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
     if !inG[impMod[k]] && d >= 0 {
       const om = wiImpOrigin[k]
       if om < 0 {
-        if inG[d] {
+        if inG[d] && skImportName(k) != "" {
           wiCulprit = impMod[k]
           wiCulpritName = "(namespace)"
           return false
@@ -6986,8 +6990,8 @@ function wiDemandShut(inG: boolean[], roots: i32[], pos: i32[]): boolean {
 
 // Whether the un-annotated binding `merged` of the module rooted at `root` has a type its own
 // initialiser fixes, so no importer's use can choose it: a non-empty list of scalar literals and
-// names of a primitive type, or a call of a closed, non-generic, non-overloaded function with a
-// declared return type.
+// names of a primitive type, or a call of a closed, non-overloaded function with a declared
+// return type whose type parameters its scalar arguments fix (`wiClosedCall`).
 function wiInitShut(root: i32, merged: string): boolean {
   const r = P.nodes[root]
   if r is Program {
@@ -7019,8 +7023,9 @@ function wiPrimName(x: i32): boolean {
   n is Ident && tyIsPrimIx(lookup(n.identName))
 }
 
-// Whether node `e` calls, by name, one closed, non-generic function with a declared return type
-// and no overload set.
+// Whether node `e` calls, by name, one closed function with a declared return type and no
+// overload set, and when it is generic, binds each type parameter at a parameter annotated as
+// exactly that name to a scalar literal or primitive name, no other annotation naming one.
 function wiClosedCall(e: i32): boolean {
   if e < 0 || e >= P.nodes.length { return false }
   const c = P.nodes[e]
@@ -7035,11 +7040,40 @@ function wiClosedCall(e: i32): boolean {
   const d = fnDeclIx[f.identName] ?? -1
   if d < 0 || d >= P.nodes.length { return false }
   const fd = P.nodes[d]
-  fd is FuncDecl
-    && fd.fnName == f.identName
-    && fd.fnRet >= 0
-    && fd.fnTyParams.length == 0
-    && skParamsClosed(fd.fnParams)
+  if !(fd is FuncDecl) || fd.fnName != f.identName || fd.fnRet < 0 {
+    return false
+  }
+  if !skParamsClosed(fd.fnParams) { return false }
+  if fd.fnTyParams.length == 0 { return true }
+  if callHasTyArgs(e) || hasNamedArgs(c.callArgNames) { return false }
+  const bound: {[string]: boolean} = Map()
+  let i = 0
+  while i < fd.fnParams.length {
+    const p = P.nodes[fd.fnParams[i]]
+    if !(p is Param) || p.parType < 0 || p.parType >= P.nodes.length {
+      return false
+    }
+    const a = P.nodes[p.parType]
+    if !(a is TypeRef) { return false }
+    let exact = false
+    for tp in fd.fnTyParams {
+      if a.tyName == tp {
+        exact = true
+        let x = -1
+        if i < c.callArgs.length { x = c.callArgs[i] }
+        if p.parRest != 0 || !(skSignedLit(x) || wiPrimName(x)) { return false }
+        bound[tp] = true
+      } else if a.tyName.indexOf(tp) >= 0 {
+        return false
+      }
+    }
+    if !exact && i >= c.callArgs.length && p.parDefault < 0 { return false }
+    i = i + 1
+  }
+  for tp in fd.fnTyParams {
+    if !bound.has(tp) { return false }
+  }
+  c.callArgs.length <= fd.fnParams.length
 }
 
 // Whether declaration `merged` of the module rooted at `root` carries a type this check's

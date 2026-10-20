@@ -206,6 +206,8 @@ const TWIN_LIB = (read: string) =>
   "export type P = { x: i32, tag: string }\nexport function mk(): i32 {\n" +
   `  const p: P = { x: 1, tag: "a" }\n  ${read}\n}\n`;
 const WRAP = "export function wrap<T>(v: T): T[] { [v] }\n";
+const FILL = "export function fill<T>(n: i32, v: T): T[] {\n  const o: T[] = []\n  let i = 0\n" +
+  "  while i < n {\n    o.push(v)\n    i = i + 1\n  }\n  o\n}\n";
 const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(1)[0] }\n';
 
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
@@ -399,6 +401,76 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "demand",
+  },
+  {
+    name: "a generic call whose scalar literal argument binds its type parameter is served",
+    graph: {
+      "main.vl": 'import { xs } from "./lib"\nxs.push(4)\nprint(xs[3])\n',
+      "lib.vl": 'import { fill } from "./gen"\nexport let xs = fill(3, -1)\n',
+      "gen.vl": FILL,
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a generic call whose argument an importer can still retype declines its binding",
+    graph: {
+      "main.vl": 'import { xs } from "./lib"\nxs[0].push("a")\nprint(xs.length)\n',
+      "lib.vl": 'import { fill } from "./gen"\nexport let xs = fill(2, [])\n',
+      "gen.vl": FILL,
+    },
+    target: "lib.vl",
+    want: "demand",
+  },
+  {
+    name: "a generic call binding its type parameter through a wider annotation declines",
+    graph: {
+      "main.vl": 'import { xs } from "./lib"\nxs.push("a")\nprint(xs.length)\n',
+      "lib.vl": 'import { same } from "./gen"\nexport let xs = same(1, [])\n',
+      "gen.vl": "export function same<T>(n: i32, v: T[]): T[] { v }\n",
+    },
+    target: "lib.vl",
+    want: "demand",
+  },
+  {
+    name: "a call of a function with a call-site default is closed",
+    graph: {
+      "main.vl": 'import { C } from "./lib"\nconst x: i64 = C\nprint(x)\n',
+      "lib.vl": "type Loc = { file: string, line: i32, col: i32 }\n" +
+        "function mk(n: i32, at: Loc = __callsite__): i32 { n + at.line }\nexport const C = mk(1)\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a self-function outside G whose name G spells only as a plain word is served",
+    graph: {
+      "main.vl": 'import { f } from "./lib"\ntype Rq = { zzt: i32 }\n' +
+        "function zzn(self: Rq): i32 { self.zzt }\nconst r: Rq = { zzt: 1 }\nprint(r.zzn() + f(2))\n",
+      "lib.vl": "export function f(n: i32): i32 {\n  const zzn = n * 2\n  zzn\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a record outside G whose field G spells only as a parameter is served",
+    graph: {
+      "main.vl": 'import { f } from "./lib"\ntype Rq = { zzs: i32 }\nconst r: Rq = { zzs: 1 }\n' +
+        "print(r.zzs + f(2))\n",
+      "lib.vl": "export function f(zzs: i32): i32 { zzs * 2 }\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a record outside G whose field G spells as a literal key declines",
+    graph: {
+      "main.vl": 'import { f } from "./lib"\ntype Rq = { zzs: i32 }\nconst r: Rq = { zzs: 1 }\n' +
+        "print(r.zzs + f(2))\n",
+      "lib.vl": "export function f(n: i32): i32 {\n  const q = { zzs: n }\n  q.zzs\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
   },
   {
     name: "a fresh record G builds is delivered into a wider type outside G",
