@@ -354,7 +354,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - 13 fn-value and closure matrices against master `6aab4c3c9`'s seed: 0 runs→not-runs, 0 silent.
     - cases_wasm closures + functions: 1,191 pass. Both new pins fail on master's seed.
     - L2 fuel, this source: 105,915,352,967 on master's seed, 105,915,803,514 on this seed (+0.0004%).
-    - Seed 6,642,738 → 6,647,775 bytes (+5,037).
+    - Seed 6,642,738 → 6,647,780 bytes (+5,042).
 
 ### L2 log
 
