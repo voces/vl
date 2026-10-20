@@ -96,6 +96,7 @@ import {
   structNameOfTy,
   tyArrayElemIx,
   tyArrayElemPrim,
+  tyEqSameHoles,
   tyFieldTyOf,
   tyHoldsObj,
   tyIsLitUnion,
@@ -819,7 +820,7 @@ import {
   tailSelfFnSet,
   tyAnnRefListSlot,
 } from "./emit_nullable_rets"
-import { objVariantIndexDrop } from "./emit_obj_lit_fits"
+import { objLitFieldSig, objVariantIndexDrop } from "./emit_obj_lit_fits"
 import { rlWidenVariantOf } from "./emit_ref_list_kinds"
 import {
   anonLeafFoldBlocked,
@@ -8001,6 +8002,10 @@ function mintPinnedObjLitRows() {
       const fd = P.nodes[fnStmts[fe]]
       if fd is FuncDecl {
         pinCtorUnserved = !instRetKeepsRecordsIn(monoInstOrig[k])
+        if pinCtorUnserved {
+          pinCtorRet = tyStepRet(nodeTyIxOf(monoOrigNode[monoInstOrig[k]]))
+          pinCtorBody = fd.fnBody
+        }
         const before = sNames.length
         mintPinnedObjLitsIn(fd.fnBody, fnStmts[fe], fd.fnBody, 0)
         if pinCtorUnserved && sNames.length > before { ctorRows = true }
@@ -8015,6 +8020,20 @@ function mintPinnedObjLitRows() {
 
 // Whether `mintPinnedObjLit` is minting a constructor's literal, which mints only when unserved.
 let pinCtorUnserved = false
+// That constructor's template return type: only a literal of exactly that type mints, never
+// one arm of a join, whose other arms would be built at another row (D2855).
+let pinCtorRet = -1
+// That constructor's body, where a second literal with the same field names is such an arm.
+let pinCtorBody = -1
+
+// How many record literals under `ix` carry the field-name signature `sig`.
+function objLitSigCountIn(ix: i32, sig: string, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > 256 { return 0 }
+  let c = 0
+  if P.nodes[ix] is ObjLit && objLitFieldSig(ix) == sig { c = 1 }
+  for k in nodeChildren(ix) { c = c + objLitSigCountIn(k, sig, depth + 1) }
+  c
+}
 
 // Every concrete record literal left without a row because a field holds a constructor's
 // record, whose row exists only once its instance mints it (D2850).
@@ -8134,6 +8153,8 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
     return 0
   }
   if pinCtorUnserved {
+    if !tyEqSameHoles(lt, pinCtorRet) { return 0 }
+    if objLitSigCountIn(pinCtorBody, objLitFieldSig(objIx), 0) != 1 { return 0 }
     if structIndexOfObjCtx(objIx, fnIx) >= 0 { return 0 }
     if objVariantNameCtx(objIx, fnIx) != "" { return 0 }
   }
