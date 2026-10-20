@@ -179,9 +179,9 @@ export let cwIxUp: i32[] = []
 export let cwIxParent: i32[] = []
 export let cwIxUpKind: i32[] = []
 export let cwIxUpAux: i32[] = []
-// The note pass's own cursor: one row per node it has read, so the walk is a grow loop over
+// The note pass's own cursor: how many nodes it has read, so the walk is a grow loop over
 // columns phase one has already sized to the arena.
-let cwIxNoted: i32[] = []
+let cwIxNotedN = 0
 // Per interned name, the first named `FuncDecl` that declares it, or -1 — the callee
 // resolution the argument and call-result edges key on.
 let cwIxFnDecl: i32[] = []
@@ -234,7 +234,7 @@ function cwIxReset() {
   cwIxParent = []
   cwIxUpKind = []
   cwIxUpAux = []
-  cwIxNoted = []
+  cwIxNotedN = 0
   cwIxFnDecl = []
   cwIxWrNode = []
   cwIxWrRecv = []
@@ -345,8 +345,7 @@ function cwIxNote(at: i32) {
   const n = P.nodes[at]
   // The facts only the record rule (D2060) reads — parents and the value edges of `if`/`match`
   // arms and spreads — are filed for live nodes only.
-  const live = cwIxLive(at)
-  if live && !cwIxParentFiled { cwIxNoteParent(at) }
+  if !cwIxParentFiled && cwIxLive(at) { cwIxNoteParent(at) }
   // The arms run in descending kind frequency: a `match` tests them in order.
   match n {
     Ident => {
@@ -401,7 +400,7 @@ function cwIxNote(at: i32) {
       cwIxPlace(at, n.memObj)
     }
     MatchExpr => {
-      if live {
+      if cwIxLive(at) {
         let mb = 0
         while mb < n.matchBodies.length {
           cwIxUpSet(rcwBlockTail(n.matchBodies[mb]), at, CW_UP_ARM, 0)
@@ -410,10 +409,10 @@ function cwIxNote(at: i32) {
       }
     }
     Spread => {
-      if live { cwIxUpSet(n.spdArg, at, CW_UP_SPREAD, 0) }
+      if cwIxLive(at) { cwIxUpSet(n.spdArg, at, CW_UP_SPREAD, 0) }
     }
     IfStmt => {
-      if live {
+      if cwIxLive(at) {
         cwIxUpSet(rcwBlockTail(n.ifThen), at, CW_UP_ARM, 0)
         if n.ifElse >= 0 && n.ifElse < P.nodes.length {
           const el = P.nodes[n.ifElse]
@@ -498,7 +497,6 @@ function cwIxNoteParent(at: i32) {
     if k >= 0 && k < cwIxParent.length { cwIxParent[k] = at }
     i = i + 1
   }
-  cwKidsPop(n)
   const link = elseIfLink(at)
   if link >= 0 && link < cwIxParent.length { cwIxParent[link] = at }
   0
@@ -531,11 +529,12 @@ export function cwIxBuild() {
   }
   cwIxUpKind = __array_new__(len, CW_UP_NONE)
   cwIxUpAux = __array_new__(len, 0)
-  while cwIxNoted.length < P.nodes.length {
-    const at = cwIxNoted.length
-    cwIxNoted.push(1)
+  while cwIxNotedN < P.nodes.length {
+    const at = cwIxNotedN
+    cwIxNotedN = at + 1
     cwIxNote(at)
   }
+  cwKids = []
   cwIxBuilt = true
   0
 }
@@ -852,7 +851,6 @@ function cwFrameWalk(ix: i32, fr: i32) {
       cwFrameWalk(kid, fr)
       i = i + 1
     }
-    cwKidsPop(k)
     if chain {
       const link = elseIfLink(cur)
       cwFrParentNote(link, cur)
@@ -873,18 +871,9 @@ function cwFrParentNote(k: i32, at: i32) {
   0
 }
 
-// The children stack the frame walk and the parent pass share: a node's window is pushed
-// above whatever its callers' windows hold, and popped once its loop is done.
-const cwKids: i32[] = []
-
-function cwKidsPop(k: i32) {
-  let i = 0
-  while i < k {
-    cwKids.pop()
-    i = i + 1
-  }
-  0
-}
+// The children list the frame walk and the parent pass share: a node's window is pushed above
+// whatever its callers' windows hold and never popped, so it is dropped once a build is done.
+let cwKids: i32[] = []
 
 // Size both frame columns, collect the roots, then walk them — several `Program` nodes stand
 // in one arena after a module merge (D661).
@@ -897,8 +886,8 @@ export function cwBuildFrames() {
   const len = P.nodes.length
   cwFrameOf = __array_new__(len, CW_FR_UNKNOWN)
   let at = 0
-  while at < len {
-    if P.nodes[at] is Program { roots.push(at) }
+  for nd in P.nodes {
+    if nd is Program { roots.push(at) }
     at = at + 1
   }
   // A merged root lists each module's statements again; one walk declares them once. Each
@@ -933,6 +922,7 @@ export function cwBuildFrames() {
     cwFrameWalk(tops[t], CW_FR_MOD)
     t = t + 1
   }
+  cwKids = []
   cwDeclIndex()
   cwFramesBuilt = true
   0
