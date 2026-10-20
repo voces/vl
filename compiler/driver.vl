@@ -832,13 +832,11 @@ let modCacheExpDeclLine: i32[] = []
 let modCacheExpDeclCol: i32[] = []
 let modCacheExpKwLine: i32[] = []
 let modCacheExpKwCol: i32[] = []
-let modCacheTokKind: TokKind[] = []
+// The banked tokens themselves, which a replay pushes as they are. Sharing them is sound
+// because no pass writes a token; `jwRestoreMangling` writes only a generated tail, never banked.
+let modCacheToks: Tok[] = []
 let modCacheDocLine: i32[] = []
 let modCacheDocText: string[] = []
-let modCacheTokText: string[] = []
-let modCacheTokStart: i32[] = []
-let modCacheTokLine: i32[] = []
-let modCacheTokCol: i32[] = []
 // The slot holding `key`, or -1. A dropped slot keeps its row but takes the empty
 // key, which no module can carry, so it is skipped here and reused by nothing.
 function modCacheSlotOfKey(key: string): i32 {
@@ -894,13 +892,9 @@ function modCacheClear(): i32 {
   modCacheExpDeclCol = []
   modCacheExpKwLine = []
   modCacheExpKwCol = []
-  modCacheTokKind = []
+  modCacheToks = []
   modCacheDocLine = []
   modCacheDocText = []
-  modCacheTokText = []
-  modCacheTokStart = []
-  modCacheTokLine = []
-  modCacheTokCol = []
   modCacheDeadTok = 0
   modCacheDeadSlots = 0
   modCacheClears = modCacheClears + 1
@@ -921,12 +915,8 @@ function modCachePopToI(arr: i32[], n: i32): i32 {
 function modCacheDrop(ci: i32): i32 {
   const toff = modCacheTokOff[ci]
   const tend = modCacheTokEnd[ci]
-  if toff >= 0 && tend == modCacheTokKind.length {
-    modCachePopTo(modCacheTokText, toff)
-    modCachePopToI(modCacheTokStart, toff)
-    modCachePopToI(modCacheTokLine, toff)
-    modCachePopToI(modCacheTokCol, toff)
-    while modCacheTokKind.length > toff { modCacheTokKind.pop() }
+  if toff >= 0 && tend == modCacheToks.length {
+    while modCacheToks.length > toff { modCacheToks.pop() }
   } else if toff >= 0 {
     modCacheDeadTok = modCacheDeadTok + (tend - toff)
   }
@@ -993,7 +983,7 @@ function modCacheDrop(ci: i32): i32 {
 // slot and re-banks the same key at once, so a check between the two reads one module's
 // rows as half the cache and clears on every keystroke.
 function modCacheBound(): i32 {
-  if modCacheDeadTok > modCacheTokKind.length - modCacheDeadTok {
+  if modCacheDeadTok > modCacheToks.length - modCacheDeadTok {
     return modCacheClear()
   }
   if modCacheDeadSlots > modCacheKeys.length - modCacheDeadSlots {
@@ -1014,19 +1004,7 @@ function vcLoadToks(src: string): i32 {
   }
   let i = 0
   while i < r.tokens.length {
-    const t = r.tokens[i]
-    // `pos` is the GLOBAL P.toks index (single-source: identical to the per-call
-    // index; module mode APPENDS each module's tokens, so anchors stay correct).
-    P.toks.push(
-      {
-        kind: t.kind,
-        text: t.text,
-        pos: P.toks.length,
-        start: t.start,
-        line: t.line,
-        col: t.col,
-      },
-    )
+    P.toks.push(r.tokens[i])
     i = i + 1
   }
   // Folds the lexer's diagnostics into the parse-stage store so a lex error (an empty
@@ -1088,8 +1066,8 @@ function vcEtDrop(): i32 {
 }
 // `vcLoadToks` for the entry source, through the bank above: `tokenize` is a pure function
 // of its source, so a later pass over the same bytes takes the array back instead of
-// re-lexing. Both sides need an empty `P.toks`, which is what makes a row's `pos` its own
-// index. The pop drops `jwSecondPass`'s generated tail, the one thing appended after a bank.
+// re-lexing. Both sides need an empty `P.toks`. The pop drops `jwSecondPass`'s generated
+// tail, the one thing appended after a bank.
 function vcLoadToksEntry(src: string): i32 {
   vcEpDrop()
   if P.toks.length == 0 && vcEtLen > 0 && vcEtSrc == src {
@@ -2090,17 +2068,7 @@ export function formatSrc(): i32 {
   const r = tokenize(src)
   let i = 0
   while i < r.tokens.length {
-    const t = r.tokens[i]
-    P.toks.push(
-      {
-        kind: t.kind,
-        text: t.text,
-        pos: P.toks.length,
-        start: t.start,
-        line: t.line,
-        col: t.col,
-      },
-    )
+    P.toks.push(r.tokens[i])
     i = i + 1
   }
   let d = 0
@@ -3625,7 +3593,7 @@ export function setOneShot(on: i32): i32 {
 // 1 = live token rows, 2 = rows a non-trailing drop stranded, 3 = whole-cache clears.
 export function modCacheStat(which: i32): i32 {
   if which == 0 { return modCacheKeys.length }
-  if which == 1 { return modCacheTokKind.length }
+  if which == 1 { return modCacheToks.length }
   if which == 2 { return modCacheDeadTok }
   if which == 3 { return modCacheClears }
   -1
@@ -3736,25 +3704,16 @@ function modScanCached(m: i32, key: string, src: string): i32 {
   0
 }
 // `vcLoadToks` for module `m` through the per-instance cache: on a hit, re-pushes
-// the cached token stream with fresh `pos` anchors (only a clean tokenization is
-// cached); on a miss, tokenizes and banks the stream if it produced no lex diags.
-// The miss covers a module the scan skipped or one whose lex diags made it unbankable.
+// the cached token objects (only a clean tokenization is cached); on a miss, tokenizes
+// and banks the stream if it produced no lex diags. The miss covers a module the scan
+// skipped or one whose lex diags made it unbankable.
 function vcLoadToksMod(m: i32): i32 {
   vcEpDrop()
   const ci = modCacheLookup(modKeys[m], modSrcs[m])
   if ci >= 0 && modCacheTokOff[ci] >= 0 {
     let ti = modCacheTokOff[ci]
     while ti < modCacheTokEnd[ci] {
-      P.toks.push(
-        {
-          kind: modCacheTokKind[ti],
-          text: modCacheTokText[ti],
-          pos: P.toks.length,
-          start: modCacheTokStart[ti],
-          line: modCacheTokLine[ti],
-          col: modCacheTokCol[ti],
-        },
-      )
+      P.toks.push(modCacheToks[ti])
       ti = ti + 1
     }
     // The docs ride the same slot: a replay that restored the tokens alone would answer
@@ -3773,18 +3732,13 @@ function vcLoadToksMod(m: i32): i32 {
   const docBefore = docCmtLine.length
   vcLoadToks(modSrcs[m])
   if ci >= 0 && P.diags.length == diagBefore {
-    modCacheTokOff[ci] = modCacheTokKind.length
+    modCacheTokOff[ci] = modCacheToks.length
     let ti2 = tokBefore
     while ti2 < P.toks.length {
-      const t = P.toks[ti2]
-      modCacheTokKind.push(t.kind)
-      modCacheTokText.push(t.text)
-      modCacheTokStart.push(t.start)
-      modCacheTokLine.push(t.line)
-      modCacheTokCol.push(t.col)
+      modCacheToks.push(P.toks[ti2])
       ti2 = ti2 + 1
     }
-    modCacheTokEnd[ci] = modCacheTokKind.length
+    modCacheTokEnd[ci] = modCacheToks.length
     modCacheDocOff[ci] = modCacheDocLine.length
     let dj = docBefore
     while dj < docCmtLine.length {
@@ -4136,17 +4090,13 @@ function modScan(m: i32, src: string): i32 {
   modScanDocOff = -1
   modScanDocEnd = -1
   if r.diags.length == 0 {
-    modScanTokOff = modCacheTokKind.length
+    modScanTokOff = modCacheToks.length
     let b = 0
     while b < toks.length {
-      modCacheTokKind.push(toks[b].kind)
-      modCacheTokText.push(toks[b].text)
-      modCacheTokStart.push(toks[b].start)
-      modCacheTokLine.push(toks[b].line)
-      modCacheTokCol.push(toks[b].col)
+      modCacheToks.push(toks[b])
       b = b + 1
     }
-    modScanTokEnd = modCacheTokKind.length
+    modScanTokEnd = modCacheToks.length
     // This lex is the only one most modules get, so the `///` rows are banked here on the
     // same gate the tokens are — see `modCacheDocOff`.
     modScanDocOff = modCacheDocLine.length
