@@ -204,6 +204,7 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsNewtypeBrand,
+  tyIsOneStrLit,
   tyIsRecord,
   tyLitMemberTexts,
   tyMutEpoch,
@@ -304,6 +305,7 @@ import {
   parentLetReadAt,
   parentLoopVarOf,
   placeNarrowKeyOf,
+  pushUniqueAtom,
   retV128Flag,
   setShapeOfTy,
   tyIsFuncType,
@@ -612,6 +614,7 @@ import {
   recordListSlotOfNode,
   sharedFieldArmAtomKind,
   sharedFieldArmConverts,
+  sharedFieldArmLitTexts,
   sharedFieldArmsBoxable,
   sharedFieldLitSetPlan,
   sharedFieldPlanLitTy,
@@ -723,6 +726,7 @@ import {
   repShadowOn,
   repSigSlotTokOfKind,
   repSigTokOfKind,
+  sFieldElemTyIxAt,
   tyIsI32LeafElem,
 } from "./emit_rep"
 import { nameFieldCodeTy } from "./emit_shape_intern"
@@ -9659,7 +9663,14 @@ export function coalesceLitUnionFits(exprIx: i32, fnIx: i32) {
     let lut = nodeNulLitUnionMemberTexts(lhs)
     if lut.length == 0 { lut = nodeLitUnionMemberTexts(lhs) }
     // A hole operand's members come from its pin, where the `??` there reads at the union (D3423).
-    if lut.length == 0 && tyIsLitUnion(nodeTyPinIxOf(exprIx)) {
+    const pin = nodeTyPinIxOf(exprIx)
+    if lut.length == 0 && tyIsLitUnion(pin) { lut = nulLitAtomTexts(lhs, fnIx) }
+    // An instance's `??` records its generic's hole, and the operand's own members decide.
+    if (
+      lut.length == 0
+      && fnInPinnedInstance(fnIx)
+      && (pin < 0 || tyHasTyVar(pin))
+    ) {
       lut = nulLitAtomTexts(lhs, fnIx)
     }
     return coalesceLitUnionDefaultIsAtom(e.binRight, lut, fnIx)
@@ -9676,8 +9687,15 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
   if e.binOp != "??" { return false }
   if coalesceLitUnionFits(exprIx, fnIx) { return false }
   if !exprNulLitUnion(e.binLeft, fnIx) { return false }
-  if nulLitAtomTexts(e.binLeft, fnIx).length == 0 { return false }
+  const texts = nulLitAtomTexts(e.binLeft, fnIx)
+  if texts.length == 0 { return false }
   const rt = nodeTyPinIxOf(exprIx)
+  // An instance's `??` records its generic's hole, where a string default outside the set is
+  // what makes the join `string`.
+  if fnInPinnedInstance(fnIx) && (rt < 0 || tyHasTyVar(rt)) {
+    const d = P.nodes[unwrapParen(e.binRight)]
+    if d is StrLit { return !litLexIsMember(d.strText, texts) }
+  }
   if rt < 0 || rt >= T.tys.length { return false }
   const r = T.tys[rt]
   if r is TyPrim { return r.primName == "string" }
@@ -11463,7 +11481,13 @@ function capturedIsLitAtom(fnIx: i32, name: string) {
   if fe < 0 { return false }
   const b = parentBindingOf(fe, name)
   if b >= 0 {
-    if bindingIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) { return true }
+    // Asked off the initializer from the capturing frame, as `captureValKind` sizes the env
+    // field, so a parent local the read names answers from its own declaration (D7441).
+    const askWas = capInitAsk
+    capInitAsk = true
+    const at = bindingIsLitAtom(b, parentBindingFrameArenaOf(fe, name))
+    capInitAsk = askWas
+    if at { return true }
   }
   const lv = capturedLoopVarName(fe, name, b)
   if lv == "" { return false }
@@ -11540,9 +11564,12 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
   if fe < 0 { return false }
   const b = parentBindingOf(fe, name)
   if b >= 0 {
-    if bindingIsNulLitUnion(b, parentBindingFrameArenaOf(fe, name)) {
-      return true
-    }
+    // From the capturing frame, as `capturedIsLitAtom` asks (D7441).
+    const askWas = capInitAsk
+    capInitAsk = true
+    const at = bindingIsNulLitUnion(b, parentBindingFrameArenaOf(fe, name))
+    capInitAsk = askWas
+    if at { return true }
   }
   const lv = capturedLoopVarName(fe, name, b)
   if lv == "" { return false }
@@ -11627,6 +11654,12 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if hole.length > 0 { return hole }
   const lv = tyNulLitUnionMemberTexts(loopVarPinTyOf(ix, fnIx))
   if lv.length > 0 { return lv }
+  // A join with a `null` arm holds its other arm's atom or `-1`, so a field read there names it.
+  const thIx = nulArmIfThenValueIx(ix)
+  if thIx >= 0 {
+    const th = memberAtomFieldTexts(thIx, fnIx)
+    if th.length > 0 { return th }
+  }
   const e = P.nodes[unwrapParen(ix)]
   if e is Index {
     const elem = tyNulLitUnionMemberTexts(holeNulLitElemTy(e.idxArr, fnIx))
@@ -11652,7 +11685,29 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if e is Ident && depth < declFallbackDepthCap() {
     const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(ix))
     if pt >= 0 { return nodeNulLitUnionMemberTexts(pt) }
-    const d = bindingDeclInScope(e.identName)
+    let d = bindingDeclInScope(e.identName)
+    // Outside the emit walk no scope is open, so the body's own declaration answers, as it
+    // does for `exprNulLitUnion`.
+    if d < 0 && fnIx >= 0 {
+      const dfn = P.nodes[fnIx]
+      if dfn is FuncDecl { d = parentLetOf(dfn.fnBody, e.identName) }
+    }
+    // A capture's declaration is in the frame that owns it, and classifies there (D7441).
+    if d < 0 {
+      const fe = capturedFrameOf(fnIx, e.identName)
+      const b = if fe >= 0 { parentBindingOf(fe, e.identName) } else { -1 }
+      if b >= 0 {
+        const bn = P.nodes[b]
+        if bn is LetDecl && bn.letType < 0 && bn.letInit >= 0 {
+          const pfn = parentBindingFrameArenaOf(fe, e.identName)
+          const askWas = capInitAsk
+          capInitAsk = true
+          const ct = nulLitAtomTextsAt(bn.letInit, pfn, depth + 1)
+          capInitAsk = askWas
+          return ct
+        }
+      }
+    }
     if d >= 0 {
       const dn = P.nodes[d]
       if dn is LetDecl {
@@ -11664,6 +11719,80 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
     }
   }
   tyNulLitUnionMemberTexts(exactOperandTyOf(ix, fnIx))
+}
+
+// The member texts of the atom FIELD a `recv.f` read lands on, from the row's own sidecar. A
+// literal whose checked type is `{f: string}` can share the row a literal-union field minted,
+// so the row, not the read's recorded type, is what names the members (D2151). A field every
+// arm of a struct union stores as an atom names every set its members' rows hold (D5164).
+export function memberAtomFieldTexts(ix: i32, fnIx: i32): string[] {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Member {
+    const vis: i32[] = []
+    const fis: i32[] = []
+    const ux = unwrapParen(ix)
+    if sharedUnionFieldPlan(e.memObj, e.memProp, ux, fnIx, vis, fis) == FC_I32 {
+      const texts: string[] = []
+      let k = 0
+      while k < vis.length {
+        for t in sharedFieldArmLitTexts(vis[k], fis[k]) {
+          pushUniqueAtom(texts, t)
+        }
+        k = k + 1
+      }
+      if texts.length > 0 { return texts }
+    }
+    // A variant receiver's atom field names its own set, as `exprIsLitAtomMember` claims it.
+    const vi = memRecvVariantIndex(e, ux, fnIx)
+    if vi >= 0 {
+      const vfi = variantFieldIndex(vi, e.memProp)
+      if vfi >= 0 && variantFieldIsLitUnion(vi, vfi) {
+        return sharedFieldArmLitTexts(vi, vfi)
+      }
+    }
+    const si = structIndexOfExpr(e.memObj, fnIx)
+    if si >= 0 {
+      const fi = sFieldIndex(si, e.memProp)
+      if fi >= 0 && sFieldIsLitUnion(si, fi) {
+        return tyLitMemberTexts(sFieldElemTyIxAt(si, fi))
+      }
+    }
+    // An instance's hole receiver, read where no narrowing is open: its pin's every record arm
+    // stores the field as an atom of a literal set.
+    if fnInPinnedInstance(fnIx) {
+      return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx)
+    }
+  }
+  const none: string[] = []
+  none
+}
+
+// The member texts of field `prop` over every record arm of hole receiver `recvIx`'s pin, a
+// `null` arm skipped; empty when any arm lacks the field or stores it as anything but a set.
+function holeRecvAtomFieldTexts(
+  recvIx: i32,
+  prop: string,
+  fnIx: i32,
+): string[] {
+  const none: string[] = []
+  const rt = holeOperandTyOf(recvIx, fnIx)
+  if rt < 0 || rt >= T.tys.length { return none }
+  const arms: i32[] = []
+  const r = T.tys[rt]
+  if r is TyUnion {
+    for m in r.uMembers { arms.push(m) }
+  } else {
+    arms.push(rt)
+  }
+  const texts: string[] = []
+  for m in arms {
+    if tyPrimNameOf(m) != "null" {
+      const ft = tyFieldTyOf(m, prop)
+      if !tyIsLitUnion(ft) && !tyIsOneStrLit(ft) { return none }
+      for t in tyLitMemberTexts(ft) { pushUniqueAtom(texts, t) }
+    }
+  }
+  texts
 }
 
 // The element type of receiver `arrIx`, which a hole instance `fnIx` pins to a list; -1 for any
@@ -11993,7 +12122,7 @@ export function asExprLitAtomYieldsStr(ix: i32, fnIx: i32): boolean {
 }
 
 // Whether `ty` is a lone string literal type.
-function tyIsBareStrLit(ty: i32): boolean {
+export function tyIsBareStrLit(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyLit { return t.litKind == "str" }
@@ -12098,20 +12227,21 @@ function exprIsLitAtomIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
 
 // True if a field read `e` yields a literal-union atom, through a variant or nullable-variant
 // receiver, a struct union whose members all store it as one, or a struct's own field.
+// The variant member read `memIx`'s receiver holds, in the order the field-code twins take
+// it: the narrowing, else a bare variant, else the `Arm | null` niche; -1 for none of them.
+export function memRecvVariantIndex(e: Member, memIx: i32, fnIx: i32): i32 {
+  if !memIsNarrowed(memIx) { return memRecvArmVariantIndex(e.memObj, fnIx) }
+  const vi = memNarrowVariantIndex(memIx)
+  if vi >= 0 { return vi }
+  memRecvNulVariantIndex(e.memObj, fnIx)
+}
+
 function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
   // `t0.f` reading a literal-union atom field through a narrowed union receiver or a
   // variant-typed receiver yields the atom — the variant-table twin of the struct-receiver
   // case below, in `memFieldTypeCode`'s dispatch order. Without it the read printed the raw atom id.
   const mIxA = unwrapParen(exprIx)
-  let mviA = -1
-  if memIsNarrowed(mIxA) {
-    mviA = memNarrowVariantIndex(mIxA)
-  } else {
-    mviA = exprVariantIndex(e.memObj, fnIx)
-  }
-  // The fifth receiver shape, taken in the same order the field-code twins take it: a
-  // bare variant first, then the `Arm | null` niche.
-  if mviA < 0 { mviA = memRecvNulVariantIndex(e.memObj, fnIx) }
+  const mviA = memRecvVariantIndex(e, mIxA, fnIx)
   if mviA >= 0 {
     const mvfiA = variantFieldIndex(mviA, e.memProp)
     if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == FC_I32 {
@@ -12125,10 +12255,15 @@ function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
   // claim cannot drift; code 0 alone is not sufficient, since it is also plain i32/boolean.
   const avis: i32[] = []
   const afis: i32[] = []
-  if (
-    sharedUnionFieldPlan(e.memObj, e.memProp, mIxA, fnIx, avis, afis)
-    == FC_I32
-  ) {
+  const aplan = sharedUnionFieldPlan(
+    e.memObj,
+    e.memProp,
+    mIxA,
+    fnIx,
+    avis,
+    afis,
+  )
+  if aplan == FC_I32 {
     let allAtom = avis.length > 0
     let ai = 0
     while ai < avis.length {
@@ -12158,6 +12293,10 @@ function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
       const r = sFieldIsLitUnion(msi, mfi)
       return r
     }
+  }
+  // An instance's hole receiver where no narrowing is open, as `memberAtomFieldTexts` reads it.
+  if aplan < 0 && mviA < 0 && fnInPinnedInstance(fnIx) {
+    return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx).length > 0
   }
   false
 }
@@ -19089,6 +19228,8 @@ export function letIsString(letIx: i32, fnIx: i32) {
         // Canon's banked type: `nameIsString` reads the spelling, which softens a litunion to
         // `string` — right here since nothing else claims the binding first.
         if nodeTyPrimName(d.letType) == "string" { return true }
+        // A lone literal value is its string, whatever atom field initialises it (D7220).
+        if tyIsBareStrLit(nodeTyIxOf(d.letType)) { return true }
       }
     }
     return exprString(d.letInit, fnIx)
