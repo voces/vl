@@ -6005,7 +6005,9 @@ function monoBakeCallback(
   if n is Paren {
     const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames, fnDeclIx)
     if ci == n.parInner { return ix }
-    return mkParen(ci, n.pos)
+    const np = mkParen(ci, n.pos)
+    nodeTyCarry(np, ix)
+    return np
   }
   if n is Call {
     // A call whose callee names a specialized closure param `f(...)` → direct call `cbFn(...)`;
@@ -6049,11 +6051,15 @@ function monoBakeCallback(
     // Descend into a plain assignment or arithmetic node (`acc = f(acc, x)`, the
     // reduce/fold shape). A compound-assignment node is left intact — rebuilding it
     // through `mkBinary` would drop its surface tag, and its call stays a `call_ref`.
+    // The copy answers the template's type, which a `??` reads its niche off (D7452).
     if n.binCompound != "" { return ix }
     const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames, fnDeclIx)
     const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames, fnDeclIx)
     if cl == n.binLeft && cr == n.binRight { return ix }
-    return mkBinary(n.binOp, cl, cr, n.pos)
+    const nb = mkBinary(n.binOp, cl, cr, n.pos)
+    nodeTyCarry(nb, ix)
+    if n.binRegion != 0 { markArithRegion(nb) }
+    return nb
   }
   ix
 }
@@ -13129,10 +13135,9 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   }
   if pins.length != 1 { return 0 }
   // A pin taken at this instance's own template is this instance's alone, and a generic's
-  // instances share `d`: each instance's reads of the list are typed at its own instance there.
-  if monoFrameIsGenericInstance(ctx) && monoDeclPathPinsPerInstance(at, path) {
-    return 0
-  }
+  // instances share `d`: its elements are instanced here and its reads typed per instance.
+  const shared = monoFrameIsGenericInstance(ctx)
+    && monoDeclPathPinsPerInstance(at, path)
   const ann = monoSigFnTyName(pins[0] + ";")
   let ft = -1
   for e in lit.arrElems {
@@ -13149,8 +13154,9 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     }
     const et = nodeTyIxOf(e)
     if ft < 0 && monoTyClosedFn(et) { ft = et }
-    // An instance whose pins bind none of the holes its recorded type names: read `ann`'s parameters.
-    if ft < 0 && holeLam { ft = monoHoleLamAtAnnTy(et0, ann) }
+    // An instance whose pins bind none of the holes its recorded type names: read `ann`'s
+    // parameters, as a shared list's hole functions do at this instance's own pin.
+    if ft < 0 && (holeLam || shared) { ft = monoHoleLamAtAnnTy(et0, ann) }
   }
   // A pin that is itself a function value names only a wasm signature, so a hole function's
   // instance there keeps its hole: the slot's pinned parameter types and the element's result
@@ -13159,6 +13165,10 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if !monoTyClosedFn(ft) { return 0 }
   const fty = T.tys[ft]
   if !(fty is TyFunc) { return 0 }
+  if shared {
+    monoRetypeSlotReads(ctx, at, "e", ft)
+    return 0
+  }
   // The pin's own parameter spelling, from which each instance is built, in the canonical
   // `(p)=>r` form a pin spelling is compared in (D6602).
   const lt = mkArrayTy(ft)
@@ -13270,30 +13280,28 @@ function monoPinRecordFields(d: LetDecl, at: i32, ctx: i32): i32 {
   0
 }
 
-// Types each read `d.name` in frame `fx` of the record binding declared at `at` at the pinned
-// function type `ft` where the checker left it open, so a call through the field has a
-// signature when the field's value is not a name the emitter resolves to one function (D5061).
-// A generic's instances share the read node, so there the type is kept per instance (D5079).
-function monoRetypeFieldReads(fx: i32, at: i32, name: string, ft: i32) {
+// Types each read of slot `slot` ("f.<name>" a field, "e" an element) in frame `fx` of the
+// binding declared at `at` at the pinned function type `ft` where the checker left it open, so a
+// call through it has a signature when its value is no one function (D5061). A generic's
+// instances share the read node, so there the type is kept per instance (D5079).
+function monoRetypeSlotReads(fx: i32, at: i32, slot: string, ft: i32) {
   const d = P.nodes[at]
   if !(d is LetDecl) { return 0 }
   const shared = fx >= 0 && monoFrameIsGenericInstance(fx)
   const nodes = monoFrameNodes(fx)
   const aliases: i32[] = []
   for ix in nodes {
-    const n = P.nodes[ix]
-    if n is Member {
-      if n.memProp == name && monoReadsBinding(n.memObj, d.letName, fx, at) {
-        const rt = nodeTyIxOf(ix)
-        if rt < 0 || tyHasTyVar(rt) {
-          if shared {
-            monoNoteFieldReadTy(ix, fx, ft)
-          } else {
-            nodeTyRecord(ix, ft)
-          }
+    if monoIsSlotRead(ix, slot, d.letName, fx, at) {
+      const rt = nodeTyIxOf(ix)
+      if rt < 0 || tyHasTyVar(rt) {
+        if shared {
+          monoNoteFieldReadTy(ix, fx, ft)
+        } else {
+          nodeTyRecord(ix, ft)
         }
       }
     }
+    const n = P.nodes[ix]
     if shared && n is LetDecl {
       if n.letType < 0 && n.letInit >= 0 {
         if n.letKw == "const" || !monoLetWrittenIn([fx, ix]) {
@@ -13324,6 +13332,28 @@ function monoRetypeFieldReads(fx: i32, at: i32, name: string, ft: i32) {
     }
   }
   0
+}
+
+// Whether node `ix` reads slot `slot` (`monoRetypeSlotReads`) of the binding `nm` declared at
+// `decl`, in frame `fx`.
+function monoIsSlotRead(
+  ix: i32,
+  slot: string,
+  nm: string,
+  fx: i32,
+  decl: i32,
+): boolean {
+  if slot == "e" { return monoIsElemRead(ix, nm, fx, decl) }
+  const n = P.nodes[ix]
+  n is Member
+    && "f." + n.memProp == slot
+    && monoReadsBinding(n.memObj, nm, fx, decl)
+}
+
+// Whether node `ix` indexes the binding `nm` declared at `decl`, in frame `fx`.
+function monoIsElemRead(ix: i32, nm: string, fx: i32, decl: i32): boolean {
+  const n = P.nodes[ix]
+  n is Index && monoReadsBinding(n.idxArr, nm, fx, decl)
 }
 
 // Whether `v` is a read of the binding `nm` declared at `decl`, in frame `fx`.
@@ -13392,7 +13422,7 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   if (vt < 0 || tyHasTyVar(vt)) && !monoFrameIsGenericInstance(ctx) {
     nodeTyRecord(val, ft)
   }
-  monoRetypeFieldReads(ctx, at, name, ft)
+  monoRetypeSlotReads(ctx, at, "f." + name, ft)
   for w in monoWritesOf("f:", at) {
     const wb = P.nodes[w]
     const wf = monoLetWriteFrame(lf, w)

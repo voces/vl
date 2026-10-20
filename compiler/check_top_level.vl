@@ -92,6 +92,7 @@ import {
   moduleGlobals,
 } from "./check_getter_effects"
 import { markValDiscard } from "./check_if_value"
+import { inferCycleMembers } from "./check_infer_groups"
 import { inferTentative, inferTentativeTake } from "./check_infer_rows"
 import {
   annCommitVariantMembers,
@@ -210,11 +211,7 @@ function inferReturnsPrePass() {
   const m = checkMark()
   const savedSym = symEnabled
   symEnabled = 0
-  let i = 0
-  while i < topUnannotFns.length {
-    preInferOne(topUnannotFns[i])
-    i = i + 1
-  }
+  for f in inferCycleMembers(topUnannotFns) { preInferOne(f) }
   let shrinking = true
   let rounds = 0
   while shrinking && rounds < 2000 {
@@ -465,8 +462,9 @@ export function checkProgramNode(n: Program) {
 }
 
 // Pass 2 for top-level statement `j`, after any later-declared function its body reaches whose
-// write summary still reads an untyped node: what a call may write then does not depend on
-// source order (D5593). A statement is marked done on entry, so a cycle keeps source order.
+// return is still pending or whose write summary still reads an untyped node: the callee is then
+// checked at the top level rather than inside the caller (D7764), and what a call may write does
+// not depend on source order (D5593). A statement is marked done on entry, so a cycle keeps source order.
 function progCheckCalleeFirst(
   stmts: i32[],
   j: i32,
@@ -477,7 +475,7 @@ function progCheckCalleeFirst(
   if P.nodes[stmts[j]] is FuncDecl {
     for d in weFnRefs(stmts[j]) {
       const k = stmtAt[d] ?? -1
-      if k > j && !done[k] && weSummaryUnsettled(d) {
+      if k > j && !done[k] && (retPending(d) || weSummaryUnsettled(d)) {
         progCheckCalleeFirst(stmts, k, stmtAt, done)
       }
     }
@@ -488,6 +486,19 @@ function progCheckCalleeFirst(
   checkNodeHook(stmts[j])
   crStmtLeave()
   0
+}
+
+// Whether top-level function declaration `d` still has its hoisted return pending (`-2`).
+function retPending(d: i32): boolean {
+  const fd = P.nodes[d]
+  if fd is FuncDecl {
+    const h = lookup(fd.fnName)
+    if h >= 0 {
+      const ht = T.tys[h]
+      if ht is TyFunc { return ht.fnRet == -2 }
+    }
+  }
+  false
 }
 
 // Pass 0a of `checkProgramNode`: every top-level `type` name registers before any body is
