@@ -417,7 +417,7 @@ import {
   ifElseValueIx,
   ifIsChainHeadIn,
   ifJoinIsMapUnion,
-  ifJoinIsNulStringPair,
+  ifJoinIsNulString,
   ifJoinIsScalarPrim,
   ifListArmValueIx,
   ifRepArmValueIx,
@@ -9654,10 +9654,10 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
   !tySameSet(vt, tyPeelNul(nodeTyPinIxOf(ix)), TY_WALK_DEPTH)
 }
 
-// The one nullability decision for the non-map `??` reps (the value-union box and the
-// nullable-struct niche): `??` coalesces on the LHS being null, so a non-null default
-// collapses to the non-null rep while a nullable default leaves `T | null`. Structural in
-// the chain, never banked, since a re-associated `p ?? q ?? r` mints an untyped inner node.
+// The one nullability decision for the `??` reps: a non-null default collapses to the
+// non-null rep, a nullable one leaves `T | null`. A hole's read off a map its instance pins is
+// `V | null` whatever the template recorded. Structural in the chain, never banked, since a
+// re-associated `p ?? q ?? r` mints an untyped inner node.
 export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   if defIx < 0 { return false }
   const dix = unwrapParen(defIx)
@@ -9670,8 +9670,20 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
     BinExpr => {
       if d.binOp == "??" { return coalesceDefaultNullable(d.binRight, fnIx) }
     }
+    Index => {
+      const dt = nodeTyIxOf(dix)
+      if (
+        dt >= 0
+        && dt < T.tys.length
+        && T.tys[dt] is TyVar
+        && !indexPlaceNonNull(dix)
+        && mapRecvTyIn(d.idxArr, fnIx) >= 0
+      ) {
+        return true
+      }
+    }
     // Any other default is nullable only by its type or its union, read below.
-    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   if nodeTyIsNullable(dix) { return true }
   const un = unionNameOfExpr(dix, fnIx)
@@ -10248,11 +10260,11 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   }
   // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfA = nulIfArmNullableValueIx(exprIx)
-  // A two-arm join typed `string | null` is the string niche, whatever its first arm is; a link
-  // of an `else if` chain keeps its chain's answer (D3303).
+  // A join typed `string | null` is the string niche, whatever its first arm is, at its chain's
+  // head in a function or the module; a link of an `else if` chain keeps its chain's answer (D3303).
   if (
     nlIfA >= 0
-    && !(ifJoinIsNulStringPair(unwrapParen(exprIx))
+    && !(ifJoinIsNulString(unwrapParen(exprIx))
       && ifIsChainHeadIn(unwrapParen(exprIx), fnIx))
   ) {
     if exprNulLitUnion(nlIfA, fnIx) { return true }
@@ -11891,23 +11903,28 @@ function coalMapReadNulAtomTexts(ix: i32, fnIx: i32): string[] {
   if u < 0 { return none }
   const e = P.nodes[u]
   if !(e is BinExpr) || e.binOp != "??" { return none }
-  const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-  if cr < 0 || !coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
-  if coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
-  mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+  if !coalesceDefaultNullable(e.binRight, fnIx) { return none }
+  coalMapReadChainTexts(u, fnIx)
 }
 
-// `coalesceDefaultNullable`, where a default that is itself a hole's read off a map its
-// instance pins also counts: that read is `V | null`, whatever the template recorded.
-export function coalMapDefaultMayBeNull(defIx: i32, fnIx: i32): boolean {
-  if coalesceDefaultNullable(defIx, fnIx) { return true }
-  const dix = unwrapParen(defIx)
-  if dix < 0 { return false }
-  const d = P.nodes[dix]
-  if !(d is Index) || indexPlaceNonNull(dix) { return false }
-  const dt = nodeTyIxOf(dix)
-  if dt < 0 || dt >= T.tys.length || !(T.tys[dt] is TyVar) { return false }
-  mapRecvTyIn(d.idxArr, fnIx) >= 0
+// The member texts of the `??` chain at `u` whose leftmost operand is a read off an atom-valued
+// map and each of whose defaults that read's atom rep holds; empty for any other expression.
+// A chain groups left, so `m[a] ?? m[b] ?? d` is found through its left spine (D7444).
+function coalMapReadChainTexts(u: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  const e = P.nodes[u]
+  if !(e is BinExpr) || e.binOp != "??" { return none }
+  const l = unwrapParen(e.binLeft)
+  if l < 0 { return none }
+  const cr = fusedMapReadRecvIx(l)
+  if cr >= 0 {
+    if coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
+    return mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+  }
+  const texts = coalMapReadChainTexts(l, fnIx)
+  if texts.length == 0 { return none }
+  if !coalesceLitUnionDefaultIsAtom(e.binRight, texts, fnIx) { return none }
+  texts
 }
 
 // `callResultAtomTexts`'s type: the callee's result where it names member texts, else -1. An
