@@ -1475,11 +1475,13 @@ import { srcmapFileOfTok } from "./srcmap"
 import { covarRootFrame, covarRootName } from "./check_write_scan"
 import {
   flattenVariantsInto,
+  isNullTy,
   nonNullTy,
   nullableInnerOrNone,
   numLitUnionHasBase,
   numPrimTyOfKind,
   primNameOf,
+  tyAdmitsNull,
   tyEmitPrimOf,
   tyHasTyVar,
   tyHoldsNumbersApart,
@@ -5941,6 +5943,19 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
   return 0
 }
 
+// 1 or 0 when the re-readable operand of `is` at `isIx` holds only `null` at instance `fnIx`,
+// so the test is whether the tested type admits `null`; -1 otherwise. The name cascade would
+// read such an operand as the `i32` it shares a pin with (D8182).
+function nullInstanceIsResult(isIx: i32, fnIx: i32): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return -1 }
+  if !isNullTy(instanceReadTyOf(nd.isObj, fnIx)) { return -1 }
+  if !exprReReadable(unwrapParen(nd.isObj)) { return -1 }
+  const nlt = isVarTyIxOf(isIx)
+  if nlt < 0 || nlt >= T.tys.length || T.tys[nlt] is TyVar { return -1 }
+  if tyAdmitsNull(nlt) { 1 } else { 0 }
+}
+
 // `recv is X` over an operand read at the rep the narrowing stack leaves it. Fixed,
 // load-bearing arm order: niche null tests, atom/literal-union membership, box-tag compares,
 // mono-static folds, then the variant tag+discriminant compare. A niche `is` assumes the checker
@@ -5959,6 +5974,11 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
         return ionRc
       }
     }
+  }
+  const nst = nullInstanceIsResult(isIx, fnIx)
+  if nst >= 0 {
+    fbI32Const(nst)
+    return 0
   }
   const rfit = emitRecordFitIs(body, isIx, fnIx)
   if rfit != 0 { return if rfit < 0 { -1 } else { 0 } }
@@ -6258,32 +6278,11 @@ function emitNarrowedMem(body: u8[], memIx: i32, fnIx: i32) {
     fbRefCast(uVarHeap[vi])
     fbStructGet(uVarHeap[vi], idx)
 
+    // A value-union field read while the checker types it as one atom unboxes to that atom,
+    // through the home the bare-arm twin uses: an index-rooted path has no member key, so
+    // only that home's checker-typed arm sees `xs[0].r` under `!= null` (D8145).
     if variantFieldTypeAt(vi, idx) == FC_UNION {
-      // a value-union field whose own member path is narrowed to one scalar atom: the
-      // `struct.get` above yields the field's inner box, so unbox it to the atom's rep too.
-      const mAtom = narrowVariantFor(memberPathKeyOf(memIx))
-      const mk = valueAtomKind(mAtom)
-      if mk >= 0 && mk != nullValKind() {
-        fbStructGet(uBoxIdx, 1)
-
-        if mk == 2 {
-          if !aUsed {
-            return emitFail(
-              "emitProgram: narrowed string union field read but array type not collected",
-            )
-          }
-          fbRefCast(sTypeIdx)
-        } else {
-          const mvb = vbHeapIdxOfKind(mk)
-          if mvb < 0 {
-            return emitFail(
-              "emitProgram: narrowed union field atom has no value box",
-            )
-          }
-          fbRefCast(mvb)
-          fbStructGet(mvb, 0)
-        }
-      }
+      return emitUnionFieldNarrowUnbox(memIx, fnIx)
     }
     return 0
   }
@@ -38709,6 +38708,16 @@ function emitCoalesceCallStash(
   return emitCoalesceUnionField(body, e, lhsIx, exprIx, fnIx)
 }
 
+// The variant row the receiver of the field read `memIx` is narrowed to when that receiver is
+// a union box, or -1: the pairing `emitMem` reads through `emitNarrowedMem`.
+function coalNarrowedBoxArm(memIx: i32, fnIx: i32): i32 {
+  const m = P.nodes[memIx]
+  if !(m is Member) || !memIsNarrowed(memIx) { return -1 }
+  const vi = memNarrowVariantIndex(memIx)
+  if vi < 0 || !exprUnion(m.memObj, fnIx) { return -1 }
+  vi
+}
+
 // The `emitCoalesceGo` arm over a value-union record field `o.v ?? d`, then the rest of the
 // ladder. Returns what `emitCoalesceGo` returns.
 function emitCoalesceUnionField(
@@ -38730,7 +38739,12 @@ function emitCoalesceUnionField(
     let mfi = -1
     let mphys = ""
     let mCast = -1
-    const msi = structIndexOfExpr(lhs.memObj, fnIx)
+    // A box receiver narrowed to one arm is unwrapped to that arm, asked ahead of the row as
+    // `emitMem` asks it: an index place is typed at the arm, so `structIndexOfExpr` answers
+    // for a ref it does not hold (D8145). A null-tested nullable arm is asserted non-null.
+    let mvi = coalNarrowedBoxArm(lhsIx, fnIx)
+    if mvi >= 0 { mCast = uVarHeap[mvi] }
+    const msi = if mvi >= 0 { -1 } else { structIndexOfExpr(lhs.memObj, fnIx) }
     if msi >= 0 {
       mfi = sFieldIndex(msi, lhs.memProp)
       if mfi >= 0 && sFieldTypeAt(msi, mfi) == FC_UNION {
@@ -38738,13 +38752,7 @@ function emitCoalesceUnionField(
         mphys = sFieldElemNameAt(msi, mfi)
       }
     } else {
-      // A box receiver narrowed to one arm is unwrapped to that arm, and a null-tested
-      // nullable arm asserted non-null, before the field read.
-      let mvi = exprVariantIndex(lhs.memObj, fnIx)
-      if mvi < 0 && memIsNarrowed(lhsIx) && exprUnion(lhs.memObj, fnIx) {
-        mvi = memNarrowVariantIndex(lhsIx)
-        if mvi >= 0 { mCast = uVarHeap[mvi] }
-      }
+      if mvi < 0 { mvi = exprVariantIndex(lhs.memObj, fnIx) }
       if mvi < 0 && exprNullableVariant(lhs.memObj, fnIx) {
         mvi = nulVariantIdxOfExpr(lhs.memObj, fnIx)
         mCast = -2

@@ -612,7 +612,7 @@ const CASES: Case[] = [
     why: "ambient",
     from: "print(3)",
     to: "const qq: { f: i32 } = { f: 1 }\n  print(qq.f)",
-    uses: "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nfunction mk() { { f: 4 } }\nconst xj: J = idn(mk())\nprint(xj.f ?? 0)\n",
+    uses: "type J = { f: i32 | null }\nfunction mk() { { f: 4 } }\nconst xj: J = mk()\nconst kk = mk()\nprint(xj.f ?? 0)\nprint(kk.f)\n",
   },
   {
     name: "a private lib type spells main's literal record",
@@ -620,7 +620,7 @@ const CASES: Case[] = [
     why: "ambient",
     from: "function quiet",
     to: "type II = { f: i32 }\nfunction quiet",
-    uses: "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nfunction mk() { { f: 4 } }\nconst xj: J = idn(mk())\nprint(xj.f ?? 0)\n",
+    uses: "type J = { f: i32 | null }\nfunction mk() { { f: 4 } }\nconst xj: J = mk()\nconst kk = mk()\nprint(xj.f ?? 0)\nprint(kk.f)\n",
   },
   {
     name: "a lib generic application spells main's literal record",
@@ -629,7 +629,7 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "function bq(b: Bx<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: i32 | null }\ntype Bx<T> = { f: T }\n",
-    uses: 'import { J } from "./lib"\nfunction idn<T>(v: T): T { v }\nfunction mk() { { f: 4 } }\nconst xj: J = idn(mk())\nprint(xj.f ?? 0)\n',
+    uses: 'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J = mk()\nconst kk = mk()\nprint(xj.f ?? 0)\nprint(kk.f)\n',
   },
   {
     name: "a private lib self-function main's typo is near",
@@ -705,7 +705,7 @@ const CASES: Case[] = [
     from: "function quiet",
     to: "function bq(b: Map<i32>): void { print(b.f) }\nfunction quiet",
     libUses: "export type J = { f: i32 | null }\ntype Map<T> = { f: T }\n",
-    uses: 'import { J } from "./lib"\nfunction idn<T>(v: T): T { v }\nfunction mk() { { f: 4 } }\nconst xj: J = idn(mk())\nprint(xj.f ?? 0)\n',
+    uses: 'import { J } from "./lib"\nfunction mk() { { f: 4 } }\nconst xj: J = mk()\nconst kk = mk()\nprint(xj.f ?? 0)\nprint(kk.f)\n',
   },
   {
     name: "main's private type spells a lib body literal's record",
@@ -714,7 +714,7 @@ const CASES: Case[] = [
     from: "n * 2",
     to: "n * 3",
     libUses:
-      "type J = { f: i32 | null }\nfunction idn<T>(v: T): T { v }\nfunction mk() { { f: 4 } }\nfunction jj(): void {\n  const xj: J = idn(mk())\n  print(xj.f ?? 0)\n}\n",
+      "type J = { f: i32 | null }\nfunction mk() { { f: 4 } }\nfunction jj(): void {\n  const xj: J = mk()\n  const kk = mk()\n  print(xj.f ?? 0)\n  print(kk.f)\n}\n",
     uses: "type II = { f: i32 }\n",
   },
   {

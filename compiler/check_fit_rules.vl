@@ -249,6 +249,8 @@ import {
   recAdLandingList,
   recAdPushDecl,
   recDelivPush,
+  recPendDstTy,
+  recPendSrc,
 } from "./check_rec_rows"
 import {
   recAtPinnedArg,
@@ -332,6 +334,7 @@ import {
   containerElemClassDiffers,
   containerWidenServed,
   containerWidenWhy,
+  fieldStorageEq,
   listJoinStorageDiffers,
   listPairNeedsCopy,
   objFieldNameSetsEq,
@@ -1660,7 +1663,7 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   cwIxBuild()
   recDelivPush(fd, call, REC_DELIV_READ)
   const sites: i32[] = []
-  if rcwCallSites(fd, sites) >= 0 || sites.length != 1 || sites[0] != call * 2 {
+  if rcwCallSites(fd, sites) >= 0 || !recSitesLandAt(sites, call, own, dst) {
     return false
   }
   const leaves = recFnValueLeaves(fd)
@@ -1678,6 +1681,16 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
       && recInferredFnOf(lp) != fd
     ) {
       calls.push(lp)
+    } else if lp != call && recSolePinArg(lp) >= 0 {
+      let x = lp
+      let hops = 0
+      while x >= 0 && x < P.nodes.length && hops < 16 && recSolePinArg(x) >= 0 {
+        x = cwPeelValue(recSolePinArg(x))
+        hops = hops + 1
+      }
+      const ia = recInferredFnOf(x)
+      if ia < 0 || ia == fd { return false }
+      calls.push(lp)
     } else {
       return false
     }
@@ -1686,6 +1699,79 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
   // A leaf calling another such function hands the destination on to it (D8143).
   for cl in calls { recAdoptNote(cl, nodeTyIxOf(cl), dst) }
   true
+}
+
+// Whether call sites `sites` (`rcwCallSites`) are `call` and calls each queued for a delivery
+// that lands a record of `own` on one of `dst`'s field storage, so one build serves them all
+// (D8201).
+function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
+  if sites.length == 1 { return sites[0] == call * 2 }
+  let hasCall = false
+  for s in sites {
+    if s % 2 != 0 { return false }
+    const c = s / 2
+    if c == call { hasCall = true }
+    const at = recQueuedLandingOf(c, own)
+    if at < 0 || !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
+  }
+  hasCall
+}
+
+// The record a queued delivery lands call `c`'s record of `own` on, through generic identities
+// only it pins and the fields and elements of literals; -1 when no queued delivery reaches `c` or
+// two land it differently.
+function recQueuedLandingOf(c: i32, own: i32): i32 {
+  let got = -1
+  let i = 0
+  while i < recPendSrc.length {
+    const t = recLandingIn(
+      recPendSrc[i],
+      recPendDstTy[i],
+      c,
+      own,
+      REC_STORE_DEPTH,
+    )
+    if t >= 0 {
+      if got >= 0 && !fieldStorageEq(got, t, REC_STORE_DEPTH) { return -1 }
+      got = t
+    }
+    i = i + 1
+  }
+  got
+}
+
+// `recQueuedLandingOf` for one delivery of `src` as a `dstTy`.
+function recLandingIn(src: i32, dstTy: i32, c: i32, own: i32, depth: i32): i32 {
+  const p = cwPeelValue(src)
+  const d = nonNulTyOf(dstTy)
+  if p < 0 || p >= P.nodes.length || d < 0 || d >= T.tys.length || depth <= 0 {
+    return -1
+  }
+  if p == c { return recAdLanding(own, d) }
+  if recSolePinArg(p) >= 0 {
+    return recLandingIn(recSolePinArg(p), d, c, own, depth - 1)
+  }
+  const e = P.nodes[p]
+  const dt = T.tys[d]
+  if e is ObjLit && dt is TyObj {
+    let i = 0
+    while i < dt.objFieldNames.length {
+      const fx = objLitFieldExpr(p, dt.objFieldNames[i])
+      if fx >= 0 {
+        const t = recLandingIn(fx, dt.objFieldTypes[i], c, own, depth - 1)
+        if t >= 0 { return t }
+      }
+      i = i + 1
+    }
+  } else if e is ArrayLit {
+    const de = tyArrayElemIx(d)
+    if de < 0 { return -1 }
+    for el in e.arrElems {
+      const t = recLandingIn(el, de, c, own, depth - 1)
+      if t >= 0 { return t }
+    }
+  }
+  -1
 }
 
 // Does the inferred function `fd` hand back an object literal, directly or through a call to
@@ -1860,6 +1946,15 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
           && recFloatBuiltElsewhere(p, srcTy, pl)
         ) {
           return 0
+        }
+        // Where only this argument pins the instance, the call is built at the record it lands
+        // on and the instance is taken there, as a direct delivery builds it (D8020).
+        if (
+          recSolePinArg(p) >= 0
+          && recLandingOf(srcTy, dstTy) == pl
+          && recFnBuiltAtDst(pf, pp, srcTy, dstTy)
+        ) {
+          return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pp)
         }
         if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
       }

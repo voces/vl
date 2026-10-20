@@ -96,6 +96,7 @@ import {
   structNameOfTy,
   tyArrayElemIx,
   tyArrayElemPrim,
+  tyEqSameHoles,
   tyFieldTyOf,
   tyHoldsObj,
   tyIsLitUnion,
@@ -698,6 +699,7 @@ import {
   nulRefStructIdxOfLet,
   nulVariantIdxOfLet,
   objVariantName,
+  objVariantNameCtx,
   pinnedValTyOf,
   preStmtNarrow,
   pushPostGuardNarrow,
@@ -708,6 +710,7 @@ import {
   stmtIsTailValue,
   structIndexOfLet,
   structIndexOfObj,
+  structIndexOfObjCtx,
   unionNameOfExpr,
   variantIndexOfLet,
 } from "./emit_classify"
@@ -817,7 +820,7 @@ import {
   tailSelfFnSet,
   tyAnnRefListSlot,
 } from "./emit_nullable_rets"
-import { objVariantIndexDrop } from "./emit_obj_lit_fits"
+import { objLitFieldSig, objVariantIndexDrop } from "./emit_obj_lit_fits"
 import { rlWidenVariantOf } from "./emit_ref_list_kinds"
 import {
   anonLeafFoldBlocked,
@@ -7986,25 +7989,73 @@ function mintGradualObjLitRows() {
   0
 }
 
-// Every generic instance's record literals with a field at a type parameter get the row of
-// their type at that instance's pins, which the collect pass could not mint from the template's
-// type (D3032). A literal whose pins do not all resolve mints nothing and refuses at emit. Not
-// in a constructor, whose record leaves the instance and is built where it is delivered (D2850).
+// Every generic instance's record literals with a field at a type parameter get their row at
+// that instance's pins, which the template's type cannot mint (D3032); unresolved pins refuse at
+// emit. A constructor, whose record leaves the instance, mints only a literal no row or union
+// arm serves there, so a pin delivered into a wider declared arm keeps building it (D2850).
 function mintPinnedObjLitRows() {
+  let ctorRows = false
   let k = 0
   while k < monoInstFe.length && k < monoInstOrig.length {
     const fe = monoInstFe[k]
-    if (
-      fe >= 0
-      && fe < fnStmts.length
-      && instRetKeepsRecordsIn(monoInstOrig[k])
-    ) {
+    if fe >= 0 && fe < fnStmts.length {
       const fd = P.nodes[fnStmts[fe]]
       if fd is FuncDecl {
+        pinCtorUnserved = !instRetKeepsRecordsIn(monoInstOrig[k])
+        if pinCtorUnserved {
+          pinCtorRet = tyStepRet(nodeTyIxOf(monoOrigNode[monoInstOrig[k]]))
+          pinCtorBody = fd.fnBody
+        }
+        const before = sNames.length
         mintPinnedObjLitsIn(fd.fnBody, fnStmts[fe], fd.fnBody, 0)
+        if pinCtorUnserved && sNames.length > before { ctorRows = true }
+        pinCtorUnserved = false
+        pinCtorRet = -1
+        pinCtorBody = -1
       }
     }
     k = k + 1
+  }
+  if ctorRows { mintCtorHolderRows() }
+  0
+}
+
+// Whether `mintPinnedObjLit` is minting a constructor's literal, which mints only when unserved.
+let pinCtorUnserved = false
+// That constructor's template return type: only a literal of exactly that type mints, never
+// one arm of a join, whose other arms would be built at another row (D2855).
+let pinCtorRet = -1
+// That constructor's body, where a second literal with the same field names is such an arm.
+let pinCtorBody = -1
+
+// How many record literals under `ix` carry the field-name signature `sig`.
+function objLitSigCountIn(ix: i32, sig: string, depth: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length || depth > 256 { return 0 }
+  let c = 0
+  if P.nodes[ix] is ObjLit && objLitFieldSig(ix) == sig { c = 1 }
+  for k in nodeChildren(ix) { c = c + objLitSigCountIn(k, sig, depth + 1) }
+  c
+}
+
+// Every concrete record literal left without a row because a field holds a constructor's
+// record, whose row exists only once its instance mints it (D2850).
+function mintCtorHolderRows() {
+  const nLim = P.nodes.length
+  let li = 0
+  while li < nLim {
+    if P.nodes[li] is ObjLit {
+      const lt = nodeTyIxOf(li)
+      if (
+        lt >= 0
+        && lt < T.tys.length
+        && !tyHasTyVar(lt)
+        && structIndexOfObj(li) < 0
+        && objVariantName(li) == ""
+      ) {
+        internShapeDeepOfTy(lt)
+      }
+    }
+    li = li + 1
   }
   0
 }
@@ -8102,6 +8153,12 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
       internShapeDeepOfTy(lt)
     }
     return 0
+  }
+  if pinCtorUnserved {
+    if !tyEqSameHoles(lt, pinCtorRet) { return 0 }
+    if objLitSigCountIn(pinCtorBody, objLitFieldSig(objIx), 0) != 1 { return 0 }
+    if structIndexOfObjCtx(objIx, fnIx) >= 0 { return 0 }
+    if objVariantNameCtx(objIx, fnIx) != "" { return 0 }
   }
   // A field at a union holding a type parameter is substituted through the instance's own
   // bindings, since no one value's pin names the parameter (D2906).
