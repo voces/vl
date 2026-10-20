@@ -103,6 +103,7 @@ import { substNullFoldOffFor, substNullFoldRestore } from "./check_subst_fold"
 import { uniqueGenericDeclNamed } from "./check_generic_args"
 import {
   T,
+  TY_NULL,
   TY_VOID,
   Ty,
   TyArray,
@@ -131,6 +132,7 @@ import {
   tyEq,
   tyFieldTyOf,
   tyIsLitUnion,
+  tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsMap,
   tyIsOneStrLit,
@@ -1012,6 +1014,9 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   // or nullable); the annotation channel exists only for the clone whose node carries `T`.
   if own >= 0 && nodeTyIsFunc(ax) { return own }
   if tyNulFuncInner(own) >= 0 { return own }
+  if monoReadsUnfilledNull(ax) || monoParamPinnedNull(ax, fnIx) {
+    return TY_NULL
+  }
   const pn = monoCloPinAnnNodeOfExpr(ax, fnIx)
   if pn >= 0 { return nodeTyIxOf(pn) }
   own
@@ -1097,7 +1102,11 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // reaches the membership test looking like a match on both sides, and the pin then
   // drops from the interned atom to a string ref. `tyRenderSoftensLits` is the home for
   // that hazard, and a litunion argument's pin is claimed by the litunion rungs anyway.
-  if tyRenderSoftensLits(nt) { return monoNarrowedLitPinName(nt, wide) }
+  if tyRenderSoftensLits(nt) {
+    const ln = monoNarrowedLitPinName(nt, wide)
+    if ln != "" { return ln }
+    return monoNarrowedNonNullPinName(nt, wide)
+  }
   const n = tyToEmitName(nt)
   if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, nt, wide) {
     if monoAnnPinName(n) == n { return n }
@@ -1136,6 +1145,61 @@ function monoNarrowedNulRecPinName(nt: i32, n: string, wide: string): string {
     if monoAnnPinName(n) == n { return n }
   }
   ""
+}
+
+// The pin of a value union `nt` holding literal arms, read out of the nullable union `wide` with
+// only its `null` narrowed away: `wide`'s spelling less `null`, registered as the row `nt` is,
+// else "". The render of `nt` softens its literals, so the arms are compared as `wide` spells
+// them (D8281).
+function monoNarrowedNonNullPinName(nt: i32, wide: string): string {
+  if nt < 0 || !(T.tys[nt] is TyUnion) || tyIsLitUnion(nt) { return "" }
+  const wa: string[] = []
+  unionArmsOf(wide, wa)
+  let hasNull = false
+  let base = ""
+  for a in wa {
+    if a == "null" {
+      hasNull = true
+    } else {
+      if base != "" { base = base + "|" }
+      base = base + a
+    }
+  }
+  if !hasNull || base == "" || wa.length < 3 { return "" }
+  let arms = monoUnionArmCount(nt, TY_WALK_DEPTH)
+  if arms < 0 { return "" }
+  if monoUnionStrLitCount(nt, TY_WALK_DEPTH) > 0 { arms = arms + 1 }
+  if arms != wa.length - 1 { return "" }
+  if monoRegisterPinUnion(base, nt) < 0 { return "" }
+  if monoAnnPinName(base) != base { return "" }
+  base
+}
+
+// The arms union `ty` renders, less its string literals, which the render softens into one
+// `string` arm: a nested union's flattened, a literal-union alias as one. -1 past `depth`.
+function monoUnionArmCount(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
+  const t = T.tys[ty]
+  if t is TyLit && t.litKind == "str" { return 0 }
+  if !(t is TyUnion) || tyIsLitUnionAlias(ty) { return 1 }
+  let n = 0
+  for m in t.uMembers {
+    const k = monoUnionArmCount(m, depth - 1)
+    if k < 0 { return -1 }
+    n = n + k
+  }
+  n
+}
+
+// The string literals `monoUnionArmCount` leaves out of the union `ty`.
+function monoUnionStrLitCount(ty: i32, depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return 0 }
+  const t = T.tys[ty]
+  if t is TyLit && t.litKind == "str" { return 1 }
+  if !(t is TyUnion) || tyIsLitUnionAlias(ty) { return 0 }
+  let n = 0
+  for m in t.uMembers { n = n + monoUnionStrLitCount(m, depth - 1) }
+  n
 }
 
 // The narrowed pin of a literal-union argument: its alias, when that alias is a member of the
@@ -1379,7 +1443,14 @@ function monoArgPinName(ix: i32, fnIx: i32) {
   }
   // An argument the checker typed the `null` unit type pins it, the `nulnone` cell, whether a
   // bare `null` or a `null`-typed read; a `null[]` pins its own spelling, not the i32 list (D4687).
-  if nodeTyIsNullType(unwrapParen(ix)) { return "null" }
+  if (
+    nodeTyIsNullType(unwrapParen(ix))
+    || monoReadsUnfilledNull(unwrapParen(ix))
+  ) {
+    return "null"
+  }
+  // An instance's own parameter pinned at `null`, handed on: the node still records `T` (D8280).
+  if monoParamPinnedNull(unwrapParen(ix), fnIx) { return "null" }
   if nodeArrayElemIsNullUnit(unwrapParen(ix)) { return "null[]" }
   const n = monoNarrowedPinName(unwrapParen(ix), fnIx, w)
   if n != "" { return n }
@@ -1391,6 +1462,62 @@ function monoArgPinName(ix: i32, fnIx: i32) {
   const drl = monoDeclRecListPinName(unwrapParen(ix), w)
   if drl != "" { return drl }
   w
+}
+
+// Whether `ax` reads a `let x = null` binding no write filled. By emit time every scope has
+// closed, so its only value is `null` and the binding reps `nullref` (D8280).
+function monoReadsUnfilledNull(ax: i32): boolean {
+  if ax < 0 || !(P.nodes[ax] is Ident) { return false }
+  const d = identDeclOf(ax)
+  if d < 0 || d >= P.nodes.length || !(P.nodes[d] is LetDecl) { return false }
+  tyIsUnfilledNullHole(nodeTyIxOf(ax))
+}
+
+function tyIsUnfilledNullHole(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyNullable { return t.nInner < 0 }
+  false
+}
+
+// Whether a hole parameter's pin, resolved to `named` from its spelling, lost the string-literal
+// members of `arg`, the value union the argument holds: `named` softened them to `string`.
+function monoPinKeepsInlineLits(named: i32, arg: i32): boolean {
+  if named < 0 || arg < 0 || named >= T.tys.length || arg >= T.tys.length {
+    return false
+  }
+  if tyHasLitDeep(named, 3) { return false }
+  const a = T.tys[monoPeelNullable(arg)]
+  if !(a is TyUnion) || tyIsLitUnion(monoPeelNullable(arg)) { return false }
+  if !(T.tys[monoPeelNullable(named)] is TyUnion) { return false }
+  let lit = false
+  for m in a.uMembers {
+    const mt = T.tys[m]
+    if mt is TyLit {
+      if mt.litKind != "str" { return false }
+      lit = true
+    }
+  }
+  lit
+}
+
+// `ty`'s inner type when it is a filled nullable, else `ty`.
+function monoPeelNullable(ty: i32): i32 {
+  const t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner >= 0 && t.nInner < T.tys.length { return t.nInner }
+  }
+  ty
+}
+
+// Whether `ax` reads a parameter of instance `fnIx` whose annotation is the `null` type.
+function monoParamPinnedNull(ax: i32, fnIx: i32): boolean {
+  if ax < 0 || fnIx < 0 { return false }
+  const n = P.nodes[ax]
+  if !(n is Ident) { return false }
+  const ptn = paramTypeNode(fnIx, n.identName)
+  if ptn < 0 { return false }
+  tyNameOf(ptn) == "null"
 }
 
 // `S[]` for a list or `readonly` view argument whose element is declared record `S` itself and
@@ -9496,6 +9623,11 @@ function monoMakeInstanceParams(
         }
       } else if annotateI32 || pinned[pj] != "i32" {
         nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
+        // The pin name renders inline literal members as `string`; a union box holding them
+        // keeps the argument's own members, which its narrowed reads are keyed on (D8181).
+        if monoPinKeepsInlineLits(nodeTyIxOf(nt), pinTys[pj]) {
+          nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
+        }
         synthed = true
       }
       // The pinned concrete param type is recorded on the instance's annotation node,
