@@ -17,6 +17,7 @@ import {
   FieldInit,
   FuncDecl,
   Ident,
+  IfStmt,
   Index,
   IsExpr,
   LetDecl,
@@ -73,6 +74,8 @@ let fsMode = FS_COMPILE
 // The refused declarations, as parse-arena indices, and whether the last compile added one.
 let fsAsks: i32[] = []
 let fsTpAsks: i32[] = []
+// The refused calls through a function value handed a generic function (D7183).
+let fsCallAsks: i32[] = []
 let fsAskGrew = false
 // The parse arena's length in the current compile; a node at or past it is minted by the plan.
 let fsParseLen = 0
@@ -223,6 +226,7 @@ export function fsReset(): i32 {
   fsMode = FS_COMPILE
   fsAsks = []
   fsTpAsks = []
+  fsCallAsks = []
   fsAskGrew = false
   fsPlanReset()
 }
@@ -236,7 +240,9 @@ export function fsSetMode(m: i32): i32 {
 export function fsModeOf(): i32 { fsMode }
 
 // Whether the compile asked for a split, and whether its asks include a new declaration.
-export function fsAsked(): boolean { fsAsks.length > 0 || fsTpAsks.length > 0 }
+export function fsAsked(): boolean {
+  fsAsks.length > 0 || fsTpAsks.length > 0 || fsCallAsks.length > 0
+}
 export function fsGrew(): boolean { fsAskGrew }
 
 // Whether parse node `ix` is one the plan minted, in the compile that applies it.
@@ -250,6 +256,15 @@ export function fsAskCallee(callee: i32): i32 {
   const d = letDeclOfRead(callee)
   if d < 0 { return 0 }
   fsAsk(d)
+}
+
+// The emitter refuses call `c` through a function value for handing a generic function to a
+// parameter no one instance binds; records its parse node, whose callees' parameters are asked.
+export function fsAskOpenCall(c: i32): i32 {
+  if c < 0 || c >= fsParseLen || hasI32(fsCallAsks, c) { return 0 }
+  fsCallAsks.push(c)
+  fsAskGrew = true
+  0
 }
 
 // The emitter refuses declaration `d` for wanting two signatures; records its parse node.
@@ -281,6 +296,17 @@ function hasI32(xs: i32[], x: i32): boolean {
     if y == x { return true }
   }
   false
+}
+
+// Whether key lists `a` and `b` hold the same keys in the same order.
+function fsSameKeys(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if a[i] != b[i] { return false }
+    i = i + 1
+  }
+  true
 }
 
 function hasStr(xs: string[], x: string): boolean {
@@ -1312,6 +1338,7 @@ export function fsPlan(root: i32): i32 {
   fsWalk(root)
   fsReachIndex(root)
   let fields = 1
+  fsAskOpenCallPars()
   const tps = fsPlanTyParams()
   // A generic read refused as an identity call's argument asks for the binding it initializes.
   let ai = 0
@@ -1951,6 +1978,12 @@ function fsFnCalls(fd: i32): i32[] {
           calls.push(c)
         } else if fsFnAliasInit(c) == r && !hasI32(decls, c) {
           decls.push(c)
+        } else if fsIfJoinLetOf(r) >= 0 {
+          // An `if` arm a `const` holds is called through that binding's reads (D7183).
+          if !hasI32(decls, fsIfJoinLetOf(r)) { decls.push(fsIfJoinLetOf(r)) }
+        } else if fsIfArmElemOf(r) >= 0 {
+          // An `if` arm a list element ends in is called through the literal's reads (D7183).
+          for lc in vrCalls(fsIfArmElemOf(r), "") { calls.push(lc) }
         } else if cn is BinExpr && (cn.binOp == "==" || cn.binOp == "!=") {
           // A comparison reads the function's identity and calls nothing.
         } else if cn is ArrayLit || cn is FieldInit {
@@ -1991,6 +2024,53 @@ function fsFnCalls(fd: i32): i32[] {
   }
   fsFnCallsCopy = cps
   calls
+}
+
+// The un-annotated `const` binding whose initializer is an `if` with an `else`, one of whose
+// arms ends in read `r`; -1 otherwise.
+function fsIfJoinLetOf(r: i32): i32 {
+  const i = fsIfArmOf(r)
+  if i < 0 { return -1 }
+  const d = fsParent[i]
+  if d < 0 || d >= fsParseLen { return -1 }
+  const dn = P.nodes[d]
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit != i
+  ) {
+    return -1
+  }
+  d
+}
+
+// The `if` with an `else` a list literal holds as an element, one of whose arms ends in read
+// `r`; -1 otherwise.
+function fsIfArmElemOf(r: i32): i32 {
+  const i = fsIfArmOf(r)
+  if i < 0 { return -1 }
+  const l = fsParent[i]
+  if l < 0 || l >= fsParseLen || !(P.nodes[l] is ArrayLit) { return -1 }
+  i
+}
+
+// The `if` with an `else` one of whose arms ends in read `r`; -1 otherwise.
+function fsIfArmOf(r: i32): i32 {
+  const b = fsParent[r]
+  if b < 0 || !(P.nodes[b] is Block) { return -1 }
+  const bn = P.nodes[b]
+  if bn is Block {
+    if bn.blkStmts.length == 0 || bn.blkStmts[bn.blkStmts.length - 1] != r {
+      return -1
+    }
+  }
+  const i = fsParent[b]
+  if i < 0 { return -1 }
+  const inode = P.nodes[i]
+  if !(inode is IfStmt) { return -1 }
+  if inode.ifElse < 0 || (inode.ifThen != b && inode.ifElse != b) { return -1 }
+  i
 }
 
 // The initializer of `d` when it is an un-annotated `const` binding initialized by a name, else -1.
@@ -2474,12 +2554,14 @@ function fsPlanHoles(): i32 {
             } else if ad >= 0 && ad < fsParseLen && P.nodes[ad] is Param {
               work.push(ad)
             } else {
-              // A call several list elements reach hands its argument once, and only to one
-              // parameter list.
+              // A call several list elements reach hands its argument once, to parameters
+              // splitting at one key list (D7183).
               let hx = 0
               while hx < hdRead.length && hdRead[hx] != a { hx = hx + 1 }
               if hx < hdRead.length {
-                if hdPar[hx] != par { return fsHoleDecline() }
+                if hdPar[hx] != par && !fsSameKeys(hdKeys[hx], ks) {
+                  return fsHoleDecline()
+                }
               } else {
                 hdRead.push(a)
                 hdKeys.push(ks)
@@ -2493,6 +2575,41 @@ function fsPlanHoles(): i32 {
     }
   }
   if hsPar.length == 0 { return 1 }
+  0
+}
+
+// Asks, for each asked call, the hole parameter of every named function the call reaches at
+// each position it hands a function by name.
+function fsAskOpenCallPars(): i32 {
+  if fsCallAsks.length == 0 { return 0 }
+  const fns: i32[] = []
+  for r in fsIdents {
+    const d = identDeclOf(r)
+    if d >= 0 && d < fsParseLen && P.nodes[d] is FuncDecl && !hasI32(fns, d) {
+      fns.push(d)
+    }
+  }
+  for fd in fns {
+    const f = P.nodes[fd]
+    const own = fsFnOwner(fd)
+    if f is FuncDecl && own >= 0 {
+      const calls = fsFnCalls(own)
+      for c in fsCallAsks {
+        const cn = P.nodes[c]
+        if cn is Call && hasI32(calls, c) {
+          let j = 0
+          while j < f.fnParams.length && j < cn.callArgs.length {
+            const a = fsParenPeel(cn.callArgs[j])
+            const par = f.fnParams[j]
+            if a >= 0 && P.nodes[a] is Ident && !hasI32(fsAsks, par) {
+              fsAsks.push(par)
+            }
+            j = j + 1
+          }
+        }
+      }
+    }
+  }
   0
 }
 
