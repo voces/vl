@@ -58,6 +58,7 @@ import {
   externLinkOf,
   externRetIsVoid,
   hasSpreadItem,
+  i32ToStr,
   memberCallRungOf,
   nodeChildren,
   nodeSpineChildren,
@@ -476,6 +477,7 @@ import {
   asgReadNarrowSet,
   asgSameCell,
   asgUnwidenPrim,
+  criFnIsAnonLambda,
   declaredNulString,
   fnIndexOfInScopeAt,
   fnIndexOfInScopeSid,
@@ -3851,6 +3853,36 @@ function repABNoteNameResult(sid: i32, scoped: i32) {
 // `capRecord` can ask whether an enclosing frame binds a name without threading it through
 // `capScan`'s recursion. Sound because `capComputeNamesOf` is the only entry point.
 let capFrame: i32 = -1
+// Set by `capScan`'s `Ident` arm for the one `capRecord` it makes: the identifier is read as a
+// value rather than named as a call's callee (`capCalleeIx`), so a function it names needs a cell.
+let capValueRead = false
+let capCalleeIx: i32 = -1
+// Set when the frame being computed reads itself as a value; `capComputeNamesOf` answers it.
+let capSelfCell = false
+
+// The capture name standing for the cell of function `fe`, which no source identifier can spell.
+export function capCellName(fe: i32): string { "#cell:" + i32ToStr(fe) }
+
+// The function whose cell capture `name` is, or -1 when `name` is an ordinary capture.
+export function capCellTargetOf(name: string): i32 {
+  if name.length < 7 || name.slice(0, 6) != "#cell:" { return -1 }
+  let v = 0
+  let i = 6
+  while i < name.length {
+    const c = name[i]
+    if c < '0' || c > '9' { return -1 }
+    v = v * 10 + (c - '0')
+    i = i + 1
+  }
+  v
+}
+
+// Whether a value read of function `fe` from another frame goes through `fe`'s cell: a nested
+// function declared by statement, since a lambda's every evaluation is a new value.
+function capCellEligible(fe: i32): boolean {
+  if fe < 0 || fe >= fnParent.length || fe >= fnStmts.length { return false }
+  fnParent[fe] >= 0 && !criFnIsAnonLambda(fe)
+}
 
 // The captured-variable names of the lifted function at `fnStmts[fe]`, in encounter order,
 // which is env-field order, by direct walk. A capture is a free variable: read in the body,
@@ -3873,9 +3905,19 @@ export function capComputeNamesOf(fe: i32) {
     // `capScan` resolves a narrowing condition against the frame whose body it is in;
     // this is that frame. Set only while recording, so an ordinary scan is unchanged.
     if cnRecording { cnScanFnIx = fnStmts[fe] }
+    const savedSelf = capSelfCell
+    capSelfCell = false
+    capCalleeIx = -1
     nfdWalkEnter()
     capScan(fn.fnBody, bound, caps)
     nfdWalkLeave()
+    // A function that reads itself as a value takes its own cell, but only when it captures
+    // something else: with nothing captured its one constant closure is already one value.
+    const self = capCellName(fe)
+    if capSelfCell && caps.length > 0 && !strListHas(caps, self) {
+      caps.push(self)
+    }
+    capSelfCell = savedSelf
   }
   caps
 }
@@ -3977,6 +4019,22 @@ function capRecord(
   caps: string[],
   atIx: i32,
 ) {
+  const valueRead = capValueRead
+  capValueRead = false
+  // A cell rides every env between its function's declaring frame, which owns it, and a reader.
+  // A nested body is scanned inline, so the owner is also the scope binding the function's name.
+  const cellOf = capCellTargetOf(name)
+  if cellOf >= 0 {
+    if cellOf < fnParent.length && fnParent[cellOf] == capFrame { return 0 }
+    if cellOf < fnStmts.length {
+      const decl = P.nodes[fnStmts[cellOf]]
+      if decl is FuncDecl {
+        if capIsBound(bound, decl.fnName) { return 0 }
+      }
+    }
+    if !strListHas(caps, name) { caps.push(name) }
+    return 0
+  }
   if capIsBound(bound, name) { return 0 }
   // An extern is a module-level import, addressable from any frame like a function; only a
   // program that reads one as a value can meet it here (D2618).
@@ -3991,7 +4049,9 @@ function capRecord(
       // in a top-level loop body addresses the module function instead of the loop variable.
       if moduleLoopEnclosing(capFrame, name) < 0 {
         if cnGlobOn && cnRecording { cnGlobReads[name] = 1 }
-        capSiblingFrees(name, bound, caps, atIx)
+        const sib = capSiblingFe(name, atIx)
+        const nsub = capSiblingFold(sib, bound, caps)
+        if valueRead { capCellNote(sib, nsub, caps) }
         return 0
       }
     }
@@ -4004,17 +4064,9 @@ function capRecord(
   0
 }
 
-// A SIBLING nested function's free names are the caller's captures too: `j` calling `k` builds
-// `k`'s env inside `j`, so every name `k` needs from an outer frame must ride `j`'s env. Depth
-// already works through `capScan`'s `FuncDecl` arm, which folds a nested body's frees upward;
-// this is the sibling direction, which `capRecord` dropped with the function name (D1761).
-function capSiblingFrees(
-  name: string,
-  bound: {[string]: i32},
-  caps: string[],
-  atIx: i32,
-) {
-  if capFrame < 0 || capFrame >= fnStmts.length { return 0 }
+// The nested function `name` denotes at `atIx` from the frame being computed, or -1.
+function capSiblingFe(name: string, atIx: i32): i32 {
+  if capFrame < 0 || capFrame >= fnStmts.length { return -1 }
   // The same outward walk `fnIndexOfInScopeSid` takes, and for the same reason: only a
   // NESTED function is found, so a module-level callee resolves to -1 and folds in nothing.
   let pp = capFrame
@@ -4047,11 +4099,17 @@ function capSiblingFrees(
       if lc >= 0 { fe = lc }
     }
   }
-  if fe < 0 { return 0 }
-  if fe == capFrame { return 0 }
+  fe
+}
+
+// A SIBLING's free names are the caller's captures too: `j` calling `k` builds `k`'s env
+// inside `j`, so every name `k` needs from an outer frame rides `j`'s env (D1761). Returns how
+// many `fe` has, or -1 when `fe` is none, the frame itself, or a sibling already being walked.
+function capSiblingFold(fe: i32, bound: {[string]: i32}, caps: string[]): i32 {
+  if fe < 0 || fe == capFrame { return -1 }
   let si = 0
   while si < capSibStack.length {
-    if capSibStack[si] == fe { return 0 }
+    if capSibStack[si] == fe { return -1 }
     si = si + 1
   }
   capSibStack.push(fe)
@@ -4069,6 +4127,22 @@ function capSiblingFrees(
     capRecord(sub[ci], bound, caps, -1)
     ci = ci + 1
   }
+  sub.length
+}
+
+// A value read of nested function `fe` outside its declaring frame takes `fe`'s cell, so the
+// read reaches the env that frame keeps. `nsub` is `fe`'s capture count from the fold; with
+// none, `fe` is one constant closure and needs no cell. A read in the frame itself asks
+// `capComputeNamesOf`, which alone knows the frame's own count once its walk ends.
+function capCellNote(fe: i32, nsub: i32, caps: string[]) {
+  if !capCellEligible(fe) || fnParent[fe] == capFrame { return 0 }
+  if fe == capFrame {
+    capSelfCell = true
+    return 0
+  }
+  if nsub <= 0 { return 0 }
+  const name = capCellName(fe)
+  if !strListHas(caps, name) { caps.push(name) }
   0
 }
 
@@ -4135,10 +4209,12 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
       return 0
     }
     Ident => {
+      capValueRead = ix != capCalleeIx
       capRecord(n.identName, bound, caps, ix)
       return 0
     }
     Call => {
+      capCalleeIx = n.callFn
       if !capCalleeExempt(ix, n, bound) { capScan(n.callFn, bound, caps) }
       capScanEach(n.callArgs, bound, caps)
       return 0
