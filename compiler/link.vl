@@ -14,7 +14,7 @@ import {
   RS_TAG,
   relSkew,
 } from "./emit_reloc"
-import { typeOrderChoose } from "./emit_type_order"
+import { typeOrderCanon } from "./emit_type_order"
 
 // A reference's kind: a function index, a global index, or a value of row space 1 to 6.
 export const LK_FUNC = 0
@@ -44,15 +44,16 @@ export type LinkFn = {
 export type LinkGlobal = { key: string, entry: LinkPiece }
 // An export: its name bytes, its kind, and its target's symbol ("" keeps index 0).
 export type LinkExport = { name: u8[], kind: i32, key: string }
-// A heap type of the recursion group: its symbol, its rank in mint order, and its
-// definition, every type it names cut.
-export type LinkTy = { key: string, rank: i32, def: LinkPiece }
-// An entry of a tag band: `v:`, `rl:`, `map:` or `clo:` and what it ranks, and its rank.
-export type LinkBand = { key: string, rank: i32 }
+// A heap type of the recursion group: its canonical key and its definition, every type it
+// names cut.
+export type LinkTy = { key: string, def: LinkPiece }
+// An entry of the program's tag-band table: `v:`, `rl:`, `map:` or `clo:` and what it ranks,
+// its rank in its band, and for a variant the string its tag is ranked by.
+export type LinkBand = { key: string, rank: i32, sort: string }
 // One module's artifact. `consts` are its immutable bindings' initialisers in declaration
 // order; `defs` the shared globals it names; `guards` every top-level binding; `pool` and
-// `poolIs` the literals it pools; `tys` and `bands` every group type and tag-band entry it
-// names; `sigs` and `tags` the runtime's own signatures and exception tags.
+// `poolIs` the literals it pools; `tys` every group type it names and `bands` every union
+// tag key; `sigs` and `tags` the runtime's own signatures and exception tags.
 export type LinkArt = {
   path: string,
   fns: LinkFn[],
@@ -64,14 +65,15 @@ export type LinkArt = {
   poolIs: string[],
   exports: LinkExport[],
   tys: LinkTy[],
-  bands: LinkBand[],
+  bands: string[],
   sigs: LinkPiece[],
   tags: LinkPiece[],
 }
 export type LinkSec = { id: i32, b: LinkPiece }
 // The program-level input: the sections passed through, the imports, whether the table
 // exists, the functions placed after every module's own (lifted functions, later instances),
-// the runtime's functions and globals, the start function, and the value-atom band's top.
+// the runtime's functions and globals, the start function, the program's tag-band table, and
+// each value-atom code's name.
 export type LinkProg = {
   secs: LinkSec[],
   fnImports: string[],
@@ -80,7 +82,8 @@ export type LinkProg = {
   tail: LinkFn[],
   runtime: LinkArt,
   startKey: string,
-  atomTop: i32,
+  bands: LinkBand[],
+  atomNames: string[],
 }
 // The linked module, how many references name no symbol (the first few by key), and how many
 // symbols are defined twice.
@@ -95,6 +98,7 @@ let tIdx: { [string]: i32 } = Map()
 // The recursion group in index order, and the tag bands built from every artifact's entries.
 let lkGroup: LinkTy[] = []
 let vKeys: string[] = []
+let vSortOf: { [string]: string } = Map()
 let rlBand: string[] = []
 let mvKind: i32[] = []
 let mvVal: string[] = []
@@ -116,7 +120,7 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
   lkUnresolved = 0
   lkMissKeys = []
   lkDup = 0
-  lkBands(lkWithRuntime(p, arts))
+  lkBands(p, lkWithRuntime(p, arts))
   const fns: LinkFn[] = []
   let fi = 0
   while fi < p.fnImports.length {
@@ -206,6 +210,7 @@ function lkGlobals(
   const seen: { [string]: boolean } = Map()
   for a in arts { lkAddNew(a.pool, lexes, seen) }
   for a in arts { lkAddNew(a.poolIs, lexes, seen) }
+  lkAddNew(p.runtime.pool, lexes, seen)
   for lex in lexes {
     const key = "s:" + lex
     const d = defs[key] ?? -1
@@ -338,25 +343,27 @@ function lkRefVal(p: LinkProg, r: LinkRef): i32 {
   v
 }
 
-// A union box tag from its key: a variant's rank among every variant key, a value-atom code
-// above them, or a slot-band arm by its table position. -1 for a key no table names.
+// A union box tag from its key: a variant's rank among every variant's sort string, a
+// value-atom code above them by its name, or a slot-band arm by its table position. -1 for a
+// key no table names.
 function lkTag(p: LinkProg, key: string): i32 {
   const memo = tagMemo[key] ?? -2
   if memo != -2 { return memo }
   const k0 = vKeys.length
-  const base = k0 + p.atomTop
+  const base = k0 + p.atomNames.length
   let t = -1
   if lkHasPrefix(key, "v:") {
-    const sig = key.slice(2, key.length)
-    let below = 0
-    let hit = false
-    for s in vKeys {
-      if lkLess(s, sig) { below = below + 1 }
-      if s == sig { hit = true }
+    const sort = vSortOf[key] ?? ""
+    if sort != "" {
+      let below = 0
+      for s in vKeys {
+        if lkLess(s, sort) { below = below + 1 }
+      }
+      t = below
     }
-    if hit { t = below }
   } else if lkHasPrefix(key, "k:") {
-    t = k0 + lkInt(key.slice(2, key.length))
+    const i = lkFind(p.atomNames, key.slice(2, key.length), 0)
+    if i >= 0 { t = k0 + i }
   } else if lkHasPrefix(key, "rl:") {
     const i = lkFind(rlBand, key.slice(3, key.length), 0)
     if i >= 0 { t = base + 3 * i }
@@ -392,28 +399,28 @@ function lkColon(kv: string): i32 {
   c
 }
 
-// The tag bands from every artifact's entries, each placed at its rank; two entries that rank
-// alike in one band count as defined twice.
-function lkBands(all: LinkArt[]) {
+// The tag bands from the program's table, each entry placed at its rank (two entries that rank
+// alike in one band count as defined twice), then every artifact's tag keys looked up there.
+function lkBands(p: LinkProg, all: LinkArt[]) {
   vKeys = []
+  vSortOf = Map()
   rlBand = []
   mvKind = []
   mvVal = []
   cloBand = []
   const mvAt: string[] = []
-  for a in all {
-    for e in a.bands {
-      if lkHasPrefix(e.key, "v:") {
-        lkPlace(vKeys, e.rank, e.key.slice(2, e.key.length))
-      } else if lkHasPrefix(e.key, "rl:") {
-        lkPlace(rlBand, e.rank, e.key.slice(3, e.key.length))
-      } else if lkHasPrefix(e.key, "map:") {
-        lkPlace(mvAt, e.rank, e.key.slice(4, e.key.length))
-      } else if lkHasPrefix(e.key, "clo:") {
-        lkPlace(cloBand, e.rank, e.key.slice(4, e.key.length))
-      } else {
-        lkMiss(e.key)
-      }
+  for e in p.bands {
+    if lkHasPrefix(e.key, "v:") {
+      lkPlace(vKeys, e.rank, e.sort)
+      vSortOf[e.key] = e.sort
+    } else if lkHasPrefix(e.key, "rl:") {
+      lkPlace(rlBand, e.rank, e.key.slice(3, e.key.length))
+    } else if lkHasPrefix(e.key, "map:") {
+      lkPlace(mvAt, e.rank, e.key.slice(4, e.key.length))
+    } else if lkHasPrefix(e.key, "clo:") {
+      lkPlace(cloBand, e.rank, e.key.slice(4, e.key.length))
+    } else {
+      lkMiss(e.key)
     }
   }
   for kv in mvAt {
@@ -424,6 +431,11 @@ function lkBands(all: LinkArt[]) {
     } else {
       mvKind.push(-1)
       mvVal.push("")
+    }
+  }
+  for a in all {
+    for k in a.bands {
+      if lkTag(p, k) < 0 { lkMiss(k) }
     }
   }
   0
@@ -446,9 +458,9 @@ function lkPlace(band: string[], r: i32, x: string) {
   0
 }
 
-// The recursion group from every artifact's types in mint rank order, reordered by reference
-// counts over the linked module as the emitter's order pass does; the signatures follow it,
-// the functions' own and then the runtime's. One key or rank met twice unalike is a duplicate.
+// The recursion group from every artifact's types in the emitter's canonical order (key
+// order, past 64 types reordered by reference counts over the linked module); the signatures
+// follow it. One key met twice with unalike definitions is a duplicate.
 function lkTypes(
   p: LinkProg,
   arts: LinkArt[],
@@ -457,50 +469,35 @@ function lkTypes(
   thunks: LinkFn[],
   globals: LinkPiece[],
 ) {
-  const byKey: { [string]: i32 } = Map()
-  const tys: LinkTy[] = []
-  let top = -1
+  const oldOf: { [string]: i32 } = Map()
+  const old: LinkTy[] = []
   for a in lkWithRuntime(p, arts) {
     for t in a.tys {
-      const at = byKey[t.key] ?? -1
+      const at = oldOf[t.key] ?? -1
       if at < 0 {
-        byKey[t.key] = tys.length
-        tys.push(t)
-        if t.rank > top { top = t.rank }
-      } else if (
-        tys[at].rank != t.rank
-        || linkPieceHash(tys[at].def) != linkPieceHash(t.def)
-      ) {
+        oldOf[t.key] = old.length
+        old.push(t)
+      } else if linkPieceHash(old[at].def) != linkPieceHash(t.def) {
         lkDup = lkDup + 1
       }
     }
   }
-  const rankAt: i32[] = []
-  while rankAt.length <= top { rankAt.push(-1) }
-  let ti = 0
-  while ti < tys.length {
-    const rk = tys[ti].rank
-    if rk < 0 || rankAt[rk] >= 0 { lkDup = lkDup + 1 } else { rankAt[rk] = ti }
-    ti = ti + 1
-  }
-  const old: LinkTy[] = []
-  const oldOf: { [string]: i32 } = Map()
-  for x in rankAt {
-    if x >= 0 {
-      oldOf[tys[x].key] = old.length
-      old.push(tys[x])
-    }
-  }
   const g = old.length
-  let order: i32[] = []
+  const keys: string[] = []
+  for t in old { keys.push(t.key) }
+  let nu: i32[] = []
+  let ns: i32[] = []
   if g > 64 {
     const ps = lkTyPieces(p, fns, thunks, globals, old)
-    order = typeOrderChoose(
-      lkTyCounts(ps, oldOf, LK_TYPE, g),
-      lkTyCounts(ps, oldOf, LK_HEAP, g),
-      lkSupers(old, oldOf),
-    )
+    nu = lkTyCounts(ps, oldOf, LK_TYPE, g)
+    ns = lkTyCounts(ps, oldOf, LK_HEAP, g)
+  } else {
+    while nu.length < g {
+      nu.push(0)
+      ns.push(0)
+    }
   }
+  let order = typeOrderCanon(keys, nu, ns, lkSupers(old, oldOf))
   if order.length != g {
     order = []
     while order.length < g { order.push(order.length) }
@@ -899,13 +896,9 @@ export function linkArtHash(a: LinkArt): i32 {
   }
   for t in a.tys {
     h = lkHS(h, t.key)
-    h = lkH(h, t.rank)
     h = lkHP(h, t.def)
   }
-  for e in a.bands {
-    h = lkHS(h, e.key)
-    h = lkH(h, e.rank)
-  }
+  for k in a.bands { h = lkHS(h, k) }
   for x in a.sigs { h = lkHP(h, x) }
   for x in a.tags { h = lkHP(h, x) }
   h
@@ -937,7 +930,12 @@ export function linkProgHash(p: LinkProg): i32 {
   for s in p.globImports { h = lkHS(h, s) }
   if p.table { h = lkH(h, 1) }
   h = lkHS(h, p.startKey)
-  h = lkH(h, p.atomTop)
+  for e in p.bands {
+    h = lkHS(h, e.key)
+    h = lkH(h, e.rank)
+    h = lkHS(h, e.sort)
+  }
+  for s in p.atomNames { h = lkHS(h, s) }
   h
 }
 

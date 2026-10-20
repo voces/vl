@@ -6,7 +6,7 @@
 import { FuncDecl, P, StrLit, declNameTokOf, i32ToStr, nodeToks } from "./ast"
 import { cpsToUtf8, strToCps } from "./emit_base"
 import { wName, wSLEB, wSection, wTarget, wU8, wULEB } from "./emit_bytes"
-import { uAtomBandTop } from "./emit_map_twins"
+import { atomCodeName, uAtomBandTop } from "./emit_map_twins"
 import { modIxOfId } from "./modid"
 import { globalCellIsImmutable } from "./emit_query"
 import {
@@ -22,7 +22,7 @@ import {
   relSubAt,
   relValAt,
 } from "./emit_reloc"
-import { relSymKey } from "./emit_reloc_keys"
+import { relSymKey, variantKeyOf } from "./emit_reloc_keys"
 import {
   W,
   cloSigTagNames,
@@ -41,14 +41,13 @@ import {
   gStrPoolTexts,
   gSynthBase,
   globalStmts,
-  mAllocKind,
   mvKeyKind,
   mvValName,
   rlElemName,
   topFnNodes,
   uVariants,
 } from "./emit_state"
-import { TypeSites, typeOrderOldOf, typeSitesOf } from "./emit_type_order"
+import { TypeSites, typeOrderKeyOf, typeSitesOf } from "./emit_type_order"
 import { variantTagKey } from "./emit_variant_sig"
 import {
   LK_FUNC,
@@ -83,13 +82,16 @@ import { initGuardGlobalText, userGlobalIdx } from "./wasmEmit"
 const LINK_DROP_EVERY = 0
 const LINK_VERSION = 1
 
-// The literals each `is` test pools, by node, noted while the pool is collected.
+// The literals each `is` test pools, by node, noted while the pool is collected, and how
+// many nodes the arena held then: a literal the emitter makes later is no module's own.
 let isNode: i32[] = []
 let isLex: string[] = []
+let poolNodes = 0
 
 export function linkIsReset() {
   isNode = []
   isLex = []
+  poolNodes = P.nodes.length
   0
 }
 
@@ -124,8 +126,13 @@ let tyS: TypeSites = {
 let tyKey: string[] = []
 
 // Splits, links and compares the module in `W`; `n` user functions keyed `fnKeys`, and the
-// table thunks of `thunkFes` in order.
-export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
+// table thunks of `thunkFes` in order, and each runtime helper's name by function index.
+export function emitLinkSection(
+  n: i32,
+  fnKeys: string[],
+  thunkFes: i32[],
+  rtNames: { [i32]: string },
+) {
   if !RELOC_ARMED { return 0 }
   mb = []
   for ch in W.chunks {
@@ -163,7 +170,8 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
     tail: [],
     runtime: elArt(""),
     startKey: "",
-    atomTop: uAtomBandTop(),
+    bands: elBandTable(),
+    atomNames: elAtomNames(),
   }
   let nfImp = 0
   let ngImp = 0
@@ -190,7 +198,7 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
   for fk in fnKeys { fKey.push(fk) }
   k = 0
   while k < nRt {
-    fKey.push("rt#" + i32ToStr(k))
+    fKey.push(elRtKey(rtNames, nfImp + n + k, k))
     k = k + 1
   }
   for fe in thunkFes { fKey.push("t:" + fnKeys[fe]) }
@@ -327,7 +335,7 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
   }
   // Pooled literals by owning module, string literals first and `is` tests after.
   let ni = 0
-  while ni < P.nodes.length {
+  while ni < poolNodes && ni < P.nodes.length {
     const nd = P.nodes[ni]
     if nd is StrLit && (gStrPoolIx[nd.strText] ?? -1) >= 0 {
       const a = arts[artOf[elNodeMod(ni)] ?? 0]
@@ -344,6 +352,18 @@ export function emitLinkSection(n: i32, fnKeys: string[], thunkFes: i32[]) {
       elNoteDef(a, "s:" + isLex[k], gEntries, ngImp)
     }
     k = k + 1
+  }
+  // A literal type's text that no module spells is the program's, after every module's.
+  const held: { [string]: boolean } = Map()
+  for a in arts {
+    for s in a.pool { held[s] = true }
+    for s in a.poolIs { held[s] = true }
+  }
+  for lex in gStrPoolTexts {
+    if !(held[lex] ?? false) {
+      prog.runtime.pool.push(lex)
+      elNoteDef(prog.runtime, "s:" + lex, gEntries, ngImp)
+    }
   }
   elExports(ids, st, en, prog.runtime)
   si = 0
@@ -572,69 +592,17 @@ function elTyKeyOf(v: i32): string {
   "?t" + i32ToStr(v)
 }
 
-// Each type index's symbol. A heap type of the first group is named by its family and the
-// structure it has, refined until two types share a name only when they are alike all the
-// way down, then numbered by mint order among the alike; a function's own signature by its
-// function; a runtime signature by its position.
+// Each type index's symbol: a heap type of the first group by the canonical key the order
+// pass gave it, a function's own signature by its function, a runtime signature by its
+// position.
 function elTyKeys(n: i32) {
   tyKey = []
   const g = tyS.group
-  const h0: i32[] = []
-  const refs: i32[][] = []
   let t = 0
   while t < g {
-    const old = typeOrderOldOf(t)
-    let h = elH(-2128831035, elAt(mAllocKind, old))
-    const rs: i32[] = []
-    let s = elSiteFrom(tyS.entS[t])
-    let i = tyS.entS[t]
-    while i < tyS.entE[t] {
-      if s < tyS.at.length && tyS.at[s] == i {
-        if tyS.heap[s] { h = elH(h, -1) } else { h = elH(h, -2) }
-        rs.push(tyS.val[s])
-        i = i + tyS.len[s]
-        s = s + 1
-      } else {
-        h = elH(h, mb[i])
-        i = i + 1
-      }
-    }
-    h0.push(h)
-    refs.push(rs)
+    const k = typeOrderKeyOf(t)
+    if k == "" { tyKey.push("?g" + i32ToStr(t)) } else { tyKey.push(k) }
     t = t + 1
-  }
-  let cur = h0
-  let classes = elDistinct(cur)
-  let round = 0
-  let more = g > 0
-  while more && round <= g {
-    const nxt: i32[] = []
-    t = 0
-    while t < g {
-      let h = h0[t]
-      for r in refs[t] {
-        if r >= 0 && r < g { h = elH(h, cur[r]) } else { h = elH(h, r) }
-      }
-      nxt.push(h)
-      t = t + 1
-    }
-    const c = elDistinct(nxt)
-    cur = nxt
-    more = c > classes
-    classes = c
-    round = round + 1
-  }
-  while tyKey.length < g { tyKey.push("") }
-  const seen: { [string]: i32 } = Map()
-  const newOf = elNewOrder(g)
-  let o = 0
-  while o < g {
-    t = newOf[o]
-    const base = "T" + i32ToStr(elAt(mAllocKind, o)) + ":" + i32ToStr(cur[t])
-    const k = seen[base] ?? 0
-    seen[base] = k + 1
-    if k == 0 { tyKey[t] = base } else { tyKey[t] = base + "#" + i32ToStr(k) }
-    o = o + 1
   }
   let r = 0
   while g + r < tyS.entS.length {
@@ -647,33 +615,6 @@ function elTyKeys(n: i32) {
   }
   0
 }
-
-// Per mint position of the first group, the index the order pass gave it.
-function elNewOrder(g: i32): i32[] {
-  const out: i32[] = []
-  while out.length < g { out.push(0) }
-  let t = 0
-  while t < g {
-    const o = typeOrderOldOf(t)
-    if o >= 0 && o < g { out[o] = t }
-    t = t + 1
-  }
-  out
-}
-
-function elDistinct(xs: i32[]): i32 {
-  const m: { [i32]: boolean } = Map()
-  let c = 0
-  for x in xs {
-    if !(m[x] ?? false) {
-      m[x] = true
-      c = c + 1
-    }
-  }
-  c
-}
-
-function elH(h: i32, x: i32): i32 { (h ^ x) * 16777619 }
 
 // Each defined global's entry, cut; a synthetic constant takes its key from its contents.
 function elGlobals(ids: i32[], st: i32[], en: i32[], ngImp: i32): LinkPiece[] {
@@ -1143,8 +1084,8 @@ function elTags(from: i32, to: i32, a: LinkArt) {
   0
 }
 
-// The group types and tag-band entries each artifact's pieces name, a type's own definition
-// followed. The runtime takes those of the tail and of the sections, then every one no
+// The group types and union tag keys each artifact's pieces name, a type's own definition
+// followed. The runtime takes those of the tail and of the sections, then every type no
 // artifact names, so each still holds its index.
 function elDemands(prog: LinkProg, arts: LinkArt[]) {
   const g = tyS.group
@@ -1156,30 +1097,20 @@ function elDemands(prog: LinkProg, arts: LinkArt[]) {
     ixOf[tyKey[t]] = t
     t = t + 1
   }
-  const table = elBandTable()
-  const bandOf = elBandRanks(table)
   const tyDone: boolean[] = []
   while tyDone.length < g { tyDone.push(false) }
-  const bandDone: { [string]: boolean } = Map()
-  for a in arts {
-    elDemand(a, elArtPieces(a), defs, ixOf, bandOf, tyDone, bandDone)
-  }
+  for a in arts { elDemand(a, elArtPieces(a), defs, ixOf, tyDone) }
   const rt = prog.runtime
   const ps = elArtPieces(rt)
   for f in prog.tail { elFnPieces(f, ps) }
   for x in rt.sigs { ps.push(x) }
   for x in rt.tags { ps.push(x) }
   for x in prog.secs { ps.push(x.b) }
-  elDemand(rt, ps, defs, ixOf, bandOf, tyDone, bandDone)
+  elDemand(rt, ps, defs, ixOf, tyDone)
   t = 0
   while t < g {
-    if !tyDone[t] {
-      rt.tys.push({ key: tyKey[t], rank: typeOrderOldOf(t), def: defs[t] })
-    }
+    if !tyDone[t] { rt.tys.push({ key: tyKey[t], def: defs[t] }) }
     t = t + 1
-  }
-  for e in table {
-    if !(bandDone[e.key + "@" + i32ToStr(e.rank)] ?? false) { rt.bands.push(e) }
   }
   0
 }
@@ -1203,15 +1134,13 @@ function elFnPieces(f: LinkFn, ps: LinkPiece[]) {
 }
 
 // Notes on `a` every group type `ps` names, in first-reference order with each definition's
-// own references followed, and every tag-band entry; marks each as named somewhere.
+// own references followed, and every union tag key once; marks each type as named somewhere.
 function elDemand(
   a: LinkArt,
   ps: LinkPiece[],
   defs: LinkPiece[],
   ixOf: { [string]: i32 },
-  bandOf: { [string]: i32 },
   tyDone: boolean[],
-  bandDone: { [string]: boolean },
 ) {
   const seen: boolean[] = []
   while seen.length < defs.length { seen.push(false) }
@@ -1231,17 +1160,12 @@ function elDemand(
         if t >= 0 && !seen[t] {
           seen[t] = true
           tyDone[t] = true
-          a.tys.push({ key: r.key, rank: typeOrderOldOf(t), def: defs[t] })
+          a.tys.push({ key: r.key, def: defs[t] })
           next.push(defs[t])
         }
-      } else if r.kind == RS_TAG {
-        const rk = bandOf[r.key] ?? -1
-        const id = r.key + "@" + i32ToStr(rk)
-        if rk >= 0 && !(bandSeen[id] ?? false) {
-          bandSeen[id] = true
-          bandDone[id] = true
-          a.bands.push({ key: r.key, rank: rk })
-        }
+      } else if r.kind == RS_TAG && !(bandSeen[r.key] ?? false) {
+        bandSeen[r.key] = true
+        a.bands.push(r.key)
       }
     }
     let ni = next.length - 1
@@ -1253,42 +1177,46 @@ function elDemand(
   0
 }
 
-// Every tag-band entry, by key and rank: each variant, ref-list slot, map value slot and
-// closure signature the program holds.
+// The program's tag-band table: each variant row by its key, ranked by the string the
+// emitter sorts tags by, then each ref-list slot, map value slot and closure signature.
 function elBandTable(): LinkBand[] {
   const out: LinkBand[] = []
   let vi = 0
   for _v in uVariants {
-    out.push({ key: "v:" + variantTagKey(vi), rank: vi })
+    out.push(
+      { key: "v:" + variantKeyOf(vi), rank: vi, sort: variantTagKey(vi) },
+    )
     vi = vi + 1
   }
   let ri = 0
   for nm in rlElemName {
-    out.push({ key: "rl:" + nm, rank: ri })
+    out.push({ key: "rl:" + nm, rank: ri, sort: "" })
     ri = ri + 1
   }
   let mi = 0
   for nm in mvValName {
-    out.push(
-      { key: "map:" + i32ToStr(elAt(mvKeyKind, mi)) + ":" + nm, rank: mi },
-    )
+    const kv = i32ToStr(elAt(mvKeyKind, mi)) + ":" + nm
+    out.push({ key: "map:" + kv, rank: mi, sort: "" })
     mi = mi + 1
   }
   let ci = 0
   for nm in cloSigTagNames {
-    out.push({ key: "clo:" + nm, rank: ci })
+    out.push({ key: "clo:" + nm, rank: ci, sort: "" })
     ci = ci + 1
   }
   out
 }
 
-// The rank a tag key resolves through: the first entry of its band with that key, a closure
-// signature's past slot 0. A value-atom code or the mono map arm has none.
-function elBandRanks(table: LinkBand[]): { [string]: i32 } {
-  const out: { [string]: i32 } = Map()
-  for e in table {
-    const clo0 = e.rank == 0 && elHasPrefix(e.key, "clo:")
-    if !clo0 && (out[e.key] ?? -1) < 0 { out[e.key] = e.rank }
-  }
+// Each value-atom code's name, by code.
+function elAtomNames(): string[] {
+  const out: string[] = []
+  while out.length < uAtomBandTop() { out.push(atomCodeName(out.length)) }
   out
+}
+
+// A runtime function's key: its name-section name, or its position past the user functions.
+function elRtKey(names: { [i32]: string }, ix: i32, k: i32): string {
+  const nm = names[ix] ?? ""
+  if nm != "" { return "rt:" + nm }
+  "rt#" + i32ToStr(k)
 }

@@ -3,11 +3,13 @@
 //
 //     vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...]
 //     vl run scripts/s5-relocs.vl -- consts A.wasm B.wasm
+//     vl run scripts/s5-relocs.vl -- invariance A.wasm B.wasm [...]
 //
 // `census` prints one row per space (sites, LEB widths) and per opcode. `consts` aligns two
 // builds of one program instruction by instruction and counts the `i32.const` immediates
 // that differ, which is how a perturbed compiler shows where an index travels as a value
-// (union tags). A discovery instrument: docs/internals/s5-per-module-artifacts.md.
+// (union tags). `invariance` asks every module two armed builds share for one artifact
+// digest. A discovery instrument: docs/internals/s5-per-module-artifacts.md.
 
 import { IoError, listDir, pathExists, pathKind, readFile } from "std:fs"
 import { Utf8Error, programArgs } from "std:args"
@@ -18,7 +20,7 @@ import { exit } from "std:process"
 import { sort } from "std:array"
 import { die } from "./lib/common"
 
-const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED] | proof-drop N ARMED PERTURBED | link ARMED [TWIN]"
+const USAGE = "usage: vl run scripts/s5-relocs.vl -- census A.wasm [B.wasm ...] | consts A B | proof ARMED [PERTURBED] | proof-drop N ARMED PERTURBED | link ARMED [TWIN] | invariance ARMED ARMED [...]"
 
 const SP_FUNC = 0
 const SP_TYPE = 1
@@ -1447,6 +1449,47 @@ function linkProof(a: string, t: string): i32 {
   0
 }
 
+// Per-module invariance: every module path two or more armed builds both hold must carry one
+// artifact digest in all of them, whatever else each program held.
+function invariance(ws: string[]): i32 {
+  const first: { [string]: i32 } = Map()
+  const firstIn: { [string]: string } = Map()
+  const counted: { [string]: boolean } = Map()
+  let shared = 0
+  let differ = 0
+  for w in ws {
+    const r = readLink(bytesOf(w))
+    if r == null {
+      return die2("invariance: \{w}: no vl.link section (not an armed build)")
+    }
+    let k = 0
+    while k < r.paths.length {
+      const p = r.paths[k]
+      const h = r.hashes[k]
+      const was = firstIn[p] ?? ""
+      if was == "" {
+        firstIn[p] = w
+        first[p] = h
+      } else {
+        if !(counted[p] ?? false) {
+          counted[p] = true
+          shared = shared + 1
+        }
+        if (first[p] ?? 0) != h {
+          differ = differ + 1
+          if differ <= 20 { print("invariance: \{p}: \{was} and \{w} differ") }
+        }
+      }
+      k = k + 1
+    }
+  }
+  print(
+    "== \{ws.length} builds, \{shared} modules held by two or more, \{differ} pairs differ",
+  )
+  if differ > 0 || shared == 0 { return 1 }
+  0
+}
+
 function die2(msg: string): i32 {
   die(msg, 2)
   2
@@ -1457,6 +1500,9 @@ function main(): i32 {
   if args is Utf8Error { return die2(USAGE) }
   if args.length < 2 { return die2(USAGE) }
   if args[0] == "census" { return census(args.slice(1, args.length)) }
+  if args[0] == "invariance" && args.length >= 3 {
+    return invariance(args.slice(1, args.length))
+  }
   if args[0] == "consts" && args.length == 3 { return consts(args[1], args[2]) }
   if args[0] == "link" && args.length == 2 { return linkProof(args[1], "") }
   if args[0] == "link" && args.length == 3 {
