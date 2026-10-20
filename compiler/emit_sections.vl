@@ -28,6 +28,8 @@ import { refViewSrcTys } from "./check_ref_list_view"
 import { lbiArenaReset } from "./check_num_lit_state"
 import {
   PrimName,
+  T,
+  TyLit,
   tyLitMemberTexts,
   tyPrimNameOf,
   tyToEmitName,
@@ -472,9 +474,11 @@ import {
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
+  mvKeyKind,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
+  mvValName,
   mvValTyIx,
   narrowNames,
   narrowRetired,
@@ -490,6 +494,7 @@ import {
   rlBackIdx,
   rlElemHeap,
   rlElemKindTbl,
+  rlElemName,
   rlElemTyIx,
   rlWrapIdx,
   rvNul,
@@ -531,6 +536,8 @@ import {
   uFieldCount,
   uFieldElemKeyKind,
   uFieldElemTyIx,
+  uFieldNames,
+  uFieldStart,
   uSinkFired,
   uTags,
   uVarHeap,
@@ -653,7 +660,7 @@ import {
   relSubAt,
   relValAt,
 } from "./emit_reloc"
-import { relSymKey } from "./emit_reloc_keys"
+import { relKeysReset, relSymKey } from "./emit_reloc_keys"
 import { emitLinkSection, linkIsNote, linkIsReset } from "./emit_link"
 import {
   anonLeafSupersedeOf,
@@ -5908,7 +5915,18 @@ function fnSymKeys(n: i32): string[] {
   const out: string[] = []
   let fi = 0
   while fi < n {
-    const nm = fnSymName(fi)
+    let nm = fnSymName(fi)
+    // A lambda's synthesized name counts every lambda of the program, its anchor only its own.
+    const fn = P.nodes[fnStmts[fi]]
+    if fn is FuncDecl && fnDispNames[fi].length == 0 {
+      const lam = "__lambda_"
+      if (
+        fn.fnName.length > lam.length
+        && fn.fnName.slice(0, lam.length) == lam
+      ) {
+        nm = "__lambda" + fnLocSuffix(fnStmts[fi], true)
+      }
+    }
     const dup = seen[nm] ?? 0
     seen[nm] = dup + 1
     if dup == 0 {
@@ -5919,6 +5937,101 @@ function fnSymKeys(n: i32): string[] {
     fi = fi + 1
   }
   out
+}
+
+// Each shared runtime helper's function index, keyed to its name-section name, and the
+// `__log__` decoder's; a per-module artifact names a call to one by that name.
+function runtimeFnNames(): { [i32]: string } {
+  const buf: u8[] = []
+  const prev = wTarget(buf)
+  nameHelpers()
+  wTarget(prev)
+  const out: { [i32]: string } = Map()
+  if memLogUsed { out[gMemLogIdx] = "__log__" }
+  const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+  const at = [0]
+  while at[0] < buf.length {
+    const ix = seedLeb(buf, at)
+    const len = seedLeb(buf, at)
+    let s = ""
+    let i = 0
+    while i < len && at[0] < buf.length {
+      const c: i32 = buf[at[0]]
+      if c >= 32 && c < 127 {
+        s = s + ascii.slice(c - 32, c - 31)
+      } else {
+        s = s + "?"
+      }
+      at[0] = at[0] + 1
+      i = i + 1
+    }
+    out[ix] = s
+  }
+  out
+}
+
+function seedLeb(b: u8[], at: i32[]): i32 {
+  let r = 0
+  let sh = 0
+  while at[0] < b.length {
+    const x: i32 = b[at[0]]
+    at[0] = at[0] + 1
+    if sh < 32 { r = r | ((x & 127) << sh) }
+    sh = sh + 7
+    if (x & 128) == 0 { return r }
+  }
+  r
+}
+
+// Per minted group type below `g`, what it stands for beyond its bytes: a record's field names,
+// a list's element name, a map's key kind and value name, a closure env's captures. Records
+// of both families share one spelling, as twins share one heap type.
+function typeSeeds(g: i32): string[] {
+  const out: string[] = []
+  let k = 0
+  while k < g {
+    let kind = -1
+    let slot = 0
+    if k < mAllocKind.length && k < mAllocSlot.length {
+      kind = mAllocKind[k]
+      slot = mAllocSlot[k]
+    }
+    let s = "k" + i32ToStr(kind)
+    if kind == TSK_STRUCT && slot >= 0 && slot < sFieldCount.length {
+      s = "R" + seedNames(sFieldNames, sFieldStart[slot], sFieldCount[slot])
+    } else if kind == TSK_VARIANT && slot >= 0 && slot < uFieldCount.length {
+      s = "R" + seedNames(uFieldNames, uFieldStart[slot], uFieldCount[slot])
+    } else if (
+      (kind == TSK_REF_BACK || kind == TSK_REF_WRAP)
+      && slot >= 0
+      && slot < rlElemName.length
+    ) {
+      s = s + ":" + rlElemName[slot]
+    } else if (
+      kind == TSK_MV_MAP
+      && slot >= 0
+      && slot < mvKeyKind.length
+      && slot < mvValName.length
+    ) {
+      s = s + ":" + i32ToStr(mvKeyKind[slot]) + ":" + mvValName[slot]
+    } else if kind == TSK_CLO_ENV {
+      const caps = captureNamesOf(slot)
+      s = s + ":" + seedNames(caps, 0, caps.length)
+    }
+    out.push(s)
+    k = k + 1
+  }
+  out
+}
+
+function seedNames(names: string[], from: i32, n: i32): string {
+  let s = ""
+  let i = 0
+  while i < n && from + i < names.length {
+    s = s + names[from + i] + ","
+    i = i + 1
+  }
+  s
 }
 
 // The armed recorder's rows as the `vl.reloc` custom section: version 2, the symbols (space,
@@ -5983,10 +6096,10 @@ function emitRelocSection(n: i32) {
   wSection(0, payload)
 }
 
-// Collects the string-literal pool: every distinct `StrLit` lexeme in the arena (first-seen
-// arena order, deterministic per program) whose decoded length fits one `array.new_fixed` (an
-// over-cap literal keeps the inline chunked build), then every literal an `is` compares with
-// `__str_eq__` that is not pooled yet, so the test allocates nothing (D2062).
+// Collects the string-literal pool, in arena order: every `StrLit` lexeme that fits one
+// `array.new_fixed` (an over-cap one keeps the inline build), every literal an `is` compares
+// with `__str_eq__`, and every string literal type an atom's conversion prints, so a module's
+// code reads the pool whatever literals the rest of its program holds.
 function collectStrPool() {
   gStrPoolTexts = []
   gStrPoolIx = Map()
@@ -6016,6 +6129,9 @@ function collectStrPool() {
   while j < isLexes.length {
     strPoolAdd(isLexes[j])
     j = j + 1
+  }
+  for t in T.tys {
+    if t is TyLit && t.litKind == "str" { strPoolAdd(quoteLex(t.litText)) }
   }
   0
 }
@@ -6115,6 +6231,7 @@ function emitModule(_stmts: i32[]) {
   emitReset()
   typeOrderReset()
   relReset()
+  relKeysReset()
   // The collect passes are done, so this is the last moment before any section indexes a
   // variant: prove the field-span tables cover every `uVariants` row, or fail loudly and pad
   // them, since a short table turns the next thirty reads into a compiler trap. Deliberately not
@@ -6210,14 +6327,16 @@ function emitModule(_stmts: i32[]) {
   emitDataSection()
   relPlaceSections()
   // Every section that names a type is written, so the first group can take its final order.
-  if !emitFailed { typeOrderRun(typeOffset) }
+  if !emitFailed { typeOrderRun(typeOffset, typeSeeds(typeOffset)) }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
   // unchanged for every golden.
   emitNameSection(n)
   emitRelocSection(n)
-  if RELOC_ARMED { emitLinkSection(n, fnSymKeys(n), cloThunkFes) }
+  if RELOC_ARMED {
+    emitLinkSection(n, fnSymKeys(n), cloThunkFes, runtimeFnNames())
+  }
   if wStray.length > 0 {
     return emitFail(
       "emitProgram: a module byte was written outside any section",

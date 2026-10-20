@@ -16,8 +16,8 @@ This doc covers:
 6. the cache key;
 7. the ordered steps and the gate on each.
 
-Step 1, the relocation recorder, has landed (§8), and so has step 2, symbolic value rows (§9).
-Step 3a, a link pass inside one compile, is in review (§10).
+Steps 1, 2, 3a and 3b have landed (§8 to §11). Step 4, per-module emission against local
+numbering, is in review (§12).
 
 ## 1. What a body encodes: the census
 
@@ -171,14 +171,18 @@ on program behaviour instead.
      init guards are assigned at link from their symbols, and union tags are resolved from
      their keys against the program's band tables. The type, import, memory, tag and data
      sections pass through as program-level input.
-   - **3b.** (In review, §11.) The type section and the tag band tables are built at link
+   - **3b.** (Landed, §11.) The type section and the tag band tables are built at link
      from per-module demands, so that no section passes through whole. This is where step
      4's local numbering starts to be possible.
 4. **Per-module emission.** Emit each module's bodies against local numbering, with
    instances as demands (§4), still inside one compile and still linked at once. Gates:
-   identity and the fixpoint, plus a **key-coverage test**. One module compiled under two
-   different importer sets must give the same artifact whenever its key is equal. This is
-   where design §5 need 4, the whole-program facts, is settled fact by fact.
+   the fixpoint, plus a **key-coverage test**. One module compiled under two different
+   importer sets must give the same artifact whenever its key is equal. This is where
+   design §5 need 4, the whole-program facts, is settled fact by fact. (In review, §12.)
+   This step is the exception to byte identity. The canonical type order and the
+   literal-type pool change normal builds, and are graded on behaviour instead. Types, tags,
+   atoms, runtime helpers and lambdas are keyed per module, and invariance holds on three
+   sets. Function frames still reserve slots on program-wide facts, and §12 lists them.
 5. **`-O` after link.** Move the optimiser behind the link. Gates: identity on `-O` builds,
    the plumb-shape cost gate, and seed-size.
 6. **Switch-over: the artifact cache.** The host stores artifacts and instances under §6's
@@ -455,3 +459,144 @@ Cost: seed 6,580,170 → 6,607,976 bytes (+0.42%). L2 guest fuel at #4190:
 - the new seed on this source: 109,863,131,568 (+0.0007%).
 
 The compiler is no slower on a given program, and the cost is its own larger source.
+
+## 12. Step 4: per-module emission against local numbering
+
+Step 3b left two whole-program facts: the mint rank of each group type and tag-band entry,
+and the value-atom band's top. Step 4 replaces both with keys that a module reads from
+itself. It also keys the last symbols that still carried a program-wide counter, and it
+makes the string pool cover every literal an atom's conversion can print. Every proof
+below grades the armed build. The new piece is **invariance**: a module compiled into two
+different programs gives byte-identical artifacts.
+
+**Decision: the type order is canonical, (a).** The emitter orders the first recursion
+group by a canonical key (`typeOrderCanon`, `emit_type_order.vl`), and the link calls the
+same function on the same keys. Option (b) would have sorted only at link, and it has a
+problem: linked output must equal direct output, so the direct emitter would need that
+order too, and then (b) is (a). So the rank is a sort key computed from keys alone, and
+the emitter writes the same order. The cost is that normal builds change their type
+order, which is the difftree family below.
+
+A type's key is `"T" + h1 + "." + h2`. It is two independent 32-bit hashes over:
+
+- a seed (`typeSeeds`, `emit_sections.vl`), which is a record's field names, a list's
+  element name, a map's key kind and value name, or a closure environment's captures;
+- the type's bytes, with every type it names cut;
+- the same for each group type it reaches, breadth first in byte order.
+
+Two types with equal keys get `#k` suffixes in mint order. The self-build has none: 266
+distinct keys over 225 artifacts. Past 64 types, the reference-count reorder runs over the
+key-sorted base, and a supertype still precedes its subtypes. Every group is now ordered,
+not only groups past 64 types.
+
+**Tag keys.**
+
+- **Variants.** A variant is keyed by `variantKeyOf` (`emit_reloc_keys.vl`): its signature,
+  `|`, and the canonical key of its first row's heap type. The variant band ranks by that
+  string, so a variant's tag no longer depends on which variants the rest of the program
+  holds. The rank table travels as `LinkProg.bands`.
+- **Value atoms.** An atom code is keyed by `atomCodeName` (`emit_map_twins.vl`). A code
+  below the map-twin codes is its own number. A map twin's code is `mt:` and the twin's
+  type. An atom-leaf list's code is `al:` and its depth. The atom-leaf check runs first,
+  because that code moves when a program's byte-array, `v128` or integer-map arms shift the
+  codes below it. The link resolves these names against `LinkProg.atomNames`, which
+  replaces `atomTop`.
+
+**Function keys.** A shared runtime helper is keyed `rt:` plus its name-section name
+(`runtimeFnNames`). Before, it was keyed by its position among the helpers, which depends
+on which helpers the program uses. A lifted lambda is keyed `__lambda` plus its own anchor
+(`fnLocSuffix`). Before, its synthesized name counted every lambda in the program.
+
+**The string pool.** An atom's conversion to a string builds a synthetic `mkStr` node. That
+node read a pooled global when some other module happened to spell the same literal, and
+built inline otherwise, so a module's body depended on its neighbours. `collectStrPool` now
+also pools the text of every string literal type in the arena. The conversion therefore
+always reads the pool. Normal builds gain a pool global per such text.
+
+At link, a text no module spells is the program's. It goes into the runtime artifact's
+pool after every module's, so it keeps its index. A module's own pool counts only nodes
+that existed when the pool was collected (`poolNodes`). A literal the emitter creates later
+belongs to no module.
+
+**Proof.** Armed build, skewed twin `RELOC_SKEW = 1`:
+
+| build | artifacts | functions | rows | sections differ | bodies differ | unconsumed | twin artifacts differ |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| self-build | 225 | 13,329 | 18,745 | 0 | 0 | 0 | 0 of 1 |
+| tests/cases, 4,358 programs | 5,111 | 73,980 | 43,399 | 0 | 0 | 0 | 0 of 4,358 |
+
+Nothing is unresolved, defined twice, non-minimal or undecodable. The step-1/2 proof on the
+self-build with its twin re-links 1,233,384 decoded sites with 0 modules differing. It
+records all 18,701 perturbed body constants and all 44 initialiser constants, and gives 0 of
+22,524 cross re-link regions differing. The 1,004 tests/cases programs that build no output
+are the corpus's reject cases. The master seed builds none of them either.
+
+**Invariance** (`s5-relocs.vl invariance`) compares every module's artifact across builds
+that hold it:
+
+| set | programs | shared modules | what the importers vary | pairs differ |
+| --- | ---: | ---: | --- | ---: |
+| a | 3 | 2 | which records, unions, closures, maps and literals the importers use, and import order | 0 |
+| b | 2 | 1 | a second imported module with a `u8[]` and a `boolean[]`, around an atom-list read and a value-union map | 0 |
+| c | 2 | 1 | a `u8[] \| f64[] \| string` union in the importer, which moves the atom-leaf list's code | 0 |
+
+Each set's link also reads 0 modules differing.
+
+**Controls.** Each control breaks one key, and an instrument must red:
+
+| control | what it breaks | red on |
+| --- | --- | --- |
+| variant by row | a variant keyed by its row number | set a: 2 pairs differ, link 3 modules differ |
+| atom by code | an atom keyed by its code | set c: 1 pair differs, link 2 modules differ |
+| no link order | the link places the group unsorted | link: 3, 2 and 2 modules differ over sets a, b and c |
+| no literal-type pool | literal type texts not pooled | set b: 1 pair differs |
+| no atom-list rule | the atom-leaf list named by its raw code | set c: 1 pair differs |
+
+The atom-by-code control is green on sets a and b, which is why set c exists.
+
+**What stays whole-program, for step 5.** Invariance fails on a set of 8 scripts
+(`s5-relocs.vl`, `goal-scoreboard.vl`, `seed-size.vl` and five more), and the link is green
+there. The cause is the function frame. A body's locals vector reserves scratch slots on
+program-wide facts. A two-program witness (`m3` under `r1` and `r2`) shows identical
+references, with locals `0x25` against `0x28`. The facts are:
+
+- `resetFnScratchFlags` reads `moduleHasUnionAs` and `moduleHasNumCast`
+  (`emit_union_casts.vl`, L6's), and `moduleHasFcpSpill` and `moduleHasIntMinMax`
+  (`emit_fn_scans.vl`);
+- `fbReserveCollectionFrames` reserves the call-ref frame on `fnValUsed`, and the map frames
+  on `mI32Used`, `mI64Used` and `mvValName.length` (the Map runtime's);
+- the `variantRebox`/`cloEq` slot;
+- `envSlotShift`, on `fnNestUsed`.
+
+Each needs its fact asked of the function or the module, not the program. Forcing every
+frame on would cost about 4% of the seed, so that was not done. Also still program-level:
+
+- the band rank table (`LinkProg.bands`, now a sort over keys, but carried whole);
+- lifted lambdas and instances in `prog.tail`;
+- the runtime artifact;
+- the literal-type texts no module spells.
+
+**Disarmed, normal builds change**, as decision (a) and the pool require. The fixpoint holds
+(6,620,623 bytes). difftree `--identity` against master's seed reads 9,547 of 10,951 builds
+differing, 0 uncompared, and every difference is explained:
+
+- 9,522 differ only in the module's bytes and size. Check output, build exit and stderr are
+  equal.
+- 25 also differ in stderr. Each is a check-clean invalid-wasm cell already filed (D2594,
+  D2595, and the rv3310 sets). Its validator message names type indices and offsets, and only
+  those numbers moved.
+- The candidate compiling master's source differs from master's fixpoint for the same
+  reason, 6,615,925 against 6,608,517 bytes.
+
+Behaviour is unchanged. The `cases_wasm` suites pass 5,530 and fail 0. `regress.vl` loses 0
+runs and moves 0 cells to silent. Its 21 "other movements" are those same cells, each
+`check-clean invalid wasm` before and after.
+
+Cost: seed 6,608,517 → 6,620,623 bytes (+0.18%). L2 guest fuel at #4192:
+
+- the master seed on its own source: 109,035,608,207;
+- the master seed on this source: 109,610,291,174 (+0.53%);
+- the new seed on this source: 109,735,964,460 (+0.11%).
+
+The compiler pays 0.11% on a given program, for keying and ordering every group rather than
+only those past 64 types. The rest is its own larger source.
