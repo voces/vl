@@ -1,6 +1,6 @@
-// The four `scripts/perf/*.vl` profiling tools, held to fixed output over hand-built inputs.
+// The `scripts/perf/*.vl` profiling tools, held to fixed output over hand-built inputs.
 //
-// Each was a Python script until T3 of the architecture refactor. The ports were graded by
+// Four were Python scripts until T3 of the architecture refactor. The ports were graded by
 // running both, output for output, before the Python was deleted: stdout and exit code were
 // byte-identical on real `VL_PROFILE_GUEST` profiles (a `check` of `compiler/entry.vl` and of
 // `std/json.vl`, a `build` of `compiler/entry.vl`, every row printed), on a full
@@ -202,6 +202,38 @@ Deno.test({
           argv: [empty, "a"],
           code: 1,
           out: lines("profile-parents: the profile has no samples"),
+        },
+        {
+          script: "profile-callers",
+          argv: [prof],
+          code: 0,
+          out: lines(
+            "20 samples; 12 in __ helpers (60.00%)",
+            "   all%  str_eq  probe  hash  probe32  rsz32  rsz  other  caller",
+            "  25.00  25.00   0.00   0.00   0.00   0.00   0.00   0.00  lookup",
+            "  15.00  15.00   0.00   0.00   0.00   0.00   0.00   0.00  modVisit",
+            "  10.00  10.00   0.00   0.00   0.00   0.00   0.00   0.00  emitProgram",
+            "  10.00  10.00   0.00   0.00   0.00   0.00   0.00   0.00  <root>",
+          ),
+        },
+        {
+          script: "profile-callers",
+          argv: [prof, "2", "2"],
+          code: 0,
+          out: lines(
+            "20 samples; 12 in __ helpers (60.00%)",
+            "   all%  str_eq  probe  hash  probe32  rsz32  rsz  other  caller",
+            "  25.00  25.00   0.00   0.00   0.00   0.00   0.00   0.00  lookup < checkProgram",
+            "  15.00  15.00   0.00   0.00   0.00   0.00   0.00   0.00  modVisit < checkProgram",
+          ),
+        },
+        {
+          script: "profile-callers",
+          argv: [],
+          code: 2,
+          out: lines(
+            "usage: vl run scripts/perf/profile-callers.vl -- <profile.json> [top] [depth]",
+          ),
         },
         {
           script: "profile-parents",
