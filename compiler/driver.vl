@@ -487,7 +487,7 @@ import {
   fmtSetSource,
   formatProgram,
 } from "./format"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
 
 const vcAcc = cpAccNew()
 // The in-module source channel, set when a VL caller already holds the source string
@@ -661,6 +661,12 @@ let expDeclCol: i32[] = []
 // for the "redundant export keyword" hint (an export imported by no other module).
 let expKwLine: i32[] = []
 let expKwCol: i32[] = []
+// The modules each name is exported from, by `expName` row and by `reExpPublic` row: an index
+// over the two tables' rows `[0, *Read)`, extended on each read and dropped by `modReset`.
+let expOwnBy: {[string]: i32[]} = Map()
+let expReBy: {[string]: i32[]} = Map()
+let expOwnRead = 0
+let expReRead = 0
 // Resolved keys imported by committed modules that are neither committed nor
 // marked missing — what the host fetch loop reads next. Recomputed per commit.
 let modPending: string[] = []
@@ -691,8 +697,10 @@ let modRenameTo: string[] = []
 // exactly a walk of this map: every row whose TARGET is a registered
 // `self`-function is a plain name this module binds to one.
 let modRenameFrom: string[] = []
-let modRenameFirstBySid: i32[] = []
-let modRenameLastBySid: i32[] = []
+const modRenameFirstBySid: i32[] = []
+const modRenameLastBySid: i32[] = []
+// The sids `modRenamePush` has set a slot of since the last `modRenameClear`.
+let modRenameSids: i32[] = []
 // One string per merged name for the whole program, so every module's references to a
 // declaration share one string and later compares answer by identity.
 let modCanonTo: {[string]: string} = Map()
@@ -718,6 +726,25 @@ let modOvUseCall: boolean[] = []
 let modSelfFnName: string[] = []
 let modSelfFnArity: i32[] = []
 let modSelfFnMinArity: i32[] = []
+// The names in `modSelfFnName`, for `modSelfFnDeclared`.
+let modSelfFnSet: {[string]: boolean} = Map()
+
+function modSelfFnReset() {
+  modSelfFnName = []
+  modSelfFnArity = []
+  modSelfFnMinArity = []
+  modSelfFnSet = Map()
+  0
+}
+
+// Registers the `self`-function `name` declaring `params`.
+function modSelfFnAdd(name: string, params: i32[]) {
+  modSelfFnName.push(name)
+  modSelfFnArity.push(params.length)
+  modSelfFnMinArity.push(fnRequiredArity(params))
+  modSelfFnSet[name] = true
+  0
+}
 // Generic type-parameter names live inside the rewrite of their declaration
 // (`T` while inside `id<T>`'s annotations/body or `Box<T>`'s definition): a
 // segment matching one must NOT rewrite through the rename map — it names the
@@ -1206,13 +1233,8 @@ function progBindsAmbientName(): boolean {
 function ambientRenameSingle(root: i32): i32 {
   ambTopRenamed = []
   if !progBindsAmbientName() { return 0 }
-  modRenameTo = []
-  modRenameFrom = []
-  modRenameFirstBySid = []
-  modRenameLastBySid = []
-  modSelfFnName = []
-  modSelfFnArity = []
-  modSelfFnMinArity = []
+  modRenameClear()
+  modSelfFnReset()
   const r = P.nodes[root]
   if r is Program {
     for sx in r.progStmts {
@@ -1229,9 +1251,7 @@ function ambientRenameSingle(root: i32): i32 {
           const p0 = P.nodes[st.fnParams[0]]
           if p0 is Param {
             if p0.parName == "self" {
-              modSelfFnName.push(st.fnName + modSuffixOf(0))
-              modSelfFnArity.push(st.fnParams.length)
-              modSelfFnMinArity.push(fnRequiredArity(st.fnParams))
+              modSelfFnAdd(st.fnName + modSuffixOf(0), st.fnParams)
             }
           }
         }
@@ -1244,9 +1264,7 @@ function ambientRenameSingle(root: i32): i32 {
   modRwMod = -1
   modAmbMod = 0
   modRwStmt(root)
-  modSelfFnName = []
-  modSelfFnArity = []
-  modSelfFnMinArity = []
+  modSelfFnReset()
   0
 }
 
@@ -3508,6 +3526,10 @@ export function modReset(): i32 {
   reExpKey = []
   reExpName = []
   reExpTarget = []
+  expOwnBy = Map()
+  expReBy = Map()
+  expOwnRead = 0
+  expReRead = 0
   modPending = []
   modPendScanned = 0
   modPendSeen = Map()
@@ -4535,19 +4557,31 @@ function modExportListNoFromMsg(m: i32, name: string, pub: string): string {
 // separate rather than merged, since `expName` also means "declared with the
 // keyword here" for go-to-definition. Visibility is the union, provenance is not.
 function modExportsHas(m: i32, name: string): boolean {
-  let i = 0
-  while i < expMod.length {
-    if expMod[i] == m && expName[i] == name { return true }
-    i = i + 1
-  }
   // A re-export publishes its PUBLIC name (`reExpPublic` — the `as` alias, else the
   // source name), so `export { a as b } from "dep"` surfaces `b` and NOT `a`.
-  let r = 0
-  while r < reExpMod.length {
-    if reExpMod[r] == m && reExpPublic[r] == name { return true }
-    r = r + 1
+  modDeclExports(m, name) || i32ListHas(expReByNow()[name] ?? [], m)
+}
+// Whether module `m` declares `name` with the `export` keyword (an `expName` row).
+function modDeclExports(m: i32, name: string) {
+  while expOwnRead < expMod.length {
+    expByAdd(expOwnBy, expName[expOwnRead], expMod[expOwnRead])
+    expOwnRead = expOwnRead + 1
   }
-  false
+  i32ListHas(expOwnBy[name] ?? [], m)
+}
+// `expReBy` brought up to every `reExpPublic` row.
+function expReByNow(): {[string]: i32[]} {
+  while expReRead < reExpMod.length {
+    expByAdd(expReBy, reExpPublic[expReRead], reExpMod[expReRead])
+    expReRead = expReRead + 1
+  }
+  expReBy
+}
+function expByAdd(by: {[string]: i32[]}, name: string, m: i32) {
+  const ms = by[name] ?? []
+  ms.push(m)
+  by[name] = ms
+  0
 }
 // The merged (mangled) name of the declaration that module `m`'s public `name`
 // ultimately denotes. When `m` re-exports rather than declares it, follows the
@@ -7207,10 +7241,19 @@ function modTyRenamedSeg(seg: string) {
   }
   modRenameTo[row]
 }
-// Appends one row to the rename map and indexes it under its interned `from`. The
-// two sid views are fresh arrays per module, so a row index is only ever read
-// against the map that produced it — no cross-program row can survive a `sidReset`,
-// the hazard `symbols.sidKeyedTablesReset` describes for un-rebuilt tables.
+// Empties the rename map. The sid views keep their length and reset only the slots a row set,
+// by position, so no row survives into the next map even across a `sidReset`.
+function modRenameClear() {
+  for s in modRenameSids {
+    modRenameFirstBySid[s] = -1
+    modRenameLastBySid[s] = -1
+  }
+  modRenameSids = []
+  modRenameTo = []
+  modRenameFrom = []
+  0
+}
+// Appends one row to the rename map and indexes it under its interned `from`.
 function modRenamePush(from: string, to: string): i32 {
   const row = modRenameTo.length
   const canon = modCanonTo[to] ?? ""
@@ -7223,16 +7266,14 @@ function modRenamePush(from: string, to: string): i32 {
   modRenameFrom.push(from)
   const s = sidOf(from)
   if sidArrGet(modRenameFirstBySid, s) < 0 {
+    modRenameSids.push(s)
     sidArrPut(modRenameFirstBySid, s, row)
   }
   sidArrPut(modRenameLastBySid, s, row)
   0
 }
 function modBuildRename(m: i32, root: i32): i32 {
-  modRenameTo = []
-  modRenameFrom = []
-  modRenameFirstBySid = []
-  modRenameLastBySid = []
+  modRenameClear()
   const impLocals: string[] = []
   let ii = 0
   while ii < impMod.length {
@@ -7317,9 +7358,7 @@ function modBuildRename(m: i32, root: i32): i32 {
 // merge. Runs with each module's rename map live, so `shout` registers as
 // `shout$mN`, the name the rewritten `memProp` and merged `FuncDecl` will carry.
 function modCollectSelfFns(roots: i32[]): i32 {
-  modSelfFnName = []
-  modSelfFnArity = []
-  modSelfFnMinArity = []
+  modSelfFnReset()
   let o = 0
   while o < roots.length {
     const m = modOrder[o]
@@ -7343,9 +7382,7 @@ function modCollectSelfFns(roots: i32[]): i32 {
                 // because the rename map is built through the same call.
                 const sfBase = modDeclBase(ss[si], st.fnName)
                 const sfMangled = modRenamed(sfBase)
-                modSelfFnName.push(sfMangled)
-                modSelfFnArity.push(st.fnParams.length)
-                modSelfFnMinArity.push(fnRequiredArity(st.fnParams))
+                modSelfFnAdd(sfMangled, st.fnParams)
                 // D1230's registry, filled from the one walk that already has
                 // both halves: the module index and its rename map.
                 modNoteUfcsImportCand(m, sfBase, sfMangled)
@@ -7365,14 +7402,7 @@ function modCollectSelfFns(roots: i32[]): i32 {
 // Recorded so the checker can turn a field-not-found error into a missing-import
 // suggestion. Three gates skip a wrong one; it does not gate on the receiver type.
 function modNoteUfcsImportCand(m: i32, base: string, mangled: string): i32 {
-  if m == 0 { return 0 }
-  let ex = 0
-  let exported = false
-  while ex < expMod.length {
-    if expMod[ex] == m && expName[ex] == base { exported = true }
-    ex = ex + 1
-  }
-  if !exported { return 0 }
+  if m == 0 || !modDeclExports(m, base) { return 0 }
   const spec = modUfcsSpecFromEntry(m)
   if spec == "" { return 0 }
   ufcsImpAdd(base, mangled, spec, modKeyIsEntryImported(modKeys[m]))
@@ -7425,12 +7455,7 @@ function modSelfFnTarget(prop: string, argc: i32): string {
 // Is `name` a merged top-level `self`-function? The arity-free half of
 // `modSelfFnTarget`, asked of a rename TARGET rather than of a call.
 function modSelfFnDeclared(name: string): boolean {
-  let i = 0
-  while i < modSelfFnName.length {
-    if modSelfFnName[i] == name { return true }
-    i = i + 1
-  }
-  false
+  modSelfFnSet[name] ?? false
 }
 // D1191 — module `m`'s UFCS scope, from the rename map already live for it: rows
 // whose target is a `self`-function are exactly the plain names `m` may dispatch
