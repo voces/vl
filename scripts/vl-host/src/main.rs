@@ -7819,6 +7819,114 @@ fn test_pool_allowed() -> bool {
     !guest_fuel_on() && guest_profile_path().is_none()
 }
 
+/// Whether `vl check` may stage its root pool. Not under a guest profile, which samples
+/// ONE store; under `$VL_FUEL` it may, because each worker's fuel is added to the run's
+/// total (`CHECK_POOL_FUEL`), so the count describes the schedule a plain run uses.
+fn check_pool_allowed() -> bool {
+    guest_profile_path().is_none()
+}
+
+/// The fuel every retired `vl check` pool worker burned, for the run's `[fuel]` line.
+static CHECK_POOL_FUEL: AtomicU64 = AtomicU64::new(0);
+
+/// `wiStat`'s reasons in its order, then the import-free checks `wiModStat` adds.
+const CHECK_STAT_NAMES: [&str; 11] = [
+    "served", "unseen", "dirty", "entry", "demand", "fresh", "writer", "ambient", "asks",
+    "graph", "single",
+];
+
+/// Per `CHECK_STAT_NAMES` row, the roots and module checks every instance of this run
+/// counted: each retired pool worker's, then the parent's (`$VL_CHECK_STATS=1`).
+static CHECK_STATS: Mutex<[(i64, i64); 11]> = Mutex::new([(0, 0); 11]);
+
+/// Whether `$VL_CHECK_STATS` (`1`, or `trace`) asked `vl check` for its per-reason serving counts.
+fn check_stats_on() -> bool {
+    matches!(std::env::var("VL_CHECK_STATS").ok().as_deref(), Some("1" | "trace"))
+}
+
+/// Whether `$VL_CHECK_STATS=trace` also asked for one `[check] decline` row per declined root.
+fn check_trace_on() -> bool {
+    std::env::var("VL_CHECK_STATS").ok().as_deref() == Some("trace")
+}
+
+/// Print one instance's declined-root rows (`wiTraceCount`): reason, key, module count, and
+/// the module and imported name its guard named. A seed without the trace prints none.
+fn print_check_trace(store: &mut Store<()>, inst: &Instance) {
+    let (Ok(count), Ok(len), Ok(at)) = (
+        inst.get_typed_func::<(), i32>(&mut *store, "wiTraceCount"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "wiTraceLen"),
+        inst.get_typed_func::<(i32, i32), i32>(&mut *store, "wiTraceAt"),
+    ) else {
+        return;
+    };
+    let n = count.call(&mut *store, ()).unwrap_or(0);
+    let mut rows = String::new();
+    for i in 0..n {
+        let l = len.call(&mut *store, i).unwrap_or(0);
+        let bytes: Vec<u8> = (0..l).map(|j| at.call(&mut *store, (i, j)).unwrap_or(0) as u8).collect();
+        let row = String::from_utf8_lossy(&bytes);
+        let mut f = row.splitn(2, ' ');
+        let why: usize = f.next().and_then(|w| w.parse().ok()).unwrap_or(usize::MAX);
+        let name = CHECK_STAT_NAMES.get(why).copied().unwrap_or("?");
+        rows.push_str(&format!("[check] decline {name} {}\n", f.next().unwrap_or("")));
+    }
+    eprint!("{rows}");
+}
+
+/// Add one instance's serving counts and burned fuel to the run's totals. A seed without
+/// `wiModStat` adds no counts.
+fn harvest_check_instance(store: &mut Store<()>, inst: &Instance, pooled: bool) {
+    if pooled && guest_fuel_on() {
+        if let Ok(left) = store.get_fuel() {
+            CHECK_POOL_FUEL.fetch_add(u64::MAX - left, Ordering::Relaxed);
+        }
+    }
+    if !check_stats_on() {
+        return;
+    }
+    if check_trace_on() {
+        print_check_trace(store, inst);
+    }
+    let (Ok(stat), Ok(mods)) = (
+        inst.get_typed_func::<i32, i32>(&mut *store, "wiStat"),
+        inst.get_typed_func::<i32, i32>(&mut *store, "wiModStat"),
+    ) else {
+        return;
+    };
+    let mut totals = CHECK_STATS.lock().unwrap();
+    for (r, row) in totals.iter_mut().enumerate() {
+        let m = mods.call(&mut *store, r as i32).unwrap_or(0).max(0);
+        // An import-free check is one root and one module.
+        let roots = if r < 10 { stat.call(&mut *store, r as i32).unwrap_or(0) } else { m };
+        row.0 += i64::from(roots.max(0));
+        row.1 += i64::from(m);
+    }
+}
+
+/// `vl check`'s run totals on stderr: under `$VL_FUEL=1`, `[fuel] guest: <n>` over the
+/// parent and every pool worker; under `$VL_CHECK_STATS=1`, one `[check]` line per reason
+/// with its roots and module checks, then the module-check total.
+fn report_check_run(store: &mut Store<()>, inst: &Instance) {
+    harvest_check_instance(store, inst, false);
+    if guest_fuel_on() {
+        if let Ok(left) = store.get_fuel() {
+            let total = (u64::MAX - left) + CHECK_POOL_FUEL.load(Ordering::Relaxed);
+            eprintln!("[fuel] guest: {total}");
+        }
+    }
+    if check_stats_on() {
+        let totals = CHECK_STATS.lock().unwrap();
+        let mut checked = 0;
+        for (name, (roots, mods)) in CHECK_STAT_NAMES.iter().zip(totals.iter()) {
+            if *name != "served" {
+                checked += mods;
+            }
+            eprintln!("[check] {name}: roots={roots} modules={mods}");
+        }
+        eprintln!("[check] module checks: {checked}");
+    }
+}
+
 /// One pool worker: a fresh compiler instance on `module`, driven through the same
 /// command loop in compile-one mode (`cliTestPoolStage(2)`) over the single file
 /// `path`. `Ok(Ok(bytes))` is the emitted test module; `Ok(Err(text))` is the file's
@@ -7982,6 +8090,7 @@ struct CheckWorker {
     file_commit: TypedFunc<i32, i32>,
     root_in: Option<RootIn>,
     exit_code: TypedFunc<(), i32>,
+    inst: Instance,
 }
 
 impl CheckWorker {
@@ -8023,6 +8132,7 @@ impl CheckWorker {
             file_commit: inst.get_typed_func::<i32, i32>(&mut store, "cliFileCommit")?,
             root_in: RootIn::probe(&mut store, &inst),
             exit_code: inst.get_typed_func::<(), i32>(&mut store, "cliExitCode")?,
+            inst,
             store,
         })
     }
@@ -8097,13 +8207,18 @@ fn check_roots_pooled(
             })();
             let (payload, keep) = outcome.unwrap_or((None, false));
             if !keep {
-                worker = None;
+                if let Some(mut w) = worker.take() {
+                    harvest_check_instance(&mut w.store, &w.inst, true);
+                }
             }
             if test_trace_on() {
                 let how = if payload.is_some() { "pooled" } else { "deferred" };
                 eprintln!("vl-test-trace check root={i} ms={} {how}", t0.elapsed().as_millis());
             }
             *slots[i].lock().unwrap() = payload;
+        }
+        if let Some(mut w) = worker.take() {
+            harvest_check_instance(&mut w.store, &w.inst, true);
         }
     };
     std::thread::scope(|scope| {
@@ -8900,7 +9015,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
         if let Ok(stage) = inst.get_typed_func::<i32, i32>(&mut store, "cliTestPoolStage") {
             stage.call(&mut store, 1)?;
         }
-        // `vl check`'s root pool, the same way: a seed without it checks every root here.
+    }
+    // `vl check`'s root pool, the same way: a seed without it checks every root here.
+    if check_pool_allowed() {
         if let Ok(stage) = inst.get_typed_func::<(i32, i32), i32>(&mut store, "cliCheckPoolStage")
         {
             stage.call(&mut store, (1, -1))?;
@@ -9261,6 +9378,9 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // AFTER the last guest call, and before the `exit` that keeps `main`'s own
     // `finish_guest_profile` from ever running on this path.
     let mut code = exit_code.call(&mut store, ())?;
+    if args.first().map(String::as_str) == Some("check") {
+        report_check_run(&mut store, &inst);
+    }
     finish_guest_profile();
     if gc_stats {
         print_compile_gc_stats();

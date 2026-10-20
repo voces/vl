@@ -582,7 +582,8 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   setRepShadow: "uncached", setSharedMemory: "input", src: "input", srcReset: "input",
   vlRootCommit: "input", vlRootPush: "input", vltCount: "uncached", vltFailAt: "uncached",
   vltFailLen: "uncached", vltNameAt: "uncached", vltNameLen: "uncached", vltRun: "uncached",
-  vltSkipped: "uncached",
+  vltSkipped: "uncached", wiModStat: "uncached", wiStat: "uncached", wiTraceAt: "uncached",
+  wiTraceCount: "uncached", wiTraceLen: "uncached",
 };
 
 // A pooled worker answers DONE, LIST_DIR (a constant 0), READ_FILE (recorded), the two
