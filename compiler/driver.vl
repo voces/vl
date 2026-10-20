@@ -297,6 +297,7 @@ import {
   ihImport,
   ihMask,
   ihModule,
+  ihNameDeclaredOut,
   ihOccDigests,
   ihPlainBinding,
   ihPosHash,
@@ -1448,9 +1449,11 @@ export function checkSrc(): i32 {
   wiServedLast = false
   wiBankedKeys = []
   wiBankedMods = []
+  wiSrvDiags = []
+  wiSrvRc = 0
   // Module mode (H3) — see compileSrc; `check` runs the same pipeline minus emit.
   if modKeys.length > 0 {
-    if wiServe() { return 0 }
+    if wiServe() { return wiSrvRc }
     const rc = modCompile(0)
     if rc != SK_RERUN { return rc }
     // A declined skip has already checked part of the graph into the arena, so the whole
@@ -5181,7 +5184,10 @@ function modCompile(emit: i32): i32 {
   // A lossless-recovered graph CHECKS but never BUILDS — same rule as
   // `compileSrc`, and the rc stays 1 so `vl build` behaves exactly as before.
   if P.diags.length > 0 { return 1 }
-  if T.diags.length > 0 { return 2 }
+  if T.diags.length > 0 {
+    if wiLiveNow && emit == 0 && keep.length == 0 { wiBankWhole(roots) }
+    return 2
+  }
   // The deep-`is` second pass, on the merged program: the generated walkers name
   // their types through `tyToStr`, which renders the mangled declarations
   // (`Json$m1`) after the merge — so the fragment, parsed after the rename pass,
@@ -6502,9 +6508,9 @@ function skBankNow(tokEnd: i32, keep: boolean[]): i32 {
 }
 
 // ── serving one invocation's targets from an importer's check (`wiArm`) ─────────────────────
-// A clean check of an importer banks each target in its graph whose own check cannot differ:
-// nothing outside the target's import closure G reaches G (`wiGuard`). A later check of that
-// target over the same sources is served with no diagnostics and the banked lint sites.
+// An importer's check banks each target whose own check cannot differ: nothing outside its
+// import closure G reaches G (`wiGuard`), and G holds every type error (D7801). A later check
+// of that target over the same sources is served the banked diagnostics, rc and lint sites.
 const WI_SERVED = 0
 const WI_UNSEEN = 1
 const WI_DIRTY = 2
@@ -6516,13 +6522,32 @@ const WI_AMBIENT = 7
 const WI_ASKS = 8
 const WI_GRAPH = 9
 const WI_REASONS = 10
+// One banked type diagnostic: its module's key, its span and its rendered message.
+type WiDiag = {
+  dKey: string,
+  dLine: i32,
+  dCol: i32,
+  dEndLine: i32,
+  dEndCol: i32,
+  dMsg: string,
+}
 type WiBank = {
   wKeys: {[string]: i32},
   wSrcs: string[],
   wPlus: {[i32]: i32}[],
   wStrIdx: {[i32]: i32}[],
   wScalar: {[i32]: i32}[],
+  wDiags: WiDiag[],
+  wRc: i32,
 }
+// The served check's diagnostics and rc (`wiServe`).
+let wiSrvDiags: WiDiag[] = []
+let wiSrvRc = 0
+// Whether this bank pass runs over a check with type errors, and each error's module and
+// rendered message, read once per pass by `wiBankWhole`.
+let wiDirtyNow = false
+let wiDiagMods: i32[] = []
+let wiDiagMsgs: string[] = []
 let wiOn = false
 let wiMask = 0
 // Whether `wiArm` armed the interface hashes, so a check needs only their statement table.
@@ -6579,6 +6604,7 @@ const WI_NO_ADOPTED = 256
 const WI_NO_TWIN = 512
 const WI_NO_KEPT = 1024
 const WI_NO_CALLED = 2048
+const WI_NO_DIAG_NAMES = 4096
 // The delivery flags whose judgement reads every site of the value: kept, or site-counted.
 const WI_COUNTED = 5
 
@@ -6694,6 +6720,18 @@ export function wiBankedCount(): i32 { wiBankedKeys.length }
 export function wiBankedKey(i: i32): string { wiBankedKeys[i] }
 export function wiBankedMod(i: i32): i32 { wiBankedMods[i] }
 
+// The served check's type diagnostics, in its own check's order: how many, and row `i`'s
+// module index in this graph, span and message.
+export function wiDiagCount(): i32 { wiSrvDiags.length }
+export function wiDiagMod(i: i32): i32 { modIndexOfKey(wiSrvDiags[i].dKey) }
+export function wiDiagLine(i: i32): i32 { wiSrvDiags[i].dLine }
+export function wiDiagCol(i: i32): i32 { wiSrvDiags[i].dCol }
+export function wiDiagEndLine(i: i32): i32 { wiSrvDiags[i].dEndLine }
+export function wiDiagEndCol(i: i32): i32 { wiSrvDiags[i].dEndCol }
+export function wiDiagMsg(i: i32): string { wiSrvDiags[i].dMsg }
+export function wiDiagMsgLen(i: i32): i32 { wiSrvDiags[i].dMsg.length }
+export function wiDiagMsgAt(i: i32, j: i32): i32 { wiSrvDiags[i].dMsg[j] }
+
 // Before a module check: serve the entry from its bank when that bank holds exactly this graph.
 function wiServe(): boolean {
   if !wiOn || modKeys.length == 0 { return false }
@@ -6742,6 +6780,8 @@ function wiServe(): boolean {
       m = m + 1
     }
     plBankGen = plGen
+    wiSrvDiags = b.wDiags
+    wiSrvRc = b.wRc
   }
   mimpClear()
   vcEpDrop()
@@ -6751,15 +6791,19 @@ function wiServe(): boolean {
   true
 }
 
-// After a whole module check that passed: bank every pending target the graph holds as a
-// module other than the entry, when `wiGuard` finds its own check could not differ.
+// After a whole module check with no parse errors: bank every pending target the graph holds
+// as a module other than the entry, when `wiGuard` finds its own check could not differ. A
+// check with type errors never runs the deep-`is` pass, and neither does the target's own.
 function wiBankWhole(roots: i32[]): i32 {
+  wiDirtyNow = T.diags.length > 0
+  wiDiagMods = []
+  const placed = !wiDirtyNow || wiDiagsPlaced()
   const clean = P.diags.length == 0
-    && T.diags.length == 0
-    && jwSiteNode.length == 0
+    && (wiDirtyNow || jwSiteNode.length == 0)
     && mimpMissed.length == 0
     && !fsAsked()
     && fsModeOf() == FS_COMPILE
+    && placed
   const pos = skPosOf()
   let ready = false
   let m = 1
@@ -6772,12 +6816,70 @@ function wiBankWhole(roots: i32[]): i32 {
         ready = true
       }
       wiCulprit = -1
+      if !placed { wiCulpritName = "(unplaced error)" }
       if clean { why = wiGuard(m, roots, pos) }
       if why == WI_SERVED { wiBankOne(m) } else { wiBlame(key, why) }
     }
     m = m + 1
   }
   0
+}
+
+// Whether every type error of this check is anchored in a module (`wiDiagMods`), renders
+// with no merge spelling left in it, and holds a position no other error holds, since the
+// report orders errors at one position by their check order.
+function wiDiagsPlaced(): boolean {
+  wiDiagMods = []
+  wiDiagMsgs = []
+  const seen: {[string]: boolean} = Map()
+  let j = 0
+  while j < T.diags.length {
+    const m = skDiagMod(j)
+    if m < 0 { return false }
+    const msg = vcDiagMsg(P.diags.length + j)
+    if strContains(msg, "#") || strContains(msg, "$") { return false }
+    const at = i32ToStr(m)
+      + ":"
+      + i32ToStr(T.diags[j].tline)
+      + ":"
+      + i32ToStr(T.diags[j].tcol)
+    if seen.has(at) { return false }
+    seen[at] = true
+    wiDiagMods.push(m)
+    wiDiagMsgs.push(msg)
+    j = j + 1
+  }
+  true
+}
+
+// Whether an error message names a type declared outside `inG`, the one way an outside
+// declaration reaches the text of an error placed in G: a type renders by a declared name.
+function wiDiagNamesOut(inG: boolean[]): boolean {
+  for msg in wiDiagMsgs {
+    let i = 0
+    while i < msg.length {
+      let j = i
+      while j < msg.length && wiIdentChar(msg[j]) { j = j + 1 }
+      if j > i {
+        const w = msg.slice(i, j)
+        if ihNameDeclaredOut(w, inG) {
+          wiCulpritName = "(error names " + w + ")"
+          return true
+        }
+        i = j
+      } else {
+        i = i + 1
+      }
+    }
+  }
+  false
+}
+
+function wiIdentChar(c: i32): boolean {
+  (c >= 'a' && c <= 'z')
+    || (c >= 'A' && c <= 'Z')
+    || (c >= '0' && c <= '9')
+    || c == '_'
 }
 
 // Record the reason a guard declined target `key` and the module it named, so no later graph
@@ -6867,6 +6969,12 @@ function wiClosure(t: i32): boolean[] {
 // statement outside meets G's words; or G asked about a body outside it.
 function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
   const inG = wiClosure(t)
+  for m in wiDiagMods {
+    if !inG[m] {
+      wiCulpritName = "(error in " + modKeys[m] + ")"
+      return WI_DIRTY
+    }
+  }
   if (wiMask & WI_NO_ENTRY) == 0 && !wiEntryNeutral(t, roots[pos[t]]) {
     wiCulprit = WI_ANY
     return WI_ENTRY
@@ -6882,6 +6990,10 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
     if !wiIndexed {
       ihAmbientIndex()
       wiIndexed = true
+    }
+    if wiDirtyNow && (wiMask & WI_NO_DIAG_NAMES) == 0 && wiDiagNamesOut(inG) {
+      wiCulprit = WI_ANY
+      return WI_AMBIENT
     }
     const rows = (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(t)
     const meets = ihAmbientMeetsIn(
@@ -7166,6 +7278,24 @@ function wiBankOne(t: i32): i32 {
     wPlus: [],
     wStrIdx: [],
     wScalar: [],
+    wDiags: [],
+    wRc: 0,
+  }
+  if wiDirtyNow { b.wRc = 2 }
+  let j = 0
+  while wiDirtyNow && j < T.diags.length {
+    const i = P.diags.length + j
+    b.wDiags.push(
+      {
+        dKey: modKeys[wiDiagMods[j]],
+        dLine: diagLine(i),
+        dCol: diagCol(i),
+        dEndLine: diagEndLine(i),
+        dEndCol: diagEndCol(i),
+        dMsg: wiDiagMsgs[j],
+      },
+    )
+    j = j + 1
   }
   let m = 0
   while m < modKeys.length {
