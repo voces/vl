@@ -1421,9 +1421,12 @@ argument lists each way that read can happen, and shows the key it needs is in F
 3. **Receiver calls.** `x.name(…)` and a getter `x.name` are found from the receiver's type,
    in any module. A getter is global: main's getter on lib's type changes lib's diagnostic.
    - The call spells `name`, so the RECV row is in FV(S).
-   - An operator is found from no spelled name, so it is WILD.
+   - An operator is found from no spelled name, so on a structural type it is WILD. On a `new`
+     type its row is the type's name, since a value of one enters only where that name is
+     spelled (D7501).
 4. **Type names.** A NAME row is kept, but a private type is module-scoped, so no witness
-   reads it unimported (see the table below). It is a conservative guard, not a narrowing
+   reads it unimported (see the table below). Whole-root serving meets one only when the root
+   has a report row (D7501); here it stays a conservative guard, not a narrowing
    this step claims.
 5. **Diagnostic text.** A diagnostic can suggest a near name from any module, for a type or
    a receiver function. A near name is not in FV(S) by construction, so any diagnostic in S

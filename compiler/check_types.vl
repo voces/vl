@@ -14,7 +14,7 @@ import {
   demangleSpelling,
   groupInnerOf,
   nameIsBareIdent,
-  nameIsQuotedLeaf,
+  nameIsQuotedWhole,
 } from "./tyname"
 import { i32ListHas } from "./listutil"
 import {
@@ -1909,12 +1909,7 @@ function tyNameObj(ix: i32, t: TyObj, nominal: boolean): string {
       if fbal != "" { fs = fbal }
     }
     // A lone string literal field keeps its literal: it reps as the atom, not as `string` (D7220).
-    if fs == "" {
-      const flt = T.tys[ftys[fi]]
-      if flt is TyLit {
-        if flt.litKind == "str" { fs = "\"" + flt.litText + "\"" }
-      }
-    }
+    if fs == "" { fs = oneStrLitSpelling(ftys[fi]) }
     if fs == "" {
       fs = tyToNameAt(ftys[fi], nameKidCtx(ix, RC_FIELD, nominal), nominal)
     }
@@ -2021,6 +2016,8 @@ function tyToNameGo(ix: i32, ctx: i32, nominal: boolean): string {
       // The element's own atom width, as its producer reported it — an alias identifier is
       // one atom, the render leg reports its own.
       let elw = 1
+      // So does a lone string literal element, its one-member set's atom (D7340).
+      if el == "" { el = oneStrLitSpelling(t.aElem) }
       if el == "" {
         el = tyToNameAt(t.aElem, nameKidCtx(ix, RC_ELEM, nominal), nominal)
         elw = tyNameAtoms
@@ -4019,6 +4016,12 @@ export function tyIsOneStrLit(ty: i32): boolean {
   tyLitMemberTexts(ty).length == 1
 }
 
+// The quoted spelling of `ty` when it is exactly one string literal, else "".
+export function oneStrLitSpelling(ty: i32): string {
+  if !tyIsOneStrLit(ty) { return "" }
+  "\"" + tyLitMemberTexts(ty)[0] + "\""
+}
+
 // ── type-arena constructors ──────────────────────────────────────────────────
 // Each appends a variant to `T.tys` and returns its index — the same shape as the AST's `mk*`
 // constructors, for the parallel arena.
@@ -4063,8 +4066,22 @@ export function mkNullableTy(inner: i32) {
 }
 
 export function mkArrayTy(elem: i32) {
-  const t: Ty = { aElem: elem, aRead: 0 }
+  const t: Ty = { aElem: elemAsLitSet(elem), aRead: 0 }
   addTy(t)
+}
+
+// A list element of one string literal is its one-member set, so `"a"[]` and `K[]` over
+// `type K = "a"` are one element type and store one atom (D7340).
+function elemAsLitSet(elem: i32): i32 {
+  if elem < 0 || elem >= T.tys.length { return elem }
+  const t = T.tys[elem]
+  if t is TyLit {
+    if t.litKind == "str" {
+      const u: Ty = { uMembers: [elem] }
+      return addTy(u)
+    }
+  }
+  elem
 }
 
 // `ty | null`, for an emit-side rewrite that needs a box over a value with no niche (D2826).
@@ -4073,7 +4090,7 @@ export function mkNullableTyOf(ty: i32) { mkNullableTy(ty) }
 // The read-only view over the same element (`readonly T[]`). A sibling constructor rather
 // than a flag on `mkArrayTy`, so every existing mint stays a mutable list by construction.
 export function mkArrayViewTy(elem: i32) {
-  const t: Ty = { aElem: elem, aRead: 1 }
+  const t: Ty = { aElem: elemAsLitSet(elem), aRead: 1 }
   addTy(t)
 }
 
@@ -4130,9 +4147,9 @@ export function litMemberTy(name: string) {
   if name.length == 0 { return -1 }
   // A string-literal type `"a"`: the quoted lexeme is the member, and the raw inner text is kept,
   // since the literal expression side keeps its raw lexeme too and membership compares the same
-  // characters. The quote test (`tyname.nameIsQuotedLeaf`) stays here because the group-interior
+  // characters. The quote test (`tyname.nameIsQuotedWhole`) stays here because the group-interior
   // cut at its home is delimiter-blind by design; its bound is the length test two lines up.
-  if nameIsQuotedLeaf(name) { return mkLitTy("str", groupInnerOf(name)) }
+  if nameIsQuotedWhole(name) { return mkLitTy("str", groupInnerOf(name)) }
   // An integer-literal type (`0`, `0x10`). A float lexeme (`1.5`, `1e3`) names no type.
   if name[0] >= '0' && name[0] <= '9' {
     if numLexIsFloat(name) { return -1 }
