@@ -1589,6 +1589,11 @@ function recBuiltAtDeclared(at: i32, srcTy: i32, dstTy: i32): boolean {
     if !found { found = recDeclaredRowOf(recAdRecOf(ut), own, dst) }
   }
   if !found { return false }
+  recRefuseAtOwnRow(at, own, dst)
+}
+
+// Refuse delivering `at`, a record of `own` built at its own row, onto `dst`'s storage; true.
+function recRefuseAtOwnRow(at: i32, own: i32, dst: i32): boolean {
   shapeAdaptSrcTySet(own)
   shapeAdaptDstTySet(dst)
   shapeAdaptSrcExprSet(at)
@@ -1715,6 +1720,44 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     if at < 0 || !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
   }
   hasCall
+}
+
+// Whether `p` reaches the call `po` through generic identities each pinned only by the argument it
+// hands back.
+function recSolePinChain(p: i32, po: i32): boolean {
+  let x = cwPeelValue(p)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops < 16 {
+    if x == po { return true }
+    const a = recSolePinArg(x)
+    if a < 0 { return false }
+    x = cwPeelValue(a)
+    hops = hops + 1
+  }
+  false
+}
+
+// Whether some call of `fd` has a queued delivery landing its record of `own` on a field storage
+// other than both `dst`'s and its own.
+function recSitesLandApart(fd: i32, own: i32, dst: i32): boolean {
+  if own < 0 || !(T.tys[own] is TyObj) || !(T.tys[dst] is TyObj) {
+    return false
+  }
+  const sites: i32[] = []
+  if rcwCallSites(fd, sites) >= 0 { return false }
+  for s in sites {
+    if s % 2 == 0 {
+      const at = recQueuedLandingOf(s / 2, own)
+      if (
+        at >= 0
+        && !fieldStorageEq(at, dst, REC_STORE_DEPTH)
+        && !fieldStorageEq(at, own, REC_STORE_DEPTH)
+      ) {
+        return true
+      }
+    }
+  }
+  false
 }
 
 // The record a queued delivery lands call `c`'s record of `own` on, through generic identities
@@ -1913,6 +1956,17 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       // A union destination keeps master's delivery, which boxes the record it builds.
       if recFloatBuiltElsewhere(p, srcTy, nonNulTyOf(dstTy)) { return 0 }
       if recBuildsLit(fd, 8) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+      // One body builds one row, so calls landing on two field storages cannot all be served
+      // and the record stays at its own row (D8301).
+      const ld = recLandingOf(srcTy, dstTy)
+      if (
+        recBuildsLit(fd, 8)
+        && ld >= 0
+        && recSitesLandApart(fd, nonNulTyOf(srcTy), ld)
+      ) {
+        recRefuseAtOwnRow(p, nonNulTyOf(srcTy), ld)
+        return 0
+      }
       return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
     }
     const pa = recPassThroughArg(p)
@@ -1924,6 +1978,15 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
       if pp >= 0 && recPassThroughArg(pp) >= 0 {
         const po = recOriginExpr(pp)
         const pi = if po >= 0 { recInferredFnOf(po) } else { -1 }
+        // Identities each pinned only by the call inside hand the build on to it (D8303).
+        if (
+          pi >= 0
+          && recSolePinChain(p, po)
+          && recLandingOf(srcTy, dstTy) == nonNulTyOf(dstTy)
+          && recFnBuiltAtDst(pi, po, srcTy, dstTy)
+        ) {
+          return recAdPushDecl(pi, srcTy, nonNulTyOf(dstTy), false, po)
+        }
         if pi >= 0 && recHasLitLeaf(pi) && recBuiltAtDeclared(p, srcTy, dstTy) {
           return 0
         }
@@ -1957,6 +2020,15 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
           return recAdPushDecl(pf, srcTy, nonNulTyOf(dstTy), false, pp)
         }
         if recHasLitLeaf(pf) && recBuiltAtDeclared(p, srcTy, dstTy) { return 0 }
+        const pld = recLandingOf(srcTy, dstTy)
+        if (
+          recHasLitLeaf(pf)
+          && pld >= 0
+          && recSitesLandApart(pf, nonNulTyOf(srcTy), pld)
+        ) {
+          recRefuseAtOwnRow(p, nonNulTyOf(srcTy), pld)
+          return 0
+        }
       }
       // An object literal argument is built at the identity's own instance, which holds an
       // integer where a flat float field waits (D3442).
