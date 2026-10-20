@@ -216,7 +216,7 @@ const NO_ADOPTED = 256;
 
 // The fresh guard, the asks guard and the ambient guard's arena half have no mask witness: no
 // graph found shows a served answer that differs once they are dropped, so they are defensive.
-// The twin and called-generic widenings carry must-decline controls in their place.
+// The twin, called-generic and narrowed ambient keys carry must-serve and must-decline controls.
 const CASES: Case[] = [
   {
     name: "a closed function import is served",
@@ -331,6 +331,64 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "ambient",
+  },
+  {
+    name: "a record outside G whose field G spells only on its own other-shaped record is served",
+    graph: {
+      "main.vl": 'import { mk } from "./lib"\ntype Rng = { s: i32 }\nconst r: Rng = { s: 1 }\n' +
+        "print(mk())\nprint(r.s)\n",
+      "lib.vl": "export type W = { s: f64, t: i32 }\nexport function mk(): i32 {\n" +
+        "  const w: W = { s: 0.5, t: 2 }\n  w.t\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a private type outside G named like G's own is a different type",
+    graph: {
+      "main.vl": 'import { mk } from "./lib"\ntype Key = { k: i32 }\nconst q: Key = { k: 1 }\n' +
+        "print(mk())\nprint(q.k)\n",
+      "lib.vl": 'type Key = { a: string }\nexport function mk(): i32 {\n  const q: Key = { a: "x" }\n' +
+        "  q.a.length\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "an operator outside G on a `new` type G never names is served",
+    graph: {
+      "main.vl": 'import { g } from "./lib"\nimport { mkV } from "./v"\nprint(g() + mkV()[1])\n',
+      "v.vl": "export type V = new { base: i32, length: i32 }\n" +
+        'export function "[]"(self: V, i: i32): i32 { self.base + i }\n' +
+        "export function mkV(): V { return { base: 1, length: 2 } }\n",
+      "lib.vl": "export function g(): i32 {\n  const r = { base: 1, size: 2 }\n  r.base\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "an operator outside G on a structural type can index G's own record",
+    graph: {
+      "main.vl": 'import { g } from "./lib"\nimport { mk } from "./v"\nprint(mk() + g())\n',
+      "v.vl": "export type V = { base: i32, length: i32 }\n" +
+        'export function "[]"(self: V, i: i32): i32 { self.base + i }\n' +
+        "export function mk(): i32 { 1 }\n",
+      "lib.vl": "type W = { base: i32, length: i32 }\nexport function g(): i32 {\n" +
+        "  const r: W = { base: 1, length: 2 }\n  r[0]\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_AMBIENT,
+  },
+  {
+    name: "a push G makes on a list an outside body types leaves no clean check to serve",
+    graph: {
+      "main.vl": 'import { add, xs } from "./lib"\nimport { u } from "./use"\nprint(add("a") + u())\n',
+      "lib.vl": "export let xs = []\nexport function add(s: string): i32 {\n  xs.push(s)\n  0\n}\n",
+      "use.vl": 'import { xs } from "./lib"\nexport function u(): i32 {\n  xs.push(1)\n  0\n}\n',
+    },
+    target: "use.vl",
+    want: "unseen",
   },
   {
     name: "a closed generic an importer only calls is served",
