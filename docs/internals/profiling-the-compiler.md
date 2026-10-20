@@ -56,7 +56,8 @@ Notes, each of which cost something to learn:
   registries (`isUName`, `variantIndexOf`, `declaredSlotOf`, `__map_probe__`) doing linear
   lookups. `vl run scripts/perf/profile-parents.vl -- <profile.json> <func>` ranks the
   immediate PARENT frame of every sample whose leaf is a given function, to find whose loop
-  it is.
+  it is. `profile-callers.vl -- <profile.json>` charges every helper sample to its first
+  non-helper ancestor instead, which is the caller a cut has to change.
 * **`VL_STD=<worktree>/std`** on every worktree probe — the host resolves `std:` from the
   BINARY's checkout, which is the main repo's.
 
@@ -88,6 +89,7 @@ source of truth, this is a copy of it.
 | `per-program-cost.sh` | Per-PROGRAM cost of the compiler in lines and host phases, across three sizes and three std footprints. | |
 | `per-test-rank.vl` | Ranks a `deno test` log by per-test and per-file duration. | |
 | `profile-parents.vl` | Ranks the immediate PARENT frame of every sample whose leaf is a given function, to find whose loop it is. | |
+| `profile-callers.vl` | Charges every sample whose leaf is a `__` runtime helper to its first non-helper ancestor, with a column per helper, to find who pays for `__str_eq__` and the map probes. | |
 | `profile-phases.vl` | Attributes a `VL_PROFILE_GUEST` profile to the module pipeline's PHASES rather than its functions. | |
 | `seed-jit-cost.sh` | COLD vs WARM: what a `vl` process pays to get the seed executable (Cranelift JIT vs `.cwasm` deserialize). | |
 | `seed-sections.sh` | Section sizes of the seed, and its growth over the last N days of master. | |

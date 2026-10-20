@@ -1,0 +1,126 @@
+// Who pays for the runtime helpers? Every sample whose leaf is a `__`-named runtime helper
+// is charged to its first ancestor that is not one, and the callers are ranked.
+//
+//     vl run scripts/perf/profile-callers.vl -- <profile.json> [top=30] [depth=1]
+//
+// `depth` 2 keys each row as `caller < its parent`; `depth` 0 groups the callers by source file.
+
+import { exit } from "std:process"
+import { split, startsWith } from "std:str"
+import { programArgs } from "std:args"
+import { Utf8Error } from "std:utf8"
+import { padLeft, parseI32, toString } from "std:fmt"
+import { die, pyFixed } from "../lib/common"
+import { loadProfile, nodeName, rankDesc } from "../lib/profile"
+
+const HELPERS = [
+  "__str_eq__", "__map_probe__", "__str_hash__", "__map_probe_i32__",
+  "__map_resize_i32__", "__map_resize__",
+]
+
+type Tally = {
+  ix: Map<string, i32>,
+  names: string[],
+  counts: f64[],
+  per: f64[][],
+}
+
+function tally(): Tally {
+  const ix: Map<string, i32> = Map()
+  { ix: ix, names: [], counts: [], per: [] }
+}
+
+function bump(t: Tally, name: string, h: i32) {
+  let at = t.ix[name] ?? -1
+  if at < 0 {
+    at = t.names.length
+    t.ix[name] = at
+    t.names.push(name)
+    t.counts.push(0.0)
+    const row: f64[] = []
+    for _ in HELPERS { row.push(0.0) }
+    row.push(0.0)
+    t.per.push(row)
+  }
+  t.counts[at] = t.counts[at] + 1.0
+  t.per[at][h] = t.per[at][h] + 1.0
+}
+
+function helperIx(name: string): i32 {
+  let i = 0
+  while i < HELPERS.length {
+    if HELPERS[i] == name { return i }
+    i = i + 1
+  }
+  HELPERS.length
+}
+
+function short(n: string): string { split(n, "$")[0] }
+
+function main(argv: string[]): i32 {
+  if argv.length < 1 {
+    print(
+      "usage: vl run scripts/perf/profile-callers.vl -- <profile.json> [top] [depth]",
+    )
+    return 2
+  }
+  const p = loadProfile(argv[0], "profile-callers")
+  const top = if argv.length > 1 { parseI32(argv[1]) ?? 30 } else { 30 }
+  const depth = if argv.length > 2 { parseI32(argv[2]) ?? 1 } else { 1 }
+  const t = tally()
+  let total = 0
+  let hits = 0
+  for s in p.stacks {
+    if s < 0 { continue }
+    total = total + 1
+    const leaf = nodeName(p, s)
+    if !leaf.startsWith("__") { continue }
+    hits = hits + 1
+    let up = p.prefix[s]
+    while up >= 0 && nodeName(p, up).startsWith("__") { up = p.prefix[up] }
+    let key = if up >= 0 { short(nodeName(p, up)) } else { "<root>" }
+    if depth == 0 && up >= 0 {
+      const at = split(nodeName(p, up), "@")
+      key = if at.length > 1 { split(at[1], ":")[0] } else { key }
+    }
+    if depth > 1 && up >= 0 {
+      const pp = p.prefix[up]
+      key = key
+        + " < "
+        + (if pp >= 0 { short(nodeName(p, pp)) } else { "<root>" })
+    }
+    bump(t, key, helperIx(leaf))
+  }
+  const tot = total as f64
+  print(
+    "\{toString(total)} samples; \{toString(hits)} in __ helpers (\{pyFixed(100.0 * (hits as f64) / tot, 2)}%)",
+  )
+  print("   all%  str_eq  probe  hash  probe32  rsz32  rsz  other  caller")
+  const ix: i32[] = []
+  let i = 0
+  while i < t.names.length {
+    ix.push(i)
+    i = i + 1
+  }
+  const ranked = rankDesc(ix, t.counts)
+  let n = 0
+  for k in ranked {
+    if n >= top { break }
+    n = n + 1
+    let line = padLeft(pyFixed(100.0 * t.counts[k] / tot, 2), 7, " ")
+    let j = 0
+    while j <= HELPERS.length {
+      line = line + padLeft(pyFixed(100.0 * t.per[k][j] / tot, 2), 7, " ")
+      j = j + 1
+    }
+    print(line + "  " + t.names[k])
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  die("profile-callers: an argument is not UTF-8: " + argv.msg, 2)
+} else {
+  exit(main(argv))
+}
