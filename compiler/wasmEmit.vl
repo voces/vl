@@ -1475,11 +1475,13 @@ import { srcmapFileOfTok } from "./srcmap"
 import { covarRootFrame, covarRootName } from "./check_write_scan"
 import {
   flattenVariantsInto,
+  isNullTy,
   nonNullTy,
   nullableInnerOrNone,
   numLitUnionHasBase,
   numPrimTyOfKind,
   primNameOf,
+  tyAdmitsNull,
   tyEmitPrimOf,
   tyHasTyVar,
   tyHoldsNumbersApart,
@@ -5945,6 +5947,19 @@ function emitIsTestVariant(body: u8[], isIx: i32, nd: IsExpr, fnIx: i32) {
 // load-bearing arm order: niche null tests, atom/literal-union membership, box-tag compares,
 // mono-static folds, then the variant tag+discriminant compare. A niche `is` assumes the checker
 // proved the tested shape is the sole non-null member, which monomorphization can break (D950).
+// 1 or 0 when the re-readable operand of `is` at `isIx` holds only `null` at instance `fnIx`,
+// so the test is whether the tested type admits `null`; -1 otherwise. The name cascade would
+// read such an operand as the `i32` it shares a pin with (D8182).
+function nullInstanceIsResult(isIx: i32, fnIx: i32): i32 {
+  const nd = P.nodes[isIx]
+  if !(nd is IsExpr) { return -1 }
+  if !isNullTy(instanceReadTyOf(nd.isObj, fnIx)) { return -1 }
+  if !exprReReadable(unwrapParen(nd.isObj)) { return -1 }
+  const nlt = isVarTyIxOf(isIx)
+  if nlt < 0 || nlt >= T.tys.length || T.tys[nlt] is TyVar { return -1 }
+  if tyAdmitsNull(nlt) { 1 } else { 0 }
+}
+
 function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = P.nodes[isIx]
   // `r?.f is null` is `r?.f == null`: one test over every link and the field's own null (D3457).
@@ -5959,6 +5974,11 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
         return ionRc
       }
     }
+  }
+  const nst = nullInstanceIsResult(isIx, fnIx)
+  if nst >= 0 {
+    fbI32Const(nst)
+    return 0
   }
   const rfit = emitRecordFitIs(body, isIx, fnIx)
   if rfit != 0 { return if rfit < 0 { -1 } else { 0 } }
