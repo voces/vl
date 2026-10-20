@@ -1044,9 +1044,10 @@ const lintRankRangeLen = 8
 const lintRankPreferInterp = 9
 const lintRankCompilerNoInterp = 10
 const lintRankByteAsCp = 11
-const lintRankCount = 12
+const lintRankArenaSlotWrite = 12
+const lintRankCount = 13
 
-// Offer `ix` to all twelve structural rules, in rank order. Each visitor opens with its
+// Offer `ix` to all thirteen structural rules, in rank order. Each visitor opens with its
 // own `is` test, so this is a flat unconditional sequence: there is no rule id to
 // dispatch on and no chain a new rule could be inserted into in the wrong place.
 function lintVisitAll(ix: i32) {
@@ -1062,6 +1063,7 @@ function lintVisitAll(ix: i32) {
   preferInterpVisit(ix)
   compilerNoInterpVisit(ix)
   byteAsCpVisit(ix)
+  arenaSlotWriteVisit(ix)
   0
 }
 
@@ -1103,6 +1105,7 @@ function lintRankOfCode(code: string) {
   if code == "prefer-interpolation" { return lintRankPreferInterp }
   if code == "compiler-no-interpolation" { return lintRankCompilerNoInterp }
   if code == "byte-as-code-point" { return lintRankByteAsCp }
+  if code == "arena-slot-write" { return lintRankArenaSlotWrite }
   lintRankCount
 }
 
@@ -2479,6 +2482,35 @@ function compilerNoInterpVisit(ix: i32) {
       )
     }
   }
+  0
+}
+
+// ── 4f. an arena slot is written through the edit log (arena-slot-write) ─────
+
+// `P.nodes[i] = n` outside `ast.vl`. `arenaSetNode` / `arenaReplaceNode` write the slot and
+// log the edit, which the write scan and the parse bank read to know what changed since
+// their last walk; a bare store leaves both describing a node that is gone.
+function arenaSlotWriteVisit(ix: i32) {
+  if !scaIsCompiler(scaRunPath) || scaRunPath == "compiler/ast.vl" { return 0 }
+  const n = P.nodes[ix]
+  if !(n is BinExpr) || n.binOp != "=" { return 0 }
+  const l = P.nodes[n.binLeft]
+  if !(l is Index) { return 0 }
+  const a = P.nodes[l.idxArr]
+  if !(a is Member) || a.memProp != "nodes" { return 0 }
+  const o = P.nodes[a.memObj]
+  if !(o is Ident) || o.identName != "P" { return 0 }
+  const first = nodeStartTok(ix)
+  if first < 0 { return 0 }
+  lintEmitAtSpan(
+    "arena-slot-write",
+    "this writes an arena slot directly — call `arenaSetNode(i, n)` from ast.vl, which "
+      + "logs the edit that the write scan and the parse bank read",
+    "warning",
+    P.toks[first].line,
+    P.toks[first].col,
+    tokFirstLineEndCol(nodeSpanEndTok(ix)),
+  )
   0
 }
 
@@ -4691,12 +4723,13 @@ const asAllow = [
   "startFnDetectScratch", "anonLeafIxBuild", "strAccScanStart",
   "markNeverCallsByDecl", "esDumpText", "captureFoldedConsts",
   "anonGenArgBuild", "progBindsAmbientName", "fnFlowShadowFinish",
-  "objFieldHolesToI32", "ihAmbientScan", "skDeclKeys",
+  "objFieldHolesToI32", "ihAmbientScan", "skDeclKeys", "emitLinkSection",
+  "ihIxArena",
 ]
 // Each entry above runs once per module from its caller(s) — arena rename, anon-shape intern
-// and index, data section, global promotion, type order, variant tags, `dupScanRun`'s
-// per-candidate scan, start proof, never-call marks, effects dump, const fold, generic marks,
-// ambient rename, flow shadow, field holes, the interface hash's ambient marks, the skip's keys.
+// and index, data section, global promotion, type order, variant tags, `dupScanRun`'s scan,
+// start proof, never-call marks, effects dump, const fold, generic marks, ambient rename, flow
+// shadow, field holes, the hash's ambient marks, skip keys, link proof, held-record index.
 
 // The whole-program table whose `.length` is read at `i`, or "" when none is.
 function asTableAt(s: string, i: i32, b: i32) {

@@ -13,6 +13,7 @@ import {
   OP_INDEX_SET,
   P,
   Param,
+  Paren,
   Unary,
 } from "./ast"
 import {
@@ -235,7 +236,8 @@ import {
   unknownTyErr,
   widenLitTy,
 } from "./check_relate_core"
-import { declare, isConstName, lookup } from "./check_scopes"
+import { declare, isConstName, lookup, lookupFnDeclNode } from "./check_scopes"
+import { fsMinted } from "./fn_split"
 import {
   nhLink,
   recordDeadNullTest,
@@ -823,12 +825,12 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       if dl >= 0 {
         if assignable(dl, innerFull) { return innerFull }
       }
-      // An atom-valued map get's default must itself be an atom — a member literal or a
-      // value of the same litunion; the method spelling `m.get(k) ?? d` is rejected here too.
+      // An atom-valued map get's default is a member, an atom of the set, or a string the
+      // result joins to (D7448); the method spelling `m.get(k) ?? d` is held here too.
       const mgRecv = fusedMapReadRecvIx(n.binLeft)
       if mgRecv >= 0 {
         if mapTyValIsLitUnion(nodeTyIxOf(mgRecv)) {
-          if !assignable(rt, innerFull) {
+          if !assignable(rt, innerFull) && !assignable(nonNullTy(rt), TY_STR) {
             tErrUnsupported(
               "`??` over an atom-valued map needs a member-literal (or atom) default",
               ix,
@@ -862,6 +864,27 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     return cd
   }
   return lt
+}
+
+// Whether `ix` reads a function the split plan gave a parameter. The check before the plan
+// compared it at its written type, which is the one an `==` reads.
+function splitWidenedFnRead(ix: i32): boolean {
+  let u = ix
+  while u >= 0 && P.nodes[u] is Paren {
+    const pn = P.nodes[u]
+    if pn is Paren { u = pn.parInner } else { u = -1 }
+  }
+  if u < 0 { return false }
+  const en = P.nodes[u]
+  if !(en is Ident) { return false }
+  const d = lookupFnDeclNode(en.identName)
+  if d < 0 { return false }
+  const f = P.nodes[d]
+  if !(f is FuncDecl) { return false }
+  for p in f.fnParams {
+    if fsMinted(p) { return true }
+  }
+  false
 }
 
 // `==` / `!=` over `lt` and `rt`: the operands must be mutually compatible and comparable.
@@ -938,7 +961,12 @@ function checkEqualityBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // the brand, as in every other position; the genuine-mix reject already fired above.
   const nomEqLit = nomNameOfTy(lt) != nomNameOfTy(rt)
     && !nomBinMixes(lt, rt, n.binLeft, n.binRight)
-  const eqMutual = assignable(lt, rt) || assignable(rt, lt) || nomEqLit
+  // A function the split plan widened is compared at its written type (D7384).
+  const eqMutual = splitWidenedFnRead(n.binLeft)
+    || splitWidenedFnRead(n.binRight)
+    || assignable(lt, rt)
+    || assignable(rt, lt)
+    || nomEqLit
   if !eqMutual {
     tErr("cannot compare " + tyToStr(lt) + " with " + tyToStr(rt), ix)
   }

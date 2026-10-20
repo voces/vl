@@ -47,11 +47,12 @@ import {
   elseIfLink,
   hasNamedArgs,
   i32ToStr,
-  nodeSpineChildren,
+  nodeSpineChildrenPush,
 } from "./ast"
 import { sidLookup, sidOf } from "./symbols"
 import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { demangleName } from "./check_suggest"
+import { hashMixPair } from "./hash_mix"
 
 // —— which binding does a name mean: the frame table the write scan keys on (D1610/D1611) ——
 // A name is not a value: two functions may each bind `b` and mean two lists. Every predicate
@@ -87,7 +88,8 @@ let cwDeclSlotN: i32[] = []
 let cwDeclCap = 0
 // The enclosing frame of a frame, indexed by its `FuncDecl` node — the chain a name walks out
 // along. A lambda is a `FuncDecl` with an empty name, so capture needs no arm of its own.
-// Keyed by the frames only, and as long as `cwFrameOf`: a node that opens none reads `CW_FR_MOD`.
+// Keyed by the frames only: a node that opens none reads `CW_FR_MOD`. A map, not an
+// arena-length column, so the frame build allocates nothing per node (D7740).
 let cwFrameUp: {[i32]: i32} = Map()
 let cwFramesBuilt = false
 // The join sites (list literals, `if`s, `match`es, `??`, functions) and the `return`s the frame
@@ -332,7 +334,59 @@ function cwIxNote(at: i32) {
   // arms and spreads — are filed for live nodes only.
   const live = cwIxLive(at)
   if live { cwIxNoteParent(at) }
+  // The arms run in descending kind frequency: a `match` tests them in order.
   match n {
+    Ident => {
+      const sid = sidOf(n.identName)
+      let fr = CW_FR_UNKNOWN
+      if cwFrameOfOpen(at) { fr = cwFrameResolve(cwFrameOf[at], sid) }
+      cwIxOcc(sid, at, fr, CW_OCC_USE)
+    }
+    BinExpr => {
+      if n.binOp == "=" {
+        cwIxUpSet(n.binLeft, at, CW_UP_ASG_LHS, 0)
+        cwIxUpSet(n.binRight, at, CW_UP_ASG_RHS, 0)
+        cwIxNoteIdxWrite(at, cwPeel(n.binLeft))
+        const ln = covarRootName(n.binLeft)
+        if ln != "" {
+          cwIxOcc(sidOf(ln), at, covarRootFrame(n.binLeft), CW_OCC_ASG)
+          cwIxHold(cwPeel(n.binRight))
+        }
+      }
+      if n.binOp == "==" || n.binOp == "!=" {
+        cwIxUpSet(n.binLeft, at, CW_UP_CMP, 0)
+        cwIxUpSet(n.binRight, at, CW_UP_CMP, 0)
+      }
+      if n.binOp == "??" {
+        cwIxUpSet(n.binLeft, at, CW_UP_COAL, 0)
+        cwIxUpSet(n.binRight, at, CW_UP_COAL, 0)
+      }
+    }
+    // no fact is filed for these kinds
+    Block | NumLit | StrLit | TypeRef | Paren | Unary => {}
+    Call => {
+      cwIxUpSet(n.callFn, at, CW_UP_CALLEE, 0)
+      let a = 0
+      while a < n.callArgs.length {
+        cwIxUpSet(n.callArgs[a], at, CW_UP_ARG, a)
+        a = a + 1
+      }
+      cwIxNoteCallWrite(at, cwPeel(n.callFn))
+      const cn = covarRootName(n.callFn)
+      if cn != "" { cwIxOcc(sidOf(cn), at, CW_FR_UNKNOWN, CW_OCC_CALL) }
+      const mcf = P.nodes[cwPeel(n.callFn)]
+      if mcf is Member {
+        cwIxOcc(
+          sidOf(demangleName(mcf.memProp)),
+          at,
+          CW_FR_UNKNOWN,
+          CW_OCC_MCALL,
+        )
+      }
+    }
+    Member => {
+      cwIxPlace(at, n.memObj)
+    }
     MatchExpr => {
       if live {
         let mb = 0
@@ -358,14 +412,8 @@ function cwIxNote(at: i32) {
         }
       }
     }
-    Ident => {
-      cwIxOcc(sidOf(n.identName), at, cwFrameOfUse(at, n.identName), CW_OCC_USE)
-    }
     Param => {
       cwIxOcc(sidOf(n.parName), at, cwFrameOfDecl(at), CW_OCC_BIND)
-    }
-    Member => {
-      cwIxPlace(at, n.memObj)
     }
     OptMember => {
       cwIxPlace(at, n.omObj)
@@ -414,48 +462,8 @@ function cwIxNote(at: i32) {
         cwIxUpSet(n.letInit, at, CW_UP_LETINIT, 0)
       }
     }
-    Call => {
-      cwIxUpSet(n.callFn, at, CW_UP_CALLEE, 0)
-      let a = 0
-      while a < n.callArgs.length {
-        cwIxUpSet(n.callArgs[a], at, CW_UP_ARG, a)
-        a = a + 1
-      }
-      cwIxNoteCallWrite(at, cwPeel(n.callFn))
-      const cn = covarRootName(n.callFn)
-      if cn != "" { cwIxOcc(sidOf(cn), at, CW_FR_UNKNOWN, CW_OCC_CALL) }
-      const mcf = P.nodes[cwPeel(n.callFn)]
-      if mcf is Member {
-        cwIxOcc(
-          sidOf(demangleName(mcf.memProp)),
-          at,
-          CW_FR_UNKNOWN,
-          CW_OCC_MCALL,
-        )
-      }
-    }
-    BinExpr => {
-      if n.binOp == "=" {
-        cwIxUpSet(n.binLeft, at, CW_UP_ASG_LHS, 0)
-        cwIxUpSet(n.binRight, at, CW_UP_ASG_RHS, 0)
-        cwIxNoteIdxWrite(at, cwPeel(n.binLeft))
-        const ln = covarRootName(n.binLeft)
-        if ln != "" {
-          cwIxOcc(sidOf(ln), at, covarRootFrame(n.binLeft), CW_OCC_ASG)
-          cwIxHold(cwPeel(n.binRight))
-        }
-      }
-      if n.binOp == "==" || n.binOp == "!=" {
-        cwIxUpSet(n.binLeft, at, CW_UP_CMP, 0)
-        cwIxUpSet(n.binRight, at, CW_UP_CMP, 0)
-      }
-      if n.binOp == "??" {
-        cwIxUpSet(n.binLeft, at, CW_UP_COAL, 0)
-        cwIxUpSet(n.binRight, at, CW_UP_COAL, 0)
-      }
-    }
     // no fact is filed for these kinds
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | Paren | ErrExpr | TypeRef | WhileStmt | BreakStmt | ContinueStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | AsExpr | ForRange | ImportDecl => {}
+    CharLit | BoolLit | NullLit | ErrExpr | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | AsExpr | ForRange | ImportDecl => {}
   }
   0
 }
@@ -469,33 +477,34 @@ function cwIxLive(at: i32): boolean {
 
 // File `at` as the parent of each of its children, and of the `else if` link after it.
 function cwIxNoteParent(at: i32) {
-  const kids = nodeSpineChildren(at)
+  const base = cwKids.length
+  const n = nodeSpineChildrenPush(at, cwKids)
   let i = 0
-  while i < kids.length {
-    const k = kids[i]
+  while i < n {
+    const k = cwKids[base + i]
     if k >= 0 && k < cwIxParent.length { cwIxParent[k] = at }
     i = i + 1
   }
+  cwKidsPop(n)
   const link = elseIfLink(at)
   if link >= 0 && link < cwIxParent.length { cwIxParent[link] = at }
   0
 }
 
-// Build the index once for this arena, in two grow loops rather than a scan: one sizes every
-// per-node column, so the second may file a fact about a node it has not reached — a parent
-// naming its own child, which arena order does not promise.
+// Build the index once for this arena: every per-node column is sized before the note loop,
+// so a note may file a fact about a node it has not reached — a parent naming its own child,
+// which arena order does not promise.
 export function cwIxBuild() {
   if cwIxBuilt { return 0 }
   cwBuildFrames()
-  while cwIxObj.length < P.nodes.length {
-    cwIxObj.push(-1)
-    cwIxIsObj.push(0)
-    cwIxHeld.push(0)
-    cwIxUp.push(-1)
-    cwIxParent.push(-1)
-    cwIxUpKind.push(CW_UP_NONE)
-    cwIxUpAux.push(0)
-  }
+  const len = P.nodes.length
+  cwIxObj = __array_new__(len, -1)
+  cwIxIsObj = __array_new__(len, 0)
+  cwIxHeld = __array_new__(len, 0)
+  cwIxUp = __array_new__(len, -1)
+  cwIxParent = __array_new__(len, -1)
+  cwIxUpKind = __array_new__(len, CW_UP_NONE)
+  cwIxUpAux = __array_new__(len, 0)
   while cwIxNoted.length < P.nodes.length {
     const at = cwIxNoted.length
     cwIxNoted.push(1)
@@ -505,23 +514,10 @@ export function cwIxBuild() {
   0
 }
 
-// The pair (`fr`, `sid`) as one mixed key, for a power-of-two table to mask. Sids are minted
-// in order and a frame declares a run of them, which an additive key lays out as one
-// contiguous cluster that every linear probe landing in it has to walk.
-function cwPairKey(fr: i32, sid: i32): i32 {
-  let k = fr * -1640531535 + sid
-  k = k ^ (k >>> 16)
-  k = k * -2048144789
-  k = k ^ (k >>> 13)
-  k = k * -1028477387
-  k = k ^ (k >>> 16)
-  k
-}
-
 // The slot the pair (`fr`, `sid`) occupies, or the free slot it would take; -1 while no
-// table is open.
+// table is open. A frame declares a run of consecutive sids, so the key is mixed.
 function cwIxPSlotOf(fr: i32, sid: i32): i32 {
-  let h = cwPairKey(fr, sid) & (cwIxPCap - 1)
+  let h = hashMixPair(fr, sid) & (cwIxPCap - 1)
   if h < 0 || h >= cwIxPSlotSid.length { return -1 }
   while cwIxPSlotSid[h] >= 0 {
     if cwIxPSlotSid[h] == sid {
@@ -699,7 +695,7 @@ function cwDeclare(fr: i32, nm: string) {
 // how `cwFrameDeclares` answers no, so both callers read the slot rather than a boolean; -1
 // while no table is open.
 function cwDeclSlotOf(fr: i32, sid: i32): i32 {
-  let h = cwPairKey(fr, sid) & (cwDeclCap - 1)
+  let h = hashMixPair(fr, sid) & (cwDeclCap - 1)
   if h < 0 || h >= cwDeclSlotSid.length { return -1 }
   while cwDeclSlotSid[h] >= 0 {
     if cwDeclSlotSid[h] == sid {
@@ -760,36 +756,51 @@ function cwFrameWalk(ix: i32, fr: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   cwFrameOf[ix] = fr
   const n = P.nodes[ix]
-  // The record rule's join sites and `return`s, gathered by the walk that reaches them.
-  if n is ArrayLit || n is IfStmt || n is FuncDecl || n is MatchExpr {
-    cwFrJoins.push(ix)
-  }
-  if n is RetStmt { cwFrRets.push(ix) }
-  if n is BinExpr {
-    if n.binOp == "??" || n.binOp == "+" { cwFrJoins.push(ix) }
-  }
-  if n is LetDecl { cwDeclare(fr, n.letName) }
-  if n is ForRange { cwDeclare(fr, n.frVar) }
-  if n is ForIn {
-    cwDeclare(fr, n.fiVar)
-    if n.fiVar2 != "" { cwDeclare(fr, n.fiVar2) }
-  }
-  if n is FuncDecl {
-    // The declaration's own name binds OUTSIDE the frame it opens; its params and body are in.
-    cwDeclare(fr, n.fnName)
-    cwFrameUp[ix] = fr
-    let p = 0
-    while p < n.fnParams.length {
-      const pix = n.fnParams[p]
-      if pix >= 0 && pix < P.nodes.length {
-        const pn = P.nodes[pix]
-        if pn is Param { cwDeclare(ix, pn.parName) }
-        cwFrameWalk(pix, ix)
-      }
-      p = p + 1
+  // The record rule's join sites and `return`s, gathered by the walk that reaches them. The
+  // arms run in descending kind frequency, and a leaf returns before the child loop.
+  match n {
+    Ident | NumLit | StrLit | TypeRef => {
+      return 0
     }
-    cwFrameWalk(n.fnBody, ix)
-    return 0
+    BinExpr => {
+      if n.binOp == "??" || n.binOp == "+" { cwFrJoins.push(ix) }
+    }
+    IfStmt | ArrayLit | MatchExpr => {
+      cwFrJoins.push(ix)
+    }
+    RetStmt => {
+      cwFrRets.push(ix)
+    }
+    LetDecl => {
+      cwDeclare(fr, n.letName)
+    }
+    ForRange => {
+      cwDeclare(fr, n.frVar)
+    }
+    ForIn => {
+      cwDeclare(fr, n.fiVar)
+      if n.fiVar2 != "" { cwDeclare(fr, n.fiVar2) }
+    }
+    FuncDecl => {
+      cwFrJoins.push(ix)
+      // The declaration's own name binds OUTSIDE the frame it opens; its params and body are in.
+      cwDeclare(fr, n.fnName)
+      cwFrameUp[ix] = fr
+      let p = 0
+      while p < n.fnParams.length {
+        const pix = n.fnParams[p]
+        if pix >= 0 && pix < P.nodes.length {
+          const pn = P.nodes[pix]
+          if pn is Param { cwDeclare(ix, pn.parName) }
+          cwFrameWalk(pix, ix)
+        }
+        p = p + 1
+      }
+      cwFrameWalk(n.fnBody, ix)
+      return 0
+    }
+    // walked for their children only
+    Block | Call | Member | Paren | Index | Param | Unary | CharLit | BoolLit | NullLit | OptMember | ErrExpr | WhileStmt | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | UnionDecl | IsExpr | AsExpr | ImportDecl | Spread => {}
   }
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
@@ -798,33 +809,49 @@ function cwFrameWalk(ix: i32, fr: i32) {
       cwFrameOf[cur] = fr
       cwFrJoins.push(cur)
     }
-    const kids = nodeSpineChildren(cur)
+    const base = cwKids.length
+    const k = nodeSpineChildrenPush(cur, cwKids)
     let i = 0
-    while i < kids.length {
-      cwFrameWalk(kids[i], fr)
+    while i < k {
+      cwFrameWalk(cwKids[base + i], fr)
       i = i + 1
     }
+    cwKidsPop(k)
     cur = elseIfLink(cur)
   }
   0
 }
 
-// One grow pass sizes the frame column and collects the roots as it goes, then the walk runs
-// over the roots — several `Program` nodes stand in one arena after a module merge (D661).
+// The children stack the frame walk and the parent pass share: a node's window is pushed
+// above whatever its callers' windows hold, and popped once its loop is done.
+const cwKids: i32[] = []
+
+function cwKidsPop(k: i32) {
+  let i = 0
+  while i < k {
+    cwKids.pop()
+    i = i + 1
+  }
+  0
+}
+
+// Size both frame columns, collect the roots, then walk them — several `Program` nodes stand
+// in one arena after a module merge (D661).
 // Memoised on `cwFramesBuilt`, which `covarValueWriteState` drops with the rest of the memo
 // when the monomorphizer has grown the arena under it.
 export function cwBuildFrames() {
   if cwFramesBuilt { return 0 }
   cwFrameReset()
   const roots: i32[] = []
-  while cwFrameOf.length < P.nodes.length {
-    const at = cwFrameOf.length
-    cwFrameOf.push(CW_FR_UNKNOWN)
-    const n = P.nodes[at]
-    if n is Program { roots.push(at) }
+  const len = P.nodes.length
+  cwFrameOf = __array_new__(len, CW_FR_UNKNOWN)
+  let at = 0
+  while at < len {
+    if P.nodes[at] is Program { roots.push(at) }
+    at = at + 1
   }
   // A merged root lists each module's statements again; one walk declares them once.
-  const topSeen: {[i32]: boolean} = Map()
+  const topSeen = __array_new__(len, false)
   let r = 0
   while r < roots.length {
     const pn = P.nodes[roots[r]]
@@ -832,7 +859,8 @@ export function cwBuildFrames() {
       let s = 0
       while s < pn.progStmts.length {
         const st = pn.progStmts[s]
-        if !(topSeen[st] ?? false) {
+        // an index outside the arena walks nothing
+        if st >= 0 && st < len && !topSeen[st] {
           topSeen[st] = true
           cwFrameWalk(st, CW_FR_MOD)
         }
@@ -858,13 +886,22 @@ export function cwFramedNode(ix: i32): boolean {
 // declares it, module scope last. `CW_FR_UNKNOWN` where nothing does — an undeclared name or a
 // binder this walk does not model — and that matches every frame rather than none.
 export function cwFrameOfUse(ix: i32, nm: string): i32 {
-  if ix < 0 || ix >= P.nodes.length { return CW_FR_UNKNOWN }
+  if cwFrameOfOpen(ix) { return cwFrameResolve(cwFrameOf[ix], sidOf(nm)) }
+  CW_FR_UNKNOWN
+}
+
+// Whether the node `ix` has a frame to resolve a name from: the frame walk reached it. A node
+// it has no row for (a rewrite added it) answers the coarsest frame, as an unreached one does.
+function cwFrameOfOpen(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return false }
   cwBuildFrames()
-  // A node the frame walk has no row for (a rewrite added it) answers the coarsest frame.
-  if ix >= cwFrameOf.length { return CW_FR_UNKNOWN }
-  let fr = cwFrameOf[ix]
-  if fr == CW_FR_UNKNOWN { return CW_FR_UNKNOWN }
-  const sid = sidOf(nm)
+  if ix >= cwFrameOf.length { return false }
+  cwFrameOf[ix] != CW_FR_UNKNOWN
+}
+
+// Walk out from frame `from` to the first that declares the interned name `sid`.
+function cwFrameResolve(from: i32, sid: i32) {
+  let fr = from
   while fr >= 0 && fr < cwFrameOf.length {
     if cwFrameDeclares(fr, sid) { return fr }
     fr = cwFrameUp[fr] ?? CW_FR_MOD

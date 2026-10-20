@@ -58,6 +58,7 @@ import {
   externLinkOf,
   externRetIsVoid,
   hasSpreadItem,
+  i32ToStr,
   memberCallRungOf,
   nodeChildren,
   nodeSpineChildren,
@@ -204,6 +205,7 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsNewtypeBrand,
+  tyIsOneStrLit,
   tyIsRecord,
   tyLitMemberTexts,
   tyMutEpoch,
@@ -304,6 +306,7 @@ import {
   parentLetReadAt,
   parentLoopVarOf,
   placeNarrowKeyOf,
+  pushUniqueAtom,
   retV128Flag,
   setShapeOfTy,
   tyIsFuncType,
@@ -414,7 +417,7 @@ import {
   ifElseValueIx,
   ifIsChainHeadIn,
   ifJoinIsMapUnion,
-  ifJoinIsNulStringPair,
+  ifJoinIsNulString,
   ifJoinIsScalarPrim,
   ifListArmValueIx,
   ifRepArmValueIx,
@@ -474,6 +477,7 @@ import {
   asgReadNarrowSet,
   asgSameCell,
   asgUnwidenPrim,
+  criFnIsAnonLambda,
   declaredNulString,
   fnIndexOfInScopeAt,
   fnIndexOfInScopeSid,
@@ -612,6 +616,7 @@ import {
   recordListSlotOfNode,
   sharedFieldArmAtomKind,
   sharedFieldArmConverts,
+  sharedFieldArmLitTexts,
   sharedFieldArmsBoxable,
   sharedFieldLitSetPlan,
   sharedFieldPlanLitTy,
@@ -723,6 +728,7 @@ import {
   repShadowOn,
   repSigSlotTokOfKind,
   repSigTokOfKind,
+  sFieldElemTyIxAt,
   tyIsI32LeafElem,
 } from "./emit_rep"
 import { nameFieldCodeTy } from "./emit_shape_intern"
@@ -3847,6 +3853,36 @@ function repABNoteNameResult(sid: i32, scoped: i32) {
 // `capRecord` can ask whether an enclosing frame binds a name without threading it through
 // `capScan`'s recursion. Sound because `capComputeNamesOf` is the only entry point.
 let capFrame: i32 = -1
+// Set by `capScan`'s `Ident` arm for the one `capRecord` it makes: the identifier is read as a
+// value rather than named as a call's callee (`capCalleeIx`), so a function it names needs a cell.
+let capValueRead = false
+let capCalleeIx: i32 = -1
+// Set when the frame being computed reads itself as a value; `capComputeNamesOf` answers it.
+let capSelfCell = false
+
+// The capture name standing for the cell of function `fe`, which no source identifier can spell.
+export function capCellName(fe: i32): string { "#cell:" + i32ToStr(fe) }
+
+// The function whose cell capture `name` is, or -1 when `name` is an ordinary capture.
+export function capCellTargetOf(name: string): i32 {
+  if name.length < 7 || name.slice(0, 6) != "#cell:" { return -1 }
+  let v = 0
+  let i = 6
+  while i < name.length {
+    const c = name[i]
+    if c < '0' || c > '9' { return -1 }
+    v = v * 10 + (c - '0')
+    i = i + 1
+  }
+  v
+}
+
+// Whether a value read of function `fe` from another frame goes through `fe`'s cell: a nested
+// function declared by statement, since a lambda's every evaluation is a new value.
+function capCellEligible(fe: i32): boolean {
+  if fe < 0 || fe >= fnParent.length || fe >= fnStmts.length { return false }
+  fnParent[fe] >= 0 && !criFnIsAnonLambda(fe)
+}
 
 // The captured-variable names of the lifted function at `fnStmts[fe]`, in encounter order,
 // which is env-field order, by direct walk. A capture is a free variable: read in the body,
@@ -3869,9 +3905,19 @@ export function capComputeNamesOf(fe: i32) {
     // `capScan` resolves a narrowing condition against the frame whose body it is in;
     // this is that frame. Set only while recording, so an ordinary scan is unchanged.
     if cnRecording { cnScanFnIx = fnStmts[fe] }
+    const savedSelf = capSelfCell
+    capSelfCell = false
+    capCalleeIx = -1
     nfdWalkEnter()
     capScan(fn.fnBody, bound, caps)
     nfdWalkLeave()
+    // A function that reads itself as a value takes its own cell, but only when it captures
+    // something else: with nothing captured its one constant closure is already one value.
+    const self = capCellName(fe)
+    if capSelfCell && caps.length > 0 && !strListHas(caps, self) {
+      caps.push(self)
+    }
+    capSelfCell = savedSelf
   }
   caps
 }
@@ -3973,6 +4019,22 @@ function capRecord(
   caps: string[],
   atIx: i32,
 ) {
+  const valueRead = capValueRead
+  capValueRead = false
+  // A cell rides every env between its function's declaring frame, which owns it, and a reader.
+  // A nested body is scanned inline, so the owner is also the scope binding the function's name.
+  const cellOf = capCellTargetOf(name)
+  if cellOf >= 0 {
+    if cellOf < fnParent.length && fnParent[cellOf] == capFrame { return 0 }
+    if cellOf < fnStmts.length {
+      const decl = P.nodes[fnStmts[cellOf]]
+      if decl is FuncDecl {
+        if capIsBound(bound, decl.fnName) { return 0 }
+      }
+    }
+    if !strListHas(caps, name) { caps.push(name) }
+    return 0
+  }
   if capIsBound(bound, name) { return 0 }
   // An extern is a module-level import, addressable from any frame like a function; only a
   // program that reads one as a value can meet it here (D2618).
@@ -3987,7 +4049,9 @@ function capRecord(
       // in a top-level loop body addresses the module function instead of the loop variable.
       if moduleLoopEnclosing(capFrame, name) < 0 {
         if cnGlobOn && cnRecording { cnGlobReads[name] = 1 }
-        capSiblingFrees(name, bound, caps, atIx)
+        const sib = capSiblingFe(name, atIx)
+        const nsub = capSiblingFold(sib, bound, caps)
+        if valueRead { capCellNote(sib, nsub, caps) }
         return 0
       }
     }
@@ -4000,17 +4064,9 @@ function capRecord(
   0
 }
 
-// A SIBLING nested function's free names are the caller's captures too: `j` calling `k` builds
-// `k`'s env inside `j`, so every name `k` needs from an outer frame must ride `j`'s env. Depth
-// already works through `capScan`'s `FuncDecl` arm, which folds a nested body's frees upward;
-// this is the sibling direction, which `capRecord` dropped with the function name (D1761).
-function capSiblingFrees(
-  name: string,
-  bound: {[string]: i32},
-  caps: string[],
-  atIx: i32,
-) {
-  if capFrame < 0 || capFrame >= fnStmts.length { return 0 }
+// The nested function `name` denotes at `atIx` from the frame being computed, or -1.
+function capSiblingFe(name: string, atIx: i32): i32 {
+  if capFrame < 0 || capFrame >= fnStmts.length { return -1 }
   // The same outward walk `fnIndexOfInScopeSid` takes, and for the same reason: only a
   // NESTED function is found, so a module-level callee resolves to -1 and folds in nothing.
   let pp = capFrame
@@ -4043,11 +4099,17 @@ function capSiblingFrees(
       if lc >= 0 { fe = lc }
     }
   }
-  if fe < 0 { return 0 }
-  if fe == capFrame { return 0 }
+  fe
+}
+
+// A SIBLING's free names are the caller's captures too: `j` calling `k` builds `k`'s env
+// inside `j`, so every name `k` needs from an outer frame rides `j`'s env (D1761). Returns how
+// many `fe` has, or -1 when `fe` is none, the frame itself, or a sibling already being walked.
+function capSiblingFold(fe: i32, bound: {[string]: i32}, caps: string[]): i32 {
+  if fe < 0 || fe == capFrame { return -1 }
   let si = 0
   while si < capSibStack.length {
-    if capSibStack[si] == fe { return 0 }
+    if capSibStack[si] == fe { return -1 }
     si = si + 1
   }
   capSibStack.push(fe)
@@ -4065,6 +4127,22 @@ function capSiblingFrees(
     capRecord(sub[ci], bound, caps, -1)
     ci = ci + 1
   }
+  sub.length
+}
+
+// A value read of nested function `fe` outside its declaring frame takes `fe`'s cell, so the
+// read reaches the env that frame keeps. `nsub` is `fe`'s capture count from the fold; with
+// none, `fe` is one constant closure and needs no cell. A read in the frame itself asks
+// `capComputeNamesOf`, which alone knows the frame's own count once its walk ends.
+function capCellNote(fe: i32, nsub: i32, caps: string[]) {
+  if !capCellEligible(fe) || fnParent[fe] == capFrame { return 0 }
+  if fe == capFrame {
+    capSelfCell = true
+    return 0
+  }
+  if nsub <= 0 { return 0 }
+  const name = capCellName(fe)
+  if !strListHas(caps, name) { caps.push(name) }
   0
 }
 
@@ -4131,10 +4209,12 @@ export function capScan(ix: i32, bound: {[string]: i32}, caps: string[]) {
       return 0
     }
     Ident => {
+      capValueRead = ix != capCalleeIx
       capRecord(n.identName, bound, caps, ix)
       return 0
     }
     Call => {
+      capCalleeIx = n.callFn
       if !capCalleeExempt(ix, n, bound) { capScan(n.callFn, bound, caps) }
       capScanEach(n.callArgs, bound, caps)
       return 0
@@ -9563,18 +9643,21 @@ export function coalesceMapReadJoins(exprIx: i32, fnIx: i32): boolean {
   const e = P.nodes[ix]
   if !(e is BinExpr) || e.binOp != "??" { return false }
   const recv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-  if recv < 0 || !exprMap(recv, fnIx) || !coalesceResultIsBox(ix) {
-    return false
+  if recv < 0 || !exprMap(recv, fnIx) { return false }
+  // A default an atom-valued map's read cannot hold joins it to `string` (D7448).
+  if nodeTyIsMap(recv) && coalMapReadForeignDefault(recv, e.binRight, fnIx) {
+    return true
   }
+  if !coalesceResultIsBox(ix) { return false }
   const vt = tyPeelNul(tyMapValOf(mapRecvTyIn(recv, fnIx)))
   if vt < 0 { return false }
   !tySameSet(vt, tyPeelNul(nodeTyPinIxOf(ix)), TY_WALK_DEPTH)
 }
 
-// The one nullability decision for the non-map `??` reps (the value-union box and the
-// nullable-struct niche): `??` coalesces on the LHS being null, so a non-null default
-// collapses to the non-null rep while a nullable default leaves `T | null`. Structural in
-// the chain, never banked, since a re-associated `p ?? q ?? r` mints an untyped inner node.
+// The one nullability decision for the `??` reps: a non-null default collapses to the
+// non-null rep, a nullable one leaves `T | null`. A hole's read off a map its instance pins is
+// `V | null` whatever the template recorded. Structural in the chain, never banked, since a
+// re-associated `p ?? q ?? r` mints an untyped inner node.
 export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
   if defIx < 0 { return false }
   const dix = unwrapParen(defIx)
@@ -9587,13 +9670,40 @@ export function coalesceDefaultNullable(defIx: i32, fnIx: i32): boolean {
     BinExpr => {
       if d.binOp == "??" { return coalesceDefaultNullable(d.binRight, fnIx) }
     }
+    Index => {
+      if coalHoleMapReadIx(dix, fnIx) { return true }
+    }
     // Any other default is nullable only by its type or its union, read below.
-    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+    NumLit | StrLit | CharLit | BoolLit | Ident | Unary | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   if nodeTyIsNullable(dix) { return true }
   const un = unionNameOfExpr(dix, fnIx)
   if un != "" { return unionSetHasNull(un) }
   false
+}
+
+// Whether `ix` is a hole's read off a map its instance pins, `V | null` whatever the template
+// recorded; false for any other node.
+function coalHoleMapReadIx(ix: i32, fnIx: i32): boolean {
+  if ix < 0 { return false }
+  const d = P.nodes[ix]
+  if !(d is Index) || indexPlaceNonNull(ix) { return false }
+  const dt = nodeTyIxOf(ix)
+  if dt < 0 || dt >= T.tys.length || !(T.tys[dt] is TyVar) { return false }
+  mapRecvTyIn(d.idxArr, fnIx) >= 0
+}
+
+// Whether the last default of the `??` chain at `defIx` is a hole's map read
+// (`coalHoleMapReadIx`), whose own union name is no evidence of its set.
+function coalDefaultEndsInHoleMapRead(defIx: i32, fnIx: i32): boolean {
+  const dix = unwrapParen(defIx)
+  if dix < 0 { return false }
+  const d = P.nodes[dix]
+  if d is BinExpr {
+    if d.binOp == "??" { return coalDefaultEndsInHoleMapRead(d.binRight, fnIx) }
+    return false
+  }
+  coalHoleMapReadIx(dix, fnIx)
 }
 
 // The HALF a non-map `??` result lands in — `true` the NULLABLE half, `false` the non-null one
@@ -9629,16 +9739,13 @@ function coalesceLitUnionDefaultIsAtom(defIx: i32, texts: string[], fnIx: i32) {
 }
 
 // True when `defIx`, the default of a `??` over a read off the atom-valued map `recvIx`, is a
-// value that read's atom rep cannot hold, where a hole instance reads the map at its pin. The
-// direct spelling refuses such a default at check; the instance keeps the template's reading,
-// under which the read is not an atom.
+// value that read's atom rep cannot hold, so the result is not an atom: the read is a nullable
+// operand whose member decodes to its string, and a hole instance reads the map at its pin.
 export function coalMapReadForeignDefault(
   recvIx: i32,
   defIx: i32,
   fnIx: i32,
 ): boolean {
-  const rt = nodeTyIxOf(recvIx)
-  if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyMap { return false }
   const texts = mapTyValLitUnionTexts(mapRecvTyIn(recvIx, fnIx))
   if texts.length == 0 { return false }
   !coalesceLitUnionDefaultIsAtom(defIx, texts, fnIx)
@@ -9659,7 +9766,14 @@ export function coalesceLitUnionFits(exprIx: i32, fnIx: i32) {
     let lut = nodeNulLitUnionMemberTexts(lhs)
     if lut.length == 0 { lut = nodeLitUnionMemberTexts(lhs) }
     // A hole operand's members come from its pin, where the `??` there reads at the union (D3423).
-    if lut.length == 0 && tyIsLitUnion(nodeTyPinIxOf(exprIx)) {
+    const pin = nodeTyPinIxOf(exprIx)
+    if lut.length == 0 && tyIsLitUnion(pin) { lut = nulLitAtomTexts(lhs, fnIx) }
+    // An instance's `??` records its generic's hole, and the operand's own members decide.
+    if (
+      lut.length == 0
+      && fnInPinnedInstance(fnIx)
+      && (pin < 0 || tyHasTyVar(pin))
+    ) {
       lut = nulLitAtomTexts(lhs, fnIx)
     }
     return coalesceLitUnionDefaultIsAtom(e.binRight, lut, fnIx)
@@ -9676,10 +9790,20 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
   if e.binOp != "??" { return false }
   if coalesceLitUnionFits(exprIx, fnIx) { return false }
   if !exprNulLitUnion(e.binLeft, fnIx) { return false }
-  if nulLitAtomTexts(e.binLeft, fnIx).length == 0 { return false }
+  const texts = nulLitAtomTexts(e.binLeft, fnIx)
+  if texts.length == 0 { return false }
   const rt = nodeTyPinIxOf(exprIx)
+  // An instance's `??` records its generic's hole, where a string default outside the set is
+  // what makes the join `string`.
+  if fnInPinnedInstance(fnIx) && (rt < 0 || tyHasTyVar(rt)) {
+    const d = P.nodes[unwrapParen(e.binRight)]
+    if d is StrLit { return !litLexIsMember(d.strText, texts) }
+  }
   if rt < 0 || rt >= T.tys.length { return false }
-  const r = T.tys[rt]
+  // A nullable `string` default leaves the join `string | null` (D7448).
+  const pr = tyPeelNul(rt)
+  if pr < 0 { return false }
+  const r = T.tys[pr]
   if r is TyPrim { return r.primName == "string" }
   false
 }
@@ -10151,11 +10275,11 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
   }
   // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfA = nulIfArmNullableValueIx(exprIx)
-  // A two-arm join typed `string | null` is the string niche, whatever its first arm is; a link
-  // of an `else if` chain keeps its chain's answer (D3303).
+  // A join typed `string | null` is the string niche, whatever its first arm is, at its chain's
+  // head in a function or the module; a link of an `else if` chain keeps its chain's answer (D3303).
   if (
     nlIfA >= 0
-    && !(ifJoinIsNulStringPair(unwrapParen(exprIx))
+    && !(ifJoinIsNulString(unwrapParen(exprIx))
       && ifIsChainHeadIn(unwrapParen(exprIx), fnIx))
   ) {
     if exprNulLitUnion(nlIfA, fnIx) { return true }
@@ -11463,7 +11587,13 @@ function capturedIsLitAtom(fnIx: i32, name: string) {
   if fe < 0 { return false }
   const b = parentBindingOf(fe, name)
   if b >= 0 {
-    if bindingIsLitAtom(b, parentBindingFrameArenaOf(fe, name)) { return true }
+    // Asked off the initializer from the capturing frame, as `captureValKind` sizes the env
+    // field, so a parent local the read names answers from its own declaration (D7441).
+    const askWas = capInitAsk
+    capInitAsk = true
+    const at = bindingIsLitAtom(b, parentBindingFrameArenaOf(fe, name))
+    capInitAsk = askWas
+    if at { return true }
   }
   const lv = capturedLoopVarName(fe, name, b)
   if lv == "" { return false }
@@ -11540,9 +11670,12 @@ function capturedIsNulLitUnion(fnIx: i32, name: string) {
   if fe < 0 { return false }
   const b = parentBindingOf(fe, name)
   if b >= 0 {
-    if bindingIsNulLitUnion(b, parentBindingFrameArenaOf(fe, name)) {
-      return true
-    }
+    // From the capturing frame, as `capturedIsLitAtom` asks (D7441).
+    const askWas = capInitAsk
+    capInitAsk = true
+    const at = bindingIsNulLitUnion(b, parentBindingFrameArenaOf(fe, name))
+    capInitAsk = askWas
+    if at { return true }
   }
   const lv = capturedLoopVarName(fe, name, b)
   if lv == "" { return false }
@@ -11627,6 +11760,12 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if hole.length > 0 { return hole }
   const lv = tyNulLitUnionMemberTexts(loopVarPinTyOf(ix, fnIx))
   if lv.length > 0 { return lv }
+  // A join with a `null` arm holds its other arm's atom or `-1`, so a field read there names it.
+  const thIx = nulArmIfThenValueIx(ix)
+  if thIx >= 0 {
+    const th = memberAtomFieldTexts(thIx, fnIx)
+    if th.length > 0 { return th }
+  }
   const e = P.nodes[unwrapParen(ix)]
   if e is Index {
     const elem = tyNulLitUnionMemberTexts(holeNulLitElemTy(e.idxArr, fnIx))
@@ -11652,7 +11791,29 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
   if e is Ident && depth < declFallbackDepthCap() {
     const pt = paramTypeNodeAt(fnIx, e.identName, unwrapParen(ix))
     if pt >= 0 { return nodeNulLitUnionMemberTexts(pt) }
-    const d = bindingDeclInScope(e.identName)
+    let d = bindingDeclInScope(e.identName)
+    // Outside the emit walk no scope is open, so the body's own declaration answers, as it
+    // does for `exprNulLitUnion`.
+    if d < 0 && fnIx >= 0 {
+      const dfn = P.nodes[fnIx]
+      if dfn is FuncDecl { d = parentLetOf(dfn.fnBody, e.identName) }
+    }
+    // A capture's declaration is in the frame that owns it, and classifies there (D7441).
+    if d < 0 {
+      const fe = capturedFrameOf(fnIx, e.identName)
+      const b = if fe >= 0 { parentBindingOf(fe, e.identName) } else { -1 }
+      if b >= 0 {
+        const bn = P.nodes[b]
+        if bn is LetDecl && bn.letType < 0 && bn.letInit >= 0 {
+          const pfn = parentBindingFrameArenaOf(fe, e.identName)
+          const askWas = capInitAsk
+          capInitAsk = true
+          const ct = nulLitAtomTextsAt(bn.letInit, pfn, depth + 1)
+          capInitAsk = askWas
+          return ct
+        }
+      }
+    }
     if d >= 0 {
       const dn = P.nodes[d]
       if dn is LetDecl {
@@ -11664,6 +11825,80 @@ function nulLitAtomTextsAt(ix: i32, fnIx: i32, depth: i32): string[] {
     }
   }
   tyNulLitUnionMemberTexts(exactOperandTyOf(ix, fnIx))
+}
+
+// The member texts of the atom FIELD a `recv.f` read lands on, from the row's own sidecar. A
+// literal whose checked type is `{f: string}` can share the row a literal-union field minted,
+// so the row, not the read's recorded type, is what names the members (D2151). A field every
+// arm of a struct union stores as an atom names every set its members' rows hold (D5164).
+export function memberAtomFieldTexts(ix: i32, fnIx: i32): string[] {
+  const e = P.nodes[unwrapParen(ix)]
+  if e is Member {
+    const vis: i32[] = []
+    const fis: i32[] = []
+    const ux = unwrapParen(ix)
+    if sharedUnionFieldPlan(e.memObj, e.memProp, ux, fnIx, vis, fis) == FC_I32 {
+      const texts: string[] = []
+      let k = 0
+      while k < vis.length {
+        for t in sharedFieldArmLitTexts(vis[k], fis[k]) {
+          pushUniqueAtom(texts, t)
+        }
+        k = k + 1
+      }
+      if texts.length > 0 { return texts }
+    }
+    // A variant receiver's atom field names its own set, as `exprIsLitAtomMember` claims it.
+    const vi = memRecvVariantIndex(e, ux, fnIx)
+    if vi >= 0 {
+      const vfi = variantFieldIndex(vi, e.memProp)
+      if vfi >= 0 && variantFieldIsLitUnion(vi, vfi) {
+        return sharedFieldArmLitTexts(vi, vfi)
+      }
+    }
+    const si = structIndexOfExpr(e.memObj, fnIx)
+    if si >= 0 {
+      const fi = sFieldIndex(si, e.memProp)
+      if fi >= 0 && sFieldIsLitUnion(si, fi) {
+        return tyLitMemberTexts(sFieldElemTyIxAt(si, fi))
+      }
+    }
+    // An instance's hole receiver, read where no narrowing is open: its pin's every record arm
+    // stores the field as an atom of a literal set.
+    if fnInPinnedInstance(fnIx) {
+      return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx)
+    }
+  }
+  const none: string[] = []
+  none
+}
+
+// The member texts of field `prop` over every record arm of hole receiver `recvIx`'s pin, a
+// `null` arm skipped; empty when any arm lacks the field or stores it as anything but a set.
+function holeRecvAtomFieldTexts(
+  recvIx: i32,
+  prop: string,
+  fnIx: i32,
+): string[] {
+  const none: string[] = []
+  const rt = holeOperandTyOf(recvIx, fnIx)
+  if rt < 0 || rt >= T.tys.length { return none }
+  const arms: i32[] = []
+  const r = T.tys[rt]
+  if r is TyUnion {
+    for m in r.uMembers { arms.push(m) }
+  } else {
+    arms.push(rt)
+  }
+  const texts: string[] = []
+  for m in arms {
+    if tyPrimNameOf(m) != "null" {
+      const ft = tyFieldTyOf(m, prop)
+      if !tyIsLitUnion(ft) && !tyIsOneStrLit(ft) { return none }
+      for t in tyLitMemberTexts(ft) { pushUniqueAtom(texts, t) }
+    }
+  }
+  texts
 }
 
 // The element type of receiver `arrIx`, which a hole instance `fnIx` pins to a list; -1 for any
@@ -11683,23 +11918,28 @@ function coalMapReadNulAtomTexts(ix: i32, fnIx: i32): string[] {
   if u < 0 { return none }
   const e = P.nodes[u]
   if !(e is BinExpr) || e.binOp != "??" { return none }
-  const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
-  if cr < 0 || !coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
-  if coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
-  mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+  if !coalesceDefaultNullable(e.binRight, fnIx) { return none }
+  coalMapReadChainTexts(u, fnIx)
 }
 
-// `coalesceDefaultNullable`, where a default that is itself a hole's read off a map its
-// instance pins also counts: that read is `V | null`, whatever the template recorded.
-export function coalMapDefaultMayBeNull(defIx: i32, fnIx: i32): boolean {
-  if coalesceDefaultNullable(defIx, fnIx) { return true }
-  const dix = unwrapParen(defIx)
-  if dix < 0 { return false }
-  const d = P.nodes[dix]
-  if !(d is Index) || indexPlaceNonNull(dix) { return false }
-  const dt = nodeTyIxOf(dix)
-  if dt < 0 || dt >= T.tys.length || !(T.tys[dt] is TyVar) { return false }
-  mapRecvTyIn(d.idxArr, fnIx) >= 0
+// The member texts of the `??` chain at `u` whose leftmost operand is a read off an atom-valued
+// map and each of whose defaults that read's atom rep holds; empty for any other expression.
+// A chain groups left, so `m[a] ?? m[b] ?? d` is found through its left spine (D7444).
+function coalMapReadChainTexts(u: i32, fnIx: i32): string[] {
+  const none: string[] = []
+  const e = P.nodes[u]
+  if !(e is BinExpr) || e.binOp != "??" { return none }
+  const l = unwrapParen(e.binLeft)
+  if l < 0 { return none }
+  const cr = fusedMapReadRecvIx(l)
+  if cr >= 0 {
+    if coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
+    return mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
+  }
+  const texts = coalMapReadChainTexts(l, fnIx)
+  if texts.length == 0 { return none }
+  if !coalesceLitUnionDefaultIsAtom(e.binRight, texts, fnIx) { return none }
+  texts
 }
 
 // `callResultAtomTexts`'s type: the callee's result where it names member texts, else -1. An
@@ -11993,7 +12233,7 @@ export function asExprLitAtomYieldsStr(ix: i32, fnIx: i32): boolean {
 }
 
 // Whether `ty` is a lone string literal type.
-function tyIsBareStrLit(ty: i32): boolean {
+export function tyIsBareStrLit(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const t = T.tys[ty]
   if t is TyLit { return t.litKind == "str" }
@@ -12098,20 +12338,21 @@ function exprIsLitAtomIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
 
 // True if a field read `e` yields a literal-union atom, through a variant or nullable-variant
 // receiver, a struct union whose members all store it as one, or a struct's own field.
+// The variant member read `memIx`'s receiver holds, in the order the field-code twins take
+// it: the narrowing, else a bare variant, else the `Arm | null` niche; -1 for none of them.
+export function memRecvVariantIndex(e: Member, memIx: i32, fnIx: i32): i32 {
+  if !memIsNarrowed(memIx) { return memRecvArmVariantIndex(e.memObj, fnIx) }
+  const vi = memNarrowVariantIndex(memIx)
+  if vi >= 0 { return vi }
+  memRecvNulVariantIndex(e.memObj, fnIx)
+}
+
 function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
   // `t0.f` reading a literal-union atom field through a narrowed union receiver or a
   // variant-typed receiver yields the atom — the variant-table twin of the struct-receiver
   // case below, in `memFieldTypeCode`'s dispatch order. Without it the read printed the raw atom id.
   const mIxA = unwrapParen(exprIx)
-  let mviA = -1
-  if memIsNarrowed(mIxA) {
-    mviA = memNarrowVariantIndex(mIxA)
-  } else {
-    mviA = exprVariantIndex(e.memObj, fnIx)
-  }
-  // The fifth receiver shape, taken in the same order the field-code twins take it: a
-  // bare variant first, then the `Arm | null` niche.
-  if mviA < 0 { mviA = memRecvNulVariantIndex(e.memObj, fnIx) }
+  const mviA = memRecvVariantIndex(e, mIxA, fnIx)
   if mviA >= 0 {
     const mvfiA = variantFieldIndex(mviA, e.memProp)
     if mvfiA >= 0 && variantFieldTypeAt(mviA, mvfiA) == FC_I32 {
@@ -12125,10 +12366,15 @@ function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
   // claim cannot drift; code 0 alone is not sufficient, since it is also plain i32/boolean.
   const avis: i32[] = []
   const afis: i32[] = []
-  if (
-    sharedUnionFieldPlan(e.memObj, e.memProp, mIxA, fnIx, avis, afis)
-    == FC_I32
-  ) {
+  const aplan = sharedUnionFieldPlan(
+    e.memObj,
+    e.memProp,
+    mIxA,
+    fnIx,
+    avis,
+    afis,
+  )
+  if aplan == FC_I32 {
     let allAtom = avis.length > 0
     let ai = 0
     while ai < avis.length {
@@ -12158,6 +12404,10 @@ function exprIsLitAtomMember(e: Member, exprIx: i32, fnIx: i32): boolean {
       const r = sFieldIsLitUnion(msi, mfi)
       return r
     }
+  }
+  // An instance's hole receiver where no narrowing is open, as `memberAtomFieldTexts` reads it.
+  if aplan < 0 && mviA < 0 && fnInPinnedInstance(fnIx) {
+    return holeRecvAtomFieldTexts(e.memObj, e.memProp, fnIx).length > 0
   }
   false
 }
@@ -14661,7 +14911,11 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         const cln = unionNameOfExpr(e.binLeft, fnIx)
         if cln != "" && coalesceDefaultNullable(e.binRight, fnIx) {
           const crn = unionNameOfExpr(e.binRight, fnIx)
-          if crn == "" || crn == cln { return cln }
+          // A hole's map read default names no set, so it keeps `cln` only by naming it.
+          if crn == cln { return cln }
+          if crn == "" && !coalDefaultEndsInHoleMapRead(e.binRight, fnIx) {
+            return cln
+          }
         }
         // A `?.` LHS over a value-union LEAF stays a BOX past the `??` even with a NON-null
         // default: peeling `null` off `i32 | string | null` leaves TWO atoms, which have no
@@ -19089,6 +19343,8 @@ export function letIsString(letIx: i32, fnIx: i32) {
         // Canon's banked type: `nameIsString` reads the spelling, which softens a litunion to
         // `string` — right here since nothing else claims the binding first.
         if nodeTyPrimName(d.letType) == "string" { return true }
+        // A lone literal value is its string, whatever atom field initialises it (D7220).
+        if tyIsBareStrLit(nodeTyIxOf(d.letType)) { return true }
       }
     }
     return exprString(d.letInit, fnIx)
@@ -19812,6 +20068,9 @@ function cloArrCallRetKind(callIx: i32, fnIx: i32): VKind | null {
     if c.callFn < 0 { return null }
     const callee = P.nodes[c.callFn]
     if callee is Index {
+      // A read a generic's instances share holds its pinned type per instance (D7840).
+      const fk = sigKeyOfTy(monoFieldReadTyAt(c.callFn, fnIx))
+      if fk != "" { return sigKeyRetKind(fk) }
       if exprRefArray(callee.idxArr, fnIx) {
         return sigKeyRetKind(
           cloArrSlotSigKey(refListSlotOfExpr(callee.idxArr, fnIx)),

@@ -25,7 +25,23 @@ import { nodeToks } from "./ast"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { TokKind, isIdPart } from "./lexer"
 import { lookup } from "./check_scopes"
-import { T, TyObj, tyMayHoldFn, tyToStr } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
+  TyMap,
+  TyNeg,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  TyVar,
+  tyMayHoldFn,
+  tyToStr,
+} from "./check_types"
+import { nodeTyIxOf } from "./check_node_tys"
 import { tyHasTyVar } from "./tyquery"
 import { strListHas } from "./listutil"
 
@@ -107,13 +123,14 @@ let ihStFullOk: boolean[] = []
 // position hash, and each statement's full-token hash on first read (`ihFullOf`).
 let ihLean = false
 let ihStAmb: boolean[] = []
-// Ambient keys, per statement `ihAkSt[k]`: a declared name, a method's or getter's name, or one
-// record level's field names, as `ihAkW[ihAkLo[k], ihAkHi[k])`. An ambient statement that no
-// key bounds is wild. `ihDeclsOf` holds each type name's declarations, `ihFv` the words
-// `ihAmbientFv` read.
+// Ambient keys, per statement `ihAkSt[k]`: a declared name, a method's or getter's name, one
+// record level's field names, or the `new` type an operator takes, as `ihAkW[ihAkLo[k],
+// ihAkHi[k])`. An ambient statement that no key bounds is wild. `ihDeclsOf` holds each type
+// name's declarations, `ihFv` the words `ihAmbientFv` read.
 const IH_AK_NAME = 0
 const IH_AK_RECV = 1
 const IH_AK_FIELDS = 2
+const IH_AK_OPER = 3
 let ihStWild: boolean[] = []
 // Per statement: whether it declares a type a render may name another type by.
 let ihStNames: boolean[] = []
@@ -726,7 +743,7 @@ function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
 
 // Whether `fd` is found by a call that does not name it through an import: a method on its
 // first parameter `self`, a getter, or an operator. A method's or getter's name becomes a key
-// of `at`; an operator makes `at` wild.
+// of `at`, and so does the `new` type an operator takes; any other operator makes `at` wild.
 function ihReceiverFn(fd: FuncDecl, at: i32): boolean {
   let nm = ihSourceName(fd.fnName)
   let recv = false
@@ -737,7 +754,14 @@ function ihReceiverFn(fd: FuncDecl, at: i32): boolean {
       nm = nm.slice(i + 1, nm.length)
       i = 0
     } else if !isIdPart(nm[i]) {
-      if at >= 0 { ihStWild[at] = true }
+      if at >= 0 {
+        const nt = ihNewOperand(fd, at)
+        if nt == "" {
+          ihStWild[at] = true
+        } else {
+          ihAkRow(at, IH_AK_OPER, [nt])
+        }
+      }
       return true
     } else {
       i = i + 1
@@ -749,6 +773,40 @@ function ihReceiverFn(fd: FuncDecl, at: i32): boolean {
   }
   if recv && at >= 0 { ihAkRow(at, IH_AK_RECV, [nm]) }
   recv
+}
+
+// A parameter type of `fd`, at statement `at`, that names a `new` type its own module declares,
+// or "". A value of a `new` type enters a check only where it spells the name or calls an
+// ambient function that meets, so an operator on one is bounded by that word; on a structural
+// type it applies to any record of the shape.
+function ihNewOperand(fd: FuncDecl, at: i32): string {
+  for p in fd.fnParams {
+    if p >= 0 && p < P.nodes.length {
+      const pn = P.nodes[p]
+      if pn is Param && pn.parType >= 0 && pn.parType < P.nodes.length {
+        const tn = P.nodes[pn.parType]
+        if tn is TypeRef && ihNewHere(ihDeclBase(tn.tyName), ihStMod[at]) {
+          return ihDeclBase(tn.tyName)
+        }
+      }
+    }
+  }
+  ""
+}
+
+// Whether module `m` declares the plain type name `n` as a `new` type.
+function ihNewHere(n: string, m: i32): boolean {
+  let i = 0
+  while i < n.length {
+    if !isIdPart(n[i]) { return false }
+    i = i + 1
+  }
+  for d in ihDeclsOf[n] ?? [] {
+    const dn = P.nodes[d]
+    const ds = ihStAt(nodeLastTok(d))
+    if ds >= 0 && ihStMod[ds] == m && dn is TypeDecl { return dn.tdNew != 0 }
+  }
+  false
 }
 
 // The statement row holding token `t`, or -1.
@@ -964,10 +1022,13 @@ export function ihAmbientMeets(diags: boolean): boolean[] {
 // sets can each be asked `ihAmbientMeets`'s question without reading their tokens again.
 type IhIndex = {
   xWord: {[string]: i32[]},
+  xMember: {[string]: i32[]},
+  xField: {[string]: i32[]},
   xLit: {[i32]: i32[]},
   xRep: i32[],
   xArena: {[i32]: i32[]},
   xArenaW: string[][],
+  xArenaM: i32[][],
   xArenaRep: i32[],
   xWild: boolean[],
   xNames: boolean[],
@@ -978,10 +1039,13 @@ let ihIx: IhIndex = ihIndexEmpty()
 function ihIndexEmpty(): IhIndex {
   const ix: IhIndex = {
     xWord: Map(),
+    xMember: Map(),
+    xField: Map(),
     xLit: Map(),
     xRep: [],
     xArena: Map(),
     xArenaW: [],
+    xArenaM: [],
     xArenaRep: [],
     xWild: [],
     xNames: [],
@@ -1032,39 +1096,136 @@ export function ihAmbientIndex(): i32 {
         if ihStWild[s] { ix.xWild[m] = true }
         if ihStNames[s] { ix.xNames[m] = true }
       }
+      // The open brackets around token `t`, so a name inside `(` or `[` is not read as a field.
+      const open: TokKind[] = []
       let t = ihStLo[s]
       while t < ihStHi[s] && t < P.toks.length {
         const w = P.toks[t].text
         ihIxWord(ix, w, m)
+        let pk: TokKind = ""
+        if t > ihStLo[s] { pk = P.toks[t - 1].kind }
+        let nk: TokKind = ""
+        if t + 1 < ihStHi[s] && t + 1 < P.toks.length {
+          nk = P.toks[t + 1].kind
+        }
+        const member = pk == "DOT" || pk == "QUESTION_DOT"
+        if member { ihIxRow(ix.xMember, w, m) }
+        let inBrace = true
+        if open.length > 0 { inBrace = open[open.length - 1] == "LBRACE" }
+        const lead = pk == "LBRACE" || pk == "COMMA"
+        const ends = nk == "RBRACE" || nk == "COMMA" || nk == "EQUAL"
+        const named = nk == "COLON" || nk == "QUESTION" || lead && ends
+        const field = member || (inBrace && named)
+        if field { ihIxRow(ix.xField, w, m) }
+        const tk = P.toks[t].kind
+        if tk == "LBRACE" || tk == "LPAREN" || tk == "LBRACK" { open.push(tk) }
+        if (
+          (tk == "RBRACE" || tk == "RPAREN" || tk == "RBRACK")
+          && open.length > 0
+        ) {
+          open.pop()
+        }
         if w.length >= 2 && (w[0] == '"' || w[0] == '\'') {
           ihIxWord(ix, w.slice(1, w.length - 1), m)
+          if field { ihIxRow(ix.xField, w.slice(1, w.length - 1), m) }
         }
         t = t + 1
       }
     }
     s = s + 1
   }
-  if !ihOn(IH_NO_AMB_ARENA) {
-    for ty in T.tys {
-      if ty is TyObj {
-        const a = ix.xArenaW.length
-        ix.xArenaW.push(ty.objFieldNames)
-        if ihHasRepeat(ty.objFieldNames) { ix.xArenaRep.push(a) }
-        const key = ihSetKey(ty.objFieldNames)
-        const rows = ix.xArena[key] ?? []
-        rows.push(a)
-        ix.xArena[key] = rows
-      }
-    }
-  }
+  if !ihOn(IH_NO_AMB_ARENA) { ihIxArena(ix) }
   ihIx = ix
   0
 }
 
+// Per record field-name set, the modules whose own check holds a record of it: every record
+// level they spell, and every record their checked nodes' types reach.
+function ihIxArena(ix: IhIndex): i32 {
+  let k = 0
+  while k < ihAkSt.length {
+    if ihAkKind[k] == IH_AK_FIELDS {
+      ihIxRec(ix, ihAkW.slice(ihAkLo[k], ihAkHi[k]), ihStMod[ihAkSt[k]])
+    }
+    k = k + 1
+  }
+  const seen: i32[] = []
+  for _ in T.tys { seen.push(-1) }
+  let x = 0
+  while x < P.nodes.length {
+    const at = ihStAt(nodeLastTok(x))
+    if at >= 0 { ihIxReach(ix, nodeTyIxOf(x), ihStMod[at], seen) }
+    x = x + 1
+  }
+  0
+}
+
+// Every record level type `ty` reaches, held by module `m`; `seen[ty] == m` once visited for it.
+function ihIxReach(ix: IhIndex, ty: i32, m: i32, seen: i32[]): void {
+  if ty < 0 || ty >= seen.length || m < 0 || seen[ty] == m { return }
+  seen[ty] = m
+  const t = T.tys[ty]
+  match t {
+    TyObj => {
+      ihIxRec(ix, t.objFieldNames, m)
+      for f in t.objFieldTypes { ihIxReach(ix, f, m, seen) }
+    }
+    TyFunc => {
+      for p in t.fnParamTypes { ihIxReach(ix, p, m, seen) }
+      ihIxReach(ix, t.fnRet, m, seen)
+    }
+    TyUnion => {
+      for u in t.uMembers { ihIxReach(ix, u, m, seen) }
+    }
+    TyNullable => ihIxReach(ix, t.nInner, m, seen)
+    TyArray => ihIxReach(ix, t.aElem, m, seen)
+    TyMap => {
+      ihIxReach(ix, t.mKey, m, seen)
+      ihIxReach(ix, t.mVal, m, seen)
+    }
+    TyNeg => ihIxReach(ix, t.negTy, m, seen)
+    TyPrim => {}
+    TyErr => {}
+    TyVar => {}
+    TyLit => {}
+  }
+}
+
+// Module `m` holds a record with field names `ws`.
+function ihIxRec(ix: IhIndex, ws: string[], m: i32): void {
+  if m < 0 { return }
+  const key = ihSetKey(ws)
+  const rows = ix.xArena[key] ?? []
+  for a in rows {
+    if ihSameSet(ix.xArenaW[a], ws) {
+      ihIxPush(ix.xArenaM[a], m)
+      return
+    }
+  }
+  const a = ix.xArenaW.length
+  ix.xArenaW.push(ws)
+  ix.xArenaM.push([m])
+  if ihHasRepeat(ws) { ix.xArenaRep.push(a) }
+  rows.push(a)
+  ix.xArena[key] = rows
+}
+
+function ihSameSet(a: string[], b: string[]): boolean {
+  if a.length != b.length { return false }
+  for w in b {
+    if !strListHas(a, w) { return false }
+  }
+  true
+}
+
 function ihIxWord(ix: IhIndex, w: string, m: i32): void {
-  const rows = ix.xWord[w] ?? []
+  ihIxRow(ix.xWord, w, m)
+}
+
+function ihIxRow(tab: {[string]: i32[]}, w: string, m: i32): void {
+  const rows = tab[w] ?? []
   ihIxPush(rows, m)
-  ix.xWord[w] = rows
+  tab[w] = rows
 }
 
 function ihIxIn(rows: i32[], inS: boolean[]): boolean {
@@ -1074,17 +1235,24 @@ function ihIxIn(rows: i32[], inS: boolean[]): boolean {
   false
 }
 
+// Whether `inS` spells every name of `ws` where a field is named: after `.`, or inside `{` before
+// `:` or `?`, or alone between `{` or `,` and `}`, `,` or `=`.
 function ihIxSpells(ws: string[], inS: boolean[]): boolean {
   for w in ws {
-    if !ihIxIn(ihIx.xWord[w] ?? [], inS) { return false }
+    if !ihIxIn(ihIx.xField[w] ?? [], inS) { return false }
   }
   true
 }
 
-// `ihAmbientFv(inS)` then `ihAmbientMeets(false)`, from the last `ihAmbientIndex`. With `arena`,
-// a record type of the check also counts when `inS` spells all its fields; with `rows`, a type
-// declaration that may name another type in a rendered report row meets. With `twin`, a record
-// declaration adds nothing when `inS` declares its shape, since the two are one type.
+// Whether a module of `inS` holds record entry `a` and `inS` spells each of its field names.
+function ihIxHolds(a: i32, inS: boolean[]): boolean {
+  ihIxIn(ihIx.xArenaM[a], inS) && ihIxSpells(ihIx.xArenaW[a], inS)
+}
+
+// `ihAmbientMeets(false)` over a clean check of `inS`: a method or getter meets only after `.` or
+// `?.`, and a type's name only with `rows`, since names are module-scoped and only a row renders
+// one. With `arena`, a record also counts when `inS` holds and spells it; with `twin`, a record
+// declaration adds nothing when `inS` declares its shape (one type).
 export function ihAmbientMeetsIn(
   inS: boolean[],
   arena: boolean,
@@ -1101,11 +1269,15 @@ export function ihAmbientMeetsIn(
   let any = ihIxIn(ihIx.xRep, inS)
   if arena && !any {
     for a in ihIx.xArenaRep {
-      if ihIxSpells(ihIx.xArenaW[a], inS) { any = true }
+      if ihIxHolds(a, inS) { any = true }
     }
   }
+  ihMeetWhy = []
+  for _ in out { ihMeetWhy.push("") }
   d = 0
   while d < out.length && d < ihIx.xWild.length {
+    if ihIx.xWild[d] { ihMeetWhy[d] = "wild" }
+    if rows && ihIx.xNames[d] { ihMeetWhy[d] = "rows" }
     if ihIx.xWild[d] || (rows && ihIx.xNames[d]) { out[d] = true }
     d = d + 1
   }
@@ -1116,30 +1288,75 @@ export function ihAmbientMeetsIn(
       const kind = ihAkKind[k]
       let all = true
       if kind == IH_AK_FIELDS {
+        ihViaArena = false
         all = any || ihIxIn(ihIx.xLit[ihAkSet[k]] ?? [], inS)
         if !all && arena {
           for a in ihIx.xArena[ihAkSet[k]] ?? [] {
-            if ihIxSpells(ihIx.xArenaW[a], inS) { all = true }
+            if ihIxHolds(a, inS) {
+              all = true
+              ihViaArena = true
+            }
           }
         }
       } else {
         let w = ihAkLo[k]
         while w < ihAkHi[k] {
-          if !ihIxIn(ihIx.xWord[ihAkW[w]] ?? [], inS) { all = false }
+          let hits = ihIx.xWord[ihAkW[w]] ?? []
+          if kind == IH_AK_RECV { hits = ihIx.xMember[ihAkW[w]] ?? [] }
+          if !ihIxIn(hits, inS) { all = false }
           w = w + 1
         }
       }
-      if kind == IH_AK_NAME && ihOn(IH_NO_AMB_NAMES) { all = false }
+      if kind == IH_AK_NAME && (!rows || ihOn(IH_NO_AMB_NAMES)) { all = false }
       if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
       if kind == IH_AK_FIELDS && ihOn(IH_NO_AMB_FIELDS) { all = false }
       if all && twin && ihAkShape[k] != 0 {
         if ihIxIn(ihIx.xShape[ihAkShape[k]] ?? [], inS) { all = false }
       }
-      if all { out[m] = true }
+      if all {
+        out[m] = true
+        ihMeetWhy[m] = ihAkWhy(k, any)
+      }
     }
     k = k + 1
   }
   out
+}
+
+// Per module, after `ihAmbientMeetsIn`: the key that met, for the check's trace.
+let ihMeetWhy: string[] = []
+let ihViaArena = false
+
+// Whether a type or union named `w` is declared in a module outside `inS` (or in no module).
+export function ihNameDeclaredOut(w: string, inS: boolean[]): boolean {
+  for x in ihDeclsOf[w] ?? [] {
+    const at = ihStAt(nodeLastTok(x))
+    if at < 0 { return true }
+    const m = ihStMod[at]
+    if m < 0 || m >= inS.length || !inS[m] { return true }
+  }
+  false
+}
+
+export function ihAmbientWhy(m: i32): string {
+  if m >= 0 && m < ihMeetWhy.length { return ihMeetWhy[m] }
+  ""
+}
+
+function ihAkWhy(k: i32, any: boolean): string {
+  let s = "name:"
+  if ihAkKind[k] == IH_AK_RECV { s = "recv:" }
+  if ihAkKind[k] == IH_AK_OPER { s = "oper:" }
+  if ihAkKind[k] == IH_AK_FIELDS { s = "fields:" }
+  if ihAkKind[k] == IH_AK_FIELDS && any { s = "rep:" }
+  if ihAkKind[k] == IH_AK_FIELDS && ihViaArena { s = "arena:" }
+  let w = ihAkLo[k]
+  while w < ihAkHi[k] {
+    if w > ihAkLo[k] { s = s + "," }
+    s = s + ihAkW[w]
+    w = w + 1
+  }
+  s
 }
 
 function ihTokHash(a: i32, b: i32): i32 {

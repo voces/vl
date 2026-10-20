@@ -28,6 +28,7 @@ import { COMPILER, VL, exists, nativeEnv } from "./support/tree.ts";
  * carries `comment-measurement-uncited`. */
 const INTERNAL = [
   "arena-scan-outside-pass",
+  "arena-slot-write",
   "comment-block-too-long",
   "comment-history",
   "comment-measurement-uncited",
@@ -73,8 +74,13 @@ function perThing(seed: i32) {
   n
 }
 function wU8(b: i32) { b }
+const P = { nodes: nodes }
+function put(n: Node) {
+  P.nodes[0] = n
+  0
+}
 function label(x: i32): string { "n=\\{x}" }
-let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f)
+let total = holeOf({ nKid: 1 }) + readIt({ nKid: 0 }) + pick("x") + perThing(1) + wU8(0x7f) + put({ nKid: 2 })
 print(label(total))
 `;
 

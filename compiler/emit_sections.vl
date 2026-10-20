@@ -28,6 +28,8 @@ import { refViewSrcTys } from "./check_ref_list_view"
 import { lbiArenaReset } from "./check_num_lit_state"
 import {
   PrimName,
+  T,
+  TyLit,
   tyLitMemberTexts,
   tyPrimNameOf,
   tyToEmitName,
@@ -183,6 +185,7 @@ import {
   SYNTH_CONST_LIST,
   SYNTH_EMPTY_BACKING,
   TSK_CLOSURE,
+  TSK_CLO_CELL,
   TSK_CLO_ENV,
   TSK_CLO_SIG,
   TSK_F32_ARRAY,
@@ -237,6 +240,10 @@ import {
   caSeenUnSets,
   caSeenVariants,
   capMemoArmed,
+  cloAdapterCanon,
+  cloCellIdx,
+  cloCellTarget,
+  cloDeclAt,
   cloLiftWriteCapAt,
   cloLiftWriteCount,
   cloSigBase,
@@ -266,6 +273,8 @@ import {
   emitPhase,
   emitRootIx,
   emitStateReset,
+  envCacheFes,
+  envCacheTys,
   externIdxAt,
   fRetRArrElem,
   fRetStructIdx,
@@ -468,9 +477,11 @@ import {
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
+  mvKeyKind,
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
+  mvValName,
   mvValTyIx,
   narrowNames,
   narrowRetired,
@@ -486,6 +497,7 @@ import {
   rlBackIdx,
   rlElemHeap,
   rlElemKindTbl,
+  rlElemName,
   rlElemTyIx,
   rlWrapIdx,
   rvNul,
@@ -527,6 +539,8 @@ import {
   uFieldCount,
   uFieldElemKeyKind,
   uFieldElemTyIx,
+  uFieldNames,
+  uFieldStart,
   uSinkFired,
   uTags,
   uVarHeap,
@@ -575,12 +589,14 @@ import {
   fbI64Const,
   fbIf,
   fbIfRefNul,
+  fbImmutI32Field,
   fbLocalGet,
   fbLocalSet,
   fbLocalTee,
   fbLoop,
   fbMapSlotOf,
   fbMapTagOfI64,
+  fbMutRefNullField,
   fbPushRetExtra,
   fbRefAsNonNull,
   fbRefCast,
@@ -588,6 +604,7 @@ import {
   fbRefNullForKind,
   fbRefNullNone,
   fbRefNullStruct,
+  fbRefNullValtype,
   fbRetExtra,
   fbReturn,
   fbReturnCall,
@@ -601,6 +618,7 @@ import {
   fbStructGet,
   fbStructNew,
   fbStructSet,
+  fbStructTypeHead,
   fbUnreachable,
   fbV128ConstZero,
   fbValtype,
@@ -643,11 +661,13 @@ import {
   relRebase,
   relReset,
   relSectionParts,
+  relSkew,
   relSpAt,
   relSubAt,
   relValAt,
 } from "./emit_reloc"
-import { relSymKey } from "./emit_reloc_keys"
+import { relKeysReset, relSymKey } from "./emit_reloc_keys"
+import { emitLinkSection, linkIsNote, linkIsReset } from "./emit_link"
 import {
   anonLeafSupersedeOf,
   sFieldTypeAt,
@@ -657,6 +677,7 @@ import {
 import { capMemoEditsReset, fnEnvIdxOf, nfdReset } from "./emit_capture_frames"
 import { bcReset } from "./emit_closure_callee"
 import {
+  capCellTargetOf,
   captureNamesOf,
   captureValKind,
   captureValStructIdx,
@@ -810,6 +831,7 @@ import {
   fnFlowShadowSweep,
 } from "./fn_flow_shadow"
 import { cloLiftScan, cloLifted } from "./emit_lift"
+import { criFnIsAnonLambda } from "./emit_local_scope"
 import { identAuditBegin, identAuditMark, identAuditRun } from "./ident_audit"
 import {
   armScopeOpenOver,
@@ -1318,6 +1340,45 @@ function rebaseStmtSpans(base: i32, bodyInOut: i32, exprInBody: i32) {
   }
 }
 
+// The functions each function declares directly, by enclosing function; built at the first body.
+let envCacheKids: {[i32]: i32[]} = Map()
+let envCacheKidsBuilt = false
+
+// Fills `envCacheFes`/`envCacheTys` for the body of function `fnPos`: the functions it declares
+// by statement that capture and are not lambda-lifted. A lambda is excluded, since each
+// evaluation of its expression is a new function value.
+function envCacheOpen(fnPos: i32) {
+  envCacheFes = []
+  envCacheTys = []
+  if !fnNestUsed || fnPos < 0 { return 0 }
+  if !envCacheKidsBuilt {
+    envCacheKidsBuilt = true
+    let fe = 0
+    while fe < fnParent.length && fe < fnStmts.length {
+      const p = fnParent[fe]
+      if p >= 0 {
+        const have = envCacheKids[p] ?? []
+        have.push(fe)
+        envCacheKids[p] = have
+      }
+      fe = fe + 1
+    }
+  }
+  for kid in envCacheKids[fnPos] ?? [] {
+    const ty = fnEnvIdxOf(kid)
+    if ty >= 0 && !cloLifted(kid) && !criFnIsAnonLambda(kid) {
+      envCacheFes.push(kid)
+      // A function another frame reads keeps its cell here instead of its env (D7700).
+      if kid < cloCellTarget.length && cloCellTarget[kid] == 1 {
+        envCacheTys.push(cloCellIdx)
+      } else {
+        envCacheTys.push(ty)
+      }
+    }
+  }
+  0
+}
+
 // Builds the size-prefixed code-section body for the `FuncDecl` at `fnIx`: the locals vector
 // (declared locals, all i32), the body's statement instructions, then `end`. Framed bytes are
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
@@ -1330,6 +1391,7 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
     // the offending function; `fnPos` is the caller's own `fnStmts` loop index, which `fnStmtsPosOf` reads instead of scanning.
     emitCurFnIx = fnIx
     emitCurFnPos = fnPos
+    envCacheOpen(fnPos)
     // Replays the narrowing this frame's closure sits inside, for the whole body —
     // locals collection included, since a `const t = <captured narrowed read>` is typed from it.
     // Only a value-union-box capture is seeded, so a function capturing nothing narrowed emits
@@ -2379,6 +2441,7 @@ function emitStartFnCode(out: u8[]) {
   fnUsesUnionSink = false
   fnUsesUnionLetSink = false
   uSinkFired = 0
+  envCacheOpen(-1)
   fbBeginFunc(0, nStartLocals)
 
   const bodyExpr: u8[] = []
@@ -2442,7 +2505,7 @@ function emitStartFnCode(out: u8[]) {
       // A guarded global's initializer has run (a folded one, at its declaration): advance the
       // progress cell past it.
       if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitProgIdx >= 0 {
-        fbI32RelOf(RS_GUARD, gi, gi + 1)
+        fbI32RelOf(RS_GUARD, gi, gi + 1 + relSkew(RS_GUARD))
         fbGlobalSet(gInitProgIdx)
       }
       // The row the D1594 diagnostic reads: this initializer's own byte range, so an
@@ -4593,7 +4656,7 @@ function emitInitFailPick(param: i32, strs: string[], sp: i32, subs: i32[]) {
   let k = 0
   while k < strs.length {
     fbLocalGet(param)
-    fbI32RelOf(sp, subs[k], k)
+    fbI32RelOf(sp, subs[k], k + relSkew(sp))
     fbI32Bin(70) // 0x46 i32.eq
     fbIf(64)
     emitInitFailText(strs[k])
@@ -5864,7 +5927,18 @@ function fnSymKeys(n: i32): string[] {
   const out: string[] = []
   let fi = 0
   while fi < n {
-    const nm = fnSymName(fi)
+    let nm = fnSymName(fi)
+    // A lambda's synthesized name counts every lambda of the program, its anchor only its own.
+    const fn = P.nodes[fnStmts[fi]]
+    if fn is FuncDecl && fnDispNames[fi].length == 0 {
+      const lam = "__lambda_"
+      if (
+        fn.fnName.length > lam.length
+        && fn.fnName.slice(0, lam.length) == lam
+      ) {
+        nm = "__lambda" + fnLocSuffix(fnStmts[fi], true)
+      }
+    }
     const dup = seen[nm] ?? 0
     seen[nm] = dup + 1
     if dup == 0 {
@@ -5875,6 +5949,101 @@ function fnSymKeys(n: i32): string[] {
     fi = fi + 1
   }
   out
+}
+
+// Each shared runtime helper's function index, keyed to its name-section name, and the
+// `__log__` decoder's; a per-module artifact names a call to one by that name.
+function runtimeFnNames(): { [i32]: string } {
+  const buf: u8[] = []
+  const prev = wTarget(buf)
+  nameHelpers()
+  wTarget(prev)
+  const out: { [i32]: string } = Map()
+  if memLogUsed { out[gMemLogIdx] = "__log__" }
+  const ascii = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+  const at = [0]
+  while at[0] < buf.length {
+    const ix = seedLeb(buf, at)
+    const len = seedLeb(buf, at)
+    let s = ""
+    let i = 0
+    while i < len && at[0] < buf.length {
+      const c: i32 = buf[at[0]]
+      if c >= 32 && c < 127 {
+        s = s + ascii.slice(c - 32, c - 31)
+      } else {
+        s = s + "?"
+      }
+      at[0] = at[0] + 1
+      i = i + 1
+    }
+    out[ix] = s
+  }
+  out
+}
+
+function seedLeb(b: u8[], at: i32[]): i32 {
+  let r = 0
+  let sh = 0
+  while at[0] < b.length {
+    const x: i32 = b[at[0]]
+    at[0] = at[0] + 1
+    if sh < 32 { r = r | ((x & 127) << sh) }
+    sh = sh + 7
+    if (x & 128) == 0 { return r }
+  }
+  r
+}
+
+// Per minted group type below `g`, what it stands for beyond its bytes: a record's field names,
+// a list's element name, a map's key kind and value name, a closure env's captures. Records
+// of both families share one spelling, as twins share one heap type.
+function typeSeeds(g: i32): string[] {
+  const out: string[] = []
+  let k = 0
+  while k < g {
+    let kind = -1
+    let slot = 0
+    if k < mAllocKind.length && k < mAllocSlot.length {
+      kind = mAllocKind[k]
+      slot = mAllocSlot[k]
+    }
+    let s = "k" + i32ToStr(kind)
+    if kind == TSK_STRUCT && slot >= 0 && slot < sFieldCount.length {
+      s = "R" + seedNames(sFieldNames, sFieldStart[slot], sFieldCount[slot])
+    } else if kind == TSK_VARIANT && slot >= 0 && slot < uFieldCount.length {
+      s = "R" + seedNames(uFieldNames, uFieldStart[slot], uFieldCount[slot])
+    } else if (
+      (kind == TSK_REF_BACK || kind == TSK_REF_WRAP)
+      && slot >= 0
+      && slot < rlElemName.length
+    ) {
+      s = s + ":" + rlElemName[slot]
+    } else if (
+      kind == TSK_MV_MAP
+      && slot >= 0
+      && slot < mvKeyKind.length
+      && slot < mvValName.length
+    ) {
+      s = s + ":" + i32ToStr(mvKeyKind[slot]) + ":" + mvValName[slot]
+    } else if kind == TSK_CLO_ENV {
+      const caps = captureNamesOf(slot)
+      s = s + ":" + seedNames(caps, 0, caps.length)
+    }
+    out.push(s)
+    k = k + 1
+  }
+  out
+}
+
+function seedNames(names: string[], from: i32, n: i32): string {
+  let s = ""
+  let i = 0
+  while i < n && from + i < names.length {
+    s = s + names[from + i] + ","
+    i = i + 1
+  }
+  s
 }
 
 // The armed recorder's rows as the `vl.reloc` custom section: version 2, the symbols (space,
@@ -5939,10 +6108,10 @@ function emitRelocSection(n: i32) {
   wSection(0, payload)
 }
 
-// Collects the string-literal pool: every distinct `StrLit` lexeme in the arena (first-seen
-// arena order, deterministic per program) whose decoded length fits one `array.new_fixed` (an
-// over-cap literal keeps the inline chunked build), then every literal an `is` compares with
-// `__str_eq__` that is not pooled yet, so the test allocates nothing (D2062).
+// Collects the string-literal pool, in arena order: every `StrLit` lexeme that fits one
+// `array.new_fixed` (an over-cap one keeps the inline build), every literal an `is` compares
+// with `__str_eq__`, and every string literal type an atom's conversion prints, so a module's
+// code reads the pool whatever literals the rest of its program holds.
 function collectStrPool() {
   gStrPoolTexts = []
   gStrPoolIx = Map()
@@ -5950,6 +6119,7 @@ function collectStrPool() {
   gStrDataStart = []
   gStrDataLen = []
   gStrDataParts = []
+  linkIsReset()
   if !aUsed { return 0 }
   const isLexes: string[] = []
   let i = 0
@@ -5961,6 +6131,7 @@ function collectStrPool() {
       let k = 0
       while k < texts.length {
         isLexes.push(quoteLex(texts[k]))
+        linkIsNote(i, isLexes[isLexes.length - 1])
         k = k + 1
       }
     }
@@ -5970,6 +6141,9 @@ function collectStrPool() {
   while j < isLexes.length {
     strPoolAdd(isLexes[j])
     j = j + 1
+  }
+  for t in T.tys {
+    if t is TyLit && t.litKind == "str" { strPoolAdd(quoteLex(t.litText)) }
   }
   0
 }
@@ -6069,6 +6243,7 @@ function emitModule(_stmts: i32[]) {
   emitReset()
   typeOrderReset()
   relReset()
+  relKeysReset()
   // The collect passes are done, so this is the last moment before any section indexes a
   // variant: prove the field-span tables cover every `uVariants` row, or fail loudly and pad
   // them, since a short table turns the next thirty reads into a compiler trap. Deliberately not
@@ -6110,6 +6285,10 @@ function emitModule(_stmts: i32[]) {
   gSynthArg = []
   gSynthInit = []
   gSynthAt = Map()
+  cloAdapterCanon = Map()
+  cloDeclAt = Map()
+  envCacheKids = Map()
+  envCacheKidsBuilt = false
 
   // Heap-type indices, in type-section order: standalone structs, then (for the union path)
   // the variant structs + box, the i32 array/list pair, each ref-list pair, the string-list
@@ -6160,13 +6339,16 @@ function emitModule(_stmts: i32[]) {
   emitDataSection()
   relPlaceSections()
   // Every section that names a type is written, so the first group can take its final order.
-  if !emitFailed { typeOrderRun(typeOffset) }
+  if !emitFailed { typeOrderRun(typeOffset, typeSeeds(typeOffset)) }
 
   // Custom "name" section LAST (after the code section, where it conventionally
   // lives). A no-op unless `gEmitNames` is set, so the default emit path is
   // unchanged for every golden.
   emitNameSection(n)
   emitRelocSection(n)
+  if RELOC_ARMED {
+    emitLinkSection(n, fnSymKeys(n), cloThunkFes, runtimeFnNames())
+  }
   if wStray.length > 0 {
     return emitFail(
       "emitProgram: a module byte was written outside any section",
@@ -8204,18 +8386,27 @@ function tsU8List() {
 }
 
 function tsClosure() {
-  // The closure fat-pointer struct `{ env: (ref null struct), id: i32 }` — field 0 a nullable
-  // `structref` env (null when non-capturing), field 1 the lifted function's wasm index, both
-  // immutable. One closure struct serves every arity since the id is untyped; a call site
-  // supplies the concrete env-leading `$fnsig` as `call_indirect`'s type operand, trapping on mismatch. No `funcref` field: reading one back out of the GC heap is a costly host libcall, where an i32 field is a plain load.
+  // The closure fat-pointer struct `{ env: (ref null struct), id: i32, decl: i32 }`, all
+  // immutable: the env (null when non-capturing), the wasm index `call_indirect` dispatches on,
+  // and the index of the function standing for the source declaration, which with the env is
+  // the `==` identity. No `funcref` field: reading one back out of the GC heap is a host libcall.
   tsEntryAt(cloStructIdx, "closure")
-  wU8(95)  // 0x5f struct
-  wU8(2)   // 2 fields
-  wU8(99)  // field 0 env: 0x63 (ref null ht)
-  wU8(107) // ...to the abstract `struct` heaptype (structref)
-  wU8(0)   // immutable
-  wU8(127) // field 1 id: 0x7f i32 — identity token AND dispatch index
-  wU8(0)   // immutable
+  wU8(95)           // 0x5f struct
+  wU8(3)            // 3 fields
+  wU8(99)           // field 0 env: 0x63 (ref null ht)
+  wU8(107)          // ...to the abstract `struct` heaptype (structref)
+  wU8(0)            // immutable
+  fbImmutI32Field() // field 1 id, the dispatch index
+  fbImmutI32Field() // field 2 decl, the identity token
+  0
+}
+
+// The function-value cell `{ v: (mut (ref null $closure)) }` a declaring frame and every frame
+// reading its function as a value share (`cloCellTarget`).
+function tsCloCell() {
+  tsEntryAt(cloCellIdx, "function-value cell")
+  fbStructTypeHead(1)
+  fbMutRefNullField(cloStructIdx)
   0
 }
 
@@ -8253,7 +8444,11 @@ function tsCloEnv(fe: i32) {
   wULEB(caps.length)
   let ci = 0
   while ci < caps.length {
-    fbValtype(captureValKind(fe, caps[ci]), captureValStructIdx(fe, caps[ci]))
+    if capCellTargetOf(caps[ci]) >= 0 {
+      fbRefNullValtype(cloCellIdx) // the shared function-value cell
+    } else {
+      fbValtype(captureValKind(fe, caps[ci]), captureValStructIdx(fe, caps[ci]))
+    }
     wU8(0) // immutable
     ci = ci + 1
   }
@@ -8328,6 +8523,7 @@ function tsEmitEntry(kind: i32, slot: i32) {
   if kind == TSK_CLO_SIG { return tsCloSig(slot) }
   if kind == TSK_CLO_ENV { return tsCloEnv(slot) }
   if kind == TSK_MV_MAP { return tsMvMap(slot) }
+  if kind == TSK_CLO_CELL { return tsCloCell() }
   emitFail(
     "emitProgram: the type section has no writer for allocation kind "
       + i32ToStr(kind),
@@ -9109,7 +9305,13 @@ function frameGlobalSection() {
       wBytes(gSynthInit[i])
     } else {
       fbRefNullStruct()
-      fbI32RelOf(RS_SLOT, gSynthArg[i], gImports + gSynthArg[i])
+      fbI32RelOf(
+        RS_SLOT,
+        gSynthArg[i],
+        gImports + gSynthArg[i] + relSkew(RS_SLOT),
+      )
+      const decl = cloDeclAt[gSynthArg[i]] ?? gSynthArg[i]
+      fbI32RelOf(RS_SLOT, decl, gImports + decl + relSkew(RS_SLOT))
       fbStructNew(ty)
     }
     fbEnd()

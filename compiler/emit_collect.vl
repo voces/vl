@@ -99,6 +99,7 @@ import {
   tyFieldTyOf,
   tyHoldsObj,
   tyIsLitUnion,
+  tyIsOneStrLit,
   tyIsTwinRecordUnion,
   tyLitMemberTexts,
   tyMembersDistinctRecords,
@@ -270,6 +271,7 @@ import {
   RLK_U8_LIST,
   RLK_UNION,
   TSK_CLOSURE,
+  TSK_CLO_CELL,
   TSK_CLO_ENV,
   TSK_CLO_SIG,
   TSK_F32_ARRAY,
@@ -329,11 +331,14 @@ import {
   caSeenUnSets,
   caSeenVariants,
   cboxReadTy,
+  cloCellIdx,
+  cloCellUsed,
   cloLiftCapN,
   cloLiftWrReset,
   cloLiftedFes,
   cloSigBase,
   cloSigKeys,
+  cloSigPosBy,
   cloSigRepFn,
   cloSigTagNames,
   cloSigTwin,
@@ -587,6 +592,7 @@ import {
   sTyIxOfName,
   structCanonIxReset,
 } from "./emit_rep"
+import { RS_TAG, relSkew } from "./emit_reloc"
 import {
   anonFieldElemKeyKind,
   anonMapFieldDestAdmits,
@@ -937,6 +943,7 @@ import {
   isUName,
   isUNameAB,
   isUNameKeyAB,
+  unABOn,
   unNameBound,
   unRowOfCanon,
   unVarSliceAdoptKeySibling,
@@ -1215,6 +1222,10 @@ function litSetTyIxOf(tyIx: i32): i32 {
 // `code`, declined for the names `repElemKey` keys nominally and for literal unions.
 function fieldElemHintOf(fdType: i32, code: i32, elemNm: string) {
   if elemNm == "" { return -1 }
+  // A bare string literal's atom row is its own literal type; its lexeme resolves to none.
+  if code == FC_I32 && tyIsOneStrLit(nodeTyIxOf(fdType)) {
+    return nodeTyIxOf(fdType)
+  }
   if elemNameIsNominal(elemNm) { return -1 }
   if nameIsLitUnionType(elemNm) {
     // A registered alias resolves through `recordSFieldElemRowTy`'s own name rung; an inline
@@ -2741,6 +2752,7 @@ export function collectFns(stmts: i32[]) {
   // signature key reads each function's param and return kinds, and an un-annotated callback's
   // return kind is known only once inference ran.
   cloSigKeys = []
+  cloSigPosBy = Map()
   cloSigRepFn = []
   // The pool's twin column is rebuilt at the pool's own emit; clear it with the two columns it
   // parallels so a long-lived process cannot read the previous module's folds through a
@@ -2764,6 +2776,7 @@ function cloResultIsPlainScalar(r: string) {
 function internCloSigKey(key: string, rep: i32) {
   if key == "" { return 0 }
   if cloSigPosOfKey(key) >= 0 { return 0 }
+  cloSigPosBy[key] = cloSigKeys.length
   cloSigKeys.push(key)
   cloSigRepFn.push(rep)
   0
@@ -2878,6 +2891,7 @@ function internNulCloResultSpine(tn: string, ty: i32) {
 // `fnValUsed`. Empty unless `fnValUsed`, the invariant that keeps every golden's bytes fixed.
 export function collectCloSigs() {
   cloSigKeys = []
+  cloSigPosBy = Map()
   cloSigRepFn = []
   // The pool's twin column is rebuilt at the pool's own emit; clear it with the two columns it
   // parallels so a long-lived process cannot read the previous module's folds through a
@@ -6385,6 +6399,9 @@ function mAssignClosureTypes() {
       }
       fe = fe + 1
     }
+    // The function-value cell, only when some function is read as a value outside its frame.
+    cloCellIdx = -1
+    if cloCellUsed { cloCellIdx = mAllocType(TSK_CLO_CELL, 0) }
   } else {
     cloStructIdx = mNextType
     cloSigBase = mNextType + 1
@@ -12004,6 +12021,10 @@ function fieldRecElemName(tyIx: i32, code: i32) {
     // canon rewrote the spelling. Dual-written: 932 reaches, 0 disagreements.
     const ftn = tyNameOf(tyIx)
     if tyIsLitUnion(annRowOfNode(tyIx)) { return ftn }
+    // A bare string literal names its one-member set: the set's alias, else its lexeme.
+    if tyIsOneStrLit(nodeTyIxOf(tyIx)) {
+      return litSetAtomNameOfTy(nodeTyIxOf(tyIx))
+    }
     return en
   }
   // The string-slot inline literal-union field: the recorded name must be the member set, not
@@ -12699,7 +12720,7 @@ export function assignTags() {
     while q < ord.length && sigs[ord[q]] == sigs[ord[p]] { q = q + 1 }
     let t = p
     while t < q {
-      uTags[ord[t]] = p
+      uTags[ord[t]] = p + relSkew(RS_TAG)
       t = t + 1
     }
     p = q
@@ -13174,6 +13195,25 @@ function reachRegisterName(tyIx: i32, underFunc: boolean): string {
   arenaEmitName(tyIx)
 }
 
+// Per arena type, the deepest `depth` a walk below completed at, one column per `underFunc`,
+// so a repeat reaching no deeper is skipped: it would meet only unions already registered.
+// Dropped with the union registry at `collectU`'s start; off while the A/B shadow counts calls.
+let ctrDoneAt: i32[] = []
+let ctrDoneAtFn: i32[] = []
+
+function ctrDoneDepth(tyIx: i32, underFunc: boolean): i32 {
+  const col = if underFunc { ctrDoneAtFn } else { ctrDoneAt }
+  if tyIx >= col.length { return 0 }
+  col[tyIx]
+}
+
+function ctrDoneMark(tyIx: i32, underFunc: boolean, depth: i32) {
+  const col = if underFunc { ctrDoneAtFn } else { ctrDoneAt }
+  while col.length <= tyIx { col.push(0) }
+  if col[tyIx] < depth { col[tyIx] = depth }
+  0
+}
+
 // ── unified arena registration walk ───────────────────────────────────────────
 // The structural sibling of the name walk: recurses over `tyIx`'s `T.tys` shape and registers
 // every reachable `TyUnion`, so a union in a novel nesting position the name walk cannot see
@@ -13185,6 +13225,20 @@ function collectTyReachRegister(
   underFunc: boolean,
 ) {
   if tyIx < 0 || depth <= 0 { return 0 }
+  const memo = unABOn() == 0
+  if memo && ctrDoneDepth(tyIx, underFunc) >= depth { return 0 }
+  const r = collectTyReachRegisterGo(stmts, tyIx, depth, underFunc)
+  if memo && r >= 0 { ctrDoneMark(tyIx, underFunc, depth) }
+  r
+}
+
+// One step of `collectTyReachRegister`'s walk, unmemoised.
+function collectTyReachRegisterGo(
+  stmts: i32[],
+  tyIx: i32,
+  depth: i32,
+  underFunc: boolean,
+) {
   const t = T.tys[tyIx]
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can carry a union must get a
   // descent here, not take the leaf `0` and drop every union beneath it.
@@ -13927,6 +13981,8 @@ export function collectU(stmts: i32[]) {
 // registration starts from nothing a previous program left behind; only the i64 and f64 boxes
 // a retag widening asks for start used.
 function collectUReset() {
+  ctrDoneAt = []
+  ctrDoneAtFn = []
   uDeclared = false
   vbI32Used = false
   vbI64Used = false

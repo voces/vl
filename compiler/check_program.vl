@@ -45,7 +45,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
-  arenaEpochBump,
+  arenaSetNode,
   brkValSeen,
   clearAnnTs,
   clearUdTs,
@@ -556,6 +556,7 @@ import {
 } from "./check_ty_relate"
 import {
   nameIsLitUnionType,
+  nameIsOneStrLit,
   nomErasedTyIx,
   numLitUnionAliasName,
   oneListUnionAliasName,
@@ -1509,7 +1510,8 @@ function nulLitUnionPreserve(parts: string[], ctx: i32) {
     core = core + "|" + rest[j]
     j = j + 1
   }
-  if nameIsLitUnionType(core) {
+  // One quoted literal beside `null` is its one-member set, the atom niche too (D7446).
+  if nameIsLitUnionType(core) || nameIsOneStrLit(core) {
     // The reconstructed name's atom count, banked for `canonEmitName`: `rest` holds
     // top-level members of the original split and the `null` arm adds one — duplicate
     // `null` members collapse into the single suffix, so this is `rest.length + 1`, not `parts.length`.
@@ -1835,6 +1837,15 @@ function canonEmitNameTs(name: string, ctx: i32, root: i32) {
   // an arena type at a leaf, which `litMemberTy` now supplies. Total here, since
   // `softenLitTy` of a `TyLit` is never `never`, the only prim this renderer has no name for.
   const lmt = litMemberTy(name)
+  // A lone string literal at a record field, list element or map value is its one-member set:
+  // it keeps its spelling, so it shares neither `string`'s row nor its list (D7340, D7446).
+  if (
+    lmt >= 0
+    && (ctx & (RC_FIELD | RC_ELEM | RC_MAP_VAL)) != 0
+    && tyIsBareStrLitTy(lmt)
+  ) {
+    return name
+  }
   if lmt >= 0 {
     const lbn = tyToEmitNameAt(softenLitTy(lmt), ctx)
     // A softened literal is a base scalar — one atom. Set explicitly, since the render
@@ -5471,7 +5482,6 @@ function recDupFieldErrs() {
 // own block, so the emitter sees the two statements it already lowers. A site already split is
 // skipped; one whose recorded block does not list it is refused rather than left to the emitter.
 function voidRetRewrite() {
-  let changed = false
   let i = 0
   while i < voidRetRwRet.length {
     const r = voidRetRwRet[i]
@@ -5493,10 +5503,9 @@ function voidRetRewrite() {
         }
         if found {
           const nb: Node = { blkStmts: out, pos: bn.pos }
-          P.nodes[b] = nb
+          arenaSetNode(b, nb)
           const nr: Node = { retArg: -1, pos: rn.pos }
-          P.nodes[r] = nr
-          changed = true
+          arenaSetNode(r, nr)
         } else {
           tErr(
             "a `return` of a void value here is not split — write the call, then `return`",
@@ -5507,8 +5516,6 @@ function voidRetRewrite() {
     }
     i = i + 1
   }
-  // The banked parse differs from the tree now, so a later consumer re-parses, as after getters.
-  if changed { arenaEpochBump() }
   0
 }
 
@@ -5518,4 +5525,11 @@ function checkerForce(k: i32, a: i32, b: i32, c: i32): i32 {
   if k == 0 { return checkNode(a) }
   if assignableExpr(a, b, c) { return 1 }
   0
+}
+
+// Whether `ty` is one string literal type.
+function tyIsBareStrLitTy(ty: i32): boolean {
+  const t = T.tys[ty]
+  if t is TyLit { return t.litKind == "str" }
+  false
 }

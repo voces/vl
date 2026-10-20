@@ -1,4 +1,5 @@
 import { cpCount, hexVal } from "./strutil"
+import { hashMix } from "./hash_mix"
 
 // A lexer for VL, written in VL — the self-hosted scanner the whole pipeline runs on. It
 // scans identifiers, keywords and `@name` labels, integer and real literals (`12`, `3.14`,
@@ -161,8 +162,7 @@ let gInKey: i32[] = []
 let gInVal: string[] = []
 let gInUsed = 0
 // The long-identifier intern table (`lexIdText`): open addressing, a power-of-two size,
-// keyed by source bytes. `gIdAt` is the slot's lexeme start in `gSrc`, -1 while empty.
-let gIdAt: i32[] = []
+// keyed by the lexeme's bytes, a slot empty while its value is "".
 let gIdHash: i32[] = []
 let gIdVal: string[] = []
 let gIdUsed = 0
@@ -474,9 +474,9 @@ function mkTokText(
   { kind: kind, text: text, start: start, line: startLine, col: startCol }
 }
 
-// The lexeme `gSrc[a, b)`. One of at most four bytes is interned for the rest of this lex,
-// so every occurrence of `(`, a newline or a short name shares one string (D2318). A miss on
-// a full table, or a longer lexeme, is a fresh slice.
+// The lexeme `gSrc[a, b)`. One of at most four bytes is interned for the life of the
+// tables, so every occurrence of `(`, a newline or a short name shares one string (D2318).
+// A longer lexeme is a fresh slice.
 function lexText(a: i32, b: i32): string {
   const n = b - a
   if n < 1 || n > 4 { return gSrc.slice(a, b) }
@@ -487,26 +487,38 @@ function lexText(a: i32, b: i32): string {
     i = i + 1
   }
   const mask = gInVal.length - 1
-  let h = (key ^ (key >>> 7) ^ (key >>> 17)) & mask
+  let h = hashMix(key) & mask
+  if h < 0 || h >= gInKey.length { return gSrc.slice(a, b) }
   while gInVal[h].length > 0 {
     if gInKey[h] == key && gInVal[h].length == n { return gInVal[h] }
     h = (h + 1) & mask
   }
   const s = gSrc.slice(a, b)
-  if gInUsed * 2 < mask {
+  if (gInUsed + 1) * 2 > gInVal.length {
+    lexShortGrow()
+    lexShortPlace(key, s)
+  } else {
     gInKey[h] = key
     gInVal[h] = s
     gInUsed = gInUsed + 1
   }
+  lexPinSource()
   s
 }
 
-// Empties the intern table for a new source, sized to it: a slot can hold a slice only of
-// the source being lexed, so an editor's instance never keeps an old file's bytes alive.
-function lexInternReset(srcLen: i32) {
-  let cap = 256
-  if srcLen >= 65536 { cap = 1024 }
-  if srcLen >= 1048576 { cap = 4096 }
+// Store the short lexeme `s`, packed as `key`, in the first empty slot of its run.
+function lexShortPlace(key: i32, s: string) {
+  const mask = gInVal.length - 1
+  let h = hashMix(key) & mask
+  if h < 0 || h >= gInKey.length { return 0 }
+  while gInVal[h].length > 0 { h = (h + 1) & mask }
+  gInKey[h] = key
+  gInVal[h] = s
+  gInUsed = gInUsed + 1
+  0
+}
+
+function lexShortSized(cap: i32) {
   const keys: i32[] = []
   const vals: string[] = []
   while keys.length < cap {
@@ -516,12 +528,49 @@ function lexInternReset(srcLen: i32) {
   gInKey = keys
   gInVal = vals
   gInUsed = 0
-  lexIdTableSized(64)
 }
 
-// The identifier `gSrc[a, b)`, one string per spelling for the rest of this lex, so every
-// later comparison of two occurrences short-circuits on identity instead of walking bytes.
-// A lexeme of four bytes or fewer goes through `lexText`'s table.
+// Doubles the short-lexeme table, re-placing every filled slot by its key.
+function lexShortGrow() {
+  const oldKey = gInKey
+  const oldVal = gInVal
+  lexShortSized(oldVal.length * 2)
+  let i = 0
+  while i < oldVal.length {
+    if oldVal[i].length > 0 { lexShortPlace(oldKey[i], oldVal[i]) }
+    i = i + 1
+  }
+  0
+}
+
+// The intern tables outlive one `tokenize`, so equal names in different modules of one
+// compile share a string too. A slot is a view into the source that first spelled it,
+// so the tables are emptied once the sources they keep alive pass `LEX_PIN_LIMIT` bytes:
+// an editor's instance re-lexing one file per keystroke stays bounded.
+const LEX_PIN_LIMIT = 33554432
+let gPinned = 0
+let gPinnedThis = false
+
+function lexInternReset(srcLen: i32) {
+  gPinnedThis = false
+  if gInVal.length > 0 && gPinned + srcLen <= LEX_PIN_LIMIT { return 0 }
+  lexShortSized(256)
+  lexIdTableSized(64)
+  gPinned = 0
+  0
+}
+
+// Records that a slot now views `gSrc`, counting its bytes once per `tokenize`.
+function lexPinSource() {
+  if gPinnedThis { return 0 }
+  gPinnedThis = true
+  gPinned = gPinned + gSrc.length
+  0
+}
+
+// The identifier `gSrc[a, b)`, one string per spelling for the life of the tables, so
+// every later comparison of two occurrences short-circuits on identity instead of walking
+// bytes. A lexeme of four bytes or fewer goes through `lexText`'s table.
 function lexIdText(a: i32, b: i32): string {
   const n = b - a
   if n <= 4 { return lexText(a, b) }
@@ -532,36 +581,36 @@ function lexIdText(a: i32, b: i32): string {
     i = i + 1
   }
   h = h ^ (h >>> 15)
-  const mask = gIdAt.length - 1
+  const mask = gIdVal.length - 1
   let s = h & mask
-  while gIdAt[s] >= 0 {
-    if gIdHash[s] == h && gIdVal[s].length == n && lexIdSame(gIdAt[s], a, n) {
+  while gIdVal[s].length > 0 {
+    if gIdHash[s] == h && gIdVal[s].length == n && lexIdSame(gIdVal[s], a, n) {
       return gIdVal[s]
     }
     s = (s + 1) & mask
   }
   const text = gSrc.slice(a, b)
-  if (gIdUsed + 1) * 2 > gIdAt.length { lexIdGrow() }
-  lexIdPlace(h, a, text)
+  if (gIdUsed + 1) * 2 > gIdVal.length { lexIdGrow() }
+  lexIdPlace(h, text)
+  lexPinSource()
   text
 }
 
-// Whether `gSrc[x, x + n)` and `gSrc[y, y + n)` hold the same bytes.
-function lexIdSame(x: i32, y: i32, n: i32): boolean {
+// Whether `t` holds the bytes `gSrc[a, a + n)`; the caller has checked `t.length == n`.
+function lexIdSame(t: string, a: i32, n: i32): boolean {
   let i = 0
   while i < n {
-    if gSrc[x + i] != gSrc[y + i] { return false }
+    if t[i] != gSrc[a + i] { return false }
     i = i + 1
   }
   true
 }
 
-// Store `text`, which starts at `a` and hashes to `h`, in the first empty slot of its run.
-function lexIdPlace(h: i32, a: i32, text: string) {
-  const mask = gIdAt.length - 1
+// Store `text`, which hashes to `h`, in the first empty slot of its run.
+function lexIdPlace(h: i32, text: string) {
+  const mask = gIdVal.length - 1
   let s = h & mask
-  while gIdAt[s] >= 0 { s = (s + 1) & mask }
-  gIdAt[s] = a
+  while gIdVal[s].length > 0 { s = (s + 1) & mask }
   gIdHash[s] = h
   gIdVal[s] = text
   gIdUsed = gIdUsed + 1
@@ -569,15 +618,12 @@ function lexIdPlace(h: i32, a: i32, text: string) {
 }
 
 function lexIdTableSized(cap: i32) {
-  const at: i32[] = []
   const hs: i32[] = []
   const vals: string[] = []
-  while at.length < cap {
-    at.push(-1)
+  while hs.length < cap {
     hs.push(0)
     vals.push("")
   }
-  gIdAt = at
   gIdHash = hs
   gIdVal = vals
   gIdUsed = 0
@@ -585,13 +631,12 @@ function lexIdTableSized(cap: i32) {
 
 // Doubles the identifier table, re-placing every filled slot by its stored hash.
 function lexIdGrow() {
-  const oldAt = gIdAt
   const oldHash = gIdHash
   const oldVal = gIdVal
-  lexIdTableSized(oldAt.length * 2)
+  lexIdTableSized(oldVal.length * 2)
   let i = 0
-  while i < oldAt.length {
-    if oldAt[i] >= 0 { lexIdPlace(oldHash[i], oldAt[i], oldVal[i]) }
+  while i < oldVal.length {
+    if oldVal[i].length > 0 { lexIdPlace(oldHash[i], oldVal[i]) }
     i = i + 1
   }
   0

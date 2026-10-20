@@ -90,7 +90,6 @@ import {
 } from "./check_types"
 import {
   sFieldElemNameAt,
-  sFieldIsLitUnion,
   sIsAnonRow,
   structIndexOfTy,
 } from "./emit_atom_kinds"
@@ -98,7 +97,6 @@ import {
   memberPathKeyOf,
   nameIsBareMap,
   placeNarrowKeyOf,
-  pushUniqueAtom,
   unwrapParen,
 } from "./emit_base"
 import { emitFailAt } from "./emit_bytes"
@@ -124,8 +122,9 @@ import {
   capturedRefListSlot,
   cnPostGuard,
   cnWalkFrame,
-  coalMapDefaultMayBeNull,
   coalMapReadForeignDefault,
+  coalesceDefaultNullable,
+  coalesceLitUnionFits,
   exactOperandTyOf,
   exprArray,
   exprF32Array,
@@ -146,7 +145,9 @@ import {
   exprStringArray,
   exprU8Array,
   exprUnion,
+  fnIndexOfNode,
   fnIndexOfSid,
+  fnRetExprOf,
   fnRetRefArrayNameSid,
   fnReturnsClosure,
   forInElemKind,
@@ -171,14 +172,15 @@ import {
   mapShapeOfExpr,
   memReadBoxNames,
   memRecvArmVariantIndex,
+  memberAtomFieldTexts,
   memberUnionFieldNameRead,
+  nulLitAtomTexts,
   objMatchesVariantIdxOmit,
   optChainStructIdxOf,
   preStmtNarrow,
   pushNarrowRep,
   pushNarrowWriteReNarrow,
   refListSlotOfExpr,
-  sharedUnionFieldPlan,
   structIndexOfExpr,
   structIndexOfObj,
   unionNameOfIdentAt,
@@ -216,7 +218,6 @@ import {
 } from "./emit_nullable_rets"
 import {
   paramRefArrayName,
-  sharedFieldArmLitTexts,
   structIdxMatchesVariantIdx,
 } from "./emit_obj_lit_fits"
 import { paramIndexOf } from "./emit_query"
@@ -248,7 +249,6 @@ import {
 import { vkNulNicheOf } from "./emit_sig_tokens"
 import { narrowedNulLitAlias, narrowedValueAtomOf } from "./emit_start_block"
 import {
-  FC_I32,
   LBK_F32_LIST,
   LBK_F64_LIST,
   LBK_I32_LIST,
@@ -281,6 +281,7 @@ import {
   cnVariant,
   emitRootIx,
   fRetKind,
+  fRetLitAtom,
   fRetVoid,
   fitShName,
   fitShRecv,
@@ -458,6 +459,7 @@ export function capNarrowBuild() {
   cnSet = []
   cnGlobReads = Map()
   cnGlobOn = false
+  callResultTextsDepth = 0
   const savedTop = narrowTop
   cnRecording = true
   cnTopFe = Map()
@@ -1209,6 +1211,12 @@ export function litAtomWidenTexts(ix: i32, fnIx: i32) {
   if own.length > 0 { return own }
   const mr = mapReadAtomTexts(ix, fnIx)
   if mr.length > 0 { return mr }
+  // A `??` whose default keeps the niche's atom holds one of its operand's members.
+  const ce = P.nodes[unwrapParen(ix)]
+  if ce is BinExpr && ce.binOp == "??" && coalesceLitUnionFits(ix, fnIx) {
+    const cl = nulLitAtomTexts(ce.binLeft, fnIx)
+    if cl.length > 0 { return cl }
+  }
   const clo = callResultAtomTexts(ix, fnIx)
   if clo.length > 0 { return clo }
   const fld = memberAtomFieldTexts(ix, fnIx)
@@ -1220,7 +1228,17 @@ export function litAtomWidenTexts(ix: i32, fnIx: i32) {
     if d >= 0 {
       const dn = P.nodes[d]
       if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 {
-        return memberAtomFieldTexts(dn.letInit, fnIx)
+        const lf = memberAtomFieldTexts(dn.letInit, fnIx)
+        if lf.length > 0 { return lf }
+        return callResultAtomTexts(dn.letInit, fnIx)
+      }
+    }
+    // A binding of an instance's atom result names the texts that result widens with.
+    const g = if d < 0 { globalLetOfIn(fnIx, e.identName, unwrapParen(ix)) } else { -1 }
+    if g >= 0 {
+      const gn = P.nodes[g]
+      if gn is LetDecl && gn.letType < 0 && gn.letInit >= 0 {
+        return callResultAtomTexts(gn.letInit, -1)
       }
     }
   }
@@ -1240,7 +1258,7 @@ function mapReadAtomTexts(ix: i32, fnIx: i32): string[] {
     const cr = fusedMapReadRecvIx(unwrapParen(e.binLeft))
     if cr < 0 || coalMapReadForeignDefault(cr, e.binRight, fnIx) { return none }
     // A result that can still be null is the niche, never a bare member.
-    if coalMapDefaultMayBeNull(e.binRight, fnIx) { return none }
+    if coalesceDefaultNullable(e.binRight, fnIx) { return none }
     return mapTyValLitUnionTexts(mapRecvTyIn(cr, fnIx))
   }
   const recv = fusedMapReadRecvIx(u)
@@ -1252,41 +1270,33 @@ function mapReadAtomTexts(ix: i32, fnIx: i32): string[] {
 // twin of `cloCallResultLitUnion` and of `exprIsLitAtom`'s named-callee rung, which claim the
 // atom from those same types. A call a specialisation wrote records no type of its own (D2152).
 function callResultAtomTexts(ix: i32, fnIx: i32): string[] {
-  tyLitMemberTexts(callResultAtomTyAt(ix, fnIx, 0))
-}
-
-// The member texts of the atom FIELD a `recv.f` read lands on, from the row's own sidecar. A
-// literal whose checked type is `{f: string}` can share the row a literal-union field minted,
-// so the row, not the read's recorded type, is what names the members (D2151). A field every
-// arm of a struct union stores as an atom names every set its members' rows hold (D5164).
-function memberAtomFieldTexts(ix: i32, fnIx: i32): string[] {
-  const e = P.nodes[unwrapParen(ix)]
-  if e is Member {
-    const vis: i32[] = []
-    const fis: i32[] = []
-    const ux = unwrapParen(ix)
-    if sharedUnionFieldPlan(e.memObj, e.memProp, ux, fnIx, vis, fis) == FC_I32 {
-      const texts: string[] = []
-      let k = 0
-      while k < vis.length {
-        for t in sharedFieldArmLitTexts(vis[k], fis[k]) {
-          pushUniqueAtom(texts, t)
-        }
-        k = k + 1
-      }
-      if texts.length > 0 { return texts }
-    }
-    const si = structIndexOfExpr(e.memObj, fnIx)
-    if si >= 0 {
-      const fi = sFieldIndex(si, e.memProp)
-      if fi >= 0 && sFieldIsLitUnion(si, fi) {
-        return tyLitMemberTexts(sFieldElemTyIxAt(si, fi))
+  const ty = tyLitMemberTexts(callResultAtomTyAt(ix, fnIx, 0))
+  if ty.length > 0 || callResultTextsDepth > 2 { return ty }
+  // An instance's atom result whose returned expression records its generic's hole names no
+  // type, so its texts are the ones that expression widens with in the callee.
+  const c = P.nodes[unwrapParen(ix)]
+  if c is Call && c.callFn >= 0 && P.nodes[c.callFn] is Ident {
+    const t = fnIndexOfNode(c.callFn)
+    if (
+      t >= 0
+      && t < fRetLitAtom.length
+      && fRetLitAtom[t] == 1
+      && fnInPinnedInstance(fnStmts[t])
+    ) {
+      const rx = fnRetExprOf(fnStmts[t])
+      if rx >= 0 {
+        callResultTextsDepth = callResultTextsDepth + 1
+        const rt = litAtomWidenTexts(rx, fnStmts[t])
+        callResultTextsDepth = callResultTextsDepth - 1
+        return rt
       }
     }
   }
-  const none: string[] = []
-  none
+  ty
 }
+
+// How many callee hops `callResultAtomTexts` is inside, so a self-returning call terminates.
+let callResultTextsDepth = 0
 
 // `holeOperandTyOf` where that type is `boolean`, `boolean | null` or a literal union, which
 // share the `i32` rep and so are told apart from it only by the type; -1 otherwise (D2919).
