@@ -51,7 +51,7 @@ import {
 import { nodeArrayElemName } from "./check_emit_queries"
 import { isBoolLitExpr } from "./check_leaf_steps"
 import { canonEmitNameOfTy } from "./check_program"
-import { substTyDeep } from "./check_relate_core"
+import { assignable, substTyDeep } from "./check_relate_core"
 import { isVarTyIxOf } from "./check_list_union"
 import { listDisjointDepth } from "./check_type_shape"
 import { inferRetFnKey } from "./check_side_rows"
@@ -155,6 +155,7 @@ import {
   WhileStmt,
   annTsOf,
   arithRegionSeen,
+  callHasTyArgs,
   elseIfLink,
   externGlobalLinkOfNode,
   funcDeclNodes,
@@ -8134,6 +8135,48 @@ function nameInListLit(
   false
 }
 
+// Whether a row already serves constructor literal `objIx` (recorded type `lt`) at instance
+// `fnIx`: the row it classifies to takes the literal's type at the pins. Another pin's row
+// sharing its wasm shape, `{a: i32}` for `{a: boolean}`, does not (D8240).
+function pinCtorRowServes(objIx: i32, fnIx: i32, lt: i32): boolean {
+  const row = structIndexOfObjCtx(objIx, fnIx)
+  if row < 0 { return false }
+  const rt = rlColAt(sTyIx, row)
+  const st = pinSubstObjLitTy(objIx, fnIx, lt)
+  if rt < 0 || st < 0 { return true }
+  assignable(st, rt)
+}
+
+// The recorded type `lt` of record literal `objIx` with each type-parameter field at its value's
+// pin in instance `fnIx`, or -1 when a field holds a parameter some other way or has no pin.
+function pinSubstObjLitTy(objIx: i32, fnIx: i32, lt: i32): i32 {
+  const o = P.nodes[objIx]
+  if !(o is ObjLit) { return -1 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  for fi in o.objFields {
+    const f = P.nodes[fi]
+    if f is FieldInit {
+      const ft = tyFieldTyOf(lt, f.fiName)
+      if ft >= 0 && ft < T.tys.length {
+        const fty = T.tys[ft]
+        if fty is TyVar {
+          const pin = pinnedValTyOf(f.fiValue, fnIx)
+          if pin < 0 { return -1 }
+          bNames.push(fty.tvName)
+          bTys.push(pin)
+        } else if tyHasTyVar(ft) {
+          return -1
+        }
+      }
+    }
+  }
+  if bNames.length == 0 { return -1 }
+  const st = substTyDeep(lt, bNames, bTys)
+  if st < 0 || tyHasTyVar(st) { return -1 }
+  st
+}
+
 // Interns the row of the record literal at `objIx` at instance `fnIx`'s pins, when a field of
 // its recorded type is a type parameter and every such field's value has a pin.
 function mintPinnedObjLit(objIx: i32, fnIx: i32) {
@@ -8157,7 +8200,7 @@ function mintPinnedObjLit(objIx: i32, fnIx: i32) {
   if pinCtorUnserved {
     if !tyEqSameHoles(lt, pinCtorRet) { return 0 }
     if objLitSigCountIn(pinCtorBody, objLitFieldSig(objIx), 0) != 1 { return 0 }
-    if structIndexOfObjCtx(objIx, fnIx) >= 0 { return 0 }
+    if pinCtorRowServes(objIx, fnIx, lt) { return 0 }
     if objVariantNameCtx(objIx, fnIx) != "" { return 0 }
   }
   // A field at a union holding a type parameter is substituted through the instance's own
@@ -14027,6 +14070,13 @@ export function collectU(stmts: i32[]) {
         if pcf.memProp == "pop" || pcf.memProp == "get" {
           const pun = nulNumScalarUnionName(nodeTyIxOf(ipu))
           if pun != "" { registerValueUnionName(pun) }
+        }
+      }
+      // `Map<K, V>()` may be the only spelling of the unions its value holds (D8260).
+      if pcf is Ident && pcf.identName == "Map" && callHasTyArgs(ipu) {
+        const mct = nodeTyIxOf(ipu)
+        if mct >= 0 && mct < T.tys.length && T.tys[mct] is TyMap {
+          if collectTyReachRegister(stmts, mct, 16, false) < 0 { return -1 }
         }
       }
     }
