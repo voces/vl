@@ -5657,7 +5657,13 @@ function emitIsTestArmTag(body: u8[], isIx: i32, ndv: IsExpr, fnIx: i32) {
 
     if vrecv is Member {
       if memberUnionFieldNameRead(unwrapParen(ndv.isObj), fnIx) != "" {
-        if memIsNarrowed(unwrapParen(ndv.isObj)) {
+        // Only a receiver narrowed to a variant of a box, as `emitMem` asks; a nullable record
+        // narrowed by `!= null` is the record itself (D8000).
+        if (
+          memIsNarrowed(unwrapParen(ndv.isObj))
+          && memNarrowVariantIndex(unwrapParen(ndv.isObj)) >= 0
+          && exprUnion(vrecv.memObj, fnIx)
+        ) {
           if emitNarrowedMem(body, unwrapParen(ndv.isObj), fnIx) < 0 {
             return -1
           }
@@ -23139,6 +23145,13 @@ function emitCallCorePrint(body: u8[], callIx: i32, c: Call, fnIx: i32) {
   }
   const pmk = mapReadScalarBoxKind(c.callArgs[0], fnIx)
   if pmk >= 0 { return emitPrintScalarMapRead(body, c.callArgs[0], pmk, fnIx) }
+  // A read narrowed to `K | null` out of a wider box prints as that niche (D7965).
+  if narrowedNulLitBoxKey(c.callArgs[0], fnIx) != "" {
+    const nbTexts = nulLitMemberTexts(nodeTyIxOf(unwrapParen(c.callArgs[0])))
+    if nbTexts.length > 0 {
+      return emitPrintNulLitUnion(body, c.callArgs[0], nbTexts, fnIx)
+    }
+  }
   // print(literal-union atom): widen it to its member string — a per-member
   // `if id == <id> { print "<name>" }` chain. Asked before `exprString`, which also
   // answers true for an atom-repped global (the softened render says `string` over a
@@ -33385,7 +33398,16 @@ function emitPrintNulLitUnion(
   texts: string[],
   fnIx: i32,
 ) {
-  if emitStashAtomId(body, argIx, fnIx) < 0 { return -1 }
+  // A `K | null` read out of a wider box converts to the niche first (D7965).
+  const nlk = narrowedNulLitBoxKey(argIx, fnIx)
+  if nlk != "" {
+    if emitNarrowedNicheRead(body, argIx, nlk, NICHE_NUL_LIT, fnIx) < 0 {
+      return -1
+    }
+    setStrScrI(body, 0)
+  } else if emitStashAtomId(body, argIx, fnIx) < 0 {
+    return -1
+  }
   pushStrScrI(body, 0)
   fbI32Const(-1)
   fbI32Bin(70) // 0x46 i32.eq
