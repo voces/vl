@@ -229,6 +229,7 @@ import {
   genFnHoleCallInsts,
   genFnHoleCalled,
   genFnHoleInstance,
+  holeLamRetAt,
   holeRetTyOf,
   judgeHoleCallOps,
   substTyDeep,
@@ -313,6 +314,7 @@ import {
   tyPrintsAsRef,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
+  tySame,
   tyToStr,
   tyWideUnionMinted,
 } from "./check_types"
@@ -1802,6 +1804,11 @@ function callFtyPinCstrs(
     const hr = holeRetTyOf(cstrCallee, vNames, vTys)
     if hr >= 0 { retTy = hr }
   }
+  if cfn is Ident {
+    let hd = namedFn
+    if hd < 0 { hd = constLambdaOf(cfn, n.callFn) }
+    retTy = directHoleBodyRet(n, hd, vNames, vTys, retTy)
+  }
   if tpIfFn.length > 0 || tpIfReFn.length > 0 {
     const pinTys: i32[] = []
     let pp = 0
@@ -1812,6 +1819,40 @@ function callFtyPinCstrs(
     validateTpIfJoins(vNames, vTys, pinTys, retTy, ix, cstrCallee)
   }
   retTy
+}
+
+// The result of direct call `n` of un-annotated function `decl` as its body gives it at the bound
+// arguments, as a hole call of it takes (D8161): `half(3)` over `a / 2.0` is `f64`. `retTy` when
+// `decl` declares its result or has no hole parameter, or an argument stays open.
+function directHoleBodyRet(
+  n: Call,
+  decl: i32,
+  vNames: string[],
+  vTys: i32[],
+  retTy: i32,
+): i32 {
+  if decl < 0 || decl >= P.nodes.length { return retTy }
+  const f = P.nodes[decl]
+  if !(f is FuncDecl) || f.fnRet >= 0 || f.fnTyParams.length > 0 {
+    return retTy
+  }
+  let hole = false
+  for pi in f.fnParams {
+    const p = P.nodes[pi]
+    if p is Param && p.parType < 0 { hole = true }
+  }
+  if !hole { return retTy }
+  const vt = nodeTyOf(n.callFn)
+  if vt < 0 || vt >= T.tys.length { return retTy }
+  const vf = T.tys[vt]
+  if !(vf is TyFunc) || !tyHasTyVar(vf.fnRet) { return retTy }
+  const inst = substTyDeep(vt, vNames, vTys)
+  if inst < 0 || tyHasTyVar(inst) { return retTy }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(decl, inst, noN, noT)
+  if r < 0 || tySame(r, retTy) { return retTy }
+  r
 }
 
 // A lambda literal handed to a hole callee is pinned where the call binds that callee: its
