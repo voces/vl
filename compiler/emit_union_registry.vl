@@ -47,12 +47,19 @@ import {
   canonUnionKeyNullAtOfTy,
   canonUnionKeyOfAnnName,
   canonUnionKeyOfName,
+  canonUnionKeyOfText,
   canonUnionKeyOfTy,
+  canonUnionKeyTextOfName,
+  declaredStructUnionMembers,
 } from "./check_nj_join"
 import { primTyIxOfName } from "./check_decl_scan"
+import { nominalNameOfObj } from "./check_fit_rules"
 import { canonUnionMemberTysOf } from "./check_program"
 import { canonUnionKeyAtomOfTy, valueAtomKind } from "./check_ty_rep"
 import {
+  RC_NULLABLE,
+  RC_ROOT,
+  RC_UNION_MEM,
   T,
   TyArray,
   TyErr,
@@ -66,8 +73,20 @@ import {
   TyUnion,
   TyVar,
   cUserTypes,
+  ctxKeepsLitUnion,
+  litUnionAliasNameOfTy,
+  litUnionAliasOfLitTexts,
+  litUnionInlineNameOfTy,
+  mixedLitRunAliasOf,
+  oneStrLitSpelling,
+  structNameOfTy,
   tyIsLitUnionOrLit,
+  tyMembersDistinctRecords,
+  tyNameAtoms,
   tySame,
+  tyToEmitNameAt,
+  tyToNominalNameAt,
+  tyToStr,
 } from "./check_types"
 import {
   atomsHaveValueAtom,
@@ -136,7 +155,12 @@ import {
   tyTopIndexOf,
   unionMemberCount,
 } from "./tyname"
-import { flattenVariantsInto, primNameOf } from "./tyquery"
+import {
+  flattenVariantsInto,
+  intLitUnionBasesOf,
+  isNullTy,
+  primNameOf,
+} from "./tyquery"
 
 // The arena type the narrowing at stack slot `i` binds — see `narrowSlotTy`. Exported for the
 // emitter's narrowed-arm consumers, which ask it of the slot `narrowSlotOf` returned.
@@ -471,6 +495,7 @@ function unionArmsOfSetTy(name: string, s: i32, ty: i32, out: string[]) {
 // the row too. The type key goes to a row with `null` last, as its type's key places it, and
 // only while the key's first row records the same members `null`'s position aside.
 export function unKeyPushOfTy(ty: i32, spelling: string) {
+  softKeyProbeAt("keyPush", spelling, ty)
   const nk = canonUnionKeyOfName(spelling)
   const u = unKey.length
   let k = -1
@@ -517,12 +542,296 @@ export function unionRowOf(name: string): i32 {
   unRowOfSetText(name)
 }
 
+// The softened key text of `ty`: the member sequence of its emit render, literals widened to
+// their scalar and a union alias flattened where its members are, read off the type and never
+// off a rendered string. An integer-literal union over two widths is its widths. "" when `ty`
+// renders as fewer than two atoms or has a part this walk does not split.
+export function softUnionKeyTextOfTy(ty: i32): string {
+  softUnionKeyTextOfTyIn(ty, [])
+}
+
+// `softUnionKeyTextOfTy` with each anonymous record member spelled as the first declaration
+// in `stmts` of its exact shape, as an inferred return's recorded name spells it.
+export function softUnionKeyTextOfTyIn(ty: i32, stmts: i32[]): string {
+  if ty < 0 { return "" }
+  let atoms: string[] = []
+  if !sukAtomsAt(ty, RC_ROOT, true, stmts, atoms) { return "" }
+  if atoms.length < 2 {
+    const widths: string[] = []
+    for b in intLitUnionBasesOf(ty) {
+      widths.push(tyToEmitNameAt(b, RC_UNION_MEM))
+    }
+    if widths.length < 2 { return "" }
+    atoms = widths
+  }
+  const kept: string[] = []
+  for a in atoms {
+    const ex: string[] = []
+    if !sukAliasAtoms(a, ex) { return "" }
+    for e in ex {
+      let dup = false
+      for k in kept {
+        if k == e { dup = true }
+      }
+      if !dup { kept.push(e) }
+    }
+  }
+  if kept.length < 2 { return "" }
+  let out = ""
+  for k in kept {
+    if out != "" { out = out + "|" }
+    out = out + k
+  }
+  out
+}
+
+// The atoms alias atom `a` stands for in a key: its own members where a declared union alias
+// renders as two or more, else `a`. An alias of declared records spells its members by name.
+function sukAliasAtoms(a: string, out: string[]): boolean {
+  const ix = cUserTypes[a] ?? -1
+  if ix >= 0 {
+    const t = T.tys[ix]
+    const ex: string[] = []
+    if t is TyNullable {
+      if !sukAtomsAt(t.nInner, RC_ROOT, false, [], ex) { return false }
+      ex.push("null")
+    } else if t is TyUnion {
+      if declaredStructUnionMembers(a) != "" {
+        if !sukUnionAtoms(ix, t, RC_ROOT, true, [], ex) { return false }
+      } else if !sukAtomsAt(ix, RC_ROOT, false, [], ex) {
+        return false
+      }
+    }
+    if ex.length > 1 {
+      for e in ex { out.push(e) }
+      return true
+    }
+  }
+  out.push(a)
+  true
+}
+
+// The render of `ty` at `ctx` on the face asked for, `tyNameAtoms` set to its width.
+function sukRender(ty: i32, ctx: i32, nominal: boolean): string {
+  if nominal { return tyToNominalNameAt(ty, ctx) }
+  tyToEmitNameAt(ty, ctx)
+}
+
+// Whether every record of `recs` takes a declaration's name in `rev`.
+function sukRevNamesAll(recs: i32[], rev: i32[]): boolean {
+  if rev.length == 0 { return false }
+  for r in recs {
+    if sukRevName(r, rev) == "" { return false }
+  }
+  true
+}
+
+// The declaration in `rev` an anonymous record `ty` has the exact shape of, or "".
+function sukRevName(ty: i32, rev: i32[]): string {
+  if rev.length == 0 || ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  if !(t is TyObj) || structNameOfTy(ty) != "" { return "" }
+  nominalNameOfObj(ty, rev)
+}
+
+// Appends the atoms of `ty`'s emit render at position `ctx`, the parts the render joins at
+// its top level; false when it renders as "" or as a part this walk does not split.
+function sukAtomsAt(
+  ty: i32,
+  ctx: i32,
+  nominal: boolean,
+  rev: i32[],
+  out: string[],
+): boolean {
+  const rn = sukRevName(ty, rev)
+  if rn != "" {
+    out.push(rn)
+    return true
+  }
+  const s = sukRender(ty, ctx, nominal)
+  if s == "" { return false }
+  if tyNameAtoms == 1 {
+    out.push(s)
+    return true
+  }
+  const t = T.tys[ty]
+  if t is TyNullable { return sukNullableAtoms(t, nominal, rev, out) }
+  if t is TyUnion { return sukUnionAtoms(ty, t, ctx, nominal, rev, out) }
+  sukNoKeyOfKind()
+}
+
+// Every Ty kind but a nullable and a union whose render still spells two or more atoms: no
+// softened key, so the caller keys by the name. Fails closed, as a guessed split would mint
+// a key no name produces.
+function sukNoKeyOfKind(): boolean { false }
+
+// The string-literal run of union `ty` as the render spells it: its alias, else each distinct
+// literal quoted. `null` members are skipped.
+function sukLitRunAtoms(ty: i32, out: string[]) {
+  const texts: string[] = []
+  const t = T.tys[ty]
+  if t is TyUnion {
+    for m in t.uMembers {
+      const mt = T.tys[m]
+      if mt is TyLit {
+        let dup = false
+        for x in texts {
+          if x == mt.litText { dup = true }
+        }
+        if !dup { texts.push(mt.litText) }
+      }
+    }
+  }
+  const al = litUnionAliasOfLitTexts(texts)
+  if al != "" {
+    out.push(al)
+    return 0
+  }
+  for x in texts { out.push("\"" + x + "\"") }
+  0
+}
+
+// `sukAtomsAt` over a nullable, as its render keeps a literal-union inner whole.
+function sukNullableAtoms(
+  t: TyNullable,
+  nominal: boolean,
+  rev: i32[],
+  out: string[],
+): boolean {
+  const inner = t.nInner
+  const nal = litUnionAliasNameOfTy(inner)
+  if nal != "" {
+    out.push(nal)
+  } else if litUnionInlineNameOfTy(inner) != "" {
+    sukLitRunAtoms(inner, out)
+  } else if oneStrLitSpelling(inner) != "" {
+    out.push(oneStrLitSpelling(inner))
+  } else if inner >= 0 && T.tys[inner] is TyFunc {
+    const s = sukRender(inner, RC_NULLABLE, nominal)
+    if s == "" { return false }
+    out.push("(" + s + ")")
+  } else if !sukAtomsAt(inner, RC_NULLABLE, nominal, rev, out) {
+    return false
+  }
+  out.push("null")
+  true
+}
+
+// `sukAtomsAt` over a union of two or more parts: each member's atoms, a repeated part once.
+function sukUnionAtoms(
+  ix: i32,
+  t: TyUnion,
+  ctx: i32,
+  nominal: boolean,
+  rev: i32[],
+  out: string[],
+): boolean {
+  const members = t.uMembers
+  if litUnionInlineNameOfTy(ix) != "" {
+    let hasNull = false
+    for m in members { hasNull = hasNull || isNullTy(m) }
+    if hasNull || ctxKeepsLitUnion(ctx) {
+      sukLitRunAtoms(ix, out)
+      if hasNull { out.push("null") }
+      return true
+    }
+  }
+  const recs: i32[] = []
+  for m in members {
+    if !isNullTy(m) { recs.push(m) }
+  }
+  if tyMembersDistinctRecords(recs) && !sukRevNamesAll(recs, rev) {
+    return false
+  }
+  const rgAlias = mixedLitRunAliasOf(members)
+  let rgDone = false
+  const parts: string[] = []
+  const partAtoms: string[] = []
+  for m in members {
+    const mt = T.tys[m]
+    const pa: string[] = []
+    if rgAlias != "" && mt is TyLit {
+      if !rgDone { pa.push(rgAlias) }
+      rgDone = true
+    } else {
+      const al = litUnionAliasNameOfTy(m)
+      if al != "" {
+        pa.push(al)
+      } else if mt is TyFunc {
+        const s = sukRender(m, RC_UNION_MEM | (ctx & RC_NULLABLE), nominal)
+        if s == "" { return false }
+        pa.push("(" + s + ")")
+      } else if (
+        !sukAtomsAt(m, RC_UNION_MEM | (ctx & RC_NULLABLE), nominal, rev, pa)
+      ) {
+        return false
+      }
+    }
+    if pa.length > 0 {
+      let text = ""
+      for a in pa {
+        if text != "" { text = text + "|" }
+        text = text + a
+      }
+      let dup = false
+      for p in parts {
+        if p == text { dup = true }
+      }
+      if !dup {
+        parts.push(text)
+        for a in pa { partAtoms.push(a) }
+      }
+    }
+  }
+  for a in partAtoms { out.push(a) }
+  true
+}
+
 // The first row carrying the union key of member-set spelling `set`, or -1. A spelling that
 // names a declared type is that type's name, not a member set, and finds no row here.
 export function unRowOfSetText(set: string): i32 {
   if set == "" { return -1 }
   if (cUserTypes[set] ?? -1) >= 0 { return -1 }
   unRowOfKeyId(canonUnionKeyOfName(set))
+}
+
+// Armed, the softened key text of `ty` against the key text of `name` at `site`: agree,
+// differ, or none where `ty` has no softened text. Flushed by the registry sweep.
+let sukNotes: string[] = []
+
+export function softKeyProbe(site: i32, name: string, ty: i32) {
+  softKeyProbeAt(unABSiteName(site), name, ty)
+}
+
+// `softKeyProbe` for a caller that offers no type of its own, only the one `name` renders.
+export function softKeyProbeNoTy(
+  site: i32,
+  name: string,
+  ty: i32,
+  stmts: i32[],
+) {
+  softKeyProbeIn("noTy/" + unABSiteName(site), name, ty, stmts)
+}
+
+export function softKeyProbeAt(label: string, name: string, ty: i32) {
+  softKeyProbeIn(label, name, ty, [])
+}
+
+function softKeyProbeIn(label: string, name: string, ty: i32, stmts: i32[]) {
+  if unABOn() == 0 || ty < 0 || name == "" { return 0 }
+  const s = softUnionKeyTextOfTyIn(ty, stmts)
+  const n = canonUnionKeyTextOfName(name)
+  let k = "agree"
+  if s == "" { k = "none" }
+  else if s != n { k = "differ" }
+  const tag = "softKey/" + label + "/" + k
+  sukNotes.push(tag)
+  if k != "agree" {
+    sukNotes.push(
+      tag + " " + name + " :: " + n + " :: " + s + " :: " + tyToStr(ty),
+    )
+  }
+  0
 }
 
 // ── the union registry asked by arena type id — an A/B shadow harness (docs/internals/registry-by-type-id.md)
@@ -705,6 +1014,10 @@ function unionRowOfTyRaw(ty: i32): i32 {
 export function unSiteOnKey(site: i32): boolean {
   site >= 1 && site < UNAB_N && site != 55
 }
+
+// Whether no-type `site`, holding the type its name records, finds the name's row by
+// that type's softened key (`softKeyOrNameKey`) rather than by the name.
+export function unSiteOnSoftKey(site: i32): boolean { site == 44 }
 
 // The ID side's row for `site`: a switched site and harness mode 3 key on `unKey`, anything
 // else on `repCanonId`. Only the A/B seams route through here.
@@ -919,6 +1232,23 @@ export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
   d >= 0
 }
 
+// The key a no-type site finds `name`'s row by when it holds the type `ty` the name
+// records: `ty`'s softened key with records named by their declarations in `stmts`,
+// else the key of `name` where `ty` has none.
+export function softKeyOrNameKey(name: string, ty: i32, stmts: i32[]): i32 {
+  const k = canonUnionKeyOfText(softUnionKeyTextOfTyIn(ty, stmts))
+  if k >= 0 { return k }
+  canonUnionKeyOfName(name)
+}
+
+// `isUNameKeyAB`'s no-type branch asked by key `key`, which the caller derived.
+export function isUKeyAB(site: i32, name: string, key: i32): boolean {
+  let d = -1
+  if key >= 0 { d = unRowOfKeyId(key) }
+  if unABOn() > 0 { unABProbe(site, unRowOfName(name), d, key) }
+  d >= 0
+}
+
 // `unionRowOf(name)`, for a caller that goes on to read the registry by `name` and holds the
 // type `name` renders. Armed, the row that type keys to is tallied against it under
 // `site`; the answer stays the name's until those readers are keyed by type too.
@@ -1106,6 +1436,8 @@ export function unionRegistryABSweep() {
   }
   repShadowAddReason("atomRetry/id-hit", unRetryHit)
   repShadowAddReason("atomRetry/id-miss", unRetryMiss)
+  for l in sukNotes { repShadowBumpReason(l) }
+  sukNotes = []
   unABCnt = []
   unRetryHit = 0
   unRetryMiss = 0
