@@ -9630,6 +9630,9 @@ export function monoStateReset() {
   monoCallFrameSlot = 0 - 1
   monoCellAliasListOk = 0 - 1
   monoCgcGenAliasNames = []
+  monoChoiceBindDecl = []
+  monoChoiceBindFr = []
+  monoChoiceBindTy = []
   monoCurHasLam = false
   monoDestPinOff = false
   monoInstBody = -1
@@ -11869,6 +11872,9 @@ function monoCoerceFnValueName(
       if monoCoerceAliasOfCell(exprIx, ctx, tname) { return 0 }
       // So does an alias of a reassigned `let` deliver that `let` (D9010).
       if monoCoerceAliasOfWrittenLet(exprIx, ctx, tname) { return 0 }
+      // A binding of an `if` choosing open functions delivers that `if` (D9080).
+      const cb = monoCoerceChoiceBinding(exprIx, ctx, tname, expTy)
+      if cb != 0 { return if cb < 0 { -1 } else { 0 } }
       let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
       // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
       if gfe < 0 { gfe = monoReadGenFnFe(exprIx) }
@@ -12070,6 +12076,12 @@ function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
 // chain of copies, when each is un-annotated and never written and the last one's initializer is
 // an `if` naming generic functions in every arm; `[-1, -1]` otherwise.
 function monoIfBindingOf(rd: i32, ctx: i32): i32[] {
+  monoIfBindingWalk(rd, ctx, false)
+}
+
+// `monoIfBindingOf`, also answering for an `if` whose arms name un-annotated functions
+// (`monoArgIsOpenFnChoice`) when `open` is set.
+function monoIfBindingWalk(rd: i32, ctx: i32, open: boolean): i32[] {
   const none: i32[] = [0 - 1, 0 - 1]
   if rd < 0 || !(P.nodes[rd] is Ident) { return none }
   let r = rd
@@ -12089,8 +12101,81 @@ function monoIfBindingOf(rd: i32, ctx: i32): i32[] {
   if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return none }
   const iv = unwrapParen(d.letInit)
   if iv < 0 || !(P.nodes[iv] is IfStmt) { return none }
-  if !monoValueNamesGenerics(iv, lf[0], 0) { return none }
-  lf
+  if monoValueNamesGenerics(iv, lf[0], 0) { return lf }
+  if open && monoArgIsOpenFnChoice(iv, 0) { return lf }
+  none
+}
+
+// Each binding `monoCoerceChoiceBinding` coerces, keyed by declaration and frame, with the function
+// type it is coerced at, for the compile.
+let monoChoiceBindDecl: i32[] = []
+let monoChoiceBindFr: i32[] = []
+let monoChoiceBindTy: string[] = []
+
+// For read `at` (frame `ctx`) of a never-written binding of an `if` choosing open functions,
+// delivered at function type `tname` (`expTy`, or -1): instances each arm there as the inline
+// `if` is, and types binding and read at it. A second delivery at another type is refused, the
+// binding holding one value. Answers 1 once coerced, 0 for no such read, -1 on a failure.
+function monoCoerceChoiceBinding(
+  at: i32,
+  ctx: i32,
+  tname: string,
+  expTy: i32,
+): i32 {
+  const lf = monoIfBindingWalk(at, ctx, true)
+  if lf[1] < 0 { return 0 }
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) { return 0 }
+  let ct = tname
+  let xt = expTy
+  let et = if monoTyConcreteFn(expTy) { expTy } else { nameToTy(tname) }
+  // A delivery that leaves the type open takes the flow table's one pin of the binding.
+  if !monoTyConcreteFn(et) {
+    const pn = monoSlotPinName(lf[1], [], lf[0])
+    if pn != "" {
+      ct = pn
+      xt = -1
+      et = nameToTy(pn)
+    }
+  }
+  const key = if monoTyConcreteFn(et) { tyToStr(et) } else { ct }
+  let k = 0
+  while k < monoChoiceBindDecl.length {
+    if monoChoiceBindDecl[k] == lf[1] && monoChoiceBindFr[k] == lf[0] {
+      if monoChoiceBindTy[k] != key {
+        emitFail(
+          "emitProgram: a binding of an `if` choosing generic functions is delivered at two function types — annotate the binding",
+        )
+        return -1
+      }
+      monoRetypeChoiceRead(d.letInit, at)
+      return 1
+    }
+    k = k + 1
+  }
+  monoChoiceBindDecl.push(lf[1])
+  monoChoiceBindFr.push(lf[0])
+  monoChoiceBindTy.push(key)
+  if monoCoerceFnValueName(d.letInit, ct, lf[0], xt) < 0 { return -1 }
+  const iv = unwrapParen(d.letInit)
+  if monoTyConcreteFn(et) {
+    nodeTyRecord(iv, et)
+    nodeTyRecord(d.letInit, et)
+  } else {
+    monoRetypeIfInit(d.letInit, monoFirstArmGenName(iv, lf[0], 0), at, lf[0])
+  }
+  monoRetypeChoiceRead(d.letInit, at)
+  1
+}
+
+// Records on read `at` the concrete type a choice's initializer `init` holds after coercion, where
+// the checker left the read open.
+function monoRetypeChoiceRead(init: i32, at: i32): i32 {
+  const it = nodeTyIxOf(unwrapParen(init))
+  if !monoTyConcreteFn(it) { return 0 }
+  const rt = nodeTyIxOf(at)
+  if rt < 0 || tyHasTyVar(rt) { nodeTyRecord(at, it) }
+  0
 }
 
 // For call `n` (node `ix`, in frame `ctx`) of an `if` naming generic functions in every arm:
@@ -12160,7 +12245,10 @@ function monoFirstArmGenName(v: i32, ctx: i32, depth: i32): i32 {
     )
   }
   let g = x
-  if !monoNamesDeclaredGeneric(g, ctx) { g = unwrapParen(monoAdapterCallee(x)) }
+  if !monoNamesDeclaredGeneric(g, ctx) {
+    const ac = monoAdapterCallee(x)
+    g = if ac >= 0 { unwrapParen(ac) } else { -1 }
+  }
   if g < 0 || !monoNamesDeclaredGeneric(g, ctx) { return -1 }
   g
 }
@@ -16985,6 +17073,15 @@ function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
   const x = unwrapParen(a)
   if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
   const n = P.nodes[x]
+  // A never-written, un-annotated binding of one is that `if` (D9080).
+  if n is Ident {
+    const d = identDeclOf(x)
+    if d < 0 || d >= P.nodes.length { return false }
+    const dn = P.nodes[d]
+    if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return false }
+    if fnFlowDeclWritten(x) { return false }
+    return monoArgIsOpenFnChoice(dn.letInit, depth + 1)
+  }
   if !(n is IfStmt) || n.ifElse < 0 { return false }
   let open = false
   for arm in [n.ifThen, n.ifElse] {
