@@ -32438,7 +32438,12 @@ export function emitFuncBody(body: u8[], blockIx: i32, fnIx: i32) {
       // Banked after whichever arm lowers it: an implicit return leaves through
       // `emitReturnExit`, so hooking the plain arm alone missed the tail statement.
       const tlAt = body.length
-      if isLast && stmtIsTailValue(stmts[i], fnIx) {
+      if isLast && blockTailIsDead(stmts) {
+        if emitDeadTail(body, stmts, fnIx) < 0 {
+          scopePop()
+          return -1
+        }
+      } else if isLast && stmtIsTailValue(stmts[i], fnIx) {
         // Implicit return: seed the return context + push the value (so a trailing
         // `null` / nullable value boxes or sentinels exactly like `return e`), then
         // terminate the exit.
@@ -32625,7 +32630,9 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32) {
       }
     }
     let rc = 0
-    if !cut {
+    if !cut && blockTailIsDead(stmts) {
+      rc = emitDeadTail(body, stmts, fnIx)
+    } else if !cut {
       preStmtNarrow(stmts[n - 1])
       rc = emitStmtTail(body, stmts[n - 1], fnIx)
     }
@@ -32634,6 +32641,25 @@ function emitStmtsTail(body: u8[], blockIx: i32, fnIx: i32) {
     return rc
   }
   emitFail("emitProgram: function has no block body")
+}
+
+// Whether the last of `stmts` follows a statement that always exits. The checker does not take
+// such a tail as the implicit return, so its value never reaches the result (D1974).
+function blockTailIsDead(stmts: i32[]): boolean {
+  stmts.length > 1 && stmtAlwaysExits(stmts[stmts.length - 2])
+}
+
+// Lowers a dead tail as `unreachable`, keeping the slots its locals own; a nested function
+// declaration still takes the statement path. Returns 0, or -1.
+function emitDeadTail(body: u8[], stmts: i32[], fnIx: i32): i32 {
+  const t = stmts[stmts.length - 1]
+  if P.nodes[t] is FuncDecl {
+    if emitStmtIn(body, stmts, stmts.length - 1, fnIx) < 0 { return -1 }
+  } else {
+    cursorAdvance(cursorSlotsUnder(t))
+  }
+  fbUnreachable() // 0x00 — the predecessor exited
+  0
 }
 
 // Lower the single statement at `stmtIx` in TAIL position. A bare tail value becomes
