@@ -186,8 +186,12 @@ import {
   LBK_STR_LIST,
   VKind,
   anonLeafParamMoved,
+  cboxCellNames,
+  emitCurFnIx,
   emitPhaseReached,
   fnMvBase,
+  fnParent,
+  fnStmtsIndexOf,
   localIsRef,
   mvValsOutBase,
   sFieldCount,
@@ -293,22 +297,50 @@ export function asgValueIsFunc(asgIx: i32): boolean {
   vt >= 0 && vt < T.tys.length && T.tys[vt] is TyFunc
 }
 
-// Whether the assignment at `asgIx` writes a field or an element, the targets `spillTail`
-// turns into a store of a spilled value followed by a read of it. A bare `null`, a map and a
-// function value are not: an inferred return of theirs has no rep the tail can yield (D2496).
+// Whether `spillTail` turns the field or element write at `asgIx` into a store and a read of
+// the value, or a fresh `null` for a bare one. Declined: a nullable map or function value (no
+// inferred-return rep, D2498), a write to a captured cell (boxed after `spillTail`), and a
+// `null` at a lambda's or nested function's tail, whose `null` result does not lower.
 export function assignTargetSpills(asgIx: i32): boolean {
   const a = P.nodes[asgIx]
   if !(a is BinExpr) { return false }
   if a.binOp != "=" { return false }
   const v = unwrapParen(a.binRight)
-  if v < 0 || P.nodes[v] is NullLit { return false }
+  if v < 0 { return false }
   const t = unwrapParen(a.binLeft)
   if t < 0 { return false }
   if !(P.nodes[t] is Member || P.nodes[t] is Index) { return false }
   const vt = nodeTyIxOf(asgIx)
-  if vt < 0 { return false }
+  if P.nodes[v] is NullLit {
+    return !asgTargetIsCell(t) && !asgFrameIsClosure()
+  }
+  if vt < 0 || vt >= T.tys.length { return false }
+  if T.tys[vt] is TyMap { return !asgTargetIsCell(t) }
   const nt = T.tys[nonNullTy(vt)]
   !(nt is TyMap || nt is TyFunc)
+}
+
+// Whether the write target `t` is a captured binding's cell, `cell[0]`.
+function asgTargetIsCell(t: i32): boolean {
+  const tn = P.nodes[t]
+  if !(tn is Index) { return false }
+  const cell = P.nodes[tn.idxArr]
+  if !(cell is Ident) { return false }
+  (cboxCellNames[cell.identName] ?? 0) == 1
+}
+
+// Whether the function a tail is classified in is a lifted lambda or a nested function: the
+// one `computeVoidFns` stages, else the one being lowered; false when neither is set.
+function asgFrameIsClosure(): boolean {
+  let f = tailSelfFnIx
+  if f < 0 { f = emitCurFnIx }
+  if f < 0 || f >= P.nodes.length { return false }
+  const fn = P.nodes[f]
+  if !(fn is FuncDecl) { return false }
+  const nm = fn.fnName
+  if nm.length >= 8 && nm.slice(0, 8) == "__lambda" { return true }
+  const pos = fnStmtsIndexOf(f)
+  pos >= 0 && pos < fnParent.length && fnParent[pos] >= 0
 }
 
 // The function `computeVoidFns` is classifying, or -1: its own call in tail position yields
