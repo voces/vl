@@ -457,8 +457,12 @@ import {
 } from "./check_union_mint"
 import { isWideLitJoin, wideLitTyIxs } from "./check_wide_lits"
 import {
+  CW_FR_UNKNOWN,
+  covarRootFrame,
   cwCalleeDeclOf,
   cwFnValueDeclOf,
+  cwFnValueTargets,
+  cwFramedNode,
   cwPeel,
   fnDeclIx,
 } from "./check_write_scan"
@@ -4061,27 +4065,117 @@ export function holeFnArgRetAt(
 // The closed result of the un-annotated function argument `a` names, called at the closed
 // parameter types `pts`; -1 when `a` names none or its body's result stays open.
 export function holeFnArgRetAtParams(a: i32, pts: i32[]): i32 {
-  const d = holeFnArgDecl(a)
-  if d < 0 { return -1 }
+  const ds = holeFnArgDecls(a)
+  if ds.length == 0 { return -1 }
   for pt in pts {
     if tyHasTyVar(pt) { return -1 }
   }
   const noN: string[] = []
   const noT: i32[] = []
-  const r = holeLamRetAt(d, mkFuncTy(pts, TY_I32), noN, noT)
-  if r < 0 || tyHasTyVar(r) { return -1 }
-  r
+  let r0 = -1
+  for d in ds {
+    const r = holeLamRetAt(d, mkFuncTy(pts, TY_I32), noN, noT)
+    if r < 0 || tyHasTyVar(r) || (r0 >= 0 && !tySame(r, r0)) { return -1 }
+    r0 = r
+  }
+  r0
 }
 
-// `ty` with its own type variable read from `hN`/`hT`, else unchanged. Not `substTyDeep`, which
-// pins the hole it substitutes and so re-asks the argument at the result's type.
+// The un-annotated functions argument `a` may hold: the one it names, or each a re-pointed `let`
+// it reads may be (D9001); [] when one of them is not such a function or the set is not known.
+export function holeFnArgDecls(a: i32): i32[] {
+  const d = holeFnArgDecl(a)
+  if d >= 0 { return [d] }
+  const ix = parenPeelIx(a)
+  if ix < 0 || ix >= P.nodes.length || !cwFramedNode(ix) { return [] }
+  const n = P.nodes[ix]
+  if !(n is Ident) { return [] }
+  const fr = covarRootFrame(ix)
+  if fr == CW_FR_UNKNOWN { return [] }
+  const ts = cwFnValueTargets(n.identName, fr)
+  for t in ts {
+    const f = P.nodes[t]
+    if !directHoleDecl(t) || !(f is FuncDecl) || f.fnTyParams.length > 0 {
+      return []
+    }
+  }
+  ts
+}
+
+// `ty` with each type variable it holds read from `hN`/`hT`, through lists, nullables, records,
+// maps, functions and unions (D9000); a part with nothing bound keeps its index. Not
+// `substTyDeep`, which pins the hole it substitutes and so re-asks the argument at the result's type.
 function holeFnRetSubst(ty: i32, hN: string[], hT: i32[]): i32 {
-  if ty < 0 || ty >= T.tys.length { return ty }
+  holeFnRetSubstAt(ty, hN, hT, 0)
+}
+
+function holeFnRetSubstAt(ty: i32, hN: string[], hT: i32[], depth: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || depth > 16 { return ty }
   const t = T.tys[ty]
-  if !(t is TyVar) { return ty }
-  const b = bindOf(hN, hT, t.tvName)
-  if b < 0 { return ty }
-  b
+  if t is TyVar {
+    const b = bindOf(hN, hT, t.tvName)
+    if b < 0 { return ty }
+    return b
+  }
+  if t is TyArray {
+    const e = holeFnRetSubstAt(t.aElem, hN, hT, depth + 1)
+    if e == t.aElem { return ty }
+    if t.aRead == 1 { return mkArrayViewTy(e) }
+    return mkArrayTy(e)
+  }
+  if t is TyNullable {
+    const n = holeFnRetSubstAt(t.nInner, hN, hT, depth + 1)
+    if n == t.nInner { return ty }
+    return mkNullableTy(nullableFlatInner(n))
+  }
+  if t is TyMap {
+    const k = holeFnRetSubstAt(t.mKey, hN, hT, depth + 1)
+    const v = holeFnRetSubstAt(t.mVal, hN, hT, depth + 1)
+    if k == t.mKey && v == t.mVal { return ty }
+    return mkMapTy(k, v, t.mSet)
+  }
+  if t is TyObj {
+    const fs: i32[] = []
+    let changed = false
+    for f in t.objFieldTypes {
+      const f2 = holeFnRetSubstAt(f, hN, hT, depth + 1)
+      if f2 != f { changed = true }
+      fs.push(f2)
+    }
+    if !changed { return ty }
+    const nn: string[] = []
+    for nm in t.objFieldNames { nn.push(nm) }
+    return mkObjTy(nn, fs)
+  }
+  if t is TyFunc {
+    const ps: i32[] = []
+    let changed = false
+    for p in t.fnParamTypes {
+      const p2 = holeFnRetSubstAt(p, hN, hT, depth + 1)
+      if p2 != p { changed = true }
+      ps.push(p2)
+    }
+    const r = holeFnRetSubstAt(t.fnRet, hN, hT, depth + 1)
+    if !changed && r == t.fnRet { return ty }
+    return mkFuncTy(ps, r)
+  }
+  if t is TyUnion {
+    const ms: i32[] = []
+    let changed = false
+    for m in t.uMembers {
+      const m2 = holeFnRetSubstAt(m, hN, hT, depth + 1)
+      if m2 != m { changed = true }
+      ms.push(m2)
+    }
+    if !changed { return ty }
+    return substUnionRebuild(ty, t.uMembers, ms)
+  }
+  // A primitive, literal or error holds no type variable; a negation is left as written.
+  if t is TyPrim { return ty }
+  if t is TyLit { return ty }
+  if t is TyErr { return ty }
+  if t is TyNeg { return ty }
+  ty
 }
 
 // The un-annotated function or lambda that the name argument `a` reads, with no type parameters;
