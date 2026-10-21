@@ -15105,7 +15105,10 @@ function monoCoerceListCbArg(n: Call, ctx: i32): i32 {
     return 0
   }
   const a = n.callArgs[0]
-  if !(P.nodes[unwrapParen(a)] is Ident) { return 0 }
+  const ax = unwrapParen(a)
+  // An `if` choosing a function per arm is instanced arm by arm (D9072).
+  const choice = ax >= 0 && P.nodes[ax] is IfStmt
+  if ax < 0 || (!(P.nodes[ax] is Ident) && !choice) { return 0 }
   // Inside a generic instance the receiver is read at that instance's binding.
   const rt = monoExactPinTyOf(nodeTyIxOf(m.memObj), ctx)
   if rt < 0 || rt >= T.tys.length { return 0 }
@@ -15118,7 +15121,13 @@ function monoCoerceListCbArg(n: Call, ctx: i32): i32 {
   const ft = mkFuncTy(qs, r)
   const fs = monoPinAnnSpelling(ft)
   if fs == "" { return 0 }
-  monoCoerceFnValueName(a, fs, ctx, ft)
+  if monoCoerceFnValueName(a, fs, ctx, ft) < 0 { return -1 }
+  // The choice's own type is what its closure value is built and called at.
+  if choice && tyHasTyVar(nodeTyIxOf(ax)) {
+    nodeTyRecord(ax, ft)
+    nodeTyRecord(a, ft)
+  }
+  0
 }
 
 // The annotation node the callee `Ident` at `callee` is declared with, as a parameter or a local
@@ -15391,6 +15400,7 @@ function monoCallGenFnToTyParamArrow(
               }
               if monoWrittenGenLetFrame(ax, ctx)[1] >= 0 { return true }
             }
+            if monoArgIsOpenFnChoice(ax, 0) { return true }
           }
         }
         // A list of functions riding the type parameters, handed a literal of generics (D3913).
@@ -16309,6 +16319,27 @@ function monoArgIsOpenFnValue(a: i32): boolean {
     return false
   }
   tyHasTyVar(nodeTyIxOf(x))
+}
+
+// Whether argument `a` is an `if` whose arms each name a function, one of them generic or
+// un-annotated, so it takes the type the value arguments bind as either function would (D9005).
+function monoArgIsOpenFnChoice(a: i32, depth: i32): boolean {
+  const x = unwrapParen(a)
+  if x < 0 || depth > MONO_ALIAS_CHAIN_MAX { return false }
+  const n = P.nodes[x]
+  if !(n is IfStmt) || n.ifElse < 0 { return false }
+  let open = false
+  for arm in [n.ifThen, n.ifElse] {
+    if !monoArmEndsNever(arm) {
+      const tv = ifArmValueExpr(arm)
+      const v = unwrapParen(if tv >= 0 { tv } else { arm })
+      if v < 0 { return false }
+      if monoCalleeIsGeneric(v) || monoArgIsOpenFnValue(v) { open = true }
+      else if monoArgIsOpenFnChoice(v, depth + 1) { open = true }
+      else if !(P.nodes[v] is Ident) || fnIndexOfNode(v) < 0 { return false }
+    }
+  }
+  open
 }
 
 // Whether flow pin `t` is a list whose element is an inference hole, as `[]` pins.
@@ -17312,6 +17343,7 @@ function monoPinTyParamComposite(
     if (
       monoCalleeIsGeneric(unwrapParen(args[i]))
       || monoArgIsOpenFnValue(args[i])
+      || monoArgIsOpenFnChoice(args[i], 0)
     ) {
       if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
         monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV)
