@@ -391,8 +391,20 @@ made. Both callers go on to read the registry by the spelling they return. An id
 skips the `unRowOfCanon` fallback that recovers the row's own name. The switch waits until those
 readers key by type too.
 
+Then the fourth slice (L6 log, 2026-10-20). Seven `registerValueUnionName` callers that hold the
+type they rendered the name from go through `registerValueUnionNameAB` (sites 54–60), and six
+register by that type: a code-16 field (54), an array literal's, a `.pop`/`.get`'s, a `??`
+if-operand's and a `?.`'s nullable scalar (56–59), and a map arm's value union (60). No module
+changes. Site 55, `registerInlineUnionGo`'s value union, tallies only. Its type keeps what the
+name's render drops: `i32|f64` arrives with `1 | 2 | f64`, `i32|null` with `N2 | null`, and
+`i32|string|boolean` with `U | boolean`. Switched, it changed 12 modules' codegen and broke
+`is` over a numeric literal union. It switches once a type key at the name's grain exists.
+
 Left:
 
+- Site 55, behind the softened type key.
+- `registerValueUnionName`'s seven plain callers: two in `emit_collect.vl` that hold only a
+  spelling, four in `emit_shape_intern.vl` and one in `emit_sections.vl`.
 - `annParamKindTy`, behind the twin-softened list row.
 - Sites 52 and 53 answering by type, once their downstream readers do.
 - The `isUName` / `unionRowOf` callers that hold no type.
