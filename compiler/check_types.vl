@@ -1458,69 +1458,6 @@ export function tyIsEmitRepresentable(ix: i32): boolean {
   false
 }
 
-// Whether `ix`'s emitter-classifiable name is exactly `string` (`tyToEmitName(ix) ==
-// "string"`), decided structurally. Only three arms can spell a bare `string`: the `string`
-// prim, a softened string literal, and a union whose parts all render `string` (the render
-// dedups them to one part). Every other arm renders a composite or a declared alias name.
-function tyEmitNameIsString(ix: i32): boolean {
-  if ix < 0 { return false }
-  const t = T.tys[ix]
-  match t {
-    TyPrim => t.primName == "string"
-    TyLit => t.litKind == "str"
-    TyUnion => {
-      const members = t.uMembers
-      if members.length == 0 { return false }
-      // Mirrors `tyToNameGo`'s union arm: the flattened-alias regroup and the per-member
-      // litunion-alias lookup can substitute a declared alias name for a literal run, and a
-      // name that isn't `string` makes this predicate's answer false — dual-written
-      // deliberately, since `tyToEmitName(ix) == "string"` is a contract only if both move together.
-      const rgTexts: string[] = []
-      let rgNonLit = false
-      let rg = 0
-      while rg < members.length {
-        const rm = T.tys[members[rg]]
-        if rm is TyLit {
-          if rm.litKind == "str" { rgTexts.push(rm.litText) }
-        } else {
-          let rmNull = false
-          if rm is TyPrim {
-            if rm.primName == "null" { rmNull = true }
-          }
-          if !rmNull { rgNonLit = true }
-        }
-        rg = rg + 1
-      }
-      let rgAlias = ""
-      if rgNonLit && rgTexts.length >= 2 {
-        rgAlias = litUnionAliasOfLitTexts(rgTexts)
-      }
-      if rgAlias != "" && rgAlias != "string" { return false }
-      let i = 0
-      while i < members.length {
-        const rgm = T.tys[members[i]]
-        let skip = false
-        if rgAlias != "" && rgm is TyLit { skip = true }
-        if !skip {
-          // A closure member renders parenthesized (`(()=>i32)`) — never bare.
-          if rgm is TyFunc { return false }
-          // A member that is a registered litunion alias contributes its name.
-          const al = litUnionAliasNameOfTy(members[i])
-          if al != "" {
-            if al != "string" { return false }
-          } else if !tyEmitNameIsString(members[i]) {
-            return false
-          }
-        }
-        i = i + 1
-      }
-      true
-    }
-    // Each of these renders a composite or a declared alias name, never a bare `string`.
-    TyFunc | TyObj | TyNullable | TyArray | TyMap | TyNeg | TyVar | TyErr => false
-  }
-}
-
 // The render-context vocabulary — the `ctx` half of the one agreed emit renderer
 // (`renderEmit(ty, ctx)`). A parameter at all because the policy is not global: a litunion
 // alias softens in a direct union but is preserved in a closure result, map value, array
@@ -2122,60 +2059,6 @@ export function structNameOfTy(ty: i32): string {
   const i = cStructFirstPos[ty]
   if i < 0 || i >= cStructNames.length { return "" }
   cStructNames[i]
-}
-
-// Whether `ty` holds a record whose emit render two differently-named declared records share,
-// so the render alone cannot name the declaration. `skipTop` exempts `ty` itself, for a caller
-// that names it by its declaration. Depth-bounded; false at the floor.
-export function tyHoldsSharedRecordRender(
-  ty: i32,
-  skipTop: boolean,
-  depth: i32,
-): boolean {
-  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
-  const t = T.tys[ty]
-  match t {
-    TyObj => {
-      if !skipTop {
-        const r = tyToEmitName(ty)
-        let named = ""
-        let i = 0
-        while i < cStructTyIxs.length {
-          if tyToEmitName(cStructTyIxs[i]) == r {
-            if named != "" && named != cStructNames[i] { return true }
-            named = cStructNames[i]
-          }
-          i = i + 1
-        }
-      }
-      for ft in t.objFieldTypes {
-        if tyHoldsSharedRecordRender(ft, false, depth - 1) { return true }
-      }
-    }
-    TyArray => {
-      return tyHoldsSharedRecordRender(t.aElem, false, depth - 1)
-    }
-    TyNullable => {
-      return tyHoldsSharedRecordRender(t.nInner, false, depth - 1)
-    }
-    TyMap => {
-      return tyHoldsSharedRecordRender(t.mKey, false, depth - 1)
-        || tyHoldsSharedRecordRender(t.mVal, false, depth - 1)
-    }
-    TyUnion => {
-      for m in t.uMembers {
-        if tyHoldsSharedRecordRender(m, false, depth - 1) { return true }
-      }
-    }
-    TyFunc => {
-      for pt in t.fnParamTypes {
-        if tyHoldsSharedRecordRender(pt, false, depth - 1) { return true }
-      }
-      return tyHoldsSharedRecordRender(t.fnRet, false, depth - 1)
-    }
-    TyPrim | TyErr | TyLit | TyNeg | TyVar => {}
-  }
-  false
 }
 
 // The declared alias name of declared-union arena index `ty` (`type U = A | B` → "U"), or

@@ -843,8 +843,9 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
   `VL_COMPILE_CACHE_MAX_MB` and `VL_COMPILE_CACHE_VERIFY=1` (exit 71 on a mismatch) as above.
   Entries live in `<cache dir>/compile/` (`<manifest key>.m`, `<result key>.r`), not
   `compiles/`. The host build id is `build.rs`'s `$VL_HOST_BUILD_ID`.
-- Actions: `vl build`, and each pooled `vl test` file. Not yet `vl run` or `vl check`.
-- Only the guest's emitted bytes are stored, and only for a compile that succeeded and whose
+- Actions: `vl build`, each pooled `vl test` file, and each whole `vl check` invocation (see
+  below). Not yet `vl run`.
+- For `vl build` and `vl test`, only the guest's emitted bytes are stored, and only for a compile that succeeded and whose
   module the engine validates. A failed compile is recomputed every time, so no printed text
   is replayed; that is the conservative half of "the exact stdout and stderr text".
 - Staged values go into the manifest key rather than being replayed: the entry path, the name
@@ -859,10 +860,35 @@ sunpa's unless stated, and anything not yet measured is marked as an estimate.
   whose host reads the compiler instance after the compile (the `heapWindowRead` checks under
   `--low-memory-unused` or `--import-memory` without a heap window) bypasses; `wasm-opt`
   is keyed by path and file hash, without a `--version` spawn.
-- Left for default-on: `vl run`/`vl check` actions; replayed text for failed compiles; the
+- Left for default-on: a `vl run` action; replayed text for failed compiles; the
   verify-sample schedule (`sample:20`); gate 4 (`VL_NO_COMPILE_CACHE=1` in `gate.sh` and CI);
   the matrix rows for each seed rung, `$VL_STD`, `BINARYEN_*`, a swapped `wasm-opt` and the
   host id; lookups before the pool is sized (§4.4); the trial week.
+
+**The `check` action (opt-in, with S1).** One action is one `vl check` invocation, whatever
+its paths: the report is whole-run (one summary, pooled roots folded in by the parent), so it
+does not split per path. `check_cached` in `main.rs`.
+- Key: the seed's hash, the argv the guest is given with the synthetic `--color=` appended
+  (so every `--budget`, `--budget-why`, `--findings`, `--severity`, `--json`, `--codegen`,
+  `--fix` spelling is keyed), the VL root, the cwd, the host build id and every keyed `VL_*`.
+- Transcript: every module read, root query and directory listing (`CMD_LIST_DIR` is served
+  through `read_module_key` under a `\0dir:` key), from the pump AND its pool workers on other
+  threads (`Action::process_wide`), kept as a sorted set. `std:` is read through the same reader,
+  so a std edit misses; `.git` reads behind `--budget-why` are module reads too.
+- Result: the exit code and every printed line in order, tagged stdout or stderr; a hit replays
+  them and exits with that code. While the cache is active the run's output is buffered and
+  printed at the end. A failed check is stored like a clean one: its text is the result.
+- Never stored: a run that issued `CMD_WRITE_FILE` (`--fix` that changed something,
+  `--write-baseline`) or `CMD_READ_STDIN`. A `--fix` run that writes nothing is stored, and by
+  the transcript argument a run that hits would have written nothing either.
+- Bypass: `VL_CHECK_STATS` (read off the instances after the run) and `VL_CHECK_KEEP_MODULES`
+  (writes side files), besides `VL_FUEL`, `VL_PROFILE*` and `VL_FAULT_INJECT`. A host-side
+  note printed while answering a read (a std module not found) is printed again by the lookup.
+- Measured on a copy of diderven (330 `.vl` files) on 2026-10-21, load 13–22 on 24 threads,
+  five interleaved pairs: `vl check src` cache off 5.0–7.5 s wall, 10.3–12.0 s user; a miss
+  5.1–6.1 s wall, 10.4–11.5 s user (no measurable miss cost); a hit 0.01 s wall, 0.00–0.01 s
+  user, 12 MB RSS against 637 MB. `vl check --fix src/game.vl`: 1.1–1.4 s cold, 0.01 s hit.
+  A 687-read transcript, a 9 KB result. Any edit is a full cold run: there is no per-module reuse.
 
 **S2 as built (opt-in, with S1).** A `vl build -O`/`-O3` is two actions: S1's compile, then
 the chain as action kind `opt` (`opt_cache_action`, `main.rs`), traced as `-O hit`, `-O miss`, ….
