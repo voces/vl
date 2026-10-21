@@ -43,7 +43,9 @@ const FIXTURES: [string, Want][] = [
   ["fresh-argument-stored", "kept"],
   ["fresh-argument-held", "output"],
 ];
-const RUNGS = ["-O", "-O3"];
+// The step runs before the rung's binaryen passes and writes the same dump at both, so only
+// `melts`, whose count is read after those passes, is graded at `-O3` as well.
+const rungsOf = (want: Want) => want === "melts" ? ["-O", "-O3"] : ["-O"];
 
 // `struct.new` sites in function bodies: a global's initializer runs once and is not counted.
 const allocations = (wat: string): number => {
@@ -103,7 +105,7 @@ for (const [fx, want] of FIXTURES) {
               } rc=${r0.code}`,
           );
         }
-        for (const rung of RUNGS) {
+        for (const rung of rungsOf(want)) {
           const dump = `${tmp}/step${rung}.wasm`;
           const built = async (step: boolean) => {
             const out = `${tmp}/m${rung}${step ? "" : "-off"}.wasm`;
