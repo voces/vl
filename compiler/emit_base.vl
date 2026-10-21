@@ -19,7 +19,18 @@ import {
 import { declAnnRawTyName } from "./check_gen_alias_anns"
 import { litUnionPreserve, partIsStrLitSet } from "./check_lit_union_spell"
 import { inferRetNameOf } from "./check_infer_ret"
-import { T, TyArray, TyFunc, TyMap, TyNullable, TyPrim } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyMap,
+  TyNullable,
+  TyObj,
+  TyPrim,
+  TyUnion,
+  litUnionAliasNameOfTy,
+  tyIsLitUnion,
+} from "./check_types"
 import { sidArrGet, sidArrPut, sidLookup, sidOf, sidOfNode } from "./symbols"
 // ── the type-name grammars this file calls, homed in `tyname.vl` ──
 // A leaf with zero imports; this file binds them for its own calls and republishes
@@ -50,7 +61,6 @@ import {
   nameIsParenSpanEnds,
   nameIsQuotedLeaf,
   nameIsShapeOpen,
-  nameIsSpaceFree,
   peelGroupParens,
   spanEqAt,
   splitUnionAtoms,
@@ -3559,73 +3569,56 @@ export function shapeInnerFieldSplit(
   }
   0
 }
-// True if `name` is a bare canonical struct shape name — a `{…}` group that is not a map
-// (`{[`), carries no top-level arrow, and is space-free. The space test is load-bearing: a
-// spaced obj render (`{f: () -> i32 | boolean}`) is not an `sNames` key, so any space marks a
-// non-canonical name and rejects it.
-function canonBareShapeName(name: string) {
-  // The inline-shape endpoint span at its home. The three lines this replaces (`length < 2`,
-  // the `{`/`}` endpoint pair, and the `name[1] == '['` map reject) are `nameIsShapeSpanEnds`
-  // character for character, on every input rather than on every input tried.
-  if !nameIsShapeSpanEnds(name) { return false }
-  if annArrowAt(name) >= 0 { return false }
-  // The space-free assertion at its home (`tyname.nameIsSpaceFree`) — the rule this function's header calls "the load-bearing half", named once for the tree.
-  nameIsSpaceFree(name)
+// Whether record type `ty` has a field, at any depth through record fields, whose slot is a
+// union box or a nullable: a `TyUnion` other than a literal-union alias, or a `TyNullable`.
+// A function-typed field is skipped, since its `|` belongs to the result. False for a non-record.
+export function tyIsStructWithUnionField(ty: i32): boolean {
+  structUnionFieldAt(ty, 16)
 }
-// True if `name` is a bare canonical struct shape (not a map) with at least one field whose
-// type is a top-level union — `{f:boolean|{w:i32}}`. Such a struct has a boxed field slot (a
-// `(ref $uBox)`) a body `ObjLit` built from bare literals does not naturally produce.
-// `synthRetAnnots` pins an anonymous lambda's `fnRet` to it so the body's boxing matches; skips a closure field (`=>`), whose `|` binds the result, not the field.
-export function nameIsStructWithUnionField(name: string) {
-  // CANONICAL only, and not a map / closure — `canonBareShapeName`, the gate this
-  // function and its two siblings each spelled out.
-  if !canonBareShapeName(name) { return false }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  // The group-interior cut at its home (`tyname.groupInnerOf`) — the gate above is the
-  // guard, and `canonBareShapeName` opens with `nameIsShapeSpanEnds`, so the home's bound is
-  // already discharged here.
-  shapeInnerFieldSplit(groupInnerOf(name), fnames, ftexts)
+// Whether `ty` is a list whose element is such a record (`{f:{f:f64}|boolean}[]`).
+export function tyIsStructListWithUnionField(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = T.tys[ty]
+  if t is TyArray { return structUnionFieldAt(t.aElem, 16) }
+  false
+}
+
+function structUnionFieldAt(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return false }
+  const ftys = t.objFieldTypes
   let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] != "" {
-      const ftype = ftexts[fi]
-      // A CLOSURE field (top-level `=>`) binds any `|` to its RESULT — skip it. Only a field
-      // type that is itself a top-level UNION (`|` at depth 0) is a boxed field slot. The
-      // depth-0 bar scan is the checker's home, the same walk `nullablePartOf` asks.
-      if annArrowAt(ftype) < 0 {
-        if tyTopIndexOf(ftype, '|', 0, 0) >= 0 { return true }
-        // A nested bare-shape field (`{f:{f:i32|string}}`): the boxed slot may sit one level down —
-        // recurse, so the `synthRetAnnots` pin also fires for a lambda whose nested literal field
-        // adopted a union-field shape. No endpoint pre-filter needed: the recursion's own first line
-        // is `canonBareShapeName(ftype)`, which already rejects on `length < 2` and the `{`/`}` endpoint pair, so a guard here would cost a call on a field about to be rejected anyway.
-        if nameIsStructWithUnionField(ftype) { return true }
+  while fi < ftys.length {
+    const f = ftys[fi]
+    if f >= 0 {
+      const ft = T.tys[f]
+      if ft is TyNullable { return true }
+      if ft is TyUnion {
+        if litUnionAliasNameOfTy(f) == "" { return true }
       }
+      if structUnionFieldAt(f, depth - 1) { return true }
     }
     fi = fi + 1
   }
   false
 }
-// True if `name` is a bare canonical struct shape with at least one field whose type is a
-// litunion alias (`{f:K0}`), at any nesting depth. Such a field slot is the litunion's i32
-// atom, which a body `ObjLit` built from a bare string literal does not naturally produce
-// (it self-infers `{f:string}`, a twin struct at a different rep) — the litunion-atom sibling of `nameIsStructWithUnionField`, whose pin a lambda with no threaded annotation otherwise misses, trapping at the narrowed call.
-export function nameIsStructWithLitUnionField(name: string) {
-  if !canonBareShapeName(name) { return false }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  // The group-interior cut at its home (`tyname.groupInnerOf`), same guard as the sibling.
-  shapeInnerFieldSplit(groupInnerOf(name), fnames, ftexts)
+// Whether record type `ty` has a field, at any depth through record fields, whose type is a
+// string literal union (`{f:K0}`). Its slot is the i32 atom, which a body `ObjLit` built from
+// a bare string literal does not produce. False for a non-record.
+export function tyIsStructWithLitUnionField(ty: i32): boolean {
+  structLitUnionFieldAt(ty, 16)
+}
+
+function structLitUnionFieldAt(ty: i32, depth: i32): boolean {
+  if ty < 0 || depth <= 0 { return false }
+  const t = T.tys[ty]
+  if !(t is TyObj) { return false }
+  const ftys = t.objFieldTypes
   let fi = 0
-  while fi < fnames.length {
-    if fnames[fi] != "" {
-      const ftype = ftexts[fi]
-      if nameIsLitUnionType(ftype) { return true }
-      // The endpoint pre-filter, DELETED as redundant for the same reason as the sibling's:
-      // the recursion opens with `canonBareShapeName(ftype)`, which begins with the identical
-      // `length < 2` + `{`/`}` endpoint rejects.
-      if nameIsStructWithLitUnionField(ftype) { return true }
-    }
+  while fi < ftys.length {
+    if tyIsLitUnion(ftys[fi]) { return true }
+    if structLitUnionFieldAt(ftys[fi], depth - 1) { return true }
     fi = fi + 1
   }
   false
