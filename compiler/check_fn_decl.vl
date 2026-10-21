@@ -11,6 +11,7 @@ import {
   RetStmt,
   TypeRef,
   annTsOf,
+  blockTailIsDead,
   fnTpBoundOf,
   i32ToStr,
   paramDefaultIsCallsite,
@@ -49,6 +50,7 @@ import {
   inferSawErr,
   inferSawErrSet,
   inferVoidRetSites,
+  noteDeadTailBlk,
   paramSolveTried,
   retNatural,
   retNaturalErr,
@@ -1308,23 +1310,23 @@ function fnDeclCheckBody(
       const stmts = body.blkStmts
       let s = 0
       while s < stmts.length {
-        // The LAST statement's value is this function's implicit return. Under inference,
-        // mark it as the return-tail position so a tail `if`/`else`'s base-case branch
-        // seeds `inferObserved` before a recursive sibling branch is checked.
+        // The LAST statement's value is the implicit return, unless a statement before it always
+        // exits (asked once those are checked: a `never` call is marked by its check). Under
+        // inference it is the return-tail position, so a tail `if`/`else`'s base case seeds
+        // `inferObserved` before a recursive sibling branch is checked.
         const savedRTPbody = retTailPos
-        if s == stmts.length - 1 && inferring {
+        let tailIsReturn = s == stmts.length - 1
+        if tailIsReturn && blockTailIsDead(stmts) {
+          tailIsReturn = false
+          noteDeadTailBlk(n.fnBody)
+        }
+        if tailIsReturn && inferring {
           retTailPosSet(true)
         } else {
           retTailPosSet(false)
         }
         // The implicit return is seeded with the declared type, exactly as the explicit one is
-        // (`checkRetStmtNode`) — otherwise a narrower literal types at its default instead. An
-        // unreachable tail (`return 1  print(9)`, two statements on one line) is not the implicit
-        // return, so neither seeding nor checking may treat it as the returned expression.
-        let tailIsReturn = s == stmts.length - 1
-        if tailIsReturn && s > 0 {
-          if stmtAlwaysExits(stmts[s - 1]) { tailIsReturn = false }
-        }
+        // (`checkRetStmtNode`) — otherwise a narrower literal types at its default instead.
         if tailIsReturn && !inferring && ret >= 0 {
           if !isStmtNode(stmts[s]) || P.nodes[stmts[s]] is IfStmt {
             seedTailArms(stmts[s], ret)
@@ -1351,10 +1353,8 @@ function fnDeclCheckBody(
         // return-type witness. With a CONCRETE annotated return, a trailing empty
         // collection (`mk(): i32[] { … inner }`) pins its element from the return
         // type here — before the body scope is popped (and `inner`'s floor checked).
-        if s == stmts.length - 1 {
-          if !inferring && tailIsReturn {
-            fnTailGradeAgainstRet(stmts[s], stTy, ret)
-          }
+        if tailIsReturn {
+          if !inferring { fnTailGradeAgainstRet(stmts[s], stTy, ret) }
           if inferring {
             fnTailInferWitness(stmts[s], stTy)
           } else {
