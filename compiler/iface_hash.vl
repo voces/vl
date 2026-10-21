@@ -46,7 +46,7 @@ import {
   tyToStr,
 } from "./check_types"
 import { nodeTyIxOf } from "./check_node_tys"
-import { tyHasTyVar } from "./tyquery"
+import { tyHasTyVar, tyReachesHole } from "./tyquery"
 import { strListHas } from "./listutil"
 import { recFnValueLeaves } from "./check_type_shape"
 import { cwPeel } from "./check_write_scan"
@@ -670,7 +670,7 @@ function ihDeclKeys(x: i32, at: i32, seen: string[]): void {
             if ft is TypeRef {
               ihSpellKeys(ft.tyName, at, seen)
               typed = true
-              tys.push(if ihPrimName(ft.tyName) { ft.tyName } else { "" })
+              tys.push(ihSpellClass(ft.tyName))
             }
           }
         }
@@ -752,12 +752,37 @@ function ihSkipQuoted(s: string, i: i32): i32 {
   j + 1
 }
 
+// The index past a field's type spelling starting at `s[i]`: the first `,` or closing bracket
+// outside any bracket or quote.
+function ihFieldTyEnd(s: string, i: i32): i32 {
+  let depth = 0
+  let j = i
+  while j < s.length {
+    const c = s[j]
+    if c == '"' || c == '\'' {
+      j = ihSkipQuoted(s, j)
+    } else if c == '=' && j + 1 < s.length && s[j + 1] == '>' {
+      j = j + 2
+    } else {
+      if c == '{' || c == '(' || c == '[' || c == '<' { depth = depth + 1 }
+      if c == '}' || c == ')' || c == ']' || c == '>' {
+        if depth == 0 { return j }
+        depth = depth - 1
+      }
+      if c == ',' && depth == 0 { return j }
+      j = j + 1
+    }
+  }
+  s.length
+}
+
 // Whether a type spelling holds a record level or a generic application, which a literal in
 // another module's check can adopt; each record level's field names become a key of `at`.
 function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
   let amb = false
   const kinds: boolean[] = []
   const words: string[][] = []
+  const tys: string[][] = []
   let i = 0
   while i < s.length {
     const c = s[i]
@@ -769,6 +794,10 @@ function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
       const top = kinds.length - 1
       if k < s.length && s[k] == ':' && top >= 0 && kinds[top] {
         words[top].push(s.slice(i, j))
+        const opt = s.slice(j, k).indexOf("?") >= 0
+        tys[top].push(
+          if opt { "" } else { ihSpellClass(s.slice(k + 1, ihFieldTyEnd(s, k + 1))) },
+        )
       } else if j < s.length && s[j] == '<' && !ihOn(IH_NO_AMB_GENERIC) {
         const head = s.slice(i, j)
         if !ihBuiltinHead(head) {
@@ -789,11 +818,17 @@ function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
       kinds.push(rec)
       const none: string[] = []
       words.push(none)
+      const noTys: string[] = []
+      tys.push(noTys)
       i = i + 1
     } else if c == '}' || c == ')' || c == ']' || c == '>' {
       const rec = kinds.pop() ?? false
       const ws = words.pop() ?? []
-      if rec { ihAkRow(at, IH_AK_FIELDS, ws) }
+      const ts = tys.pop() ?? []
+      if rec {
+        ihAkRow(at, IH_AK_FIELDS, ws)
+        ihAkTys[ihAkTys.length - 1] = ts
+      }
       i = i + 1
     } else {
       i = i + 1
@@ -936,6 +971,10 @@ export function ihAmbientScan(): i32 {
   ihLitArg = []
   ihLitSettled = []
   ihDeclsOf = Map()
+  ihUnionAt = []
+  ihLitSets = Map()
+  ihLitSetsBuilt = false
+  ihLitSetsWild = false
   let s = 0
   while s < ihStMod.length {
     ihStAmb.push(ihStKind[s] == IH_ST_TYPE)
@@ -948,7 +987,10 @@ export function ihAmbientScan(): i32 {
     const nd = P.nodes[x]
     let nm = ""
     if nd is TypeDecl { nm = ihDeclBase(nd.tdName) }
-    if nd is UnionDecl { nm = ihDeclBase(nd.udName) }
+    if nd is UnionDecl {
+      nm = ihDeclBase(nd.udName)
+      ihUnionAt.push(x)
+    }
     if nm != "" {
       const prev = ihDeclsOf[nm] ?? []
       prev.push(x)
@@ -1401,51 +1443,89 @@ function ihIxRec(ix: IhIndex, ws: string[], cls: string[], m: i32): void {
   ihIxPush(ix.xSigM[s], m)
 }
 
-// The field types of record `t` aligned with its names: a primitive's name, `i32` for an integer
-// literal (stored as one), and "" for any other type.
+// The field types of record `t` aligned with its names, as `ihTyClass` names them; every field is
+// `*` when one reaches a hole, since the check then shares the record's storage with any record.
 function ihFieldClasses(t: TyObj): string[] {
   const out: string[] = []
+  let hole = false
   for f in t.objFieldTypes {
-    let c = ""
-    if f >= 0 && f < T.tys.length {
-      const ft = T.tys[f]
-      match ft {
-        TyPrim => {
-          c = ft.primName
-        }
-        TyLit => {
-          if ft.litKind == "int" { c = "i32" }
-        }
-        // a storage the arena does not compare stays unknown
-        TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyNeg => {}
-      }
-    }
-    out.push(c)
+    if tyReachesHole(f, 8) { hole = true }
+    out.push(ihTyClass(f, 4))
+  }
+  let i = 0
+  while hole && i < out.length {
+    out[i] = "*"
+    i = i + 1
   }
   out
 }
 
+// A storage class: a primitive's name, `i32` for an integer literal (stored as one), a class
+// with `[]` for a list of it, and "" for any other type, whose storage stays unknown.
+function ihTyClass(f: i32, depth: i32): string {
+  if f < 0 || f >= T.tys.length || depth <= 0 { return "" }
+  const ft = T.tys[f]
+  match ft {
+    TyPrim => ft.primName
+    TyLit => if ft.litKind == "int" { "i32" } else { "" }
+    TyArray => {
+      const e = ihTyClass(ft.aElem, depth - 1)
+      if e == "" { "" } else { e + "[]" }
+    }
+    // a storage the arena does not compare stays unknown
+    TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyMap | TyVar | TyNeg => ""
+  }
+}
+
+// The storage class a field's type spelling names, as `ihTyClass` does: a primitive no module
+// redeclares, with any `[]`s, or "".
+function ihSpellClass(s: string): string {
+  let t = ""
+  let i = 0
+  while i < s.length {
+    if s[i] != ' ' { t = t + s.slice(i, i + 1) }
+    i = i + 1
+  }
+  let n = 0
+  while t.length >= 2 && t.slice(t.length - 2, t.length) == "[]" {
+    t = t.slice(0, t.length - 2)
+    n = n + 1
+  }
+  if !ihPrimName(t) && !(t == "u8" && !ihDeclsOf.has(t)) { return "" }
+  while n > 0 {
+    t = t + "[]"
+    n = n - 1
+  }
+  t
+}
+
 // Whether a module of `inS` holds a record of entry `a` whose storage can equal key `k`'s
-// declaration: every field both name a primitive of agrees, as the check's storage test reads it.
+// declaration, and one whose storage can differ from it: a literal is built at a declared record
+// only when it is delivered to a record of its names stored apart from that one.
 function ihIxStoreHolds(a: i32, k: i32, inS: boolean[]): boolean {
   const tys = ihAkTys[k]
   if tys.length == 0 { return ihIxIn(ihIx.xArenaM[a], inS) }
   const at = ihIx.xArenaW[a]
+  let fits = false
+  let apart = false
   for s in ihIx.xArenaS[a] {
-    if ihIxIn(ihIx.xSigM[s], inS) && ihSigFits(ihIx.xSigC[s], at, k, tys) {
-      return true
+    if ihIxIn(ihIx.xSigM[s], inS) {
+      if ihSigFits(ihIx.xSigC[s], at, k, tys) { fits = true }
+      if !ihSigSame(ihIx.xSigC[s], at, k, tys) { apart = true }
     }
   }
-  false
+  fits && apart
 }
 
-// Whether storage `sig` of fields `at` can equal key `k`'s declared field types `tys`.
+// Whether storage `sig` of fields `at` can equal key `k`'s declared field types `tys`. A record
+// with a field reaching a hole (`*`) shares storage with any record.
 function ihSigFits(
   sig: string[],
   at: string[],
   k: i32,
   tys: string[],
 ): boolean {
+  if strListHas(sig, "*") { return true }
   let i = 0
   while i < at.length && i < sig.length {
     let j = 0
@@ -1461,6 +1541,30 @@ function ihSigFits(
       }
       j = j + 1
     }
+    i = i + 1
+  }
+  true
+}
+
+// Whether storage `sig` of fields `at` is surely key `k`'s declared storage `tys`: every field's
+// class is known on both sides and agrees, or a field reaches a hole, which no storage differs from.
+function ihSigSame(
+  sig: string[],
+  at: string[],
+  k: i32,
+  tys: string[],
+): boolean {
+  if strListHas(sig, "*") { return true }
+  if sig.length != at.length { return false }
+  let i = 0
+  while i < at.length {
+    let d = ""
+    let j = 0
+    while j < tys.length && ihAkLo[k] + j < ihAkHi[k] {
+      if ihAkW[ihAkLo[k] + j] == at[i] { d = tys[j] }
+      j = j + 1
+    }
+    if d == "" || d != sig[i] { return false }
     i = i + 1
   }
   true
@@ -1501,12 +1605,13 @@ function ihIxHolds(a: i32, inS: boolean[]): boolean {
   ihIxIn(ihIx.xArenaM[a], inS) && ihIxSpells(ihIx.xArenaW[a], inS)
 }
 
-// `ihAmbientMeets(false)` over a clean check of `inS`: a method or getter meets only after `.` or
-// `?.`, and a type's name only with `rows`, since names are module-scoped and only a row renders
-// one. With `arena`, a record also counts when `inS` holds and spells it; with `twin`, a record
-// declaration adds nothing when `inS` declares its shape (one type).
+// `ihAmbientMeets` over a check of `inS`: a getter meets after `.` or `?.`, a method call only
+// when the check is `dirty` (a clean one resolved each call inside `inS`), a type's name only
+// with `rows`, since only a row renders one. With `arena`, a record also counts when `inS` holds
+// and spells it; with `twin`, a declaration adds nothing when `inS` declares its shape.
 export function ihAmbientMeetsIn(
   inS: boolean[],
+  dirty: boolean,
   arena: boolean,
   rows: boolean,
   twin: boolean,
@@ -1566,6 +1671,13 @@ export function ihAmbientMeetsIn(
       }
       if kind == IH_AK_NAME && (!rows || ihOn(IH_NO_AMB_NAMES)) { all = false }
       if kind == IH_AK_RECV && ihOn(IH_NO_AMB_RECV) { all = false }
+      if (
+        kind == IH_AK_RECV
+        && ihAkCall[k]
+        && (!dirty || ihLoose(IH_LOOSE_CALLS))
+      ) {
+        all = false
+      }
       if kind == IH_AK_FIELDS && ihOn(IH_NO_AMB_FIELDS) { all = false }
       if all && twin && ihAkShape[k] != 0 {
         if ihIxIn(ihIx.xShape[ihAkShape[k]] ?? [], inS) { all = false }
@@ -1580,12 +1692,14 @@ export function ihAmbientMeetsIn(
   out
 }
 
-// Guards `ihAmbientMeetsIn` loosens, for the suite's mask witnesses: a literal handed to any
-// call stops meeting (`IH_LOOSE_ARGS`), a getter meets only a member call (`IH_LOOSE_GETTER`),
-// and a literal any function returns stops meeting (`IH_LOOSE_SETTLED`).
+// Guards `ihAmbientMeetsIn` loosens, for the suite's mask witnesses: stop meeting at a literal
+// handed to any call (`IH_LOOSE_ARGS`), a literal any function returns (`IH_LOOSE_SETTLED`) or a
+// dirty check's method call (`IH_LOOSE_CALLS`); a getter meets only a member call
+// (`IH_LOOSE_GETTER`).
 const IH_LOOSE_ARGS = 1
 const IH_LOOSE_GETTER = 2
 const IH_LOOSE_SETTLED = 4
+const IH_LOOSE_CALLS = 8
 let ihLooseMask = 0
 
 export function ihAmbientLoose(mask: i32): i32 {
@@ -1621,6 +1735,52 @@ export function ihNameIsLitUnion(w: string): boolean {
     }
   }
   false
+}
+
+// Whether literal union alias `w` may render under another name: it is declared more than once,
+// its type is unknown, or another alias in the program names the same member set, since a set
+// renders by whichever of its aliases the check interned first.
+export function ihLitUnionTwinned(w: string): boolean {
+  const ds = ihDeclsOf[w] ?? []
+  if ds.length != 1 { return true }
+  const nd = P.nodes[ds[0]]
+  let ty = -1
+  if nd is UnionDecl { ty = cUserTypes[nd.udName] ?? -1 }
+  const own = ihLitSetKey(ty)
+  if own == "" { return true }
+  if !ihLitSetsBuilt {
+    ihLitSetsBuilt = true
+    for x in ihUnionAt {
+      const ud = P.nodes[x]
+      if ud is UnionDecl {
+        if (ihDeclsOf[ihDeclBase(ud.udName)] ?? []).length != 1 {
+          ihLitSetsWild = true
+        }
+        const key = ihLitSetKey(cUserTypes[ud.udName] ?? -1)
+        if key != "" { ihLitSets[key] = (ihLitSets[key] ?? 0) + 1 }
+      }
+    }
+  }
+  ihLitSetsWild || (ihLitSets[own] ?? 0) > 1
+}
+
+// How many union aliases name each sorted member set, filled by the first `ihLitUnionTwinned`;
+// wild when a union name is declared twice, since the check keeps the type of one of them.
+let ihLitSets: {[string]: i32} = Map()
+let ihLitSetsBuilt = false
+let ihLitSetsWild = false
+// The parse nodes of every union declaration, filled by `ihAmbientScan`.
+let ihUnionAt: i32[] = []
+
+// The member set of union type `ty` as sorted member spellings, or "" when `ty` is not a union.
+function ihLitSetKey(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  const ms: string[] = []
+  if t is TyUnion {
+    for m in t.uMembers { ms.push(tyToStr(m)) }
+  }
+  if ms.length == 0 { "" } else { ihSetName(ms) }
 }
 
 function ihBearsStrLit(ty: i32, depth: i32): boolean {
