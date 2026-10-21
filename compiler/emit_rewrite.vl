@@ -110,12 +110,15 @@ import {
   Call,
   CharLit,
   ContinueStmt,
+  ErrExpr,
+  FieldDef,
   FieldInit,
   ForIn,
   ForRange,
   FuncDecl,
   Ident,
   IfStmt,
+  ImportDecl,
   Index,
   IsExpr,
   LetDecl,
@@ -133,6 +136,7 @@ import {
   RetStmt,
   Spread,
   StrLit,
+  TypeDecl,
   TypeRef,
   Unary,
   UnionDecl,
@@ -861,6 +865,7 @@ function nssFusedInit(ix: i32): boolean {
   const e = P.nodes[unwrapParen(ix)]
   if e is Index { return tyIsMap(nodeTyIxOf(e.idxArr)) }
   if e is Call {
+    if e.callFn < 0 { return nssBoxedProducer(ix) }
     const callee = P.nodes[e.callFn]
     if callee is Member {
       const rt = nodeTyIxOf(callee.memObj)
@@ -1213,6 +1218,7 @@ function drwCloShadowed(name: string) { strListHas(drwCloNames, name) }
 export function drwFillDefaults(ix: i32, ctx: i32) {
   const n = P.nodes[ix]
   if n is Call {
+    if n.callFn < 0 { return 0 }
     const cf = P.nodes[n.callFn]
     if cf is Ident {
       const fe = fnIndexOfInScopeChainAt(
@@ -1554,112 +1560,123 @@ function drwWalk(ix: i32, ctx: i32) {
   const atStmt = drwAtStmt
   drwAtStmt = false
   const n = P.nodes[ix]
-  if n is Call {
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      args[i] = drwWalk(args[i], ctx)
-      i = i + 1
+  match n {
+    Call => {
+      const args = n.callArgs
+      let i = 0
+      while i < args.length {
+        args[i] = drwWalk(args[i], ctx)
+        i = i + 1
+      }
+      // `p?.f(args)` — the callee becomes the plain member read, so UFCS, a callable field and
+      // every builtin method lower through the path they already have, and `drwOptGuard` moves
+      // the whole call into the non-null arm of one guard below.
+      let optWasOpt = false
+      if n.callFn < 0 { return ix }
+      const c0 = P.nodes[n.callFn]
+      if c0 is OptMember {
+        optWasOpt = true
+        n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
+        arenaNoteRefWrite()
+      }
+      const callee = P.nodes[n.callFn]
+      if callee is Member {
+        return drwWalkMemberCall(ix, n, callee, optWasOpt, ctx, atStmt)
+      }
+      const nfn = drwWalk(n.callFn, ctx)
+      if nfn != n.callFn { arenaNoteRefWrite() }
+      n.callFn = nfn
+      drwFillDefaults(ix, ctx)
+      return ix
     }
-    // `p?.f(args)` — the callee becomes the plain member read, so UFCS, a callable field and
-    // every builtin method lower through the path they already have, and `drwOptGuard` moves
-    // the whole call into the non-null arm of one guard below.
-    let optWasOpt = false
-    const c0 = P.nodes[n.callFn]
-    if c0 is OptMember {
-      optWasOpt = true
-      n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
-      arenaNoteRefWrite()
+    Block => {
+      drwWalkBlock(n, ctx)
+      return ix
     }
-    const callee = P.nodes[n.callFn]
-    if callee is Member {
-      return drwWalkMemberCall(ix, n, callee, optWasOpt, ctx, atStmt)
+    LetDecl => {
+      n.letInit = drwWalk(n.letInit, ctx)
+      return ix
     }
-    const nfn = drwWalk(n.callFn, ctx)
-    if nfn != n.callFn { arenaNoteRefWrite() }
-    n.callFn = nfn
-    drwFillDefaults(ix, ctx)
-    return ix
-  }
-  if n is Block {
-    drwWalkBlock(n, ctx)
-    return ix
-  }
-  if n is LetDecl {
-    n.letInit = drwWalk(n.letInit, ctx)
-    return ix
-  }
-  if n is IfStmt {
-    drwWalkIfChain(ix, ctx)
-    return ix
-  }
-  if n is WhileStmt {
-    n.whileCond = drwWalk(n.whileCond, ctx)
-    n.whileBody = drwWalk(n.whileBody, ctx)
-    return ix
-  }
-  if n is ForRange {
-    n.frFrom = drwWalk(n.frFrom, ctx)
-    n.frTo = drwWalk(n.frTo, ctx)
-    n.frStep = drwWalk(n.frStep, ctx)
-    n.frBody = drwWalk(n.frBody, ctx)
-    return ix
-  }
-  if n is ForIn {
-    n.fiIter = drwWalk(n.fiIter, ctx)
-    n.fiBody = drwWalk(n.fiBody, ctx)
-    return ix
-  }
-  if n is RetStmt {
-    n.retArg = drwWalk(n.retArg, ctx)
-    return ix
-  }
-  if n is BinExpr { return drwWalkBin(ix, n, ctx) }
-  if n is Unary {
-    n.unArg = drwWalk(n.unArg, ctx)
-    return ix
-  }
-  if n is Paren {
-    n.parInner = drwWalk(n.parInner, ctx)
-    return ix
-  }
-  if n is Member {
-    n.memObj = drwWalk(n.memObj, ctx)
-    return ix
-  }
-  if n is OptMember { return drwWalkOptMember(ix, n, ctx) }
-  if n is Index { return drwWalkIndex(ix, n, ctx) }
-  if n is IsExpr {
-    n.isObj = drwWalk(n.isObj, ctx)
-    return ix
-  }
-  if n is AsExpr {
-    n.asObj = drwWalk(n.asObj, ctx)
-    return ix
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread {
-    n.spdArg = drwWalk(n.spdArg, ctx)
-    return ix
-  }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let i3 = 0
-    while i3 < es.length {
-      es[i3] = drwWalk(es[i3], ctx)
-      i3 = i3 + 1
+    IfStmt => {
+      drwWalkIfChain(ix, ctx)
+      return ix
     }
-    return ix
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let i4 = 0
-    while i4 < fs.length {
-      const f = P.nodes[fs[i4]]
-      if f is FieldInit { f.fiValue = drwWalk(f.fiValue, ctx) }
-      i4 = i4 + 1
+    WhileStmt => {
+      n.whileCond = drwWalk(n.whileCond, ctx)
+      n.whileBody = drwWalk(n.whileBody, ctx)
+      return ix
     }
-    return ix
+    ForRange => {
+      n.frFrom = drwWalk(n.frFrom, ctx)
+      n.frTo = drwWalk(n.frTo, ctx)
+      n.frStep = drwWalk(n.frStep, ctx)
+      n.frBody = drwWalk(n.frBody, ctx)
+      return ix
+    }
+    ForIn => {
+      n.fiIter = drwWalk(n.fiIter, ctx)
+      n.fiBody = drwWalk(n.fiBody, ctx)
+      return ix
+    }
+    RetStmt => {
+      n.retArg = drwWalk(n.retArg, ctx)
+      return ix
+    }
+    BinExpr => {
+      return drwWalkBin(ix, n, ctx)
+    }
+    Unary => {
+      n.unArg = drwWalk(n.unArg, ctx)
+      return ix
+    }
+    Paren => {
+      n.parInner = drwWalk(n.parInner, ctx)
+      return ix
+    }
+    Member => {
+      n.memObj = drwWalk(n.memObj, ctx)
+      return ix
+    }
+    OptMember => {
+      return drwWalkOptMember(ix, n, ctx)
+    }
+    Index => {
+      return drwWalkIndex(ix, n, ctx)
+    }
+    IsExpr => {
+      n.isObj = drwWalk(n.isObj, ctx)
+      return ix
+    }
+    AsExpr => {
+      n.asObj = drwWalk(n.asObj, ctx)
+      return ix
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      n.spdArg = drwWalk(n.spdArg, ctx)
+      return ix
+    }
+    ArrayLit => {
+      const es = n.arrElems
+      let i3 = 0
+      while i3 < es.length {
+        es[i3] = drwWalk(es[i3], ctx)
+        i3 = i3 + 1
+      }
+      return ix
+    }
+    ObjLit => {
+      const fs = n.objFields
+      let i4 = 0
+      while i4 < fs.length {
+        const f = P.nodes[fs[i4]]
+        if f is FieldInit { f.fiValue = drwWalk(f.fiValue, ctx) }
+        i4 = i4 + 1
+      }
+      return ix
+    }
+    // every other kind holds no call or operator this pass desugars, and is kept
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   ix
 }
@@ -2394,6 +2411,7 @@ function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
     return ix
   }
   if n is Call {
+    if n.callFn < 0 { return asvHalt(ix) }
     const callee = P.nodes[n.callFn]
     if callee is Member {
       callee.memObj = asvWalk(callee.memObj, out, true)
@@ -3420,133 +3438,157 @@ function cboxScanForIn(
 function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
-  if n is Ident {
-    if depth > 0 && (cboxShadow[n.identName] ?? 0) == 0 {
-      cboxNoteCap(n.identName)
+  match n {
+    Ident => {
+      if depth > 0 && (cboxShadow[n.identName] ?? 0) == 0 {
+        cboxNoteCap(n.identName)
+      }
+      return 0
     }
-    return 0
-  }
-  if n is FuncDecl {
-    if depth == 0 {
-      cboxOrd = cboxOrd + 1
-      cboxFnOrd = cboxOrd
-      if cboxArgFloor >= 0 { cboxFnOrd = cboxArgFloor }
-      cboxFnLoop = cboxLoopAt
-      cboxFnArm = cboxArmAt
+    FuncDecl => {
+      if depth == 0 {
+        cboxOrd = cboxOrd + 1
+        cboxFnOrd = cboxOrd
+        if cboxArgFloor >= 0 { cboxFnOrd = cboxArgFloor }
+        cboxFnLoop = cboxLoopAt
+        cboxFnArm = cboxArmAt
+      }
+      const fmark = cboxShTrail.length
+      cboxShadowParams(ix)
+      cboxScan(n.fnBody, depth + 1, dlets, alam)
+      return cboxShadowTrim(fmark)
     }
-    const fmark = cboxShTrail.length
-    cboxShadowParams(ix)
-    cboxScan(n.fnBody, depth + 1, dlets, alam)
-    return cboxShadowTrim(fmark)
-  }
-  if n is LetDecl {
-    cboxScan(n.letInit, depth, dlets, alam)
-    if depth == 0 {
-      cboxDeclare(n.letName, CBOX_LET, ix, dlets)
-    } else {
-      cboxShadowPush(n.letName)
+    LetDecl => {
+      cboxScan(n.letInit, depth, dlets, alam)
+      if depth == 0 {
+        cboxDeclare(n.letName, CBOX_LET, ix, dlets)
+      } else {
+        cboxShadowPush(n.letName)
+      }
+      return 0
     }
-    return 0
-  }
-  if n is Block {
-    const bmark = cboxShTrail.length
-    const bs = n.blkStmts
-    let i = 0
-    while i < bs.length {
-      cboxScan(bs[i], depth, dlets, alam)
-      i = i + 1
+    Block => {
+      const bmark = cboxShTrail.length
+      const bs = n.blkStmts
+      let i = 0
+      while i < bs.length {
+        cboxScan(bs[i], depth, dlets, alam)
+        i = i + 1
+      }
+      return cboxShadowTrim(bmark)
     }
-    return cboxShadowTrim(bmark)
-  }
-  if n is BinExpr {
-    if n.binOp == "=" {
-      if depth > 0 {
-        const t = P.nodes[n.binLeft]
-        if t is Ident {
-          if (cboxShadow[t.identName] ?? 0) == 0 {
-            if !strListHas(alam, t.identName) { alam.push(t.identName) }
+    BinExpr => {
+      if n.binOp == "=" {
+        if depth > 0 {
+          const t = P.nodes[n.binLeft]
+          if t is Ident {
+            if (cboxShadow[t.identName] ?? 0) == 0 {
+              if !strListHas(alam, t.identName) { alam.push(t.identName) }
+            }
           }
         }
       }
+      cboxScan(n.binLeft, depth, dlets, alam)
+      cboxScan(n.binRight, depth, dlets, alam)
+      if n.binOp == "=" && depth == 0 {
+        const w = P.nodes[unwrapParen(n.binLeft)]
+        if w is Ident { cboxNoteAsg(w.identName) }
+      }
+      return 0
     }
-    cboxScan(n.binLeft, depth, dlets, alam)
-    cboxScan(n.binRight, depth, dlets, alam)
-    if n.binOp == "=" && depth == 0 {
-      const w = P.nodes[unwrapParen(n.binLeft)]
-      if w is Ident { cboxNoteAsg(w.identName) }
+    IfStmt => {
+      return cboxScanIf(ix, depth, dlets, alam)
     }
-    return 0
-  }
-  if n is IfStmt { return cboxScanIf(ix, depth, dlets, alam) }
-  if n is WhileStmt {
-    if depth == 0 { cboxLoopOpen() }
-    cboxScan(n.whileCond, depth, dlets, alam)
-    cboxScan(n.whileBody, depth, dlets, alam)
-    if depth == 0 { cboxLoopClose() }
-    return 0
-  }
-  if n is ForRange { return cboxScanForRange(ix, n, depth, dlets, alam) }
-  if n is ForIn { return cboxScanForIn(ix, n, depth, dlets, alam) }
-  if n is RetStmt { return cboxScan(n.retArg, depth, dlets, alam) }
-  if n is Unary { return cboxScan(n.unArg, depth, dlets, alam) }
-  if n is Paren { return cboxScan(n.parInner, depth, dlets, alam) }
-  if n is Member { return cboxScan(n.memObj, depth, dlets, alam) }
-  if n is OptMember { return cboxScan(n.omObj, depth, dlets, alam) }
-  if n is Index {
-    cboxScan(n.idxArr, depth, dlets, alam)
-    return cboxScan(n.idxIndex, depth, dlets, alam)
-  }
-  if n is IsExpr {
-    cboxScan(n.isObj, depth, dlets, alam)
-    // `x is L` may store an empty `L` back into `x`, so it writes `x` as an assignment does.
-    const w = P.nodes[unwrapParen(n.isObj)]
-    if w is Ident {
-      if cboxIsMayStore(ix, n.isObj) {
-        if depth == 0 {
-          cboxNoteAsg(w.identName)
-        } else if (cboxShadow[w.identName] ?? 0) == 0 {
-          if !strListHas(alam, w.identName) { alam.push(w.identName) }
+    WhileStmt => {
+      if depth == 0 { cboxLoopOpen() }
+      cboxScan(n.whileCond, depth, dlets, alam)
+      cboxScan(n.whileBody, depth, dlets, alam)
+      if depth == 0 { cboxLoopClose() }
+      return 0
+    }
+    ForRange => {
+      return cboxScanForRange(ix, n, depth, dlets, alam)
+    }
+    ForIn => {
+      return cboxScanForIn(ix, n, depth, dlets, alam)
+    }
+    RetStmt => {
+      return cboxScan(n.retArg, depth, dlets, alam)
+    }
+    Unary => {
+      return cboxScan(n.unArg, depth, dlets, alam)
+    }
+    Paren => {
+      return cboxScan(n.parInner, depth, dlets, alam)
+    }
+    Member => {
+      return cboxScan(n.memObj, depth, dlets, alam)
+    }
+    OptMember => {
+      return cboxScan(n.omObj, depth, dlets, alam)
+    }
+    Index => {
+      cboxScan(n.idxArr, depth, dlets, alam)
+      return cboxScan(n.idxIndex, depth, dlets, alam)
+    }
+    IsExpr => {
+      cboxScan(n.isObj, depth, dlets, alam)
+      // `x is L` may store an empty `L` back into `x`, so it writes `x` as an assignment does.
+      const w = P.nodes[unwrapParen(n.isObj)]
+      if w is Ident {
+        if cboxIsMayStore(ix, n.isObj) {
+          if depth == 0 {
+            cboxNoteAsg(w.identName)
+          } else if (cboxShadow[w.identName] ?? 0) == 0 {
+            if !strListHas(alam, w.identName) { alam.push(w.identName) }
+          }
         }
       }
+      return 0
     }
-    return 0
-  }
-  if n is AsExpr { return cboxScan(n.asObj, depth, dlets, alam) }
-  if n is Call {
-    cboxScan(n.callFn, depth, dlets, alam)
-    const savedFloor = cboxArgFloor
-    if depth == 0 && savedFloor < 0 && hasNamedArgs(n.callArgNames) {
-      cboxArgFloor = cboxOrd
+    AsExpr => {
+      return cboxScan(n.asObj, depth, dlets, alam)
     }
-    const args = n.callArgs
-    let ci = 0
-    while ci < args.length {
-      cboxScan(args[ci], depth, dlets, alam)
-      ci = ci + 1
+    Call => {
+      cboxScan(n.callFn, depth, dlets, alam)
+      const savedFloor = cboxArgFloor
+      if depth == 0 && savedFloor < 0 && hasNamedArgs(n.callArgNames) {
+        cboxArgFloor = cboxOrd
+      }
+      const args = n.callArgs
+      let ci = 0
+      while ci < args.length {
+        cboxScan(args[ci], depth, dlets, alam)
+        ci = ci + 1
+      }
+      cboxArgFloor = savedFloor
+      return 0
     }
-    cboxArgFloor = savedFloor
-    return 0
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread { return cboxScan(n.spdArg, depth, dlets, alam) }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let ei = 0
-    while ei < es.length {
-      cboxScan(es[ei], depth, dlets, alam)
-      ei = ei + 1
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return cboxScan(n.spdArg, depth, dlets, alam)
     }
-    return 0
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let fi = 0
-    while fi < fs.length {
-      const f = P.nodes[fs[fi]]
-      if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam) }
-      fi = fi + 1
+    ArrayLit => {
+      const es = n.arrElems
+      let ei = 0
+      while ei < es.length {
+        cboxScan(es[ei], depth, dlets, alam)
+        ei = ei + 1
+      }
+      return 0
     }
-    return 0
+    ObjLit => {
+      const fs = n.objFields
+      let fi = 0
+      while fi < fs.length {
+        const f = P.nodes[fs[fi]]
+        if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam) }
+        fi = fi + 1
+      }
+      return 0
+    }
+    // every other kind binds and captures nothing, so it has no capture to box
+    NumLit | StrLit | CharLit | BoolLit | NullLit | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   0
 }
@@ -3650,10 +3692,22 @@ function cboxYieldTail(blockIx: i32, boxed: string[]) {
 // A fresh copy of the literal at `ix` (string, number, char, boolean), or -1 for any other node.
 function cboxLitCopy(ix: i32) {
   const n = P.nodes[unwrapParen(ix)]
-  if n is StrLit { return mkStr(n.strText, -1) }
-  if n is NumLit { return mkNum(n.numText, -1) }
-  if n is CharLit { return mkChar(n.charText, -1) }
-  if n is BoolLit { return mkBool(n.boolVal, -1) }
+  match n {
+    StrLit => {
+      return mkStr(n.strText, -1)
+    }
+    NumLit => {
+      return mkNum(n.numText, -1)
+    }
+    CharLit => {
+      return mkChar(n.charText, -1)
+    }
+    BoolLit => {
+      return mkBool(n.boolVal, -1)
+    }
+    // any other kind is not a literal and has no copy
+    NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
   -1
 }
 
@@ -3891,117 +3945,131 @@ function cboxRenameJoins(ix: i32, boxed: string[]) {
 function cboxWalk(ix: i32, boxed: string[]) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Ident { return cboxWalkIdent(ix, n, boxed) }
-  if n is FuncDecl {
-    const fmark = cboxShTrail.length
-    cboxShadowParams(ix)
-    if n.fnRet < 0 && !lambdaVoidAdoptedAt(ix) {
-      cboxYieldTail(n.fnBody, boxed)
+  match n {
+    Ident => {
+      return cboxWalkIdent(ix, n, boxed)
     }
-    cboxDepth = cboxDepth + 1
-    n.fnBody = cboxWalk(n.fnBody, boxed)
-    cboxDepth = cboxDepth - 1
-    cboxShadowTrim(fmark)
-    return ix
-  }
-  if n is Block {
-    const bmark = cboxShTrail.length
-    const bs = n.blkStmts
-    let i = 0
-    while i < bs.length {
-      bs[i] = cboxWalk(bs[i], boxed)
-      i = i + 1
-    }
-    cboxShadowTrim(bmark)
-    return ix
-  }
-  if n is LetDecl {
-    cboxRenameJoins(ix, boxed)
-    n.letInit = cboxWalk(n.letInit, boxed)
-    if cboxDepth > 0 {
-      cboxShadowPush(n.letName)
+    FuncDecl => {
+      const fmark = cboxShTrail.length
+      cboxShadowParams(ix)
+      if n.fnRet < 0 && !lambdaVoidAdoptedAt(ix) {
+        cboxYieldTail(n.fnBody, boxed)
+      }
+      cboxDepth = cboxDepth + 1
+      n.fnBody = cboxWalk(n.fnBody, boxed)
+      cboxDepth = cboxDepth - 1
+      cboxShadowTrim(fmark)
       return ix
     }
-    if strListHas(boxed, n.letName) { cboxBoxLet(ix, n.letName) }
-    return ix
-  }
-  if n is BinExpr { return cboxWalkBin(ix, n, boxed) }
-  if n is IfStmt { return cboxWalkIf(ix, boxed) }
-  if n is WhileStmt {
-    n.whileCond = cboxWalk(n.whileCond, boxed)
-    n.whileBody = cboxWalk(n.whileBody, boxed)
-    return ix
-  }
-  if n is ForRange { return cboxWalkForRange(ix, n, boxed) }
-  if n is ForIn { return cboxWalkForIn(ix, n, boxed) }
-  if n is RetStmt {
-    n.retArg = cboxWalk(n.retArg, boxed)
-    return ix
-  }
-  if n is Unary {
-    n.unArg = cboxWalk(n.unArg, boxed)
-    return ix
-  }
-  if n is Paren {
-    n.parInner = cboxWalk(n.parInner, boxed)
-    return ix
-  }
-  if n is Member {
-    n.memObj = cboxWalk(n.memObj, boxed)
-    return ix
-  }
-  if n is OptMember {
-    n.omObj = cboxWalk(n.omObj, boxed)
-    return ix
-  }
-  if n is Index {
-    n.idxArr = cboxWalk(n.idxArr, boxed)
-    n.idxIndex = cboxWalk(n.idxIndex, boxed)
-    return ix
-  }
-  if n is IsExpr {
-    n.isObj = cboxWalk(n.isObj, boxed)
-    return ix
-  }
-  if n is AsExpr {
-    n.asObj = cboxWalk(n.asObj, boxed)
-    return ix
-  }
-  if n is Call {
-    const nfn = cboxWalk(n.callFn, boxed)
-    if nfn != n.callFn { arenaNoteRefWrite() }
-    n.callFn = nfn
-    const args = n.callArgs
-    let ci = 0
-    while ci < args.length {
-      args[ci] = cboxWalk(args[ci], boxed)
-      ci = ci + 1
+    Block => {
+      const bmark = cboxShTrail.length
+      const bs = n.blkStmts
+      let i = 0
+      while i < bs.length {
+        bs[i] = cboxWalk(bs[i], boxed)
+        i = i + 1
+      }
+      cboxShadowTrim(bmark)
+      return ix
     }
-    return ix
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread {
-    n.spdArg = cboxWalk(n.spdArg, boxed)
-    return ix
-  }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let ei = 0
-    while ei < es.length {
-      es[ei] = cboxWalk(es[ei], boxed)
-      ei = ei + 1
+    LetDecl => {
+      cboxRenameJoins(ix, boxed)
+      n.letInit = cboxWalk(n.letInit, boxed)
+      if cboxDepth > 0 {
+        cboxShadowPush(n.letName)
+        return ix
+      }
+      if strListHas(boxed, n.letName) { cboxBoxLet(ix, n.letName) }
+      return ix
     }
-    return ix
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let fi = 0
-    while fi < fs.length {
-      const f = P.nodes[fs[fi]]
-      if f is FieldInit { f.fiValue = cboxWalk(f.fiValue, boxed) }
-      fi = fi + 1
+    BinExpr => {
+      return cboxWalkBin(ix, n, boxed)
     }
-    return ix
+    IfStmt => {
+      return cboxWalkIf(ix, boxed)
+    }
+    WhileStmt => {
+      n.whileCond = cboxWalk(n.whileCond, boxed)
+      n.whileBody = cboxWalk(n.whileBody, boxed)
+      return ix
+    }
+    ForRange => {
+      return cboxWalkForRange(ix, n, boxed)
+    }
+    ForIn => {
+      return cboxWalkForIn(ix, n, boxed)
+    }
+    RetStmt => {
+      n.retArg = cboxWalk(n.retArg, boxed)
+      return ix
+    }
+    Unary => {
+      n.unArg = cboxWalk(n.unArg, boxed)
+      return ix
+    }
+    Paren => {
+      n.parInner = cboxWalk(n.parInner, boxed)
+      return ix
+    }
+    Member => {
+      n.memObj = cboxWalk(n.memObj, boxed)
+      return ix
+    }
+    OptMember => {
+      n.omObj = cboxWalk(n.omObj, boxed)
+      return ix
+    }
+    Index => {
+      n.idxArr = cboxWalk(n.idxArr, boxed)
+      n.idxIndex = cboxWalk(n.idxIndex, boxed)
+      return ix
+    }
+    IsExpr => {
+      n.isObj = cboxWalk(n.isObj, boxed)
+      return ix
+    }
+    AsExpr => {
+      n.asObj = cboxWalk(n.asObj, boxed)
+      return ix
+    }
+    Call => {
+      const nfn = cboxWalk(n.callFn, boxed)
+      if nfn != n.callFn { arenaNoteRefWrite() }
+      n.callFn = nfn
+      const args = n.callArgs
+      let ci = 0
+      while ci < args.length {
+        args[ci] = cboxWalk(args[ci], boxed)
+        ci = ci + 1
+      }
+      return ix
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      n.spdArg = cboxWalk(n.spdArg, boxed)
+      return ix
+    }
+    ArrayLit => {
+      const es = n.arrElems
+      let ei = 0
+      while ei < es.length {
+        es[ei] = cboxWalk(es[ei], boxed)
+        ei = ei + 1
+      }
+      return ix
+    }
+    ObjLit => {
+      const fs = n.objFields
+      let fi = 0
+      while fi < fs.length {
+        const f = P.nodes[fs[fi]]
+        if f is FieldInit { f.fiValue = cboxWalk(f.fiValue, boxed) }
+        fi = fi + 1
+      }
+      return ix
+    }
+    // every other kind reads no boxed capture, so it is kept as it is
+    NumLit | StrLit | CharLit | BoolLit | NullLit | ErrExpr | Param | TypeRef | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   return ix
 }
