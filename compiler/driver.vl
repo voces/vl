@@ -31,7 +31,13 @@ import {
   fsReset,
   fsSetMode,
 } from "./fn_split"
-import { modIdAssign, modIdReset, modIxOfId, modSuffixOf } from "./modid"
+import {
+  midSalted,
+  modIdAssign,
+  modIdReset,
+  modIxOfId,
+  modSuffixOf,
+} from "./modid"
 import { crAskAnswer } from "./check_call_retire"
 import { crAskArm, crAskHold, crAskKeys, crAskQs } from "./check_capture_rows"
 import { recAdOrigDecl } from "./check_rec_adopt_rows"
@@ -303,6 +309,7 @@ import {
   ihMask,
   ihModule,
   ihNameDeclaredOut,
+  ihNameIsLitUnion,
   ihOccDigests,
   ihPlainBinding,
   ihPosHash,
@@ -379,6 +386,7 @@ import {
   expInfCount,
   expInfMsgAt,
   expInfTokAt,
+  expInfTypeAt,
   isvalCount,
   isvalMsgAt,
   isvalTokAt,
@@ -6644,6 +6652,11 @@ let wiMods: i32[] = []
 let wiTrace: string[] = []
 let wiWhyBy: {[string]: string} = Map()
 let wiCulpritName = ""
+// The report row `wiRowsIn` last counted, for the trace.
+let wiRowsWhy = ""
+// The report rows of the target `wiGuard` weighs: each row's stream and its rendered text.
+let wiRowKind: string[] = []
+let wiRowText: string[] = []
 let wiServedLast = false
 let wiBankedKeys: string[] = []
 let wiBankedMods: i32[] = []
@@ -6679,7 +6692,7 @@ const WI_NO_CALLED = 2048
 const WI_NO_DIAG_NAMES = 4096
 const WI_NO_OUTSIDE = 8192
 const WI_NO_INERT_OUT = 16384
-const WI_NO_INERT_SHAPE = 32768
+const WI_NO_LIT_ORDER = 32768
 // Loosen three ambient guards (`ihAmbientLoose`): a literal handed to any call, a getter read,
 // and a literal any function returns.
 const WI_LOOSE_ARGS = 65536
@@ -6971,20 +6984,10 @@ function wiDiagNamesOut(inG: boolean[]): boolean {
     const msg = wiDiagMsgs[k]
     k = k + 1
     if !inG[wiDiagMods[k - 1]] { continue }
-    let i = 0
-    while i < msg.length {
-      let j = i
-      while j < msg.length && wiIdentChar(msg[j]) { j = j + 1 }
-      if j > i {
-        const w = msg.slice(i, j)
-        if ihNameDeclaredOut(w, inG) {
-          wiCulpritName = "(error names " + w + ")"
-          return true
-        }
-        i = j
-      } else {
-        i = i + 1
-      }
+    const w = wiWordOut(msg, inG)
+    if w != "" {
+      wiCulpritName = "(error names " + w + ")"
+      return true
     }
   }
   false
@@ -7118,7 +7121,8 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
       wiCulprit = WI_ANY
       return WI_AMBIENT
     }
-    const named = (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(t, inG)
+    wiRowTexts(t)
+    const named = (wiMask & WI_NO_RENDER) == 0 && wiRowsIn(inG)
     const meets = ihAmbientMeetsIn(
       inG,
       (wiMask & WI_NO_ARENA) == 0,
@@ -7130,55 +7134,146 @@ function wiGuard(t: i32, roots: i32[], pos: i32[]): i32 {
       if !inG[m] && meets[m] {
         wiCulprit = m
         wiCulpritName = ihAmbientWhy(m)
+        if wiCulpritName == "rows" { wiCulpritName = "rows " + wiRowsWhy }
         return WI_AMBIENT
       }
       m = m + 1
+    }
+    if (wiMask & WI_NO_LIT_ORDER) == 0 && wiLitOrderIn(inG) {
+      wiCulprit = WI_ANY
+      return WI_AMBIENT
     }
   }
   if (wiMask & WI_NO_ASKS) == 0 && wiAsksOut(inG) { return WI_ASKS }
   WI_SERVED
 }
 
-// Whether module `t` holds a row of the report streams, whose message may render any type. A
-// redundant-annotation row whose type is one word no module outside `inG` declares does not
-// count: the root's own check holds a subset of the names, so it renders that word too.
-function wiRowsIn(t: i32, inG: boolean[]): boolean {
+// The report rows of module `t`: each row's stream and the text it renders types into.
+function wiRowTexts(t: i32): i32 {
+  wiRowKind = []
+  wiRowText = []
   let i = 0
   while i < redunCount() {
-    if redunModuleAt(i) == t && !wiInertWord(redunTypeAt(i), inG) {
-      return true
-    }
+    if redunModuleAt(i) == t { wiRowAdd("redun", redunTypeAt(i)) }
     i = i + 1
   }
   i = 0
   while i < rcoalCount() {
-    if rcoalModuleAt(i) == t { return true }
+    if rcoalModuleAt(i) == t { wiRowAdd("rcoal", rcoalMsgAt(i)) }
     i = i + 1
   }
   i = 0
   while i < isvalCount() {
-    if isvalModuleAt(i) == t { return true }
+    if isvalModuleAt(i) == t { wiRowAdd("isval", isvalMsgAt(i)) }
     i = i + 1
   }
   i = 0
   while i < expInfCount() {
-    if expInfModuleAt(i) == t { return true }
+    if expInfModuleAt(i) == t {
+      wiRowAdd("expInf", expInfMsgAt(i) + " " + expInfTypeAt(i))
+    }
+    i = i + 1
+  }
+  0
+}
+
+function wiRowAdd(kind: string, text: string): void {
+  wiRowKind.push(kind)
+  wiRowText.push(text)
+}
+
+// Whether a row `wiRowTexts` read renders a type that may read otherwise in the root's own check:
+// one still holding a merge spelling, or naming a type a module outside `inG` declares. The
+// root's own check holds a subset of the declarations, so any other word renders the same.
+function wiRowsIn(inG: boolean[]): boolean {
+  let i = 0
+  while i < wiRowText.length {
+    const s = wiRowText[i]
+    let out = wiMangled(s)
+    if !out && (wiMask & WI_NO_INERT_OUT) == 0 { out = wiWordOut(s, inG) != "" }
+    if out {
+      wiRowsWhy = wiRowKind[i] + ":" + s
+      return true
+    }
     i = i + 1
   }
   false
 }
 
-// Whether type text `s` is a word no module outside `inG` declares, with any number of `[]`
-// after it. No declaration names a bare array, so its render is its element's.
-function wiInertWord(s: string, inG: boolean[]): boolean {
-  let j = 0
-  while j < s.length && wiIdentChar(s[j]) { j = j + 1 }
-  let i = j
-  while i + 1 < s.length && s[i] == '[' && s[i + 1] == ']' { i = i + 2 }
-  if (j == 0 || i < s.length) && (wiMask & WI_NO_INERT_SHAPE) == 0 {
-    return false
+// Whether `s` holds a spelling the merge numbered by its company: a `#` alias, a `$` suffix other
+// than a module id, or a module id from a graph that salted one.
+function wiMangled(s: string): boolean {
+  let i = 0
+  while i < s.length {
+    if s[i] == '#' { return true }
+    if s[i] == '$' {
+      const id = i + 2 < s.length
+        && s[i + 1] == 'm'
+        && s[i + 2] >= '0'
+        && s[i + 2] <= '9'
+      if !id || midSalted { return true }
+    }
+    i = i + 1
   }
-  (wiMask & WI_NO_INERT_OUT) != 0 || !ihNameDeclaredOut(s.slice(0, j), inG)
+  false
+}
+
+// The first word of `s` that names a type or union declared outside `inG`, or "".
+function wiWordOut(s: string, inG: boolean[]): string {
+  for w in wiWords(s) {
+    if ihNameDeclaredOut(w, inG) { return w }
+  }
+  ""
+}
+
+// The identifier words of `s`, in order.
+function wiWords(s: string): string[] {
+  const o: string[] = []
+  let i = 0
+  while i < s.length {
+    let j = i
+    while j < s.length && wiIdentChar(s[j]) { j = j + 1 }
+    if j > i {
+      o.push(s.slice(i, j))
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+  o
+}
+
+// Whether text `s` renders a string literal union by its members or by a union name G alone
+// declares. Such a set renders as the check first interned it, and the check of a bigger
+// graph may intern it first in another order or under another name.
+function wiLitOrdered(s: string, inG: boolean[]): boolean {
+  if strContains(s, "\" | ") || strContains(s, " | \"") { return true }
+  for w in wiWords(s) {
+    if ihNameIsLitUnion(w) && !ihNameDeclaredOut(w, inG) { return true }
+  }
+  false
+}
+
+// Whether a row `wiRowTexts` read, or an error placed in `inG`, renders a string literal union.
+function wiLitOrderIn(inG: boolean[]): boolean {
+  let i = 0
+  while i < wiRowText.length {
+    if wiLitOrdered(wiRowText[i], inG) {
+      wiCulpritName = "(literal union in " + wiRowKind[i] + ")"
+      return true
+    }
+    i = i + 1
+  }
+  if !wiDirtyNow { return false }
+  i = 0
+  while i < wiDiagMsgs.length && i < wiDiagMods.length {
+    if inG[wiDiagMods[i]] && wiLitOrdered(wiDiagMsgs[i], inG) {
+      wiCulpritName = "(literal union in error)"
+      return true
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether a deep-`is` site lies in `inG`: a check with errors never runs that pass, and a
