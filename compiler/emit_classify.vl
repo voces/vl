@@ -57,6 +57,7 @@ import {
   elseIfLink,
   externLinkOf,
   externRetIsVoid,
+  fnTpBoundOf,
   hasSpreadItem,
   i32ToStr,
   memberCallRungOf,
@@ -5494,6 +5495,14 @@ function litFieldBoxedApart(
   r is TyUnion || r is TyNullable
 }
 
+// Whether field `name` of the object literal at `objIx` is typed at a type parameter that
+// instance `fnIx` binds: the instance reads the literal at its own row, not a declared one.
+function litPinnedInInstance(objIx: i32, name: string, fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  const lt = tyFieldTyOf(nodeRepTyIxOf(objIx), name)
+  lt >= 0 && tyHasTyVar(lt)
+}
+
 // The record an anonymous struct row holds: the minting literal's own type where the row
 // recorded its hole's context, else the recorded type; -1 for a declared row or none.
 export function anonRowOwnTyOf(name: string): i32 {
@@ -5513,13 +5522,14 @@ let litHoleDecl: i32[] = []
 let litHoleParam: string[] = []
 let litHoleNext: i32[] = []
 
-// The object literal argument `a` delivers: itself, or the initialiser of the un-annotated
-// binding it names; -1 for anything else.
+// The object literal argument `a` delivers: itself, the initialiser of the un-annotated
+// binding it names, or the literal a builder it calls returns; -1 for anything else.
 function litArgLiteral(a: i32): i32 {
   const u = unwrapParen(a)
   if u < 0 || u >= P.nodes.length { return -1 }
   const n = P.nodes[u]
   if n is ObjLit { return u }
+  if n is Call { return litCallTail(n) }
   if !(n is Ident) { return -1 }
   const d = identDeclOf(u)
   if d < 0 || d >= P.nodes.length { return -1 }
@@ -5532,14 +5542,46 @@ function litArgLiteral(a: i32): i32 {
   v
 }
 
-// Records the deliveries call `c` makes into un-annotated parameters.
-function litHoleScanCall(c: Call) {
-  for an in c.callArgNames {
-    if an != "" { return 0 }
-  }
-  if c.callFn < 0 { return 0 }
+// The object literal a call to a non-generic function with no return annotation hands back as
+// its body's last statement, bare or returned, or an identity over a parameter hands back from
+// its argument; -1 for anything else.
+function litCallTail(c: Call): i32 {
+  if c.callFn < 0 { return -1 }
   const d = cwCalleeDeclOf(c.callFn)
-  if d < 0 || d >= P.nodes.length { return 0 }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) { return -1 }
+  if fd.fnRet >= 0 || fd.fnTyParams.length > 0 || fd.fnBody < 0 { return -1 }
+  const b = P.nodes[fd.fnBody]
+  if !(b is Block) || b.blkStmts.length == 0 { return -1 }
+  let t = b.blkStmts[b.blkStmts.length - 1]
+  const tn = P.nodes[t]
+  if tn is RetStmt { t = tn.retArg }
+  const v = unwrapParen(t)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const vn = P.nodes[v]
+  if vn is Ident {
+    // An identity over an un-annotated parameter hands back what its call delivers there.
+    let i = 0
+    while i < fd.fnParams.length && i < c.callArgs.length {
+      const pn = P.nodes[fd.fnParams[i]]
+      if pn is Param {
+        if pn.parName == vn.identName && pn.parType < 0 && pn.parRest == 0 {
+          return litArgLiteral(c.callArgs[i])
+        }
+      }
+      i = i + 1
+    }
+    return -1
+  }
+  if !(vn is ObjLit) { return -1 }
+  v
+}
+
+// Records the deliveries call `c` makes into parameters pinned at their argument's row.
+function litHoleScanCall(c: Call) {
+  const d = litCallHoleDecl(c)
+  if d < 0 { return 0 }
   const fd = P.nodes[d]
   if !(fd is FuncDecl) { return 0 }
   let i = 0
@@ -5547,7 +5589,7 @@ function litHoleScanCall(c: Call) {
     const lit = litArgLiteral(c.callArgs[i])
     const pn = P.nodes[fd.fnParams[i]]
     if lit >= 0 && pn is Param {
-      if pn.parType < 0 && pn.parRest == 0 {
+      if paramTakesArgRow(d, fd, pn) {
         while litHoleHead.length <= lit { litHoleHead.push(-1) }
         litHoleDecl.push(d)
         litHoleParam.push(pn.parName)
@@ -5560,7 +5602,35 @@ function litHoleScanCall(c: Call) {
   0
 }
 
-// Whether object literal `objIx` is handed to an un-annotated parameter whose body reads
+// Whether parameter `pn` of `fd`, the declaration at `d`, is pinned at its argument's row:
+// un-annotated, or declared as an unbounded type parameter of `fd`. A bounded one reads its
+// fields at the bound's types.
+function paramTakesArgRow(d: i32, fd: FuncDecl, pn: Param): boolean {
+  if pn.parRest != 0 { return false }
+  if pn.parType < 0 { return true }
+  const t = P.nodes[pn.parType]
+  if !(t is TypeRef) { return false }
+  let k = 0
+  while k < fd.fnTyParams.length {
+    if fd.fnTyParams[k] == t.tyName { return fnTpBoundOf(d, k) < 0 }
+    k = k + 1
+  }
+  false
+}
+
+// The function declaration call `c` reaches with positional arguments only, else -1.
+function litCallHoleDecl(c: Call): i32 {
+  for an in c.callArgNames {
+    if an != "" { return -1 }
+  }
+  if c.callFn < 0 { return -1 }
+  const d = cwCalleeDeclOf(c.callFn)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  if !(P.nodes[d] is FuncDecl) { return -1 }
+  d
+}
+
+// Whether object literal `objIx` is handed to a parameter pinned at its row whose body reads
 // field `name` off it: the hole is pinned at the literal's row, so a row boxing the field
 // would hand that read the box (D8620). A body using the parameter whole, or testing it with
 // `is`, which pins the hole at the tested record, keeps any row.
@@ -5575,18 +5645,82 @@ function litHoleReadsField(objIx: i32, name: string): boolean {
   if objIx >= litHoleHead.length { return false }
   let k = litHoleHead[objIx]
   while k >= 0 {
-    const fd = P.nodes[litHoleDecl[k]]
-    if fd is FuncDecl {
-      const p = litHoleParam[k]
-      if (
-        subtreeReadsField(fd.fnBody, p, name)
-        && !subtreeTestsIs(fd.fnBody, p)
-      ) {
-        return true
-      }
+    if holeBodyReadsField(litHoleDecl[k], litHoleParam[k], name, 0) {
+      return true
     }
     k = litHoleNext[k]
   }
+  false
+}
+
+// Whether function `d` reads field `name` off its hole `p` and never tests it with `is`:
+// directly, through an un-annotated binding of it, or by handing it to another parameter pinned
+// at its argument's row that does. Each hole is pinned at the literal's row.
+function holeBodyReadsField(
+  d: i32,
+  p: string,
+  name: string,
+  depth: i32,
+): boolean {
+  if d < 0 || d >= P.nodes.length || depth > LIT_HOLE_FWD_DEPTH { return false }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) { return false }
+  if subtreeTestsIs(fd.fnBody, p) { return false }
+  if subtreeReadsField(fd.fnBody, p, name) { return true }
+  holeFwdReadsField(fd.fnBody, d, p, name, depth)
+}
+
+// How many holes a literal is followed through by `holeBodyReadsField`.
+const LIT_HOLE_FWD_DEPTH = 4
+
+// Whether the subtree at `ix`, in function `d`, binds `p` bare to an un-annotated local or hands
+// it to a parameter pinned at its argument's row, and that one has its field `name` read.
+function holeFwdReadsField(
+  ix: i32,
+  d: i32,
+  p: string,
+  name: string,
+  depth: i32,
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  if n is LetDecl {
+    if n.letType < 0 && identNamed(n.letInit, p) {
+      if holeBodyReadsField(d, n.letName, name, depth + 1) { return true }
+    }
+  }
+  if n is Call {
+    const cd = litCallHoleDecl(n)
+    if cd >= 0 {
+      const cf = P.nodes[cd]
+      if cf is FuncDecl {
+        let i = 0
+        while i < n.callArgs.length && i < cf.fnParams.length {
+          const pn = P.nodes[cf.fnParams[i]]
+          if pn is Param && identNamed(n.callArgs[i], p) {
+            if paramTakesArgRow(cd, cf, pn) {
+              if holeBodyReadsField(cd, pn.parName, name, depth + 1) {
+                return true
+              }
+            }
+          }
+          i = i + 1
+        }
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if holeFwdReadsField(k, d, p, name, depth) { return true }
+  }
+  false
+}
+
+// Whether `ix`, parens peeled, is the identifier `name`.
+function identNamed(ix: i32, name: string): boolean {
+  const u = unwrapParen(ix)
+  if u < 0 || u >= P.nodes.length { return false }
+  const n = P.nodes[u]
+  if n is Ident { return n.identName == name }
   false
 }
 
@@ -5804,6 +5938,9 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // The row this literal's OWN destination names, computed on first need (D1690). -2 is
     // "not asked yet": a literal with no union-box field never pays for the lookup.
     let dstRow = 0 - 2
+    // The first declared row passed over only because an instance reads a field it boxes at
+    // the literal's own pin (D8680): taken when no other row fits.
+    let apartSi = -1
     const sLimA = sScanLim()
     const cands = objLitNameCands(o, sLimA)
     let ci = 0
@@ -5812,6 +5949,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       if sFieldCount[si] == nf {
         let ok = true
         let strict = true
+        let apart = false
         let k = 0
         while k < nf {
           const f = P.nodes[o.objFields[k]]
@@ -5849,10 +5987,13 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                       ok = false
                     } else if (
                       sc == FC_UNION
-                      && litHoleReadsField(objIx, f.fiName)
                       && litFieldBoxedApart(objIx, f.fiName, si, fnIx)
                     ) {
-                      ok = false
+                      if litHoleReadsField(objIx, f.fiName) {
+                        ok = false
+                      } else if litPinnedInInstance(objIx, f.fiName, fnIx) {
+                        apart = true
+                      }
                     }
                   }
                 }
@@ -5871,6 +6012,10 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
             strict = false
           }
           k = k + 1
+        }
+        if ok && apart {
+          if apartSi < 0 { apartSi = si }
+          ok = false
         }
         if ok {
           if firstSi < 0 { firstSi = si }
@@ -5934,9 +6079,28 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       // instead of a same-fieldset niche twin like `{f: boolean | null}`.
       if strictSi >= 0 { return strictSi }
     }
+    if firstSi < 0 {
+      if apartSi >= 0 { sioApartObj = objIx }
+      return apartSi
+    }
     return firstSi
   }
   -1
+}
+
+// The literal for which `structIndexOfObjCtxGo` most recently answered with the D8680 fallback:
+// a declared row the instance reads apart, taken only because no other row fits. -1 between reads.
+let sioApartObj = -1
+
+// Whether record literal `objIx` in instance `fnIx` is built at a declared row that boxes a
+// field the instance pins bare, for want of its own row (D8682): its own row must be minted.
+export function objLitRowIsApartFallback(objIx: i32, fnIx: i32): boolean {
+  if fnIx < 0 || objIx < 0 || objIx >= P.nodes.length { return false }
+  sioApartObj = -1
+  structIndexOfObjCtxGo(objIx, fnIx)
+  const r = sioApartObj == objIx
+  sioApartObj = -1
+  r
 }
 
 // True if a literal field value coded `vc` fits row `si`'s field `mfi`, coded `sc`, on the

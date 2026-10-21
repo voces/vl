@@ -234,8 +234,8 @@ const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
 const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096, NO_OUTSIDE = 8192, NO_INERT_OUT = 16384;
-const NO_INERT_SHAPE = 32768, NO_ARENA = 64;
-const LOOSE_ARGS = 65536, LOOSE_GETTER = 131072, LOOSE_SETTLED = 262144;
+const NO_LIT_ORDER = 32768, NO_ARENA = 64;
+const LOOSE_ARGS = 65536, LOOSE_GETTER = 131072, LOOSE_SETTLED = 262144, LOOSE_CALLS = 524288;
 
 // G builds a `J` from an inferred builder; main declares a record of the literal's own storage.
 const BUILT_LIB = (body: string) =>
@@ -244,9 +244,9 @@ const BUILT_LIB = (body: string) =>
   "  print(xj.f ?? 0)\n  print([kk][0].f)\n}\n";
 const BUILT_MAIN = 'import { jj } from "./lib"\ntype II = { f: i32 }\njj()\n';
 
-// The fresh guard, the asks guard, the ambient guard's arena half and the outside guard's undo
-// halves have no mask witness: no graph found shows a served answer that differs once they are
-// dropped, so they are defensive.
+// The fresh guard, the asks guard and the outside guard's undo halves have no mask witness: no
+// graph found shows a served answer that differs once they are dropped, so they are defensive.
+// The ambient guard's arena half is witnessed only beside a dropped literal filter.
 // The twin, called-generic and narrowed ambient keys carry must-serve and must-decline controls.
 const CASES: Case[] = [
   {
@@ -337,7 +337,109 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "ambient",
-    mask: NO_INERT_SHAPE,
+    mask: NO_INERT_OUT,
+  },
+  {
+    // A string literal set renders in the order its first-interned spelling gave it.
+    name: "a row G renders as a string literal union is not served beside another member order",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\nconst z: "b" | "a" = "b"\nprint(z)\nprint(area(2))\n',
+      "lib.vl": 'export function area(n: i32): i32 {\n  const k: "a" | "b" = "a"\n' +
+        '  const t = k ?? "b"\n  print(t)\n  n\n}\n',
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_LIT_ORDER,
+  },
+  {
+    name: "an error G renders as a string literal union is not served beside a sibling's order",
+    graph: {
+      "main.vl": 'import { two } from "./g2"\nimport { area } from "./lib"\nprint(two())\n' +
+        "print(area(2))\n",
+      "g1.vl": 'export function one(): "a" | "b" { "a" }\n',
+      "g2.vl": 'export function two(): "b" | "a" { "b" }\n',
+      "lib.vl": 'import { one } from "./g1"\nimport { two } from "./g2"\n' +
+        "export function area(n: i32): i32 {\n  const k = one()\n  const j: i32 = k\n" +
+        "  print(two())\n  n + j\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_LIT_ORDER,
+  },
+  {
+    name: "an error G renders by a literal union alias is not served beside a sibling's alias",
+    graph: {
+      "main.vl": 'import { two } from "./g2"\nimport { area } from "./lib"\nprint(two())\n' +
+        "print(area(2))\n",
+      "g1.vl": 'export type L1 = "p" | "q"\nexport function one(): i32 { 1 }\n',
+      "g2.vl": 'export type L2 = "q" | "p"\nexport function two(): i32 { 2 }\n',
+      "lib.vl": 'import { one } from "./g1"\nimport { two } from "./g2"\n' +
+        'function lit(c: boolean): "p" | "q" {\n  if c { return "p" }\n  "q"\n}\n' +
+        "export function area(n: i32): i32 {\n  const j: i32 = lit(n > 1)\n" +
+        "  n + j + one() + two()\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_LIT_ORDER,
+  },
+  {
+    name: "a row G renders by a literal union alias is not served beside a sibling's alias",
+    graph: {
+      "main.vl": 'import { two } from "./g2"\nimport { area } from "./lib"\nprint(two())\n' +
+        "print(area(2))\n",
+      "g1.vl": 'export type L1 = "p" | "q"\nexport function one(): i32 { 1 }\n',
+      "g2.vl": 'export type L2 = "q" | "p"\nexport function two(): i32 { 2 }\n',
+      "lib.vl": 'import { one } from "./g1"\nimport { two } from "./g2"\n' +
+        'function lit(c: boolean): "p" | "q" {\n  if c { return "p" }\n  "q"\n}\n' +
+        "export function area(n: i32): i32 {\n  const k = lit(n > 1)\n" +
+        "  if k != null { n + one() + two() } else { 0 }\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_LIT_ORDER,
+  },
+  {
+    name: "a row G renders by the one alias of its literal union is served",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype L2 = "q" | "r"\nconst y: L2 = "q"\n' +
+        "print(y)\nprint(area(2))\n",
+      "lib.vl": 'type L1 = "p" | "q"\nexport function area(n: i32): i32 {\n' +
+        '  const z: L1 = "p"\n  if z != null { n } else { 0 }\n}\n',
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a row G renders as a numeric literal union is served beside another member order",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\nconst z: 2 | 1 = 2\nprint(z)\nprint(area(2))\n',
+      "lib.vl": "export function area(n: i32): i32 {\n  const k: 1 | 2 = 1\n" +
+        "  const t = k ?? 2\n  print(t)\n  n\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a row that renders no type is served beside an outside union",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
+        "print(area(2))\nprint(x)\n",
+      "lib.vl": "const stack: i32[] = [1, 2]\nexport function area(n: i32): i32 {\n" +
+        "  let s = n\n  if stack.length > 0 { s = s + (stack.pop() ?? 0) }\n  s\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a redundant annotation that renders a map of a primitive is served beside one",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
+        "print(area(2))\nprint(x)\n",
+      "lib.vl": "export function area(n: i32): i32 {\n  const k: Map<string, i32> = Map()\n" +
+        "  const q: Map<string, i32> = k\n  print(q.length)\n  n\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
   },
   {
     name: "a redundant annotation that renders a primitive is served beside an outside union",
@@ -394,13 +496,14 @@ const CASES: Case[] = [
     want: "served",
   },
   {
-    name: "a same-shape record outside G declines a target whose rows could name either",
+    // Each record renders by its own name, so a row naming G's `P` is served beside `Q`.
+    name: "a same-shape record outside G is served beside a row that renders G's record",
     graph: {
       "main.vl": TWIN_MAIN("i32"),
       "lib.vl": TWIN_LIB("(p ?? p).x"),
     },
     target: "lib.vl",
-    want: "ambient",
+    want: "served",
   },
   {
     name: "a same-shape record outside G is one type with G's beside a row that renders a primitive",
@@ -666,7 +769,7 @@ const CASES: Case[] = [
     want: "served",
   },
   {
-    name: "a record G holds at an outside record's storage declines",
+    name: "a record G holds only at an outside record's storage is served",
     graph: {
       "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: i32, y: i32 }\n' +
         "const c: Ct = { x: 1, y: 2 }\nprint(mk() + c.y)\n",
@@ -674,7 +777,52 @@ const CASES: Case[] = [
         "export function mk(): i32 { pt(1, 2).y }\n",
     },
     target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a built literal G delivers to a record stored apart from an outside one declines",
+    graph: {
+      "main.vl": BUILT_MAIN,
+      "lib.vl": "type J = { f: f64 }\nfunction mk() { { f: 4 } }\nexport function jj(): void {\n" +
+        "  const xj: J | string = mk()\n  const kk = mk()\n  if xj is J { print(xj.f) }\n" +
+        "  print([kk][0].f)\n}\n",
+    },
+    target: "lib.vl",
     want: "ambient",
+    mask: NO_ARENA | LOOSE_SETTLED,
+  },
+  {
+    name: "a method call a dirty G makes declines beside an outside import of the name",
+    graph: {
+      "main.vl": 'import { indexOf } from "std:array"\nimport { at } from "./lib"\n' +
+        "print(at() + [1, 2].indexOf(2))\n",
+      "lib.vl": "export function at(): i32 {\n  const xs: i32[] = [4, 5]\n  xs.indexOf(5)\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: LOOSE_CALLS,
+  },
+  {
+    name: "a method call a clean G resolves is served beside an outside one of the name",
+    graph: {
+      "main.vl": 'import { indexOf } from "std:array"\nimport { at } from "./lib"\n' +
+        "print(at() + [1, 2].indexOf(2))\n",
+      "lib.vl": "type W = { s: string }\nfunction indexOf(self: W, c: string): i32 { 1 }\n" +
+        'export function at(): i32 {\n  const w: W = { s: "ab" }\n  w.indexOf("b")\n}\n',
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a built literal G delivers only at an outside record's storage is served",
+    graph: {
+      "main.vl": BUILT_MAIN,
+      "lib.vl": "type J = { f: i32 }\nfunction mk() { { f: 4 } }\nexport function jj(): void {\n" +
+        "  const xj: J | string = mk()\n  const kk = mk()\n  if xj is J { print(xj.f) }\n" +
+        "  print([kk][0].f)\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
   },
   {
     name: "a literal G pushes onto its own list is served beside a record of its fields",

@@ -115,7 +115,6 @@ import {
   scalarTagOfKind,
   tyMapKeyKind,
   unRowOfKey,
-  vbHeapIdxOfKind,
 } from "./emit_rep"
 import {
   elemNameIsNominal,
@@ -261,7 +260,7 @@ import {
   tyMapValOfHeld,
 } from "./tyquery"
 
-// The mv shape of a bare map spelling — `mvShapeOfValName` of the map's value. One home, so
+// The mv shape of a bare map spelling — `mvShapeOfValNameTys` of the map's value. One home, so
 // that getting from `{[string]: V}` to its value rep is decided once rather than at each call
 // site. This is also the one place the key enters the mv layer: every other resolver takes it
 // as an argument, so an i32-keyed map's value interns against the i32 key rep untaught.
@@ -309,22 +308,10 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   sh
 }
 
-// Classify and intern a map value type-name, returning the binding's map shape code: `-1` for
-// the mono i32 map, a slot `>= 0` for a ref or scalar value type, `-3` unsupported. Interning
-// is idempotent. A struct value forces the element's ref-list types, and every ref-valued map
-// forces the string-list keys and the mono map types the shared probe machinery rides on.
-export function mvShapeOfValName(valNameIn: string) {
-  mvShapeOfValNameK(valNameIn, MAP_KEY_STR)
-}
-
-// The arena leg can front a find; it must not front a mint (D-MAPNODETY). This function is
-// the mv-slot interner: its first rung asks whether a slot already exists, and everything
-// below creates one when it does not, so a better answer there skips the mint and emits
-// invalid wasm. The `rowTy` form below is the exception, since it carries the same input.
-export function mvShapeOfValNameK(valNameIn: string, keyK: i32) {
-  mvShapeOfValNameRowTy(valNameIn, keyK, -1)
-}
-
+// Classify and intern a map value type-name under key kind `keyK`, returning the binding's map
+// shape code: `-1` for the mono i32 map, a slot `>= 0` for a ref or scalar value type, `-3`
+// unsupported. Interning is idempotent. The arena leg can front a find but not a mint
+// (D-MAPNODETY); `rowTy` may, since it is the value's own recorded type.
 export function mvShapeOfValNameRowTy(
   valNameIn: string,
   keyK: i32,
@@ -914,14 +901,6 @@ export function cloArmTagOfTy(ty: i32): i32 {
   cloSigSlotTag(cloSigTagSlot(tyToEmitName(ty)))
 }
 
-// The interned value-box heap-type index for a scalar atom (`boolean` shares the i32 box),
-// or -1 for `string`/`null` (a string ref is already an `anyref` subtype; null is
-// `ref.null`), and likewise for the five list flavours and the closure atom, which ride the
-// box anyref directly. The kind-to-box table lives in `emit_rep` (`vbHeapIdxOfKind`).
-export function vbHeapIdxOfAtom(atom: string) {
-  vbHeapIdxOfKind(valueAtomKind(atom))
-}
-
 // `registerValueUnionName` with the caller's arena type for this union, or -1 when the
 // caller has only a name. The row's `unTyIx` entry is that index, so the registry can be
 // asked by type rather than by spelling once its readers move.
@@ -1129,7 +1108,7 @@ export function markAtomLeafListArms(mems: i32[]) {
 
 // Interns the map value-slot for every map arm of the union `name` — its box payload rides
 // that arm's map struct ref, and `mapTagOf` needs the slot to exist. Forces the shared map
-// heap flags and interns the arm's value shape via `mvShapeOfValName`; a mono/atom value
+// heap flags and interns the arm's value shape via `mvShapeOfValNameTys`; a mono/atom value
 // interns no slot (rides -1), a typed value gets a distinct mv slot and `mapSlotTag`.
 export function markMapUnionArms(name: string) {
   const atoms: string[] = []
@@ -1148,7 +1127,7 @@ export function markMapUnionArmsRow(u: i32) {
 function markMapUnionArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   // D-UNION: a map arm is a `TyMap` member (`unMemIsMap`), not a `{[`-prefixed
   // rendering. The arm's stored atom TEXT still keys the (name-keyed) map-value slot
-  // layer below (`mapValNameOf` → `mvShapeOfValName`). Uncovered rows keep the name gate.
+  // layer below (`mapValNameOf` → `mvShapeOfValNameTys`). Uncovered rows keep the name gate.
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
@@ -2075,14 +2054,18 @@ export function isUNameAnnAB(site: i32, annIx: i32): boolean {
 }
 
 // The value-union mint's seam. `registerValueUnionName` resolves the spelling once at the
-// boundary; a switched site, or mode 2, mints from the caller's id instead. Armed, it then asks
-// the read seams' question: does the caller's id name the row the spelling now names.
+// boundary; a switched site, mode 2, or the inline mint over a type `valueUnionTyIsFlat` accepts
+// mints from the caller's id instead. Armed, it then asks the read seams' question: does the
+// caller's id name the row the spelling now names.
 export function registerValueUnionNameAB(
   site: i32,
   name: string,
   ty: i32,
 ): i32 {
-  const k = ty >= 0 && (unSiteOnKey(site) || unABMode == 2)
+  const k = ty >= 0
+    && (unSiteOnKey(site)
+    || unABMode == 2
+    || (site == 55 && valueUnionTyIsFlat(ty)))
   if k {
     registerValueUnionNameTy(name, ty)
   } else {
@@ -2094,4 +2077,23 @@ export function registerValueUnionNameAB(
   if ty >= 0 { dr = unRowOfTyAB(site, ty) }
   unABProbe(site, unRowOfName(name), dr, ty)
   0
+}
+
+// Whether `ty` is a value union whose members are its spelling's atoms: no literal member, which
+// the spelling softens to its base, and no nested union alias, which the spelling flattens.
+function valueUnionTyIsFlat(ty: i32): boolean {
+  if isValueUnionTyOr(ty) != 1 { return false }
+  let u = ty
+  const t = T.tys[ty]
+  if t is TyNullable { u = t.nInner }
+  if u < 0 { return false }
+  const ut = T.tys[u]
+  if ut is TyUnion {
+    for m in ut.uMembers {
+      if m < 0 { return false }
+      const mt = T.tys[m]
+      if mt is TyUnion { return false }
+    }
+  }
+  true
 }

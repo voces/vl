@@ -43,7 +43,6 @@ import {
   WhileStmt,
 } from "./ast"
 import {
-  canonUnionKey,
   canonUnionKeyNullAtOfTy,
   canonUnionKeyOfAnnName,
   canonUnionKeyOfName,
@@ -490,14 +489,20 @@ function unionArmsOfSetTy(name: string, s: i32, ty: i32, out: string[]) {
   nm
 }
 
-// Files the row being minted, whose member set is `spelling` and whose member slice is already
-// recorded, under its arena type's union key, else under `spelling`'s; the spelling's key finds
-// the row too. The type key goes to a row with `null` last, as its type's key places it, and
-// only while the key's first row records the same members `null`'s position aside.
+// Files the row being minted (member set `spelling`, slice recorded) under its type's union key,
+// else under its softened key, which finds the row too. A row with `null` before a member, or
+// whose softened key has another member count, keeps `spelling`'s key; the type key also needs
+// `null` last and the key's first row to record the same members, `null`'s position aside.
 export function unKeyPushOfTy(ty: i32, spelling: string) {
-  softKeyProbeAt("keyPush", spelling, ty)
-  const nk = canonUnionKeyOfName(spelling)
   const u = unKey.length
+  let nk = -1
+  if unRowNullLast(u) {
+    const kept = sukKeptAtoms(ty, [])
+    if kept.length == unMemTyCount[u] {
+      nk = canonUnionKeyOfText(sukJoin(kept))
+    }
+  }
+  if nk < 0 { nk = canonUnionKeyOfName(spelling) }
   let k = -1
   if ty >= 0 && unRowNullLast(u) { k = canonUnionKeyOfTy(ty) }
   if k >= 0 && k < unKeyFirstRow.length {
@@ -542,32 +547,32 @@ export function unionRowOf(name: string): i32 {
   unRowOfSetText(name)
 }
 
-// The softened key text of `ty`: the member sequence of its emit render, literals widened to
-// their scalar and a union alias flattened where its members are, read off the type and never
-// off a rendered string. An integer-literal union over two widths is its widths. "" when `ty`
-// renders as fewer than two atoms or has a part this walk does not split.
-export function softUnionKeyTextOfTy(ty: i32): string {
-  softUnionKeyTextOfTyIn(ty, [])
+// The softened key text of `ty`: its emit render's member sequence, literals widened (an integer
+// union over two widths is its widths) and union aliases flattened, read off the type. "" when
+// `ty` renders as fewer than two atoms or has a part this walk does not split. An anonymous
+// record member is spelled as the first declaration in `stmts` of its exact shape.
+export function softUnionKeyTextOfTyIn(ty: i32, stmts: i32[]): string {
+  sukJoin(sukKeptAtoms(ty, stmts))
 }
 
-// `softUnionKeyTextOfTy` with each anonymous record member spelled as the first declaration
-// in `stmts` of its exact shape, as an inferred return's recorded name spells it.
-export function softUnionKeyTextOfTyIn(ty: i32, stmts: i32[]): string {
-  if ty < 0 { return "" }
+// The atoms of `softUnionKeyTextOfTyIn`'s text, each once in first-seen order; empty where
+// that text is "".
+function sukKeptAtoms(ty: i32, stmts: i32[]): string[] {
+  const kept: string[] = []
+  if ty < 0 { return kept }
   let atoms: string[] = []
-  if !sukAtomsAt(ty, RC_ROOT, true, stmts, atoms) { return "" }
+  if !sukAtomsAt(ty, RC_ROOT, true, stmts, atoms) { return kept }
   if atoms.length < 2 {
     const widths: string[] = []
     for b in intLitUnionBasesOf(ty) {
       widths.push(tyToEmitNameAt(b, RC_UNION_MEM))
     }
-    if widths.length < 2 { return "" }
+    if widths.length < 2 { return kept }
     atoms = widths
   }
-  const kept: string[] = []
   for a in atoms {
     const ex: string[] = []
-    if !sukAliasAtoms(a, ex) { return "" }
+    if !sukAliasAtoms(a, ex) { return [] }
     for e in ex {
       let dup = false
       for k in kept {
@@ -576,9 +581,13 @@ export function softUnionKeyTextOfTyIn(ty: i32, stmts: i32[]): string {
       if !dup { kept.push(e) }
     }
   }
-  if kept.length < 2 { return "" }
+  if kept.length < 2 { return [] }
+  kept
+}
+
+function sukJoin(atoms: string[]): string {
   let out = ""
-  for k in kept {
+  for k in atoms {
     if out != "" { out = out + "|" }
     out = out + k
   }
@@ -800,7 +809,7 @@ export function unRowOfSetText(set: string): i32 {
 let sukNotes: string[] = []
 
 export function softKeyProbe(site: i32, name: string, ty: i32) {
-  softKeyProbeAt(unABSiteName(site), name, ty)
+  softKeyProbeIn(unABSiteName(site), name, ty, [])
 }
 
 // `softKeyProbe` for a caller that offers no type of its own, only the one `name` renders.
@@ -811,10 +820,6 @@ export function softKeyProbeNoTy(
   stmts: i32[],
 ) {
   softKeyProbeIn("noTy/" + unABSiteName(site), name, ty, stmts)
-}
-
-export function softKeyProbeAt(label: string, name: string, ty: i32) {
-  softKeyProbeIn(label, name, ty, [])
 }
 
 function softKeyProbeIn(label: string, name: string, ty: i32, stmts: i32[]) {
@@ -1298,19 +1303,12 @@ export function unionHasAtomAB(
 // The key-stability check, per row: does the key the row's producer minted equal the key the
 // other two producers (the arena type, the recorded member set) would obtain? A key with
 // three entry points is only a key if they land on one id — the property step 5's switch
-// rests on. `ty-none` separates "the arena route has no render" from "it disagrees".
+// rests on. `tykey-none` separates "the arena route has no key" from "it disagrees".
 function unKeySweepRow(u: i32, ty: i32) {
   let k = -1
   if u < unKey.length { k = unKey[u] }
   if k >= 0 { repShadowBumpReason("keySweep/covered") }
   if ty >= 0 {
-    const kt = canonUnionKey(ty)
-    if kt < 0 { repShadowBumpReason("keySweep/ty-none") }
-    else if kt == k { repShadowBumpReason("keySweep/ty-agree") }
-    else { repShadowBumpReason("keySweep/ty-differ") }
-    // The step-4a route beside the step-3 one, on the same rows in the same run: the
-    // structural render's reach is what `tykey-*` has to beat, and a table of one is a
-    // number nobody can grade.
     const kn = canonUnionKeyOfTy(ty)
     if kn < 0 { repShadowBumpReason("keySweep/tykey-none") }
     else if kn == k { repShadowBumpReason("keySweep/tykey-agree") }
@@ -2090,12 +2088,8 @@ export function unionSetHasNullTy(set: string, ty: i32): boolean {
   unionHasAtom(set, "null")
 }
 
-// CARDINALITY of a member set's non-`null` members, structurally.
-export function unionSetNonNullCount(set: string): i32 {
-  unionSetNonNullCountTy(set, -1)
-}
-
-// `unionSetNonNullCount` for a caller that also holds `set`'s arena type `ty`, or -1.
+// CARDINALITY of a member set's non-`null` members, structurally; `ty` is `set`'s arena type
+// when the caller holds it, or -1.
 export function unionSetNonNullCountTy(set: string, ty: i32): i32 {
   const s = msSetOfNameTy(set, ty)
   if s >= 0 { return msNonNullCount(s) }
