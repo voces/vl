@@ -12,16 +12,23 @@ import { wsVarTy } from "./tyquery"
 import {
   T,
   TyArray,
+  TyErr,
+  TyFunc,
+  TyLit,
   TyMap,
+  TyNeg,
   TyNullable,
   TyObj,
+  TyPrim,
   TyUnion,
+  TyVar,
   tyEqSameHoles,
   tyHasHole,
   tyHasInferHole,
 } from "./check_types"
 import { wsNoteInstErr } from "./check_width"
-import { Ident, P, i32ToStr } from "./ast"
+import { FuncDecl, Ident, P, i32ToStr } from "./ast"
+import { i32ListHas } from "./listutil"
 import { lookupFnDeclNode } from "./check_scopes"
 import { cwPeel, fnDeclIx } from "./check_write_scan"
 
@@ -667,6 +674,9 @@ export function noteLetCstr(got: i32, want: i32, ix: i32, name: string) {
       // A top-level function named as the value has only its own holes, which the delivery
       // checked its body at; a row would be re-asked of every later call of it (D5972).
       if !tyHasHole(want) && namesTopFnDecl(ix) { return 0 }
+      // So does one held in a literal or handed back by a call: every hole rides such a
+      // function's own signature, which the delivery judged against `want` (D9031).
+      if !tyHasHole(want) && tyHolesOnlyInTopFnSigs(got, 8) { return 0 }
     }
     let k = 0
     while k < letCstr.got.length {
@@ -700,6 +710,66 @@ function namesTopFnDecl(ix: i32): boolean {
   if !(n is Ident) { return false }
   const d = lookupFnDeclNode(n.identName)
   d >= 0 && (fnDeclIx[n.identName] ?? -1) == d
+}
+
+// Whether every hole in `ty` sits inside the open signature of a top-level function with an
+// un-annotated parameter whose body is not being checked; false at the depth floor.
+function tyHolesOnlyInTopFnSigs(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  if !tyHasHole(ty) { return true }
+  const t = T.tys[ty]
+  match t {
+    TyFunc => {
+      if fnTyIsTopHoleSig(t) { return true }
+      for p in t.fnParamTypes {
+        if !tyHolesOnlyInTopFnSigs(p, depth - 1) { return false }
+      }
+      tyHolesOnlyInTopFnSigs(t.fnRet, depth - 1)
+    }
+    TyArray => tyHolesOnlyInTopFnSigs(t.aElem, depth - 1)
+    TyNullable => tyHolesOnlyInTopFnSigs(t.nInner, depth - 1)
+    TyMap => {
+      tyHolesOnlyInTopFnSigs(t.mKey, depth - 1)
+        && tyHolesOnlyInTopFnSigs(t.mVal, depth - 1)
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if !tyHolesOnlyInTopFnSigs(f, depth - 1) { return false }
+      }
+      true
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if !tyHolesOnlyInTopFnSigs(m, depth - 1) { return false }
+      }
+      true
+    }
+    TyNeg => tyHolesOnlyInTopFnSigs(t.negTy, depth - 1)
+    TyVar | TyPrim | TyErr | TyLit => false
+  }
+}
+
+// Whether function type `f` is a top-level function's own open signature: its first hole
+// parameter is named for a declaration (`?name.k`) that is not on the constraint-owner stack.
+function fnTyIsTopHoleSig(f: TyFunc): boolean {
+  for p in f.fnParamTypes {
+    if p >= 0 && p < T.tys.length {
+      const pv = T.tys[p]
+      if pv is TyVar {
+        const nm = pv.tvName
+        const dot = nm.indexOf(".")
+        if nm.slice(0, 2) == "?#" || dot < 2 || nm.slice(0, 1) != "?" {
+          return false
+        }
+        const d = fnDeclIx[nm.slice(1, dot)] ?? -1
+        if d < 0 || d >= P.nodes.length || i32ListHas(cstrOwnerStack, d) {
+          return false
+        }
+        return P.nodes[d] is FuncDecl
+      }
+    }
+  }
+  false
 }
 
 // Is `at` a composite argument whose hole only a pin can decide against the concrete `exp`? A
