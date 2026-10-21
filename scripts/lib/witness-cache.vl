@@ -1,0 +1,109 @@
+// The filed-witness grader's outcome cache: what `vl` did with each witness, kept on disk
+// under a key naming everything that can move that answer (the seed's and the host's bytes,
+// the std tree, the grader's own sources, every `VL_*` setting). A record holds the witness
+// text whole, so a hit is an exact match of text and key, never a hash's.
+//
+//     import { Cached, decodeRecords, encodeRecords } from "./lib/witness-cache"
+//
+// A record file is a sequence of `<byte length>:<bytes>` fields: the key text, then five per
+// witness. A witness's own directory appears in its detail or output as `ROW_MARK`, so a hit
+// re-reads as the same text a fresh run would print in this run's directory.
+
+import { parseI32, toString } from "std:fmt"
+import { join } from "std:str"
+
+// One witness's answer; `plen` is the byte length of the row directory it ran in.
+export type Cached = {
+  outcome: string,
+  detail: string,
+  stdout: string,
+  plen: i32,
+}
+
+// Stands for a witness's row directory, with its trailing slash, inside a cached text.
+export const ROW_MARK = "<cfw-row-dir>/"
+
+// FNV-1a 64 of `data`, continued from `h0`.
+export function fnvFeed(h0: i64, data: u8[]): i64 {
+  let h = h0
+  let i = 0
+  while i < data.length {
+    h = (h ^ (data[i] as i64)) * 1099511628211
+    i = i + 1
+  }
+  h
+}
+
+// `h` as sixteen lowercase hex digits.
+export function hex64(h: i64): string {
+  const digits = "0123456789abcdef"
+  let out = ""
+  let k = 15
+  while k >= 0 {
+    const d = ((h >> ((k * 4) as i64)) & 15) as! i32
+    out = out + digits.slice(d, d + 1)
+    k = k - 1
+  }
+  out
+}
+
+function field(s: string): string { toString(s.length) + ":" + s }
+
+// A record file for `head` holding `vals[k]` as the answer for witness `keys[k]`.
+export function encodeRecords(
+  head: string,
+  keys: string[],
+  vals: Cached[],
+): string {
+  const parts: string[] = [field(head)]
+  let k = 0
+  while k < keys.length {
+    const v = vals[k]
+    parts.push(field(keys[k]))
+    parts.push(field(v.outcome))
+    parts.push(field(v.detail))
+    parts.push(field(v.stdout))
+    parts.push(field(toString(v.plen)))
+    k = k + 1
+  }
+  join(parts, "")
+}
+
+// The fields of `text` in order, or null when it is not a whole sequence of fields.
+function fields(text: string): string[] | null {
+  const out: string[] = []
+  let i = 0
+  while i < text.length {
+    let j = i
+    while j < text.length && text[j] != 58 { j = j + 1 }
+    if j >= text.length { return null }
+    const n = parseI32(text.slice(i, j))
+    if n == null { return null }
+    if n < 0 || j + 1 + n > text.length { return null }
+    out.push(text.slice(j + 1, j + 1 + n))
+    i = j + 1 + n
+  }
+  out
+}
+
+// The answers a record file holds, by witness text; empty unless its key text is `head`.
+export function decodeRecords(text: string, head: string): Map<string, Cached> {
+  const got: Map<string, Cached> = Map()
+  const fs = fields(text)
+  if fs == null { return got }
+  if fs.length == 0 || fs[0] != head || (fs.length - 1) % 5 != 0 { return got }
+  let k = 1
+  while k < fs.length {
+    const plen = parseI32(fs[k + 4])
+    if plen != null {
+      got[fs[k]] = {
+        outcome: fs[k + 1],
+        detail: fs[k + 2],
+        stdout: fs[k + 3],
+        plen: plen,
+      }
+    }
+    k = k + 5
+  }
+  got
+}
