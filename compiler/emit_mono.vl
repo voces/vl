@@ -402,6 +402,7 @@ import {
   sTyIx,
   startStmtOrd,
   startStmts,
+  uVarTyIx,
   uVariants,
   unNames,
 } from "./emit_state"
@@ -1024,6 +1025,9 @@ export function monoArgPinTyIx(ix: i32, fnIx: i32) {
   }
   const pn = monoCloPinAnnNodeOfExpr(ax, fnIx)
   if pn >= 0 { return nodeTyIxOf(pn) }
+  // The variant `monoArgTyNameRep` pinned an unadopted literal at banks that variant's type.
+  const ov = monoArgOwnVariant(ax)
+  if ov >= 0 && ov < uVarTyIx.length { return uVarTyIx[ov] }
   own
 }
 
@@ -1377,6 +1381,15 @@ function monoSpelledShapeStaysAnon(sp: string): boolean {
   nm.length >= 5 && nm.slice(0, 5) == "#anon"
 }
 
+// The pin for a list literal of type `lt` whose record element has no committed name, as a
+// generic constructor's result has none before its instance exists: the list's own spelling
+// through the pin membership list, else "" (D8321).
+function monoAnonListPinName(lt: i32): string {
+  const el = tyRefArrElemOf(lt)
+  if el < 0 || !(T.tys[el] is TyObj) { return "" }
+  monoAnnPinName(tyToEmitName(lt))
+}
+
 // Composite annotation `ann` substituted with each `#anonN` binding spelled by its row's shape,
 // where that shape resolves back to the same row, else `pinC`. A handle inside a record spelling
 // resolves to nothing, and the field-set scan then claims a declared record (D3144).
@@ -1697,7 +1710,9 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
       // A spread copy pins the row it is built at, its source's (D2938).
       const spn = spreadLitSrcRowName(ix, fnIx)
       if spn != "" { return arrElemSuffixed(spn) }
-      return arrElemSuffixed(arrLitElemName(ix))
+      const aen = arrLitElemName(ix)
+      if aen == "" { return monoAnonListPinName(nodeTyIxOf(ix)) }
+      return arrElemSuffixed(aen)
     }
     // The arena, for every other shape: a call or projection reaches this floor with a type
     // the checker recorded and no literal to read an element off. The same question the
@@ -1768,6 +1783,11 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     if avn != "" { return avn }
   }
   if exprStruct(ix, fnIx) {
+    const olv = monoArgOwnVariant(cax)
+    if olv >= 0 && olv < uVariants.length {
+      const olp = monoAnnPinName(uVariants[olv])
+      if olp != "" { return olp }
+    }
     const si = structIndexOfExpr(ix, fnIx)
     if si >= 0 { return sNames[si] }
     // No `sNames` row, but a good spelling — the checker's recorded shape, routed through
@@ -1794,6 +1814,89 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   if exprNullableVariant(ix, fnIx) { return "" }
   if exprNullableRefArray(ix, fnIx) { return "" }
   "i32"
+}
+
+// Unadopted object literal -> the variant row of the union destination its generic calls hand
+// it to, as `monoNoteLitDest` records it.
+let monoLitDestVariant: {[i32]: i32} = Map()
+
+// The variant row `monoNoteLitDest` recorded for argument `ix`, else -1.
+function monoArgOwnVariant(ix: i32): i32 {
+  monoLitDestVariant[unwrapParen(ix)] ?? -1
+}
+
+// Records the variant row an unadopted object literal at `at` lands in when `at`, a generic
+// call handing the literal back, is delivered to union-typed `tyNode`. The literal's own type
+// is that variant's, while the field-name scan would pin a declared record sharing it (D8381).
+function monoNoteLitDest(at: i32, tyNode: i32): i32 {
+  if at < 0 || tyNode < 0 { return 0 }
+  const dt = nodeTyIxOf(tyNode)
+  if dt < 0 || dt >= T.tys.length { return 0 }
+  const du = T.tys[dt]
+  if !(du is TyUnion) { return 0 }
+  monoNoteLitDestIn(unwrapParen(at), du.uMembers, 0)
+}
+
+// `monoNoteLitDest` through call `x` at nesting `depth`, over destination members `ms`.
+function monoNoteLitDestIn(x: i32, ms: i32[], depth: i32): i32 {
+  const c = P.nodes[x]
+  if !(c is Call) || depth > TY_WALK_DEPTH { return 0 }
+  const ct = nodeTyIxOf(x)
+  for a in c.callArgs {
+    const ax = unwrapParen(a)
+    const at = nodeTyIxOf(ax)
+    if ax >= 0 && monoTyMutual(at, ct) {
+      if P.nodes[ax] is Call {
+        monoNoteLitDestIn(ax, ms, depth + 1)
+      } else if P.nodes[ax] is ObjLit && nodeRepTyIxOf(ax) == at {
+        const vr = monoVariantRowAmong(at, ms)
+        if vr >= 0 { monoLitDestVariant[ax] = vr }
+      }
+    }
+  }
+  0
+}
+
+// The one variant row whose type is in `ms` and is `ty`'s own, else -1.
+function monoVariantRowAmong(ty: i32, ms: i32[]): i32 {
+  let vr = -1
+  let i = 0
+  while i < uVarTyIx.length && i < uVariants.length {
+    const vt = uVarTyIx[i]
+    if monoTyIn(vt, ms) && monoTyMutual(vt, ty) {
+      if vr >= 0 { return -1 }
+      vr = i
+    }
+    i = i + 1
+  }
+  vr
+}
+
+// `monoNoteLitDestIn` for each call element of list literal `ix`, where the list's element
+// type is a variant's: the list stores that variant's row.
+function monoNoteListLitDests(ix: i32): i32 {
+  const n = P.nodes[ix]
+  const lt = nodeTyIxOf(ix)
+  if !(n is ArrayLit) || lt < 0 || lt >= T.tys.length { return 0 }
+  const l = T.tys[lt]
+  if !(l is TyArray) || l.aElem < 0 { return 0 }
+  const ms = [l.aElem]
+  for e in n.arrElems { monoNoteLitDestIn(unwrapParen(e), ms, 0) }
+  0
+}
+
+// Whether type `t` is, up to mutual assignability, one of `ms`.
+function monoTyIn(t: i32, ms: i32[]): boolean {
+  for m in ms {
+    if m == t || monoTyMutual(m, t) { return true }
+  }
+  false
+}
+
+// Whether types `a` and `b` are each assignable to the other; false for a hole.
+function monoTyMutual(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  assignable(a, b) && assignable(b, a)
 }
 
 // The pin a litunion or litunion-list argument `ix` takes, "" for any other argument.
@@ -9671,6 +9774,14 @@ function monoMakeInstanceHit(
   false
 }
 
+// The parameter annotation for pin `name`, typed `tyFb` where the name does not resolve. A list
+// of a literal's `#anon` row resolves to no type by name, so it takes the row's list (D4710).
+function monoSynthPinRef(name: string, tyFb: i32): i32 {
+  const alt = monoAnonRowListTy(name)
+  if alt >= 0 { return synthTypeRefTy(name, -1, alt) }
+  synthTypeRefFb(name, -1, tyFb)
+}
+
 // The instance's parameters, cloned with each one's pinned annotation: pushes one cloned
 // `Param` per declared parameter onto `nps` and its resolved arena row (-1 for none) onto
 // `pinnedTyIx`, one row per entry of `params`. 0 on success, -1 when a record argument's
@@ -9721,7 +9832,7 @@ function monoMakeInstanceParams(
             gateTy,
             unTyKeyTagParam(),
           )
-          nt = synthTypeRefFb(pinName, -1, pinTys[pj])
+          nt = monoSynthPinRef(pinName, pinTys[pj])
           // A literal-union arm beside a scalar (`T | i32` at `T := K`) boxes under a row too,
           // and no direct spelling minted one (D5310).
           if monoTyHoldsLitUnionArm(nodeTyIxOf(nt)) {
@@ -9733,7 +9844,7 @@ function monoMakeInstanceParams(
           synthed = true
         }
       } else if annotateI32 || pinned[pj] != "i32" {
-        nt = synthTypeRefFb(pinned[pj], -1, pinTys[pj])
+        nt = monoSynthPinRef(pinned[pj], pinTys[pj])
         // The pin name renders inline literal members as `string`; a union box holding them
         // keeps the argument's own members, which its narrowed reads are keyed on (D8181).
         if monoPinKeepsInlineLits(nodeTyIxOf(nt), pinTys[pj]) {
@@ -10002,7 +10113,12 @@ function monoMakeInstanceRetExpr(
           }
         }
       }
-      if rxe is Ident {
+      // A return of a parameter pinned at `null` returns the `nullref` it holds; the checker's
+      // recorded return for a hole instance is not `null`, so nothing else re-derives it (D8400).
+      if rxe is Ident && monoParamPinIs(rxe.identName, params, pinned, "null") {
+        nret = synthTypeRefTy("null", -1, TY_NULL)
+      }
+      if rxe is Ident && nret < 0 {
         // `return <local>` where the local is a hole-built list: the list shares the
         // indexed param's array type, so type the return as that param's pinned type.
         // No source param found → keep `nret = -1`.
@@ -10088,6 +10204,24 @@ function monoMakeInstanceRetExpr(
     pinnedTyIx,
     twoOut,
   )
+}
+
+// Whether the parameter of `params` named `name` is pinned at exactly `pin`.
+function monoParamPinIs(
+  name: string,
+  params: i32[],
+  pinned: string[],
+  pin: string,
+): boolean {
+  let i = 0
+  while i < params.length && i < pinned.length {
+    const p = P.nodes[params[i]]
+    if p is Param {
+      if p.parName == name { return pinned[i] == pin }
+    }
+    i = i + 1
+  }
+  false
 }
 
 // The return a value-call through the closure-pinned param `rcal` takes; else `nret`.
@@ -17782,6 +17916,7 @@ function monoWalk(ix: i32, ctx: i32) {
   const n = P.nodes[ix]
   match n {
     Call => {
+      monoNoteCallLitDests(n, ix, ctx)
       const args = n.callArgs
       let i = 0
       while i < args.length {
@@ -17940,6 +18075,7 @@ function monoWalk(ix: i32, ctx: i32) {
     }
     ArrayLit => {
       const es = n.arrElems
+      monoNoteListLitDests(ix)
       let i3 = 0
       while i3 < es.length {
         // An alias of a capture cell's read in a program's list is called through the list, which
@@ -18020,7 +18156,28 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   }
   monoInstanceExactRet = false
   if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
+  monoNoteLitDest(n.letInit, n.letType)
   return monoWalk(n.letInit, ctx)
+}
+
+// `monoNoteLitDest` for each argument of call `n` (node `ix`) at a concrete annotated
+// parameter, ahead of the walk that instantiates the generic calls inside those arguments.
+function monoNoteCallLitDests(n: Call, ix: i32, ctx: i32) {
+  if n.callFn < 0 { return 0 }
+  const callee = P.nodes[n.callFn]
+  if !(callee is Ident) { return 0 }
+  const dfe = monoFnFeOfIdent(n.callFn, callee.identName, ctx)
+  if dfe < 0 { return 0 }
+  const pargs = monoArgsInParamOrder(ix, monoFnDeclNodeAt(dfe))
+  let ca = 0
+  while ca < pargs.length {
+    const pty = monoFnParamTypeAt(dfe, ca)
+    if pty >= 0 && !monoFnParamAnnRidesTyParam(dfe, ca) {
+      monoNoteLitDest(pargs[ca], pty)
+    }
+    ca = ca + 1
+  }
+  0
 }
 
 // `monoWalk`'s arm for a call `n` (node `ix`, in frame `ctx`) whose callee is the identifier
@@ -19990,6 +20147,7 @@ export function monomorphize(stmts: i32[]) {
   monoArenaTick = 0
   monoClashLits = []
   monoCallTpl = Map()
+  monoLitDestVariant = Map()
   monoLamCallCallees = []
   monoProgLamNames = []
   monoRebuiltStamp = 0 - 1
