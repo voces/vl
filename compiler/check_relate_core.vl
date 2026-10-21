@@ -462,8 +462,10 @@ import {
   cwCalleeDeclOf,
   cwFnValueDeclOf,
   cwFnValueTargets,
+  cwFnValueWriteOf,
   cwFramedNode,
   cwPeel,
+  cwSoleBinderOf,
   fnDeclIx,
 } from "./check_write_scan"
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
@@ -4048,6 +4050,7 @@ export function holeFnArgRetAt(
     if q >= 0 && q < T.tys.length {
       const qf = T.tys[q]
       if qf is TyFunc && qf.fnRet >= 0 && tyHasTyVar(qf.fnRet) {
+        holeLetWritesDisagree(args[i], qf.fnParamTypes)
         const r = holeFnArgRetAtParams(args[i], qf.fnParamTypes)
         if r >= 0 {
           const hN: string[] = []
@@ -4100,6 +4103,102 @@ export function holeFnArgDecls(a: i32): i32[] {
     }
   }
   ts
+}
+
+// Refuses, at its write, a function the re-pointed `let` argument `a` reads may hold whose body
+// gives another result at the closed parameter types `pts` than the one written first, since a
+// call through the binding runs either (D9003). False when it refuses nothing.
+export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
+  if inferQuiet || holeFnArgDecl(a) >= 0 { return false }
+  const ds = holeFnArgDecls(a)
+  if ds.length < 2 { return false }
+  const wp: i32[] = []
+  for pt in pts {
+    if pt < 0 || tyHasTyVar(pt) { return false }
+    wp.push(widenLitTy(pt))
+  }
+  const ix = parenPeelIx(a)
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  let nm = ""
+  if n is Ident { nm = n.identName }
+  const fr = covarRootFrame(ix)
+  // A parameter's set is every caller's argument, and each call instances its own copy.
+  const bd = cwSoleBinderOf(nm, fr)
+  if bd < 0 || !(P.nodes[bd] is LetDecl) { return false }
+  const ft = mkFuncTy(wp, TY_I32)
+  const noN: string[] = []
+  const noT: i32[] = []
+  const rs: i32[] = []
+  const ws: i32[] = []
+  let b = 0
+  let k = 0
+  while k < ds.length {
+    const r = holeLamRetAt(ds[k], ft, noN, noT)
+    if r < 0 || tyHasTyVar(r) { return false }
+    rs.push(widenLitTy(r))
+    // Only a write that names the function itself: one through a parameter is per call.
+    const w = cwFnValueWriteOf(nm, fr, ds[k])
+    if w < 0 { return false }
+    let wv = w
+    const wn = P.nodes[w]
+    if wn is BinExpr { wv = wn.binRight }
+    if cwFnValueDeclOf(wv) != ds[k] { return false }
+    ws.push(w)
+    if nodeStartTok(w) < nodeStartTok(ws[b]) { b = k }
+    k = k + 1
+  }
+  k = 0
+  while k < ds.length {
+    if !tySame(rs[k], rs[b]) {
+      tErr(holeLetDisagreeMsg(nm, wp, ds[k], rs[k], ds[b], rs[b]), ws[k])
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The `holeLetWritesDisagree` refusal: function `d` written to `nm` returns `r` at `wp`, where
+// `d0`, also written to it, returns `r0`.
+function holeLetDisagreeMsg(
+  nm: string,
+  wp: i32[],
+  d: i32,
+  r: i32,
+  d0: i32,
+  r0: i32,
+): string {
+  let ps = "("
+  let j = 0
+  while j < wp.length {
+    if j > 0 { ps = ps + ", " }
+    ps = ps + tyToStr(wp[j])
+    j = j + 1
+  }
+  ps = ps + ")"
+  "cannot write "
+    + holeDeclName(d)
+    + " to '"
+    + nm
+    + "': called at "
+    + ps
+    + " it returns "
+    + tyToStr(r)
+    + ", where "
+    + holeDeclName(d0)
+    + ", also written to it, returns "
+    + tyToStr(r0)
+    + " — every function a call through '"
+    + nm
+    + "' may run must return one type"
+}
+
+// How a diagnostic names the function or lambda `d`.
+function holeDeclName(d: i32): string {
+  const f = P.nodes[d]
+  if f is FuncDecl && f.fnName != "" { return "'" + f.fnName + "'" }
+  "a lambda"
 }
 
 // `ty` with each type variable it holds read from `hN`/`hT`, through lists, nullables, records,
