@@ -430,12 +430,22 @@ import { mkUnionTy } from "./check_union_mint"
 import { isWideLitJoin, mkWideStrLitTy } from "./check_wide_lits"
 import { placeRootOf, weDigits } from "./check_write_effects"
 import {
+  CW_OCC_BIND,
+  CW_OCC_USE,
   CW_UP_ARG,
+  CW_UP_CALLEE,
+  CW_UP_LETINIT,
+  CW_UP_OBJ,
   covarRootFrame,
   covarRootName,
+  cwFrameOfDecl,
   cwIxBuild,
+  cwIxKind,
+  cwIxNode,
   cwIxUp,
   cwIxUpKind,
+  cwOccNext,
+  cwOccWalk,
   cwPeel,
   cwPeelValue,
 } from "./check_write_scan"
@@ -456,6 +466,7 @@ import {
   isNullTy,
   nonNulTyOf,
   nonNullTy,
+  nullableInnerOrNone,
   primNameOf,
   tyAdmitsNull,
   tyHasNullMember,
@@ -1707,8 +1718,9 @@ function recFnBuiltAtDst(fd: i32, call: i32, srcTy: i32, dstTy: i32): boolean {
 }
 
 // Whether call sites `sites` (`rcwCallSites`) are `call` and calls each queued for a delivery
-// that lands a record of `own` on one of `dst`'s field storage, so one build serves them all
-// (D8201).
+// that lands a record of `own` on one of `dst`'s field storage, or queued for none, so one build
+// serves them all (D8201). A call queued for none is served only when it is read for a field
+// and `dst` adds no more than `null` to a field (D8302).
 function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
   if sites.length == 1 { return sites[0] == call * 2 }
   let hasCall = false
@@ -1717,9 +1729,94 @@ function recSitesLandAt(sites: i32[], call: i32, own: i32, dst: i32): boolean {
     const c = s / 2
     if c == call { hasCall = true }
     const at = recQueuedLandingOf(c, own)
-    if at < 0 || !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
+    if at >= 0 {
+      if !fieldStorageEq(at, dst, REC_STORE_DEPTH) { return false }
+    } else if (
+      c == call
+      || !recNullWidened(own, dst)
+      || recQueuedReaches(c, own)
+      || !recReadInPlace(c)
+    ) {
+      return false
+    }
   }
   hasCall
+}
+
+// Whether the record `dst` stores each field of the record `own` as `own` does, or as that
+// type or null. A numeric widening is excluded: a field read of it changes value.
+function recNullWidened(own: i32, dst: i32): boolean {
+  const o = T.tys[own]
+  const d = T.tys[dst]
+  if o is TyObj && d is TyObj {
+    let i = 0
+    while i < o.objFieldNames.length {
+      const of = o.objFieldTypes[i]
+      const df = objFieldType(d, o.objFieldNames[i])
+      if df < 0 { return false }
+      if !fieldStorageEq(of, df, REC_STORE_DEPTH) {
+        const inner = nullableInnerOrNone(df)
+        if inner < 0 || !fieldStorageEq(of, inner, REC_STORE_DEPTH) {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    return true
+  }
+  false
+}
+
+// Whether the value of call `c` is only read for a field: `c.f`, or an un-annotated `const`
+// whose every use is a field read. Any other use stores it where its own row is built (D8302).
+function recReadInPlace(c: i32): boolean {
+  cwIxBuild()
+  if recFieldRead(c) { return true }
+  if c >= cwIxUpKind.length || cwIxUpKind[c] != CW_UP_LETINIT { return false }
+  const d = cwIxUp[c]
+  if d < 0 || d >= P.nodes.length { return false }
+  const dn = P.nodes[d]
+  if dn is LetDecl {
+    if dn.letType >= 0 || dn.letKw != "const" { return false }
+    let used = false
+    const ow = cwOccWalk(dn.letName, cwFrameOfDecl(d))
+    while cwOccNext(ow) {
+      const r = ow.row
+      if cwIxKind[r] == CW_OCC_USE {
+        if !recFieldRead(cwIxNode[r]) { return false }
+        used = true
+      } else if cwIxKind[r] != CW_OCC_BIND || cwIxNode[r] != d {
+        return false
+      }
+    }
+    return used
+  }
+  false
+}
+
+// Whether `x` is the object of a field read that is not a method's callee.
+function recFieldRead(x: i32): boolean {
+  if x < 0 || x >= cwIxUpKind.length || cwIxUpKind[x] != CW_UP_OBJ {
+    return false
+  }
+  const u = cwIxUp[x]
+  if u < 0 || u >= P.nodes.length || !(P.nodes[u] is Member) { return false }
+  u >= cwIxUpKind.length || cwIxUpKind[u] != CW_UP_CALLEE
+}
+
+// Whether some queued delivery reaches call `c`'s record of `own` (`recLandingIn`).
+function recQueuedReaches(c: i32, own: i32): boolean {
+  let i = 0
+  while i < recPendSrc.length {
+    if (
+      recLandingIn(recPendSrc[i], recPendDstTy[i], c, own, REC_STORE_DEPTH)
+      >= 0
+    ) {
+      return true
+    }
+    i = i + 1
+  }
+  false
 }
 
 // Whether `p` reaches the call `po` through generic identities each pinned only by the argument it
