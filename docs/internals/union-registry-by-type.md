@@ -472,6 +472,28 @@ Left:
 - The deletion of `canonUnionKeyOfName`. Three emit files call it 9 times, and
   `check_nj_join.vl` calls it 3 times.
 
+Then the seventh slice (L6 log, 2026-10-21). Site 55 registers by its type where the type is a
+flat value union (`valueUnionTyIsFlat`): a value union with no member that is itself a union.
+There the name's atoms are the type's members, so the two agree. Switched for every type, 9
+modules change; switched for every value union, 1 changes (`unions/is-union-alias-arm.vl`,
+whose `U | boolean` arm the name flattens to `i32|string|boolean`); switched for a flat one, 0.
+`canonUnionKey` is deleted. Only the armed sweep's `ty-*` buckets called it, and nothing reads
+them; `canonUnionKeyOfTy` is the type's route.
+
+Left, measured:
+
+- `canonUnionKeyOfTy` cannot mint its text unexpanded (`canonUnionKeyOfText`). Its text keeps
+  a union alias member as the alias's name, and the name's key expands it one level: 2,247 key
+  texts of 978,267 differ, in 19 files, each such an alias member.
+- `canonUnionKeyNullAtOfTy` (7,671 texts) and `unRowOfCanonMembers` (93) agree with the
+  unexpanded mint on the corpus, but not by construction, because an atom can be a union alias.
+- `unNameShareCanonRow` keyed by the type's softened key changes 2 modules, and keyed by
+  `canonUnionKeyOfTy` 3. Its alias serves name-keyed readers, which look it up by the name.
+- Site 55's literal-member and nested-alias types, `unKeyPush`'s two fallbacks, and the callers
+  that hold no type (`unRowOfSetText`, `isUName`, the adopt with no type, `isUNameKeyAB`'s
+  fallback).
+- `canonUnionKeyOfName`: 9 calls in three emit files and 2 in `check_nj_join.vl`.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a
