@@ -11831,6 +11831,8 @@ function monoCoerceFnValueName(
       if monoCoerceWrittenLetValues(exprIx, ctx, tname) { return 0 }
       // An alias of a capture cell's read delivers that cell (D3948).
       if monoCoerceAliasOfCell(exprIx, ctx, tname) { return 0 }
+      // So does an alias of a reassigned `let` deliver that `let` (D9010).
+      if monoCoerceAliasOfWrittenLet(exprIx, ctx, tname) { return 0 }
       let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
       // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
       if gfe < 0 { gfe = monoReadGenFnFe(exprIx) }
@@ -12332,6 +12334,41 @@ function monoCoerceAliasOfCell(at: i32, ctx: i32, tname: string): boolean {
   const ar = monoAliasCellRead(at, ctx)
   if ar[0] < 0 { return false }
   monoCoerceWrittenCell(ar[0], ar[1], tname)
+}
+
+// For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
+// after their initializer ends at a reassigned `let`: coerces that `let`'s values at `tname` as
+// `monoCoerceWrittenLetValues` does, and answers true when it finds one.
+function monoCoerceAliasOfWrittenLet(
+  at: i32,
+  ctx: i32,
+  tname: string,
+): boolean {
+  // Asked of every value read, so a name that is no alias leaves first.
+  if !(P.nodes[at] is Ident) { return false }
+  const d0 = identDeclOf(at)
+  if d0 < 0 || d0 >= P.nodes.length { return false }
+  const n0 = P.nodes[d0]
+  if !(n0 is LetDecl) || n0.letInit < 0 { return false }
+  const i0 = unwrapParen(n0.letInit)
+  if i0 < 0 || !(P.nodes[i0] is Ident) { return false }
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    const lf = monoReadLetFrame(ax, fr)
+    if lf[1] < 0 { return false }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return false }
+    if d.letKw != "const" && monoLetWrittenIn(lf) { return false }
+    const iv = unwrapParen(d.letInit)
+    if iv < 0 || !(P.nodes[iv] is Ident) { return false }
+    if monoCoerceWrittenLetValues(iv, lf[0], tname) { return true }
+    ax = iv
+    fr = lf[0]
+    hops = hops + 1
+  }
+  false
 }
 
 // Whether node `v`, read in frame `ctx`, is a name `monoAliasCellRead` resolves to a cell.
@@ -14039,9 +14076,14 @@ function monoPinRecordField(at: i32, name: string, val: i32, ctx: i32): i32 {
   if holeLam && monoLastInstFe < 0 {
     if monoNoteBindDeliveryAt(val, ann, ctx) < 0 { return -1 }
   }
-  if monoLastInstFe < 0 { return 0 }
-  let ft = monoPinSubTyOf(nodeTyIxOf(val), fnStmts[monoLastInstFe])
-  if !monoTyConcreteFn(ft) && holeLam { ft = monoHoleLamAtAnnTy(vt0, ann) }
+  let ft = -1
+  if monoLastInstFe >= 0 {
+    ft = monoPinSubTyOf(nodeTyIxOf(val), fnStmts[monoLastInstFe])
+    if !monoTyConcreteFn(ft) && holeLam { ft = monoHoleLamAtAnnTy(vt0, ann) }
+  }
+  // A value naming no one instance (a `let` written twice) takes the result its functions
+  // agree on at the pin's parameters, as a list element does (D9010).
+  if !monoTyConcreteFn(ft) { ft = monoValueAtAnnTy(val, ann) }
   if !monoTyConcreteFn(ft) { return 0 }
   const vt = nodeTyIxOf(val)
   // A generic's instances share `val`, so its type stays open there (D5079).
