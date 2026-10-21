@@ -32,7 +32,10 @@ if (GATED && !ENABLED) {
 const dec = new TextDecoder();
 type Out = { code: number; out: string };
 
-const port = async (argv: string[]): Promise<Out> => {
+const port = async (
+  argv: string[],
+  extra: Record<string, string> = {},
+): Promise<Out> => {
   const { code, stdout } = await new Deno.Command(VL, {
     args: [
       "run",
@@ -45,7 +48,7 @@ const port = async (argv: string[]): Promise<Out> => {
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ NO_COLOR: "1", JOBS: "2" }),
+    env: nativeEnv({ NO_COLOR: "1", JOBS: "2", WITNESS_CACHE: "0", ...extra }),
   }).output();
   return { code, out: dec.decode(stdout) };
 };
@@ -422,7 +425,8 @@ Deno.test({
 // that never finished fell through `classify` to `silent_invalid_wasm` (a filed row graded
 // that way at load 83–122 and `runs` alone). It is retried once, then reported not graded.
 Deno.test({
-  name: "check-filed-witnesses: a witness stopped by its timeout is not graded, never a filed outcome",
+  name:
+    "check-filed-witnesses: a witness stopped by its timeout is not graded, never a filed outcome",
   ignore: !ENABLED,
   fn: async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_cfw_timeout_" });
@@ -435,22 +439,170 @@ Deno.test({
       );
       const t0 = performance.now();
       const { code, stdout } = await new Deno.Command(VL, {
-        args: ["run", "scripts/check-filed-witnesses.vl", "--compiler", COMPILER, "--", doc],
+        args: [
+          "run",
+          "scripts/check-filed-witnesses.vl",
+          "--compiler",
+          COMPILER,
+          "--",
+          doc,
+        ],
         cwd: ROOT,
         stdout: "piped",
         stderr: "piped",
-        env: nativeEnv({ NO_COLOR: "1", JOBS: "1", WITNESS_TIMEOUT: "2" }),
+        env: nativeEnv({
+          NO_COLOR: "1",
+          JOBS: "1",
+          WITNESS_TIMEOUT: "2",
+          WITNESS_CACHE: "0",
+        }),
       }).output();
       const out = dec.decode(stdout);
       const want = "0 graded · 0 as filed · 0 MOVED · 1 not graded";
-      if (code !== 0 || !out.includes(want) || !out.includes("`vl run` was stopped after 2 s twice")) {
-        throw new Error(`want exit 0, "${want}" and the timeout reason, got exit ${code}:\n${out}`);
+      if (
+        code !== 0 || !out.includes(want) ||
+        !out.includes("`vl run` was stopped after 2 s twice")
+      ) {
+        throw new Error(
+          `want exit 0, "${want}" and the timeout reason, got exit ${code}:\n${out}`,
+        );
       }
       // The batch run and both solo tries each wait out the 2 s bound, so a grader that
       // dropped the retry finishes in two bounds; load can only add to this, never take away.
       const secs = (performance.now() - t0) / 1000;
       if (secs < 5.5) {
-        throw new Error(`want three 2 s waits (the retry included), the grader took ${secs.toFixed(1)} s`);
+        throw new Error(
+          `want three 2 s waits (the retry included), the grader took ${
+            secs.toFixed(1)
+          } s`,
+        );
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
+
+// The outcome cache (`$WITNESS_CACHE`): a warm run prints the cold run's report, a witness
+// that touches the file system is never kept, the cached answer is what the warm run grades
+// (a poisoned record moves its row), a `VL_*` setting is part of the key, and a witness
+// routed past the run batch by a stale hint is still graded by what it does.
+Deno.test({
+  name:
+    "check-filed-witnesses: the outcome cache answers exactly what a fresh run would",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_cfw_cache_" });
+    try {
+      const enc = new TextEncoder();
+      const field = (s: string) => `${enc.encode(s).length}:${s}`;
+      const fields = (b: Uint8Array): string[] => {
+        const out: string[] = [];
+        let i = 0;
+        while (i < b.length) {
+          let j = i;
+          while (b[j] !== 58) j++;
+          const n = Number(dec.decode(b.slice(i, j)));
+          out.push(dec.decode(b.slice(j + 1, j + 1 + n)));
+          i = j + 1 + n;
+        }
+        return out;
+      };
+      const doc = `${dir}/rows.md`;
+      await Deno.writeTextFile(
+        doc,
+        [
+          `### D1 — runs\n**closed**\n\nRepro:\n\n${ind("print(6 * 7)")}\n`,
+          `### D2 — a check reject\n**loud check reject**\n\nRepro:\n\n${
+            ind('const x: i32 = "nope"\nprint(x)')
+          }\n`,
+          `### D3 — reads the file system\n**closed**\n\nRepro:\n\n${
+            ind(
+              'import { fileSize } from "std:fs"\nprint(fileSize("/") is i64)',
+            )
+          }\n`,
+        ].join("\n"),
+      );
+      const cache = `${dir}/cache`;
+      const recs = () =>
+        [...Deno.readDirSync(cache)].map((e) => e.name).filter((n) =>
+          /^[0-9a-f]{16}\.rec$/.test(n)
+        ).sort();
+      const run = (env: Record<string, string>) =>
+        port(["--strict", doc], { WITNESS_CACHE: cache, ...env });
+
+      const cold = await run({});
+      if (
+        cold.code !== 0 || !cold.out.includes("3 graded · 3 as filed · 0 MOVED")
+      ) {
+        throw new Error(
+          `cold: want exit 0 and 3 as filed, got ${cold.code}:\n${cold.out}`,
+        );
+      }
+      const keys = recs();
+      if (keys.length !== 1) {
+        throw new Error(`cold: want one record file, got ${keys}`);
+      }
+      const rec = Deno.readFileSync(`${cache}/${keys[0]}`);
+      const kept = fields(rec).filter((_, i) => i > 0 && (i - 1) % 5 === 0);
+      if (
+        kept.length !== 2 || !kept.some((w) => w.includes("6 * 7")) ||
+        !kept.some((w) => w.includes("nope")) ||
+        dec.decode(rec).includes("std:fs")
+      ) {
+        throw new Error(
+          `cold: want D1 and D2 kept and D3 not, got ${JSON.stringify(kept)}`,
+        );
+      }
+      const hints = dec.decode(Deno.readFileSync(`${cache}/hints.rec`));
+      if (!hints.includes("nope") || hints.includes("6 * 7")) {
+        throw new Error(`cold: want D2 hinted and D1 not, got ${hints}`);
+      }
+
+      const warm = await run({});
+      if (warm.code !== cold.code || warm.out !== cold.out) {
+        throw new Error(
+          `warm: want the cold report, got ${warm.code}:\n${warm.out}`,
+        );
+      }
+
+      const poisoned = dec.decode(rec).replace("12:check_reject", "4:runs");
+      if (poisoned === dec.decode(rec)) {
+        throw new Error("the record holds no check_reject");
+      }
+      Deno.writeTextFileSync(`${cache}/${keys[0]}`, poisoned);
+      const hit = await run({});
+      if (
+        hit.code !== 1 ||
+        !/^D2 +check_reject +runs +\*\* MOVED \*\*/m.test(hit.out)
+      ) {
+        throw new Error(
+          `poisoned: want D2 MOVED, so the record was read, got ${hit.code}:\n${hit.out}`,
+        );
+      }
+      const rekeyed = await run({ VL_CFW_CACHE_PROBE: "1" });
+      if (rekeyed.out !== cold.out || recs().length !== 2) {
+        throw new Error(
+          `another VL_* setting: want a fresh key and the cold report, got ${recs()}:\n${rekeyed.out}`,
+        );
+      }
+
+      const fresh = `${dir}/hinted`;
+      Deno.mkdirSync(fresh);
+      Deno.writeTextFileSync(
+        `${fresh}/hints.rec`,
+        field("check-filed-witnesses hints 1") +
+          kept.map((w) =>
+            field(w) + field("check_reject") + field("") + field("") +
+            field("0")
+          )
+            .join(""),
+      );
+      const routed = await port(["--strict", doc], { WITNESS_CACHE: fresh });
+      if (routed.out !== cold.out) {
+        throw new Error(
+          `a stale hint: want the cold report, got:\n${routed.out}`,
+        );
       }
     } finally {
       await Deno.remove(dir, { recursive: true });
