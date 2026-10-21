@@ -137,6 +137,7 @@ import {
   tyIsMap,
   tyIsOneStrLit,
   tyIsParamHole,
+  tyIxIsFunc,
   tyMayHoldFn,
   tyPrimNameOf,
   tyRenderSoftensLits,
@@ -763,10 +764,11 @@ function monoRetJoinDisagrees(fnNodeIx: i32, reIx: i32): boolean {
 // A struct or struct-array annotation name usable as a monomorphization pin while the
 // locals and struct-classification tables are unbuilt: the bare struct `P`, or `P[]`.
 // "" for anything else. One level of `[]`; `n >= 3` excludes the degenerate `"[]"`.
-function monoStructAnnName(name: string) {
+// `isArr` is `nameIsArray(name)`.
+function monoStructAnnName(name: string, isArr: boolean) {
   if isSName(name) { return name }
   const n = name.length
-  if n >= 3 && nameIsArray(name) {
+  if n >= 3 && isArr {
     if isSName(arrElemNameRaw(name)) { return name }
   }
   ""
@@ -854,12 +856,19 @@ function monoModuleDupPin(name: string, fnIx: i32, siteIx: i32) {
   agreed
 }
 
+// Whether arena type `ty` is a list itself (`TyArray`), not a union of lists; false for -1.
+function monoTyIsList(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  T.tys[ty] is TyArray
+}
+
 // The one home for "which annotation name can serve as a monomorphization pin". Both
 // callers exist because mid-mono the `expr*` rep cascade cannot classify a binding at
 // all (`buildLocals` is post-mono), so the annotation is the only truth; both sit behind
 // `fnIx >= 0`. "" means no pin from the annotation, and the cascade answers instead.
 function monoAnnPinName(name: string) {
-  const r = monoStructAnnName(name)
+  const isArr = nameIsArray(name)
+  const r = monoStructAnnName(name, isArr)
   if r != "" { return r }
   // A union-typed annotation (`a: Cat | Dog`, or an alias): bind `T` to the union name
   // so the instance's param and return ride the union box. The union key answers; an
@@ -868,7 +877,7 @@ function monoAnnPinName(name: string) {
   // …and its list rung (D1082): `isUName` is false for an array name, so `first<T>(xs:
   // T[])` over a `const xs: Shape[]` had no arm at all. The pin is the caller's own
   // spelling, safe because the same program through a non-generic `firstS` runs.
-  if nameIsArray(name) {
+  if isArr {
     if isUName(arrElemNameRaw(name)) { return name }
   }
   // A declared union arm (`Circle` in `type Shape = Circle | Sq`) — the kind-8 variant,
@@ -879,7 +888,7 @@ function monoAnnPinName(name: string) {
   // …and the list rung of that same arm (D37). `monoStructAnnName`'s list rung asks
   // `isSName("Circle")` and `variantIndexOf("Circle[]")` is false for an array name, so
   // `Circle[]` is claimed by neither. The pin is again the caller's own spelling.
-  if nameIsArray(name) {
+  if isArr {
     if variantIndexOf(arrElemNameRaw(name)) >= 0 { return name }
   }
   // A bare inline object shape (`{r: i32}`). `isSName` cannot answer by construction:
@@ -887,12 +896,12 @@ function monoAnnPinName(name: string) {
   // pushes no `sNames` entry (D53). After the variant arms and before the map arm, since
   // `nameIsShapeSpanEnds` is brace-span-not-second and a map spelling stays below.
   if nameIsShapeSpanEnds(name) { return name }
-  const rl = monoCompositeListAnnName(name)
+  const rl = monoCompositeListAnnName(name, isArr)
   if rl != "" { return rl }
   // A literal-union alias array (`K[]`), the array sibling of the `isUName` arm above and
   // subsumed by the union-alias list rung at the top of this ladder (D1082) — a litunion
   // alias is in `unNames` too. Kept as the rung whose absence a whole family witnessed.
-  if nameIsArray(name) {
+  if isArr {
     const luElem = arrElemNameRaw(name)
     const luTy = if luElem != "" && isUName(luElem) { cUserTypes.get(luElem) ?? -1 } else { -1 }
     if luTy >= 0 && tyIsLitUnion(luTy) { return name }
@@ -910,7 +919,7 @@ function monoAnnPinName(name: string) {
   // checker's recorded type or a `param*` probe, and both go blind in one position: a
   // generic body's own binding, whose `const y: T = x` carries the substituted annotation
   // and no recorded type while `buildLocals` has yet to run.
-  const rs = monoScalarAnnName(name)
+  const rs = monoScalarAnnName(name, isArr)
   if rs != "" { return rs }
   // A nullable spelling, whose `| null` the pin has to carry.
   monoNulAnnName(name)
@@ -937,13 +946,13 @@ function monoNulAnnName(name: string) {
   ""
 }
 
-// A canonical scalar-rep annotation spelling (`i32` / `i64` / `f32` / `f64` / `boolean`
-// / `string`) or a list over one, or `u8[]`, echoed back — else "". Exact spellings only:
-// the pin becomes the instance's parameter annotation, so a name that is not already the
-// rep's own spelling would rename the rep. A bare `u8` is storage and never a pin.
-function monoScalarAnnName(name: string) {
+// A canonical scalar-rep spelling (`i32` / `i64` / `f32` / `f64` / `boolean` / `string`),
+// a list over one (`isArr` is `nameIsArray(name)`), or `u8[]`, echoed back; else "". Exact
+// spellings only: the pin becomes the instance's parameter annotation, so any other name
+// would rename the rep. A bare `u8` is storage and never a pin.
+function monoScalarAnnName(name: string, isArr: boolean) {
   let leaf = name
-  if nameIsArray(name) { leaf = arrElemNameRaw(name) }
+  if isArr { leaf = arrElemNameRaw(name) }
   if leaf == "i32" { return name }
   if leaf == "i64" { return name }
   if leaf == "f32" { return name }
@@ -960,12 +969,12 @@ function monoScalarAnnName(name: string) {
   ""
 }
 
-// The annotation name of an annotated local or parameter whose type is a list over a
-// composite element — a nested list, a paren group, an inline shape — or "". The
-// `expr*` cascade cannot name these: it reads the expression, and mid-mono the locals
-// table is unbuilt, so a nested list pins one dimension short of the checker's type.
-function monoCompositeListAnnName(name: string) {
-  if !nameIsArray(name) { return "" }
+// The annotation name of a local or parameter typed as a list (`isArr` is `nameIsArray(name)`)
+// over a composite element — a nested list, a paren group, an inline shape — or "". The
+// `expr*` cascade reads the expression, and mid-mono the locals table is unbuilt, so a
+// nested list would pin one dimension short of the checker's type.
+function monoCompositeListAnnName(name: string, isArr: boolean) {
+  if !isArr { return "" }
   const elem = arrElemNameRaw(name)
   if elem == "" { return "" }
   if nameIsArray(elem) { return name }
@@ -1259,7 +1268,7 @@ function monoUnionPinName(ix: i32): string {
 // `monoUnionPinName` over arena type `ty`, or "".
 function monoUnionPinNameOfTy(ty: i32): string {
   if ty < 0 { return "" }
-  const r = monoAnnPinName(tyToEmitName(ty))
+  const r = monoAnnPinNameOfTy(ty)
   if r != "" { return r }
   const ur = unRowOfCanon(ty)
   if ur >= 0 && ur < unNames.length { return monoAnnPinName(unNames[ur]) }
@@ -1670,7 +1679,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   if ealN is ArrayLit {
     if ealN.arrElems.length == 0 && !tyHasTyVar(nodeTyIxOf(cax)) {
       const ealTy = nodeTyIxOf(cax)
-      const ealPin = monoAnnPinName(tyToEmitName(ealTy))
+      const ealPin = monoAnnPinNameOfTy(ealTy)
       if ealPin != "" { return ealPin }
       const ealEl = tyRefArrElemOf(ealTy)
       const ealRow = structRowOfObjFieldSet(ealEl)
@@ -1701,7 +1710,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     // spell it — and a pin is a NAME, not a rep. The arena's render is the pin, so a bare `T`
     // bound from this list keeps its `| null` and its parameter stays nullable (D1897).
     if nodeTyArrayElemIsNullable(unwrapParen(ix)) {
-      const snp = monoAnnPinName(tyToEmitName(nodeTyIxOf(unwrapParen(ix))))
+      const snp = monoAnnPinNameOfTy(nodeTyIxOf(unwrapParen(ix)))
       if snp != "" { return snp }
     }
     return "string[]"
@@ -1736,7 +1745,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     // The arena, for every other shape: a call or projection reaches this floor with a type
     // the checker recorded and no literal to read an element off. The same question the
     // nullable-struct floor below asks, through the same membership list (D1755).
-    const rap = monoAnnPinName(tyToEmitName(nodeTyIxOf(unwrapParen(ix))))
+    const rap = monoAnnPinNameOfTy(nodeTyIxOf(unwrapParen(ix)))
     if rap != "" { return rap }
     return ""
   }
@@ -1762,7 +1771,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     // above it: every arm before this resolves a binding, so an if-expression or any other
     // projection reaches the floor with a type the checker recorded and no channel to spell
     // it. Through `monoAnnPinName`, the one pin membership list, so `""` still refuses (D1755).
-    const nsp = monoAnnPinName(tyToEmitName(nodeTyIxOf(unwrapParen(ix))))
+    const nsp = monoAnnPinNameOfTy(nodeTyIxOf(unwrapParen(ix)))
     if nsp != "" { return nsp }
     return ""
   }
@@ -1771,7 +1780,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
   // non-null half and the instance's parameter loses its `| null`. Same question, same
   // membership list, one rung on (D1753).
   if nodeTyIsNullable(unwrapParen(ix)) {
-    const nulPin = monoAnnPinName(tyToEmitName(nodeTyIxOf(unwrapParen(ix))))
+    const nulPin = monoAnnPinNameOfTy(nodeTyIxOf(unwrapParen(ix)))
     if nulPin != "" { return nulPin }
   }
   // A boxed union no binding arm resolves, a `for` walk's variable among them, pins at its
@@ -1823,7 +1832,7 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     // the one pin membership list, which claims a bare inline object shape (D703). The row
     // goes missing because `collectS` skips a `type X = {…}` that is a union member. At the
     // floor, and `tyToEmitName` rather than `nodeTyName`: `tyToStr` flattens an alias field.
-    const shp = monoAnnPinName(tyToEmitName(nodeTyIxOf(unwrapParen(ix))))
+    const shp = monoAnnPinNameOfTy(nodeTyIxOf(unwrapParen(ix)))
     if shp != "" { return shp }
     return ""
   }
@@ -2058,8 +2067,9 @@ function monoArgTyNameProjected(ix: i32, fnIx: i32, cax: i32): string {
     const recvTy = monoArgTyName(argN.memObj, fnIx)
     let rsi = structIndexByName(recvTy)
     // A nullable receiver is read only where it is narrowed, so its record is the base's.
-    if rsi < 0 && nullablePartOf(recvTy) != "" {
-      rsi = structIndexByName(nullablePartOf(recvTy))
+    if rsi < 0 {
+      const recvBase = nullablePartOf(recvTy)
+      if recvBase != "" { rsi = structIndexByName(recvBase) }
     }
     if rsi >= 0 {
       const fi = sFieldIndex(rsi, argN.memProp)
@@ -2236,7 +2246,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
               const eln = P.nodes[ld.letInit]
               if eln is ArrayLit {
                 if eln.arrElems.length == 0 {
-                  const epn = monoAnnPinName(tyToEmitName(nodeTyIxOf(cax)))
+                  const epn = monoAnnPinNameOfTy(nodeTyIxOf(cax))
                   if epn != "" { return epn }
                 }
               }
@@ -2299,7 +2309,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
           const geln = P.nodes[gd.letInit]
           if geln is ArrayLit {
             if geln.arrElems.length == 0 {
-              const gepn = monoAnnPinName(tyToEmitName(nodeTyIxOf(cax)))
+              const gepn = monoAnnPinNameOfTy(nodeTyIxOf(cax))
               if gepn != "" { return gepn }
             }
           }
@@ -2328,7 +2338,7 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
   // union, which the rep cascade below would name `i32` (D2919, D2942).
   const hbt = holeOperandI32PinTyOf(cax, fnIx)
   if hbt >= 0 {
-    const hbn = monoAnnPinName(tyToEmitName(hbt))
+    const hbn = monoAnnPinNameOfTy(hbt)
     if hbn != "" { return hbn }
   }
   // An `i32` niche, a nullable literal union or `boolean | null`: the annotation's name and the
@@ -2389,7 +2399,7 @@ export function monoArgTyName(ix: i32, fnIx: i32) {
     const ncqN = P.nodes[cax]
     if ncqN is AsExpr {
       if ncqN.asMode == "null" {
-        const ncq = monoAnnPinName(tyToEmitName(nodeTyIxOf(cax)))
+        const ncq = monoAnnPinNameOfTy(nodeTyIxOf(cax))
         if ncq != "" { return ncq }
       }
     }
@@ -11152,9 +11162,9 @@ function monoMakeInstanceLetTyCol(
   while lj < params.length {
     let lt = -1
     if lj < pinnedTyIx.length { lt = pinnedTyIx[lj] }
-    if lj < pinned.length {
-      if annArrowAt(pinned[lj]) >= 1 || pinKinds[lj] == PIN_SIGKEY {
-        if lj < pinTys.length && pinTys[lj] >= 0 { lt = pinTys[lj] }
+    if lj < pinned.length && lj < pinTys.length && pinTys[lj] >= 0 {
+      if tyIxIsFunc(pinTys[lj]) || pinKinds[lj] == PIN_SIGKEY {
+        lt = pinTys[lj]
       }
     }
     letTyCol.push(lt)
@@ -15262,7 +15272,7 @@ function monoCallGenFnToTyParamArrow(
     if p is Param {
       if p.parType >= 0 {
         const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-        if annArrowAt(ann) >= 1 && monoAnnHasTyParam(ann, typarams) {
+        if nodeTyIsFunc(p.parType) && monoAnnHasTyParam(ann, typarams) {
           const ax = unwrapParen(args[i])
           if ax >= 0 {
             const av = P.nodes[ax]
@@ -15573,7 +15583,7 @@ function monoPreBindPastUnionRest(
     if p is Param {
       if p.parType >= 0 {
         ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-        if annArrowAt(ann) >= 1 || !monoAnnHasTyParam(ann, typarams) {
+        if nodeTyIsFunc(p.parType) || !monoAnnHasTyParam(ann, typarams) {
           ann = ""
         }
       }
@@ -15720,7 +15730,7 @@ function monoCalleeHasTyParamArrow(origFe: i32): boolean {
             tyNameOf(p.parType),
             fn.fnTyParams,
           )
-          if annArrowAt(ann) >= 1 && monoAnnHasTyParam(ann, fn.fnTyParams) {
+          if nodeTyIsFunc(p.parType) && monoAnnHasTyParam(ann, fn.fnTyParams) {
             return true
           }
         }
@@ -15737,7 +15747,8 @@ function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
   if p is Param {
     if p.parType < 0 { return false }
     const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-    return nameIsArray(ann) && monoAnnHasTyParam(ann, typarams)
+    return monoTyIsList(nodeTyIxOf(p.parType))
+      && monoAnnHasTyParam(ann, typarams)
   }
   false
 }
@@ -16716,7 +16727,7 @@ function monoPreBindNonArrowArgs(
         )
         // The ARROW parameters are the ones whose binding is in question; every other
         // annotation reads its type off the argument the call actually passes.
-        if annArrowAt(pbAnn) < 1 {
+        if !nodeTyIsFunc(pbp.parType) {
           if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
             const pbConc = monoArgPinName(args[pb], ctx)
             if pbConc != "" {
@@ -17031,7 +17042,8 @@ function monoPinTyParamComposite(
   // The argument's own `#anonN` row, kept as the parameter's pin where its spelled
   // shape would resolve to a declared record sharing the field names.
   let anRowPin = ""
-  if annArrowAt(ann) >= 1 {
+  const annIsFn = nodeTyIsFunc(p.parType)
+  if annIsFn {
     anC = monoArgFnTypeName(args[i], ctx)
     // A generic function value takes the type the value arguments bound (D3913).
     if monoCalleeIsGeneric(unwrapParen(args[i])) {
@@ -17048,7 +17060,7 @@ function monoPinTyParamComposite(
       && anC.slice(0, 5) == "#anon"
       && !monoAnonArgSoftens(args[i], anTy)
     ) {
-      const anSp = monoAnnPinName(tyToEmitName(anTy))
+      const anSp = monoAnnPinNameOfTy(anTy)
       if anSp != "" {
         if !monoSpelledShapeStaysAnon(anSp) { anRowPin = anC }
         anC = anSp
@@ -17090,7 +17102,7 @@ function monoPinTyParamComposite(
   // The coercion `monoWalk` deferred, since at that point the pin names
   // would be the type variables themselves. `pinC` is the substituted
   // spelling, the concrete function type that parameter takes.
-  if annArrowAt(ann) >= 1 || nameIsClosureArray(pinC) {
+  if annIsFn || nameIsClosureArray(pinC) {
     if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 { return -1 }
   }
   pinned.push(pinC)
