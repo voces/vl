@@ -4,7 +4,8 @@
 // back unchanged, appends the banked image rebased onto the current arena ends instead of
 // parsing it again. This suite drives two instances through one sequence of compiles, one with
 // the bank on and one with it off, and holds every step's diagnostics, wasm and editor symbol
-// rows identical.
+// rows identical. After every check it also runs the module-graph lint, which on the bank-on
+// side replays the parses that check banked, and holds its findings identical too.
 // The pair isolates the bank: any other per-instance state is the same on both sides. The
 // sequences reorder lib.vl's predecessors (graphs A–D of the parse-image suite), then check a
 // slice of the compiler's own module graph, edit one module in the middle of it, and check
@@ -60,6 +61,16 @@ type Exports = {
   diagMsgAt(i: number, j: number): number;
   parseReplaySet(on: number): number;
   parseReplayStat(which: number): number;
+  checkGen(): number;
+  lintUseCheck(gen: number): number;
+  lintGraph(): number;
+  lintGraphModule(i: number): number;
+  lintGraphLine(i: number): number;
+  lintGraphCol(i: number): number;
+  lintGraphCodeLen(i: number): number;
+  lintGraphCodeByte(i: number, j: number): number;
+  lintGraphMsgLen(i: number): number;
+  lintGraphMsgByte(i: number, j: number): number;
 };
 
 const LIB_KEY = "/proj/lib.vl";
@@ -188,7 +199,30 @@ const readStr = (len: number, at: (j: number) => number) => {
 // `sym` is the editor's check: the symbol table on, read back as the occurrence and inlay rows
 // go-to-definition and hover answer from. Those read token indices the diagnostics never do.
 type Mode = "check" | "emit" | "sym";
-type Step = { diags: string; bytes: string; syms: string; ms: number };
+// After a check, `lint` is the module-graph lint the CLI runs next, and `lintHits` the modules
+// it replayed from the bank that check filled rather than parsing again.
+type Step = {
+  diags: string;
+  bytes: string;
+  syms: string;
+  lint: string;
+  lintHits: number;
+  ms: number;
+};
+
+const lintRows = (exp: Exports): string => {
+  exp.lintUseCheck(exp.checkGen());
+  const n = exp.lintGraph();
+  const rows: string[] = [];
+  for (let i = 0; i < n; i++) {
+    rows.push(
+      `${exp.lintGraphModule(i)} ${exp.lintGraphLine(i)}:${exp.lintGraphCol(i)} ${
+        readStr(exp.lintGraphCodeLen(i), (j) => exp.lintGraphCodeByte(i, j))
+      } ${readStr(exp.lintGraphMsgLen(i), (j) => exp.lintGraphMsgByte(i, j))}`,
+    );
+  }
+  return rows.join("\n");
+};
 
 const symRows = (exp: Exports): string => {
   const rows: string[] = [];
@@ -262,7 +296,10 @@ const run = (exp: Exports, g: Graph, mode: Mode): Step => {
     bytes = Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
   }
   const syms = mode === "sym" ? symRows(exp) : "";
-  return { diags: d.join("\n"), bytes, syms, ms };
+  const hits0 = exp.parseReplayStat(1);
+  const lint = mode === "emit" ? "" : lintRows(exp);
+  const lintHits = exp.parseReplayStat(1) - hits0;
+  return { diags: d.join("\n"), bytes, syms, lint, lintHits, ms };
 };
 
 const instance = (replay: number): Exports => {
@@ -298,6 +335,16 @@ const agree = (
     if (x.diags !== y.diags) {
       throw new Error(
         `REPLAY DIVERGED — graph ${g.name}'s diagnostics:\nwant (fresh parse)\n${y.diags}\ngot (replayed)\n${x.diags}`,
+      );
+    }
+    if (x.lint !== y.lint) {
+      throw new Error(
+        `REPLAY DIVERGED — graph ${g.name}'s lint findings:\nwant (fresh parse)\n${y.lint}\ngot (replayed)\n${x.lint}`,
+      );
+    }
+    if (mode !== "emit" && x.lintHits === 0) {
+      throw new Error(
+        `CONTROL — graph ${g.name}'s lint replayed no module the check had banked`,
       );
     }
     if (x.bytes !== y.bytes) {
@@ -382,6 +429,9 @@ Deno.test({
     const orig = compilerGraph("compiler");
     const edited = compilerGraph("compiler, listutil.vl edited", EDIT);
     const { on, off, hits } = agree([[orig, "check"], [edited, "sym"]]);
+    if (on[0].lint === "") {
+      throw new Error("CONTROL — the compiler slice produced no lint findings");
+    }
     if (hits < 20) {
       throw new Error(`CONTROL — want at least 20 replayed compiler modules / got ${hits}`);
     }
