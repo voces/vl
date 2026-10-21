@@ -3121,8 +3121,79 @@ function hsSlotNames(si: i32): string[] {
   out
 }
 
-// The let slots of every asked `let`; 0 with a plan, 1 when there is nothing it can split.
+// The let slots of every asked `let`; 0 with a plan, 1 when there is nothing it can split. When
+// the read keys give no split, or one slot to reads handed to an open parameter at two calls,
+// each such read takes a slot per call (D9006).
 function fsPlanLets(): i32 {
+  fsPinLanes = false
+  const base = fsLaneSet()
+  if base != 0 || fsLanesMixPins() {
+    fsPinLanes = true
+    if fsLaneSet() != 0 {
+      fsPinLanes = false
+      if base != 0 { return 1 }
+      fsLaneSet()
+    }
+  }
+  let mi = 0
+  while mi < fsMem.length {
+    if fsPlanMember(mi) != 0 { return 1 }
+    mi = mi + 1
+  }
+  0
+}
+
+// Whether a read handed to an open parameter takes its call's slot (`fsPinReadKey`).
+let fsPinLanes = false
+
+// The slot key of read `r` handed to a generic or un-annotated parameter of a declared function:
+// the parameter and the call's argument types, so each call instancing the callee reads a binding
+// of its own; "" for any other read.
+function fsPinReadKey(r: i32): string {
+  const q = fsHoleFwd(r)
+  if q < 0 { return "" }
+  const dt = fsDestTy(r)
+  if dt >= 0 && !tyHasTyVar(dt) && !tyReachesHole(dt, 8) { return "" }
+  const cn = P.nodes[fsParent[r]]
+  if !(cn is Call) { return "" }
+  "p" + i32ToStr(q) + ":" + fsCallKey(cn, 0)
+}
+
+// Whether some member's slot holds two reads handed to open parameters at different calls.
+function fsLanesMixPins(): boolean {
+  for m in fsMem {
+    const ks: string[] = []
+    const ps: string[] = []
+    for r in fsIdents {
+      if identDeclOf(r) == m && hdIx(r) < 0 {
+        const pk = fsPinReadKey(r)
+        if pk != "" {
+          const k = fsMemberReadKey(r)
+          let i = 0
+          while i < ks.length {
+            if ks[i] == k && ps[i] != pk { return true }
+            i = i + 1
+          }
+          ks.push(k)
+          ps.push(pk)
+        }
+      }
+    }
+  }
+  false
+}
+
+// `fsMemberReadKey`, or `fsPinReadKey` while the plan keys by call.
+function fsLaneReadKey(r: i32): string {
+  if fsPinLanes {
+    const pk = fsPinReadKey(r)
+    if pk != "" { return pk }
+  }
+  fsMemberReadKey(r)
+}
+
+// The split set and each member's slot keys; 0 when some member takes two, else 1.
+function fsLaneSet(): i32 {
   fsMem = []
   fsLanes = []
   // The set: the asked declarations, closed over copies in either direction.
@@ -3160,7 +3231,7 @@ function fsPlanLets(): i32 {
     const ks: string[] = []
     for r in fsIdents {
       if identDeclOf(r) == m {
-        const key = fsMemberReadKey(r)
+        const key = fsLaneReadKey(r)
         const hd = hdIx(r)
         if hd >= 0 {
           for k in hdKeys[hd] {
@@ -3199,11 +3270,6 @@ function fsPlanLets(): i32 {
     if ks.length > 1 { split = true }
   }
   if !split { return 1 }
-  let mi = 0
-  while mi < fsMem.length {
-    if fsPlanMember(mi) != 0 { return 1 }
-    mi = mi + 1
-  }
   0
 }
 
@@ -3255,7 +3321,7 @@ function fsPlanMember(mi: i32): i32 {
   }
   for r in fsIdents {
     if identDeclOf(r) == m {
-      const key = fsMemberReadKey(r)
+      const key = fsLaneReadKey(r)
       if key == "" {
         const w = fsParent[r]
         const wn = P.nodes[w]
