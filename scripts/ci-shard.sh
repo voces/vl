@@ -42,8 +42,6 @@ FUEL_WARM=110
 # self-sharded file's row is its whole cost, and each shard is charged 1/n of it.
 WEIGHTS='
 selfhost_native_align_test.ts 9
-vl_budget_mode_test.ts 49
-vl_compile_cache_test.ts 45
 vl_distilled_tools_test.ts 37
 vl_deep_nesting_test.ts 35
 vl_capability_probes_port_test.ts 28
@@ -79,6 +77,7 @@ vl_std_json_test.ts 6
 vl_label_block_object_test.ts 5
 vl_seed_size_test.ts 5
 vl_union_key_licence_test.ts 5
+vl_compile_cache_test.ts 4
 vl_instance_state_leak_test.ts 4
 vl_kind_ladder_test.ts 4
 vl_large_source_test.ts 4
@@ -90,6 +89,7 @@ vl_lint_span_test.ts 3
 vl_run_args_test.ts 3
 vl_seed_provenance_test.ts 3
 vl_std_process_test.ts 3
+vl_budget_mode_test.ts 1
 vl_deep_else_chain_test.ts 11
 vl_buffer_view_bounds_shape_test.ts 40
 selfhost_native_release_shape_test.ts 30
