@@ -212,8 +212,9 @@ the closed rows, kept as regression pins — which is the right shape for a clos
 it pins the fix instead of depending on the bug.
 
 Three of them earn their place beyond liveness. `synthetic/trap` is the only control that
-exercises the extra `vl build` this script runs to tell a PROGRAM trap from a COMPILER trap,
-which is the one piece of grading it adds to `capability-probes.vl`'s. `synthetic/wrong`
+exercises the split between a PROGRAM trap and a COMPILER trap, which `lib/probe-grade.vl`
+now reads from the host's exit code and banner (it was an extra `vl build` here, before the
+shared grader learned it). `synthetic/wrong`
 is the only one that would fail if the output contract went back to `capability-probes.vl`'s SUBSTRING
 test, which passes `"2"` against a printed `"12"`. `synthetic/modules-check` is the only one
 that says outright that the multi-file WRITER delivered two files: the three module agree

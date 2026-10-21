@@ -100,8 +100,11 @@ those cells are D1244/D1253 speaking, not the template's own capability — read
 harness reporting two standing rows rather than as a finding about the value under test.
 
 Grading is `scripts/lib/probe-grade.vl`'s, the same vocabulary as the probe runner: RUNS /
-WRONG / check refuses / emit refuses / SILENT / COMPILER TRAP / TIMEOUT. It exits non-zero on
-`runs -> not-runs` between two seeds or any `SILENT` after, so **a brief runs it before the
+WRONG / check refuses / emit refuses / SILENT / COMPILER TRAP / TRAP (program) / TIMEOUT. A
+trap is COMPILER TRAP only when the host says the compiler module trapped (exit 70, or its
+`the compiler itself trapped` banner); a check-clean program that traps when run is TRAP
+(program), clause 1. It exits non-zero on `runs -> not-runs` between two seeds or any `SILENT`
+or `TRAP (program)` cell after, so **a brief runs it before the
 fix and after it** and pastes both tables. `--keep` leaves the cells, which is how a red one
 becomes a probe here. A template is a fragment collection, not a program: `lint-self.sh`
 prunes `matrix/` from its fmt sweep, and the probe runner's count is untouched because it

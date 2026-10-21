@@ -20,6 +20,11 @@
 //      usage text goes to stdout, because VL has no stderr sink.
 //   2. The usage and error lines name `capability-probes.vl`, where the Python's named
 //      `run.py`: a message naming a deleted script would be wrong.
+//
+// Since the Python's deletion the goldens follow the grader, not it: a trap is COMPILER
+// TRAP only on the host's exit 70 or its banner, any other trap past a clean check is
+// TRAP (program), and a trap's detail is its `wasm trap:` line. So `n-trap-inv` (exit 1,
+// an invalid module) is SILENT, and `n2`/`n3` are the program-trap and banner controls.
 
 // @test-timing native
 
@@ -115,6 +120,18 @@ const PROBES: Record<string, string> = {
     "//! run-err: call stack exhausted\\nInvalid input WebAssembly code\\n",
     "",
   ].join("\n"),
+  "n2-trap-program.vl": [
+    "//! run-rc: 1",
+    "//! run-err: Error: error while executing at wasm backtrace:\\n    0: 0x1 - vl!f\\n\\nCaused by:\\n    wasm trap: null reference\\n",
+    CHECKED,
+    "",
+  ].join("\n"),
+  "n3-trap-banner.vl": [
+    "//! run-rc: 70",
+    "//! run-err: vl: the compiler itself trapped while compiling x.vl. This is a bug in vl, not in your program.\\nError: wasm trap: out of bounds array access\\n",
+    CHECKED,
+    "",
+  ].join("\n"),
   "q-scenery.vl": [
     "//! run-rc: 1",
     "//! run-err: Error: emit error  \\nChecked 3 files, no errors.\\nFound 2 errors.\\n[ERROR]:\\nfoo.vl:1:2:   the real cause\\n",
@@ -136,7 +153,7 @@ const PROBES: Record<string, string> = {
 
 // The two probes that answer by never answering. They are graded apart, in a tree of their
 // own and under a bound long enough that no probe that DOES answer can be starved into one,
-// so the other seventeen are graded with a bound they cannot reach at all.
+// so the other nineteen are graded with a bound they cannot reach at all.
 const TIMEOUTS: Record<string, string> = {
   "o-timeout-run.vl": "// Should print 1.\n//! run-sleep: 600\n",
   "p-timeout-check.vl":
@@ -157,6 +174,8 @@ const RED = [
   "l-silent-none.vl",
   "m-trap.vl",
   "n-trap-inv.vl",
+  "n2-trap-program.vl",
+  "n3-trap-banner.vl",
   "q-scenery.vl",
   "r-live.vl",
   "s-drift.vl",
@@ -298,7 +317,8 @@ Deno.test({
           "SILENT (check rc 0): Invalid input",
           "SILENT (check rc 0): type mismatch: expected i32",
           "SILENT (check rc 0): the last line",
-          "COMPILER TRAP (check rc 0): wasm backtrace:",
+          "COMPILER TRAP (check rc 0): wasm trap: out of bounds",
+          "TRAP (program): wasm trap: null reference",
           "emit refuses: the real cause",
         ]
       ) {
