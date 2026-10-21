@@ -236,7 +236,7 @@ import {
   storageListNote,
   zeroBytesFixIx,
 } from "./check_mismatch_notes"
-import { joinArmIsLit, njJoinGated } from "./check_nj_join"
+import { collectRetValues, joinArmIsLit, njJoinGated } from "./check_nj_join"
 import { nodeTyIx, nodeTyIxOf, nodeTyOf, nodeTySet } from "./check_node_tys"
 import { numCmpOp, numPairTy, valueTailSplit } from "./check_num_adopt"
 import {
@@ -459,11 +459,15 @@ import { isWideLitJoin, wideLitTyIxs } from "./check_wide_lits"
 import {
   CW_FR_UNKNOWN,
   covarRootFrame,
+  cwBindingWrittenValues,
+  cwBoundInitOf,
   cwCalleeDeclOf,
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwFnValueWriteOf,
   cwFramedNode,
+  cwHeldFnOf,
+  cwParamArgs,
   cwPeel,
   cwSoleBinderOf,
   fnDeclIx,
@@ -4105,25 +4109,94 @@ export function holeFnArgDecls(a: i32): i32[] {
   ts
 }
 
-// Refuses, at its write, a function the re-pointed `let` argument `a` reads may hold whose body
-// gives another result at the closed parameter types `pts` than the one written first, since a
-// call through the binding runs either (D9003). False when it refuses nothing.
+// Refuses, at its write, a function a re-pointed `let` the value `a` may be read from may hold
+// whose body gives another result at the closed parameter types `pts` than the one written
+// first, since a call through the binding runs either (D9003). False when it refuses nothing.
 export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
   if inferQuiet || holeFnArgDecl(a) >= 0 { return false }
-  const ds = holeFnArgDecls(a)
-  if ds.length < 2 { return false }
   const wp: i32[] = []
   for pt in pts {
     if pt < 0 || tyHasTyVar(pt) { return false }
     wp.push(widenLitTy(pt))
   }
+  const reads: i32[] = []
+  const seen: i32[] = []
+  holeLetReadsOf(a, seen, reads)
+  for r in reads {
+    if holeLetJudge(r, wp) { return true }
+  }
+  false
+}
+
+// Add to `out` each read of a `let` that the value `a` may be: the name itself, and through a
+// parameter every call's argument, through a binding each value written to it, through a call
+// of a named function each value it returns (D9007, D9008). `seen` holds the nodes visited.
+function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
   const ix = parenPeelIx(a)
-  if ix < 0 { return false }
+  if (
+    ix < 0
+    || ix >= P.nodes.length
+    || i32ListHas(seen, ix)
+    || seen.length > 64
+  ) {
+    return 0
+  }
+  seen.push(ix)
+  const n = P.nodes[ix]
+  if n is Call {
+    const d = cwCalleeDeclOf(n.callFn)
+    if d < 0 || d >= P.nodes.length { return 0 }
+    const f = P.nodes[d]
+    if !(f is FuncDecl) || f.fnBody < 0 { return 0 }
+    const rv: i32[] = []
+    collectRetValues(f.fnBody, rv)
+    for v in rv { holeLetReadsOf(v, seen, out) }
+    return 0
+  }
+  // An element of a list bound once to a literal is any of the literal's elements.
+  if n is Index {
+    const lx = parenPeelIx(n.idxArr)
+    if lx < 0 || lx >= P.nodes.length || !cwFramedNode(lx) { return 0 }
+    const ln = P.nodes[lx]
+    if !(ln is Ident) { return 0 }
+    const li = cwBoundInitOf(ln.identName, covarRootFrame(lx))
+    if li < 0 || li >= P.nodes.length { return 0 }
+    const lit = P.nodes[li]
+    if lit is ArrayLit {
+      for v in lit.arrElems { holeLetReadsOf(v, seen, out) }
+    }
+    return 0
+  }
+  if !(n is Ident) || !cwFramedNode(ix) { return 0 }
+  const fr = covarRootFrame(ix)
+  if fr == CW_FR_UNKNOWN { return 0 }
+  const bd = cwSoleBinderOf(n.identName, fr)
+  if bd < 0 || bd >= P.nodes.length { return 0 }
+  // Each call of a parameter's function instances its own copy, so its arguments are judged
+  // one by one and never as one set.
+  if P.nodes[bd] is Param {
+    const vs: i32[] = []
+    if cwParamArgs(bd, vs) {
+      for v in vs { holeLetReadsOf(v, seen, out) }
+    }
+    return 0
+  }
+  if !(P.nodes[bd] is LetDecl) { return 0 }
+  out.push(ix)
+  for v in cwBindingWrittenValues(n.identName, fr) {
+    holeLetReadsOf(v, seen, out)
+  }
+  0
+}
+
+// `holeLetWritesDisagree` for the `let` read at `ix`, at the widened parameter types `wp`.
+function holeLetJudge(ix: i32, wp: i32[]): boolean {
+  const ds = holeFnArgDecls(ix)
+  if ds.length < 2 { return false }
   const n = P.nodes[ix]
   let nm = ""
   if n is Ident { nm = n.identName }
   const fr = covarRootFrame(ix)
-  // A parameter's set is every caller's argument, and each call instances its own copy.
   const bd = cwSoleBinderOf(nm, fr)
   if bd < 0 || !(P.nodes[bd] is LetDecl) { return false }
   const ft = mkFuncTy(wp, TY_I32)
@@ -4143,7 +4216,8 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
     let wv = w
     const wn = P.nodes[w]
     if wn is BinExpr { wv = wn.binRight }
-    if cwFnValueDeclOf(wv) != ds[k] { return false }
+    // Read from the source: a write after a body that calls the binding is not yet resolved.
+    if cwHeldFnOf(wv) != ds[k] { return false }
     ws.push(w)
     if nodeStartTok(w) < nodeStartTok(ws[b]) { b = k }
     k = k + 1
