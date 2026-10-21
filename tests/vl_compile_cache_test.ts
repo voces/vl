@@ -58,6 +58,8 @@ const vl = async (
     VL_CACHE_DIR: `${cwd}/../cache`,
     VL_COMPILE_CACHE: "1",
     VL_COMPILE_CACHE_TRACE: "1",
+    // An ambient verify adds `verified` lines to every trace; a case opts in itself.
+    VL_COMPILE_CACHE_VERIFY: "0",
     NO_COLOR: "1",
     PATH,
     ...set,

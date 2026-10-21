@@ -59,7 +59,8 @@ const vl = async (args: string[], env: Record<string, string> = {}) => {
     args: [...args, "--compiler", COMPILER],
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv(env),
+    // A cache hit would skip the wasm-opt run this suite counts.
+    env: nativeEnv({ VL_COMPILE_CACHE: "0", ...env }),
   }).output();
   return {
     code,
