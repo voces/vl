@@ -113,6 +113,9 @@ import {
   narrowVariants,
   uVariants,
   unKey,
+  unKeyAliasRow,
+  unKeyFirstRow,
+  unKeyPush,
   unMemAtomIds,
   unMemAtoms,
   unMemKinds,
@@ -463,6 +466,47 @@ function unionArmsOfSetTy(name: string, s: i32, ty: i32, out: string[]) {
   nm
 }
 
+// Files the row being minted, whose member set is `spelling` and whose member slice is already
+// recorded, under its arena type's union key, else under `spelling`'s; the spelling's key finds
+// the row too. The type key goes to a row with `null` last, as its type's key places it, and
+// only while the key's first row records the same members `null`'s position aside.
+export function unKeyPushOfTy(ty: i32, spelling: string) {
+  const nk = canonUnionKeyOfName(spelling)
+  const u = unKey.length
+  let k = -1
+  if ty >= 0 && unRowNullLast(u) { k = canonUnionKeyOfTy(ty) }
+  if k >= 0 && k < unKeyFirstRow.length {
+    const first = unKeyFirstRow[k]
+    if first >= 0 && !unRowSetSameNullBlind(first, u) { k = -1 }
+  }
+  if k < 0 { return unKeyPush(nk) }
+  unKeyPush(k)
+  unKeyAliasRow(nk, unKey.length - 1)
+}
+
+// Whether row `u` records a member slice in bounds of the member columns.
+function unRowHasSlice(u: i32): boolean {
+  if u < 0 || u >= unMemTyStart.length || u >= unMemTyCount.length {
+    return false
+  }
+  const st = unMemTyStart[u]
+  const end = st + unMemTyCount[u]
+  st >= 0 && end <= unMemAtoms.length && end <= unMemKinds.length
+}
+
+// Whether row `u`'s recorded members hold no `null`, or one, as the last member; false for a
+// row with no recorded slice.
+function unRowNullLast(u: i32): boolean {
+  if !unRowHasSlice(u) { return false }
+  const st = unMemTyStart[u]
+  let i = 0
+  while i + 1 < unMemTyCount[u] {
+    if unMemKinds[st + i] == 0 { return false }
+    i = i + 1
+  }
+  true
+}
+
 // The `unNames` ROW of the union `name` — matched on the alias NAME, else on the union key of
 // the member set it spells (a consumer that already resolved the alias hands us the set), or
 // -1. The name is asked first: a spelling that is one row's name keeps naming that row.
@@ -554,9 +598,12 @@ export function unABProbe(site: i32, n: i32, d: i32, ty: i32) {
 // just pushes it and returns; the spelling is needed only by the report. Ids 1-10 are the
 // sites the initial shim added (including id-free callers that already hold an arena id);
 // 11+ came from later one-hop threading. `UNAB_N` bounds the report loop.
-const UNAB_N = 52
+const UNAB_N = 54
 function unABSiteName(s: i32): string {
   if s == 47 { return "collectU/optCallRet" }
+  // 52-53 are `unionRowOf` callers that hold the type they rendered the name from.
+  if s == 52 { return "anonUnionFieldName" }
+  if s == 53 { return "mvValUnionRow" }
   // 48-51 are step 5: name-only readers and a mint that rendered a type they held.
   if s == 48 { return "mapValNominalName" }
   if s == 49 { return "nulRefElemNominal" }
@@ -861,6 +908,19 @@ export function isUNameKeyAB(site: i32, name: string, ty: i32): boolean {
   d >= 0
 }
 
+// `unionRowOf(name)`, for a caller that goes on to read the registry by `name` and holds the
+// type `name` renders. Armed, the row that type keys to is tallied against it under
+// `site`; the answer stays the name's until those readers are keyed by type too.
+export function unionRowOfAB(site: i32, name: string, ty: i32): i32 {
+  const r = unionRowOf(name)
+  if unABOn() > 0 {
+    let d = -1
+    if ty >= 0 { d = unRowOfTyAB(site, ty) }
+    unABProbe(site, r, d, ty)
+  }
+  r
+}
+
 // The member-type seam: the members of the row the type keys to, or, where the type finds no
 // row or there is none (`ty < 0`), of the row carrying the key of `name`. False when neither
 // finds a covered row, leaving `out` untouched.
@@ -975,13 +1035,41 @@ function unKeySweepPair(u: i32, v: i32) {
   if k != kv { return 0 }
   repShadowBumpReason("keySweep/merge")
   if unNames[u] != unNames[v] { repShadowBumpReason("keySweep/merge-diffname") }
-  if v < unMemberSet.length && u < unMemberSet.length {
-    if unMemberSet[u] != unMemberSet[v] {
-      repShadowBumpReason("keySweep/merge-diffset")
-    }
+  if !unRowSetSameNullBlind(u, v) {
+    repShadowBumpReason("keySweep/merge-diffset")
   }
   if !unRowVariantsSame(u, v) { repShadowBumpReason("keySweep/merge-diffvar") }
   0
+}
+
+// Whether rows `u` and `v` record the same members in the same order once their `null` members
+// are set aside, with as many members each. `null`'s box tag is global, so where it sits is no
+// part of the layout; every other member's position is, and none is deduped. A row with no
+// recorded slice compares by its member-set spelling.
+function unRowSetSameNullBlind(u: i32, v: i32): boolean {
+  if u < 0 || v < 0 || u >= unMemberSet.length || v >= unMemberSet.length {
+    return true
+  }
+  if unMemberSet[u] == unMemberSet[v] { return true }
+  if !unRowHasSlice(u) || !unRowHasSlice(v) { return false }
+  const n = unMemTyCount[u]
+  if n != unMemTyCount[v] { return false }
+  const su = unMemTyStart[u]
+  const sv = unMemTyStart[v]
+  let i = 0
+  let j = 0
+  while i < n || j < n {
+    while i < n && unMemKinds[su + i] == 0 { i = i + 1 }
+    while j < n && unMemKinds[sv + j] == 0 { j = j + 1 }
+    if i < n && j < n {
+      if unMemAtoms[su + i] != unMemAtoms[sv + j] { return false }
+      i = i + 1
+      j = j + 1
+    } else if i < n || j < n {
+      return false
+    }
+  }
+  true
 }
 
 // The whole-registry measurement, run once per program beside `repShadowSweep`: every row
