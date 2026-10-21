@@ -233,7 +233,8 @@ const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(
 
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
-const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096, NO_OUTSIDE = 8192;
+const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096, NO_OUTSIDE = 8192, NO_INERT_OUT = 16384;
+const NO_INERT_SHAPE = 32768;
 
 // The fresh guard, the asks guard, the ambient guard's arena half and the outside guard's undo
 // halves have no mask witness: no graph found shows a served answer that differs once they are
@@ -303,6 +304,54 @@ const CASES: Case[] = [
     target: "lib.vl",
     want: "ambient",
     mask: NO_RENDER,
+  },
+  {
+    // The merged check renders `q`'s redundant annotation as main's `AB`, G's own as the union.
+    name: "a redundant annotation G renders by an outside union's name is not served",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
+        "print(area(2))\nprint(x)\n",
+      "lib.vl": 'export function area(n: i32): i32 {\n  const k: "a" | "b" = "a"\n' +
+        '  const q: "a" | "b" = k\n  print(q)\n  n\n}\n',
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_INERT_OUT,
+  },
+  {
+    // The merged render is `{[string]: AB}`: past one word and its `[]`s, any part may name.
+    name: "a redundant annotation G renders with an outside union inside a map is not served",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
+        "print(area(2))\nprint(x)\n",
+      "lib.vl": 'export function area(n: i32): i32 {\n  const k: Map<string, "a" | "b"> = Map()\n' +
+        '  const q: Map<string, "a" | "b"> = k\n  print(q.length)\n  n\n}\n',
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_INERT_SHAPE,
+  },
+  {
+    name: "a redundant annotation that renders a primitive is served beside an outside union",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
+        "print(area(2))\nprint(x)\n",
+      "lib.vl": "export function area(n: i32): i32 {\n  const b: boolean = n > 1\n" +
+        "  print(b)\n  n\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a redundant annotation that renders an array of a primitive is served beside one",
+    graph: {
+      "main.vl": 'import { area } from "./lib"\ntype AB = "a" | "b"\nconst x: AB = "a"\n' +
+        "print(area(2))\nprint(x)\n",
+      "lib.vl": 'export function area(n: i32): i32 {\n  const o: string[] = ["x"]\n' +
+        "  print(o[0])\n  n\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
   },
   {
     name: "a callback an importer registers writes a global G narrows across a call",
