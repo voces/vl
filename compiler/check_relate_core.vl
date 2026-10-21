@@ -469,6 +469,8 @@ import {
   cwHeldFnOf,
   cwParamArgs,
   cwPeel,
+  cwSlotPath,
+  cwSlotWrittenValues,
   cwSoleBinderOf,
   fnDeclIx,
 } from "./check_write_scan"
@@ -4166,6 +4168,7 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
     if pt < 0 || tyHasTyVar(pt) { return false }
     wp.push(widenLitTy(pt))
   }
+  if holeSlotJudge(a, wp) { return true }
   const reads: i32[] = []
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
@@ -4272,7 +4275,10 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   k = 0
   while k < ds.length {
     if !tySame(rs[k], rs[b]) {
-      tErr(holeLetDisagreeMsg(nm, wp, ds[k], rs[k], ds[b], rs[b]), ws[k])
+      tErr(
+        holeLetDisagreeMsg("'" + nm + "'", wp, ds[k], rs[k], ds[b], rs[b]),
+        ws[k],
+      )
       return true
     }
     k = k + 1
@@ -4280,8 +4286,79 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   false
 }
 
-// The `holeLetWritesDisagree` refusal: function `d` written to `nm` returns `r` at `wp`, where
-// `d0`, also written to it, returns `r0`.
+// `holeLetWritesDisagree` for the list element or record field the callee at `a` reads, every
+// function stored there judged at `wp` against the one stored first, once one is written after
+// the initialiser (D9060).
+function holeSlotJudge(a: i32, wp: i32[]): boolean {
+  const path: string[] = []
+  const root = cwSlotPath(a, path)
+  if root < 0 || path.length == 0 || !cwFramedNode(root) { return false }
+  const rn = P.nodes[root]
+  if !(rn is Ident) { return false }
+  const fr = covarRootFrame(root)
+  if fr == CW_FR_UNKNOWN { return false }
+  const bd = cwSoleBinderOf(rn.identName, fr)
+  if bd < 0 || !(P.nodes[bd] is LetDecl) { return false }
+  const vals: i32[] = []
+  const ats: i32[] = []
+  const nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
+  if nW < 1 { return false }
+  const ft = mkFuncTy(wp, TY_I32)
+  const noN: string[] = []
+  const noT: i32[] = []
+  const ds: i32[] = []
+  const rs: i32[] = []
+  let b = 0
+  let k = 0
+  while k < vals.length {
+    const d = cwHeldFnOf(vals[k])
+    if d < 0 || d >= P.nodes.length || !directHoleDecl(d) { return false }
+    const f = P.nodes[d]
+    if !(f is FuncDecl) || f.fnTyParams.length > 0 { return false }
+    const r = holeLamRetAt(d, ft, noN, noT)
+    if r < 0 || tyHasTyVar(r) { return false }
+    ds.push(d)
+    rs.push(widenLitTy(r))
+    if nodeStartTok(ats[k]) < nodeStartTok(ats[b]) { b = k }
+    k = k + 1
+  }
+  // Only a write is refused: a literal of functions with other results is its own question.
+  k = vals.length - nW
+  while k < vals.length {
+    if !tySame(rs[k], rs[b]) {
+      tErr(
+        holeLetDisagreeMsg(
+          holeSlotName(rn.identName, path),
+          wp,
+          ds[k],
+          rs[k],
+          ds[b],
+          rs[b],
+        ),
+        ats[k],
+      )
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+// How a diagnostic names the place `path` under `nm`: `'r.f'`, or an element of `'xs'`.
+function holeSlotName(nm: string, path: string[]): string {
+  let s = nm
+  let k = 0
+  while k < path.length - 1 {
+    if path[k] == "[]" { s = s + "[]" } else { s = s + "." + path[k] }
+    k = k + 1
+  }
+  const last = path[path.length - 1]
+  if last == "[]" { return "an element of '" + s + "'" }
+  "'" + s + "." + last + "'"
+}
+
+// The `holeLetWritesDisagree` refusal: function `d` written to the place `nm` names returns `r`
+// at `wp`, where `d0`, also written to it, returns `r0`.
 function holeLetDisagreeMsg(
   nm: string,
   wp: i32[],
@@ -4300,9 +4377,9 @@ function holeLetDisagreeMsg(
   ps = ps + ")"
   "cannot write "
     + holeDeclName(d)
-    + " to '"
+    + " to "
     + nm
-    + "': called at "
+    + ": called at "
     + ps
     + " it returns "
     + tyToStr(r)
@@ -4310,9 +4387,9 @@ function holeLetDisagreeMsg(
     + holeDeclName(d0)
     + ", also written to it, returns "
     + tyToStr(r0)
-    + " — every function a call through '"
+    + " — every function a call through "
     + nm
-    + "' may run must return one type"
+    + " may run must return one type"
 }
 
 // How a diagnostic names the function or lambda `d`.
