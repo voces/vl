@@ -1959,6 +1959,78 @@ function recIdentityLeavesAt(fd: i32, dst: i32) {
   0
 }
 
+// A function that only returns its un-annotated parameter hands back what call `p` delivers
+// there, so a literal or literal binding argument adopts the record the call lands on, as it
+// does through a generic identity; true when it did.
+function recHoleIdentityAt(p: i32, fd: i32, srcTy: i32, dstTy: i32): boolean {
+  const a = recHoleIdentityArg(p, fd)
+  if a < 0 { return false }
+  const ap = cwPeelValue(a)
+  if ap < 0 || ap >= P.nodes.length { return false }
+  if P.nodes[ap] is ObjLit { return recHoleAdoptLit(ap, srcTy, dstTy) }
+  if recFreshDeclOf(ap) < 0 { return false }
+  recAdoptNote(a, nodeTyIxOf(a), dstTy)
+  true
+}
+
+// Adopts object literal `ap` at the record a value of `srcTy` lands on in `dstTy` when it fits
+// there; true when it does.
+function recHoleAdoptLit(ap: i32, srcTy: i32, dstTy: i32): boolean {
+  const ld = recLandingOf(srcTy, dstTy)
+  if ld < 0 || !recLitFits(ap, ld, REC_STORE_DEPTH) { return false }
+  recordRepTyAdopt(ap, ld, 6)
+  true
+}
+
+// The argument of call `p` that `fd`, a non-generic function whose body only rebinds and returns
+// an un-annotated parameter, hands back; -1 otherwise.
+function recHoleIdentityArg(p: i32, fd: i32): i32 {
+  if p < 0 || p >= P.nodes.length || fd < 0 || fd >= P.nodes.length {
+    return -1
+  }
+  const c = P.nodes[p]
+  const f = P.nodes[fd]
+  if !(c is Call) || !(f is FuncDecl) { return -1 }
+  if f.fnTyParams.length > 0 || f.fnRet >= 0 || f.fnBody < 0 { return -1 }
+  for an in c.callArgNames {
+    if an != "" { return -1 }
+  }
+  const b = P.nodes[f.fnBody]
+  if !(b is Block) || b.blkStmts.length == 0 { return -1 }
+  let t = b.blkStmts[b.blkStmts.length - 1]
+  const tn = P.nodes[t]
+  if tn is RetStmt { t = tn.retArg }
+  const v = parenPeelIx(t)
+  if v < 0 || v >= P.nodes.length { return -1 }
+  const vn = P.nodes[v]
+  if !(vn is Ident) { return -1 }
+  // Earlier statements may only rebind the value to un-annotated names, walked back here.
+  let name = vn.identName
+  let k = b.blkStmts.length - 2
+  while k >= 0 {
+    const s = P.nodes[b.blkStmts[k]]
+    if !(s is LetDecl) || s.letType >= 0 { return -1 }
+    const si = parenPeelIx(s.letInit)
+    if si < 0 || si >= P.nodes.length { return -1 }
+    const sn = P.nodes[si]
+    if !(sn is Ident) { return -1 }
+    if s.letName == name { name = sn.identName }
+    k = k - 1
+  }
+  let i = 0
+  while i < f.fnParams.length && i < c.callArgs.length {
+    const pn = P.nodes[f.fnParams[i]]
+    if pn is Param {
+      if pn.parName == name {
+        if pn.parType >= 0 || pn.parRest != 0 { return -1 }
+        return c.callArgs[i]
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
 // Does the object literal `lit` fit the record `dst` field by field, where only an integer
 // literal may meet another number, at every depth of object literals?
 function recLitFits(lit: i32, dst: i32, depth: i32): boolean {
@@ -2078,6 +2150,7 @@ export function recAdoptNote(srcExpr: i32, srcTy: i32, dstTy: i32) {
         recRefuseAtOwnRow(p, nonNulTyOf(srcTy), ld)
         return 0
       }
+      if recHoleIdentityAt(p, fd, srcTy, dstTy) { return 0 }
       recIdentityLeavesAt(fd, ld)
       return recAdPushDecl(fd, srcTy, nonNulTyOf(dstTy), false, p)
     }
