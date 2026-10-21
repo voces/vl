@@ -21,6 +21,7 @@ import {
   Index,
   IsExpr,
   LetDecl,
+  MatchExpr,
   Member,
   NullLit,
   NumLit,
@@ -32,6 +33,7 @@ import {
   RetStmt,
   StrLit,
   TypeRef,
+  Unary,
   binderNameAt,
   callHasTyArgs,
   clearAnnTs,
@@ -60,7 +62,11 @@ import {
   tyToStr,
 } from "./check_types"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
-import { reparseArrowLambdaAt, reparseFuncDeclAt } from "./parser"
+import {
+  reparseArrowLambdaAt,
+  reparseChoiceExprAt,
+  reparseFuncDeclAt,
+} from "./parser"
 import { declOrigOf, identDeclOf } from "./symbols"
 import { vrCalls, vrIndex, vrLostIn, vrReset } from "./value_reach"
 
@@ -552,6 +558,7 @@ function fsValuePeer(v: i32): i32 {
     return -1
   }
   if n is FuncDecl && n.fnName == "" { return -1 }
+  if fsPureChoice(v, 0) { return -1 }
   const ia = fsIdentityArg(v)
   if ia >= 0 && (letDeclOfRead(ia) < 0 || fsConstLambdaOf(ia) >= 0) {
     return -1
@@ -561,6 +568,82 @@ function fsValuePeer(v: i32): i32 {
     -2,
     "a value that is not a name, a lambda or a name through an identity call",
   )
+}
+
+// Whether `v` is an `if` with an `else` whose arms are each only a name or another such `if`,
+// and whose conditions read without a call or a write, so a slot can evaluate a fresh copy of it
+// to the same function (D9120).
+function fsPureChoice(v: i32, depth: i32): boolean {
+  const x = fsParenPeel(v)
+  if x < 0 || x >= P.nodes.length || depth > 16 { return false }
+  const n = P.nodes[x]
+  if n is MatchExpr { return fsPureMatch(n, depth) }
+  if !(n is IfStmt) || n.ifElse < 0 || !fsPureRead(n.ifCond, 0) { return false }
+  fsPureChoiceArm(n.ifThen, depth) && fsPureChoiceArm(n.ifElse, depth)
+}
+
+// `fsPureChoice` for a `match` not yet lowered: a pure scrutinee, literal or `_` patterns
+// binding nothing, and arms that are each a name or a pure choice.
+function fsPureMatch(n: MatchExpr, depth: i32): boolean {
+  if !fsPureRead(n.matchScrut, 0) { return false }
+  let i = 0
+  while i < n.matchPats.length {
+    if n.matchBinds[i] >= 0 || !fsPureRead(n.matchPats[i], 0) { return false }
+    i = i + 1
+  }
+  for b in n.matchBodies {
+    if b < 0 || b >= P.nodes.length { return false }
+    if !(P.nodes[b] is Ident) && !fsPureChoiceArm(b, depth) { return false }
+  }
+  true
+}
+
+// Whether `if` arm `a` (a block holding one value, or an `else if`) is a name or a pure choice.
+function fsPureChoiceArm(a: i32, depth: i32): boolean {
+  if a < 0 || a >= P.nodes.length { return false }
+  const n = P.nodes[a]
+  if n is IfStmt { return fsPureChoice(a, depth + 1) }
+  if !(n is Block) || n.blkStmts.length != 1 { return false }
+  const s = fsParenPeel(n.blkStmts[0])
+  if s < 0 || s >= P.nodes.length { return false }
+  P.nodes[s] is Ident || fsPureChoice(s, depth + 1)
+}
+
+// Whether expression `x` reads names, literals, fields, elements and operators only, so a second
+// evaluation of it gives the same value and has no effect.
+function fsPureRead(x: i32, depth: i32): boolean {
+  if x < 0 || x >= P.nodes.length || depth > 32 { return false }
+  const n = P.nodes[x]
+  if (
+    n is Ident
+    || n is NumLit
+    || n is StrLit
+    || n is CharLit
+    || n is BoolLit
+    || n is NullLit
+  ) {
+    return true
+  }
+  if n is Paren { return fsPureRead(n.parInner, depth + 1) }
+  if n is Unary {
+    if n.unOp != "!" && n.unOp != "-" && n.unOp != "~" { return false }
+    return fsPureRead(n.unArg, depth + 1)
+  }
+  if n is BinExpr {
+    if n.binOp == "=" { return false }
+    return fsPureRead(n.binLeft, depth + 1) && fsPureRead(n.binRight, depth + 1)
+  }
+  if n is Member { return fsPureRead(n.memObj, depth + 1) }
+  if n is Index {
+    return fsPureRead(n.idxArr, depth + 1) && fsPureRead(n.idxIndex, depth + 1)
+  }
+  if n is ArrayLit {
+    for e in n.arrElems {
+      if !fsPureRead(e, depth + 1) { return false }
+    }
+    return true
+  }
+  fsExcluded(0, "a condition that may call, write or build a function") != 0
 }
 
 // The argument node call `c` hands back unchanged, or -1. The callee is a declared function
@@ -2416,7 +2499,39 @@ function fsMemberReadKey(r: i32): string {
   if dk != "" { return dk }
   const ik = fsIdentityReadKey(r)
   if ik != "" { return ik }
-  fsReadKey(r)
+  const rk = fsReadKey(r)
+  if rk.slice(0, 2) == "u:" {
+    const lk = fsListCallbackKey(r)
+    if lk != "" { return lk }
+  }
+  rk
+}
+
+// The key of read `r` handed as the callback of a `.map` / `.filter` over a list of a closed
+// element type: that type, which fixes the one instantiation the callback takes; else "".
+function fsListCallbackKey(r: i32): string {
+  const p = fsParent[r]
+  if p < 0 { return "" }
+  const pn = P.nodes[p]
+  if (
+    !(pn is Call)
+    || pn.callFn == r
+    || pn.callArgs.length != 1
+    || pn.callArgs[0] != r
+  ) {
+    return ""
+  }
+  if pn.callFn < 0 { return "" }
+  const cf = P.nodes[pn.callFn]
+  if !(cf is Member) || (cf.memProp != "map" && cf.memProp != "filter") {
+    return ""
+  }
+  const ot = nodeTyIxOf(cf.memObj)
+  if ot < 0 { return "" }
+  const at = T.tys[ot]
+  if !(at is TyArray) || at.aElem < 0 { return "" }
+  if tyHasTyVar(at.aElem) || tyReachesHole(at.aElem, 8) { return "" }
+  "c:" + tyToStr(at.aElem) + ","
 }
 
 // The key of read `r` when it is an identity call's argument initializing a binding: that
@@ -3567,7 +3682,13 @@ function fsValueNode(src: i32, name: string): i32 {
     if f < 0 { return -2 }
     return f
   }
-  fsExcluded(-2, "a value that is not a name or a lambda")
+  if n is IfStmt || n is MatchExpr {
+    // Copied from its tokens, since the check lowers a `match` to an `if` chain in place.
+    const e = reparseChoiceExprAt(fsFirstTok(src))
+    if e < 0 || !(P.nodes[e] is IfStmt || P.nodes[e] is MatchExpr) { return -2 }
+    return e
+  }
+  fsExcluded(-2, "a value that is not a name, a lambda or a choice of names")
 }
 
 // Annotation `t` names type `nm`; the parser's spelling tree for it is dropped, since every
