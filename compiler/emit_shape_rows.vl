@@ -364,6 +364,7 @@ import {
   memoMoved,
   memoPassMoved,
   tyRegWrites,
+  uFieldReLays,
 } from "./memo"
 import {
   annGenAppSpanEnds,
@@ -1078,8 +1079,24 @@ export function elemRowsCaptureCompat(vn: string, dn: string): boolean {
       ercVal = []
       pxSized(ercCap, ercKeyV, ercKeyD, ercStamp, ercVal)
       ercWalk = 0
+      ercKeepSize(ercCap)
     }
     ercWalk = ercWalk + 1
+    let moved = memoMoved(ercKeepKey, 0, tyRegGenNow())
+    moved = memoMoved(ercKeepKey, 1, uFieldReLays) || moved
+    if moved {
+      ercKeepGen = ercKeepGen + 1
+      ercKeepN = 0
+    }
+    // A table past half full probes long, so it grows; at its cap it starts over instead.
+    if ercKeepN * 2 >= ercKeepCap {
+      if ercKeepCap < 262144 {
+        ercKeepSize(ercKeepCap * 2)
+      } else {
+        ercKeepGen = ercKeepGen + 1
+        ercKeepN = 0
+      }
+    }
   }
   ercBusy = ercBusy + 1
   const ercAns = elemRowsCaptureCompatAt(vn, dn)
@@ -1094,11 +1111,13 @@ let ercBusy: i32 = 0
 let ercCap: i32 = 0
 let ercWalk: i32 = 0
 
-// Restarts the two walk depths and the pair index's size at compile start; the memo key that
-// sizes the index is reset in the same prologue, so the first walk rebuilds it.
+// Restarts the two walk depths and both pair indexes' sizes at compile start; the memo key that
+// sizes them is reset in the same prologue, so the first walk rebuilds them.
 export function shapeRowsReset() {
   ercBusy = 0
   ercCap = 0
+  ercKeepCap = 0
+  ercAssumed = 0
   rasDepth = 0
   0
 }
@@ -1106,6 +1125,30 @@ let ercKeyV: i32[] = []
 let ercKeyD: i32[] = []
 let ercStamp: i32[] = []
 let ercVal: i32[] = []
+
+// Answers that outlive one walk: a pair whose walk met no pair still in progress and no full
+// index is a function of the registry alone, so it is kept until the registry's generation
+// moves. A walk value of 2 or 3 is the answer 0 or 1 of a pair that leaned on an assumption.
+const ercKeepKey = memoKeyNew(2)
+let ercKeepGen: i32 = 0
+let ercKeepCap: i32 = 0
+let ercKeepN: i32 = 0
+let ercAssumed: i32 = 0
+let ercKeepV: i32[] = []
+let ercKeepD: i32[] = []
+let ercKeepStamp: i32[] = []
+let ercKeepVal: i32[] = []
+
+function ercKeepSize(cap: i32) {
+  ercKeepCap = cap
+  ercKeepV = []
+  ercKeepD = []
+  ercKeepStamp = []
+  ercKeepVal = []
+  pxSized(cap, ercKeepV, ercKeepD, ercKeepStamp, ercKeepVal)
+  ercKeepGen = 0
+  ercKeepN = 0
+}
 
 // The same question one nesting level at a time: a nested-struct field is asked of its own two
 // element rows, so a box or a missing field at ANY depth refutes. A pair the index cannot hold
@@ -1127,11 +1170,33 @@ function elemRowsCaptureCompatAt(vn: string, dn: string): boolean {
     return true
   }
   const slot = pxSlotOf(ercKeyV, ercKeyD, ercStamp, ercCap, ercWalk, vi, di)
-  if slot < 0 { return true }
-  if ercStamp[slot] == ercWalk {
-    if ercVal[slot] == 0 - 2 { return true }
-    return ercVal[slot] == 1
+  if slot < 0 {
+    ercAssumed = ercAssumed + 1
+    return true
   }
+  if ercStamp[slot] == ercWalk {
+    const seen = ercVal[slot]
+    if seen == 0 - 2 || seen >= 2 { ercAssumed = ercAssumed + 1 }
+    if seen == 0 - 2 { return true }
+    return seen == 1 || seen == 3
+  }
+  const kept = pxSlotOf(
+    ercKeepV,
+    ercKeepD,
+    ercKeepStamp,
+    ercKeepCap,
+    ercKeepGen,
+    vi,
+    di,
+  )
+  if kept >= 0 && ercKeepStamp[kept] == ercKeepGen {
+    ercKeyV[slot] = vi
+    ercKeyD[slot] = di
+    ercStamp[slot] = ercWalk
+    ercVal[slot] = ercKeepVal[kept]
+    return ercKeepVal[kept] == 1
+  }
+  const assumedBefore = ercAssumed
   ercKeyV[slot] = vi
   ercKeyD[slot] = di
   ercStamp[slot] = ercWalk
@@ -1183,7 +1248,28 @@ function elemRowsCaptureCompatAt(vn: string, dn: string): boolean {
     ercKeyV[back] = vi
     ercKeyD[back] = di
     ercStamp[back] = ercWalk
-    if fits { ercVal[back] = 1 } else { ercVal[back] = 0 }
+    let v = 0
+    if fits { v = 1 }
+    if ercAssumed != assumedBefore { v = v + 2 }
+    ercVal[back] = v
+  }
+  if ercAssumed == assumedBefore && ercKeepN * 2 < ercKeepCap {
+    const keep = pxSlotOf(
+      ercKeepV,
+      ercKeepD,
+      ercKeepStamp,
+      ercKeepCap,
+      ercKeepGen,
+      vi,
+      di,
+    )
+    if keep >= 0 {
+      if ercKeepStamp[keep] != ercKeepGen { ercKeepN = ercKeepN + 1 }
+      ercKeepV[keep] = vi
+      ercKeepD[keep] = di
+      ercKeepStamp[keep] = ercKeepGen
+      if fits { ercKeepVal[keep] = 1 } else { ercKeepVal[keep] = 0 }
+    }
   }
   fits
 }
