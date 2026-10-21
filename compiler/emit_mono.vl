@@ -16144,7 +16144,7 @@ function monoCallGenFnToTyParamArrow(
               if gfe >= 0 && gfe < monoGen.length {
                 if monoGen[gfe] == 1 { return true }
               }
-              if monoWrittenGenLetFrame(ax, ctx)[1] >= 0 { return true }
+              if monoHandLetRead(ax, ctx)[0] >= 0 { return true }
             }
             if monoArgIsOpenFnChoice(ax, 0) { return true }
           }
@@ -18027,6 +18027,34 @@ function monoWrittenLetRetsDisagree(
   false
 }
 
+// The read `[read, frame]` of the written `let` of generics (`monoWrittenGenLetFrame`) that the
+// name read at `at` in frame `ctx` is, or reaches through a chain of un-annotated aliases never
+// written after their initializer (D9130); `[-1, -1]` for none.
+function monoHandLetRead(at: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  if at < 0 || !(P.nodes[at] is Ident) { return none }
+  let ax = at
+  let fr = ctx
+  let hops = 0
+  while hops < MONO_ALIAS_CHAIN_MAX {
+    if monoWrittenGenLetFrame(ax, fr)[1] >= 0 {
+      const out: i32[] = [ax, fr]
+      return out
+    }
+    const lf = monoReadLetFrame(ax, fr)
+    if lf[1] < 0 { return none }
+    const d = P.nodes[lf[1]]
+    if !(d is LetDecl) || d.letType >= 0 || d.letInit < 0 { return none }
+    if d.letKw != "const" && monoLetWrittenIn(lf) { return none }
+    const iv = unwrapParen(d.letInit)
+    if iv < 0 || !(P.nodes[iv] is Ident) { return none }
+    ax = iv
+    fr = lf[0]
+    hops = hops + 1
+  }
+  none
+}
+
 // Hands the re-pointed `let` read at `arg` to arrow parameter `p` of `fn`: every function it may
 // hold is instanced at the parameter's type the value arguments bind (D9001). 1 when that type
 // closed, 0 when it did not, -1 when an earlier delivery took another type.
@@ -18093,20 +18121,24 @@ function monoPinTyParamComposite(
   const annIsFn = nodeTyIsFunc(p.parType)
   if annIsFn {
     anC = monoArgFnTypeName(args[i], ctx)
+    // An alias of a written `let` hands that `let`, whatever its initializer names (D9130).
+    const ax = unwrapParen(args[i])
+    const wl = monoHandLetRead(ax, ctx)
     // A generic function value takes the type the value arguments bound (D3913), and so does
     // an un-annotated lambda or alias of one (D8981).
     if (
-      monoCalleeIsGeneric(unwrapParen(args[i]))
-      || monoArgIsOpenFnValue(args[i])
-      || monoArgIsOpenFnChoice(args[i], 0)
+      (wl[0] < 0 || wl[0] == ax)
+      && (monoCalleeIsGeneric(ax)
+        || monoArgIsOpenFnValue(args[i])
+        || monoArgIsOpenFnChoice(args[i], 0))
     ) {
       if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
         monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV)
       }
       const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
       if pre != "" { anC = pre }
-    } else if monoWrittenGenLetFrame(unwrapParen(args[i]), ctx)[1] >= 0 {
-      const hr = monoHandWrittenLet(p, fn, ann, args[i], ctx, tvN, tvV)
+    } else if wl[0] >= 0 {
+      const hr = monoHandWrittenLet(p, fn, ann, wl[0], wl[1], tvN, tvV)
       if hr < 0 { return hr }
       if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
     }
