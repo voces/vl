@@ -50,7 +50,7 @@ import {
   i32ToStr,
   nodeSpineChildrenPush,
 } from "./ast"
-import { sidLookup, sidOf, sidOfNode } from "./symbols"
+import { identDeclOf, sidLookup, sidOf, sidOfNode } from "./symbols"
 import { i32ListHas, i32ListIndexOf } from "./listutil"
 import { demangleName } from "./check_suggest"
 import { hashMixPair } from "./hash_mix"
@@ -212,6 +212,9 @@ let cwIxPUsed = 0
 // binding is being resolved, so a cycle of bindings declines.
 let cwFvSlot: {[string]: i32} = Map()
 let cwFvSets: i32[][] = []
+// `cwBoundInitOf` memo: `"<frame>#<name>"` to its answer, so a binding named at every call of
+// a long body is resolved once.
+let cwBiSlot: {[string]: i32} = Map()
 
 function cwIxReset() {
   cwIxHead = []
@@ -243,6 +246,7 @@ function cwIxReset() {
   cwIxParentFiled = false
   cwFvSlot = Map()
   cwFvSets = []
+  cwBiSlot = Map()
   0
 }
 
@@ -1154,11 +1158,63 @@ export function cwLambdaDeclOf(nm: string, fr: i32): i32 {
   -1
 }
 
+// The function declaration or lambda node `a` names: itself, the declaration a name resolves
+// to, or the initialiser of the un-annotated `const` or once-bound `let` it reads, followed
+// through aliases (D8981); -1 else.
+export function cwFnValueDeclOf(a: i32): i32 {
+  let ix = cwPeel(a)
+  let hops = 0
+  while ix >= 0 && ix < P.nodes.length && hops < 8 {
+    const n = P.nodes[ix]
+    if n is FuncDecl { return ix }
+    if !(n is Ident) { return -1 }
+    const d = identDeclOf(ix)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    const dn = P.nodes[d]
+    if dn is FuncDecl { return d }
+    if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
+    if dn.letKw == "const" {
+      ix = cwPeel(dn.letInit)
+    } else {
+      ix = cwBoundInitOf(n.identName, covarRootFrame(ix))
+    }
+    hops = hops + 1
+  }
+  -1
+}
+
+// The function declaration or lambda the name `a` holds, read from the source alone, so before
+// the checker has resolved it: a declared function, or what a binding bound once holds, followed
+// through aliases; -1 else.
+export function cwHeldFnOf(a: i32): i32 {
+  let ix = cwPeel(a)
+  let hops = 0
+  while ix >= 0 && ix < P.nodes.length && hops < 8 {
+    const n = P.nodes[ix]
+    if n is FuncDecl { return ix }
+    if !(n is Ident) { return -1 }
+    const f = fnDeclIx[n.identName] ?? -1
+    if f >= 0 { return f }
+    ix = cwBoundInitOf(n.identName, covarRootFrame(ix))
+    hops = hops + 1
+  }
+  -1
+}
+
 // The initialiser, parens peeled, of the binding `nm` bound exactly once in frame `fr` and never
 // re-pointed, or -1.
 export function cwBoundInitOf(nm: string, fr: i32): i32 {
   if nm == "" { return -1 }
   cwIxBuild()
+  const key = i32ToStr(fr) + "#" + nm
+  const m = cwBiSlot.get(key)
+  if m != null { return m }
+  const init = cwBoundInitScan(nm, fr)
+  cwBiSlot[key] = init
+  init
+}
+
+function cwBoundInitScan(nm: string, fr: i32): i32 {
   if !cwBoundOnce(nm, fr) { return -1 }
   const ow = cwOccWalk(nm, fr)
   while cwOccNext(ow) {
