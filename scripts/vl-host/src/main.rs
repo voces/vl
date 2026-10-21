@@ -3521,6 +3521,9 @@ struct LinkOpts {
     heap_base_given: bool,
     /// `--low-memory-unused[=<bytes>]`: no access reaches below this address (`None`: no promise).
     low_memory: Option<i32>,
+    /// `-O` / `-O3`: the seed emits the shapes binaryen scalarises (an inline map store) rather
+    /// than the smaller out-of-line ones a plain build gets.
+    optimizing: bool,
 }
 
 /// The largest page count an i32-addressed memory can declare (4 GiB).
@@ -3727,6 +3730,7 @@ fn parse_link_opts(args: &[String]) -> LinkOpts {
         heap: heap_window(base, limit),
         heap_base_given: base.is_some(),
         low_memory: None,
+        optimizing: false,
     };
     if let Some(m) = memory_sizes_error(&link) {
         usage_exit(&m);
@@ -4211,6 +4215,13 @@ fn compile_vl_instance(
     if emit_names == Names::NoSrcMap {
         if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setEmitSrcMap") {
             set.call(&mut store, 0)?;
+        }
+    }
+    // `-O` / `-O3` next: the seed keeps a map store inline, where binaryen can scalarise the map.
+    // Optional, like `setEmitNames`: an older seed has no out-of-line store to withhold.
+    if link.optimizing {
+        if let Ok(set) = inst.get_typed_func::<i32, i32>(&mut store, "setOptimized") {
+            set.call(&mut store, 1)?;
         }
     }
     // `vl build --import-memory`. Unlike the name section this changes what the module
@@ -10885,6 +10896,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
     // it (DECISIONS.md §"Linear memory is a layout contract").
     let mut link = parse_link_opts(args);
     link.low_memory = low_memory.map(|n| n as i32);
+    link.optimizing = optimizing;
     // A heap window that starts inside the promised-unused region breaks the promise with the
     // first allocation, so the two flags contradict each other.
     if let (Some(n), Some((base, _))) = (low_memory, link.heap) {
