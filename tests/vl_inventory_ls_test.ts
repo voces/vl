@@ -43,6 +43,8 @@ const ROWS: Record<string, string> = {
   D3: "### D3 — a loud row\n**loud emit reject**\n",
   D7: "### D7 — a negated status\n**not closed by D2**\n",
   D4: "### D4 — a trap\n**loads then traps**\n",
+  D5: "### D5 — a design close\n**now a loud check reject, closed by lane x**\n",
+  D6: "### D6 — a half fixed\n**loud emit reject · lane y fixed the other half**\n",
 };
 
 // Everything above the marker is kept as written; the ranges below it are rewritten sorted.
@@ -105,16 +107,18 @@ Deno.test({
           "D2   runs                   a closed row\n" +
           "D3   emit_reject            a loud row\n" +
           "D4   trap_loads             a trap\n" +
+          "D5   check_reject           a design close\n" +
+          "D6   emit_reject            a half fixed\n" +
           "D7   ?                      a negated status\n" +
           "D10  silent_invalid_wasm    a silent row\n\n" +
-          "6 of 6 rows · docs/internals/inventory, docs/internals/inventory-2\n",
+          "8 of 8 rows · docs/internals/inventory, docs/internals/inventory-2\n",
       );
       check(
         "--status silent",
         await ls(dir, ["--status", "silent", "docs/internals/inventory"]),
         0,
         "D10  silent_invalid_wasm    a silent row\n\n" +
-          "1 of 5 rows · --status silent · docs/internals/inventory\n",
+          "1 of 7 rows · --status silent · docs/internals/inventory\n",
       );
       check(
         "--status open --tail 2",
@@ -128,7 +132,28 @@ Deno.test({
         0,
         "D7   ?                      a negated status\n" +
           "D10  silent_invalid_wasm    a silent row\n\n" +
-          "2 of 5 rows · --status open · docs/internals/inventory\n",
+          "2 of 7 rows · --status open · docs/internals/inventory\n",
+      );
+      // A status whose first clause says closed is not open, whatever outcome it files;
+      // a later clause crediting a half does not close the row.
+      check(
+        "--status open",
+        await ls(dir, ["--status", "open", "docs/internals/inventory"]),
+        0,
+        "D3   emit_reject            a loud row\n" +
+          "D4   trap_loads             a trap\n" +
+          "D6   emit_reject            a half fixed\n" +
+          "D7   ?                      a negated status\n" +
+          "D10  silent_invalid_wasm    a silent row\n\n" +
+          "5 of 7 rows · --status open · docs/internals/inventory\n",
+      );
+      check(
+        "--status closed",
+        await ls(dir, ["--status", "closed", "docs/internals/inventory"]),
+        0,
+        "D2   runs                   a closed row\n" +
+          "D5   check_reject           a design close\n\n" +
+          "2 of 7 rows · --status closed · docs/internals/inventory\n",
       );
 
       // --next is one past the highest id in the first inventory, skipping reservations.
