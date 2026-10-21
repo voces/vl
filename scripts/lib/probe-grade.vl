@@ -1,7 +1,7 @@
 // The capability-probe grading vocabulary: run one program under a seed and name what
-// happened — RUNS, WRONG, check refuses, emit refuses, SILENT, COMPILER TRAP or TIMEOUT.
-// The verdict and detail bytes match the probe runner's, so the position matrix and the
-// probes read alike. Import with a relative path, e.g. `from "./lib/probe-grade"`.
+// happened — RUNS, WRONG, check refuses, emit refuses, SILENT, COMPILER TRAP, TRAP (program)
+// or TIMEOUT. The verdict and detail bytes match the probe runner's, so the position
+// matrix and the probes read alike. Import with a relative path, e.g. `from "./lib/probe-grade"`.
 
 import { IoError } from "std:fs"
 import { runProgram } from "std:process"
@@ -149,12 +149,19 @@ function dropPosPrefix(l: string): string {
   l
 }
 
-// The refusal channel named from `vl check`'s rc and the combined output, and the
-// detail beside it. The channel is read from what happened to the module, never from
-// the sentence, and advice lines (hint, warning, info) are never the detail.
+// The host's exit code, and its banner, for a fault inside the compiler module rather
+// than in the program it built (`report`, scripts/vl-host/src/main.rs).
+const EXIT_COMPILER_BUG = 70
+const COMPILER_TRAPPED = "the compiler itself trapped"
+
+// The refusal channel named from `vl check`'s and `vl run`'s rc and the combined output,
+// and the detail beside it. The channel is read from what happened to the module, never
+// from the sentence, and advice lines (hint, warning, info) are never the detail. A trap
+// is the compiler's only when the host says so (exit 70 or its banner); any other trap
+// past a clean check is the built program's, TRAP (program).
 export type Verdict = { where: string, detail: string }
 
-export function classify(chkRc: i32, err: string): Verdict {
+export function classify(chkRc: i32, runRc: i32, err: string): Verdict {
   const lines: string[] = []
   for raw in splitLines(err) {
     if (
@@ -172,10 +179,13 @@ export function classify(chkRc: i32, err: string): Verdict {
     err,
     ["not yet supported", "has no lowering", "not supported by codegen"],
   )
+  const trapped = anyIn(err, ["wasm backtrace", "call stack exhausted"])
   let where = "emit refuses"
-  if chkRc != 0 {
+  if chkRc == EXIT_COMPILER_BUG && contains(err, COMPILER_TRAPPED) {
+    where = "COMPILER TRAP (check rc 70)"
+  } else if chkRc != 0 {
     where = "check refuses"
-  } else if anyIn(err, ["wasm backtrace", "call stack exhausted"]) {
+  } else if contains(err, COMPILER_TRAPPED) {
     where = "COMPILER TRAP (check rc 0)"
   } else if (
     anyIn(
@@ -187,13 +197,21 @@ export function classify(chkRc: i32, err: string): Verdict {
     )
   ) {
     where = "SILENT (check rc 0)"
+  } else if trapped && runRc == EXIT_COMPILER_BUG {
+    where = "COMPILER TRAP (check rc 0)"
+  } else if trapped {
+    where = "TRAP (program)"
   }
   const inv = leftmost(
     err,
     ["Invalid input WebAssembly code", "type mismatch: expected "],
   )
+  const wt = findFrom(err, "wasm trap: ", 0)
   let detail = ""
-  if startsWith(where, "SILENT") || startsWith(where, "COMPILER TRAP") {
+  const isTrap = where == "TRAP (program)" || startsWith(where, "COMPILER TRAP")
+  if isTrap && wt >= 0 {
+    detail = err.slice(wt, cpRunEnd(err, wt, 70, false))
+  } else if startsWith(where, "SILENT") || isTrap {
     if inv.at >= 0 {
       let n = 48
       if inv.alt == "Invalid input WebAssembly code" { n = 60 }
@@ -283,6 +301,6 @@ export function grade(j: Job, want: string | null): Graded {
     }
   }
   const err = chk.out + chk.err + run.out + run.err
-  const v = classify(chk.code, err)
+  const v = classify(chk.code, run.code, err)
   { verdict: v.where, detail: v.detail, out: out, err: err }
 }

@@ -34,6 +34,7 @@ const VERDICTS = [
   "emit refuses",
   "SILENT",
   "COMPILER TRAP",
+  "TRAP (program)",
   "TIMEOUT",
 ];
 
@@ -71,7 +72,7 @@ const runMatrixOnce = async (
     "--compiler",
     COMPILER,
     "--",
-    `${TEMPLATES}/${template}`,
+    template.startsWith("/") ? template : `${TEMPLATES}/${template}`,
     "--compiler",
     COMPILER,
     "--vl",
@@ -328,6 +329,56 @@ Deno.test({
     }
     if (cells.length !== 2) {
       throw new Error(`want the 2 local_assign cells, got ${cells.length}`);
+    }
+  },
+});
+
+// A PROGRAM'S TRAP IS NOT THE COMPILER'S. A check-clean cell whose built program trapped was
+// graded COMPILER TRAP, from the backtrace alone, and the matrix exited 0 over it. The host
+// says which module trapped (exit 70 and its banner for the compiler), so the cell is now
+// TRAP (program), clause 1, and the matrix exits 1. The control is D3202's own witness as the
+// proof, on the master seed: `vl check` rc 0, `vl run` `wasm trap: null reference`. When
+// D3202 closes these cells run; replace the proof with an out-of-bounds index then. The
+// compiler-trap half is in vl_capability_matrix_port_test.ts, on a stub, since no master seed
+// traps the compiler on demand.
+const D3202_TEMPLATE = `// D3202's witness as the proof.
+// @@PRELUDE@@
+function __show(x) { const l = [x]; l[0] = x; print(l[0]) }
+const __v0: string | null = null
+// @@VALUE@@
+__v0
+// @@TYPE@@
+string | null
+// @@PROOF@@
+__show(v)
+// @@WANT@@
+null
+`;
+
+Deno.test({
+  name: "matrix: a check-clean program that traps is TRAP (program) and exits 1 (D3202)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_capability_matrix_trap_" });
+    try {
+      const t = `${dir}/d3202-program-trap.matrix.vl`;
+      await Deno.writeTextFile(t, D3202_TEMPLATE);
+      const { code, cells, out } = await runMatrix(t, "binding,argument");
+      for (const face of ["annotated", "un-annotated"]) {
+        for (const p of ["binding", "argument"]) {
+          wantVerdict(cells, p, face, "TRAP (program)", "D3202: check rc 0, then the program traps");
+          const grade = gradeOf(cells, p, face);
+          if (!grade.includes("wasm trap: null reference")) {
+            throw new Error(`${p}/${face}: want the trap named, got ${grade}`);
+          }
+        }
+      }
+      if (!out.includes("-> program trap   4")) {
+        throw new Error(`want the summary to count 4 program traps, got:\n${out}`);
+      }
+      if (code !== 1) throw new Error(`want exit 1 on a program trap (clause 1), got ${code}`);
+    } finally {
+      await Deno.remove(dir, { recursive: true });
     }
   },
 });
