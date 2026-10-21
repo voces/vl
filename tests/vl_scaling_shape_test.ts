@@ -783,23 +783,25 @@ axis(
   (d) => twoFiles(d, genValueWrites(12000, false), genValueWrites(12000, true)),
 );
 
-// D2872's GROWTH pair: the in-function arm at `n` against `n/4`, so linear reads 4 and
-// quadratic 16. Fuel reads 4.02; master read 14.97, from a per-name scan of every local in
-// scope (`igWalk`) and a list shift per moved write (`asvList`).
+// D2872's GROWTH pair: the in-function arm at 6,000 against 1,500, so linear reads 4 and
+// quadratic 16. Fuel reads 4.01; master read 14.97 at 12,000, from a per-name scan of every
+// local in scope (`igWalk`) and a list shift per moved write (`asvList`). A planted per-call
+// arena scan reads 10.23 at 6,000.
 axis(
   "in-function value writes",
   5.0,
   "`igWalk`'s shadow lookup (compiler/emit_sections.vl) or `asvList`'s rewrite (compiler/emit_rewrite.vl) is scanning per write.",
-  (d) => twoFiles(d, genValueWrites(12000, true), genValueWrites(3000, true)),
+  (d) => twoFiles(d, genValueWrites(6000, true), genValueWrites(1500, true)),
 );
 
-// D3276's GROWTH pair, 8,000 functions of arm and branch bodies against 2,000, so linear reads 4.
-// A per-block scan of the object-looking arms once read 9.5x master at 8,000.
+// D3276's GROWTH pair, 4,000 functions of arm and branch bodies against 1,000, so linear reads 4.
+// A per-block scan of the object-looking arms once read 9.5x master at 8,000; at 4,000 fuel
+// reads 3.98, and a planted per-function arena scan 10.08.
 axis(
   "object-looking arm bodies",
   5.0,
   "A per-block or per-function pass is scanning the arm bodies (compiler/parser.vl `parseArmBody`).",
-  (d) => twoFiles(d, genArmBodies(8000), genArmBodies(2000)),
+  (d) => twoFiles(d, genArmBodies(4000), genArmBodies(1000)),
 );
 
 // D2914's GROWTH pair, 400 re-seated lists against 100, so linear reads 4 and quadratic 16. A
@@ -866,9 +868,10 @@ axis(
   (d) => twoFiles(d, genConstChain(200), genConstChain(50)),
 );
 
-// 1.09 / 0.97 / 1.13.
+// 1.09 / 0.97 / 1.13 at 6,000. At 3,000 fuel reads 1.00, and an arena scan planted on each
+// distinct identifier's first check reads 4.18.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
-  twoFiles(d, genCallSites(6000, 1), genCallSites(6000, 20)));
+  twoFiles(d, genCallSites(3000, 1), genCallSites(3000, 20)));
 
 // The entry file's export table: deduping the staged names and resolving each one's target
 // scanned per export. Fuel reads 1.01; master `4179e4b36` read 4.23 here, and 8x the fuel at
@@ -1116,12 +1119,14 @@ axis(
 
 // The same pair through a callee that calls itself: the recursion cuts a cycle under every
 // delivery's first question, and an answer computed under a cut must still be banked at the
-// outermost question, or each delivery re-walks the uses (D2060).
+// outermost question, or each delivery re-walks the uses (D2060). At 2,500 fuel reads 1.90,
+// and 4.22 with `rcwMemoGet` answering every key as unbanked. The non-recursive pair above
+// stays at 3,500: that same mutant reads only 3.19 there.
 axis(
   "covariant record deliveries to a recursive callee",
   2.5,
   "The D2060 memo is declining to bank a cut answer at the outermost open question (`rcwMemoPut`).",
-  (d) => twoFiles(d, genRecordCovar(5000, true, true, 0), genRecordCovar(5000, false, true, 0)),
+  (d) => twoFiles(d, genRecordCovar(2500, true, true, 0), genRecordCovar(2500, false, true, 0)),
 );
 
 // One function of `n` sibling blocks, each binding five temps and folding them into `acc` —
@@ -1151,11 +1156,13 @@ const genSiblingBlocks = (n: number, temps: "same" | "unique" | "hoisted"): stri
 // 44 s at 250 blocks and ran past 300 s at 500, where the hoisted arm read 0.06 s (D2090).
 // Every same-named slot made the scope-less detection sweep run once more, and each lookup
 // scanned the frame; without the sweep dedupe the interleaved f64/i32 temp is quadratic alone.
+// The three pairs below run at 1,250 blocks, where an arena scan planted on every `let` reads
+// 7.40 / 7.44 / 7.79.
 axis(
   "sibling blocks redeclaring locals",
   2.5,
   "`dupScanRun` is sweeping once per same-named slot, or `declaredSlotOf` is scanning the frame (D2090).",
-  (d) => twoFiles(d, genSiblingBlocks(2500, "same"), genSiblingBlocks(2500, "hoisted")),
+  (d) => twoFiles(d, genSiblingBlocks(1250, "same"), genSiblingBlocks(1250, "hoisted")),
 );
 
 // 0.63 / 0.65 / 0.97 at 2,500 blocks, against master's 168 s / 0.59 s at 4,000: a frame of
@@ -1165,7 +1172,7 @@ axis(
   "locals per function",
   2.5,
   "A per-read lookup is scanning every local of the frame — `declaredSlotOf`, `capIsBound` (D2090).",
-  (d) => twoFiles(d, genSiblingBlocks(2500, "unique"), genSiblingBlocks(2500, "hoisted")),
+  (d) => twoFiles(d, genSiblingBlocks(1250, "unique"), genSiblingBlocks(1250, "hoisted")),
 );
 
 // `genSiblingBlocks` with five temps whose reps alternate on their OWN periods (2, 3, 5, 7,
@@ -1193,13 +1200,14 @@ const genSiblingReps = (n: number, temps: "same" | "hoisted"): string => {
 };
 
 // The sweep dedupe above keys on the whole tuple, so here it re-swept the body once per
-// distinct tuple: 2,310 sweeps of a 2,500-block body. Sweeping each name's rep classes
+// distinct tuple: 2,310 sweeps of a 2,500-block body, and at 1,250 blocks every block's tuple
+// is distinct. Sweeping each name's rep classes
 // instead of its slot positions takes two (D2309).
 axis(
   "same-named locals of several reps",
   2.5,
   "`dupScanRun` is sweeping once per slot position or class tuple rather than per class (D2309).",
-  (d) => twoFiles(d, genSiblingReps(2500, "same"), genSiblingReps(2500, "hoisted")),
+  (d) => twoFiles(d, genSiblingReps(1250, "same"), genSiblingReps(1250, "hoisted")),
 );
 
 // A value-union declared once, then `n` top-level statements (so `startStmts` holds `n`
@@ -1241,7 +1249,8 @@ axis(
 // enclosing declaration" should make the search past the first miss O(1). D2326:
 // `plBestDupAt`'s walk past a binary-search miss stepped to the previous SIBLING instead of
 // jumping via `plSortedSkip` to the nearest ENCLOSING one, re-walking the whole closed chain
-// on every one of the `n` reads.
+// on every one of the `n` reads. At 6,000 fuel reads 2.61, and an arena scan planted on every
+// `let` reads 18.85.
 const genManyClosedSiblingReads = (n: number, many: boolean): string => {
   const o = ["type U = i32 | string", "function h(): i32 {", "  let t = 0", "  let v = 1"];
   const shadows = many ? n : 1;
@@ -1255,7 +1264,7 @@ axis(
   "reads after many closed sibling shadows",
   3.4,
   "`plBestDupAt` is stepping past every closed sibling instead of jumping via `plSortedSkip` (D2326).",
-  (d) => twoFiles(d, genManyClosedSiblingReads(12000, true), genManyClosedSiblingReads(12000, false)),
+  (d) => twoFiles(d, genManyClosedSiblingReads(6000, true), genManyClosedSiblingReads(6000, false)),
 );
 
 // `n` top-level `if true` blocks, each declaring `const u` and a closure reading it — the
@@ -1355,8 +1364,9 @@ const genLongBody = (n: number, closure: boolean): string => {
 
 // 0.59 / 0.54 / 1.09 at 1,500 arms, against master's 38.73 / 0.46 / 84.20: every read of `k`
 // re-walked the whole closure body to learn its capture set until `captureNamesOf` kept the
-// walk for the pass (D2017). The fill is shared and reads no global set from `g`, which would
-// price a different per-read walk (D2130).
+// walk for the pass (D2017). The shared fill is most of a short arm, so the pair stays at 1,500:
+// with the capture cache disabled it reads 9.85 here and 3.32 at 750. The fill reads no global
+// set from `g`, which would price a different per-read walk (D2130).
 axis(
   "closure body length",
   2.5,
@@ -1541,9 +1551,10 @@ axis(
 );
 
 // D3417's GROWTH pair: one `n`-element literal per element kind (i32, f64, i64, a record) at
-// 40,000 against 10,000, so linear reads 4 and quadratic 16; it reads 2.9, the fixed cost of a
-// compile riding the short arm. A scalar literal past the operand cap is a data segment, and
-// each element is asked its width once per classification.
+// 20,000 against 5,000, so linear reads 4 and quadratic 16; it reads 3.72, the fixed cost of a
+// compile riding the short arm, and 14.13 with an arena scan planted per object literal. A
+// scalar literal past the operand cap is a data segment, and each element is asked its width
+// once per classification.
 const genArrayLiterals = (n: number): string => {
   const o: string[] = [];
   const els = (f: (i: number) => string) => Array.from({ length: n }, (_, i) => f(i)).join(", ");
@@ -1559,7 +1570,7 @@ axis(
   "array literal length",
   5.0,
   "A literal's elements are re-scanned per element, or a scalar literal past the operand cap stopped lowering as a data segment (`arrLitNumKind`, `arrLitDataBuild`; D3417).",
-  (d) => twoFiles(d, genArrayLiterals(40000), genArrayLiterals(10000)),
+  (d) => twoFiles(d, genArrayLiterals(20000), genArrayLiterals(5000)),
 );
 
 // A chain of `depth` generics, each calling the next, every body carrying deferred
@@ -1947,6 +1958,8 @@ axis(
 // it, and that answer comes off a per-sid index of the frame's bindings, not a body walk (D2289).
 // At 16,000 calls: 0.38 / 0.34 / 0.95 here, 15.66 / 0.36 / 39.15 on #3135's round-3 cut, and
 // 0.72 / 0.36 / 1.80 on master, whose `blockDeclaresStmt` scanned the body's statements per read.
+// The pair runs at 10,000, where fuel reads 1.03 and an arena scan planted in `chainShadowsAt`
+// reads 170.
 const genShadowedCallee = (n: number, shadow: boolean): string => {
   const b = shadow ? "w" : "v";
   const o = ["function w(): i32 { return 1 }", "function g(): i32 {", "  let acc = 0"];
@@ -1961,7 +1974,7 @@ axis(
   "calls under a same-named binding",
   2.5,
   "A call's shadow test is walking the frame body per call (`chainShadowsAt`, D2289).",
-  (d) => twoFiles(d, genShadowedCallee(20000, true), genShadowedCallee(20000, false)),
+  (d) => twoFiles(d, genShadowedCallee(10000, true), genShadowedCallee(10000, false)),
 );
 
 // `fns` functions of `arms` sibling blocks, each binding its function's one list name to a
@@ -2472,13 +2485,13 @@ shardTest({
     let red = "";
     try {
       await gradePair("fuel control", 2.5, "unreachable: the control exists to fail.", (d) =>
-        twoFiles(d, genStatements(4000), genStatements(200)));
+        twoFiles(d, genStatements(2000), genStatements(100)));
     } catch (e) {
       red = String(e);
     }
     if (!red.includes("fuel control: the many-entity arm")) {
       throw new Error(
-        "the fuel control did not red: 4,000 statements against 200 of the same came in under " +
+        "the fuel control did not red: 2,000 statements against 100 of the same came in under " +
           `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
           `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
       );
@@ -2487,7 +2500,7 @@ shardTest({
 });
 
 // THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
-// (reads about 5.5: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
+// (reads 4.50: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
 shardTest({
   name: "scaling shape: control — twenty times the work reds the allocation grader",
   ignore: !ENABLED,
@@ -2495,13 +2508,13 @@ shardTest({
     let red = "";
     try {
       await gradeAllocPair("allocation control", 2.5, "unreachable: the control exists to fail.", (d) =>
-        twoFiles(d, genStatements(4000), genStatements(200)));
+        twoFiles(d, genStatements(2000), genStatements(100)));
     } catch (e) {
       red = String(e);
     }
     if (!red.includes("allocation control: the many-entity arm")) {
       throw new Error(
-        "the allocation control did not red: 4,000 statements against 200 of the same came in " +
+        "the allocation control did not red: 2,000 statements against 100 of the same came in " +
           "under 2.5x the bytes allocated. The `[alloc]` reading has stopped measuring, so every " +
           `allocation axis above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
       );
