@@ -5494,6 +5494,14 @@ function litFieldBoxedApart(
   r is TyUnion || r is TyNullable
 }
 
+// Whether field `name` of the object literal at `objIx` is typed at a type parameter that
+// instance `fnIx` binds: the instance reads the literal at its own row, not a declared one.
+function litPinnedInInstance(objIx: i32, name: string, fnIx: i32): boolean {
+  if fnIx < 0 { return false }
+  const lt = tyFieldTyOf(nodeRepTyIxOf(objIx), name)
+  lt >= 0 && tyHasTyVar(lt)
+}
+
 // The record an anonymous struct row holds: the minting literal's own type where the row
 // recorded its hole's context, else the recorded type; -1 for a declared row or none.
 export function anonRowOwnTyOf(name: string): i32 {
@@ -5513,13 +5521,14 @@ let litHoleDecl: i32[] = []
 let litHoleParam: string[] = []
 let litHoleNext: i32[] = []
 
-// The object literal argument `a` delivers: itself, or the initialiser of the un-annotated
-// binding it names; -1 for anything else.
+// The object literal argument `a` delivers: itself, the initialiser of the un-annotated
+// binding it names, or the literal a builder it calls returns; -1 for anything else.
 function litArgLiteral(a: i32): i32 {
   const u = unwrapParen(a)
   if u < 0 || u >= P.nodes.length { return -1 }
   const n = P.nodes[u]
   if n is ObjLit { return u }
+  if n is Call { return litCallTail(n) }
   if !(n is Ident) { return -1 }
   const d = identDeclOf(u)
   if d < 0 || d >= P.nodes.length { return -1 }
@@ -5529,6 +5538,25 @@ function litArgLiteral(a: i32): i32 {
   const v = unwrapParen(ld.letInit)
   if v < 0 || v >= P.nodes.length { return -1 }
   if !(P.nodes[v] is ObjLit) { return -1 }
+  v
+}
+
+// The object literal a call to a non-generic function with no return annotation hands back as
+// its body's last statement, bare or returned; -1 for anything else.
+function litCallTail(c: Call): i32 {
+  if c.callFn < 0 { return -1 }
+  const d = cwCalleeDeclOf(c.callFn)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const fd = P.nodes[d]
+  if !(fd is FuncDecl) { return -1 }
+  if fd.fnRet >= 0 || fd.fnTyParams.length > 0 || fd.fnBody < 0 { return -1 }
+  const b = P.nodes[fd.fnBody]
+  if !(b is Block) || b.blkStmts.length == 0 { return -1 }
+  let t = b.blkStmts[b.blkStmts.length - 1]
+  const tn = P.nodes[t]
+  if tn is RetStmt { t = tn.retArg }
+  const v = unwrapParen(t)
+  if v < 0 || v >= P.nodes.length || !(P.nodes[v] is ObjLit) { return -1 }
   v
 }
 
@@ -5804,6 +5832,9 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
     // The row this literal's OWN destination names, computed on first need (D1690). -2 is
     // "not asked yet": a literal with no union-box field never pays for the lookup.
     let dstRow = 0 - 2
+    // The first declared row passed over only because an instance reads a field it boxes at
+    // the literal's own pin (D8680): taken when no other row fits.
+    let apartSi = -1
     const sLimA = sScanLim()
     const cands = objLitNameCands(o, sLimA)
     let ci = 0
@@ -5812,6 +5843,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       if sFieldCount[si] == nf {
         let ok = true
         let strict = true
+        let apart = false
         let k = 0
         while k < nf {
           const f = P.nodes[o.objFields[k]]
@@ -5849,10 +5881,13 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
                       ok = false
                     } else if (
                       sc == FC_UNION
-                      && litHoleReadsField(objIx, f.fiName)
                       && litFieldBoxedApart(objIx, f.fiName, si, fnIx)
                     ) {
-                      ok = false
+                      if litHoleReadsField(objIx, f.fiName) {
+                        ok = false
+                      } else if litPinnedInInstance(objIx, f.fiName, fnIx) {
+                        apart = true
+                      }
                     }
                   }
                 }
@@ -5871,6 +5906,10 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
             strict = false
           }
           k = k + 1
+        }
+        if ok && apart {
+          if apartSi < 0 { apartSi = si }
+          ok = false
         }
         if ok {
           if firstSi < 0 { firstSi = si }
@@ -5934,6 +5973,7 @@ function structIndexOfObjCtxGo(objIx: i32, fnIx: i32) {
       // instead of a same-fieldset niche twin like `{f: boolean | null}`.
       if strictSi >= 0 { return strictSi }
     }
+    if firstSi < 0 { return apartSi }
     return firstSi
   }
   -1
