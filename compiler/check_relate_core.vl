@@ -12,6 +12,7 @@ import {
   Call,
   FieldDef,
   FieldInit,
+  ForIn,
   FuncDecl,
   Ident,
   IfStmt,
@@ -465,6 +466,7 @@ import {
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwFnValueWriteOf,
+  cwForInBinderOf,
   cwFramedNode,
   cwHeldFnOf,
   cwParamArgs,
@@ -4168,19 +4170,38 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
     if pt < 0 || tyHasTyVar(pt) { return false }
     wp.push(widenLitTy(pt))
   }
-  if holeSlotJudge(a, wp) { return true }
   const reads: i32[] = []
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
   for r in reads {
-    if holeLetJudge(r, wp) { return true }
+    const rn = P.nodes[r]
+    if rn is Index || rn is Member || rn is ForIn {
+      if holeSlotJudge(r, wp) { return true }
+    } else if holeLetJudge(r, wp) {
+      return true
+    }
   }
   false
 }
 
-// Add to `out` each read of a `let` that the value `a` may be: the name itself, and through a
-// parameter every call's argument, through a binding each value written to it, through a call
-// of a named function each value it returns (D9007, D9008). `seen` holds the nodes visited.
+// Whether the value `a` may be read from a list element, a record field or a `for` loop's
+// element, so a call through it runs what that place holds (D9090).
+export function holeFnReadsSlot(a: i32): boolean {
+  if holeFnArgDecl(a) >= 0 { return false }
+  const reads: i32[] = []
+  const seen: i32[] = []
+  holeLetReadsOf(a, seen, reads)
+  for r in reads {
+    const rn = P.nodes[r]
+    if rn is Index || rn is Member || rn is ForIn { return true }
+  }
+  false
+}
+
+// Add to `out` each read of a `let`, list element, record field or `for` element that the
+// value `a` may be: the name itself, and through a parameter every call's argument, through a
+// binding each value written to it, through a call of a named function each value it returns
+// (D9007, D9008, D9090). `seen` holds the nodes visited.
 function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
   const ix = parenPeelIx(a)
   if (
@@ -4203,8 +4224,13 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
     for v in rv { holeLetReadsOf(v, seen, out) }
     return 0
   }
+  if n is Member {
+    out.push(ix)
+    return 0
+  }
   // An element of a list bound once to a literal is any of the literal's elements.
   if n is Index {
+    out.push(ix)
     const lx = parenPeelIx(n.idxArr)
     if lx < 0 || lx >= P.nodes.length || !cwFramedNode(lx) { return 0 }
     const ln = P.nodes[lx]
@@ -4221,7 +4247,12 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
   const fr = covarRootFrame(ix)
   if fr == CW_FR_UNKNOWN { return 0 }
   const bd = cwSoleBinderOf(n.identName, fr)
-  if bd < 0 || bd >= P.nodes.length { return 0 }
+  if bd < 0 {
+    const fl = cwForInBinderOf(ix)
+    if fl >= 0 { out.push(fl) }
+    return 0
+  }
+  if bd >= P.nodes.length { return 0 }
   // Each call of a parameter's function instances its own copy, so its arguments are judged
   // one by one and never as one set.
   if P.nodes[bd] is Param {
@@ -4276,7 +4307,7 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   while k < ds.length {
     if !tySame(rs[k], rs[b]) {
       tErr(
-        holeLetDisagreeMsg("'" + nm + "'", wp, ds[k], rs[k], ds[b], rs[b]),
+        holeLetDisagreeMsg("'" + nm + "'", wp, ds[k], rs[k], ds[b], rs[b], false),
         ws[k],
       )
       return true
@@ -4286,12 +4317,19 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
   false
 }
 
-// `holeLetWritesDisagree` for the list element or record field the callee at `a` reads, every
-// function stored there judged at `wp` against the one stored first, once one is written after
-// the initialiser (D9060).
+// `holeLetWritesDisagree` for the list element or record field `a` reads, or the element a `for`
+// loop `a` binds, every function stored there judged at `wp` against the one stored first
+// (D9060, D9090, D9092).
 function holeSlotJudge(a: i32, wp: i32[]): boolean {
   const path: string[] = []
-  const root = cwSlotPath(a, path)
+  let root = -1
+  const an = P.nodes[a]
+  if an is ForIn {
+    root = cwSlotPath(an.fiIter, path)
+    path.push("[]")
+  } else {
+    root = cwSlotPath(a, path)
+  }
   if root < 0 || path.length == 0 || !cwFramedNode(root) { return false }
   const rn = P.nodes[root]
   if !(rn is Ident) { return false }
@@ -4302,7 +4340,7 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
   const vals: i32[] = []
   const ats: i32[] = []
   const nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
-  if nW < 1 { return false }
+  if nW < 0 || vals.length < 2 { return false }
   const ft = mkFuncTy(wp, TY_I32)
   const noN: string[] = []
   const noT: i32[] = []
@@ -4322,8 +4360,11 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
     if nodeStartTok(ats[k]) < nodeStartTok(ats[b]) { b = k }
     k = k + 1
   }
-  // Only a write is refused: a literal of functions with other results is its own question.
-  k = vals.length - nW
+  // The initialiser's first value is the one stored first; a write through a function declared
+  // above it is not earlier.
+  if nW < vals.length { b = 0 }
+  // A literal's own elements are judged too, as its annotated twin's union element is (D9092).
+  k = 0
   while k < vals.length {
     if !tySame(rs[k], rs[b]) {
       tErr(
@@ -4334,6 +4375,7 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
           rs[k],
           ds[b],
           rs[b],
+          k < vals.length - nW,
         ),
         ats[k],
       )
@@ -4357,8 +4399,8 @@ function holeSlotName(nm: string, path: string[]): string {
   "'" + s + "." + last + "'"
 }
 
-// The `holeLetWritesDisagree` refusal: function `d` written to the place `nm` names returns `r`
-// at `wp`, where `d0`, also written to it, returns `r0`.
+// The `holeLetWritesDisagree` refusal: function `d` written (or, `stored`, held by a literal) to
+// the place `nm` names returns `r` at `wp`, where `d0`, also there, returns `r0`.
 function holeLetDisagreeMsg(
   nm: string,
   wp: i32[],
@@ -4366,7 +4408,16 @@ function holeLetDisagreeMsg(
   r: i32,
   d0: i32,
   r0: i32,
+  stored: boolean,
 ): string {
+  let verb = "write "
+  let into = " to "
+  let also = ", also written to it, returns "
+  if stored {
+    verb = "store "
+    into = " in "
+    also = ", also stored in it, returns "
+  }
   let ps = "("
   let j = 0
   while j < wp.length {
@@ -4375,9 +4426,10 @@ function holeLetDisagreeMsg(
     j = j + 1
   }
   ps = ps + ")"
-  "cannot write "
+  "cannot "
+    + verb
     + holeDeclName(d)
-    + " to "
+    + into
     + nm
     + ": called at "
     + ps
@@ -4385,7 +4437,7 @@ function holeLetDisagreeMsg(
     + tyToStr(r)
     + ", where "
     + holeDeclName(d0)
-    + ", also written to it, returns "
+    + also
     + tyToStr(r0)
     + " — every function a call through "
     + nm
