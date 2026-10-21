@@ -468,6 +468,10 @@ import {
   gImports,
   gLowMemUnused,
   gMapDeletes,
+  gMapSetFn,
+  gMapSetFnBase,
+  gMapSetRows,
+  gMapSetTy,
   gMemLogIdx,
   gNeedsF32Print,
   gNeedsF64Print,
@@ -663,6 +667,7 @@ import {
   fbF64Neg,
   fbF64PromoteF32,
   fbF64Trunc,
+  fbFuncTypeHead,
   fbGlobalGet,
   fbGlobalSet,
   fbI32And,
@@ -699,7 +704,9 @@ import {
   fbRefNullNone,
   fbRefNullOfKind,
   fbRefNullStruct,
+  fbRefNullValtype,
   fbRefTest,
+  fbRefValtype,
   fbRetExtra,
   fbReturn,
   fbReturnCall,
@@ -12284,26 +12291,33 @@ function cmKeysBack() {
 // The current op's target-key scratch local: the string frame's slot 1, a `(ref $sTypeIdx)`
 // string, or an integer frame's slot 0, the raw key.
 function cmKeyLocal() {
+  if msHelp { return 1 }
   if cmKeyInt() { return cmIntKeyBase() }
   mapScratchBase + 1
 }
 // The current op's grown or compacted keys-backing scratch local: the string frame's slot 6, or
 // an integer frame's slot 1.
 function cmKeysBkLocal() {
+  if msHelp { return 6 }
   if cmKeyInt() { return cmIntKeyBase() + 1 }
   mapScratchBase + 6
 }
+// True while a `__map_set_<row>__` body emits: its map, key and value are params 0, 1 and 2, and
+// every other slot is the string frame's own, rebased to local 0, whatever the shape.
+let msHelp = false
 // The current op's mapRef local. An mv slot always uses its own typed frame slot, asked first
 // because that frame is already typed to the slot's map struct whichever key rep it carries. Only
 // the two mono shapes have to choose between the shared `(ref $mStructIdx)` scratch slot 0 and
 // the i32-keyed frame's own, the mono local being typed to the string-keyed struct.
 function cmMapRefLocal() {
+  if msHelp { return 0 }
   if cmSlot >= 0 { return fnMvMapRefLocal(cmSlot) }
   if cmKeyInt() { return cmIntKeyBase() + 4 }
   mapScratchBase
 }
 // The current op's vals-backing scratch local (grow/compact temporary).
 function cmValsBkLocal() {
+  if msHelp { return 7 }
   if cmSlot < 0 { return mapScratchBase + 7 }
   fnMvValsBkLocal(cmSlot)
 }
@@ -13926,6 +13940,10 @@ function emitMapSetValExpr(
 // machinery touches it, so the value survives from its write through the overwrite or
 // append store; slot 3 (the pushVal stash) is also the probe slot and cannot hold one.
 function setMapSetValStash(body: u8[], mslot: i32) {
+  if msHelp {
+    fbLocalSet(2)
+    return 0
+  }
   if mslot >= 0 {
     fbLocalSet(fnMvValStashLocal(mslot))
     return 0
@@ -13934,6 +13952,10 @@ function setMapSetValStash(body: u8[], mslot: i32) {
   0
 }
 function pushMapSetValStash(body: u8[], mslot: i32) {
+  if msHelp {
+    fbLocalGet(2)
+    return 0
+  }
   if mslot >= 0 {
     fbLocalGet(fnMvValStashLocal(mslot))
     return 0
@@ -13994,13 +14016,110 @@ function emitMapSetV(
       return -1
     }
   }
+  cmSlot = mslot // re-pin: inner map ops in the value expr clobber it
+  // [mapRef, key, value] are the shape's store helper's params, in order.
+  const setFn = mapSetFnOf(mslot)
+  if setFn >= 0 {
+    fbCall(setFn)
+    return 0
+  }
   if setMapSetValStash(body, mslot) < 0 { return -1 }
-  cmSlot = mslot           // re-pin: inner map ops in the value expr clobber it
   fbLocalSet(cmKeyLocal()) // the target key (popped off the stack)
   setMapRef(body)          // mapRef
+  emitMapSetStore(body, mslot)
+}
+
+// The function a set over map shape `sh` calls: its row's store helper, given the next index
+// after the helpers already called the first time a site asks; -1 when the row has no functype.
+function mapSetFnOf(sh: i32) {
+  const row = mapShapeRow(sh)
+  if row < 0 || row >= gMapSetTy.length || gMapSetTy[row] < 0 { return -1 }
+  if gMapSetFn[row] < 0 {
+    gMapSetFn[row] = gMapSetFnBase + gMapSetRows.length
+    gMapSetRows.push(row)
+  }
+  gMapSetFn[row]
+}
+
+// The row of map shape `sh` in the per-shape helper tables: 0 the string-keyed mono map, 1 the
+// i32-keyed one, `2 + s` mv slot `s`, the last the i64-keyed one; a Set rows as its key's map.
+function mapShapeRow(sh: i32) {
+  if sh == -1 || sh == -2 { return 0 }
+  if sh == -4 || sh == -5 { return 1 }
+  if sh == -6 || sh == -7 { return mvMapTypeIdx.length + 2 }
+  if sh < 0 { return -1 }
+  sh + 2
+}
+
+// `__map_set_<row>__(m, k, v)`'s functype for map shape `sh`: the map, its key rep and the value
+// in the type a set site's value expression leaves.
+export function mapSetFuncType(sh: i32) {
+  const saved = cmSlot
+  cmSlot = sh
+  fbFuncTypeHead(3)
+  fbRefValtype(cmMapTy())
+  const k = cmKeyKind()
+  if k == MAP_KEY_I32 { fbValtype("i32", -1) }
+  else if k == MAP_KEY_I64 { fbValtype("i64", -1) }
+  else { fbRefValtype(sTypeIdx) }
+  if sh < 0 {
+    fbValtype("i32", -1) // the mono map's value
+  } else if mvValKind[sh] == MVK_F64 {
+    fbValtype("f64", -1)
+  } else if mvValKind[sh] == MVK_I64 {
+    fbValtype("i64", -1)
+  } else if mvValKind[sh] == MVK_F32 {
+    fbValtype("f32", -1)
+  } else {
+    fbRefNullValtype(mvValElemHeapOf(sh)) // the vals element
+  }
+  wULEB(0)
+  cmSlot = saved
+  0
+}
+
+// The body of `__map_set_<row>__` for map shape `sh`: the store a set site would otherwise
+// inline, over the params, with the string frame's slots 3 to 13 as its locals.
+export function mapSetFnBody(sh: i32): u8[] {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  const savedSlot = cmSlot
+  const savedBase = mapScratchBase
+  cmSlot = sh
+  wULEB(6)
+  wULEB(3)
+  fbValtype("i32", -1) // 3 slot, 4 cap, 5 entry
+  wULEB(1)
+  fbRefValtype(cmKeysBack()) // 6 keysBk
+  wULEB(1)
+  fbRefValtype(cmValsBack()) // 7 valsBk
+  wULEB(1)
+  if gMapDeletes {
+    fbRefNullValtype(ia64TypeIdx) // 8 the grown seqs
+  } else {
+    fbValtype("i32", -1) // 8 unused without deletes
+  }
+  wULEB(3)
+  fbValtype("i32", -1) // 9 hcur, 10 and 11 unused
+  wULEB(2)
+  fbRefValtype(aTypeIdx) // 12 liveBk, 13 hashBk
+  mapScratchBase = 0
+  msHelp = true
+  emitMapSetStore(body, sh)
+  msHelp = false
+  mapScratchBase = savedBase
+  cmSlot = savedSlot
+  fbEnd()
+  wTarget(prev)
+  body
+}
+
+// A set's store, with the map, key and value in their locals: probe; a hit overwrites, a miss
+// appends, compacting first when the dead entries call for it, and maybe resizes.
+function emitMapSetStore(body: u8[], mslot: i32) {
   emitMapProbe(body, true)
-  pushMapScr(body, 5)      // entry
-  fbIf(64)                 // if (entry != 0 → overwrite), void
+  pushMapScr(body, 5) // entry
+  fbIf(64)            // if (entry != 0 → overwrite), void
   // OVERWRITE: vals.backing[entry-1] = stash
   pushMapVals(body)
   fbStructGet(cmValsWrap(), 0) // struct.get (vals backing), field 0: backing
@@ -15040,6 +15159,7 @@ function mapSeqSaveSlot() {
 // The function's one `(ref null <i64 array>)` slot for a map-seqs grow, shared: no user code
 // runs between its set and its last read (D2315).
 function mapSeqsBackSlot() {
+  if msHelp { return 8 }
   let k = 0
   while k < liKinds.length {
     if liKinds[k] == "i64" && liSlots[k] == 0 - 7 && liBack[k] == 3 {
@@ -31707,10 +31827,7 @@ function emitForInMapResync(mapL: i32, curL: i32, seqL: i32, shape: i32) {
 // The compaction helper for map shape `sh` (a Set folds onto its key rep's mono map), or -1
 // when the module reserved none: nothing deletes, so no entry is ever dead (D2315).
 function mapCompactFnOf(sh: i32) {
-  let row = sh + 2
-  if sh == -1 || sh == -2 { row = 0 }
-  if sh == -4 || sh == -5 { row = 1 }
-  if sh == -6 || sh == -7 { row = mvMapTypeIdx.length + 2 }
+  const row = mapShapeRow(sh)
   if row < 0 || row >= gHelpMapCompact.length { return -1 }
   gHelpMapCompact[row]
 }

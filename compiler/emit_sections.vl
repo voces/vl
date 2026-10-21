@@ -397,6 +397,12 @@ import {
   gInitialMemPages,
   gLowMemUnused,
   gMapDeletes,
+  gMapSetFn,
+  gMapSetFnBase,
+  gMapSetRows,
+  gMapSetTy,
+  gMapSetTyBase,
+  gMapSetTyN,
   gMaxMemPages,
   gMemLogIdx,
   gNeedsAsFail,
@@ -930,6 +936,8 @@ import {
   expCtxHere,
   expCtxReset,
   maFoldCandidateCount,
+  mapSetFnBody,
+  mapSetFuncType,
   mvValsWrapOf,
   sFieldStorageSlot,
   strAccScanStart,
@@ -5677,8 +5685,11 @@ function nameMapCount(n: i32): i32 {
   count = count + rvHelperCount()
   if gHelpAsFail >= 0 { count = count + 1 }
   if gHelpStrFromBytes >= 0 { count = count + 1 }
-  count
+  count + gMapSetRows.length
 }
+
+// The name-section name of map store helper row `row`.
+function mapSetFnName(row: i32): string { "__map_set_" + i32ToStr(row) + "__" }
 
 // The namemap entries of the imports, at their slot indices: the print family, then each used
 // fs import, then the user externs. A slot with no index or name is recorded with `emitFail` and
@@ -5844,6 +5855,10 @@ function nameHelpers() {
   if gHelpStrFromBytes >= 0 {
     wULEB(gHelpStrFromBytes)
     wName("__str_from_bytes__")
+  }
+  for row in gMapSetRows {
+    wULEB(gMapSetFn[row])
+    wName(mapSetFnName(row))
   }
 }
 
@@ -6609,7 +6624,36 @@ function assignSharedHelperIndices(helpBase: i32) {
     gHelpStrFromBytes = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
+  // The map store helpers reserve only a functype per shape here. Each takes a function index,
+  // after every helper above and before the thunks, when a set site first calls it, so a shape
+  // no site sets costs a functype and no body.
+  gMapSetTy = []
+  gMapSetFn = []
+  gMapSetRows = []
+  gMapSetTyN = 0
+  gMapSetTyBase = 0
+  gMapSetFnBase = 0
+  let sr = 0
+  while sr < mvMapTypeIdx.length + 3 {
+    if mapSetRowable(mapCompactRowShape(sr)) {
+      gMapSetTy.push(gMapSetTyN)
+      gMapSetTyN = gMapSetTyN + 1
+    } else {
+      gMapSetTy.push(-1)
+    }
+    gMapSetFn.push(-1)
+    sr = sr + 1
+  }
   nHelpers
+}
+
+// Whether map shape `sh` has every heap type and shared helper its store helper names.
+function mapSetRowable(sh: i32): boolean {
+  if !mapShapeCompactable(sh) { return false }
+  const k = mapShapeKeyKind(sh)
+  if k == MAP_KEY_I32 { return gHelpMapProbeI32 >= 0 }
+  if k == MAP_KEY_I64 { return gHelpMapProbeI64 >= 0 && gHelpMapProbeI32 >= 0 }
+  gHelpMapProbe >= 0 && gHelpStrHash >= 0
 }
 
 // ── emitProgram pass manager ──
@@ -8563,7 +8607,7 @@ function emitTypeSection(
   // lower-indexed types.
   let nGroup = 0
   if typeOffset > 0 { nGroup = 1 }
-  wULEB(nGroup + n + hasStart + nPrintTypes + memFn + nHelpers)
+  wULEB(nGroup + n + hasStart + nPrintTypes + memFn + nHelpers + gMapSetTyN)
   if typeOffset > 0 {
     wU8(78)           // 0x4e rec group
     wULEB(typeOffset) // the heap types and the closure-signature pool
@@ -8792,6 +8836,11 @@ function tsEmitHelperFuncTypes() {
   }
   if gHelpStrFromBytes >= 0 {
     helpFuncType("yii", "s") // __str_from_bytes__: (u8[], at, count) -> (ref str)
+  }
+  let sft = 0
+  while sft < gMapSetTy.length {
+    if gMapSetTy[sft] >= 0 { mapSetFuncType(mapCompactRowShape(sft)) }
+    sft = sft + 1
   }
   0
 }
@@ -9047,6 +9096,8 @@ function emitFunctionSection(
     wULEB(helpTyBase + hi)
     hi = hi + 1
   }
+  gMapSetTyBase = helpTyBase + nHelpers
+  gMapSetFnBase = gImports + gFuncFixedN
   wTarget(fnPrev)
   gFuncEntries = funcPayload
   gFuncRopeAt = W.chunks.length
@@ -9102,8 +9153,9 @@ function frameFunctionSection() {
   const countBuf: u8[] = []
   const thunkBuf: u8[] = []
   const prev = wTarget(countBuf)
-  wULEB(gFuncFixedN + cloThunkFes.length)
+  wULEB(gFuncFixedN + gMapSetRows.length + cloThunkFes.length)
   wTarget(thunkBuf)
+  for row in gMapSetRows { wULEB(gMapSetTyBase + gMapSetTy[row]) }
   let k = 0
   while k < cloThunkFes.length {
     wULEB(fnSigIdxOfFn(cloThunkFes[k]))
@@ -9845,9 +9897,17 @@ function buildCodePayload(
     if emitStrFromBytesFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_from_bytes__")
   }
+  // The map store helpers the bodies above called, in the order they first did.
+  for row in gMapSetRows {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    helpFrameBody(entry, mapSetFnBody(mapCompactRowShape(row)))
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, mapSetFnName(row))
+  }
+  const nSet = gMapSetRows.length
   // The thunk bodies last, in the order the function section declares them. A thunk's row
   // carries its target's slot and node, so its name and position are the target's.
-  collectCloThunks(n, gImports + fixedN)
+  collectCloThunks(n, gImports + fixedN + nSet)
   let tci = 0
   while tci < cloThunkFes.length {
     const rows = emitFnSpanStart.length
@@ -9864,8 +9924,8 @@ function buildCodePayload(
     )
     tci = tci + 1
   }
-  if cloThunkFes.length > 0 {
-    rewriteCodeCount(codePayload, fixedN + cloThunkFes.length, rowsAt)
+  if nSet + cloThunkFes.length > 0 {
+    rewriteCodeCount(codePayload, fixedN + nSet + cloThunkFes.length, rowsAt)
   }
   0
 }
