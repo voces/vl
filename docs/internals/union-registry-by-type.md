@@ -400,21 +400,44 @@ name's render drops: `i32|f64` arrives with `1 | 2 | f64`, `i32|null` with `N2 |
 `i32|string|boolean` with `U | boolean`. Switched, it changed 12 modules' codegen and broke
 `is` over a numeric literal union. It switches once a type key at the name's grain exists.
 
+Then the fifth slice (L6 log, 2026-10-20): the softened key. `softUnionKeyTextOfTyIn(ty, stmts)`
+spells a union type at the name's grain from the type, with no render parsed. Members render
+nominally, a literal run stays whole where the name's render keeps it, an unnamed record is
+spelled as the first declaration in `stmts` of its shape, an integer-literal union over two
+widths is its widths, and a declared union alias atom expands to its members.
+`canonUnionKeyOfText` mints the key the same way the name's key is minted. Two keys switch:
+
+- Site 44's adopt with no type, through `softKeyOrNameKey` and `unNameAdoptKeyRow`. Its text
+  agrees with the name's 184 times and differs 0 times.
+- `unKeyAliasRow` at the declared-union mint: 10 agree, 0 differ, and 2,000 with no text, which
+  fall back to the name's key.
+
+The rest do not switch, because the name carries what the type does not. Each count is a
+differ over `tests/cases`:
+
+- Site 55 differs 8 times in 4 files. In one, a nested nullable `(A | null) | B` is named
+  with `null` where the declaration put it. In the others, the name softens a literal-union
+  alias to `string` while the type keeps `K | L`. Widening the alias in the key took the
+  differs from 8 to 111.
+- `unKeyPush` differs 38 times: the same `null` position, and a mixed-width alias whose
+  name repeats a width.
+- The typed adopt differs 25 times: a record spelled structurally on one side and by its
+  declaration on the other, or `null` before a member.
+
 Left:
 
-- Site 55, behind the softened type key.
+- Site 55, `unKeyPush` and the typed adopt, each until its differs agree.
 - `registerValueUnionName`'s seven plain callers: two in `emit_collect.vl` that hold only a
   spelling, four in `emit_shape_intern.vl` and one in `emit_sections.vl`.
 - `annParamKindTy`, behind the twin-softened list row.
 - Sites 52 and 53 answering by type, once their downstream readers do.
 - The `isUName` / `unionRowOf` callers that hold no type.
-- `isUNameKeyAB`'s no-type fallback. Its type-holding callers are in `emit_classify.vl`,
-  `emit_collect.vl` and `emit_shape_rows.vl`.
-- `unRowOfSetText`, whose caller holds no type, and `unKeyAliasRow`.
-- The adopt's `i64 | i32` fallback at site 44 (`registerInferRetNominalUnion`), which needs the
-  softened type key.
-- The deletion of `canonUnionKeyOfName`. Four emit files still call it, 10 calls in all, and
-  `check_nj_join.vl`, which defines it, calls it 3 times.
+- `isUNameKeyAB`'s no-type fallback at its other sites. Its type-holding callers are in
+  `emit_classify.vl`, `emit_collect.vl` and `emit_shape_rows.vl`.
+- `unRowOfSetText`, whose caller holds no type.
+- The deletion of `canonUnionKeyOfName`. Three emit files still call it, 10 calls in all
+  (`emit_collect.vl` no longer does), and `check_nj_join.vl`, which defines it, calls it 3
+  times.
 
 ## 6. The risks
 
