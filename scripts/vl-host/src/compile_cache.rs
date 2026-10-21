@@ -14,7 +14,10 @@
 // Only the guest's emitted bytes are stored. A failed compile, a trap, and any run under a
 // bypass variable store nothing. Stage S2 adds one more action kind, `opt`: the host's `-O`
 // chain (its own steps and `wasm-opt`), keyed on the bytes it is given rather than on a
-// transcript, whose result is the final module and its source map.
+// transcript, whose result is the final module and its source map. Kind `check` is one
+// whole `vl check` invocation: its transcript is every module read and directory listing of
+// the run and its pool workers, as a set, and its result is the printed text and the exit
+// code. A check that wrote a file or read stdin stores nothing.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -47,7 +50,8 @@ const INERT: &[&str] = &[
 
 /// A variable that exists to OBSERVE a compile: a hit would skip the thing measured, and a
 /// store would key a result on an observation. `VL_REP_SHADOW` prints a report the guest
-/// computes during the compile, so it is one too.
+/// computes during the compile, so it is one too, as is `VL_CHECK_STATS` (read off the
+/// instances after a check). `VL_CHECK_KEEP_MODULES` writes files a hit would not write.
 fn is_bypass(k: &str) -> bool {
     matches!(
         k,
@@ -57,6 +61,8 @@ fn is_bypass(k: &str) -> bool {
             | "VL_COMPILE_GC_TRACE"
             | "VL_FAULT_INJECT"
             | "VL_REP_SHADOW"
+            | "VL_CHECK_STATS"
+            | "VL_CHECK_KEEP_MODULES"
     ) || k.starts_with("VL_PROFILE")
         || k.ends_with("_DUMP")
         || k.ends_with("_EXPLAIN")
@@ -112,14 +118,28 @@ thread_local! {
     static RECORDING: RefCell<Option<Reads>> = const { RefCell::new(None) };
 }
 
+/// The reads of a process-wide action (`Action::process_wide`), from every thread that has
+/// no recording of its own: a `vl check` run's pool workers read on threads of their own.
+static SHARED: std::sync::Mutex<Option<Reads>> = std::sync::Mutex::new(None);
+static SHARED_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Record one reply to a guest's module request: the key it asked for and the SHA-256 of
-/// what it was told, or `None` for absent. A no-op unless this thread is recording.
+/// what it was told, or `None` for absent. A no-op unless this thread, or the process, is
+/// recording.
 pub fn record_read(key: &str, data: Option<&str>) {
-    RECORDING.with(|r| {
-        if let Some(reads) = r.borrow_mut().as_mut() {
-            reads.push((key.to_string(), data.map(|d| sha256(d.as_bytes()))));
+    let row = || (key.to_string(), data.map(|d| sha256(d.as_bytes())));
+    let local = RECORDING.with(|r| match r.borrow_mut().as_mut() {
+        Some(reads) => {
+            reads.push(row());
+            true
         }
+        None => false,
     });
+    if !local && SHARED_ON.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(reads) = SHARED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+            reads.push(row());
+        }
+    }
 }
 
 /// One cacheable action, named by its manifest key.
@@ -128,6 +148,7 @@ pub struct Action {
     mkey: [u8; 32],
     verify: bool,
     tag: &'static str,
+    shared: bool,
 }
 
 /// The trace prefix of an action kind: the `-O` chain's lines read `-O hit`, `-O miss`, …,
@@ -261,7 +282,15 @@ impl Action {
         for p in parts()? {
             feed(&mut h, &p);
         }
-        Some(Action { dir, mkey: sha256(&h), verify, tag })
+        Some(Action { dir, mkey: sha256(&h), verify, tag, shared: false })
+    }
+
+    /// Record this action's reads from every thread, not only the one that serves it, and
+    /// keep its transcript as a sorted SET: the threads interleave in no fixed order, and a
+    /// replay compares every read whatever its position.
+    pub fn process_wide(mut self) -> Action {
+        self.shared = true;
+        self
     }
 
     fn trace(&self, what: &str) {
@@ -373,9 +402,21 @@ pub fn serve<T>(
         return Ok(cold);
     }
     action.trace("miss");
-    RECORDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
-    let result = compile();
-    let reads = RECORDING.with(|r| r.borrow_mut().take()).unwrap_or_default();
+    let result;
+    let reads = if action.shared {
+        *SHARED.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
+        SHARED_ON.store(true, std::sync::atomic::Ordering::Release);
+        result = compile();
+        SHARED_ON.store(false, std::sync::atomic::Ordering::Release);
+        let mut reads = SHARED.lock().unwrap_or_else(|p| p.into_inner()).take().unwrap_or_default();
+        reads.sort();
+        reads.dedup();
+        reads
+    } else {
+        RECORDING.with(|r| *r.borrow_mut() = Some(Vec::new()));
+        result = compile();
+        RECORDING.with(|r| r.borrow_mut().take()).unwrap_or_default()
+    };
     if let Ok(t) = &result {
         if let Some(bytes) = emitted(t) {
             action.store(reads, &bytes);

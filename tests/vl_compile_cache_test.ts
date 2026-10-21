@@ -375,6 +375,145 @@ test("verify mode exits 71 when a stored result differs from a cold compile", as
   }
 });
 
+// ── `vl check`: one action per invocation ──────────────────────────────────
+
+/** What a check run shows a user: its exit code, stdout, and stderr without the trace. */
+const shown = (r: Ran) => [r.code, r.out, r.err.split("\n").filter((l) => !l.startsWith(PREFIX)).join("\n")];
+const BAD = "let n: i32 = \"s\"\nprint(n)\n";
+
+test("vl check: a hit replays the cold run's output and exit code, and verify mode agrees", async () => {
+  const { tmp, p } = await setup();
+  try {
+    await Deno.writeTextFile(`${p}/bad.vl`, BAD);
+    for (const args of [["check", "."], ["check", "main.vl"], ["check", "bad.vl", "--json"]]) {
+      const off = await vl(args, p, { VL_COMPILE_CACHE: "0" });
+      const cold = await vl(args, p);
+      expect([cold.trace, shown(cold)], [["miss", "stored"], shown(off)], `cold ${args.join(" ")}`);
+      const hit = await vl(args, p);
+      expect([hit.trace, shown(hit)], [["hit"], shown(off)], `warm ${args.join(" ")}`);
+      const ver = await vl(args, p, { VL_COMPILE_CACHE_VERIFY: "1" });
+      expect([ver.trace, shown(ver)], [["hit", "verified"], shown(off)], `verify ${args.join(" ")}`);
+    }
+    // The failing check's code survives the hit.
+    expect((await vl(["check", "."], p)).code, 1, "a failing check exits 1 on a hit");
+    // Another flag or the colour is another key.
+    expect((await vl(["check", ".", "--severity", "error"], p)).trace, ["miss", "stored"], "a flag");
+    expect((await vl(["check", ".", "--color=always"], p)).trace, ["miss", "stored"], "the colour");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("vl check: an edited import misses, from a file or a directory check", async () => {
+  // A directory check hands its roots to pool workers on other threads (`VL_JOBS=2` keeps
+  // the pool on), and an import from outside the directory is read by those workers alone.
+  const { tmp, p } = await setup();
+  try {
+    const sub = `${p}/sub`;
+    await Deno.mkdir(sub);
+    for (const n of ["x", "y", "z"]) {
+      await Deno.writeTextFile(`${sub}/${n}.vl`, 'import { twice } from "../lib"\nprint(twice(1))\n');
+    }
+    const env = { VL_JOBS: "2" };
+    for (const args of [["check", "main.vl"], ["check", "."], ["check", "sub"]]) {
+      await Deno.writeTextFile(`${p}/lib.vl`, LIB);
+      await vl(args, p, env);
+      expect((await vl(args, p, env)).trace, ["hit"], `warm ${args.join(" ")}`);
+      await Deno.writeTextFile(`${p}/lib.vl`, 'export function twice(x: string): i32 { return 2 }\n');
+      const off = await vl(args, p, { ...env, VL_COMPILE_CACHE: "0" });
+      const edit = await vl(args, p, env);
+      expect([edit.trace, shown(edit)], [["miss", "stored"], shown(off)], `lib.vl edited: ${args.join(" ")}`);
+      expect(edit.code, 1, `the edit is an error: ${args.join(" ")}`);
+    }
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("vl check: a file added to a checked directory misses; one added elsewhere hits", async () => {
+  const { tmp, p } = await setup();
+  try {
+    await vl(["check", "."], p);
+    expect((await vl(["check", "."], p)).trace, ["hit"], "warm");
+    await Deno.writeTextFile(`${tmp}/elsewhere.vl`, BAD);
+    expect((await vl(["check", "."], p)).trace, ["hit"], "a file outside the checked directory");
+    await Deno.mkdir(`${p}/sub`);
+    await Deno.writeTextFile(`${p}/sub/c.vl`, BAD);
+    const off = await vl(["check", "."], p, { VL_COMPILE_CACHE: "0" });
+    const added = await vl(["check", "."], p);
+    expect([added.trace, shown(added)], [["miss", "stored"], shown(off)], "sub/c.vl added");
+    expect(added.code, 1, "the added file is reported");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("vl check: an edited std module the program imports misses", async () => {
+  // `std:` is read through the same recorded reader, from `$VL_STD` here.
+  const { tmp, p } = await setup();
+  try {
+    const std = `${tmp}/std`;
+    await Deno.mkdir(std);
+    for (const e of Deno.readDirSync(`${ROOT}/std`)) {
+      if (e.isFile && e.name.endsWith(".vl")) await Deno.copyFile(`${ROOT}/std/${e.name}`, `${std}/${e.name}`);
+    }
+    const env = { VL_STD: std };
+    const args = ["check", "a.test.vl"];
+    await vl(args, p, env);
+    expect((await vl(args, p, env)).trace, ["hit"], "warm");
+    const src = await Deno.readTextFile(`${std}/test.vl`);
+    await Deno.writeTextFile(`${std}/test.vl`, `${src}\nexport function zzzUnused(): i32 { return 1 }\n`);
+    expect((await vl(args, p, env)).trace, ["miss", "stored"], "std/test.vl edited");
+    // A std module the program does not import is not in its transcript.
+    await Deno.writeTextFile(`${std}/json.vl`, (await Deno.readTextFile(`${std}/json.vl`)) + "\n// edited\n");
+    expect((await vl(args, p, env)).trace, ["hit"], "std/json.vl edited");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("vl check --fix: a run that writes stores nothing, and a hit never stands in for a write", async () => {
+  const { tmp, p } = await setup();
+  try {
+    const before = "let keep = 2\nprint(keep)\n", after = "const keep = 2\nprint(keep)\n";
+    await Deno.writeTextFile(`${p}/f.vl`, before);
+    const args = ["check", "f.vl", "--fix"];
+    const n = files(tmp).length;
+    const wrote = await vl(args, p);
+    expect([wrote.trace, files(tmp).length, await Deno.readTextFile(`${p}/f.vl`)], [["miss"], n, after], "writes");
+    expect((await vl(args, p)).trace, ["miss", "stored"], "a fixed file: nothing to write");
+    expect((await vl(args, p)).trace, ["hit"], "and then a hit");
+    await Deno.writeTextFile(`${p}/f.vl`, before);
+    const again = await vl(args, p);
+    expect([again.trace, await Deno.readTextFile(`${p}/f.vl`)], [["miss"], after], "the old source again");
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
+test("vl check: bypass variables neither hit nor store; a forged result exits 71 under verify", async () => {
+  const { tmp, p } = await setup();
+  try {
+    await vl(["check", "."], p);
+    const n = files(tmp).length;
+    for (const v of ["VL_CHECK_STATS", "VL_FUEL"]) {
+      const r = await vl(["check", "."], p, { [v]: "1" });
+      expect([r.trace, files(tmp).length], [[`off (bypass ${v})`], n], v);
+    }
+    expect((await vl(["check", "."], p, { VL_COMPILE_CACHE_MAX_MB: "64" })).trace, ["hit"], "inert variable");
+    const dir = `${tmp}/cache/compile`;
+    const r = files(tmp).find((f) => f.endsWith(".r"))!;
+    const forged = (await Deno.readFile(`${dir}/${r}`)).slice(40);
+    forged[0] ^= 1;
+    await Deno.writeFile(`${dir}/${r}`, new Uint8Array([...enc("VLCR0001"), ...await sha(forged), ...forged]));
+    const v = await vl(["check", "."], p, { VL_COMPILE_CACHE_VERIFY: "1" });
+    expect([v.code, v.trace[0]], [71, "hit"], "verify mismatch");
+    if (!v.err.includes("compile cache MISMATCH")) throw new Error(`no mismatch message:\n${v.err}`);
+  } finally {
+    await Deno.remove(tmp, { recursive: true });
+  }
+});
+
 // ── stage S2: the `-O` chain ───────────────────────────────────────────────
 
 const OPT = ["build", "main.vl", "-O3", "-o", "o.wasm"];
@@ -540,23 +679,24 @@ testOpt("-O3: an explain variable bypasses the chain, stores nothing", async () 
 
 // ── the guard: every host→guest channel is classified ──────────────────────
 //
-// `input` is a staging call or a command reply the cache keys (by the staged values or the
-// transcript); `output` is read back and never keyed; `uncached` is used only on a path no
-// cached action runs (the pump's own instance, diagnostics, test collect/run, the
-// rep-shadow report, which is a bypass). A new export or command joins this table only by
-// someone deciding which it is.
+// `input` is a staging call or a command reply the cache keys (by the staged values, the
+// transcript, or the host build for the engine's own verdicts); `output` is read back and
+// never keyed; `uncached` is used only on a path no cached action runs or stores (the
+// `vl test`/`vl fmt` pump, test collect/run, a write or a stdin read, which a `check` run
+// never stores, and the rep-shadow, check-stats and keep-modules paths, which are bypasses).
+// A new export or command joins this table only by someone deciding which it is.
 const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
   checkEntryPathCommit: "input", checkEntryPathPush: "input", cliArgCommit: "input",
-  cliArgPush: "input", cliArgReset: "input", cliCheckNextRoot: "uncached",
-  cliCheckParentOf: "uncached", cliCheckPoolStage: "uncached", cliCheckPooledCommit: "uncached",
-  cliCheckPresetRoot: "uncached", cliCmdData: "output", cliCmdPath: "output",
-  cliDirCommit: "input", cliDirEntryPush: "uncached", cliDirNamePush: "uncached",
+  cliArgPush: "input", cliArgReset: "input", cliCheckNextRoot: "input",
+  cliCheckParentOf: "input", cliCheckPoolStage: "input", cliCheckPooledCommit: "input",
+  cliCheckPresetRoot: "input", cliCmdData: "output", cliCmdPath: "output",
+  cliDirCommit: "input", cliDirEntryPush: "input", cliDirNamePush: "input",
   cliExitCode: "output", cliFileCommit: "input", cliNext: "output", cliResult: "input",
   cliTestCompiledCommit: "uncached", cliTestFileCommit: "uncached",
   cliTestJobsWanted: "uncached", cliTestNameCommit: "uncached", cliTestNamePush: "uncached",
   cliTestOutPush: "uncached", cliTestPlanCount: "uncached", cliTestPlanFile: "uncached",
   cliTestPlanTest: "uncached", cliTestPoolStage: "input", cliTestResultCommit: "uncached",
-  cliValidateCommit: "uncached", cliValidateNamesFile: "uncached", cwdCommit: "input",
+  cliValidateCommit: "input", cliValidateNamesFile: "uncached", cwdCommit: "input",
   cwdPush: "input", diagAt: "output",
   diagCol: "output", diagCount: "output", diagLen: "output", diagLine: "output",
   diagModule: "output", diagMsgAt: "output", diagMsgLen: "output", emitFnSpanAt: "output",
@@ -588,14 +728,16 @@ const EXPORTS: Record<string, "input" | "output" | "uncached"> = {
 };
 
 // A pooled worker answers DONE, LIST_DIR (a constant 0), READ_FILE (recorded), the two
-// prints and STASH (outputs), and refuses every other code; `vl build` issues none.
+// prints and STASH (outputs), and refuses every other code; `vl build` issues none. A
+// `vl check` action serves LIST_DIR and READ_FILE through the recorded reader, keys
+// VALIDATE on the host build, and stores no run that issued WRITE_FILE or READ_STDIN.
 const COMMANDS: Record<string, "input" | "output" | "uncached"> = {
   CMD_DONE: "output", CMD_LIST_DIR: "input", CMD_READ_FILE: "input",
   CMD_WRITE_FILE: "uncached", CMD_PRINT_OUT: "output", CMD_PRINT_ERR: "output",
   CMD_READ_STDIN: "uncached", CMD_TEST_STASH: "output", CMD_TEST_COLLECT: "uncached",
-  CMD_TEST_RUN: "uncached", CMD_VALIDATE: "uncached", CMD_TEST_ENQUEUE: "uncached",
-  CMD_TEST_COMPILE: "uncached", CMD_CHECK_ENQUEUE: "uncached", CMD_CHECK_POOL: "uncached",
-  CMD_CHECK_ROOT_DONE: "uncached",
+  CMD_TEST_RUN: "uncached", CMD_VALIDATE: "input", CMD_TEST_ENQUEUE: "uncached",
+  CMD_TEST_COMPILE: "uncached", CMD_CHECK_ENQUEUE: "input", CMD_CHECK_POOL: "input",
+  CMD_CHECK_ROOT_DONE: "output",
 };
 
 Deno.test("compile cache: the seed is keyed on the bytes that compile, read once", async () => {
