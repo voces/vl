@@ -439,6 +439,39 @@ Left:
   (`emit_collect.vl` no longer does), and `check_nj_join.vl`, which defines it, calls it 3
   times.
 
+Then the sixth slice (L6 log, 2026-10-21). Two of the three tally-only keys switch to the
+softened key:
+
+- The typed adopt (`unNameAdoptTyKeyRow`) aliases its row under the type's softened key, and
+  compares rows by it. Its 25 differs build byte-identical.
+- `unKeyPush` (`unKeyPushOfTy`) files a row under its type's softened key where the row records
+  `null` last and the key has as many members as the row. A row with `null` before a member keeps
+  its spelling's key, because the type cannot say where `null` was spelled: the same flat type
+  arrives under both orders in one file. Without that guard, 4 modules change, all with `null`
+  mid-set: `Rec2[]|null|Rec[]` keyed as `Rec2[]|null`, `string|null|Rec`, and std:json's
+  `…|null|JsonError`. A key with fewer members than the row also keeps the spelling's key,
+  because a softened key dedupes and a box's tags index the row's members by position. That
+  guard changes no module; it stops `string|string|i32` or `Rec2[]|Rec[]|null` sharing a key with
+  a two-member row.
+
+Site 55 stays tally-only. Its type is not the name's type: the name softens literals and keeps
+aliases, and keeps `null` where the declaration put it. Rebuilding the name's type from the
+type (literals softened, members deduped) disagrees 125 times in 78 files, mostly where the name
+keeps a literal-union alias. A bisect over the type's uses in `registerValueUnionNameTy` found
+that every use changes modules, not only the key.
+
+`unNameShareCanonRow` holds a type, but aliasing its row under that type's softened key
+changes 2 modules (`unions/inferred-list-union-return-into-field.vl`,
+`unions/union-field-literal-row-positions.vl`), so it keeps the name's key.
+
+Left:
+
+- Site 55, `unNameShareCanonRow`, and `unKeyPush`'s two fallbacks.
+- `unRowOfSetText`, `isUName`, the adopt with no type and `isUNameKeyAB`'s no-type fallback.
+  Their callers hold no type.
+- The deletion of `canonUnionKeyOfName`. Three emit files call it 9 times, and
+  `check_nj_join.vl` calls it 3 times.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a
