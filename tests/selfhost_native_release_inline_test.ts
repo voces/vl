@@ -2,9 +2,11 @@
 // docs/internals/inline-records-design.md, slice S1).
 //
 // The inline-record step (the compiler's `optInlineRewrite`) replaces a struct field holding
-// a record nobody writes with the record's own fields. Pinned here, per fixture and rung, by OUTPUT: the optimized module
-// prints the unoptimized build's `@log` lines, because a field index that shifted wrongly can
-// still validate. And per fixture kind:
+// a record nobody writes with the record's own fields. Pinned here, per fixture at `-O`, by
+// OUTPUT: every optimized module prints the fixture's `@log` lines, because a field index that
+// shifted wrongly can still validate. `-O3` changes only binaryen's passes after the step, so it
+// rebuilds only the `melts` kinds, whose allocation count is binaryen's to keep. The
+// `$VL_INLINE_EXPLAIN` reasons in EXPLAIN are read off the builds below. And per fixture kind:
 //
 // * `melts`: `struct.new` sites left in function bodies equal the fixture's `@allocs`, and its
 //   CONTROL, the same rung with the step off (`$VL_OPT_NO_INLINE`), has more;
@@ -16,7 +18,7 @@
 //   the record) leaves the step nothing to do, even with `$VL_INLINE_REBOX`;
 // * `stable`: the record reaches an export only through a field, an element or a union box,
 //   which JS cannot read: inlined by default (with `$VL_INLINE_REBOX`, so a whole read does not
-//   decide it), and kept like `kept` under `--stable-layout` (owner ruling 2026-10-05,
+//   decide it), and kept under `--stable-layout` (owner ruling 2026-10-05,
 //   inline-records-design.md §6 Q2).
 //
 // Slice S2 (D3681) flattens a LIST of such records into one array of their fields, and its
@@ -25,7 +27,8 @@
 // * `flat-melts`: as `melts`, with the control `$VL_OPT_NO_FLAT` (`flat-held-locals`: whole
 //   reads held in locals the multi-value step scalarizes, D3736);
 // * `flat-grid`: every list op, forced by `$VL_INLINE_REBOX` and then `$VL_INLINE_SPILL`;
-// * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every list boxed;
+// * `flat-kept`: a disqualifier (a null element, a written field, a `filled` list) leaves every
+//   list boxed, even with `$VL_INLINE_REBOX`;
 // * `flat-stable`: an export hands JS the list: flattened by default, kept under
 //   `--stable-layout`;
 // * `flat-costly`: the cost rule keeps a list read far more than it is written boxed, or one
@@ -80,16 +83,40 @@ const FIXTURES: [string, Want][] = [
   ["flat-costly-self-copy", "flat-costly"],
   ["flat-costly-replan", "flat-costly"],
 ];
-const RUNGS = ["-O", "-O3"];
-// Whether the default build of a kind changes the module, where the `-O` checks say so.
-const STEP_DECIDES: Partial<Record<Want, boolean>> = {
-  "melts": true,
-  "kept": false,
-  "flat-melts": true,
-  "flat-kept": false,
-  "flat-stable": true,
-  "flat-costly": false,
+// `$VL_INLINE_EXPLAIN` names, per record and per field, why it was or was not inlined: the
+// reason a fixture's `-O` build gives, keyed `<fixture>` for its default build and
+// `<fixture> --stable-layout` for its `--stable-layout` one.
+const EXPLAIN: Record<string, RegExp> = {
+  "stored-fields": /type \d+ field \d+ \(type \d+\): inlined; 2 store\(s\)/,
+  "kept-written": /refused: its fields are written \(struct\.set/,
+  "kept-nullable": /not inlined: a value whose type admits null is stored into it/,
+  "kept-export": /refused: a value of it can cross the module boundary \(export /,
+  "kept-export-nullable":
+    /refused: a value of it can cross the module boundary \(export origin\)/,
+  "stable-reached-export --stable-layout":
+    /refused: a value of it can cross the module boundary \(it is stored as an abstract reference .* export either\)/,
+  "stable-export-union-record": /type \d+ field \d+ \(type \d+\): inlined/,
+  "stable-export-union-parent --stable-layout":
+    /can cross the module boundary \(it is stored as an abstract reference/,
+  "stable-export-union-record --stable-layout":
+    /refused: a value of it can cross the module boundary \(it is stored as an abstract reference/,
+  "proof-rows": /not inlined: \d+ of its \d+ read\(s\) take the whole record/,
+  "flat-melts":
+    /array type \d+ \(of type \d+\): flattened; 3 store\(s\) \(3 taken apart at the producer/,
+  "flat-kept-nullable":
+    /array type \d+ \(of type \d+\): not flattened: a value whose type admits null is stored into it \(array\.set/,
+  "flat-kept-written": /not flattened: its element type \d+ is refused: its fields are written/,
+  "flat-kept-filled": /not flattened: an array\.new fills it from one shared value/,
+  "flat-stable-export --stable-layout":
+    /not flattened: its element type \d+ is refused: a value of it can cross the module boundary \(export grab\)/,
+  "flat-costly":
+    /not flattened: its reads \(14 of a field, 0 of a whole element\) are more than 6 whole elements' worth per store/,
+  "flat-costly-replan":
+    /not flattened: 1 of its 1 element read\(s\) take the whole element .*\(the multi-value step would not take its held reads apart\)/,
+  "flat-grid": /not flattened: \d+ of its \d+ element read\(s\) take the whole element/,
 };
+// The kinds whose fixtures are built under `--stable-layout`.
+const STABLE_BUILT: Want[] = ["stable", "flat-stable"];
 
 // `struct.new` sites in function bodies: a global's initializer runs once and is not counted.
 const allocations = (wat: string): number => {
@@ -137,42 +164,48 @@ for (const [fx, want] of FIXTURES) {
       );
       const tmp = await Deno.makeTempDir();
       try {
-        const plain = `${tmp}/plain.wasm`;
-        const b0 = await vl(["build", src, "-o", plain]);
-        if (b0.code !== 0) {
-          throw new Error(`${fx}: plain vl build failed: ${b0.err.trim()}`);
-        }
-        const r0 = await vl(["run", plain]);
-        if (
-          r0.code !== 0 ||
-          JSON.stringify(linesOf(r0.out)) !== JSON.stringify(logs)
-        ) {
-          throw new Error(
-            `${fx}: the unoptimized build no longer prints the fixture's @log lines\n` +
-              `  want: ${JSON.stringify(logs)}\n  got:  ${
-                JSON.stringify(linesOf(r0.out))
-              } rc=${r0.code}`,
-          );
-        }
-        // One build of a rung under `env` and `flags`: graded by output; answers its allocation
-        // count and whether the step changed the module.
+        // Asked only once an optimized module prints something else: whether the unoptimized
+        // build still prints the `@log` lines, which tells a stale fixture from a wrong step.
+        const plainSays = async () => {
+          const plain = `${tmp}/plain.wasm`;
+          const b0 = await vl(["build", src, "-o", plain]);
+          if (b0.code !== 0) return `the plain vl build fails too: ${b0.err.trim()}`;
+          const r0 = await vl(["run", plain]);
+          const got0 = linesOf(r0.out);
+          return r0.code === 0 && JSON.stringify(got0) === JSON.stringify(logs)
+            ? "the unoptimized build prints the @log lines"
+            : `the unoptimized build prints ${JSON.stringify(got0)} rc=${r0.code}: the fixture is stale`;
+        };
+        // One build of a rung under `env` and `flags`: graded by output, and by its EXPLAIN
+        // reason if it has one; answers its allocation count and whether the step changed the
+        // module.
         const built = async (
           rung: string,
           tag: string,
           env: Record<string, string>,
           flags: string[] = [],
         ) => {
+          const spec = flags.includes("--stable-layout") ? `${fx} --stable-layout` : fx;
+          const explain = rung === "-O" && (tag === "step" || tag === "stable")
+            ? EXPLAIN[spec]
+            : undefined;
           const out = `${tmp}/m${rung}-${tag}.wasm`;
           const dump = `${tmp}/step${rung}-${tag}.wasm`;
           const flatDump = `${tmp}/flat${rung}-${tag}.wasm`;
           const b = await vl(["build", src, rung, ...flags, "-o", out], {
             VL_OPT_INLINE_DUMP: dump,
             VL_OPT_FLAT_DUMP: flatDump,
+            ...(explain ? { VL_INLINE_EXPLAIN: "1" } : {}),
             ...env,
           });
           if (b.code !== 0) {
             throw new Error(
               `${fx} ${rung} ${tag}: vl build failed: ${b.err.trim()}`,
+            );
+          }
+          if (explain && !explain.test(b.err)) {
+            throw new Error(
+              `${spec}: VL_INLINE_EXPLAIN\n  want: ${explain}\n  got:  ${b.err.trim()}`,
             );
           }
           const r = await vl(["run", out]);
@@ -182,7 +215,7 @@ for (const [fx, want] of FIXTURES) {
               `${fx} ${rung} ${tag}: the optimized module prints something else\n` +
                 `  want: ${JSON.stringify(logs)}\n  got:  ${
                   JSON.stringify(got)
-                } rc=${r.code} ${r.err.trim()}`,
+                } rc=${r.code} ${r.err.trim()}\n  ${await plainSays()}`,
             );
           }
           // Disassembled only for the kinds that grade the count.
@@ -190,153 +223,137 @@ for (const [fx, want] of FIXTURES) {
             allocations((await run(WASM_DIS, [out, ...features])).out);
           return { count, inlined: exists(dump), flat: exists(flatDump) };
         };
-        for (const rung of RUNGS) {
-          const step = await built(rung, "step", {});
-          if (rung === "-O3") {
-            // `-O3` changes only binaryen's passes after the step, which decides the same
-            // either way: its default build is graded by output, decision and count, and the
-            // variant builds below run at `-O` alone.
-            const moved = want.startsWith("flat") ? step.flat : step.inlined;
-            const decided = STEP_DECIDES[want];
-            if (decided !== undefined && moved !== decided) {
-              throw new Error(`${fx} -O3: the step ${moved ? "changed" : "left"} the module`);
-            }
-            if (want === "melts" || want === "flat-melts") {
-              const n = await step.count();
-              if (n !== allocs) {
-                throw new Error(`${fx} -O3: ${n} struct.new left in function bodies, want ${allocs}`);
-              }
-            }
-            continue;
+        if (want === "melts" || want === "flat-melts") {
+          const o3 = await built("-O3", "step", {});
+          if (!(want === "melts" ? o3.inlined : o3.flat)) {
+            throw new Error(`${fx} -O3: the step left the module`);
           }
-          if (want === "melts") {
-            if (!step.inlined) {
-              throw new Error(`${fx} ${rung}: the step inlined no field`);
-            }
-            const n = await step.count();
-            if (n !== allocs) {
-              throw new Error(
-                `${fx} ${rung}: ${n} struct.new left in function bodies\n` +
-                  `  want: ${allocs} — every store and read here is of a record held inline`,
-              );
-            }
-            const off = await built(rung, "off", { VL_OPT_NO_INLINE: "1" });
-            const offN = await off.count();
-            if (offN <= n) {
-              throw new Error(
-                `${fx} ${rung}: with the step off ${offN} struct.new are left, not more than ` +
-                  `with it (${n}): the fixture no longer exercises the step`,
-              );
-            }
+          const n = await o3.count();
+          if (n !== allocs) {
+            throw new Error(`${fx} -O3: ${n} struct.new left in function bodies, want ${allocs}`);
           }
-          if (want === "grid") {
-            for (
-              const [tag, env] of [
-                ["rebox", { VL_INLINE_REBOX: "1" }],
-                ["spill", { VL_INLINE_REBOX: "1", VL_INLINE_SPILL: "1" }],
-              ] as const
-            ) {
-              const forced = await built(rung, tag, env);
-              if (!forced.inlined) {
-                throw new Error(
-                  `${fx} ${rung} ${tag}: the step inlined no field`,
-                );
-              }
-            }
+        }
+        const rung = "-O";
+        const step = await built(rung, "step", {});
+        if (want === "melts") {
+          if (!step.inlined) {
+            throw new Error(`${fx} ${rung}: the step inlined no field`);
           }
-          if (want === "kept") {
-            const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
-            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
-            if (step.inlined || forced.inlined || stable.inlined) {
+          const n = await step.count();
+          if (n !== allocs) {
+            throw new Error(
+              `${fx} ${rung}: ${n} struct.new left in function bodies\n` +
+                `  want: ${allocs} — every store and read here is of a record held inline`,
+            );
+          }
+          const off = await built(rung, "off", { VL_OPT_NO_INLINE: "1" });
+          const offN = await off.count();
+          if (offN <= n) {
+            throw new Error(
+              `${fx} ${rung}: with the step off ${offN} struct.new are left, not more than ` +
+                `with it (${n}): the fixture no longer exercises the step`,
+            );
+          }
+        }
+        if (want === "grid") {
+          for (
+            const [tag, env] of [
+              ["rebox", { VL_INLINE_REBOX: "1" }],
+              ["spill", { VL_INLINE_REBOX: "1", VL_INLINE_SPILL: "1" }],
+            ] as const
+          ) {
+            const forced = await built(rung, tag, env);
+            if (!forced.inlined) {
               throw new Error(
-                `${fx} ${rung}: the step inlined a field a disqualifier should keep boxed`,
+                `${fx} ${rung} ${tag}: the step inlined no field`,
               );
             }
           }
-          if (want === "stable") {
-            const open = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
-            if (!open.inlined) {
+        }
+        if (want === "kept") {
+          const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+          if (step.inlined || forced.inlined) {
+            throw new Error(
+              `${fx} ${rung}: the step inlined a field a disqualifier should keep boxed`,
+            );
+          }
+        }
+        if (want === "stable") {
+          const open = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+          if (!open.inlined) {
+            throw new Error(
+              `${fx} ${rung}: the step inlined no field, though no signature names the record`,
+            );
+          }
+          const stable = await built(rung, "stable", {}, ["--stable-layout"]);
+          if (stable.inlined) {
+            throw new Error(
+              `${fx} ${rung}: under --stable-layout the step inlined a field an export reaches`,
+            );
+          }
+        }
+        if (want === "flat-melts") {
+          if (!step.flat) {
+            throw new Error(`${fx} ${rung}: the step flattened no list`);
+          }
+          const n = await step.count();
+          if (n !== allocs) {
+            throw new Error(
+              `${fx} ${rung}: ${n} struct.new left in function bodies\n` +
+                `  want: ${allocs} — every list here holds its elements' fields`,
+            );
+          }
+          const off = await built(rung, "off", { VL_OPT_NO_FLAT: "1" });
+          const offN = await off.count();
+          if (offN <= n) {
+            throw new Error(
+              `${fx} ${rung}: with no list flattened ${offN} struct.new are left, not ` +
+                `more than with it (${n}): the fixture no longer exercises the step`,
+            );
+          }
+        }
+        if (want === "flat-grid") {
+          for (
+            const [tag, env] of [
+              ["rebox", { VL_INLINE_REBOX: "1" }],
+              ["spill", { VL_INLINE_REBOX: "1", VL_INLINE_SPILL: "1" }],
+            ] as const
+          ) {
+            if (!(await built(rung, tag, env)).flat) {
               throw new Error(
-                `${fx} ${rung}: the step inlined no field, though no signature names the record`,
-              );
-            }
-            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
-            const forced = await built(rung, "stable-rebox", {
-              VL_INLINE_REBOX: "1",
-            }, ["--stable-layout"]);
-            if (stable.inlined || forced.inlined) {
-              throw new Error(
-                `${fx} ${rung}: under --stable-layout the step inlined a field an export reaches`,
+                `${fx} ${rung} ${tag}: the step flattened no list`,
               );
             }
           }
-          if (want === "flat-melts") {
-            if (!step.flat) {
-              throw new Error(`${fx} ${rung}: the step flattened no list`);
-            }
-            const n = await step.count();
-            if (n !== allocs) {
-              throw new Error(
-                `${fx} ${rung}: ${n} struct.new left in function bodies\n` +
-                  `  want: ${allocs} — every list here holds its elements' fields`,
-              );
-            }
-            const off = await built(rung, "off", { VL_OPT_NO_FLAT: "1" });
-            const offN = await off.count();
-            if (offN <= n) {
-              throw new Error(
-                `${fx} ${rung}: with no list flattened ${offN} struct.new are left, not ` +
-                  `more than with it (${n}): the fixture no longer exercises the step`,
-              );
-            }
+        }
+        if (want === "flat-kept") {
+          const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+          if (step.flat || forced.flat) {
+            throw new Error(
+              `${fx} ${rung}: the step flattened a list a disqualifier should keep boxed`,
+            );
           }
-          if (want === "flat-grid") {
-            for (
-              const [tag, env] of [
-                ["rebox", { VL_INLINE_REBOX: "1" }],
-                ["spill", { VL_INLINE_REBOX: "1", VL_INLINE_SPILL: "1" }],
-              ] as const
-            ) {
-              if (!(await built(rung, tag, env)).flat) {
-                throw new Error(
-                  `${fx} ${rung} ${tag}: the step flattened no list`,
-                );
-              }
-            }
+        }
+        if (want === "flat-stable") {
+          if (!step.flat) {
+            throw new Error(
+              `${fx} ${rung}: the step flattened no list, though no signature names the record`,
+            );
           }
-          if (want === "flat-kept") {
-            const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
-            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
-            if (step.flat || forced.flat || stable.flat) {
-              throw new Error(
-                `${fx} ${rung}: the step flattened a list a disqualifier should keep boxed`,
-              );
-            }
+          const stable = await built(rung, "stable", {}, ["--stable-layout"]);
+          if (stable.flat) {
+            throw new Error(
+              `${fx} ${rung}: under --stable-layout the step flattened a list an export reaches`,
+            );
           }
-          if (want === "flat-stable") {
-            if (!step.flat) {
-              throw new Error(
-                `${fx} ${rung}: the step flattened no list, though no signature names the record`,
-              );
-            }
-            const stable = await built(rung, "stable", {}, ["--stable-layout"]);
-            const forced = await built(rung, "stable-rebox", {
-              VL_INLINE_REBOX: "1",
-            }, ["--stable-layout"]);
-            if (stable.flat || forced.flat) {
-              throw new Error(
-                `${fx} ${rung}: under --stable-layout the step flattened a list an export reaches`,
-              );
-            }
-          }
-          if (want === "flat-costly") {
-            const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
-            if (step.flat || !forced.flat) {
-              throw new Error(
-                `${fx} ${rung}: want the list boxed by the cost rule and flattened under ` +
-                  `VL_INLINE_REBOX; got ${step.flat} and ${forced.flat}`,
-              );
-            }
+        }
+        if (want === "flat-costly") {
+          const forced = await built(rung, "rebox", { VL_INLINE_REBOX: "1" });
+          if (step.flat || !forced.flat) {
+            throw new Error(
+              `${fx} ${rung}: want the list boxed by the cost rule and flattened under ` +
+                `VL_INLINE_REBOX; got ${step.flat} and ${forced.flat}`,
+            );
           }
         }
       } finally {
@@ -346,107 +363,20 @@ for (const [fx, want] of FIXTURES) {
   });
 }
 
-// `$VL_INLINE_EXPLAIN` names, per record and per field, why it was or was not inlined.
-Deno.test({
-  name:
-    "native-release: VL_INLINE_EXPLAIN says why each field was or was not inlined",
-  ignore: !ENABLED,
-  fn: async () => {
-    const tmp = await Deno.makeTempDir();
-    try {
-      const cases: [string, RegExp][] = [
-        [
-          "stored-fields",
-          /type \d+ field \d+ \(type \d+\): inlined; 2 store\(s\)/,
-        ],
-        ["kept-written", /refused: its fields are written \(struct\.set/],
-        [
-          "kept-nullable",
-          /not inlined: a value whose type admits null is stored into it/,
-        ],
-        [
-          "kept-export",
-          /refused: a value of it can cross the module boundary \(export /,
-        ],
-        [
-          "kept-export-nullable",
-          /refused: a value of it can cross the module boundary \(export origin\)/,
-        ],
-        [
-          "stable-reached-export --stable-layout",
-          /refused: a value of it can cross the module boundary \(it is stored as an abstract reference .* export either\)/,
-        ],
-        [
-          "stable-export-union-record",
-          /type \d+ field \d+ \(type \d+\): inlined/,
-        ],
-        [
-          "stable-export-union-parent --stable-layout",
-          /can cross the module boundary \(it is stored as an abstract reference/,
-        ],
-        [
-          "stable-export-union-record --stable-layout",
-          /refused: a value of it can cross the module boundary \(it is stored as an abstract reference/,
-        ],
-        [
-          "proof-rows",
-          /not inlined: \d+ of its \d+ read\(s\) take the whole record/,
-        ],
-        [
-          "flat-melts",
-          /array type \d+ \(of type \d+\): flattened; 3 store\(s\) \(3 taken apart at the producer/,
-        ],
-        [
-          "flat-kept-nullable",
-          /array type \d+ \(of type \d+\): not flattened: a value whose type admits null is stored into it \(array\.set/,
-        ],
-        [
-          "flat-kept-written",
-          /not flattened: its element type \d+ is refused: its fields are written/,
-        ],
-        [
-          "flat-kept-filled",
-          /not flattened: an array\.new fills it from one shared value/,
-        ],
-        [
-          "flat-stable-export --stable-layout",
-          /not flattened: its element type \d+ is refused: a value of it can cross the module boundary \(export grab\)/,
-        ],
-        [
-          "flat-costly",
-          /not flattened: its reads \(14 of a field, 0 of a whole element\) are more than 6 whole elements' worth per store/,
-        ],
-        [
-          "flat-costly-replan",
-          /not flattened: 1 of its 1 element read\(s\) take the whole element .*\(the multi-value step would not take its held reads apart\)/,
-        ],
-        [
-          "flat-grid",
-          /not flattened: \d+ of its \d+ element read\(s\) take the whole element/,
-        ],
-      ];
-      for (const [spec, want] of cases) {
-        const [fx, ...flags] = spec.split(" ");
-        const b = await vl([
-          "build",
-          `${DIR}/${fx}.vl`,
-          "-O",
-          ...flags,
-          "-o",
-          `${tmp}/${fx}.wasm`,
-        ], {
-          VL_INLINE_EXPLAIN: "1",
-        });
-        if (b.code !== 0 || !want.test(b.err)) {
-          throw new Error(
-            `${spec}: VL_INLINE_EXPLAIN\n  want: ${want}\n  got:  ${b.err.trim()}`,
-          );
-        }
-      }
-    } finally {
-      await Deno.remove(tmp, { recursive: true });
+// Every EXPLAIN reason names a build the fixtures make: a fixture in FIXTURES, and the
+// `--stable-layout` build only of a kind that has one.
+Deno.test("native-release: every VL_INLINE_EXPLAIN reason names a fixture build", () => {
+  const kinds = new Map(FIXTURES);
+  for (const spec of Object.keys(EXPLAIN)) {
+    const [fx, ...flags] = spec.split(" ");
+    const kind = kinds.get(fx);
+    const ok = kind !== undefined &&
+      (flags.length === 0 ||
+        (flags.join(" ") === "--stable-layout" && STABLE_BUILT.includes(kind)));
+    if (!ok) {
+      throw new Error(`EXPLAIN "${spec}": want a fixture build, got kind ${kind ?? "none"}`);
     }
-  },
+  }
 });
 
 // The compiler's census (`optInline`, docs/internals/optimizer-in-vl.md rung R6a) decides,

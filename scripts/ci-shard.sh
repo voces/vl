@@ -43,7 +43,6 @@ FUEL_WARM=110
 WEIGHTS='
 selfhost_native_align_test.ts 9
 vl_budget_mode_test.ts 49
-selfhost_native_release_inline_test.ts 45
 vl_compile_cache_test.ts 45
 vl_distilled_tools_test.ts 37
 vl_deep_nesting_test.ts 35
@@ -53,6 +52,7 @@ vl_census_generators_test.ts 24
 vl_check_filed_witnesses_test.ts 24
 vl_capability_matrix_test.ts 23
 vl_capability_matrix_port_test.ts 22
+selfhost_native_release_inline_test.ts 22
 vl_census_readers_test.ts 20
 vl_fmt_test.ts 18
 vl_memo_generation_test.ts 18
