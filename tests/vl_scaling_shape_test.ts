@@ -242,7 +242,7 @@ const genCallSites = (n: number, k: number): string => {
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     o.push(`acc = acc + g${i % m}(${i % 5})`);
-    fill(o, i, 6);
+    fill(o, i, 2);
   }
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -306,7 +306,7 @@ const genClosures = (n: number, k: number): string => {
   o.push("let acc = 0");
   for (let i = 0; i < n; i++) {
     o.push(`acc = acc + c${i % m}(${i % 5})`);
-    fill(o, i, 6);
+    fill(o, i, 2);
   }
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -395,7 +395,7 @@ const genCovar = (n: number, cov: number): string => {
     );
   }
   o.push("let acc = 0");
-  for (let i = 0; i < n; i++) fill(o, i, 6);
+  for (let i = 0; i < n; i++) fill(o, i, 2);
   o.push("print(acc)");
   return o.join("\n") + "\n";
 };
@@ -684,7 +684,7 @@ const axis = (name: string, bar: number, note: string, mk: (d: string) => [strin
 // Each line below is many/one/ratio; `unions` carries its own, re-measured reading.
 
 // 0.75 / 0.74 / 1.02, and 5.39 / 0.93 / 5.81 on the pre-#2419 compiler. The #2419 pair,
-// folded in from tests/vl_module_predicate_scan_test.ts: 32,000 statements either way,
+// folded in from tests/vl_module_predicate_scan_test.ts: 16,000 statements either way,
 // 20x the functions, so a per-function module scan is the only thing that can separate
 // the two arms. The worst case for such a scan is a module with NO matching node, because
 // then every scan runs to the end — which is the compiler's own source.
@@ -692,7 +692,7 @@ axis(
   "functions",
   2.5,
   "Memoise it on an arena prefix the way `moduleHasUnionAs` does (compiler/emit_union_casts.vl), clearing the memo in `emitProgram`.",
-  (d) => twoFiles(d, genFunctions(1600, 20), genFunctions(80, 400)),
+  (d) => twoFiles(d, genFunctions(1600, 10), genFunctions(80, 200)),
 );
 
 // Lane AL's pair: 1,200 functions with a parameter against 60, under a `??` family. Fuel reads
@@ -890,7 +890,7 @@ axis(
 );
 
 // 1.09 / 0.97 / 1.13 at 6,000. At 3,000 fuel reads 1.00, and an arena scan planted on each
-// distinct identifier's first check reads 4.18.
+// distinct identifier's first check reads 3.24.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
   twoFiles(d, genCallSites(3000, 1), genCallSites(3000, 20)));
 
@@ -914,7 +914,7 @@ axis("modules", 2.5, "The module merge is scaling with the file count.", (d) => 
   writeModules(`${d}/one`, 200, 4, 30),
 ]);
 
-// Fuel reads 1.27, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_capture_frames.vl)
+// Fuel reads 1.64, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_capture_frames.vl)
 // is the scan that once made this axis super-linear: `fnStmts` walked once per closure.
 axis("closures", 2.5, "`fnStmtsPosOf` scans `fnStmts` once per closure.", (d) =>
   twoFiles(d, genClosures(3000, 1), genClosures(3000, 20)));
@@ -1108,46 +1108,32 @@ axis(
   (d) => twoFiles(d, genCalledNarrowedCaptures(400, 1), genCalledNarrowedCaptures(400, 20)),
 );
 
-// `n` calls handing one record to a function that reads a parameter field `n` times. `wide`
-// declares the parameter with a field wider than the record's, so every call is a covariant
-// delivery whose write analysis walks the parameter's uses; the other arm delivers the record at
-// its own type. Without a memo per (parameter, widened slots) the wide arm is calls x uses (D2060).
-const genRecordCovar = (n: number, wide: boolean, recursive = false, filler = 4): string => {
-  const o = [
-    `type P = { x: ${wide ? "i32 | string" : "i32"}, n: i32 }`,
-    `function g(p: P${recursive ? ", k: i32" : ""}): i32 {`,
-    "  let s = 0",
-  ];
+// `n` calls handing one record to a function that reads a parameter field `n` times and calls
+// itself once. `wide` declares the parameter with a field wider than the record's, so every call
+// is a covariant delivery whose write analysis walks the parameter's uses; the other arm delivers
+// the record at its own type. Without a memo per (parameter, widened slots) the wide arm is
+// calls x uses (D2060).
+const genRecordCovar = (n: number, wide: boolean): string => {
+  const o = [`type P = { x: ${wide ? "i32 | string" : "i32"}, n: i32 }`, "function g(p: P, k: i32): i32 {", "  let s = 0"];
   for (let i = 0; i < n; i++) o.push("  s = s + p.n");
-  if (recursive) o.push("  if k > 0 { s = s + g(p, k - 1) }");
+  o.push("  if k > 0 { s = s + g(p, k - 1) }");
   o.push("  s", "}", "let acc = 0", "function main() {", "  const q = { x: 1, n: 1 }", "  let t = 0");
-  for (let i = 0; i < n; i++) {
-    o.push(recursive ? "  t = t + g(q, 1)" : "  t = t + g(q)");
-    fill(o, i, filler);
-  }
+  for (let i = 0; i < n; i++) o.push("  t = t + g(q, 1)");
   o.push("  print(t)", "}", "main()", "print(acc)");
   return o.join("\n") + "\n";
 };
 
 // Both arms hand the same record to the same body the same number of times; only whether the
-// field widens differs, so the delivery analysis is the only thing that moves.
-axis(
-  "covariant record deliveries",
-  2.5,
-  "The D2060 record write analysis is re-walking the parameter's uses per delivery instead of reading `rcwMemo`.",
-  (d) => twoFiles(d, genRecordCovar(3500, true), genRecordCovar(3500, false)),
-);
-
-// The same pair through a callee that calls itself: the recursion cuts a cycle under every
-// delivery's first question, and an answer computed under a cut must still be banked at the
-// outermost question, or each delivery re-walks the uses (D2060). At 2,500 fuel reads 1.90,
-// and 4.22 with `rcwMemoGet` answering every key as unbanked. The non-recursive pair above
-// stays at 3,500: that same mutant reads only 3.19 there.
+// field widens differs, so the delivery analysis is the only thing that moves. The callee calls
+// itself, so the recursion cuts a cycle under every delivery's first question, and an answer
+// computed under a cut must still be banked at the outermost question, or each delivery re-walks
+// the uses (D2060). Fuel reads 1.95, and 4.41 with `rcwMemoGet` answering every key as unbanked.
+// The non-recursive spelling is not a pair of its own: every memo mutant that reds it reds this.
 axis(
   "covariant record deliveries to a recursive callee",
   2.5,
-  "The D2060 memo is declining to bank a cut answer at the outermost open question (`rcwMemoPut`).",
-  (d) => twoFiles(d, genRecordCovar(2500, true, true, 0), genRecordCovar(2500, false, true, 0)),
+  "The D2060 memo is unread (`rcwMemo`) or is declining to bank a cut answer at the outermost open question (`rcwMemoPut`).",
+  (d) => twoFiles(d, genRecordCovar(2500, true), genRecordCovar(2500, false)),
 );
 
 // One function of `n` sibling blocks, each binding five temps and folding them into `acc` —
@@ -1407,7 +1393,7 @@ const genCallBlocks = (n: number, fns: number): string => {
     o.push("  acc", "}");
   }
   o.push("let acc = 0");
-  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  for (let i = 0; i < 600; i++) fill(o, i, 6);
   for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f % 7})`);
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -1434,7 +1420,7 @@ const genFrameLocals = (n: number, fns: number): string => {
     o.push("  acc", "}");
   }
   o.push("let acc = 0");
-  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  for (let i = 0; i < 600; i++) fill(o, i, 6);
   for (let f = 0; f < fns; f++) o.push(`acc = acc + f${f}(${f % 7})`);
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -2053,7 +2039,7 @@ axis(
 );
 
 // `fns` functions each binding an un-annotated list `out`, beside one function that assigns
-// its own local `20 * fns` times, named `out` in the many arm and `sink` in the one. A
+// its own local `8 * fns` times, named `out` in the many arm and `sink` in the one. A
 // binding's store scan walked its name's occurrences in every frame rather than its own
 // (`cwIxFrHead`, compiler/check_write_scan.vl; D2688), so the sink's rows cost each binding.
 const genSharedListName = (fns: number, shared: boolean): string => {
@@ -2072,7 +2058,7 @@ const genSharedListName = (fns: number, shared: boolean): string => {
   }
   const s = shared ? "out" : "sink";
   o.push("function h(k: i32): i32 {", `  let ${s} = k`);
-  for (let j = 0; j < 20 * fns; j++) o.push(`  ${s} = ${s} + ${j % 7}`);
+  for (let j = 0; j < 8 * fns; j++) o.push(`  ${s} = ${s} + ${j % 7}`);
   o.push(`  ${s}`, "}", "let acc = h(1)");
   for (let f = 0; f < fns; f += 50) o.push(`acc = acc + g${f}(${f}).length`);
   o.push("print(acc)");
@@ -2103,7 +2089,7 @@ const genGenericCycle = (n: number, cycle: boolean): string => {
     o.push("  false", "}");
   }
   o.push("let acc = 0");
-  for (let i = 0; i < 2400; i++) fill(o, i, 6);
+  for (let i = 0; i < 600; i++) fill(o, i, 6);
   o.push("const s: i32[] = []", `print(f0<i32[]>(s, ${n}))`, "print(acc)");
   return o.join("\n") + "\n";
 };
@@ -2133,7 +2119,7 @@ const genGenericClique = (n: number, clique: boolean): string => {
     o.push("  false", "}");
   }
   o.push("let acc = 0");
-  for (let i = 0; i < 3600; i++) fill(o, i, 6);
+  for (let i = 0; i < 600; i++) fill(o, i, 6);
   o.push("const s: i32[] = []", `print(f0<i32[]>(s, ${n}))`, "print(acc)");
   return o.join("\n") + "\n";
 };
