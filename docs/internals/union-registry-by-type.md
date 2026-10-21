@@ -365,15 +365,44 @@ answer is right. Answering "union" by type turns a witness that runs into `union
 on a union with no recorded members`. The seam moves only once such a row stops answering as a
 union.
 
+Then the third slice (L6 log, 2026-10-20). The licence compares member sets with `null`'s
+position set aside (`unRowSetSameNullBlind`), and only that: the other members still compare
+in order and by count. It reads the rows' recorded member columns, so it parses no spelling.
+`pushValueUnionRow` keys its row by type too, through the same `unKeyPushOfTy`, now in
+`emit_union_registry.vl`. The nullable exclusion is narrowed to a row whose `null` is not its
+last member (`unRowNullLast`). The three mints record a row's member slice before they key it,
+so both helpers read the slice. With the exclusion dropped outright, 1 module of
+11,087 changes and prints the same: in `annotated-param-union-at-nullable-pin.vl`,
+`string|null|Rec` takes the type key ahead of `string|Rec|null`. A later spelling's adoption
+then compares where `null` sits (`unNameAdoptTyKeyRow`), refuses, and mints one more row, so
+every scalar tag shifts by one. With the gate, no module changes.
+
+`unionRowOf`'s two callers that hold the type they rendered the name from are A/B sites 52
+(`anonUnionFieldName`) and 53 (`mvValUnionRow`), through `unionRowOfAB`. That seam tallies only;
+the answer stays the name's. Over `tests/cases`:
+
+| site | agree | differ | id-only | name-only | neither |
+| --- | --- | --- | --- | --- | --- |
+| 52 | 219 (17 files) | 4 (1) | 110 (11) | 42 (4) | 7,394 |
+| 53 | 69,343 (125) | 290 (22) | 63 (19) | 561 (4) | 10 |
+
+When the type answered, 7 modules changed codegen and printed the same, so the switch was not
+made. Both callers go on to read the registry by the spelling they return. An id-only answer
+skips the `unRowOfCanon` fallback that recovers the row's own name. The switch waits until those
+readers key by type too.
+
 Left:
 
-- The licence's null-blind set compare. Then `pushValueUnionRow` keys by type, and
-  `unKeyPushOfTy` drops its nullable exclusion.
 - `annParamKindTy`, behind the twin-softened list row.
-- The `isUName` / `unionRowOf` callers that hold no type. A new A/B site for any of them needs
-  `emit_union_registry.vl`.
-- Then `unRowOfSetText`, `unKeyAliasRow`, `isUNameKeyAB`'s no-type fallback, the adopt's
-  `i64 | i32` fallback, and the deletion of `canonUnionKeyOfName`.
+- Sites 52 and 53 answering by type, once their downstream readers do.
+- The `isUName` / `unionRowOf` callers that hold no type.
+- `isUNameKeyAB`'s no-type fallback. Its type-holding callers are in `emit_classify.vl`,
+  `emit_collect.vl` and `emit_shape_rows.vl`.
+- `unRowOfSetText`, whose caller holds no type, and `unKeyAliasRow`.
+- The adopt's `i64 | i32` fallback at site 44 (`registerInferRetNominalUnion`), which needs the
+  softened type key.
+- The deletion of `canonUnionKeyOfName`. Four emit files still call it, 10 calls in all, and
+  `check_nj_join.vl`, which defines it, calls it 3 times.
 
 ## 6. The risks
 
