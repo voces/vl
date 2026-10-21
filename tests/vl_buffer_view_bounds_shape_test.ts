@@ -1,5 +1,5 @@
-// The view-bounds shape suite — one test per `bench/buffer-view-bounds/` fixture, graded at
-// all three optimizer rungs, then the P1.4 contract over the same fixtures' `-O3` builds. One
+// The view-bounds shape suite — one test per tabled `bench/buffer-view-bounds/` fixture, graded
+// at all three optimizer rungs, then the P1.4 contract over the same fixtures' `-O3` builds. One
 // file so each (fixture, rung) is built once and the rows run a few at a time; the machinery
 // and the table (with the prose that explains every cell) are in the shared support module.
 //

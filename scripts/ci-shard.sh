@@ -60,13 +60,13 @@ vl_sentinel_index_test.ts 15
 vl_compile_gc_test.ts 14
 vl_plumb_shape_port_test.ts 13
 vl_survey_regrade_port_test.ts 12
-selfhost_native_release_multivalue_test.ts 12
+selfhost_native_release_multivalue_test.ts 10
 vl_label_codemod_test.ts 11
 vl_gen_cases_test.ts 10
 vl_ladder_census_test.ts 10
 vl_perf_tools_test.ts 9
 vl_std_math_grade_test.ts 9
-vl_memarg_offset_test.ts 8
+vl_memarg_offset_test.ts 5
 vl_emit_refusal_sites_test.ts 8
 vl_twin_agreement_test.ts 7
 vl_check_fix_test.ts 6
@@ -91,7 +91,7 @@ vl_seed_provenance_test.ts 3
 vl_std_process_test.ts 3
 vl_budget_mode_test.ts 1
 vl_deep_else_chain_test.ts 11
-vl_buffer_view_bounds_shape_test.ts 40
+vl_buffer_view_bounds_shape_test.ts 33
 selfhost_native_release_shape_test.ts 30
 selfhost_native_release_escape_test.ts 20
 selfhost_native_release_melt_test.ts 25

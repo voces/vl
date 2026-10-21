@@ -330,7 +330,7 @@ const RT = [
 const RT_IMPORT = 'import { M32, ld8, ld16, ld32, ld64, st8, st16, st32, st64 } from "./rt"';
 
 // PL-061, part 2: under the promise, a call of a trivial accessor with a constant-offset address
-// builds to the same wasm as the intrinsic's offset form, one shape at a time and all together.
+// builds to the same wasm as the intrinsic's offset form, every shape together and two alone.
 Deno.test({
   name: "memarg offset: --low-memory-unused folds a trivial accessor's address like the offset form",
   ignore: !ENABLED,
@@ -371,8 +371,10 @@ Deno.test({
           ].join("\n"),
         );
       }
+      // `all` holds every shape; `ld32` and `st64` add the two positions it lacks, a load as the
+      // whole body and a store as its only statement.
       for (const rung of [["-O", "--low-memory-unused=65536"], ["-O3", "--low-memory-unused=65536"]]) {
-        for (const name of [...shapes.map(([n]) => n), "all"]) {
+        for (const name of ["ld32", "st64", "all"]) {
           const h = bodies(await dis(dir, `h_${name}`, rung));
           const d = bodies(await dis(dir, `d_${name}`, rung));
           if (h !== d) throw new Error(`${rung} ${name}: the helper call is not the offset form:\n${h}\nwant\n${d}`);

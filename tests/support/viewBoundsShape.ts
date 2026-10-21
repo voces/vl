@@ -155,8 +155,8 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // calls per trip: V8 would run the absorbed kernel on its baseline tier for the whole run
 // (2-4x slower than the UNOPTIMIZED module on all eighteen, measured). So every optimized row
 // carries the driver's per-trip `call` again, as `none` always did, and the descriptor no
-// longer melts into a driver that absorbed its kernel: `scale-view`, `scale-accessor`,
-// `reduce-view` and `rows-view` read their `sget` like `scale-seedtwice`. The per-trip
+// longer melts into a driver that absorbed its kernel: `scale-view`, `reduce-view` and
+// `rows-view` read their `sget` like `scale-seedtwice`. The per-trip
 // view-construction reads of `axpy-at`, `axpy-fencedhoist` and `soa-at` moved into the
 // kernel, above its loop, so those rows read 0. The comments below describe the collapsed
 // shape these rows had before; §M of `buffer-design.md` carries the re-measured costs.
@@ -169,19 +169,9 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 // fields: every `view` and `buf` row's optimized `sget` is 0, the per-element reload the
 // comments below describe is gone, and every `trap` cell is unchanged.
 export const TABLE: Record<string, Row> = {
+  // `scale-accessor` and `scale-seedtwice` have no row: each read `scale-view`'s three
+  // cells, and every mutant that reddened either of them reddens another row here too. `vl_view_descriptor_melt_test.ts` still builds `scale-seedtwice` at `-O3`.
   "scale-view": { none: c(2, 7, 1), O: c(2, 2, 0), O3: c(4, 1, 0) },
-  // Identical to `scale-view` in every cell, which is the POINT: the bracket's
-  // extra frame is one level DOWN (`"[]"` calls `getF32`), so a loop-level count
-  // cannot see it. It shows up only in the call TARGET and on the clock (§M3(4)).
-  "scale-accessor": { none: c(2, 7, 1), O: c(2, 2, 0), O3: c(4, 1, 0) },
-  // `scale-view` with its IDEMPOTENT seed helper called twice, and no other
-  // difference: one buffer, one view, one column, the same kernel source. The
-  // second call site keeps `seed` alive, the module stops collapsing into its
-  // driver, `f32view` stops being inlined, and the descriptor that `scale-view`
-  // melts away survives — so the `-O3` cell that reads 0 there reads non-zero
-  // here, and the kernel runs 3.0x slower (0.445 -> 1.36 ns/element). This row
-  // is the evidence that the reload is NOT a "two views of one width" property.
-  "scale-seedtwice": { none: c(2, 7, 1), O: c(2, 2, 0), O3: c(4, 1, 0) },
   "scale-buf": { none: c(2, 7, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
   "scale-hoist": { none: c(2, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
   "reduce-view": { none: c(2, 6, 1), O: c(2, 1, 0), O3: c(2, 1, 0) },
