@@ -2873,6 +2873,8 @@ fn prune_cache_dir(dir: &std::path::Path, ours: &std::path::Path, suffixes: &[&s
 fn read_module_key(key: &str) -> Option<String> {
     let data = if let Some(path) = key.strip_prefix(ROOT_QUERY) {
         Some(module_root_of(path))
+    } else if let Some(path) = key.strip_prefix(DIR_QUERY) {
+        dir_listing(path)
     } else {
         match key.strip_prefix("std:") {
             Some(name) => read_std_module(name),
@@ -2886,6 +2888,25 @@ fn read_module_key(key: &str) -> Option<String> {
 /// The key prefix that asks [`read_module_key`] for a module's project root rather than its
 /// source. No path holds a NUL, so it cannot name a file.
 const ROOT_QUERY: &str = "\0root:";
+
+/// The key prefix that asks [`read_module_key`] for a directory's listing, in the form
+/// [`dir_listing`] returns: `CMD_LIST_DIR` is served through it, so a recording sees it.
+const DIR_QUERY: &str = "\0dir:";
+
+/// The entries of directory `path` as `CMD_LIST_DIR` commits them, in `read_dir` order: per
+/// entry a `1` (a directory) or `0`, its name, and a NUL. `None` when `path` is not a
+/// directory (a file, or missing).
+fn dir_listing(path: &str) -> Option<String> {
+    let entries = std::fs::read_dir(path).ok()?;
+    let mut s = String::new();
+    for entry in entries.flatten() {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        s.push(if is_dir { '1' } else { '0' });
+        s.push_str(&entry.file_name().to_string_lossy());
+        s.push('\0');
+    }
+    Some(s)
+}
 
 /// The files that mark a directory as a project root: the set `lsp/src/moduleGraph.ts`
 /// (`ROOT_SENTINELS`) uses, so the CLI and the editor find one root per module.
@@ -9050,7 +9071,7 @@ fn slash_path_args(args: &[String]) -> Vec<String> {
 /// path + TTY colour, stream argv in, then loop servicing file reads and line
 /// prints until the VL program reports CMD_DONE, and exit with its code.
 fn cli_pump(args: &[String]) -> Result<()> {
-    use std::io::{IsTerminal, Write};
+    use std::io::IsTerminal;
     let args = &take_test_externs(args)[..];
     let args = &slash_path_args(args)[..];
     // Resolve the compiler module (host mechanism): --compiler / env / default.
@@ -9070,20 +9091,6 @@ fn cli_pump(args: &[String]) -> Result<()> {
     // value fails the invocation up front instead of at whichever file first
     // validates (and never, on a run that validates nothing).
     let fault = fault_injection()?;
-
-    // A COLLECTING collector: the copying engine `vl build`/`vl run` compile under, so the
-    // two load one `.cwasm` sidecar (`copying_seed_engine`). The pump drives one
-    // compiler instance across every file a directory walk finds, so its garbage grows
-    // with the FILE COUNT; under the null collector the heap only ever grows and a walk
-    // of a few dozen files dies with `wasm trap: allocation size too large`. Two copies
-    // of this repo's own `compiler/` (54 files) were enough.
-    let gc_stats = maybe_install_gc_stats();
-    let engine = match std::env::var("VL_PUMP_GC").ok().as_deref() {
-        Some("null") => seed_engine(Collector::Null)?,
-        Some("refcount") => seed_engine(Collector::DeferredReferenceCounting)?,
-        _ => copying_seed_engine()?,
-    };
-    let ((mut store, inst), compiler_module) = load_compiler_keep(&engine, &compiler)?;
 
     // TTY + NO_COLOR + TERM is host mechanism; the VL formatter can't probe isatty,
     // so the resolved decision rides in as a synthetic `--color=always|never`
@@ -9110,6 +9117,186 @@ fn cli_pump(args: &[String]) -> Result<()> {
         }
     }
     let color = choice.resolve(std::io::stdout().is_terminal());
+    let color_arg = if color {
+        "--color=always"
+    } else {
+        "--color=never"
+    };
+
+    let gc_stats = maybe_install_gc_stats();
+    let mut code = if args.first().map(String::as_str) == Some("check") {
+        check_cached(args, &compiler, color_arg, fault)?
+    } else {
+        pump_session(args, &compiler, color_arg, fault, &mut PumpOut::default())?
+    };
+    finish_guest_profile();
+    if gc_stats {
+        print_compile_gc_stats();
+    }
+    if let Some(msg) = unused_defines_error() {
+        eprintln!("vl test: {msg}");
+        code = code.max(1);
+    }
+    std::process::exit(code);
+}
+
+/// What a pump session prints. By default each line goes straight to its stream; under the
+/// compile cache (`capture`) the lines are kept in order instead, as a `check` action's
+/// result, and `side_effect` notes a run that wrote a file or read stdin, which stores nothing.
+#[derive(Default)]
+struct PumpOut {
+    capture: Option<Vec<(bool, String)>>,
+    side_effect: bool,
+}
+
+impl PumpOut {
+    /// Raw stdout text (no added newline).
+    fn out(&mut self, data: String) -> Result<()> {
+        match self.capture.as_mut() {
+            Some(lines) => lines.push((false, data)),
+            None => {
+                use std::io::Write;
+                write!(std::io::stdout(), "{data}")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One stderr line (a newline is added).
+    fn err(&mut self, line: String) -> Result<()> {
+        match self.capture.as_mut() {
+            Some(lines) => lines.push((true, line)),
+            None => {
+                use std::io::Write;
+                writeln!(std::io::stderr(), "{line}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Print captured lines exactly as a streaming session would have.
+fn print_pump_lines(lines: &[(bool, String)]) {
+    use std::io::Write;
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    for (to_err, text) in lines {
+        let _ = if *to_err {
+            out.flush().and_then(|_| writeln!(err, "{text}"))
+        } else {
+            err.flush().and_then(|_| write!(out, "{text}"))
+        };
+    }
+    let _ = out.flush();
+    let _ = err.flush();
+}
+
+/// A whole `vl check` run as one compile-cache action (kind `check`): keyed on the seed, the
+/// argv the guest is given (with the synthetic `--color=`), the VL root and the cwd; its
+/// transcript is every module read, root query and directory listing of the run and of its
+/// pool workers. The result is the printed lines in order and the exit code. A run that wrote
+/// a file (`--fix`, `--write-baseline`) or read stdin is never stored, so a hit never stands in
+/// for a write: by the transcript argument a hit's run would have written nothing either.
+fn check_cached(
+    args: &[String],
+    compiler: &CompilerSource,
+    color_arg: &str,
+    fault: Option<Fault>,
+) -> Result<i32> {
+    let action = compile_cache::Action::new("check", || {
+        let (root, cwd) = staged_root_and_cwd();
+        let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        argv.push(color_arg);
+        Some(vec![
+            compiler_hash(compiler)?.to_vec(),
+            argv.join("\0").into_bytes(),
+            root.into_bytes(),
+            cwd.into_bytes(),
+        ])
+    })
+    .map(compile_cache::Action::process_wide);
+    if action.is_none() {
+        return pump_session(args, compiler, color_arg, fault, &mut PumpOut::default());
+    }
+    let run = compile_cache::serve(
+        action.as_ref(),
+        &read_module_key,
+        || {
+            let mut sink = PumpOut { capture: Some(Vec::new()), side_effect: false };
+            match pump_session(args, compiler, color_arg, fault, &mut sink) {
+                Ok(code) => Ok((code, sink)),
+                Err(e) => {
+                    print_pump_lines(sink.capture.as_deref().unwrap_or_default());
+                    Err(e)
+                }
+            }
+        },
+        |(code, sink)| (!sink.side_effect).then(|| pack_check_result(*code, sink)),
+        |bytes| match unpack_check_result(&bytes) {
+            Some(r) => r,
+            None => {
+                eprintln!("vl: compile cache: a malformed cached check result");
+                std::process::exit(compile_cache::EXIT_CACHE_MISMATCH);
+            }
+        },
+    )?;
+    let (code, sink) = run;
+    print_pump_lines(sink.capture.as_deref().unwrap_or_default());
+    Ok(code)
+}
+
+/// A `check` result as one stored blob: the exit code, then per printed line its stream
+/// (`0` stdout, `1` stderr), its length and its text.
+fn pack_check_result(code: i32, sink: &PumpOut) -> Vec<u8> {
+    let mut v = code.to_le_bytes().to_vec();
+    for (to_err, text) in sink.capture.as_deref().unwrap_or_default() {
+        v.push(*to_err as u8);
+        v.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        v.extend_from_slice(text.as_bytes());
+    }
+    v
+}
+
+fn unpack_check_result(b: &[u8]) -> Option<(i32, PumpOut)> {
+    let code = i32::from_le_bytes(b.get(..4)?.try_into().ok()?);
+    let mut lines = Vec::new();
+    let mut at = 4;
+    while at < b.len() {
+        let to_err = match b[at] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let n = u64::from_le_bytes(b.get(at + 1..at + 9)?.try_into().ok()?) as usize;
+        let text = b.get(at + 9..(at + 9).checked_add(n)?)?;
+        lines.push((to_err, String::from_utf8(text.to_vec()).ok()?));
+        at += 9 + n;
+    }
+    Some((code, PumpOut { capture: Some(lines), side_effect: false }))
+}
+
+/// One pump session in a fresh compiler instance: load the compiler, stage argv (with
+/// `color_arg` last), the VL root and the cwd, then service commands until CMD_DONE, printing
+/// through `sink`. Returns the guest's exit code.
+fn pump_session(
+    args: &[String],
+    compiler: &CompilerSource,
+    color_arg: &str,
+    fault: Option<Fault>,
+    sink: &mut PumpOut,
+) -> Result<i32> {
+    use std::io::Write;
+    // A COLLECTING collector: the copying engine `vl build`/`vl run` compile under, so the
+    // two load one `.cwasm` sidecar (`copying_seed_engine`). The pump drives one
+    // compiler instance across every file a directory walk finds, so its garbage grows
+    // with the FILE COUNT; under the null collector the heap only ever grows and a walk
+    // of a few dozen files dies with `wasm trap: allocation size too large`. Two copies
+    // of this repo's own `compiler/` (54 files) were enough.
+    let engine = match std::env::var("VL_PUMP_GC").ok().as_deref() {
+        Some("null") => seed_engine(Collector::Null)?,
+        Some("refcount") => seed_engine(Collector::DeferredReferenceCounting)?,
+        _ => copying_seed_engine()?,
+    };
+    let ((mut store, inst), compiler_module) = load_compiler_keep(&engine, &compiler)?;
 
     let arg_reset = inst.get_typed_func::<(), i32>(&mut store, "cliArgReset")?;
     let arg_push = inst.get_typed_func::<i32, i32>(&mut store, "cliArgPush")?;
@@ -9121,11 +9308,6 @@ fn cli_pump(args: &[String]) -> Result<()> {
         }
         arg_commit.call(&mut store, ())?;
     }
-    let color_arg = if color {
-        "--color=always"
-    } else {
-        "--color=never"
-    };
     for ch in color_arg.chars() {
         arg_push.call(&mut store, ch as i32)?;
     }
@@ -9167,8 +9349,6 @@ fn cli_pump(args: &[String]) -> Result<()> {
     let mut test_engine_slot: Option<Engine> = None;
     let mut check_queue: Vec<(String, i32)> = Vec::new();
 
-    let mut out = std::io::stdout();
-    let mut err = std::io::stderr();
     loop {
         match next.call(&mut store, ())? {
             CMD_DONE => break,
@@ -9177,19 +9357,21 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // policy). `cliDirCommit(1)` when the path is a directory (entries
                 // streamed first), `0` when it is a file or does not exist, so the
                 // VL program can classify a file-vs-directory target.
+                // Served through `read_module_key`, so a compile-cache recording sees it.
                 let path = cmd_path.read(&mut store)?;
-                match std::fs::read_dir(&path) {
-                    Ok(entries) => {
-                        for entry in entries.flatten() {
-                            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                            for ch in entry.file_name().to_string_lossy().chars() {
+                match read_module_key(&format!("{DIR_QUERY}{path}")) {
+                    Some(listing) => {
+                        for entry in listing.split_terminator('\0') {
+                            let mut chars = entry.chars();
+                            let is_dir = chars.next() == Some('1');
+                            for ch in chars {
                                 dir_name_push.call(&mut store, ch as i32)?;
                             }
                             dir_entry_push.call(&mut store, if is_dir { 1 } else { 0 })?;
                         }
                         dir_commit.call(&mut store, 1)?;
                     }
-                    Err(_) => {
+                    None => {
                         // Not a directory (a file, or missing) — no entries.
                         dir_commit.call(&mut store, 0)?;
                     }
@@ -9224,12 +9406,14 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // data both ride the current-command payload.
                 let path = cmd_path.read(&mut store)?;
                 let data = cmd_data.read(&mut store)?;
+                sink.side_effect = true;
                 std::fs::write(&path, data.as_bytes())
                     .map_err(|e| Error::from(e).context(format!("writing `{path}`")))?;
             }
             CMD_READ_STDIN => {
                 // `… | vl fmt` — slurp stdin and commit it like a file read.
                 use std::io::Read;
+                sink.side_effect = true;
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s).ok();
                 result_in.send(&mut store, &s)?;
@@ -9239,11 +9423,11 @@ fn cli_pump(args: &[String]) -> Result<()> {
                 // Raw stdout (no added newline) — formatted source carries its own
                 // trailing newline, so `vl fmt` output stays byte-exact.
                 let data = cmd_data.read(&mut store)?;
-                write!(out, "{data}")?;
+                sink.out(data)?;
             }
             CMD_PRINT_ERR => {
                 let line = cmd_data.read(&mut store)?;
-                writeln!(err, "{line}")?;
+                sink.err(line)?;
             }
             CMD_TEST_STASH => {
                 // The brain just emitted a test module; keep its bytes. They come
@@ -9499,23 +9683,15 @@ fn cli_pump(args: &[String]) -> Result<()> {
             other => bail!("vl: unknown CLI command {other} from the wasm pump"),
         }
     }
-    out.flush().ok();
-    err.flush().ok();
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
     // AFTER the last guest call, and before the `exit` that keeps `main`'s own
     // `finish_guest_profile` from ever running on this path.
-    let mut code = exit_code.call(&mut store, ())?;
+    let code = exit_code.call(&mut store, ())?;
     if args.first().map(String::as_str) == Some("check") {
         report_check_run(&mut store, &inst);
     }
-    finish_guest_profile();
-    if gc_stats {
-        print_compile_gc_stats();
-    }
-    if let Some(msg) = unused_defines_error() {
-        eprintln!("vl test: {msg}");
-        code = code.max(1);
-    }
-    std::process::exit(code);
+    Ok(code)
 }
 
 /// `vl test`'s `--extern NAME=VALUE` flags, taken out of `args` before the VL parser (which
