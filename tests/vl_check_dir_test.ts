@@ -365,3 +365,49 @@ Deno.test({
     }
   },
 });
+
+// D8500: whether `st.v` stays narrowed across `q.v = null` depends on whether the PROGRAM hands
+// `st` on, so r.vl alone is clean and a.vl's check reports r.vl's error. Served from a.vl's
+// check, r.vl must still report what its own check reports, at one worker and at six.
+Deno.test({
+  name: "vl-check-dir: a root is not served an importer's use of a sole-reference record (D8500)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_sole_" });
+    try {
+      const files: Record<string, string> = {
+        "s.vl": "export type S = { v: i32 | null }\nexport const st: S = { v: 1 }\n",
+        "r.vl": 'import { S, st } from "./s"\nexport function g(q: S): i32 {\n' +
+          "  if (st.v != null) {\n    q.v = null\n    return st.v\n  }\n  return 0\n}\n",
+        "a.vl": 'import { st } from "./s"\nimport { g } from "./r"\nprint(g(st))\n',
+      };
+      for (const [name, src] of Object.entries(files)) {
+        await Deno.writeTextFile(`${dir}/${name}`, src);
+      }
+      const run = async (args: string[], jobs: string) => {
+        const r = await new Deno.Command(VL, {
+          args: ["check", ...args, "--concise", "--compiler", COMPILER],
+          cwd: dir,
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: jobs }),
+        }).output();
+        return { code: r.code, err: new TextDecoder().decode(r.stderr) };
+      };
+      const errs = (s: string) => s.split("\n").filter((l) => /^[ar]\.vl: error /.test(l));
+      const ra = await run(["a.vl"], "1");
+      const rr = await run(["r.vl"], "1");
+      if (errs(ra.err).length !== 1 || ra.code !== 1 || errs(rr.err).length !== 0 || rr.code !== 0) {
+        throw new Error(`want a.vl: 1 error in r.vl, r.vl alone: clean, got:\n${ra.err}\n${rr.err}`);
+      }
+      for (const jobs of ["1", "6"]) {
+        const r = await run(["a.vl", "r.vl"], jobs);
+        if (JSON.stringify(errs(r.err)) !== JSON.stringify(errs(ra.err)) || r.code !== 1) {
+          throw new Error(`VL_JOBS=${jobs}: want a.vl's one error and none for r.vl, got:\n${r.err}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
