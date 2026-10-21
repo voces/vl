@@ -259,3 +259,74 @@ Deno.test({
     Deno.removeSync(dir, { recursive: true });
   }
 });
+
+// D8780: with no project root marker the id hashes the module's ABSOLUTE path, and the
+// canonical type order used to read the suffixed names as they are, so one source built in
+// two directories emitted its struct and list types at different indices. Eight sibling directories, so a
+// compiler whose bytes depend on the path cannot agree by luck.
+Deno.test({
+  name:
+    "module-id-stable: a two-module program builds to the same bytes in any marker-less directory",
+  ignore: !ENABLED,
+}, async () => {
+  const dir = Deno.makeTempDirSync({ prefix: "vl-module-id-noroot-" });
+  try {
+    for (
+      let d = dir;
+      d !== "/" && d !== ".";
+      d = d.replace(/\/[^/]*$/, "") || "/"
+    ) {
+      for (const m of ["deno.json", "package.json", ".git"]) {
+        if (exists(`${d}/${m}`)) {
+          throw new Error(
+            `precondition: ${d}/${m} marks a project root above the temp dir`,
+          );
+        }
+      }
+    }
+    const lib = "export type P = { x: i32, y: i32 }\n" +
+      "export function mk(): P[] { return [{ x: 1, y: 2 }] }\n";
+    const main =
+      'import { mk } from "./lib"\nconst ps = mk()\nprint(ps[0].x + ps[0].y)\n';
+    const builds: [string, Uint8Array][] = [];
+    for (let i = 0; i < 8; i++) {
+      const sub = `${dir}/d${i}`;
+      Deno.mkdirSync(sub);
+      Deno.writeTextFileSync(`${sub}/lib.vl`, lib);
+      Deno.writeTextFileSync(`${sub}/main.vl`, main);
+      const [cwd, entry] = i % 2 === 0
+        ? [sub, "main.vl"]
+        : [dir, `${sub}/main.vl`];
+      const p = await new Deno.Command(VL, {
+        args: ["build", entry, "-o", `${sub}/out.wasm`, "--compiler", COMPILER],
+        cwd,
+        env: nativeEnv(),
+        stdout: "piped",
+        stderr: "piped",
+      }).output();
+      if (!p.success) {
+        throw new Error(
+          `vl build in ${sub} failed:\n${new TextDecoder().decode(p.stdout)}${
+            new TextDecoder().decode(p.stderr)
+          }`,
+        );
+      }
+      builds.push([sub, Deno.readFileSync(`${sub}/out.wasm`)]);
+    }
+    const [want, wantBytes] = builds[0];
+    for (const [where, got] of builds.slice(1)) {
+      if (
+        got.length !== wantBytes.length ||
+        got.some((b, k) => b !== wantBytes[k])
+      ) {
+        throw new Error(
+          `the build in ${where} differs from the build in ${want}: want ${wantBytes.length} bytes, got ${got.length} (first difference at ${
+            got.findIndex((b, k) => b !== wantBytes[k])
+          })`,
+        );
+      }
+    }
+  } finally {
+    Deno.removeSync(dir, { recursive: true });
+  }
+});
