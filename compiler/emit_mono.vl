@@ -9633,6 +9633,7 @@ export function monoStateReset() {
   monoChoiceBindDecl = []
   monoChoiceBindFr = []
   monoChoiceBindTy = []
+  monoChoiceBindGen = []
   monoCurHasLam = false
   monoDestPinOff = false
   monoInstBody = -1
@@ -12029,16 +12030,27 @@ function monoCallIfBound(ix: i32, ctx: i32): i32 {
   if !(d is LetDecl) { return 0 }
   const iv = unwrapParen(d.letInit)
   const g0 = monoFirstArmGenName(iv, lf[0], 0)
-  if g0 < 0 { return 0 }
+  // A binding a first use coerced names instances now, so its generic is the one noted then.
+  const k0 = monoChoiceBindIx(lf)
+  const gfe = if g0 >= 0 { monoFnFeOfIdent(g0, monoIdentNameOf(g0), lf[0]) } else if k0 >= 0 { monoChoiceBindGen[k0] } else { -1 }
+  if gfe < 0 { return 0 }
   let ct = monoSlotPinName(lf[1], [], lf[0])
   if ct == "" {
-    ct = monoSeedCallSig(
-      monoFnFeOfIdent(g0, monoIdentNameOf(g0), lf[0]),
-      ix,
-      ctx,
-    )
+    ct = monoSeedCallSig(gfe, ix, ctx)
     if ct == "!" { return -1 }
     if ct == "" { return 0 }
+  }
+  // The binding holds one value, so a call at another type is refused and split (D9120).
+  const et = nameToTy(ct)
+  const seen = monoChoiceBindNote(
+    lf,
+    if monoTyConcreteFn(et) { tyToStr(et) } else { ct },
+    gfe,
+  )
+  if seen < 0 { return -1 }
+  if seen > 0 {
+    monoRetypeChoiceRead(d.letInit, n.callFn)
+    return 0
   }
   if monoCoerceFnValueName(iv, ct, lf[0], -1) < 0 { return -1 }
   monoRetypeIfInit(d.letInit, g0, n.callFn, lf[0])
@@ -12102,20 +12114,56 @@ function monoIfBindingWalk(rd: i32, ctx: i32, open: boolean): i32[] {
   const iv = unwrapParen(d.letInit)
   if iv < 0 || !(P.nodes[iv] is IfStmt) { return none }
   if monoValueNamesGenerics(iv, lf[0], 0) { return lf }
+  // Its arms name instances once a first use coerced it, and it is still the same choice.
+  if monoChoiceBindIx(lf) >= 0 { return lf }
   if open && monoArgIsOpenFnChoice(iv, 0) { return lf }
   none
 }
 
-// Each binding `monoCoerceChoiceBinding` coerces, keyed by declaration and frame, with the function
-// type it is coerced at, for the compile.
+// Each choice binding coerced, keyed by declaration and frame, with the function type it is coerced
+// at and the generic its first arm named (-1 when none), for the compile.
 let monoChoiceBindDecl: i32[] = []
 let monoChoiceBindFr: i32[] = []
 let monoChoiceBindTy: string[] = []
+let monoChoiceBindGen: i32[] = []
+
+// The row of choice binding `lf` (`[frame, declaration]`) in the coerced-binding registry, or -1.
+function monoChoiceBindIx(lf: i32[]): i32 {
+  let k = 0
+  while k < monoChoiceBindDecl.length {
+    if monoChoiceBindDecl[k] == lf[1] && monoChoiceBindFr[k] == lf[0] {
+      return k
+    }
+    k = k + 1
+  }
+  -1
+}
+
+// Notes that the choice binding `lf` (`[frame, declaration]`), its first arm naming generic `gen`,
+// is coerced at function type `key`: 0 the first time, 1 when it already is at `key`, and -1 at
+// another type, refused and asked of the split (`fn_split.vl`), which gives each type a binding
+// of its own (D9120, D9121).
+function monoChoiceBindNote(lf: i32[], key: string, gen: i32): i32 {
+  const k = monoChoiceBindIx(lf)
+  if k >= 0 {
+    if monoChoiceBindTy[k] == key { return 1 }
+    fsAsk(lf[1])
+    emitFail(
+      "emitProgram: a binding of an `if` choosing generic functions is delivered at two function types — annotate the binding",
+    )
+    return -1
+  }
+  monoChoiceBindDecl.push(lf[1])
+  monoChoiceBindFr.push(lf[0])
+  monoChoiceBindTy.push(key)
+  monoChoiceBindGen.push(gen)
+  0
+}
 
 // For read `at` (frame `ctx`) of a never-written binding of an `if` choosing open functions,
 // delivered at function type `tname` (`expTy`, or -1): instances each arm there as the inline
-// `if` is, and types binding and read at it. A second delivery at another type is refused, the
-// binding holding one value. Answers 1 once coerced, 0 for no such read, -1 on a failure.
+// `if` is, and types binding and read at it. A second delivery at another type is refused and
+// split (`monoChoiceBindNote`). Answers 1 once coerced, 0 for no such read, -1 on a failure.
 function monoCoerceChoiceBinding(
   at: i32,
   ctx: i32,
@@ -12138,26 +12186,19 @@ function monoCoerceChoiceBinding(
       et = nameToTy(pn)
     }
   }
-  const key = if monoTyConcreteFn(et) { tyToStr(et) } else { ct }
-  let k = 0
-  while k < monoChoiceBindDecl.length {
-    if monoChoiceBindDecl[k] == lf[1] && monoChoiceBindFr[k] == lf[0] {
-      if monoChoiceBindTy[k] != key {
-        emitFail(
-          "emitProgram: a binding of an `if` choosing generic functions is delivered at two function types — annotate the binding",
-        )
-        return -1
-      }
-      monoRetypeChoiceRead(d.letInit, at)
-      return 1
-    }
-    k = k + 1
-  }
-  monoChoiceBindDecl.push(lf[1])
-  monoChoiceBindFr.push(lf[0])
-  monoChoiceBindTy.push(key)
-  if monoCoerceFnValueName(d.letInit, ct, lf[0], xt) < 0 { return -1 }
   const iv = unwrapParen(d.letInit)
+  const g0 = monoFirstArmGenName(iv, lf[0], 0)
+  const seen = monoChoiceBindNote(
+    lf,
+    if monoTyConcreteFn(et) { tyToStr(et) } else { ct },
+    if g0 >= 0 { monoFnFeOfIdent(g0, monoIdentNameOf(g0), lf[0]) } else { -1 },
+  )
+  if seen < 0 { return -1 }
+  if seen > 0 {
+    monoRetypeChoiceRead(d.letInit, at)
+    return 1
+  }
+  if monoCoerceFnValueName(d.letInit, ct, lf[0], xt) < 0 { return -1 }
   if monoTyConcreteFn(et) {
     nodeTyRecord(iv, et)
     nodeTyRecord(d.letInit, et)
