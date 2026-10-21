@@ -1346,6 +1346,164 @@ export function cwBindingWrittenValues(nm: string, fr: i32): i32[] {
   out
 }
 
+// The root identifier of the place `a` reads through list elements and record fields, with the
+// steps from it in `path` root first (a field name, or "[]" for an element); -1 for any other root.
+export function cwSlotPath(a: i32, path: string[]): i32 {
+  const rev: string[] = []
+  let ix = cwPeel(a)
+  while ix >= 0 && ix < P.nodes.length && rev.length < 16 {
+    const n = P.nodes[ix]
+    if n is Ident {
+      let k = rev.length - 1
+      while k >= 0 {
+        path.push(rev[k])
+        k = k - 1
+      }
+      return ix
+    }
+    if n is Index {
+      rev.push("[]")
+      ix = cwPeel(n.idxArr)
+    } else if n is Member {
+      rev.push(n.memProp)
+      ix = cwPeel(n.memObj)
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+// Every value stored at the place `path` under the binding (`nm`, `fr`), in `vals`, with the
+// write each is blamed on in `ats`: what its literals hold there, each `p = v` whose place is
+// `path` or a prefix of it, and each `p.push(v)`. Returns how many came from a write after the
+// initialiser, or -1 when one value is not a literal's part.
+export function cwSlotWrittenValues(
+  nm: string,
+  fr: i32,
+  path: string[],
+  vals: i32[],
+  ats: i32[],
+): i32 {
+  if nm == "" || fr == CW_FR_UNKNOWN || path.length == 0 { return -1 }
+  const bd = cwSoleBinderOf(nm, fr)
+  if bd < 0 { return -1 }
+  const bn = P.nodes[bd]
+  if !(bn is LetDecl) { return -1 }
+  if !cwSlotDescend(bn.letInit, path, 0, -1, vals, ats) { return -1 }
+  const nBound = vals.length
+  for v in cwBindingWrittenValues(nm, fr) {
+    if v != bn.letInit && !cwSlotDescend(v, path, 0, -1, vals, ats) {
+      return -1
+    }
+  }
+  const ow = cwOccWalk(nm, fr)
+  while cwOccNext(ow) {
+    const r = ow.row
+    if cwIxKind[r] == CW_OCC_USE && cwIxFr[r] == fr {
+      // Climb from the name to the outermost element or field read it roots.
+      let top = cwIxNode[r]
+      while (
+        top >= 0
+        && top < cwIxUpKind.length
+        && cwIxUpKind[top] == CW_UP_OBJ
+      ) {
+        top = cwIxUp[top]
+      }
+      if top >= 0 && top < cwIxUpKind.length {
+        const up = cwIxUp[top]
+        const k = cwIxUpKind[top]
+        const tn = P.nodes[top]
+        const lp: string[] = []
+        if k == CW_UP_ASG_LHS && up >= 0 {
+          const an = P.nodes[up]
+          if an is BinExpr {
+            if (
+              cwSlotPath(top, lp) >= 0
+              && lp.length > 0
+              && cwPathPrefix(lp, path)
+            ) {
+              let blame = -1
+              if lp.length == path.length { blame = up }
+              if (
+                !cwSlotDescend(an.binRight, path, lp.length, blame, vals, ats)
+              ) {
+                return -1
+              }
+            }
+          }
+        } else if k == CW_UP_CALLEE && up >= 0 && tn is Member {
+          // A `push` onto the list holding the place adds an element to it.
+          const c = P.nodes[up]
+          if tn.memProp == "push" && c is Call {
+            if (
+              cwSlotPath(tn.memObj, lp) >= 0
+              && lp.length == path.length - 1
+              && path[path.length - 1] == "[]"
+              && cwPathPrefix(lp, path)
+            ) {
+              for v in c.callArgs {
+                if P.nodes[cwPeel(v)] is Spread { return -1 }
+                vals.push(v)
+                ats.push(v)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  vals.length - nBound
+}
+
+// Whether every step of `p` is the step of `path` at its position.
+function cwPathPrefix(p: string[], path: string[]): boolean {
+  if p.length > path.length { return false }
+  let k = 0
+  while k < p.length {
+    if p[k] != path[k] { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Add to `vals` what value `e` holds at the steps of `path` from `k`, through list and record
+// literals, blamed on `blame` (or on the value itself at -1); false at any other node.
+function cwSlotDescend(
+  e: i32,
+  path: string[],
+  k: i32,
+  blame: i32,
+  vals: i32[],
+  ats: i32[],
+): boolean {
+  const v = cwPeel(e)
+  if v < 0 || v >= P.nodes.length { return false }
+  if k >= path.length {
+    vals.push(v)
+    if blame >= 0 { ats.push(blame) } else { ats.push(v) }
+    return true
+  }
+  const n = P.nodes[v]
+  if path[k] == "[]" {
+    if !(n is ArrayLit) { return false }
+    for el in n.arrElems {
+      if P.nodes[cwPeel(el)] is Spread { return false }
+      if !cwSlotDescend(el, path, k + 1, blame, vals, ats) { return false }
+    }
+    return true
+  }
+  if !(n is ObjLit) { return false }
+  for f in n.objFields {
+    const fi = P.nodes[f]
+    if !(fi is FieldInit) { return false }
+    if fi.fiName == path[k] {
+      return cwSlotDescend(fi.fiValue, path, k + 1, blame, vals, ats)
+    }
+  }
+  false
+}
+
 // Add the functions the value expression `e` may be to `out`: a lambda, or what the name it is
 // spells may be. False for anything else.
 function cwFvAddValue(e: i32, out: i32[]): boolean {
