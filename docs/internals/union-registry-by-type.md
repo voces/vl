@@ -346,6 +346,35 @@ Left:
 - Then `unRowOfSetText`, `unKeyAliasRow`, `isUNameKeyAB`'s no-type fallback, the
   adopt's `i64 | i32` fallback, and the deletion of `canonUnionKeyOfName`.
 
+Then the second slice (L6 log, 2026-10-20). `mintInlineUnion` and the declared-union mint key
+their row by the arena type (`unKeyPushOfTy`), and the spelling's key finds it too. A nullable
+type keeps the spelling's key, and so does a type key whose first row records another set. No
+module changes.
+
+**Decision: where `null` sits is not part of the box tag layout.** A scalar's tag is global
+(`scalarTagOfKind`), and `null`'s is `nullBoxTag()` at every position. A probe that moved `null`
+last in every name key changed 1 module of 11,083, with the same output and its tag-rank
+constants each shifted by one. `nullpos.vl` (§7) and D3504's fixture build byte-identical under
+it, and under a type key in `pushValueUnionRow`. Only the licence tells the two orders apart:
+`unKeySweepPair` compares member-set strings in order. It should compare them with `null`'s
+position ignored. That change is in `emit_union_registry.vl`.
+
+`annParamKindTy`'s `$fnsig`: the type of `f(b: i32[] | K[])` with `K = 0 | 1` keys to the
+twin-softened row `i32[]|i32[]`. The parameter lowers as a plain i32 list, so the spelling's
+answer is right. Answering "union" by type turns a witness that runs into `union box atom test
+on a union with no recorded members`. The seam moves only once such a row stops answering as a
+union.
+
+Left:
+
+- The licence's null-blind set compare. Then `pushValueUnionRow` keys by type, and
+  `unKeyPushOfTy` drops its nullable exclusion.
+- `annParamKindTy`, behind the twin-softened list row.
+- The `isUName` / `unionRowOf` callers that hold no type. A new A/B site for any of them needs
+  `emit_union_registry.vl`.
+- Then `unRowOfSetText`, `unKeyAliasRow`, `isUNameKeyAB`'s no-type fallback, the adopt's
+  `i64 | i32` fallback, and the deletion of `canonUnionKeyOfName`.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a
@@ -422,4 +451,48 @@ const n2: boolean | i32 | null = n1
 print(n2)
 const lst: (B | A)[] = [x, y]
 print(f(lst[0]))
+```
+
+`nullpos.vl`: one nullable value union in two orders of `null`, delivered into each other (prints
+`b false b 7 i false 7 i n true n 2.5 true 4 true true`, one per line).
+
+```vl
+// Two orders of one nullable value union in one program, delivered into each other.
+function mk(k: i32): boolean | null | i32 {
+  if k == 0 { return true }
+  if k == 1 { return 7 }
+  return null
+}
+function take(v: boolean | i32 | null): string {
+  if v is i32 {
+    print(v)
+    return "i"
+  }
+  if v is boolean { return "b" }
+  "n"
+}
+function back(v: boolean | i32 | null): boolean | null | i32 { v }
+const xs: (boolean | null | i32)[] = [mk(0), mk(1), mk(2)]
+for x in xs {
+  print(take(x))
+  const y = back(x)
+  print(y == null)
+  print(take(y))
+}
+const a: null | i32 | f64 = 2.5
+const b: i32 | f64 | null = a
+if b is f64 { print(b) }
+const c: i32 | null | f64 = null
+const d: f64 | i32 | null = c
+print(d == null)
+const e: i32 | f64 | null = 3
+const f: null | f64 | i32 = e
+if f is i32 { print(f + 1) }
+print(F(0, true, 4))
+print(F(2, true, 4) == null)
+function F<A, B>(k: i32, a: A, b: B): (A | null) | B {
+  if k == 0 { return a }
+  if k == 1 { return b }
+  return null
+}
 ```
