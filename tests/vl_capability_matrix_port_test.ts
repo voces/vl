@@ -33,7 +33,42 @@ const TEMPLATE = "scripts/capability-probes/matrix/orerr-generic-pin.matrix.vl";
 // The stub `vl`: `<cmd> <program> --compiler <seed>`. A seed named `old*` runs every cell
 // and prints what its header asks for. Any other seed: `binding` and annotated `array_push`
 // are check-clean invalid wasm, `argument` is a check refusal, the un-annotated
-// `global_init` prints the wrong value, and the rest run.
+// `global_init` prints the wrong value, `local_assign` passes check and its program traps,
+// `global_assign` passes check and the compiler traps building it, `closure_capture` traps
+// the compiler inside `vl check`, and the rest run.
+//
+// The two trap texts are the host's `report` (scripts/vl-host/src/main.rs): a program trap
+// exits 1 with source frames and no banner; a compiler trap exits 70 under the banner. The
+// compiler one is reconstructed from that function, since no master seed traps on demand.
+const PROGRAM_TRAP = [
+  "Error: error while executing at wasm backtrace:",
+  "    0:    0x138 - vl!float",
+  "    1:    0x1fc - vl!__start__@1",
+  "",
+  "Caused by:",
+  "    wasm trap: null reference",
+  "",
+  "",
+  "vl source frames (innermost first):",
+  "    at cell.vl:1:32  in `f`",
+  "",
+  "note: a null value was used where a non-null one was required.",
+  "",
+].join("\n");
+const COMPILER_TRAP = [
+  "vl: the compiler itself trapped while compiling cell.vl. This is a bug in vl, not in your program.",
+  "    please report it with this file and the output below (vl 0.1.0, seed 6345507 bytes)",
+  "",
+  "Error: error while executing at wasm backtrace:",
+  "    0: 0x1a2b3c - vl!internInlineShapeTy",
+  "",
+  "Caused by:",
+  "    wasm trap: out of bounds array access",
+  "",
+  "vl source frames (innermost first):",
+  "    at compiler/intern.vl:10:3  in `internInlineShapeTy`",
+  "",
+].join("\n");
 const STUB = `#!/usr/bin/env bash
 cmd=$1; f=$2; c=$4
 want=$(head -1 "$f" | sed -n 's/.*Should print \\(.*\\)\\.$/\\1/p')
@@ -49,6 +84,14 @@ case "$f" in
     echo "$f:3:1: [ERROR]: cannot pass x"; echo "Found 1 error."; exit 1 ;;
   *_global_init_un*)
     [ "$cmd" = run ] && echo "wrong answer"; exit 0 ;;
+  *_local_assign_*)
+    if [ "$cmd" = run ]; then printf '%s' "$PROGRAM_TRAP" >&2; exit 1; fi
+    echo "Checked 1 file, no errors."; exit 0 ;;
+  *_global_assign_*)
+    if [ "$cmd" = run ]; then printf '%s' "$COMPILER_TRAP" >&2; exit 70; fi
+    echo "Checked 1 file, no errors."; exit 0 ;;
+  *_closure_capture_*)
+    printf '%s' "$COMPILER_TRAP" >&2; exit 70 ;;
 esac
 [ "$cmd" = run ] && echo "$want"
 exit 0
@@ -69,7 +112,7 @@ const port = async (argv: string[]): Promise<Out> => {
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
-    env: nativeEnv({ NO_COLOR: "1" }),
+    env: nativeEnv({ NO_COLOR: "1", PROGRAM_TRAP, COMPILER_TRAP }),
   }).output();
   return { code, out: dec.decode(stdout), err: dec.decode(stderr) };
 };
@@ -159,8 +202,44 @@ Deno.test({
         ]),
         0,
         [
-          "runs -> not-runs  0\n-> silent         0\n",
+          "runs -> not-runs  0\n-> silent         0\n-> program trap   0\n",
         ],
+      );
+
+      // A trap is the compiler's only when the host says so. The program's own trap past a
+      // clean check is clause 1 and exits 1; it was graded COMPILER TRAP, exit 0, from the
+      // backtrace alone. The compiler's trap, in build or in check, is still COMPILER TRAP.
+      want(
+        "traps",
+        await port([
+          ...base,
+          "--compiler",
+          "new.wasm",
+          "--only",
+          "local_assign,global_assign,closure_capture",
+        ]),
+        1,
+        [
+          "| `local_assign` | annotated | TRAP (program): wasm trap: null reference |",
+          "| `global_assign` | annotated | COMPILER TRAP: wasm trap: out of bounds array access |",
+          "| `closure_capture` | annotated | COMPILER TRAP (check rc 70): wasm trap: out of bounds array access |",
+          "runs -> not-runs  0\n-> silent         0\n",
+          "-> program trap   2   local_assign/ann, local_assign/unann\n",
+          "A TRAP (program) cell passed check and its built program trapped: clause 1.",
+        ],
+      );
+      // The compiler traps alone are not a movement: exit 0, as before.
+      want(
+        "compiler traps",
+        await port([
+          ...base,
+          "--compiler",
+          "new.wasm",
+          "--only",
+          "global_assign,closure_capture",
+        ]),
+        0,
+        ["-> program trap   0\n"],
       );
 
       // A cell that never ran is not lost: `new` before `old` gains, it does not regress.
