@@ -29,16 +29,34 @@ const BASELINE = `${ROOT}/scripts/interp-budget-baseline.json`;
 const CODE = "prefer-interpolation";
 const NARROW = ["std", "scripts/seed-size.vl"];
 const DOCTORED_FILE = "std/fs.vl";
-// The sentinel write's population: one compiler file. The committed baseline over the whole
-// tree is lint-self.sh's hold; this test owns the writer's layout and sentences.
-const SENTINEL_NARROW = "compiler/emit_union_registry.vl";
+// The sentinel write's population: one fixture file in a temp tree, since the committed
+// baseline is at zero. The committed baseline over the whole tree is lint-self.sh's hold;
+// this test owns the writer's layout and sentences.
+const SENTINEL_FIXTURE = "compiler/holes.vl";
+const SENTINEL_FIXTURE_SRC = `let tys: i32[] = []
+
+type Row = { inner: i32 }
+
+function ok(t: Row): i32 {
+  if t.inner < 0 { return 0 }
+  tys[t.inner]
+}
+
+function bad(t: Row): i32 {
+  tys[t.inner]
+}
+
+function worse(t: Row): i32 {
+  tys[t.inner] + 1
+}
+`;
 
 type Run = { code: number; out: string; err: string };
 
-const vl = async (args: string[]): Promise<Run> => {
+const vl = async (args: string[], cwd = ROOT): Promise<Run> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["check", ...args, "--compiler", COMPILER],
-    cwd: ROOT,
+    cwd,
     env: nativeEnv(),
     stdout: "piped",
     stderr: "piped",
@@ -184,8 +202,8 @@ Deno.test({
 });
 
 // THE SENTINEL RATCHET RIDES THE SAME MODE, WITH ITS OWN SENTENCES. Its baseline names an
-// `ok` template and a `remedy` paragraph, and the census (scripts/sentinel-census.vl, an
-// independent implementation) must agree with the lint's count file by file.
+// `ok` template and a `remedy` paragraph. The committed baseline is at zero, so the write's
+// population is a fixture tree of its own: two unguarded reads in one `compiler/` file.
 Deno.test({
   name:
     "vl check --budget holds the sentinel-index baseline with its own sentences",
@@ -195,43 +213,19 @@ Deno.test({
     const committed = JSON.parse(await Deno.readTextFile(path));
     const dir = await Deno.makeTempDir({ prefix: "vl_budget_sentinel_" });
     try {
+      await Deno.mkdir(`${dir}/compiler`);
+      await Deno.writeTextFile(`${dir}/${SENTINEL_FIXTURE}`, SENTINEL_FIXTURE_SRC);
       const full = `${dir}/full.json`;
       await Deno.copyFile(path, full);
-      // The hold reads a report at exactly the baseline: the walk is the write's to prove.
-      const atBaseline = `${dir}/at-baseline.json`;
-      await Deno.writeTextFile(
-        atBaseline,
-        JSON.stringify(
-          Object.entries(
-            committed.files as Record<string, Record<string, number>>,
-          )
-            .flatMap(([file, codes]) =>
-              Object.entries(codes).flatMap(([code, n]) =>
-                Array.from(
-                  { length: n },
-                  (_, i) => ({ file, code, line: i + 1, col: 1 }),
-                )
-              )
-            ),
-        ),
-      );
-      const [w, check, ex] = await Promise.all([
-        vl(["--budget", full, "--write-baseline", SENTINEL_NARROW]),
-        vl(["--budget", path, "--findings", atBaseline]),
+      const [w, ex] = await Promise.all([
+        vl(["--budget", full, "--write-baseline", SENTINEL_FIXTURE], dir),
         vl(["--budget", path, "--exempt-codes"]),
       ]);
       expectEq("--write-baseline: exit", 0, w.code);
-      expectEq("--budget: exit", 0, check.code);
       const [u, s] = [
         "sentinel-index-unguarded",
         "sentinel-index-strict-untested",
       ];
-      expectEq(
-        "--budget: the baseline's own ok sentence",
-        `sentinel-index budget ok — ${committed.total[u]} unguarded reads, ` +
-          `${committed.total[s]} untested strict reads (baseline or below)\n`,
-        check.out,
-      );
       expectEq(
         "--exempt-codes",
         Object.keys(committed.total).filter((c) => committed.total[c] > 0).join(
@@ -239,31 +233,48 @@ Deno.test({
         ) + "\n",
         ex.out,
       );
-      // A write over one file keeps the committed header byte for byte (ok, remedy and its
-      // escapes, targets) and writes that file's lines exactly as the committed file has them.
+      // A write keeps the committed header byte for byte (ok, remedy and its escapes,
+      // targets) and writes one count line and one entry line per finding.
       const want = (await Deno.readTextFile(path)).split("\n");
       const got = (await Deno.readTextFile(full)).split("\n");
       const header = (t: string[]) =>
         t.slice(0, t.findIndex((l) => l.startsWith('"total"')))
           .filter((l) => !l.startsWith('"commit"'));
-      expectEq("a narrowed write keeps the header", header(want), header(got));
-      const mine = (t: string[]) =>
-        t.filter((l) => l.includes(`"${SENTINEL_NARROW}`))
-          .map((l) => l.replace(/,$/, ""));
-      if (mine(want).length < 2) {
-        throw new Error(`${SENTINEL_NARROW} has no committed entry, so this is vacuous`);
-      }
-      expectEq("a narrowed write's own lines", mine(want), mine(got));
-      const n = committed.files[SENTINEL_NARROW][u];
+      expectEq("a write keeps the header", header(want), header(got));
       expectEq(
-        "a narrowed write's total line",
-        `"total": {"${u}": ${n}, "${s}": 0},`,
+        "a write's own lines",
+        [
+          `"${SENTINEL_FIXTURE}": {"${u}": 2, "${s}": 0}`,
+          `["${u}", "${SENTINEL_FIXTURE}: tys[t.inner]", 1]`,
+          `["${u}", "${SENTINEL_FIXTURE}: tys[t.inner] + 1", 1]`,
+        ],
+        got.filter((l) => l.includes(`"${SENTINEL_FIXTURE}`))
+          .map((l) => l.replace(/,$/, "")),
+      );
+      expectEq(
+        "a write's total line",
+        `"total": {"${u}": 2, "${s}": 0},`,
         got.find((l) => l.startsWith('"total"')),
+      );
+      // The hold reads a report at exactly the written baseline: the walk is the write's to prove.
+      const atBaseline = `${dir}/at-baseline.json`;
+      await Deno.writeTextFile(
+        atBaseline,
+        JSON.stringify(
+          [1, 2].map((line) => ({ file: SENTINEL_FIXTURE, code: u, line, col: 1 })),
+        ),
+      );
+      const check = await vl(["--budget", full, "--findings", atBaseline]);
+      expectEq("--budget: exit", 0, check.code);
+      expectEq(
+        "--budget: the baseline's own ok sentence",
+        `sentinel-index budget ok — 2 unguarded reads, 0 untested strict reads (baseline or below)\n`,
+        check.out,
       );
       // A second write over the first is a fixed point.
       const again = `${dir}/again.json`;
       await Deno.copyFile(full, again);
-      const w2 = await vl(["--budget", again, "--write-baseline", SENTINEL_NARROW]);
+      const w2 = await vl(["--budget", again, "--write-baseline", SENTINEL_FIXTURE], dir);
       expectEq("a second write: exit", 0, w2.code);
       expectEq(
         "a second write is byte-identical",
@@ -284,9 +295,6 @@ Deno.test({
   name: "vl check --budget --findings counts a report, not a walk",
   ignore: !ENABLED,
   async fn() {
-    const base = JSON.parse(
-      await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
-    );
     const code = "sentinel-index-unguarded";
     const at = (file: string, n: number) =>
       Array.from(
@@ -295,9 +303,16 @@ Deno.test({
       );
     const dir = await Deno.makeTempDir({ prefix: "vl_budget_findings_" });
     try {
-      const baselinePath = `${ROOT}/scripts/sentinel-budget-baseline.json`;
+      // The committed baseline is at zero; a copy owing three reads in one file is the hold.
+      const base = JSON.parse(
+        await Deno.readTextFile(`${ROOT}/scripts/sentinel-budget-baseline.json`),
+      );
       const file = "compiler/emit_mono.vl";
-      const was = base.files[file][code];
+      const was = 3;
+      base.total[code] = was;
+      base.files[file] = { [code]: was, "sentinel-index-strict-untested": 0 };
+      const baselinePath = `${dir}/baseline.json`;
+      await Deno.writeTextFile(baselinePath, JSON.stringify(base));
       const ok = `${dir}/ok.json`;
       await Deno.writeTextFile(
         ok,

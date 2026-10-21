@@ -325,6 +325,27 @@ alias has a literal-preserving type key that finds no row. `isUName`, `unionRowO
 `canonUnionKeyOfName`. They move once a softened type key at the `tyCanonKey` grain exists, or
 once the type reaches `registerValueUnionName`'s callers.
 
+Then the softened key's first slice (L6 log, 2026-10-20). Four seams that held a type but
+asked by name now hand the type over:
+
+- the map-value narrow rep and `nulRefElemEmitName` ask `isUNameKeyAB` (sites 48 and 49);
+- the `as?` null arm and `registerSharedReadUnion` mint through `registerValueUnionNameAB`
+  (sites 50 and 51).
+
+No module in `tests/cases` or the corpus changes, and [D4260](inventory/D4260.md) closes.
+
+Left:
+
+- `annParamKindTy`'s type keys to a row its spelling does not, which costs one unused
+  `$fnsig`.
+- `pushValueUnionRow` cannot key by type yet. A nested-null pin spelling (`boolean|null|i32`)
+  and its type (`boolean|i32|null`) differ in member order, so two rows would share a key
+  across sets.
+- The `isUName` / `unionRowOf` callers that hold no type.
+- `emit_collect`'s sites, which belong to another lane.
+- Then `unRowOfSetText`, `unKeyAliasRow`, `isUNameKeyAB`'s no-type fallback, the
+  adopt's `i64 | i32` fallback, and the deletion of `canonUnionKeyOfName`.
+
 ## 6. The risks
 
 - **The member-set ABI.** The row's atom columns stay parallel and are never deduped. The KEY is a

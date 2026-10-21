@@ -670,6 +670,7 @@ function monoFnNameIsSourceNamed(nm: string) {
 // The gate is the arena (`nodeTyIsFunc`), and the struct part is nominalized once here.
 function monoArgFnTypeName(argIx: i32, fnIx: i32) {
   const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
   const an = P.nodes[ax]
 
   if nodeTyIsFunc(ax) {
@@ -947,6 +948,10 @@ function monoScalarAnnName(name: string) {
   if leaf == "u8" && leaf != name { return name }
   // A vector pins bare only: a list of them has no rep.
   if leaf == "v128" && leaf == name { return name }
+  // `void`, `null` and `never` carry no value rep to pin.
+  if leaf == "void" { return "" }
+  if leaf == "null" { return "" }
+  if leaf == "never" { return "" }
   ""
 }
 
@@ -1804,7 +1809,7 @@ function monoArgLitUnionPin(ix: i32): string {
   // binds every `T` mentioning the element to plain i32. See `monoAnnPinName`'s
   // litunion-array arm — the two channels must claim the same shape.
   const luIsArr = tyIsLitUnionArray(luTy)
-  if luIsArr {
+  if luIsArr && luTy >= 0 {
     const luArrT = T.tys[luTy]
     if luArrT is TyArray {
       const luElAl = litUnionAliasNameOfTy(luArrT.aElem)
@@ -1990,7 +1995,7 @@ function monoArgTyNameBound(ix: i32, fnIx: i32, cax: i32): string {
   // post-mono, so `exprStruct` cannot classify the inner call and the type param would
   // default to i32. The instance's already-substituted return annotation resolves it.
   const argN = P.nodes[unwrapParen(ix)]
-  if argN is Call {
+  if argN is Call && argN.callFn >= 0 {
     const argCallee = P.nodes[argN.callFn]
     if argCallee is Ident {
       // Scope-aware, as the closure pin above: a nested namesake is not the flat map's first.
@@ -3384,55 +3389,81 @@ function monoRemakeListLitTpl(ix: i32, es: i32[], pos: i32): i32 {
 // banked row.
 function monoExprMake(ix: i32, kids: i32[]): i32 {
   const n = P.nodes[ix]
-  if n is Ident { return monoCopyOf(ix, mkIdent(n.identName, n.pos)) }
-  if n is Call {
-    const args: i32[] = []
-    let ai = 1
-    while ai < kids.length {
-      args.push(kids[ai])
-      ai = ai + 1
+  match n {
+    Ident => {
+      return monoCopyOf(ix, mkIdent(n.identName, n.pos))
     }
-    const nc = monoRemintCall(ix, kids[0], args)
-    const tas = callTyArgsOf(ix)
-    if tas.length > 0 { setCallTyArgs(nc, tas, callTyArgEndsOf(ix)) }
-    return nc
-  }
-  if n is BinExpr {
-    if n.binCompound == "++" || n.binCompound == "--" {
-      return mkPreIncr(n.binCompound, kids[0], n.pos)
-    }
-    if n.binCompound != "" {
-      // A compound whose right side a rewrite respelled from `target op value` offers no value
-      // kid (`monoExprKids`), so it is kept as it is (D3993).
-      if kids.length < 2 { return ix }
-      return mkCompoundAssign(n.binCompound, kids[0], kids[1], n.pos)
-    }
-    const nb = mkBinary(n.binOp, kids[0], kids[1], n.pos)
-    if n.binRegion != 0 { markArithRegion(nb) }
-    return nb
-  }
-  if n is Unary { return mkUnary(n.unOp, kids[0], n.pos) }
-  if n is Paren { return mkParen(kids[0], n.pos) }
-  if n is Member { return mkMember(kids[0], n.memProp, n.pos) }
-  if n is OptMember { return mkOptMember(kids[0], n.omProp, n.omDot, n.pos) }
-  if n is Index { return mkIndex(kids[0], kids[1], n.pos) }
-  if n is IsExpr { return monoReIsExpr(ix, kids[0]) }
-  if n is AsExpr { return mkAsExpr(kids[0], n.asTy, n.asMode, n.pos) }
-  if n is Spread { return mkSpread(kids[0], n.pos) }
-  if n is ArrayLit { return monoCopyOf(ix, mkArrayLit(kids, n.pos)) }
-  if n is ObjLit {
-    const fs: i32[] = []
-    let fi = 0
-    while fi < n.objFields.length {
-      let nf = n.objFields[fi]
-      const f = P.nodes[nf]
-      if f is FieldInit {
-        if kids[fi] != f.fiValue { nf = mkFieldInit(f.fiName, kids[fi], f.pos) }
+    Call => {
+      const args: i32[] = []
+      let ai = 1
+      while ai < kids.length {
+        args.push(kids[ai])
+        ai = ai + 1
       }
-      fs.push(nf)
-      fi = fi + 1
+      const nc = monoRemintCall(ix, kids[0], args)
+      const tas = callTyArgsOf(ix)
+      if tas.length > 0 { setCallTyArgs(nc, tas, callTyArgEndsOf(ix)) }
+      return nc
     }
-    return monoCopyOf(ix, mkObjLit(fs, n.pos))
+    BinExpr => {
+      if n.binCompound == "++" || n.binCompound == "--" {
+        return mkPreIncr(n.binCompound, kids[0], n.pos)
+      }
+      if n.binCompound != "" {
+        // A compound whose right side a rewrite respelled from `target op value` offers no value
+        // kid (`monoExprKids`), so it is kept as it is (D3993).
+        if kids.length < 2 { return ix }
+        return mkCompoundAssign(n.binCompound, kids[0], kids[1], n.pos)
+      }
+      const nb = mkBinary(n.binOp, kids[0], kids[1], n.pos)
+      if n.binRegion != 0 { markArithRegion(nb) }
+      return nb
+    }
+    Unary => {
+      return mkUnary(n.unOp, kids[0], n.pos)
+    }
+    Paren => {
+      return mkParen(kids[0], n.pos)
+    }
+    Member => {
+      return mkMember(kids[0], n.memProp, n.pos)
+    }
+    OptMember => {
+      return mkOptMember(kids[0], n.omProp, n.omDot, n.pos)
+    }
+    Index => {
+      return mkIndex(kids[0], kids[1], n.pos)
+    }
+    IsExpr => {
+      return monoReIsExpr(ix, kids[0])
+    }
+    AsExpr => {
+      return mkAsExpr(kids[0], n.asTy, n.asMode, n.pos)
+    }
+    Spread => {
+      return mkSpread(kids[0], n.pos)
+    }
+    ArrayLit => {
+      return monoCopyOf(ix, mkArrayLit(kids, n.pos))
+    }
+    ObjLit => {
+      const fs: i32[] = []
+      let fi = 0
+      while fi < n.objFields.length {
+        let nf = n.objFields[fi]
+        const f = P.nodes[nf]
+        if f is FieldInit {
+          if kids[fi] != f.fiValue {
+            nf = mkFieldInit(f.fiName, kids[fi], f.pos)
+          }
+        }
+        fs.push(nf)
+        fi = fi + 1
+      }
+      return monoCopyOf(ix, mkObjLit(fs, n.pos))
+    }
+    // no other kind offers `monoExprKids` a kid, so none is remade
+    NumLit | StrLit | CharLit | BoolLit | NullLit | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | ForRange | ForIn | MatchExpr | ImportDecl => {}
   }
   ix
 }
@@ -3702,7 +3733,7 @@ function monoCollCtorAnn(
   const ix = unwrapParen(initIx)
   if ix < 0 || ix >= P.nodes.length { return -1 }
   const c = P.nodes[ix]
-  if c is Call {
+  if c is Call && c.callFn >= 0 {
     const f = P.nodes[c.callFn]
     if f is Ident {
       const tas = callTyArgsOf(ix)
@@ -3757,13 +3788,34 @@ function monoCloneBodyRaw(
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Block {
-    const ns: i32[] = []
-    let changed = false
-    let i = 0
-    while i < n.blkStmts.length {
-      const cs = monoCloneBody(
-        n.blkStmts[i],
+  match n {
+    Block => {
+      const ns: i32[] = []
+      let changed = false
+      let i = 0
+      while i < n.blkStmts.length {
+        const cs = monoCloneBody(
+          n.blkStmts[i],
+          typarams,
+          tvN,
+          tvV,
+          outName,
+          outType,
+          outTyIx,
+          bN,
+          bT,
+        )
+        ns.push(cs)
+        if cs != n.blkStmts[i] { changed = true }
+        i = i + 1
+      }
+      if !changed { return ix }
+      return mkBlock(ns, n.pos)
+    }
+    LetDecl => {
+      return monoCloneLetDecl(
+        n,
+        ix,
         typarams,
         tvN,
         tvV,
@@ -3773,127 +3825,109 @@ function monoCloneBodyRaw(
         bN,
         bT,
       )
-      ns.push(cs)
-      if cs != n.blkStmts[i] { changed = true }
-      i = i + 1
     }
-    if !changed { return ix }
-    return mkBlock(ns, n.pos)
+    WhileStmt => {
+      const cb = monoCloneBody(
+        n.whileBody,
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      )
+      if cb == n.whileBody { return ix }
+      return mkWhileAs(n, n.whileCond, cb)
+    }
+    IfStmt => {
+      return monoCloneIfChain(
+        ix,
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      )
+    }
+    ForRange => {
+      const cb = monoCloneBody(
+        n.frBody,
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      )
+      if cb == n.frBody { return ix }
+      return mkForRange(
+        n.frVar,
+        n.frFrom,
+        n.frTo,
+        n.frStep,
+        n.frExcl,
+        cb,
+        n.frLabel,
+        n.pos,
+      )
+    }
+    ForIn => {
+      const cb = monoCloneBody(
+        n.fiBody,
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      )
+      const ci = monoHoleIterLitCopy(n.fiIter)
+      if cb == n.fiBody && ci == n.fiIter { return ix }
+      return mkForIn(n.fiVar, n.fiVar2, ci, cb, n.fiLabel, n.pos)
+    }
+    RetStmt => {
+      // The return value may be a block or `if` expression carrying its own `LetDecl`s.
+      const ca = monoCloneBody(
+        n.retArg,
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      )
+      if ca == n.retArg { return ix }
+      return mkReturn(ca, n.pos)
+    }
+    Paren => {
+      const ci = monoCloneBody(
+        n.parInner,
+        typarams,
+        tvN,
+        tvV,
+        outName,
+        outType,
+        outTyIx,
+        bN,
+        bT,
+      )
+      if ci == n.parInner { return ix }
+      return mkParen(ci, n.pos)
+    }
+    // a pure expression or other statement carries no `LetDecl` annotation to rewrite: share
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Call | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
-  if n is LetDecl {
-    return monoCloneLetDecl(
-      n,
-      ix,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-  }
-  if n is WhileStmt {
-    const cb = monoCloneBody(
-      n.whileBody,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-    if cb == n.whileBody { return ix }
-    return mkWhileAs(n, n.whileCond, cb)
-  }
-  if n is IfStmt {
-    return monoCloneIfChain(
-      ix,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-  }
-  if n is ForRange {
-    const cb = monoCloneBody(
-      n.frBody,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-    if cb == n.frBody { return ix }
-    return mkForRange(
-      n.frVar,
-      n.frFrom,
-      n.frTo,
-      n.frStep,
-      n.frExcl,
-      cb,
-      n.frLabel,
-      n.pos,
-    )
-  }
-  if n is ForIn {
-    const cb = monoCloneBody(
-      n.fiBody,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-    const ci = monoHoleIterLitCopy(n.fiIter)
-    if cb == n.fiBody && ci == n.fiIter { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, ci, cb, n.fiLabel, n.pos)
-  }
-  if n is RetStmt {
-    // The return value may be a block or `if` expression carrying its own `LetDecl`s.
-    const ca = monoCloneBody(
-      n.retArg,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-    if ca == n.retArg { return ix }
-    return mkReturn(ca, n.pos)
-  }
-  if n is Paren {
-    const ci = monoCloneBody(
-      n.parInner,
-      typarams,
-      tvN,
-      tvV,
-      outName,
-      outType,
-      outTyIx,
-      bN,
-      bT,
-    )
-    if ci == n.parInner { return ix }
-    return mkParen(ci, n.pos)
-  }
-  // A pure expression / other statement carries no `LetDecl` annotation to rewrite — share.
   ix
 }
 
@@ -4009,6 +4043,7 @@ function monoCloneIfChain(
 // return annotation, since the inferred-return path has no f64/string-array map-result form.
 function monoLambdaPreservesElem(argIx: i32) {
   const fnNodeIx = unwrapParen(argIx)
+  if fnNodeIx < 0 { return false }
   const a = P.nodes[fnNodeIx]
   if a is FuncDecl {
     const tail = fnRetExprOf(fnNodeIx)
@@ -4751,7 +4786,7 @@ function monoPinBodyLambdasRaw(
     rb = monoPinRetype(ix, bN, bT)
   } else if n is ObjLit {
     monoTpJoinObjTy(ix, rb, bN, bT)
-  } else if n is AsExpr && tyIsGradualUnion(nodeTyIxOf(n.asObj)) {
+  } else if n is AsExpr && rb >= 0 && tyIsGradualUnion(nodeTyIxOf(n.asObj)) {
     // A cast re-made over a re-typed operand keeps the template's result at the pin: an `as?`
     // is nullable at every pin, as over a bare parameter (D2754).
     const apt = monoPinnedTyOf(ix, bN, bT)
@@ -5530,7 +5565,7 @@ function monoPinIsBoxReturn(ix: i32): boolean {
 // since its other operand is still read at the template's type.
 function monoPinSinkKids(ix: i32): boolean {
   const n = P.nodes[ix]
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const f = P.nodes[n.callFn]
     if f is Ident { return f.identName == "print" }
   }
@@ -5894,147 +5929,157 @@ function monoPinMapLambdas(
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Block {
-    const ns: i32[] = []
-    let changed = false
-    let i = 0
-    while i < n.blkStmts.length {
-      const cs = monoPinMapLambdas(n.blkStmts[i], pNames, pElems, pElemTys)
-      ns.push(cs)
-      if cs != n.blkStmts[i] { changed = true }
-      i = i + 1
-    }
-    if !changed { return ix }
-    return mkBlock(ns, n.pos)
-  }
-  if n is RetStmt {
-    const ca = monoPinMapLambdas(n.retArg, pNames, pElems, pElemTys)
-    if ca == n.retArg { return ix }
-    return mkReturn(ca, n.pos)
-  }
-  if n is LetDecl {
-    const ci = monoPinMapLambdas(n.letInit, pNames, pElems, pElemTys)
-    if ci == n.letInit { return ix }
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
-  }
-  if n is WhileStmt {
-    const cb = monoPinMapLambdas(n.whileBody, pNames, pElems, pElemTys)
-    if cb == n.whileBody { return ix }
-    return mkWhileAs(n, n.whileCond, cb)
-  }
-  if n is IfStmt {
-    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
-    const links = monoIfChainLinks(ix)
-    const ccs: i32[] = []
-    const cts: i32[] = []
-    let k = 0
-    while k < links.length {
-      const c = P.nodes[links[k]]
-      if c is IfStmt {
-        ccs.push(c.ifCond)
-        cts.push(monoPinMapLambdas(c.ifThen, pNames, pElems, pElemTys))
+  match n {
+    Block => {
+      const ns: i32[] = []
+      let changed = false
+      let i = 0
+      while i < n.blkStmts.length {
+        const cs = monoPinMapLambdas(n.blkStmts[i], pNames, pElems, pElemTys)
+        ns.push(cs)
+        if cs != n.blkStmts[i] { changed = true }
+        i = i + 1
       }
-      k = k + 1
+      if !changed { return ix }
+      return mkBlock(ns, n.pos)
     }
-    return monoIfChainRebuild(
-      links,
-      ccs,
-      cts,
-      monoPinMapLambdas(monoIfChainElse(links), pNames, pElems, pElemTys),
-    )
-  }
-  if n is ForRange {
-    const cb = monoPinMapLambdas(n.frBody, pNames, pElems, pElemTys)
-    if cb == n.frBody { return ix }
-    return mkForRange(
-      n.frVar,
-      n.frFrom,
-      n.frTo,
-      n.frStep,
-      n.frExcl,
-      cb,
-      n.frLabel,
-      n.pos,
-    )
-  }
-  if n is ForIn {
-    const cb = monoPinMapLambdas(n.fiBody, pNames, pElems, pElemTys)
-    if cb == n.fiBody { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, n.fiIter, cb, n.fiLabel, n.pos)
-  }
-  if n is Paren {
-    const ci = monoPinMapLambdas(n.parInner, pNames, pElems, pElemTys)
-    if ci == n.parInner { return ix }
-    return mkParen(ci, n.pos)
-  }
-  // A list literal's items and a spread's source are value positions like a call's
-  // arguments, so a callback under `[...p.filter(f)]` is pinned too (D2334).
-  if n is ArrayLit {
-    const es: i32[] = []
-    let echanged = false
-    let ei = 0
-    while ei < n.arrElems.length {
-      const ce = monoPinMapLambdas(n.arrElems[ei], pNames, pElems, pElemTys)
-      es.push(ce)
-      if ce != n.arrElems[ei] { echanged = true }
-      ei = ei + 1
+    RetStmt => {
+      const ca = monoPinMapLambdas(n.retArg, pNames, pElems, pElemTys)
+      if ca == n.retArg { return ix }
+      return mkReturn(ca, n.pos)
     }
-    if !echanged { return ix }
-    return monoRemakeListLitTpl(ix, es, n.pos)
-  }
-  if n is Spread {
-    const sa = monoPinMapLambdas(n.spdArg, pNames, pElems, pElemTys)
-    if sa == n.spdArg { return ix }
-    return mkSpread(sa, n.pos)
-  }
-  if n is Call {
-    let newCallee = n.callFn
-    const callee = P.nodes[n.callFn]
-    // A `<paramRecv>.map/.filter(<lambda>)` over a concrete non-i32 element: pin the callback.
-    if callee is Member {
-      const recvNew = monoPinMapLambdas(callee.memObj, pNames, pElems, pElemTys)
-      if recvNew != callee.memObj {
-        newCallee = mkMember(recvNew, callee.memProp, callee.pos)
+    LetDecl => {
+      const ci = monoPinMapLambdas(n.letInit, pNames, pElems, pElemTys)
+      if ci == n.letInit { return ix }
+      return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
+    }
+    WhileStmt => {
+      const cb = monoPinMapLambdas(n.whileBody, pNames, pElems, pElemTys)
+      if cb == n.whileBody { return ix }
+      return mkWhileAs(n, n.whileCond, cb)
+    }
+    IfStmt => {
+      // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+      const links = monoIfChainLinks(ix)
+      const ccs: i32[] = []
+      const cts: i32[] = []
+      let k = 0
+      while k < links.length {
+        const c = P.nodes[links[k]]
+        if c is IfStmt {
+          ccs.push(c.ifCond)
+          cts.push(monoPinMapLambdas(c.ifThen, pNames, pElems, pElemTys))
+        }
+        k = k + 1
       }
-      if callee.memProp == "map" || callee.memProp == "filter" {
-        if n.callArgs.length == 1 {
-          const elemTyOut: i32[] = []
-          let elem = monoRecvParamElem(
-            callee.memObj,
-            pNames,
-            pElems,
-            pElemTys,
-            elemTyOut,
-          )
-          let elemTy = -1
-          if elemTyOut.length > 0 { elemTy = elemTyOut[0] }
-          const armEl = monoFitArmElem(callee.memObj, elemTy)
-          const armName = monoFitArmElemName(armEl)
-          if armName != "" {
-            elem = armName
-            elemTy = armEl
-          }
-          if elem != "" && elem != "i32" {
-            const cloned = monoCloneLambdaPinned(n.callArgs[0], elem, elemTy)
-            if cloned >= 0 {
-              const oneArg: i32[] = [cloned]
-              return monoRemintCallTpl(ix, newCallee, oneArg)
+      return monoIfChainRebuild(
+        links,
+        ccs,
+        cts,
+        monoPinMapLambdas(monoIfChainElse(links), pNames, pElems, pElemTys),
+      )
+    }
+    ForRange => {
+      const cb = monoPinMapLambdas(n.frBody, pNames, pElems, pElemTys)
+      if cb == n.frBody { return ix }
+      return mkForRange(
+        n.frVar,
+        n.frFrom,
+        n.frTo,
+        n.frStep,
+        n.frExcl,
+        cb,
+        n.frLabel,
+        n.pos,
+      )
+    }
+    ForIn => {
+      const cb = monoPinMapLambdas(n.fiBody, pNames, pElems, pElemTys)
+      if cb == n.fiBody { return ix }
+      return mkForIn(n.fiVar, n.fiVar2, n.fiIter, cb, n.fiLabel, n.pos)
+    }
+    Paren => {
+      const ci = monoPinMapLambdas(n.parInner, pNames, pElems, pElemTys)
+      if ci == n.parInner { return ix }
+      return mkParen(ci, n.pos)
+    }
+    // A list literal's items and a spread's source are value positions like a call's
+    // arguments, so a callback under `[...p.filter(f)]` is pinned too (D2334).
+    ArrayLit => {
+      const es: i32[] = []
+      let echanged = false
+      let ei = 0
+      while ei < n.arrElems.length {
+        const ce = monoPinMapLambdas(n.arrElems[ei], pNames, pElems, pElemTys)
+        es.push(ce)
+        if ce != n.arrElems[ei] { echanged = true }
+        ei = ei + 1
+      }
+      if !echanged { return ix }
+      return monoRemakeListLitTpl(ix, es, n.pos)
+    }
+    Spread => {
+      const sa = monoPinMapLambdas(n.spdArg, pNames, pElems, pElemTys)
+      if sa == n.spdArg { return ix }
+      return mkSpread(sa, n.pos)
+    }
+    Call => {
+      if n.callFn < 0 { return ix }
+      let newCallee = n.callFn
+      const callee = P.nodes[n.callFn]
+      // A `<paramRecv>.map/.filter(<lambda>)` over a concrete non-i32 element: pin the callback.
+      if callee is Member {
+        const recvNew = monoPinMapLambdas(
+          callee.memObj,
+          pNames,
+          pElems,
+          pElemTys,
+        )
+        if recvNew != callee.memObj {
+          newCallee = mkMember(recvNew, callee.memProp, callee.pos)
+        }
+        if callee.memProp == "map" || callee.memProp == "filter" {
+          if n.callArgs.length == 1 {
+            const elemTyOut: i32[] = []
+            let elem = monoRecvParamElem(
+              callee.memObj,
+              pNames,
+              pElems,
+              pElemTys,
+              elemTyOut,
+            )
+            let elemTy = -1
+            if elemTyOut.length > 0 { elemTy = elemTyOut[0] }
+            const armEl = monoFitArmElem(callee.memObj, elemTy)
+            const armName = monoFitArmElemName(armEl)
+            if armName != "" {
+              elem = armName
+              elemTy = armEl
+            }
+            if elem != "" && elem != "i32" {
+              const cloned = monoCloneLambdaPinned(n.callArgs[0], elem, elemTy)
+              if cloned >= 0 {
+                const oneArg: i32[] = [cloned]
+                return monoRemintCallTpl(ix, newCallee, oneArg)
+              }
             }
           }
         }
       }
+      const nargs: i32[] = []
+      let changed = newCallee != n.callFn
+      let ai = 0
+      while ai < n.callArgs.length {
+        const cca = monoPinMapLambdas(n.callArgs[ai], pNames, pElems, pElemTys)
+        nargs.push(cca)
+        if cca != n.callArgs[ai] { changed = true }
+        ai = ai + 1
+      }
+      if !changed { return ix }
+      return monoRemintCallTpl(ix, newCallee, nargs)
     }
-    const nargs: i32[] = []
-    let changed = newCallee != n.callFn
-    let ai = 0
-    while ai < n.callArgs.length {
-      const cca = monoPinMapLambdas(n.callArgs[ai], pNames, pElems, pElemTys)
-      nargs.push(cca)
-      if cca != n.callArgs[ai] { changed = true }
-      ai = ai + 1
-    }
-    if !changed { return ix }
-    return monoRemintCallTpl(ix, newCallee, nargs)
+    // every other kind is shared as it is: this pass does not descend into it
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl => {}
   }
   ix
 }
@@ -6098,35 +6143,48 @@ function monoListSrcParam(blockIx: i32, retName: string) {
 
 function monoListSrcParamStmt(ix: i32, retName: string) {
   const s = P.nodes[ix]
-  if s is Block { return monoListSrcParam(ix, retName) }
-  if s is WhileStmt { return monoListSrcParam(s.whileBody, retName) }
-  if s is ForRange { return monoListSrcParam(s.frBody, retName) }
-  if s is ForIn { return monoListSrcParam(s.fiBody, retName) }
-  if s is IfStmt {
-    const rt = monoListSrcParam(s.ifThen, retName)
-    if rt != "" { return rt }
-    if s.ifElse >= 0 { return monoListSrcParamStmt(s.ifElse, retName) }
-    return ""
-  }
-  // A `<retName>.push(<param>[<idx>])` statement: the param is the list's element source.
-  if s is Call {
-    const callee = P.nodes[s.callFn]
-    if callee is Member {
-      if callee.memProp == "push" {
-        const recv = P.nodes[callee.memObj]
-        if recv is Ident {
-          if recv.identName == retName {
-            if s.callArgs.length == 1 {
-              const arg = P.nodes[s.callArgs[0]]
-              if arg is Index {
-                const ia = P.nodes[arg.idxArr]
-                if ia is Ident { return ia.identName }
+  match s {
+    Block => {
+      return monoListSrcParam(ix, retName)
+    }
+    WhileStmt => {
+      return monoListSrcParam(s.whileBody, retName)
+    }
+    ForRange => {
+      return monoListSrcParam(s.frBody, retName)
+    }
+    ForIn => {
+      return monoListSrcParam(s.fiBody, retName)
+    }
+    IfStmt => {
+      const rt = monoListSrcParam(s.ifThen, retName)
+      if rt != "" { return rt }
+      if s.ifElse >= 0 { return monoListSrcParamStmt(s.ifElse, retName) }
+      return ""
+    }
+    Call => {
+      // A `<retName>.push(<param>[<idx>])` statement: the param is the list's element source.
+      if s.callFn < 0 { return "" }
+      const callee = P.nodes[s.callFn]
+      if callee is Member {
+        if callee.memProp == "push" {
+          const recv = P.nodes[callee.memObj]
+          if recv is Ident {
+            if recv.identName == retName {
+              if s.callArgs.length == 1 {
+                const arg = P.nodes[s.callArgs[0]]
+                if arg is Index {
+                  const ia = P.nodes[arg.idxArr]
+                  if ia is Ident { return ia.identName }
+                }
               }
             }
           }
         }
       }
     }
+    // no other statement holds a push into the list
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
   ""
 }
@@ -6143,142 +6201,154 @@ function monoBakeCallback(
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Block {
-    const ns: i32[] = []
-    let changed = false
-    let i = 0
-    while i < n.blkStmts.length {
-      const cs = monoBakeCallback(
-        n.blkStmts[i],
+  match n {
+    Block => {
+      const ns: i32[] = []
+      let changed = false
+      let i = 0
+      while i < n.blkStmts.length {
+        const cs = monoBakeCallback(
+          n.blkStmts[i],
+          cbParamNames,
+          cbFnNames,
+          fnDeclIx,
+        )
+        ns.push(cs)
+        if cs != n.blkStmts[i] { changed = true }
+        i = i + 1
+      }
+      if !changed { return ix }
+      return mkBlock(ns, n.pos)
+    }
+    RetStmt => {
+      const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames, fnDeclIx)
+      if ca == n.retArg { return ix }
+      return mkReturn(ca, n.pos)
+    }
+    LetDecl => {
+      const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames, fnDeclIx)
+      if ci == n.letInit { return ix }
+      return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
+    }
+    WhileStmt => {
+      const cb = monoBakeCallback(
+        n.whileBody,
         cbParamNames,
         cbFnNames,
         fnDeclIx,
       )
-      ns.push(cs)
-      if cs != n.blkStmts[i] { changed = true }
-      i = i + 1
+      if cb == n.whileBody { return ix }
+      return mkWhileAs(n, n.whileCond, cb)
     }
-    if !changed { return ix }
-    return mkBlock(ns, n.pos)
-  }
-  if n is RetStmt {
-    const ca = monoBakeCallback(n.retArg, cbParamNames, cbFnNames, fnDeclIx)
-    if ca == n.retArg { return ix }
-    return mkReturn(ca, n.pos)
-  }
-  if n is LetDecl {
-    const ci = monoBakeCallback(n.letInit, cbParamNames, cbFnNames, fnDeclIx)
-    if ci == n.letInit { return ix }
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
-  }
-  if n is WhileStmt {
-    const cb = monoBakeCallback(n.whileBody, cbParamNames, cbFnNames, fnDeclIx)
-    if cb == n.whileBody { return ix }
-    return mkWhileAs(n, n.whileCond, cb)
-  }
-  if n is IfStmt {
-    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
-    const links = monoIfChainLinks(ix)
-    const ccs: i32[] = []
-    const cts: i32[] = []
-    let k = 0
-    while k < links.length {
-      const c = P.nodes[links[k]]
-      if c is IfStmt {
-        ccs.push(c.ifCond)
-        cts.push(monoBakeCallback(c.ifThen, cbParamNames, cbFnNames, fnDeclIx))
+    IfStmt => {
+      // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+      const links = monoIfChainLinks(ix)
+      const ccs: i32[] = []
+      const cts: i32[] = []
+      let k = 0
+      while k < links.length {
+        const c = P.nodes[links[k]]
+        if c is IfStmt {
+          ccs.push(c.ifCond)
+          cts.push(
+            monoBakeCallback(c.ifThen, cbParamNames, cbFnNames, fnDeclIx),
+          )
+        }
+        k = k + 1
       }
-      k = k + 1
+      return monoIfChainRebuild(
+        links,
+        ccs,
+        cts,
+        monoBakeCallback(
+          monoIfChainElse(links),
+          cbParamNames,
+          cbFnNames,
+          fnDeclIx,
+        ),
+      )
     }
-    return monoIfChainRebuild(
-      links,
-      ccs,
-      cts,
-      monoBakeCallback(
-        monoIfChainElse(links),
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-      ),
-    )
-  }
-  if n is ForRange {
-    const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames, fnDeclIx)
-    if cb == n.frBody { return ix }
-    return mkForRange(
-      n.frVar,
-      n.frFrom,
-      n.frTo,
-      n.frStep,
-      n.frExcl,
-      cb,
-      n.frLabel,
-      n.pos,
-    )
-  }
-  if n is ForIn {
-    const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames, fnDeclIx)
-    if cb == n.fiBody { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, n.fiIter, cb, n.fiLabel, n.pos)
-  }
-  if n is Paren {
-    const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames, fnDeclIx)
-    if ci == n.parInner { return ix }
-    const np = mkParen(ci, n.pos)
-    nodeTyCarry(np, ix)
-    return np
-  }
-  if n is Call {
-    // A call whose callee names a specialized closure param `f(...)` → direct call `cbFn(...)`;
-    // its arguments may themselves contain such calls, so recurse there too. Skipped when a
-    // block still open here shadows the param's name with a different value (D2325).
-    let newCallee = n.callFn
-    const callee = P.nodes[n.callFn]
-    if callee is Ident {
-      if (
-        !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
-        && monoReadsOwnParam(fnDeclIx, callee.identName, n.callFn)
-      ) {
-        let bk = 0
-        while bk < cbParamNames.length {
-          if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
-            newCallee = mkIdent(cbFnNames[bk], callee.pos)
-            identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
+    ForRange => {
+      const cb = monoBakeCallback(n.frBody, cbParamNames, cbFnNames, fnDeclIx)
+      if cb == n.frBody { return ix }
+      return mkForRange(
+        n.frVar,
+        n.frFrom,
+        n.frTo,
+        n.frStep,
+        n.frExcl,
+        cb,
+        n.frLabel,
+        n.pos,
+      )
+    }
+    ForIn => {
+      const cb = monoBakeCallback(n.fiBody, cbParamNames, cbFnNames, fnDeclIx)
+      if cb == n.fiBody { return ix }
+      return mkForIn(n.fiVar, n.fiVar2, n.fiIter, cb, n.fiLabel, n.pos)
+    }
+    Paren => {
+      const ci = monoBakeCallback(n.parInner, cbParamNames, cbFnNames, fnDeclIx)
+      if ci == n.parInner { return ix }
+      const np = mkParen(ci, n.pos)
+      nodeTyCarry(np, ix)
+      return np
+    }
+    Call => {
+      // A call whose callee names a specialized closure param `f(...)` → direct call `cbFn(...)`;
+      // its arguments may themselves contain such calls, so recurse there too. Skipped when a
+      // block still open here shadows the param's name with a different value (D2325).
+      let newCallee = n.callFn
+      if n.callFn < 0 { return ix }
+      const callee = P.nodes[n.callFn]
+      if callee is Ident {
+        if (
+          !fnBlockShadowsAt(fnDeclIx, sidOfNode(n.callFn), n.callFn)
+          && monoReadsOwnParam(fnDeclIx, callee.identName, n.callFn)
+        ) {
+          let bk = 0
+          while bk < cbParamNames.length {
+            if cbFnNames[bk] != "" && callee.identName == cbParamNames[bk] {
+              newCallee = mkIdent(cbFnNames[bk], callee.pos)
+              identFromDecl(newCallee, monoFnDeclNamed(cbFnNames[bk]))
+            }
+            bk = bk + 1
           }
-          bk = bk + 1
         }
       }
+      const nargs: i32[] = []
+      let changed = newCallee != n.callFn
+      let ai = 0
+      while ai < n.callArgs.length {
+        const cca = monoBakeCallback(
+          n.callArgs[ai],
+          cbParamNames,
+          cbFnNames,
+          fnDeclIx,
+        )
+        nargs.push(cca)
+        if cca != n.callArgs[ai] { changed = true }
+        ai = ai + 1
+      }
+      if !changed { return ix }
+      return monoRemintCallTpl(ix, newCallee, nargs)
     }
-    const nargs: i32[] = []
-    let changed = newCallee != n.callFn
-    let ai = 0
-    while ai < n.callArgs.length {
-      const cca = monoBakeCallback(
-        n.callArgs[ai],
-        cbParamNames,
-        cbFnNames,
-        fnDeclIx,
-      )
-      nargs.push(cca)
-      if cca != n.callArgs[ai] { changed = true }
-      ai = ai + 1
+    BinExpr => {
+      // Descend into a plain assignment or arithmetic node (`acc = f(acc, x)`, the
+      // reduce/fold shape). A compound-assignment node is left intact — rebuilding it
+      // through `mkBinary` would drop its surface tag, and its call stays a `call_ref`.
+      // The copy answers the template's type, which a `??` reads its niche off (D7452).
+      if n.binCompound != "" { return ix }
+      const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames, fnDeclIx)
+      const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames, fnDeclIx)
+      if cl == n.binLeft && cr == n.binRight { return ix }
+      const nb = mkBinary(n.binOp, cl, cr, n.pos)
+      nodeTyCarry(nb, ix)
+      if n.binRegion != 0 { markArithRegion(nb) }
+      return nb
     }
-    if !changed { return ix }
-    return monoRemintCallTpl(ix, newCallee, nargs)
-  }
-  if n is BinExpr {
-    // Descend into a plain assignment or arithmetic node (`acc = f(acc, x)`, the
-    // reduce/fold shape). A compound-assignment node is left intact — rebuilding it
-    // through `mkBinary` would drop its surface tag, and its call stays a `call_ref`.
-    // The copy answers the template's type, which a `??` reads its niche off (D7452).
-    if n.binCompound != "" { return ix }
-    const cl = monoBakeCallback(n.binLeft, cbParamNames, cbFnNames, fnDeclIx)
-    const cr = monoBakeCallback(n.binRight, cbParamNames, cbFnNames, fnDeclIx)
-    if cl == n.binLeft && cr == n.binRight { return ix }
-    const nb = mkBinary(n.binOp, cl, cr, n.pos)
-    nodeTyCarry(nb, ix)
-    if n.binRegion != 0 { markArithRegion(nb) }
-    return nb
+    // every other kind is shared as it is: a callback call under it stays a `call_ref`
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | Member | OptMember | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | MatchExpr | ImportDecl | Spread => {}
   }
   ix
 }
@@ -6464,7 +6534,7 @@ function monoNameOnlyCalled(ix: i32, name: string, inLam: boolean): boolean {
   const n = P.nodes[ix]
   if n is Ident { return n.identName != name }
   let skip = -1
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cal = P.nodes[n.callFn]
     if cal is Ident {
       if cal.identName == name {
@@ -6928,6 +6998,11 @@ function monoShadowRenameDecl(d: i32, inner: i32, name: string): i32 {
     if monoShAliasSlot[k] == d && monoShAliasName[k] == name { return 0 }
     k = k + 1
   }
+  if d < 0 || d >= fnStmts.length || inner < 0 || inner >= fnStmts.length {
+    return emitFail(
+      "emitProgram: monomorphize: shadow rename names no function slot",
+    )
+  }
   const own = monoTyParamRows(fnStmts[d], name)
   const theirs = monoTyParamRows(fnStmts[inner], name)
   for r in own {
@@ -7361,7 +7436,7 @@ function monoTyParamCallReaches(
 ): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
   const n = P.nodes[ix]
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cf = P.nodes[n.callFn]
     if cf is Ident {
       const fe = fnIndexOf(cf.identName)
@@ -7584,7 +7659,7 @@ function monoRetReachesClash(
     if n.binOp == "??" { return monoCoalDefaultClashesPin(n, b) }
     return false
   }
-  if !(n is Call) { return false }
+  if !(n is Call) || n.callFn < 0 { return false }
   const c = P.nodes[n.callFn]
   if !(c is Ident) { return false }
   if !monoCalleeIsGeneric(n.callFn) { return false }
@@ -7595,6 +7670,7 @@ function monoRetReachesClash(
   if !(f is FuncDecl) { return false }
   const rets: i32[] = []
   collectValuedReturns(f.fnBody, rets)
+  if f.fnBody < 0 { return false }
   const body = P.nodes[f.fnBody]
   if body is Block {
     if body.blkStmts.length > 0 {
@@ -7659,6 +7735,7 @@ function monoCopyCellRead(ix: i32): i32 {
 // Returns `ix` when nothing changed and the call carries no type arguments.
 function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
   let newCallee = n.callFn
+  if n.callFn < 0 { return ix }
   const callee = P.nodes[n.callFn]
   let lamCall = false
   let cellCall = false
@@ -7717,162 +7794,172 @@ function monoCloneGenericCallArm(ix: i32, n: Call): i32 {
 function monoCloneGenericCallsRaw(ix: i32) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Call { return monoCloneGenericCallArm(ix, n) }
-  if n is Block {
-    const ns: i32[] = []
-    let bchanged = false
-    let i = 0
-    while i < n.blkStmts.length {
-      const cs = monoCloneGenericCalls(n.blkStmts[i])
-      ns.push(cs)
-      if cs != n.blkStmts[i] { bchanged = true }
-      i = i + 1
+  match n {
+    Call => {
+      return monoCloneGenericCallArm(ix, n)
     }
-    if !bchanged { return ix }
-    return mkBlock(ns, n.pos)
-  }
-  if n is LetDecl {
-    let ci = monoCloneGenericCalls(n.letInit)
-    // The alias's read of the generic is this instance's own, renamed with its calls (D3887).
-    if (
-      ci == n.letInit
-      && n.letInit >= 0
-      && monoStrListHas(monoCgcGenAliasNames, n.letName)
-    ) {
-      const iv = P.nodes[n.letInit]
-      if iv is Ident {
-        ci = mkIdent(iv.identName, iv.pos)
-        lfNoteMinted(ci, n.letInit)
-        identFrom(ci, n.letInit)
+    Block => {
+      const ns: i32[] = []
+      let bchanged = false
+      let i = 0
+      while i < n.blkStmts.length {
+        const cs = monoCloneGenericCalls(n.blkStmts[i])
+        ns.push(cs)
+        if cs != n.blkStmts[i] { bchanged = true }
+        i = i + 1
+      }
+      if !bchanged { return ix }
+      return mkBlock(ns, n.pos)
+    }
+    LetDecl => {
+      let ci = monoCloneGenericCalls(n.letInit)
+      // The alias's read of the generic is this instance's own, renamed with its calls (D3887).
+      if (
+        ci == n.letInit
+        && n.letInit >= 0
+        && monoStrListHas(monoCgcGenAliasNames, n.letName)
+      ) {
+        const iv = P.nodes[n.letInit]
+        if iv is Ident {
+          ci = mkIdent(iv.identName, iv.pos)
+          lfNoteMinted(ci, n.letInit)
+          identFrom(ci, n.letInit)
+        }
+      }
+      if ci == n.letInit { return ix }
+      return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
+    }
+    RetStmt => {
+      const ca2 = monoCloneGenericCalls(n.retArg)
+      if ca2 == n.retArg { return ix }
+      return mkReturn(ca2, n.pos)
+    }
+    IfStmt => {
+      // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+      const links = monoIfChainLinks(ix)
+      const ccs: i32[] = []
+      const cts: i32[] = []
+      let k = 0
+      while k < links.length {
+        const c = P.nodes[links[k]]
+        if c is IfStmt {
+          ccs.push(monoCloneGenericCalls(c.ifCond))
+          cts.push(monoCloneGenericCalls(c.ifThen))
+        }
+        k = k + 1
+      }
+      return monoIfChainRebuild(
+        links,
+        ccs,
+        cts,
+        monoCloneGenericCalls(monoIfChainElse(links)),
+      )
+    }
+    WhileStmt => {
+      const wc = monoCloneGenericCalls(n.whileCond)
+      const wb = monoCloneGenericCalls(n.whileBody)
+      if wc == n.whileCond && wb == n.whileBody { return ix }
+      return mkWhileAs(n, wc, wb)
+    }
+    ForRange => {
+      const ff = monoCloneGenericCalls(n.frFrom)
+      const ft = monoCloneGenericCalls(n.frTo)
+      const fs = monoCloneGenericCalls(n.frStep)
+      const fb = monoCloneGenericCalls(n.frBody)
+      if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
+        return ix
+      }
+      return mkForRange(n.frVar, ff, ft, fs, n.frExcl, fb, n.frLabel, n.pos)
+    }
+    ForIn => {
+      const fi = monoCloneGenericCalls(n.fiIter)
+      const fbi = monoCloneGenericCalls(n.fiBody)
+      if fi == n.fiIter && fbi == n.fiBody { return ix }
+      return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
+    }
+    BinExpr => {
+      return monoCloneGenericBinArm(ix, n)
+    }
+    Unary => {
+      // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is the
+      // mutated target — left whole for the compound form's reason. Nothing to clone in it
+      // either way: the parser accepts only an identifier there, and an `Ident` holds no call.
+      if n.unOp == "p+" || n.unOp == "p-" { return ix }
+      const ua = monoCloneGenericCalls(n.unArg)
+      if ua == n.unArg { return ix }
+      return mkUnary(n.unOp, ua, n.pos)
+    }
+    Paren => {
+      const pi = monoCloneGenericCalls(n.parInner)
+      if pi == n.parInner { return ix }
+      return mkParen(pi, n.pos)
+    }
+    Member => {
+      const mo = monoCloneGenericCalls(n.memObj)
+      if mo == n.memObj { return ix }
+      return mkMember(mo, n.memProp, n.pos)
+    }
+    OptMember => {
+      const oo = monoCloneGenericCalls(n.omObj)
+      if oo == n.omObj { return ix }
+      return mkOptMember(oo, n.omProp, n.omDot, n.pos)
+    }
+    Index => {
+      const xa = monoCloneGenericCalls(n.idxArr)
+      const xi = monoCloneGenericCalls(n.idxIndex)
+      if xa == n.idxArr && xi == n.idxIndex { return ix }
+      return mkIndex(xa, xi, n.pos)
+    }
+    IsExpr => {
+      const io = monoCloneGenericCalls(n.isObj)
+      if io == n.isObj { return ix }
+      return monoReIsExpr(ix, io)
+    }
+    AsExpr => {
+      const ao = monoCloneGenericCalls(n.asObj)
+      if ao == n.asObj { return ix }
+      return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      const sa = monoCloneGenericCalls(n.spdArg)
+      if sa == n.spdArg { return ix }
+      return mkSpread(sa, n.pos)
+    }
+    ArrayLit => {
+      const es: i32[] = []
+      let echanged = false
+      let ei = 0
+      while ei < n.arrElems.length {
+        const ce = monoCloneGenericCalls(n.arrElems[ei])
+        es.push(ce)
+        if ce != n.arrElems[ei] { echanged = true }
+        ei = ei + 1
+      }
+      if !echanged { return ix }
+      return monoCopyOf(ix, mkArrayLit(es, n.pos))
+    }
+    ObjLit => {
+      return monoCloneGenericObjArm(ix, n)
+    }
+    // A generic function read as a value (a list element, a field, a binding) is renamed to
+    // its instance per enclosing instance, so it gets its own node, typed at this instance (D3909).
+    Ident => {
+      if (
+        monoCalleeIsGeneric(ix)
+        || monoStrListHas(monoCgcGenAliasNames, n.identName)
+        || monoStrListHas(monoCgcLamNames, n.identName)
+      ) {
+        const vi = mkIdent(n.identName, n.pos)
+        lfNoteMinted(vi, ix)
+        identFrom(vi, ix)
+        const vt = monoLamCallTy(nodeTyIxOf(ix))
+        if vt >= 0 { nodeTyRecord(vi, vt) }
+        return vi
       }
     }
-    if ci == n.letInit { return ix }
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
-  }
-  if n is RetStmt {
-    const ca2 = monoCloneGenericCalls(n.retArg)
-    if ca2 == n.retArg { return ix }
-    return mkReturn(ca2, n.pos)
-  }
-  if n is IfStmt {
-    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
-    const links = monoIfChainLinks(ix)
-    const ccs: i32[] = []
-    const cts: i32[] = []
-    let k = 0
-    while k < links.length {
-      const c = P.nodes[links[k]]
-      if c is IfStmt {
-        ccs.push(monoCloneGenericCalls(c.ifCond))
-        cts.push(monoCloneGenericCalls(c.ifThen))
-      }
-      k = k + 1
-    }
-    return monoIfChainRebuild(
-      links,
-      ccs,
-      cts,
-      monoCloneGenericCalls(monoIfChainElse(links)),
-    )
-  }
-  if n is WhileStmt {
-    const wc = monoCloneGenericCalls(n.whileCond)
-    const wb = monoCloneGenericCalls(n.whileBody)
-    if wc == n.whileCond && wb == n.whileBody { return ix }
-    return mkWhileAs(n, wc, wb)
-  }
-  if n is ForRange {
-    const ff = monoCloneGenericCalls(n.frFrom)
-    const ft = monoCloneGenericCalls(n.frTo)
-    const fs = monoCloneGenericCalls(n.frStep)
-    const fb = monoCloneGenericCalls(n.frBody)
-    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
-      return ix
-    }
-    return mkForRange(n.frVar, ff, ft, fs, n.frExcl, fb, n.frLabel, n.pos)
-  }
-  if n is ForIn {
-    const fi = monoCloneGenericCalls(n.fiIter)
-    const fbi = monoCloneGenericCalls(n.fiBody)
-    if fi == n.fiIter && fbi == n.fiBody { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
-  }
-  if n is BinExpr { return monoCloneGenericBinArm(ix, n) }
-  if n is Unary {
-    // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is the
-    // mutated target — left whole for the compound form's reason. Nothing to clone in it
-    // either way: the parser accepts only an identifier there, and an `Ident` holds no call.
-    if n.unOp == "p+" || n.unOp == "p-" { return ix }
-    const ua = monoCloneGenericCalls(n.unArg)
-    if ua == n.unArg { return ix }
-    return mkUnary(n.unOp, ua, n.pos)
-  }
-  if n is Paren {
-    const pi = monoCloneGenericCalls(n.parInner)
-    if pi == n.parInner { return ix }
-    return mkParen(pi, n.pos)
-  }
-  if n is Member {
-    const mo = monoCloneGenericCalls(n.memObj)
-    if mo == n.memObj { return ix }
-    return mkMember(mo, n.memProp, n.pos)
-  }
-  if n is OptMember {
-    const oo = monoCloneGenericCalls(n.omObj)
-    if oo == n.omObj { return ix }
-    return mkOptMember(oo, n.omProp, n.omDot, n.pos)
-  }
-  if n is Index {
-    const xa = monoCloneGenericCalls(n.idxArr)
-    const xi = monoCloneGenericCalls(n.idxIndex)
-    if xa == n.idxArr && xi == n.idxIndex { return ix }
-    return mkIndex(xa, xi, n.pos)
-  }
-  if n is IsExpr {
-    const io = monoCloneGenericCalls(n.isObj)
-    if io == n.isObj { return ix }
-    return monoReIsExpr(ix, io)
-  }
-  if n is AsExpr {
-    const ao = monoCloneGenericCalls(n.asObj)
-    if ao == n.asObj { return ix }
-    return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread {
-    const sa = monoCloneGenericCalls(n.spdArg)
-    if sa == n.spdArg { return ix }
-    return mkSpread(sa, n.pos)
-  }
-  if n is ArrayLit {
-    const es: i32[] = []
-    let echanged = false
-    let ei = 0
-    while ei < n.arrElems.length {
-      const ce = monoCloneGenericCalls(n.arrElems[ei])
-      es.push(ce)
-      if ce != n.arrElems[ei] { echanged = true }
-      ei = ei + 1
-    }
-    if !echanged { return ix }
-    return monoCopyOf(ix, mkArrayLit(es, n.pos))
-  }
-  if n is ObjLit { return monoCloneGenericObjArm(ix, n) }
-  // A generic function read as a value (a list element, a field, a binding) is renamed to
-  // its instance per enclosing instance, so it gets its own node, typed at this instance (D3909).
-  if n is Ident {
-    if (
-      monoCalleeIsGeneric(ix)
-      || monoStrListHas(monoCgcGenAliasNames, n.identName)
-      || monoStrListHas(monoCgcLamNames, n.identName)
-    ) {
-      const vi = mkIdent(n.identName, n.pos)
-      lfNoteMinted(vi, ix)
-      identFrom(vi, ix)
-      const vt = monoLamCallTy(nodeTyIxOf(ix))
-      if vt >= 0 { nodeTyRecord(vi, vt) }
-      return vi
-    }
+    // every other kind is shared as it is: no generic call under it is cloned here
+    NumLit | StrLit | CharLit | BoolLit | NullLit | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   ix
 }
@@ -8165,10 +8252,12 @@ function monoPinCall(ix: i32, n: Call, pNames: string[], pTys: i32[]): i32 {
     if ca2 != n.callArgs[ai] { changed = true }
     ai = ai + 1
   }
-  const pcallee = P.nodes[n.callFn]
-  if pcallee is Member {
-    const mc = monoPinMemberCall(ix, n, pcallee, nargs, pNames, pTys)
-    if mc >= 0 { return mc }
+  if n.callFn >= 0 {
+    const pcallee = P.nodes[n.callFn]
+    if pcallee is Member {
+      const mc = monoPinMemberCall(ix, n, pcallee, nargs, pNames, pTys)
+      if mc >= 0 { return mc }
+    }
   }
   if !changed { return ix }
   monoRemintCallTpl(ix, cf, nargs)
@@ -8181,148 +8270,158 @@ function monoPinCall(ix: i32, n: Call, pNames: string[], pTys: i32[]): i32 {
 function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is BinExpr { return monoPinBin(ix, n, pNames, pTys) }
-  if n is Block { return monoPinBlock(ix, n, pNames, pTys) }
-  if n is LetDecl {
-    const ci = monoPinBinOps(n.letInit, pNames, pTys)
-    if ci == n.letInit { return ix }
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
-  }
-  if n is RetStmt {
-    const ca = monoPinBinOps(n.retArg, pNames, pTys)
-    if ca == n.retArg { return ix }
-    return mkReturn(ca, n.pos)
-  }
-  if n is IfStmt {
-    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
-    const links = monoIfChainLinks(ix)
-    const ccs: i32[] = []
-    const cts: i32[] = []
-    let k = 0
-    while k < links.length {
-      const c = P.nodes[links[k]]
-      if c is IfStmt {
-        ccs.push(monoPinBinOps(c.ifCond, pNames, pTys))
-        cts.push(monoPinBinOps(c.ifThen, pNames, pTys))
-      }
-      k = k + 1
+  match n {
+    BinExpr => {
+      return monoPinBin(ix, n, pNames, pTys)
     }
-    return monoIfChainRebuild(
-      links,
-      ccs,
-      cts,
-      monoPinBinOps(monoIfChainElse(links), pNames, pTys),
-    )
-  }
-  if n is WhileStmt {
-    const wc = monoPinBinOps(n.whileCond, pNames, pTys)
-    const wb = monoPinBinOps(n.whileBody, pNames, pTys)
-    if wc == n.whileCond && wb == n.whileBody { return ix }
-    return mkWhileAs(n, wc, wb)
-  }
-  if n is ForRange {
-    const ff = monoPinBinOps(n.frFrom, pNames, pTys)
-    const ft = monoPinBinOps(n.frTo, pNames, pTys)
-    const fs = monoPinBinOps(n.frStep, pNames, pTys)
-    const frN: string[] = []
-    const frT: i32[] = []
-    monoPinDrop(n.frVar, pNames, pTys, frN, frT)
-    const fb = monoPinBinOps(n.frBody, frN, frT)
-    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
-      return ix
+    Block => {
+      return monoPinBlock(ix, n, pNames, pTys)
     }
-    return mkForRange(n.frVar, ff, ft, fs, n.frExcl, fb, n.frLabel, n.pos)
-  }
-  if n is ForIn {
-    const fi = monoPinBinOps(n.fiIter, pNames, pTys)
-    const fiN: string[] = []
-    const fiT: i32[] = []
-    monoPinDrop(n.fiVar, pNames, pTys, fiN, fiT)
-    const fi2N: string[] = []
-    const fi2T: i32[] = []
-    monoPinDrop(n.fiVar2, fiN, fiT, fi2N, fi2T)
-    const fbi = monoPinBinOps(n.fiBody, fi2N, fi2T)
-    if fi == n.fiIter && fbi == n.fiBody { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
-  }
-  if n is Call { return monoPinCall(ix, n, pNames, pTys) }
-  if n is Unary {
-    // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is the
-    // mutated target — left whole for the compound form's reason.
-    if n.unOp == "p+" || n.unOp == "p-" { return ix }
-    const ua = monoPinBinOps(n.unArg, pNames, pTys)
-    if ua == n.unArg { return ix }
-    return mkUnary(n.unOp, ua, n.pos)
-  }
-  if n is Paren {
-    const pi = monoPinBinOps(n.parInner, pNames, pTys)
-    if pi == n.parInner { return ix }
-    return mkParen(pi, n.pos)
-  }
-  if n is Member {
-    const mo = monoPinBinOps(n.memObj, pNames, pTys)
-    if mo == n.memObj { return ix }
-    return mkMember(mo, n.memProp, n.pos)
-  }
-  if n is OptMember {
-    const oo = monoPinBinOps(n.omObj, pNames, pTys)
-    if oo == n.omObj { return ix }
-    return mkOptMember(oo, n.omProp, n.omDot, n.pos)
-  }
-  if n is Index {
-    const ia = monoPinBinOps(n.idxArr, pNames, pTys)
-    const ii = monoPinBinOps(n.idxIndex, pNames, pTys)
-    if ia == n.idxArr && ii == n.idxIndex { return ix }
-    return mkIndex(ia, ii, n.pos)
-  }
-  if n is IsExpr {
-    const io = monoPinBinOps(n.isObj, pNames, pTys)
-    if io == n.isObj { return ix }
-    return monoReIsExpr(ix, io)
-  }
-  if n is AsExpr {
-    const ao = monoPinBinOps(n.asObj, pNames, pTys)
-    if ao == n.asObj { return ix }
-    return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread {
-    const sa = monoPinBinOps(n.spdArg, pNames, pTys)
-    if sa == n.spdArg { return ix }
-    return mkSpread(sa, n.pos)
-  }
-  if n is ArrayLit {
-    const es: i32[] = []
-    let echanged = false
-    let ei = 0
-    while ei < n.arrElems.length {
-      const ce = monoPinBinOps(n.arrElems[ei], pNames, pTys)
-      es.push(ce)
-      if ce != n.arrElems[ei] { echanged = true }
-      ei = ei + 1
+    LetDecl => {
+      const ci = monoPinBinOps(n.letInit, pNames, pTys)
+      if ci == n.letInit { return ix }
+      return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
     }
-    if !echanged { return ix }
-    return monoRemakeListLitTpl(ix, es, n.pos)
-  }
-  if n is ObjLit {
-    const fl: i32[] = []
-    let ochanged = false
-    let oi = 0
-    while oi < n.objFields.length {
-      let nf = n.objFields[oi]
-      const f = P.nodes[nf]
-      if f is FieldInit {
-        const cv = monoPinBinOps(f.fiValue, pNames, pTys)
-        if cv != f.fiValue {
-          nf = mkFieldInit(f.fiName, cv, f.pos)
-          ochanged = true
+    RetStmt => {
+      const ca = monoPinBinOps(n.retArg, pNames, pTys)
+      if ca == n.retArg { return ix }
+      return mkReturn(ca, n.pos)
+    }
+    IfStmt => {
+      // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+      const links = monoIfChainLinks(ix)
+      const ccs: i32[] = []
+      const cts: i32[] = []
+      let k = 0
+      while k < links.length {
+        const c = P.nodes[links[k]]
+        if c is IfStmt {
+          ccs.push(monoPinBinOps(c.ifCond, pNames, pTys))
+          cts.push(monoPinBinOps(c.ifThen, pNames, pTys))
         }
+        k = k + 1
       }
-      fl.push(nf)
-      oi = oi + 1
+      return monoIfChainRebuild(
+        links,
+        ccs,
+        cts,
+        monoPinBinOps(monoIfChainElse(links), pNames, pTys),
+      )
     }
-    if !ochanged { return ix }
-    return monoCopyOf(ix, mkObjLit(fl, n.pos))
+    WhileStmt => {
+      const wc = monoPinBinOps(n.whileCond, pNames, pTys)
+      const wb = monoPinBinOps(n.whileBody, pNames, pTys)
+      if wc == n.whileCond && wb == n.whileBody { return ix }
+      return mkWhileAs(n, wc, wb)
+    }
+    ForRange => {
+      const ff = monoPinBinOps(n.frFrom, pNames, pTys)
+      const ft = monoPinBinOps(n.frTo, pNames, pTys)
+      const fs = monoPinBinOps(n.frStep, pNames, pTys)
+      const frN: string[] = []
+      const frT: i32[] = []
+      monoPinDrop(n.frVar, pNames, pTys, frN, frT)
+      const fb = monoPinBinOps(n.frBody, frN, frT)
+      if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
+        return ix
+      }
+      return mkForRange(n.frVar, ff, ft, fs, n.frExcl, fb, n.frLabel, n.pos)
+    }
+    ForIn => {
+      const fi = monoPinBinOps(n.fiIter, pNames, pTys)
+      const fiN: string[] = []
+      const fiT: i32[] = []
+      monoPinDrop(n.fiVar, pNames, pTys, fiN, fiT)
+      const fi2N: string[] = []
+      const fi2T: i32[] = []
+      monoPinDrop(n.fiVar2, fiN, fiT, fi2N, fi2T)
+      const fbi = monoPinBinOps(n.fiBody, fi2N, fi2T)
+      if fi == n.fiIter && fbi == n.fiBody { return ix }
+      return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
+    }
+    Call => {
+      return monoPinCall(ix, n, pNames, pTys)
+    }
+    Unary => {
+      // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is the
+      // mutated target — left whole for the compound form's reason.
+      if n.unOp == "p+" || n.unOp == "p-" { return ix }
+      const ua = monoPinBinOps(n.unArg, pNames, pTys)
+      if ua == n.unArg { return ix }
+      return mkUnary(n.unOp, ua, n.pos)
+    }
+    Paren => {
+      const pi = monoPinBinOps(n.parInner, pNames, pTys)
+      if pi == n.parInner { return ix }
+      return mkParen(pi, n.pos)
+    }
+    Member => {
+      const mo = monoPinBinOps(n.memObj, pNames, pTys)
+      if mo == n.memObj { return ix }
+      return mkMember(mo, n.memProp, n.pos)
+    }
+    OptMember => {
+      const oo = monoPinBinOps(n.omObj, pNames, pTys)
+      if oo == n.omObj { return ix }
+      return mkOptMember(oo, n.omProp, n.omDot, n.pos)
+    }
+    Index => {
+      const ia = monoPinBinOps(n.idxArr, pNames, pTys)
+      const ii = monoPinBinOps(n.idxIndex, pNames, pTys)
+      if ia == n.idxArr && ii == n.idxIndex { return ix }
+      return mkIndex(ia, ii, n.pos)
+    }
+    IsExpr => {
+      const io = monoPinBinOps(n.isObj, pNames, pTys)
+      if io == n.isObj { return ix }
+      return monoReIsExpr(ix, io)
+    }
+    AsExpr => {
+      const ao = monoPinBinOps(n.asObj, pNames, pTys)
+      if ao == n.asObj { return ix }
+      return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      const sa = monoPinBinOps(n.spdArg, pNames, pTys)
+      if sa == n.spdArg { return ix }
+      return mkSpread(sa, n.pos)
+    }
+    ArrayLit => {
+      const es: i32[] = []
+      let echanged = false
+      let ei = 0
+      while ei < n.arrElems.length {
+        const ce = monoPinBinOps(n.arrElems[ei], pNames, pTys)
+        es.push(ce)
+        if ce != n.arrElems[ei] { echanged = true }
+        ei = ei + 1
+      }
+      if !echanged { return ix }
+      return monoRemakeListLitTpl(ix, es, n.pos)
+    }
+    ObjLit => {
+      const fl: i32[] = []
+      let ochanged = false
+      let oi = 0
+      while oi < n.objFields.length {
+        let nf = n.objFields[oi]
+        const f = P.nodes[nf]
+        if f is FieldInit {
+          const cv = monoPinBinOps(f.fiValue, pNames, pTys)
+          if cv != f.fiValue {
+            nf = mkFieldInit(f.fiName, cv, f.pos)
+            ochanged = true
+          }
+        }
+        fl.push(nf)
+        oi = oi + 1
+      }
+      if !ochanged { return ix }
+      return monoCopyOf(ix, mkObjLit(fl, n.pos))
+    }
+    // every other kind is shared as it is: no operator under it is pinned here
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
   ix
 }
@@ -8414,149 +8513,161 @@ function monoFoldTyParamLayout(
 ) {
   if ix < 0 { return ix }
   const n = P.nodes[ix]
-  if n is Member {
-    const mo = P.nodes[n.memObj]
-    if mo is Ident {
-      if monoTyParamOf(mo.identName, typarams) != "" {
-        return monoLayoutConstOf(ix, n, mo, tvN, tvV)
+  match n {
+    Member => {
+      const mo = P.nodes[n.memObj]
+      if mo is Ident {
+        if monoTyParamOf(mo.identName, typarams) != "" {
+          return monoLayoutConstOf(ix, n, mo, tvN, tvV)
+        }
       }
+      const mc = monoFoldTyParamLayout(n.memObj, typarams, tvN, tvV)
+      if mc == n.memObj { return ix }
+      return mkMember(mc, n.memProp, n.pos)
     }
-    const mc = monoFoldTyParamLayout(n.memObj, typarams, tvN, tvV)
-    if mc == n.memObj { return ix }
-    return mkMember(mc, n.memProp, n.pos)
-  }
-  if n is Block {
-    const ns: i32[] = []
-    let bchanged = false
-    let i = 0
-    while i < n.blkStmts.length {
-      const cs = monoFoldTyParamLayout(n.blkStmts[i], typarams, tvN, tvV)
-      ns.push(cs)
-      if cs != n.blkStmts[i] { bchanged = true }
-      i = i + 1
-    }
-    if !bchanged { return ix }
-    return mkBlock(ns, n.pos)
-  }
-  if n is LetDecl {
-    const ci = monoFoldTyParamLayout(n.letInit, typarams, tvN, tvV)
-    if ci == n.letInit { return ix }
-    return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
-  }
-  if n is RetStmt {
-    const ca = monoFoldTyParamLayout(n.retArg, typarams, tvN, tvV)
-    if ca == n.retArg { return ix }
-    return mkReturn(ca, n.pos)
-  }
-  if n is IfStmt {
-    // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
-    const links = monoIfChainLinks(ix)
-    const ccs: i32[] = []
-    const cts: i32[] = []
-    let k = 0
-    while k < links.length {
-      const c = P.nodes[links[k]]
-      if c is IfStmt {
-        ccs.push(monoFoldTyParamLayout(c.ifCond, typarams, tvN, tvV))
-        cts.push(monoFoldTyParamLayout(c.ifThen, typarams, tvN, tvV))
+    Block => {
+      const ns: i32[] = []
+      let bchanged = false
+      let i = 0
+      while i < n.blkStmts.length {
+        const cs = monoFoldTyParamLayout(n.blkStmts[i], typarams, tvN, tvV)
+        ns.push(cs)
+        if cs != n.blkStmts[i] { bchanged = true }
+        i = i + 1
       }
-      k = k + 1
+      if !bchanged { return ix }
+      return mkBlock(ns, n.pos)
     }
-    return monoIfChainRebuild(
-      links,
-      ccs,
-      cts,
-      monoFoldTyParamLayout(monoIfChainElse(links), typarams, tvN, tvV),
-    )
-  }
-  if n is WhileStmt {
-    const wc = monoFoldTyParamLayout(n.whileCond, typarams, tvN, tvV)
-    const wb = monoFoldTyParamLayout(n.whileBody, typarams, tvN, tvV)
-    if wc == n.whileCond && wb == n.whileBody { return ix }
-    return mkWhileAs(n, wc, wb)
-  }
-  if n is ForRange {
-    const ff = monoFoldTyParamLayout(n.frFrom, typarams, tvN, tvV)
-    const ft = monoFoldTyParamLayout(n.frTo, typarams, tvN, tvV)
-    const fs = monoFoldTyParamLayout(n.frStep, typarams, tvN, tvV)
-    const fb = monoFoldTyParamLayout(n.frBody, typarams, tvN, tvV)
-    if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
-      return ix
+    LetDecl => {
+      const ci = monoFoldTyParamLayout(n.letInit, typarams, tvN, tvV)
+      if ci == n.letInit { return ix }
+      return monoCopyOf(ix, mkLet(n.letKw, n.letName, n.letType, ci, n.pos))
     }
-    return mkForRange(n.frVar, ff, ft, fs, n.frExcl, fb, n.frLabel, n.pos)
-  }
-  if n is ForIn {
-    const fi = monoFoldTyParamLayout(n.fiIter, typarams, tvN, tvV)
-    const fbi = monoFoldTyParamLayout(n.fiBody, typarams, tvN, tvV)
-    if fi == n.fiIter && fbi == n.fiBody { return ix }
-    return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
-  }
-  if n is Call { return monoFoldLayoutCall(ix, n, typarams, tvN, tvV) }
-  if n is BinExpr { return monoFoldLayoutBin(ix, n, typarams, tvN, tvV) }
-  if n is Unary {
-    // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is
-    // the mutated target — left whole for the compound form's reason.
-    if n.unOp == "p+" || n.unOp == "p-" { return ix }
-    const ua = monoFoldTyParamLayout(n.unArg, typarams, tvN, tvV)
-    if ua == n.unArg { return ix }
-    return mkUnary(n.unOp, ua, n.pos)
-  }
-  if n is Paren {
-    const pi = monoFoldTyParamLayout(n.parInner, typarams, tvN, tvV)
-    if pi == n.parInner { return ix }
-    return mkParen(pi, n.pos)
-  }
-  if n is OptMember {
-    const oo = monoFoldTyParamLayout(n.omObj, typarams, tvN, tvV)
-    if oo == n.omObj { return ix }
-    return mkOptMember(oo, n.omProp, n.omDot, n.pos)
-  }
-  if n is Index {
-    const xa = monoFoldTyParamLayout(n.idxArr, typarams, tvN, tvV)
-    const xi = monoFoldTyParamLayout(n.idxIndex, typarams, tvN, tvV)
-    if xa == n.idxArr && xi == n.idxIndex { return ix }
-    return mkIndex(xa, xi, n.pos)
-  }
-  if n is IsExpr {
-    const io = monoFoldTyParamLayout(n.isObj, typarams, tvN, tvV)
-    // D951 — the check spelling is substituted only when it mentions a type parameter, the
-    // `monoAnnHasTyParam`-then-`monoSubstAnn` contract every other substitution site keeps.
-    // A concrete `is {v: i32}` must return verbatim: `monoSubstAnn`'s object arm rebuilds a
-    // shape spelling from its parts, and a rebuilt spelling is a second intern key.
-    if monoAnnHasTyParam(n.isVariant, typarams) {
-      const sub = monoSubstAnn(n.isVariant, typarams, tvN, tvV)
-      if sub != "" && sub != n.isVariant { return monoSubstIsExpr(ix, io, sub) }
+    RetStmt => {
+      const ca = monoFoldTyParamLayout(n.retArg, typarams, tvN, tvV)
+      if ca == n.retArg { return ix }
+      return mkReturn(ca, n.pos)
     }
-    if io == n.isObj { return ix }
-    return monoReIsExpr(ix, io)
-  }
-  if n is AsExpr {
-    const ao = monoFoldTyParamLayout(n.asObj, typarams, tvN, tvV)
-    if ao == n.asObj { return ix }
-    return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
-  }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread {
-    const sa = monoFoldTyParamLayout(n.spdArg, typarams, tvN, tvV)
-    if sa == n.spdArg { return ix }
-    return mkSpread(sa, n.pos)
-  }
-  if n is ArrayLit {
-    const es: i32[] = []
-    let echanged = false
-    let ei = 0
-    while ei < n.arrElems.length {
-      const ce = monoFoldTyParamLayout(n.arrElems[ei], typarams, tvN, tvV)
-      es.push(ce)
-      if ce != n.arrElems[ei] { echanged = true }
-      ei = ei + 1
+    IfStmt => {
+      // An `else if` chain is rewritten along its spine, so its depth costs no stack (D1990).
+      const links = monoIfChainLinks(ix)
+      const ccs: i32[] = []
+      const cts: i32[] = []
+      let k = 0
+      while k < links.length {
+        const c = P.nodes[links[k]]
+        if c is IfStmt {
+          ccs.push(monoFoldTyParamLayout(c.ifCond, typarams, tvN, tvV))
+          cts.push(monoFoldTyParamLayout(c.ifThen, typarams, tvN, tvV))
+        }
+        k = k + 1
+      }
+      return monoIfChainRebuild(
+        links,
+        ccs,
+        cts,
+        monoFoldTyParamLayout(monoIfChainElse(links), typarams, tvN, tvV),
+      )
     }
-    if !echanged { return ix }
-    const nl = mkArrayLit(es, n.pos)
-    nodeTyCarry(nl, ix)
-    return nl
+    WhileStmt => {
+      const wc = monoFoldTyParamLayout(n.whileCond, typarams, tvN, tvV)
+      const wb = monoFoldTyParamLayout(n.whileBody, typarams, tvN, tvV)
+      if wc == n.whileCond && wb == n.whileBody { return ix }
+      return mkWhileAs(n, wc, wb)
+    }
+    ForRange => {
+      const ff = monoFoldTyParamLayout(n.frFrom, typarams, tvN, tvV)
+      const ft = monoFoldTyParamLayout(n.frTo, typarams, tvN, tvV)
+      const fs = monoFoldTyParamLayout(n.frStep, typarams, tvN, tvV)
+      const fb = monoFoldTyParamLayout(n.frBody, typarams, tvN, tvV)
+      if ff == n.frFrom && ft == n.frTo && fs == n.frStep && fb == n.frBody {
+        return ix
+      }
+      return mkForRange(n.frVar, ff, ft, fs, n.frExcl, fb, n.frLabel, n.pos)
+    }
+    ForIn => {
+      const fi = monoFoldTyParamLayout(n.fiIter, typarams, tvN, tvV)
+      const fbi = monoFoldTyParamLayout(n.fiBody, typarams, tvN, tvV)
+      if fi == n.fiIter && fbi == n.fiBody { return ix }
+      return mkForIn(n.fiVar, n.fiVar2, fi, fbi, n.fiLabel, n.pos)
+    }
+    Call => {
+      return monoFoldLayoutCall(ix, n, typarams, tvN, tvV)
+    }
+    BinExpr => {
+      return monoFoldLayoutBin(ix, n, typarams, tvN, tvV)
+    }
+    Unary => {
+      // A postfix `x++`/`x--` rides a `Unary` over the assignment whose operand is
+      // the mutated target — left whole for the compound form's reason.
+      if n.unOp == "p+" || n.unOp == "p-" { return ix }
+      const ua = monoFoldTyParamLayout(n.unArg, typarams, tvN, tvV)
+      if ua == n.unArg { return ix }
+      return mkUnary(n.unOp, ua, n.pos)
+    }
+    Paren => {
+      const pi = monoFoldTyParamLayout(n.parInner, typarams, tvN, tvV)
+      if pi == n.parInner { return ix }
+      return mkParen(pi, n.pos)
+    }
+    OptMember => {
+      const oo = monoFoldTyParamLayout(n.omObj, typarams, tvN, tvV)
+      if oo == n.omObj { return ix }
+      return mkOptMember(oo, n.omProp, n.omDot, n.pos)
+    }
+    Index => {
+      const xa = monoFoldTyParamLayout(n.idxArr, typarams, tvN, tvV)
+      const xi = monoFoldTyParamLayout(n.idxIndex, typarams, tvN, tvV)
+      if xa == n.idxArr && xi == n.idxIndex { return ix }
+      return mkIndex(xa, xi, n.pos)
+    }
+    IsExpr => {
+      const io = monoFoldTyParamLayout(n.isObj, typarams, tvN, tvV)
+      // D951 — the check spelling is substituted only when it mentions a type parameter, the
+      // `monoAnnHasTyParam`-then-`monoSubstAnn` contract every other substitution site keeps.
+      // A concrete `is {v: i32}` must return verbatim: `monoSubstAnn`'s object arm rebuilds a
+      // shape spelling from its parts, and a rebuilt spelling is a second intern key.
+      if monoAnnHasTyParam(n.isVariant, typarams) {
+        const sub = monoSubstAnn(n.isVariant, typarams, tvN, tvV)
+        if sub != "" && sub != n.isVariant {
+          return monoSubstIsExpr(ix, io, sub)
+        }
+      }
+      if io == n.isObj { return ix }
+      return monoReIsExpr(ix, io)
+    }
+    AsExpr => {
+      const ao = monoFoldTyParamLayout(n.asObj, typarams, tvN, tvV)
+      if ao == n.asObj { return ix }
+      return mkAsExpr(ao, n.asTy, n.asMode, n.pos)
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      const sa = monoFoldTyParamLayout(n.spdArg, typarams, tvN, tvV)
+      if sa == n.spdArg { return ix }
+      return mkSpread(sa, n.pos)
+    }
+    ArrayLit => {
+      const es: i32[] = []
+      let echanged = false
+      let ei = 0
+      while ei < n.arrElems.length {
+        const ce = monoFoldTyParamLayout(n.arrElems[ei], typarams, tvN, tvV)
+        es.push(ce)
+        if ce != n.arrElems[ei] { echanged = true }
+        ei = ei + 1
+      }
+      if !echanged { return ix }
+      const nl = mkArrayLit(es, n.pos)
+      nodeTyCarry(nl, ix)
+      return nl
+    }
+    ObjLit => {
+      return monoFoldLayoutObj(ix, n, typarams, tvN, tvV)
+    }
+    // every other kind is shared as it is: no layout read under it is folded here
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
-  if n is ObjLit { return monoFoldLayoutObj(ix, n, typarams, tvN, tvV) }
   ix
 }
 
@@ -9161,7 +9272,7 @@ function monoTestsTyVar(ix: i32): boolean {
   if n is MatchExpr {
     if monoTyVarTyped(n.matchScrut) { return true }
   }
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cf = P.nodes[n.callFn]
     if cf is Ident {
       if monoCalleeIsGeneric(n.callFn) {
@@ -9833,7 +9944,7 @@ function monoMakeInstanceRetExpr(
     const rx2 = fnRetExprOf(monoOrigNode[origFe])
     if rx2 >= 0 {
       const rxe = P.nodes[rx2]
-      if rxe is Call {
+      if rxe is Call && rxe.callFn >= 0 {
         const rcal = P.nodes[rxe.callFn]
         if rcal is Ident {
           nret = monoRetOfClosureCall(
@@ -10621,6 +10732,7 @@ function monoMakeInstanceLater(
   }
   if mlsWrote { invalidateFnChildIndex() }
   monoLamMintedSlots = []
+  if calleeIx < 0 { return instFe }
   const cal2 = P.nodes[calleeIx]
   // A call through a never-written alias of a capturing nested generic, keyed on its frame:
   // the alias's own value is that instance's closure, whose env holds this frame's captures.
@@ -11112,9 +11224,12 @@ function monoMakeInstanceGo(
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
   if monoPinColsMisalignedFail(pinned, pinTys) < 0 { return -1 }
-  // `origFe` needs no bound of its own: every caller reaches here past `fe < monoGen.length`,
-  // and `monomorphize` pushes `monoGen` and `monoOrigNode` in one loop and never appends to
-  // either again, so that test is `monoOrigNode`'s length wearing another name.
+  // Every caller bounds `origFe` by `monoGen`, which `monoOrigNode` stays parallel to.
+  if origFe < 0 || origFe >= monoOrigNode.length {
+    return emitFail(
+      "emitProgram: monomorphize: instance origin is not a template slot",
+    )
+  }
   const fn = P.nodes[monoOrigNode[origFe]]
   if fn is FuncDecl {
     const params = fn.fnParams
@@ -11458,86 +11573,95 @@ function monoCoerceFnValueName(
 ) {
   if exprIx < 0 { return 0 }
   const e = P.nodes[exprIx]
-  if e is ObjLit {
-    for fx in e.objFields {
-      const f = P.nodes[fx]
-      if f is FieldInit {
-        const path: string[] = ["f." + f.fiName]
-        if monoCoerceLitPart(f.fiValue, exprIx, path, ctx) < 0 { return -1 }
+  match e {
+    ObjLit => {
+      for fx in e.objFields {
+        const f = P.nodes[fx]
+        if f is FieldInit {
+          const path: string[] = ["f." + f.fiName]
+          if monoCoerceLitPart(f.fiValue, exprIx, path, ctx) < 0 { return -1 }
+        }
       }
+      return 0
     }
-    return 0
-  }
-  if e is ArrayLit {
-    for x in e.arrElems {
-      const path: string[] = ["e"]
-      if monoCoerceLitPart(x, exprIx, path, ctx) < 0 { return -1 }
+    ArrayLit => {
+      for x in e.arrElems {
+        const path: string[] = ["e"]
+        if monoCoerceLitPart(x, exprIx, path, ctx) < 0 { return -1 }
+      }
+      return 0
     }
-    return 0
-  }
-  if e is Paren { return monoCoerceFnValueName(e.parInner, tname, ctx, expTy) }
-  // A read through a written `let`'s capture cell is read as that `let` (D3939).
-  if e is Index {
-    const cn = monoCellReadName(exprIx)
-    if cn != "" { monoCoerceWrittenCell(exprIx, ctx, tname) }
-    return 0
-  }
-  if e is IfStmt {
-    // An if-expression in value position. The expected type reaches every arm unchanged —
-    // each arm independently produces the whole value — so the recursion is per-arm, not
-    // per-element as it is for the composite literals. A `match` needs no limb: the checker
-    // lowers an exhaustive one to an if/else chain in place.
-    if monoCoerceFnValueName(e.ifThen, tname, ctx, expTy) < 0 { return -1 }
-    return monoCoerceFnValueName(e.ifElse, tname, ctx, expTy)
-  }
-  if e is Block {
-    // An arm's VALUE is its LAST statement, so that is the only position the expected type reaches.
-    const bs = e.blkStmts
-    if bs.length == 0 { return 0 }
-    return monoCoerceFnValueName(bs[bs.length - 1], tname, ctx, expTy)
-  }
-  if e is Ident {
-    // A bare function name, or a value binding holding a generic function (`const add =
-    // (a,b) => a + b`, or `const g = named`) — resolve the binding to its lifted slot so an
-    // escaping lambda binding materializes at the boundary type too.
-    // A reassigned `let` is read as itself: the generic functions written into it take this type.
-    if monoCoerceWrittenLetValues(exprIx, ctx, tname) { return 0 }
-    // An alias of a capture cell's read delivers that cell (D3948).
-    if monoCoerceAliasOfCell(exprIx, ctx, tname) { return 0 }
-    let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
-    // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
-    if gfe < 0 { gfe = monoReadGenFnFe(exprIx) }
-    // An alias a call renamed to one instance of a generic still delivers the generic (D3905).
-    if (
-      gfe >= 0
-      && gfe < fnInstOrigin.length
-      && fnInstOrigin[gfe] >= 0
-      && e.identName != monoSlotName(gfe)
-    ) {
-      const go = fnInstOrigin[gfe]
-      if go < monoGen.length && monoGen[go] == 1 { gfe = go }
+    Paren => {
+      return monoCoerceFnValueName(e.parInner, tname, ctx, expTy)
     }
-    if gfe >= 0 && gfe < monoGen.length {
-      if monoGen[gfe] == 1 {
-        const pnames: string[] = []
-        // A nullable function slot (`((t: T) => void) | null`) takes the function's instance (D3932).
-        if (
-          monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames)
-        ) {
-          // A capturing nested generic's value is this frame's instance, as a call is (D3902).
-          monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
-          monoInstanceRetName = ""
-          if monoInstanceExactRet {
-            monoInstanceRetName = normTypeAtom(
-              annRetNameOf(peelGroupParens(tname)),
+    // A read through a written `let`'s capture cell is read as that `let` (D3939).
+    Index => {
+      const cn = monoCellReadName(exprIx)
+      if cn != "" { monoCoerceWrittenCell(exprIx, ctx, tname) }
+      return 0
+    }
+    IfStmt => {
+      // An if-expression in value position. The expected type reaches every arm unchanged —
+      // each arm independently produces the whole value — so the recursion is per-arm, not
+      // per-element as it is for the composite literals. A `match` needs no limb: the checker
+      // lowers an exhaustive one to an if/else chain in place.
+      if monoCoerceFnValueName(e.ifThen, tname, ctx, expTy) < 0 { return -1 }
+      return monoCoerceFnValueName(e.ifElse, tname, ctx, expTy)
+    }
+    Block => {
+      // An arm's VALUE is its LAST statement, so that is the only position the expected type reaches.
+      const bs = e.blkStmts
+      if bs.length == 0 { return 0 }
+      return monoCoerceFnValueName(bs[bs.length - 1], tname, ctx, expTy)
+    }
+    Ident => {
+      // A bare function name, or a value binding holding a generic function (`const add =
+      // (a,b) => a + b`, or `const g = named`) — resolve the binding to its lifted slot so an
+      // escaping lambda binding materializes at the boundary type too.
+      // A reassigned `let` is read as itself: the generic functions written into it take this type.
+      if monoCoerceWrittenLetValues(exprIx, ctx, tname) { return 0 }
+      // An alias of a capture cell's read delivers that cell (D3948).
+      if monoCoerceAliasOfCell(exprIx, ctx, tname) { return 0 }
+      let gfe = monoFnFeOfIdent(exprIx, e.identName, ctx)
+      // A chain of never-written aliases of a generic delivers that generic (D3894, D3902).
+      if gfe < 0 { gfe = monoReadGenFnFe(exprIx) }
+      // An alias a call renamed to one instance of a generic still delivers the generic (D3905).
+      if (
+        gfe >= 0
+        && gfe < fnInstOrigin.length
+        && fnInstOrigin[gfe] >= 0
+        && e.identName != monoSlotName(gfe)
+      ) {
+        const go = fnInstOrigin[gfe]
+        if go < monoGen.length && monoGen[go] == 1 { gfe = go }
+      }
+      if gfe >= 0 && gfe < monoGen.length {
+        if monoGen[gfe] == 1 {
+          const pnames: string[] = []
+          // A nullable function slot (`((t: T) => void) | null`) takes the function's instance (D3932).
+          if (
+            monoFnTypeAnnParamsName(
+              peelGroupParens(nonNulBaseOf(tname)),
+              pnames,
             )
+          ) {
+            // A capturing nested generic's value is this frame's instance, as a call is (D3902).
+            monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
+            monoInstanceRetName = ""
+            if monoInstanceExactRet {
+              monoInstanceRetName = normTypeAtom(
+                annRetNameOf(peelGroupParens(tname)),
+              )
+            }
+            const vr = monoInstanceFor(gfe, pnames, exprIx, expTy)
+            monoCallFrameSlot = -1
+            return vr
           }
-          const vr = monoInstanceFor(gfe, pnames, exprIx, expTy)
-          monoCallFrameSlot = -1
-          return vr
         }
       }
     }
+    // every other kind names no generic function value, so nothing is instanced
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -11625,7 +11749,7 @@ function monoArmNamesGenerics(arm: i32, ctx: i32, depth: i32): boolean {
 // generic `g` written into a `let` becomes once the checker pins it; -1 otherwise.
 function monoAdapterCallee(v: i32): i32 {
   const f = P.nodes[unwrapParen(v)]
-  if !(f is FuncDecl) || f.fnParams.length == 0 { return -1 }
+  if !(f is FuncDecl) || f.fnParams.length == 0 || f.fnBody < 0 { return -1 }
   const b = P.nodes[f.fnBody]
   if !(b is Block) || b.blkStmts.length != 1 { return -1 }
   const c = P.nodes[b.blkStmts[0]]
@@ -12083,7 +12207,7 @@ function monoListOnlyCalled(
     const ix = stack.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
       const n = P.nodes[ix]
-      if n is Call {
+      if n is Call && n.callFn >= 0 {
         const c = P.nodes[n.callFn]
         if c is Index {
           const a = P.nodes[c.idxArr]
@@ -14948,11 +15072,13 @@ function monoCallGenFnToTyParamArrow(
         const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
         if annArrowAt(ann) >= 1 && monoAnnHasTyParam(ann, typarams) {
           const ax = unwrapParen(args[i])
-          const av = P.nodes[ax]
-          if av is Ident {
-            const gfe = monoFnFeOfIdent(ax, av.identName, ctx)
-            if gfe >= 0 && gfe < monoGen.length {
-              if monoGen[gfe] == 1 { return true }
+          if ax >= 0 {
+            const av = P.nodes[ax]
+            if av is Ident {
+              const gfe = monoFnFeOfIdent(ax, av.identName, ctx)
+              if gfe >= 0 && gfe < monoGen.length {
+                if monoGen[gfe] == 1 { return true }
+              }
             }
           }
         }
@@ -16791,6 +16917,7 @@ function monoPinTyParamComposite(
 function monoSpecializableCallbackName(argIx: i32, ctx: i32) {
   if !exprIsClosure(argIx, ctx) { return "" }
   const ax = unwrapParen(argIx)
+  if ax < 0 { return "" }
   const an = P.nodes[ax]
   let fe = -1
   // The Ident arm is scope-aware, like the call and function-value paths: the flat
@@ -16864,7 +16991,7 @@ function monoHasConcreteHOFParam() {
 // the original is kept, so it still serves any non-bakeable caller. Returns 0, or -1.
 function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
   const c = P.nodes[callIx]
-  if c is Call {
+  if c is Call && c.callFn >= 0 {
     // The one read of `fnStmts[fe]` this function needs — kept in `fnDeclIx` rather than
     // re-indexed below, so a second unguarded read of the same fall-through parameter does
     // not open a second sentinel-index hit (D2325).
@@ -16973,7 +17100,7 @@ function monoSpecializeConcrete(callIx: i32, fe: i32, ctx: i32) {
       const nfn = mkFunc(specName, noTP, nps, fn.fnRet, instBody, fn.pos)
       // D926 — as above. The ORIGINAL declaration is kept here, so both it and the
       // specialization carry the mark and both signatures follow the merge.
-      anonLeafCarryRetMark(fnStmts[fe], nfn)
+      anonLeafCarryRetMark(fnDeclIx, nfn)
       fnStmts.push(nfn)
       fnParent.push(-1)
       fnDispNames.push("")
@@ -17653,181 +17780,201 @@ function monoRespellLamFe(calleeIx: i32, ctx: i32): i32 {
 function monoWalk(ix: i32, ctx: i32) {
   if ix < 0 { return 0 }
   const n = P.nodes[ix]
-  if n is Call {
-    const args = n.callArgs
-    let i = 0
-    while i < args.length {
-      if monoWalk(args[i], ctx) < 0 { return -1 }
-      i = i + 1
-    }
-    if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
-    if monoGenArgAtOpenParam(n, ctx) && monoOpenCallAtElems(n, ctx) < 0 {
-      return -1
-    }
-    const callee = P.nodes[n.callFn]
-    if callee is Index && monoGenArgAtOpenParam(n, ctx) {
-      return monoGenArgOpenFail(ix)
-    }
-    if callee is Ident { return monoWalkIdentCall(n, callee, ix, ctx) }
-    // A call of a list element that is an alias of a capture cell's read is a call through it.
-    const le = monoListElemCellRead(n.callFn, ctx)
-    if le[0] >= 0 {
-      if monoCellCall(n, ix, le[0], le[1], ctx, true) < 0 { return -1 }
-    }
-    // A call through the capture cell of a `let` alias of a hole lambda (D3845).
-    if monoCellReadName(n.callFn) != "" {
-      const cr = monoCellCall(n, ix, n.callFn, ctx, ctx, false)
-      if cr < 0 { return -1 }
-      if cr == 1 { return 0 }
-    }
-    if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
-    if monoCoerceAtValueParams(n, -1, ctx) < 0 { return -1 }
-    if monoWalk(n.callFn, ctx) < 0 { return -1 }
-    monoTypeCallOfCall(ix, ctx)
-    return 0
-  }
-  if n is Block {
-    const bs = n.blkStmts
-    let i2 = 0
-    while i2 < bs.length {
-      if monoWalk(bs[i2], ctx) < 0 { return -1 }
-      i2 = i2 + 1
-    }
-    return 0
-  }
-  if n is LetDecl { return monoWalkLetDecl(n, ix, ctx) }
-  if n is IfStmt {
-    if monoWalk(n.ifCond, ctx) < 0 { return -1 }
-    if monoWalk(n.ifThen, ctx) < 0 { return -1 }
-    return monoWalk(n.ifElse, ctx)
-  }
-  if n is WhileStmt {
-    if monoWalk(n.whileCond, ctx) < 0 { return -1 }
-    return monoWalk(n.whileBody, ctx)
-  }
-  if n is ForRange {
-    if monoWalk(n.frFrom, ctx) < 0 { return -1 }
-    if monoWalk(n.frTo, ctx) < 0 { return -1 }
-    if monoWalk(n.frStep, ctx) < 0 { return -1 }
-    return monoWalk(n.frBody, ctx)
-  }
-  if n is ForIn {
-    if monoWalk(n.fiIter, ctx) < 0 { return -1 }
-    return monoWalk(n.fiBody, ctx)
-  }
-  if n is RetStmt {
-    // A generic function value RETURNED where the enclosing function declares a concrete function
-    // return type (`function mk(): (f64,f64)=>f64 { return add }`): materialize the instance for
-    // that return type so the returned value carries it.
-    if ctx >= 0 {
-      const cf = P.nodes[ctx]
-      if cf is FuncDecl {
-        if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
-        if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
+  match n {
+    Call => {
+      const args = n.callArgs
+      let i = 0
+      while i < args.length {
+        if monoWalk(args[i], ctx) < 0 { return -1 }
+        i = i + 1
       }
+      if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
+      if monoGenArgAtOpenParam(n, ctx) && monoOpenCallAtElems(n, ctx) < 0 {
+        return -1
+      }
+      if n.callFn < 0 { return 0 }
+      const callee = P.nodes[n.callFn]
+      if callee is Index && monoGenArgAtOpenParam(n, ctx) {
+        return monoGenArgOpenFail(ix)
+      }
+      if callee is Ident { return monoWalkIdentCall(n, callee, ix, ctx) }
+      // A call of a list element that is an alias of a capture cell's read is a call through it.
+      const le = monoListElemCellRead(n.callFn, ctx)
+      if le[0] >= 0 {
+        if monoCellCall(n, ix, le[0], le[1], ctx, true) < 0 { return -1 }
+      }
+      // A call through the capture cell of a `let` alias of a hole lambda (D3845).
+      if monoCellReadName(n.callFn) != "" {
+        const cr = monoCellCall(n, ix, n.callFn, ctx, ctx, false)
+        if cr < 0 { return -1 }
+        if cr == 1 { return 0 }
+      }
+      if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
+      if monoCoerceAtValueParams(n, -1, ctx) < 0 { return -1 }
+      if monoWalk(n.callFn, ctx) < 0 { return -1 }
+      monoTypeCallOfCall(ix, ctx)
+      return 0
     }
-    return monoWalk(n.retArg, ctx)
-  }
-  if n is BinExpr {
-    // Assignment to a function-typed binding (`let f: (i32,i32)=>i32 = mul; f = add`). The
-    // declared type is the same boundary the `LetDecl` arm reads, so a generic reaching it
-    // through a later `=` materializes identically. "" is a no-op.
-    if n.binOp == "=" {
-      const tgt = P.nodes[n.binLeft]
-      if tgt is Ident {
-        let atn = identFnTypeAnnName(tgt.identName, ctx)
-        // An un-annotated local's write delivers at the one signature the flow table pins the
-        // binding at in this frame (D3957), a hole lambda literal written there included; one
-        // written at two types is left to the binding's own two-signature refusal.
-        let byPin = false
-        if atn == "" {
-          atn = monoPlacePinName(n.binLeft, "", ctx)
-          byPin = true
-        }
-        if atn != "" {
-          if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
-          if byPin { monoLamLitTake(n.binRight, atn, ctx) }
-          if !byPin && monoDeliverCallAt(n.binRight, atn) < 0 { return -1 }
+    Block => {
+      const bs = n.blkStmts
+      let i2 = 0
+      while i2 < bs.length {
+        if monoWalk(bs[i2], ctx) < 0 { return -1 }
+        i2 = i2 + 1
+      }
+      return 0
+    }
+    LetDecl => {
+      return monoWalkLetDecl(n, ix, ctx)
+    }
+    IfStmt => {
+      if monoWalk(n.ifCond, ctx) < 0 { return -1 }
+      if monoWalk(n.ifThen, ctx) < 0 { return -1 }
+      return monoWalk(n.ifElse, ctx)
+    }
+    WhileStmt => {
+      if monoWalk(n.whileCond, ctx) < 0 { return -1 }
+      return monoWalk(n.whileBody, ctx)
+    }
+    ForRange => {
+      if monoWalk(n.frFrom, ctx) < 0 { return -1 }
+      if monoWalk(n.frTo, ctx) < 0 { return -1 }
+      if monoWalk(n.frStep, ctx) < 0 { return -1 }
+      return monoWalk(n.frBody, ctx)
+    }
+    ForIn => {
+      if monoWalk(n.fiIter, ctx) < 0 { return -1 }
+      return monoWalk(n.fiBody, ctx)
+    }
+    RetStmt => {
+      // A generic function value RETURNED where the enclosing function declares a concrete function
+      // return type (`function mk(): (f64,f64)=>f64 { return add }`): materialize the instance for
+      // that return type so the returned value carries it.
+      if ctx >= 0 {
+        const cf = P.nodes[ctx]
+        if cf is FuncDecl {
+          if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
+          if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
         }
       }
-      // A store into an element or a field of a binding delivers at the one signature the flow
-      // table pins that slot at in this frame (D3909), and a capture cell's store at the cell's
-      // element pin, a value read through another cell included.
-      if tgt is Index {
-        let sn = monoPlacePinName(n.binLeft, "", ctx)
-        if monoIsCellRead(n.binLeft) { sn = monoCellPinName(n.binLeft, ctx) }
-        const wl = unwrapParen(n.binRight)
+      return monoWalk(n.retArg, ctx)
+    }
+    BinExpr => {
+      // Assignment to a function-typed binding (`let f: (i32,i32)=>i32 = mul; f = add`). The
+      // declared type is the same boundary the `LetDecl` arm reads, so a generic reaching it
+      // through a later `=` materializes identically. "" is a no-op.
+      if n.binOp == "=" {
+        const tgt = P.nodes[n.binLeft]
+        if tgt is Ident {
+          let atn = identFnTypeAnnName(tgt.identName, ctx)
+          // An un-annotated local's write delivers at the one signature the flow table pins the
+          // binding at in this frame (D3957), a hole lambda literal written there included; one
+          // written at two types is left to the binding's own two-signature refusal.
+          let byPin = false
+          if atn == "" {
+            atn = monoPlacePinName(n.binLeft, "", ctx)
+            byPin = true
+          }
+          if atn != "" {
+            if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
+            if byPin { monoLamLitTake(n.binRight, atn, ctx) }
+            if !byPin && monoDeliverCallAt(n.binRight, atn) < 0 { return -1 }
+          }
+        }
+        // A store into an element or a field of a binding delivers at the one signature the flow
+        // table pins that slot at in this frame (D3909), and a capture cell's store at the cell's
+        // element pin, a value read through another cell included.
+        if tgt is Index {
+          let sn = monoPlacePinName(n.binLeft, "", ctx)
+          if monoIsCellRead(n.binLeft) { sn = monoCellPinName(n.binLeft, ctx) }
+          const wl = unwrapParen(n.binRight)
+          if (
+            monoIsCellRead(n.binLeft)
+            && sn != ""
+            && wl >= 0
+            && P.nodes[wl] is FuncDecl
+          ) {
+            // A lambda written to a captured binding, like one written to a plain one, leaves a
+            // second type to the binding's own refusal.
+            if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
+            monoLamLitTake(n.binRight, sn, ctx)
+          } else if monoDeliverAtPin(n.binRight, sn, ctx) < 0 {
+            return -1
+          }
+        }
+        if tgt is Member {
+          const sn = monoPlacePinName(n.binLeft, "", ctx)
+          if sn != "" {
+            if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
+          }
+        }
+      }
+      if monoWalk(n.binLeft, ctx) < 0 { return -1 }
+      return monoWalk(n.binRight, ctx)
+    }
+    Unary => {
+      return monoWalk(n.unArg, ctx)
+    }
+    Paren => {
+      return monoWalk(n.parInner, ctx)
+    }
+    Member => {
+      return monoWalk(n.memObj, ctx)
+    }
+    OptMember => {
+      return monoWalk(n.omObj, ctx)
+    }
+    Index => {
+      if monoWalk(n.idxArr, ctx) < 0 { return -1 }
+      return monoWalk(n.idxIndex, ctx)
+    }
+    IsExpr => {
+      return monoWalk(n.isObj, ctx)
+    }
+    AsExpr => {
+      return monoWalk(n.asObj, ctx)
+    }
+    // A spread's source is an operand like any other (D2334).
+    Spread => {
+      return monoWalk(n.spdArg, ctx)
+    }
+    ArrayLit => {
+      const es = n.arrElems
+      let i3 = 0
+      while i3 < es.length {
+        // An alias of a capture cell's read in a program's list is called through the list, which
+        // the cell path does not follow, so it cannot be held to the cell's one signature.
         if (
-          monoIsCellRead(n.binLeft)
-          && sn != ""
-          && wl >= 0
-          && P.nodes[wl] is FuncDecl
+          n.pos >= 0
+          && ix != monoCellAliasListOk
+          && monoListMayHoldFn(ix)
+          && monoNamesCellAlias(es[i3], ctx)
         ) {
-          // A lambda written to a captured binding, like one written to a plain one, leaves a
-          // second type to the binding's own refusal.
-          if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
-          monoLamLitTake(n.binRight, sn, ctx)
-        } else if monoDeliverAtPin(n.binRight, sn, ctx) < 0 {
-          return -1
+          return monoCellAliasListFail(es[i3])
         }
+        if monoWalk(es[i3], ctx) < 0 { return -1 }
+        i3 = i3 + 1
       }
-      if tgt is Member {
-        const sn = monoPlacePinName(n.binLeft, "", ctx)
-        if sn != "" {
-          if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
+      return 0
+    }
+    ObjLit => {
+      const fs = n.objFields
+      let i4 = 0
+      while i4 < fs.length {
+        const f = P.nodes[fs[i4]]
+        if f is FieldInit {
+          if monoWalk(f.fiValue, ctx) < 0 { return -1 }
         }
+        i4 = i4 + 1
       }
+      return 0
     }
-    if monoWalk(n.binLeft, ctx) < 0 { return -1 }
-    return monoWalk(n.binRight, ctx)
+    // A nested `FuncDecl`'s body is walked through its own `fnStmts` slot (lambda-lifted);
+    // every other node kind has no call-bearing children. `MatchExpr` never
+    // reaches here: the checker lowers every exhaustive `match` to an if/else chain and
+    // overwrites the arena slot in place, so by emit time its arms sit in `IfStmt` limbs.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
-  if n is Unary { return monoWalk(n.unArg, ctx) }
-  if n is Paren { return monoWalk(n.parInner, ctx) }
-  if n is Member { return monoWalk(n.memObj, ctx) }
-  if n is OptMember { return monoWalk(n.omObj, ctx) }
-  if n is Index {
-    if monoWalk(n.idxArr, ctx) < 0 { return -1 }
-    return monoWalk(n.idxIndex, ctx)
-  }
-  if n is IsExpr { return monoWalk(n.isObj, ctx) }
-  if n is AsExpr { return monoWalk(n.asObj, ctx) }
-  // A spread's source is an operand like any other (D2334).
-  if n is Spread { return monoWalk(n.spdArg, ctx) }
-  if n is ArrayLit {
-    const es = n.arrElems
-    let i3 = 0
-    while i3 < es.length {
-      // An alias of a capture cell's read in a program's list is called through the list, which
-      // the cell path does not follow, so it cannot be held to the cell's one signature.
-      if (
-        n.pos >= 0
-        && ix != monoCellAliasListOk
-        && monoListMayHoldFn(ix)
-        && monoNamesCellAlias(es[i3], ctx)
-      ) {
-        return monoCellAliasListFail(es[i3])
-      }
-      if monoWalk(es[i3], ctx) < 0 { return -1 }
-      i3 = i3 + 1
-    }
-    return 0
-  }
-  if n is ObjLit {
-    const fs = n.objFields
-    let i4 = 0
-    while i4 < fs.length {
-      const f = P.nodes[fs[i4]]
-      if f is FieldInit {
-        if monoWalk(f.fiValue, ctx) < 0 { return -1 }
-      }
-      i4 = i4 + 1
-    }
-    return 0
-  }
-  // A nested `FuncDecl`'s body is walked through its own `fnStmts` slot (lambda-lifted);
-  // every other node kind has no call-bearing children. `MatchExpr` never
-  // reaches here: the checker lowers every exhaustive `match` to an if/else chain and
-  // overwrites the arena slot in place, so by emit time its arms sit in `IfStmt` limbs.
   0
 }
 
@@ -18156,6 +18303,7 @@ function monoRetsReachHoleLam(fd: i32, seen: i32[]): boolean {
 // function's own excluded.
 function monoFnRetArgs(fn: FuncDecl): i32[] {
   const out: i32[] = []
+  if fn.fnBody < 0 { return out }
   const b = P.nodes[fn.fnBody]
   if b is Block {
     if b.blkStmts.length > 0 { out.push(b.blkStmts[b.blkStmts.length - 1]) }
@@ -18901,6 +19049,7 @@ function monoHoleLamCallDemand(
 // Each argument of `xs.push(…)`, and the value of `m.set(k, v)`, is delivered at the one signature
 // the flow table pins the list's element or the map's value slot at in this frame (D3867, D3881).
 function monoNotePushDeliveries(n: Call, ctx: i32) {
+  if n.callFn < 0 { return 0 }
   const cf = P.nodes[n.callFn]
   if !(cf is Member) { return 0 }
   if cf.memProp == "set" && n.callArgs.length == 2 {
@@ -19655,7 +19804,7 @@ function monoIsBuiltinCallback(lam: i32): boolean {
       const ix = stack.pop() ?? -1
       if ix >= 0 && ix < P.nodes.length {
         const n = P.nodes[ix]
-        if n is Call {
+        if n is Call && n.callFn >= 0 {
           const cf = P.nodes[n.callFn]
           if cf is Member {
             if (
@@ -19738,7 +19887,7 @@ function monoSubtreeCallsGeneric(ix: i32, ctx: i32, depth: i32): boolean {
   if ix < 0 || ix >= P.nodes.length || depth > 256 { return false }
   const n = P.nodes[ix]
   if n is FuncDecl { return false }
-  if n is Call {
+  if n is Call && n.callFn >= 0 {
     const cf = P.nodes[n.callFn]
     if cf is Ident {
       const fe = fnIndexOfInScopeAt(
@@ -20517,7 +20666,7 @@ function monoFrameNameUnread(fe: i32, target: string, calls: boolean): boolean {
     if ai >= 0 { aliasInit.push(ai) }
     const nd = P.nodes[ix]
     if i32ListHas(monoDeliveredArgs, ix) { callees.push(ix) }
-    if nd is Call {
+    if nd is Call && nd.callFn >= 0 {
       // A call through `v`, `v[i]` or a cell's `v[0]` goes through `v`.
       const cf = P.nodes[nd.callFn]
       if cf is Index {
