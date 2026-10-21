@@ -631,7 +631,7 @@ function repMemberIsLit(m: i32): boolean {
 
 // Whether a union over `mems` is MIXED: some member is neither a literal nor `null`. A
 // litunion member of a mixed union is string-repped in the box, so every key renders it as
-// `string` (the `mvCanonValName`/`rlInternName` discipline at the key layer).
+// `string` (the `mvCanonValNameTy`/`rlInternName` discipline at the key layer).
 function repUnionIsMixed(mems: i32[]): boolean {
   let mi = 0
   while mi < mems.length {
@@ -1640,7 +1640,7 @@ export function recordSFieldElemRow(nm: string, keyK: i32) {
 // `recordSFieldElemRow` with the caller's arena row for `nm`; -1 is exactly the
 // unhinted call, unchanged by construction. On the sidecar side of the mint-order
 // line (D-MAPNODETY): the row is recorded beside a mint that already happened,
-// never fronting one — a mint path here is what emitted invalid wasm at `mvShapeOfValNameK`.
+// never fronting one — a mint path here emits invalid wasm (the mv-slot interner).
 export function recordSFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
   recordFieldElemRow(
     sFieldElemName,
@@ -1652,13 +1652,9 @@ export function recordSFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
   )
 }
 
-// The `recordSFieldElemRow` twin for the VARIANT field table (`uFieldElemName`).
-export function recordUFieldElemRow(nm: string, keyK: i32) {
-  recordUFieldElemRowTy(nm, keyK, -1)
-}
-
-// `recordUFieldElemRow` with the caller's arena row for `nm`; -1 is the unhinted call.
-// The sidecar side of the mint-order line, exactly as `recordSFieldElemRowTy`.
+// The `recordSFieldElemRowTy` twin for the VARIANT field table (`uFieldElemName`), with the
+// caller's arena row for `nm` or -1. The sidecar side of the mint-order line, exactly as
+// `recordSFieldElemRowTy`.
 export function recordUFieldElemRowTy(nm: string, keyK: i32, tyHint: i32) {
   recordFieldElemRow(
     uFieldElemName,
@@ -1943,10 +1939,9 @@ export function msIsValueUnion(s: i32): i32 {
   0
 }
 
-// The globally-stable box TAG of a value atom, from its KIND — the ONE home of the
-// kind→tag table. `emit_classify`'s `scalarTagOf(atom)` delegates here over
-// `valueAtomKind(atom)`. Struct variants take the dense ranks below; atom kinds claim
-// the fixed slots above them.
+// The globally-stable box TAG of a value atom, from its KIND — the one home of the
+// kind→tag table. Struct variants take the dense ranks `0 .. uVariants.length-1`; atom
+// kinds claim the fixed slots above them, stable across every union in the module.
 export function scalarTagOfKind(k: i32): i32 {
   uVariants.length + k + relSkew(RS_TAG)
 }
@@ -2861,10 +2856,11 @@ function repOfNullableArray(elem: i32): RepDesc {
   repUncovered()
 }
 
-// The union registry row whose arena type shares `ty`'s interned canon id, or -1. The
-// id is what both producers can compute: the collect pass registers under the DECLARED
-// spelling, and an arena-side reader has no spelling to offer.
-function unRowOfCanonId(ty: i32): i32 {
+// The `unNames` row whose recorded arena type is structurally `ty` (shares its interned canon
+// id), or -1. A row-identity scan of `unTyIx` is not enough: the arena is not hash-consed for
+// composite spellings, so one spelling can mint several rows, and an arena-side reader has no
+// spelling to offer.
+export function unRowOfCanon(ty: i32): i32 {
   if ty < 0 { return -1 }
   const c = repCanonId(ty)
   let u = 0
@@ -2971,7 +2967,7 @@ function repOfArray(elem: i32): RepDesc {
       // A self-referential union with a `null` arm (`Json`) interns as `TyUnion[TyNullable(rest)]`;
       // it is the box over `rest | null`, and the registry holds its row under the wrapper.
       if w is TyNullable {
-        if tyIsValueUnionBox(w.nInner) && unRowOfCanonId(elem) >= 0 {
+        if tyIsValueUnionBox(w.nInner) && unRowOfCanon(elem) >= 0 {
           return repMk("reflist", 0, "union")
         }
       }
@@ -2983,7 +2979,7 @@ function repOfArray(elem: i32): RepDesc {
     // as its scalar list). The row is found by canon id, else by key, since an arena node
     // need not share the canon id of the spelling that registered the row.
     if tyIsValueUnionBox(elem) {
-      if unRowOfCanonId(elem) >= 0 || unRowOfKey(elem) >= 0 {
+      if unRowOfCanon(elem) >= 0 || unRowOfKey(elem) >= 0 {
         return repMk("reflist", 0, "union")
       }
     }
@@ -3025,7 +3021,7 @@ function repOfNulElemArray(elem: i32, inner: i32): RepDesc {
         || it.primName == "f32"
         || it.primName == "v128"
       ) {
-        if unRowOfCanonId(elem) >= 0 { return repMk("reflist", 0, "union") }
+        if unRowOfCanon(elem) >= 0 { return repMk("reflist", 0, "union") }
       }
     }
     TyFunc => {
@@ -3040,7 +3036,7 @@ function repOfNulElemArray(elem: i32, inner: i32): RepDesc {
       // The box over `A | B` holds `null` as a member atom, as `repOfNullable` says, so the inner's
       // row also serves a nullable only an instance forms, which no collect pass registered.
       if tyIsValueUnionBox(inner) {
-        if unRowOfCanonId(elem) >= 0 || unRowOfCanonId(inner) >= 0 {
+        if unRowOfCanon(elem) >= 0 || unRowOfCanon(inner) >= 0 {
           return repMk("reflist", 0, "union")
         }
       }
@@ -3896,7 +3892,7 @@ function rtListVKind(elem: i32): VKind | null {
     // the list is a ref list. Gated on the node's arena provenance, the same canon-id
     // question the flat arm asks, so a box with no row declines on both sides.
     "box" => {
-      if unRowOfCanonId(rtTy[elem]) >= 0 { return "reflist" }
+      if unRowOfCanon(rtTy[elem]) >= 0 { return "reflist" }
       return null
     }
   }
@@ -3909,7 +3905,7 @@ function rtNulElemListVKind(elem: i32): VKind | null {
   const d = rtDisc[elem]
   if d == 2 || d == 3 { return "list" }
   if d == 4 {
-    if unRowOfCanonId(rtTy[elem]) >= 0 { return "reflist" }
+    if unRowOfCanon(rtTy[elem]) >= 0 { return "reflist" }
     return null
   }
   const n = rtNulNicheElemName(elem)
