@@ -244,6 +244,7 @@ import {
   ovSetSpecs,
   ovSiteAdd,
   paramDefaultIsCallsite,
+  paramDefaultOf,
   paramDefaultTablesReset,
   parseFlagsMerge,
   parseFlagsTake,
@@ -260,10 +261,12 @@ import {
   tsText,
   tsToName,
   udTsRootAt,
+  ufcsAliasAtSite,
   ufcsAliasReset,
   ufcsImpAdd,
   ufcsImpReset,
   ufcsModBoundAdd,
+  ufcsPlainsOfInto,
   ufcsScopeAdd,
   ufcsSiteAdd,
 } from "./ast"
@@ -2263,16 +2266,77 @@ function checkMemSharedOrigin(): i32 {
 // since a default's value here IS the site (every other default form shares one
 // node). A pre-pass, not a rewrite: minted before `checkProgram` sizes `nodeTyIx`
 // (D969), or a later-minted node would read its type back as -1 forever.
-function csAnyCallsiteDefault(): boolean {
+let csLoose = false
+let csAnyDefault = false
+
+// The names of the declarations carrying a `__callsite__` default; `csLoose` is set when
+// such a default belongs to no declaration, and every call is then minted for.
+function csCallsiteFns(): {[string]: boolean} {
+  const fns: {[string]: boolean} = Map()
+  let all = 0
+  let held = 0
   let i = 0
   while i < P.nodes.length {
     const n = P.nodes[i]
-    if n is Param {
-      if paramDefaultIsCallsite(n.parDefault) { return true }
+    if n is FuncDecl {
+      for p in n.fnParams {
+        if paramDefaultIsCallsite(paramDefaultOf(p)) {
+          held = held + 1
+          fns[n.fnName] = true
+        }
+      }
+    } else {
+      all = all + csParamCallsite(i)
     }
     i = i + 1
   }
-  false
+  csLoose = held != all
+  csAnyDefault = all > 0
+  fns
+}
+
+// 1 when node `i` is a parameter whose default is `__callsite__`, else 0.
+function csParamCallsite(i: i32): i32 {
+  const n = P.nodes[i]
+  if n is Param {
+    if paramDefaultIsCallsite(n.parDefault) { return 1 }
+  }
+  0
+}
+
+// The plain member names that may resolve to one of `fns`: a UFCS scope row's or an
+// overload set's, beside the declared names themselves.
+function csCallsitePlains(fns: {[string]: boolean}): {[string]: boolean} {
+  const plains: {[string]: boolean} = Map()
+  ufcsPlainsOfInto(fns, plains)
+  let r = 0
+  while r < ovSetName.length && r < ovSetCands.length {
+    for c in ovSetCands[r] {
+      if fns.has(c) { plains[ovSetName[r]] = true }
+    }
+    r = r + 1
+  }
+  plains
+}
+
+// Whether call `n` at `ix` may take a `__callsite__` default: its callee names one of `fns`,
+// or is a member whose name may resolve to one, or is any other callee.
+function csMayDefault(
+  ix: i32,
+  n: Call,
+  fns: {[string]: boolean},
+  plains: {[string]: boolean},
+): boolean {
+  if csLoose || n.callFn < 0 || n.callFn >= P.nodes.length { return true }
+  const cf = P.nodes[n.callFn]
+  if cf is Ident { return fns.has(cf.identName) }
+  if cf is Member {
+    const prop = cf.memProp
+    return fns.has(prop)
+      || plains.has(prop)
+      || fns.has(ufcsAliasAtSite(ix, prop))
+  }
+  true
 }
 
 // `s` as a string-literal lexeme — quotes kept, `"` and `\` escaped. `StrLit`
@@ -2300,9 +2364,13 @@ function csFileOfTok(tok: i32): i32 {
   m
 }
 
+// Mints only for a call that can reach such a default (`csMayDefault`): every other call's
+// node would be checked, sized and scanned for nothing.
 export function csPreMintLocs(): i32 {
   paramDefaultTablesReset()
-  if !csAnyCallsiteDefault() { return 0 }
+  const fns = csCallsiteFns()
+  if !csAnyDefault { return 0 }
+  const plains = csCallsitePlains(fns)
   // Snapshot the length FIRST — minting appends, and the nodes appended are not
   // themselves calls.
   const n0 = P.nodes.length
@@ -2313,7 +2381,7 @@ export function csPreMintLocs(): i32 {
   let i = 0
   while i < n0 {
     const n = P.nodes[i]
-    if n is Call {
+    if n is Call && csMayDefault(i, n, fns, plains) {
       let ln = 0
       let co = 0
       let fileLex = noFileLex
