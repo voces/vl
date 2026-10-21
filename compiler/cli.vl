@@ -473,6 +473,10 @@ let cliPresetFromDir: i32[] = []
 // the root's whole contribution to the report, 1 = this instance checks it itself.
 let cliPoolStatus: i32[] = []
 let cliPoolPayload: string[] = []
+// When this instance checks every root itself, the walk index of each root in the queue
+// order it checks them in, and per checked root the report lengths it started at.
+let cliSelfPerm: i32[] = []
+let cliSelfSegs: i32[][] = []
 // A worker's report baselines (what its own walk left), and its `--budget` notes as
 // five fields each, replayed by the parent through `budgetNote` in root order.
 let cliPwBase: i32[] = []
@@ -682,6 +686,8 @@ export function cliArgReset() {
   cliPresetFromDir = []
   cliPoolStatus = []
   cliPoolPayload = []
+  cliSelfPerm = []
+  cliSelfSegs = []
   cliPwBase = []
   cliPwNotes = []
   cliTestFileErr = []
@@ -2852,6 +2858,94 @@ export function cliCheckPooledCommit(status: i32) {
   if st == 0 { cliPoolPayload[f] = payload }
   0
 }
+
+// When the pool handed every root back (one worker), check them here in queue order, importers
+// first, so a root still meets the importer check that can serve it. The walk's order of the
+// paths is restored and each root's report lines moved back to it by `cliSelfOrderEnd`.
+function cliSelfOrderBegin() {
+  cliSelfPerm = []
+  cliSelfSegs = []
+  if (
+    !cliWiOn
+    || cliWiPerm.length != cliFiles.length
+    || cliPoolStatus.length != cliFiles.length
+  ) {
+    return 0
+  }
+  for st in cliPoolStatus {
+    if st == 0 { return 0 }
+  }
+  const files: string[] = []
+  const fromDir: i32[] = []
+  for f in cliWiPerm {
+    files.push(cliFiles[f])
+    fromDir.push(cliFileFromDir[f])
+  }
+  cliSelfPerm = cliWiPerm
+  cliFiles = files
+  cliFileFromDir = fromDir
+  0
+}
+
+// Undo `cliSelfOrderBegin` once every root is checked: the paths in walk order, and the
+// report lines, `--json` items and `--batch` records each root appended, in walk order.
+function cliSelfOrderEnd() {
+  const n = cliSelfPerm.length
+  if n == 0 || cliSelfSegs.length != n + 1 { return 0 }
+  const at: i32[] = []
+  for _ in cliSelfPerm { at.push(0) }
+  let j = 0
+  while j < n {
+    at[cliSelfPerm[j]] = j
+    j = j + 1
+  }
+  const files: string[] = []
+  const fromDir: i32[] = []
+  for _ in cliSelfPerm {
+    files.push("")
+    fromDir.push(0)
+  }
+  j = 0
+  while j < n {
+    files[cliSelfPerm[j]] = cliFiles[j]
+    fromDir[cliSelfPerm[j]] = cliFileFromDir[j]
+    j = j + 1
+  }
+  cliFiles = files
+  cliFileFromDir = fromDir
+  cliOut = cliSelfRestore(cliOut, at, 0)
+  cliJsonItems = cliSelfRestore(cliJsonItems, at, 1)
+  cliBatchOut = cliSelfRestore(cliBatchOut, at, 2)
+  cliSelfPerm = []
+  cliSelfSegs = []
+  0
+}
+
+// `xs` with the rows each root appended (column `c` of `cliSelfSegs`) in walk order, where
+// `at[f]` is the queue position of walk root `f`.
+function cliSelfRestore(xs: string[], at: i32[], c: i32): string[] {
+  const n = at.length
+  const out: string[] = []
+  let i = 0
+  while i < cliSelfSegs[0][c] {
+    out.push(xs[i])
+    i = i + 1
+  }
+  for j in at {
+    let k = cliSelfSegs[j][c]
+    while k < cliSelfSegs[j + 1][c] {
+      out.push(xs[k])
+      k = k + 1
+    }
+  }
+  i = cliSelfSegs[n][c]
+  while i < xs.length {
+    out.push(xs[i])
+    i = i + 1
+  }
+  out
+}
+
 // A test name, one code point at a time (the `cliDirNamePush` idiom).
 export function cliTestNamePush(c: i32) {
   cliTestNameAcc.push(c)
@@ -3085,7 +3179,11 @@ function cliStartFile() {
     cliPoolApply(cliFileIdx)
     cliFileIdx = cliFileIdx + 1
   }
+  if cliSelfPerm.length > 0 && cliSelfSegs.length == cliFileIdx {
+    cliSelfSegs.push([cliOut.length, cliJsonItems.length, cliBatchOut.length])
+  }
   if cliFileIdx >= cliFiles.length {
+    cliSelfOrderEnd()
     if cliBudget == 3 { return cliBudgetGitRead(budgetGitStart()) }
     if cliBudget != 0 { cliBudgetFinish() } else { cliFinishSummary() }
     return cliBeginPrint()
@@ -4539,6 +4637,7 @@ export function cliNext() {
   if st == ST_CHECK_NEXT { return cliCheckWorkerBegin() }
   if st == ST_CHECK_POOLED {
     cliFileIdx = 0
+    cliSelfOrderBegin()
     return cliStartFile()
   }
   if st == ST_TEST_POOLED {

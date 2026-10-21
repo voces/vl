@@ -322,3 +322,46 @@ Deno.test({
     }
   },
 });
+
+// With one worker the parent checks every root itself, and it checks them importers first: b.vl
+// is named before a.vl, its importer, and is still served from a.vl's check. The report keeps
+// the order the roots were named in, so b.vl's diagnostics print before a.vl's, as when each
+// root is checked alone.
+Deno.test({
+  name: "vl-check-dir: one worker serves a root named before its importer, in the named order",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await makeTempDir({ prefix: "vl_check_order_" });
+    try {
+      const files: Record<string, string> = {
+        "a.vl": 'import { g } from "./b"\nprint(g())\nconst spare = 1\n',
+        "b.vl": 'import { h } from "./c"\nexport function g(): i32 { h() }\nconst bad = "x"\n',
+        "c.vl": "export function h(): i32 { 1 }\n",
+      };
+      for (const [name, src] of Object.entries(files)) {
+        await Deno.writeTextFile(`${dir}/${name}`, src);
+      }
+      const run = async (args: string[]) => {
+        const r = await new Deno.Command(VL, {
+          args: ["check", ...args, "--concise", "--compiler", COMPILER],
+          cwd: dir,
+          stdout: "piped",
+          stderr: "piped",
+          env: nativeEnv({ NO_COLOR: "1", VL_JOBS: "1", VL_CHECK_STATS: "1" }),
+        }).output();
+        return { code: r.code, err: new TextDecoder().decode(r.stderr) };
+      };
+      const own = (s: string) => s.split("\n").filter((l) => /^[ab]\.vl: /.test(l));
+      const want = [...own((await run(["b.vl"])).err), ...own((await run(["a.vl"])).err)];
+      const r = await run(["b.vl", "a.vl"]);
+      if (!r.err.includes("[check] served: roots=1 ")) {
+        throw new Error(`want b.vl served from a.vl's check, got:\n${r.err}`);
+      }
+      if (want.length !== 2 || JSON.stringify(own(r.err)) !== JSON.stringify(want) || r.code !== 0) {
+        throw new Error(`want b.vl's warning then a.vl's:\n${want.join("\n")}\ngot ${r.code}:\n${r.err}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
