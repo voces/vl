@@ -17236,8 +17236,36 @@ function strLitLenOf(ix: i32): i32 {
   -1
 }
 
+// The longest literal `emitStrEqLit` compares byte by byte in place of calling `__str_eq__`.
+const STR_EQ_INLINE_BYTES = 2
+
+// Leave 1 when every byte of the string in the string-op frame's last slot, whose length is
+// already known to be `bytes.length`, equals the matching byte of `bytes`, else 0.
+function emitStrBytesEq(bytes: i32[]) {
+  let k = 0
+  while k < bytes.length {
+    fbLocalGet(strScratchBase + 11)
+    fbStrBack()
+    fbLocalGet(strScratchBase + 11)
+    fbStrStart()
+    if k > 0 {
+      fbI32Const(k)
+      fbI32Bin(106) // 0x6a i32.add
+    }
+    fbArrayGet(sBackIdx)
+    fbI32Const(bytes[k])
+    fbI32Bin(70) // 0x46 i32.eq
+    if k > 0 {
+      fbI32Bin(113) // 0x71 i32.and
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Compare the string on the stack with literal node `litIx`, leaving the 0/1 result: a length
-// other than the literal's answers 0 without evaluating the literal or calling `__str_eq__`.
+// other than the literal's answers 0 without evaluating the literal or calling `__str_eq__`,
+// and an empty or short literal is compared in place without the call either.
 // The operand waits in the string-op frame's last slot; without that frame it is the bare call.
 function emitStrEqLit(body: u8[], litIx: i32, fnIx: i32) {
   const n = strLitLenOf(litIx)
@@ -17247,9 +17275,23 @@ function emitStrEqLit(body: u8[], litIx: i32, fnIx: i32) {
   }
   fbLocalTee(strScratchBase + 11)
   fbStrLen()
+  if n == 0 {
+    fbI32Eqz()
+    return 0
+  }
   fbI32Const(n)
   fbI32Bin(70) // 0x46 i32.eq
   fbIf(127)    // if (result i32)
+  if n <= STR_EQ_INLINE_BYTES && litIx < P.nodes.length {
+    const lit = P.nodes[litIx]
+    if lit is StrLit {
+      emitStrBytesEq(cpsToUtf8(decodeStr(strToCps(lit.strText))))
+      fbElse()
+      fbI32Const(0)
+      fbEnd()
+      return 0
+    }
+  }
   fbLocalGet(strScratchBase + 11)
   if emitStrValue(body, litIx, fnIx) < 0 { return -1 }
   fbCall(gHelpStrEq)
