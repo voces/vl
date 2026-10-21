@@ -15,7 +15,7 @@ import { exit, runProgram } from "std:process"
 import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
 import { parseI32, toString } from "std:fmt"
-import { endsWith, join, split, startsWith } from "std:str"
+import { endsWith, join, split, startsWith, toLowerAscii } from "std:str"
 import {
   die,
   findFrom,
@@ -31,7 +31,9 @@ import {
   declaredOutcome,
   headOf,
   idKey,
+  isAlpha,
   matchSec,
+  negatedBefore,
   padTo,
   resolve,
   sortKeys,
@@ -45,7 +47,13 @@ const MARKER = "<!-- reservations below; the marker is what --reserve/--release 
 const USAGE = "usage: vl run scripts/inventory/ls.vl -- [<doc-or-dir>...] [--status S] [--tail N]\n       vl run scripts/inventory/ls.vl -- --next\n       vl run scripts/inventory/ls.vl -- --reserve D<lo>-D<hi> <holder> [<note>]\n       vl run scripts/inventory/ls.vl -- --release D<lo>-D<hi>\n`--status` takes open, closed, silent, loud, or any canonical outcome by name."
 
 // One listed row; `key.path` carries the row's index into the list it came from.
-type Listed = { id: string, outcome: string, title: string, key: IdKey }
+type Listed = {
+  id: string,
+  outcome: string,
+  settled: boolean,
+  title: string,
+  key: IdKey,
+}
 
 // A live reservation line of `RESERVED.md`.
 type Res = { lo: i64, hi: i64, who: string, date: string, note: string }
@@ -99,20 +107,47 @@ function statusLine(body: string[]): string {
   ""
 }
 
-// The outcome a row's body files, or "?": its status line, else its first bold line.
-function rowOutcome(body: string[]): string {
-  let status = statusLine(body)
-  if status == "" {
-    for ln in body {
-      if startsWith(ln, "**") {
-        status = stripWs(stripByte(ln, 42))
-        break
-      }
-    }
+// A row's status: its status line, else its first bold line.
+function rowStatus(body: string[]): string {
+  const status = statusLine(body)
+  if status != "" { return status }
+  for ln in body {
+    if startsWith(ln, "**") { return stripWs(stripByte(ln, 42)) }
   }
+  ""
+}
+
+// The outcome a status files, or "?".
+function rowOutcome(status: string): string {
   const o = declaredOutcome(status)
   if o == "" { return "?" }
   o
+}
+
+const SETTLED_WORDS = ["closed", "fixed", "resolved", "ruled"]
+
+// Whether a status's first clause (up to ` · `) says, un-negated, that its row is closed,
+// fixed, resolved or ruled. The outcome alone cannot: a row closed as a design refusal
+// files `check_reject`. Later clauses are left out: they credit a half or a sibling.
+function rowSettled(status: string): boolean {
+  let low = toLowerAscii(status)
+  const cut = findFrom(low, " · ", 0)
+  if cut != -1 { low = low.slice(0, cut) }
+  for w in SETTLED_WORDS {
+    let at = findFrom(low, w, 0)
+    while at != -1 {
+      const end = at + w.length
+      const before = at == 0 || !wordByte(low[at - 1])
+      const after = end >= low.length || !wordByte(low[end])
+      if before && after && !negatedBefore(low, at) { return true }
+      at = findFrom(low, w, end)
+    }
+  }
+  false
+}
+
+function wordByte(b: i32): boolean {
+  isAlpha(b) || isDigit(b) || b == 45 || b == 95
 }
 
 // Every row of `doc`: a row runs from its heading to the next row or `#`/`##` heading.
@@ -134,10 +169,12 @@ function rowsOfDoc(doc: string, out: Listed[]) {
       j = j + 1
     }
     const key = idKey(m.id, toString(out.length))
+    const status = rowStatus(stripSeparator(lines.slice(i, j)))
     out.push(
       {
         id: m.id,
-        outcome: rowOutcome(stripSeparator(lines.slice(i, j))),
+        outcome: rowOutcome(status),
+        settled: rowSettled(status),
         title: m.title,
         key: key,
       },
@@ -162,9 +199,9 @@ function allRows(targets: string[]): Listed[] {
   out
 }
 
-function wanted(want: string, outcome: string): boolean {
-  if want == "open" { return outcome != "runs" }
-  if want == "closed" { return outcome == "runs" }
+function wanted(want: string, outcome: string, settled: boolean): boolean {
+  if want == "open" { return outcome != "runs" && !settled }
+  if want == "closed" { return outcome == "runs" || settled }
   if want == "silent" { return startsWith(outcome, "silent_") }
   if want == "loud" { return endsWith(outcome, "_reject") }
   outcome == want
@@ -479,7 +516,7 @@ function main(args: string[]): i32 {
   if nxt { return nextId(rows) }
   let picked: Listed[] = []
   for r in rows {
-    if want == "" || wanted(want, r.outcome) { picked.push(r) }
+    if want == "" || wanted(want, r.outcome, r.settled) { picked.push(r) }
   }
   if tail > 0 && tail < picked.length {
     picked = picked.slice(picked.length - tail, picked.length)
