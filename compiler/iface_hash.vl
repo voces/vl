@@ -8,12 +8,15 @@
 // a test or a probe; the build never reads it.
 import {
   AsExpr,
+  Call,
   FieldDef,
   FieldInit,
   FuncDecl,
   IsExpr,
   LetDecl,
+  Member,
   ObjLit,
+  OptMember,
   P,
   Param,
   Program,
@@ -44,6 +47,8 @@ import {
 import { nodeTyIxOf } from "./check_node_tys"
 import { tyHasTyVar } from "./tyquery"
 import { strListHas } from "./listutil"
+import { recFnValueLeaves } from "./check_type_shape"
+import { cwPeel } from "./check_write_scan"
 
 let ihArmed = false
 // Ingredients a mutation check removes, one bit each (see `ifaceHashDrop`).
@@ -139,20 +144,30 @@ let ihAkKind: i32[] = []
 let ihAkLo: i32[] = []
 let ihAkHi: i32[] = []
 let ihAkW: string[] = []
-let ihAkSet: i32[] = []
+let ihAkName: string[] = []
+// Per key: whether it is a `self` method's name, which only a member call `.name(` or `.name<` reaches.
+let ihAkCall: boolean[] = []
 // Per key: the ordered field names and built-in field types of the record a plain declaration
 // declares, or 0 when the key is not such a declaration's (`ihTwinShape`).
 let ihAkShape: i32[] = []
+// Per key: a declared record's field types aligned with its names, a primitive's name or "" for
+// any other type, or [] when the key is no declaration's.
+let ihAkTys: string[][] = []
 let ihDeclsOf: {[string]: i32[]} = Map()
 let ihFv: {[string]: boolean} = Map()
-// The field-name sets the check of S builds, by `ihSetKey`; `ihSetsAny` when one repeats a name.
-let ihSets: {[i32]: boolean} = Map()
+// The field-name sets the check of S builds, by `ihSetName`; `ihSetsAny` when one repeats a name.
+let ihSets: {[string]: boolean} = Map()
 let ihSetsAny = false
-// Object literals: statement `ihLitSt[k]` builds one whose field-name set has key `ihLitKey[k]`,
+// Object literals: statement `ihLitSt[k]` builds one whose field-name set is `ihLitKey[k]`,
 // with `ihLitRep[k]` when it repeats a name.
 let ihLitSt: i32[] = []
-let ihLitKey: i32[] = []
+let ihLitKey: string[] = []
 let ihLitRep: boolean[] = []
+// Per literal: 1 when it is an argument of a member call `x.m(`, 2 of a plain call, else 0.
+let ihLitArg: i32[] = []
+// Per literal: 2 when a non-generic function with a declared result returns it as it stands, 1
+// when another function does and `IH_LOOSE_SETTLED` is on, else 0.
+let ihLitSettled: i32[] = []
 // Import rows: module `ihImpMod[k]` binds `ihImpLocal[k]` to `ihImpOName[k]` of module
 // `ihImpOMod[k]`, the declaring one; an empty name is a namespace import.
 let ihImpMod: i32[] = []
@@ -555,17 +570,44 @@ function ihAkRow(at: i32, kind: i32, ws: string[]): void {
   ihAkLo.push(ihAkW.length)
   for w in ws { ihAkW.push(w) }
   ihAkHi.push(ihAkW.length)
-  ihAkSet.push(ihSetKey(ws))
+  ihAkName.push(ihSetName(ws))
+  ihAkCall.push(false)
   ihAkShape.push(0)
+  ihAkTys.push([])
   if kind == IH_AK_FIELDS && ihHasRepeat(ws) { ihMarkWild(at) }
 }
 
-// An order-free key of a set of names: equal sets give equal keys, and a collision only adds
-// a meet.
-function ihSetKey(ws: string[]): i32 {
-  let sum = 0
-  for w in ws { sum = sum + ihMixStr(IH_SEED, w) }
-  ihMixInt(sum, ws.length)
+// An order-free name of a set of names: its members sorted and joined by `,`, so two sets
+// share a name only when they hold the same names.
+function ihSetName(ws: string[]): string {
+  const s: string[] = []
+  for w in ws {
+    let i = s.length
+    s.push(w)
+    while i > 0 && ihStrAfter(s[i - 1], w) {
+      s[i] = s[i - 1]
+      i = i - 1
+    }
+    s[i] = w
+  }
+  let out = ""
+  let j = 0
+  while j < s.length {
+    if j > 0 { out = out + "," }
+    out = out + s[j]
+    j = j + 1
+  }
+  out
+}
+
+// Whether `a` sorts after `b` byte by byte, a prefix first.
+function ihStrAfter(a: string, b: string): boolean {
+  let i = 0
+  while i < a.length && i < b.length {
+    if a[i] != b[i] { return a[i] > b[i] }
+    i = i + 1
+  }
+  a.length > b.length
 }
 
 function ihHasRepeat(ws: string[]): boolean {
@@ -584,7 +626,7 @@ function ihHasRepeat(ws: string[]): boolean {
 // Adds one field-name set the check of S builds.
 function ihSetAdd(ws: string[]): void {
   if ihHasRepeat(ws) { ihSetsAny = true }
-  ihSets[ihSetKey(ws)] = true
+  ihSets[ihSetName(ws)] = true
 }
 
 // A declared type's name without its parameters or its block-scope suffix.
@@ -614,6 +656,7 @@ function ihDeclKeys(x: i32, at: i32, seen: string[]): void {
   const nd = P.nodes[x]
   if nd is TypeDecl {
     const ws: string[] = []
+    const tys: string[] = []
     let ok = true
     for f in nd.tdFields {
       let typed = false
@@ -626,13 +669,19 @@ function ihDeclKeys(x: i32, at: i32, seen: string[]): void {
             if ft is TypeRef {
               ihSpellKeys(ft.tyName, at, seen)
               typed = true
+              tys.push(if ihPrimName(ft.tyName) { ft.tyName } else { "" })
             }
           }
         }
       }
       if !typed { ok = false }
     }
-    if ok { ihAkRow(at, IH_AK_FIELDS, ws) } else { ihMarkWild(at) }
+    if ok {
+      ihAkRow(at, IH_AK_FIELDS, ws)
+      ihAkTys[ihAkTys.length - 1] = tys
+    } else {
+      ihMarkWild(at)
+    }
   } else if nd is UnionDecl {
     for v in nd.udVariants { ihSpellKeys(v, at, seen) }
   } else {
@@ -667,6 +716,17 @@ function ihScalarName(n: string): boolean {
     || n == "boolean"
     || n == "string"
   scalar && !ihDeclsOf.has(n)
+}
+
+// Whether `n` names a primitive the check stores by that name, which no module redeclares.
+function ihPrimName(n: string): boolean {
+  const prim = n == "i32"
+    || n == "i64"
+    || n == "f32"
+    || n == "f64"
+    || n == "boolean"
+    || n == "string"
+  prim && !ihDeclsOf.has(n)
 }
 
 // Whether `head` is the built-in `Map` or `Set` and no module declares that name. Its instance
@@ -742,8 +802,9 @@ function ihSpellKeys(s: string, at: i32, seen: string[]): boolean {
 }
 
 // Whether `fd` is found by a call that does not name it through an import: a method on its
-// first parameter `self`, a getter, or an operator. A method's or getter's name becomes a key
-// of `at`, and so does the `new` type an operator takes; any other operator makes `at` wild.
+// first parameter `self`, a getter, or an operator. A getter's name becomes a key of `at`, and
+// a method's one only a member call meets, since only a call resolves a method; so does the
+// `new` type an operator takes, and any other operator makes `at` wild.
 function ihReceiverFn(fd: FuncDecl, at: i32): boolean {
   let nm = ihSourceName(fd.fnName)
   let recv = false
@@ -767,11 +828,15 @@ function ihReceiverFn(fd: FuncDecl, at: i32): boolean {
       i = i + 1
     }
   }
+  const getter = recv
   if !recv && fd.fnParams.length > 0 {
     const pn = P.nodes[fd.fnParams[0]]
     recv = pn is Param && pn.parName == "self"
   }
-  if recv && at >= 0 { ihAkRow(at, IH_AK_RECV, [nm]) }
+  if recv && at >= 0 {
+    ihAkRow(at, IH_AK_RECV, [nm])
+    ihAkCall[ihAkCall.length - 1] = !getter
+  }
   recv
 }
 
@@ -860,11 +925,15 @@ export function ihAmbientScan(): i32 {
   ihAkLo = []
   ihAkHi = []
   ihAkW = []
-  ihAkSet = []
+  ihAkName = []
+  ihAkCall = []
   ihAkShape = []
+  ihAkTys = []
   ihLitSt = []
   ihLitKey = []
   ihLitRep = []
+  ihLitArg = []
+  ihLitSettled = []
   ihDeclsOf = Map()
   let s = 0
   while s < ihStMod.length {
@@ -888,6 +957,8 @@ export function ihAmbientScan(): i32 {
   }
   x = 0
   const stAt = ihStTable()
+  const argOf = ihLitArgs()
+  const settled = ihSettledLits()
   while x < P.nodes.length {
     const nd = P.nodes[x]
     const at = ihStAtIn(stAt, nodeLastTok(x))
@@ -917,14 +988,55 @@ export function ihAmbientScan(): i32 {
       if nd is ObjLit {
         const ws = ihLitNames(nd.objFields)
         ihLitSt.push(at)
-        ihLitKey.push(ihSetKey(ws))
+        ihLitKey.push(ihSetName(ws))
         ihLitRep.push(ihHasRepeat(ws))
+        ihLitArg.push(argOf[x])
+        ihLitSettled.push(settled[x])
       }
       if amb { ihStAmb[at] = true }
     }
     x = x + 1
   }
   ihWildUnkeyed()
+}
+
+// Per node, 2 when it is an object literal a non-generic function with a declared result returns
+// as it stands, which the check delivers to that result and never to a record of its names; 1
+// when another function returns it so and `IH_LOOSE_SETTLED` asks.
+function ihSettledLits(): i32[] {
+  const out: i32[] = []
+  for _ in P.nodes { out.push(0) }
+  let x = 0
+  for nd in P.nodes {
+    const settles = nd is FuncDecl && nd.fnRet >= 0 && nd.fnTyParams.length == 0
+    if nd is FuncDecl && (settles || ihLoose(IH_LOOSE_SETTLED)) {
+      const kind = if settles { 2 } else { 1 }
+      for lf in recFnValueLeaves(x) {
+        const l = cwPeel(lf)
+        if l >= 0 && l < out.length && P.nodes[l] is ObjLit && out[l] == 0 {
+          out[l] = kind
+        }
+      }
+    }
+    x = x + 1
+  }
+  out
+}
+
+// Per node, 1 when it is an argument of a member call such as `xs.push(`, 2 of a plain call.
+function ihLitArgs(): i32[] {
+  const out: i32[] = []
+  for _ in P.nodes { out.push(0) }
+  for nd in P.nodes {
+    if nd is Call && nd.callFn >= 0 && nd.callFn < P.nodes.length {
+      const f = P.nodes[nd.callFn]
+      const kind = if f is Member || f is OptMember { 1 } else { 2 }
+      for a in nd.callArgs {
+        if a >= 0 && a < out.length { out[a] = kind }
+      }
+    }
+  }
+  out
 }
 
 // Every ambient statement that holds no key is wild.
@@ -1026,7 +1138,7 @@ export function ihAmbientMeets(diags: boolean): boolean[] {
       const kind = ihAkKind[k]
       let all = true
       if kind == IH_AK_FIELDS {
-        all = ihSetsAny || ihSets.has(ihAkSet[k])
+        all = ihSetsAny || ihSets.has(ihAkName[k])
       } else {
         let w = ihAkLo[k]
         while w < ihAkHi[k] {
@@ -1049,13 +1161,20 @@ export function ihAmbientMeets(diags: boolean): boolean[] {
 type IhIndex = {
   xWord: {[string]: i32[]},
   xMember: {[string]: i32[]},
+  xCall: {[string]: i32[]},
   xField: {[string]: i32[]},
-  xLit: {[i32]: i32[]},
+  xLit: {[string]: i32[]},
+  xLitBare: {[string]: i32[]},
+  xLitLeaf: {[string]: i32[]},
   xRep: i32[],
-  xArena: {[i32]: i32[]},
+  xArena: {[string]: i32},
   xArenaW: string[][],
   xArenaM: i32[][],
   xArenaRep: i32[],
+  xArenaS: i32[][],
+  xSig: {[string]: i32},
+  xSigC: string[][],
+  xSigM: i32[][],
   xWild: boolean[],
   xNames: boolean[],
   xShape: {[i32]: i32[]},
@@ -1066,13 +1185,20 @@ function ihIndexEmpty(): IhIndex {
   const ix: IhIndex = {
     xWord: Map(),
     xMember: Map(),
+    xCall: Map(),
     xField: Map(),
     xLit: Map(),
+    xLitBare: Map(),
+    xLitLeaf: Map(),
     xRep: [],
     xArena: Map(),
     xArenaW: [],
     xArenaM: [],
     xArenaRep: [],
+    xArenaS: [],
+    xSig: Map(),
+    xSigC: [],
+    xSigM: [],
     xWild: [],
     xNames: [],
     xShape: Map(),
@@ -1108,9 +1234,17 @@ export function ihAmbientIndex(): i32 {
     const m = ihStMod[ihLitSt[k]]
     if m >= 0 {
       if ihLitRep[k] { ihIxPush(ix.xRep, m) }
-      const rows = ix.xLit[ihLitKey[k]] ?? []
-      ihIxPush(rows, m)
-      ix.xLit[ihLitKey[k]] = rows
+      // The check builds a record by its field names only from what a plain call hands back,
+      // and never from a literal a declared result settles.
+      const open = ihLitSettled[k] != 2 || ihLitRep[k]
+      const plain = ihLitArg[k] != 1 || ihLitRep[k]
+      if open && plain { ihIxRow(ix.xLit, ihLitKey[k], m) }
+      if open && (ihLitArg[k] == 0 || ihLitRep[k]) {
+        ihIxRow(ix.xLitBare, ihLitKey[k], m)
+      }
+      if (ihLitSettled[k] == 0 || ihLitRep[k]) && plain {
+        ihIxRow(ix.xLitLeaf, ihLitKey[k], m)
+      }
     }
     k = k + 1
   }
@@ -1136,6 +1270,7 @@ export function ihAmbientIndex(): i32 {
         }
         const member = pk == "DOT" || pk == "QUESTION_DOT"
         if member { ihIxRow(ix.xMember, w, m) }
+        if member && (nk == "LPAREN" || nk == "LT") { ihIxRow(ix.xCall, w, m) }
         let inBrace = true
         if open.length > 0 { inBrace = open[open.length - 1] == "LBRACE" }
         const lead = pk == "LBRACE" || pk == "COMMA"
@@ -1172,7 +1307,12 @@ function ihIxArena(ix: IhIndex): i32 {
   let k = 0
   while k < ihAkSt.length {
     if ihAkKind[k] == IH_AK_FIELDS {
-      ihIxRec(ix, ihAkW.slice(ihAkLo[k], ihAkHi[k]), ihStMod[ihAkSt[k]])
+      ihIxRec(
+        ix,
+        ihAkW.slice(ihAkLo[k], ihAkHi[k]),
+        ihAkTys[k],
+        ihStMod[ihAkSt[k]],
+      )
     }
     k = k + 1
   }
@@ -1195,7 +1335,7 @@ function ihIxReach(ix: IhIndex, ty: i32, m: i32, seen: i32[]): void {
   const t = T.tys[ty]
   match t {
     TyObj => {
-      ihIxRec(ix, t.objFieldNames, m)
+      ihIxRec(ix, t.objFieldNames, ihFieldClasses(t), m)
       for f in t.objFieldTypes { ihIxReach(ix, f, m, seen) }
     }
     TyFunc => {
@@ -1219,29 +1359,108 @@ function ihIxReach(ix: IhIndex, ty: i32, m: i32, seen: i32[]): void {
   }
 }
 
-// Module `m` holds a record with field names `ws`.
-function ihIxRec(ix: IhIndex, ws: string[], m: i32): void {
+// Module `m` holds a record with field names `ws`, whose field types `cls` names as
+// `ihAkTys` does ([] when none is known).
+function ihIxRec(ix: IhIndex, ws: string[], cls: string[], m: i32): void {
   if m < 0 { return }
-  const key = ihSetKey(ws)
-  const rows = ix.xArena[key] ?? []
-  for a in rows {
-    if ihSameSet(ix.xArenaW[a], ws) {
-      ihIxPush(ix.xArenaM[a], m)
-      return
-    }
+  const key = ihSetName(ws)
+  let a = ix.xArena[key] ?? -1
+  if a >= 0 {
+    ihIxPush(ix.xArenaM[a], m)
+  } else {
+    a = ix.xArenaW.length
+    ix.xArenaW.push(ws)
+    ix.xArenaM.push([m])
+    ix.xArenaS.push([])
+    if ihHasRepeat(ws) { ix.xArenaRep.push(a) }
+    ix.xArena[key] = a
   }
-  const a = ix.xArenaW.length
-  ix.xArenaW.push(ws)
-  ix.xArenaM.push([m])
-  if ihHasRepeat(ws) { ix.xArenaRep.push(a) }
-  rows.push(a)
-  ix.xArena[key] = rows
+  // The storage, in entry `a`'s field order.
+  const at = ix.xArenaW[a]
+  const sig: string[] = []
+  let sk = key + "|"
+  for w in at {
+    let c = ""
+    let j = 0
+    while j < ws.length && j < cls.length {
+      if ws[j] == w { c = cls[j] }
+      j = j + 1
+    }
+    sig.push(c)
+    sk = sk + c + ","
+  }
+  let s = ix.xSig[sk] ?? -1
+  if s < 0 {
+    s = ix.xSigC.length
+    ix.xSigC.push(sig)
+    ix.xSigM.push([])
+    ix.xArenaS[a].push(s)
+    ix.xSig[sk] = s
+  }
+  ihIxPush(ix.xSigM[s], m)
 }
 
-function ihSameSet(a: string[], b: string[]): boolean {
-  if a.length != b.length { return false }
-  for w in b {
-    if !strListHas(a, w) { return false }
+// The field types of record `t` aligned with its names: a primitive's name, `i32` for an integer
+// literal (stored as one), and "" for any other type.
+function ihFieldClasses(t: TyObj): string[] {
+  const out: string[] = []
+  for f in t.objFieldTypes {
+    let c = ""
+    if f >= 0 && f < T.tys.length {
+      const ft = T.tys[f]
+      match ft {
+        TyPrim => {
+          c = ft.primName
+        }
+        TyLit => {
+          if ft.litKind == "int" { c = "i32" }
+        }
+        // a storage the arena does not compare stays unknown
+        TyErr | TyObj | TyFunc | TyUnion | TyNullable | TyArray | TyMap | TyVar | TyNeg => {}
+      }
+    }
+    out.push(c)
+  }
+  out
+}
+
+// Whether a module of `inS` holds a record of entry `a` whose storage can equal key `k`'s
+// declaration: every field both name a primitive of agrees, as the check's storage test reads it.
+function ihIxStoreHolds(a: i32, k: i32, inS: boolean[]): boolean {
+  const tys = ihAkTys[k]
+  if tys.length == 0 { return ihIxIn(ihIx.xArenaM[a], inS) }
+  const at = ihIx.xArenaW[a]
+  for s in ihIx.xArenaS[a] {
+    if ihIxIn(ihIx.xSigM[s], inS) && ihSigFits(ihIx.xSigC[s], at, k, tys) {
+      return true
+    }
+  }
+  false
+}
+
+// Whether storage `sig` of fields `at` can equal key `k`'s declared field types `tys`.
+function ihSigFits(
+  sig: string[],
+  at: string[],
+  k: i32,
+  tys: string[],
+): boolean {
+  let i = 0
+  while i < at.length && i < sig.length {
+    let j = 0
+    while j < tys.length && ihAkLo[k] + j < ihAkHi[k] {
+      const d = tys[j]
+      if (
+        ihAkW[ihAkLo[k] + j] == at[i]
+        && d != ""
+        && sig[i] != ""
+        && d != sig[i]
+      ) {
+        return false
+      }
+      j = j + 1
+    }
+    i = i + 1
   }
   true
 }
@@ -1321,13 +1540,15 @@ export function ihAmbientMeetsIn(
       let all = true
       if kind == IH_AK_FIELDS {
         ihViaArena = false
-        all = any || ihIxIn(ihIx.xLit[ihAkSet[k]] ?? [], inS)
+        let lits = if ihLoose(IH_LOOSE_ARGS) { ihIx.xLitBare } else { ihIx.xLit }
+        if ihLoose(IH_LOOSE_SETTLED) { lits = ihIx.xLitLeaf }
+        all = any || ihIxIn(lits[ihAkName[k]] ?? [], inS)
         if !all && arena {
-          for a in ihIx.xArena[ihAkSet[k]] ?? [] {
-            if ihIxHolds(a, inS) {
-              all = true
-              ihViaArena = true
-            }
+          const a = ihIx.xArena[ihAkName[k]] ?? -1
+          const held = a >= 0 && ihIxStoreHolds(a, k, inS)
+          if held && ihIxSpells(ihIx.xArenaW[a], inS) {
+            all = true
+            ihViaArena = true
           }
         }
       } else {
@@ -1335,6 +1556,9 @@ export function ihAmbientMeetsIn(
         while w < ihAkHi[k] {
           let hits = ihIx.xWord[ihAkW[w]] ?? []
           if kind == IH_AK_RECV { hits = ihIx.xMember[ihAkW[w]] ?? [] }
+          if ihAkCall[k] || kind == IH_AK_RECV && ihLoose(IH_LOOSE_GETTER) {
+            hits = ihIx.xCall[ihAkW[w]] ?? []
+          }
           if !ihIxIn(hits, inS) { all = false }
           w = w + 1
         }
@@ -1354,6 +1578,21 @@ export function ihAmbientMeetsIn(
   }
   out
 }
+
+// Guards `ihAmbientMeetsIn` loosens, for the suite's mask witnesses: a literal handed to any
+// call stops meeting (`IH_LOOSE_ARGS`), a getter meets only a member call (`IH_LOOSE_GETTER`),
+// and a literal any function returns stops meeting (`IH_LOOSE_SETTLED`).
+const IH_LOOSE_ARGS = 1
+const IH_LOOSE_GETTER = 2
+const IH_LOOSE_SETTLED = 4
+let ihLooseMask = 0
+
+export function ihAmbientLoose(mask: i32): i32 {
+  ihLooseMask = mask
+  0
+}
+
+function ihLoose(bit: i32): boolean { (ihLooseMask & bit) != 0 }
 
 // Per module, after `ihAmbientMeetsIn`: the key that met, for the check's trace.
 let ihMeetWhy: string[] = []

@@ -234,7 +234,15 @@ const WRAP_MID = 'import { wrap } from "./lib"\nexport function m(): i32 { wrap(
 // Mask bits, as `WI_NO_*` in `compiler/driver.vl` numbers them.
 const NO_ENTRY = 1, NO_DEMAND = 2, NO_WRITER = 8, NO_AMBIENT = 16, NO_RENDER = 128;
 const NO_ADOPTED = 256, NO_DIAG_NAMES = 4096, NO_OUTSIDE = 8192, NO_INERT_OUT = 16384;
-const NO_INERT_SHAPE = 32768;
+const NO_INERT_SHAPE = 32768, NO_ARENA = 64;
+const LOOSE_ARGS = 65536, LOOSE_GETTER = 131072, LOOSE_SETTLED = 262144;
+
+// G builds a `J` from an inferred builder; main declares a record of the literal's own storage.
+const BUILT_LIB = (body: string) =>
+  `type J = { f: i32 | null }\nfunction id<T>(v: T): T { v }\nfunction mk() { ${body} }\n` +
+  "export function jj(): void {\n  const xj: J = mk()\n  const kk = mk()\n" +
+  "  print(xj.f ?? 0)\n  print([kk][0].f)\n}\n";
+const BUILT_MAIN = 'import { jj } from "./lib"\ntype II = { f: i32 }\njj()\n';
 
 // The fresh guard, the asks guard, the ambient guard's arena half and the outside guard's undo
 // halves have no mask witness: no graph found shows a served answer that differs once they are
@@ -393,6 +401,36 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "ambient",
+  },
+  {
+    name: "a same-shape record outside G is one type with G's beside a row that renders a primitive",
+    graph: {
+      "main.vl": TWIN_MAIN("i32"),
+      "lib.vl": TWIN_LIB("const b: boolean = p.x > 0\n  if b { p.x } else { 0 }"),
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a same-shape record checked before G is served beside a row that renders G's record",
+    graph: {
+      "main.vl": 'import { q } from "./oth"\nimport { mk } from "./lib"\nprint(mk())\nprint(q.tag)\n',
+      "oth.vl": 'export type Q = { x: i32, tag: string }\nexport const q: Q = { x: 3, tag: "b" }\n',
+      "lib.vl": TWIN_LIB("const q: P = p\n  q.x"),
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    // `r,g,b` and `w,h,d` once shared a field-set key.
+    name: "a record outside G whose field set no G literal spells is served",
+    graph: {
+      "main.vl": 'import { mk } from "./lib"\ntype Col = { r: i32, g: i32, b: i32 }\n' +
+        "const c: Col = { r: 1, g: 2, b: 3 }\nprint(mk() + c.g)\n",
+      "lib.vl": "function box() { { w: 1, h: 2, d: 3 } }\nexport function mk(): i32 { box().h }\n",
+    },
+    target: "lib.vl",
+    want: "served",
   },
   {
     name: "a record outside G that differs in one field type is not a twin",
@@ -600,6 +638,85 @@ const CASES: Case[] = [
     },
     target: "lib.vl",
     want: "ambient",
+  },
+  {
+    // The arena half then stands alone, so the mask drops it too.
+    name: "a literal an inferred builder returns declines beside a record of its storage",
+    graph: { "main.vl": BUILT_MAIN, "lib.vl": BUILT_LIB("{ f: 4 }") },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_ARENA | LOOSE_SETTLED,
+  },
+  {
+    name: "a literal a builder hands to a generic call declines beside a record of its storage",
+    graph: { "main.vl": BUILT_MAIN, "lib.vl": BUILT_LIB("id({ f: 4 })") },
+    target: "lib.vl",
+    want: "ambient",
+    mask: NO_ARENA | LOOSE_ARGS,
+  },
+  {
+    name: "a literal a declared result settles is served beside a record of other storage",
+    graph: {
+      "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: i32, y: i32 }\n' +
+        "const c: Ct = { x: 1, y: 2 }\nprint(mk() + c.y)\n",
+      "lib.vl": "type Pt = { x: f64, y: f64 }\nfunction pt(x: f64, y: f64): Pt { { x, y } }\n" +
+        "export function mk(): i32 {\n  const p = pt(1.5, 2.5)\n  if p.x > 1.0 { 1 } else { 0 }\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a record G holds at an outside record's storage declines",
+    graph: {
+      "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: i32, y: i32 }\n' +
+        "const c: Ct = { x: 1, y: 2 }\nprint(mk() + c.y)\n",
+      "lib.vl": "function pt(x: i32, y: i32): { x: i32, y: i32 } { { x, y } }\n" +
+        "export function mk(): i32 { pt(1, 2).y }\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+  },
+  {
+    name: "a literal G pushes onto its own list is served beside a record of its fields",
+    graph: {
+      "main.vl": 'import { mk } from "./lib"\ntype Ct = { x: f64, y: i32 }\n' +
+        "const c: Ct = { x: 1.5, y: 2 }\nprint(mk() + c.y)\n",
+      "lib.vl": "type Pt = { x: i32, y: i32 }\nexport function mk(): i32 {\n" +
+        "  const xs: Pt[] = []\n  xs.push({ x: 1, y: 2 })\n  xs[0].y\n}\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a self-function outside G whose name G reads only as a field is served",
+    graph: {
+      "main.vl": 'import { Gr, at } from "./lib"\nfunction next(self: Gr): i32 { 0 }\n' +
+        "const g: Gr = { next: [4] }\nprint(at(g, 0) + g.next())\n",
+      "lib.vl": "export type Gr = { next: i32[] }\nexport function at(g: Gr, i: i32): i32 { g.next[i] }\n",
+    },
+    target: "lib.vl",
+    want: "served",
+  },
+  {
+    name: "a self-function outside G that G calls declines",
+    graph: {
+      "main.vl": 'import { Gr, at } from "./lib"\nfunction zzn(self: Gr): i32 { 1 }\n' +
+        "const g: Gr = { n: 4 }\nprint(at(g))\n",
+      "lib.vl": "export type Gr = { n: i32 }\nexport function at(g: Gr): i32 { g.zzn() }\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+  },
+  {
+    name: "a getter outside G that G reads without a call declines",
+    graph: {
+      "main.vl": 'import { Cq, qv } from "./lib"\nget zzg(self: Cq): i32 { 1 }\nqv()\n',
+      "lib.vl": "export type Cq = new i32\nexport function qv(): void {\n" +
+        "  const c = 3 as! Cq\n  print(c.zzg)\n}\n",
+    },
+    target: "lib.vl",
+    want: "ambient",
+    mask: LOOSE_GETTER,
   },
   {
     name: "an error in a function body of G is served with the error",
