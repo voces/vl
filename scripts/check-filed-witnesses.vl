@@ -7,9 +7,10 @@
 //     vl run scripts/check-filed-witnesses.vl -- --self-test
 //
 // Run it from the checkout root. Rows are graded in chunks of one `vl check --batch` and one
-// `vl run --batch`, `$JOBS` chunks at a time (default 4) by `xargs -P` over a build of this
-// file, and a row the batches leave unanswered is graded alone. `xargs`, `mktemp`, `mkdir`
-// and `rm` stand in for what `std:process` and `std:fs` lack (`dogfood:` rows in ROADMAP.md).
+// `vl run --batch`, `$JOBS` chunks at a time (default 4) by `xargs -P`; a row the batches
+// leave unanswered is graded alone, and an outcome is cached under the seed, host, std and
+// grader that produced it (`$WITNESS_CACHE` names the directory, 0 turns it off). Shell tools
+// stand in for what `std:process` and `std:fs` lack (`dogfood:` rows in ROADMAP.md).
 
 import { IoError, listDir, readFile, readTextFile, writeTextFile } from "std:fs"
 import { exit, runProgram } from "std:process"
@@ -18,12 +19,14 @@ import { programArgs } from "std:args"
 import { Utf8Error, decodeUtf8Lossy } from "std:utf8"
 import { parseJson } from "std:json"
 import { parseI32, toString } from "std:fmt"
-import { endsWith, join, startsWith, toLowerAscii } from "std:str"
+import { endsWith, join, replaceAll, startsWith, toLowerAscii } from "std:str"
+import { sorted } from "std:array"
 import {
   JsonMap,
   Proc,
   cpPrefix,
   die,
+  envOr,
   exists,
   fanOutArgv,
   findFrom,
@@ -57,6 +60,14 @@ import {
   stripByte,
 } from "./lib/inventory"
 import { numField, strField } from "./lib/corpus"
+import {
+  Cached,
+  ROW_MARK,
+  decodeRecords,
+  encodeRecords,
+  fnvFeed,
+  hex64,
+} from "./lib/witness-cache"
 
 const VL = "./scripts/vl-host/target/release/vl"
 const COMPILER = "build/vl-compiler.wasm"
@@ -417,6 +428,10 @@ function batchClean(entries: string[]): Map<string, boolean> {
   clean
 }
 
+// Beside a witness whose last grading was not `runs`: run it alone rather than in the batch,
+// which would only hand it back unanswered.
+const HINT_ALONE = "hint-alone"
+
 // Grade the witnesses staged in `dirs` as `classify` would, one `vl check --batch` and one
 // `vl run --batch` for the chunk; a row either batch cannot answer as `runs` is graded alone,
 // so a hang, trap or crash in one row moves no other row's grade.
@@ -434,7 +449,11 @@ function gradeChunk(dirs: string[]) {
   const at: i32[] = []
   let k = 0
   while k < dirs.length {
-    if (clean[entries[k]] ?? false) && staged[k].alone != "" {
+    if (
+      (clean[entries[k]] ?? false)
+      && staged[k].alone != ""
+      && !exists(dirs[k] + "/" + HINT_ALONE)
+    ) {
       const name = "cfw-" + toString(k) + ".vl"
       writeText(dirs[k] + "/" + name, staged[k].alone)
       copies.push(dirs[k] + "/" + name)
@@ -495,15 +514,14 @@ function readRan(dir: string): Ran {
   }
 }
 
-// Make one directory per witness under `root`, leave its source there as `repro`, and
-// answer the directories.
-function stageAll(root: string, srcs: string[]): string[] {
+// Witness `k`'s directory under `root`.
+function rowDir(root: string, k: i32): string { root + "/" + toString(k) }
+
+// Make one directory under `root` for each witness `srcs[at[i]]`, leave its source there as
+// `repro`, and answer the directories in the order of `at`.
+function stageAll(root: string, srcs: string[], at0: i32[]): string[] {
   const dirs: string[] = []
-  let k = 0
-  while k < srcs.length {
-    dirs.push(root + "/" + toString(k))
-    k = k + 1
-  }
+  for k in at0 { dirs.push(rowDir(root, k)) }
   let at = 0
   while at < dirs.length {
     const batch = ["-p"]
@@ -516,10 +534,10 @@ function stageAll(root: string, srcs: string[]): string[] {
       die("check-filed-witnesses: mkdir failed: " + p.out + p.err, 1)
     }
   }
-  k = 0
-  while k < srcs.length {
-    writeText(dirs[k] + "/repro", srcs[k])
-    k = k + 1
+  let i = 0
+  while i < dirs.length {
+    writeText(dirs[i] + "/repro", srcs[at0[i]])
+    i = i + 1
   }
   dirs
 }
@@ -569,14 +587,229 @@ function gradeAll(root: string, dirs: string[], jobs: i32) {
   0
 }
 
-// Stage, grade and read back every source in `srcs`, in order.
-function runAll(srcs: string[], jobs: i32): Ran[] {
+// ── the outcome cache ───────────────────────────────────────────────────────────
+
+// The directory the cache lives in: `$WITNESS_CACHE` when it names one, none when it is 0,
+// else `filed-witnesses` under `vl`'s own cache root (`$VL_CACHE_DIR`, else
+// `$XDG_CACHE_HOME/vl`, else `$HOME/.cache/vl`), or "" when none of those is set.
+function cacheDir(): string {
+  const own = envOr("WITNESS_CACHE", "")
+  if own == "0" { return "" }
+  if own != "" { return own }
+  let base = envOr("VL_CACHE_DIR", "")
+  if base == "" && envOr("XDG_CACHE_HOME", "") != "" {
+    base = envOr("XDG_CACHE_HOME", "") + "/vl"
+  }
+  if base == "" && envOr("HOME", "") != "" {
+    base = envOr("HOME", "") + "/.cache/vl"
+  }
+  if base == "" { return "" }
+  base + "/filed-witnesses"
+}
+
+// Everything a witness's outcome can depend on besides its own text, or "" when any part
+// cannot be read: the seed's, the host's and the grader's bytes, the std tree `vl` resolves,
+// and every `VL_*` setting but the two that only size the host's own cache.
+function cacheKeyText(): string {
+  const files = [COMPILER, VL, SELF]
+  const libs = listDir("scripts/lib")
+  if libs is IoError { return "" }
+  for n in sorted(libs, (a: string, b: string): boolean => a < b) {
+    if endsWith(n, ".vl") { files.push("scripts/lib/" + n) }
+  }
+  const h = spawn("sha256sum", files)
+  if h.code != 0 { return "" }
+  const s = spawn(VL, ["std"])
+  let stdLine = ""
+  for l in splitLines(s.out) {
+    if stdLine == "" && contains(l, " modules, ") { stdLine = stripWs(l) }
+  }
+  if s.code != 0 || stdLine == "" { return "" }
+  const e = spawn("env", [])
+  if e.code != 0 { return "" }
+  const vars: string[] = []
+  for l in splitLines(e.out) {
+    if (
+      startsWith(l, "VL_")
+      && !startsWith(l, "VL_CACHE_DIR=")
+      && !startsWith(l, "VL_CACHE_MAX_MB=")
+    ) {
+      vars.push(l)
+    }
+  }
+  const env = sorted(vars, (a: string, b: string): boolean => a < b)
+  "check-filed-witnesses cache 1\n" + h.out + stdLine + "\n" + join(env, "\n")
+}
+
+const HINTS_HEAD = "check-filed-witnesses hints 1"
+
+// Whether a witness's outcome is a function of its text and the key: one that reads files,
+// the environment, its arguments or a process could answer differently on the next run.
+function cacheable(src: string): boolean {
+  !anyIn(src, ["std:fs", "std:process", "std:env", "std:args"])
+}
+
+function readRecords(path: string, head: string): Map<string, Cached> {
+  const t = readTextFile(path)
+  if t is IoError { return Map() }
+  decodeRecords(t, head)
+}
+
+// Replace `path` with `text` in one rename, so a concurrent reader sees one whole file.
+function writeRecords(dir: string, path: string, text: string) {
+  const t = spawn("mktemp", [dir + "/.write.XXXXXXXX"])
+  if t.code != 0 { return 0 }
+  const tmp = stripWs(t.out)
+  if writeTextFile(tmp, text) != null {
+    spawn("rm", ["-f", tmp])
+    return 0
+  }
+  spawn("mv", ["-f", tmp, path])
+  0
+}
+
+function writeMap(
+  dir: string,
+  path: string,
+  head: string,
+  m: Map<string, Cached>,
+) {
+  const keys = sorted(m.keys(), (a: string, b: string): boolean => a < b)
+  const vals: Cached[] = []
+  for k in keys {
+    const v = m[k]
+    if v != null { vals.push(v) }
+  }
+  writeRecords(dir, path, encodeRecords(head, keys, vals))
+}
+
+function lastSlash(s: string): i32 {
+  let i = s.length - 1
+  while i >= 0 && s[i] != 47 { i = i - 1 }
+  i
+}
+
+// `r`, graded in row directory `d`, as a record whose texts name `d` only through `ROW_MARK`,
+// or null when it cannot be: a timed-out run, or a text that names `d`'s run some other way.
+function toCached(r: Ran, d: string): Cached | null {
+  if r.outcome == "timed_out" { return null }
+  if contains(r.detail, ROW_MARK) || contains(r.stdout, ROW_MARK) {
+    return null
+  }
+  const pre = d + "/"
+  const run = d.slice(0, lastSlash(d))
+  const tag = run.slice(lastSlash(run) + 1, run.length)
+  const det = replaceAll(r.detail, pre, ROW_MARK)
+  const out = replaceAll(r.stdout, pre, ROW_MARK)
+  if contains(det, tag) || contains(out, tag) { return null }
+  // A detail cut at its length bound can end inside the directory's path.
+  let j = 1
+  while j < pre.length {
+    if endsWith(det, pre.slice(0, j)) { return null }
+    j = j + 1
+  }
+  { outcome: r.outcome, detail: det, stdout: out, plen: pre.length }
+}
+
+// The record `c` read back in row directory `d`, or null when `d`'s path is another length,
+// which would have cut a long detail at another place.
+function fromCached(c: Cached, d: string): Ran | null {
+  const pre = d + "/"
+  if c.plen != pre.length { return null }
+  {
+    outcome: c.outcome,
+    detail: replaceAll(c.detail, ROW_MARK, pre),
+    stdout: replaceAll(c.stdout, ROW_MARK, pre),
+  }
+}
+
+// Stage, grade and read back every source in `srcs`, in order. With `useCache`, a witness the
+// cache answers under this run's key is not run, and a witness last graded other than `runs`
+// skips the run batch.
+function runAll(srcs: string[], jobs: i32, useCache: boolean): Ran[] {
   const out: Ran[] = []
   if srcs.length == 0 { return out }
   const root = makeTempDir()
-  const dirs = stageAll(root, srcs)
-  gradeAll(root, dirs, jobs)
-  for d in dirs { out.push(readRan(d)) }
+  let dir = ""
+  if useCache { dir = cacheDir() }
+  let head = ""
+  if dir != "" && spawn("mkdir", ["-p", dir]).code == 0 {
+    head = cacheKeyText()
+  }
+  const recPath = dir
+    + "/"
+    + hex64(fnvFeed(-3750763034362895579, head.bytes()))
+    + ".rec"
+  const hintPath = dir + "/hints.rec"
+  let recs: Map<string, Cached> = Map()
+  let hints: Map<string, Cached> = Map()
+  if head != "" {
+    recs = readRecords(recPath, head)
+    hints = readRecords(hintPath, HINTS_HEAD)
+  }
+  const miss: i32[] = []
+  let k = 0
+  while k < srcs.length {
+    let r: Ran | null = null
+    const c = recs[srcs[k]]
+    if c != null && cacheable(srcs[k]) { r = fromCached(c, rowDir(root, k)) }
+    if r != null {
+      out.push(r)
+    } else {
+      out.push({ outcome: "", detail: "", stdout: "" })
+      miss.push(k)
+    }
+    k = k + 1
+  }
+  const dirs = stageAll(root, srcs, miss)
+  let i = 0
+  while i < miss.length {
+    if hints.has(srcs[miss[i]]) { writeText(dirs[i] + "/" + HINT_ALONE, "") }
+    i = i + 1
+  }
+  if dirs.length > 0 { gradeAll(root, dirs, jobs) }
+  i = 0
+  while i < miss.length {
+    out[miss[i]] = readRan(dirs[i])
+    i = i + 1
+  }
+  if head != "" {
+    let wrote = false
+    for m in miss {
+      const c = toCached(out[m], rowDir(root, m))
+      if c != null && cacheable(srcs[m]) {
+        recs[srcs[m]] = c
+        wrote = true
+      }
+    }
+    let hinted = false
+    k = 0
+    while k < srcs.length {
+      const o = out[k].outcome
+      if o == "runs" && hints.has(srcs[k]) {
+        hints.delete(srcs[k])
+        hinted = true
+      } else if o != "runs" && o != "timed_out" && !hints.has(srcs[k]) {
+        hints[srcs[k]] = { outcome: o, detail: "", stdout: "", plen: 0 }
+        hinted = true
+      }
+      k = k + 1
+    }
+    if wrote {
+      writeMap(dir, recPath, head, recs)
+      // The newest eight keys stay; an older one is a seed nobody grades with any more.
+      spawn(
+        "sh",
+        [
+          "-c",
+          "cd \"$1\" && ls -t | grep '^[0-9a-f]*\\.rec$' | tail -n +9 | xargs rm -f --",
+          "prune",
+          dir,
+        ],
+      )
+    }
+    if hinted { writeMap(dir, hintPath, HINTS_HEAD, hints) }
+  }
   spawn("rm", ["-rf", root])
   out
 }
@@ -786,28 +1019,6 @@ function grade(
 
 // ── seed provenance, as `scripts/seed-provenance.vl` computes it ──────────────────
 
-function fnvFeed(h0: i64, data: u8[]): i64 {
-  let h = h0
-  let i = 0
-  while i < data.length {
-    h = (h ^ (data[i] as i64)) * 1099511628211
-    i = i + 1
-  }
-  h
-}
-
-function hex64(h: i64): string {
-  const digits = "0123456789abcdef"
-  let out = ""
-  let k = 15
-  while k >= 0 {
-    const d = ((h >> ((k * 4) as i64)) & 15) as! i32
-    out = out + digits.slice(d, d + 1)
-    k = k - 1
-  }
-  out
-}
-
 // FNV-1a over every `compiler/*.vl` in sorted name order, and how many there were.
 type Identity = { hash: string, files: i32 }
 
@@ -963,7 +1174,7 @@ function mainReport(docs: string[], strict: boolean, outJson: string): i32 {
     if declared[k] != "" { srcs.push(rows[k].repro) }
     k = k + 1
   }
-  const ran = runAll(srcs, jobsFromEnv())
+  const ran = runAll(srcs, jobsFromEnv(), true)
   const results: Graded[] = []
   const ungradable: Graded[] = []
   let wantChecked = 0
@@ -1158,7 +1369,7 @@ function selfTest(): i32 {
     }
     if !seen { all.push(s) }
   }
-  const ran = runAll(all, 1)
+  const ran = runAll(all, 1, false)
   let bad = 0
   let k = 0
   while k < wants.length {

@@ -78,6 +78,7 @@ import {
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
+import { cwFnValueDeclOf } from "./check_write_scan"
 import { recSolePinArg } from "./check_record_origins"
 import { recFnDeclByName } from "./check_scopes"
 import { recFnValueLeaves, tyLeavesDisjoint } from "./check_type_shape"
@@ -103,6 +104,7 @@ import { substNullFoldOffFor, substNullFoldRestore } from "./check_subst_fold"
 import { uniqueGenericDeclNamed } from "./check_generic_args"
 import {
   T,
+  TY_BOOL,
   TY_NULL,
   TY_VOID,
   Ty,
@@ -11754,7 +11756,7 @@ function monoCoerceLitPart(v: i32, lit: i32, path: string[], ctx: i32) {
 }
 
 // The `fnStmts` slot of the function an `Ident` names — the one resolver every question
-// this pass asks about a named function goes through. `fnIndexOfInScope` is the language's
+// this pass asks about a named function goes through. `fnIndexOfInScopeSid` is the language's
 // innermost-scope rule for a name a `FuncDecl` carries; `identClosureFeSid` covers an
 // arrow lambda, which parses to a nameless `FuncDecl` and carries its name on the binding.
 function monoFnFeOfIdent(identIx: i32, name: string, ctx: i32) {
@@ -15013,6 +15015,30 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
   0
 }
 
+// A generic function named as the callback of `.map` / `.filter` over a list of a closed element
+// takes its instance at that element, as a lambda's contextual type pins it (D8944).
+function monoCoerceListCbArg(n: Call, ctx: i32): i32 {
+  if n.callFn < 0 || n.callArgs.length != 1 { return 0 }
+  const m = P.nodes[n.callFn]
+  if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
+    return 0
+  }
+  const a = n.callArgs[0]
+  if !(P.nodes[unwrapParen(a)] is Ident) { return 0 }
+  const rt = nodeTyIxOf(m.memObj)
+  if rt < 0 || rt >= T.tys.length { return 0 }
+  const lt = T.tys[rt]
+  if !(lt is TyArray) || lt.aElem < 0 || tyHasTyVar(lt.aElem) { return 0 }
+  const qs: i32[] = [lt.aElem]
+  let r = TY_BOOL
+  if m.memProp == "map" { r = monoValueRetAt(a, qs, 0) }
+  if r < 0 || tyHasTyVar(r) { return 0 }
+  const ft = mkFuncTy(qs, r)
+  const fs = monoPinAnnSpelling(ft)
+  if fs == "" { return 0 }
+  monoCoerceFnValueName(a, fs, ctx, ft)
+}
+
 // The annotation node the callee `Ident` at `callee` is declared with, as a parameter or a local
 // of function `fnIx` or as a module global, or -1.
 function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
@@ -16170,21 +16196,36 @@ function monoTyLeftOpen(pv: i32, gN: string[], gT: i32[]): boolean {
 }
 
 // The function declaration an open function argument `a` names: an un-annotated lambda, or an
-// identifier naming a hole function or a `const` holding a lambda; -1 for anything else.
+// identifier naming a hole function, or a `const` or once-bound `let` holding one; -1 for anything
+// else.
 function monoOpenFnArgDecl(a: i32): i32 {
+  let x = unwrapParen(a)
+  let hops = 0
+  while x >= 0 && x < P.nodes.length && hops <= MONO_ALIAS_CHAIN_MAX {
+    const n = P.nodes[x]
+    if n is FuncDecl { return x }
+    if !(n is Ident) { return -1 }
+    const d = identDeclOf(x)
+    if d < 0 || d >= P.nodes.length { return -1 }
+    const dn = P.nodes[d]
+    if dn is FuncDecl { return d }
+    if !(dn is LetDecl) { return -1 }
+    // A `let` bound once and never re-pointed holds its initialiser; a `const` alias of
+    // another name is followed to what that name holds (D8981).
+    if dn.letKw != "const" { return cwFnValueDeclOf(x) }
+    x = unwrapParen(dn.letInit)
+    hops = hops + 1
+  }
+  -1
+}
+
+// Whether argument `a` names an un-annotated function value whose type still holds a hole.
+function monoArgIsOpenFnValue(a: i32): boolean {
   const x = unwrapParen(a)
-  if x < 0 { return -1 }
-  const n = P.nodes[x]
-  if n is FuncDecl { return x }
-  if !(n is Ident) { return -1 }
-  const d = identDeclOf(x)
-  if d < 0 || d >= P.nodes.length { return -1 }
-  const dn = P.nodes[d]
-  if dn is FuncDecl { return d }
-  if !(dn is LetDecl) || dn.letKw != "const" { return -1 }
-  const lx = unwrapParen(dn.letInit)
-  if lx < 0 || !(P.nodes[lx] is FuncDecl) { return -1 }
-  lx
+  if x < 0 || !(P.nodes[x] is Ident) || monoOpenFnArgDecl(x) < 0 {
+    return false
+  }
+  tyHasTyVar(nodeTyIxOf(x))
 }
 
 // Whether flow pin `t` is a list whose element is an inference hole, as `[]` pins.
@@ -17020,6 +17061,56 @@ function monoPinAnnotatedParam(
   0
 }
 
+// Binds the type parameters only the result of arrow annotation `annIx` names to the result
+// function value `argIx` gives at the parameter types `tvN`/`tvV` already close, as an
+// un-annotated function handed to `(T) => R` gives `R` (D8943).
+function monoBindArrowRet(
+  annIx: i32,
+  argIx: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  const at = nodeTyIxOf(annIx)
+  if at < 0 || at >= T.tys.length { return 0 }
+  const af = T.tys[at]
+  if !(af is TyFunc) || af.fnRet < 0 { return 0 }
+  const hN: string[] = []
+  const hT: i32[] = []
+  let k = 0
+  while k < tvN.length && k < tvV.length {
+    const bt = nameToTy(tvV[k])
+    if bt >= 0 {
+      hN.push(tvN[k])
+      hT.push(bt)
+    }
+    k = k + 1
+  }
+  const qs: i32[] = []
+  for pt in af.fnParamTypes {
+    const q = substTyDeep(pt, hN, hT)
+    if q < 0 || tyHasTyVar(q) { return 0 }
+    qs.push(q)
+  }
+  const r = monoValueRetAt(argIx, qs, 0)
+  if r < 0 { return 0 }
+  const rN: string[] = []
+  const rT: i32[] = []
+  bindGenWalk(substTyDeep(af.fnRet, hN, hT), r, rN, rT)
+  k = 0
+  while k < rN.length {
+    if strListHas(typarams, rN[k]) && monoBindOf(tvN, tvV, rN[k]) == "" {
+      const sp = monoPinAnnSpelling(rT[k])
+      if sp != "" && !tyHasTyVar(rT[k]) {
+        tvN.push(rN[k])
+        tvV.push(sp)
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
 // Pins parameter `p`'s composite annotation `ann` riding type params: -1 on a refusal, else 0.
 function monoPinTyParamComposite(
   p: Param,
@@ -17045,8 +17136,15 @@ function monoPinTyParamComposite(
   const annIsFn = nodeTyIsFunc(p.parType)
   if annIsFn {
     anC = monoArgFnTypeName(args[i], ctx)
-    // A generic function value takes the type the value arguments bound (D3913).
-    if monoCalleeIsGeneric(unwrapParen(args[i])) {
+    // A generic function value takes the type the value arguments bound (D3913), and so does
+    // an un-annotated lambda or alias of one (D8981).
+    if (
+      monoCalleeIsGeneric(unwrapParen(args[i]))
+      || monoArgIsOpenFnValue(args[i])
+    ) {
+      if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
+        monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV)
+      }
       const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
       if pre != "" { anC = pre }
     }
@@ -18015,6 +18113,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if cr == 1 { return 0 }
       }
       if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
+      if monoCoerceListCbArg(n, ctx) < 0 { return -1 }
       if monoCoerceAtValueParams(n, -1, ctx) < 0 { return -1 }
       if monoWalk(n.callFn, ctx) < 0 { return -1 }
       monoTypeCallOfCall(ix, ctx)

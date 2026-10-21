@@ -456,7 +456,12 @@ import {
   tyOfMembers,
 } from "./check_union_mint"
 import { isWideLitJoin, wideLitTyIxs } from "./check_wide_lits"
-import { cwCalleeDeclOf, cwPeel, fnDeclIx } from "./check_write_scan"
+import {
+  cwCalleeDeclOf,
+  cwFnValueDeclOf,
+  cwPeel,
+  fnDeclIx,
+} from "./check_write_scan"
 import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
@@ -4020,6 +4025,75 @@ export function directHoleBodyRet(
   if r < 0 || tySame(r, retTy) { return retTy }
   if !directGenericNumRet(decl, r, retTy) { return retTy }
   r
+}
+
+// The open result `retTy` of a call closed by the body of each un-annotated function handed to
+// a function-typed parameter of `params`, read at the parameter types the call bound: `R` of
+// `apply<T, R>(h: (T) => R, x: T)` handed `half` at `T = i32` is `f64` (D8943).
+export function holeFnArgRetAt(
+  args: i32[],
+  params: i32[],
+  vNames: string[],
+  vTys: i32[],
+  retTy: i32,
+): i32 {
+  let r0 = retTy
+  let i = 0
+  while i < args.length && i < params.length && tyHasTyVar(r0) {
+    const q = substTyDeep(params[i], vNames, vTys)
+    if q >= 0 && q < T.tys.length {
+      const qf = T.tys[q]
+      if qf is TyFunc && qf.fnRet >= 0 && tyHasTyVar(qf.fnRet) {
+        const r = holeFnArgRetAtParams(args[i], qf.fnParamTypes)
+        if r >= 0 {
+          const hN: string[] = []
+          const hT: i32[] = []
+          bindGenWalk(qf.fnRet, r, hN, hT)
+          r0 = holeFnRetSubst(r0, hN, hT)
+        }
+      }
+    }
+    i = i + 1
+  }
+  r0
+}
+
+// The closed result of the un-annotated function argument `a` names, called at the closed
+// parameter types `pts`; -1 when `a` names none or its body's result stays open.
+export function holeFnArgRetAtParams(a: i32, pts: i32[]): i32 {
+  const d = holeFnArgDecl(a)
+  if d < 0 { return -1 }
+  for pt in pts {
+    if tyHasTyVar(pt) { return -1 }
+  }
+  const noN: string[] = []
+  const noT: i32[] = []
+  const r = holeLamRetAt(d, mkFuncTy(pts, TY_I32), noN, noT)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  r
+}
+
+// `ty` with its own type variable read from `hN`/`hT`, else unchanged. Not `substTyDeep`, which
+// pins the hole it substitutes and so re-asks the argument at the result's type.
+function holeFnRetSubst(ty: i32, hN: string[], hT: i32[]): i32 {
+  if ty < 0 || ty >= T.tys.length { return ty }
+  const t = T.tys[ty]
+  if !(t is TyVar) { return ty }
+  const b = bindOf(hN, hT, t.tvName)
+  if b < 0 { return ty }
+  b
+}
+
+// The un-annotated function or lambda that the name argument `a` reads, with no type parameters;
+// -1 else.
+export function holeFnArgDecl(a: i32): i32 {
+  const ix = parenPeelIx(a)
+  if ix < 0 || ix >= P.nodes.length || !(P.nodes[ix] is Ident) { return -1 }
+  const d = cwFnValueDeclOf(ix)
+  if d < 0 || !directHoleDecl(d) { return -1 }
+  const f = P.nodes[d]
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  d
 }
 
 // Whether `decl` is a function with no declared result and either type parameters or a hole

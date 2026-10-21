@@ -384,7 +384,7 @@ import {
 import { numUnionConverts, numUnionMinted } from "./check_union_mint"
 import { wideLitByNode } from "./check_wide_lits"
 import { argLitAt, wsSuppress } from "./check_width"
-import { fnDeclIx } from "./check_write_scan"
+import { cwFnValueDeclOf, fnDeclIx } from "./check_write_scan"
 import { numLexIsFloat } from "./emit_bignum"
 import { i32ListEq, strListHas } from "./listutil"
 import { nodePos } from "./fmt_util"
@@ -827,11 +827,24 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
     }
   }
   if decl >= P.nodes.length { return 0 }
-  if decl < 0 { return holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName) }
+  if decl < 0 {
+    const d0 = T.diags.length
+    holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName)
+    const vd = cwFnValueDeclOf(srcExpr)
+    if T.diags.length == d0 && vd >= 0 {
+      holeDeclValueCstrsAt(srcExpr, vd, st, dstTy, e.identName)
+    }
+    return 0
+  }
   const fd = P.nodes[decl]
   if !(fd is FuncDecl) { return 0 }
   if fd.fnTyParams.length == 0 {
-    return holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName)
+    const d0 = T.diags.length
+    holeFnValueCstrsAt(srcExpr, st, dstTy, e.identName)
+    if T.diags.length == d0 {
+      holeDeclValueCstrsAt(srcExpr, decl, st, dstTy, e.identName)
+    }
+    return 0
   }
   let dt = dstTy
   const dn = T.tys[dt]
@@ -981,6 +994,51 @@ function holeFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, who: string) {
   }
   if !anyHole { return 0 }
   holeFnDeliveryDemands(srcTy, dt, srcExpr, "`" + who + "`")
+  0
+}
+
+// Un-annotated function `decl` delivered by name at the concrete function type `dstTy`: every
+// constraint its body deferred is judged at that type's parameters, as a direct call there is,
+// so a member read the parameter type lacks is refused at the delivery (D8980).
+function holeDeclValueCstrsAt(
+  srcExpr: i32,
+  decl: i32,
+  srcTy: i32,
+  dstTy: i32,
+  who: string,
+) {
+  let dt = dstTy
+  const dn = T.tys[dt]
+  if dn is TyNullable { dt = dn.nInner }
+  if dt < 0 || tyHasTyVar(dt) || tyHasHole(dt) { return 0 }
+  const fd = P.nodes[decl]
+  if !(fd is FuncDecl) || fd.fnTyParams.length > 0 { return 0 }
+  if fd.fnName != "" && (fnDeclIx[fd.fnName] ?? -1) == decl {
+    return holeDeclCstrsAt(srcExpr, decl, srcTy, dt)
+  }
+  // A lambda owns no constraint of its own, so its holes are judged over the constraints its
+  // own body recorded: another delivery of the same lambda is not part of it.
+  const s = T.tys[srcTy]
+  const d = T.tys[dt]
+  if !(s is TyFunc) || !(d is TyFunc) { return 0 }
+  if s.fnParamTypes.length != d.fnParamTypes.length { return 0 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  let i = 0
+  while i < s.fnParamTypes.length {
+    if tyIsHole(s.fnParamTypes[i]) {
+      bindGenWalk(s.fnParamTypes[i], d.fnParamTypes[i], bNames, bTys)
+    }
+    i = i + 1
+  }
+  if bNames.length == 0 { return 0 }
+  const modeWas = substNestMode
+  const declWas = substNestDecl
+  substNestModeSet(SUBST_NESTED)
+  substNestDeclSet(decl)
+  declCstrsAtBinding(bNames, bTys, srcExpr, CSTR_NODECL, who)
+  substNestModeSet(modeWas)
+  substNestDeclSet(declWas)
   0
 }
 

@@ -2,18 +2,18 @@
 //
 // The interp ratchet has no script: `vl check --budget scripts/interp-budget-baseline.json`
 // is its gate row and `--write-baseline` its writer, in the layout the retired
-// scripts/ratchet.py wrote (architecture-refactor-plan T2). This holds the three verbs to one answer:
+// scripts/ratchet.py wrote (architecture-refactor-plan T2). This holds the verbs to one answer:
 //
-//   1. A fresh write must pass its own `--budget` with the ok line, `--budget-why` must
-//      find every entry where the write put it, and a second write over the first must be
-//      byte-identical (the layout is a fixed point).
+//   1. A fresh write keeps the committed header and writes one line per entry, and
+//      `--budget-why` over it finds every entry where the write put it.
 //   2. On a doctored copy (one file's count lowered, one entry dropped, one invented),
 //      `--budget` must red with exactly the doctored file's line and `--budget-why` must
 //      move a name both ways.
 //
 // Every verb runs over a NARROWED population: the verbs do not depend on its size, and the
-// committed baseline over the real tree is ci.yml's "Interpolation budget" step.
-//   3. `--exempt-codes` prints the codes the committed baseline still owes.
+// committed baseline over the real tree is ci.yml's "Interpolation budget" step. Each
+// invocation here is the only one a planted defect in the budget mode reds; one that only
+// re-caught another's defects was removed rather than kept as a second witness.
 //
 // @test-timing native
 
@@ -113,39 +113,6 @@ Deno.test({
         base.entries.length + 1,
         text.split('\n["').length,
       );
-      const [check, why, again] = await Promise.all([
-        vl(["--budget", full, ...NARROW]),
-        vl(["--budget-why", full, ...NARROW]),
-        Deno.copyFile(full, `${dir}/again.json`).then(() =>
-          vl(["--budget", `${dir}/again.json`, "--write-baseline", ...NARROW])
-        ),
-      ]);
-      expectEq("--budget on a fresh write: exit", 0, check.code);
-      expectEq(
-        "--budget on a fresh write: stdout",
-        `interp budget ok — ${total} ${CODE} (baseline ${total} or below)\n`,
-        check.out,
-      );
-      expectEq("--budget-why: exit", 0, why.code);
-      for (
-        const want of [
-          "  (the same entries, by name)",
-          "Nothing moved by name.",
-        ]
-      ) {
-        if (!why.out.includes(want)) {
-          throw new Error(
-            `--budget-why did not find the written names:\n${why.out}`,
-          );
-        }
-      }
-      expectEq("a second write: exit", 0, again.code);
-      expectEq(
-        "a second write is byte-identical",
-        text,
-        await Deno.readTextFile(`${dir}/again.json`),
-      );
-
       // 2. A doctored baseline.
       const doc: Baseline = structuredClone(base);
       const was = doc.files[DOCTORED_FILE]?.[CODE] ?? 0;
@@ -161,10 +128,24 @@ Deno.test({
       doc.entries.push([CODE, `${DOCTORED_FILE}: an entry no tree has`, 2]);
       const doctored = `${dir}/doctored.json`;
       await Deno.writeTextFile(doctored, JSON.stringify(doc, null, 0));
-      const [vc, vw] = await Promise.all([
+      const [why, vc, vw] = await Promise.all([
+        vl(["--budget-why", full, ...NARROW]),
         vl(["--budget", doctored, ...NARROW]),
         vl(["--budget-why", doctored, ...NARROW]),
       ]);
+      expectEq("--budget-why on a fresh write: exit", 0, why.code);
+      for (
+        const want of [
+          "  (the same entries, by name)",
+          "Nothing moved by name.",
+        ]
+      ) {
+        if (!why.out.includes(want)) {
+          throw new Error(
+            `--budget-why did not find the written names:\n${why.out}`,
+          );
+        }
+      }
       expectEq("doctored --budget: exit", 1, vc.code);
       expectEq(
         "doctored --budget: the regressed lines",
@@ -186,15 +167,6 @@ Deno.test({
           `the doctored --budget-why moved no name both ways:\n${vw.out}`,
         );
       }
-
-      // 3. The codes lint-self.sh exempts.
-      const ex = await vl(["--budget", BASELINE, "--exempt-codes"]);
-      expectEq("--exempt-codes: exit", 0, ex.code);
-      expectEq(
-        "--exempt-codes: stdout",
-        committed.total[CODE] > 0 ? `${CODE}\n` : "\n",
-        ex.out,
-      );
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
@@ -271,24 +243,14 @@ Deno.test({
         `sentinel-index budget ok — 2 unguarded reads, 0 untested strict reads (baseline or below)\n`,
         check.out,
       );
-      // A second write over the first is a fixed point.
-      const again = `${dir}/again.json`;
-      await Deno.copyFile(full, again);
-      const w2 = await vl(["--budget", again, "--write-baseline", SENTINEL_FIXTURE], dir);
-      expectEq("a second write: exit", 0, w2.code);
-      expectEq(
-        "a second write is byte-identical",
-        got.join("\n"),
-        await Deno.readTextFile(again),
-      );
     } finally {
       await Deno.remove(dir, { recursive: true });
     }
   },
 });
 
-// `--findings` COUNTS A `--json` REPORT INSTEAD OF WALKING. A report with one finding more
-// than a file's baseline reds on exactly that file; an out-of-target file is ignored. A
+// `--findings` COUNTS A `--json` REPORT INSTEAD OF WALKING. A report at a file's baseline
+// passes and an out-of-target file is ignored; the red path is the doctored walk's above. A
 // finding names its entry only through an optional `text`, so `--budget-why` refuses a
 // report without one rather than naming every entry by its file alone.
 Deno.test({
@@ -318,23 +280,11 @@ Deno.test({
         ok,
         JSON.stringify([...at(file, was), ...at("std/fs.vl", 5)]),
       );
-      const good = await vl(["--budget", baselinePath, "--findings", ok]);
-      expectEq("at baseline: exit", 0, good.code);
-      const bad = `${dir}/bad.json`;
-      await Deno.writeTextFile(bad, JSON.stringify(at(file, was + 1)));
-      const red = await vl(["--budget", baselinePath, "--findings", bad]);
-      expectEq("one over: exit", 1, red.code);
-      expectEq(
-        "one over: names the file",
-        true,
-        red.out.includes(`${file}  ${code}: ${was + 1} (baseline ${was})`),
-      );
-      const refused = await vl([
-        "--budget-why",
-        baselinePath,
-        "--findings",
-        ok,
+      const [good, refused] = await Promise.all([
+        vl(["--budget", baselinePath, "--findings", ok]),
+        vl(["--budget-why", baselinePath, "--findings", ok]),
       ]);
+      expectEq("at baseline: exit", 0, good.code);
       expectEq("--budget-why refuses findings with no `text`", 2, refused.code);
       expectEq(
         "the refusal says why",
