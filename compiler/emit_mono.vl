@@ -70,6 +70,8 @@ import {
   assignable,
   bindGenWalk,
   genFnHoleBodyRet,
+  holeFnArgDecls,
+  holeFnArgRetAtParams,
   holeLamRetAt,
   nameToTy,
   substTyDeep,
@@ -7281,6 +7283,9 @@ let monoCallFrameSlot = 0 - 1
 let monoNoRename: i32[] = []
 // Callee identifiers that read a `let`/`const`, keyed to that binding, once renamed to an instance.
 let monoAliasCallDecl: {[i32]: i32} = Map()
+// A re-pointed `let` handed to a generic arrow parameter, keyed `<frame>:<decl>`, to the instance
+// its values are handed on at; a second instance asks for a slot per type (D9006).
+let monoWrittenLetHanded: {[string]: string} = Map()
 
 // Notes callee `calleeIx` before its rename to an instance, when it reads a binding.
 function monoAliasCallNote(calleeIx: i32) {
@@ -13843,6 +13848,9 @@ function monoValueRetAt(v: i32, qs: i32[], depth: i32): i32 {
   if !(n is IfStmt) {
     const lx = monoOpenFnArgDecl(x)
     if lx >= 0 { return monoFnDeclRetAt(lx, qs) }
+    // A re-pointed `let` of un-annotated functions gives the result they all agree on (D9001).
+    const hr = holeFnArgRetAtParams(x, qs)
+    if hr >= 0 { return hr }
     return monoFnTyRetAt(nodeTyIxOf(x), qs)
   }
   if n.ifElse < 0 { return -1 }
@@ -15307,6 +15315,7 @@ function monoCallGenFnToTyParamArrow(
               if gfe >= 0 && gfe < monoGen.length {
                 if monoGen[gfe] == 1 { return true }
               }
+              if monoWrittenGenLetFrame(ax, ctx)[1] >= 0 { return true }
             }
           }
         }
@@ -17077,27 +17086,15 @@ function monoBindArrowRet(
   if !(af is TyFunc) || af.fnRet < 0 { return 0 }
   const hN: string[] = []
   const hT: i32[] = []
-  let k = 0
-  while k < tvN.length && k < tvV.length {
-    const bt = nameToTy(tvV[k])
-    if bt >= 0 {
-      hN.push(tvN[k])
-      hT.push(bt)
-    }
-    k = k + 1
-  }
-  const qs: i32[] = []
-  for pt in af.fnParamTypes {
-    const q = substTyDeep(pt, hN, hT)
-    if q < 0 || tyHasTyVar(q) { return 0 }
-    qs.push(q)
-  }
+  monoBoundTys(tvN, tvV, hN, hT)
+  const qs = monoArrowParamTysAt(af, hN, hT)
+  if qs.length > 0 && qs[0] < 0 { return 0 }
   const r = monoValueRetAt(argIx, qs, 0)
   if r < 0 { return 0 }
   const rN: string[] = []
   const rT: i32[] = []
   bindGenWalk(substTyDeep(af.fnRet, hN, hT), r, rN, rT)
-  k = 0
+  let k = 0
   while k < rN.length {
     if strListHas(typarams, rN[k]) && monoBindOf(tvN, tvV, rN[k]) == "" {
       const sp = monoPinAnnSpelling(rT[k])
@@ -17109,6 +17106,106 @@ function monoBindArrowRet(
     k = k + 1
   }
   0
+}
+
+// Appends each binding of `tvN`/`tvV` whose spelling names a type to `hN`/`hT`.
+function monoBoundTys(
+  tvN: string[],
+  tvV: string[],
+  hN: string[],
+  hT: i32[],
+): i32 {
+  let k = 0
+  while k < tvN.length && k < tvV.length {
+    const bt = nameToTy(tvV[k])
+    if bt >= 0 {
+      hN.push(tvN[k])
+      hT.push(bt)
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The parameter types of arrow `af` under `hN`/`hT`; [-1] when one stays open.
+function monoArrowParamTysAt(af: TyFunc, hN: string[], hT: i32[]): i32[] {
+  const qs: i32[] = []
+  for pt in af.fnParamTypes {
+    const q = substTyDeep(pt, hN, hT)
+    if q < 0 || tyHasTyVar(q) { return [0 - 1] }
+    qs.push(q)
+  }
+  qs
+}
+
+// Whether the re-pointed `let` read at `at` holds un-annotated functions whose bodies give two
+// result types at arrow annotation `annIx`'s parameters under `tvN`/`tvV` (D9001).
+function monoWrittenLetRetsDisagree(
+  annIx: i32,
+  at: i32,
+  tvN: string[],
+  tvV: string[],
+): boolean {
+  const ds = holeFnArgDecls(at)
+  if ds.length < 2 { return false }
+  const t = nodeTyIxOf(annIx)
+  if t < 0 || t >= T.tys.length { return false }
+  const af = T.tys[t]
+  if !(af is TyFunc) { return false }
+  const hN: string[] = []
+  const hT: i32[] = []
+  monoBoundTys(tvN, tvV, hN, hT)
+  const qs = monoArrowParamTysAt(af, hN, hT)
+  if qs.length > 0 && qs[0] < 0 { return false }
+  let r0 = -1
+  for d in ds {
+    const r = monoFnDeclRetAt(d, qs)
+    if r < 0 { return false }
+    if r0 >= 0 && !tySameSpelled(r, r0, TY_WALK_DEPTH) { return true }
+    r0 = r
+  }
+  false
+}
+
+// Hands the re-pointed `let` read at `arg` to arrow parameter `p` of `fn`: every function it may
+// hold is instanced at the parameter's type the value arguments bind (D9001). 1 when that type
+// closed, 0 when it did not, -1 when an earlier delivery took another type.
+function monoHandWrittenLet(
+  p: Param,
+  fn: FuncDecl,
+  ann: string,
+  arg: i32,
+  ctx: i32,
+  tvN: string[],
+  tvV: string[],
+): i32 {
+  const at = unwrapParen(arg)
+  const lf = monoWrittenGenLetFrame(at, ctx)
+  if monoWrittenLetRetsDisagree(p.parType, at, tvN, tvV) {
+    return emitFailAt(
+      "emitProgram: the reassigned function binding handed here holds functions that give "
+        + "different result types at this parameter's type — one binding holds one closure "
+        + "signature. Annotate the functions' results, or bind a separate value per function",
+      at,
+    )
+  }
+  if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
+    monoBindArrowRet(p.parType, at, fn.fnTyParams, tvN, tvV)
+  }
+  const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
+  if pre == "" { return 0 }
+  const key = i32ToStr(lf[0]) + ":" + i32ToStr(lf[1])
+  const was = monoWrittenLetHanded.get(key) ?? ""
+  if was != "" && was != pre {
+    const d = P.nodes[lf[1]]
+    let nm = ""
+    if d is LetDecl { nm = d.letName }
+    return monoBindSigFail(nm, lf[1])
+  }
+  // arena-tick exempt: the pin each binding is first handed at, read only by the refusal above.
+  monoWrittenLetHanded[key] = pre
+  monoCoerceWrittenLetValues(at, ctx, pre)
+  1
 }
 
 // Pins parameter `p`'s composite annotation `ann` riding type params: -1 on a refusal, else 0.
@@ -17147,6 +17244,10 @@ function monoPinTyParamComposite(
       }
       const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
       if pre != "" { anC = pre }
+    } else if monoWrittenGenLetFrame(unwrapParen(args[i]), ctx)[1] >= 0 {
+      const hr = monoHandWrittenLet(p, fn, ann, args[i], ctx, tvN, tvV)
+      if hr < 0 { return hr }
+      if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
     }
   } else {
     anC = monoArgPinName(args[i], ctx)
@@ -20366,6 +20467,7 @@ export function monomorphize(stmts: i32[]) {
   monoProgNamesDeep = false
   monoNoRename = []
   monoAliasCallDecl = Map()
+  monoWrittenLetHanded = Map()
   monoDeclWrites = Map()
   monoWriteOrder = []
   monoCellWrites = Map()
