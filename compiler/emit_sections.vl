@@ -374,6 +374,7 @@ import {
   gHelpStrBytes,
   gHelpStrConcat,
   gHelpStrEq,
+  gHelpStrFill,
   gHelpStrFromBytes,
   gHelpStrHash,
   gHelpSvGet,
@@ -420,6 +421,8 @@ import {
   gStrDataLen,
   gStrDataParts,
   gStrDataStart,
+  gStrFillOff,
+  gStrFillSeg,
   gStrPoolIx,
   gStrPoolTexts,
   gSynthArg,
@@ -572,6 +575,7 @@ import {
   fbArrayCopy,
   fbArrayFill,
   fbArrayGet,
+  fbArrayInitData,
   fbArrayLen,
   fbArrayNewDefault,
   fbArrayNewFixed,
@@ -581,11 +585,13 @@ import {
   fbBr,
   fbBrIf,
   fbCall,
+  fbDrop,
   fbElse,
   fbEmitLocalsVec,
   fbEnd,
   fbF32Const,
   fbF64Const,
+  fbGlobalGet,
   fbGlobalSet,
   fbI32Bin,
   fbI32Const,
@@ -2468,6 +2474,8 @@ function emitStartFnCode(out: u8[]) {
 
   const bodyExpr: u8[] = []
   const exprPrev = wTarget(bodyExpr)
+  // The pool fills first: every later line of the module may read a pool string.
+  emitStrFillCalls()
   // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
   // mirroring `emitFuncCode` — no leak from the last user function.
   scopeNames = []
@@ -3790,6 +3798,55 @@ function emitStrFromBytesFnCode(out: u8[]) {
   fbEnd() // end (function)
   wTarget(prev)
   helpFrameBody(out, body)
+}
+
+// `__str_fill__(off, s) -> off + s.len` — copies `s.len` bytes of the pool segment from `off`
+// into the zeroed backing of pool string `s`. The start function threads the offset through
+// one call per filled entry, so a fill costs a `global.get` and a `call` and no constant.
+function emitStrFillFnCode(out: u8[]) {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(0) // no locals
+  fbLocalGet(1)
+  fbStrBack()
+  fbI32Const(0)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbStrLen()
+  fbArrayInitData(sBackIdx, gStrFillSeg)
+  fbLocalGet(0)
+  fbLocalGet(1)
+  fbStrLen()
+  fbI32Bin(106) // i32.add
+  fbEnd() // end (function)
+  wTarget(prev)
+  helpFrameBody(out, body)
+}
+
+// Filled entries per offset chain. A chain is one nested expression to a tree-shaped reader
+// (binaryen overflows its stack parsing thousands), so each run restarts from its own offset.
+const STR_FILL_RUN = 32
+
+// The fill prologue of the start function: every filled pool entry, in segment order.
+function emitStrFillCalls() {
+  if gHelpStrFill < 0 { return 0 }
+  fbI32Const(0)
+  let k = 0
+  let run = 0
+  while k < gStrFillOff.length {
+    if gStrFillOff[k] >= 0 {
+      if run == STR_FILL_RUN {
+        fbDrop()
+        fbI32Const(gStrFillOff[k])
+        run = 0
+      }
+      run = run + 1
+      fbGlobalGet(externGlobalCount() + k)
+      fbCall(gHelpStrFill)
+    }
+    k = k + 1
+  }
+  fbDrop()
 }
 
 // The wrap-trap's reason, streamed through the same base print pair `__trap__("reason")`
@@ -5693,6 +5750,7 @@ function nameMapCount(n: i32): i32 {
   count = count + rvHelperCount()
   if gHelpAsFail >= 0 { count = count + 1 }
   if gHelpStrFromBytes >= 0 { count = count + 1 }
+  if gHelpStrFill >= 0 { count = count + 1 }
   count + gMapSetRows.length
 }
 
@@ -5863,6 +5921,10 @@ function nameHelpers() {
   if gHelpStrFromBytes >= 0 {
     wULEB(gHelpStrFromBytes)
     wName("__str_from_bytes__")
+  }
+  if gHelpStrFill >= 0 {
+    wULEB(gHelpStrFill)
+    wName("__str_fill__")
   }
   for row in gMapSetRows {
     wULEB(gMapSetFn[row])
@@ -6149,6 +6211,8 @@ function collectStrPool() {
   gStrDataStart = []
   gStrDataLen = []
   gStrDataParts = []
+  gStrFillOff = []
+  gStrFillSeg = -1
   linkIsReset()
   if !aUsed { return 0 }
   const isLexes: string[] = []
@@ -6175,6 +6239,62 @@ function collectStrPool() {
   for t in T.tys {
     if t is TyLit && t.litKind == "str" { strPoolAdd(quoteLex(t.litText)) }
   }
+  strFillPlan()
+}
+
+// Bytes a module pays to fill pool entries from a segment at all: `__str_fill__`'s type and
+// body, a start function if the module has none, and the data-count and segment framing.
+const STR_FILL_FIXED = 64
+
+// Chooses the pool entries the start function fills from one passive segment, in pool order: an
+// entry whose pushed bytes cost more than its segment bytes plus a `global.get` and a `call`, and
+// only when the module saves more than the fixed cost. A build bound for `-O` fills nothing, since
+// the fill reads every entry and binaryen could then not drop the dead ones.
+function strFillPlan() {
+  if gOptimized != 0 { return 0 }
+  const bytes: i32[][] = []
+  let save = 0
+  for lex in gStrPoolTexts {
+    const b = cpsToUtf8(decodeStr(strToCps(lex)))
+    // Inline: an `i32.const` per byte. Filled: the bytes in the segment, a `global.get` and a
+    // `call`, and the init's `i32.const n`, one byte wider than the count `array.new_fixed` takes.
+    let pushed = 0
+    for v in b {
+      if v < 64 { pushed = pushed + 2 } else { pushed = pushed + 3 }
+    }
+    const gain = pushed - b.length - countWidening(b.length) - 7
+    if gain > 0 {
+      save = save + gain
+      bytes.push(b)
+    } else {
+      bytes.push([])
+    }
+    gStrFillOff.push(if gain > 0 { 0 } else { -1 })
+  }
+  if save <= STR_FILL_FIXED {
+    gStrFillOff = []
+    return 0
+  }
+  const seg: u8[] = []
+  let k = 0
+  while k < gStrFillOff.length {
+    if gStrFillOff[k] >= 0 {
+      gStrFillOff[k] = seg.length
+      for v in bytes[k] { seg.push(v) }
+    }
+    k = k + 1
+  }
+  gStrFillSeg = gStrDataLen.length
+  gStrDataStart.push(gStrDataParts.length)
+  gStrDataParts.push({ b: seg })
+  gStrDataLen.push(seg.length)
+  0
+}
+
+// How much wider `n` is as an `i32.const` (signed LEB) than as a count (unsigned LEB).
+function countWidening(n: i32): i32 {
+  if n >= 64 && n < 128 { return 1 }
+  if n >= 8192 && n < 16384 { return 1 }
   0
 }
 
@@ -6288,10 +6408,15 @@ function emitModule(_stmts: i32[]) {
   // inline in the global section: its cell is zero-initialized there, and a single synthetic
   // start function (the last function index, so no user index shifts) runs every such init via `global.set` first. `computeGlobalPromotion` runs here so it sees the arena every pass left behind, before any section reads a global index.
   computeGlobalPromotion()
+  // Intern the string-literal pool (its globals PRECEDE the user cells — every
+  // user-global index below rides `userGlobalIdx`). Ahead of the start-function count, since
+  // a pool the start function fills is a reason to have one.
+  collectStrPool()
   const nNonConst = nonConstGlobalCount()
   let hasStart = 0
   if nNonConst > 0 { hasStart = 1 }
   if startStmts.length > 0 { hasStart = 1 }
+  if gStrFillSeg >= 0 { hasStart = 1 }
   // The synthetic start function's index (last, after all `n` user functions, which
   // themselves sit after any imports) and its `()->()` functype index (one past the
   // user functypes). Both unused when no start.
@@ -6305,9 +6430,6 @@ function emitModule(_stmts: i32[]) {
 
   const nHelpers = assignSharedHelperIndices(gImports + n + hasStart + memFn)
 
-  // Intern the string-literal pool (its globals PRECEDE the user cells — every
-  // user-global index below rides `userGlobalIdx`).
-  collectStrPool()
   // Placed by `emitGlobalSection`, which runs before any function body is emitted.
   gHeapGlobalIdx = -1
   gSynthBase = -1
@@ -6630,6 +6752,12 @@ function assignSharedHelperIndices(helpBase: i32) {
   gHelpStrFromBytes = -1
   if gNeedsStrFromBytes {
     gHelpStrFromBytes = helpBase + nHelpers
+    nHelpers = nHelpers + 1
+  }
+  // `__str_fill__`, after them, only when the pool has a segment to fill from.
+  gHelpStrFill = -1
+  if gStrFillSeg >= 0 {
+    gHelpStrFill = helpBase + nHelpers
     nHelpers = nHelpers + 1
   }
   // The map store helpers reserve only a functype per shape here. Each takes a function index,
@@ -8846,6 +8974,9 @@ function tsEmitHelperFuncTypes() {
   if gHelpStrFromBytes >= 0 {
     helpFuncType("yii", "s") // __str_from_bytes__: (u8[], at, count) -> (ref str)
   }
+  if gHelpStrFill >= 0 {
+    helpFuncType("is", "i") // __str_fill__: (segment offset, pool string) -> next offset
+  }
   let sft = 0
   while sft < gMapSetTy.length {
     if gMapSetTy[sft] >= 0 { mapSetFuncType(mapCompactRowShape(sft)) }
@@ -9240,21 +9371,26 @@ function emitGlobalSection() {
     // opcodes) all stream to `curBuf == globalPayload`. Restored before framing.
     const gPrev = wTarget(globalPayload)
     // The string-literal pool first (indices 0..np-1, before the user cells): each entry an
-    // immutable non-null string ref whose init constexpr builds the literal once
-    // (`array.new_fixed` for the packed backing, then `struct.new` for the header) — every
-    // pooled literal fits the cap by construction. `array.new_fixed` and `struct.new` are both constant instructions under the GC proposal, so the pool remains one `global.get` at every use site.
+    // immutable non-null string ref built once, so every use is one `global.get`. Its backing is
+    // `array.new_fixed`, or for a filled entry (`gStrFillOff`) a zeroed `array.new_default` the
+    // start function copies into, since `array.new_data` is not a constant instruction.
     let pli = 0
     while pli < np {
       wU8(100) // 0x64 (ref $sTypeIdx) — non-null string ref
       wSLEB(sTypeIdx)
       wU8(0)   // immutable
       const pcps = cpsToUtf8(decodeStr(strToCps(gStrPoolTexts[pli])))
-      let pci = 0
-      while pci < pcps.length {
-        fbI32Const(pcps[pci])
-        pci = pci + 1
+      if pli < gStrFillOff.length && gStrFillOff[pli] >= 0 {
+        fbI32Const(pcps.length)
+        fbArrayNewDefault(sBackIdx)
+      } else {
+        let pci = 0
+        while pci < pcps.length {
+          fbI32Const(pcps[pci])
+          pci = pci + 1
+        }
+        fbArrayNewFixed(sBackIdx, pcps.length)
       }
-      fbArrayNewFixed(sBackIdx, pcps.length)
       fbI32Const(0)           // start
       fbI32Const(pcps.length) // len
       fbStrNew()              // 0xfb 0x00 <string header>
@@ -9905,6 +10041,12 @@ function buildCodePayload(
     const entry: u8[] = []
     if emitStrFromBytesFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_from_bytes__")
+  }
+  if gHelpStrFill >= 0 {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitStrFillFnCode(entry) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_fill__")
   }
   // The map store helpers the bodies above called, in the order they first did.
   for row in gMapSetRows {
