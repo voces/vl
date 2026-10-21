@@ -382,7 +382,12 @@ import {
   nameIsShapeOpen,
   peelGroupParens,
 } from "./tyname"
-import { flattenVariantsInto, nonNullTy, tyHasTyVar } from "./tyquery"
+import {
+  flattenVariantsInto,
+  nonNullTy,
+  tyHasTyVar,
+  tyIsArray,
+} from "./tyquery"
 
 // Resolve a value type-name to a struct table index: a declared struct by name, or an inline
 // object type matched against the table by field set, since `collectAnonShapes` interns
@@ -812,10 +817,13 @@ export function mvCanonValNameTy(valName: string, ty: i32) {
 // `docs/internals/litunion-compact-rep-design.md`.
 function canonLitUnionArms(name: string, ty: i32): string {
   const atoms = canonAtomsOfTy(name, ty)
+  const lit: boolean[] = []
   let hasOther = false
   let h = 0
   while h < atoms.length {
-    if atoms[h] != "null" && !nameIsLitUnionType(atoms[h]) { hasOther = true }
+    const hl = nameIsLitUnionType(atoms[h])
+    lit.push(hl)
+    if atoms[h] != "null" && !hl { hasOther = true }
     h = h + 1
   }
   if !hasOther { return name }
@@ -828,7 +836,7 @@ function canonLitUnionArms(name: string, ty: i32): string {
     // `docs/internals/litunion-compact-rep-design.md`): re-widening it here would query the
     // union registry under a spelling no row is minted with, so registration and query would
     // stop agreeing.
-    if !nameIsLitUnionType(a) && a != "null" {
+    if !lit[i] && a != "null" {
       const ra = rlCanonLitUnionAtoms(a, -1)
       if ra != a {
         a = ra
@@ -2065,7 +2073,8 @@ function refArrShapeKindGo(name: string): i32 {
   // Nested lists of a NON-i32 scalar/string element — the element is that inner list's
   // WRAPPER (kinds 6/7/8 → `mkListIdx` / `fl64TypeIdx` / `il64TypeIdx`). Used for a
   // string[]/f64[]/i64[]-VALUED map's vals ref-list (the value analogue of `i32[][]` kind 4).
-  if nameIsArray(name) && nameIsStringArray(arrElemNameRaw(name)) {
+  const isArr = nameIsArray(name)
+  if isArr && nameIsStringArray(arrElemNameRaw(name)) {
     // `string[][]` AND the niche `(string | null)[][]`: the element is the string-list
     // wrapper (`$mkListIdx`) either way — the nullable rides INSIDE the inner elements.
     return RLK_STR_LIST
@@ -2085,9 +2094,7 @@ function refArrShapeKindGo(name: string): i32 {
   // A nested ref array (`S[][]`, `(C|D)[][]`, `((i32)=>i32)[][]`, `S[][][]`, …): the
   // element is itself a ref array, stored as the inner list's wrapper — kind 9. Recurses
   // to any depth via the interned inner slots.
-  if nameIsArray(name) && nameIsRefArray(refArrElemName(name)) {
-    return RLK_REF_LIST
-  }
+  if isArr && nameIsRefArray(refArrElemName(name)) { return RLK_REF_LIST }
   if nameIsMapArray(name) { return RLK_MAP }
   // The paren-grouped element, resolved once: five former arms each re-derived the same
   // `(…)[]` union element and its `| null` part separately; one lookup gates all of them,
@@ -2405,9 +2412,7 @@ export function refElemArrName(elemName: string): string {
     arrName = "(" + elemName + ")[]"
   } else if (
     parenUnionArrElemName("(" + elemName + ")[]") != ""
-    && (isValueUnionName(elemName)
-      || nullablePartOf(elemName) == ""
-      || nulBoxUnionElem(enp))
+    && (isValueUnionName(elemName) || enp == "" || nulBoxUnionElem(enp))
   ) {
     // A value-union element needs its grouping parens restored, or `refArrElemKind`
     // mis-splits it as a struct element and an unboxed value lands in a ref slot; a
@@ -2772,19 +2777,20 @@ export function fieldTypeCode(tyIx: i32) {
   if ty is TypeRef {
     const c = fieldCodeOfSpelling(ty.tyName, tyIx)
     if c >= 0 { return c }
-    // An inline-shape struct field resolves structurally to its interned struct
-    // (pre-interned by `collectNestedFieldShapes`), the dual of a nominal `inner: Inner`.
-    // Guarded against an array base: `structIndexOfTypeName` ignores a trailing `[]` and
-    // would mis-code a nullable struct-list field as a nullable struct (invalid wasm).
+    // An inline-shape struct field resolves structurally to its interned struct, the dual of
+    // a nominal `inner: Inner`. Guarded by the annotation's own type, `| null` peeled: the
+    // lookup ignores a trailing `[]`, so a nullable struct-list field would mis-code as a
+    // nullable struct (invalid wasm).
     const base = nonNulBaseOf(ty.tyName)
-    if !nameIsArray(base) && structIndexOfTypeName(base) >= 0 {
-      return FC_STRUCT
-    }
+    let fTy = nodeTyIxOf(tyIx)
+    if canonRewroteNode(tyIx) { fTy = canonTyIxOf(tyIx) }
+    const baseIsArr = tyIsArray(nonNullTy(fTy))
+    if !baseIsArr && structIndexOfTypeName(base) >= 0 { return FC_STRUCT }
     // A generic-application field is a struct-ref field over the monomorphized instance,
     // code 15, keyed by the application name `gaeEnsure` interns the instance under. It
     // cannot use `structIndexOfTypeName` above: `collectS` codes every declared struct
     // before `gaeCollectDecls` runs, so at field-code time the instance exists only in the arena.
-    if !nameIsArray(base) && nameIsGenAppDecl(base) { return FC_STRUCT }
+    if !baseIsArr && nameIsGenAppDecl(base) { return FC_STRUCT }
     return -1
   }
   -1
@@ -2918,22 +2924,15 @@ export function fieldRefElemName(tyIx: i32) {
       if arm >= 0 { return sNames[arm] }
       return base
     }
-    // A nullable ref-list field's element is the ref-array element of the non-null part
-    // (`S[]|null` -> `S`), so `sFieldRefSlot` finds its interned slot. Deferred exactly as
-    // the shape-text recorder is: `collectVariantFields` reaches this from `collectU`,
-    // which runs before `collectS` builds the struct table, so the slot is un-interned (D1293).
-    if code == FC_NUL_REF_LIST {
-      return refArrElemKeyDeferred(nullablePartOf(ty.tyName))
-    }
     // The ATOM codes the shape-text recorder keys and the NODE recorder does not: a
     // code-0 literal-union field and a code-30 `K | null` niche field carry their union
     // name from the annotation interner, not from here.
     if code == FC_I32 { return "" }
     if code == FC_NUL_LIT_UNION { return "" }
     // Every other code is recorded identically from a spelling: code 16 the union name,
-    // 19/29 the map's value name, 4 the atom array name, 5 the canonical ref element
-    // (parens stripped, nullable-array peeled — without it a declared `f: (f64|null)[]`
-    // field would store a raw f64 into the box-ref backing).
+    // 19/29 the map's value name, 4 the atom array name, 5 the canonical ref element (else a
+    // `(f64|null)[]` field stores a raw f64 into the box backing), and 28 its non-null part's,
+    // deferred since `collectU` runs before the struct table exists (D1293).
     return shapeFieldElemName(ty.tyName, code)
   }
   ""
