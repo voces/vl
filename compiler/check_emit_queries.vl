@@ -9,6 +9,7 @@ import {
   P,
   PIN_ANON,
   PIN_SIGKEY,
+  TypeDecl,
   ovDemangle,
   ovInstSite,
   ovSiteSetOf,
@@ -56,6 +57,7 @@ import {
   monoLocalDeclTy,
   monoRetScalarKind,
   njApartSet,
+  nomLitRelax,
   rejoinDropSubsumed,
 } from "./check_leaf_steps"
 import { recordClonedIsVarTyIx, tpIfJoinAt } from "./check_list_union"
@@ -101,7 +103,9 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cUserTypesVer,
   mkFuncTy,
+  nwTyIxs,
   objFieldType,
   structNameOfTy,
   tyArrayElemIx,
@@ -110,12 +114,14 @@ import {
   tyIsHole,
   tyIsLitUnion,
   tyIsTwinRecordUnion,
+  tyMutEpoch,
   tyNestedArrLeafRenders,
   tySame,
   tyToEmitName,
   tyToNominalName,
   tyToStructStr,
   tyUnionAllLists,
+  tyVarRenames,
   unionAliasDeclNameOfTy,
 } from "./check_types"
 import { tyIsNumUnion } from "./check_union_mint"
@@ -123,11 +129,7 @@ import { i32ListHas } from "./listutil"
 import { monoRecheckBegin } from "./check_assignable"
 import { checkNode } from "./typecheck"
 import { monoRecheckEnd } from "./check_demands"
-import {
-  nominalDeclAtOfObj,
-  nominalNameOfObj,
-  nullableRetName,
-} from "./check_fit_rules"
+import { nominalDeclAtOfObj, nullableRetName } from "./check_fit_rules"
 import {
   assignable,
   bindGenUnionArm,
@@ -149,6 +151,8 @@ import {
   structUnionRetName,
   variantBoxUnionRetName,
 } from "./check_ret_name_shapes"
+import { asgSrcStack } from "./check_asg_rows"
+import { emitPassGen, memoKeyNew, memoMoved } from "./memo"
 
 // The same refusal for an import's local binding (D2268), spanning exactly token `tk`: the
 // alias, or the name when there is none. `at` is a node of the importing module, for its file.
@@ -444,8 +448,61 @@ export function opSelfFnNameForRecv(op: string, recvTy: i32): string {
 export function nominalStructNameOfTy(ty: i32): string {
   if ty < 0 { return "" }
   const t = T.tys[ty]
-  if t is TyObj { return nominalNameOfObj(ty, gRootStmts) }
+  if t is TyObj {
+    const i = nominalRootDeclAt(ty, false)
+    if i < 0 { return "" }
+    const s = P.nodes[gRootStmts[i]]
+    if s is TypeDecl { return s.tdName }
+  }
   ""
+}
+
+// `nominalDeclAtOfObj` over the root statements, from the start (`second` false) or past the
+// first match, memoised per type while every input the scan reads holds: the arena, its
+// in-place writes, the name table, the brands and the pass. A deep record is asked once per
+// member read along its path, and each scan compares it against every declaration (D2793).
+const ndMemoKey = memoKeyNew(8)
+let ndMemoFirst: i32[] = []
+let ndMemoSecond: i32[] = []
+
+function nominalRootDeclAt(ty: i32, second: boolean): i32 {
+  // An answer asked inside an assignability walk or under the literal relaxation reads the
+  // walk's own state, so it is computed and not kept.
+  if asgSrcStack.length > 0 || nomLitRelax != 0 {
+    return nominalRootDeclScan(ty, second)
+  }
+  let moved = memoMoved(ndMemoKey, 0, T.tys.length)
+  moved = memoMoved(ndMemoKey, 1, tyMutEpoch) || moved
+  moved = memoMoved(ndMemoKey, 2, cUserTypesVer) || moved
+  moved = memoMoved(ndMemoKey, 3, tyVarRenames) || moved
+  moved = memoMoved(ndMemoKey, 4, nwTyIxs.length) || moved
+  moved = memoMoved(ndMemoKey, 5, gRootStmts.length) || moved
+  moved = memoMoved(ndMemoKey, 6, emitPassGen) || moved
+  moved = memoMoved(ndMemoKey, 7, P.nodes.length) || moved
+  if moved {
+    ndMemoFirst = []
+    ndMemoSecond = []
+  }
+  while ndMemoFirst.length <= ty {
+    ndMemoFirst.push(0 - 2)
+    ndMemoSecond.push(0 - 2)
+  }
+  if second {
+    if ndMemoSecond[ty] == 0 - 2 {
+      ndMemoSecond[ty] = nominalRootDeclScan(ty, true)
+    }
+    return ndMemoSecond[ty]
+  }
+  if ndMemoFirst[ty] == 0 - 2 {
+    ndMemoFirst[ty] = nominalRootDeclScan(ty, false)
+  }
+  ndMemoFirst[ty]
+}
+
+function nominalRootDeclScan(ty: i32, second: boolean): i32 {
+  const i = nominalDeclAtOfObj(ty, gRootStmts, 0)
+  if !second || i < 0 { return i }
+  nominalDeclAtOfObj(ty, gRootStmts, i + 1)
 }
 
 // The `(S|null)[]` spelling of list type `ty` whose element is a nullable record a declared
@@ -476,8 +533,7 @@ export function nulRecNominalName(ty: i32): string {
 // it rather than whichever of several same-shape declarations comes first.
 export function nominalStructSoleOfTy(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyObj) { return false }
-  const i = nominalDeclAtOfObj(ty, gRootStmts, 0)
-  i >= 0 && nominalDeclAtOfObj(ty, gRootStmts, i + 1) < 0
+  nominalRootDeclAt(ty, false) >= 0 && nominalRootDeclAt(ty, true) < 0
 }
 
 // An overloaded member call on a receiver each instance supplies, in a function no call

@@ -868,6 +868,27 @@ axis(
   (d) => twoFiles(d, genConstChain(200), genConstChain(50)),
 );
 
+// D2793's pair: a 40-deep chain of named records read back through `id<L40>(v) as! L40`, a
+// generic over `T | string`, against the same chain bound directly, so only the pin differs.
+// Fuel reads 1.13; master `14a806b96` read 23.9, every member read re-asking which declared
+// record the pinned type is and comparing it against all 40 declarations.
+const genRecordChainPin = (depth: number, pinned: boolean): string => {
+  const o = ["type L0 = {a: i32}"];
+  for (let i = 1; i <= depth; i++) o.push(`type L${i} = {x: L${i - 1}}`);
+  o.push("function id<T>(x: T | string): T | string { x }");
+  o.push(`const v: L${depth} = ${"{x: ".repeat(depth)}{a: 1}${"}".repeat(depth)}`);
+  o.push(pinned ? `const r = id<L${depth}>(v) as! L${depth}` : "const r = v");
+  o.push(`print(r${".x".repeat(depth)}.a)`);
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "record chain pinned through a generic union",
+  2.0,
+  "Which declared record a pinned type is (`nominalRootDeclAt`, compiler/check_emit_queries.vl) is being re-scanned per member read.",
+  (d) => twoFiles(d, genRecordChainPin(40, true), genRecordChainPin(40, false)),
+);
+
 // 1.09 / 0.97 / 1.13 at 6,000. At 3,000 fuel reads 1.00, and an arena scan planted on each
 // distinct identifier's first check reads 4.18.
 axis("call sites", 2.5, "Callee resolution is scaling with the number of callees.", (d) =>
