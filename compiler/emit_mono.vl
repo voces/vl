@@ -375,6 +375,8 @@ import {
   fnPosIndexDrop,
   fnStmts,
   fnValUsed,
+  globalStmtOrd,
+  globalStmts,
   invalidateFnChildIndex,
   lambdaCtr,
   lfNoteClone,
@@ -13011,6 +13013,9 @@ let mfrCalled: i32[] = []
 let mfrKeptIndex: i32[] = []
 let mfrKeptTop: i32[] = []
 let mfrAliasWrites: {[i32]: i32[]} = Map()
+// Pairs `[a, b]` of literal roots read as one: a pushed list and a list it is spread into, or two
+// maps one binding is handed.
+let mfrTied: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -13028,6 +13033,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrKeptIndex = []
   mfrKeptTop = []
   mfrAliasWrites = Map()
+  mfrTied = []
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -13176,6 +13182,48 @@ function monoFlowLamLeaf(v: i32): i32 {
   p
 }
 
+// The module-level generic every `return` of the function call `c` names, read bare, when its last
+// statement is one of them; -1 otherwise. A binding of the call still runs it (D9481).
+function monoFlowCallLeaf(c: i32): i32 {
+  const cn = P.nodes[c]
+  if !(cn is Call) { return -1 }
+  const f = unwrapParen(cn.callFn)
+  if f < 0 || !(P.nodes[f] is Ident) { return -1 }
+  const fd = identDeclOf(f)
+  if fd < 0 { return -1 }
+  const fnd = P.nodes[fd]
+  if !(fnd is FuncDecl) || fnd.fnTyParams.length > 0 || fnd.fnBody < 0 {
+    return -1
+  }
+  const b = P.nodes[fnd.fnBody]
+  if !(b is Block) || b.blkStmts.length == 0 { return -1 }
+  if !(P.nodes[b.blkStmts[b.blkStmts.length - 1]] is RetStmt) { return -1 }
+  let g = -1
+  const stack: i32[] = [fnd.fnBody]
+  while stack.length > 0 {
+    const x = stack.pop()
+    const xn = P.nodes[x]
+    if xn is RetStmt {
+      const a = unwrapParen(xn.retArg)
+      if a < 0 || !(P.nodes[a] is Ident) { return -1 }
+      const an = P.nodes[a]
+      const ad = identDeclOf(a)
+      if ad < 0 || !(P.nodes[ad] is FuncDecl) || !(mfrGen[ad] ?? false) {
+        return -1
+      }
+      if (mfrParent[ad] ?? -1) >= 0 { return -1 }
+      if an is Ident && (mfrNameCount[an.identName] ?? 0) != 1 { return -1 }
+      if g >= 0 && g != ad { return -1 }
+      g = ad
+    } else if !(xn is FuncDecl) {
+      for k in nodeChildren(x) {
+        if k >= 0 { stack.push(k) }
+      }
+    }
+  }
+  g
+}
+
 // The name a read rewritten to leaf `g` (`monoFlowLeafGen`) spells: a function's or a `const`'s.
 function monoFlowLeafName(g: i32): string {
   const gd = P.nodes[g]
@@ -13266,6 +13314,7 @@ function monoFlowLeafGen(v: i32): i32 {
     r = unwrapParen(ad.letInit)
     if r < 0 { return -1 }
     if P.nodes[r] is FuncDecl { return monoFlowLamLeaf(r) }
+    if !(P.nodes[r] is Ident) { return monoFlowCallLeaf(r) }
     hops = hops + 1
   }
   -1
@@ -13372,17 +13421,27 @@ function monoFlowStoreMap(p: i32, x: i32): i32 {
   mv
 }
 
-// The one `Map()` candidate binding `d`, an un-annotated parameter or `const` other than its
-// owner, holds; -1 when it holds anything else or more than one value.
+// The first `Map()` candidate binding `d` holds (`monoFlowAliasMaps`), tying every other one to it;
+// -1 when it holds none.
 function monoFlowAliasMap(d: i32): i32 {
-  if d < 0 || d >= P.nodes.length || !(mfrCand[d] ?? false) { return -1 }
+  const ms = monoFlowAliasMaps(d)
+  if ms.length == 0 { return -1 }
+  for m in ms { monoFlowTie(ms[0], m) }
+  ms[0]
+}
+
+// The `Map()` values candidate binding `d`, an un-annotated parameter or `const` other than their
+// owner, holds; empty when it may hold anything else. A write through `d` stores into each (D9480).
+function monoFlowAliasMaps(d: i32): i32[] {
+  if d < 0 || d >= P.nodes.length || !(mfrCand[d] ?? false) { return [] }
   const dn = P.nodes[d]
-  if dn is LetDecl && dn.letKw != "const" { return -1 }
+  if dn is LetDecl && dn.letKw != "const" { return [] }
   const vs = monoFlowDeclVals(d)
-  if vs.length != 1 { return -1 }
-  const o = monoFlowMapOwner(vs[0])
-  if o < 0 || o == d { return -1 }
-  vs[0]
+  for v in vs {
+    const o = monoFlowMapOwner(v)
+    if o < 0 || o == d { return [] }
+  }
+  vs
 }
 
 // The candidate binding read `x` of a map is handed to whole, the parameter of a direct call
@@ -13445,7 +13504,7 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
       } else {
         const h = monoFlowMapHandOn(x)
         if h >= 0 && !i32ListHas(via, h) {
-          if monoFlowAliasMap(h) != mv { return false }
+          if !i32ListHas(monoFlowAliasMaps(h), mv) { return false }
           via.push(h)
         }
       }
@@ -13753,6 +13812,26 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
       }
     }
   }
+  // Tied roots decline together (D9482).
+  let spreadMoved = true
+  while spreadMoved {
+    spreadMoved = false
+    let si = 0
+    while si + 1 < mfrTied.length {
+      const a = mfrTied[si]
+      const b = mfrTied[si + 1]
+      const da = mfrDirty[a] ?? false
+      const db = mfrDirty[b] ?? false
+      if da != db {
+        // arena-tick exempt: a side table of this pass, not the arena
+        mfrDirty[a] = true
+        // arena-tick exempt: a side table of this pass, not the arena
+        mfrDirty[b] = true
+        spreadMoved = true
+      }
+      si = si + 2
+    }
+  }
   // A binding some read, loop or spread of which keeps reading through the literal.
   const through: i32[] = []
   let i = 0
@@ -13921,7 +14000,7 @@ function monoFlowUsePlan(
     if monoFlowNullTest(p, cur) { return true }
     // A map handed whole to a binding whose own writes and reads are its owner's (D9440).
     const h = monoFlowMapHandOn(cur)
-    return cv.length == 1 && h >= 0 && monoFlowAliasMap(h) == cv[0]
+    return cv.length == 1 && h >= 0 && i32ListHas(monoFlowAliasMaps(h), cv[0])
   }
   let lits = 0
   for v in cv {
@@ -14081,7 +14160,12 @@ function monoFlowLoopUse(
 // literal; appends `[spread, list]` to `spreads` when so.
 function monoFlowSpreadUse(p: i32, cv: i32[], spreads: i32[]): boolean {
   if !(P.nodes[p] is Spread) || cv.length != 1 { return false }
-  if monoFlowPushed(cv[0]).length > 0 { return false }
+  if monoFlowListGrows(cv[0], 0) {
+    // A pushed list is not expanded: the host's reads name its one generic (D9482).
+    const hx = mfrParent[p] ?? -1
+    if hx < 0 || !(P.nodes[hx] is ArrayLit) { return false }
+    return monoFlowPushedSpreadSrc(p) == cv[0] && monoFlowElemsGen(cv[0]) >= 0
+  }
   const host = mfrParent[p] ?? -1
   const vn = P.nodes[cv[0]]
   if host < 0 || !(P.nodes[host] is ArrayLit) || !(vn is ArrayLit) {
@@ -14131,9 +14215,7 @@ function monoFlowFieldOf(v: i32, name: string): i32 {
 function monoFlowElemsGen(v: i32): i32 {
   const ln = P.nodes[v]
   if !(ln is ArrayLit) { return -1 }
-  const es: i32[] = []
-  for e in ln.arrElems { es.push(unwrapParen(e)) }
-  for x in monoFlowPushed(v) { es.push(x) }
+  const es = monoFlowElemLeaves(v, 0)
   if es.length == 0 { return -1 }
   let g = -1
   for e in es {
@@ -14142,6 +14224,68 @@ function monoFlowElemsGen(v: i32): i32 {
     g = eg
   }
   g
+}
+
+// The values list literal `v` holds: its elements, the values its owner pushes, and in place of a
+// spread of a pushed list (`monoFlowPushedSpreadSrc`) that list's own values (D9482).
+function monoFlowElemLeaves(v: i32, depth: i32): i32[] {
+  const out: i32[] = []
+  const ln = P.nodes[v]
+  if !(ln is ArrayLit) || depth > 8 { return out }
+  for e in ln.arrElems {
+    const x = unwrapParen(e)
+    const sv = monoFlowPushedSpreadSrc(x)
+    if sv >= 0 {
+      for y in monoFlowElemLeaves(sv, depth + 1) { out.push(y) }
+    } else {
+      out.push(x)
+    }
+  }
+  for x in monoFlowPushed(v) { out.push(x) }
+  out
+}
+
+// The list literal spread `x` expands when that list grows (`monoFlowListGrows`), so its length
+// is known only when it runs; -1 for any other node. Each such pair is noted in `mfrTied`.
+function monoFlowPushedSpreadSrc(x: i32): i32 { monoFlowGrownSpreadSrc(x, 0) }
+
+// Whether list literal `v`'s owner pushes into it or it spreads such a list.
+function monoFlowListGrows(v: i32, depth: i32): boolean {
+  const ln = P.nodes[v]
+  if !(ln is ArrayLit) || depth > 8 { return false }
+  if monoFlowPushed(v).length > 0 { return true }
+  for e in ln.arrElems {
+    if monoFlowGrownSpreadSrc(unwrapParen(e), depth + 1) >= 0 { return true }
+  }
+  false
+}
+
+// `monoFlowPushedSpreadSrc` at nesting `depth`.
+function monoFlowGrownSpreadSrc(x: i32, depth: i32): i32 {
+  if x < 0 { return -1 }
+  const sn = P.nodes[x]
+  if !(sn is Spread) { return -1 }
+  const a = unwrapParen(sn.spdArg)
+  if a < 0 || !(P.nodes[a] is Ident) { return -1 }
+  const d = identDeclOf(a)
+  if d < 0 || !(mfrCand[d] ?? false) { return -1 }
+  const vs = monoFlowDeclVals(d)
+  if vs.length != 1 || monoFlowListOwner(vs[0]) != d { return -1 }
+  if !monoFlowListGrows(vs[0], depth) { return -1 }
+  monoFlowTie(monoFlowLitRoot(vs[0]), monoFlowLitRoot(x))
+  vs[0]
+}
+
+// Notes roots `a` and `b` in `mfrTied`, once.
+function monoFlowTie(a: i32, b: i32) {
+  let i = 0
+  while i + 1 < mfrTied.length {
+    if mfrTied[i] == a && mfrTied[i + 1] == b { return 0 }
+    i = i + 2
+  }
+  mfrTied.push(a)
+  mfrTied.push(b)
+  0
 }
 
 // The un-annotated `const` list literal `v` initializes; -1 otherwise.
@@ -14220,20 +14364,18 @@ function monoFlowKeptIndexElem(v: i32, ix: i32): i32 {
   if v < 0 || ix < 0 { return -1 }
   const xn = P.nodes[ix]
   if !(xn is Index) { return -1 }
-  // A literal index past a literal's elements reads what a push appended (D9441).
-  const pushed = monoFlowPushed(v)
-  if pushed.length == 0 && P.nodes[unwrapParen(xn.idxIndex)] is NumLit {
+  const ln = P.nodes[v]
+  if !(ln is ArrayLit) { return -1 }
+  // A literal index past a literal's elements reads what a push appended (D9441), or what a
+  // spread of a pushed list holds (D9482). A spread of any other list is expanded first.
+  if !monoFlowListGrows(v, 0) && P.nodes[unwrapParen(xn.idxIndex)] is NumLit {
     return -1
   }
-  const ln = P.nodes[v]
-  if !(ln is ArrayLit) || monoFlowElemsGen(v) < 0 { return -1 }
-  for e in ln.arrElems {
-    if P.nodes[e] is Spread { return -1 }
-  }
+  const leaves = monoFlowElemLeaves(v, 0)
+  if monoFlowElemsGen(v) < 0 { return -1 }
   if monoFlowCallStmtOf(ix) < 0 { return -1 }
   if !i32ListHas(mfrKeptIndex, ix) { mfrKeptIndex.push(ix) }
-  if ln.arrElems.length == 0 { return pushed[0] }
-  unwrapParen(ln.arrElems[0])
+  leaves[0]
 }
 
 // The statement holding the call whose callee is read `ix`, when nothing in that statement runs
@@ -14248,6 +14390,8 @@ function monoFlowCallStmtOf(ix: i32): i32 {
   let x = c
   while monoFlowPosIn(monoFlowStmtListOf(x), x) < 0 {
     const p = mfrParent[x] ?? -1
+    // A module global's initializer runs in the start function at its declaration (D9483).
+    if p < 0 && monoFlowPosIn(globalStmts, x) >= 0 { return x }
     if p < 0 || !monoFlowRunsFirstIn(p, x) { return -1 }
     x = p
   }
@@ -14325,6 +14469,24 @@ function monoFlowKeepIndex(x: i32): boolean {
   if c < 0 { return false }
   const xn = P.nodes[x]
   if !(xn is Index) { return false }
+  const gat = monoFlowPosIn(globalStmts, c)
+  if gat >= 0 && (mfrParent[c] ?? -1) < 0 {
+    // Before a global's initializer: a start statement ordered just before its position.
+    const ord = globalStmtOrd[gat] - 1
+    let si = 0
+    while si < startStmtOrd.length && startStmtOrd[si] <= ord { si = si + 1 }
+    const gk = mkIndex(xn.idxArr, xn.idxIndex, xn.pos)
+    if si < startStmts.length {
+      monoFlowInsertAt(startStmts, si, gk)
+      monoFlowInsertAt(startStmtOrd, si, ord)
+    } else {
+      startStmts.push(gk)
+      startStmtOrd.push(ord)
+      monoArenaTouch()
+    }
+    mfrKeptTop.push(gk)
+    return true
+  }
   const xs = monoFlowStmtListOf(c)
   const at = monoFlowPosIn(xs, c)
   if at < 0 { return false }
@@ -14434,6 +14596,51 @@ function monoFlowNoteInertLeaf(x: i32) {
   if g >= 0 && monoFlowGenCalled(g) && !i32ListHas(monoInertCalled, x) {
     if !i32ListHas(monoInertValues, x) { monoInertValues.push(x) }
     monoInertCalled.push(x)
+    monoFlowNoteInertRets(x)
+  }
+  0
+}
+
+// Notes inert each `return` operand of the function whose one call initializes the `const` chain
+// read `x` names (`monoFlowCallLeaf`), each link read once, so `x` is all that reads the result
+// (D9481).
+function monoFlowNoteInertRets(x: i32) {
+  let r = x
+  let hops = 0
+  while hops <= MONO_ALIAS_CHAIN_MAX {
+    if !(P.nodes[r] is Ident) { return 0 }
+    const d = identDeclOf(r)
+    if d < 0 { return 0 }
+    const dn = P.nodes[d]
+    if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return 0 }
+    if (mfrUses[d] ?? []).length != 1 { return 0 }
+    r = unwrapParen(dn.letInit)
+    if r < 0 { return 0 }
+    const rn = P.nodes[r]
+    if rn is Call {
+      if monoFlowCallLeaf(r) < 0 { return 0 }
+      const fd = identDeclOf(unwrapParen(rn.callFn))
+      if fd < 0 || fd >= P.nodes.length { return 0 }
+      if (mfrUses[fd] ?? []).length != 1 { return 0 }
+      const fnd = P.nodes[fd]
+      if !(fnd is FuncDecl) { return 0 }
+      const stack: i32[] = [fnd.fnBody]
+      while stack.length > 0 {
+        const y = stack.pop()
+        const yn = P.nodes[y]
+        if yn is RetStmt {
+          const a = unwrapParen(yn.retArg)
+          if !i32ListHas(monoInertValues, a) { monoInertValues.push(a) }
+          if !i32ListHas(monoInertCalled, a) { monoInertCalled.push(a) }
+        } else if !(yn is FuncDecl) {
+          for k in nodeChildren(y) {
+            if k >= 0 { stack.push(k) }
+          }
+        }
+      }
+      return 0
+    }
+    hops = hops + 1
   }
   0
 }
@@ -14525,6 +14732,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       for e in lit.arrElems { held.push([e, ctx]) }
       if monoValsInert(held) { return monoUncalledListElems(d, at, lf, lit) }
     }
+    if pushed.length == 0 && monoSpreadHostInert(at, lit) { return 0 }
     if fnFlowDeclKidSrc(at, "e") >= 0 { return 0 }
     // A list its function returns asks for a copy of the function per pin, as a returned literal
     // does (D9450).
@@ -14813,6 +15021,21 @@ function monoRepointBindingLit(v: i32, ctx: i32, self: i32): i32[] {
   }
   const out: i32[] = [li, sf[0]]
   out
+}
+
+// Whether list literal `lit` declared at `at` spreads a list and holds otherwise only inert
+// values, unwritten and pushed into by no one, so it takes the type of the lists it spreads
+// (D9482).
+function monoSpreadHostInert(at: i32, lit: ArrayLit): boolean {
+  if monoWritesOf("e:", at).length > 0 || monoWritesOf("n:", at).length > 0 {
+    return false
+  }
+  let spreads = 0
+  for e in lit.arrElems {
+    if P.nodes[e] is Spread { spreads = spreads + 1 }
+    else if !i32ListHas(monoInertValues, unwrapParen(e)) { return false }
+  }
+  spreads > 0
 }
 
 // Annotates the list `d` declared at `at`, literal `lit`, whose element slot nothing calls, at
