@@ -18537,7 +18537,10 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   // Inside a generic instance the receiver is read at that instance's binding.
   let rt = monoExactPinTyOf(nodeTyIxOf(m.memObj), ctx)
   // A list of functions the flow pinned is read at the annotation the pin gave it (D9093).
-  if lam && (rt < 0 || tyHasTyVar(rt)) { rt = monoPinnedListAnnTy(m.memObj) }
+  // So is one a named function is handed, whose own parameter the flow linked to it (D9761).
+  if (lam || P.nodes[ax] is Ident) && (rt < 0 || tyHasTyVar(rt)) {
+    rt = monoPinnedListAnnTy(m.memObj)
+  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = T.tys[rt]
   if !(lt is TyArray) || lt.aElem < 0 || tyHasTyVar(lt.aElem) { return 0 }
@@ -18561,6 +18564,11 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   const fs = monoPinAnnSpelling(ft)
   if fs == "" { return 0 }
   if monoCoerceFnValueName(a, fs, ctx, ft) < 0 { return -1 }
+  // A `.map` the checker left open, its element a hole function's, gives a list of that result.
+  if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
+    nodeTyRecord(ix, mkArrayTy(r))
+    monoArenaTouch()
+  }
   // The choice's own type is what its closure value is built and called at.
   if choice && tyHasTyVar(nodeTyIxOf(ax)) {
     nodeTyRecord(ax, ft)
@@ -22875,10 +22883,34 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
   monoNoteLitDest(n.letInit, n.letType)
   if monoWalk(n.letInit, ctx) < 0 { return -1 }
+  monoCloseListCbBindReads(n, ix, ctx)
   // A field a call initialises reads at the instance the walk just gave that call (D9714).
   if monoObjLitOpenCallField(n) {
     if monoPinFieldContainers(n, ix, ctx) < 0 { return -1 }
   }
+  0
+}
+
+// Types each open read of the un-annotated `let` `n` (node `at`) at its initialiser's type, where
+// that is a `.map` the walk just closed over a list of hole functions (D9766).
+function monoCloseListCbBindReads(n: LetDecl, at: i32, ctx: i32) {
+  if n.letType >= 0 || n.letInit < 0 { return 0 }
+  if ctx >= 0 && monoFrameIsGenericInstance(ctx) { return 0 }
+  const x = unwrapParen(n.letInit)
+  if x < 0 || x >= P.nodes.length { return 0 }
+  const c = P.nodes[x]
+  if !(c is Call) || c.callFn < 0 { return 0 }
+  const m = P.nodes[c.callFn]
+  if !(m is Member) || m.memProp != "map" { return 0 }
+  const t = nodeTyIxOf(x)
+  if t < 0 || monoTyOpen(t) { return 0 }
+  if monoTyOpen(nodeTyIxOf(at)) { nodeTyRecord(at, t) }
+  for ix in monoFrameNodes(ctx) {
+    if monoTyOpen(nodeTyIxOf(ix)) && monoReadsBinding(ix, n.letName, ctx, at) {
+      nodeTyRecord(ix, t)
+    }
+  }
+  monoArenaTouch()
   0
 }
 
