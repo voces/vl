@@ -326,6 +326,7 @@ import {
   FF_CHAIN_LONG,
   FF_PIN_DECLINE,
   fnFlowAliasLam,
+  fnFlowCallPathAgreedPinTys,
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
@@ -14574,7 +14575,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   // A pin that is itself a function value names only a wasm signature, so a hole function's
   // instance there keeps its hole: the slot's pinned parameter types and the element's result
   // at them give the type, as a list literal handed to the parameter gets it (D6886).
-  if ft < 0 { ft = monoListSlotPinnedFnTy(at, lit.arrElems) }
+  if ft < 0 { ft = monoListSlotPinnedFnTy(at, lit.arrElems, -1) }
   // An empty literal that `push` fills takes the one type its pushed functions agree on.
   if !monoTyClosedFn(ft) && lit.arrElems.length == 0 && !shared {
     const pushed = monoMethodStoredArgs(at, lf, "push", 1, "")
@@ -14858,15 +14859,21 @@ function monoTyClosedFn(t: i32): boolean {
 // The function type every element of `elems` takes at the closed parameter types the flow table
 // pins slot `e` of declaration `at` at, with the elements' one result there; -1 when the pins,
 // an element or the results do not close or agree.
-function monoListSlotPinnedFnTy(at: i32, elems: i32[]): i32 {
+function monoListSlotPinnedFnTy(at: i32, elems: i32[], call: i32): i32 {
   const ePath: string[] = ["e"]
-  monoPathSlotPinnedFnTy(at, ePath, elems)
+  monoPathSlotPinnedFnTy(at, ePath, elems, call)
 }
 
-// `monoListSlotPinnedFnTy` at slot `path` of declaration `at`.
-function monoPathSlotPinnedFnTy(at: i32, path: string[], elems: i32[]): i32 {
+// `monoListSlotPinnedFnTy` at slot `path` of declaration `at`, read in the walk call `call`
+// makes of its function when the flow table has one, so another call adds no pin (D9360).
+function monoPathSlotPinnedFnTy(
+  at: i32,
+  path: string[],
+  elems: i32[],
+  call: i32,
+): i32 {
   const qs: i32[] = []
-  if !fnFlowDeclPathAgreedPinTys(at, path, qs) { return -1 }
+  if !fnFlowCallPathAgreedPinTys(at, path, call, qs) { return -1 }
   for q in qs {
     if tyHasTyVar(q) { return -1 }
   }
@@ -19130,12 +19137,13 @@ function monoHoleGenBindFnArgs(
   0
 }
 
-// The pin of a list literal of open function values (`[h]`) handed to
-// un-annotated parameter `i` of `decl`: a list of the function type its body calls an element at,
-// the one agreed pin of the parameter's element slot, with the elements' own result there; ""
-// when the list, the pin or the result does not close (D6601).
+// The pin of a list literal of open function values (`[h]`) handed to un-annotated parameter `i`
+// of `decl` in `call`: a list of the function type its body calls an element at, the one agreed
+// pin of the parameter's element slot in that call's walk, with the elements' own result there;
+// "" when the list, the pin or the result does not close (D6601).
 function monoOpenFnListPin(
   decl: i32,
+  call: i32,
   argIx: i32,
   i: i32,
   ctx: i32,
@@ -19153,7 +19161,7 @@ function monoOpenFnListPin(
   if !(T.tys[la.aElem] is TyFunc) || !tyHasTyVar(la.aElem) { return "" }
   const al = P.nodes[ax]
   if !(al is ArrayLit) || al.arrElems.length == 0 { return "" }
-  const ft = monoListSlotPinnedFnTy(dn.fnParams[i], al.arrElems)
+  const ft = monoListSlotPinnedFnTy(dn.fnParams[i], al.arrElems, call)
   if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
   // Each element is delivered at that type, a hole function's name as a direct argument is
   // (`monoFnPinAt`).
@@ -19175,12 +19183,13 @@ function monoOpenFnListPin(
   monoConcreteFnPinName(lt)
 }
 
-// The pin of a record literal handed to un-annotated parameter `i` of `decl` whose open fields are
-// each a list literal of open function values (`{ xs: [h] }`): each list at the one agreed pin of
-// the parameter's slot `f.<field>/e`, as `monoOpenFnListPin` gives a bare list (D9301); "" when a
-// field, a pin or a result does not close.
+// The pin of a record literal handed to un-annotated parameter `i` of `decl` in call `call` whose
+// open fields are each a list literal of open function values (`{ xs: [h] }`): each list at the one
+// agreed pin of the parameter's slot `f.<field>/e` in that call's walk, as `monoOpenFnListPin` gives
+// a bare list (D9301); "" when a field, a pin or a result does not close.
 function monoOpenFnRecListPin(
   decl: i32,
+  call: i32,
   argIx: i32,
   i: i32,
   ctx: i32,
@@ -19232,7 +19241,12 @@ function monoOpenFnRecListPin(
           return ""
         } else if al is ArrayLit {
           const path: string[] = ["f." + f.fiName, "e"]
-          const ft = monoPathSlotPinnedFnTy(dn.fnParams[i], path, al.arrElems)
+          const ft = monoPathSlotPinnedFnTy(
+            dn.fnParams[i],
+            path,
+            al.arrElems,
+            call,
+          )
           if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
           // arena-tick exempt: a local copy of the field types; the arena is touched below.
           tys[k] = mkArrayTy(ft)
@@ -20009,12 +20023,12 @@ function monoPinHoleParam(
   }
   if an == "" {
     const flTy: i32[] = [0 - 1]
-    an = monoOpenFnListPin(oDecl, args[i], i, ctx, flTy)
+    an = monoOpenFnListPin(oDecl, callIx, args[i], i, ctx, flTy)
     anTy = flTy[0]
   }
   if an == "" {
     const rlTy: i32[] = [0 - 1]
-    an = monoOpenFnRecListPin(oDecl, args[i], i, ctx, rlTy)
+    an = monoOpenFnRecListPin(oDecl, callIx, args[i], i, ctx, rlTy)
     anTy = rlTy[0]
   }
   if an == "" {

@@ -124,6 +124,9 @@ let dfTo: i32[][] = []
 let dfPin: i32[][] = []
 let ffDeclSlots: {[i32]: i32[]} = Map()
 let ffDeclSlotCtx: {[i32]: i32[]} = Map()
+// Per pre-mono direct call of a generic, the context it walks its callee in; -1 when two walks of
+// the call's own frame give it two.
+let ffCallCtx: {[i32]: i32} = Map()
 
 // A pin is the parameter types a class is called or annotated at, in the context that read
 // them, and the return an annotation gives it (-1 for a call); `pinName` renders them once the
@@ -219,6 +222,7 @@ export function fnFlowShadowBegin() {
   ffKeyStamp = [-1, -1, -1]
   ffDeclSlots = Map()
   ffDeclSlotCtx = Map()
+  ffCallCtx = Map()
   pinTys = []
   pinRet = []
   pinName = []
@@ -1413,6 +1417,8 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
     if fd is FuncDecl {
       if monoIsGenericDecl(fn) {
         ffRecord(callee, 2, -1, "direct call", fn, ctx)
+        const was = ffCallCtx[ix] ?? ctx
+        ffCallCtx[ix] = if was == ctx { ctx } else { -1 }
       }
       ffEnsureWalked(fn, ctx)
       const ord = ffArgsInParamOrder(n, fd)
@@ -1780,10 +1786,34 @@ export function fnFlowDeclPathAgreedPinTys(
   path: string[],
   tys: i32[],
 ): boolean {
+  ffAgreedPinTys(d, path, -1, tys)
+}
+
+// `fnFlowDeclPathAgreedPinTys` over the walk pre-mono call `call` makes of `d`'s function alone,
+// so another call's instance adds no pin; over every walk when the table has no one for it.
+export function fnFlowCallPathAgreedPinTys(
+  d: i32,
+  path: string[],
+  call: i32,
+  tys: i32[],
+): boolean {
+  const cx = ffCallCtx[call] ?? -1
+  if cx < 2 { return ffAgreedPinTys(d, path, -1, tys) }
+  ffAgreedPinTys(d, path, cx, tys)
+}
+
+// `fnFlowDeclPathAgreedPinTys` over the walks of context `cx`, every walk when it is -1.
+function ffAgreedPinTys(d: i32, path: string[], cx: i32, tys: i32[]): boolean {
   if !ffBuilt || d < 0 { return false }
   let hit = -1
-  for s in ffDeclSlots[ffOrigDecl(d)] ?? [] {
-    let r = s
+  const o = ffOrigDecl(d)
+  const slots = ffDeclSlots[o] ?? []
+  const ctxs = ffDeclSlotCtx[o] ?? []
+  let si = 0
+  while si < slots.length {
+    let r = slots[si]
+    if cx >= 0 && (si >= ctxs.length || ctxs[si] != cx) { r = -1 }
+    si = si + 1
     for k in path {
       if r >= 0 { r = ffKidOf(ffFind(r), k) }
     }
