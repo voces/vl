@@ -2138,7 +2138,7 @@ function genericFnAssignable(srcTy: i32, dstTy: i32) {
         const bi = T.tys[genFnHoleBodyRet(srcTy, inst)]
         if bi is TyFunc { ret = bi.fnRet }
       }
-      return fnSlotAssignable(ret, d.fnRet)
+      return fnSlotRetAssignable(ret, d.fnRet)
     }
   }
   false
@@ -3275,6 +3275,41 @@ export function fnSlotAssignable(src: i32, dst: i32) {
   assignable(src, dst)
 }
 
+// `fnSlotAssignable` for a function slot's RESULT, which also admits a result widened to its own
+// nullable (`f64[]` at `f64[] | null`). The reps differ, so a delivered function value is wrapped
+// in `fvaAdapt`'s adapter, which widens at the call; a function inside a container is refused
+// there instead (D9781). A parameter stays invariant in nullability.
+function fnSlotRetAssignable(src: i32, dst: i32) {
+  if src >= 0 && !tyBearsNull(src) {
+    const d = nonNullTy(dst)
+    if d >= 0 && d != dst && fnSlotAssignable(src, d) { return true }
+  }
+  fnSlotAssignable(src, dst)
+}
+
+// Whether function type `src` reaches `dst`, or a function member of union `dst` other than `src`
+// itself, only through `fnSlotRetAssignable`'s widening: a value of `dst` is never one of `src`,
+// since a function carries no tag and its signature is fixed (D9781).
+export function fnSlotRetWidens(src: i32, dst: i32): boolean {
+  if src < 0 || dst < 0 || src >= T.tys.length || dst >= T.tys.length {
+    return false
+  }
+  const s = T.tys[src]
+  if !(s is TyFunc) || s.fnRet < 0 { return false }
+  const du = T.tys[dst]
+  if du is TyUnion {
+    let widens = false
+    for m in du.uMembers {
+      if m == src || tySame(m, src) { return false }
+      if fnSlotRetWidens(src, m) { widens = true }
+    }
+    return widens
+  }
+  if !(du is TyFunc) || du.fnRet < 0 { return false }
+  if s.fnParamTypes.length != du.fnParamTypes.length { return false }
+  !fnSlotAssignable(s.fnRet, du.fnRet) && fnSlotRetAssignable(s.fnRet, du.fnRet)
+}
+
 // The type a function slot is stored as: a numeric literal union is its base scalar (`1 | 2`
 // is an `i32`), so `() => N` and `() => i32` share one wasm signature (D9382).
 function fnSlotStoreTy(ty: i32): i32 {
@@ -3453,7 +3488,7 @@ function assignableGo(src: i32, dst: i32) {
         const dp = d.fnParamTypes
         if sp.length != dp.length { return false }
         let i = 0
-        let ok = fnSlotAssignable(sTail.fnRet, d.fnRet)
+        let ok = fnSlotRetAssignable(sTail.fnRet, d.fnRet)
         while i < sp.length {
           if !fnSlotAssignable(dp[i], sp[i]) { ok = false }
           i = i + 1

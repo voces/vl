@@ -260,6 +260,7 @@ import {
   f64ExactJoinLeaves,
   litTreeAdoptDst,
   mapDeliveryMayRecord,
+  valueTailSplit,
 } from "./check_num_adopt"
 import {
   anyArgIsLitOnly,
@@ -2463,15 +2464,60 @@ export function monoRecheckBegin(
 // rep traps. The delivery is rewritten in place into `(p…): R => f(p…)` at the destination's
 // type and checked as written code; a conversion that code cannot make is refused there.
 
+// A value `if`, `match` or block delivered at a function type `dstTy` (or its nullable): each
+// function-value tail is adapted to `dstTy` and, if any needed it, the join is typed `dstTy`, so
+// the emitter builds it at one `$fnsig` (D9781, D9881). False when no tail needed an adapter.
+export function fvaAdaptJoin(srcExpr: i32, dstTy: i32): boolean {
+  const lix = parenPeelIx(srcExpr)
+  if lix < 0 { return false }
+  const e = P.nodes[lix]
+  if !(e is IfStmt || e is MatchExpr || e is Block) { return false }
+  const dt = nonNullTy(dstTy)
+  if dt < 0 || !(T.tys[dt] is TyFunc) { return false }
+  const spine: i32[] = []
+  const leaves: i32[] = []
+  valueTailSplit(lix, spine, leaves)
+  if spine.length == 0 || leaves.length == 0 { return false }
+  let adapted = false
+  for lf in leaves {
+    const lt = nodeTyIxOf(lf)
+    if lt >= 0 && lt < T.tys.length && T.tys[lt] is TyFunc {
+      if fvaAdapt(lf, lt, dt) { adapted = true }
+    }
+  }
+  if !adapted { return false }
+  for sp in spine {
+    if sp < nodeTyIx.length { nodeTySet(sp, dstTy) }
+  }
+  true
+}
+
+// A list literal of type `listTy` whose elements hold functions: each element is adapted to the
+// joined element type, so every slot holds one `$fnsig` (D9882). False when `ix` is no list literal.
+export function fvaAdaptListLit(ix: i32, listTy: i32): boolean {
+  const lix = parenPeelIx(ix)
+  if lix < 0 || listTy < 0 || listTy >= T.tys.length { return false }
+  const lit = P.nodes[lix]
+  if !(lit is ArrayLit) { return false }
+  const la = T.tys[nonNullTy(listTy)]
+  if !(la is TyArray) || !tyMayHoldFn(la.aElem, 0) { return false }
+  for el in lit.arrElems {
+    if spreadArgOf(el) < 0 { fvaAdapt(el, nodeTyIxOf(el), la.aElem) }
+  }
+  true
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
 export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   fvaNoteNameDecl(srcExpr)
-  if srcTy == dstTy || inferQuiet || monoRecheckDepth > 0 { return false }
+  if inferQuiet || monoRecheckDepth > 0 { return false }
   if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
   if srcTy >= T.tys.length || dstTy >= T.tys.length { return false }
-  if !tyMayHoldFn(dstTy, 0) { return false }
+  // A join typed at the destination still carries each tail's own function value.
+  if fvaAdaptJoin(srcExpr, dstTy) { return srcTy != dstTy }
+  if srcTy == dstTy || !tyMayHoldFn(dstTy, 0) { return false }
   // A literal delivers each element or field at the destination's own type, one seam down.
   const lit = P.nodes[parenPeelIx(srcExpr)]
   if lit is ArrayLit {
