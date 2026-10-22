@@ -20,6 +20,7 @@ import { nodeRepTyIxOf } from "./check_core_state"
 import { nodeTyIsLitUnionAlias, nodeTyIxOf } from "./check_node_tys"
 import {
   T,
+  TY_NEVER,
   TyArray,
   TyErr,
   TyFunc,
@@ -34,6 +35,7 @@ import {
   litUnionAliasNameOfTy,
   structNameOfTy,
   tyEmitNameKey,
+  tyEmitNameNonEmpty,
   tyEq,
   tyIsLitUnion,
   tyIsNullableLitUnion,
@@ -948,9 +950,78 @@ export function sigParamTokOfTy(pty: i32): string {
   const lr = sigDeclRecListTokOfTy(pty)
   if lr != "" { return lr }
   if sigRecUnionListHasNoTok(pty) { return "" }
+  if sigFuncParamIsClosure(pty) { return repSigTokOfKind("closure") }
+  if sigUnionParamIsBox(pty) { return repSigTokOfKind("union") }
   const pnm = tyToEmitName(pty)
   if pnm == "" { return "" }
   annParamKindTy(pnm, pty)
+}
+
+// Whether function-type parameter `pty` keys the closure fat-pointer, the answer
+// `annParamKindTy` gives its render, without spelling a parameter or result that doubles per
+// level. A union, nullable or map result declines, since its render ends in a spelling the
+// earlier arms of that ladder read.
+function sigFuncParamIsClosure(pty: i32): boolean {
+  if pty < 0 || pty >= T.tys.length { return false }
+  const t = T.tys[pty]
+  if !(t is TyFunc) { return false }
+  if t.fnRet >= 0 && t.fnRet != TY_NEVER {
+    const rt = T.tys[t.fnRet]
+    if (
+      !(rt is TyPrim
+        || rt is TyLit
+        || rt is TyObj
+        || rt is TyFunc
+        || rt is TyArray)
+    ) {
+      return false
+    }
+  }
+  tyEmitNameNonEmpty(pty) == 1
+}
+
+// Whether union parameter `pty` keys the `{tag, value}` box, the answer `annParamKindTy` gives
+// its render, without spelling a member that doubles per level. Only a union of scalars, lists,
+// records and maps, with or without `null`, whose other members fall in two render classes.
+function sigUnionParamIsBox(pty: i32): boolean {
+  if pty < 0 || pty >= T.tys.length || annTyIsLitUnion(pty) { return false }
+  let t = T.tys[pty]
+  if t is TyNullable && t.nInner >= 0 { t = T.tys[t.nInner] }
+  if !(t is TyUnion) { return false }
+  const classes: string[] = []
+  let i = 0
+  while i < t.uMembers.length {
+    const c = sigUnionMemberClass(t.uMembers[i])
+    if c == "" { return false }
+    if c != "null" && !strListHas(classes, c) { classes.push(c) }
+    i = i + 1
+  }
+  classes.length >= 2 && tyEmitNameNonEmpty(pty) == 1
+}
+
+// The render class of union member `m` — a scalar's own name, or the list, record or map
+// bracket every such render ends in — or "" for a member `sigUnionParamIsBox` declines.
+function sigUnionMemberClass(m: i32): string {
+  if m < 0 || m >= T.tys.length { return "" }
+  const t = T.tys[m]
+  match t {
+    TyPrim => {
+      if t.primName == "never" { return "" }
+      return t.primName
+    }
+    TyArray => {
+      return "[]"
+    }
+    TyObj => {
+      return "{}"
+    }
+    TyMap => {
+      return "{[]}"
+    }
+    TyLit | TyUnion | TyNullable | TyFunc | TyVar | TyNeg | TyErr => {
+      return ""
+    }
+  }
 }
 
 // The token of a record parameter by the declared record that owns its row, or "": the
@@ -1147,6 +1218,7 @@ export function sigRetTokOfTy(rty: i32): string {
     const rl = sigDeclRecListTokOfTy(rty)
     if rl != "" { return ">" + rl }
   }
+  if sigFuncParamIsClosure(rty) { return ">" + repSigTokOfKind("closure") }
   let rs = fnRetEmitName(rty)
   if rs == "" { return "" }
   const rt = T.tys[rty]
