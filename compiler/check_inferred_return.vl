@@ -39,6 +39,7 @@ import {
   scalarLeafListRetName,
   unresolvedHole,
 } from "./check_leaf_steps"
+import { a20RetWalk } from "./check_nj_gate"
 import { gRootStmts } from "./check_nj_join"
 import { nodeTyIx, nodeTySet } from "./check_node_tys"
 import { isF32AdoptingLitExpr } from "./check_num_lits"
@@ -137,7 +138,9 @@ import {
   litUnionAliasNameOfTy,
   mkFuncTy,
   mkNullableTy,
+  numLitUnionBaseTy,
   objFieldType,
+  tyEq,
   tyIsLitUnion,
   tyIsNulI32BackedListInner,
   tyIsPrimNamed,
@@ -150,10 +153,12 @@ import { fnDeclIx } from "./check_write_scan"
 import { numLexFitsI32, numLexIsFloat } from "./emit_bignum"
 import { strListHas } from "./listutil"
 import {
+  isNumericPrimTy,
   isVoidTy,
   numLitUnionHasBase,
   primNameOf,
   tyHasTyVar,
+  tyIntLitWideTexts,
   tyIsFnArmUnion,
 } from "./tyquery"
 
@@ -308,6 +313,61 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   false
 }
 
+// Whether a lambda adopts an expected numeric literal union result, or that union or `null`:
+// every value it returns, each `return` and the tail alike, is delivered to it (D9490, D9491).
+// The union reps as its base scalar, so a value outside it would print rather than refuse.
+function numLitUnionAdoptsRet(
+  n: FuncDecl,
+  inferred: i32,
+  expRet: i32,
+): boolean {
+  if expRet < 0 { return false }
+  let base = expRet
+  const et = T.tys[expRet]
+  if et is TyNullable { base = et.nInner }
+  if !numLitUnionHasBase(base) { return false }
+  if inferred >= 0 && tyEq(inferred, expRet) { return false }
+  retValsDeliver(n, inferred, expRet)
+}
+
+// Whether a lambda inferring a numeric literal union adopts an expected numeric primitive
+// every member converts to exactly (`1 | 5000000000` into `i64`), as `const b: i64 = a` does;
+// the return seam then converts the value (D9492).
+function numLitUnionConvertsRet(
+  n: FuncDecl,
+  inferred: i32,
+  expRet: i32,
+): boolean {
+  if inferred < 0 || !isNumericPrimTy(expRet) { return false }
+  if !numLitUnionHasBase(inferred) && tyIntLitWideTexts(inferred).length == 0 {
+    return false
+  }
+  retValsDeliver(n, inferred, expRet)
+}
+
+// Whether every value the lambda `n` returns, each `return` and the tail, is delivered to `dst`.
+function retValsDeliver(n: FuncDecl, inferred: i32, dst: i32): boolean {
+  const vals: i32[] = []
+  a20RetWalk(n.fnBody, true, vals)
+  if vals.length == 0 { return false }
+  for v in vals {
+    let vt = inferred
+    if v < nodeTyIx.length && nodeTyIx[v] >= 0 { vt = nodeTyIx[v] }
+    if !assignableExpr(v, vt, dst) { return false }
+  }
+  true
+}
+
+// `base | null` for a nullable numeric literal union over `base`, else -1.
+function nulNumLitUnionBoxTy(ty: i32): i32 {
+  if ty < 0 { return -1 }
+  const t = T.tys[ty]
+  if !(t is TyNullable) { return -1 }
+  const b = numLitUnionBaseTy(t.nInner)
+  if b < 0 { return -1 }
+  mkNullableTy(b)
+}
+
 // The niche rungs of an anonymous lambda's contextual return adoption: a bare `{}` body,
 // a litunion member, and the nullable string/boolean/list/closure/struct/litunion niches.
 // Hands back `inferred`, replaced by `expRet` where a rung adopts it.
@@ -335,6 +395,9 @@ function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
     if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
       inferred = expRet
     }
+  }
+  if inferred != expRet && numLitUnionAdoptsRet(n, inferred, expRet) {
+    inferred = expRet
   }
   // A nullable-string result: a lambda body inferring a bare `string` member of an
   // expected `string | null` closure result adopts the nullable — its functype result is
@@ -772,6 +835,14 @@ function inferRetCascadeName(
   if unm == "" {
     unm = irRung(IR_RUNG_VALUE_UNION, valueUnionRetName(inferred))
   }
+  // A nullable numeric literal union is its base's nullable box (`N | null` is `i32 | null`),
+  // the rep an annotated `(): N | null` result builds (D9491).
+  if unm == "" {
+    unm = irRung(
+      IR_RUNG_VALUE_UNION,
+      valueUnionRetName(nulNumLitUnionBoxTy(inferred)),
+    )
+  }
   // The litunion-array value-union dual (adopted above): records its alias-preserving
   // emit name so `collectU` registers the union and `synthRetAnnots`'s `isValueUnionName`
   // arm pins `fnRet` to it, keying the `$fnsig` result `>u` to match the value call.
@@ -1127,6 +1198,9 @@ export function finishInferredReturn(
     const expRet = cbExpectedRetFor(fnIx)
     if expRet >= 0 {
       if numWidens(inferred, expRet) { inferred = expRet }
+      if inferred != expRet && numLitUnionConvertsRet(n, inferred, expRet) {
+        inferred = expRet
+      }
       // The f32 dual of the numeric widen: a literal-bodied lambda whose contextual return
       // is f32 infers f64/i32 by default, but the literal re-encodes exactly at f32 — the
       // same grant a direct `const v: f32 = 5.5` binding makes. Adopts f32 so the functype
