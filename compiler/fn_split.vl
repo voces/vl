@@ -978,8 +978,8 @@ function fsChoiceRetLeaves(c: i32): string[] {
 
 // The statement choice-returning call `a` (`fsChoiceRetLeaves`), an argument of call `c`, can run
 // before: `c` is that statement or the value it binds, names no argument, and every argument
-// ahead of `a` is a literal, a function's name, or a parameter or `const` read that a call passed
-// no lambda cannot write; -1 otherwise.
+// ahead of `a` stays (`fsAheadStays`) or is bound ahead of it in order (`fsAheadHoists`); -1
+// otherwise.
 function fsChoiceStmt(c: i32, a: i32): i32 {
   if (
     c < 0
@@ -996,22 +996,10 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   if !(cn is Call) || !(an is Call) || hasNamedArgs(cn.callArgNames) {
     return -1
   }
-  let lam = false
-  for x in an.callArgs {
-    if fsIsLambdaLit(x) { lam = true }
-  }
+  const lam = fsChoiceTakesLambda(an)
   for x in cn.callArgs {
     if x == a { break }
-    const xn = P.nodes[x]
-    const xd = identDeclOf(x)
-    let ok = xn is NumLit || xn is StrLit || xn is BoolLit
-    if xn is Ident && xd >= 0 && xd < P.nodes.length {
-      const dn = P.nodes[xd]
-      if dn is FuncDecl { ok = true }
-      if dn is LetDecl && dn.letKw == "const" && !lam { ok = true }
-      if dn is Param && !lam { ok = true }
-    }
-    if !ok { return -1 }
+    if !fsAheadStays(x, lam) && !fsAheadHoists(x) { return -1 }
   }
   let s = c
   const p = fsParent[c]
@@ -1021,6 +1009,58 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   }
   if fsListOwner(s) < 0 { return -1 }
   s
+}
+
+// Whether choosing call `an` is passed a lambda literal, which may write a `const`'s contents or
+// a parameter.
+function fsChoiceTakesLambda(an: Call): boolean {
+  for x in an.callArgs {
+    if fsIsLambdaLit(x) { return true }
+  }
+  false
+}
+
+// Whether argument `x`, ahead of a choosing call, reads the same after that call runs: a literal,
+// a function's name, or a parameter or `const` read when the call is passed no lambda (`lam`).
+function fsAheadStays(x: i32, lam: boolean): boolean {
+  const xn = P.nodes[x]
+  if xn is NumLit || xn is StrLit || xn is BoolLit { return true }
+  const xd = identDeclOf(x)
+  if !(xn is Ident) || xd < 0 || xd >= P.nodes.length { return false }
+  const dn = P.nodes[xd]
+  dn is FuncDecl
+    || (!lam && ((dn is LetDecl && dn.letKw == "const") || dn is Param))
+}
+
+// Whether argument `x`, ahead of a choosing call, can be bound to a `const` ahead of that call
+// with no destination to type it: a binding read, a member or element read, or arithmetic
+// (D10022).
+function fsAheadHoists(x: i32): boolean {
+  const xn = P.nodes[x]
+  const op = fsBinOpAt(x)
+  xn is Member
+    || xn is Index
+    || fsReadsBinding(x)
+    || op == "+"
+    || op == "-"
+    || op == "*"
+    || op == "/"
+    || op == "%"
+}
+
+// The operator of the binary expression at `x`, or "" when `x` is none.
+function fsBinOpAt(x: i32): string {
+  const xn = P.nodes[x]
+  if xn is BinExpr { return xn.binOp }
+  ""
+}
+
+// Whether `x` reads a `let`, `const` or parameter binding.
+function fsReadsBinding(x: i32): boolean {
+  const xd = identDeclOf(x)
+  if !(P.nodes[x] is Ident) || xd < 0 || xd >= P.nodes.length { return false }
+  const dn = P.nodes[xd]
+  dn is LetDecl || dn is Param
 }
 
 // Whether parse node `r` names a generic module function no other declaration shares a name with.
@@ -3673,9 +3713,18 @@ function fsApplyChoiceRets(): i32 {
     P.pos = nodeToks[a] + 1
     const pos = an.pos
     an.callFn = mkIdent(pnFn[i], P.nodes[an.callFn].pos)
+    const lam = fsChoiceTakesLambda(an)
     const args: i32[] = []
+    let ahead = true
     for x in c.callArgs {
-      if x == a {
+      if x == a { ahead = false }
+      if ahead && !fsAheadStays(x, lam) {
+        const tmp = pnSel[i] + "$a" + i32ToStr(args.length)
+        if fsInsertBefore(pnStmt[i], mkLet("const", tmp, -1, x, pos)) != 0 {
+          return -1
+        }
+        args.push(mkIdent(tmp, pos))
+      } else if x == a {
         let k = 0
         while k < pnCount[i] {
           args.push(fsSelectArm(pnSel[i], pnLeaves[i], pos))
