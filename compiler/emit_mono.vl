@@ -15487,7 +15487,15 @@ function monoStoredSlotFnTy(
       vft = monoPinSubTyOf(nodeTyIxOf(val), fnStmts[monoLastInstFe])
       if !monoTyClosedFn(vft) && holeLam { vft = monoHoleLamAtAnnTy(vt0, ann) }
     }
-    if !monoTyClosedFn(vft) { vft = monoValueAtAnnTy(val, ann) }
+    // The instance's hole binding carries the result the checker guessed at a call it could not
+    // see through; the function's own result at the pin is the one its instance returns (D9064).
+    const aft = monoValueAtAnnTy(val, ann)
+    if (
+      !monoTyClosedFn(vft)
+      || (monoTyClosedFn(aft) && sigKeyOfTy(aft) != sigKeyOfTy(vft))
+    ) {
+      vft = aft
+    }
     if !monoTyClosedFn(vft) { return -1 }
     if ft >= 0 && sigKeyOfTy(vft) != sigKeyOfTy(ft) { return -1 }
     ft = vft
@@ -15555,10 +15563,13 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
   const nodes = monoFrameNodes(ctx)
   const aliases: i32[] = []
   const loops: i32[] = []
+  // Every node reading the slot's value, whose calls take the value's result.
+  const reads: i32[] = []
   for ix in nodes {
     // A parenthesised `??` is typed at both nodes.
     const n = P.nodes[unwrapParen(ix)]
     const ty = nodeTyIxOf(ix)
+    if monoIsMapValueRead(ix, d.letName, fld, ctx, at) { reads.push(ix) }
     if n is LetDecl && n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
       if monoIsMapValueRead(unwrapParen(n.letInit), d.letName, fld, ctx, at) {
         aliases.push(ix)
@@ -15576,7 +15587,11 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
       if monoIsMapValueRead(unwrapParen(n.binLeft), d.letName, fld, ctx, at) {
         if monoTyOpen(rty) || sigKeyOfTy(rty) == sigKeyOfTy(ft) {
           nodeTyRecord(ix, ft)
+        } else if monoFnValueAgreesAt(n.binRight, ft) {
+          nodeTyRecord(ix, ft)
+          nodeTyRecord(n.binRight, ft)
         }
+        reads.push(unwrapParen(ix))
       }
     } else if monoTyOpen(ty) && monoReadsSlotOf(ix, d.letName, fld, ctx, at) {
       nodeTyRecord(ix, nt)
@@ -15608,10 +15623,9 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
     if a is LetDecl {
       for ix in nodes {
         const ty = nodeTyIxOf(ix)
-        if (
-          monoFnReadTyStale(ty, ft, ctx)
-          && monoReadsBinding(ix, a.letName, ctx, ax)
-        ) {
+        const rd = monoReadsBinding(ix, a.letName, ctx, ax)
+        if rd { reads.push(ix) }
+        if monoFnReadTyStale(ty, ft, ctx) && rd {
           if ty >= 0 && T.tys[ty] is TyNullable {
             nodeTyRecord(ix, rt)
           } else {
@@ -15634,18 +15648,17 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
       if vn != "" {
         for ix in nodes {
           const vr = P.nodes[ix]
-          if (
-            vr is Ident
-            && vr.identName == vn
-            && identDeclOf(ix) == lx
-            && monoFnReadTyStale(nodeTyIxOf(ix), ft, ctx)
-          ) {
-            nodeTyRecord(ix, ft)
+          if (vr is Ident && vr.identName == vn && identDeclOf(ix) == lx) {
+            reads.push(ix)
+            if monoFnReadTyStale(nodeTyIxOf(ix), ft, ctx) {
+              nodeTyRecord(ix, ft)
+            }
           }
         }
       }
     }
   }
+  monoRetypeCallsAt(nodes, reads, ft)
   0
 }
 
@@ -15734,6 +15747,110 @@ function monoRetypeHeldFnReads(
   0
 }
 
+// Types each call in `nodes` through one of `reads`, a value now typed `ft` — a function, or a
+// record read possibly null whose field it calls — at the function's result, and the `?.` guard
+// around it at that result or null, where the checker guessed another result (D9064, D9065).
+// A field callee takes the field's type too, or a same-named field of another record keys it.
+function monoRetypeCallsAt(nodes: i32[], reads: i32[], ft: i32) {
+  if ft < 0 || ft >= T.tys.length { return 0 }
+  const retyped: i32[] = []
+  for ix in nodes {
+    const c = P.nodes[ix]
+    if c is Call && c.callFn >= 0 {
+      const cf = unwrapParen(c.callFn)
+      const pt = monoCalleeFnTyThrough(cf, reads, ft)
+      if pt >= 0 && cf >= 0 && cf < P.nodes.length {
+        const p = T.tys[pt]
+        if P.nodes[cf] is Member && !tyEq(nodeTyIxOf(cf), pt) {
+          nodeTyRecord(cf, pt)
+        }
+        const ct = nodeTyIxOf(ix)
+        if p is TyFunc && ct >= 0 && ct < T.tys.length && !tyEq(ct, p.fnRet) {
+          nodeTyRecord(ix, p.fnRet)
+          retyped.push(ix)
+        }
+      }
+    }
+  }
+  if retyped.length == 0 { return 0 }
+  const guards: i32[] = []
+  for ix in nodes {
+    const g = P.nodes[ix]
+    const gt = nodeTyIxOf(ix)
+    if g is IfStmt && gt >= 0 && gt < T.tys.length && T.tys[gt] is TyNullable {
+      const b = P.nodes[g.ifThen]
+      if (
+        b is Block
+        && b.blkStmts.length == 1
+        && i32ListHas(retyped, b.blkStmts[0])
+      ) {
+        nodeTyRecord(ix, mkNullableTy(nodeTyIxOf(b.blkStmts[0])))
+        guards.push(ix)
+      }
+    }
+  }
+  // A `??` over such a guard whose default has the call's type has that type.
+  for ix in nodes {
+    const q = P.nodes[ix]
+    if q is BinExpr && q.binOp == "??" {
+      const l = unwrapParen(q.binLeft)
+      if i32ListHas(guards, l) {
+        const lt = T.tys[nodeTyIxOf(l)]
+        const rt = nodeTyIxOf(q.binRight)
+        if (
+          lt is TyNullable
+          && rt >= 0
+          && tyEq(lt.nInner, rt)
+          && !tyEq(nodeTyIxOf(ix), rt)
+        ) {
+          nodeTyRecord(ix, rt)
+        }
+      }
+    }
+  }
+  0
+}
+
+// The function type of callee `cf` when `cf` is one of `reads` typed function type `ft`, or
+// reads a closed function field of one typed `ft` or `ft | null`; -1 otherwise.
+function monoCalleeFnTyThrough(cf: i32, reads: i32[], ft: i32): i32 {
+  if cf < 0 || cf >= P.nodes.length || ft < 0 || ft >= T.tys.length {
+    return -1
+  }
+  const f = T.tys[ft]
+  if f is TyFunc {
+    return if nodeTyIxOf(cf) == ft && i32ListHas(reads, cf) { ft } else { -1 }
+  }
+  const m = P.nodes[cf]
+  if (
+    !(f is TyObj)
+    || !(m is Member)
+    || !i32ListHas(reads, unwrapParen(m.memObj))
+  ) {
+    return -1
+  }
+  let rt = nodeTyIxOf(unwrapParen(m.memObj))
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  const rn = T.tys[rt]
+  if rn is TyNullable { rt = rn.nInner }
+  if rt != ft { return -1 }
+  const k = strListIndexOf(f.objFieldNames, m.memProp)
+  if k < 0 || k >= f.objFieldTypes.length { return -1 }
+  const pt = f.objFieldTypes[k]
+  if pt < 0 || pt >= T.tys.length { return -1 }
+  if T.tys[pt] is TyFunc && monoTyClosedFn(pt) { return pt }
+  -1
+}
+
+// Whether value `v`, called at function type `ft`'s parameters, returns `ft`'s result.
+function monoFnValueAgreesAt(v: i32, ft: i32): boolean {
+  if ft < 0 || ft >= T.tys.length { return false }
+  const f = T.tys[ft]
+  if !(f is TyFunc) { return false }
+  const r = monoValueRetAt(v, f.fnParamTypes, 0)
+  r >= 0 && sigKeyOfTy(mkFuncTy(f.fnParamTypes, r)) == sigKeyOfTy(ft)
+}
+
 // Whether `v` reads the binding `name` declared at `at`, or, when `fld` is not "", its field `fld`.
 function monoReadsSlotOf(
   v: i32,
@@ -15816,9 +15933,22 @@ function monoMethodCallRecv(ix: i32, method: string): i32 {
   cf.memObj
 }
 
+// Whether call `ix` calls a field of the record its nullable receiver type `ot` holds, which the
+// flow table pins as it pins the same call on a non-null receiver (D9065).
+function monoNullableRecFieldCall(ix: i32, ot: i32): boolean {
+  const c = P.nodes[ix]
+  if !(c is Call) || c.callFn < 0 { return false }
+  const cf = P.nodes[unwrapParen(c.callFn)]
+  const n = T.tys[ot]
+  if !(cf is Member) || !(n is TyNullable) { return false }
+  if n.nInner < 0 || n.nInner >= T.tys.length { return false }
+  const o = T.tys[n.nInner]
+  o is TyObj && strListHas(o.objFieldNames, cf.memProp)
+}
+
 // Whether a method of a value of the map binding `name` declared at `at`, or of a `const` bound
-// to one, is called on a receiver typed nullable, as a `?.` call's guarded arm is: the flow table
-// pins no such call, so a slot type taken from the pins could miss it.
+// to one, is called on a receiver typed nullable, as a `?.` call's guarded arm is, other than a
+// record field's: the flow table pins no such call, so a slot type taken from the pins could miss it.
 function monoMapValueUnpinnedCall(
   name: string,
   fld: string,
@@ -15840,7 +15970,11 @@ function monoMapValueUnpinnedCall(
     if recv >= 0 {
       const o = unwrapParen(recv)
       const ot = nodeTyIxOf(o)
-      if ot < 0 || ot >= T.tys.length || T.tys[ot] is TyNullable {
+      if (
+        ot < 0
+        || ot >= T.tys.length
+        || (T.tys[ot] is TyNullable && !monoNullableRecFieldCall(ix, ot))
+      ) {
         if monoIsMapValueRead(o, name, fld, ctx, at) { return true }
         for ax in aliases {
           const a = P.nodes[ax]
