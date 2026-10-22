@@ -1701,8 +1701,19 @@ export function identBoundAt(fnIx: i32, sid: i32, atIx: i32) {
 export function globalLetOfSidIn(fnIx: i32, sid: i32, atIx: i32) {
   const li = globalLetOfSid(sid)
   if li < 0 { return -1 }
+  if identReadsGlobal(sid, atIx) { return li }
   if identBoundAt(fnIx, sid, atIx) { return -1 }
   li
+}
+
+// True when the resolver bound the read at `atIx` to the module global `sid`, which it then
+// denotes whatever the live scope holds: a chase into a global's initializer runs inside the
+// reader's frame, whose same-named local would otherwise answer, and can lead back to the
+// chase's start (D9681).
+export function identReadsGlobal(sid: i32, atIx: i32): boolean {
+  if atIx < 0 { return false }
+  const li = globalLetOfSid(sid)
+  li >= 0 && identDeclOf(atIx) == li
 }
 
 export function globalLetOfIn(fnIx: i32, name: string, atIx: i32) {
@@ -14633,8 +14644,10 @@ function structIndexOfCallExpr(e: Call, exprIx: i32, fnIx: i32): i32 {
 function structIndexOfIdentExpr(e: Ident, exprIx: i32, fnIx: i32): i32 {
   const pi = paramStructIndex(fnIx, e.identName)
   if pi >= 0 && paramReadAt(fnIx, e.identName, exprIx) { return pi }
-  const di = declaredStructIndex(e.identName)
-  if di >= 0 { return di }
+  if !identReadsGlobal(sidOfNode(exprIx), exprIx) {
+    const di = declaredStructIndex(e.identName)
+    if di >= 0 { return di }
+  }
   const gi = globalStructIndexSid(fnIx, sidOfNode(exprIx), exprIx)
   if gi >= 0 { return gi }
   const ci = capturedStructIndex(fnIx, e.identName)
@@ -16783,9 +16796,11 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   // name is the arm's, so `refListSlotOfExpr` resolves the wrapper the narrowed read casts to.
   const raN = narrowedRefArrayOf(e.identName)
   if raN != "" { return refArrElemName(raN) }
+  // A read the resolver bound to a module global is no same-named local of this frame (D9681).
+  const rdg = identReadsGlobal(sidOfNode(exprIx), exprIx)
   // A kind-18 nullable ref-array local stores its INNER ref-list slot in `localStructIdx`; its element
   // name is that inner slot's element name, so `refListSlotOfExpr` round-trips back to the inner slot.
-  if declaredKind(e.identName) == "nulreflist" {
+  if !rdg && declaredKind(e.identName) == "nulreflist" {
     const sl18 = declaredSlotOf(e.identName)
     if sl18 >= 0 {
       const is18 = localStructIdx[sl18]
@@ -16810,7 +16825,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   }
   const pn = paramRefArrayName(fnIx, e.identName)
   if pn != "" && paramReadAt(fnIx, e.identName, exprIx) { return pn }
-  const dn = declaredRefArrayName(e.identName)
+  const dn = if rdg { "" } else { declaredRefArrayName(e.identName) }
   if dn != "" { return dn }
   // A captured ref-array's element name is the `rlElemName` of the slot the env field is
   // typed with — the storage-class mirror of `exprRefArray`'s capture arm.
@@ -19217,7 +19232,8 @@ export function exprMap(exprIx: i32, fnIx: i32) {
       if paramMap(fnIx, e.identName) && paramReadAt(fnIx, e.identName, exprIx) {
         return true
       }
-      if declaredMap(e.identName) { return true }
+      const gmr = identReadsGlobal(sidOfNode(exprIx), exprIx)
+      if !gmr && declaredMap(e.identName) { return true }
       if globalIsMapSid(fnIx, sidOfNode(exprIx), exprIx) { return true }
       // A captured map variable of a lifted lambda: classify it exactly as a param/local
       // receiver would, so it takes the map-arm boxing in a union-boxed result.
@@ -19597,7 +19613,8 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     if nm != "" {
       return mvSlotOfMapNameTy(nm, narrowedMapValTyOf(e.identName))
     }
-    if declaredMap(e.identName) {
+    const gms = identReadsGlobal(sidOfNode(exprIx), exprIx)
+    if !gms && declaredMap(e.identName) {
       const slot = declaredSlotOf(e.identName)
       if slot >= 0 { return localStructIdx[slot] }
       return -1
@@ -19609,7 +19626,7 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
     }
     // A nullable map binding narrowed non-null — its shape is the `| null`-stripped value
     // type, resolved from the local slot or the param annotation.
-    if declaredNulMap(e.identName) {
+    if !gms && declaredNulMap(e.identName) {
       const nslot = declaredSlotOf(e.identName)
       if nslot >= 0 { return localStructIdx[nslot] }
       return -1
