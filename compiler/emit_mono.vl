@@ -12321,7 +12321,7 @@ function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
   const key = if lf[1] >= 0 { lf[1] } else { g0 }
   const noPath: string[] = []
   const ct = monoSlotPinName(key, noPath, fr)
-  if ct == "" { return monoAskRetCopies(fr, key, ctx, -1) }
+  if ct == "" { return monoAskRetCopies(fr, key, noPath, ctx, -1) }
   if monoCoerceFnValueName(iv, ct, fr, -1) < 0 { return -1 }
   monoRetypeIfInit(init, g0, at, fr)
   monoRetypePinCalls(key, noPath)
@@ -14376,6 +14376,13 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   const pins = monoDeclPathPins(lf, path)
   if pins.length > 1 {
     if fnFlowDeclKidSrc(at, "e") >= 0 { return 0 }
+    // A list its function returns asks for a copy of the function per pin, as a returned literal
+    // does (D9450).
+    if monoFnReturnsListLit(ctx, d.letInit) {
+      for e in lit.arrElems {
+        monoAskRetCopies(ctx, at, path, ctx, unwrapParen(e))
+      }
+    }
     return monoGenericListFail(d.letInit)
   }
   if (
@@ -17705,6 +17712,17 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
     }
   }
   t
+}
+
+// Whether un-annotated function node `fx` returns list literal `lit` (`monoRetListLitOf`).
+function monoFnReturnsListLit(fx: i32, lit: i32): boolean {
+  if fx < 0 || fx >= P.nodes.length { return false }
+  const fn = P.nodes[fx]
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return false }
+  for r in monoFnRetArgs(fn) {
+    if r >= 0 && monoRetListLitOf(r) == lit { return true }
+  }
+  false
 }
 
 // The list literal returned value `r` is, or initialises as the un-annotated `const` it names
@@ -22869,6 +22887,13 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     const ft = monoRetFnListTy(x, ctx)
     if ft == -2 { return -1 }
     if ft >= 0 { return 0 }
+    const xl = P.nodes[x]
+    if xl is ArrayLit {
+      // Its element slot pinned at two signatures wants a copy of the function per pin (D9450).
+      for e in xl.arrElems {
+        monoAskRetCopies(ctx, x, ["e"], ctx, unwrapParen(e))
+      }
+    }
     const noPath: string[] = []
     return monoDeliverLitAt(x, x, noPath, nodeTyIxOf(x), ctx, 0)
   }
@@ -22904,7 +22929,7 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     if lf[1] >= 0 && dn is LetDecl && dn.letInit >= 0 {
       rd = unwrapParen(dn.letInit)
     }
-    return monoAskRetCopies(fr, d, ctx, rd)
+    return monoAskRetCopies(fr, d, noPath, ctx, rd)
   }
   monoInstanceWidenRet = true
   const cr = monoCoerceFnValueName(x, nm, ctx, -1)
@@ -22933,17 +22958,22 @@ function monoRetFnListTy(x: i32, ctx: i32): i32 {
   ft
 }
 
-// A generic read `x` (keyed `d` in frame `fr`) that `ctx` returns past two pins or two results
-// asks for a copy of `ctx`'s template per pin, and is refused until the copies exist even when
-// another delivery already instanced the generic (D9380, D9383).
-function monoAskRetCopies(fr: i32, d: i32, ctx: i32, x: i32): i32 {
-  const noPath: string[] = []
+// A generic read `x` (keyed `d` in frame `fr`, at its slot `path`) that `ctx` returns past two
+// pins or two results asks for a copy of `ctx`'s template per pin, and is refused until the
+// copies exist even when another delivery already instanced the generic (D9380, D9383).
+function monoAskRetCopies(
+  fr: i32,
+  d: i32,
+  path: string[],
+  ctx: i32,
+  x: i32,
+): i32 {
   const it = monoFrameInstTmpl(ctx)
   let asked = ctx
   if it[0] == ctx && it[1] >= 0 { asked = it[1] }
   if (
-    monoDeclPathPins([fr, d], noPath).length > 1
-    || monoSlotRetCount(d, noPath, fr) > 1
+    monoDeclPathPins([fr, d], path).length > 1
+    || monoSlotRetCount(d, path, fr) > 1
   ) {
     fsAsk(asked)
     if x >= 0 && !i32ListHas(monoRetCopyReads, x) { monoRetCopyReads.push(x) }
