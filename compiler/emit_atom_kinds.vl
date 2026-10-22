@@ -45,6 +45,7 @@ import {
 import { nodeRepTyIxOf } from "./check_core_state"
 import { isVarTyIxOf } from "./check_list_union"
 import { nodeTyIxOf } from "./check_node_tys"
+import { holeFnArgRetAtParams } from "./check_relate_core"
 import { nomErasedTyIx, valueAtomKind, valueRowKind } from "./check_ty_rep"
 import {
   PrimName,
@@ -120,7 +121,7 @@ import {
   uFieldTypes,
   uVarTyIx,
 } from "./emit_state"
-import { memoKeyNew } from "./memo"
+import { memoKeyNew, memoPassMoved } from "./memo"
 import { strContains } from "./strutil"
 import { hashMixPair } from "./hash_mix"
 import { recFitNarrowedFields } from "./check_fit_rules"
@@ -447,6 +448,7 @@ export function declRowFieldKindFits(
   const lt = tyFieldTyOf(nodeRepTyIxOf(objIx), name)
   const own = objFieldOwnTyOf(objIx, name, lt)
   if !fnFieldTyFits(own, rt) { return false }
+  if !holeFnFieldFits(objFieldVal(objIx, name), own, rt) { return false }
   const rk = fieldScalarKindOf(rt)
   if rk == 0 { return true }
   if ownTyIsFunc(own) { return false }
@@ -459,7 +461,58 @@ export function declRowFieldKindFits(
 // anonymous row, whose closure fields `anonValueFitsField` checks by signature instead.
 export function declRowFnFieldFits(lt: i32, si: i32, name: string): boolean {
   if sIsAnonRow(si) { return true }
+  if !holeFnTyFieldFits(lt, si, name) { return false }
   rowFnFieldFits(lt, si, name)
+}
+
+// Every object-literal field value named `fiName` whose checked type is a function with holes,
+// collected once per pass and resumed as the arena grows: a type alone cannot say what such a
+// function returns, so `holeFnTyFieldFits` asks its values (D9530).
+const hfvKey = memoKeyNew(1)
+let hfvTys: i32[] = []
+let hfvVals: i32[] = []
+let hfvNames: string[] = []
+let hfvScanned = 0
+
+function hfvSync() {
+  if memoPassMoved(hfvKey, 0) {
+    hfvTys = []
+    hfvVals = []
+    hfvNames = []
+    hfvScanned = 0
+  }
+  let i = hfvScanned
+  while i < P.nodes.length {
+    const n = P.nodes[i]
+    if n is FieldInit {
+      const t = nodeTyIxOf(unwrapParen(n.fiValue))
+      if ownTyIsFunc(t) && tyHasTyVar(t) {
+        hfvTys.push(t)
+        hfvVals.push(n.fiValue)
+        hfvNames.push(n.fiName)
+      }
+    }
+    i = i + 1
+  }
+  hfvScanned = P.nodes.length
+  0
+}
+
+// `holeFnFieldFits` for a field type `lt` with no literal at hand: refuted when any field value
+// `name` checked at `lt` gives a result other than row `si`'s declared signature does (D9571).
+function holeFnTyFieldFits(lt: i32, si: i32, name: string): boolean {
+  if !ownTyIsFunc(lt) || !tyHasTyVar(lt) { return true }
+  if si < 0 || si >= sTyIx.length { return true }
+  const rt = tyFieldTyOf(sTyIx[si], name)
+  hfvSync()
+  let j = 0
+  while j < hfvTys.length {
+    if hfvTys[j] == lt && hfvNames[j] == name {
+      if !holeFnFieldFits(unwrapParen(hfvVals[j]), lt, rt) { return false }
+    }
+    j = j + 1
+  }
+  true
 }
 
 // `fnFieldTyFits` against field `name` of row `si`'s recorded type, declared or anonymous.
@@ -510,6 +563,23 @@ function fnFieldTyFits(lt: i32, rt: i32): boolean {
   if rf < 0 || !(T.tys[rf] is TyFunc) { return true }
   if tyHasTyVar(lt) || tyHasTyVar(rf) { return true }
   tyEq(lt, rf)
+}
+
+// Whether the un-annotated function field value `fv` (typed `lt`, with holes) gives the result of
+// declared field type `rt` when called at its parameters, as a call through the row reads it.
+// Refutation only: an unknown or literal result, or a non-function, agrees (D9530).
+function holeFnFieldFits(fv: i32, lt: i32, rt: i32): boolean {
+  if fv < 0 || lt < 0 || rt < 0 || lt >= T.tys.length || rt >= T.tys.length {
+    return true
+  }
+  if !(T.tys[lt] is TyFunc) || !tyHasTyVar(lt) { return true }
+  const rf = nonNullTy(rt)
+  if rf < 0 || rf >= T.tys.length || tyHasTyVar(rf) { return true }
+  const w = T.tys[rf]
+  if !(w is TyFunc) { return true }
+  const hr = holeFnArgRetAtParams(fv, w.fnParamTypes)
+  if hr < 0 || hr >= T.tys.length || T.tys[hr] is TyLit { return true }
+  tyEq(hr, w.fnRet)
 }
 
 // Whether `ty` is a record, list, map or function: a reference that no scalar slot holds.
