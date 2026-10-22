@@ -1123,6 +1123,7 @@ export function hcReset() {
   hcCanonMemo = []
   hcElemMemo = []
   hcMvMemo = []
+  hcImpure = 0
   memoKeyClear(repSlotCacheGenKey)
   hcTag = []
   hcArgStart = []
@@ -1286,15 +1287,21 @@ function repIdOf(ty: i32, mode: RepKeyMode): i32 {
       const d = stack.length - si
       const a: i32[] = []
       a.push(d)
+      hcImpure = hcImpure + 1
       return hcIntern(HC_BACK, a, 1 + hcDigits(d))
     }
     si = si - 1
   }
   const top = stack.length == 0
-  if top {
-    const hit = hcMemoGet(ty, mode)
-    if hit >= 0 { return hit }
+  const hit = hcMemoGet(ty, mode)
+  if hit >= 0 { return hit }
+  if hit < -1 {
+    if top {
+      hcImpure = hcImpure + 1
+      return -2 - hit
+    }
   }
+  const before = hcImpure
   stack.push(ty)
   let r = repIdGo(ty, mode)
   stack.pop()
@@ -1303,8 +1310,23 @@ function repIdOf(ty: i32, mode: RepKeyMode): i32 {
     a.push(ty)
     r = hcIntern(HC_BIG, a, 5 + hcDigits(ty))
   }
-  if top { hcMemoPut(ty, mode, r) }
+  if hcImpure == before {
+    hcMemoPut(ty, mode, r)
+  } else {
+    if top { hcMemoPut(ty, mode, -2 - r) }
+  }
   r
+}
+
+// The count of answers a walk took from its position — a back-edge, or a banked top-level
+// answer that had one. A walk that leaves it unchanged means the same id at every depth, so
+// its answer is banked for interior asks too, which keeps a shared inner type to one walk.
+let hcImpure = 0
+
+// A memo cell's id whatever its purity: `-2 - id` banks a top-level-only answer, -1 a miss.
+function hcMemoIdOf(v: i32): i32 {
+  if v < -1 { return -2 - v }
+  v
 }
 
 function hcStackOf(mode: RepKeyMode): i32[] {
@@ -1321,7 +1343,8 @@ function hcStackOf(mode: RepKeyMode): i32[] {
   }
 }
 
-// The depth-0 memo's id for `ty` under `mode`, -1 for a miss.
+// The memo cell for `ty` under `mode`: an id, -1 for a miss, or `-2 - id` for an answer valid
+// only at depth 0.
 function hcMemoGet(ty: i32, mode: RepKeyMode): i32 {
   match mode {
     "canon" => {
@@ -4131,8 +4154,8 @@ function repMemoCheck() {
   hcElemMemo = []
   let i = 0
   while i < bankedMv.length {
-    if bankedMv[i] >= 0 {
-      if repMvValId(i) != bankedMv[i] {
+    if bankedMv[i] != -1 {
+      if repMvValId(i) != hcMemoIdOf(bankedMv[i]) {
         hcMemoBad = hcMemoBad + 1
         repShadowNoteRaw("hc-memo mv ty=" + i32ToStr(i))
       }
@@ -4142,8 +4165,8 @@ function repMemoCheck() {
   hcMvMemo = []
   let j = 0
   while j < bankedElem.length {
-    if bankedElem[j] >= 0 {
-      if repElemId(j) != bankedElem[j] {
+    if bankedElem[j] != -1 {
+      if repElemId(j) != hcMemoIdOf(bankedElem[j]) {
         hcMemoBad = hcMemoBad + 1
         repShadowNoteRaw("hc-memo elem ty=" + i32ToStr(j))
       }
