@@ -8218,6 +8218,9 @@ function monoCloneGenericCallsRaw(ix: i32) {
         const vi = mkIdent(n.identName, n.pos)
         lfNoteMinted(vi, ix)
         identFrom(vi, ix)
+        // A value nothing calls stays one in each instance's copy (D9590).
+        if i32ListHas(monoInertValues, ix) { monoInertValues.push(vi) }
+        if i32ListHas(monoInertCalled, ix) { monoInertCalled.push(vi) }
         const vt = monoLamCallTy(nodeTyIxOf(ix))
         if vt >= 0 { nodeTyRecord(vi, vt) }
         return vi
@@ -13016,6 +13019,9 @@ let mfrAliasWrites: {[i32]: i32[]} = Map()
 // Pairs `[a, b]` of literal roots read as one: a pushed list and a list it is spread into, or two
 // maps one binding is handed.
 let mfrTied: i32[] = []
+// Pairs `[binding, use]` of reads `monoFlowUsePlan` found naming no generic only because a value
+// they read is an alias of a literal slot this round may rewrite to one (D9652).
+let mfrPending: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -13034,6 +13040,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrKeptTop = []
   mfrAliasWrites = Map()
   mfrTied = []
+  mfrPending = []
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -13295,6 +13302,7 @@ function monoFlowLeafGen(v: i32): i32 {
     if c < 0 || !(P.nodes[c] is Ident) { return -1 }
     return monoFlowLeafGen(c)
   }
+  if n is Call { return monoFlowCallLeaf(v) }
   if !(n is Ident) { return -1 }
   // A chain of un-annotated `const` aliases names what its last initializer names (D5061).
   let r = v
@@ -13848,6 +13856,7 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
     }
     i = i + 3
   }
+  monoFlowReplanPending(planned, through)
   i = 0
   while i < ps.length {
     through.push(ps[i])
@@ -13864,6 +13873,67 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
     i = i + 3
   }
   hosts
+}
+
+// Plans again, after this round's rewrites, each read of `mfrPending` whose clean binding is in
+// `planned`: a read now naming a generic is rewritten to it, and one that cannot be keeps its
+// binding in `through`, so the names its literal holds stay values a slot call reaches (D9652).
+function monoFlowReplanPending(planned: i32[], through: i32[]) {
+  const pend = mfrPending
+  mfrPending = []
+  let i = 0
+  while i + 1 < pend.length {
+    const d = pend[i]
+    if i32ListHas(planned, d) && monoFlowDeclClean(d) {
+      const reads: i32[] = []
+      const loops: i32[] = []
+      const spreads: i32[] = []
+      const ok = monoFlowUsePlan(
+        d,
+        pend[i + 1],
+        monoFlowDeclVals(d),
+        reads,
+        loops,
+        spreads,
+      )
+      let kept = !ok || loops.length > 0 || spreads.length > 0
+      let k = 0
+      while k + 1 < reads.length {
+        if !monoFlowReadSet(reads[k], reads[k + 1]) { kept = true }
+        k = k + 2
+      }
+      if kept || mfrPending.length > 0 { through.push(d) }
+      mfrPending = []
+    }
+    i = i + 2
+  }
+  0
+}
+
+// Whether `v` names an un-annotated `const` whose alias chain ends at an element or field read.
+function monoFlowAliasOfRead(v: i32): boolean {
+  let r = v
+  let hops = 0
+  while hops <= MONO_ALIAS_CHAIN_MAX {
+    if r < 0 || !(P.nodes[r] is Ident) { return false }
+    const g = identDeclOf(r)
+    if g < 0 { return false }
+    const ad = P.nodes[g]
+    if (
+      !(ad is LetDecl)
+      || ad.letKw != "const"
+      || ad.letType >= 0
+      || ad.letInit < 0
+    ) {
+      return false
+    }
+    r = unwrapParen(ad.letInit)
+    if r < 0 { return false }
+    const rn = P.nodes[r]
+    if rn is Index || rn is Member { return true }
+    hops = hops + 1
+  }
+  false
 }
 
 // Appends each pair of `pairs` to `out` as a triple led by binding `d`.
@@ -14018,7 +14088,16 @@ function monoFlowUsePlan(
     if path.length > 0 || !monoFlowCalledAt(cur) { return false }
   }
   const g = monoFlowCommonGen(cv)
-  if g == -1 { return true }
+  if g == -1 {
+    for v in cv {
+      if monoFlowAliasOfRead(v) {
+        mfrPending.push(d)
+        mfrPending.push(u)
+        return true
+      }
+    }
+    return true
+  }
   if g < 0 { return false }
   if viaMap {
     // A hole function read out of a map keeps the slot its pin types (D9064).
@@ -14591,6 +14670,12 @@ function monoFlowNoteInertIn(v: i32, depth: i32) {
 
 // Notes value `x` inert when it names a called generic; any other value is left as it is.
 function monoFlowNoteInertLeaf(x: i32) {
+  // A call written as the element still runs; what it returns is a value nothing calls (D9592).
+  if P.nodes[x] is Call {
+    const cg = monoFlowCallLeaf(x)
+    if cg >= 0 && monoFlowGenCalled(cg) { monoFlowNoteCallRets(x) }
+    return 0
+  }
   if !(P.nodes[x] is Ident) { return 0 }
   const g = monoFlowLeafGen(x)
   if g >= 0 && monoFlowGenCalled(g) && !i32ListHas(monoInertCalled, x) {
@@ -14616,31 +14701,35 @@ function monoFlowNoteInertRets(x: i32) {
     if (mfrUses[d] ?? []).length != 1 { return 0 }
     r = unwrapParen(dn.letInit)
     if r < 0 { return 0 }
-    const rn = P.nodes[r]
-    if rn is Call {
-      if monoFlowCallLeaf(r) < 0 { return 0 }
-      const fd = identDeclOf(unwrapParen(rn.callFn))
-      if fd < 0 || fd >= P.nodes.length { return 0 }
-      if (mfrUses[fd] ?? []).length != 1 { return 0 }
-      const fnd = P.nodes[fd]
-      if !(fnd is FuncDecl) { return 0 }
-      const stack: i32[] = [fnd.fnBody]
-      while stack.length > 0 {
-        const y = stack.pop()
-        const yn = P.nodes[y]
-        if yn is RetStmt {
-          const a = unwrapParen(yn.retArg)
-          if !i32ListHas(monoInertValues, a) { monoInertValues.push(a) }
-          if !i32ListHas(monoInertCalled, a) { monoInertCalled.push(a) }
-        } else if !(yn is FuncDecl) {
-          for k in nodeChildren(y) {
-            if k >= 0 { stack.push(k) }
-          }
-        }
-      }
-      return 0
-    }
+    if P.nodes[r] is Call { return monoFlowNoteCallRets(r) }
     hops = hops + 1
+  }
+  0
+}
+
+// Notes inert each `return` operand of the function call `r` runs, when it always returns one
+// generic (`monoFlowCallLeaf`) and nothing else calls that function.
+function monoFlowNoteCallRets(r: i32) {
+  const rn = P.nodes[r]
+  if !(rn is Call) || monoFlowCallLeaf(r) < 0 { return 0 }
+  const fd = identDeclOf(unwrapParen(rn.callFn))
+  if fd < 0 || fd >= P.nodes.length { return 0 }
+  if (mfrUses[fd] ?? []).length != 1 { return 0 }
+  const fnd = P.nodes[fd]
+  if !(fnd is FuncDecl) { return 0 }
+  const stack: i32[] = [fnd.fnBody]
+  while stack.length > 0 {
+    const y = stack.pop()
+    const yn = P.nodes[y]
+    if yn is RetStmt {
+      const a = unwrapParen(yn.retArg)
+      if !i32ListHas(monoInertValues, a) { monoInertValues.push(a) }
+      if !i32ListHas(monoInertCalled, a) { monoInertCalled.push(a) }
+    } else if !(yn is FuncDecl) {
+      for k in nodeChildren(y) {
+        if k >= 0 { stack.push(k) }
+      }
+    }
   }
   0
 }
@@ -16495,9 +16584,37 @@ function monoStoredSlotFnTy(
 function monoValsInert(vals: i32[][]): boolean {
   if vals.length == 0 { return false }
   for vw in vals {
-    if !i32ListHas(monoInertValues, unwrapParen(vw[0])) { return false }
+    const x = unwrapParen(vw[0])
+    if !i32ListHas(monoInertValues, x) && !monoCallRetsInert(x) { return false }
   }
   true
+}
+
+// Whether `x` is a call of a function always returning one generic (`monoFlowCallLeaf`) whose
+// every `return` operand `monoFlowNoteCallRets` noted inert: the call runs, its value is uncalled.
+function monoCallRetsInert(x: i32): boolean {
+  if x < 0 || !(P.nodes[x] is Call) || monoFlowCallLeaf(x) < 0 { return false }
+  const cn = P.nodes[x]
+  if !(cn is Call) { return false }
+  const fd = identDeclOf(unwrapParen(cn.callFn))
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const fnd = P.nodes[fd]
+  if !(fnd is FuncDecl) { return false }
+  const stack: i32[] = [fnd.fnBody]
+  let rets = 0
+  while stack.length > 0 {
+    const y = stack.pop()
+    const yn = P.nodes[y]
+    if yn is RetStmt {
+      if !i32ListHas(monoInertValues, unwrapParen(yn.retArg)) { return false }
+      rets = rets + 1
+    } else if !(yn is FuncDecl) {
+      for k in nodeChildren(y) {
+        if k >= 0 { stack.push(k) }
+      }
+    }
+  }
+  rets > 0
 }
 
 // The type a slot nothing calls holds its functions `vals` at, with its spelling pushed onto
@@ -18198,7 +18315,8 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
   const fd = monoCalleeDeclOf(c)
   if fd < 0 { return -1 }
   const fn = P.nodes[fd]
-  if !(fn is FuncDecl) || fn.fnRet >= 0 { return -1 }
+  if !(fn is FuncDecl) { return -1 }
+  if fn.fnRet >= 0 { return monoInstAnnRetTy(fd, fn.fnRet) }
   const it = monoCallInstRetTy(c, fd)
   if it >= 0 { return it }
   let t = -1
@@ -18212,6 +18330,24 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
       if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
       t = rt
     }
+  }
+  t
+}
+
+// The closed list-of-functions type that the return annotation `ret` of instance `fd` takes at its
+// pin (D9602); -1 when `fd` is not an instance or that type is open.
+function monoInstAnnRetTy(fd: i32, ret: i32): i32 {
+  const it = monoFrameInstTmpl(fd)
+  if it[0] != fd || it[1] < 0 || it[1] == fd { return -1 }
+  const t = nodeTyIxOf(ret)
+  if (
+    t < 0
+    || t >= T.tys.length
+    || !(T.tys[t] is TyArray)
+    || monoTyOpen(t)
+    || !tyMayHoldFn(t, 0)
+  ) {
+    return -1
   }
   t
 }
@@ -18230,10 +18366,35 @@ function monoCallInstRetTy(c: Call, fd: i32): i32 {
   const it = monoFrameInstTmpl(d)
   if d == fd || it[0] != d || it[1] != fd { return -1 }
   const dn = P.nodes[d]
-  if !(dn is FuncDecl) || dn.fnRet < 0 { return -1 }
+  if !(dn is FuncDecl) { return -1 }
+  if dn.fnRet < 0 { return monoInstRetLitTy(dn) }
   const t = nodeTyIxOf(dn.fnRet)
   if t < 0 || t >= T.tys.length || !(T.tys[t] is TyArray) || monoTyOpen(t) {
     return -1
+  }
+  t
+}
+
+// The one closed list-of-functions type every value un-annotated instance `fn` returns records,
+// each a returned list literal its own copy of the body instanced (D9601); -1 otherwise.
+function monoInstRetLitTy(fn: FuncDecl): i32 {
+  let t = -1
+  for r in monoFnRetArgs(fn) {
+    if r >= 0 && !(P.nodes[r] is RetStmt) {
+      const rx = monoRetListLitOf(r)
+      const rt = if rx >= 0 { nodeTyIxOf(rx) } else { -1 }
+      if (
+        rt < 0
+        || rt >= T.tys.length
+        || !(T.tys[rt] is TyArray)
+        || monoTyOpen(rt)
+        || !tyMayHoldFn(rt, 0)
+        || (t >= 0 && !tyEq(t, rt))
+      ) {
+        return -1
+      }
+      t = rt
+    }
   }
   t
 }
@@ -18249,10 +18410,13 @@ function monoCloseRetFnTy(ix: i32, ctx: i32) {
     if n.arrElems.length == 0 { return 0 }
     for e in n.arrElems {
       const ex = unwrapParen(e)
-      if ex < 0 || !(P.nodes[ex] is Call) || monoRetSlotsSplit(ex) { return 0 }
+      if ex < 0 || !(P.nodes[ex] is Call) { return 0 }
+      if monoRetSlotsSplit(ex) { return monoAskSplitRetCopies(ex) }
     }
-  } else if !(n is Call) || monoRetSlotsSplit(ix) {
+  } else if !(n is Call) {
     return 0
+  } else if monoRetSlotsSplit(ix) {
+    return monoAskSplitRetCopies(ix)
   }
   const t = monoPinnedAnnTyAt(ix, 0)
   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
@@ -18273,6 +18437,16 @@ function monoRetSlotsSplit(ix: i32): boolean {
     if rx >= 0 && monoDeclPathPins([fd, rx], ["e"]).length > 1 { return true }
   }
   false
+}
+
+// A call `x` whose returned literal's slot takes two pins asks for a copy of its function per
+// pin, each read of it then closed at its own copy (D9553).
+function monoAskSplitRetCopies(x: i32) {
+  const ix = unwrapParen(x)
+  if ix < 0 || ix >= P.nodes.length || !monoRetSlotsSplit(ix) { return 0 }
+  const c = P.nodes[ix]
+  if c is Call { fsAsk(monoCalleeDeclOf(c)) }
+  0
 }
 
 // Whether un-annotated function node `fx` returns list literal `lit` (`monoRetListLitOf`).
@@ -19400,6 +19574,76 @@ function monoHoleGenBindFnArgs(
   0
 }
 
+// The function type open function `fx` takes as field `fld` of parameter `i` of `dn`, at the
+// closed argument types every `<param>.<fld>(...)` call in the body agrees on, with `fx`'s
+// result there; -1 when there is no such call, or an argument or the result does not close.
+function monoFieldCallPinnedFnTy(
+  dn: FuncDecl,
+  i: i32,
+  fld: string,
+  fx: i32,
+): i32 {
+  const px = dn.fnParams[i]
+  const pn = P.nodes[px]
+  if !(pn is Param) || pn.parType >= 0 { return -1 }
+  const qs: i32[] = []
+  const seen: i32[] = [0]
+  if !monoFieldCallArgTys(dn.fnBody, px, fld, qs, seen) || seen[0] == 0 {
+    return -1
+  }
+  const ex = monoOpenFnArgDecl(fx)
+  if ex < 0 { return -1 }
+  const r = monoFnDeclRetAt(ex, qs)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  const ft = mkFuncTy(qs, r)
+  if !monoTyClosedFn(ft) { return -1 }
+  ft
+}
+
+// Collects into `qs` the argument types of the calls `<px>.<fld>(...)` under `ix`, where `px` is
+// the parameter the receiver resolves to, counting them in `seen[0]`; false when two disagree or
+// one is open.
+function monoFieldCallArgTys(
+  ix: i32,
+  px: i32,
+  fld: string,
+  qs: i32[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is Call {
+    const c = unwrapParen(n.callFn)
+    if c < 0 || c >= P.nodes.length { return true }
+    const cn = P.nodes[c]
+    if cn is Member && cn.memProp == fld {
+      const o = unwrapParen(cn.memObj)
+      if (
+        o >= 0
+        && o < P.nodes.length
+        && P.nodes[o] is Ident
+        && identDeclOf(o) == px
+      ) {
+        if seen[0] > 0 && qs.length != n.callArgs.length { return false }
+        let a = 0
+        while a < n.callArgs.length {
+          const at = nodeTyIxOf(n.callArgs[a])
+          if at < 0 || tyHasTyVar(at) || tyReachesHole(at, 16) { return false }
+          if seen[0] == 0 { qs.push(at) }
+          else if !tyEq(qs[a], at) { return false }
+          a = a + 1
+        }
+        // arena-tick exempt: a caller-owned counter, not the arena.
+        seen[0] = seen[0] + 1
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if !monoFieldCallArgTys(k, px, fld, qs, seen) { return false }
+  }
+  true
+}
+
 // The pin of a list literal of open function values (`[h]`) handed to un-annotated parameter `i`
 // of `decl` in `call`: a list of the function type its body calls an element at, the one agreed
 // pin of the parameter's element slot in that call's walk, with the elements' own result there;
@@ -19448,8 +19692,8 @@ function monoOpenFnListPin(
 
 // The pin of a record literal handed to un-annotated parameter `i` of `decl` in call `call` whose
 // open fields are each a list literal of open function values (`{ xs: [h] }`): each list at the one
-// agreed pin of the parameter's slot `f.<field>/e` in that call's walk, as `monoOpenFnListPin` gives
-// a bare list (D9301); "" when a field, a pin or a result does not close.
+// agreed pin of the slot `f.<field>/e`, as `monoOpenFnListPin` gives a bare list (D9301), or an
+// open function named there (`{ f: h }`, D9572); "" when a field, a pin or a result does not close.
 function monoOpenFnRecListPin(
   decl: i32,
   call: i32,
@@ -19476,6 +19720,7 @@ function monoOpenFnRecListPin(
   for t in o.objFieldTypes { tys.push(t) }
   const lits: i32[] = []
   const litTys: i32[] = []
+  const fnLits: i32[] = []
   for fi in lit.objFields {
     const f = P.nodes[fi]
     if f is FieldInit {
@@ -19494,6 +19739,24 @@ function monoOpenFnRecListPin(
           tys[k] = bt
           lits.push(vx)
           litTys.push(bt)
+        } else if (
+          al is Ident
+          && tys[k] < T.tys.length
+          && T.tys[tys[k]] is TyFunc
+          && monoOpenFnArgDecl(vx) >= 0
+        ) {
+          // An open function named at the field takes the one agreed pin of slot `f.<field>`, or
+          // the argument types the body calls the field at (D9572).
+          const fPath: string[] = ["f." + f.fiName]
+          const one: i32[] = [vx]
+          let ft = monoPathSlotPinnedFnTy(dn.fnParams[i], fPath, one, call)
+          if ft < 0 { ft = monoFieldCallPinnedFnTy(dn, i, f.fiName, vx) }
+          if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
+          // arena-tick exempt: a local copy of the field types; the arena is touched below.
+          tys[k] = ft
+          lits.push(vx)
+          litTys.push(ft)
+          fnLits.push(vx)
         } else if (
           !(al is ArrayLit)
           || al.arrElems.length == 0
@@ -19522,9 +19785,14 @@ function monoOpenFnRecListPin(
   if lits.length == 0 { return "" }
   let j = 0
   while j < lits.length {
+    const al = P.nodes[lits[j]]
+    if al is Ident && i32ListHas(fnLits, lits[j]) {
+      const fnm = monoConcreteFnTyName(litTys[j])
+      if fnm == "" { return "" }
+      if monoCoerceFnValueName(lits[j], fnm, ctx, litTys[j]) < 0 { return "" }
+    }
     const ft = tyArrayElemIx(litTys[j])
     const nm = monoConcreteFnTyName(ft)
-    const al = P.nodes[lits[j]]
     if nm != "" && al is ArrayLit {
       for el in al.arrElems {
         const ex = unwrapParen(el)
@@ -20252,6 +20520,11 @@ function monoPinHoleParam(
   // shared with `synthParamAnnots`; "" keeps the argument-derived pin.
   let an = recordedParamPinName(params[i])
   let anTy = -1
+  // A literal handed to a parameter the body's own annotation decides delivers its open
+  // functions at the slots the flow table pins, as at an annotated parameter (D9610).
+  if an != "" && monoFlowIsLit(unwrapParen(args[i])) {
+    if monoCoerceFnValueName(args[i], an, ctx, -1) < 0 { return -1 }
+  }
   // One copy of the parameter cannot hold a generic its body calls at two instances;
   // the split plan gives it one per instance (D6210). The walk goes on, so every such
   // parameter is asked in one compile.
@@ -21642,7 +21915,13 @@ function monoWalk(ix: i32, ctx: i32) {
         if monoWalk(args[i], ctx) < 0 { return -1 }
         i = i + 1
       }
-      monoCloseRetFnTy(ix, ctx)
+      // A generic callee's result is read at the instance the call takes (D9601).
+      const fdx = monoCalleeDeclOf(n)
+      const genCallee = (fdx >= 0
+        && monoIsGenericDecl(fdx)
+        && n.callFn >= 0
+        && P.nodes[n.callFn] is Ident)
+      if !genCallee { monoCloseRetFnTy(ix, ctx) }
       if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
       if monoGenArgAtOpenParam(n, ctx) && monoOpenCallAtElems(n, ctx) < 0 {
         return -1
@@ -21652,7 +21931,11 @@ function monoWalk(ix: i32, ctx: i32) {
       if callee is Index && monoGenArgAtOpenParam(n, ctx) {
         return monoGenArgOpenFail(ix)
       }
-      if callee is Ident { return monoWalkIdentCall(n, callee, ix, ctx) }
+      if callee is Ident {
+        const wr = monoWalkIdentCall(n, callee, ix, ctx)
+        if wr >= 0 && genCallee { monoCloseRetFnTy(ix, ctx) }
+        return wr
+      }
       // A call of a list element that is an alias of a capture cell's read is a call through it.
       const le = monoListElemCellRead(n.callFn, ctx)
       if le[0] >= 0 {
@@ -21743,6 +22026,11 @@ function monoWalk(ix: i32, ctx: i32) {
             if monoCoerceFnValueName(n.binRight, atn, ctx, -1) < 0 { return -1 }
             if byPin { monoLamLitTake(n.binRight, atn, ctx) }
             if !byPin && monoDeliverCallAt(n.binRight, atn) < 0 { return -1 }
+          }
+          // A literal written whole delivers its functions at the binding's slots (D9670).
+          const it = nodeTyIxOf(n.binLeft)
+          if monoDeliverLitAtPlace(n.binRight, n.binLeft, "", it, ctx) < 0 {
+            return -1
           }
         }
         // A store into an element or a field of a binding delivers at the one signature the flow

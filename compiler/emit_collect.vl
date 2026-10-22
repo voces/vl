@@ -879,6 +879,7 @@ import {
   shapeFieldElemName,
   structIndexOfTypeName,
   structRowOfObjFieldSet,
+  tyRegGenNow,
   variantFieldLitRepMixed,
   variantFieldLitRepStrMixed,
   variantLitDiscriminable,
@@ -13660,25 +13661,50 @@ function funcRetUnrepresentable(retIx: i32): boolean {
 // and interns every reachable `TyFunc`'s `$fnsig`. Render discipline mirrors the registration
 // walk, so keys agree; idempotent and order-stable, called last so an existing sig keeps its slot.
 function collectTyReachCloSigs(tyIx: i32, depth: i32) {
+  ctwSeenDepth = Map()
+  ctwSeenGen = Map()
+  collectTyReachCloSigsGo(tyIx, depth)
+}
+
+// The deepest remaining budget each node has had in this root's walk, and the registry
+// generation of that visit: a revisit with no more budget in the same generation interns
+// only keys its first visit interned, so it is skipped, and a type nesting one record twice per
+// level is walked once per node rather than once per path.
+let ctwSeenDepth: {[i32]: i32} = Map()
+let ctwSeenGen: {[i32]: i32} = Map()
+
+// One node of `collectTyReachCloSigs`'s walk, behind the revisit memo.
+function collectTyReachCloSigsGo(tyIx: i32, depth: i32): i32 {
   if tyIx < 0 || depth <= 0 { return 0 }
+  const gen = tyRegGenNow()
+  if (ctwSeenGen[tyIx] ?? -1) == gen && (ctwSeenDepth[tyIx] ?? 0) >= depth {
+    return 0
+  }
+  ctwSeenGen[tyIx] = gen
+  ctwSeenDepth[tyIx] = depth
+  collectTyReachCloSigsArm(tyIx, depth)
+}
+
+// The walk's step at `tyIx`, its children asked through `collectTyReachCloSigsGo`.
+function collectTyReachCloSigsArm(tyIx: i32, depth: i32): i32 {
   const t = T.tys[tyIx]
   // Exhaustive over `Ty` and `_`-less: a new arena variant that can hold a closure must get a
   // descent, and a silent leaf here leaves its `$fnsig` un-interned.
   match t {
     TyNullable => {
-      return collectTyReachCloSigs(t.nInner, depth - 1)
+      return collectTyReachCloSigsGo(t.nInner, depth - 1)
     }
     TyArray => {
-      return collectTyReachCloSigs(t.aElem, depth - 1)
+      return collectTyReachCloSigsGo(t.aElem, depth - 1)
     }
     TyMap => {
-      return collectTyReachCloSigs(t.mVal, depth - 1)
+      return collectTyReachCloSigsGo(t.mVal, depth - 1)
     }
     TyObj => {
       const ftys = t.objFieldTypes
       let i = 0
       while i < ftys.length {
-        if collectTyReachCloSigs(ftys[i], depth - 1) < 0 { return -1 }
+        if collectTyReachCloSigsGo(ftys[i], depth - 1) < 0 { return -1 }
         i = i + 1
       }
       return 0
@@ -13687,7 +13713,7 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
       const members = t.uMembers
       let i = 0
       while i < members.length {
-        if collectTyReachCloSigs(members[i], depth - 1) < 0 { return -1 }
+        if collectTyReachCloSigsGo(members[i], depth - 1) < 0 { return -1 }
         i = i + 1
       }
       return 0
@@ -13711,10 +13737,10 @@ function collectTyReachCloSigs(tyIx: i32, depth: i32) {
       const ps = t.fnParamTypes
       let i = 0
       while i < ps.length {
-        if collectTyReachCloSigs(ps[i], depth - 1) < 0 { return -1 }
+        if collectTyReachCloSigsGo(ps[i], depth - 1) < 0 { return -1 }
         i = i + 1
       }
-      return collectTyReachCloSigs(t.fnRet, depth - 1)
+      return collectTyReachCloSigsGo(t.fnRet, depth - 1)
     }
     TyPrim => {
       // A leaf scalar holds no closure.
