@@ -204,16 +204,16 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D9460's witness at depth 22, where it traps under the null collector: a
-      // list parameter of a record whose structural spelling doubles per level, which
-      // outgrows the null collector's largest object. When D9460 closes, move this to the
-      // next open trap under the null collector.
+      // D9512's witness at depth 22, where it traps under the null collector: a
+      // parameter of a list-or-string union of a record whose structural spelling doubles
+      // per level, which outgrows the null collector's largest object. When D9512 closes,
+      // move this to the next open trap under the null collector.
       const lines = ["type A0 = {x: i32}"];
       for (let i = 1; i <= 22; i++) {
         lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
       }
       lines.push(
-        "function g(u: A22[]): i32 { 1 }",
+        "function g(u: A22[] | string): i32 { 1 }",
         "const a0: A0 = {x: 1}",
       );
       for (let i = 1; i <= 22; i++) {
