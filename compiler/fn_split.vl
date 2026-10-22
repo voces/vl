@@ -104,10 +104,13 @@ let pwValSrc: i32[] = []
 let pwValName: string[] = []
 // The choice binding `pcAnchor` evaluates its whole choice once into the `const` `pcName`
 // declared before it, as the index of the arm chosen; it and each of its slots' copies select
-// the arm's name `pcLeaves` by that index (D9322).
+// the arm's name `pcLeaves` by that index (D9322). A choosing call (`fsChoiceRetLeaves`) is
+// evaluated as a call of its arm-index copy `pcCallFn` instead, returning one of `pcCallLeaves`.
 let pcAnchor: i32[] = []
 let pcName: string[] = []
 let pcLeaves: string[][] = []
+let pcCallFn: string[] = []
+let pcCallLeaves: string[][] = []
 let prIdent: i32[] = []
 let prName: string[] = []
 // A copy of function `pfSrc` named `pfName` goes after the module statement `pfAnchor`.
@@ -153,10 +156,10 @@ let pyPars: string[][] = []
 // Call `pmCall`, through a record field, calls function `pmName` directly instead.
 let pmCall: i32[] = []
 let pmName: string[] = []
-// Argument `pnArg` of call `pnCall`, a call of a function returning one of the generics
-// `pnLeaves` (`fsChoiceRetLeaves`), runs once before statement `pnStmt` as a call of copy `pnFn`
-// of that function returning the arm index into `pnSel`; it and the `pnCount - 1` arguments after
-// it each select their generic by that index (D9596). Copy `pnFn` of `pnSrc` goes after it.
+// Argument `pnArg` of call `pnCall`, a call returning one of the generics `pnLeaves`, runs once
+// before statement `pnStmt` as a call of copy `pnFn`, its arm index held by `pnSel`; it and the
+// `pnCount - 1` arguments after it each select their generic by that index (D9596). Each copy
+// `pnSrcName` of function `pnSrc` returns the index into `pnSrcLeaves`.
 let pnCall: i32[] = []
 let pnArg: i32[] = []
 let pnStmt: i32[] = []
@@ -166,6 +169,7 @@ let pnLeaves: string[][] = []
 let pnCount: i32[] = []
 let pnSrc: i32[] = []
 let pnSrcName: string[] = []
+let pnSrcLeaves: string[][] = []
 // Record literal `pxObj` takes field `pxField` holding function `pxName`, and member read
 // `pxMember` reads field `pxMemberName` instead.
 let pxObj: i32[] = []
@@ -214,6 +218,7 @@ function fsPlanReset(): i32 {
   pnCount = []
   pnSrc = []
   pnSrcName = []
+  pnSrcLeaves = []
   pxObj = []
   pxField = []
   pxName = []
@@ -231,6 +236,8 @@ function fsPlanReset(): i32 {
   pcAnchor = []
   pcName = []
   pcLeaves = []
+  pcCallFn = []
+  pcCallLeaves = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -1759,17 +1766,19 @@ export function fsPlan(root: i32): i32 {
       }
     }
     // A refused function always returning one generic asks for each binding its result
-    // initializes that is called at two types.
-    if a >= 0 && a < P.nodes.length && P.nodes[a] is FuncDecl {
+    // initializes that is called at two types, as does a generic one of its returns names
+    // when it returns one of several (D10021).
+    const fa = fsAskedRetFn(a)
+    if fa >= 0 {
       for r in fsIdents {
         const c = fsParent[r]
         let d = -1
         if (
-          r != a
+          r != fa
           && c >= 0
           && fsCallsVia(c, r)
-          && fsCallRunsFn(c) == a
-          && fsConstRet(c) >= 0
+          && fsCallRunsFn(c) == fa
+          && ((fa == a && fsConstRet(c) >= 0) || fsChoiceRetLeaves(c).length > 0)
         ) {
           d = fsParent[c]
         }
@@ -1879,6 +1888,17 @@ export function fsPlan(root: i32): i32 {
   const inst = fsPlanInstances()
   if byName == 0 { return 0 }
   inst
+}
+
+// The function asked node `a` is, or the one whose `return` reads it; -1 for neither.
+function fsAskedRetFn(a: i32): i32 {
+  if a < 0 || a >= P.nodes.length || a >= fsParent.length { return -1 }
+  if P.nodes[a] is FuncDecl { return a }
+  const p = fsParent[a]
+  if !(P.nodes[a] is Ident) || p < 0 { return -1 }
+  const pn = P.nodes[p]
+  if !(pn is RetStmt) || pn.retArg != a { return -1 }
+  fsEnclosingFn(a)
 }
 
 // Asks for each un-annotated `const` initialized by a bare read of binding `d`, at most `depth`
@@ -3670,13 +3690,10 @@ function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
   const s = fsChoiceStmt(c, a)
   const fd = fsCallRunsFn(a)
   if s < 0 || fd < 0 || fd >= P.nodes.length { return fsHoleDecline() }
+  const nm = fsPlanArmCopy(a, leaves)
+  if nm == "" { return fsHoleDecline() }
   const f = P.nodes[fd]
   if !(f is FuncDecl) { return fsHoleDecline() }
-  const nm = f.fnName + "$x" + i32ToStr(fd)
-  if !hasStr(pnSrcName, nm) {
-    pnSrc.push(fd)
-    pnSrcName.push(nm)
-  }
   pnCall.push(c)
   pnArg.push(a)
   pnStmt.push(s)
@@ -3687,19 +3704,33 @@ function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
   0
 }
 
-// Mints each arm-index copy `fsPlanChoiceRet` planned, then runs each planned call once into
+// The name of the arm-index copy of the callee of choosing call `a`, returning the index of the
+// one of `leaves` it returns, planned once per callee; "" when `a` runs no declared function.
+function fsPlanArmCopy(a: i32, leaves: string[]): string {
+  const fd = fsCallRunsFn(a)
+  if fd < 0 || fd >= P.nodes.length { return "" }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) { return "" }
+  const nm = f.fnName + "$x" + i32ToStr(fd)
+  if !hasStr(pnSrcName, nm) {
+    pnSrc.push(fd)
+    pnSrcName.push(nm)
+    pnSrcLeaves.push(leaves)
+  }
+  nm
+}
+
+// Mints each arm-index copy `fsPlanArmCopy` planned, then runs each planned call once into
 // its arm index binding and hands every split argument a choice by that index. -1 when it cannot.
 function fsApplyChoiceRets(): i32 {
   let i = 0
   while i < pnSrc.length {
-    let j = 0
-    while j < pnFn.length && pnFn[j] != pnSrcName[i] { j = j + 1 }
     const f = reparseFuncDeclAt(fsFirstTok(pnSrc[i]))
-    if f < 0 || j >= pnFn.length { return -1 }
+    if f < 0 { return -1 }
     const fn = P.nodes[f]
     if !(fn is FuncDecl) { return -1 }
     fn.fnName = pnSrcName[i]
-    if fsNumberRets(fn.fnBody, pnLeaves[j]) != 0 { return -1 }
+    if fsNumberRets(fn.fnBody, pnSrcLeaves[i]) != 0 { return -1 }
     if fsInsertAfter(pnSrc[i], f) != 0 { return -1 }
     i = i + 1
   }
@@ -4022,11 +4053,20 @@ function fsPlanMember(mi: i32): i32 {
   if lanes.length == 0 { return 0 }
   if d.letType >= 0 && !(P.nodes[d.letType] is TypeRef) { return 1 }
   if !fsStmtParentOk(m) { return 1 }
-  const hoist = lanes.length > 1 && fsHoistsChoice(d.letInit)
+  // A call returning one of several generics runs once too, as the index of the one it returns.
+  const callLeaves = if lanes.length > 1 { fsChoiceRetLeaves(d.letInit) } else { [] }
+  let callFn = ""
+  if callLeaves.length > 0 {
+    callFn = fsPlanArmCopy(d.letInit, callLeaves)
+    if callFn == "" { return 1 }
+  }
+  const hoist = callFn != "" || (lanes.length > 1 && fsHoistsChoice(d.letInit))
   const ip = if hoist { -1 } else { fsValuePeer(d.letInit) }
   if ip == -2 { return 1 }
   if hoist {
     pcAnchor.push(m)
+    pcCallFn.push(callFn)
+    pcCallLeaves.push(callLeaves)
     const dollar = d.letName.indexOf("$")
     const base = if dollar > 0 { d.letName.slice(0, dollar) } else { d.letName }
     pcName.push(base + "$c" + i32ToStr(m))
@@ -4407,7 +4447,15 @@ function fsApply(): i32 {
       // The binding's own choice, its leaves numbered, becomes the arm index binding.
       P.pos = nodeToks[c] + 1
       const pos = P.nodes[c].pos
-      rc = fsNumberLeaves(c, names, 0)
+      const cn = P.nodes[c]
+      if pcCallFn[i] == "" {
+        rc = fsNumberLeaves(c, names, 0)
+      } else if cn is Call && cn.callFn >= 0 && cn.callFn < P.nodes.length {
+        cn.callFn = mkIdent(pcCallFn[i], P.nodes[cn.callFn].pos)
+        for l in pcCallLeaves[i] { names.push(l) }
+      } else {
+        rc = -1
+      }
       const sel = fsSelectArm(pcName[i], names, pos)
       if rc == 0 && sel >= 0 {
         d.letInit = sel
