@@ -44,7 +44,12 @@ import { gRootStmts } from "./check_nj_join"
 import { nodeTyIx, nodeTySet } from "./check_node_tys"
 import { isF32AdoptingLitExpr } from "./check_num_lits"
 import { isClassifiableRetName } from "./check_redundant_ret"
-import { assignable, tErrUnsupported, widenLitTy } from "./check_relate_core"
+import {
+  assignable,
+  fnSlotAssignable,
+  tErrUnsupported,
+  widenLitTy,
+} from "./check_relate_core"
 import {
   elemRefArmValueUnionListRetName,
   elemVariantBoxListRetName,
@@ -115,7 +120,7 @@ import {
   valueUnionRetName,
 } from "./check_ret_names"
 import { declare, lookup, lookupDepth } from "./check_scopes"
-import { noteNestedUnannotFn } from "./check_side_rows"
+import { noteCtxRetLambda, noteNestedUnannotFn } from "./check_side_rows"
 import { symEnabled } from "./check_state"
 import { symRetainType } from "./check_sym_occ"
 import {
@@ -358,6 +363,18 @@ function retValsDeliver(n: FuncDecl, inferred: i32, dst: i32): boolean {
     if !assignableExpr(v, vt, dst) { return false }
   }
   true
+}
+
+// `retValsDeliver` asked quietly: nothing is reported and no diagnostic it raised is kept, so a
+// refused probe leaves the argument's own mismatch as the one report.
+function retValsDeliverQuiet(n: FuncDecl, inferred: i32, dst: i32): boolean {
+  const savedQuiet = inferQuiet
+  const mark = T.diags.length
+  inferQuiet = true
+  const ok = retValsDeliver(n, inferred, dst)
+  inferQuiet = savedQuiet
+  while T.diags.length > mark { T.diags.pop() }
+  ok
 }
 
 // `base | null` for a nullable numeric literal union over `base`, else -1.
@@ -1207,6 +1224,19 @@ export function finishInferredReturn(
           inferred = expRet
           objRetAdopted = true
         }
+      }
+      // The general rung, last: a result no rung above adopted that the function slot
+      // cannot hold as inferred — a collection with an element or value hole, or a type the
+      // slot's rep refuses — takes the expected result when every value the lambda returns
+      // is delivered to it, exactly as the annotated result `(x): R => …` does.
+      if (
+        inferred != expRet
+        && (unresolvedHole(inferred) || !fnSlotAssignable(inferred, expRet))
+        && retValsDeliverQuiet(n, inferred, expRet)
+        && retValsDeliver(n, inferred, expRet)
+      ) {
+        inferred = expRet
+        if !inferQuiet { noteCtxRetLambda(fnIx) }
       }
       inferRetEmptyListFloor(n, inferred, expRet)
     }
