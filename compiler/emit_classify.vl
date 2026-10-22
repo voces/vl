@@ -1012,6 +1012,7 @@ import {
   TY_WALK_DEPTH,
   arrLitSameIdentName,
   asgTestedIdent,
+  coalResultTyOf,
   coalesceKeepsScalarBox,
   coalesceNicheLhs,
   coalesceOperandPinTy,
@@ -6988,14 +6989,14 @@ function coalesceAtomKind(exprIx: i32, fnIx: i32) {
   const e = P.nodes[unwrapParen(exprIx)]
   if e is BinExpr {
     if e.binOp == "??" {
-      // The RESULT's own atom, asked first: a wider default widens the whole expression, so
-      // the operand's residual below is right for the common case and not for that one. A
-      // union result is not an atom and falls through, which is the box arm's (D1699/D1702).
-      const crt = nodeTyPinIxOf(unwrapParen(exprIx))
       // A default of another number type joins apart: the result is the box, never an atom,
       // at the instance's join where the `??` records only its hole (D9701).
       const hrt = holeOperandTyOf(exprIx, fnIx)
       if hrt >= 0 && numUnionMinted && tyHoldsNumbersApart(hrt) { return -1 }
+      // The RESULT's own atom, asked first: a wider default widens the whole expression, so
+      // the operand's residual below is right for the common case and not for that one. A
+      // union result is not an atom and falls through, which is the box arm's (D1699/D1702).
+      const crt = coalResultTyOf(exprIx, fnIx)
       if (
         numUnionMinted
         && numBoxExpr(unwrapParen(exprIx), crt)
@@ -14917,6 +14918,19 @@ function opTyIn(exprIx: i32, fnIx: i32): i32 {
   nodeTyIxOf(unwrapParen(exprIx))
 }
 
+// `opTyIn` where the operator yields a numeric union's box: an instance's read of the hole counts
+// only when an operand `l`/`r` (-1 for none) is itself a box, since an operand the instance keeps
+// at its scalar pin is computed at that width (D9870). -1 otherwise.
+function opNumUnionTyIn(exprIx: i32, fnIx: i32, l: i32, r: i32): i32 {
+  const t = opTyIn(exprIx, fnIx)
+  if !tyIsNumUnion(t) { return -1 }
+  if holeOperandTyOf(exprIx, fnIx) < 0 { return t }
+  if (l >= 0 && exprUnion(l, fnIx)) || (r >= 0 && exprUnion(r, fnIx)) {
+    return t
+  }
+  -1
+}
+
 // True if evaluating the expression at `exprIx` yields the union box: a union-returning
 // call, a union param/local reference, or a parenthesized union expression. A bare object
 // literal is not a union here.
@@ -14985,12 +14999,15 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
     }
     Unary => {
       // An operator over a numeric union whose member results differ yields their union's box.
-      if numUnionMinted && tyIsNumUnion(opTyIn(exprIx, fnIx)) {
+      if numUnionMinted && opNumUnionTyIn(exprIx, fnIx, e.unArg, -1) >= 0 {
         if e.unOp == "-" { return true }
       }
     }
     BinExpr => {
-      if numUnionMinted && tyIsNumUnion(opTyIn(exprIx, fnIx)) {
+      if (
+        numUnionMinted
+        && opNumUnionTyIn(exprIx, fnIx, e.binLeft, e.binRight) >= 0
+      ) {
         if e.binOp != "=" && e.binOp != "??" { return true }
       }
       // `m[k] ?? d` over a UNION-valued map yields the value union box — EXCEPT a `scalar | null`
@@ -15581,8 +15598,8 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     BinExpr => {
       // An operator over a numeric union names the union of its member results.
       if numUnionMinted {
-        const nuTy = opTyIn(exprIx, fnIx)
-        if (tyIsNumUnion(nuTy) && !(e.binOp == "=" || e.binOp == "??")) {
+        const nuTy = opNumUnionTyIn(exprIx, fnIx, e.binLeft, e.binRight)
+        if (nuTy >= 0 && !(e.binOp == "=" || e.binOp == "??")) {
           const nun = valueUnionRenderOfTy(nuTy)
           if nun != "" { return nun }
         }
@@ -15594,7 +15611,9 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
         // one does: inside a hole-parameter body the `??` result is a deferred hole, and the
         // consumers that ask this (`exprUnion`, the print ladder) would otherwise classify the
         // box the lowering just built as a scalar (D1702).
-        const ccn = valueUnionRenderOfTy(nodeTyPinIxOf(unwrapParen(exprIx)))
+        const ccn = valueUnionRenderOfTy(
+          coalResultTyOf(unwrapParen(exprIx), fnIx),
+        )
         if ccn != "" { return ccn }
         // A MIXED result renders structurally, so the name comes off the canon index — the same
         // fallback the lowering takes. The two must agree or the destination boxes a value the
@@ -15653,8 +15672,8 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
     Unary => {
       // An operator over a numeric union names the union of its member results.
       if numUnionMinted {
-        const nuTy = opTyIn(exprIx, fnIx)
-        if tyIsNumUnion(nuTy) {
+        const nuTy = opNumUnionTyIn(exprIx, fnIx, e.unArg, -1)
+        if nuTy >= 0 {
           const nun = valueUnionRenderOfTy(nuTy)
           if nun != "" { return nun }
         }
