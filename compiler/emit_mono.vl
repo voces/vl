@@ -1326,15 +1326,19 @@ function monoNarrowedLitPinName(nt: i32, wide: string): string {
 }
 
 // The pin of a `for-in` variable read at `ix` in frame `fnIx` that the checker typed as a
-// nominal record: the record's name, or "" for any other read.
+// record: the record's name, a closed inline record's shape (D9641), or "" for any other read.
 function monoLoopVarRecordPin(ix: i32, fnIx: i32): string {
   if ix < 0 { return "" }
   const n = P.nodes[ix]
   if !(n is Ident) { return "" }
   if readLoopNodeOf(ix, n.identName, fnIx) < 0 { return "" }
-  const nom = nominalStructNameOfTy(nodeTyIxOf(ix))
-  if nom == "" { return "" }
-  monoAnnPinName(nom)
+  const t = nodeTyIxOf(ix)
+  const nom = nominalStructNameOfTy(t)
+  if nom != "" { return monoAnnPinName(nom) }
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyObj) || monoTyOpen(t) {
+    return ""
+  }
+  monoAnnPinNameOfTy(t)
 }
 
 // The union name a pin can carry for the node at `ix`, or "". The render, then the
@@ -15126,6 +15130,9 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
   if et < 0 || et >= T.tys.length || !monoTyOpen(et) { return 0 }
   const v = T.tys[et]
   if !(v is TyObj) { return 0 }
+  if repoints.length == 0 && monoRecListFieldCalledAtHole(d, lf, lit, v) {
+    return 0
+  }
   const stored: i32[][] = []
   for e in lit.arrElems { stored.push([e, ctx]) }
   let ri = 0
@@ -15156,6 +15163,90 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
   monoArenaTouch()
   monoRetypeMapReads(ctx, lf[1], nt, nv, "")
   0
+}
+
+// Whether the unwritten list `d` (`lf`, literal `lit`, element `v`) of record literals is read
+// once, as `xs[k]` handed to an un-annotated parameter whose body calls each open function field
+// at closed arguments, so `monoOpenFnRecSrcPin` pins it at that call rather than at a slot type
+// the flow table reads as uncalled (D9644).
+function monoRecListFieldCalledAtHole(
+  d: LetDecl,
+  lf: i32[],
+  lit: ArrayLit,
+  v: TyObj,
+): boolean {
+  if (
+    monoWritesOf("n:", lf[1]).length > 0
+    || monoWritesOf("e:", lf[1]).length > 0
+  ) {
+    return false
+  }
+  for ix in monoFrameNodes(lf[0]) {
+    const cn = P.nodes[ix]
+    if cn is Call {
+      let j = 0
+      while j < cn.callArgs.length {
+        const ax = unwrapParen(cn.callArgs[j])
+        if ax < 0 || ax >= P.nodes.length { return false }
+        const an = P.nodes[ax]
+        if an is Index && monoReadsBinding(an.idxArr, d.letName, lf[0], lf[1]) {
+          if !monoRecSrcReadOnce(lf, unwrapParen(an.idxArr)) { return false }
+          const fd = identDeclOf(unwrapParen(cn.callFn))
+          if fd < 0 || fd >= P.nodes.length { return false }
+          const dn = P.nodes[fd]
+          if !(dn is FuncDecl) || j >= dn.fnParams.length { return false }
+          return monoRecElemsFieldCalled(dn, j, ix, lf[0], lit, v)
+        }
+        j = j + 1
+      }
+    }
+  }
+  false
+}
+
+// Whether every element of `lit` is a record literal whose each open function field of `v` names
+// an open function the body of `dn` calls as parameter `j`'s field at closed arguments in `call`.
+function monoRecElemsFieldCalled(
+  dn: FuncDecl,
+  j: i32,
+  call: i32,
+  ctx: i32,
+  lit: ArrayLit,
+  v: TyObj,
+): boolean {
+  const srcs: i32[][] = []
+  for e in lit.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 || !(P.nodes[ex] is ObjLit) { return false }
+    srcs.push([ex, ctx])
+  }
+  let open = 0
+  let k = 0
+  while k < v.objFieldNames.length {
+    const fty = v.objFieldTypes[k]
+    if monoTyOpen(fty) {
+      if fty < 0 || fty >= T.tys.length || !(T.tys[fty] is TyFunc) {
+        return false
+      }
+      const fvs = monoMapStoredFields(srcs, v.objFieldNames[k])
+      if fvs.length != srcs.length { return false }
+      for fv in fvs {
+        const vx = unwrapParen(fv[0])
+        if vx < 0 || !(P.nodes[vx] is Ident) || monoOpenFnArgDecl(vx) < 0 {
+          return false
+        }
+        if (
+          monoFieldCallPinnedFnTy(dn, j, v.objFieldNames[k], vx, call, ctx)
+          < 0
+        ) {
+          return false
+        }
+      }
+      open = open + 1
+    }
+    k = k + 1
+  }
+  open > 0
 }
 
 // The list literals the `let` `d` (`lf`, `monoReadLetFrame`) is re-pointed to, each followed by
@@ -19673,19 +19764,38 @@ function monoHoleGenBindFnArgs(
 
 // The function type open function `fx` takes as field `fld` of parameter `i` of `dn`, at the
 // closed argument types every `<param>.<fld>(...)` call in the body agrees on, with `fx`'s
-// result there; -1 when there is no such call, or an argument or the result does not close.
+// result there, an argument reading another parameter at the type `call` (in frame `ctx`) pins
+// it at; -1 when there is no such call, or an argument or the result does not close.
 function monoFieldCallPinnedFnTy(
   dn: FuncDecl,
   i: i32,
   fld: string,
   fx: i32,
+  call: i32,
+  ctx: i32,
 ): i32 {
   const px = dn.fnParams[i]
   const pn = P.nodes[px]
   if !(pn is Param) || pn.parType >= 0 { return -1 }
+  if call < 0 || call >= P.nodes.length { return -1 }
+  const cl = P.nodes[call]
+  if !(cl is Call) { return -1 }
+  const pa: i32[] = []
+  let j = 0
+  while j < dn.fnParams.length {
+    let t = -1
+    if j != i && j < cl.callArgs.length {
+      t = nameToTy(monoArgPinName(cl.callArgs[j], ctx))
+    }
+    pa.push(t)
+    j = j + 1
+  }
   const qs: i32[] = []
   const seen: i32[] = [0]
-  if !monoFieldCallArgTys(dn.fnBody, px, fld, qs, seen) || seen[0] == 0 {
+  if (
+    !monoFieldCallArgTys(dn.fnBody, px, fld, qs, seen, dn.fnParams, pa)
+    || seen[0] == 0
+  ) {
     return -1
   }
   const ex = monoOpenFnArgDecl(fx)
@@ -19699,13 +19809,15 @@ function monoFieldCallPinnedFnTy(
 
 // Collects into `qs` the argument types of the calls `<px>.<fld>(...)` under `ix`, where `px` is
 // the parameter the receiver resolves to, counting them in `seen[0]`; false when two disagree or
-// one is open.
+// one is open. A read of parameter `ps[j]` is typed `pa[j]` when that is not -1.
 function monoFieldCallArgTys(
   ix: i32,
   px: i32,
   fld: string,
   qs: i32[],
   seen: i32[],
+  ps: i32[],
+  pa: i32[],
 ): boolean {
   if ix < 0 || ix >= P.nodes.length { return true }
   const n = P.nodes[ix]
@@ -19724,7 +19836,13 @@ function monoFieldCallArgTys(
         if seen[0] > 0 && qs.length != n.callArgs.length { return false }
         let a = 0
         while a < n.callArgs.length {
-          const at = nodeTyIxOf(n.callArgs[a])
+          let at = nodeTyIxOf(n.callArgs[a])
+          const ax = unwrapParen(n.callArgs[a])
+          if ax >= 0 && P.nodes[ax] is Ident {
+            let j = 0
+            while j < ps.length && ps[j] != identDeclOf(ax) { j = j + 1 }
+            if j < ps.length && j < pa.length && pa[j] >= 0 { at = pa[j] }
+          }
           if at < 0 || tyHasTyVar(at) || tyReachesHole(at, 16) { return false }
           if seen[0] == 0 { qs.push(at) }
           else if !tyEq(qs[a], at) { return false }
@@ -19736,7 +19854,7 @@ function monoFieldCallArgTys(
     }
   }
   for k in nodeChildren(ix) {
-    if !monoFieldCallArgTys(k, px, fld, qs, seen) { return false }
+    if !monoFieldCallArgTys(k, px, fld, qs, seen, ps, pa) { return false }
   }
   true
 }
@@ -19847,7 +19965,9 @@ function monoOpenFnRecListPin(
           const fPath: string[] = ["f." + f.fiName]
           const one: i32[] = [vx]
           let ft = monoPathSlotPinnedFnTy(dn.fnParams[i], fPath, one, call)
-          if ft < 0 { ft = monoFieldCallPinnedFnTy(dn, i, f.fiName, vx) }
+          if ft < 0 {
+            ft = monoFieldCallPinnedFnTy(dn, i, f.fiName, vx, call, ctx)
+          }
           if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
           // arena-tick exempt: a local copy of the field types; the arena is touched below.
           tys[k] = ft
@@ -19913,6 +20033,162 @@ function monoOpenFnRecListPin(
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = rt
   monoArgPinName(ax, ctx)
+}
+
+// The pin of a read of record literals handed to un-annotated parameter `i` of `decl` in call
+// `call`: a `const` record binding (`r`) or an element of a `const` list of record literals or
+// such bindings (`xs[0]`), each read only there, whose open fields each name an open function.
+// Each field takes `monoOpenFnRecListPin`'s pin; "" when a source, a read or a pin does not close.
+function monoOpenFnRecSrcPin(
+  decl: i32,
+  call: i32,
+  argIx: i32,
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  if decl < 0 || decl >= P.nodes.length || monoFrameIsGenericInstance(ctx) {
+    return ""
+  }
+  const dn = P.nodes[decl]
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return "" }
+  const ax = unwrapParen(argIx)
+  if ax < 0 || ax >= P.nodes.length { return "" }
+  const ot = nodeTyIxOf(ax)
+  if ot < 0 || ot >= T.tys.length || !monoTyOpen(ot) { return "" }
+  const o = T.tys[ot]
+  if !(o is TyObj) { return "" }
+  // Each source as `[literal, frame]`, the bindings and reads that carry it, and the list.
+  const srcs: i32[][] = []
+  const binds: i32[] = []
+  const reads: i32[] = [ax]
+  let listDecl = -1
+  let listLit = -1
+  let listRead = -1
+  const an = P.nodes[ax]
+  if an is Index {
+    const lr = unwrapParen(an.idxArr)
+    const lb = monoRepointBindingLit(lr, ctx, -1)
+    if lb.length != 2 { return "" }
+    const lf = monoReadLetFrame(lr, ctx)
+    if lf[1] < 0 || !monoRecSrcReadOnce(lf, lr) { return "" }
+    listDecl = lf[1]
+    listLit = lb[0]
+    listRead = lr
+    const ll = P.nodes[listLit]
+    if !(ll is ArrayLit) || ll.arrElems.length == 0 { return "" }
+    for e in ll.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 || ex >= P.nodes.length { return "" }
+      if P.nodes[ex] is ObjLit { srcs.push([ex, lb[1]]) }
+      else if !monoRecSrcBinding(ex, lb[1], srcs, binds, reads) { return "" }
+    }
+  } else if !monoRecSrcBinding(ax, ctx, srcs, binds, reads) {
+    return ""
+  }
+  const tys: i32[] = []
+  const vals: i32[][] = []
+  let k = 0
+  while k < o.objFieldNames.length {
+    const name = o.objFieldNames[k]
+    let fty = o.objFieldTypes[k]
+    if monoTyOpen(fty) {
+      if fty < 0 || fty >= T.tys.length || !(T.tys[fty] is TyFunc) { return "" }
+      const fvs = monoMapStoredFields(srcs, name)
+      if fvs.length != srcs.length { return "" }
+      const fx: i32[] = []
+      for fv in fvs {
+        const vx = unwrapParen(fv[0])
+        if vx < 0 || !(P.nodes[vx] is Ident) || monoOpenFnArgDecl(vx) < 0 {
+          return ""
+        }
+        fx.push(vx)
+      }
+      const fPath: string[] = ["f." + name]
+      fty = monoPathSlotPinnedFnTy(dn.fnParams[i], fPath, fx, call)
+      if fty < 0 {
+        for vx in fx {
+          const vt = monoFieldCallPinnedFnTy(dn, i, name, vx, call, ctx)
+          if vt < 0 || (fty >= 0 && sigKeyOfTy(vt) != sigKeyOfTy(fty)) {
+            return ""
+          }
+          fty = vt
+        }
+      }
+      if fty < 0 || sigKeyOfTy(fty) == "" { return "" }
+      for fv in fvs { vals.push([unwrapParen(fv[0]), fv[1], fty]) }
+    }
+    tys.push(fty)
+    k = k + 1
+  }
+  if vals.length == 0 { return "" }
+  const rt = mkObjTy(o.objFieldNames, tys)
+  const rs = monoPinAnnSpelling(rt)
+  if rs == "" { return "" }
+  for v in vals {
+    const fnm = monoConcreteFnTyName(v[2])
+    if fnm == "" || monoCoerceFnValueName(v[0], fnm, v[1], v[2]) < 0 {
+      return ""
+    }
+    nodeTyRecord(v[0], v[2])
+  }
+  for s in srcs {
+    monoSupersededObjTys.push(nodeTyIxOf(s[0]))
+    nodeTyRecord(s[0], rt)
+    // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
+    monoGradualObjList.push(s[0])
+  }
+  for b in binds {
+    const bd = P.nodes[b]
+    if bd is LetDecl { bd.letType = synthTypeRefTy(rs, -1, rt) }
+  }
+  for r in reads { nodeTyRecord(r, rt) }
+  if listDecl >= 0 {
+    const lt = mkArrayTy(rt)
+    const ld = P.nodes[listDecl]
+    if ld is LetDecl { ld.letType = synthTypeRefTy(rs + "[]", -1, lt) }
+    nodeTyRecord(listLit, lt)
+    nodeTyRecord(listRead, lt)
+  }
+  monoArenaTouch()
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = rt
+  monoArgPinName(ax, ctx)
+}
+
+// Adds to `srcs` the record literal initialising the un-annotated `const` the name `v` (read in
+// frame `ctx`) reads, unwritten and read only there, with its declaration to `binds` and `v` to
+// `reads`; false for any other read.
+function monoRecSrcBinding(
+  v: i32,
+  ctx: i32,
+  srcs: i32[][],
+  binds: i32[],
+  reads: i32[],
+): boolean {
+  if v < 0 || v >= P.nodes.length || !(P.nodes[v] is Ident) { return false }
+  const sf = monoReadLetFrame(v, ctx)
+  if sf[1] < 0 || !monoRecSrcReadOnce(sf, v) { return false }
+  const sd = P.nodes[sf[1]]
+  if !(sd is LetDecl) || sd.letKw != "const" || sd.letType >= 0 { return false }
+  const li = unwrapParen(sd.letInit)
+  if li < 0 || li >= P.nodes.length || !(P.nodes[li] is ObjLit) { return false }
+  if monoWritesOf("f:", sf[1]).length > 0 { return false }
+  srcs.push([li, sf[0]])
+  binds.push(sf[1])
+  reads.push(v)
+  true
+}
+
+// Whether the read `v` is the only read of the binding `[frame, declaration]` `lf` names in its
+// frame, nested functions included.
+function monoRecSrcReadOnce(lf: i32[], v: i32): boolean {
+  const d = P.nodes[lf[1]]
+  if !(d is LetDecl) { return false }
+  for ix in monoFrameNodes(lf[0]) {
+    if ix != v && monoReadsBinding(ix, d.letName, lf[0], lf[1]) { return false }
+  }
+  true
 }
 
 // The closed result of function declaration `lx` called at the closed parameter types `qs`: its
@@ -20663,6 +20939,11 @@ function monoPinHoleParam(
     const rlTy: i32[] = [0 - 1]
     an = monoOpenFnRecListPin(oDecl, callIx, args[i], i, ctx, rlTy)
     anTy = rlTy[0]
+  }
+  if an == "" {
+    const rsTy: i32[] = [0 - 1]
+    an = monoOpenFnRecSrcPin(oDecl, callIx, args[i], i, ctx, rsTy)
+    anTy = rsTy[0]
   }
   if an == "" {
     const inTy: i32[] = [0 - 1]

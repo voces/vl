@@ -93,17 +93,43 @@ export function nulClosureElemListRetName(er: i32) {
 // the named-function spelling already round-trips, so a lambda may adopt it. A map/union/
 // nullable/list/closure/nested-struct field is not this (those stay loud rejects). "" otherwise.
 export function structElemListRetName(er: i32) {
-  if er < 0 { return "" }
+  if !structElemListAdmits(er) { return "" }
+  irRendered(tyToEmitName(er))
+}
+
+// Whether `structElemListRetName(er)` answers non-empty, without rendering it.
+export function structElemListAdmits(er: i32): boolean {
+  if er < 0 { return false }
   const t = T.tys[er]
-  if t is TyArray {
-    if t.aElem < 0 { return "" }
-    const et = T.tys[t.aElem]
-    if et is TyObj {
-      if !structElemFieldsPlain(t.aElem, 4) { return "" }
-      return irRendered(tyToEmitName(er))
-    }
+  if !(t is TyArray) || t.aElem < 0 || !(T.tys[t.aElem] is TyObj) {
+    return false
   }
-  ""
+  structElemFieldsPlain(t.aElem)
+}
+
+const SEFP_WIDTH_CAP = 4096
+
+// The field positions in the spelling of plain record `ty`, saturating past
+// `SEFP_WIDTH_CAP`, each arena node counted once through `memo`.
+function sefpWidth(ty: i32, memo: {[i32]: i32}): i32 {
+  if ty < 0 || ty >= T.tys.length { return 1 }
+  const seen = memo[ty] ?? -1
+  if seen >= 0 { return seen }
+  memo[ty] = SEFP_WIDTH_CAP + 1
+  let w = 1
+  const t = T.tys[ty]
+  if t is TyObj {
+    let i = 0
+    while i < t.objFieldTypes.length && w <= SEFP_WIDTH_CAP {
+      w = w + sefpWidth(t.objFieldTypes[i], memo)
+      i = i + 1
+    }
+  } else if t is TyArray {
+    w = w + sefpWidth(t.aElem, memo)
+  }
+  if w > SEFP_WIDTH_CAP { w = SEFP_WIDTH_CAP + 1 }
+  memo[ty] = w
+  w
 }
 
 // The emitter-format name of a nullable-struct-element list return `er` —
@@ -122,7 +148,7 @@ export function nulStructElemListRetName(er: i32) {
       if it is TyObj {
         // A boxed-union-field element isn't `structElemFieldsPlain`, but the annotated form
         // lowers it too — admit it when `structFieldBoxRetName` proves every field lowerable.
-        if !structElemFieldsPlain(et.nInner, 4) {
+        if !structElemFieldsPlain(et.nInner) {
           if structFieldBoxRetName(et.nInner) == "" { return "" }
         }
         return irRendered(tyToEmitName(er))
@@ -171,16 +197,33 @@ export function structPlainRetName(er: i32) {
   if er < 0 { return "" }
   const t = T.tys[er]
   if !(t is TyObj) { return "" }
-  if !structElemFieldsPlain(er, 4) { return "" }
+  if !structElemFieldsPlain(er) { return "" }
   irRendered(tyToEmitName(er))
 }
 
-// The field gate for `structElemListRetName`: every field is a scalar/string/boolean prim, a
-// litunion alias, or (recursively) a nested plain struct. The nested-struct admission is
-// load-bearing — an un-pinned lambda self-resolves each element by field-name set, and a
-// same-fieldset twin type in scope can box the wrong row as invalid wasm without this gate.
-function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
-  if depth <= 0 { return false }
+// The field gate for `structElemListRetName`: every field is a prim, a litunion alias, or a nested
+// plain struct at any depth (an un-pinned lambda would box a same-fieldset twin's row otherwise).
+// Each arena node is decided once and a recursive record declines; so does one whose spelling
+// holds more than `SEFP_WIDTH_CAP` field positions, since the pin is that spelling (D9740).
+function structElemFieldsPlain(objTy: i32): boolean {
+  const memo: {[i32]: boolean} = Map()
+  if !sefpGo(objTy, memo) { return false }
+  const wmemo: {[i32]: i32} = Map()
+  sefpWidth(objTy, wmemo) <= SEFP_WIDTH_CAP
+}
+
+// One record of `structElemFieldsPlain`, asked through `memo`; in progress reads false.
+function sefpGo(objTy: i32, memo: {[i32]: boolean}): boolean {
+  const seen = memo[objTy]
+  if seen != null { return seen }
+  memo[objTy] = false
+  const r = sefpArm(objTy, memo)
+  memo[objTy] = r
+  r
+}
+
+// The fields of one record, for `sefpGo`.
+function sefpArm(objTy: i32, memo: {[i32]: boolean}): boolean {
   const et = T.tys[objTy]
   if !(et is TyObj) { return false }
   let i = 0
@@ -195,7 +238,7 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
         ok = true
       }
       TyObj => {
-        if structElemFieldsPlain(fty, depth - 1) { ok = true }
+        if sefpGo(fty, memo) { ok = true }
       }
       // A map field admits when its value is emit-representable — the annotated form lowers a
       // string-keyed map field, and un-admitted the whole struct loses the canon record.
@@ -217,7 +260,7 @@ function structElemFieldsPlain(objTy: i32, depth: i32): boolean {
           if !ok {
             if tyIsLitUnion(feIx) { ok = true }
             if aet is TyObj {
-              if structElemFieldsPlain(feIx, depth - 1) { ok = true }
+              if sefpGo(feIx, memo) { ok = true }
             }
             // A box-element-union list field (`f: (i64|string|{q:i64})[]`) rides the same union
             // box as a bare `(...)[]` return, so it admits through the same two predicates.

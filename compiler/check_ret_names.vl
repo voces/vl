@@ -31,6 +31,7 @@ import {
   oneStrLitSpelling,
   primNameStr,
   tyArrayElemIx,
+  tyEmitNameNonEmpty,
   tyHasLitLeaf,
   tyIsEmitRepresentable,
   tyIsLitUnion,
@@ -183,9 +184,28 @@ function collectRetAtoms(er: i32, out: string[]) {
 // slot), else "". A closure-result body literal self-infers the plain field shape, so
 // `synthRetAnnots` pins `fnRet` to this canonical name, matching the annotated form (the struct-field dual of `valueUnionRetName`/`mapUnionRetName`).
 export function structFieldBoxRetName(er: i32) {
-  if er < 0 { return "" }
+  const memo: {[i32]: boolean} = Map()
+  if !sfbHasBox(er, memo) { return "" }
+  irRendered(tyToEmitName(er))
+}
+
+// Whether `structFieldBoxRetName(er)` answers non-empty, deciding each arena node once per
+// call through `memo`, so a record nesting one record twice per level is not walked per path.
+function sfbHasBox(er: i32, memo: {[i32]: boolean}): boolean {
+  if er < 0 { return false }
+  const seen = memo[er]
+  if seen != null { return seen }
+  memo[er] = false
+  const r = sfbHasBoxArm(er, memo)
+  memo[er] = r
+  r
+}
+
+// One node of `sfbHasBox`: a record with a boxed union or nullable field slot, its own or a
+// nested record's, whose every union member is lowerable as that slot.
+function sfbHasBoxArm(er: i32, memo: {[i32]: boolean}): boolean {
   const t = T.tys[er]
-  if !(t is TyObj) { return "" }
+  if !(t is TyObj) { return false }
   let hasBox = false
   let i = 0
   while i < t.objFieldTypes.length {
@@ -212,27 +232,27 @@ export function structFieldBoxRetName(er: i32) {
             // second closure member is declined conservatively — discriminable in principle
             // (each tags its own interned signature slot), but untested on this naming path.
             uClo = uClo + 1
-            if uClo > 1 { return "" }
+            if uClo > 1 { return false }
           } else if mt is TyMap {
             // A map member (`{[string]: {a, f, z}} | i32`): rides the box tagged by
             // `mapSlotTag` (the #865/#868 map-union rep), and the annotated spelling of such a
             // field lowers fully. Requires the canonical render to succeed first (the
             // `vbUnionMemberName` map-admission twin), or the struct declines instead of mis-pinning.
-            if !tyIsEmitRepresentable(ft.uMembers[m]) { return "" }
+            if !tyIsEmitRepresentable(ft.uMembers[m]) { return false }
           } else if !tyIsLitUnion(ft.uMembers[m]) {
-            return ""
+            return false
           }
         }
         m = m + 1
       }
-      if uClo > 0 && uObj == 0 { return "" }
+      if uClo > 0 && uObj == 0 { return false }
       hasBox = true
     } else if ft is TyNullable {
       // A nullable struct field (`{f: f64 | null}`, `{f: S | null}`) — a niche slot the
       // annotated form already lowers. Recorded as box-bearing (so the pin fires) when the
       // inner is a prim/literal/object; an unlowerable inner (closure/map/list) declines the
       // whole struct as before, so the lambda takes the proven annotated-form path.
-      if ft.nInner < 0 { return "" }
+      if ft.nInner < 0 { return false }
       const nin = T.tys[ft.nInner]
       if !(nin is TyPrim) && !(nin is TyLit) && !(nin is TyObj) {
         // A nullable struct-element-list field (`{f: {f: string}[] | null}` — the code-28
@@ -246,20 +266,28 @@ export function structFieldBoxRetName(er: i32) {
             if nel is TyObj { nulListOk = true }
           }
         }
-        if !nulListOk { return "" }
+        if !nulListOk { return false }
       }
       hasBox = true
     } else if ft is TyObj {
       // A nested struct field (`{f: {f: i32 | string}}`): the boxed slot may sit one level
       // down, so this recurses to fire the pin for a lambda whose nested literal field adopted
-      // a union-field shape. A nested shape with no box contributes nothing — the "" is a
+      // a union-field shape. A nested shape with no box contributes nothing — its false is a
       // plain no-box, not a decline, since its own unlowerable unions still fail loudly elsewhere.
-      if structFieldBoxRetName(t.objFieldTypes[i]) != "" { hasBox = true }
+      if sfbNestedHasBox(t.objFieldTypes[i], memo) { hasBox = true }
     }
     i = i + 1
   }
-  if !hasBox { return "" }
-  irRendered(tyToEmitName(er))
+  hasBox
+}
+
+// A nested record field contributes a box when it has one and renders non-empty; a render
+// that meets a cycle is asked of the renderer itself.
+function sfbNestedHasBox(ft: i32, memo: {[i32]: boolean}): boolean {
+  if !sfbHasBox(ft, memo) { return false }
+  const ne = tyEmitNameNonEmpty(ft)
+  if ne < 0 { return tyToEmitName(ft) != "" }
+  ne == 1
 }
 
 // The canonical emitter name for an inferred return `er` if it is a bare struct carrying a
