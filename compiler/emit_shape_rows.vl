@@ -87,7 +87,9 @@ import {
   aliasNameOfTyIx,
   cUserTypesVer,
   litBaseTy,
+  structNameOfTy,
   tyArrayElemIx,
+  tyDeeperThan,
   tyFieldTyOf,
   tyIsLitUnion,
   tyIsLitUnionAlias,
@@ -323,6 +325,7 @@ import {
   uFieldCount,
   uFieldElemName,
   uFieldLitTyIx,
+  uFieldNames,
   uFieldStart,
   uFieldTyText,
   uFieldTypes,
@@ -3346,7 +3349,7 @@ export function arrElemIsClosureTy(arrIx: i32, cen: string): boolean {
 // the checker's recorded element type, whose render is the string an annotated `{[K]: V}[]`
 // spelling reduces to, so both spellings intern one row of kind 3.
 export function arrLitMapElemName(arrIx: i32): string {
-  const cen = nodeArrayElemName(arrIx)
+  const cen = arrLitElemRender(arrIx)
   if cen == "" { return "" }
   if !nameIsBareMap(cen) { return "" }
   cen
@@ -3389,6 +3392,88 @@ function arrLitNulRefGrouped(name: string): string {
   name
 }
 
+// `nodeArrayElemName` of the literal at `arrIx`, but the nominal spelling for an element that
+// `deepDeclRecName` names, or a function type nesting past depth 8: what the annotation
+// interns, without a render that spells a declared record by shape at every level.
+export function arrLitElemRender(arrIx: i32): string {
+  const ty = nodeTyIxOf(arrIx)
+  if ty >= 0 && ty < T.tys.length {
+    const t = T.tys[ty]
+    if t is TyArray {
+      const dn = deepDeclRecName(t.aElem)
+      if dn != "" { return dn }
+      if tyIsFuncOrNulFunc(t.aElem) && sigFuncDeeperThan(t.aElem, 8) {
+        const fnm = fnElemNominalName(t.aElem)
+        if fnm != "" { return fnm }
+      }
+    }
+  }
+  nodeArrayElemName(arrIx)
+}
+
+// The ref-list key of list element `e`, a function type bare or made nullable, spelling its
+// declared records by name: parenthesized when bare, as `nodeArrayElemName` keys it. "" for a
+// signature with a type variable, which that render keys at its pin instead.
+export function fnElemNominalName(e: i32): string {
+  if tyHasTyVar(e) || fnSigNamesLit(e, 8) { return "" }
+  const fnm = tyToNominalName(e)
+  if fnm == "" || tyNomNameCycled() { return "" }
+  if T.tys[e] is TyFunc { return "(" + fnm + ")" }
+  fnm
+}
+
+// Whether function type `ty` has a literal outside its records within `depth` levels, or is
+// deeper: the render softens a literal union to its base where the nominal name keeps it.
+function fnSigNamesLit(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return true }
+  const t = T.tys[ty]
+  match t {
+    TyLit => true
+    TyNullable => fnSigNamesLit(t.nInner, depth - 1)
+    TyArray => fnSigNamesLit(t.aElem, depth - 1)
+    TyMap => fnSigNamesLit(t.mKey, depth - 1) || fnSigNamesLit(t.mVal, depth - 1)
+    TyUnion => {
+      for m in t.uMembers {
+        if fnSigNamesLit(m, depth - 1) { return true }
+      }
+      false
+    }
+    TyFunc => {
+      for p in t.fnParamTypes {
+        if fnSigNamesLit(p, depth - 1) { return true }
+      }
+      fnSigNamesLit(t.fnRet, depth - 1)
+    }
+    TyObj | TyPrim | TyVar | TyErr | TyNeg => false
+  }
+}
+
+// The nominal spelling `R`, with one `[]` per list, of type `ty` whose leaf is a declared
+// record `R` nested past depth 8 and owning a struct row no other row or variant arm may
+// match, else "". The render spells `R` by shape, which doubles per level (D9510).
+export function deepDeclRecName(ty: i32): string {
+  let b = ty
+  let sfx = ""
+  while b >= 0 && b < T.tys.length && T.tys[b] is TyArray {
+    b = tyArrayElemIx(b)
+    sfx = sfx + "[]"
+  }
+  if b < 0 || b >= T.tys.length || !(T.tys[b] is TyObj) { return "" }
+  if !tyDeeperThan(b, 8) || variantRowOfTy(b) >= 0 { return "" }
+  const nm = structNameOfTy(b)
+  if nm == "" { return "" }
+  const si = structIndexByName(nm)
+  if (
+    si < 0
+    || repSlotOfTy(b) != si
+    || !sigRowHasNoTwin(si)
+    || !sigRowHasNoArmTwin(si)
+  ) {
+    return ""
+  }
+  nm + sfx
+}
+
 export function arrLitNestedElemName(arrIx: i32): string {
   const ty = nodeTyIxOf(arrIx)
   if ty < 0 { return "" }
@@ -3399,12 +3484,13 @@ export function arrLitNestedElemName(arrIx: i32): string {
       if el is TyArray {
         // The gate is the same one `nodeArrayElemName`'s arm asks (D702): does this element
         // render? A spelling with no render is one no row can be keyed under.
-        if !tyNestedArrLeafRenders(t.aElem) { return "" }
+        const dn = deepDeclRecName(t.aElem)
+        if dn == "" && !tyNestedArrLeafRenders(t.aElem) { return "" }
         // The nominal spelling first, where the inner element is a nullable ref: the reader
         // side resolves it by declared name, which the structural render is not.
         const nnr = nestedNulRefElemNominal(t.aElem)
         if nnr != "" { return nnr }
-        const nen = nodeArrayElemName(arrIx)
+        const nen = arrLitElemRender(arrIx)
         if nen == "" { return "" }
         // The ref-list layer must also be able to name it: `refArrElemKind` answers a kind
         // for every name, so a render alone is not enough. Without this, `{r: K}[]` (no
@@ -3423,7 +3509,7 @@ export function arrLitNestedElemName(arrIx: i32): string {
 // can never differ from the kind the annotation side derives — `rlInternName` banks the
 // first kind against a shared rep key, and a disagreement types one wrapper over another.
 export function arrLitNestedElemKind(arrIx: i32): i32 {
-  const en = nodeArrayElemName(arrIx)
+  const en = arrLitElemRender(arrIx)
   if en == "" { return RLK_I32_LIST }
   refArrElemKind(refElemArrName(en))
 }
@@ -4842,4 +4928,126 @@ export function shapeNominalOfTy(ty: i32): string {
   const vw = variantRowOfObjFieldSetK(ty, true)
   if vw >= 0 { return uVariants[vw] }
   ""
+}
+
+// Whether no other scanned row may match the render of row `si`'s record: none has its field
+// names with every nested-record field of `si` compatible, judged as the scan judges it.
+export function sigRowHasNoTwin(si: i32): boolean {
+  if si < 0 || si >= sFieldStart.length || si >= sFieldCount.length {
+    return false
+  }
+  const lim = sScanLim()
+  let j = 0
+  while j < lim && j < sFieldCount.length && j < sFieldStart.length {
+    if j != si && sFieldCount[j] == sFieldCount[si] {
+      // A row whose fields are not all appended yet may still become a twin.
+      if sFieldStart[j] + sFieldCount[j] > sFieldNames.length { return false }
+      if sigRowMayMatch(si, j) { return false }
+    }
+    j = j + 1
+  }
+  true
+}
+
+// Whether no variant arm has exactly the field names of struct row `si`: such an arm takes the
+// record's render in the signature tables, so a slot keyed on the row would part from it.
+export function sigRowHasNoArmTwin(si: i32): boolean {
+  if si < 0 || si >= sFieldStart.length || si >= sFieldCount.length {
+    return false
+  }
+  let vi = 0
+  while vi < uFieldCount.length && vi < uFieldStart.length {
+    if uFieldCount[vi] == sFieldCount[si] && sigArmHasRowNames(si, vi) {
+      return false
+    }
+    vi = vi + 1
+  }
+  true
+}
+
+// Whether variant arm `vi` carries every field name of struct row `si`.
+function sigArmHasRowNames(si: i32, vi: i32): boolean {
+  let k = 0
+  while k < sFieldCount[si] {
+    const fi = sFieldStart[si] + k
+    if fi < 0 || fi >= sFieldNames.length { return true }
+    let found = false
+    let m = 0
+    while m < uFieldCount[vi] && !found {
+      const fj = uFieldStart[vi] + m
+      if fj < 0 || fj >= uFieldNames.length { return true }
+      if uFieldNames[fj] == sFieldNames[fi] { found = true }
+      m = m + 1
+    }
+    if !found { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Whether row `j` has every field name of row `si`, each field possibly matching `si`'s.
+function sigRowMayMatch(si: i32, j: i32): boolean {
+  const start = sFieldStart[si]
+  const cnt = sFieldCount[si]
+  let k = 0
+  while k < cnt {
+    const fi = start + k
+    if fi < 0 || fi >= sFieldNames.length { return true }
+    const fj = sFieldIndex(j, sFieldNames[fi])
+    if fj < 0 { return false }
+    if !sigFieldMayMatch(fi, sFieldStart[j] + fj) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Whether a render of the field at flat index `fi` may match the field at `fj`: false only
+// for a nested record against a non-record field, or against one of another canonical record.
+function sigFieldMayMatch(fi: i32, fj: i32): boolean {
+  if fi >= sFieldTypes.length || fj < 0 || fj >= sFieldTypes.length {
+    return true
+  }
+  if sFieldTypes[fi] != FC_STRUCT { return true }
+  const cj = sFieldTypes[fj]
+  if cj == FC_UNION { return true }
+  if cj != FC_STRUCT { return false }
+  if fi >= sFieldElemName.length || fj >= sFieldElemName.length { return true }
+  const ki = sigElemCanonId(sFieldElemName[fi])
+  const kj = sigElemCanonId(sFieldElemName[fj])
+  ki < 0 || kj < 0 || ki == kj
+}
+
+// The canonical identity of a nested-record field's recorded element name, or -1.
+function sigElemCanonId(nm: string): i32 {
+  if nm == "" { return -1 }
+  const k = repNameCanonId(nm)
+  if k >= 0 { return k }
+  rowCanonIdOfName(nm)
+}
+
+// Whether function type `ty`, bare or made nullable, has a parameter or result nesting deeper
+// than `budget` levels, as `tyDeeperThan` counts them.
+export function sigFuncDeeperThan(ty: i32, budget: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  let t = T.tys[ty]
+  if t is TyNullable {
+    if t.nInner < 0 || t.nInner >= T.tys.length { return false }
+    t = T.tys[t.nInner]
+  }
+  if !(t is TyFunc) { return false }
+  for p in t.fnParamTypes {
+    if tyDeeperThan(p, budget - 1) { return true }
+  }
+  tyDeeperThan(t.fnRet, budget - 1)
+}
+
+// Whether `ty` is a function type, bare or made nullable.
+export function tyIsFuncOrNulFunc(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if t is TyFunc { return true }
+  t is TyNullable
+    && t.nInner >= 0
+    && t.nInner < T.tys.length
+    && T.tys[t.nInner] is TyFunc
 }
