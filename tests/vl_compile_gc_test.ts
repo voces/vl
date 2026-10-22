@@ -204,19 +204,19 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D9935's witness at depth 23, where it traps under the null collector: `==` over
-      // a record whose every level holds the one below twice, whose inline comparison
-      // doubles per level and outgrows the null collector's largest object.
-      // When D9935 closes, move this to the next open trap under the null collector.
-      const lines = ["type A0 = {x: i32}"];
-      for (let i = 1; i <= 23; i++) {
+      // D9962's witness at depth 17, where it traps under the null collector: `==` over
+      // a record whose every level holds the one below twice and whose leaf is a list,
+      // whose inline comparison doubles per level and outgrows the largest object.
+      // When D9962 closes, move this to the next open trap under the null collector.
+      const lines = ["type A0 = {x: i32[]}"];
+      for (let i = 1; i <= 17; i++) {
         lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
       }
-      lines.push("const a0: A0 = {x: 1}");
-      for (let i = 1; i <= 23; i++) {
+      lines.push("const a0: A0 = {x: [1, 2]}");
+      for (let i = 1; i <= 17; i++) {
         lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
       }
-      lines.push("print(a23 == a23)");
+      lines.push("print(a17 == a17)");
       await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
       const r = await vl(
         ["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`],

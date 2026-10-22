@@ -435,6 +435,9 @@ import {
   gConstExprEmit,
   gEmitNames,
   gEmitSrcMap,
+  gEqHelpFn,
+  gEqHelpTy,
+  gEqHelpTyN,
   gF32PrintIdx,
   gF64PrintIdx,
   gFnTableIdx,
@@ -471,7 +474,6 @@ import {
   gMapDeletes,
   gMapSetFn,
   gMapSetFnBase,
-  gMapSetRows,
   gMapSetTy,
   gMemLogIdx,
   gNeedsF32Print,
@@ -480,6 +482,7 @@ import {
   gPromoInStart,
   gPromoOk,
   gPromoSlot,
+  gSawEqOp,
   gSharedMemPages,
   gStrDataIx,
   gStrDataLen,
@@ -487,6 +490,7 @@ import {
   gStrDataStart,
   gStrPoolIx,
   gStrPoolTexts,
+  gTailFnRows,
   globalStmts,
   i64PushScratchBase,
   ia64TypeIdx,
@@ -14042,8 +14046,8 @@ function mapSetFnOf(sh: i32) {
   const row = mapShapeRow(sh)
   if row < 0 || row >= gMapSetTy.length || gMapSetTy[row] < 0 { return -1 }
   if gMapSetFn[row] < 0 {
-    gMapSetFn[row] = gMapSetFnBase + gMapSetRows.length
-    gMapSetRows.push(row)
+    gMapSetFn[row] = gMapSetFnBase + gTailFnRows.length
+    gTailFnRows.push(row)
   }
   gMapSetFn[row]
 }
@@ -18673,6 +18677,13 @@ function emitStructEqNestedField(
       "emitProgram: nested struct field equality with no interned shape",
     )
   }
+  const hf = eqHelpFnOf(nsi)
+  if hf >= 0 {
+    if emitChainRead(body, lRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    if emitChainRead(body, rRoot, pathSi, pathFi, fnIx) < 0 { return -1 }
+    fbCall(hf)
+    return 0
+  }
   if emitNulFieldGuardOpen(body, lRoot, rRoot, pathSi, pathFi, fnIx) < 0 {
     return -1
   }
@@ -18680,6 +18691,124 @@ function emitStructEqNestedField(
     return -1
   }
   emitNulFieldGuardClose()
+}
+
+// A struct row whose compare is written as a helper once its inline compare would read more
+// than this many fields: the smallest a doubling record reaches at depth 5.
+const EQ_HELP_PATHS = 32
+
+// Per struct row, the leaf fields its inline compare reads, or -1 when a field needs a frame a
+// helper has no locals for; -2 marks a row being counted, so a recursive row declines.
+let eqHelpPaths: i32[] = []
+
+// Reserve a compare helper functype for every struct row worth one: the program spells `==`
+// somewhere, and the row's compare is helper-safe and reads more than `EQ_HELP_PATHS` fields.
+export function eqHelpReserve() {
+  gEqHelpTy = []
+  gEqHelpFn = []
+  gEqHelpTyN = 0
+  eqHelpPaths = []
+  let r = 0
+  while r < sFieldCount.length {
+    eqHelpPaths.push(-3)
+    r = r + 1
+  }
+  r = 0
+  while r < sFieldCount.length {
+    if gSawEqOp && eqHelpPathsOf(r) > EQ_HELP_PATHS {
+      gEqHelpTy.push(gEqHelpTyN)
+      gEqHelpTyN = gEqHelpTyN + 1
+    } else {
+      gEqHelpTy.push(-1)
+    }
+    gEqHelpFn.push(-1)
+    r = r + 1
+  }
+  0
+}
+
+// The leaf fields struct row `si`'s compare reads, saturating at 2^20, or -1 when one of them
+// is not a scalar, a string or a nested struct that is itself helper-safe.
+function eqHelpPathsOf(si: i32): i32 {
+  if si < 0 || si >= eqHelpPaths.length { return -1 }
+  const memo = eqHelpPaths[si]
+  if memo == -2 { return -1 }
+  if memo != -3 { return memo }
+  eqHelpPaths[si] = -2
+  let total = 0
+  let fi = 0
+  while fi < sFieldCount[si] && total >= 0 {
+    const n = eqHelpFieldPaths(si, fi)
+    if n < 0 { total = -1 } else { total = total + n }
+    if total > 1048576 { total = 1048576 }
+    fi = fi + 1
+  }
+  eqHelpPaths[si] = total
+  total
+}
+
+// The leaf fields field `fi` of struct row `si` contributes to its compare, or -1.
+function eqHelpFieldPaths(si: i32, fi: i32): i32 {
+  const code = sFieldTypeAt(si, fi)
+  if code == FC_NUL_NONE || code == FC_I32 || code == FC_NUL_BOOL { return 1 }
+  if code == FC_NUL_LIT_UNION || code == FC_F64 || code == FC_I64 { return 1 }
+  if code == FC_F32 { return 1 }
+  if code == FC_STR || code == FC_NUL_STR {
+    if aUsed { return 1 }
+    return -1
+  }
+  if code == FC_STRUCT { return eqHelpPathsOf(sFieldTgtStructIdx(si, fi)) }
+  -1
+}
+
+// The function a nested compare of struct row `si` calls: its helper, given the next tail
+// index the first time a compare asks, or -1 when the row has none and compares inline.
+function eqHelpFnOf(si: i32): i32 {
+  if si < 0 || si >= gEqHelpTy.length || gEqHelpTy[si] < 0 { return -1 }
+  if gEqHelpFn[si] < 0 {
+    gEqHelpFn[si] = gMapSetFnBase + gTailFnRows.length
+    gTailFnRows.push(-1 - si)
+  }
+  gEqHelpFn[si]
+}
+
+// `__eq_<row>__(a, b)`'s functype: two nullable refs of struct row `si`, an i32 0/1 result.
+export function eqHelpFuncType(si: i32) {
+  fbFuncTypeHead(2)
+  fbRefNullValtype(sHeapIdx[si])
+  fbRefNullValtype(sHeapIdx[si])
+  wULEB(1)
+  fbValtype("i32", -1)
+  0
+}
+
+export function eqHelpFnName(si: i32): string { "__eq_" + i32ToStr(si) + "__" }
+
+// The body of `__eq_<row>__`: both null equal, one null unequal, else the field-wise compare a
+// nested field would otherwise write inline, over the two params.
+export function eqHelpFnBody(si: i32): u8[] {
+  const body: u8[] = []
+  const prev = wTarget(body)
+  wULEB(0) // no locals beyond the two params
+  const savedL = eqStashL
+  const savedR = eqStashR
+  const savedRec = eqChainRecover
+  eqStashL = 0
+  eqStashR = 1
+  eqChainRecover = false
+  const pathSi: i32[] = []
+  const pathFi: i32[] = []
+  if emitNulFieldGuardOpen(body, -2, -3, pathSi, pathFi, -1) >= 0 {
+    if emitStructEqRec(body, -2, -3, si, pathSi, pathFi, -1) >= 0 {
+      emitNulFieldGuardClose()
+    }
+  }
+  eqStashL = savedL
+  eqStashR = savedR
+  eqChainRecover = savedRec
+  fbEnd()
+  wTarget(prev)
+  body
 }
 
 // `emitStructEqFieldAt`'s `i32[]` field: lengths equal and element-wise equal — `len` from the

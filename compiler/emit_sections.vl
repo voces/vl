@@ -345,6 +345,9 @@ import {
   gConstExprEmit,
   gEmitNames,
   gEmitSrcMap,
+  gEqHelpFn,
+  gEqHelpTy,
+  gEqHelpTyN,
   gExtIdx,
   gF32PrintIdx,
   gF64PrintIdx,
@@ -400,7 +403,6 @@ import {
   gMapDeletes,
   gMapSetFn,
   gMapSetFnBase,
-  gMapSetRows,
   gMapSetTy,
   gMapSetTyBase,
   gMapSetTyN,
@@ -416,6 +418,7 @@ import {
   gPromoInStart,
   gPromoOk,
   gPromoSlot,
+  gSawEqOp,
   gSharedMemPages,
   gStrDataIx,
   gStrDataLen,
@@ -430,6 +433,7 @@ import {
   gSynthBase,
   gSynthInit,
   gSynthKind,
+  gTailFnRows,
   genTyParamNames,
   genTyParamSeen,
   globalIndexBySid,
@@ -938,6 +942,10 @@ import {
   emitUserGlobalSet,
   emitVariantCoerce,
   emitVoidTailCall,
+  eqHelpFnBody,
+  eqHelpFnName,
+  eqHelpFuncType,
+  eqHelpReserve,
   expCtxApply,
   expCtxForCell,
   expCtxHere,
@@ -5751,7 +5759,7 @@ function nameMapCount(n: i32): i32 {
   if gHelpAsFail >= 0 { count = count + 1 }
   if gHelpStrFromBytes >= 0 { count = count + 1 }
   if gHelpStrFill >= 0 { count = count + 1 }
-  count + gMapSetRows.length
+  count + gTailFnRows.length
 }
 
 // The name-section name of map store helper row `row`.
@@ -5926,9 +5934,14 @@ function nameHelpers() {
     wULEB(gHelpStrFill)
     wName("__str_fill__")
   }
-  for row in gMapSetRows {
-    wULEB(gMapSetFn[row])
-    wName(mapSetFnName(row))
+  for row in gTailFnRows {
+    if row >= 0 {
+      wULEB(gMapSetFn[row])
+      wName(mapSetFnName(row))
+    } else {
+      wULEB(gEqHelpFn[-1 - row])
+      wName(eqHelpFnName(-1 - row))
+    }
   }
 }
 
@@ -6766,7 +6779,7 @@ function assignSharedHelperIndices(helpBase: i32) {
   // stores inline where binaryen can scalarise the map.
   gMapSetTy = []
   gMapSetFn = []
-  gMapSetRows = []
+  gTailFnRows = []
   gMapSetTyN = 0
   gMapSetTyBase = 0
   gMapSetFnBase = 0
@@ -6781,6 +6794,8 @@ function assignSharedHelperIndices(helpBase: i32) {
     gMapSetFn.push(-1)
     sr = sr + 1
   }
+  // The struct compare helpers likewise reserve only a functype per qualifying row here.
+  eqHelpReserve()
   nHelpers
 }
 
@@ -7299,6 +7314,14 @@ function scanPrintUse() {
         if rneed > 0 { saw.sawFloatRem = true }
         else if rneed < 0 { saw.sawRemUnknown = true }
       }
+      if pn.binOp == "==" || pn.binOp == "!=" {
+        if (
+          nodeTyPrimName(pn.binLeft) == ""
+          && nodeTyPrimName(pn.binRight) == ""
+        ) {
+          gSawEqOp = true
+        }
+      }
     }
     // Any type annotation containing an i64/f64/f32 leaf anywhere — bare, `T[]` element, union
     // member, map value, closure result, struct field, nullable inner — flags the program as
@@ -7627,6 +7650,7 @@ function emitProgramReset(rootIx: i32) {
   // helper INDEX is recomputed every compile while a surviving `true` would declare a
   // `__f64_rem__` this module's tail never emits. `scanPrintUse` writes it (D1586).
   gNeedsF64Rem = false
+  gSawEqOp = false
   gNeedsAsFail = false
   gNeedsStrFromBytes = false
   gMapDeletes = false
@@ -8751,7 +8775,16 @@ function emitTypeSection(
   // lower-indexed types.
   let nGroup = 0
   if typeOffset > 0 { nGroup = 1 }
-  wULEB(nGroup + n + hasStart + nPrintTypes + memFn + nHelpers + gMapSetTyN)
+  wULEB(
+    nGroup
+      + n
+      + hasStart
+      + nPrintTypes
+      + memFn
+      + nHelpers
+      + gMapSetTyN
+      + gEqHelpTyN,
+  )
   if typeOffset > 0 {
     wU8(78)           // 0x4e rec group
     wULEB(typeOffset) // the heap types and the closure-signature pool
@@ -8988,6 +9021,11 @@ function tsEmitHelperFuncTypes() {
   while sft < gMapSetTy.length {
     if gMapSetTy[sft] >= 0 { mapSetFuncType(mapCompactRowShape(sft)) }
     sft = sft + 1
+  }
+  let eft = 0
+  while eft < gEqHelpTy.length {
+    if gEqHelpTy[eft] >= 0 { eqHelpFuncType(eft) }
+    eft = eft + 1
   }
   0
 }
@@ -9300,9 +9338,15 @@ function frameFunctionSection() {
   const countBuf: u8[] = []
   const thunkBuf: u8[] = []
   const prev = wTarget(countBuf)
-  wULEB(gFuncFixedN + gMapSetRows.length + cloThunkFes.length)
+  wULEB(gFuncFixedN + gTailFnRows.length + cloThunkFes.length)
   wTarget(thunkBuf)
-  for row in gMapSetRows { wULEB(gMapSetTyBase + gMapSetTy[row]) }
+  for row in gTailFnRows {
+    if row >= 0 {
+      wULEB(gMapSetTyBase + gMapSetTy[row])
+    } else {
+      wULEB(gMapSetTyBase + gMapSetTyN + gEqHelpTy[-1 - row])
+    }
+  }
   let k = 0
   while k < cloThunkFes.length {
     wULEB(fnSigIdxOfFn(cloThunkFes[k]))
@@ -10055,14 +10099,31 @@ function buildCodePayload(
     if emitStrFillFnCode(entry) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 3, "__str_fill__")
   }
-  // The map store helpers the bodies above called, in the order they first did.
-  for row in gMapSetRows {
+  // The map store and struct compare helpers the bodies above called, in the order they first
+  // did; a compare helper's body can call another, which joins the list behind it.
+  let tfi = 0
+  while tfi < gTailFnRows.length {
+    const row = gTailFnRows[tfi]
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    helpFrameBody(entry, mapSetFnBody(mapCompactRowShape(row)))
-    placeCodeEntry(codePayload, entry, rows, -1, -1, 3, mapSetFnName(row))
+    if row >= 0 {
+      helpFrameBody(entry, mapSetFnBody(mapCompactRowShape(row)))
+      placeCodeEntry(codePayload, entry, rows, -1, -1, 3, mapSetFnName(row))
+    } else {
+      helpFrameBody(entry, eqHelpFnBody(-1 - row))
+      placeCodeEntry(
+        codePayload,
+        entry,
+        rows,
+        -1,
+        -1,
+        3,
+        eqHelpFnName(-1 - row),
+      )
+    }
+    tfi = tfi + 1
   }
-  const nSet = gMapSetRows.length
+  const nSet = gTailFnRows.length
   // The thunk bodies last, in the order the function section declares them. A thunk's row
   // carries its target's slot and node, so its name and position are the target's.
   collectCloThunks(n, gImports + fixedN + nSet)
