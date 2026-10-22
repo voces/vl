@@ -20473,6 +20473,8 @@ function emitNulArmToLocal(
   if valIx < 0 {
     return emitFail("emitProgram: if-expression arm is not a value")
   }
+  // A `never` arm writes nothing: its `unreachable` ends the path (D10230).
+  if callIsNever(valIx) { return emitExpr(body, valIx, fnIx) }
   if rep == 0 {
     // The binding's local is the union box `(ref $uBox)`, so a concrete-variant arm (a
     // kind-8 `(ref $variant)`) must be boxed to match, exactly as `emitUnionIfArm` and a
@@ -38495,6 +38497,15 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
     if emitNulNoneForEffect(body, lhsIx, fnIx) < 0 { return -1 }
     return emitExpr(body, e.binRight, fnIx)
   }
+  // An instance's `if` with a `null` arm keeps the generic `V | null` no arm below has a rep for.
+  if (
+    lhs is IfStmt
+    && tyHasTyVar(nodeTyIxOf(lhsIx))
+    && fnInPinnedInstance(fnIx)
+  ) {
+    const armIf = coalNullArmIf(e, exprIx)
+    if armIf >= 0 { return emitExpr(body, armIf, fnIx) }
+  }
   if coalesceOperandPinNonNull(exprIx, fnIx) {
     return emitExpr(body, lhsIx, fnIx)
   }
@@ -39715,9 +39726,56 @@ function emitCoalesceNullableRefs(
       return emitExpr(body, nIf, fnIx)
     }
   }
+  const armIf = coalNullArmIf(e, exprIx)
+  if armIf >= 0 { return emitExpr(body, armIf, fnIx) }
   emitFail(
     "emitProgram: `??` over this nullable value is not supported yet — narrow it first, e.g. `if v != null { … }`",
   )
+}
+
+// `if c { d } else { a ?? d }` for `(if c { null } else { a }) ?? d`, and its mirror, which is
+// what `?? d` means for an `if` with a `null` arm: the `??` moves onto the other arm, whose own
+// rep an instance types, where the `if` keeps its generic `V | null` (D10130). Only a desugared
+// `if` reaches here: a written one is already bound to a local. -1 otherwise.
+function coalNullArmIf(e: BinExpr, exprIx: i32): i32 {
+  const lhsIx = unwrapParen(e.binLeft)
+  if lhsIx < 0 { return -1 }
+  const n = P.nodes[lhsIx]
+  if !(n is IfStmt) || n.ifElse < 0 { return -1 }
+  const tv = coalSoleStmt(n.ifThen)
+  const ev = coalSoleStmt(n.ifElse)
+  if tv < 0 || ev < 0 { return -1 }
+  const tNull = P.nodes[tv] is NullLit
+  const eNull = P.nodes[ev] is NullLit
+  if tNull == eNull { return -1 }
+  const pos = e.pos
+  let live = tv
+  if tNull { live = ev }
+  const inner = mkBinary("??", live, e.binRight, pos)
+  nodeTyCarry(inner, exprIx)
+  const liveS: i32[] = []
+  liveS.push(inner)
+  const deadS: i32[] = []
+  deadS.push(e.binRight)
+  let thenB = mkBlock(liveS, pos)
+  let elseB = mkBlock(deadS, pos)
+  if tNull {
+    thenB = mkBlock(deadS, pos)
+    elseB = mkBlock(liveS, pos)
+  }
+  const ifIx = mkIf(n.ifCond, thenB, elseB, pos)
+  nodeTyCarry(ifIx, exprIx)
+  ifIx
+}
+
+// The one statement block `ix` holds, or -1 when it holds another number or is not a block.
+function coalSoleStmt(ix: i32): i32 {
+  if ix < 0 { return -1 }
+  const b = P.nodes[ix]
+  if b is Block {
+    if b.blkStmts.length == 1 { return b.blkStmts[0] }
+  }
+  -1
 }
 
 // Whether the `??` at `exprIx` reads the field `lhsIx` of a record whose stored row holds that

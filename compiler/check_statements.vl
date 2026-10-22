@@ -27,7 +27,11 @@ import {
   mkBlock,
   mkBool,
   mkBreak,
+  mkCall,
+  mkForIn,
   mkIf,
+  mkIndex,
+  mkMember,
   mkNum,
   mkWhile,
   stmtAlwaysExits,
@@ -35,6 +39,7 @@ import {
   valueIfAdd,
 } from "./ast"
 import {
+  lmValTy,
   luAllSpell,
   luChain,
   luDecl,
@@ -158,6 +163,7 @@ import {
   voidSlotExemptExpr,
 } from "./check_leaf_steps"
 import {
+  lmMembers,
   luAnnTy,
   luAt,
   luDeclPosPut,
@@ -269,6 +275,7 @@ import {
   TyErr,
   TyMap,
   TyObj,
+  TyUnion,
   TyVar,
   mkNullableTy,
   tyHasHole,
@@ -1061,6 +1068,77 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
   checkNodeHook(ix)
 }
 
+// `for k[, v] in recv { body }` over a union of maps whose keys agree, rewritten in place to a
+// loop over the keys read member by member, as `for k in recv.keys()` is. A map's value binding
+// reads `.values()` at the key's position: `{ const $lm = recv; const $lv = $lm.values();
+// for k, $lj in $lm.keys() { let v: V = $lv[$lj]; body } }`. -1 when a type has no spelling.
+function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
+  const m0 = T.tys[ms[0]]
+  if !(m0 is TyMap) || !luAllSpell(iterTy, ms) { return -1 }
+  const pos = n.pos
+  const none: i32[] = []
+  if n.fiVar2 == "" || m0.mSet == 1 {
+    const keys = luAt(
+      mkCall(luAt(mkMember(n.fiIter, "keys", pos), ix), none, pos),
+      ix,
+    )
+    const fw: Node = {
+      fiVar: n.fiVar,
+      fiVar2: n.fiVar2,
+      fiIter: keys,
+      fiBody: n.fiBody,
+      fiLabel: n.fiLabel,
+      pos: pos,
+    }
+    arenaSetNode(ix, fw)
+    luGrow()
+    return checkNodeHook(ix)
+  }
+  const val = lmValTy(ms)
+  if val < 0 || luSpell(val) == "" { return -1 }
+  const recv = "$lm" + i32ToStr(ix)
+  const vals = "$lv" + i32ToStr(ix)
+  const at = "$lj" + i32ToStr(ix)
+  const outer: i32[] = []
+  outer.push(luDecl("const", recv, iterTy, n.fiIter, ix, pos))
+  const vcall = mkCall(
+    luAt(mkMember(luRef(recv, ix, pos), "values", pos), ix),
+    none,
+    pos,
+  )
+  outer.push(luDecl("const", vals, -1, luAt(vcall, ix), ix, pos))
+  const loop: i32[] = []
+  const rd = luAt(mkIndex(luRef(vals, ix, pos), luRef(at, ix, pos), pos), ix)
+  const vDecl = luDecl("let", n.fiVar2, val, rd, ix, pos)
+  luDeclPosPut(vDecl, n.fiIter)
+  loop.push(vDecl)
+  const bn = P.nodes[n.fiBody]
+  if bn is Block {
+    for s in bn.blkStmts { loop.push(s) }
+  } else {
+    loop.push(n.fiBody)
+  }
+  const kcall = mkCall(
+    luAt(mkMember(luRef(recv, ix, pos), "keys", pos), ix),
+    none,
+    pos,
+  )
+  const body = luAt(mkBlock(loop, pos), ix)
+  outer.push(
+    luAt(mkForIn(n.fiVar, at, luAt(kcall, ix), body, n.fiLabel, pos), ix),
+  )
+  const once = luAt(mkBool(1, -1), ix)
+  const w: Node = {
+    ifCond: once,
+    ifThen: luAt(mkBlock(outer, pos), ix),
+    ifElse: -1,
+    pos: pos,
+  }
+  arenaSetNode(ix, w)
+  luGrow()
+  checkNodeHook(ix)
+}
+
 // Extracted from `checkNodeReal`'s `WhileStmt` arm (C3: thin the dispatcher).
 export function checkWhileStmtNode(n: WhileStmt, ix: i32) {
   crLoopPreRetire(ix)
@@ -1206,7 +1284,23 @@ export function checkForInNode(n: ForIn, ix: i32) {
     elemTy = luElem
     elem2Ty = TY_I32
   }
-  if luElem >= 0 && inferQuiet {
+  let lmMs: i32[] = []
+  if luElem < 0 && it is TyUnion { lmMs = lmMembers(iterTy) }
+  if !luRecvLowers(n.fiIter, lmMs) { lmMs = [] }
+  if lmMs.length > 0 {
+    const lm0 = T.tys[lmMs[0]]
+    if !(lm0 is TyMap) {
+      lmMs = []
+    } else if !inferQuiet {
+      if lmForInAt(n, ix, iterTy, lmMs) >= 0 { return TY_VOID }
+      lmMs = []
+    } else {
+      elemTy = lm0.mKey
+      elem2Ty = if lm0.mSet == 1 { TY_I32 } else { lmValTy(lmMs) }
+      if elem2Ty < 0 { elem2Ty = TY_ERR }
+    }
+  }
+  if (luElem >= 0 || lmMs.length > 0) && inferQuiet {
     // Typed as the rewrite will type it; the real pass rewrites the loop.
   } else if it is TyArray || it is TyMap || isStringTy(iterTy) || it is TyErr {
     // Iterable (or already reported): `forInBindTy` has typed both bindings.

@@ -122,6 +122,7 @@ import {
   TyUnion,
   cUserTypes,
   cUserTypesVer,
+  mkArrayTy,
   mkMapTy,
   mkNullableTy,
   tyEq,
@@ -590,6 +591,40 @@ export function lmValTy(ms: i32[]): i32 {
   e
 }
 
+// The union of the map members' `.values()` lists, each the member's own value list, as an
+// `is` test on each member then the call would type it; -1 when they have no union.
+export function lmValsTy(ms: i32[]): i32 {
+  // A join collapses `V[] | string[]` to one list, where the written union keeps two arms.
+  if luAnyTyVar(ms) {
+    let sp = ""
+    for m in ms {
+      const a = T.tys[m]
+      if !(a is TyMap) { return -1 }
+      const s = luSpell(mkArrayTy(a.mVal))
+      if s == "" { return -1 }
+      if sp != "" { sp = sp + "|" }
+      sp = sp + s
+    }
+    const mark = T.diags.length
+    const u = nameToTy(sp)
+    while T.diags.length > mark { T.diags.pop() }
+    return u
+  }
+  let e = -1
+  for m in ms {
+    const a = T.tys[m]
+    if a is TyMap {
+      const l = mkArrayTy(a.mVal)
+      if e < 0 { e = l } else { e = joinVariantTys(e, l) }
+    }
+  }
+  if e == TY_ERR {
+    joinClashMsgSet("")
+    return -1
+  }
+  e
+}
+
 // One arm's read over map `recv`: kind 0 its `.length`, 1 the index `recv[args[0]]`, 2 the
 // call `recv.prop(args…)`, delivered through a `const` at the read's union type `res`. A value
 // read of member `mem` is first bound at its own `V | null`, whose miss then widens as a null.
@@ -646,8 +681,15 @@ export function lmChain(
   pos: i32,
 ): i32 {
   const arm = lmArm(recv, ms[k], kind, prop, args, res, site, pos)
-  if k >= ms.length - 1 { return arm }
+  // A type parameter's map tests its last member too, as `luChain` does.
+  const open = luAnyTyVar(ms)
+  if k >= ms.length - 1 && !open { return arm }
   const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
+  if k >= ms.length - 1 {
+    const tl: i32[] = []
+    tl.push(luAt(mkCall(luRef("__trap__", site, pos), [], pos), site))
+    return luAt(mkIf(test, arm, luAt(mkBlock(tl, pos), site), pos), site)
+  }
   const rest = lmChain(ms, k + 1, recv, kind, prop, args, res, site, pos)
   luAt(mkIf(test, arm, rest, pos), site)
 }
@@ -664,9 +706,12 @@ export function luSpell(ty: i32): string {
   // name spells a literal-union parameter by its old base scalar.
   const an = luArrowTight(dn)
   if an != dn && luSpellsAs(an, ty) { return an }
+  // A map naming a type parameter has no emit name, and its display name spaces the colon.
+  const tn = fvaTight(dn)
+  if tn != an && luSpellsAs(tn, ty) { return tn }
   // A union naming a type parameter, whose written form resolves to one member when its lists
   // meet: spelled for the pin to substitute, and typed through `luAnnTy`.
-  if luUnionSpellsByMember(ty) { return dn }
+  if luUnionSpellsByMember(ty) { return tn }
   ""
 }
 
