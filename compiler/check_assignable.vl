@@ -150,7 +150,13 @@ import {
   tpEnvNames,
   tpEnvTys,
 } from "./check_cursor"
-import { ctnWrUnreachedBy, wrUnreachedBy } from "./check_decl_scan"
+import {
+  ctnBindingDeclOf,
+  ctnRebound,
+  ctnWrDeclOf,
+  ctnWrUnreachedBy,
+  wrUnreachedBy,
+} from "./check_decl_scan"
 import {
   argCstrErr,
   argFlowErr,
@@ -809,6 +815,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
     }
     return 0
   }
+  ctnWrittenCstrsAt(srcExpr, srcTy, dstTy)
   const e = lit
   if !(e is Ident) { return 0 }
   let st = srcTy
@@ -903,6 +910,64 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   substNestModeSet(modeWas)
   substNestDeclSet(declWas)
   0
+}
+
+// A container binding delivered, whole or by element, where the destination fixes the type
+// variables of its element: each function value written into the binding is judged at those
+// types, as a call through it at that type judges it (D10080).
+function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  if srcTy < 0 || !tyHasTyVar(srcTy) || tyHasTyVar(dstTy) { return 0 }
+  const d = ctnBindingDeclOf(srcExpr)
+  if d < 0 { return 0 }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  bindGenWalk(srcTy, nonNullTy(dstTy), bNames, bTys)
+  if bNames.length == 0 || ctnRebound(d) { return 0 }
+  const at = " (written into `"
+    + ctnDeclName(d)
+    + "`, delivered at "
+    + tyToStr(dstTy)
+    + ")"
+  let ci = 0
+  while ci < bmCstr.got.length {
+    if ctnWrDeclOf(bmCstr.ix[ci]) == d {
+      const bg = substTyDeep(bmCstr.got[ci], bNames, bTys)
+      const bw = substTyDeep(bmCstr.want[ci], bNames, bTys)
+      let bc = bmCstr.ctx[ci]
+      if bc >= 0 { bc = substTyDeep(bc, bNames, bTys) }
+      if !tyHasHole(bg) && !tyHasHole(bw) {
+        if !bmArgPred(bmCstr.form[ci], bg, bw, bmCstr.ix[ci]) {
+          const m = bmArgMsg(bmCstr.form[ci], bmCstr.label[ci], bg, bw, bc)
+          tErr(m + at, srcExpr)
+          return 0
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  ci = 0
+  while ci < letCstr.got.length {
+    if ctnWrDeclOf(letCstr.ix[ci]) == d {
+      const lg = substTyDeep(letCstr.got[ci], bNames, bTys)
+      const lw = substTyDeep(letCstr.want[ci], bNames, bTys)
+      if !tyHasHole(lg) && !tyHasHole(lw) {
+        if !assignableExpr(letCstr.ix[ci], lg, lw) {
+          const m = letAssignMsg(letCstr.ix[ci], lg, lw, letCstr.name[ci], -1)
+          tErr(m + at, srcExpr)
+          return 0
+        }
+      }
+    }
+    ci = ci + 1
+  }
+  0
+}
+
+// The name declaration `d` binds, or "" when it is no `let`/`const`.
+function ctnDeclName(d: i32): string {
+  const n = P.nodes[d]
+  if n is LetDecl { return n.letName }
+  ""
 }
 
 // Every constraint `owner`'s body deferred, adjudicated at the bindings `bNames`/`bTys` and
