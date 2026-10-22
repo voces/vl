@@ -9941,6 +9941,10 @@ function monoMakeInstanceParams(
         // keeps the argument's own members, which its narrowed reads are keyed on (D8181).
         if monoPinKeepsInlineLits(nodeTyIxOf(nt), pinTys[pj]) {
           nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
+        } else if nodeTyIxOf(nt) < 0 && pinTys[pj] >= 0 {
+          // A pin name the type parser cannot read back (a map of functions renders with a
+          // space after its colon) takes the argument's own type rather than none (D9180).
+          nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
         }
         synthed = true
       }
@@ -14474,6 +14478,7 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
   const rt = monoPinObjFields(d.letInit, at, ctx, "", pinned, recs, recTys)
   if rt == -2 { return -1 }
   if rt < 0 || !monoLetWritesAt(d, at, ctx, rt) { return 0 }
+  monoLetWritesRecord(d, at, ctx)
   monoSupersededObjTys.push(nodeTyIxOf(d.letInit))
   nodeTyRecord(d.letInit, rt)
   // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
@@ -14554,6 +14559,172 @@ function monoPinFieldContainers(d: LetDecl, at: i32, ctx: i32): i32 {
   }
   monoArenaTouch()
   0
+}
+
+// Types the record literal `rx` an un-annotated function returns in frame `ctx` at the closed
+// types of the bindings its open fields read, nested record literals included, so the inferred
+// result is that record and not the checker's open one (D9181).
+function monoPinReturnedObj(rx: i32, ctx: i32) {
+  if rx < 0 { return 0 }
+  const lx = unwrapParen(rx)
+  if lx < 0 || !(P.nodes[lx] is ObjLit) || monoFrameIsGenericInstance(ctx) {
+    return 0
+  }
+  if monoClosedObjLitTy(lx, ctx, true) >= 0 { monoArenaTouch() }
+  0
+}
+
+// Types the un-annotated binding `d` declared at `at` in frame `ctx`, initialized by a call of a
+// non-generic un-annotated function whose every result is a record literal `monoPinReturnedObj`
+// types alike, at that record, with the call and the reads through each function field (D9181).
+function monoPinCallRecord(d: LetDecl, at: i32, ctx: i32) {
+  if d.letInit < 0 || (ctx >= 0 && monoFrameIsGenericInstance(ctx)) { return 0 }
+  const cx = unwrapParen(d.letInit)
+  if cx < 0 || cx >= P.nodes.length { return 0 }
+  const c = P.nodes[cx]
+  if !(c is Call) || c.callFn < 0 || !monoTyOpen(nodeTyIxOf(cx)) { return 0 }
+  const callee = P.nodes[c.callFn]
+  if !(callee is Ident) { return 0 }
+  const fe = monoFnFeOfIdent(c.callFn, callee.identName, ctx)
+  if (
+    fe < 0
+    || fe >= fnStmts.length
+    || (fe < monoGen.length && monoGen[fe] != 0)
+  ) {
+    return 0
+  }
+  const fx = fnStmts[fe]
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) || fd.fnRet >= 0 { return 0 }
+  let rt = -1
+  for r in monoFnRetArgs(fd) {
+    if r < 0 { return 0 }
+    let v = r
+    const rn = P.nodes[r]
+    if rn is RetStmt { v = rn.retArg }
+    if v < 0 { return 0 }
+    const lx = unwrapParen(v)
+    if lx < 0 || lx >= P.nodes.length || !(P.nodes[lx] is ObjLit) { return 0 }
+    monoClosedObjLitTy(lx, fx, true)
+    const lt = nodeTyIxOf(lx)
+    if lt < 0 || monoTyOpen(lt) || (rt >= 0 && !tyEq(rt, lt)) { return 0 }
+    rt = lt
+  }
+  if (
+    rt < 0
+    || !monoLetWritesClosed(d, at, ctx)
+    || !monoLetWritesAt(d, at, ctx, rt)
+  ) {
+    return 0
+  }
+  monoLetWritesRecord(d, at, ctx)
+  nodeTyRecord(cx, rt)
+  for ix in monoFrameNodes(ctx) {
+    if monoTyOpen(nodeTyIxOf(ix)) && monoReadsBinding(ix, d.letName, ctx, at) {
+      nodeTyRecord(ix, rt)
+    }
+  }
+  monoRetypeRecFieldReads(ctx, at, rt)
+  monoArenaTouch()
+  0
+}
+
+// Types the reads in frame `ctx` through each field of the record `rt` held by the binding
+// declared at `at`: a container of functions by its slot, any other field by its held paths.
+function monoRetypeRecFieldReads(ctx: i32, at: i32, rt: i32) {
+  if rt < 0 || rt >= T.tys.length { return 0 }
+  const o = T.tys[rt]
+  if o is TyObj {
+    const pinned: string[] = []
+    let k = 0
+    while k < o.objFieldNames.length && k < o.objFieldTypes.length {
+      const ft = o.objFieldTypes[k]
+      const et = monoContainerElemTy(ft)
+      if et >= 0 && et < T.tys.length && T.tys[et] is TyFunc {
+        monoRetypeMapReads(ctx, at, ft, et, o.objFieldNames[k])
+      } else {
+        monoHeldRecPaths(at, ctx, ft, o.objFieldNames[k], pinned, 1)
+      }
+      k = k + 1
+    }
+  }
+  0
+}
+
+// The closed type of the binding the identifier `vx` in frame `ctx` reads, recorded on it when
+// `rec`; -1 for any other expression or a binding still open.
+function monoClosedReadTy(vx: i32, ctx: i32, rec: boolean): i32 {
+  if !(P.nodes[vx] is Ident) { return -1 }
+  const bd = monoReadLetFrame(vx, ctx)[1]
+  if bd < 0 { return -1 }
+  const b = P.nodes[bd]
+  if !(b is LetDecl) { return -1 }
+  const bt = monoLetTyIx(b)
+  if bt < 0 || bt >= T.tys.length || monoTyOpen(bt) { return -1 }
+  if rec { nodeTyRecord(vx, bt) }
+  bt
+}
+
+// The closed type value `v` of a record field takes in frame `ctx`: a literal's at the closed
+// bindings it reads, or the closed binding it reads; recorded when `rec`, -1 when neither.
+function monoClosedFieldValTy(v: i32, ctx: i32, rec: boolean): i32 {
+  if v < 0 { return -1 }
+  const vx = unwrapParen(v)
+  if vx < 0 || vx >= P.nodes.length { return -1 }
+  if P.nodes[vx] is ObjLit {
+    const lt = monoClosedObjLitTy(vx, ctx, rec)
+    if lt >= 0 { return lt }
+    const ot = nodeTyIxOf(vx)
+    if monoTyOpen(ot) { return -1 }
+    return ot
+  }
+  monoClosedReadTy(vx, ctx, rec)
+}
+
+// The type record literal `lx` in frame `ctx` takes from the closed bindings its open fields read,
+// nested literals included, recorded on it (and on them) when `rec`; -1 when no field reads one.
+function monoClosedObjLitTy(lx: i32, ctx: i32, rec: boolean): i32 {
+  const lit = P.nodes[lx]
+  if !(lit is ObjLit) { return -1 }
+  const ot = nodeTyIxOf(lx)
+  if ot < 0 || ot >= T.tys.length { return -1 }
+  const o = T.tys[ot]
+  if !(o is TyObj) { return -1 }
+  const tys: i32[] = []
+  for t in o.objFieldTypes { tys.push(t) }
+  let any = false
+  for fi in lit.objFields {
+    const f = P.nodes[fi]
+    if f is FieldInit {
+      let k = 0
+      while k < o.objFieldNames.length && o.objFieldNames[k] != f.fiName {
+        k = k + 1
+      }
+      if k < tys.length && monoTyOpen(tys[k]) {
+        const vx = unwrapParen(f.fiValue)
+        let nt = -1
+        if vx >= 0 && vx < P.nodes.length && P.nodes[vx] is ObjLit {
+          nt = monoClosedObjLitTy(vx, ctx, rec)
+        } else {
+          nt = monoClosedReadTy(vx, ctx, rec)
+        }
+        if nt >= 0 {
+          // arena-tick exempt: a local copy of the field types; the caller touches after.
+          tys[k] = nt
+          any = true
+        }
+      }
+    }
+  }
+  if !any { return -1 }
+  const rt = mkObjTy(o.objFieldNames, tys)
+  if rec {
+    monoSupersededObjTys.push(ot)
+    nodeTyRecord(lx, rt)
+    // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
+    monoGradualObjList.push(lx)
+  }
+  rt
 }
 
 // The dotted field path `path` relative to the record at path `pre` ("" the root record): `path`
@@ -14811,19 +14982,56 @@ function monoLetWritesClosed(d: LetDecl, at: i32, ctx: i32): boolean {
   if d.letKw == "const" { return true }
   for w in monoLetWholeWrites(at) {
     const t = monoLetWriteRhsTy(w, ctx)
-    if t < 0 || t >= T.tys.length || monoTyOpen(t) { return false }
+    if (
+      monoLetWriteFreshMap(w) < 0
+      && (t < 0 || t >= T.tys.length || monoTyOpen(t))
+    ) {
+      return false
+    }
   }
   true
 }
 
-// Whether each write of the `let` declared at `at` stores a value of type `t`.
+// Whether each write of the `let` declared at `at` stores a value of type `t`; a fresh `Map()`
+// takes a map type `t`, and is recorded at it.
 function monoLetWritesAt(d: LetDecl, at: i32, ctx: i32, t: i32): boolean {
   if d.letKw == "const" { return true }
+  const isMap = t >= 0 && t < T.tys.length && T.tys[t] is TyMap
+  const fresh: i32[] = []
   for w in monoLetWholeWrites(at) {
-    const wt = monoLetWriteRhsTy(w, ctx)
-    if wt < 0 || !tyEq(wt, t) { return false }
+    const fx = monoLetWriteFreshMap(w)
+    if fx >= 0 && isMap {
+      fresh.push(fx)
+    } else {
+      const wt = monoLetWriteRhsTy(w, ctx)
+      if wt < 0 || !tyEq(wt, t) { return false }
+    }
   }
+  for fx in fresh { nodeTyRecord(fx, t) }
   true
+}
+
+// The right side of write `w` when it is a `Map()` call with no arguments, else -1 (D9182).
+function monoLetWriteFreshMap(w: i32): i32 {
+  const wb = P.nodes[w]
+  if !(wb is BinExpr) || wb.binOp != "=" { return -1 }
+  const rx = unwrapParen(wb.binRight)
+  if rx < 0 || rx >= P.nodes.length { return -1 }
+  const c = P.nodes[rx]
+  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return -1 }
+  const f = P.nodes[c.callFn]
+  if !(f is Ident) || f.identName != "Map" || identDeclOf(c.callFn) >= 0 {
+    return -1
+  }
+  rx
+}
+
+// Records on each record literal a write of the `let` declared at `at` stores the type
+// `monoLetWritesAt` compared, once the binding is pinned.
+function monoLetWritesRecord(d: LetDecl, at: i32, ctx: i32) {
+  if d.letKw == "const" { return 0 }
+  for w in monoLetWholeWrites(at) { monoLetWriteRhsTyRec(w, ctx, true) }
+  0
 }
 
 // The writes `d = v` of the binding declared at `at`, its capture cell's included.
@@ -14834,13 +15042,24 @@ function monoLetWholeWrites(at: i32): i32[] {
   out
 }
 
-// The type write `w` stores: the type the binding its right side reads holds, -1 for a write
-// that is no `=` or stores anything but a read of a `let`.
+// The type write `w` stores: the type the binding its right side reads holds, or a record
+// literal's at the closed bindings its fields read (D9182), recorded when `rec`; -1 for a write
+// that is no `=` or stores anything else.
 function monoLetWriteRhsTy(w: i32, ctx: i32): i32 {
+  monoLetWriteRhsTyRec(w, ctx, false)
+}
+
+function monoLetWriteRhsTyRec(w: i32, ctx: i32, rec: boolean): i32 {
   const wb = P.nodes[w]
   if !(wb is BinExpr) || wb.binOp != "=" { return -1 }
   const rx = unwrapParen(wb.binRight)
-  if rx < 0 || !(P.nodes[rx] is Ident) { return -1 }
+  if rx < 0 || rx >= P.nodes.length { return -1 }
+  if P.nodes[rx] is ObjLit {
+    const lt = monoClosedObjLitTy(rx, monoStoreFrame(w, ctx), rec)
+    if lt >= 0 { return lt }
+    return nodeTyIxOf(rx)
+  }
+  if !(P.nodes[rx] is Ident) { return -1 }
   const bd = monoReadLetFrame(rx, monoStoreFrame(w, ctx))[1]
   if bd < 0 { return -1 }
   const b = P.nodes[bd]
@@ -14923,13 +15142,30 @@ function monoPinStoredRecords(
   spell: string[],
 ): i32 {
   const fts: i32[] = []
+  const recVals: i32[][] = []
   let vs = "{"
   let k = 0
   while k < v.objFieldNames.length {
     const name = v.objFieldNames[k]
     let fty = v.objFieldTypes[k]
-    if monoTyOpen(fty) {
-      if fty < 0 || fty >= T.tys.length || !(T.tys[fty] is TyFunc) { return -1 }
+    if (
+      monoTyOpen(fty)
+      && fty >= 0
+      && fty < T.tys.length
+      && !(T.tys[fty] is TyFunc)
+    ) {
+      // A field reading a closed binding, or a record literal of them, takes its type (D9183).
+      const fvals = monoMapStoredFields(stored, name)
+      if fvals.length != stored.length { return -1 }
+      fty = -1
+      for fv in fvals {
+        const t = monoClosedFieldValTy(fv[0], fv[1], false)
+        if t < 0 || (fty >= 0 && !tyEq(fty, t)) { return -1 }
+        fty = t
+      }
+      for fv in fvals { recVals.push(fv) }
+    } else if monoTyOpen(fty) {
+      if fty < 0 || fty >= T.tys.length { return -1 }
       const fvals = monoMapStoredFields(stored, name)
       if fvals.length != stored.length { return -1 }
       const fpath: string[] = []
@@ -14947,9 +15183,18 @@ function monoPinStoredRecords(
     k = k + 1
   }
   spell.push(vs + "}")
+  for fv in recVals { monoClosedFieldValTy(fv[0], fv[1], true) }
   const nv = mkObjTy(v.objFieldNames, fts)
   structTyMarkAliasable(nv)
-  for s in stored { monoRecordOpen(unwrapParen(s[0]), nv, s[1]) }
+  for s in stored {
+    const sx = unwrapParen(s[0])
+    if recVals.length > 0 && monoTyOpen(nodeTyIxOf(sx)) {
+      monoSupersededObjTys.push(nodeTyIxOf(sx))
+      // arena-tick exempt: the post-monomorphization shape pass mints the literal's row.
+      monoGradualObjList.push(sx)
+    }
+    monoRecordOpen(sx, nv, s[1])
+  }
   nv
 }
 
@@ -15148,6 +15393,26 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
       nodeTyRecord(ix, nt)
     }
   }
+  // A `const` bound to a read of an alias is one too.
+  let ai = 0
+  while ai < aliases.length {
+    const a = P.nodes[aliases[ai]]
+    if a is LetDecl {
+      for ix in nodes {
+        const b = P.nodes[ix]
+        if (
+          b is LetDecl
+          && b.letKw == "const"
+          && b.letType < 0
+          && b.letInit >= 0
+          && monoReadsBinding(unwrapParen(b.letInit), a.letName, ctx, aliases[ai])
+        ) {
+          aliases.push(ix)
+        }
+      }
+    }
+    ai = ai + 1
+  }
   // A read of a `const` bound to a value read is that value, nullable unless narrowed.
   for ax in aliases {
     const a = P.nodes[ax]
@@ -15164,6 +15429,10 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
             nodeTyRecord(ix, ft)
           }
         }
+      }
+      // A record value's own function containers are read through the alias (D9183).
+      if ft >= 0 && ft < T.tys.length && T.tys[ft] is TyObj {
+        monoRetypeRecFieldReads(ctx, ax, ft)
       }
     }
   }
@@ -19706,6 +19975,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if cf is FuncDecl {
           if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
           if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
+          if cf.fnRet < 0 { monoPinReturnedObj(n.retArg, ctx) }
         }
       }
       return monoWalk(n.retArg, ctx)
@@ -19874,6 +20144,7 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   // So does an un-annotated map of function values (D4579).
   if n.letType < 0 {
     if monoPinMapValues(n, ix, ctx) < 0 { return -1 }
+    monoPinCallRecord(n, ix, ctx)
   }
   // An annotated function-typed binding to a generic named function: materialize the
   // instance for the annotation's param types and point the binding at it, so the value
