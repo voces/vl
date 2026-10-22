@@ -190,7 +190,14 @@ import {
 import { getterDemandNote } from "./check_getter_effects"
 import { getterNarrowNote } from "./check_getter_walk"
 import { arrDefRowServed, holeCastNames } from "./check_hole_links"
-import { HD_ELEM, HD_RET, hdBase, hdKind, hdRowOf } from "./check_hole_pins"
+import {
+  HD_ELEM,
+  HD_RET,
+  hdBase,
+  hdKind,
+  hdRootTy,
+  hdRowOf,
+} from "./check_hole_pins"
 import {
   calleeWriteAt,
   calleeWriteGot,
@@ -1927,6 +1934,43 @@ function memCstrAtCallMsg(msg: string, who: string): string {
   msg + " (" + mWho + " at the call's argument types)"
 }
 
+// Refuses an empty `[]` argument whose element the callee calls: no use names the element's
+// result type, so it is the `const e = []` floor reached through a parameter (D9281). `told`
+// holds the argument nodes already refused at this call.
+function refuseEmptyListCalledArg(
+  cTy: i32,
+  prop: string,
+  mr: i32,
+  who: string,
+  hNames: string[],
+  hArgNo: i32[],
+  hArgNode: i32[],
+  told: i32[],
+) {
+  if inferQuiet || (prop != OP_CALL_PIN && prop != OP_CALL_GUARDED_PIN) {
+    return 0
+  }
+  if !tyHasHole(mr) { return 0 }
+  const argNo = cstrArgNoOf(hdRootTy(cTy), hNames, hArgNo)
+  if argNo <= 0 { return 0 }
+  const an = cstrArgNodeOf(argNo, hArgNo, hArgNode)
+  if an < 0 || an >= P.nodes.length || i32ListHas(told, an) { return 0 }
+  const n = P.nodes[an]
+  if !(n is ArrayLit) { return 0 }
+  if n.arrElems.length != 0 { return 0 }
+  told.push(an)
+  let callee = "this call"
+  if who != "" { callee = "`" + who + "`" }
+  tErr(
+    "cannot infer a type for this empty list — "
+      + callee
+      + " calls its element, and an empty array literal has no element type; annotate it where"
+      + " it is bound (`const fs: ((x: i32) => i32)[] = []`)",
+    an,
+  )
+  0
+}
+
 // The arity refusal of call pin `prop` at `site` on a function type `recv` still holding a hole;
 // "" for any other constraint, which waits for its holes.
 function callPinOpenArityMsg(recv: i32, prop: string, site: i32): string {
@@ -1951,6 +1995,7 @@ export function validateMemCstrs(
 ) {
   const nOrigM = memCstr.ty.length
   const cvWas = cvNow
+  const told0: i32[] = []
   let ci = 0
   while ci < nOrigM {
     if (
@@ -1959,6 +2004,16 @@ export function validateMemCstrs(
     ) {
       cvNow = cvPick(CV_MEM, ci, cvWas)
       const mr = substTyDeep(memCstr.ty[ci], bNames, bTys)
+      refuseEmptyListCalledArg(
+        memCstr.ty[ci],
+        memCstr.prop[ci],
+        mr,
+        who,
+        hNames,
+        hArgNo,
+        hArgNode,
+        told0,
+      )
       if (
         calleeFn >= 0
         || substNestMode == SUBST_NESTED
