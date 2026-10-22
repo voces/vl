@@ -340,6 +340,7 @@ import {
   fnFlowDeclPathPinFns,
   fnFlowDeclPathPinRets,
   fnFlowDeclPathPinSigs,
+  fnFlowDeclPathPinSigsOmitting,
   fnFlowDeclPathPinTysAt,
   fnFlowDeclPathPinTysOf,
   fnFlowDeclPathSrcs,
@@ -13143,6 +13144,13 @@ let mfrAliasWrites: {[i32]: i32[]} = Map()
 // Pairs `[a, b]` of literal roots read as one: a pushed list and a list it is spread into, or two
 // maps one binding is handed.
 let mfrTied: i32[] = []
+// The positions in `mfrTied` of the pairs whose second root is a copy a spread makes of the first.
+let mfrTiedCopy: {[i32]: boolean} = Map()
+// Bindings every read of which names their one generic and every spread of which is expanded, so
+// no call reaches their element slot (D9595).
+let mfrSpreadDone: i32[] = []
+// The calls whose callee read `monoFlowReadSet` rewrote to name a generic.
+let mfrSetCalls: i32[] = []
 // Pairs `[binding, use]` of reads `monoFlowUsePlan` found naming no generic only because a value
 // they read is an alias of a literal slot this round may rewrite to one (D9652).
 let mfrPending: i32[] = []
@@ -13168,6 +13176,9 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrListSrc = Map()
   mfrAliasWrites = Map()
   mfrTied = []
+  mfrTiedCopy = Map()
+  mfrSpreadDone = []
+  mfrSetCalls = []
   mfrPending = []
   mfrLetBusy = Map()
   mfrLetDepth = 0
@@ -13201,6 +13212,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   }
   monoFlowReadsAll(lets)
   for d in lets { monoFlowLetCalls(d) }
+  for d in lets { monoFlowMapNoteAliasWrites(d) }
   for a in mfrAnnLets { monoFlowAnnLits(a) }
   for x in direct {
     const n = P.nodes[x]
@@ -13665,7 +13677,7 @@ function monoFlowStoreMap(p: i32, x: i32): i32 {
 function monoFlowAliasMap(d: i32): i32 {
   const ms = monoFlowAliasMaps(d)
   if ms.length == 0 { return -1 }
-  for m in ms { monoFlowTie(ms[0], m) }
+  for m in ms { monoFlowTie(ms[0], m, false) }
   ms[0]
 }
 
@@ -13715,13 +13727,16 @@ function monoFlowMapHandOn(x: i32): i32 {
 }
 
 // Appends to `out` every value map `mv` (`monoFlowMapOwner`) may hold: each literal or generic a
-// write through its owner's name stores; false when one stores anything else.
+// write through its owner's name stores; false when one stores anything else. The writes through
+// its aliases are noted (`monoFlowAliasStored`) when each stores a literal or a generic, even
+// where an owner's own write stores another function (D9651).
 function monoFlowMapVals(mv: i32, out: i32[]): boolean {
   const d = monoFlowMapOwner(mv)
   if d < 0 { return false }
   // A parameter or `const` the map is handed to writes it as its owner does (D9440).
   const via: i32[] = [d]
   const writes: i32[] = []
+  let named = true
   let i = 0
   while i < via.length {
     for u in mfrUses[via[i]] ?? [] {
@@ -13732,13 +13747,12 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
       const s = monoFlowStoreOf(x)
       if s >= 0 {
         const sv = unwrapParen(s)
-        if monoFlowIsLit(sv) {
-          if !monoFlowValsOf(sv, out) { return false }
-        } else if monoFlowLeafGen(sv) >= 0 {
-          out.push(sv)
-        } else {
-          return false
-        }
+        let ok = true
+        if monoFlowIsLit(sv) { ok = monoFlowValsOf(sv, out) }
+        else if monoFlowLeafGen(sv) >= 0 { out.push(sv) }
+        else { ok = false }
+        if !ok && via[i] != d { return false }
+        if !ok { named = false }
         if via[i] != d { writes.push(s) }
       } else {
         const h = monoFlowMapHandOn(x)
@@ -13752,7 +13766,20 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
   }
   // arena-tick exempt: a side table of this pass, not the arena
   mfrAliasWrites[d] = writes
-  true
+  named
+}
+
+// Notes the writes through the aliases of the map candidate `d` initializes, when no read of it
+// asked already, so the map's pin instances what they store too (D9651).
+function monoFlowMapNoteAliasWrites(d: i32) {
+  if mfrAliasWrites.has(d) { return 0 }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) { return 0 }
+  const mv = unwrapParen(dn.letInit)
+  if monoFlowMapOwner(mv) != d { return 0 }
+  const held: i32[] = []
+  monoFlowMapVals(mv, held)
+  0
 }
 
 // The values a write through a parameter or `const` the map declared at `at` is handed to stores,
@@ -14080,7 +14107,8 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
       }
     }
   }
-  // Tied roots decline together (D9482).
+  // Tied roots decline together (D9482), but a list a spread copies keeps its plan when only the
+  // copy declines: its values are then what the copy is built from (D9595).
   let spreadMoved = true
   while spreadMoved {
     spreadMoved = false
@@ -14090,7 +14118,7 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
       const b = mfrTied[si + 1]
       const da = mfrDirty[a] ?? false
       const db = mfrDirty[b] ?? false
-      if da != db {
+      if da != db && !(db && (mfrTiedCopy[si] ?? false)) {
         // arena-tick exempt: a side table of this pass, not the arena
         mfrDirty[a] = true
         // arena-tick exempt: a side table of this pass, not the arena
@@ -14100,9 +14128,17 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
       si = si + 2
     }
   }
+  const copied: i32[] = []
+  let i = 0
+  while i + 1 < mfrTied.length {
+    if (mfrTiedCopy[i] ?? false) && (mfrDirty[mfrTied[i + 1]] ?? false) {
+      copied.push(mfrTied[i])
+    }
+    i = i + 2
+  }
   // A binding some read, loop or spread of which keeps reading through the literal.
   const through: i32[] = []
-  let i = 0
+  i = 0
   while i < pr.length {
     if monoFlowDeclClean(pr[i]) && !monoFlowReadSet(pr[i + 1], pr[i + 2]) {
       through.push(pr[i])
@@ -14117,18 +14153,32 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
     i = i + 3
   }
   monoFlowReplanPending(planned, through)
+  const viaReads: i32[] = []
+  for t in through { viaReads.push(t) }
   i = 0
   while i < ps.length {
     through.push(ps[i])
     i = i + 3
   }
-  monoFlowNoteInert(planned, through)
+  monoFlowNoteInert(planned, through, copied)
   i = 0
   const hosts: i32[] = []
+  const unset: i32[] = []
   while i < ps.length {
-    if monoFlowDeclClean(ps[i]) {
-      const h = monoFlowSpreadSet(ps[i + 1], ps[i + 2])
-      if h >= 0 { hosts.push(monoFlowLitRoot(h)) }
+    let h = -1
+    if monoFlowDeclClean(ps[i]) { h = monoFlowSpreadSet(ps[i + 1], ps[i + 2]) }
+    if h >= 0 { hosts.push(monoFlowLitRoot(h)) } else { unset.push(ps[i]) }
+    i = i + 3
+  }
+  i = 0
+  while i < ps.length {
+    const d = ps[i]
+    if (
+      !i32ListHas(viaReads, d)
+      && !i32ListHas(unset, d)
+      && !i32ListHas(mfrSpreadDone, d)
+    ) {
+      mfrSpreadDone.push(d)
     }
     i = i + 3
   }
@@ -14399,7 +14449,11 @@ function monoFlowUsePlanAt(
   } else if path.length > 0 && path[path.length - 1] == "e" {
     // A list's elements share one slot, so a literal-index read of it, unwritten, names its own
     // element even where another element names another generic (D6795).
-    if !monoFlowSrcHas(d, path, g) && !monoFlowHeldIs(d, path, g) {
+    if (
+      !monoFlowSrcHas(d, path, g)
+      && !monoFlowHeldIs(d, path, g)
+      && !monoFlowSpreadSrcElem(d, path, cur, g)
+    ) {
       return false
     }
   } else if !monoFlowSrcIs(d, path, g) && !monoFlowHeldIs(d, path, g) {
@@ -14409,6 +14463,44 @@ function monoFlowUsePlanAt(
   reads.push(cur)
   reads.push(g)
   true
+}
+
+// Whether `cur` reads, by index, an element naming generic `g` of the one list literal `d` owns,
+// every element of it when it grows, and `d` is spread: the flow table joins a spread list's slot with its copy's, whose
+// writes and other values then reach no read of `d` (D9595).
+function monoFlowSpreadSrcElem(
+  d: i32,
+  path: string[],
+  cur: i32,
+  g: i32,
+): boolean {
+  if path.length != 1 { return false }
+  const xn = P.nodes[cur]
+  if !(xn is Index) { return false }
+  const vs = monoFlowDeclVals(d)
+  if vs.length != 1 || monoFlowListOwner(vs[0]) != d { return false }
+  if monoFlowListGrows(vs[0], 0) {
+    if monoFlowElemsGen(vs[0]) != g { return false }
+  } else if monoFlowLeafGen(monoFlowElemAt(vs[0], xn.idxIndex)) != g {
+    return false
+  }
+  if !i32ListHas(fnFlowDeclPathHeldSrcs(d, path), g) { return false }
+  for u in mfrUses[d] ?? [] {
+    const p = mfrParent[u] ?? -1
+    if p >= 0 && P.nodes[p] is Spread { return true }
+  }
+  false
+}
+
+// The closed pins the flow table takes downstream of slot `path` of `d`, leaving out those at a
+// call whose callee read `monoFlowReadSet` pointed at a generic; empty when the table declines.
+function monoFlowSlotPins(d: i32, path: string[]): string[] {
+  const none: string[] = []
+  if mfrSetCalls.length == 0 { return none }
+  const dead: {[i32]: boolean} = Map()
+  const pins = fnFlowDeclPathPinSigsOmitting(d, path, -1, -1, dead, mfrSetCalls)
+  if pins.length == 1 && pins[0] == FF_PIN_DECLINE { return none }
+  pins
 }
 
 // Whether `p` uses value `cur` whole where its own reads are planned or it is tested for `null`.
@@ -14777,17 +14869,19 @@ function monoFlowGrownSpreadSrc(x: i32, depth: i32): i32 {
   const vs = monoFlowDeclVals(d)
   if vs.length != 1 || monoFlowListOwner(vs[0]) != d { return -1 }
   if !monoFlowListGrows(vs[0], depth) { return -1 }
-  monoFlowTie(monoFlowLitRoot(vs[0]), monoFlowLitRoot(x))
+  monoFlowTie(monoFlowLitRoot(vs[0]), monoFlowLitRoot(x), true)
   vs[0]
 }
 
-// Notes roots `a` and `b` in `mfrTied`, once.
-function monoFlowTie(a: i32, b: i32) {
+// Notes roots `a` and `b` in `mfrTied`, once; `copy` when `b` is a list a spread copies `a` into.
+function monoFlowTie(a: i32, b: i32, copy: boolean) {
   let i = 0
   while i + 1 < mfrTied.length {
     if mfrTied[i] == a && mfrTied[i + 1] == b { return 0 }
     i = i + 2
   }
+  // arena-tick exempt: a side table of this pass, not the arena
+  if copy { mfrTiedCopy[mfrTied.length] = true }
   mfrTied.push(a)
   mfrTied.push(b)
   0
@@ -15049,6 +15143,7 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   }
   const n: Node = { identName: nm, pos: nodePos(x) }
   if monoFlowCalledAt(x) && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
+  if monoFlowCalledAt(x) { mfrSetCalls.push(mfrParent[x] ?? -1) }
   arenaSetNode(x, n)
   sidNoteNodeName(x, g)
   monoArenaTouch()
@@ -15080,10 +15175,11 @@ function monoFlowAliasCallsSet(x: i32, g: i32) {
 }
 
 // Notes as inert each name of a generic in the literals the clean bindings of `planned` hold,
-// unless a binding in `through` holds the same literal tree: every read of the rest now names
-// the generic itself, so no call reaches one of those names (D6661).
-function monoFlowNoteInert(planned: i32[], through: i32[]) {
+// unless a binding in `through` holds the same literal tree or it is a root in `copied`: every
+// read of the rest now names the generic itself, so no call reaches one of those names (D6661).
+function monoFlowNoteInert(planned: i32[], through: i32[], copied: i32[]) {
   const kept: i32[] = []
+  for r in copied { kept.push(r) }
   for d in through {
     for v in mfrVals[d] ?? [] { kept.push(monoFlowLitRoot(v)) }
   }
@@ -15283,7 +15379,7 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if nr != 0 { return if nr < 0 { -1 } else { 0 } }
   }
   const path: string[] = ["e"]
-  const pins = monoDeclPathPins(lf, path)
+  let pins = monoDeclPathPins(lf, path)
   if pins.length > 1 {
     // Pushed functions whose every read now names its generic are called through no slot (D9441).
     const pushed = monoMethodStoredArgs(at, lf, "push", 1, "")
@@ -15297,17 +15393,25 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
       if monoValsInert(held) { return monoUncalledListElems(d, at, lf, lit) }
     }
     if pushed.length == 0 && monoSpreadHostInert(at, lit) { return 0 }
+    // A list read only by name and spread, whose spreads now hold its generic, shares the pins of
+    // the lists that spread it but no call through its own slot (D9595).
+    if i32ListHas(mfrSpreadDone, at) { return 0 }
     if fnFlowDeclKidSrc(at, "e") >= 0 || monoFlowHeldOneGen(at, path) {
       return 0
     }
-    // A list its function returns asks for a copy of the function per pin, as a returned literal
-    // does (D9450).
-    if monoFnReturnsListLit(ctx, d.letInit) {
-      for e in lit.arrElems {
-        monoAskRetCopies(ctx, at, path, ctx, unwrapParen(e))
+    // Calls whose read the flow pass pointed at its generic go through no slot (D9595).
+    const live = monoFlowSlotPins(at, path)
+    if live.length != 1 {
+      // A list its function returns asks for a copy of the function per pin, as a returned
+      // literal does (D9450).
+      if monoFnReturnsListLit(ctx, d.letInit) {
+        for e in lit.arrElems {
+          monoAskRetCopies(ctx, at, path, ctx, unwrapParen(e))
+        }
       }
+      return monoGenericListFail(d.letInit)
     }
-    return monoGenericListFail(d.letInit)
+    pins = live
   }
   if (
     pins.length == 0
@@ -17218,13 +17322,17 @@ function monoStoredSlotFnTy(
   spell: string[],
 ): i32 {
   const at = lf[1]
-  const pins = monoDeclPathPins(lf, path)
+  let pins = monoDeclPathPins(lf, path)
   if pins.length == 0 && fnFlowDeclPathUncalled(at, path) {
     return monoUncalledSlotFnTy(vals, spell)
   }
   // Functions whose every read now names its generic are called through no slot.
   if pins.length > 1 && monoValsInert(vals) {
     return monoUncalledSlotFnTy(vals, spell)
+  }
+  if pins.length > 1 {
+    const live = monoFlowSlotPins(at, path)
+    if live.length == 1 { pins = live }
   }
   if pins.length != 1 { return -1 }
   const ann = monoSlotPinAnn(lf, path, pins[0], "void")
