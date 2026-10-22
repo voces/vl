@@ -293,6 +293,7 @@ import {
   tyToStr,
 } from "./check_types"
 import {
+  binArithOp,
   mkUnionTy,
   numUnionMinted,
   softenLitOpTy,
@@ -446,15 +447,17 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
 }
 
 // The one place a binary expression's type is handed out, so the one place the answer can be
-// deferred to a pin. `ltOut` carries the left operand's type out rather than re-reading
-// `nodeTyIx[n.binLeft]`: `checkNode` records a node type only when `!inferQuiet`, and a nested
-// binary on the right could have overwritten a module-level slot before this returns.
+// deferred to a pin. `ltOut` carries the left operand's type (and then any `i64` beside a hole)
+// out rather than re-reading `nodeTyIx[n.binLeft]`: `checkNode` records a node type only when
+// `!inferQuiet`, and a nested binary on the right could have overwritten a module-level slot.
 export function checkBinExprNode(n: BinExpr, ix: i32) {
   const ltOut: i32[] = []
   const bTy = checkBinExprNodeReal(n, ix, ltOut)
   if ltOut.length == 0 { return bTy }
   if n.binOp == "+" && !inferQuiet { plusLinkRecord(ix, ltOut[0]) }
-  mkBinOpRetTy(n, bTy, ltOut[0])
+  let wide = -1
+  if ltOut.length > 1 { wide = ltOut[1] }
+  mkBinOpRetTy(n, bTy, ltOut[0], wide)
 }
 
 // `a in b` outside a `for` head: refused, with the membership test the receiver `b` does have.
@@ -1230,6 +1233,9 @@ function binNoteHoleCstr(n: BinExpr, op: string, lt: i32, rt: i32) {
     op,
     eqCstrOperandTy(op, n.binRight, rt),
   )
+  // Arithmetic's result carries the width to the pin (`mkBinOpRetTy`), where every destination
+  // re-asks it, and a comparison's is `boolean`; a compound write stores into the hole (D9620).
+  if n.binCompound == "" && (binArithOp(op) || numCmpOp(op)) { return 0 }
   cexNoteHoleWidth(lt, rt)
   cexNoteHoleWidth(rt, lt)
   0
@@ -1461,7 +1467,10 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // A binary op with a hole operand can't decide its form until the hole is bound at the call —
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
   if op != "=" && op != "&&" && op != "||" {
-    if tyHasHole(lt) || tyHasHole(rt) { binNoteHoleCstr(n, op, lt, rt) }
+    if tyHasHole(lt) || tyHasHole(rt) {
+      binNoteHoleCstr(n, op, lt, rt)
+      if lt == TY_I64 || rt == TY_I64 { ltOut.push(TY_I64) }
+    }
   }
   // Nominal newtype (P1.5): every non-assignment binary operator's operands must carry the
   // same brand — structural rules can't see it (`sameNumeric` compares `primName`, ordering skips `assignable`).
