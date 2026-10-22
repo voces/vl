@@ -204,19 +204,19 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D9771's witness at depth 23, where it traps under the null collector: a
-      // parameter of a map whose value is a function over a record whose structural
-      // spelling doubles per level, which outgrows the null collector's largest object.
-      // When D9771 closes, move this to the next open trap under the null collector.
+      // D9935's witness at depth 23, where it traps under the null collector: `==` over
+      // a record whose every level holds the one below twice, whose inline comparison
+      // doubles per level and outgrows the null collector's largest object.
+      // When D9935 closes, move this to the next open trap under the null collector.
       const lines = ["type A0 = {x: i32}"];
       for (let i = 1; i <= 23; i++) {
         lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
       }
-      lines.push(
-        "function g(m: {[string]: ((x: A23) => i32) | null}): i32 { 1 }",
-        "const m: {[string]: ((x: A23) => i32) | null} = Map()",
-        "print(g(m))",
-      );
+      lines.push("const a0: A0 = {x: 1}");
+      for (let i = 1; i <= 23; i++) {
+        lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
+      }
+      lines.push("print(a23 == a23)");
       await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
       const r = await vl(
         ["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`],

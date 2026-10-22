@@ -20,9 +20,10 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Four axes
+// every run, so the margin pays only for the compiler changing, not for the box. Five axes
 // sit above the default because they are super-linear today — `types`, `reads after many
-// closed sibling shadows`, `list concat chain length`, `if joins nested deep` —
+// closed sibling shadows`, `list concat chain length`, `if joins nested deep`, `diamond
+// record depth` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
 // multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
@@ -887,6 +888,34 @@ axis(
   2.0,
   "Which declared record a pinned type is (`nominalRootDeclAt`, compiler/check_emit_queries.vl) is being re-scanned per member read.",
   (d) => twoFiles(d, genRecordChainPin(40, true), genRecordChainPin(40, false)),
+);
+
+// A 12-level record whose every level holds the one below twice, so its spelling doubles per
+// level, against the same 12 levels holding it once beside an i32, through each position that
+// rendered it: a map of nullable functions over it, a list literal of them, and the record
+// built from inferred locals. Fuel reads 2.90; master `23ac8244a` read 31.3 (D9771, D9810, D9840).
+const genDiamond = (n: number, diamond: boolean): string => {
+  const r = (a: string, b: string) => (diamond ? a : b);
+  const o = ["type A0 = {x: i32}"];
+  for (let i = 1; i <= n; i++) o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
+  o.push("const a0: A0 = {x: 1}");
+  for (let i = 1; i <= n; i++) o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
+  const fn = `((x: A${n}) => i32) | null`;
+  o.push(`function g(m: {[string]: ${fn}}): i32 { 1 }`, `const m: {[string]: ${fn}} = Map()`);
+  o.push(`function h(ys: (${fn})[]): i32 { ys.length }`);
+  o.push(`const ys: (${fn})[] = [null, (x: A${n}): i32 => 20]`);
+  o.push(`function mk(x: i32): A${n} {`, "  const b0 = {x: x}");
+  for (let i = 1; i < n; i++) o.push(`  const b${i} = {l: b${i - 1}, r: ${r(`b${i - 1}`, "x")}}`);
+  o.push(`  return {l: b${n - 1}, r: ${r(`b${n - 1}`, "x")}}`, "}");
+  o.push(`print(g(m) + h(ys) + h([null, (x: A${n}): i32 => 20]) + mk(5)${".l".repeat(n)}.x)`);
+  return o.join("\n") + "\n";
+};
+
+axis(
+  "diamond record depth",
+  3.6,
+  "A position is keying a record by its rendered spelling, which doubles per level, rather than by its arena type — `tyDeeperThan`, `mvDeepFuncSlotOfTy` or `repIdOf`'s cap (D9771, D9810, D9840).",
+  (d) => twoFiles(d, genDiamond(12, true), genDiamond(12, false)),
 );
 
 // 1.09 / 0.97 / 1.13 at 6,000. At 3,000 fuel reads 1.00, and an arena scan planted on each

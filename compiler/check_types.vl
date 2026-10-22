@@ -17,6 +17,7 @@ import {
   nameIsQuotedWhole,
 } from "./tyname"
 import { i32ListHas } from "./listutil"
+import { pairMemoClear, pairMemoGet, pairMemoNew, pairMemoPut } from "./memo"
 import {
   builtinTyNames,
   demangleName,
@@ -688,31 +689,68 @@ export function tyHasNullHole(ti: i32, depth: i32): boolean {
 export function tyDeeperThan(ti: i32, budget: i32): boolean {
   if ti < 0 { return false }
   if budget <= 0 { return true }
+  tyWrapHeight(ti) >= budget
+}
+
+// The wrapper height `tyDeeperThan` compares, memoised per arena index and stamped with
+// `tyMutEpoch`, so a sub-type a diamond shares is walked once (D9930); a cycle is unbounded.
+const TD_UNBOUNDED = 1073741824
+const TD_BUSY = -2
+const tdHeight: i32[] = []
+const tdStamp: i32[] = []
+
+function tyWrapHeight(ti: i32): i32 {
+  while tdHeight.length <= ti {
+    tdHeight.push(0)
+    tdStamp.push(-1)
+  }
+  if tdStamp[ti] == tyMutEpoch {
+    if tdHeight[ti] == TD_BUSY { return TD_UNBOUNDED }
+    return tdHeight[ti]
+  }
+  const ep = tyMutEpoch
+  tdStamp[ti] = ep
+  tdHeight[ti] = TD_BUSY
+  let h = 0
   const t = T.tys[ti]
   match t {
     TyObj => {
       const fts = t.objFieldTypes
       let i = 0
       while i < fts.length {
-        if tyDeeperThan(fts[i], budget - 1) { return true }
+        h = tyWrapStep(h, fts[i])
         i = i + 1
       }
-      false
     }
-    TyArray => tyDeeperThan(t.aElem, budget - 1)
-    TyNullable => tyDeeperThan(t.nInner, budget - 1)
+    TyArray => {
+      h = tyWrapStep(h, t.aElem)
+    }
+    TyNullable => {
+      h = tyWrapStep(h, t.nInner)
+    }
     TyUnion => {
       const ms = t.uMembers
       let i = 0
       while i < ms.length {
-        if tyDeeperThan(ms[i], budget - 1) { return true }
+        h = tyWrapStep(h, ms[i])
         i = i + 1
       }
-      false
     }
     // Leaves, and wrappers the re-stamp does not descend.
-    TyPrim | TyFunc | TyMap | TyNeg | TyVar | TyLit | TyErr => false
+    TyPrim | TyFunc | TyMap | TyNeg | TyVar | TyLit | TyErr => {}
   }
+  tdStamp[ti] = ep
+  tdHeight[ti] = h
+  h
+}
+
+// `h` raised to one more than child `c`'s height; a hole (`c < 0`) adds nothing.
+function tyWrapStep(h: i32, c: i32): i32 {
+  if c < 0 { return h }
+  const ch = tyWrapHeight(c)
+  if ch >= TD_UNBOUNDED { return TD_UNBOUNDED }
+  if ch + 1 > h { return ch + 1 }
+  h
 }
 
 // D-ARRGROUP — the one home of the array-element grouping rule, shared by all three renderers.
@@ -1168,15 +1206,40 @@ export function tyEq(a0: i32, b0: i32) {
   // guard for recursive named types, like `assignable`'s.
   let gi = tyEqAStack.length - 1
   while gi >= 0 {
-    if tyEqAStack[gi] == a && tyEqBStack[gi] == b { return true }
+    if tyEqAStack[gi] == a && tyEqBStack[gi] == b {
+      tyEqGuardHits = tyEqGuardHits + 1
+      return true
+    }
     gi = gi - 1
   }
+  const tag = tyEqMemoTag()
+  const seen = pairMemoGet(tyEqMemo, a, b, tag)
+  if seen >= 0 { return seen == 1 }
+  const hits = tyEqGuardHits
   tyEqAStack.push(a)
   tyEqBStack.push(b)
   const ok = tyEqGo(a, b)
   tyEqAStack.pop()
   tyEqBStack.pop()
+  if tyEqAStack.length > 0 && tyEqGuardHits == hits && T.tys[a] is TyObj {
+    pairMemoPut(tyEqMemo, a, b, tag, ok)
+  }
+  if tyEqAStack.length == 0 { pairMemoClear(tyEqMemo) }
   ok
+}
+
+// The record pairs one outermost `tyEq` call decided without assuming a pair still being
+// compared, so a sub-record a diamond shares is compared once per call (D9930).
+let tyEqGuardHits = 0
+
+const tyEqMemo = pairMemoNew()
+
+// The modes an answer is decided under.
+function tyEqMemoTag(): i32 {
+  let f = 0
+  if tyEqSoft { f = f + 1 }
+  if tyEqHolesExact { f = f + 2 }
+  f
 }
 
 // Flattens nested union layers only — a nullable renders `T?` here, not `T | null`, so
