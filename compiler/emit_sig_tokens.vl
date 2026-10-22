@@ -37,10 +37,16 @@ import {
   tyEq,
   tyIsLitUnion,
   tyIsNullableLitUnion,
+  tyReachesSelf,
   tySame,
   tyToEmitName,
 } from "./check_types"
-import { sFieldTypeAt, sScanLim, structIndexByName } from "./emit_atom_kinds"
+import {
+  rowCanonIdOfName,
+  sFieldTypeAt,
+  sScanLim,
+  structIndexByName,
+} from "./emit_atom_kinds"
 import {
   PL_READ_UNPLACED,
   annArrowAt,
@@ -104,6 +110,7 @@ import {
 import { paramTypeNode } from "./emit_query"
 import {
   repKindOfSigTok,
+  repNameCanonId,
   repOfTy,
   repRowOfTyStruct,
   repSigSlotTokOfKind,
@@ -131,6 +138,8 @@ import {
   FC_MAP,
   FC_NUL_CLOSURE,
   FC_STR,
+  FC_STRUCT,
+  FC_UNION,
   MfKind,
   VKind,
   emitRootIx,
@@ -142,8 +151,10 @@ import {
   localIsRef,
   localStructIdx,
   sFieldCount,
+  sFieldElemName,
   sFieldNames,
   sFieldStart,
+  sFieldTypes,
   sNames,
   uVariants,
   unTyIx,
@@ -931,6 +942,9 @@ export function sigParamTokOfTy(pty: i32): string {
   if dr != "" { return dr }
   const ur = sigRecScalarUnionTokOfTy(pty)
   if ur != "" { return ur }
+  const nr = sigNulDeclRecTokOfTy(pty)
+  if nr != "" { return nr }
+  if sigRecUnionListHasNoTok(pty) { return "" }
   const pnm = tyToEmitName(pty)
   if pnm == "" { return "" }
   annParamKindTy(pnm, pty)
@@ -939,12 +953,110 @@ export function sigParamTokOfTy(pty: i32): string {
 // The token of a record parameter by the declared record that owns its row, or "": the
 // answer `annParamKindTy` gives its render, without spelling a deep record whole (D9331).
 function sigDeclRecTokOfTy(pty: i32): string {
-  if pty < 0 || !(T.tys[pty] is TyObj) { return "" }
-  const nm = structNameOfTy(pty)
-  if nm == "" { return "" }
-  const si = structIndexByName(nm)
-  if si < 0 || repSlotOfTy(pty) != si { return "" }
+  const si = sigDeclRecSlotOfTy(pty)
+  if si < 0 { return "" }
   repSigSlotTokOfKind("struct", si)
+}
+
+// The struct row of record type `ty` when the declared record of its name owns that row, else -1.
+function sigDeclRecSlotOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyObj) { return -1 }
+  const nm = structNameOfTy(ty)
+  if nm == "" { return -1 }
+  const si = structIndexByName(nm)
+  if si < 0 || repSlotOfTy(ty) != si { return -1 }
+  si
+}
+
+// The `nulstruct` token of a nullable declared-record type, keyed by that record's row, or "":
+// the answer `annUnionSigKind` gives its `{..} | null` render, without spelling it (D9420).
+// "" when a row of the same field names may render alike, since the render's scan may pick it.
+function sigNulDeclRecTokOfTy(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  if !(t is TyNullable) { return "" }
+  const si = sigDeclRecSlotOfTy(t.nInner)
+  if si < 0 || !sigRowHasNoTwin(si) { return "" }
+  repSigSlotTokOfKind("nulstruct", si)
+}
+
+// Whether no other scanned row may match the render of row `si`'s record: none has its field
+// names with every nested-record field of `si` compatible, judged as the scan judges it.
+function sigRowHasNoTwin(si: i32): boolean {
+  if si < 0 || si >= sFieldStart.length || si >= sFieldCount.length {
+    return false
+  }
+  const lim = sScanLim()
+  let j = 0
+  while j < lim && j < sFieldCount.length && j < sFieldStart.length {
+    if j != si && sFieldCount[j] == sFieldCount[si] {
+      // A row whose fields are not all appended yet may still become a twin.
+      if sFieldStart[j] + sFieldCount[j] > sFieldNames.length { return false }
+      if sigRowMayMatch(si, j) { return false }
+    }
+    j = j + 1
+  }
+  true
+}
+
+// Whether row `j` has every field name of row `si`, each field possibly matching `si`'s.
+function sigRowMayMatch(si: i32, j: i32): boolean {
+  const start = sFieldStart[si]
+  const cnt = sFieldCount[si]
+  let k = 0
+  while k < cnt {
+    const fi = start + k
+    if fi < 0 || fi >= sFieldNames.length { return true }
+    const fj = sFieldIndex(j, sFieldNames[fi])
+    if fj < 0 { return false }
+    if !sigFieldMayMatch(fi, sFieldStart[j] + fj) { return false }
+    k = k + 1
+  }
+  true
+}
+
+// Whether a render of the field at flat index `fi` may match the field at `fj`: false only
+// for a nested record against a non-record field, or against one of another canonical record.
+function sigFieldMayMatch(fi: i32, fj: i32): boolean {
+  if fi >= sFieldTypes.length || fj < 0 || fj >= sFieldTypes.length {
+    return true
+  }
+  if sFieldTypes[fi] != FC_STRUCT { return true }
+  const cj = sFieldTypes[fj]
+  if cj == FC_UNION { return true }
+  if cj != FC_STRUCT { return false }
+  if fi >= sFieldElemName.length || fj >= sFieldElemName.length { return true }
+  const ki = sigElemCanonId(sFieldElemName[fi])
+  const kj = sigElemCanonId(sFieldElemName[fj])
+  ki < 0 || kj < 0 || ki == kj
+}
+
+// The canonical identity of a nested-record field's recorded element name, or -1.
+function sigElemCanonId(nm: string): i32 {
+  if nm == "" { return -1 }
+  const k = repNameCanonId(nm)
+  if k >= 0 { return k }
+  rowCanonIdOfName(nm)
+}
+
+// Whether `ty` is a list whose element is a bare union of declared records and value scalars:
+// its render spells each record by shape, which no ref-list slot is interned under, so
+// `annParamKindTy` gives it no token (D9422).
+function sigRecUnionListHasNoTok(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const t = T.tys[ty]
+  if !(t is TyArray) { return false }
+  const e = t.aElem
+  if e < 0 || e >= T.tys.length { return false }
+  const u = T.tys[e]
+  if !(u is TyUnion) { return false }
+  if sigRecScalarUnionTokOfTy(e) == "" { return false }
+  for m in u.uMembers {
+    if T.tys[m] is TyObj && (structNameOfTy(m) == "" || tyReachesSelf(m)) {
+      return false
+    }
+  }
+  true
 }
 
 // The box token of a union parameter, bare or nullable, whose members are renderable records
@@ -991,6 +1103,12 @@ function sigRecScalarUnionTokOfTy(pty: i32): string {
 export function sigRetTokOfTy(rty: i32): string {
   const raTok = retTokOfTy(rty)
   if raTok != "" { return raTok }
+  if !annTyIsLitUnion(rty) {
+    const ru = sigRecScalarUnionTokOfTy(rty)
+    if ru != "" { return ">" + ru }
+    const rn = sigNulDeclRecTokOfTy(rty)
+    if rn != "" { return ">" + rn }
+  }
   let rs = fnRetEmitName(rty)
   if rs == "" { return "" }
   const rt = T.tys[rty]
