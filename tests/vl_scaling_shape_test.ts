@@ -20,10 +20,11 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Six axes
+// every run, so the margin pays only for the compiler changing, not for the box. Seven axes
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep`, `diamond
-// record depth`, `diamond record depth under ==` —
+// record depth`, `diamond record depth under ==`, `diamond record depth under == with a list
+// leaf` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
 // multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
@@ -919,21 +920,23 @@ axis(
 );
 
 // The same 12-level diamond against its chain, through one use each: function type aliases
-// over it as record fields, `==` and `!=` over it, and an un-annotated `Map()` holding it.
-// Fuel reads 1.17, 2.28 and 1.30; master `0f0face1e` read 366, 88.5 and, at depth 8, 36.5.
-type DiamondUse = "fnAlias" | "eq" | "inferredMap";
+// over it as record fields, `==` and `!=` over it, the same with a list and a nullable leaf,
+// and an un-annotated `Map()` holding it. Fuel reads 1.17, 2.28, 2.28 and 1.30; master
+// `0f0face1e` read 366, 88.5, 151 and, at depth 8, 36.5.
+type DiamondUse = "fnAlias" | "eq" | "eqListLeaf" | "inferredMap";
 const genDiamondUse = (use: DiamondUse, n: number, diamond: boolean): string => {
   const r = (a: string, b: string) => (diamond ? a : b);
-  const o = ["type A0 = {x: i32}"];
+  const listLeaf = use == "eqListLeaf";
+  const o = [listLeaf ? "type A0 = {x: i32[], n: i32 | null}" : "type A0 = {x: i32}"];
   for (let i = 1; i <= n; i++) o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
   if (use == "fnAlias") {
     o.push(`type FF = (x: i32) => A${n}`, `type GG = (a: A${n}) => i32`, "type R = {f: FF, g: GG}");
     o.push("const fs: FF[] = []", "print(fs.length + 1)");
     return o.join("\n") + "\n";
   }
-  o.push("const a0: A0 = {x: 5}");
+  o.push(listLeaf ? "const a0: A0 = {x: [5], n: null}" : "const a0: A0 = {x: 5}");
   for (let i = 1; i <= n; i++) o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
-  if (use == "eq") o.push(`print(a${n} == a${n})`, `print(a${n} != a${n})`);
+  if (use == "eq" || listLeaf) o.push(`print(a${n} == a${n})`, `print(a${n} != a${n})`);
   else {
     o.push("const m = Map()", `m["k"] = a${n}`, 'const v = m["k"]');
     o.push(`if v != null { print(v${".l".repeat(n)}.x) }`);
@@ -955,6 +958,13 @@ axis(
   2.9,
   "`==` over a deep record compares inline per field path rather than through one helper per record type — `eqHelpReserve`, `isEquatable` or `eqListFieldPath` (D9935).",
   diamondUse("eq"),
+);
+
+axis(
+  "diamond record depth under == with a list leaf",
+  2.9,
+  "`==` over a deep record whose leaf holds a list or a nullable scalar compares inline per field path — `eqHelpFieldPaths` (wasmEmit.vl) or `eqHelpFnCode` (emit_sections.vl) (D9962).",
+  diamondUse("eqListLeaf"),
 );
 
 axis(

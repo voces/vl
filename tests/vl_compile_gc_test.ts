@@ -204,20 +204,10 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D9962's witness at depth 17, where it traps under the null collector: `==` over
-      // a record whose every level holds the one below twice and whose leaf is a list,
-      // whose inline comparison doubles per level and outgrows the largest object.
-      // When D9962 closes, move this to the next open trap under the null collector.
-      const lines = ["type A0 = {x: i32[]}"];
-      for (let i = 1; i <= 17; i++) {
-        lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
-      }
-      lines.push("const a0: A0 = {x: [1, 2]}");
-      for (let i = 1; i <= 17; i++) {
-        lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
-      }
-      lines.push("print(a17 == a17)");
-      await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
+      // An entry file past the null collector's 64 MiB object cap: the guest holds the
+      // source as one byte array, so the trap does not depend on any compiler defect
+      // staying open.
+      await Deno.writeTextFile(`${dir}/main.vl`, sourceOf(70 * 1024 * 1024));
       const r = await vl(
         ["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`],
         "null",

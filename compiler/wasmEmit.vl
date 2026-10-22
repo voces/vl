@@ -18697,8 +18697,8 @@ function emitStructEqNestedField(
 // than this many fields: the smallest a doubling record reaches at depth 5.
 const EQ_HELP_PATHS = 32
 
-// Per struct row, the leaf fields its inline compare reads, or -1 when a field needs a frame a
-// helper has no locals for; -2 marks a row being counted, so a recursive row declines.
+// Per struct row, the leaf fields its inline compare reads, or -1 when a field has no compare;
+// -2 marks a row being counted, so a recursive row declines.
 let eqHelpPaths: i32[] = []
 
 // Reserve a compare helper functype for every struct row worth one: the program spells `==`
@@ -18728,7 +18728,7 @@ export function eqHelpReserve() {
 }
 
 // The leaf fields struct row `si`'s compare reads, saturating at 2^20, or -1 when one of them
-// is not a scalar, a string or a nested struct that is itself helper-safe.
+// has no field compare or is a nested struct that is not itself helper-safe.
 function eqHelpPathsOf(si: i32): i32 {
   if si < 0 || si >= eqHelpPaths.length { return -1 }
   const memo = eqHelpPaths[si]
@@ -18747,17 +18747,27 @@ function eqHelpPathsOf(si: i32): i32 {
   total
 }
 
-// The leaf fields field `fi` of struct row `si` contributes to its compare, or -1.
+// The leaf fields field `fi` of struct row `si` contributes to its compare, or -1. A list,
+// union box or function field counts as one: the helper's frame holds what it stages (D9962).
 function eqHelpFieldPaths(si: i32, fi: i32): i32 {
   const code = sFieldTypeAt(si, fi)
-  if code == FC_NUL_NONE || code == FC_I32 || code == FC_NUL_BOOL { return 1 }
-  if code == FC_NUL_LIT_UNION || code == FC_F64 || code == FC_I64 { return 1 }
-  if code == FC_F32 { return 1 }
+  if code == FC_STRUCT { return eqHelpPathsOf(sFieldTgtStructIdx(si, fi)) }
   if code == FC_STR || code == FC_NUL_STR {
     if aUsed { return 1 }
     return -1
   }
-  if code == FC_STRUCT { return eqHelpPathsOf(sFieldTgtStructIdx(si, fi)) }
+  if code == FC_NUL_NONE || code == FC_I32 || code == FC_NUL_BOOL { return 1 }
+  if code == FC_NUL_LIT_UNION || code == FC_F64 || code == FC_I64 { return 1 }
+  if code == FC_F32 || code == FC_UNION || code == FC_CLOSURE { return 1 }
+  if code == FC_NUL_CLOSURE || code == FC_I32_LIST || code == FC_REF_LIST {
+    return 1
+  }
+  // Every other list code, nullable or not; a map field has no compare.
+  const inner = nulFieldInnerCode(code)
+  if inner == FC_I32_LIST || inner == FC_REF_LIST { return 1 }
+  if eqScalarListFieldKind(code) >= 0 || eqScalarListFieldKind(inner) >= 0 {
+    return 1
+  }
   -1
 }
 
@@ -18784,12 +18794,12 @@ export function eqHelpFuncType(si: i32) {
 
 export function eqHelpFnName(si: i32): string { "__eq_" + i32ToStr(si) + "__" }
 
-// The body of `__eq_<row>__`: both null equal, one null unequal, else the field-wise compare a
-// nested field would otherwise write inline, over the two params.
+// The instructions of `__eq_<row>__`, after its locals vector: both null equal, one null
+// unequal, else the field-wise compare a nested field would otherwise write inline, over the
+// two params. Its frame is laid out by the caller before this runs.
 export function eqHelpFnBody(si: i32): u8[] {
   const body: u8[] = []
   const prev = wTarget(body)
-  wULEB(0) // no locals beyond the two params
   const savedL = eqStashL
   const savedR = eqStashR
   const savedRec = eqChainRecover

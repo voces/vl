@@ -27,6 +27,7 @@ import {
 import {
   rowCanonIdOfName,
   sFieldElemNameAt,
+  sFieldTgtStructIdx,
   sFieldTypeAt,
   sIsAnonRow,
   sScanLim,
@@ -117,20 +118,27 @@ export function mvValRowOfShape(name: string): i32 {
     }
     // An anonymous row's codes are read off a literal, so they are exact and the strict scan
     // above already had its chance at them; only a declared row adopts.
-    if sFieldCount[si] == fnames.length && !sIsAnonRow(si) {
-      let ok = true
-      let k = 0
-      while k < fnames.length {
-        const fj = sFieldIndex(si, fnames[k])
-        if fj < 0 { ok = false }
-        else if !adoptedFieldCompat(ftypes[k], si, fj) { ok = false }
-        k = k + 1
-      }
-      if ok { return si }
-    }
+    if !sIsAnonRow(si) && shapeFieldsAdopt(fnames, ftypes, si) { return si }
     si = si + 1
   }
   -1
+}
+
+// Could a literal whose fields are named `fnames` and spelled `ftypes` be adopted into row `si`?
+function shapeFieldsAdopt(
+  fnames: string[],
+  ftypes: string[],
+  si: i32,
+): boolean {
+  if sFieldCount[si] != fnames.length { return false }
+  let k = 0
+  while k < fnames.length {
+    const fj = sFieldIndex(si, fnames[k])
+    if fj < 0 { return false }
+    if !adoptedFieldCompat(ftypes[k], si, fj) { return false }
+    k = k + 1
+  }
+  true
 }
 
 // Could a value of the field type spelled `t` be adopted into row `si`'s field `fj`?
@@ -140,9 +148,19 @@ export function mvValRowOfShape(name: string): i32 {
 function adoptedFieldCompat(t: string, si: i32, fj: i32): boolean {
   const want = fieldCodeForMatch(fieldElemTyIxOfName(t))
   const code = sFieldTypeAt(si, fj)
+  // A `null` field is a null reference, which a nested-struct slot holds: the node-side
+  // adopter builds `{next: null}` at a `next: Node | null` row (D9963).
+  if t == "null" && code == FC_STRUCT { return true }
   if want == code {
     if code == FC_STRUCT {
-      return nestedStructNamesCompat(t, sFieldElemNameAt(si, fj))
+      if nestedStructNamesCompat(t, sFieldElemNameAt(si, fj)) { return true }
+      // A nested literal is adopted into the field's own row as the outer one is (D9963).
+      const tgt = sFieldTgtStructIdx(si, fj)
+      if tgt < 0 || !nameIsWholeSpanShape(t) || sIsAnonRow(tgt) { return false }
+      const fnames: string[] = []
+      const ftypes: string[] = []
+      shapeFieldParse(t, fnames, ftypes)
+      return shapeFieldsAdopt(fnames, ftypes, tgt)
     }
     return true
   }
