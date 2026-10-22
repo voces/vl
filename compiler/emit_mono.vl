@@ -13019,6 +13019,9 @@ let mfrAliasWrites: {[i32]: i32[]} = Map()
 // Pairs `[a, b]` of literal roots read as one: a pushed list and a list it is spread into, or two
 // maps one binding is handed.
 let mfrTied: i32[] = []
+// Pairs `[binding, use]` of reads `monoFlowUsePlan` found naming no generic only because a value
+// they read is an alias of a literal slot this round may rewrite to one (D9652).
+let mfrPending: i32[] = []
 
 // Rewrites, in the program `stmts` and the bodies in `fnStmts`, every such read; -1 never.
 function monoFlowReads(stmts: i32[]): i32 {
@@ -13037,6 +13040,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrKeptTop = []
   mfrAliasWrites = Map()
   mfrTied = []
+  mfrPending = []
   const lets: i32[] = []
   const direct: i32[] = []
   const seen: {[i32]: boolean} = Map()
@@ -13852,6 +13856,7 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
     }
     i = i + 3
   }
+  monoFlowReplanPending(planned, through)
   i = 0
   while i < ps.length {
     through.push(ps[i])
@@ -13868,6 +13873,67 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
     i = i + 3
   }
   hosts
+}
+
+// Plans again, after this round's rewrites, each read of `mfrPending` whose clean binding is in
+// `planned`: a read now naming a generic is rewritten to it, and one that cannot be keeps its
+// binding in `through`, so the names its literal holds stay values a slot call reaches (D9652).
+function monoFlowReplanPending(planned: i32[], through: i32[]) {
+  const pend = mfrPending
+  mfrPending = []
+  let i = 0
+  while i + 1 < pend.length {
+    const d = pend[i]
+    if i32ListHas(planned, d) && monoFlowDeclClean(d) {
+      const reads: i32[] = []
+      const loops: i32[] = []
+      const spreads: i32[] = []
+      const ok = monoFlowUsePlan(
+        d,
+        pend[i + 1],
+        monoFlowDeclVals(d),
+        reads,
+        loops,
+        spreads,
+      )
+      let kept = !ok || loops.length > 0 || spreads.length > 0
+      let k = 0
+      while k + 1 < reads.length {
+        if !monoFlowReadSet(reads[k], reads[k + 1]) { kept = true }
+        k = k + 2
+      }
+      if kept || mfrPending.length > 0 { through.push(d) }
+      mfrPending = []
+    }
+    i = i + 2
+  }
+  0
+}
+
+// Whether `v` names an un-annotated `const` whose alias chain ends at an element or field read.
+function monoFlowAliasOfRead(v: i32): boolean {
+  let r = v
+  let hops = 0
+  while hops <= MONO_ALIAS_CHAIN_MAX {
+    if r < 0 || !(P.nodes[r] is Ident) { return false }
+    const g = identDeclOf(r)
+    if g < 0 { return false }
+    const ad = P.nodes[g]
+    if (
+      !(ad is LetDecl)
+      || ad.letKw != "const"
+      || ad.letType >= 0
+      || ad.letInit < 0
+    ) {
+      return false
+    }
+    r = unwrapParen(ad.letInit)
+    if r < 0 { return false }
+    const rn = P.nodes[r]
+    if rn is Index || rn is Member { return true }
+    hops = hops + 1
+  }
+  false
 }
 
 // Appends each pair of `pairs` to `out` as a triple led by binding `d`.
@@ -14022,7 +14088,16 @@ function monoFlowUsePlan(
     if path.length > 0 || !monoFlowCalledAt(cur) { return false }
   }
   const g = monoFlowCommonGen(cv)
-  if g == -1 { return true }
+  if g == -1 {
+    for v in cv {
+      if monoFlowAliasOfRead(v) {
+        mfrPending.push(d)
+        mfrPending.push(u)
+        return true
+      }
+    }
+    return true
+  }
   if g < 0 { return false }
   if viaMap {
     // A hole function read out of a map keeps the slot its pin types (D9064).
@@ -16509,9 +16584,37 @@ function monoStoredSlotFnTy(
 function monoValsInert(vals: i32[][]): boolean {
   if vals.length == 0 { return false }
   for vw in vals {
-    if !i32ListHas(monoInertValues, unwrapParen(vw[0])) { return false }
+    const x = unwrapParen(vw[0])
+    if !i32ListHas(monoInertValues, x) && !monoCallRetsInert(x) { return false }
   }
   true
+}
+
+// Whether `x` is a call of a function always returning one generic (`monoFlowCallLeaf`) whose
+// every `return` operand `monoFlowNoteCallRets` noted inert: the call runs, its value is uncalled.
+function monoCallRetsInert(x: i32): boolean {
+  if x < 0 || !(P.nodes[x] is Call) || monoFlowCallLeaf(x) < 0 { return false }
+  const cn = P.nodes[x]
+  if !(cn is Call) { return false }
+  const fd = identDeclOf(unwrapParen(cn.callFn))
+  if fd < 0 || fd >= P.nodes.length { return false }
+  const fnd = P.nodes[fd]
+  if !(fnd is FuncDecl) { return false }
+  const stack: i32[] = [fnd.fnBody]
+  let rets = 0
+  while stack.length > 0 {
+    const y = stack.pop()
+    const yn = P.nodes[y]
+    if yn is RetStmt {
+      if !i32ListHas(monoInertValues, unwrapParen(yn.retArg)) { return false }
+      rets = rets + 1
+    } else if !(yn is FuncDecl) {
+      for k in nodeChildren(y) {
+        if k >= 0 { stack.push(k) }
+      }
+    }
+  }
+  rets > 0
 }
 
 // The type a slot nothing calls holds its functions `vals` at, with its spelling pushed onto
