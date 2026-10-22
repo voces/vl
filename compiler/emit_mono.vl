@@ -65,7 +65,7 @@ import {
 } from "./check_emit_queries"
 import { bindOf, i32TyIx, tyIsGradualUnion } from "./check_leaf_steps"
 import { canonEmitName } from "./check_program"
-import { tyIsForeignGenericSig } from "./check_subst"
+import { topFnOwnerOf, tyIsForeignGenericSig } from "./check_subst"
 import {
   assignable,
   bindGenWalk,
@@ -75,6 +75,7 @@ import {
   holeLamRetAt,
   nameToTy,
   substTyDeep,
+  substTyDeepOf,
   subtractTy,
   tyProvesNonNull,
 } from "./check_relate_core"
@@ -376,6 +377,7 @@ import {
   monoAnonParamPinTy,
   monoArgInstFe,
   monoExactSubN,
+  monoExactSubOwn,
   monoExactSubRow,
   monoExactSubT,
   monoFieldReadTyIn,
@@ -399,6 +401,7 @@ import {
   monoOrigNode,
   monoParamPinTy,
   monoPinSubN,
+  monoPinSubOwn,
   monoPinSubRow,
   monoPinSubT,
   monoProgStmts,
@@ -520,8 +523,10 @@ import { sFieldIndex } from "./emit_struct_order"
 import {
   TY_WALK_DEPTH,
   exactBindWalk,
+  exactSubAt,
   holeNulStringPinTyOf,
   monoExactSubRowOf,
+  pinSubAt,
   pinSubOperandTyOf,
   tyCanonKey,
   tySameSpelled,
@@ -2627,7 +2632,7 @@ function monoSubstLetType(
         let sty = -1
         const origLet = nodeTyIxOf(letType)
         if origLet >= 0 {
-          const s2 = substTyDeep(origLet, bN, bT)
+          const s2 = monoSubstInst(origLet, bN, bT)
           if s2 >= 0 && s2 != origLet {
             if !tyHasTyVar(s2) { sty = s2 }
           }
@@ -2670,7 +2675,7 @@ function monoPushedListAnn(init: i32, bN: string[], bT: i32[]): i32 {
   const rt = nodeTyIxOf(u)
   if rt < 0 || rt >= T.tys.length || !tyHasTyVar(rt) { return -1 }
   if monoListLeaf(rt)[1] == 0 { return -1 }
-  const sj = substTyDeep(rt, bN, bT)
+  const sj = monoSubstInst(rt, bN, bT)
   if sj < 0 || sj >= T.tys.length || tyHasTyVar(sj) { return -1 }
   const sl = monoListLeaf(sj)
   if sl[1] == 0 { return -1 }
@@ -2921,10 +2926,7 @@ function monoIfChainRebuildPinned(
       // A join the checker kept apart as `T | C` is read at the pin wherever it goes (D2906), and
       // so is a `??` over one, whose result the checker re-joins without the mark (D3568).
       const tpu = tyIsTpJoinUnion(raw) || monoCoalOverTpJoin(c.ifCond, c.ifThen)
-      // A choice of generics joins at their open signature, which no binding here closes (D9160).
-      if tyIsForeignGenericSig(raw) {
-        pty = -1
-      } else if monoIfArmsAllTy(at, raw, bN, bT) {
+      if monoIfArmsAllTy(at, raw, bN, bT) {
         pty = monoPinnedTyOf(at, bN, bT)
         // Such a join is a union at the pin only as a box registered here.
         if tpu { pty = monoPinUnionBoxed(pty, false) }
@@ -2981,7 +2983,7 @@ function monoNulJoinMixesNumbers(raw: i32, bN: string[], bT: i32[]): boolean {
   let bare = false
   for m in ms {
     if m >= 0 && m < T.tys.length && T.tys[m] is TyVar {
-      const s = substTyDeep(m, bN, bT)
+      const s = monoSubstInst(m, bN, bT)
       const ns: i32[] = []
       flattenVariantsInto(nonNullTy(s), ns)
       for x in ns {
@@ -3054,7 +3056,7 @@ function monoHoleJoinPinTy(at: i32, bN: string[], bT: i32[]): i32 {
   const jN: string[] = []
   const jT: i32[] = []
   monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
-  const s = substTyDeep(nodeTyIxOf(at), jN, jT)
+  const s = monoSubstInst(nodeTyIxOf(at), jN, jT)
   if s < 0 || tyHasTyVar(s) { return p }
   s
 }
@@ -3267,7 +3269,7 @@ function monoPinArmSubst(ty: i32, bN: string[], bT: i32[]): i32 {
     xN = monoPinArmBN
     xT = monoPinArmBT
   }
-  let p = substTyDeep(ty, xN, xT)
+  let p = monoSubstInst(ty, xN, xT)
   if p >= 0 && tyHasTyVar(p) { p = monoDropUnboundMembers(p) }
   if p < 0 || tyHasTyVar(p) { return -1 }
   p
@@ -3323,8 +3325,8 @@ function monoArmTailIsTy(
     }
   }
   if !tyHasTyVar(vt) { return false }
-  const pv = substTyDeep(vt, bN, bT)
-  const pj = substTyDeep(ty, bN, bT)
+  const pv = monoSubstInst(vt, bN, bT)
+  const pj = monoSubstInst(ty, bN, bT)
   if pv < 0 || pj < 0 || tyHasTyVar(pv) || tyHasTyVar(pj) { return false }
   tyEq(pv, pj)
 }
@@ -3464,8 +3466,8 @@ function monoElseRemainderAt(ty: i32, bN: string[], bT: i32[]): i32 {
   const base = tvElseBase.get(ty)
   const tested = tvElseTested.get(ty)
   if base == null || tested == null { return -1 }
-  const sb = substTyDeep(base, bN, bT)
-  const sx = substTyDeep(tested, bN, bT)
+  const sb = monoSubstInst(base, bN, bT)
+  const sx = monoSubstInst(tested, bN, bT)
   if sb < 0 || sx < 0 || tyHasTyVar(sb) || tyHasTyVar(sx) { return -1 }
   subtractTy(sb, sx)
 }
@@ -3476,7 +3478,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
   if !tyHasTyVar(ty) { return ty }
   const rem = monoElseRemainderAt(ty, bN, bT)
   if rem >= 0 { return rem }
-  let st = substTyDeep(ty, bN, bT)
+  let st = monoSubstInst(ty, bN, bT)
   if (st < 0 || tyHasTyVar(st)) && monoPinHoleN.length > 0 {
     // A hole instance's list literal, element read and call of a function value are typed at
     // its holes, which `bN` does not name (D3066). A method's result is the receiver's to answer.
@@ -3487,7 +3489,7 @@ function monoPinnedTyOf(ix: i32, bN: string[], bT: i32[]): i32 {
       const jN: string[] = []
       const jT: i32[] = []
       monoJoinBinding(bN, bT, monoPinHoleN, monoPinHoleT, jN, jT)
-      st = substTyDeep(ty, jN, jT)
+      st = monoSubstInst(ty, jN, jT)
       // A record list's rows are the literal's own, which a pin re-type does not collect.
       if monoListElemHoldsObj(st) { return ty }
     }
@@ -3716,7 +3718,7 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   const isCall = P.nodes[unwrapParen(init)] is Call
   const t = nodeTyIxOf(unwrapParen(init))
   if !tyIsTpJoinUnion(t) { return -1 }
-  const st = substTyDeep(t, bN, bT)
+  const st = monoSubstInst(t, bN, bT)
   if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
   if T.tys[st] is TyUnion && monoListsLitMixed(st) {
     if isCall { return -1 }
@@ -3747,7 +3749,7 @@ function monoInitListsLitMixed(init: i32, bN: string[], bT: i32[]): boolean {
   if t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) || !tyHasTyVar(t) {
     return false
   }
-  const st = substTyDeep(t, bN, bT)
+  const st = monoSubstInst(t, bN, bT)
   st >= 0 && st < T.tys.length && T.tys[st] is TyUnion && monoListsLitMixed(st)
 }
 
@@ -3832,7 +3834,7 @@ function monoTpJoinListLitAnn(initIx: i32, bN: string[], bT: i32[]): i32 {
   if t < 0 || t >= T.tys.length { return -1 }
   const tt = T.tys[t]
   if !(tt is TyArray) || !tyIsTpJoinUnion(tt.aElem) { return -1 }
-  const st = substTyDeep(t, bN, bT)
+  const st = monoSubstInst(t, bN, bT)
   if st < 0 || st >= T.tys.length || tyHasTyVar(st) { return -1 }
   const sl = T.tys[st]
   if !(sl is TyArray) || sl.aElem < 0 { return -1 }
@@ -4369,7 +4371,7 @@ function monoSubstAnnNode(
       let sty = -1
       const orig = nodeTyIxOf(pty)
       if orig >= 0 {
-        const s2 = substTyDeep(orig, bN, bT)
+        const s2 = monoSubstInst(orig, bN, bT)
         if s2 >= 0 && s2 != orig {
           if !tyHasTyVar(s2) { sty = s2 }
         }
@@ -4443,7 +4445,7 @@ function monoLamParamPinAnn(
     if pi >= lt.fnParamTypes.length { return -1 }
     const pty = lt.fnParamTypes[pi]
     if pty < 0 || !tyHasTyVar(pty) { return -1 }
-    let st = substTyDeep(pty, bN, bT)
+    let st = monoSubstInst(pty, bN, bT)
     // A type variable of another declaration (the generic initializing the binding) is
     // pinned by the calls the lambda's value reaches in this instance (D7181).
     if st >= 0 && tyHasTyVar(st) { st = monoLamReachParamTy(fnIx, pi, bN, bT) }
@@ -4463,9 +4465,9 @@ function monoLamReachParamTy(fnIx: i32, pi: i32, bN: string[], bT: i32[]): i32 {
   if ct < 0 || ct >= T.tys.length { return -1 }
   const f = T.tys[ct]
   if f is TyFunc {
-    if pi < 0 { return substTyDeep(f.fnRet, bN, bT) }
+    if pi < 0 { return monoSubstInst(f.fnRet, bN, bT) }
     if pi < f.fnParamTypes.length {
-      return substTyDeep(f.fnParamTypes[pi], bN, bT)
+      return monoSubstInst(f.fnParamTypes[pi], bN, bT)
     }
   }
   -1
@@ -4712,7 +4714,7 @@ function monoLamPinRetAnn(fnIx: i32, nret: i32, bN: string[], bT: i32[]) {
     && (tyIsTpJoinUnion(kept) || tyIsArmedDeferredJoin(kept))
   if keptJoin { rty = kept }
   if rty >= 0 && tyHasTyVar(rty) {
-    let rs = substTyDeep(rty, bN, bT)
+    let rs = monoSubstInst(rty, bN, bT)
     if rs >= 0 && tyHasTyVar(rs) {
       const rr = monoLamReachParamTy(fnIx, -1, bN, bT)
       if rr >= 0 { rs = rr }
@@ -5863,7 +5865,11 @@ function monoPinFnValueTy(cur: i32, orig: i32, bN: string[], bT: i32[]): i32 {
   if ty < 0 || ty >= T.tys.length { return cur }
   if !(T.tys[ty] is TyFunc) { return cur }
   const st = monoPinnedTyOf(orig, bN, bT)
-  if st == ty { return cur }
+  // A read of a binding choosing open generics is coerced per delivery, so each instance
+  // takes a read of its own even where the pin leaves its type open (D9220).
+  if st == ty && !(tyHasTyVar(ty) && monoArgIsOpenFnChoice(orig, 0)) {
+    return cur
+  }
   let nx = cur
   if nx == orig { nx = monoExprRemake(orig, monoExprKids(orig)) }
   if nx == orig { return cur }
@@ -6654,7 +6660,7 @@ let monoCgcHoleT: i32[] = []
 // variable stays.
 function monoLamCallTy(t: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
-  const st = monoHoleTy(substTyDeep(t, monoCgcBN, monoCgcBT))
+  const st = monoHoleTy(monoSubstInst(t, monoCgcBN, monoCgcBT))
   if st < 0 || tyHasTyVar(st) { return t }
   st
 }
@@ -8141,10 +8147,7 @@ function monoCloneGenericCallsRaw(ix: i32) {
         const vi = mkIdent(n.identName, n.pos)
         lfNoteMinted(vi, ix)
         identFrom(vi, ix)
-        // A generic read at its own open signature keeps it: its type variables are the
-        // callee's, which the enclosing instance's same-named binding does not speak for (D9160).
-        const ot = nodeTyIxOf(ix)
-        const vt = if monoCalleeIsGeneric(ix) && tyIsForeignGenericSig(ot) { ot } else { monoLamCallTy(ot) }
+        const vt = monoLamCallTy(nodeTyIxOf(ix))
         if vt >= 0 { nodeTyRecord(vi, vt) }
         return vi
       }
@@ -9150,7 +9153,7 @@ function monoShPendFlush(
   }
   let i = from
   while i < monoShPendTag.length {
-    let ty = substTyDeep(nodeTyIxOf(monoShPendNode[i]), xN, xT)
+    let ty = monoSubstInst(nodeTyIxOf(monoShPendNode[i]), xN, xT)
     if ty >= 0 && tyHasTyVar(ty) { ty = -1 }
     if monoShPendTag[i] == unTyKeyTagParamList() { ty = tyStepElem(ty) }
     unTyKeyShadow(monoShPendTag[i], monoShPendName[i], ty)
@@ -9211,7 +9214,7 @@ function monoShRetTy(
   const xN: string[] = []
   const xT: i32[] = []
   monoShBindingOf(params, pinTys, bN, bT, xN, xT)
-  const t = substTyDeep(origRet, xN, xT)
+  const t = monoSubstInst(origRet, xN, xT)
   if t < 0 || tyHasTyVar(t) { return -1 }
   t
 }
@@ -9581,7 +9584,7 @@ function monoExactPinTyOf(t: i32, ctx: i32): i32 {
   if t < 0 || !tyHasTyVar(t) { return t }
   const row = monoExactSubRowOf(ctx)
   if row >= 0 && row < monoExactSubN.length {
-    const st = substTyDeep(t, monoExactSubN[row], monoExactSubT[row])
+    const st = exactSubAt(t, row)
     if st >= 0 && !tyHasTyVar(st) { return st }
   }
   monoPinSubTyOf(t, ctx)
@@ -9599,7 +9602,7 @@ function monoPinSubTyOf(t: i32, ctx: i32): i32 {
   while pos >= 0 && guard <= fnStmts.length {
     const row = monoPinSubRow.get(pos) ?? -1
     if row >= 0 && row < monoPinSubN.length {
-      const st = substTyDeep(cur, monoPinSubN[row], monoPinSubT[row])
+      const st = pinSubAt(cur, row)
       if st < 0 { return t }
       if !tyHasTyVar(st) { return st }
       cur = st
@@ -9665,12 +9668,15 @@ export function monoSubTablesReset() {
   monoExactSubRow = Map()
   monoExactSubN = []
   monoExactSubT = []
+  monoExactSubOwn = []
   monoHoleSubRow = Map()
   monoHoleSubN = []
   monoHoleSubT = []
   monoPinSubRow = Map()
   monoPinSubN = []
   monoPinSubT = []
+  monoPinSubOwn = []
+  monoInstOwn = ""
   monoArgInstFe = Map()
   monoOpenArgCall = 0 - 1
   monoOpenArgCallee = 0 - 1
@@ -9720,6 +9726,8 @@ function monoMakeInstance(
 ) {
   // A `K | (L | null)` pin softens without its null, so the instance keeps the nesting (D3504).
   const foldWas = substNullFoldOffFor(pinTys)
+  const ownWas = monoInstOwn
+  monoInstOwn = monoTemplateOwner(origFe)
   const rc = monoMakeInstanceGo(
     origFe,
     pinned,
@@ -9733,7 +9741,24 @@ function monoMakeInstance(
     cbFnNames,
   )
   substNullFoldRestore(foldWas)
+  monoInstOwn = ownWas
   rc
+}
+
+// The owner key of the template `monoMakeInstance` is instantiating: its bindings (`letBN`,
+// `exSubN`, the clone's `monoCgcBN`) substitute only that generic's own type variables.
+let monoInstOwn = ""
+
+// `substTyDeep` of an instance binding of the template being instantiated (D9190).
+function monoSubstInst(t: i32, bN: string[], bT: i32[]): i32 {
+  substTyDeepOf(t, bN, bT, monoInstOwn)
+}
+
+// The owner key of template slot `origFe`'s type parameters: its name when it is the top-level
+// declaration so named, else "" (a nested template's instance binds by name, as before).
+function monoTemplateOwner(origFe: i32): string {
+  if origFe < 0 || origFe >= monoOrigNode.length { return "" }
+  topFnOwnerOf(monoOrigNode[origFe])
 }
 
 // The instance registry key, `key` extended by the pins, the exact types a type-testing body
@@ -9915,7 +9940,7 @@ function monoMakeInstanceParams(
           // arguments substituted through the annotation name the union itself (D2679).
           let gateTy = pinTys[pj]
           if !monoTyHoldsRefArm(gateTy) && exBN.length > 0 {
-            const pst = substTyDeep(nodeTyIxOf(p3.parType), exBN, exBT)
+            const pst = monoSubstInst(nodeTyIxOf(p3.parType), exBN, exBT)
             if pst >= 0 && !tyHasTyVar(pst) { gateTy = pst }
           }
           if unABOn() > 0 { monoShParNode = p3.parType }
@@ -10063,7 +10088,7 @@ function monoMakeInstanceRetAnn(
         // The body's own binding column, and that agreement is the invariant: the registry
         // is keyed on the pins, so a result sourced elsewhere makes the instance a function
         // the key cannot see.
-        const sub2 = substTyDeep(origRet, letBN, letBT)
+        const sub2 = monoSubstInst(origRet, letBN, letBT)
         if sub2 >= 0 {
           if sub2 != origRet {
             // `substTyDeep`'s union arm dedupes and collapses, so a `T | string` at
@@ -10518,7 +10543,7 @@ function monoMakeInstanceRetJoin(
       if dft >= 0 && dft < T.tys.length {
         const dfn = T.tys[dft]
         if dfn is TyFunc {
-          const cr = substTyDeep(dfn.fnRet, letBN, letBT)
+          const cr = monoSubstInst(dfn.fnRet, letBN, letBT)
           if cr >= 0 && cr < T.tys.length && !tyHasTyVar(cr) {
             if T.tys[cr] is TyArray { pick = cr }
           }
@@ -10597,7 +10622,7 @@ function monoMakeInstanceRetChecked(
     if gft is TyFunc && tyIsGradualUnion(gft.fnRet) {
       monoGradualRetPinned = true
       if gNeed {
-        let grt = substTyDeep(gft.fnRet, letBN, letBT)
+        let grt = monoSubstInst(gft.fnRet, letBN, letBT)
         // A join kept apart over parameter holes is bound by the holes' binding (D3333).
         if grt >= 0 && tyHasTyVar(grt) {
           grt = monoHoleRetSubst(gft.fnRet, gft, params, letTyCol)
@@ -10637,7 +10662,7 @@ function monoMakeInstanceRetChecked(
         // type) is read at this instance's binding, as the body's own nodes are.
         let rty = ft.fnRet
         if rty >= 0 && tyHasTyVar(rty) {
-          rty = substTyDeep(rty, letBN, letBT)
+          rty = monoSubstInst(rty, letBN, letBT)
           if rty >= 0 && tyHasTyVar(rty) {
             rty = monoHoleRetSubst(rty, ft, params, letTyCol)
           }
@@ -11133,11 +11158,13 @@ function monoMakeInstanceRegister(
     monoExactSubRow.set(instFe, monoExactSubN.length)
     monoExactSubN.push(exSubN)
     monoExactSubT.push(exSubT)
+    monoExactSubOwn.push(monoInstOwn)
   }
   if letBN.length > 0 {
     monoPinSubRow.set(instFe, monoPinSubN.length)
     monoPinSubN.push(letBN)
     monoPinSubT.push(letBT)
+    monoPinSubOwn.push(monoInstOwn)
   }
   if instHoleN.length > 0 {
     monoHoleSubRow.set(instFe, monoHoleSubN.length)
@@ -18868,13 +18895,8 @@ function monoPinTyParamComposite(
   pinned.push(pinC)
   // A generic function value's own type still rides its type variables, so
   // it names no row this pin denotes; the substituted spelling is the answer.
-  // Nor does a value typed at a foreign generic's open signature, which this instance's
-  // same-named binding would otherwise close (D9160).
-  const argTy = monoArgPinTyIx(args[i], ctx)
-  let pinCTy = monoExactPinTyOf(argTy, ctx)
-  if pinCTy >= 0 && (tyHasTyVar(pinCTy) || tyIsForeignGenericSig(argTy)) {
-    pinCTy = -1
-  }
+  let pinCTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
+  if pinCTy >= 0 && tyHasTyVar(pinCTy) { pinCTy = -1 }
   pinTys.push(pinCTy)
   0
 }
