@@ -15698,6 +15698,8 @@ function monoObjFieldTy(t: i32, name: string): i32 {
 // are typed with it. -1 when the field is left alone, -2 when instancing a value is refused.
 function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
   const vx = unwrapParen(v)
+  // A call's open result is read at what its function returns (D9503).
+  if vx >= 0 && P.nodes[vx] is Call { monoCloseRetFnTy(vx, ctx) }
   const vt = nodeTyIxOf(vx)
   const et = monoContainerElemTy(vt)
   if vx < 0 || vt < 0 || vt >= T.tys.length || et < 0 || et >= T.tys.length {
@@ -15965,16 +15967,41 @@ function monoPinMapSlot(
       return -1
     }
     const elems: i32[][] = []
+    // A stored call is read at what its function returns (D9502).
+    let called = -1
     for s in stored {
-      const lit = P.nodes[unwrapParen(s[0])]
-      if !(lit is ArrayLit) { return -1 }
-      for e in lit.arrElems { elems.push([e, s[1]]) }
+      const sx = unwrapParen(s[0])
+      if sx < 0 || sx >= P.nodes.length { return -1 }
+      const lit = P.nodes[sx]
+      if lit is Call {
+        monoCloseRetFnTy(sx, s[1])
+        const ct = nodeTyIxOf(sx)
+        const cet = tyArrayElemIx(ct)
+        if monoTyOpen(ct) || cet < 0 || !(T.tys[cet] is TyFunc) { return -1 }
+        if called >= 0 && !tyEq(called, ct) { return -1 }
+        called = ct
+      } else if lit is ArrayLit {
+        for e in lit.arrElems { elems.push([e, s[1]]) }
+      } else {
+        return -1
+      }
     }
-    const sp: string[] = []
-    const ft = monoStoredSlotFnTy(lf, monoSlotPath(fld, ["v", "e"]), elems, sp)
-    if ft < 0 { return ft }
-    nv = mkArrayTy(ft)
-    vs = "(" + sp[0] + ")[]"
+    if called >= 0 && elems.length == 0 {
+      nv = called
+      vs = "(" + monoPinAnnSpelling(tyArrayElemIx(called)) + ")[]"
+    } else {
+      const sp: string[] = []
+      const ft = monoStoredSlotFnTy(
+        lf,
+        monoSlotPath(fld, ["v", "e"]),
+        elems,
+        sp,
+      )
+      if ft < 0 { return ft }
+      nv = mkArrayTy(ft)
+      if called >= 0 && !tyEq(called, nv) { return -1 }
+      vs = "(" + sp[0] + ")[]"
+    }
     for s in stored { monoRecordOpen(unwrapParen(s[0]), nv, s[1]) }
   } else if v is TyObj {
     const sp: string[] = []
@@ -17825,8 +17852,8 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
 }
 
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
-// read through a binding nothing re-points that is initialised from another, a list element or
-// a record field (D9173); -1 when none is found.
+// read through a binding initialised from another, a list element, a map value or a record
+// field, every value written there agreeing (D9173, D9502); -1 when none is found.
 function monoPinnedListAnnTy(recv: i32): i32 { monoPinnedAnnTyAt(recv, 0) }
 
 function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
@@ -17834,47 +17861,148 @@ function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
   if depth > 0 && !monoTyOpen(nodeTyIxOf(x)) { return nodeTyIxOf(x) }
   const xn = P.nodes[x]
-  if xn is Index {
-    const at = monoPinnedAnnTyAt(xn.idxArr, depth + 1)
-    if at < 0 || at >= T.tys.length { return -1 }
-    const a = T.tys[at]
-    if a is TyArray { return a.aElem }
-    return -1
-  }
+  if xn is Index { return monoPinnedElemAnnTy(xn, depth) }
   if xn is Member {
     return tyFieldTyOf(monoPinnedAnnTyAt(xn.memObj, depth + 1), xn.memProp)
   }
   if xn is Call { return monoPinnedRetAnnTy(xn, depth) }
+  if xn is ArrayLit {
+    let t = -1
+    for e in xn.arrElems {
+      if P.nodes[unwrapParen(e)] is Spread { return -1 }
+      t = monoPinnedAgree(t, monoPinnedAnnTyAt(e, depth + 1))
+      if t < 0 { return -1 }
+    }
+    if t < 0 { return -1 }
+    return mkArrayTy(t)
+  }
+  // A `??` whose fallback is an empty list reads at its left side.
+  if xn is BinExpr && xn.binOp == "??" {
+    const rx = unwrapParen(xn.binRight)
+    const lt = monoPinnedAnnTyAt(xn.binLeft, depth + 1)
+    if lt < 0 || rx < 0 { return -1 }
+    const rn = P.nodes[rx]
+    if rn is ArrayLit && rn.arrElems.length == 0 { return lt }
+    return monoPinnedAgree(lt, monoPinnedAnnTyAt(rx, depth + 1))
+  }
   if !(xn is Ident) { return -1 }
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = P.nodes[d]
   if !(dn is LetDecl) { return -1 }
   if dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
-  if dn.letInit < 0 || monoWritesOf("n:", d).length > 0 { return -1 }
-  monoPinnedAnnTyAt(dn.letInit, depth + 1)
+  if dn.letInit < 0 { return -1 }
+  let t = monoPinnedAnnTyAt(dn.letInit, depth + 1)
+  for w in monoWritesOf("n:", d) {
+    const wn = P.nodes[w]
+    if t < 0 || !(wn is BinExpr) { return -1 }
+    t = monoPinnedAgree(t, monoPinnedAnnTyAt(wn.binRight, depth + 1))
+  }
+  t
 }
 
-// `monoPinnedAnnTyAt` for call `c` of an un-annotated, non-generic declared function: the one
+// `monoPinnedAnnTyAt` for an element or map-value read `xn`: the container's element, agreeing
+// with every value written to an element of a container binding; an un-annotated `Map()` reads
+// at its writes alone.
+function monoPinnedElemAnnTy(xn: Index, depth: i32): i32 {
+  const b = unwrapParen(xn.idxArr)
+  let t = -1
+  let srcs: i32[] = []
+  let emptyMap = false
+  const d = if b >= 0 && P.nodes[b] is Ident { identDeclOf(b) } else { -1 }
+  if d >= 0 && d < P.nodes.length {
+    const dn = P.nodes[d]
+    if dn is LetDecl && dn.letType < 0 && dn.letInit >= 0 {
+      srcs = monoWritesOf("e:", d)
+      emptyMap = monoFlowMapOwner(unwrapParen(dn.letInit)) == d
+    }
+  }
+  if !emptyMap {
+    const at = monoPinnedAnnTyAt(xn.idxArr, depth + 1)
+    if at < 0 || at >= T.tys.length { return -1 }
+    const a = T.tys[at]
+    if a is TyArray { t = a.aElem }
+    else if a is TyMap { t = a.mVal }
+    else { return -1 }
+  } else if srcs.length == 0 {
+    return -1
+  }
+  for w in srcs {
+    const wn = P.nodes[w]
+    if !(wn is BinExpr) { return -1 }
+    t = monoPinnedAgree(t, monoPinnedAnnTyAt(wn.binRight, depth + 1))
+    if t < 0 { return -1 }
+  }
+  t
+}
+
+// The one type two pinned reads agree on, where `a` is -1 before the first; -1 when either has
+// none or they differ.
+function monoPinnedAgree(a: i32, b: i32): i32 {
+  if b < 0 { return -1 }
+  if a >= 0 && !tyEq(a, b) { return -1 }
+  b
+}
+
+// `monoPinnedAnnTyAt` for call `c` of an un-annotated declared function, generic or not: the one
 // type every value it returns reads at, a returned list literal of functions instanced at its
-// element's pin first, since the caller can be walked before the body (D9410); -1 when they
+// element's pin first, since the caller can be walked before the body (D9501); -1 when they
 // differ or one has none.
 function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
   const fd = monoCalleeDeclOf(c)
-  if fd < 0 || monoIsGenericDecl(fd) { return -1 }
+  if fd < 0 { return -1 }
   const fn = P.nodes[fd]
   if !(fn is FuncDecl) || fn.fnRet >= 0 { return -1 }
   let t = -1
   for r in monoFnRetArgs(fn) {
     if r >= 0 && !(P.nodes[r] is RetStmt) {
       const rx = monoRetListLitOf(r)
-      if rx >= 0 { monoRetFnListTy(rx, fd) }
-      const rt = monoPinnedAnnTyAt(r, depth + 1)
+      let pft = -9
+      if rx >= 0 { pft = monoRetFnListTy(rx, fd) }
+      let rt = monoPinnedAnnTyAt(r, depth + 1)
+      if rt < 0 && pft >= 0 { rt = mkArrayTy(pft) }
       if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
       t = rt
     }
   }
   t
+}
+
+// A call `ix` of an un-annotated function, or a list literal of such calls, whose open type holds
+// a function records the type `monoPinnedAnnTyAt` reads it at, so a caller's literal or argument
+// holding it has a shape (D9503, D9504).
+function monoCloseRetFnTy(ix: i32, ctx: i32) {
+  const t0 = nodeTyIxOf(ix)
+  if !monoTyOpen(t0) || !tyMayHoldFn(t0, 0) { return 0 }
+  const n = P.nodes[ix]
+  if n is ArrayLit {
+    if n.arrElems.length == 0 { return 0 }
+    for e in n.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 || !(P.nodes[ex] is Call) || monoRetSlotsSplit(ex) { return 0 }
+    }
+  } else if !(n is Call) || monoRetSlotsSplit(ix) {
+    return 0
+  }
+  const t = monoPinnedAnnTyAt(ix, 0)
+  if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
+  0
+}
+
+// Whether the call at `ix` returns a list literal whose element slot is pinned at more than one
+// signature, each read of it then delivered apart.
+function monoRetSlotsSplit(ix: i32): boolean {
+  const c = P.nodes[ix]
+  if !(c is Call) { return false }
+  const fd = monoCalleeDeclOf(c)
+  if fd < 0 { return false }
+  const fn = P.nodes[fd]
+  if !(fn is FuncDecl) { return false }
+  for r in monoFnRetArgs(fn) {
+    const rx = if r >= 0 { monoRetListLitOf(r) } else { -1 }
+    if rx >= 0 && monoDeclPathPins([fd, rx], ["e"]).length > 1 { return true }
+  }
+  false
 }
 
 // Whether un-annotated function node `fx` returns list literal `lit` (`monoRetListLitOf`).
@@ -21237,6 +21365,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if monoWalk(args[i], ctx) < 0 { return -1 }
         i = i + 1
       }
+      monoCloseRetFnTy(ix, ctx)
       if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
       if monoGenArgAtOpenParam(n, ctx) && monoOpenCallAtElems(n, ctx) < 0 {
         return -1
@@ -21436,6 +21565,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if monoWalk(es[i3], ctx) < 0 { return -1 }
         i3 = i3 + 1
       }
+      monoCloseRetFnTy(ix, ctx)
       return 0
     }
     ObjLit => {
@@ -23128,24 +23258,51 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   monoRetypePinCalls(d, noPath)
 }
 
-// The function type the returned list literal `x` of functions in frame `ctx` is instanced at
-// and now records as its element, from the one pin its element slot takes; -1 when it is no
-// such list or the slot has none, -2 when instancing is refused (D9410).
+// The element type the returned list literal `x` of functions, or of such lists, in frame `ctx`
+// is instanced at and now records, from the one pin its innermost slot takes; -1 when it is no
+// such list or the slot has none, -2 when instancing is refused (D9410, D9503).
 function monoRetFnListTy(x: i32, ctx: i32): i32 {
   const l = P.nodes[x]
-  if !(l is ArrayLit) || l.arrElems.length == 0 || !monoTyOpen(nodeTyIxOf(x)) {
-    return -1
-  }
+  if !(l is ArrayLit) || !monoTyOpen(nodeTyIxOf(x)) { return -1 }
+  const lits: i32[] = [x]
+  const et = monoRetLitElemTy(x, lits, ["e"], ctx, 0)
+  if et < 0 { return et }
+  monoRecordOpen(x, mkArrayTy(et), ctx)
+  et
+}
+
+// The element type of the list literals `lits`, the slot `path` of returned literal `x`: the
+// pinned function type, or each element's own list type when every element is a list literal.
+function monoRetLitElemTy(
+  x: i32,
+  lits: i32[],
+  path: string[],
+  ctx: i32,
+  depth: i32,
+): i32 {
+  if depth > TY_WALK_DEPTH { return -1 }
   const vals: i32[][] = []
-  for e in l.arrElems {
-    if P.nodes[unwrapParen(e)] is Spread { return -1 }
-    vals.push([e, ctx])
+  const inner: i32[] = []
+  for li in lits {
+    const l = P.nodes[li]
+    if !(l is ArrayLit) || l.arrElems.length == 0 { return -1 }
+    for e in l.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 || P.nodes[ex] is Spread { return -1 }
+      if P.nodes[ex] is ArrayLit { inner.push(ex) }
+      vals.push([e, ctx])
+    }
   }
-  const sp: string[] = []
-  const ft = monoStoredSlotFnTy([ctx, x], ["e"], vals, sp)
-  if ft < 0 { return ft }
-  monoRecordOpen(x, mkArrayTy(ft), ctx)
-  ft
+  if inner.length == 0 {
+    const sp: string[] = []
+    return monoStoredSlotFnTy([ctx, x], path, vals, sp)
+  }
+  if inner.length != vals.length { return -1 }
+  const et = monoRetLitElemTy(x, inner, monoPathWith(path, "e"), ctx, depth + 1)
+  if et < 0 { return et }
+  const lt = mkArrayTy(et)
+  for i in inner { monoRecordOpen(i, lt, ctx) }
+  lt
 }
 
 // A generic read `x` (keyed `d` in frame `fr`, at its slot `path`) that `ctx` returns past two
