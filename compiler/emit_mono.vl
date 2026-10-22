@@ -13117,6 +13117,8 @@ let mfrAnnLets: i32[] = []
 let mfrCalled: i32[] = []
 let mfrKeptIndex: i32[] = []
 let mfrKeptTop: i32[] = []
+// Each read rewritten from an element of a `let` list to a generic's name, to that `let` (D9980).
+let mfrListSrc: {[i32]: i32} = Map()
 let mfrAliasWrites: {[i32]: i32[]} = Map()
 // Pairs `[a, b]` of literal roots read as one: a pushed list and a list it is spread into, or two
 // maps one binding is handed.
@@ -13143,6 +13145,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrCalled = []
   mfrKeptIndex = []
   mfrKeptTop = []
+  mfrListSrc = Map()
   mfrAliasWrites = Map()
   mfrTied = []
   mfrPending = []
@@ -13786,6 +13789,7 @@ function monoFlowValsOf(x: i32, out: i32[]): boolean {
   }
   if n is Ident {
     const d = identDeclOf(v)
+    if d >= 0 && P.nodes[d] is ForIn { return monoFlowLoopVarVals(d, out) }
     if d < 0 || !(mfrCand[d] ?? false) { return false }
     const dv = monoFlowDeclVals(d)
     if dv.length == 0 { return false }
@@ -13840,6 +13844,29 @@ function monoFlowValsOf(x: i32, out: i32[]): boolean {
     if !monoFlowIsLit(fv) { return false }
     out.push(fv)
   }
+  true
+}
+
+// Appends to `out` the rows the variable of the one-variable loop `d` takes: each element of the
+// list literals its iterable holds, when every one is a list literal no push grows; false when it
+// may hold anything else (D9981).
+function monoFlowLoopVarVals(d: i32, out: i32[]): boolean {
+  const fi = P.nodes[d]
+  if !(fi is ForIn) || fi.fiVar2 != "" { return false }
+  const lists: i32[] = []
+  if !monoFlowValsOf(fi.fiIter, lists) || lists.length == 0 { return false }
+  const rows: i32[] = []
+  for l in lists {
+    const ln = P.nodes[l]
+    if !(ln is ArrayLit) || monoFlowListGrows(l, 0) { return false }
+    for e in ln.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 || !(P.nodes[ex] is ArrayLit) { return false }
+      rows.push(ex)
+    }
+  }
+  if rows.length == 0 { return false }
+  for r in rows { out.push(r) }
   true
 }
 
@@ -14992,6 +15019,14 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   const nm = monoFlowLeafName(g)
   if nm == "" || !monoFlowInScope(x, g) { return false }
   if i32ListHas(mfrKeptIndex, x) && !monoFlowKeepIndex(x) { return false }
+  const xn = P.nodes[x]
+  if xn is Index {
+    const a = unwrapParen(xn.idxArr)
+    if a >= 0 && P.nodes[a] is Ident {
+      const d = identDeclOf(a)
+      if d >= 0 && P.nodes[d] is LetDecl { mfrListSrc[x] = d }
+    }
+  }
   const n: Node = { identName: nm, pos: nodePos(x) }
   if monoFlowCalledAt(x) && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
   arenaSetNode(x, n)
@@ -20000,7 +20035,14 @@ function monoHoleGenFnPin(
     if an != "" && fl[1] >= 0 { monoPinOpenCallLams(fl[1], bt) }
     return an
   }
-  const ft = monoHoleGenFnFlowTy(argIx, fl)
+  let ft = monoHoleGenFnFlowTy(argIx, fl)
+  if ft < 0 {
+    ft = monoListSrcElemTy(argIx)
+    if ft >= 0 {
+      const ePath: string[] = ["e"]
+      monoRetypePinCalls(mfrListSrc[unwrapParen(argIx)] ?? -1, ePath)
+    }
+  }
   // The plan decides whether the hole is called at two types; the flow pins may stop at a
   // recursive forward before they reach both (D6091).
   if ft < 0 && fl[1] >= 0 {
@@ -20011,6 +20053,23 @@ function monoHoleGenFnPin(
       && monoHoleOwnCallsDiffer(fl[1], pIx)
   }
   monoFnPinAt(argIx, ctx, ft, fl[1], tyOut)
+}
+
+// The closed function type at which the `let` list holding rewritten read `argIx`'s element is
+// pinned (`monoPinListElems`): the flow table keeps the read's pins on the list's slot, not on the
+// generic it now names. -1 for any other read (D9980).
+function monoListSrcElemTy(argIx: i32): i32 {
+  const ax = unwrapParen(argIx)
+  if ax < 0 { return -1 }
+  const d = mfrListSrc[ax] ?? -1
+  if d < 0 { return -1 }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) || dn.letType < 0 { return -1 }
+  const lt = nodeTyIxOf(dn.letType)
+  if lt < 0 || lt >= T.tys.length || !(T.tys[lt] is TyArray) { return -1 }
+  const et = tyArrayElemIx(lt)
+  if !monoTyClosedFn(et) || tyHasTyVar(et) { return -1 }
+  et
 }
 
 // Whether two of the calls pinning the slot of `d` call the hole `pIx` itself, at different
@@ -21278,6 +21337,9 @@ function monoPinnedListElemPin(ax: i32, out: i32[]): string {
   if !monoTyClosedFn(et) { return "" }
   // arena-tick exempt: the caller's local out-parameter, never read by a rebuild pass.
   out[0] = et
+  // A call the read reaches past its callee, `g(5)` after `const g = id(v[k])`, takes the pin (D9980).
+  const ePath: string[] = ["e"]
+  monoRetypePinCalls(d, ePath)
   monoPinAnnSpelling(et)
 }
 

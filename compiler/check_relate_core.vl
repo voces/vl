@@ -4168,6 +4168,57 @@ function genFnHoleCallOwn(
   1
 }
 
+// The closed result of the un-annotated function `a` names, typed `cbTy`, called at function
+// element `el` as a direct call `ap(v[0])` types it: its body read with its parameter bound to the
+// element (D9862). `cbRet` when `a` names no single function or the result stays open.
+export function holeCbRetAtElem(a: i32, cbTy: i32, el: i32, cbRet: i32): i32 {
+  const d = holeFnArgDecl(a)
+  if d < 0 || el < 0 || el >= T.tys.length || !(T.tys[el] is TyFunc) {
+    return cbRet
+  }
+  if cbTy < 0 || cbTy >= T.tys.length { return cbRet }
+  const cb = T.tys[cbTy]
+  if !(cb is TyFunc) || cb.fnParamTypes.length != 1 { return cbRet }
+  const bNames: string[] = []
+  const bTys: i32[] = []
+  bindGenWalk(cb.fnParamTypes[0], el, bNames, bTys)
+  if bNames.length == 0 || holeFnArgDepth >= HOLE_CALL_NODE_MAX { return cbRet }
+  holeFnArgDepth = holeFnArgDepth + 1
+  const r = holeRetTyOf(d, bNames, bTys)
+  holeFnArgDepth = holeFnArgDepth - 1
+  if r < 0 || tyHasTyVar(r) { return cbRet }
+  r
+}
+
+// The type of `.map` call `n` in `calleeFn`'s body under the call's bindings, its named
+// un-annotated callback read at the receiver's bound element (D9862); -1 for any other call or
+// when the result stays open.
+function holeMapNodeTy(
+  n: Call,
+  vNames: string[],
+  vTys: i32[],
+  calleeFn: i32,
+  depth: i32,
+): i32 {
+  if n.callArgs.length != 1 || n.callFn < 0 || n.callFn >= P.nodes.length {
+    return -1
+  }
+  const m = P.nodes[n.callFn]
+  if !(m is Member) || m.memProp != "map" { return -1 }
+  // The element may be an un-annotated function's own open signature, which the body still reads.
+  let rt = holeCallNodeTy(m.memObj, vNames, vTys, calleeFn, depth + 1)
+  if rt < 0 { rt = substTyDeep(nodeTyOf(parenPeelIx(m.memObj)), vNames, vTys) }
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  const ra = T.tys[rt]
+  if !(ra is TyArray) { return -1 }
+  const cb = n.callArgs[0]
+  const cbTy = nodeTyOf(cb)
+  let r = holeFnArgRetAtParams(cb, [ra.aElem])
+  if r < 0 { r = holeCbRetAtElem(cb, cbTy, ra.aElem, -1) }
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  mkArrayTy(r)
+}
+
 // How deep `holeCallNodeTy` follows calls nested in calls.
 const HOLE_CALL_NODE_MAX = 8
 
@@ -4209,6 +4260,10 @@ function holeCallNodeTy(
   }
   if n is BinExpr {
     return holeArithNodeTy(n, ix, vNames, vTys, calleeFn, depth)
+  }
+  if n is Call {
+    const mt = holeMapNodeTy(n, vNames, vTys, calleeFn, depth)
+    if mt >= 0 { return mt }
   }
   const t = substTyDeep(nodeTyOf(ix), vNames, vTys)
   if t < 0 || tyHasTyVar(t) || tyIsDeferredJoin(t) { return -1 }
