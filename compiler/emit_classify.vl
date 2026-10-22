@@ -1357,7 +1357,7 @@ export function cloRetValSlot(fe: i32) {
       }
       // A `: {[string]: V}` annotated map result — the slot is the map shape (-1 when mono,
       // else the value type's mv slot), so the `$fnsig` result selects this map's struct.
-      if k == "map" { return mapAnnShape(fn.fnRet) }
+      if k == "map" || k == "nulmap" { return mapAnnShape(fn.fnRet) }
       return -1
     }
     // The slot half of `cloRetValKind`'s assignment-cell arm, read from the same cell,
@@ -1387,13 +1387,17 @@ export function cloRetValSlot(fe: i32) {
         const mrx = fnRetExprOf(fnStmts[fe])
         if mrx >= 0 { return mapRetExprShape(mrx, fe) }
       }
+      // An inferred nullable-map return — the slot the function's own functype result reads.
+      "nulmap" => {
+        return inferredRetMapSlot(fe)
+      }
       // An inferred ref-list return — its element name (`fRetRArrElem`, set by the
       // return-classify scan) resolves the ref-list slot.
       "reflist" => {
         return rlSlotByName(fRetRArrElem[fe])
       }
       // Every other inferred kind carries no slot.
-      "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulmap" | "nulnone" | "u8list" | "v128" => {}
+      "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulnone" | "u8list" | "v128" => {}
     }
   }
   -1
@@ -1420,7 +1424,9 @@ export function cloRetKeySuffix(fe: i32) {
   // A map result carries its map shape slot, so two map-returning closures share a
   // `$fnsig` exactly when their value types match and the result `(ref $mapStruct)` is the
   // heap type the returned map and the closure's env field both carry.
-  if k == "map" { return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe)) }
+  if k == "map" || k == "nulmap" {
+    return ">" + repSigSlotTokOfKind(k, cloRetValSlot(fe))
+  }
   // A ref-list result: the `$fnsig` result is the ref-list wrapper ref, recovered non-null
   // at the value-call site like every other ref result — the dual of the `r<idx>;` param
   // token. No resolved slot means no sig.
@@ -2210,6 +2216,7 @@ export function exprNullableList(exprIx: i32, fnIx: i32) {
       // narrows with `if t0 != null`.
       return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nullist"
     }
+    return cloValueCallRetKind(exprIx, fnIx) == "nullist"
   }
   // `u as? i32[]` out of a union box yields the arm's list or null.
   if e is AsExpr {
@@ -2587,6 +2594,8 @@ export function exprNulScalarListKind(exprIx: i32, fnIx: i32): VKind | null {
       const cvk = calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn)
       if isNulScalarListKind(cvk) { return cvk }
     }
+    const ovk = cloValueCallRetKind(exprIx, fnIx)
+    if isNulScalarListKind(ovk) { return ovk }
   }
   // A field read of a nullable distinct-backing scalar list (codes 31 to 34) yields the
   // leaf's `(ref null $wrapper)`, so an un-annotated `const l = s.f` binds the matching
@@ -13786,10 +13795,10 @@ export function identCellVKind(exprIx: i32, fnIx: i32): VKind | null {
   null
 }
 
-// D1576 — is this expression's value the `null` type, whose rep is `nullref`? Two producers
-// mint the same value: a never-filled `let x = null` binding, and a call to a function whose
-// every returned value is a bare `null`. The one home, so consumers that must treat the
-// value as statically null ask once. An indirect call is deliberately not claimed.
+// D1576 — is this expression's value the `null` type, whose rep is `nullref`? Producers: a
+// never-filled `let x = null` binding, a call to a function whose every return is a bare
+// `null`, and a call through a function value whose `$fnsig` result token is `Z`. The one home,
+// so consumers that must treat the value as statically null ask once.
 export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
   if exprIx < 0 { return false }
   const e = P.nodes[unwrapParen(exprIx)]
@@ -13798,6 +13807,10 @@ export function exprIsNulNone(exprIx: i32, fnIx: i32): boolean {
     if cf is Ident {
       const t = fnIndexOfNode(e.callFn)
       if t >= 0 { return repOfFnSlot(t).rdKind == "nulnone" }
+      return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulnone"
+    }
+    if cloValueCallRetKind(unwrapParen(exprIx), fnIx) == "nulnone" {
+      return true
     }
     // A `null[]`'s `pop` and `get` hand back its element, and a `null`-valued map's `get` its value.
     if cf is Member {
@@ -19227,7 +19240,9 @@ export function exprNullableMap(exprIx: i32, fnIx: i32) {
             return repOfFnSlot(target).rdKind == "nulmap"
           }
         }
+        return calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn) == "nulmap"
       }
+      return cloValueCallRetKind(exprIx, fnIx) == "nulmap"
     }
     // No other expression is a nullable map by its own form.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
@@ -19682,6 +19697,19 @@ export function mapShapeOfExpr(exprIx: i32, fnIx: i32) {
       // map's mv slot); a `Map()` constructor is the mono map (-1).
       const fe = fnIndexOfNode(e.callFn)
       if fe >= 0 { return fnRetMapShapeAt(sidOfNode(e.callFn), exprIx) }
+    }
+    // A call through a function value lands in its `$fnsig` result's map shape.
+    const vrk = cloValueCallRetKind(exprIx, fnIx)
+    if vrk == "map" || vrk == "nulmap" {
+      return sigKeyRetSlot(cloCallSigKey(exprIx, fnIx))
+    }
+    if callee is Ident && fnIndexOfNode(e.callFn) < 0 {
+      const ivk = calleeRetKindAt(sidOfNode(e.callFn), fnIx, e.callFn)
+      if ivk == "map" || ivk == "nulmap" {
+        return sigKeyRetSlot(
+          calleeCloSigKeyAt(sidOfNode(e.callFn), fnIx, e.callFn),
+        )
+      }
     }
     // An i32-keyed constructor/factory result: the key comes off the call's own recorded
     // type, paired with the value below rather than short-circuiting to the mono sentinel.
@@ -20803,6 +20831,25 @@ function calleeReturnsStructIdxAt(sid: i32, fnIx: i32, atIx: i32) {
 // `calleeCloSigKeyAt` so two sibling blocks binding one name resolve the call's own (D2316).
 function calleeRetKindAt(sid: i32, fnIx: i32, atIx: i32): VKind | null {
   return sigKeyRetKind(calleeCloSigKeyAt(sid, fnIx, atIx))
+}
+
+// The result kind of a call through a function value reached by an index, a record field, a
+// returned function or a parenthesised lambda, off its `$fnsig` key's result token; `null`
+// for any other callee, an `Ident` among them (those resolve through `calleeRetKindAt`).
+function cloValueCallRetKind(callIx: i32, fnIx: i32): VKind | null {
+  const c = P.nodes[callIx]
+  if c is Call {
+    const cfx = unwrapParen(c.callFn)
+    if cfx < 0 { return null }
+    const cre = P.nodes[cfx]
+    if cre is Member {
+      if !memberIsClosure(cre.memObj, cre.memProp, fnIx) { return null }
+    } else if !(cre is Index || cre is Call || cre is FuncDecl) {
+      return null
+    }
+    return sigKeyRetKind(cloCallSigKey(callIx, fnIx))
+  }
+  null
 }
 
 // The result value-kind of a call whose callee is an index into a closure array (`fs[i](x)`):
