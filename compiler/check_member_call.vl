@@ -2,6 +2,9 @@
 // function, or a free function reached by UFCS, with overload and hole-typed callees.
 
 import { ctnWrRecvPut } from "./check_decl_scan"
+import { lmReadAt } from "./check_access"
+import { lmValTy } from "./check_annot_resolve"
+import { lmMembers, luOwnRecv } from "./check_list_union"
 import {
   Call,
   FuncDecl,
@@ -761,6 +764,32 @@ function ufcsRevalidatePins(
   validateUfcsCstrs(bNames, bTys, ix, fnDeclIx[name] ?? CSTR_NODECL, plainName)
 }
 
+// `recv.get(k)`, `.has(k)` or `.keys()` over a union of maps whose keys agree, read member by
+// member (`lmReadAt`); -1 for any other call, a write among them.
+function lmCallAt(
+  n: Call,
+  ix: i32,
+  recvIx: i32,
+  prop: string,
+  recvTy: i32,
+): i32 {
+  if luOwnRecv(recvIx) { return -1 }
+  const ms = lmMembers(recvTy)
+  if ms.length == 0 { return -1 }
+  const m0 = T.tys[ms[0]]
+  if !(m0 is TyMap) { return -1 }
+  let res = -1
+  const argc = n.callArgs.length
+  if prop == "has" && argc == 1 { res = TY_BOOL }
+  if prop == "keys" && argc == 0 { res = mkArrayTy(m0.mKey) }
+  if prop == "get" && argc == 1 && m0.mSet == 0 {
+    const v = lmValTy(ms)
+    if v >= 0 { res = mkNullableTy(v) }
+  }
+  if res < 0 { return -1 }
+  lmReadAt(ix, recvIx, recvTy, ms, 2, prop, n.callArgs, res, n.pos)
+}
+
 // Method call on a member callee (`xs.push(e)`, `m.get(k)`, `s.slice(a)`): types the
 // builtin receiver kinds directly, never as a struct field read. Returns the call type,
 // or `-1` when no builtin arm claims it and the caller falls through to the field/UFCS
@@ -817,6 +846,10 @@ export function checkMemberCallNode(
   }
   if recvTy < 0 || recvTy >= T.tys.length { return -1 }
   rt = T.tys[recvTy]
+  if rt is TyUnion && recvPre < 0 {
+    const lmc = lmCallAt(n, ix, recvIx, prop, recvTy)
+    if lmc >= 0 { return lmc }
+  }
   // Banked for the emitter's rewrite, which must take the rung this call took (D2476).
   if builtinMethodClaims(recvTy, prop) {
     memberCallRungAdd(ix, MC_RUNG_BUILTIN)

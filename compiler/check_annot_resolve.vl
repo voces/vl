@@ -117,11 +117,13 @@ import {
   TY_NEVER,
   TyArray,
   TyFunc,
+  TyMap,
   TyNullable,
   TyUnion,
   cUserTypes,
   cUserTypesVer,
   mkMapTy,
+  mkNullableTy,
   tyEq,
   tySame,
   tyToEmitName,
@@ -569,6 +571,85 @@ export function luElemTy(ms: i32[]): i32 {
     return -1
   }
   e
+}
+
+// The union of the map members' value types, kept apart as `luElemTy` keeps elements; -1 when
+// they have no union.
+export function lmValTy(ms: i32[]): i32 {
+  let e = -1
+  for m in ms {
+    const a = T.tys[m]
+    if a is TyMap {
+      if e < 0 { e = a.mVal } else { e = joinVariantTys(e, a.mVal) }
+    }
+  }
+  if e == TY_ERR {
+    joinClashMsgSet("")
+    return -1
+  }
+  e
+}
+
+// One arm's read over map `recv`: kind 0 its `.length`, 1 the index `recv[args[0]]`, 2 the
+// call `recv.prop(args…)`, delivered through a `const` at the read's union type `res`. A value
+// read of member `mem` is first bound at its own `V | null`, whose miss then widens as a null.
+function lmArm(
+  recv: string,
+  mem: i32,
+  kind: i32,
+  prop: string,
+  args: string[],
+  res: i32,
+  site: i32,
+  pos: i32,
+): i32 {
+  const stmts: i32[] = []
+  let rd = -1
+  if kind == 0 {
+    rd = luAt(mkMember(luRef(recv, site, pos), "length", pos), site)
+  } else if kind == 1 {
+    rd = luAt(
+      mkIndex(luRef(recv, site, pos), luRef(args[0], site, pos), pos),
+      site,
+    )
+  } else {
+    const cargs: i32[] = []
+    for a in args { cargs.push(luRef(a, site, pos)) }
+    const callee = luAt(mkMember(luRef(recv, site, pos), prop, pos), site)
+    rd = luAt(mkCall(callee, cargs, pos), site)
+  }
+  const mt = T.tys[mem]
+  if mt is TyMap && (kind == 1 || prop == "get") {
+    const own = mkNullableTy(mt.mVal)
+    if luSpell(own) != "" {
+      const otmp = "$lo" + i32ToStr(site)
+      stmts.push(luDecl("const", otmp, own, rd, site, pos))
+      rd = luRef(otmp, site, pos)
+    }
+  }
+  const tmp = "$le" + i32ToStr(site)
+  stmts.push(luDecl("const", tmp, res, rd, site, pos))
+  stmts.push(luRef(tmp, site, pos))
+  luAt(mkBlock(stmts, pos), site)
+}
+
+// The `is` chain over map `recv`'s members from `k` on, as `luChain`, each arm an `lmArm`.
+export function lmChain(
+  ms: i32[],
+  k: i32,
+  recv: string,
+  kind: i32,
+  prop: string,
+  args: string[],
+  res: i32,
+  site: i32,
+  pos: i32,
+): i32 {
+  const arm = lmArm(recv, ms[k], kind, prop, args, res, site, pos)
+  if k >= ms.length - 1 { return arm }
+  const test = luAt(mkIsExpr(luRef(recv, site, pos), luSpell(ms[k]), pos), site)
+  const rest = lmChain(ms, k + 1, recv, kind, prop, args, res, site, pos)
+  luAt(mkIf(test, arm, rest, pos), site)
 }
 
 // The spelling the rewrite names `ty` by in an `is` test or an annotation: the first of its
