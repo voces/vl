@@ -13928,6 +13928,10 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyArray && !tyHasTyVar(rt) {
     return 0
   }
+  if repoints.length == 0 {
+    const nr = monoPinNestedListElems(d, lf, lit)
+    if nr != 0 { return if nr < 0 { -1 } else { 0 } }
+  }
   const path: string[] = ["e"]
   const pins = monoDeclPathPins(lf, path)
   if pins.length > 1 {
@@ -14060,6 +14064,63 @@ function monoListStoresAgree(
   true
 }
 
+// Gives the un-annotated list `d` (`lf`) of list literals of functions, written nowhere, the
+// function type the flow table pins the inner element at, as `monoPinListElems` does one level
+// down (D9173): 1 when pinned, 0 when left alone, -1 when an instance is refused.
+function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
+  const ctx = lf[0]
+  const at = lf[1]
+  if lit.arrElems.length == 0 || monoFrameIsGenericInstance(ctx) { return 0 }
+  if monoWritesOf("e:", at).length > 0 { return 0 }
+  const inner: i32[] = []
+  const vals: i32[] = []
+  for e in lit.arrElems {
+    const x = unwrapParen(e)
+    if x < 0 || x >= P.nodes.length { return 0 }
+    const il = P.nodes[x]
+    if !(il is ArrayLit) || il.arrElems.length == 0 { return 0 }
+    inner.push(x)
+    for v in il.arrElems { vals.push(v) }
+  }
+  const pins = monoDeclPathPins(lf, ["e", "e"])
+  if pins.length != 1 { return 0 }
+  const ann = monoSigFnTyName(pins[0] + ";")
+  let pre = -1
+  for v in vals {
+    const r = monoValueAtAnnTy(v, ann)
+    if r >= 0 && pre >= 0 && sigKeyOfTy(r) != sigKeyOfTy(pre) { return 0 }
+    if r >= 0 { pre = r }
+  }
+  let ft = -1
+  for v in vals {
+    monoLastInstFe = -1
+    const et0 = nodeTyIxOf(v)
+    if monoCoerceFnValueName(v, ann, ctx, -1) < 0 { return -1 }
+    if ft < 0 && monoLastInstFe >= 0 {
+      const st = monoPinSubTyOf(nodeTyIxOf(v), fnStmts[monoLastInstFe])
+      if monoTyClosedFn(st) { ft = st }
+    }
+    const et = nodeTyIxOf(v)
+    if ft < 0 && monoTyClosedFn(et) { ft = et }
+    if ft < 0 { ft = monoHoleLamAtAnnTy(et0, ann) }
+  }
+  if !monoTyClosedFn(ft) { return 0 }
+  const fty = T.tys[ft]
+  if !(fty is TyFunc) { return 0 }
+  const it = mkArrayTy(ft)
+  const lt = mkArrayTy(it)
+  const fnm = monoSigFnTyNameAt(pins[0] + ";", fty)
+  d.letType = synthTypeRefTy("(" + fnm + ")[][]", -1, lt)
+  monoArenaTouch()
+  nodeTyRecord(d.letInit, lt)
+  for x in inner { nodeTyRecord(x, it) }
+  for v in vals {
+    const et = nodeTyIxOf(v)
+    if et < 0 || tyHasTyVar(et) { nodeTyRecord(v, ft) }
+  }
+  1
+}
+
 // Gives the un-annotated list `d` (`lf`) of record literals, whose element the checker left open
 // at a record of functions, the record type the flow table pins each function field at
 // (`monoPinStoredRecords`), over its elements, the elements its `repoints` hold and the record
@@ -14107,7 +14168,8 @@ function monoPinListRecords(d: LetDecl, lf: i32[], repoints: i32[]): i32 {
 }
 
 // The list literals the `let` `d` (`lf`, `monoReadLetFrame`) is re-pointed to, each followed by
-// the frame its write runs in; `[-1]` when a re-pointing write stores anything else.
+// the frame it is evaluated in; a re-point to another list binding gives that binding's literal
+// (`monoRepointBindingLit`). `[-1]` when a re-pointing write stores anything else.
 function monoLetRepointLits(d: LetDecl, lf: i32[]): i32[] {
   const out: i32[] = []
   if d.letKw != "let" { return out }
@@ -14116,14 +14178,43 @@ function monoLetRepointLits(d: LetDecl, lf: i32[]): i32[] {
     const wf = monoLetWriteFrame(lf, w)
     if wn is BinExpr && wf.length == 1 {
       const v = unwrapParen(wn.binRight)
-      if v < 0 || !(P.nodes[v] is ArrayLit) {
+      const bl = monoRepointBindingLit(v, wf[0], lf[1])
+      if bl.length == 2 {
+        out.push(bl[0])
+        out.push(bl[1])
+      } else if v < 0 || !(P.nodes[v] is ArrayLit) {
         const no: i32[] = [0 - 1]
         return no
+      } else {
+        out.push(v)
+        out.push(wf[0])
       }
-      out.push(v)
-      out.push(wf[0])
     }
   }
+  out
+}
+
+// The list literal initialising the list binding the `Ident` at `v` names (read in frame
+// `ctx`), and that declaration's frame, when nothing writes the binding or its elements and it is
+// not the binding `self`; `[]` otherwise (D9170).
+function monoRepointBindingLit(v: i32, ctx: i32, self: i32): i32[] {
+  const none: i32[] = []
+  if v < 0 || v >= P.nodes.length || !(P.nodes[v] is Ident) { return none }
+  const sf = monoReadLetFrame(v, ctx)
+  if sf[1] < 0 || sf[1] == self { return none }
+  const sd = P.nodes[sf[1]]
+  if !(sd is LetDecl) || sd.letInit < 0 { return none }
+  const li = unwrapParen(sd.letInit)
+  if li < 0 || !(P.nodes[li] is ArrayLit) || monoGeneratedCellElem(li) >= 0 {
+    return none
+  }
+  if (
+    monoWritesOf("n:", sf[1]).length > 0
+    || monoWritesOf("e:", sf[1]).length > 0
+  ) {
+    return none
+  }
+  const out: i32[] = [li, sf[0]]
   out
 }
 
@@ -16357,7 +16448,7 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
 
 // A generic function named as the callback of `.map` / `.filter` over a list of a closed element
 // takes its instance at that element, as a lambda's contextual type pins it (D8944).
-function monoCoerceListCbArg(n: Call, ctx: i32): i32 {
+function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if n.callFn < 0 || n.callArgs.length != 1 { return 0 }
   const m = P.nodes[n.callFn]
   if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
@@ -16376,7 +16467,18 @@ function monoCoerceListCbArg(n: Call, ctx: i32): i32 {
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = T.tys[rt]
   if !(lt is TyArray) || lt.aElem < 0 || tyHasTyVar(lt.aElem) { return 0 }
-  if lam { return monoListCbLamAt(a, lt.aElem, ctx) }
+  if lam {
+    monoListCbLamAt(a, lt.aElem, ctx)
+    // A `.map` whose lambda returns a function gives a list of that function's type (D9171).
+    if m.memProp == "map" && monoTyOpen(nodeTyIxOf(ix)) {
+      const lr = monoValueRetAt(a, [lt.aElem], 0)
+      if monoTyClosedFn(lr) {
+        nodeTyRecord(ix, mkArrayTy(lr))
+        monoArenaTouch()
+      }
+    }
+    return 0
+  }
   const qs: i32[] = [lt.aElem]
   let r = TY_BOOL
   if m.memProp == "map" { r = monoValueRetAt(a, qs, 0) }
@@ -16394,15 +16496,33 @@ function monoCoerceListCbArg(n: Call, ctx: i32): i32 {
 }
 
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
-// or -1.
-function monoPinnedListAnnTy(recv: i32): i32 {
+// read through a binding nothing re-points that is initialised from another, a list element or
+// a record field (D9173); -1 when none is found.
+function monoPinnedListAnnTy(recv: i32): i32 { monoPinnedAnnTyAt(recv, 0) }
+
+function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   const x = unwrapParen(recv)
-  if x < 0 || !(P.nodes[x] is Ident) { return -1 }
+  if x < 0 || x >= P.nodes.length || depth > 8 { return -1 }
+  if depth > 0 && !monoTyOpen(nodeTyIxOf(x)) { return nodeTyIxOf(x) }
+  const xn = P.nodes[x]
+  if xn is Index {
+    const at = monoPinnedAnnTyAt(xn.idxArr, depth + 1)
+    if at < 0 || at >= T.tys.length { return -1 }
+    const a = T.tys[at]
+    if a is TyArray { return a.aElem }
+    return -1
+  }
+  if xn is Member {
+    return tyFieldTyOf(monoPinnedAnnTyAt(xn.memObj, depth + 1), xn.memProp)
+  }
+  if !(xn is Ident) { return -1 }
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = P.nodes[d]
-  if !(dn is LetDecl) || dn.letType < 0 { return -1 }
-  nodeTyIxOf(dn.letType)
+  if !(dn is LetDecl) { return -1 }
+  if dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
+  if dn.letInit < 0 || monoWritesOf("n:", d).length > 0 { return -1 }
+  monoPinnedAnnTyAt(dn.letInit, depth + 1)
 }
 
 // The hole lambda `at` handed to `.map` / `.filter` over a list of functions of closed type `el`
@@ -19660,7 +19780,7 @@ function monoWalk(ix: i32, ctx: i32) {
         if cr == 1 { return 0 }
       }
       if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
-      if monoCoerceListCbArg(n, ctx) < 0 { return -1 }
+      if monoCoerceListCbArg(n, ix, ctx) < 0 { return -1 }
       if monoCoerceAtValueParams(n, -1, ctx) < 0 { return -1 }
       if monoWalk(n.callFn, ctx) < 0 { return -1 }
       monoTypeCallOfCall(ix, ctx)
