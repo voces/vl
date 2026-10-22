@@ -1155,6 +1155,11 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
     if ln != "" { return ln }
     return monoNarrowedNonNullPinName(nt, wide)
   }
+  // A record renders as a brace span, so it can be an arm of `wide` only when `wide` holds a
+  // brace; the render doubles with each nested level of a shared shape, so it is skipped (D2780).
+  if monoTyIsObj(nt) && !strContains(wide, "{") {
+    return monoNarrowedNominalPinName(nt, "", wide)
+  }
   const n = tyToEmitName(nt)
   if monoNameNarrowsFrom(n, wide) || monoNicheNarrowsFrom(n, nt, wide) {
     if monoAnnPinName(n) == n { return n }
@@ -1170,6 +1175,12 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // differently, since `tyToEmitName` spells a narrowed object structurally (`{r:i32}`)
   // while a union carries its arms' declared names, so the test missed on the SPELLING and
   // not on the type. This is the equality the variant tables are built under (D1754).
+  monoNarrowedNominalPinName(nt, n, wide)
+}
+
+// The NOMINAL spelling of the narrowed arm `nt` (render `n`) when it is an arm of `wide`, else
+// the nullable-record rung's answer, else "".
+function monoNarrowedNominalPinName(nt: i32, n: string, wide: string): string {
   const nom = nominalStructNameOfTy(nt)
   if nom == "" { return monoNarrowedNulRecPinName(nt, n, wide) }
   if !monoNameNarrowsFrom(nom, wide) { return "" }
@@ -1326,6 +1337,8 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
   if chosen == "" { return "" }
   const nt = nodeTyIxOf(ax)
   if nt < 0 { return "" }
+  // A record renders with no `null` arm, so it never widens; skipping its render is D2780's.
+  if monoTyIsObj(nt) { return "" }
   const n = tyToEmitName(nt)
   if n == "" { return monoElemlessNulListPinName(nt, chosen) }
   if n == chosen { return "" }
@@ -1584,11 +1597,10 @@ function monoParamPinnedNull(ax: i32, fnIx: i32): boolean {
 function monoDeclRecListPinName(ax: i32, w: string): string {
   if ax < 0 { return "" }
   const ty = nodeTyIxOf(ax)
-  if ty < 0 || w != tyToEmitName(ty) { return "" }
-  const t = T.tys[ty]
-  if !(t is TyArray) { return "" }
+  if ty < 0 || !(T.tys[ty] is TyArray) { return "" }
   const nm = structNameOfTy(tyArrayElemIx(ty))
   if nm == "" || structIndexOfTypeName(nm) < 0 { return "" }
+  if w != tyToEmitName(ty) { return "" }
   nm + "[]"
 }
 
@@ -2817,8 +2829,8 @@ function monoCloPinShapeAnn(initIx: i32): i32 {
         if fty < 0 { return -1 }
         const ftn = tyToEmitName(fty)
         if ftn == "" { return -1 }
-        if j > 0 { txt = txt + ", " }
-        txt = txt + f.fiName + ": " + ftn
+        if j > 0 { txt = txt + "," }
+        txt = txt + f.fiName + ":" + ftn
         fns.push(f.fiName)
         fts.push(fty)
       } else {
@@ -9966,10 +9978,6 @@ function monoMakeInstanceParams(
         // keeps the argument's own members, which its narrowed reads are keyed on (D8181).
         if monoPinKeepsInlineLits(nodeTyIxOf(nt), pinTys[pj]) {
           nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
-        } else if nodeTyIxOf(nt) < 0 && pinTys[pj] >= 0 {
-          // A pin name the type parser cannot read back (a map of functions renders with a
-          // space after its colon) takes the argument's own type rather than none (D9180).
-          nt = synthTypeRefTy(pinned[pj], -1, pinTys[pj])
         }
         synthed = true
       }
@@ -14711,23 +14719,7 @@ function monoPinCallRecord(d: LetDecl, at: i32, ctx: i32) {
   ) {
     return 0
   }
-  const fx = fnStmts[fe]
-  const fd = P.nodes[fx]
-  if !(fd is FuncDecl) || fd.fnRet >= 0 { return 0 }
-  let rt = -1
-  for r in monoFnRetArgs(fd) {
-    if r < 0 { return 0 }
-    let v = r
-    const rn = P.nodes[r]
-    if rn is RetStmt { v = rn.retArg }
-    if v < 0 { return 0 }
-    const lx = unwrapParen(v)
-    if lx < 0 || lx >= P.nodes.length || !(P.nodes[lx] is ObjLit) { return 0 }
-    monoClosedObjLitTy(lx, fx, true)
-    const lt = nodeTyIxOf(lx)
-    if lt < 0 || monoTyOpen(lt) || (rt >= 0 && !tyEq(rt, lt)) { return 0 }
-    rt = lt
-  }
+  const rt = monoRetRecordOf(fnStmts[fe])
   if (
     rt < 0
     || !monoLetWritesClosed(d, at, ctx)
@@ -14746,6 +14738,80 @@ function monoPinCallRecord(d: LetDecl, at: i32, ctx: i32) {
   monoArenaTouch()
   0
 }
+
+// The record every value un-annotated function `fx` returns takes at the closed bindings it
+// reads, -1 unless all of them are record literals that close alike. A result the emitter
+// pinned to the checker's open record is re-pinned to it (D9250).
+function monoRetRecordOf(fx: i32): i32 {
+  if fx < 0 || fx >= P.nodes.length { return -1 }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) || monoIsGenericDecl(fx) { return -1 }
+  let pinned = false
+  if fd.fnRet >= 0 {
+    const done = monoRetRepinned.get(fx) ?? -1
+    if done >= 0 { return done }
+    const at = nodeTyIxOf(fd.fnRet)
+    if at < 0 || !monoTyOpen(at) || monoFrameIsGenericInstance(fx) { return -1 }
+    pinned = true
+  }
+  let rt = -1
+  for r in monoFnRetArgs(fd) {
+    if r < 0 { return -1 }
+    let v = r
+    const rn = P.nodes[r]
+    if rn is RetStmt { v = rn.retArg }
+    if v < 0 { return -1 }
+    const lx = unwrapParen(v)
+    if lx < 0 || lx >= P.nodes.length { return -1 }
+    let lt = -1
+    if P.nodes[lx] is ObjLit {
+      monoClosedObjLitTy(lx, fx, true)
+      lt = nodeTyIxOf(lx)
+    } else {
+      lt = monoRetConstRecord(lx, fx)
+    }
+    if lt < 0 || monoTyOpen(lt) || (rt >= 0 && !tyEq(rt, lt)) { return -1 }
+    rt = lt
+  }
+  if rt >= 0 && pinned {
+    const nm = monoPinAnnSpelling(rt)
+    if nm == "" { return -1 }
+    buildFnMapNoteFnSlotWrite()
+    fd.fnRet = synthTypeRefTy(nm, -1, rt)
+    // arena-tick exempt: a side table keyed by declaration, not an arena scan
+    monoRetRepinned.set(fx, rt)
+    monoArenaTouch()
+  }
+  rt
+}
+
+// The record the `const` that identifier `vx` returns in frame `fx` holds once its record
+// literal is typed at the closed bindings it reads, recorded on the literal and each read of
+// the binding; -1 for any other expression (D9251).
+function monoRetConstRecord(vx: i32, fx: i32): i32 {
+  const vn = P.nodes[vx]
+  if !(vn is Ident) { return -1 }
+  const at = monoReadLetFrame(vx, fx)[1]
+  if at < 0 { return -1 }
+  const d = P.nodes[at]
+  if !(d is LetDecl) || d.letKw != "const" || d.letType >= 0 || d.letInit < 0 {
+    return -1
+  }
+  const lx = unwrapParen(d.letInit)
+  if lx < 0 || lx >= P.nodes.length || !(P.nodes[lx] is ObjLit) { return -1 }
+  monoClosedObjLitTy(lx, fx, true)
+  const rt = nodeTyIxOf(lx)
+  if rt < 0 || monoTyOpen(rt) { return -1 }
+  for ix in monoFrameNodes(fx) {
+    if monoTyOpen(nodeTyIxOf(ix)) && monoReadsBinding(ix, d.letName, fx, at) {
+      nodeTyRecord(ix, rt)
+    }
+  }
+  rt
+}
+
+// Per function node `monoRetRecordOf` re-pinned, the record its result now names.
+let monoRetRepinned: {[i32]: i32} = Map()
 
 // Types the reads in frame `ctx` through each field of the record `rt` held by the binding
 // declared at `at`: a container of functions by its slot, any other field by its held paths.
@@ -14823,6 +14889,10 @@ function monoClosedObjLitTy(lx: i32, ctx: i32, rec: boolean): i32 {
         let nt = -1
         if vx >= 0 && vx < P.nodes.length && P.nodes[vx] is ObjLit {
           nt = monoClosedObjLitTy(vx, ctx, rec)
+        } else if vx >= 0 && vx < P.nodes.length && P.nodes[vx] is ArrayLit {
+          // An inline list of functions takes its element slot's pin, which the flow table
+          // banks under the record literal itself (D9254).
+          if rec { nt = monoPinFieldContainer(lx, ctx, f.fiName, vx) }
         } else {
           nt = monoClosedReadTy(vx, ctx, rec)
         }
@@ -15241,7 +15311,7 @@ function monoPinMapSlot(
     return -1
   }
   const nt = mkMapTy(mt.mKey, nv, 0)
-  spell.push("{[" + monoPinAnnSpelling(mt.mKey) + "]: " + vs + "}")
+  spell.push("{[" + monoPinAnnSpelling(mt.mKey) + "]:" + vs + "}")
   monoArenaTouch()
   nodeTyRecord(mx, nt)
   monoRetypeMapReads(ctx, at, nt, nv, fld)
@@ -15295,8 +15365,8 @@ function monoPinStoredRecords(
     }
     const ftn = monoPinAnnSpelling(fty)
     if ftn == "" { return -1 }
-    if k > 0 { vs = vs + ", " }
-    vs = vs + name + ": " + ftn
+    if k > 0 { vs = vs + "," }
+    vs = vs + name + ":" + ftn
     fts.push(fty)
     k = k + 1
   }
@@ -15500,6 +15570,7 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
     const stale = monoFnReadTyStale(ty, ft, ctx)
     if stale && monoIsMapValueRead(ix, d.letName, fld, ctx, at) {
       nodeTyRecord(ix, rt)
+      monoRetypeRecMemberReads(ctx, nodes, ix, ft, 0)
     } else if stale && n is BinExpr && n.binOp == "??" {
       const rty = nodeTyIxOf(n.binRight)
       if monoIsMapValueRead(unwrapParen(n.binLeft), d.letName, fld, ctx, at) {
@@ -15569,6 +15640,91 @@ function monoRetypeMapReads(ctx: i32, at: i32, nt: i32, ft: i32, fld: string) {
             && identDeclOf(ix) == lx
             && monoFnReadTyStale(nodeTyIxOf(ix), ft, ctx)
           ) {
+            nodeTyRecord(ix, ft)
+          }
+        }
+      }
+    }
+  }
+  0
+}
+
+// Types each read `root.f` among `nodes` in frame `ctx`, where `root` holds record `rt`, at the
+// field's type: through nested records, and for a map or list of functions the reads of its
+// values and the `const`s bound to one (D9252, D9253).
+function monoRetypeRecMemberReads(
+  ctx: i32,
+  nodes: i32[],
+  root: i32,
+  rt: i32,
+  depth: i32,
+) {
+  if depth > 8 || rt < 0 || rt >= T.tys.length || !(T.tys[rt] is TyObj) {
+    return 0
+  }
+  for ix in nodes {
+    const m = P.nodes[ix]
+    if (
+      m is Member
+      && unwrapParen(m.memObj) == root
+      && monoTyOpen(nodeTyIxOf(ix))
+    ) {
+      const fty = monoObjFieldTy(rt, m.memProp)
+      if fty >= 0 && !monoTyOpen(fty) {
+        nodeTyRecord(ix, fty)
+        const et = monoContainerElemTy(fty)
+        if et >= 0 && et < T.tys.length && T.tys[et] is TyFunc {
+          monoRetypeHeldFnReads(ctx, nodes, ix, fty, et)
+        } else {
+          monoRetypeRecMemberReads(ctx, nodes, ix, fty, depth + 1)
+        }
+      }
+    }
+  }
+  0
+}
+
+// Types each read among `nodes` in frame `ctx` of a value of the container node `holder`, a map
+// or list `ct` of functions `ft`, and each read of a `const` bound to one, where still stale.
+function monoRetypeHeldFnReads(
+  ctx: i32,
+  nodes: i32[],
+  holder: i32,
+  ct: i32,
+  ft: i32,
+) {
+  let rt = ft
+  if T.tys[ct] is TyMap { rt = mkNullableTy(ft) }
+  const aliases: i32[] = []
+  for ix in nodes {
+    const n = P.nodes[ix]
+    let rd = false
+    if n is Index { rd = unwrapParen(n.idxArr) == holder }
+    if !rd {
+      const recv = monoMethodCallRecv(ix, "get")
+      rd = recv >= 0 && unwrapParen(recv) == holder
+    }
+    if rd && monoFnReadTyStale(nodeTyIxOf(ix), ft, ctx) { nodeTyRecord(ix, rt) }
+    if n is LetDecl && n.letKw == "const" && n.letType < 0 && n.letInit >= 0 {
+      const ii = unwrapParen(n.letInit)
+      if ii >= 0 && ii < P.nodes.length {
+        const iv = P.nodes[ii]
+        if iv is Index && unwrapParen(iv.idxArr) == holder { aliases.push(ix) }
+      }
+    }
+  }
+  for ax in aliases {
+    const a = P.nodes[ax]
+    if a is LetDecl {
+      for ix in nodes {
+        const ty = nodeTyIxOf(ix)
+        if (
+          monoFnReadTyStale(ty, ft, ctx)
+          && monoReadsBinding(ix, a.letName, ctx, ax)
+        ) {
+          if ty >= 0 && ty < T.tys.length && T.tys[ty] is TyNullable {
+            nodeTyRecord(ix, rt)
+          } else {
             nodeTyRecord(ix, ft)
           }
         }
@@ -20117,7 +20273,11 @@ function monoWalk(ix: i32, ctx: i32) {
         if cf is FuncDecl {
           if monoCoerceFnValue(n.retArg, cf.fnRet, ctx) < 0 { return -1 }
           if cf.fnRet < 0 && monoCoerceRetAtPin(n.retArg, ctx) < 0 { return -1 }
-          if cf.fnRet < 0 { monoPinReturnedObj(n.retArg, ctx) }
+          if cf.fnRet < 0 {
+            monoPinReturnedObj(n.retArg, ctx)
+          } else {
+            monoRetRecordOf(ctx)
+          }
         }
       }
       return monoWalk(n.retArg, ctx)
@@ -20500,6 +20660,7 @@ function monoWalkFnBody(fnIx: i32) {
     monoReachIndex(one)
   }
   if fn is FuncDecl {
+    if fn.fnRet >= 0 { monoRetRecordOf(fnIx) }
     if monoCoerceFnValue(fn.fnBody, fn.fnRet, fnIx) < 0 { return -1 }
     if monoNoteRetDeliveries(fn, fnIx) < 0 { return -1 }
     // A body's value is delivered past the return like a `return`'s argument (D6340).
@@ -22313,6 +22474,7 @@ export function monomorphize(stmts: i32[]) {
   monoFramedPushes = Map()
   monoBindCallSigs = Map()
   monoRetDeliveredAt = Map()
+  monoRetRepinned = Map()
   monoCellCoercedSig = Map()
   monoSigCallRet = -2
   monoHoleLamSlots = Map()

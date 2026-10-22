@@ -204,14 +204,14 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D2780's witness at depth 20 under the null collector: a record type whose structural
-      // spelling doubles per level, which fills the heap. About 5 s. When D2780 closes, move
+      // D2780's witness at depth 21 under the null collector: a record type whose structural
+      // spelling doubles per level, which fills the heap. About 7 s. When D2780 closes, move
       // this to the next open trap under the null collector.
       const lines = ["type A0 = {x: i32}"];
-      for (let i = 1; i <= 20; i++) lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
+      for (let i = 1; i <= 21; i++) lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
       lines.push("function f<T>(u: T | string): boolean { u is string }", "const a0: A0 = {x: 1}");
-      for (let i = 1; i <= 20; i++) lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
-      lines.push("print(f<A20>(a20))");
+      for (let i = 1; i <= 21; i++) lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
+      lines.push("print(f<A21>(a21))");
       await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
       const r = await vl(
         ["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`],
