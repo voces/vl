@@ -131,8 +131,6 @@ import {
   isNegI32MinLit,
   jwBadMsg,
   lbiNoteCoalDefault,
-  lwStoreDstSet,
-  mapStoreValPin,
   mkBinOpRetTy,
   noteHoleFlow,
   noteLitElemCstrs,
@@ -514,6 +512,24 @@ function checkLogicalBinNode(n: BinExpr, ix: i32): i32 {
   return TY_BOOL
 }
 
+// The value slot `V` a map index store at place `tgt` lands in — what `.set(k, v)` checks
+// against, where the place reads as `V | null` — through a hole receiver's demanded map too;
+// -1 when `tgt` is no index into a map. A quiet pass records no node types, so the receiver
+// is re-checked there, as the index arm of `checkAssignBinNode` does.
+function mapStoreSlotTy(tgt: i32): i32 {
+  const t = P.nodes[tgt]
+  if !(t is Index) { return -1 }
+  let ct = nodeTyIxOf(t.idxArr)
+  if ct < 0 { ct = checkNodeHook(t.idxArr) }
+  if ct < 0 || ct >= T.tys.length { return -1 }
+  const h = T.tys[ct]
+  if h is TyVar { ct = holeMapOf(h.tvName) }
+  if ct < 0 || ct >= T.tys.length { return -1 }
+  const m = T.tys[ct]
+  if m is TyMap { return m.mVal }
+  -1
+}
+
 // The store half of assignment `n`, once an index target has pinned what it pins: `rt` must
 // be assignable to the place's storage type (not its narrowed flow type), then the write fills
 // or retires the binding's narrowings. Answers what the expression yields: `rt`, or the place's
@@ -524,8 +540,14 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   let asgLt = lt
   let asgBarred = false
   const asgDcl = writeStorageTy(n.binLeft)
+  const asgMapSlot = mapStoreSlotTy(n.binLeft)
   if asgDcl >= 0 {
     asgLt = asgDcl
+  } else if asgMapSlot >= 0 {
+    // A map index store lands in the value slot `V`, not the read's `V | null`, so it checks
+    // and pins its source exactly as `.set(k, v)` does (D10042, D2639).
+    asgLt = asgMapSlot
+    asgBarred = writeBarredByLoop(n.binLeft)
   } else if elemValueHoleBase(lt) >= 0 {
     // An index write through a hole checks the element's STORAGE, so a `u8[]` pin still
     // refuses an out-of-range literal; the read type is the widened value (D2238).
@@ -536,7 +558,6 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A plain assignment pins the source's open holes, exactly as an annotated let-init, call
   // argument, or typed return already does — runs before `assignableExpr` so the pin applies first.
   constrainEmptyExpr(n.binRight, rt, asgLt)
-  mapStoreValPin(n.binLeft, asgLt)
   noteU8StoreRhs(n.binLeft, n.binRight)
   nlAsgTgt = n.binLeft
   nlAsgGot = rt
@@ -544,7 +565,6 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   nlAsgTgt = -1
   const asgOk = asgFits
     && !writeLeavesLoopEntry(n.binLeft, asgLitRhsTy(ix, asgLt, rt))
-  lwStoreDstSet(-1)
   if !asgOk {
     if asgFits || asgBarred || (asgDcl >= 0 && writeBarredByLoop(n.binLeft)) {
       writeBarredErr(placeKeyOf(n.binLeft), ix)
@@ -1329,7 +1349,15 @@ function binCheckRightOperand(
 ): i32 {
   // Contextual typing for an assignment RHS: seed the LHS type so an un-annotated lambda
   // param infers from the target, matching let-init/arg/return seeding.
-  if op == "=" { seedExpected(n.binRight, lt) }
+  // A map index store seeds its value slot, as `.set(k, v)` seeds its argument.
+  if op == "=" {
+    const seedSlot = mapStoreSlotTy(n.binLeft)
+    if seedSlot >= 0 {
+      seedExpected(n.binRight, seedSlot)
+    } else {
+      seedExpected(n.binRight, lt)
+    }
+  }
   // Contextual typing for a `??` default: seed it with the LHS's non-null shape so an
   // un-annotated default-lambda param infers, mirroring the `=` seeding.
   if op == "??" { seedExpected(n.binRight, lt) }
