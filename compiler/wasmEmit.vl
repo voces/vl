@@ -1289,6 +1289,7 @@ import {
   mapPinnedParamTyOf,
   mapReadScalarBoxKindTy,
   mapRecvScalarBoxKindIn,
+  mapRecvScalarKindInst,
   mapRecvTyIn,
   mapShapeTwinned,
   mapSoftTwin,
@@ -12716,16 +12717,29 @@ function defExprNullable(ix: i32) {
 }
 
 // Lower a map get `m[k]` with a default (`m[k] ?? d`) onto `body`: probe, then if the
-// key is found push `vals[entry-1]`, else push the default `d`. The self-host checker
-// always reads a map through `?? -1` (a total fallback), so this is the primary get.
+// key is found push `vals[entry-1]`, else push the default `d`. The self-host checker always
+// reads a map through `?? -1`, so this is the primary get. `rk` is the `??`'s own atom kind
+// (-1 none): a scalar value it is wider than is read and widened to it (D10091).
 function emitMapGetOr(
   body: u8[],
   recvIx: i32,
   keyIx: i32,
   defIx: i32,
   fnIx: i32,
+  rk: i32,
 ) {
   if emitMapPrep(body, recvIx, keyIx, fnIx) < 0 { return -1 }
+  const wvk = mapRecvScalarKindInst(recvIx, fnIx)
+  if wvk >= 0 && coalWidens(wvk, rk) && !defExprNullable(defIx) {
+    pushMapScr(body, 5)          // entry
+    fbIf(valBlockTypeOfKind(rk)) // if (entry != 0 → found), the result's blocktype
+    pushMapScalarHit(body)
+    if coalWidenUnboxed(wvk, rk) < 0 { return -1 }
+    fbElse()
+    if emitExprAsKind(body, defIx, rk, fnIx) < 0 { return -1 }
+    fbEnd()
+    return 0
+  }
   if cmSlot >= 0 {
     // Ref values route through the slot's nullable valStash local rather than a
     // value-typed `if` (needs no interned blocktype): the hit arm sets it from the
@@ -12738,7 +12752,7 @@ function emitMapGetOr(
     // `ref.is_null` path below. A null-free union value has no tag and takes the plain path.
     if mvValKind[mslot] == MVK_UNION {
       if mvValUnionHasNull(mslot) {
-        return emitMapGetOrUnionBox(body, mslot, defIx, fnIx)
+        return emitMapGetOrUnionBox(body, mslot, defIx, fnIx, rk)
       }
     }
     // A SCALAR-valued map (f64/i64) stores the value directly; its default is emitted in
@@ -12859,8 +12873,15 @@ function emitMapGetOr(
 // Lower `m[k] ?? d` over a boxed value-union map value that includes null (mv kind 2
 // with a `null` atom): read the box (hit → stored, miss → the null-tagged box), then
 // coalesce on the box's null tag — a `scalar | null` value peels to the raw unboxed
-// scalar, a multi-member `… | null` value peels to the non-null union box.
-function emitMapGetOrUnionBox(body: u8[], mslot: i32, defIx: i32, fnIx: i32) {
+// scalar, a multi-member `… | null` value peels to the non-null union box. `rk` is the `??`'s
+// atom kind (-1 none); a peeled scalar it is wider than widens to it.
+function emitMapGetOrUnionBox(
+  body: u8[],
+  mslot: i32,
+  defIx: i32,
+  fnIx: i32,
+  rk: i32,
+) {
   const uvn = mvValName[mslot]
   // The map value union's members come from the recorded member columns; an
   // un-interned value spelling re-splits (the ladder fall-through). One resolution
@@ -12900,17 +12921,20 @@ function emitMapGetOrUnionBox(body: u8[], mslot: i32, defIx: i32, fnIx: i32) {
     if vb < 0 {
       return emitFail("emitProgram: scalar|null map value has no value box")
     }
+    let urk = ak
+    if coalWidens(ak, rk) { urk = rk }
     fbLocalGet(stashL)
-    fbStructGet(uBoxIdx, 0)      // field 0: tag
+    fbStructGet(uBoxIdx, 0)       // field 0: tag
     fbI32Rel(RS_TAG, nullBoxTag())
-    fbI32Bin(70)                 // 0x46 i32.eq → null?
-    fbIf(valBlockTypeOfKind(ak)) // value-typed if in the scalar's rep
-    if emitExprAsKind(body, defIx, ak, fnIx) < 0 { return -1 }
+    fbI32Bin(70)                  // 0x46 i32.eq → null?
+    fbIf(valBlockTypeOfKind(urk)) // value-typed if in the result's rep
+    if emitExprAsKind(body, defIx, urk, fnIx) < 0 { return -1 }
     fbElse()
     fbLocalGet(stashL)
-    fbStructGet(uBoxIdx, 1)      // field 1: value (anyref payload)
+    fbStructGet(uBoxIdx, 1)       // field 1: value (anyref payload)
     fbRefCast(vb)
-    fbStructGet(vb, 0)           // the scalar payload
+    fbStructGet(vb, 0)            // the scalar payload
+    if coalWidenUnboxed(ak, urk) < 0 { return -1 }
     fbEnd()
     return 0
   }
@@ -38075,6 +38099,20 @@ function coalWidenUnboxed(from: i32, to: i32) {
   )
 }
 
+// True when `coalWidenUnboxed` converts atom kind `from` to a different kind `to`.
+function coalWidens(from: i32, to: i32): boolean {
+  if from == 0 { return to == 3 || to == 4 || to == 5 }
+  if from == 3 || from == 5 { return to == 4 }
+  false
+}
+
+// The checker's atom kind for the `??` at `exprIx`, -1 when it is not a value atom or is null.
+function coalResultKindOf(exprIx: i32, fnIx: i32): i32 {
+  const k = valueAtomKindOfTy(coalResultTyOf(exprIx, fnIx))
+  if k == nullValKind() { return -1 }
+  k
+}
+
 // `l ?? d`, with a `?.` chain on the left staged for the whole lowering when its base is not
 // a re-readable place — the fused arms read the receiver two and three times, and the stash
 // is what lets them do that to a call. One save/restore, since a default may hold a chain.
@@ -38512,7 +38550,14 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   if lhs is Index {
     if mapFused && exprMap(lhs.idxArr, fnIx) {
-      return emitMapGetOr(body, lhs.idxArr, lhs.idxIndex, e.binRight, fnIx)
+      return emitMapGetOr(
+        body,
+        lhs.idxArr,
+        lhs.idxIndex,
+        e.binRight,
+        fnIx,
+        coalResultKindOf(exprIx, fnIx),
+      )
     }
   }
   const cmj = emitCoalesceMapJoin(body, e, exprIx, fnIx)
@@ -38539,6 +38584,7 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
             lhs.callArgs[0],
             e.binRight,
             fnIx,
+            coalResultKindOf(exprIx, fnIx),
           )
         }
         // `xs.get(i) ?? d` over a SCALAR-element list (i32 / boolean / f64, and an i64 or
