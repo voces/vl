@@ -16,6 +16,7 @@ import {
   nodeTyArrayElemIsNullable,
   nodeTyCarry,
   nodeTyIsFunc,
+  nodeTyIsNulFunc,
   nodeTyIsNullType,
   nodeTyIsNullable,
   nodeTyIsNullableStruct,
@@ -275,6 +276,7 @@ import {
   annFnDecompose,
   annObjFieldSplit,
   annRetNameOf,
+  annSplitParams,
   declStructNodeOf,
   drwDispatchOp,
   moduleLocalLetAll,
@@ -11995,6 +11997,14 @@ function monoFnTyRet(t: i32): i32 {
   -1
 }
 
+// Whether boundary spelling `nm` names the closed type `ty`, compared on the arena, so a record
+// spelled by its shape matches the alias a parameter declares it by.
+function monoPinNamesTy(nm: string, ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
+  const at = nameToTy(nm)
+  at >= 0 && tyEq(at, ty)
+}
+
 // Materialize or reuse the instance of generic `origFe` for an annotated function-typed
 // binding, pinning each parameter to the annotation's param type name and pointing
 // `letInitIx` at it. Unlike the call-driven path this carries the value's concrete type
@@ -12030,7 +12040,10 @@ function monoInstanceFor(
           if monoAnnHasTyParam(ann, fn.fnTyParams) {
             const act = monoPinShapeName(ann, pinnedNames[i], fn.fnTyParams)
             monoBindFromAnn(ann, act, fn.fnTyParams, tvN, tvV)
-          } else if normTypeAtom(ann) != normTypeAtom(pinnedNames[i]) {
+          } else if (
+            normTypeAtom(ann) != normTypeAtom(pinnedNames[i])
+            && !monoPinNamesTy(pinnedNames[i], nodeTyIxOf(p.parType))
+          ) {
             return 0
           }
         }
@@ -17740,8 +17753,41 @@ function monoLetPinTake(lf: i32[], tname: string, byCall: boolean): i32 {
   const quiet = monoSigRetVoid(tname)
   if pins.length > 1 && !quiet { return MONO_PIN_REFUSE }
   if sig == join { return MONO_PIN_COERCE }
+  // A function-value pin (`=>k`) names a wasm signature, so it is compared at the closed
+  // parameter types of the call that pins it (D9851).
+  const noPath: string[] = []
+  if sig == monoFnNameSig(monoSlotPinAnn(lf, noPath, join, "void")) {
+    return MONO_PIN_COERCE
+  }
+  // The binding's own call takes an instance whose parameters each admit the one pin's, such as
+  // a function value at a nullable function parameter, and converts its arguments (D9852).
+  if byCall && pins.length == 1 && monoPinWidensTo(lf[1], join, tname) {
+    return MONO_PIN_COERCE
+  }
   if byCall && quiet && monoSigJoin(sig, join) == join { return MONO_PIN_KEEP }
   MONO_PIN_REFUSE
+}
+
+// Whether each closed type pin `sig` of binding `d` is taken at is assignable to the matching
+// parameter of function type `tname`, compared on the arena.
+function monoPinWidensTo(d: i32, sig: string, tname: string): boolean {
+  const noPath: string[] = []
+  const pt = fnFlowDeclPathPinTysOf(d, noPath, sig)
+  const parts: string[] = []
+  if annFnDecompose(peelGroupParens(nonNulBaseOf(tname)), parts) == "" {
+    return false
+  }
+  if pt.length != parts.length { return false }
+  let k = 0
+  while k < pt.length {
+    const want = nameToTy(parts[k])
+    if pt[k] < 0 || want < 0 || tyHasTyVar(pt[k]) || tyHasTyVar(want) {
+      return false
+    }
+    if !assignable(pt[k], want) { return false }
+    k = k + 1
+  }
+  true
 }
 
 // The pins (`fnFlowDeclPathPinSigs`) of the written `let` `lf`, in the walk its frame's instance
@@ -19057,6 +19103,12 @@ function monoGenArgAtOpenParam(n: Call, ctx: i32): boolean {
   false
 }
 
+// Whether annotation node `annIx` is typed as a function or a nullable function: a slot a
+// function value is delivered to.
+function monoAnnIsFnSlot(annIx: i32): boolean {
+  nodeTyIsFunc(annIx) || nodeTyIsNulFunc(annIx)
+}
+
 // Does this call hand a generic function value to a parameter whose annotation is an arrow
 // riding the callee's own type parameters? The trigger for the pre-binding pass in
 // `monoInstantiate`, asked so that pass changes nothing elsewhere: the two binding orders
@@ -19074,7 +19126,7 @@ function monoCallGenFnToTyParamArrow(
     if p is Param {
       if p.parType >= 0 {
         const ann = monoDeclAnnName(p.parType, tyNameOf(p.parType), typarams)
-        if nodeTyIsFunc(p.parType) && monoAnnHasTyParam(ann, typarams) {
+        if monoAnnIsFnSlot(p.parType) && monoAnnHasTyParam(ann, typarams) {
           const ax = unwrapParen(args[i])
           if ax >= 0 {
             const av = P.nodes[ax]
@@ -21033,7 +21085,7 @@ function monoPreBindNonArrowArgs(
         )
         // The ARROW parameters are the ones whose binding is in question; every other
         // annotation reads its type off the argument the call actually passes.
-        if !nodeTyIsFunc(pbp.parType) {
+        if !monoAnnIsFnSlot(pbp.parType) {
           if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
             const pbConc = monoArgPinName(args[pb], ctx)
             if pbConc != "" {
@@ -21343,7 +21395,7 @@ function monoPinAnnotatedParam(
 
 // Binds the type parameters only the result of arrow annotation `annIx` names to the result
 // function value `argIx` gives at the parameter types `tvN`/`tvV` already close, as an
-// un-annotated function handed to `(T) => R` gives `R` (D8943).
+// un-annotated function handed to `(T) => R` gives `R` (D8943), or to `((T) => R) | null`.
 function monoBindArrowRet(
   annIx: i32,
   argIx: i32,
@@ -21351,7 +21403,9 @@ function monoBindArrowRet(
   tvN: string[],
   tvV: string[],
 ) {
-  const at = nodeTyIxOf(annIx)
+  let at = nodeTyIxOf(annIx)
+  const nf = tyNulFuncInner(at)
+  if nf >= 0 { at = nf }
   if at < 0 || at >= T.tys.length { return 0 }
   const af = T.tys[at]
   if !(af is TyFunc) || af.fnRet < 0 { return 0 }
@@ -21362,9 +21416,22 @@ function monoBindArrowRet(
   if qs.length > 0 && qs[0] < 0 { return 0 }
   const r = monoValueRetAt(argIx, qs, 0)
   if r < 0 { return 0 }
+  monoBindArenaWalk(substTyDeep(af.fnRet, hN, hT), r, typarams, tvN, tvV)
+}
+
+// Binds each of `typarams` still unbound in `tvN`/`tvV` that pattern type `pt` names to what
+// `bindGenWalk` pairs it with in argument type `at`, where that is closed, spelled as a pin. 0.
+function monoBindArenaWalk(
+  pt: i32,
+  at: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
   const rN: string[] = []
   const rT: i32[] = []
-  bindGenWalk(substTyDeep(af.fnRet, hN, hT), r, rN, rT)
+  bindGenWalk(pt, at, rN, rT)
   let k = 0
   while k < rN.length {
     if strListHas(typarams, rN[k]) && monoBindOf(tvN, tvV, rN[k]) == "" {
@@ -21530,8 +21597,11 @@ function monoPinTyParamComposite(
   // shape would resolve to a declared record sharing the field names.
   let anRowPin = ""
   const annIsFn = nodeTyIsFunc(p.parType)
-  if annIsFn {
-    anC = monoArgFnTypeName(args[i], ctx)
+  if annIsFn { anC = monoArgFnTypeName(args[i], ctx) }
+  // A nullable function slot takes a function value as a function slot does; only its
+  // argument's own spelling is read as any other composite's (D9820).
+  const annFnSlot = monoAnnIsFnSlot(p.parType)
+  if annFnSlot {
     // An alias of a written `let` hands that `let`, whatever its initializer names (D9130).
     const ax = unwrapParen(args[i])
     const wl = monoHandLetRead(ax, ctx)
@@ -21553,7 +21623,8 @@ function monoPinTyParamComposite(
       if hr < 0 { return hr }
       if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
     }
-  } else {
+  }
+  if !annIsFn && anC == "" {
     anC = monoArgPinName(args[i], ctx)
     // An anonymous row's `#anonN` has no fields to match the pattern against;
     // the checker's spelled shape does, unless the render softens a literal (D3123).
@@ -21577,6 +21648,15 @@ function monoPinTyParamComposite(
   monoBindFromAnn(
     ann,
     monoArgBindSpelling(ann, anC, args[i]),
+    fn.fnTyParams,
+    tvN,
+    tvV,
+  )
+  // A function value pins at its signature key, which spells no type the pattern can pair
+  // with, so the arena types unify what the spelling left open (`((T) => T) | null`, D9820).
+  monoBindArenaWalk(
+    nodeTyIxOf(p.parType),
+    monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx),
     fn.fnTyParams,
     tvN,
     tvV,
@@ -21605,7 +21685,7 @@ function monoPinTyParamComposite(
   // The coercion `monoWalk` deferred, since at that point the pin names
   // would be the type variables themselves. `pinC` is the substituted
   // spelling, the concrete function type that parameter takes.
-  if annIsFn || nameIsClosureArray(pinC) {
+  if annFnSlot || nameIsClosureArray(pinC) {
     if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 { return -1 }
   }
   pinned.push(pinC)
@@ -24089,10 +24169,12 @@ function monoSlotPinAnn(
   const fts = monoPinFnParamTys(lf[1], path, sig)
   let out = "("
   let k = 0
-  for pn in monoSigPins(sig + ";") {
+  for pn in monoSigPinsTop(sig) {
     if k > 0 { out = out + "," }
     if monoPinIsFnSig(pn) && fts.length > 0 {
       out = out + "(" + monoConcreteFnTyName(fts[k]) + ")"
+    } else if fts.length > 0 && monoConcreteNulFnTyName(fts[k]) != "" {
+      out = out + monoConcreteNulFnTyName(fts[k])
     } else if nameIsBraceSpanEnds(pn) {
       out = out + monoPinShapeSpell(pn)
     } else {
@@ -24101,6 +24183,15 @@ function monoSlotPinAnn(
     k = k + 1
   }
   out + ")=>" + ret
+}
+
+// The pins of pin list `sig` (`p1,p2,`), split at its top-level commas so a pin spelling a
+// nullable function type keeps its own parameter list.
+function monoSigPinsTop(sig: string): string[] {
+  const out: string[] = []
+  annSplitParams(sig, out)
+  if out.length > 0 { out.pop() }
+  out
 }
 
 // `monoSlotPinName` with a function-value pin left as its wasm signature, which a hole lambda
@@ -24120,16 +24211,11 @@ function monoSlotRetName(lf: i32[], path: string[]): string {
   "void"
 }
 
-// The closed parameter types pin `sig` of slot `path` of `d` is taken at, when one of its pins is
-// a function value's and every such parameter is a function type with no hole; empty otherwise.
+// The closed parameter types pin `sig` of slot `path` of `d` is taken at, when every function-value
+// pin among them is a function type with no hole; empty otherwise.
 function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
   const none: i32[] = []
-  const ps = monoSigPins(sig + ";")
-  let any = false
-  for p in ps {
-    if monoPinIsFnSig(p) { any = true }
-  }
-  if !any { return none }
+  const ps = monoSigPinsTop(sig)
   const tys = fnFlowDeclPathPinTysOf(d, path, sig)
   if tys.length != ps.length { return none }
   let k = 0
@@ -24146,6 +24232,14 @@ function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
 function monoConcreteFnTyName(ty: i32): string {
   if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyFunc) { return "" }
   monoConcreteFnPinName(ty)
+}
+
+// The pin spelling of `ty` when it is a nullable function type with no hole, else "" (D9821).
+function monoConcreteNulFnTyName(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length || tyNulFuncInner(ty) < 0 || tyHasTyVar(ty) {
+    return ""
+  }
+  monoI32AtomPinName(ty)
 }
 
 // The pin spelling of `ty` when it is a function type or a list of one, with no hole, else "".
@@ -24322,6 +24416,134 @@ function monoBindingAtPin(lf: i32[], nDecl: i32): i32 {
   0
 }
 
+// For generic `x` read in frame `ctx` and pinned at binding `d` of frame `fr`: its declared
+// parameter types then its result, when every pin of `d` binds them to one closed signature that
+// widens a pin at a parameter that admits `null`, such as a function value at `((x: T) => T) | null`;
+// else empty.
+function monoRetGenWidePins(x: i32, ctx: i32, d: i32, fr: i32): i32[] {
+  const none: i32[] = []
+  const xn = P.nodes[x]
+  if !(xn is Ident) { return none }
+  let gfe = monoFnFeOfIdent(x, xn.identName, ctx)
+  if gfe < 0 { gfe = monoReadGenFnFe(x) }
+  if gfe < 0 || gfe >= monoGen.length || monoGen[gfe] != 1 { return none }
+  const fn = P.nodes[monoOrigNode[gfe]]
+  if !(fn is FuncDecl) || fn.fnTyParams.length == 0 || fn.fnRet < 0 {
+    return none
+  }
+  const noPath: string[] = []
+  let out: i32[] = []
+  let widens = false
+  for sig in monoDeclPathPins([fr, d], noPath) {
+    const pt = fnFlowDeclPathPinTysOf(d, noPath, sig)
+    const one = monoGenDeclPinTys(fn, pt)
+    if one.length == 0 { return none }
+    if out.length == 0 { out = one }
+    else if !monoTyListsEq(out, one) { return none }
+    let j = 0
+    while j < pt.length {
+      if tyBearsNull(one[j]) && !tyEq(pt[j], one[j]) { widens = true }
+      j = j + 1
+    }
+  }
+  // A call passing a narrower argument than its pin, a function value where the pin admits `null`,
+  // is retyped past the pin at the declared signature too.
+  for cx in fnFlowDeclPathPinCalls(d, noPath) {
+    const c = P.nodes[cx]
+    if c is Call && out.length == c.callArgs.length + 1 {
+      let k = 0
+      while k < c.callArgs.length {
+        const at = nodeTyIxOf(c.callArgs[k])
+        if (
+          at >= 0
+          && !tyHasTyVar(at)
+          && tyBearsNull(out[k])
+          && !tyEq(at, out[k])
+        ) {
+          widens = true
+        }
+        k = k + 1
+      }
+    }
+  }
+  if !widens { return none }
+  out
+}
+
+// The parameter types of generic `fn` then its result, with its type parameters bound by unifying
+// each declared parameter with its pin in `pt`; empty when one stays open or a pin does not fit.
+function monoGenDeclPinTys(fn: FuncDecl, pt: i32[]): i32[] {
+  const none: i32[] = []
+  if pt.length != fn.fnParams.length { return none }
+  const rN: string[] = []
+  const rT: i32[] = []
+  const decl: i32[] = []
+  for px in fn.fnParams {
+    const p = P.nodes[px]
+    if !(p is Param) || p.parType < 0 { return none }
+    decl.push(nodeTyIxOf(p.parType))
+  }
+  let i = 0
+  while i < pt.length {
+    if decl[i] < 0 || pt[i] < 0 || pt[i] >= T.tys.length { return none }
+    bindGenWalk(decl[i], pt[i], rN, rT)
+    i = i + 1
+  }
+  const out: i32[] = []
+  i = 0
+  while i < pt.length {
+    const t = substTyDeep(decl[i], rN, rT)
+    if t < 0 || tyHasTyVar(t) || !assignable(pt[i], t) { return none }
+    out.push(t)
+    i = i + 1
+  }
+  const r = substTyDeep(nodeTyIxOf(fn.fnRet), rN, rT)
+  if r < 0 || tyHasTyVar(r) { return none }
+  out.push(r)
+  out
+}
+
+// Whether type lists `a` and `b` are pairwise the same types.
+function monoTyListsEq(a: i32[], b: i32[]): boolean {
+  if a.length != b.length { return false }
+  let i = 0
+  while i < a.length {
+    if !tyEq(a[i], b[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
+// The function type spelling of closed parameter types `ps` and result `r`.
+function monoTysFnName(ps: i32[], r: i32): string {
+  monoConcreteFnTyName(mkFuncTy(ps, r))
+}
+
+// Each call taking a pin of binding `d`'s slot `path` is typed at closed parameters `ps`, the one
+// signature every pin takes, and its own closed result.
+function monoRetypePinCallsAt(d: i32, path: string[], ps: i32[]): i32 {
+  for cx in fnFlowDeclPathPinCalls(d, path) {
+    const c = P.nodes[cx]
+    if c is Call {
+      const cf = unwrapParen(c.callFn)
+      const ct = nodeTyIxOf(cf)
+      const rt = nodeTyIxOf(cx)
+      if (
+        cf >= 0
+        && ct >= 0
+        && ct < T.tys.length
+        && T.tys[ct] is TyFunc
+        && rt >= 0
+        && !tyHasTyVar(rt)
+        && c.callArgs.length == ps.length
+      ) {
+        nodeTyRecord(cf, mkFuncTy(ps, rt))
+      }
+    }
+  }
+  0
+}
+
 // For the binding `d` held at its one pin: each call taking that pin whose callee the checker left
 // an open type, as one past an inferred return is, is typed at its own arguments and result,
 // which are the pin's (D5062). In a body a generic's instances share, those types are closed, so
@@ -24438,6 +24660,22 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
       const tr = monoIdentAtPosIn(it[1], xn.identName, xn.pos, 0)
       if tr >= 0 { d = tr }
     }
+  }
+  // Pins its declared parameters widen, such as a function value and `null` at `((x: T) => T) |
+  // null`, are one signature: the declared one, with its type parameters bound (D9850).
+  const wide = monoRetGenWidePins(x, ctx, d, fr)
+  if wide.length > 1 {
+    const ps = wide.slice(0, wide.length - 1)
+    monoInstanceWidenRet = true
+    const wr = monoCoerceFnValueName(
+      x,
+      monoTysFnName(ps, wide[wide.length - 1]),
+      ctx,
+      -1,
+    )
+    monoInstanceWidenRet = false
+    if wr < 0 { return -1 }
+    return monoRetypePinCallsAt(d, noPath, ps)
   }
   const nm = monoSlotPinName(d, noPath, fr)
   if nm == "" && monoSlotRetCount(d, noPath, fr) <= 1 {
