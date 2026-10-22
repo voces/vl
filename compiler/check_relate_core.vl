@@ -4371,6 +4371,16 @@ export function holeFnArgDecls(a: i32): i32[] {
 // whose body gives another result at the closed parameter types `pts` than the one written
 // first, since a call through the binding runs either (D9003). False when it refuses nothing.
 export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
+  holeLetWritesDisagreeAt(a, pts, pts)
+}
+
+// `holeLetWritesDisagree`, judging each fixed-type function a slot holds at `fixed` (D10120);
+// an empty `fixed` judges none.
+export function holeLetWritesDisagreeAt(
+  a: i32,
+  pts: i32[],
+  fixed: i32[],
+): boolean {
   if inferQuiet || holeFnArgDecl(a) >= 0 { return false }
   const wp: i32[] = []
   for pt in pts {
@@ -4382,7 +4392,7 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
   holeLetReadsOf(a, seen, reads)
   for r in reads {
     if holeIsSlotRead(r) {
-      if holeSlotJudge(r, wp) { return true }
+      if holeSlotJudge(r, wp, fixed) { return true }
     } else if holeLetJudge(r, wp) {
       return true
     }
@@ -4546,7 +4556,7 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
 // `holeLetWritesDisagree` for the list element or record field `a` reads, or the element a `for`
 // loop `a` binds, every function stored there judged at `wp` against the one stored first
 // (D9060, D9090, D9092).
-function holeSlotJudge(a: i32, wp: i32[]): boolean {
+function holeSlotJudge(a: i32, wp: i32[], pts: i32[]): boolean {
   const p0: string[] = []
   let root = -1
   const an = P.nodes[a]
@@ -4574,15 +4584,22 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
     const args: i32[] = []
     if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
     for v in args {
-      if holeSlotArgJudge(v, rn.identName, path, wp) { return true }
+      if holeSlotArgJudge(v, rn.identName, path, wp, pts, 0) { return true }
     }
     return false
   }
   if !(P.nodes[bd] is LetDecl) { return false }
+  const init = parenPeelIx(cwBoundInitOf(rn.identName, fr))
+  if init >= 0 && init < P.nodes.length {
+    const cn = P.nodes[init]
+    if cn is Call && holeSlotRetJudge(cn, rn.identName, path, wp, pts, 0) {
+      return true
+    }
+  }
   const vals: i32[] = []
   const ats: i32[] = []
   const nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
-  holeSlotValsJudge(holeSlotName(rn.identName, path), vals, ats, nW, wp)
+  holeSlotValsJudge(holeSlotName(rn.identName, path), vals, ats, nW, wp, pts)
 }
 
 // The root of the place `root` and `p0` name, its steps in `out`, followed through each binding
@@ -4612,12 +4629,14 @@ function holeSlotRebase(root: i32, p0: string[], out: string[]): i32 {
 }
 
 // `holeSlotJudge` for argument `v` handed to the parameter `pNm` the slot `path` reads: an
-// inline list literal's elements, or the slot of the binding the argument names.
+// inline list literal's elements, or the slot of the binding it names, `depth` calls deep.
 function holeSlotArgJudge(
   v: i32,
   pNm: string,
   path: string[],
   wp: i32[],
+  pts: i32[],
+  depth: i32,
 ): boolean {
   const ix = parenPeelIx(v)
   if ix < 0 || ix >= P.nodes.length { return false }
@@ -4630,17 +4649,71 @@ function holeSlotArgJudge(
       vals.push(e)
       ats.push(e)
     }
-    return holeSlotValsJudge(holeSlotName(pNm, path), vals, ats, 0, wp)
+    return holeSlotValsJudge(holeSlotName(pNm, path), vals, ats, 0, wp, pts)
   }
+  if depth > 8 { return false }
+  if n is Call { return holeSlotRetJudge(n, pNm, path, wp, pts, depth) }
   if !(n is Ident) || !cwFramedNode(ix) { return false }
+  // A binding bound to another place reads that place's slot.
+  const rp: string[] = []
+  const rx = holeSlotRebase(ix, path, rp)
+  if rx != ix && rx >= 0 && rx < P.nodes.length {
+    return holeSlotArgJudge(rx, pNm, rp, wp, pts, depth + 1)
+  }
   const fr = covarRootFrame(ix)
   if fr == CW_FR_UNKNOWN { return false }
   const bd = cwSoleBinderOf(n.identName, fr)
-  if bd < 0 || bd >= P.nodes.length || !(P.nodes[bd] is LetDecl) {
+  if bd < 0 || bd >= P.nodes.length { return false }
+  const init = parenPeelIx(cwBoundInitOf(n.identName, fr))
+  if P.nodes[bd] is LetDecl && init >= 0 && init < P.nodes.length {
+    const cn = P.nodes[init]
+    if cn is Call && holeSlotRetJudge(cn, pNm, path, wp, pts, depth) {
+      return true
+    }
+  }
+  // A parameter handed on is each of its own calls' arguments (D10120).
+  if P.nodes[bd] is Param {
+    const args: i32[] = []
+    if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
+    for a in args {
+      if holeSlotArgJudge(a, n.identName, path, wp, pts, depth + 1) {
+        return true
+      }
+    }
     return false
   }
+  if !(P.nodes[bd] is LetDecl) { return false }
   const nW = cwSlotWrittenValues(n.identName, fr, path, vals, ats)
-  holeSlotValsJudge(holeSlotName(n.identName, path), vals, ats, nW, wp)
+  holeSlotValsJudge(holeSlotName(n.identName, path), vals, ats, nW, wp, pts)
+}
+
+// `holeSlotArgJudge` for the call `c`: each value a top-level function declaring no type
+// parameter returns, when `c` calls one.
+function holeSlotRetJudge(
+  c: Call,
+  pNm: string,
+  path: string[],
+  wp: i32[],
+  pts: i32[],
+  depth: i32,
+): boolean {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return false }
+  const cf = P.nodes[parenPeelIx(c.callFn)]
+  if !(cf is Ident) { return false }
+  const fx = fnDeclIx[cf.identName] ?? -1
+  if fx < 0 || fx >= P.nodes.length || lookupFnDeclNode(cf.identName) != fx {
+    return false
+  }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) || fd.fnTyParams.length > 0 || fd.fnBody < 0 {
+    return false
+  }
+  const rv: i32[] = []
+  collectRetValues(fd.fnBody, rv)
+  for r in rv {
+    if holeSlotArgJudge(r, pNm, path, wp, pts, depth + 1) { return true }
+  }
+  false
 }
 
 // Refuses the first function among `vals` (stored at `ats`, the last `nW` of them by a write)
@@ -4651,8 +4724,10 @@ function holeSlotValsJudge(
   ats: i32[],
   nW: i32,
   wp: i32[],
+  pts: i32[],
 ): boolean {
   if nW < 0 || vals.length < 2 { return false }
+  if holeSlotFixedJudge(nm, vals, ats, nW, pts) { return true }
   const ft = mkFuncTy(wp, TY_I32)
   const noN: string[] = []
   const noT: i32[] = []
@@ -4696,6 +4771,104 @@ function holeSlotValsJudge(
     k = k + 1
   }
   false
+}
+
+// Refuses the first function with fixed parameter types among `vals` (stored at `ats`, the last
+// `nW` by a write) that a call at the argument types `pts` cannot pass, when the place also
+// holds a generic function, which the call instances at those types (D10120).
+function holeSlotFixedJudge(
+  nm: string,
+  vals: i32[],
+  ats: i32[],
+  nW: i32,
+  pts: i32[],
+): boolean {
+  let gen = false
+  for v in vals {
+    const d = cwHeldFnOf(v)
+    if d >= 0 && d < P.nodes.length {
+      const f = P.nodes[d]
+      if f is FuncDecl && f.fnTyParams.length > 0 { gen = true }
+    }
+  }
+  if !gen { return false }
+  let k = 0
+  while k < vals.length && k < ats.length {
+    const d = cwHeldFnOf(vals[k])
+    const vt = holeFixedFnTyOf(vals[k], d)
+    if vt >= 0 && vt < T.tys.length {
+      const ft = T.tys[vt]
+      if ft is TyFunc && ft.fnParamTypes.length == pts.length {
+        let j = 0
+        while j < pts.length {
+          if !assignable(pts[j], ft.fnParamTypes[j]) {
+            tErr(
+              holeFixedMisfitMsg(nm, pts, d, vt, k < vals.length - nW),
+              ats[k],
+            )
+            return true
+          }
+          j = j + 1
+        }
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+// The function type of the value `v`, a name holding the declaration `d`, when `d` declares no
+// type parameter and annotates every parameter; -1 otherwise, and for any value but a name.
+function holeFixedFnTyOf(v: i32, d: i32): i32 {
+  const vx = parenPeelIx(v)
+  if vx < 0 || vx >= P.nodes.length || !(P.nodes[vx] is Ident) { return -1 }
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const f = P.nodes[d]
+  if !(f is FuncDecl) || f.fnTyParams.length > 0 { return -1 }
+  for pi in f.fnParams {
+    const p = P.nodes[pi]
+    if !(p is Param) || p.parType < 0 || p.parRest == 1 || p.parOpt == 1 {
+      return -1
+    }
+  }
+  let t = nodeTyOf(parenPeelIx(v))
+  if (t < 0 || t >= T.tys.length) && f.fnName != "" { t = lookup(f.fnName) }
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) || tyHasHole(t) { return -1 }
+  t
+}
+
+// The `holeSlotFixedJudge` refusal: function `d`, typed `vt`, written (or, `stored`, held by a
+// literal) to the place `nm` names, cannot take a call through it at `pts`.
+function holeFixedMisfitMsg(
+  nm: string,
+  pts: i32[],
+  d: i32,
+  vt: i32,
+  stored: boolean,
+): string {
+  let verb = "write "
+  let into = " to "
+  if stored {
+    verb = "store "
+    into = " in "
+  }
+  let ps = "("
+  let j = 0
+  while j < pts.length {
+    if j > 0 { ps = ps + ", " }
+    ps = ps + tyToStr(widenLitTy(pts[j]))
+    j = j + 1
+  }
+  ps = ps + ")"
+  "cannot "
+    + verb
+    + holeDeclName(d)
+    + into
+    + nm
+    + ": a call through it at "
+    + ps
+    + " runs it, and it is "
+    + tyToStr(vt)
 }
 
 // How a diagnostic names the place `path` under `nm`: `'r.f'`, or an element of `'xs'`.
