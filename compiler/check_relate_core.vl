@@ -551,6 +551,7 @@ import {
   tyHasNullMember,
   tyHasTyVar,
   tyHoldsNumericPrim,
+  tyIsLitUnionLike,
   unionArmSubsumedBy,
   unionCoversTy,
   unionDropSubsumedArms,
@@ -3348,15 +3349,32 @@ export function fnSlotAssignable(src: i32, dst: i32) {
 }
 
 // `fnSlotAssignable` for a function slot's RESULT, which also admits a result widened to its own
-// nullable (`f64[]` at `f64[] | null`). The reps differ, so a delivered function value is wrapped
-// in `fvaAdapt`'s adapter, which widens at the call; a function inside a container is refused
-// there instead (D9781). A parameter stays invariant in nullability.
+// nullable, a `null` result to any nullable, and a closed non-union result to a union admitting
+// it. The reps differ, so a delivered value is wrapped in `fvaAdapt`'s adapter and a function in a
+// container is refused (D9781). A parameter stays invariant.
 function fnSlotRetAssignable(src: i32, dst: i32) {
+  if isNullTy(src) && !isNullTy(dst) && tyBearsNull(dst) { return true }
+  if fnRetUnionWidens(src, dst) { return true }
   if src >= 0 && !tyBearsNull(src) {
     const d = nonNullTy(dst)
     if d >= 0 && d != dst && fnSlotAssignable(src, d) { return true }
   }
   fnSlotAssignable(src, dst)
+}
+
+// Whether closed result `src`, no union itself, is a value of the closed value union `dst`.
+function fnRetUnionWidens(src: i32, dst: i32): boolean {
+  if src < 0 || dst < 0 || src >= T.tys.length || dst >= T.tys.length {
+    return false
+  }
+  const s = T.tys[src]
+  if !(T.tys[dst] is TyUnion) || s is TyUnion || s is TyFunc || isNullTy(src) {
+    return false
+  }
+  !tyHasTyVar(src)
+    && !tyHasTyVar(dst)
+    && !tyIsLitUnionLike(dst, 8)
+    && assignable(src, dst)
 }
 
 // Whether function type `src` reaches `dst`, or a function member of union `dst` other than `src`
@@ -6337,14 +6355,17 @@ function bindFnRetNullDefault(
 
 // A function result `T | string` or `T[] | string` given a closed result its fixed members
 // admit leaves `T` holding no value, so `T` takes the unbound default `i32` and the call boxes
-// the result at it; no read in the body can observe the default (D10161).
+// the result at it; no read in the body can observe the default (D10161). Given the enclosing
+// generic's own type parameter, a bare `T` is bound to it, so each instance boxes its own (D10241).
 function bindFnRetUnionDefault(
   expIx: i32,
   atIx: i32,
   uNames: string[],
   uTys: i32[],
 ) {
-  if tyHasTyVar(atIx) { return 0 }
+  const av = if atIx >= 0 && atIx < T.tys.length { T.tys[atIx] } else { T.tys[TY_I32] }
+  const enc = av is TyVar && tpEnvTyOfName(av.tvName) >= 0
+  if tyHasTyVar(atIx) && !enc { return 0 }
   const gms: i32[] = []
   flattenVariantsInto(expIx, gms)
   let open = -1
@@ -6356,6 +6377,14 @@ function bindFnRetUnionDefault(
     }
   }
   if open < 0 { return 0 }
+  if enc {
+    const ov = T.tys[open]
+    if ov is TyVar && bindOf(uNames, uTys, ov.tvName) < 0 {
+      uNames.push(ov.tvName)
+      uTys.push(atIx)
+    }
+    return 0
+  }
   const pms: i32[] = []
   flattenVariantsInto(atIx, pms)
   for p in pms {
