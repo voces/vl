@@ -1344,6 +1344,12 @@ function ffMethodAt(ix: i32, recv: i32, name: string, k: string): i32 {
     if name == "get" || name == "pop" || name == "shift" || name == "at" {
       return ffKid(r, k)
     }
+    // A whole copy of a list of functions is the spread copy the flow pass rewrites it to.
+    if fnFlowWholeSliceRecv(ix) >= 0 {
+      const s = ffNew()
+      ffInto(ffKid(s, k), ffKid(r, k))
+      return s
+    }
     if (
       name == "slice"
       || name == "concat"
@@ -1354,6 +1360,49 @@ function ffMethodAt(ix: i32, recv: i32, name: string, k: string): i32 {
     }
   }
   -1
+}
+
+// The list `xs` of call `xs.slice(0)` when `xs` is a `const` list literal of functions named by
+// their declarations, so the call copies it whole as `[...xs]` does; -1 for any other call.
+export function fnFlowWholeSliceRecv(ix: i32): i32 {
+  const n = P.nodes[ix]
+  if !(n is Call) || n.callArgs.length != 1 { return -1 }
+  const a = P.nodes[unwrapParen(n.callArgs[0])]
+  if !(a is NumLit) || a.numText != "0" { return -1 }
+  const c = unwrapParen(n.callFn)
+  if c < 0 { return -1 }
+  const cm = P.nodes[c]
+  if !(cm is Member) || cm.memProp != "slice" { return -1 }
+  const recv = unwrapParen(cm.memObj)
+  if recv < 0 || !(P.nodes[recv] is Ident) { return -1 }
+  const rt = nodeTyIxOf(recv)
+  if rt < 0 || rt >= T.tys.length { return -1 }
+  const lt = T.tys[rt]
+  if !(lt is TyArray) || !ffTyHasFn(lt.aElem, 0) { return -1 }
+  const d = identDeclOf(recv)
+  if d < 0 { return -1 }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return -1 }
+  const lit = P.nodes[unwrapParen(dn.letInit)]
+  if !(lit is ArrayLit) || lit.arrElems.length == 0 { return -1 }
+  for e in lit.arrElems {
+    if !ffNamesFnDecl(e, 0) { return -1 }
+  }
+  recv
+}
+
+// Whether `e` names a declared function or a parameter, directly or through `const` aliases.
+function ffNamesFnDecl(e: i32, depth: i32): boolean {
+  const x = unwrapParen(e)
+  if x < 0 || depth > 8 || !(P.nodes[x] is Ident) { return false }
+  const d = identDeclOf(x)
+  if d < 0 { return false }
+  const dn = P.nodes[d]
+  if dn is FuncDecl || dn is Param { return true }
+  dn is LetDecl
+    && dn.letKw == "const"
+    && dn.letInit >= 0
+    && ffNamesFnDecl(dn.letInit, depth + 1)
 }
 
 // Whether `a` is a lambda literal, or the name of a declared function, handed to `.map` /
