@@ -430,6 +430,7 @@ import {
   primNameStr,
   softenLitTy,
   tyBearsNull,
+  tyEqSameHoles,
   tyHasHole,
   tyIsHole,
   tyIsLitUnion,
@@ -472,6 +473,7 @@ import {
   cwFnValueWriteOf,
   cwForInBinderOf,
   cwFramedNode,
+  cwGetRecv,
   cwHeldFnOf,
   cwParamArgs,
   cwPeel,
@@ -4178,8 +4180,7 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
   for r in reads {
-    const rn = P.nodes[r]
-    if rn is Index || rn is Member || rn is ForIn || rn is Param {
+    if holeIsSlotRead(r) {
       if holeSlotJudge(r, wp) { return true }
     } else if holeLetJudge(r, wp) {
       return true
@@ -4196,10 +4197,15 @@ export function holeFnReadsSlot(a: i32): boolean {
   const seen: i32[] = []
   holeLetReadsOf(a, seen, reads)
   for r in reads {
-    const rn = P.nodes[r]
-    if rn is Index || rn is Member || rn is ForIn || rn is Param { return true }
+    if holeIsSlotRead(r) { return true }
   }
   false
+}
+
+// Whether read `r` reads a list element, a map value, a record field or a `for` loop's element.
+function holeIsSlotRead(r: i32): boolean {
+  const rn = P.nodes[r]
+  rn is Index || rn is Member || rn is ForIn || rn is Param || cwGetRecv(r) >= 0
 }
 
 // Add to `out` each read of a `let`, list element, record field or `for` element that the
@@ -4218,6 +4224,11 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
   }
   seen.push(ix)
   const n = P.nodes[ix]
+  // A `.get` reads a value of the map, or an element of the list, it is called on (D9311).
+  if cwGetRecv(ix) >= 0 {
+    out.push(ix)
+    return 0
+  }
   if n is Call {
     const d = cwCalleeDeclOf(n.callFn)
     if d < 0 || d >= P.nodes.length { return 0 }
@@ -4348,10 +4359,64 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
   const fr = covarRootFrame(root)
   if fr == CW_FR_UNKNOWN { return false }
   const bd = cwSoleBinderOf(rn.identName, fr)
-  if bd < 0 || !(P.nodes[bd] is LetDecl) { return false }
+  if bd < 0 || bd >= P.nodes.length { return false }
+  // A parameter's list is each call's argument, judged one call at a time (D9280).
+  if P.nodes[bd] is Param {
+    const args: i32[] = []
+    if cwElemCallbackRecv(bd) >= 0 || !cwParamArgs(bd, args) { return false }
+    for v in args {
+      if holeSlotArgJudge(v, rn.identName, path, wp) { return true }
+    }
+    return false
+  }
+  if !(P.nodes[bd] is LetDecl) { return false }
   const vals: i32[] = []
   const ats: i32[] = []
   const nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
+  holeSlotValsJudge(holeSlotName(rn.identName, path), vals, ats, nW, wp)
+}
+
+// `holeSlotJudge` for argument `v` handed to the parameter `pNm` the slot `path` reads: an
+// inline list literal's elements, or the slot of the binding the argument names.
+function holeSlotArgJudge(
+  v: i32,
+  pNm: string,
+  path: string[],
+  wp: i32[],
+): boolean {
+  const ix = parenPeelIx(v)
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = P.nodes[ix]
+  const vals: i32[] = []
+  const ats: i32[] = []
+  if n is ArrayLit {
+    if path.length != 1 || path[0] != "[]" { return false }
+    for e in n.arrElems {
+      vals.push(e)
+      ats.push(e)
+    }
+    return holeSlotValsJudge(holeSlotName(pNm, path), vals, ats, 0, wp)
+  }
+  if !(n is Ident) || !cwFramedNode(ix) { return false }
+  const fr = covarRootFrame(ix)
+  if fr == CW_FR_UNKNOWN { return false }
+  const bd = cwSoleBinderOf(n.identName, fr)
+  if bd < 0 || bd >= P.nodes.length || !(P.nodes[bd] is LetDecl) {
+    return false
+  }
+  const nW = cwSlotWrittenValues(n.identName, fr, path, vals, ats)
+  holeSlotValsJudge(holeSlotName(n.identName, path), vals, ats, nW, wp)
+}
+
+// Refuses the first function among `vals` (stored at `ats`, the last `nW` of them by a write)
+// whose result at `wp` differs from the one stored first, naming the place `nm`.
+function holeSlotValsJudge(
+  nm: string,
+  vals: i32[],
+  ats: i32[],
+  nW: i32,
+  wp: i32[],
+): boolean {
   if nW < 0 || vals.length < 2 { return false }
   const ft = mkFuncTy(wp, TY_I32)
   const noN: string[] = []
@@ -4381,7 +4446,7 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
     if !tySame(rs[k], rs[b]) {
       tErr(
         holeLetDisagreeMsg(
-          holeSlotName(rn.identName, path),
+          nm,
           wp,
           ds[k],
           rs[k],
@@ -4630,7 +4695,12 @@ function holeOpenFnRetAt(f: i32, c: i32, bNames: string[], bTys: i32[]): i32 {
   const p0 = T.tys[ft.fnParamTypes[0]]
   if !(p0 is TyVar) || !tyIsHole(ft.fnParamTypes[0]) { return -1 }
   const d = holeParamDecl(p0.tvName)
-  if d < 0 || nodeTyOf(d) != f || holeFnArgDepth >= HOLE_CALL_NODE_MAX {
+  // A declared function read by name is a copy of its signature naming the same holes (D9280).
+  if (
+    d < 0
+    || !tyEqSameHoles(nodeTyOf(d), f)
+    || holeFnArgDepth >= HOLE_CALL_NODE_MAX
+  ) {
     return -1
   }
   const ats: i32[] = []
@@ -5588,7 +5658,9 @@ export function bindGenWalk(
     if a is TyNullable { bindGenWalk(e.nInner, a.nInner, bNames, bTys) }
     else if atIx != TY_NULL { bindGenWalk(e.nInner, atIx, bNames, bTys) }
   } else if e is TyObj {
-    if a is TyObj {
+    // A record with no type variable binds nothing, and walking a diamond's shared fields
+    // pairwise would visit it once per path (D9331).
+    if a is TyObj && tyHasTyVar(expIx) {
       const enames = e.objFieldNames
       const etys = e.objFieldTypes
       const anames = a.objFieldNames

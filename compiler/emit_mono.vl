@@ -154,6 +154,7 @@ import {
   tyToStr,
   tyToStructStr,
   tyVarRenameRow,
+  tyWrapsRecord,
 } from "./check_types"
 import { blockHasBareReturn, fnResultUnconsumed } from "./check_unconsumed"
 import { collectValuedReturns } from "./check_nj_gate"
@@ -405,6 +406,7 @@ import {
   monoPinSubRow,
   monoPinSubT,
   monoProgStmts,
+  monoRetCopyReads,
   monoStubSlots,
   monoSupersededObjTys,
   monoTwoListRet,
@@ -1127,6 +1129,31 @@ function monoArmsNarrowFrom(
   true
 }
 
+// Whether `ty` is a list whose element peels, through lists and nullables, to a record: its
+// render is a brace span suffixed `[]`, or "".
+function monoTyIsListOfRecord(ty: i32): boolean {
+  ty >= 0 && ty < T.tys.length && T.tys[ty] is TyArray && tyWrapsRecord(ty)
+}
+
+// Whether `wide` or one of the arms `unionArmsOf` resolves it to holds a brace: the only
+// spellings a record's render can equal.
+function monoWideArmsHoldBrace(wide: string): boolean {
+  if strContains(wide, "{") { return true }
+  const arms: string[] = []
+  unionArmsOf(wide, arms)
+  for a in arms {
+    if strContains(a, "{") { return true }
+  }
+  false
+}
+
+// The number of arms `unionArmsOf` resolves `wide` to, as `monoArmsNarrowFrom` reads them.
+function monoArmCount(wide: string): i32 {
+  const arms: string[] = []
+  unionArmsOf(wide, arms)
+  arms.length
+}
+
 // Whether arena type `ty` renders with more than one top-level arm: a union or a nullable.
 function monoTyIsUnionShaped(ty: i32): boolean {
   if ty < 0 { return false }
@@ -1158,6 +1185,21 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // A record renders as a brace span, so it can be an arm of `wide` only when `wide` holds a
   // brace; the render doubles with each nested level of a shared shape, so it is skipped (D2780).
   if monoTyIsObj(nt) && !strContains(wide, "{") {
+    return monoNarrowedNominalPinName(nt, "", wide)
+  }
+  // So does a list of records, which no rung below answers unless one of `wide`'s arms is
+  // its brace-holding render (D9330).
+  if monoTyIsListOfRecord(nt) && !monoWideArmsHoldBrace(wide) { return "" }
+  // A nullable record has two arms, so it is a proper arm subset of `wide` only past two arms;
+  // the nominal rung answers it only once its names have matched.
+  if (
+    nt >= 0
+    && T.tys[nt] is TyNullable
+    && tyWrapsRecord(nt)
+    && !monoWideArmsHoldBrace(wide)
+    && monoArmCount(wide) <= 2
+    && !monoNulRecNamesNarrow(nt, wide)
+  ) {
     return monoNarrowedNominalPinName(nt, "", wide)
   }
   const n = tyToEmitName(nt)
@@ -1192,18 +1234,23 @@ function monoNarrowedNominalPinName(nt: i32, n: string, wide: string): string {
 // render `n`, when the record's nominal name and `null` are both arms of `wide`, which the
 // whole-spelling membership test above cannot see (D3099). "" otherwise.
 function monoNarrowedNulRecPinName(nt: i32, n: string, wide: string): string {
-  if nt < 0 { return "" }
+  if !monoNulRecNamesNarrow(nt, wide) { return "" }
+  if monoAnnPinName(n) == n { return n }
+  ""
+}
+
+// Whether `nt` is a nullable record whose nominal name and `null` are both arms of `wide`, and
+// `wide` is not already that nullable (whose ladder answer stands).
+function monoNulRecNamesNarrow(nt: i32, wide: string): boolean {
+  if nt < 0 { return false }
   const t = T.tys[nt]
   if t is TyNullable {
     const inom = nominalStructNameOfTy(t.nInner)
-    if inom == "" { return "" }
-    // `wide` already `Circle | null` is no wider: the ladder's answer stands.
-    if nullablePartOf(wide) == inom { return "" }
-    if !monoNameNarrowsFrom(inom, wide) { return "" }
-    if !monoNameNarrowsFrom("null", wide) { return "" }
-    if monoAnnPinName(n) == n { return n }
+    if inom == "" { return false }
+    if nullablePartOf(wide) == inom { return false }
+    return monoNameNarrowsFrom(inom, wide) && monoNameNarrowsFrom("null", wide)
   }
-  ""
+  false
 }
 
 // The pin of a value union `nt` holding literal arms, read out of the nullable union `wide` with
@@ -1339,10 +1386,16 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
   if nt < 0 { return "" }
   // A record renders with no `null` arm, so it never widens; skipping its render is D2780's.
   if monoTyIsObj(nt) { return "" }
+  // Nor does a list, whose render closes on `[]`; and a nullable record's non-null part is
+  // its brace span, which a `chosen` holding no brace cannot be (D9330).
+  if T.tys[nt] is TyArray { return "" }
+  if tyWrapsRecord(nt) && !strContains(chosen, "{") { return "" }
   const n = tyToEmitName(nt)
   if n == "" { return monoElemlessNulListPinName(nt, chosen) }
   if n == chosen { return "" }
-  if nullablePartOf(n) != chosen { return "" }
+  // `nullablePartOf` answers `n` less five bytes or "", so the length decides first without
+  // scanning a render that doubles per level of a nested record (D9330).
+  if n.length != chosen.length + 5 || nullablePartOf(n) != chosen { return "" }
   if monoAnnPinName(n) != n { return "" }
   n
 }
@@ -1600,6 +1653,8 @@ function monoDeclRecListPinName(ax: i32, w: string): string {
   if ty < 0 || !(T.tys[ty] is TyArray) { return "" }
   const nm = structNameOfTy(tyArrayElemIx(ty))
   if nm == "" || structIndexOfTypeName(nm) < 0 { return "" }
+  // The render is a brace span or "", so a `w` holding no brace is not it (D9330).
+  if w != "" && !strContains(w, "{") { return "" }
   if w != tyToEmitName(ty) { return "" }
   nm + "[]"
 }
@@ -1758,11 +1813,9 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     if nd is ArrayLit {
       // A nested list literal over a `boolean` leaf: `arrLitElemName`'s nested-list
       // rung has no boolean member, so `[[true]]` pins `i32[][]`. `nodeTyName` renders
-      // the checker's whole array type, which is the pin this site wants.
-      const nlt = nodeTyName(ix)
-      // The arena: two `TyArray` hops answer directly what two grammar cuts over a render
-      // asked. The render is still the pin returned below; only the question moved.
-      if nodeTyNestedElemIsBoolPrim(ix) { return nlt }
+      // the checker's whole array type, which is the pin this site wants; two `TyArray` hops
+      // ask the question, so the render is built only for the pin.
+      if nodeTyNestedElemIsBoolPrim(ix) { return nodeTyName(ix) }
       // A spread copy pins the row it is built at, its source's (D2938).
       const spn = spreadLitSrcRowName(ix, fnIx)
       if spn != "" { return arrElemSuffixed(spn) }
@@ -9740,6 +9793,9 @@ function monoMakeInstance(
   const foldWas = substNullFoldOffFor(pinTys)
   const ownWas = monoInstOwn
   monoInstOwn = monoTemplateOwner(origFe)
+  // The deliveries inside the instance's body are its own, not the one being built.
+  const widenWas = monoInstanceWidenRet
+  monoInstanceWidenRet = false
   const rc = monoMakeInstanceGo(
     origFe,
     pinned,
@@ -9754,6 +9810,7 @@ function monoMakeInstance(
   )
   substNullFoldRestore(foldWas)
   monoInstOwn = ownWas
+  monoInstanceWidenRet = widenWas
   rc
 }
 
@@ -11519,6 +11576,10 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  const retWiden = monoInstRetWidenName
+  const retWidenTy = monoInstRetWidenTy
+  monoInstRetWidenName = ""
+  monoInstRetWidenTy = 0 - 1
   if monoPinColsMisalignedFail(pinned, pinTys) < 0 { return -1 }
   // Every caller bounds `origFe` by `monoGen`, which `monoOrigNode` stays parallel to.
   if origFe < 0 || origFe >= monoOrigNode.length {
@@ -11539,6 +11600,8 @@ function monoMakeInstanceGo(
       tvV,
       cbFnNames,
     )
+    // arena-tick exempt: a fresh instance key record, read by the registry, never by a pass.
+    if retWiden != "" { k.key = k.key + "=>" + retWiden }
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
     if (
@@ -11616,6 +11679,7 @@ function monoMakeInstanceGo(
       retOutIx,
     )
     if nret < -1 { return -1 }
+    const nretW = if retWiden != "" { synthTypeRefTy(retWiden, -1, retWidenTy) } else { nret }
     const twoListTy = retOutIx[1]
     let instName = fn.fnName
     // A frame-keyed instance never takes the template's slot, whose frame is the template's.
@@ -11667,7 +11731,7 @@ function monoMakeInstanceGo(
       letBN,
       letBT,
     )
-    const nfn = monoMakeInstanceFunc(fn, origFe, nret, instBody, instName, nps)
+    const nfn = monoMakeInstanceFunc(fn, origFe, nretW, instBody, instName, nps)
     const instFe = monoMakeInstanceInstall(
       fn,
       nfn,
@@ -11729,6 +11793,38 @@ function monoFnValueParamTys(t: i32, n: i32): i32[] {
 // type `monoInstanceFor` must then reproduce, or "" for any return.
 let monoInstanceExactRet = false
 let monoInstanceRetName = ""
+
+// Set while a generic is delivered past a return at the flow table's pin: an instance whose
+// result only converts to the pin's result is built returning the pin's (D9282).
+let monoInstanceWidenRet = false
+
+// The result the next instance `monoMakeInstance` builds is returned at, when that delivery's
+// own result only converts to it; "" for the substituted result.
+let monoInstRetWidenName = ""
+let monoInstRetWidenTy = 0 - 1
+
+// The result annotation of generic `fn` spelled through the bindings `tvN`/`tvV`.
+function monoInstanceSubstRet(
+  fn: FuncDecl,
+  tvN: string[],
+  tvV: string[],
+): string {
+  const rs = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
+  if monoAnnHasTyParam(rs, fn.fnTyParams) {
+    return monoSubstAnn(rs, fn.fnTyParams, tvN, tvV)
+  }
+  rs
+}
+
+// The result type of function type `t` (a nullable one's function arm), or -1.
+function monoFnTyRet(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const nt = nonNullTy(t)
+  if nt < 0 || nt >= T.tys.length { return -1 }
+  const f = T.tys[nt]
+  if f is TyFunc { return f.fnRet }
+  -1
+}
 
 // Materialize or reuse the instance of generic `origFe` for an annotated function-typed
 // binding, pinning each parameter to the annotation's param type name and pointing
@@ -11796,11 +11892,28 @@ function monoInstanceFor(
     }
     if monoInstanceExactRet {
       if fn.fnRet < 0 || monoInstanceRetName == "" { return 0 }
-      let rs = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
-      if monoAnnHasTyParam(rs, fn.fnTyParams) {
-        rs = monoSubstAnn(rs, fn.fnTyParams, tvN, tvV)
+      if (
+        normTypeAtom(monoInstanceSubstRet(fn, tvN, tvV))
+        != monoInstanceRetName
+      ) {
+        return 0
       }
-      if normTypeAtom(rs) != monoInstanceRetName { return 0 }
+    } else if (
+      monoInstanceWidenRet
+      && fn.fnRet >= 0
+      && monoInstanceRetName != ""
+    ) {
+      // A result that only converts to the slot's own result is returned at it (D9282).
+      const rs = monoInstanceSubstRet(fn, tvN, tvV)
+      if normTypeAtom(rs) != monoInstanceRetName {
+        let want = monoFnTyRet(expTy)
+        if want < 0 { want = nameToTy(monoInstanceRetName) }
+        const got = nameToTy(rs)
+        if want >= 0 && got >= 0 && assignable(got, want) {
+          monoInstRetWidenName = monoInstanceRetName
+          monoInstRetWidenTy = want
+        }
+      }
     }
     // A type parameter the boundary binds nothing defaults as at an inferred call, so the
     // binding's instance is the direct call's.
@@ -11949,7 +12062,7 @@ function monoCoerceFnValueName(
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetName = ""
-            if monoInstanceExactRet {
+            if monoInstanceExactRet || monoInstanceWidenRet {
               monoInstanceRetName = normTypeAtom(
                 annRetNameOf(peelGroupParens(tname)),
               )
@@ -12125,7 +12238,7 @@ function monoIfBoundRetAtPin(at: i32, ctx: i32): i32 {
   const key = if lf[1] >= 0 { lf[1] } else { g0 }
   const noPath: string[] = []
   const ct = monoSlotPinName(key, noPath, fr)
-  if ct == "" { return monoAskRetCopies(fr, key, ctx) }
+  if ct == "" { return monoAskRetCopies(fr, key, ctx, -1) }
   if monoCoerceFnValueName(iv, ct, fr, -1) < 0 { return -1 }
   monoRetypeIfInit(init, g0, at, fr)
   monoRetypePinCalls(key, noPath)
@@ -22281,21 +22394,49 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
     }
   }
   const nm = monoSlotPinName(d, noPath, fr)
-  if nm == "" { return monoAskRetCopies(fr, d, ctx) }
-  if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
+  if nm == "" || monoSlotRetCount(d, noPath, fr) > 1 {
+    // An alias's refused read is the generic its initializer names.
+    let rd = x
+    const dn = P.nodes[d]
+    if lf[1] >= 0 && dn is LetDecl && dn.letInit >= 0 {
+      rd = unwrapParen(dn.letInit)
+    }
+    return monoAskRetCopies(fr, d, ctx, rd)
+  }
+  monoInstanceWidenRet = true
+  const cr = monoCoerceFnValueName(x, nm, ctx, -1)
+  monoInstanceWidenRet = false
+  if cr < 0 { return -1 }
   monoRetypePinCalls(d, noPath)
 }
 
-// For a value keyed `d` in frame `fr` that frame `ctx` returns with no one pin: two pins past
-// the return ask for a copy of the function per result pin (D5531). An instance asks for its
-// template, which is what the plan copies.
-function monoAskRetCopies(fr: i32, d: i32, ctx: i32): i32 {
+// A generic read `x` (keyed `d` in frame `fr`) that `ctx` returns past two pins or two results
+// asks for a copy of `ctx`'s template per pin, and is refused until the copies exist even when
+// another delivery already instanced the generic (D9380, D9383).
+function monoAskRetCopies(fr: i32, d: i32, ctx: i32, x: i32): i32 {
   const noPath: string[] = []
   const it = monoFrameInstTmpl(ctx)
   let asked = ctx
   if it[0] == ctx && it[1] >= 0 { asked = it[1] }
-  if monoDeclPathPins([fr, d], noPath).length > 1 { fsAsk(asked) }
+  if (
+    monoDeclPathPins([fr, d], noPath).length > 1
+    || monoSlotRetCount(d, noPath, fr) > 1
+  ) {
+    fsAsk(asked)
+    if x >= 0 && !i32ListHas(monoRetCopyReads, x) { monoRetCopyReads.push(x) }
+  }
   0
+}
+
+// How many distinct results the return annotations pin slot `path` of binding or literal `d` at
+// in frame `fr`, a declined walk not counting.
+function monoSlotRetCount(d: i32, path: string[], fr: i32): i32 {
+  const noDead: {[i32]: boolean} = Map()
+  const seen: string[] = []
+  for r in monoDeclPathKeys([fr, d], path, true, noDead) {
+    if r != FF_PIN_DECLINE && !strListHas(seen, r) { seen.push(r) }
+  }
+  seen.length
 }
 
 // Whether every write of the binding `d` the checker gave a closed function type takes the
@@ -22877,6 +23018,7 @@ export function monomorphize(stmts: i32[]) {
   monoBuiltinCbLamsBuilt = false
   monoDeliveredArgs = []
   monoStubSlots = []
+  monoRetCopyReads = []
   monoInertValues = []
   monoInertCalled = []
   monoInertArgAt = []
