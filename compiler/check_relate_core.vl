@@ -491,6 +491,7 @@ import { cexNeg, cexNotConst, cexOfLexeme, cexOk } from "./const_exact"
 import { numLexIsFloat } from "./emit_bignum"
 import { nodeLastTok, nodeStartTok } from "./fmt_util"
 import { i32ListHas } from "./listutil"
+import { pairMemoClear, pairMemoGet, pairMemoNew, pairMemoPut } from "./memo"
 import {
   mimpAnyProgramSpec,
   mimpExportedByNote,
@@ -3391,16 +3392,41 @@ export function assignable(src: i32, dst: i32) {
   if src == dst { return true }
   let gi = asgSrcStack.length - 1
   while gi >= 0 {
-    if asgSrcStack[gi] == src && asgDstStack[gi] == dst { return true }
+    if asgSrcStack[gi] == src && asgDstStack[gi] == dst {
+      asgGuardHits = asgGuardHits + 1
+      return true
+    }
     gi = gi - 1
   }
+  const tag = nomLitRelax
+  const seen = pairMemoGet(asgMemo, src, dst, tag)
+  if seen >= 0 { return seen == 1 }
+  const hits = asgGuardHits
+  const epoch = tyMutEpoch
   asgSrcStackPush(src)
   asgDstStackPush(dst)
   const ok = assignableGo(src, dst)
   asgSrcStackPop()
   asgDstStackPop()
+  if (
+    asgSrcStack.length > 0
+    && asgGuardHits == hits
+    && epoch == tyMutEpoch
+    && tag >= 0
+    && T.tys[src] is TyObj
+  ) {
+    pairMemoPut(asgMemo, src, dst, tag, ok)
+  }
+  if asgSrcStack.length == 0 { pairMemoClear(asgMemo) }
   ok
 }
+
+// The record pairs one outermost `assignable` call decided without assuming a pair still being
+// compared, and without an arena write under it, so a sub-record a diamond shares is related
+// once per call (D9930). An answer carries the literal relaxation of the call that decided it.
+let asgGuardHits = 0
+
+const asgMemo = pairMemoNew()
 
 // A union source `members` fits `dst` when every member does. A value box holding a numeric
 // member that only widens to a numeric target has no conversion yet (D2611).
