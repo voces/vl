@@ -3886,21 +3886,14 @@ export function monoSubstAnn(
   // already is (`ann.slice(0, mi + 2)`), never rebuilt from parts, and the re-render is gated on
   // the value actually moving — so a concrete map annotation returns verbatim and never becomes a second intern key.
   if nameIsMap(ann) {
-    let mi = 2
-    while mi < ann.length - 1 {
-      if ann[mi] == ']' {
-        if ann[mi + 1] == ':' {
-          const mval = ann.slice(mi + 2, ann.length - 1)
-          if mval == "" { return ann }
-          const msub = monoSubstAnn(mval, typarams, tvN, tvV)
-          if msub == "" { return "" }
-          if msub == mval { return ann }
-          return ann.slice(0, mi + 2) + msub + "}"
-        }
-      }
-      mi = mi + 1
-    }
-    return ann
+    const mi = monoMapKeyEnd(ann)
+    if mi < 0 { return ann }
+    const mval = ann.slice(mi + 2, ann.length - 1)
+    if mval == "" { return ann }
+    const msub = monoSubstAnn(mval, typarams, tvN, tvV)
+    if msub == "" { return "" }
+    if msub == mval { return ann }
+    return ann.slice(0, mi + 2) + msub + "}"
   }
   const parts: string[] = []
   const gHead = annGenAppDecompose(ann, parts)
@@ -4066,23 +4059,18 @@ function joinUnionAtoms(atoms: string[]): string {
   out
 }
 
-// The one non-`null` atom of union name `n`, or `n` itself when it is not a union or holds
-// more than one such atom.
-function monoSoleNonNullAtom(n: string): string {
-  if unionMemberCount(n) < 2 { return n }
-  const atoms: string[] = []
-  splitUnionAtoms(n, atoms)
-  let sole = ""
-  let i = 0
-  while i < atoms.length {
-    if atoms[i] != "null" {
-      if sole != "" { return n }
-      sole = atoms[i]
+// The index of the `]` closing map annotation `ann`'s key, whose `]:` the value follows to the
+// closing `}`; -1 when `ann` is not a map.
+function monoMapKeyEnd(ann: string): i32 {
+  if !nameIsMap(ann) { return -1 }
+  let mi = 2
+  while mi < ann.length - 1 {
+    if ann[mi] == ']' {
+      if ann[mi + 1] == ':' { return mi }
     }
-    i = i + 1
+    mi = mi + 1
   }
-  if sole == "" { return n }
-  sole
+  -1
 }
 
 // Binds the open atom of union pattern `pats` to the atoms of `acts` that no concrete atom of
@@ -4095,11 +4083,13 @@ function monoBindUnionRest(
   tvN: string[],
   tvV: string[],
 ) {
+  // A map's open atom never takes `null`: a narrowing keeps that atom in the spelling (D10232).
+  const mapOpen = nameIsMap(pats[open])
   let rest = ""
   let n = 0
   let i = 0
   while i < acts.length {
-    let covered = false
+    let covered = mapOpen && normTypeAtom(acts[i]) == "null"
     let j = 0
     while j < pats.length && !covered {
       if j != open && normTypeAtom(pats[j]) == normTypeAtom(acts[i]) {
@@ -4122,8 +4112,7 @@ function monoBindUnionRest(
 
 // `monoBindFromAnn` for one member of a union pattern, plus the map arm only a member needs:
 // `{[string]:V}` against `{[string]:i32}` binds the value where the keys agree (D10171). A bare
-// map parameter is bound from its argument's type and never reaches here. A `null` beside one
-// map in the argument is a spelling its narrowing kept, so the map alone is matched (D10232).
+// map parameter is bound from its argument's type and never reaches here.
 function monoBindMemberFromAnn(
   pat: string,
   actual: string,
@@ -4131,16 +4120,21 @@ function monoBindMemberFromAnn(
   tvN: string[],
   tvV: string[],
 ) {
-  if !nameIsMap(pat) { return monoBindFromAnn(pat, actual, typarams, tvN, tvV) }
-  const am = monoSoleNonNullAtom(actual)
-  const pv = mapValNameOf(pat)
-  const av = mapValNameOf(am)
-  const pk = pat.length - pv.length - 1
-  const ak = am.length - av.length - 1
-  if pv != "" && av != "" && pat.slice(0, pk) == am.slice(0, ak) {
-    monoBindFromAnn(pv, av, typarams, tvN, tvV)
+  const mi = monoMapKeyEnd(pat)
+  if mi < 0 { return monoBindFromAnn(pat, actual, typarams, tvN, tvV) }
+  if (
+    monoMapKeyEnd(actual) != mi
+    || actual.slice(0, mi + 2) != pat.slice(0, mi + 2)
+  ) {
+    return 0
   }
-  0
+  monoBindFromAnn(
+    pat.slice(mi + 2, pat.length - 1),
+    actual.slice(mi + 2, actual.length - 1),
+    typarams,
+    tvN,
+    tvV,
+  )
 }
 
 // Bind type params by matching a parameter's annotation PATTERN against the
