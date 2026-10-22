@@ -1764,20 +1764,7 @@ export function numUnionBinTy(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       }
       const p = numPairTy(n, a, b)
       if p < 0 {
-        tErr(
-          "operator '"
-            + n.binOp
-            + "' over "
-            + tyToStr(lt)
-            + " and "
-            + tyToStr(rt)
-            + " mixes the members "
-            + tyToStr(a)
-            + " and "
-            + tyToStr(b)
-            + "; narrow with `is` or convert with `as` first",
-          ix,
-        )
+        tErr(numUnionMixMsg(n.binOp, lt, rt, a, b), ix)
         if cmp { return TY_BOOL }
         return TY_ERR
       }
@@ -1791,6 +1778,83 @@ export function numUnionBinTy(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   if cmp { return TY_BOOL }
   if res.length == 1 { return res[0] }
   mkUnionTy(res)
+}
+
+// The refusal of `op` over `lt`/`rt`, a numeric union among them, whose members `a` and `b`
+// have no scalar pair form.
+function numUnionMixMsg(op: string, lt: i32, rt: i32, a: i32, b: i32): string {
+  "operator '"
+    + op
+    + "' over "
+    + tyToStr(lt)
+    + " and "
+    + tyToStr(rt)
+    + " mixes the members "
+    + tyToStr(a)
+    + " and "
+    + tyToStr(b)
+    + "; narrow with `is` or convert with `as` first"
+}
+
+// The refusal of two numeric primitives `a` and `b` that operator `op` does not mix.
+export function numScalarMixMsg(op: string, a: i32, b: i32): string {
+  if op == "<" || op == ">" || op == "<=" || op == ">=" {
+    return "comparison mixes " + tyToStr(a) + " and " + tyToStr(b)
+  }
+  if binIntOnlyOp(op) && binFloatOperandPair(a, b) {
+    return "operator '"
+      + op
+      + "' is integer-only, got "
+      + tyToStr(a)
+      + " and "
+      + tyToStr(b)
+  }
+  "operator '" + op + "' mixes " + tyToStr(a) + " and " + tyToStr(b)
+}
+
+// The direct spelling's refusal of the numeric operator `n` at operand types `lt`/`rt`, or ""
+// when its pair rule holds. A pin asks it of the body's own node, whose literals adapt there.
+// Equality between two scalars is `eqRefusals`' and answers "".
+export function numBinPairRefusal(n: BinExpr, lt0: i32, rt0: i32): string {
+  const op = n.binOp
+  if !numUnionOp(op) { return "" }
+  const lt = softenLitOpTy(lt0)
+  const rt = softenLitOpTy(rt0)
+  if tyIsNumUnion(lt) || tyIsNumUnion(rt) {
+    let ls = numUnionMembersOf(lt)
+    if ls.length == 0 { ls = [lt] }
+    let rs = numUnionMembersOf(rt)
+    if rs.length == 0 { rs = [rt] }
+    for a in ls {
+      for b in rs {
+        if isNumericPrimTy(a) && isNumericPrimTy(b) && numPairTy(n, a, b) < 0 {
+          return numUnionMixMsg(op, lt, rt, a, b)
+        }
+      }
+    }
+    return ""
+  }
+  if op == "==" || op == "!=" || !isNumericPrimTy(lt) || !isNumericPrimTy(rt) {
+    return ""
+  }
+  if numPairTy(n, lt, rt) < 0 { return numScalarMixMsg(op, lt, rt) }
+  ""
+}
+
+// `numBinPairRefusal` for deferred constraint `ci` pinned at `clt`/`crt`, or "" when the row
+// names no BinExpr, names one a rollback has since replaced, or the pair has a scalar form.
+// Asked quietly: an instance's types must not retype the shared body's literal tails.
+export function binCstrPairRefusal(ci: i32, clt: i32, crt: i32): string {
+  const node = binCstr.node[ci]
+  if node < 0 || node >= P.nodes.length { return "" }
+  const n = P.nodes[node]
+  if !(n is BinExpr) { return "" }
+  if n.binOp != binCstr.op[ci] { return "" }
+  const savedQuiet = inferQuiet
+  inferQuiet = true
+  const refusal = numBinPairRefusal(n, clt, crt)
+  inferQuiet = savedQuiet
+  refusal
 }
 
 // `joinTys` for the arms of a value `if` or `match`.
@@ -2095,6 +2159,7 @@ function binCstrsHold(bNames: string[], bTys: i32[], calleeFn: i32) {
           if eqLitNonMember(clt, crt) { return false }
           if !eqLitMemberOk(clt, crt) && !eqLitMemberOk(crt, clt) {
             if !binOpDefinedFor(binCstr.op[ci], clt, crt) { return false }
+            if binCstrPairRefusal(ci, clt, crt) != "" { return false }
           }
         }
       }
