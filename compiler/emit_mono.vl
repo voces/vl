@@ -13211,6 +13211,8 @@ let mfrTiedCopy: {[i32]: boolean} = Map()
 // Bindings every read of which names their one generic and every spread of which is expanded, so
 // no call reaches their element slot (D9595).
 let mfrSpreadDone: i32[] = []
+// Bindings a planned read slices, whose literal the slice's calls then reach through its slot.
+let mfrSliced: i32[] = []
 // The calls whose callee read `monoFlowReadSet` rewrote to name a generic.
 let mfrSetCalls: i32[] = []
 // Pairs `[binding, use]` of reads `monoFlowUsePlan` found naming no generic only because a value
@@ -13240,6 +13242,7 @@ function monoFlowReads(stmts: i32[]): i32 {
   mfrTied = []
   mfrTiedCopy = Map()
   mfrSpreadDone = []
+  mfrSliced = []
   mfrSetCalls = []
   mfrPending = []
   mfrLetBusy = Map()
@@ -14215,6 +14218,9 @@ function monoFlowReadsRound(lets: i32[]): i32[] {
     i = i + 3
   }
   monoFlowReplanPending(planned, through)
+  for d in planned {
+    if i32ListHas(mfrSliced, d) && !i32ListHas(through, d) { through.push(d) }
+  }
   const viaReads: i32[] = []
   for t in through { viaReads.push(t) }
   i = 0
@@ -14440,6 +14446,15 @@ function monoFlowUsePlanAt(
             return monoFlowLeafGen(unwrapParen(pv)) >= 0
           }
         }
+        // A slice of the list copies its values into a list whose calls keep its slot (D10082).
+        if prop == "slice" && path.length == 0 && lists == cv.length {
+          const sc = mfrParent[p] ?? -1
+          if sc < 0 { return false }
+          const scn = P.nodes[sc]
+          if !(scn is Call) || scn.callFn != p { return false }
+          if !i32ListHas(mfrSliced, d) { mfrSliced.push(d) }
+          return true
+        }
         return lists == cv.length && prop == "length" && !monoFlowIsWrite(p)
       }
       const next: i32[] = []
@@ -14515,6 +14530,7 @@ function monoFlowUsePlanAt(
       !monoFlowSrcHas(d, path, g)
       && !monoFlowHeldIs(d, path, g)
       && !monoFlowSpreadSrcElem(d, path, cur, g)
+      && !monoFlowAliasSrcElem(d, path, cur, g)
     ) {
       return false
     }
@@ -14554,6 +14570,36 @@ function monoFlowSpreadSrcElem(
   false
 }
 
+// Whether `cur` reads, by a literal index, an element of the one ungrown list literal `d` owns
+// that is a `const` alias naming generic `g`: the flow table joins every slot listing the alias,
+// whose writes and other values then reach no read of `d` (D10081).
+function monoFlowAliasSrcElem(
+  d: i32,
+  path: string[],
+  cur: i32,
+  g: i32,
+): boolean {
+  if path.length != 1 { return false }
+  const xn = P.nodes[cur]
+  if !(xn is Index) { return false }
+  const vs = monoFlowDeclVals(d)
+  if (
+    vs.length != 1
+    || monoFlowListOwner(vs[0]) != d
+    || monoFlowListGrows(vs[0], 0)
+  ) {
+    return false
+  }
+  const el = monoFlowElemAt(vs[0], xn.idxIndex)
+  if el < 0 || !(P.nodes[el] is Ident) || monoFlowLeafGen(el) != g {
+    return false
+  }
+  const ad = identDeclOf(el)
+  if ad < 0 { return false }
+  const an = P.nodes[ad]
+  an is LetDecl && an.letKw == "const"
+}
+
 // The closed pins the flow table takes downstream of slot `path` of `d`, leaving out those at a
 // call whose callee read `monoFlowReadSet` pointed at a generic; empty when the table declines.
 function monoFlowSlotPins(d: i32, path: string[]): string[] {
@@ -14563,6 +14609,15 @@ function monoFlowSlotPins(d: i32, path: string[]): string[] {
   const pins = fnFlowDeclPathPinSigsOmitting(d, path, -1, -1, dead, mfrSetCalls)
   if pins.length == 1 && pins[0] == FF_PIN_DECLINE { return none }
   pins
+}
+
+// Whether every pin downstream of slot `path` of `d` is taken at a call whose callee read
+// `monoFlowReadSet` pointed at a generic, so no call is left reaching the slot (D10081).
+function monoFlowSlotPinsAllSet(d: i32, path: string[]): boolean {
+  if mfrSetCalls.length == 0 { return false }
+  const dead: {[i32]: boolean} = Map()
+  const left = fnFlowDeclPathPinSigsOmitting(d, path, -1, -1, dead, mfrSetCalls)
+  left.length == 0
 }
 
 // Whether `p` uses value `cur` whole where its own reads are planned or it is tested for `null`.
@@ -15458,11 +15513,17 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     // A list read only by name and spread, whose spreads now hold its generic, shares the pins of
     // the lists that spread it but no call through its own slot (D9595).
     if i32ListHas(mfrSpreadDone, at) { return 0 }
-    if fnFlowDeclKidSrc(at, "e") >= 0 || monoFlowHeldOneGen(at, path) {
+    // Calls whose read the flow pass pointed at its generic go through no slot (D9595), and a
+    // sliced list's copies reach its literal through the calls left (D10082).
+    const live = monoFlowSlotPins(at, path)
+    const sliced = live.length > 0 && i32ListHas(mfrSliced, at)
+    if (
+      !sliced
+      && (fnFlowDeclKidSrc(at, "e") >= 0 || monoFlowHeldOneGen(at, path))
+    ) {
       return 0
     }
-    // Calls whose read the flow pass pointed at its generic go through no slot (D9595).
-    const live = monoFlowSlotPins(at, path)
+    if live.length == 0 && monoFlowSlotPinsAllSet(at, path) { return 0 }
     if live.length != 1 {
       // A list its function returns asks for a copy of the function per pin, as a returned
       // literal does (D9450).
