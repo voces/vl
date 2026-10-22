@@ -950,7 +950,34 @@ function fsSlotSrc(v: i32): i32 {
   if a >= 0 { return a }
   const r = fsConstRet(v)
   if r >= 0 { return r }
+  const cr = fsConstAliasRet(v)
+  if cr >= 0 { return cr }
   v
+}
+
+// The name a read `v` of an un-annotated `const` chain evaluates to when the chain ends in a
+// constant call (`fsConstRet`), whose binding runs the call; -1 otherwise (D9593).
+function fsConstAliasRet(v: i32): i32 {
+  let x = v
+  let hops = 0
+  while hops <= 8 {
+    const d = letDeclOfRead(x)
+    if d < 0 { return -1 }
+    const dn = P.nodes[d]
+    if (
+      !(dn is LetDecl)
+      || dn.letKw != "const"
+      || dn.letType >= 0
+      || dn.letInit < 0
+    ) {
+      return -1
+    }
+    const r = fsConstRet(dn.letInit)
+    if r >= 0 { return r }
+    x = dn.letInit
+    hops = hops + 1
+  }
+  -1
 }
 
 // Whether parse node `a` is a lambda literal, parenthesised or not, which a call can hand again
@@ -1004,6 +1031,17 @@ function fsLetCallKeys(d: i32): i32 {
     }
   }
   ks.length
+}
+
+// Whether binding `d` of a generic a call returns wants a slot per key: called at two types, or
+// called at one and also delivered as a value its own slot reads afresh (D9594).
+function fsLetSplitKeys(d: i32): boolean {
+  const n = fsLetCallKeys(d)
+  if n != 1 { return n > 1 }
+  for r in fsIdents {
+    if identDeclOf(r) == d && fsReadKey(r).slice(0, 2) == "u:" { return true }
+  }
+  false
 }
 
 // Whether read `r` is an argument of a call, with no type arguments, of a function declaration.
@@ -1591,11 +1629,12 @@ export function fsPlan(root: i32): i32 {
             dn is LetDecl
             && dn.letInit == c
             && dn.letType < 0
-            && fsLetCallKeys(d) > 1
+            && fsLetSplitKeys(d)
             && !hasI32(fsAsks, d)
           ) {
             fsAsks.push(d)
           }
+          fsAskConstAliases(d, 0)
         }
       }
     }
@@ -1690,6 +1729,28 @@ export function fsPlan(root: i32): i32 {
   const inst = fsPlanInstances()
   if byName == 0 { return 0 }
   inst
+}
+
+// Asks for each un-annotated `const` initialized by a bare read of binding `d`, at most `depth`
+// links down a chain of them, that is called at two types (D9593).
+function fsAskConstAliases(d: i32, depth: i32) {
+  if d < 0 || depth > 8 { return 0 }
+  for r in fsIdents {
+    const a = fsParent[r]
+    if r != d && identDeclOf(r) == d && a >= 0 {
+      const an = P.nodes[a]
+      if (
+        an is LetDecl
+        && an.letKw == "const"
+        && an.letInit == r
+        && an.letType < 0
+      ) {
+        if fsLetSplitKeys(a) && !hasI32(fsAsks, a) { fsAsks.push(a) }
+        fsAskConstAliases(a, depth + 1)
+      }
+    }
+  }
+  0
 }
 
 // An asked maker (the function holding an asked read) or module `const`, read in a function
@@ -3491,6 +3552,7 @@ function fsLaneSet(): i32 {
   }
   for m in fsMem {
     const ks: string[] = []
+    const gen = fsMemHoldsGeneric(m)
     for r in fsIdents {
       if identDeclOf(r) == m {
         const key = fsLaneReadKey(r)
@@ -3500,12 +3562,14 @@ function fsLaneSet(): i32 {
             if !hasStr(ks, k) { ks.push(k) }
           }
         } else {
-          // A delivery into a type that does not fix one instantiation keeps the refusal.
-          if key.slice(0, 2) == "u:" && !fsDestFixed(r) { return 1 }
+          // A delivery into a type that does not fix one instantiation keeps the refusal,
+          // unless the slot is a fresh read of a generic name (D9594).
+          if key.slice(0, 2) == "u:" && !fsDestFixed(r) && !gen { return 1 }
           if key != "" && key != "=" && !hasStr(ks, key) { ks.push(key) }
         }
       }
     }
+    if gen && fsCallLaneFirst(ks) != 0 { return 1 }
     fsLanes.push(ks)
   }
   // A member needs every slot a binding it is copied into needs.
@@ -3533,6 +3597,35 @@ function fsLaneSet(): i32 {
   }
   if !split { return 1 }
   0
+}
+
+// Whether member `m` is an un-annotated `const` whose call always returns one generic name
+// (`fsConstRet`, `fsConstAliasRet`), so a slot past its first can read the name afresh.
+function fsMemHoldsGeneric(m: i32): boolean {
+  const d = P.nodes[m]
+  if !(d is LetDecl) || d.letKw != "const" || d.letType >= 0 || d.letInit < 0 {
+    return false
+  }
+  let r = fsConstRet(d.letInit)
+  if r < 0 { r = fsConstAliasRet(d.letInit) }
+  r >= 0 && fsGenericName(r)
+}
+
+// Moves a key other than a value read's own (`u:`) to the front of `ks`, so the binding that
+// runs the call keeps a slot some call fixes; 1 when every key is a value read's own.
+function fsCallLaneFirst(ks: string[]): i32 {
+  if ks.length == 0 || ks[0].slice(0, 2) != "u:" { return 0 }
+  let i = 1
+  while i < ks.length {
+    if ks[i].slice(0, 2) != "u:" {
+      const k = ks[i]
+      ks[i] = ks[0]
+      ks[0] = k
+      return 0
+    }
+    i = i + 1
+  }
+  1
 }
 
 // Asks every parameter binding `d` is initialized or written from (`let d = p`, `d = p`) that
