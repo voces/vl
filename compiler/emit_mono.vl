@@ -17591,6 +17591,7 @@ function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   if xn is Member {
     return tyFieldTyOf(monoPinnedAnnTyAt(xn.memObj, depth + 1), xn.memProp)
   }
+  if xn is Call { return monoPinnedRetAnnTy(xn, depth) }
   if !(xn is Ident) { return -1 }
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return -1 }
@@ -17599,6 +17600,46 @@ function monoPinnedAnnTyAt(recv: i32, depth: i32): i32 {
   if dn.letType >= 0 { return nodeTyIxOf(dn.letType) }
   if dn.letInit < 0 || monoWritesOf("n:", d).length > 0 { return -1 }
   monoPinnedAnnTyAt(dn.letInit, depth + 1)
+}
+
+// `monoPinnedAnnTyAt` for call `c` of an un-annotated, non-generic declared function: the one
+// type every value it returns reads at, a returned list literal of functions instanced at its
+// element's pin first, since the caller can be walked before the body (D9410); -1 when they
+// differ or one has none.
+function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
+  const fd = monoCalleeDeclOf(c)
+  if fd < 0 || monoIsGenericDecl(fd) { return -1 }
+  const fn = P.nodes[fd]
+  if !(fn is FuncDecl) || fn.fnRet >= 0 { return -1 }
+  let t = -1
+  for r in monoFnRetArgs(fn) {
+    if r >= 0 && !(P.nodes[r] is RetStmt) {
+      const rx = monoRetListLitOf(r)
+      if rx >= 0 { monoRetFnListTy(rx, fd) }
+      const rt = monoPinnedAnnTyAt(r, depth + 1)
+      if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
+      t = rt
+    }
+  }
+  t
+}
+
+// The list literal returned value `r` is, or initialises as the un-annotated `const` it names
+// that nothing writes; -1 otherwise.
+function monoRetListLitOf(r: i32): i32 {
+  const x = unwrapParen(r)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  if P.nodes[x] is ArrayLit { return x }
+  if !(P.nodes[x] is Ident) { return -1 }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  const ix = unwrapParen(dn.letInit)
+  if ix < 0 || !(P.nodes[ix] is ArrayLit) || monoWritesOf("n:", d).length > 0 {
+    return -1
+  }
+  ix
 }
 
 // The hole lambda `at` handed to `.map` / `.filter` over a list of functions of closed type `el`
@@ -22692,6 +22733,15 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   if v < 0 { return 0 }
   const x = unwrapParen(v)
   if x < 0 { return 0 }
+  // A returned list or record literal delivers each function it holds at its own slot's pin
+  // (D9410).
+  if P.nodes[x] is ArrayLit || P.nodes[x] is ObjLit {
+    const ft = monoRetFnListTy(x, ctx)
+    if ft == -2 { return -1 }
+    if ft >= 0 { return 0 }
+    const noPath: string[] = []
+    return monoDeliverLitAt(x, x, noPath, nodeTyIxOf(x), ctx, 0)
+  }
   if (
     monoIfBindingOf(x, ctx)[1] >= 0
     || P.nodes[x] is IfStmt && monoValueNamesGenerics(x, ctx, 0)
@@ -22731,6 +22781,26 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   monoInstanceWidenRet = false
   if cr < 0 { return -1 }
   monoRetypePinCalls(d, noPath)
+}
+
+// The function type the returned list literal `x` of functions in frame `ctx` is instanced at
+// and now records as its element, from the one pin its element slot takes; -1 when it is no
+// such list or the slot has none, -2 when instancing is refused (D9410).
+function monoRetFnListTy(x: i32, ctx: i32): i32 {
+  const l = P.nodes[x]
+  if !(l is ArrayLit) || l.arrElems.length == 0 || !monoTyOpen(nodeTyIxOf(x)) {
+    return -1
+  }
+  const vals: i32[][] = []
+  for e in l.arrElems {
+    if P.nodes[unwrapParen(e)] is Spread { return -1 }
+    vals.push([e, ctx])
+  }
+  const sp: string[] = []
+  const ft = monoStoredSlotFnTy([ctx, x], ["e"], vals, sp)
+  if ft < 0 { return ft }
+  monoRecordOpen(x, mkArrayTy(ft), ctx)
+  ft
 }
 
 // A generic read `x` (keyed `d` in frame `fr`) that `ctx` returns past two pins or two results
