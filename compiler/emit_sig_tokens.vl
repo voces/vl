@@ -114,6 +114,7 @@ import {
   repKindOfSigTok,
   repOfTy,
   repRowOfTyStruct,
+  repSigKindOfTy,
   repSigSlotTokOfKind,
   repSigTokHasSlot,
   repSigTokOfKind,
@@ -174,6 +175,7 @@ import {
 import { nodeRepIn } from "./emit_ty_canon"
 import {
   isUNameAnnAB,
+  mapShapeOfTyPeeled,
   mvDeclRecSlotOfTy,
   mvDeepFuncSlotOfTy,
 } from "./emit_union_atoms"
@@ -738,7 +740,7 @@ function annUnionSigKind(t: string, slotOut: i32[]): VKind | null {
   // A nullable closure: the shared fat-pointer made nullable, slot-free, matching `>C`.
   if strContains(nonNull[0], "=>") { return "nulclosure" }
   // A nullable numeric scalar or vector reps as the value-union box; `boolean | null` is the
-  // i32-sentinel niche instead, outside the ABI since its valtype is plain i32.
+  // i32-sentinel niche instead and crosses as the plain `i` token.
   if (
     nonNull[0] == "i32"
     || nonNull[0] == "i64"
@@ -966,7 +968,26 @@ export function sigParamTokOfTy(pty: i32): string {
   if sigTyIsNulFunc(pty) { return repSigTokOfKind("nulclosure") }
   const pnm = tyToEmitName(pty)
   if pnm == "" { return "" }
-  annParamKindTy(pnm, pty)
+  const pk = annParamKindTy(pnm, pty)
+  if pk != "" { return pk }
+  sigRepTokOfTy(pty)
+}
+
+// The token the rep layer gives arena type `ty` where no ladder above keys it: a slot-free
+// kind's own, a nullable map's keyed by its map shape as the bare map's is, and "" for any
+// other slot-carrying kind or a type the rep layer cannot represent. An integer-keyed map has
+// no rep-tree node, so its `| null` is keyed as the bare map the ladders key.
+function sigRepTokOfTy(ty: i32): string {
+  const k = repSigKindOfTy(ty)
+  const mt = tyPeelNul(ty)
+  const isNulMap = mt != ty && mt >= 0 && T.tys[mt] is TyMap
+  if k == "nulmap" || (k == null && isNulMap) {
+    const sh = mapShapeOfTyPeeled(ty)
+    if sh == -3 { return "" }
+    return repSigSlotTokOfKind("nulmap", sh)
+  }
+  if repSigTokHasSlot(k) { return "" }
+  repSigTokOfKind(k)
 }
 
 // Whether function-type parameter `pty` with a union, nullable or map result keys the closure
@@ -1286,7 +1307,10 @@ export function sigRetTokOfTy(rty: i32): string {
   if rt is TyFunc { rs = "(" + rs + ")" }
   const rk = annRetKindTy(rs, rty)
   if rd != "" && sigTokIsStruct(rk) { return rd }
-  rk
+  if rk != "" { return rk }
+  const rr = sigRepTokOfTy(rty)
+  if rr == "" { return "" }
+  ">" + rr
 }
 
 // Whether result token `tok` (`>X`) keys a struct row.
@@ -1588,15 +1612,21 @@ export function tyUnionHasLitUnionNestedArrayArm(ty: i32): boolean {
 export function sigKeyRetSlot(k: string) { sigSlotAtTok(k, sigKeyRetTokIx(k)) }
 
 // The `;`-terminated decimal SLOT of the token starting at `ti`, or -1 when `ti` names no
-// token or that kind carries no slot / malformed digits. The ONE slot-digit parse, read by
-// both key decoders that want one (`sigKeyRetSlot` for the result token, `sigParamSlotAt`
-// for the param spine).
+// token or that kind carries no slot / malformed digits; a map shape may itself be negative.
+// The ONE slot-digit parse, read by both key decoders that want one (`sigKeyRetSlot` for
+// the result token, `sigParamSlotAt` for the param spine).
 export function sigSlotAtTok(k: string, ti: i32): i32 {
   if ti < 0 || ti >= k.length { return -1 }
   if !repSigTokHasSlot(repKindOfSigTok(k[ti])) { return -1 }
   let j = ti + 1
   let acc = 0
   let saw = false
+  // A map shape can be negative (the mono maps), written with a leading `-`.
+  let neg = false
+  if j < k.length && k[j] == '-' {
+    neg = true
+    j = j + 1
+  }
   while j < k.length && k[j] != ';' {
     const d = k[j]
     if d < '0' || d > '9' { return -1 }
@@ -1605,6 +1635,7 @@ export function sigSlotAtTok(k: string, ti: i32): i32 {
     j = j + 1
   }
   if !saw { return -1 }
+  if neg { return 0 - acc }
   acc
 }
 
