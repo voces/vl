@@ -52,6 +52,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  hasNamedArgs,
   markDefaultGlobalRef,
   nodeChildren,
   nodeToks,
@@ -168,6 +169,8 @@ import {
 import { gaIndexOf } from "./check_gen_alias_anns"
 import { CSTR_NODECL } from "./check_generic_args"
 import { identNameAt } from "./check_narrow_paths"
+import { fnDeclIx } from "./check_write_scan"
+import { strListHas } from "./listutil"
 
 // `cBoundDecls` — every `type Showable = { toString(): string }` in the program, name → the
 // declaration's bound-body annotation node. Registered in pass 0a instead of `cUserTypes`:
@@ -589,6 +592,232 @@ function wrFnClosed(fx: i32): boolean {
   true
 }
 
+// The container each written value lands in, keyed on the value: the receiver of a write method,
+// or the base of an index write.
+export let ctnWrRecv: {[i32]: i32} = Map()
+export function ctnWrRecvPut(k: i32, v: i32) { ctnWrRecv.set(k, v) }
+
+// The program's top-level statements, the reach scan's root for a module binding.
+export let ctnRootStmts: i32[] = []
+export function ctnRootStmtsSet(v: i32[]) { ctnRootStmts = v }
+
+// Per container declaration: the arena length its scan saw, and the `get` bindings it found, or
+// null when some read hands its elements elsewhere.
+let ctnScanAt: {[i32]: i32} = Map()
+let ctnScanGets: {[i32]: string[] | null} = Map()
+
+// Whether call `c` cannot reach the function value `v` that a deferred row of owner `owner`
+// writes into a container binding: every read of the binding writes into it, calls an element,
+// binds a `.get` that is only called or compared with `null`, or hands it to a function that only
+// writes into it, or reads its length — and `c` is none of those calls (D10020).
+export function ctnWrUnreachedBy(
+  v: i32,
+  got: i32,
+  owner: i32,
+  c: i32,
+): boolean {
+  if got < 0 || got >= T.tys.length || !(T.tys[got] is TyFunc) { return false }
+  if c < 0 || c >= P.nodes.length { return false }
+  const cn = P.nodes[c]
+  if !(cn is Call) { return false }
+  const r = ctnPeel(ctnWrRecv.get(v) ?? -1)
+  if r < 0 { return false }
+  const rn = P.nodes[r]
+  if !(rn is Ident) { return false }
+  const d = identDeclOf(r)
+  if d < 0 || d >= P.nodes.length || !(P.nodes[d] is LetDecl) { return false }
+  const fx = letDeclFn.get(d) ?? -1
+  if !wrFnChainClosed(fx) || (owner >= 0 && !wrFnClosed(owner)) { return false }
+  const gets = ctnScan(d, rn.identName, fx)
+  if gets == null { return false }
+  const f = ctnPeel(cn.callFn)
+  if f < 0 { return false }
+  const fname = identNameAt(f)
+  if fname != "" { return !strListHas(gets, fname) }
+  !ctnElemRead(f, rn.identName, d)
+}
+
+// Whether `ix` is an element read of binding `d` named `name`.
+function ctnElemRead(ix: i32, name: string, d: i32): boolean {
+  const n = P.nodes[ix]
+  n is Index && ctnIsRead(n.idxArr, name, d)
+}
+
+// `ix` with its parentheses removed, or -1 when `ix` is no arena node.
+function ctnPeel(ix: i32): i32 {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const n = P.nodes[ix]
+  if n is Paren { return ctnPeel(n.parInner) }
+  ix
+}
+
+// Whether `ix` reads binding `d` named `name`; an unresolved read of the name counts.
+function ctnIsRead(ix: i32, name: string, d: i32): boolean {
+  const p = ctnPeel(ix)
+  if p < 0 { return false }
+  const n = P.nodes[p]
+  if !(n is Ident) || n.identName != name { return false }
+  const rd = identDeclOf(p)
+  rd == d || rd < 0
+}
+
+function ctnWriteProp(prop: string): boolean {
+  prop == "push" || prop == "unshift" || prop == "set" || prop == "add"
+}
+
+// The `get` bindings of container `d`, or null when a read of it is none of the forms
+// `ctnWrUnreachedBy` names; memoised per arena length.
+function ctnScan(d: i32, name: string, fx: i32): string[] | null {
+  if (ctnScanAt.get(d) ?? -1) == P.nodes.length {
+    return ctnScanGets.get(d) ?? null
+  }
+  let roots = ctnRootStmts
+  if fx >= 0 {
+    const fd = P.nodes[fx]
+    if !(fd is FuncDecl) { return null }
+    roots = [fd.fnBody]
+  }
+  const gets: string[] = []
+  let res: string[] | null = gets
+  if !ctnReadsKept(roots, name, d, gets) {
+    res = null
+  } else {
+    for g in gets {
+      if !ctnGetKept(roots, g) { res = null }
+    }
+  }
+  ctnScanAt.set(d, P.nodes.length)
+  ctnScanGets.set(d, res)
+  res
+}
+
+// Whether every read of `d` under `roots` is a write into it, an element call, a `.get` bound by
+// a `const` (its name pushed to `gets`), a length read, or an argument a top-level function only
+// writes into.
+function ctnReadsKept(
+  roots: i32[],
+  name: string,
+  d: i32,
+  gets: string[],
+): boolean {
+  let total = 0
+  let kept = 0
+  const stack: i32[] = []
+  for r in roots { stack.push(r) }
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is Ident {
+        if n.identName == name {
+          const rd = identDeclOf(at)
+          if rd == d || rd < 0 { total = total + 1 }
+        }
+      } else if n is Call {
+        const fi = ctnPeel(n.callFn)
+        if fi >= 0 && (ctnWriteRecv(fi, name, d) || ctnElemRead(fi, name, d)) {
+          kept = kept + 1
+        }
+        let ai = 0
+        while ai < n.callArgs.length {
+          if ctnIsRead(n.callArgs[ai], name, d) && ctnArgWriteOnly(n, ai) {
+            kept = kept + 1
+          }
+          ai = ai + 1
+        }
+      } else if n is Member {
+        if (
+          (n.memProp == "length" || n.memProp == "size")
+          && ctnIsRead(n.memObj, name, d)
+        ) {
+          kept = kept + 1
+        }
+      } else if n is BinExpr {
+        const li = ctnPeel(n.binLeft)
+        if n.binOp == "=" && li >= 0 && ctnElemRead(li, name, d) {
+          kept = kept + 1
+        }
+      } else if n is LetDecl {
+        if n.letKw == "const" && ctnGetOf(ctnPeel(n.letInit), name, d) {
+          kept = kept + 1
+          gets.push(n.letName)
+        }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  total == kept
+}
+
+// Whether `ix` is a writing method of binding `d` named `name`, as a call's callee.
+function ctnWriteRecv(ix: i32, name: string, d: i32): boolean {
+  const n = P.nodes[ix]
+  n is Member && ctnWriteProp(n.memProp) && ctnIsRead(n.memObj, name, d)
+}
+
+// Whether `ix` is a one-argument `.get` call on binding `d` named `name`; -1 is none.
+function ctnGetOf(ix: i32, name: string, d: i32): boolean {
+  if ix < 0 { return false }
+  const n = P.nodes[ix]
+  if !(n is Call) || n.callArgs.length != 1 { return false }
+  const g = ctnPeel(n.callFn)
+  if g < 0 { return false }
+  const gn = P.nodes[g]
+  gn is Member && gn.memProp == "get" && ctnIsRead(gn.memObj, name, d)
+}
+
+// Whether every read of the name `g` under `roots` calls it or compares it with `null`.
+function ctnGetKept(roots: i32[], g: string): boolean {
+  let total = 0
+  let kept = 0
+  const stack: i32[] = []
+  for r in roots { stack.push(r) }
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is Ident {
+        if n.identName == g { total = total + 1 }
+      } else if n is Call {
+        const fi = ctnPeel(n.callFn)
+        if fi >= 0 && identNameAt(fi) == g { kept = kept + 1 }
+      } else if n is BinExpr {
+        const l = ctnPeel(n.binLeft)
+        const r = ctnPeel(n.binRight)
+        if (n.binOp == "==" || n.binOp == "!=") && l >= 0 && r >= 0 {
+          if identNameAt(l) == g && P.nodes[r] is NullLit { kept = kept + 1 }
+          if identNameAt(r) == g && P.nodes[l] is NullLit { kept = kept + 1 }
+        }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  total == kept
+}
+
+// Whether argument `ai` of call `n` goes to a top-level function whose parameter there is only
+// written into.
+function ctnArgWriteOnly(n: Call, ai: i32): boolean {
+  if hasNamedArgs(n.callArgNames) { return false }
+  let si = 0
+  while si <= ai {
+    if P.nodes[n.callArgs[si]] is Spread { return false }
+    si = si + 1
+  }
+  const callee = ctnPeel(n.callFn)
+  const cname = identNameAt(callee)
+  if cname == "" { return false }
+  const fdIx = fnDeclIx[cname] ?? -1
+  if fdIx < 0 || identDeclOf(callee) != fdIx { return false }
+  const fd = P.nodes[fdIx]
+  if !(fd is FuncDecl) || ai >= fd.fnParams.length { return false }
+  const pn = P.nodes[fd.fnParams[ai]]
+  if !(pn is Param) { return false }
+  const noGets: string[] = []
+  ctnReadsKept([fd.fnBody], pn.parName, fd.fnParams[ai], noGets)
+    && noGets.length == 0
+}
+
 // Whether `dIx` is a form allowed as a parameter default. A default is substituted into each
 // direct call site that omits the argument, so its expression resolves names at the
 // declaration but evaluates in the caller's frame — v1 admits only a literal, a module
@@ -845,6 +1074,10 @@ export function declScanReset() {
   letDeclFn = Map()
   fnDeclParent = Map()
   wrDstDecl = Map()
+  ctnWrRecv = Map()
+  ctnRootStmts = []
+  ctnScanAt = Map()
+  ctnScanGets = Map()
   moduleConstIntInit = Map()
   annUnionAtoms = Map()
   nwBodyScopedNames = Map()
