@@ -1373,6 +1373,9 @@ export function cwSlotPath(a: i32, path: string[]): i32 {
     } else if n is Index {
       rev.push("[]")
       ix = cwPeel(n.idxArr)
+    } else if cwGetRecv(ix) >= 0 {
+      rev.push("[]")
+      ix = cwPeel(cwGetRecv(ix))
     } else if n is Member {
       rev.push(n.memProp)
       ix = cwPeel(n.memObj)
@@ -1381,6 +1384,27 @@ export function cwSlotPath(a: i32, path: string[]): i32 {
     }
   }
   -1
+}
+
+// The receiver of `ix` when it is a `.get(k)` call, which reads an element of a list or a value
+// of a map as an index does; -1 otherwise.
+export function cwGetRecv(ix: i32): i32 {
+  const x = cwPeel(ix)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const c = P.nodes[x]
+  if !(c is Call) || c.callArgs.length != 1 || c.callFn < 0 { return -1 }
+  if hasNamedArgs(c.callArgNames) { return -1 }
+  const m = P.nodes[cwPeel(c.callFn)]
+  if !(m is Member) || m.memProp != "get" { return -1 }
+  m.memObj
+}
+
+// Whether `x` is a fresh `Map()`, which holds no value yet.
+function cwFreshMap(x: i32): boolean {
+  const c = P.nodes[x]
+  if !(c is Call) || c.callArgs.length != 0 || c.callFn < 0 { return false }
+  const f = P.nodes[cwPeel(c.callFn)]
+  f is Ident && f.identName == "Map" && identDeclOf(cwPeel(c.callFn)) < 0
 }
 
 // Every value stored at `path` under the binding (`nm`, `fr`) in `vals`, each blamed in `ats` on
@@ -1517,6 +1541,22 @@ function cwSlotWritesThrough(
               }
             }
           }
+          // A `set` on the map holding the place stores its value there (D9311).
+          if tn.memProp == "set" && c is Call && c.callArgs.length == 2 {
+            if (
+              !hasNamedArgs(c.callArgNames)
+              && cwSlotPath(tn.memObj, lp) >= 0
+              && lp.length < path.length
+              && path[lp.length] == "[]"
+              && cwPathPrefix(lp, path)
+            ) {
+              if (
+                !cwSlotDescend(c.callArgs[1], path, lp.length + 1, -1, vals, ats)
+              ) {
+                return false
+              }
+            }
+          }
         }
       }
     }
@@ -1584,6 +1624,7 @@ function cwSlotDescend(
   }
   const n = P.nodes[v]
   if path[k] == "[]" {
+    if cwFreshMap(v) { return true }
     if !(n is ArrayLit) { return false }
     for el in n.arrElems {
       if P.nodes[cwPeel(el)] is Spread { return false }
