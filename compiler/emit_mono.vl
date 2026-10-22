@@ -5146,6 +5146,9 @@ function monoPinBodyLambdasRaw(
       }
     }
   }
+  if n is BinExpr && n.binOp == "??" && monoPinHoleN.length > 0 {
+    monoHoleCoalUnion(ix)
+  }
   if sink { rb = monoPinCoalJoin(ix, rb, bN, bT) }
   if numUnionMinted { rb = monoNumUnionOpPin(ix, rb, bN, bT) }
   rb
@@ -5364,6 +5367,21 @@ function monoEqOfTpJoin(ix: i32): boolean {
       || tyIsTpJoinUnion(nodeTyIxOf(n.binRight))
   }
   false
+}
+
+// Registers the numeric box a hole instance's `??` at `ix` reads at the instance's holes, which
+// no template type spells when the function has several pins (D9913). A join with a reference
+// member is left to the `??` lowering's own refusal.
+function monoHoleCoalUnion(ix: i32) {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyVar) { return 0 }
+  const j = holePinReadOf(t, monoPinHoleN, monoPinHoleT)
+  if j < 0 || j >= T.tys.length || tyHasTyVar(j) || !tyIsNumericBox(j) {
+    return 0
+  }
+  const name = valueUnionRetName(j)
+  if name == "" { return 0 }
+  monoRegisterPinUnion(name, j)
 }
 
 // `monoIfArmsPinJoin` for a `??` at `ix`, rebuilt as `rb`: where its sides' pinned types join
@@ -8769,7 +8787,9 @@ function monoPinBinOps(ix: i32, pNames: string[], pTys: i32[]) {
         oi = oi + 1
       }
       if !ochanged { return ix }
-      return monoCopyOf(ix, mkObjLit(fl, n.pos))
+      const nol = monoCopyOf(ix, mkObjLit(fl, n.pos))
+      nodeTyCarry(nol, ix)
+      return nol
     }
     // every other kind is shared as it is: no operator under it is pinned here
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
@@ -20625,10 +20645,10 @@ function monoOpenFnRecListPin(
   monoArgPinName(ax, ctx)
 }
 
-// The pin of a read of record literals handed to un-annotated parameter `i` of `decl` in call
-// `call`: a `const` record binding (`r`) or an element of a `const` list of record literals or
-// such bindings (`xs[0]`), each read only there, whose open fields each name an open function.
-// Each field takes `monoOpenFnRecListPin`'s pin; "" when a source, a read or a pin does not close.
+// The pin of record literals handed to un-annotated parameter `i` of `decl` in call `call` as a
+// `const` binding (`r`), an element of a `const` list of them (`xs[0]`) or a list literal (`[r]`),
+// each read only there, whose open fields hold open functions or values of the pinned type, each
+// at `monoOpenFnRecListPin`'s pin; "" when a source, a read or a pin does not close.
 function monoOpenFnRecSrcPin(
   decl: i32,
   call: i32,
@@ -20644,19 +20664,25 @@ function monoOpenFnRecSrcPin(
   if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return "" }
   const ax = unwrapParen(argIx)
   if ax < 0 || ax >= P.nodes.length { return "" }
-  const ot = nodeTyIxOf(ax)
+  const an = P.nodes[ax]
+  // A list literal of records is the parameter's element slot `e` (D9647).
+  const asList = an is ArrayLit
+  let ot = nodeTyIxOf(ax)
+  if asList { ot = tyArrayElemIx(ot) }
   if ot < 0 || ot >= T.tys.length || !monoTyOpen(ot) { return "" }
   const o = T.tys[ot]
   if !(o is TyObj) { return "" }
   // Each source as `[literal, frame]`, the bindings and reads that carry it, and the list.
   const srcs: i32[][] = []
   const binds: i32[] = []
-  const reads: i32[] = [ax]
+  const reads: i32[] = []
+  if !asList { reads.push(ax) }
   let listDecl = -1
   let listLit = -1
   let listRead = -1
-  const an = P.nodes[ax]
-  if an is Index {
+  if an is ArrayLit {
+    if !monoRecSrcElems(an, ctx, srcs, binds, reads) { return "" }
+  } else if an is Index {
     const lr = unwrapParen(an.idxArr)
     const lb = monoRepointBindingLit(lr, ctx, -1)
     if lb.length != 2 { return "" }
@@ -20666,18 +20692,15 @@ function monoOpenFnRecSrcPin(
     listLit = lb[0]
     listRead = lr
     const ll = P.nodes[listLit]
-    if !(ll is ArrayLit) || ll.arrElems.length == 0 { return "" }
-    for e in ll.arrElems {
-      const ex = unwrapParen(e)
-      if ex < 0 || ex >= P.nodes.length { return "" }
-      if P.nodes[ex] is ObjLit { srcs.push([ex, lb[1]]) }
-      else if !monoRecSrcBinding(ex, lb[1], srcs, binds, reads) { return "" }
+    if !(ll is ArrayLit) || !monoRecSrcElems(ll, lb[1], srcs, binds, reads) {
+      return ""
     }
   } else if !monoRecSrcBinding(ax, ctx, srcs, binds, reads) {
     return ""
   }
   const tys: i32[] = []
   const vals: i32[][] = []
+  let openField = false
   let k = 0
   while k < o.objFieldNames.length {
     const name = o.objFieldNames[k]
@@ -20686,17 +20709,40 @@ function monoOpenFnRecSrcPin(
       if fty < 0 || fty >= T.tys.length || !(T.tys[fty] is TyFunc) { return "" }
       const fvs = monoMapStoredFields(srcs, name)
       if fvs.length != srcs.length { return "" }
+      // An open function takes the pin; a closed function value beside it must already agree.
       const fx: i32[] = []
+      const opens: i32[][] = []
+      const closed: i32[] = []
       for fv in fvs {
         const vx = unwrapParen(fv[0])
-        if vx < 0 || !(P.nodes[vx] is Ident) || monoOpenFnArgDecl(vx) < 0 {
-          return ""
+        if vx < 0 || vx >= P.nodes.length { return "" }
+        if P.nodes[vx] is Ident && monoOpenFnArgDecl(vx) >= 0 {
+          fx.push(vx)
+          opens.push([vx, fv[1]])
+        } else {
+          const ct = nodeTyIxOf(vx)
+          if (
+            ct < 0
+            || ct >= T.tys.length
+            || !(T.tys[ct] is TyFunc)
+            || monoTyOpen(ct)
+          ) {
+            return ""
+          }
+          closed.push(ct)
         }
-        fx.push(vx)
       }
-      const fPath: string[] = ["f." + name]
-      fty = monoPathSlotPinnedFnTy(dn.fnParams[i], fPath, fx, call)
-      if fty < 0 {
+      const fPath: string[] = []
+      if asList { fPath.push("e") }
+      fPath.push("f." + name)
+      fty = -1
+      // A field only closed values fill is pinned at their one type.
+      if fx.length == 0 && closed.length > 0 {
+        fty = closed[0]
+      } else {
+        fty = monoPathSlotPinnedFnTy(dn.fnParams[i], fPath, fx, call)
+      }
+      if fty < 0 && !asList && fx.length > 0 {
         for vx in fx {
           const vt = monoFieldCallPinnedFnTy(dn, i, name, vx, call, ctx)
           if vt < 0 || (fty >= 0 && sigKeyOfTy(vt) != sigKeyOfTy(fty)) {
@@ -20706,12 +20752,16 @@ function monoOpenFnRecSrcPin(
         }
       }
       if fty < 0 || sigKeyOfTy(fty) == "" { return "" }
-      for fv in fvs { vals.push([unwrapParen(fv[0]), fv[1], fty]) }
+      for ct in closed {
+        if sigKeyOfTy(ct) != sigKeyOfTy(fty) { return "" }
+      }
+      for op in opens { vals.push([op[0], op[1], fty]) }
+      openField = true
     }
     tys.push(fty)
     k = k + 1
   }
-  if vals.length == 0 { return "" }
+  if !openField { return "" }
   const rt = mkObjTy(o.objFieldNames, tys)
   const rs = monoPinAnnSpelling(rt)
   if rs == "" { return "" }
@@ -20741,9 +20791,33 @@ function monoOpenFnRecSrcPin(
     nodeTyRecord(listRead, lt)
   }
   monoArenaTouch()
+  let pinTy = rt
+  if asList {
+    pinTy = mkArrayTy(rt)
+    nodeTyRecord(ax, pinTy)
+  }
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
-  tyOut[0] = rt
+  tyOut[0] = pinTy
   monoArgPinName(ax, ctx)
+}
+
+// Adds to `srcs` each element of the list literal `ll` (in frame `ctx`): a record literal, or a
+// name `monoRecSrcBinding` follows to one; false when the list is empty or an element is neither.
+function monoRecSrcElems(
+  ll: ArrayLit,
+  ctx: i32,
+  srcs: i32[][],
+  binds: i32[],
+  reads: i32[],
+): boolean {
+  if ll.arrElems.length == 0 { return false }
+  for e in ll.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 || ex >= P.nodes.length { return false }
+    if P.nodes[ex] is ObjLit { srcs.push([ex, ctx]) }
+    else if !monoRecSrcBinding(ex, ctx, srcs, binds, reads) { return false }
+  }
+  true
 }
 
 // Adds to `srcs` the record literal initialising the un-annotated `const` the name `v` (read in
@@ -20762,8 +20836,16 @@ function monoRecSrcBinding(
   const sd = P.nodes[sf[1]]
   if !(sd is LetDecl) || sd.letKw != "const" || sd.letType >= 0 { return false }
   const li = unwrapParen(sd.letInit)
-  if li < 0 || li >= P.nodes.length || !(P.nodes[li] is ObjLit) { return false }
-  if monoWritesOf("f:", sf[1]).length > 0 { return false }
+  if li < 0 || li >= P.nodes.length || monoWritesOf("f:", sf[1]).length > 0 {
+    return false
+  }
+  // A `const` initialised by another such name carries that name's literal (`const v = r`).
+  if P.nodes[li] is Ident && binds.length < 16 && !i32ListHas(binds, sf[1]) {
+    binds.push(sf[1])
+    reads.push(v)
+    return monoRecSrcBinding(li, sf[0], srcs, binds, reads)
+  }
+  if !(P.nodes[li] is ObjLit) { return false }
   srcs.push([li, sf[0]])
   binds.push(sf[1])
   reads.push(v)
@@ -21281,6 +21363,66 @@ function monoPinnedListElemPin(ax: i32, out: i32[]): string {
   monoPinAnnSpelling(et)
 }
 
+// The function type the walk of call `call` pins field `name` of un-annotated parameter `i` of
+// `dn` at, where the argument's own field type `ft` is open, or -1.
+function monoOpenRowFieldTy(
+  dn: FuncDecl,
+  i: i32,
+  call: i32,
+  name: string,
+  ft: i32,
+): i32 {
+  if ft < 0 || ft >= T.tys.length || !(T.tys[ft] is TyFunc) || !monoTyOpen(ft) {
+    return -1
+  }
+  const qs: i32[] = []
+  const path: string[] = ["f." + name]
+  if !fnFlowCallPathAgreedPinTys(dn.fnParams[i], path, call, qs) { return -1 }
+  const r = monoFnTyRetAt(ft, qs)
+  if r < 0 { return -1 }
+  mkFuncTy(qs, r)
+}
+
+// The record type argument `arg` of call `call` has at un-annotated parameter `i` of `dn` once
+// each open function field takes the type the walk pins it at, or -1 where none is pinned.
+function monoOpenRowPinnedTy(dn: FuncDecl, i: i32, call: i32, arg: i32): i32 {
+  if i < 0 || i >= dn.fnParams.length { return -1 }
+  const p = P.nodes[dn.fnParams[i]]
+  const ot = nodeTyIxOf(unwrapParen(arg))
+  if (
+    !(p is Param)
+    || p.parType >= 0
+    || ot < 0
+    || ot >= T.tys.length
+    || !monoTyOpen(ot)
+  ) {
+    return -1
+  }
+  const o = T.tys[ot]
+  if !(o is TyObj) { return -1 }
+  const tys: i32[] = []
+  let pinnedAny = false
+  let k = 0
+  while k < o.objFieldNames.length {
+    const ft = monoOpenRowFieldTy(
+      dn,
+      i,
+      call,
+      o.objFieldNames[k],
+      o.objFieldTypes[k],
+    )
+    tys.push(o.objFieldTypes[k])
+    if ft >= 0 {
+      // arena-tick exempt: a fresh local field list for mkObjTy, read by no pass.
+      tys[k] = ft
+      pinnedAny = true
+    }
+    k = k + 1
+  }
+  if !pinnedAny { return -1 }
+  mkObjTy(o.objFieldNames, tys)
+}
+
 // The refusal for a parameter `par` of `callee` no argument pin closes.
 function monoArgTyFail(par: string, callee: string): i32 {
   emitFail(
@@ -21581,7 +21723,11 @@ function monoPinHoleParam(
     an = monoInertParamStubPin(oDecl, args[i], inTy)
     anTy = inTy[0]
   }
-  if an == "" { an = monoArgPinName(args[i], ctx) }
+  if an == "" {
+    an = monoArgPinName(args[i], ctx)
+    // An open row keys and rechecks its instance at the types its functions are pinned at.
+    if an != "" { anTy = monoOpenRowPinnedTy(fn, i, callIx, args[i]) }
+  }
   if an == "" {
     const lamTy: i32[] = [0 - 1]
     an = monoHoleLamArgPin(callIx, oDecl, args, i, ctx, lamTy)

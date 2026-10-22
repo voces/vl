@@ -34,11 +34,9 @@ import {
   gaeLtAt,
   groupInnerOf,
   listElemNameOf,
-  mapSpellValName,
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
-  nameIsMapSpanEnds,
   nameIsShapeOpen,
   peelGroupParens,
   splitUnionAtoms,
@@ -969,7 +967,6 @@ import {
   unionSetAtomsOf,
   unionSetAtomsOfTy,
   unionSetHasNull,
-  unionSetMemberCount,
 } from "./emit_union_registry"
 import {
   arrLitElemHintTy,
@@ -995,7 +992,6 @@ import {
   strListHas,
   strListIndexOf,
 } from "./listutil"
-import { strContains } from "./strutil"
 import {
   intLitUnionBasesOf,
   primNameOf,
@@ -1009,7 +1005,6 @@ import {
 import {
   MAP_KEY_I32,
   MAP_KEY_I64,
-  MAP_KEY_STR,
   isValueUnionName,
   isValueUnionTyOr,
   nameIsInlineLitUnion,
@@ -6500,127 +6495,6 @@ function mAssignMapValueStructs() {
   0
 }
 
-// Whether an annotation spelling that mentions an i32-keyed map is one the emitter can lower:
-// 0 when it is, else the loud reject (-1) naming the position that failed. Passing this gate is
-// not the same as being collected — a spelling this accepts whose flag nothing sets still emits
-// a module with no i32-key scratch frame, `vl check` rc 0 and invalid wasm (ROADMAP B6a).
-function i32MapSpellingLowerable(name: string) {
-  const bare = i32MapPeelWrappers(name)
-  // A union spelling is split first: its text can open with `{[` and close with `}` while being
-  // two members, so the span tests below would read `{[string]: R} | {[i32]: R}` as one map.
-  // Each member is asked this same question; a member that IS the map boxes under its own tag.
-  if unionSetMemberCount(bare) > 1 {
-    const atoms: string[] = []
-    unionSetAtomsOf(bare, atoms)
-    let ai = 0
-    while ai < atoms.length {
-      if nameMentionsIntKeyedMap(atoms[ai]) {
-        if i32MapSpellingLowerable(atoms[ai]) < 0 { return -1 }
-      }
-      ai = ai + 1
-    }
-    return 0
-  }
-  if nameIsMapSpanEnds(bare) {
-    if mapNameKeyKind(bare) != MAP_KEY_STR { return 0 }
-    // A map whose VALUE mentions an i32-keyed map (`{[string]: {[i32]: V}}`): the inner map is
-    // delivered exactly as any other map value is, so ask this same question of it.
-    const mv = mapSpellValName(bare)
-    if nameMentionsIntKeyedMap(mv) { return i32MapSpellingLowerable(mv) }
-    return 0
-  }
-  // A shape spelling — an inline struct annotation or an inline union arm — delegates to its
-  // fields. This is the one position whose map is invisible to the scan that reaches this gate:
-  // the whole shape is one `TypeRef` name. Each field text is asked this same question, so the
-  // set a field may hold is exactly the set any other position may hold, and nothing wider.
-  if nameIsShapeSpanEnds(bare) { return i32MapShapeFieldsLowerable(bare) }
-  i32MapSpellingUnsupported(name)
-}
-
-// Whether the spelling `name` mentions an integer-keyed map anywhere, the text test the
-// position gate above is asked behind.
-function nameMentionsIntKeyedMap(name: string): boolean {
-  strContains(name, "{[i32]:") || strContains(name, "{[i64]:")
-}
-
-// Strip the wrappers that carry a map's shape through to its leaf, to a FIXPOINT: a function
-// type's return, one list layer, one `| null` niche, and a grouping paren that hides an arrow.
-// A fixpoint rather than one pass of each, so `{[i32]: V}[][]` and an array of map-returning
-// closures reach the same leaf their one-layer twins do.
-function i32MapPeelWrappers(name: string) {
-  let bare = name
-  let peeling = true
-  while peeling {
-    peeling = false
-    const fr = annRetNameOf(bare)
-    if fr != "" {
-      bare = fr
-      peeling = true
-    }
-    // A grouping paren is stripped only when it REVEALS a top-level arrow (the cut is
-    // `tyname.peelGroupParens`), so a parameter list is never mistaken for one.
-    if annRetNameOf(bare) == "" {
-      const gi = peelGroupParens(bare)
-      if gi != bare {
-        if annRetNameOf(gi) != "" {
-          bare = gi
-          peeling = true
-        }
-      }
-    }
-    const ae = listElemNameOf(bare)
-    if ae != "" {
-      bare = ae
-      peeling = true
-    }
-    const inner = nulMapInnerName(bare)
-    if inner != "" {
-      bare = inner
-      peeling = true
-    }
-  }
-  bare
-}
-
-// The gate's reject, named once: the leaf test above and a shape's field through the
-// recursion both raise it, and the message must not drift between them. Each position the
-// message names is exercised by a corpus case and lowers today.
-function i32MapSpellingUnsupported(name: string): i32 {
-  let kw = "i32"
-  if !strContains(name, "{[i32]:") { kw = "i64" }
-  emitFail(
-    "emitProgram: an "
-      + kw
-      + "-keyed Map/Set is supported as a binding / parameter / "
-      + "return / `| null` / a union member / an ARRAY ELEMENT at any depth / a closure "
-      + "result / a MAP VALUE / a struct or variant FIELD — not inside '"
-      + name
-      + "'. Bind the "
-      + kw
-      + "-keyed map on its own and pass it where you need it.",
-  )
-}
-
-// Ask `i32MapSpellingLowerable` of every field of the shape spelling `nm` that mentions an
-// i32-keyed map. The field row's key column is what makes this legal: a map field records only
-// its value, and the key column is the other half of the mv slot's identity. A field that does
-// not mention the key rep is not examined; this gate answers for the i32-keyed rep alone.
-function i32MapShapeFieldsLowerable(nm: string): i32 {
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  // The group-interior cut at its home (`tyname.groupInnerOf`); the guard is the caller's
-  // `nameIsShapeSpanEnds`.
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let i = 0
-  while i < ftexts.length {
-    if nameMentionsIntKeyedMap(ftexts[i]) {
-      if i32MapSpellingLowerable(ftexts[i]) < 0 { return -1 }
-    }
-    i = i + 1
-  }
-  0
-}
-
 // The one home of "reserve the backing and wrapper heap types the type name `a` needs". A
 // presence flag is a reservation: `mAssignTypeIndices` mints a heap type only where the flag is
 // set, and an unminted index falls through to `mNextType`, so a missed reservation is
@@ -7378,12 +7252,6 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
 // `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
 // spelling forces. Returns 0, or -1 once a spelling with no rep has failed loudly.
 function collectATypeRef(i: i32, nd: TypeRef) {
-  // The integer-keyed maps' position gate, asked of every annotation name before the
-  // type-forcing chain below reads it: a union member that IS the map lowers into a box that
-  // records no map struct, so that position is a loud reject rather than invalid wasm.
-  if nameMentionsIntKeyedMap(nd.tyName) {
-    if i32MapSpellingLowerable(nd.tyName) < 0 { return -1 }
-  }
   // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
   // see `forceNestedCloSigReps`, which walks INTO the spelling for it.
   forceNestedCloSigReps(nd.tyName, 0)
