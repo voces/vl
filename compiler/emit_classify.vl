@@ -1136,6 +1136,7 @@ import {
   holeFnArgRetAtParams,
   substTyDeep,
   tvWriteLandTy,
+  tyProvesNonNull,
 } from "./check_relate_core"
 import {
   flattenVariantsInto,
@@ -10240,6 +10241,20 @@ export function coalesceNulAtomToStr(exprIx: i32, fnIx: i32): boolean {
   false
 }
 
+// Whether the `??` at `exprIx` in the pinned instance `fnIx` reads an operand `lhsIx` the
+// instance typed without `null`, at the `??`'s own type or at a numeric literal type that reps
+// as its scalar: the default is dead, the fold the template's rewrite makes of a concrete one.
+export function coalRetypedDead(exprIx: i32, lhsIx: i32, fnIx: i32): boolean {
+  if !fnInPinnedInstance(fnIx) { return false }
+  const lt = nodeTyIxOf(lhsIx)
+  if lt < 0 || lt >= T.tys.length || !tyProvesNonNull(lt) { return false }
+  const pt = nodeTyPinIxOf(exprIx)
+  if lt == pt { return true }
+  if T.tys[lt] is TyPrim { return false }
+  const pn = tyPrimNameOf(pt)
+  pn != null && tyNumScalarBaseName(lt) == pn
+}
+
 // True when the `??` at `exprIx` sits in a generic body whose operand this instance pins to
 // `string` or `i32` and whose default is of that same type: the `??` is its operand, as the
 // fold makes it at a direct spelling (D3206). Any other pin or default keeps its refusal,
@@ -12608,6 +12623,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
       // the one fused-read shape home rather than an `is Index` half-set; without the `.get`
       // half this classifier declined and `print` printed the raw atom id.
       if e.binOp == "??" {
+        if coalRetypedDead(exprIx, unwrapParen(e.binLeft), fnIx) {
+          return exprIsLitAtom(e.binLeft, fnIx)
+        }
         const blRecv = fusedMapReadRecvIx(unwrapParen(e.binLeft))
         if blRecv >= 0 {
           if coalMapReadForeignDefault(blRecv, e.binRight, fnIx) {
@@ -19865,6 +19883,9 @@ export function exprString(exprIx: i32, fnIx: i32) {
         if coalesceNulAtomToStr(exprIx, fnIx) { return true }
         if coalesceRetypedAtomToStr(exprIx, fnIx) { return true }
         if coalesceOperandPinNonNull(exprIx, fnIx) {
+          return exprString(e.binLeft, fnIx)
+        }
+        if coalRetypedDead(exprIx, unwrapParen(e.binLeft), fnIx) {
           return exprString(e.binLeft, fnIx)
         }
         // …and over a `null`-typed LHS the value is the default, at the default's rep (D1576).

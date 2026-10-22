@@ -313,20 +313,21 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   false
 }
 
-// Whether a lambda adopts an expected numeric literal union result, or that union or `null`:
-// every value it returns, each `return` and the tail alike, is delivered to it (D9490, D9491).
-// The union reps as its base scalar, so a value outside it would print rather than refuse.
-function numLitUnionAdoptsRet(
-  n: FuncDecl,
-  inferred: i32,
-  expRet: i32,
-): boolean {
+// Whether a lambda adopts an expected literal result: a lone string literal, or a string or
+// numeric literal union or that union or `null`. Every value it returns, each `return` and
+// the tail alike, must be delivered to it, as an annotated result's are (D9490, D9520).
+function litUnionAdoptsRet(n: FuncDecl, inferred: i32, expRet: i32): boolean {
   if expRet < 0 { return false }
   let base = expRet
+  let strLit = false
   const et = T.tys[expRet]
   if et is TyNullable { base = et.nInner }
-  if !numLitUnionHasBase(base) { return false }
-  if inferred >= 0 && tyEq(inferred, expRet) { return false }
+  if et is TyLit { strLit = et.litKind == "str" }
+  if base < 0 { return false }
+  if !tyIsLitUnion(base) && !strLit {
+    if !numLitUnionHasBase(base) { return false }
+    if inferred >= 0 && tyEq(inferred, expRet) { return false }
+  }
   retValsDeliver(n, inferred, expRet)
 }
 
@@ -369,8 +370,8 @@ function nulNumLitUnionBoxTy(ty: i32): i32 {
 }
 
 // The niche rungs of an anonymous lambda's contextual return adoption: a bare `{}` body,
-// a litunion member, and the nullable string/boolean/list/closure/struct/litunion niches.
-// Hands back `inferred`, replaced by `expRet` where a rung adopts it.
+// a literal union member, and the nullable string/boolean/list/closure/struct niches, then
+// every other result through the boxed rungs. Hands back `inferred`, or `expRet` if adopted.
 function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
   let inferred = inferred0
   // A bare `{}` body completes the expected record, as it would at any delivery (D2223).
@@ -381,22 +382,11 @@ function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
     bareBraceSpecSet(bareBraceSpec - 1)
     if bareBraceRecordOf(expRet) >= 0 { inferred = expRet }
   }
-  // The litunion dual: a string-literal body that is a member of the expected literal union,
-  // or is the expected one-literal result (`() => "a"`, D7880), adopts it. Its inferred type is
-  // the softened `string`; the direct `const k: K = "b"` binding grants the same flow through
-  // `assignableExpr`, and a one-literal result is a string ref as a declared `: "a"` return is.
-  let expStrLit = false
-  if expRet >= 0 {
-    const elT = T.tys[expRet]
-    if elT is TyLit { expStrLit = elT.litKind == "str" }
-  }
-  if inferred != expRet && (tyIsLitUnion(expRet) || expStrLit) {
-    const luTail = lambdaBodyTail(n.fnBody)
-    if luTail >= 0 && assignableExpr(luTail, inferred, expRet) {
-      inferred = expRet
-    }
-  }
-  if inferred != expRet && numLitUnionAdoptsRet(n, inferred, expRet) {
+  // The literal dual: a body every value of which is a member of the expected literal union,
+  // or is the expected one-literal result (`() => "a"`, D7880), adopts it. A string body's
+  // inferred type is the softened `string`, which the direct `const k: K = "b"` binding
+  // also takes, and the `K | null` niche's result is the atom with `-1` for null.
+  if inferred != expRet && litUnionAdoptsRet(n, inferred, expRet) {
     inferred = expRet
   }
   // A nullable-string result: a lambda body inferring a bare `string` member of an
@@ -452,19 +442,9 @@ function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
           }
         }
       }
-      // The nullable-litunion dual: a lambda body inferring a bare `string` member of
-      // the expected `K | null` litunion adopts the niche — its functype result is the
-      // i32 atom (`-1` = null), and `emitReturnValue`'s `retNulLitUnion` arm encodes it
-      // exactly as the annotated `: () => K | null` form already does.
-      if tyIsLitUnion(etU.nInner) {
-        const nluTail = lambdaBodyTail(n.fnBody)
-        if nluTail >= 0 && assignableExpr(nluTail, inferred, expRet) {
-          inferred = expRet
-        }
-      }
     }
   }
-  inferred
+  inferRetAdoptBoxed(n, inferred, expRet)
 }
 
 // The nullable-element list rungs of `inferRetAdoptBoxed`: scalar, struct, map and inner-list
@@ -1216,7 +1196,6 @@ export function finishInferredReturn(
         objRetAdopted = true
       }
       inferred = inferRetAdoptNiche(n, inferred, expRet)
-      inferred = inferRetAdoptBoxed(n, inferred, expRet)
       // The struct-element-list result: a lambda body array literal's element structs
       // coerce field-wise into the expected shape and adopt it — `assignableExpr`'s
       // per-element `ObjLit` coercion records the coerced field types for the emitter's
