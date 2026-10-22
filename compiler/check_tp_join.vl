@@ -8,7 +8,15 @@
 
 import { FuncDecl, P, Param, i32ToStr } from "./ast"
 import { cstrOwnerStack, lamCheckDepth, lamRefoldDepth } from "./check_cursor"
-import { tyParamsApart, tyVarOwnerOf } from "./check_hole_pins"
+import {
+  HD_BINOP,
+  hdAlt,
+  hdKind,
+  hdRootTy,
+  hdRowOf,
+  tyParamsApart,
+  tyVarOwnerOf,
+} from "./check_hole_pins"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
   flattenVariantsInto,
@@ -36,6 +44,7 @@ import {
   tyArrayElemIx,
   tyBearsNull,
   tyEq,
+  tyEqSameHoles,
   tyIsDeclaredParam,
   tyIsHole,
   tyNulInnerTy,
@@ -283,9 +292,17 @@ export function markTpJoinApart(j: i32) {
   0
 }
 
-// The join of `a` and `b` when every member is a declared type parameter or a null and one
-// parameter is the checked body's own: each parameter once, the null kept, re-joined at each
-// pin (D3267). -1 otherwise; a concrete member is joined by the rules above.
+// Whether `t` is arithmetic over a parameter's hole, beside an `i64` or `f64` operand when
+// `wide`: a pin may type it apart from that hole, so a join keeps the two apart (D9631).
+function paramArithHole(t: i32, wide: boolean): boolean {
+  const r = hdRowOf(t)
+  if r < 0 || hdKind[r] != HD_BINOP || (wide && hdAlt[r] < 0) { return false }
+  tyIsNamedParamHole(hdRootTy(t))
+}
+
+// The join of `a` and `b` when every member is a declared type parameter, a null, or a
+// parameter's arithmetic where one member is beside a wide operand (`paramArithHole`), and one
+// parameter is the checked body's own: each member once, re-joined at each pin. -1 otherwise.
 export function tpOpenJoin(a: i32, b: i32): i32 {
   if tpArmJoinDepth == 0 { return -1 }
   const ms: i32[] = []
@@ -294,17 +311,23 @@ export function tpOpenJoin(a: i32, b: i32): i32 {
   const kept: i32[] = []
   let hasNull = false
   let open = false
+  let anyWide = false
+  for m in ms {
+    if paramArithHole(m, true) { anyWide = true }
+  }
   for m in ms {
     if m < 0 || m >= T.tys.length || m == TY_ERR || m == TY_VOID { return -1 }
     const mt = T.tys[m]
     if isNullTy(m) {
       hasNull = true
     } else if mt is TyVar {
-      if !tyIsGradualParam(m) { return -1 }
-      if tyParamOfInnermostBody(m) { open = true }
+      const wide = anyWide && paramArithHole(m, false)
+      if !wide && !tyIsGradualParam(m) { return -1 }
+      if tyParamOfInnermostBody(hdRootTy(m)) { open = true }
       let dup = false
       for k in kept {
         if k == m || sameDeclaredTyParam(k, m) { dup = true }
+        if wide && tyEqSameHoles(k, m) { dup = true }
       }
       if !dup { kept.push(m) }
     } else {
