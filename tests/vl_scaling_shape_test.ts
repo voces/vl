@@ -20,10 +20,10 @@
 
 // A COMPILE BAR IS THE FAMILY DEFAULT 2.5, OR 1.25x THE AXIS'S FUEL RATIO WHERE THAT IS
 // HIGHER; an axis whose bar is deliberately tighter keeps it. A fuel ratio is the same on
-// every run, so the margin pays only for the compiler changing, not for the box. Five axes
+// every run, so the margin pays only for the compiler changing, not for the box. Six axes
 // sit above the default because they are super-linear today — `types`, `reads after many
 // closed sibling shadows`, `list concat chain length`, `if joins nested deep`, `diamond
-// record depth` —
+// record depth`, `diamond record depth under ==` —
 // and that is recorded DEBT, not tolerance: lower a bar when the thing it names stops
 // multiplying. Twelve are GROWTH pairs, the same shape at `n` against `n/4`, so linear reads 4
 // rather than 1: `many distinct captured sibling blocks`, `list concat chain length`,
@@ -916,6 +916,52 @@ axis(
   3.6,
   "A position is keying a record by its rendered spelling, which doubles per level, rather than by its arena type — `tyDeeperThan`, `mvDeepFuncSlotOfTy` or `repIdOf`'s cap (D9771, D9810, D9840).",
   (d) => twoFiles(d, genDiamond(12, true), genDiamond(12, false)),
+);
+
+// The same 12-level diamond against its chain, through one use each: function type aliases
+// over it as record fields, `==` and `!=` over it, and an un-annotated `Map()` holding it.
+// Fuel reads 1.17, 2.28 and 1.30; master `0f0face1e` read 366, 88.5 and, at depth 8, 36.5.
+type DiamondUse = "fnAlias" | "eq" | "inferredMap";
+const genDiamondUse = (use: DiamondUse, n: number, diamond: boolean): string => {
+  const r = (a: string, b: string) => (diamond ? a : b);
+  const o = ["type A0 = {x: i32}"];
+  for (let i = 1; i <= n; i++) o.push(`type A${i} = {l: A${i - 1}, r: ${r(`A${i - 1}`, "i32")}}`);
+  if (use == "fnAlias") {
+    o.push(`type FF = (x: i32) => A${n}`, `type GG = (a: A${n}) => i32`, "type R = {f: FF, g: GG}");
+    o.push("const fs: FF[] = []", "print(fs.length + 1)");
+    return o.join("\n") + "\n";
+  }
+  o.push("const a0: A0 = {x: 5}");
+  for (let i = 1; i <= n; i++) o.push(`const a${i}: A${i} = {l: a${i - 1}, r: ${r(`a${i - 1}`, "1")}}`);
+  if (use == "eq") o.push(`print(a${n} == a${n})`, `print(a${n} != a${n})`);
+  else {
+    o.push("const m = Map()", `m["k"] = a${n}`, 'const v = m["k"]');
+    o.push(`if v != null { print(v${".l".repeat(n)}.x) }`);
+  }
+  return o.join("\n") + "\n";
+};
+const diamondUse = (use: DiamondUse) => (d: string) =>
+  twoFiles(d, genDiamondUse(use, 12, true), genDiamondUse(use, 12, false));
+
+axis(
+  "diamond record depth under a function type alias",
+  2.5,
+  "A function type alias over a deep record renders structurally rather than nominally — `transparentMemberEmitName` or `unionAliasMultiMembers` (D9891).",
+  diamondUse("fnAlias"),
+);
+
+axis(
+  "diamond record depth under ==",
+  2.9,
+  "`==` over a deep record compares inline per field path rather than through one helper per record type — `eqHelpReserve`, `isEquatable` or `eqListFieldPath` (D9935).",
+  diamondUse("eq"),
+);
+
+axis(
+  "diamond record depth in an un-annotated map",
+  2.5,
+  "An un-annotated map's value slot is keyed by the record's rendered spelling rather than its declared name — `mapNodeValName` (D9936).",
+  diamondUse("inferredMap"),
 );
 
 // 1.09 / 0.97 / 1.13 at 6,000. At 3,000 fuel reads 1.00, and an arena scan planted on each
