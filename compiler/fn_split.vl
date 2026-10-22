@@ -41,9 +41,12 @@ import {
   hasNamedArgs,
   i32ToStr,
   mkBinary,
+  mkBlock,
   mkFieldInit,
   mkIdent,
+  mkIf,
   mkLet,
+  mkNum,
   mkParam,
   mkTypeRef,
   nodeChildren,
@@ -99,10 +102,12 @@ let pwAnchor: i32[] = []
 let pwName: string[] = []
 let pwValSrc: i32[] = []
 let pwValName: string[] = []
-// The choice binding `pcAnchor` evaluates its condition once into the `const` `pcName` declared
-// before it, which it and each of its slots' copies read (D9161).
+// The choice binding `pcAnchor` evaluates its whole choice once into the `const` `pcName`
+// declared before it, as the index of the arm chosen; it and each of its slots' copies select
+// the arm's name `pcLeaves` by that index (D9322).
 let pcAnchor: i32[] = []
 let pcName: string[] = []
+let pcLeaves: string[][] = []
 let prIdent: i32[] = []
 let prName: string[] = []
 // A copy of function `pfSrc` named `pfName` goes after the module statement `pfAnchor`.
@@ -203,6 +208,7 @@ function fsPlanReset(): i32 {
   psRetypeName = []
   pcAnchor = []
   pcName = []
+  pcLeaves = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -578,24 +584,21 @@ function fsValuePeer(v: i32): i32 {
 
 // Whether `v` is an `if` with an `else` whose arms are each only a name or another such `if`,
 // and whose conditions read without a call or a write, so a slot can evaluate a fresh copy of it
-// to the same function (D9120).
+// to the same function (D9120). While `fsAnyCond` is set, a condition may be anything.
 function fsPureChoice(v: i32, depth: i32): boolean {
   const x = fsParenPeel(v)
   if x < 0 || x >= P.nodes.length || depth > 16 { return false }
   const n = P.nodes[x]
   if n is MatchExpr { return fsPureMatch(n, depth) }
-  if !(n is IfStmt) || n.ifElse < 0 || !fsPureRead(n.ifCond, 0) { return false }
+  if !(n is IfStmt) || n.ifElse < 0 { return false }
+  if !fsAnyCond && !fsPureRead(n.ifCond, 0) { return false }
   fsPureChoiceArm(n.ifThen, depth) && fsPureChoiceArm(n.ifElse, depth)
 }
 
 // `fsPureChoice` for a `match` not yet lowered: a pure scrutinee, literal or `_` patterns
 // binding nothing, and arms that are each a name or a pure choice.
 function fsPureMatch(n: MatchExpr, depth: i32): boolean {
-  fsPureRead(n.matchScrut, 0) && fsPureMatchArms(n, depth)
-}
-
-// `fsPureMatch` without its scrutinee.
-function fsPureMatchArms(n: MatchExpr, depth: i32): boolean {
+  if !fsAnyCond && !fsPureRead(n.matchScrut, 0) { return false }
   let i = 0
   while i < n.matchPats.length {
     if n.matchBinds[i] >= 0 || !fsPureRead(n.matchPats[i], 0) { return false }
@@ -608,67 +611,117 @@ function fsPureMatchArms(n: MatchExpr, depth: i32): boolean {
   true
 }
 
-// Whether choice `v` is pure but for its own condition or scrutinee, which may call or write;
-// its slots' copies then read that from one evaluation before the binding (D9161).
-function fsHoistsCond(v: i32): boolean {
-  const x = fsParenPeel(v)
-  if x < 0 || x >= P.nodes.length || fsPureChoice(x, 0) { return false }
-  const t = fsFirstTok(x)
-  if t >= 0 && P.toks[t].kind == "MATCH" {
-    // The check bound a computed scrutinee to `$scrut<match>`, which the copy evaluates anew.
-    fsScrutOk = "$scrut" + i32ToStr(x)
-    const ok = fsPureChoice(x, 0)
-    fsScrutOk = ""
-    return ok
-  }
-  const n = P.nodes[x]
-  if !(n is IfStmt) || n.ifElse < 0 { return false }
-  fsPureChoiceArm(n.ifThen, 0) && fsPureChoiceArm(n.ifElse, 0)
+// Whether `fsPureChoice` accepts any condition or scrutinee; set only by `fsHoistsChoice`.
+let fsAnyCond = false
+
+// Whether choice `v` has a name at every leaf but a condition or scrutinee that calls or
+// writes. Its binding then evaluates the choice once, as an arm index its slots' copies select
+// by, so every condition runs as often and in the order the source says (D9161, D9322).
+function fsHoistsChoice(v: i32): boolean {
+  if fsPureChoice(v, 0) { return false }
+  fsAnyCond = true
+  const ok = fsPureChoice(v, 0)
+  fsAnyCond = false
+  ok
 }
 
-// The hoisted scrutinee `fsPureRead` reads as pure while `fsHoistsCond` asks, else "".
-let fsScrutOk = ""
-
-// The condition or scrutinee of choice `v`, or -1.
-function fsChoiceCond(v: i32): i32 {
+// Replaces each name at a leaf of choice `v`, left to right, by its index in `names`, which it
+// appends to. -1 when a leaf is not a name.
+function fsNumberLeaves(v: i32, names: string[], depth: i32): i32 {
   const x = fsParenPeel(v)
-  if x < 0 || x >= P.nodes.length { return -1 }
+  if x < 0 || x >= P.nodes.length || depth > 16 { return -1 }
   const n = P.nodes[x]
-  if n is MatchExpr { return n.matchScrut }
-  if n is IfStmt { return n.ifCond }
-  fsNotAChoice()
-}
-
-// The named default of the two ladders around it: -1. Only an `if` or a `match` chooses, and
-// every other node kind is a value the split copies whole.
-function fsNotAChoice(): i32 { -1 }
-
-// Points choice `v`'s condition or scrutinee at the binding `name`. -1 when `v` is no choice.
-function fsSetChoiceCond(v: i32, name: string): i32 {
-  const x = fsParenPeel(v)
-  if x < 0 || x >= P.nodes.length { return -1 }
-  const n = P.nodes[x]
-  const pos = n.pos
-  if n is MatchExpr {
-    n.matchScrut = mkIdent(name, pos)
-    return 0
-  }
   if n is IfStmt {
-    n.ifCond = mkIdent(name, pos)
+    if fsNumberArm(n.ifThen, names, depth) < 0 { return -1 }
+    return fsNumberArm(n.ifElse, names, depth)
+  }
+  if n is MatchExpr {
+    let i = 0
+    while i < n.matchBodies.length {
+      const b = n.matchBodies[i]
+      const bn = if b >= 0 && b < P.nodes.length { P.nodes[b] } else { n }
+      if bn is Ident {
+        n.matchBodies[i] = mkNum(i32ToStr(names.length), bn.pos)
+        names.push(bn.identName)
+      } else if fsNumberArm(b, names, depth) < 0 {
+        return -1
+      }
+      i = i + 1
+    }
     return 0
   }
-  fsNotAChoice()
+  fsExcluded(-1, "a choice arm that is neither a name nor a choice")
+}
+
+// `fsNumberLeaves` for arm `a`: a block holding one name or choice, or an `else if`.
+function fsNumberArm(a: i32, names: string[], depth: i32): i32 {
+  if a < 0 || a >= P.nodes.length { return -1 }
+  const n = P.nodes[a]
+  if !(n is Block) { return fsNumberLeaves(a, names, depth + 1) }
+  if n.blkStmts.length != 1 { return -1 }
+  const s = fsParenPeel(n.blkStmts[0])
+  const sn = if s >= 0 && s < P.nodes.length { P.nodes[s] } else { n }
+  if sn is Ident {
+    n.blkStmts[0] = mkNum(i32ToStr(names.length), sn.pos)
+    names.push(sn.identName)
+    return 0
+  }
+  fsNumberLeaves(n.blkStmts[0], names, depth + 1)
+}
+
+// A fresh choice of `names` by the arm index binding `sel`: `if sel == 0 { names[0] } else …`.
+// -1 for no names.
+function fsSelectArm(sel: string, names: string[], pos: i32): i32 {
+  if names.length == 0 { return -1 }
+  if names.length == 1 { return mkIdent(names[0], pos) }
+  let e = mkBlock([mkIdent(names[names.length - 1], pos)], pos)
+  let k = names.length - 2
+  while k >= 0 {
+    const c = mkBinary("==", mkIdent(sel, pos), mkNum(i32ToStr(k), pos), pos)
+    e = mkIf(c, mkBlock([mkIdent(names[k], pos)], pos), e, pos)
+    k = k - 1
+  }
+  e
 }
 
 // Whether `if` arm `a` (a block holding one value, or an `else if`) is a name or a pure choice.
 function fsPureChoiceArm(a: i32, depth: i32): boolean {
   if a < 0 || a >= P.nodes.length { return false }
   const n = P.nodes[a]
-  if n is IfStmt { return fsPureChoice(a, depth + 1) }
-  if !(n is Block) || n.blkStmts.length != 1 { return false }
-  const s = fsParenPeel(n.blkStmts[0])
+  if n is IfStmt { return fsMatchOnce(a) && fsPureChoice(a, depth + 1) }
+  if !(n is Block) { return false }
+  // A nested `match` whose scrutinee the check bound ahead of it in the arm (D9322).
+  const at = if fsAnyCond && n.blkStmts.length == 2 && fsScrutBind(n.blkStmts[0]) { 1 } else { 0 }
+  if n.blkStmts.length != at + 1 { return false }
+  const s = fsParenPeel(n.blkStmts[at])
   if s < 0 || s >= P.nodes.length { return false }
+  if at == 0 && !fsMatchOnce(s) { return false }
   P.nodes[s] is Ident || fsPureChoice(s, depth + 1)
+}
+
+// Whether nested choice `s` evaluates its scrutinee once: it is no `match` the check lowered,
+// or that `match` tests a place. A computed one the check could not bind ahead of it tests the
+// scrutinee once per arm (D2038), so the choice is not evaluated as the source says.
+function fsMatchOnce(s: i32): boolean {
+  if !fsAnyCond { return true }
+  if s < 0 || s >= P.nodes.length { return false }
+  const n = P.nodes[s]
+  const t = fsFirstTok(s)
+  if !(n is IfStmt) || t < 0 || P.toks[t].kind != "MATCH" { return true }
+  fsScrutOnce = true
+  const ok = fsPureRead(n.ifCond, 0)
+  fsScrutOnce = false
+  ok
+}
+
+// Whether `fsPureRead` reads a bound scrutinee as evaluated once; set only by `fsMatchOnce`.
+let fsScrutOnce = false
+
+// Whether statement `s` is a `const $scrut<match>` the check minted for a computed scrutinee.
+function fsScrutBind(s: i32): boolean {
+  if s < 0 || s >= P.nodes.length { return false }
+  const d = P.nodes[s]
+  d is LetDecl && d.letName.slice(0, 6) == "$scrut"
 }
 
 // Whether expression `x` reads names, literals, fields, elements and operators only, so a second
@@ -678,9 +731,10 @@ function fsPureRead(x: i32, depth: i32): boolean {
   const n = P.nodes[x]
   // A binding the check minted for a computed scrutinee or receiver stands for that
   // expression, which a copy made from the tokens evaluates again.
-  if n is Ident && n.identName != fsScrutOk {
+  if n is Ident {
     const nm = n.identName
-    if nm.slice(0, 6) == "$scrut" || nm.slice(0, 3) == "$om" { return false }
+    if nm.slice(0, 6) == "$scrut" { return fsScrutOnce }
+    if nm.slice(0, 3) == "$om" { return false }
   }
   if (
     n is Ident
@@ -3499,7 +3553,7 @@ function fsPlanMember(mi: i32): i32 {
   if lanes.length == 0 { return 0 }
   if d.letType >= 0 && !(P.nodes[d.letType] is TypeRef) { return 1 }
   if !fsStmtParentOk(m) { return 1 }
-  const hoist = lanes.length > 1 && fsHoistsCond(d.letInit)
+  const hoist = lanes.length > 1 && fsHoistsChoice(d.letInit)
   const ip = if hoist { -1 } else { fsValuePeer(d.letInit) }
   if ip == -2 { return 1 }
   if hoist {
@@ -3864,19 +3918,26 @@ function fsApply(): i32 {
   i = 0
   while i < pcAnchor.length {
     const d = P.nodes[pcAnchor[i]]
-    if rc == 0 && d is LetDecl {
-      const c = fsChoiceCond(d.letInit)
-      rc = -1
-      if c >= 0 {
-        P.pos = nodeToks[c] + 1
-        const pos = P.nodes[c].pos
-        rc = fsSetChoiceCond(d.letInit, pcName[i])
-        if rc == 0 {
-          rc = fsInsertBefore(
-            pcAnchor[i],
-            mkLet("const", pcName[i], -1, c, pos),
-          )
-        }
+    const names: string[] = []
+    pcLeaves.push(names)
+    const c = if d is LetDecl { d.letInit } else { -1 }
+    if (
+      rc == 0
+      && d is LetDecl
+      && c >= 0
+      && c < P.nodes.length
+      && c < nodeToks.length
+    ) {
+      // The binding's own choice, its leaves numbered, becomes the arm index binding.
+      P.pos = nodeToks[c] + 1
+      const pos = P.nodes[c].pos
+      rc = fsNumberLeaves(c, names, 0)
+      const sel = fsSelectArm(pcName[i], names, pos)
+      if rc == 0 && sel >= 0 {
+        d.letInit = sel
+        rc = fsInsertBefore(pcAnchor[i], mkLet("const", pcName[i], -1, c, pos))
+      } else {
+        rc = -1
       }
     } else {
       rc = -1
@@ -3888,14 +3949,15 @@ function fsApply(): i32 {
     if rc == 0 {
       const a = pdAnchor[i]
       P.pos = nodeToks[a] + 1
-      let v = fsValueNode(pdValSrc[i], pdValName[i])
-      // A copy of a choice with a hoisted condition reads the hoisted binding.
+      // A copy of a choice evaluated once selects its arm by the arm index binding.
       let ci = 0
-      while ci < pcAnchor.length && v >= 0 {
-        if pcAnchor[ci] == a {
-          v = if fsSetChoiceCond(v, pcName[ci]) == 0 { v } else { -2 }
-        }
-        ci = ci + 1
+      while ci < pcAnchor.length && pcAnchor[ci] != a { ci = ci + 1 }
+      let v = -2
+      if ci < pcAnchor.length {
+        v = fsSelectArm(pcName[ci], pcLeaves[ci], P.nodes[a].pos)
+        if v < 0 { v = -2 }
+      } else {
+        v = fsValueNode(pdValSrc[i], pdValName[i])
       }
       let ty = -1
       // A lane of a binding whose type parameter is stripped is un-annotated too (D6761).
