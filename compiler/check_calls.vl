@@ -45,6 +45,7 @@ import {
   genFnValueCstrs,
   holeDeclCstrsAt,
   holeDeclCstrsBind,
+  holeFnArgUnionRetTy,
   holeLambdaDefers,
   holeLambdaSeedTy,
   validateArgCstrs,
@@ -93,7 +94,12 @@ import {
   noteMemCstr,
   notePrintCstr,
 } from "./check_cstr_rows"
-import { inferQuiet, tpEnvNames, tpEnvTys } from "./check_cursor"
+import {
+  cstrOwnerStack,
+  inferQuiet,
+  tpEnvNames,
+  tpEnvTys,
+} from "./check_cursor"
 import {
   boundObjRootOf,
   memOffsetCheckedValue,
@@ -221,7 +227,7 @@ import {
   fsbArgTysOf,
   voidValueSlotErr,
 } from "./check_node_rules"
-import { nodeTyOf } from "./check_node_tys"
+import { nodeTyOf, nodeTySet } from "./check_node_tys"
 import { lbiNoDest } from "./check_num_lit_state"
 import { floatIntrWidth } from "./check_num_lits"
 import { arityWantText, ovPlainHint, paramNamesOfNodes } from "./check_overload"
@@ -329,6 +335,7 @@ import {
   tyPrintsAsRef,
   tyRefusesArrayDemand,
   tyRefusesArrayWrite,
+  tySame,
   tyToStr,
   tyWideUnionMinted,
 } from "./check_types"
@@ -351,7 +358,7 @@ import {
   cwSoleBinderOf,
   fnDeclIx,
 } from "./check_write_scan"
-import { strListHas, strListIndexOf } from "./listutil"
+import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import {
   isVoidTy,
   nonNullTy,
@@ -1145,6 +1152,17 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
   const vNames: string[] = []
   const vTys: i32[] = []
   withUnionArmBinds(bNames, bTys, uNames, uTys, vNames, vTys)
+  // A parameter an adopted lambda bound only to itself takes the union arm's binding (D10211).
+  let si = 0
+  while si < vNames.length {
+    const sb = vTys[si]
+    const sv = if sb >= 0 && sb < T.tys.length { T.tys[sb] } else { T.tys[TY_I32] }
+    if sv is TyVar && sv.tvName == vNames[si] {
+      const ub = bindOf(uNames, uTys, vNames[si])
+      if ub >= 0 { vTys[si] = ub }
+    }
+    si = si + 1
+  }
   // A function argument whose expected type left a result type parameter open, which a union
   // arm binds, is delivered at the bound type, so a narrower result is boxed (D10133).
   if !inferQuiet && uNames.length > 0 {
@@ -1157,7 +1175,17 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
       ) {
         const fin = substTyDeep(params[fi], vNames, vTys)
         if fin >= 0 && !tyHasTyVar(fin) {
-          fvaAdapt(args[fi], nodeTyOf(args[fi]), fin)
+          const ft0 = nodeTyOf(args[fi])
+          const lam = P.nodes[parenPeelIx(args[fi])] is FuncDecl
+          // A lambda that adopted the open expected type is typed at the bound one (D10211).
+          if (
+            !fvaAdapt(args[fi], ft0, fin)
+            && lam
+            && tyHasTyVar(ft0)
+            && tySame(substTyDeep(ft0, vNames, vTys), fin)
+          ) {
+            nodeTySet(args[fi], fin)
+          }
         }
       }
       fi = fi + 1
@@ -1433,7 +1461,15 @@ function callFtyCheckArg(
   const seedTy = callFtyArgSeedTy(cfn, params, args, i, bNames, bTys)
   seedExpected(args[i], seedTy)
   if tpEnvNames.length > 0 { tpIfMarkOk(args[i]) }
-  const at = checkNodeHook(args[i])
+  let at = checkNodeHook(args[i])
+  // A function value at a hole the callee hands on to a generic's union-result function
+  // parameter is delivered at that parameter's bound type (D10210).
+  if tyIsHole(params[i]) && cfn is Ident {
+    const hd = holeFnArgUnionRetTy(fnDeclIx[cfn.identName] ?? -1, params[i], at)
+    if hd >= 0 && hd != at && fvaAdapt(args[i], at, hd) {
+      at = nodeTyOf(args[i])
+    }
+  }
   // A template hole meeting its injected renderer. This line is the first
   // moment the hole's type exists, which is why the type-directed half of
   // the template lowering lives here and not in the parser's desugar.
@@ -1467,7 +1503,11 @@ function callFtyCheckArg(
   // SUBSTITUTED expected type — a later disagreeing use errors here.
   bindGenWalk(params[i], at, bNames, bTys)
   bindGenUnionArm(params[i], at, uNames, uTys)
-  bindGenFnRetUnionArm(params[i], at, uNames, uTys)
+  // A call from inside the callee itself hands on its own `T`, which no default may take.
+  let calleeDecl = -1
+  if cfn is Ident { calleeDecl = fnDeclIx[cfn.identName] ?? -1 }
+  const adopted = calleeDecl >= 0 && !i32ListHas(cstrOwnerStack, calleeDecl)
+  bindGenFnRetUnionArm(params[i], at, uNames, uTys, adopted)
   if tyHasTyVar(params[i]) || tyIsHole(params[i]) {
     checkFnValueRetTyParamBound(args[i], at)
   }
