@@ -17809,6 +17809,22 @@ function monoCoerceAtValueParams(n: Call, dfe: i32, ctx: i32): i32 {
   0
 }
 
+// Whether `n` is a `.map` / `.filter` whose receiver is a call, or an index into one.
+function monoListCbRecvIsCall(n: Call): boolean {
+  if n.callFn < 0 || n.callArgs.length != 1 { return false }
+  const m = P.nodes[n.callFn]
+  if !(m is Member) || (m.memProp != "map" && m.memProp != "filter") {
+    return false
+  }
+  let r = unwrapParen(m.memObj)
+  while r >= 0 {
+    const rn = P.nodes[r]
+    if !(rn is Index) { break }
+    r = unwrapParen(rn.idxArr)
+  }
+  r >= 0 && P.nodes[r] is Call
+}
+
 // A generic function named as the callback of `.map` / `.filter` over a list of a closed element
 // takes its instance at that element, as a lambda's contextual type pins it (D8944).
 function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
@@ -17960,6 +17976,8 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
   if fd < 0 { return -1 }
   const fn = P.nodes[fd]
   if !(fn is FuncDecl) || fn.fnRet >= 0 { return -1 }
+  const it = monoCallInstRetTy(c, fd)
+  if it >= 0 { return it }
   let t = -1
   for r in monoFnRetArgs(fn) {
     if r >= 0 && !(P.nodes[r] is RetStmt) {
@@ -17971,6 +17989,28 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
       if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
       t = rt
     }
+  }
+  t
+}
+
+// The closed list result of the instance of template `fd` that call `c` now names, as the
+// emitter resolves its callee; -1 before the call takes one, or when that result is open or not
+// a list (D9552).
+function monoCallInstRetTy(c: Call, fd: i32): i32 {
+  if c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  const cf = P.nodes[c.callFn]
+  if !(cf is Ident) { return -1 }
+  const fe = fnIndexOf(cf.identName)
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  const d = fnStmts[fe]
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const it = monoFrameInstTmpl(d)
+  if d == fd || it[0] != d || it[1] != fd { return -1 }
+  const dn = P.nodes[d]
+  if !(dn is FuncDecl) || dn.fnRet < 0 { return -1 }
+  const t = nodeTyIxOf(dn.fnRet)
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyArray) || monoTyOpen(t) {
+    return -1
   }
   t
 }
@@ -21402,9 +21442,12 @@ function monoWalk(ix: i32, ctx: i32) {
         if cr == 1 { return 0 }
       }
       if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
+      // A callback over a call's result reads it at the instance that call takes (D9550).
+      const cbRecvCall = monoListCbRecvIsCall(n)
+      if cbRecvCall && monoWalk(n.callFn, ctx) < 0 { return -1 }
       if monoCoerceListCbArg(n, ix, ctx) < 0 { return -1 }
       if monoCoerceAtValueParams(n, -1, ctx) < 0 { return -1 }
-      if monoWalk(n.callFn, ctx) < 0 { return -1 }
+      if !cbRecvCall && monoWalk(n.callFn, ctx) < 0 { return -1 }
       monoTypeCallOfCall(ix, ctx)
       return 0
     }
@@ -23281,7 +23324,7 @@ function monoRetFnListTy(x: i32, ctx: i32): i32 {
   const lits: i32[] = [x]
   const et = monoRetLitElemTy(x, lits, ["e"], ctx, 0)
   if et < 0 { return et }
-  monoRecordOpen(x, mkArrayTy(et), ctx)
+  monoRecordInstOpen(x, mkArrayTy(et), ctx)
   et
 }
 
@@ -23315,8 +23358,29 @@ function monoRetLitElemTy(
   const et = monoRetLitElemTy(x, inner, monoPathWith(path, "e"), ctx, depth + 1)
   if et < 0 { return et }
   const lt = mkArrayTy(et)
-  for i in inner { monoRecordOpen(i, lt, ctx) }
+  for i in inner { monoRecordInstOpen(i, lt, ctx) }
   lt
+}
+
+// `monoRecordOpen`, also at a node of an instance's own copy of its template's body; a node
+// the template's body still holds is shared with its other instances and is left open.
+function monoRecordInstOpen(x: i32, t: i32, wf: i32) {
+  const it = if wf >= 0 { monoFrameInstTmpl(wf) } else { [0 - 1, 0 - 1] }
+  const tx = it[1]
+  if (
+    x >= 0
+    && it[0] == wf
+    && tx >= 0
+    && tx < P.nodes.length
+    && monoTyOpen(nodeTyIxOf(x))
+  ) {
+    const tn = P.nodes[tx]
+    if tn is FuncDecl && !nodeContains(tn.fnBody, x) {
+      nodeTyRecord(x, t)
+      return 0
+    }
+  }
+  monoRecordOpen(x, t, wf)
 }
 
 // A generic read `x` (keyed `d` in frame `fr`, at its slot `path`) that `ctx` returns past two
