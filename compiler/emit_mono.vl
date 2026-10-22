@@ -20849,11 +20849,19 @@ function monoWalk(ix: i32, ctx: i32) {
           } else if monoDeliverAtPin(n.binRight, sn, ctx) < 0 {
             return -1
           }
+          const lt = nodeTyIxOf(n.binLeft)
+          if monoDeliverLitAtPlace(n.binRight, n.binLeft, "", lt, ctx) < 0 {
+            return -1
+          }
         }
         if tgt is Member {
           const sn = monoPlacePinName(n.binLeft, "", ctx)
           if sn != "" {
             if monoCoerceFnValueName(n.binRight, sn, ctx, -1) < 0 { return -1 }
+          }
+          const mt = nodeTyIxOf(n.binLeft)
+          if monoDeliverLitAtPlace(n.binRight, n.binLeft, "", mt, ctx) < 0 {
+            return -1
           }
         }
       }
@@ -22027,16 +22035,112 @@ function monoNotePushDeliveries(n: Call, ctx: i32) {
   if n.callFn < 0 { return 0 }
   const cf = P.nodes[n.callFn]
   if !(cf is Member) { return 0 }
+  const ot = nodeTyIxOf(cf.memObj)
   if cf.memProp == "set" && n.callArgs.length == 2 {
     const sv = monoPlacePinName(cf.memObj, "v", ctx)
-    return monoDeliverAtPin(n.callArgs[1], sv, ctx)
+    if monoDeliverAtPin(n.callArgs[1], sv, ctx) < 0 { return -1 }
+    return monoDeliverLitAtPlace(
+      n.callArgs[1],
+      cf.memObj,
+      "v",
+      monoMapValTy(ot),
+      ctx,
+    )
   }
   if cf.memProp != "push" { return 0 }
   const en = monoPlacePinName(cf.memObj, "e", ctx)
   for pa in n.callArgs {
     if monoDeliverAtPin(pa, en, ctx) < 0 { return -1 }
+    if monoDeliverLitAtPlace(pa, cf.memObj, "e", monoListElemTy(ot), ctx) < 0 {
+      return -1
+    }
   }
   0
+}
+
+// The element type of list type `t`, else -1.
+function monoListElemTy(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const l = T.tys[t]
+  if l is TyArray { return l.aElem }
+  -1
+}
+
+// The value type of map type `t`, else -1.
+function monoMapValTy(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const m = T.tys[t]
+  if m is TyMap { return m.mVal }
+  -1
+}
+
+// `monoDeliverLitAt` for a list or record literal `v` stored into place `e`, or into its slot
+// `kid` when not "", whose type there is `ty`; nothing for any other value.
+function monoDeliverLitAtPlace(
+  v: i32,
+  e: i32,
+  kid: string,
+  ty: i32,
+  ctx: i32,
+): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || !(P.nodes[x] is ArrayLit || P.nodes[x] is ObjLit) { return 0 }
+  const path: string[] = []
+  const d = monoPlaceRoot(e, path, 0)
+  if kid != "" { path.push(kid) }
+  monoDeliverLitAt(x, d, path, ty, ctx, 0)
+}
+
+// Each function list or record literal `v` holds, at slot `path` of binding `d` (-1 for none)
+// whose type is `ty`, is delivered at the one signature the flow table pins its slot at, else
+// at the slot's own function type when that has no hole (D9340).
+function monoDeliverLitAt(
+  v: i32,
+  d: i32,
+  path: string[],
+  ty: i32,
+  ctx: i32,
+  depth: i32,
+): i32 {
+  const x = unwrapParen(v)
+  if x < 0 || depth > TY_WALK_DEPTH { return 0 }
+  const n = P.nodes[x]
+  if n is ArrayLit {
+    const et = monoListElemTy(ty)
+    for el in n.arrElems {
+      if !(P.nodes[unwrapParen(el)] is Spread) {
+        const p = monoPathWith(path, "e")
+        if monoDeliverLitAt(el, d, p, et, ctx, depth + 1) < 0 { return -1 }
+      }
+    }
+    return 0
+  }
+  if n is ObjLit {
+    for fx in n.objFields {
+      const f = P.nodes[fx]
+      if f is FieldInit {
+        const p = monoPathWith(path, "f." + f.fiName)
+        const ft = tyFieldTyOf(ty, f.fiName)
+        if monoDeliverLitAt(f.fiValue, d, p, ft, ctx, depth + 1) < 0 {
+          return -1
+        }
+      }
+    }
+    return 0
+  }
+  if depth == 0 { return 0 }
+  let pin = ""
+  if d >= 0 { pin = monoSlotPinName(d, path, ctx) }
+  if pin == "" { pin = monoConcreteFnTyName(ty) }
+  monoDeliverAtPin(x, pin, ctx)
+}
+
+// A copy of slot path `path` with step `kid` appended.
+function monoPathWith(path: string[], kid: string): string[] {
+  const p: string[] = []
+  for s in path { p.push(s) }
+  p.push(kid)
+  p
 }
 
 // Deliver value `v` at the function type `pin` names: a generic it names takes that instance, and
