@@ -153,6 +153,19 @@ let pyPars: string[][] = []
 // Call `pmCall`, through a record field, calls function `pmName` directly instead.
 let pmCall: i32[] = []
 let pmName: string[] = []
+// Argument `pnArg` of call `pnCall`, a call of a function returning one of the generics
+// `pnLeaves` (`fsChoiceRetLeaves`), runs once before statement `pnStmt` as a call of copy `pnFn`
+// of that function returning the arm index into `pnSel`; it and the `pnCount - 1` arguments after
+// it each select their generic by that index (D9596). Copy `pnFn` of `pnSrc` goes after it.
+let pnCall: i32[] = []
+let pnArg: i32[] = []
+let pnStmt: i32[] = []
+let pnFn: string[] = []
+let pnSel: string[] = []
+let pnLeaves: string[][] = []
+let pnCount: i32[] = []
+let pnSrc: i32[] = []
+let pnSrcName: string[] = []
 // Record literal `pxObj` takes field `pxField` holding function `pxName`, and member read
 // `pxMember` reads field `pxMemberName` instead.
 let pxObj: i32[] = []
@@ -192,6 +205,15 @@ function fsPlanReset(): i32 {
   pyPars = []
   pmCall = []
   pmName = []
+  pnCall = []
+  pnArg = []
+  pnStmt = []
+  pnFn = []
+  pnSel = []
+  pnLeaves = []
+  pnCount = []
+  pnSrc = []
+  pnSrcName = []
   pxObj = []
   pxField = []
   pxName = []
@@ -911,6 +933,94 @@ function fsConstRet(c: i32): i32 {
     i = i + 1
   }
   tail
+}
+
+// The generics, in first-return order, that call `c` of a non-generic module function with no
+// return annotation may evaluate to: every `return` of the callee names one by a name
+// `fsGenericName` accepts, and its last statement is a `return`. Empty unless there are two or
+// more, which `fsConstRet` does not cover (D9596).
+function fsChoiceRetLeaves(c: i32): string[] {
+  const none: string[] = []
+  const fd = fsCallRunsFn(c)
+  if fd < 0 || fsParent[fd] < 0 || !(P.nodes[fsParent[fd]] is Program) {
+    return none
+  }
+  const f = P.nodes[fd]
+  if (
+    !(f is FuncDecl)
+    || f.fnTyParams.length > 0
+    || f.fnRet >= 0
+    || f.fnBody < 0
+  ) {
+    return none
+  }
+  const body = P.nodes[f.fnBody]
+  if !(body is Block) || body.blkStmts.length == 0 { return none }
+  if !(P.nodes[body.blkStmts[body.blkStmts.length - 1]] is RetStmt) {
+    return none
+  }
+  const cn = P.nodes[c]
+  if !(cn is Call) || hasNamedArgs(cn.callArgNames) { return none }
+  const names: string[] = []
+  let i = 0
+  while i < fsParseLen {
+    const n = P.nodes[i]
+    if n is RetStmt && fsEnclosingFn(i) == fd {
+      if n.retArg < 0 || !fsGenericName(n.retArg) { return none }
+      const g = P.nodes[n.retArg]
+      if g is Ident && !hasStr(names, g.identName) { names.push(g.identName) }
+    }
+    i = i + 1
+  }
+  if names.length < 2 { return none }
+  names
+}
+
+// The statement choice-returning call `a` (`fsChoiceRetLeaves`), an argument of call `c`, can run
+// before: `c` is that statement or the value it binds, names no argument, and every argument
+// ahead of `a` is a literal, a function's name, or a parameter or `const` read that a call passed
+// no lambda cannot write; -1 otherwise.
+function fsChoiceStmt(c: i32, a: i32): i32 {
+  if (
+    c < 0
+    || c >= P.nodes.length
+    || c >= fsParent.length
+    || a < 0
+    || a >= P.nodes.length
+  ) {
+    return -1
+  }
+  if fsChoiceRetLeaves(a).length == 0 { return -1 }
+  const cn = P.nodes[c]
+  const an = P.nodes[a]
+  if !(cn is Call) || !(an is Call) || hasNamedArgs(cn.callArgNames) {
+    return -1
+  }
+  let lam = false
+  for x in an.callArgs {
+    if fsIsLambdaLit(x) { lam = true }
+  }
+  for x in cn.callArgs {
+    if x == a { break }
+    const xn = P.nodes[x]
+    const xd = identDeclOf(x)
+    let ok = xn is NumLit || xn is StrLit || xn is BoolLit
+    if xn is Ident && xd >= 0 && xd < P.nodes.length {
+      const dn = P.nodes[xd]
+      if dn is FuncDecl { ok = true }
+      if dn is LetDecl && dn.letKw == "const" && !lam { ok = true }
+      if dn is Param && !lam { ok = true }
+    }
+    if !ok { return -1 }
+  }
+  let s = c
+  const p = fsParent[c]
+  if p >= 0 {
+    const pn = P.nodes[p]
+    if pn is LetDecl && pn.letInit == c { s = p }
+  }
+  if fsListOwner(s) < 0 { return -1 }
+  s
 }
 
 // Whether parse node `r` names a generic module function no other declaration shares a name with.
@@ -2929,7 +3039,10 @@ function fsPlanHoles(): i32 {
             if a < 0 { return fsHoleDecline() }
             const lam = fsIsLambdaLit(a)
             // A call always returning one generic is handed once, then the generic (D9540).
-            const ret = P.nodes[a] is Call && cp < 0 && fsConstRet(a) >= 0
+            // So is one returning one of several, by the arm index it returns (D9596).
+            const ret = (P.nodes[a] is Call
+              && cp < 0
+              && (fsConstRet(a) >= 0 || fsChoiceStmt(c, a) >= 0))
             if !lam && !ret && !(P.nodes[a] is Ident) { return fsHoleDecline() }
             let ad = -1
             if !lam && !ret { ad = identDeclOf(a) }
@@ -3327,6 +3440,13 @@ function fsPlanHoleRewrites(): i32 {
     if d >= 0 { mi = memIx(d) }
     // A lambda literal is handed as itself and then a fresh copy per further key, a call as
     // itself and then the generic it returns, by name.
+    let leaves: string[] = []
+    if mi < 0 { leaves = fsChoiceRetLeaves(a) }
+    if leaves.length > 0 {
+      if fsPlanChoiceRet(a, leaves, hdKeys[hi].length) != 0 { return 1 }
+      hi = hi + 1
+      continue
+    }
     let rn = ""
     const gx = fsConstRet(a)
     if gx >= 0 {
@@ -3498,6 +3618,109 @@ function fsStripTyParam(par: i32): i32 {
   if uses != 0 { return 0 }
   for q in named {
     if !hasI32(ptPar, q) { ptPar.push(q) }
+  }
+  0
+}
+
+// Plans choice-returning call `a` (`fsChoiceRetLeaves`, returning one of `leaves`) handed to a
+// parameter split `count` ways: it runs once ahead of its statement, as a call of an
+// arm-index copy of its callee minted once per callee, and each split argument selects by it.
+function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
+  const c = fsParent[a]
+  const s = fsChoiceStmt(c, a)
+  const fd = fsCallRunsFn(a)
+  if s < 0 || fd < 0 || fd >= P.nodes.length { return fsHoleDecline() }
+  const f = P.nodes[fd]
+  if !(f is FuncDecl) { return fsHoleDecline() }
+  const nm = f.fnName + "$x" + i32ToStr(fd)
+  if !hasStr(pnSrcName, nm) {
+    pnSrc.push(fd)
+    pnSrcName.push(nm)
+  }
+  pnCall.push(c)
+  pnArg.push(a)
+  pnStmt.push(s)
+  pnFn.push(nm)
+  pnSel.push(f.fnName + "$n" + i32ToStr(a))
+  pnLeaves.push(leaves)
+  pnCount.push(count)
+  0
+}
+
+// Mints each arm-index copy `fsPlanChoiceRet` planned, then runs each planned call once into
+// its arm index binding and hands every split argument a choice by that index. -1 when it cannot.
+function fsApplyChoiceRets(): i32 {
+  let i = 0
+  while i < pnSrc.length {
+    let j = 0
+    while j < pnFn.length && pnFn[j] != pnSrcName[i] { j = j + 1 }
+    const f = reparseFuncDeclAt(fsFirstTok(pnSrc[i]))
+    if f < 0 || j >= pnFn.length { return -1 }
+    const fn = P.nodes[f]
+    if !(fn is FuncDecl) { return -1 }
+    fn.fnName = pnSrcName[i]
+    if fsNumberRets(fn.fnBody, pnLeaves[j]) != 0 { return -1 }
+    if fsInsertAfter(pnSrc[i], f) != 0 { return -1 }
+    i = i + 1
+  }
+  i = 0
+  while i < pnCall.length {
+    const c = P.nodes[pnCall[i]]
+    const a = pnArg[i]
+    const an = P.nodes[a]
+    if !(c is Call) || !(an is Call) || a >= nodeToks.length { return -1 }
+    if an.callFn < 0 || an.callFn >= P.nodes.length { return -1 }
+    P.pos = nodeToks[a] + 1
+    const pos = an.pos
+    an.callFn = mkIdent(pnFn[i], P.nodes[an.callFn].pos)
+    const args: i32[] = []
+    for x in c.callArgs {
+      if x == a {
+        let k = 0
+        while k < pnCount[i] {
+          args.push(fsSelectArm(pnSel[i], pnLeaves[i], pos))
+          k = k + 1
+        }
+      } else {
+        args.push(x)
+      }
+    }
+    if args.length != c.callArgs.length + pnCount[i] - 1 { return -1 }
+    c.callArgs = args
+    if c.callArgNames.length > 0 {
+      const nms: string[] = []
+      for _x in args { nms.push("") }
+      c.callArgNames = nms
+    }
+    if fsInsertBefore(pnStmt[i], mkLet("const", pnSel[i], -1, a, pos)) != 0 {
+      return -1
+    }
+    i = i + 1
+  }
+  0
+}
+
+// Replaces, in body `b` of an arm-index copy, each `return` of a name in `leaves` by its index
+// there, past nested functions. -1 when a `return` names none of them.
+function fsNumberRets(b: i32, leaves: string[]): i32 {
+  const stack: i32[] = [b]
+  while stack.length > 0 {
+    const x = stack.pop() ?? -1
+    const n = P.nodes[x]
+    if n is RetStmt {
+      const r = n.retArg
+      const rn = if r >= 0 && r < P.nodes.length { P.nodes[r] } else { n }
+      if !(rn is Ident) { return -1 }
+      let k = 0
+      while k < leaves.length && leaves[k] != rn.identName { k = k + 1 }
+      if k >= leaves.length || r >= nodeToks.length { return -1 }
+      P.pos = nodeToks[r] + 1
+      n.retArg = mkNum(i32ToStr(k), rn.pos)
+    } else if !(n is FuncDecl) {
+      for k in nodeChildren(x) {
+        if k >= 0 && k < P.nodes.length { stack.push(k) }
+      }
+    }
   }
   0
 }
@@ -4227,6 +4450,7 @@ function fsApply(): i32 {
     if rc == 0 { rc = fsApplyArgs(paCall[i], paArg[i], paNames[i], paPars[i]) }
     i = i + 1
   }
+  if rc == 0 { rc = fsApplyChoiceRets() }
   i = 0
   while i < pkCall.length {
     if rc == 0 { rc = fsApplyArgDrop(pkCall[i], pkArg[i]) }
