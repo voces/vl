@@ -19457,6 +19457,76 @@ function monoHoleGenBindFnArgs(
   0
 }
 
+// The function type open function `fx` takes as field `fld` of parameter `i` of `dn`, at the
+// closed argument types every `<param>.<fld>(...)` call in the body agrees on, with `fx`'s
+// result there; -1 when there is no such call, or an argument or the result does not close.
+function monoFieldCallPinnedFnTy(
+  dn: FuncDecl,
+  i: i32,
+  fld: string,
+  fx: i32,
+): i32 {
+  const px = dn.fnParams[i]
+  const pn = P.nodes[px]
+  if !(pn is Param) || pn.parType >= 0 { return -1 }
+  const qs: i32[] = []
+  const seen: i32[] = [0]
+  if !monoFieldCallArgTys(dn.fnBody, px, fld, qs, seen) || seen[0] == 0 {
+    return -1
+  }
+  const ex = monoOpenFnArgDecl(fx)
+  if ex < 0 { return -1 }
+  const r = monoFnDeclRetAt(ex, qs)
+  if r < 0 || tyHasTyVar(r) { return -1 }
+  const ft = mkFuncTy(qs, r)
+  if !monoTyClosedFn(ft) { return -1 }
+  ft
+}
+
+// Collects into `qs` the argument types of the calls `<px>.<fld>(...)` under `ix`, where `px` is
+// the parameter the receiver resolves to, counting them in `seen[0]`; false when two disagree or
+// one is open.
+function monoFieldCallArgTys(
+  ix: i32,
+  px: i32,
+  fld: string,
+  qs: i32[],
+  seen: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length { return true }
+  const n = P.nodes[ix]
+  if n is Call {
+    const c = unwrapParen(n.callFn)
+    if c < 0 || c >= P.nodes.length { return true }
+    const cn = P.nodes[c]
+    if cn is Member && cn.memProp == fld {
+      const o = unwrapParen(cn.memObj)
+      if (
+        o >= 0
+        && o < P.nodes.length
+        && P.nodes[o] is Ident
+        && identDeclOf(o) == px
+      ) {
+        if seen[0] > 0 && qs.length != n.callArgs.length { return false }
+        let a = 0
+        while a < n.callArgs.length {
+          const at = nodeTyIxOf(n.callArgs[a])
+          if at < 0 || tyHasTyVar(at) || tyReachesHole(at, 16) { return false }
+          if seen[0] == 0 { qs.push(at) }
+          else if !tyEq(qs[a], at) { return false }
+          a = a + 1
+        }
+        // arena-tick exempt: a caller-owned counter, not the arena.
+        seen[0] = seen[0] + 1
+      }
+    }
+  }
+  for k in nodeChildren(ix) {
+    if !monoFieldCallArgTys(k, px, fld, qs, seen) { return false }
+  }
+  true
+}
+
 // The pin of a list literal of open function values (`[h]`) handed to un-annotated parameter `i`
 // of `decl` in `call`: a list of the function type its body calls an element at, the one agreed
 // pin of the parameter's element slot in that call's walk, with the elements' own result there;
@@ -19505,8 +19575,8 @@ function monoOpenFnListPin(
 
 // The pin of a record literal handed to un-annotated parameter `i` of `decl` in call `call` whose
 // open fields are each a list literal of open function values (`{ xs: [h] }`): each list at the one
-// agreed pin of the parameter's slot `f.<field>/e` in that call's walk, as `monoOpenFnListPin` gives
-// a bare list (D9301); "" when a field, a pin or a result does not close.
+// agreed pin of the slot `f.<field>/e`, as `monoOpenFnListPin` gives a bare list (D9301), or an
+// open function named there (`{ f: h }`, D9572); "" when a field, a pin or a result does not close.
 function monoOpenFnRecListPin(
   decl: i32,
   call: i32,
@@ -19533,6 +19603,7 @@ function monoOpenFnRecListPin(
   for t in o.objFieldTypes { tys.push(t) }
   const lits: i32[] = []
   const litTys: i32[] = []
+  const fnLits: i32[] = []
   for fi in lit.objFields {
     const f = P.nodes[fi]
     if f is FieldInit {
@@ -19551,6 +19622,24 @@ function monoOpenFnRecListPin(
           tys[k] = bt
           lits.push(vx)
           litTys.push(bt)
+        } else if (
+          al is Ident
+          && tys[k] < T.tys.length
+          && T.tys[tys[k]] is TyFunc
+          && monoOpenFnArgDecl(vx) >= 0
+        ) {
+          // An open function named at the field takes the one agreed pin of slot `f.<field>`, or
+          // the argument types the body calls the field at (D9572).
+          const fPath: string[] = ["f." + f.fiName]
+          const one: i32[] = [vx]
+          let ft = monoPathSlotPinnedFnTy(dn.fnParams[i], fPath, one, call)
+          if ft < 0 { ft = monoFieldCallPinnedFnTy(dn, i, f.fiName, vx) }
+          if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
+          // arena-tick exempt: a local copy of the field types; the arena is touched below.
+          tys[k] = ft
+          lits.push(vx)
+          litTys.push(ft)
+          fnLits.push(vx)
         } else if (
           !(al is ArrayLit)
           || al.arrElems.length == 0
@@ -19579,9 +19668,14 @@ function monoOpenFnRecListPin(
   if lits.length == 0 { return "" }
   let j = 0
   while j < lits.length {
+    const al = P.nodes[lits[j]]
+    if al is Ident && i32ListHas(fnLits, lits[j]) {
+      const fnm = monoConcreteFnTyName(litTys[j])
+      if fnm == "" { return "" }
+      if monoCoerceFnValueName(lits[j], fnm, ctx, litTys[j]) < 0 { return "" }
+    }
     const ft = tyArrayElemIx(litTys[j])
     const nm = monoConcreteFnTyName(ft)
-    const al = P.nodes[lits[j]]
     if nm != "" && al is ArrayLit {
       for el in al.arrElems {
         const ex = unwrapParen(el)
