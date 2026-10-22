@@ -99,6 +99,10 @@ let pwAnchor: i32[] = []
 let pwName: string[] = []
 let pwValSrc: i32[] = []
 let pwValName: string[] = []
+// The choice binding `pcAnchor` evaluates its condition once into the `const` `pcName` declared
+// before it, which it and each of its slots' copies read (D9161).
+let pcAnchor: i32[] = []
+let pcName: string[] = []
 let prIdent: i32[] = []
 let prName: string[] = []
 // A copy of function `pfSrc` named `pfName` goes after the module statement `pfAnchor`.
@@ -197,6 +201,8 @@ function fsPlanReset(): i32 {
   psName = []
   psRetype = []
   psRetypeName = []
+  pcAnchor = []
+  pcName = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -585,7 +591,11 @@ function fsPureChoice(v: i32, depth: i32): boolean {
 // `fsPureChoice` for a `match` not yet lowered: a pure scrutinee, literal or `_` patterns
 // binding nothing, and arms that are each a name or a pure choice.
 function fsPureMatch(n: MatchExpr, depth: i32): boolean {
-  if !fsPureRead(n.matchScrut, 0) { return false }
+  fsPureRead(n.matchScrut, 0) && fsPureMatchArms(n, depth)
+}
+
+// `fsPureMatch` without its scrutinee.
+function fsPureMatchArms(n: MatchExpr, depth: i32): boolean {
   let i = 0
   while i < n.matchPats.length {
     if n.matchBinds[i] >= 0 || !fsPureRead(n.matchPats[i], 0) { return false }
@@ -596,6 +606,54 @@ function fsPureMatch(n: MatchExpr, depth: i32): boolean {
     if !(P.nodes[b] is Ident) && !fsPureChoiceArm(b, depth) { return false }
   }
   true
+}
+
+// Whether choice `v` is pure but for its own condition or scrutinee, which may call or write;
+// its slots' copies then read that from one evaluation before the binding (D9161).
+function fsHoistsCond(v: i32): boolean {
+  const x = fsParenPeel(v)
+  if x < 0 || x >= P.nodes.length || fsPureChoice(x, 0) { return false }
+  const t = fsFirstTok(x)
+  if t >= 0 && P.toks[t].kind == "MATCH" {
+    // The check bound a computed scrutinee to `$scrut<match>`, which the copy evaluates anew.
+    fsScrutOk = "$scrut" + i32ToStr(x)
+    const ok = fsPureChoice(x, 0)
+    fsScrutOk = ""
+    return ok
+  }
+  const n = P.nodes[x]
+  if !(n is IfStmt) || n.ifElse < 0 { return false }
+  fsPureChoiceArm(n.ifThen, 0) && fsPureChoiceArm(n.ifElse, 0)
+}
+
+// The hoisted scrutinee `fsPureRead` reads as pure while `fsHoistsCond` asks, else "".
+let fsScrutOk = ""
+
+// The condition or scrutinee of choice `v`, or -1.
+function fsChoiceCond(v: i32): i32 {
+  const x = fsParenPeel(v)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = P.nodes[x]
+  if n is MatchExpr { return n.matchScrut }
+  if n is IfStmt { return n.ifCond }
+  -1
+}
+
+// Points choice `v`'s condition or scrutinee at the binding `name`. -1 when `v` is no choice.
+function fsSetChoiceCond(v: i32, name: string): i32 {
+  const x = fsParenPeel(v)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = P.nodes[x]
+  const pos = n.pos
+  if n is MatchExpr {
+    n.matchScrut = mkIdent(name, pos)
+    return 0
+  }
+  if n is IfStmt {
+    n.ifCond = mkIdent(name, pos)
+    return 0
+  }
+  -1
 }
 
 // Whether `if` arm `a` (a block holding one value, or an `else if`) is a name or a pure choice.
@@ -614,6 +672,12 @@ function fsPureChoiceArm(a: i32, depth: i32): boolean {
 function fsPureRead(x: i32, depth: i32): boolean {
   if x < 0 || x >= P.nodes.length || depth > 32 { return false }
   const n = P.nodes[x]
+  // A binding the check minted for a computed scrutinee or receiver stands for that
+  // expression, which a copy made from the tokens evaluates again.
+  if n is Ident && n.identName != fsScrutOk {
+    const nm = n.identName
+    if nm.slice(0, 6) == "$scrut" || nm.slice(0, 3) == "$om" { return false }
+  }
   if (
     n is Ident
     || n is NumLit
@@ -1528,9 +1592,16 @@ export function fsPlan(root: i32): i32 {
   // Lets that need no slot leave the plan to the functions; one that half-planned declines.
   let lets = 1
   if anyLet {
-    const was = prIdent.length + pdAnchor.length + pwAnchor.length
+    const was = prIdent.length
+      + pdAnchor.length
+      + pwAnchor.length
+      + pcAnchor.length
     lets = fsPlanLets()
-    if lets != 0 && prIdent.length + pdAnchor.length + pwAnchor.length != was {
+    if (
+      lets != 0
+      && prIdent.length + pdAnchor.length + pwAnchor.length + pcAnchor.length
+        != was
+    ) {
       return 1
     }
     // A declined let plan leaves every binding its own name for the hole rewrites.
@@ -3424,8 +3495,15 @@ function fsPlanMember(mi: i32): i32 {
   if lanes.length == 0 { return 0 }
   if d.letType >= 0 && !(P.nodes[d.letType] is TypeRef) { return 1 }
   if !fsStmtParentOk(m) { return 1 }
-  const ip = fsValuePeer(d.letInit)
+  const hoist = lanes.length > 1 && fsHoistsCond(d.letInit)
+  const ip = if hoist { -1 } else { fsValuePeer(d.letInit) }
   if ip == -2 { return 1 }
+  if hoist {
+    pcAnchor.push(m)
+    const dollar = d.letName.indexOf("$")
+    const base = if dollar > 0 { d.letName.slice(0, dollar) } else { d.letName }
+    pcName.push(base + "$c" + i32ToStr(m))
+  }
   let k = 0
   while k < lanes.length {
     const vn = fsLaneValName(d.letInit, ip, lanes[k])
@@ -3682,9 +3760,12 @@ function fsValueNode(src: i32, name: string): i32 {
     if f < 0 { return -2 }
     return f
   }
-  if n is IfStmt || n is MatchExpr {
+  const cx = fsParenPeel(src)
+  if cx < 0 || cx >= P.nodes.length { return -2 }
+  const cn = P.nodes[cx]
+  if cn is IfStmt || cn is MatchExpr {
     // Copied from its tokens, since the check lowers a `match` to an `if` chain in place.
-    const e = reparseChoiceExprAt(fsFirstTok(src))
+    const e = reparseChoiceExprAt(fsFirstTok(cx))
     if e < 0 || !(P.nodes[e] is IfStmt || P.nodes[e] is MatchExpr) { return -2 }
     return e
   }
@@ -3777,11 +3858,41 @@ function fsApply(): i32 {
     i = i + 1
   }
   i = 0
+  while i < pcAnchor.length {
+    const d = P.nodes[pcAnchor[i]]
+    if rc == 0 && d is LetDecl {
+      const c = fsChoiceCond(d.letInit)
+      rc = -1
+      if c >= 0 {
+        P.pos = nodeToks[c] + 1
+        const pos = P.nodes[c].pos
+        rc = fsSetChoiceCond(d.letInit, pcName[i])
+        if rc == 0 {
+          rc = fsInsertBefore(
+            pcAnchor[i],
+            mkLet("const", pcName[i], -1, c, pos),
+          )
+        }
+      }
+    } else {
+      rc = -1
+    }
+    i = i + 1
+  }
+  i = 0
   while i < pdAnchor.length {
     if rc == 0 {
       const a = pdAnchor[i]
       P.pos = nodeToks[a] + 1
-      const v = fsValueNode(pdValSrc[i], pdValName[i])
+      let v = fsValueNode(pdValSrc[i], pdValName[i])
+      // A copy of a choice whose condition was evaluated once reads that evaluation.
+      let ci = 0
+      while ci < pcAnchor.length && v >= 0 {
+        if pcAnchor[ci] == a {
+          v = if fsSetChoiceCond(v, pcName[ci]) == 0 { v } else { -2 }
+        }
+        ci = ci + 1
+      }
       let ty = -1
       // A lane of a binding whose type parameter is stripped is un-annotated too (D6761).
       if pdTy[i] >= 0 && !hasI32(ptPar, a) {
