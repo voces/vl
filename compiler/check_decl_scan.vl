@@ -52,6 +52,7 @@ import {
   UnionDecl,
   WhileStmt,
   annTsOf,
+  declHasExportKw,
   hasNamedArgs,
   markDefaultGlobalRef,
   nodeChildren,
@@ -62,6 +63,7 @@ import {
   tsKind,
   tsText,
 } from "./ast"
+import { nodeStartTok } from "./fmt_util"
 import { identDeclOf, sidOfNode } from "./symbols"
 import { symOccTok, symOccTy } from "./check_state"
 import {
@@ -756,28 +758,27 @@ export function ctnBindingDeclOf(ix: i32): i32 {
   d
 }
 
-// Whether the binding declaration `d` is a `let` that some assignment rebinds, so a value
-// written into it may not be what a later read holds.
-export function ctnRebound(d: i32): boolean {
-  const rhs: i32[] = []
-  !ctnRebindRhs(d, rhs) || rhs.length > 0
+// The flow cut of a delivery of a `let`: values stored into `ctnCutDecl` before token
+// `ctnCutTok`, outside a nested function, are replaced by an assignment every path to the
+// delivery runs, so the delivery's judges skip them (D10202).
+let ctnCutDecl = -1
+let ctnCutTok = -1
+let ctnCutOwn: {[i32]: boolean} = Map()
+let ctnCutNested: {[i32]: boolean} = Map()
+
+export function ctnCutClear() {
+  ctnCutDecl = -1
+  ctnCutTok = -1
+  ctnCutOwn = Map()
+  ctnCutNested = Map()
 }
 
-// Whether the binding declaration `d` is a `let` that some assignment rebinds to anything but
-// another binding's name, which the place tracing of a delivery does not follow.
-export function ctnReboundFresh(d: i32): boolean {
-  const rhs: i32[] = []
-  if !ctnRebindRhs(d, rhs) { return true }
-  for r in rhs {
-    const p = ctnPeel(r)
-    if p < 0 || !(P.nodes[p] is Ident) { return true }
-  }
-  false
-}
-
-// The right side of each assignment that rebinds the binding declaration `d`, into `out`; false
-// when `d` is not a declaration whose scope this can walk.
-function ctnRebindRhs(d: i32, out: i32[]): boolean {
+// Arms the cut for the binding declaration `d` read at `at`: the last assignment to it that is
+// a statement of a block holding `at`, or, for `at` in one nested function, of `d`'s scope
+// before that function can first run. False when `d`'s scope cannot be walked; not judged then.
+export function ctnCutArm(d: i32, at: i32): boolean {
+  ctnCutClear()
+  if d < 0 || d >= P.nodes.length { return true }
   const ld = P.nodes[d]
   if !(ld is LetDecl) { return false }
   if ld.letKw == "const" { return true }
@@ -788,19 +789,175 @@ function ctnRebindRhs(d: i32, out: i32[]): boolean {
     if !(fd is FuncDecl) { return false }
     roots = [fd.fnBody]
   }
-  const stack: i32[] = []
-  for r in roots { stack.push(r) }
-  while stack.length > 0 {
-    const at = stack.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is BinExpr && n.binOp == "=" && ctnIsRead(n.binLeft, ld.letName, d) {
-        out.push(n.binRight)
-      }
-      for k in nodeChildren(at) { stack.push(k) }
+  const path: i32[] = []
+  let found = false
+  for r in roots {
+    if !found && ctnPathTo(r, at, path) { found = true }
+  }
+  if !found { return true }
+  const on: {[i32]: boolean} = Map()
+  let fnAt = -1
+  let k = 0
+  while k < path.length {
+    const p = path[k]
+    on.set(p, true)
+    if p != at && P.nodes[p] is FuncDecl {
+      if fnAt >= 0 { return true }
+      fnAt = k
+    }
+    k = k + 1
+  }
+  let cut = -1
+  const blocks: i32[][] = []
+  if fx < 0 && fnAt < 0 { blocks.push(roots) }
+  k = fnAt + 1
+  while k < path.length {
+    const pn = P.nodes[path[k]]
+    if pn is Block { blocks.push(pn.blkStmts) }
+    k = k + 1
+  }
+  const atTok = nodeStartTok(at)
+  for ss in blocks { cut = ctnCutLast(ss, on, ld.letName, d, atTok, cut) }
+  if cut < 0 && fnAt >= 0 {
+    let outer = roots
+    if fx >= 0 {
+      const body = P.nodes[roots[0]]
+      if !(body is Block) { return true }
+      outer = body.blkStmts
+    }
+    const first = ctnFnFirstRun(path[fnAt], roots)
+    if first >= 0 { cut = ctnCutLast(outer, on, ld.letName, d, first, -1) }
+  }
+  if cut < 0 { return true }
+  ctnCutDecl = d
+  ctnCutTok = cut
+  ctnCutMark(ld.letInit, true, false)
+  for r in roots { ctnCutWalk(r, ld.letName, d) }
+  true
+}
+
+// The start token of the last statement of `ss` off the path `on` that assigns binding `d`
+// named `name` and starts before token `before`, or `cut` when none starts after `cut`.
+function ctnCutLast(
+  ss: i32[],
+  on: {[i32]: boolean},
+  name: string,
+  d: i32,
+  before: i32,
+  cut: i32,
+): i32 {
+  let c = cut
+  for s in ss {
+    const sn = P.nodes[s]
+    const st = nodeStartTok(s)
+    if (
+      !on.has(s)
+      && sn is BinExpr
+      && sn.binOp == "="
+      && ctnIsRead(sn.binLeft, name, d)
+      && st < before
+      && st > c
+    ) {
+      c = st
     }
   }
+  c
+}
+
+// The first token from which the nested function `f` under `roots` can run: a lambda where it
+// is made, a named function at its first reference, past every token when it has none. -1 when
+// it is exported or referenced from another nested function, which may run it at any time.
+function ctnFnFirstRun(f: i32, roots: i32[]): i32 {
+  const fd = P.nodes[f]
+  if !(fd is FuncDecl) { return -1 }
+  if fd.fnName == "" { return nodeStartTok(f) }
+  if declHasExportKw(f) { return -1 }
+  const first: i32[] = [-1]
+  for r in roots {
+    if !ctnFnRefs(r, f, fd.fnName, false, first) { return -1 }
+  }
+  if first[0] < 0 { return P.toks.length }
+  first[0]
+}
+
+// Lowers `first[0]` to the start of each reference of function `f` named `name` under `ix`;
+// false on a reference inside a nested function other than `f` itself.
+function ctnFnRefs(
+  ix: i32,
+  f: i32,
+  name: string,
+  nested: boolean,
+  first: i32[],
+): boolean {
+  if ix < 0 || ix >= P.nodes.length || ix == f { return true }
+  const n = P.nodes[ix]
+  let isRef = false
+  if n is Ident && n.identName == name {
+    isRef = identDeclOf(ix) == f || identDeclOf(ix) < 0
+  }
+  if n is Member && n.memProp == name { isRef = true }
+  if isRef {
+    if nested { return false }
+    const t = nodeStartTok(ix)
+    if first[0] < 0 || t < first[0] { first[0] = t }
+  }
+  const inner = nested || n is FuncDecl
+  for c in nodeChildren(ix) {
+    if !ctnFnRefs(c, f, name, inner, first) { return false }
+  }
   true
+}
+
+// Whether the value node `v` is stored into the armed cut's binding before the cut: by its
+// initialiser or an assignment, or written into it or into a `const` alias of it.
+export function ctnCutKills(v: i32): boolean {
+  if ctnCutDecl < 0 || v < 0 || v >= P.nodes.length || ctnCutNested.has(v) {
+    return false
+  }
+  if nodeStartTok(v) >= ctnCutTok { return false }
+  if ctnCutOwn.has(v) { return true }
+  const wd = ctnWrDeclOf(v)
+  if wd == ctnCutDecl { return true }
+  if wd < 0 || wd >= P.nodes.length { return false }
+  const wn = P.nodes[wd]
+  wn is LetDecl
+    && wn.letKw == "const"
+    && ctnBindingDeclOf(wn.letInit) == ctnCutDecl
+}
+
+// Whether `at` is under `ix`, with the nodes from `ix` down to `at` pushed onto `path`.
+function ctnPathTo(ix: i32, at: i32, path: i32[]): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  path.push(ix)
+  if ix == at { return true }
+  for k in nodeChildren(ix) {
+    if ctnPathTo(k, at, path) { return true }
+  }
+  path.pop()
+  false
+}
+
+// Marks the nodes under `ix` as in a nested function, or as stored into the cut's binding.
+function ctnCutMark(ix: i32, own: boolean, nested: boolean) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  if nested { ctnCutNested.set(ix, true) }
+  if own && !nested { ctnCutOwn.set(ix, true) }
+  for k in nodeChildren(ix) { ctnCutMark(k, own, nested) }
+  0
+}
+
+function ctnCutWalk(ix: i32, name: string, d: i32) {
+  if ix < 0 || ix >= P.nodes.length { return 0 }
+  const n = P.nodes[ix]
+  if n is FuncDecl {
+    ctnCutMark(ix, false, true)
+    return 0
+  }
+  if n is BinExpr && n.binOp == "=" && ctnIsRead(n.binLeft, name, d) {
+    ctnCutMark(n.binRight, true, false)
+  }
+  for k in nodeChildren(ix) { ctnCutWalk(k, name, d) }
+  0
 }
 
 // Whether `ix` is an element read of binding `d` named `name`.
