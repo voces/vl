@@ -114,6 +114,7 @@ import {
   pxSlotOf,
   rowCanonIdOfName,
   sFieldElemNameAt,
+  sFieldRowTyAt,
   sFieldTgtStructIdx,
   sFieldTypeAt,
   sIsAnonRow,
@@ -390,7 +391,9 @@ import {
 } from "./tyname"
 import {
   flattenVariantsInto,
+  isNullTy,
   nonNullTy,
+  tyAdmitsNull,
   tyHasTyVar,
   tyIsArray,
   tyReachesHole,
@@ -1715,6 +1718,8 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
           const fj = sFieldIndex(si, fnames[k])
           if fj < 0 {
             ok = false
+          } else if widen && declRowFieldAdopts(ftys[k], si, fj, 8) {
+            // The node-side adopter builds this literal at the row; the codes alone refute it.
           } else {
             const want = fieldCodeForMatch(ftys[k])
             if want >= 0 {
@@ -1784,6 +1789,40 @@ function structRowOfObjFieldSetK(ty: i32, widen: boolean): i32 {
     return first
   }
   -1
+}
+
+// Could a record field of type `fty` be adopted into declared row `si`'s record field `fi`, as
+// the node-side adopter builds the literal: a `null` where the declared field admits null, a
+// nested record whose fields adopt into the field's own row. `depth` bounds the walk (D10040).
+function declRowFieldAdopts(fty: i32, si: i32, fi: i32, depth: i32): boolean {
+  if depth <= 0 || si < 0 || sIsAnonRow(si) || fty < 0 || fty >= T.tys.length {
+    return false
+  }
+  if sFieldTypeAt(si, fi) != FC_STRUCT { return false }
+  if isNullTy(fty) { return tyAdmitsNull(sFieldRowTyAt(si, fi)) }
+  const t = T.tys[fty]
+  if !(t is TyObj) { return false }
+  const tgt = sFieldTgtStructIdx(si, fi)
+  if tgt < 0 || sIsAnonRow(tgt) || sFieldCount[tgt] != t.objFieldNames.length {
+    return false
+  }
+  let k = 0
+  while k < t.objFieldNames.length {
+    const fj = sFieldIndex(tgt, t.objFieldNames[k])
+    if fj < 0 { return false }
+    const fk = t.objFieldTypes[k]
+    if !declRowFieldAdopts(fk, tgt, fj, depth - 1) {
+      const want = fieldCodeForMatch(fk)
+      if want < 0 || !objFieldCodeWidens(want, sFieldTypeAt(tgt, fj), tgt, fj) {
+        return false
+      }
+      if want == FC_I32 && !code0TyFitsRow(fk, tgt, fj) { return false }
+      if want == FC_STRUCT && !nestedAnonRowFits(fk, tgt, fj) { return false }
+      if !declRowFnFieldFits(fk, tgt, t.objFieldNames[k]) { return false }
+    }
+    k = k + 1
+  }
+  true
 }
 
 // The struct table index a type NAME names: a declared struct name directly, or an INLINE
