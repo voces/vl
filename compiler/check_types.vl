@@ -1498,6 +1498,33 @@ const emitNameSeen: i32[] = []
 // answer does not depend on the ancestors it is asked under.
 let emitNameCycleHits = 0
 
+// One outermost render's memo of its records, so a record nested twice in a type is walked
+// once: an entry stands for the render that stamped it (`emitNameGen`), and only past
+// `EMIT_NAME_MEMO_AFTER` record visits, so a small type pays no lookups (D9330).
+let emitNameDepth = 0
+let emitNameGen = 0
+let emitNameObjVisits = 0
+const EMIT_NAME_MEMO_AFTER = 32
+const emitNameMemoGen: {[i32]: i32} = Map()
+const emitNameMemoVal: {[i32]: string} = Map()
+
+// The memoised render of record `ix` in this outermost render, or "".
+function emitNameMemoOf(ix: i32): string {
+  if emitNameObjVisits < EMIT_NAME_MEMO_AFTER { return "" }
+  if (emitNameMemoGen[ix] ?? -1) != emitNameGen { return "" }
+  emitNameMemoVal[ix] ?? ""
+}
+
+// Records the render `r` of `ix` when it is a record whose walk met no cycle, so it is the
+// same under any ancestors; counts the visit either way.
+function emitNameMemoSet(ix: i32, r: string) {
+  if r == "" || ix < 0 || ix >= T.tys.length || !(T.tys[ix] is TyObj) { return }
+  emitNameObjVisits = emitNameObjVisits + 1
+  if emitNameObjVisits < EMIT_NAME_MEMO_AFTER { return }
+  emitNameMemoGen[ix] = emitNameGen
+  emitNameMemoVal[ix] = r
+}
+
 // Renders a resolved arena type as an emitter-classifiable synthetic name, or "" when it
 // has none (a `TyVar`, a residual negation, err/never, or a recursive type). Ask
 // `tyIsEmitRepresentable` for "does it have one at all", not this for "". The position-free
@@ -1527,9 +1554,22 @@ export function tyToEmitNameAt(ix: i32, ctx: i32) {
     }
     si = si + 1
   }
+  if emitNameDepth == 0 {
+    emitNameGen = emitNameGen + 1
+    emitNameObjVisits = 0
+  }
+  const memo = emitNameMemoOf(ix)
+  if memo != "" {
+    tyNameAtoms = 1
+    return memo
+  }
+  const before = emitNameCycleHits
+  emitNameDepth = emitNameDepth + 1
   emitNameSeen.push(ix)
   const r = tyToNameGo(ix, ctx, false)
   emitNameSeen.pop()
+  emitNameDepth = emitNameDepth - 1
+  if emitNameCycleHits == before { emitNameMemoSet(ix, r) }
   // An empty render is not an answer, and a declared name always beats it: `type J = null |
   // f64 | JO` folds to a one-member `TyUnion` whose member is a `TyNullable`, so the cycle
   // guard cannot name that index and `J` would otherwise get no emit name at all. Gated on
@@ -1919,17 +1959,76 @@ function tyNameObjFieldPreserve(ft: i32): string {
 }
 
 // A key two types share exactly when `tyToEmitName` renders them alike, without building a
-// render that doubles per level of a record nested in itself: a deep record spells its fields
-// by interned ids, so each inner record is walked once. A deep record and a non-record that
-// render alike key apart; "" when the render is "" (D2780).
+// render that doubles per level of a nested record: a deep record, or a list or nullable of one,
+// spells each inner record by an interned id. A deep record and a non-record that render alike
+// key apart; "" when the render is "" (D2780, D9330).
 export function tyEmitNameKey(ix: i32): string {
   if ix < 0 || ix >= T.tys.length || !tyDeeperThan(ix, 8) {
     return tyToEmitName(ix)
   }
-  const t = T.tys[ix]
-  if !(t is TyObj) { return tyToEmitName(ix) }
+  if !tyWrapsRecord(ix) { return tyToEmitName(ix) }
   emitKeyMemo = Map()
-  emitKeyObj(ix, t)
+  emitKeyWrapped(ix)
+}
+
+// Whether `ix` is a record, or a list or nullable whose peel down those wrappers is one.
+export function tyWrapsRecord(ix: i32): boolean {
+  let k = ix
+  let steps = 0
+  while k >= 0 && k < T.tys.length && steps < 64 {
+    const t = T.tys[k]
+    match t {
+      TyObj => {
+        return true
+      }
+      TyNullable => {
+        k = t.nInner
+      }
+      TyArray => {
+        k = t.aElem
+      }
+      TyPrim | TyErr | TyFunc | TyUnion | TyMap | TyVar | TyLit | TyNeg => {
+        return false
+      }
+    }
+    steps = steps + 1
+  }
+  false
+}
+
+// `tyToEmitNameAt`'s walk over a type `tyWrapsRecord` admits: a record by `emitKeyObj`, a
+// nullable as `tyNameNullable` spells a record's, a list as `arrElemRender` groups its element.
+function emitKeyWrapped(ix: i32): string {
+  const t = T.tys[ix]
+  if t is TyObj { return emitKeyObj(ix, t) }
+  for a in emitNameSeen {
+    if a == ix {
+      emitNameCycleHits = emitNameCycleHits + 1
+      return aliasNameOfTyIx(ix)
+    }
+  }
+  emitNameSeen.push(ix)
+  let r = ""
+  if t is TyNullable {
+    const k = emitKeyWrapped(t.nInner)
+    if k != "" { r = k + "|null" }
+  } else if t is TyArray {
+    const k = emitKeyWrapped(t.aElem)
+    if k != "" {
+      if (
+        t.aElem >= 0
+        && t.aElem < T.tys.length
+        && T.tys[t.aElem] is TyNullable
+      ) {
+        r = "(" + k + ")[]"
+      } else {
+        r = k + "[]"
+      }
+    }
+  }
+  emitNameSeen.pop()
+  if r == "" { return nulFoldAliasNameOf(ix) }
+  r
 }
 
 // The interned ids of the record spellings `tyEmitNameKey` has built, and one call's memo of
