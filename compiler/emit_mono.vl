@@ -9740,6 +9740,9 @@ function monoMakeInstance(
   const foldWas = substNullFoldOffFor(pinTys)
   const ownWas = monoInstOwn
   monoInstOwn = monoTemplateOwner(origFe)
+  // The deliveries inside the instance's body are its own, not the one being built.
+  const widenWas = monoInstanceWidenRet
+  monoInstanceWidenRet = false
   const rc = monoMakeInstanceGo(
     origFe,
     pinned,
@@ -9754,6 +9757,7 @@ function monoMakeInstance(
   )
   substNullFoldRestore(foldWas)
   monoInstOwn = ownWas
+  monoInstanceWidenRet = widenWas
   rc
 }
 
@@ -11519,6 +11523,10 @@ function monoMakeInstanceGo(
 ) {
   const callFrame = monoCallFrameSlot
   monoCallFrameSlot = -1
+  const retWiden = monoInstRetWidenName
+  const retWidenTy = monoInstRetWidenTy
+  monoInstRetWidenName = ""
+  monoInstRetWidenTy = 0 - 1
   if monoPinColsMisalignedFail(pinned, pinTys) < 0 { return -1 }
   // Every caller bounds `origFe` by `monoGen`, which `monoOrigNode` stays parallel to.
   if origFe < 0 || origFe >= monoOrigNode.length {
@@ -11539,6 +11547,8 @@ function monoMakeInstanceGo(
       tvV,
       cbFnNames,
     )
+    // arena-tick exempt: a fresh instance key record, read by the registry, never by a pass.
+    if retWiden != "" { k.key = k.key + "=>" + retWiden }
     monoPinKindsNoteFnVal(pinKinds)
     // Registry hit: point this call site at the existing instance.
     if (
@@ -11616,6 +11626,7 @@ function monoMakeInstanceGo(
       retOutIx,
     )
     if nret < -1 { return -1 }
+    const nretW = if retWiden != "" { synthTypeRefTy(retWiden, -1, retWidenTy) } else { nret }
     const twoListTy = retOutIx[1]
     let instName = fn.fnName
     // A frame-keyed instance never takes the template's slot, whose frame is the template's.
@@ -11667,7 +11678,7 @@ function monoMakeInstanceGo(
       letBN,
       letBT,
     )
-    const nfn = monoMakeInstanceFunc(fn, origFe, nret, instBody, instName, nps)
+    const nfn = monoMakeInstanceFunc(fn, origFe, nretW, instBody, instName, nps)
     const instFe = monoMakeInstanceInstall(
       fn,
       nfn,
@@ -11729,6 +11740,38 @@ function monoFnValueParamTys(t: i32, n: i32): i32[] {
 // type `monoInstanceFor` must then reproduce, or "" for any return.
 let monoInstanceExactRet = false
 let monoInstanceRetName = ""
+
+// Set while a generic is delivered past a return at the flow table's pin: an instance whose
+// result only converts to the pin's result is built returning the pin's (D9282).
+let monoInstanceWidenRet = false
+
+// The result the next instance `monoMakeInstance` builds is returned at, when that delivery's
+// own result only converts to it; "" for the substituted result.
+let monoInstRetWidenName = ""
+let monoInstRetWidenTy = 0 - 1
+
+// The result annotation of generic `fn` spelled through the bindings `tvN`/`tvV`.
+function monoInstanceSubstRet(
+  fn: FuncDecl,
+  tvN: string[],
+  tvV: string[],
+): string {
+  const rs = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
+  if monoAnnHasTyParam(rs, fn.fnTyParams) {
+    return monoSubstAnn(rs, fn.fnTyParams, tvN, tvV)
+  }
+  rs
+}
+
+// The result type of function type `t` (a nullable one's function arm), or -1.
+function monoFnTyRet(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return -1 }
+  const nt = nonNullTy(t)
+  if nt < 0 || nt >= T.tys.length { return -1 }
+  const f = T.tys[nt]
+  if f is TyFunc { return f.fnRet }
+  -1
+}
 
 // Materialize or reuse the instance of generic `origFe` for an annotated function-typed
 // binding, pinning each parameter to the annotation's param type name and pointing
@@ -11796,11 +11839,28 @@ function monoInstanceFor(
     }
     if monoInstanceExactRet {
       if fn.fnRet < 0 || monoInstanceRetName == "" { return 0 }
-      let rs = monoDeclAnnName(fn.fnRet, tyNameOf(fn.fnRet), fn.fnTyParams)
-      if monoAnnHasTyParam(rs, fn.fnTyParams) {
-        rs = monoSubstAnn(rs, fn.fnTyParams, tvN, tvV)
+      if (
+        normTypeAtom(monoInstanceSubstRet(fn, tvN, tvV))
+        != monoInstanceRetName
+      ) {
+        return 0
       }
-      if normTypeAtom(rs) != monoInstanceRetName { return 0 }
+    } else if (
+      monoInstanceWidenRet
+      && fn.fnRet >= 0
+      && monoInstanceRetName != ""
+    ) {
+      // A result that only converts to the slot's own result is returned at it (D9282).
+      const rs = monoInstanceSubstRet(fn, tvN, tvV)
+      if normTypeAtom(rs) != monoInstanceRetName {
+        let want = monoFnTyRet(expTy)
+        if want < 0 { want = nameToTy(monoInstanceRetName) }
+        const got = nameToTy(rs)
+        if want >= 0 && got >= 0 && assignable(got, want) {
+          monoInstRetWidenName = monoInstanceRetName
+          monoInstRetWidenTy = want
+        }
+      }
     }
     // A type parameter the boundary binds nothing defaults as at an inferred call, so the
     // binding's instance is the direct call's.
@@ -11949,7 +12009,7 @@ function monoCoerceFnValueName(
             // A capturing nested generic's value is this frame's instance, as a call is (D3902).
             monoCallFrameSlot = monoNestedCallFrame(gfe, ctx)
             monoInstanceRetName = ""
-            if monoInstanceExactRet {
+            if monoInstanceExactRet || monoInstanceWidenRet {
               monoInstanceRetName = normTypeAtom(
                 annRetNameOf(peelGroupParens(tname)),
               )
@@ -22282,7 +22342,10 @@ function monoCoerceRetAtPin(v: i32, ctx: i32): i32 {
   }
   const nm = monoSlotPinName(d, noPath, fr)
   if nm == "" { return monoAskRetCopies(fr, d, ctx) }
-  if monoCoerceFnValueName(x, nm, ctx, -1) < 0 { return -1 }
+  monoInstanceWidenRet = true
+  const cr = monoCoerceFnValueName(x, nm, ctx, -1)
+  monoInstanceWidenRet = false
+  if cr < 0 { return -1 }
   monoRetypePinCalls(d, noPath)
 }
 
