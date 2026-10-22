@@ -9552,7 +9552,8 @@ tree read stays an editor reference.
   the use, not where it is declared, so `(1 << 70) >> 60` is 1024.
 * In a generic body, an `i64` operand beside a type-parameter operand records a constraint
   (`OP_LITFIT`) that a narrower pin refuses (`i32 cannot hold the 64-bit operand it meets`),
-  since the body alone cannot see the width (D2712, D3426); an `f32` pin is still open (D3429).
+  since the body alone cannot see the width (D2712, D3426);
+  an `f32` pin is refused by the direct spelling's pair rule, `operator '+' mixes f32 and i64` (D3429).
 
 **Programs whose behaviour changed.** Every one computed a constant that wrapped, or a float
 constant rounded step by step, and now has the exact value or a loud refusal. One more kind is not a wrap: an operation over
