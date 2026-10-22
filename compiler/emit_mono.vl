@@ -18198,7 +18198,8 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
   const fd = monoCalleeDeclOf(c)
   if fd < 0 { return -1 }
   const fn = P.nodes[fd]
-  if !(fn is FuncDecl) || fn.fnRet >= 0 { return -1 }
+  if !(fn is FuncDecl) { return -1 }
+  if fn.fnRet >= 0 { return monoInstAnnRetTy(fd, fn.fnRet) }
   const it = monoCallInstRetTy(c, fd)
   if it >= 0 { return it }
   let t = -1
@@ -18212,6 +18213,24 @@ function monoPinnedRetAnnTy(c: Call, depth: i32): i32 {
       if rt < 0 || (t >= 0 && !tyEq(t, rt)) { return -1 }
       t = rt
     }
+  }
+  t
+}
+
+// The closed list-of-functions type that the return annotation `ret` of instance `fd` takes at its
+// pin (D9602); -1 when `fd` is not an instance or that type is open.
+function monoInstAnnRetTy(fd: i32, ret: i32): i32 {
+  const it = monoFrameInstTmpl(fd)
+  if it[0] != fd || it[1] < 0 || it[1] == fd { return -1 }
+  const t = nodeTyIxOf(ret)
+  if (
+    t < 0
+    || t >= T.tys.length
+    || !(T.tys[t] is TyArray)
+    || monoTyOpen(t)
+    || !tyMayHoldFn(t, 0)
+  ) {
+    return -1
   }
   t
 }
@@ -18230,10 +18249,35 @@ function monoCallInstRetTy(c: Call, fd: i32): i32 {
   const it = monoFrameInstTmpl(d)
   if d == fd || it[0] != d || it[1] != fd { return -1 }
   const dn = P.nodes[d]
-  if !(dn is FuncDecl) || dn.fnRet < 0 { return -1 }
+  if !(dn is FuncDecl) { return -1 }
+  if dn.fnRet < 0 { return monoInstRetLitTy(dn) }
   const t = nodeTyIxOf(dn.fnRet)
   if t < 0 || t >= T.tys.length || !(T.tys[t] is TyArray) || monoTyOpen(t) {
     return -1
+  }
+  t
+}
+
+// The one closed list-of-functions type every value un-annotated instance `fn` returns records,
+// each a returned list literal its own copy of the body instanced (D9601); -1 otherwise.
+function monoInstRetLitTy(fn: FuncDecl): i32 {
+  let t = -1
+  for r in monoFnRetArgs(fn) {
+    if r >= 0 && !(P.nodes[r] is RetStmt) {
+      const rx = monoRetListLitOf(r)
+      const rt = if rx >= 0 { nodeTyIxOf(rx) } else { -1 }
+      if (
+        rt < 0
+        || rt >= T.tys.length
+        || !(T.tys[rt] is TyArray)
+        || monoTyOpen(rt)
+        || !tyMayHoldFn(rt, 0)
+        || (t >= 0 && !tyEq(t, rt))
+      ) {
+        return -1
+      }
+      t = rt
+    }
   }
   t
 }
@@ -18249,10 +18293,13 @@ function monoCloseRetFnTy(ix: i32, ctx: i32) {
     if n.arrElems.length == 0 { return 0 }
     for e in n.arrElems {
       const ex = unwrapParen(e)
-      if ex < 0 || !(P.nodes[ex] is Call) || monoRetSlotsSplit(ex) { return 0 }
+      if ex < 0 || !(P.nodes[ex] is Call) { return 0 }
+      if monoRetSlotsSplit(ex) { return monoAskSplitRetCopies(ex) }
     }
-  } else if !(n is Call) || monoRetSlotsSplit(ix) {
+  } else if !(n is Call) {
     return 0
+  } else if monoRetSlotsSplit(ix) {
+    return monoAskSplitRetCopies(ix)
   }
   const t = monoPinnedAnnTyAt(ix, 0)
   if t >= 0 && !monoTyOpen(t) { monoRecordOpen(ix, t, ctx) }
@@ -18273,6 +18320,16 @@ function monoRetSlotsSplit(ix: i32): boolean {
     if rx >= 0 && monoDeclPathPins([fd, rx], ["e"]).length > 1 { return true }
   }
   false
+}
+
+// A call `x` whose returned literal's slot takes two pins asks for a copy of its function per
+// pin, each read of it then closed at its own copy (D9553).
+function monoAskSplitRetCopies(x: i32) {
+  const ix = unwrapParen(x)
+  if ix < 0 || ix >= P.nodes.length || !monoRetSlotsSplit(ix) { return 0 }
+  const c = P.nodes[ix]
+  if c is Call { fsAsk(monoCalleeDeclOf(c)) }
+  0
 }
 
 // Whether un-annotated function node `fx` returns list literal `lit` (`monoRetListLitOf`).
@@ -21647,7 +21704,13 @@ function monoWalk(ix: i32, ctx: i32) {
         if monoWalk(args[i], ctx) < 0 { return -1 }
         i = i + 1
       }
-      monoCloseRetFnTy(ix, ctx)
+      // A generic callee's result is read at the instance the call takes (D9601).
+      const fdx = monoCalleeDeclOf(n)
+      const genCallee = (fdx >= 0
+        && monoIsGenericDecl(fdx)
+        && n.callFn >= 0
+        && P.nodes[n.callFn] is Ident)
+      if !genCallee { monoCloseRetFnTy(ix, ctx) }
       if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
       if monoGenArgAtOpenParam(n, ctx) && monoOpenCallAtElems(n, ctx) < 0 {
         return -1
@@ -21657,7 +21720,11 @@ function monoWalk(ix: i32, ctx: i32) {
       if callee is Index && monoGenArgAtOpenParam(n, ctx) {
         return monoGenArgOpenFail(ix)
       }
-      if callee is Ident { return monoWalkIdentCall(n, callee, ix, ctx) }
+      if callee is Ident {
+        const wr = monoWalkIdentCall(n, callee, ix, ctx)
+        if wr >= 0 && genCallee { monoCloseRetFnTy(ix, ctx) }
+        return wr
+      }
       // A call of a list element that is an alias of a capture cell's read is a call through it.
       const le = monoListElemCellRead(n.callFn, ctx)
       if le[0] >= 0 {
