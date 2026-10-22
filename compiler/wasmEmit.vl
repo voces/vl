@@ -1287,6 +1287,7 @@ import {
   mapSoftTwin,
   mapTwinExact,
   mapTwinOneStruct,
+  nodeTyInOf,
   pinSubOperandTyOf,
   restoreNarrow,
   tyMentionsSet,
@@ -34590,7 +34591,11 @@ function emitUnaryNode(body: u8[], e: Unary, exprIx: i32, fnIx: i32) {
     return 0
   }
   // A two-base literal set negates at `i64`, the width its arithmetic computes at (D3512).
-  if e.unOp == "-" && !tyIsPrimIx(nodeTyIxOf(e.unArg)) && njIsLitSide(e.unArg) {
+  if (
+    e.unOp == "-"
+    && !tyIsPrimIx(nodeTyIxOf(e.unArg))
+    && njIsLitSide(e.unArg, fnIx)
+  ) {
     fbI64Const(0, 0)
     if emitNumUnionConvert(body, e.unArg, 3, fnIx) < 0 { return -1 }
     fbI32Bin(125) // 0x7d i64.sub
@@ -35028,7 +35033,7 @@ function njWidensOut(ix: i32, fnIx: i32): boolean {
   // Nearly every widened value is typed at one primitive, which is no box.
   if tyIsPrimIx(nodeTyIxOf(ix)) { return false }
   if numUnionMinted && nodeIsNumUnion(ix, fnIx) { return true }
-  njLitBasesOf(ix).length > 0
+  njLitBasesOf(ix, fnIx).length > 0
 }
 
 // Whether the value at `ix` lowers as a box of numbers that converts out member by member,
@@ -35038,9 +35043,10 @@ function njBoxWidens(ix: i32, fnIx: i32): boolean {
 }
 
 // The bases of the two-base literal-number union the value at `ix` holds (`litNumUnionBasesOf`):
-// its recorded type's, or, for a name narrowed past `null`, its nullable type's. Empty otherwise.
-function njLitBasesOf(ix: i32): i32[] {
-  const t = nodeTyIxOf(ix)
+// its recorded type's, at the instance `fnIx` where that is a hole or type parameter (D9523),
+// or, for a name narrowed past `null`, its nullable type's. Empty otherwise.
+function njLitBasesOf(ix: i32, fnIx: i32): i32[] {
+  const t = njSideTyOf(ix, fnIx)
   const lb = litNumUnionBasesOf(t)
   if lb.length > 0 || t < 0 { return lb }
   const nn = nonNullTy(t)
@@ -35054,10 +35060,21 @@ function njLitBasesOf(ix: i32): i32[] {
   lb
 }
 
+// The type of operand `ix` a dispatch reads its literal bases off: its recorded type, or where
+// that is a hole or type parameter, the one instance `fnIx` binds it to.
+function njSideTyOf(ix: i32, fnIx: i32): i32 {
+  const t = nodeTyIxOf(ix)
+  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyVar) { return t }
+  const it = nodeTyInOf(ix, fnIx)
+  if it < 0 || it >= T.tys.length || tyHasTyVar(it) { return t }
+  it
+}
+
 // Whether the value at `ix` is a two-base integer-literal union rather than a numeric union: its
 // members are constants, so an operator over it computes at the common width `i64` (D3512).
-function njIsLitSide(ix: i32): boolean {
-  numUnionMembersOf(nodeTyIxOf(ix)).length == 0 && njLitBasesOf(ix).length > 0
+function njIsLitSide(ix: i32, fnIx: i32): boolean {
+  numUnionMembersOf(njSideTyOf(ix, fnIx)).length == 0
+    && njLitBasesOf(ix, fnIx).length > 0
 }
 
 // The type member `m` of the current dispatch's `left` or right side computes at.
@@ -35072,7 +35089,7 @@ function njMembersOf(ix: i32, fnIx: i32): i32[] {
   const t = nodeTyIxOf(ix)
   const ms = numUnionMembersOf(t)
   if ms.length > 0 { return ms }
-  const lb = njLitBasesOf(ix)
+  const lb = njLitBasesOf(ix, fnIx)
   if lb.length > 0 { return lb }
   const none: i32[] = []
   // Only a name can be a box its recorded type does not name; any other node is typed by it.
@@ -35363,8 +35380,8 @@ function emitNumUnionBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   njOp = e.binOp
   njLUnion = lMs.length > 0
   njRUnion = rMs.length > 0
-  njLLit = njLUnion && njIsLitSide(e.binLeft)
-  njRLit = njRUnion && njIsLitSide(e.binRight)
+  njLLit = njLUnion && njIsLitSide(e.binLeft, fnIx)
+  njRLit = njRUnion && njIsLitSide(e.binRight, fnIx)
   njLTys = lMs
   if !njLUnion { njLTys = [njScalarTy(e.binLeft, fnIx)] }
   njRTys = rMs
@@ -35387,7 +35404,7 @@ function emitNumUnionBin(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   // The node's consumers read its recorded type, so a result shape it does not name is refused
   // loudly rather than handed on in a rep they do not expect (D3453).
   if !numCmpOp(e.binOp) {
-    const recTy = nodeTyIxOf(exprIx)
+    const recTy = njSideTyOf(exprIx, fnIx)
     const recBox = tyIsNumUnion(recTy)
     if recBox != njResBox || (!njResBox && njKindOfTy(recTy) != rks[0]) {
       return emitFail(
