@@ -329,6 +329,7 @@ import {
   FF_PIN_DECLINE,
   fnFlowAliasLam,
   fnFlowCallPathAgreedPinTys,
+  fnFlowCallPathAnnPinTys,
   fnFlowCellLam,
   fnFlowDeclFn,
   fnFlowDeclKidSrc,
@@ -13837,7 +13838,12 @@ function monoFlowRetVals(d: i32, out: i32[]): boolean {
     if xn is RetStmt {
       if xn.retArg < 0 { return false }
       const a = unwrapParen(xn.retArg)
-      if !monoFlowIsLit(a) || !monoFlowValsOf(a, out) { return false }
+      // A returned local list binding returns the literals it holds (D9763).
+      if monoFlowIsLit(a) {
+        if !monoFlowValsOf(a, out) { return false }
+      } else if !monoFlowRetLocalLists(d, a, out) {
+        return false
+      }
     } else if !(xn is FuncDecl) {
       for k in nodeChildren(x) {
         if k >= 0 { stack.push(k) }
@@ -14081,10 +14087,26 @@ function monoFlowUsePlan(
   loops: i32[],
   spreads: i32[],
 ): boolean {
-  if monoFlowWholeWrite(u) >= 0 { return true }
+  const top: string[] = []
+  monoFlowUsePlanAt(d, u, vals, top, reads, loops, spreads)
+}
+
+// `monoFlowUsePlan` for a read `u` of the slot at `pre` of binding `d`, which may hold any
+// literal in `vals`.
+function monoFlowUsePlanAt(
+  d: i32,
+  u: i32,
+  vals: i32[],
+  pre: string[],
+  reads: i32[],
+  loops: i32[],
+  spreads: i32[],
+): boolean {
+  if monoFlowWholeWrite(u) >= 0 { return pre.length == 0 }
   let cur = u
   let cv: i32[] = vals
   const path: string[] = []
+  for k in pre { path.push(k) }
   // A value read out of a map may be absent, so its reads are never rewritten whole.
   let viaMap = false
   for v in vals {
@@ -14179,7 +14201,7 @@ function monoFlowUsePlan(
   }
   if lits > 0 {
     if lits != cv.length || p < 0 { return false }
-    return monoFlowContainerUse(d, p, cur, cv, path, loops, spreads)
+    return monoFlowContainerUse(d, p, cur, cv, path, reads, loops, spreads)
   }
   if monoFlowIsWrite(cur) { return false }
   const whole = path.length == 0 || path[path.length - 1] == "v"
@@ -14244,22 +14266,97 @@ function monoFlowHeldIs(d: i32, path: string[], g: i32): boolean {
 }
 
 // Plans node `cur`, a read of binding `d` at `path` that may be any literal in `cv`, used by its
-// parent `p`: a binding or whole `=` whose own reads are planned, a null test, a `for … in` over
-// lists whose elements all name one generic, or a spread of one list literal.
+// parent `p`: a binding, a whole `=` or a `return` whose own reads are planned, a null test, a
+// `for … in` over lists whose elements all name one generic or over lists of lists, or a spread of
+// one list literal.
 function monoFlowContainerUse(
   d: i32,
   p: i32,
   cur: i32,
   cv: i32[],
   path: string[],
+  reads: i32[],
   loops: i32[],
   spreads: i32[],
 ): boolean {
   monoFlowAliasUse(p, cur)
+    || (path.length == 0 && monoFlowRetUse(p, cur))
     || monoFlowArgUse(p, cur)
     || monoFlowBinUse(p, cur)
     || monoFlowLoopUse(d, p, cur, cv, path, loops)
+    || monoFlowRowLoopUse(d, p, cur, cv, path, reads, loops, spreads)
     || monoFlowSpreadUse(p, cv, spreads)
+}
+
+// Whether `p` returns `cur`, a binding local to the function, whole from a function whose
+// returned literals are known (D9763).
+function monoFlowRetUse(p: i32, cur: i32): boolean {
+  const pn = P.nodes[p]
+  if !(pn is RetStmt) || pn.retArg != cur { return false }
+  const f = monoFlowEnclosingFn(p)
+  if f < 0 { return false }
+  const scratch: i32[] = []
+  monoFlowRetLocalLists(f, cur, scratch) && monoFlowDeclVals(f).length > 0
+}
+
+// The function declaration enclosing node `x`; -1 at the top level.
+function monoFlowEnclosingFn(x: i32): i32 {
+  let f = mfrParent[x] ?? -1
+  while f >= 0 && !(P.nodes[f] is FuncDecl) { f = mfrParent[f] ?? -1 }
+  f
+}
+
+// Appends to `out` the literals binding `a` names, when it is declared inside function `f` and
+// every literal it holds is a list literal; false otherwise. A module binding returned whole is
+// left to the plans that read it elsewhere (D6700).
+function monoFlowRetLocalLists(f: i32, a: i32, out: i32[]): boolean {
+  if a < 0 || !(P.nodes[a] is Ident) { return false }
+  const d = identDeclOf(a)
+  if d < 0 || monoFlowEnclosingFn(d) != f { return false }
+  const vals: i32[] = []
+  if !monoFlowValsOf(a, vals) { return false }
+  for v in vals {
+    if !(P.nodes[v] is ArrayLit) { return false }
+  }
+  for v in vals { out.push(v) }
+  true
+}
+
+// Whether `p` is a `for … in` over `cur` whose lists in `cv` each hold only list literals, and
+// each read of its row is planned as a read of `d` at `path` and `e` (D9760).
+function monoFlowRowLoopUse(
+  d: i32,
+  p: i32,
+  cur: i32,
+  cv: i32[],
+  path: string[],
+  reads: i32[],
+  loops: i32[],
+  spreads: i32[],
+): boolean {
+  const pn = P.nodes[p]
+  if !(pn is ForIn) || pn.fiIter != cur || pn.fiVar2 != "" { return false }
+  const rows: i32[] = []
+  for v in cv {
+    const vn = P.nodes[v]
+    if !(vn is ArrayLit) || monoFlowListGrows(v, 0) { return false }
+    for e in vn.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 || !(P.nodes[ex] is ArrayLit) { return false }
+      rows.push(ex)
+    }
+  }
+  if rows.length == 0 { return false }
+  const ep: string[] = []
+  for k in path { ep.push(k) }
+  ep.push("e")
+  for w in mfrUses[p] ?? [] {
+    if monoFlowIsWrite(w) { return false }
+    if !monoFlowUsePlanAt(d, w, rows, ep, reads, loops, spreads) {
+      return false
+    }
+  }
+  true
 }
 
 // Whether `p` is a candidate binding initialized by `cur` whose literals are known.
@@ -15421,11 +15518,16 @@ function monoPathSlotPinnedFnTy(
   call: i32,
 ): i32 {
   const qs: i32[] = []
-  if !fnFlowCallPathAgreedPinTys(at, path, call, qs) { return -1 }
+  // An annotation pinning the slot gives its parameters, and its result must be each element's.
+  let annRet = -1
+  if !fnFlowCallPathAgreedPinTys(at, path, call, qs) {
+    annRet = fnFlowCallPathAnnPinTys(at, path, call, qs)
+    if annRet < 0 { return -1 }
+  }
   for q in qs {
     if tyHasTyVar(q) { return -1 }
   }
-  let ft = -1
+  let ft = if annRet >= 0 { mkFuncTy(qs, annRet) } else { -1 }
   for el in elems {
     // An element naming no one declaration (a `let` written twice) has its own type's result.
     const ex = monoOpenFnArgDecl(el)
@@ -18541,6 +18643,12 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
   if (lam || P.nodes[ax] is Ident) && (rt < 0 || tyHasTyVar(rt)) {
     rt = monoPinnedListAnnTy(m.memObj)
   }
+  // A list literal receiver is read at the type its own element slot is pinned at.
+  if rt < 0 || tyHasTyVar(rt) {
+    const lr = monoOpenFnListLitTy(m.memObj, ctx)
+    if lr == -2 { return -1 }
+    if lr >= 0 { rt = lr }
+  }
   if rt < 0 || rt >= T.tys.length { return 0 }
   const lt = T.tys[rt]
   if !(lt is TyArray) || lt.aElem < 0 || tyHasTyVar(lt.aElem) { return 0 }
@@ -18575,6 +18683,32 @@ function monoCoerceListCbArg(n: Call, ix: i32, ctx: i32): i32 {
     nodeTyRecord(a, ft)
   }
   0
+}
+
+// The list type literal `recv` of open functions takes at the one agreed pin of its own element
+// slot, its elements delivered there and the literal retyped; -1 when it is no such literal or the
+// pin does not close, -2 when an element is refused.
+function monoOpenFnListLitTy(recv: i32, ctx: i32): i32 {
+  const x = unwrapParen(recv)
+  if x < 0 { return -1 }
+  const al = P.nodes[x]
+  if !(al is ArrayLit) || al.arrElems.length == 0 || al.pos < 0 { return -1 }
+  const t0 = nodeTyIxOf(x)
+  if t0 < 0 || t0 >= T.tys.length { return -1 }
+  const la = T.tys[t0]
+  if !(la is TyArray) || la.aElem < 0 || la.aElem >= T.tys.length { return -1 }
+  if !(T.tys[la.aElem] is TyFunc) || !tyHasTyVar(la.aElem) { return -1 }
+  for e in al.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 || P.nodes[ex] is Spread { return -1 }
+  }
+  const ft = monoListSlotPinnedFnTy(x, al.arrElems, -1)
+  if ft < 0 || sigKeyOfTy(ft) == "" { return -1 }
+  if !monoDeliverFnElemsAt(al.arrElems, ft, ctx) { return -2 }
+  const lt = mkArrayTy(ft)
+  nodeTyRecord(x, lt)
+  monoArenaTouch()
+  lt
 }
 
 // The type of the annotation a pin gave the un-annotated binding the `Ident` at `recv` names,
