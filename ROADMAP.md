@@ -2478,6 +2478,9 @@ in-language GC knobs.
   alias-element}.vl`, each alone with its key because `mI32Used` is module-wide and a DECLARED
   `type S` spelling covers it. The map-ARRAY annotation arm's hand-written copy of the same
   forcing went with it.
+  **The spelling gate is DELETED (D9920, 2026-10-22)**: every position it refused lowers over 44
+  integer-keyed map and Set templates, once a Set as a generic record's type argument found its
+  row (D9991), so the list below is history.
   REMAINING, all
   loud rejects with pinned fixtures: ~~**a UNION MEMBER**~~ (`{[i32]: V} | i32` — lowered
   2026-09-26 by a box tag per integer-keyed mono map struct, D2519, `maps/i32-keyed-position-union-member.vl`;
