@@ -153,6 +153,7 @@ import {
 import {
   ctnBindingDeclOf,
   ctnRebound,
+  ctnReboundFresh,
   ctnWrDeclOf,
   ctnWrUnreachedBy,
   wrUnreachedBy,
@@ -286,6 +287,7 @@ import {
   fnValVoidCoerce,
   holeGenericParamAt,
   holeLetWritesDisagree,
+  holeSlotDeliveryJudge,
   joinLitsFitAt,
   litLeafFitting,
   substTyDeep,
@@ -815,7 +817,7 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
     }
     return 0
   }
-  ctnWrittenCstrsAt(srcExpr, srcTy, dstTy)
+  ctnWrittenJudge(srcExpr, srcTy, dstTy)
   const e = lit
   if !(e is Ident) { return 0 }
   let st = srcTy
@@ -912,6 +914,18 @@ function genFnValueCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32, depth: i32) {
   0
 }
 
+// `ctnWrittenCstrsAt`, then for a value it does not refuse the place the value reads, traced
+// through aliases and returns (D10150). A `let` assigned anything but another binding's name is
+// judged by neither.
+function ctnWrittenJudge(srcExpr: i32, srcTy: i32, dstTy: i32) {
+  const d = ctnDeliveredDeclOf(srcExpr)
+  if d >= 0 && ctnReboundFresh(d) { return 0 }
+  const d0 = T.diags.length
+  ctnWrittenCstrsAt(srcExpr, srcTy, dstTy)
+  if T.diags.length == d0 { holeSlotDeliveryJudge(srcExpr, srcTy, dstTy) }
+  0
+}
+
 // A container binding delivered, whole or by element, where the destination fixes the type
 // variables of its element: each function value written into the binding is judged at those
 // types, as a call through it at that type judges it (D10080).
@@ -961,6 +975,48 @@ function ctnWrittenCstrsAt(srcExpr: i32, srcTy: i32, dstTy: i32) {
     ci = ci + 1
   }
   0
+}
+
+// `ctnWrittenCstrsAt` for argument `li` of a generic call, whose parameter's type variables the
+// bindings `bNames`/`bTys` left on another function's type variable: each is closed at the type
+// an argument binds it to that carries none, as the call instances it there (D10150).
+export function ctnWrittenCstrsAtCall(
+  params: i32[],
+  args: i32[],
+  li: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  if li >= args.length || li >= params.length || args[li] < 0 { return 0 }
+  const cNames: string[] = []
+  const cTys: i32[] = []
+  let j = 0
+  while j < args.length && j < params.length {
+    if args[j] >= 0 {
+      const jn: string[] = []
+      const jt: i32[] = []
+      bindGenWalk(params[j], nodeTyOf(args[j]), jn, jt)
+      let k = 0
+      while k < jn.length {
+        const t = jt[k]
+        if (
+          t >= 0
+          && !tyHasTyVar(t)
+          && !tyHasHole(t)
+          && !strListHas(cNames, jn[k])
+        ) {
+          cNames.push(jn[k])
+          cTys.push(widenLitTy(t))
+        }
+        k = k + 1
+      }
+    }
+    j = j + 1
+  }
+  if cNames.length == 0 { return 0 }
+  const fin = substTyDeep(substTyDeep(params[li], cNames, cTys), bNames, bTys)
+  if tyHasTyVar(fin) || tyHasHole(fin) { return 0 }
+  ctnWrittenJudge(args[li], nodeTyOf(args[li]), fin)
 }
 
 // The `let`/`const` declaration whose binding `ix` delivers: read directly, or handed back by

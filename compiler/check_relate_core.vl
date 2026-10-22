@@ -121,7 +121,7 @@ import {
   tpEnvTyOfName,
   tpEnvTys,
 } from "./check_cursor"
-import { cBoundDecls, primTyOfName } from "./check_decl_scan"
+import { cBoundDecls, ctnReboundFresh, primTyOfName } from "./check_decl_scan"
 import {
   TY_ARG_READ_HINT,
   cvViaNote,
@@ -4687,6 +4687,53 @@ function holeSlotArgJudge(
   holeSlotValsJudge(holeSlotName(n.identName, path), vals, ats, nW, wp, pts)
 }
 
+// Refuses a fixed-type function written to an element of the list `v`, whose type `srcTy` holds
+// a generic function, when it does not share the signature of the generic's instance at the
+// closed element type of `dstTy` the list is delivered at; followed through aliases, element and
+// field reads and returns as a call through the place is (D10150).
+export function holeSlotDeliveryJudge(v: i32, srcTy: i32, dstTy: i32): boolean {
+  if inferQuiet || v < 0 || srcTy < 0 || !tyHasTyVar(srcTy) { return false }
+  const dt = nonNullTy(dstTy)
+  if dt < 0 || dt >= T.tys.length || tyHasTyVar(dt) || tyHasHole(dt) {
+    return false
+  }
+  const da = T.tys[dt]
+  if !(da is TyArray) || da.aElem < 0 || da.aElem >= T.tys.length {
+    return false
+  }
+  const ef = T.tys[da.aElem]
+  if !(ef is TyFunc) { return false }
+  const pts: i32[] = []
+  for p in ef.fnParamTypes { pts.push(widenLitTy(p)) }
+  let nm = ""
+  const vx = parenPeelIx(v)
+  if vx >= 0 && vx < P.nodes.length {
+    const vn = P.nodes[vx]
+    if vn is Ident {
+      nm = vn.identName
+      if holeSlotRootRebound(vx) { return false }
+    }
+  }
+  holeSlotArgJudge(v, nm, ["[]"], pts, pts, 0)
+}
+
+// Whether the binding the place `ix` names, followed through the bindings it is bound to, is a
+// `let` assigned anything but another binding's name, which the delivery judge does not follow.
+function holeSlotRootRebound(ix: i32): boolean {
+  const rp: string[] = []
+  const rx = holeSlotRebase(ix, ["[]"], rp)
+  if rx < 0 || rx >= P.nodes.length { return false }
+  const rn = P.nodes[rx]
+  if !(rn is Ident) { return false }
+  const fr = covarRootFrame(rx)
+  if fr == CW_FR_UNKNOWN { return false }
+  const bd = cwSoleBinderOf(rn.identName, fr)
+  if bd < 0 || bd >= P.nodes.length || !(P.nodes[bd] is LetDecl) {
+    return false
+  }
+  ctnReboundFresh(bd)
+}
+
 // `holeSlotArgJudge` for the call `c`: each value a top-level function declaring no type
 // parameter returns, when `c` calls one.
 function holeSlotRetJudge(
@@ -4783,15 +4830,16 @@ function holeSlotFixedJudge(
   nW: i32,
   pts: i32[],
 ): boolean {
-  let gen = false
+  let gen = -1
   for v in vals {
     const d = cwHeldFnOf(v)
-    if d >= 0 && d < P.nodes.length {
+    if d >= 0 && d < P.nodes.length && gen < 0 {
       const f = P.nodes[d]
-      if f is FuncDecl && f.fnTyParams.length > 0 { gen = true }
+      if f is FuncDecl && f.fnTyParams.length > 0 { gen = d }
     }
   }
-  if !gen { return false }
+  if gen < 0 { return false }
+  const inst = holeGenInstTy(gen, pts)
   let k = 0
   while k < vals.length && k < ats.length {
     const d = cwHeldFnOf(vals[k])
@@ -4799,22 +4847,64 @@ function holeSlotFixedJudge(
     if vt >= 0 && vt < T.tys.length {
       const ft = T.tys[vt]
       if ft is TyFunc && ft.fnParamTypes.length == pts.length {
+        let misfit = !holeFixedSameSig(ft, inst)
         let j = 0
         while j < pts.length {
-          if !assignable(pts[j], ft.fnParamTypes[j]) {
-            tErr(
-              holeFixedMisfitMsg(nm, pts, d, vt, k < vals.length - nW),
-              ats[k],
-            )
-            return true
-          }
+          if !assignable(pts[j], ft.fnParamTypes[j]) { misfit = true }
           j = j + 1
+        }
+        if misfit {
+          tErr(holeFixedMisfitMsg(nm, pts, d, vt, k < vals.length - nW), ats[k])
+          return true
         }
       }
     }
     k = k + 1
   }
   false
+}
+
+// Whether the fixed function type `ft` has the signature of the generic's instance `inst`, the
+// only one a call through the place runs; true when `inst` is -1 (D10152).
+function holeFixedSameSig(ft: TyFunc, inst: i32): boolean {
+  if inst < 0 || inst >= T.tys.length { return true }
+  const it = T.tys[inst]
+  if !(it is TyFunc) || it.fnParamTypes.length != ft.fnParamTypes.length {
+    return true
+  }
+  let j = 0
+  while j < ft.fnParamTypes.length {
+    if !tySame(it.fnParamTypes[j], ft.fnParamTypes[j]) { return false }
+    j = j + 1
+  }
+  tySame(widenLitTy(it.fnRet), widenLitTy(ft.fnRet))
+}
+
+// The function type the generic `gen` is instanced at by a call at `pts`, or -1 when a type it
+// leaves open or an argument type carrying a type variable means it cannot be named.
+function holeGenInstTy(gen: i32, pts: i32[]): i32 {
+  const f = P.nodes[gen]
+  if !(f is FuncDecl) || f.fnName == "" { return -1 }
+  const gt = lookup(f.fnName)
+  if gt < 0 || gt >= T.tys.length { return -1 }
+  const g = T.tys[gt]
+  if !(g is TyFunc) || g.fnParamTypes.length != pts.length { return -1 }
+  const bn: string[] = []
+  const bt: i32[] = []
+  let j = 0
+  while j < pts.length {
+    const pt = pts[j]
+    if pt < 0 || pt >= T.tys.length || tyHasTyVar(pt) || tyHasHole(pt) {
+      return -1
+    }
+    bindGenWalk(g.fnParamTypes[j], widenLitTy(pt), bn, bt)
+    j = j + 1
+  }
+  const it = substTyDeep(gt, bn, bt)
+  if it < 0 || it >= T.tys.length || tyHasTyVar(it) || tyHasHole(it) {
+    return -1
+  }
+  it
 }
 
 // The function type of the value `v`, a name holding the declaration `d`, when `d` declares no
