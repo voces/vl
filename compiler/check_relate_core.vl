@@ -329,6 +329,9 @@ import {
   stSeenStackPush,
   substBindsNestRow,
   substNestMode,
+  substSelfOwner,
+  substSelfOwnerSet,
+  substSkipsForeignSig,
   tyIsForeignGenericSig,
   tyIsHoleGenericSig,
   tyRidesVarOf,
@@ -463,6 +466,7 @@ import {
   cwBindingWrittenValues,
   cwBoundInitOf,
   cwCalleeDeclOf,
+  cwElemCallbackRecv,
   cwFnValueDeclOf,
   cwFnValueTargets,
   cwFnValueWriteOf,
@@ -4175,7 +4179,7 @@ export function holeLetWritesDisagree(a: i32, pts: i32[]): boolean {
   holeLetReadsOf(a, seen, reads)
   for r in reads {
     const rn = P.nodes[r]
-    if rn is Index || rn is Member || rn is ForIn {
+    if rn is Index || rn is Member || rn is ForIn || rn is Param {
       if holeSlotJudge(r, wp) { return true }
     } else if holeLetJudge(r, wp) {
       return true
@@ -4193,7 +4197,7 @@ export function holeFnReadsSlot(a: i32): boolean {
   holeLetReadsOf(a, seen, reads)
   for r in reads {
     const rn = P.nodes[r]
-    if rn is Index || rn is Member || rn is ForIn { return true }
+    if rn is Index || rn is Member || rn is ForIn || rn is Param { return true }
   }
   false
 }
@@ -4256,6 +4260,11 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
   // Each call of a parameter's function instances its own copy, so its arguments are judged
   // one by one and never as one set.
   if P.nodes[bd] is Param {
+    // A `.map` / `.filter` lambda's element parameter reads the list it runs over (D9172).
+    if cwElemCallbackRecv(bd) >= 0 {
+      out.push(bd)
+      return 0
+    }
     const vs: i32[] = []
     if cwParamArgs(bd, vs) {
       for v in vs { holeLetReadsOf(v, seen, out) }
@@ -4326,6 +4335,9 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
   const an = P.nodes[a]
   if an is ForIn {
     root = cwSlotPath(an.fiIter, path)
+    path.push("[]")
+  } else if an is Param {
+    root = cwSlotPath(cwElemCallbackRecv(a), path)
     path.push("[]")
   } else {
     root = cwSlotPath(a, path)
@@ -5790,7 +5802,7 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
     if b >= 0 { return b }
     return tyIx
   }
-  if substOnSeenStack(tyIx) { return tyIx }
+  if substOnSeenStack(tyIx) || substSkipsForeignSig(tyIx) { return tyIx }
   stSeenStackPush(tyIx)
   let res = tyIx
   if t is TyArray {
@@ -5820,6 +5832,23 @@ export function substTyDeep(tyIx: i32, bNames: string[], bTys: i32[]) {
   // fresh arena index the provenance bank does not know about unless re-banked here, or the same type renders under two different names depending which door it came through.
   genAppCarry(tyIx, res, bNames, bTys)
   res
+}
+
+// `substTyDeep` of an instance binding: `bNames` are the type parameters of top-level generic
+// `owner`, so a type variable another top-level generic owns under the same name is left open
+// (D9190). `owner` "" substitutes by name alone.
+export function substTyDeepOf(
+  tyIx: i32,
+  bNames: string[],
+  bTys: i32[],
+  owner: string,
+): i32 {
+  if owner == substSelfOwner { return substTyDeep(tyIx, bNames, bTys) }
+  const was = substSelfOwner
+  substSelfOwnerSet(owner)
+  const r = substTyDeep(tyIx, bNames, bTys)
+  substSelfOwnerSet(was)
+  r
 }
 
 // Whether `tyIx` is already being substituted further up this walk (a recursive named type).
