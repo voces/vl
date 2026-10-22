@@ -14218,6 +14218,8 @@ function monoFlowUsePlanAt(
   for v in vals {
     if monoFlowMapOwner(monoFlowLitRoot(v)) >= 0 { viaMap = true }
   }
+  // Set once a computed index reads a row of a nested literal: every row is then a candidate.
+  let rows = false
   let p = mfrParent[cur] ?? -1
   while p >= 0 {
     const pn = P.nodes[p]
@@ -14259,8 +14261,9 @@ function monoFlowUsePlanAt(
       for v in cv {
         let el = monoFlowElemAt(v, pn.idxIndex)
         if el < 0 { el = monoFlowKeptIndexElem(v, p) }
-        if el < 0 { return false }
-        next.push(el)
+        if el < 0 && monoFlowRowLeaves(v, p, next) { rows = true }
+        else if el < 0 { return false }
+        else { next.push(el) }
       }
       cv = next
       path.push("e")
@@ -14293,6 +14296,11 @@ function monoFlowUsePlanAt(
       break
     }
     p = mfrParent[cur] ?? -1
+  }
+  // A read through a computed row index is rewritten only as a callee whose copy runs first, so
+  // its bound checks still run (D9900).
+  if rows && (monoFlowMapCount(cv) > 0 || monoFlowCallStmtOf(cur) < 0) {
+    return false
   }
   if monoFlowMapCount(cv) > 0 {
     if p < 0 { return false }
@@ -14350,6 +14358,7 @@ function monoFlowUsePlanAt(
   } else if !monoFlowSrcIs(d, path, g) && !monoFlowHeldIs(d, path, g) {
     return false
   }
+  if rows && !i32ListHas(mfrKeptIndex, cur) { mfrKeptIndex.push(cur) }
   reads.push(cur)
   reads.push(g)
   true
@@ -14827,6 +14836,23 @@ function monoFlowKeptIndexElem(v: i32, ix: i32): i32 {
   leaves[0]
 }
 
+// Pushes onto `out` every row list literal `v` holds, for computed-index read `ix` of it that is
+// no write; false, pushing nothing, when `v` is no list literal or any value it holds is no list.
+function monoFlowRowLeaves(v: i32, ix: i32, out: i32[]): boolean {
+  const xn = P.nodes[ix]
+  if !(xn is Index) || !(P.nodes[v] is ArrayLit) || monoFlowIsWrite(ix) {
+    return false
+  }
+  if P.nodes[unwrapParen(xn.idxIndex)] is NumLit { return false }
+  const leaves = monoFlowElemLeaves(v, 0)
+  if leaves.length == 0 { return false }
+  for e in leaves {
+    if !(P.nodes[e] is ArrayLit) { return false }
+  }
+  for e in leaves { out.push(e) }
+  true
+}
+
 // The statement holding the call whose callee is read `ix`, when nothing in that statement runs
 // before the call but reads of names and literals, so a copy of the read can run as the
 // statement before it (D7385); -1 otherwise. A block's or the start function's statement.
@@ -14971,7 +14997,31 @@ function monoFlowReadSet(x: i32, g: i32): boolean {
   arenaSetNode(x, n)
   sidNoteNodeName(x, g)
   monoArenaTouch()
+  monoFlowAliasCallsSet(x, g)
   true
+}
+
+// Rewrites to generic `g` each call of the un-annotated binding that rewritten read `x` wholly
+// initializes, when every use of it is such a call, so it is never written: its checked type is
+// the slot's, not the generic's, so each call names `g` and `x` is noted inert (D9901).
+function monoFlowAliasCallsSet(x: i32, g: i32) {
+  let p = mfrParent[x] ?? -1
+  while p >= 0 && P.nodes[p] is Paren { p = mfrParent[p] ?? -1 }
+  if p < 0 { return 0 }
+  const pn = P.nodes[p]
+  if !(pn is LetDecl) || pn.letType >= 0 { return 0 }
+  if unwrapParen(pn.letInit) != x { return 0 }
+  const calls: i32[] = []
+  for r in mfrUses[p] ?? [] {
+    if !monoFlowCallReads(r, calls, 1) { return 0 }
+  }
+  if calls.length == 0 { return 0 }
+  for u in calls {
+    if !monoFlowInScope(u, g) { return 0 }
+  }
+  for u in calls { monoFlowReadSet(u, g) }
+  monoFlowNoteInertLeaf(x)
+  0
 }
 
 // Notes as inert each name of a generic in the literals the clean bindings of `planned` hold,
@@ -15368,12 +15418,7 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     const held: i32[][] = []
     for v in vals { held.push([v, ctx]) }
     if pins.length == 0 && !fnFlowDeclPathUncalled(at, ["e", "e"]) { return 0 }
-    if (
-      pins.length > 1
-      && (monoFrameIsGenericInstance(ctx) || !monoValsInert(held))
-    ) {
-      return 0
-    }
+    if (pins.length > 1 && !monoValsInert(held)) { return 0 }
     return monoUncalledNestedListElems(d, inner, held)
   }
   const ann = monoSigFnTyName(pins[0] + ";")
@@ -21213,6 +21258,29 @@ function monoInertArgsStubbed(): i32 {
   0
 }
 
+// The spelling of the closed function type index read `ax` reads from a list binding whose
+// annotation, written or pinned (`monoPinListElems`), closes it, with the type in `out[0]`; ""
+// when `ax` is no such read. The read itself keeps the open element the checker gave it (D9890).
+function monoPinnedListElemPin(ax: i32, out: i32[]): string {
+  const x = unwrapParen(ax)
+  if x < 0 { return "" }
+  const xn = P.nodes[x]
+  if !(xn is Index) { return "" }
+  const a = unwrapParen(xn.idxArr)
+  if a < 0 || !(P.nodes[a] is Ident) { return "" }
+  const d = identDeclOf(a)
+  if d < 0 { return "" }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) || dn.letType < 0 { return "" }
+  const lt = nodeTyIxOf(dn.letType)
+  if lt < 0 || lt >= T.tys.length || !(T.tys[lt] is TyArray) { return "" }
+  const et = tyArrayElemIx(lt)
+  if !monoTyClosedFn(et) { return "" }
+  // arena-tick exempt: the caller's local out-parameter, never read by a rebuild pass.
+  out[0] = et
+  monoPinAnnSpelling(et)
+}
+
 // The refusal for a parameter `par` of `callee` no argument pin closes.
 function monoArgTyFail(par: string, callee: string): i32 {
   emitFail(
@@ -21530,6 +21598,11 @@ function monoPinHoleParam(
     anTy = pinTy[0]
   }
   if an == "" {
+    const rowTy: i32[] = [0 - 1]
+    an = monoPinnedListElemPin(args[i], rowTy)
+    anTy = rowTy[0]
+  }
+  if an == "" {
     // A name handed through an identity call into a binding can take a slot per type.
     if P.nodes[args[i]] is Ident {
       fsAsk(args[i])
@@ -21631,6 +21704,11 @@ function monoPinAnnotatedParam(
       const pinTy: i32[] = [0 - 1]
       an2 = monoOpenFnFlowPin(args[i], ctx, -1, pinTy)
       an2Ty = pinTy[0]
+    }
+    if an2 == "" && ann == tp {
+      const rowTy: i32[] = [0 - 1]
+      an2 = monoPinnedListElemPin(args[i], rowTy)
+      an2Ty = rowTy[0]
     }
     if an2Ty < 0 { an2Ty = monoArgPinTyIx(args[i], ctx) }
     if an2 == "" {
