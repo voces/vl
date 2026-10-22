@@ -4165,8 +4165,9 @@ function monoCloneBodyRaw(
         bN,
         bT,
       )
-      if ca == n.retArg { return ix }
-      return mkReturn(ca, n.pos)
+      const cl = if ca == n.retArg { monoRetBoundLitCopy(ca) } else { ca }
+      if cl == n.retArg { return ix }
+      return mkReturn(cl, n.pos)
     }
     Paren => {
       const ci = monoCloneBody(
@@ -4189,6 +4190,78 @@ function monoCloneBodyRaw(
   ix
 }
 
+// The instance's own copy of returned list literal `x` when it is open at a function and every
+// element reads a binding, which the instance's walk records at the bindings' types; `x` otherwise.
+function monoRetBoundLitCopy(x: i32): i32 {
+  if x < 0 || x >= P.nodes.length { return x }
+  const lx = unwrapParen(x)
+  if lx < 0 || lx >= P.nodes.length { return x }
+  const l = P.nodes[lx]
+  if !(l is ArrayLit) || l.arrElems.length == 0 { return x }
+  const t = nodeTyIxOf(lx)
+  if !monoTyOpen(t) || !tyMayHoldFn(t, 0) { return x }
+  for e in l.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 || !(P.nodes[ex] is Ident) { return x }
+  }
+  const cx = monoCopyOf(lx, mkArrayLit(l.arrElems, l.pos))
+  nodeTyRecord(cx, t)
+  cx
+}
+
+// The out type row asking `monoCloneLetDecl` for the instance's own un-annotated copy of the
+// returned binding, which the instance's walk then annotates.
+const MONO_OUT_OWN_COPY = -2
+
+// Whether the instance takes its own un-annotated copy of binding `n`, for its walk to annotate:
+// the returned binding `outName` asks for one, and so does a `const` of a list literal of
+// function names whose type the checker left open at a function.
+function monoLetOwnCopy(n: LetDecl, outName: string, outTyIx: i32): boolean {
+  if outName != "" && n.letName == outName && outTyIx == MONO_OUT_OWN_COPY {
+    return true
+  }
+  if n.letKw != "const" || n.letType >= 0 || n.letInit < 0 { return false }
+  const x = unwrapParen(n.letInit)
+  if !monoNameListLit(x) { return false }
+  const t = nodeTyIxOf(x)
+  monoTyOpen(t) && tyMayHoldFn(t, 0)
+}
+
+// Whether generic instance `fx` holds its own copy `at` of a binding `d` of a list of names.
+function monoInstOwnNameList(fx: i32, at: i32, d: LetDecl): boolean {
+  d.letInit >= 0
+    && monoNameListLit(unwrapParen(d.letInit))
+    && monoInstOwns(fx, at)
+}
+
+// Whether `x` is a non-empty list literal whose elements each name a function or a `const` of
+// such a literal, or are such literals; a `let`, which may be written, is not one.
+function monoNameListLit(x: i32): boolean { monoNameListLitAt(x, 0) }
+
+function monoNameListLitAt(x: i32, depth: i32): boolean {
+  if depth > TY_WALK_DEPTH || x < 0 || x >= P.nodes.length { return false }
+  const l = P.nodes[x]
+  if !(l is ArrayLit) || l.arrElems.length == 0 { return false }
+  for e in l.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 || ex >= P.nodes.length { return false }
+    if P.nodes[ex] is Ident {
+      const d = identDeclOf(ex)
+      if d < 0 || d >= P.nodes.length { return false }
+      const dn = P.nodes[d]
+      const ok = dn is FuncDecl
+        || (dn is LetDecl
+        && dn.letKw == "const"
+        && dn.letInit >= 0
+        && monoNameListLitAt(unwrapParen(dn.letInit), depth + 1))
+      if !ok { return false }
+    } else if !monoNameListLitAt(ex, depth + 1) {
+      return false
+    }
+  }
+  true
+}
+
 // `monoCloneBodyRaw`'s arm for the binding `n` at `ix`: its instance annotation.
 function monoCloneLetDecl(
   n: LetDecl,
@@ -4206,6 +4279,9 @@ function monoCloneLetDecl(
   // The inferred-list-return local (`const out = []`): annotate its empty build with the
   // pinned element type, per instance. Clones only this `LetDecl` and its enclosing
   // Block, never the shared original.
+  if nt < 0 && monoLetOwnCopy(n, outName, outTyIx) {
+    return monoCopyOf(ix, mkLet(n.letKw, n.letName, -1, n.letInit, n.pos))
+  }
   if nt < 0 {
     if outName != "" {
       if n.letName == outName {
@@ -10348,9 +10424,17 @@ function monoMakeInstanceRetExpr(
             rxe.identName,
             listTyIx,
           )
+          let ltIx = -1
+          if listTyIx.length > 0 { ltIx = listTyIx[0] }
+          // A list of functions the re-check leaves open names no slot an annotation could
+          // intern: the instance takes its own copy of the binding, which its walk types at the
+          // pins its returned literal takes (D9660, D9662).
+          if listTy != "" && monoTyOpen(ltIx) && tyMayHoldFn(ltIx, 0) {
+            listTy = ""
+            monoOutName = rxe.identName
+            monoOutTypeIx = MONO_OUT_OWN_COPY
+          }
           if listTy != "" {
-            let ltIx = -1
-            if listTyIx.length > 0 { ltIx = listTyIx[0] }
             listTy = monoListSpelling(listTy, ltIx)
             // A list of records is spelled the way the shape interner keys its row, as the
             // return-expression arm below spells one; the check's render keeps its spaces (D4683).
@@ -14841,8 +14925,10 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
   }
   if pins.length != 1 { return 0 }
   // A pin taken at this instance's own template is this instance's alone, and a generic's
-  // instances share `d`: its elements are instanced here and its reads typed per instance.
+  // instances share `d` unless this one took its own copy (D9660): its elements are instanced
+  // here and its reads typed per instance.
   const shared = monoFrameIsGenericInstance(ctx)
+    && !monoInstOwnNameList(ctx, at, d)
     && monoDeclPathPinsPerInstance(at, path)
   const ann = monoSigFnTyName(pins[0] + ";")
   if !monoListStoresAgree(lit, repoints, at, ann) { return 0 }
@@ -14964,8 +15050,19 @@ function monoListStoresAgree(
 function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
   const ctx = lf[0]
   const at = lf[1]
-  if lit.arrElems.length == 0 || monoFrameIsGenericInstance(ctx) { return 0 }
-  if monoWritesOf("e:", at).length > 0 { return 0 }
+  if lit.arrElems.length == 0 || monoWritesOf("e:", at).length > 0 { return 0 }
+  // A generic's instances share `d`, unless this instance took its own copy (D9662).
+  if monoFrameIsGenericInstance(ctx) && !monoInstOwns(ctx, at) { return 0 }
+  // Its elements reading bindings already pinned take their type, as inline literals would (D9661).
+  const lits: i32[] = [d.letInit]
+  const bt = monoBoundFnListElemsTy(lits, ctx)
+  if bt >= 0 {
+    const blt = mkArrayTy(bt)
+    d.letType = synthTypeRefTy(monoPinAnnSpelling(blt), -1, blt)
+    monoArenaTouch()
+    nodeTyRecord(d.letInit, blt)
+    return 1
+  }
   const inner: i32[] = []
   const vals: i32[] = []
   for e in lit.arrElems {
@@ -23849,6 +23946,8 @@ function monoRetLitElemTy(
   depth: i32,
 ): i32 {
   if depth > TY_WALK_DEPTH { return -1 }
+  const bt = monoBoundFnListElemsTy(lits, ctx)
+  if bt >= 0 { return bt }
   const vals: i32[][] = []
   const inner: i32[] = []
   for li in lits {
@@ -23871,6 +23970,67 @@ function monoRetLitElemTy(
   const lt = mkArrayTy(et)
   for i in inner { monoRecordInstOpen(i, lt, ctx) }
   lt
+}
+
+// The one closed list-of-functions type every element of the list literals `lits` reads, each a
+// `const` its own walk annotated at its pin, now recorded on each read in frame `ctx`; -1 when an
+// element is anything else or two disagree.
+function monoBoundFnListElemsTy(lits: i32[], ctx: i32): i32 {
+  let t = -1
+  const reads: i32[] = []
+  for li in lits {
+    const l = P.nodes[li]
+    if !(l is ArrayLit) || l.arrElems.length == 0 { return -1 }
+    for e in l.arrElems {
+      const x = unwrapParen(e)
+      if x < 0 || x >= P.nodes.length || !(P.nodes[x] is Ident) { return -1 }
+      const dx = monoInstLetCopy(ctx, identDeclOf(x))
+      if dx < 0 || dx >= P.nodes.length { return -1 }
+      const dn = P.nodes[dx]
+      if !(dn is LetDecl) || dn.letKw != "const" || dn.letType < 0 { return -1 }
+      const bt = nodeTyIxOf(dn.letType)
+      if (
+        bt < 0
+        || bt >= T.tys.length
+        || !(T.tys[bt] is TyArray)
+        || monoTyOpen(bt)
+        || !tyMayHoldFn(bt, 0)
+        || (t >= 0 && !tyEq(t, bt))
+      ) {
+        return -1
+      }
+      t = bt
+      reads.push(x)
+    }
+  }
+  for x in reads { monoRecordInstOpen(x, t, ctx) }
+  t
+}
+
+// The copy generic instance `fx` took of its template's binding `d` (`monoLetOwnCopy`), which a
+// read the instance shares with its template still resolves to `d`; `d` itself otherwise.
+function monoInstLetCopy(fx: i32, d: i32): i32 {
+  if d < 0 || d >= P.nodes.length || !monoFrameIsGenericInstance(fx) {
+    return d
+  }
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) || monoInstOwns(fx, d) { return d }
+  for ix in monoFrameNodes(fx) {
+    const n = P.nodes[ix]
+    if ix != d && n is LetDecl && n.letName == dn.letName && n.pos == dn.pos {
+      return ix
+    }
+  }
+  d
+}
+
+// Whether node `x` belongs to generic instance `fx`'s own copy of its template's body.
+function monoInstOwns(fx: i32, x: i32): boolean {
+  if fx < 0 || x < 0 { return false }
+  const it = monoFrameInstTmpl(fx)
+  if it[0] != fx || it[1] < 0 || it[1] >= P.nodes.length { return false }
+  const tn = P.nodes[it[1]]
+  tn is FuncDecl && !nodeContains(tn.fnBody, x)
 }
 
 // `monoRecordOpen`, also at a node of an instance's own copy of its template's body; a node
