@@ -37,6 +37,7 @@ import {
   TyVar,
   litUnionAliasNameOfTy,
   structNameOfTy,
+  tyArrayElemIx,
   tyEmitNameKey,
   tyEmitNameNonEmpty,
   tyEq,
@@ -118,6 +119,8 @@ import {
   repSlotOfTy,
 } from "./emit_rep"
 import {
+  deepDeclRecName,
+  fnElemNominalName,
   mvSlotOfMapNameTys,
   nameIsRefArray,
   nulScalarListKind,
@@ -126,9 +129,13 @@ import {
   repVariantSlotRep,
   rlSlotOfArrName,
   shapeNominalOfTy,
+  sigFuncDeeperThan,
+  sigRowHasNoArmTwin,
+  sigRowHasNoTwin,
   sktGen,
   sktKey,
   structIndexOfTypeName,
+  tyIsFuncOrNulFunc,
   tyRegGenNow,
   variantIndexOfTypeName,
 } from "./emit_shape_rows"
@@ -158,17 +165,13 @@ import {
   declaredKind,
   declaredSlotOf,
   rlElemTyIxAt,
+  rlNestRowsNamed,
   rlSlotOfTy,
   rlSoleSlotOfRecTy,
   sFieldIndex,
 } from "./emit_struct_order"
 import { nodeRepIn } from "./emit_ty_canon"
-import {
-  isUNameAnnAB,
-  mvDeclRecSlotOfTy,
-  sigRowHasNoArmTwin,
-  sigRowHasNoTwin,
-} from "./emit_union_atoms"
+import { isUNameAnnAB, mvDeclRecSlotOfTy } from "./emit_union_atoms"
 import {
   isUName,
   unionMemberSetOf,
@@ -946,6 +949,7 @@ export function sigParamTokOfTy(pty: i32): string {
   const nr = sigNulDeclRecTokOfTy(pty)
   if nr != "" { return nr }
   const lr = sigDeclRecListTokOfTy(pty)
+  if lr == SIG_NO_TOK { return "" }
   if lr != "" { return lr }
   const mr = sigDeclRecMapTokOfTy(pty)
   if mr != "" { return mr }
@@ -1106,22 +1110,28 @@ function sigNulDeclRecTokOfTy(ty: i32): string {
 // The `reflist` token of a list of a declared record, bare or nullable, or `nulreflist` of
 // that list made nullable, keyed by the element's ref-list slot, or "": the token its render
 // gets through `annRefListSlot`, without spelling a deep record whole (D9460, D9461).
+// `SIG_NO_TOK` when that render provably gets none, so the caller answers "" unrendered.
 function sigDeclRecListTokOfTy(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
   const t = T.tys[ty]
   if t is TyNullable {
     const ns = sigDeclRecListSlotOfTy(t.nInner)
+    if ns == -3 { return SIG_NO_TOK }
     if ns < 0 { return "" }
     return repSigSlotTokOfKind("nulreflist", ns)
   }
   const s = sigDeclRecListSlotOfTy(ty)
+  if s == -3 { return SIG_NO_TOK }
   if s < 0 { return "" }
   repSigSlotTokOfKind("reflist", s)
 }
 
+const SIG_NO_TOK = "!"
+
 // The ref-list slot of list type `ty` whose element is a declared record or one made
 // nullable, or -1: also when another struct row may match the record's render
 // (`sigRowHasNoTwin`), or another ref-list row's element may (`rlSoleSlotOfRecTy`).
+// -3 from `sigDeepNestListSlotOfTy`.
 function sigDeclRecListSlotOfTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const t = T.tys[ty]
@@ -1130,10 +1140,58 @@ function sigDeclRecListSlotOfTy(ty: i32): i32 {
   if e < 0 || e >= T.tys.length { return -1 }
   let base = e
   const et = T.tys[e]
+  if et is TyArray || tyIsFuncOrNulFunc(e) { return sigDeepNestListSlotOfTy(e) }
   if et is TyNullable { base = et.nInner }
   const si = sigDeclRecSlotOfTy(base)
   if si < 0 || !sigRowHasNoTwin(si) { return -1 }
   rlSoleSlotOfRecTy(e, si)
+}
+
+// -3 when list element `e`, nested past depth 8, is a list of lists of a declared record or a
+// function type over one, and no ref-list row its render could reach exists: every row that
+// may be `e` is keyed under the nominal spelling, which the render never equals. Else -1,
+// and the render answers (D9510, D9770).
+function sigDeepNestListSlotOfTy(e: i32): i32 {
+  if tyIsFuncOrNulFunc(e) {
+    if !sigFuncDeeperThan(e, 8) || !sigFuncNamesDeclRec(e) { return -1 }
+    const fnm = fnElemNominalName(e)
+    if fnm == "" || !rlNestRowsNamed(e, -1, fnm) { return -1 }
+    return -3
+  }
+  const nm = deepDeclRecName(e)
+  if nm == "" { return -1 }
+  let b = e
+  while b >= 0 && b < T.tys.length && T.tys[b] is TyArray {
+    b = tyArrayElemIx(b)
+  }
+  if !rlNestRowsNamed(e, repSlotOfTy(b), nm) { return -1 }
+  -3
+}
+
+// Whether function type `ty`, bare or made nullable, has a parameter or result that is a
+// declared record, bare, nullable or in lists: its render then differs from its nominal name.
+function sigFuncNamesDeclRec(ty: i32): boolean {
+  if ty < 0 || ty >= T.tys.length { return false }
+  const f = tyPeelNul(ty)
+  if f < 0 || f >= T.tys.length { return false }
+  const t = T.tys[f]
+  if !(t is TyFunc) { return false }
+  for p in t.fnParamTypes {
+    if sigTyLeafIsDeclRec(p) { return true }
+  }
+  sigTyLeafIsDeclRec(t.fnRet)
+}
+
+// Whether `ty`, peeled of lists and nullables, is a declared record.
+function sigTyLeafIsDeclRec(ty: i32): boolean {
+  let b = ty
+  while b >= 0 && b < T.tys.length {
+    const bt = T.tys[b]
+    if bt is TyArray { b = bt.aElem }
+    else if bt is TyNullable { b = bt.nInner }
+    else { return bt is TyObj && structNameOfTy(b) != "" }
+  }
+  false
 }
 
 // Whether `ty` is a list whose element is a bare union of declared records and value scalars:
@@ -1206,6 +1264,7 @@ export function sigRetTokOfTy(rty: i32): string {
     const rn = sigNulDeclRecTokOfTy(rty)
     if rn != "" { return ">" + rn }
     const rl = sigDeclRecListTokOfTy(rty)
+    if rl == SIG_NO_TOK { return "" }
     if rl != "" { return ">" + rl }
   }
   if sigFuncParamIsClosure(rty) { return ">" + repSigTokOfKind("closure") }
