@@ -15078,7 +15078,20 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
     for v in il.arrElems { vals.push(v) }
   }
   const pins = monoDeclPathPins(lf, ["e", "e"])
-  if pins.length != 1 { return 0 }
+  if pins.length != 1 {
+    // A slot nothing calls, or one whose every read now names its generic (D9711), takes the
+    // type its functions hold at no call, as the flat list does.
+    const held: i32[][] = []
+    for v in vals { held.push([v, ctx]) }
+    if pins.length == 0 && !fnFlowDeclPathUncalled(at, ["e", "e"]) { return 0 }
+    if (
+      pins.length > 1
+      && (monoFrameIsGenericInstance(ctx) || !monoValsInert(held))
+    ) {
+      return 0
+    }
+    return monoUncalledNestedListElems(d, inner, held)
+  }
   const ann = monoSigFnTyName(pins[0] + ";")
   let pre = -1
   for v in vals {
@@ -15112,6 +15125,28 @@ function monoPinNestedListElems(d: LetDecl, lf: i32[], lit: ArrayLit): i32 {
   for v in vals {
     const et = nodeTyIxOf(v)
     if et < 0 || tyHasTyVar(et) { nodeTyRecord(v, ft) }
+  }
+  1
+}
+
+// Annotates the list `d` of the list literals `inner`, holding the functions `held`, whose inner
+// slot nothing calls, at the type `monoUncalledSlotFnTy` gives them: 1 when annotated, else 0.
+function monoUncalledNestedListElems(
+  d: LetDecl,
+  inner: i32[],
+  held: i32[][],
+): i32 {
+  const sp: string[] = []
+  const ft = monoUncalledSlotFnTy(held, sp)
+  if ft < 0 { return 0 }
+  const it = mkArrayTy(ft)
+  const lt = mkArrayTy(it)
+  d.letType = synthTypeRefTy("(" + sp[0] + ")[][]", -1, lt)
+  monoArenaTouch()
+  nodeTyRecord(d.letInit, lt)
+  for x in inner { nodeTyRecord(x, it) }
+  for vw in held {
+    if !monoTyClosedFn(nodeTyIxOf(vw[0])) { nodeTyRecord(vw[0], ft) }
   }
   1
 }
@@ -16230,6 +16265,9 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
   const sp: string[] = []
   if c is TyMap { return monoPinMapSlot(vx, at, ctx, fld, sp) }
   const lit = P.nodes[vx]
+  if lit is ArrayLit && T.tys[et] is TyArray {
+    return monoPinFieldNestedFnList(at, ctx, fld, vx, lit)
+  }
   if !(lit is ArrayLit) || !(T.tys[et] is TyFunc) { return -1 }
   const lf: i32[] = [ctx, at]
   const vals: i32[][] = []
@@ -16249,6 +16287,40 @@ function monoPinFieldContainer(at: i32, ctx: i32, fld: string, v: i32): i32 {
   nodeTyRecord(vx, nt)
   for rl in relits { monoRecordOpen(rl[0], nt, rl[1]) }
   monoRetypeMapReads(ctx, at, nt, ft, fld)
+  nt
+}
+
+// The type field `fld` of the record declared at `at` takes from its inline list of list literals
+// `lit` (`vx`) of functions, at the one type its slot `e`/`e` is pinned at (D9713); -1 left alone.
+function monoPinFieldNestedFnList(
+  at: i32,
+  ctx: i32,
+  fld: string,
+  vx: i32,
+  lit: ArrayLit,
+): i32 {
+  const vals: i32[][] = []
+  const inner: i32[] = []
+  for e in lit.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 { return -1 }
+    const il = P.nodes[ex]
+    if !(il is ArrayLit) { return -1 }
+    inner.push(ex)
+    for v in il.arrElems { vals.push([v, ctx]) }
+  }
+  const sp: string[] = []
+  const ft = monoStoredSlotFnTy(
+    [ctx, at],
+    monoSlotPath(fld, ["e", "e"]),
+    vals,
+    sp,
+  )
+  if ft < 0 { return ft }
+  const it = mkArrayTy(ft)
+  const nt = mkArrayTy(it)
+  nodeTyRecord(vx, nt)
+  for x in inner { nodeTyRecord(x, it) }
   nt
 }
 
@@ -16469,6 +16541,16 @@ function monoPinMapSlot(
     if ft < 0 { return ft }
     nv = ft
     vs = "(" + sp[0] + ")"
+  } else if (
+    v is TyArray
+    && v.aElem >= 0
+    && v.aElem < T.tys.length
+    && T.tys[v.aElem] is TyArray
+  ) {
+    const sp: string[] = []
+    nv = monoPinMapNestedFnLists(lf, fld, stored, sp)
+    if nv < 0 { return nv }
+    vs = "(" + sp[0] + ")[][]"
   } else if v is TyArray {
     if v.aElem < 0 || v.aElem >= T.tys.length || !(T.tys[v.aElem] is TyFunc) {
       return -1
@@ -16524,6 +16606,45 @@ function monoPinMapSlot(
   nodeTyRecord(mx, nt)
   monoRetypeMapReads(ctx, at, nt, nv, fld)
   nt
+}
+
+// The list-of-lists type the map value slot of the binding `lf` (field `fld`) takes when every
+// value `stored` is a list of list literals of functions, at the one type its slot `v`/`e`/`e` is
+// pinned at, with that pin's spelling pushed onto `spell` (D9715); -1 otherwise, -2 refused.
+function monoPinMapNestedFnLists(
+  lf: i32[],
+  fld: string,
+  stored: i32[][],
+  spell: string[],
+): i32 {
+  const vals: i32[][] = []
+  const inner: i32[][] = []
+  for s in stored {
+    const sx = unwrapParen(s[0])
+    if sx < 0 || sx >= P.nodes.length { return -1 }
+    const lit = P.nodes[sx]
+    if !(lit is ArrayLit) { return -1 }
+    for e in lit.arrElems {
+      const ex = unwrapParen(e)
+      if ex < 0 { return -1 }
+      const il = P.nodes[ex]
+      if !(il is ArrayLit) { return -1 }
+      inner.push([ex, s[1]])
+      for v in il.arrElems { vals.push([v, s[1]]) }
+    }
+  }
+  const ft = monoStoredSlotFnTy(
+    lf,
+    monoSlotPath(fld, ["v", "e", "e"]),
+    vals,
+    spell,
+  )
+  if ft < 0 { return ft }
+  const it = mkArrayTy(ft)
+  const nv = mkArrayTy(it)
+  for x in inner { monoRecordOpen(x[0], it, x[1]) }
+  for s in stored { monoRecordOpen(unwrapParen(s[0]), nv, s[1]) }
+  nv
 }
 
 // The record type the record literals of `stored` (each beside its write's frame), held at slot
@@ -18648,8 +18769,8 @@ function monoFnReturnsListLit(fx: i32, lit: i32): boolean {
   false
 }
 
-// The list literal returned value `r` is, or initialises as the un-annotated `const` it names
-// that nothing writes; -1 otherwise.
+// The list literal returned value `r` is, or initialises as the un-annotated `const` or `let`
+// it names that nothing writes whole (D9716); -1 otherwise.
 function monoRetListLitOf(r: i32): i32 {
   const x = unwrapParen(r)
   if x < 0 || x >= P.nodes.length { return -1 }
@@ -18658,11 +18779,12 @@ function monoRetListLitOf(r: i32): i32 {
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return -1 }
   const dn = P.nodes[d]
-  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return -1 }
+  if !(dn is LetDecl) || dn.letType >= 0 || dn.letInit < 0 { return -1 }
   const ix = unwrapParen(dn.letInit)
   if ix < 0 || !(P.nodes[ix] is ArrayLit) || monoWritesOf("n:", d).length > 0 {
     return -1
   }
+  if dn.letKw != "const" && monoWritesOf("c:", d).length > 0 { return -1 }
   ix
 }
 
@@ -19531,11 +19653,20 @@ function monoOpenFnFlowPin(
     return ""
   }
   let fl = monoReadLetFrame(ax, ctx)
+  let ft = -1
   if fl[1] < 0 {
-    if !(P.nodes[ax] is Call) { return "" }
-    fl = [ctx, ax]
+    const nl = monoNestedRowReadFrame(ax, ctx)
+    if nl[1] >= 0 {
+      fl = nl
+      ft = monoHoleGenFnFlowTyAt(argIx, fl, ["e", "e"])
+    } else {
+      if !(P.nodes[ax] is Call) { return "" }
+      fl = [ctx, ax]
+      ft = monoHoleGenFnFlowTy(argIx, fl)
+    }
+  } else {
+    ft = monoHoleGenFnFlowTy(argIx, fl)
   }
-  const ft = monoHoleGenFnFlowTy(argIx, fl)
   if ft < 0 && bindTy >= 0 && monoTyConcreteFn(bindTy) {
     return monoFnPinAt(argIx, ctx, bindTy, -1, tyOut)
   }
@@ -19642,15 +19773,20 @@ function monoHoleGenFnFlowDecl(argIx: i32, ctx: i32): i32[] {
 // un-annotated lambdas at what the rest bind (D6543), and the result its body gives there.
 // -1 for no pin, two, a parameter that does not fit, or a type variable left open.
 function monoHoleGenFnFlowTy(argIx: i32, lf: i32[]): i32 {
-  if lf[1] < 0 { return -1 }
   const noPath: string[] = []
-  const pins = monoDeclPathPins(lf, noPath)
+  monoHoleGenFnFlowTyAt(argIx, lf, noPath)
+}
+
+// `monoHoleGenFnFlowTy` over slot `path` of the binding `lf`.
+function monoHoleGenFnFlowTyAt(argIx: i32, lf: i32[], path: string[]): i32 {
+  if lf[1] < 0 { return -1 }
+  const pins = monoDeclPathPins(lf, path)
   let ps: i32[] = []
   let cx = -1
   if pins.length == 1 {
-    ps = fnFlowDeclPathPinTysOf(lf[1], noPath, pins[0])
+    ps = fnFlowDeclPathPinTysOf(lf[1], path, pins[0])
   } else if pins.length == 0 {
-    cx = fnFlowDeclPathOnlyPinCall(lf[1], noPath, ps)
+    cx = fnFlowDeclPathOnlyPinCall(lf[1], path, ps)
     if cx < 0 { return -1 }
   } else {
     return -1
@@ -19880,29 +20016,70 @@ function monoOpenFnListPin(
   if at < 0 || at >= T.tys.length { return "" }
   const la = T.tys[at]
   if !(la is TyArray) || la.aElem < 0 || la.aElem >= T.tys.length { return "" }
-  if !(T.tys[la.aElem] is TyFunc) || !tyHasTyVar(la.aElem) { return "" }
   const al = P.nodes[ax]
   if !(al is ArrayLit) || al.arrElems.length == 0 { return "" }
+  if T.tys[la.aElem] is TyArray && tyHasTyVar(la.aElem) {
+    return monoOpenFnNestedListPin(dn.fnParams[i], call, al, ctx, tyOut)
+  }
+  if !(T.tys[la.aElem] is TyFunc) || !tyHasTyVar(la.aElem) { return "" }
   const ft = monoListSlotPinnedFnTy(dn.fnParams[i], al.arrElems, call)
   if ft < 0 || sigKeyOfTy(ft) == "" { return "" }
-  // Each element is delivered at that type, a hole function's name as a direct argument is
-  // (`monoFnPinAt`).
-  const nm = monoConcreteFnTyName(ft)
-  if nm != "" {
-    for el in al.arrElems {
-      const ex = unwrapParen(el)
-      if ex < 0 { return "" }
-      if P.nodes[ex] is Ident {
-        if monoCoerceFnValueName(ex, nm, ctx, ft) < 0 { return "" }
-      } else {
-        monoLamLitTake(ex, nm, ctx)
-      }
-    }
-  }
+  if !monoDeliverFnElemsAt(al.arrElems, ft, ctx) { return "" }
   const lt = mkArrayTy(ft)
   // arena-tick exempt: a caller-owned out-parameter, not the arena.
   tyOut[0] = lt
   monoConcreteFnPinName(lt)
+}
+
+// Delivers each function of `elems` at function type `ft`, a hole function's name as a direct
+// argument is (`monoFnPinAt`); false when one is refused.
+function monoDeliverFnElemsAt(elems: i32[], ft: i32, ctx: i32): boolean {
+  const nm = monoConcreteFnTyName(ft)
+  if nm == "" { return true }
+  for el in elems {
+    const ex = unwrapParen(el)
+    if ex < 0 { return false }
+    if P.nodes[ex] is Ident {
+      if monoCoerceFnValueName(ex, nm, ctx, ft) < 0 { return false }
+    } else {
+      monoLamLitTake(ex, nm, ctx)
+    }
+  }
+  true
+}
+
+// `monoOpenFnListPin` for a list `al` of list literals of open functions handed to parameter
+// `param`: each inner list at the one agreed pin of the slot `e`/`e` (D9765); "" when a row is no
+// list literal or the pins do not agree.
+function monoOpenFnNestedListPin(
+  param: i32,
+  call: i32,
+  al: ArrayLit,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  const elems: i32[] = []
+  const inner: i32[] = []
+  for e in al.arrElems {
+    const ex = unwrapParen(e)
+    if ex < 0 { return "" }
+    const il = P.nodes[ex]
+    if !(il is ArrayLit) || il.arrElems.length == 0 { return "" }
+    inner.push(ex)
+    for v in il.arrElems { elems.push(v) }
+  }
+  const ft = monoPathSlotPinnedFnTy(param, ["e", "e"], elems, call)
+  if ft < 0 || sigKeyOfTy(ft) == "" || !(T.tys[ft] is TyFunc) { return "" }
+  if !monoDeliverFnElemsAt(elems, ft, ctx) { return "" }
+  const it = mkArrayTy(ft)
+  for x in inner { nodeTyRecord(x, it) }
+  const lt = mkArrayTy(it)
+  if tyHasTyVar(lt) { return "" }
+  const inn = monoConcreteFnPinName(it)
+  if inn == "" { return "" }
+  // arena-tick exempt: a caller-owned out-parameter, not the arena.
+  tyOut[0] = lt
+  inn + "[]"
 }
 
 // The pin of a record literal handed to un-annotated parameter `i` of `decl` in call `call` whose
@@ -20499,10 +20676,23 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   if ax < 0 { return "" }
   const al = P.nodes[ax]
   let list = false
+  // A list of list literals is each row's functions, at the stub's list of lists (D9765).
+  let rows = false
   if al is ArrayLit {
     if al.arrElems.length == 0 { return "" }
+    rows = P.nodes[unwrapParen(al.arrElems[0])] is ArrayLit
     for e in al.arrElems {
-      if !monoInertArgFns(e, fes, at, 0) { return "" }
+      const ex = unwrapParen(e)
+      if ex < 0 { return "" }
+      const il = P.nodes[ex]
+      if rows && il is ArrayLit {
+        if il.arrElems.length == 0 { return "" }
+        for ie in il.arrElems {
+          if !monoInertArgFns(ie, fes, at, 0) { return "" }
+        }
+      } else if rows || !monoInertArgFns(e, fes, at, 0) {
+        return ""
+      }
     }
     list = true
   } else if !monoInertArgFns(argIx, fes, at, 0) {
@@ -20523,7 +20713,12 @@ function monoInertParamStubPin(oDecl: i32, argIx: i32, tyOut: i32[]): string {
   const noPs: i32[] = []
   let st = mkFuncTy(noPs, TY_VOID)
   let nm = ""
-  if list {
+  if rows {
+    st = mkArrayTy(st)
+    nm = monoConcreteFnPinName(st)
+    st = mkArrayTy(st)
+    if nm != "" { nm = nm + "[]" }
+  } else if list {
     st = mkArrayTy(st)
     nm = monoConcreteFnPinName(st)
   } else {
@@ -21842,6 +22037,23 @@ function monoDeclFrameIn(e: i32, ctx: i32): i32[] {
   none
 }
 
+// `[frame, declaration]` of the list of lists read at `at` (`v[0][0]`, literal indices), whose
+// slot `e`/`e` holds the function read (D9710); `[-1, -1]` for any other read.
+function monoNestedRowReadFrame(at: i32, ctx: i32): i32[] {
+  const none: i32[] = [0 - 1, 0 - 1]
+  const o = P.nodes[at]
+  if !(o is Index) || !(P.nodes[o.idxIndex] is NumLit) { return none }
+  const ix = unwrapParen(o.idxArr)
+  if ix < 0 { return none }
+  const i = P.nodes[ix]
+  if !(i is Index) || !(P.nodes[i.idxIndex] is NumLit) { return none }
+  const r = unwrapParen(i.idxArr)
+  if r < 0 || !(P.nodes[r] is Ident) { return none }
+  const e = identDeclOf(r)
+  if e < 0 || e >= P.nodes.length || !(P.nodes[e] is LetDecl) { return none }
+  monoDeclFrameIn(e, ctx)
+}
+
 // `[frame, declaration]` of the `let` the read at `at` (a name, or a capture cell's `d[0]`)
 // names by declaration, in frame `ctx` or the nearest enclosing frame holding its copy;
 // `[-1, -1]` for a read of anything else, such as a parameter.
@@ -22582,7 +22794,28 @@ function monoWalkLetDecl(n: LetDecl, ix: i32, ctx: i32): i32 {
   monoInstanceExactRet = false
   if monoNoteBindDelivery(n.letInit, n.letType, ctx, -1) < 0 { return -1 }
   monoNoteLitDest(n.letInit, n.letType)
-  return monoWalk(n.letInit, ctx)
+  if monoWalk(n.letInit, ctx) < 0 { return -1 }
+  // A field a call initialises reads at the instance the walk just gave that call (D9714).
+  if monoObjLitOpenCallField(n) {
+    if monoPinFieldContainers(n, ix, ctx) < 0 { return -1 }
+  }
+  0
+}
+
+// Whether the un-annotated `let` `n` is initialised by a record literal still open at a field a
+// call initialises.
+function monoObjLitOpenCallField(n: LetDecl): boolean {
+  if n.letType >= 0 || n.letInit < 0 { return false }
+  const lit = P.nodes[n.letInit]
+  if !(lit is ObjLit) || !monoTyOpen(nodeTyIxOf(n.letInit)) { return false }
+  for fi in lit.objFields {
+    const f = P.nodes[fi]
+    if f is FieldInit {
+      const vx = unwrapParen(f.fiValue)
+      if vx >= 0 && P.nodes[vx] is Call { return true }
+    }
+  }
+  false
 }
 
 // `monoNoteLitDest` for each argument of call `n` (node `ix`) at a concrete annotated
@@ -24685,6 +24918,10 @@ function monoBindSigFail(nm: string, decl: i32): i32 {
 function monoPinLamFromCheckedTy(fe: i32) {
   const fn = P.nodes[fnStmts[fe]]
   if fn is FuncDecl {
+    const rowSp = monoCbFnListRowSpell(fnStmts[fe])
+    if rowSp != "" && fn.fnParams.length == 1 {
+      return monoInstanceFor(fe, [rowSp], fnStmts[fe], -1)
+    }
     if !monoSubtreeCallsGeneric(fn.fnBody, fnStmts[fe], 0) { return 0 }
     const tys = monoFnValueParamTys(nodeTyIxOf(fnStmts[fe]), fn.fnParams.length)
     // A callback of a built-in `.map` / `.filter` is called at its element's own spelling; one
@@ -24692,6 +24929,29 @@ function monoPinLamFromCheckedTy(fe: i32) {
     return monoPinLamAtTys(fe, tys, monoIsBuiltinCallback(fnStmts[fe]))
   }
   0
+}
+
+// The spelling of a row of the list of function lists a built-in callback `lam` walks, when its
+// receiver names a binding the pass annotated at a closed `((...)=>...)[][]` (D9712); else "".
+function monoCbFnListRowSpell(lam: i32): string {
+  if !monoIsBuiltinCallback(lam) { return "" }
+  const recv = unwrapParen(monoBuiltinCbRecv[lam] ?? -1)
+  if recv < 0 || !(P.nodes[recv] is Ident) { return "" }
+  const dx = identDeclOf(recv)
+  if dx < 0 || dx >= P.nodes.length { return "" }
+  const d = P.nodes[dx]
+  if !(d is LetDecl) || d.letType < 0 { return "" }
+  const lt = nodeTyIxOf(d.letType)
+  if lt < 0 || lt >= T.tys.length || tyHasTyVar(lt) { return "" }
+  const t = T.tys[lt]
+  if !(t is TyArray) || t.aElem < 0 { return "" }
+  const it = T.tys[t.aElem]
+  if !(it is TyArray) || it.aElem < 0 || !(T.tys[it.aElem] is TyFunc) {
+    return ""
+  }
+  const sp = tyNameOf(d.letType)
+  if sp.length < 4 || sp.slice(sp.length - 2, sp.length) != "[]" { return "" }
+  sp.slice(0, sp.length - 2)
 }
 
 // Instantiates the lambda in slot `fe` at parameter types `tys`, each pinned by its declared
@@ -24725,12 +24985,15 @@ function monoPinLamAtTys(fe: i32, tys: i32[], builtin: boolean): i32 {
 // The lambda nodes passed straight to a built-in `.map` or `.filter`, found on first use.
 let monoBuiltinCbLams: {[i32]: i32} = Map()
 let monoBuiltinCbLamsBuilt = false
+// Per such lambda, the receiver of the call it is the callback of.
+let monoBuiltinCbRecv: {[i32]: i32} = Map()
 
 // Whether lambda node `lam` is the callback of a built-in `.map` or `.filter` call.
 function monoIsBuiltinCallback(lam: i32): boolean {
   if !monoBuiltinCbLamsBuilt {
     monoBuiltinCbLamsBuilt = true
     monoBuiltinCbLams = Map()
+    monoBuiltinCbRecv = Map()
     const stack: i32[] = []
     for st in monoProgStmts { stack.push(st) }
     while stack.length > 0 {
@@ -24746,6 +25009,7 @@ function monoIsBuiltinCallback(lam: i32): boolean {
             ) {
               // arena-tick exempt: this module's own lookup table, not the arena.
               monoBuiltinCbLams[unwrapParen(n.callArgs[0])] = 1
+              monoBuiltinCbRecv[unwrapParen(n.callArgs[0])] = cf.memObj
             }
           }
         }
