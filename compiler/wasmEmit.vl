@@ -218,6 +218,7 @@ import {
   mkArrayLit,
   mkBinary,
   mkBlock,
+  mkBool,
   mkCallN,
   mkIdent,
   mkIf,
@@ -38201,6 +38202,42 @@ function coalNullTestIf(e: BinExpr, exprIx: i32, fnIx: i32): i32 {
   ifIx
 }
 
+// `if true { l } else { d }` for an instance's `l ?? d` whose operand it typed without `null` at
+// a type the `??`'s join widens, so the dead default still shapes the join the arms deliver
+// into; -1 when the operand bears `null`, matches the join, or either type is a hole.
+function coalRetypedDeadJoinIf(
+  e: BinExpr,
+  lhsIx: i32,
+  exprIx: i32,
+  fnIx: i32,
+): i32 {
+  if !fnInPinnedInstance(fnIx) { return -1 }
+  const lt = nodeTyIxOf(lhsIx)
+  if (
+    lt < 0
+    || lt >= T.tys.length
+    || T.tys[lt] is TyVar
+    || !tyProvesNonNull(lt)
+  ) {
+    return -1
+  }
+  const pt = nodeTyPinIxOf(exprIx)
+  if pt < 0 || pt >= T.tys.length || pt == lt || tyHasTyVar(pt) { return -1 }
+  const thenS: i32[] = []
+  thenS.push(e.binLeft)
+  const elseS: i32[] = []
+  elseS.push(e.binRight)
+  const pos = e.pos
+  const ifIx = mkIf(
+    mkBool(1, pos),
+    mkBlock(thenS, pos),
+    mkBlock(elseS, pos),
+    pos,
+  )
+  nodeTyRecord(ifIx, pt)
+  ifIx
+}
+
 // A copy of the name, field or map read `ix` typed at its literal union without `null`, or `ix`
 // itself when its type, an instance's own for a hole, is no declared `K | null` atom niche.
 function coalNarrowedReRead(ix: i32, fnIx: i32): i32 {
@@ -38271,6 +38308,8 @@ function emitCoalesceGo(body: u8[], e: BinExpr, exprIx: i32, fnIx: i32) {
   }
   // An operand an instance re-typed at a pin that excludes `null` has a dead default.
   if coalRetypedDead(exprIx, lhsIx, fnIx) { return emitExpr(body, lhsIx, fnIx) }
+  const djIf = coalRetypedDeadJoinIf(e, lhsIx, exprIx, fnIx)
+  if djIf >= 0 { return emitExpr(body, djIf, fnIx) }
   // A field the receiver's stored row holds flat cannot be null, whatever row a narrowing
   // typed the read at, so the default is dead (D8342).
   if coalFieldStoredFlat(exprIx, lhsIx, fnIx) {
