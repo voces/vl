@@ -13,6 +13,8 @@ import {
 } from "./ast"
 import {
   flatMemberFold,
+  lmChain,
+  lmValTy,
   luAllSpell,
   luChain,
   luDecl,
@@ -62,6 +64,7 @@ import {
   omRecvTy,
 } from "./check_leaf_steps"
 import {
+  lmMembers,
   luMembers,
   luOwnRecv,
   luRecvLowers,
@@ -158,6 +161,66 @@ function luIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
   stmts.push(luChain(ms, 0, recv, idx, elem, ix, n.pos))
   luValueAt(ix, stmts, n.pos)
   checkNodeHook(ix)
+}
+
+// A read at `site` over a union of maps `recvTy` with members `ms`, rewritten in place to an
+// `is` chain of `lmChain` arm `kind` whose value is `res`: the receiver and each of `argNodes`
+// are evaluated once, in order. -1 when a member or `res` has no spelling.
+export function lmReadAt(
+  site: i32,
+  recvNode: i32,
+  recvTy: i32,
+  ms: i32[],
+  kind: i32,
+  prop: string,
+  argNodes: i32[],
+  res: i32,
+  pos: i32,
+): i32 {
+  if inferQuiet { return res }
+  if !luAllSpell(recvTy, ms) || luSpell(res) == "" { return -1 }
+  const recv = "$lu" + i32ToStr(site)
+  const stmts: i32[] = []
+  stmts.push(luDecl("const", recv, recvTy, recvNode, site, pos))
+  const args: string[] = []
+  let i = 0
+  while i < argNodes.length {
+    const an = "$la" + i32ToStr(site) + "_" + i32ToStr(i)
+    stmts.push(luDecl("const", an, -1, argNodes[i], site, pos))
+    args.push(an)
+    i = i + 1
+  }
+  stmts.push(lmChain(ms, 0, recv, kind, prop, args, res, site, pos))
+  luValueAt(site, stmts, pos)
+  checkNodeHook(site)
+}
+
+// `recv[k]` read over a union of maps whose keys agree: the values' union or null, or -1 when
+// `arrTy` is not one. A write is not rewritten, since the value would have to fit every member.
+function lmIndexAt(n: Index, ix: i32, arrTy: i32): i32 {
+  if (luWriteTgt[ix] ?? false) || luOwnRecv(n.idxArr) { return -1 }
+  const ms = lmMembers(arrTy)
+  if ms.length == 0 { return -1 }
+  const m0 = T.tys[ms[0]]
+  if m0 is TyMap {
+    if m0.mSet == 1 { return -1 }
+    const v = lmValTy(ms)
+    if v < 0 { return -1 }
+    const args: i32[] = []
+    args.push(n.idxIndex)
+    return lmReadAt(
+      ix,
+      n.idxArr,
+      arrTy,
+      ms,
+      1,
+      "",
+      args,
+      mkNullableTy(v),
+      n.pos,
+    )
+  }
+  -1
 }
 
 // Extracted from `checkNodeReal`'s `Member` arm (C3: thin the dispatcher).
@@ -258,6 +321,24 @@ function checkMemberUnionTy(n: Member, ix: i32, ot: TyUnion, objTy: i32): i32 {
     }
     const lul = luLengthAt(n, ix, objTy)
     if lul >= 0 { return lul }
+    if !(luWriteTgt[ix] ?? false) && !luOwnRecv(n.memObj) {
+      const lms = lmMembers(objTy)
+      if lms.length > 0 {
+        const none: i32[] = []
+        const lml = lmReadAt(
+          ix,
+          n.memObj,
+          objTy,
+          lms,
+          0,
+          "",
+          none,
+          TY_I32,
+          n.pos,
+        )
+        if lml >= 0 { return lml }
+      }
+    }
   }
   // The field is on some but not all members — unsafe until narrowed to a member that
   // has it. Names the offending member so a reader need not diff a four-arm union by hand.
@@ -398,6 +479,19 @@ export function checkIndexNode(n: Index, ix: i32) {
   // Index trap (B13): a user object declaring `"[]"` handles `o[k]` itself — the key checks
   // against the method's parameter, checked before the native i32-index rule. Write traps use `"[]="`.
   if at is TyObj { return checkIndexTrap(n, at, arrTy, idxTy, ix) }
+  if at is TyUnion {
+    const lmi = lmIndexAt(n, ix, arrTy)
+    if lmi >= 0 { return lmi }
+    if (luWriteTgt[ix] ?? false) && lmMembers(arrTy).length > 0 {
+      tErr(
+        "cannot write through an index of "
+          + tyToStr(arrTy)
+          + ": the value would have to fit every member's value — narrow with `is` first",
+        ix,
+      )
+      return TY_ERR
+    }
+  }
   if !assignable(idxTy, TY_I32) {
     tErr("array index must be i32, got " + tyToStr(idxTy), n.idxIndex)
   } else if tyHasTyVar(idxTy) {
