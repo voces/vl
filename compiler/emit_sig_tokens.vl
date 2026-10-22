@@ -18,9 +18,12 @@ import {
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
 import { nodeTyIsLitUnionAlias, nodeTyIxOf } from "./check_node_tys"
+import { MAP_KEY_I32, MAP_KEY_STR } from "./check_ty_rep"
 import {
   T,
+  TY_I32,
   TY_NEVER,
+  TY_STR,
   TyArray,
   TyErr,
   TyFunc,
@@ -43,12 +46,7 @@ import {
   tySame,
   tyToEmitName,
 } from "./check_types"
-import {
-  rowCanonIdOfName,
-  sFieldTypeAt,
-  sScanLim,
-  structIndexByName,
-} from "./emit_atom_kinds"
+import { sFieldTypeAt, sScanLim, structIndexByName } from "./emit_atom_kinds"
 import {
   PL_READ_UNPLACED,
   annArrowAt,
@@ -112,7 +110,6 @@ import {
 import { paramTypeNode } from "./emit_query"
 import {
   repKindOfSigTok,
-  repNameCanonId,
   repOfTy,
   repRowOfTyStruct,
   repSigSlotTokOfKind,
@@ -140,8 +137,6 @@ import {
   FC_MAP,
   FC_NUL_CLOSURE,
   FC_STR,
-  FC_STRUCT,
-  FC_UNION,
   MfKind,
   VKind,
   emitRootIx,
@@ -153,10 +148,8 @@ import {
   localIsRef,
   localStructIdx,
   sFieldCount,
-  sFieldElemName,
   sFieldNames,
   sFieldStart,
-  sFieldTypes,
   sNames,
   uVariants,
   unTyIx,
@@ -170,7 +163,12 @@ import {
   sFieldIndex,
 } from "./emit_struct_order"
 import { nodeRepIn } from "./emit_ty_canon"
-import { isUNameAnnAB } from "./emit_union_atoms"
+import {
+  isUNameAnnAB,
+  mvDeclRecSlotOfTy,
+  sigRowHasNoArmTwin,
+  sigRowHasNoTwin,
+} from "./emit_union_atoms"
 import {
   isUName,
   unionMemberSetOf,
@@ -949,6 +947,8 @@ export function sigParamTokOfTy(pty: i32): string {
   if nr != "" { return nr }
   const lr = sigDeclRecListTokOfTy(pty)
   if lr != "" { return lr }
+  const mr = sigDeclRecMapTokOfTy(pty)
+  if mr != "" { return mr }
   if sigRecUnionListHasNoTok(pty) { return "" }
   if sigFuncParamIsClosure(pty) || sigFuncParamOfCompositeIsClosure(pty) {
     return repSigTokOfKind("closure")
@@ -1056,6 +1056,24 @@ function sigDeclRecSlotOfTy(ty: i32): i32 {
   si
 }
 
+// The `map` token of a string- or i32-keyed map whose value is a deep declared record, keyed by
+// the slot `mvDeclRecSlotOfTy` finds, or "": the slot the render path would key a twin of,
+// without spelling a record that doubles per level (D9511).
+function sigDeclRecMapTokOfTy(ty: i32): string {
+  if ty < 0 || ty >= T.tys.length { return "" }
+  const t = T.tys[ty]
+  if !(t is TyMap) || t.mSet != 0 { return "" }
+  let keyK = -1
+  if t.mKey == TY_STR { keyK = MAP_KEY_STR }
+  if t.mKey == TY_I32 { keyK = MAP_KEY_I32 }
+  if keyK < 0 { return "" }
+  const si = sigDeclRecSlotOfTy(t.mVal)
+  if si < 0 || !sigRowHasNoTwin(si) || !sigRowHasNoArmTwin(si) { return "" }
+  const sl = mvDeclRecSlotOfTy(t.mVal, keyK)
+  if sl < 0 { return "" }
+  repSigSlotTokOfKind("map", sl)
+}
+
 // The `nulstruct` token of a nullable declared-record type, keyed by that record's row, or "":
 // the answer `annUnionSigKind` gives its `{..} | null` render, without spelling it (D9420).
 // "" when a row of the same field names may render alike, since the render's scan may pick it.
@@ -1099,65 +1117,6 @@ function sigDeclRecListSlotOfTy(ty: i32): i32 {
   const si = sigDeclRecSlotOfTy(base)
   if si < 0 || !sigRowHasNoTwin(si) { return -1 }
   rlSoleSlotOfRecTy(e, si)
-}
-
-// Whether no other scanned row may match the render of row `si`'s record: none has its field
-// names with every nested-record field of `si` compatible, judged as the scan judges it.
-function sigRowHasNoTwin(si: i32): boolean {
-  if si < 0 || si >= sFieldStart.length || si >= sFieldCount.length {
-    return false
-  }
-  const lim = sScanLim()
-  let j = 0
-  while j < lim && j < sFieldCount.length && j < sFieldStart.length {
-    if j != si && sFieldCount[j] == sFieldCount[si] {
-      // A row whose fields are not all appended yet may still become a twin.
-      if sFieldStart[j] + sFieldCount[j] > sFieldNames.length { return false }
-      if sigRowMayMatch(si, j) { return false }
-    }
-    j = j + 1
-  }
-  true
-}
-
-// Whether row `j` has every field name of row `si`, each field possibly matching `si`'s.
-function sigRowMayMatch(si: i32, j: i32): boolean {
-  const start = sFieldStart[si]
-  const cnt = sFieldCount[si]
-  let k = 0
-  while k < cnt {
-    const fi = start + k
-    if fi < 0 || fi >= sFieldNames.length { return true }
-    const fj = sFieldIndex(j, sFieldNames[fi])
-    if fj < 0 { return false }
-    if !sigFieldMayMatch(fi, sFieldStart[j] + fj) { return false }
-    k = k + 1
-  }
-  true
-}
-
-// Whether a render of the field at flat index `fi` may match the field at `fj`: false only
-// for a nested record against a non-record field, or against one of another canonical record.
-function sigFieldMayMatch(fi: i32, fj: i32): boolean {
-  if fi >= sFieldTypes.length || fj < 0 || fj >= sFieldTypes.length {
-    return true
-  }
-  if sFieldTypes[fi] != FC_STRUCT { return true }
-  const cj = sFieldTypes[fj]
-  if cj == FC_UNION { return true }
-  if cj != FC_STRUCT { return false }
-  if fi >= sFieldElemName.length || fj >= sFieldElemName.length { return true }
-  const ki = sigElemCanonId(sFieldElemName[fi])
-  const kj = sigElemCanonId(sFieldElemName[fj])
-  ki < 0 || kj < 0 || ki == kj
-}
-
-// The canonical identity of a nested-record field's recorded element name, or -1.
-function sigElemCanonId(nm: string): i32 {
-  if nm == "" { return -1 }
-  const k = repNameCanonId(nm)
-  if k >= 0 { return k }
-  rowCanonIdOfName(nm)
 }
 
 // Whether `ty` is a list whose element is a bare union of declared records and value scalars:
