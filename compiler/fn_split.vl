@@ -2472,8 +2472,14 @@ function fsHoleKeys(par: i32): string[] {
           } else {
             const q = fsHoleFwd(r)
             const dk = fsFixedDeliveryKey(r, q)
+            const lcs = fsListElemCalls(r)
             if dk != "" {
               if !hasStr(ks, dk) { ks.push(dk) }
+            } else if lcs.length > 0 {
+              for lc in lcs {
+                const lk = fsListElemCallKey(lc)
+                if !hasStr(ks, lk) { ks.push(lk) }
+              }
             } else if q < 0 {
               hsBad = true
               return ks
@@ -2486,6 +2492,66 @@ function fsHoleKeys(par: i32): string[] {
     }
   }
   ks
+}
+
+// The calls of hole read `r`'s element of the un-annotated `const` list it is an element of,
+// when every element reads `r`'s binding, nothing writes it, and every read of the list calls
+// `xs[k]` at a literal index in range, so each call can name the binding directly (D9653);
+// else empty. A list holds its elements, not the binding they are read from.
+function fsListElemCalls(r: i32): i32[] {
+  const none: i32[] = []
+  const l = fsParent[r]
+  if l < 0 || l >= fsParseLen { return none }
+  const ln = P.nodes[l]
+  if !(ln is ArrayLit) { return none }
+  const d = fsParent[l]
+  if d < 0 || d >= fsParseLen { return none }
+  const dn = P.nodes[d]
+  if (
+    !(dn is LetDecl)
+    || dn.letKw != "const"
+    || dn.letType >= 0
+    || dn.letInit != l
+  ) {
+    return none
+  }
+  const h = identDeclOf(r)
+  if h < 0 || fsBindingWritten(h) { return none }
+  let at = ""
+  let j = 0
+  while j < ln.arrElems.length {
+    const e = ln.arrElems[j]
+    if e < 0 || !(P.nodes[e] is Ident) || identDeclOf(e) != h { return none }
+    if e == r { at = i32ToStr(j) }
+    j = j + 1
+  }
+  const out: i32[] = []
+  for x in fsIdents {
+    if identDeclOf(x) == d && x != d {
+      const ix = fsParent[x]
+      if ix < 0 || ix >= fsParseLen { return none }
+      const xn = P.nodes[ix]
+      if !(xn is Index) || xn.idxArr != x { return none }
+      const kn = P.nodes[xn.idxIndex]
+      if !(kn is NumLit) { return none }
+      let k = 0
+      while k < ln.arrElems.length && i32ToStr(k) != kn.numText { k = k + 1 }
+      if k == ln.arrElems.length { return none }
+      const c = fsParent[ix]
+      if c < 0 || c >= fsParseLen { return none }
+      const cn = P.nodes[c]
+      if !(cn is Call) || cn.callFn != ix { return none }
+      if kn.numText == at { out.push(c) }
+    }
+  }
+  out
+}
+
+// The key call `c` of a listed hole calls it at.
+function fsListElemCallKey(c: i32): string {
+  const cn = P.nodes[c]
+  if cn is Call { return fsCallKey(cn, 0) }
+  "!"
 }
 
 // The call key of hole read `r` handed bare to a closed function type, which calls it at that
@@ -2541,9 +2607,18 @@ function fsHoleCopyKeys(r: i32): string[] {
   let ok = true
   for x in fsIdents {
     if identDeclOf(x) == d && ok {
-      // A further copy (`const c = b`) is read at its own binding's key (D6520).
-      let xk = fsHoleCopyKey(x)
-      if xk == "" { xk = fsMemberReadKey(x) }
+      // A further copy (`const c = b`) is read at its own binding's key (D6520), a listed
+      // copy at each key a call through the list takes (D9653).
+      const lcs = fsListElemCalls(x)
+      for lc in lcs {
+        const lk = fsListElemCallKey(lc)
+        if !hasStr(ks, lk) { ks.push(lk) }
+      }
+      let xk = ""
+      if lcs.length == 0 {
+        xk = fsHoleCopyKey(x)
+        if xk == "" { xk = fsMemberReadKey(x) }
+      }
       if xk != "" {
         if xk.slice(0, 2) != "c:" { ok = false }
         else if !hasStr(ks, xk) { ks.push(xk) }
@@ -3209,9 +3284,21 @@ function fsPlanHoleRewrites(): i32 {
           const cks = fsHoleCopyKeys(r)
           const q = fsHoleFwd(r)
           const qi = hsIx(q)
+          const lcs = fsListElemCalls(r)
           // A copy read at two keys is the let plan's, which writes each slot from the
-          // parameter of its key.
-          if cks.length == 1 {
+          // parameter of its key. A listed hole stays its first parameter in the list, and
+          // each call through the list calls its key's parameter instead (D9653).
+          if (
+            lcs.length > 0
+            && cks.length == 0
+            && qi < 0
+            && fsFixedDeliveryKey(r, q) == ""
+          ) {
+            for lc in lcs {
+              pmCall.push(lc)
+              pmName.push(hsSlot(si, fsListElemCallKey(lc)))
+            }
+          } else if cks.length == 1 {
             fsRename(r, hsSlot(si, cks[0]))
           } else if cks.length == 0 && qi >= 0 {
             const names: string[] = []
@@ -3557,9 +3644,16 @@ function fsLaneSet(): i32 {
       if identDeclOf(r) == m {
         const key = fsLaneReadKey(r)
         const hd = hdIx(r)
+        const lcs = fsListElemCalls(r)
         if hd >= 0 {
           for k in hdKeys[hd] {
             if !hasStr(ks, k) { ks.push(k) }
+          }
+        } else if lcs.length > 0 {
+          // A listed binding takes a slot per key a call through the list takes (D9653).
+          for lc in lcs {
+            const lk = fsListElemCallKey(lc)
+            if !hasStr(ks, lk) { ks.push(lk) }
           }
         } else {
           // A delivery into a type that does not fix one instantiation keeps the refusal,
@@ -3703,6 +3797,13 @@ function fsPlanMember(mi: i32): i32 {
             pwValName.push(vn)
           }
           wk = wk + 1
+        }
+      } else if fsListElemCalls(r).length > 0 && hdIx(r) < 0 {
+        // A listed binding stays its first slot in the list, and each call through the
+        // list calls its key's slot instead (D9653).
+        for lc in fsListElemCalls(r) {
+          pmCall.push(lc)
+          pmName.push(laneName(mi, fsListElemCallKey(lc)))
         }
       } else if key != "=" && hdIx(r) < 0 {
         fsRename(r, laneName(mi, key))
