@@ -204,21 +204,22 @@ Deno.test({
   ignore: !ENABLED,
   fn: async () => {
     await withDir(async (dir) => {
-      // D9330's witness at depth 20, the smallest that traps under the null collector: a list
-      // of a record type whose structural spelling doubles per level, which fills the heap.
-      // About 8 s. When D9330 closes, move this to the next open trap under the null collector.
+      // D9390's witness at depth 22, the smallest that traps under the null collector: a
+      // parameter typed as a union of a record whose structural spelling doubles per level,
+      // which outgrows the null collector's largest object. When D9390 closes, move this to
+      // the next open trap under the null collector.
       const lines = ["type A0 = {x: i32}"];
-      for (let i = 1; i <= 20; i++) {
+      for (let i = 1; i <= 22; i++) {
         lines.push(`type A${i} = {l: A${i - 1}, r: A${i - 1}}`);
       }
       lines.push(
-        "function f<T>(u: T | string): boolean { u is string }",
+        "function g(u: A22 | string): i32 { 1 }",
         "const a0: A0 = {x: 1}",
       );
-      for (let i = 1; i <= 20; i++) {
+      for (let i = 1; i <= 22; i++) {
         lines.push(`const a${i}: A${i} = {l: a${i - 1}, r: a${i - 1}}`);
       }
-      lines.push("print(f<A20[]>([a20]))");
+      lines.push("print(g(a22))");
       await Deno.writeTextFile(`${dir}/main.vl`, lines.join("\n") + "\n");
       const r = await vl(
         ["build", `${dir}/main.vl`, "-o", `${dir}/main.wasm`],
@@ -226,13 +227,13 @@ Deno.test({
       );
       if (
         r.code !== 70 || !r.err.includes("vl: compile collector: null ") ||
-        !r.err.includes("filled its 4 GiB heap") ||
+        !r.err.includes("an allocation larger than the GC heap can ever hold") ||
         !r.err.includes(
           "`VL_COMPILE_GC=copying` compiles under a collecting one",
         )
       ) {
         throw new Error(
-          `want exit 70 under null, the heap named full and the escape named, got ${
+          `want exit 70 under null, the oversized allocation and the escape named, got ${
             show(r)
           }`,
         );

@@ -154,6 +154,7 @@ import {
   tyToStr,
   tyToStructStr,
   tyVarRenameRow,
+  tyWrapsRecord,
 } from "./check_types"
 import { blockHasBareReturn, fnResultUnconsumed } from "./check_unconsumed"
 import { collectValuedReturns } from "./check_nj_gate"
@@ -1127,6 +1128,31 @@ function monoArmsNarrowFrom(
   true
 }
 
+// Whether `ty` is a list whose element peels, through lists and nullables, to a record: its
+// render is a brace span suffixed `[]`, or "".
+function monoTyIsListOfRecord(ty: i32): boolean {
+  ty >= 0 && ty < T.tys.length && T.tys[ty] is TyArray && tyWrapsRecord(ty)
+}
+
+// Whether `wide` or one of the arms `unionArmsOf` resolves it to holds a brace: the only
+// spellings a record's render can equal.
+function monoWideArmsHoldBrace(wide: string): boolean {
+  if strContains(wide, "{") { return true }
+  const arms: string[] = []
+  unionArmsOf(wide, arms)
+  for a in arms {
+    if strContains(a, "{") { return true }
+  }
+  false
+}
+
+// The number of arms `unionArmsOf` resolves `wide` to, as `monoArmsNarrowFrom` reads them.
+function monoArmCount(wide: string): i32 {
+  const arms: string[] = []
+  unionArmsOf(wide, arms)
+  arms.length
+}
+
 // Whether arena type `ty` renders with more than one top-level arm: a union or a nullable.
 function monoTyIsUnionShaped(ty: i32): boolean {
   if ty < 0 { return false }
@@ -1158,6 +1184,21 @@ function monoNarrowedPinName(ax: i32, fnIx: i32, wide: string) {
   // A record renders as a brace span, so it can be an arm of `wide` only when `wide` holds a
   // brace; the render doubles with each nested level of a shared shape, so it is skipped (D2780).
   if monoTyIsObj(nt) && !strContains(wide, "{") {
+    return monoNarrowedNominalPinName(nt, "", wide)
+  }
+  // So does a list of records, which no rung below answers unless one of `wide`'s arms is
+  // its brace-holding render (D9330).
+  if monoTyIsListOfRecord(nt) && !monoWideArmsHoldBrace(wide) { return "" }
+  // A nullable record has two arms, so it is a proper arm subset of `wide` only past two arms;
+  // the nominal rung answers it only once its names have matched.
+  if (
+    nt >= 0
+    && T.tys[nt] is TyNullable
+    && tyWrapsRecord(nt)
+    && !monoWideArmsHoldBrace(wide)
+    && monoArmCount(wide) <= 2
+    && !monoNulRecNamesNarrow(nt, wide)
+  ) {
     return monoNarrowedNominalPinName(nt, "", wide)
   }
   const n = tyToEmitName(nt)
@@ -1192,18 +1233,23 @@ function monoNarrowedNominalPinName(nt: i32, n: string, wide: string): string {
 // render `n`, when the record's nominal name and `null` are both arms of `wide`, which the
 // whole-spelling membership test above cannot see (D3099). "" otherwise.
 function monoNarrowedNulRecPinName(nt: i32, n: string, wide: string): string {
-  if nt < 0 { return "" }
+  if !monoNulRecNamesNarrow(nt, wide) { return "" }
+  if monoAnnPinName(n) == n { return n }
+  ""
+}
+
+// Whether `nt` is a nullable record whose nominal name and `null` are both arms of `wide`, and
+// `wide` is not already that nullable (whose ladder answer stands).
+function monoNulRecNamesNarrow(nt: i32, wide: string): boolean {
+  if nt < 0 { return false }
   const t = T.tys[nt]
   if t is TyNullable {
     const inom = nominalStructNameOfTy(t.nInner)
-    if inom == "" { return "" }
-    // `wide` already `Circle | null` is no wider: the ladder's answer stands.
-    if nullablePartOf(wide) == inom { return "" }
-    if !monoNameNarrowsFrom(inom, wide) { return "" }
-    if !monoNameNarrowsFrom("null", wide) { return "" }
-    if monoAnnPinName(n) == n { return n }
+    if inom == "" { return false }
+    if nullablePartOf(wide) == inom { return false }
+    return monoNameNarrowsFrom(inom, wide) && monoNameNarrowsFrom("null", wide)
   }
-  ""
+  false
 }
 
 // The pin of a value union `nt` holding literal arms, read out of the nullable union `wide` with
@@ -1339,10 +1385,16 @@ function monoNicheWidenedPinName(ax: i32, chosen: string): string {
   if nt < 0 { return "" }
   // A record renders with no `null` arm, so it never widens; skipping its render is D2780's.
   if monoTyIsObj(nt) { return "" }
+  // Nor does a list, whose render closes on `[]`; and a nullable record's non-null part is
+  // its brace span, which a `chosen` holding no brace cannot be (D9330).
+  if T.tys[nt] is TyArray { return "" }
+  if tyWrapsRecord(nt) && !strContains(chosen, "{") { return "" }
   const n = tyToEmitName(nt)
   if n == "" { return monoElemlessNulListPinName(nt, chosen) }
   if n == chosen { return "" }
-  if nullablePartOf(n) != chosen { return "" }
+  // `nullablePartOf` answers `n` less five bytes or "", so the length decides first without
+  // scanning a render that doubles per level of a nested record (D9330).
+  if n.length != chosen.length + 5 || nullablePartOf(n) != chosen { return "" }
   if monoAnnPinName(n) != n { return "" }
   n
 }
@@ -1600,6 +1652,8 @@ function monoDeclRecListPinName(ax: i32, w: string): string {
   if ty < 0 || !(T.tys[ty] is TyArray) { return "" }
   const nm = structNameOfTy(tyArrayElemIx(ty))
   if nm == "" || structIndexOfTypeName(nm) < 0 { return "" }
+  // The render is a brace span or "", so a `w` holding no brace is not it (D9330).
+  if w != "" && !strContains(w, "{") { return "" }
   if w != tyToEmitName(ty) { return "" }
   nm + "[]"
 }
@@ -1758,11 +1812,9 @@ function monoArgTyNameRep(ix: i32, fnIx: i32, cax: i32): string {
     if nd is ArrayLit {
       // A nested list literal over a `boolean` leaf: `arrLitElemName`'s nested-list
       // rung has no boolean member, so `[[true]]` pins `i32[][]`. `nodeTyName` renders
-      // the checker's whole array type, which is the pin this site wants.
-      const nlt = nodeTyName(ix)
-      // The arena: two `TyArray` hops answer directly what two grammar cuts over a render
-      // asked. The render is still the pin returned below; only the question moved.
-      if nodeTyNestedElemIsBoolPrim(ix) { return nlt }
+      // the checker's whole array type, which is the pin this site wants; two `TyArray` hops
+      // ask the question, so the render is built only for the pin.
+      if nodeTyNestedElemIsBoolPrim(ix) { return nodeTyName(ix) }
       // A spread copy pins the row it is built at, its source's (D2938).
       const spn = spreadLitSrcRowName(ix, fnIx)
       if spn != "" { return arrElemSuffixed(spn) }
