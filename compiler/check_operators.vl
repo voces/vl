@@ -64,6 +64,7 @@ import {
 } from "./check_core_state"
 import {
   noteBinCstr,
+  noteBinCstrAt,
   noteIsCstr,
   noteLetCstr,
   noteMemCstr,
@@ -189,6 +190,7 @@ import {
 } from "./check_node_rules"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
+  binLitShape,
   binShiftOp,
   f32AdoptingOperand,
   litTreeAdoptDst,
@@ -227,6 +229,7 @@ import {
   joinTys,
   nameToTyAt,
   nhFillLinked,
+  numScalarMixMsg,
   numUnionBinTy,
   opSelfFnKeyFor,
   substTyDeep,
@@ -1096,7 +1099,7 @@ function checkBinCmpTail(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     ) {
       // Mixed numerics may be compared when one side widens to the other; the f32-with-a-literal
       // pair is admitted separately (`cmpF32LitAdopts`) so comparison agrees with arithmetic's `+`.
-      tErr("comparison mixes " + tyToStr(olt) + " and " + tyToStr(ort), ix)
+      tErr(numScalarMixMsg(op, olt, ort), ix)
     }
     return TY_BOOL
   }
@@ -1172,15 +1175,7 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
   // any more (D1586): float remainder now lowers exactly via the `__f64_rem__` intrinsic.
   if binIntOnlyOp(op) {
     if binFloatOperandPair(lt, rt) {
-      tErr(
-        "operator '"
-          + op
-          + "' is integer-only, got "
-          + tyToStr(lt)
-          + " and "
-          + tyToStr(rt),
-        ix,
-      )
+      tErr(numScalarMixMsg(op, lt, rt), ix)
       return TY_ERR
     }
   }
@@ -1208,10 +1203,7 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
       nlAsgTgt = nlCmpdTgt
       nlAsgGot = rt
     }
-    tErr(
-      "operator '" + op + "' mixes " + tyToStr(lt) + " and " + tyToStr(rt),
-      ix,
-    )
+    tErr(numScalarMixMsg(op, lt, rt), ix)
     nlAsgTgt = -1
     return TY_ERR
   }
@@ -1224,12 +1216,21 @@ function checkBinNumTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
 }
 
 // Records the deferred constraint of operator `op` over a hole operand `lt`/`rt` of `n`, whose
-// form cannot be decided until the call binds the hole, and the width each side meets.
-function binNoteHoleCstr(n: BinExpr, op: string, lt: i32, rt: i32) {
-  noteBinCstr(
+// form cannot be decided until the call binds the hole, and the width each side meets. A
+// numeric operator keeps its node `ix`, where the pin asks the direct spelling's pair rule.
+function binNoteHoleCstr(n: BinExpr, ix: i32, op: string, lt: i32, rt: i32) {
+  let node = -1
+  let shape = -1
+  if numUnionOp(op) {
+    node = ix
+    shape = binLitShape(n, ix)
+  }
+  noteBinCstrAt(
     eqCstrOperandTy(op, n.binLeft, lt),
     op,
     eqCstrOperandTy(op, n.binRight, rt),
+    node,
+    shape,
   )
   // Arithmetic's result carries the width to the pin (`mkBinOpRetTy`), where every destination
   // re-asks it, and a comparison's is `boolean`; a compound write stores into the hole (D9620).
@@ -1266,7 +1267,7 @@ function binNomMixRefusal(
 }
 
 // The type of operator `op` over a numeric-union operand `lt`/`rt`. Beside a type parameter
-// the pairs are the pin's to check (`numUnionPinOk`), so the constraint is deferred.
+// the pairs are the pin's to check (`numBinPairRefusal`), so the constraint is deferred.
 function binNumUnionOpTy(
   n: BinExpr,
   ix: i32,
@@ -1275,7 +1276,7 @@ function binNumUnionOpTy(
   rt: i32,
 ): i32 {
   if tyHasTyVar(lt) || tyHasTyVar(rt) {
-    noteBinCstr(lt, op, rt)
+    noteBinCstrAt(lt, op, rt, ix, binLitShape(n, ix))
     if numCmpOp(op) { return TY_BOOL }
     if tyIsNumUnion(lt) { return lt }
     return rt
@@ -1466,7 +1467,7 @@ function checkBinExprNodeReal(n: BinExpr, ix: i32, ltOut: i32[]) {
   // record the deferred constraint (skipping assignment / logical, handled by their own arms).
   if op != "=" && op != "&&" && op != "||" {
     if tyHasHole(lt) || tyHasHole(rt) {
-      binNoteHoleCstr(n, op, lt, rt)
+      binNoteHoleCstr(n, ix, op, lt, rt)
       if lt == TY_I64 || rt == TY_I64 {
         ltOut.push(TY_I64)
       } else if lt == TY_F64 || rt == TY_F64 {
