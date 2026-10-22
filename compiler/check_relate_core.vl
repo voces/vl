@@ -4205,7 +4205,12 @@ export function holeFnReadsSlot(a: i32): boolean {
 // Whether read `r` reads a list element, a map value, a record field or a `for` loop's element.
 function holeIsSlotRead(r: i32): boolean {
   const rn = P.nodes[r]
-  rn is Index || rn is Member || rn is ForIn || rn is Param || cwGetRecv(r) >= 0
+  rn is Index
+    || rn is Member
+    || rn is OptMember
+    || rn is ForIn
+    || rn is Param
+    || cwGetRecv(r) >= 0
 }
 
 // Add to `out` each read of a `let`, list element, record field or `for` element that the
@@ -4239,7 +4244,7 @@ function holeLetReadsOf(a: i32, seen: i32[], out: i32[]) {
     for v in rv { holeLetReadsOf(v, seen, out) }
     return 0
   }
-  if n is Member {
+  if n is Member || n is OptMember {
     out.push(ix)
     return 0
   }
@@ -4341,19 +4346,22 @@ function holeLetJudge(ix: i32, wp: i32[]): boolean {
 // loop `a` binds, every function stored there judged at `wp` against the one stored first
 // (D9060, D9090, D9092).
 function holeSlotJudge(a: i32, wp: i32[]): boolean {
-  const path: string[] = []
+  const p0: string[] = []
   let root = -1
   const an = P.nodes[a]
   if an is ForIn {
-    root = cwSlotPath(an.fiIter, path)
-    path.push("[]")
+    root = cwSlotPath(an.fiIter, p0)
+    p0.push("[]")
   } else if an is Param {
-    root = cwSlotPath(cwElemCallbackRecv(a), path)
-    path.push("[]")
+    root = cwSlotPath(cwElemCallbackRecv(a), p0)
+    p0.push("[]")
   } else {
-    root = cwSlotPath(a, path)
+    root = cwSlotPath(a, p0)
   }
-  if root < 0 || path.length == 0 || !cwFramedNode(root) { return false }
+  if root < 0 || p0.length == 0 || !cwFramedNode(root) { return false }
+  const path: string[] = []
+  root = holeSlotRebase(root, p0, path)
+  if root < 0 || root >= P.nodes.length || !cwFramedNode(root) { return false }
   const rn = P.nodes[root]
   if !(rn is Ident) { return false }
   const fr = covarRootFrame(root)
@@ -4374,6 +4382,32 @@ function holeSlotJudge(a: i32, wp: i32[]): boolean {
   const ats: i32[] = []
   const nW = cwSlotWrittenValues(rn.identName, fr, path, vals, ats)
   holeSlotValsJudge(holeSlotName(rn.identName, path), vals, ats, nW, wp)
+}
+
+// The root of the place `root` and `p0` name, its steps in `out`, followed through each binding
+// bound once to another binding or to an element, value or field read of one:
+// `const r = m.get(k)` makes `r.f` the place `m[].f` (D9370).
+function holeSlotRebase(root: i32, p0: string[], out: string[]): i32 {
+  let ix = root
+  let tail = p0
+  let steps = 0
+  while ix >= 0 && ix < P.nodes.length && steps < 16 {
+    const n = P.nodes[ix]
+    if !(n is Ident) || !cwFramedNode(ix) { break }
+    const fr = covarRootFrame(ix)
+    if fr == CW_FR_UNKNOWN { break }
+    const init = cwBoundInitOf(n.identName, fr)
+    if init < 0 || init >= P.nodes.length { break }
+    const pre: string[] = []
+    const up = cwSlotPath(init, pre)
+    if up < 0 || up == ix { break }
+    for s in tail { pre.push(s) }
+    tail = pre
+    ix = up
+    steps = steps + 1
+  }
+  for s in tail { out.push(s) }
+  ix
 }
 
 // `holeSlotJudge` for argument `v` handed to the parameter `pNm` the slot `path` reads: an
