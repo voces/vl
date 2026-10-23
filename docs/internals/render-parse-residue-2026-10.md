@@ -417,6 +417,37 @@ What each slice changes:
     hand `monoInstanceFor` the pin types the flow table already resolves
     (`fnFlowDeclPathPinTysOf`, `monoPinFnParamTys`). That is a new parameter on all eight
     callers, and no program misbehaves today.
+
+  **The flow table's typed pins, landed (2026-10-23).** The two callers named above were not
+  where the placeholder came from. A probe recorded, at every instance minted for a `=>` pin,
+  whether its parameter type was a closed function type. It showed that the placeholder came
+  from `monoCoerceFnValueName`, which flow-table sites call with `expTy` `-1`:
+  `monoPinListElems`, `monoPinNestedListElems`, `monoPinRecordField` and `monoStoredSlotFnTy`.
+  - Each of those sites now passes `monoPinFnParamTys` of its slot through
+    `monoCoerceFnValueTys`, `monoCoerceWrittenLetTys` and `monoCoerceNamedGenericTys`.
+  - `monoInstanceFor` takes those types (`deliveryTys`) when neither the value nor `expTy`
+    gives a parameter type. The other seven callers pass `[]`.
+  - A sig pin's key now carries the type's canon (`=>ii>i=(i32, i32) => i32`).
+  - `monoReachSlotTy` had read a pinned slot as already typed and returned without typing the
+    callees it reaches. A callee the checker left open now takes the pin. Without that, a hole
+    generic held by a reassigned `let` in a record field, called with a function
+    (`written-let-first-fn-in-record-field-called.vl`), refused at its call.
+
+  The probe ran over 16,619 files before and after. The control,
+  `hof-written-let-in-record-field-called-with-fn.vl`, disagreed before.
+
+  | site | files before: agree / disagree | files after | events after: agree / disagree |
+  | --- | --- | --- | --- |
+  | `monoCoerceFnValueName`'s instance | 0 / 18 | 7 / 11 | 13 / 38 (was 0 / 51) |
+  | call-driven `=>` pin | 216 / 31 | 216 / 31 | 2,015 / 91 (unchanged) |
+  | cell take | 0 / 6 | 0 / 6 | 0 / 21 (unchanged) |
+
+  Left: in the 11 coerce files and the other two rows, the delivered value is itself a hole
+  function, or the slot is called at two types (`hole-fn-if-join-*`,
+  `hole-fn-join-called-at-two-fn-types*`, `hole-fn-list-handed-hole-param`). The pin there has
+  no closed type, so `monoPinFnParamTys` answers `[]`. Typing it needs the delivered hole
+  function's instance type. **Step 1 moved no consumer.** No `=>` pin site has zero
+  disagreement, so the instance's TypeRef text, its key and `rsC` stay on the spelling there.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
