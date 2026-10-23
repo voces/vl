@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect (landed: 4 retired, 13 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -386,9 +386,26 @@ What each slice changes:
     signature. The union-arm pass (13 files) agreed in every file. `exprNulClosure`'s
     `calleeCloRetName` rung is deleted too: it was reached in 1,859 files and in the
     self-compile, and never answered true.
-  - Left: `nameIsNulClosure`. Only `nameFieldCode` (3 files) still holds only a name.
-  - Left, not probed: the niche ladders, the name-grammar tests and the spelling walkers. Their
-    callers hold only a name.
+  - Done: 1 parse. `forceNestedCloSigReps` walked a TypeRef's spelling to reserve the reps a
+    closure field's result and parameters need. `forceNestedCloSigRepsOfTy` walks the
+    TypeRef's arena type instead, and `forceAnnLeafRepsOfTy` reserves each leaf from its type.
+    A probe compared the flags each walk reserves, over the self-compile and 16,864 files. The
+    self-compile reached the gate 0 times; 26 files reached it. The flag sets differed in 6
+    files, and in 2 of them the type reserved a flag not already held. In all 6 the spelling
+    reserved nothing and the type reserved the string backing: generic applications
+    (`Pair<(i32) => i32, …>`, `R<string>`) and a parenthesised function arm whose result is a
+    shape. All 6 build byte-identical modules with the same output. No file had a spelling
+    that reserved where the node had no type. The D1092 fixture is the control that trips it.
+  - Left: `nameIsNulClosure`. `nameFieldCode` was reached in 4,805 files. Where it held a
+    type, the typed answer agreed in every file. It held only a name and answered true in 2
+    (`generic-function-into-nullable-function-slot.vl` and
+    `map-closure-return-nulclosure-field-struct.vl`), so the name leg is live.
+  - Left: `gaePeelWrappers` and `collectGenAliasShapes`. They produce the application spelling
+    `gaeEnsure` keys on, and the arena has no node for a generic application.
+  - Left, not probed: the niche ladders and the name-grammar tests. Their callers hold only a
+    name. `nameIsNulI32List` keeps two such callers, `forceAnnLeafReps` under
+    `forceGenAppArgTypes` and `fieldCodeOfSpelling`. `annRetNameOf` has callers in
+    `emit_mono` (the L1 lane's file).
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
   slot by element type. This turns most of the B key producers into dead code. A probe compared
   the spelling's name with the row that `rlSlotOfTy` keys by the node's element type, at fifteen
