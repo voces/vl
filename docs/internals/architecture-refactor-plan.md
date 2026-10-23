@@ -1231,7 +1231,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Seed 6,724,360 → 6,724,410 bytes (+50) on the pre-rebase base; 6,724,836 after the rebase.
 - **2026-10-21, render-parse in `wasmEmit.vl` and the remaining emitter files: 97 / 250 → 95 / 250.**
   - Two renders are now read from the type:
-    - `coalResultBoxName` asks `valueUnionRenderOfTy(rt)`, the existing reader that returns the render only when it names a value union. This moves the render into a helper, so it is a relocation rather than a removal.
+    - `coalResultBoxName` asks `valueUnionNameOfTy(rt)`, which returns the typed spelling `unionSpellingOfTy` when it names a value union. The render is gone from this reader (D5).
     - `emitCoalesceValUnionIdent` reads the result kind with `valueAtomKindOfTy`, not with `valueAtomKind` over the rendered name.
   - A/B probe for the second site, over the 4,062 corpus files that hold a `??` (`tests/cases`, distilled `cells/` and `named/`):
     - The typed kind decided, and an `emitFail` fired whenever the two answers differed in whether a kind exists or in which kind it is. It fired in 0 files.

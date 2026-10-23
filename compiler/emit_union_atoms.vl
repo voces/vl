@@ -22,6 +22,7 @@ import {
 import {
   MAP_KEY_I64,
   MAP_KEY_STR,
+  canonUnionKeyAtomOfTy,
   isValueUnionName,
   isValueUnionTyOr,
   nameIsLitUnionArmValueUnion,
@@ -41,6 +42,10 @@ import {
   TyUnion,
   TyVar,
   litBaseTy,
+  litUnionAliasNameOfTy,
+  litUnionInlineNameOfTy,
+  mixedLitRunAliasOf,
+  oneStrLitSpelling,
   structNameOfTy,
   tyAt,
   tyDeeperThan,
@@ -947,8 +952,13 @@ export function cloSigSlotTag(slot: i32): i32 {
 // through one arm answers an `is` against another.
 export function cloArmTagOfTy(ty: i32): i32 {
   if ty < 0 { return scalarTagOfKind(11) }
-  cloSigSlotTag(cloSigTagSlot(tyToEmitName(ty)))
+  cloSigSlotTag(cloSigTagSlot(cloSigNameOfTy(ty)))
 }
+
+// The spelling function type `ty` keys its closure-signature slot under, which is also its
+// atom in a value union's name: the structural render, so an alias and its inline spelling
+// meet.
+function cloSigNameOfTy(ty: i32): string { tyToEmitName(ty) }
 
 // `registerValueUnionName` with the caller's arena type for this union, or -1 when the
 // caller has only a name. The row's `unTyIx` entry is that index, so the registry can be
@@ -1013,6 +1023,118 @@ export function valueUnionKeyTextOfTy(ty: i32): string {
   const vu = isValueUnionTyOr(ty)
   if vu == 1 || (vu < 0 && isValueUnionName(text)) { return text }
   ""
+}
+
+// The name a value union `ty` is registered under by spelling: `unionSpellingOfTy` when that
+// spelling is a value union, else "".
+export function valueUnionNameOfTy(ty: i32): string {
+  const text = unionSpellingOfTy(ty, 8)
+  if text == UNION_SPELLING_DECLINE || !isValueUnionName(text) { return "" }
+  text
+}
+
+// `unionSpellingOfTy`'s decline: `ty` is no union, or a member is a hole, a record or a map,
+// none of which a value union holds.
+export const UNION_SPELLING_DECLINE = ""
+
+// The member-order spelling of union `ty`, bare or nullable, built from its members as the
+// emit render spells it: a literal widens to its base, a literal-union alias keeps its name,
+// and a part equal to an earlier one drops (`9000000000 | 1` is `i64|i32`). Declines past
+// `depth` nested unions, as at any member a value union cannot hold.
+export function unionSpellingOfTy(ty: i32, depth: i32): string {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 {
+    return UNION_SPELLING_DECLINE
+  }
+  const t = tyAt(ty)
+  match t {
+    TyUnion => unionMembersSpelling(ty, t.uMembers, depth)
+    TyNullable => nullableSpelling(t.nInner, depth)
+    TyPrim | TyLit | TyObj | TyArray | TyMap | TyFunc | TyVar | TyNeg | TyErr => {
+      UNION_SPELLING_DECLINE
+    }
+  }
+}
+
+// `unionSpellingOfTy` over the members `ms` of union `ty`.
+function unionMembersSpelling(ty: i32, ms: i32[], depth: i32): string {
+  if ms.length == 0 { return UNION_SPELLING_DECLINE }
+  // A pure string-literal union keeps its members only beside `null`.
+  const lui = litUnionInlineNameOfTy(ty)
+  if lui != "" {
+    for m in ms {
+      if isNullTy(m) { return lui + "|null" }
+    }
+  }
+  const rgAlias = mixedLitRunAliasOf(ms)
+  const parts: string[] = []
+  let rgDone = false
+  for m in ms {
+    let s = ""
+    if rgAlias != "" && tyAt(m) is TyLit {
+      if rgDone { continue }
+      rgDone = true
+      s = rgAlias
+    } else {
+      s = unionPartSpelling(m, depth - 1)
+    }
+    if s == UNION_SPELLING_DECLINE { return UNION_SPELLING_DECLINE }
+    let dup = false
+    for p in parts {
+      if p == s { dup = true }
+    }
+    if !dup { parts.push(s) }
+  }
+  let out = parts[0]
+  let k = 1
+  while k < parts.length {
+    out = out + "|" + parts[k]
+    k = k + 1
+  }
+  out
+}
+
+// `T | null` over `inner`, as the render spells it.
+function nullableSpelling(inner: i32, depth: i32): string {
+  if inner < 0 || inner >= T.tys.length { return UNION_SPELLING_DECLINE }
+  const nal = litUnionAliasNameOfTy(inner)
+  if nal != "" { return nal + "|null" }
+  const nlui = litUnionInlineNameOfTy(inner)
+  if nlui != "" { return nlui + "|null" }
+  const one = oneStrLitSpelling(inner)
+  if one != "" { return one + "|null" }
+  const s = unionPartSpelling(inner, depth - 1)
+  if s == UNION_SPELLING_DECLINE { return UNION_SPELLING_DECLINE }
+  s + "|null"
+}
+
+// One member `m` of a union, or a nullable's inner: a nested union spells its own members, a
+// list the key's atom, a function its parenthesized closure-signature spelling.
+function unionPartSpelling(m: i32, depth: i32): string {
+  if m < 0 || m >= T.tys.length || depth <= 0 { return UNION_SPELLING_DECLINE }
+  const al = litUnionAliasNameOfTy(m)
+  if al != "" { return al }
+  const t = tyAt(m)
+  match t {
+    TyPrim => {
+      if t.primName == "never" { return UNION_SPELLING_DECLINE }
+      t.primName
+    }
+    TyLit => {
+      const bt = tyAt(litBaseTy(t))
+      if bt is TyPrim { return bt.primName }
+      UNION_SPELLING_DECLINE
+    }
+    TyUnion => unionMembersSpelling(m, t.uMembers, depth)
+    TyNullable => nullableSpelling(t.nInner, depth)
+    TyArray => canonUnionKeyAtomOfTy(m)
+    TyFunc => {
+      const sig = cloSigNameOfTy(m)
+      if sig == "" { return UNION_SPELLING_DECLINE }
+      "(" + sig + ")"
+    }
+    // A record or a map is no value atom, and a hole has no spelling.
+    TyObj | TyMap | TyVar | TyNeg | TyErr => UNION_SPELLING_DECLINE
+  }
 }
 
 // Marks the per-rep value-box usage flags for every scalar atom of the value union `name`,
