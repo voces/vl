@@ -710,6 +710,34 @@ What each slice changes:
     renders, the mv mint key in `mvShapeOfMapNameTys`, `cloArmTagOfTy`'s render, which the link
     step reads as the `clo:` key, and the two D34 entries. The mv slot stays keyed by spelling,
     so D2's `mvValKindOfName` callers do not move with it.
+  - Banked, nothing retired: the map-value slot's kind questions take the type where the caller
+    holds one. `mvSlotOfValNameFindK`, the entry side of `mvValNamesCompat` and
+    `objMapFieldCompat` pass the value's arena type to `mvValKindOfNameTy`.
+    `funcTypeShapeLowerable` asks `mapTyValKindLowerable` of the field type when the walk has
+    one: 56 reaches, 0 differ, and the spelling leg is reached in no file. `fieldCodeOfSpelling`'s
+    nullable-map arm also reads a node-less caller's `fty`: 26 reaches in 6 files, 0 differ.
+    A probe over the self-compile and 16,763 files compared the spelling and the type at the
+    three `nameIsRefArray` rungs. Lines 447 and 698 agree wherever they are reached (3 and 23
+    files), always with a type. Line 742 disagrees in 8 files, where the spelling is `""`.
+    Switching it there fails 7 of them at run time and traps the compiler on the eighth. All
+    16,500 identity files compile exactly as before.
+  - Plan for the map-value slot.
+    1. The 8 `""` values come first. They are hole-fn and generic-fn lists, which a later arm
+       of the ladder answers today. Find that arm and ask its question of the type ahead of
+       the ref-list rung.
+    2. Pass a type from `mvValNamesCompat`'s row side, which reads
+       `shapeFieldElemName(t, want, -1)`. `sFieldElemTyIx` already banks that type. The side is
+       reached untyped in 268 files, 65 of them at line 742.
+    3. Pin `mvSlotOfMapValNameOrMono`'s untyped callers to `mvValTyIxAt`: 376 files, 80 of
+       them at line 742.
+    4. Thread `fty` through the 4 files where `nameFieldCode` passes -1.
+    5. Find a type for `mvShapeOfValNameArmTyGo` in the 50 files where it mints with
+       `kindTy` -1.
+
+    After steps 2 to 5, nothing calls `mvValKindOfName` without a type. The three rungs,
+    `mapValKindLowerable` and `mvValKindOfName` itself can then go. That retires the D2 entries
+    at 447, 698 and 742 and the A1 entry at 469. Keying `mvValName` by type, and the mint key
+    in `mvShapeOfMapNameTys`, come after that.
 
 **Order.** The five A slices and C4 can start today. C1 waits on L1's bind columns. D1 and D2
 come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam, and D4 lands after D3 and D5.
