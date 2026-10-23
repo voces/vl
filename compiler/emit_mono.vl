@@ -118,6 +118,7 @@ import { uniqueGenericDeclNamed } from "./check_generic_args"
 import {
   T,
   TY_BOOL,
+  TY_F64,
   TY_I32,
   TY_NULL,
   TY_VOID,
@@ -12562,7 +12563,13 @@ function monoInstanceFor(
       } else {
         pinned.push(pinnedNames[j])
       }
-      if j < vty.length { pinTys.push(vty[j]) } else { pinTys.push(-1) }
+      let pt = if j < vty.length { vty[j] } else { -1 }
+      // A hole function's pin is the closed type its `=>` key names, as at a call's argument.
+      if monoPinIsFnSig(pinnedNames[j]) {
+        const ct = monoHoleFnPinTyOf(pt, pinnedNames[j])
+        if ct >= 0 { pt = ct }
+      }
+      pinTys.push(pt)
       j = j + 1
     }
     // The annotation-driven binding path (`const c: (f64,f64)=>f64 = add`) bakes no callback — the
@@ -22883,6 +22890,54 @@ function monoOpenRowPinnedTy(dn: FuncDecl, i: i32, call: i32, arg: i32): i32 {
   mkObjTy(o.objFieldNames, tys)
 }
 
+// The closed function type the `=>` pin `pin` of hole-function argument `ax` in frame `fnIx`
+// keys: the argument's type with its holes in parameter position at one default and in the
+// result at another, each `i32` or `f64` as a hole's rep key has it; -1 when the type is closed
+// or no such fill keys as `pin`.
+function monoHoleFnPinTy(ax: i32, fnIx: i32, pin: string): i32 {
+  if !monoPinIsFnSig(pin) { return -1 }
+  monoHoleFnPinTyOf(monoArgPinTyIx(ax, fnIx), pin)
+}
+
+// The closed function type the `=>` pin `pin` keys for the function type `vt` with holes, as
+// `monoHoleFnPinTy` fills it; -1 when `vt` is closed or no fill keys as `pin`.
+function monoHoleFnPinTyOf(vt: i32, pin: string): i32 {
+  if vt < 0 || vt >= T.tys.length || monoTyClosedFn(vt) { return -1 }
+  const f = tyAt(vt)
+  if !(f is TyFunc) { return -1 }
+  const key = pin.slice(2, pin.length)
+  const fills: i32[] = [TY_I32, TY_F64]
+  for pf in fills {
+    const ps: i32[] = []
+    for p in f.fnParamTypes { ps.push(monoTyFillHoles(p, pf, 8)) }
+    for rf in fills {
+      const r = if f.fnRet == -2 { rf } else { monoTyFillHoles(f.fnRet, rf, 8) }
+      const t = mkFuncTy(ps, r)
+      if monoTyClosedFn(t) && sigKeyOfTy(t) == key { return t }
+    }
+  }
+  -1
+}
+
+// `t` with each type variable at `fill`, through function, list and nullable rows; any other
+// row is kept as it is.
+function monoTyFillHoles(t: i32, fill: i32, depth: i32): i32 {
+  if t < 0 || t >= T.tys.length || depth <= 0 { return t }
+  const r = tyAt(t)
+  match r {
+    TyVar => fill
+    TyArray => mkArrayTy(monoTyFillHoles(r.aElem, fill, depth - 1))
+    TyNullable => mkNullableTy(monoTyFillHoles(r.nInner, fill, depth - 1))
+    TyFunc => {
+      const ps: i32[] = []
+      for p in r.fnParamTypes { ps.push(monoTyFillHoles(p, fill, depth - 1)) }
+      const rr = if r.fnRet == -2 { fill } else { monoTyFillHoles(r.fnRet, fill, depth - 1) }
+      mkFuncTy(ps, rr)
+    }
+    TyMap | TyObj | TyUnion | TyPrim | TyNeg | TyLit | TyErr => t
+  }
+}
+
 // The refusal for a parameter `par` of `callee` no argument pin closes.
 function monoArgTyFail(par: string, callee: string): i32 {
   emitFail(
@@ -23274,6 +23329,8 @@ function monoPinHoleParam(
     an = monoArgPinName(args[i], ctx)
     // An open row keys and rechecks its instance at the types its functions are pinned at.
     if an != "" { anTy = monoOpenRowPinnedTy(fn, i, callIx, args[i]) }
+    // A hole function's `=>` pin is typed at the closed signature its rep key names.
+    if anTy < 0 { anTy = monoHoleFnPinTy(args[i], ctx, an) }
   }
   if an == "" {
     const lamTy: i32[] = [0 - 1]

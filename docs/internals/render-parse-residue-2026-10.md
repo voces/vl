@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function pin typed; 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 7 retired, 14 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -477,7 +477,8 @@ What each slice changes:
   No arena type stands behind that key.
   Typing it needs the hole function's instance keyed by type (D3), or a checker bind of the
   hole at that call. Until then no `=>` pin site has zero disagreement. The TypeRef text, the
-  key, `rsC`, and the member-order and literal-arm rows stay on the spelling.
+  key, `rsC`, and the member-order and literal-arm rows stay on the spelling. D3 has since
+  typed that arm in all but 4 files.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot
@@ -776,6 +777,29 @@ What each slice changes:
     which renders one spelling per instance, for the TypeRef text only. D4's blocker was that
     taking a row found by type under another name changed the instance key. The typed key
     should absorb that, but D4 has not been re-probed against it.
+  - Done: the hole-function pin (the `monoArgPinName` arm of `monoPinHoleParam`) has a type.
+    `monoHoleFnPinTy` fills the argument's holes, `i32` or `f64` in parameter position and
+    in the result, and keeps the closed fill whose `sigKeyOfTy` is the pin's `=>` key.
+    `monoInstanceFor` fills a `=>` pin's open value type the same way. A probe compared each
+    `=>` pin's type before and after, over the self-compile and 16,621 fixture and corpus files.
+    The control was `listed-hole-fn-called-at-two-types.vl`. Counts are files, then events.
+
+    | site | open before | open after | closed after |
+    | --- | --- | --- | --- |
+    | `monoArgPinName` arm | 33 files, 100 events | 4 files, 6 events | 100 files, 869 events |
+    | every `=>` pin `monoPinHoleParam` pushes | 17 files, 67 events (closures only) | 4 files, 6 events | 200 files, 2,576 events |
+    | `monoCoerceFnValueName`'s instance | 6 files, 29 events (closures only) | 1 file, 5 events | 17 files, 59 events |
+
+    difftree `--identity` found 1 differing file:
+    `tests/cases/functions/generic-fn-value-hole-type-param-at-two-types.vl`. Its module is 10
+    bytes smaller, and it prints what it did before.
+  - Left: no `=>` pin site reaches zero, so no consumer moved and no entry retired. Four files
+    still pass an argument whose type is not a function type, so no fill applies. Three are
+    `fn-value-param-copied-into-*` and `generic-fn-value-param-copied-into-*`, where the
+    argument is a parameter typed `F`. The fourth is `hole-field-function-passed-to-hole-param`,
+    whose argument is a hole record's field. In
+    `alias-of-written-let-called-with-hole-function`, `monoInstanceFor` gets no value type at
+    all.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
