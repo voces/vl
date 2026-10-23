@@ -11,6 +11,7 @@ import {
   ForRange,
   FuncDecl,
   Ident,
+  Index,
   LetDecl,
   Member,
   P,
@@ -33,10 +34,18 @@ import {
 import { isReservedIntrinsicName } from "./check_intrinsics"
 import { nodeTyIxOf } from "./check_node_tys"
 import { tyHasTyVar, tyOpenOrTyVar } from "./tyquery"
-import { T, TyArray, TyFunc } from "./check_types"
+import {
+  T,
+  TyArray,
+  TyFunc,
+  TyObj,
+  objFieldType,
+  tyArrayElemIx,
+} from "./check_types"
 import {
   CW_FR_UNKNOWN,
   covarRootFrame,
+  cwBoundInitOf,
   cwFnDeclOf,
   cwFnValueTargets,
   cwFramedNode,
@@ -131,10 +140,54 @@ function argOpenMeetsTyVar(paramTy: i32, argIx: i32): boolean {
       for t in ts {
         if fnOpenMeetsTyVar(pt, t) { return true }
       }
-      return false
+      return tyOpenMeetsTyVar(pt, argCheckedTy(ax, 0))
     }
   }
-  fnOpenMeetsTyVar(pt, d)
+  if fnOpenMeetsTyVar(pt, d) { return true }
+  // A generic read out of a list, a field or a call is open by the type already checked (D10251).
+  !(P.nodes[ax] is Ident) && tyOpenMeetsTyVar(pt, argCheckedTy(ax, 0))
+}
+
+// The type the checker already gave the value `ix` names, read through a binding's initialiser, a
+// list's element and a record's field, or -1.
+function argCheckedTy(ix: i32, depth: i32): i32 {
+  if depth > 8 || ix < 0 || ix >= P.nodes.length { return -1 }
+  const x = cwPeel(ix)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const own = nodeTyIxOf(x)
+  if own >= 0 { return own }
+  const n = P.nodes[x]
+  if n is Ident {
+    if !cwFramedNode(x) { return -1 }
+    const fr = covarRootFrame(x)
+    if fr == CW_FR_UNKNOWN { return -1 }
+    return argCheckedTy(cwBoundInitOf(n.identName, fr), depth + 1)
+  }
+  if n is Index { return tyArrayElemIx(argCheckedTy(n.idxArr, depth + 1)) }
+  if n is Member {
+    const o = argCheckedTy(n.memObj, depth + 1)
+    if o < 0 || o >= T.tys.length { return -1 }
+    const ot = T.tys[o]
+    if ot is TyObj { return objFieldType(ot, n.memProp) }
+    return -1
+  }
+  // Any other node, a call among them, answers only by the type recorded on it.
+  nodeTyIxOf(x)
+}
+
+// Does the function type `at` have a parameter still open at an arrow position of `pt` that
+// carries a type variable?
+function tyOpenMeetsTyVar(pt: TyFunc, at: i32): boolean {
+  if at < 0 || at >= T.tys.length { return false }
+  const ft = T.tys[at]
+  if !(ft is TyFunc) { return false }
+  const pps = pt.fnParamTypes
+  let k = 0
+  while k < ft.fnParamTypes.length && k < pps.length {
+    if tyHasTyVar(pps[k]) && tyHasTyVar(ft.fnParamTypes[k]) { return true }
+    k = k + 1
+  }
+  false
 }
 
 // Does the function declaration `d` have an open parameter at an arrow position of `pt` that
