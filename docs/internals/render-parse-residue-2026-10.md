@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 3 retired, 18 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 4 retired, 17 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -517,9 +517,17 @@ What each slice changes:
     (`i64|i32` with a literal member) and holes. The type-keyed row's name differs more, because
     a row's member order is its first mint's. `ifJoinUnionNameIn` agrees in all 5 files at its
     value-union rung, but its nullable-box fallback returns the render, which no file reaches.
-  - Left: `scanPrintUse` adopts a row by the spelling `{v:i32}|{v:string}|null` in 1 file that
-    the key text does not name. `anonUnionFieldName` and `unionNameOfExpr` agree at the
-    value-union rung, but the record rungs still return the render (17 and 9 files differ).
+  - Done: 1 render. `anonUnionFieldName` names a value-union field by `valueUnionKeyTextOfTy`,
+    which agreed with the render in all 72 file and union pairs that reach it. A record or list
+    field takes the name of the row `unRowOfKey`, `unRowOfCanon` or the softened key finds.
+    difftree `--identity` found 0 of 16,486 files differ. A string field no longer reads as a
+    union where a one-literal string alias registered a row that the set text `string` finds, so
+    it stores the string directly instead of in a box.
+  - Left: `scanPrintUse` adopts a row by the spelling `{v:i32}|{w:string}|null` in 1 file
+    (`as-opt-record-union-field-read.vl`), and the key text does not name it. Readers look that
+    spelling up by name 103 times, and `{v:i32}|{v:string}|null` 119 times. Without the binding,
+    `u.w` refuses. The call retires along with those readers. `unionNameOfExpr` agrees at the
+    value-union rung, but its record rung still returns the render (9 files differ).
   - Left: the atom tests. `isVariantBoxUnionAtoms`, `unionStrArmCountOf` and the uncovered-row
     fallback of `markRefArrayArmsOf` need the spelling where an atom has no arena type (69, 25
     and 1 files). `pushIndexMapComplement` differs at literal-alias members in 4 files (D8120).
