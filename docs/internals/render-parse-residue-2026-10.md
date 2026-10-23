@@ -6,7 +6,8 @@ entries (ten spelling parsers). That count was measured at `c1bcc6474`. L6 is do
 ratchet reaches its floor, and the floor is not zero. A site whose spelling *is* the product stays.
 This document sorts all 311 entries into what stays and what still moves. The rows are in
 [`render-parse-residue-2026-10.jsonl`](render-parse-residue-2026-10.jsonl), one entry per line,
-with the fields `code file line fn callee class group slice reason next text`.
+with the fields `code file line fn callee class group slice reason next text`. A row a slice has
+worked carries a `status` field as well, saying what moved and why the rest stayed.
 
 ## Method
 
@@ -148,6 +149,12 @@ What each slice changes:
   - `genTyParamArr` and `genTyParamNulArr` read the type parameter off the arena;
   - `nulScalarListKind` takes the element type;
   - `rlElemNicheNullable` reads the `rlElemNullable` column.
+
+  Outcome: no parse retired. Three callers moved to their typed twin, and the moves closed D2723.
+  Their sites stay for callers that hold no type. The five `genTyParamArr`/`genTyParamNulArr`
+  rows are class C, because a generic alias parameter is not a `TyVar` in the arena. The
+  `rlElemNicheNullable` twin regressed D4721, so that row stays. Each row's `status` has the
+  probe counts.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it:
   `monoNicheNulListCheck`, `monoModuleLetTyIs`, `monoModuleDupPin`, `monoRetOfClosureCall`,
   `monoPreBindPastUnionRest` and `monoCloPinListAnn`.
