@@ -135,7 +135,7 @@ the slice retires.
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 6 retired, 15 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
-| D7 | narrowing store banks a type (landed: 4 retired, 1 to B and since deleted, 6 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
+| D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
@@ -861,12 +861,43 @@ What each slice changes:
     - The rung is gated to records and lists. Ungated, `tyEqSoftLits` matched a literal test
       (`is "a"`) to its base-scalar member, and the set differed in at least 15 files. Across all other `pushNarrowComplement` callers, the rung
       fires in 0 files.
-  - Left: the producers (`removeAtomFromGo`, `indexElemNulRefArrayName`,
-    `pushIndexNicheNarrow`, `pushIndexMapNullNarrow` and `litElseSurvName`). They write the
-    spelling that the `narrowVariantFor` callers still read.
-    `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74 files,
-    where the complement has no member-set id, and it changes the spelling in 55 of them. `narrowedMapOf`'s render is the mv slot's
-    key, so it goes with D8.
+  - Done: 2 parses. The niche producers stop writing a spelling. `pushIndexNicheNarrow` pushes
+    the marker `NARROW_TYPED` beside the banked peeled type for a nullable ref-array cell and a
+    nullable scalar-list cell, and `indexElemNulRefArrayName` is deleted. Its gate in
+    `refListElemNameOfIndex` tests the slot. Every `narrowVariantFor` reader was classified
+    (below), and no reader of a niche slot needs its text: they test presence, or read the
+    banked type (`narrowedIsRefArray`).
+    - A probe over the self-compile and 16,620 files compared the old spelling with the banked
+      type's rendering, and the old gate with the slot test. The ref-array leg was reached in
+      19 files, the scalar-list leg in 6, and the gate in 224. All three differed in 0, and no
+      reach had a -1 type.
+    - The identity sweep is the instrument that shows the text is unread. With all four typed
+      producers writing a placeholder, 9 files of 16,508 differed. With only the niche
+      producers writing it, 0 differed.
+  - Left: three producers whose text readers still read.
+    - `pushIndexMapNullNarrow`'s render. With a placeholder, 6 files differ. The text is read
+      as a member set: `pushIndexMapComplement`'s `isValueUnionName(cur)`, `pushNarrowLess` over
+      `cur`, and the print readers (`printNarrowKeepsBox`, `printNarrowLiveAtoms`). It moves when
+      the slot banks the union's set id and those readers take `narrowSets` first.
+    - `litElseSurvName`'s render. With a placeholder, 3 files lose their struct row (`field
+      access receiver is not a struct`). The text is a row identity: `variantIndexOf` in
+      `emit_atom_kinds`, `memberIsClosure` and `emitNarrowedMem`. It moves when those ask
+      `variantRowOfTy(narrowSlotTy(i))` first.
+    - `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74
+      files, where the complement has no member-set id, and it changes the spelling in 55 of
+      them.
+  - `narrowedMapOf`'s render is the mv slot's key, so it goes with D8. `emit_mv_slots`' `cnVariant`
+    copies the text too; that file is the shape-row lane's.
+
+  The `narrowVariantFor` readers, by what they need from the slot:
+
+  | Need | Readers |
+  | --- | --- |
+  | presence, or the `null` pin | `indexPlaceNonNull`, `refListElemNameOfIndex`, `nullPinnedKey`, `narrowedToNullKey`, `narrowExcludesNull`, `narrowDropsNull`, `narrowedIsRefArray`, `emit_fn_ret_kinds`, `memIsNarrowed`, `wasmEmit`'s null test |
+  | an atom kind | the four `valueAtomKind(narrowVariantFor(..))` tests in `emit_classify`, the `string` test, `nameIsNulStrList`, `narrowedValueAtomOf` and its closure case |
+  | a row identity | `variantIndexOf` in `emit_atom_kinds`, `memberIsClosure`, `emitNarrowedMem` |
+  | a member set | `currentNarrowSetAt`, `currentStructNarrowSetAt`, `narrowSlotAtomsInto`, `printNarrowKeepsBox`, `printNarrowLiveAtoms`, `indexCellCurSet`, `indexCellCurSlot`, `pushIndexStructComplement`, `pushIndexMapComplement`, `pushIndexMapNullNarrow`, the `narrowIsElse` readers, `forInElemKind`, `njMembersOf`, `njBoxHoldsNull`, `narrowedNicheAtomOf`, `narrowedNulLitAlias` |
+  | real text | none |
 - **D8.** The mv-slot, closure-signature and field-companion tables are keyed by type. The
   `emit_classify` arm mint withholds its type on purpose (D34), so that entry moves only together
   with the ruling that requires it.
@@ -976,8 +1007,6 @@ These were not settled by reading the code. Each needs a probe before its slice 
 - **`refArrElemNameGo` is B, but its key is parsed back.** An uncounted
   `strContains(.., "=>")` in `emit_fns_scans` re-parses the key. That is an A outside the census's
   callee set, and the ratchet cannot see it.
-- **`indexElemNulRefArrayName` (A)** needs an A/B probe against the `rlElemKindTbl` and
-  `rlElemNullable` columns before it switches.
 - **`monoNicheNulListCheck` (A)** assumes the typed binding reaches it. A control has to show
   that.
 - **`unionHasCollapsedStringMapArm` (A)** is dead according to its own comment. Whether it is dead
