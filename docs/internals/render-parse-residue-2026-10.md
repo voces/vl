@@ -806,13 +806,22 @@ What each slice changes:
     - Probe: old and new answers side by side at every moved site, over the self-compile and
       16,762 files, with a control that trips in 2,533. All agree but 7 files, and each of
       those builds the same module bytes and output on the master seed and the candidate.
-    - A shape with a literal-union field, at any record depth, stays on the name path.
-      `jrWantOf` codes the field as the string slot, but a declared row such as
-      `type R = { k: K }` holds the alias as an atom (code 0). So the strict pass took a
-      `{k:string}` row ahead of `R`, and `closures/generic-returned-record-param.vl` trapped
-      with an indirect-call type mismatch.
-    - Left: `mintUnionFieldObjRow`'s test. There the typed scan finds an existing row in 9
-      files where the name finds none, which skips the mint and changes the module in 4.
+    - Done: a shape with a literal-union field takes the typed scan too (`jrHasLitUnionField`
+      is gone). `jrWantOf` codes an alias or lone-literal field as the atom (code 0), as the
+      declared row does, and an inline set as the string slot. A probe over the self-compile and
+      16,880 files found the typed and name answers differ in 7 files, each building the same
+      module bytes and output on the master seed and the candidate.
+      `closures/generic-returned-record-param.vl`, the control, trips with the guard removed
+      and the old coding.
+    - Both scans now refuse, for a string-literal or literal-union field, a code-0 or code-3
+      row whose own field type is known and is neither (`rowFieldTakesLit`). A 36-cell
+      literal-union-field matrix found 12 cells where an inline `{k: K}` or `{k: "z"}` adopted a
+      declared `{k: string}` or `{k: i32}` row (D11030, present on master): 24 to 36 run.
+    - Left, measured: `mintUnionFieldObjRow`'s test. The typed scan answers differently from
+      the name in 12 files and changes the mint decision in 7. Converting it moved
+      `generics/gradual-type-parameter-union.vl` from runs to `field access receiver is not a
+      struct`, and changed the module in 4 more files with the same output. The mint keys the
+      shape interner by spelling, so it waits for rows minted from types.
     - Left: 39 plain `structIndexOfTypeName` and `variantIndexOfTypeName` calls, most holding
       only a spelling (element, member and variant names, shape-text walkers). Not probed:
       `emit_collect`'s function-return rung, which renders a `TyObj` it holds with `tyToStr`,
@@ -928,9 +937,11 @@ What each slice changes:
 
        Partly done (D6, `structIndexOfTypeNameTy`): the callers that hold the shape's type
        moved. The untyped map-value query is now reached in 12 files, down from 262, and not
-       by the self-compile; the 12 are not yet attributed to a caller. A shape with a
-       literal-union field stays on the name path until `jrWantOf` codes an alias field as the
-       declared row does.
+       by the self-compile; the 12 are not yet attributed to a caller. Shapes with a
+       literal-union field moved too (D11030's PR). Untyped `mvValKindOfNameTy` reaches remain
+       in 75 files, so none of C5's spelling tests, D8's map-value rungs, A1's
+       `mapValKindLowerable`, C4's field-code arms or `mvValKindOfName` retire yet;
+       `fieldCodeOfSpelling`'s spelling legs are still reached with no type.
     3. Done: the slot finds pass a type. 8 files still have none, because their caller banked
        no `mvValTyIx`/`rlElemTyIx`.
     4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in

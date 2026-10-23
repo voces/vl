@@ -88,6 +88,7 @@ import {
   aliasNameOfTyIx,
   cUserTypesVer,
   litBaseTy,
+  litUnionAliasNameOfTy,
   structNameOfTy,
   tyArrayElemIx,
   tyAt,
@@ -98,6 +99,7 @@ import {
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
+  tyIsLitUnionOrLit,
   tyIsOneStrLit,
   tyMutEpoch,
   tyNestedArrLeafRenders,
@@ -807,9 +809,7 @@ export function mvValArmOfShape(name: string): i32 {
 // `| null` niche), -1 for none: a record type is matched against the arms by its field types.
 export function mvValArmOfShapeTy(name: string, ty: i32): i32 {
   const ot = nonNullTy(ty)
-  if ot < 0 || !(tyAt(ot) is TyObj) || jrHasLitUnionField(ot, 4) {
-    return mvValArmOfShape(name)
-  }
+  if ot < 0 || !(tyAt(ot) is TyObj) { return mvValArmOfShape(name) }
   if !nameIsWholeSpanShape(name) { return -1 }
   if structIndexOfTypeNameTy(name, ot) >= 0 { return -1 }
   const direct = variantIndexOf(name)
@@ -1508,8 +1508,9 @@ function jrScanK(
 // or -1 for a spelling that ladder does not code.
 function jrWantOf(f: i32): i32 {
   if f < 0 || f >= T.tys.length { return -1 }
-  // A literal union renders its members inline inside a record, the string slot; its list is
-  // the atom list.
+  // A literal union kept as its alias, or a lone string literal, is the atom; an inline set is
+  // the string slot. Its list is the atom list.
+  if jrLitAtomOf(f) != 0 { return FC_I32 }
   if tyIsLitUnion(f) { return FC_STR }
   if tyIsLitUnionArray(f) { return FC_I32_LIST }
   const t = tyAt(f)
@@ -1540,6 +1541,14 @@ function jrWantOf(f: i32): i32 {
       return -1
     }
   }
+}
+
+// How a record renders its string-literal field `f`: 1 as a literal-union alias's name, 2 as one
+// quoted literal, both the atom; 0 for any other type, an inline set among them.
+function jrLitAtomOf(f: i32): i32 {
+  if litUnionAliasNameOfTy(f) != "" { return 1 }
+  if tyIsOneStrLit(f) { return 2 }
+  0
 }
 
 // `jrWantOf` for a nullable or a union: a niche where one member and `null` make one, the box
@@ -1602,6 +1611,7 @@ function jrFieldFits(
   fj: i32,
   lenient: i32,
 ): boolean {
+  if tyIsLitUnionOrLit(f) && !rowFieldTakesLit(si, fj) { return false }
   jrFieldFitsAt(
     f,
     want,
@@ -1610,6 +1620,21 @@ function jrFieldFits(
     sFieldElemTyIxAt(si, fj),
     lenient,
   )
+}
+
+// Whether row `si`'s field `fj` may hold a string-literal or literal-union field: not when the
+// row's own field type is known and is neither, as a declared `{k: string}` or `{k: i32}` is,
+// since that row reads the value at another rep (D11030).
+function rowFieldTakesLit(si: i32, fj: i32): boolean {
+  const code = sFieldTypeAt(si, fj)
+  if code != FC_I32 && code != FC_STR { return true }
+  const rt = sFieldRowTyAt(si, fj)
+  rt < 0 || tyIsLitUnionOrLit(rt)
+}
+
+// Whether field spelling `t` is a string literal or a literal union.
+function nameIsLitSpelling(t: string): boolean {
+  nameIsLitUnionType(t) || nameIsOneStrLit(t)
 }
 
 // `jrFieldFits` against a field given by its code, element name and element type, so a union
@@ -1633,6 +1658,8 @@ function jrFieldFitsAt(
     return true
   }
   if want != code {
+    // An atom field may sit at a row that lays the same literal union out as the string (D1460).
+    if want == FC_I32 && code == FC_STR && jrLitAtomOf(f) != 0 { return true }
     if lenient >= 1 && code == FC_UNION { return true }
     if lenient >= 2 {
       if want == FC_I32 {
@@ -1653,6 +1680,9 @@ function jrFieldFitsAt(
     }
     return false
   }
+  // An alias atom field is only an atom row's: a plain `i32` or `boolean` row reads it back as
+  // a number.
+  if want == FC_I32 && jrLitAtomOf(f) == 1 { return tyIsLitUnion(et) }
   if elem == "" { return true }
   if want == FC_I32 { return !tyIsLitUnion(et) }
   if want == FC_I32_LIST {
@@ -1881,37 +1911,10 @@ export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
   const si = structIndexByName(name)
   if si >= 0 { return si }
   const ot = nonNullTy(ty)
-  if (
-    ot >= 0
-    && nameIsWholeSpanShape(name)
-    && tyAt(ot) is TyObj
-    && !jrHasLitUnionField(ot, 4)
-  ) {
+  if ot >= 0 && nameIsWholeSpanShape(name) && tyAt(ot) is TyObj {
     return joinRowScanOfTyMemo(ot)
   }
   structIndexOfTypeName(name)
-}
-
-// Whether record `ty` has a literal-union field (true past `depth` records deep): the field-set
-// scan codes one as the string slot, which a declared row's atom field never strictly matches.
-function jrHasLitUnionField(ty: i32, depth: i32): boolean {
-  const t = tyAt(ty)
-  if !(t is TyObj) { return false }
-  if depth <= 0 { return true }
-  let k = 0
-  while k < t.objFieldTypes.length {
-    const f = nonNullTy(t.objFieldTypes[k])
-    if (
-      f >= 0
-      && (tyIsLitUnion(f)
-        || tyIsLitUnionArray(f)
-        || jrHasLitUnionField(f, depth - 1))
-    ) {
-      return true
-    }
-    k = k + 1
-  }
-  false
 }
 
 // `joinRowScanOfTy`'s field-set match, each answer stamped by the `tyRegGenNow` read before
@@ -2000,6 +2003,8 @@ function shapeRowScanK(fnames: string[], ftypes: string[], lenient: i32): i32 {
           ok = false
         } else if !declRowFnSpellingFits(ftypes[k], si2, fnames[k]) {
           ok = false
+        } else if nameIsLitSpelling(ftypes[k]) && !rowFieldTakesLit(si2, fj) {
+          ok = false
         }
         k = k + 1
       }
@@ -2085,7 +2090,7 @@ function shapeFieldTypeCompatK(
     // either (D1460): a discriminant can lay out as the string while canon still renders
     // the arm's field as its declared alias (code 0).
     if want == FC_I32 && code == FC_STR {
-      if nameIsLitUnionType(t) || nameIsOneStrLit(t) { return true }
+      if nameIsLitSpelling(t) { return true }
     }
     // The union-box field accepts every atom — the name resolver's half of the leniency
     // `anonValueFitsField` already applies node-side (D461): both answer which struct row a
