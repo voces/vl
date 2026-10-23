@@ -987,7 +987,9 @@ Deno.test({
 });
 
 // Each ingredient is load-bearing: dropping it turns its witness case unsound, and the witness
-// is sound with nothing dropped.
+// is sound with nothing dropped. Top-level lets as exposed (1024) has no witness here: each
+// module's top level is its own init function, so no dependent's code holds a private let's
+// initialiser; the hash keeps it for a program that falls back to one start (s5 doc §21).
 const INGREDIENTS: {
   what: string;
   mask: number;
@@ -1019,11 +1021,6 @@ const INGREDIENTS: {
     witness: "inferred: private type field",
   },
   {
-    what: "top-level lets as exposed",
-    mask: 1024,
-    witness: "private let initialiser edit",
-  },
-  {
     what: "the mentions of a function a cut body calls",
     mask: 2048,
     witness: "private callee writes a narrowed global",
@@ -1041,7 +1038,7 @@ const INGREDIENTS: {
   {
     what: "mentions in cut bodies",
     mask: 16,
-    witness: "annotated body writes a global",
+    witness: "annotated body writes a narrowed global",
   },
   {
     what: "deep hashes",

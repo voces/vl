@@ -1363,6 +1363,28 @@ pooled-string fill and then calls the inits in order.
   `link()` places the inits after the start, in artifact order, and writes the calls back
   into the start before its `end` (`lkWithCalls`). So `rt#0`'s artifact body is the pool
   fill alone.
+- **Names.** With init functions the start is named `__start__`, with no file: the root's
+  init already takes `__start__@<root>:1`, and two functions sharing a name are told apart by
+  a disassembler by function index. A dependent's text then named its own init by that index,
+  which moves when a dependency adds a private function; `tests/vl_iface_hash_test.ts` read
+  this as three unsound hits (a private type, a lambda, a re-exporter's private helper).
+
+**The interface hash.** Two of its mutation witnesses relied on lib's top level running
+inside the root's start, and no longer do:
+
+- **Top-level lets as exposed (mask 1024).** A private let's initialiser now lowers in its
+  own module's init, so no dependent's function holds it. With the ingredient dropped,
+  `private let initialiser edit` stays sound, and so do a private let whose initialiser calls
+  a function writing an exported nullable global the root narrows, and a private let whose
+  string literal the root also uses. That holds when the start is counted as the root's
+  function too. The hash keeps the ingredient, because a program whose windows fall back to
+  the monolithic start still runs a private initialiser in the root's start; the suite lists
+  no mutant for it.
+- **Mentions in cut bodies (mask 16).** Its old witness, `annotated body writes a global`,
+  showed the root's start promoting `counter` to a local while no function wrote it.
+  Promotion is decided per window now, and `counter` is declared in lib's window, so it is
+  never promoted in the root's. The witness is now `annotated body writes a narrowed global`,
+  which the root's checker sees.
 
 **Measured.** Over 4,762 armed tests/cases builds at d78220c61 (the `@run` files plus every
 `modules/**/entry*.vl`), with this step's witness:
