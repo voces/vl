@@ -135,7 +135,7 @@ the slice retires.
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type | 12 | 0 / 0 / 12 | 3 / 9 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
-| D7 | narrowing store banks a type | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
+| D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
@@ -431,6 +431,24 @@ What each slice changes:
   `structIndexOfLet` answer by type. The blocker is `structIndexOfTy` disagreeing with the spelling
   lookup on inline shapes (#4466).
 - **D7.** `narrowVariants` banks a type for multi-member sets, where `narrowSlotTy` is `-1` today.
+
+  No new column was needed for the two sites that moved: the slot's member set already holds the
+  member types. A probe compared the spelling with the type at each reader, over the self-compile
+  and 16,803 fixture and corpus files. Counts are files.
+  - Done: 2 parses. `narrowedNulStructArm` asks `narrowSlotNulArmTy`, the non-null member of an
+    `X | null` slot. It was reached in 769 files and differed in 0. `narrowedRefArrayOf`'s second
+    rung asks `tyIsRefArray` of the banked type. It was reached in 1,180 files and differed in 0.
+    The render it returns is the row's name, so it moves to B.
+  - Left: `narrowedRefArrayOf`'s first rung. In 19 files the slot has no type while its spelling
+    is a ref list (`i32[][][]` cells), and in 4 more the spelling is an alias the type renders
+    differently (`VArr`, `JsonArr`).
+  - Left: `setAtomSpelling`. The struct narrow set's member-set id does not cover the spelling in
+    23 of 87 files, which are generic pins, unions of maps and an alias. In 1 more file, a rolled
+    recursive arm, the typed gate answers differently.
+  - Left, not probed: the producers (`removeAtomFromGo`, `indexElemNulRefArrayName`,
+    `pushIndexNicheNarrow`, `pushIndexMapNullNarrow` and `litElseSurvName`). They write the
+    spelling that the two readers above still read. `narrowedMapOf`'s render is the mv slot's
+    key, so it goes with D8.
 - **D8.** The mv-slot, closure-signature and field-companion tables are keyed by type. The
   `emit_classify` arm mint withholds its type on purpose (D34), so that entry moves only together
   with the ruling that requires it.
