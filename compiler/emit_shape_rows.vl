@@ -990,7 +990,7 @@ export function rlElemInnerSlot(slot: i32): i32 {
   const ar = rlInnerSlotOfElem(slot)
   if ar >= 0 { return ar }
   if slot < 0 || slot >= rlElemName.length { return -1 }
-  rlSlotOfArrName(rlElemName[slot])
+  rlSlotOfArrNameTy(rlElemName[slot], tyRefArrElemOf(rlElemTyIxAt(slot)))
 }
 
 // The struct-table row of a ref-list element — the chokepoint the
@@ -1058,10 +1058,13 @@ export function rlElemNulMapValMvSlot(slot: i32): i32 {
 export function mvValInnerRlSlot(slot: i32): i32 {
   const ar = mvValInnerRlSlotAt(slot)
   if ar >= 0 { return ar }
-  // The fall-through's key hint reads the same `mvValName` cell that feeds `mvValTyIx`,
+  // The fall-through's type hint reads the same `mvValName` cell that feeds `mvValTyIx`,
   // so the arena peel and the name peel are one row and cannot disagree.
   if slot < 0 || slot >= mvValName.length { return -1 }
-  rlSlotOfArrNameTy(mvValName[slot], tyRefArrElemOf(mvValTyIxAt(slot)))
+  rlSlotByNameTy(
+    refArrElemName(mvValName[slot]),
+    tyRefArrElemOf(mvValTyIxAt(slot)),
+  )
 }
 
 // The mv slot of a nested-map value's inner value. Arena first (`mvValTyIx` to the
@@ -4143,47 +4146,38 @@ export function rlElemStoredName(name: string, ty: i32): string {
   c
 }
 
-// The table slot for a ref-list element type name: nominal exact-name match first, then the
-// rep-key scan (`repElemKey`), then the struct-twin fallback, so a struct element spelled
-// differently from the interned key still resolves to the same heap. Niche-nullable and
-// non-null elements never merge, since that would change the read discipline.
+// The table slot for a ref-list element type name with no arena type in hand: the exact
+// stored-name match, then the rep-key scan (`repElemKey`) off the name. There is no
+// struct-twin rung here; a caller that holds the element's type asks `rlSlotByNameTwin`.
 export function rlSlotByName(name: string): i32 {
   rlSlotByNameTyK(name, -1, -1)
 }
 
-// `rlSlotByName` with a key-only hint: the caller's recorded arena type reaches rung 2's
-// `repElemKey` and nothing else — the rendered rung 3 stays laddered, unlike
-// `rlSlotByNameTy`'s full hint, which deletes it. The two differ because `rlSlotByNameTy`
-// asserts the arena leg is total for its caller; a caller without that measurement keeps rung 3.
-export function rlSlotByNameKeyTy(name: string, keyTy: i32): i32 {
-  rlSlotByNameTyK(name, -1, keyTy)
+// `rlSlotByName`'s two name rungs, then `rlSlotOfTyTwin(ty)`: for a caller whose `ty` may be
+// a neighbour of the name's type (an initialiser's literal type beside an annotation's
+// spelling), so the type answers only once the name has missed. An empty name is no element.
+export function rlSlotByNameTwin(name: string, ty: i32): i32 {
+  if name == "" { return -1 }
+  rlSlotByNameTyK(name, ty, -1)
 }
 
-// The ref-list slot of the element of the ref-array spelling `arrName` — `rlSlotByName`
-// of `refArrElemName`. One home for a composition several call sites once wrote by hand.
-export function rlSlotOfArrName(arrName: string): i32 {
-  rlSlotByNameKeyTy(refArrElemName(arrName), -1)
+// The ref-list slot of the element of the ref-array spelling `arrName`, whose arena element
+// type is `elemTy` (`tyRefArrElemOf` of the array's type) or -1 — `rlSlotByNameTwin` of
+// `refArrElemName`.
+export function rlSlotOfArrNameTy(arrName: string, elemTy: i32): i32 {
+  rlSlotByNameTwin(refArrElemName(arrName), elemTy)
 }
 
-// `rlSlotOfArrName` with the caller's arena element type for `arrName`'s element,
-// key-only: `elemTy` is `tyRefArrElemOf` of the array's recorded type, the arena dual of
-// the `refArrElemName` peel this composition performs on the spelling.
-function rlSlotOfArrNameTy(arrName: string, elemTy: i32): i32 {
-  rlSlotByNameKeyTy(refArrElemName(arrName), elemTy)
-}
-
-// `rlSlotByName` with the caller's recorded arena element type as a hint for rungs 2 and 3.
-// Rung 1, the exact-stored-name match, is untouched and still first — a hint must never
-// preempt it. Rung 3 resolves a struct row from a rendered spelling on both sides;
-// `rlSlotOfTyTwin` is its arena dual, and a hinted call skips rung 3 entirely (`ty` -1 keeps it).
+// The table slot for ref-list element name `name` whose arena type is exactly `ty`, or -1:
+// the exact stored-name match first, then the rep-key scan keyed by `ty` (by the name when
+// `ty` is -1), then `rlSlotOfTyTwin`, so a struct element spelled differently from the
+// interned key still resolves to the same heap. Niche-nullable and non-null never merge.
 export function rlSlotByNameTy(name: string, ty: i32): i32 {
   rlSlotByNameTyK(name, ty, ty)
 }
 
-// The shared body of the three entry points above. `ty` is the full hint (rung 3's twin
-// input); `keyTy` is the key hint alone. `rlSlotByNameTy` passes the same index as both;
-// `rlSlotByNameKeyTy` passes -1 as `ty`, so only rung 2 moves.
-function rlSlotByNameTyK(name: string, ty: i32, keyTy: i32): i32 {
+// The shared body: `twinTy` feeds the last rung, `keyTy` the rep-key scan.
+function rlSlotByNameTyK(name: string, twinTy: i32, keyTy: i32): i32 {
   let i = 0
   while i < rlElemName.length {
     if rlElemName[i] == name { return i }
@@ -4195,34 +4189,7 @@ function rlSlotByNameTyK(name: string, ty: i32, keyTy: i32): i32 {
     if rlElemKey[ci] == key { return ci }
     ci = ci + 1
   }
-  const tw = rlSlotOfTyTwin(ty)
-  if tw >= 0 { return tw }
-  // The rendered rung is skipped for a hinted caller: no `nullablePartOf`, no
-  // `structIndexOfTypeName`, no `shapeFieldParse` on this path.
-  if ty >= 0 { return -1 }
-  const qn = nullablePartOf(name)
-  let qBase = name
-  if qn != "" { qBase = qn }
-  const qsi = structIndexOfTypeName(qBase)
-  if qsi < 0 { return -1 }
-  let j = 0
-  while j < rlElemName.length {
-    if rlElemKindTbl[j] == RLK_STRUCT {
-      const en = rlElemName[j]
-      const enn = nullablePartOf(en)
-      let parity = false
-      if qn == "" && enn == "" { parity = true }
-      if qn != "" && enn != "" { parity = true }
-      if parity {
-        let eBase = en
-        if enn != "" { eBase = enn }
-        const esi = structIndexOfTypeName(eBase)
-        if esi >= 0 && repStructSlotsTwin(qsi, esi) == 1 { return j }
-      }
-    }
-    j = j + 1
-  }
-  -1
+  rlSlotOfTyTwin(twinTy)
 }
 
 // The struct table row an arena type resolves to, with the same two-rung shape
@@ -4259,10 +4226,9 @@ function repRowOfTyLenientRow(ty: i32, lim: i32): i32 {
   -1
 }
 
-// The arena dual of `rlSlotByName`'s struct-twin rung: the ref-list slot whose element is
-// a layout twin of the arena type `ty`, with both sides resolved from recorded arena types
-// rather than rendered spellings. The `| null` niche parity the name rung enforces is a
-// `TyNullable` test here. -1 means no arena answer, and the rendered rung runs instead.
+// The ref-list slot whose element is a layout twin of the arena type `ty`, with both sides
+// resolved from recorded arena types rather than rendered spellings. A nullable and a
+// non-null element never twin (`TyNullable` parity). -1 for no twin, or `ty` -1.
 function rlSlotOfTyTwin(ty: i32): i32 {
   if ty < 0 { return -1 }
   if ty >= T.tys.length { return -1 }
@@ -4681,15 +4647,12 @@ export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
 export function variantFieldRefSlot(vi: i32, fi: i32) {
   // D5: the arena leg — the field's recorded element type resolves the slot through the
   // rep key the layer is already interned on; the recorded name is the fall-through for a
-  // row the sidecar does not cover, and for `rlSlotByName`'s struct-twin rung, which has no arena input.
+  // row the sidecar does not cover.
   const ety = uFieldElemTyIxAt(vi, fi)
   const a = rlSlotOfTy(ety)
   if a >= 0 { return a }
   if vi < 0 || vi >= uFieldStart.length { return -1 }
-  // The fall-through's rung 2 reads that same index rather than re-resolving the name beside
-  // it, key-only: the rendered rung below it still answers for a live share of entries here,
-  // so it stays laddered — `sFieldRefSlot`'s stronger `rlSlotByNameTy` claim is not this caller's.
-  rlSlotByNameKeyTy(uFieldElemName[uFieldStart[vi] + fi], ety)
+  rlSlotByNameTy(uFieldElemName[uFieldStart[vi] + fi], ety)
 }
 
 // The ref-list table slot of struct `si`'s ref-list field `fi` — `variantFieldRefSlot`'s

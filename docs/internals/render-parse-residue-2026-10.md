@@ -370,8 +370,8 @@ What each slice changes:
   arm mint passes the arm's type to its fields alone (`internInlineShapeFieldsTy`). Over the
   self-compile, `tests` and the distilled corpus (16,824 files) the typed answer differed in 0
   files at each site, and `shapeFieldElemName`'s literal-union arm retired: 3,746 files agree,
-  and the 96 reached with no type answered false by spelling too. The other 5 stay.
-  - Probed again and still left: 5, over the self-compile, `tests` and the distilled corpus
+  and the 96 reached with no type answered false by spelling too. The other 5 stayed.
+  - Probed again and still left: 3, over the self-compile, `tests` and the distilled corpus
     (16,872 files, counting files; two controls trip every tag):
     - The three field-code arms agree wherever a type came: 0 differing files of 856 (literal
       union), 753 (array) and 1,115 (function). They still reach with no type in 2,663,
@@ -388,11 +388,14 @@ What each slice changes:
       `anonRowServesLeafSet` (23). Also `internShapeAs` (40), `gaeEnsure` (11) and
       `nameFieldCodeTy` called with -1 (62 to 107).
     - `fieldCodeOfSpelling` is the name-only caller that C5 waits on.
-    - Rung 3 of `rlSlotByNameTyK` is reached in 8,087 files and finds the slot in 58, the
-      self-compile among them (`{q: i32}` to `{q:i32}`, `{r:i32}` to `Dot`, `#anon0` to
-      `{x:i32}`). It runs only for an unhinted caller. There are 43 such sites: 37
-      `rlSlotByName`, 3 `rlSlotByNameKeyTy(.., -1)` and 3 `rlSlotOfArrName`, across 11 files
-      and mostly in D1's. It goes when those sites pass the type they hold.
+  - Done: 2 parses, the rendered rung 3 of `rlSlotByNameTyK`. The 35 unhinted call sites
+    pass the element type they hold to `rlSlotByNameTwin`: the two name rungs, then
+    `rlSlotOfTyTwin`. Keying rung 2 by that type instead moved the slot in 80 files, because
+    an initialiser's literal type is not the annotation's. Old and new ladders ran side by
+    side over the self-compile and 16,761 files, and a control that drops the rung tripped in
+    23. Only `annRefListSlot` differs, in 20 files, and all 20 build byte-identical modules.
+    `arrLitFrameLeafRow`'s two scalar-leaf callers stay untyped; the rung never answered a
+    `string[]`, `f64[]` or `i64[]` leaf.
 - **C5.** These name-only gates get a typed caller, or are proved dead and removed:
   - the `nameIsNul*` niche ladders and `annSpelledArray`;
   - the generic-alias test and `inferRetIsLitUnionAt`;

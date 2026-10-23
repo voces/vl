@@ -785,6 +785,7 @@ import {
   rlElemStructRow,
   rlElemVariantRow,
   rlSlotByName,
+  rlSlotByNameTwin,
   sFieldMapShape,
   structIndexOfTypeName,
   structRowOfObjFieldSet,
@@ -1400,7 +1401,7 @@ export function cloRetValSlot(fe: i32) {
       // An inferred ref-list return — its element name (`fRetRArrElem`, set by the
       // return-classify scan) resolves the ref-list slot.
       "reflist" => {
-        return rlSlotByName(fRetRArrElem[fe])
+        return rlSlotByNameTwin(fRetRArrElem[fe], fnRetRArrElemTy(fe))
       }
       // Every other inferred kind carries no slot.
       "i32" | "list" | "str" | "union" | "strlist" | "i64" | "f64" | "f64list" | "f32" | "closure" | "nullist" | "nulstr" | "nulbool" | "nulreflist" | "nulclosure" | "i64list" | "f32list" | "nulstrlist" | "nulf64list" | "nuli64list" | "nulf32list" | "nulu8list" | "nulnone" | "u8list" | "v128" => {}
@@ -2436,7 +2437,9 @@ function nulRefArrayInnerSlot(exprIx: i32, fnIx: i32) {
         fnIx,
         e.callFn,
       )
-      if rn != "" { return rlSlotByName(rn) }
+      if rn != "" {
+        return rlSlotByNameTwin(rn, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
+      }
     }
     // A function-value callee keyed `>R<slot>;` answers the slot its signature carries (D5882).
     const nvk = cloCallSigKey(exprIx, fnIx)
@@ -3723,7 +3726,9 @@ export function fnAssignRetKind(fe: i32): VKind | null {
 export function fnAssignRetSlot(fe: i32) {
   const k = fnAssignRetKind(fe)
   if k == null { return -1 }
-  if k == "reflist" { return rlSlotByName(fnAssignRetElemName(fe)) }
+  if k == "reflist" {
+    return rlSlotByNameTwin(fnAssignRetElemName(fe), fnRetRArrElemTy(fe))
+  }
   // A map cell's slot is its value shape, not a struct index. Naming the kind without the
   // shape points the cell at the mono map, so this arm has to sit beside the `map` and
   // `nulmap` kinds rather than after them.
@@ -17120,11 +17125,13 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   // read's own typed row; any other receiver yields no ref-list element.
   const outer = refListElemNameOfExpr(e.idxArr, fnIx)
   if outer == "" { return "" }
-  const os = rlSlotByName(outer)
+  const os = rlSlotByNameTwin(outer, tyRefArrElemOf(nodeTyInOf(e.idxArr, fnIx)))
   if rlSlotIsKindList(os, RLK_REF_LIST) {
     const ins = rlElemInnerSlot(os)
     if ins >= 0 && ins < rlElemName.length {
-      if rlSlotByName(rlElemName[ins]) == ins { return rlElemName[ins] }
+      if rlSlotByNameTwin(rlElemName[ins], rlElemTyIxAt(ins)) == ins {
+        return rlElemName[ins]
+      }
     }
   }
   const at = nodeTyIxOf(e.idxArr)
@@ -17142,7 +17149,7 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
 // borrow it: every caller tests the result before indexing a backing/wrapper/element table.
 export function refListSlotOfExpr(exprIx: i32, fnIx: i32) {
   const nm = refListElemNameOfExpr(exprIx, fnIx)
-  const s = rlSlotByName(nm)
+  const s = rlSlotByNameTwin(nm, tyRefArrElemOf(nodeTyInOf(exprIx, fnIx)))
   if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "call") }
   if s < 0 {
     if repShadowOn { repABNote("clamp", "refListSlotOfExpr", "CLAMPED") }
@@ -17200,6 +17207,36 @@ export function letRefListElemName(letIx: i32, fnIx: i32) {
   ""
 }
 
+// The arena element type of the name `letRefListElemName` returns, read from the same source:
+// the annotation's element where that names one, else the initializer's at `fnIx`. -1 else.
+export function letRefListElemTy(letIx: i32, fnIx: i32): i32 {
+  if letIx < 0 { return -1 }
+  const d = nodeAt(letIx)
+  if d is LetDecl {
+    if d.letType >= 0 && nodeAt(d.letType) is TypeRef {
+      if annBareRefArrElemName(d.letType) != "" {
+        return tyRefArrElemOf(nodeTyIxOf(d.letType))
+      }
+    }
+    if d.letInit < 0 { return -1 }
+    return tyRefArrElemOf(nodeTyInOf(d.letInit, fnIx))
+  }
+  -1
+}
+
+// The arena element type of list literal `arrIx` inside function `fnIx`, or -1 — the type
+// beside `arrLitElemNameIn`'s name.
+export function arrLitElemTyIn(arrIx: i32, fnIx: i32): i32 {
+  tyRefArrElemOf(nodeTyInOf(arrIx, fnIx))
+}
+
+// The arena element type of function `fe`'s ref-list return, the type beside its
+// `fRetRArrElem` name, or -1.
+export function fnRetRArrElemTy(fe: i32): i32 {
+  if fe < 0 || fe >= fnStmts.length { return -1 }
+  tyRefArrElemOf(rsFnRetTy(fnStmts[fe]))
+}
+
 // The ref-list table slot a ref-list `LetDecl` binds (stored in `localStructIdx` for a
 // code-5 local so `declaredRefArrayName` can recover its element type), or -1.
 export function letRefListSlot(letIx: i32, fnIx: i32) {
@@ -17219,7 +17256,10 @@ export function letRefListSlot(letIx: i32, fnIx: i32) {
   if dsl >= 0 { return dsl }
   const rsl = letRecordListDestSlot(letIx, fnIx)
   if rsl >= 0 { return rsl }
-  rlSlotByName(letRefListElemName(letIx, fnIx))
+  rlSlotByNameTwin(
+    letRefListElemName(letIx, fnIx),
+    letRefListElemTy(letIx, fnIx),
+  )
 }
 
 // The record row a declared destination names for an un-annotated list of object literals
@@ -17240,7 +17280,10 @@ export function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
         if rsIsBuiltRecord(e0) { rsBuiltElemRefuse(letIx, fnIx, ai) }
         return -1
       }
-      const own = rlSlotByName(arrLitElemNameIn(ai, fnIx))
+      const own = rlSlotByNameTwin(
+        arrLitElemNameIn(ai, fnIx),
+        arrLitElemTyIn(ai, fnIx),
+      )
       if !rlSlotIsKindList(own, RLK_STRUCT) { return -1 }
       let dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
       if dst < 0 { dst = rsElemListDestSlot(letIx, fnIx, own) }
@@ -17260,7 +17303,10 @@ export function letRecordListDestSlot(letIx: i32, fnIx: i32): i32 {
 // another record of the same field names: its elements are that other row, and a record is
 // shared rather than converted, so no build of the list serves the destination (D2917).
 function rsBuiltElemRefuse(letIx: i32, fnIx: i32, ai: i32) {
-  const own = rlSlotByName(arrLitElemNameIn(ai, fnIx))
+  const own = rlSlotByNameTwin(
+    arrLitElemNameIn(ai, fnIx),
+    arrLitElemTyIn(ai, fnIx),
+  )
   if !rlSlotIsKindList(own, RLK_STRUCT) { return 0 }
   if !structNamesTwoRows(rsSlotRow(own)) { return 0 }
   const dst = letRefListDestSlotK(letIx, fnIx, RLK_STRUCT)
@@ -18009,7 +18055,10 @@ function rsFieldInitSafe(
     const fi = sFieldIndex(si, f.fiName)
     if fi < 0 { return -2 }
     if list {
-      const slot = rlSlotByName(sFieldElemNameAt(si, fi))
+      const slot = rlSlotByNameTwin(
+        sFieldElemNameAt(si, fi),
+        sFieldElemTyIxAt(si, fi),
+      )
       if !rlSlotIsKindList(slot, RLK_STRUCT) { return -2 }
       if rsSlotIsRow(slot, w) { return -1 }
       return vx
@@ -18316,7 +18365,10 @@ function dsDestSlotAt(i: i32, nm: string, fnIx: i32, want: i32): i32 {
                   if fv.identName == nm {
                     const fi2 = sFieldIndex(dsi, ff.fiName)
                     if fi2 >= 0 {
-                      const rs = rlSlotByName(sFieldElemNameAt(dsi, fi2))
+                      const rs = rlSlotByNameTwin(
+                        sFieldElemNameAt(dsi, fi2),
+                        sFieldElemTyIxAt(dsi, fi2),
+                      )
                       if rlSlotIsKindList(rs, want) { return rs }
                     }
                   }
@@ -21385,7 +21437,7 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
             if si < sTyIx.length { elemTy = sTyIx[si] }
             const aRow = rlSlotOfTy(elemTy)
             if aRow >= 0 { return aRow }
-            return rlSlotByName(sNames[si])
+            return rlSlotByNameTwin(sNames[si], elemTy)
           }
         }
         // A struct-returning closure-value callback: no lifted fe, so the result struct
@@ -21399,7 +21451,7 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
               if csi < sTyIx.length { cElemTy = sTyIx[csi] }
               const cRow = rlSlotOfTy(cElemTy)
               if cRow >= 0 { return cRow }
-              return rlSlotByName(sNames[csi])
+              return rlSlotByNameTwin(sNames[csi], cElemTy)
             }
           }
         }
@@ -21408,18 +21460,20 @@ export function mfResultSlotOf(callIx: i32, fnIx: i32) {
         if fe >= 0 && cloRetValKind(fe) == "variant" {
           const vi = cloRetValSlot(fe)
           if vi >= 0 && vi < uVariants.length {
-            return rlSlotByName(uVariants[vi])
+            let vTy = -1
+            if vi < uVarTyIx.length { vTy = uVarTyIx[vi] }
+            return rlSlotByNameTwin(uVariants[vi], vTy)
           }
         }
         // A UNION-returning `.map`: the result is a ref list of the declared union (all
         // unions share `$uBox`, so the element key is the union alias name).
         if fe >= 0 && cloRetValKind(fe) == "union" && unNames.length > 0 {
           // With no row resolved, the first union's: every union shares one box.
-          const mur = mapUnionResultRow(callIx, fnIx)
-          if mur < 0 || mur >= unNames.length {
-            return rlSlotByName(unNames[0])
-          }
-          return rlSlotByName(unNames[mur])
+          let mur = mapUnionResultRow(callIx, fnIx)
+          if mur < 0 || mur >= unNames.length { mur = 0 }
+          let uTy = -1
+          if mur < unTyIx.length { uTy = unTyIx[mur] }
+          return rlSlotByNameTwin(unNames[mur], uTy)
         }
       }
     }
