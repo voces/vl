@@ -1062,21 +1062,37 @@ What each slice changes:
        | `mvShapeOfMapNodeTy` hole value | 10 | 0 | an unconstrained `Map()` value answers `-3` from `nodeMapValTyIx` < 0; 10 of 10 files agreed with the name answer |
        | `objMapFieldCompat` hole value | 6 | 0 | the same guard answers true; 6 of 6 files agreed |
 
-       Left, by caller, in files untyped (one file can hold two callers):
-       - 12: `shapeFieldTypeCompatK`'s query, a field type cut from shape text (step 2).
-       - 7: `annRetKindTy`'s map arm, reached from `sigRetTokOfTy`. The result type is an
-         index-hook record (`{[]: (i32) => i32}`), not a map. `nameIsBareMap` reads its
-         `{[` spelling as a map, so `tyMapValOfHeld` has nothing to give. Asking the type
-         would change those signature keys; not tried.
-       - 4: `{x: i32}` map arm of a union whose row is uncovered (`emit_classify`'s
-         index-read fallback; `unionMapArmNameTy` gives no member type).
-       - 4: `mvShapeOfValNameRowTy` for a record's function-typed field with a hole row type.
-       - 7: `collectATypeRef`'s interior TypeRefs, which have no arena type. The parent has
-         to supply it.
-       - 2: `fieldCodeOfSpelling`'s `recTy < 0` arm, from `mapValKindLowerable`.
-       - 1: a nested map element (`array-new-generic-pin-element-grid.vl`).
-       - 1: `mvSlotOfValNameFindK` with a mis-cut `mvValName` (`i64}|nul`, in
-         `maps/store-null-nullable-value-map.vl`). Not filed yet.
+       Partly done (map-value producers, second slice): 37 files down to 7, over 16,621
+       files, with the control tripping (98 typed events). difftree --identity: 11,652 built,
+       7 differ, each dropping one unused function type (the `>m` signature key an index-hook
+       record `{"[]": ...}` minted); run output is identical on both seeds. Nothing retires,
+       because the name leg is still reached. By caller tag, files untyped before and after:
+
+       | caller | before | after | how |
+       | --- | --- | --- | --- |
+       | `synthTypeRefTy` pin, through `structIndexOfTypeName` | 7 | 0 | `pinKindOfNameTy` asks the typed row scan |
+       | `paramStructIndexRaw` | 1 | 0 | passes the parameter's node type outside a generic original |
+       | `collectATypeRef` orphaned TypeRefs | 7 | 1 | a node with no arena type mints nothing; its owner's field-table pass mints it |
+       | `annRetKindTy` map arm | 7 | 0 | `annRetIsBareMap` asks `TyMap` of the type, so an index-hook record is not a map |
+       | union map arm, uncovered row (`mapReadMvSlot`) | 4 | 0 | `unionMapArmValTyOf` reads the receiver's own type |
+       | `mvShapeOfValNameRowTy` hole row | 4 | 0 | an empty value name with a hole row answers `-3` |
+       | `mvValInnerMvSlot` on `i64}\|nul` | 1 | 0 | the inner-slot reader peels a nullable map (the former `mvValNulInnerMvSlot`) |
+
+       Left, by file:
+       - `generics/pin-nullable-set-and-literal-map-is.vl`: `collectATypeRef`'s map-name arm
+         with an `i32` value and no node type.
+       - `closures/closure-result-array-of-map-closure-field-structs.vl`,
+         `closures/closure-struct-elem-list-map-fields.vl`: D2's ref-list ladder
+         (`forceCloListTypeOf` → `nameIsRefArray` → `refArrElemNameGo` →
+         `structIndexOfTypeName`).
+       - `generics/anon-record-arg-to-record-pattern.vl`: `monoStructAnnName` (C1's lane).
+       - `literal-unions/coalesce-map-read-joins-atom.vl`: `mintUnionFieldObjRow`. A typed scan
+         there disagreed with the name answer in 12 files; not taken.
+       - `arrays/array-new-generic-pin-element-grid.vl`: `ensureRefElemKindTail` in a mono
+         instance whose fill is a `TyVar` (C1's pin types).
+       - `maps/map-value-layout-twin-heap-merge.vl`: `nameFieldCodeTy` through the arm mint
+         `internInlineShapeFieldsTy(..., -1, aty)`. Passing the field types there disagreed in
+         52 files (`-1` became 16); not taken.
     3. Done: the slot finds pass a type. 8 files still have none, because their caller banked
        no `mvValTyIx`/`rlElemTyIx`.
     4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in
