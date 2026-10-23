@@ -1,7 +1,8 @@
 // The sentinel-index census: the discovery instrument behind `sentinel-index-unguarded` and
 // `sentinel-index-strict-untested` (docs/internals/sentinel-index-lint.md). A hit is a table
-// read `<table>[<idx>]` whose index came from something that answers an in-band "no answer"
-// (a call, or a field the module compares against 0 or -1), with no bound test before it.
+// read `<table>[<idx>]`, or an arena accessor `nodeAt(<idx>)` / `tyAt(<idx>)` standing for
+// one, whose index came from something that answers an in-band "no answer" (a call, or a
+// field the module compares against 0 or -1), with no bound test before it.
 //
 //     vl run scripts/sentinel-census.vl -- [--root DIR] [--limit N] [--code CODE]
 //     vl run scripts/sentinel-census.vl -- [--root DIR] --readers [--hits] | --holes | --tables
@@ -627,19 +628,35 @@ type Read = { col: i32, table: string, idx: string }
 // A byte that may not precede a read's table: a name character, `.`, `]` or `)`.
 function beforeRead(b: i32): boolean { inOperand(b) || b == 93 || b == 41 }
 
-// Every `<t>[<i>]` or `<g>.<t>[<g>.<f>]` subscript read in the line, 0-based column.
+// The arena accessors and the table each reads: `nodeAt(ix)` is `P.nodes[ix]` with its bounds
+// check held in one body, so a call of one counts as a read of that table.
+function accessorTable(name: string): string {
+  if name == "nodeAt" { return "P.nodes" }
+  if name == "tyAt" { return "T.tys" }
+  ""
+}
+
+// Every `<t>[<i>]` or `<g>.<t>[<g>.<f>]` subscript read in the line, and every accessor
+// call `<fn>(<i>)` as a read of its table, 0-based column.
 function reads(s: string): Read[] {
   const out: Read[] = []
   let p = 0
   while p < s.length {
     if isIdStart(s[p]) && !(p > 0 && beforeRead(s[p - 1])) {
       const te = pathEnd(s, p)
-      if at(s, te) == 91 {
+      const open = at(s, te)
+      let table = s.slice(p, te)
+      let close = 93
+      if open == 40 {
+        table = accessorTable(table)
+        close = 41
+      }
+      if (open == 91 || open == 40) && table != "" {
         const j = skipSp(s, te + 1)
         const ie = pathEnd(s, j)
         const k = skipSp(s, ie)
-        if ie > j && at(s, k) == 93 {
-          out.push({ col: p, table: s.slice(p, te), idx: s.slice(j, ie) })
+        if ie > j && at(s, k) == close {
+          out.push({ col: p, table: table, idx: s.slice(j, ie) })
           p = k + 1
           continue
         }

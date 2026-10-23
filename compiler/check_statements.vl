@@ -13,7 +13,6 @@ import {
   LetDecl,
   Node,
   OptMember,
-  P,
   Paren,
   RetStmt,
   TypeRef,
@@ -34,6 +33,7 @@ import {
   mkMember,
   mkNum,
   mkWhile,
+  nodeAt,
   stmtAlwaysExits,
   tsText,
   valueIfAdd,
@@ -278,6 +278,7 @@ import {
   TyUnion,
   TyVar,
   mkNullableTy,
+  tyAt,
   tyHasHole,
   tyIsHole,
   tyIsStructBearingUnion,
@@ -311,7 +312,7 @@ function letDeclResolveAnnot(n: LetDecl): LetAnnot {
   // Read immediately after resolution and compared against THIS annotation's own answer.
   let annotCollapsedHere = false
   if n.letType >= 0 {
-    const tn = P.nodes[n.letType]
+    const tn = nodeAt(n.letType)
     if tn is TypeRef {
       // A binding the list-union rewrite minted is typed as the rewrite typed it, since a
       // written `T[] | i32[]` resolves to one list (D2876).
@@ -386,9 +387,9 @@ function letDeclMarkCollapsed(n: LetDecl, annotCollapsedHere: boolean) {
   if annotCollapsedHere {
     markCollapsedBinding(n.letName)
   } else if n.letType < 0 && n.letInit >= 0 {
-    const cInit = P.nodes[n.letInit]
+    const cInit = nodeAt(n.letInit)
     if cInit is Call && cInit.callFn >= 0 {
-      const cFn = P.nodes[cInit.callFn]
+      const cFn = nodeAt(cInit.callFn)
       if cFn is Ident {
         const cDecl = fnDeclIx[cFn.identName] ?? lookupFnDeclNode(cFn.identName)
         if fnRetCollapsed(cDecl) { markCollapsedBinding(n.letName) }
@@ -403,7 +404,7 @@ function letDeclMarkCollapsed(n: LetDecl, annotCollapsedHere: boolean) {
 // a binding that aliases one, is the whole rung: a copy of an alias owns what it owns (D5160).
 function letDeclNoteFnAlias(n: LetDecl) {
   if n.letInit >= 0 {
-    const aInit = P.nodes[parenPeelIx(n.letInit)]
+    const aInit = nodeAt(parenPeelIx(n.letInit))
     if aInit is Ident {
       let aDecl = fnDeclIx[aInit.identName] ?? lookupFnDeclNode(aInit.identName)
       if aDecl < 0 { aDecl = lookupFnAliasNode(aInit.identName) }
@@ -440,7 +441,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
     const lp = cwPeel(n.letInit)
     if lp >= 0 {
-      const li = P.nodes[lp]
+      const li = nodeAt(lp)
       if li is IfStmt { letJoinCandidates.push(ix) }
       if li is BinExpr {
         if li.binOp == "??" { letJoinCandidates.push(ix) }
@@ -457,7 +458,7 @@ export function checkLetDeclNodeIn(n: LetDecl, ix: i32) {
   // An un-annotated binding to a bare lambda: mark it so its un-annotated params type as
   // inference holes rather than being rejected as uninferable.
   if annot < 0 && n.letInit >= 0 {
-    const liN = P.nodes[n.letInit]
+    const liN = nodeAt(n.letInit)
     if liN is FuncDecl {
       if liN.fnName == "" { noteValBindLambda(n.letInit) }
     }
@@ -631,12 +632,12 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
   // emitter. Gated to if-expr/`?.` inits only — rendering via `tyToStr` is costly on the hot path.
   let initIf = n.letInit
   if initIf >= 0 {
-    const ini0 = P.nodes[initIf]
+    const ini0 = nodeAt(initIf)
     if ini0 is Paren { initIf = ini0.parInner }
   }
   let isIfInit = false
   if initIf >= 0 {
-    const ini1 = P.nodes[initIf]
+    const ini1 = nodeAt(initIf)
     if ini1 is IfStmt { isIfInit = true }
     // A standalone optional chain (`const t = a?.w`) is the other init shape whose union the
     // emitter can learn about from nowhere else — as rare as an if-expression init.
@@ -648,7 +649,7 @@ function letDeclInferredBound(n: LetDecl, ix: i32, initTy: i32): i32 {
     // …and an optional CALL (`const t = p?.f()`), whose `| null` comes from the guard and
     // so appears in neither the callee's type nor the call's own spelling (D1814).
     if ini1 is Call && ini1.callFn >= 0 {
-      const iniCallee = P.nodes[ini1.callFn]
+      const iniCallee = nodeAt(ini1.callFn)
       if iniCallee is OptMember { isIfInit = true }
     }
   }
@@ -688,7 +689,7 @@ export function checkIfStmtNode(ix: i32) {
   let cur = ix
   let elseRes = TY_VOID
   while cur >= 0 {
-    const c = P.nodes[cur]
+    const c = nodeAt(cur)
     const at = cur
     cur = -1
     if c is IfStmt {
@@ -696,7 +697,7 @@ export function checkIfStmtNode(ix: i32) {
       // A discarded chain discards every link and arm under it.
       if c.ifElse >= 0 && valDiscarded(at) { markValDiscard(c.ifElse) }
       if c.ifElse >= 0 {
-        if P.nodes[c.ifElse] is IfStmt {
+        if nodeAt(c.ifElse) is IfStmt {
           // `checkNode`'s entry for the inner link; an `if` is a tail-spine node.
           savedTails.push(retTailPos)
           cur = c.ifElse
@@ -747,7 +748,7 @@ function ifNoteGuardAlts(
     if !isPathKey(tnNames[ai]) {
       const curIx = lookup(tnNames[ai])
       if curIx >= 0 {
-        const cur = T.tys[curIx]
+        const cur = tyAt(curIx)
         if cur is TyVar {
           const row = noteHoleAlt(curIx, cur.tvName, tnTys[ai])
           if row >= 0 {
@@ -805,7 +806,7 @@ function ifEnterElseArm(
   }
   // An `else if` chain: the else node's VALUE is its own branch join, since `blockTailTy`
   // holds only the innermost block's tail and under-joins a mixed chain.
-  const enElse = P.nodes[n.ifElse]
+  const enElse = nodeAt(n.ifElse)
   // A chain link post-narrows the PARENT's fall-through, not its own — marked so its own
   // `checkIfStmtNode` banks into `pgUpKeys` instead of a scope that is about to be popped.
   if enElse is IfStmt { pgUpArmIxSet(n.ifElse) }
@@ -1042,7 +1043,7 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
   const vDecl = luDecl("let", n.fiVar, elem, val, ix, pos)
   luDeclPosPut(vDecl, n.fiIter)
   loop.push(vDecl)
-  const bn = P.nodes[n.fiBody]
+  const bn = nodeAt(n.fiBody)
   if bn is Block {
     let i = 0
     while i < bn.blkStmts.length {
@@ -1073,7 +1074,7 @@ function luForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[], elem: i32): i32 {
 // reads `.values()` at the key's position: `{ const $lm = recv; const $lv = $lm.values();
 // for k, $lj in $lm.keys() { let v: V = $lv[$lj]; body } }`. -1 when a type has no spelling.
 function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
-  const m0 = T.tys[ms[0]]
+  const m0 = tyAt(ms[0])
   if !(m0 is TyMap) || !luAllSpell(iterTy, ms) { return -1 }
   const pos = n.pos
   const none: i32[] = []
@@ -1112,7 +1113,7 @@ function lmForInAt(n: ForIn, ix: i32, iterTy: i32, ms: i32[]): i32 {
   const vDecl = luDecl("let", n.fiVar2, val, rd, ix, pos)
   luDeclPosPut(vDecl, n.fiIter)
   loop.push(vDecl)
-  const bn = P.nodes[n.fiBody]
+  const bn = nodeAt(n.fiBody)
   if bn is Block {
     for s in bn.blkStmts { loop.push(s) }
   } else {
@@ -1272,7 +1273,7 @@ export function checkForInNode(n: ForIn, ix: i32) {
   if iterTy >= 0 { iterTy = strLitRecvTy(iterTy) }
   let elemTy = forInBindTy(iterTy, false)
   let elem2Ty = forInBindTy(iterTy, true)
-  const it = T.tys[iterTy]
+  const it = tyAt(iterTy)
   let luMs = luMembers(iterTy)
   if !luRecvLowers(n.fiIter, luMs) { luMs = [] }
   const luElem = if luMs.length > 0 { luElemTy(luMs) } else { -1 }
@@ -1288,7 +1289,7 @@ export function checkForInNode(n: ForIn, ix: i32) {
   if luElem < 0 && it is TyUnion { lmMs = lmMembers(iterTy) }
   if !luRecvLowers(n.fiIter, lmMs) { lmMs = [] }
   if lmMs.length > 0 {
-    const lm0 = T.tys[lmMs[0]]
+    const lm0 = tyAt(lmMs[0])
     if !(lm0 is TyMap) {
       lmMs = []
     } else if !inferQuiet {
@@ -1534,7 +1535,7 @@ export function checkBlockNode(n: Block, ix: i32) {
       } else {
         // An if-expression tail IS the block's value even though `IfStmt` is otherwise a
         // statement node — non-void only for a genuine value-`if` with an else.
-        const lastN2 = P.nodes[stmts[i]]
+        const lastN2 = nodeAt(stmts[i])
         if lastN2 is IfStmt {
           // A discarded tail keeps its value here, typed on no node, for an enclosing arm's join.
           const ity = discardedValTyOf(stmts[i], sty)

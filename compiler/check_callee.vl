@@ -50,6 +50,7 @@ import {
   elseIfLink,
   i32ToStr,
   isBinOpFuncName,
+  nodeAt,
   nodeSpineChildren,
   ufcsAliasAtSite,
 } from "./ast"
@@ -73,6 +74,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  tyAt,
 } from "./check_types"
 import {
   CW_FR_UNKNOWN,
@@ -142,7 +144,7 @@ let weFnDecls: {[string]: i32} = Map()
 // included, or -1.
 function findFnDeclWalk(rootIx: i32, name: string) {
   if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
-  const n = P.nodes[rootIx]
+  const n = nodeAt(rootIx)
   if n is FuncDecl {
     if n.fnName == name { return rootIx }
   }
@@ -167,7 +169,7 @@ function findFnDeclWalk(rootIx: i32, name: string) {
 export function callArgPlaces(cn: Call, callIx: i32) {
   const out: i32[] = []
   if cn.callFn >= 0 {
-    const cf = P.nodes[cn.callFn]
+    const cf = nodeAt(cn.callFn)
     if cf is Member {
       if callDeclFnIx(cn, callIx) >= 0 { out.push(cf.memObj) }
     }
@@ -197,12 +199,12 @@ export function recvTyOf(ix: i32): i32 {
   const t = nodeTyOf(ix)
   if t >= 0 || cbPendNames.length == 0 { return t }
   let px = ix
-  while px >= 0 && px < P.nodes.length && P.nodes[px] is Paren {
-    const pn = P.nodes[px]
+  while px >= 0 && px < P.nodes.length && nodeAt(px) is Paren {
+    const pn = nodeAt(px)
     if pn is Paren { px = pn.parInner }
   }
   if px < 0 || px >= P.nodes.length { return -1 }
-  const n = P.nodes[px]
+  const n = nodeAt(px)
   if n is Ident {
     const j = strListIndexOf(cbPendNames, n.identName)
     if j >= 0 { return cbPendTys[j] }
@@ -216,7 +218,7 @@ export function recvTyOf(ix: i32): i32 {
 // `-2` is an intrinsic, which writes no field of an object handed to it.
 export function callDeclFnIx(cn: Call, callIx: i32) {
   if cn.callFn < 0 { return -1 }
-  const cf = P.nodes[cn.callFn]
+  const cf = nodeAt(cn.callFn)
   match cf {
     Ident => {
       const d = lookupFnDeclNode(cf.identName)
@@ -264,7 +266,7 @@ export function callDeclFnIx(cn: Call, callIx: i32) {
 // which every caller reads as the opaque -1 (D5017).
 export function callFnValueDecls(cn: Call): i32[] {
   if cn.callFn < 0 || cn.callFn >= P.nodes.length { return [] }
-  const cf = P.nodes[cn.callFn]
+  const cf = nodeAt(cn.callFn)
   if !(cf is Ident) { return [] }
   const fr = covarRootFrame(cn.callFn)
   if !cwFramedNode(cn.callFn) || fr == CW_FR_UNKNOWN { return [] }
@@ -279,7 +281,7 @@ function memberCalleeKind(cf: Member) {
   if rt < 0 {
     return -1 // receiver type unresolved → fail closed
   }
-  const t = T.tys[rt]
+  const t = tyAt(rt)
   // A record or a collection has no other built-in method, so one not resolved above is a
   // `self`-function this reading cannot see: opaque.
   if t is TyObj || t is TyArray || t is TyMap { return -1 }
@@ -318,7 +320,7 @@ export function opSiteArgs(ix: i32): i32[] {
 // The receiver and subscript of an index read `p[i]`.
 function opIndexReadArgs(ix: i32): i32[] {
   const out: i32[] = []
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is Index {
     out.push(n.idxArr)
     out.push(n.idxIndex)
@@ -329,10 +331,10 @@ function opIndexReadArgs(ix: i32): i32[] {
 // The operands of `a op b`, or the receiver, subscript and value of `p[i] = x`.
 function opBinSiteArgs(ix: i32): i32[] {
   const out: i32[] = []
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is BinExpr {
     if n.binOp == "=" {
-      const t = P.nodes[n.binLeft]
+      const t = nodeAt(n.binLeft)
       if t is Index {
         out.push(t.idxArr)
         out.push(t.idxIndex)
@@ -381,7 +383,7 @@ export function opSiteDecls(ix: i32): i32[] {
 function opRecvBuiltinIndexed(ix: i32): boolean {
   const t = opIndexRecvTy(ix)
   if t < 0 || t >= T.tys.length { return false }
-  const r = T.tys[t]
+  const r = tyAt(t)
   if r is TyArray || r is TyMap { return true }
   r is TyPrim && r.primName == "string"
 }
@@ -417,7 +419,7 @@ export function crIsDispatchSite(ix: i32): boolean {
 // `get` are a map surface a set must not leak, and `add` a set surface a map must not.
 export function mapMethodNames(recvTy: i32) {
   const out = ["has", "delete", "clear", "keys", "values", "length"]
-  const rt = T.tys[recvTy]
+  const rt = tyAt(recvTy)
   if rt is TyMap {
     if rt.mSet == 0 {
       out.push("set")
@@ -436,7 +438,7 @@ export function builtinMethodNamesOf(recvTy: i32): string[] {
   if recvTy < 0 { return noMethodNames }
   const ix = nomErasedTyIx(recvTy)
   if ix < 0 || ix >= T.tys.length { return noMethodNames }
-  const t = T.tys[ix]
+  const t = tyAt(ix)
   match t {
     TyArray => {
       return listMethodNames
@@ -533,10 +535,10 @@ export function calleeReset() {
 // The callee's written name, for the diagnostic. `"?"` when the callee is neither a
 // bare name nor a member access (a parenthesised or computed callee).
 export function calleeNameOf(callIx: i32) {
-  const cn = P.nodes[callIx]
+  const cn = nodeAt(callIx)
   if cn is Call {
     if cn.callFn < 0 { return "?" }
-    const cf = P.nodes[cn.callFn]
+    const cf = nodeAt(cn.callFn)
     match cf {
       Ident => {
         return cf.identName

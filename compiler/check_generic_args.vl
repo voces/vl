@@ -24,6 +24,7 @@ import {
   callTyArgsAny,
   callTyArgsOf,
   mkTypeRef,
+  nodeAt,
   nodeChildren,
   tsKidCount,
   tsKidStart,
@@ -41,6 +42,7 @@ import {
   TyObj,
   objFieldType,
   tyArrayElemIx,
+  tyAt,
 } from "./check_types"
 import {
   CW_FR_UNKNOWN,
@@ -73,11 +75,11 @@ export function fsbOwnerCallee(o: i32): i32 {
 // it is pinned per boundary and no parked demand may be re-asked against another's pin.
 export function argIsOwnGenericFnValue(argIx: i32): boolean {
   if argIx < 0 || argIx >= P.nodes.length { return false }
-  const a = P.nodes[argIx]
+  const a = nodeAt(argIx)
   if a is Ident {
     const d = fnDeclIx[a.identName] ?? CSTR_NODECL
     if d >= 0 && d < P.nodes.length {
-      const fd = P.nodes[d]
+      const fd = nodeAt(d)
       if fd is FuncDecl { return fd.fnTyParams.length > 0 }
     }
   }
@@ -117,20 +119,20 @@ function argOpenMeetsTyVar(paramTy: i32, argIx: i32): boolean {
   const ax = cwPeel(argIx)
   if ax < 0 || ax >= P.nodes.length { return false }
   // A list literal is such an argument when one of its elements is, at the element type (D10204).
-  const pa = T.tys[paramTy]
-  const la = P.nodes[ax]
+  const pa = tyAt(paramTy)
+  const la = nodeAt(ax)
   if pa is TyArray && la is ArrayLit {
     for el in la.arrElems {
       if argOpenMeetsTyVar(pa.aElem, el) { return true }
     }
     return false
   }
-  const pt = T.tys[paramTy]
+  const pt = tyAt(paramTy)
   if !(pt is TyFunc) { return false }
   // A name resolves to its declaration, or to the function a binding holds (D8981), or to each a
   // re-pointed `let` may hold (D9001); any other node is its own candidate.
   let d = ax
-  const a = P.nodes[ax]
+  const a = nodeAt(ax)
   if a is Ident {
     d = cwHeldFnOf(ax)
     if d < 0 && cwFramedNode(ax) {
@@ -145,7 +147,7 @@ function argOpenMeetsTyVar(paramTy: i32, argIx: i32): boolean {
   }
   if fnOpenMeetsTyVar(pt, d) { return true }
   // A generic read out of a list, a field or a call is open by the type already checked (D10251).
-  !(P.nodes[ax] is Ident) && tyOpenMeetsTyVar(pt, argCheckedTy(ax, 0))
+  !(nodeAt(ax) is Ident) && tyOpenMeetsTyVar(pt, argCheckedTy(ax, 0))
 }
 
 // The type the checker already gave the value `ix` names, read through a binding's initialiser, a
@@ -156,7 +158,7 @@ function argCheckedTy(ix: i32, depth: i32): i32 {
   if x < 0 || x >= P.nodes.length { return -1 }
   const own = nodeTyIxOf(x)
   if own >= 0 { return own }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if n is Ident {
     if !cwFramedNode(x) { return -1 }
     const fr = covarRootFrame(x)
@@ -167,7 +169,7 @@ function argCheckedTy(ix: i32, depth: i32): i32 {
   if n is Member {
     const o = argCheckedTy(n.memObj, depth + 1)
     if o < 0 || o >= T.tys.length { return -1 }
-    const ot = T.tys[o]
+    const ot = tyAt(o)
     if ot is TyObj { return objFieldType(ot, n.memProp) }
     return -1
   }
@@ -179,7 +181,7 @@ function argCheckedTy(ix: i32, depth: i32): i32 {
 // carries a type variable?
 function tyOpenMeetsTyVar(pt: TyFunc, at: i32): boolean {
   if at < 0 || at >= T.tys.length { return false }
-  const ft = T.tys[at]
+  const ft = tyAt(at)
   if !(ft is TyFunc) { return false }
   const pps = pt.fnParamTypes
   let k = 0
@@ -194,13 +196,13 @@ function tyOpenMeetsTyVar(pt: TyFunc, at: i32): boolean {
 // carries a type variable?
 function fnOpenMeetsTyVar(pt: TyFunc, d: i32): boolean {
   if d < 0 || d >= P.nodes.length { return false }
-  const fd = P.nodes[d]
+  const fd = nodeAt(d)
   if !(fd is FuncDecl) { return false }
   const generic = fd.fnTyParams.length > 0
   const pps = pt.fnParamTypes
   let k = 0
   while k < fd.fnParams.length && k < pps.length {
-    const p = P.nodes[fd.fnParams[k]]
+    const p = nodeAt(fd.fnParams[k])
     if p is Param {
       if (generic || p.parType < 0) && tyHasTyVar(pps[k]) { return true }
     }
@@ -214,7 +216,7 @@ function fnOpenMeetsTyVar(pt: TyFunc, d: i32): boolean {
 // an index. A body is proven closed only through calls that resolve here.
 function closedCalleeDecl(c: Call, d: i32): i32 {
   if c.callFn < 0 { return -1 }
-  const cf = P.nodes[c.callFn]
+  const cf = nodeAt(c.callFn)
   let name = ""
   let dx = -1
   if cf is Ident {
@@ -229,7 +231,7 @@ function closedCalleeDecl(c: Call, d: i32): i32 {
     dx = cwUfcsDeclOf(c.callFn)
   }
   if dx < 0 || dx >= P.nodes.length || closedNameBound(d, name) { return -1 }
-  if P.nodes[dx] is FuncDecl { return dx }
+  if nodeAt(dx) is FuncDecl { return dx }
   -1
 }
 
@@ -237,10 +239,10 @@ function closedCalleeDecl(c: Call, d: i32): i32 {
 // nested function — so a call spelled `name` there does not reach the declared function.
 function closedNameBound(d: i32, name: string): boolean {
   if d < 0 || d >= P.nodes.length { return true }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if dn is FuncDecl {
     for p in dn.fnParams {
-      const pn = P.nodes[p]
+      const pn = nodeAt(p)
       if pn is Param {
         if pn.parName == name { return true }
       }
@@ -252,7 +254,7 @@ function closedNameBound(d: i32, name: string): boolean {
 
 function nodeBindsNameGo(ix: i32, name: string): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is LetDecl {
     if n.letName == name { return true }
   } else if n is Param {
@@ -276,14 +278,14 @@ function nodeBindsNameGo(ix: i32, name: string): boolean {
 // binding a member (D3602).
 export function genericBodyClosed(d: i32, depth: i32): boolean {
   if depth > 4 || d < 0 || d >= P.nodes.length { return false }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if dn is FuncDecl { return nodeClosedGo(dn.fnBody, d, depth) }
   false
 }
 
 function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return true }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is BinExpr {
     const op = n.binOp
     const keeps = (op == "=="
@@ -312,7 +314,7 @@ function nodeClosedGo(ix: i32, d: i32, depth: i32): boolean {
     const g = closedCalleeDecl(n, d)
     if g != -2 {
       if g < 0 { return false }
-      const gn = P.nodes[g]
+      const gn = nodeAt(g)
       if gn is FuncDecl {
         if (
           gn.fnTyParams.length > 0
@@ -342,7 +344,7 @@ export function annotateTyArgLambdas() {
   const n0 = P.nodes.length
   let i = 0
   while i < n0 {
-    const d = P.nodes[i]
+    const d = nodeAt(i)
     if d is FuncDecl {
       if d.fnTyParams.length > 0 {
         if genDeclByName.has(d.fnName) {
@@ -356,7 +358,7 @@ export function annotateTyArgLambdas() {
   }
   let c = 0
   while c < n0 {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if cn is Call {
       const tas = callTyArgsOf(c)
       if tas.length > 0 { annotateCallLambdas(cn, tas) }
@@ -374,7 +376,7 @@ let genDeclByName: {[string]: i32} = Map()
 export function uniqueGenericDeclNamed(name: string, arity: i32): i32 {
   const ix = genDeclByName[name] ?? -1
   if ix < 0 || ix >= P.nodes.length { return -1 }
-  const d = P.nodes[ix]
+  const d = nodeAt(ix)
   if d is FuncDecl {
     if d.fnTyParams.length == arity { return ix }
   }
@@ -383,26 +385,26 @@ export function uniqueGenericDeclNamed(name: string, arity: i32): i32 {
 
 function annotateCallLambdas(cn: Call, tas: i32[]) {
   if cn.callFn < 0 { return 0 }
-  const f = P.nodes[cn.callFn]
+  const f = nodeAt(cn.callFn)
   if !(f is Ident) { return 0 }
   const dIx = uniqueGenericDeclNamed(f.identName, tas.length)
   if dIx < 0 { return 0 }
-  const d = P.nodes[dIx]
+  const d = nodeAt(dIx)
   if !(d is FuncDecl) { return 0 }
   const names: string[] = []
   let t = 0
   while t < tas.length {
-    const ta = P.nodes[tas[t]]
+    const ta = nodeAt(tas[t])
     if ta is TypeRef { names.push(ta.tyName) } else { return 0 }
     t = t + 1
   }
   let a = 0
   while a < cn.callArgs.length && a < d.fnParams.length {
     if a < cn.callArgNames.length && cn.callArgNames[a] != "" { return 0 }
-    const dp = P.nodes[d.fnParams[a]]
+    const dp = nodeAt(d.fnParams[a])
     const lx = cwPeel(cn.callArgs[a])
     if dp is Param && lx >= 0 && lx < P.nodes.length {
-      const lam = P.nodes[lx]
+      const lam = nodeAt(lx)
       if lam is FuncDecl {
         if dp.parType >= 0 {
           annotateLambdaFrom(lam, annTsOf(dp.parType), d.fnTyParams, names)
@@ -427,7 +429,7 @@ function annotateLambdaFrom(
   if cnt != lam.fnParams.length { return 0 }
   let k = 0
   while k < cnt {
-    const p = P.nodes[lam.fnParams[k]]
+    const p = nodeAt(lam.fnParams[k])
     if p is Param {
       if p.parType < 0 {
         const kid = tsKids[tsKidStart[root] + k]

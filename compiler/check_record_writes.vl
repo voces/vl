@@ -32,6 +32,7 @@ import {
   TypeRef,
   WhileStmt,
   i32ToStr,
+  nodeAt,
   nodeChildren,
   nodeToks,
 } from "./ast"
@@ -74,7 +75,7 @@ import {
 import { demangleName } from "./check_suggest"
 import { nodeLineOf } from "./check_capture_loss"
 import { srcmapModOfTok, srcmapPathOf } from "./srcmap"
-import { T, TyErr, TyObj, TyUnion, tyToStr } from "./check_types"
+import { T, TyErr, TyObj, TyUnion, tyAt, tyToStr } from "./check_types"
 import { tyHasTyVar } from "./tyquery"
 import { containerElemClassDiffers, covarNonNullArms } from "./check_ty_relate"
 import { isIdPart } from "./lexer"
@@ -147,10 +148,10 @@ export function rcwSourceSlotTy(
   if root < 0 || depth > 2 { return -1 }
   const v = cwPeel(val)
   if v < 0 || v >= P.nodes.length { return -1 }
-  const rn = P.nodes[root]
+  const rn = nodeAt(root)
   if rn is Ident {
     const rfr = covarRootFrame(root)
-    const vn = P.nodes[v]
+    const vn = nodeAt(v)
     if vn is Ident {
       if vn.identName == rn.identName { return -1 }
       const fr = covarRootFrame(v)
@@ -183,7 +184,7 @@ function rcwPlaceRoot(ix: i32): i32 {
   let cur = cwPeel(ix)
   let steps = 0
   while cur >= 0 && cur < P.nodes.length && steps < 64 {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is Ident { return cur }
     if n is Member { cur = cwPeel(n.memObj) } else { return -1 }
     steps = steps + 1
@@ -197,7 +198,7 @@ function rcwConstInit(nm: string, fr: i32): i32 {
   while cwOccNext(ow) {
     const r = ow.row
     if cwIxKind[r] == CW_OCC_BIND {
-      const b = P.nodes[cwIxNode[r]]
+      const b = nodeAt(cwIxNode[r])
       if b is LetDecl {
         if b.letKw == "const" { return b.letInit }
       }
@@ -211,13 +212,13 @@ function rcwConstInit(nm: string, fr: i32): i32 {
 export function rcwRootIdent(v: i32): i32 {
   const p = cwPeel(v)
   if p < 0 || p >= P.nodes.length { return -1 }
-  if P.nodes[p] is Ident { return p }
+  if nodeAt(p) is Ident { return p }
   -1
 }
 
 // The value a storing collection call writes: its last argument, or -1 when it has none.
 export function rcwStoredArg(call: i32): i32 {
-  const cn = P.nodes[call]
+  const cn = nodeAt(call)
   if cn is Call {
     if cn.callArgs.length > 0 { return cn.callArgs[cn.callArgs.length - 1] }
   }
@@ -301,12 +302,12 @@ function rcwBranches(ix: i32, out: i32[]) {
 
 // When `p` is an `if` used as a value, queue its arms' tails (an `else if` link as itself).
 function rcwPushIfArms(p: i32, todo: i32[]): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is IfStmt {
     todo.push(rcwBlockTail(n.ifThen))
     const el = n.ifElse
     if el >= 0 && el < P.nodes.length {
-      if P.nodes[el] is IfStmt {
+      if nodeAt(el) is IfStmt {
         todo.push(el)
       } else {
         todo.push(rcwBlockTail(el))
@@ -319,7 +320,7 @@ function rcwPushIfArms(p: i32, todo: i32[]): boolean {
 
 // When `p` is a `match` used as a value, queue each arm's tail.
 function rcwPushMatchArms(p: i32, todo: i32[]): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is MatchExpr {
     let i = 0
     while i < n.matchBodies.length {
@@ -333,7 +334,7 @@ function rcwPushMatchArms(p: i32, todo: i32[]): boolean {
 
 // When `p` is `a ?? b`, queue both operands: the value is one of them.
 function rcwPushCoalOperands(p: i32, todo: i32[]): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is BinExpr {
     if n.binOp == "??" {
       todo.push(n.binLeft)
@@ -347,7 +348,7 @@ function rcwPushCoalOperands(p: i32, todo: i32[]): boolean {
 // A leaf that holds no slot any other handle can see: a scalar literal, a statement that is
 // not a value, or an empty `Map()` / `Set()` just made.
 export function rcwLeafVacuous(p: i32): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if (
     n is NumLit
     || n is StrLit
@@ -373,9 +374,9 @@ export function rcwLeafVacuous(p: i32): boolean {
 
 // An empty `Map()` / `Set()` made on the spot, by the builtin rather than a same-named binding.
 function rcwIsFreshCtor(p: i32): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is Call {
-    const cf = P.nodes[cwPeel(n.callFn)]
+    const cf = nodeAt(cwPeel(n.callFn))
     if cf is Ident {
       if (
         n.callArgs.length == 0
@@ -396,11 +397,11 @@ function rcwAllFresh(ix: i32, depth: i32): boolean {
   let li = 0
   while li < leaves.length {
     const p = leaves[li]
-    const n = P.nodes[p]
+    const n = nodeAt(p)
     if n is ObjLit {
       let k = 0
       while k < n.objFields.length {
-        const f = P.nodes[n.objFields[k]]
+        const f = nodeAt(n.objFields[k])
         if f is FieldInit {
           if !rcwAllFresh(f.fiValue, depth + 1) { return false }
         } else {
@@ -458,24 +459,24 @@ function rcwLeafSlotFresh(
 // A direct call of a declared function every return of which is fresh at `c[i..]`: each call
 // makes its value anew, so no other handle sees the slot either.
 function rcwCallSlotFresh(p: i32, c: string, i: i32, depth: i32): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if !(n is Call) || depth > 64 { return false }
   const cf = cwPeel(n.callFn)
-  if cf < 0 || !(P.nodes[cf] is Ident) { return false }
+  if cf < 0 || !(nodeAt(cf) is Ident) { return false }
   const fx = cwCalleeDeclOf(n.callFn)
   if fx < 0 || fx >= P.nodes.length { return false }
-  const fd = P.nodes[fx]
+  const fd = nodeAt(fx)
   if !(fd is FuncDecl) || fd.fnBody < 0 { return false }
   const tail = cwFnTailStmt(fx)
   if tail < 0 { return false }
-  if !(P.nodes[tail] is RetStmt) && !rcwSlotFresh(tail, c, i, depth + 1) {
+  if !(nodeAt(tail) is RetStmt) && !rcwSlotFresh(tail, c, i, depth + 1) {
     return false
   }
   const stack: i32[] = [fd.fnBody]
   while stack.length > 0 {
     const x = stack.pop()
     if x >= 0 && x < P.nodes.length {
-      const xn = P.nodes[x]
+      const xn = nodeAt(x)
       if xn is RetStmt {
         if xn.retArg < 0 || !rcwSlotFresh(xn.retArg, c, i, depth + 1) {
           return false
@@ -490,7 +491,7 @@ function rcwCallSlotFresh(p: i32, c: string, i: i32, depth: i32): boolean {
 
 // An object or list literal: a value made here, whose slots no other handle has seen.
 function rcwIsLiteralRecord(p: i32): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   n is ObjLit || n is ArrayLit
 }
 
@@ -502,12 +503,12 @@ function rcwFieldSlotFresh(
   e: i32,
   depth: i32,
 ): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is ObjLit {
     const name = c.slice(i + 1, e)
     let k = 0
     while k < n.objFields.length {
-      const f = P.nodes[n.objFields[k]]
+      const f = nodeAt(n.objFields[k])
       if f is FieldInit {
         if f.fiName == name { return rcwSlotFresh(f.fiValue, c, e, depth + 1) }
       }
@@ -519,7 +520,7 @@ function rcwFieldSlotFresh(
 
 // The element segment of the literal `p`, followed into every element.
 function rcwElemSlotFresh(p: i32, c: string, e: i32, depth: i32): boolean {
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is ArrayLit {
     let k = 0
     while k < n.arrElems.length {
@@ -571,10 +572,10 @@ export function rcwSelfDeclsOf(prop: string, callee: i32): i32[] {
 
 // Whether the `FuncDecl` at `d` takes `self` first.
 function rcwFirstParamIsSelf(d: i32): boolean {
-  const fd = P.nodes[d]
+  const fd = nodeAt(d)
   if fd is FuncDecl {
     if fd.fnParams.length == 0 { return false }
-    const p0 = P.nodes[fd.fnParams[0]]
+    const p0 = nodeAt(fd.fnParams[0])
     if p0 is Param { return p0.parName == "self" }
   }
   false
@@ -582,10 +583,10 @@ function rcwFirstParamIsSelf(d: i32): boolean {
 
 // The name of parameter `k` of `fnIx`, or "?".
 export function rcwParamNameOf(fnIx: i32, k: i32): string {
-  const fd = P.nodes[fnIx]
+  const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     if k >= 0 && k < fd.fnParams.length {
-      const pn = P.nodes[fd.fnParams[k]]
+      const pn = nodeAt(fd.fnParams[k])
       if pn is Param { return pn.parName }
     }
   }
@@ -594,11 +595,11 @@ export function rcwParamNameOf(fnIx: i32, k: i32): string {
 
 // The position of the parameter named `nm` in the function `fnIx`, or -1.
 export function rcwParamIndexOf(fnIx: i32, nm: string): i32 {
-  const fd = P.nodes[fnIx]
+  const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     let i = 0
     while i < fd.fnParams.length {
-      const pn = P.nodes[fd.fnParams[i]]
+      const pn = nodeAt(fd.fnParams[i])
       if pn is Param {
         if pn.parName == nm { return i }
       }
@@ -611,11 +612,11 @@ export function rcwParamIndexOf(fnIx: i32, nm: string): i32 {
 // A function's name for a message: its declared name, the `const` a lambda is bound to, or
 // "a function literal".
 export function rcwFnLabel(fnIx: i32): string {
-  const fd = P.nodes[fnIx]
+  const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     if fd.fnName != "" { return demangleName(fd.fnName) }
     if fnIx < cwIxUpKind.length && cwIxUpKind[fnIx] == CW_UP_LETINIT {
-      const ld = P.nodes[cwIxUp[fnIx]]
+      const ld = nodeAt(cwIxUp[fnIx])
       if ld is LetDecl { return ld.letName }
     }
   }
@@ -627,7 +628,7 @@ export function rcwFnLabel(fnIx: i32): string {
 // calls cannot be enumerated past: a lambda bound to nothing, or the function read as a value.
 export function rcwCallSites(fnIx: i32, out: i32[]): i32 {
   if fnIx < 0 || fnIx >= P.nodes.length { return fnIx }
-  const fd = P.nodes[fnIx]
+  const fd = nodeAt(fnIx)
   if fd is FuncDecl {
     let nm = fd.fnName
     let fr = CW_FR_UNKNOWN
@@ -635,7 +636,7 @@ export function rcwCallSites(fnIx: i32, out: i32[]): i32 {
       if fnIx >= cwIxUpKind.length || cwIxUpKind[fnIx] != CW_UP_LETINIT {
         return fnIx
       }
-      const ld = P.nodes[cwIxUp[fnIx]]
+      const ld = nodeAt(cwIxUp[fnIx])
       if ld is LetDecl {
         nm = ld.letName
         fr = cwFrameOfDecl(cwIxUp[fnIx])
@@ -655,7 +656,7 @@ export function rcwCallSites(fnIx: i32, out: i32[]): i32 {
       while r >= 0 {
         if cwIxKind[r] == CW_OCC_MCALL {
           const occ = cwIxNode[r]
-          const cn = P.nodes[occ]
+          const cn = nodeAt(occ)
           if cn is Call {
             const d = cwUfcsDeclOf(cn.callFn)
             if d < 0 || d == fnIx { out.push(occ * 2 + 1) }
@@ -676,7 +677,7 @@ function rcwNamedCallSites(nm: string, fnIx: i32, fr: i32, out: i32[]): i32 {
   while r >= 0 {
     const occ = cwIxNode[r]
     if cwIxKind[r] == CW_OCC_CALL {
-      const cn = P.nodes[occ]
+      const cn = nodeAt(occ)
       if cn is Call {
         const d = cwCalleeDeclOf(cn.callFn)
         if d < 0 || d == fnIx { out.push(occ * 2) }
@@ -709,7 +710,7 @@ export function rcwPlainAlias(u: i32): i32 {
   }
   const up = cwIxUp[u]
   if up < 0 || up >= P.nodes.length { return -1 }
-  if P.nodes[up] is LetDecl { return up }
+  if nodeAt(up) is LetDecl { return up }
   -1
 }
 
@@ -734,7 +735,7 @@ export function rcwModOf(at: i32): i32 {
 
 // A call's callee as the source spells it, in backticks.
 export function rcwCalleeText(callIx: i32): string {
-  const cn = P.nodes[callIx]
+  const cn = nodeAt(callIx)
   if cn is Call { return "`" + rcwExprText(cn.callFn, 0) + "`" }
   "a call"
 }
@@ -743,7 +744,7 @@ export function rcwCalleeText(callIx: i32): string {
 export function rcwExprText(ix: i32, depth: i32): string {
   const p = cwPeel(ix)
   if p < 0 || p >= P.nodes.length || depth > 6 { return "an expression" }
-  const n = P.nodes[p]
+  const n = nodeAt(p)
   if n is Ident { return demangleName(n.identName) }
   if n is Member {
     return rcwExprText(n.memObj, depth + 1) + "." + demangleName(n.memProp)
@@ -758,7 +759,7 @@ export function rcwExprText(ix: i32, depth: i32): string {
 // 2 as `tp[]`, 3 inside some other type this does not follow.
 export function rcwParamSpellsTp(ann: i32, tp: string): i32 {
   if ann < 0 || ann >= P.nodes.length { return 0 }
-  const a = P.nodes[ann]
+  const a = nodeAt(ann)
   if a is TypeRef {
     if a.tyName == tp { return 1 }
     if a.tyName == tp + "[]" { return 2 }
@@ -791,8 +792,8 @@ export function rcwContainerRuleDomain(se: i32, de: i32): boolean {
   // which asks again at the call that pins it.
   if tyHasTyVar(de) || tyHasTyVar(se) { return true }
   if containerElemClassDiffers(se, de) { return true }
-  const dt = T.tys[de]
-  if T.tys[se] is TyObj {
+  const dt = tyAt(de)
+  if tyAt(se) is TyObj {
     if dt is TyUnion { return covarNonNullArms(dt.uMembers) >= 2 }
   }
   false
@@ -802,7 +803,7 @@ export function rcwContainerRuleDomain(se: i32, de: i32): boolean {
 // which values it holds.
 export function rcwTyUnknown(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return true }
-  if T.tys[t] is TyErr { return true }
+  if tyAt(t) is TyErr { return true }
   tyHasTyVar(t)
 }
 

@@ -1,7 +1,7 @@
 // `emit_join_records.vl` — whether a join widens a record, and the `jr*` fit tests
 // between a joined record's members.
 
-import { ArrayLit, FuncDecl, IfStmt, MatchExpr, P, TypeRef } from "./ast"
+import { ArrayLit, FuncDecl, IfStmt, MatchExpr, TypeRef, nodeAt } from "./ast"
 import { recordJoinSeen } from "./check_core_state"
 import { collectRetValues } from "./check_nj_join"
 import { nodeTyIxOf } from "./check_node_tys"
@@ -21,6 +21,7 @@ import {
   TyUnion,
   TyVar,
   tyArrayElemIx,
+  tyAt,
   tyEq,
   tyFieldTyOf,
   tyIsLitUnion,
@@ -53,7 +54,7 @@ import {
 // A record type with any nullable wrapper removed, or -1 when `ty` is not a record.
 export function recordBaseTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyObj => {
       return ty
@@ -110,7 +111,7 @@ export function jrListCode(f: i32, dflt: i32): i32 {
 
 // The nullable type `f` is when it wraps member `m` directly, else -1.
 export function jrNullableOf(f: i32, m: i32): i32 {
-  const t = T.tys[f]
+  const t = tyAt(f)
   if t is TyNullable {
     if t.nInner == m { return f }
   }
@@ -132,7 +133,7 @@ export function jrFlatMembers(f: i32, out: i32[]): boolean {
 // The members `f` renders in order, `null` as `JR_NULL`, for comparing two box layouts.
 function jrMemberSeq(f: i32, out: i32[]) {
   if f < 0 || f >= T.tys.length { return 0 }
-  const t = T.tys[f]
+  const t = tyAt(f)
   // Exhaustive over `Ty` and `_`-less: only a nullable, a union that is not a literal union and
   // `null` itself are not one member.
   match t {
@@ -176,18 +177,18 @@ function jrSameMember(a: i32, b: i32): boolean {
 // Whether `f`, or the type under its `| null`, is a record.
 export function jrIsRecord(f: i32): boolean {
   const b = nonNullTy(f)
-  b >= 0 && T.tys[b] is TyObj
+  b >= 0 && tyAt(b) is TyObj
 }
 
 // Whether `f` renders as `boolean`.
 export function jrIsBoolean(f: i32): boolean {
-  const t = T.tys[f]
+  const t = tyAt(f)
   t is TyPrim && t.primName == "boolean"
 }
 
 // Whether the function type `f` returns a nullable.
 export function jrRetIsNullable(f: i32): boolean {
-  const t = T.tys[f]
+  const t = tyAt(f)
   if t is TyFunc {
     const ms: i32[] = []
     return jrFlatMembers(t.fnRet, ms)
@@ -233,7 +234,7 @@ export function jrCode0Fits(fnames: string[], ftys: i32[], si: i32): boolean {
   let k = 0
   while k < fnames.length {
     let tk = 0
-    const ft = T.tys[ftys[k]]
+    const ft = tyAt(ftys[k])
     if ft is TyPrim {
       if ft.primName == "i32" { tk = 1 }
       if ft.primName == "boolean" { tk = 2 }
@@ -254,8 +255,8 @@ export function recordRepDiffers(a: i32, b: i32, depth: i32): boolean {
   const ra = recordBaseTy(a)
   const rb = recordBaseTy(b)
   if ra < 0 || rb < 0 || depth > 8 || tyEq(ra, rb) { return false }
-  const ta = T.tys[ra]
-  const tb = T.tys[rb]
+  const ta = tyAt(ra)
+  const tb = tyAt(rb)
   if ta is TyObj {
     if tb is TyObj {
       let i = 0
@@ -295,7 +296,7 @@ function fieldRepDiffers(af: i32, bf: i32, depth: i32): boolean {
 
 // 1 for a union box, 2 for a nullable, 0 for a type stored by its own kind.
 function fieldStorageTag(ty: i32): i32 {
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyUnion => {
       return 1
@@ -329,11 +330,11 @@ export const NESTED_LAMBDA_JOIN_MSG = "emitProgram: this function value returns 
 // Whether the lambda at `ix` returns a join of records wider than its tails, one of whose
 // fields is itself a record.
 export function lambdaJoinsNestedRecord(ix: i32): boolean {
-  const ln = P.nodes[ix]
+  const ln = nodeAt(ix)
   if ln is FuncDecl {
     // A return the author declared names its row by that declaration, and runs.
     if ln.fnRet >= 0 {
-      const rt = P.nodes[ln.fnRet]
+      const rt = nodeAt(ln.fnRet)
       if rt is TypeRef {
         if rt.pos >= 0 { return false }
       }
@@ -345,7 +346,7 @@ export function lambdaJoinsNestedRecord(ix: i32): boolean {
   if !fnRetJoinsWiderRecord(ix, rty) { return false }
   const rb = recordBaseTy(rty)
   if rb < 0 { return false }
-  const t = T.tys[rb]
+  const t = tyAt(rb)
   if t is TyObj {
     let i = 0
     while i < t.objFieldTypes.length {
@@ -360,7 +361,7 @@ export function lambdaJoinsNestedRecord(ix: i32): boolean {
 // record none of its leaves is (D2731): a leaf literal would build its own row, not the join's.
 export function initJoinsWiderRecord(ini: i32, ty: i32): boolean {
   if ini < 0 || ty < 0 || ty >= T.tys.length { return false }
-  const n = P.nodes[ini]
+  const n = nodeAt(ini)
   // The joined record is asked for first, so a statement `if` costs no walk of its chain.
   let base = -1
   const leaves: i32[] = []
@@ -404,7 +405,7 @@ export function fnRetJoinsWiderRecord(fnIx: i32, rty: i32): boolean {
   if !recordJoinSeen() || fnIx < 0 { return false }
   const base = recordBaseTy(rty)
   if base < 0 { return false }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const rets: i32[] = []
     collectRetValues(fn.fnBody, rets)
@@ -427,7 +428,7 @@ export function fnRetJoinsWiderRecord(fnIx: i32, rty: i32): boolean {
 // parameter left in it: returns joining lists of different storage, boxed per list (D2768).
 export function tyIsListUnion(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length || tyHasTyVar(ty) { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyNullable => {
       return tyIsListUnion(t.nInner)
@@ -452,7 +453,7 @@ export function tyIsListUnion(ty: i32): boolean {
 // gives a join of records that share a field-name set, which no arm literal builds itself.
 export function tyIsJoinedRecord(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyArray => {
       return tyIsJoinedRecord(t.aElem)
@@ -462,7 +463,7 @@ export function tyIsJoinedRecord(ty: i32): boolean {
       while i < t.objFieldTypes.length {
         const ft = t.objFieldTypes[i]
         if ft >= 0 && ft < T.tys.length {
-          if T.tys[ft] is TyUnion { return true }
+          if tyAt(ft) is TyUnion { return true }
         }
         i = i + 1
       }
@@ -481,9 +482,9 @@ export function declaredI64(name: string) { declaredKind(name) == "i64" }
 // Whether node `ix` is a numeric union box: a numeric union, or a value `if` joining numbers
 // with `null`, whose arms alone would each read as one width.
 export function numBoxExpr(ix: i32, t: i32): boolean {
-  if t < 0 || t >= T.tys.length || T.tys[t] is TyPrim { return false }
+  if t < 0 || t >= T.tys.length || tyAt(t) is TyPrim { return false }
   if tyIsNumUnion(t) { return true }
-  P.nodes[ix] is IfStmt && tyIsNumericBox(t)
+  nodeAt(ix) is IfStmt && tyIsNumericBox(t)
 }
 
 // The code-0 kind (`code0KindOf`) of row `si`'s field `name`, off the row's own type and then,

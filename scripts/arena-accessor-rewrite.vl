@@ -1,0 +1,360 @@
+// The arena-accessor rewrite: every READ of `P.nodes[ix]` or `T.tys[ix]` in `compiler/*.vl`
+// becomes `nodeAt(ix)` or `tyAt(ix)`, the import lists follow, and `vl fmt -w` lays the
+// touched files out again. A rebase of the change is "reset compiler/ to master, re-run".
+//
+//     vl run scripts/arena-accessor-rewrite.vl -- [--root DIR] [--vl PATH] [--no-fmt]
+//
+// A write (`P.nodes[ix] = n`) stays inline, and so does every read in a file of `SKIP`.
+// The accessors are added to their home modules when missing, and their own bodies are never
+// rewritten, so a second run over a rewritten tree changes nothing. Comments and strings are
+// left alone: the compiler's lexer finds the reads. Paths resolve against the working
+// directory (`DIR`, default `.`), so run it from the checkout root; `PATH` is the `vl` that
+// formats, default `scripts/vl-host/target/release/vl`.
+
+import { IoError, listDir, readTextFile, writeTextFile } from "std:fs"
+import { programArgs } from "std:args"
+import { exit, runProgram } from "std:process"
+import { decodeUtf8Lossy } from "std:utf8"
+import { toString } from "std:fmt"
+import { endsWith, join } from "std:str"
+import { includes } from "std:array"
+import { Tok, tokenize } from "../compiler/lexer"
+import { die } from "./lib/common"
+import { sortStrings } from "./lib/corpus"
+
+// One arena: the global and field a read spells, the accessor it becomes, the module that
+// defines it, and the declaration line the accessor is placed after there.
+type Arena = {
+  base: string,
+  field: string,
+  fn: string,
+  home: string,
+  spec: string,
+  anchor: string,
+  body: string,
+}
+
+const ARENAS: Arena[] = [
+  {
+    base: "P",
+    field: "nodes",
+    fn: "nodeAt",
+    home: "ast.vl",
+    spec: "\"./ast\"",
+    anchor: "export let P: Parser = ",
+    body: "// The arena node at `ix`; one body holds the bounds check that an inline `P.nodes[ix]`\n// repeats at every read site.\nexport function nodeAt(ix: i32): Node { P.nodes[ix] }\n",
+  },
+  {
+    base: "T",
+    field: "tys",
+    fn: "tyAt",
+    home: "check_types.vl",
+    spec: "\"./check_types\"",
+    anchor: "export let T: Checker = ",
+    body: "// The type arena row at `ix`; one body holds the bounds check that an inline `T.tys[ix]`\n// repeats at every read site.\nexport function tyAt(ix: i32): Ty { T.tys[ix] }\n",
+  },
+]
+
+// Files whose reads stay inline: they were being edited by other lanes when the rewrite
+// first landed, and leaving them is what keeps a re-run equal to that change.
+const SKIP = [
+  "check_assignable.vl", "check_calls.vl", "check_nj_gate.vl",
+  "check_relate_core.vl", "emit_classify.vl", "emit_mono.vl",
+  "fn_flow_shadow.vl", "fn_split.vl", "wasmEmit.vl",
+]
+
+function kindOf(t: Tok): string { "\{t.kind}" }
+
+function tokEnd(t: Tok): i32 { t.start + t.text.length }
+
+function isIdent(toks: Tok[], i: i32, text: string): boolean {
+  i >= 0
+    && i < toks.length
+    && kindOf(toks[i]) == "IDENT"
+    && toks[i].text == text
+}
+
+function isKind(toks: Tok[], i: i32, kind: string): boolean {
+  i >= 0 && i < toks.length && kindOf(toks[i]) == kind
+}
+
+// Where the line holding offset `p` starts.
+function lineStart(s: string, p: i32): i32 {
+  let i = p
+  while i > 0 && s[i - 1] != '\n' { i = i - 1 }
+  i
+}
+
+function startsAt(s: string, i: i32, lit: string): boolean {
+  i >= 0 && i + lit.length <= s.length && s.slice(i, i + lit.length) == lit
+}
+
+// The token closing the `[` at `open`, or -1.
+function closeOf(toks: Tok[], open: i32): i32 {
+  let depth = 0
+  let k = open
+  while k < toks.length {
+    const kd = kindOf(toks[k])
+    if kd == "LBRACK" { depth = depth + 1 }
+    if kd == "RBRACK" {
+      depth = depth - 1
+      if depth == 0 { return k }
+    }
+    k = k + 1
+  }
+  -1
+}
+
+type Read = { at: i32, close: i32 }
+
+// Every read of `a`'s arena in `toks`: `<base>.<field>[…]` not after a `.`, not the target
+// of an `=`, and not inside the accessor's own body.
+function readsOf(s: string, toks: Tok[], a: Arena): Read[] {
+  const out: Read[] = []
+  let i = 0
+  while i + 3 < toks.length {
+    if (
+      isIdent(toks, i, a.base)
+      && !isKind(toks, i - 1, "DOT")
+      && isKind(toks, i + 1, "DOT")
+      && isIdent(toks, i + 2, a.field)
+      && isKind(toks, i + 3, "LBRACK")
+    ) {
+      const c = closeOf(toks, i + 3)
+      if c < 0 {
+        die(
+          "arena-accessor-rewrite: an unclosed `[` at line \{toString(toks[i].line)}",
+          1,
+        )
+      }
+      const own = startsAt(
+        s,
+        lineStart(s, toks[i].start),
+        "export function " + a.fn + "(",
+      )
+      if !isKind(toks, c + 1, "EQUAL") && !own { out.push({ at: i, close: c }) }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// One pass: rewrite every read with no other read inside its brackets. Answers `s` itself
+// when there is none left.
+function rewritePass(s: string, a: Arena): string {
+  const toks = tokenize(s).tokens
+  const rs = readsOf(s, toks, a)
+  if rs.length == 0 { return s }
+  const parts: string[] = []
+  let from = 0
+  let k = 0
+  while k < rs.length {
+    const r = rs[k]
+    const inner = k + 1 < rs.length && rs[k + 1].at < r.close
+    if !inner && toks[r.at].start >= from {
+      parts.push(s.slice(from, toks[r.at].start))
+      parts.push(a.fn + "(")
+      parts.push(s.slice(tokEnd(toks[r.at + 3]), toks[r.close].start))
+      parts.push(")")
+      from = tokEnd(toks[r.close])
+    }
+    k = k + 1
+  }
+  parts.push(s.slice(from, s.length))
+  join(parts, "")
+}
+
+function rewriteReads(src: string, a: Arena): string {
+  let s = src
+  let guard = 0
+  while guard < 64 {
+    const next = rewritePass(s, a)
+    if next == s { return s }
+    s = next
+    guard = guard + 1
+  }
+  die(
+    "arena-accessor-rewrite: the reads of `\{a.base}.\{a.field}` did not converge",
+    1,
+  )
+  s
+}
+
+// Whether a token outside every import names `name` as a value: an identifier not after a
+// `.`. `call` asks for a call of it instead.
+function uses(toks: Tok[], name: string, call: boolean): boolean {
+  let inImport = false
+  let i = 0
+  while i < toks.length {
+    const kd = kindOf(toks[i])
+    if kd == "IMPORT" { inImport = true }
+    if inImport && kd == "STRING" { inImport = false }
+    if !inImport && isIdent(toks, i, name) && !isKind(toks, i - 1, "DOT") {
+      if !call || isKind(toks, i + 1, "LPAREN") { return true }
+    }
+    i = i + 1
+  }
+  false
+}
+
+// `s` with the import from `spec` naming `add` (when it is not "") and not naming `drop`
+// (when it is not ""). Leaves the list unsorted and on one line; `vl fmt` sorts and wraps.
+function editImport(
+  s: string,
+  spec: string,
+  add: string,
+  drop: string,
+): string {
+  const toks = tokenize(s).tokens
+  let i = 0
+  while i < toks.length {
+    if isKind(toks, i, "IMPORT") && isKind(toks, i + 1, "LBRACE") {
+      let r = i + 2
+      while r < toks.length && !isKind(toks, r, "RBRACE") { r = r + 1 }
+      if (
+        isIdent(toks, r + 1, "from")
+        && isKind(toks, r + 2, "STRING")
+        && toks[r + 2].text == spec
+      ) {
+        const body = s.slice(tokEnd(toks[i + 1]), toks[r].start)
+        let c = 0
+        while c + 1 < body.length {
+          if body[c] == '/' && body[c + 1] == '/' {
+            die(
+              "arena-accessor-rewrite: a comment inside the import from \{spec}",
+              1,
+            )
+          }
+          c = c + 1
+        }
+        const names: string[] = []
+        let cur: string[] = []
+        let k = i + 2
+        while k <= r {
+          const kd = kindOf(toks[k])
+          if kd == "COMMA" || kd == "RBRACE" {
+            if cur.length > 0 { names.push(join(cur, " ")) }
+            cur = []
+          } else if kd != "NEWLINE" {
+            cur.push(toks[k].text)
+          }
+          k = k + 1
+        }
+        const kept: string[] = []
+        let has = false
+        for n in names {
+          if n == add { has = true }
+          if n != drop { kept.push(n) }
+        }
+        if add != "" && !has { kept.push(add) }
+        return s.slice(0, toks[i + 1].start)
+          + "{ "
+          + join(kept, ", ")
+          + " }"
+          + s.slice(tokEnd(toks[r]), s.length)
+      }
+      i = r
+    }
+    i = i + 1
+  }
+  if add != "" {
+    die("arena-accessor-rewrite: no import from \{spec} to add `\{add}` to", 1)
+  }
+  s
+}
+
+// `s` with the accessor declared after its anchor line, when `s` is its home and lacks it.
+function placeAccessor(s: string, a: Arena): string {
+  const own = "export function " + a.fn + "("
+  let i = 0
+  while i < s.length {
+    if startsAt(s, i, own) { return s }
+    i = i + 1
+  }
+  let p = 0
+  while p < s.length && !startsAt(s, p, a.anchor) { p = p + 1 }
+  if p >= s.length {
+    die("arena-accessor-rewrite: no `\{a.anchor}` in \{a.home}", 1)
+  }
+  while p < s.length && s[p] != '\n' { p = p + 1 }
+  s.slice(0, p + 1) + "\n" + a.body + s.slice(p + 1, s.length)
+}
+
+function rewriteFile(name: string, src: string): string {
+  let s = src
+  for a in ARENAS {
+    const before = s
+    s = rewriteReads(s, a)
+    if name == a.home {
+      s = placeAccessor(s, a)
+    } else if s != before {
+      const toks = tokenize(s).tokens
+      let drop = ""
+      if !uses(toks, a.base, false) { drop = a.base }
+      s = editImport(s, a.spec, a.fn, "")
+      if drop != "" { s = editImport(s, a.spec, "", drop) }
+    }
+  }
+  s
+}
+
+function valueOf(args: string[], flag: string, dflt: string): string {
+  let i = 0
+  while i < args.length {
+    if args[i] == flag {
+      if i + 1 >= args.length {
+        die("arena-accessor-rewrite: \{flag} takes a value", 2)
+      }
+      return args[i + 1]
+    }
+    i = i + 1
+  }
+  dflt
+}
+
+function main(args: string[]): i32 {
+  const root = valueOf(args, "--root", ".")
+  const vl = valueOf(args, "--vl", "scripts/vl-host/target/release/vl")
+  const dir = root + "/compiler"
+  const listed = listDir(dir)
+  if listed is IoError {
+    print("arena-accessor-rewrite: \{dir}: \{listed.msg}")
+    return 1
+  }
+  const names = sortStrings(listed)
+  const changed: string[] = []
+  for name in names {
+    if !endsWith(name, ".vl") || includes(SKIP, name) { continue }
+    const path = dir + "/" + name
+    const src = readTextFile(path)
+    if src is IoError {
+      print("arena-accessor-rewrite: \{path}: \{src.msg}")
+      return 1
+    }
+    const out = rewriteFile(name, src)
+    if out != src {
+      const w = writeTextFile(path, out)
+      if w is IoError { die("arena-accessor-rewrite: \{path}: \{w.msg}", 1) }
+      changed.push(path)
+    }
+  }
+  print("arena-accessor-rewrite: \{toString(changed.length)} files rewritten")
+  if changed.length == 0 || includes(args, "--no-fmt") { return 0 }
+  const fmtArgs = ["fmt", "-w"]
+  for p in changed { fmtArgs.push(p) }
+  const r = runProgram(vl, fmtArgs)
+  if r is IoError {
+    print("arena-accessor-rewrite: \{vl}: \{r.msg}")
+    return 1
+  }
+  if r.code != 0 {
+    print(decodeUtf8Lossy(r.stdout) + decodeUtf8Lossy(r.stderr))
+    die("arena-accessor-rewrite: `vl fmt -w` exited \{toString(r.code)}", 1)
+  }
+  0
+}
+
+const argv = programArgs()
+if argv is string[] { exit(main(argv)) }
+print("arena-accessor-rewrite: the arguments are not UTF-8")
+exit(2)
