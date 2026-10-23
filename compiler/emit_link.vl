@@ -5,11 +5,13 @@
 
 import {
   FuncDecl,
+  LetDecl,
   P,
   StrLit,
   declNameTokOf,
   i32ToStr,
   nodeAt,
+  nodeChildren,
   nodeToks,
 } from "./ast"
 import { cpsToUtf8, strToCps } from "./emit_base"
@@ -35,6 +37,7 @@ import {
   W,
   cloSigTagNames,
   fnAddrTakenAt,
+  fnParent,
   fnStmts,
   gCellIdx,
   gFoldAt,
@@ -62,6 +65,8 @@ import {
 import { TypeSites, typeOrderKeyOf, typeSitesOf } from "./emit_type_order"
 import { variantTagKey } from "./emit_variant_sig"
 import {
+  LIFT_INIT,
+  LIFT_START,
   LK_FUNC,
   LK_GLOBAL,
   LK_HEAP,
@@ -113,6 +118,44 @@ export function linkIsNote(node: i32, lex: string) {
   if !RELOC_ARMED { return 0 }
   isNode.push(node)
   isLex.push(lex)
+  0
+}
+
+// What `collectFns` lifted, noted as it returns: the slot its lifting ended at, each slot's
+// enclosing frame then, and whether a frameless one sits in a top-level statement rather than
+// a binding's initialiser. Later passes move both, so the split reads this copy.
+let liftEnd = 0
+let liftParent: i32[] = []
+let liftInStart: boolean[] = []
+
+export function linkLiftNote() {
+  if !RELOC_ARMED { return 0 }
+  liftEnd = fnStmts.length
+  liftParent = []
+  for p in fnParent { liftParent.push(p) }
+  const inInit: { [i32]: boolean } = Map()
+  for gs in globalStmts {
+    const g = nodeAt(gs)
+    if g is LetDecl { elMarkFns(g.letInit, inInit) }
+  }
+  liftInStart = []
+  for ix in fnStmts { liftInStart.push(!(inInit[ix] ?? false)) }
+  0
+}
+
+// Marks every function under `root` that no other function under it encloses.
+function elMarkFns(root: i32, out: { [i32]: boolean }) {
+  const stack: i32[] = [root]
+  while stack.length > 0 {
+    const ix = stack.pop()
+    if ix >= 0 {
+      if nodeAt(ix) is FuncDecl {
+        out[ix] = true
+      } else {
+        for c in nodeChildren(ix) { stack.push(c) }
+      }
+    }
+  }
   0
 }
 
@@ -273,8 +316,9 @@ export function emitLinkSection(
   for nd in mapDeleteSites() { arts[artOf[elNodeMod(nd)] ?? 0].deletes = true }
   const bodies = elBodies(ids, st, en)
   bodyPieces = bodies
-  // A top-level function sits in its module's artifact; one lifted or instanced after the
-  // top-level functions sits in the program's tail, in the order the program reached it.
+  // A top-level function sits in its module's artifact, and so does one lifted out of the
+  // module's source, beside its frame's key; one a later pass made sits in the program's tail,
+  // in the order the program reached it.
   const byFe: LinkFn[] = []
   let fi = 0
   while fi < n {
@@ -287,6 +331,10 @@ export function emitLinkSection(
     // A tail function's shared globals are the program's, as its types are (`elDemands`).
     if fi < topFnNodes.length {
       a.fns.push(f)
+      elNoteDefs(a, f.body, gEntries, ngImp)
+    } else if fi < liftEnd && fi < liftParent.length {
+      a.lifted.push(f)
+      a.liftedIn.push(elLiftFrame(fi, nfImp))
       elNoteDefs(a, f.body, gEntries, ngImp)
     } else {
       prog.tail.push(f)
@@ -407,6 +455,8 @@ function elArt(path: string): LinkArt {
     facts: elFacts(),
     deletes: false,
     fns: [],
+    lifted: [],
+    liftedIn: [],
     cells: [],
     consts: [],
     defs: [],
@@ -419,6 +469,14 @@ function elArt(path: string): LinkArt {
     sigs: [],
     tags: [],
   }
+}
+
+// Where lifted function `fi` sits: its frame's key, or which kind of top-level code holds it.
+function elLiftFrame(fi: i32, nfImp: i32): string {
+  const p = liftParent[fi]
+  if p >= 0 { return elFKey(nfImp + p) }
+  if fi < liftInStart.length && liftInStart[fi] { return LIFT_START }
+  LIFT_INIT
 }
 
 // The facts this compile emits every body under, which every artifact's key carries.
@@ -956,8 +1014,9 @@ function elWrite(
   let nRefs = 0
   for f in prog.tail { nRefs = nRefs + f.body.refs.length }
   for a in arts {
-    nFns = nFns + a.fns.length
+    nFns = nFns + a.fns.length + a.lifted.length
     for f in a.fns { nRefs = nRefs + f.body.refs.length }
+    for f in a.lifted { nRefs = nRefs + f.body.refs.length }
   }
   const payload: u8[] = []
   const prev = wTarget(payload)
@@ -991,7 +1050,7 @@ function elWrite(
   elStr(linkFactsKey(out.facts))
   for a in arts {
     elStr(a.path)
-    wULEB(a.fns.length)
+    wULEB(a.fns.length + a.lifted.length)
     wSLEB(linkArtHash(a))
     elStr(linkFactsKey(a.facts))
   }
@@ -1169,6 +1228,7 @@ function elDemands(prog: LinkProg, arts: LinkArt[]) {
 function elArtPieces(a: LinkArt): LinkPiece[] {
   const ps: LinkPiece[] = []
   for f in a.fns { elFnPieces(f, ps) }
+  for f in a.lifted { elFnPieces(f, ps) }
   for c in a.cells { ps.push(c.entry) }
   for c in a.consts { ps.push(c) }
   for c in a.defs { ps.push(c.entry) }

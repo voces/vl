@@ -54,15 +54,17 @@ export type LinkBand = { key: string, rank: i32, sort: string }
 // key carries (§6): the `-O` flavour, the `--low-memory-unused` bound, and whether the program
 // deletes from a map, which gives every map struct two more fields.
 export type LinkFacts = { optimized: i32, lowMem: i32, mapDeletes: boolean }
-// One module's artifact: `facts` it is emitted under, `deletes` if its source calls `.delete`,
-// `consts` its immutable initialisers in order, `defs` the shared globals it names, `guards`
-// its top-level bindings, `pool`/`poolIs` its literals, `tys` its group types, `bands` its tag
-// keys, and `sigs`/`tags` the runtime's own signatures and exception tags.
+// One module's artifact under `facts`; `deletes` if it calls `.delete`; `lifted` its lambdas and
+// nested functions, each framed in `liftedIn` by a function key or a `LIFT_*` mark; `consts` its
+// immutable initialisers; `defs`, `guards`, `pool`/`poolIs`, `tys` and `bands` the shared globals,
+// bindings, literals, group types and tag keys it names; `sigs`/`tags` the runtime's own.
 export type LinkArt = {
   path: string,
   facts: LinkFacts,
   deletes: boolean,
   fns: LinkFn[],
+  lifted: LinkFn[],
+  liftedIn: string[],
   cells: LinkGlobal[],
   consts: LinkPiece[],
   defs: LinkGlobal[],
@@ -76,8 +78,12 @@ export type LinkArt = {
   tags: LinkPiece[],
 }
 export type LinkSec = { id: i32, b: LinkPiece }
+// A lifted function with no frame: one in a top-level binding's initialiser, or in a
+// top-level statement.
+export const LIFT_INIT = "^init"
+export const LIFT_START = "^start"
 // The program-level input: the sections passed through, the imports, whether the table
-// exists, the functions placed after every module's own (lifted functions, later instances),
+// exists, the functions placed after every module's own (twins and instances),
 // the runtime's functions and globals, the start function, the program's tag-band table, each
 // value-atom code's name, and the build's flavour (`LinkFacts`'s first two).
 export type LinkProg = {
@@ -150,6 +156,11 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
       fi = fi + 1
     }
   }
+  for f in lkLifted(arts, fns) {
+    lkPut(fIdx, f.key, fi)
+    fns.push(f)
+    fi = fi + 1
+  }
   for f in p.tail {
     lkPut(fIdx, f.key, fi)
     fns.push(f)
@@ -187,6 +198,62 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
     facts: facts,
     factMiss: factMiss,
   }
+}
+
+// The lifted functions in the order lifting reaches them: breadth-first from `top`, a frame's
+// own in its module's order; once that runs dry, every initialiser's frameless ones and then
+// every statement's, modules in load order, and the walk resumes. One whose frame is never
+// reached follows, in input order.
+function lkLifted(arts: LinkArt[], top: LinkFn[]): LinkFn[] {
+  const all: LinkFn[] = []
+  const next: i32[] = []
+  const head: { [string]: i32 } = Map()
+  const last: { [string]: i32 } = Map()
+  for a in arts {
+    let k = 0
+    while k < a.lifted.length && k < a.liftedIn.length {
+      const fr = a.liftedIn[k]
+      const j = all.length
+      all.push(a.lifted[k])
+      next.push(-1)
+      const t = last[fr] ?? -1
+      if t >= 0 { next[t] = j } else { head[fr] = j }
+      last[fr] = j
+      k = k + 1
+    }
+  }
+  const out: LinkFn[] = []
+  const placed: boolean[] = []
+  while placed.length < all.length { placed.push(false) }
+  const queue: string[] = []
+  for f in top { queue.push(f.key) }
+  let qi = 0
+  let pass = 0
+  while pass < 2 {
+    if pass == 1 {
+      queue.push(LIFT_INIT)
+      queue.push(LIFT_START)
+    }
+    pass = pass + 1
+    while qi < queue.length {
+      let j = head[queue[qi]] ?? -1
+      while j >= 0 {
+        if !placed[j] {
+          placed[j] = true
+          out.push(all[j])
+          queue.push(all[j].key)
+        }
+        j = next[j]
+      }
+      qi = qi + 1
+    }
+  }
+  let j = 0
+  while j < all.length {
+    if !placed[j] { out.push(all[j]) }
+    j = j + 1
+  }
+  out
 }
 
 // The facts a program's artifacts must all have been emitted under: the build's flavour, and
@@ -924,6 +991,8 @@ export function linkArtHash(a: LinkArt): i32 {
   let h = lkHS(-2128831035, a.path)
   if a.deletes { h = lkH(h, 1) } else { h = lkH(h, 0) }
   for f in a.fns { h = lkHF(h, f) }
+  for f in a.lifted { h = lkHF(h, f) }
+  for s in a.liftedIn { h = lkHS(h, s) }
   for g in a.cells {
     h = lkHS(h, g.key)
     h = lkHP(h, g.entry)

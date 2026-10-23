@@ -206,6 +206,10 @@ on program behaviour instead.
      emitted under (`LinkFacts`: the flavour, the low-memory bound, the map-delete bit), and
      the link re-derives them. The map-delete bit is now a per-module fact plus a link-time
      merge. Gates: identity, the fixpoint, and invariance by key.
+   - **5c. Lifted functions in their module's artifact.** (§15.) The nested functions and
+     lambdas that `collectFns` lifts leave the program tail. Each one sits in its module's
+     artifact beside its frame's key, and the link rebuilds the lifting order from those
+     keys. Gates: identity, the fixpoint, the link proof and invariance.
 6. **Switch-over: the artifact cache.** The host stores artifacts and instances under §6's
    keys and links a build from them. Gates: every gate on master, with
    `VL_COMPILE_CACHE_VERIFY=1` comparing a cached link against a cold build. The hit rate is
@@ -583,7 +587,8 @@ references, with locals `0x25` against `0x28`. "Function frames" below takes tho
 Also still program-level:
 
 - the band rank table (`LinkProg.bands`, now a sort over keys, but carried whole);
-- lifted lambdas and instances in `prog.tail`;
+- lifted lambdas and instances in `prog.tail` (the lifted ones moved to their artifacts in
+  step 5c, §15; twins and instances remain);
 - the runtime artifact;
 - the literal-type texts no module spells.
 
@@ -789,9 +794,113 @@ cost gate passes: main fuel −3.1%, tail fuel −3.2%, RSS −2.2%. L2 guest fu
   measured hit rate asks for it.
 - **The generic template slots and instance demands** (`monoPruneTemplates`, §4, §12).
   These are the 2 pairs left, and they live in `emit_mono.vl`.
-- **The program tail, the runtime artifact and the band tables.** The tail's defs are noted
-  against the runtime artifact, the runtime is emitted per program, and the band tables are
-  built at link from demands (§11). Step 6 has to key or rebuild the runtime artifact per
-  link.
+- **The rest of the program tail, the runtime artifact and the band tables.** The lifted
+  functions left the tail in step 5c (§15). What is still program-level, and why it did not
+  move under byte identity, is in §15's last part. Step 6 has to key or rebuild each of those
+  per link.
 - **The host store**: artifacts and instances under §6's keys, with
   `VL_COMPILE_CACHE_VERIFY=1` comparing a cached link against a cold build.
+
+## 15. Step 5c: lifted functions in their module's artifact
+
+Before this step, every function at or past `topFnNodes.length` went to `LinkProg.tail`, and
+the tail's shared globals and type demands were noted against the runtime artifact. Those
+functions are of four kinds. Classified by key shape over the 4,889 armed tests/cases builds
+at #4484, 2,054 builds carry a tail:
+
+- 3,502 lambdas;
+- 2,265 nested named functions;
+- 3,393 twins from the rewrite passes (`$voidtw`, `$extv`, `$eqc`);
+- 310 generic instances.
+
+The first two kinds are what `collectFns` lifts. They are a module's own source, so they now
+move into its artifact.
+
+**The artifact.** `LinkArt.lifted` holds a module's lifted functions in lifting order. Beside
+each one, `LinkArt.liftedIn` holds its frame's function key. A function with no frame gets a
+mark instead: `LIFT_INIT` for one in a top-level binding's initialiser, `LIFT_START` for one
+in a top-level statement. Each lifted function's shared globals and type demands are noted
+against its artifact, and `linkArtHash` folds both lists. `vl.link`'s per-artifact count
+includes them.
+
+**The order is rebuilt at link.** Plain rules do not reproduce the emitted order. Sorting
+the whole tail by artifact fails on 23 builds. Putting each artifact's lifted functions in a
+row, ahead of the instances, fails on 14. The reason is that `collectFns` lifts breadth-first
+over the whole program. It visits every top-level function, then every lifted one, appending
+each frame's children as it goes. When that runs dry, it appends every initialiser's lambdas,
+then every statement's, and the walk resumes. `lkLifted` (`link.vl`) replays that walk from
+the artifacts alone:
+
+- the queue starts as every artifact's top-level functions, in load order;
+- each function the queue reaches appends its children, in their module's order;
+- once the queue is exhausted, the `LIFT_INIT` and then the `LIFT_START` functions of every
+  artifact, in load order, are appended, and the walk resumes.
+
+The lifted functions go after every artifact's top-level functions. The remaining tail
+(twins and instances) follows them.
+
+**Noted when lifting ends.** Later passes rewrite `fnParent`, and `emit_rewrite` repoints
+`startStmts` at new arena nodes. So the split does not read either of them at emit time.
+`linkLiftNote` (`emit_link.vl`) runs when the `collectFns` pass returns, in the pass
+dispatcher. It records where lifting ended, each slot's frame, and which frameless lambdas
+sit under a binding's initialiser. It does that last part by walking each initialiser down
+to its first functions. `emit_collect.vl` is untouched. The hook does nothing when the build
+is disarmed.
+
+**Proof.** The armed builds are at #4486.
+
+| set | builds | artifacts | functions | body references | sections differ | bodies differ | unresolved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 scripts, master | 8 | 92 | 2,151 | 77,281 | 0 | 0 | 0 |
+| 8 scripts, this change | 8 | 92 | 2,151 | 77,281 | 0 | 0 | 0 |
+| tests/cases, master | 4,890 | 5,851 | 84,941 | 900,852 | 0 | 0 | 0 |
+| tests/cases, this change | 4,890 | 5,851 | 84,941 | 900,852 | 0 | 0 | 0 |
+
+In every row, nothing is defined twice and no row is left unconsumed. Invariance gives the
+same result on master and on this change:
+
+- **The 8 scripts:** 22 keys held by two or more builds, and 0 pairs differ. 56 builds are
+  keyed apart, and 49 of those are equal.
+- **tests/cases:** 33 keys held, and 4,662 pairs differ. All 4,662 pairs fall under the empty
+  path. That path is the main module of every single-file program, so those are different
+  programs, not one module in two importers.
+
+**The witness and the control.** `tests/cases/modules/lifted-order-across-modules/` holds
+three modules. Lifting reaches `b`'s lambda before `a`'s inner one. In that case, a link
+that lays each artifact's lifted functions out in a row misplaces them.
+
+- **The control** replaces `lkLifted`'s result with that row. It is green over all 4,890
+  tests/cases builds, because no other case separates the two orders. On the witness it reds
+  with 4 sections and 6 bodies differing.
+- **This change** reads 0 differing on the witness.
+- **A second importer** (`entry2`) uses `a` and `b` in another order, beside other lambdas. It
+  gives invariance 0 pairs differ over the two shared modules, lifted functions included.
+
+**Gates.**
+
+- **Identity:** difftree `--identity` reads 0 of 16,439 files differing, 0 uncompared. The
+  candidate compiling master's source equals master's fixpoint.
+- **Seed:** the fixpoint holds, at 5,688,822 bytes (master 5,683,995, +0.08%).
+- **plumb-shape cost:** passes, with main fuel −3.0%, tail fuel −3.2% and RSS −2.1% against
+  its baseline.
+- **L2 guest fuel:**
+  - the master fixpoint on its own source: 89,115,704,774;
+  - the master fixpoint on this source: 89,105,505,871 (−0.01%);
+  - the new seed on this source: 89,105,505,951 (+80 instructions).
+
+**What stays program-level, and why it did not move here.**
+
+- **Twins and instances** stay in `prog.tail`. Instances are the generic-demand work (§4),
+  in `emit_mono.vl`. The rewrite passes mint twins in pass order over the whole program, so
+  their placement is a replay of each pass, not of one walk.
+- **The band rank table** (`LinkProg.bands`). Ref-list, map and closure tags rank by the
+  order the emitter minted them in `rlElemName`, `mvValName`/`mvKeyKind` and
+  `cloSigTagNames`. A variant sorts by `variantTagKey`, which carries a rep row index. Each
+  of those is a program-wide count. A rank computed from keys alone would change every body
+  that tests a tag, so it cannot land under byte identity. It belongs with step 6's
+  switch-over, which is graded on behaviour, as step 4's canonical type order was.
+- **The runtime artifact.** The runtime helpers are emitted per program, and so are the
+  group types and band keys that no artifact names. All exports also sit there: each is a
+  program output, keyed by the function it names. The literal-type texts no module spells sit
+  there too. Step 6 either keys the runtime by the helper set it holds or rebuilds it at
+  every link.
