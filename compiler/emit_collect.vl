@@ -997,7 +997,9 @@ import {
 } from "./listutil"
 import {
   intLitUnionBasesOf,
+  isNullTy,
   primNameOf,
+  tyEmitPrimOf,
   tyHasTyVar,
   tyIsLitSet,
   tyMapValOf,
@@ -1087,10 +1089,38 @@ function inferRetIsUnionAt(inRow: i32, inm: string): boolean {
 // escapes both name hazards: canon softening makes the recorded name the lowering while the
 // row is the precise type, and the arena is not hash-consed.
 function inferRetIsLitUnionAt(inRow: i32, inm: string): boolean {
-  if inRow < 0 { return nameIsLitUnionType(inm) }
   const row = inferRetTyIxAt(inRow)
   if row < 0 { return nameIsLitUnionType(inm) }
   tyIsLitUnion(row)
+}
+
+// Is inferred-return row `ty` a bare map whose value spells `i32`? The arena form of a recorded
+// name that is a whole map spelling with an `i32` value; false for a hole, a list or a union.
+function retTyIsI32Map(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  if t is TyMap { return tyEmitPrimOf(t.mVal) == "i32" }
+  false
+}
+
+// Is inferred-return row `ty` a map or null: a nullable over a bare map, or the two-member
+// union of the two, which renders the same `{[K]: V}|null`. False for a hole.
+function retTyIsNulMap(ty: i32): boolean {
+  const inner = tyPeelNul(ty)
+  if inner != ty { return tyIsMap(inner) }
+  retTyIsMapNullPair(ty)
+}
+
+// The two-member-union half of `retTyIsNulMap`: a map and the `null` type, in either order.
+function retTyIsMapNullPair(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  if !(t is TyUnion) { return false }
+  if t.uMembers.length != 2 { return false }
+  const a = t.uMembers[0]
+  const b = t.uMembers[1]
+  if isNullTy(a) { return tyIsMap(b) }
+  isNullTy(b) && tyIsMap(a)
 }
 
 // Could this functype's result be a mixed scalar-plus-composite union? `false` is a definite
@@ -3618,10 +3648,10 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
       fRetKind[li] = "i64list"
     } else if retElem == "f32" {
       fRetKind[li] = "f32list"
-    } else if nameIsBareMap(inm) && mapValNameOf(inm) == "i32" {
+    } else if retTyIsI32Map(retTyIx) {
       // A mono `{[string]: i32}` map inferred return. `criClassify`'s `exprMap` can miss it,
       // since a returned local's kind is not collected during the global return pass, so set
-      // it from the checker's inferred return name.
+      // it from the type the checker banked with the inferred return.
       fRetKind[li] = "map"
     } else if nameIsNulString(inm) {
       // A `string | null` niche inferred return drives the kind-16 result valtype, the same
@@ -3629,10 +3659,10 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
       // result valtype is plain i32, so it falls through to the default. `nameIsNulString`
       // is `nullablePartOf(name) == "string"`, the same home the annotation side calls.
       fRetKind[li] = "nulstr"
-    } else if (nameIsBareMap(nullablePartOf(inm))) {
+    } else if retTyIsNulMap(retTyIx) {
       // D937 — the nullable map inferred return, the sibling of the mono-map arm above.
       // Same pair the annotated path stores (`retNulMapFlag` -> `"nulmap"`), read off the
-      // name the checker recorded. Any string-keyed map, not just the i32-valued one, and
+      // type the checker banked. Any string-keyed map, not just the i32-valued one, and
       // ahead of `inferNulStructRow`, which would otherwise resolve a map as a struct row.
       fRetKind[li] = "nulmap"
     } else if inferNulVariantRow(inm) >= 0 {
