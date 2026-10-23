@@ -2898,6 +2898,134 @@ export function tyElemIsRefListElem(e: i32): boolean {
   false
 }
 
+// Whether arena type `ty` is a list the ref-list layer stores by reference and can name a
+// row for: `nameIsRefArray`'s question asked of the type. An object element needs its own
+// struct or arm row; unlike the spelling, an inferred record that only adopts into a declared
+// row (`{r: null}` into `{r: i32 | null}`) is not one, so only callers holding no such element ask.
+export function tyIsRefArray(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  if !(t is TyArray) { return false }
+  if tyIsLitUnionArray(ty) { return false }
+  tyIsRefArrayElem(t.aElem)
+}
+
+// The element half of `tyIsRefArray`.
+function tyIsRefArrayElem(e: i32): boolean {
+  if e < 0 { return false }
+  if tyIsLitUnion(e) { return false }
+  if tyIsLitUnionAlias(e) { return false }
+  const et = tyAt(e)
+  match et {
+    TyObj => {
+      return tyObjHasRefRow(e)
+    }
+    TyUnion => {
+      return true
+    }
+    TyFunc => {
+      return true
+    }
+    TyMap => {
+      return true
+    }
+    TyArray => {
+      if tyIsScalarListElem(et.aElem) { return true }
+      return tyIsRefArray(e)
+    }
+    TyNullable => {
+      // A nullable string, boolean or literal-union element is a scalar niche list.
+      return !tyIsScalarNicheElem(et.nInner)
+    }
+    TyPrim => {
+      // A scalar element has its own backing wrapper, one per width.
+    }
+    TyLit => {
+      // A bare literal element is the atom list.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep until the monomorphizer pins it.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole has no rep.
+    }
+  }
+  false
+}
+
+// Whether `ty` is a nullable ref list (`S[] | null`): `nameIsNulRefList` asked of the type.
+export function tyIsNulRefArray(ty: i32): boolean {
+  if ty < 0 { return false }
+  const t = tyAt(ty)
+  if t is TyNullable { return tyIsRefArray(t.nInner) }
+  false
+}
+
+// Whether an object element has a row the ref-list layer can key: a struct row by index or
+// structure, or a union arm by index or by its own render.
+function tyObjHasRefRow(e: i32): boolean {
+  if structIndexOfTy(e) >= 0 { return true }
+  if repRowOfTyStruct(e, sScanLim()) >= 0 { return true }
+  if variantRowOfTy(e) >= 0 { return true }
+  variantRowOfOwnRenderTy(e) >= 0
+}
+
+// Whether `e`, an inner list's element, makes that list a scalar or string list.
+function tyIsScalarListElem(e: i32): boolean {
+  if e < 0 { return false }
+  if tyIsLitUnion(e) || tyIsLitUnionAlias(e) { return true }
+  const et = tyAt(e)
+  match et {
+    TyPrim => {
+      return true
+    }
+    TyNullable => {
+      return tyIsScalarNicheElem(et.nInner)
+    }
+    TyObj => {
+      // A record element makes the inner list a ref list.
+    }
+    TyUnion => {
+      // A value union element is boxed, so the inner list is a ref list.
+    }
+    TyFunc => {
+      // A closure element is stored by reference.
+    }
+    TyMap => {
+      // A map element is stored by reference.
+    }
+    TyArray => {
+      // A nested list element is stored by reference.
+    }
+    TyLit => {
+      // A bare literal element is the atom list, not a scalar wrapper.
+    }
+    TyVar => {
+      // An unsubstituted type parameter has no element rep yet.
+    }
+    TyNeg => {
+      // A negation is a checker-only refinement, never an element rep.
+    }
+    TyErr => {
+      // The error hole has no rep.
+    }
+  }
+  false
+}
+
+// Whether `e`, the inner of a nullable element, is a string, boolean or literal union:
+// the three nullables a list stores as a niche of its scalar backing.
+function tyIsScalarNicheElem(e: i32): boolean {
+  if e < 0 { return false }
+  if tyIsLitUnion(e) || tyIsLitUnionAlias(e) { return true }
+  const et = tyAt(e)
+  if et is TyPrim { return et.primName == "string" || et.primName == "boolean" }
+  false
+}
+
 // The nullable-ELEMENT twin: `(A | null)[]` stores the same wrapper as `A[]`, so its niche
 // codes 28 too. Kept apart from the set above because a `(K | null)[]` literal-union element
 // is the i32 ATOM backing instead, and only the inner kind tells the two apart.
@@ -3114,12 +3242,11 @@ export function armFieldStructRow(base: string): i32 {
   variantStructHeapTwinAt(vi)
 }
 
-// Validates an array type name as a supported element type: `i32[]` or a ref list
-// `S[]`/`N[]` over a declared struct or union alias. A nested `i32[][]`, or an array of
-// an unsupported element, fails loudly. Returns 0 on success, or -1 via `emitFail`.
+// Validates an array annotation that no earlier `collectATypeRef` rung claimed: only `i32[]`
+// remains supported, since the ref-list rung ahead of it already took every `S[]`/`N[]`.
+// Anything else fails loudly. Returns 0 on success, or -1 via `emitFail`.
 export function checkArrName(name: string) {
   if nameIsI32Array(name) { return 0 }
-  if nameIsRefArray(name) { return 0 }
   emitFail(
     "emitProgram: only i32[] arrays and struct/union element arrays are supported",
   )
@@ -3453,19 +3580,19 @@ function nestedNulRefElemNominalAt(innerArrTy: i32, depth: i32): string {
   // This level: grouped, which is the spelling the annotation interns and the one
   // `refElemArrName` peels back.
   const here = nulRefElemNameOfArrTy(innerArrTy)
-  if here != "" { return arrLitNulRefGrouped("(" + here + ")[]") }
+  if here != "" { return arrLitNulRefGrouped("(" + here + ")[]", innerArrTy) }
   // ...else one level further down, so `[[[{n: 42}, null]]]` names its element too. A leaf
   // that is not a nullable and not another list has no nominal half to recover, and
   // `nodeArrayElemName`'s structural render stands.
   const deeper = nestedNulRefElemNominalAt(tyArrayElemIx(innerArrTy), depth + 1)
   if deeper == "" { return "" }
-  arrLitNulRefGrouped(deeper + "[]")
+  arrLitNulRefGrouped(deeper + "[]", innerArrTy)
 }
 
 // `name` echoed back when the ref-list layer can name it, else "" — the gate every arm of
 // the nested walk applies before handing a spelling to the table.
-function arrLitNulRefGrouped(name: string): string {
-  if !nameIsRefArray(refElemArrName(name)) { return "" }
+function arrLitNulRefGrouped(name: string, elemTy: i32): string {
+  if !tyIsRefArrayElem(elemTy) { return "" }
   name
 }
 
@@ -3658,8 +3785,7 @@ function nulRefElemNameOfArrTy(ty: i32): string {
   if el is TyNullable {
     const nen = nulRefElemEmitName(ae, el.nInner)
     if nen == "" { return "" }
-    const an = refElemArrName(nen)
-    if !nameIsRefArray(an) { return "" }
+    if !tyIsRefArray(ty) { return "" }
     return nen
   }
   ""
