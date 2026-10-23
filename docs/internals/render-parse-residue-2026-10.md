@@ -127,7 +127,7 @@ the slice retires.
 | C1 | mono walkers bind by type (L1) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
-| C4 | shape-text field callers thread a type | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
+| C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
@@ -187,7 +187,13 @@ What each slice changes:
   stay inside `emit_mono`. It follows C1.
 - **C3.** The `emit_shape_intern` walkers take the field type alongside the field text.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
-  already holds.
+  already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
+  the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
+  field kept apart from its base, and `gaeArgIsTyParam` asks the declared-type test its
+  `base[]` spelling stood for. A probe over every `tests/**/*.vl` and the distilled corpus
+  found 0 differing files for each. The other 6 stay. Rung 3 of `rlSlotByNameTyK` differs from
+  its arena twin in 47 files, in both directions. The 4 shape-text sites serve callers in
+  `emit_shape_intern` and `emit_collect` that hold no field type, which is C3's producer.
 - **C5.** These name-only gates get a typed caller, or are proved dead and removed:
   - the `nameIsNul*` niche ladders and `annSpelledArray`;
   - the generic-alias test and `inferRetIsLitUnionAt`;
