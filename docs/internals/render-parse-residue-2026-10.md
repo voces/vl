@@ -124,7 +124,7 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, no site swaps) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, different-type rows ablated, no site swaps) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
@@ -366,6 +366,57 @@ What each slice changes:
   family whose typed side is wrong is a typed-column fix. A family whose spelling is wrong is a
   filed row. The member-order and literal-arm rows need the consumer to key on the type, which
   is D3's instance key.
+
+  **The 53 rows, ablated (2026-10-23, master `ad71da511`).** A fifth probe was a scratch build
+  over 16,619 files. It changed the comparison in two ways:
+  - It resolves the spelling and compares types (`tySameSet`, `tyEqSoftLits`), so a spelling
+    that names the same type is no longer a different-type row.
+  - It compares a parameter pin with `monoSubstInst` of the DECLARED signature
+    (`monoDeclParamTys`), not with the annotation node's type.
+
+  Its control file tripped every site. 32 events in 16 files still differ in type. No family
+  showed a program misbehaving, so no defect row was filed.
+
+  | family | files / events | which side is right | verdict |
+  | --- | --- | --- | --- |
+  | instance parameter holds the argument's type: `b._u`, `first._u`, `k<i32>("b")`'s `p`, `recv.v`, and `mid.a1:F` where `F` is bound from another parameter | 7 / 13 | the spelling, by design (D2734, D2974, D6092) | the typed product that agrees is `pinTys`/`pinnedTyIx`, not the substituted declaration |
+  | `pin-exact-key-union-box-is.vl`: a `Set<i32>` argument spelled as its boolean map | 1 / 1 | the type; the spelling is lossy but has the same rep | D2720's exact key compensates; a type key retires that |
+  | nested-record argument whose `#anon3` row reads `{inner: _}` | 1 / 2 | the type | the row is degraded in `anonHandleTyIx`; left to the shape-row lane |
+  | `never` result spelled `void` | 2 / 3 | both: `void` is the rep (D1972) | a typed consumer maps `never` to the `void` rep |
+  | flow-pinned instance whose `F` binds to the `()=>_` placeholder | 2 / 6 | the spelling; the typed side is degraded | left; see below |
+  | apart join at a let, `T[] \| i32[]` | 3 / 7 | D10521, already ruled | the let's rep comes from the apart-join knowledge |
+
+  The other #4545 rows are the same type under resolution. That covers the nominal-against-
+  structural families (`Dot[]`, `Rows<Node>`, `Rec`/`Rec2` under the structural-records ruling),
+  alias names, member order, subsumed literal arms and `K` against `"x"|"y"`. The probe counted
+  them in five sites:
+
+  | site | files | events |
+  | --- | --- | --- |
+  | return | 73 | 105 |
+  | parameter | 50 | 107 |
+  | `tvV` | 31 | 58 |
+  | let | 10 | 18 |
+  | annotation | 2 | 3 |
+
+  Member order and literal arms change box tags, so they wait on D3.
+
+  `type-param-shadows-alias-funcdecl-constructors.vl` disagreed only against the node type.
+  Inside `appI<Id>` beside `type Id = i32`, the annotation node resolves `Id` as the alias. The
+  first instance's keep-node arm in `monoMakeInstanceParams` also records its own type on the
+  template's node. Against the declared signature the row agrees.
+
+  What step 1 takes from this:
+  - **A parameter's typed product is `pinnedTyIx`** (the argument's type), not
+    `monoSubstInst` of the declaration.
+  - **A consumer that substitutes a declaration reads `monoDeclParamTys`**, never
+    `nodeTyIxOf(p.parType)`.
+  - **The flow table's typed pins come next.** `monoNoteBindDeliveryCall` and
+    `monoRenameInitAt` call `monoInstanceFor` with `monoSigPins(sig)` and `expTy` `-1`, so
+    `pinTys` is `-1` and `recordClonedNodeTyFb` binds `F` to the placeholder. Each one has to
+    hand `monoInstanceFor` the pin types the flow table already resolves
+    (`fnFlowDeclPathPinTysOf`, `monoPinFnParamTys`). That is a new parameter on all eight
+    callers, and no program misbehaves today.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
