@@ -126,7 +126,7 @@ the slice retires.
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
-| C3 | shape-intern walkers take field types (landed: 9 retired, 7 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
+| C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
@@ -343,6 +343,23 @@ What each slice changes:
     234 files, and `internFuncTypeShapesTy`'s nullable peel in 11. The other four produce a
     name the walk keys: the `internShapeDeepOfTy` render, the arm split (2 files differ), the
     map-value name (1 differs), and `structElemArrayLowerable`'s base name.
+  - Probed again and still left: 7, over the self-compile and 16,758 files, counting files. No
+    entry can move without a new type producer, which this slice does not add:
+    - The typed answers are not better. `tyIsFuncArena` disagrees with the paren-closure test
+      in 131 files. In 130 the TypeRef is named by a closure-signature mangle (`=>i>i`), and in
+      the other the name has lost its grouping parens. The typed `| null` peel differs in 232
+      and 11 files. Nearly all are an `A|B|null` that the arena holds as a nullable over a
+      union, while the walk keys the three-member set, so a typed peel would change the key.
+    - The no-type reaches come from two producers by design. `collectAnnShapes` gives no type
+      to a TypeRef that names a generic-alias parameter. `gaeInternAppFieldShapes` passes field
+      text that only exists after substitution. Between them they reach the paren-closure test
+      in 17 files, the nullable peel in 40 and the map-value recursion in 140, where the
+      spelling still answers.
+    - The keys cannot become renders. A render expands a declared record (`Circle` renders
+      `{r:i32}`) and softens a literal union (`K` renders `string`). It differs from the peeled
+      spelling in 1,334 files at the nullable recursion and 1,390 at the map value. The arena
+      also holds `Circle[]` and `{r:i32}[]` as one shape, while `structElemArrayLowerable`
+      admits the two differently.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
