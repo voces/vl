@@ -23167,6 +23167,11 @@ function monoPinHoleParam(
     anTy = rowTy[0]
   }
   if an == "" {
+    const ocTy: i32[] = [0 - 1]
+    an = monoHoleLamOwnCallsPin(callIx, oDecl, args, i, ctx, ocTy)
+    anTy = ocTy[0]
+  }
+  if an == "" {
     // A name handed through an identity call into a binding can take a slot per type.
     if nodeAt(args[i]) is Ident {
       fsAsk(args[i])
@@ -25711,8 +25716,17 @@ function monoHoleLamArgPin(
   ctx: i32,
   tyOut: i32[],
 ): string {
-  const x = unwrapParen(args[i])
-  if x < 0 || !(nodeAt(x) is FuncDecl) { return "" }
+  if monoHoleLamArgFe(args[i], ctx) < 0 { return "" }
+  let bt = monoHoleArgDemandTy(decl, args, i, ctx)
+  // A hole parameter the body calls takes the instance the checker bound at this call (D5935).
+  if bt < 0 { bt = monoHoleParamBindTy(callIx, decl, i) }
+  monoHoleLamPinAt(callIx, bt, args, i, ctx, tyOut)
+}
+
+// The slot of the hole lambda literal `a` in frame `ctx`, or -1 for any other argument.
+function monoHoleLamArgFe(a: i32, ctx: i32): i32 {
+  const x = unwrapParen(a)
+  if x < 0 || !(nodeAt(x) is FuncDecl) { return -1 }
   const lfe = monoLamValueFe(x, ctx)
   if (
     lfe < 0
@@ -25720,12 +25734,49 @@ function monoHoleLamArgPin(
     || monoGen[lfe] != 1
     || !monoLamIsHole(lfe)
   ) {
+    return -1
+  }
+  lfe
+}
+
+// `monoHoleLamArgPin` where nothing the call hands on or the checker bound types the parameter:
+// the one closed parameter list the body's own calls of it pass, as a call through a list of
+// hole functions reads each element's (D10793); "" when they pass none or two.
+function monoHoleLamOwnCallsPin(
+  callIx: i32,
+  decl: i32,
+  args: i32[],
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  if monoHoleLamArgFe(args[i], ctx) < 0 { return "" }
+  if decl < 0 || decl >= P.nodes.length { return "" }
+  const dn = nodeAt(decl)
+  if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return "" }
+  const qs: i32[] = []
+  const noPath: string[] = []
+  if !fnFlowCallPathAgreedPinTys(dn.fnParams[i], noPath, callIx, qs) {
     return ""
   }
-  let bt = monoHoleArgDemandTy(decl, args, i, ctx)
-  // A hole parameter the body calls takes the instance the checker bound at this call (D5935).
-  if bt < 0 { bt = monoHoleParamBindTy(callIx, decl, i) }
-  if bt < 0 || !monoTyConcreteFn(bt) { return "" }
+  const r = monoFnDeclRetAt(monoOpenFnArgDecl(args[i]), qs)
+  if r < 0 { return "" }
+  monoHoleLamPinAt(callIx, mkFuncTy(qs, r), args, i, ctx, tyOut)
+}
+
+// The pin of hole lambda `args[i]` of call `callIx` at closed function type `bt`, the lambda
+// instanced at it in place or by an instance of its own replacing the argument; "" for none.
+function monoHoleLamPinAt(
+  callIx: i32,
+  bt: i32,
+  args: i32[],
+  i: i32,
+  ctx: i32,
+  tyOut: i32[],
+): string {
+  const x = unwrapParen(args[i])
+  const lfe = monoHoleLamArgFe(x, ctx)
+  if lfe < 0 || bt < 0 || !monoTyConcreteFn(bt) { return "" }
   const sk = sigKeyOfTy(bt)
   const bf = tyAt(bt)
   if sk == "" || !(bf is TyFunc) { return "" }
