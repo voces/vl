@@ -2,7 +2,7 @@
 // lowers to, and the shape fields it parses.
 
 import { inferRetNameByNode, inferRetTyIxByNode } from "./check_infer_ret"
-import { isValueUnionTyOr, nameIsLitUnionType } from "./check_ty_rep"
+import { isValueUnionTyOr } from "./check_ty_rep"
 import {
   T,
   TyArray,
@@ -23,7 +23,6 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tySame,
-  tyToEmitName,
 } from "./check_types"
 import {
   rowCanonIdOfName,
@@ -44,6 +43,7 @@ import { isVariantSpelling, variantIndexOf } from "./emit_narrow_slots"
 import {
   fieldElemTyIxOfName,
   repCanonId,
+  repElemTyOfName,
   repNameCanonId,
   repOfTy,
   sFieldElemTyIxAt,
@@ -552,11 +552,6 @@ export function nameIsRecordSpelling(t: string): boolean {
   gaeIndexOf(gaeHeadNameOf(t, gaeLtAt(t))) >= 0
 }
 
-// Whether a row's recorded field type-name `elem` is a literal union.
-export function elemIsLitUnion(elem: string): boolean {
-  nameIsLitUnionType(elem)
-}
-
 // True unless the two nested-struct type spellings `ta` / `elem` are proven to denote
 // distinct structures: both resolve through the checker's canonical structural key
 // (`repNameCanonId`) and the keys differ. Either side unresolvable (-1) stays lenient —
@@ -575,11 +570,11 @@ export function nestedStructNamesCompat(ta: string, elem: string): boolean {
 
 // The arm whose own canonical render is `name` (D762) — strictly tighter than
 // `variantIndexOfTypeName` below, which is a lenient field-set match so an adopted
-// literal's render can reach the arm the adoption already chose. This asks whether canon,
-// rendering the arm itself, would produce exactly this string — the container-element question.
+// literal's render can reach the arm the adoption already chose. Asked of the arena type
+// `name` resolves to, field by field in order — the container-element question.
 export function variantIndexOfOwnRender(name: string): i32 {
   if !nameIsShapeOpen(name) { return -1 }
-  variantRowOwnRender(name, -1)
+  variantRowOwnRender(jrOneRecordOf(repElemTyOfName(name)), true)
 }
 
 // The arm whose own type renders as the record `ty` does — the arm recorded at that record
@@ -587,7 +582,7 @@ export function variantIndexOfOwnRender(name: string): i32 {
 export function variantRowOfOwnRenderTy(tyIn: i32): i32 {
   const ty = jrOneRecordOf(tyIn)
   if ty < 0 { return -1 }
-  variantRowOwnRender("", ty)
+  variantRowOwnRender(ty, false)
 }
 
 // `isVariantSpelling`, then the arm whose record is the tested record's type spelled by shape:
@@ -603,18 +598,16 @@ export function isVariantSpellingOfShape(variant: string, tyIx: i32): string {
   uVariants[vi]
 }
 
-// The one arm scan both keys share: the first arm rendering as `name` when it is not "", else
-// the first matching the record `ty`; -1 for none.
-function variantRowOwnRender(name: string, ty: i32): i32 {
+// The one arm scan both keys share: the first arm that is the record `ty` or has its fields in
+// its order, each spelled alike; `exact` also keeps a literal field apart from its base, as the
+// arm's own render does. -1 for none.
+function variantRowOwnRender(ty: i32, exact: boolean): i32 {
+  if ty < 0 { return -1 }
   let vi = 0
   while vi < uVariants.length {
     if vi < uVarTyIx.length && uVarTyIx[vi] >= 0 {
       const a = uVarTyIx[vi]
-      if name != "" {
-        if tyToEmitName(a) == name { return vi }
-      } else if a == ty || jrSameFieldSeq(a, ty, 0) {
-        return vi
-      }
+      if a == ty || jrSameFieldSeq(a, ty, 0, exact) { return vi }
     }
     vi = vi + 1
   }
@@ -634,13 +627,13 @@ function jrOneRecordOf(ty: i32): i32 {
   if m0 < 0 || !(tyAt(m0) is TyObj) { return -1 }
   for m in ms {
     if m < 0 || !(tyAt(m) is TyObj) { return -1 }
-    if !jrSpelledAlike(m, m0, 0) { return -1 }
+    if !jrSpelledAlike(m, m0, 0, false) { return -1 }
   }
   m0
 }
 
 // Whether records `a` and `b` have the same fields in the same order, each spelled alike.
-function jrSameFieldSeq(a: i32, b: i32, depth: i32): boolean {
+function jrSameFieldSeq(a: i32, b: i32, depth: i32, exact: boolean): boolean {
   if a < 0 || a >= T.tys.length || b < 0 || b >= T.tys.length { return false }
   const ta = tyAt(a)
   const tb = tyAt(b)
@@ -653,7 +646,12 @@ function jrSameFieldSeq(a: i32, b: i32, depth: i32): boolean {
       while k < na.length {
         if na[k] != nb[k] { return false }
         if (
-          !jrSpelledAlike(ta.objFieldTypes[k], tb.objFieldTypes[k], depth + 1)
+          !jrSpelledAlike(
+            ta.objFieldTypes[k],
+            tb.objFieldTypes[k],
+            depth + 1,
+            exact,
+          )
         ) {
           return false
         }
@@ -666,29 +664,34 @@ function jrSameFieldSeq(a: i32, b: i32, depth: i32): boolean {
 }
 
 // Whether field types `a` and `b` render alike: one literal-union alias, one primitive (a
-// literal spells its base), or the same shape all the way down.
-function jrSpelledAlike(a: i32, b: i32, depth: i32): boolean {
+// literal spells its base unless `exact`), or the same shape all the way down.
+function jrSpelledAlike(a: i32, b: i32, depth: i32, exact: boolean): boolean {
   if a == b { return true }
   if depth > 8 || a < 0 || b < 0 { return false }
   if litUnionAliasNameOfTy(a) != litUnionAliasNameOfTy(b) { return false }
   const pa = tyEmitPrimOf(a)
   const pb = tyEmitPrimOf(b)
-  if pa != null || pb != null { return pa == pb }
+  if pa != null || pb != null {
+    if exact && !(tyAt(a) is TyPrim && tyAt(b) is TyPrim) {
+      return tySame(a, b)
+    }
+    return pa == pb
+  }
   if tySame(a, b) { return true }
   const ta = tyAt(a)
   const tb = tyAt(b)
   // Exhaustive over `Ty` and `_`-less: only a shape, a list or a nullable spells its parts.
   match ta {
     TyObj => {
-      return jrSameFieldSeq(a, b, depth + 1)
+      return jrSameFieldSeq(a, b, depth + 1, exact)
     }
     TyArray => {
       const eb = tyArrayElemIx(b)
-      return eb >= 0 && jrSpelledAlike(ta.aElem, eb, depth + 1)
+      return eb >= 0 && jrSpelledAlike(ta.aElem, eb, depth + 1, exact)
     }
     TyNullable => {
       if tb is TyNullable {
-        return jrSpelledAlike(ta.nInner, tb.nInner, depth + 1)
+        return jrSpelledAlike(ta.nInner, tb.nInner, depth + 1, exact)
       }
     }
     TyPrim | TyErr | TyUnion | TyVar | TyLit | TyNeg | TyFunc | TyMap => {
