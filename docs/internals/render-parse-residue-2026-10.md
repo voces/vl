@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 6 retired, 15 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 7 retired, 14 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -808,8 +808,18 @@ What each slice changes:
     differs from the render in 13 files at `coalesceResultUnionName`, 10 at `ifJoinUnionName`
     and 12 at `valueUnionRenderOfTy`, mostly a union the arena does not call a value union
     (`i64|i32` with a literal member) and holes. The type-keyed row's name differs more, because
-    a row's member order is its first mint's. `ifJoinUnionNameIn` agrees in all 5 files at its
-    value-union rung, but its nullable-box fallback returns the render, which no file reaches.
+    a row's member order is its first mint's: taking the key text, and the row's name when the
+    member set is a value union, differs in 91 files at `coalesceResultUnionName`, 18 at
+    `ifJoinUnionName` and 63 at `valueUnionRenderOfTy`. These readers wait on a typed answer that
+    widens a literal member to its base and keeps the render's member order, the way
+    `tyToEmitName` names `9000000000 | 1` as `i64|i32`.
+  - Done: 1 render. `ifJoinUnionNameIn` names its value-union rung by `valueUnionKeyTextOfTy`,
+    which agrees with the render in all 5 files that reach it, and its nullable-box fallback by
+    the row `unRowOfKey` finds. No file reaches that fallback with a box, nor do six hand-written
+    generic joins, because `ifJoinUnionName` names them first. `ifJoinUnionName` itself passes
+    its row rung no name, and its nullable-box fallback takes the row's name too: 1 of 153 files
+    differs by string (rv3310), where neither name finds a row. Its value-union rung still
+    returns the render. difftree `--identity` found 0 of 16,510 files differ.
   - Done: 1 render. `anonUnionFieldName` names a value-union field by `valueUnionKeyTextOfTy`,
     which agreed with the render in all 72 file and union pairs that reach it. A record or list
     field takes the name of the row `unRowOfKey`, `unRowOfCanon` or the softened key finds.
