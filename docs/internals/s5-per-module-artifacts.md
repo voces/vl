@@ -16,8 +16,9 @@ This doc covers:
 6. the cache key;
 7. the ordered steps and the gate on each.
 
-Steps 1, 2, 3a and 3b have landed (§8 to §11). Step 4, per-module emission against local
-numbering, is in review (§12).
+Steps 1 to 4 have landed (§8 to §12). Step 5, `-O` after link, is in review (§13): the
+optimiser already ran once, after the module was finished, and step 5 names what `-O` still
+changes in the emitter.
 
 ## 1. What a body encodes: the census
 
@@ -133,6 +134,11 @@ growth-budget decision is global. Artifacts are therefore unoptimised, and `-O` 
 over the linked module. An unoptimised build (the `vl test` default) needs no optimiser
 pass at all, which is what makes artifact reuse pay off for test runs.
 
+The optimiser already works this way (§13). It reads only the emitted module's bytes, in a
+fresh compiler instance. The emitter still makes a few choices differently under `-O`, so an
+artifact built for an `-O` build is not the artifact a plain build uses. The key in §6
+carries that flavour.
+
 ## 6. The cache key
 
 An artifact is keyed on:
@@ -142,7 +148,8 @@ An artifact is keyed on:
   covers the readings the check bank serves on;
 - the whole-program facts the bodies read (design §5 need 4), each either computed from the
   key or moved to link;
-- the compiler's own hash, as the whole-compile cache keys today.
+- the compiler's own hash, as the whole-compile cache keys today;
+- the emitter flavour: whether the build is `-O`, and `--low-memory-unused` (§13).
 
 An instance's key is (template interface hash, canonical type arguments, compiler hash).
 `iface_hash` is reused unchanged. What is new is that codegen must not read anything the key
@@ -178,14 +185,18 @@ on program behaviour instead.
    instances as demands (§4), still inside one compile and still linked at once. Gates:
    the fixpoint, plus a **key-coverage test**. One module compiled under two different
    importer sets must give the same artifact whenever its key is equal. This is where
-   design §5 need 4, the whole-program facts, is settled fact by fact. (In review, §12.)
+   design §5 need 4, the whole-program facts, is settled fact by fact. (Landed, §12.)
    This step is the exception to byte identity. The canonical type order and the
    literal-type pool change normal builds, and are graded on behaviour instead. Types, tags,
    atoms, runtime helpers and lambdas are keyed per module, and invariance holds on three
    sets. A function's frame mints its scratch slots on first use (§12, "Function frames");
    the facts that stay program-wide are listed there.
 5. **`-O` after link.** Move the optimiser behind the link. Gates: identity on `-O` builds,
-   the plumb-shape cost gate, and seed-size.
+   the plumb-shape cost gate, and seed-size. (In review, §13.) The optimiser already ran
+   once, over the finished module, in its own compiler instance that reads only bytes, so no
+   pass moved. What `-O` still changes is two emitter decisions, the map-set helper and the
+   pooled-string fill, plus `--low-memory-unused` addressing. Those stay flavour bits that
+   step 6's key carries.
 6. **Switch-over: the artifact cache.** The host stores artifacts and instances under §6's
    keys and links a build from them. Gates: every gate on master, with
    `VL_COMPILE_CACHE_VERIFY=1` comparing a cached link against a cold build. The hit rate is
@@ -651,3 +662,64 @@ and reservations. L2 guest fuel:
 - the master seed on its own source: 89,741,422,205;
 - the master seed on this source: 89,547,985,463 (−0.22%);
 - the new seed on this source: 88,775,239,636 (−0.86% with the source held fixed).
+
+## 13. Step 5: `-O` after link
+
+**The optimiser already ran after the module.** The host emits the whole module first. Then
+`opt_pipeline` (`scripts/vl-host/src/main.rs`) loads a fresh compiler instance, stages the
+bytes, and drives `optPipeStart` to its end. It does this once per build, only when a `-O`
+or `-O3` rung is set, and `-O3` wins when both are given. A plain build never enters the
+chain. The chain's import closure is the `opt_*` modules, `wasm_read`, `wasm_write`,
+`wasm_names` and `listutil`, and only `entry.vl` re-exports it to the host. So the optimiser
+reads no emitter state, and an artifact cannot have been through an optimiser pass. No pass
+had to move.
+
+**The linked module is the module `-O` reads.** Under the `-O` flavour, an armed compile
+re-linked through `emitLinkSection` equals the direct output:
+
+| set | artifacts | functions | value rows | differ |
+| --- | --- | --- | --- | --- |
+| self-build | 226 | 14,226 | 20,365 | 0 |
+| `tests/cases`, 5,086 modules | 6,099 | 84,642 | 56,250 | 0 |
+
+**What `-O` still changes in the emitter.** Before emission the host calls `setOptimized(1)`
+and, with `--low-memory-unused`, `setLowMemoryUnused`. Five functions read the two flags:
+
+| reader | flag | plain | `-O` |
+| --- | --- | --- | --- |
+| `assignSharedHelperIndices` (`emit_sections.vl`) | `gOptimized` | a map set calls `__map_set_<row>__` | the store is inline, where binaryen can scalarise the map |
+| `strFillPlan` (`emit_sections.vl`) | `gOptimized` | long pooled strings fill from a passive segment | each is built inline |
+| `emitMemAddr`, `emitLowMemAccessorCall`, `emitCallCoreUserFn` (`wasmEmit.vl`) | `gLowMemUnused` | the address is computed | its constant folds into the memarg |
+
+Over the 4,315 single-file cases, the `-O` flavour changes 782 modules: 694 by the map-set
+helper alone, 26 by the pooled-string fill as well, and 62 only in the type section, where
+the map-set functype is reserved. Over the 5,086 armed case builds, 894 have at least one
+artifact that differs between the plain and `-O` flavours, 1,444 of 6,099 artifacts in all.
+
+These choices stay in the emitter. Moving them behind the link would change `-O` output,
+which this step must keep byte for byte. So the flavour joins the artifact key (§6). The
+whole-compile cache already keys both flags.
+
+**The test.** `tests/vl_opt_after_link_test.ts` holds three claims:
+
+- the optimiser's import closure is bytes only, and `entry.vl` is its only importer;
+- the flavour readers are exactly the five above, so a new one fails until it is named here
+  or moved behind the link;
+- the host runs the chain 0 times for a plain build and once for `-O`, `-O3` and `-O -O3`,
+  counted by the multi-value step's header under `$VL_MV_EXPLAIN`.
+
+Two controls fail the first half: an `opt_scan.vl` import of `emit_state`, and an
+`emit_link.vl` import of `opt_scan`.
+
+**Gates.** No compiler source changed. The seed is byte-identical to master's, two
+refreshes in a row give the same bytes, and so plain and `-O` builds are unchanged. Seed
+5,676,488 bytes against the 5,914,725 baseline. The plumb-shape cost gate passes: main fuel
+−3.1%, tail fuel −3.2%, RSS −2.2% against its baseline. L2 fuel moves 0.
+
+**What step 6 needs.** Step 6 must key artifacts on the flavour, or move the map-set and
+pool-fill choices behind the link and accept the change to `-O` output. It also needs the
+§12 residue settled:
+
+- `gMapDeletes`;
+- the generic template slots and instance demands;
+- the program tail, the runtime artifact and the band tables.
