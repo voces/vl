@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 5 retired, 25 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -330,6 +330,21 @@ What each slice changes:
   - the `nameIsNul*` niche ladders and `annSpelledArray`;
   - the generic-alias test and `inferRetIsLitUnionAt`;
   - the remaining name-grammar tests.
+
+  A probe ran over the self-compile and 16,554 fixture and corpus files. Counts are files.
+  - Done: 2 parses. `inferRetIsLitUnionAt`'s fallback for an entry with no row was reached by
+    no file, so that entry now answers false. `internCloResultSpine` asks `tyStepRet` whether a
+    level's result is a closure. It was reached in 87 files and differed in 0.
+  - Left: `annSpelledArray`'s name fallback. It was reached in 6,052 files, had no type in 54,
+    and disagreed with the type in 6. Those 6 are union-of-list annotations and a type
+    parameter that shadows an array alias.
+  - Left: `nameIsNulClosure`. Its `collectCloSigs` caller agreed with the type everywhere, but
+    `cloNameSigKeyTy`'s fallback (1 file) and `nameFieldCode` (3 files) hold only a name and
+    answer true.
+  - Left: `nullClosureArrElem`. Both callers agreed with the type, but the element spelling it
+    returns is parsed again by `internCloSigOfAtom`.
+  - Left, not probed: the niche ladders, the name-grammar tests and the spelling walkers. Their
+    callers hold only a name.
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
   slot by element type. This turns most of the B key producers into dead code. A probe compared
   the spelling's name with the row that `rlSlotOfTy` keys by the node's element type, at fifteen
