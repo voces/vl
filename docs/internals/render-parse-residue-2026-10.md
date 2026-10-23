@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 4 retired, 12 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 4 retired, 13 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -369,10 +369,15 @@ What each slice changes:
     fallback was reached in 1 file of 16,852, where the type was present and the spelling
     keyed `""` as well. `collectCloSigs` asks `nodeTyIsNulClosure`, which agreed with the
     spelling in all 3,655 files that reach it.
-  - Left: `nameIsNulClosure`. `nameFieldCode` (3 files) and `exprNulClosure`'s
-    `calleeCloRetName` rung still hold only a name.
-  - Left: `nullClosureArrElem`. Both callers agreed with the type, but the element spelling it
-    returns is parsed again by `internCloSigOfAtom`.
+  - Done: 1 parse. `nullClosureArrElem` and `cloArrElemNameOf` are deleted. Both
+    `collectCloSigs` passes intern a closure-array element's `$fnsig` from the element type
+    (`cloArrElemFuncTyOf`). The TypeRef pass, reached in 281 of 16,855 files, keyed differently
+    in 2 files, where the spelling keyed `""` and the type keyed the element. Both build
+    byte-identical modules with the same output, because another pass already interns that
+    signature. The union-arm pass (13 files) agreed in every file. `exprNulClosure`'s
+    `calleeCloRetName` rung is deleted too: it was reached in 1,859 files and in the
+    self-compile, and never answered true.
+  - Left: `nameIsNulClosure`. Only `nameFieldCode` (3 files) still holds only a name.
   - Left, not probed: the niche ladders, the name-grammar tests and the spelling walkers. Their
     callers hold only a name.
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
