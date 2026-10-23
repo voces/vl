@@ -239,6 +239,38 @@ What each slice changes:
   Step 2 changes instance identity, so it is an `--allow-diff` change. After step 1,
   `monoSubstAnn`'s 18 call sites and `monoBindFromAnn`'s 4 in `emit_mono` move off the spelling, and the
   walkers' 12 entries leave with them.
+
+  **Step 1 cannot be byte-identical, and the typed column is not yet right.** A second probe
+  (2026-10-22, master `ba14205a8`, the same population) rendered each typed product three ways:
+  `tyToEmitName`, `tyToNominalName` and `arenaEmitName`.
+
+  | site | all three match | only nominal or arena matches | spelling is a handle | same type, other spelling | different type |
+  | --- | --- | --- | --- | --- | --- |
+  | `tvV` vs `letBT` | 7,859 | 1,151 | 277 | 7 | 3 (+ 93 `letBT` misses) |
+  | param pin vs `monoSubstInst` | 8,591 | 1,563 | 2,084 | 67 | 19 |
+  | return `rs` vs `sub2` | 2,481 | 374 | 59 | 88 | 12 |
+  | let annotation vs `s2` | 680 | 165 | 80 | 8 | 17 |
+
+  A handle is a `=>` signature key, an `#anonN` row, a `#luN` literal union or an `X$m<hash>`
+  name. Same type, other spelling covers union member order, kept grouping parentheses, an
+  alias inside a union and literal members. Those are spelling-only: the typed form is the
+  normal one, so the instance's TypeRef text and key would change. Step 1 needs a composite
+  renderer (signature key, then row handle, then `tyToNominalName`), and it is still an
+  `--allow-diff` change.
+
+  Ablation found typed-side defects among the different-type rows, so step 1 cannot just swap
+  the column in:
+  - D10520: an inline record argument's map binding is stale across calls.
+  - D10521: a generic body's inferred `T[] | i32[]` loses its `i32[]` arm.
+  - `monoSubstInst` keeps a duplicate member. `f<i32 | string>` at `T | string` gives
+    `i32|string|string`, and `type-param-list-join-storage-apart.vl` gives `i32|i32|null`.
+  - The arena collapses same-shape records (`Rec`/`Rec2`). This is the structural-records
+    ruling, but the spelling keeps them apart.
+  - An inferred `f(s)` at `T | string` leaves `T` unbound in `letBT`.
+
+  The probe also found a live clause-1 defect that is unrelated to C1, D10522. Revised order:
+  first fix the typed column (D10520, D10521, the duplicate member and the `letBT` misses), then
+  build the composite renderer, then do step 1 graded on behaviour.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
