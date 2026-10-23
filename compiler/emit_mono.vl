@@ -20428,13 +20428,23 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
   let j = 0
   while j < args.length {
     let pt = -1
+    let axs = monoParamHeldFns(args[j])
     if monoNamesDeclaredGeneric(args[j], ctx) {
+      axs = [monoOpenFnArgDecl(args[j])]
+    }
+    if axs.length > 0 {
       const qs: i32[] = []
       const noPath: string[] = []
-      const ax = monoOpenFnArgDecl(args[j])
-      if ax >= 0 && fnFlowDeclPathAgreedPinTys(f.fnParams[j], noPath, qs) {
-        const r = monoFnDeclRetAt(ax, qs)
-        if r >= 0 { pt = mkFuncTy(qs, r) }
+      if axs[0] >= 0 && fnFlowDeclPathAgreedPinTys(f.fnParams[j], noPath, qs) {
+        // Every function a parameter can hold is taken at the one instance the pins give.
+        for ax in axs {
+          const r = monoFnDeclRetAt(ax, qs)
+          const at = if r >= 0 { mkFuncTy(qs, r) } else { -1 }
+          if at < 0 || (pt >= 0 && sigKeyOfTy(at) != sigKeyOfTy(pt)) {
+            return none
+          }
+          pt = at
+        }
       } else if !monoSubtreeReads(f.fnBody, f.fnParams[j]) {
         pts.push(-1)
         j = j + 1
@@ -20448,6 +20458,47 @@ function monoElemParamTys(el: i32, args: i32[], ctx: i32): i32[] {
     j = j + 1
   }
   pts
+}
+
+// What call `n`, through list elements or `if` arms, hands as un-annotated parameters: 2 when
+// one's type still holds a hole, 1 when each such one's is closed, 0 when it hands none.
+function monoElemsParamArgs(n: Call): i32 {
+  if monoCalleeElems(n.callFn).length == 0 { return 0 }
+  let out = 0
+  for a in n.callArgs {
+    const x = unwrapParen(a)
+    if x >= 0 && x < P.nodes.length && nodeAt(x) is Ident {
+      const d = identDeclOf(x)
+      if d >= 0 && d < P.nodes.length {
+        const dn = nodeAt(d)
+        if dn is Param && dn.parType < 0 {
+          if tyHasTyVar(nodeTyIxOf(x)) { return 2 }
+          out = 1
+        }
+      }
+    }
+  }
+  out
+}
+
+// The declared functions the un-annotated parameter read `a` can hold, each once; empty when it
+// is no such read or can hold anything else (D7845).
+function monoParamHeldFns(a: i32): i32[] {
+  const none: i32[] = []
+  const x = unwrapParen(a)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return none }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return none }
+  const dn = nodeAt(d)
+  if !(dn is Param) || dn.parType >= 0 { return none }
+  const noPath: string[] = []
+  const out: i32[] = []
+  for v in fnFlowDeclPathHeldSrcs(d, noPath) {
+    const g = if nodeAt(v) is FuncDecl { v } else { monoFlowLeafGen(v) }
+    if g < 0 || !(nodeAt(g) is FuncDecl) { return none }
+    if !i32ListHas(out, g) { out.push(g) }
+  }
+  out
 }
 
 // Whether the subtree at `ix` reads the declaration `d`.
@@ -24342,7 +24393,8 @@ function monoWalk(ix: i32, ctx: i32) {
       if !genCallee { monoCloseRetFnTy(ix, ctx) }
       if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
       let elemsTyped = 0
-      if monoGenArgAtOpenParam(n, ctx) {
+      const paramArgs = monoElemsParamArgs(n)
+      if monoGenArgAtOpenParam(n, ctx) || paramArgs > 0 {
         elemsTyped = monoOpenCallAtElems(n, ctx)
         if elemsTyped < 0 { return -1 }
       }
@@ -24353,6 +24405,9 @@ function monoWalk(ix: i32, ctx: i32) {
       if (callee is Index || calleeIf) && monoGenArgAtOpenParam(n, ctx) {
         return monoGenArgOpenFail(ix)
       }
+      // A parameter of open type handed through list elements asks the split as a generic does
+      // (D7845).
+      if elemsTyped == 0 && paramArgs == 2 { fsAskOpenCall(monoCallTplOf(ix)) }
       if callee is Ident {
         const wr = monoWalkIdentCall(n, callee, ix, ctx)
         if wr >= 0 && genCallee { monoCloseRetFnTy(ix, ctx) }

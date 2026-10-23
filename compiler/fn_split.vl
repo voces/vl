@@ -2651,6 +2651,41 @@ function fsHoleFwd(r: i32): i32 {
   gn.fnParams[j]
 }
 
+// The parameters read `r` is handed to as an argument of a call through list elements or `if`
+// arms naming declared functions, one per function the call reaches (D7845); empty otherwise.
+function fsHoleElemFwds(r: i32): i32[] {
+  const out: i32[] = []
+  const c = fsParent[r]
+  if c < 0 || c >= fsParseLen { return out }
+  const cn = nodeAt(c)
+  if !(cn is Call) || cn.callFn == r || fsCalleeFn(cn.callFn) >= 0 {
+    return out
+  }
+  let i = 0
+  while i < cn.callArgs.length && cn.callArgs[i] != r { i = i + 1 }
+  if i >= cn.callArgs.length { return out }
+  const done: i32[] = []
+  for e in fsIdents {
+    const ed = identDeclOf(e)
+    const p = fsParent[e]
+    if ed >= 0 && ed < fsParseLen && p >= 0 && !hasI32(done, ed) {
+      const edn = nodeAt(ed)
+      const listed = nodeAt(p) is ArrayLit
+        || fsIfArmOf(e) >= 0
+        || fsIfCalleeCallOf(e) >= 0
+      if edn is FuncDecl && listed {
+        done.push(ed)
+        if hasI32(fsFnCalls(fsFnOwner(ed)), c) {
+          const j = fsParamOfArg(cn, edn, i)
+          if j < 0 { return [-1] }
+          out.push(edn.fnParams[j])
+        }
+      }
+    }
+  }
+  out
+}
+
 // The argument-type keys parameter `par` is called at, through every hole it reaches by
 // forwards, a cycle among them included (D6091, D6202, D6203); sets `hsBad` when a reached hole
 // cannot take a parameter per type, or a read of one is neither a call, a forward nor a copy
@@ -2694,8 +2729,15 @@ function fsHoleKeys(par: i32): string[] {
                 if !hasStr(ks, lk) { ks.push(lk) }
               }
             } else if q < 0 {
-              hsBad = true
-              return ks
+              // A call through list elements forwards to each element's parameter (D7845).
+              const eqs = fsHoleElemFwds(r)
+              if eqs.length == 0 || hasI32(eqs, -1) {
+                hsBad = true
+                return ks
+              }
+              for eq in eqs {
+                if !hasI32(seen, eq) { seen.push(eq) }
+              }
             } else if !hasI32(seen, q) {
               seen.push(q)
             }
@@ -3122,6 +3164,11 @@ function fsPlanHoles(): i32 {
           if identDeclOf(r) == par {
             const q = fsHoleFwd(r)
             if q >= 0 && fsFixedDeliveryKey(r, q) == "" { work.push(q) }
+            if q < 0 {
+              for eq in fsHoleElemFwds(r) {
+                if eq >= 0 { work.push(eq) }
+              }
+            }
             const cd = fsHoleCopyDecl(r)
             if fsHoleCopyKeys(r).length > 1 && !hasI32(fsAsks, cd) {
               fsAsks.push(cd)
@@ -3500,7 +3547,13 @@ function fsPlanHoleRewrites(): i32 {
           fsRename(r, hsSlot(si, fsReadKey(r)))
         } else {
           const cks = fsHoleCopyKeys(r)
-          const q = fsHoleFwd(r)
+          let q = fsHoleFwd(r)
+          // A call through list elements is handed a slot per key of the elements' one key
+          // list (D7845).
+          if q < 0 {
+            const eqs = fsHoleElemFwds(r)
+            if eqs.length > 0 && eqs[0] >= 0 { q = eqs[0] }
+          }
           const qi = hsIx(q)
           const lcs = fsListElemCalls(r)
           // A copy read at two keys is the let plan's, which writes each slot from the
