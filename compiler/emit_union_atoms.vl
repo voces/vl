@@ -263,6 +263,10 @@ import {
   nulLitUnionPeelTy,
   tyMapValOf,
   tyMapValOfHeld,
+  tyPeelNul,
+  tyStepElem,
+  tyStepParam,
+  tyStepRet,
 } from "./tyquery"
 
 // The mv shape of a bare map spelling — `mvShapeOfValNameTys` of the map's value. One home, so
@@ -305,6 +309,8 @@ export function mvShapeOfMapNodeTy(ix: i32) {
   if nodeTyMapValIsNulLitUnion(ix) { return mapMonoShapeOfKey(ki) }
   const drs = mvDeclRecSlotOfTy(nodeMapValTyIx(ix), ki)
   if drs >= 0 { return drs }
+  // A hole value (an unconstrained `Map()`) has no value rep to intern.
+  if nodeMapValTyIx(ix) < 0 { return -3 }
   const fs = mvDeepFuncSlotOfTy(nodeMapValTyIx(ix), ki)
   if fs >= 0 { return fs }
   const sh = mvShapeOfValNameArmTy(
@@ -604,9 +610,15 @@ export function ensureRefElem(elemName: string) {
 
 // `ensureRefElem` with the caller's recorded arena type for `elemName` (D-REPELEMTY),
 // threaded to `rlInternNameTy` for the slot key only — classification still reads the
-// spelling, and the intern still mints on a miss. `ty` -1 = no hint; the k==9 recursion
-// stays unhinted, since the arm re-forms a name that can disagree with the arena.
+// spelling, and the intern still mints on a miss. `ty` -1 = no hint.
 export function ensureRefElemTy(elemName: string, ty: i32) {
+  ensureRefElemTys(elemName, ty, ty)
+}
+
+// `ensureRefElemTy` with the element's type `kindTy` held apart from the key hint `ty`:
+// `kindTy` only classifies a map element's value, so a caller whose hint is -1 by design
+// still hands over the type it holds. Either may be -1.
+export function ensureRefElemTys(elemName: string, ty: i32, kindTy: i32) {
   if elemName == "" { return -1 }
   const k = refArrElemKind(refElemArrName(elemName))
   if k == RLK_REF_LIST {
@@ -614,21 +626,17 @@ export function ensureRefElemTy(elemName: string, ty: i32) {
     // itself a ref array (kind 9), its inner element is `ty`'s own `aElem`, so the inner
     // intern needs no re-resolution of the spelling this line cuts.
     const inm = refArrElemName(elemName)
-    let inner = -1
-    if ty >= 0 {
-      const it = tyAt(ty)
-      if it is TyArray { inner = it.aElem }
-    }
+    let inner = tyStepElem(ty)
     if elemNameIsNominal(inm) { inner = -1 }
-    ensureRefElemTy(inm, inner)
+    ensureRefElemTys(inm, inner, tyStepElem(kindTy))
   }
-  ensureRefElemKindTail(elemName, k, ty)
+  ensureRefElemKindTail(elemName, k, ty, kindTy)
 }
 
 // The flag-setting and intern half of `ensureRefElemTy`, run after the kind is known and
 // any kind-9 recursion has finished — split out so the literal side (`collectA`) can reach
 // it with the kind its own classifier already chose, rather than re-deriving one.
-function ensureRefElemKindTail(elemName: string, k: i32, ty: i32) {
+function ensureRefElemKindTail(elemName: string, k: i32, ty: i32, kindTy: i32) {
   // A map element (kind 3): forces the map heap types and interns the element map's value
   // slot, so a typed-value map in any composition position resolves the same per-value map
   // struct a standalone `{[string]: V}` binding does. A mono or atom value interns nothing,
@@ -648,7 +656,7 @@ function ensureRefElemKindTail(elemName: string, k: i32, ty: i32) {
     mvShapeOfMapNameTys(
       mve,
       tyMapValOf(unMemPeelAliasWrapper(ty)),
-      tyMapValOfHeld(ty),
+      tyMapValOfHeld(kindTy),
     )
     // The one home that also sets `mI32Used` for an i32-keyed map reached only through a
     // map-typed ref-list element — every other map-forcing site sets `mUsed`/`lUsed`/`aUsed`
@@ -1204,17 +1212,47 @@ function markMapUnionArmsOf(atoms: string[], mems: i32[], cov: boolean) {
   0
 }
 
+// The function type of the one closure arm among `arms`, read off `ty`, the type they spell:
+// `ty` itself, its `| null` inner, or its one function member. -1 when either side holds two
+// closure arms, since nothing pairs them, or when `ty` is a hole.
+function cloArmFnTyOf(arms: string[], ty: i32): i32 {
+  let parens = 0
+  let ai = 0
+  while ai < arms.length {
+    if nameIsParenOpen(normTypeAtom(arms[ai])) { parens = parens + 1 }
+    ai = ai + 1
+  }
+  if parens != 1 { return -1 }
+  const t0 = tyPeelNul(ty)
+  if t0 < 0 || t0 >= T.tys.length { return -1 }
+  const k = tyAt(t0)
+  if k is TyFunc { return t0 }
+  if !(k is TyUnion) { return -1 }
+  let found = -1
+  let i = 0
+  while i < k.uMembers.length {
+    const m = tyPeelNul(k.uMembers[i])
+    if m >= 0 && m < T.tys.length && tyAt(m) is TyFunc {
+      if found >= 0 { return -1 }
+      found = m
+    }
+    i = i + 1
+  }
+  found
+}
+
 // Forces the shared map machinery and interns the mv value slot of a map reached only as a
-// closure result inside a composite annotation. The whole spelling is one TypeRef whose map
-// is invisible to every branch of the `collectA` scan, so the narrowed arm's call-result map
-// ops rejected "map type not collected". Self-gating: a name with no arrow or map forces nothing.
-export function forceCloResultMapTypes(nm: string) {
+// closure result inside composite annotation `nm` of type `ty` (or -1), which no `collectA`
+// branch can see, so its call-result map ops would find no map type. Self-gating: a name with
+// no arrow or map forces nothing; `ty` only classifies the result map's value.
+export function forceCloResultMapTypes(nm: string, ty: i32) {
   // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an
   // arrow and a map can carry a closure-result map — two substring scans, no
   // allocation, before the arm split allocates anything.
   if !strContains(nm, "=>") || !strContains(nm, "{[") { return 0 }
   const arms: string[] = []
   unionSetAtomsOf(nm, arms)
+  const fnTy = cloArmFnTyOf(arms, ty)
   let i = 0
   while i < arms.length {
     const a = normTypeAtom(arms[i])
@@ -1231,10 +1269,10 @@ export function forceCloResultMapTypes(nm: string) {
           mUsed = true
           lUsed = true
           aUsed = true
-          mvShapeOfMapName(res)
+          mvShapeOfMapNameTys(res, -1, tyMapValOfHeld(tyStepRet(fnTy)))
         } else if annArrowAt(res) >= 0 {
           // A curried result (`() => () => {[string]: V}`) recurses to ITS result.
-          forceCloResultMapTypes(res)
+          forceCloResultMapTypes(res, tyPeelNul(tyStepRet(fnTy)))
         }
       }
     }
@@ -1244,15 +1282,16 @@ export function forceCloResultMapTypes(nm: string) {
 }
 
 // Forces the wrapper/backing types of a scalar-leaf (or string) list reached only as a
-// closure's result or parameter inside a composite annotation. The whole spelling is one
-// TypeRef whose lists are invisible to every branch of the `collectA` scan, so a value call
-// found no list type. The list dual of `forceCloResultMapTypes`; parameters since D2399.
-export function forceCloResultListTypes(nm: string) {
+// closure's result or parameter inside composite annotation `nm` of type `ty` (or -1), which
+// no `collectA` branch can see, so a value call would find no list type. The list dual of
+// `forceCloResultMapTypes`; `ty` keys a ref-element list's slot.
+export function forceCloResultListTypes(nm: string, ty: i32) {
   // Cheap pre-gate (this runs per arena TypeRef): only a name spelling BOTH an arrow
   // and an array can carry a closure-result list — two substring scans, no allocation.
   if !strContains(nm, "=>") || !strContains(nm, "[]") { return 0 }
   const arms: string[] = []
   unionSetAtomsOf(nm, arms)
+  const fnTy = cloArmFnTyOf(arms, ty)
   let i = 0
   while i < arms.length {
     const a = normTypeAtom(arms[i])
@@ -1260,12 +1299,12 @@ export function forceCloResultListTypes(nm: string) {
     // test runs first so the one-char reject precedes the depth scan.
     if nameIsParenOpen(a) {
       const ret0 = annRetNameOf(a)
-      if ret0 != "" { forceCloListTypeOf(ret0) }
+      if ret0 != "" { forceCloListTypeOf(ret0, tyStepRet(fnTy)) }
       const ps: string[] = []
       annFnDecompose(a, ps)
       let pi = 0
       while pi < ps.length {
-        forceCloListTypeOf(ps[pi])
+        forceCloListTypeOf(ps[pi], tyStepParam(fnTy, pi, ps.length))
         pi = pi + 1
       }
     }
@@ -1274,9 +1313,11 @@ export function forceCloResultListTypes(nm: string) {
   0
 }
 
-// `forceCloResultListTypes` for one position's type name `t`, its `| null` peeled.
-function forceCloListTypeOf(t: string) {
+// `forceCloResultListTypes` for one position's type name `t` and its type `tTy` (or -1),
+// both with their `| null` peeled.
+function forceCloListTypeOf(t: string, tTy: i32) {
   const res = nonNulBaseOf(normTypeAtom(t))
+  const resTy = tyPeelNul(tTy)
   // The scalar-element backings via the one home (`scalarListRepOfName`).
   const sk = scalarListRepOfName(res)
   if sk == "strlist" {
@@ -1299,10 +1340,10 @@ function forceCloListTypeOf(t: string) {
     // producer interned, or the read finds no wrapper.
     rlUsed = true
     raUsed = true
-    ensureRefElem(refArrElemName(res))
+    ensureRefElemTys(refArrElemName(res), -1, tyStepElem(resTy))
   } else if annArrowAt(res) >= 0 {
     // A curried position (`() => () => f32[]`) recurses into its own positions.
-    forceCloResultListTypes(res)
+    forceCloResultListTypes(res, resTy)
   }
   0
 }

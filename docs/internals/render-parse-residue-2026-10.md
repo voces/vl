@@ -1004,6 +1004,34 @@ What each slice changes:
        in 75 files, so none of C5's spelling tests, D8's map-value rungs, A1's
        `mapValKindLowerable`, C4's field-code arms or `mvValKindOfName` retire yet;
        `fieldCodeOfSpelling`'s spelling legs are still reached with no type.
+
+       Partly done (map-value producers): 75 files down to 37, over 16,620 files, with the
+       control (`unions/anon-arm-map-value.vl`, 98 typed events) tripping. difftree
+       --identity: 11,651 built, 0 differ. Nothing retires, because the name leg is still
+       reached. The moves, by caller tag, with files untyped before and after:
+
+       | caller | before | after | how |
+       | --- | --- | --- | --- |
+       | `forceCloResultMapTypes` result mint | 18 | 0 | `collectATypeRef` passes the node type; the closure arm's `TyFunc` gives the result map's value |
+       | `ensureRefElemKindTail` map-element mint | 13 | 1 | `ensureRefElemTys` holds the classifying type apart from the key hint, so the literal side and `forceCloListTypeOf` hand over the element type and keep the key unhinted |
+       | `mvShapeOfMapNodeTy` hole value | 10 | 0 | an unconstrained `Map()` value answers `-3` from `nodeMapValTyIx` < 0; 10 of 10 files agreed with the name answer |
+       | `objMapFieldCompat` hole value | 6 | 0 | the same guard answers true; 6 of 6 files agreed |
+
+       Left, by caller, in files untyped (one file can hold two callers):
+       - 12: `shapeFieldTypeCompatK`'s query, a field type cut from shape text (step 2).
+       - 7: `annRetKindTy`'s map arm, reached from `sigRetTokOfTy`. The result type is an
+         index-hook record (`{[]: (i32) => i32}`), not a map. `nameIsBareMap` reads its
+         `{[` spelling as a map, so `tyMapValOfHeld` has nothing to give. Asking the type
+         would change those signature keys; not tried.
+       - 4: `{x: i32}` map arm of a union whose row is uncovered (`emit_classify`'s
+         index-read fallback; `unionMapArmNameTy` gives no member type).
+       - 4: `mvShapeOfValNameRowTy` for a record's function-typed field with a hole row type.
+       - 7: `collectATypeRef`'s interior TypeRefs, which have no arena type. The parent has
+         to supply it.
+       - 2: `fieldCodeOfSpelling`'s `recTy < 0` arm, from `mapValKindLowerable`.
+       - 1: a nested map element (`array-new-generic-pin-element-grid.vl`).
+       - 1: `mvSlotOfValNameFindK` with a mis-cut `mvValName` (`i64}|nul`, in
+         `maps/store-null-nullable-value-map.vl`). Not filed yet.
     3. Done: the slot finds pass a type. 8 files still have none, because their caller banked
        no `mvValTyIx`/`rlElemTyIx`.
     4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in
