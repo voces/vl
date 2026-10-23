@@ -6238,6 +6238,63 @@ hashes `Cargo.toml`, so this change is one clean miss, then warm. The distribute
 (`scripts/build-binary.sh`, `release.yml`) builds the same `--release` profile and gets the
 change too.
 
+## Small modules compile on one rayon thread (2026-10-23)
+
+wasmtime validates and compiles a module's function bodies with `into_par_iter` on rayon's
+global pool, one pool thread per CPU. A module of a few functions gives that pool almost no
+work, and the woken threads spin before they sleep. A distilled-corpus cell is about 5 KB, so
+every grading worker paid that spin on every cell: on a quiet box, sys time was 12.5 of the
+`distilled corpus` row's 45 CPU-s. #4563 measured this first, by running the grader's workers
+under `RAYON_NUM_THREADS=1`.
+
+The host now does it for every caller. `by_module_size` (`scripts/vl-host/src/main.rs`) runs
+each `Module::new` and `Module::validate` of a module up to `SERIAL_COMPILE_MAX_BYTES` (64 KiB)
+inside a one-thread pool owned by the calling thread. `ThreadPool::install` makes that pool the
+current one, so wasmtime's `into_par_iter` stays on that one thread. Larger modules keep the
+global pool. These include the compiler seed (5.7 MB), its self-compile output, and consumer
+programs. An explicit `$RAYON_NUM_THREADS` turns the split off: that setting then sizes the
+global pool for every module.
+
+**Why not `Config::parallel_compilation(false)`.** It is a setting of the ENGINE, and one engine
+serves modules of every size. The seed engine validates a 5 KB cell and also compiles the 5.7 MB
+compiler on a sidecar miss. `vl run --batch`'s run engine compiles whatever the batch holds. So a
+per-module choice needs a per-call pool, not a per-engine flag.
+
+**The threshold is where the parallel wall gain outgrows the spin.** Measured on uncached
+`vl run <module>.wasm` (`VL_NO_CACHE=1`), 20 runs per arm, 3 interleaved rounds, at load about
+20. Each cell is per-run wall / CPU seconds:
+
+| module bytes | global pool | one thread |
+| --- | --- | --- |
+| 4,902 (corpus cell) | 0.018 / 0.028 | 0.023 / 0.018 |
+| 10,583 | 0.017 / 0.060 | 0.040 / 0.041 |
+| 26,941 | 0.030 / 0.103 | 0.113 / 0.076 |
+| 35,670 | 0.038 / 0.139 | 0.096 / 0.102 |
+| 120,739 | 0.175 / 0.477 | 0.403 / 0.419 |
+| 278,952 (single run) | 0.32 / 1.02 | 0.76 / 0.83 |
+| 603,654 (diderven `game.vl`, single run) | 1.38 / 2.80 | 2.39 / 2.53 |
+
+One thread always costs less CPU, but above a few tens of KB it costs several times the wall.
+That matters to a person waiting on `vl run` with a cold cache. 64 KiB covers the corpus cells
+and nearly every `tests/cases` program. The wall cost at that boundary is under 0.1 s, and only
+when the module cache misses.
+
+**What it bought** (interleaved A/B against the same tree's host, identical output in every pair):
+
+| workload | before CPU-s | after CPU-s | wall before → after |
+| --- | --- | --- | --- |
+| `distilled corpus` row, warm cache, load 3–4 (medians of 3) | 45.1 | 33.3 | 9.5 → 11.3 (bimodal 8.5/11.4 in both arms) |
+| the same, cold cell cache, load 3–4 | 138.0 | 88.9 | 15.9 → 28.5 |
+| `filed witnesses` row, `WITNESS_CACHE=0`, load 5–10 (medians of 3) | 90.4 | 81.6 | 43.2 → 41.5 |
+| `vl test src` in ~/diderven, warm and cold | no change | no change | its test modules are over the threshold |
+| ci-native (`selfhost_native_*` + `vl_*`), 2 rounds each | 790–857 | 703–857 | noise; nothing measurable |
+| L2 self-compile `vl build compiler/entry.vl` (medians of 3) | 18.1 | 18.8 | 19.95 → 19.84, byte-identical seed |
+
+On the distilled row the host change matches `RAYON_NUM_THREADS=1` (33.4 CPU-s in the same
+rounds), so #4563's environment setting adds nothing on top of it. A cold cell cache on an idle
+box loses wall, because four workers each compiling serially leave cores idle that the global pool
+used to fill. In the gate, rows compete for CPU, so the gate does not see that wall loss.
+
 ## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
 
 The owner asked whether `vl` should distribute with std baked in. It should, and the reason is

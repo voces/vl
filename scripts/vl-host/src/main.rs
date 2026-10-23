@@ -2703,22 +2703,45 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Modules up to this many bytes validate and compile on a one-thread rayon pool of the
+/// calling thread's own: wasmtime fans functions out over the global pool, whose woken
+/// threads only spin for a module of a few functions. Larger modules keep the fan-out.
+/// DECISIONS.md, "Small modules compile on one rayon thread".
+const SERIAL_COMPILE_MAX_BYTES: usize = 64 << 10;
+
+/// Run `f`, a validation or compile of a `len`-byte module, on the pool its size calls for.
+/// An explicit `$RAYON_NUM_THREADS` sizes the global pool and is used for every module.
+fn by_module_size<R: Send>(len: usize, f: impl FnOnce() -> R + Send) -> R {
+    thread_local! {
+        static SERIAL: Option<rayon::ThreadPool> =
+            rayon::ThreadPoolBuilder::new().num_threads(1).build().ok();
+    }
+    let explicit = std::env::var_os("RAYON_NUM_THREADS").is_some_and(|v| !v.is_empty());
+    if len > SERIAL_COMPILE_MAX_BYTES || explicit {
+        return f();
+    }
+    SERIAL.with(|pool| match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    })
+}
+
 /// Compile a USER module (`Module::new`), through the on-disk cache when one is
 /// available. A module the engine refuses returns `Module::new`'s own error, exactly
 /// as uncached; every cache failure is silent and falls back to compiling.
 fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
     if module_cache_disabled() {
         module_cache_trace("off", None);
-        return Module::new(engine, bytes);
+        return by_module_size(bytes.len(), || Module::new(engine, bytes));
     }
     let Some(root) = user_cache_root() else {
-        return Module::new(engine, bytes);
+        return by_module_size(bytes.len(), || Module::new(engine, bytes));
     };
     // Both levels: files live in `modules/`, and whoever controls `root` can swap it.
     let dir = root.join("modules");
     if private_cache_dir(&root).is_err() || private_cache_dir(&dir).is_err() {
         module_cache_trace("rejected (unsafe dir)", Some(&dir));
-        return Module::new(engine, bytes);
+        return by_module_size(bytes.len(), || Module::new(engine, bytes));
     }
     let wasm_hash = sha256(bytes);
     let tag = engine_cache_tag(engine);
@@ -2731,7 +2754,7 @@ fn user_module(engine: &Engine, bytes: &[u8]) -> Result<Module> {
         Err(Some(why)) => module_cache_trace(&format!("rejected ({why})"), Some(&path)),
         Err(None) => module_cache_trace("miss", Some(&path)),
     }
-    let module = Module::new(engine, bytes)?;
+    let module = by_module_size(bytes.len(), || Module::new(engine, bytes))?;
     if let Ok(artifact) = module.serialize() {
         write_module_cache(&path, &wasm_hash, &tag, &artifact);
         prune_cache_dir(&dir, &path, &[".cwasm"], module_cache_max_bytes());
@@ -6978,7 +7001,7 @@ fn disassemble_to_wat(wasm_path: &str, wat_path: &str) -> Result<()> {
 /// caller not to use it. `--no-validate` restores the old write-and-bless path
 /// for anyone who wants the artifact without the gate.
 fn validate_written_module(engine: &Engine, bytes: &[u8], path: &str) -> Result<()> {
-    Module::validate(engine, bytes).map_err(|e| {
+    by_module_size(bytes.len(), || Module::validate(engine, bytes)).map_err(|e| {
         Error::from(e).context(format!(
             "`{path}` is not a valid WebAssembly module — it was written, but it cannot \
              instantiate (this is a compiler emit bug; `--no-validate` skips this check)"
@@ -9664,7 +9687,7 @@ fn pump_session(
                 if let Some(f) = fault {
                     inject_fault(f, &mut bytes)?;
                 }
-                match Module::validate(&engine, &bytes) {
+                match by_module_size(bytes.len(), || Module::validate(&engine, &bytes)) {
                     Ok(()) => {
                         if let Some(dir) = &keep_dir {
                             keep_module(dir, &cmd_path.read(&mut store)?, &bytes)?;
@@ -11118,7 +11141,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
             )
         },
         |r: &(Vec<u8>, Option<(Store<()>, Instance)>)| {
-            Module::validate(&compile_engine, &r.0)
+            by_module_size(r.0.len(), || Module::validate(&compile_engine, &r.0))
                 .is_ok()
                 .then(|| r.0.clone())
         },
@@ -11302,7 +11325,7 @@ fn build_cmd(args: &[String]) -> Result<()> {
             chain,
             |b: &Vec<u8>| {
                 let (m, _) = unpack_opt_result(b)?;
-                Module::validate(&compile_engine, &m)
+                by_module_size(m.len(), || Module::validate(&compile_engine, &m))
                     .is_ok()
                     .then(|| b.clone())
             },
