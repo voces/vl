@@ -958,10 +958,35 @@ What each slice changes:
       `emit_atom_kinds`, `memberIsClosure` and `emitNarrowedMem` read it as a row identity.
       It moves when those ask `variantRowOfTy(narrowSlotTy(i))` first, and the closure reader
       takes the slot's type.
+      - Measured 2026-10-23: the closure reader cannot take the type without
+        `narrowedValueAtomOf` (`emit_start_block`) answering from the type too. With
+        `identIsBoundClosure`, `exprIsClosure` and the callee's signature key reading the
+        slot's type, the new case gets past `call to unknown function` and then builds invalid
+        wasm, because the ident read's unbox in `wasmEmit` asks `valueAtomKind` and
+        `unionSetHasAtom` of `narrowedValueAtomOf`'s spelling. The "an atom kind" readers
+        below have to take a kind or a type first. `emit_start_block` was the D5 lane's.
     - `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74
       files, where the complement has no member-set id, and it changes the spelling in 55 of
-      them. A typed slot no longer reaches it (`pushNarrowLess`'s typed arm). The fallback is
-      in `emit_base`, which the map-value-kind lane holds.
+      them. A typed slot no longer reaches it (`pushNarrowLess`'s typed arm).
+      - Done: `mvUnionIsScalarNull`'s tail takes the non-`null` atom of its two-member set
+        instead of subtracting `null` from the spelling, so `removeAtomRestOf` is the
+        fallback's one caller. Identity sweep: 0 differ.
+      - Callers, from a probe tagged per call site over the same 74 files. Counts are files
+        that reach the fallback, then files where it changes the spelling: `narrowIsElse`'s
+        struct-complement ident arm 32 / 15, its value-union ident arm 29 / 29,
+        `narrowValueNonNull` 5 / 4, `narrowStructNonNull` 4 / 3, `narrowIsElseIndex` 4 / 4,
+        `narrowIsElseMember` 3 / 2, `pushIndexMapComplement` 1 / 1, and `emit_ty_canon`'s
+        `indexCellCurSlot` 1 / 0. The other 14 tagged call sites, `wasmEmit`'s four among
+        them, reach it in 0.
+      - Why there is no id: the set ADT is a mask over a union ROW, and these sets have none.
+        Most are value unions and list unions an instance result or join produced
+        (`i32|string`, `i32[]|i32`, `string[]|i32[]`). Neither the declared type nor the
+        node's type has a row by key (`unRowOfKey` is -1), and neither does `X|null` over a
+        scalar or a record union. The rest are slots pushed without a set, which then
+        subtract again (`i32`, `f64`, `{v:i32}|{w:string}`).
+      - Next: a member set that does not need a row, built from the arena type's flattened
+        members, so `msSetOfTy` answers for every union and nullable type. Then the callers
+        pass `msSetOfTy` of the type they hold, and the fallback is deleted.
   - `narrowedMapOf`'s render is the mv slot's key, so it goes with D8. `emit_mv_slots`' `cnVariant`
     copies the text too; that file is the shape-row lane's.
 
