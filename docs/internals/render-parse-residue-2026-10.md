@@ -273,6 +273,45 @@ What each slice changes:
   The probe also found a live clause-1 defect that is unrelated to C1, D10522. Revised order:
   first fix the typed column (D10520, D10521, the duplicate member and the `letBT` misses), then
   build the composite renderer, then do step 1 graded on behaviour.
+
+  **The typed-column fixes.** The emitted output is unchanged. difftree `--identity` found 1 of
+  16,437 files with a different module, `value-join-at-the-pin.vl`, and that file prints the same
+  output. There `h("x", null)` now binds `U` to `null` in `letBT`, so `u ?? t` is a nullable
+  local. A third probe ran over the same population with the same probe in both columns:
+
+  | class | before | after |
+  | --- | --- | --- |
+  | `tvV` vs `letBT`, different type | 7 | 6 |
+  | param pin vs `monoSubstInst`, different type | 7 | 6 |
+  | return vs `sub2`, different type | 4 | 3 |
+  | `letBT` misses | 93 | 54 |
+  | param type still holds a TyVar | 70 | 30 |
+  | return type still holds a TyVar | 5 | 2 |
+  | param type with a duplicate member | 7 | 0 |
+  | return type with a duplicate member | 5 | 2 |
+  | let type with a duplicate member | 18 | 12 |
+
+  - D10520 is fixed: `monoMakeInstanceParams` keeps the argument's record type when its layout's
+    first row renders differently. Its three rows fell to 0.
+  - The duplicate member is fixed. When a type parameter is bound to a union that shares a member
+    with the rest of the union, `substUnionRebuild` splices the bound union's members in. It also
+    drops a second copy of the same map. A bound union that shares nothing stays one member,
+    because splicing `T | "err"` at `T := "a" | "b"` built invalid wasm.
+  - The `letBT` misses fell from 93 to 54. `monoBindCols` now binds three things as the
+    spelling does: a union parameter's one bare type parameter, a function result's union, and
+    `T | null` at `null`.
+  - `monoBindCols` leaves 11 of those bindings unbound: a binding that holds a Set or a boolean
+    map. Binding one sends the instance into D10540, where `is` tests the box tag the two share.
+    `pin-exact-key-record-twin.vl` printed `true` for `false`. That guard goes when D10540 closes.
+  - D10521 is not a typed-column defect. The typed `f64[]` is the checker's type for the call,
+    and the spelling is the instance's rep union. Step 1 takes a let's rep from the apart-join
+    knowledge, not from `substTyDeep`.
+  - The duplicates that remain are kept apart on purpose: D3357's nesting (`i32|i32|null`) and
+    D3504's `Rec[]`/`Rec2[]`. The spelling holds them too.
+  - The other 43 misses are other families: nested-generic shadowing, `flat-generic-rows`, a phantom
+    type parameter, a newtype brand, function-typed bindings, and a literal-union alias arm.
+  - The other disagreements were there before: the `monoUnionRestPin` argument, exact-key nested
+    set maps, `void`, an `i64|i32` element row, and a `mapIndexed` literal union.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot

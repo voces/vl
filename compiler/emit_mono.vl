@@ -74,6 +74,8 @@ import { canonEmitName } from "./check_program"
 import { topFnOwnerOf, tyIsForeignGenericSig } from "./check_subst"
 import {
   assignable,
+  bindGenFnRetUnionArm,
+  bindGenUnionArm,
   bindGenWalk,
   genFnHoleBodyRet,
   holeFnArgDecls,
@@ -84,6 +86,7 @@ import {
   substTyDeepOf,
   subtractTy,
   tyProvesNonNull,
+  widenLitTy,
 } from "./check_relate_core"
 import { ovPickFor } from "./check_demands"
 import { primTyOfName } from "./check_decl_scan"
@@ -2639,6 +2642,138 @@ function monoBindCols(
       bindGenUnionShapedArmInto(decl, at, bN, bT)
     }
     bi = bi + 1
+  }
+  // A union over a bare type parameter binds only what no other parameter did (D2734).
+  let ui = 0
+  while ui < params.length && ui < tyCol.length {
+    const up = nodeAt(params[ui])
+    if up is Param {
+      let ud = nodeTyIxOf(up.parType)
+      if ui < declTys.length && declTys[ui] >= 0 && !tyHasTyVar(ud) {
+        ud = declTys[ui]
+      }
+      monoBindBareUnionArm(ud, tyCol[ui], bN, bT)
+    }
+    ui = ui + 1
+  }
+  0
+}
+
+// Whether function type `e`'s result, through nested function results matched by `a`'s, is a
+// union (`() => T | string`), which `bindGenFnRetUnionArm` binds.
+function monoFnRetIsUnion(e: i32, a: i32): boolean {
+  const x = monoFnRetEnd(e, a, true)
+  x >= 0 && tyAt(x) is TyUnion
+}
+
+// The first result of function type `e` (when `exp`, else of `a`, matched level by level) that is
+// not itself a function type; -1 where the two stop matching first.
+function monoFnRetEnd(e: i32, a: i32, exp: boolean): i32 {
+  let x = e
+  let y = a
+  let depth = 0
+  while x >= 0 && y >= 0 && x < T.tys.length && y < T.tys.length && depth < 8 {
+    const xf = tyAt(x)
+    const yf = tyAt(y)
+    if !(xf is TyFunc) {
+      if exp { return x }
+      return y
+    }
+    if !(yf is TyFunc) { return -1 }
+    x = xf.fnRet
+    y = yf.fnRet
+    depth = depth + 1
+  }
+  -1
+}
+
+// `T | null` at a `null` argument binds `T` to `null`, as the spelling's pin does: the
+// substituted type is `null`, there being no second null (D10271).
+function monoBindNullArm(e: i32, a: i32, bN: string[], bT: i32[]) {
+  if e < 0 || a < 0 || e >= T.tys.length || a != TY_NULL { return 0 }
+  const en = tyAt(e)
+  if !(en is TyNullable) || en.nInner < 0 { return 0 }
+  const iv = tyAt(en.nInner)
+  if iv is TyVar && bindOf(bN, bT, iv.tvName) < 0 {
+    bN.push(iv.tvName)
+    bT.push(TY_NULL)
+  }
+  0
+}
+
+// Whether `ty` holds a Set or a boolean-valued map, which share a box tag: an instance binding
+// one through a union reads `is` against that tag, so the binding is left unbound (D10540).
+function monoTyHoldsSetTwin(ty: i32, depth: i32): boolean {
+  if ty < 0 || ty >= T.tys.length || depth <= 0 { return false }
+  const t = tyAt(ty)
+  match t {
+    TyMap => {
+      return t.mSet == 1
+        || t.mVal == TY_BOOL
+        || monoTyHoldsSetTwin(t.mVal, depth - 1)
+    }
+    TyArray => {
+      return monoTyHoldsSetTwin(t.aElem, depth - 1)
+    }
+    TyNullable => {
+      return monoTyHoldsSetTwin(t.nInner, depth - 1)
+    }
+    TyUnion => {
+      for m in t.uMembers {
+        if monoTyHoldsSetTwin(m, depth - 1) { return true }
+      }
+    }
+    TyObj => {
+      for f in t.objFieldTypes {
+        if monoTyHoldsSetTwin(f, depth - 1) { return true }
+      }
+    }
+    // a function's parameters and result are not the value `is` tests
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
+  }
+  false
+}
+
+// Binds the one bare type parameter of union parameter type `decl` from argument type `at`, as
+// the spelling's pin does: to the argument's members no concrete member admits, or to the whole
+// argument when one admits them all (`T | string` at `string` binds `T` to `string`); a function
+// type's result binds as the checker's call does.
+function monoBindBareUnionArm(decl: i32, at: i32, bN: string[], bT: i32[]) {
+  if decl < 0 || at < 0 || decl >= T.tys.length || at >= T.tys.length {
+    return 0
+  }
+  if tyHasTyVar(at) { return 0 }
+  if tyAt(decl) is TyFunc {
+    if monoFnRetIsUnion(decl, at) {
+      bindGenFnRetUnionArm(decl, at, bN, bT, false)
+    }
+    monoBindNullArm(
+      monoFnRetEnd(decl, at, true),
+      monoFnRetEnd(decl, at, false),
+      bN,
+      bT,
+    )
+    return 0
+  }
+  monoBindNullArm(decl, at, bN, bT)
+  if !(tyAt(decl) is TyUnion) { return 0 }
+  const gms: i32[] = []
+  flattenVariantsInto(decl, gms)
+  let open = ""
+  for g in gms {
+    if g >= 0 && tyHasTyVar(g) {
+      const gt = tyAt(g)
+      if !(gt is TyVar) || open != "" { return 0 }
+      open = gt.tvName
+    }
+  }
+  if open == "" || bindOf(bN, bT, open) >= 0 || monoTyHoldsSetTwin(at, 8) {
+    return 0
+  }
+  bindGenUnionArm(decl, at, bN, bT)
+  if bindOf(bN, bT, open) < 0 {
+    bN.push(open)
+    bT.push(widenLitTy(at))
   }
   0
 }
@@ -9252,6 +9387,20 @@ function monoConcreteObjTy(ty: i32): boolean {
   tyAt(ty) is TyObj && !tyHasTyVar(ty)
 }
 
+// Whether a record pin spelled by its fields binds argument type `arg` rather than `row`, the
+// first row of its layout: a layout keys a map field by its rep, so a later call's `Set<i32>`
+// field would read the first call's `{[i32]:i32}` from the row (D10520).
+function monoSpelledRecordLeavesRow(
+  spelling: string,
+  arg: i32,
+  row: i32,
+): boolean {
+  if spelling == "" || spelling[0] == "#"[0] || !monoConcreteObjTy(arg) {
+    return false
+  }
+  !tyHasTyVar(row) && !tySame(arg, row)
+}
+
 // A record type an instance binds in place of its anonymous row's own (see
 // `monoObjDiffersInFnFieldsOnly`), to the row's handle, so a pin spelled from it names that row.
 let monoFnFieldTwinRow: {[i32]: string} = Map()
@@ -10302,6 +10451,11 @@ function monoMakeInstanceParams(
       ) {
         pinTy = pinTys[pj]
         monoFnFieldTwinRow.set(pinTy, pinned[pj])
+      } else if (
+        anonTy >= 0
+        && monoSpelledRecordLeavesRow(pinned[pj], pinTys[pj], anonTy)
+      ) {
+        pinTy = pinTys[pj]
       }
       let isLit = pj < argLit.length && argLit[pj]
       const agree = anonRowKindsAgree(pinned[pj], pinTys[pj])
