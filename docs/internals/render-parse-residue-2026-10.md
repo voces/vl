@@ -122,7 +122,7 @@ the slice retires.
 | A1 | shape-row typed twins | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests | 9 | 9 / 0 / 0 | 3 / 6 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
-| A4 | nominal and signature-key twins | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
+| A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
@@ -163,6 +163,14 @@ What each slice changes:
   `collectATypeRef` chain is order-dependent, so its rungs move together.
 - **A4.** `resolveShapeToNominal` on a rendered type becomes `shapeNominalOfTy`. The
   signature-key sites that still render read `sigKeyOfTy`, which needs widening to cover them.
+  Landed for 2 parses: `cboxElemName` tests `TyArray`, and `recordedParamPinName`'s nullable
+  arm resolves under the null on the arena, which moves its render to B. The arena names two
+  witnesses' `{r:i32}|null` pin `Circle|null` where the name path did not, with the emitted
+  wasm byte-identical over every `tests/**/*.vl` and the distilled corpus. The other 6 stay,
+  and each row's `next` says why: `listUnionEmitName` renders a scalar list member as its
+  product, `resolveShapeToNominal` keeps `setAtomSpelling` as a name caller, and the four
+  signature-key parses serve callers in `emit_collect`, `emit_classify` and `emit_lit_atoms`
+  that pass no type.
 - **A5.** Atom-kind, closure-result-forcing, union-ref-arm and coalesce tests read the union row's
   member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
