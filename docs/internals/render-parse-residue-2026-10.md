@@ -448,9 +448,39 @@ What each slice changes:
   no closed type, so `monoPinFnParamTys` answers `[]`. Typing it needs the delivered hole
   function's instance type. **Step 1 moved no consumer.** No `=>` pin site has zero
   disagreement, so the instance's TypeRef text, its key and `rsC` stay on the spelling there.
+
+  **The seed call's instance types, landed (2026-10-23).** In all 11 coerce files the delivery
+  came from a call through a binding (`monoCallIfBound`, `monoCallIfValue`, `monoCallWrittenLet`).
+  Each takes its signature from `monoSeedCallSigTys` (formerly `monoSeedCallSig`), which mints
+  the seed's instance for the call. It now also returns that instance's parameter types when
+  each `=>` pin among them is a closed function type, and the three callers pass them as
+  `deliveryTys`. A probe over `tests/cases/closures` (1,077 files), with the control
+  `hole-fn-list-handed-hole-param.vl` disagreeing:
+
+  | site | files before: agree / disagree | files after | events after: agree / disagree |
+  | --- | --- | --- | --- |
+  | `monoCoerceFnValueName`'s instance | 5 / 11 | 11 / 6 | 30 / 29 |
+
+  difftree `--identity` found 5 of 16,509 files with a different module: the five of the 11 that
+  now type the instance (`hole-fn-if-join-result-handed-hole-fn`,
+  `hole-fn-join-called-at-two-fn-types` and its `-in-function` twin, and
+  `hole-fn-list-handed-hole-lambda` and `-param`). Each module loses one function. That function
+  was a second instance at the same signature, minted because a key with an open type did not
+  match the typed one. All five print what they did before.
+
+  Left: in the other 6 files the seed instance's own parameter is open. Its TypeRef text is a
+  `=>` key and its type is `(_, _) => _`. A second probe, at every `=>` pin `monoPinHoleParam`
+  pushes, found 67 open pins in 17 files: the six, plus the `listed-hole-fn-*`,
+  `hole-copy-chain-*` and `module-fw-binding-*` families. All 29 the report lists came from one
+  arm, the `monoArgPinName` pin. There the argument is a hole function, and `monoArgTyName` keys
+  it by its REP signature (`fnSigKeyOf` or `sigKeyOfTy`), with each hole at its `i32` default.
+  No arena type stands behind that key.
+  Typing it needs the hole function's instance keyed by type (D3), or a checker bind of the
+  hole at that call. Until then no `=>` pin site has zero disagreement. The TypeRef text, the
+  key, `rsC`, and the member-order and literal-arm rows stay on the spelling.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
-  (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
+  (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot
   stay inside `emit_mono`. It follows C1.
 - **C3.** The `emit_shape_intern` walkers take the field type alongside the field text. A probe
   over the self-compile and 16,820 fixture and corpus files compared each site's spelling
@@ -1042,21 +1072,37 @@ What each slice changes:
        | `mvShapeOfMapNodeTy` hole value | 10 | 0 | an unconstrained `Map()` value answers `-3` from `nodeMapValTyIx` < 0; 10 of 10 files agreed with the name answer |
        | `objMapFieldCompat` hole value | 6 | 0 | the same guard answers true; 6 of 6 files agreed |
 
-       Left, by caller, in files untyped (one file can hold two callers):
-       - 12: `shapeFieldTypeCompatK`'s query, a field type cut from shape text (step 2).
-       - 7: `annRetKindTy`'s map arm, reached from `sigRetTokOfTy`. The result type is an
-         index-hook record (`{[]: (i32) => i32}`), not a map. `nameIsBareMap` reads its
-         `{[` spelling as a map, so `tyMapValOfHeld` has nothing to give. Asking the type
-         would change those signature keys; not tried.
-       - 4: `{x: i32}` map arm of a union whose row is uncovered (`emit_classify`'s
-         index-read fallback; `unionMapArmNameTy` gives no member type).
-       - 4: `mvShapeOfValNameRowTy` for a record's function-typed field with a hole row type.
-       - 7: `collectATypeRef`'s interior TypeRefs, which have no arena type. The parent has
-         to supply it.
-       - 2: `fieldCodeOfSpelling`'s `recTy < 0` arm, from `mapValKindLowerable`.
-       - 1: a nested map element (`array-new-generic-pin-element-grid.vl`).
-       - 1: `mvSlotOfValNameFindK` with a mis-cut `mvValName` (`i64}|nul`, in
-         `maps/store-null-nullable-value-map.vl`). Not filed yet.
+       Partly done (map-value producers, second slice): 37 files down to 7, over 16,621
+       files, with the control tripping (98 typed events). difftree --identity: 11,652 built,
+       7 differ, each dropping one unused function type (the `>m` signature key an index-hook
+       record `{"[]": ...}` minted); run output is identical on both seeds. Nothing retires,
+       because the name leg is still reached. By caller tag, files untyped before and after:
+
+       | caller | before | after | how |
+       | --- | --- | --- | --- |
+       | `synthTypeRefTy` pin, through `structIndexOfTypeName` | 7 | 0 | `pinKindOfNameTy` asks the typed row scan |
+       | `paramStructIndexRaw` | 1 | 0 | passes the parameter's node type outside a generic original |
+       | `collectATypeRef` orphaned TypeRefs | 7 | 1 | a node with no arena type mints nothing; its owner's field-table pass mints it |
+       | `annRetKindTy` map arm | 7 | 0 | `annRetIsBareMap` asks `TyMap` of the type, so an index-hook record is not a map |
+       | union map arm, uncovered row (`mapReadMvSlot`) | 4 | 0 | `unionMapArmValTyOf` reads the receiver's own type |
+       | `mvShapeOfValNameRowTy` hole row | 4 | 0 | an empty value name with a hole row answers `-3` |
+       | `mvValInnerMvSlot` on `i64}\|nul` | 1 | 0 | the inner-slot reader peels a nullable map (the former `mvValNulInnerMvSlot`) |
+
+       Left, by file:
+       - `generics/pin-nullable-set-and-literal-map-is.vl`: `collectATypeRef`'s map-name arm
+         with an `i32` value and no node type.
+       - `closures/closure-result-array-of-map-closure-field-structs.vl`,
+         `closures/closure-struct-elem-list-map-fields.vl`: D2's ref-list ladder
+         (`forceCloListTypeOf` → `nameIsRefArray` → `refArrElemNameGo` →
+         `structIndexOfTypeName`).
+       - `generics/anon-record-arg-to-record-pattern.vl`: `monoStructAnnName` (C1's lane).
+       - `literal-unions/coalesce-map-read-joins-atom.vl`: `mintUnionFieldObjRow`. A typed scan
+         there disagreed with the name answer in 12 files; not taken.
+       - `arrays/array-new-generic-pin-element-grid.vl`: `ensureRefElemKindTail` in a mono
+         instance whose fill is a `TyVar` (C1's pin types).
+       - `maps/map-value-layout-twin-heap-merge.vl`: `nameFieldCodeTy` through the arm mint
+         `internInlineShapeFieldsTy(..., -1, aty)`. Passing the field types there disagreed in
+         52 files (`-1` became 16); not taken.
     3. Done: the slot finds pass a type. 8 files still have none, because their caller banked
        no `mvValTyIx`/`rlElemTyIx`.
     4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in
