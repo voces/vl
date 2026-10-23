@@ -88,6 +88,7 @@ import {
   mkNullableTyOf,
   numLitUnionBaseName,
   tyArrayElemIx,
+  tyAt,
   tyBearsNull,
   tyEq,
   tyFieldTyOf,
@@ -178,6 +179,7 @@ import {
   mkParam,
   mkStr,
   mkUnary,
+  nodeAt,
   nodeChildren,
   nodeSpineChildren,
   nodeToks,
@@ -307,7 +309,7 @@ import { opBinFnAtNode, opIdxFnAtNode } from "./check_callee"
 // dropped function declaration is unreachable too: a local is visible only after it is declared.
 export function deadTailDrop() {
   for b in deadTailBlks {
-    const bn = P.nodes[b]
+    const bn = nodeAt(b)
     if bn is Block {
       while blockTailIsDead(bn.blkStmts) { bn.blkStmts.pop() }
     }
@@ -337,7 +339,7 @@ export function loopValueRewrite(rootIx: i32) {
     const ix = todo.pop() ?? -1
     const atStmt = todoStmt.pop() ?? false
     if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
+      const n = nodeAt(ix)
       if (
         (n is WhileStmt || n is ForRange || n is ForIn)
         && loopValTyOf(ix) >= 0
@@ -364,7 +366,7 @@ export function loopValueRewrite(rootIx: i32) {
   const moved: {[i32]: i32} = Map()
   while k >= 0 {
     const y = lvRewriteAt(loops[k], loopValTyOf(loops[k]), loopStmt[k])
-    if y >= 0 && !(P.nodes[y] is WhileStmt) { moved[loops[k]] = y }
+    if y >= 0 && !(nodeAt(y) is WhileStmt) { moved[loops[k]] = y }
     k = k - 1
   }
   // A `for` loop declares its variables, and its uses follow it to its new node.
@@ -378,7 +380,7 @@ export function loopValueRewrite(rootIx: i32) {
 // Is `ix` a loop whose used value is nullable?
 function lvIsNullableLoop(ix: i32): boolean {
   if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is WhileStmt || n is ForRange || n is ForIn) { return false }
   const ty = loopValTyOf(ix)
   ty >= 0 && tyBearsNull(ty)
@@ -388,11 +390,11 @@ function lvIsNullableLoop(ix: i32): boolean {
 // its value: an arm's own binding has no rep until the arm lowers, so a `??` over the whole `if`
 // found none, where one over the binding reads it as any local (D3370).
 function lvCoalesceIntoArm(q: i32) {
-  const c = P.nodes[q]
+  const c = nodeAt(q)
   if c is BinExpr {
-    const s = P.nodes[unwrapParen(c.binLeft)]
+    const s = nodeAt(unwrapParen(c.binLeft))
     if s is IfStmt {
-      const tb = P.nodes[s.ifThen]
+      const tb = nodeAt(s.ifThen)
       if tb is Block {
         const st = tb.blkStmts
         if st.length == 0 { return 0 }
@@ -419,7 +421,7 @@ function lvCoalesceIntoArm(q: i32) {
 // Rewrites the loop at `x`, whose used value has type `ty`, in place into the if-expression,
 // and returns the loop's new node, or -1 when it failed.
 function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
-  const loop = P.nodes[x]
+  const loop = nodeAt(x)
   const pos = loop.pos
   const name = "$lv" + i32ToStr(x)
   const nullable = tyBearsNull(ty)
@@ -490,7 +492,7 @@ function lvRewriteAt(x: i32, ty: i32, atStmt: boolean): i32 {
 // since a carrier's annotation could not spell that signature (D6990, D7010).
 function lvBlockIsOwnValue(x: i32, ty: i32): boolean {
   if x < 0 || x >= P.nodes.length || ty < 0 { return false }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if !(n is WhileStmt) || n.whileBlk != 1 { return false }
   if !tyHasTyVar(ty) || !tyMayHoldFn(ty, 0) { return false }
   const all = lvRewriteBreaks(n.whileBody, n.whileLabel, "", -1, ty, 0, false)
@@ -501,7 +503,7 @@ function lvBlockIsOwnValue(x: i32, ty: i32): boolean {
 // it, an arm; with `strip` each is removed, so its value ends the branch.
 function lvTailBreaks(b: i32, label: string, ty: i32, strip: boolean): i32 {
   if b < 0 || b >= P.nodes.length { return 0 }
-  const n = P.nodes[b]
+  const n = nodeAt(b)
   if n is IfStmt {
     if n.ifElse < 0 { return 0 }
     const k = lvTailBreaks(n.ifThen, label, ty, strip)
@@ -525,14 +527,14 @@ function lvTailFrom(
   ty: i32,
   strip: boolean,
 ): i32 {
-  const n = P.nodes[b]
+  const n = nodeAt(b)
   if !(n is Block) { return 0 }
   const st = n.blkStmts
   let k = st.length
   if k <= from { return 0 }
   let i = from
   while i < k - 1 {
-    const s = P.nodes[st[i]]
+    const s = nodeAt(st[i])
     if (
       s is IfStmt
       && s.ifElse < 0
@@ -555,13 +557,13 @@ function lvTailFrom(
     i = i + 1
   }
   // An arm that exits ends in the `__trap__` `exitArmsEndNever` appended after its `break`.
-  const tl = P.nodes[st[k - 1]]
+  const tl = nodeAt(st[k - 1])
   const trapped = k - from > 1
     && tl is Call
     && isIdentNamed(tl.callFn, "__trap__")
-    && P.nodes[st[k - 2]] is BreakStmt
+    && nodeAt(st[k - 2]) is BreakStmt
   if trapped { k = k - 1 }
-  const last = P.nodes[st[k - 1]]
+  const last = nodeAt(st[k - 1])
   if last is BreakStmt {
     if (
       k - from < 2
@@ -585,7 +587,7 @@ function lvTailFrom(
 // Writes at `x` the if-expression `if true { thenB } else { __trap__() }` of type `ty`, in a
 // value position unless `atStmt`.
 function lvIfAt(x: i32, thenB: i32, ty: i32, atStmt: boolean) {
-  const pos = P.nodes[x].pos
+  const pos = nodeAt(x).pos
   nodeTyRecord(thenB, ty)
   const trapFn = mkIdent("__trap__", pos)
   identFromDecl(trapFn, IDENT_BUILTIN)
@@ -633,7 +635,7 @@ function exitArmsEndNever() {
   while i < exitArmCount() {
     const blk = exitArmBlockAt(i)
     if blk < 0 || blk >= P.nodes.length { return 0 }
-    const b = P.nodes[blk]
+    const b = nodeAt(blk)
     if b is Block {
       const trapFn = mkIdent("__trap__", b.pos)
       identFromDecl(trapFn, IDENT_BUILTIN)
@@ -656,7 +658,7 @@ function exitFirstLetsAnnotate() {
   while i < exitFirstLetCount() {
     const li = exitFirstLetAt(i)
     if li >= 0 && li < P.nodes.length {
-      const d = P.nodes[li]
+      const d = nodeAt(li)
       if d is LetDecl {
         let ty = nodeTyIxOf(d.letInit)
         if (
@@ -689,7 +691,7 @@ function exitFirstLetsAnnotate() {
 function lvAssign(name: string, decl: i32, v: i32, ty: i32): i32 {
   // An inner loop value rewritten as a statement is a value from here on, so the collect pass
   // must walk its arms for their locals.
-  if v >= 0 && P.nodes[v] is IfStmt { valueIfAdd(v) }
+  if v >= 0 && nodeAt(v) is IfStmt { valueIfAdd(v) }
   const t = mkIdent(name, -1)
   identFromDecl(t, decl)
   nodeTyRecord(t, ty)
@@ -701,7 +703,7 @@ function lvAssign(name: string, decl: i32, v: i32, ty: i32): i32 {
 // A labelled block's value tail `tail`, the last statement of its body `body`, becomes `name = tail`.
 function lvRewriteTail(body: i32, tail: i32, name: string, decl: i32, ty: i32) {
   if tail < 0 { return 0 }
-  const b = P.nodes[body]
+  const b = nodeAt(body)
   if b is Block {
     const st = b.blkStmts
     if st.length > 0 && st[st.length - 1] == tail {
@@ -732,7 +734,7 @@ function lvRewriteBreaks(
     const ix = todo.pop() ?? -1
     const depth = todoDepth.pop() ?? 0
     const shadow = todoShadow.pop() ?? false
-    if ix >= 0 && ix < P.nodes.length && !(P.nodes[ix] is FuncDecl) {
+    if ix >= 0 && ix < P.nodes.length && !(nodeAt(ix) is FuncDecl) {
       found = found
         + lvRewriteBlockBreaks(ix, label, name, decl, ty, depth, shadow)
       let d = depth
@@ -760,7 +762,7 @@ const LV_NOT_A_LOOP = "%"
 
 // The label of the loop or labelled block at `ix` ("" for none), else `lvNotALoop`'s answer.
 function lvLabelOf(ix: i32): string {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is WhileStmt { return n.whileLabel }
   if n is ForRange { return n.frLabel }
   if n is ForIn { return n.fiLabel }
@@ -781,14 +783,14 @@ function lvRewriteBlockBreaks(
   depth: i32,
   shadow: boolean,
 ) {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   let found = 0
   if n is Block {
     const st = n.blkStmts
     let j = 1
     while j < st.length {
       if st[j] >= 0 && st[j] < P.nodes.length {
-        const b = P.nodes[st[j]]
+        const b = nodeAt(st[j])
         if b is BreakStmt {
           if b.brkHasVal == 1 && lvLeaves(b.brkLabel, label, depth, shadow) {
             if name != "" { st[j - 1] = lvAssign(name, decl, st[j - 1], ty) }
@@ -828,7 +830,7 @@ export function nulScalarSplit(rootIx: i32) {
     const ix = todo.pop() ?? -1
     let mode = todoMode.pop() ?? 0
     if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
+      const n = nodeAt(ix)
       if n is FuncDecl {
         if n.fnTyParams.length > 0 || mode == 2 { mode = 2 } else { mode = 1 }
       }
@@ -862,7 +864,7 @@ export function nulScalarSplit(rootIx: i32) {
 
 // The scalar `S` of a `const` whose initializer is typed `S | null`, or -1.
 function nssScalarOf(letIx: i32): i32 {
-  const d = P.nodes[letIx]
+  const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letKw != "const" || d.letInit < 0 { return -1 }
     const t = nodeTyIxOf(d.letInit)
@@ -881,11 +883,11 @@ function nssScalarOf(letIx: i32): i32 {
 // (`m[k]`, `m.get(k)`), a scalar list's `.get(i)` or `.pop()`. Any other
 // producer already hands over a box, and splitting it only hides the box from the optimizer.
 function nssFusedInit(ix: i32): boolean {
-  const e = P.nodes[unwrapParen(ix)]
+  const e = nodeAt(unwrapParen(ix))
   if e is Index { return tyIsMap(nodeTyIxOf(e.idxArr)) }
   if e is Call {
     if e.callFn < 0 { return nssBoxedProducer(ix) }
-    const callee = P.nodes[e.callFn]
+    const callee = nodeAt(e.callFn)
     if callee is Member {
       const rt = nodeTyIxOf(callee.memObj)
       if callee.memProp == "get" && e.callArgs.length == 1 {
@@ -911,7 +913,7 @@ function nssCandidate(ix: i32): boolean {
 // True when node `ix` declares `name` (a shadow the walk does not follow), or is a `match`,
 // which the checker desugars before this pass and so is not expected here.
 function nssDeclares(ix: i32, name: string): boolean {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is LetDecl { return n.letName == name }
   if n is Param { return n.parName == name }
   if n is ForRange { return n.frVar == name }
@@ -927,8 +929,8 @@ function nssBindsNoName(_ix: i32): boolean { false }
 // Classifies every use of the `const` at `letIx`, the statement of block `blk`, and rewrites
 // them and the binding when all qualify.
 function nssTry(blk: i32, letIx: i32) {
-  const b = P.nodes[blk]
-  const d = P.nodes[letIx]
+  const b = nodeAt(blk)
+  const d = nodeAt(letIx)
   if b is Block {
     if d is LetDecl {
       const s = nssScalarOf(letIx)
@@ -960,7 +962,7 @@ function nssTry(blk: i32, letIx: i32) {
         const fn = inFn.pop() ?? false
         if ix >= 0 && ix < P.nodes.length {
           if nssDeclares(ix, name) { return 0 }
-          const n = P.nodes[ix]
+          const n = nodeAt(ix)
           let kids = true
           if n is Ident {
             if n.identName == name {
@@ -973,13 +975,13 @@ function nssTry(blk: i32, letIx: i32) {
               let operand = -1
               if (
                 isIdentNamed(n.binLeft, name)
-                && P.nodes[n.binRight] is NullLit
+                && nodeAt(n.binRight) is NullLit
               ) {
                 operand = n.binLeft
               }
               if (
                 isIdentNamed(n.binRight, name)
-                && P.nodes[n.binLeft] is NullLit
+                && nodeAt(n.binLeft) is NullLit
               ) {
                 operand = n.binRight
               }
@@ -1084,13 +1086,13 @@ function nssRewrite(
     const id = mkIdent(np, -1)
     identFromDecl(id, npDecl)
     nodeTyRecord(id, tb)
-    const un: Node = { unOp: "!", unArg: id, pos: P.nodes[ix].pos }
+    const un: Node = { unOp: "!", unArg: id, pos: nodeAt(ix).pos }
     arenaSetNode(ix, un)
     nodeTyRecord(ix, tb)
   }
   for ix in reads { nssSetName(ix, nv, s, nvDecl) }
   for ix in coals {
-    const c = P.nodes[ix]
+    const c = nodeAt(ix)
     if c is BinExpr {
       const ty = nodeTyIxOf(ix)
       const cp = mkIdent(np, -1)
@@ -1116,7 +1118,7 @@ function nssRewrite(
 
 // Overwrites node `ix` with a read of the name `name` declared at `decl`, typed `ty`.
 function nssSetName(ix: i32, name: string, ty: i32, decl: i32) {
-  const w: Node = { identName: name, pos: P.nodes[ix].pos }
+  const w: Node = { identName: name, pos: nodeAt(ix).pos }
   arenaSetNode(ix, w)
   sidNoteNodeName(ix, decl)
   nodeTyRecord(ix, ty)
@@ -1141,7 +1143,7 @@ function nssZero(s: i32, pos: i32): i32 {
 // checker resolved to the intrinsic (`memSharedCalls`), the one condition the build decides.
 function isMemSharedIf(ix: i32): boolean {
   if ix < 0 { return false }
-  const s = P.nodes[ix]
+  const s = nodeAt(ix)
   if s is IfStmt {
     if s.ifElse >= 0 { return false }
     let i = 0
@@ -1164,7 +1166,7 @@ function foldMemSharedList(stmts: i32[]) {
     const ix = stmts[r]
     if isMemSharedIf(ix) {
       if gSharedMemPages > 0 {
-        const s = P.nodes[ix]
+        const s = nodeAt(ix)
         if s is IfStmt { s.ifCond = mkBool(1, s.pos) }
         stmts[w] = ix
         w = w + 1
@@ -1186,7 +1188,7 @@ export function foldMemShared() {
   const n = P.nodes.length
   let i = 0
   while i < n {
-    const nd = P.nodes[i]
+    const nd = nodeAt(i)
     if nd is Block { foldMemSharedList(nd.blkStmts) }
     else if nd is Program { foldMemSharedList(nd.progStmts) }
     i = i + 1
@@ -1206,13 +1208,13 @@ export function foldMemShared() {
 export function drwSelfFnOf(name: string, argc: i32) {
   const fe = fnIndexOf(name)
   if fe < 0 { return -1 }
-  const fn = P.nodes[fnStmts[fe]]
+  const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
     const ps = fn.fnParams
     if argc > ps.length { return -1 }
     if argc < fnRequiredArity(ps) { return -1 }
     if ps.length > 0 {
-      const p0 = P.nodes[ps[0]]
+      const p0 = nodeAt(ps[0])
       if p0 is Param {
         if p0.parName == "self" { return fe }
       }
@@ -1234,10 +1236,10 @@ function drwCloShadowed(name: string) { strListHas(drwCloNames, name) }
 // monomorphization, so every later pass sees an ordinary full-arity call and no
 // new `$fnsig` key is minted. A call through a function value resolves nothing.
 export function drwFillDefaults(ix: i32, ctx: i32) {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is Call {
     if n.callFn < 0 { return 0 }
-    const cf = P.nodes[n.callFn]
+    const cf = nodeAt(n.callFn)
     if cf is Ident {
       const fe = fnIndexOfInScopeChainAt(
         sidOfNode(n.callFn),
@@ -1252,7 +1254,7 @@ export function drwFillDefaults(ix: i32, ctx: i32) {
       if paramIsClosure(ctx, cf.identName) { return 0 }
       if paramNulClosure(ctx, cf.identName) { return 0 }
       if drwCloShadowed(cf.identName) { return 0 }
-      const fn = P.nodes[fnStmts[fe]]
+      const fn = nodeAt(fnStmts[fe])
       if fn is FuncDecl {
         const ps = fn.fnParams
         const args = n.callArgs
@@ -1262,7 +1264,7 @@ export function drwFillDefaults(ix: i32, ctx: i32) {
           const pNames: string[] = []
           let pn = 0
           while pn < ps.length {
-            const pnode = P.nodes[ps[pn]]
+            const pnode = nodeAt(ps[pn])
             if pnode is Param { pNames.push(pnode.parName) }
             pn = pn + 1
           }
@@ -1310,7 +1312,7 @@ export function drwFillDefaults(ix: i32, ctx: i32) {
 // True if `ix` is a map index read (`m[k]`), parens peeled — the shape whose `??` has a
 // fused lowering in `emitMapGetOr` and must not be desugared into a re-reading `if`.
 function drwIsMapRead(ix: i32) {
-  const n = P.nodes[unwrapParen(ix)]
+  const n = nodeAt(unwrapParen(ix))
   if n is Index { return nodeTyIsMap(n.idxArr) }
   false
 }
@@ -1321,16 +1323,16 @@ function drwIsMapRead(ix: i32) {
 // any type too.
 function drwRecvIsTyParam(recvIx: i32, ctx: i32) {
   if ctx < 0 { return false }
-  const fn = P.nodes[ctx]
+  const fn = nodeAt(ctx)
   if fn is FuncDecl {
-    const r = P.nodes[unwrapParen(recvIx)]
+    const r = nodeAt(unwrapParen(recvIx))
     if r is Ident {
       const ps = fn.fnParams
       let pi = -1
       let piHole = false
       let i = 0
       while i < ps.length {
-        const pp = P.nodes[ps[i]]
+        const pp = nodeAt(ps[i])
         if pp is Param {
           if pp.parName == r.identName {
             pi = i
@@ -1377,7 +1379,7 @@ export function fnDeclNamed(name: string) {
   }
   while fdnLen < fnStmts.length {
     const d = fnStmts[fdnLen]
-    const f = P.nodes[d]
+    const f = nodeAt(d)
     if f is FuncDecl {
       if fdnDecl.has(f.fnName) {
         fdnDecl[f.fnName] = -1
@@ -1394,7 +1396,7 @@ export function fnDeclNamed(name: string) {
 // share one arena index. Only the place forms `exprReReadable` admits are minted; anything
 // else is handed back unchanged, its caller having already declined (D1814).
 function drwRecvClone(ix: i32) {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is Paren { return drwRecvClone(n.parInner) }
   if n is Ident {
     const cId = mkIdent(n.identName, n.pos)
@@ -1495,7 +1497,7 @@ function drwWalkBlock(n: Block, ctx: i32) {
       capMemoNoteEdit()
       plCacheBust()
     }
-    const bst = P.nodes[bs[i2]]
+    const bst = nodeAt(bs[i2])
     if bst is LetDecl {
       if letDeclIsClosureNoLocal(bs[i2]) { drwCloNames.push(bst.letName) }
     }
@@ -1511,13 +1513,13 @@ function drwWalkBlock(n: Block, ctx: i32) {
 function drwWalkIfChain(ix: i32, ctx: i32) {
   let cur = ix
   while cur >= 0 {
-    const c = P.nodes[cur]
+    const c = nodeAt(cur)
     cur = -1
     if c is IfStmt {
       c.ifCond = drwWalk(c.ifCond, ctx)
       c.ifThen = drwWalk(c.ifThen, ctx)
       if c.ifElse >= 0 {
-        if P.nodes[c.ifElse] is IfStmt {
+        if nodeAt(c.ifElse) is IfStmt {
           drwAtStmt = false
           cur = c.ifElse
         } else {
@@ -1577,7 +1579,7 @@ function drwWalk(ix: i32, ctx: i32) {
   if ix < 0 { return ix }
   const atStmt = drwAtStmt
   drwAtStmt = false
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   match n {
     Call => {
       const args = n.callArgs
@@ -1591,13 +1593,13 @@ function drwWalk(ix: i32, ctx: i32) {
       // the whole call into the non-null arm of one guard below.
       let optWasOpt = false
       if n.callFn < 0 { return ix }
-      const c0 = P.nodes[n.callFn]
+      const c0 = nodeAt(n.callFn)
       if c0 is OptMember {
         optWasOpt = true
         n.callFn = mkMember(c0.omObj, c0.omProp, c0.pos)
         arenaNoteRefWrite()
       }
-      const callee = P.nodes[n.callFn]
+      const callee = nodeAt(n.callFn)
       if callee is Member {
         return drwWalkMemberCall(ix, n, callee, optWasOpt, ctx, atStmt)
       }
@@ -1687,7 +1689,7 @@ function drwWalk(ix: i32, ctx: i32) {
       const fs = n.objFields
       let i4 = 0
       while i4 < fs.length {
-        const f = P.nodes[fs[i4]]
+        const f = nodeAt(fs[i4])
         if f is FieldInit { f.fiValue = drwWalk(f.fiValue, ctx) }
         i4 = i4 + 1
       }
@@ -1822,7 +1824,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
   // The index write-trap form `o[k] = v` is handled before the general child walk,
   // so the assignment-target Index is not first rewritten into a read trap.
   if n.binOp == "=" {
-    const tgt = P.nodes[n.binLeft]
+    const tgt = nodeAt(n.binLeft)
     if tgt is Index {
       tgt.idxArr = drwWalk(tgt.idxArr, ctx)
       tgt.idxIndex = drwWalk(tgt.idxIndex, ctx)
@@ -1851,7 +1853,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
   // `r?.f ?? d` over a re-readable nullable union of records whose field `f` is never null
   // is the null test choosing between the field read and the default (D5243).
   if n.binOp == "??" {
-    const cl = P.nodes[unwrapParen(n.binLeft)]
+    const cl = nodeAt(unwrapParen(n.binLeft))
     if cl is OptMember {
       const clTy = nodeTyIxOf(unwrapParen(n.binLeft))
       const clFt = recUnionFieldTyOf(nodeTyIxOf(cl.omObj), cl.omProp, clTy)
@@ -1893,12 +1895,12 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     // `x ?? null` is `x` for every `x`: a null left selects a null default. Folded so the
     // read lowers at its own nullable rep instead of through a coalesce whose arms assume
     // the default is the non-null half (D2247).
-    if P.nodes[unwrapParen(n.binRight)] is NullLit {
+    if nodeAt(unwrapParen(n.binRight)) is NullLit {
       capMemoNoteEdit()
       return n.binLeft
     }
     // `null ?? d` is `d`, the type the checker gave it (D2261).
-    if coalLhs >= 0 && P.nodes[coalLhs] is NullLit {
+    if coalLhs >= 0 && nodeAt(coalLhs) is NullLit {
       capMemoNoteEdit()
       return n.binRight
     }
@@ -1907,7 +1909,7 @@ function drwWalkBin(ix: i32, n: BinExpr, ctx: i32): i32 {
     // null test, whose join every value rep lowers (D2248). An atom value's read is the `-1`
     // niche, which the `??` lowers directly where that join does not (D7448).
     if coalLhs >= 0 && drwIsMapRead(n.binLeft) && exprReReadable(coalLhs) {
-      const mdRead = P.nodes[coalLhs]
+      const mdRead = nodeAt(coalLhs)
       if (
         mdRead is Index
         && nodeTyMapValExcludesNull(mdRead.idxArr)
@@ -2049,7 +2051,7 @@ function recUnionFieldTyOf(recvTy: i32, prop: string, omTy: i32): i32 {
 // Meaning-preserving: the checker types a bare block `void`, same as an else-less `if`.
 function drwBareBlock(ix: i32) {
   if ix < 0 { return ix }
-  const b = P.nodes[ix]
+  const b = nodeAt(ix)
   if b is Block { return mkBareBlockIf(ix, b.pos) }
   ix
 }
@@ -2059,7 +2061,7 @@ function drwBareBlock(ix: i32) {
 export function dispatchRewrite(stmts: i32[]) {
   let i = 0
   while i < stmts.length {
-    const s = P.nodes[stmts[i]]
+    const s = nodeAt(stmts[i])
     if s is FuncDecl {
     } else if s is LetDecl {
       s.letInit = drwWalk(s.letInit, -1)
@@ -2073,7 +2075,7 @@ export function dispatchRewrite(stmts: i32[]) {
       const topOut: i32[] = []
       if spillCompoundPlace(oldIx, topOut, -1) {
         topOut.push(oldIx)
-        topIx = mkBlock(topOut, P.nodes[oldIx].pos)
+        topIx = mkBlock(topOut, nodeAt(oldIx).pos)
         capMemoNoteEdit()
       }
       drwAtStmt = true
@@ -2094,7 +2096,7 @@ export function dispatchRewrite(stmts: i32[]) {
   }
   let fe = 0
   while fe < fnStmts.length {
-    const fn = P.nodes[fnStmts[fe]]
+    const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       drwCloNames.clear()
       const drwBody = drwWalk(fn.fnBody, fnStmts[fe])
@@ -2118,16 +2120,16 @@ export function dispatchRewrite(stmts: i32[]) {
 // of a last `if` the checker says yields a value.
 function spillTail(blockIx: i32, fnIx: i32) {
   if blockIx < 0 { return 0 }
-  const b = P.nodes[blockIx]
+  const b = nodeAt(blockIx)
   if b is Block {
     const n = b.blkStmts.length
     if n == 0 { return 0 }
     const last = b.blkStmts[n - 1]
-    if P.nodes[last] is IfStmt {
+    if nodeAt(last) is IfStmt {
       if ifYieldsNoValue(last) { return 0 }
       let cur = last
       while cur >= 0 {
-        const c = P.nodes[cur]
+        const c = nodeAt(cur)
         cur = elseIfLink(cur)
         if c is IfStmt {
           spillTail(c.ifThen, fnIx)
@@ -2158,7 +2160,7 @@ function spillTail(blockIx: i32, fnIx: i32) {
 // other node. A right side the checker typed at the place's type, a literal built at it, is
 // stored unspilled and yielded by re-reading the spilled place (D2395).
 function spillWrite(asgIx: i32, out: i32[]): i32 {
-  const a = P.nodes[asgIx]
+  const a = nodeAt(asgIx)
   if a is BinExpr {
     if a.binOp != "=" { return -1 }
     const t = unwrapParen(a.binLeft)
@@ -2166,7 +2168,7 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     const byPlace = asgValueNode(asgIx) == a.binLeft
     let place = -1
     let reread = -1
-    const tn = P.nodes[t]
+    const tn = nodeAt(t)
     if tn is Member {
       const obj = spillLocal(tn.memObj, asgIx, "o", out, a.pos)
       place = mkMember(obj, tn.memProp, tn.pos)
@@ -2175,7 +2177,7 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
       const recv = spillLocal(tn.idxArr, asgIx, "o", out, a.pos)
       let idx = tn.idxIndex
       // A number re-evaluates to itself; any other index is spilled with the receiver.
-      const idxLit = P.nodes[idx]
+      const idxLit = nodeAt(idx)
       if idxLit is NumLit {
         if byPlace {
           const idx2 = mkNum(idxLit.numText, idxLit.pos)
@@ -2192,13 +2194,13 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
     nodeTyCarry(place, t)
     a.binLeft = place
     // A compound write reads its target inside the right-hand side, through the same node.
-    const inner = P.nodes[a.binRight]
+    const inner = nodeAt(a.binRight)
     if inner is BinExpr {
       if unwrapParen(inner.binLeft) == t { inner.binLeft = place }
     }
     // A bare `null` has no rep of its own to spill into, so the tail yields a fresh one.
     const rv = unwrapParen(a.binRight)
-    if rv >= 0 && P.nodes[rv] is NullLit {
+    if rv >= 0 && nodeAt(rv) is NullLit {
       const nul = mkNull("null", a.pos)
       nodeTyCarry(nul, rv)
       return nul
@@ -2219,12 +2221,12 @@ function spillWrite(asgIx: i32, out: i32[]): i32 {
 // writes, so a receiver or index that is not re-readable would run twice. Spills each such
 // operand once, receiver first, onto `out` and points the target at the spill; true if any.
 function spillCompoundPlace(asgIx: i32, out: i32[], ctx: i32): boolean {
-  const a = P.nodes[asgIx]
+  const a = nodeAt(asgIx)
   if a is BinExpr {
     if a.binCompound == "" || a.binOp != "=" { return false }
     const t = unwrapParen(a.binLeft)
     if t < 0 { return false }
-    const tn = P.nodes[t]
+    const tn = nodeAt(t)
     if tn is Index {
       if cpReReadable(tn.idxIndex, ctx) {
         if cpReReadable(tn.idxArr, ctx) { return false }
@@ -2250,7 +2252,7 @@ function spillCompoundRecv(
   pos: i32,
   ctx: i32,
 ): boolean {
-  const tn = P.nodes[t]
+  const tn = nodeAt(t)
   if tn is Member {
     if cpReReadable(tn.memObj, ctx) { return false }
     tn.memObj = spillLocal(tn.memObj, asgIx, "co", out, pos)
@@ -2264,7 +2266,7 @@ function spillCompoundRecv(
 function cpReReadable(ix: i32, ctx: i32): boolean {
   const u = unwrapParen(ix)
   if u < 0 { return false }
-  const e = P.nodes[u]
+  const e = nodeAt(u)
   if e is Index {
     if opIdxFnAtNode(u) != "" { return false }
     if drwFieldClosure(structIndexOfExpr(e.idxArr, ctx), "[]") { return false }
@@ -2277,7 +2279,7 @@ function cpReReadable(ix: i32, ctx: i32): boolean {
 // and anything else is `exprReReadable`'s.
 function cpRecvReReadable(u: i32, ctx: i32): boolean {
   if u < 0 { return false }
-  const e = P.nodes[u]
+  const e = nodeAt(u)
   if e is Member { return cpReReadable(e.memObj, ctx) }
   exprReReadable(u)
 }
@@ -2303,7 +2305,7 @@ function spillLocal(
 
 // A second read of the spilled name `rd` reads, with its type.
 function spillRead(rd: i32): i32 {
-  const n = P.nodes[rd]
+  const n = nodeAt(rd)
   if n is Ident {
     const r2 = mkIdent(n.identName, n.pos)
     identFrom(r2, rd)
@@ -2319,7 +2321,7 @@ function spillTypeByTarget(decl: i32, rd: i32, t: i32) {
   const ty = nodeTyIxOf(t)
   const al = litUnionAliasNameOfTy(ty)
   if al == "" { return 0 }
-  const d = P.nodes[decl]
+  const d = nodeAt(decl)
   if d is LetDecl { d.letType = synthTypeRefTy(al, -1, ty) }
   nodeTyRecord(decl, ty)
   nodeTyRecord(rd, ty)
@@ -2344,7 +2346,7 @@ let asvTopLet = false
 function asvPassOperand(ix: i32) {
   const u = unwrapParen(ix)
   if u < 0 { return 0 }
-  const n = P.nodes[u]
+  const n = nodeAt(u)
   if n is Ident {
     asvReads.push(n.identName)
     return 0
@@ -2356,7 +2358,7 @@ function asvPassOperand(ix: i32) {
 // A literal or a name: an operand whose evaluation neither writes nor depends on order.
 function asvIsLeaf(ix: i32): boolean {
   if ix < 0 { return false }
-  if P.nodes[ix] is Member || P.nodes[ix] is Index { return false }
+  if nodeAt(ix) is Member || nodeAt(ix) is Index { return false }
   exprReReadable(ix)
 }
 
@@ -2364,7 +2366,7 @@ function asvIsLeaf(ix: i32): boolean {
 // `exprReReadable` does not answer for, a call among them.
 function asvMayWrite(ix: i32): boolean {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is BinExpr {
     if n.binOp == "=" { return true }
     return asvMayWrite(n.binLeft) || asvMayWrite(n.binRight)
@@ -2383,9 +2385,9 @@ function asvLeafMayWrite(ix: i32): boolean { !exprReReadable(ix) }
 // or anything `e` may write.
 function asvMoves(asgIx: i32): boolean {
   if !asvTypeMoves(asgIx) { return false }
-  const a = P.nodes[asgIx]
+  const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
-  const t = P.nodes[a.binLeft]
+  const t = nodeAt(a.binLeft)
   if !(t is Ident) { return false }
   let i = 0
   let spilled = true
@@ -2401,11 +2403,11 @@ function asvMoves(asgIx: i32): boolean {
 // storage type is not the value's, where neither is a literal-union atom or holds a type
 // variable, and the value is not a bare `null`.
 function asvTypeMoves(asgIx: i32): boolean {
-  const a = P.nodes[asgIx]
+  const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
   if a.binOp != "=" || a.binCompound != "" { return false }
-  if !(P.nodes[a.binLeft] is Ident) { return false }
-  if P.nodes[unwrapParen(a.binRight)] is NullLit { return false }
+  if !(nodeAt(a.binLeft) is Ident) { return false }
+  if nodeAt(unwrapParen(a.binRight)) is NullLit { return false }
   const lt = asgStoreTyOf(asgIx)
   const vt = nodeTyIxOf(asgIx)
   if lt < 0 || vt < 0 || tySame(lt, vt) { return false }
@@ -2418,7 +2420,7 @@ function asvTypeMoves(asgIx: i32): boolean {
 // statement's own top-level write, whose value nothing reads.
 function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
   if ix < 0 || asvStop { return ix }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if (
     n is Ident
     || n is NumLit
@@ -2447,7 +2449,7 @@ function asvWalk(ix: i32, out: i32[], isValue: boolean): i32 {
   }
   if n is Call {
     if n.callFn < 0 { return asvHalt(ix) }
-    const callee = P.nodes[n.callFn]
+    const callee = nodeAt(n.callFn)
     if callee is Member {
       callee.memObj = asvWalk(callee.memObj, out, true)
       asvPassOperand(callee.memObj)
@@ -2516,9 +2518,9 @@ function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
   let lead = -1
   let i = 0
   while i < n.objFields.length {
-    const f = P.nodes[n.objFields[i]]
+    const f = nodeAt(n.objFields[i])
     if f is FieldInit {
-      const v = P.nodes[unwrapParen(f.fiValue)]
+      const v = nodeAt(unwrapParen(f.fiValue))
       if !(v is NumLit || v is StrLit || v is CharLit || v is BoolLit) {
         if lead >= 0 {
           asvStop = true
@@ -2530,7 +2532,7 @@ function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
     i = i + 1
   }
   if lead >= 0 {
-    const lf = P.nodes[lead]
+    const lf = nodeAt(lead)
     if lf is FieldInit { lf.fiValue = asvWalk(lf.fiValue, out, true) }
   }
   asvStop = true
@@ -2542,7 +2544,7 @@ function asvWalkObj(ix: i32, n: ObjLit, out: i32[]): i32 {
 // the walk.
 function asvPassTarget(ti: i32) {
   if ti < 0 { return asvHalt(ti) }
-  const t = P.nodes[ti]
+  const t = nodeAt(ti)
   if t is Member { return asvPassOperand(t.memObj) }
   if t is Index {
     asvPassOperand(t.idxArr)
@@ -2578,7 +2580,7 @@ function asvWalkWrite(ix: i32, n: BinExpr, out: i32[], isValue: boolean): i32 {
 function asvLitCopy(ix: i32): i32 {
   const u = unwrapParen(ix)
   if u < 0 { return -1 }
-  const n = P.nodes[u]
+  const n = nodeAt(u)
   if n is Unary {
     if n.unOp != "-" { return -1 }
     const inner = cboxLitCopy(n.unArg)
@@ -2594,7 +2596,7 @@ function asvLitCopy(ix: i32): i32 {
 function asvStmt(ix: i32, out: i32[]) {
   asvReads = []
   asvStop = false
-  const s = P.nodes[ix]
+  const s = nodeAt(ix)
   if s is LetDecl {
     s.letInit = asvWalk(s.letInit, out, true)
   } else if s is RetStmt {
@@ -2622,14 +2624,14 @@ let asvBoundBuilt = false
 
 // Records the name the `let` at `ix` binds, if it is one.
 function asvNoteLet(ix: i32) {
-  const bn = P.nodes[ix]
+  const bn = nodeAt(ix)
   if bn is LetDecl { asvBound[bn.letName] = 1 }
   0
 }
 
 // Records the name the parameter at `ix` binds, if it is one.
 function asvNoteParam(ix: i32) {
-  const bn = P.nodes[ix]
+  const bn = nodeAt(ix)
   if bn is Param { asvBound[bn.parName] = 1 }
   0
 }
@@ -2659,11 +2661,11 @@ function asvList(stmts: i32[], top: boolean) {
   let i = 0
   while i < stmts.length {
     const out: i32[] = []
-    asvTopLet = top && P.nodes[stmts[i]] is LetDecl
+    asvTopLet = top && nodeAt(stmts[i]) is LetDecl
     asvStmt(stmts[i], out)
     if out.length > 0 { moved = true }
     if out.length > 0 && top && !asvTopLet {
-      const blk = mkBareBlockIf(mkBlock(out, -1), P.nodes[stmts[i]].pos)
+      const blk = mkBareBlockIf(mkBlock(out, -1), nodeAt(stmts[i]).pos)
       out.push(stmts[i])
       res.push(blk)
     } else {
@@ -2689,10 +2691,10 @@ function asvList(stmts: i32[], top: boolean) {
 // Whether function `fnIx` yields its body's value: un-annotated and not adopted as a void
 // callback, or annotated with a type other than `void`.
 function asvFnYields(fnIx: i32): boolean {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
   if fn.fnRet < 0 { return !lambdaVoidAdoptedAt(fnIx) }
-  const rt = P.nodes[fn.fnRet]
+  const rt = nodeAt(fn.fnRet)
   if rt is TypeRef { return rt.tyName != "void" }
   false
 }
@@ -2700,16 +2702,16 @@ function asvFnYields(fnIx: i32): boolean {
 // The value tail of the block at `blockIx`, arm by arm along a tail `if`'s `else if` spine: a
 // write `asvMoves` accepts becomes `const v = e; a = v; v`, as `spillTail` does for a field.
 function asvTail(blockIx: i32) {
-  const b = P.nodes[blockIx]
+  const b = nodeAt(blockIx)
   if !(b is Block) { return 0 }
   const st = b.blkStmts
   if st.length == 0 { return 0 }
   const tx = st[st.length - 1]
-  if P.nodes[tx] is IfStmt {
+  if nodeAt(tx) is IfStmt {
     if ifYieldsNoValue(tx) || !asvChainHasElse(tx) { return 0 }
     let cur = tx
     while cur >= 0 {
-      const c = P.nodes[cur]
+      const c = nodeAt(cur)
       cur = elseIfLink(cur)
       if c is IfStmt {
         asvTail(c.ifThen)
@@ -2718,7 +2720,7 @@ function asvTail(blockIx: i32) {
     }
     return 0
   }
-  if !(P.nodes[tx] is BinExpr) { return 0 }
+  if !(nodeAt(tx) is BinExpr) { return 0 }
   asvReads = []
   asvStop = false
   asvTopLet = false
@@ -2744,7 +2746,7 @@ function asvChainHasElse(ix: i32): boolean {
     last = cur
     cur = elseIfLink(cur)
   }
-  const l = P.nodes[last]
+  const l = nodeAt(last)
   if l is IfStmt { return l.ifElse >= 0 }
   false
 }
@@ -2758,7 +2760,7 @@ export function assignValueSpill(stmts: i32[]) {
   if !asgAnyWiderStore() { return 0 }
   let i = 0
   while i < n {
-    const nd = P.nodes[i]
+    const nd = nodeAt(i)
     if nd is Block { asvList(nd.blkStmts, false) }
     if nd is FuncDecl {
       if asvFnYields(i) { asvTail(nd.fnBody) }
@@ -2778,7 +2780,7 @@ export function synthRetAnnots() {
   let fe = 0
   while fe < fnStmts.length {
     const lamIx = fnStmts[fe]
-    const fn = P.nodes[lamIx]
+    const fn = nodeAt(lamIx)
     if fn is FuncDecl {
       if fn.fnRet < 0 {
         // Void-context lambda (`lambdaVoidAdoptedAt`): checked against an expected
@@ -2929,7 +2931,7 @@ export function synthRetAnnots() {
 export function synthNulListRetAnns() {
   let i = 0
   while i < fnStmts.length {
-    const fn = P.nodes[fnStmts[i]]
+    const fn = nodeAt(fnStmts[i])
     if fn is FuncDecl {
       if fn.fnRet < 0 && fn.fnName != "" {
         // D1220 — the nullable-struct return is the same pin, one type family over:
@@ -2988,12 +2990,12 @@ export function synthNulListRetAnns() {
 // storage (`xs ?? [[1]]` over `string[] | null`) to that list union, registering the union
 // as the annotated spelling does; a bare join names no union row to box into (D2844).
 function synthListUnionLet(letIx: i32): i32 {
-  const s = P.nodes[letIx]
+  const s = nodeAt(letIx)
   if !(s is LetDecl) { return 0 }
   if s.letType >= 0 || s.letInit < 0 { return 0 }
   const init = unwrapParen(s.letInit)
   if init < 0 { return 0 }
-  const n = P.nodes[init]
+  const n = nodeAt(init)
   let joins = n is IfStmt
   if n is BinExpr { joins = n.binOp == "??" }
   if !joins { return 0 }
@@ -3001,7 +3003,7 @@ function synthListUnionLet(letIx: i32): i32 {
   if !tyIsListUnion(jty) { return 0 }
   const jnm = listUnionEmitName(jty)
   if jnm == "" || emitRootIx < 0 { return 0 }
-  const root = P.nodes[emitRootIx]
+  const root = nodeAt(emitRootIx)
   if root is Program {
     const before = uVariants.length
     if registerInlineUnionOfTy(root.progStmts, jnm, jty) < 0 { return -1 }
@@ -3018,7 +3020,7 @@ function synthListUnionLet(letIx: i32): i32 {
 // (D2768, D4349). No pin when `jnm` is "".
 function synthUnionRet(fn: FuncDecl, jty: i32, jnm: string): i32 {
   if jnm == "" || emitRootIx < 0 { return 0 }
-  const root = P.nodes[emitRootIx]
+  const root = nodeAt(emitRootIx)
   if root is Program {
     const before = uVariants.length
     if registerInlineUnionOfTy(root.progStmts, jnm, jty) < 0 { return -1 }
@@ -3117,12 +3119,12 @@ export function recordedParamPinName(pIx: i32) {
 export function synthParamAnnots() {
   let fe = 0
   while fe < fnStmts.length {
-    const fn = P.nodes[fnStmts[fe]]
+    const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       const ps = fn.fnParams
       let pi = 0
       while pi < ps.length {
-        const p = P.nodes[ps[pi]]
+        const p = nodeAt(ps[pi])
         if p is Param {
           if p.parType < 0 {
             const upin = recordedParamPinName(ps[pi])
@@ -3237,12 +3239,12 @@ function cboxShadowTrim(mark: i32) {
 
 // Opens the parameters of nested function `fn` as shadows.
 function cboxShadowParams(fn: i32) {
-  const f = P.nodes[fn]
+  const f = nodeAt(fn)
   if f is FuncDecl {
     const ps = f.fnParams
     let pi = 0
     while pi < ps.length {
-      const p = P.nodes[ps[pi]]
+      const p = nodeAt(ps[pi])
       if p is Param { cboxShadowPush(p.parName) }
       pi = pi + 1
     }
@@ -3404,7 +3406,7 @@ function cboxScanIf(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   const armMark = cboxArmAt
   let cur = ix
   while cur >= 0 {
-    const c = P.nodes[cur]
+    const c = nodeAt(cur)
     const at = cur
     cur = -1
     if c is IfStmt {
@@ -3415,7 +3417,7 @@ function cboxScanIf(ix: i32, depth: i32, dlets: string[], alam: string[]) {
       cboxArmAt = up
       if c.ifElse >= 0 {
         if depth == 0 { cboxArmOpen(at, 1) }
-        if P.nodes[c.ifElse] is IfStmt {
+        if nodeAt(c.ifElse) is IfStmt {
           cur = c.ifElse
         } else {
           cboxScan(c.ifElse, depth, dlets, alam)
@@ -3480,7 +3482,7 @@ function cboxScanForIn(
 // captures, assignments and loops `cboxByRef` compares.
 function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
   if ix < 0 { return 0 }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   match n {
     Ident => {
       if depth > 0 && (cboxShadow[n.identName] ?? 0) == 0 {
@@ -3523,7 +3525,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     BinExpr => {
       if n.binOp == "=" {
         if depth > 0 {
-          const t = P.nodes[n.binLeft]
+          const t = nodeAt(n.binLeft)
           if t is Ident {
             if (cboxShadow[t.identName] ?? 0) == 0 {
               if !strListHas(alam, t.identName) { alam.push(t.identName) }
@@ -3534,7 +3536,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
       cboxScan(n.binLeft, depth, dlets, alam)
       cboxScan(n.binRight, depth, dlets, alam)
       if n.binOp == "=" && depth == 0 {
-        const w = P.nodes[unwrapParen(n.binLeft)]
+        const w = nodeAt(unwrapParen(n.binLeft))
         if w is Ident { cboxNoteAsg(w.identName) }
       }
       return 0
@@ -3577,7 +3579,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
     IsExpr => {
       cboxScan(n.isObj, depth, dlets, alam)
       // `x is L` may store an empty `L` back into `x`, so it writes `x` as an assignment does.
-      const w = P.nodes[unwrapParen(n.isObj)]
+      const w = nodeAt(unwrapParen(n.isObj))
       if w is Ident {
         if cboxIsMayStore(ix, n.isObj) {
           if depth == 0 {
@@ -3624,7 +3626,7 @@ function cboxScan(ix: i32, depth: i32, dlets: string[], alam: string[]) {
       const fs = n.objFields
       let fi = 0
       while fi < fs.length {
-        const f = P.nodes[fs[fi]]
+        const f = nodeAt(fs[fi])
         if f is FieldInit { cboxScan(f.fiValue, depth, dlets, alam) }
         fi = fi + 1
       }
@@ -3645,11 +3647,11 @@ function cboxIsMayStore(isIx: i32, obj: i32): boolean {
   if chk < 0 || chk >= T.tys.length || ot < 0 || ot >= T.tys.length {
     return false
   }
-  if !(T.tys[chk] is TyArray) { return false }
-  const u = T.tys[ot]
+  if !(tyAt(chk) is TyArray) { return false }
+  const u = tyAt(ot)
   if u is TyUnion {
     for m in u.uMembers {
-      if m >= 0 && m < T.tys.length && T.tys[m] is TyArray && !tySame(m, chk) {
+      if m >= 0 && m < T.tys.length && tyAt(m) is TyArray && !tySame(m, chk) {
         return true
       }
     }
@@ -3661,7 +3663,7 @@ function cboxIsMayStore(isIx: i32, obj: i32): boolean {
 // nested binding shadows it, or "".
 function cboxTypedLeftName(n: BinExpr, boxed: string[]) {
   if n.binOp != "??" && n.binOp != "=" { return "" }
-  const l = P.nodes[unwrapParen(n.binLeft)]
+  const l = nodeAt(unwrapParen(n.binLeft))
   if l is Ident {
     if strListHas(boxed, l.identName) && (cboxShadow[l.identName] ?? 0) == 0 {
       return l.identName
@@ -3683,16 +3685,16 @@ export function cboxIsWriteLet(name: string): boolean {
   (cboxWriteLets[name] ?? 0) == 1
 }
 function cboxYieldTail(blockIx: i32, boxed: string[]) {
-  const b = P.nodes[blockIx]
+  const b = nodeAt(blockIx)
   if !(b is Block) { return 0 }
   const st = b.blkStmts
   if st.length == 0 { return 0 }
   const tx = st[st.length - 1]
-  const tn = P.nodes[tx]
+  const tn = nodeAt(tx)
   if tn is IfStmt {
     if tn.ifElse < 0 { return 0 }
     cboxYieldTail(tn.ifThen, boxed)
-    if P.nodes[tn.ifElse] is IfStmt {
+    if nodeAt(tn.ifElse) is IfStmt {
       const eb: i32[] = []
       eb.push(tn.ifElse)
       tn.ifElse = mkBlock(eb, -1)
@@ -3702,7 +3704,7 @@ function cboxYieldTail(blockIx: i32, boxed: string[]) {
   if !(tn is BinExpr) { return 0 }
   const nm = cboxTypedLeftName(tn, boxed)
   if nm == "" || tn.binOp != "=" { return 0 }
-  if P.nodes[unwrapParen(tn.binRight)] is NullLit { return 0 }
+  if nodeAt(unwrapParen(tn.binRight)) is NullLit { return 0 }
   const elemTy = tyArrayElemIx(cboxCellTy[nm] ?? -1)
   const valTy = nodeTyIxOf(tx)
   if elemTy < 0 || valTy < 0 || tySame(elemTy, valTy) { return 0 }
@@ -3734,7 +3736,7 @@ function cboxYieldTail(blockIx: i32, boxed: string[]) {
 
 // A fresh copy of the literal at `ix` (string, number, char, boolean), or -1 for any other node.
 function cboxLitCopy(ix: i32) {
-  const n = P.nodes[unwrapParen(ix)]
+  const n = nodeAt(unwrapParen(ix))
   match n {
     StrLit => {
       return mkStr(n.strText, -1)
@@ -3759,11 +3761,11 @@ function cboxLitCopy(ix: i32) {
 // takes its array form so the list classifies as the matching list type (`[0.0]` builds an
 // f64 list); an un-annotated cell is the list of its init's recorded type.
 function cboxBoxLet(ix: i32, key: string) {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is LetDecl) { return 0 }
   if cboxVecBoxLet(ix, n, key) { return 0 }
   if n.letType >= 0 {
-    const lt = P.nodes[n.letType]
+    const lt = nodeAt(n.letType)
     if lt is TypeRef {
       // A composite element (`i32 | string`, `S | null`, a function type) is parenthesized,
       // since `nm + "[]"` would bind to its last atom.
@@ -3859,7 +3861,7 @@ function cboxSeedLet(name: string, decl: i32, annot: i32, ty: i32) {
 
 // Block `blk` with `first` put before its statements.
 function cboxPrepend(blk: i32, first: i32) {
-  const b = P.nodes[blk]
+  const b = nodeAt(blk)
   if b is Block {
     const out: i32[] = []
     out.push(first)
@@ -3897,14 +3899,14 @@ function cboxContStoreBack(
 ) {
   let cur = ix
   while cur >= 0 {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is FuncDecl { return 0 }
     if n is Block {
       const bs = n.blkStmts
       const out: i32[] = []
       let i = 0
       while i < bs.length {
-        const s = P.nodes[bs[i]]
+        const s = nodeAt(bs[i])
         if s is ContinueStmt {
           if (
             (s.contLabel == "" && nest == 0)
@@ -3987,7 +3989,7 @@ function cboxRenameJoins(ix: i32, boxed: string[]) {
 // reassign — mirrors `drwWalk`, plus descending into `FuncDecl` bodies.
 function cboxWalk(ix: i32, boxed: string[]) {
   if ix < 0 { return ix }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   match n {
     Ident => {
       return cboxWalkIdent(ix, n, boxed)
@@ -4105,7 +4107,7 @@ function cboxWalk(ix: i32, boxed: string[]) {
       const fs = n.objFields
       let fi = 0
       while fi < fs.length {
-        const f = P.nodes[fs[fi]]
+        const f = nodeAt(fs[fi])
         if f is FieldInit { f.fiValue = cboxWalk(f.fiValue, boxed) }
         fi = fi + 1
       }
@@ -4140,7 +4142,7 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: string[]): i32 {
     }
     if rd >= 0 && rty >= 0 { cboxReadTy[rd] = rty }
     if rd >= 0 && cboxStoreTarget { cboxStoreCells[rd] = 1 }
-    if rd >= 0 && rty >= 0 && !cboxStoreTarget && !(T.tys[rty] is TyFunc) {
+    if rd >= 0 && rty >= 0 && !cboxStoreTarget && !(tyAt(rty) is TyFunc) {
       nodeTyRecord(rd, rty)
     }
     return rd
@@ -4153,7 +4155,7 @@ function cboxWalkIdent(ix: i32, n: Ident, boxed: string[]): i32 {
 function cboxWalkBin(ix: i32, n: BinExpr, boxed: string[]): i32 {
   cboxRenameJoins(ix, boxed)
   const leftName = cboxTypedLeftName(n, boxed)
-  cboxStoreTarget = n.binOp == "=" && P.nodes[unwrapParen(n.binLeft)] is Ident
+  cboxStoreTarget = n.binOp == "=" && nodeAt(unwrapParen(n.binLeft)) is Ident
   n.binLeft = cboxWalk(n.binLeft, boxed)
   cboxStoreTarget = false
   n.binRight = cboxWalk(n.binRight, boxed)
@@ -4176,13 +4178,13 @@ function cboxWalkIf(ix: i32, boxed: string[]): i32 {
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
   while cur >= 0 {
-    const c = P.nodes[cur]
+    const c = nodeAt(cur)
     cur = -1
     if c is IfStmt {
       c.ifCond = cboxWalk(c.ifCond, boxed)
       c.ifThen = cboxWalk(c.ifThen, boxed)
       if c.ifElse >= 0 {
-        if P.nodes[c.ifElse] is IfStmt {
+        if nodeAt(c.ifElse) is IfStmt {
           cur = c.ifElse
         } else {
           c.ifElse = cboxWalk(c.ifElse, boxed)
@@ -4210,7 +4212,7 @@ function cboxWalkForRange(ix: i32, n: ForRange, boxed: string[]): i32 {
   n.frBody = cboxWalk(n.frBody, boxed)
   if rseed >= 0 {
     cboxContStoreBack(n.frBody, n.frVar, ix, n.frLabel, 0)
-    const rb = P.nodes[n.frBody]
+    const rb = nodeAt(n.frBody)
     if rb is Block {
       rb.blkStmts.push(cboxStoreBack(n.frVar, ix))
       plCacheBust()
@@ -4254,7 +4256,7 @@ function cboxWalkForIn(ix: i32, n: ForIn, boxed: string[]): i32 {
 // assignment (a read before it is a definite-assignment error).
 function cboxZeroInit(letType: i32) {
   if letType < 0 { return -1 }
-  const lt = P.nodes[letType]
+  const lt = nodeAt(letType)
   if !(lt is TypeRef) { return -1 }
   const nm = lt.tyName
   let lit = -1
@@ -4288,7 +4290,7 @@ function cboxPick(dlets: string[], alam: string[], unboxed: string[]) {
       let ok = true
       const lx = cboxLetIx[nm] ?? -1
       if (cboxKind[nm] ?? CBOX_LET) == CBOX_LET && lx >= 0 {
-        const ld = P.nodes[lx]
+        const ld = nodeAt(lx)
         if ld is LetDecl {
           if ld.letInit < 0 { ld.letInit = cboxZeroInit(ld.letType) }
           if ld.letInit < 0 {
@@ -4324,7 +4326,7 @@ function cboxScalarLets(dlets: string[], alam: string[], tys: i32[]): string[] {
       && lx >= 0
       && cboxByRef(nm, alam)
     ) {
-      const ld = P.nodes[lx]
+      const ld = nodeAt(lx)
       if ld is LetDecl {
         let ty = -1
         if ld.letType >= 0 {
@@ -4361,7 +4363,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
   cboxRenamedRows = Map()
   let fe = 0
   while fe < fnStmts.length {
-    const fn = P.nodes[fnStmts[fe]]
+    const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       cboxFrameReset()
       const dlets: string[] = []
@@ -4369,7 +4371,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
       const ps = fn.fnParams
       let pi = 0
       while pi < ps.length {
-        const p = P.nodes[ps[pi]]
+        const p = nodeAt(ps[pi])
         if p is Param { cboxDeclare(p.parName, CBOX_PARAM, ps[pi], dlets) }
         pi = pi + 1
       }
@@ -4383,7 +4385,7 @@ export function captureBoxRewrite(_stmts: i32[]) {
         const seeds: i32[] = []
         pi = 0
         while pi < ps.length {
-          const p = P.nodes[ps[pi]]
+          const p = nodeAt(ps[pi])
           if p is Param {
             if strListHas(boxed, p.parName) {
               let annot = p.parType
@@ -4469,7 +4471,7 @@ let shrSerial = 0
 function shrCollect(ix: i32, inFn: boolean) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is Ident {
       if inFn {
         shrLamNames[n.identName] = 1
@@ -4496,7 +4498,7 @@ function shrCollect(ix: i32, inFn: boolean) {
 function shrCollectParams(ix: i32, ps: string[], inFn: boolean) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is Ident {
       if inFn && !strListHas(ps, n.identName) { shrLamFree[n.identName] = 1 }
       return 0
@@ -4510,7 +4512,7 @@ function shrCollectParams(ix: i32, ps: string[], inFn: boolean) {
       }
       let pi = 0
       while pi < n.fnParams.length {
-        const pn = P.nodes[n.fnParams[pi]]
+        const pn = nodeAt(n.fnParams[pi])
         if pn is Param {
           shrLamParams[pn.parName] = 1
           inner.push(pn.parName)
@@ -4542,9 +4544,9 @@ function shrParamShadows(name: string): boolean {
 function shrCollectMethods(ix: i32) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is Call {
-      const cf = P.nodes[unwrapParen(n.callFn)]
+      const cf = nodeAt(unwrapParen(n.callFn))
       if cf is Member { shrMethodNames[cf.memProp] = 1 }
       if cf is OptMember { shrMethodNames[cf.omProp] = 1 }
     }
@@ -4626,7 +4628,7 @@ function shrTrim(mark: i32) {
 // Opens function `fnIx`'s own frame — a fresh one, whose parameters keep their spellings and
 // whose nested functions' reads are collected anew — walks its body, and closes it again.
 function shrWalkFrame(fnIx: i32) {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const savedSeen = shrFrameSeen
     const savedShared = shrFrameShared
@@ -4650,7 +4652,7 @@ function shrWalkFrame(fnIx: i32) {
     const seeds: i32[] = []
     let pi = 0
     while pi < ps.length {
-      const p = P.nodes[ps[pi]]
+      const p = nodeAt(ps[pi])
       if p is Param {
         if shrParamNeedsSeed(p.parName, fn.fnBody) {
           const sp = shrMint(p.parName)
@@ -4695,7 +4697,7 @@ function shrParamNeedsSeed(name: string, body: i32): boolean {
   if (shrMethodNames[name] ?? 0) == 1 { return false }
   if !shrParamShadows(name) { return false }
   if body < 0 || body >= P.nodes.length { return false }
-  P.nodes[body] is Block
+  nodeAt(body) is Block
 }
 
 // Respells the bindings under `ix` that `shrDeclare` decides to, and every read of one. A
@@ -4729,7 +4731,7 @@ function shrRespellJoins(ix: i32) {
 function shrWalk(ix: i32) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is IfStmt || n is LetDecl || n is BinExpr { shrRespellJoins(cur) }
     if n is Ident {
       const sp = shrCur[n.identName] ?? ""
@@ -4808,7 +4810,7 @@ export function shadowRespell(stmts: i32[]) {
   shrJoinDone = Map()
   let gi = 0
   while gi < stmts.length {
-    const g = P.nodes[stmts[gi]]
+    const g = nodeAt(stmts[gi])
     if g is LetDecl { shrGlobals[g.letName] = 1 }
     if g is FuncDecl {
       if g.fnName != "" { shrGlobals[g.fnName] = 1 }
@@ -4823,7 +4825,7 @@ export function shadowRespell(stmts: i32[]) {
   shrLamFree = Map()
   let mi = 0
   while mi < stmts.length {
-    if P.nodes[stmts[mi]] !is FuncDecl {
+    if nodeAt(stmts[mi]) !is FuncDecl {
       shrCollect(stmts[mi], false)
       shrCollectParams(stmts[mi], [], false)
       shrCollectMethods(stmts[mi])
@@ -4837,7 +4839,7 @@ export function shadowRespell(stmts: i32[]) {
     shrFrameShared = Map()
     let si = 0
     while si < stmts.length {
-      const st = P.nodes[stmts[si]]
+      const st = nodeAt(stmts[si])
       if st is LetDecl {
         // A top-level binding is a module global rather than a frame local, so only its
         // initialiser, which may hold a closure, is walked.
@@ -4851,7 +4853,7 @@ export function shadowRespell(stmts: i32[]) {
   }
   let fi = 0
   while fi < stmts.length {
-    const fn = P.nodes[stmts[fi]]
+    const fn = nodeAt(stmts[fi])
     if fn is FuncDecl {
       shrLamNames = Map()
       shrLamAny = false
@@ -4912,7 +4914,7 @@ function topLevelFnByName(name: string) {
   while i < fnStmts.length {
     if i < fnParent.length {
       if fnParent[i] < 0 {
-        const fn = P.nodes[fnStmts[i]]
+        const fn = nodeAt(fnStmts[i])
         if fn is FuncDecl {
           if fn.fnName == name { return i }
         }
@@ -4932,7 +4934,7 @@ export function synthVoidTwins(_stmts: i32[]) {
     const name = voidCoerceValNameAt(i)
     const target = topLevelFnByName(name)
     if target >= 0 && voidTwinOfTarget(target) < 0 {
-      const tfn = P.nodes[fnStmts[target]]
+      const tfn = nodeAt(fnStmts[target])
       if tfn is FuncDecl {
         // The checker's grant already excluded generics and non-declarations; these
         // emit-side re-checks fail closed — an unmintable target simply gets no twin,
@@ -4943,7 +4945,7 @@ export function synthVoidTwins(_stmts: i32[]) {
           const argIds: i32[] = []
           let pj = 0
           while pj < tfn.fnParams.length {
-            const pn = P.nodes[tfn.fnParams[pj]]
+            const pn = nodeAt(tfn.fnParams[pj])
             if pn is Param {
               if pn.parType < 0 { mintable = false }
               // Fresh Param nodes sharing the original's annotation node, so the twin's
@@ -5018,7 +5020,7 @@ export function synthExternValues() {
   extValFe = []
   extvLoopVars = []
   if !externValueSeen() || emitRootIx < 0 { return 0 }
-  const root = P.nodes[emitRootIx]
+  const root = nodeAt(emitRootIx)
   if root is Program {
     let s = 0
     while s < root.progStmts.length {
@@ -5029,7 +5031,7 @@ export function synthExternValues() {
   const nFns = fnStmts.length
   let fe = 0
   while fe < nFns {
-    const fn = P.nodes[fnStmts[fe]]
+    const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl { extvRespellIn(fn.fnBody, fnStmts[fe]) }
     fe = fe + 1
   }
@@ -5046,7 +5048,7 @@ let extvLoopVars: string[] = []
 function extvRespellIn(ix: i32, fnIx: i32) {
   let cur = ix
   while cur >= 0 && cur < P.nodes.length {
-    const n = P.nodes[cur]
+    const n = nodeAt(cur)
     if n is FuncDecl { return 0 }
     if n is Ident {
       const nm = n.identName
@@ -5067,7 +5069,7 @@ function extvRespellIn(ix: i32, fnIx: i32) {
     }
     let skip = -1
     if n is Call {
-      if P.nodes[unwrapParen(n.callFn)] is Ident { skip = n.callFn }
+      if nodeAt(unwrapParen(n.callFn)) is Ident { skip = n.callFn }
     }
     const kids = nodeSpineChildren(cur)
     let k = 0
@@ -5144,10 +5146,10 @@ export function synthRecEqCores() {
   let pos = -1
   let ix = 0
   while ix < P.nodes.length && pos < 0 {
-    const n = P.nodes[ix]
+    const n = nodeAt(ix)
     if n is BinExpr {
       const eqOp = n.binOp == "==" || n.binOp == "!="
-      if eqOp && !(P.nodes[n.binRight] is NullLit) {
+      if eqOp && !(nodeAt(n.binRight) is NullLit) {
         if recEqTyCyclic(nodeTyIxOf(n.binLeft), onPath, done) { pos = n.pos }
         if pos < 0 && recEqTyCyclic(nodeTyIxOf(n.binRight), onPath, done) {
           pos = n.pos
@@ -5173,7 +5175,7 @@ function recEqTyCyclic(ty: i32, onPath: i32[], done: i32[]): boolean {
   if i32ListHas(done, ty) { return false }
   onPath.push(ty)
   const kids: i32[] = []
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyObj {
     let fi = 0
     while fi < t.objFieldTypes.length {

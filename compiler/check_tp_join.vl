@@ -6,7 +6,7 @@
 // (`tyIsNamedParamHole`, `tyIsGradualParam`, `tyParamOfInnermostBody`) are what those
 // decisions read. `joinRowsReset` clears the join rows per program.
 
-import { FuncDecl, P, Param, i32ToStr } from "./ast"
+import { FuncDecl, P, Param, i32ToStr, nodeAt } from "./ast"
 import { cstrOwnerStack, lamCheckDepth, lamRefoldDepth } from "./check_cursor"
 import {
   HD_BINOP,
@@ -44,6 +44,7 @@ import {
   TyVar,
   mkNullableTy,
   tyArrayElemIx,
+  tyAt,
   tyBearsNull,
   tyEq,
   tyEqSameHoles,
@@ -65,7 +66,7 @@ export let tvElseTested: {[i32]: i32} = Map()
 
 // A copy of union `cur` that pins to `cur − tIdx` per instance, or -1 when `cur` is not a union.
 export function mkTvElseRemTy(cur: i32, tIdx: i32): i32 {
-  const u = T.tys[cur]
+  const u = tyAt(cur)
   if !(u is TyUnion) { return -1 }
   const ms: i32[] = []
   for m in u.uMembers { ms.push(m) }
@@ -89,7 +90,7 @@ export function joinTyParamNull(a: i32, b: i32) {
   if isNullTy(b) { tv = a }
   else if isNullTy(a) { tv = b }
   if tv < 0 || tv >= T.tys.length { return -1 }
-  const t = T.tys[tv]
+  const t = tyAt(tv)
   if t is TyVar {
     // A hole's name starts with `?`; a declared parameter's is an identifier. A parameter's
     // hole in the body declaring it is one as well (D3303).
@@ -110,7 +111,7 @@ export function joinTyParamNull(a: i32, b: i32) {
 // parameter's and a call's fresh one are not.
 function tyIsNamedParamHole(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
-  const tt = T.tys[t]
+  const tt = tyAt(t)
   if tt is TyVar {
     const nm = tt.tvName
     if nm.length < 2 || nm[0] != "?"[0] || nm[1] == "#"[0] { return false }
@@ -132,7 +133,7 @@ export function noteHoleTpJoin(t: i32) {
     let m = m0
     if tyIsNonNullHoleRead(m) { m = holeBaseTy(m) }
     if tyIsNamedParamHole(m) {
-      const mt = T.tys[m]
+      const mt = tyAt(m)
       if mt is TyVar { holeTpJoinNames[mt.tvName] = true }
     }
   }
@@ -152,7 +153,7 @@ export function holeNamesTpJoin(ns: string[]): boolean {
 function holeNameOfDecl(name: string, owner: i32): boolean {
   if name.length < 2 || name[0] != "?"[0] { return false }
   if owner < 0 || owner >= P.nodes.length { return false }
-  const fd = P.nodes[owner]
+  const fd = nodeAt(owner)
   if fd is FuncDecl {
     if fd.fnName == "" { return false }
     return holeNameIsParamOf(name, fd.fnName, owner, fd.fnParams.length)
@@ -173,7 +174,7 @@ export function tyParamsApartIn(at: i32, exp: i32, owner: i32): boolean {
 // walks the list and nullable shapes `tyParamsApart` admits.
 function tyHolesOwnedBy(ty: i32, owner: i32, depth: i32): boolean {
   if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyVar {
     return t.tvName.length == 0
       || t.tvName[0] != "?"[0]
@@ -190,14 +191,14 @@ function tyHolesOwnedBy(ty: i32, owner: i32, depth: i32): boolean {
 // whole substituted union. The concrete members' type, or `ty` when it is no such union.
 export function tpGradualView(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return ty }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyUnion) { return ty }
   const keep: i32[] = []
   let tp = false
   let hole = -1
   for m in t.uMembers {
     if m < 0 || m >= T.tys.length { return ty }
-    if T.tys[m] is TyVar {
+    if tyAt(m) is TyVar {
       if tpGradualMember(m) { tp = true }
       if hole < 0 { hole = m }
     } else {
@@ -238,8 +239,8 @@ export function unionHasDeclaredParam(ms: i32[]): boolean {
 // Whether `a` and `b` are two rows of one declared type parameter or one parameter's hole:
 // substitution matches by name.
 export function sameDeclaredTyParam(a: i32, b: i32): boolean {
-  const ta = T.tys[a]
-  const tb = T.tys[b]
+  const ta = tyAt(a)
+  const tb = tyAt(b)
   if ta is TyVar {
     if tb is TyVar {
       if ta.tvName != tb.tvName { return false }
@@ -271,7 +272,7 @@ export function paramJoinDropsNull(u: i32, o: i32): boolean {
 // Whether `t` is a union holding a declared type parameter, decided per instance.
 export function tyIsParamUnion(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
-  const u = T.tys[t]
+  const u = tyAt(t)
   u is TyUnion && unionHasDeclaredParam(u.uMembers)
 }
 
@@ -284,7 +285,7 @@ export function writtenTpUnion(t: i32): boolean {
     return false
   }
   const u = nonNullTy(t)
-  u >= 0 && u < T.tys.length && T.tys[u] is TyUnion
+  u >= 0 && u < T.tys.length && tyAt(u) is TyUnion
 }
 
 // Marks a join kept apart over a type parameter (`tpJoinUnions`), or the union inside its
@@ -293,7 +294,7 @@ export function markTpJoinApart(j: i32) {
   if j < 0 || j >= T.tys.length || tpJoinUnions.length == 0 { return 0 }
   // arena-tick exempt: a per-program mark on an existing arena row.
   if tpJoinUnions.has(j) { tpJoinUnions[j] = 2 }
-  const jt = T.tys[j]
+  const jt = tyAt(j)
   if jt is TyNullable {
     // arena-tick exempt: a per-program mark on an existing arena row.
     if tpJoinUnions.has(jt.nInner) { tpJoinUnions[jt.nInner] = 2 }
@@ -327,7 +328,7 @@ export function tpOpenJoin(a: i32, b: i32): i32 {
   }
   for m in ms {
     if m < 0 || m >= T.tys.length || m == TY_ERR || m == TY_VOID { return -1 }
-    const mt = T.tys[m]
+    const mt = tyAt(m)
     if isNullTy(m) {
       hasNull = true
     } else if mt is TyVar {
@@ -390,22 +391,22 @@ export function holeParamBesideConcrete(p: i32, c: i32): boolean {
 // type parameter, the two shapes whose instances do not yet build such a join (D3357, D3358).
 export function tyParamOfInnermostBody(p: i32): boolean {
   if lamCheckDepth > 0 { return false }
-  const tp = T.tys[p]
+  const tp = tyAt(p)
   if tp is TyVar {
     const k = cstrOwnerStack.length - 1
     if k < 0 { return false }
     const owner = cstrOwnerStack[k]
     if owner >= 0 && owner < P.nodes.length {
-      const fd = P.nodes[owner]
+      const fd = nodeAt(owner)
       if fd is FuncDecl {
         for pi in fd.fnParams {
-          const pn = P.nodes[pi]
+          const pn = nodeAt(pi)
           if pn is Param && pn.parType >= 0 {
             const pt = nodeTyIxOf(pn.parType)
             if (
               pt >= 0
               && pt < T.tys.length
-              && T.tys[pt] is TyArray
+              && tyAt(pt) is TyArray
               && tyHasTyVar(pt)
             ) {
               return false
@@ -427,7 +428,7 @@ export function tyParamOfInnermostBody(p: i32): boolean {
 function gradualParamOfOpenBody(p: i32): boolean {
   if tyIsDeclaredParam(p) { return tyParamOfOpenBody(p) }
   if !tyIsNamedParamHole(p) { return false }
-  const tp = T.tys[p]
+  const tp = tyAt(p)
   if tp is TyVar {
     for owner in cstrOwnerStack {
       if holeNameOfDecl(tp.tvName, owner) { return true }
@@ -445,11 +446,11 @@ function lamParamOfOpenBody(p: i32): boolean {
 
 // Whether type variable `p` names a type parameter of a declaration whose body is being checked.
 function tyParamOfOpenBody(p: i32): boolean {
-  const tp = T.tys[p]
+  const tp = tyAt(p)
   if tp is TyVar {
     for owner in cstrOwnerStack {
       if owner >= 0 && owner < P.nodes.length {
-        const fd = P.nodes[owner]
+        const fd = nodeAt(owner)
         if fd is FuncDecl {
           for nm in fd.fnTyParams {
             if nm == tp.tvName { return true }
@@ -468,7 +469,7 @@ export function keptParamUnion(tyIx: i32, keep: boolean): i32 {
   if tyIx < 0 || tyIx >= T.tys.length || !keep || !tpOwnParamsOnly(tyIx) {
     return -1
   }
-  const t = T.tys[tyIx]
+  const t = tyAt(tyIx)
   if !(t is TyUnion) { return -1 }
   const tc = mkUnionTy(t.uMembers)
   // arena-tick exempt: a per-program mark on a fresh arena row.
@@ -481,7 +482,7 @@ export function keptParamUnion(tyIx: i32, keep: boolean): i32 {
 // holes, and nothing else.
 function tpOwnParamsOnly(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
-  const u = T.tys[t]
+  const u = tyAt(t)
   if !(u is TyUnion) || u.uMembers.length < 2 { return false }
   for m in u.uMembers {
     if !tyIsGradualParam(m) || !tyParamOfInnermostBody(m) { return false }
@@ -500,7 +501,7 @@ export function deferredJoinOverOpenParams(tyIx: i32): boolean {
   let nul = false
   for m in ms {
     if m < 0 || m >= T.tys.length { return false }
-    const mt = T.tys[m]
+    const mt = tyAt(m)
     if isNullTy(m) { nul = true }
     if mt is TyVar {
       if !gradualParamOfOpenBody(m) { return false }
@@ -523,7 +524,7 @@ export function tyIsDeferredJoin(tyIx: i32) {
   if tyIx < 0 { return false }
   // A declared parameter's join with a concrete type is a real union, not a placeholder.
   if tpJoinUnions.length > 0 && tpJoinUnions.has(tyIx) { return false }
-  const t = T.tys[tyIx]
+  const t = tyAt(tyIx)
   match t {
     TyNullable => {
       return tyIsDeferredJoin(t.nInner)
@@ -547,7 +548,7 @@ export function tyIsDeferredJoin(tyIx: i32) {
 // holes only, which a pin may fold to one of its holes (D3125, D3616).
 export function tyIsArmedDeferredJoin(tyIx: i32): boolean {
   if !tyIsDeferredJoin(tyIx) || tyBearsNull(tyIx) { return false }
-  const t = T.tys[tyIx]
+  const t = tyAt(tyIx)
   if !(t is TyUnion) { return false }
   let i = 0
   while i < t.uMembers.length {

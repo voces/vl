@@ -1,7 +1,16 @@
 // `emit_struct_order.vl` — the order structs are emitted in, the duplicate-index
 // scan, and which `array.new` kind and fill a list's element kind takes.
 
-import { ArrayLit, Call, Ident, Index, LetDecl, P, i32ToStr } from "./ast"
+import {
+  ArrayLit,
+  Call,
+  Ident,
+  Index,
+  LetDecl,
+  P,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
 import { nominalStructNameOfTy } from "./check_emit_queries"
 import { nodeTyPinIxOf, pinnedHoleTyOf } from "./check_hole_pins"
 import { nodeArrayElemTyIx, nodeTyIxOf } from "./check_node_tys"
@@ -20,6 +29,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  tyAt,
   tyIsLitUnion,
 } from "./check_types"
 import { structPrefixCands } from "./emit_atom_kinds"
@@ -92,7 +102,7 @@ export function blockBindingHidden() {
 // assuming the struct one. `arrNewIntrKind` below is the kind itself: `__array_new__` reads
 // its fill, `__array_new_default__` its destination, and `"none"` is not an intrinsic allocation.
 export function arrNewFillTyIx(callIx: i32): i32 {
-  const c = P.nodes[callIx]
+  const c = nodeAt(callIx)
   if c is Call {
     if c.callArgs.length == 2 { return nodeTyIxOf(c.callArgs[1]) }
   }
@@ -116,7 +126,7 @@ export type ArrNewKind = "none"
 // resolved element type at all: an unbound `TyVar`, a bare literal, a negation, the err hole.
 export function tyIsRefListElemTy(el: i32) {
   if el < 0 { return false }
-  const e = T.tys[el]
+  const e = tyAt(el)
   if e is TyObj { return true }
   if e is TyArray { return true }
   if e is TyUnion { return true }
@@ -266,7 +276,7 @@ function localDeclClass(slot: i32) {
 // scope-less pass resolves a name in its initializer to? Conservative: an index, an array
 // literal or a chain deeper than the cap counts as yielding something.
 function declYieldsNothing(d: i32, depth: i32): boolean {
-  const n = P.nodes[d]
+  const n = nodeAt(d)
   if n is LetDecl {
     if n.letType >= 0 {
       if tyIsLitUnion(nodeArrayElemTyIx(n.letType)) { return false }
@@ -288,7 +298,7 @@ function initYieldsNothing(e: i32, depth: i32): boolean {
   if tyIsLitUnion(tyStepElem(nodeTyPinIxOf(ix))) { return false }
   if tyIsLitUnion(pinnedHoleTyOf(nodeArrayElemTyIx(e))) { return false }
   if ix < 0 || ix >= P.nodes.length { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is ArrayLit { return false }
   if n is Index { return false }
   if n is Ident { return identYieldsNothing(n.identName, depth) }
@@ -718,7 +728,7 @@ export function rlSlotOfTy(ty: i32): i32 {
 // The declared struct type a record spelled by shape (`ty`) shares its ref-list slot with,
 // or -1 when `ty` is no record or is that declared type itself (D4930, D4932).
 export function rlDeclTwinTy(ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyObj) { return -1 }
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyObj) { return -1 }
   const nom = nominalStructNameOfTy(ty)
   if nom == "" { return -1 }
   const d = declTyIxOfName(nom)
@@ -738,7 +748,7 @@ export function rlSoleSlotOfRecTy(ty: i32, si: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
   const key = repElemId(ty)
   if key < 0 { return -1 }
-  const nul = T.tys[ty] is TyNullable
+  const nul = tyAt(ty) is TyNullable
   let found = -1
   let i = 0
   while i < rlElemKey.length {
@@ -756,10 +766,10 @@ function rlElemMayBeRow(slot: i32, si: i32, nul: boolean): boolean {
   const ety = rlElemTyIxAt(slot)
   if ety < 0 || ety >= T.tys.length { return true }
   let b = ety
-  const et = T.tys[ety]
+  const et = tyAt(ety)
   if et is TyNullable { b = et.nInner }
   if b < 0 || b >= T.tys.length { return true }
-  const bt = T.tys[b]
+  const bt = tyAt(b)
   if bt is TyVar || bt is TyErr { return true }
   if bt is TyUnion { return rlUnionMayBeVar(bt.uMembers) }
   if !(bt is TyObj) || (et is TyNullable) != nul { return false }
@@ -773,7 +783,7 @@ function rlUnionMayBeVar(mems: i32[]): boolean {
   while i < mems.length {
     const m = mems[i]
     if m < 0 || m >= T.tys.length { return true }
-    const mt = T.tys[m]
+    const mt = tyAt(m)
     if mt is TyVar || mt is TyErr { return true }
     i = i + 1
   }
@@ -799,8 +809,8 @@ export function rlNestRowsNamed(ty: i32, si: i32, nm: string): boolean {
 // sidecar does not cover it, or it is a type variable, at any list depth down to `ty`'s leaf.
 function rlElemMayBeNest(a: i32, ty: i32, si: i32): boolean {
   if a < 0 || a >= T.tys.length || ty < 0 || ty >= T.tys.length { return true }
-  const xt = T.tys[a]
-  const bt = T.tys[ty]
+  const xt = tyAt(a)
+  const bt = tyAt(ty)
   match xt {
     TyVar | TyErr => {
       return true
@@ -823,7 +833,7 @@ function rlElemMayBeNest(a: i32, ty: i32, si: i32): boolean {
       if si >= 0 || !(bt is TyNullable) { return false }
       const n = xt.nInner
       if n < 0 || n >= T.tys.length { return true }
-      const nt = T.tys[n]
+      const nt = tyAt(n)
       return nt is TyFunc || nt is TyVar || nt is TyErr
     }
     TyPrim | TyLit | TyMap | TyNeg => {
@@ -857,10 +867,10 @@ export function rlElemTyIxAt(slot: i32): i32 {
 // `PrimName` rather than over the list `VKind` this folds to.
 export function tyPrimLeafElemName(ty: i32): PrimName | null {
   if ty < 0 { return null }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyArray {
     if t.aElem < 0 { return null }
-    const el = T.tys[t.aElem]
+    const el = tyAt(t.aElem)
     if el is TyPrim { return el.primName }
   }
   null

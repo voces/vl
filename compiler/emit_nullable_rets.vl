@@ -46,6 +46,7 @@ import {
   WhileStmt,
   i32ToStr,
   mkTypeRef,
+  nodeAt,
   ufcsSiteRoot,
 } from "./ast"
 import { nodeRepTyIxOf } from "./check_core_state"
@@ -89,6 +90,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  tyAt,
   tyIsNullableLitUnion,
   tyMutEpoch,
   tyPrimNameOf,
@@ -215,10 +217,10 @@ import {
 // still has, its annotation carrying the pin while the recorded type is the original's
 // unpinned `T`. `"none"` for a fill that is not an annotated parameter.
 export function arrNewFillAnnKind(callIx: i32, fnIx: i32): ArrNewKind {
-  const c = P.nodes[callIx]
+  const c = nodeAt(callIx)
   if c is Call {
     if c.callArgs.length == 2 {
-      const a = P.nodes[c.callArgs[1]]
+      const a = nodeAt(c.callArgs[1])
       if a is Ident {
         const pt = paramTypeNode(fnIx, a.identName)
         if pt >= 0 { return arrNewKindOfElemVKind(vtKindOfType(pt)) }
@@ -231,14 +233,14 @@ export function arrNewFillAnnKind(callIx: i32, fnIx: i32): ArrNewKind {
 // Whether function `fnIx` returns the nullable atom `K | null`, annotated or inferred, whose
 // fall-through null is the `-1` sentinel (D5340).
 export function fnRetIsNulAtom(fnIx: i32): boolean {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
   if fn.fnRet >= 0 { return nodeTyIsNulLitUnion(fn.fnRet) }
   tyIsNullableLitUnion(inferRetTyIxOf(inferRetFnKey(fnIx, fn.fnName)))
 }
 
 export function fnRetNullBearing(fnIx: i32) {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
   const r = fn.fnRet
   if tyIsNulBool(r) { return true }
@@ -275,10 +277,10 @@ export function fnRetNullBearing(fnIx: i32) {
 // `emitFuncBody`/`emitStmtTail` (the tail is the result), and `emitCallStmt`'s discard.
 // Reads the checker's type at every method, not a by-name exclusion list (D1301, D1592).
 export function memberCallYieldsValue(stmtIx: i32) {
-  const s = P.nodes[stmtIx]
+  const s = nodeAt(stmtIx)
   if s is Call {
     if s.callFn < 0 { return false }
-    const callee = P.nodes[s.callFn]
+    const callee = nodeAt(s.callFn)
     if callee is Member {
       // An unrecorded type (-1) is "cannot answer", never a value. A per-instance copy of a
       // call records no type of its own and answers the checked call it copies (D4670).
@@ -294,7 +296,7 @@ export function memberCallYieldsValue(stmtIx: i32) {
 // Whether assignment `asgIx`'s value is typed a non-nullable function.
 export function asgValueIsFunc(asgIx: i32): boolean {
   const vt = nodeTyIxOf(asgIx)
-  vt >= 0 && vt < T.tys.length && T.tys[vt] is TyFunc
+  vt >= 0 && vt < T.tys.length && tyAt(vt) is TyFunc
 }
 
 // Whether `spillTail` turns the field or element write at `asgIx` into a store and a read of
@@ -302,29 +304,27 @@ export function asgValueIsFunc(asgIx: i32): boolean {
 // inferred-return rep, D2498), a write to a captured cell (boxed after `spillTail`), and a
 // `null` at a lambda's or nested function's tail, whose `null` result does not lower.
 export function assignTargetSpills(asgIx: i32): boolean {
-  const a = P.nodes[asgIx]
+  const a = nodeAt(asgIx)
   if !(a is BinExpr) { return false }
   if a.binOp != "=" { return false }
   const v = unwrapParen(a.binRight)
   if v < 0 { return false }
   const t = unwrapParen(a.binLeft)
   if t < 0 { return false }
-  if !(P.nodes[t] is Member || P.nodes[t] is Index) { return false }
+  if !(nodeAt(t) is Member || nodeAt(t) is Index) { return false }
   const vt = nodeTyIxOf(asgIx)
-  if P.nodes[v] is NullLit {
-    return !asgTargetIsCell(t) && !asgFrameIsClosure()
-  }
+  if nodeAt(v) is NullLit { return !asgTargetIsCell(t) && !asgFrameIsClosure() }
   if vt < 0 || vt >= T.tys.length { return false }
-  if T.tys[vt] is TyMap { return !asgTargetIsCell(t) }
-  const nt = T.tys[nonNullTy(vt)]
+  if tyAt(vt) is TyMap { return !asgTargetIsCell(t) }
+  const nt = tyAt(nonNullTy(vt))
   !(nt is TyMap || nt is TyFunc)
 }
 
 // Whether the write target `t` is a captured binding's cell, `cell[0]`.
 function asgTargetIsCell(t: i32): boolean {
-  const tn = P.nodes[t]
+  const tn = nodeAt(t)
   if !(tn is Index) { return false }
-  const cell = P.nodes[tn.idxArr]
+  const cell = nodeAt(tn.idxArr)
   if !(cell is Ident) { return false }
   (cboxCellNames[cell.identName] ?? 0) == 1
 }
@@ -335,7 +335,7 @@ function asgFrameIsClosure(): boolean {
   let f = tailSelfFnIx
   if f < 0 { f = emitCurFnIx }
   if f < 0 || f >= P.nodes.length { return false }
-  const fn = P.nodes[f]
+  const fn = nodeAt(f)
   if !(fn is FuncDecl) { return false }
   const nm = fn.fnName
   if nm.length >= 8 && nm.slice(0, 8) == "__lambda" { return true }
@@ -364,7 +364,7 @@ export function tailSelfFnSet(fnIx: i32) {
 // through to: a rep `fnRetNullBearing` reads now, or one `synthNulListRetAnns` pins later.
 export function inferNullFallsThrough(fnIx: i32): boolean {
   if fnRetNullBearing(fnIx) { return true }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
   if fn.fnRet >= 0 { return false }
   if inferRetNulPinned(inferRetFnKey(fnIx, fn.fnName)) { return true }
@@ -381,7 +381,7 @@ export function inferRetNulPinned(irk: string): boolean {
   if inferRetIsNulList(irk) { return true }
   const itx = inferRetTyIxOf(irk)
   if itx < 0 { return false }
-  const it = T.tys[itx]
+  const it = tyAt(itx)
   if !(it is TyNullable) { return false }
   const inner = it.nInner
   if inner < 0 { return false }
@@ -396,7 +396,7 @@ export function inferRetNulPinned(irk: string): boolean {
 // `else if` chain) is never "empty" in this sense and answers false.
 export function ifTailArmIsEmpty(blockIx: i32): boolean {
   if blockIx < 0 { return false }
-  const ab = P.nodes[blockIx]
+  const ab = nodeAt(blockIx)
   if ab is Block { return ab.blkStmts.length == 0 }
   false
 }
@@ -404,7 +404,7 @@ export function ifTailArmIsEmpty(blockIx: i32): boolean {
 // True when the function node `fnIx` carries a return annotation other than `void`.
 export function fnDeclaresNonVoid(fnIx: i32): boolean {
   if fnIx < 0 { return false }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if !(fn is FuncDecl) { return false }
   fn.fnRet >= 0 && retVoidAnnFlag(fn.fnRet) == 0
 }
@@ -415,17 +415,17 @@ export function fnDeclaresNonVoid(fnIx: i32): boolean {
 // function eligible for the sink at all. Every other expression is a single exit.
 export function retValueExitCount(exprIx: i32, fnIx: i32) {
   if exprIx < 0 { return 0 }
-  const bare = P.nodes[unwrapParen(exprIx)]
+  const bare = nodeAt(unwrapParen(exprIx))
   if bare is IfStmt {
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let total = 0
     let cur = unwrapParen(exprIx)
     while cur >= 0 {
-      const c = P.nodes[cur]
+      const c = nodeAt(cur)
       cur = -1
       if c is IfStmt {
         total = total + retArmExitCount(c.ifThen, fnIx)
-        if c.ifElse >= 0 && P.nodes[c.ifElse] is IfStmt {
+        if c.ifElse >= 0 && nodeAt(c.ifElse) is IfStmt {
           cur = c.ifElse
         } else {
           total = total + retArmExitCount(c.ifElse, fnIx)
@@ -442,7 +442,7 @@ export function retValueExitCount(exprIx: i32, fnIx: i32) {
 // and anything else is one exit.
 function retArmExitCount(armIx: i32, fnIx: i32) {
   if armIx < 0 { return 0 }
-  const a = P.nodes[armIx]
+  const a = nodeAt(armIx)
   match a {
     IfStmt => {
       return retValueExitCount(armIx, fnIx)
@@ -475,7 +475,7 @@ function localNameIsUnionSlot(name: string) {
 // into a nested `FuncDecl`, whose locals belong to its own lifted wasm function.
 function blockHasUnionLetIf(stmtIx: i32) {
   if stmtIx < 0 { return false }
-  const s = P.nodes[stmtIx]
+  const s = nodeAt(stmtIx)
   match s {
     FuncDecl => {
       return false
@@ -517,7 +517,7 @@ function blockHasUnionLetIf(stmtIx: i32) {
 // past the merge. A prediction only (`unionIfBindingAllBox` decides at lowering time
 // whether the rewrite fires); over-firing costs two unused locals, under-firing declines a sink.
 export function fnUnionLetSinkOk(fnIx: i32) {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl { return blockHasUnionLetIf(fn.fnBody) }
   false
 }
@@ -536,7 +536,7 @@ export function retNulRefFlag(tyIx: i32) {
   if tyIx >= 0 {
     // The checker recorded this node's type as a nullable declared struct (`S | null`).
     if nodeTyIsNulStruct(tyIx) { return 1 }
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     if ty is TypeRef {
       // A union variant with no struct row is `nulvariant`, not kind 9 (`retNulVariantFlag`
       // is the positive answer) — excluded here, at the one producer: `collectS` refuses a
@@ -546,10 +546,10 @@ export function retNulRefFlag(tyIx: i32) {
       // (the kind-16 ref) or a node with no nullable rep is not.
       const nrt = nodeRepTyIxOf(tyIx)
       if nrt >= 0 {
-        const tn = T.tys[nrt]
+        const tn = tyAt(nrt)
         if tn is TyNullable {
           if tn.nInner >= 0 {
-            const ti2 = T.tys[tn.nInner]
+            const ti2 = tyAt(tn.nInner)
             if ti2 is TyObj { return 1 }
           }
         }
@@ -575,7 +575,7 @@ export function nulVariantIndexOf(tyIx: i32) {
   if tyIx < 0 { return -1 }
   const nvt = nodeTyIxOf(tyIx)
   if nvt >= 0 {
-    const nvty = T.tys[nvt]
+    const nvty = tyAt(nvt)
     if nvty is TyNullable {
       if nvty.nInner >= 0 {
         const nvr = variantRowOfTy(nvty.nInner)
@@ -595,13 +595,13 @@ export function retNulRefIndex(tyIx: i32) {
     // (`repSlotOfTy`, nominal identity plus the structural-declared bridge). Confirms only.
     const rt = nodeRepTyIxOf(tyIx)
     if rt >= 0 {
-      const t = T.tys[rt]
+      const t = tyAt(rt)
       if t is TyNullable {
         const ds = repSlotOfTy(t.nInner)
         if ds >= 0 { return ds }
       }
     }
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     if ty is TypeRef {
       const nb = nulBaseStructRow(tyIx)
       if nb >= 0 { return nb }
@@ -617,11 +617,11 @@ export function retNulRefIndex(tyIx: i32) {
 export function nulBaseStructRow(tyIx: i32): i32 {
   const nt = nodeRepTyIxOf(tyIx)
   if nt < 0 { return -1 }
-  const t = T.tys[nt]
+  const t = tyAt(nt)
   if !(t is TyNullable) { return -1 }
   const inner = t.nInner
   if inner < 0 { return -1 }
-  if !(T.tys[inner] is TyObj) { return -1 }
+  if !(tyAt(inner) is TyObj) { return -1 }
   const ar = repRowOfTyStruct(inner, sScanLim())
   if ar >= 0 { return ar }
   namedRowOfTy(inner)
@@ -668,7 +668,7 @@ export function retStructRowIndex(tyIx: i32) {
   if tyIx < 0 { return -1 }
   const ds = repSlotOfTy(nodeRepTyIxOf(tyIx))
   if ds >= 0 { return ds }
-  const ty = P.nodes[tyIx]
+  const ty = nodeAt(tyIx)
   if ty is TypeRef {
     const si = structIndexByName(ty.tyName)
     if si >= 0 { return si }
@@ -696,7 +696,7 @@ export function retStructIndex(tyIx: i32) {
     // declared twin), byte-safe now that the sig-canon slice renders twin-safe `$fnsig` digits.
     const ds = repSlotOfTy(nodeRepTyIxOf(tyIx))
     if ds >= 0 { return ds }
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     if ty is TypeRef {
       const si = structIndexByName(ty.tyName)
       if si >= 0 { return si }
@@ -814,7 +814,7 @@ export function retListKindFlag(tyIx: i32) {
 // or "". Populates `fRetRArrElem`.
 export function retRefArrElemName(tyIx: i32) {
   if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     // `refArrElemNameIf` IS the `nameIsRefArray`-gated `refArrElemName` this arm spelled
     // out; its "" for a non-ref-array annotation is the same "" this function's tail
     // returned, so the early return is exact.
@@ -901,7 +901,7 @@ function nslSpellOf(ty: i32): i32 {
 const nslSeen: i32[] = []
 
 function nslSpellGo(ty: i32): i32 {
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less: only a list or a union of lists spells one.
   match t {
     TyArray => {
@@ -962,7 +962,7 @@ export function nulScalarListKindOfNode(tyIx: i32): VKind | null {
     if isNulScalarListKind(rk) { return rk }
     return null
   }
-  const ty = P.nodes[tyIx]
+  const ty = nodeAt(tyIx)
   if ty is TypeRef { return nulScalarListKind(ty.tyName) }
   null
 }
@@ -1021,13 +1021,13 @@ export function isNulScalarListFieldCode(c: i32): boolean {
 // `| null` and has no node left to ask.
 function tyIsNulStrArr(ty: i32) {
   if ty < 0 { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyArray {
     if t.aElem < 0 { return false }
-    const e = T.tys[t.aElem]
+    const e = tyAt(t.aElem)
     if e is TyNullable {
       if e.nInner < 0 { return false }
-      const inner = T.tys[e.nInner]
+      const inner = tyAt(e.nInner)
       if inner is TyPrim { return inner.primName == "string" }
     }
   }
@@ -1041,7 +1041,7 @@ export function annIsNulStrListDeep(tyIx: i32) {
   if tyIx < 0 { return false }
   let ty = nodeTyIxOf(tyIx)
   if ty >= 0 {
-    const t = T.tys[ty]
+    const t = tyAt(ty)
     if t is TyNullable { ty = t.nInner }
   }
   if tyIsNulLitUnionArr(ty) { return false }
@@ -1064,7 +1064,7 @@ function vtKindOfTypeLadder(tyIx: i32): VKind {
   // A literal-union annotation (`type K = "a" | "b"`) is an i32-backed interned atom (`"i32"`), NOT
   // a value-union box — checked first (it IS a `TyUnion`, so `retUnionFlag` would claim it).
   if tyIx >= 0 {
-    if P.nodes[tyIx] is TypeRef {
+    if nodeAt(tyIx) is TypeRef {
       if nodeTyIsLitUnionAlias(tyIx) { return "i32" }
     }
   }
@@ -1072,7 +1072,7 @@ function vtKindOfTypeLadder(tyIx: i32): VKind {
   // value `-1` encoding `null` (no box). Checked before the `string | null` niche
   // (`"nulstr"`) as a defensive ordering, ahead of any base-collapse.
   if tyIx >= 0 {
-    if P.nodes[tyIx] is TypeRef {
+    if nodeAt(tyIx) is TypeRef {
       if nodeTyIsNulLitUnion(tyIx) { return "i32" }
     }
   }
@@ -1146,7 +1146,7 @@ function vtKindOfTypeLadder(tyIx: i32): VKind {
 // return / functype valtype (the `(ref $mapStruct)` cell), not only a local.
 export function retMapFlag(tyIx: i32) {
   if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     if ty is TypeRef {
       // A string-keyed map crosses a call boundary as kind 6 (`(ref $mapStruct)`), gated by
       // the same classifier the local path interns with (`mvValKindOfName`). A map-member
@@ -1169,7 +1169,7 @@ export function retMapFlag(tyIx: i32) {
 // `retMapFlag`, so an unrepresentable nullable-map value keeps failing loudly (D-BAREMAP).
 export function retNulMapFlag(tyIx: i32) {
   if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     if ty is TypeRef {
       if tyIsNulBareMap(tyIx) {
         if mapValKindLowerable(nulMapInnerName(ty.tyName)) { return 1 }
@@ -1185,7 +1185,7 @@ export function retNulMapFlag(tyIx: i32) {
 // Shared by the param/return valtype and the body shape resolution (`mapShapeOfExpr`).
 export function mapAnnShape(tyIx: i32) {
   if tyIx >= 0 {
-    const ty = P.nodes[tyIx]
+    const ty = nodeAt(tyIx)
     if ty is TypeRef {
       // A NULLABLE map annotation (`{[string]: V} | null`) resolves its shape from the BARE inner
       // map — its `(ref null $mapStruct)` cell selects the SAME `$mapStruct` its non-null twin does.
@@ -1229,12 +1229,12 @@ export function mapAnnShape(tyIx: i32) {
 // or -1. Lets `mapShapeOfExpr` resolve a map param's VALUE type instead of assuming mono i32.
 export function paramMapShape(fnIx: i32, name: string) {
   if fnIx < 0 { return -1 }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const params = fn.fnParams
     let i = 0
     while i < params.length {
-      const p = P.nodes[params[i]]
+      const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name { return mapAnnShape(p.parType) }
       }
@@ -1303,7 +1303,7 @@ export function retUnionFlag(tyIx: i32) {
 // `"str"`, `"i32"`, …) — its annotation's `vtKindOfType`, or `"i32"` for a node
 // that is not a `Param`.
 export function vtKindOfParam(paramIx: i32): VKind {
-  const p = P.nodes[paramIx]
+  const p = nodeAt(paramIx)
   if p is Param { return vtKindOfType(p.parType) }
   "i32"
 }
@@ -1313,7 +1313,7 @@ export function vtKindOfParam(paramIx: i32): VKind {
 // `annValtypeSlotOf`, kept so `emitTypeSection` and the `$fnsig` tokens read a
 // param-shaped question; every kind-to-table pairing lives in the one home.
 export function paramStructIdxOf(paramIx: i32) {
-  const p = P.nodes[paramIx]
+  const p = nodeAt(paramIx)
   if p is Param {
     return anonLeafParamRowOf(paramIx, annValtypeSlotOf(p.parType))
   }
@@ -1324,7 +1324,7 @@ export function paramStructIdxOf(paramIx: i32) {
 // asking "what row will the bytes say" (the `$fnsig` interning key, `cloParamTok`): the
 // mint is over the moment `collectAnonShapes` returns, well before the `minted` phase.
 export function paramStructIdxFinal(paramIx: i32) {
-  const p = P.nodes[paramIx]
+  const p = nodeAt(paramIx)
   if p is Param {
     const si = annValtypeSlotOf(p.parType)
     if si < 0 { return si }
@@ -1363,7 +1363,7 @@ export function annValtypeSlotOf(tyIx: i32) {
   // `(ref null $mapStruct)` cell's heap type (`mapAnnShape` is `| null`-aware).
   if retNulMapFlag(tyIx) == 1 { return mapAnnShape(tyIx) }
   if retVariantFlag(tyIx) == 1 && tyIx >= 0 && tyIx < P.nodes.length {
-    const ptv = P.nodes[tyIx]
+    const ptv = nodeAt(tyIx)
     if ptv is TypeRef { return variantIndexOf(ptv.tyName) }
   }
   // `Circle | null` — the variant index under the null, the slot `fbValtype`'s
@@ -1525,7 +1525,7 @@ export function repLadderABSweep() {
 export function annIsU8Array(tyIx: i32) {
   if tyIx < 0 { return false }
   if tyIsU8ArrayTy(nodeTyIxOf(tyIx)) { return true }
-  const t = P.nodes[tyIx]
+  const t = nodeAt(tyIx)
   if t is TypeRef { return nameIsU8Array(t.tyName) }
   false
 }

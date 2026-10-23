@@ -11,10 +11,10 @@ import {
   Member,
   OP_INDEX_GET,
   OP_INDEX_SET,
-  P,
   Param,
   Paren,
   Unary,
+  nodeAt,
 } from "./ast"
 import {
   asgOpenElemRow,
@@ -284,6 +284,7 @@ import {
   objFieldType,
   primNameStr,
   softenLitTy,
+  tyAt,
   tyBuiltinIndexable,
   tyHasHole,
   tyIsHole,
@@ -330,11 +331,11 @@ function sharedFieldWriteRefused(
 ): boolean {
   const rt = nodeTyIxOf(parenPeelIx(tgt.memObj))
   if rt < 0 || rt >= T.tys.length || vt < 0 { return false }
-  const r = T.tys[rt]
+  const r = tyAt(rt)
   if r is TyUnion {
     for mIx in r.uMembers {
       if mIx >= 0 && mIx < T.tys.length {
-        const m = T.tys[mIx]
+        const m = tyAt(mIx)
         if m is TyObj {
           const ft = objFieldType(m, tgt.memProp)
           if ft >= 0 && !assignableExpr(valIx, vt, ft) {
@@ -375,7 +376,7 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
   // Bank the receiver-keyed name for the emitter, so `a + b` lowers to the exact declaration
   // resolved here rather than a bare-name re-scan that a merge could rewrite differently.
   opBinBank(ix, opKey)
-  const preFt = T.tys[fnTy]
+  const preFt = tyAt(fnTy)
   if preFt is TyFunc {
     if preFt.fnRet == -2 {
       if !onInferStack(opKey) {
@@ -388,18 +389,18 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
   }
   const dIx2 = fnDeclIx[opKey] ?? -1
   if dIx2 < 0 { return -1 }
-  const d = P.nodes[dIx2]
+  const d = nodeAt(dIx2)
   let selfOk = false
   if d is FuncDecl {
     if d.fnParams.length == 2 {
-      const p0 = P.nodes[d.fnParams[0]]
+      const p0 = nodeAt(d.fnParams[0])
       if p0 is Param {
         if p0.parName == "self" { selfOk = true }
       }
     }
   }
   if !selfOk { return -1 }
-  const ft = T.tys[fnTy]
+  const ft = tyAt(fnTy)
   if ft is TyFunc {
     let retTy = ft.fnRet
     if retTy == -2 { retTy = TY_ERR }
@@ -408,14 +409,14 @@ function opSelfFnTy(op: string, lt: i32, rt: i32, rightIx: i32, ix: i32) {
     if !assignable(lt, params[0]) { return -1 }
     const bNames: string[] = []
     const bTys: i32[] = []
-    const p0t = T.tys[params[0]]
+    const p0t = tyAt(params[0])
     if p0t is TyVar {
       if !holeDemandOk(p0t.tvName, -1, lt) { return -1 }
     }
     bindGenWalk(params[0], lt, bNames, bTys)
     bindGenWalk(params[1], rt, bNames, bTys)
     const expected = substTyDeep(params[1], bNames, bTys)
-    const p1t = T.tys[params[1]]
+    const p1t = tyAt(params[1])
     if p1t is TyVar {
       if !holeDemandOk(p1t.tvName, rightIx, rt) {
         tErr(
@@ -467,7 +468,7 @@ function checkInOpNode(n: BinExpr, ix: i32) {
   checkNodeHook(n.binLeft)
   const rt = strLitRecvTy(checkNodeHook(n.binRight))
   if rt >= 0 && rt < T.tys.length {
-    const st = T.tys[nomErasedTyIx(rt)]
+    const st = tyAt(nomErasedTyIx(rt))
     if st is TyPrim {
       if st.primName == "string" {
         tErr(
@@ -518,15 +519,15 @@ function checkLogicalBinNode(n: BinExpr, ix: i32): i32 {
 // -1 when `tgt` is no index into a map. A quiet pass records no node types, so the receiver
 // is re-checked there, as the index arm of `checkAssignBinNode` does.
 function mapStoreSlotTy(tgt: i32): i32 {
-  const t = P.nodes[tgt]
+  const t = nodeAt(tgt)
   if !(t is Index) { return -1 }
   let ct = nodeTyIxOf(t.idxArr)
   if ct < 0 { ct = checkNodeHook(t.idxArr) }
   if ct < 0 || ct >= T.tys.length { return -1 }
-  const h = T.tys[ct]
+  const h = tyAt(ct)
   if h is TyVar { ct = holeMapOf(h.tvName) }
   if ct < 0 || ct >= T.tys.length { return -1 }
-  const m = T.tys[ct]
+  const m = tyAt(ct)
   if m is TyMap { return m.mVal }
   -1
 }
@@ -578,13 +579,13 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   } else {
     // The same vacuous-gate check covers three write spellings (`r = e`, `b.v = e`,
     // `xs[0] = e`) — records the pair for the pin using `asgLt`, the storage type actually asked.
-    const asgIdx = P.nodes[n.binLeft]
+    const asgIdx = nodeAt(n.binLeft)
     if asgIdx is Index && ctnBindingDeclOf(asgIdx.idxArr) >= 0 {
       noteElemLetCstr(coalPinTy(n.binRight, rt), asgLt, n.binRight, "")
     } else {
       noteLetCstr(coalPinTy(n.binRight, rt), asgLt, n.binRight, "")
     }
-    if P.nodes[n.binLeft] is Ident {
+    if nodeAt(n.binLeft) is Ident {
       wrDstDeclPut(n.binRight, identDeclOf(n.binLeft))
     }
     if asgIdx is Index { ctnWrRecvPut(n.binRight, asgIdx.idxArr) }
@@ -596,7 +597,7 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   }
   // A-infer-null: a nullable binding's open inner hole fills from the first non-null
   // assignment in place; a straight-line non-null write narrows for the rest of the block.
-  const asgTgt = P.nodes[n.binLeft]
+  const asgTgt = nodeAt(n.binLeft)
   let asgPreTy = -1
   if asgTgt is Ident {
     if rt >= 0 && asgLt >= 0 && !tySame(asgLt, rt) {
@@ -613,15 +614,15 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     if asgCur >= 0 {
       // A write to a hole binding ends the pin's jurisdiction over it: the call site pins the
       // parameter, this write replaces the value, so a cast after it is not the pin's to adjudicate (D1342).
-      const asgHole = T.tys[asgCur]
+      const asgHole = tyAt(asgCur)
       if asgHole is TyVar {
         noteCastClobber(asgHole.tvName + "." + asgTgt.identName)
       }
-      const rtT = T.tys[rt]
+      const rtT = tyAt(rt)
       let rhsNullable = false
       if rtT is TyNullable { rhsNullable = true }
       const rhsNonNull = !rhsNullable && !isNullTy(rt) && rt >= 0
-      const asgCt = T.tys[asgCur]
+      const asgCt = tyAt(asgCur)
       if asgCt is TyNullable {
         if rhsNonNull {
           if asgCt.nInner < 0 {
@@ -674,7 +675,7 @@ function checkAssignStore(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
 function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   // A `const` name cannot be rebound (`x = ...`, and the `x++`/`x += ...`
   // desugarings). Data behind it stays mutable (a Member/Index target).
-  const tgt = P.nodes[n.binLeft]
+  const tgt = nodeAt(n.binLeft)
   if tgt is Member { sharedFieldWriteRefused(tgt, n.binRight, rt, ix) }
   if tgt is Ident {
     if isConstName(tgt.identName) {
@@ -701,7 +702,7 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     if arrTy0 < 0 { arrTy0 = checkNodeHook(tgt.idxArr) }
     // An un-annotated-param hole receiver stands for its demanded map, so the map pin below
     // is the same arm the concrete receiver takes, not a second copy of it.
-    const arrH0 = T.tys[arrTy0]
+    const arrH0 = tyAt(arrTy0)
     if arrH0 is TyVar {
       // An index WRITE through a hole, filed like `xs.push(v)`: the read that typed the
       // receiver noted only that the body indexes it, which a view satisfies.
@@ -714,7 +715,7 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
       const hmw = holeMapOf(arrH0.tvName)
       if hmw >= 0 { arrTy0 = hmw }
     }
-    const arrT0 = T.tys[arrTy0]
+    const arrT0 = tyAt(arrTy0)
     if arrT0 is TyArray {
       // An index write is a write to the list's own shape, so a view refuses it. Ahead of
       // the element pin below, which would otherwise infer a hole from a store that never
@@ -799,7 +800,7 @@ function checkAssignBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     if arrT0 is TyObj {
       const wtrap = objFieldType(arrT0, "[]=")
       if wtrap >= 0 {
-        const wt = T.tys[wtrap]
+        const wt = tyAt(wtrap)
         if wt is TyFunc {
           if wt.fnParamTypes.length == 2 {
             if !assignableExpr(n.binRight, rt, wt.fnParamTypes[1]) {
@@ -838,7 +839,7 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
   }
   // A left operand that is only ever `null` always takes the default (D2261).
   if isNullTy(lt) { return rt }
-  const lt2 = T.tys[lt]
+  const lt2 = tyAt(lt)
   if lt2 is TyNullable {
     // D1589 — an open hole has no non-null part yet, so `nonNullTy` hands back the nullable
     // and the default's type is the safe answer: `fillCoalHoleNodes` re-derives it once the fill arrives.
@@ -893,16 +894,16 @@ function checkCoalesceBinNode(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
 // compared it at its written type, which is the one an `==` reads.
 function splitWidenedFnRead(ix: i32): boolean {
   let u = ix
-  while u >= 0 && P.nodes[u] is Paren {
-    const pn = P.nodes[u]
+  while u >= 0 && nodeAt(u) is Paren {
+    const pn = nodeAt(u)
     if pn is Paren { u = pn.parInner } else { u = -1 }
   }
   if u < 0 { return false }
-  const en = P.nodes[u]
+  const en = nodeAt(u)
   if !(en is Ident) { return false }
   const d = lookupFnDeclNode(en.identName)
   if d < 0 { return false }
-  const f = P.nodes[d]
+  const f = nodeAt(d)
   if !(f is FuncDecl) { return false }
   for p in f.fnParams {
     if fsMinted(p) { return true }
@@ -1029,11 +1030,11 @@ function checkBinArithTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
   // A gradual union operand is checked at its concrete members; the constraint noted above
   // re-checks the whole union at each pin.
   if op != "&&" && op != "||" {
-    if T.tys[lt] is TyUnion {
+    if tyAt(lt) is TyUnion {
       const glt = tpGradualView(lt)
       if glt >= 0 && glt < T.tys.length { lt = glt }
     }
-    if rt >= 0 && rt < T.tys.length && T.tys[rt] is TyUnion {
+    if rt >= 0 && rt < T.tys.length && tyAt(rt) is TyUnion {
       const grt = tpGradualView(rt)
       if grt >= 0 && grt < T.tys.length { rt = grt }
     }
@@ -1041,7 +1042,7 @@ function checkBinArithTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
   // Operator dispatch on a struct (B13 + B14): a free `self`-function named for the operator
   // is checked first, then an operator closure field — equality/logicals/`=`/`??` already returned.
   if op != "&&" && op != "||" {
-    const odsp = T.tys[lt]
+    const odsp = tyAt(lt)
     // A `new v128` brand has no arithmetic of the language's own, so it dispatches like an
     // object: its declaring module's operator is the only meaning `a + b` can have.
     if tyIsV128Brand(lt) {
@@ -1061,7 +1062,7 @@ function checkBinArithTail(n: BinExpr, ix: i32, lt0: i32, rt0: i32): i32 {
       }
       const ofld = objFieldType(odsp, op)
       if ofld >= 0 {
-        const oft = T.tys[ofld]
+        const oft = tyAt(ofld)
         if oft is TyFunc {
           if oft.fnParamTypes.length == 1 {
             if !assignableExpr(n.binRight, rt, oft.fnParamTypes[0]) {
@@ -1150,9 +1151,9 @@ function checkBinCmpTail(n: BinExpr, ix: i32, lt: i32, rt: i32): i32 {
     }
     // List concat `a + b` → a new `T[]` (collections-design §VL.4); the two
     // element types must agree (an empty `[]` adopts the other side's).
-    const lta = T.tys[lt]
+    const lta = tyAt(lt)
     if lta is TyArray {
-      const rta = T.tys[rt]
+      const rta = tyAt(rt)
       if rta is TyArray {
         constrainEmpty(rt, lt)
         constrainEmpty(lt, rt)
@@ -1319,7 +1320,7 @@ function binCheckLeftOperand(n: BinExpr, op: string): i32 {
   const savedWriteTarget = daWriteTarget
   const savedGetWrite = getWriteTarget
   if op == "=" {
-    const wtgt = P.nodes[n.binLeft]
+    const wtgt = nodeAt(n.binLeft)
     if wtgt is Ident { daWriteTarget = n.binLeft }
     if wtgt is Member { getWriteTargetSet(n.binLeft) }
     if wtgt is Index || wtgt is Member { luWriteTgtPut(n.binLeft, true) }
@@ -1372,7 +1373,7 @@ function binCheckRightOperand(
   asgOpenElemRowSet(-1)
   if op == "=" {
     asgOpenElemRowSet(asgOpenElemRowOf(n.binLeft))
-    if tpEnvNames.length > 0 && P.nodes[n.binLeft] is Ident {
+    if tpEnvNames.length > 0 && nodeAt(n.binLeft) is Ident {
       tpIfMarkOk(n.binRight)
     }
   }
@@ -1567,7 +1568,7 @@ export function checkCastNode(n: AsExpr, ix: i32) {
   // A hole operand answers neither of the trio's type-level questions, so the numeric ladder
   // admits it on purpose — park both on the hole, re-asked at the call site that pins it (D1342).
   if arg >= 0 {
-    const argH = T.tys[arg]
+    const argH = tyAt(arg)
     if argH is TyVar {
       noteCastDemand(argH.tvName, n, ix, target)
       noteHoleCallCastDemand(arg, n, ix, target)
@@ -1585,7 +1586,7 @@ export function checkCastNode(n: AsExpr, ix: i32) {
   // `as%` picks no arm — it is the wrap cast over two integer widths, so a union operand is
   // simply not a number and takes the numeric ladder's own refusal below.
   if argU >= 0 && n.asMode != "wrap" {
-    const argT = T.tys[argU]
+    const argT = tyAt(argU)
     if argT is TyUnion {
       return checkCastUnionArm(n, ix, argU, argT, target, isU8Cast)
     }
@@ -1598,7 +1599,7 @@ export function checkCastNode(n: AsExpr, ix: i32) {
 function castUnionOperandOf(arg: i32): i32 {
   let argU = arg
   if arg >= 0 {
-    const argN = T.tys[arg]
+    const argN = tyAt(arg)
     if argN is TyNullable {
       if argN.nInner >= 0 {
         const nulU = mkUnionTy([argN.nInner, TY_NULL])
@@ -1769,7 +1770,7 @@ export function checkUnaryNode(n: Unary, ix: i32) {
   }
   // A hole operand is numeric only at a pin that says so; the pin re-asks it (`OP_NEG`, or
   // `OP_BNOT` for `~`, which a float pin cannot satisfy).
-  if arg2 >= 0 && !(T.tys[arg2] is TyPrim) && tyHasHole(arg2) {
+  if arg2 >= 0 && !(tyAt(arg2) is TyPrim) && tyHasHole(arg2) {
     let unCstr = OP_NEG
     if n.unOp == "~" { unCstr = OP_BNOT }
     noteBinCstr(arg2, unCstr, arg2)
@@ -1872,7 +1873,7 @@ export function checkIsExprNode(n: IsExpr, ix: i32) {
     if tyIsParamHole(objTy) { noteIsCstr(objTy, chkTy, n.isVariant, ix) }
     // Soundness: `x is T` is meaningful only when `T` is assignable to `x`'s type, since the
     // then branch narrows verbatim — an ungated test would launder invalid wasm through a newtype.
-    const ot = T.tys[objTy]
+    const ot = tyAt(objTy)
     let baseTy = objTy
     let inUnion = false
     if ot is TyUnion {

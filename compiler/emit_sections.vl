@@ -135,6 +135,7 @@ import {
   externRetIsVoid,
   i32ToStr,
   isDefaultGlobalRef,
+  nodeAt,
   nodeChildren,
   nodeToks,
   tsMentionsAnyName,
@@ -1098,7 +1099,7 @@ function buildLocals(fnIx: i32) {
   scopeNames = []
   scopeSlots = []
   scopeFrames = []
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl { return collectLocals(fn.fnBody, fnIx) }
   emitFail("emitProgram: not a function declaration")
 }
@@ -1106,12 +1107,12 @@ function buildLocals(fnIx: i32) {
 // Verify every parameter of the FuncDecl at `fnIx` is typed `i32` — the only type
 // this slice emits. Returns 0 on success or -1 (via `emitFail`) otherwise.
 function checkParams(fnIx: i32) {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const params = fn.fnParams
     let pi = 0
     while pi < params.length {
-      const p = P.nodes[params[pi]]
+      const p = nodeAt(params[pi])
       if p is Param {
         if p.parType < 0 {
           // An un-annotated parameter — a contextually-inferred callback literal
@@ -1120,7 +1121,7 @@ function checkParams(fnIx: i32) {
           pi = pi + 1
           continue
         }
-        const ty = P.nodes[p.parType]
+        const ty = nodeAt(p.parType)
         if ty is TypeRef {
           // The parameter valtype ladder. `nodeTyHasRepTyVar` comes first because every rung below
           // answers yes about a constructor over an unbound type parameter (D426); the checker's
@@ -1421,7 +1422,7 @@ function envCacheOpen(fnPos: i32) {
 // appended onto `out`. Returns 0, or -1 (via `emitFail`) on any unsupported shape. Every
 // declared local is i32, so the vector is one run `(L, 0x7f)`; params are not counted here — they are encoded in the functype, not the locals vector.
 function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     // Anchors any emit failure raised while lowering this body at its declaration (`emitFail`
     // snapshots `emitCurFnIx`). Sequential emission means the cursor's value at failure time is
@@ -1544,10 +1545,10 @@ function emitFuncCode(out: u8[], fnIx: i32, fnPos: i32) {
 // Record the ref-list slot of a bare top-level `recv.push(x)` statement (the
 // block-level collector handles pushes nested in loop/if bodies).
 function recordStartRefPushSlot(stmtIx: i32) {
-  const s = P.nodes[stmtIx]
+  const s = nodeAt(stmtIx)
   if s is Call {
     if s.callFn < 0 { return 0 }
-    const callee = P.nodes[s.callFn]
+    const callee = nodeAt(s.callFn)
     if callee is Member {
       if callee.memProp == "push" {
         recordRefPushSlot(refListSlotOfExpr(callee.memObj, -1))
@@ -1565,7 +1566,7 @@ function startScanBlock(blockIx: i32) {
   applyPushPopBits(blockPushPopBits(blockIx, -1))
   if blockHasStrOp(blockIx, -1) { fnUsesStrOp = true }
   // A statement's arm tail is read at its prelude locals, as `emitStmt` reads it (D5333).
-  const blk = P.nodes[blockIx]
+  const blk = nodeAt(blockIx)
   if blk is Block {
     let bi = 0
     while bi < blk.blkStmts.length {
@@ -1609,7 +1610,7 @@ function startScanIf(ifIx: i32) {
   let elseTop = -1
   let cur = ifIx
   while cur >= 0 {
-    const st = P.nodes[cur]
+    const st = nodeAt(cur)
     cur = -1
     if st is IfStmt {
       startScanHeaderExpr(st.ifCond)
@@ -1626,7 +1627,7 @@ function startScanIf(ifIx: i32) {
         if setNarrowFromCondElse(st.ifCond, -1) {
           if elseTop < 0 { elseTop = savedElseTop }
         }
-        const els = P.nodes[st.ifElse]
+        const els = nodeAt(st.ifElse)
         if els is Block { startScanBlock(st.ifElse) }
         if els is IfStmt { cur = st.ifElse }
       }
@@ -1650,7 +1651,7 @@ function promoMark(marks: i32[], ix: i32) {
   if ix >= marks.length { return 0 }
   if marks[ix] == 1 { return 0 }
   marks[ix] = 1
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   match n {
     FuncDecl => {
       return 0
@@ -1783,7 +1784,7 @@ function promoMark(marks: i32[], ix: i32) {
 // plain numeric scalar, for which `fbValtypeNullable`/`fbValtype` are the same byte, so a
 // start-fn local is a drop-in (a ref cell is nullable but would be a non-null local, not attempted here). P3: the binding has an initializer, since a promoted slot has no other way to get a value.
 function globalPromotable(gi: i32) {
-  const d = P.nodes[globalStmts[gi]]
+  const d = nodeAt(globalStmts[gi])
   if d is LetDecl {
     if d.letInit < 0 { return false }
     // A binding the export section publishes is a wasm global by contract.
@@ -1862,7 +1863,7 @@ export function computeGlobalPromotion() {
     }
     let ai = 0
     while ai < P.nodes.length {
-      const nd = P.nodes[ai]
+      const nd = nodeAt(ai)
       if nd is Ident {
         // A module-`const` parameter default vetoes promotion unconditionally, marked or not. The
         // reachability walk answers "is this node reached", and a default node is shared by every
@@ -1933,7 +1934,7 @@ export function globalRunsInStartFn(gi: i32) {
 // `dupScanRun` has set. Split from the resets in `emitFuncCode` so it can be re-run per
 // candidate binding of a shadowed name (D1595): every flag it touches is set and never cleared, and every list it appends to dedupes, so the passes OR.
 function fnDetectScratch(fnIx: i32) {
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     // Declaration-time address fold: a pure recount over `localDeclIx` (already built by
     // `buildLocals` above), safe to repeat under `dupScanRun`'s re-run.
@@ -2144,7 +2145,7 @@ function startFnDetectFrames() {
 // only where no tail decides the global's cell, which `globalCellKind` classifies with no
 // arm frame open — an annotated global, or an init no arm tail yields into (D5430).
 function globalArmScopeOk(stmtIx: i32): boolean {
-  const s = P.nodes[stmtIx]
+  const s = nodeAt(stmtIx)
   if s is LetDecl {
     return globalHasTypeAnn(stmtIx) || !initYieldsArmTail(s.letInit)
   }
@@ -2157,7 +2158,7 @@ function initYieldsArmTail(ix: i32): boolean {
   if ix < 0 { return false }
   const b = unwrapParen(ix)
   if b < 0 || b >= P.nodes.length { return false }
-  const n = P.nodes[b]
+  const n = nodeAt(b)
   if n is BinExpr {
     const op = n.binOp
     if (
@@ -2182,7 +2183,7 @@ function initYieldsArmTail(ix: i32): boolean {
 // tail; any other kind holds no element a value `if` can yield into.
 function kidsYieldArmTail(b: i32): boolean {
   if b < 0 || b >= P.nodes.length { return false }
-  const n = P.nodes[b]
+  const n = nodeAt(b)
   if !(n is ArrayLit || n is ObjLit || n is FieldInit || n is Spread) {
     return false
   }
@@ -2206,7 +2207,7 @@ function startFnDetectScratch() {
     // constexpr), so its scratch needs are detected on the same gate — else a const
     // init that needs a frame would reach the start fn with none reserved.
     if globalRunsInStartFn(gi) {
-      const g = P.nodes[globalStmts[gi]]
+      const g = nodeAt(globalStmts[gi])
       if g is LetDecl {
         const ix = g.letInit
         applyPushPopBits(exprPopBits(ix, -1))
@@ -2249,7 +2250,7 @@ function startFnDetectScratch() {
   // block walker over one body; `startScanIf` descends an if/else-if chain.
   let si = 0
   while si < startStmts.length {
-    const st = P.nodes[startStmts[si]]
+    const st = nodeAt(startStmts[si])
     // The function-value call frame is detected over the whole statement, ahead of the shape split
     // below: `blockHasCallRef` recurses into an `if`/`while`/`for` body itself, whereas
     // `startScanBlock`/`startScanIf` run only the walkers that do not. A closure call nested in a
@@ -2307,7 +2308,7 @@ function startFnDetectScratch() {
   let vrg = 0
   while vrg < globalStmts.length {
     if globalRunsInStartFn(vrg) {
-      const vg = P.nodes[globalStmts[vrg]]
+      const vg = nodeAt(globalStmts[vrg])
       if vg is LetDecl {
         if vg.letInit >= 0 {
           if blockHasVariantRebox(vg.letInit, -1) { fnUsesVariantRebox = true }
@@ -2328,7 +2329,7 @@ function startFnDetectScratch() {
   let lgi = 0
   while lgi < globalStmts.length {
     if globalRunsInStartFn(lgi) {
-      const lg = P.nodes[globalStmts[lgi]]
+      const lg = nodeAt(globalStmts[lgi])
       if lg is LetDecl { leqScanExpr(lg.letInit, -1) }
     }
     lgi = lgi + 1
@@ -2363,7 +2364,7 @@ function collectStartLocals() {
   scopePush()
   let i = 0
   while i < startStmts.length {
-    const s = P.nodes[startStmts[i]]
+    const s = nodeAt(startStmts[i])
     if s is ForRange {
       if (
         collectExprArms(s.frFrom, -1) < 0
@@ -2424,7 +2425,7 @@ function collectStartLocals() {
   let pgi = 0
   while pgi < globalStmts.length {
     // A global's initializer runs in this function, so its if-expression arms' locals are ours.
-    const gd = P.nodes[globalStmts[pgi]]
+    const gd = nodeAt(globalStmts[pgi])
     if gd is LetDecl {
       if collectExprArms(gd.letInit, -1) < 0 {
         scopePop()
@@ -2432,7 +2433,7 @@ function collectStartLocals() {
       }
     }
     if gPromoOk[pgi] == 1 {
-      const pg = P.nodes[globalStmts[pgi]]
+      const pg = nodeAt(globalStmts[pgi])
       if pg is LetDecl {
         // P2 restricted the cell to a plain numeric scalar, so `structIdx` is never
         // consulted and `fbLocalRun(ck, -1)` writes the same valtype byte the cell's
@@ -2620,7 +2621,7 @@ function emitStartGlobalInit(
   gst: i32,
 ) {
   if globalRunsInStartFn(gi) {
-    const g = P.nodes[gst]
+    const g = nodeAt(gst)
     if g is LetDecl {
       // Numeric WIDENING at the global-init boundary (a non-const `: f64`/`: f32`/`: i64`
       // global whose init is a narrower numeric — e.g. `const b: f64 = a` with `a: i32`):
@@ -2785,7 +2786,7 @@ function emitStartGlobalSeedCtx(gst: i32, g: LetDecl, gck: VKind) {
   // call-argument boundary both spell): a list-literal init whose element is null must lower that element as `ref.null $S`, and an un-gated seed would retype it to the wrapper instead.
   if gck == "nulreflist" {
     if cellCtx.listSlot >= 0 && cellCtx.listSlot < rlWrapIdx.length {
-      const gnraInit = P.nodes[unwrapParen(g.letInit)]
+      const gnraInit = nodeAt(unwrapParen(g.letInit))
       if gnraInit is NullLit {
         cellCtx.nulRefHeap = rlWrapIdx[cellCtx.listSlot]
       }
@@ -2822,7 +2823,7 @@ function emitStartGlobalInitValue(
   // with `ref.as_non_null` first. Without this arm the init falls through to `emitMapGet`'s bare `ref.null` miss — check-clean, then a runtime `null reference` trap.
   const gUmr = letNulMapReadUnionBox(gst, -1)
   if gUmr {
-    const gumrN = P.nodes[unwrapParen(g.letInit)]
+    const gumrN = nodeAt(unwrapParen(g.letInit))
     if gumrN is Index {
       if (emitMapGetUnionBox(bodyExpr, gumrN.idxArr, gumrN.idxIndex, -1) < 0) {
         wTarget(exprPrev)
@@ -5860,7 +5861,7 @@ function nameImports() {
 function nameUserFns(n: i32) {
   let fi = 0
   while fi < n {
-    const fn = P.nodes[fnStmts[fi]]
+    const fn = nodeAt(fnStmts[fi])
     if fn is FuncDecl {
       wULEB(gImports + fi)
       wName(fnSymName(fi))
@@ -5873,7 +5874,7 @@ function nameUserFns(n: i32) {
 // `const foo = …` → "foo") wins over the synthesized `__lambda_N`, so a backtrace reads `foo`.
 function fnSymName(fi: i32): string {
   if fi < 0 || fi >= fnStmts.length { return "#" + i32ToStr(fi) }
-  const fn = P.nodes[fnStmts[fi]]
+  const fn = nodeAt(fnStmts[fi])
   if fn is FuncDecl {
     const disp = fnDispNames[fi]
     // A display name means a lambda, whose anchor token IS its declaration.
@@ -6053,7 +6054,7 @@ function fnSymKeys(n: i32): string[] {
   while fi < n {
     let nm = fnSymName(fi)
     // A lambda's synthesized name counts every lambda of the program, its anchor only its own.
-    const fn = P.nodes[fnStmts[fi]]
+    const fn = nodeAt(fnStmts[fi])
     if fn is FuncDecl && fnDispNames[fi].length == 0 {
       const lam = "__lambda_"
       if (
@@ -6251,7 +6252,7 @@ function collectStrPool() {
   const isLexes: string[] = []
   let i = 0
   while i < P.nodes.length {
-    const nd = P.nodes[i]
+    const nd = nodeAt(i)
     if nd is StrLit { strLitCollect(nd.strText) }
     if nd is IsExpr && strPoolIsTest(nd) {
       const texts = tyLitMemberTexts(isVarTyIxOf(i))
@@ -6957,7 +6958,7 @@ function igWalk(
   work: i32[],
 ) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   const mark = shadow.names.length
   if n is Ident {
     if !igShadowHas(shadow, n.identName) {
@@ -6975,7 +6976,7 @@ function igWalk(
     }
     pi = 0
     while pi < n.fnParams.length {
-      const pn = P.nodes[n.fnParams[pi]]
+      const pn = nodeAt(n.fnParams[pi])
       if pn is Param { igShadowPush(shadow, pn.parName) }
       pi = pi + 1
     }
@@ -6984,7 +6985,7 @@ function igWalk(
     let si = 0
     while si < n.blkStmts.length {
       igWalk(n.blkStmts[si], ord, shadow, seen, head, next, work)
-      const sn = P.nodes[n.blkStmts[si]]
+      const sn = nodeAt(n.blkStmts[si])
       if sn is LetDecl { igShadowPush(shadow, sn.letName) }
       si = si + 1
     }
@@ -7004,7 +7005,7 @@ function igWalk(
     if n is OptMember { igMention(n.omProp, 0, ord, seen, head, next, work) }
     if n is BinExpr {
       if n.binOp == "=" {
-        const lhs = P.nodes[n.binLeft]
+        const lhs = nodeAt(n.binLeft)
         if lhs is Ident {
           if !igShadowHas(shadow, lhs.identName) {
             igMention(lhs.identName, 2, ord, seen, head, next, work)
@@ -7030,10 +7031,10 @@ function igWalk(
 function igInitAllocates(gi: i32): boolean {
   const init = igLetInit(globalStmts[gi])
   if init < 0 { return false }
-  const e = P.nodes[unwrapParen(init)]
+  const e = nodeAt(unwrapParen(init))
   if e is ArrayLit { return true }
   if e is ObjLit { return true }
-  const d = P.nodes[globalStmts[gi]]
+  const d = nodeAt(globalStmts[gi])
   if d is LetDecl {
     if letInitFoldsExpr(d) { return true }
   }
@@ -7042,7 +7043,7 @@ function igInitAllocates(gi: i32): boolean {
 
 // The initializer of module binding `letIx`, or -1 when it has none.
 function igLetInit(letIx: i32): i32 {
-  const d = P.nodes[letIx]
+  const d = nodeAt(letIx)
   if d is LetDecl { return d.letInit }
   -1
 }
@@ -7063,7 +7064,7 @@ function initGuardScan(): i32 {
     gInitGuard.push(0)
     // A folded `let` is a candidate too (a write can still precede it), and so is a folded
     // record or list, which a mutation can reach early.
-    const cd = P.nodes[globalStmts[gi]]
+    const cd = nodeAt(globalStmts[gi])
     if cd is LetDecl {
       if (
         cd.letKw == "let"
@@ -7081,7 +7082,7 @@ function initGuardScan(): i32 {
   while p < fnStmts.length {
     gInitFnReach.push(INIT_REACH_NEVER)
     next.push(-1)
-    const fd = P.nodes[fnStmts[p]]
+    const fd = nodeAt(fnStmts[p])
     if fd is FuncDecl {
       next[p] = head[fd.fnName] ?? -1
       head[fd.fnName] = p
@@ -7117,7 +7118,7 @@ function initGuardScan(): i32 {
       }
     }
     if takeGlobal {
-      const g = P.nodes[node]
+      const g = nodeAt(node)
       if g is LetDecl {
         const bits = seen[g.letName] ?? 0
         const early = (bits & 1) != 0
@@ -7264,7 +7265,7 @@ function scanPrintUse() {
     sawRemUnknown: false,
   }
   while pscan < P.nodes.length {
-    const pn = P.nodes[pscan]
+    const pn = nodeAt(pscan)
     // A map an `is` or `as` names joins its struct's tag family even where no union arm is
     // that map, so a pin whose union lacks it cannot answer with a twin's tag (D2493).
     if pn is IsExpr { mapTwinNotePattern(isVarTyIxOf(pscan)) }
@@ -7299,7 +7300,7 @@ function scanPrintUse() {
       }
     }
     if pn is Call && pn.callFn >= 0 {
-      const pcallee = P.nodes[pn.callFn]
+      const pcallee = nodeAt(pn.callFn)
       if pcallee is Ident {
         const pmask = scanPrintCallIntrinsic(
           pscan,
@@ -7905,7 +7906,7 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
 export function emitProgram(rootIx: i32) {
   emitProgramReset(rootIx)
   if rootIx < 0 { return emitFail("emitProgram: empty arena (root index < 0)") }
-  const root = P.nodes[rootIx]
+  const root = nodeAt(rootIx)
   if root is Program {
     const stmts = root.progStmts
     // No floor on an empty statement list, for `passCheckTopLevel`'s reason one stage earlier
@@ -8044,7 +8045,7 @@ function emitCloSigFunctype(sai: i32) {
   // interned it from a bare `(…)=>…` type) carries the -1 rep sentinel: synthesize
   // its functype from the KEY string (the same bytes the rep path emits for that key).
   if repFe < 0 { return emitSynthCloSig(cloSigKeys[sai]) }
-  const rep = P.nodes[fnStmts[repFe]]
+  const rep = nodeAt(fnStmts[repFe])
   if rep is FuncDecl {
     const rparams = rep.fnParams
     wU8(96)                   // 0x60 func
@@ -8145,7 +8146,7 @@ function emitSynthCloSig(key: string) {
 // byte the same either way.
 function emitOneFuncType(ti: i32) {
   const withEnv = fnHasEnvParam(ti)
-  const fn = P.nodes[fnStmts[ti]]
+  const fn = nodeAt(fnStmts[ti])
   if fn is FuncDecl {
     const params = fn.fnParams
     const nParams = params.length
@@ -9382,7 +9383,7 @@ function emitCloThunkCode(out: u8[], fe: i32) {
   const body: u8[] = []
   const prev = wTarget(body)
   wULEB(0) // no local runs
-  const tfn = P.nodes[fnStmts[fe]]
+  const tfn = nodeAt(fnStmts[fe])
   if tfn is FuncDecl {
     let pi = 0
     while pi < tfn.fnParams.length {
@@ -9477,7 +9478,7 @@ function emitGlobalSection() {
         gi = gi + 1
         continue
       }
-      const g = P.nodes[globalStmts[gi]]
+      const g = nodeAt(globalStmts[gi])
       if g is LetDecl {
         if g.letInit < 0 {
           return emitFail("emitProgram: module global has no initializer")
@@ -9605,7 +9606,7 @@ function frameGlobalSection() {
 // a constexpr runs before every function body, so a leaked null rep would retype a bare `null`
 // anywhere in the module (D1563). Shared by the global section and `captureFoldedConsts`.
 function emitConstCellInit(buf: u8[], gi: i32): i32 {
-  const g = P.nodes[globalStmts[gi]]
+  const g = nodeAt(globalStmts[gi])
   if g is LetDecl {
     const gcSaved = expCtxHere()
     // The init must build the cell's wasm type: `pendingStructIdx` seeds an `ObjLit` to the
@@ -9763,7 +9764,7 @@ function fnFirstSlotByName(): {[string]: i32} {
   const first: {[string]: i32} = Map()
   let tj = 0
   while tj < fnStmts.length {
-    const tfn = P.nodes[fnStmts[tj]]
+    const tfn = nodeAt(fnStmts[tj])
     if tfn is FuncDecl {
       if !first.has(tfn.fnName) { first[tfn.fnName] = tj }
     }

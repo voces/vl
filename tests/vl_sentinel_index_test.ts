@@ -398,6 +398,67 @@ function innerSlot(slot: i32): i32 {
     strict: [],
     says: { code: UNGUARDED, text: "the parameter `slot` on a fall-through path" },
   },
+  {
+    // The ARENA ACCESSORS: `nodeAt(ix)` is `P.nodes[ix]` with its bounds check held in one
+    // body, so a call of one is a read of that table and fires like the subscript would.
+    // Reading the arenas through them hid every such read from a rule that saw only `[`.
+    // A bound-tested call and a call of some other function stay quiet.
+    name: "accessor_node.vl",
+    src: `type Parser = { nodes: i32[] }
+let P: Parser = { nodes: [] }
+
+function nodeAt(ix: i32): i32 { P.nodes[ix] }
+
+function other(ix: i32): i32 { ix }
+
+function slotOf(n: i32): i32 {
+  if n > 3 { return n }
+  -1
+}
+
+function guarded(n: i32): i32 {
+  const s = slotOf(n)
+  if s < 0 || s >= P.nodes.length { return 0 }
+  nodeAt(s)
+}
+
+function notAnAccessor(n: i32): i32 {
+  const s = slotOf(n)
+  other(s)
+}
+
+function bad(n: i32): i32 {
+  const s = slotOf(n)
+  nodeAt(s)
+}
+`,
+    unguarded: ["26:3"],
+    strict: [],
+    says: { code: UNGUARDED, text: "`nodeAt(s)` indexes a table with `slotOf`" },
+  },
+  {
+    // `tyAt` is the type arena's accessor, graded the same way; here off a hole field.
+    name: "accessor_ty.vl",
+    src: `type Checker = { tys: i32[] }
+let T: Checker = { tys: [] }
+
+type Row = { inner: i32 }
+
+function tyAt(ix: i32): i32 { T.tys[ix] }
+
+function ok(t: Row): i32 {
+  if t.inner < 0 { return 0 }
+  tyAt(t.inner)
+}
+
+function bad(t: Row): i32 {
+  tyAt(t.inner)
+}
+`,
+    unguarded: ["14:3"],
+    strict: [],
+    says: { code: UNGUARDED, text: "`tyAt(t.inner)` indexes a table with `t.inner`" },
+  },
 ];
 
 type Hits = { at: Record<string, string[]>; msgs: Record<string, string[]> };

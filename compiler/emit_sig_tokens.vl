@@ -13,6 +13,7 @@ import {
   TS_OBJ,
   TypeRef,
   annTsOf,
+  nodeAt,
   tsHasKind,
   tsKind,
 } from "./ast"
@@ -38,6 +39,7 @@ import {
   litUnionAliasNameOfTy,
   structNameOfTy,
   tyArrayElemIx,
+  tyAt,
   tyDeeperThan,
   tyEmitNameKey,
   tyEmitNameNonEmpty,
@@ -230,10 +232,10 @@ export function rlElemCloSigKey(slot: i32): string {
   const ty = rlElemTyIxAt(slot)
   if ty < 0 { return "" }
   let b = ty
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyNullable { b = t.nInner }
   if b < 0 { return "" }
-  const bt = T.tys[b]
+  const bt = tyAt(b)
   if bt is TyFunc { return sigKeyOfTy(b) }
   ""
 }
@@ -242,7 +244,7 @@ export function rlElemCloSigKey(slot: i32): string {
 // (`Circle[]|i32[]`); "" when a member has no name.
 export function listUnionEmitName(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyNullable => {
       const inn = listUnionEmitName(t.nInner)
@@ -354,7 +356,7 @@ export function fieldCodeVKind(code: i32): VKind | null {
 // Deriving the row from the expression's type instead answers -1 for a cell holding an
 // inferred union's arm, which is a `variant` (D1685).
 export function identCellSlot(exprIx: i32): i32 {
-  const e = P.nodes[unwrapParen(exprIx)]
+  const e = nodeAt(unwrapParen(exprIx))
   if e is Ident { return declaredSlotOf(e.identName) }
   -1
 }
@@ -380,7 +382,7 @@ export function declaredStruct(name: string) { declaredKind(name) == "struct" }
 // unsupported field type). Checked only after union/nullable-struct/struct classification,
 // so a valid inline-struct binding never reaches it; catches the remainder so it rejects cleanly.
 export function letAnnIsUninternedShape(letIx: i32) {
-  const d = P.nodes[letIx]
+  const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType < 0 { return false }
     const nm = nonNulBaseOf(tyNameOf(d.letType))
@@ -407,10 +409,10 @@ export function letAnnIsUninternedShape(letIx: i32) {
 // excluded, since it reps as an interned i32 atom, not the box. The initializer-free
 // reading is what makes it usable from `structIndexOfLet`, on the path `exprUnion` reaches.
 export function letAnnIsUnion(letIx: i32) {
-  const d = P.nodes[letIx]
+  const d = nodeAt(letIx)
   if d is LetDecl {
     if d.letType >= 0 {
-      const lt = P.nodes[d.letType]
+      const lt = nodeAt(d.letType)
       if lt is TypeRef {
         // Not `nodeTyIsUnionAlias(d.letType)`, though it reads as exactly this conjunction:
         // its body has two more positive arms — a same-shape-collapsed `TyObj` and a
@@ -448,16 +450,16 @@ function paramStructIndexRaw(fnIx: i32, name: string) {
   if fnIx < 0 {
     return -1 // module-scope initializer (no enclosing function)
   }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const params = fn.fnParams
     let i = 0
     while i < params.length {
-      const p = P.nodes[params[i]]
+      const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name {
           if p.parType >= 0 {
-            const ty = P.nodes[p.parType]
+            const ty = nodeAt(p.parType)
             if ty is TypeRef {
               // A plain struct name, or the `S | null` nullable base — not a union variant,
               // since a variant-typed param rides the gap-#2 path. Name, not the arena: for a
@@ -508,7 +510,7 @@ export function fnRetVariantIndexSid(
 ) {
   const fe = fnIndexOfInScopeAt(sid, name, fnIx, at)
   if fe >= 0 {
-    const fn = P.nodes[fnStmts[fe]]
+    const fn = nodeAt(fnStmts[fe])
     if fn is FuncDecl {
       if fn.fnRet >= 0 {
         // The kind decides, not the name: `variantIndexOf` answers for any spelling
@@ -516,7 +518,7 @@ export function fnRetVariantIndexSid(
         // the checker never called it a variant. Taking the index anyway would feed a
         // `uVarHeap` cell from an `sHeapIdx` value — invalid wasm.
         if retVariantFlag(fn.fnRet) != 1 { return -1 }
-        const rt = P.nodes[fn.fnRet]
+        const rt = nodeAt(fn.fnRet)
         if rt is TypeRef { return variantIndexOf(rt.tyName) }
         return -1
       }
@@ -563,7 +565,7 @@ export function declaredStructIndex(name: string) {
 export function nulStructRowOfNodeTy(exprIx: i32): i32 {
   const ty = nodeRepTyIxOf(exprIx)
   if ty < 0 { return -1 }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyNullable { return repRowOfTyStruct(t.nInner, sScanLim()) }
   -1
 }
@@ -764,7 +766,7 @@ export function annSigKeyTy(name: string, fty: i32) {
   let pts: i32[] = []
   let rty = -1
   if fty >= 0 {
-    const ft = T.tys[fty]
+    const ft = tyAt(fty)
     if ft is TyFunc {
       if ft.fnParamTypes.length == parts.length {
         pts = ft.fnParamTypes
@@ -793,7 +795,7 @@ export function annSigKeyTy(name: string, fty: i32) {
 // `annParamKindTy`/`annRetKindTy` the string path uses. "" for a non-function type or leaf outside the ABI.
 function paramTokOfTy(ty: i32) {
   if ty < 0 { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that has a `$fnsig` token must
   // name it here, since a `""` decline is what the name path is left to answer.
   match t {
@@ -809,7 +811,7 @@ function paramTokOfTy(ty: i32) {
     }
     TyArray => {
       if t.aElem < 0 { return "" }
-      const el = T.tys[t.aElem]
+      const el = tyAt(t.aElem)
       if el is TyPrim {
         const en = el.primName
         if en == "i32" || en == "boolean" { return repSigTokOfKind("list") }
@@ -846,7 +848,7 @@ function paramTokOfTy(ty: i32) {
 // authoritative there. Dual-written inside `sigKeyOfTy`.
 function retTokOfTy(ty: i32) {
   if ty < 0 { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less, the partition `paramTokOfTy` uses: a new arena variant
   // with a result token must name it rather than take the `""` decline.
   match t {
@@ -862,7 +864,7 @@ function retTokOfTy(ty: i32) {
     }
     TyArray => {
       if t.aElem < 0 { return "" }
-      const el = T.tys[t.aElem]
+      const el = tyAt(t.aElem)
       if el is TyPrim {
         const en = el.primName
         if en == "i32" || en == "boolean" {
@@ -902,7 +904,7 @@ function retTokOfTy(ty: i32) {
 // nullable, keeps its alias name, since a raw render softens it to `string`. "" when unrendered.
 export function fnRetEmitName(ty: i32): string {
   if ty < 0 { return "" }
-  const rtn = T.tys[ty]
+  const rtn = tyAt(ty)
   if rtn is TyNullable {
     const nal = litUnionAliasNameOfTy(rtn.nInner)
     if nal != "" { return nal + "|null" }
@@ -927,7 +929,7 @@ export function sigKeyOfTy(funcTyIx: i32): string {
 }
 
 function sigKeyOfTyGo(funcTyIx: i32): string {
-  const t = T.tys[funcTyIx]
+  const t = tyAt(funcTyIx)
   if !(t is TyFunc) { return "" }
   let key = ""
   let i = 0
@@ -980,7 +982,7 @@ export function sigParamTokOfTy(pty: i32): string {
 function sigRepTokOfTy(ty: i32): string {
   const k = repSigKindOfTy(ty)
   const mt = tyPeelNul(ty)
-  const isNulMap = mt != ty && mt >= 0 && T.tys[mt] is TyMap
+  const isNulMap = mt != ty && mt >= 0 && tyAt(mt) is TyMap
   if k == "nulmap" || (k == null && isNulMap) {
     const sh = mapShapeOfTyPeeled(ty)
     if sh == -3 { return "" }
@@ -995,9 +997,9 @@ function sigRepTokOfTy(ty: i32): string {
 // only: `sigRetTokOfTy` still asks its render.
 function sigFuncParamOfCompositeIsClosure(pty: i32): boolean {
   if pty < 0 || pty >= T.tys.length { return false }
-  const t = T.tys[pty]
+  const t = tyAt(pty)
   if !(t is TyFunc) || t.fnRet < 0 || t.fnRet >= T.tys.length { return false }
-  const rt = T.tys[t.fnRet]
+  const rt = tyAt(t.fnRet)
   if !(rt is TyUnion || rt is TyNullable || rt is TyMap) { return false }
   tyEmitNameNonEmpty(pty) == 1
 }
@@ -1008,10 +1010,10 @@ function sigFuncParamOfCompositeIsClosure(pty: i32): boolean {
 // earlier arms of that ladder read; `sigFuncParamOfCompositeIsClosure` answers a parameter.
 function sigFuncParamIsClosure(pty: i32): boolean {
   if pty < 0 || pty >= T.tys.length { return false }
-  const t = T.tys[pty]
+  const t = tyAt(pty)
   if !(t is TyFunc) { return false }
   if t.fnRet >= 0 && t.fnRet != TY_NEVER {
-    const rt = T.tys[t.fnRet]
+    const rt = tyAt(t.fnRet)
     if (
       !(rt is TyPrim
         || rt is TyLit
@@ -1030,11 +1032,11 @@ function sigFuncParamIsClosure(pty: i32): boolean {
 // Answered without spelling a parameter that doubles per level.
 function sigTyIsNulFunc(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyNullable) || t.nInner < 0 || t.nInner >= T.tys.length {
     return false
   }
-  T.tys[t.nInner] is TyFunc && tyEmitNameNonEmpty(ty) == 1
+  tyAt(t.nInner) is TyFunc && tyEmitNameNonEmpty(ty) == 1
 }
 
 // Whether union parameter `pty` keys the `{tag, value}` box, the answer `annParamKindTy` gives
@@ -1042,8 +1044,8 @@ function sigTyIsNulFunc(ty: i32): boolean {
 // records, maps and functions, with or without `null`, whose members fall in two render classes.
 function sigUnionParamIsBox(pty: i32): boolean {
   if pty < 0 || pty >= T.tys.length || annTyIsLitUnion(pty) { return false }
-  let t = T.tys[pty]
-  if t is TyNullable && t.nInner >= 0 { t = T.tys[t.nInner] }
+  let t = tyAt(pty)
+  if t is TyNullable && t.nInner >= 0 { t = tyAt(t.nInner) }
   if !(t is TyUnion) { return false }
   const classes: string[] = []
   let i = 0
@@ -1061,7 +1063,7 @@ function sigUnionParamIsBox(pty: i32): boolean {
 // `sigUnionParamIsBox` declines.
 function sigUnionMemberClass(m: i32): string {
   if m < 0 || m >= T.tys.length { return "" }
-  const t = T.tys[m]
+  const t = tyAt(m)
   match t {
     TyPrim => {
       if t.primName == "never" { return "" }
@@ -1095,7 +1097,7 @@ function sigDeclRecTokOfTy(pty: i32): string {
 
 // The struct row of record type `ty` when the declared record of its name owns that row, else -1.
 function sigDeclRecSlotOfTy(ty: i32): i32 {
-  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyObj) { return -1 }
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyObj) { return -1 }
   const nm = structNameOfTy(ty)
   if nm == "" { return -1 }
   const si = structIndexByName(nm)
@@ -1108,7 +1110,7 @@ function sigDeclRecSlotOfTy(ty: i32): i32 {
 // "": the slot the render path would key, without spelling what doubles per level (D9511).
 function sigDeclRecMapTokOfTy(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyMap) || t.mSet != 0 { return "" }
   let keyK = -1
   if t.mKey == TY_STR { keyK = MAP_KEY_STR }
@@ -1128,7 +1130,7 @@ function sigDeclRecMapTokOfTy(ty: i32): string {
 // "" when a row of the same field names may render alike, since the render's scan may pick it.
 function sigNulDeclRecTokOfTy(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyNullable) { return "" }
   const si = sigDeclRecSlotOfTy(t.nInner)
   if si < 0 || !sigRowHasNoTwin(si) { return "" }
@@ -1141,7 +1143,7 @@ function sigNulDeclRecTokOfTy(ty: i32): string {
 // `SIG_NO_TOK` when that render provably gets none, so the caller answers "" unrendered.
 function sigDeclRecListTokOfTy(ty: i32): string {
   if ty < 0 || ty >= T.tys.length { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyNullable {
     const ns = sigDeclRecListSlotOfTy(t.nInner)
     if ns == -3 { return SIG_NO_TOK }
@@ -1162,12 +1164,12 @@ const SIG_NO_TOK = "!"
 // -3 from `sigDeepNestListSlotOfTy`.
 function sigDeclRecListSlotOfTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyArray) { return -1 }
   const e = t.aElem
   if e < 0 || e >= T.tys.length { return -1 }
   let base = e
-  const et = T.tys[e]
+  const et = tyAt(e)
   if et is TyArray || tyIsFuncOrNulFunc(e) { return sigDeepNestListSlotOfTy(e) }
   if et is TyNullable { base = et.nInner }
   const si = sigDeclRecSlotOfTy(base)
@@ -1189,7 +1191,7 @@ function sigDeepNestListSlotOfTy(e: i32): i32 {
   const nm = deepDeclRecName(e)
   if nm == "" { return -1 }
   let b = e
-  while b >= 0 && b < T.tys.length && T.tys[b] is TyArray {
+  while b >= 0 && b < T.tys.length && tyAt(b) is TyArray {
     b = tyArrayElemIx(b)
   }
   if !rlNestRowsNamed(e, repSlotOfTy(b), nm) { return -1 }
@@ -1202,7 +1204,7 @@ function sigFuncNamesDeclRec(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   const f = tyPeelNul(ty)
   if f < 0 || f >= T.tys.length { return false }
-  const t = T.tys[f]
+  const t = tyAt(f)
   if !(t is TyFunc) { return false }
   for p in t.fnParamTypes {
     if sigTyLeafIsDeclRec(p) { return true }
@@ -1214,7 +1216,7 @@ function sigFuncNamesDeclRec(ty: i32): boolean {
 function sigTyLeafIsDeclRec(ty: i32): boolean {
   let b = ty
   while b >= 0 && b < T.tys.length {
-    const bt = T.tys[b]
+    const bt = tyAt(b)
     if bt is TyArray { b = bt.aElem }
     else if bt is TyNullable { b = bt.nInner }
     else { return bt is TyObj && structNameOfTy(b) != "" }
@@ -1227,15 +1229,15 @@ function sigTyLeafIsDeclRec(ty: i32): boolean {
 // `annParamKindTy` gives it no token (D9422).
 function sigRecUnionListHasNoTok(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyArray) { return false }
   const e = t.aElem
   if e < 0 || e >= T.tys.length { return false }
-  const u = T.tys[e]
+  const u = tyAt(e)
   if !(u is TyUnion) { return false }
   if sigRecScalarUnionTokOfTy(e) == "" { return false }
   for m in u.uMembers {
-    if T.tys[m] is TyObj && (structNameOfTy(m) == "" || tyReachesSelf(m)) {
+    if tyAt(m) is TyObj && (structNameOfTy(m) == "" || tyReachesSelf(m)) {
       return false
     }
   }
@@ -1247,17 +1249,17 @@ function sigRecUnionListHasNoTok(ty: i32): boolean {
 // so `annParamKindTy` boxes it, without spelling a deep record whole (D9390).
 function sigRecScalarUnionTokOfTy(pty: i32): string {
   if pty < 0 || pty >= T.tys.length { return "" }
-  let u = T.tys[pty]
+  let u = tyAt(pty)
   if u is TyNullable {
     if u.nInner < 0 || u.nInner >= T.tys.length { return "" }
-    u = T.tys[u.nInner]
+    u = tyAt(u.nInner)
   }
   if !(u is TyUnion) { return "" }
   let recs = 0
   let prims = 0
   for m in u.uMembers {
     if m < 0 || m >= T.tys.length { return "" }
-    const mt = T.tys[m]
+    const mt = tyAt(m)
     if mt is TyPrim {
       const pn = mt.primName
       if (
@@ -1300,10 +1302,10 @@ export function sigRetTokOfTy(rty: i32): string {
   const rd = sigDeclRecRetTokOfTy(rty)
   // A deep record keys the row it owns without its render, which a shared sub-record doubles
   // per level (D9930).
-  if rd != "" && tyDeeperThan(rty, 8) && T.tys[rty] is TyObj { return rd }
+  if rd != "" && tyDeeperThan(rty, 8) && tyAt(rty) is TyObj { return rd }
   let rs = fnRetEmitName(rty)
   if rs == "" { return "" }
-  const rt = T.tys[rty]
+  const rt = tyAt(rty)
   if rt is TyFunc { rs = "(" + rs + ")" }
   const rk = annRetKindTy(rs, rty)
   if rd != "" && sigTokIsStruct(rk) { return rd }
@@ -1334,7 +1336,7 @@ export function recRowOfTy(ty: i32): i32 {
     si < 0
     && ty >= 0
     && ty < T.tys.length
-    && T.tys[ty] is TyObj
+    && tyAt(ty) is TyObj
     && structNameOfTy(ty) == ""
   ) {
     si = repSlotOfTy(ty)
@@ -1367,11 +1369,11 @@ export function unionArmSigKeyTy(arm: string, ty: i32) {
 // `parentLetOf` and `globalLetOf` reached from here, one id serves both.
 export function identFnTypeAnnNodeAt(sid: i32, fnIx: i32, atIx: i32) {
   if fnIx >= 0 {
-    const fn = P.nodes[fnIx]
+    const fn = nodeAt(fnIx)
     if fn is FuncDecl {
       const li = bodyLetReadAtSid(fn.fnBody, sid, atIx)
       if li >= 0 {
-        const d = P.nodes[li]
+        const d = nodeAt(li)
         if d is LetDecl {
           if tyIsFuncType(d.letType) { return d.letType }
         }
@@ -1387,7 +1389,7 @@ export function identFnTypeAnnNodeAt(sid: i32, fnIx: i32, atIx: i32) {
 // its all-i32 arity fallback.
 export function cloNameSigKeyTy(nm: string, ty: i32) {
   const fty = tyPeelNul(ty)
-  if fty >= 0 && T.tys[fty] is TyFunc {
+  if fty >= 0 && tyAt(fty) is TyFunc {
     const tk = sigKeyOfTy(fty)
     if tk != "" { return tk }
   }
@@ -1406,7 +1408,7 @@ export function cloNameSigKeyTy(nm: string, ty: i32) {
 export function fnBlockShadowsAt(fnIx: i32, sid: i32, atIx: i32): boolean {
   if fnIx < 0 { return false }
   if atIx < 0 { return false }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl { return parentLetCoversAt(fn.fnBody, sid, atIx) }
   false
 }
@@ -1419,7 +1421,7 @@ export const COPY_CHAIN_MAX = 64
 export function frameBodyEnd(fnIx: i32): i32 {
   if fnIx < 0 { return emitRootIx }
   if fnIx >= P.nodes.length { return -1 }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl { return fn.fnBody }
   -1
 }
@@ -1430,7 +1432,7 @@ export function calleeNodeSigKey(atIx: i32): string {
   if atIx < 0 { return "" }
   const aty = nodeTyIxOf(atIx)
   if aty >= 0 {
-    if T.tys[aty] is TyFunc { return sigKeyOfTy(aty) }
+    if tyAt(aty) is TyFunc { return sigKeyOfTy(aty) }
   }
   ""
 }
@@ -1489,20 +1491,20 @@ export function sigKeyRetIsVoid(k: string) {
 // struct/closure/plain-scalar-list arm is not flagged — those rep fine.
 export function tyUnionHasValueUnionElemArrayArm(ty: i32): boolean {
   if ty < 0 { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyUnion) { return false }
   let i = 0
   while i < t.uMembers.length {
-    const m = T.tys[t.uMembers[i]]
+    const m = tyAt(t.uMembers[i])
     if m is TyArray && m.aElem >= 0 {
-      const el = T.tys[m.aElem]
+      const el = tyAt(m.aElem)
       if el is TyUnion {
         // A VALUE union element (2+ members, at least one scalar) — not a variant union.
         if el.uMembers.length >= 2 {
           let hasPrim = false
           let j = 0
           while j < el.uMembers.length {
-            if T.tys[el.uMembers[j]] is TyPrim { hasPrim = true }
+            if tyAt(el.uMembers[j]) is TyPrim { hasPrim = true }
             j = j + 1
           }
           if hasPrim { return true }
@@ -1521,10 +1523,10 @@ export function tyUnionHasValueUnionElemArrayArm(ty: i32): boolean {
 export function tyIsUnionMemberOf(ut: i32, mt: i32): boolean {
   if ut < 0 || mt < 0 { return false }
   let u = ut
-  const un = T.tys[u]
+  const un = tyAt(u)
   if un is TyNullable { u = un.nInner }
   if u < 0 { return false }
-  const t = T.tys[u]
+  const t = tyAt(u)
   if !(t is TyUnion) { return false }
   let i = 0
   while i < t.uMembers.length {
@@ -1574,12 +1576,12 @@ export function sigSlotAtTok(k: string, ti: i32): i32 {
 // lacked, a closure-typed param or local returned by name.
 function frameBindingNode(fnIx: i32, name: string): i32 {
   if fnIx < 0 { return -1 }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const params = fn.fnParams
     let i = 0
     while i < params.length {
-      const p = P.nodes[params[i]]
+      const p = nodeAt(params[i])
       if p is Param {
         if p.parName == name { return params[i] }
       }
@@ -1596,7 +1598,7 @@ function frameBindingNode(fnIx: i32, name: string): i32 {
 // scope there shadows a parameter, and one in a block the read is outside binds nothing.
 function frameBindingNodeAt(fnIx: i32, name: string, atIx: i32): i32 {
   if fnIx < 0 { return -1 }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const sid = readSidOf(name, atIx)
     const li = bodyReadLet(fn.fnBody, sid, atIx)
@@ -1643,7 +1645,7 @@ export function nameFreeToModule(fnIx: i32, name: string): boolean {
   if fnIx >= 0 {
     const own = frameBindingNode(fnIx, name)
     if own >= 0 {
-      const on = P.nodes[own]
+      const on = nodeAt(own)
       if !(on is ForRange || on is ForIn) { return false }
     }
     const fe = fnStmtsPosOf(fnIx)
@@ -1664,7 +1666,7 @@ export function outerFrameBinds(fe: i32, fnIx: i32, name: string): boolean {
     if pp < 0 || pp >= fnStmts.length { return false }
     const hit = frameBindingNode(fnStmts[pp], name)
     if hit >= 0 {
-      const hn = P.nodes[hit]
+      const hn = nodeAt(hit)
       if !(hn is ForRange || hn is ForIn) { return true }
       if nodeSubtreeHas(hit, fnIx) { return true }
     }
@@ -1706,7 +1708,7 @@ export function vkIsPlainList(k: VKind | null): boolean {
 // kind until return inference reaches it, so the call's checked list rep answers where it names
 // another list.
 export function mfI32ResultOrColumn(callIx: i32, fnIx: i32, fe: i32): MfKind {
-  const fn = P.nodes[fnStmts[fe]]
+  const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
     if fn.fnRet >= 0 { return "i32" }
   }
@@ -1776,7 +1778,7 @@ function tyListHasEq(xs: i32[], t: i32): boolean {
 // print import choice (`__print_bool__` renders true/false).
 export function mfCbRetIsBool(fe: i32) {
   if fe < 0 || fe >= fnStmts.length { return false }
-  const fn = P.nodes[fnStmts[fe]]
+  const fn = nodeAt(fnStmts[fe])
   if fn is FuncDecl {
     if fn.fnRet >= 0 {
       // Drops the `rt is TypeRef` gate the spelling path needed: a non-`TypeRef` return
@@ -1802,7 +1804,7 @@ function nominalizePartOfTy(ty: i32): string {
 
 export function nominalizeFnTypeOfTy(ty: i32): string {
   if ty < 0 { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyFunc) { return "" }
   let out = "("
   const pts = t.fnParamTypes
@@ -1819,7 +1821,7 @@ export function nominalizeFnTypeOfTy(ty: i32): string {
 // callee leaves nothing and each call site follows it with `unreachable` (D1972).
 function fnResultEmitName(ty: i32): string {
   if ty >= 0 {
-    const r = T.tys[ty]
+    const r = tyAt(ty)
     if r is TyPrim {
       if r.primName == "never" { return "void" }
     }
@@ -1840,7 +1842,7 @@ export function drwFieldClosure(si: i32, name: string) {
 export function arrElemNominalOfTy(arrIx: i32): string {
   const aty = nodeTyIxOf(arrIx)
   if aty < 0 { return "" }
-  const at = T.tys[aty]
+  const at = tyAt(aty)
   if at is TyArray { return shapeNominalOfTy(at.aElem) }
   ""
 }
@@ -1852,7 +1854,7 @@ export function arrElemNominalOfTy(arrIx: i32): string {
 export function nodeMapArmNominalName(ix: i32): string {
   const ty = nodeTyIxOf(ix)
   if ty < 0 { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyMap {
     const vr = variantRowOfTy(t.mVal)
     if vr < 0 { return "" }

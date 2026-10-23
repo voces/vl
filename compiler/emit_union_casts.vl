@@ -1,7 +1,7 @@
 // `emit_union_casts.vl` — whether a module casts unions or numbers, the niche casts
 // it wires, and which functions use a map.
 
-import { AsExpr, FuncDecl, P, Param, TypeRef } from "./ast"
+import { AsExpr, FuncDecl, P, Param, TypeRef, nodeAt } from "./ast"
 import {
   nodeTyIsFunc,
   nodeTyIxOf,
@@ -12,7 +12,6 @@ import { numCastCanFail } from "./check_num_lits"
 import { widenRetagAny } from "./check_retag_rows"
 import { valueAtomKind } from "./check_ty_rep"
 import {
-  T,
   TyArray,
   TyErr,
   TyFunc,
@@ -25,6 +24,7 @@ import {
   TyUnion,
   TyVar,
   primNameStr,
+  tyAt,
   tyIxIsVariantMember,
 } from "./check_types"
 import { structIndexOfTy, valueAtomKindOfTy } from "./emit_atom_kinds"
@@ -71,12 +71,12 @@ import { isNullTy, primNameOf, tyPeelNul } from "./tyquery"
 // The struct row an `x as! S` yields over a nullable-ref `S | null` operand, where `S` is a
 // standalone struct; else -1 — the first row denoting `S`, as an annotated binding resolves it.
 export function asTrapStructRow(asIx: i32): i32 {
-  const n = P.nodes[asIx]
+  const n = nodeAt(asIx)
   if !(n is AsExpr) { return -1 }
   if n.asMode != "trap" { return -1 }
   const payload = nulRefNichePayloadTy(nodeTyIxOf(n.asObj))
   if payload < 0 { return -1 }
-  if !(T.tys[payload] is TyObj) { return -1 }
+  if !(tyAt(payload) is TyObj) { return -1 }
   if tyIxIsVariantMember(payload) { return -1 }
   structIndexOfTy(payload)
 }
@@ -87,7 +87,7 @@ export function asTrapStructRow(asIx: i32): i32 {
 export function memReadCheckerAtomKind(memIx: i32): i32 {
   const cty = nodeTyIxOf(memIx)
   if cty < 0 { return -1 }
-  const t = T.tys[cty]
+  const t = tyAt(cty)
   // A read the checker narrowed to a function arm delivers the closure the box holds (D4346).
   if nodeTyIsFunc(memIx) { return valueAtomKindOfTy(cty) }
   if t is TyPrim {
@@ -231,15 +231,15 @@ export function fnHasMap(fnIx: i32) {
     }
     i = i + 1
   }
-  const fn = P.nodes[fnIx]
+  const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     const params = fn.fnParams
     let pj = 0
     while pj < params.length {
-      const p = P.nodes[params[pj]]
+      const p = nodeAt(params[pj])
       if p is Param {
         if p.parType >= 0 {
-          const ty = P.nodes[p.parType]
+          const ty = nodeAt(p.parType)
           if ty is TypeRef {
             // The arena test must match the WIDTH of the name test it replaces
             // (`nameIsMap` accepted a nullable- or union-wrapped map too, not just bare) —
@@ -291,11 +291,11 @@ export function moduleHasUnionAs(): boolean {
 // target arm, so it cannot tell a union propagation from a numeric conversion.
 export function asExprIsUnionCast(ix: i32): boolean {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return false }
   const oty = nodeTyIxOf(n.asObj)
   if oty < 0 { return false }
-  const ot = T.tys[oty]
+  const ot = tyAt(oty)
   // Exhaustive over `Ty` and `_`-less: a new arena variant that boxes must be admitted here,
   // not fall to `false` and route the cast through the plain numeric ladder.
   match ot {
@@ -320,11 +320,11 @@ export function asExprIsUnionCast(ix: i32): boolean {
 // `asExprIsUnionCast` declines and the cast falls to the plain numeric ladder (D1251).
 export function asExprOperandIsHole(ix: i32): boolean {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return false }
   const oty = nodeTyIxOf(n.asObj)
   if oty < 0 { return true }
-  const ot = T.tys[oty]
+  const ot = tyAt(oty)
   if ot is TyVar { return true }
   false
 }
@@ -337,7 +337,7 @@ export function nulRefNichePayloadTy(ty: i32): i32 {
   if ty < 0 { return -1 }
   const inner = tyNulSoleInner(ty)
   if inner < 0 { return -1 }
-  const it = T.tys[inner]
+  const it = tyAt(inner)
   // Exhaustive over `Ty` and deliberately `_`-less: whether a nullable is a REF cell is a
   // question each arena variant answers for itself, so a twelfth breaks the self-compile
   // here rather than falling to -1, which reads as "this is a value niche" and is a lie.
@@ -374,7 +374,7 @@ export function nulRefNichePayloadTy(ty: i32): i32 {
 // refusal for them rather than trading it for a miscompile (D1812).
 export function nulNicheCastWiredTy(inner: i32): boolean {
   if inner < 0 { return false }
-  const it = T.tys[inner]
+  const it = tyAt(inner)
   // `_`-less over `Ty` for the same reason as its payload sibling: a twelfth variant is a
   // rep nobody has graded, and admitting it silently is how a loud refusal becomes a
   // miscompile at the delivery positions the matrix would have reddened.
@@ -404,7 +404,7 @@ export function nulNicheCastWiredTy(inner: i32): boolean {
 // survivor of a two-member `TyUnion` carrying `null`. The two spellings reach the emitter as
 // different arena shapes and must classify alike.
 function tyNulSoleInner(ty: i32): i32 {
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   // Exhaustive over `Ty` and `_`-less: the two shapes that spell `X | null`.
   match t {
     TyNullable => {
@@ -427,7 +427,7 @@ function tyNulSoleInner(ty: i32): i32 {
 // `N | null` at every pin, so each instance's lowering yields the value box (D2754).
 export function asExprHoleNumOpt(ix: i32): boolean {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return false }
   if n.asMode != "null" { return false }
   if !asExprOperandIsHole(ix) && !(monoGradualAsScalar.get(ix) ?? false) {
@@ -442,12 +442,12 @@ export function asExprHoleNumOpt(ix: i32): boolean {
 // rather than the spelling `n.asTy` (safe for `emitAsCast`'s lossless ladder, which only
 // compares the four primitive names). Survives an alias (`type Px = i32`) and `T | null`.
 export function asExprNumSrcName(ix: i32): string {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return "" }
   primNameStr(primNameOf(nodeTyIxOf(n.asObj)))
 }
 export function asExprNumTgtName(ix: i32): string {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return "" }
   // `as?` records `T | null` on the node; the other two record `T`. Peeling is a no-op on a
   // non-nullable, so one read serves all three modes.
@@ -459,7 +459,7 @@ export function asExprNumTgtName(ix: i32): string {
 // records `i32` (the value it produces), so only the spelling still says `u8` (D1587). The
 // target name still decides the conversion opcode, so the two must not be merged.
 export function asExprNumCastDomain(ix: i32): string {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return "" }
   if n.asTy == "u8" { return "u8" }
   asExprNumTgtName(ix)
@@ -470,7 +470,7 @@ export function asExprNumCastDomain(ix: i32): string {
 // by operand (a union operand is never a primitive), so the two gates cannot both claim a cast.
 export function asExprNumFallible(ix: i32): boolean {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return false }
   // `as%` keeps the low bits, so it cannot fail at any width pair and owes no staging slot,
   // no `T | null` box row and no trap message.
@@ -483,7 +483,7 @@ export function asExprNumFallible(ix: i32): boolean {
 // operand: the checker cannot tell there whether it can fail, so each instance asks (D2791).
 export function asExprHoleNumSad(ix: i32): boolean {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if !(n is AsExpr) { return false }
   if n.asMode != "trap" && n.asMode != "prop" { return false }
   if !asExprOperandIsHole(ix) { return false }
@@ -498,7 +498,7 @@ export function moduleHasNumCast(): boolean {
   if modNumCastHit { return true }
   let i = modNumCastSeen
   while i < P.nodes.length {
-    if P.nodes[i] is AsExpr {
+    if nodeAt(i) is AsExpr {
       if asExprNumFallible(i) || asExprHoleNumOpt(i) || asExprHoleNumSad(i) {
         modNumCastHit = true
         return true

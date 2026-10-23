@@ -19,6 +19,7 @@ import {
   Unary,
   WhileStmt,
   callIsNever,
+  nodeAt,
   nodeChildren,
   stmtAlwaysExits,
 } from "./ast"
@@ -52,7 +53,7 @@ export let dJoinRelayed: {[i32]: boolean} = Map()
 // Unlike `stmtAlwaysExits`, this counts the implicit return.
 function nodeIsTotalAt(ix: i32, tail: boolean) {
   if ix < 0 { return false }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is Block {
     const st = n.blkStmts
     if st.length == 0 { return false }
@@ -74,7 +75,7 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let cur = ix
     while cur >= 0 {
-      const c = P.nodes[cur]
+      const c = nodeAt(cur)
       const at = cur
       cur = -1
       if c is IfStmt {
@@ -87,7 +88,7 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
         // An arm that completes with no value falls off the end, whatever the other arm does.
         if ifYieldsNoValue(at) { return false }
         if !nodeIsTotalAt(c.ifThen, tail) { return false }
-        if P.nodes[c.ifElse] is IfStmt {
+        if nodeAt(c.ifElse) is IfStmt {
           cur = c.ifElse
         } else {
           return nodeIsTotalAt(c.ifElse, tail)
@@ -105,7 +106,7 @@ function nodeIsTotalAt(ix: i32, tail: boolean) {
         && !breaksToLabel(n.whileBody, n.whileLabel)
     }
     // `while true { … }` never completes normally — it diverges or returns inside.
-    const c = P.nodes[n.whileCond]
+    const c = nodeAt(n.whileCond)
     if c is BoolLit { return c.boolVal != 0 }
     return false
   }
@@ -124,7 +125,7 @@ function breaksToLabel(root: i32, label: string): boolean {
   while todo.length > 0 {
     const ix = todo.pop() ?? -1
     if ix >= 0 && ix < P.nodes.length {
-      const n = P.nodes[ix]
+      const n = nodeAt(ix)
       if n is BreakStmt {
         if n.brkLabel == label { return true }
       }
@@ -144,12 +145,12 @@ function breaksToLabel(root: i32, label: string): boolean {
 // statement, and `emitFuncBody`'s tail ladder drops its value — so only what DIVERGES inside it
 // makes the body total. A bare-block expression makes this arm `nodeIsTotalAt(last, true)` (D1902).
 export function nodeIsTotal(ix: i32) {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is Block {
     const st = n.blkStmts
     if st.length > 0 {
       const last = st[st.length - 1]
-      if P.nodes[last] is Block { return nodeIsTotalAt(last, false) }
+      if nodeAt(last) is Block { return nodeIsTotalAt(last, false) }
     }
   }
   nodeIsTotalAt(ix, true)
@@ -195,7 +196,7 @@ export function tpIfMarkOk(ix: i32) {
   if tpEnvNames.length == 0 || ix < 0 || ix >= P.nodes.length { return 0 }
   const u = crUnParen(ix)
   if u < 0 || u >= P.nodes.length { return 0 }
-  const un = P.nodes[u]
+  const un = nodeAt(u)
   if un is IfStmt || un is MatchExpr { tpIfOkAt.set(u, true) }
   0
 }
@@ -246,8 +247,8 @@ export function f32ArmPlainTy(armIx: i32, ty: i32): i32 {
   if f32JoinAdoptCount == 0 || armIx < 0 { return ty }
   let at = parenPeelIx(armIx)
   // A block arm's value is its last statement.
-  while at >= 0 && P.nodes[at] is Block {
-    const b = P.nodes[at]
+  while at >= 0 && nodeAt(at) is Block {
+    const b = nodeAt(at)
     at = -1
     if b is Block {
       if b.blkStmts.length > 0 {
@@ -278,7 +279,7 @@ export function ifNoValueClear(ix: i32) {
 export function ifArmGivesNoValue(armIx: i32, armTy: i32): boolean {
   if armTy == TY_VOID { return true }
   if armIx < 0 { return false }
-  const a = P.nodes[armIx]
+  const a = nodeAt(armIx)
   if a is Block {
     const n = a.blkStmts.length
     if n == 0 { return true }
@@ -314,7 +315,7 @@ export function clearTailVerdict(ix: i32) {
     const at = cur
     cur = -1
     ifNoValueClear(at)
-    const n = P.nodes[at]
+    const n = nodeAt(at)
     if n is IfStmt {
       clearTailVerdict(blockLastStmt(n.ifThen))
       clearTailVerdict(blockLastStmt(n.ifElse))
@@ -327,7 +328,7 @@ export function clearTailVerdict(ix: i32) {
 // The last statement of the block at `ix`, or -1 for an empty block or a non-block node.
 export function blockLastStmt(ix: i32): i32 {
   if ix < 0 { return -1 }
-  const b = P.nodes[ix]
+  const b = nodeAt(ix)
   if !(b is Block) { return -1 }
   const n = b.blkStmts.length
   if n == 0 { return -1 }
@@ -347,7 +348,7 @@ export function ifTailValTyOf(ix: i32, fallback: i32): i32 {
 // completing-arm join instead of the arm join `armTy`, which counts an exiting arm as `void`.
 export function ifArmValTy(armIx: i32, armTy: i32): i32 {
   if armIx < 0 { return armTy }
-  const a = P.nodes[armIx]
+  const a = nodeAt(armIx)
   if a is Block {
     const n = a.blkStmts.length
     if n > 0 { return ifTailValTyOf(a.blkStmts[n - 1], armTy) }
@@ -362,8 +363,8 @@ export function ifArmValTy(armIx: i32, armTy: i32): i32 {
 export function noteExitFirstLet(n: LetDecl, ix: i32) {
   if n.letType < 0 && n.letInit >= 0 && !inferQuiet {
     let ini = n.letInit
-    while ini >= 0 && P.nodes[ini] is Paren {
-      const pn = P.nodes[ini]
+    while ini >= 0 && nodeAt(ini) is Paren {
+      const pn = nodeAt(ini)
       if pn is Paren { ini = pn.parInner }
     }
     // A loop value's binding is read through the result binding the emitter mints, which
@@ -426,7 +427,7 @@ export function discardedValTyOf(ix: i32, ty: i32): i32 {
 // An unread function's tail value as inference would have taken it: an `if` with a value-less
 // arm is a statement, and a value-if answers the join of its completing arms.
 export function discardedTailTy(ix: i32, ty: i32): i32 {
-  if isStmtNode(ix) && !(P.nodes[ix] is IfStmt) { return TY_VOID }
+  if isStmtNode(ix) && !(nodeAt(ix) is IfStmt) { return TY_VOID }
   if ifYieldsNoValue(ix) { return TY_VOID }
   const v = discardedValTyOf(ix, ty)
   if v == TY_VOID || v == TY_ERR { return TY_VOID }
@@ -437,7 +438,7 @@ export function discardedTailTy(ix: i32, ty: i32): i32 {
 // any other node is left alone.
 export function markValDiscard(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is IfStmt || n is Block || n is MatchExpr { valDiscardAt[ix] = true }
   if n is BinExpr || n is Unary || n is Paren { discRoots.push(ix) }
   if lpOn && (n is WhileStmt || n is ForRange || n is ForIn) {
@@ -449,7 +450,7 @@ export function markValDiscard(ix: i32) {
 
 // A discarded `match` builds no value, so its join is never read as one list (D2832).
 function tpIfMarkDiscard(ix: i32) {
-  if P.nodes[ix] is MatchExpr { tpIfOkAt.set(ix, true) }
+  if nodeAt(ix) is MatchExpr { tpIfOkAt.set(ix, true) }
   0
 }
 

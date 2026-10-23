@@ -1,7 +1,15 @@
 // The return type an un-annotated function infers from its returns, once its body is
 // checked, with the object-literal returns widened to the record they adopt.
 
-import { FieldInit, FuncDecl, NumLit, ObjLit, P, Paren, i32ToStr } from "./ast"
+import {
+  FieldInit,
+  FuncDecl,
+  NumLit,
+  ObjLit,
+  Paren,
+  i32ToStr,
+  nodeAt,
+} from "./ast"
 import { assignableExpr } from "./check_assignable"
 import { bareBraceRecordOf } from "./check_bare_brace"
 import {
@@ -147,6 +155,7 @@ import {
   mkNullableTy,
   numLitUnionBaseTy,
   objFieldType,
+  tyAt,
   tyEq,
   tyIsLitUnion,
   tyIsNulI32BackedListInner,
@@ -180,10 +189,10 @@ function objLitWidenFields(
   recNodes: i32[],
   recTys: i32[],
 ): boolean {
-  const lit = P.nodes[litIx]
+  const lit = nodeAt(litIx)
   if !(lit is ObjLit) { return false }
-  const s = T.tys[sTyIx]
-  const d = T.tys[dTyIx]
+  const s = tyAt(sTyIx)
+  const d = tyAt(dTyIx)
   if !(s is TyObj) { return false }
   if !(d is TyObj) { return false }
   if s.objFieldNames.length != d.objFieldNames.length { return false }
@@ -198,7 +207,7 @@ function objLitWidenFields(
     const fl = lit.objFields
     let fi = 0
     while fi < fl.length {
-      const fn = P.nodes[fl[fi]]
+      const fn = nodeAt(fl[fi])
       if fn is FieldInit {
         if fn.fiName == d.objFieldNames[i] { fv = fn.fiValue }
       }
@@ -207,7 +216,7 @@ function objLitWidenFields(
     if numWidens(sty, dty) {
       // The widening field's value must be a small int literal in the literal body.
       if fv < 0 { return false }
-      const fvn = P.nodes[fv]
+      const fvn = nodeAt(fv)
       if fvn is NumLit {
         if numLexIsFloat(fvn.numText) { return false }
         if !numLexFitsI32(fvn.numText) { return false }
@@ -232,16 +241,16 @@ function objLitWidenFields(
       let fvIn = fv
       let fvDone = false
       while !fvDone {
-        const fvp = P.nodes[fvIn]
+        const fvp = nodeAt(fvIn)
         if fvp is Paren { fvIn = fvp.parInner } else { fvDone = true }
       }
-      const fvNode = P.nodes[fvIn]
+      const fvNode = nodeAt(fvIn)
       // The recursion targets a nested-struct destination only: an ObjLit value against a union
       // field is a member of that union, an arm rather than a field-wise widening target, and
       // descending into it refutes the whole adoption, leaving the emitter to key the outer
       // literal onto a same-field-name-set twin. A non-`TyObj` dest takes the member-flow check.
       let dtyIsObj = false
-      const dtyT = T.tys[dty]
+      const dtyT = tyAt(dty)
       if dtyT is TyObj { dtyIsObj = true }
       if fvNode is ObjLit && dtyIsObj {
         if !objLitWidenFields(fvIn, sty, dty, recNodes, recTys) { return false }
@@ -278,20 +287,20 @@ function objRetWidenAdopt(bodyIx: i32, inferredTy: i32, expRetTy: i32) {
   if u < 0 { return false }
   let done = false
   while !done {
-    const pn = P.nodes[u]
+    const pn = nodeAt(u)
     if pn is Paren { u = pn.parInner } else { done = true }
   }
-  const lit = P.nodes[u]
+  const lit = nodeAt(u)
   if !(lit is ObjLit) { return false }
-  const s = T.tys[inferredTy]
+  const s = tyAt(inferredTy)
   // A nullable expected result (`() => {f: K0} | null`, spelled directly or through the
   // nullable-closure wrapper): adopt against the inner struct. The caller still adopts the full
   // nullable expected, so the lambda's `$fnsig` result keys the nullable struct exactly as the
   // annotation-side consumer does; without the unwrap the two sides key different structs.
   let expInnerTy = expRetTy
-  const dn = T.tys[expRetTy]
+  const dn = tyAt(expRetTy)
   if dn is TyNullable { expInnerTy = dn.nInner }
-  const d = T.tys[expInnerTy]
+  const d = tyAt(expInnerTy)
   if s is TyObj {
     if d is TyObj {
       const recNodes: i32[] = []
@@ -327,7 +336,7 @@ function litUnionAdoptsRet(n: FuncDecl, inferred: i32, expRet: i32): boolean {
   if expRet < 0 { return false }
   let base = expRet
   let strLit = false
-  const et = T.tys[expRet]
+  const et = tyAt(expRet)
   if et is TyNullable { base = et.nInner }
   if et is TyLit { strLit = et.litKind == "str" }
   if base < 0 { return false }
@@ -381,7 +390,7 @@ function retValsDeliverQuiet(n: FuncDecl, inferred: i32, dst: i32): boolean {
 // `base | null` for a nullable numeric literal union over `base`, else -1.
 function nulNumLitUnionBoxTy(ty: i32): i32 {
   if ty < 0 { return -1 }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if !(t is TyNullable) { return -1 }
   const b = numLitUnionBaseTy(t.nInner)
   if b < 0 { return -1 }
@@ -413,7 +422,7 @@ function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
   // the string-ref `ref.null` niche, and `emitReturnValue` niches the value exactly as
   // the named-function value spelling lowers. Covers the string/boolean niches only; a nullable numeric scalar boxes through `valueUnionRetName` instead.
   if inferred != expRet {
-    const etU = T.tys[expRet]
+    const etU = tyAt(expRet)
     if etU is TyNullable {
       // The boolean-niche dual of the string niche: a lambda body inferring a bare
       // `boolean`/`null` member of an expected `boolean | null` adopts the niche — its
@@ -443,7 +452,7 @@ function inferRetAdoptNiche(n: FuncDecl, inferred0: i32, expRet: i32): i32 {
       // `(ref null $cloStruct)`, and `emitReturnValue`'s `retNulClosure` arm niches a
       // `return null` exactly as the annotated form already lowers.
       if etU.nInner >= 0 {
-        const etInnerTy = T.tys[etU.nInner]
+        const etInnerTy = tyAt(etU.nInner)
         if etInnerTy is TyFunc {
           const ncTail = lambdaBodyTail(n.fnBody)
           if ncTail >= 0 && assignableExpr(ncTail, inferred, expRet) {
@@ -713,7 +722,7 @@ function inferRetEmptyListFloor(n: FuncDecl, inferred: i32, expRet: i32) {
   // cast-trap the value call or disagree with the body's list at emit. Exempt only the
   // i32-backed elements (`i32`/`boolean`), which share the one i32-list backing with the annotation and so are already correct un-adopted.
   if inferred != expRet && unresolvedHole(inferred) {
-    const ehT = T.tys[expRet]
+    const ehT = tyAt(expRet)
     if ehT is TyArray {
       if (
         !tyIsPrimNamed(ehT.aElem, "i32")
@@ -744,7 +753,7 @@ function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
     && !tyIsDeferredJoin(inferred)
     && valueUnionRetName(inferred) == ""
   ) {
-    const itt = T.tys[inferred]
+    const itt = tyAt(inferred)
     // A variant-box union (`{w: i32} | i32`, and its nullable form) lowers un-annotated: the
     // A20 loop records `variantBoxUnionRetName` and the emitter boxes it exactly like the
     // annotated spelling. Checked before the `TyUnion`/`TyNullable` arms below (it spans
@@ -794,7 +803,7 @@ function inferRetFloorUnsupported(n: FuncDecl, inferred: i32) {
       // own recorder for the emitter to seed from — so none of them floor (D1576).
       if (
         itt.nInner >= 0
-        && !(T.tys[itt.nInner] is TyVar)
+        && !(tyAt(itt.nInner) is TyVar)
         && !tyIsParamUnion(itt.nInner)
         && !tyIsPrimNamed(itt.nInner, "boolean")
         && !tyIsPrimNamed(itt.nInner, "string")
@@ -1065,7 +1074,7 @@ function inferRetPublish(
     }
     let patched = false
     if bound >= 0 {
-      const bt = T.tys[bound]
+      const bt = tyAt(bound)
       if bt is TyFunc {
         bt.fnRet = inferred
         tyMutEpoch = tyMutEpoch + 1 // inferred return patched in place
@@ -1264,7 +1273,7 @@ export function finishInferredReturn(
     && !isVoidTy(inferred)
     && inferred != TY_ERR
   ) {
-    const inT = T.tys[inferred]
+    const inT = tyAt(inferred)
     if !(inT is TyNullable) { inferred = mkNullableTy(inferred) }
   }
   // Robustness floor: an un-annotated function whose returns join to a union/nullable now

@@ -2,7 +2,7 @@
 // generic substitution mode, and the argument pins a solve reports once.
 // Emptied by `substReset`. Does not import the checker.
 import { lookupFnDeclNode } from "./check_scopes"
-import { Call, FuncDecl, P, i32ToStr, nodeChildren } from "./ast"
+import { Call, FuncDecl, P, i32ToStr, nodeAt, nodeChildren } from "./ast"
 import { i32ListHas, strListHas } from "./listutil"
 import {
   T,
@@ -21,6 +21,7 @@ import {
   addTy,
   mkObjTy,
   tvNestOf,
+  tyAt,
   tyIsHole,
   tyMutEpoch,
 } from "./check_types"
@@ -314,7 +315,7 @@ export function substSkipsForeignSig(ty: i32): boolean {
     substSelfOwner == ""
     || ty < 0
     || ty >= T.tys.length
-    || !(T.tys[ty] is TyFunc)
+    || !(tyAt(ty) is TyFunc)
   ) {
     return false
   }
@@ -322,7 +323,7 @@ export function substSkipsForeignSig(ty: i32): boolean {
   if owner == "" || owner == substSelfOwner { return false }
   const d = fnDeclIx[owner] ?? -1
   if d < 0 || d >= P.nodes.length { return false }
-  const fd = P.nodes[d]
+  const fd = nodeAt(d)
   if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
   tyVarsOwnedBy(ty, owner, [], 64)
 }
@@ -330,7 +331,7 @@ export function substSkipsForeignSig(ty: i32): boolean {
 // The owner key of declaration node `d` when it is the top-level function so named, else "".
 export function topFnOwnerOf(d: i32): string {
   if d < 0 || d >= P.nodes.length { return "" }
-  const fd = P.nodes[d]
+  const fd = nodeAt(d)
   if !(fd is FuncDecl) || (fnDeclIx[fd.fnName] ?? -1) != d { return "" }
   fd.fnName
 }
@@ -358,9 +359,9 @@ function nestEscapes(nd: i32): boolean {
   let esc = true
   let known = true
   const par = nestParentOf.get(nd) ?? -1
-  const f = P.nodes[nd]
+  const f = nodeAt(nd)
   if par >= 0 && par < P.nodes.length && f is FuncDecl {
-    const pf = P.nodes[par]
+    const pf = nodeAt(par)
     if pf is FuncDecl {
       esc = false
       const callees: {[i32]: i32} = Map()
@@ -368,7 +369,7 @@ function nestEscapes(nd: i32): boolean {
       while stack.length > 0 && !esc {
         const ix = stack.pop() ?? -1
         if ix >= 0 && ix < P.nodes.length {
-          const nn = P.nodes[ix]
+          const nn = nodeAt(ix)
           if nn is Call { callees.set(nn.callFn, 1) }
           // A read of the name that is the declaration, by its type: a parameter or loop
           // variable of the same name is another binding. An unchecked read counts.
@@ -395,7 +396,7 @@ function nestEscapes(nd: i32): boolean {
 // Whether `ty` holds a type-parameter row of nested generic `nd`.
 function nestTyHas(ty: i32, nd: i32, depth: i32): boolean {
   if ty < 0 || ty >= T.tys.length || depth > 8 { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyVar => {
       return (tvNestOf.get(ty) ?? -1) == nd
@@ -440,7 +441,7 @@ export function tyVarsOfEnclosingGeneric(ty: i32): boolean {
   let d = fnDeclIx[curFnEscName] ?? -1
   if d < 0 { d = lookupFnDeclNode(curFnEscName) }
   if d < 0 || d >= P.nodes.length { return false }
-  const fd = P.nodes[d]
+  const fd = nodeAt(d)
   if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
   tyVarsOwnedBy(ty, curFnOwner, fd.fnTyParams, 64)
 }
@@ -455,7 +456,7 @@ function tyVarsOwnedBy(
 ): boolean {
   if ty < 0 || ty >= T.tys.length { return true }
   if depth <= 0 { return false }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyVar {
     const o = tyVarOwnerOf(ty)
     return o == owner || (o == "" && strListHas(names, t.tvName))
@@ -500,7 +501,7 @@ export function tyRidesVarOf(
 ): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
   if depth <= 0 { return true }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyVar {
     const o = tyVarOwnerOf(ty)
     return t.tvName == name && (owner == "" || o == "" || o == owner)
@@ -538,14 +539,14 @@ function tysRideVarOf(
 // checked: every variable in it is that declaration's, so each delivery binds them afresh and no
 // pin of the declaration elsewhere speaks for this value (D5290).
 export function tyIsForeignGenericSig(ty: i32): boolean {
-  if ty < 0 || ty >= T.tys.length || !(T.tys[ty] is TyFunc) { return false }
+  if ty < 0 || ty >= T.tys.length || !(tyAt(ty) is TyFunc) { return false }
   const owner = tyFirstVarOwner(ty, 64)
   if owner == "" || owner == curFnOwner { return false }
   const d = fnDeclIx[owner] ?? -1
   if d < 0 || d >= P.nodes.length || i32ListHas(cstrOwnerStack, d) {
     return false
   }
-  const fd = P.nodes[d]
+  const fd = nodeAt(d)
   if !(fd is FuncDecl) || fd.fnTyParams.length == 0 { return false }
   tyVarsOwnedBy(ty, owner, [], 64)
 }
@@ -554,11 +555,11 @@ export function tyIsForeignGenericSig(ty: i32): boolean {
 // parameters whose body is not being checked: its first parameter hole is that function's.
 export function tyIsHoleGenericSig(ty: i32): boolean {
   if ty < 0 || ty >= T.tys.length { return false }
-  const f = T.tys[ty]
+  const f = tyAt(ty)
   if !(f is TyFunc) || f.fnParamTypes.length == 0 { return false }
   const p0 = f.fnParamTypes[0]
   if p0 < 0 || p0 >= T.tys.length { return false }
-  const pv = T.tys[p0]
+  const pv = tyAt(p0)
   if !(pv is TyVar) || !tyIsHole(p0) { return false }
   const nm = pv.tvName
   const dot = nm.indexOf(".")
@@ -567,13 +568,13 @@ export function tyIsHoleGenericSig(ty: i32): boolean {
   if d < 0 || d >= P.nodes.length || i32ListHas(cstrOwnerStack, d) {
     return false
   }
-  P.nodes[d] is FuncDecl
+  nodeAt(d) is FuncDecl
 }
 
 // The recorded owner of the first type variable met in `ty`, or "" when none is met.
 function tyFirstVarOwner(ty: i32, depth: i32): string {
   if ty < 0 || ty >= T.tys.length || depth <= 0 { return "" }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   match t {
     TyVar => tyVarOwnerOf(ty)
     TyArray => tyFirstVarOwner(t.aElem, depth - 1)

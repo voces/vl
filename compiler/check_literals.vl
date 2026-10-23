@@ -47,6 +47,7 @@ import {
   Unary,
   UnionDecl,
   WhileStmt,
+  nodeAt,
 } from "./ast"
 import {
   T,
@@ -64,6 +65,7 @@ import {
   cUnionTyIxs,
   litBaseTy,
   luPosOfTexts,
+  tyAt,
   tyDeeperThan,
   tyIsLitUnionArray,
   tyIsNicheNulScalarElem,
@@ -79,7 +81,7 @@ export function litMembersBaseTy(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return ty }
   const lb = litBaseOrNeg(ty)
   if lb >= 0 { return lb }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyUnion {
     let base = -1
     for m in t.uMembers {
@@ -95,7 +97,7 @@ export function litMembersBaseTy(ty: i32): i32 {
 // The base primitive of literal type `ty`, or -1 when `ty` is not a literal.
 function litBaseOrNeg(ty: i32): i32 {
   if ty < 0 || ty >= T.tys.length { return -1 }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyLit { return litBaseTy(t) }
   -1
 }
@@ -113,14 +115,14 @@ export function litWide64SetAt(k: i32, v: boolean) { litWide64[k] = v }
 // holds each member at its base, as `intLitUnionBasesOf`'s does.
 export function litNumUnionBasesOf(t: i32): i32[] {
   const none: i32[] = []
-  if t < 0 || t >= T.tys.length || !(T.tys[t] is TyUnion) { return none }
+  if t < 0 || t >= T.tys.length || !(tyAt(t) is TyUnion) { return none }
   const vs: i32[] = []
   flattenVariantsInto(t, vs)
   const out: i32[] = []
   let lits = 0
   for v in vs {
     if v < 0 { return none }
-    const vt = T.tys[v]
+    const vt = tyAt(v)
     let b = v
     if vt is TyLit {
       if vt.litKind != "int" { return none }
@@ -147,13 +149,13 @@ export function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
   if inferQuiet || srcExpr < 0 || dstTy < 0 || depth <= 0 { return 0 }
   if litPinN.length > 0 { return 0 }
   let dtix = dstTy
-  const dN = T.tys[dtix]
+  const dN = tyAt(dtix)
   if dN is TyNullable { dtix = dN.nInner }
   // An unfilled A-infer-null hole (`let x = null`) peels to no inner — nothing to record, and
   // indexing the arena at -1 traps the compiler.
   if dtix < 0 { return 0 }
-  const d = T.tys[dtix]
-  const e = P.nodes[srcExpr]
+  const d = tyAt(dtix)
+  const e = nodeAt(srcExpr)
   match e {
     Paren => {
       // Record on the wrapping `Paren` too, not only the inner literal: the emitter's typed-IR fast
@@ -214,7 +216,7 @@ export function recordElemRepArrayLit(srcExpr: i32, dstTy: i32, depth: i32) {
           const dft = d.objFieldTypes
           let k = 0
           while k < e.objFields.length {
-            const f = P.nodes[e.objFields[k]]
+            const f = nodeAt(e.objFields[k])
             if f is FieldInit {
               let dj = -1
               let j = 0
@@ -286,7 +288,7 @@ export function u8LexValue(t: string) {
 // the walk stopped on, not the outer expression, which answers both cases the wrong way.
 export function litShapeDropSrcExpr(claimedExpr: i32) {
   if claimedExpr < 0 { return false }
-  const ce = P.nodes[claimedExpr]
+  const ce = nodeAt(claimedExpr)
   if ce is ObjLit { return true }
   false
 }
@@ -295,7 +297,7 @@ export function litShapeDropSrcExpr(claimedExpr: i32) {
 // -1 when there is none, or the literals mix bases (`1 | "a"`), a union with no one scalar rep.
 export function litUnionOneBase(ty: i32, depth: i32): i32 {
   if ty < 0 || ty >= T.tys.length || depth <= 0 { return -1 }
-  const t = T.tys[ty]
+  const t = tyAt(ty)
   if t is TyLit { return litBaseTy(t) }
   if t is TyNullable { return litUnionOneBase(t.nInner, depth - 1) }
   if t is TyArray { return litUnionOneBase(t.aElem, depth - 1) }
@@ -325,7 +327,7 @@ export function litUnionAliasTyOfMembers(members: i32[]): i32 {
   const texts: string[] = []
   let i = 0
   while i < members.length {
-    const m = T.tys[members[i]]
+    const m = tyAt(members[i])
     if m is TyLit {
       if m.litKind != "str" { return -1 }
       texts.push(m.litText)
@@ -345,7 +347,7 @@ export function litUnionAliasTyOfMembers(members: i32[]): i32 {
 // checker keeps no constant-value scope, so folding one would widen "constant" for no reader (D1588).
 export function constIntExprIs(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return false }
-  const e = P.nodes[ix]
+  const e = nodeAt(ix)
   if e is Paren { return constIntExprIs(e.parInner) }
   if e is Unary {
     if e.unOp == "-" || e.unOp == "+" { return constIntExprIs(e.unArg) }
@@ -359,7 +361,7 @@ export function constIntExprIs(ix: i32) {
 // answer, not a hole, since the direction rule then does not apply and the range keeps its
 // runtime contract (D1588).
 function constIntLeafIs(ix: i32) {
-  const e = P.nodes[ix]
+  const e = nodeAt(ix)
   if e is NumLit {
     if numLexIsFloat(e.numText) { return false }
     return numLexFitsI32(e.numText)
@@ -373,7 +375,7 @@ function constIntLeafIs(ix: i32) {
 // reached (D1588).
 export function constIntExprVal(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
-  const e = P.nodes[ix]
+  const e = nodeAt(ix)
   if e is Paren { return constIntExprVal(e.parInner) }
   if e is Unary {
     if e.unOp == "-" { return 0 - constIntExprVal(e.unArg) }
@@ -387,7 +389,7 @@ export function constIntExprVal(ix: i32) {
 // folds through the lexeme's own base, and every other kind answers 0 — a real bound, so
 // reachable only by a caller that skipped the predicate (D1588).
 function constIntLeafVal(ix: i32) {
-  const e = P.nodes[ix]
+  const e = nodeAt(ix)
   if e is NumLit { return parseI32(e.numText) }
   0
 }
