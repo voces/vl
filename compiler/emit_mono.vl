@@ -13368,6 +13368,8 @@ function monoFlowLetCalls(d: i32) {
     } else if monoFlowListArgRead(u) || monoFlowHandedNarrowed(u) {
       calls.push(u)
       listed = true
+    } else if monoFlowCopyHanded(u, calls) {
+      listed = true
     } else if !monoFlowCallReads(u, calls, 0) {
       return 0
     }
@@ -13542,6 +13544,32 @@ function monoFlowCallReads(u: i32, calls: i32[], depth: i32): boolean {
   true
 }
 
+// Appends to `calls` each read of the un-annotated `const` read `u` wholly initializes, when every
+// one is handed on as an argument or list literal argument or is a call (`monoFlowCallReads`) and
+// one at least is handed on (D10380); false otherwise, with `calls` unchanged.
+function monoFlowCopyHanded(u: i32, calls: i32[]): boolean {
+  let p = mfrParent[u] ?? -1
+  while p >= 0 && nodeAt(p) is Paren { p = mfrParent[p] ?? -1 }
+  if p < 0 || !(mfrCand[p] ?? false) { return false }
+  const pn = nodeAt(p)
+  if !(pn is LetDecl) || pn.letKw != "const" || unwrapParen(pn.letInit) != u {
+    return false
+  }
+  const got: i32[] = []
+  let handed = false
+  for r in mfrUses[p] ?? [] {
+    if monoFlowListArgRead(r) || monoFlowHandedNarrowed(r) {
+      got.push(r)
+      handed = true
+    } else if !monoFlowCallReads(r, got, 1) {
+      return false
+    }
+  }
+  if !handed { return false }
+  for r in got { calls.push(r) }
+  true
+}
+
 // Banks for annotated binding `a` the literals its initializer may be: a call of a concrete
 // function returning only literals, when every call of it initializes a binding annotated
 // alike, so each literal is delivered at that one type and its generics can be pinned there.
@@ -13641,9 +13669,13 @@ function monoFlowLamLeaf(v: i32): i32 {
   p
 }
 
-// The module-level generic every `return` of the function call `c` names, read bare, when its last
-// statement is one of them; -1 otherwise. A binding of the call still runs it (D9481).
-function monoFlowCallLeaf(c: i32): i32 {
+// The module-level generic every `return` of the function call `c` names, read bare or through
+// another such call, when its last statement is one of them; -1 otherwise. A binding of the call
+// still runs it (D9481, D10381).
+function monoFlowCallLeaf(c: i32): i32 { monoFlowCallLeafAt(c, 0) }
+
+function monoFlowCallLeafAt(c: i32, depth: i32): i32 {
+  if depth > MONO_ALIAS_CHAIN_MAX || c < 0 || c >= P.nodes.length { return -1 }
   const cn = nodeAt(c)
   if !(cn is Call) { return -1 }
   const f = unwrapParen(cn.callFn)
@@ -13658,6 +13690,12 @@ function monoFlowCallLeaf(c: i32): i32 {
   const ops = monoFlowRetOperands(fnd.fnBody)
   if ops.length == 0 { return -1 }
   for a in ops {
+    if a >= 0 && nodeAt(a) is Call {
+      const cg = monoFlowCallLeafAt(a, depth + 1)
+      if cg < 0 || (g >= 0 && g != cg) { return -1 }
+      g = cg
+      continue
+    }
     if a < 0 || !(nodeAt(a) is Ident) { return -1 }
     const an = nodeAt(a)
     const ad = identDeclOf(a)
@@ -14048,8 +14086,12 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
 
 // The value a field or literal-index read `v` of a candidate binding gives, directly or through
 // un-annotated `const` aliases, when every literal the binding may hold gives the same generic
-// there and its slot holds that generic alone; -1 otherwise (D10383).
-function monoFlowReadElem(v: i32): i32 {
+// there, itself or through another such read (D10401), and its slot holds that generic alone; -1
+// otherwise (D10383).
+function monoFlowReadElem(v: i32): i32 { monoFlowReadElemAt(v, 0) }
+
+function monoFlowReadElemAt(v: i32, depth: i32): i32 {
+  if depth > MONO_ALIAS_CHAIN_MAX { return -1 }
   let x = v
   let hops = 0
   while x >= 0 && nodeAt(x) is Ident && hops < MONO_ALIAS_CHAIN_MAX {
@@ -14082,8 +14124,15 @@ function monoFlowReadElem(v: i32): i32 {
   let g = -1
   let el = -1
   for b in base {
-    const e = if k >= 0 { monoFlowElemAt(b, k) } else { monoFlowFieldOf(b, prop) }
-    const eg = monoFlowLeafGen(e)
+    let e = if k >= 0 { monoFlowElemAt(b, k) } else { monoFlowFieldOf(b, prop) }
+    let eg = monoFlowLeafGen(e)
+    if eg < 0 && e >= 0 {
+      const re = monoFlowReadElemAt(e, depth + 1)
+      if re >= 0 {
+        e = re
+        eg = monoFlowLeafGen(re)
+      }
+    }
     if eg < 0 || (g >= 0 && eg != g) { return -1 }
     g = eg
     el = e
@@ -15793,6 +15842,8 @@ function monoFlowNoteCallRets(r: i32) {
   for a in monoFlowRetOperands(fnd.fnBody) {
     if !i32ListHas(monoInertValues, a) { monoInertValues.push(a) }
     if !i32ListHas(monoInertCalled, a) { monoInertCalled.push(a) }
+    // A returned call's own returns are what reaches the caller (D10381).
+    if nodeAt(a) is Call { monoFlowNoteCallRets(a) }
   }
   0
 }
