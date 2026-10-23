@@ -524,8 +524,11 @@ Deno.test({
         [...Deno.readDirSync(cache)].map((e) => e.name).filter((n) =>
           /^[0-9a-f]{16}\.rec$/.test(n)
         ).sort();
+      // A check reject's detail is cut at 200 code points and names its row directory, so
+      // under a long $TMPDIR the cut lands inside that path and the record is rightly not kept.
+      const short = { TMPDIR: "/tmp" };
       const run = (env: Record<string, string>) =>
-        port(["--strict", doc], { WITNESS_CACHE: cache, ...env });
+        port(["--strict", doc], { WITNESS_CACHE: cache, ...short, ...env });
 
       const cold = await run({});
       if (
@@ -594,7 +597,10 @@ Deno.test({
           )
             .join(""),
       );
-      const routed = await port(["--strict", doc], { WITNESS_CACHE: fresh });
+      const routed = await port(["--strict", doc], {
+        WITNESS_CACHE: fresh,
+        ...short,
+      });
       if (routed.out !== cold.out) {
         throw new Error(
           `a stale hint: want the cold report, got:\n${routed.out}`,
