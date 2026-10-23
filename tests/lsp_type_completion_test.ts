@@ -14,7 +14,7 @@
 // module pipeline serves tokens from a cache, so single-file fixtures cannot see that class.
 
 import { filePath } from "./support/filePath.ts";
-import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { loadWasmChecker, seedModule } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
   type ExtTypeName,
@@ -178,7 +178,7 @@ Deno.test("type completion: typeCompletionsFromWasm de-dupes and drops an empty 
 // ── the playground, end to end ───────────────────────────────────────────────
 
 const module = seedExists
-  ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
+  ? seedModule(Deno.readFileSync(SEED))
   : undefined;
 
 Deno.test({ name: "type completion: the playground offers the type with its prose", ignore }, async () => {
