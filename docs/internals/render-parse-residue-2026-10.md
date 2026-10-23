@@ -539,7 +539,9 @@ What each slice changes:
     current callers. They fall into three groups:
     - The three mv-kind sites are reached through `mvValKindOfName` with no type. One of the
       callers, `mapValKindLowerable`, is called from `emit_shape_intern`, which holds no type.
-      These wait on D8.
+      These wait on D8. After D8's typed slot finds, the untyped reaches are the shape-text
+      query (77 files), the arm mint (47), 8 map-name finds, `mapValKindLowerable` (4) and 1
+      inner slot.
     - `refArrElemNameIf` and every caller of the ladder want an element name to key the
       name-keyed ref-list slot. D1 has since moved four of `refArrElemNameIf`'s five callers to
       the type, leaving `unionClosureArrElemUnion`. `refArrElemKind` also derives its kind from
@@ -724,23 +726,43 @@ What each slice changes:
     files), always with a type. Line 742 disagrees in 8 files, where the spelling is `""`.
     Switching it there fails 7 of them at run time and traps the compiler on the eighth. All
     16,500 identity files compile exactly as before.
-  - Plan for the map-value slot.
-    1. The 8 `""` values come first. They are hole-fn and generic-fn lists, which a later arm
-       of the ladder answers today. Find that arm and ask its question of the type ahead of
-       the ref-list rung.
-    2. Pass a type from `mvValNamesCompat`'s row side, which reads
-       `shapeFieldElemName(t, want, -1)`. `sFieldElemTyIx` already banks that type. The side is
-       reached untyped in 268 files, 65 of them at line 742.
-    3. Pin `mvSlotOfMapValNameOrMono`'s untyped callers to `mvValTyIxAt`: 376 files, 80 of
-       them at line 742.
-    4. Thread `fty` through the 4 files where `nameFieldCode` passes -1.
-    5. Find a type for `mvShapeOfValNameArmTyGo` in the 50 files where it mints with
-       `kindTy` -1.
+  - Banked, nothing retired: the third `nameIsRefArray` rung asks the type first, and every
+    map-value slot find passes one where its caller holds it.
+    - `mvValIsRefList` answers `tyIsRefArray(ty) && tyEmitNameNonEmpty(ty) != 0` when it has a
+      type. The 8 `""` files are lists whose type has no emitter name, and they stay
+      unsupported as before. Over the self-compile and the same population, the typed answer
+      differs from the spelling in 1 file: a generic template's `((T)=>void)[]` value
+      (`generic-function-stored-through-parameter-inferred-local-and-map.vl`) no longer mints a
+      slot. Its module loses one unused type, its disassembly is otherwise identical, and the
+      output is the same on the master seed and the candidate. difftree --identity: 11,643
+      built, that 1 differs.
+    - `mvSlotOfMapName`, `mvSlotOfMapValNameOrMono` and `mvSlotOfMapValNameOrMonoK` are gone.
+      Their callers, the four slot wrappers and `jrMapValFits`, pass `tyMapValOf` of the banked
+      slot type or the field's type. `mvValNamesCompat` passes both sides' types to the slot
+      find too.
+    - Untyped reaches of `mvValKindOfNameTy`, in files, after the change: `shapeFieldTypeCompatK`'s
+      query spelling 77 (the self-compile among them), the arm mint with `kindTy` -1 47,
+      map-name finds whose caller banked no type 8 (`(i32)=>i32` index-hook maps, `{x: i32}`),
+      `mapValKindLowerable` 4, `mvValInnerMvSlot` with no `mvValTyIx` 1.
+  - Plan for the map-value slot, revised.
+    1. Done: the `""` values are asked of the type (`mvValIsRefList`).
+    2. Relabelled. The plan's "row side" already passed `elemTy`, and the probe reached it
+       untyped in 0 files. The untyped side is the QUERY: `shapeFieldTypeCompatK` compares a
+       field type cut from a shape-text spelling by `shapeFieldParse`, inside the name-keyed
+       resolvers `structIndexOfTypeName` and `variantIndexOfShapeK`. It holds no type by
+       construction, and gets one only when those resolvers' callers move to the typed scan
+       (`jrFieldFits`). That is the largest group, 77 files.
+    3. Done: the slot finds pass a type. 8 files still have none, because their caller banked
+       no `mvValTyIx`/`rlElemTyIx`.
+    4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in
+       `emit_collect` and `emit_shape_intern`.
+    5. Find a type for `mvShapeOfValNameArmTyGo` in the 47 files where it mints with
+       `kindTy` -1. It has many callers, and the arm mint's D34 entries withhold the type.
 
-    After steps 2 to 5, nothing calls `mvValKindOfName` without a type. The three rungs,
-    `mapValKindLowerable` and `mvValKindOfName` itself can then go. That retires the D2 entries
-    at 447, 698 and 742 and the A1 entry at 469. Keying `mvValName` by type, and the mint key
-    in `mvShapeOfMapNameTys`, come after that.
+    After steps 2, 4 and 5 and the 8 finds, nothing calls `mvValKindOfNameTy` without a type.
+    The three rungs, `mapValKindLowerable` and `mvValKindOfName` can then go. That retires the
+    D2 entries at 450, 709 and 649 and the A1 entry at 469. Keying `mvValName` by type, and the
+    mint key in `mvShapeOfMapNameTys`, come after that.
 
 **Order.** The five A slices and C4 can start today. C1 waits on L1's bind columns. D1 and D2
 come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam, and D4 lands after D3 and D5.
