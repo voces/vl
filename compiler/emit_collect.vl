@@ -33,7 +33,6 @@ import {
   gaeHeadNameOf,
   gaeLtAt,
   groupInnerOf,
-  listElemNameOf,
   nameIsArray,
   nameIsFuncTypeAtom,
   nameIsMapOpen,
@@ -104,6 +103,8 @@ import {
   tyLitMemberTexts,
   tyMembersDistinctRecords,
   tyNomNameCycled,
+  tyNulInnerIsPrim,
+  tyNulInnerTy,
   tyPrimNameOf,
   tyScalarBasePrim,
   tyToEmitName,
@@ -167,7 +168,6 @@ import {
   valueIfNodes,
 } from "./ast"
 import {
-  annFnDecompose,
   annGenAppDecompose,
   annRetNameOf,
   arrLeafNameOf,
@@ -6662,71 +6662,177 @@ function forceGenAppArgTypes(name: string): i32 {
   0
 }
 
-// Reserve the reps a closure field's signature needs, at every depth of an annotation spelling.
-// `collectA`'s `annRetNameOf` rung handles a top-level function type; a closure spelled as a
-// struct field (`{f: () => string}`) reaches no rung, because the top-level arrow scan stops at
-// the brace. Scope: it forces only from types reached through an arrow nested in a composite.
-function forceNestedCloSigReps(nm: string, depth: i32): i32 {
-  if depth > 6 { return 0 }
-  // Every reservation below sits behind an arrow, so a spelling with none forces nothing and
-  // has no member set to ask for.
-  if !nm.includes("=>") { return 0 }
-  // A union or nullable spelling: the shape may sit in any arm. `unionSetAtomsOf` stops at a
-  // top-level `=>`, so a function type reaches the arrow rung below as one atom.
-  const arms: string[] = []
-  unionSetAtomsOf(nm, arms)
-  if arms.length > 1 {
-    let ai = 0
-    while ai < arms.length {
-      forceNestedCloSigReps(arms[ai], depth + 1)
-      ai = ai + 1
+// Whether list element `e` rides the i32-list backing: `i32`, `boolean`, `null`, a literal
+// union, or a nullable boolean or literal union.
+function tyElemRidesI32List(e: i32): boolean {
+  if e < 0 || e >= T.tys.length { return false }
+  const k = tyAt(e)
+  if k is TyPrim {
+    return k.primName == "i32"
+      || k.primName == "boolean"
+      || k.primName == "null"
+  }
+  if tyIsLitUnion(e) { return true }
+  const ni = tyNulInnerTy(e)
+  if ni < 0 { return false }
+  const nk = tyAt(ni)
+  if nk is TyPrim { return nk.primName == "boolean" }
+  tyIsLitUnion(ni)
+}
+
+// Whether list element `e` is `string` or `string | null`, the two that share the string list.
+function tyElemIsStrListLeaf(e: i32): boolean {
+  if e < 0 || e >= T.tys.length { return false }
+  const k = tyAt(e)
+  if k is TyPrim { return k.primName == "string" }
+  tyNulInnerIsPrim(e, "string")
+}
+
+// `forceAnnLeafReps` for arena type `t`: the backing and wrapper heap types a closure field's
+// result or parameter of that type needs. A type it does not name reserves nothing.
+function forceAnnLeafRepsOfTy(t: i32): i32 {
+  if t < 0 || t >= T.tys.length { return 0 }
+  const k = tyAt(t)
+  if k is TyPrim {
+    if k.primName == "string" { aUsed = true }
+    return 0
+  }
+  if k is TyMap {
+    if k.mSet == 0 {
+      mUsed = true
+      lUsed = true
+      aUsed = true
     }
     return 0
   }
-  // An array of the spelling (`{f: () => string}[]`) — peel one layer and continue.
-  if nameIsArray(nm) {
-    return forceNestedCloSigReps(listElemNameOf(nm), depth + 1)
-  }
-  // A top-level function type: descend into its parts without forcing them, so the
-  // `annRetNameOf` rung stays the sole owner of a top-level return's reservation.
-  const tps: string[] = []
-  const tret = annFnDecompose(nm, tps)
-  if tret != "" {
-    forceNestedCloSigReps(tret, depth + 1)
-    let ti = 0
-    while ti < tps.length {
-      forceNestedCloSigReps(tps[ti], depth + 1)
-      ti = ti + 1
+  if k is TyArray {
+    const e = k.aElem
+    if tyElemIsStrListLeaf(e) {
+      slUsed = true
+      aUsed = true
+      return 0
     }
-    return 0
-  }
-  // A shape. Every field whose text carries a top-level arrow is a closure field: force the reps
-  // its result and parameters name, then keep descending — a result may itself be a shape with a
-  // closure field of its own.
-  if !nameIsShapeSpanEnds(nm) { return 0 }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  // The group-interior cut at its home (`tyname.groupInnerOf`); the guard above is the bound
-  // that home requires.
-  shapeInnerFieldSplit(groupInnerOf(nm), fnames, ftexts)
-  let fi = 0
-  while fi < ftexts.length {
-    const ft = ftexts[fi]
-    const ps: string[] = []
-    const ret = annFnDecompose(ft, ps)
-    if ret != "" {
-      forceAnnLeafReps(ret)
-      forceNestedCloSigReps(ret, depth + 1)
-      let pi = 0
-      while pi < ps.length {
-        forceAnnLeafReps(ps[pi])
-        forceNestedCloSigReps(ps[pi], depth + 1)
-        pi = pi + 1
+    if e < 0 || e >= T.tys.length { return 0 }
+    const ek = tyAt(e)
+    if !(ek is TyPrim) { return 0 }
+    match ek.primName {
+      "f64" => {
+        fa64Used = true
       }
-    } else {
-      forceNestedCloSigReps(ft, depth + 1)
+      "i64" => {
+        ia64Used = true
+      }
+      "f32" => {
+        fa32Used = true
+      }
+      "i32" | "boolean" => {
+        lUsed = true
+        aUsed = true
+      }
+      "string" | "void" | "null" | "never" | "u8" | "v128" => {
+        // A string element is taken above; the rest reserve no backing here.
+      }
     }
-    fi = fi + 1
+    return 0
+  }
+  const ni = tyNulInnerTy(t)
+  if ni < 0 { return 0 }
+  const nk = tyAt(ni)
+  if nk is TyPrim {
+    if nk.primName == "string" { aUsed = true }
+    return 0
+  }
+  if !(nk is TyArray) { return 0 }
+  const ne = nk.aElem
+  if tyElemRidesI32List(ne) {
+    lUsed = true
+    aUsed = true
+    return 0
+  }
+  if tyElemIsStrListLeaf(ne) {
+    slUsed = true
+    aUsed = true
+    return 0
+  }
+  if ne < 0 || ne >= T.tys.length { return 0 }
+  const nek = tyAt(ne)
+  if !(nek is TyPrim) { return 0 }
+  match nek.primName {
+    "f64" => {
+      fa64Used = true
+    }
+    "i64" => {
+      ia64Used = true
+    }
+    "f32" => {
+      fa32Used = true
+    }
+    "u8" => {
+      ba8Used = true
+    }
+    "string" | "i32" | "boolean" | "void" | "null" | "never" | "v128" => {
+      // Taken above, or no backing of its own.
+    }
+  }
+  0
+}
+
+// Reserve the reps a closure field's signature needs, at every depth of annotation type `t`.
+// `collectA`'s `annRetNameOf` rung handles a top-level function type; a closure that is a field
+// of an inline shape (`{f: () => string}`) reaches no rung. Forces only from the result and
+// parameters of such a field, descending through unions, lists, function parts and shapes.
+function forceNestedCloSigRepsOfTy(t: i32, depth: i32): i32 {
+  if depth > 6 || t < 0 || t >= T.tys.length { return 0 }
+  const k = tyAt(t)
+  match k {
+    TyUnion => {
+      let ai = 0
+      while ai < k.uMembers.length {
+        forceNestedCloSigRepsOfTy(k.uMembers[ai], depth + 1)
+        ai = ai + 1
+      }
+    }
+    TyNullable => {
+      forceNestedCloSigRepsOfTy(k.nInner, depth + 1)
+    }
+    TyArray => {
+      forceNestedCloSigRepsOfTy(k.aElem, depth + 1)
+    }
+    TyFunc => {
+      // A function type's own parts are not forced here: a top-level return belongs to the
+      // `annRetNameOf` rung.
+      forceNestedCloSigRepsOfTy(k.fnRet, depth + 1)
+      let ti = 0
+      while ti < k.fnParamTypes.length {
+        forceNestedCloSigRepsOfTy(k.fnParamTypes[ti], depth + 1)
+        ti = ti + 1
+      }
+    }
+    TyObj => {
+      // A declared record's fields are reserved through its own declaration.
+      if structNameOfTy(t) != "" { return 0 }
+      let fi = 0
+      while fi < k.objFieldTypes.length {
+        const ft = k.objFieldTypes[fi]
+        if ft >= 0 && ft < T.tys.length {
+          const fk = tyAt(ft)
+          if fk is TyFunc {
+            forceAnnLeafRepsOfTy(fk.fnRet)
+            forceNestedCloSigRepsOfTy(fk.fnRet, depth + 1)
+            let pi = 0
+            while pi < fk.fnParamTypes.length {
+              forceAnnLeafRepsOfTy(fk.fnParamTypes[pi])
+              forceNestedCloSigRepsOfTy(fk.fnParamTypes[pi], depth + 1)
+              pi = pi + 1
+            }
+          } else {
+            forceNestedCloSigRepsOfTy(ft, depth + 1)
+          }
+        }
+        fi = fi + 1
+      }
+    }
+    TyPrim | TyMap | TyVar | TyLit | TyNeg | TyErr => {}
   }
   0
 }
@@ -7297,9 +7403,9 @@ function collectARefArrayAnn(i: i32, nd: TypeRef): i32 {
 // `collectA`'s arm for the annotation at node `i`: the heap types, list and map rows its
 // spelling forces. Returns 0, or -1 once a spelling with no rep has failed loudly.
 function collectATypeRef(i: i32, nd: TypeRef) {
-  // A CLOSURE spelled as a struct FIELD reserves nothing through the rung below —
-  // see `forceNestedCloSigReps`, which walks INTO the spelling for it.
-  forceNestedCloSigReps(nd.tyName, 0)
+  // A closure that is a struct field reserves nothing through the rung below —
+  // see `forceNestedCloSigRepsOfTy`, which walks into the annotation's type for it.
+  forceNestedCloSigRepsOfTy(nodeTyIxOf(i), 0)
   // A top-level function-type annotation (`(i32) => R`): the function-type name needs no
   // array or list type, but its return `R` may, so force the return's backing types. The
   // arrow must be top-level, so an array of functions falls through to the array branches.
