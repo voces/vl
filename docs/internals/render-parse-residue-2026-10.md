@@ -130,7 +130,7 @@ the slice retires.
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
-| D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
+| D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 6 retired, 15 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
@@ -479,6 +479,18 @@ What each slice changes:
     spelling (`T`, `C<i32>[]`) carries the instance's canon type, and 411 reaches have no type.
     Two map-value sites agree but have callers passing `-1`. `refArrElemNameIf`'s callers are in
     other slices' files. The ladder internals stay while any of these keep a name caller.
+  - Re-surveyed at 5a834bcfe: none of the 15 can retire yet, and each `.jsonl` row names its
+    current callers. They fall into three groups:
+    - The three mv-kind sites are reached through `mvValKindOfName` with no type. One of the
+      callers, `mapValKindLowerable`, is called from `emit_shape_intern`, which holds no type.
+      These wait on D8.
+    - `refArrElemNameIf` and every caller of the ladder want an element name to key the
+      name-keyed ref-list slot. `refArrElemKind` also derives its kind from the spelling, so it
+      matches the annotation side. This group waits on D1.
+    - `refArrShapeKind` is also called from `emit_shape_intern` 663.
+
+    So the ten ladder-internal entries (`refArrShapeKindGo`, `nameIsRefArrayGo`,
+    `refElemArrName` and `nameIsNulRefList`) are the last of D2 to go.
 - **D3.** The mono instance key and the `monoAnnPinName` ladder take the pin's type. Most of the
   slice is this one seam, and it carries 15 of the 52 D renders.
   - Done: the instance is keyed by type as well as by spelling. When the spelled key misses,
