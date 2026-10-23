@@ -546,6 +546,7 @@ import {
 } from "./emit_mv_slots"
 import {
   NARROW_SHADOW,
+  NARROW_TYPED,
   globalLetOf,
   globalLetOfSid,
   ifJoinTypedAtom,
@@ -8215,18 +8216,10 @@ export function indexElemUnionName(idxIx: i32, fnIx: i32) {
   ""
 }
 
-// The nullable-ref-array element name of an index read `xs[0]` — `"i32[][][] | null"` for
-// `xs: (i32[][][] | null)[]` — or "" otherwise (D451's other half). A niche, not a box:
+// The arena type of a nullable-ref-array index read `xs[0]` less its `| null` —
+// `i32[][][]` for `xs: (i32[][][] | null)[]` — or -1 (D451's other half). A niche, not a box:
 // `array.get` + `ref.as_non_null` already leaves the right value, so the peel is sound
-// only under the narrowing guard, not off the bare name.
-function indexElemNulRefArrayName(idxIx: i32, fnIx: i32) {
-  const slot = indexElemNulRefArraySlot(idxIx, fnIx)
-  if slot < 0 { return "" }
-  nullablePartOf(rlElemName[slot])
-}
-
-// The arena type `indexElemNulRefArrayName` spells, the cell's element less its `| null`; -1
-// when the slot's type column does not cover it.
+// only under the narrowing guard, not off the bare type.
 function indexElemNulRefArrayTy(idxIx: i32, fnIx: i32): i32 {
   tyPeelNul(rlElemTyIxAt(indexElemNulRefArraySlot(idxIx, fnIx)))
 }
@@ -8282,11 +8275,10 @@ function pushIndexStructComplement(
 function pushIndexNicheNarrow(idxIx: i32, fnIx: i32) {
   const ik = indexPathKeyOf(idxIx)
   if ik == "" { return false }
-  // A nullable ref-array cell carries its peeled name as the variant, because the guarded
-  // reads resolve the inner ref-list row from it.
-  const np = indexElemNulRefArrayName(idxIx, fnIx)
-  if np != "" {
-    pushNarrowRep(ik, np, indexElemNulRefArrayTy(idxIx, fnIx), -1)
+  // A nullable ref-array cell banks its peeled type; the guarded reads resolve the inner
+  // ref-list row from the cell's slot.
+  if indexElemNulRefArraySlot(idxIx, fnIx) >= 0 {
+    pushNarrowRep(ik, NARROW_TYPED, indexElemNulRefArrayTy(idxIx, fnIx), -1)
     return true
   }
   // A nullable string cell — the variant only has to be a non-`null` spelling, and
@@ -8301,7 +8293,7 @@ function pushIndexNicheNarrow(idxIx: i32, fnIx: i32) {
       pushNarrow(ik, "boolean")
       return true
     }
-    // A nullable scalar-list cell (`(i32[] | null)[]`): the variant is the list the recovered
+    // A nullable scalar-list cell (`(i32[] | null)[]`): the slot banks the list the recovered
     // ref holds, and the column reads the element at that list (D2393).
     if exprRefArray(e.idxArr, fnIx) {
       const sl = refListSlotOfExpr(e.idxArr, fnIx)
@@ -8320,11 +8312,8 @@ function pushIndexNicheNarrow(idxIx: i32, fnIx: i32) {
             || sk == RLK_I64_LIST
             || sk == RLK_F32_LIST)
         ) {
-          const snp = nullablePartOf(rlElemName[sl])
-          if snp != "" {
-            pushNarrowRep(ik, snp, tyPeelNul(rlElemTyIxAt(sl)), -1)
-            return true
-          }
+          pushNarrowRep(ik, NARROW_TYPED, tyPeelNul(rlElemTyIxAt(sl)), -1)
+          return true
         }
       }
     }
@@ -17091,7 +17080,7 @@ function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   if narrowedIsRefArrayPlace(exprIx) { return refListElemNameOfNodeTy(exprIx) }
   // A narrowed index over a nullable-ref-array element resolves via `nulRefArrayInnerSlot`,
   // gated on the ref-array shape so an unrelated nullable-string cell can't borrow the row. D451.
-  if indexElemNulRefArrayName(unwrapParen(exprIx), fnIx) != "" {
+  if indexElemNulRefArraySlot(unwrapParen(exprIx), fnIx) >= 0 {
     if narrowVariantFor(indexPathKeyOf(exprIx)) != "" {
       const nin = nulRefArrayInnerSlot(unwrapParen(exprIx), fnIx)
       if nin >= 0 && nin < rlElemName.length { return rlElemName[nin] }
