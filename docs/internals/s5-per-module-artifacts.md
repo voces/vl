@@ -1359,8 +1359,8 @@ pooled-string fill and then calls the inits in order.
   promoted binding never crosses an init function. The narrowing an init leaves is carried
   into the next and restored after the last.
 - **The artifact.** `emitLinkSection` keys init `k` as `init:<module path>` and puts it in
-  that module's `LinkArt.init`. It removes the calls from `rt#0`'s body (`elDropInitCalls`).
-  `link()` places the inits after the start, in artifact order, and writes the calls back
+  that module's `LinkArt.init`. It removes the calls from `rt#0`'s body (`elDropInitCalls`,
+  `elDropStartCalls` since §22). `link()` places the inits after the start, in artifact order, and writes the calls back
   into the start before its `end` (`lkWithCalls`). So `rt#0`'s artifact body is the pool
   fill alone.
 - **Names.** With init functions the start is named `__start__`, with no file: the root's
@@ -1429,10 +1429,80 @@ This change reads 0 and 0.
 
 **What is left of the start function.**
 
-- **The pool fill** stays in `rt#0`, so a start still follows the program's string pool.
-  Moving it needs each module's literals filled by its own artifact, or the fill keyed by
-  the pool's content at link.
+- **The pool fill** stayed in `rt#0`, so a start still followed the program's string pool.
+  §22 moves it to the link, keyed by the pool's content.
 - **The narrowing carried between inits** is a program fact: an init's body can depend on
   what an earlier module's init narrowed. This step did not measure how often it does.
 - **Single-file programs** keep the monolithic start. A cache gains nothing from splitting
   them, since their only module is the root.
+
+## 22. Step 7, fifth part: the pooled-string fill is keyed by the pool at link
+
+**What moved.** After §21 the start function of a multi-module program held two things: the
+calls to each module's init, which link writes back, and the pooled-string fill, which the
+emitter wrote into `rt#0`'s body. The fill reads which pool globals are filled from a
+segment and at which offsets, so `rt#0`'s split body differed whenever two programs' pools
+differed, which was all 27 of the `modules/**` pairs left by §21.
+
+**The mechanism.** The link decides the fill from the pool's content, not the emitter.
+
+- `linkFillPlan(bytes, optimized)` (`compiler/link.vl`) is the old `strFillPlan` decision,
+  moved: an entry is filled when it saves more than the widening it costs, the plan fills
+  nothing under `-O` or when the total save is 64 bytes or fewer, and a run restarts every
+  32 entries. It returns each filled entry's offset into the segment, or -1. The emitter's
+  `strFillPlan` calls the same function, so a direct build and a linked one agree.
+- A pool global `s:<lex>` is always emitted into its artifact in the FIXED form (its bytes as
+  `i32.const`s and `array.new_fixed`), whatever its program decided (`elDefEntry`,
+  `compiler/emit_link.vl`). Its bytes are a function of the literal alone.
+- `link()` runs `lkPoolPlan` over the pool in its linked order, rewrites a filled entry to the
+  filled form (`linkPoolFilled`, a length and `array.new_default`), and builds the fill
+  calls into `rt:__str_fill__` and the segment from the same plan (`lkFillCalls`).
+- `rt#0`'s split body is `0x00 0x0b` when every reference in it is a pool global, the fill
+  helper or an init (`elDropStartCalls`). Link writes the fill calls, then the init calls,
+  before its `end` (`lkWithCalls`).
+- A single-file program keeps its monolithic start, with the fill inside it, so `link()`
+  adds no second fill when the start already calls `rt:__str_fill__` (`lkOwnFill`).
+
+**Why not per module.** The alternative was each module filling its own literals in its init.
+That needs a segment offset per module, which is again a program fact, and two modules sharing
+a literal would each fill it, since a pool global is defined once per program. Keying the fill
+at link keeps one segment and one helper, and leaves every artifact's bytes a function of its
+own source.
+
+**Measured.** Armed, at e4a5b289e, master against this change:
+
+| | master | this change |
+| --- | ---: | ---: |
+| `modules/**` builds: `rt#0` pairs that differ | 27 | 1 |
+| `modules/**` builds: module pairs that differ | 235 | 233 |
+| all 4,795 tests/cases builds: module keys held by two or more | 37 | 37 |
+| module pairs that differ | 4,582 | 4,572 |
+| runtime functions held by two or more | 166 | 166 |
+| runtime pairs that differ | 4,845 | 4,845 |
+| of them, `rt#0` | 4,792 | 4,792 |
+
+The one `rt#0` pair left in `modules/**` is `modules/solo/entry.vl`, a single-file program
+whose start is its top level. The link proof reads 0 sections or bodies differing and 0
+unresolved on the `modules/**` builds (2,734 functions), the 4,673 `@run` builds (82,597
+functions) and the armed self-build (14,440 functions), which fills in several runs.
+
+**The witness and the control.** `tests/cases/modules/start-pool-fill-per-module/` has two
+roots sharing `notes.vl`, whose pooled literal is too short for a program to fill on its own.
+`entry.vl` adds a long literal, so its program fills both; `entry2.vl` adds none, so its
+program fills neither. On master 1 module pair (`notes.vl`, whose literal was filled in one
+program only) and 1 runtime pair (`rt#0`) differ. This change reads 0 and 0.
+
+**Gates.**
+
+- **Identity:** difftree `--identity` against master's fixpoint at a6d1916a2 reads 16,497
+  files, 11,639 built, 0 differ and 0 uncompared, and the candidate compiling master's source
+  gives master's fixpoint. Disarmed output does not change, because the emitter calls the same
+  plan. `--allow-diff` is not needed.
+- **regress.vl:** 0 runs → not-runs, 0 → silent, no cell changed class.
+- **Seed:** the fixpoint holds, at 5,729,491 bytes (master's fixpoint 5,723,732, +0.10%);
+  `seed-size.vl --check` passes against its baseline.
+- **L2 guest fuel**, one run each on this source: 89,433,919,101 on master's seed and
+  89,433,919,513 on the new one (+412 units).
+
+**What is left.** The fill segment, `rt:__str_fill__` and whether a start exists at all are
+still program facts, decided at link. Single-file programs keep their own fill.

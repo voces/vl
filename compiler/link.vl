@@ -14,6 +14,7 @@ import {
   RS_TAG,
   relSkew,
 } from "./emit_reloc"
+import { cpsToUtf8, decodeStr, strToCps } from "./emit_base"
 import { typeOrderCanon } from "./emit_type_order"
 
 // A reference's kind: a function index, a global index, or a value of row space 1 to 6.
@@ -144,6 +145,7 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
   lkMissKeys = []
   lkDup = 0
   lkBands(p, lkWithRuntime(p, arts))
+  lkPoolPlan(p, arts)
   const fns: LinkFn[] = []
   let fi = 0
   while fi < p.fnImports.length {
@@ -173,11 +175,13 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
   for a in arts {
     for f in a.init { inits.push(f) }
   }
-  let placed = inits.length == 0
+  // The start fills the pooled literals the link chose before those calls.
+  const fill = lkFillCalls()
+  let placed = inits.length == 0 && fill.b.length == 0
   for f in p.runtime.fns {
     lkPut(fIdx, f.key, fi)
     if f.key == p.startKey && !placed {
-      fns.push(lkWithCalls(f, inits))
+      fns.push(lkWithCalls(f, lkOwnFill(f, fill), inits))
       fi = fi + 1
       for g in inits {
         lkPut(fIdx, g.key, fi)
@@ -191,6 +195,7 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
     }
   }
   if !placed {
+    if fill.b.length > 0 { lkMiss(p.startKey) }
     for g in inits {
       lkMiss(g.key)
       lkPut(fIdx, g.key, fi)
@@ -226,8 +231,19 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
   }
 }
 
-// The start `f` with a call to each of `inits` before its closing `end`.
-function lkWithCalls(f: LinkFn, inits: LinkFn[]): LinkFn {
+// `fill`, or none for a start that calls `__str_fill__` itself: one whose body is the whole
+// program's top level, which fills ahead of its first line.
+function lkOwnFill(f: LinkFn, fill: LinkPiece): LinkPiece {
+  for r in f.body.refs {
+    if r.kind == LK_FUNC && r.key == LINK_STR_FILL {
+      return { b: [], refs: [] }
+    }
+  }
+  fill
+}
+
+// The start `f` with `fill`, then a call to each of `inits`, before its closing `end`.
+function lkWithCalls(f: LinkFn, fill: LinkPiece, inits: LinkFn[]): LinkFn {
   const b: u8[] = []
   const refs: LinkRef[] = []
   const n = f.body.b.length - 1
@@ -237,6 +253,10 @@ function lkWithCalls(f: LinkFn, inits: LinkFn[]): LinkFn {
     i = i + 1
   }
   for r in f.body.refs { refs.push(r) }
+  for r in fill.refs {
+    refs.push({ at: b.length + r.at, kind: r.kind, key: r.key })
+  }
+  for x in fill.b { b.push(x) }
   for g in inits {
     b.push(0x10)
     refs.push({ at: b.length, kind: LK_FUNC, key: g.key })
@@ -373,17 +393,20 @@ function lkGlobals(
     lkPut(gIdx, p.globImports[k], k)
     k = k + 1
   }
-  const lexes: string[] = []
-  const seen: { [string]: boolean } = Map()
-  for a in arts { lkAddNew(a.pool, lexes, seen) }
-  for a in arts { lkAddNew(a.poolIs, lexes, seen) }
-  lkAddNew(p.runtime.pool, lexes, seen)
-  for lex in lexes {
-    const key = "s:" + lex
+  let li = 0
+  while li < lkLexes.length {
+    const key = "s:" + lkLexes[li]
     const d = defs[key] ?? -1
     lkPut(gIdx, key, gi)
-    if d >= 0 { out.push(defAt[d].entry) } else { lkMiss(key) }
+    if d < 0 {
+      lkMiss(key)
+    } else if li < lkFillOff.length && lkFillOff[li] >= 0 {
+      out.push(linkPoolFilled(defAt[d].entry, lkPoolBytes[li].length))
+    } else {
+      out.push(defAt[d].entry)
+    }
     gi = gi + 1
+    li = li + 1
   }
   for a in arts {
     for c in a.cells {
@@ -416,6 +439,151 @@ function lkGlobals(
     }
   }
   out
+}
+
+// The pooled literals in global order, each one's bytes, and the segment offset each fills
+// from at start (-1 for one its initialiser pushes; empty when the build fills none).
+let lkLexes: string[] = []
+let lkPoolBytes: i32[][] = []
+let lkFillOff: i32[] = []
+
+// The fill helper's key, which the start calls once per filled pooled literal.
+export const LINK_STR_FILL = "rt:__str_fill__"
+// Bytes a module pays to fill pool entries from a segment at all: `__str_fill__`'s type and
+// body, a start function if the module has none, and the data-count and segment framing.
+const STR_FILL_FIXED = 64
+// Filled entries per offset chain. A chain is one nested expression to a tree-shaped reader
+// (binaryen overflows its stack parsing thousands), so each run restarts from its own offset.
+export const STR_FILL_RUN = 32
+
+// The segment offset of each pooled literal of `bytes` that fills from a passive segment, in
+// pool order, or -1: one whose pushed bytes cost more than its segment bytes plus a `global.get`
+// and a `call`, only when that saves more than the fixed cost. Empty when none fills, and always
+// under `-O`, since the fill reads every entry and binaryen could then not drop the dead ones.
+export function linkFillPlan(bytes: i32[][], optimized: i32): i32[] {
+  if optimized != 0 { return [] }
+  const off: i32[] = []
+  let save = 0
+  let at = 0
+  for b in bytes {
+    // Inline: an `i32.const` per byte. Filled: the bytes in the segment, a `global.get` and a
+    // `call`, and the init's `i32.const n`, one byte wider than the count `array.new_fixed` takes.
+    let pushed = 0
+    for v in b {
+      if v < 64 { pushed = pushed + 2 } else { pushed = pushed + 3 }
+    }
+    const gain = pushed - b.length - lkCountWidening(b.length) - 7
+    if gain > 0 {
+      save = save + gain
+      off.push(at)
+      at = at + b.length
+    } else {
+      off.push(-1)
+    }
+  }
+  if save <= STR_FILL_FIXED { return [] }
+  off
+}
+
+// How much wider `n` is as an `i32.const` (signed LEB) than as a count (unsigned LEB).
+function lkCountWidening(n: i32): i32 {
+  if n >= 64 && n < 128 { return 1 }
+  if n >= 8192 && n < 16384 { return 1 }
+  0
+}
+
+// The bytes pooled literal lexeme `lex` holds.
+export function linkPoolBytes(lex: string): i32[] {
+  cpsToUtf8(decodeStr(strToCps(lex)))
+}
+
+// The pooled literals in the order their globals take, and which of them the start fills.
+function lkPoolPlan(p: LinkProg, arts: LinkArt[]) {
+  lkLexes = []
+  const seen: { [string]: boolean } = Map()
+  for a in arts { lkAddNew(a.pool, lkLexes, seen) }
+  for a in arts { lkAddNew(a.poolIs, lkLexes, seen) }
+  lkAddNew(p.runtime.pool, lkLexes, seen)
+  lkPoolBytes = []
+  for lex in lkLexes { lkPoolBytes.push(linkPoolBytes(lex)) }
+  lkFillOff = linkFillPlan(lkPoolBytes, p.optimized)
+  0
+}
+
+// The start's fill prologue: one `__str_fill__` call per filled literal, threading the segment
+// offset, restarted from its own offset every `STR_FILL_RUN` calls. Empty when none fills.
+function lkFillCalls(): LinkPiece {
+  const b: u8[] = []
+  const refs: LinkRef[] = []
+  let run = 0
+  let li = 0
+  while li < lkFillOff.length {
+    const off = lkFillOff[li]
+    if off >= 0 {
+      if b.length == 0 {
+        b.push(0x41)
+        lkS(b, off)
+      } else if run == STR_FILL_RUN {
+        b.push(0x1a)
+        b.push(0x41)
+        lkS(b, off)
+        run = 0
+      }
+      run = run + 1
+      b.push(0x23)
+      refs.push({ at: b.length, kind: LK_GLOBAL, key: "s:" + lkLexes[li] })
+      b.push(0x10)
+      refs.push({ at: b.length, kind: LK_FUNC, key: LINK_STR_FILL })
+    }
+    li = li + 1
+  }
+  if b.length > 0 { b.push(0x1a) }
+  { b: b, refs: refs }
+}
+
+// Pooled literal entry `e` (a `(ref $s)` global: its backing, then the string struct over it)
+// with its backing a zeroed `array.new_default` of `n` bytes that the start fills.
+export function linkPoolFilled(e: LinkPiece, n: i32): LinkPiece {
+  lkPoolEntry(e, [], n, true)
+}
+
+// The same entry with its backing pushed by `array.new_fixed` of `bytes`, the form an artifact
+// carries whatever its program fills.
+export function linkPoolFixed(e: LinkPiece, bytes: i32[]): LinkPiece {
+  lkPoolEntry(e, bytes, bytes.length, false)
+}
+
+// An entry of another shape than three type references, the first the global's, is returned
+// as it stands, which the link proof then reports.
+function lkPoolEntry(
+  e: LinkPiece,
+  bytes: i32[],
+  n: i32,
+  filled: boolean,
+): LinkPiece {
+  if e.refs.length != 3 || e.refs[0].at != 1 { return e }
+  const b: u8[] = [0x64, 0x00]
+  const refs: LinkRef[] = [{ at: 1, kind: e.refs[0].kind, key: e.refs[0].key }]
+  if filled {
+    b.push(0x41)
+    lkS(b, n)
+  } else {
+    for v in bytes {
+      b.push(0x41)
+      lkS(b, v)
+    }
+  }
+  b.push(0xfb)
+  if filled { b.push(0x07) } else { b.push(0x08) }
+  refs.push({ at: b.length, kind: e.refs[1].kind, key: e.refs[1].key })
+  if !filled { lkU(b, n) }
+  // The string struct: start 0, length `n`, hash 0 (not computed yet).
+  for x in [0x41, 0x00, 0x41] { b.push(x) }
+  lkS(b, n)
+  for x in [0x41, 0x00, 0xfb, 0x00] { b.push(x) }
+  refs.push({ at: b.length, kind: e.refs[2].kind, key: e.refs[2].key })
+  b.push(0x0b)
+  { b: b, refs: refs }
 }
 
 function lkAddNew(src: string[], dst: string[], seen: { [string]: boolean }) {
