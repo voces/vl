@@ -121,10 +121,10 @@ the slice retires.
 | --- | --- | --- | --- | --- | --- |
 | A1 | shape-row typed twins | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
-| A3 | emit_collect / emit_classify typed rungs | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
+| A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
@@ -167,6 +167,18 @@ What each slice changes:
 - **A3.** Each typed rung of the `emit_collect` field-hint ladders and the `collectATypeRef` ladder
   reads the arena, and the `emit_classify` rung reads the rl-slot columns. Hazard: the
   `collectATypeRef` chain is order-dependent, so its rungs move together.
+  - Done, byte-identical: `indexElemNulRefArrayName` reads the slot's kind and nullable
+    columns. The arm-pin map walk is `mapLeafValTy` over the annotation's arena type, so
+    `mapLeafValName` and `armPinAnnName`'s cut are gone; `alcCommitName` now returns the
+    annotation node, so `alcNamesArm` asks the same walk. The `??` field atom reads the
+    operand's `TyObj` field type, which retires `anonLeafAnnAtomOf`, `anonLeafAtomAdmits`
+    and `anonLeafAtomOfText`. That is 7 parses.
+  - Left: `fieldElemHintOf` and `collectARefArrayAnn`'s nullable reject disagree with the
+    arena on a probe (one-literal and spaced spellings, and `A | B | null` as a nullable
+    union), and the reject's message names the inner spelling. `dstPinMapValue`'s gate is
+    typed, but its cut is the pin name it pushes. `internArmShapeAt` needs a declared-vs-inline
+    answer the arena does not give, since both are a `TyObj`. Each row's `status` has the
+    probe counts.
 - **A4.** `resolveShapeToNominal` on a rendered type becomes `shapeNominalOfTy`. The
   signature-key sites that still render read `sigKeyOfTy`, which needs widening to cover them.
   Landed for 2 parses: `cboxElemName` tests `TyArray`, and `recordedParamPinName`'s nullable
@@ -180,7 +192,44 @@ What each slice changes:
 - **A5.** Atom-kind, closure-result-forcing, union-ref-arm and coalesce tests read the union row's
   member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
-  `monoSubstAnn`, `monoBindOf` and their kin bind by type.
+  `monoSubstAnn`, `monoBindOf` and their kin bind by type. Landed for the 5 parses of the two
+  pre-bind predicates. `monoAnnIsOpenUnion` and `monoUnionLeavesOpenFree` are gone, and
+  `monoPreBindPastUnionRest` asks `monoDeclIsOpenUnion` and `monoDeclLeavesOpenFree` of the
+  generic's declared parameter type and the argument's exact pin type. A probe agreed on 391 of
+  391 and 392 of 393 events. The one disagreement already had its type argument bound
+  explicitly. difftree `--identity` found 0 of 16,437 files differ.
+
+  The other 12 entries are in `annFnDecompose`, `monoTyParamOf`, `monoAnnHasTyParam`,
+  `monoSubstAnn` and `monoBindFromAnn`. These walkers PRODUCE spellings: the `tvV` binding,
+  and the substituted annotation that becomes the instance's TypeRef text and key. The typed
+  answer exists beside each one. The probe compared it at each site over `tests/**` and the
+  distilled corpus, rendering it with `tyToEmitName`; a spelling that did not match was
+  re-tried with the renderers listed below.
+
+  | site | agree | agree only by another renderer | disagree | type `-1` | type has a TyVar |
+  | --- | --- | --- | --- | --- | --- |
+  | `tvV` vs `monoBindCols` (`letBT`) | 7,305 | 1,239 | 13 | 96 | 13 |
+  | `tvV` vs argument-only `monoBindCols` | 6,880 | 1,116 | 120 | 520 | 30 |
+  | `tvV` vs `callBindTyOf` | 7,112 | 1,291 | 222 | 1,280 | 122 |
+  | param pin vs `monoSubstInst` of its annotation | 7,356 | 1,497 | 167 | 0 | 517 |
+  | return `rs` vs `monoSubstInst` (`sub2`) | 1,788 | 389 | 100 | 0 | 5 |
+  | let annotation vs `monoSubstInst` (`s2`) | 685 | 178 | 22 | 0 | 4 |
+
+  The other renderers are `tyToNominalName`, `arenaEmitName`, the `=>` signature key and the
+  `#anon` row handle. The binding is there: `letBT` misses 13 of 8,666. No single renderer
+  reproduces the spelling, though. A walker spells a declared record by its name or by its
+  structure, depending on what the source wrote. So none of the 12 can leave while its product
+  stays a spelling.
+
+  The rest of the plan:
+  1. Mint the instance from `letBN`/`letBT`, with `monoSubstInst` for the parameter, return and
+     let types.
+  2. Key the instance by type (D3).
+  3. Render a spelling only for the TypeRef text, once per instance.
+
+  Step 2 changes instance identity, so it is an `--allow-diff` change. After step 1,
+  `monoSubstAnn`'s 18 call sites and `monoBindFromAnn`'s 4 in `emit_mono` move off the spelling, and the
+  walkers' 12 entries leave with them.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot

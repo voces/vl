@@ -154,8 +154,10 @@ import {
   tyIsParamHole,
   tyIxIsFunc,
   tyMayHoldFn,
+  tyMentionsTyVarNamed,
   tyPrimNameOf,
   tyRenderSoftensLits,
+  tySame,
   tyScalarBasePrim,
   tyToEmitName,
   tyToStr,
@@ -290,14 +292,12 @@ import {
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
-  monoAnnIsOpenUnion,
   monoBindFromAnn,
   monoBindOf,
   monoDeclAnnName,
   monoIsGenericDecl,
   monoSubstAnn,
   monoTyParamOf,
-  monoUnionLeavesOpenFree,
   nameIsBareMap,
   nameIsClosureArray,
   nameIsF64Array,
@@ -9772,7 +9772,8 @@ function monoTestsTyVar(ix: i32): boolean {
 }
 
 // Whether `ty` is a union with a type-parameter member and a concrete member besides `null`,
-// the shape the checker's binding walk passes over (`monoAnnIsOpenUnion`'s arena twin).
+// the shape the checker's binding walk passes over (`monoDeclIsOpenUnion`, which also names the
+// member).
 function monoTyIsOpenUnion(ty: i32): boolean {
   const ms: i32[] = []
   flattenVariantsInto(ty, ms)
@@ -20510,11 +20511,70 @@ function monoBindFromLaterArg(
   0
 }
 
-// Whether parameter annotation `ann` at argument `act` binds only after the call's others: a
-// union the checker's walk passes over, or one whose argument leaves its type parameter free.
-function monoPinDefers(ann: string, act: string, typarams: string[]): boolean {
-  monoAnnIsOpenUnion(ann, typarams)
-    || monoUnionLeavesOpenFree(ann, act, typarams)
+// The index in `ms` of the one member naming a type parameter in `typarams`, or -1 when none or
+// several do.
+function monoTyOpenMember(ms: i32[], typarams: string[]): i32 {
+  let open = -1
+  let i = 0
+  while i < ms.length {
+    let names = false
+    for tp in typarams {
+      if tyMentionsTyVarNamed(ms[i], tp, 24) { names = true }
+    }
+    if names {
+      if open >= 0 { return -1 }
+      open = i
+    }
+    i = i + 1
+  }
+  open
+}
+
+// Whether declared parameter type `dt` is a union with one type-parameter member and a concrete
+// member besides `null`. Its binding yields to every other parameter's, since the checker binds a
+// type parameter from a nullable (`T | null`) in order but from such a union not at all.
+function monoDeclIsOpenUnion(dt: i32, typarams: string[]): boolean {
+  const ms: i32[] = []
+  flattenVariantsInto(dt, ms)
+  if ms.length < 2 { return false }
+  const open = monoTyOpenMember(ms, typarams)
+  if open < 0 { return false }
+  let i = 0
+  while i < ms.length {
+    if i != open && ms[i] != TY_NULL { return true }
+    i = i + 1
+  }
+  false
+}
+
+// Whether every member of argument type `at` is a concrete member of union `dt`, so its one
+// type-parameter member is left free (`T | null` at `null`) and should bind elsewhere first.
+function monoDeclLeavesOpenFree(dt: i32, at: i32, typarams: string[]): boolean {
+  const ms: i32[] = []
+  flattenVariantsInto(dt, ms)
+  if ms.length < 2 { return false }
+  const open = monoTyOpenMember(ms, typarams)
+  if open < 0 { return false }
+  const as: i32[] = []
+  flattenVariantsInto(at, as)
+  for a in as {
+    let covered = false
+    let j = 0
+    while j < ms.length && !covered {
+      if j != open && a >= 0 && ms[j] >= 0 && tySame(ms[j], a) {
+        covered = true
+      }
+      j = j + 1
+    }
+    if !covered { return false }
+  }
+  true
+}
+
+// Whether declared parameter type `dt` at argument type `at` binds only after the call's others:
+// a union the checker's walk passes over, or one whose argument leaves its type parameter free.
+function monoPinDefers(dt: i32, at: i32, typarams: string[]): boolean {
+  monoDeclIsOpenUnion(dt, typarams) || monoDeclLeavesOpenFree(dt, at, typarams)
 }
 
 // Per parameter of the call being instantiated: the argument's own spelling where the union
@@ -20523,7 +20583,8 @@ let monoUnionRestPin: string[] = []
 
 // Where some parameter's annotation is a union over a type parameter (`u: T | string`), binds
 // every other type-parameter annotation from its argument first, so the union only fills a
-// type parameter nothing else binds, as the checker's inference does (D2734).
+// type parameter nothing else binds, as the checker's inference does (D2734). `decl` holds the
+// generic's declared parameter types (`monoDeclParamTys`).
 function monoPreBindPastUnionRest(
   params: i32[],
   args: i32[],
@@ -20531,6 +20592,7 @@ function monoPreBindPastUnionRest(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  decl: i32[],
 ) {
   monoUnionRestPin = []
   let z = 0
@@ -20540,12 +20602,18 @@ function monoPreBindPastUnionRest(
   }
   const anns: string[] = []
   const acts: string[] = []
+  // Per parameter: its declared type where its annotation is a union over a type parameter,
+  // else -1, and its argument's pinned type wherever `acts` spells one.
+  const dts: i32[] = []
+  const ats: i32[] = []
   let any = false
   let i = 0
   while i < params.length && i < args.length {
     let ann = ""
     let act = ""
     let isUnion = false
+    let dt = -1
+    let at = -1
     const p = nodeAt(params[i])
     if p is Param {
       if p.parType >= 0 {
@@ -20563,11 +20631,17 @@ function monoPreBindPastUnionRest(
     // Only a union annotation can defer, so only its argument is spelled here: a pin name
     // renders the whole argument type, which a wide type makes dear.
     if ann != "" && isUnion {
+      if i < decl.length { dt = decl[i] }
       act = monoPreBindArgName(args[i], ctx)
-      if act != "" && monoPinDefers(ann, act, typarams) { any = true }
+      if act != "" {
+        at = monoPreBindArgTy(args[i], ctx)
+        if monoPinDefers(dt, at, typarams) { any = true }
+      }
     }
     anns.push(ann)
     acts.push(act)
+    dts.push(dt)
+    ats.push(at)
     i = i + 1
   }
   if !any { return 0 }
@@ -20576,13 +20650,15 @@ function monoPreBindPastUnionRest(
     // arena-tick exempt: the call's own argument-name column, not an arena node.
     if anns[a] != "" && acts[a] == "" {
       acts[a] = monoPreBindArgName(args[a], ctx)
+      // arena-tick exempt: the call's own argument-type column, not an arena node.
+      if acts[a] != "" { ats[a] = monoPreBindArgTy(args[a], ctx) }
     }
     a = a + 1
   }
   let j = 0
   while j < anns.length {
     if anns[j] != "" && acts[j] != "" {
-      if !monoPinDefers(anns[j], acts[j], typarams) {
+      if !monoPinDefers(dts[j], ats[j], typarams) {
         monoBindFromAnn(anns[j], acts[j], typarams, tvN, tvV)
       }
     }
@@ -20593,7 +20669,7 @@ function monoPreBindPastUnionRest(
   let k = 0
   while k < anns.length {
     if anns[k] != "" && acts[k] != "" {
-      if monoAnnIsOpenUnion(anns[k], typarams) {
+      if monoDeclIsOpenUnion(dts[k], typarams) {
         const sub = monoSubstAnn(anns[k], typarams, tvN, tvV)
         if (
           sub != ""
@@ -20645,6 +20721,13 @@ function monoBindBareArenaPins(
 function monoPreBindArgName(ax: i32, ctx: i32): string {
   if nodeAt(unwrapParen(ax)) is NullLit { return "null" }
   monoArgPinName(ax, ctx)
+}
+
+// The pinned type of argument `ax` for the pre-bind, read inside function `ctx`: a bare `null`
+// is the null type, whatever its recorded pin.
+function monoPreBindArgTy(ax: i32, ctx: i32): i32 {
+  if nodeAt(unwrapParen(ax)) is NullLit { return TY_NULL }
+  monoExactPinTyOf(monoArgPinTyIx(ax, ctx), ctx)
 }
 
 // Whether every atom of union spelling `inner` is an atom of `outer`.
@@ -22308,7 +22391,15 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       }
       monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
-      monoPreBindPastUnionRest(params, args, fn.fnTyParams, ctx, tvN, tvV)
+      monoPreBindPastUnionRest(
+        params,
+        args,
+        fn.fnTyParams,
+        ctx,
+        tvN,
+        tvV,
+        monoDeclParamTys(origFe, params.length),
+      )
       let oDecl = -1
       if origFe >= 0 && origFe < monoOrigNode.length {
         oDecl = monoOrigNode[origFe]
