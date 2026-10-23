@@ -130,7 +130,7 @@ the slice retires.
 | C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
-| D2 | ref-list kind ladder by type (landed: 5 retired, 17 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
+| D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
@@ -198,7 +198,9 @@ What each slice changes:
   files for each retired site. The three `emit_base` entries wait until C1 lands. Five stay:
   - `valueAtomKindOfTy`'s fallback answers declined shapes, and some of those no file reaches.
   - `mapAnnShape`'s value spelling also keys the D8 mv-slot lookups.
-  - The two closure-result walkers have their only caller in `emit_collect`.
+  - The two closure-result walkers intern by spelling (`mvShapeOfMapName`, `ensureRefElem`),
+    and a closure position inside one TypeRef has no node, so a typed walk would need a render
+    to rebuild the key. They wait on D8's mv slot and D1's ref-list slot keyed by type.
   - `monoStaticIsResult`'s typed compare answers differently in 2 files.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
   `monoSubstAnn`, `monoBindOf` and their kin bind by type. Landed for the 5 parses of the two
@@ -300,13 +302,23 @@ What each slice changes:
     `arrLitNulRefGrouped` and `nulRefElemNameOfArrTy` ask the type, with 0 differing reaches.
     `checkArrName`'s ref-list rung was dead, because its only caller's earlier rung already
     claims every name it accepted.
-  - Left: the twin is too NARROW at three sites (`mvValKindOfNameTy`'s list arm,
-    `arrLitNestedElemName`, `arrLitShapeElemName`; 49 reaches), always the same way. An inferred
-    record that only adopts into a declared row (`[{ r: null }]` beside `{ r: i32 | null }`) has
-    no row of its own, while the spelling reaches the row through `structIndexOfTypeName`'s
-    lenient passes. Annotating the literal, or deleting the declared row, makes the two agree, and
-    the cells run, so the spelling is not wrong there. The twin needs that adoption bridge
-    (`declRowFieldAdopts` over the rows) before these switch.
+  - Done, one differing file: 2 parses. The twin was too narrow at three sites, always the same
+    way. An inferred record that only adopts into a declared row (`[{ r: null }]` beside
+    `{ r: i32 | null }`) has no row of its own, while the spelling reaches the row through
+    `structIndexOfTypeName`'s lenient passes. `tyObjHasRefRow` now also takes the declared row
+    the record adopts into, through `structRowOfObjFieldSet`, the existing field-set scan over
+    `declRowFieldAdopts`. A probe over 16,438 fixture and corpus files then disagreed in 1 file,
+    down from 49. `arrLitShapeElemName` and `arrLitNestedElemName` ask the type.
+    - The remaining file is `anon-struct-declared-row-capture-containers.vl`. There, `{p: 7}`
+      fits two union-box rows equally, so the field-set scan finds no unique claimant, where the
+      spelling took the first row. The module differs by 13 bytes, prints the same output, and
+      still runs with the two rows swapped.
+    - Adding the variant field-set scan as well added 3 new disagreements, so the bridge stops
+      at struct rows.
+  - Left: `mvValKindOfNameTy`'s list arm. With the bridge, every file where the spelling said
+    ref list agrees with the type. Still apart: 8 files where the spelling is empty (closure and
+    generic-fn map values), and 136 with no type. Its callers pass `-1` through
+    `mvValKindOfName`, and two of those hold no type by construction.
   - Left: `collectATypeRef`'s rung also disagrees in the other direction. A generic original's
     spelling (`T`, `C<i32>[]`) carries the instance's canon type, and 411 reaches have no type.
     Two map-value sites agree but have callers passing `-1`. `refArrElemNameIf`'s callers are in
