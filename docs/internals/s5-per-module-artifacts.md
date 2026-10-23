@@ -19,7 +19,8 @@ This doc covers:
 Steps 1 to 5 have landed (§8 to §13). In step 5, `-O` after link, the optimiser already ran
 once, after the module was finished, and the step names what `-O` still changes in the
 emitter. §14 puts those flags and the map-delete bit into each artifact's key, and leaves
-the remaining step 6 work in one list.
+the remaining step 6 work in one list. §15 and §16 move lifted functions and the root's
+exports into the artifacts, and §16 measures what the tail and the runtime still hold.
 
 ## 1. What a body encodes: the census
 
@@ -904,3 +905,106 @@ that lays each artifact's lifted functions out in a row misplaces them.
   program output, keyed by the function it names. The literal-type texts no module spells sit
   there too. Step 6 either keys the runtime by the helper set it holds or rebuilds it at
   every link.
+
+## 16. Step 6, first part: the root's exports in its artifact
+
+**What the tail and the runtime hold.** A scratch build listed `LinkProg.tail` and the
+runtime artifact by key in each of the 4,899 armed tests/cases builds at #4487. §15's
+"3,393 twins" counted every key with a `$` in it, and most of those are generic instances.
+
+| item | entries | builds |
+| --- | ---: | ---: |
+| tail: generic instances (`name$n`) | 2,793 | — |
+| tail: lambdas cloned into an instance (`#n`) | 672 | — |
+| tail: other mono output (an instance's lambdas, `$cb` callback clones) | 256 | — |
+| tail, those three together | 3,721 | 1,072 |
+| tail: `$voidtw` twins | 3 | 2 |
+| tail: `$extv` twins | 3 | 3 |
+| tail: `$eqc` cores | 7 | 3 |
+| runtime: helper functions (`rt:` or `rt#n`) | 32,697 | at least 4,885 |
+| runtime: group types | 45,177 | 4,480 |
+| runtime: band keys | 2,956 | 1,218 |
+| runtime: literal-type texts no module spells | 442 | 290 |
+| runtime: exports | 228 | 195 |
+
+So 99.7% of the tail is `emit_mono.vl` output, which is the generic-demand work and out of
+this step. The twins are 13 functions in 8 builds.
+
+**The exports move.** Only the root module's declarations reach the wasm ABI
+(`modAliasRootExports`, `modResolveRootReExports`). So the export section is the root's, and
+its entries now sit in the root's artifact, except the memory export, which stays in the
+runtime because `memUsed` is a program fact.
+
+- `LinkArt.exports` on the root holds the function exports, in section order. A re-exported
+  function keeps the key of the module that declares it.
+- After those come the global exports. They are taken from `exportGlobalRows`, which the
+  export section reads too. That list still holds a row named `memory` that the section
+  drops when the program exports its memory, so the root's artifact does not change with
+  whether the program uses memory.
+- `lkExports` writes each artifact's exports in order, then the runtime's. It skips a global
+  export whose name the runtime exports, which is the rule the emitter applies.
+
+A module is root in one program and a dependency in another only if both programs build it.
+None of the sets here does that. Such a module's artifact differs between the two, since a
+dependency's exports reach no ABI.
+
+**Proof.** The armed builds are at #4487. The tests/cases rows include the witness's two
+builds.
+
+| set | builds | artifacts | functions | body references | sections differ | bodies differ | unresolved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 scripts, master | 8 | 99 | 2,320 | 88,931 | 0 | 0 | 0 |
+| 8 scripts, this change | 8 | 99 | 2,320 | 88,931 | 0 | 0 | 0 |
+| tests/cases, master | 4,901 | 5,869 | 85,029 | 900,994 | 0 | 0 | 0 |
+| tests/cases, this change | 4,901 | 5,869 | 85,029 | 900,994 | 0 | 0 | 0 |
+
+The 8 scripts are s5-relocs, goal-scoreboard, seed-size, check-filed-witnesses,
+emit-refusal-sites, sentinel-census, plumb-shape-cost and capability-matrix. §15's set was a
+different eight, so its counts are not these. In every row nothing is defined twice and no
+row is left unconsumed.
+
+Invariance gives the same result on master and on this change:
+
+- **The 8 scripts:** 23 keys held, 1 pair differs (`std:array` between capability-matrix and
+  s5-relocs), 23 keyed apart and 18 of those equal.
+- **tests/cases (4,899 builds):** 20 keys held, and 4,565 pairs differ, all under the empty
+  path of a single-file program's main module.
+
+**The witness and the control.** `tests/cases/modules/root-exports-memory-name/` has two
+roots that share one dependency.
+
+- `entry.vl` uses linear memory. It re-exports the dependency's `twice` and exports a
+  function and two bindings, one of them named `memory`.
+- `entry2.vl` uses no memory, so its `memory` binding is published as a wasm global.
+
+The control publishes every artifact's exports with no skip. It reds on 2 of the 4,901
+tests/cases builds, `entry.vl` and `extern/global-export-named-memory.vl`, each with section
+7 differing. This change reads 0 differing on both. Invariance over the two roots: 1 key
+held (`lib.vl`), 0 pairs differ.
+
+**Gates.**
+
+- **Identity:** difftree `--identity` reads 16,444 files, 11,435 built, 0 differ and 0
+  uncompared: the candidate compiling master's source equals master's fixpoint.
+- **Seed:** the fixpoint holds, at 5,691,699 bytes (master 5,689,403, +0.04%), rebased onto
+  #4489.
+- **plumb-shape cost:** passes, with main fuel −3.0%, tail fuel −3.2% and RSS −2.0% against
+  its baseline.
+- **L2 guest fuel**, one run each on this source: the master seed 88,990,940,067 and the new
+  seed 88,990,938,309 (−1,758 instructions).
+
+**What is left of step 6.**
+
+- **The twins.** `$voidtw` follows the checker's seam order, `$extv` is minted at the first
+  read of an extern over all top-level code and then every function body, and `$eqc` is a
+  program fact (one core per cyclic record, minted only if some comparison anywhere has a
+  recursive operand). Each needs a per-module copy deduplicated at link and a replay of its
+  pass, and together they are 13 functions in 8 builds.
+- **The runtime's group types**: 45,177 entries in 4,480 builds. These are the types the
+  runtime helpers, the tail and the import, memory and data sections name, and
+  every type no artifact names, which keeps its index. That split has not been measured.
+- **The literal-type texts no module spells.** A text in a literal type is owned by a type,
+  and the arena does not record which module a type came from.
+- **The band rank table**, as §15 says: it is graded on behaviour at the switch-over.
+- **The runtime helpers** are one set per program. The runtime is keyed by that set or
+  rebuilt at every link.
