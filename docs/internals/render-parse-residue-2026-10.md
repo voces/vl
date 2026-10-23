@@ -300,9 +300,10 @@ What each slice changes:
   - The `letBT` misses fell from 93 to 54. `monoBindCols` now binds three things as the
     spelling does: a union parameter's one bare type parameter, a function result's union, and
     `T | null` at `null`.
-  - `monoBindCols` leaves 11 of those bindings unbound: a binding that holds a Set or a boolean
-    map. Binding one sends the instance into D10540, where `is` tests the box tag the two share.
-    `pin-exact-key-record-twin.vl` printed `true` for `false`. That guard goes when D10540 closes.
+  - D10540 is fixed, and the `letBT` misses fell from 54 to 43. `monoBindCols` had left 11
+    bindings unbound: each one held a Set or a boolean map, and binding one made `is` test the
+    box tag the two share. `is` now reads the clone's recorded type. The typed column takes the
+    true row where a pin spelling softened a Set to its map. The guard is gone.
   - D10521 is not a typed-column defect. The typed `f64[]` is the checker's type for the call,
     and the spelling is the instance's rep union. Step 1 takes a let's rep from the apart-join
     knowledge, not from `substTyDeep`.
