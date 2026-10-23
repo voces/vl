@@ -11,7 +11,7 @@
 // hover's rather than assuming it.
 
 import { filePath } from "./support/filePath.ts";
-import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { loadWasmChecker, seedModule } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
   docMarkdown,
@@ -229,7 +229,7 @@ Deno.test({ name: "ufcs docs: an `import` does not silence the panel (D1863)", i
 // must arrive there too.
 
 const module = seedExists
-  ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
+  ? seedModule(Deno.readFileSync(SEED))
   : undefined;
 
 Deno.test({ name: "ufcs docs: the playground offers the method, with its prose", ignore }, async () => {

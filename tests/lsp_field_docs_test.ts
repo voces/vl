@@ -18,7 +18,7 @@
 // a whole class of defect. Every new doc suite carries one from now on.
 
 import { filePath } from "./support/filePath.ts";
-import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { loadWasmChecker, seedModule } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
   docMarkdown,
@@ -235,7 +235,7 @@ Deno.test({ name: "field docs: an `import` does not silence the panel (D1863)", 
 // ── the playground, end to end ───────────────────────────────────────────────
 
 const module = seedExists
-  ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
+  ? seedModule(Deno.readFileSync(SEED))
   : undefined;
 
 Deno.test({ name: "field docs: the playground panel carries the same prose", ignore }, async () => {

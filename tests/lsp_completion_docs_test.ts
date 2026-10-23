@@ -18,7 +18,7 @@
 // `documentation` string itself.
 
 import { filePath } from "./support/filePath.ts";
-import { loadWasmChecker } from "../lsp/src/wasmCheckerNode.ts";
+import { loadWasmChecker, seedModule } from "../lsp/src/wasmCheckerNode.ts";
 import {
   type Completion,
   docMarkdown,
@@ -230,7 +230,7 @@ Deno.test({ name: "completion docs: an `import` does not silence the panel (D186
 // sees rather than the `Completion` behind it.
 
 const module = seedExists
-  ? new WebAssembly.Module(Deno.readFileSync(SEED) as BufferSource)
+  ? seedModule(Deno.readFileSync(SEED))
   : undefined;
 
 Deno.test({ name: "completion docs: the playground panel carries the same prose", ignore }, async () => {
