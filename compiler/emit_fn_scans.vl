@@ -30,7 +30,6 @@ import {
   NumLit,
   ObjLit,
   OptMember,
-  P,
   Param,
   Paren,
   Program,
@@ -62,7 +61,6 @@ import { EqCmpKind, EqCore, eqCoreKindOfTyToken } from "./check_ty_relate"
 import { isValueUnionName, valueAtomKind } from "./check_ty_rep"
 import {
   T,
-  TyFunc,
   TyUnion,
   tyAt,
   tyIsLitUnion,
@@ -75,7 +73,6 @@ import {
   recordFitIsStagesRecv,
 } from "./emit_atom_kinds"
 import {
-  fnLetInitOf,
   nulCloFlag,
   parenUnionArrElemName,
   tyNameOf,
@@ -85,8 +82,6 @@ import {
 import { fnStmtsPosOf } from "./emit_capture_frames"
 import {
   assignTargetReReads,
-  callIsIntrMinMax,
-  captureCountOf,
   captureValKind,
   capturedKindOf,
   catListKindOfExpr,
@@ -122,7 +117,6 @@ import {
   forInMapRecv,
   globalCellKind,
   globalLetOfSidIn,
-  identIsBoundClosure,
   identIsEnvCapture,
   ifJoinAtomMeetsString,
   instanceReadTyOf,
@@ -190,18 +184,10 @@ import {
   vtKindOfParam,
   vtKindOfType,
 } from "./emit_nullable_rets"
-import {
-  tyArmPathHasCloValue,
-  tyArmPathIsCloArray,
-  tyArmPathIsClosure,
-  tyArmPathIsMap,
-  tyArmPathIsMapList,
-  unMemIsFuncReachArray,
-} from "./emit_obj_lit_fits"
+import { tyArmPathIsMap, tyArmPathIsMapList } from "./emit_obj_lit_fits"
 import { ifArmValueExpr, paramTypeNode } from "./emit_query"
 import { TK_STR, rlSlotIsKindList, tyKindOf } from "./emit_ref_list_kinds"
 import { msMemberValKindsOf, nodeRepIs, nullValKind } from "./emit_rep"
-import { refArrElemNameIf } from "./emit_shape_rows"
 import {
   coalesceChainLeftmost,
   coalesceResultIsBox,
@@ -213,10 +199,6 @@ import {
   RLK_I32_LIST,
   fnStmts,
   fnUsesCloEq,
-  modFcpSpillHit,
-  modFcpSpillSeen,
-  modIntMinMaxHit,
-  modIntMinMaxSeen,
   narrowTop,
   rlElemKindTbl,
   sFieldCount,
@@ -229,16 +211,10 @@ import {
   armPathArenaDeclined,
   nodeTyUnionHasMapArm,
   unionArmTys,
-  unionHasClosureArm,
-  unionHasClosureArrayArm,
   unionHasMapArm,
   unionHasMapArrayArm,
 } from "./emit_union_atoms"
-import {
-  StashWant,
-  minMaxRecordedFloat,
-  structIdxHasReboxVariant,
-} from "./emit_union_casts"
+import { StashWant, structIdxHasReboxVariant } from "./emit_union_casts"
 import {
   isUNameAB,
   msMemberAtomsOfSet,
@@ -255,7 +231,6 @@ import {
   unionSetHasNullTy,
 } from "./emit_union_registry"
 import { strListHas } from "./listutil"
-import { strContains } from "./strutil"
 import { sidOfNode } from "./symbols"
 import { nameIsQuotedLeaf } from "./tyname"
 import { tyStepElem } from "./tyquery"
@@ -1751,214 +1726,6 @@ export function callSpillsFcpArg(ix: i32): boolean {
   !(a is Ident)
 }
 
-// Does the module spill a `fromCodePoints` argument anywhere? The `moduleHasNumCast` twin,
-// reserving the one reference slot by the same linear arena walk and memoised the same way.
-export function moduleHasFcpSpill(): boolean {
-  if modFcpSpillHit { return true }
-  let i = modFcpSpillSeen
-  while i < P.nodes.length {
-    if callSpillsFcpArg(i) {
-      modFcpSpillHit = true
-      return true
-    }
-    i = i + 1
-  }
-  modFcpSpillSeen = P.nodes.length
-  false
-}
-
-// Does the module hold a `min` / `max` that may lower at an integer width? Any intrinsic call
-// `minMaxKind` does not decide as a float from its recorded type, so a generic body's call
-// reserves the frame for its instances.
-export function moduleHasIntMinMax(): boolean {
-  if modIntMinMaxHit { return true }
-  let i = modIntMinMaxSeen
-  while i < P.nodes.length {
-    if callIsIntrMinMax(i, -1) && minMaxRecordedFloat(i) == "" {
-      modIntMinMaxHit = true
-      return true
-    }
-    i = i + 1
-  }
-  modIntMinMaxSeen = P.nodes.length
-  false
-}
-
-// True if the statement/expression tree at `ix` contains a function-value call (a `Call`
-// whose callee is a closure value rather than a known function name) — so the function
-// needs the closure scratch slot for `call_ref`.
-export function blockHasCallRef(ix: i32, fnIx: i32) {
-  if ix < 0 { return false }
-  const n = nodeAt(ix)
-  match n {
-    Call => {
-      if n.callFn < 0 { return false }
-      const callee = nodeAt(n.callFn)
-      let isVal = false
-      // A call by name to a module function with no captures is a plain `call`: no frame.
-      let isDirect = false
-      if callee is Ident {
-        let t = fnIndexOfNode(n.callFn)
-        // A live closure binding of the name is what the call denotes, so the frame needs
-        // the scratch even though a module function carries the name — without it the
-        // `call_ref` spills into a local the vector never declared (D1602).
-        if t >= 0 && identIsBoundClosure(callee.identName, fnIx) { t = -1 }
-        if t < 0 {
-          if exprIsClosure(n.callFn, fnIx) { isVal = true }
-          // `t()` where `t` is a union binding with a bare-closure arm: the `is`-narrowing
-          // that makes `t` a closure isn't active in this pre-pass, so reserve conservatively.
-          if !isVal && calleeIsUnionClosureIdent(n.callFn, fnIx) {
-            isVal = true
-          }
-        } else {
-          // A direct call to a capturing function is lowered via call_ref too.
-          if captureCountOf(t) > 0 { isVal = true } else { isDirect = true }
-        }
-      } else {
-        if exprIsClosure(n.callFn, fnIx) { isVal = true }
-        // `p[0]()` where `p` is a union with a closure-array arm: the `is`-narrowing needed to
-        // see it isn't active in this pre-pass, so reserve conservatively (a spare local is harmless).
-        if !isVal && calleeIsUnionClosureArrayIndex(n.callFn, fnIx) {
-          isVal = true
-        }
-        // `t0.f[0]()` through a union struct-arm's closure-array field: same pre-pass
-        // narrowing gap, reserved conservatively (the indexed-member twin of the arm above).
-        if !isVal && calleeIsUnionArmCloArrayIndex(n.callFn, fnIx) {
-          isVal = true
-        }
-        // `t0.f.f()` through a union struct-arm's closure-field chain: same gap, reserved
-        // conservatively — an unreserved `call_ref` would spill into the next frame's local.
-        if !isVal && calleeIsUnionArmClosureMember(n.callFn, fnIx) {
-          isVal = true
-        }
-        // `t0[0].f()` where `t0`'s union has a ref-array arm whose element struct carries a
-        // closure field — the indexed-element-field twin of the arms above.
-        if !isVal && calleeIsUnionElemFieldClosure(n.callFn, fnIx) {
-          isVal = true
-        }
-      }
-      // The typed-IR net for any callee spelling the syntactic classifiers above miss: the
-      // checker records every callee's own checked type, so one that types as a closure
-      // reserves the scratch regardless of shape or depth — covering narrowed callees the
-      // syntactic union-closure chain above cannot see. Over-reservation is harmless.
-      if !isVal && !isDirect {
-        const cty = nodeTyIxOf(n.callFn)
-        if cty >= 0 {
-          if tyAt(cty) is TyFunc { isVal = true }
-        }
-      }
-      if isVal { return true }
-      if blockHasCallRef(n.callFn, fnIx) { return true }
-      const args = n.callArgs
-      let i = 0
-      while i < args.length {
-        if blockHasCallRef(args[i], fnIx) { return true }
-        i = i + 1
-      }
-      return false
-    }
-    Block => {
-      const stmts = n.blkStmts
-      let i = 0
-      while i < stmts.length {
-        if blockHasCallRef(stmts[i], fnIx) { return true }
-        i = i + 1
-      }
-      return false
-    }
-    LetDecl => {
-      if n.letInit >= 0 { return blockHasCallRef(n.letInit, fnIx) }
-      return false
-    }
-    RetStmt => {
-      if n.retArg >= 0 { return blockHasCallRef(n.retArg, fnIx) }
-      return false
-    }
-    IfStmt => {
-      if blockHasCallRef(n.ifCond, fnIx) { return true }
-      if blockHasCallRef(n.ifThen, fnIx) { return true }
-      if n.ifElse >= 0 { return blockHasCallRef(n.ifElse, fnIx) }
-      return false
-    }
-    WhileStmt => {
-      if blockHasCallRef(n.whileCond, fnIx) { return true }
-      return blockHasCallRef(n.whileBody, fnIx)
-    }
-    ForRange => {
-      if blockHasCallRef(n.frFrom, fnIx) { return true }
-      if blockHasCallRef(n.frTo, fnIx) { return true }
-      if n.frStep >= 0 {
-        if blockHasCallRef(n.frStep, fnIx) { return true }
-      }
-      return blockHasCallRef(n.frBody, fnIx)
-    }
-    ForIn => {
-      if blockHasCallRef(n.fiIter, fnIx) { return true }
-      return blockHasCallRef(n.fiBody, fnIx)
-    }
-    BinExpr => {
-      if blockHasCallRef(n.binLeft, fnIx) { return true }
-      return blockHasCallRef(n.binRight, fnIx)
-    }
-    Unary => {
-      return blockHasCallRef(n.unArg, fnIx)
-    }
-    Paren => {
-      return blockHasCallRef(n.parInner, fnIx)
-    }
-    // An `is` operand (`f(x) is i32`) may itself be a function-value call — without this the
-    // closure scratch slot (`callRefSlot`) goes unreserved and the inline `call_ref` reads a
-    // non-existent local 0.
-    IsExpr => {
-      return blockHasCallRef(n.isObj, fnIx)
-    }
-    AsExpr => {
-      return blockHasCallRef(n.asObj, fnIx)
-    }
-    Member => {
-      return blockHasCallRef(n.memObj, fnIx)
-    }
-    // A `?.` RECEIVER is lowered exactly as a `.` one is (`emitOptChainIsNull` emits it), so a
-    // function-value call under it needs the same slot; without this arm the `call_ref` spills
-    // into a local the vector never declared (D1667).
-    OptMember => {
-      return blockHasCallRef(n.omObj, fnIx)
-    }
-    Index => {
-      if blockHasCallRef(n.idxArr, fnIx) { return true }
-      return blockHasCallRef(n.idxIndex, fnIx)
-    }
-    ObjLit => {
-      const fields = n.objFields
-      let i = 0
-      while i < fields.length {
-        const f = nodeAt(fields[i])
-        if f is FieldInit {
-          if blockHasCallRef(f.fiValue, fnIx) { return true }
-        }
-        i = i + 1
-      }
-      return false
-    }
-    // A spread's source is an operand like any other (D2334).
-    Spread => {
-      return blockHasCallRef(n.spdArg, fnIx)
-    }
-    ArrayLit => {
-      const elems = n.arrElems
-      let i = 0
-      while i < elems.length {
-        if blockHasCallRef(elems[i], fnIx) { return true }
-        i = i + 1
-      }
-      return false
-    }
-    // Any other node holds no call this walk descends into.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
-  }
-  false
-}
-
 // True if the expression at `exprIx` is a multi-field struct-returning call — a
 // non-re-readable source, since a call can't be re-evaluated per field — whose result
 // shape must be re-boxed into a variant-box union arm, the one case
@@ -2009,7 +1776,7 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
 }
 
 // Whether the tree at `ix` holds a node needing the `want` stash, so the function reserves
-// its slot. Mirrors `blockHasCallRef`'s traversal; under-reserving the rebox slot fails
+// its slot. Walks every statement and expression kind; under-reserving the rebox slot fails
 // loudly and the `?.` one is invalid wasm, so the walk over-approximates for both.
 export function blockHasStash(ix: i32, fnIx: i32, want: StashWant): boolean {
   if ix < 0 { return false }
@@ -2650,208 +2417,6 @@ export function unionStructArmMapListElemIndex(exprIx: i32, fnIx: i32) {
       mi = mi + 1
     }
     return false
-  }
-  false
-}
-
-// True if `exprIx` is `p[0]` where `p` is a union IDENT whose union has a closure-array arm —
-// the callee shape `blockHasCallRef` reserves `callRefSlot` for (the narrowing-blind pre-pass).
-function calleeIsUnionClosureArrayIndex(exprIx: i32, fnIx: i32) {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Index {
-    const arr = nodeAt(unwrapParen(e.idxArr))
-    if arr is Ident {
-      const un = unionNameOfIdentAt(
-        sidOfNode(unwrapParen(e.idxArr)),
-        fnIx,
-        unwrapParen(e.idxArr),
-      )
-      if un != "" { return unionHasClosureArrayArm(un) }
-    }
-  }
-  false
-}
-
-// `t0[0].f()` where `t0`'s union has a ref-array arm whose element struct carries a
-// closure field: the `is`-narrowing that makes `t0` the ref array is not active in this
-// frame pre-pass, so `exprIsClosure` is false and `callRefSlot` must be reserved
-// conservatively, or an unreserved `call_ref` spill shares the next frame's local — invalid wasm.
-export function calleeIsUnionElemFieldClosure(exprIx: i32, fnIx: i32) {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Member {
-    const ix = nodeAt(unwrapParen(e.memObj))
-    if ix is Index {
-      const arr = nodeAt(unwrapParen(ix.idxArr))
-      if arr is Ident {
-        const un = unionNameOfIdentAt(
-          sidOfNode(unwrapParen(ix.idxArr)),
-          fnIx,
-          unwrapParen(ix.idxArr),
-        )
-        if un != "" {
-          const atoms: string[] = []
-          // The deliberately-conservative `strContains(elem, "=>")` arm test is a
-          // reachability question — `unMemIsFuncReachArray` asks it of the arena (a
-          // `TyArray` whose element structure reaches a `TyFunc`) instead of the rendered spelling.
-          const mems: i32[] = []
-          if unionArmTys(un, atoms, mems) {
-            let m = 0
-            while m < mems.length {
-              if unMemIsFuncReachArray(mems[m]) { return true }
-              m = m + 1
-            }
-            return false
-          }
-          let i = 0
-          while i < atoms.length {
-            const a = atoms[i]
-            // `refArrElemNameIf` IS the `nameIsRefArray` gate plus the element read;
-            // a non-ref-array atom yields "" and `strContains("", "=>")` is false, so
-            // dropping the conjunct is exact.
-            if a != "null" && valueAtomKind(a) < 0 {
-              if strContains(refArrElemNameIf(a), "=>") { return true }
-            }
-            i = i + 1
-          }
-        }
-      }
-    }
-  }
-  false
-}
-
-// True if `exprIx` is an ident whose declared union has a bare-closure arm — the callee shape
-// `blockHasCallRef` reserves `callRefSlot` for, since the `is`-narrowing that makes the ident
-// a closure is not active during the narrowing-blind frame pre-pass. The bare-binding
-// analogue of `calleeIsUnionClosureArrayIndex`.
-export function calleeIsUnionClosureIdent(exprIx: i32, fnIx: i32) {
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Ident {
-    const un = unionNameOfIdentAt(
-      sidOfNode(unwrapParen(exprIx)),
-      fnIx,
-      unwrapParen(exprIx),
-    )
-    if un != "" { return unionHasClosureArm(un) }
-    // A rebind of a union-arm field union: the binding's own union name resolves "" here,
-    // so walk the init chain to the member's field table — a closure field or a union-box
-    // field with a closure arm means the narrowed `call_ref` needs its scratch.
-    // Reservation-only; without it the closure spill indexed an unreserved local — invalid wasm.
-    return identRebindUnionArmClosureField(e.identName, fnIx, 4)
-  }
-  false
-}
-
-// True when local `name`'s let-init chain (rebinds followed up to `depth`) bottoms out at
-// a member chain rooted at a union-typed ident whose arm field path leafs at a closure
-// field (code 14/22) or a closure-armed union-box field (code 16) — the rebound-binding
-// dual of `calleeIsUnionArmClosureMember`, for `blockHasCallRef`'s reservation.
-function identRebindUnionArmClosureField(
-  name: string,
-  fnIx: i32,
-  depth: i32,
-): boolean {
-  if depth <= 0 { return false }
-  const initIx = fnLetInitOf(fnIx, name)
-  if initIx < 0 { return false }
-  const init = nodeAt(initIx)
-  match init {
-    Ident => {
-      return identRebindUnionArmClosureField(init.identName, fnIx, depth - 1)
-    }
-    Member => {
-      const path: string[] = []
-      const cur = memberChainPath(initIx, path)
-      if cur < 0 { return false }
-      const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
-      if un == "" { return false }
-      const atoms: string[] = []
-      // D-UNION: the arm walk is structural (`tyArmPathHasCloValue` — a `TyFunc` leaf,
-      // bare / nullable, or a `TyUnion` with a `TyFunc` member).
-      const mems: i32[] = []
-      // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
-      // second walk over the arms' rendered spellings.
-      if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
-      let m = 0
-      while m < mems.length {
-        if atoms[m] != "null" {
-          if tyArmPathHasCloValue(mems[m], path) { return true }
-        }
-        m = m + 1
-      }
-      return false
-    }
-    // Any other init is no rebind and no member chain.
-    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
-  }
-  false
-}
-
-// True if `exprIx` is a member chain rooted at an ident declared as a union, whose field
-// path walks — narrowing-blindly through the arms' field tables — to a closure field
-// (code 14, or the nullable-closure niche 22). The callee shape `blockHasCallRef` reserves
-// `callRefSlot` for, since without it the closure spill falls on an unreserved index — invalid wasm.
-export function calleeIsUnionArmClosureMember(exprIx: i32, fnIx: i32) {
-  if !uDeclared {
-    return false // no unions declared — nothing to probe (cheap bail)
-  }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Member {
-    const path: string[] = []
-    const cur = memberChainPath(unwrapParen(exprIx), path)
-    if cur < 0 { return false }
-    const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
-    if un == "" { return false }
-    const atoms: string[] = []
-    // D-UNION: the arm walk is structural (`tyArmPathIsClosure` — a `TyFunc` leaf, bare
-    // or under the nullable-closure niche's `TyNullable`).
-    const mems: i32[] = []
-    // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
-    // second walk over the arms' rendered spellings.
-    if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
-    let m = 0
-    while m < mems.length {
-      if atoms[m] != "null" {
-        if tyArmPathIsClosure(mems[m], path) { return true }
-      }
-      m = m + 1
-    }
-    return false
-  }
-  false
-}
-
-// Walks field path `path` from union arm `arm`: the first hop resolves through the arm's
-// struct-table or variant-table row, each mid hop must be a code-15 nested-struct field,
-// and the last hop is a closure field (code 14/22) — used for the index whose receiver is
-// a member chain rooted at a union ident, needing `blockHasCallRef`'s reservation.
-export function calleeIsUnionArmCloArrayIndex(exprIx: i32, fnIx: i32) {
-  if !uDeclared { return false }
-  const e = nodeAt(unwrapParen(exprIx))
-  if e is Index {
-    const m = nodeAt(unwrapParen(e.idxArr))
-    if m is Member {
-      const path: string[] = []
-      const cur = memberChainPath(unwrapParen(e.idxArr), path)
-      if cur < 0 { return false }
-      const un = unionNameOfIdentAt(sidOfNode(cur), fnIx, cur)
-      if un == "" { return false }
-      const atoms: string[] = []
-      // D-UNION: the arm walk is structural (`tyArmPathIsCloArray` — a `TyArray` over a
-      // `TyFunc` leaf).
-      const mems: i32[] = []
-      // The arena declining is answered conservatively by `armPathArenaDeclined`, not by a
-      // second walk over the arms' rendered spellings.
-      if !unionArmTys(un, atoms, mems) { return armPathArenaDeclined() }
-      let mi = 0
-      while mi < mems.length {
-        if atoms[mi] != "null" {
-          if tyArmPathIsCloArray(mems[mi], path) { return true }
-        }
-        mi = mi + 1
-      }
-      return false
-    }
   }
   false
 }

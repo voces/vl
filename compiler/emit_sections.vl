@@ -310,14 +310,11 @@ import {
   fnStmts,
   fnUsesArrNew,
   fnUsesAtomStage,
-  fnUsesCallRef,
   fnUsesCloEq,
   fnUsesCoalesceCall,
   fnUsesF32Push,
   fnUsesF64Push,
-  fnUsesFcpSpill,
   fnUsesI64Push,
-  fnUsesIntMinMax,
   fnUsesListEqI,
   fnUsesListEqS,
   fnUsesListGet,
@@ -326,14 +323,12 @@ import {
   fnUsesMapKeys,
   fnUsesMapVals,
   fnUsesNulStrPush,
-  fnUsesNumCast,
   fnUsesOptRecv,
   fnUsesPush,
   fnUsesRefPush,
   fnUsesStrOp,
   fnUsesStrPush,
   fnUsesU8Push,
-  fnUsesUnionAs,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
@@ -481,14 +476,6 @@ import {
   mfSrcSlots,
   mkArrIdx,
   mkListIdx,
-  modFcpSpillHit,
-  modFcpSpillSeen,
-  modIntMinMaxHit,
-  modIntMinMaxSeen,
-  modNumCastHit,
-  modNumCastSeen,
-  modUnionAsHit,
-  modUnionAsSeen,
   monoHoleSubN,
   monoHoleSubRow,
   monoHoleSubT,
@@ -732,7 +719,6 @@ import {
   inferredRetKindCore,
 } from "./emit_fn_ret_kinds"
 import {
-  blockHasCallRef,
   blockHasMapOp,
   blockHasStash,
   blockHasStrOp,
@@ -749,8 +735,6 @@ import {
   fnUnionRetSinkOk,
   globalInitIsLitAtom,
   globalInitWidensAtomToStr,
-  moduleHasFcpSpill,
-  moduleHasIntMinMax,
 } from "./emit_fn_scans"
 import {
   letIsLitUnion,
@@ -833,8 +817,6 @@ import {
   asExprNumFallible,
   asExprNumTgtName,
   fnHasMap,
-  moduleHasNumCast,
-  moduleHasUnionAs,
 } from "./emit_union_casts"
 import { printPlanReset, unionRegistryABSweep } from "./emit_union_registry"
 import { unTyKeyShadowSweep } from "./emit_union_tykey"
@@ -1244,7 +1226,7 @@ function checkParams(fnIx: i32) {
 // local count. The run helpers stream straight to `curBuf` (bind it with `wTarget` first); each emits the `1` count then a valtype.
 
 // Clears the per-function scratch flags and slot lists `emitFuncCode` sets before laying out a
-// body; the module-wide ones (`moduleHasUnionAs` and its kin) are recomputed here.
+// body.
 function resetFnScratchFlags() {
   fnUsesPush = false
   fnUsesRefPush = false
@@ -1260,15 +1242,6 @@ function resetFnScratchFlags() {
   fnUsesArrNew = false
   fnUsesCoalesceCall = false
   fnUsesMap = false
-  // A function-value call (`call_ref`) anywhere in the body reserves the closure
-  // scratch slot. Only detected when a function value exists module-wide (lambdas).
-  fnUsesCallRef = false
-  fnUsesUnionAs = moduleHasUnionAs()
-  // The numeric exact-or-fail staging slots, module-wide for `moduleHasUnionAs`'s reason.
-  fnUsesNumCast = moduleHasNumCast()
-  // The `fromCodePoints` argument spill, module-wide for the same reason.
-  fnUsesFcpSpill = moduleHasFcpSpill()
-  fnUsesIntMinMax = moduleHasIntMinMax()
   fnUsesVariantRebox = false
   fnUsesOptRecv = false
   fnUsesListGet = false
@@ -1962,11 +1935,6 @@ function fnDetectScratch(fnIx: i32) {
     // `fnHasMap` only scans locals/params; also reserve the frame when a map op runs
     // on a global struct-field map-array element (e.g. `T.scopes[top][k] = v`).
     if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
-    if fnValUsed {
-      if !fnUsesCallRef {
-        if blockHasCallRef(fn.fnBody, fnIx) { fnUsesCallRef = true }
-      }
-    }
     // A multi-field call result re-boxed into a variant-box union arm stashes the call
     // in the `variantReboxSlot` (a call cannot be re-read per field).
     if !fnUsesVariantRebox {
@@ -2107,13 +2075,6 @@ function startFnDetectFrames() {
   fnUsesArrNew = false
   fnUsesCoalesceCall = false
   fnUsesMap = false
-  fnUsesCallRef = false
-  // The union-`as` box slot is module-wide (see `moduleHasUnionAs`), so the start fn and the
-  // global initializers reserve it on the same condition every function body does.
-  fnUsesUnionAs = moduleHasUnionAs()
-  fnUsesNumCast = moduleHasNumCast()
-  fnUsesFcpSpill = moduleHasFcpSpill()
-  fnUsesIntMinMax = moduleHasIntMinMax()
   fnUsesVariantRebox = false
   fnUsesOptRecv = false
   fnUsesListGet = false
@@ -2226,9 +2187,6 @@ function startFnDetectScratch() {
         if exprHasScratch(ix, "arrNew") { fnUsesArrNew = true }
         if exprHasScratch(ix, "coalesceCall") { fnUsesCoalesceCall = true }
         if exprHasMapOp(ix, -1) { fnUsesMap = true }
-        if fnValUsed {
-          if blockHasCallRef(ix, -1) { fnUsesCallRef = true }
-        }
         collectMemberPopRefSlotsExpr(ix, -1)
         // A `.map`/`.filter` in a non-const global initializer (`const ys =
         // xs.map(...)`) runs in the start function — reserve its HOF frame here.
@@ -2251,13 +2209,6 @@ function startFnDetectScratch() {
   let si = 0
   while si < startStmts.length {
     const st = nodeAt(startStmts[si])
-    // The function-value call frame is detected over the whole statement, ahead of the shape split
-    // below: `blockHasCallRef` recurses into an `if`/`while`/`for` body itself, whereas
-    // `startScanBlock`/`startScanIf` run only the walkers that do not. A closure call nested in a
-    // top-level block needs the frame exactly as a bare top-level call does.
-    if fnValUsed {
-      if blockHasCallRef(startStmts[si], -1) { fnUsesCallRef = true }
-    }
     if st is ForRange {
       // The whole HEAD — bounds and step alike — is part of the start function's body, and
       // nothing scans it by default: `for i in 0 to (g(2) ?? 0) { }` at module scope would
@@ -7686,18 +7637,6 @@ function emitProgramReset(rootIx: i32) {
   bodyRebuiltFrom = Map()
   monoHoleSubN = []
   monoHoleSubT = []
-  // The module-predicate memo (`moduleHasUnionAs`/`moduleHasNumCast`) is keyed on an arena
-  // prefix, so it needs the same per-compile clear: the next program's arena can be longer
-  // than this one's, and a surviving `…Seen` would start the scan inside a prefix that
-  // belongs to nobody. Cleared here, not beside `P.nodes = []`, since every read is inside `emitProgram`.
-  modUnionAsSeen = 0
-  modUnionAsHit = false
-  modNumCastSeen = 0
-  modNumCastHit = false
-  modFcpSpillSeen = 0
-  modFcpSpillHit = false
-  modIntMinMaxSeen = 0
-  modIntMinMaxHit = false
   typeDeclNameIxReset()
   callsByCalleeReset()
   tyRegMemoReset()
