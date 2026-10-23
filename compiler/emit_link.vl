@@ -40,6 +40,7 @@ import {
   fnParent,
   fnStmts,
   gCellIdx,
+  gEqHelpTy,
   gFoldAt,
   gFoldLen,
   gFoldOk,
@@ -50,6 +51,9 @@ import {
   gInitGuard,
   gLowMemUnused,
   gMapDeletes,
+  gMapSetTy,
+  gMapSetTyBase,
+  gMapSetTyN,
   gOptimized,
   gStrPoolIx,
   gStrPoolTexts,
@@ -88,6 +92,7 @@ import {
   link,
   linkArtHash,
   linkFactsKey,
+  linkFnHash,
   linkPieceHash,
   linkProgHash,
 } from "./link"
@@ -105,7 +110,7 @@ import { initGuardGlobalText, userGlobalIdx } from "./wasmEmit"
 
 // A scratch control sets this to `k`, so the split forgets every `k`th row.
 const LINK_DROP_EVERY = 0
-const LINK_VERSION = 2
+const LINK_VERSION = 3
 
 // The literals each `is` test pools, by node, noted while the pool is collected, and how
 // many nodes the arena held then: a literal the emitter makes later is no module's own.
@@ -266,7 +271,7 @@ export function emitLinkSection(
   }
   for fe in thunkFes { fKey.push("t:" + fnKeys[fe]) }
   tyS = typeSitesOf(mb)
-  elTyKeys(n)
+  elTyKeys(n, elRtSigOwners(ids, st, en, n, nfImp, rowKeys))
   const fnTys = elFnTypes(ids, st, en)
   si = 0
   while si < ids.length {
@@ -450,7 +455,9 @@ export function emitLinkSection(
   }
   k = g + n
   while k < tyS.entS.length {
-    prog.runtime.sigs.push(elSpan(tyS.entS[k], tyS.entE[k]))
+    prog.runtime.sigs.push(
+      { key: tyKey[k], def: elSpan(tyS.entS[k], tyS.entE[k]) },
+    )
     k = k + 1
   }
   elDemands(prog, arts)
@@ -707,9 +714,9 @@ function elTyKeyOf(v: i32): string {
 }
 
 // Each type index's symbol: a heap type of the first group by the canonical key the order
-// pass gave it, a function's own signature by its function, a runtime signature by its
-// position.
-function elTyKeys(n: i32) {
+// pass gave it, a function's own signature by its function, and a runtime signature by its
+// owner in `own`, or by its position when it has none.
+function elTyKeys(n: i32, own: string[]) {
   tyKey = []
   const g = tyS.group
   let t = 0
@@ -718,15 +725,104 @@ function elTyKeys(n: i32) {
     if k == "" { tyKey.push("?g" + i32ToStr(t)) } else { tyKey.push(k) }
     t = t + 1
   }
+  const used: { [string]: boolean } = Map()
   let r = 0
   while g + r < tyS.entS.length {
     if r < n {
       tyKey.push("F:" + fKey[gImports + r])
     } else {
-      tyKey.push("F:rt#" + i32ToStr(r - n))
+      let k = ""
+      if r - n < own.length { k = own[r - n] }
+      if k == "" || (used[k] ?? false) { k = "sig#" + i32ToStr(r - n) }
+      used[k] = true
+      tyKey.push("F:" + k)
     }
     r = r + 1
   }
+  0
+}
+
+// Each runtime signature's owner: the first function import, then the first function past
+// the user ones, whose entry names it; else the map store or record compare row that
+// reserved it; else "".
+function elRtSigOwners(
+  ids: i32[],
+  st: i32[],
+  en: i32[],
+  n: i32,
+  nfImp: i32,
+  rows: { [string]: string },
+): string[] {
+  const base = tyS.group + n
+  const own: string[] = []
+  while base + own.length < tyS.entS.length { own.push("") }
+  let si = 0
+  while si < ids.length {
+    if ids[si] == 2 { elImportOwners(st[si], en[si], base, own) }
+    if ids[si] == 3 {
+      const c = wcNew(mb, st[si], en[si])
+      const cnt = wcU32(c)
+      let i = 0
+      while i < cnt && !c.failed {
+        const v = wcU32(c)
+        if i >= n { elOwn(own, v - base, elFKey(nfImp + i)) }
+        i = i + 1
+      }
+    }
+    si = si + 1
+  }
+  let r = 0
+  while r < gMapSetTy.length {
+    if gMapSetTy[r] >= 0 {
+      const nm = "__map_set_" + i32ToStr(r) + "__"
+      elOwn(own, gMapSetTyBase + gMapSetTy[r] - base, "rt:" + (rows[nm] ?? nm))
+    }
+    r = r + 1
+  }
+  r = 0
+  while r < gEqHelpTy.length {
+    if gEqHelpTy[r] >= 0 {
+      const nm = "__eq_" + i32ToStr(r) + "__"
+      const v = gMapSetTyBase + gMapSetTyN + gEqHelpTy[r]
+      elOwn(own, v - base, "rt:" + (rows[nm] ?? nm))
+    }
+    r = r + 1
+  }
+  own
+}
+
+// Owns each runtime signature a function import names, by the import's key.
+function elImportOwners(s: i32, e: i32, base: i32, own: string[]) {
+  const c = wcNew(mb, s, e)
+  const cnt = wcU32(c)
+  let fi = 0
+  let i = 0
+  while i < cnt && !c.failed {
+    elImpName(c)
+    elImpName(c)
+    const kind = wcByte(c)
+    if kind == 0 {
+      elOwn(own, wcU32(c) - base, elFKey(fi))
+      fi = fi + 1
+    } else if kind == 1 {
+      wcValType(c)
+      elLimits(c)
+    } else if kind == 2 {
+      elLimits(c)
+    } else if kind == 3 {
+      wcValType(c)
+      wcSkip(c, 1)
+    } else {
+      wcSkip(c, 1)
+      wcU32(c)
+    }
+    i = i + 1
+  }
+  0
+}
+
+function elOwn(own: string[], r: i32, key: string) {
+  if r >= 0 && r < own.length && own[r] == "" { own[r] = key }
   0
 }
 
@@ -971,7 +1067,8 @@ function elExports(
 
 // The `vl.link` section: the version, the counts, how many sections and bodies the linked
 // module differs from the emitted one in, the holes, the program digest and the facts the link
-// decided, then each artifact's path, digest and key facts.
+// decided, each artifact's path, digest and key facts, then each runtime function's key and
+// digest.
 function elWrite(
   out: LinkOut,
   ids: i32[],
@@ -1081,6 +1178,11 @@ function elWrite(
     wULEB(a.fns.length + a.lifted.length)
     wSLEB(linkArtHash(a))
     elStr(linkFactsKey(a.facts))
+  }
+  wULEB(prog.runtime.fns.length)
+  for f in prog.runtime.fns {
+    elStr(f.key)
+    wSLEB(linkFnHash(f))
   }
   wTarget(prev)
   wSection(0, payload)
@@ -1241,7 +1343,7 @@ function elDemands(prog: LinkProg, arts: LinkArt[]) {
   const rt = prog.runtime
   const ps = elArtPieces(rt)
   for f in prog.tail { elFnPieces(f, ps) }
-  for x in rt.sigs { ps.push(x) }
+  for x in rt.sigs { ps.push(x.def) }
   for x in rt.tags { ps.push(x) }
   for x in prog.secs { ps.push(x.b) }
   elDemand(rt, ps, defs, ixOf, tyDone)
