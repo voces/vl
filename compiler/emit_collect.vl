@@ -736,7 +736,7 @@ import {
   leqCoreKindOfAtomKind,
   nulFieldInnerCode,
 } from "./emit_eq_rows"
-import { nameIsWholeSpanShape } from "./emit_field_codes"
+import { nameIsWholeSpanShape, variantRowOfShapeTy } from "./emit_field_codes"
 import {
   cloSigPosOfKey,
   criSettleNonNullRecordRet,
@@ -997,6 +997,8 @@ import {
 import {
   intLitUnionBasesOf,
   isNullTy,
+  nonNullTy,
+  nullableInnerOrNone,
   primNameOf,
   tyEmitPrimOf,
   tyHasTyVar,
@@ -2862,7 +2864,7 @@ function internCloSigOfAtomTy(atom: string, kIn: string, ty: i32) {
   let k = kIn
   if k == "" { k = unionArmSigKeyTy(atom, ty) }
   if k == "" { return 0 }
-  if nulCloMixedUnionUnregistered(atom) { return 0 }
+  if nulCloMixedUnionUnregistered(atom, ty) { return 0 }
   internCloSigKey(k, -1)
 }
 
@@ -3666,20 +3668,20 @@ function buildFnMapClassifyRow(i: i32, s: FuncDecl, li: i32) {
       // type the checker banked. Any string-keyed map, not just the i32-valued one, and
       // ahead of `inferNulStructRow`, which would otherwise resolve a map as a struct row.
       fRetKind[li] = "nulmap"
-    } else if inferNulVariantRow(inm) >= 0 {
+    } else if inferNulVariantRow(retTyIx) >= 0 {
       // D1562 — a nullable union-variant inferred return, the twin the `nulstruct` arm below
       // never had. Ahead of `nulstruct`, which is the annotated ladder's order:
       // `retAnnKindChain` is last-match-wins and puts the variant after the ref, and this
       // chain is first-match-wins, so mirroring that precedence means going first.
       fRetKind[li] = "nulvariant"
-      fRetStructIdx[li] = inferNulVariantRow(inm)
-    } else if inferNulStructRow(inm) >= 0 {
+      fRetStructIdx[li] = inferNulVariantRow(retTyIx)
+    } else if inferNulStructRow(retTyIx) >= 0 {
       // D887 — a nullable-struct inferred return, the same pair the annotated path stores
       // (`retNulRefFlag` -> `"nulstruct"` + `retStructIndex`), read off the name the checker
       // recorded, so all four owners of a return row read one answer. Ahead of the two union
       // arms below because the row is a nullable; both decline anyway.
       fRetKind[li] = "nulstruct"
-      fRetStructIdx[li] = inferNulStructRow(inm)
+      fRetStructIdx[li] = inferNulStructRow(retTyIx)
     } else if inferRetIsValueUnionAt(inRow, inm) {
       fRetKind[li] = "union"
     } else if (inferRetIsUnionAt(inRow, inm) && !inferRetIsLitUnionAt(inRow)) {
@@ -3840,24 +3842,22 @@ export function computeVoidFns() {
   0
 }
 
-// D887 — the struct row an inferred-return name's nullable part occupies, or -1. The name is
-// the checker's own render, so a declared inner arrives as its nominal name and an inline shape
-// as the emitter-format text, and `structIndexOfTypeName` resolves both onto the row the
-// annotated spelling keys. -1 for a non-nullable name and for a part naming no row.
-function inferNulStructRow(inm: string): i32 {
-  const part = nullablePartOf(inm)
-  if part == "" { return -1 }
-  structIndexOfTypeName(part)
+// The non-null part of inferred return type `rt` when it is nullable, else -1.
+function inferNulInnerTy(rt: i32): i32 {
+  if nullableInnerOrNone(rt) < 0 { return -1 }
+  nonNullTy(rt)
 }
 
-// D1562 — the variant row an inferred-return name's nullable part occupies, or -1: the twin of
+// D887 — the struct row the non-null part of inferred return type `rt` occupies, or -1: the
+// type's own row, else the first row of the same type, which is the row the annotated spelling
+// keys. -1 for a non-nullable return and for a part with no row.
+function inferNulStructRow(rt: i32): i32 { structRowOfTy(inferNulInnerTy(rt)) }
+
+// D1562 — the variant row the non-null part of `rt` occupies, or -1: the twin of
 // `inferNulStructRow` one index space over. `collectS` gives a union arm no struct row, so the
-// struct twin answers -1 for every `Circle | null`. `variantIndexOf` is the same lookup the
-// annotated spelling's `nulVariantIndexOf` ends at, so the two faces name one row.
-function inferNulVariantRow(inm: string): i32 {
-  const part = nullablePartOf(inm)
-  if part == "" { return -1 }
-  variantIndexOf(part)
+// struct twin answers -1 for every `Circle | null`; a record an arm adopted names that arm.
+function inferNulVariantRow(rt: i32): i32 {
+  variantRowOfShapeTy(inferNulInnerTy(rt))
 }
 
 // The struct row of the result the checker gave function `i`, for a function the expression
@@ -14660,23 +14660,34 @@ function mapCallStructResultRow(callIx: i32): i32 {
   -1
 }
 
-// True when the nul-closure arm's result is a mixed scalar+composite union that no
-// registration path admitted (not a registered alias, value union, litunion-arm value
-// union, or map-member union). Such a union has no pin/box path, so its synthetic `>u`
-// `$fnsig` must not intern — the call site rejects loudly instead of cast-trapping.
-function nulCloMixedUnionUnregistered(arm: string) {
+// True when the nul-closure arm's result is a mixed scalar+composite union no registration
+// path admitted, so it has no pin/box path and its `>u` `$fnsig` must not intern (the call
+// site rejects loudly). `ty` is the arm's arena type or -1; a literal-union atom is told by
+// its member type, and an atom with no type counts as composite.
+function nulCloMixedUnionUnregistered(arm: string, ty: i32) {
   const res = cloResultAtomOf(arm)
   if res == "" { return false }
   const atoms: string[] = []
   unionSetAtomsOf(res, atoms)
   if atoms.length < 2 { return false }
+  let rt = ty
+  if rt >= 0 {
+    const nt = tyAt(rt)
+    if nt is TyNullable { rt = nt.nInner }
+  }
+  if rt >= 0 {
+    const ft = tyAt(rt)
+    if ft is TyFunc { rt = ft.fnRet } else { rt = -1 }
+  }
+  const tys: i32[] = []
+  unionAtomTysOf(rt, atoms, tys)
   let hasScalar = false
   let hasComposite = false
   let i = 0
   while i < atoms.length {
     const a = atoms[i]
     if a != "null" {
-      if valueAtomKind(a) >= 0 || nameIsLitUnionType(a) {
+      if valueAtomKind(a) >= 0 || (tys[i] >= 0 && tyIsLitUnion(tys[i])) {
         // A closure atom is value-atom kind 11 but composes like a ref — count only
         // the non-closure value atoms as the scalar side of the mix test.
         if nameIsFuncTypeAtom(a) {

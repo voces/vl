@@ -44,8 +44,8 @@ worked carries a `status` field as well, saying what moved and why the rest stay
 - `nameIsRefArray` with a type in hand is still **D**. The ref-list kind ladder answers through
   the struct and union tables by spelling, and its arena twin `tyElemIsRefListElem` admits more
   than it does (L6 log, 2026-10-20).
-- `inferNulStructRow` and `inferNulVariantRow` are **D**, because `structIndexOfTy` disagrees with
-  the spelling lookup on inline shapes (#4466).
+- `structIndexOfLet`'s nullable rung is **D**, because every typed struct lookup disagrees with
+  the spelling on inline shapes; `structRowOfTy` comes closest (D6).
 
 ## Totals
 
@@ -133,10 +133,10 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
-| D6 | struct and variant rows of inline shapes by type | 12 | 0 / 0 / 12 | 3 / 9 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
+| D5 | union registry by type (step 5 remainder) (landed: 3 retired, 18 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 3 retired, 15 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -455,9 +455,54 @@ What each slice changes:
     the instance key and `monoAnnPinName` read, so it moves with D3's ladder.
 - **D5.** This is the L6 step-5 remainder. The union registry is asked by type at the 13 files
   that still pass a spelling.
+
+  A probe compared the spelling's answer with the type's at every entry, over the self-compile
+  and 16,803 fixture and corpus files. Counts are files, and a file can hold both an agreeing and
+  a differing case.
+  - Done: 1 render and 2 parses. `registerSharedReadUnion` registers under
+    `valueUnionKeyTextOfTy`, the key's own text when the type is a value union: the gate differed
+    in 0 of 73 files and the name in 0 of the 5 that register. `nulCloMixedUnionUnregistered`
+    takes the arm's type and asks `tyIsLitUnion` of each atom's member type: 0 differ in 40, and
+    the 2 with an untyped atom answer false both ways. `unionParamPinName` passes over a row with
+    no type; no file reaches its loop. difftree `--identity` found 0 of 16,448 files differ.
+  - Left: the value-union name readers in `emit_start_block` and `unionNameOfExpr`. The key text
+    differs from the render in 13 files at `coalesceResultUnionName`, 10 at `ifJoinUnionName`
+    and 12 at `valueUnionRenderOfTy`, mostly a union the arena does not call a value union
+    (`i64|i32` with a literal member) and holes. The type-keyed row's name differs more, because
+    a row's member order is its first mint's. `ifJoinUnionNameIn` agrees in all 5 files at its
+    value-union rung, but its nullable-box fallback returns the render, which no file reaches.
+  - Left: `scanPrintUse` adopts a row by the spelling `{v:i32}|{v:string}|null` in 1 file that
+    the key text does not name. `anonUnionFieldName` and `unionNameOfExpr` agree at the
+    value-union rung, but the record rungs still return the render (17 and 9 files differ).
+  - Left: the atom tests. `isVariantBoxUnionAtoms`, `unionStrArmCountOf` and the uncovered-row
+    fallback of `markRefArrayArmsOf` need the spelling where an atom has no arena type (69, 25
+    and 1 files). `pushIndexMapComplement` differs at literal-alias members in 4 files (D8120).
+  - Left, not reached or not probed: `cloCallParamUnionName` and `njStash` (no file reaches
+    them), `shareFieldUnionRow` (the render is the registered key), and the registry's own
+    `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go when rows mint
+    from types.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
-  `structIndexOfLet` answer by type. The blocker is `structIndexOfTy` disagreeing with the spelling
-  lookup on inline shapes (#4466).
+  `structIndexOfLet` answer by type.
+
+  A probe compared the spelling's row with each typed lookup's at every entry, over the
+  self-compile and 16,816 fixture and corpus files. Counts are files. `structIndexOfTy` still
+  disagrees with the spelling on inline shapes after #4466 (48 files at `structIndexOfLet`).
+  - Done: 2 parses. `inferNulStructRow` asks `structRowOfTy` of the non-null part of the banked
+    return type: 2,140 files reach it with a type and 0 differ (`structIndexOfTy` alone differs in
+    3). `inferNulVariantRow` asks `variantRowOfShapeTy`, which is `variantRowOfTy` and then the arm
+    whose own render and type are the record's: 2,141 and 0 (`variantRowOfTy` alone differs in 1,
+    an arm adopted by shape, D4668). The 8,273 files with no banked type have no row by spelling
+    either. difftree `--identity` found 0 of 16,450 files differ.
+  - Left: `structIndexOfLet`'s nullable rung. It differs from `structRowOfTy` in 5 files, from
+    `structIndexOfTy` in 48 and from `repRowOfTyStruct` in 59: the type finds a row for a variant
+    arm (`Circle | null`) the spelling does not, picks a twin row, and finds none for a
+    literal-field shape.
+  - Left: the 3 renders. `internJoinedRecordRow`, `mintUnionFieldObjRow` and `internArmShapeRow`
+    key the shape interner, which interns by spelling (D34 also withholds the arm's type).
+    `mintUnionFieldObjRow`'s `structIndexOfTypeName(nm) < 0` test differs from `structRowOfTy` in
+    14 files and from `repRowOfTyStruct` in 6, so not even its decision moves.
+  - Left: the 6 parses in `mvValNamesCompat` and `shapeFieldTypeCompatK`, inside the name-keyed
+    resolver. They go with `structIndexOfTypeName`, not one by one.
 - **D7.** `narrowVariants` banks a type for multi-member sets, where `narrowSlotTy` is `-1` today.
 
   No new column was needed for the two sites that moved: the slot's member set already holds the
@@ -480,6 +525,27 @@ What each slice changes:
 - **D8.** The mv-slot, closure-signature and field-companion tables are keyed by type. The
   `emit_classify` arm mint withholds its type on purpose (D34), so that entry moves only together
   with the ruling that requires it.
+
+  A probe compared the spelling with the type at nine sites, over the self-compile and 16,803
+  fixture and corpus files. Counts are files.
+  - Done: 3 parses. `annRetKindTy`'s closure rung asks whether the type is a `TyFunc`: reached in
+    2,769 files, differed in 0. `fnRetNulRefArrayNameSid` reads the return type and names the
+    element's ref-list row: 5,248 and 0. Outside that population it closes D3508, where the
+    spelling `Rec2[] | Rec[] | null` hid that the type is one nullable list. `emitArrRef`'s variant fallback asks `variantRowOfTy` of
+    the slot's element type: 398 and 0.
+  - Left: the arrow scans in `annParamKindTy` and `annIsTopLevelFunc`. A parenthesized function
+    spelling, `((i32,i32)=>i32)`, reads as no function while its type is one, in 4 and 8 files.
+    `annIsTopLevelFunc` also has 9 files with neither a tree nor a type.
+  - Left: `annRefListSlot`. `rlSlotOfTy` misses the slot the spelling finds in 72 files at the
+    parameter call and 6 at the result call: nested ref lists, lists of map-valued records, and
+    inline records the spelling adopts. That waits on D1.
+  - Left: the two closure-signature keys in `emit_collect`. The key agrees with `sigKeyOfTy`
+    everywhere but one generic template, and there `nulCloMixedUnionUnregistered` rejects the
+    atom by its spelling. The guard and the result spine's whole-span disjunct still read it.
+  - Left, not probed: the products. These are the field companion renders, the signature-ladder
+    renders, the mv mint key in `mvShapeOfMapNameTys`, `cloArmTagOfTy`'s render, which the link
+    step reads as the `clo:` key, and the two D34 entries. The mv slot stays keyed by spelling,
+    so D2's `mvValKindOfName` callers do not move with it.
 
 **Order.** The five A slices and C4 can start today. C1 waits on L1's bind columns. D1 and D2
 come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam, and D4 lands after D3 and D5.

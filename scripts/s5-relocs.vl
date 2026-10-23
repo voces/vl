@@ -1261,7 +1261,7 @@ function proof(a: string, p: string): i32 {
 
 // The armed link proof's `vl.link` section, per module: the counters `emitLinkSection` writes,
 // the sections the linked module differs in, the program digest and the facts the link decided,
-// and each artifact's digest and key facts.
+// each artifact's digest and key facts, and (version 3) each runtime function's key and digest.
 type LinkRead = {
   n: i32[],
   diffs: i32[],
@@ -1272,6 +1272,8 @@ type LinkRead = {
   paths: string[],
   hashes: i32[],
   keys: string[],
+  rtKeys: string[],
+  rtHashes: i32[],
 }
 
 const LINK_FIELDS = [
@@ -1300,7 +1302,8 @@ function readLink(b: u8[]): LinkRead | null {
       const name = decodeUtf8Lossy(b.slice(sc.pos, sc.pos + nlen))
       sc.pos = sc.pos + nlen
       if name == "vl.link" {
-        if byte(sc) != 2 { return null }
+        const ver = byte(sc)
+        if ver != 2 && ver != 3 { return null }
         const out: LinkRead = {
           n: [],
           diffs: [],
@@ -1311,6 +1314,8 @@ function readLink(b: u8[]): LinkRead | null {
           paths: [],
           hashes: [],
           keys: [],
+          rtKeys: [],
+          rtHashes: [],
         }
         let k = 0
         while k < LINK_FIELDS.length {
@@ -1350,6 +1355,15 @@ function readLink(b: u8[]): LinkRead | null {
           out.hashes.push(s32(sc))
           out.keys.push(str(sc))
           k = k + 1
+        }
+        if ver == 3 {
+          const nrt = u32(sc)
+          k = 0
+          while k < nrt {
+            out.rtKeys.push(str(sc))
+            out.rtHashes.push(s32(sc))
+            k = k + 1
+          }
         }
         return out
       }
@@ -1524,8 +1538,54 @@ function invariance(ws: string[]): i32 {
   print(
     "== \{ws.length} builds, \{shared} keys held by two or more, \{differ} pairs differ; \{apart} keyed apart, \{apartSame} of them equal",
   )
+  rtInvariance(ws)
   if differ > 0 || shared == 0 { return 1 }
   0
+}
+
+// The same question of each runtime function, by its key and the link's facts, which builds
+// before version 3 do not record. Printed, not graded: a helper's body can follow the program.
+function rtInvariance(ws: string[]) {
+  const first: { [string]: i32 } = Map()
+  const firstIn: { [string]: string } = Map()
+  const counted: { [string]: boolean } = Map()
+  const byFn: { [string]: i32 } = Map()
+  const fns: string[] = []
+  let shared = 0
+  let differ = 0
+  for w in ws {
+    const r = readLink(bytesOf(w))
+    if r == null { continue }
+    let k = 0
+    while k < r.rtKeys.length {
+      const key = "\{r.rtKeys[k]} [\{r.facts}]"
+      const h = r.rtHashes[k]
+      const was = firstIn[key] ?? ""
+      if was == "" {
+        firstIn[key] = w
+        first[key] = h
+      } else {
+        if !(counted[key] ?? false) {
+          counted[key] = true
+          shared = shared + 1
+        }
+        if (first[key] ?? 0) != h {
+          differ = differ + 1
+          const fk = r.rtKeys[k]
+          if (byFn[fk] ?? 0) == 0 { fns.push(fk) }
+          byFn[fk] = (byFn[fk] ?? 0) + 1
+        }
+      }
+      k = k + 1
+    }
+  }
+  print(
+    "== runtime: \{shared} functions held by two or more, \{differ} pairs differ",
+  )
+  sort(fns, (x: string, y: string): boolean => (byFn[x] ?? 0) > (byFn[y] ?? 0))
+  for f in fns.slice(0, 12) {
+    print("  \{padStart("\{byFn[f] ?? 0}", 6, " ")} \{f}")
+  }
 }
 
 function die2(msg: string): i32 {
