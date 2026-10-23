@@ -16,9 +16,10 @@ This doc covers:
 6. the cache key;
 7. the ordered steps and the gate on each.
 
-Steps 1 to 4 have landed (§8 to §12). Step 5, `-O` after link, is in review (§13): the
-optimiser already ran once, after the module was finished, and step 5 names what `-O` still
-changes in the emitter.
+Steps 1 to 5 have landed (§8 to §13). In step 5, `-O` after link, the optimiser already ran
+once, after the module was finished, and the step names what `-O` still changes in the
+emitter. §14 puts those flags and the map-delete bit into each artifact's key, and leaves
+the remaining step 6 work in one list.
 
 ## 1. What a body encodes: the census
 
@@ -149,7 +150,11 @@ An artifact is keyed on:
 - the whole-program facts the bodies read (design §5 need 4), each either computed from the
   key or moved to link;
 - the compiler's own hash, as the whole-compile cache keys today;
-- the emitter flavour: whether the build is `-O`, and `--low-memory-unused` (§13).
+- the emitter flavour: whether the build is `-O`, and `--low-memory-unused` (§13);
+- whether the program deletes from a map, which sets every map struct's layout (§14).
+
+The last two, with the flavour, are `LinkFacts` (`link.vl`), written per artifact as
+`O<n>.L<bytes>.D<0|1>` (`linkFactsKey`).
 
 An instance's key is (template interface hash, canonical type arguments, compiler hash).
 `iface_hash` is reused unchanged. What is new is that codegen must not read anything the key
@@ -192,11 +197,15 @@ on program behaviour instead.
    sets. A function's frame mints its scratch slots on first use (§12, "Function frames");
    the facts that stay program-wide are listed there.
 5. **`-O` after link.** Move the optimiser behind the link. Gates: identity on `-O` builds,
-   the plumb-shape cost gate, and seed-size. (In review, §13.) The optimiser already ran
+   the plumb-shape cost gate, and seed-size. (Landed, §13.) The optimiser already ran
    once, over the finished module, in its own compiler instance that reads only bytes, so no
    pass moved. What `-O` still changes is two emitter decisions, the map-set helper and the
    pooled-string fill, plus `--low-memory-unused` addressing. Those stay flavour bits that
    step 6's key carries.
+   - **5b. The program facts in the key.** (§14.) Each artifact names the facts it was
+     emitted under (`LinkFacts`: the flavour, the low-memory bound, the map-delete bit), and
+     the link re-derives them. The map-delete bit is now a per-module fact plus a link-time
+     merge. Gates: identity, the fixpoint, and invariance by key.
 6. **Switch-over: the artifact cache.** The host stores artifacts and instances under §6's
    keys and links a build from them. Gates: every gate on master, with
    `VL_COMPILE_CACHE_VERIFY=1` comparing a cached link against a cold build. The hit rate is
@@ -629,7 +638,8 @@ Left program-wide, each for a reason:
 - **`gMapDeletes`** (`scanPrintUse`). A program that deletes from a map gives every map
   struct two more fields (`seqs`, `next`) and an extra initialiser. A map value crosses
   modules, so its layout is a program ABI and not a body fact. This accounts for
-  `std:json`, `lib/corpus.vl` and `lib/census-read.vl` in the residue below.
+  `std:json`, `lib/corpus.vl` and `lib/census-read.vl` in the residue below. Since §14 it
+  is a per-module fact merged at link and carried in every artifact's key.
 - **Generic template slots** (`monoPruneTemplates`, `emit_mono.vl`). An uninstantiated
   generic's slot is stubbed to `() -> ()`, or filled by the program's first instance, so
   `std:array`'s `filled`, `sort`, `sorted` and `includes` artifacts depend on the program.
@@ -716,10 +726,72 @@ refreshes in a row give the same bytes, and so plain and `-O` builds are unchang
 5,676,488 bytes against the 5,914,725 baseline. The plumb-shape cost gate passes: main fuel
 −3.1%, tail fuel −3.2%, RSS −2.2% against its baseline. L2 fuel moves 0.
 
-**What step 6 needs.** Step 6 must key artifacts on the flavour, or move the map-set and
-pool-fill choices behind the link and accept the change to `-O` output. It also needs the
-§12 residue settled:
+**What step 6 needs.** §14 keys artifacts on the flavour and settles `gMapDeletes`. The
+rest of the list is there.
 
-- `gMapDeletes`;
-- the generic template slots and instance demands;
-- the program tail, the runtime artifact and the band tables.
+## 14. The program facts in the key
+
+**`gMapDeletes` is a per-module fact.** `scanPrintUse` used to set the global the moment
+it met a `.delete` call. Now it notes the call site (`mapDeleteNote`, `emit_state.vl`) and
+sets the global once, after the scan (`mapDeleteMerge`). Nothing reads the global during the
+scan, so the order change is byte-identical. `emitLinkSection` attributes each noted site to
+its module's artifact (`LinkArt.deletes`). The link takes the OR over every artifact and the
+runtime (`linkFacts`, `link.vl`), so the bit the map layout reads is something the link can
+recompute from the artifacts alone.
+
+**The key carries the facts.** `LinkFacts` holds `optimized`, `lowMem` and `mapDeletes`.
+Each artifact records the facts its bodies were emitted under, and `vl.link` (version 2)
+writes them as `O<n>.L<bytes>.D<0|1>`: once for the program, then per artifact. The link
+counts artifacts whose facts differ from the facts it re-derived (`LinkOut.factMiss`). A
+cache that hands the link an artifact built under other facts is then a loud count, not a
+wrong layout. `linkArtHash` folds `deletes`, and `linkProgHash` folds both flavour fields.
+`elFacts` (`emit_link.vl`) is the only reader of the three globals in the link section.
+
+**Every artifact carries the program's delete bit, not only those that touch a map.** This
+over-keys on purpose: a module with no map value reads no map layout, but proving that per
+module is a new body census. Refining the bit to the modules that touch a map is left to
+step 6, which can measure the hit rate it costs.
+
+**The test.** `tests/vl_opt_after_link_test.ts` gains two claims:
+
+- `emit_link`'s readers of `gOptimized`, `gLowMemUnused` and `gMapDeletes` are exactly
+  `elFacts`, so a new program fact needs a field in `LinkFacts`;
+- `gMapDeletes` has two writers only, `mapDeleteMerge` and `mapDeleteReset`.
+
+**Invariance**, by key, on the armed 8-script set. `s5-relocs.vl invariance` now groups
+artifacts by path and facts key:
+
+| | pairs that differ within a key | builds keyed apart | of them equal |
+| --- | --- | --- | --- |
+| master (path only) | 5 | — | — |
+| this change | 2 | 21 | 18 |
+
+The 3 pairs that moved are `std:json` twice and `std:array` once, each between a script that
+deletes from a map and one that does not. Those pairs are now keyed apart. The 18 equal pairs
+that are keyed apart are the over-keying's cost on this set. The 2 pairs left are `std:array`
+generic slots (§12). Two plain builds plus their `-O` twins read 0 pairs differing and 21
+keyed apart, 0 of them equal. So every artifact the flavour splits really does differ.
+
+The link proof on all 8 builds reads 0 modules differing and 0 artifacts under other facts.
+
+**Gates.** The seed is 5,678,918 bytes (master 5,677,060, +0.03%, from the larger source).
+The fixpoint holds. difftree `--identity` against master reads 0 of 16,437 files differing,
+0 uncompared, and the candidate compiling master's source equals master's fixpoint. The plumb-shape
+cost gate passes: main fuel −3.1%, tail fuel −3.2%, RSS −2.2%. L2 guest fuel:
+
+- the master seed on its own source: 88,377,079,896;
+- the master seed on this source: 88,818,734,366 (+0.50%);
+- the new seed on this source: 88,818,734,416 (+50 instructions).
+
+**What step 6 still needs.**
+
+- **Refining the delete bit** to the artifacts whose bodies touch a map layout, if the
+  measured hit rate asks for it.
+- **The generic template slots and instance demands** (`monoPruneTemplates`, §4, §12).
+  These are the 2 pairs left, and they live in `emit_mono.vl`.
+- **The program tail, the runtime artifact and the band tables.** The tail's defs are noted
+  against the runtime artifact, the runtime is emitted per program, and the band tables are
+  built at link from demands (§11). Step 6 has to key or rebuild the runtime artifact per
+  link.
+- **The host store**: artifacts and instances under §6's keys, with
+  `VL_COMPILE_CACHE_VERIFY=1` comparing a cached link against a cold build.
