@@ -13378,18 +13378,65 @@ function monoFlowLetCalls(d: i32) {
     if monoFlowCallPassesLambda(u) { lam = true }
   }
   if !lam { return 0 }
-  const g = monoFlowLetLeaf(d)
+  let g = monoFlowLetLeaf(d)
+  const stored: i32[] = []
+  if g == -1 { g = monoFlowLetMapLeaf(d, stored) }
   if g < 0 || !(P.nodes[g] is FuncDecl) { return 0 }
   for u in calls {
     if !monoFlowInScope(u, g) { return 0 }
   }
   for u in calls { monoFlowReadSet(u, g) }
+  // The rewritten reads hand `g` on, so the map's stored values are called through no slot.
+  if stored.length > 0 && !i32ListHas(mfrCalled, g) { mfrCalled.push(g) }
+  for v in stored { monoFlowNoteInertLeaf(v) }
   monoFlowNoteInertLeaf(unwrapParen(dn.letInit))
   for u in us {
     const w = monoFlowWholeWrite(u)
     if w >= 0 { monoFlowNoteInertLeaf(unwrapParen(w)) }
   }
   0
+}
+
+// The one generic written `let` `d` holds when its initializer and every whole `=` to it is a
+// read, narrowed non-null, of an un-annotated `const` bound to a map read whose stored values all
+// name it, so every read of `d` names it too (D10384), with those values pushed onto `stored`;
+// -1 otherwise.
+function monoFlowLetMapLeaf(d: i32, stored: i32[]): i32 {
+  const dn = P.nodes[d]
+  if !(dn is LetDecl) { return -1 }
+  const srcs: i32[] = [unwrapParen(dn.letInit)]
+  for u in mfrUses[d] ?? [] {
+    if monoFlowIsWrite(u) {
+      const w = monoFlowWholeWrite(u)
+      if w < 0 { return -1 }
+      srcs.push(unwrapParen(w))
+    }
+  }
+  let g = -1
+  for s in srcs {
+    if s < 0 || !(P.nodes[s] is Ident) { return -1 }
+    const t = nodeTyIxOf(s)
+    if t < 0 || t >= T.tys.length || !(T.tys[t] is TyFunc) { return -1 }
+    const sd = identDeclOf(s)
+    if sd < 0 { return -1 }
+    const sn = P.nodes[sd]
+    if !(sn is LetDecl) || sn.letKw != "const" || sn.letType >= 0 { return -1 }
+    const base: i32[] = []
+    const init = unwrapParen(sn.letInit)
+    if init < 0 || !(P.nodes[init] is Index) { return -1 }
+    const ib = P.nodes[init]
+    if !(ib is Index) || !monoFlowValsOf(ib.idxArr, base) { return -1 }
+    if base.length == 0 || monoFlowMapCount(base) != base.length { return -1 }
+    const vs: i32[] = []
+    if !monoFlowMapReadVals(base, vs) || vs.length == 0 { return -1 }
+    for v in vs {
+      const vg = monoFlowLeafGen(v)
+      if vg < 0 || (g >= 0 && vg != g) { return -1 }
+      g = vg
+      if !i32ListHas(stored, v) { stored.push(v) }
+    }
+  }
+  g
 }
 
 // Rewrites to generic `g` each read of the un-annotated, unwritten binding `d` bound, directly
@@ -13973,9 +14020,14 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
       if s >= 0 {
         const sv = unwrapParen(s)
         let ok = true
-        if monoFlowIsLit(sv) { ok = monoFlowValsOf(sv, out) }
-        else if monoFlowLeafGen(sv) >= 0 { out.push(sv) }
-        else { ok = false }
+        if monoFlowIsLit(sv) {
+          ok = monoFlowValsOf(sv, out)
+        } else if monoFlowLeafGen(sv) >= 0 {
+          out.push(sv)
+        } else {
+          const rv = monoFlowReadElem(sv)
+          if rv >= 0 { out.push(rv) } else { ok = false }
+        }
         if !ok && via[i] != d { return false }
         if !ok { named = false }
         if via[i] != d { writes.push(s) }
@@ -13992,6 +14044,54 @@ function monoFlowMapVals(mv: i32, out: i32[]): boolean {
   // arena-tick exempt: a side table of this pass, not the arena
   mfrAliasWrites[d] = writes
   named
+}
+
+// The value a field or literal-index read `v` of a candidate binding gives, directly or through
+// un-annotated `const` aliases, when every literal the binding may hold gives the same generic
+// there and its slot holds that generic alone; -1 otherwise (D10383).
+function monoFlowReadElem(v: i32): i32 {
+  let x = v
+  let hops = 0
+  while x >= 0 && P.nodes[x] is Ident && hops < MONO_ALIAS_CHAIN_MAX {
+    const ad = identDeclOf(x)
+    if ad < 0 { return -1 }
+    const an = P.nodes[ad]
+    if !(an is LetDecl) || an.letKw != "const" || an.letType >= 0 { return -1 }
+    x = unwrapParen(an.letInit)
+    hops = hops + 1
+  }
+  if x < 0 { return -1 }
+  const n = P.nodes[x]
+  let obj = -1
+  let k = -1
+  let prop = ""
+  if n is Member {
+    obj = unwrapParen(n.memObj)
+    prop = n.memProp
+  } else if n is Index {
+    obj = unwrapParen(n.idxArr)
+    k = n.idxIndex
+  } else {
+    return -1
+  }
+  if obj < 0 || !(P.nodes[obj] is Ident) { return -1 }
+  const d = identDeclOf(obj)
+  if d < 0 || !(mfrCand[d] ?? false) { return -1 }
+  const base = monoFlowDeclVals(d)
+  if base.length == 0 || monoFlowMapCount(base) > 0 { return -1 }
+  let g = -1
+  let el = -1
+  for b in base {
+    const e = if k >= 0 { monoFlowElemAt(b, k) } else { monoFlowFieldOf(b, prop) }
+    const eg = monoFlowLeafGen(e)
+    if eg < 0 || (g >= 0 && eg != g) { return -1 }
+    g = eg
+    el = e
+  }
+  const path: string[] = []
+  if k >= 0 { path.push("e") } else { path.push("f." + prop) }
+  if !monoFlowSrcIs(d, path, g) && !monoFlowHeldIs(d, path, g) { return -1 }
+  el
 }
 
 // Notes the writes through the aliases of the map candidate `d` initializes, when no read of it
@@ -14448,8 +14548,10 @@ function monoFlowReplanPending(planned: i32[], through: i32[]) {
   0
 }
 
-// Whether `v` names an un-annotated `const` whose alias chain ends at an element or field read.
+// Whether `v` is an element or field read, or names an un-annotated `const` whose alias chain
+// ends at one, so a rewrite later in the round may make it name a generic (D10390).
 function monoFlowAliasOfRead(v: i32): boolean {
+  if v >= 0 && (P.nodes[v] is Index || P.nodes[v] is Member) { return true }
   let r = v
   let hops = 0
   while hops <= MONO_ALIAS_CHAIN_MAX {
