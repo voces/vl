@@ -98,6 +98,7 @@ import { inferRetFnKey } from "./check_side_rows"
 import { recordClonedCallRetire } from "./check_asg_rows"
 import { isVarTyIxOf, recordClonedIsVarTyIx } from "./check_list_union"
 import { blockLastStmt } from "./check_if_value"
+import { HD_COAL, hdKindIs } from "./check_hole_pins"
 import { joinArmIsLit } from "./check_nj_join"
 import {
   callBindHas,
@@ -4013,7 +4014,7 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
     )
     return -1
   }
-  let nm = monoPinUnionName(tyToEmitName(st))
+  let nm = monoPinUnionNameOfTy(st)
   // A literal union is spelled by its alias, whose rep is the atom; its render is `string`.
   if tyIsLitUnion(nonNullTy(st)) { nm = monoI32AtomPinName(st) }
   if nm == "" { return -1 }
@@ -4022,6 +4023,38 @@ function monoTpJoinBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
   }
   if isCall { return -1 }
   synthTypeRefTy(nm, -1, st)
+}
+
+// The annotation an un-annotated binding of a `??` over a type parameter takes where the pin
+// makes the `??` a join (`T ?? 5` at `i32[]` is `i32[] | i32`): that box, which the body's
+// reads of the binding and the call's result already name. -1 otherwise.
+function monoCoalBoxBindAnn(init: i32, bN: string[], bT: i32[]): i32 {
+  if init < 0 || bN.length == 0 { return -1 }
+  const u = unwrapParen(init)
+  if u < 0 || nodeAt(u) is Call { return -1 }
+  const t = nodeTyIxOf(u)
+  if !monoTyNamesCoalHole(t) { return -1 }
+  const st = monoSubstInst(t, bN, bT)
+  if st < 0 || st >= T.tys.length || tyHasTyVar(st) || !(tyAt(st) is TyUnion) {
+    return -1
+  }
+  if tyIsLitUnion(st) || monoTyHoldsRefArm(st) { return -1 }
+  const nm = monoPinUnionNameOfTy(st)
+  if nm == "" || monoRegisterPinUnion(nm, st) < 0 { return -1 }
+  synthTypeRefTy(nm, -1, st)
+}
+
+// Whether `t` is a `??` result hole, or a union with one as a member.
+function monoTyNamesCoalHole(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  if hdKindIs(t, HD_COAL) { return true }
+  const ut = tyAt(t)
+  if ut is TyUnion {
+    for m in ut.uMembers {
+      if hdKindIs(m, HD_COAL) { return true }
+    }
+  }
+  false
 }
 
 // Whether initializer `init`, typed at a union over a type parameter, is at the pin a union of
@@ -4488,6 +4521,8 @@ function monoCloneLetDecl(
   bT: i32[],
 ): i32 {
   let nt = monoSubstLetType(n.letType, typarams, tvN, tvV, bN, bT)
+  // Ahead of the returned-local rungs, which read the re-check's dead-default `i32[]`.
+  if nt < 0 { nt = monoCoalBoxBindAnn(n.letInit, bN, bT) }
   // The inferred-list-return local (`const out = []`): annotate its empty build with the
   // pinned element type, per instance. Clones only this `LetDecl` and its enclosing
   // Block, never the shared original.
@@ -9482,6 +9517,11 @@ function monoSigPinDiscrim(pin: string, tyIx: i32): string {
   "=" + tyCanonKey(tyIx, TY_WALK_DEPTH)
 }
 
+// The registry name of pinned type `st`'s box: its emitter spelling, canon'd as a union name.
+function monoPinUnionNameOfTy(st: i32): string {
+  monoPinUnionName(tyToEmitName(st))
+}
+
 // D1042 — the emitter-vocabulary spelling of a name `monoSubstAnn` produced, for the shapes
 // where the two can disagree: a union, and a list of a grouped element (`(T | string)[]`).
 // `monoSubstAnn` substitutes into the declared annotation text, so a literal member stays
@@ -11122,7 +11162,7 @@ function monoMakeInstanceRetChecked(
         // union with a record, map or reference-list arm is left out: annotating it breaks
         // complement narrowing of the caller's un-annotated binding.
         const rtyBox = rty >= 0
-          && nret < 0
+          && (nret < 0 || monoRetNamesMemberOf(nret, rty))
           && tyAt(rty) is TyUnion
           && !tyIsLitUnion(rty)
           && !monoTyHoldsRefArm(rty)
@@ -11145,6 +11185,20 @@ function monoMakeInstanceRetChecked(
     }
   }
   nret
+}
+
+// Whether result annotation `nret` names one member of the value union `rty` the checked
+// signature gives the call: the call reads the box, so the instance must return it.
+function monoRetNamesMemberOf(nret: i32, rty: i32): boolean {
+  const nt = nodeTyIxOf(nret)
+  if nt < 0 || nt >= T.tys.length || rty < 0 || rty >= T.tys.length {
+    return false
+  }
+  if tyAt(nt) is TyUnion || tyBearsNull(nt) || !(tyAt(rty) is TyUnion) {
+    return false
+  }
+  if tyHasTyVar(nt) || tyHasTyVar(rty) { return false }
+  assignable(nt, rty) && !assignable(rty, nt)
 }
 
 // The instance body cloned at this pin with its lambdas pinned: `monoCloneBody` at the
