@@ -34,8 +34,8 @@ export function njGateReset() {
   njGateSeen = 0
 }
 
-// Whether every join in function `fx` is master's: it is reached from a lambda body, by value,
-// as a recursive generic or hole, or from a generic or hole body that is itself reached so.
+// Whether every join in function `fx` is master's: it is read by value, or mentioned in a lambda
+// body or in another generic or hole body (`njGateScan`).
 export function njFnReached(fx: i32): boolean {
   if fx < 0 || fx >= P.nodes.length { return false }
   const fn = P.nodes[fx]
@@ -45,10 +45,10 @@ export function njFnReached(fx: i32): boolean {
   njGateNames.get(fn.fnName) ?? false
 }
 
-// Records every name read other than as a call's callee or as a member, every generic or hole
-// function that mentions itself, every name mentioned in a lambda body or in a gated generic or
-// hole body, and every name such an ungated body mentions other than a helper `njHelperShapeOk`
-// admits: that helper's kept-apart return each pin of the caller re-joins (D3589).
+// Records every name read other than as a call's callee or as a member, every name or member
+// mentioned in a lambda body or in a gated generic or hole body, and every one such an ungated
+// body mentions other than itself and a helper `njHelperShapeOk` admits: that helper's
+// kept-apart return each pin of the caller re-joins (D3589). A self-call is one more pin.
 function njGateScan() {
   njGateScanned = true
   // 1 at each node a scanned call names as its callee, grown past the arena if one does.
@@ -67,8 +67,6 @@ function njGateScan() {
       }
     } else if n is Ident {
       reads.push(i)
-    } else if n is Member {
-      njGateNames[n.memProp] = true
     } else if n is FuncDecl {
       let open = n.fnTyParams.length > 0
       for pi in n.fnParams {
@@ -77,15 +75,12 @@ function njGateScan() {
           if pn.parType < 0 { open = true }
         }
       }
-      // A function with declared parameters and no type parameter that names itself joins apart
-      // as a mutually recursive pair does: no pin re-reads its result (D10090).
-      if open || n.fnName == "" {
-        njGateBody(n.fnBody, n.fnName == "", n.fnName)
-      }
-      if open && n.fnName != "" {
+      if n.fnName == "" {
+        njGateBody(n.fnBody)
+      } else if open {
         openNames.push(n.fnName)
         openBodies.push(n.fnBody)
-        njGateHelpers(n.fnBody)
+        njGateHelpers(n.fnBody, n.fnName)
       }
     }
     i = i + 1
@@ -108,7 +103,7 @@ function njGateScan() {
       if !done[k] && (njGateNames.get(openNames[k]) ?? false) {
         done[k] = true
         grew = true
-        njGateBody(openBodies[k], true, openNames[k])
+        njGateBody(openBodies[k])
       }
       k = k + 1
     }
@@ -116,15 +111,16 @@ function njGateScan() {
   0
 }
 
-// Records each name body `ix` mentions other than a helper `njHelperShapeOk` admits.
-function njGateHelpers(ix: i32) {
+// Records each name body `ix` mentions other than its own function `self`, which each pin
+// re-checks with the body, and a helper `njHelperShapeOk` admits.
+function njGateHelpers(ix: i32, self: string) {
   const todo: i32[] = [ix]
   while todo.length > 0 {
     const at = todo.pop() ?? -1
     if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is Ident {
-        if !njHelperShapeOk(n.identName) { njGateNames[n.identName] = true }
+      const nm = njMentionAt(at)
+      if nm != "" && nm != self && !njHelperShapeOk(nm) {
+        njGateNames[nm] = true
       }
       for k in nodeChildren(at) {
         if k >= 0 { todo.push(k) }
@@ -195,22 +191,36 @@ export function njMatchDesugared(at: i32): boolean {
   false
 }
 
-// Walks body `ix`: every name it mentions when `open`, else only `self`.
-function njGateBody(ix: i32, open: boolean, self: string) {
+// Records every name body `ix` mentions (`njMentionAt`).
+function njGateBody(ix: i32) {
   const todo: i32[] = [ix]
   while todo.length > 0 {
     const at = todo.pop() ?? -1
     if at >= 0 && at < P.nodes.length {
-      const n = P.nodes[at]
-      if n is Ident {
-        if open || n.identName == self { njGateNames[n.identName] = true }
-      }
+      const nm = njMentionAt(at)
+      if nm != "" { njGateNames[nm] = true }
       for k in nodeChildren(at) {
         if k >= 0 { todo.push(k) }
       }
     }
   }
   0
+}
+
+// The function name node `at` mentions: a member, which a call through it may reach, or a name
+// (`njNameAt`).
+function njMentionAt(at: i32): string {
+  if at < 0 || at >= P.nodes.length { return "" }
+  const n = P.nodes[at]
+  if n is Member { return n.memProp }
+  njNameAt(at)
+}
+
+// The name an `Ident` at `at` reads; "" at any other node.
+function njNameAt(at: i32): string {
+  const n = P.nodes[at]
+  if n is Ident { return n.identName }
+  ""
 }
 
 // Every valued `return` under `blockIx` in source order, at any depth but a nested function's.
