@@ -16,6 +16,10 @@ import {
   TyVar,
   tyAt,
   tyFieldTyOf,
+  tyIsFuncArena,
+  tyIsLitUnion,
+  tyIsLitUnionAlias,
+  tyIsLitUnionArray,
   tyToEmitName,
 } from "./check_types"
 import { declAnnTyOf } from "./check_gen_alias_anns"
@@ -94,10 +98,10 @@ import {
   nameIsRefArray,
   nameIsStructDecl,
   nulRefListFieldCodeOfTy,
-  refArrElemKind,
   refArrElemName,
   refArrShapeKind,
   shapeFieldElemName,
+  tyIsNestedScalarLeafArray,
 } from "./emit_shape_rows"
 import {
   FC_F32,
@@ -118,12 +122,6 @@ import {
   FC_STR_LIST,
   FC_U8_LIST,
   FC_UNION,
-  RLK_F32_LIST,
-  RLK_F64_LIST,
-  RLK_I32_LIST,
-  RLK_I64_LIST,
-  RLK_REF_LIST,
-  RLK_STR_LIST,
   RLK_UNION,
   emitPhaseReached,
   gaeBases,
@@ -180,6 +178,7 @@ import {
 import {
   nullableInnerOrNone,
   tyMapValOf,
+  tyPeelNul,
   tyStepElem,
   tyStepParam,
   tyStepRet,
@@ -378,34 +377,13 @@ function funcTypeFieldCodeSafe(c: i32): boolean {
     || isNulScalarListFieldCode(c)
 }
 
-// True if `nm` is a nested array bottoming out at a scalar or string leaf list (kinds
-// 4/6/7/8/10, or a deeper recursion over those), never a struct, union, closure, or
-// map-element array. The leaf test the closure-result shape gate uses: such a field is a
-// plain code-5 ref-list slot whose element machinery is fully interned by `collectA`.
-export function nameIsNestedScalarLeafArray(nm: string): boolean {
-  if !nameIsRefArray(nm) { return false }
-  const k = refArrElemKind(nm)
-  if (
-    k == RLK_I32_LIST
-    || k == RLK_STR_LIST
-    || k == RLK_F64_LIST
-    || k == RLK_I64_LIST
-    || k == RLK_F32_LIST
-  ) {
-    return true
-  }
-  if k == RLK_REF_LIST {
-    return nameIsNestedScalarLeafArray(refArrElemName(nm))
-  }
-  false
-}
-
-// True if `t` is a struct-element array whose element itself lowers as a closure-result
-// field: a declared plain struct name (not a union variant, whose list rides the variant
-// machinery), or an inline shape that recursively passes `funcTypeShapeLowerable`. A
-// nullable-struct element admits too, as the kind-1 struct niche in the same ref-list wrapper.
-function structElemArrayLowerable(t: string): boolean {
+// True if `t`, of recorded type `ty`, is a struct-element array whose element itself lowers
+// as a closure-result field: a declared plain struct name (not a union variant, whose list
+// rides the variant machinery), or an inline shape that recursively passes
+// `funcTypeShapeLowerable`. A nullable-struct element admits too, as the kind-1 struct niche.
+function structElemArrayLowerable(t: string, ty: i32): boolean {
   if !nameIsElemArray(t) { return false }
+  const eTy = tyPeelNul(tyStepElem(ty))
   // The element text as written carries any grouping parens the source spelled. Peel the
   // grouping pair, then a `| null` wrapper, so both reach the same admission test the
   // paren-free spelling takes. Without this, the whole closure-result struct stayed
@@ -413,15 +391,15 @@ function structElemArrayLowerable(t: string): boolean {
   let base = normTypeAtom(arrElemNameRaw(t))
   const nb = nullablePartOf(base)
   if nb != "" { base = normTypeAtom(nb) }
-  if nameIsShapeOpen(base) { return funcTypeShapeLowerable(base) }
+  if nameIsShapeOpen(base) { return funcTypeShapeLowerable(base, eTy) }
   nameIsStructDecl(base) && variantIndexOf(base) < 0
 }
 
-// Whether inline shape `nm` lowers as a closure result or param with no unsupported
-// composite field, recursing through nested inline shapes. A map, value-union,
+// Whether inline shape `nm`, of recorded type `ty`, lowers as a closure result or param with
+// no unsupported composite field, recursing through nested inline shapes. A map, value-union,
 // distinct-backing-nullable-list, or closure field makes it un-lowerable, so the shape is
 // left un-interned and the closure stays a clean reject, never invalid wasm.
-export function funcTypeShapeLowerable(nm: string): boolean {
+export function funcTypeShapeLowerable(nm: string, ty: i32): boolean {
   if !nameIsShapeSpanEnds(nm) { return false }
   const fnames: string[] = []
   const ftexts: string[] = []
@@ -434,12 +412,13 @@ export function funcTypeShapeLowerable(nm: string): boolean {
       okAll = false
     } else {
       const ftxt = ftexts[fi]
+      const fTy = tyFieldTyOf(ty, fnames[fi])
       const fc = nameFieldCode(ftxt)
       if fc < 0 {
         // A nested inline-shape field: recurse into the base shape — lowerable only if
         // it is.
         const base = nonNulBaseOf(ftxt)
-        if !funcTypeShapeLowerable(base) { okAll = false }
+        if !funcTypeShapeLowerable(base, tyPeelNul(fTy)) { okAll = false }
       } else if !funcTypeFieldCodeSafe(fc) {
         // A code-5 field whose type is a nested scalar-leaf array or a lowerable
         // struct-element array is a plain ref-list slot, lowerable. A code-19 map field
@@ -447,8 +426,8 @@ export function funcTypeShapeLowerable(nm: string): boolean {
         // A registered code-16 union box and a code-22 nullable closure are the same rep the field carries in any non-closure struct.
         if (
           !(fc == FC_REF_LIST
-            && (nameIsNestedScalarLeafArray(ftxt)
-            || structElemArrayLowerable(ftxt)
+            && (tyIsNestedScalarLeafArray(fTy)
+            || structElemArrayLowerable(ftxt, fTy)
             || nameIsClosureArray(ftxt)))
           && !(fc == FC_MAP && mapValKindLowerable(ftxt))
           && !(fc == FC_UNION && isUName(ftxt))
@@ -527,18 +506,10 @@ export function armMintShapeName(nm: string) {
   out + "}"
 }
 
-// Interns the plainly-lowerable inline shapes buried in the params or result of a
-// function-type name, peeling the grouping, nullable, array, and nested-functype wrappers
-// around each position. Only a fully-lowerable struct leaf is interned; an unsupported
-// composite field is left un-interned so the closure stays a clean reject, never invalid wasm.
-export function internFuncTypeShapes(nm: string): i32 {
-  internFuncTypeShapesTy(nm, -1)
-}
-
-// `internFuncTypeShapes` with the caller's recorded arena type for `nm` — the functype twin
-// of `internShapeDeepTy`, peeled in lockstep with the same name grammar. The name walk stays
-// authoritative for every key and stored spelling; the type rides alongside and reaches only
-// the `sTyIx` hint at the leaf. A value-union leaf declines, since box registration has no leaf to hint.
+// Interns the plainly-lowerable inline shapes in the params or result of function-type name
+// `nm` of recorded type `ty`, peeled in lockstep with `internShapeDeepTy`'s grammar. Only a
+// fully-lowerable struct leaf interns; an unsupported composite field is left un-interned so
+// the closure stays a clean reject, never invalid wasm.
 function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
   if nm.length < 2 { return 0 }
   // Peels only a grouping pair that wraps the whole name. A functype whose leading `(` is
@@ -579,7 +550,7 @@ function internFuncTypeShapesTy(nm: string, ty: i32): i32 {
     return internFuncTypeShapesTy(arrElemNameRaw(nm), tyStepElem(ty))
   }
   if nameIsShapeSpanEnds(nm) {
-    if funcTypeShapeLowerable(nm) {
+    if funcTypeShapeLowerable(nm, ty) {
       internShapeFieldElemsTy(nm, ty)
       internInlineShapeTy(nm, ty)
     } else {
@@ -605,10 +576,10 @@ function internNonLowerableFieldShapesTy(nm: string, ty: i32) {
   while fi < fnames.length {
     if fnames[fi] != "" {
       const ftxt = ftexts[fi]
-      // A closure field (`() => {f: i64}`) — intern its result shape. Depth-aware:
-      // an inner arrow makes the field a closure regardless of wrappers.
+      // A closure field (`() => {f: i64}`), read from the field's type: intern its result
+      // shape.
       const fldTy = tyFieldTyOf(ty, fnames[fi])
-      if annArrowAt(ftxt) >= 0 {
+      if tyIsFuncArena(fldTy) {
         internShapeDeepTy(ftxt, fldTy)
       } else {
         // A nested inline-shape field (`{f: string[]}`, possibly `| null` / `[]`
@@ -1015,12 +986,20 @@ function iisPushFieldElem(
     // codes 5 and 28 above stay local, resolving through the already-interned tables.
     const en = shapeFieldElemName(texts[pi], codes[pi])
     // The field's own row, projected per code, where the name it accompanies is not
-    // one `repElemKey` keys nominally and not a literal union.
+    // one `repElemKey` keys nominally and the row is not a literal union.
     let enTy = -1
     if en != "" {
       if !elemNameIsNominal(en) {
-        if !nameIsLitUnionType(en) && !nameIsLitUnionArray(en) {
-          enTy = shapeFieldElemRow(shapeFieldRowOf(tyIx, names[pi]), codes[pi])
+        const er = shapeFieldElemRow(
+          shapeFieldRowOf(tyIx, names[pi]),
+          codes[pi],
+        )
+        if (
+          !tyIsLitUnion(er)
+          && !tyIsLitUnionArray(er)
+          && !tyIsLitUnionAlias(er)
+        ) {
+          enTy = er
         }
       }
     }
