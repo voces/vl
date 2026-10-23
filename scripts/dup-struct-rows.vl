@@ -1,0 +1,383 @@
+// Counts the types that own more than one struct row once a program's emit has finished.
+//
+//     vl run scripts/dup-struct-rows.vl                       # self, fixtures and corpus
+//     vl run scripts/dup-struct-rows.vl -- self fixtures      # some populations
+//     vl run scripts/dup-struct-rows.vl -- --list progs.txt   # one program path per line
+//     vl run scripts/dup-struct-rows.vl -- --rev 33f3280a6    # instrument an older compiler
+//
+// It patches a copy of `compiler/` so the end of `emitProgram` refuses with the row count and,
+// for every row that `repStructSlotRep` folds onto an earlier one, that earlier row's spelling.
+// A program that printed no `DUPROWS` line never reached the end of emit and counts nothing.
+// `--jobs` (default `$JOBS`, else 6) builds run at once. Run from the checkout root.
+
+import { Utf8Error, programArgs } from "std:args"
+import { exit } from "std:process"
+import { join, replace, startsWith } from "std:str"
+import { includes } from "std:array"
+import {
+  envOr,
+  fanOutArgv,
+  findFrom,
+  isDigit,
+  isFile,
+  mktempDirArgs,
+  splitLines,
+  stripWs,
+} from "./lib/common"
+import {
+  cellsIn,
+  cwd,
+  readText,
+  sortStrings,
+  spawn,
+  writeText,
+} from "./lib/corpus"
+
+const PROBE = join(
+  [
+    "", "export function dupStructRowsCensus(): string {", "  let nDup = 0",
+    "  let nTy = 0", "  let names = \"\"", "  const seen: boolean[] = []",
+    "  let si = 0", "  while si < sNames.length {", "    seen.push(false)",
+    "    const r = repStructSlotRep(si)",
+    "    if r != si && r >= 0 && r < si {", "      nDup = nDup + 1",
+    "      if !seen[r] {", "        seen[r] = true", "        nTy = nTy + 1",
+    "        names = names + \"\\nDUPTYPE \" + sNames[r]", "      }", "    }",
+    "    si = si + 1", "  }",
+    "  \"DUPROWS rows=\" + i32ToStr(sNames.length) + \" dup=\" + i32ToStr(nDup) + names",
+    "}", "",
+  ],
+  "\n",
+)
+
+const HOOK = "    repLadderABSweep()\n    return rc\n"
+
+function countOf(s: string, needle: string): i32 {
+  let n = 0
+  let at = findFrom(s, needle, 0)
+  while at >= 0 {
+    n = n + 1
+    at = findFrom(s, needle, at + needle.length)
+  }
+  n
+}
+
+// Appends the census to `emit_rep.vl` and calls it at the end of `emitProgram`. Answers "" or
+// the reason the tree could not be instrumented.
+function instrument(src: string): string {
+  const rep = src + "/emit_rep.vl"
+  writeText(rep, readText(rep) + PROBE)
+  const es = src + "/emit_sections.vl"
+  const e = readText(es)
+  if countOf(e, HOOK) != 1 {
+    return "dup-struct-rows: the end-of-emitProgram anchor is not unique in emit_sections.vl; update HOOK"
+  }
+  const call = "    repLadderABSweep()\n    emitFail(dupStructRowsCensus())\n    return -1\n"
+  writeText(
+    es,
+    "import { dupStructRowsCensus } from \"./emit_rep\"\n"
+      + replace(e, HOOK, call),
+  )
+  ""
+}
+
+// One program's census: `rows` is -1 when it printed none.
+type Census = { rows: i32, dup: i32, types: string[] }
+
+function numAfter(s: string, key: string): i32 {
+  const at = findFrom(s, key, 0)
+  if at < 0 { return -1 }
+  let i = at + key.length
+  let n = 0
+  let any = false
+  while i < s.length && isDigit(s[i]) {
+    n = n * 10 + (s[i] - 48)
+    any = true
+    i = i + 1
+  }
+  if !any { return -1 }
+  n
+}
+
+function readCensus(out: string): Census {
+  const c: Census = { rows: -1, dup: 0, types: [] }
+  for line in splitLines(out) {
+    if startsWith(line, "DUPTYPE ") {
+      c.types.push(line.slice(8, line.length))
+    } else if findFrom(line, "DUPROWS rows=", 0) >= 0 {
+      c.rows = numAfter(line, "DUPROWS rows=")
+      c.dup = numAfter(line, " dup=")
+    }
+  }
+  c
+}
+
+// The programs of one named population, as checkout-relative paths.
+function population(root: string, name: string): string[] {
+  if name == "self" { return ["compiler/entry.vl"] }
+  if name == "fixtures" {
+    const f = spawn("find", ["tests/cases", "-name", "*.vl", "-type", "f"])
+    const out: string[] = []
+    for l in splitLines(f.out) {
+      if stripWs(l) != "" { out.push(stripWs(l)) }
+    }
+    return sortStrings(out)
+  }
+  const out: string[] = []
+  for sub in ["cells", "named"] {
+    const dir = "scripts/silent-sweep/distilled/" + sub
+    for c in sortStrings(cellsIn(root + "/" + dir)) {
+      out.push(dir + "/" + c + ".vl")
+    }
+  }
+  out
+}
+
+type Opts = {
+  code: i32,
+  seed: string,
+  rev: string,
+  list: string,
+  jobs: string,
+  show: i32,
+  keep: boolean,
+  pops: string[],
+}
+
+const USAGE = "usage: dup-struct-rows.vl [self] [fixtures] [corpus] [--list FILE] [--seed SEED]\n                          [--rev REV] [--jobs N] [--show N] [--keep]"
+
+function parseArgs(args: readonly string[]): Opts {
+  const o: Opts = {
+    code: -1,
+    seed: "build/vl-compiler.wasm",
+    rev: "",
+    list: "",
+    jobs: envOr("JOBS", "6"),
+    show: 10,
+    keep: false,
+    pops: [],
+  }
+  let i = 0
+  while i < args.length {
+    const a = args[i]
+    if a == "-h" || a == "--help" {
+      print(USAGE)
+      o.code = 0
+      return o
+    } else if a == "--keep" {
+      o.keep = true
+    } else if includes(["self", "fixtures", "corpus"], a) {
+      o.pops.push(a)
+    } else if includes(["--seed", "--rev", "--list", "--jobs", "--show"], a) {
+      if i + 1 >= args.length {
+        print(USAGE)
+        print(
+          "dup-struct-rows.vl: error: argument " + a + ": expected one argument",
+        )
+        o.code = 2
+        return o
+      }
+      const v = args[i + 1]
+      i = i + 1
+      if a == "--seed" { o.seed = v }
+      if a == "--rev" { o.rev = v }
+      if a == "--list" { o.list = v }
+      if a == "--jobs" { o.jobs = v }
+      if a == "--show" { o.show = numAfter(v, "") }
+    } else {
+      print(USAGE)
+      print("dup-struct-rows.vl: error: unrecognized argument: " + a)
+      o.code = 2
+      return o
+    }
+    i = i + 1
+  }
+  if o.pops.length == 0 && o.list == "" {
+    o.pops = ["self", "fixtures", "corpus"]
+  }
+  o
+}
+
+function finish(work: string, keep: boolean, code: i32): i32 {
+  if keep { print("scratch: " + work) } else { spawn("rm", ["-rf", work]) }
+  code
+}
+
+// Prints one population's totals and its most frequent duplicated spellings.
+function report(label: string, progs: string[], cs: Census[], show: i32) {
+  let reached = 0
+  let withDup = 0
+  let dup = 0
+  let types = 0
+  const keys: string[] = []
+  const counts: i32[] = []
+  for c in cs {
+    if c.rows < 0 { continue }
+    reached = reached + 1
+    if c.dup > 0 { withDup = withDup + 1 }
+    dup = dup + c.dup
+    types = types + c.types.length
+    for t in c.types {
+      let j = 0
+      while j < keys.length && keys[j] != t { j = j + 1 }
+      if j == keys.length {
+        keys.push(t)
+        counts.push(1)
+      } else {
+        counts[j] = counts[j] + 1
+      }
+    }
+  }
+  print(
+    "\{label}: \{reached} of \{progs.length} programs reached the end of emit; \{withDup} own a type with more than one struct row; \{types} such types, \{dup} rows past the first",
+  )
+  const done: boolean[] = []
+  while done.length < keys.length { done.push(false) }
+  let k = 0
+  while k < show && k < keys.length {
+    let best = -1
+    let j = 0
+    while j < keys.length {
+      if !done[j] && (best < 0 || counts[j] > counts[best]) { best = j }
+      j = j + 1
+    }
+    done[best] = true
+    print("  \{counts[best]} programs  \{keys[best]}")
+    k = k + 1
+  }
+}
+
+function run(o: Opts): i32 {
+  const root = cwd()
+  const vl = root + "/scripts/vl-host/target/release/vl"
+  const std = envOr("VL_STD", root + "/std")
+  const mk = spawn("mktemp", mktempDirArgs("dup-struct-rows-"))
+  if mk.code != 0 {
+    print("dup-struct-rows: mktemp failed: " + mk.err)
+    return 1
+  }
+  const work = stripWs(mk.out)
+  if o.rev != "" {
+    const x = spawn(
+      "sh",
+      [
+        "-c",
+        "git archive \"$1\" compiler | tar -x -C \"$2\"",
+        "sh",
+        o.rev,
+        work,
+      ],
+    )
+    if x.code != 0 {
+      print("dup-struct-rows: git archive \{o.rev} failed: " + x.err)
+      return finish(work, o.keep, 1)
+    }
+  } else {
+    const c = spawn("cp", ["-rL", root + "/compiler", work + "/compiler"])
+    if c.code != 0 {
+      print("dup-struct-rows: cannot copy compiler/: " + c.err)
+      return finish(work, o.keep, 1)
+    }
+  }
+  const why = instrument(work + "/compiler")
+  if why != "" {
+    print(why)
+    return finish(work, o.keep, 1)
+  }
+  const probe = work + "/probe.wasm"
+  let seed = o.seed
+  if !startsWith(seed, "/") { seed = root + "/" + seed }
+  const b = spawn(
+    "env",
+    [
+      "-C",
+      work,
+      "VL_STD=" + std,
+      "timeout",
+      "300",
+      vl,
+      "build",
+      "compiler/entry.vl",
+      "-o",
+      probe,
+      "--compiler",
+      seed,
+    ],
+  )
+  if b.code != 0 || !isFile(probe) {
+    print(b.out + b.err)
+    print("dup-struct-rows: the probe compiler did not build")
+    return finish(work, o.keep, 1)
+  }
+  const labels: string[] = []
+  const sets: string[][] = []
+  for p in o.pops {
+    labels.push(p)
+    sets.push(population(root, p))
+  }
+  if o.list != "" {
+    const l: string[] = []
+    for line in splitLines(readText(o.list)) {
+      if stripWs(line) != "" { l.push(stripWs(line)) }
+    }
+    labels.push(o.list)
+    sets.push(l)
+  }
+  spawn("mkdir", [work + "/o"])
+  const worker = work + "/one.sh"
+  writeText(
+    worker,
+    join(
+      [
+        "#!/bin/sh", "i=${1%%:*}; f=${1#*:}",
+        "env VL_STD=\"$VL_STD_DIR\" timeout 300 \"$VL_BIN\" build \"$f\" -o \"$WORK/o/$i.wasm\" --compiler \"$WORK/probe.wasm\" > \"$WORK/o/$i.txt\" 2>&1",
+        "rm -f \"$WORK/o/$i.wasm\"", "",
+      ],
+      "\n",
+    ),
+  )
+  const lines: string[] = []
+  let n = 0
+  for s in sets {
+    for p in s {
+      lines.push("\{n}:\{p}")
+      n = n + 1
+    }
+  }
+  writeText(work + "/list.txt", join(lines, "\n") + "\n")
+  const fanArgs = ["WORK=" + work, "VL_BIN=" + vl, "VL_STD_DIR=" + std, "sh"]
+  for a in fanOutArgv(work + "/list.txt", o.jobs, ["sh", worker]) {
+    fanArgs.push(a)
+  }
+  const fan = spawn("env", fanArgs)
+  if fan.code != 0 && fan.code != 123 {
+    print("dup-struct-rows: the fan-out failed: " + fan.err)
+    return finish(work, o.keep, 1)
+  }
+  let at = 0
+  let si = 0
+  while si < sets.length {
+    const cs: Census[] = []
+    for _p in sets[si] {
+      const f = "\{work}/o/\{at}.txt"
+      if isFile(f) {
+        cs.push(readCensus(readText(f)))
+      } else {
+        cs.push({ rows: -1, dup: 0, types: [] })
+      }
+      at = at + 1
+    }
+    report(labels[si], sets[si], cs, o.show)
+    si = si + 1
+  }
+  finish(work, o.keep, 0)
+}
+
+const argv = programArgs()
+if argv is Utf8Error {
+  print("dup-struct-rows: an argument is not UTF-8: " + argv.msg)
+  exit(2)
+} else {
+  const o = parseArgs(argv)
+  if o.code >= 0 { exit(o.code) }
+  exit(run(o))
+}
