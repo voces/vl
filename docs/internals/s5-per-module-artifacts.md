@@ -1276,3 +1276,63 @@ reads 13 shared and 1 differing (`rt#0`).
 - `__as_fail__`, `__init_fail__`, the view helpers and the two map probes above, and §17's 8
   functions whose helper set depends on the program. `__as_fail__` can take a fixed domain
   table (the fallible domains are a closed set), which changes the emitted module.
+
+## 20. Step 7, third part: `__as_fail__`'s domain rows are a fixed table
+
+**Why `__as_fail__` differed, and why a key cannot fix it.** A failing `as!` calls
+`__as_fail__(line, colRow)`, and `colRow & 7` is the row of the cast's target domain. The rows
+were numbered in the order the program met the domains, so the helper's body branched over a
+program-dependent table. The row also sits as an `i32.const` in the CALLER's body. A module
+that casts to `u8` passed row 0 in one program and row 1 in another that met `i32` first, so
+the user module's artifact differed too, not only the runtime helper.
+
+**What moved: the table.** `AS_FAIL_DOMS` is a constant, the five numeric domains a cast can
+fail into, `i32`, `i64`, `u8`, `f32`, `f64`, in that order. `emitNumCastTrapMsg` looks a
+domain up and no longer appends; a domain outside the table is an `emitFail`. This changes
+the emitted module: every module that uses `as!` (including through `std:fmt`) carries all
+five branches, about 90 bytes more.
+
+**Measured.** Over 4,751 armed tests/cases builds at #4500 (the `@run` files plus every
+`modules/**/entry*.vl`; §19's 5,108 was a different population), with this step's witness:
+
+| | master | this change |
+| --- | ---: | ---: |
+| module keys held by two or more | 37 | 37 |
+| module pairs that differ | 4,545 | 4,544 |
+| runtime functions held by two or more | 166 | 166 |
+| runtime pairs that differ | 4,826 | 4,801 |
+| of them, `__as_fail__` | 25 | 0 |
+
+The module pair that leaves is the witness's shared `byte.vl`. The runtime pairs left are
+`rt#0` 4,748, `__rv_sync__`/`__rv_get__`/`__rv_len__` 15 each, `__init_fail__` 5, and
+`__sv_sync_1__`/`__sv_get_1__`/`__sv_len_1__` 1 each. The two map probes do not occur in this
+population.
+
+**The witness and the control.** `tests/cases/modules/as-fail-domain-rows/` has two roots
+that share `byte.vl`, whose `as! u8` passes its row to `__as_fail__`. `entry.vl` meets `u8`
+first; `entry2.vl` loads `other.vl`'s `as! i32` ahead of it. The control is master, which
+numbers rows in meeting order: 1 module pair differs (`byte.vl`) and 2 runtime pairs differ
+(`rt#0`, `__as_fail__`). This change reads 0 module pairs and 1 runtime pair (`rt#0`).
+
+**Gates.**
+
+- **Identity:** difftree `--identity` reads 16,450 files, 11,441 built, 670 differ and 0
+  uncompared. All 670 differ only in module bytes, and each was run under both seeds with
+  the same stdout and exit code.
+- **regress.vl:** 0 runs → not-runs, 0 → silent, no cell changed class.
+- **Seed:** the fixpoint holds, at 5,698,219 bytes (master 5,698,204, +15).
+- **L2 guest fuel**, one run each on this source: 88,978,287,615 on the master seed and
+  88,978,287,602 on the new one (−13).
+
+**Why the other program-dependent helpers stay.** Their bodies are program data, not an
+order:
+
+- `__init_fail__` prints the names of the program's globals.
+- `__rv_*__` and `__sv_*_1__` dispatch over the program's view rows and view types.
+- `__map_probe__` and `__map_probe_i32__` leave the trap reason out when the build has no
+  print import (`emitMapProbeTrapReason`). That is a whole-program fact like `gMapDeletes`,
+  so it could become a link fact; no build in this population shows it.
+
+**What is left of step 7.** The unnamed reservations, the start function and the runtime's
+order (§18), the helpers just listed, and §17's 8 functions whose helper set depends on the
+program.
