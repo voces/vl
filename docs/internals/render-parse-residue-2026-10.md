@@ -905,18 +905,33 @@ What each slice changes:
     - The identity sweep is the instrument that shows the text is unread. With all four typed
       producers writing a placeholder, 9 files of 16,508 differed. With only the niche
       producers writing it, 0 differed.
-  - Left: three producers whose text readers still read.
-    - `pushIndexMapNullNarrow`'s render. With a placeholder, 6 files differ. The text is read
-      as a member set: `pushIndexMapComplement`'s `isValueUnionName(cur)`, `pushNarrowLess` over
-      `cur`, and the print readers (`printNarrowKeepsBox`, `printNarrowLiveAtoms`). It moves when
-      the slot banks the union's set id and those readers take `narrowSets` first.
-    - `litElseSurvName`'s render. With a placeholder, 3 files lose their struct row (`field
-      access receiver is not a struct`). The text is a row identity: `variantIndexOf` in
-      `emit_atom_kinds`, `memberIsClosure` and `emitNarrowedMem`. It moves when those ask
-      `variantRowOfTy(narrowSlotTy(i))` first.
+  - Done: 1 render. `pushIndexMapNullNarrow` pushes `NARROW_TYPED` beside the value type and
+    the union's set id (`msSetOfTy`). Its four member-set readers take a typed slot's set
+    first: `pushIndexMapComplement` asks `msIsValueUnion`, `pushNarrowLess` subtracts with
+    `msRemoveAtomId` and pushes the survivor's set, `indexCellCurSlot` counts the set
+    (`msMemberCount`, new), and `printNarrowKeepsBox` / `printNarrowLiveAtoms` read the set.
+    - A probe over the self-compile and 16,622 files compared each old text answer with the
+      set's answer, 0 uncompared. The producer-side set, count, gate and atom answers agreed in
+      all 13 files that reached them. The value-union and null tests disagreed only in the
+      control, `tests/cases/maps/narrowed-alias-union-value-print.vl` (20 events): over alias
+      `U` the text test reads `isValueUnionName("U")` false while the set is a value union.
+      The print readers were reached in 1 file and agreed; the complement, less and cell
+      readers were reached in 0.
+    - Identity sweep with the typed producer: 16,509 files, 11,651 built, 0 differ.
+  - Left: two producers whose text readers still read.
+    - `litElseSurvName`'s render. With a placeholder for the value-atom arm, 0 of 16,509
+      files differ, but the closure survivor still reads the text:
+      `tests/cases/literal-unions/else-survivor-non-literal-arm.vl` (new; the sweep population
+      had no such case) fails with `call to unknown function`, through `narrowedValueAtomOf`
+      → `narrowedClosureOf` → `annSigKeyTy`. With a placeholder for the whole render, 3 files
+      lose their struct row (`field access receiver is not a struct`): `variantIndexOf` in
+      `emit_atom_kinds`, `memberIsClosure` and `emitNarrowedMem` read it as a row identity.
+      It moves when those ask `variantRowOfTy(narrowSlotTy(i))` first, and the closure reader
+      takes the slot's type.
     - `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74
       files, where the complement has no member-set id, and it changes the spelling in 55 of
-      them.
+      them. A typed slot no longer reaches it (`pushNarrowLess`'s typed arm). The fallback is
+      in `emit_base`, which the map-value-kind lane holds.
   - `narrowedMapOf`'s render is the mv slot's key, so it goes with D8. `emit_mv_slots`' `cnVariant`
     copies the text too; that file is the shape-row lane's.
 
