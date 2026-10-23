@@ -27,6 +27,15 @@ import {
   VKind,
   msAtomIds,
   msAtomTexts,
+  msFreeAtomIds,
+  msFreeAtoms,
+  msFreeByTy,
+  msFreeChain,
+  msFreeCount,
+  msFreeKinds,
+  msFreeStart,
+  msFreeTys,
+  msFreeValKind,
   msGen,
   msRowChain,
   msSetGen,
@@ -1744,9 +1753,9 @@ function unMemAtomTyIx(atom: string): i32 {
   declTyIxOfName(atom)
 }
 
-// The interned id of a union member's atom spelling, after `peelGroupParens` (the
-// same normalization `removeAtomFrom` applies to both sides, so a `(() => i64)`
-// member and an `is () => i64` test are the same reference). Two references are
+// The interned id of a union member's atom spelling, after `peelGroupParens` (applied
+// to both sides, so a `(() => i64)` member and an `is () => i64` test are the same
+// reference). Two references are
 // equal iff their ids are, so membership and subtraction are integer work. Ids are pure text identities with no arena content, so the table lives across programs.
 export function msAtomIdOf(atom: string): i32 {
   const p = peelGroupParens(atom)
@@ -1804,6 +1813,70 @@ export function unMemRowStart(u: i32): i32 {
   st
 }
 
+// A set's row `u` names a member slice: a registered union row when `u >= 0`, row-less slice
+// `-2 - u` (`msFreeStart`) when `u <= -2`. The readers below take either, so a set answers the
+// same questions whether or not its members have a row; only a registered row has box tags.
+// The member count of slice `u`, or -1 when it is not covered.
+export function msSliceCount(u: i32): i32 {
+  if u >= 0 {
+    if unMemRowStart(u) < 0 { return -1 }
+    return unMemTyCount[u]
+  }
+  const k = -2 - u
+  if k < 0 || k >= msFreeStart.length { return -1 }
+  const st = msFreeStart[k]
+  const n = msFreeCount[k]
+  if st < 0 || n < 1 || st + n > msFreeAtoms.length { return -1 }
+  n
+}
+
+// Member `i` of covered slice `u`: its arena type (-1 for `null`), atom spelling, interned atom id,
+// member kind (`unMemKindOf`) and value-atom kind (-2 when the bank does not cover it).
+export function msSliceTy(u: i32, i: i32): i32 {
+  if u >= 0 { return unMemTys[unMemRowStart(u) + i] }
+  msFreeTys[msFreeStart[-2 - u] + i]
+}
+
+export function msSliceAtom(u: i32, i: i32): string {
+  if u >= 0 { return unMemAtoms[unMemRowStart(u) + i] }
+  msFreeAtoms[msFreeStart[-2 - u] + i]
+}
+
+export function msSliceAtomId(u: i32, i: i32): i32 {
+  if u >= 0 { return unMemAtomIds[unMemRowStart(u) + i] }
+  msFreeAtomIds[msFreeStart[-2 - u] + i]
+}
+
+export function msSliceKind(u: i32, i: i32): i32 {
+  if u >= 0 { return unMemKinds[unMemRowStart(u) + i] }
+  msFreeKinds[msFreeStart[-2 - u] + i]
+}
+
+export function msSliceValKind(u: i32, i: i32): i32 {
+  if u >= 0 { return unMemValKindAt(unMemRowStart(u) + i) }
+  msFreeValKind[msFreeStart[-2 - u] + i]
+}
+
+// The row-less slice holding members `tys` spelled `atoms` (index-parallel, -1 / "null" for
+// `null`), as row id `-2 - k`; banked like `recordUnMemTys` banks a row's members.
+export function msFreeSlicePush(tys: i32[], atoms: string[]): i32 {
+  const k = msFreeStart.length
+  msFreeStart.push(msFreeAtoms.length)
+  msFreeCount.push(atoms.length)
+  msFreeChain.push(-1)
+  let i = 0
+  while i < atoms.length {
+    const a = atoms[i]
+    msFreeTys.push(tys[i])
+    msFreeAtoms.push(a)
+    msFreeAtomIds.push(msAtomIdOf(a))
+    msFreeKinds.push(unMemKindOf(a, tys[i]))
+    msFreeValKind.push(valueAtomKind(a))
+    i = i + 1
+  }
+  -2 - k
+}
+
 // The number of 32-bit words a member mask over `n` members takes.
 function msMaskWords(n: i32): i32 { (n + 31) >>> 5 }
 
@@ -1818,7 +1891,7 @@ export function msSetHas(s: i32, i: i32): boolean {
 // A fresh copy of set `s`'s mask words, for a subtraction to clear bits in before it interns
 // the result (`msSetIntern`). `s` is a set id the caller bounded.
 export function msSetMaskCopy(s: i32): i32[] {
-  const n = msMaskWords(unMemTyCount[msSetRow[s]])
+  const n = msMaskWords(msSliceCount(msSetRow[s]))
   const at = msSetWordAt[s]
   const out: i32[] = []
   let k = 0
@@ -1873,9 +1946,8 @@ export function msSoloValKind(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -2 }
   if msSetGen[s] != msGen.at { return -2 }
   const u = msSetRow[s]
-  const st = unMemRowStart(u)
-  if st < 0 { return -2 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -2 }
   let solo = -1
   let cnt = 0
   let i = 0
@@ -1887,7 +1959,7 @@ export function msSoloValKind(s: i32): i32 {
     i = i + 1
   }
   if cnt != 1 { return -1 }
-  unMemValKindAt(st + solo)
+  msSliceValKind(u, solo)
 }
 
 // Iteration over the banked kinds, the kind column's twin of `msMemberAtomsOfSet`:
@@ -1898,13 +1970,12 @@ export function msMemberValKindsOf(s: i32, out: i32[]): boolean {
   if s < 0 || s >= msSetRow.length { return false }
   if msSetGen[s] != msGen.at { return false }
   const u = msSetRow[s]
-  const st = unMemRowStart(u)
-  if st < 0 { return false }
-  if unMemValKind.length != unMemAtoms.length { return false }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return false }
+  if u >= 0 && unMemValKind.length != unMemAtoms.length { return false }
   let i = 0
   while i < n {
-    if msSetHas(s, i) { out.push(unMemValKind[st + i]) }
+    if msSetHas(s, i) { out.push(msSliceValKind(u, i)) }
     i = i + 1
   }
   true
@@ -1919,21 +1990,20 @@ export function msHasValKind(s: i32, k: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   if msSetGen[s] != msGen.at { return -1 }
   const u = msSetRow[s]
-  const st = unMemRowStart(u)
-  if st < 0 { return -1 }
-  if unMemValKind.length != unMemAtoms.length { return -1 }
-  if unMemTys.length != unMemAtoms.length { return -1 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
+  if u >= 0 && unMemValKind.length != unMemAtoms.length { return -1 }
+  if u >= 0 && unMemTys.length != unMemAtoms.length { return -1 }
   let hit = 0
   let i = 0
   while i < n {
     if msSetHas(s, i) {
-      const mk = unMemValKind[st + i]
+      const mk = msSliceValKind(u, i)
       if mk == k { hit = 1 }
       if mk < 0 {
         // An ALIAS spelling whose arena type IS a primitive would answer YES on the
         // `TyPrim` path and NO here — decline the whole set rather than differ.
-        const ty = unMemTys[st + i]
+        const ty = msSliceTy(u, i)
         if ty >= 0 && ty < T.tys.length {
           const t = tyAt(ty)
           if t is TyPrim { return -1 }
@@ -2114,6 +2184,15 @@ export function msPoolReset() {
   msSetText = []
   msSetGen = []
   msRowChain = []
+  msFreeStart = []
+  msFreeCount = []
+  msFreeChain = []
+  msFreeTys = []
+  msFreeAtoms = []
+  msFreeAtomIds = []
+  msFreeKinds = []
+  msFreeValKind = []
+  msFreeByTy = []
   memoGenAdvance(msGen)
   0
 }
