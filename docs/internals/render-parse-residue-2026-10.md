@@ -441,10 +441,41 @@ What each slice changes:
     `map-closure-return-nulclosure-field-struct.vl`), so the name leg is live.
   - Left: `gaePeelWrappers` and `collectGenAliasShapes`. They produce the application spelling
     `gaeEnsure` keys on, and the arena has no node for a generic application.
-  - Left, not probed: the niche ladders and the name-grammar tests. Their callers hold only a
-    name. `nameIsNulI32List` keeps two such callers, `forceAnnLeafReps` under
-    `forceGenAppArgTypes` and `fieldCodeOfSpelling`. `annRetNameOf` has callers in
-    `emit_mono` (the L1 lane's file).
+  - Converted, no parse retired: every caller of the niche ladders and the name-grammar tests
+    that holds a type. A probe compared the name and type answers at each converted site, over
+    the self-compile and 16,880 files. 11,957 of the files compile, and a file the compiler
+    refuses reports nothing.
+    - `inferNicheNullByName` asks `tyNulInnerIsPrim` and `tyIsNulStringRep`. It was reached in
+      4,139 files and answered true in 4 (boolean) and 17 (string). It differed in 0.
+    - Collect's array-literal and closure-result `nameIsNulString` gates were reached in 3 and
+      8,624 files, and differed in 0.
+    - `calleeCloRetName` and `cloArrSlotRetName` are deleted. `exprNulBool` and
+      `exprNulLitUnion` ask the callee's function type (`cloCallRetTy`) instead. The boolean
+      rung was reached in 3,024 files and never answered, because the node-type test answers
+      first.
+    - The literal-union Ident rung was reached in 3,273 files and differed in 3. In each, a
+      nullable literal-union alias spells as its own name, which the spelling test missed.
+    - The literal-union Index rung (41 files) and wasmEmit's `retNulLitUnion` (4,136 files)
+      differed in 0.
+    - Collect's two map-member-union sites ask the type. They were reached in 101 and 1 files
+      and differed in 1, `{[string]: f32}[] | f64`, where the spelling's `{[` read an
+      array-of-maps arm as a map.
+    - `annNulListKind` asks `tyIsNulI32List` of the type its callers hold. It was reached in
+      4,411 files and differed in 0.
+
+    The 4 differing files, and the 27 the compiler traps on, build byte-identical modules
+    with the same output under the master seed and the candidate.
+  - Left: every niche ladder and grammar test keeps a caller in a file another lane owns.
+    - `nameIsNulI32List`, `nameIsNulString`, `nameIsNulBool` and `nulLitUnionScan` are held
+      by `fieldCodeOfSpelling` (emit_shape_rows). `forceAnnLeafReps` also holds
+      `nameIsNulI32List` and `nameIsNulString`, because generic-application arguments have no
+      type.
+    - `nameIsStrLitSet` falls with `nulLitUnionScan` and `nameIsLitUnionArray`.
+    - `nameIsMap` is held by emit_shape_rows, emit_mv_slots and emit_shape_intern.
+    - `nameIsMapMemberUnion` is now called only by `nameIsBareMap`. That is held by
+      emit_shape_rows, emit_map_value_slots and emit_mono.
+    - `annRetNameOf` is held by emit_mono, `collectATypeRef`, emit_union_atoms and
+      emit_start_block. Those callers hold stored names.
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
   slot by element type. This turns most of the B key producers into dead code. A probe compared
   the spelling's name with the row that `rlSlotOfTy` keys by the node's element type, at fifteen

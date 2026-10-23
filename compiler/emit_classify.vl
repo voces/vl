@@ -210,10 +210,12 @@ import {
   tyIsLitUnionArray,
   tyIsNewtypeBrand,
   tyIsNulValueUnionBox,
+  tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyIsRecord,
   tyLitMemberTexts,
   tyMutEpoch,
+  tyNulInnerIsPrim,
   tyNumScalarBaseName,
   tyPrimNameOf,
   tyReachesUnion,
@@ -281,7 +283,6 @@ import {
 } from "./emit_atom_kinds"
 import {
   PL_READ_UNPLACED,
-  annRetNameOf,
   callMemProp,
   callOriginOf,
   capIsBound,
@@ -299,8 +300,6 @@ import {
   nameIsF64Array,
   nameIsI32Array,
   nameIsI64Array,
-  nameIsNulBool,
-  nameIsNulLitUnion,
   nameIsNulLitUnionList,
   nameIsNulStrList,
   nameIsStringArray,
@@ -361,7 +360,6 @@ import {
   bcPutB,
   bcSpineLeave,
   calleeRetIsNulLitUnion,
-  cloArrSlotRetName,
   cloArrSlotSigKey,
   cloCallCalleeFnTy,
   cloCallResultLitUnion,
@@ -797,7 +795,6 @@ import {
 import {
   COPY_CHAIN_MAX,
   annCloSigSpelled,
-  annIsTopLevelFunc,
   annSigKeyTy,
   calleeNodeSigKey,
   cloNameSigKeyTy,
@@ -1165,6 +1162,7 @@ import {
   tyNulLitUnionMemberTexts,
   tyPeelNul,
   tyStepElem,
+  tyStepRet,
 } from "./tyquery"
 
 // The interning key for lifted function `fe`'s env-leading `$fnsig`, or "" when the
@@ -10629,41 +10627,10 @@ export function stmtIsTailValue(stmtIx: i32, fnIx: i32) {
   false
 }
 
-// The return-type name of a function-value callee `name` (in scope of `fnIx`): the return
-// part of its source function-type annotation — a closure-typed param, local/global
-// binding, or a union arm narrowed to a bare closure. "" when `name` isn't a resolvable
-// closure value or its annotation isn't a `(…) => R` arrow.
-export function calleeCloRetName(name: string, fnIx: i32) {
-  let ft = ""
-  // A union binding narrowed to a bare-closure arm carries the arm's `(…) => R` name.
-  const nc = narrowedClosureOf(name)
-  if nc != "" {
-    ft = nc
-  } else if fnIx >= 0 {
-    // A closure-typed PARAM of the enclosing function.
-    const fn = nodeAt(fnIx)
-    if fn is FuncDecl {
-      const params = fn.fnParams
-      let i = 0
-      while i < params.length {
-        const p = nodeAt(params[i])
-        if p is Param {
-          if p.parName == name {
-            const pn = tyNameOf(p.parType)
-            // The annotation's tree root, else its arena type: a top-level function type,
-            // not an arrow anywhere in the spelling.
-            if annIsTopLevelFunc(p.parType, nodeTyIxOf(p.parType)) { ft = pn }
-          }
-        }
-        i = i + 1
-      }
-    }
-  }
-  // A closure-typed local/global binding annotation.
-  if ft == "" { ft = identFnTypeAnnName(name, fnIx) }
-  // The second exact copy of `annRetNameOf` (#1144); same `< 0` vs `< 1` note as
-  // `cloArrSlotRetName` above.
-  return annRetNameOf(ft)
+// The result type of calling the closure value at callee node `callFn`, through a `| null` on
+// the callee's type; -1 when the checker recorded no function type there.
+function cloCallRetTy(callFn: i32): i32 {
+  tyStepRet(tyPeelNul(nodeTyIxOf(callFn)))
 }
 
 // True if the expression is a NAME (param / local / module global) annotated
@@ -10735,7 +10702,7 @@ export function exprNulBool(exprIx: i32, fnIx: i32) {
         }
         // A call of a closure-typed VALUE (`p()` where `p: () => boolean | null`) — a
         // param / local / global `fnIndexOf` can't see: read its return-type annotation.
-        if nameIsNulBool(calleeCloRetName(callee.identName, fnIx)) {
+        if t < 0 && tyNulInnerIsPrim(cloCallRetTy(e.callFn), "boolean") {
           return true
         }
       }
@@ -10921,18 +10888,15 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
         }
         // A call of a closure-typed VALUE (`p()` where `p: () => K | null`) — a param /
         // local / global whose `K | null` niche return `fnIndexOf` can't see.
-        if nameIsNulLitUnion(calleeCloRetName(callee.identName, fnIx)) {
-          return true
-        }
+        if t < 0 && tyIsNullableLitUnion(cloCallRetTy(e.callFn)) { return true }
       }
       // An INDEXED closure-array call (`p[i]()` where `p: (() => K | null)[]`): the element's
-      // closure result is the `K | null` niche. `cloArrSlotRetName` reads it off the ref-list slot,
-      // the indexed dual of the Ident `calleeCloRetName` above — so `const t0 = p[i]()` binds the
+      // closure result is the `K | null` niche, read off the element's closure type, the indexed
+      // dual of the Ident case above — so `const t0 = p[i]()` binds the
       // kind-0 litunion niche (an i32) instead of mis-inferring the softened `string | null` ref.
       if callee is Index {
         if exprRefArray(callee.idxArr, fnIx) {
-          const rn = cloArrSlotRetName(refListSlotOfExpr(callee.idxArr, fnIx))
-          if nameIsNulLitUnion(rn) { return true }
+          if tyIsNullableLitUnion(cloCallRetTy(e.callFn)) { return true }
         }
       }
       // Fallback, scoped to a call: a `K | null`-returning closure value call whose callee the
