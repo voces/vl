@@ -141,7 +141,12 @@ import {
   tsMentionsAnyName,
 } from "./ast"
 import { bignumReset, numLexFitsI32, numLexIsFloat } from "./emit_bignum"
-import { srcmapFileOfTok, srcmapPathOf } from "./srcmap"
+import {
+  srcmapFileOfTok,
+  srcmapLoadOrder,
+  srcmapModOfTok,
+  srcmapPathOf,
+} from "./srcmap"
 import {
   LIT_PIECE,
   NEW_FIXED_MAX,
@@ -391,6 +396,7 @@ import {
   gInitGLocs,
   gInitGNames,
   gInitGuard,
+  gInitMods,
   gInitProgIdx,
   gInitReaders,
   gInitStartOrd,
@@ -1623,15 +1629,17 @@ function startScanIf(ifIx: i32) {
 // motivates it. This block is the ANALYSIS: the reachability walk, the safety
 // predicate, and the one query the four start-fn / global-section gates share.
 
-// Marks every arena node reachable from the top-level region — the top-level statement list
-// and initializers — into `marks`, without descending into a nested `FuncDecl` (a lambda
-// literal written at top level is lifted to its own wasm function, but its body still
-// addresses the binding as a module cell). A node shape this ladder does not know leaves its descendants unmarked, refusing the promotion — a hole here costs population, never soundness.
-function promoMark(marks: i32[], ix: i32) {
+// Marks every arena node reachable from the top-level statements and initializers with `val`
+// (the init window's number plus one; -1 once two windows reach it), without descending into a
+// nested `FuncDecl`: a lifted top-level lambda still addresses the binding as a module cell.
+// A node shape this ladder does not know leaves its descendants unmarked, refusing the promotion — a hole here costs population, never soundness.
+function promoMark(marks: i32[], ix: i32, val: i32) {
   if ix < 0 { return 0 }
   if ix >= marks.length { return 0 }
-  if marks[ix] == 1 { return 0 }
-  marks[ix] = 1
+  if marks[ix] == val || marks[ix] == -1 { return 0 }
+  let v = val
+  if marks[ix] != 0 { v = -1 }
+  marks[ix] = v
   const n = nodeAt(ix)
   match n {
     FuncDecl => {
@@ -1641,81 +1649,81 @@ function promoMark(marks: i32[], ix: i32) {
       const bs = n.blkStmts
       let bi = 0
       while bi < bs.length {
-        promoMark(marks, bs[bi])
+        promoMark(marks, bs[bi], v)
         bi = bi + 1
       }
       return 0
     }
     LetDecl => {
-      return promoMark(marks, n.letInit)
+      return promoMark(marks, n.letInit, v)
     }
     BinExpr => {
-      promoMark(marks, n.binLeft)
-      return promoMark(marks, n.binRight)
+      promoMark(marks, n.binLeft, v)
+      return promoMark(marks, n.binRight, v)
     }
     Call => {
-      promoMark(marks, n.callFn)
+      promoMark(marks, n.callFn, v)
       const args = n.callArgs
       let ai = 0
       while ai < args.length {
-        promoMark(marks, args[ai])
+        promoMark(marks, args[ai], v)
         ai = ai + 1
       }
       return 0
     }
     IfStmt => {
-      promoMark(marks, n.ifCond)
-      promoMark(marks, n.ifThen)
-      return promoMark(marks, n.ifElse)
+      promoMark(marks, n.ifCond, v)
+      promoMark(marks, n.ifThen, v)
+      return promoMark(marks, n.ifElse, v)
     }
     WhileStmt => {
-      promoMark(marks, n.whileCond)
-      return promoMark(marks, n.whileBody)
+      promoMark(marks, n.whileCond, v)
+      return promoMark(marks, n.whileBody, v)
     }
     ForRange => {
-      promoMark(marks, n.frFrom)
-      promoMark(marks, n.frTo)
-      promoMark(marks, n.frStep)
-      return promoMark(marks, n.frBody)
+      promoMark(marks, n.frFrom, v)
+      promoMark(marks, n.frTo, v)
+      promoMark(marks, n.frStep, v)
+      return promoMark(marks, n.frBody, v)
     }
     ForIn => {
-      promoMark(marks, n.fiIter)
-      return promoMark(marks, n.fiBody)
+      promoMark(marks, n.fiIter, v)
+      return promoMark(marks, n.fiBody, v)
     }
     RetStmt => {
-      return promoMark(marks, n.retArg)
+      return promoMark(marks, n.retArg, v)
     }
     Unary => {
-      return promoMark(marks, n.unArg)
+      return promoMark(marks, n.unArg, v)
     }
     Paren => {
-      return promoMark(marks, n.parInner)
+      return promoMark(marks, n.parInner, v)
     }
     Member => {
-      return promoMark(marks, n.memObj)
+      return promoMark(marks, n.memObj, v)
     }
     OptMember => {
-      return promoMark(marks, n.omObj)
+      return promoMark(marks, n.omObj, v)
     }
     IsExpr => {
-      return promoMark(marks, n.isObj)
+      return promoMark(marks, n.isObj, v)
     }
     AsExpr => {
-      return promoMark(marks, n.asObj)
+      return promoMark(marks, n.asObj, v)
     }
     Index => {
-      promoMark(marks, n.idxArr)
-      return promoMark(marks, n.idxIndex)
+      promoMark(marks, n.idxArr, v)
+      return promoMark(marks, n.idxIndex, v)
     }
     // A spread's source is an operand like any other (D2334).
     Spread => {
-      return promoMark(marks, n.spdArg)
+      return promoMark(marks, n.spdArg, v)
     }
     ArrayLit => {
       const es = n.arrElems
       let ei = 0
       while ei < es.length {
-        promoMark(marks, es[ei])
+        promoMark(marks, es[ei], v)
         ei = ei + 1
       }
       return 0
@@ -1724,32 +1732,32 @@ function promoMark(marks: i32[], ix: i32) {
       const fs = n.objFields
       let fi = 0
       while fi < fs.length {
-        promoMark(marks, fs[fi])
+        promoMark(marks, fs[fi], v)
         fi = fi + 1
       }
       return 0
     }
     FieldInit => {
-      return promoMark(marks, n.fiValue)
+      return promoMark(marks, n.fiValue, v)
     }
     MatchExpr => {
-      promoMark(marks, n.matchScrut)
+      promoMark(marks, n.matchScrut, v)
       const pats = n.matchPats
       let pi = 0
       while pi < pats.length {
-        promoMark(marks, pats[pi])
+        promoMark(marks, pats[pi], v)
         pi = pi + 1
       }
       const binds = n.matchBinds
       let bj = 0
       while bj < binds.length {
-        promoMark(marks, binds[bj])
+        promoMark(marks, binds[bj], v)
         bj = bj + 1
       }
       const bodies = n.matchBodies
       let mj = 0
       while mj < bodies.length {
-        promoMark(marks, bodies[mj])
+        promoMark(marks, bodies[mj], v)
         mj = mj + 1
       }
       return 0
@@ -1783,6 +1791,168 @@ function globalPromotable(gi: i32) {
   false
 }
 
+// The init windows: each maximal run of top-level globals and statements, in the order the
+// start runs them, written in one module. Window `w` covers globals `iwG0[w]` to `iwG1[w]` and
+// statements `iwS0[w]` to `iwS1[w]`, end exclusive; `gWinOf`/`sWinOf` give each node's window.
+let iwG0: i32[] = []
+let iwG1: i32[] = []
+let iwS0: i32[] = []
+let iwS1: i32[] = []
+let iwMod: i32[] = []
+let gWinOf: i32[] = []
+let sWinOf: i32[] = []
+// The globals and statements the start-function walks cover: everything, or one init's window.
+let swG0 = 0
+let swG1 = 0
+let swS0 = 0
+let swS1 = 0
+// The windows each init function runs, `ifW0[k]` to `ifW1[k]` end exclusive.
+let ifW0: i32[] = []
+let ifW1: i32[] = []
+
+// The module node `ix` is written in, or -1 when no token places it.
+function topNodeMod(ix: i32): i32 {
+  let tk = declNameTokOf(ix)
+  if tk < 0 && ix >= 0 && ix < nodeToks.length { tk = nodeToks[ix] }
+  if tk < 0 { return -1 }
+  srcmapModOfTok(tk)
+}
+
+// Splits the top level into init windows. A node no token places joins the module after it,
+// or the one before it at the end.
+function computeInitWindows() {
+  iwG0 = []
+  iwG1 = []
+  iwS0 = []
+  iwS1 = []
+  iwMod = []
+  gWinOf = []
+  sWinOf = []
+  const isG: boolean[] = []
+  const mods: i32[] = []
+  let gi = 0
+  let si = 0
+  while gi < globalStmts.length || si < startStmts.length {
+    let takeGlobal = gi < globalStmts.length
+    if takeGlobal && si < startStmts.length {
+      if startStmtOrd[si] < globalStmtOrd[gi] { takeGlobal = false }
+    }
+    isG.push(takeGlobal)
+    if takeGlobal {
+      mods.push(topNodeMod(globalStmts[gi]))
+      gi = gi + 1
+    } else {
+      mods.push(topNodeMod(startStmts[si]))
+      si = si + 1
+    }
+  }
+  let next = -1
+  let j = mods.length - 1
+  while j >= 0 {
+    if mods[j] < 0 { mods[j] = next } else { next = mods[j] }
+    j = j - 1
+  }
+  let last = 0
+  gi = 0
+  si = 0
+  let k = 0
+  while k < mods.length {
+    if mods[k] < 0 { mods[k] = last } else { last = mods[k] }
+    if k == 0 || mods[k] != mods[k - 1] {
+      iwG0.push(gi)
+      iwG1.push(gi)
+      iwS0.push(si)
+      iwS1.push(si)
+      iwMod.push(mods[k])
+    }
+    const w = iwMod.length - 1
+    if isG[k] {
+      gWinOf.push(w)
+      gi = gi + 1
+      iwG1[w] = gi
+    } else {
+      sWinOf.push(w)
+      si = si + 1
+      iwS1[w] = si
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Whether window `w` lowers any code: a statement, a global whose initialiser runs, or a
+// guarded global's progress write.
+function initWindowLive(w: i32): boolean {
+  if iwS1[w] > iwS0[w] { return true }
+  let gi = iwG0[w]
+  while gi < iwG1[w] {
+    if globalRunsInStartFn(gi) { return true }
+    if gi < gInitGuard.length && gInitGuard[gi] >= 1 && gInitAny { return true }
+    gi = gi + 1
+  }
+  false
+}
+
+// Groups the live windows into one init function per module, in load order, into
+// `gInitMods` and `ifW0`/`ifW1`. A single-file program, a module whose code is split by
+// another's, or modules out of load order leave `gInitMods` empty: the start runs it all.
+function computeInitFns(hasStart: i32) {
+  gInitMods = []
+  ifW0 = []
+  ifW1 = []
+  swG1 = 0
+  swS1 = 0
+  initNarrowTop = 0
+  const order = srcmapLoadOrder()
+  if hasStart == 0 || order.length < 2 { return 0 }
+  const rank: { [i32]: i32 } = Map()
+  let r = 0
+  while r < order.length {
+    rank[order[r]] = r
+    r = r + 1
+  }
+  let prevRank = -1
+  let w = 0
+  while w < iwMod.length {
+    if initWindowLive(w) {
+      const k = gInitMods.length - 1
+      if k >= 0 && gInitMods[k] == iwMod[w] {
+        ifW1[k] = w + 1
+      } else {
+        const rk = rank[iwMod[w]] ?? 0
+        if rk <= prevRank {
+          gInitMods = []
+          ifW0 = []
+          ifW1 = []
+          return 0
+        }
+        prevRank = rk
+        gInitMods.push(iwMod[w])
+        ifW0.push(w)
+        ifW1.push(w + 1)
+      }
+    }
+    w = w + 1
+  }
+  0
+}
+
+// Sets the start-function walks to cover windows `w0` to `w1`, end exclusive, or the whole
+// top level when `w0` is negative.
+function startWalkWindows(w0: i32, w1: i32) {
+  swG0 = 0
+  swG1 = globalStmts.length
+  swS0 = 0
+  swS1 = startStmts.length
+  if w0 >= 0 && w1 > w0 {
+    swG0 = iwG0[w0]
+    swG1 = iwG1[w1 - 1]
+    swS0 = iwS0[w0]
+    swS1 = iwS1[w1 - 1]
+  }
+  0
+}
+
 // Decides, for every top-level binding, whether it lives in a cell or a start-function local,
 // and re-densifies the cell indices around the ones that leave. Runs once, at the top of
 // `emitModule`, after every arena-mutating pass. The safety predicate is P1 here plus P2/P3
@@ -1809,12 +1979,15 @@ export function computeGlobalPromotion() {
     gFoldLen.push(0)
     ri = ri + 1
   }
-  // P1: promotion never mints a start function, so it needs an existing one.
+  computeInitWindows()
+  // P1: promotion never mints a start function, so it needs an existing one: a statement in
+  // the binding's own init window.
   let anyCand = false
   if startStmts.length > 0 {
     let ci = 0
     while ci < globalStmts.length {
-      if globalPromotable(ci) {
+      const cw = gWinOf[ci]
+      if iwS1[cw] > iwS0[cw] && globalPromotable(ci) {
         gPromoOk[ci] = 1
         anyCand = true
       }
@@ -1832,14 +2005,16 @@ export function computeGlobalPromotion() {
       marks.push(0)
       mi = mi + 1
     }
+    // Each window marks with its own number, so a read from another window vetoes too: a
+    // promoted binding is a local of its window's init function.
     let gi = 0
     while gi < globalStmts.length {
-      promoMark(marks, globalStmts[gi])
+      promoMark(marks, globalStmts[gi], gWinOf[gi] + 1)
       gi = gi + 1
     }
     let si = 0
     while si < startStmts.length {
-      promoMark(marks, startStmts[si])
+      promoMark(marks, startStmts[si], sWinOf[si] + 1)
       si = si + 1
     }
     let ai = 0
@@ -1853,9 +2028,9 @@ export function computeGlobalPromotion() {
         if isDefaultGlobalRef(ai) {
           const gd = globalIndexOf(nd.identName)
           if gd >= 0 { gPromoOk[gd] = 0 }
-        } else if marks[ai] == 0 {
+        } else if marks[ai] <= 0 || iwG0.length > 1 {
           const gj = globalIndexOf(nd.identName)
-          if gj >= 0 { gPromoOk[gj] = 0 }
+          if gj >= 0 && marks[ai] != gWinOf[gj] + 1 { gPromoOk[gj] = 0 }
         }
       }
       ai = ai + 1
@@ -2170,8 +2345,8 @@ function kidsYieldArmTail(b: i32): boolean {
 // position, so an init's push frames are driven by Member-receiver `.pop`s instead. Split from
 // the resets in `startFnDetectFrames` so it can be re-run per candidate binding of a shadowed name (D1595).
 function startFnDetectScratch() {
-  let gi = 0
-  while gi < globalStmts.length {
+  let gi = swG0
+  while gi < swG1 {
     // A PROMOTED binding's init runs here too (its `local.set` replaces the cell's
     // constexpr), so its scratch needs are detected on the same gate — else a const
     // init that needs a frame would reach the start fn with none reserved.
@@ -2205,8 +2380,8 @@ function startFnDetectScratch() {
   }
   // `.map`/`.filter` sites in top-level STATEMENTS (`print(e.map(...).length)`)
   // also run in the start function; `mfScan` recurses every statement shape itself.
-  let mfi = 0
-  while mfi < startStmts.length {
+  let mfi = swS0
+  while mfi < swS1 {
     mfScan(startStmts[mfi], -1)
     mfi = mfi + 1
   }
@@ -2214,8 +2389,8 @@ function startFnDetectScratch() {
   // top-level `for`/`while`/`if` body or a bare call). Scan each through the same
   // walkers (which recurse into for/while/if bodies). `startScanBlock` runs every
   // block walker over one body; `startScanIf` descends an if/else-if chain.
-  let si = 0
-  while si < startStmts.length {
+  let si = swS0
+  while si < swS1 {
     const st = nodeAt(startStmts[si])
     if st is ForRange {
       // The whole HEAD — bounds and step alike — is part of the start function's body, and
@@ -2264,8 +2439,8 @@ function startFnDetectScratch() {
   // Variant-rebox stash for the start function: a multi-field CALL result re-boxed into a
   // variant-box union arm in a non-const global initializer or a top-level statement.
   // `blockHasVariantRebox` recurses into for/while/if bodies itself.
-  let vrg = 0
-  while vrg < globalStmts.length {
+  let vrg = swG0
+  while vrg < swG1 {
     if globalRunsInStartFn(vrg) {
       const vg = nodeAt(globalStmts[vrg])
       if vg is LetDecl {
@@ -2278,23 +2453,23 @@ function startFnDetectScratch() {
     }
     vrg = vrg + 1
   }
-  let vrs = 0
-  while vrs < startStmts.length {
+  let vrs = swS0
+  while vrs < swS1 {
     if blockHasVariantRebox(startStmts[vrs], -1) { fnUsesVariantRebox = true }
     if blockHasStash(startStmts[vrs], -1, "optrecv") { fnUsesOptRecv = true }
     if blockHasStash(startStmts[vrs], -1, "listget") { fnUsesListGet = true }
     vrs = vrs + 1
   }
-  let lgi = 0
-  while lgi < globalStmts.length {
+  let lgi = swG0
+  while lgi < swG1 {
     if globalRunsInStartFn(lgi) {
       const lg = nodeAt(globalStmts[lgi])
       if lg is LetDecl { leqScanExpr(lg.letInit, -1) }
     }
     lgi = lgi + 1
   }
-  let lsi = 0
-  while lsi < startStmts.length {
+  let lsi = swS0
+  while lsi < swS1 {
     leqScanStmt(startStmts[lsi], -1)
     lsi = lsi + 1
   }
@@ -2321,8 +2496,8 @@ function collectStartLocals() {
   scopeSlots = []
   scopeFrames = []
   scopePush()
-  let i = 0
-  while i < startStmts.length {
+  let i = swS0
+  while i < swS1 {
     const s = nodeAt(startStmts[i])
     if s is ForRange {
       if (
@@ -2381,8 +2556,8 @@ function collectStartLocals() {
   // statement walk declared, so a program promoting nothing emits the frame it always did.
   // The slot registers under `<name>#g`, not the binding's own name — `#` cannot occur in a
   // source identifier, so nothing resolves to this slot by name; the only reader is `emitUserGlobalGet`/`emitUserGlobalSet` via `gPromoSlot`.
-  let pgi = 0
-  while pgi < globalStmts.length {
+  let pgi = swG0
+  while pgi < swG1 {
     // A global's initializer runs in this function, so its if-expression arms' locals are ours.
     const gd = nodeAt(globalStmts[pgi])
     if gd is LetDecl {
@@ -2410,11 +2585,56 @@ function collectStartLocals() {
   localNames.length
 }
 
-// Emits the synthetic start function's size-prefixed code entry onto `out`. The body runs
-// every non-const global initializer in declaration order, then `global.set gi`, so each cell
-// holds its real value before any other code runs. Frames exactly as `emitFuncCode` does:
-// collect locals, detect scratch frames, lay them out, emit the locals vector, then the body and `end`, size-prefixed.
-function emitStartFnCode(out: u8[]) {
+// Emits the synthetic start function's size-prefixed code entry onto `out`: the pool fills,
+// then a call to each module's init function, or every top-level node itself when
+// `gInitMods` is empty. `n` is the user function count.
+function emitStartFnCode(out: u8[], n: i32) {
+  emitCurFnIx = -1
+  emitCurFnPos = -1
+  startWalkWindows(-1, -1)
+  if gInitMods.length == 0 { return emitStartBodyCode(out, -1) }
+  // The whole top level is scanned once, so every init reads one accumulator answer.
+  if collectStartLocals() < 0 { return -1 }
+  startFnDetectFrames()
+  strAccScanStart()
+  const body: u8[] = []
+  body.push(0)
+  const prev = wTarget(body)
+  emitStrFillCalls()
+  let k = 0
+  while k < gInitMods.length {
+    fbCall(gImports + n + 1 + k)
+    k = k + 1
+  }
+  fbEnd()
+  wTarget(prev)
+  const outPrev = wTarget(out)
+  wULEB(body.length)
+  wBytes(body)
+  wTarget(outPrev)
+  0
+}
+
+// The narrowing depth before the first init function, restored after the last.
+let initNarrowTop = 0
+
+// Emits the code entry of init function `k` onto `out`: the top-level nodes of its windows.
+function emitInitFnCode(out: u8[], k: i32) {
+  emitCurFnIx = -1
+  emitCurFnPos = -1
+  startWalkWindows(ifW0[k], ifW1[k])
+  fnUsesU8Push = false
+  fnUsesMapVals = false
+  if k == 0 { initNarrowTop = narrowTop }
+  const rc = emitStartBodyCode(out, k)
+  if k == gInitMods.length - 1 { restoreNarrow(initNarrowTop) }
+  rc
+}
+
+// The body both entries above share, over the nodes `startWalkWindows` set: the whole start
+// when `k` is -1, else init function `k`, which runs no pool fill and keeps the narrowing
+// its predecessor left. Frames exactly as `emitFuncCode` does.
+function emitStartBodyCode(out: u8[], k: i32) {
   // Locals first, detection second: the scratch detectors classify expressions through the
   // declared-locals registry, so it must be populated first — `declaredSlotOf` falls back to the
   // flat `localNames` scan when no scope frame is active. The start function is synthetic and has
@@ -2431,7 +2651,7 @@ function emitStartFnCode(out: u8[]) {
   // Which top-level string bindings are loop accumulators. After the detection sweep, which
   // is what sets `fnUsesStrOp` for this body, and after the last user function's own scan —
   // the start function's code entry is emitted last, so nothing overwrites the answer.
-  strAccScanStart()
+  if k < 0 { strAccScanStart() }
   // The start function is void, so it has no union-box return to sink, and its top-level
   // bindings take neither sink; clear the flags the last user function left set, or
   // `fbBeginFunc`/`fbLocalsCount`/`fbEmitLocalsVec` would each reserve a frame for it.
@@ -2444,7 +2664,7 @@ function emitStartFnCode(out: u8[]) {
   const bodyExpr: u8[] = []
   const exprPrev = wTarget(bodyExpr)
   // The pool fills first: every later line of the module may read a pool string.
-  emitStrFillCalls()
+  if k < 0 { emitStrFillCalls() }
   // Reset the emit-time scope/loop bookkeeping (the start fn has its own empty frame),
   // mirroring `emitFuncCode` — no leak from the last user function.
   scopeNames = []
@@ -2467,8 +2687,8 @@ function emitStartFnCode(out: u8[]) {
   // (merged on `startStmtOrd`/`globalStmtOrd`, the list positions): `xs.push(1)` before
   // `const ys = xs.map(f)` must execute before that init. A program with only inits, or only
   // statements, emits the same bytes as before. The emit context is module-level (`fnIx = -1`): identifier reads/writes resolve to globals.
-  let gi = 0
-  let si = 0
+  let gi = swG0
+  let si = swS0
   // Post-statement narrowing for the top-level statement list (the assignment
   // narrowing of `pushPostGuardNarrow` — a top-level guard `if` cannot
   // `return`, so only the assignment arm ever fires here). Restored at loop end.
@@ -2478,9 +2698,9 @@ function emitStartFnCode(out: u8[]) {
   // produce one is armed for exactly the span streaming this body. Every user function body and
   // every const cell's constexpr init has already run with the flag false, so a promoted binding reaching them is a loud reject rather than a wrong opcode.
   gPromoInStart = true
-  while gi < globalStmts.length || si < startStmts.length {
-    let takeGlobal = gi < globalStmts.length
-    if takeGlobal && si < startStmts.length {
+  while gi < swG1 || si < swS1 {
+    let takeGlobal = gi < swG1
+    if takeGlobal && si < swS1 {
       if startStmtOrd[si] < globalStmtOrd[gi] { takeGlobal = false }
     }
     if takeGlobal {
@@ -2539,7 +2759,7 @@ function emitStartFnCode(out: u8[]) {
   // inert: a failed body aborts the whole module emit, and `computeGlobalPromotion`
   // clears the flag at the top of the next one.
   gPromoInStart = false
-  restoreNarrow(savedStartNarrowTop)
+  if k < 0 { restoreNarrow(savedStartNarrowTop) }
   wTarget(exprPrev)
 
   const body: u8[] = []
@@ -5721,6 +5941,7 @@ function fnLocSuffix(nodeIx: i32, anchorOk: boolean): string {
 function nameMapCount(n: i32): i32 {
   let count = gImports + n
   if startStmts.length > 0 { count = count + 1 }
+  count = count + gInitMods.length
   if gHelpStrHash >= 0 { count = count + 6 }
   if gHelpStrBytes >= 0 { count = count + 1 }
   if gHelpMapProbe >= 0 { count = count + 2 }
@@ -5951,6 +6172,13 @@ function emitNameSection(n: i32) {
     // Top-level statements have no declaration of their own, so the start frame names the
     // ENTRY file at line 1 — the file a reader opens, which is what the frame is for.
     wName("__start__" + startLocSuffix())
+  }
+  // Each init function names its own module, so a trap in its top level names that file.
+  let ik = 0
+  while ik < gInitMods.length {
+    wULEB(gImports + n + 1 + ik)
+    wName("__start__@" + srcmapPathOf(gInitMods[ik]) + ":1")
+    ik = ik + 1
   }
   // The shared runtime helpers (module-tail indices — after the start fn and the
   // `__log__` decoder, so the namemap stays strictly increasing).
@@ -6419,9 +6647,12 @@ function emitModule(_stmts: i32[]) {
   // index shifts. `memFn` (0 or 1) feeds the function/code section counts.
   let memFn = 0
   if memLogUsed { memFn = 1 }
-  gMemLogIdx = gImports + n + hasStart
+  // The per-module init functions the start calls sit right after it.
+  computeInitFns(hasStart)
+  const nStartFns = hasStart + gInitMods.length
+  gMemLogIdx = gImports + n + nStartFns
 
-  const nHelpers = assignSharedHelperIndices(gImports + n + hasStart + memFn)
+  const nHelpers = assignSharedHelperIndices(gImports + n + nStartFns + memFn)
 
   // Placed by `emitGlobalSection`, which runs before any function body is emitted.
   gHeapGlobalIdx = -1
@@ -9230,7 +9461,7 @@ function emitFunctionSection(
   // Framed by `frameFunctionSection` once the bodies have decided the thunks it ends with.
   const funcPayload: u8[] = []
   const fnPrev = wTarget(funcPayload)
-  gFuncFixedN = n + hasStart + memFn + nHelpers
+  gFuncFixedN = n + hasStart + gInitMods.length + memFn + nHelpers
   let fi = 0
   while fi < n {
     // A function carrying the env param whose signature matches an interned `$fnsig` is
@@ -9245,6 +9476,12 @@ function emitFunctionSection(
   }
   if hasStart == 1 {
     wULEB(typeOffset + n) // start fn functype index
+  }
+  // Each init function shares the start's `()->()` functype.
+  let ii = 0
+  while ii < gInitMods.length {
+    wULEB(typeOffset + n)
+    ii = ii + 1
   }
   if memLogUsed {
     // The synthetic `__log__` decoder uses the standalone `(i32,i32)->()` functype
@@ -9958,7 +10195,7 @@ function buildCodePayload(
 ) {
   // The count is written once the bodies have decided the thunks, into the head chunk pushed
   // here; `rowsAt` marks the span rows its width change moves.
-  const fixedN = n + hasStart + memFn + nHelpers
+  const fixedN = n + hasStart + gInitMods.length + memFn + nHelpers
   const countHead: u8[] = []
   const codePrev = wTarget(countHead)
   wULEB(fixedN)
@@ -9986,8 +10223,16 @@ function buildCodePayload(
     // Pushed after them, since `emitFnSpanAt` returns the first row whose range holds the offset and the narrower answer is the useful one.
     const rows = emitFnSpanStart.length
     const entry: u8[] = []
-    if emitStartFnCode(entry) < 0 { return -1 }
+    if emitStartFnCode(entry, n) < 0 { return -1 }
     placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
+  }
+  let ik = 0
+  while ik < gInitMods.length {
+    const rows = emitFnSpanStart.length
+    const entry: u8[] = []
+    if emitInitFnCode(entry, ik) < 0 { return -1 }
+    placeCodeEntry(codePayload, entry, rows, -1, -1, 4, "")
+    ik = ik + 1
   }
   if memLogUsed {
     const rows = emitFnSpanStart.length

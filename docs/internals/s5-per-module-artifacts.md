@@ -1335,4 +1335,82 @@ order:
 
 **What is left of step 7.** The unnamed reservations, the start function and the runtime's
 order (§18), the helpers just listed, and §17's 8 functions whose helper set depends on the
-program.
+program. §21 moves the start function's body into the modules.
+
+## 21. Step 7, fourth part: each module's initialisation is its own function
+
+**Why `rt#0` differed.** The start function ran every top-level global initialiser and
+statement of the program, so its body was the program: two programs that share a module
+still held that module's initialisation in two different `rt#0` bodies.
+
+**What moved: the top level.** `computeInitWindows` (emit_sections.vl) cuts the top-level
+globals and statements, in the order the start runs them, into windows of one module each.
+`computeInitFns` groups the windows that lower any code into one init function per module,
+in load order (`gInitMods`). Each init function sits right after the start, takes the
+start's `() -> ()` type, and is named `__start__@<module path>:1`. The start keeps the
+pooled-string fill and then calls the inits in order.
+
+- **Which builds change.** A single-file program keeps the one start function, so its bytes
+  do not change. So does a program whose live windows do not come in load order (a module's
+  code split by another's), which falls back to the monolithic start.
+- **Program-wide passes stay program-wide.** The local and frame scan and the string
+  accumulator scan (`strAccScanStart`) run once over the whole top level, before the first
+  init. Promotion of a binding to a start local (P1, P4) is decided per window, so a
+  promoted binding never crosses an init function. The narrowing an init leaves is carried
+  into the next and restored after the last.
+- **The artifact.** `emitLinkSection` keys init `k` as `init:<module path>` and puts it in
+  that module's `LinkArt.init`. It removes the calls from `rt#0`'s body (`elDropInitCalls`).
+  `link()` places the inits after the start, in artifact order, and writes the calls back
+  into the start before its `end` (`lkWithCalls`). So `rt#0`'s artifact body is the pool
+  fill alone.
+
+**Measured.** Over 4,762 armed tests/cases builds at d78220c61 (the `@run` files plus every
+`modules/**/entry*.vl`), with this step's witness:
+
+| | master | this change |
+| --- | ---: | ---: |
+| module keys held by two or more | 37 | 37 |
+| module pairs that differ | 4,554 | 4,554 |
+| runtime functions held by two or more | 166 | 166 |
+| runtime pairs that differ | 4,811 | 4,811 |
+| of them, `rt#0` | 4,758 | 4,758 |
+| link proof: functions | 83,534 | 84,364 |
+| link proof: sections or bodies that differ, unresolved | 0, 0 | 0, 0 |
+
+The 830 new functions are the init functions; the module keys whose artifacts gained one
+differ in no new pair. Over the whole population `rt#0` still differs in every pair,
+because nearly every build is a single-file program whose start is unchanged. Over the 120
+`modules/**` builds alone, `rt#0` pairs go **118 → 27**: the 27 left differ in the pooled
+strings their start fills. The module pairs there stay 230 → 230.
+
+**The witness and the control.** `tests/cases/modules/start-init-per-module/` has two roots
+that share `table.vl`, whose top level builds a list and prints a sum. `entry2.vl` loads
+`other.vl` first, whose initialisation must run ahead of `table.vl`'s; neither root uses a
+pooled string. The control is master: 0 module pairs and 1 runtime pair (`rt#0`) differ.
+This change reads 0 and 0.
+
+**Gates.**
+
+- **Identity:** difftree `--identity` against a master fixpoint built from d78220c61 reads
+  16,461 files, 11,451 built, 964 differ and 0 uncompared; the fixpoint differs, since the
+  compiler is a multi-module program. Each of the 964 was run under both seeds: stdout,
+  stderr and exit code agree once wasm offsets are left out. A trap in a module's top level
+  now shows one more wasm backtrace frame, the start calling the init; the `vl source frames`
+  lines are the same. `--allow-diff` is needed.
+- **regress.vl:** 0 runs → not-runs, 0 → silent, no cell changed class.
+- **Seed:** the fixpoint holds, at 5,714,756 bytes (master's fixpoint 5,703,837, +0.19%);
+  `seed-size.vl --check` passes against its baseline.
+- **L2 guest fuel**, one run each on this source: 89,179,964,033 on master's seed and
+  89,198,915,296 on the new one (+0.02%).
+- **plumb-shape cost:** passes, with main fuel −3.0%, tail fuel −3.2% and RSS −2.0% against
+  its baseline.
+
+**What is left of the start function.**
+
+- **The pool fill** stays in `rt#0`, so a start still follows the program's string pool.
+  Moving it needs each module's literals filled by its own artifact, or the fill keyed by
+  the pool's content at link.
+- **The narrowing carried between inits** is a program fact: an init's body can depend on
+  what an earlier module's init narrowed. This step did not measure how often it does.
+- **Single-file programs** keep the monolithic start. A cache gains nothing from splitting
+  them, since their only module is the root.

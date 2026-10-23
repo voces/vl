@@ -54,15 +54,16 @@ export type LinkBand = { key: string, rank: i32, sort: string }
 // key carries (§6): the `-O` flavour, the `--low-memory-unused` bound, and whether the program
 // deletes from a map, which gives every map struct two more fields.
 export type LinkFacts = { optimized: i32, lowMem: i32, mapDeletes: boolean }
-// One module's artifact under `facts`; `deletes` if it calls `.delete`; `lifted` its lambdas and
-// nested functions, each framed in `liftedIn` by a function key or a `LIFT_*` mark; `consts` its
-// immutable initialisers; `defs`, `guards`, `pool`/`poolIs`, `tys`, `bands` the shared globals,
-// bindings, literals, group types and tag keys it names; the runtime's `tags`, and `sigs` by owner.
+// One module's artifact under `facts`; `deletes` if it calls `.delete`; `init` the function the
+// start calls for its top level; `lifted` its lambdas and nested functions, framed in `liftedIn`
+// by a function key or a `LIFT_*` mark; `consts` its immutable initialisers; `defs`, `guards`,
+// `pool`/`poolIs`, `tys`, `bands` what it names; the runtime's `tags`, and `sigs` by owner.
 export type LinkArt = {
   path: string,
   facts: LinkFacts,
   deletes: boolean,
   fns: LinkFn[],
+  init: LinkFn[],
   lifted: LinkFn[],
   liftedIn: string[],
   cells: LinkGlobal[],
@@ -167,10 +168,35 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
     fi = fi + 1
   }
   const nUser = fns.length
+  // Each artifact's init function follows the start, in load order, and the start calls it.
+  const inits: LinkFn[] = []
+  for a in arts {
+    for f in a.init { inits.push(f) }
+  }
+  let placed = inits.length == 0
   for f in p.runtime.fns {
     lkPut(fIdx, f.key, fi)
-    fns.push(f)
-    fi = fi + 1
+    if f.key == p.startKey && !placed {
+      fns.push(lkWithCalls(f, inits))
+      fi = fi + 1
+      for g in inits {
+        lkPut(fIdx, g.key, fi)
+        fns.push(g)
+        fi = fi + 1
+      }
+      placed = true
+    } else {
+      fns.push(f)
+      fi = fi + 1
+    }
+  }
+  if !placed {
+    for g in inits {
+      lkMiss(g.key)
+      lkPut(fIdx, g.key, fi)
+      fns.push(g)
+      fi = fi + 1
+    }
   }
   const thunks: LinkFn[] = []
   let ui = 0
@@ -197,6 +223,34 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
     dup: lkDup,
     facts: facts,
     factMiss: factMiss,
+  }
+}
+
+// The start `f` with a call to each of `inits` before its closing `end`.
+function lkWithCalls(f: LinkFn, inits: LinkFn[]): LinkFn {
+  const b: u8[] = []
+  const refs: LinkRef[] = []
+  const n = f.body.b.length - 1
+  let i = 0
+  while i < n {
+    b.push(f.body.b[i])
+    i = i + 1
+  }
+  for r in f.body.refs { refs.push(r) }
+  for g in inits {
+    b.push(0x10)
+    refs.push({ at: b.length, kind: LK_FUNC, key: g.key })
+  }
+  if n >= 0 { b.push(f.body.b[n]) }
+  {
+    key: f.key,
+    ty: f.ty,
+    sig: f.sig,
+    body: { b: b, refs: refs },
+    taken: f.taken,
+    thunk: f.thunk,
+    thunkTy: f.thunkTy,
+    thunkBody: f.thunkBody,
   }
 }
 
@@ -1001,6 +1055,7 @@ export function linkArtHash(a: LinkArt): i32 {
   let h = lkHS(-2128831035, a.path)
   if a.deletes { h = lkH(h, 1) } else { h = lkH(h, 0) }
   for f in a.fns { h = lkHF(h, f) }
+  for f in a.init { h = lkHF(h, f) }
   for f in a.lifted { h = lkHF(h, f) }
   for s in a.liftedIn { h = lkHS(h, s) }
   for g in a.cells {
