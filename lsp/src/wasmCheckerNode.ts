@@ -48,6 +48,7 @@
 // only by keeping the paired artifact first.
 
 import { execFileSync } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { readFileSync, statSync } from "node:fs";
 import type { ModuleReader } from "../../compiler/coreTypes.ts";
 import { withStd } from "./moduleGraph.ts";
@@ -110,6 +111,18 @@ const readSource = (
   }
 };
 
+// The last seed compiled in this isolate, keyed by its BYTES. Compiling the seed is
+// the expensive half of a load (V8 compiles each function lazily, per Module); an
+// Instance is cheap. So a second load of identical bytes gets a FRESH Instance —
+// compiler state is never shared — over the Module already compiled.
+let compiled: { bytes: Uint8Array; module: WebAssembly.Module } | undefined;
+export const seedModule = (bytes: Uint8Array): WebAssembly.Module => {
+  if (compiled !== undefined && Buffer.compare(compiled.bytes, bytes) === 0) return compiled.module;
+  const module = new WebAssembly.Module(bytes as BufferSource);
+  compiled = { bytes, module };
+  return module;
+};
+
 /**
  * Load (or reuse) the checker, trying `sources` in order. Returns undefined —
  * after a log line naming every rung that was tried — when no rung yields a seed
@@ -160,7 +173,7 @@ export const loadWasmChecker = (
         continue;
       }
       try {
-        const module = new WebAssembly.Module(got.bytes as BufferSource);
+        const module = seedModule(got.bytes);
         exports = new WebAssembly.Instance(module, {}).exports as unknown as Exports;
         loadedFrom = src;
         loadedMtime = got.mtime;

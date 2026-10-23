@@ -13,6 +13,7 @@ import { filePath } from "./support/filePath.ts";
 import { seedStatusView } from "../lsp/src/typeFeatures.ts";
 import {
   loadWasmChecker,
+  seedModule,
   type SeedOrigin,
 } from "../lsp/src/wasmCheckerNode.ts";
 
@@ -118,4 +119,38 @@ Deno.test("seed-status: a ladder with no viable rung reports undefined (degraded
       }`,
     );
   }
+});
+
+// ---- the per-isolate Module cache ------------------------------------------
+// A load of bytes already compiled reuses the Module and builds a FRESH Instance;
+// different bytes compile again. Both halves are observable: the Module identity,
+// and two checkers over one seed answering for their own documents.
+
+Deno.test({ name: "seed-module: identical bytes share a Module, other bytes do not", ignore }, () => {
+  const bytes = Deno.readFileSync(SEED);
+  const first = seedModule(bytes);
+  if (seedModule(bytes.slice()) !== first) {
+    throw new Error("want: a copy of the same seed bytes reuses the compiled Module");
+  }
+  // The smallest valid module: magic + version. Same isolate, different bytes.
+  const empty = seedModule(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+  if (empty === first) throw new Error("want: different bytes compile their own Module");
+  if (seedModule(bytes) === first) {
+    throw new Error("want: the cache holds the LAST bytes, so the seed compiles again");
+  }
+});
+
+Deno.test({ name: "seed-module: two checkers over one seed keep separate instances", ignore }, async () => {
+  const none = () => undefined;
+  const a = loadWasmChecker(SEED, log)!;
+  const b = loadWasmChecker(SEED, log)!;
+  const srcA = "const x = 1\nprint(x)\n";
+  const srcB = 'const x = "s"\nprint(x)\n';
+  const want = await a.hoverTypeAt(srcA, "/tmp/a.vl", none, 0, 6);
+  const other = await b.hoverTypeAt(srcB, "/tmp/b.vl", none, 0, 6);
+  if (want === other) throw new Error(`want two different types, got ${want} for both`);
+  // `a`'s memo still holds srcA, so this reads `a`'s instance without re-checking:
+  // a shared instance would answer with `b`'s program.
+  const again = await a.hoverTypeAt(srcA, "/tmp/a.vl", none, 0, 6);
+  if (again !== want) throw new Error(`want ${want} from a's own instance, got ${again}`);
 });
