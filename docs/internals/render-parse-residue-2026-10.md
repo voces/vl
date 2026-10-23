@@ -448,9 +448,39 @@ What each slice changes:
   no closed type, so `monoPinFnParamTys` answers `[]`. Typing it needs the delivered hole
   function's instance type. **Step 1 moved no consumer.** No `=>` pin site has zero
   disagreement, so the instance's TypeRef text, its key and `rsC` stay on the spelling there.
+
+  **The seed call's instance types, landed (2026-10-23).** In all 11 coerce files the delivery
+  came from a call through a binding (`monoCallIfBound`, `monoCallIfValue`, `monoCallWrittenLet`).
+  Each takes its signature from `monoSeedCallSigTys` (formerly `monoSeedCallSig`), which mints
+  the seed's instance for the call. It now also returns that instance's parameter types when
+  each `=>` pin among them is a closed function type, and the three callers pass them as
+  `deliveryTys`. A probe over `tests/cases/closures` (1,077 files), with the control
+  `hole-fn-list-handed-hole-param.vl` disagreeing:
+
+  | site | files before: agree / disagree | files after | events after: agree / disagree |
+  | --- | --- | --- | --- |
+  | `monoCoerceFnValueName`'s instance | 5 / 11 | 11 / 6 | 30 / 29 |
+
+  difftree `--identity` found 5 of 16,509 files with a different module: the five of the 11 that
+  now type the instance (`hole-fn-if-join-result-handed-hole-fn`,
+  `hole-fn-join-called-at-two-fn-types` and its `-in-function` twin, and
+  `hole-fn-list-handed-hole-lambda` and `-param`). Each module loses one function. That function
+  was a second instance at the same signature, minted because a key with an open type did not
+  match the typed one. All five print what they did before.
+
+  Left: in the other 6 files the seed instance's own parameter is open. Its TypeRef text is a
+  `=>` key and its type is `(_, _) => _`. A second probe, at every `=>` pin `monoPinHoleParam`
+  pushes, found 67 open pins in 17 files: the six, plus the `listed-hole-fn-*`,
+  `hole-copy-chain-*` and `module-fw-binding-*` families. All 29 the report lists came from one
+  arm, the `monoArgPinName` pin. There the argument is a hole function, and `monoArgTyName` keys
+  it by its REP signature (`fnSigKeyOf` or `sigKeyOfTy`), with each hole at its `i32` default.
+  No arena type stands behind that key.
+  Typing it needs the hole function's instance keyed by type (D3), or a checker bind of the
+  hole at that call. Until then no `=>` pin site has zero disagreement. The TypeRef text, the
+  key, `rsC`, and the member-order and literal-arm rows stay on the spelling.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
-  (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
+  (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot
   stay inside `emit_mono`. It follows C1.
 - **C3.** The `emit_shape_intern` walkers take the field type alongside the field text. A probe
   over the self-compile and 16,820 fixture and corpus files compared each site's spelling
