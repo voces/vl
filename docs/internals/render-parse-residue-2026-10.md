@@ -1001,7 +1001,7 @@ What each slice changes:
       The print readers were reached in 1 file and agreed; the complement, less and cell
       readers were reached in 0.
     - Identity sweep with the typed producer: 16,509 files, 11,651 built, 0 differ.
-  - Left: two producers whose text readers still read.
+  - Left: one producer whose text readers still read, and one retired below.
     - `litElseSurvName`'s render. With a placeholder for the value-atom arm, 0 of 16,509
       files differ, but the closure survivor still reads the text:
       `tests/cases/literal-unions/else-survivor-non-literal-arm.vl` (new; the sweep population
@@ -1018,9 +1018,9 @@ What each slice changes:
         wasm, because the ident read's unbox in `wasmEmit` asks `valueAtomKind` and
         `unionSetHasAtom` of `narrowedValueAtomOf`'s spelling. The "an atom kind" readers
         below have to take a kind or a type first. `emit_start_block` was the D5 lane's.
-    - `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74
-      files, where the complement has no member-set id, and it changes the spelling in 55 of
-      them. A typed slot no longer reaches it (`pushNarrowLess`'s typed arm).
+    - Retired: `removeAtomFromGo`'s spelling fallback. Before this, `removeAtomRestOf`
+      reached it in 74 files, where the complement had no member-set id, and it changed the
+      spelling in 55 of them. A typed slot no longer reached it (`pushNarrowLess`'s typed arm).
       - Done: `mvUnionIsScalarNull`'s tail takes the non-`null` atom of its two-member set
         instead of subtracting `null` from the spelling, so `removeAtomRestOf` is the
         fallback's one caller. Identity sweep: 0 differ.
@@ -1037,9 +1037,44 @@ What each slice changes:
         node's type has a row by key (`unRowOfKey` is -1), and neither does `X|null` over a
         scalar or a record union. The rest are slots pushed without a set, which then
         subtract again (`i32`, `f64`, `{v:i32}|{w:string}`).
-      - Next: a member set that does not need a row, built from the arena type's flattened
-        members, so `msSetOfTy` answers for every union and nullable type. Then the callers
-        pass `msSetOfTy` of the type they hold, and the fallback is deleted.
+      - Done: the fallback is deleted (`removeAtomFromGo`, `removeAtomFrom` and their memo).
+        `msSetOfTyAny` answers for every type: a registered row's set when a row carries the
+        key, else a row-less set over the type's own members as `canonUnionMembersInto`
+        spells them (one member for a type that is no union), never reordered or deduplicated.
+        A row-less set stores row `-2 - k` for slice `k`, so it never lends a box tag. The
+        callers pass the type they hold (the slot's banked type, the declared union type, or
+        the node's type). When no key covers the spelling, `removeAtomRestOf` renders that set
+        less the removed atom. The id stays key-only (`removeAtomIdOf`), so a set built from a
+        type is never banked on the narrowing stack: its row need not be the row the rendering
+        names.
+      - Probe, over 16,621 files and the self-compile, 0 uncompared, with the control
+        `tests/cases/unions/generic-join-record-pin-is-arm.vl`. Files, then events:
+
+        | Caller | Files agree / disagree | Events agree / disagree |
+        | --- | --- | --- |
+        | `narrowIsElse` value-union arm | 29 / 0 | 109 / 0 |
+        | `narrowIsElse` struct-complement arm | 14 / 6 of 17 | 70 / 25 |
+        | `narrowValueNonNull` | 4 / 0 | 19 / 0 |
+        | `narrowStructNonNull` | 2 / 1 | 13 / 8 |
+        | `narrowIsElseIndex` | 4 / 0 | 21 / 0 |
+        | `narrowIsElseMember` | 3 / 0 | 4 / 0 |
+        | `pushIndexMapComplement` | 0 / 1 | 0 / 2 |
+        | `indexCellCurSlot` | 1 / 0 | 8 / 0 |
+
+        No caller reached the subtraction without a type. The disagreements: a record union
+        spelled structurally where the old text was nominal (`P` / `{x:i32}`,
+        `{v:i32}|{w:string}` / `A|B`); in `else-complement-after-then-call.vl`, `string`
+        where the text kept `string|null` that an outer `!= null` had already removed; and an
+        `is` whose removed atom is spelled apart from the slice's atom (old `i32`, new
+        `Err|i32`), where the new path declines and keeps the set. Identity sweep on 08819f550:
+        0 of 16,511 files differ, so no disagreement changes a module.
+      - The callers that passed no type were reached in 0 of those files and are reachable
+        outside them. With the fallback deleted and those callers untyped, the filed witness
+        D3151 refused: its write `c = null` then `c = 4` subtracts `null` from `i32|null`
+        through `pgAssignIdentNarrow`. Every caller of `removeAtomRestOf` and
+        `removeAtomFromSet` now passes a type, and
+        `tests/cases/unions/narrowed-null-reassign-subtracts.vl` holds the witness. Its
+        member-field face is an older master defect, filed as D11160.
   - `narrowedMapOf`'s render is the mv slot's key, so it goes with D8. `emit_mv_slots`' `cnVariant`
     copies the text too; that file is the shape-row lane's.
 

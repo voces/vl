@@ -53,7 +53,7 @@ import {
 } from "./check_nj_join"
 import { primTyIxOfName } from "./check_decl_scan"
 import { nominalNameOfObj } from "./check_fit_rules"
-import { canonUnionMemberTysOf } from "./check_program"
+import { canonUnionMemberTysOf, canonUnionMembersInto } from "./check_program"
 import { canonUnionKeyAtomOfTy, valueAtomKind } from "./check_ty_rep"
 import {
   RC_NULLABLE,
@@ -94,7 +94,6 @@ import {
   atomsTakeAtomAsStr,
   indexPathKeyOf,
   memberPathKeyOf,
-  removeAtomFrom,
   unionHasAtom,
   unwrapParen,
 } from "./emit_base"
@@ -103,12 +102,18 @@ import { NARROW_TYPED, narrowSlotOf } from "./emit_narrow_slots"
 import {
   declTyIxOfName,
   msAtomIdOf,
+  msFreeSlicePush,
   msMaskClear,
   msMaskFull,
   msMaskHas,
   msMaskIsEmpty,
   msSetHas,
   msSetMaskCopy,
+  msSliceAtom,
+  msSliceAtomId,
+  msSliceCount,
+  msSliceKind,
+  msSliceTy,
   repCanonId,
   repShadowAddReason,
   repShadowBumpReason,
@@ -121,6 +126,8 @@ import {
 } from "./emit_rep"
 export { unRowOfCanon } from "./emit_rep"
 import {
+  msFreeByTy,
+  msFreeChain,
   msGen,
   msRowChain,
   msSetGen,
@@ -137,7 +144,6 @@ import {
   unKeyAliasRow,
   unKeyFirstRow,
   unKeyPush,
-  unMemAtomIds,
   unMemAtoms,
   unMemKinds,
   unMemTyCount,
@@ -1665,15 +1671,14 @@ function msRowStart(u: i32): i32 { unMemRowStart(u) }
 // The rendered form of the subset `mask` of row `u`: the surviving members'
 // verbatim spellings, joined on `|`, in the row's recorded order.
 function msRenderSet(u: i32, mask: i32[]): string {
-  const st = msRowStart(u)
-  if st < 0 { return "" }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return "" }
   let out = ""
   let i = 0
   while i < n {
     if msMaskHas(mask, i) {
       if out != "" { out = out + "|" }
-      out = out + unMemAtoms[st + i]
+      out = out + msSliceAtom(u, i)
     }
     i = i + 1
   }
@@ -1692,12 +1697,18 @@ function msSetMaskIs(s: i32, mask: i32[]): boolean {
   true
 }
 
+// The first set interned over slice `u` (-1 none), the head of its `msSetNext` chain.
+function msChainHead(u: i32): i32 {
+  if u >= 0 { return msRowChain[u] }
+  msFreeChain[-2 - u]
+}
+
 // The interned set id for the subset `mask` of row `u` — one id per distinct
 // (row, mask), so a set's rendering is built once and every later operation on it is
 // a table read. `mask` is `msMaskWords` words of the row. Stamped with the pool generation (method note 7).
 function msSetIntern(u: i32, mask: i32[]): i32 {
-  while msRowChain.length <= u { msRowChain.push(-1) }
-  let s = msRowChain[u]
+  while u >= 0 && msRowChain.length <= u { msRowChain.push(-1) }
+  let s = msChainHead(u)
   while s >= 0 {
     if msSetGen[s] == msGen.at && msSetMaskIs(s, mask) { return s }
     s = msSetNext[s]
@@ -1712,9 +1723,9 @@ function msSetIntern(u: i32, mask: i32[]): i32 {
     k = k + 1
   }
   msSetGen.push(msGen.at)
-  msSetNext.push(msRowChain[u])
+  msSetNext.push(msChainHead(u))
   msSetText.push(txt)
-  msRowChain[u] = id
+  if u >= 0 { msRowChain[u] = id } else { msFreeChain[-2 - u] = id }
   id
 }
 
@@ -1733,6 +1744,38 @@ export function msSetOfTy(ty: i32): i32 {
   const u = unRowOfKey(ty)
   if u < 0 { return -1 }
   msSetOfRow(u)
+}
+
+// The full member set of type `ty` whether or not a row carries its key: the row's set when one
+// does, else a set over the type's own members in the canon render's order (`msFreeSliceOfTy`),
+// one member for a type that is no union. A row-less set answers every member question but has
+// no box tags. -1 when a member has no render.
+export function msSetOfTyAny(ty: i32): i32 {
+  const s = msSetOfTy(ty)
+  if s >= 0 || ty < 0 { return s }
+  const u = msFreeSliceOfTy(ty)
+  if u > -2 { return -1 }
+  msSetIntern(u, msMaskFull(msSliceCount(u)))
+}
+
+// The row-less member slice of type `ty`, built once per type: its members as
+// `canonUnionMembersInto` spells them, never reordered or deduplicated past that. -1 when a
+// member has no render.
+function msFreeSliceOfTy(ty: i32): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  while msFreeByTy.length <= ty { msFreeByTy.push(-1) }
+  const got = msFreeByTy[ty]
+  if got >= 0 { return -2 - got }
+  if got == -2 { return -1 }
+  const tys: i32[] = []
+  const atoms: string[] = []
+  if !canonUnionMembersInto(ty, tys, atoms) || atoms.length < 1 {
+    msFreeByTy[ty] = -2
+    return -1
+  }
+  const u = msFreeSlicePush(tys, atoms)
+  msFreeByTy[ty] = -2 - u
+  u
 }
 
 // The full member set of union `name` whose arena type is `ty`, or -1: a union or alias name
@@ -1764,12 +1807,11 @@ export function msMemberAtomsOfSet(s: i32, out: string[]): boolean {
   if s < 0 { return false }
   if s >= msSetRow.length { return false }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return false }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return false }
   let i = 0
   while i < n {
-    if msSetHas(s, i) { out.push(unMemAtoms[st + i]) }
+    if msSetHas(s, i) { out.push(msSliceAtom(u, i)) }
     i = i + 1
   }
   true
@@ -1780,12 +1822,11 @@ export function msMemberTysOfSet(s: i32, out: i32[]): boolean {
   if s < 0 { return false }
   if s >= msSetRow.length { return false }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return false }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return false }
   let i = 0
   while i < n {
-    if msSetHas(s, i) { out.push(unMemTys[st + i]) }
+    if msSetHas(s, i) { out.push(msSliceTy(u, i)) }
     i = i + 1
   }
   true
@@ -1803,13 +1844,12 @@ export function msMemberCount(s: i32): i32 {
 export function msHasNull(s: i32): boolean {
   if s < 0 || s >= msSetRow.length { return false }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return false }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return false }
   let i = 0
   while i < n {
     if msSetHas(s, i) {
-      if unMemKinds[st + i] == 0 { return true }
+      if msSliceKind(u, i) == 0 { return true }
     }
     i = i + 1
   }
@@ -1820,14 +1860,13 @@ export function msHasNull(s: i32): boolean {
 function msNonNullCount(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return 0 }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return 0 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return 0 }
   let c = 0
   let i = 0
   while i < n {
     if msSetHas(s, i) {
-      if unMemKinds[st + i] != 0 { c = c + 1 }
+      if msSliceKind(u, i) != 0 { c = c + 1 }
     }
     i = i + 1
   }
@@ -1841,34 +1880,32 @@ function msNonNullCount(s: i32): i32 {
 export function msSoleMemberTy(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return -1 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
   let found = -1
   let i = 0
   while i < n {
     if msSetHas(s, i) {
       if found >= 0 { return -1 }
-      found = st + i
+      found = i
     }
     i = i + 1
   }
   if found < 0 { return -1 }
-  unMemTys[found]
+  msSliceTy(u, found)
 }
 
 // SUBTRACTION of the `null` keyword: clear every member whose KIND is the null token.
 export function msSubNull(s: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return -1 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
   const mask = msSetMaskCopy(s)
   let i = 0
   while i < n {
     if msMaskHas(mask, i) {
-      if unMemKinds[st + i] == 0 { msMaskClear(mask, i) }
+      if msSliceKind(u, i) == 0 { msMaskClear(mask, i) }
     }
     i = i + 1
   }
@@ -1882,14 +1919,13 @@ export function msKeepTy(s: i32, ty: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   if ty < 0 { return -1 }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return -1 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
   const mask = msSetMaskCopy(s)
   let i = 0
   while i < n {
     if msMaskHas(mask, i) {
-      if !msTyCovers(ty, unMemTys[st + i]) { msMaskClear(mask, i) }
+      if !msTyCovers(ty, msSliceTy(u, i)) { msMaskClear(mask, i) }
     }
     i = i + 1
   }
@@ -1904,15 +1940,14 @@ export function msSubTy(s: i32, ty: i32): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   if ty < 0 { return s }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return -1 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
   const mask = msSetMaskCopy(s)
   let changed = false
   let i = 0
   while i < n {
     if msMaskHas(mask, i) {
-      if msTyCovers(ty, unMemTys[st + i]) {
+      if msTyCovers(ty, msSliceTy(u, i)) {
         msMaskClear(mask, i)
         changed = true
       }
@@ -1968,15 +2003,14 @@ function msTyCovers(ty: i32, m: i32): boolean {
 export function msSubAtom(s: i32, removed: string): i32 {
   if s < 0 || s >= msSetRow.length { return -1 }
   const u = msSetRow[s]
-  const st = msRowStart(u)
-  if st < 0 { return -1 }
-  const n = unMemTyCount[u]
+  const n = msSliceCount(u)
+  if n < 0 { return -1 }
   const rid = msAtomIdOf(removed)
   const mask = msSetMaskCopy(s)
   let i = 0
   while i < n {
     if msMaskHas(mask, i) {
-      if unMemAtomIds[st + i] == rid { msMaskClear(mask, i) }
+      if msSliceAtomId(u, i) == rid { msMaskClear(mask, i) }
     }
     i = i + 1
   }
@@ -1985,12 +2019,15 @@ export function msSubAtom(s: i32, removed: string): i32 {
 
 // ── the set ADT's consumers (structure first, string surgery as fall-through) ──
 
-// Set SUBTRACTION — the else-branch complement of `is removed` / `!= null`. The
-// structural path resolves the set, clears the removed member's bits and renders the
-// survivors in the row's recorded ORDER; `removeAtomFrom`'s string surgery stays as
-// the fall-through for a set the pool does not cover.
-export function removeAtomFromSet(set: string, removed: string): string {
-  removeAtomFromSetOf(-1, set, removed)
+// Set SUBTRACTION — the else-branch complement of `is removed` / `!= null`: resolves the set,
+// clears the removed member's bits and renders the survivors in the row's recorded ORDER. `ty`
+// is `set`'s arena type (-1 none), as `removeAtomRestOf` takes it.
+export function removeAtomFromSet(
+  set: string,
+  removed: string,
+  ty: i32,
+): string {
+  removeAtomFromSetOf(-1, set, removed, ty)
 }
 
 // The id of set `s` less member `removed`, or -1 when `s` is -1 or the set path declines. `null`
@@ -2001,39 +2038,40 @@ export function msRemoveAtomId(s: i32, removed: string): i32 {
   msSubAtomOrView(s, removed)
 }
 
-// `removeAtomFromSet` for a caller already holding the id `sid` of `set`, which it then does not
-// resolve again; -1 resolves `set`. The id must be the one `set` is the rendering of.
+// `removeAtomFromSet` for a caller already holding the id `sid` of `set` (-1 resolves `set`) and
+// `set`'s arena type `ty` (-1 none), as `removeAtomRestOf` takes it.
 export function removeAtomFromSetOf(
   sid: i32,
   set: string,
   removed: string,
+  ty: i32,
 ): string {
-  removeAtomRestOf(removeAtomIdOf(sid, set, removed), set, removed)
+  removeAtomRestOf(removeAtomIdOf(sid, set, removed), set, removed, ty)
 }
 
 // The id of `set` less `removed`, where `sid` is `set`'s id or -1 to resolve `set` by key; -1
-// when neither covers it or `set` is one primitive keyword with no id. A narrowing pushed from
-// the survivors banks this id.
+// when no key covers it. A narrowing pushed from the survivors banks this id.
 export function removeAtomIdOf(sid: i32, set: string, removed: string): i32 {
-  if sid < 0 && primTyIxOfName(set) >= 0 { return -1 }
   let s = sid
-  if s < 0 { s = msSetOfUnion(set) }
+  if s < 0 && primTyIxOfName(set) < 0 { s = msSetOfUnion(set) }
   msRemoveAtomId(s, removed)
 }
 
-// The rendering of `set` less `removed`, given `rid` from `removeAtomIdOf`: the id's own
-// rendering when it has one, else the subtraction done on the spelling.
+// The rendering of the survivors `rid` from `removeAtomIdOf`. With no id, `set`'s arena type
+// `ty` (-1 none) builds a set from its own members, rendered less `removed` and not banked: its
+// row need not be the row the rendering names. `set` itself when neither covers it.
 export function removeAtomRestOf(
   rid: i32,
   set: string,
   removed: string,
+  ty: i32,
 ): string {
   if rid >= 0 { return msTextOf(rid) }
-  const out = removeAtomFrom(set, removed)
-  if out != set { return out }
-  const roIn = roListInnerName(removed)
-  if roIn != "" { return removeAtomFrom(set, roIn) }
-  out
+  if set == "" || ty < 0 { return set }
+  const c = msSetOfTyAny(ty)
+  const rc = msRemoveAtomId(c, removed)
+  if rc < 0 || rc == c { return set }
+  msTextOf(rc)
 }
 
 // `msSubAtom`, where a set that spells a view's member as its list still loses it: the two are
