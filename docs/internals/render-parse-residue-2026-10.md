@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function pin typed; 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 10 retired, 11 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -819,6 +819,51 @@ What each slice changes:
     whose argument is a hole record's field. In
     `alias-of-written-let-called-with-hole-function`, `monoInstanceFor` gets no value type at
     all.
+  - Done: a lambda written to a let is typed by the call instance that receives it. At the
+    written-let call, `monoInstParamPinTys` reads the instance's parameter types, and it used
+    to decline whenever a parameter had no annotation node. A parameter pinned at plain `i32`
+    has none, so every lambda written beside an `i32` argument got no delivery types, and its
+    `=>` pin in `monoInstanceFor` stayed open. The parameter column the clone resolved
+    (`monoMakeInstanceLetTyCol`, which takes the argument's typed pin at a function pin) is now
+    kept per instance in `monoInstParamTyCol` and read first. The probe compared the `=>` pin's
+    closed type at `monoInstanceFor` with its `=>` key, over the self-compile and 16,623 files.
+    The control was `written-let-hole-lambda-generic-typed-by-write.vl`.
+
+    | site | before | after |
+    | --- | --- | --- |
+    | `monoInstanceFor` `=>` pin | 4 files, 15 events open | 24 files, 85 events closed, 0 open |
+    | argument `=>` pin (`monoPinHoleParam`) | | 201 files, 2,582 events, all closed |
+
+    The four files were `let-hole-lambda-reassigned-fn-param`, `hole-lambda-typed-by-callee-call`
+    and the two `written-let-hole-lambda-generic-*`. Emitted code does not change: difftree
+    `--identity` found 0 differing files (full sweep in the PR).
+  - Left, measured: the clone's TypeRef text cannot yet be produced from the typed pin, so no
+    entry retired. A probe at each parameter `monoMakeInstanceParams` pins compared the pin's
+    spelling with renders of its type (the argument's typed pin, else the resolved pin):
+    `tyToEmitName`, the `=>` sig key, the struct row handle and `tyToNominalName`. Every pin had
+    a type. Counts are files, then events.
+
+    | outcome | files | events |
+    | --- | --- | --- |
+    | some render reproduces the spelling | 5,233 | 19,671 |
+    | of those, `tyToEmitName` alone | 4,308 | 15,216 |
+    | of those, only another render (sig key, row handle, nominal) | 1,501 | 4,455 |
+    | no render reproduces it | 417 | 947 |
+
+    The 947 fall into four groups, by whether the spelling parses back to the rendered type:
+    - the argument is narrower than the pin, so the pin is not the argument's type (`i32|string`
+      from `i32`, `string|null` from `null`): 135 files, 338 events;
+    - the spelling names the same type another way: a declared record or alias pinned from its
+      inline literal (`Circle` from `{r:f64}`, `K` from `string`), or grouping parentheses
+      (`{[string]:((i32)=>i32)}`): 141 files, 231 events;
+    - neither: mostly an `#anon` row handle, whose name is the shape interner's mint order
+      (`#anon0` from `{f:(i32)=>i32}`), plus map-in-union pins wider than their argument:
+      141 files, 296 events;
+    - the argument's type still holds a hole or renders empty: 39 files, 82 events.
+
+    The first and the last need the pin's own type rather than the argument's, which is C1
+    step 3's per-instance render. The other two would change the instance's spelled key, so
+    each would move a registry row and its box tags (see D4). The 22 entries keep their status.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
