@@ -42,6 +42,7 @@
 // @test-timing native
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const CI_YML = `${ROOT}/.github/workflows/ci.yml`;
 const GATE_SH = `${ROOT}/scripts/gate.sh`;
@@ -70,14 +71,7 @@ const run = async (
   argv: string[],
 ): Promise<{ code: number; out: string; err: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: [
-      "run",
-      "scripts/seed-size.vl",
-      "--compiler",
-      COMPILER,
-      "--",
-      ...argv,
-    ],
+    args: ["run", await builtScript("scripts/seed-size.vl", { cwd: ROOT }), "--", ...argv],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",

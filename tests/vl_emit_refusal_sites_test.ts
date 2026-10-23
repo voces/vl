@@ -14,6 +14,7 @@
 // @test-timing native
 
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -48,7 +49,7 @@ Deno.test({
       const bad: string[] = [];
       for (const c of CASES) {
         const { code, stdout } = await new Deno.Command(VL, {
-          args: ["run", SCRIPT, "--", ...c.args],
+          args: ["run", await builtScript(SCRIPT, { compiler: null }), "--", ...c.args],
           cwd: dir,
           stdout: "piped",
           stderr: "piped",

@@ -23,6 +23,7 @@
 // @test-timing native
 
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -39,9 +40,7 @@ async function provenance(argv: string[], cwd = ROOT) {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: [
       "run",
-      `${ROOT}/scripts/seed-provenance.vl`,
-      "--compiler",
-      COMPILER,
+      await builtScript(`${ROOT}/scripts/seed-provenance.vl`, { cwd: ROOT }),
       "--",
       ...argv,
     ],
