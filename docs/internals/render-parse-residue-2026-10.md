@@ -365,9 +365,12 @@ What each slice changes:
     field and canon-rewritten annotations that the checker never types. An alias-to-list
     union-arm field also has no type, and it builds byte-identical with the answer false.
     `difftree --identity` found 0 of 16,483 files differing.
-  - Left: `nameIsNulClosure`. Its `collectCloSigs` caller agreed with the type everywhere, but
-    `cloNameSigKeyTy`'s fallback (1 file) and `nameFieldCode` (3 files) hold only a name and
-    answer true.
+  - Done: 2 parses. `cloNameSigKeyTy` keys a nullable closure by its type alone. Its name
+    fallback was reached in 1 file of 16,852, where the type was present and the spelling
+    keyed `""` as well. `collectCloSigs` asks `nodeTyIsNulClosure`, which agreed with the
+    spelling in all 3,655 files that reach it.
+  - Left: `nameIsNulClosure`. `nameFieldCode` (3 files) and `exprNulClosure`'s
+    `calleeCloRetName` rung still hold only a name.
   - Left: `nullClosureArrElem`. Both callers agreed with the type, but the element spelling it
     returns is parsed again by `internCloSigOfAtom`.
   - Left, not probed: the niche ladders, the name-grammar tests and the spelling walkers. Their
