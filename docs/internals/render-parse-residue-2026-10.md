@@ -44,8 +44,8 @@ worked carries a `status` field as well, saying what moved and why the rest stay
 - `nameIsRefArray` with a type in hand is still **D**. The ref-list kind ladder answers through
   the struct and union tables by spelling, and its arena twin `tyElemIsRefListElem` admits more
   than it does (L6 log, 2026-10-20).
-- `inferNulStructRow` and `inferNulVariantRow` are **D**, because `structIndexOfTy` disagrees with
-  the spelling lookup on inline shapes (#4466).
+- `structIndexOfLet`'s nullable rung is **D**, because every typed struct lookup disagrees with
+  the spelling on inline shapes; `structRowOfTy` comes closest (D6).
 
 ## Totals
 
@@ -134,7 +134,7 @@ the slice retires.
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 3 retired, 18 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
-| D6 | struct and variant rows of inline shapes by type | 12 | 0 / 0 / 12 | 3 / 9 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
+| D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 3 retired, 15 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
@@ -482,8 +482,27 @@ What each slice changes:
     `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go when rows mint
     from types.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
-  `structIndexOfLet` answer by type. The blocker is `structIndexOfTy` disagreeing with the spelling
-  lookup on inline shapes (#4466).
+  `structIndexOfLet` answer by type.
+
+  A probe compared the spelling's row with each typed lookup's at every entry, over the
+  self-compile and 16,816 fixture and corpus files. Counts are files. `structIndexOfTy` still
+  disagrees with the spelling on inline shapes after #4466 (48 files at `structIndexOfLet`).
+  - Done: 2 parses. `inferNulStructRow` asks `structRowOfTy` of the non-null part of the banked
+    return type: 2,140 files reach it with a type and 0 differ (`structIndexOfTy` alone differs in
+    3). `inferNulVariantRow` asks `variantRowOfShapeTy`, which is `variantRowOfTy` and then the arm
+    whose own render and type are the record's: 2,141 and 0 (`variantRowOfTy` alone differs in 1,
+    an arm adopted by shape, D4668). The 8,273 files with no banked type have no row by spelling
+    either. difftree `--identity` found 0 of 16,450 files differ.
+  - Left: `structIndexOfLet`'s nullable rung. It differs from `structRowOfTy` in 5 files, from
+    `structIndexOfTy` in 48 and from `repRowOfTyStruct` in 59: the type finds a row for a variant
+    arm (`Circle | null`) the spelling does not, picks a twin row, and finds none for a
+    literal-field shape.
+  - Left: the 3 renders. `internJoinedRecordRow`, `mintUnionFieldObjRow` and `internArmShapeRow`
+    key the shape interner, which interns by spelling (D34 also withholds the arm's type).
+    `mintUnionFieldObjRow`'s `structIndexOfTypeName(nm) < 0` test differs from `structRowOfTy` in
+    14 files and from `repRowOfTyStruct` in 6, so not even its decision moves.
+  - Left: the 6 parses in `mvValNamesCompat` and `shapeFieldTypeCompatK`, inside the name-keyed
+    resolver. They go with `structIndexOfTypeName`, not one by one.
 - **D7.** `narrowVariants` banks a type for multi-member sets, where `narrowSlotTy` is `-1` today.
 
   No new column was needed for the two sites that moved: the slot's member set already holds the
