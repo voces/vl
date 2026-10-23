@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 5 retired, 25 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type | 12 | 0 / 0 / 12 | 3 / 9 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -409,6 +409,34 @@ What each slice changes:
     other slices' files. The ladder internals stay while any of these keep a name caller.
 - **D3.** The mono instance key and the `monoAnnPinName` ladder take the pin's type. Most of the
   slice is this one seam, and it carries 15 of the 52 D renders.
+  - Done: the instance is keyed by type as well as by spelling. When the spelled key misses,
+    `monoTypedInstKey` rebuilds the key with each pin as its kind and the `tyCanonKey` of the
+    type the clone resolved it to. A typed hit reuses the instance already minted and drops the
+    clone's staged writes. `monoAnonPinDiscrim` keys an `#anon` pin by `tyCanonKey`. One render
+    retired. This was step 2 of the C1 plan, landed before step 1: it needs only the resolved
+    pin column `monoMakeInstanceParams` already fills, not the `letBN`/`letBT` mint.
+  - Measured first: a side-by-side probe recorded each new instance's spelled and typed key
+    over 16,801 programs (the self-compile, `tests/**/*.vl` and the distilled corpus). Keying
+    by type merges 19 instance pairs in 14 programs and splits none. The merges fall into five
+    groups:
+    - union member order (`i32|f64` and `f64|i32`), in 5;
+    - an alias and its members (`Animal` and `Cat|Dog`), in 2;
+    - a literal-union alias list (`KC[]` and `"circle"[]`), in 1;
+    - grouping parentheses on a closure type, in 4;
+    - an `#anon` handle and its inline record, in 7.
+
+    The landed key keeps the argument-type discriminators, so the last group stays apart.
+  - Result: difftree --identity found 9 of 16,443 files differ, all in `tests/cases`, every one
+    smaller and printing its `@log` lines. The compiler's own fixpoint is unchanged. One file
+    gained an instance from the `#anon` discriminator: a declared-record argument now keys
+    apart from the literal it came from.
+    `tests/cases/generics/union-pin-member-order-shares-instance.vl` pins the merge.
+  - Left: 22 entries. Each one produces a pin spelling: the `monoAnnPinName` ladder,
+    `monoArgTyName`, the lambda and closure pin names, and `unionParamPinName`. The spelling is
+    still the instance's TypeRef text and its spelled key. These entries go with C1 step 3,
+    which renders one spelling per instance, for the TypeRef text only. D4's blocker was that
+    taking a row found by type under another name changed the instance key. The typed key
+    should absorb that, but D4 has not been re-probed against it.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
   - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
