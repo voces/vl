@@ -129,7 +129,7 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 4 retired, 12 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 5 retired, 25 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 6 retired, 24 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -379,8 +379,12 @@ What each slice changes:
     outer cut. The parameter arm names `#anon0` where the spelling said `{x:i32}`, which is the
     same slot. The outer cut answers "" for a closure element whose spelling had no row either.
     Both modules build byte-identical.
+  - Done, 2 differing files: 1 parse. The narrowed ref-array arm (`raN`) keys the row by the
+    node's element type at the mono instance's pins (`instanceTyOf`). A generic body's `P[]`
+    names its pinned row, and those 4 files build byte-identical. In the 2 Json fixtures the
+    spelling had named a row under the expanded `Json` union. The type names the `Json` row.
+    Those modules declare fewer scratch locals, have the same code, and run the same.
   - Left in `emit_classify`: the arms where the typed lookup misses or names another row.
-    - A generic body's type parameter (`P`, `Q`) has no type-keyed row: `raN`, 5 of 111 files.
     - Closure elements and nullable records have no row: the outer row's inner-row rung, 12 of
       212.
     - Fills and generic pins reach `$m` rows the type does not: `anDst`, 7 of 40.
