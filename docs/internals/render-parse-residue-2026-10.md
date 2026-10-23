@@ -126,7 +126,7 @@ the slice retires.
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
-| C3 | shape-intern walkers take field types | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
+| C3 | shape-intern walkers take field types (landed: 4 retired, 12 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 5 retired, 25 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
@@ -317,7 +317,23 @@ What each slice changes:
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
   stay inside `emit_mono`. It follows C1.
-- **C3.** The `emit_shape_intern` walkers take the field type alongside the field text.
+- **C3.** The `emit_shape_intern` walkers take the field type alongside the field text. A probe
+  over the self-compile and 16,820 fixture and corpus files compared each site's spelling
+  answer with a typed twin. Counts are files.
+  - Done: 4 parses. `funcTypeShapeLowerable` takes the shape's type, and its nested-leaf test is
+    `tyIsNestedScalarLeafArray` of the field type (12 files, 0 differ). The name walker it
+    replaced is gone, and with it 2 parses. A closure field in `internNonLowerableFieldShapesTy`
+    is `tyIsFuncArena` of the field type (23 files, 0 differ). The literal-union gate in
+    `iisPushFieldElem` asks the field row it projects (669 files, 0 differ). Two grids of
+    closure results, 34 nested-leaf cells and 11 closure-field cells, built the same output on
+    both seeds, and difftree --identity found 0 of 16,451 files differ.
+  - Left: 12. Four reach with no type: `internShapeArms` in 264 files, and
+    `shapeFieldsRideTyParam`'s three in 201 (its nullable peel also differs in 1). Three
+    differ: `internShapeDeepTy`'s paren-closure and nullable peels in 206 and 234 files, and
+    `internFuncTypeShapesTy`'s nullable peel in 11. `internShapeDeepTy`'s arrow test agrees but
+    1 file has no type. The other four produce a name the walk keys: the `internShapeDeepOfTy`
+    render, the arm split (2 files differ), the map-value name (1 differs), and
+    `structElemArrayLowerable`'s base name.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
