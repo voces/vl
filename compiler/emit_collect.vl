@@ -39,7 +39,6 @@ import {
   nameIsMapOpen,
   nameIsShapeOpen,
   peelGroupParens,
-  splitUnionAtoms,
 } from "./tyname"
 import {
   nameMentionsGenAliasParam,
@@ -789,7 +788,7 @@ import {
   tyRefArrElemOf,
 } from "./emit_map_value_slots"
 import {
-  armLayoutContested,
+  armLayoutContestedAt,
   markMapKeyUsed,
   mvSlotByValNameK,
   scopeBind,
@@ -1523,33 +1522,29 @@ function synthCellNarrowedReadAnn(s: LetDecl, ri: i32) {
   0
 }
 
-// The value spelling at the bottom of a chain of map spellings — `Circle` for both
-// `{[string]: Circle}` and `{[string]: {[string]: Circle}}` — or "" when `name` is not a map
-// (D156). Termination is structural rather than the hop bound: every cut strictly shortens
-// the spelling, and a non-map result such as `mapValNameOf`'s garbled cut stops the loop.
-function mapLeafValName(name: string) {
-  let cur = mapValNameOf(name)
-  if cur == "" { return "" }
+// The value type at the bottom of a chain of map types — `Circle` for both `{[string]: Circle}`
+// and `{[string]: {[string]: Circle}}` — or -1 when `ty` is not a map (D156).
+function mapLeafValTy(ty: i32): i32 {
+  let cur = tyMapValOf(ty)
+  if cur < 0 { return -1 }
   let hops = 0
   while hops < 8 {
-    const nxt = mapValNameOf(cur)
-    if nxt == "" { return cur }
+    const nxt = tyMapValOf(cur)
+    if nxt < 0 { return cur }
     cur = nxt
     hops = hops + 1
   }
   cur
 }
 
-// Does `name` — a spelling one cut below a map annotation — reach a union arm through further
-// map hops, and is that arm's layout uncontested (D171)? Un-gated, the deeper rung costs
-// working programs wherever a layout twin is declared: a half-pinned chain is worse than an
-// un-pinned one, which rides the arm/twin conflation the mv and ref-list layers still carry.
-function pinArmDeepUncontested(name: string) {
-  if name == "" { return false }
-  const leaf = mapLeafValName(name)
-  if leaf == "" { return false }
-  if variantIndexOf(leaf) < 0 { return false }
-  !armLayoutContested(leaf)
+// Does `ty` — the type one cut below a map annotation — reach a union arm through further map
+// hops, and is that arm's layout uncontested (D171)? Un-gated, the deeper rung costs working
+// programs wherever a layout twin is declared: a half-pinned chain is worse than an un-pinned
+// one, which rides the arm/twin conflation the mv and ref-list layers still carry.
+function pinArmDeepUncontestedTy(ty: i32): boolean {
+  const row = variantRowOfTy(mapLeafValTy(ty))
+  if row < 0 { return false }
+  !armLayoutContestedAt(row)
 }
 
 // The name-side form of `armPinAnnName`'s ref-list rung: does this spelling name a ref-list
@@ -1579,13 +1574,13 @@ function armPinAnnName(tyIx: i32) {
     }
   }
   // A map whose value names an arm (`{[string]: Circle}`), the third container this seam
-  // reaches. `variantIndexOf` also fences off `mapValNameOf`'s garbled non-map cut (D87).
-  const mvn = mapValNameOf(tyNameOf(tyIx))
-  if mvn != "" {
-    if variantIndexOf(mvn) >= 0 { return tyNameOf(tyIx) }
+  // reaches, read off the annotation's arena type.
+  const mvT = tyMapValOf(annRowOfNode(tyIx))
+  if mvT >= 0 {
+    if variantRowOfTy(mvT) >= 0 { return tyNameOf(tyIx) }
     // …and at every depth, not one (D156). Declining here is not neutral: `dstPinPushAnn`
     // reads the "" as a destination disagreement, so one nested-map delivery vetoes the pin.
-    if pinArmDeepUncontested(mvn) { return tyNameOf(tyIx) }
+    if pinArmDeepUncontestedTy(mvT) { return tyNameOf(tyIx) }
   }
   ""
 }
@@ -2250,8 +2245,9 @@ function dstPinMapValue(
               // or reaching one through further map hops (D156): a nested map delivers a map
               // to the value cell, and the inner binding's pin is that map's spelling.
               const vn = mapValNameOf(tyNameOf(mapAnn))
-              if vn != "" {
-                if variantIndexOf(vn) >= 0 || pinArmDeepUncontested(vn) {
+              const vT = tyMapValOf(annRowOfNode(mapAnn))
+              if vn != "" && vT >= 0 {
+                if variantRowOfTy(vT) >= 0 || pinArmDeepUncontestedTy(vT) {
                   outN.push(vn)
                   outT.push(-1)
                 }
@@ -2362,11 +2358,12 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
       // union is a union-box list, and reading only the first would key it under one arm. A
       // heterogeneous literal has no single committed rep, so the bank stays empty and the
       // checker-typed union rung keeps it.
-      const cn = alcCommitName(n.arrElems[0], bodyIx, fnIx, 0)
-      let agree = alcNamesArm(cn)
+      const ca = alcCommitAnn(n.arrElems[0], bodyIx, fnIx, 0)
+      const cn = alcAnnName(ca)
+      let agree = alcNamesArm(cn, ca)
       let ei = 1
       while ei < n.arrElems.length {
-        if alcCommitName(n.arrElems[ei], bodyIx, fnIx, 0) != cn {
+        if alcAnnName(alcCommitAnn(n.arrElems[ei], bodyIx, fnIx, 0)) != cn {
           agree = false
         }
         ei = ei + 1
@@ -2388,27 +2385,31 @@ function alcWalk(ix: i32, bodyIx: i32, fnIx: i32) {
   0
 }
 
-// Does `name` reach a union arm — bare, or through the map grammar at any depth? The gate, and
-// it is `armPinAnnName`'s question asked of a name instead of an annotation node: the
+// Does the annotation `ann`, spelled `name`, reach a union arm — bare, or through map values at
+// any depth? The gate, and it is `armPinAnnName`'s question asked of a committed element: the
 // struct/variant seam is the only place the checker's structural record and the element's
 // committed rep can name different heaps (D39).
-function alcNamesArm(name: string): boolean {
+function alcNamesArm(name: string, ann: i32): boolean {
   if name == "" { return false }
   if variantIndexOf(name) >= 0 { return true }
-  const leaf = mapLeafValName(name)
-  if leaf == "" { return false }
-  variantIndexOf(leaf) >= 0
+  variantRowOfTy(mapLeafValTy(annRowOfNode(ann))) >= 0
 }
 
-// The type name the expression at `ex` has already committed its rep to, or "". Four sources,
-// every one an annotation a user wrote or a pin synthesized and never an inference: a bound
-// local, a parameter, a callee's declared result, and a callee's inferred result read through
-// the binding that supplies it. Depth-bounded, since the arena is not this pass's to trust.
-function alcCommitName(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): string {
-  if ex < 0 { return "" }
-  if depth > 4 { return "" }
+// The spelling of the annotation node `ann`, or "" for none.
+function alcAnnName(ann: i32): string {
+  if ann < 0 { return "" }
+  tyNameOf(ann)
+}
+
+// The annotation node the expression at `ex` has already committed its rep to, or -1. Four
+// sources, every one an annotation a user wrote or a pin synthesized and never an inference: a
+// bound local, a parameter, a callee's declared result, and a callee's inferred result read
+// through the binding that supplies it. Depth-bounded, since the arena is not this pass's to trust.
+function alcCommitAnn(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): i32 {
+  if ex < 0 { return -1 }
+  if depth > 4 { return -1 }
   const u = unwrapParen(ex)
-  if u < 0 { return "" }
+  if u < 0 { return -1 }
   const n = nodeAt(u)
   match n {
     Ident => {
@@ -2416,24 +2417,24 @@ function alcCommitName(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): string {
       if lli >= 0 {
         const ld = nodeAt(lli)
         if ld is LetDecl {
-          if ld.letType >= 0 { return tyNameOf(ld.letType) }
+          if ld.letType >= 0 { return ld.letType }
           // An un-annotated binding is a link in the chain, not the end of it —
           // `dstPinLocalDest`'s rule, shared through `retLocalLetOfBlock`: the alias re-names a
           // value, it does not re-rep one.
-          return alcCommitName(ld.letInit, bodyIx, fnIx, depth + 1)
+          return alcCommitAnn(ld.letInit, bodyIx, fnIx, depth + 1)
         }
-        return ""
+        return -1
       }
-      const pn = alcParamAnnName(fnIx, n.identName)
-      if pn != "" { return pn }
+      const pn = alcParamAnn(fnIx, n.identName)
+      if pn >= 0 { return pn }
       const gli = globalLetOf(n.identName)
       if gli >= 0 {
         const gd = nodeAt(gli)
         if gd is LetDecl {
-          if gd.letType >= 0 { return tyNameOf(gd.letType) }
+          if gd.letType >= 0 { return gd.letType }
         }
       }
-      return ""
+      return -1
     }
     Call => {
       const cf = nodeAt(unwrapParen(n.callFn))
@@ -2445,26 +2446,26 @@ function alcCommitName(ex: i32, bodyIx: i32, fnIx: i32, depth: i32): string {
           if cfn is FuncDecl {
             // A declared result is the commitment; nothing inside the callee can overrule the
             // claim it makes about its own result.
-            if cfn.fnRet >= 0 { return tyNameOf(cfn.fnRet) }
+            if cfn.fnRet >= 0 { return cfn.fnRet }
             const crx = fnRetExprOf(cix)
-            if crx < 0 { return "" }
-            return alcCommitName(crx, cfn.fnBody, cix, depth + 1)
+            if crx < 0 { return -1 }
+            return alcCommitAnn(crx, cfn.fnBody, cix, depth + 1)
           }
         }
       }
-      return ""
+      return -1
     }
     // No other expression commits to a name.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
-  ""
+  -1
 }
 
-// The annotation spelling of parameter `name` of the function at `fnIx`, or "". The parameter
+// The annotation node of parameter `name` of the function at `fnIx`, or -1. The parameter
 // half of the lookup above: `parentLetOf` answers for a function's locals and a parameter is
 // not one, yet it is the commitment an identity conduit's body hands back.
-function alcParamAnnName(fnIx: i32, name: string): string {
-  if fnIx < 0 { return "" }
+function alcParamAnn(fnIx: i32, name: string): i32 {
+  if fnIx < 0 { return -1 }
   const fn = nodeAt(fnIx)
   if fn is FuncDecl {
     let j = 0
@@ -2472,14 +2473,14 @@ function alcParamAnnName(fnIx: i32, name: string): string {
       const pp = nodeAt(fn.fnParams[j])
       if pp is Param {
         if pp.parName == name {
-          if pp.parType >= 0 { return tyNameOf(pp.parType) }
-          return ""
+          if pp.parType >= 0 { return pp.parType }
+          return -1
         }
       }
       j = j + 1
     }
   }
-  ""
+  -1
 }
 
 // The pre-monomorphization run of `synthDstPinAnn`, over every function body, and the ordering
@@ -2490,7 +2491,7 @@ export function synthDstPinAnns(rootIx: i32) {
   // To a fixpoint. The bound is a guard, not a policy: each round either pins at least one
   // binding or stops, and a binding is pinned at most once. 32 rather than 8 because a round is
   // consumed per level of the pin dependency chain and truncating leaves it half-pinned (D171);
-  // the deepest chain the gates can pin is bounded by `mapLeafValName`'s own 8-cut cap.
+  // the deepest chain the gates can pin is bounded by `mapLeafValTy`'s own 8-cut cap.
   let round = 0
   while round < 32 {
     dstPinFired = 0
@@ -9274,70 +9275,41 @@ function anonLeafAnnTyOf(n: i32): i32 {
   anonLeafAnnTy[n]
 }
 
-// D872 — the atom the `??` left operand's declared type spells at field `fname`, or "".
-// Read off the spelling, not the row's field code: `{r: i32}` and `{r: boolean}` fields are
-// both code 0 (`fieldCodeOfSpelling`), and a merged set built off the wrong one names a union
-// the box cannot hold. Answers "" outside `anonLeafAtomName`'s six spellings.
+// D872 — the atom the `??` left operand's declared type spells at field `fname`, or "". Read
+// off the field's arena type, not the row's field code: `{r: i32}` and `{r: boolean}` fields
+// are both code 0, and a merged set built off the wrong one names a union the box cannot
+// hold. A declared name (D922) and an inline shape are the same `TyObj`.
 function anonLeafAnnAtomOf(tyIx: i32, fname: string): string {
   if tyIx < 0 { return "" }
-  const arms: string[] = []
-  splitUnionAtoms(tyNameOf(tyIx), arms)
-  let shape = ""
-  let k = 0
-  while k < arms.length {
-    if arms[k] != "null" {
-      // More than one non-null arm: the operand's non-null value is not one shape.
-      if shape != "" { return "" }
-      shape = arms[k]
+  const ty = annRowOfNode(tyIx)
+  if ty < 0 { return "" }
+  let cur = ty
+  const t = tyAt(ty)
+  if t is TyNullable { cur = t.nInner }
+  if t is TyUnion {
+    cur = -1
+    let k = 0
+    while k < t.uMembers.length {
+      if !isNullTy(t.uMembers[k]) {
+        // More than one non-null arm: the operand's non-null value is not one shape.
+        if cur >= 0 { return "" }
+        cur = t.uMembers[k]
+      }
+      k = k + 1
     }
-    k = k + 1
   }
-  // D922 — a declared name (`type R = {r: i32}`) is the same shape written down once, so its
-  // fields come off the declaration's `FieldDef` nodes rather than off a spelling to split.
-  if !nameIsShapeSpanEnds(shape) { return anonLeafDeclFieldAtom(shape, fname) }
-  const fnames: string[] = []
-  const ftexts: string[] = []
-  shapeInnerFieldSplit(groupInnerOf(shape), fnames, ftexts)
-  let i = 0
-  while i < fnames.length {
-    if fnames[i] == fname { return anonLeafAtomOfText(ftexts[i]) }
-    i = i + 1
+  if cur < 0 { return "" }
+  const o = tyAt(cur)
+  if o is TyObj {
+    let i = 0
+    while i < o.objFieldNames.length {
+      if o.objFieldNames[i] == fname {
+        return anonLeafAtomOfTy(o.objFieldTypes[i])
+      }
+      i = i + 1
+    }
   }
   ""
-}
-
-// D922 — the atom a declared struct type spells at field `fname`, or "". Refuses on
-// disagreement rather than taking the first: two declarations of one name give the operand
-// no single declared type. A generic declaration's `tdName` carries the parameter span, so
-// the plain-name compare never matches one.
-function anonLeafDeclFieldAtom(shape: string, fname: string): string {
-  if shape == "" { return "" }
-  let hit = ""
-  let seen = false
-  let i = 0
-  while i < P.nodes.length {
-    const s = nodeAt(i)
-    if s is TypeDecl {
-      if s.tdName == shape {
-        if seen { return "" }
-        seen = true
-        let fi = 0
-        while fi < s.tdFields.length {
-          if s.tdFields[fi] >= 0 {
-            const fd = nodeAt(s.tdFields[fi])
-            if fd is FieldDef {
-              if fd.fdName == fname {
-                hit = anonLeafAtomOfText(tyNameOf(fd.fdType))
-              }
-            }
-          }
-          fi = fi + 1
-        }
-      }
-    }
-    i = i + 1
-  }
-  hit
 }
 
 // A width rank for `typecheck.numWidensName`'s lattice, gating whether an annotation atom
@@ -9375,7 +9347,7 @@ function anonLeafAnnAtomJoins(annAtom: string, atoms: string[]): boolean {
 // `nameFieldCode` spells for the declared twin and `K | string | null` has no code — a set
 // the mint cannot code falls back to `anonFieldCode`'s answer rather than merely declining.
 function anonLeafAtomAdmits(atom: string, atoms: string[]): boolean {
-  if !nameIsLitUnionType(atom) { return true }
+  if atom == "" || anonLeafAtomIsScalar(atom) { return true }
   let i = 0
   while i < atoms.length {
     if atoms[i] != "null" { return false }
@@ -9384,19 +9356,31 @@ function anonLeafAtomAdmits(atom: string, atoms: string[]): boolean {
   true
 }
 
-// The atom NAME a field's annotation TEXT spells, or "" for everything else — the type-side
-// twin of `anonLeafAtomName`, and deliberately the same six atoms and no more.
-function anonLeafAtomOfText(t: string): string {
-  if t == "i32" { return "i32" }
-  if t == "boolean" { return "boolean" }
-  if t == "string" { return "string" }
-  if t == "f64" { return "f64" }
-  if t == "i64" { return "i64" }
-  if t == "f32" { return "f32" }
-  // D884 — a literal-union alias (`type K = "a" | "b"`) is the seventh atom, not a valtype
-  // like the six: it names a registered type whose rep is the interned i32 atom.
-  if nameIsLitUnionType(t) { return t }
-  ""
+// Is `t` one of the six scalar atoms?
+function anonLeafAtomIsScalar(t: string): boolean {
+  t == "i32"
+    || t == "boolean"
+    || t == "string"
+    || t == "f64"
+    || t == "i64"
+    || t == "f32"
+}
+
+// The atom NAME a field's arena type spells, or "" for everything else — the type-side twin of
+// `anonLeafAtomName`: the six scalars, and a literal union (D884), which names a registered
+// type whose rep is the interned i32 atom rather than a valtype.
+function anonLeafAtomOfTy(fty: i32): string {
+  if fty < 0 { return "" }
+  const t = tyAt(fty)
+  if t is TyPrim {
+    const pn = primNameStr(t.primName)
+    if anonLeafAtomIsScalar(pn) { return pn }
+    return ""
+  }
+  if !tyIsLitUnion(fty) { return "" }
+  const al = litUnionAliasNameOfTy(fty)
+  if al != "" { return al }
+  litUnionInlineNameOfTy(fty)
 }
 
 // D873 — the row `n`'s `??` left operand's own carrier resolves to, or -1. Not always

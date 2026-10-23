@@ -121,7 +121,7 @@ the slice retires.
 | --- | --- | --- | --- | --- | --- |
 | A1 | shape-row typed twins | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
-| A3 | emit_collect / emit_classify typed rungs | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
+| A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
@@ -167,6 +167,18 @@ What each slice changes:
 - **A3.** Each typed rung of the `emit_collect` field-hint ladders and the `collectATypeRef` ladder
   reads the arena, and the `emit_classify` rung reads the rl-slot columns. Hazard: the
   `collectATypeRef` chain is order-dependent, so its rungs move together.
+  - Done, byte-identical: `indexElemNulRefArrayName` reads the slot's kind and nullable
+    columns. The arm-pin map walk is `mapLeafValTy` over the annotation's arena type, so
+    `mapLeafValName` and `armPinAnnName`'s cut are gone; `alcCommitName` now returns the
+    annotation node, so `alcNamesArm` asks the same walk. The `??` field atom reads the
+    operand's `TyObj` field type, which retires `anonLeafAnnAtomOf`, `anonLeafAtomAdmits`
+    and `anonLeafAtomOfText`. That is 7 parses.
+  - Left: `fieldElemHintOf` and `collectARefArrayAnn`'s nullable reject disagree with the
+    arena on a probe (one-literal and spaced spellings, and `A | B | null` as a nullable
+    union), and the reject's message names the inner spelling. `dstPinMapValue`'s gate is
+    typed, but its cut is the pin name it pushes. `internArmShapeAt` needs a declared-vs-inline
+    answer the arena does not give, since both are a `TyObj`. Each row's `status` has the
+    probe counts.
 - **A4.** `resolveShapeToNominal` on a rendered type becomes `shapeNominalOfTy`. The
   signature-key sites that still render read `sigKeyOfTy`, which needs widening to cover them.
   Landed for 2 parses: `cboxElemName` tests `TyArray`, and `recordedParamPinName`'s nullable
