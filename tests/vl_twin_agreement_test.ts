@@ -13,6 +13,7 @@
 // @test-timing native
 
 import { exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && Deno.build.os !== "windows";
@@ -98,7 +99,7 @@ Deno.test({
       const bad: string[] = [];
       for (const c of CASES) {
         const { code, stdout } = await new Deno.Command(VL, {
-          args: ["run", `${ROOT}/scripts/twin-agreement.vl`, "--", ...c.args],
+          args: ["run", await builtScript(`${ROOT}/scripts/twin-agreement.vl`, { compiler: null }), "--", ...c.args],
           cwd: root,
           stdout: "piped",
           stderr: "piped",

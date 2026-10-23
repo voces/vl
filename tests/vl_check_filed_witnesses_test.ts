@@ -20,6 +20,9 @@
 // @test-timing native
 
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
+
+const SCRIPT = "scripts/check-filed-witnesses.vl";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -37,14 +40,7 @@ const port = async (
   extra: Record<string, string> = {},
 ): Promise<Out> => {
   const { code, stdout } = await new Deno.Command(VL, {
-    args: [
-      "run",
-      "scripts/check-filed-witnesses.vl",
-      "--compiler",
-      COMPILER,
-      "--",
-      ...argv,
-    ],
+    args: ["run", await builtScript(SCRIPT, { cwd: ROOT }), "--", ...argv],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
@@ -432,21 +428,21 @@ Deno.test({
     const dir = await Deno.makeTempDir({ prefix: "vl_cfw_timeout_" });
     try {
       const doc = `${dir}/rows.md`;
+      // The witness blocks opening a FIFO nothing writes, so each wait costs no CPU.
+      const fifo = `${dir}/never-written`;
+      const mk = await new Deno.Command("mkfifo", { args: [fifo] }).output();
+      if (mk.code !== 0) throw new Error(`mkfifo ${fifo}: exit ${mk.code}`);
+      const src = `import { readTextFile } from "std:fs"\n` +
+        `const t = readTextFile("${fifo}")\nprint(t is string)`;
       await Deno.writeTextFile(
         doc,
         `### D1 — a witness that never finishes\n**check-clean invalid wasm**\n\nRepro:\n\n` +
-          `${ind("let i = 0\nwhile true { i = i + 1 }")}\n`,
+          `${ind(src)}\n`,
       );
+      const grader = await builtScript(SCRIPT, { cwd: ROOT });
       const t0 = performance.now();
       const { code, stdout } = await new Deno.Command(VL, {
-        args: [
-          "run",
-          "scripts/check-filed-witnesses.vl",
-          "--compiler",
-          COMPILER,
-          "--",
-          doc,
-        ],
+        args: ["run", grader, "--", doc],
         cwd: ROOT,
         stdout: "piped",
         stderr: "piped",

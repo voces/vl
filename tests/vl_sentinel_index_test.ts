@@ -27,6 +27,7 @@
 // @test-timing sweep n=30
 
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const SCRIPT = `${ROOT}/scripts/sentinel-census.vl`;
 const UNGUARDED = "sentinel-index-unguarded";
@@ -34,9 +35,9 @@ const STRICT = "sentinel-index-strict-untested";
 const CODES = [UNGUARDED, STRICT] as const;
 
 // The census, run from the checkout root: it grades `compiler/*.vl` under its working directory.
-const census = (args: string[]) =>
+const census = async (args: string[]) =>
   new Deno.Command(VL, {
-    args: ["run", SCRIPT, "--", ...args],
+    args: ["run", await builtScript(SCRIPT, { compiler: null }), "--", ...args],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",

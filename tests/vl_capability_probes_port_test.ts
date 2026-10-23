@@ -29,6 +29,7 @@
 // @test-timing native
 
 import { COMPILER, exists, nativeEnv, ROOT, STD, VL } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -263,8 +264,8 @@ Deno.test({
         }).output();
         return { code, out: dec.decode(stdout) + dec.decode(stderr) };
       };
-      const port = (argv: string[]) =>
-        spawn(VL, ["run", `${P}.vl`, "--compiler", COMPILER, "--", ...argv]);
+      const port = async (argv: string[]) =>
+        spawn(VL, ["run", await builtScript(`${P}.vl`, { cwd }), "--", ...argv]);
       const norm = (s: string) =>
         s.replaceAll(dirT, "@T@").replaceAll(dir, "@D@").replaceAll(STD, "@S@");
       const agree = async (label: string, argv: string[], want: number) => {

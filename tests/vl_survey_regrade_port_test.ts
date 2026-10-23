@@ -26,6 +26,7 @@
 // @test-timing native
 
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
+import { builtScript } from "./support/builtScript.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
 const ENABLED = GATED && exists(VL) && exists(COMPILER);
@@ -248,12 +249,21 @@ Deno.test({
       }).output();
       return { code, out: dec.decode(stdout) + dec.decode(stderr) };
     };
-    const port = (argv: string[]) =>
+    const fromSource = (argv: string[]) =>
       spawn(VL, [
         "run",
         "scripts/survey-regrade.vl",
         "--compiler",
         COMPILER,
+        "--",
+        ...argv,
+      ]);
+    // The port is compiled once and every pinned case runs that module; the must-red control
+    // below runs its mutated source instead.
+    const port = async (argv: string[]) =>
+      spawn(VL, [
+        "run",
+        await builtScript("scripts/survey-regrade.vl", { cwd: dir }),
         "--",
         ...argv,
       ]);
@@ -458,7 +468,7 @@ Deno.test({
       );
       if (mutated === src) throw new Error("the mutation did not apply");
       await Deno.writeTextFile(`${dir}/scripts/survey-regrade.vl`, mutated);
-      const m = await port(["survey.md"]);
+      const m = await fromSource(["survey.md"]);
       await Deno.writeTextFile(`${dir}/scripts/survey-regrade.vl`, src);
       if (untemp(m.out) === golden["unknown seed, rows moved"].out) {
         throw new Error(
