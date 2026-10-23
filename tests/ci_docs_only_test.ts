@@ -20,6 +20,7 @@ const NOT_READERS: Record<string, string> = {
   "tests/vl_gc_heap_shape_test.ts": "message",
   "tests/vl_instance_state_leak_test.ts": "message",
   "tests/vl_memo_generation_test.ts": "message",
+  "tests/vl_opt_after_link_test.ts": "message",
   "tests/vl_scaling_shape_test.ts": "message",
   "tests/vl_seed_gc_headroom_test.ts": "message",
   "tests/vl_view_descriptor_melt_test.ts": "message",
