@@ -123,7 +123,7 @@ the slice retires.
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
-| A5 | union-atom and atom-kind twins | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
+| A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
@@ -190,7 +190,16 @@ What each slice changes:
   signature-key parses serve callers in `emit_collect`, `emit_classify` and `emit_lit_atoms`
   that pass no type.
 - **A5.** Atom-kind, closure-result-forcing, union-ref-arm and coalesce tests read the union row's
-  member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`.
+  member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`. Landed for 1 render and
+  3 parses. The coalesce element kind asks `valueAtomKindOfTy` of the operand's non-null type.
+  The two ref-array arm tests ask the element union row's `unionMemberTysOf` members.
+  `unionHasCollapsedStringMapArm` is deleted with its caller block, which an armed probe reached
+  in 0 files. A probe over every `tests/**/*.vl` and the distilled corpus found 0 differing
+  files for each retired site. The three `emit_base` entries wait until C1 lands. Five stay:
+  - `valueAtomKindOfTy`'s fallback answers declined shapes, and some of those no file reaches.
+  - `mapAnnShape`'s value spelling also keys the D8 mv-slot lookups.
+  - The two closure-result walkers have their only caller in `emit_collect`.
+  - `monoStaticIsResult`'s typed compare answers differently in 2 files.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
   `monoSubstAnn`, `monoBindOf` and their kin bind by type. Landed for the 5 parses of the two
   pre-bind predicates. `monoAnnIsOpenUnion` and `monoUnionLeavesOpenFree` are gone, and
