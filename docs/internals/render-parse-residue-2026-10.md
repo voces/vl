@@ -124,7 +124,7 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, different-type rows ablated, no site swaps) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
@@ -135,7 +135,7 @@ the slice retires.
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 6 retired, 15 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
-| D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
+| D7 | narrowing store banks a type (landed: 4 retired, 1 to B and since deleted, 6 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
@@ -185,10 +185,10 @@ What each slice changes:
   arm resolves under the null on the arena, which moves its render to B. The arena names two
   witnesses' `{r:i32}|null` pin `Circle|null` where the name path did not, with the emitted
   wasm byte-identical over every `tests/**/*.vl` and the distilled corpus. The other 6 stay,
-  and each row's `next` says why: `listUnionEmitName` renders a scalar list member as its
-  product, `resolveShapeToNominal` keeps `setAtomSpelling` as a name caller, and the four
-  signature-key parses serve callers in `emit_collect`, `emit_classify` and `emit_lit_atoms`
-  that pass no type.
+  and each row's `next` says why. `listUnionEmitName` renders a scalar list member as its
+  product. `resolveShapeToNominal` keeps `listUnionEmitName` and two `emit_rewrite` sites as
+  callers (D7 deleted `setAtomSpelling`). The four signature-key parses serve callers in
+  `emit_collect`, `emit_classify` and `emit_lit_atoms` that pass no type.
 - **A5.** Atom-kind, closure-result-forcing, union-ref-arm and coalesce tests read the union row's
   member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`. Landed for 1 render and
   3 parses. The coalesce element kind asks `valueAtomKindOfTy` of the operand's non-null type.
@@ -313,6 +313,110 @@ What each slice changes:
     type parameter, a newtype brand, function-typed bindings, and a literal-union alias arm.
   - The other disagreements were there before: the `monoUnionRestPin` argument, exact-key nested
     set maps, `void`, an `i64|i32` element row, and a `mapIndexed` literal union.
+
+  **The composite renderer, measured (2026-10-23, master `98345931c`).** The renderer gives a
+  function type its `=>` signature key, an anonymous record its `#anonN` row handle, and any
+  other type `tyToNominalName`. A fourth probe compared it with each walker spelling over
+  16,508 files: `tests/cases`, with one `entry.vl` per module directory, plus the distilled
+  `cells/` and `named/`. 4,076 of those files mint an instance.
+
+  | site | composite exact | another renderer exact | handle or grouping | member order | literal arm | different type | type `-1` or holds a TyVar |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `tvV` vs `letBT` | 8,549 | 50 | 9 | 0 | 3 | 3 | 44 + 14 |
+  | param pin vs `monoSubstInst` | 8,972 | 489 | 36 | 4 | 3 | 30 | 0 + 17 |
+  | return `rs` vs `sub2` | 2,124 | 42 | 11 | 23 | 53 | 12 | 0 + 2 |
+  | let annotation vs `s2` | 817 | 43 | 10 | 2 | 2 | 8 | 0 + 4 |
+
+  The other renderers are `tyToEmitName`, `tyToNominalName` and `arenaEmitName`. "Handle or
+  grouping" also counts the 9 rows where the typed side renders as an empty string.
+
+  **No call site can swap to the renderer.** The renderer matches 93.7% of `rs` and 98.6% of
+  `tvV`. The misses are a property of the SOURCE, not of the type:
+  - A function type is spelled as a `=>` key when a hole binding carried it, and
+    structurally (`(i32)=>i32`) when the source wrote it. Both spellings occur at the same
+    site, so no fixed choice per site matches. This is most of the 489 param rows that
+    another renderer matches.
+  - An anonymous record is spelled the same way, `#anon2` or `{x:i32,y:i32}`, depending on
+    where it came from.
+  - The arena orders a union's members canonically, with `null` last. The spelling keeps the
+    source's order (`K|null|i32`). Box tags are positional, so this is not cosmetic.
+  - The arena folds a subsumed literal arm (`string|"err"` becomes `string`). The spelling keeps
+    it, and `monoPinUnionName` softens it later.
+
+  The 53 rows of different type are the clause-1 risk. Which side is right has not been
+  established by ablation for any of them. Most of them are the first family below:
+  - The typed side loses a nominal name to a structural row. Examples are `Dot[]` and
+    `Circle[]` at `{r:i32}[]`, the `flat-generic-rows` `Rows<Node>` family, the
+    `generic-returned-record-param.vl` records, and D3504's `Rec[]`/`Rec2[]`.
+  - The literal-delivery join: `union-member-widened-delivery.vl` pins `string|i32` where the
+    typed side has `i64|string`.
+  - The bindings of `pin-inferred-from-union-argument.vl` (`i32|null` against `boolean|string`)
+    and `nullable-litunion-arm-of-box-prints.vl` (`string` against `i32|AB|null`).
+  - `type-param-shadows-alias-funcdecl-constructors.vl`: `Inner<string>` against `{w:i32}`.
+  - D10521's apart join at a let (`f64[]|i32[]` against `f64[]`).
+
+  The probe was a scratch build, and nothing in the compiler changed.
+
+  **The revised plan.** Step 1 moves the CONSUMERS of the spelling, not its producers. Each
+  consumer of a substituted spelling (the instance's TypeRef text, its key, `rsC`) takes the
+  typed product, and the composite renderer spells it only where text has to stay. The
+  walkers' 12 entries leave once no consumer reads them.
+
+  Before step 1, ablation has to settle the 53 different-type rows, one family at a time. A
+  family whose typed side is wrong is a typed-column fix. A family whose spelling is wrong is a
+  filed row. The member-order and literal-arm rows need the consumer to key on the type, which
+  is D3's instance key.
+
+  **The 53 rows, ablated (2026-10-23, master `ad71da511`).** A fifth probe was a scratch build
+  over 16,619 files. It changed the comparison in two ways:
+  - It resolves the spelling and compares types (`tySameSet`, `tyEqSoftLits`), so a spelling
+    that names the same type is no longer a different-type row.
+  - It compares a parameter pin with `monoSubstInst` of the DECLARED signature
+    (`monoDeclParamTys`), not with the annotation node's type.
+
+  Its control file tripped every site. 32 events in 16 files still differ in type. No family
+  showed a program misbehaving, so no defect row was filed.
+
+  | family | files / events | which side is right | verdict |
+  | --- | --- | --- | --- |
+  | instance parameter holds the argument's type: `b._u`, `first._u`, `k<i32>("b")`'s `p`, `recv.v`, and `mid.a1:F` where `F` is bound from another parameter | 7 / 13 | the spelling, by design (D2734, D2974, D6092) | the typed product that agrees is `pinTys`/`pinnedTyIx`, not the substituted declaration |
+  | `pin-exact-key-union-box-is.vl`: a `Set<i32>` argument spelled as its boolean map | 1 / 1 | the type; the spelling is lossy but has the same rep | D2720's exact key compensates; a type key retires that |
+  | nested-record argument whose `#anon3` row reads `{inner: _}` | 1 / 2 | the type | the row is degraded in `anonHandleTyIx`; left to the shape-row lane |
+  | `never` result spelled `void` | 2 / 3 | both: `void` is the rep (D1972) | a typed consumer maps `never` to the `void` rep |
+  | flow-pinned instance whose `F` binds to the `()=>_` placeholder | 2 / 6 | the spelling; the typed side is degraded | left; see below |
+  | apart join at a let, `T[] \| i32[]` | 3 / 7 | D10521, already ruled | the let's rep comes from the apart-join knowledge |
+
+  The other #4545 rows are the same type under resolution. That covers the nominal-against-
+  structural families (`Dot[]`, `Rows<Node>`, `Rec`/`Rec2` under the structural-records ruling),
+  alias names, member order, subsumed literal arms and `K` against `"x"|"y"`. The probe counted
+  them in five sites:
+
+  | site | files | events |
+  | --- | --- | --- |
+  | return | 73 | 105 |
+  | parameter | 50 | 107 |
+  | `tvV` | 31 | 58 |
+  | let | 10 | 18 |
+  | annotation | 2 | 3 |
+
+  Member order and literal arms change box tags, so they wait on D3.
+
+  `type-param-shadows-alias-funcdecl-constructors.vl` disagreed only against the node type.
+  Inside `appI<Id>` beside `type Id = i32`, the annotation node resolves `Id` as the alias. The
+  first instance's keep-node arm in `monoMakeInstanceParams` also records its own type on the
+  template's node. Against the declared signature the row agrees.
+
+  What step 1 takes from this:
+  - **A parameter's typed product is `pinnedTyIx`** (the argument's type), not
+    `monoSubstInst` of the declaration.
+  - **A consumer that substitutes a declaration reads `monoDeclParamTys`**, never
+    `nodeTyIxOf(p.parType)`.
+  - **The flow table's typed pins come next.** `monoNoteBindDeliveryCall` and
+    `monoRenameInitAt` call `monoInstanceFor` with `monoSigPins(sig)` and `expTy` `-1`, so
+    `pinTys` is `-1` and `recordClonedNodeTyFb` binds `F` to the placeholder. Each one has to
+    hand `monoInstanceFor` the pin types the flow table already resolves
+    (`fnFlowDeclPathPinTysOf`, `monoPinFnParamTys`). That is a new parameter on all eight
+    callers, and no program misbehaves today.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
@@ -739,16 +843,27 @@ What each slice changes:
     element type beside the spelling. This closes the first rung's no-type leg: 976 of the
     2,002 reaching files have no banked type, and the old answer is "" in all of them. All 16,451
     identity files compile exactly as before.
-  - Left: `narrowedRefArrayOf`'s first rung. With a type, returning the spelling still differs in
-    4 files, where it is an alias the program wrote (`VArr`, `JsonArr`) or `(readonly i32[])[]`.
-    Both typed renderings do worse: `tyToEmitName` differs in 46 files, because a record renders
-    by shape, and the ref-list row name differs in 37.
-  - Left: `setAtomSpelling`. The struct narrow set's member-set id does not cover the spelling in
-    23 of 87 files, which are generic pins, unions of maps and an alias. In 1 more file, a rolled
-    recursive arm, the typed gate answers differently.
+  - Done: 1 parse, and the render that had moved to B. `narrowedRefArrayOf` became
+    `narrowedIsRefArray`, a boolean. Every caller only compared the returned name with `""`, so
+    no consumer needed a spelling or a row name. It answers from the banked type alone. A
+    second probe (2026-10-23) ran over the self-compile and 16,879 files: `tests/**/*.vl` plus
+    the distilled `cells/` and `named/`. The function was reached in 2,017 files and the
+    boolean differed from the old name test in 0. The self-compile reached it 221 times.
+  - Done: 1 parse. `setAtomSpelling` is deleted. The struct complement subtracts the spelling the
+    receiver resolves to. When neither that spelling nor `msSubTy` clears a member, a third rung
+    in `pushNarrowComplement` does. `msSubTyAlike` clears the first record or list member that
+    `tyEqSoftLits` calls equal to the tested type. The site was reached in 1,269 files. The
+    resolved spelling differs from `setAtomSpelling`'s in 6 of them.
+    - Without the new rung, the pushed set differs in 2 files. This was the control. In
+      `nullable-value-map.vl`, `{f:K1[]}` is tested against a set row spelled `{f:K0[]}`. In
+      `rolled-unrolled-arm-one-tag.vl`, a rolled arm is tested against its unrolled member.
+    - With the rung, the set differs in 0 files. The rung fires only in those 2.
+    - The rung is gated to records and lists. Ungated, `tyEqSoftLits` matched a literal test
+      (`is "a"`) to its base-scalar member, and the set differed in at least 15 files. Across all other `pushNarrowComplement` callers, the rung
+      fires in 0 files.
   - Left: the producers (`removeAtomFromGo`, `indexElemNulRefArrayName`,
     `pushIndexNicheNarrow`, `pushIndexMapNullNarrow` and `litElseSurvName`). They write the
-    spelling that the two readers above and the `narrowVariantFor` callers still read.
+    spelling that the `narrowVariantFor` callers still read.
     `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74 files,
     where the complement has no member-set id, and it changes the spelling in 55 of them. `narrowedMapOf`'s render is the mv slot's
     key, so it goes with D8.

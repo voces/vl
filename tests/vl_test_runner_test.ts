@@ -714,6 +714,18 @@ const peakConcurrency = (intervals: Array<[number, number]>): number => {
   return peak;
 };
 
+// One traced `--jobs 4` run and one `--jobs 1` run of SLOW, made once: the run-phase and
+// compile-phase tests below read different stamps from the same two reports.
+let slowPair:
+  | Promise<{ par: Awaited<ReturnType<typeof runTest>>; ser: Awaited<ReturnType<typeof runTest>> }>
+  | undefined;
+const tracedSlow = () =>
+  slowPair ??= (async () => {
+    const par = await runTest(SLOW, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
+    const ser = await runTest(SLOW, ["--jobs", "1"], { VL_TEST_TRACE: "1" });
+    return { par, ser };
+  })();
+
 Deno.test({
   name:
     "vl-test: files run in PARALLEL — the schedule itself, not a wall-clock proxy",
@@ -731,8 +743,7 @@ Deno.test({
     // are the same reading (~1.0). Overlap has no such ambiguity: contention
     // makes each file take LONGER, which WIDENS the overlap rather than hiding
     // it, so the measurement strengthens as the runner gets busier.
-    const par = await runTest(SLOW, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
-    const ser = await runTest(SLOW, ["--jobs", "1"], { VL_TEST_TRACE: "1" });
+    const { par, ser } = await tracedSlow();
 
     if (par.code !== 0 || ser.code !== 0) {
       throw new Error(
@@ -788,8 +799,7 @@ Deno.test({
     // instance, so N files importing one large module paid N full compiles in
     // series. The pool gives each file a fresh compiler instance; `--jobs 1` keeps
     // the single-instance path. Read off the schedule, as the run-phase test does.
-    const par = await runTest(SLOW, ["--jobs", "4"], { VL_TEST_TRACE: "1" });
-    const ser = await runTest(SLOW, ["--jobs", "1"], { VL_TEST_TRACE: "1" });
+    const { par, ser } = await tracedSlow();
     if (par.code !== 0 || ser.code !== 0) {
       throw new Error(`the slow fixtures must all pass:\n${par.err}\n${ser.err}`);
     }
