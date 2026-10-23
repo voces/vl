@@ -200,15 +200,13 @@ const PROGRAMS: Program[] = [
       'function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return "s"\n}\n' +
       "const v = pick(true)\nif v is i32 { print(v) }\n",
   },
-  // ── the module-predicate memo: `modUnionAsHit`/`modUnionAsSeen`, `modNumCastHit`/…Seen ──
-  // `moduleHasUnionAs` / `moduleHasNumCast` bank their answer on an arena PREFIX, so a
-  // surviving `…Hit` reserves the union-`as` box or the three numeric staging slots in a
-  // program that has neither, and a surviving `…Seen` would start the next program's scan
-  // inside a prefix belonging to nobody. `emitProgram` clears all four; this program is what
-  // sets them, so the NONE family below is where a missing clear would show.
+  // ── the lazy scratch rows: the union-`as` box and the numeric staging slots ──
+  // Each is minted by `scratchSlot` on its function's first use, so a row surviving into
+  // the next function or program would add a local nobody reads. This program mints both,
+  // so the NONE family below is where a missing reset would show.
   {
     id: "as-memo-arm",
-    family: "modUnionAsHit + modNumCastHit",
+    family: "lazy union-as + num-cast rows",
     src:
       "function pick(b: boolean): i32 | string {\n  if b { return 1 }\n  return \"s\"\n}\n" +
       "const u = pick(false)\nconst s = u as? string\n" +

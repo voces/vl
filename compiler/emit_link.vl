@@ -181,15 +181,11 @@ export function emitLinkSection(
     bands: elBandTable(),
     atomNames: elAtomNames(),
   }
-  let nfImp = 0
-  let ngImp = 0
+  const fImp: string[] = []
+  const gImp: string[] = []
   let si = 0
   while si < ids.length {
-    if ids[si] == 2 {
-      const cnt = elImports(st[si], en[si])
-      nfImp = cnt[0]
-      ngImp = cnt[1]
-    }
+    if ids[si] == 2 { elImports(st[si], en[si], fImp, gImp) }
     if ids[si] == 4 { prog.table = true }
     si = si + 1
   }
@@ -197,11 +193,11 @@ export function emitLinkSection(
   const nThunk = thunkFes.length
   const nRt = elFnCount(ids, st, en) - n - nThunk
   fKey = []
-  k = 0
-  while k < nfImp {
-    fKey.push("i:f" + i32ToStr(k))
-    prog.fnImports.push(fKey[k])
-    k = k + 1
+  const nfImp = fImp.length
+  const ngImp = gImp.length
+  for nm in fImp {
+    fKey.push("i:f:" + nm)
+    prog.fnImports.push("i:f:" + nm)
   }
   for fk in fnKeys { fKey.push(fk) }
   k = 0
@@ -224,11 +220,9 @@ export function emitLinkSection(
   const g = tyS.group
   // Global index keys; a synthetic constant's waits for its own entry.
   gKey = []
-  k = 0
-  while k < ngImp {
-    gKey.push("i:g" + i32ToStr(k))
-    prog.globImports.push(gKey[k])
-    k = k + 1
+  for nm in gImp {
+    gKey.push("i:g:" + nm)
+    prog.globImports.push("i:g:" + nm)
   }
   for lex in gStrPoolTexts { gKey.push("s:" + lex) }
   const cellOf: i32[] = []
@@ -281,9 +275,15 @@ export function emitLinkSection(
     if g + fi < tyS.entS.length {
       f.sig = elSpan(tyS.entS[g + fi], tyS.entE[g + fi])
     }
-    if fi < topFnNodes.length { a.fns.push(f) } else { prog.tail.push(f) }
+    // A tail function's shared globals are the program's, as its types are (`elDemands`).
+    if fi < topFnNodes.length {
+      a.fns.push(f)
+      elNoteDefs(a, f.body, gEntries, ngImp)
+    } else {
+      prog.tail.push(f)
+      elNoteDefs(prog.runtime, f.body, gEntries, ngImp)
+    }
     byFe.push(f)
-    elNoteDefs(a, f.body, gEntries, ngImp)
     fi = fi + 1
   }
   k = 0
@@ -488,21 +488,16 @@ function elGKey(ix: i32): string {
 }
 
 // The import section's function and global counts.
-function elImports(s: i32, e: i32): i32[] {
+function elImports(s: i32, e: i32, fns: string[], gls: string[]) {
   const c = wcNew(mb, s, e)
   const cnt = wcU32(c)
-  let nf = 0
-  let ng = 0
   let i = 0
   while i < cnt && !c.failed {
-    const ml = wcU32(c)
-    wcSkip(c, ml)
-    const fl = wcU32(c)
-    wcSkip(c, fl)
+    const nm = elImpName(c) + "::" + elImpName(c)
     const kind = wcByte(c)
     if kind == 0 {
       wcU32(c)
-      nf = nf + 1
+      fns.push(elImpUnique(fns, nm))
     } else if kind == 1 {
       wcValType(c)
       elLimits(c)
@@ -511,14 +506,42 @@ function elImports(s: i32, e: i32): i32[] {
     } else if kind == 3 {
       wcValType(c)
       wcSkip(c, 1)
-      ng = ng + 1
+      gls.push(elImpUnique(gls, nm))
     } else {
       wcSkip(c, 1)
       wcU32(c)
     }
     i = i + 1
   }
-  [nf, ng]
+  0
+}
+
+// One length-prefixed import name at `c`, read as code points.
+function elImpName(c: WasmCursor): string {
+  const n = wcU32(c)
+  const cps: i32[] = []
+  let k = 0
+  while k < n && c.pos + k < c.end {
+    cps.push(mb[c.pos + k])
+    k = k + 1
+  }
+  wcSkip(c, n)
+  fromCodePoints(cps)
+}
+
+// `nm`, or `nm#k` when `k` earlier imports of one kind already carry it.
+function elImpUnique(seen: string[], nm: string): string {
+  let k = 0
+  for x in seen {
+    if (
+      x == nm
+      || x.length > nm.length && x.slice(0, nm.length + 1) == nm + "#"
+    ) {
+      k = k + 1
+    }
+  }
+  if k == 0 { return nm }
+  nm + "#" + i32ToStr(k)
 }
 
 function elLimits(c: WasmCursor) {

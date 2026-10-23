@@ -93,7 +93,7 @@ per-compile, the flag was not, and the pair disagreed.
 
 **Frame bases**, likewise: `pushScratchBase`, `refPushScratchBase`, `f64PushScratchBase`,
 `i64PushScratchBase`, `f32PushScratchBase`, `u8PushScratchBase`, `strPushScratchBase`,
-`strScratchBase`, `mapScratchBase`, `mapI32Base`, `mapKeysBase`, `mapValsBase`,
+`strScratchBase`, `mapScratchBase`, `mapKeysBase`, `mapValsBase`,
 `mfScratchBase`, `arrNewScratchBase`, `cloEqScratchBase`, `leqIScratchBase`,
 `leqSScratchBase`, `unionSinkBase`, `unionAsSlot`, `variantReboxSlot`, `coalesceCallSlot`,
 `coalesceCallStrSlot`, `coalesceCallBoolSlot`, `callRefSlot`, `atomStageSlot`,
@@ -109,6 +109,11 @@ The remainder: `capFrame`, `cmSlot`, `eqStashL`/`eqStashR`, `gStrInfLet`,
 `pendingNulList`, `pendingRawNullRead`, `gDivRemNonzero`, `repShadowOn`, `rtWalkN`,
 `fnUsesUnionAs`, `fnUsesNumCast`, `gckDepth`, `mvShapeNest`, `monoInstIsFirst`, `saFnIx`,
 `unABMode`. `emitRootIx` is assigned in the prologue with a value, not cleared.
+The lazy scratch rows (`scratchSlot`, `compiler/emit_union_casts.vl`) are minted on first
+use in the function being emitted and reset by `fbBeginFunc`, so they hold no program fact:
+the union-`as` box, the numeric `as` stashes, the `fromCodePoints` spill, the integer
+`min`/`max` stash, the call-ref slot, the multi-value map frames, the i32- and i64-keyed map
+frames and the `.map`/`.filter` callback slot.
 A memo key made by `memoKeyNew` (`compiler/memo.vl`) is registered, and `memoCompileReset`,
 the first call in `emitProgram`, clears every key and restarts the pass and registry
 counters, so the rep element and slot-cache memos, the variant sig and tag keys and the

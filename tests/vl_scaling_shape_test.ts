@@ -693,7 +693,7 @@ const axis = (name: string, bar: number, note: string, mk: (d: string) => [strin
 axis(
   "functions",
   2.5,
-  "Memoise it on an arena prefix the way `moduleHasUnionAs` does (compiler/emit_union_casts.vl), clearing the memo in `emitProgram`.",
+  "Ask the fact on first use in the function being emitted, the way `scratchSlot` does (compiler/emit_union_casts.vl), or bank it once in a pass.",
   (d) => twoFiles(d, genFunctions(1600, 10), genFunctions(80, 200)),
 );
 

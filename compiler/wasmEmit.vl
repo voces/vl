@@ -365,7 +365,6 @@ import {
   bankSpanRow,
   bl8TypeIdx,
   callRefDepth,
-  callRefSlot,
   capCountTbl,
   capNamesFlat,
   capStartTbl,
@@ -404,7 +403,6 @@ import {
   fa32Used,
   fa64TypeIdx,
   fa64Used,
-  fcpSpillSlot,
   fitGrowFn,
   fitGrowLocal,
   fitGrowName,
@@ -499,7 +497,6 @@ import {
   ia64TypeIdx,
   ia64Used,
   il64TypeIdx,
-  intMinMaxSlot,
   lTypeIdx,
   lUsed,
   lcatBases,
@@ -534,8 +531,6 @@ import {
   mIntMonoArmUsed,
   mUsed,
   maFoldScratchBase,
-  mapI32Base,
-  mapI64Base,
   mapKeysBase,
   mapScratchBase,
   mapValsBase,
@@ -549,9 +544,6 @@ import {
   mvValName,
   narrowTop,
   nulStrReadStaysRaw,
-  numCastF32Slot,
-  numCastF64Slot,
-  numCastI64Slot,
   optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
@@ -624,7 +616,6 @@ import {
   uVarHeap,
   uVarTyIx,
   uVariants,
-  unionAsSlot,
   unionSinkBase,
   variantReboxSlot,
   vbAtomListUsed,
@@ -1159,10 +1150,6 @@ import {
 } from "./emit_narrow_slots"
 import {
   annValtypeSlotOf,
-  fnMvMapRefLocal,
-  fnMvValStashLocal,
-  fnMvValsBkLocal,
-  fnMvValsOutLocal,
   fnRetIsNulAtom,
   globalNameIsNonConst,
   globalNameIsNonConstSid,
@@ -1335,13 +1322,24 @@ import {
   asExprNumSrcName,
   asExprNumTgtName,
   callRefNestSlot,
+  fcpSpillStashSlot,
+  fnMvMapRefLocal,
+  fnMvValStashLocal,
+  fnMvValsBkLocal,
+  fnMvValsOutLocal,
+  intMinMaxStashSlot,
   listIdxKindOf,
   listIdxWrapSlot,
+  mapI32KeyLocal,
+  mapI64KeyLocal,
+  mfCallbackLocal,
   mfDstLocalFor,
   mfSrcLocalFor,
   nulNicheCastWiredTy,
   nulRefNichePayloadTy,
+  numCastStashSlot,
   sharedFieldRecvSlot,
+  unionAsBoxSlot,
   unionHasAtomK,
   unionHasAtomKindArm,
   unionStoreAtomKindOfSet,
@@ -12301,10 +12299,9 @@ function emitArrUnder(body: u8[], arrIx: i32, fnIx: i32) {
 // +8 chr, +9 hcur, +10 idxBk, +11 rslot, +12 liveBk, +13 hashBk, +14 valSet. `hcur` is the op's
 // key hash, live from `emitMapProbe` through an appending set's `hashes[]` store.
 
-// The i32-keyed rep re-types four of those slots and appends its own frame (`mapI32Base`, minted
-// only when the module has one, so no offset above moves): +0 the i32 key, +1 keys backing, +2
-// and +3 the key-list builder's backings, +4 mapRef. The i64-keyed rep has the same frame at
-// `mapI64Base`. `cmKeyKind` picks, through the `cm*` helpers.
+// The i32-keyed rep re-types four of those slots and keeps five of its own, each minted on first
+// use (`mapI32KeyLocal`): the i32 key, the keys backing, the key-list builder's two backings and
+// the map struct. The i64-keyed rep has the same five (`mapI64KeyLocal`). `cmKeyKind` picks.
 
 // The current op's map struct heap type / vals wrapper / vals backing.
 function cmMapTy() { mapTypeIdxOf(cmSlot) }
@@ -12322,10 +12319,10 @@ function cmValsBack() { mvValsBackOf(cmSlot) }
 function cmKeyKind() { mapShapeKeyKind(cmSlot) }
 // Whether the current op's index is the (tag, entry) pair layout: an i32 or an i64 key.
 function cmKeyInt() { cmKeyKind() != MAP_KEY_STR }
-// The current op's integer-key frame base: the i32 frame or the i64 one.
-function cmIntKeyBase() {
-  if cmKeyKind() == MAP_KEY_I64 { return mapI64Base }
-  mapI32Base
+// Slot `k` of the current op's integer-key frame: the i32 frame or the i64 one.
+function cmIntKeyLocal(k: i32) {
+  if cmKeyKind() == MAP_KEY_I64 { return mapI64KeyLocal(k) }
+  mapI32KeyLocal(k)
 }
 // The current op's keys-list wrapper and backing heap types: the string-ref pair for the
 // string-keyed rep, the i32 or i64 list pair for an integer-keyed one.
@@ -12345,14 +12342,14 @@ function cmKeysBack() {
 // string, or an integer frame's slot 0, the raw key.
 function cmKeyLocal() {
   if msHelp { return 1 }
-  if cmKeyInt() { return cmIntKeyBase() }
+  if cmKeyInt() { return cmIntKeyLocal(0) }
   mapScratchBase + 1
 }
 // The current op's grown or compacted keys-backing scratch local: the string frame's slot 6, or
 // an integer frame's slot 1.
 function cmKeysBkLocal() {
   if msHelp { return 6 }
-  if cmKeyInt() { return cmIntKeyBase() + 1 }
+  if cmKeyInt() { return cmIntKeyLocal(1) }
   mapScratchBase + 6
 }
 // True while a `__map_set_<row>__` body emits: its map, key and value are params 0, 1 and 2, and
@@ -12365,7 +12362,7 @@ let msHelp = false
 function cmMapRefLocal() {
   if msHelp { return 0 }
   if cmSlot >= 0 { return fnMvMapRefLocal(cmSlot) }
-  if cmKeyInt() { return cmIntKeyBase() + 4 }
+  if cmKeyInt() { return cmIntKeyLocal(4) }
   mapScratchBase
 }
 // The current op's vals-backing scratch local (grow/compact temporary).
@@ -13576,13 +13573,13 @@ function emitMapKeys(body: u8[], recvIx: i32, fnIx: i32) {
   if keyK == MAP_KEY_I32 {
     keysWrap = lTypeIdx
     keysBack = aTypeIdx
-    outBackL = mapI32Base + 2
-    keysBackL = mapI32Base + 3
+    outBackL = mapI32KeyLocal(2)
+    keysBackL = mapI32KeyLocal(3)
   } else if keyK == MAP_KEY_I64 {
     keysWrap = il64TypeIdx
     keysBack = ia64TypeIdx
-    outBackL = mapI64Base + 2
-    keysBackL = mapI64Base + 3
+    outBackL = mapI64KeyLocal(2)
+    keysBackL = mapI64KeyLocal(3)
   }
   const liveL = mapKeysBase + 2
   const iL = mapKeysBase + 3
@@ -19496,7 +19493,7 @@ function emitMapRetag(
   mapUnboxHeld = held
   const arms = fromTags.length + wFrom.length
   if r < 0 || !boxed || arms == 0 { return r }
-  fbLocalSet(unionAsSlot)
+  fbLocalSet(unionAsBoxSlot())
   let w = 0
   while w < wFrom.length {
     if emitWidenRetagArm(wFrom[w], wTo[w]) < 0 { return -1 }
@@ -19504,19 +19501,19 @@ function emitMapRetag(
   }
   let i = 0
   while i < fromTags.length {
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 0)
     fbI32Rel(RS_TAG, fromTags[i])
     fbI32Bin(70) // i32.eq
     fbIfRefNul(uBoxIdx, false)
     fbI32Rel(RS_TAG, toTags[i])
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 1)
     fbStructNew(uBoxIdx)
     fbElse()
     i = i + 1
   }
-  fbLocalGet(unionAsSlot)
+  fbLocalGet(unionAsBoxSlot())
   let e = 0
   while e < arms {
     fbEnd()
@@ -19579,7 +19576,7 @@ function boxAtomRetagKind(p: string, to: string[], from: string[]): i32 {
 }
 
 // One arm of `emitMapRetag`'s chain for a scalar member `fromTy` the destination holds widened
-// as `toTy`: under `fromTy`'s tag, the box in `unionAsSlot` is rebuilt under `toTy`'s with its
+// as `toTy`: under `fromTy`'s tag, the box in `unionAsBoxSlot` is rebuilt under `toTy`'s with its
 // payload converted; the arm is left open on its `else`.
 function emitWidenRetagArm(fromTy: i32, toTy: i32) {
   const fk = valueAtomKindOfTy(fromTy)
@@ -19591,13 +19588,13 @@ function emitWidenRetagArm(fromTy: i32, toTy: i32) {
       "emitProgram: a union delivered widened has no box for its widened member",
     )
   }
-  fbLocalGet(unionAsSlot)
+  fbLocalGet(unionAsBoxSlot())
   fbStructGet(uBoxIdx, 0)
   fbI32Rel(RS_TAG, scalarTagOfKind(fk))
   fbI32Bin(70) // i32.eq
   fbIfRefNul(uBoxIdx, false)
   fbI32Rel(RS_TAG, scalarTagOfKind(tk))
-  fbLocalGet(unionAsSlot)
+  fbLocalGet(unionAsBoxSlot())
   if emitUnionUnboxTail(fk) < 0 { return -1 }
   wU8(conv)
   fbStructNew(vb)
@@ -21027,14 +21024,14 @@ function emitNumExactTest(src: string, dom: string, integral: boolean) {
   if src == "i64" {
     // `i64 -> i32` / `i64 -> u8`: a pure range test, and never a wrap. The bounds are exact
     // i64 literals. An i32 SOURCE arrives here too — `emitNumExactCast` widens it, exactly.
-    fbLocalGet(numCastI64Slot)
+    fbLocalGet(numCastStashSlot(2))
     if u8Dom {
       fbI64Const(0, 0) // i64.const 0
     } else {
       fbI64Const(-1, -2147483648) // i64.const -2147483648
     }
     fbI64GeS()
-    fbLocalGet(numCastI64Slot)
+    fbLocalGet(numCastStashSlot(2))
     if u8Dom {
       fbI64Const(0, 255) // i64.const 255
     } else {
@@ -21045,8 +21042,8 @@ function emitNumExactTest(src: string, dom: string, integral: boolean) {
     return 0
   }
   const isF32 = src == "f32"
-  let slot = numCastF64Slot
-  if isF32 { slot = numCastF32Slot }
+  let slot = numCastStashSlot(0)
+  if isF32 { slot = numCastStashSlot(1) }
   // INTEGRAL: `trunc(d) == d`. A fraction fails it, and so does NaN (no comparison involving
   // NaN is true), which is the ruling's verdict on a NaN cast arriving for free.
   if !integral {
@@ -21100,16 +21097,16 @@ function emitNumExactTest(src: string, dom: string, integral: boolean) {
 // honest outcome, not a silent clamp.
 function emitNumExactConvert(src: string, tgt: string) {
   if src == "i64" {
-    fbLocalGet(numCastI64Slot)
+    fbLocalGet(numCastStashSlot(2))
     fbI32WrapI64()
     return 0
   }
   if src == "f32" {
-    fbLocalGet(numCastF32Slot)
+    fbLocalGet(numCastStashSlot(1))
     if tgt == "i32" { fbI32TruncF32S() } else { fbI64TruncF32S() }
     return 0
   }
-  fbLocalGet(numCastF64Slot)
+  fbLocalGet(numCastStashSlot(0))
   if tgt == "i32" { fbI32TruncF64S() } else { fbI64TruncF64S() }
   0
 }
@@ -21178,13 +21175,13 @@ function emitNumExactCastFrom(
   // Stage the operand ONCE — the test reads it up to three times and it is typically a call.
   if src == "i64" {
     if emitNumIntrArg(body, e.asObj, 3, fnIx) < 0 { return -1 }
-    fbLocalSet(numCastI64Slot)
+    fbLocalSet(numCastStashSlot(2))
   } else if src == "f32" {
     if emitNumIntrArg(body, e.asObj, 5, fnIx) < 0 { return -1 }
-    fbLocalSet(numCastF32Slot)
+    fbLocalSet(numCastStashSlot(1))
   } else {
     if emitNumIntrArg(body, e.asObj, 4, fnIx) < 0 { return -1 }
-    fbLocalSet(numCastF64Slot)
+    fbLocalSet(numCastStashSlot(0))
   }
   const integral = src != "i64" && exprIsIntegralFloat(e.asObj, fnIx)
   if emitNumExactTest(src, dom, integral) < 0 { return -1 }
@@ -21398,7 +21395,7 @@ function emitAsUnionOpt(
     || armVi < 0 && (ak == 0 || ak == 3 || ak == 4 || ak == 5 || ak == 14)
   ) {
     fbIfRefNul(uBoxIdx, false) // if (result (ref $uBoxIdx))
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbElse()
     // the null-tagged box, what `T | null` means for a boxed union — a non-null box
     // carrying `nullBoxTag()`, not a null box ref: the rep the null test and
@@ -21412,7 +21409,7 @@ function emitAsUnionOpt(
   // a map or list target's `M | null` is the nullable ref: the payload on the hit, a null.
   if mapHeap >= 0 {
     fbIfRefNul(mapHeap, true)
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     fbRefCast(mapHeap)
     fbElse()
@@ -21431,7 +21428,7 @@ function emitAsUnionOpt(
       )
     }
     fbIfRefNul(uVarHeap[armVi], true)
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
     fbRefCast(uVarHeap[armVi])
     fbElse()
@@ -21445,7 +21442,7 @@ function emitAsUnionOpt(
   // null), so the block's result is a scalar where every other target's is a ref.
   if ak == 1 {
     fbIf(127) // 0x04 if, 0x7f i32 result blocktype
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     if emitUnionUnboxTail(ak) < 0 { return -1 }
     fbElse()
     fbI32Const(2) // the null sentinel
@@ -21462,7 +21459,7 @@ function emitAsUnionOpt(
     )
   }
   fbIfRefNul(sTypeIdx, true) // if (result (ref null $sTypeIdx))
-  fbLocalGet(unionAsSlot)
+  fbLocalGet(unionAsBoxSlot())
   fbStructGet(uBoxIdx, 1) // field 1: value (anyref)
   fbRefCast(sTypeIdx)
   fbElse()
@@ -21525,13 +21522,13 @@ function emitAsUnionCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
     )
   }
   if emitExpr(body, obj, fnIx) < 0 { return -1 }
-  fbLocalSet(unionAsSlot)
+  fbLocalSet(unionAsBoxSlot())
   // `tag == w0 || tag == w1 || …` — one compare for a single arm, a chain for a sub-union.
   // The tag is re-read per arm rather than stashed in a second i32 slot: it is a
   // `struct.get` off a local, two instructions, and costs no frame.
   let wi = 0
   while wi < wantTags.length {
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbStructGet(uBoxIdx, 0) // field 0: the tag
     fbI32Rel(RS_TAG, wantTags[wi])
     fbI32Bin(70)            // 0x46 i32.eq
@@ -21554,11 +21551,11 @@ function emitAsUnionCast(body: u8[], e: AsExpr, _exprIx: i32, fnIx: i32) {
   if e.asMode == "trap" {
     fbUnreachable()
   } else {
-    fbLocalGet(unionAsSlot)
+    fbLocalGet(unionAsBoxSlot())
     fbReturn()
   }
   fbEnd()
-  fbLocalGet(unionAsSlot)
+  fbLocalGet(unionAsBoxSlot())
   // a sub-union result is the box itself, at a narrower type — nothing to unbox.
   if subUnion { return 0 }
   // a struct arm's payload is the variant struct — recover it with the variant heap
@@ -22197,22 +22194,24 @@ function emitIntMinMax(
     return emitFail("emitProgram: expected an integer min/max call")
   }
   let k = 0
-  let s0 = intMinMaxSlot
+  let w = 0
   // i32.lt_s 0x48 · i32.gt_s 0x4a · i64.lt_s 0x53 · i64.gt_s 0x55
   let cmp = 0x48
   if wide {
     k = 3
-    s0 = intMinMaxSlot + 2
+    w = 2
     cmp = 0x53
   }
+  const s0 = intMinMaxStashSlot(w)
+  const s1 = intMinMaxStashSlot(w + 1)
   if name == "max" { cmp = cmp + 2 }
   if emitNumIntrArg(body, c.callArgs[0], k, fnIx) < 0 { return -1 }
   if emitNumIntrArg(body, c.callArgs[1], k, fnIx) < 0 { return -1 }
-  fbLocalSet(s0 + 1)
+  fbLocalSet(s1)
   fbLocalTee(s0)
-  fbLocalGet(s0 + 1)
+  fbLocalGet(s1)
   fbLocalGet(s0)
-  fbLocalGet(s0 + 1)
+  fbLocalGet(s1)
   fbNumOp(cmp)
   fbSelect() // → the first operand when the compare holds
   0
@@ -22227,11 +22226,12 @@ function emitIntAbs(body: u8[], callIx: i32, fnIx: i32, wide: boolean) {
     return emitFail("emitProgram: expected an integer abs call")
   }
   let k = 0
-  let s0 = intMinMaxSlot
+  let w = 0
   if wide {
     k = 3
-    s0 = intMinMaxSlot + 2
+    w = 2
   }
+  const s0 = intMinMaxStashSlot(w)
   if emitNumIntrArg(body, c.callArgs[0], k, fnIx) < 0 { return -1 }
   fbLocalSet(s0)
   if wide { fbI64Const(0, 0) } else { fbI32Const(0) }
@@ -23465,10 +23465,10 @@ function emitCallCoreFromCodePoints(
   // effects. `callSpillsFcpArg` is the same question the frame reserved on (D1640).
   if callSpillsFcpArg(callIx) {
     if emitExpr(body, fcpArg, fnIx) < 0 { return -1 }
-    fbLocalTee(fcpSpillSlot)
+    fbLocalTee(fcpSpillStashSlot())
     fbStructGet(lTypeIdx, 0)
     fbI32Const(0)
-    fbLocalGet(fcpSpillSlot)
+    fbLocalGet(fcpSpillStashSlot())
     fbStructGet(lTypeIdx, 1)
     fbCall(gHelpUtf8Enc)
     return 0
@@ -24235,14 +24235,6 @@ function cloLiftCalleeOf(calleeIx: i32, fnIx: i32): i32 {
   cloLiftLetFe(fnStmtsPosOf(fnIx), li)
 }
 
-// The slot a function-value call stashes its closure in: the eager `callRefSlot` at depth
-// 0, else a lazy slot of its own depth (D2329). The id is read after the arguments, so a
-// call nested in them must not share the enclosing call's slot.
-function callRefStashSlot() {
-  if callRefDepth == 0 { return callRefSlot }
-  callRefNestSlot(callRefDepth)
-}
-
 // A narrowed `X | null` argument keeps its nullable rep, so a parameter of non-null kind `pk`
 // whose slot is a bare `(ref $heap)` takes it through `ref.as_non_null`. The checker proved
 // the call guarded, so the recover cannot trap. `null` or any other kind is a no-op.
@@ -24515,14 +24507,14 @@ function emitCallRefUnder(body: u8[], callIx: i32, fnIx: i32) {
         "emitProgram: named arguments work only on declared functions, not on a function value",
       )
     }
-    // Evaluate the closure once into the call-ref scratch local (`callRefSlot`).
+    // Evaluate the closure once into the call-ref scratch local (`callRefNestSlot`).
     if emitExpr(body, c.callFn, fnIx) < 0 { return -1 }
     // A NULLABLE function value (`fn | null`, kind 19) loads as `(ref null $cloStruct)`;
     // the scratch slot is non-null, and the checker proved it non-null here (the `if c !=
     // null` narrowing), so recover to non-null.
     if exprNulClosure(c.callFn, fnIx) { fbRefAsNonNull() }
     const crDepth = callRefDepth
-    const crSlot = callRefStashSlot()
+    const crSlot = callRefNestSlot(callRefDepth)
     fbLocalSet(crSlot)
     // the callee's interned `$fnsig` key — from a function-typed annotation, an inferred
     // binding's sig, a field closure's, or a closure-array element's. Its tokens drive
@@ -27104,7 +27096,7 @@ function emitMapFilter(body: u8[], callIx: i32, fnIx: i32) {
       const iL = mfScratchBase
       const nL = mfScratchBase + 1
       const jL = mfScratchBase + 2
-      const cL = mfScratchBase + 3
+      const cL = mfCallbackLocal()
       // src = <receiver>, evaluated ONCE. (Any nested `.map`/`.filter` in the
       // receiver chain completes — including its result wrapper — before this store,
       // so the shared frame slots are free to reuse.) The receiver builds at its own type: a
@@ -27743,13 +27735,13 @@ function emitRefListRetagSite(
   fbArrayGet(srcBack)
   // Below `len` every element is a box: a `null` member is boxed under its own tag.
   fbRefAsNonNull()
-  fbLocalSet(unionAsSlot)
+  fbLocalSet(unionAsBoxSlot())
   let w = 0
   while w < from.length {
     if emitWidenRetagArm(from[w], to[w]) < 0 { return false }
     w = w + 1
   }
-  fbLocalGet(unionAsSlot)
+  fbLocalGet(unionAsBoxSlot())
   let e = 0
   while e < from.length {
     fbEnd()
@@ -37180,7 +37172,7 @@ function emitCapturedCall(body: u8[], callIx: i32, fnIx: i32, target: i32) {
   // this one is consumed by the call that pinned it, so an un-annotated parameter is fine.
   if emitClosureValueCore(body, target, fnIx) < 0 { return -1 }
   const crDepth = callRefDepth
-  const crSlot = callRefStashSlot()
+  const crSlot = callRefNestSlot(callRefDepth)
   fbLocalSet(crSlot)
   fbLocalGet(crSlot)
   fbStructGet(cloStructIdx, 0) // env

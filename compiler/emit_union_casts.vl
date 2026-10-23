@@ -1,7 +1,7 @@
 // `emit_union_casts.vl` — whether a module casts unions or numbers, the niche casts
 // it wires, and which functions use a map.
 
-import { AsExpr, FuncDecl, P, Param, TypeRef, nodeAt } from "./ast"
+import { AsExpr, FuncDecl, Param, TypeRef, nodeAt } from "./ast"
 import {
   nodeTyIsFunc,
   nodeTyIxOf,
@@ -9,7 +9,6 @@ import {
   nodeTyReachesMap,
 } from "./check_node_tys"
 import { numCastCanFail } from "./check_num_lits"
-import { widenRetagAny } from "./check_retag_rows"
 import { valueAtomKind } from "./check_ty_rep"
 import {
   TyArray,
@@ -28,7 +27,6 @@ import {
   tyIxIsVariantMember,
 } from "./check_types"
 import { structIndexOfTy, valueAtomKindOfTy } from "./emit_atom_kinds"
-import { mapRetagAnyEmitted } from "./emit_map_twins"
 import { structIdxMatchesVariantIdx } from "./emit_obj_lit_fits"
 import { msHasValKind } from "./emit_rep"
 import {
@@ -42,17 +40,12 @@ import {
   localIsRef,
   localNames,
   localStructIdx,
-  mTwinSettled,
   mfDstBases,
   mfDstKinds,
   mfDstSlots,
   mfSrcBases,
   mfSrcKinds,
   mfSrcSlots,
-  modNumCastHit,
-  modNumCastSeen,
-  modUnionAsHit,
-  modUnionAsSeen,
   monoGradualAsScalar,
   rlElemKindTbl,
   sHeapIdx,
@@ -252,36 +245,6 @@ export function fnHasMap(fnIx: i32) {
       pj = pj + 1
     }
   }
-  false
-}
-
-// Does the module contain a union-operand `as` cast? It needs a 1-slot box scratch, since
-// its operand is evaluated once and then both tested and unboxed. Module-wide rather than
-// a per-function hand-walk (like `blockHasCallRef`'s), deliberately: a hand-walk that
-// misses a node kind under-reserves the slot, invalid wasm — a linear arena pass cannot.
-export function moduleHasUnionAs(): boolean {
-  // Memoised on an arena prefix (never a plain boolean): asked once per emitted function,
-  // so a full rescan on every call would cost noticeably more self-compile time.
-  if modUnionAsHit { return true }
-  // A box retagged on delivery stages in the same slot (`emitMapRetag`).
-  if mTwinSettled && mapRetagAnyEmitted() { return true }
-  if widenRetagAny() { return true }
-  let i = modUnionAsSeen
-  while i < P.nodes.length {
-    if asExprIsUnionCast(i) {
-      modUnionAsHit = true
-      return true
-    }
-    // The hole operand, over-approximated: with no `fnIx` here this can't ask the rep
-    // question the emit-time check does, so it reserves rather than risk an invalid-wasm
-    // miss — an unused local costs nothing (D1251).
-    if asExprOperandIsHole(i) {
-      modUnionAsHit = true
-      return true
-    }
-    i = i + 1
-  }
-  modUnionAsSeen = P.nodes.length
   false
 }
 
@@ -491,25 +454,6 @@ export function asExprHoleNumSad(ix: i32): boolean {
   d == "i32" || d == "i64" || d == "f32" || d == "f64" || d == "u8"
 }
 
-// Does the module contain a fallible numeric cast? The `moduleHasUnionAs` twin, reserving
-// the three staging slots by the same linear arena walk, since an exactness test's operand
-// is read twice and is typically not re-readable. Memoised the same way, for the same reason.
-export function moduleHasNumCast(): boolean {
-  if modNumCastHit { return true }
-  let i = modNumCastSeen
-  while i < P.nodes.length {
-    if nodeAt(i) is AsExpr {
-      if asExprNumFallible(i) || asExprHoleNumOpt(i) || asExprHoleNumSad(i) {
-        modNumCastHit = true
-        return true
-      }
-    }
-    i = i + 1
-  }
-  modNumCastSeen = P.nodes.length
-  false
-}
-
 // The float width the checker recorded for the `min` / `max` call at `ix`, or "". The one
 // fact both the lowering and the frame reservation read, so neither can go integer alone.
 export function minMaxRecordedFloat(ix: i32): string {
@@ -623,7 +567,65 @@ export function sharedFieldRecvSlot() {
 
 // The closure stash of a function-value call lowered inside another's arguments, code 23,
 // keyed by nesting depth so siblings share a slot and an inner call never writes the outer
-// call's (D2329). `(ref null $cloStruct)`; depth 0 uses the eager `callRefSlot` instead.
+// call's (D2329). `(ref null $cloStruct)`, minted on first use, so depth 0 is a slot too.
 export function callRefNestSlot(depth: i32) {
   scratchSlot(23, "i32", depth, SCRATCH_BY_KEY)
+}
+
+// The map struct local of mv slot `slot`, minted on first use in this function.
+export function fnMvMapRefLocal(slot: i32) {
+  scratchSlot(34, "i32", slot, SCRATCH_BY_KEY)
+}
+
+// The values-backing local of mv slot `slot`, minted on first use.
+export function fnMvValsBkLocal(slot: i32) {
+  scratchSlot(35, "i32", slot, SCRATCH_BY_KEY)
+}
+
+// The value stash of mv slot `slot` (a scalar for an f64/f32/i64 value), minted on first use.
+export function fnMvValStashLocal(slot: i32) {
+  scratchSlot(36, "i32", slot, SCRATCH_BY_KEY)
+}
+
+// The `m.values()` output backing local of mv slot `slot`, minted on first use.
+export function fnMvValsOutLocal(slot: i32) {
+  scratchSlot(37, "i32", slot, SCRATCH_BY_KEY)
+}
+
+// Slot `k` of the i32-keyed map frame, minted on first use: 0 the key, 1 the keys backing,
+// 2 and 3 the key-list builder's backings, 4 the map struct.
+export function mapI32KeyLocal(k: i32) {
+  scratchSlot(38, "i32", k, SCRATCH_BY_KEY)
+}
+
+// Slot `k` of the i64-keyed map frame, laid out as `mapI32KeyLocal`'s.
+export function mapI64KeyLocal(k: i32) {
+  scratchSlot(39, "i32", k, SCRATCH_BY_KEY)
+}
+
+// The `.map`/`.filter` callback closure, `(ref $cloStruct)`, minted on first use: a function
+// whose frame only `slice` uses declares no closure slot.
+export function mfCallbackLocal() { scratchSlot(40, "i32", 0, SCRATCH_BY_CODE) }
+
+// The union-`as` box stash, code 30: a non-null `(ref $uBoxIdx)` (an i32 when the module
+// mints no box), `local.set` before every read. Minted on first use, so a function that never
+// lowers a union `as` declares no slot for it.
+export function unionAsBoxSlot() { scratchSlot(30, "i32", 0, SCRATCH_BY_CODE) }
+
+// The numeric exact-or-fail `as` operand stash, code 31, keyed by source rep: 0 f64, 1 f32,
+// 2 i64. The exactness test reads the staged operand up to three times.
+export function numCastStashSlot(which: i32) {
+  scratchSlot(31, "i32", which, SCRATCH_BY_KEY)
+}
+
+// The `fromCodePoints` argument spill, code 32: a `(ref null $lTypeIdx)` holding a list
+// argument that is not a re-readable name, so its backing and length come off one evaluation.
+export function fcpSpillStashSlot() {
+  scratchSlot(32, "i32", 0, SCRATCH_BY_CODE)
+}
+
+// The integer `min` / `max` / `abs` operand stash, code 33, keyed 0 and 1 for the two i32
+// operands and 2 and 3 for the two i64 ones.
+export function intMinMaxStashSlot(which: i32) {
+  scratchSlot(33, "i32", which, SCRATCH_BY_KEY)
 }

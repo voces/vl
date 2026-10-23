@@ -182,7 +182,8 @@ on program behaviour instead.
    This step is the exception to byte identity. The canonical type order and the
    literal-type pool change normal builds, and are graded on behaviour instead. Types, tags,
    atoms, runtime helpers and lambdas are keyed per module, and invariance holds on three
-   sets. Function frames still reserve slots on program-wide facts, and §12 lists them.
+   sets. A function's frame mints its scratch slots on first use (§12, "Function frames");
+   the facts that stay program-wide are listed there.
 5. **`-O` after link.** Move the optimiser behind the link. Gates: identity on `-O` builds,
    the plumb-shape cost gate, and seed-size.
 6. **Switch-over: the artifact cache.** The host stores artifacts and instances under §6's
@@ -554,22 +555,12 @@ Each set's link also reads 0 modules differing.
 
 The atom-by-code control is green on sets a and b, which is why set c exists.
 
-**What stays whole-program, for step 5.** Invariance fails on a set of 8 scripts
-(`s5-relocs.vl`, `goal-scoreboard.vl`, `seed-size.vl` and five more), and the link is green
-there. The cause is the function frame. A body's locals vector reserves scratch slots on
-program-wide facts. A two-program witness (`m3` under `r1` and `r2`) shows identical
-references, with locals `0x25` against `0x28`. The facts are:
-
-- `resetFnScratchFlags` reads `moduleHasUnionAs` and `moduleHasNumCast`
-  (`emit_union_casts.vl`, L6's), and `moduleHasFcpSpill` and `moduleHasIntMinMax`
-  (`emit_fn_scans.vl`);
-- `fbReserveCollectionFrames` reserves the call-ref frame on `fnValUsed`, and the map frames
-  on `mI32Used`, `mI64Used` and `mvValName.length` (the Map runtime's);
-- the `variantRebox`/`cloEq` slot;
-- `envSlotShift`, on `fnNestUsed`.
-
-Each needs its fact asked of the function or the module, not the program. Forcing every
-frame on would cost about 4% of the seed, so that was not done. Also still program-level:
+**What stayed whole-program after step 4.** Invariance failed on a set of 8 scripts
+(`s5-relocs.vl`, `goal-scoreboard.vl`, `seed-size.vl` and five more) while the link was green
+there. The cause was the function frame: a body's locals vector reserved scratch slots on
+program-wide facts. A two-program witness (`m3` under `r1` and `r2`) showed identical
+references, with locals `0x25` against `0x28`. "Function frames" below takes those facts one at a time.
+Also still program-level:
 
 - the band rank table (`LinkProg.bands`, now a sort over keys, but carried whole);
 - lifted lambdas and instances in `prog.tail`;
@@ -600,3 +591,63 @@ Cost: seed 6,608,517 → 6,620,623 bytes (+0.18%). L2 guest fuel at #4192:
 
 The compiler pays 0.11% on a given program, for keying and ordering every group rather than
 only those past 64 types. The rest is its own larger source.
+
+### Function frames
+
+A scratch slot is now a lazy row (`scratchSlot`, `emit_union_casts.vl`). The function being
+emitted mints it on first use and types it in `fbLazyListSlotRun` (`emit_bytes.vl`). So a
+body's locals vector holds exactly the slots its own lowering asked for, and a program-wide
+fact no longer adds locals to a function that never reads them. Nothing forces a frame on.
+
+| fact | was | now |
+| --- | --- | --- |
+| `moduleHasUnionAs` | program arena scan | lazy `unionAsBoxSlot` |
+| `moduleHasNumCast` | program arena scan | lazy `numCastStashSlot` |
+| `moduleHasFcpSpill` | program arena scan | lazy `fcpSpillStashSlot` |
+| `moduleHasIntMinMax` | program arena scan | lazy `intMinMaxStashSlot` |
+| call-ref frame on `fnValUsed` | a slot in every function, plus the `blockHasCallRef` prediction scans | lazy `callRefNestSlot`; also closes [D3232](inventory/D3232.md), a call the scan missed |
+| map value frames on `mvValName.length` | program-wide reservation | lazy `fnMvMapRefLocal`, `fnMvValsBkLocal`, `fnMvValStashLocal`, `fnMvValsOutLocal` |
+| i32- and i64-keyed map frames on `mI32Used`, `mI64Used` | a 5-slot frame per map-using function | lazy `mapI32KeyLocal`, `mapI64KeyLocal` |
+| `.map`/`.filter` closure slot | reserved with the frame | lazy `mfCallbackLocal` |
+| `variantRebox`, `cloEq` | already asked per function (`fnUsesVariantRebox`, `fnUsesCloEq`) | unchanged |
+| imports | keyed by program index | keyed by `<module>::<field>` (`emit_link.vl`) |
+| a tail function's defs | noted against the last module | noted against the runtime artifact |
+
+Left program-wide, each for a reason:
+
+- **`gMapDeletes`** (`scanPrintUse`). A program that deletes from a map gives every map
+  struct two more fields (`seqs`, `next`) and an extra initialiser. A map value crosses
+  modules, so its layout is a program ABI and not a body fact. This accounts for
+  `std:json`, `lib/corpus.vl` and `lib/census-read.vl` in the residue below.
+- **Generic template slots** (`monoPruneTemplates`, `emit_mono.vl`). An uninstantiated
+  generic's slot is stubbed to `() -> ()`, or filled by the program's first instance, so
+  `std:array`'s `filled`, `sort`, `sorted` and `includes` artifacts depend on the program.
+  This is §4's instances-as-demands work, and it lives in `emit_mono.vl`.
+- **`envSlotShift` on `fnNestUsed`.** The hidden env parameter is the calling convention of
+  every function value, part of a function's signature rather than its frame, and
+  `fnNestUsed` is partly set in `emit_mono.vl`. It moves no artifact in this set.
+
+**Invariance** on the 8-script set, armed: master 75 pairs differ, this change **7**. All 7 are the
+first two residue rows: `std:json`, `lib/corpus.vl` and `lib/census-read.vl` between scripts
+that do and do not delete from a map, and `std:array` between `s5-relocs.vl` and three scripts
+that instantiate its generics. The control witness `m3` under `r1` (union `as!`, a numeric
+`as!`, a closure, i32 and i64 maps, `min`, `fromCodePoints`) and `r2` (only `m3`) reads 1 pair
+differ on master and 0 here, and both programs print the same output on both seeds.
+
+**Behaviour**, disarmed. The fixpoint holds. `cases_wasm_0..3` pass 6,024 and fail 0.
+`regress.vl` loses 0 runs and moves 0 floors to silent. Its 2 `-> silent` report rows
+(`d2915_list_5_earlyR_bound`, `d2915_list_5_twoNames_bound`) are check-clean invalid wasm on
+the master seed too, with the same validator message. difftree `--identity` against master's
+seed reads 5,303 of 16,435 files differing, 0 uncompared:
+
+- 5,291 differ only in the module's bytes and size. Check output, build exit and stderr are
+  equal.
+- 12 also differ in stderr. Each is a filed `rv3310_nested_fn` invalid-wasm cell whose
+  validator message names a byte offset, and only the offset moved.
+
+Cost: seed 5,916,276 → 5,676,451 bytes (−4.05%). Most of it is the deleted prediction scans
+and reservations. L2 guest fuel:
+
+- the master seed on its own source: 89,741,422,205;
+- the master seed on this source: 89,547,985,463 (−0.22%);
+- the new seed on this source: 88,775,239,636 (−0.86% with the source held fixed).

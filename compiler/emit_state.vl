@@ -1600,8 +1600,6 @@ export let mTwinExtra = 0
 // Whether the value-slot rows have been grouped by the struct they emit (`mapTwinSettle`); a
 // slot's struct is known only once collection ends.
 export let mTwinSettled = false
-// Whether a delivery retags a box (`mapRetagAnyEmitted`): -1 not yet asked, else 0 or 1.
-export let mTwinRetagMemo = -1
 export let vbI32Idx = 0
 export let vbI64Idx = 0
 export let vbF32Idx = 0
@@ -1637,14 +1635,6 @@ export let uFieldElemTyIx: i32[] = []
 export let uFieldElemKeyKind: i32[] = []
 export let fnUsesMap = false
 export let mapScratchBase = 0
-// The i32-keyed map's own scratch slots, appended after the string-keyed frame so no
-// existing offset moves. Reserved when `fnUsesMap && mI32Used`:
-//   +0 keyI32 i32 (target key) . +1 keysBk (ref $aTypeIdx) (keys backing) . +2/+3 kOut/kSrc
-//   (ref $aTypeIdx) (`.keys()` output/source) . +4 mapRef (ref $mStructI32Idx), typed apart from the string frame's mono slot.
-export let mapI32Base = 0
-// The i64-keyed twin of that frame, reserved when `fnUsesMap && mI64Used`: +0 the i64 key,
-// +1 keysBk, +2/+3 kOut/kSrc (all `(ref $ia64TypeIdx)`), +4 mapRef (ref $mStructI64Idx).
-export let mapI64Base = 0
 // `m.keys()` / `for k in m` build a fresh string list of LIVE keys: a 6-slot frame —
 // outBack (ref $mkArrIdx), keysBack (ref $mkArrIdx), live (ref $aTypeIdx), then i/j/count
 // (3 i32). Reserved when the function builds a map's key list (`fnUsesMapKeys`).
@@ -1655,53 +1645,10 @@ export let mapKeysBase = 0
 // (3 i32). The i32 sibling of the key-list frame.
 export let fnUsesMapVals = false
 export let mapValsBase = 0
-// `m.values()` over a ref/scalar-valued (mv-slot) map needs an output backing of the
-// value's type, one slot per module mv slot (typed `mvValsBackOf`) — the value-list
-// dual of the per-mv-slot frame. Reserved when `fnUsesMapVals`, which also sets `fnUsesMapKeys` for the source backing and live/i/j/count it reuses.
-export let mvValsOutBase = 0
-// The base wasm-local index of the ref-valued map frames (3 typed slots per module
-// mv slot — mapRef / valsBk / valStash), reserved after every other scratch frame
-// in a map-using function. See `fbBeginFunc`.
-export let fnMvBase = 0
-// Whether the current function performs a `call_ref` (a function-value call) — drives a
-// 1-slot closure scratch frame (`callRefSlot`, a `(ref $cloStruct)` local) that stashes
-// the closure once so its env + code fields are read off ONE evaluation.
-export let fnUsesCallRef = false
-export let callRefSlot = 0
 // How many function-value calls are open around the one being lowered, i.e. whose closure
-// is stashed and whose id is not yet read (D2329). Depth 0 stashes in `callRefSlot`; a call
+// is stashed and whose id is not yet read (D2329). Each depth has its own lazy slot; a call
 // in another's arguments takes its own lazy slot, so it cannot overwrite the outer closure.
 export let callRefDepth = 0
-// Union-`as` propagation scratch (the `as` trio's propagating form): `x as T` over a
-// union operand evaluates the operand once, tests the box tag, early-returns the whole
-// box when it is not a `T`, and unboxes otherwise — the operand is typically a call, so
-// it cannot be re-read. Non-null `(ref $uBoxIdx)`, always `local.set` before any read, which wasm accepts for a non-defaultable local.
-export let fnUsesUnionAs = false
-export let unionAsSlot = 0
-// D1041 — numeric exact-or-fail `as` scratch: a numeric cast to an integer target
-// tests the operand before converting (truncation, then compare), reading it twice, so
-// a non-re-readable operand is staged once in the slot for its own source rep. Three
-// slots for three valtypes; a module using only one still declares all three (an unused local, never a wrong index).
-export let fnUsesNumCast = false
-// The module-predicate memo (`moduleHasUnionAs`/`moduleHasNumCast`): both predicates
-// are whole-arena scans, so the answer is banked rather than re-derived per function.
-// `...Seen` is the arena prefix scanned, `...Hit` the answer over it — a prefix, not a
-// boolean, so a pass appending nodes stays exact; `emitProgram` clears all four so a long-lived instance never reads a stale prefix.
-export let modUnionAsSeen = 0
-export let modUnionAsHit = false
-export let modNumCastSeen = 0
-export let modNumCastHit = false
-export let numCastF64Slot = 0
-export let numCastF32Slot = 0
-export let numCastI64Slot = 0
-// D1640 — `fromCodePoints(e)` spill slot: the lowering reads the list's backing and its
-// length, so an argument that is not a bare name is evaluated once into this
-// `(ref null $lTypeIdx)` slot and both fields read off it. Module-wide, memoised on the
-// arena prefix, for `moduleHasNumCast`'s reason.
-export let fnUsesFcpSpill = false
-export let fcpSpillSlot = 0
-export let modFcpSpillSeen = 0
-export let modFcpSpillHit = false
 // D1671 — the `?.` receiver stash: the chain's base is emitted for the null test and again
 // for the field read, so a base that is not a re-readable place (a call) is evaluated ONCE
 // into this `(ref null struct)` local and every re-read is a `ref.cast` off it.
@@ -1721,13 +1668,6 @@ export let listGetIdxStagedIx = -1
 export let listGetIdxStagedSet = false
 export let listGetRecvStagedIx = -1
 export let listGetRecvStagedSet = false
-// Integer `min` / `max` staging: `select` reads each operand twice, so both are evaluated
-// once into these locals (two i32, then two i64). Module-wide, memoised on the arena prefix,
-// for `moduleHasNumCast`'s reason.
-export let fnUsesIntMinMax = false
-export let intMinMaxSlot = 0
-export let modIntMinMaxSeen = 0
-export let modIntMinMaxHit = false
 // The literal-union atom-narrow staging slot: a string-repped literal union reaching
 // an atom-typed destination whose value is not re-readable (a call) stashes the
 // value's string once, non-null `(ref $sTypeIdx)`, so the narrow's select-tower
@@ -1735,8 +1675,8 @@ export let modIntMinMaxHit = false
 export let fnUsesAtomStage = false
 export let atomStageSlot = 0
 // `.map`/`.filter` scratch frame (the HOF loop): 3 shared i32 temporaries (`i`, `n`,
-// `j`), one closure slot built once before the loop, one typed source slot per
-// distinct receiver list type, one typed dest slot per distinct result element kind.
+// `j`), one typed source slot per distinct receiver list type, one typed dest slot per
+// distinct result element kind. The closure slot is lazy (`mfCallbackLocal`).
 // Reserved only in a function whose body holds a `.map`/`.filter` (`mfScan`).
 export type MfKind = "i32" | "f64" | "ref" | "str" | "i64" | "f32" | "u8"
 export let fnUsesMapFilter = false
@@ -2269,7 +2209,6 @@ export function emitStateReset() {
   atomStageSlot = 0
   ba8TypeIdx = 0
   bl8TypeIdx = 0
-  callRefSlot = 0
   cloEqScratchBase = 0
   cloSigBase = 0
   cloStructIdx = 0
@@ -2287,14 +2226,8 @@ export function emitStateReset() {
   fbEagerScratch = 0
   fbFrameParams = 0
   fbScratchCur = 0
-  fcpSpillSlot = 0
   fl32TypeIdx = 0
   fl64TypeIdx = 0
-  fnMvBase = 0
-  fnUsesFcpSpill = false
-  fnUsesIntMinMax = false
-  fnUsesNumCast = false
-  fnUsesUnionAs = false
   gConstExprEmit = false
   gHelpSvGet = []
   gHelpSvLen = []
@@ -2305,7 +2238,6 @@ export function emitStateReset() {
   i64PushScratchBase = 0
   ia64TypeIdx = 0
   il64TypeIdx = 0
-  intMinMaxSlot = 0
   lTypeIdx = 0
   leqIScratchBase = 0
   leqSScratchBase = 0
@@ -2317,8 +2249,6 @@ export function emitStateReset() {
   mStructIdx = 0
   maFoldScratchBase = 0
   envCacheBase = 0
-  mapI32Base = 0
-  mapI64Base = 0
   mapKeysBase = 0
   mapScratchBase = 0
   mapValsBase = 0
@@ -2326,11 +2256,7 @@ export function emitStateReset() {
   mkArrIdx = 0
   mkListIdx = 0
   monoProgStmts = []
-  mvValsOutBase = 0
   narrowBareIdentOnly = false
-  numCastF32Slot = 0
-  numCastF64Slot = 0
-  numCastI64Slot = 0
   optRecvSlot = 0
   pushScratchBase = 0
   raTypeIdx = 0
@@ -2343,7 +2269,6 @@ export function emitStateReset() {
   svViewTy = []
   u8PushScratchBase = 0
   uBoxIdx = 0
-  unionAsSlot = 0
   unionSinkBase = 0
   variantReboxSlot = 0
   vbF32Idx = 0

@@ -60,7 +60,6 @@ import {
   ba8Used,
   bl8TypeIdx,
   callRefDepth,
-  callRefSlot,
   cloEqScratchBase,
   cloStructIdx,
   coalesceCallBoolSlot,
@@ -84,7 +83,6 @@ import {
   fbFrameParams,
   fbRunsWritten,
   fbScratchCur,
-  fcpSpillSlot,
   fitGrowFn,
   fitGrowLocal,
   fitGrowName,
@@ -102,18 +100,14 @@ import {
   fnListEqGSlots,
   fnListEqRSlots,
   fnMemAddrFoldCount,
-  fnMvBase,
   fnRefPushSlots,
   fnUsesArrNew,
   fnUsesAtomStage,
-  fnUsesCallRef,
   fnUsesCloEq,
   fnUsesCoalesceCall,
   fnUsesF32Push,
   fnUsesF64Push,
-  fnUsesFcpSpill,
   fnUsesI64Push,
-  fnUsesIntMinMax,
   fnUsesListEqI,
   fnUsesListEqS,
   fnUsesListGet,
@@ -122,20 +116,17 @@ import {
   fnUsesMapKeys,
   fnUsesMapVals,
   fnUsesNulStrPush,
-  fnUsesNumCast,
   fnUsesOptRecv,
   fnUsesPush,
   fnUsesStrOp,
   fnUsesStrPush,
   fnUsesU8Push,
-  fnUsesUnionAs,
   fnUsesUnionLetSink,
   fnUsesUnionSink,
   fnUsesVariantRebox,
   i64PushScratchBase,
   ia64TypeIdx,
   il64TypeIdx,
-  intMinMaxSlot,
   lTypeIdx,
   lcatBases,
   leqIScratchBase,
@@ -162,8 +153,6 @@ import {
   mStructI64Idx,
   mStructIdx,
   maFoldScratchBase,
-  mapI32Base,
-  mapI64Base,
   mapKeysBase,
   mapScratchBase,
   mapValsBase,
@@ -179,12 +168,7 @@ import {
   mvMapTypeIdx,
   mvRlSlot,
   mvValKind,
-  mvValName,
   mvValStructIdx,
-  mvValsOutBase,
-  numCastF32Slot,
-  numCastF64Slot,
-  numCastI64Slot,
   optRecvSlot,
   optRecvStagedIx,
   optRecvStagedSet,
@@ -206,7 +190,6 @@ import {
   uBoxNewEnd,
   uDeclared,
   uVarHeap,
-  unionAsSlot,
   unionSinkBase,
   variantReboxSlot,
 } from "./emit_state"
@@ -1528,28 +1511,18 @@ function fbReserveCollectionFrames() {
   // G8 map scratch frame (15 slots).
   mapScratchBase = fbScratchCur
   if fnUsesMap { fbReserve(15) }
-  // The i32-KEYED map's extra slots (5), reserved only in a module that has one — so
-  // every frame after it keeps its existing index in a string-keyed-only program.
-  mapI32Base = fbScratchCur
-  if fnUsesMap && mI32Used { fbReserve(5) }
-  // The i64-KEYED twin (5), after it for the same reason.
-  mapI64Base = fbScratchCur
-  if fnUsesMap && mI64Used { fbReserve(5) }
   // `m.keys()` / `for k in m` key-list builder frame (6 slots).
   mapKeysBase = fbScratchCur
   if fnUsesMapKeys { fbReserve(6) }
   // `m.values()` (mono i32 map) value-list builder frame (6 slots).
   mapValsBase = fbScratchCur
   if fnUsesMapVals { fbReserve(6) }
-  // Closure scratch frame (1 slot, a `(ref $cloStruct)`) for `call_ref` (lambdas).
-  callRefSlot = fbScratchCur
-  if fnUsesCallRef { fbReserve(1) }
   callRefDepth = 0
-  // `.map`/`.filter` HOF frame: 4 shared slots (i, n, j, the callback closure), then
-  // one typed src-wrapper slot per distinct receiver list type and one typed
-  // dst-backing slot per distinct result element kind.
+  // `.map`/`.filter` HOF frame: 3 shared i32 slots (i, n, j), then one typed src-wrapper slot
+  // per distinct receiver list type and one typed dst-backing slot per distinct result element
+  // kind. The callback closure is `mfCallbackLocal`'s.
   mfScratchBase = fbScratchCur
-  if fnUsesMapFilter { fbReserve(4) }
+  if fnUsesMapFilter { fbReserve(3) }
   mfSrcBases = []
   let mfk = 0
   while mfk < mfSrcKinds.length {
@@ -1561,28 +1534,6 @@ function fbReserveCollectionFrames() {
   while mfd < mfDstKinds.length {
     mfDstBases.push(fbReserve(1))
     mfd = mfd + 1
-  }
-  // Ref-valued map frames: 3 typed slots per module mv slot in any map-using function
-  // — mapRef, valsBk, and valStash (the pushVal/get value temporary). Allocated for
-  // every mv slot rather than per-function-used ones, since locals are cheap and an
-  // mv-free module reserves zero, keeping existing layouts' indices.
-  fnMvBase = fbScratchCur
-  if fnUsesMap {
-    let mvk = 0
-    while mvk < mvValName.length {
-      fbReserve(3)
-      mvk = mvk + 1
-    }
-  }
-  // `m.values()` per-mv-slot OUTPUT backing (1 slot per module mv slot), reserved only when
-  // the function builds a value list — the typed dual of the mv frame's `valsBk` source.
-  mvValsOutBase = fbScratchCur
-  if fnUsesMapVals {
-    let mvo = 0
-    while mvo < mvValName.length {
-      fbReserve(1)
-      mvo = mvo + 1
-    }
   }
 }
 // `fbBeginFunc`'s list compare and concat frames, one typed frame per compared or
@@ -1653,31 +1604,14 @@ function fbReserveStashSlots() {
   // is lowered; the exit block reading them is emitted only if a `return` actually sank.
   unionSinkBase = fbScratchCur
   if fbUsesSinkPair() { fbReserve(2) }
-  // Union-`as` box slot (1 slot, a non-null `(ref $uBoxIdx)`). LAST of the EAGER frames, so
-  // every earlier base is unchanged in a program that does not use the cast; the lazy list
-  // frame below still follows it, exactly as it follows every other eager frame.
-  unionAsSlot = fbScratchCur
-  if fnUsesUnionAs { fbReserve(1) }
   // Literal-union atom-NARROW staging slot (1 slot, a non-null `(ref $sTypeIdx)`), appended
-  // after `unionAsSlot` so every earlier base is unchanged in a program that never stages a
+  // after the union-box sink so every earlier base is unchanged in a program that never stages a
   // narrow — which is every program with no string literal union (`gLitUnionUsed` gates the
   // scan bit, so the self-hosted compiler reserves nothing).
   atomStageSlot = fbScratchCur
   if fnUsesAtomStage { fbReserve(1) }
-  // Numeric exact-or-fail `as` staging (3 slots — f64, f32, i64 — one per SOURCE rep the
-  // exactness test can read twice), appended after `atomStageSlot` so every earlier base is
-  // unchanged in a program with no fallible numeric cast.
-  numCastF64Slot = fbScratchCur
-  numCastF32Slot = fbScratchCur + 1
-  numCastI64Slot = fbScratchCur + 2
-  if fnUsesNumCast { fbReserve(3) }
-  // `fromCodePoints` argument spill (1 slot, `(ref null $lTypeIdx)`), LAST of the eager
-  // frames so every earlier base is unchanged in a module that hands the builtin only bare
-  // names — which is every module the compiler compiles of itself.
-  fcpSpillSlot = fbScratchCur
-  if fnUsesFcpSpill { fbReserve(1) }
   // D1671 — the `?.` receiver stash (1 slot, `(ref null struct)`), appended after
-  // `fcpSpillSlot` so every earlier base is unchanged in a module whose `?.` receivers are
+  // the atom-narrow slot so every earlier base is unchanged in a module whose `?.` receivers are
   // all re-readable places, which is every module the compiler compiles of itself.
   optRecvSlot = fbScratchCur
   if fnUsesOptRecv { fbReserve(1) }
@@ -1687,10 +1621,6 @@ function fbReserveStashSlots() {
   listGetIdxSlot = fbScratchCur
   listGetRecvSlot = fbScratchCur + 1
   if fnUsesListGet { fbReserve(2) }
-  // Integer `min` / `max` staging (4 slots: two i32, then two i64), appended after the
-  // `.get` stash so every earlier base is unchanged in a module with no integer `min`/`max`.
-  intMinMaxSlot = fbScratchCur
-  if fnUsesIntMinMax { fbReserve(4) }
   // Nothing is staged as a frame opens: the marker is set and restored around one chain's
   // lowering, and a failed emission must not carry a dead index into the next function.
   optRecvStagedIx = -1
@@ -2050,27 +1980,6 @@ function fbEmitStrOpMapFrames() {
     fbRefRun(aTypeIdx)
     fbI32Run()
   }
-  fbFrameAt(mapI32Base, "i32-keyed map")
-  // The i32-KEYED map's extra slots, in `fbBeginFunc`'s reservation order:
-  //   0 keyI32 i32, 1 keysBk (ref $aTypeIdx), 2 kOut (ref $aTypeIdx),
-  //   3 kSrc (ref $aTypeIdx), 4 mapRef (ref $mStructI32Idx).
-  if fnUsesMap && mI32Used {
-    fbI32Run()
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
-    fbRefRun(aTypeIdx)
-    fbRefRun(mStructI32Idx)
-  }
-  fbFrameAt(mapI64Base, "i64-keyed map")
-  // The i64-KEYED twin: 0 key i64, 1 keysBk, 2 kOut, 3 kSrc (each `(ref $ia64TypeIdx)`),
-  // 4 mapRef (ref $mStructI64Idx).
-  if fnUsesMap && mI64Used {
-    fbI64Run()
-    fbRefRun(ia64TypeIdx)
-    fbRefRun(ia64TypeIdx)
-    fbRefRun(ia64TypeIdx)
-    fbRefRun(mStructI64Idx)
-  }
   fbFrameAt(mapKeysBase, "map-keys")
   // `m.keys()` / `for k in m` key-list builder frame (6 slots): outBack (ref $mkArrIdx),
   // keysBack (ref $mkArrIdx), live (ref $aTypeIdx), i, j, count (3 i32).
@@ -2098,14 +2007,12 @@ function fbEmitStrOpMapFrames() {
 // wrapper per receiver kind and one typed destination backing per result kind.
 function fbEmitMapFilterFrames() {
   fbFrameAt(mfScratchBase, "map/filter")
-  // `.map`/`.filter` HOF frame: i, n, j (3 i32) + the callback closure
-  // (ref $cloStruct), then the typed src-wrapper slots, then the typed dst-backing
-  // slots — in `fbBeginFunc`'s reservation order.
+  // `.map`/`.filter` HOF frame: i, n, j (3 i32), then the typed src-wrapper slots, then the
+  // typed dst-backing slots — in `fbBeginFunc`'s reservation order.
   if fnUsesMapFilter {
     fbI32Run()
     fbI32Run()
     fbI32Run()
-    fbRefRun(cloStructIdx)
   }
   let mfv = 0
   while mfv < mfSrcKinds.length {
@@ -2144,41 +2051,11 @@ function fbEmitMapFilterFrames() {
 function fbEmitPushMapFrames() {
   fbEmitPushFrames()
   fbEmitStrOpMapFrames()
-  fbFrameAt(callRefSlot, "call_ref")
-  // Closure scratch slot (1, (ref $cloStruct)) for `call_ref` (lambdas).
-  if fnUsesCallRef { fbRefRun(cloStructIdx) }
   fbEmitMapFilterFrames()
 }
 // The ref-valued map, list-compare, closure-equality and single-slot staging frames of
 // `fbEmitLocalsVec`, through the address-fold slots that end the eager frames.
 function fbEmitStagingFrames() {
-  fbFrameAt(fnMvBase, "ref-valued map")
-  // Ref-valued map frames (3 typed slots per module mv slot, map-using functions
-  // only — `fbBeginFunc`'s reservation order): mapRef, valsBk, valStash (nullable —
-  // it holds a vals-slot read, which is a `(ref null <elem>)`).
-  if fnUsesMap {
-    let mvr = 0
-    while mvr < mvValName.length {
-      fbRefRun(mvMapTypeIdx[mvr])
-      fbRefRun(mvValsBackOf(mvr))
-      // valStash: a SCALAR f64/i64 local for an f64/i64-valued map (kind 11/10), else the
-      // nullable `(ref null <elem>)` that holds a string/struct vals-slot read.
-      if mvValKind[mvr] == MVK_F64 { fbF64Run() }
-      else if mvValKind[mvr] == MVK_I64 { fbI64Run() }
-      else if mvValKind[mvr] == MVK_F32 { fbF32Run() }
-      else { fbRefNullRun(mvValElemHeapOf(mvr)) }
-      mvr = mvr + 1
-    }
-  }
-  fbFrameAt(mvValsOutBase, "map-values output")
-  // `m.values()` per-mv-slot output backing (1 per mv slot, typed as the value backing).
-  if fnUsesMapVals {
-    let mvo = 0
-    while mvo < mvValName.length {
-      fbRefRun(mvValsBackOf(mvo))
-      mvo = mvo + 1
-    }
-  }
   fbFrameAt(leqIScratchBase, "i32-list compare")
   // List `==`/`!=`/`+` frames, in `fbBeginFunc`'s reservation order: the
   // i32-list frame (A/B wrapper refs, the concat out backing, n, i), the
@@ -2263,27 +2140,11 @@ function fbEmitStagingFrames() {
     fbI32Run()
     fbAnyRun()
   }
-  fbFrameAt(unionAsSlot, "union-`as` box")
-  // The union-`as` box slot — non-null, `local.set` before every read.
-  if fnUsesUnionAs {
-    if uDeclared { fbRefRun(uBoxIdx) } else { fbI32Run() }
-  }
   fbFrameAt(atomStageSlot, "atom-narrow staging")
   // The atom-narrow staging slot — likewise non-null, `local.set` before every read.
   if fnUsesAtomStage {
     if aUsed { fbRefRun(sTypeIdx) } else { fbI32Run() }
   }
-  fbFrameAt(numCastF64Slot, "numeric-cast staging")
-  // The numeric exact-or-fail staging slots, in `fbBeginFunc`'s order: f64, f32, i64.
-  if fnUsesNumCast {
-    fbF64Run()
-    fbF32Run()
-    fbI64Run()
-  }
-  fbFrameAt(fcpSpillSlot, "fromCodePoints spill")
-  // The `fromCodePoints` argument spill — nullable, so an unreached function still has a
-  // defaultable local; the two `struct.get`s reading it accept a nullable reference.
-  if fnUsesFcpSpill { fbRefNullRun(lTypeIdx) }
   fbFrameAt(optRecvSlot, "`?.` receiver stash")
   // The `?.` receiver stash: any struct row, so the abstract `structref` — nullable,
   // because a `?.` receiver is exactly the value whose null-ness is being tested.
@@ -2294,14 +2155,6 @@ function fbEmitStagingFrames() {
   if fnUsesListGet {
     fbI32Run()
     fbStructNullRun()
-  }
-  fbFrameAt(intMinMaxSlot, "integer min/max staging")
-  // The integer `min` / `max` staging slots, in `fbBeginFunc`'s order: i32, i32, i64, i64.
-  if fnUsesIntMinMax {
-    fbI32Run()
-    fbI32Run()
-    fbI64Run()
-    fbI64Run()
   }
   fbFrameAt(maFoldScratchBase, "declaration-time address fold")
   // One i32 run per declaration-time address-fold scratch slot — `fnMemAddrFoldCount` of
@@ -2482,6 +2335,49 @@ function fbLazyListSlotRun(lix: i32) {
     // slot holds whichever niche rep the value has and hands it to the box's `anyref`
     // payload unchanged. Kind is "i32" for the reason codes 13, 15 and 17 are.
     fbAnyRun()
+  } else if liBack[lix] == 30 {
+    // The union-`as` box stash (`unionAsBoxSlot`), non-null: set before every read.
+    if uDeclared { fbRefRun(uBoxIdx) } else { fbI32Run() }
+  } else if liBack[lix] == 31 {
+    // A numeric exact-or-fail operand (`numCastStashSlot`), typed by its source rep.
+    if liSlots[lix] == 0 { fbF64Run() }
+    else if liSlots[lix] == 1 { fbF32Run() }
+    else { fbI64Run() }
+  } else if liBack[lix] == 32 {
+    // The `fromCodePoints` argument spill (`fcpSpillStashSlot`).
+    fbRefNullRun(lTypeIdx)
+  } else if liBack[lix] == 33 {
+    // An integer `min` / `max` / `abs` operand (`intMinMaxStashSlot`): keys 0-1 i32, 2-3 i64.
+    if liSlots[lix] < 2 { fbI32Run() } else { fbI64Run() }
+  } else if liBack[lix] == 34 {
+    // An mv slot's map struct (`fnMvMapRefLocal`); `liSlots` is the mv slot.
+    fbRefRun(mapTypeIdxOf(liSlots[lix]))
+  } else if liBack[lix] == 35 || liBack[lix] == 37 {
+    // An mv slot's values backing (`fnMvValsBkLocal`) or `m.values()` output (`fnMvValsOutLocal`).
+    fbRefRun(mvValsBackOf(liSlots[lix]))
+  } else if liBack[lix] == 36 {
+    // An mv slot's value stash (`fnMvValStashLocal`): a scalar for a numeric value, else
+    // the nullable element a vals-slot read yields.
+    const mvr = liSlots[lix]
+    if mvValKind[mvr] == MVK_F64 { fbF64Run() }
+    else if mvValKind[mvr] == MVK_I64 { fbI64Run() }
+    else if mvValKind[mvr] == MVK_F32 { fbF32Run() }
+    else { fbRefNullRun(mvValElemHeapOf(mvr)) }
+  } else if liBack[lix] == 38 {
+    // The i32-keyed map frame (`mapI32KeyLocal`): the key, three i32 backings, the map.
+    const k = liSlots[lix]
+    if k == 0 { fbI32Run() }
+    else if k == 4 { fbRefRun(mStructI32Idx) }
+    else { fbRefRun(aTypeIdx) }
+  } else if liBack[lix] == 39 {
+    // The i64-keyed map frame (`mapI64KeyLocal`): the key, three i64 backings, the map.
+    const k = liSlots[lix]
+    if k == 0 { fbI64Run() }
+    else if k == 4 { fbRefRun(mStructI64Idx) }
+    else { fbRefRun(ia64TypeIdx) }
+  } else if liBack[lix] == 40 {
+    // The `.map`/`.filter` callback closure (`mfCallbackLocal`).
+    fbRefRun(cloStructIdx)
   } else if liBack[lix] == 29 {
     // A literal-union atom `as` operand (`litAtomCastSlot`), the bare i32 id.
     fbI32Run()
