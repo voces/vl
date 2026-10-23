@@ -725,6 +725,7 @@ const assertLint = (d: Directives, lints: LintDiag[]): void => {
     [d.warnings, "warning", "@warning"],
     [d.infos, "info", "@info"],
     [d.hints, "hint", "@hint"],
+    [[], "error", "@error"],
   ];
   for (const [decls, sev, directive] of wants) {
     const actual = bySev(sev);

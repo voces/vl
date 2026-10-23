@@ -164,11 +164,10 @@ DEDUPE=$(printf '%s\n%s\n%s\n' "$CI_NATIVE" "$LSP_CI" "$OWN_ROW" | sort -u | pas
 # `bash -c` instead, every newline would be a COMMAND separator (measured: 78 of
 # ci-native's 79 files ran as commands, rc=126).
 # THE CORPUS ORACLE (tests/cases_wasm_{0..3}_test.ts) is the V8 face of the ~5,300-fixture
-# tests/cases corpus, and it carries the corpus's content here: it pins everything the native
-# face does over the same seed bytes, plus @error message text and spans and
-# @warning/@hint/@info. ci-native's selfhost_native_align_test.ts asserts only the host-face
-# subset (the host, wasmtime, the batch CLIs); a cross-face census over 41 archived seeds
-# found no case outside it that native failed and the oracle passed.
+# tests/cases corpus, and it carries the corpus's content here: @error message text and spans,
+# @warning/@hint/@info, and an error-tier lint on a case that declares none. Neither face covers
+# the other: ci-native's selfhost_native_align_test.ts alone grades the CLI's diagnostic STAGE
+# and the whole-graph `vl check` of a multi-file case (a mutation of each reds one face only).
 # GATE_V8_CORPUS=0 drops the oracle from row 1, and so does a CI proof: checks-suites ran it.
 ORACLE=$(ls tests/cases_wasm_*_test.ts | paste -sd, -)
 if [[ "$CI_PROVEN" == *"|corpus oracle|"* ]]; then GATE_V8_CORPUS=0; CI_SKIPPED+=("corpus oracle"); fi
