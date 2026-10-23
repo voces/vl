@@ -25,7 +25,6 @@ import {
   isValueUnionName,
   isValueUnionTyOr,
   nameIsLitUnionArmValueUnion,
-  nameIsLitUnionType,
   valueAtomKind,
 } from "./check_ty_rep"
 import {
@@ -258,7 +257,7 @@ import { variantSig } from "./emit_variant_sig"
 import { i32ListHas } from "./listutil"
 import { strContains } from "./strutil"
 import { sidArrGet, sidArrPut, sidOf } from "./symbols"
-import { nameIsArray, nameIsMapOpen, nameIsParenOpen } from "./tyname"
+import { nameIsMapOpen, nameIsParenOpen } from "./tyname"
 import {
   isNullTy,
   nulLitUnionPeelTy,
@@ -1338,28 +1337,6 @@ export function unionHasMapArmSlot(name: string, slot: i32) {
   false
 }
 
-// True when the union member-set `name` carries a map arm whose value spelling is the bare
-// `string` — the checker's render of a litunion-valued map, since the litunion bit lives on
-// the node, not the name. `emitUnionCoerce` consults this when a mono litunion-valued map
-// misses the slot match, tagging mono (`mapSlotTag(-1)`) so store and narrow resolve one tag.
-export function unionHasCollapsedStringMapArm(name: string) {
-  const atoms: string[] = []
-  unionSetAtomsOf(name, atoms)
-  // Deliberately not migrated to an arena leg: this classifier's verdict asks about the
-  // checker's render of a litunion map value, which is exactly the information the arena
-  // keeps and the name loses, and it is dead on the whole corpus, so an arena leg here could
-  // not be verified.
-  let i = 0
-  while i < atoms.length {
-    const a = atoms[i]
-    if a != "null" && nameIsBareMap(a) {
-      if mapValNameOf(a) == "string" { return true }
-    }
-    i = i + 1
-  }
-  false
-}
-
 // True if the union member-set `name` has a MAP arm (`{[string]: V}`). Resolves an alias to its
 // member set first. Used by the frame pre-pass (`exprHasMapOp` → `unionMapArmIdent`) to reserve the
 // map scratch frame for a `t[k]` on a union binding narrowed to its map arm — the narrowing is not
@@ -1701,9 +1678,6 @@ export function unionRefArrayArmSlotForElem(name: string, elemAtom: string) {
 // The exact-atom pass of `unionRefArrayArmSlotForElem`: the first union-box-element
 // ref-array arm whose element union carries `elemAtom` verbatim (any arm for "").
 function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
-  // The arm slot per member, off the arena. The element-union atom test below still
-  // reads a member-set spelling, and it reads the arm row's stored one, since the row
-  // stores the very spelling the parse produced.
   const mems: i32[] = []
   if !unionArmMemberTys(name, mems) { return -1 }
   let i = 0
@@ -1717,17 +1691,36 @@ function unionRefArrayArmSlotForElemAtom(name: string, elemAtom: string) {
       let j = 0
       while j < eAtoms.length {
         if eAtoms[j] == elemAtom { return slot }
-        // R3's boxed-member rule, at the arm's stored element spelling: a litunion-alias
-        // member of a value union rides the box as the `string` atom, and the stored
-        // spelling keeps the alias rather than widening it. Without this leg, a
-        // `(K | i32)[]` arm is invisible to a string-element literal — invalid wasm.
-        if elemAtom == "string" && nameIsLitUnionType(eAtoms[j]) { return slot }
         j = j + 1
       }
+      // R3's boxed-member rule: a litunion member of a value union rides the box as the
+      // `string` atom. Without this leg a `(K | i32)[]` arm is invisible to a
+      // string-element literal — invalid wasm.
+      if elemAtom == "string" && elemUnionHasLitUnionMember(en) { return slot }
     }
     i = i + 1
   }
   -1
+}
+
+// True when the element union row `en` has a literal-union member; false for an uncovered row.
+function elemUnionHasLitUnionMember(en: string): boolean {
+  const ms: i32[] = []
+  if !unionMemberTysOf(en, ms) { return false }
+  for m in ms {
+    if m >= 0 && tyIsLitUnion(m) { return true }
+  }
+  false
+}
+
+// True when the element union row `en` has a list member; false for an uncovered row.
+function elemUnionHasArrayMember(en: string): boolean {
+  const ms: i32[] = []
+  if !unionMemberTysOf(en, ms) { return false }
+  for m in ms {
+    if m >= 0 && tyAt(m) is TyArray { return true }
+  }
+  false
 }
 
 // The interned reflist slot of the first union-box-element ref-array arm of `name` whose
@@ -1748,16 +1741,14 @@ export function unionRefArrayArmSlotForNestedElem(
       && slot < rlElemKindTbl.length
       && rlElemKindTbl[slot] == RLK_UNION
     ) {
-      const eAtoms: string[] = []
-      unionArmsOf(rlElemName[slot], eAtoms)
-      let j = 0
-      while j < eAtoms.length {
-        if wantMap {
-          if nameIsMapOpen(eAtoms[j]) { return slot }
-        } else {
-          if nameIsArray(eAtoms[j]) { return slot }
+      if wantMap {
+        const eAtoms: string[] = []
+        unionArmsOf(rlElemName[slot], eAtoms)
+        for a in eAtoms {
+          if nameIsMapOpen(a) { return slot }
         }
-        j = j + 1
+      } else {
+        if elemUnionHasArrayMember(rlElemName[slot]) { return slot }
       }
     }
     i = i + 1
