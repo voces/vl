@@ -696,10 +696,15 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
     across repeated runs, unit paths, `VL_STD` locations and box loads). It is what makes a tight
     bar possible on a shared box. The fuel engine has its own `.cwasm` sidecar: ~12 s wall and
     ~24 s CPU the first time a new seed is metered.
-  * **Peak RSS, +10%.** The build's largest process; 289.1–289.7 MB over every run measured.
+  * **Peak RSS, +10%.** The build's largest process, read off the same metered build as the
+    fuel and the rung facts (real `wasm-opt` included). The fuel engine maps 4–7 MB more than
+    a plain build of the same seed (301 vs 297 MB, 316 vs 309 MB on two seeds). The
+    control's own builds run first under both engines, so a cold sidecar's in-process JIT
+    (~1 GB) is never a measured build's.
   * **CPU, +15% compile / +25% `wasm-opt`.** The least of three runs, graded only on the
-    baseline's machine and only from runs whose Python control read within 15% of its
-    baseline. **CPU seconds are not load-proof on this box**: measured 2026-09-24 over 40
+    baseline's machine and only from runs whose control read within 15% of its
+    baseline. Under `--check` a timed build runs only after a quiet control, and none runs
+    off the baseline's host; the compile cache is pinned off, since a hit skips `wasm-opt`. **CPU seconds are not load-proof on this box**: measured 2026-09-24 over 40
     runs of the same build, compile CPU read 1.37–1.42 s at load 3 and 1.8–3.3 s (1.3–2.3x)
     at system busy 51–99%, and the control inflated 1.6–3.5x without tracking it closely
     enough to divide out (±10% residual). Inside the gate's fan-out the CPU half is therefore
@@ -715,8 +720,8 @@ Four, and they fire at different moments. Profiling is what you do AFTER one of 
   | before #3108 (403fcd5e8) | **+88.5%** | **+59.9%** (463 MB) | **+313%** |
 
   The old seeds ran under today's host, whose 256 MiB first heap does not fit their larger
-  live sets, so their CPU and RSS here are not #3108's or #3112's own before-numbers. ~10 s
-  a run in the gate (16 s CPU), and it gates in ci-native with `--require-fuel`, where CPU is
+  live sets, so their CPU and RSS here are not #3108's or #3112's own before-numbers. ~11 s
+  a run in the gate (~10 s CPU busy, ~30 s quiet), and it gates in ci-native with `--require-fuel`, where CPU is
   not graded (another machine) and `-O`'s `wasm-opt` step is stubbed out (no binaryen there).
 
   **A second, TAIL unit** (`--shape tail`, D2335/D2336) puts the whole 2 MB in one function,
