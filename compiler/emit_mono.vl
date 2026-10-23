@@ -11992,11 +11992,28 @@ function monoTypedInstKey(
           + tyCanonKey(pinnedTyIx[pk], TY_WALK_DEPTH)
       }
     }
+    // A hole function's pin is keyed by the closed type its `=>` key names.
+    const ht = monoSigPinHeadTy(
+      pinned[pk],
+      if pk < pinTys.length { pinTys[pk] } else { -1 },
+    )
+    if ht >= 0 && pk < pinKinds.length {
+      const np = i32ToStr(pinKinds[pk]) + ":" + tyCanonKey(ht, TY_WALK_DEPTH)
+      pin = np
+    }
     heads.push(pin)
     pk = pk + 1
   }
   const seg = monoKeyPinSeg(heads, pinned, pinTys)
   k.key.slice(0, k.pinAt) + seg + k.key.slice(k.pinEnd, k.key.length)
+}
+
+// `t` when `pin` is a `=>` pin and `t` is the closed function type its key names, else -1.
+function monoSigPinHeadTy(pin: string, t: i32): i32 {
+  if !monoPinIsFnSig(pin) || t < 0 || t >= T.tys.length { return -1 }
+  if !monoTyClosedFn(t) { return -1 }
+  if sigKeyOfTy(t) != pin.slice(2, pin.length) { return -1 }
+  t
 }
 
 // Typed instance key → the registry key of the instance first minted under it.
@@ -17002,7 +17019,7 @@ function monoPinWrittenLam(v: i32, ann: string, wf: i32): i32 {
   ) {
     return 0
   }
-  if monoCellLamTake(lfe, x, ann, wf) == 0 { return 0 }
+  if monoCellLamTake(lfe, x, ann, wf, []) == 0 { return 0 }
   emitFailAt(
     "emitProgram: a lambda written into an element or field holding a generic function cannot "
       + "take the type the calls through it give it — annotate its parameters",
@@ -19217,7 +19234,7 @@ function monoCoerceWrittenLetTys(
     if nd is BinExpr && wf.length == 1 {
       monoCoerceNamedGenericTys(nd.binRight, tname, wf[0], delTys)
       // The binding's own call is the type a hole lambda literal written to it is called at.
-      if byCall { monoLamLitTake(nd.binRight, tname, wf[0]) }
+      if byCall { monoLamLitTakeTys(nd.binRight, tname, wf[0], delTys) }
     }
   }
   monoWrittenLetBusy.pop()
@@ -19507,7 +19524,7 @@ function monoCellValueTakeAt(v: i32, tname: string, ctx: i32, depth: i32): i32 {
     if nodeAt(x) is FuncDecl && monoLamIsHole(lfe) {
       if !monoCellSigOne(monoOrigNode[lfe], tname) { return 1 }
       if lfe < monoGen.length && monoGen[lfe] == 1 {
-        return monoCellLamTake(lfe, x, tname, ctx)
+        return monoCellLamTake(lfe, x, tname, ctx, [])
       }
       return 0
     }
@@ -19691,23 +19708,35 @@ function monoCellConcreteTake(t: i32, tname: string, open: i32): i32 {
 // Pins hole lambda `lfe`, the value at node `x` in frame `ctx`, at function type `tname`, where
 // nothing has yet: 0 when the lambda the cell holds then has that signature (and it is the last
 // instance), 1 when it holds another, 2 when it cannot take the type.
-function monoCellLamTake(lfe: i32, x: i32, tname: string, ctx: i32): i32 {
+function monoCellLamTake(
+  lfe: i32,
+  x: i32,
+  tname: string,
+  ctx: i32,
+  delTys: i32[],
+): i32 {
   const pnames: string[] = []
   if !monoFnTypeAnnParamsName(peelGroupParens(nonNulBaseOf(tname)), pnames) {
     return 2
   }
-  monoCellLamTakeAt(lfe, x, pnames, ctx)
+  monoCellLamTakeAt(lfe, x, pnames, ctx, delTys)
 }
 
 // `monoCellLamTake` at the parameter pin names `pnames`.
-function monoCellLamTakeAt(lfe: i32, x: i32, pnames: string[], ctx: i32): i32 {
+function monoCellLamTakeAt(
+  lfe: i32,
+  x: i32,
+  pnames: string[],
+  ctx: i32,
+  delTys: i32[],
+): i32 {
   let want = ""
   for pn in pnames { want = want + normTypeAtom(pn) + "," }
   const had = monoInstantiatedAny(lfe)
   if !had {
     monoLastInstFe = -1
     monoCallFrameSlot = monoNestedCallFrame(lfe, ctx)
-    const r = monoInstanceFor(lfe, pnames, x, -1, [])
+    const r = monoInstanceFor(lfe, pnames, x, -1, delTys)
     monoCallFrameSlot = -1
     if r < 0 || monoLastInstFe < 0 { return 2 }
   }
@@ -20397,7 +20426,7 @@ function monoListCbLamAt(at: i32, el: i32, ctx: i32): i32 {
   const fs = monoPinAnnSpelling(el)
   if fs == "" { return 0 }
   const pnames: string[] = [fs]
-  monoCellLamTakeAt(lfe, x, pnames, ctx)
+  monoCellLamTakeAt(lfe, x, pnames, ctx, [])
   0
 }
 
@@ -22896,16 +22925,47 @@ function monoOpenRowPinnedTy(dn: FuncDecl, i: i32, call: i32, arg: i32): i32 {
 // or no such fill keys as `pin`.
 function monoHoleFnPinTy(ax: i32, fnIx: i32, pin: string): i32 {
   if !monoPinIsFnSig(pin) { return -1 }
-  monoHoleFnPinTyOf(monoArgPinTyIx(ax, fnIx), pin)
+  const t = monoHoleFnPinTyOf(monoArgPinTyIx(ax, fnIx), pin)
+  if t >= 0 { return t }
+  monoHoleFnPinTyOf(monoLocalCopySrcTy(ax, fnIx), pin)
+}
+
+// The type a local binding `ax` reads copies from in frame `fnIx` where its own is a type
+// variable: the initializer's pinned type, or the field type of a record parameter pinned at an
+// anonymous row; -1 otherwise.
+function monoLocalCopySrcTy(ax: i32, fnIx: i32): i32 {
+  const a = unwrapParen(ax)
+  if a < 0 || !(nodeAt(a) is Ident) { return -1 }
+  const own = nodeTyIxOf(a)
+  if own < 0 || own >= T.tys.length || !(tyAt(own) is TyVar) { return -1 }
+  const d = identDeclOf(a)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const ld = nodeAt(d)
+  if !(ld is LetDecl) { return -1 }
+  const li = unwrapParen(ld.letInit)
+  if li < 0 { return -1 }
+  const m = nodeAt(li)
+  if m is Member {
+    const o = nodeAt(unwrapParen(m.memObj))
+    if o is Ident {
+      const ptn = paramTypeNode(fnIx, o.identName)
+      const pt = if ptn >= 0 { monoAnonParamPinTy.get(ptn) ?? -1 } else { -1 }
+      if pt >= 0 { return tyFieldTyOf(pt, m.memProp) }
+    }
+    return -1
+  }
+  monoArgPinTyIx(li, fnIx)
 }
 
 // The closed function type the `=>` pin `pin` keys for the function type `vt` with holes, as
-// `monoHoleFnPinTy` fills it; -1 when `vt` is closed or no fill keys as `pin`.
+// `monoHoleFnPinTy` fills it, or `vt` itself when closed and keyed as `pin`; -1 when no fill
+// keys as `pin`.
 function monoHoleFnPinTyOf(vt: i32, pin: string): i32 {
-  if vt < 0 || vt >= T.tys.length || monoTyClosedFn(vt) { return -1 }
+  if vt < 0 || vt >= T.tys.length { return -1 }
+  const key = pin.slice(2, pin.length)
+  if monoTyClosedFn(vt) { return if sigKeyOfTy(vt) == key { vt } else { -1 } }
   const f = tyAt(vt)
   if !(f is TyFunc) { return -1 }
-  const key = pin.slice(2, pin.length)
   const fills: i32[] = [TY_I32, TY_F64]
   for pf in fills {
     const ps: i32[] = []
@@ -25328,7 +25388,12 @@ function monoWalkIdentCall(n: Call, callee: Ident, ix: i32, ctx: i32) {
           const prev = monoSigCallRet
           monoSigCallRet = nodeTyIxOf(ix)
           monoCellSigByCall = true
-          monoCoerceWrittenLetValues(wlAt, wlFr, ctn)
+          monoCoerceWrittenLetTys(
+            wlAt,
+            wlFr,
+            ctn,
+            monoInstParamPinTys(monoLastInstFe),
+          )
           monoCellSigByCall = false
           monoSigCallRet = prev
         }
@@ -25916,13 +25981,19 @@ function monoDeliverLamLit(at: i32, ann: string, ctx: i32, callIx: i32): i32 {
 // `monoCellLamTake` for the hole lambda literal at `at`, or 0 for anything else, including one
 // its context already typed, which keeps that signature and its result.
 function monoLamLitTake(at: i32, ann: string, ctx: i32): i32 {
+  const none: i32[] = []
+  monoLamLitTakeTys(at, ann, ctx, none)
+}
+
+// `monoLamLitTake` where the caller holds the parameter types `delTys` the lambda is called at.
+function monoLamLitTakeTys(at: i32, ann: string, ctx: i32, delTys: i32[]): i32 {
   const x = unwrapParen(at)
   if x < 0 || !(nodeAt(x) is FuncDecl) { return 0 }
   if monoTyConcreteFn(nodeTyIxOf(x)) { return 0 }
   const lfe = monoLamValueFe(x, ctx)
   if lfe < 0 || lfe >= monoGen.length || monoGen[lfe] != 1 { return 0 }
   if !monoLamIsHole(lfe) { return 0 }
-  monoCellLamTake(lfe, x, ann, ctx)
+  monoCellLamTake(lfe, x, ann, ctx, delTys)
 }
 
 // The pin of hole lambda `args[i]` handed to un-annotated parameter `i` of generic `decl`: the
@@ -26104,7 +26175,7 @@ function monoHoleLamPinAt(
     if pn == "" { return "" }
     pnames.push(pn)
   }
-  let r = monoCellLamTakeAt(lfe, x, pnames, ctx)
+  let r = monoCellLamTakeAt(lfe, x, pnames, ctx, [])
   if r == 1 {
     const nx = monoHoleLamArgAgain(callIx, lfe, x, pnames)
     if nx >= 0 {
@@ -26600,6 +26671,25 @@ function monoPinFnParamTys(d: i32, path: string[], sig: string): i32[] {
     k = k + 1
   }
   tys
+}
+
+// The types instance `fe`'s parameters are pinned at, when each has one and every function
+// type among them has no hole; empty otherwise.
+function monoInstParamPinTys(fe: i32): i32[] {
+  const none: i32[] = []
+  if fe < 0 || fe >= fnStmts.length { return none }
+  const fd = nodeAt(fnStmts[fe])
+  if !(fd is FuncDecl) { return none }
+  const out: i32[] = []
+  for pi in fd.fnParams {
+    const p = nodeAt(pi)
+    if !(p is Param) || p.parType < 0 { return none }
+    const t = monoParamPinTy.get(p.parType) ?? nodeTyIxOf(p.parType)
+    if t < 0 || t >= T.tys.length { return none }
+    if tyAt(t) is TyFunc && !monoTyClosedFn(t) { return none }
+    out.push(t)
+  }
+  out
 }
 
 // The spelling of `ty` when it is a function type with no hole, else "".
