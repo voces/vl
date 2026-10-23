@@ -190,7 +190,7 @@ import {
 export function nameFieldCodeTy(t: string, ty: i32): i32 {
   const a = fieldCodeOfTy(ty)
   if a != -2 { return a }
-  const c = nameFieldCode(t)
+  const c = nameFieldCode(t, ty)
   if c >= 0 { return c }
   // A union whose row its type keys, though its spelling does not: `null` before a member
   // keeps the name off the row (D10410).
@@ -417,7 +417,7 @@ export function funcTypeShapeLowerable(nm: string, ty: i32): boolean {
     } else {
       const ftxt = ftexts[fi]
       const fTy = tyFieldTyOf(ty, fnames[fi])
-      const fc = nameFieldCode(ftxt)
+      const fc = nameFieldCode(ftxt, fTy)
       if fc < 0 {
         // A nested inline-shape field: recurse into the base shape — lowerable only if
         // it is.
@@ -630,12 +630,6 @@ function internShapeFieldElemsTy(nm: string, ty: i32) {
   0
 }
 
-// Interns the inline object-shape text `nm` as an anonymous struct shape, returning its
-// struct table index, or -1 when `nm` is not an internable shape. A field whose type is
-// itself an inline shape recurses: the nested shape interns first, and only a nested text
-// with no code fails the whole shape. Idempotent per field-name+code set (`annShapeIndexOf`).
-export function internInlineShape(nm: string) { internInlineShapeTy(nm, -1) }
-
 // True if any raw field-type text in `rawTexts` names a declared generic type parameter as
 // an array element (`T[]`, or a paren-grouped nullable union arm), declining to mint
 // a shape row before the parameter is substituted.
@@ -676,7 +670,12 @@ function shapeFieldsRideTyParam(rawTexts: string[]) {
 // annotation interned after it must not mint a narrower twin and split the program's reps in
 // two. `annShapeIndexOf` dedups on exact field codes, so a `??`-joined pair's merged row (coded
 // 16) would otherwise miss that dedup and mint a second row for the same value.
-function annShapeWiderRowOf(names: string[], codes: i32[], texts: string[]) {
+function annShapeWiderRowOf(
+  names: string[],
+  codes: i32[],
+  texts: string[],
+  tyIx: i32,
+) {
   if !emitPhaseReached("monomorphized") { return 0 - 1 }
   const sLimW = sScanLim()
   let si = 0
@@ -699,7 +698,11 @@ function annShapeWiderRowOf(names: string[], codes: i32[], texts: string[]) {
           } else if rc == codes[i] {
             if (
               sFieldElemNameAt(si, fi)
-              != shapeFieldElemName(texts[i], codes[i])
+              != shapeFieldElemName(
+                texts[i],
+                codes[i],
+                shapeFieldRowOf(tyIx, names[i]),
+              )
             ) {
               allIn = false
             }
@@ -818,7 +821,7 @@ export function anonRowServesLeafSet(
   // first's box, and two structurally identical rows serving one family is not cosmetic — a
   // `type mismatch` between them cost a `runs` cell. Only the two codes the fold can spell are served.
   if parts.length == 1 {
-    const pc = nameFieldCode(set)
+    const pc = nameFieldCode(set, -1)
     if pc != FC_F64 && pc != FC_I64 { return false }
     return sFieldTypeAt(si, fi) == pc
   }
@@ -850,11 +853,21 @@ function unionSetNamesAtom(set: string, atom: string): boolean {
   false
 }
 
-// `internInlineShape` with the caller's recorded arena type for `nm`. The hint reaches more
-// than the `sTyIx` cell, since the field loop calls `nameFieldCodeTy` and its codes feed
-// `annShapeIndexOf`'s key. `rlInternNameTy`'s rule governs: the hint must compute the same
-// key, which the `sTyIx` leg does by construction here.
+// Interns the inline object-shape text `nm` as an anonymous struct shape and returns its
+// struct table index, or -1 when `nm` is not an internable shape, with the caller's arena
+// type for `nm` (-1 for none). The hint reaches the field codes and `annShapeIndexOf`'s
+// key, so it must compute the key the `sTyIx` leg would (`rlInternNameTy`'s rule).
 export function internInlineShapeTy(nm: string, tyIx: i32) {
+  internInlineShapeFieldsTy(nm, tyIx, tyIx)
+}
+
+// `internInlineShapeTy` whose fields' element names read `fieldsTy`'s field types while
+// `tyIx` stays out of the row: an arm mint knows the arm's type but must not bank it (D34).
+export function internInlineShapeFieldsTy(
+  nm: string,
+  tyIx: i32,
+  fieldsTy: i32,
+) {
   // A re-entrancy memo, live only while an outer intern is on the stack (D1700). Each field
   // interns its nested shape TWICE — once through `internShapeDeepTy` and again to recover
   // the row when `nameFieldCodeTy` declines — which is 2^depth walks of one spine. The second
@@ -867,7 +880,7 @@ export function internInlineShapeTy(nm: string, tyIx: i32) {
     }
   }
   iisBusy = iisBusy + 1
-  const iisAns = internInlineShapeTyGo(nm, tyIx)
+  const iisAns = internInlineShapeTyGo(nm, tyIx, fieldsTy)
   iisBusy = iisBusy - 1
   if iisBusy > 0 {
     sidArrPut(iisMemoTy, iisSid, tyIx + 2)
@@ -932,6 +945,7 @@ export function internOwnShapeOfTy(ty: i32): string {
 // table's answer.
 function iisPushFieldElem(
   tyIx: i32,
+  fieldsTy: i32,
   names: string[],
   codes: i32[],
   texts: string[],
@@ -969,7 +983,13 @@ function iisPushFieldElem(
       // classified BEFORE, so a struct element with no row yet leaves them both empty. The
       // deferred key is what the declared field and the anonymous mint record for the same
       // element, and an unkeyed ref-list field cannot resolve its slot at emit (D1692).
-      if e5 == "" { e5 = shapeFieldElemName(texts[pi], FC_REF_LIST) }
+      if e5 == "" {
+        e5 = shapeFieldElemName(
+          texts[pi],
+          FC_REF_LIST,
+          shapeFieldRowOf(fieldsTy, names[pi]),
+        )
+      }
     }
     sFieldElemName.push(e5)
     recordSFieldElemRow(e5, fkK) // D5 + B6b
@@ -979,7 +999,11 @@ function iisPushFieldElem(
     // else its raw `[]` cut, which is `shapeFieldElemName`'s code-28 arm exactly. A struct
     // table hit on the cut names the cut too, so no rung of its own is needed. The element
     // shape or union is pre-interned in the parse loop.
-    const e28 = shapeFieldElemName(texts[pi], FC_NUL_REF_LIST)
+    const e28 = shapeFieldElemName(
+      texts[pi],
+      FC_NUL_REF_LIST,
+      shapeFieldRowOf(fieldsTy, names[pi]),
+    )
     sFieldElemName.push(e28)
     recordSFieldElemRow(e28, fkK) // D5 + B6b
     if isValueUnionName(e28) { registerValueUnionName(e28) }
@@ -988,7 +1012,11 @@ function iisPushFieldElem(
     // shape-text table answers: code 16 the union name, 15 the nested-struct target,
     // 19/29 the map's value name, 0/4 the litunion atom name, 30 the niche's union. Only
     // codes 5 and 28 above stay local, resolving through the already-interned tables.
-    const en = shapeFieldElemName(texts[pi], codes[pi])
+    const en = shapeFieldElemName(
+      texts[pi],
+      codes[pi],
+      shapeFieldRowOf(fieldsTy, names[pi]),
+    )
     // The field's own row, projected per code, where the name it accompanies is not
     // one `repElemKey` keys nominally and the row is not a literal union.
     let enTy = -1
@@ -1017,7 +1045,7 @@ function iisPushFieldElem(
   0
 }
 
-function internInlineShapeTyGo(nm: string, tyIx: i32) {
+function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   if !nameIsShapeSpanEnds(nm) { return -1 }
   // Split `x:i32,y:string` into names + codes at depth 0 (`shapeInnerFieldSplit` —
   // the shape layer's ONE field scanner). `texts` keeps each field's type TEXT (a
@@ -1090,7 +1118,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
   if names.length == 0 {
     if nameStripSpaces(groupInnerOf(nm)).length != 0 { return -1 }
   }
-  const existing = annShapeIndexOf(names, codes, texts, tyIx)
+  const existing = annShapeIndexOf(names, codes, texts, tyIx, fieldsTy)
   if existing >= 0 {
     // A literal's `#anon` row carries no spelling, so the annotation it serves is recorded
     // against its arena type, as the wider row below is (D9570).
@@ -1102,7 +1130,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
   // its arena type records that row, since no row carries the annotation spelling (D8340).
   let wider = -1
   if !(iisOwnRow && iisBusy == 1) && !shapeIsAVariant(tyIx) {
-    wider = annShapeWiderRowOf(names, codes, texts)
+    wider = annShapeWiderRowOf(names, codes, texts, fieldsTy)
   }
   if wider >= 0 {
     structTyMarkAliasable(tyIx)
@@ -1136,7 +1164,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32) {
     // whose element is a map. `nameIsI32KeyedMap`'s key cut needs only the `{[K]:` prefix,
     // so it answers correctly for a map spelling's list and `| null` widths too.
     const fkK = mapNameKeyKind(texts[pi])
-    iisPushFieldElem(tyIx, names, codes, texts, pi, fkK)
+    iisPushFieldElem(tyIx, fieldsTy, names, codes, texts, pi, fkK)
     pj = pj + 1
   }
   sNames.length - 1
@@ -1151,12 +1179,13 @@ export function internShapeAs(key: string, nm: string) {
   shapeInnerFieldSplit(groupInnerOf(nm), rawNames, rawTexts)
   const names: string[] = []
   const codes: i32[] = []
+  const asTy = sTyIxOfName(key)
   let fi = 0
   while fi < rawNames.length {
     if rawNames[fi] == "" {
       return emitFail("emitProgram: malformed struct field")
     }
-    const fc = nameFieldCode(rawTexts[fi])
+    const fc = nameFieldCode(rawTexts[fi], shapeFieldRowOf(asTy, rawNames[fi]))
     if fc < 0 { return emitFail(fieldTypeRefusalMsg(rawTexts[fi])) }
     names.push(rawNames[fi])
     codes.push(fc)
@@ -1347,6 +1376,7 @@ function annShapeIndexOf(
   codes: i32[],
   texts: string[],
   tyIx: i32,
+  fieldsTy: i32,
 ) {
   const sLimC = sScanLim()
   sSetSync()
@@ -1359,7 +1389,11 @@ function annShapeIndexOf(
     // The same derivation the refinement makes, hoisted: `shapeFieldElemName` is the
     // mint's one home for "what element does this (text, code) record", and "" means the
     // field records none — in which case the atom bit carries the split instead.
-    let qb = shapeFieldElemName(texts[qi], codes[qi])
+    let qb = shapeFieldElemName(
+      texts[qi],
+      codes[qi],
+      shapeFieldRowOf(fieldsTy, names[qi]),
+    )
     if qb != "" {
       if codes[qi] == FC_STRUCT { qb = nonNulBaseOf(qb) }
     }
@@ -1557,7 +1591,8 @@ export function gaeEnsure(name: string) {
     // A field that is ITSELF an application (or an array of one) interns
     // depth-first, so the ref/elem lookups below resolve.
     gaeEnsure(arrLeafNameOf(tn))
-    let code = nameFieldCode(tn)
+    const gaeFty = shapeFieldRowOf(gaeTy, gaeFieldNames[fs + fi])
+    let code = nameFieldCode(tn, gaeFty)
     let elem = ""
     if code < 0 {
       // An interned application name is a struct-ref field (`nameFieldCode`
@@ -1593,7 +1628,7 @@ export function gaeEnsure(name: string) {
       // target, the union name, and the atom-array name. This path deliberately records ""
       // for the map, litunion-atom, nullable-ref-list, and `K | null` codes where the
       // shape-text table records a key — a known, intentional divergence, not merged here.
-      elem = shapeFieldElemName(tn, code)
+      elem = shapeFieldElemName(tn, code, gaeFty)
       if code == FC_UNION { registerValueUnionName(elem) }
     }
     if code < 0 { ok = false }

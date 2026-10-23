@@ -93,6 +93,7 @@ import {
   tyAt,
   tyDeeperThan,
   tyFieldTyOf,
+  tyIsFuncArena,
   tyIsLitUnion,
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
@@ -1963,7 +1964,7 @@ function shapeFieldTypeCompatK(
   elemTy: i32,
   lenient: i32,
 ): boolean {
-  const want = nameFieldCode(t)
+  const want = nameFieldCode(t, -1)
   if want < 0 || code < 0 {
     // A nested-struct candidate field (code 15) whose spelled type can't classify is
     // almost always an inline nested shape — tighten by canonical structural key so two
@@ -2041,7 +2042,9 @@ function shapeFieldTypeCompatK(
   // value is a different row — at the plain code (19) and at the `| null` niche (29), whose
   // value name comes off the same cut the recorder used (D1665).
   if want == FC_MAP || want == FC_NUL_MAP {
-    if elem != "" { return mvValNamesCompat(shapeFieldElemName(t, want), elem) }
+    if elem != "" {
+      return mvValNamesCompat(shapeFieldElemName(t, want, -1), elem)
+    }
   }
   if want == FC_UNION && elem != "" {
     // The name-side twin of `anonValueFitsField`'s box arm: a box's member sequence decides
@@ -2680,10 +2683,10 @@ export function nameIsNulRefList(name: string) {
 export function fieldTypeIsDeferred(t: string): boolean { nameIsU8Array(t) }
 
 // The per-field wasm-type code a field type spelling carries — the one home of the
-// field-code ladder, shared by `fieldTypeCode` and `nameFieldCode`; both reps of a field
-// must agree arm for arm and in order. `litNode` is an AST node when the caller has one
-// (decided from the checker's recorded type) or -1 when only the spelling is available.
-function fieldCodeOfSpelling(t: string, litNode: i32) {
+// field-code ladder, shared by `fieldTypeCode` and `nameFieldCode`, whose arms must agree in
+// order. `litNode` is the annotation node (-1 for none); `fty` is a node-less caller's arena
+// type for the field (-1 for none), read ahead of the spelling by the literal-union and list arms.
+function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
   if t == "i32" { return FC_I32 }
   // The `null` unit type stores its one value in a `nullref` slot (D4671).
   if t == "null" { return FC_NUL_NONE }
@@ -2721,7 +2724,9 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
     // Without it an inline-shape annotation of the identical field coded 0, so passing a
     // declared struct to that parameter produced check-clean invalid wasm.
     if nameIsInlineLitUnion(t) { return FC_STR }
-    if nameIsLitUnionType(t) { return FC_I32 }
+    if (fty >= 0 && tyIsLitUnion(fty)) || (fty < 0 && nameIsLitUnionType(t)) {
+      return FC_I32
+    }
     // A lone string literal is its one-member set, the atom (D7220).
     if nameIsOneStrLit(t) { return FC_I32 }
   }
@@ -2737,8 +2742,10 @@ function fieldCodeOfSpelling(t: string, litNode: i32) {
   } else if nameIsString(t) {
     return FC_STR
   }
-  // A list is asked of the type where a node came with the spelling, of the spelling where none did.
-  if (fsTy >= 0 && tyIsArray(fsTy)) || (fsTy < 0 && nameIsArray(t)) {
+  // A list is asked of the type where one came with the spelling, of the spelling where none did.
+  let listTy = fsTy
+  if litNode < 0 { listTy = fty }
+  if (listTy >= 0 && tyIsArray(listTy)) || (listTy < 0 && nameIsArray(t)) {
     // A scalar-element list stores its own wrapper, never code 5 (struct/union/closure only).
     const sk = scalarListRepOfName(t)
     if sk != null { return fieldCodeOfListRep(sk) }
@@ -3087,7 +3094,7 @@ export function fieldTypeCode(tyIx: i32) {
   if tyIsFuncType(tyIx) { return FC_CLOSURE }
   const ty = nodeAt(tyIx)
   if ty is TypeRef {
-    const c = fieldCodeOfSpelling(ty.tyName, tyIx)
+    const c = fieldCodeOfSpelling(ty.tyName, tyIx, -1)
     if c >= 0 { return c }
     // An inline-shape struct field resolves structurally to its interned struct, the dual of
     // a nominal `inner: Inner`. Guarded by the annotation's own type, `| null` peeled: the
@@ -3245,7 +3252,7 @@ export function fieldRefElemName(tyIx: i32) {
     // 19/29 the map's value name, 4 the atom array name, 5 the canonical ref element (else a
     // `(f64|null)[]` field stores a raw f64 into the box backing), and 28 its non-null part's,
     // deferred since `collectU` runs before the struct table exists (D1293).
-    return shapeFieldElemName(ty.tyName, code)
+    return shapeFieldElemName(ty.tyName, code, -1)
   }
   ""
 }
@@ -4482,7 +4489,7 @@ export function anonCodeIsSelfContained(c: i32) {
   c == FC_CLOSURE
 }
 
-export function nameFieldCode(t: string) {
+export function nameFieldCode(t: string, fty: i32) {
   // A nullable function field text is the nullable closure fat-pointer, code 22 — the
   // text reading of `fieldTypeCode`'s `nulCloFlag` arm.
   if nameIsNulClosure(t) { return FC_NUL_CLOSURE }
@@ -4490,9 +4497,11 @@ export function nameFieldCode(t: string) {
   // Depth-aware (`annArrowAt`, not a substring test): a union carrying a closure member
   // nests its arrow in parens and is a value union (code 16), which a substring test would
   // mis-claim as a bare closure and mismatch the box ref against the closure-typed field.
-  if annArrowAt(t) >= 0 { return FC_CLOSURE }
-  // -1: there is no node, so the literal-union arm is decided from the spelling.
-  fieldCodeOfSpelling(t, -1)
+  if (fty >= 0 && tyIsFuncArena(fty)) || (fty < 0 && annArrowAt(t) >= 0) {
+    return FC_CLOSURE
+  }
+  // -1: there is no node; `fty`, where the caller has one, decides ahead of the spelling.
+  fieldCodeOfSpelling(t, -1, fty)
 }
 
 const armDeferStack: string[] = []
@@ -4629,8 +4638,8 @@ export function refArrElemKeyDeferred(name: string) {
 
 // The element or target name a shape-text field records in `uFieldElemName`: a ref-list
 // field its element name, a nested-struct field its non-null target name, a value-union
-// field its atom-set name; "" otherwise.
-export function shapeFieldElemName(ftxt: string, code: i32) {
+// field its atom-set name; "" otherwise. `fty` is the field's arena type (-1 for none).
+export function shapeFieldElemName(ftxt: string, code: i32, fty: i32) {
   if code == FC_REF_LIST { return refArrElemKeyDeferred(ftxt) }
   if code == FC_STRUCT { return nonNulBaseOf(ftxt) }
   if code == FC_UNION { return ftxt }
@@ -4651,7 +4660,7 @@ export function shapeFieldElemName(ftxt: string, code: i32) {
   // the raw member string into the i32 atom slot. An inline litunion field (code 3) records
   // its member set for the same reason, since code 3 is layout-shared with a plain string field.
   if code == FC_STR && nameIsInlineLitUnion(ftxt) { return ftxt }
-  if code == FC_I32 && (nameIsLitUnionType(ftxt) || nameIsOneStrLit(ftxt)) {
+  if code == FC_I32 && fty >= 0 && (tyIsLitUnion(fty) || tyIsOneStrLit(fty)) {
     return ftxt
   }
   if code == FC_I32_LIST && nameIsLitUnionArray(ftxt) { return ftxt }

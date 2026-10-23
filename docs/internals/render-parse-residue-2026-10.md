@@ -127,7 +127,7 @@ the slice retires.
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 4 retired, 12 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
-| C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
+| C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 5 retired, 25 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
@@ -339,9 +339,15 @@ What each slice changes:
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
   field kept apart from its base, and `gaeArgIsTyParam` asks the declared-type test its
   `base[]` spelling stood for. A probe over every `tests/**/*.vl` and the distilled corpus
-  found 0 differing files for each. The other 6 stay. Rung 3 of `rlSlotByNameTyK` differs from
-  its arena twin in 47 files, in both directions. The 4 shape-text sites serve callers in
-  `emit_shape_intern` and `emit_collect` that hold no field type, which is C3's producer.
+  found 0 differing files for each. A second landing gave `nameFieldCode` and
+  `shapeFieldElemName` the field's arena type, which every caller holding one now passes; an
+  arm mint passes the arm's type to its fields alone (`internInlineShapeFieldsTy`). Over the
+  self-compile, `tests` and the distilled corpus (16,824 files) the typed answer differed in 0
+  files at each site, and `shapeFieldElemName`'s literal-union arm retired: 3,746 files agree,
+  and the 96 reached with no type answered false by spelling too. The other 5 stay. The three
+  `fieldCodeOfSpelling` and `nameFieldCode` arms still reach with no type in 2,290 to 4,230
+  files, mostly from `shapeFieldTypeCompatK` and `nameFieldCodeTy` called with -1. Rung 3 of
+  `rlSlotByNameTyK` differs from its arena twin in 47 files, in both directions.
 - **C5.** These name-only gates get a typed caller, or are proved dead and removed:
   - the `nameIsNul*` niche ladders and `annSpelledArray`;
   - the generic-alias test and `inferRetIsLitUnionAt`;
