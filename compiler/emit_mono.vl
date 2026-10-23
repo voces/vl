@@ -159,6 +159,7 @@ import {
   tyIxIsFunc,
   tyMayHoldFn,
   tyMentionsTyVarNamed,
+  tyNulInnerTy,
   tyPrimNameOf,
   tyRenderSoftensLits,
   tySame,
@@ -2664,8 +2665,54 @@ function monoBindCols(
         ud = declTys[ui]
       }
       monoBindBareUnionArm(ud, tyCol[ui], bN, bT)
+      monoBindInnerUnionArms(ud, tyCol[ui], bN, bT, 0)
     }
     ui = ui + 1
+  }
+  0
+}
+
+// The union arms of parameter type `decl` that sit inside a list element, a nullable, a record
+// field or a map value (`(T | i32)[]`), bound from the same position of argument type `at` as a
+// top-level union's are: `bindGenWalk` passes over a union, at any depth (D10880).
+function monoBindInnerUnionArms(
+  decl: i32,
+  at: i32,
+  bN: string[],
+  bT: i32[],
+  depth: i32,
+) {
+  if decl < 0 || at < 0 || decl >= T.tys.length || at >= T.tys.length {
+    return 0
+  }
+  if depth > TY_WALK_DEPTH || !tyHasTyVar(decl) || tyHasTyVar(at) { return 0 }
+  const d = tyAt(decl)
+  match d {
+    TyUnion => {
+      // A top-level union is `monoBindCols`'s own arm walk.
+      if depth > 0 {
+        monoBindBareUnionArm(decl, at, bN, bT)
+        bindGenUnionShapedArmInto(decl, at, bN, bT)
+      }
+    }
+    TyArray => {
+      monoBindInnerUnionArms(d.aElem, tyArrayElemIx(at), bN, bT, depth + 1)
+    }
+    TyNullable => {
+      monoBindInnerUnionArms(d.nInner, tyNulInnerTy(at), bN, bT, depth + 1)
+    }
+    TyObj => {
+      let i = 0
+      while i < d.objFieldNames.length && i < d.objFieldTypes.length {
+        const af = tyFieldTyOf(at, d.objFieldNames[i])
+        monoBindInnerUnionArms(d.objFieldTypes[i], af, bN, bT, depth + 1)
+        i = i + 1
+      }
+    }
+    TyMap => {
+      monoBindInnerUnionArms(d.mVal, tyMapValOf(at), bN, bT, depth + 1)
+    }
+    TyPrim | TyErr | TyFunc | TyVar | TyLit | TyNeg => {}
   }
   0
 }
@@ -2782,8 +2829,8 @@ function monoFnDeclaresLambda(slot: i32): boolean {
 }
 
 // Refuses an instance whose `(T | null)[]` annotation binds `T` where `T | null` is a niche
-// rather than a box or a nullable reference: a string, boolean, literal-union or function
-// element. Those instances read the element at the template's rep (D2525).
+// rather than a box or a nullable reference: a literal-union or function element, or a
+// record holding such a list read through a lambda. Those read the template's rep (D2525).
 function monoNicheNulListCheck(
   ann: string,
   typarams: string[],
@@ -2803,9 +2850,7 @@ function monoNicheNulListCheck(
   const b = normTypeAtom(monoBindOf(tvN, tvV, tp))
   if b == "" { return 0 }
   if (
-    b == "string"
-    || b == "boolean"
-    || nameIsLitUnionType(b)
+    nameIsLitUnionType(b)
     || annArrowAt(b) >= 0
     || (monoCurHasLam && gaeAppHasNulParamListField(b))
   ) {
@@ -23389,6 +23434,34 @@ function monoBindArenaWalk(
   const rN: string[] = []
   const rT: i32[] = []
   bindGenWalk(pt, at, rN, rT)
+  monoPushPins(rN, rT, typarams, tvN, tvV)
+}
+
+// `monoBindArenaWalk` for the union arms inside `pt`'s lists, nullables, fields and map values
+// (`(S | T)[]`), which a spelling cannot pair when `at` spells a member another way (D10880).
+function monoBindInnerArmPins(
+  pt: i32,
+  at: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
+  const rN: string[] = []
+  const rT: i32[] = []
+  monoBindInnerUnionArms(pt, at, rN, rT, 0)
+  monoPushPins(rN, rT, typarams, tvN, tvV)
+}
+
+// Pushes each binding of `rN`/`rT` that names one of `typarams` still unbound in `tvN`/`tvV`
+// and is closed, spelled as a pin. 0.
+function monoPushPins(
+  rN: string[],
+  rT: i32[],
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
   let k = 0
   while k < rN.length {
     if strListHas(typarams, rN[k]) && monoBindOf(tvN, tvV, rN[k]) == "" {
@@ -23608,6 +23681,13 @@ function monoPinTyParamComposite(
     anC = monoPinnedListElemPin(args[i], rowTy)
   }
   if anC == "" { return monoArgTyFail(p.parName, fn.fnName) }
+  monoBindInnerArmPins(
+    nodeTyIxOf(p.parType),
+    monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx),
+    fn.fnTyParams,
+    tvN,
+    tvV,
+  )
   monoBindFromAnn(
     ann,
     monoArgBindSpelling(ann, anC, args[i]),
