@@ -285,6 +285,7 @@ import {
   annSplitParams,
   declStructNodeOf,
   drwDispatchOp,
+  exprEffectFree,
   moduleLocalLetAll,
   moduleLocalLetOfUnique,
   monoAnnHasTyParam,
@@ -14487,6 +14488,14 @@ function monoFlowUsePlanAt(
       viaMap = true
       cur = rd
     } else if pn is Index && pn.idxArr == cur {
+      // An element write through the list's own name or an alias stores a value its reads count,
+      // so it is planned only when every value the list holds names one generic (D10340).
+      if path.length == 0 && cv.length == 1 && monoFlowElemWriteOf(cur) >= 0 {
+        const ow = monoFlowListOwner(cv[0])
+        return ow >= 0
+          && i32ListHas(monoFlowListNames(ow), d)
+          && monoFlowElemsGen(cv[0]) >= 0
+      }
       const next: i32[] = []
       for v in cv {
         let el = monoFlowElemAt(v, pn.idxIndex)
@@ -14504,10 +14513,12 @@ function monoFlowUsePlanAt(
         if P.nodes[v] is ArrayLit { lists = lists + 1 }
       }
       if lists > 0 {
-        // A push through the list's own name appends a value its reads already count (D9441).
+        // A push through the list's own name or an alias appends a value its reads already count
+        // (D9441, D10341).
         if prop == "push" && path.length == 0 && cv.length == 1 {
           const pv = monoFlowPushOf(cur)
-          if pv >= 0 && monoFlowListOwner(cv[0]) == d {
+          const ow = monoFlowListOwner(cv[0])
+          if pv >= 0 && ow >= 0 && i32ListHas(monoFlowListNames(ow), d) {
             return monoFlowLeafGen(unwrapParen(pv)) >= 0
           }
         }
@@ -15005,7 +15016,7 @@ function monoFlowElemsGen(v: i32): i32 {
   g
 }
 
-// The values list literal `v` holds: its elements, the values its owner pushes, and in place of a
+// The values list literal `v` holds: its elements, the values its owner pushes or writes, and in place of a
 // spread of a pushed list (`monoFlowPushedSpreadSrc`) that list's own values (D9482).
 function monoFlowElemLeaves(v: i32, depth: i32): i32[] {
   const out: i32[] = []
@@ -15021,6 +15032,7 @@ function monoFlowElemLeaves(v: i32, depth: i32): i32[] {
     }
   }
   for x in monoFlowPushed(v) { out.push(x) }
+  for x in monoFlowElemWrites(v) { out.push(x) }
   out
 }
 
@@ -15103,17 +15115,74 @@ function monoFlowPushOf(x: i32): i32 {
   wn.callArgs[0]
 }
 
-// Each value the owner of list literal `v` appends through its own name by `.push`.
-function monoFlowPushed(v: i32): i32[] {
+// The owner `d` of a list literal and each un-annotated `const` naming it whole, directly or
+// through another such `const`, which hold the same list (D10341).
+function monoFlowListNames(d: i32): i32[] {
+  const out: i32[] = [d]
+  let i = 0
+  while i < out.length && out.length <= MONO_ALIAS_CHAIN_MAX {
+    for u in mfrUses[out[i]] ?? [] {
+      let p = mfrParent[u] ?? -1
+      while p >= 0 && P.nodes[p] is Paren { p = mfrParent[p] ?? -1 }
+      if p >= 0 && !i32ListHas(out, p) {
+        const pn = P.nodes[p]
+        if pn is LetDecl && pn.letKw == "const" && pn.letType < 0 {
+          if unwrapParen(pn.letInit) == u { out.push(p) }
+        }
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+// Each read, past its parentheses, of a name `monoFlowListNames` gives the owner of list literal
+// `v`; empty when `v` has no owner.
+function monoFlowOwnerReads(v: i32): i32[] {
   const out: i32[] = []
   const d = monoFlowListOwner(v)
   if d < 0 { return out }
-  for u in mfrUses[d] ?? [] {
-    let x = u
-    while (mfrParent[x] ?? -1) >= 0 && P.nodes[mfrParent[x] ?? -1] is Paren {
-      x = mfrParent[x] ?? -1
+  for a in monoFlowListNames(d) {
+    for u in mfrUses[a] ?? [] {
+      let x = u
+      while (mfrParent[x] ?? -1) >= 0 && P.nodes[mfrParent[x] ?? -1] is Paren {
+        x = mfrParent[x] ?? -1
+      }
+      out.push(x)
     }
+  }
+  out
+}
+
+// Each value the owner of list literal `v` appends by `.push` through its own name or an alias.
+function monoFlowPushed(v: i32): i32[] {
+  const out: i32[] = []
+  for x in monoFlowOwnerReads(v) {
     const s = monoFlowPushOf(x)
+    if s >= 0 { out.push(unwrapParen(s)) }
+  }
+  out
+}
+
+// The value a plain `=` stores into an element of read `x`, as `x[k] = v`; -1 otherwise.
+function monoFlowElemWriteOf(x: i32): i32 {
+  const q = mfrParent[x] ?? -1
+  if q < 0 { return -1 }
+  const qn = P.nodes[q]
+  if !(qn is Index) || qn.idxArr != x { return -1 }
+  const w = mfrParent[q] ?? -1
+  if w < 0 { return -1 }
+  const wn = P.nodes[w]
+  if !(wn is BinExpr) || wn.binOp != "=" || wn.binLeft != q { return -1 }
+  wn.binRight
+}
+
+// Each value the owner of list literal `v` stores by an element write through its own name or an
+// alias (D10340).
+function monoFlowElemWrites(v: i32): i32[] {
+  const out: i32[] = []
+  for x in monoFlowOwnerReads(v) {
+    const s = monoFlowElemWriteOf(x)
     if s >= 0 { out.push(unwrapParen(s)) }
   }
   out
@@ -15202,8 +15271,8 @@ function monoFlowCallStmtOf(ix: i32): i32 {
   x
 }
 
-// Whether child `x` of node `p` is evaluated, every time `p` is, after only reads of names and
-// literals among `p`'s other operands.
+// Whether child `x` of node `p` is evaluated, every time `p` is, after only `monoFlowInert`
+// operands of `p`.
 function monoFlowRunsFirstIn(p: i32, x: i32): boolean {
   const pn = P.nodes[p]
   if pn is Paren { return true }
@@ -15211,11 +15280,12 @@ function monoFlowRunsFirstIn(p: i32, x: i32): boolean {
   if pn is RetStmt { return pn.retArg == x }
   if pn is IfStmt { return pn.ifCond == x }
   if pn is Unary { return pn.unArg == x }
+  if pn is Member { return pn.memObj == x }
   if pn is BinExpr {
     if pn.binLeft == x { return true }
     const op = pn.binOp
     if op == "&&" || op == "||" || op == "??" { return false }
-    return pn.binRight == x && monoFlowNameOrLit(pn.binLeft)
+    return pn.binRight == x && monoFlowInert(pn.binLeft, 0)
   }
   monoFlowArgRunsFirst(p, x)
 }
@@ -15225,27 +15295,53 @@ function monoFlowRunsFirstIn(p: i32, x: i32): boolean {
 function monoFlowArgRunsFirst(p: i32, x: i32): boolean {
   const pn = P.nodes[p]
   if !(pn is Call) { return false }
-  if hasNamedArgs(pn.callArgNames) || !monoFlowNameOrLit(pn.callFn) {
+  if hasNamedArgs(pn.callArgNames) || !monoFlowInert(pn.callFn, 0) {
     return false
   }
   for a in pn.callArgs {
     if a == x { return true }
-    if !monoFlowNameOrLit(a) { return false }
+    if !monoFlowInert(a, 0) { return false }
   }
   false
 }
 
-// Whether `e` is a name read or a literal, which no other evaluation can change or trap.
-function monoFlowNameOrLit(e: i32): boolean {
-  const u = unwrapParen(e)
-  if u < 0 { return false }
-  const n = P.nodes[u]
-  n is Ident
-    || n is NumLit
-    || n is StrLit
-    || n is CharLit
-    || n is BoolLit
-    || n is NullLit
+// Whether evaluating `e` writes nothing and calls only generics whose bodies write and call
+// nothing, so a read run ahead of it is observed only by which trap fires first (D10342).
+function monoFlowInert(e: i32, depth: i32): boolean {
+  const x = unwrapParen(e)
+  if x < 0 || depth > 8 { return false }
+  const n = P.nodes[x]
+  if n is Member { return monoFlowInert(n.memObj, depth + 1) }
+  if n is BinExpr && n.binOp != "=" {
+    return monoFlowInert(n.binLeft, depth + 1)
+      && monoFlowInert(n.binRight, depth + 1)
+  }
+  if !(n is Call) { return exprEffectFree(x) }
+  if hasNamedArgs(n.callArgNames) { return false }
+  const c = unwrapParen(n.callFn)
+  if c < 0 || !exprEffectFree(c) { return false }
+  let g = monoFlowLeafGen(c)
+  const cn = P.nodes[c]
+  if cn is Index {
+    const a = unwrapParen(cn.idxArr)
+    const ad = if a >= 0 && P.nodes[a] is Ident { identDeclOf(a) } else { -1 }
+    if ad >= 0 {
+      const vs = monoFlowDeclVals(ad)
+      if vs.length == 1 { g = monoFlowElemsGen(vs[0]) }
+    }
+  }
+  if g < 0 { return false }
+  const fd = P.nodes[g]
+  if !(fd is FuncDecl) || fd.fnBody < 0 { return false }
+  const body = P.nodes[fd.fnBody]
+  if !(body is Block) { return false }
+  for s in body.blkStmts {
+    if !exprEffectFree(s) { return false }
+  }
+  for a in n.callArgs {
+    if !monoFlowInert(a, depth + 1) { return false }
+  }
+  true
 }
 
 // The statement list a statement `c` would sit in: its block's, or at module scope the start
@@ -15415,6 +15511,7 @@ function monoFlowNoteInertIn(v: i32, depth: i32) {
   if n is ArrayLit {
     for e in n.arrElems { monoFlowNoteInertIn(e, depth + 1) }
     for e in monoFlowPushed(x) { monoFlowNoteInertIn(e, depth + 1) }
+    for e in monoFlowElemWrites(x) { monoFlowNoteInertIn(e, depth + 1) }
     return 0
   }
   if n is ObjLit {
