@@ -130,7 +130,7 @@ the slice retires.
 | C4 | shape-text field callers thread a type (landed: 3 retired, 6 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
-| D2 | ref-list kind ladder by type | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
+| D2 | ref-list kind ladder by type (landed: 5 retired, 17 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
@@ -291,8 +291,26 @@ What each slice changes:
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
   slot by element type. This turns most of the B key producers into dead code.
 - **D2.** `nameIsRefArray`, `refArrShapeKind` and the `rasRef`/`rasKind` memo answer by type.
-  First the arena twin `tyElemIsRefListElem` has to agree with the spelling ladder; today it
-  admits more.
+  `tyElemIsRefListElem` admits more than the spelling ladder by construction: it answers true for
+  every record and every nested list, with no row. So the slice added a narrower twin,
+  `tyIsRefArray`, which asks for the record's own struct or arm row. A probe put both answers side
+  by side at eleven sites, over the self-compile and 16,678 fixture and corpus files. Counts are
+  files reaching a site, not calls.
+  - Done, byte-identical: 5 parses. `synthEmptyListAnn`, `collectARefArrayAnn`'s nullable test,
+    `arrLitNulRefGrouped` and `nulRefElemNameOfArrTy` ask the type, with 0 differing reaches.
+    `checkArrName`'s ref-list rung was dead, because its only caller's earlier rung already
+    claims every name it accepted.
+  - Left: the twin is too NARROW at three sites (`mvValKindOfNameTy`'s list arm,
+    `arrLitNestedElemName`, `arrLitShapeElemName`; 49 reaches), always the same way. An inferred
+    record that only adopts into a declared row (`[{ r: null }]` beside `{ r: i32 | null }`) has
+    no row of its own, while the spelling reaches the row through `structIndexOfTypeName`'s
+    lenient passes. Annotating the literal, or deleting the declared row, makes the two agree, and
+    the cells run, so the spelling is not wrong there. The twin needs that adoption bridge
+    (`declRowFieldAdopts` over the rows) before these switch.
+  - Left: `collectATypeRef`'s rung also disagrees in the other direction. A generic original's
+    spelling (`T`, `C<i32>[]`) carries the instance's canon type, and 411 reaches have no type.
+    Two map-value sites agree but have callers passing `-1`. `refArrElemNameIf`'s callers are in
+    other slices' files. The ladder internals stay while any of these keep a name caller.
 - **D3.** The mono instance key and the `monoAnnPinName` ladder take the pin's type. Most of the
   slice is this one seam, and it carries 15 of the 52 D renders.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
