@@ -6734,11 +6734,76 @@ function substRecordTwin(a: i32, b: i32): boolean {
   sameVariantTy(a, b)
 }
 
+// Whether two substituted members are one map type at two arena indices:
+// `{[string]: V} | {[string]: string}` at `V := string` is one map.
+function substMapTwin(a: i32, b: i32): boolean {
+  if a < 0 || b < 0 || a >= T.tys.length || b >= T.tys.length { return false }
+  if !(tyAt(a) is TyMap) || !(tyAt(b) is TyMap) { return false }
+  tySame(a, b)
+}
+
 // Whether every member of `ms` is a literal or a literal union over one common base, at least
 // one of them a union: a set the annotation route flattens, and none of them boxed.
 function substLitSetArms(ms: i32[]): boolean {
   const flat: i32[] = []
   litUnionFlatMembers(ms, flat)
+}
+
+// `out3` with each member that type parameter `ms[i]` binds to a union sharing a member with
+// another of `out3` replaced by that union's members in order: `T | string` at
+// `T := i32 | string` is `i32 | string`, not a union holding `i32 | string` beside a second
+// `string`. A bound union sharing nothing stays one member (`T | "err"` at `T := "a" | "b"`).
+function substSplicedBoundUnions(ms: i32[], out3: i32[]): i32[] {
+  const at: boolean[] = []
+  let spliced = false
+  let i = 0
+  while i < out3.length {
+    const s = i < ms.length
+      && substBoundUnionAt(ms[i], out3[i])
+      && substUnionShares(out3, i)
+    at.push(s)
+    if s { spliced = true }
+    i = i + 1
+  }
+  if !spliced { return out3 }
+  const res: i32[] = []
+  let j = 0
+  while j < out3.length {
+    const m = out3[j]
+    if at[j] {
+      const um = tyAt(m)
+      if um is TyUnion {
+        for x in um.uMembers { res.push(x) }
+      }
+    } else {
+      res.push(m)
+    }
+    j = j + 1
+  }
+  res
+}
+
+// Whether member `before` is a type parameter its substitution `after` bound to a union.
+function substBoundUnionAt(before: i32, after: i32): boolean {
+  if before < 0 || after < 0 || before == after { return false }
+  if before >= T.tys.length || after >= T.tys.length { return false }
+  tyAt(before) is TyVar && tyAt(after) is TyUnion
+}
+
+// Whether union member `out3[k]`'s own members include another member of `out3`.
+function substUnionShares(out3: i32[], k: i32): boolean {
+  const u = tyAt(out3[k])
+  if !(u is TyUnion) { return false }
+  let j = 0
+  while j < out3.length {
+    if j != k {
+      for x in u.uMembers {
+        if x == out3[j] { return true }
+      }
+    }
+    j = j + 1
+  }
+  false
 }
 
 // The union at `tyIx` rebuilt over its substituted members `out3` (`ms` before substitution):
@@ -6750,7 +6815,7 @@ function substUnionRebuild(tyIx: i32, ms: i32[], out3: i32[]): i32 {
   const wrapNull = src.length > 0
   // Dedupes by arena-index identity only (not `sameVariantTy`) then rebuilds: substitution
   // can make two members the same type, and matching structurally here would merge members this walk must leave alone (the mixed-union arena shape is load-bearing).
-  let dms = out3
+  let dms = substSplicedBoundUnions(ms, out3)
   if wrapNull { dms = src }
   const uniq: i32[] = []
   let q = 0
@@ -6763,6 +6828,7 @@ function substUnionRebuild(tyIx: i32, ms: i32[], out3: i32[]): i32 {
       if !wrapNull && substListTwin(uniq[w], dms[q]) { seen = true }
       if wrapNull && substListTwinNominal(uniq[w], dms[q]) { seen = true }
       if substRecordTwin(uniq[w], dms[q]) { seen = true }
+      if substMapTwin(uniq[w], dms[q]) { seen = true }
       w = w + 1
     }
     if !seen { uniq.push(dms[q]) }
