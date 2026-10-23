@@ -1094,3 +1094,117 @@ control reads 1 (`store.vl`).
   (`LinkProg.runtime.sigs` and the `F:rt#n` type keys), so it moves with the group types.
 - **The 8 functions above**, whose helper set depends on the program.
 - §16's twins, group types, literal-type texts and band rank table are unchanged.
+
+## 18. Step 7, first part: the runtime signatures keyed by owner
+
+**What a runtime signature is referenced by.** The type section holds the group types, then
+the n user signatures (`F:<fnKey>`), then the runtime's signatures, which were keyed by
+position (`F:rt#k`). A scratch probe over the 5,101 armed tests/cases builds at #4494 listed,
+for each of the 47,543 runtime signatures, the first byte that names its index.
+
+| referenced by | signatures |
+| --- | ---: |
+| a runtime function's type | 33,354 |
+| a function import | 13,273 |
+| nothing | 916 |
+
+No module artifact references a runtime signature. The 916 are the map store types
+`(ref, ref, i32) -> ()` a map row reserves whether or not a store is called. Content does not
+key them: 9,079 signatures repeat another's definition in the same build.
+
+**What moved: the keys.** `elRtSigOwners` keys each runtime signature by the function that
+owns it: a function import by its import key, a runtime function by its function key, and a
+reserved map store or record compare type by the row key §17 gave its helper
+(`rt:__map_set__@<kind>:<value>`, `rt:__eq__@<type>`). A signature with no owner, or a second
+one with the same owner, keeps its position as `F:sig#<k>`. `LinkArt.sigs` holds key and
+definition (`LinkTy`), so link places a signature by its key. `vl.link` is version 3 and
+records each runtime function's key and digest, which `s5-relocs.vl invariance` compares
+across builds as its `== runtime` line. The emitted module does not change.
+
+On the change, over 5,104 builds:
+
+| owner | signatures |
+| --- | ---: |
+| a named runtime function (`F:rt:...`), with the reserved rows | 29,376 |
+| a function import (`F:i:f:...`) | 13,278 |
+| an unnamed runtime function (`F:rt#k`, the start function) | 4,914 |
+| none, keyed by position (`F:sig#k`) | 0 |
+
+No runtime function's type names a signature another owner holds.
+
+**Proof.** The armed builds are at #4494. The tests/cases rows include the witness's builds.
+
+| set | builds | artifacts | functions | body references | sections differ | bodies differ | unresolved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 scripts, master | 8 | 99 | 2,323 | 89,478 | 0 | 0 | 0 |
+| 8 scripts, this change | 8 | 99 | 2,323 | 89,478 | 0 | 0 | 0 |
+| tests/cases, master | 5,101 | 6,122 | 86,763 | 921,318 | 0 | 0 | 0 |
+| tests/cases, this change | 5,104 | 6,127 | 86,789 | 921,366 | 0 | 0 | 0 |
+
+In every row nothing is defined twice and no row is left unconsumed.
+
+Invariance:
+
+- **The 8 scripts:** 23 keys held and 1 pair differs (`std:array`), as on master.
+- **tests/cases:** 4,905 pairs differ against master's 4,902. The 3 added are the witness's
+  files; the key the witness adds (`text.vl`) is held equal.
+- **Runtime functions** held by two or more builds: 190. Their bodies differ in 5,187 pairs on
+  this change, against 27,946 when every signature keeps its position. Of the 5,187, 4,912 are
+  the start function (`rt#0`), whose body is the program. The rest are helpers whose body
+  depends on a program fact: `__as_fail__` (28), `__init_fail__` (21), the `__rv_*__` views
+  (15 each) and the map stores (`__map_set__@0:Circle` 17). On the 8 scripts: 37 held, 7
+  pairs differ (`rt#0` 6, `__as_fail__` 1).
+
+**The witness and the control.** `tests/cases/modules/runtime-sig-keys/` has two roots that
+share `text.vl`, which concatenates strings. `entry2.vl` prints a float first, so the float
+print import moves every runtime signature after it. The control keys every signature by
+position (`if true` in `elTyKeys`). Both link with 0 differing. Over the two roots, this
+change reads 7 runtime functions shared and 1 pair differing (`rt#0`); the control reads 7
+differing (`rt#0`, `__str_hash__`, `__str_eq__`, `__str_concat__`, `__utf8_dec__`,
+`__utf8_enc__`, `__utf8_cplen__`).
+
+**Gates.**
+
+- **Identity:** difftree `--identity` reads 16,446 files, 11,437 built, 0 differ and 0
+  uncompared.
+- **Seed:** the fixpoint holds, at 5,695,645 bytes (master 5,693,406, +0.04%).
+- **plumb-shape cost:** passes.
+- **L2 guest fuel**, one run each on this source: the master seed 89,025,117,854 and the new
+  seed 89,025,117,833 (−21 instructions).
+
+**Why link cannot rebuild the runtime's order yet.** The runtime artifact carries its
+signatures and functions as ordered lists, and two orders in them are not a function of
+the keys:
+
+- the map store types are reserved in row order, and the used and unused ones interleave,
+  while map store functions are numbered in call order;
+- the start function's signature comes first, and its body is the program.
+
+So the order stays the runtime artifact's list order. That artifact is program-level, and no
+module artifact references a runtime signature, so the keys above are enough for a module
+artifact to stay the same across programs.
+
+**The group types.** Over 4,580 builds, 45,590 group types are in the runtime's share. By the
+first byte that names one:
+
+| first named by | group types |
+| --- | ---: |
+| a module artifact, and also the runtime | 28,049 |
+| nothing | 12,324 |
+| a runtime function | 4,344 |
+| the tail | 735 |
+| a runtime signature | 138 |
+
+The 12,324 that nothing names are rows a program fact reserves: closure signatures (9,042),
+closure environments (937), union and value boxes (477, 382), records (326), i32 lists (293),
+variants (256), and fewer of each other kind. Struct rows are deduplicated across the program,
+so they belong to no single module.
+
+**What is left of step 7.**
+
+- **The unnamed reservations.** The 12,324 group types and the 916 map store types that no
+  byte names hold indices. Dropping them changes the emitted module.
+- **The start function** keeps `rt#0`; its body is the program.
+- **The runtime's order**, rebuilt from the artifacts, which needs the two orders above keyed.
+- **Runtime helpers whose body follows the program**, the 275 non-start pairs above, and §17's 8
+  functions whose helper set depends on the program.
