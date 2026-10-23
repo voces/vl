@@ -9460,7 +9460,7 @@ function monoDeclFnFieldTwin(pin: string, ty: i32): i32 {
 // D988 — the key suffix an anonymous-shape pin, or a declared-record twin, needs; "" for every
 // other pin. A hole parameter pins the argument's type name, and two object literals with the
 // same field names share one synthetic row whatever their field types are, so both key the same
-// instance. The rendering is the right grain — keying on the type index mints per site.
+// instance. The canonical key is the right grain — keying on the type index mints per site.
 function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   if tyIx < 0 { return "" }
   if monoDeclFnFieldTwin(pin, tyIx) >= 0 {
@@ -9468,9 +9468,9 @@ function monoAnonPinDiscrim(pin: string, tyIx: i32): string {
   }
   if pin.length < 5 { return "" }
   if pin[0] != "#"[0] { return "" }
-  const rendered = tyToEmitName(tyIx)
-  if rendered == "" { return "" }
-  "=" + rendered
+  const canon = tyCanonKey(tyIx, TY_WALK_DEPTH)
+  if canon == "" { return "" }
+  "=" + canon
 }
 
 // The key suffix a function-value pin needs, or "". The pin is the value's `$fnsig` key, which
@@ -10197,13 +10197,32 @@ function monoTemplateOwner(origFe: i32): string {
   topFnOwnerOf(monoOrigNode[origFe])
 }
 
-// The instance registry key, `key` extended by the pins, the exact types a type-testing body
-// binds (pushed onto `exSubN`/`exSubT`) and the baked-callback identities. Returns the key.
+// The pin segment of an instance key: per pin, `heads[pk]` and the argument type's
+// discriminators. `heads` is the pin spelling, or for the typed key the pin's resolved type.
+function monoKeyPinSeg(
+  heads: string[],
+  pinned: string[],
+  pinTys: i32[],
+): string {
+  let seg = ""
+  let pk = 0
+  while pk < pinned.length {
+    seg = seg
+      + heads[pk]
+      + monoAnonPinDiscrim(pinned[pk], pinTys[pk])
+      + monoSigPinDiscrim(pinned[pk], pinTys[pk])
+      + ","
+    pk = pk + 1
+  }
+  seg
+}
+
+// The instance registry key, `key` extended by the exact types a type-testing body binds
+// (pushed onto `exSubN`/`exSubT`) and the baked-callback identities. Returns the key.
 function monoMakeInstanceKey(
   key: string,
   origFe: i32,
   params: i32[],
-  pinned: string[],
   pinTys: i32[],
   tps: string[],
   exBN: string[],
@@ -10212,15 +10231,6 @@ function monoMakeInstanceKey(
   exSubT: i32[],
   cbFnNames: string[],
 ) {
-  let pk = 0
-  while pk < pinned.length {
-    key = key
-      + pinned[pk]
-      + monoAnonPinDiscrim(pinned[pk], pinTys[pk])
-      + monoSigPinDiscrim(pinned[pk], pinTys[pk])
-      + ","
-    pk = pk + 1
-  }
   // A body testing a value of a type parameter is keyed by the exact types, which a pin's
   // spelling can merge (a Set and its boolean map), so each instance binds them to one.
   if monoNeedsExactKey(origFe) {
@@ -11833,6 +11843,8 @@ type MonoInstKey = {
   exSubN: string[],
   exSubT: i32[],
   argLit: boolean[],
+  pinAt: i32,
+  pinEnd: i32,
 }
 
 // The key of `fn`'s instance at these pins, taking over the staged explicit bindings.
@@ -11865,11 +11877,13 @@ function monoMakeInstanceKeyOf(
   // The exact-type binding the key names, read again by the body rewrite.
   const exSubN: string[] = []
   const exSubT: i32[] = []
+  const pinAt = key.length
+  key = key + monoKeyPinSeg(pinned, pinned, pinTys)
+  const pinEnd = key.length
   key = monoMakeInstanceKey(
     key,
     origFe,
     fn.fnParams,
-    pinned,
     pinTys,
     tps,
     exBN,
@@ -11886,9 +11900,42 @@ function monoMakeInstanceKeyOf(
     exSubN: exSubN,
     exSubT: exSubT,
     argLit: argLit,
+    pinAt: pinAt,
+    pinEnd: pinEnd,
   }
   k
 }
+
+// `k.key` with each pin's spelling replaced by its kind and the canonical key of the type the
+// clone resolved it to, so two spellings of one type (`i32|string`, `string|i32`) share an
+// instance. A pin with no resolved type keeps its spelling.
+function monoTypedInstKey(
+  k: MonoInstKey,
+  pinned: string[],
+  pinKinds: i32[],
+  pinTys: i32[],
+  pinnedTyIx: i32[],
+): string {
+  const heads: string[] = []
+  let pk = 0
+  while pk < pinned.length {
+    let pin = "S:" + pinned[pk]
+    if pk < pinnedTyIx.length && pk < pinKinds.length {
+      if pinnedTyIx[pk] >= 0 {
+        pin = i32ToStr(pinKinds[pk])
+          + ":"
+          + tyCanonKey(pinnedTyIx[pk], TY_WALK_DEPTH)
+      }
+    }
+    heads.push(pin)
+    pk = pk + 1
+  }
+  const seg = monoKeyPinSeg(heads, pinned, pinTys)
+  k.key.slice(0, k.pinAt) + seg + k.key.slice(k.pinEnd, k.key.length)
+}
+
+// Typed instance key → the registry key of the instance first minted under it.
+let monoTypedKeys: {[string]: string} = Map()
 
 // Binds each enclosing pin that has a spelling, and returns the key text naming them.
 function monoBindEnclosingPins(
@@ -12045,6 +12092,28 @@ function monoMakeInstanceGo(
       monoShPendFlush(shAt, [], [], [], [])
       return -1
     }
+    // A spelling missed but the resolved pin types name an instance already minted: reuse it,
+    // dropping the clone's staged writes.
+    const typedKey = monoTypedInstKey(k, pinned, pinKinds, pinTys, pinnedTyIx)
+    const typedHit = monoTypedKeys.get(typedKey) ?? ""
+    if typedHit != "" {
+      monoShPendFlush(shAt, [], [], [], [])
+      if (
+        monoMakeInstanceHit(
+          typedHit,
+          origFe,
+          pinned,
+          pinTys,
+          calleeIx,
+          annotateI32,
+        )
+      ) {
+        return 0
+      }
+      return emitFail(
+        "emitProgram: monomorphize: a typed instance key names no registered instance",
+      )
+    }
     const letTyCol = monoMakeInstanceLetTyCol(
       params,
       pinned,
@@ -12150,6 +12219,7 @@ function monoMakeInstanceGo(
     if instFe < 0 { return -1 }
     // REGISTER before walking the body, so a recursive self-call at the same
     // shape resolves here instead of recursing (the host's discipline).
+    if !monoTypedKeys.has(typedKey) { monoTypedKeys.set(typedKey, k.key) }
     monoMakeInstanceRegister(
       k.key,
       origFe,
@@ -27099,6 +27169,7 @@ export function monomorphize(stmts: i32[]) {
   monoOrigNode = []
   fnPosIndexDrop()
   monoKeys = []
+  monoTypedKeys = Map()
   monoInstOrig = []
   monoInstName = []
   monoInstFe = []
