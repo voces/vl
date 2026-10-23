@@ -545,15 +545,15 @@ const spawn = async (
   };
 };
 
-const build = (src: string, out: string): Promise<Cost> =>
-  spawn(`build on ${src}`, ["build", src, "-o", out, "--compiler", COMPILER], true);
-
-// A build under the NULL collector, which never frees, so its `[alloc]` line is every byte the
-// compile allocated — the quantity the null collector's 4 GiB heap caps. The reading is the
-// process's resident growth, and a process that first compiled the seed for this engine reuses
-// the memory that compile freed, reading up to ~30 MB low; one warm build per file run first.
+// Every build runs under the NULL collector, which never frees, so its `[alloc]` line is every
+// byte the compile allocated — the quantity the null collector's 4 GiB heap caps. Fuel counts
+// guest instructions, which the collector does not change, and a compile that never collects
+// spends less CPU on the same count, so one build serves a fuel pair and an allocation pair.
+// The reading is the process's resident growth, and a process that first compiled the seed for
+// this engine reuses the memory that compile freed, reading up to ~30 MB low; one warm build
+// per file run first.
 let nullWarm: Promise<Cost> | null = null;
-const buildNull = async (src: string, out: string): Promise<Cost> => {
+const build = async (src: string, out: string): Promise<Cost> => {
   nullWarm ??= (async () => {
     const dir = await Deno.makeTempDir({ prefix: "vl_scale_warm_" });
     try {
@@ -588,15 +588,22 @@ const fail = (axis: string, bar: number, note: string, reading: string, why: str
   );
 };
 
-// A compile pair: both arms at once, graded on the ratio of their guest fuel.
-const gradeFuel = async (
+// A compile pair's two builds, both arms at once, in a temp dir that is gone when they return.
+const buildPair = async (
   axis: string,
-  bar: number,
-  note: string,
-  many: () => Promise<Cost>,
-  one: () => Promise<Cost>,
-): Promise<number> => {
-  const [m, o] = await Promise.all([many(), one()]);
+  mk: (dir: string) => Promise<[string, string]> | [string, string],
+): Promise<[Cost, Cost]> => {
+  const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis.replace(/[^\w-]+/g, "_")}_` });
+  try {
+    const [manySrc, oneSrc] = await mk(dir);
+    return await Promise.all([build(manySrc, `${dir}/many.wasm`), build(oneSrc, `${dir}/one.wasm`)]);
+  } finally {
+    await Deno.remove(dir, { recursive: true });
+  }
+};
+
+// A compile pair graded on the ratio of its two arms' guest fuel.
+const gradeFuel = (axis: string, bar: number, note: string, m: Cost, o: Cost): number => {
   if (!(m.fuel > 0 && o.fuel > 0)) throw new Error(`${axis}: an arm read no fuel (${m.fuel}, ${o.fuel})`);
   const ratio = m.fuel / o.fuel;
   const reading = `${m.fuel.toExponential(3)} fuel against ${o.fuel.toExponential(3)} ` +
@@ -649,19 +656,8 @@ const gradePair = async (
   note: string,
   mk: (dir: string) => Promise<[string, string]> | [string, string],
 ): Promise<number> => {
-  const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis}_` });
-  try {
-    const [manySrc, oneSrc] = await mk(dir);
-    return await gradeFuel(
-      axis,
-      bar,
-      note,
-      () => build(manySrc, `${dir}/many.wasm`),
-      () => build(oneSrc, `${dir}/one.wasm`),
-    );
-  } finally {
-    await Deno.remove(dir, { recursive: true });
-  }
+  const [m, o] = await buildPair(axis, mk);
+  return gradeFuel(axis, bar, note, m, o);
 };
 
 const twoFiles = (dir: string, many: string, one: string): [string, string] => {
@@ -2243,37 +2239,35 @@ axis(
 // behind a small entry file) filled the heap and trapped the compiler, exit 70 (D3737). These
 // pairs grade the `[alloc]` line, the bytes a null-collector compile allocated, and are GROWTH
 // pairs: `n` against `n/4`, so linear reads under 4 (a fixed cost rides on both arms).
+const gradeAlloc = (axis: string, bar: number, note: string, m: Cost, o: Cost): number => {
+  if (!(m.alloc > 0 && o.alloc > 0)) {
+    throw new Error(`${axis}: an arm printed no \`[alloc]\` line (${m.alloc}, ${o.alloc}): rebuild scripts/vl-host`);
+  }
+  const ratio = m.alloc / o.alloc;
+  const reading = `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${(o.alloc / 2 ** 20).toFixed(1)} MiB ` +
+    `(ratio ${ratio.toFixed(3)})`;
+  if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
+  if (ratio > bar) {
+    fail(
+      axis,
+      bar,
+      note,
+      reading,
+      "(The ratio is of what a null-collector compile allocated, which a table reset per entity " +
+        "multiplies even where fuel does not.)",
+    );
+  }
+  return ratio;
+};
+
 const gradeAllocPair = async (
   axis: string,
   bar: number,
   note: string,
   mk: (dir: string) => [string, string],
 ): Promise<number> => {
-  const dir = await Deno.makeTempDir({ prefix: `vl_scale_alloc_` });
-  try {
-    const [manySrc, oneSrc] = mk(dir);
-    const [m, o] = await Promise.all([
-      buildNull(manySrc, `${dir}/many.wasm`),
-      buildNull(oneSrc, `${dir}/one.wasm`),
-    ]);
-    const ratio = m.alloc / o.alloc;
-    const reading = `${(m.alloc / 2 ** 20).toFixed(1)} MiB allocated against ${(o.alloc / 2 ** 20).toFixed(1)} MiB ` +
-      `(ratio ${ratio.toFixed(3)})`;
-    if (VERBOSE) console.log(`[scaling] ${axis}: ${reading} bar ${bar}`);
-    if (ratio > bar) {
-      fail(
-        axis,
-        bar,
-        note,
-        reading,
-        "(The ratio is of what a null-collector compile allocated, which a table reset per entity " +
-          "multiplies even where fuel does not.)",
-      );
-    }
-    return ratio;
-  } finally {
-    await Deno.remove(dir, { recursive: true });
-  }
+  const [m, o] = await buildPair(axis, mk);
+  return gradeAlloc(axis, bar, note, m, o);
 };
 
 const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [string, string]) =>
@@ -2282,6 +2276,35 @@ const allocAxis = (name: string, bar: number, note: string, mk: (d: string) => [
     ignore: !ENABLED,
     fn: async () => {
       await gradeAllocPair(name, bar, note, mk);
+    },
+  });
+
+// One pair graded on fuel AND allocation, where both axes compile the same two programs. Both
+// verdicts are taken before either throws, so a red on one never hides the other.
+type Bar = { name: string; bar: number; note: string };
+const gradeBoth = async (fuel: Bar, alloc: Bar, mk: (d: string) => [string, string]): Promise<string[]> => {
+  const [m, o] = await buildPair(fuel.name, mk);
+  const red: string[] = [];
+  const verdicts = [
+    () => gradeFuel(fuel.name, fuel.bar, fuel.note, m, o),
+    () => gradeAlloc(alloc.name, alloc.bar, alloc.note, m, o),
+  ];
+  for (const g of verdicts) {
+    try {
+      g();
+    } catch (e) {
+      red.push(e instanceof Error ? e.message : String(e));
+    }
+  }
+  return red;
+};
+const fuelAllocAxis = (fuel: Bar, alloc: Bar, mk: (d: string) => [string, string]) =>
+  shardTest({
+    name: `scaling shape: ${fuel.name}; ${alloc.name}`,
+    ignore: !ENABLED,
+    fn: async () => {
+      const red = await gradeBoth(fuel, alloc, mk);
+      if (red.length > 0) throw new Error(red.join("\n"));
     },
   });
 
@@ -2330,21 +2353,21 @@ allocAxis(
 // D3737: the inline-shape intern's re-entrancy memo, keyed by the shape spelling's symbol id,
 // was dropped after each outermost intern and regrown to the whole id space by the next one.
 // Reads 2.51; master `7529a4ea6` read 8.73, and at 5,000 functions (706 KB) trapped the
-// compiler.
-allocAxis(
-  "allocation: nested inline record types across functions",
-  4.5,
-  "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
-  (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
-);
-
-// D3738: the same shape on FUEL. Every object literal scanned every struct row, field by field,
-// and the type section compared every row with every row for a prefix. Reads 4.61; master
-// `42c4d4c10` read 11.97.
-axis(
-  "nested inline record types across functions (fuel)",
-  6,
-  "A struct-row question is scanning every row (`objLitNameCands`, `structPrefixCands`, compiler/emit_classify.vl; `repRowOfTyStruct`, compiler/emit_rep.vl).",
+// compiler. D3738, the same two programs on FUEL: every object literal scanned every struct
+// row, field by field, and the type section compared every row with every row for a prefix.
+// Reads 4.61; master `42c4d4c10` read 11.97.
+fuelAllocAxis(
+  {
+    name: "nested inline record types across functions (fuel)",
+    bar: 6,
+    note:
+      "A struct-row question is scanning every row (`objLitNameCands`, `structPrefixCands`, compiler/emit_classify.vl; `repRowOfTyStruct`, compiler/emit_rep.vl).",
+  },
+  {
+    name: "allocation: nested inline record types across functions",
+    bar: 4.5,
+    note: "The inline-shape memo (`internInlineShapeTy`, compiler/emit_classify.vl) is being regrown per intern.",
+  },
   (d) => twoFiles(d, genPerFunction(2000, shapeUnit), genPerFunction(500, shapeUnit)),
 );
 
@@ -2559,10 +2582,11 @@ axis(
   (d) => twoFiles(d, genGenericProgram(1600), genGenericProgram(400)),
 );
 
-// THE FUEL GRADER'S CONTROL. The same program at 20x the statements against 1x: twenty times
-// the work by construction, so it must red a 2.5 bar, and only a broken fuel reading (no
-// `[fuel]` line parsed, a constant, both arms metered as one) can pass it. Its many arm is
-// linear, so no compiler improvement can turn it green.
+// THE FUEL AND ALLOCATION GRADERS' CONTROL. The same program at 20x the statements against 1x:
+// twenty times the work by construction, so it must red a 2.5 bar on fuel and on allocation
+// (which reads 4.50: a fixed cost rides on both arms), and only a broken reading (no line
+// parsed, a constant, both arms metered as one) can pass either. Its many arm is linear, so no
+// compiler improvement can turn it green. One pair of builds; each verdict is required alone.
 const genStatements = (n: number): string => {
   const o = ["let acc = 0"];
   for (let i = 0; i < n; i++) fill(o, i, 6);
@@ -2571,38 +2595,21 @@ const genStatements = (n: number): string => {
 };
 
 shardTest({
-  name: "scaling shape: control — twenty times the work reds the fuel grader",
+  name: "scaling shape: control — twenty times the work reds the fuel and the allocation grader",
   ignore: !ENABLED,
   fn: async () => {
-    let red = "";
-    try {
-      await gradePair("fuel control", 2.5, "unreachable: the control exists to fail.", (d) =>
-        twoFiles(d, genStatements(2000), genStatements(100)));
-    } catch (e) {
-      red = String(e);
-    }
+    const note = "unreachable: the control exists to fail.";
+    const red = (await gradeBoth(
+      { name: "fuel control", bar: 2.5, note },
+      { name: "allocation control", bar: 2.5, note },
+      (d) => twoFiles(d, genStatements(2000), genStatements(100)),
+    )).join("\n");
     if (!red.includes("fuel control: the many-entity arm")) {
       throw new Error(
         "the fuel control did not red: 2,000 statements against 100 of the same came in under " +
           `2.5x the guest fuel. The fuel reading has stopped measuring, so every compile axis ` +
           `above is worth nothing — fix the grader, not this case. (${red || "no error"})`,
       );
-    }
-  },
-});
-
-// THE ALLOCATION GRADER'S CONTROL: twenty times the statements must allocate past a 2.5 bar
-// (reads 4.50: a fixed cost rides on both arms), so only a broken `[alloc]` reading passes it.
-shardTest({
-  name: "scaling shape: control — twenty times the work reds the allocation grader",
-  ignore: !ENABLED,
-  fn: async () => {
-    let red = "";
-    try {
-      await gradeAllocPair("allocation control", 2.5, "unreachable: the control exists to fail.", (d) =>
-        twoFiles(d, genStatements(2000), genStatements(100)));
-    } catch (e) {
-      red = String(e);
     }
     if (!red.includes("allocation control: the many-entity arm")) {
       throw new Error(
