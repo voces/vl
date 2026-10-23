@@ -132,7 +132,7 @@ the slice retires.
 | D1 | ref-list slot keyed by type | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
-| D4 | narrowed pins and pin unions | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
+| D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type | 12 | 0 / 0 / 12 | 3 / 9 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
@@ -367,6 +367,20 @@ What each slice changes:
   slice is this one seam, and it carries 15 of the 52 D renders.
 - **D4.** `monoRegisterPinUnion` and `canonUnionKeyOfName` register a narrowed pin's union by its
   type.
+  - Probed and blocked: no entry retired. A side-by-side probe read the spelling and the type at
+    each site over 16,797 files (the self-compile, `tests/**/*.vl` and the distilled corpus).
+  - The five registry renders: at every site some files find no row by type, so the render is
+    the name a new row is minted under. That happens in 243 files at `monoMakeInstanceRetChecked`
+    and in 5 to 30 at each of the other four. Another 4 to 12 files per site find a row by type
+    under a different name: `i32|string` for `string|i32`, `P|i32` for `{x:i32}|i32`, or an
+    alias `U`. Box tags are positional and the name is the instance's TypeRef text, so taking the
+    row's name changes the instance key. Minting by type is D5, and the key is D3.
+  - The six narrowed-pin entries: `wide` is the `monoArgTyName` ladder's spelling and has no
+    type. A type read off the binding is missing in 2,483 files and renders differently in 955.
+    Where the spelling answered, a typed top-level membership test disagreed in 5 files, because
+    a narrowed pin can be a sub-union (`string|null` out of `string|i32|null`,
+    `tests/cases/unions/hole-param-pinned-at-narrowed-string-niche.vl`). The answer is the pin
+    the instance key and `monoAnnPinName` read, so it moves with D3's ladder.
 - **D5.** This is the L6 step-5 remainder. The union registry is asked by type at the 13 files
   that still pass a spelling.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
@@ -378,7 +392,7 @@ What each slice changes:
   with the ruling that requires it.
 
 **Order.** The five A slices and C4 can start today. C1 waits on L1's bind columns. D1 and D2
-come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam.
+come before C3, because C3's walkers feed the ref-list slots. D3 and D4 share the pin seam, and D4 lands after D3 and D5.
 
 ## Verification
 
