@@ -124,7 +124,7 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left; composite renderer measured, no site swaps) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
@@ -313,6 +313,59 @@ What each slice changes:
     type parameter, a newtype brand, function-typed bindings, and a literal-union alias arm.
   - The other disagreements were there before: the `monoUnionRestPin` argument, exact-key nested
     set maps, `void`, an `i64|i32` element row, and a `mapIndexed` literal union.
+
+  **The composite renderer, measured (2026-10-23, master `98345931c`).** The renderer gives a
+  function type its `=>` signature key, an anonymous record its `#anonN` row handle, and any
+  other type `tyToNominalName`. A fourth probe compared it with each walker spelling over
+  16,508 files: `tests/cases`, with one `entry.vl` per module directory, plus the distilled
+  `cells/` and `named/`. 4,076 of those files mint an instance.
+
+  | site | composite exact | another renderer exact | handle or grouping | member order | literal arm | different type | type `-1` or holds a TyVar |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `tvV` vs `letBT` | 8,549 | 50 | 9 | 0 | 3 | 3 | 44 + 14 |
+  | param pin vs `monoSubstInst` | 8,972 | 489 | 36 | 4 | 3 | 30 | 0 + 17 |
+  | return `rs` vs `sub2` | 2,124 | 42 | 11 | 23 | 53 | 12 | 0 + 2 |
+  | let annotation vs `s2` | 817 | 43 | 10 | 2 | 2 | 8 | 0 + 4 |
+
+  The other renderers are `tyToEmitName`, `tyToNominalName` and `arenaEmitName`. "Handle or
+  grouping" also counts the 9 rows where the typed side renders as an empty string.
+
+  **No call site can swap to the renderer.** The renderer matches 93.7% of `rs` and 98.6% of
+  `tvV`. The misses are a property of the SOURCE, not of the type:
+  - A function type is spelled as a `=>` key when a hole binding carried it, and
+    structurally (`(i32)=>i32`) when the source wrote it. Both spellings occur at the same
+    site, so no fixed choice per site matches. This is most of the 489 param rows that
+    another renderer matches.
+  - An anonymous record is spelled the same way, `#anon2` or `{x:i32,y:i32}`, depending on
+    where it came from.
+  - The arena orders a union's members canonically, with `null` last. The spelling keeps the
+    source's order (`K|null|i32`). Box tags are positional, so this is not cosmetic.
+  - The arena folds a subsumed literal arm (`string|"err"` becomes `string`). The spelling keeps
+    it, and `monoPinUnionName` softens it later.
+
+  The 53 rows of different type are the clause-1 risk. Which side is right has not been
+  established by ablation for any of them. Most of them are the first family below:
+  - The typed side loses a nominal name to a structural row. Examples are `Dot[]` and
+    `Circle[]` at `{r:i32}[]`, the `flat-generic-rows` `Rows<Node>` family, the
+    `generic-returned-record-param.vl` records, and D3504's `Rec[]`/`Rec2[]`.
+  - The literal-delivery join: `union-member-widened-delivery.vl` pins `string|i32` where the
+    typed side has `i64|string`.
+  - The bindings of `pin-inferred-from-union-argument.vl` (`i32|null` against `boolean|string`)
+    and `nullable-litunion-arm-of-box-prints.vl` (`string` against `i32|AB|null`).
+  - `type-param-shadows-alias-funcdecl-constructors.vl`: `Inner<string>` against `{w:i32}`.
+  - D10521's apart join at a let (`f64[]|i32[]` against `f64[]`).
+
+  The probe was a scratch build, and nothing in the compiler changed.
+
+  **The revised plan.** Step 1 moves the CONSUMERS of the spelling, not its producers. Each
+  consumer of a substituted spelling (the instance's TypeRef text, its key, `rsC`) takes the
+  typed product, and the composite renderer spells it only where text has to stay. The
+  walkers' 12 entries leave once no consumer reads them.
+
+  Before step 1, ablation has to settle the 53 different-type rows, one family at a time. A
+  family whose typed side is wrong is a typed-column fix. A family whose spelling is wrong is a
+  filed row. The member-order and literal-arm rows need the consumer to key on the type, which
+  is D3's instance key.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
