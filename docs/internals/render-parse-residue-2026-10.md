@@ -129,7 +129,7 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 4 retired, 12 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 2 retired, 15 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 9 retired, 21 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -391,8 +391,11 @@ What each slice changes:
     gate asks for a list element, not a row, so it declines where the spelling did, in
     `narrowed-place-arm-delivery.vl`. 220 files reach it, and the self-compile builds
     byte-identical.
+  - Done, 0 differing modules: 1 render. The `__array_new__` destination (`anDst`) is keyed by
+    the destination's element type at the instance's pins. 13 of the 40 files that reach it
+    answer differently in some emit pass, either a shape-spelled duplicate row or the same slot
+    under another name. All 13 build byte-identical modules and run the same.
   - Left in `emit_classify`: the arms where the typed lookup misses or names another row.
-    - Fills and generic pins reach `$m` rows the type does not: `anDst`, 7 of 40.
     - Some rows do not exist yet, because the caller interns them under the name: `fill` and
       the `.map` result (`mfListResultElemName`).
     - The struct-list mv arm finds the same slot under a structural name in 24 of 206 files, and
