@@ -120,12 +120,12 @@ the slice retires.
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
 | A1 | shape-row typed twins | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
-| A2 | emit_mono typed tests | 9 | 9 / 0 / 0 | 3 / 6 | `emit_mono` |
+| A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (landed: 2 retired, 1 to B, 6 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
-| C2 | instance cell signatures typed | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
+| C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
@@ -155,9 +155,15 @@ What each slice changes:
   rows are class C, because a generic alias parameter is not a `TyVar` in the arena. The
   `rlElemNicheNullable` twin regressed D4721, so that row stays. Each row's `status` has the
   probe counts.
-- **A2.** These `emit_mono` predicates test the type they hold instead of rendering it:
-  `monoNicheNulListCheck`, `monoModuleLetTyIs`, `monoModuleDupPin`, `monoRetOfClosureCall`,
-  `monoPreBindPastUnionRest` and `monoCloPinListAnn`.
+- **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
+  - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
+    with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
+    is a union. That retires 2 renders and 1 parse. `monoCloPinListAnn` now records its text
+    beside `mkArrayTy(ety)`, so its render moves to B.
+  - Left: `monoNicheNulListCheck`'s two annotation parses stay A. The arena keeps a type
+    parameter that shadows an alias where the canon spelling has erased it, so the typed test
+    refuses a fixture that runs. Its two bound-pin tests and `monoRetOfClosureCall` are C. The
+    pin there is text, or `-1` for an un-annotated hole parameter, until C1 binds by type.
 - **A3.** Each typed rung of the `emit_collect` field-hint ladders and the `collectATypeRef` ladder
   reads the arena, and the `emit_classify` rung reads the rl-slot columns. Hazard: the
   `collectATypeRef` chain is order-dependent, so its rungs move together.
@@ -175,8 +181,10 @@ What each slice changes:
   member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
   `monoSubstAnn`, `monoBindOf` and their kin bind by type.
-- **C2.** `monoSlotSig` and `monoSigFnTyName` carry the instance cell's function type, not only
-  its spelling.
+- **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
+  sites whose cell spelling is a function type. Every producer of that spelling is text
+  (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSig`), so the change cannot
+  stay inside `emit_mono`. It follows C1.
 - **C3.** The `emit_shape_intern` walkers take the field type alongside the field text.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds.

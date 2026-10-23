@@ -42,7 +42,6 @@ import {
   nameIsParenOpen,
   nameIsParenSpanEnds,
   peelGroupParens,
-  unionMemberCount,
 } from "./tyname"
 import { njSetPinFn, nodeRepTyIxOf, pinResolvedFnTy } from "./check_core_state"
 import {
@@ -841,21 +840,26 @@ function monoModuleLetOf(name: string, fnIx: i32) {
   moduleLocalLetOfUnique(emitRootIx, name)
 }
 
-// Does the module-block binding at `letIx` carry `want`, the emit name of what the checker
-// recorded for a call site? Both of the binding's spellings answer: an alias puts `Box` on
-// the annotation and the inline shape on the initializer, and only one renders as `want`.
-function monoModuleLetTyIs(letIx: i32, want: string) {
-  if want == "" { return false }
+// Does the module-block binding at `letIx` carry `want`, the type the checker recorded for a
+// call site? Both of the binding's types answer: an alias puts `Box` on the annotation and
+// the inline shape on the initializer, and either may be the one the site holds.
+function monoModuleLetTyIs(letIx: i32, want: i32) {
+  if want < 0 { return false }
   const gd = nodeAt(letIx)
   if gd is LetDecl {
-    if gd.letType >= 0 {
-      if tyNameOf(gd.letType) == want { return true }
+    if gd.letType >= 0 && monoModuleTyIs(nodeTyIxOf(gd.letType), want) {
+      return true
     }
-    if gd.letInit >= 0 {
-      if tyToEmitName(nodeTyIxOf(gd.letInit)) == want { return true }
+    if gd.letInit >= 0 && monoModuleTyIs(nodeTyIxOf(gd.letInit), want) {
+      return true
     }
   }
   false
+}
+
+// Whether a binding's type `t` is the site's type `want`, as their spellings would agree.
+function monoModuleTyIs(t: i32, want: i32): boolean {
+  t >= 0 && (t == want || tySameSpelled(t, want, TY_WALK_DEPTH))
 }
 
 // The pin a module-block binding gives, or "" — its annotation, else its initializer's own
@@ -882,7 +886,7 @@ function monoModuleDupPin(name: string, fnIx: i32, siteIx: i32) {
   const cands: i32[] = []
   moduleLocalLetAll(emitRootIx, name, cands)
   if cands.length < 2 { return "" }
-  const want = tyToEmitName(nodeTyIxOf(siteIx))
+  const want = nodeTyIxOf(siteIx)
   let i = 0
   while i < cands.length {
     if monoModuleLetTyIs(cands[i], want) {
@@ -2934,7 +2938,7 @@ function monoCloPinListAnn(initIx: i32): i32 {
     }
     const en = tyToEmitName(ety)
     if en == "" { return -1 }
-    return synthTypeRef("(" + en + ")[]", 0 - 1)
+    return synthTypeRefTy("(" + en + ")[]", 0 - 1, mkArrayTy(ety))
   }
   -1
 }
@@ -20541,6 +20545,7 @@ function monoPreBindPastUnionRest(
   while i < params.length && i < args.length {
     let ann = ""
     let act = ""
+    let isUnion = false
     const p = nodeAt(params[i])
     if p is Param {
       if p.parType >= 0 {
@@ -20548,11 +20553,16 @@ function monoPreBindPastUnionRest(
         if nodeTyIsFunc(p.parType) || !monoAnnHasTyParam(ann, typarams) {
           ann = ""
         }
+        const pt = nodeTyIxOf(p.parType)
+        if pt >= 0 && pt < T.tys.length {
+          const ptt = tyAt(pt)
+          isUnion = ptt is TyUnion || ptt is TyNullable
+        }
       }
     }
     // Only a union annotation can defer, so only its argument is spelled here: a pin name
     // renders the whole argument type, which a wide type makes dear.
-    if ann != "" && unionMemberCount(ann) > 1 {
+    if ann != "" && isUnion {
       act = monoPreBindArgName(args[i], ctx)
       if act != "" && monoPinDefers(ann, act, typarams) { any = true }
     }
