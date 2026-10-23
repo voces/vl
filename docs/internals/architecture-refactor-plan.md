@@ -459,6 +459,14 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - `hole-fn-join-handed-hole-fn` matrix: 46 of 46, 0 runs→not-runs, 0 silent, 0 traps against master's seed.
     - difftree `--identity`: fixpoint identical; 175 of 16,485 files differ, all `d3125` cells and the two new pins. Of those, 153 move class and 20 already ran (an `i32 | string` element, now returned as its nullable) with unchanged output.
     - cases_wasm: 6,069 passed.
+- **2026-10-23, a list or an `if` value mixing a function with an annotated function parameter and a hole function runs.** D10790 (clause 2) closes.
+  - The list takes its element type from the closed element, so a call through it passes a closed argument and reaches no open-call rung. Nothing instanced the hole function, and it was emitted as its raw template (`call to unknown function` in its body).
+  - `monoCoerceListLitElems` (emit_mono.vl) instances each generic element of a list literal at the literal's closed element type when a non-generic sibling is present. `monoCoerceIfArms` does the same for an `if` value's generic arm.
+  - Residue: an `if` whose then-arm is the hole function takes the open type for the whole join (D10797).
+  - Gates:
+    - `regress.vl`: no cell changed class.
+    - difftree `--identity`: fixpoint identical; 6 of 16,491 files differ, the five new pins and `generic-call-and-generic-listed-pushed.vl`, whose `id` instance is now made at the list (functions reordered, one duplicate table slot gone, same output).
+    - cases_wasm: 6,080 passed.
 
 ### L2 log
 
