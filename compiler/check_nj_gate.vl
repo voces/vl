@@ -34,15 +34,29 @@ export function njGateReset() {
   njGateSeen = 0
 }
 
-// Whether every join in function `fx` is master's: it is read by value, or mentioned in a lambda
-// body or in another generic or hole body (`njGateScan`).
+// Whether every join in function `fx` is master's: a generic or hole function read by value, or
+// mentioned in a lambda body or in another generic or hole body (`njGateScan`). A top-level
+// function with no type parameter and no hole has one signature wherever it is read, so never.
 export function njFnReached(fx: i32): boolean {
   if fx < 0 || fx >= P.nodes.length { return false }
   const fn = P.nodes[fx]
   if !(fn is FuncDecl) { return false }
   if fn.fnName == "" { return true }
+  if !njDeclOpen(fn) && (fnDeclIx.get(fn.fnName) ?? -1) == fx { return false }
   if !njGateScanned { njGateScan() }
   njGateNames.get(fn.fnName) ?? false
+}
+
+// Whether `fn` has a type parameter or a parameter with no declared type.
+function njDeclOpen(fn: FuncDecl): boolean {
+  if fn.fnTyParams.length > 0 { return true }
+  for pi in fn.fnParams {
+    const pn = P.nodes[pi]
+    if pn is Param {
+      if pn.parType < 0 { return true }
+    }
+  }
+  false
 }
 
 // Records every name read other than as a call's callee or as a member, every name or member
@@ -68,24 +82,17 @@ function njGateScan() {
     } else if n is Ident {
       reads.push(i)
     } else if n is FuncDecl {
-      let open = n.fnTyParams.length > 0
-      for pi in n.fnParams {
-        const pn = P.nodes[pi]
-        if pn is Param {
-          if pn.parType < 0 { open = true }
-        }
-      }
       if n.fnName == "" {
         njGateBody(n.fnBody)
-      } else if open {
+      } else if njDeclOpen(n) {
         openNames.push(n.fnName)
         openBodies.push(n.fnBody)
-        njGateHelpers(n.fnBody, n.fnName)
       }
     }
     i = i + 1
   }
   njGateSeen = P.nodes.length
+  njGateHelpers(openNames, openBodies)
   for r in reads {
     if r >= callee.length || callee[r] == 0 {
       const rn = P.nodes[r]
@@ -111,23 +118,88 @@ function njGateScan() {
   0
 }
 
-// Records each name body `ix` mentions other than its own function `self`, which each pin
-// re-checks with the body, and a helper `njHelperShapeOk` admits.
-function njGateHelpers(ix: i32, self: string) {
-  const todo: i32[] = [ix]
-  while todo.length > 0 {
-    const at = todo.pop() ?? -1
-    if at >= 0 && at < P.nodes.length {
-      const nm = njMentionAt(at)
-      if nm != "" && nm != self && !njHelperShapeOk(nm) {
-        njGateNames[nm] = true
+// Records each name the body `bodies[k]` of open function `names[k]` mentions other than a
+// function in a cycle of open calls back to it, whose call each pin re-checks with the body, and
+// a helper `njHelperShapeOk` admits.
+function njGateHelpers(names: string[], bodies: i32[]) {
+  const ixOf: {[string]: i32} = Map()
+  let k = 0
+  while k < names.length {
+    if !(ixOf.has(names[k])) { ixOf[names[k]] = k }
+    k = k + 1
+  }
+  // Each open body's mentions, and as `edges` the open functions among them.
+  const ments: string[][] = []
+  const edges: i32[][] = []
+  for b in bodies {
+    const ms = njBodyMentions(b)
+    const es: i32[] = []
+    for nm in ms {
+      const t = ixOf.get(nm) ?? -1
+      if t >= 0 { es.push(t) }
+    }
+    ments.push(ms)
+    edges.push(es)
+  }
+  // `reach[t]`, once computed, flags each open function a call chain from `t` mentions.
+  const reach: boolean[][] = []
+  for _ in names { reach.push([]) }
+  k = 0
+  while k < names.length {
+    for nm in ments[k] {
+      if !njHelperShapeOk(nm) {
+        const t = ixOf.get(nm) ?? -1
+        let cyc = false
+        if t >= 0 {
+          if reach[t].length == 0 { reach[t] = njReachFrom(t, edges) }
+          cyc = reach[t][k]
+        }
+        if !cyc { njGateNames[nm] = true }
       }
-      for k in nodeChildren(at) {
-        if k >= 0 { todo.push(k) }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Every open function the open function `s` reaches through `edges`, itself included.
+function njReachFrom(s: i32, edges: i32[][]): boolean[] {
+  const seen: boolean[] = __array_new__(edges.length, false)
+  seen[s] = true
+  const todo: i32[] = [s]
+  while todo.length > 0 {
+    const at = todo.pop()
+    if at >= 0 && at < edges.length {
+      for t in edges[at] {
+        if !seen[t] {
+          seen[t] = true
+          todo.push(t)
+        }
       }
     }
   }
-  0
+  seen
+}
+
+// Each name body `ix` mentions (`njMentionAt`), once.
+function njBodyMentions(ix: i32): string[] {
+  const out: string[] = []
+  const had: {[string]: boolean} = Map()
+  const todo: i32[] = [ix]
+  while todo.length > 0 {
+    const at = todo.pop()
+    if at >= 0 && at < P.nodes.length {
+      const nm = njMentionAt(at)
+      if nm != "" && !(had.has(nm)) {
+        had[nm] = true
+        out.push(nm)
+      }
+      for c in nodeChildren(at) {
+        if c >= 0 { todo.push(c) }
+      }
+    }
+  }
+  out
 }
 
 // Whether top-level function `name` yields only its own parameters, each through `return` or a
