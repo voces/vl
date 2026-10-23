@@ -126,7 +126,7 @@ the slice retires.
 | A5 | union-atom and atom-kind twins (landed: 4 retired, 3 deferred to after C1, 5 left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
-| C3 | shape-intern walkers take field types (landed: 4 retired, 12 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
+| C3 | shape-intern walkers take field types (landed: 9 retired, 7 left) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 4 retired, 13 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
@@ -327,13 +327,22 @@ What each slice changes:
     `iisPushFieldElem` asks the field row it projects (669 files, 0 differ). Two grids of
     closure results, 34 nested-leaf cells and 11 closure-field cells, built the same output on
     both seeds, and difftree --identity found 0 of 16,451 files differ.
-  - Left: 12. Four reach with no type: `internShapeArms` in 264 files, and
-    `shapeFieldsRideTyParam`'s three in 201 (its nullable peel also differs in 1). Three
-    differ: `internShapeDeepTy`'s paren-closure and nullable peels in 206 and 234 files, and
-    `internFuncTypeShapesTy`'s nullable peel in 11. `internShapeDeepTy`'s arrow test agrees but
-    1 file has no type. The other four produce a name the walk keys: the `internShapeDeepOfTy`
-    render, the arm split (2 files differ), the map-value name (1 differs), and
-    `structElemArrayLowerable`'s base name.
+  - Done in a second landing: 5 parses, over 16,864 files. `internShapeArms` tests
+    `tyIsFuncArena` of the arm's type, and finds an uncovered row's arms by `setTy`'s key
+    (`unionMemberTysOfAB`): 990 agree, 0 differ, and the 2 that reach with no type build
+    byte-identical modules. The value-union arm loop in `internShapeDeepTy` tests the covered
+    arm's type the same way (59 agree, 0 differ, 1 with no type builds the same module).
+    `shapeFieldsRideTyParam` reads the field's arena type, a type parameter as its element's
+    spine leaf or as a nullable element's inner, which retires its three parses: 499 agree,
+    and all 201 with no type answered false by spelling too. The 1 that differs,
+    `error-param-shadow-tyaram-nullable-elem.vl`, keeps the `RLK_UNION` guard. A `T[]` field
+    whose `T` shadows a declared record no longer mints that record's shape, so its module
+    differs and its output does not (`param-shadow-tyaram-array-elem.vl`). Three clause-2
+    refusals the type-parameter grids met are D10880, D10881 and D10882.
+  - Left: 7. Three differ: `internShapeDeepTy`'s paren-closure and nullable peels in 206 and
+    234 files, and `internFuncTypeShapesTy`'s nullable peel in 11. The other four produce a
+    name the walk keys: the `internShapeDeepOfTy` render, the arm split (2 files differ), the
+    map-value name (1 differs), and `structElemArrayLowerable`'s base name.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal
