@@ -4,6 +4,7 @@
 import { FieldInit, ObjLit, nodeAt } from "./ast"
 import { fieldNameOrder } from "./check_obj_shape"
 import {
+  arrSpineLeafTy,
   isValueUnionName,
   nameIsInlineLitUnion,
   nameIsLitUnionType,
@@ -42,13 +43,11 @@ import {
   mapValNameOf,
   nameIsClosureArray,
   nameIsElemArray,
-  nameIsI32Array,
   nameIsLitUnionArray,
   nameIsMap,
   nameIsShapeSpanEnds,
   normTypeAtom,
   nullablePartOf,
-  parenUnionArrElemName,
   shapeInnerFieldSplit,
 } from "./emit_base"
 import { emitFail } from "./emit_bytes"
@@ -89,7 +88,6 @@ import {
   elemNameIsNominal,
   fieldTypeIsDeferred,
   fieldTypeRefusalMsg,
-  fnTyParamName,
   forceScalarListField,
   gaeArgIsTyParam,
   genAppRidesTyParam,
@@ -97,7 +95,6 @@ import {
   nameFieldCode,
   nameIsConcreteGenAppDecl,
   nameIsGenAppDecl,
-  nameIsRefArray,
   nameIsStructDecl,
   nulRefListFieldCodeOfTy,
   refArrElemName,
@@ -208,22 +205,28 @@ export function nameFieldCodeTy(t: string, ty: i32): i32 {
 // `internShapeDeep` — the shared body of the paren-free and paren-carrying splits. The bare
 // `{` opener test at index 0 is the one grammar character-test this file keeps, since no
 // existing brace-family predicate covers a bare `len >= 1` opener test.
-function internShapeArms(set: string, arms: string[]) {
+function internShapeArms(set: string, arms: string[], setTy: i32) {
   // Arena hand-over: `arms` is `splitUnionAtoms(set)`, and `unionMemberTysOf` appends the
   // row's member types in exactly that order by construction, since a multi-arm `set`
-  // reaches `unionRowOf` through the row whose recorded set spelling is this string. An
-  // uncovered row leaves every arm at -1, so the unhinted call is unchanged.
+  // reaches `unionRowOf` through the row whose recorded set spelling is this string. A row
+  // the spelling misses is found by `setTy`'s key instead.
   const armTys: i32[] = []
   let cov = unionMemberTysOf(set, armTys)
   if armTys.length != arms.length { cov = false }
+  const abTys: i32[] = []
+  let abCov = false
+  if !cov && setTy >= 0 { abCov = unionMemberTysOfAB(10, set, setTy, abTys) }
+  if abTys.length != arms.length { abCov = false }
   let uai = 0
   while uai < arms.length {
     let armTy = -1
     if cov { armTy = armTys[uai] }
+    let fnTy = armTy
+    if abCov { fnTy = abTys[uai] }
     const uCore = arrLeafNameOf(arms[uai])
     if uCore.length >= 1 && uCore[0] == '{' {
       internShapeDeepTy(arms[uai], armTy)
-    } else if annArrowAt(normTypeAtom(uCore)) >= 0 {
+    } else if tyIsFuncArena(tyStepArrRun(fnTy, arms[uai], uCore)) {
       // A closure arm: the inline shapes buried in its params or result are otherwise
       // unreachable, since the arm is one spelling inside the union name. Routed through
       // the soundness-gated functype interner, which keeps an unsupported-field shape
@@ -299,11 +302,10 @@ export function internShapeDeepTy(nm: string, ty: i32) {
       if vTys.length != vArms.length { vCov = false }
       let va = 0
       while va < vArms.length {
-        const vc = normTypeAtom(vArms[va])
-        if annArrowAt(vc) >= 0 {
-          let vTy = -1
-          if vCov { vTy = vTys[va] }
-          internFuncTypeShapesTy(vc, vTy)
+        let vTy = -1
+        if vCov { vTy = vTys[va] }
+        if tyIsFuncArena(vTy) {
+          internFuncTypeShapesTy(normTypeAtom(vArms[va]), vTy)
         }
         va = va + 1
       }
@@ -331,7 +333,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
     if unionSetMemberCount(nm) > 1 {
       const uArms: string[] = []
       unionSetAtomsOf(nm, uArms)
-      internShapeArms(nm, uArms)
+      internShapeArms(nm, uArms, ty)
       return 0
     }
   } else {
@@ -339,7 +341,7 @@ export function internShapeDeepTy(nm: string, ty: i32) {
     if unionSetMemberCount(nm) > 1 {
       const pArms: string[] = []
       unionSetAtomsOf(nm, pArms)
-      internShapeArms(nm, pArms)
+      internShapeArms(nm, pArms, ty)
       // Returns, exactly as the paren-free branch does: the arms below (array, map, and
       // inline-shape peels) would otherwise treat a top-level `|` name as the composite its
       // first arm happens to be — `{[string]:()=>i32}|{w:i32}|null` claimed by `nameIsMap`,
@@ -632,10 +634,15 @@ function internShapeFieldElemsTy(nm: string, ty: i32) {
   0
 }
 
-// True if any raw field-type text in `rawTexts` names a declared generic type parameter as
-// an array element (`T[]`, or a paren-grouped nullable union arm), declining to mint
-// a shape row before the parameter is substituted.
-function shapeFieldsRideTyParam(rawTexts: string[]) {
+// True if any field of shape `tyIx` (raw names `rawNames`, texts `rawTexts`) holds a generic
+// type parameter as an array element (`T[]` at any depth, or `(T | null)[]`), declining to
+// mint a shape row before the parameter is substituted. A field with no arena type answers
+// false.
+function shapeFieldsRideTyParam(
+  rawTexts: string[],
+  rawNames: string[],
+  tyIx: i32,
+) {
   if genTyParamNames.length == 0 && gaeBases.length == 0 { return false }
   let gp = 0
   while gp < rawTexts.length {
@@ -644,23 +651,17 @@ function shapeFieldsRideTyParam(rawTexts: string[]) {
     // interns it, so a row coding it as a struct ref has no heap to point at (D4556).
     const ga = arrLeafNameOf(nonNulBaseOf(t))
     if nameIsGenAppDecl(ga) && genAppRidesTyParam(ga, 8) { return true }
-    const tArr = nameIsArray(t)
-    if tArr && !nameIsI32Array(t) && !nameIsRefArray(t) {
-      if fnTyParamName(arrLeafNameOf(t)) { return true }
-    }
-    // The paren-grouped element `(T | null)[]`: `refArrShapeKind`'s paren-union fall-through
-    // is unconditional, so `nameIsRefArray` is true and `rlInternName` would resolve the
-    // unregistered `T | null` onto struct row 0 — invalid at run. `refArrShapeKind` answers 1
-    // for a resolved nullable-struct element, so skip only on kind 2; every resolved kind keeps its row.
-    if tArr && !nameIsI32Array(t) {
-      const pu = parenUnionArrElemName(t)
-      if pu != "" {
-        const nn = nullablePartOf(pu)
-        if nn != "" {
-          if fnTyParamName(nn) {
-            if refArrShapeKind(t) == RLK_UNION { return true }
-          }
-        }
+    let fTy = -1
+    if tyIx >= 0 { fTy = tyFieldTyOf(tyIx, rawNames[gp]) }
+    const eTy = tyStepElem(fTy)
+    if eTy >= 0 {
+      if tyAt(arrSpineLeafTy(eTy)) is TyVar { return true }
+      // `(T | null)[]`: `refArrShapeKind`'s paren-union fall-through is unconditional, so
+      // `rlInternName` would resolve the unregistered `T | null` onto struct row 0, invalid
+      // at run. A declared `T` the parameter shadows resolves to kind 1 and keeps its row.
+      const nTy = nullableInnerOrNone(eTy)
+      if nTy >= 0 && tyAt(nTy) is TyVar && refArrShapeKind(t) == RLK_UNION {
+        return true
       }
     }
     gp = gp + 1
@@ -1060,7 +1061,7 @@ function internInlineShapeTyGo(nm: string, tyIx: i32, fieldsTy: i32) {
   // alias declares none, so it must not be interned: without this a type-parameter array
   // field resolved to "" and `pushFieldStorage` read `rlWrapIdx[-1]`, a compiler crash.
   // Skipping is right because the original is replaced by its instances, never emitted.
-  if shapeFieldsRideTyParam(rawTexts) { return -1 }
+  if shapeFieldsRideTyParam(rawTexts, rawNames, tyIx) { return -1 }
   const names: string[] = []
   const codes: i32[] = []
   const texts: string[] = []
