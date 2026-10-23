@@ -1008,3 +1008,89 @@ held (`lib.vl`), 0 pairs differ.
 - **The band rank table**, as §15 says: it is graded on behaviour at the switch-over.
 - **The runtime helpers** are one set per program. The runtime is keyed by that set or
   rebuilt at every link.
+
+## 17. Step 6, second part: the runtime helpers' keys
+
+**The set stays program-level.** A scratch build listed every runtime function and its
+callers in the 4,893 armed tests/cases builds at #4492: 32,733 functions.
+
+| caller | functions |
+| --- | ---: |
+| none | 16,468 |
+| the start function (`rt#0`) | 4,890 |
+| at least one artifact | 4,207 |
+| only other runtime functions | 7,121 |
+| only the tail | 47 |
+
+The 16,468 that nothing calls are the shared helpers a flag turns on, for example
+`__utf8_cplen__` (3,464), `__utf8_enc__` (3,462), `__str_concat__` (3,151), `__str_hash__`
+(3,059) and `__str_eq__` (2,578). A flag is set by a program fact, so the set cannot be rebuilt
+from what the artifacts call. Link keeps it as one runtime per program.
+
+**What moved: the keys.** An artifact names a runtime helper by key, and three helper families
+carry a program-wide row number in their name: `__map_set_<row>__` and
+`__map_compact_<row>__` number a map by the order the program's map value types were met, and
+`__eq_<si>__` numbers a wide record compare by the order its heap types were minted. A module
+shared by two programs could therefore name `__map_set_3__` in one and `__map_set_4__` in the
+other for the same map. `elRtRowKeys` now keys each by what its row serves:
+
+- a map row by its key kind and value type, the band table's key (`__map_set__@str`,
+  `__map_set__@i32`, `__map_set__@<kind>:<value>`, `__map_set__@i64`);
+- an eq row by its record's canonical type key (`typeOrderMintedKey`, since `sHeapIdx` holds
+  minted indices). Two rows over one heap type keep their numbers.
+
+The emitted module does not change: keys live in the `vl.link` section only.
+
+**Proof.** The armed builds are at #4492. The tests/cases rows include the witness's two
+builds.
+
+| set | builds | artifacts | functions | body references | sections differ | bodies differ | unresolved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 scripts, master | 8 | 99 | 2,320 | 88,931 | 0 | 0 | 0 |
+| 8 scripts, this change | 8 | 99 | 2,320 | 88,931 | 0 | 0 | 0 |
+| tests/cases, master | 4,906 | 5,877 | 85,113 | 901,353 | 0 | 0 | 0 |
+| tests/cases, this change | 4,906 | 5,877 | 85,113 | 901,353 | 0 | 0 | 0 |
+
+The 8 scripts are §16's. In every row nothing is defined twice and no row is left unconsumed.
+
+Invariance:
+
+- **The 8 scripts:** the same as master and §16, 23 keys held and 1 pair differs
+  (`std:array`, from its generic bodies).
+- **tests/cases:** 4,681 pairs differ against master's 4,682. The one that left is
+  `modules/runtime-helper-keys/store.vl`. The rest are the empty path of a single-file
+  program's main module, or same-named files in unrelated directories.
+- **Runtime references only**, over the 93 functions with a non-empty path that two or more
+  builds hold: master names a different helper sequence in 10 of them, this change in 8. The
+  8 call a different helper SET per program. For example `std:fmt`'s `bnBitLen` calls
+  `__as_fail__` in 290 builds and `__sv_get_0__` in 2, and `std:json`'s `renderInto` calls
+  `__map_resync__` in 2 of 19. Those are body differences, which a key cannot remove. The
+  8 are `lib/census-read.vl`'s `grading` and `manifestCoords`, `lib/corpus.vl`'s `audit`,
+  `dumpCells`, `prune` and `sourceNames`, `std:fmt`'s `bnBitLen`, and `std:json`'s
+  `renderInto`.
+
+**The witness and the control.** `tests/cases/modules/runtime-helper-keys/` has two roots
+that share `store.vl`, which sets a map of records and compares two records wide enough
+(more than 32 leaf fields) for an `__eq_<si>__` helper. `entry2.vl` loads `other.vl` first,
+which has a map and a wide compare of its own, so every one of `store.vl`'s row numbers moves.
+The control keeps the numbered names (`rows[nm]` replaced by `nm`). Both link with 0
+differing. Invariance over the two roots: this change reads 0 pairs differing, and the
+control reads 1 (`store.vl`).
+
+**Gates.**
+
+- **Identity:** difftree `--identity` reads 16,445 files, 11,436 built, 0 differ and 0
+  uncompared.
+- **Seed:** the fixpoint holds, at 5,693,390 bytes (master 5,691,815, +0.03%).
+- **plumb-shape cost:** passes, with main fuel −3.0%, tail fuel −3.2% and RSS −2.0% against
+  its baseline.
+- **L2 guest fuel**, one run each on this source: the master seed 89,000,105,652 and the new
+  seed 89,000,105,782 (+130 instructions).
+
+**What is left of step 6.**
+
+- **The runtime's order.** Link still takes the runtime functions in the program's order.
+  Rebuilding that order from the artifacts is tied to the runtime's positional signatures
+  (`LinkProg.runtime.sigs` and the `F:rt#n` type keys), so it moves with the group types.
+- **The 8 functions above**, whose helper set depends on the program.
+- §16's twins, group types, literal-type texts and band rank table are unchanged.
