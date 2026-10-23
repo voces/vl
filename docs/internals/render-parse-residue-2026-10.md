@@ -129,7 +129,7 @@ the slice retires.
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
-| D1 | ref-list slot keyed by type (landed: 10 retired, 20 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
+| D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
@@ -458,6 +458,23 @@ What each slice changes:
       callers intern under that name.
     - Taken whole, `refListSlotOfExpr`'s answer differs from the typed slot in 1,475 of the
       4,319 files that reach it. The spelling does not stand for one type-keyed row.
+  - Done, 0 differing files: 1 parse. The nullable ref-array parameter arm's gate in
+    `refListElemNameOfIdent` asks `annNulRefArrSlot` of the annotation node, so a mono
+    instance's grouped `(i32[][]|null)` needs no peel. 21 files reach it, the spelling's gate
+    never declined, and the typed gate agreed in all 21.
+  - Moved, no entry retired yet: four of `refArrElemNameIf`'s five callers
+    (`fnAssignCellElem`, `letRefListElemName`, `paramRefArrayName`, `retRefArrElemName`) read
+    `annBareRefArrElemName(node)`, the stored name of the row keyed by the annotation's element
+    type. Over the self-compile and 16,872 fixture and corpus files, they reach 1, 244, 1,287 and
+    8,022 files. The names differ in 5, 34 and 181 of the last three, almost all the same slot
+    under another name. The slot differs at 5 site-file pairs, and at 6 only one side found a
+    row. The identity diff over 16,500 files finds one differing module,
+    `memory/newtype-struct-reflist-key-population.vl`: two locals of the top-level function
+    are declared in the other order, with the same types and code, and it prints the same output.
+  - Left: the fifth caller, `unionClosureArrElemUnion`, holds split union atoms with no node. It
+    is reached in 61 files and answers "" in all 61, and its originating fixture is now served
+    by an earlier arm, so no program shows what a typed answer must equal. In 19 of the 61 the
+    name has no recorded member set. `refArrElemNameIf`'s D2 entry goes with this caller.
   - Left elsewhere:
     - `synthEmptyListAnn`'s `string|null` element has no ref-list row (3 of 4 files).
     - `rlMapElemValSlot`'s fall-through is live in 115 files.
@@ -502,8 +519,9 @@ What each slice changes:
       callers, `mapValKindLowerable`, is called from `emit_shape_intern`, which holds no type.
       These wait on D8.
     - `refArrElemNameIf` and every caller of the ladder want an element name to key the
-      name-keyed ref-list slot. `refArrElemKind` also derives its kind from the spelling, so it
-      matches the annotation side. This group waits on D1.
+      name-keyed ref-list slot. D1 has since moved four of `refArrElemNameIf`'s five callers to
+      the type, leaving `unionClosureArrElemUnion`. `refArrElemKind` also derives its kind from
+      the spelling, so it matches the annotation side. This group waits on D1.
     - `refArrShapeKind` is also called from `emit_shape_intern` 663.
 
     So the ten ladder-internal entries (`refArrShapeKindGo`, `nameIsRefArrayGo`,
