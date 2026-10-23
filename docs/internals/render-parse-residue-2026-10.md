@@ -528,15 +528,22 @@ What each slice changes:
     `X | null` slot. It was reached in 769 files and differed in 0. `narrowedRefArrayOf`'s second
     rung asks `tyIsRefArray` of the banked type. It was reached in 1,180 files and differed in 0.
     The render it returns is the row's name, so it moves to B.
-  - Left: `narrowedRefArrayOf`'s first rung. In 19 files the slot has no type while its spelling
-    is a ref list (`i32[][][]` cells), and in 4 more the spelling is an alias the type renders
-    differently (`VArr`, `JsonArr`).
+  - Banked, nothing retired: the two niche narrows in `pushIndexNicheNarrow` now push the peeled
+    element type beside the spelling. This closes the first rung's no-type leg: 976 of the
+    2,002 reaching files have no banked type, and the old answer is "" in all of them. All 16,451
+    identity files compile exactly as before.
+  - Left: `narrowedRefArrayOf`'s first rung. With a type, returning the spelling still differs in
+    4 files, where it is an alias the program wrote (`VArr`, `JsonArr`) or `(readonly i32[])[]`.
+    Both typed renderings do worse: `tyToEmitName` differs in 46 files, because a record renders
+    by shape, and the ref-list row name differs in 37.
   - Left: `setAtomSpelling`. The struct narrow set's member-set id does not cover the spelling in
     23 of 87 files, which are generic pins, unions of maps and an alias. In 1 more file, a rolled
     recursive arm, the typed gate answers differently.
-  - Left, not probed: the producers (`removeAtomFromGo`, `indexElemNulRefArrayName`,
+  - Left: the producers (`removeAtomFromGo`, `indexElemNulRefArrayName`,
     `pushIndexNicheNarrow`, `pushIndexMapNullNarrow` and `litElseSurvName`). They write the
-    spelling that the two readers above still read. `narrowedMapOf`'s render is the mv slot's
+    spelling that the two readers above and the `narrowVariantFor` callers still read.
+    `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74 files,
+    where the complement has no member-set id, and it changes the spelling in 55 of them. `narrowedMapOf`'s render is the mv slot's
     key, so it goes with D8.
 - **D8.** The mv-slot, closure-signature and field-companion tables are keyed by type. The
   `emit_classify` arm mint withholds its type on purpose (D34), so that entry moves only together
