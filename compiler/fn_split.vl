@@ -15,6 +15,7 @@ import {
   Call,
   CharLit,
   FieldInit,
+  ForIn,
   FuncDecl,
   Ident,
   IfStmt,
@@ -86,6 +87,12 @@ let fsAsks: i32[] = []
 let fsTpAsks: i32[] = []
 // The refused calls through a function value handed a generic function (D7183).
 let fsCallAsks: i32[] = []
+// The `const` lists of functions called through at two function types (D10701), and each read
+// `flRead` of list `flDecl` a call goes through, with the type `flKey` it takes ("!" for two).
+let fsListAsks: i32[] = []
+let flRead: i32[] = []
+let flDecl: i32[] = []
+let flKey: string[] = []
 let fsAskGrew = false
 // The parse arena's length in the current compile; a node at or past it is minted by the plan.
 let fsParseLen = 0
@@ -285,6 +292,10 @@ export function fsReset(): i32 {
   fsAsks = []
   fsTpAsks = []
   fsCallAsks = []
+  fsListAsks = []
+  flRead = []
+  flDecl = []
+  flKey = []
   fsAskGrew = false
   fsPlanReset()
 }
@@ -299,7 +310,10 @@ export function fsModeOf(): i32 { fsMode }
 
 // Whether the compile asked for a split, and whether its asks include a new declaration.
 export function fsAsked(): boolean {
-  fsAsks.length > 0 || fsTpAsks.length > 0 || fsCallAsks.length > 0
+  fsAsks.length > 0
+    || fsTpAsks.length > 0
+    || fsCallAsks.length > 0
+    || fsListAsks.length > 0
 }
 export function fsGrew(): boolean { fsAskGrew }
 
@@ -321,6 +335,39 @@ export function fsAskCallee(callee: i32): i32 {
 export function fsAskOpenCall(c: i32): i32 {
   if c < 0 || c >= fsParseLen || hasI32(fsCallAsks, c) { return 0 }
   fsCallAsks.push(c)
+  fsAskGrew = true
+  0
+}
+
+// The emitter calls through read `read` of `const` list `decl` at function type `key`; records
+// both parse nodes, for a list later asked by `fsAskList`.
+export function fsNoteListCall(read: i32, decl: i32, key: string): i32 {
+  let d = declOrigOf(decl)
+  if d < 0 { d = decl }
+  if read < 0 || read >= fsParseLen || d < 0 || d >= fsParseLen { return 0 }
+  let i = 0
+  while i < flRead.length {
+    if flRead[i] == read {
+      if flKey[i] != key { flKey[i] = "!" }
+      return 0
+    }
+    i = i + 1
+  }
+  flRead.push(read)
+  flDecl.push(d)
+  flKey.push(key)
+  // A call first met once the list is asked, such as one past the first refusal, plans again.
+  if hasI32(fsListAsks, d) { fsAskGrew = true }
+  0
+}
+
+// The emitter refuses a call through `const` list `decl` for taking its elements at a second
+// function type; records its parse node, which may take a copy per type (D10701).
+export function fsAskList(decl: i32): i32 {
+  let d = declOrigOf(decl)
+  if d < 0 { d = decl }
+  if d < 0 || d >= fsParseLen || hasI32(fsListAsks, d) { return 0 }
+  fsListAsks.push(d)
   fsAskGrew = true
   0
 }
@@ -1748,6 +1795,130 @@ export function fsPlan(root: i32): i32 {
   fsPlanReset()
   fsWalk(root)
   fsReachIndex(root)
+  const lists = fsPlanLists()
+  if fsAsks.length + fsTpAsks.length + fsCallAsks.length == 0 { return lists }
+  fsPlanAsks()
+}
+
+// Each asked list (`fsAskList`) takes a `const` copy per function type its calls take past the
+// first, and each call's read of it, or of a `const` alias of it, reads its type's copy. A read
+// other than as a `for` iterable, a called element, its `.length` or an alias's value, or an
+// element other than a name or a pure choice, declines that list. 0 with a plan, 1 with none.
+function fsPlanLists(): i32 {
+  let rc = 1
+  const done: i32[] = []
+  for a in fsListAsks {
+    const d = fsListBase(a)
+    const lanes = if d >= 0 && !hasI32(done, d) { fsListLanes(d) } else { fsNoLanes() }
+    if d >= 0 { done.push(d) }
+    const dn = nodeAt(if d >= 0 { d } else { a })
+    let k = 1
+    while dn is LetDecl && k < lanes.length {
+      const copy = dn.letName + "$l" + i32ToStr(d) + "_" + i32ToStr(k)
+      pdAnchor.push(d)
+      pdKw.push("const")
+      pdName.push(copy)
+      pdTy.push(-1)
+      pdValSrc.push(dn.letInit)
+      pdValName.push("")
+      let i = 0
+      while i < flRead.length {
+        if fsListBase(flDecl[i]) == d && flKey[i] == lanes[k] {
+          prIdent.push(flRead[i])
+          prName.push(copy)
+        }
+        i = i + 1
+      }
+      rc = 0
+      k = k + 1
+    }
+  }
+  rc
+}
+
+// The function types the calls through asked list `d` take, in note order; empty
+// when the list cannot be copied or a read is called at two.
+function fsListLanes(d: i32): string[] {
+  const none: string[] = []
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) { return none }
+  const l = nodeAt(fsParenPeel(dn.letInit))
+  if !(l is ArrayLit) { return none }
+  for e in l.arrElems {
+    if !(nodeAt(e) is Ident) && !fsPureChoice(e, 0) { return none }
+  }
+  for r in fsIdents {
+    const rd = identDeclOf(r)
+    if (
+      rd >= 0
+      && fsListBase(rd) == d
+      && !fsListReadCopies(r)
+      && !fsListAliasRead(r)
+    ) {
+      return none
+    }
+  }
+  const lanes: string[] = []
+  let i = 0
+  while i < flRead.length {
+    if fsListBase(flDecl[i]) == d {
+      if flKey[i] == "!" { return none }
+      if !hasStr(lanes, flKey[i]) { lanes.push(flKey[i]) }
+    }
+    i = i + 1
+  }
+  lanes
+}
+
+function fsNoLanes(): string[] {
+  const none: string[] = []
+  none
+}
+
+// The un-annotated `const` a list literal initializes that `const` `d` is, or names through a
+// chain of un-annotated `const`s; -1 when the chain ends anywhere else.
+function fsListBase(d: i32): i32 {
+  let c = d
+  let hops = 0
+  while c >= 0 && c < fsParseLen && hops < 16 {
+    const cn = nodeAt(c)
+    if !(cn is LetDecl) || cn.letKw != "const" || cn.letType >= 0 { return -1 }
+    const x = fsParenPeel(cn.letInit)
+    if x < 0 || x >= P.nodes.length { return -1 }
+    if nodeAt(x) is ArrayLit { return c }
+    if !(nodeAt(x) is Ident) { return -1 }
+    c = identDeclOf(x)
+    hops = hops + 1
+  }
+  -1
+}
+
+// Whether list read `r` is the whole value of an un-annotated `const` alias.
+function fsListAliasRead(r: i32): boolean {
+  const p = fsParent[r]
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  pn is LetDecl
+    && pn.letKw == "const"
+    && pn.letType < 0
+    && fsParenPeel(pn.letInit) == r
+}
+
+// Whether list read `r` can read a copy of the list: a `for` iterable, the list of an element
+// read that is called, or the list of a `.length` read.
+function fsListReadCopies(r: i32): boolean {
+  const p = fsParent[r]
+  if p < 0 { return false }
+  const pn = nodeAt(p)
+  if pn is ForIn { return pn.fiIter == r }
+  if pn is Member { return pn.memObj == r && pn.memProp == "length" }
+  if !(pn is Index) || pn.idxArr != r { return false }
+  const c = fsParent[p]
+  c >= 0 && fsCallsVia(c, p)
+}
+
+// Plans the asks other than lists; 0 with a plan, 1 when there is nothing it can split.
+function fsPlanAsks(): i32 {
   let fields = 1
   fsAskOpenCallPars()
   const tps = fsPlanTyParams()
@@ -4508,7 +4679,15 @@ function fsValueNode(src: i32, name: string): i32 {
     if e < 0 || !(nodeAt(e) is IfStmt || nodeAt(e) is MatchExpr) { return -2 }
     return e
   }
-  fsExcluded(-2, "a value that is not a name, a lambda or a choice of names")
+  if cn is ArrayLit {
+    const e = reparseChoiceExprAt(fsFirstTok(cx))
+    if e < 0 || !(nodeAt(e) is ArrayLit) { return -2 }
+    return e
+  }
+  fsExcluded(
+    -2,
+    "a value that is not a name, a lambda, a list or a choice of names",
+  )
 }
 
 // Annotation `t` names type `nm`; the parser's spelling tree for it is dropped, since every

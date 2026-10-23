@@ -319,7 +319,13 @@ import {
   unwrapParen,
 } from "./emit_base"
 import { callBindShadowNote, fnFlowSigFailNote } from "./call_bind_shadow"
-import { fsAsk, fsAskOpenCall, fsAskTyParam } from "./fn_split"
+import {
+  fsAsk,
+  fsAskList,
+  fsAskOpenCall,
+  fsAskTyParam,
+  fsNoteListCall,
+} from "./fn_split"
 import {
   monoCalleeDeclOf,
   monoFrameInstTmpl,
@@ -20313,9 +20319,17 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   const nm = monoConcreteFnTyName(ft)
   if nm == "" { return 0 }
   // An element holds one instance, so a call that coerces it to another instance than an earlier
-  // call through it did cannot be served by the one value (D10701).
+  // call through it did cannot be served by the one value; a `const` list asks for a copy per
+  // type (D10701).
+  const lr = monoCalleeListRead(n.callFn)
+  if lr >= 0 { fsNoteListCall(lr, identDeclOf(lr), nm) }
   for el in elems {
     if monoElemTakenSig.has(el) && monoElemTakenSig[el] != nm {
+      if lr >= 0 {
+        fsAskList(identDeclOf(lr))
+      } else {
+        monoAskJoinBinding(n.callFn)
+      }
       return emitFailAt(
         "emitProgram: a function this call reaches through a list or join is already taken at another function type by an earlier call through it",
         n.callFn,
@@ -20329,6 +20343,40 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   }
   nodeTyRecord(n.callFn, ft)
   1
+}
+
+// A callee naming an un-annotated `const` join of functions asks for a copy per call type.
+function monoAskJoinBinding(c: i32): i32 {
+  const x = unwrapParen(c)
+  if x < 0 || x >= P.nodes.length || !(nodeAt(x) is Ident) { return 0 }
+  const d = identDeclOf(x)
+  if d < 0 || d >= P.nodes.length { return 0 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 { return 0 }
+  fsAsk(d)
+}
+
+// The identifier callee `c` reads its list through, as the indexed list or a `for` variable's
+// iterable, when it names an un-annotated `const`; -1 otherwise.
+function monoCalleeListRead(c: i32): i32 {
+  const x = unwrapParen(c)
+  if x < 0 || x >= P.nodes.length { return -1 }
+  const n = nodeAt(x)
+  let r = -1
+  if n is Index { r = unwrapParen(n.idxArr) }
+  if n is Ident {
+    const d = identDeclOf(x)
+    if d >= 0 && d < P.nodes.length {
+      const dn = nodeAt(d)
+      if dn is ForIn && dn.fiVar == n.identName { r = unwrapParen(dn.fiIter) }
+    }
+  }
+  if r < 0 || r >= P.nodes.length || !(nodeAt(r) is Ident) { return -1 }
+  const ld = identDeclOf(r)
+  if ld < 0 || ld >= P.nodes.length { return -1 }
+  const l = nodeAt(ld)
+  if !(l is LetDecl) || l.letKw != "const" || l.letType >= 0 { return -1 }
+  r
 }
 
 // The function values callee `c` reads: a list literal's through an index or a `for` variable,
