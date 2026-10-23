@@ -50,12 +50,18 @@ export type LinkTy = { key: string, def: LinkPiece }
 // An entry of the program's tag-band table: `v:`, `rl:`, `map:` or `clo:` and what it ranks,
 // its rank in its band, and for a variant the string its tag is ranked by.
 export type LinkBand = { key: string, rank: i32, sort: string }
-// One module's artifact. `consts` are its immutable bindings' initialisers in declaration
-// order; `defs` the shared globals it names; `guards` every top-level binding; `pool` and
-// `poolIs` the literals it pools; `tys` every group type it names and `bands` every union
-// tag key; `sigs` and `tags` the runtime's own signatures and exception tags.
+// What a body reads besides its own module and its imports' interfaces, so what an artifact's
+// key carries (§6): the `-O` flavour, the `--low-memory-unused` bound, and whether the program
+// deletes from a map, which gives every map struct two more fields.
+export type LinkFacts = { optimized: i32, lowMem: i32, mapDeletes: boolean }
+// One module's artifact: `facts` it is emitted under, `deletes` if its source calls `.delete`,
+// `consts` its immutable initialisers in order, `defs` the shared globals it names, `guards`
+// its top-level bindings, `pool`/`poolIs` its literals, `tys` its group types, `bands` its tag
+// keys, and `sigs`/`tags` the runtime's own signatures and exception tags.
 export type LinkArt = {
   path: string,
+  facts: LinkFacts,
+  deletes: boolean,
   fns: LinkFn[],
   cells: LinkGlobal[],
   consts: LinkPiece[],
@@ -72,9 +78,11 @@ export type LinkArt = {
 export type LinkSec = { id: i32, b: LinkPiece }
 // The program-level input: the sections passed through, the imports, whether the table
 // exists, the functions placed after every module's own (lifted functions, later instances),
-// the runtime's functions and globals, the start function, the program's tag-band table, and
-// each value-atom code's name.
+// the runtime's functions and globals, the start function, the program's tag-band table, each
+// value-atom code's name, and the build's flavour (`LinkFacts`'s first two).
 export type LinkProg = {
+  optimized: i32,
+  lowMem: i32,
   secs: LinkSec[],
   fnImports: string[],
   globImports: string[],
@@ -85,9 +93,17 @@ export type LinkProg = {
   bands: LinkBand[],
   atomNames: string[],
 }
-// The linked module, how many references name no symbol (the first few by key), and how many
-// symbols are defined twice.
-export type LinkOut = { b: u8[], unresolved: i32, miss: string[], dup: i32 }
+// The linked module, how many references name no symbol (the first few by key), how many
+// symbols are defined twice, the facts the link decides and how many artifacts carry other
+// facts.
+export type LinkOut = {
+  b: u8[],
+  unresolved: i32,
+  miss: string[],
+  dup: i32,
+  facts: LinkFacts,
+  factMiss: i32,
+}
 
 let fIdx: { [string]: i32 } = Map()
 let gIdx: { [string]: i32 } = Map()
@@ -158,12 +174,42 @@ export function link(p: LinkProg, arts: LinkArt[]): LinkOut {
   const globals = lkGlobals(p, arts, fns, thunks)
   lkTypes(p, arts, fns, nUser, thunks, globals)
   lkValues(arts, globals, fns, thunks)
+  const facts = linkFacts(p, arts)
+  let factMiss = 0
+  for a in lkWithRuntime(p, arts) {
+    if linkFactsKey(a.facts) != linkFactsKey(facts) { factMiss = factMiss + 1 }
+  }
   {
     b: lkModule(p, arts, fns, nUser, thunks, globals),
     unresolved: lkUnresolved,
     miss: lkMissKeys,
     dup: lkDup,
+    facts: facts,
+    factMiss: factMiss,
   }
+}
+
+// The facts a program's artifacts must all have been emitted under: the build's flavour, and
+// map deletes when any artifact's own source deletes.
+export function linkFacts(p: LinkProg, arts: LinkArt[]): LinkFacts {
+  let del = p.runtime.deletes
+  for a in arts {
+    if a.deletes { del = true }
+  }
+  { optimized: p.optimized, lowMem: p.lowMem, mapDeletes: del }
+}
+
+// The facts as the key part an artifact cache files them under: `O<n>.L<bytes>.D<0|1>`.
+export function linkFactsKey(f: LinkFacts): string {
+  let d = "0"
+  if f.mapDeletes { d = "1" }
+  "O" + lkNum(f.optimized) + ".L" + lkNum(f.lowMem) + ".D" + d
+}
+
+function lkNum(v: i32): string {
+  if v < 0 { return "-" + lkNum(0 - v) }
+  if v < 10 { return "0123456789".slice(v, v + 1) }
+  lkNum(v / 10) + lkNum(v % 10)
 }
 
 function lkMiss(key: string) {
@@ -876,6 +922,7 @@ export function lkS(s: u8[], value: i32) {
 // artifacts agree only when nothing in them depends on how the rest of the program numbered.
 export function linkArtHash(a: LinkArt): i32 {
   let h = lkHS(-2128831035, a.path)
+  if a.deletes { h = lkH(h, 1) } else { h = lkH(h, 0) }
   for f in a.fns { h = lkHF(h, f) }
   for g in a.cells {
     h = lkHS(h, g.key)
@@ -921,6 +968,8 @@ function lkHF(h0: i32, f: LinkFn): i32 {
 // The digest of the program-level input, the runtime artifact included.
 export function linkProgHash(p: LinkProg): i32 {
   let h = linkArtHash(p.runtime)
+  h = lkH(h, p.optimized)
+  h = lkH(h, p.lowMem)
   for f in p.tail { h = lkHF(h, f) }
   for s in p.secs {
     h = lkH(h, s.id)

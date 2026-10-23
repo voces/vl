@@ -1,5 +1,5 @@
 // `-O` RUNS ONCE, OVER THE LINKED MODULE — S5 step 5 (docs/internals/s5-per-module-artifacts.md §5,
-// §13). Three halves, each a different claim:
+// §13, §14). Four parts, each a different claim:
 //
 //   1. The optimiser reads nothing but bytes. Its import closure is `opt_*`, the wasm reader,
 //      writer and name table, and `listutil`; no emitter, link or driver module imports an
@@ -10,7 +10,10 @@
 //      `gOptimized` or `gLowMemUnused`, so an artifact emitted for `-O` differs from a plain one
 //      at those sites, and the artifact key carries the flavour (§13). A new reader is a new
 //      decision the key has to name, so the list is exhaustive and this test says which moved.
-//   3. The host calls the chain once per `-O` / `-O3` build and never on a plain one. The
+//   3. The artifact key carries every program-wide fact (`LinkFacts`): only `elFacts` reads
+//      the flavour and the map-delete bit into the link section, and the delete bit is
+//      written only by the per-module merge, so the link can re-derive it.
+//   4. The host calls the chain once per `-O` / `-O3` build and never on a plain one. The
 //      multi-value step prints its header once per chain run under `$VL_MV_EXPLAIN`.
 
 import { ROOT, VL, COMPILER, binaryen, exists, nativeEnv } from "./support/tree.ts";
@@ -81,15 +84,20 @@ const FLAVOUR_READERS = [
   "wasmEmit:emitMemAddr gLowMemUnused",
 ];
 const FLAVOUR_GLOBALS = ["gOptimized", "gLowMemUnused"];
+// The one function that reads the program-wide facts into an artifact's key (`LinkFacts`,
+// link.vl), and every fact it has to carry: the flavour, and the program's map-delete bit,
+// which every map struct's layout reads.
+const KEY_READER = "emit_link:elFacts";
+const KEY_FACTS = [...FLAVOUR_GLOBALS, "gMapDeletes"];
 
-const readersOf = (file: string, src: string): string[] => {
+const readersOf = (file: string, src: string, globals = FLAVOUR_GLOBALS): string[] => {
   const out = new Set<string>();
   let fn = "";
   for (const line of src.split("\n")) {
     const head = line.match(/^(?:export )?function ([A-Za-z0-9_]+)/);
     if (head) fn = head[1];
     const code = line.replace(/\/\/.*$/, "");
-    for (const g of FLAVOUR_GLOBALS) {
+    for (const g of globals) {
       if (!new RegExp(`\\b${g}\\b`).test(code)) continue;
       if (/^\s*[A-Za-z0-9_]+,\s*$/.test(code)) continue; // an import list entry
       if (/^export let /.test(code)) continue; // the declaration
@@ -101,7 +109,10 @@ const readersOf = (file: string, src: string): string[] => {
 };
 
 Deno.test("opt-after-link: the emitter's -O flavour is the named decisions", () => {
-  const got = [...sources().entries()].flatMap(([m, s]) => readersOf(m, s)).sort();
+  const got = [...sources().entries()]
+    .flatMap(([m, s]) => readersOf(m, s))
+    .filter((r) => !r.startsWith(`${KEY_READER} `))
+    .sort();
   const want = [...FLAVOUR_READERS].sort();
   const added = got.filter((r) => !want.includes(r));
   const gone = want.filter((r) => !got.includes(r));
@@ -111,6 +122,39 @@ Deno.test("opt-after-link: the emitter's -O flavour is the named decisions", () 
         "A new reader is an emitter decision an -O artifact differs on: name it here and in " +
         "s5-per-module-artifacts.md §13, or move it behind the link.",
     );
+  }
+});
+
+Deno.test("opt-after-link: the artifact key carries every program-wide fact", () => {
+  const src = sources().get("emit_link") ?? "";
+  const got = readersOf("emit_link", src, KEY_FACTS).sort();
+  const want = KEY_FACTS.map((g) => `${KEY_READER} ${g}`).sort();
+  if (got.join(";") !== want.join(";")) {
+    throw new Error(
+      `the link section's fact readers: want [${want.join("; ")}], got [${got.join("; ")}]. ` +
+        "Each fact an artifact's bodies read is a field of its key (`LinkFacts`), read in one place.",
+    );
+  }
+});
+
+// The program's map-delete bit is the merge of each module's `.delete` calls, written only by
+// the merge and its reset, so the link can re-derive it from the artifacts.
+Deno.test("opt-after-link: gMapDeletes is written only by the per-module merge", () => {
+  const writers: string[] = [];
+  for (const [m, s] of sources()) {
+    let fn = "";
+    for (const line of s.split("\n")) {
+      const head = line.match(/^(?:export )?function ([A-Za-z0-9_]+)/);
+      if (head) fn = head[1];
+      const code = line.replace(/\/\/.*$/, "");
+      if (/\bgMapDeletes\s*=[^=]/.test(code) && !/^export let /.test(code)) {
+        writers.push(`${m}:${fn}`);
+      }
+    }
+  }
+  const want = ["emit_state:mapDeleteMerge", "emit_state:mapDeleteReset"];
+  if (writers.sort().join(";") !== want.join(";")) {
+    throw new Error(`gMapDeletes writers: want [${want.join("; ")}], got [${writers.join("; ")}]`);
   }
 });
 
