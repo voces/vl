@@ -49,6 +49,7 @@ import {
   mkNum,
   mkParam,
   mkTypeRef,
+  nodeAt,
   nodeChildren,
   nodeToks,
   orderArgsByParamNames,
@@ -56,12 +57,12 @@ import {
 import { a20CollectRets } from "./check_leaf_steps"
 import { nodeTyIxOf } from "./check_node_tys"
 import {
-  T,
   TyArray,
   TyFunc,
   TyMap,
   TyObj,
   objFieldType,
+  tyAt,
   tyToStr,
 } from "./check_types"
 import { tyHasTyVar, tyReachesHole } from "./tyquery"
@@ -376,10 +377,10 @@ function hasStr(xs: string[], x: string): boolean {
 // The declaration a parse-arena identifier resolves to when it is a `let`/`const`, else -1.
 function letDeclOfRead(ix: i32): i32 {
   if ix < 0 || ix >= fsParseLen { return -1 }
-  if !(P.nodes[ix] is Ident) { return -1 }
+  if !(nodeAt(ix) is Ident) { return -1 }
   const d = identDeclOf(ix)
   if d < 0 || d >= fsParseLen { return -1 }
-  if P.nodes[d] is LetDecl { return d }
+  if nodeAt(d) is LetDecl { return d }
   -1
 }
 
@@ -394,7 +395,7 @@ function fsWalk(root: i32): i32 {
   const stack: i32[] = [root]
   while stack.length > 0 {
     const ix = stack.pop()
-    if P.nodes[ix] is Ident { fsIdents.push(ix) }
+    if nodeAt(ix) is Ident { fsIdents.push(ix) }
     for c in nodeChildren(ix) {
       if c >= 0 && c < P.nodes.length && fsParent[c] < 0 && c != root {
         fsParent[c] = ix
@@ -413,7 +414,7 @@ function fsReadKey(r: i32): string { fsReadKeyAt(r, 0) }
 function fsReadKeyAt(r: i32, depth: i32): string {
   const p = fsParent[r]
   if p < 0 { return "u:" + i32ToStr(r) }
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if pn is Call && pn.callFn == r { return fsCallKey(pn, depth) }
   if pn is BinExpr {
     if pn.binOp == "=" && pn.binLeft == r { return "" }
@@ -433,7 +434,7 @@ function fsReachKey(r: i32, depth: i32): string {
   if cs.length == 0 || vrLostIn(cs) { return own }
   let k = ""
   for c in cs {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if !(cn is Call) { return own }
     const ck = fsCallKey(cn, depth)
     if k != "" && ck != k { return own }
@@ -454,16 +455,16 @@ function fsCallKey(c: Call, depth: i32): string {
 function fsArgKey(a: i32, depth: i32): string {
   const t = nodeTyIxOf(a)
   if depth < 8 && a >= 0 && a < P.nodes.length && (t < 0 || tyHasTyVar(t)) {
-    const n = P.nodes[a]
+    const n = nodeAt(a)
     if (
       n is Call
       && n.callFn >= 0
       && n.callFn < P.nodes.length
-      && P.nodes[n.callFn] is Ident
+      && nodeAt(n.callFn) is Ident
     ) {
       const d = identDeclOf(n.callFn)
       if d >= 0 && d < P.nodes.length {
-        const pd = P.nodes[d]
+        const pd = nodeAt(d)
         if pd is Param {
           return "r(" + pd.parName + fsReadKeyAt(n.callFn, depth + 1) + ")"
         }
@@ -471,7 +472,7 @@ function fsArgKey(a: i32, depth: i32): string {
     }
     const ld = letDeclOfRead(a)
     if ld >= 0 {
-      const l = P.nodes[ld]
+      const l = nodeAt(ld)
       if l is LetDecl && l.letType < 0 && l.letInit >= 0 {
         return fsArgKey(l.letInit, depth + 1)
       }
@@ -483,7 +484,7 @@ function fsArgKey(a: i32, depth: i32): string {
 // The binding a copy read `r` flows into (`let g = r` or `g = r`).
 function fsCopyTarget(r: i32): i32 {
   const p = fsParent[r]
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if pn is LetDecl { return p }
   if pn is BinExpr { return letDeclOfRead(pn.binLeft) }
   fsExcluded(-1, "a parent that copies into no binding")
@@ -496,15 +497,15 @@ function fsCopyTarget(r: i32): i32 {
 function fsDestTy(r: i32): i32 {
   const p = fsParent[r]
   if p < 0 { return -1 }
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if pn is Call && pn.callFn != r {
     for nm in pn.callArgNames {
       if nm != "" { return -1 }
     }
     if pn.callFn < 0 { return -1 }
-    const cf = P.nodes[pn.callFn]
+    const cf = nodeAt(pn.callFn)
     if cf is Member && nodeTyIxOf(cf.memObj) >= 0 {
-      const rv = T.tys[nodeTyIxOf(cf.memObj)]
+      const rv = tyAt(nodeTyIxOf(cf.memObj))
       if cf.memProp == "push" && rv is TyArray { return rv.aElem }
       if (
         cf.memProp == "set"
@@ -517,7 +518,7 @@ function fsDestTy(r: i32): i32 {
     }
     const ft = nodeTyIxOf(pn.callFn)
     if ft < 0 { return -1 }
-    const f = T.tys[ft]
+    const f = tyAt(ft)
     if !(f is TyFunc) { return -1 }
     let i = 0
     while i < pn.callArgs.length && pn.callArgs[i] != r { i = i + 1 }
@@ -527,34 +528,34 @@ function fsDestTy(r: i32): i32 {
   if pn is ArrayLit {
     const at = fsDestTy(p)
     if at < 0 { return -1 }
-    const a = T.tys[at]
+    const a = tyAt(at)
     if a is TyArray { return a.aElem }
     return -1
   }
   if pn is FieldInit {
     const o = fsParent[p]
-    if o < 0 || !(P.nodes[o] is ObjLit) { return -1 }
+    if o < 0 || !(nodeAt(o) is ObjLit) { return -1 }
     const ot = fsDestTy(o)
     if ot < 0 { return -1 }
-    const t = T.tys[ot]
+    const t = tyAt(ot)
     if t is TyObj { return objFieldType(t, pn.fiName) }
     return -1
   }
   if pn is RetStmt {
     let f = fsParent[p]
-    while f >= 0 && !(P.nodes[f] is FuncDecl) { f = fsParent[f] }
+    while f >= 0 && !(nodeAt(f) is FuncDecl) { f = fsParent[f] }
     if f < 0 { return -1 }
     const ft = nodeTyIxOf(f)
     if ft < 0 { return -1 }
-    const t = T.tys[ft]
+    const t = tyAt(ft)
     if t is TyFunc { return t.fnRet }
     return -1
   }
   if pn is LetDecl && pn.letType >= 0 { return nodeTyIxOf(pn.letType) }
   if pn is BinExpr && pn.binOp == "=" && pn.binRight == r {
-    const l = P.nodes[pn.binLeft]
+    const l = nodeAt(pn.binLeft)
     if l is Index && nodeTyIxOf(l.idxArr) >= 0 {
-      const m = T.tys[nodeTyIxOf(l.idxArr)]
+      const m = tyAt(nodeTyIxOf(l.idxArr))
       if m is TyMap { return m.mVal }
     }
     return nodeTyIxOf(pn.binLeft)
@@ -565,7 +566,7 @@ function fsDestTy(r: i32): i32 {
 // Whether a delivery read lands in a function type that fixes one instantiation.
 function fsDestFixed(r: i32): boolean {
   const t = fsDestTy(r)
-  if t < 0 || !(T.tys[t] is TyFunc) { return false }
+  if t < 0 || !(tyAt(t) is TyFunc) { return false }
   !tyHasTyVar(t) && !tyReachesHole(t, 8)
 }
 
@@ -585,12 +586,12 @@ function memIx(d: i32): i32 {
 function laneName(mi: i32, key: string): string {
   const lanes = fsLanes[mi]
   if lanes.length > 0 && lanes[0] == key {
-    const d = P.nodes[fsMem[mi]]
+    const d = nodeAt(fsMem[mi])
     if d is LetDecl { return d.letName }
   }
   let k = 0
   while k < lanes.length && lanes[k] != key { k = k + 1 }
-  const d = P.nodes[fsMem[mi]]
+  const d = nodeAt(fsMem[mi])
   let base = ""
   if d is LetDecl { base = d.letName }
   const dollar = base.indexOf("$")
@@ -602,7 +603,7 @@ function laneName(mi: i32, key: string): string {
 // else declines the plan. Answers the peer's member index, -1 for no peer, -2 to decline.
 function fsValuePeer(v: i32): i32 {
   if v < 0 { return -1 }
-  const n = P.nodes[v]
+  const n = nodeAt(v)
   if n is Ident {
     const d = letDeclOfRead(v)
     if d >= 0 { return memIx(d) }
@@ -627,7 +628,7 @@ function fsValuePeer(v: i32): i32 {
 function fsPureChoice(v: i32, depth: i32): boolean {
   const x = fsParenPeel(v)
   if x < 0 || x >= P.nodes.length || depth > 16 { return false }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if n is MatchExpr { return fsPureMatch(n, depth) }
   if !(n is IfStmt) || n.ifElse < 0 { return false }
   if !fsAnyCond && !fsPureRead(n.ifCond, 0) { return false }
@@ -645,7 +646,7 @@ function fsPureMatch(n: MatchExpr, depth: i32): boolean {
   }
   for b in n.matchBodies {
     if b < 0 || b >= P.nodes.length { return false }
-    if !(P.nodes[b] is Ident) && !fsPureChoiceArm(b, depth) { return false }
+    if !(nodeAt(b) is Ident) && !fsPureChoiceArm(b, depth) { return false }
   }
   true
 }
@@ -669,7 +670,7 @@ function fsHoistsChoice(v: i32): boolean {
 function fsNumberLeaves(v: i32, names: string[], depth: i32): i32 {
   const x = fsParenPeel(v)
   if x < 0 || x >= P.nodes.length || depth > 16 { return -1 }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if n is IfStmt {
     if fsNumberArm(n.ifThen, names, depth) < 0 { return -1 }
     return fsNumberArm(n.ifElse, names, depth)
@@ -678,7 +679,7 @@ function fsNumberLeaves(v: i32, names: string[], depth: i32): i32 {
     let i = 0
     while i < n.matchBodies.length {
       const b = n.matchBodies[i]
-      const bn = if b >= 0 && b < P.nodes.length { P.nodes[b] } else { n }
+      const bn = if b >= 0 && b < P.nodes.length { nodeAt(b) } else { n }
       if bn is Ident {
         n.matchBodies[i] = mkNum(i32ToStr(names.length), bn.pos)
         names.push(bn.identName)
@@ -695,11 +696,11 @@ function fsNumberLeaves(v: i32, names: string[], depth: i32): i32 {
 // `fsNumberLeaves` for arm `a`: a block holding one name or choice, or an `else if`.
 function fsNumberArm(a: i32, names: string[], depth: i32): i32 {
   if a < 0 || a >= P.nodes.length { return -1 }
-  const n = P.nodes[a]
+  const n = nodeAt(a)
   if !(n is Block) { return fsNumberLeaves(a, names, depth + 1) }
   if n.blkStmts.length != 1 { return -1 }
   const s = fsParenPeel(n.blkStmts[0])
-  const sn = if s >= 0 && s < P.nodes.length { P.nodes[s] } else { n }
+  const sn = if s >= 0 && s < P.nodes.length { nodeAt(s) } else { n }
   if sn is Ident {
     n.blkStmts[0] = mkNum(i32ToStr(names.length), sn.pos)
     names.push(sn.identName)
@@ -726,7 +727,7 @@ function fsSelectArm(sel: string, names: string[], pos: i32): i32 {
 // Whether `if` arm `a` (a block holding one value, or an `else if`) is a name or a pure choice.
 function fsPureChoiceArm(a: i32, depth: i32): boolean {
   if a < 0 || a >= P.nodes.length { return false }
-  const n = P.nodes[a]
+  const n = nodeAt(a)
   if n is IfStmt { return fsMatchOnce(a) && fsPureChoice(a, depth + 1) }
   if !(n is Block) { return false }
   // A nested `match` whose scrutinee the check bound ahead of it in the arm (D9322).
@@ -735,7 +736,7 @@ function fsPureChoiceArm(a: i32, depth: i32): boolean {
   const s = fsParenPeel(n.blkStmts[at])
   if s < 0 || s >= P.nodes.length { return false }
   if at == 0 && !fsMatchOnce(s) { return false }
-  P.nodes[s] is Ident || fsPureChoice(s, depth + 1)
+  nodeAt(s) is Ident || fsPureChoice(s, depth + 1)
 }
 
 // Whether nested choice `s` evaluates its scrutinee once: it is no `match` the check lowered,
@@ -744,7 +745,7 @@ function fsPureChoiceArm(a: i32, depth: i32): boolean {
 function fsMatchOnce(s: i32): boolean {
   if !fsAnyCond { return true }
   if s < 0 || s >= P.nodes.length { return false }
-  const n = P.nodes[s]
+  const n = nodeAt(s)
   const t = fsFirstTok(s)
   if !(n is IfStmt) || t < 0 || P.toks[t].kind != "MATCH" { return true }
   fsScrutOnce = true
@@ -759,7 +760,7 @@ let fsScrutOnce = false
 // Whether statement `s` is a `const $scrut<match>` the check minted for a computed scrutinee.
 function fsScrutBind(s: i32): boolean {
   if s < 0 || s >= P.nodes.length { return false }
-  const d = P.nodes[s]
+  const d = nodeAt(s)
   d is LetDecl && d.letName.slice(0, 6) == "$scrut"
 }
 
@@ -767,7 +768,7 @@ function fsScrutBind(s: i32): boolean {
 // evaluation of it gives the same value and has no effect.
 function fsPureRead(x: i32, depth: i32): boolean {
   if x < 0 || x >= P.nodes.length || depth > 32 { return false }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   // A binding the check minted for a computed scrutinee or receiver stands for that
   // expression, which a copy made from the tokens evaluates again.
   if n is Ident {
@@ -812,21 +813,21 @@ function fsPureRead(x: i32, depth: i32): boolean {
 // and the argument there is a name, so a slot can hold that name's value without the call.
 function fsIdentityArg(c: i32): i32 {
   if c < 0 || c >= fsParseLen { return -1 }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) { return -1 }
   const fd = identDeclOf(cn.callFn)
   if fd < 0 || fd >= fsParseLen { return -1 }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) || f.fnName == "" { return -1 }
   if cn.callArgs.length != f.fnParams.length { return -1 }
   for nm in cn.callArgNames {
     if nm != "" { return -1 }
   }
   if f.fnBody < 0 || f.fnBody >= P.nodes.length { return -1 }
-  const body = P.nodes[f.fnBody]
+  const body = nodeAt(f.fnBody)
   if !(body is Block) || body.blkStmts.length == 0 { return -1 }
-  const last = P.nodes[body.blkStmts[body.blkStmts.length - 1]]
-  if !(last is RetStmt) || last.retArg < 0 || !(P.nodes[last.retArg] is Ident) {
+  const last = nodeAt(body.blkStmts[body.blkStmts.length - 1])
+  if !(last is RetStmt) || last.retArg < 0 || !(nodeAt(last.retArg) is Ident) {
     return -1
   }
   const par = identDeclOf(last.retArg)
@@ -835,11 +836,11 @@ function fsIdentityArg(c: i32): i32 {
   if p == f.fnParams.length { return -1 }
   let i = 0
   while i < fsParseLen {
-    const rn = P.nodes[i]
+    const rn = nodeAt(i)
     if rn is RetStmt && fsEnclosingFn(i) == fd {
       if (
         rn.retArg < 0
-        || !(P.nodes[rn.retArg] is Ident)
+        || !(nodeAt(rn.retArg) is Ident)
         || identDeclOf(rn.retArg) != par
       ) {
         return -1
@@ -849,7 +850,7 @@ function fsIdentityArg(c: i32): i32 {
   }
   for r in fsIdents {
     if identDeclOf(r) == par && fsParent[r] >= 0 {
-      const w = P.nodes[fsParent[r]]
+      const w = nodeAt(fsParent[r])
       if (
         w is BinExpr
         && w.binLeft == r
@@ -860,14 +861,14 @@ function fsIdentityArg(c: i32): i32 {
     }
   }
   const arg = cn.callArgs[p]
-  if !(P.nodes[arg] is Ident) { return -1 }
+  if !(nodeAt(arg) is Ident) { return -1 }
   arg
 }
 
 // The nearest function or lambda enclosing node `n`, or -1.
 function fsEnclosingFn(n: i32): i32 {
   let q = fsParent[n]
-  while q >= 0 && !(P.nodes[q] is FuncDecl) { q = fsParent[q] }
+  while q >= 0 && !(nodeAt(q) is FuncDecl) { q = fsParent[q] }
   q
 }
 
@@ -878,14 +879,14 @@ function fsIdentityLetOf(a: i32): i32 {
   if c < 0 || fsIdentityArg(c) != a { return -1 }
   const d = fsParent[c]
   if d < 0 { return -1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if dn is LetDecl && dn.letInit == c && dn.letType < 0 { return d }
   -1
 }
 
 // Whether node `c` is a call whose callee is identifier `r`.
 function fsCallsVia(c: i32, r: i32): boolean {
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   cn is Call && cn.callFn == r
 }
 
@@ -903,13 +904,13 @@ function fsReachesUntypedCalls(r: i32): boolean {
 // holds; -1 for any other callee.
 function fsCallRunsFn(c: i32): i32 {
   if c < 0 || c >= fsParseLen { return -1 }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) { return -1 }
   const lam = fsConstLambdaOf(cn.callFn)
   if lam >= 0 { return lam }
   const fd = identDeclOf(cn.callFn)
   if fd < 0 || fd >= fsParseLen { return -1 }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) || f.fnName == "" { return -1 }
   fd
 }
@@ -920,27 +921,27 @@ function fsCallRunsFn(c: i32): i32 {
 function fsConstRet(c: i32): i32 {
   const fd = fsCallRunsFn(c)
   if fd < 0 { return -1 }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) || f.fnBody < 0 || f.fnBody >= P.nodes.length {
     return -1
   }
-  const body = P.nodes[f.fnBody]
+  const body = nodeAt(f.fnBody)
   if !(body is Block) || body.blkStmts.length == 0 { return -1 }
   let tail = body.blkStmts[body.blkStmts.length - 1]
-  const last = P.nodes[tail]
+  const last = nodeAt(tail)
   if last is RetStmt { tail = last.retArg }
-  if tail < 0 || !(P.nodes[tail] is Ident) { return -1 }
+  if tail < 0 || !(nodeAt(tail) is Ident) { return -1 }
   const g = identDeclOf(tail)
   if g < 0 || g >= fsParseLen || fsParent[g] < 0 { return -1 }
-  const gn = P.nodes[g]
-  if !(gn is FuncDecl) || !(P.nodes[fsParent[g]] is Program) { return -1 }
+  const gn = nodeAt(g)
+  if !(gn is FuncDecl) || !(nodeAt(fsParent[g]) is Program) { return -1 }
   let i = 0
   while i < fsParseLen {
-    const n = P.nodes[i]
+    const n = nodeAt(i)
     if n is RetStmt && fsEnclosingFn(i) == fd {
       if (
         n.retArg < 0
-        || !(P.nodes[n.retArg] is Ident)
+        || !(nodeAt(n.retArg) is Ident)
         || identDeclOf(n.retArg) != g
       ) {
         return -1
@@ -959,10 +960,10 @@ function fsConstRet(c: i32): i32 {
 function fsChoiceRetLeaves(c: i32): string[] {
   const none: string[] = []
   const fd = fsCallRunsFn(c)
-  if fd < 0 || fsParent[fd] < 0 || !(P.nodes[fsParent[fd]] is Program) {
+  if fd < 0 || fsParent[fd] < 0 || !(nodeAt(fsParent[fd]) is Program) {
     return none
   }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if (
     !(f is FuncDecl)
     || f.fnTyParams.length > 0
@@ -971,20 +972,20 @@ function fsChoiceRetLeaves(c: i32): string[] {
   ) {
     return none
   }
-  const body = P.nodes[f.fnBody]
+  const body = nodeAt(f.fnBody)
   if !(body is Block) || body.blkStmts.length == 0 { return none }
-  if !(P.nodes[body.blkStmts[body.blkStmts.length - 1]] is RetStmt) {
+  if !(nodeAt(body.blkStmts[body.blkStmts.length - 1]) is RetStmt) {
     return none
   }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) || hasNamedArgs(cn.callArgNames) { return none }
   const names: string[] = []
   let i = 0
   while i < fsParseLen {
-    const n = P.nodes[i]
+    const n = nodeAt(i)
     if n is RetStmt && fsEnclosingFn(i) == fd {
       if n.retArg < 0 || !fsGenericName(n.retArg) { return none }
-      const g = P.nodes[n.retArg]
+      const g = nodeAt(n.retArg)
       if g is Ident && !hasStr(names, g.identName) { names.push(g.identName) }
     }
     i = i + 1
@@ -1008,8 +1009,8 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
     return -1
   }
   if fsChoiceRetLeaves(a).length == 0 { return -1 }
-  const cn = P.nodes[c]
-  const an = P.nodes[a]
+  const cn = nodeAt(c)
+  const an = nodeAt(a)
   if !(cn is Call) || !(an is Call) || hasNamedArgs(cn.callArgNames) {
     return -1
   }
@@ -1021,7 +1022,7 @@ function fsChoiceStmt(c: i32, a: i32): i32 {
   let s = c
   const p = fsParent[c]
   if p >= 0 {
-    const pn = P.nodes[p]
+    const pn = nodeAt(p)
     if pn is LetDecl && pn.letInit == c { s = p }
   }
   if fsListOwner(s) < 0 { return -1 }
@@ -1040,11 +1041,11 @@ function fsChoiceTakesLambda(an: Call): boolean {
 // Whether argument `x`, ahead of a choosing call, reads the same after that call runs: a literal,
 // a function's name, or a parameter or `const` read when the call is passed no lambda (`lam`).
 function fsAheadStays(x: i32, lam: boolean): boolean {
-  const xn = P.nodes[x]
+  const xn = nodeAt(x)
   if xn is NumLit || xn is StrLit || xn is BoolLit { return true }
   const xd = identDeclOf(x)
   if !(xn is Ident) || xd < 0 || xd >= P.nodes.length { return false }
-  const dn = P.nodes[xd]
+  const dn = nodeAt(xd)
   dn is FuncDecl
     || (!lam && ((dn is LetDecl && dn.letKw == "const") || dn is Param))
 }
@@ -1053,7 +1054,7 @@ function fsAheadStays(x: i32, lam: boolean): boolean {
 // with no destination to type it: a binding read, a member or element read, or arithmetic
 // (D10022).
 function fsAheadHoists(x: i32): boolean {
-  const xn = P.nodes[x]
+  const xn = nodeAt(x)
   const op = fsBinOpAt(x)
   xn is Member
     || xn is Index
@@ -1067,7 +1068,7 @@ function fsAheadHoists(x: i32): boolean {
 
 // The operator of the binary expression at `x`, or "" when `x` is none.
 function fsBinOpAt(x: i32): string {
-  const xn = P.nodes[x]
+  const xn = nodeAt(x)
   if xn is BinExpr { return xn.binOp }
   ""
 }
@@ -1075,21 +1076,21 @@ function fsBinOpAt(x: i32): string {
 // Whether `x` reads a `let`, `const` or parameter binding.
 function fsReadsBinding(x: i32): boolean {
   const xd = identDeclOf(x)
-  if !(P.nodes[x] is Ident) || xd < 0 || xd >= P.nodes.length { return false }
-  const dn = P.nodes[xd]
+  if !(nodeAt(x) is Ident) || xd < 0 || xd >= P.nodes.length { return false }
+  const dn = nodeAt(xd)
   dn is LetDecl || dn is Param
 }
 
 // Whether parse node `r` names a generic module function no other declaration shares a name with.
 function fsGenericName(r: i32): boolean {
-  if r < 0 || r >= fsParseLen || !(P.nodes[r] is Ident) { return false }
+  if r < 0 || r >= fsParseLen || !(nodeAt(r) is Ident) { return false }
   const g = identDeclOf(r)
   if g < 0 || g >= fsParseLen || fsParent[g] < 0 { return false }
-  const gn = P.nodes[g]
+  const gn = nodeAt(g)
   if (
     !(gn is FuncDecl)
     || gn.fnTyParams.length == 0
-    || !(P.nodes[fsParent[g]] is Program)
+    || !(nodeAt(fsParent[g]) is Program)
   ) {
     return false
   }
@@ -1130,7 +1131,7 @@ function fsConstAliasRet(v: i32): i32 {
   while hops <= 8 {
     const d = letDeclOfRead(x)
     if d < 0 { return -1 }
-    const dn = P.nodes[d]
+    const dn = nodeAt(d)
     if (
       !(dn is LetDecl)
       || dn.letKw != "const"
@@ -1152,7 +1153,7 @@ function fsConstAliasRet(v: i32): i32 {
 function fsIsLambdaLit(a: i32): boolean {
   const l = fsParenPeel(a)
   if l < 0 || l >= fsParseLen { return false }
-  const f = P.nodes[l]
+  const f = nodeAt(l)
   f is FuncDecl && f.fnName == ""
 }
 
@@ -1160,7 +1161,7 @@ function fsIsLambdaLit(a: i32): boolean {
 function fsParenPeel(a: i32): i32 {
   let x = a
   while x >= 0 && x < P.nodes.length {
-    const n = P.nodes[x]
+    const n = nodeAt(x)
     if !(n is Paren) { return x }
     x = n.parInner
   }
@@ -1172,7 +1173,7 @@ function fsParenPeel(a: i32): i32 {
 function fsConstLambdaOf(a: i32): i32 {
   const d = letDeclOfRead(a)
   if d < 0 { return -1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
@@ -1181,7 +1182,7 @@ function fsConstLambdaOf(a: i32): i32 {
   ) {
     return -1
   }
-  const f = P.nodes[dn.letInit]
+  const f = nodeAt(dn.letInit)
   if !(f is FuncDecl) || f.fnName != "" || !fsReadsNoLocal(dn.letInit) {
     return -1
   }
@@ -1215,14 +1216,14 @@ function fsLetSplitKeys(d: i32): boolean {
 function fsArgOfNamedFn(r: i32): boolean {
   const c = fsParent[r]
   if c < 0 || callHasTyArgs(c) { return false }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) || cn.callFn == r { return false }
   let arg = false
   for x in cn.callArgs {
     if x == r { arg = true }
   }
   const g = identDeclOf(cn.callFn)
-  arg && g >= 0 && g < P.nodes.length && P.nodes[g] is FuncDecl
+  arg && g >= 0 && g < P.nodes.length && nodeAt(g) is FuncDecl
 }
 
 // Whether read `r` of a split parameter meets no use of type parameter `tp` but its own: a
@@ -1240,9 +1241,9 @@ function fsTyParamReadSplits(
   const c = fsParent[r]
   if depth <= 0 || c < 0 { return false }
   if fsReachesUntypedCalls(r) { return true }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is LetDecl) || cn.letInit != r || cn.letType < 0 { return false }
-  const tn = P.nodes[cn.letType]
+  const tn = nodeAt(cn.letType)
   if !(tn is TypeRef) || !fsSameFnTyParam(c, tn.tyName, tp) { return false }
   for x in fsIdents {
     if (
@@ -1263,7 +1264,7 @@ function fsSameFnTyParam(n: i32, nm: string, tp: string): boolean {
   if nm == tp { return true }
   let q = fsEnclosingFn(n)
   while q >= 0 {
-    const f = P.nodes[q]
+    const f = nodeAt(q)
     if f is FuncDecl && hasStr(f.fnTyParams, nm) {
       return hasStr(f.fnTyParams, tp)
     }
@@ -1278,9 +1279,9 @@ function fsSameFnTyParam(n: i32, nm: string, tp: string): boolean {
 function fsResultSplits(r: i32, tp: string, out: i32[]): boolean {
   const fd = fsEnclosingFn(r)
   if fd < 0 { return false }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) || f.fnRet < 0 || f.fnBody < 0 { return false }
-  const tn = P.nodes[f.fnRet]
+  const tn = nodeAt(f.fnRet)
   if !(tn is TypeRef) || tn.tyName != tp { return false }
   const vals: i32[] = []
   a20CollectRets(f.fnBody, vals)
@@ -1288,7 +1289,7 @@ function fsResultSplits(r: i32, tp: string, out: i32[]): boolean {
   let hit = false
   for v in vals {
     const u = fsParenPeel(v)
-    if u < 0 || !(P.nodes[u] is Ident) || identDeclOf(u) != d { return false }
+    if u < 0 || !(nodeAt(u) is Ident) || identDeclOf(u) != d { return false }
     if u == r { hit = true }
   }
   if hit && !hasI32(out, f.fnRet) { out.push(f.fnRet) }
@@ -1301,13 +1302,13 @@ function fsResultSplits(r: i32, tp: string, out: i32[]): boolean {
 function fsPlanTyParams(): i32 {
   let rc = 1
   for o in fsTpAsks {
-    const p = P.nodes[o]
+    const p = nodeAt(o)
     const fd = fsParent[o]
     const retype: i32[] = []
-    let ok = p is Param && fd >= 0 && P.nodes[fd] is FuncDecl
+    let ok = p is Param && fd >= 0 && nodeAt(fd) is FuncDecl
     let tp = ""
     if ok && p is Param {
-      const f = P.nodes[fd]
+      const f = nodeAt(fd)
       if p.parType < 0 {
         // An un-annotated one stands for a type parameter of its function the bindings it
         // seeds name (D6760).
@@ -1317,7 +1318,7 @@ function fsPlanTyParams(): i32 {
           && p.parRest == 0
         if ok && f is FuncDecl { tp = f.fnTyParams[0] }
       } else {
-        const tn = P.nodes[p.parType]
+        const tn = nodeAt(p.parType)
         ok = tn is TypeRef && f is FuncDecl && hasStr(f.fnTyParams, tn.tyName)
         if tn is TypeRef { tp = tn.tyName }
       }
@@ -1328,7 +1329,7 @@ function fsPlanTyParams(): i32 {
         ok
         && identDeclOf(r) == fd
         && c >= 0
-        && P.nodes[c] is Call
+        && nodeAt(c) is Call
         && callHasTyArgs(c)
       ) {
         ok = false
@@ -1369,13 +1370,13 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
   if g < 0 || v < 0 { return 1 }
   const fi = fsParent[v]
   if fi < 0 { return 1 }
-  const fin = P.nodes[fi]
+  const fin = nodeAt(fi)
   if !(fin is FieldInit) || fin.fiValue != v { return 1 }
   const o = fsParent[fi]
-  if o < 0 || !(P.nodes[o] is ObjLit) { return 1 }
+  if o < 0 || !(nodeAt(o) is ObjLit) { return 1 }
   const d = fsParent[o]
   if d < 0 { return 1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if (
     !(dn is LetDecl)
     || dn.letInit != o
@@ -1394,7 +1395,7 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
     if identDeclOf(r) == d && r != d {
       const m = fsParent[r]
       if m < 0 { return 1 }
-      const mn = P.nodes[m]
+      const mn = nodeAt(m)
       const whole = !(mn is Member) || mn.memObj != r
       if whole && !fsWholeReadSkips(r, fin.fiName, 4) { return 1 }
       if mn is Member && !whole && mn.memProp == fin.fiName {
@@ -1403,7 +1404,7 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
         const key = fsReadKey(m)
         if !hasStr(keys, key) { keys.push(key) }
         calls.push(c)
-        if first < 0 || P.nodes[c].pos < P.nodes[calls[first]].pos {
+        if first < 0 || nodeAt(c).pos < nodeAt(calls[first]).pos {
           first = calls.length - 1
           keep = key
         }
@@ -1411,7 +1412,7 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
     }
   }
   for c in fsFarCalls {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if cn is Call && !hasStr(keys, fsReadKey(cn.callFn)) {
       keys.push(fsReadKey(cn.callFn))
     }
@@ -1432,23 +1433,23 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
     }
   }
   for c in fsFixedCalls {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if !(cn is Call) { return 1 }
     const fk = fsReadKey(cn.callFn)
     if pinned != "" && fk != pinned { return 1 }
     pinned = fk
     keep = fk
   }
-  const gn = P.nodes[g]
+  const gn = nodeAt(g)
   if !(gn is Ident) { return 1 }
   // A call through a handed-on record keeps its receiver, so one at other types reads a field
   // of its own per types, holding the generic by name (D6700).
   for c in fsFarCalls {
-    if !(P.nodes[c] is Call) { return 1 }
+    if !(nodeAt(c) is Call) { return 1 }
   }
   const farKeys: string[] = []
   for c in fsFarCalls {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if !(cn is Call) { return 1 }
     const fk = fsReadKey(cn.callFn)
     if fk != keep {
@@ -1467,7 +1468,7 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
     }
   }
   for c in calls {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if cn is Call && fsReadKey(cn.callFn) != keep {
       pmCall.push(c)
       pmName.push(gn.identName)
@@ -1482,19 +1483,19 @@ function fsPlanFieldSlot(v: i32, src: i32): i32 {
 // first runs nothing out of order. 0 with a plan, 1 with none.
 function fsPlanHoistLit(o: i32): i32 {
   if o < 0 || o >= fsParseLen || hasI32(phLit, o) { return 1 }
-  const on = P.nodes[o]
+  const on = nodeAt(o)
   if !(on is ObjLit) { return 1 }
   const c = fsParent[o]
   if c < 0 { return 1 }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) || cn.callFn < 0 || cn.callFn >= P.nodes.length { return 1 }
-  if !(P.nodes[cn.callFn] is Ident) || fsListOwner(c) < 0 { return 1 }
+  if !(nodeAt(cn.callFn) is Ident) || fsListOwner(c) < 0 { return 1 }
   let leaves = true
   for fi in on.objFields {
-    const fin = P.nodes[fi]
+    const fin = nodeAt(fi)
     if (
       !(fin is FieldInit)
-      || !(fsConstLeaf(fin.fiValue) || P.nodes[fin.fiValue] is Ident)
+      || !(fsConstLeaf(fin.fiValue) || nodeAt(fin.fiValue) is Ident)
     ) {
       leaves = false
     }
@@ -1502,13 +1503,13 @@ function fsPlanHoistLit(o: i32): i32 {
   let j = 0
   while j < cn.callArgs.length && cn.callArgs[j] != o {
     const x = cn.callArgs[j]
-    if !fsConstLeaf(x) && !(leaves && P.nodes[x] is Ident) { return 1 }
+    if !fsConstLeaf(x) && !(leaves && nodeAt(x) is Ident) { return 1 }
     j += 1
   }
   if j >= cn.callArgs.length { return 1 }
   const d = fsHoleFwd(o)
   if d < 0 { return 1 }
-  const pn = P.nodes[d]
+  const pn = nodeAt(d)
   if !(pn is Param) || pn.parType < 0 { return 1 }
   phLit.push(o)
   phStmt.push(c)
@@ -1520,7 +1521,7 @@ function fsPlanHoistLit(o: i32): i32 {
 // Whether parse node `x` is a constant literal, which reads nothing.
 function fsConstLeaf(x: i32): boolean {
   if x < 0 || x >= P.nodes.length { return false }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   n is NumLit || n is StrLit || n is CharLit || n is BoolLit || n is NullLit
 }
 
@@ -1547,7 +1548,7 @@ function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
   // A declared parameter type is a delivery this plan does not convert, so a call through it
   // is at the kept types; the parameter may only be tested with `is` or read a field (D6702).
   if d >= 0 {
-    const pn = P.nodes[d]
+    const pn = nodeAt(d)
     if pn is Param && pn.parType >= 0 {
       for x in fsIdents {
         if identDeclOf(x) == d && x != d && !fsTypedReadSkips(x, fld) {
@@ -1559,7 +1560,7 @@ function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
   }
   const c = fsParent[r]
   if d < 0 && c >= 0 {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if (
       cn is LetDecl
       && cn.letInit == r
@@ -1570,7 +1571,7 @@ function fsWholeReadSkips(r: i32, fld: string, depth: i32): boolean {
     }
   }
   if d < 0 && c >= 0 {
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     // A function's result is read at each of its calls (D6424).
     if cn is RetStmt && cn.retArg == r {
       return fsCallsReadSkip(fsEnclosingFn(r), fld, depth - 1)
@@ -1599,7 +1600,7 @@ let fsFixedCalls: i32[] = []
 function fsTypedReadSkips(x: i32, fld: string): boolean {
   const m = fsParent[x]
   if m < 0 { return false }
-  const mn = P.nodes[m]
+  const mn = nodeAt(m)
   if mn is IsExpr && mn.isObj == x { return true }
   if !(mn is Member) || mn.memObj != x { return false }
   if mn.memProp != fld { return true }
@@ -1615,7 +1616,7 @@ function fsTypedReadSkips(x: i32, fld: string): boolean {
 function fsReadSkips(x: i32, fld: string, depth: i32): boolean {
   const m = fsParent[x]
   if m < 0 { return false }
-  const mn = P.nodes[m]
+  const mn = nodeAt(m)
   if mn is Member && mn.memObj == x {
     if mn.memProp != fld { return true }
     const c = fsParent[m]
@@ -1629,7 +1630,7 @@ function fsReadSkips(x: i32, fld: string, depth: i32): boolean {
 // Whether declared function `fd` is only ever called, and each call's result is a read
 // `fsReadSkips` allows.
 function fsCallsReadSkip(fd: i32, fld: string, depth: i32): boolean {
-  if depth <= 0 || fd < 0 || !(P.nodes[fd] is FuncDecl) { return false }
+  if depth <= 0 || fd < 0 || !(nodeAt(fd) is FuncDecl) { return false }
   for x in fsIdents {
     if identDeclOf(x) == fd && x != fd {
       const c = fsParent[x]
@@ -1647,7 +1648,7 @@ function fsListReadsSkip(lit: i32, fld: string, depth: i32): boolean {
   if depth <= 0 { return false }
   const d = fsParent[lit]
   if d < 0 { return false }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if (
     !(dn is LetDecl)
     || dn.letInit != lit
@@ -1660,7 +1661,7 @@ function fsListReadsSkip(lit: i32, fld: string, depth: i32): boolean {
     if identDeclOf(x) == d && x != d {
       const m = fsParent[x]
       if m < 0 { return false }
-      const mn = P.nodes[m]
+      const mn = nodeAt(m)
       if !(mn is Index) || mn.idxArr != x || !fsReadSkips(m, fld, depth) {
         return false
       }
@@ -1673,19 +1674,19 @@ function fsListReadsSkip(lit: i32, fld: string, depth: i32): boolean {
 // the value of when a constant call initializes it. 0 with a plan, 1 with none.
 function fsPlanFieldSlotsOf(d: i32): i32 {
   if d < 0 || d >= P.nodes.length { return 1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if !(dn is LetDecl) || dn.letKw != "const" || dn.letInit < 0 { return 1 }
   let rc = 1
   // A record `const` plans each of its fields.
-  const o = P.nodes[dn.letInit]
+  const o = nodeAt(dn.letInit)
   if o is ObjLit {
     for fi in o.objFields {
-      const fin = P.nodes[fi]
+      const fin = nodeAt(fi)
       if fin is FieldInit {
         let src = fin.fiValue
         const sd = letDeclOfRead(src)
         if sd >= 0 {
-          const sn = P.nodes[sd]
+          const sn = nodeAt(sd)
           if sn is LetDecl && sn.letKw == "const" { src = sn.letInit }
         }
         if fsPlanFieldSlot(fin.fiValue, src) == 0 { rc = 0 }
@@ -1703,7 +1704,7 @@ function fsPlanFieldSlotsOf(d: i32): i32 {
 // The field slots of every call of constant maker `fd` that is a record field, or initializes a
 // `const` that is one. 0 with a plan, 1 with none.
 function fsPlanMakerFields(fd: i32): i32 {
-  if fd < 0 || fd >= P.nodes.length || !(P.nodes[fd] is FuncDecl) { return 1 }
+  if fd < 0 || fd >= P.nodes.length || !(nodeAt(fd) is FuncDecl) { return 1 }
   let rc = 1
   for r in fsIdents {
     const c = fsParent[r]
@@ -1724,14 +1725,14 @@ function fsPlanMakerFields(fd: i32): i32 {
 function fsStmtParentOk(s: i32): boolean {
   const p = fsParent[s]
   if p < 0 { return false }
-  P.nodes[p] is Block || P.nodes[p] is Program
+  nodeAt(p) is Block || nodeAt(p) is Program
 }
 
 // Indexes program `root` for `vrCalls` in exact mode: a call it answers runs the value alone.
 function fsReachIndex(root: i32) {
   const stmts: i32[] = []
   if root >= 0 && root < P.nodes.length {
-    const rn = P.nodes[root]
+    const rn = nodeAt(root)
     if rn is Program {
       for s in rn.progStmts { stmts.push(s) }
     }
@@ -1754,7 +1755,7 @@ export function fsPlan(root: i32): i32 {
   let ai = 0
   while ai < fsAsks.length {
     const a = fsAsks[ai]
-    if a >= 0 && a < P.nodes.length && P.nodes[a] is Ident {
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is Ident {
       const d = fsIdentityLetOf(a)
       if d >= 0 && !hasI32(fsAsks, d) { fsAsks.push(d) }
       // A const lambda handed through identities into bindings each called at its own type
@@ -1793,7 +1794,7 @@ export function fsPlan(root: i32): i32 {
           d = fsParent[c]
         }
         if d >= 0 {
-          const dn = P.nodes[d]
+          const dn = nodeAt(d)
           if (
             dn is LetDecl
             && dn.letInit == c
@@ -1809,24 +1810,22 @@ export function fsPlan(root: i32): i32 {
     }
     // A binding written from a hole parameter asks for the parameter, which then takes one
     // per slot (D6530).
-    if a >= 0 && a < fsParseLen && P.nodes[a] is LetDecl {
-      fsAskWrittenHoles(a)
-    }
+    if a >= 0 && a < fsParseLen && nodeAt(a) is LetDecl { fsAskWrittenHoles(a) }
     // A maker's result, or a generic name it returns, may be a record field (D6342).
     if fsPlanFieldSlotsOf(a) == 0 || fsPlanMakerFields(a) == 0 { fields = 0 }
     // A generic named as a record `const`'s field plans that record's slots (D6700), and one
     // named in a record literal argument declares the literal as a `const` first (D6701).
-    if a >= 0 && a < fsParseLen && P.nodes[a] is Ident && fsParent[a] >= 0 {
+    if a >= 0 && a < fsParseLen && nodeAt(a) is Ident && fsParent[a] >= 0 {
       const fo = fsParent[fsParent[a]]
       if (
-        P.nodes[fsParent[a]] is FieldInit
+        nodeAt(fsParent[a]) is FieldInit
         && fo >= 0
         && fsPlanFieldSlotsOf(fsParent[fo]) == 0
       ) {
         fields = 0
       }
       if (
-        P.nodes[fsParent[a]] is FieldInit
+        nodeAt(fsParent[a]) is FieldInit
         && fo >= 0
         && fsPlanHoistLit(fo) == 0
       ) {
@@ -1836,7 +1835,7 @@ export function fsPlan(root: i32): i32 {
     if (
       a >= 0
       && a < P.nodes.length
-      && P.nodes[a] is Ident
+      && nodeAt(a) is Ident
       && fsPlanMakerFields(fsEnclosingFn(a)) == 0
     ) {
       fields = 0
@@ -1846,14 +1845,14 @@ export function fsPlan(root: i32): i32 {
   // By name first, so the holes of the functions it names see the calls it makes.
   let byName = 1
   for a in fsAsks {
-    if a >= 0 && a < fsParseLen && P.nodes[a] is Param && fsPlanByName(a) == 0 {
+    if a >= 0 && a < fsParseLen && nodeAt(a) is Param && fsPlanByName(a) == 0 {
       byName = 0
     }
   }
   const holes = fsPlanHoles()
   let anyLet = false
   for a in fsAsks {
-    if a >= 0 && a < P.nodes.length && P.nodes[a] is LetDecl { anyLet = true }
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is LetDecl { anyLet = true }
   }
   // Lets that need no slot leave the plan to the functions; one that half-planned declines.
   let lets = 1
@@ -1881,7 +1880,7 @@ export function fsPlan(root: i32): i32 {
     if (
       a >= 0
       && a < P.nodes.length
-      && P.nodes[a] is FuncDecl
+      && nodeAt(a) is FuncDecl
       && fsPlanFn(a) == 0
     ) {
       fns = 0
@@ -1903,10 +1902,10 @@ export function fsPlan(root: i32): i32 {
 // The function asked node `a` is, or the one whose `return` reads it; -1 for neither.
 function fsAskedRetFn(a: i32): i32 {
   if a < 0 || a >= P.nodes.length || a >= fsParent.length { return -1 }
-  if P.nodes[a] is FuncDecl { return a }
+  if nodeAt(a) is FuncDecl { return a }
   const p = fsParent[a]
-  if !(P.nodes[a] is Ident) || p < 0 { return -1 }
-  const pn = P.nodes[p]
+  if !(nodeAt(a) is Ident) || p < 0 { return -1 }
+  const pn = nodeAt(p)
   if !(pn is RetStmt) || pn.retArg != a { return -1 }
   fsEnclosingFn(a)
 }
@@ -1918,7 +1917,7 @@ function fsAskConstAliases(d: i32, depth: i32) {
   for r in fsIdents {
     const a = fsParent[r]
     if r != d && identDeclOf(r) == d && a >= 0 {
-      const an = P.nodes[a]
+      const an = nodeAt(a)
       if (
         an is LetDecl
         && an.letKw == "const"
@@ -1942,11 +1941,11 @@ function fsPlanInstances(): i32 {
   fiClaimBy = []
   for a in fsAsks {
     let d = -1
-    if a >= 0 && a < fsParseLen && P.nodes[a] is Ident { d = fsEnclosingFn(a) }
-    if a >= 0 && a < fsParseLen && P.nodes[a] is LetDecl { d = a }
+    if a >= 0 && a < fsParseLen && nodeAt(a) is Ident { d = fsEnclosingFn(a) }
+    if a >= 0 && a < fsParseLen && nodeAt(a) is LetDecl { d = a }
     if fsInstanceDepOk(d) && !hasI32(fiDeps, d) { fiDeps.push(d) }
     // The emitter stops at the first such read, so every maker of the same generic is one.
-    if a >= 0 && a < fsParseLen && P.nodes[a] is Ident {
+    if a >= 0 && a < fsParseLen && nodeAt(a) is Ident {
       const k = identDeclOf(a)
       for r in fsIdents {
         if k >= 0 && r != k && identDeclOf(r) == k {
@@ -1989,7 +1988,7 @@ function fsPlanInstances(): i32 {
       if (
         g >= 0
         && g != a
-        && P.nodes[g] is FuncDecl
+        && nodeAt(g) is FuncDecl
         && !hasI32(fiDeps, g)
         && !hasI32(bodies, g)
       ) {
@@ -2026,19 +2025,19 @@ function fsInstanceReader(r: i32): i32 {
 // function, or a never-written un-annotated module binding whose slot value is a name.
 function fsInstanceDepOk(d: i32): boolean {
   if d < 0 || d >= fsParseLen || fsParent[d] < 0 { return false }
-  if !(P.nodes[fsParent[d]] is Program) { return false }
-  const n = P.nodes[d]
+  if !(nodeAt(fsParent[d]) is Program) { return false }
+  const n = nodeAt(d)
   if n is FuncDecl { return n.fnName != "" }
   if !(n is LetDecl) || n.letType >= 0 || n.letInit < 0 { return false }
   if n.letKw != "const" && fsBindingWritten(d) { return false }
-  P.nodes[fsSlotSrc(n.letInit)] is Ident
+  nodeAt(fsSlotSrc(n.letInit)) is Ident
 }
 
 // Whether an assignment or compound assignment writes binding `d`.
 function fsBindingWritten(d: i32): boolean {
   for r in fsIdents {
     if identDeclOf(r) == d && fsParent[r] >= 0 {
-      const w = P.nodes[fsParent[r]]
+      const w = nodeAt(fsParent[r])
       if (
         w is BinExpr
         && w.binLeft == r
@@ -2053,24 +2052,24 @@ function fsBindingWritten(d: i32): boolean {
 
 // Whether read `r` of dependency `d` can be renamed to a copy: a function is read as a callee.
 function fsInstanceReadOk(r: i32, d: i32): boolean {
-  if !(P.nodes[d] is FuncDecl) { return true }
+  if !(nodeAt(d) is FuncDecl) { return true }
   const c = fsParent[r]
   if c < 0 { return false }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   cn is Call && cn.callFn == r
 }
 
 // The call keys of named module function `g`; empty unless every read is a call from outside it.
 function fsInstanceKeys(g: i32): string[] {
   const keys: string[] = []
-  const f = P.nodes[g]
+  const f = nodeAt(g)
   if !(f is FuncDecl) || f.fnName == "" || fsParent[g] < 0 { return [] }
-  if !(P.nodes[fsParent[g]] is Program) { return [] }
+  if !(nodeAt(fsParent[g]) is Program) { return [] }
   for r in fsIdents {
     if identDeclOf(r) == g && r != g {
       const c = fsParent[r]
       if c < 0 || fsUnder(r, g) { return [] }
-      const cn = P.nodes[c]
+      const cn = nodeAt(c)
       if !(cn is Call) || cn.callFn != r { return [] }
       const key = fsReadKey(r)
       if !hasStr(keys, key) { keys.push(key) }
@@ -2083,7 +2082,7 @@ function fsInstanceKeys(g: i32): string[] {
 // and every lane's dependency reads renamed to copies of its own, except where lane 0 can claim
 // the original, so no original is left unread. 1 when `g` has fewer than two keys.
 function fsPlanInstanceBody(g: i32): i32 {
-  const f = P.nodes[g]
+  const f = nodeAt(g)
   const keys = fsInstanceKeys(g)
   if keys.length < 2 || hasI32(pfSrc, g) || fsByNameFn(g) || !(f is FuncDecl) {
     return 1
@@ -2152,7 +2151,7 @@ function fsInstanceClaim(d: i32, g: i32): boolean {
 
 // Inside copy `copy`, the identifier matching parse node `r` is renamed `to`.
 function fsCopyRename(copy: i32, r: i32, to: string): i32 {
-  const n = P.nodes[r]
+  const n = nodeAt(r)
   if !(n is Ident) { return 0 }
   pcCopy.push(copy)
   pcPos.push(n.pos)
@@ -2172,7 +2171,7 @@ function fsInstanceDepCopy(d: i32, g: i32, k: i32): string {
     + "_"
     + i32ToStr(k)
   if hasStr(pfName, nm) || hasStr(pdName, nm) { return nm }
-  const n = P.nodes[d]
+  const n = nodeAt(d)
   if n is FuncDecl {
     const copy = pfSrc.length
     pfSrc.push(d)
@@ -2206,7 +2205,7 @@ function fsExcludedName(nm: string, _why: string): string { nm }
 function fsCallResultKey(c: i32): string {
   const p = fsParent[c]
   if p < 0 { return "u:" + i32ToStr(c) }
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if pn is Call && pn.callFn == c { return fsReadKey(c) }
   if pn is LetDecl && pn.letInit == c && pn.letType < 0 {
     let k = "l:"
@@ -2222,18 +2221,18 @@ function fsCallResultKey(c: i32): string {
   // A field of a record binding keys by the calls of that field (D6341).
   const o = fsParent[p]
   let d = -1
-  if pn is FieldInit && pn.fiValue == c && o >= 0 && P.nodes[o] is ObjLit {
+  if pn is FieldInit && pn.fiValue == c && o >= 0 && nodeAt(o) is ObjLit {
     d = fsParent[o]
   }
   if d >= 0 && pn is FieldInit {
-    const dn = P.nodes[d]
+    const dn = nodeAt(d)
     if dn is LetDecl && dn.letInit == o && dn.letType < 0 {
       let k = "l:"
       for r in fsIdents {
         if identDeclOf(r) == d && r != d {
           const m = fsParent[r]
           if m < 0 { return "u:" + i32ToStr(c) }
-          const mn = P.nodes[m]
+          const mn = nodeAt(m)
           if !(mn is Member) { return "u:" + i32ToStr(c) }
           if mn.memProp == pn.fiName {
             const rk = fsReadKey(m)
@@ -2262,7 +2261,7 @@ function fsUnder(x: i32, m: i32): boolean {
 function fsTopStmt(m: i32): i32 {
   let s = m
   while s >= 0 && fsParent[s] >= 0 {
-    if P.nodes[fsParent[s]] is Program { return s }
+    if nodeAt(fsParent[s]) is Program { return s }
     s = fsParent[s]
   }
   -1
@@ -2276,7 +2275,7 @@ function fsReadsNoLocal(m: i32): boolean {
       const d = identDeclOf(r)
       if d >= 0 && !fsUnder(d, m) {
         const p = fsParent[d]
-        if p < 0 || !(P.nodes[p] is Program) { return false }
+        if p < 0 || !(nodeAt(p) is Program) { return false }
       }
     }
   }
@@ -2288,14 +2287,14 @@ function fsReadsNoLocal(m: i32): boolean {
 // it reads a local, with each read of that key renamed to its copy (D5971). A read that
 // is not a call takes a key of its own. 1 when its reads share one key.
 function fsPlanFn(m: i32): i32 {
-  const f = P.nodes[m]
+  const f = nodeAt(m)
   if !(f is FuncDecl) || f.fnName == "" || fsParent[m] < 0 || fsByNameFn(m) {
     return 1
   }
   let top = fsTopStmt(m)
   if top < 0 { return 1 }
   if top != m {
-    if !(P.nodes[fsParent[m]] is Block) { return 1 }
+    if !(nodeAt(fsParent[m]) is Block) { return 1 }
     if !fsReadsNoLocal(m) { top = m }
   }
   const keys: string[] = []
@@ -2305,7 +2304,7 @@ function fsPlanFn(m: i32): i32 {
     if identDeclOf(r) == m && r != m {
       const c = fsParent[r]
       if c < 0 { return 1 }
-      const cn = P.nodes[c]
+      const cn = nodeAt(c)
       let key = "v:" + i32ToStr(r)
       if cn is Call && cn.callFn == r { key = fsCallResultKey(c) }
       let k = 0
@@ -2370,12 +2369,12 @@ function hsIx(par: i32): i32 {
 // initializes (D6212); -1 for any other.
 function fsFnOwner(fd: i32): i32 {
   if fd < 0 || fd >= fsParseLen { return -1 }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) { return -1 }
   if f.fnName != "" { return fd }
   const d = fsParent[fd]
   if d < 0 { return -1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if dn is LetDecl && dn.letInit == fd && dn.letType < 0 { return d }
   -1
 }
@@ -2386,20 +2385,20 @@ function fsFnOwner(fd: i32): i32 {
 // parameter without a default one argument, by position or by name in any order (D6260, D6281).
 function fsHoleParamOk(par: i32): boolean {
   if par < 0 || par >= fsParseLen || fsParent[par] < 0 { return false }
-  const p = P.nodes[par]
+  const p = nodeAt(par)
   const fd = fsParent[par]
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   const own = fsFnOwner(fd)
   if !(p is Param) || !(f is FuncDecl) || own < 0 { return false }
   if p.parDefault >= 0 || p.parOpt != 0 || p.parRest != 0 { return false }
   if p.parType >= 0 {
-    const tn = P.nodes[p.parType]
+    const tn = nodeAt(p.parType)
     if !(tn is TypeRef) || !hasStr(f.fnTyParams, tn.tyName) { return false }
   }
   if !fsStmtParentOk(own) { return false }
   for c in fsFnCalls(own) {
     if c < 0 { return false }
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if !(cn is Call) || cn.callArgs.length > f.fnParams.length { return false }
     // A parameter with a default may go without an argument (D6707).
     const ord = fsArgsInParamOrder(cn, f)
@@ -2407,7 +2406,7 @@ function fsHoleParamOk(par: i32): boolean {
     while q < f.fnParams.length {
       let a = -1
       if q < ord.length { a = ord[q] }
-      const qn = P.nodes[f.fnParams[q]]
+      const qn = nodeAt(f.fnParams[q])
       if a < 0 && !(qn is Param && (qn.parDefault >= 0 || qn.parOpt != 0)) {
         return false
       }
@@ -2432,7 +2431,7 @@ function fsFnCalls(fd: i32): i32[] {
     for r in fsIdents {
       if identDeclOf(r) == d && r != d && !hasI32(pkArg, r) {
         const c = fsParent[r]
-        const cn = P.nodes[c]
+        const cn = nodeAt(c)
         if c < 0 {
           calls.push(-1)
         } else if cn is Call && cn.callFn == r {
@@ -2494,7 +2493,7 @@ function fsIfJoinLetOf(r: i32): i32 {
   if i < 0 { return -1 }
   const d = fsParent[i]
   if d < 0 || d >= fsParseLen { return -1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
@@ -2512,15 +2511,15 @@ function fsIfArmElemOf(r: i32): i32 {
   const i = fsIfArmOf(r)
   if i < 0 { return -1 }
   const l = fsParent[i]
-  if l < 0 || l >= fsParseLen || !(P.nodes[l] is ArrayLit) { return -1 }
+  if l < 0 || l >= fsParseLen || !(nodeAt(l) is ArrayLit) { return -1 }
   i
 }
 
 // The `if` with an `else` one of whose arms ends in read `r`; -1 otherwise.
 function fsIfArmOf(r: i32): i32 {
   const b = fsParent[r]
-  if b < 0 || !(P.nodes[b] is Block) { return -1 }
-  const bn = P.nodes[b]
+  if b < 0 || !(nodeAt(b) is Block) { return -1 }
+  const bn = nodeAt(b)
   if bn is Block {
     if bn.blkStmts.length == 0 || bn.blkStmts[bn.blkStmts.length - 1] != r {
       return -1
@@ -2528,7 +2527,7 @@ function fsIfArmOf(r: i32): i32 {
   }
   const i = fsParent[b]
   if i < 0 { return -1 }
-  const inode = P.nodes[i]
+  const inode = nodeAt(i)
   if !(inode is IfStmt) { return -1 }
   if inode.ifElse < 0 || (inode.ifThen != b && inode.ifElse != b) { return -1 }
   i
@@ -2537,7 +2536,7 @@ function fsIfArmOf(r: i32): i32 {
 // The initializer of `d` when it is an un-annotated `const` binding initialized by a name, else -1.
 function fsFnAliasInit(d: i32): i32 {
   if d < 0 || d >= fsParseLen { return -1 }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
@@ -2546,7 +2545,7 @@ function fsFnAliasInit(d: i32): i32 {
   ) {
     return -1
   }
-  if !(P.nodes[dn.letInit] is Ident) { return -1 }
+  if !(nodeAt(dn.letInit) is Ident) { return -1 }
   dn.letInit
 }
 
@@ -2557,12 +2556,12 @@ function fsCalleeFn(f: i32): i32 {
   while (
     x >= 0
     && x < P.nodes.length
-    && P.nodes[x] is Ident
+    && nodeAt(x) is Ident
     && hops < fsParseLen
   ) {
     const g = identDeclOf(x)
     if g < 0 || g >= fsParseLen { return -1 }
-    if P.nodes[g] is FuncDecl { return g }
+    if nodeAt(g) is FuncDecl { return g }
     x = fsFnAliasInit(g)
     hops = hops + 1
   }
@@ -2575,7 +2574,7 @@ function fsArgsInParamOrder(cn: Call, f: FuncDecl): i32[] {
   if !hasNamedArgs(cn.callArgNames) { return cn.callArgs }
   const names: string[] = []
   for q in f.fnParams {
-    const qn = P.nodes[q]
+    const qn = nodeAt(q)
     if qn is Param { names.push(qn.parName) } else { names.push("") }
   }
   orderArgsByParamNames(names, cn.callArgs, cn.callArgNames)
@@ -2604,11 +2603,11 @@ function fsArgOfParam(cn: Call, f: FuncDecl, j: i32): i32 {
 function fsHoleFwd(r: i32): i32 {
   const c = fsParent[r]
   if c < 0 { return -1 }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) || cn.callFn == r { return -1 }
   const g = fsCalleeFn(cn.callFn)
   if g < 0 { return -1 }
-  const gn = P.nodes[g]
+  const gn = nodeAt(g)
   if !(gn is FuncDecl) { return -1 }
   let i = 0
   while i < cn.callArgs.length && cn.callArgs[i] != r { i = i + 1 }
@@ -2635,7 +2634,7 @@ function fsHoleKeys(par: i32): string[] {
     }
     for r in fsIdents {
       if identDeclOf(r) == h {
-        const cn = P.nodes[fsParent[r]]
+        const cn = nodeAt(fsParent[r])
         if cn is Call && cn.callFn == r {
           const k = fsReadKey(r)
           if !hasStr(ks, k) { ks.push(k) }
@@ -2682,11 +2681,11 @@ function fsListElemCalls(r: i32): i32[] {
   const none: i32[] = []
   const l = fsParent[r]
   if l < 0 || l >= fsParseLen { return none }
-  const ln = P.nodes[l]
+  const ln = nodeAt(l)
   if !(ln is ArrayLit) { return none }
   const d = fsParent[l]
   if d < 0 || d >= fsParseLen { return none }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if (
     !(dn is LetDecl)
     || dn.letKw != "const"
@@ -2701,7 +2700,7 @@ function fsListElemCalls(r: i32): i32[] {
   let j = 0
   while j < ln.arrElems.length {
     const e = ln.arrElems[j]
-    if e < 0 || !(P.nodes[e] is Ident) || identDeclOf(e) != h { return none }
+    if e < 0 || !(nodeAt(e) is Ident) || identDeclOf(e) != h { return none }
     if e == r { at = i32ToStr(j) }
     j = j + 1
   }
@@ -2710,16 +2709,16 @@ function fsListElemCalls(r: i32): i32[] {
     if identDeclOf(x) == d && x != d {
       const ix = fsParent[x]
       if ix < 0 || ix >= fsParseLen { return none }
-      const xn = P.nodes[ix]
+      const xn = nodeAt(ix)
       if !(xn is Index) || xn.idxArr != x { return none }
-      const kn = P.nodes[xn.idxIndex]
+      const kn = nodeAt(xn.idxIndex)
       if !(kn is NumLit) { return none }
       let k = 0
       while k < ln.arrElems.length && i32ToStr(k) != kn.numText { k = k + 1 }
       if k == ln.arrElems.length { return none }
       const c = fsParent[ix]
       if c < 0 || c >= fsParseLen { return none }
-      const cn = P.nodes[c]
+      const cn = nodeAt(c)
       if !(cn is Call) || cn.callFn != ix { return none }
       if kn.numText == at { out.push(c) }
     }
@@ -2729,7 +2728,7 @@ function fsListElemCalls(r: i32): i32[] {
 
 // The key call `c` of a listed hole calls it at.
 function fsListElemCallKey(c: i32): string {
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if cn is Call { return fsCallKey(cn, 0) }
   "!"
 }
@@ -2738,7 +2737,7 @@ function fsListElemCallKey(c: i32): string {
 // type's parameters (D6741); "" when `r` is handed to a hole `q` can split, or to nothing closed.
 function fsFixedDeliveryKey(r: i32, q: i32): string {
   if (q >= 0 && fsHoleParamOk(q)) || !fsDestFixed(r) { return "" }
-  const f = T.tys[fsDestTy(r)]
+  const f = tyAt(fsDestTy(r))
   if !(f is TyFunc) { return "" }
   let k = "c:"
   for t in f.fnParamTypes { k = k + tyToStr(t) + "," }
@@ -2749,7 +2748,7 @@ function fsFixedDeliveryKey(r: i32, q: i32): string {
 function fsHoleCopyDecl(r: i32): i32 {
   const p = fsParent[r]
   if p < 0 { return -1 }
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if pn is BinExpr && pn.binOp == "=" && pn.binRight == r {
     return letDeclOfRead(pn.binLeft)
   }
@@ -2758,7 +2757,7 @@ function fsHoleCopyDecl(r: i32): i32 {
 
 // `p` when it is a `let` initialised with `r`, else -1: every other parent reads `r` in place.
 function fsLetInitDecl(p: i32, r: i32): i32 {
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if pn is LetDecl && pn.letInit == r { return p }
   -1
 }
@@ -2817,21 +2816,21 @@ function fsHoleCopyKeys(r: i32): string[] {
 // The one key of the parameter annotated bare with the type parameter unread binding `d` is
 // annotated with, which fixes the instance the binding holds (D6762); "" when there is none.
 function fsTyParamCopyKey(d: i32): string {
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   // A binding the type-parameter plan retypes holds the instance of its own parameter.
   if !(dn is LetDecl) || dn.letType < 0 || hasI32(psRetype, dn.letType) {
     return ""
   }
-  const tn = P.nodes[dn.letType]
+  const tn = nodeAt(dn.letType)
   const fd = fsEnclosingFn(d)
   if fd < 0 || !(tn is TypeRef) { return "" }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) || !hasStr(f.fnTyParams, tn.tyName) { return "" }
   let own = -1
   for q in f.fnParams {
-    const qn = P.nodes[q]
+    const qn = nodeAt(q)
     if qn is Param && qn.parType >= 0 {
-      const qt = P.nodes[qn.parType]
+      const qt = nodeAt(qn.parType)
       if qt is TypeRef && qt.tyName == tn.tyName {
         if own >= 0 { return "" }
         own = q
@@ -2894,14 +2893,14 @@ function fsAskHoleSiblings(a: i32): i32 {
 function fsAskIdentitySiblings(a: i32): i32 {
   const c = fsParent[a]
   if c < 0 { return 0 }
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) { return 0 }
   const fd = identDeclOf(cn.callFn)
   if fd < 0 { return 0 }
   for r in fsIdents {
     const rc = fsParent[r]
     if r != a && rc >= 0 && rc != c {
-      const rcn = P.nodes[rc]
+      const rcn = nodeAt(rc)
       if rcn is Call && rcn.callFn != r && identDeclOf(rcn.callFn) == fd {
         const d = letDeclOfRead(r)
         if (
@@ -2957,7 +2956,7 @@ function fsMemberReadKey(r: i32): string {
 function fsListCallbackKey(r: i32): string {
   const p = fsParent[r]
   if p < 0 { return "" }
-  const pn = P.nodes[p]
+  const pn = nodeAt(p)
   if (
     !(pn is Call)
     || pn.callFn == r
@@ -2967,13 +2966,13 @@ function fsListCallbackKey(r: i32): string {
     return ""
   }
   if pn.callFn < 0 { return "" }
-  const cf = P.nodes[pn.callFn]
+  const cf = nodeAt(pn.callFn)
   if !(cf is Member) || (cf.memProp != "map" && cf.memProp != "filter") {
     return ""
   }
   const ot = nodeTyIxOf(cf.memObj)
   if ot < 0 { return "" }
-  const at = T.tys[ot]
+  const at = tyAt(ot)
   if !(at is TyArray) || at.aElem < 0 { return "" }
   if tyHasTyVar(at.aElem) || tyReachesHole(at.aElem, 8) { return "" }
   "c:" + tyToStr(at.aElem) + ","
@@ -2984,10 +2983,10 @@ function fsListCallbackKey(r: i32): string {
 function fsIdentityReadKey(r: i32): string {
   const c = fsParent[r]
   if c < 0 || fsIdentityArg(c) != r || fsParent[c] < 0 { return "" }
-  const dn = P.nodes[fsParent[c]]
+  const dn = nodeAt(fsParent[c])
   if dn is LetDecl && dn.letInit == c && dn.letType >= 0 {
     const at = nodeTyIxOf(dn.letType)
-    if at < 0 || !(T.tys[at] is TyFunc) { return "" }
+    if at < 0 || !(tyAt(at) is TyFunc) { return "" }
     return "t:" + tyToStr(at)
   }
   const d = fsIdentityLetOf(r)
@@ -3029,7 +3028,7 @@ function fsPlanHoles(): i32 {
     if (
       a >= 0
       && a < fsParseLen
-      && P.nodes[a] is Param
+      && nodeAt(a) is Param
       && !hasI32(pkPar, a)
       && fsHoleOverTyParam(a)
     ) {
@@ -3080,7 +3079,7 @@ function fsPlanHoles(): i32 {
         hsPar.push(par)
         hsKeys.push(ks)
         const fd = fsParent[par]
-        const f = P.nodes[fd]
+        const f = nodeAt(fd)
         let j = 0
         if f is FuncDecl {
           while j < f.fnParams.length && f.fnParams[j] != par { j = j + 1 }
@@ -3103,17 +3102,17 @@ function fsPlanHoles(): i32 {
           const cp = cps[ci]
           ci = ci + 1
           if c < 0 { return fsHoleDecline() }
-          const cn = P.nodes[c]
+          const cn = nodeAt(c)
           if cn is Call && f is FuncDecl {
             const a = fsArgOfParam(cn, f, j)
             if a < 0 { return fsHoleDecline() }
             const lam = fsIsLambdaLit(a)
             // A call always returning one generic is handed once, then the generic (D9540).
             // So is one returning one of several, by the arm index it returns (D9596).
-            const ret = (P.nodes[a] is Call
+            const ret = (nodeAt(a) is Call
               && cp < 0
               && (fsConstRet(a) >= 0 || fsChoiceStmt(c, a) >= 0))
-            if !lam && !ret && !(P.nodes[a] is Ident) { return fsHoleDecline() }
+            if !lam && !ret && !(nodeAt(a) is Ident) { return fsHoleDecline() }
             let ad = -1
             if !lam && !ret { ad = identDeclOf(a) }
             if cp >= 0 {
@@ -3124,7 +3123,7 @@ function fsPlanHoles(): i32 {
               hcCopy.push(cp)
               hcRead.push(a)
               hcPar.push(par)
-            } else if ad >= 0 && ad < fsParseLen && P.nodes[ad] is Param {
+            } else if ad >= 0 && ad < fsParseLen && nodeAt(ad) is Param {
               work.push(ad)
             } else {
               // A call several list elements reach hands its argument once, to parameters
@@ -3158,23 +3157,23 @@ function fsAskOpenCallPars(): i32 {
   const fns: i32[] = []
   for r in fsIdents {
     const d = identDeclOf(r)
-    if d >= 0 && d < fsParseLen && P.nodes[d] is FuncDecl && !hasI32(fns, d) {
+    if d >= 0 && d < fsParseLen && nodeAt(d) is FuncDecl && !hasI32(fns, d) {
       fns.push(d)
     }
   }
   for fd in fns {
-    const f = P.nodes[fd]
+    const f = nodeAt(fd)
     const own = fsFnOwner(fd)
     if f is FuncDecl && own >= 0 {
       const calls = fsFnCalls(own)
       for c in fsCallAsks {
-        const cn = P.nodes[c]
+        const cn = nodeAt(c)
         if cn is Call && hasI32(calls, c) {
           let j = 0
           while j < f.fnParams.length && j < cn.callArgs.length {
             const a = fsParenPeel(cn.callArgs[j])
             const par = f.fnParams[j]
-            if a >= 0 && P.nodes[a] is Ident && !hasI32(fsAsks, par) {
+            if a >= 0 && nodeAt(a) is Ident && !hasI32(fsAsks, par) {
               fsAsks.push(par)
             }
             j = j + 1
@@ -3195,7 +3194,7 @@ function fsListGroupPars(par: i32): i32[] {
   while gi < grp.length {
     const fd = fsParent[grp[gi]]
     gi = gi + 1
-    const f = P.nodes[fd]
+    const f = nodeAt(fd)
     if !(f is FuncDecl) { return [-1] }
     let j = 0
     while j < f.fnParams.length && f.fnParams[j] != grp[gi - 1] { j = j + 1 }
@@ -3206,7 +3205,7 @@ function fsListGroupPars(par: i32): i32[] {
         let ok = true
         const lit = fsParent[r]
         const ie = fsIfArmElemOf(r)
-        if lit >= 0 && P.nodes[lit] is ArrayLit {
+        if lit >= 0 && nodeAt(lit) is ArrayLit {
           ok = fsPushListVals(lit, vals)
         } else if ie >= 0 {
           ok = fsPushListVals(fsParent[ie], vals)
@@ -3217,7 +3216,7 @@ function fsListGroupPars(par: i32): i32[] {
         for e in vals {
           const ed = identDeclOf(e)
           if ed < 0 || ed >= fsParseLen { return [-1] }
-          const edn = P.nodes[ed]
+          const edn = nodeAt(ed)
           if !(edn is FuncDecl) || edn.fnParams.length <= j { return [-1] }
           const q = edn.fnParams[j]
           if !hasI32(grp, q) { grp.push(q) }
@@ -3231,7 +3230,7 @@ function fsListGroupPars(par: i32): i32[] {
 // Pushes the value of each element of list literal `lit`, each arm's for an `if`, onto `out`;
 // false when one is not a name.
 function fsPushListVals(lit: i32, out: i32[]): boolean {
-  const ln = P.nodes[lit]
+  const ln = nodeAt(lit)
   if !(ln is ArrayLit) { return false }
   for e in ln.arrElems {
     if !fsPushArmVals(e, out) { return false }
@@ -3244,14 +3243,14 @@ function fsPushListVals(lit: i32, out: i32[]): boolean {
 function fsPushArmVals(v: i32, out: i32[]): boolean {
   const x = fsParenPeel(v)
   if x < 0 || x >= fsParseLen { return false }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if n is Ident {
     out.push(x)
     return true
   }
   if !(n is IfStmt) || n.ifElse < 0 { return false }
   for a in [n.ifThen, n.ifElse] {
-    const an = P.nodes[a]
+    const an = nodeAt(a)
     let last = a
     if an is Block {
       if an.blkStmts.length == 0 { return false }
@@ -3268,9 +3267,9 @@ function fsPushArmVals(v: i32, out: i32[]): boolean {
 // 1 when it cannot.
 function fsPlanByName(par: i32): i32 {
   if par < 0 || par >= fsParseLen || fsParent[par] < 0 { return 1 }
-  const p = P.nodes[par]
+  const p = nodeAt(par)
   const fd = fsParent[par]
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   const own = fsFnOwner(fd)
   if !(p is Param) || !(f is FuncDecl) || own < 0 { return 1 }
   if hasI32(pfSrc, fd) || fsByNameCopied(fd) { return 1 }
@@ -3280,13 +3279,13 @@ function fsPlanByName(par: i32): i32 {
   if p.parType >= 0 || p.parDefault >= 0 || p.parOpt != 0 || p.parRest != 0 {
     return 1
   }
-  if fsParent[own] < 0 || !(P.nodes[fsParent[own]] is Program) { return 1 }
+  if fsParent[own] < 0 || !(nodeAt(fsParent[own]) is Program) { return 1 }
   let j = 0
   while j < f.fnParams.length && f.fnParams[j] != par { j = j + 1 }
   const reads: i32[] = []
   for r in fsIdents {
     if identDeclOf(r) == par {
-      const cn = P.nodes[fsParent[r]]
+      const cn = nodeAt(fsParent[r])
       if !(cn is Call) || cn.callFn != r { return 1 }
       reads.push(r)
     }
@@ -3308,9 +3307,9 @@ function fsPlanByName(par: i32): i32 {
   const names: string[] = []
   for c in calls {
     if c < 0 || hasI32(paCall, c) || (hasI32(pkCall, c) && !again) { return 1 }
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     // A copy is called by renaming the callee, which only a name can take.
-    if !(cn is Call) || cn.callFn < 0 || !(P.nodes[cn.callFn] is Ident) {
+    if !(cn is Call) || cn.callFn < 0 || !(nodeAt(cn.callFn) is Ident) {
       return 1
     }
     const a = fsArgOfParam(cn, f, j)
@@ -3354,7 +3353,7 @@ function fsPlanByName(par: i32): i32 {
         pqDecl.push(identDeclOf(fsParenPeel(args[i])))
       }
     }
-    const cn = P.nodes[calls[i]]
+    const cn = nodeAt(calls[i])
     if cn is Call && copies[k] != "" { fsRename(cn.callFn, copies[k]) }
     pkCall.push(calls[i])
     pkArg.push(args[i])
@@ -3384,12 +3383,12 @@ function fsByNameCopied(fd: i32): boolean {
 function fsFixedFnName(a: i32, fd: i32): string {
   const x = fsParenPeel(a)
   if x < 0 || x >= fsParseLen { return "" }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if !(n is Ident) { return "" }
   const d = identDeclOf(x)
   if d < 0 || d >= fsParseLen || d == fd || fsParent[d] < 0 { return "" }
-  if !(P.nodes[fsParent[d]] is Program) { return "" }
-  const dn = P.nodes[d]
+  if !(nodeAt(fsParent[d]) is Program) { return "" }
+  const dn = nodeAt(d)
   let ok = dn is FuncDecl && dn.fnName == n.identName
   if dn is LetDecl && dn.letKw == "const" && dn.letName == n.identName {
     ok = dn.letType < 0 && fsIsLambdaLit(dn.letInit)
@@ -3431,7 +3430,7 @@ function fsHoleAskLet(a: i32): i32 {
 // Split parameter `si`'s name for key `k`: its own for the first key, a fresh one past it.
 function hsSlot(si: i32, k: string): string {
   const par = hsPar[si]
-  const p = P.nodes[par]
+  const p = nodeAt(par)
   let nm = ""
   if p is Param { nm = p.parName }
   let i = 0
@@ -3460,7 +3459,7 @@ function fsPlanHoleRewrites(): i32 {
     for r in fsIdents {
       if identDeclOf(r) == par {
         const c = fsParent[r]
-        const cn = P.nodes[c]
+        const cn = nodeAt(c)
         if cn is Call && cn.callFn == r {
           fsRename(r, hsSlot(si, fsReadKey(r)))
         } else {
@@ -3503,7 +3502,7 @@ function fsPlanHoleRewrites(): i32 {
   let hi = 0
   while hi < hdRead.length {
     const a = hdRead[hi]
-    const an = P.nodes[a]
+    const an = nodeAt(a)
     const names: string[] = []
     const d = letDeclOfRead(a)
     let mi = -1
@@ -3520,7 +3519,7 @@ function fsPlanHoleRewrites(): i32 {
     let rn = ""
     const gx = fsConstRet(a)
     if gx >= 0 {
-      const g = P.nodes[gx]
+      const g = nodeAt(gx)
       if g is Ident { rn = g.identName }
     }
     for k in hdKeys[hi] {
@@ -3534,7 +3533,7 @@ function fsPlanHoleRewrites(): i32 {
   }
   hi = 0
   while hi < hcRead.length {
-    const an = P.nodes[hcRead[hi]]
+    const an = nodeAt(hcRead[hi])
     const pars = hsSlotNames(hsIx(hcPar[hi]))
     if an is Ident && pars.length > 1 {
       const rest: string[] = []
@@ -3561,25 +3560,25 @@ function fsPlanHoleRewrites(): i32 {
 // that plan retyped: each is then a copy of the parameter per slot (D6760). So does such a
 // binding a split parameter annotated with a bare type parameter seeds (D6793).
 function fsDropTyParamPlan(par: i32): i32 {
-  const p = P.nodes[par]
+  const p = nodeAt(par)
   const fd = fsParent[par]
   if fd < 0 || !(p is Param) { return 0 }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) { return 0 }
   if p.parType >= 0 {
-    const pt = P.nodes[p.parType]
+    const pt = nodeAt(p.parType)
     if !(pt is TypeRef) || !hasStr(f.fnTyParams, pt.tyName) { return 0 }
   }
   for r in fsIdents {
     const c = fsParent[r]
-    const cn = P.nodes[c]
+    const cn = nodeAt(c)
     if (
       identDeclOf(r) == par
       && cn is LetDecl
       && cn.letInit == r
       && cn.letType >= 0
     ) {
-      const tn = P.nodes[cn.letType]
+      const tn = nodeAt(cn.letType)
       if (
         tn is TypeRef
         && hasStr(f.fnTyParams, tn.tyName)
@@ -3630,9 +3629,9 @@ function fsDropTyParamPlan(par: i32): i32 {
 // Whether a parameter of `f` is annotated bare with type name `nm`.
 function fsParamsName(f: FuncDecl, nm: string): boolean {
   for q in f.fnParams {
-    const qn = P.nodes[q]
+    const qn = nodeAt(q)
     if qn is Param && qn.parType >= 0 {
-      const qt = P.nodes[qn.parType]
+      const qt = nodeAt(qn.parType)
       if qt is TypeRef && qt.tyName == nm { return true }
     }
   }
@@ -3643,7 +3642,7 @@ function fsParamsName(f: FuncDecl, nm: string): boolean {
 function fsLetOfType(t: i32): i32 {
   let i = 0
   while i < fsParseLen {
-    const n = P.nodes[i]
+    const n = nodeAt(i)
     if n is LetDecl && n.letType == t { return i }
     i = i + 1
   }
@@ -3654,26 +3653,26 @@ function fsLetOfType(t: i32): i32 {
 // read body binding's that names it, when its function names that type parameter nowhere but in
 // those bare annotations; each is then a hole of its own, as D6202's spelling is (D6240, D6470).
 function fsStripTyParam(par: i32): i32 {
-  const p = P.nodes[par]
+  const p = nodeAt(par)
   if !(p is Param) || p.parType < 0 { return 0 }
-  const tn = P.nodes[p.parType]
+  const tn = nodeAt(p.parType)
   const fd = fsParent[par]
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(tn is TypeRef) || !(f is FuncDecl) { return 0 }
   const named: i32[] = []
   for q in f.fnParams {
-    const qn = P.nodes[q]
+    const qn = nodeAt(q)
     if qn is Param && qn.parType >= 0 {
-      const qt = P.nodes[qn.parType]
+      const qt = nodeAt(qn.parType)
       if qt is TypeRef && qt.tyName == tn.tyName { named.push(q) }
     }
   }
   for r in fsIdents {
     const d = identDeclOf(r)
     if d >= 0 && d < fsParseLen && !hasI32(named, d) && fsUnder(d, fd) {
-      const dn = P.nodes[d]
+      const dn = nodeAt(d)
       if dn is LetDecl && dn.letType >= 0 {
-        const dt = P.nodes[dn.letType]
+        const dt = nodeAt(dn.letType)
         if dt is TypeRef && dt.tyName == tn.tyName { named.push(d) }
       }
     }
@@ -3702,7 +3701,7 @@ function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
   if s < 0 || fd < 0 || fd >= P.nodes.length { return fsHoleDecline() }
   const nm = fsPlanArmCopy(a, leaves)
   if nm == "" { return fsHoleDecline() }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) { return fsHoleDecline() }
   pnCall.push(c)
   pnArg.push(a)
@@ -3719,7 +3718,7 @@ function fsPlanChoiceRet(a: i32, leaves: string[], count: i32): i32 {
 function fsPlanArmCopy(a: i32, leaves: string[]): string {
   const fd = fsCallRunsFn(a)
   if fd < 0 || fd >= P.nodes.length { return "" }
-  const f = P.nodes[fd]
+  const f = nodeAt(fd)
   if !(f is FuncDecl) { return "" }
   const nm = f.fnName + "$x" + i32ToStr(fd)
   if !hasStr(pnSrcName, nm) {
@@ -3737,7 +3736,7 @@ function fsApplyChoiceRets(): i32 {
   while i < pnSrc.length {
     const f = reparseFuncDeclAt(fsFirstTok(pnSrc[i]))
     if f < 0 { return -1 }
-    const fn = P.nodes[f]
+    const fn = nodeAt(f)
     if !(fn is FuncDecl) { return -1 }
     fn.fnName = pnSrcName[i]
     if fsNumberRets(fn.fnBody, pnSrcLeaves[i]) != 0 { return -1 }
@@ -3746,14 +3745,14 @@ function fsApplyChoiceRets(): i32 {
   }
   i = 0
   while i < pnCall.length {
-    const c = P.nodes[pnCall[i]]
+    const c = nodeAt(pnCall[i])
     const a = pnArg[i]
-    const an = P.nodes[a]
+    const an = nodeAt(a)
     if !(c is Call) || !(an is Call) || a >= nodeToks.length { return -1 }
     if an.callFn < 0 || an.callFn >= P.nodes.length { return -1 }
     P.pos = nodeToks[a] + 1
     const pos = an.pos
-    an.callFn = mkIdent(pnFn[i], P.nodes[an.callFn].pos)
+    an.callFn = mkIdent(pnFn[i], nodeAt(an.callFn).pos)
     const lam = fsChoiceTakesLambda(an)
     const args: i32[] = []
     let ahead = true
@@ -3796,10 +3795,10 @@ function fsNumberRets(b: i32, leaves: string[]): i32 {
   const stack: i32[] = [b]
   while stack.length > 0 {
     const x = stack.pop() ?? -1
-    const n = P.nodes[x]
+    const n = nodeAt(x)
     if n is RetStmt {
       const r = n.retArg
-      const rn = if r >= 0 && r < P.nodes.length { P.nodes[r] } else { n }
+      const rn = if r >= 0 && r < P.nodes.length { nodeAt(r) } else { n }
       if !(rn is Ident) { return -1 }
       let k = 0
       while k < leaves.length && leaves[k] != rn.identName { k = k + 1 }
@@ -3877,7 +3876,7 @@ function fsPinReadKey(r: i32): string {
   if q < 0 { return "" }
   const dt = fsDestTy(r)
   if dt >= 0 && !tyHasTyVar(dt) && !tyReachesHole(dt, 8) { return "" }
-  const cn = P.nodes[fsParent[r]]
+  const cn = nodeAt(fsParent[r])
   if !(cn is Call) { return "" }
   "p" + i32ToStr(q) + ":" + fsCallKey(cn, 0)
 }
@@ -3921,14 +3920,14 @@ function fsLaneSet(): i32 {
   fsLanes = []
   // The set: the asked declarations, closed over copies in either direction.
   for a in fsAsks {
-    if a >= 0 && a < P.nodes.length && P.nodes[a] is LetDecl && memIx(a) < 0 {
+    if a >= 0 && a < P.nodes.length && nodeAt(a) is LetDecl && memIx(a) < 0 {
       fsMem.push(a)
     }
   }
   let i = 0
   while i < fsMem.length {
     const m = fsMem[i]
-    const d = P.nodes[m]
+    const d = nodeAt(m)
     if d is LetDecl {
       const src = letDeclOfRead(d.letInit)
       if src >= 0 && memIx(src) < 0 { fsMem.push(src) }
@@ -3940,7 +3939,7 @@ function fsLaneSet(): i32 {
           const t = fsCopyTarget(r)
           if t >= 0 && memIx(t) < 0 { fsMem.push(t) }
         } else if key == "" {
-          const w = P.nodes[fsParent[r]]
+          const w = nodeAt(fsParent[r])
           if w is BinExpr {
             const src = letDeclOfRead(w.binRight)
             if src >= 0 && memIx(src) < 0 { fsMem.push(src) }
@@ -4009,7 +4008,7 @@ function fsLaneSet(): i32 {
 // Whether member `m` is an un-annotated `const` whose call always returns one generic name
 // (`fsConstRet`, `fsConstAliasRet`), so a slot past its first can read the name afresh.
 function fsMemHoldsGeneric(m: i32): boolean {
-  const d = P.nodes[m]
+  const d = nodeAt(m)
   if !(d is LetDecl) || d.letKw != "const" || d.letType >= 0 || d.letInit < 0 {
     return false
   }
@@ -4043,7 +4042,7 @@ function fsAskWrittenHoles(d: i32): i32 {
     if (
       pd >= 0
       && pd < fsParseLen
-      && P.nodes[pd] is Param
+      && nodeAt(pd) is Param
       && fsHoleCopyDecl(r) == d
       && !hasI32(fsAsks, pd)
     ) {
@@ -4057,11 +4056,11 @@ function fsAskWrittenHoles(d: i32): i32 {
 // write, and each read renamed to its slot. 1 declines.
 function fsPlanMember(mi: i32): i32 {
   const m = fsMem[mi]
-  const d = P.nodes[m]
+  const d = nodeAt(m)
   if !(d is LetDecl) { return 1 }
   const lanes = fsLanes[mi]
   if lanes.length == 0 { return 0 }
-  if d.letType >= 0 && !(P.nodes[d.letType] is TypeRef) { return 1 }
+  if d.letType >= 0 && !(nodeAt(d.letType) is TypeRef) { return 1 }
   if !fsStmtParentOk(m) { return 1 }
   // A call returning one of several generics runs once too, as the index of the one it returns.
   const callLeaves = if lanes.length > 1 { fsChoiceRetLeaves(d.letInit) } else { [] }
@@ -4102,7 +4101,7 @@ function fsPlanMember(mi: i32): i32 {
       const key = fsLaneReadKey(r)
       if key == "" {
         const w = fsParent[r]
-        const wn = P.nodes[w]
+        const wn = nodeAt(w)
         if !(wn is BinExpr) || !fsStmtParentOk(w) { return 1 }
         const wl = if callFn != "" { fsChoiceRetLeaves(wn.binRight) } else { [] }
         if wl.length > 0 {
@@ -4166,7 +4165,7 @@ function fsPlanMember(mi: i32): i32 {
 // fresh copy of `v`; "!" when the hole has no parameter of that key.
 function fsLaneValName(v: i32, vp: i32, lane: string): string {
   if vp >= 0 { return laneName(vp, lane) }
-  if v < 0 || v >= fsParseLen || !(P.nodes[v] is Ident) { return "" }
+  if v < 0 || v >= fsParseLen || !(nodeAt(v) is Ident) { return "" }
   const si = hsIx(identDeclOf(v))
   if si < 0 || fsHoleCopyKeys(v).length < 2 { return "" }
   if !hasStr(hsKeys[si], lane) { return "!" }
@@ -4189,7 +4188,7 @@ function fsApplyChoiceWrite(i: i32): i32 {
   if w < 0 || w >= nodeToks.length || pc < 0 || pc >= pcLeaves.length {
     return -1
   }
-  const wn = P.nodes[w]
+  const wn = nodeAt(w)
   if (
     !(wn is BinExpr)
     || wn.binLeft >= P.nodes.length
@@ -4197,12 +4196,12 @@ function fsApplyChoiceWrite(i: i32): i32 {
   ) {
     return -1
   }
-  const c = P.nodes[wn.binRight]
+  const c = nodeAt(wn.binRight)
   if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
   P.pos = nodeToks[w] + 1
   const pos = wn.pos
-  c.callFn = mkIdent(pcwCallFn[i], P.nodes[c.callFn].pos)
-  wn.binLeft = mkIdent(pcName[pc], P.nodes[wn.binLeft].pos)
+  c.callFn = mkIdent(pcwCallFn[i], nodeAt(c.callFn).pos)
+  wn.binLeft = mkIdent(pcName[pc], nodeAt(wn.binLeft).pos)
   let k = pcwNames[i].length - 1
   while k >= 0 {
     const sel = fsSelectArm(pcName[pc], pcLeaves[pc], pos)
@@ -4215,7 +4214,7 @@ function fsApplyChoiceWrite(i: i32): i32 {
 }
 
 function fsRename(ix: i32, name: string): i32 {
-  const n = P.nodes[ix]
+  const n = nodeAt(ix)
   if n is Ident && n.identName == name { return 0 }
   prIdent.push(ix)
   prName.push(name)
@@ -4245,7 +4244,7 @@ function fsConstLets(): i32 {
   const cands: i32[] = []
   let i = 0
   while i < fsParseLen {
-    const n = P.nodes[i]
+    const n = nodeAt(i)
     if n is LetDecl && n.letKw == "let" && n.letType < 0 && n.letInit >= 0 {
       if fsMayHoldFixedFn(n.letInit) { cands.push(i) }
     }
@@ -4257,9 +4256,9 @@ function fsConstLets(): i32 {
   clLet = Map()
   i = 0
   while i < fsParseLen {
-    const n = P.nodes[i]
+    const n = nodeAt(i)
     if n is BinExpr && n.binOp == "=" {
-      const l = P.nodes[n.binLeft]
+      const l = nodeAt(n.binLeft)
       if l is Ident { clWritten[l.identName] = true }
     }
     let nm = ""
@@ -4283,7 +4282,7 @@ function fsConstLets(): i32 {
     t = t + 1
   }
   for c in cands {
-    const n = P.nodes[c]
+    const n = nodeAt(c)
     if (
       n is LetDecl
       && !(clWritten[n.letName] ?? false)
@@ -4299,7 +4298,7 @@ function fsConstLets(): i32 {
 function fsMayHoldFixedFn(v: i32): boolean {
   const x = fsParenPeel(v)
   if x < 0 || x >= P.nodes.length { return false }
-  const n = P.nodes[x]
+  const n = nodeAt(x)
   if n is FuncDecl { return n.fnName == "" }
   n is Ident
 }
@@ -4307,21 +4306,21 @@ function fsMayHoldFixedFn(v: i32): boolean {
 // Whether value `v` is a lambda, or a name declared once as a named function or as an unwritten
 // binding holding such a value; a copy of a written binding holds whatever the last write stored.
 function fsFixedFnValue(v: i32, depth: i32): boolean {
-  const n = P.nodes[fsParenPeel(v)]
+  const n = nodeAt(fsParenPeel(v))
   if n is FuncDecl { return n.fnName == "" }
   if !(n is Ident) || depth > 16 { return false }
   const nm = n.identName
   if (clDecls[nm] ?? 0) != 1 || (clWritten[nm] ?? false) { return false }
   const d = clLet[nm] ?? -1
   if d < 0 { return false }
-  const dn = P.nodes[d]
+  const dn = nodeAt(d)
   if dn is FuncDecl { return true }
   dn is LetDecl && dn.letInit >= 0 && fsFixedFnValue(dn.letInit, depth + 1)
 }
 
 // The statements of a block or the program; empty for any other node.
 function fsStmtsOf(o: i32): i32[] {
-  const n = P.nodes[o]
+  const n = nodeAt(o)
   if n is Block { return n.blkStmts }
   if n is Program { return n.progStmts }
   fsNoStmts("a node that holds no statement list")
@@ -4355,7 +4354,7 @@ function fsInsertAfter(anchor: i32, x: i32): i32 {
     out.push(xs[i])
     if xs[i] == anchor {
       if i + 1 < xs.length {
-        const nx = P.nodes[xs[i + 1]]
+        const nx = nodeAt(xs[i + 1])
         if nx is BreakStmt && nx.brkHasVal == 1 { return -1 }
       }
       out.push(x)
@@ -4379,7 +4378,7 @@ function fsInsertBefore(anchor: i32, x: i32): i32 {
 
 // Sets the statement list of `o`, a block or the program, to `out`. -1 for another node.
 function fsSetStmts(o: i32, out: i32[]): i32 {
-  const on = P.nodes[o]
+  const on = nodeAt(o)
   if on is Block {
     on.blkStmts = out
     return 0
@@ -4395,7 +4394,7 @@ function fsSetStmts(o: i32, out: i32[]): i32 {
 function fsFirstTok(ix: i32): i32 {
   if ix < 0 || ix >= nodeToks.length { return -1 }
   let t = nodeToks[ix]
-  const at = P.nodes[ix].pos
+  const at = nodeAt(ix).pos
   while t >= 0 && P.toks[t].start != at { t = t - 1 }
   t
 }
@@ -4403,7 +4402,7 @@ function fsFirstTok(ix: i32): i32 {
 // A fresh value: slot `name` when set, else a fresh copy of parse node `src`. -2 declines.
 function fsValueNode(src: i32, name: string): i32 {
   if src < 0 { return -1 }
-  const n = P.nodes[src]
+  const n = nodeAt(src)
   if name != "" { return mkIdent(name, n.pos) }
   if n is Ident { return mkIdent(n.identName, n.pos) }
   if n is FuncDecl {
@@ -4413,11 +4412,11 @@ function fsValueNode(src: i32, name: string): i32 {
   }
   const cx = fsParenPeel(src)
   if cx < 0 || cx >= P.nodes.length { return -2 }
-  const cn = P.nodes[cx]
+  const cn = nodeAt(cx)
   if cn is IfStmt || cn is MatchExpr {
     // Copied from its tokens, since the check lowers a `match` to an `if` chain in place.
     const e = reparseChoiceExprAt(fsFirstTok(cx))
-    if e < 0 || !(P.nodes[e] is IfStmt || P.nodes[e] is MatchExpr) { return -2 }
+    if e < 0 || !(nodeAt(e) is IfStmt || nodeAt(e) is MatchExpr) { return -2 }
     return e
   }
   fsExcluded(-2, "a value that is not a name, a lambda or a choice of names")
@@ -4426,7 +4425,7 @@ function fsValueNode(src: i32, name: string): i32 {
 // Annotation `t` names type `nm`; the parser's spelling tree for it is dropped, since every
 // resolver reads that tree before the name (D6523). `rc`, or -1 when `t` is not a `TypeRef`.
 function fsRenameTypeRef(t: i32, nm: string, rc: i32): i32 {
-  const tn = P.nodes[t]
+  const tn = nodeAt(t)
   if !(tn is TypeRef) { return -1 }
   clearAnnTs(t)
   tn.tyName = nm
@@ -4438,14 +4437,14 @@ function fsApply(): i32 {
   let rc = 0
   let i = 0
   while i < prIdent.length {
-    const n = P.nodes[prIdent[i]]
+    const n = nodeAt(prIdent[i])
     if n is Ident { n.identName = prName[i] } else { rc = -1 }
     i = i + 1
   }
   i = 0
   while i < psPar.length {
-    const p = P.nodes[psPar[i]]
-    const f = P.nodes[psFn[i]]
+    const p = nodeAt(psPar[i])
+    const f = nodeAt(psFn[i])
     if p is Param && p.parType < 0 && f is FuncDecl {
       P.pos = nodeToks[psPar[i]] + 1
       p.parType = mkTypeRef(psName[i], p.pos)
@@ -4465,10 +4464,10 @@ function fsApply(): i32 {
   }
   i = 0
   while i < pmCall.length {
-    const c = P.nodes[pmCall[i]]
+    const c = nodeAt(pmCall[i])
     if c is Call && c.callFn >= 0 {
       P.pos = nodeToks[c.callFn] + 1
-      c.callFn = mkIdent(pmName[i], P.nodes[c.callFn].pos)
+      c.callFn = mkIdent(pmName[i], nodeAt(c.callFn).pos)
     } else {
       rc = -1
     }
@@ -4476,7 +4475,7 @@ function fsApply(): i32 {
   }
   i = 0
   while i < pxObj.length {
-    const o = P.nodes[pxObj[i]]
+    const o = nodeAt(pxObj[i])
     if o is ObjLit {
       P.pos = nodeToks[pxObj[i]] + 1
       const pos = o.pos
@@ -4488,16 +4487,16 @@ function fsApply(): i32 {
   }
   i = 0
   while i < pxMember.length {
-    const m = P.nodes[pxMember[i]]
+    const m = nodeAt(pxMember[i])
     if m is Member { m.memProp = pxMemberName[i] } else { rc = -1 }
     i = i + 1
   }
   i = 0
   while i < phLit.length {
-    const c = P.nodes[phStmt[i]]
+    const c = nodeAt(phStmt[i])
     if rc == 0 && c is Call {
       P.pos = nodeToks[phLit[i]] + 1
-      const pos = P.nodes[phLit[i]].pos
+      const pos = nodeAt(phLit[i]).pos
       c.callArgs[phArg[i]] = mkIdent(phName[i], pos)
       rc = fsInsertBefore(
         phStmt[i],
@@ -4510,7 +4509,7 @@ function fsApply(): i32 {
   }
   i = 0
   while i < pcAnchor.length {
-    const d = P.nodes[pcAnchor[i]]
+    const d = nodeAt(pcAnchor[i])
     const names: string[] = []
     pcLeaves.push(names)
     const c = if d is LetDecl { d.letInit } else { -1 }
@@ -4523,12 +4522,12 @@ function fsApply(): i32 {
     ) {
       // The binding's own choice, its leaves numbered, becomes the arm index binding.
       P.pos = nodeToks[c] + 1
-      const pos = P.nodes[c].pos
-      const cn = P.nodes[c]
+      const pos = nodeAt(c).pos
+      const cn = nodeAt(c)
       if pcCallFn[i] == "" {
         rc = fsNumberLeaves(c, names, 0)
       } else if cn is Call && cn.callFn >= 0 && cn.callFn < P.nodes.length {
-        cn.callFn = mkIdent(pcCallFn[i], P.nodes[cn.callFn].pos)
+        cn.callFn = mkIdent(pcCallFn[i], nodeAt(cn.callFn).pos)
         for l in pcCallLeaves[i] { names.push(l) }
       } else {
         rc = -1
@@ -4556,7 +4555,7 @@ function fsApply(): i32 {
       while ci < pcAnchor.length && pcAnchor[ci] != a { ci = ci + 1 }
       let v = -2
       if ci < pcAnchor.length {
-        v = fsSelectArm(pcName[ci], pcLeaves[ci], P.nodes[a].pos)
+        v = fsSelectArm(pcName[ci], pcLeaves[ci], nodeAt(a).pos)
         if v < 0 { v = -2 }
       } else {
         v = fsValueNode(pdValSrc[i], pdValName[i])
@@ -4564,13 +4563,13 @@ function fsApply(): i32 {
       let ty = -1
       // A lane of a binding whose type parameter is stripped is un-annotated too (D6761).
       if pdTy[i] >= 0 && !hasI32(ptPar, a) {
-        const tn = P.nodes[pdTy[i]]
+        const tn = nodeAt(pdTy[i])
         if tn is TypeRef { ty = mkTypeRef(tn.tyName, tn.pos) } else { rc = -1 }
       }
       if v == -2 { rc = -1 }
       if rc == 0 {
         P.pos = nodeToks[a] + 1
-        rc = fsInsertAfter(a, mkLet(pdKw[i], pdName[i], ty, v, P.nodes[a].pos))
+        rc = fsInsertAfter(a, mkLet(pdKw[i], pdName[i], ty, v, nodeAt(a).pos))
       }
     }
     i = i + 1
@@ -4589,7 +4588,7 @@ function fsApply(): i32 {
       if v < 0 { rc = -1 }
       if rc == 0 {
         P.pos = nodeToks[a] + 1
-        const pos = P.nodes[a].pos
+        const pos = nodeAt(a).pos
         rc = fsInsertAfter(a, mkBinary("=", mkIdent(pwName[i], pos), v, pos))
       }
     }
@@ -4601,7 +4600,7 @@ function fsApply(): i32 {
       const f = reparseFuncDeclAt(fsFirstTok(pfSrc[i]))
       rc = -1
       if f >= 0 {
-        const fn = P.nodes[f]
+        const fn = nodeAt(f)
         if fn is FuncDecl {
           fn.fnName = pfName[i]
           fsApplyCopyRenames(i, f)
@@ -4620,7 +4619,7 @@ function fsApply(): i32 {
   }
 
   for par in ptPar {
-    const p = P.nodes[par]
+    const p = nodeAt(par)
     if p is Param { p.parType = -1 }
     else if p is LetDecl { p.letType = -1 }
     else { rc = -1 }
@@ -4650,7 +4649,7 @@ function fsApplyCopyDrops(i: i32, fn: FuncDecl): i32 {
     if pqCopy[j] == i {
       const out: i32[] = []
       for q in fn.fnParams {
-        const qn = P.nodes[q]
+        const qn = nodeAt(q)
         if !(qn is Param && qn.parName == pqName[j]) { out.push(q) }
       }
       fn.fnParams = out
@@ -4664,7 +4663,7 @@ function fsApplyCopyDrops(i: i32, fn: FuncDecl): i32 {
 function fsApplyParamDrop(par: i32): i32 {
   let fd = 0
   while fd < fsParseLen {
-    const f = P.nodes[fd]
+    const f = nodeAt(fd)
     if f is FuncDecl && hasI32(f.fnParams, par) {
       const out: i32[] = []
       for q in f.fnParams {
@@ -4680,7 +4679,7 @@ function fsApplyParamDrop(par: i32): i32 {
 
 // Call `c` without its argument `a`. -1 when it cannot.
 function fsApplyArgDrop(c: i32, a: i32): i32 {
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) { return -1 }
   const args: i32[] = []
   const nms: string[] = []
@@ -4705,9 +4704,9 @@ function fsApplyArgDrop(c: i32, a: i32): i32 {
 function fsApplyParams(par: i32, names: string[]): i32 {
   let fd = 0
   while fd < fsParseLen {
-    const f = P.nodes[fd]
+    const f = nodeAt(fd)
     if f is FuncDecl && hasI32(f.fnParams, par) {
-      const at = P.nodes[par].pos
+      const at = nodeAt(par).pos
       const out: i32[] = []
       for x in f.fnParams {
         out.push(x)
@@ -4729,7 +4728,7 @@ function fsApplyParams(par: i32, names: string[]): i32 {
 // Arguments reading `names` after argument `a` of call `c`, each passed by its name in `pars`
 // when `a` is named; a name "" is a fresh copy of the lambda literal `a`. -1 when it cannot.
 function fsApplyArgs(c: i32, a: i32, names: string[], pars: string[]): i32 {
-  const cn = P.nodes[c]
+  const cn = nodeAt(c)
   if !(cn is Call) || a < 0 || a >= P.nodes.length || a >= nodeToks.length {
     return -1
   }
@@ -4772,10 +4771,10 @@ function fsApplyCopyArgs(i: i32, f: i32): i32 {
       const stack: i32[] = [f]
       while stack.length > 0 {
         const x = stack.pop()
-        const n = P.nodes[x]
+        const n = nodeAt(x)
         if n is Call {
           for a in n.callArgs {
-            const an = P.nodes[a]
+            const an = nodeAt(a)
             if (
               !done
               && an is Ident
@@ -4806,7 +4805,7 @@ function fsApplyCopyRenames(i: i32, f: i32): i32 {
       const stack: i32[] = [f]
       while stack.length > 0 {
         const x = stack.pop()
-        const n = P.nodes[x]
+        const n = nodeAt(x)
         if n is Ident && n.pos == pcPos[j] && n.identName == pcFrom[j] {
           n.identName = pcTo[j]
         }
