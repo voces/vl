@@ -347,6 +347,7 @@ import {
   FF_PIN_DECLINE,
   fnFlowAliasLam,
   fnFlowCallPathAgreedPinTys,
+  fnFlowCallPathAgreedPinTysSkipping,
   fnFlowCallPathAnnPinTys,
   fnFlowCellLam,
   fnFlowDeclFn,
@@ -354,6 +355,7 @@ import {
   fnFlowDeclPathAgreedPinTys,
   fnFlowDeclPathHeldSrcs,
   fnFlowDeclPathOnlyPinCall,
+  fnFlowDeclPathOnlyPinCallSkipping,
   fnFlowDeclPathPinCalls,
   fnFlowDeclPathPinFns,
   fnFlowDeclPathPinRets,
@@ -25754,14 +25756,111 @@ function monoHoleLamOwnCallsPin(
   if decl < 0 || decl >= P.nodes.length { return "" }
   const dn = nodeAt(decl)
   if !(dn is FuncDecl) || i < 0 || i >= dn.fnParams.length { return "" }
-  const qs: i32[] = []
+  let qs: i32[] = []
   const noPath: string[] = []
   if !fnFlowCallPathAgreedPinTys(dn.fnParams[i], noPath, callIx, qs) {
-    return ""
+    // The class merges the parameter with every list sibling's, whose calls are not this call's;
+    // a parameter the body only calls reaches no other function (D10795).
+    const skip = monoOtherPinFns(callIx, decl, dn.fnParams[i])
+    if skip.length == 0 { return "" }
+    qs = []
+    if (
+      !fnFlowCallPathAgreedPinTysSkipping(
+        dn.fnParams[i],
+        noPath,
+        callIx,
+        skip,
+        qs,
+      )
+    ) {
+      qs = monoOwnCallOpenPinAt(dn, decl, skip, args, i)
+      if qs.length == 0 { return "" }
+    }
   }
   const r = monoFnDeclRetAt(monoOpenFnArgDecl(args[i]), qs)
   if r < 0 { return "" }
   monoHoleLamPinAt(callIx, mkFuncTy(qs, r), args, i, ctx, tyOut)
+}
+
+// For a call `callIx` through a constant list naming function `decl` at an index, a read the flow
+// rewrite already named included, whose parameter `par` the body only calls: the functions other
+// than `decl` that take the pins of `par`'s class. Empty otherwise.
+function monoOtherPinFns(callIx: i32, decl: i32, par: i32): i32[] {
+  const none: i32[] = []
+  const c = nodeAt(callIx)
+  const dn = nodeAt(decl)
+  const pn = nodeAt(par)
+  if !(c is Call) || !(dn is FuncDecl) || !(pn is Param) { return none }
+  if !monoNameOnlyCalled(dn.fnBody, pn.parName, false) { return none }
+  const fx = unwrapParen(c.callFn)
+  if fx < 0 || fx >= P.nodes.length { return none }
+  let elems = monoCalleeElems(fx)
+  if !(nodeAt(fx) is Index) {
+    const ld = mfrListSrc[fx] ?? -1
+    if ld < 0 || ld >= P.nodes.length { return none }
+    const l = nodeAt(ld)
+    if !(l is LetDecl) { return none }
+    elems = monoConstListElems(l.letInit)
+  }
+  let named = false
+  for el in elems {
+    const ed = monoOpenFnArgDecl(el)
+    if ed < 0 { return none }
+    if ed == decl || declOrigOf(ed) == decl || ed == declOrigOf(decl) {
+      named = true
+    }
+  }
+  if !named { return none }
+  const out: i32[] = []
+  const noPath: string[] = []
+  for f in fnFlowDeclPathPinFns(par, noPath) {
+    if f != decl && (f < 0 || declOrigOf(f) != decl) { out.push(f) }
+  }
+  out
+}
+
+// The parameter types of the one call of parameter `i` of `decl` outside the functions `sibs`, its
+// type parameters bound from the arguments `args` hands to parameters spelled by one alone, as
+// `g(x, x)` with `x: T` (D10796); empty when no single such call closes.
+function monoOwnCallOpenPinAt(
+  dn: FuncDecl,
+  decl: i32,
+  sibs: i32[],
+  args: i32[],
+  i: i32,
+): i32[] {
+  const none: i32[] = []
+  const noPath: string[] = []
+  const ps: i32[] = []
+  if fnFlowDeclPathOnlyPinCallSkipping(dn.fnParams[i], noPath, sibs, ps) < 0 {
+    return none
+  }
+  const bN: string[] = []
+  const bT: i32[] = []
+  let j = 0
+  while j < dn.fnParams.length && j < args.length {
+    const pj = nodeAt(dn.fnParams[j])
+    if pj is Param && pj.parType >= 0 {
+      const nm = tyNameOf(pj.parType)
+      const at = nodeTyIxOf(args[j])
+      let isTp = false
+      for tp in dn.fnTyParams {
+        if tp == nm { isTp = true }
+      }
+      if isTp && at >= 0 && !tyHasTyVar(at) && !tyReachesHole(at, 16) {
+        bN.push(nm)
+        bT.push(at)
+      }
+    }
+    j = j + 1
+  }
+  const out: i32[] = []
+  for p in ps {
+    const q = substTyDeepOf(p, bN, bT, topFnOwnerOf(decl))
+    if q < 0 || tyHasTyVar(q) || tyReachesHole(q, 16) { return none }
+    out.push(q)
+  }
+  out
 }
 
 // The pin of hole lambda `args[i]` of call `callIx` at closed function type `bt`, the lambda
