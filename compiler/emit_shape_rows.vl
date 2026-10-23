@@ -769,8 +769,8 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
     // seam, since `exprString` gates its `>S` claim on the call node's litunion-alias type.
     kind = MVK_CLOSURE
   } else {
-    if structIndexByValName(valName) >= 0 { kind = MVK_STRUCT }
-    // The nominal half of that rung (D47): `structIndexByValName` is a `sNames` lookup and
+    if structIndexOfTypeNameTy(valName, ty) >= 0 { kind = MVK_STRUCT }
+    // The nominal half of that rung (D47): `structIndexByName` is a `sNames` lookup and
     // `collectS` skips a `type X = {…}` that is a union member, so an arm spelled by its own
     // name has no struct row. Reached only by the name-keyed gates, which do not canon and
     // must not disagree with the interner. Nominal: an exact `uVariants` lookup, no shape scan.
@@ -779,7 +779,7 @@ export function mvValKindOfNameTy(valName: string, ty: i32): i32 {
     // decline — the one state in which the render names no row at all, and one the node side
     // put it in. `mvValRowOfShape` is the name-keyed reading of `collectAnonShapes`' own gate:
     // a literal whose `#anon` row is suppressed because a declared row or an arm adopts it.
-    if kind < 0 && mvValArmOfShape(valName) >= 0 { kind = MVK_STRUCT }
+    if kind < 0 && mvValArmOfShapeTy(valName, ty) >= 0 { kind = MVK_STRUCT }
     if kind < 0 && mvValRowOfShape(valName) >= 0 { kind = MVK_STRUCT }
   }
   if kind < 0 { return MVK_UNSUPPORTED }
@@ -801,6 +801,24 @@ export function mvValArmOfShape(name: string): i32 {
   const boxed = variantIndexOfShapeK(name, 1, true)
   if boxed >= 0 { return boxed }
   variantIndexOfShapeK(name, 2, true)
+}
+
+// `mvValArmOfShape` for a caller that also holds the arena type `ty` of `name` (or of its
+// `| null` niche), -1 for none: a record type is matched against the arms by its field types.
+export function mvValArmOfShapeTy(name: string, ty: i32): i32 {
+  const ot = nonNullTy(ty)
+  if ot < 0 || !(tyAt(ot) is TyObj) || jrHasLitUnionField(ot, 4) {
+    return mvValArmOfShape(name)
+  }
+  if !nameIsWholeSpanShape(name) { return -1 }
+  if structIndexOfTypeNameTy(name, ot) >= 0 { return -1 }
+  const direct = variantIndexOf(name)
+  if direct >= 0 { return direct }
+  const exact = variantRowScanOfTyK(ot, 0, false)
+  if exact >= 0 { return exact }
+  const boxed = variantRowScanOfTyK(ot, 1, true)
+  if boxed >= 0 { return boxed }
+  variantRowScanOfTyK(ot, 2, true)
 }
 
 // Canonicalize a map-value union name (arena type `ty`, or -1) for the mv table, so two
@@ -1856,6 +1874,66 @@ export function structIndexOfTypeName(name: string) {
   si
 }
 
+// `structIndexOfTypeName` for a caller that also holds the arena type `ty` of `name` (or of its
+// `| null` niche), -1 for none: a spelled shape whose type is a record is placed by the
+// field-set scan over its field TYPES, not over field texts cut from the spelling.
+export function structIndexOfTypeNameTy(name: string, ty: i32): i32 {
+  const si = structIndexByName(name)
+  if si >= 0 { return si }
+  const ot = nonNullTy(ty)
+  if (
+    ot >= 0
+    && nameIsWholeSpanShape(name)
+    && tyAt(ot) is TyObj
+    && !jrHasLitUnionField(ot, 4)
+  ) {
+    return joinRowScanOfTyMemo(ot)
+  }
+  structIndexOfTypeName(name)
+}
+
+// Whether record `ty` has a literal-union field (true past `depth` records deep): the field-set
+// scan codes one as the string slot, which a declared row's atom field never strictly matches.
+function jrHasLitUnionField(ty: i32, depth: i32): boolean {
+  const t = tyAt(ty)
+  if !(t is TyObj) { return false }
+  if depth <= 0 { return true }
+  let k = 0
+  while k < t.objFieldTypes.length {
+    const f = nonNullTy(t.objFieldTypes[k])
+    if (
+      f >= 0
+      && (tyIsLitUnion(f)
+        || tyIsLitUnionArray(f)
+        || jrHasLitUnionField(f, depth - 1))
+    ) {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+// `joinRowScanOfTy`'s field-set match, each answer stamped by the `tyRegGenNow` read before
+// computing it.
+function joinRowScanOfTyMemo(ty: i32): i32 {
+  const gen = tyRegGenNow()
+  if ty < jrsGen.length && jrsGen[ty] == gen { return jrsRow[ty] }
+  const r = joinRowScanOfTy(ty)
+  if trgGen == gen {
+    while jrsGen.length <= ty {
+      jrsGen.push(-1)
+      jrsRow.push(-1)
+    }
+    jrsGen[ty] = gen
+    jrsRow[ty] = r
+  }
+  r
+}
+
+let jrsGen: i32[] = []
+let jrsRow: i32[] = []
+
 // `structIndexOfTypeName`'s answers by name, all for the generation `trgReadGenKey` last read;
 // an answer whose own computation moved the generation is not kept.
 let sitnMemo: {[string]: i32} = Map()
@@ -2109,29 +2187,59 @@ function variantIndexOfShapeK(
   const fnames: string[] = []
   const ftypes: string[] = []
   shapeFieldParse(name, fnames, ftypes)
+  variantScanK(fnames, ftypes, [], [], lenient, unique)
+}
+
+// `variantIndexOfShapeK` asked of the record type `ty` rather than of its render: each field's
+// type against the arm's field code, as `jrScanK` asks a struct row. -1 for a non-record.
+function variantRowScanOfTyK(ty: i32, lenient: i32, unique: boolean): i32 {
+  if ty < 0 || ty >= T.tys.length { return -1 }
+  const t = tyAt(ty)
+  if !(t is TyObj) { return -1 }
+  const wants: i32[] = []
+  for f in t.objFieldTypes { wants.push(jrWantOf(f)) }
+  variantScanK(t.objFieldNames, [], t.objFieldTypes, wants, lenient, unique)
+}
+
+// The variant whose fields are exactly `fnames`, each matching its spelling in `ftypes`, or, when
+// `ftys` is non-empty, its type `ftys[k]` with field code `wants[k]`. A shared field name with a
+// mismatched type is a distinct shape. `unique` declines on a second match.
+function variantScanK(
+  fnames: string[],
+  ftypes: string[],
+  ftys: i32[],
+  wants: i32[],
+  lenient: i32,
+  unique: boolean,
+): i32 {
+  const typed = ftys.length > 0
   let found = -1
   let vi = 0
   while vi < uVariants.length {
     if uFieldCount[vi] == fnames.length {
       let ok = true
       let k = 0
-      while k < fnames.length {
+      while ok && k < fnames.length {
         const fj = variantFieldIndex(vi, fnames[k])
         if fj < 0 {
           ok = false
-        } else if (
-          !shapeFieldTypeCompatK(
+        } else if typed {
+          ok = jrFieldFitsAt(
+            ftys[k],
+            wants[k],
+            variantFieldTypeAt(vi, fj),
+            variantFieldElemName(vi, fj),
+            uFieldElemTyIxAt(vi, fj),
+            lenient,
+          )
+        } else {
+          ok = shapeFieldTypeCompatK(
             ftypes[k],
             variantFieldTypeAt(vi, fj),
             variantFieldElemName(vi, fj),
             uFieldElemTyIxAt(vi, fj),
             lenient,
           )
-        ) {
-          // A shared field NAME but a mismatched field TYPE — a distinct shape that
-          // merely collides on names (a closure returning `{a:i32,f:i64,z:f64}` is NOT
-          // the union arm `{a:boolean,f:()=>…,z:i32}`). Not this variant.
-          ok = false
         }
         k = k + 1
       }
@@ -5060,6 +5168,8 @@ export function tyRegMemoReset() {
   memoKeyClear(trgGenKey)
   memoKeyClear(trgReadGenKey)
   sitnMemo = Map()
+  jrsGen = []
+  jrsRow = []
   sktGen = []
   sktKey = []
   0
