@@ -56,6 +56,7 @@ import {
   gMapSetTyBase,
   gMapSetTyN,
   gOptimized,
+  gStrFillOff,
   gStrPoolIx,
   gStrPoolTexts,
   gSynthBase,
@@ -79,6 +80,7 @@ import { variantTagKey } from "./emit_variant_sig"
 import {
   LIFT_INIT,
   LIFT_START,
+  LINK_STR_FILL,
   LK_FUNC,
   LK_GLOBAL,
   LK_HEAP,
@@ -96,6 +98,8 @@ import {
   linkFactsKey,
   linkFnHash,
   linkPieceHash,
+  linkPoolBytes,
+  linkPoolFixed,
   linkProgHash,
 } from "./link"
 import { srcmapLoadOrder, srcmapModOfTok, srcmapPathOf } from "./srcmap"
@@ -384,7 +388,7 @@ export function emitLinkSection(
       a.init.push(f)
       elNoteDefs(a, f.body, gEntries, ngImp)
     } else {
-      if k == 0 && nInit > 0 { f.body = elDropInitCalls(f.body) }
+      if k == 0 && nInit > 0 { f.body = elDropStartCalls(f.body) }
       prog.runtime.fns.push(f)
       elNoteDefs(prog.runtime, f.body, gEntries, ngImp)
     }
@@ -485,9 +489,19 @@ export function emitLinkSection(
 // The key of module `mod`'s init function.
 function elInitKey(mod: i32): string { "init:" + srcmapPathOf(mod) }
 
-// The start body `b` without its calls to the init functions, which the link writes back
-// from the artifacts that hold them.
-function elDropInitCalls(b: LinkPiece): LinkPiece {
+// The start body `b` without its pool fill and its calls to the init functions, which the link
+// writes back from the pool it lays out and the artifacts that hold them. A body holding any
+// other reference keeps its fill, which the link then leaves alone.
+function elDropStartCalls(b: LinkPiece): LinkPiece {
+  let only = b.b.length >= 2
+  for r in b.refs {
+    const fill = r.kind == LK_GLOBAL && elHasPrefix(r.key, "s:")
+      || r.kind == LK_FUNC && r.key == LINK_STR_FILL
+    if !fill && !(r.kind == LK_FUNC && elHasPrefix(r.key, "init:")) {
+      only = false
+    }
+  }
+  if only { return { b: [b.b[0], b.b[b.b.length - 1]], refs: [] } }
   const out: LinkPiece = { b: [], refs: [] }
   let from = 0
   for r in b.refs {
@@ -1065,8 +1079,18 @@ function elNoteDef(a: LinkArt, key: string, gEntries: LinkPiece[], ngImp: i32) {
   defSeen[seen] = true
   const ix = gIxOf[key] ?? -1
   if ix < ngImp || ix - ngImp >= gEntries.length { return 0 }
-  a.defs.push({ key: key, entry: gEntries[ix - ngImp] })
+  a.defs.push({ key: key, entry: elDefEntry(key, gEntries[ix - ngImp]) })
   0
+}
+
+// A pooled literal's entry as an artifact carries it: always pushing its own bytes, since
+// whether the start fills it instead is the link's choice over the whole pool.
+function elDefEntry(key: string, e: LinkPiece): LinkPiece {
+  if !elHasPrefix(key, "s:") { return e }
+  const lex = key.slice(2, key.length)
+  const pi = gStrPoolIx[lex] ?? -1
+  if pi < 0 || pi >= gStrFillOff.length || gStrFillOff[pi] < 0 { return e }
+  linkPoolFixed(e, linkPoolBytes(lex))
 }
 
 // The export section's function entries go to `root` and its memory entry to `rt`. The root's

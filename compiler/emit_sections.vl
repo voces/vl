@@ -688,6 +688,7 @@ import {
   linkIsReset,
   linkLiftNote,
 } from "./emit_link"
+import { STR_FILL_RUN, linkFillPlan, linkPoolBytes } from "./link"
 import {
   anonLeafSupersedeOf,
   sFieldTypeAt,
@@ -4031,10 +4032,6 @@ function emitStrFillFnCode(out: u8[]) {
   helpFrameBody(out, body)
 }
 
-// Filled entries per offset chain. A chain is one nested expression to a tree-shaped reader
-// (binaryen overflows its stack parsing thousands), so each run restarts from its own offset.
-const STR_FILL_RUN = 32
-
 // The fill prologue of the start function: every filled pool entry, in segment order.
 function emitStrFillCalls() {
   if gHelpStrFill < 0 { return 0 }
@@ -6469,44 +6466,17 @@ function collectStrPool() {
   strFillPlan()
 }
 
-// Bytes a module pays to fill pool entries from a segment at all: `__str_fill__`'s type and
-// body, a start function if the module has none, and the data-count and segment framing.
-const STR_FILL_FIXED = 64
-
-// Chooses the pool entries the start function fills from one passive segment, in pool order: an
-// entry whose pushed bytes cost more than its segment bytes plus a `global.get` and a `call`, and
-// only when the module saves more than the fixed cost. A build bound for `-O` fills nothing, since
-// the fill reads every entry and binaryen could then not drop the dead ones.
+// The pool entries the start function fills from one passive segment, by `linkFillPlan`, which
+// a split build's link re-derives over the pool it lays out; the segment holds their bytes.
 function strFillPlan() {
-  if gOptimized != 0 { return 0 }
   const bytes: i32[][] = []
-  let save = 0
-  for lex in gStrPoolTexts {
-    const b = cpsToUtf8(decodeStr(strToCps(lex)))
-    // Inline: an `i32.const` per byte. Filled: the bytes in the segment, a `global.get` and a
-    // `call`, and the init's `i32.const n`, one byte wider than the count `array.new_fixed` takes.
-    let pushed = 0
-    for v in b {
-      if v < 64 { pushed = pushed + 2 } else { pushed = pushed + 3 }
-    }
-    const gain = pushed - b.length - countWidening(b.length) - 7
-    if gain > 0 {
-      save = save + gain
-      bytes.push(b)
-    } else {
-      bytes.push([])
-    }
-    gStrFillOff.push(if gain > 0 { 0 } else { -1 })
-  }
-  if save <= STR_FILL_FIXED {
-    gStrFillOff = []
-    return 0
-  }
+  for lex in gStrPoolTexts { bytes.push(linkPoolBytes(lex)) }
+  gStrFillOff = linkFillPlan(bytes, gOptimized)
+  if gStrFillOff.length == 0 { return 0 }
   const seg: u8[] = []
   let k = 0
   while k < gStrFillOff.length {
     if gStrFillOff[k] >= 0 {
-      gStrFillOff[k] = seg.length
       for v in bytes[k] { seg.push(v) }
     }
     k = k + 1
@@ -6515,13 +6485,6 @@ function strFillPlan() {
   gStrDataStart.push(gStrDataParts.length)
   gStrDataParts.push({ b: seg })
   gStrDataLen.push(seg.length)
-  0
-}
-
-// How much wider `n` is as an `i32.const` (signed LEB) than as a count (unsigned LEB).
-function countWidening(n: i32): i32 {
-  if n >= 64 && n < 128 { return 1 }
-  if n >= 8192 && n < 16384 { return 1 }
   0
 }
 
