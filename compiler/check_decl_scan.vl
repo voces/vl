@@ -172,7 +172,8 @@ import { gaIndexOf } from "./check_gen_alias_anns"
 import { CSTR_NODECL } from "./check_generic_args"
 import { identNameAt } from "./check_narrow_paths"
 import { fnDeclIx } from "./check_write_scan"
-import { strListHas } from "./listutil"
+import { i32ListHas, strListHas } from "./listutil"
+import { collectRetValues } from "./check_nj_join"
 
 // `cBoundDecls` — every `type Showable = { toString(): string }` in the program, name → the
 // declaration's bound-body annotation node. Registered in pass 0a instead of `cUserTypes`:
@@ -1016,7 +1017,8 @@ function ctnScan(d: i32, name: string, fx: i32): string[] | null {
 
 // Whether every read of `d` under `roots` is a write into it, an element call, a `.get` bound by
 // a `const` (its name pushed to `gets`), a length read, or an argument a top-level function only
-// writes into.
+// writes into. A `let`/`const` `d` may also be delivered into an annotated binding outside any
+// generic, directly or through a function handing it back, since the delivery judges its writes.
 function ctnReadsKept(
   roots: i32[],
   name: string,
@@ -1025,12 +1027,30 @@ function ctnReadsKept(
 ): boolean {
   let total = 0
   let kept = 0
+  const delivers = P.nodes[d] is LetDecl
+  const viaFns: i32[] = []
+  const walked: i32[] = []
   const stack: i32[] = []
-  for r in roots { stack.push(r) }
+  const inGen: boolean[] = []
+  for r in roots {
+    stack.push(r)
+    inGen.push(false)
+  }
   while stack.length > 0 {
     const at = stack.pop() ?? -1
+    let gen = inGen.pop() ?? true
     if at >= 0 && at < P.nodes.length {
       const n = P.nodes[at]
+      if n is FuncDecl && n.fnTyParams.length > 0 { gen = true }
+      if delivers && !gen && n is LetDecl && n.letType >= 0 {
+        const li = ctnPeel(n.letInit)
+        if li >= 0 && (ctnIsRead(li, name, d) || ctnElemRead(li, name, d)) {
+          kept = kept + 1
+        } else {
+          const fx = ctnHandsBack(li, name, d)
+          if fx >= 0 { viaFns.push(fx) }
+        }
+      }
       if n is Ident {
         if n.identName == name {
           const rd = identDeclOf(at)
@@ -1066,10 +1086,73 @@ function ctnReadsKept(
           gets.push(n.letName)
         }
       }
-      for k in nodeChildren(at) { stack.push(k) }
+      if n is FuncDecl { walked.push(at) }
+      for k in nodeChildren(at) {
+        stack.push(k)
+        inGen.push(gen)
+      }
+    }
+  }
+  const done: i32[] = []
+  for fx in viaFns {
+    const fd = P.nodes[fx]
+    if fd is FuncDecl && !i32ListHas(done, fx) && i32ListHas(walked, fx) {
+      done.push(fx)
+      let calls = 0
+      for g in viaFns {
+        if g == fx { calls = calls + 1 }
+      }
+      if ctnNameReads(roots, fd.fnName, fx) == calls {
+        const rv: i32[] = []
+        collectRetValues(fd.fnBody, rv)
+        kept = kept + rv.length
+      }
     }
   }
   total == kept
+}
+
+// The top-level function with no type parameter and no un-annotated parameter that call `ix`
+// names, when every value it hands back reads binding `d` named `name`; -1 otherwise.
+function ctnHandsBack(ix: i32, name: string, d: i32): i32 {
+  if ix < 0 { return -1 }
+  const c = P.nodes[ix]
+  if !(c is Call) { return -1 }
+  const f = ctnPeel(c.callFn)
+  const fname = identNameAt(f)
+  if fname == "" { return -1 }
+  const fx = fnDeclIx[fname] ?? -1
+  if !wrFnClosed(fx) { return -1 }
+  const fd = P.nodes[fx]
+  if !(fd is FuncDecl) || fd.fnBody < 0 || fd.fnRet >= 0 { return -1 }
+  const fdecl = identDeclOf(f)
+  if fdecl != fx && fdecl >= 0 { return -1 }
+  const rv: i32[] = []
+  collectRetValues(fd.fnBody, rv)
+  if rv.length == 0 { return -1 }
+  for v in rv {
+    if !ctnIsRead(v, name, d) { return -1 }
+  }
+  fx
+}
+
+// How many reads of the name `fname` under `roots` resolve to function `fx`, or to nothing.
+function ctnNameReads(roots: i32[], fname: string, fx: i32): i32 {
+  let total = 0
+  const stack: i32[] = []
+  for r in roots { stack.push(r) }
+  while stack.length > 0 {
+    const at = stack.pop() ?? -1
+    if at >= 0 && at < P.nodes.length {
+      const n = P.nodes[at]
+      if n is Ident && n.identName == fname {
+        const rd = identDeclOf(at)
+        if rd == fx || rd < 0 { total = total + 1 }
+      }
+      for k in nodeChildren(at) { stack.push(k) }
+    }
+  }
+  total
 }
 
 // Whether `ix` is a writing method of binding `d` named `name`, as a call's callee.
