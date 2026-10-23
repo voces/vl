@@ -659,6 +659,33 @@ What each slice changes:
     14 files and from `repRowOfTyStruct` in 6, so not even its decision moves.
   - Left: the 6 parses in `mvValNamesCompat` and `shapeFieldTypeCompatK`, inside the name-keyed
     resolver. They go with `structIndexOfTypeName`, not one by one.
+  - Banked, nothing retired: the callers that hold the shape's type ask the field-set scan over
+    field TYPES. `structIndexOfTypeNameTy(name, ty)` is the declared-name lookup, then, for a
+    whole-span shape whose type is a record, `joinRowScanOfTy` (memoised per type and
+    generation). `mvValArmOfShapeTy` is the variant twin, scanning arms with `jrFieldFitsAt`.
+    - Moved: 16 sites. `emit_sig_tokens`: `letAnnIsUninternedShape`, `annParamKindTy` (2),
+      `annRetKindTy`. `emit_classify`: 5 annotation and node finds, among them the covered
+      member's row in the union-member walk. `emit_ref_list_kinds`: `letAnnStructIdx`.
+      `emit_union_atoms`: the map-value struct row and 3 arm finds. `mvValKindOfNameTy`: its
+      struct rung and its arm rung.
+    - Probe: old and new answers side by side at every moved site, over the self-compile and
+      16,762 files, with a control that trips in 2,533. All agree but 7 files, and each of
+      those builds the same module bytes and output on the master seed and the candidate.
+    - A shape with a literal-union field, at any record depth, stays on the name path.
+      `jrWantOf` codes the field as the string slot, but a declared row such as
+      `type R = { k: K }` holds the alias as an atom (code 0). So the strict pass took a
+      `{k:string}` row ahead of `R`, and `closures/generic-returned-record-param.vl` trapped
+      with an indirect-call type mismatch.
+    - Left: `mintUnionFieldObjRow`'s test. There the typed scan finds an existing row in 9
+      files where the name finds none, which skips the mint and changes the module in 4.
+    - Left: 39 plain `structIndexOfTypeName` and `variantIndexOfTypeName` calls, most holding
+      only a spelling (element, member and variant names, shape-text walkers). Not probed:
+      `emit_collect`'s function-return rung, which renders a `TyObj` it holds with `tyToStr`,
+      and the 4 in `emit_mono`, which this step did not touch.
+    - Reach after the change, in files of the same 16,762: `shapeFieldTypeCompatK` 3,042 to
+      691, and its map-value query (`mvValNamesCompat` with no type) 262 to 12. The
+      self-compile reaches the first 918 times, down from 4,064, and the second 0 times,
+      down from 74.
 - **D7.** `narrowVariants` banks a type for multi-member sets, where `narrowSlotTy` is `-1` today.
 
   No new column was needed for the two sites that moved: the slot's member set already holds the
@@ -752,6 +779,12 @@ What each slice changes:
        resolvers `structIndexOfTypeName` and `variantIndexOfShapeK`. It holds no type by
        construction, and gets one only when those resolvers' callers move to the typed scan
        (`jrFieldFits`). That is the largest group, 77 files.
+
+       Partly done (D6, `structIndexOfTypeNameTy`): the callers that hold the shape's type
+       moved. The untyped map-value query is now reached in 12 files, down from 262, and not
+       by the self-compile; the 12 are not yet attributed to a caller. A shape with a
+       literal-union field stays on the name path until `jrWantOf` codes an alias field as the
+       declared row does.
     3. Done: the slot finds pass a type. 8 files still have none, because their caller banked
        no `mvValTyIx`/`rlElemTyIx`.
     4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in
