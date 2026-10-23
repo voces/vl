@@ -9,7 +9,7 @@
 //
 //   classes  — witnesses whose function values land in each verdict, with exact counts: an
 //              agreement, a multi-pin class against mono's own refusal, an undecided
-//              return, and the two disagreements that were silent wrong code.
+//              return, and a disagreement that was silent wrong code.
 //   identity — armed and disarmed compiles emit the same bytes and the same diagnostics.
 //   off      — disarmed, the table records no row, and a program with no generic does no work
 //              (the monomorphizer builds it, armed or not, whenever a generic exists).
@@ -94,8 +94,8 @@ click({ onClick: () => print("A") })
 print("end")
 `;
 
-// A returned closure whose written result names a type parameter the instance did not bind
-// (D3935).
+// A returned closure whose written result names a type parameter: the clone is annotated at
+// the value's type or null, so its written result agrees with the checked one (D3935).
 const M01B = `function a<T>(x: T): (t: T) => ((u: T) => T) | null { (t: T) => (u: T) => u }
 function pr<T>(x: T) {
   const f = a(x)(x)
@@ -124,8 +124,8 @@ const CASES: [string, string, number, string][] = [
     "M01B",
     M01B,
     0,
-    "agree | direct call | a=1; agree | direct call | pr=1; agree | return | __lambda_3=2; " +
-    "disagree: written result is not the checked one | return | __lambda_2=2; " +
+    "agree | direct call | a=1; agree | direct call | pr=1; agree | return | __lambda_2=2; " +
+    "agree | return | __lambda_3=2; " +
     "unpinned: binding left open | direct call | a=1; " +
     "unpinned: mono decided alone | return | __lambda_0=1; " +
     "unpinned: mono decided alone | return | __lambda_1=1",
