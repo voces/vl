@@ -60,6 +60,7 @@ import {
   nodeTyIxOf,
   nodeTyMapKeyKind,
   nodeTyWrites,
+  tyIsNulI32List,
 } from "./check_node_tys"
 import {
   MAP_KEY_STR,
@@ -100,10 +101,12 @@ import {
   tyIsLitUnionAlias,
   tyIsLitUnionArray,
   tyIsLitUnionOrLit,
+  tyIsNullableLitUnion,
   tyIsOneStrLit,
   tyMutEpoch,
   tyNestedArrLeafRenders,
   tyNomNameCycled,
+  tyNulInnerIsPrim,
   tyScalarBaseIs,
   tyToEmitName,
   tyToNominalName,
@@ -152,7 +155,6 @@ import {
   nameIsMapArray,
   nameIsNulBool,
   nameIsNulClosure,
-  nameIsNulI32List,
   nameIsNulLitUnion,
   nameIsNulStrList,
   nameIsNulString,
@@ -2252,7 +2254,7 @@ function variantScanK(
 
 // The nullable-scalar-list VKind of a distinct-backing nullable list type name (`string[] |
 // null`, `f64[] | null`, `i64[] | null`, `f32[] | null`), or "" otherwise. Each leaf has its
-// own wrapper heap type, unlike the i32-backed `nameIsNulI32List` fold: a bare `= null` init
+// own wrapper heap type, unlike the i32-backed `tyIsNulI32List` fold: a bare `= null` init
 // lowers as `ref.null $wrapper`, and a list value's wrapper ref subtypes the nullable slot.
 export function nulScalarListKind(name: string): VKind | null {
   const b = nullablePartOf(name)
@@ -2791,7 +2793,7 @@ export function forceScalarListRep(rep: string) {
 }
 
 // True if `name` is a nullable ref-list (`S[] | null`, `(i32|null)[] | null`), the ref-list
-// analogue of `nameIsNulI32List`; its non-null part is a ref array. Not `i32[] | null`,
+// analogue of `tyIsNulI32List`; its non-null part is a ref array. Not `i32[] | null`,
 // which is code 18 / kind 15.
 export function nameIsNulRefList(name: string) {
   const np = nullablePartOf(name)
@@ -2895,8 +2897,9 @@ function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
   }
   // A NULLABLE i32-list field (`rest: i32[] | null`) stores a NULLABLE ref to
   // the same wrapper as code 4 — code 18 (`0x63 lTypeIdx`). Checked before the
-  // value-union test (`i32[]` is not a value atom, so 16 never claims it).
-  if nameIsNulI32List(t) { return FC_NUL_I32_LIST }
+  // value-union test (`i32[]` is not a value atom, so 16 never claims it). Asked of the type
+  // alone; no caller without a type reaches it with a nullable i32 list.
+  if recTy >= 0 && tyIsNulI32List(recTy) { return FC_NUL_I32_LIST }
   if nameIsNulRefList(t) { return FC_NUL_REF_LIST }
   // A nullable distinct-backing scalar-list field (`f64[] | null` 32, `i64[] | null` 33,
   // `f32[] | null` 34, `string[] | null` 31): a `(ref null $leafWrapper)` slot, the field
@@ -2906,14 +2909,30 @@ function fieldCodeOfSpelling(t: string, litNode: i32, fty: i32) {
   if nsl >= 0 { return nsl }
   // A `string | null` niche field — `(ref null $sTypeIdx)`, code 20. Checked before
   // the value-union test (it is NOT a value union — a single ref + null is a niche).
-  if nameIsNulString(t) { return FC_NUL_STR }
+  // This arm and the two below ask the type where one came, the spelling where none did.
+  if (
+    (recTy >= 0 && tyNulInnerIsPrim(recTy, "string"))
+    || (recTy < 0 && nameIsNulString(t))
+  ) {
+    return FC_NUL_STR
+  }
   // A `boolean | null` niche field — i32 sentinel, code 21.
-  if nameIsNulBool(t) { return FC_NUL_BOOL }
+  if (
+    (recTy >= 0 && tyNulInnerIsPrim(recTy, "boolean"))
+    || (recTy < 0 && nameIsNulBool(t))
+  ) {
+    return FC_NUL_BOOL
+  }
   // A `K | null` nullable-litunion niche field — the i32 atom slot with the spare
   // value `-1` = `null` (member ids are interned ≥ 0), code 30. The field analogue
   // of the kind-0 `K | null` binding niche; checked before the value-union test
   // (a single atom set + null is a niche, not a box).
-  if nameIsNulLitUnion(t) { return FC_NUL_LIT_UNION }
+  if (
+    (recTy >= 0 && tyIsNullableLitUnion(recTy))
+    || (recTy < 0 && nameIsNulLitUnion(t))
+  ) {
+    return FC_NUL_LIT_UNION
+  }
   // A box-union field — a value union or a registered struct/heterogeneous union — stores
   // the shared union box ref, code 16. Checked before the nullable-struct strip, so a
   // declared `type Opt = { v: i32 | null }` carries the same rep as the inline

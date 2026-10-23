@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect (landed: 5 retired, 12 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function pin typed; 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -631,12 +631,31 @@ What each slice changes:
 
     The 4 differing files, and the 27 the compiler traps on, build byte-identical modules
     with the same output under the master seed and the candidate.
-  - Left: every niche ladder and grammar test keeps a caller in a file another lane owns.
-    - `nameIsNulI32List`, `nameIsNulString`, `nameIsNulBool` and `nulLitUnionScan` are held
-      by `fieldCodeOfSpelling` (emit_shape_rows). `forceAnnLeafReps` also holds
-      `nameIsNulI32List` and `nameIsNulString`, because generic-application arguments have no
-      type.
-    - `nameIsStrLitSet` falls with `nulLitUnionScan` and `nameIsLitUnionArray`.
+  - Done: 1 parse. `nameIsNulI32List` is deleted. `fieldCodeOfSpelling` asks `tyIsNulI32List`
+    of the type it holds: the annotation node's, or the caller's `fty`. A probe over the
+    self-compile and 16,621 files compared the two answers. Counts are files.
+    - The node path was reached in 1,715 and differed in 0.
+    - The node-less path held a type in 545 and differed in 1,
+      `closure-result-nullable-scalar-list-field-null.vl`, where the spelling `i32[] | null`
+      kept its spaces and the name test missed it. It held no type in 1,009, and there the
+      name never answered true.
+    - `forceAnnLeafReps`'s arm was reached in 191 and answered true only in the control,
+      where both flags it sets were already set, so the arm is deleted too.
+
+    The 2,556 files the probe reached build byte-identical modules.
+  - Converted, no parse retired: `fieldCodeOfSpelling`'s string, boolean and literal-union
+    arms ask `tyNulInnerIsPrim` and `tyIsNullableLitUnion` where a type came, and differed in
+    0 files. Where no type came (`nameFieldCode` with `fty` -1, about 1,000 files) the name
+    answered true in 9 (string), 7 (boolean) and 38 (literal union), so those legs are live.
+  - Left: every niche ladder and grammar test keeps a caller in a file another lane owns, or
+    a caller with no type.
+    - `nameIsNulString`, `nameIsNulBool` and `nulLitUnionScan` keep `fieldCodeOfSpelling`'s
+      no-type leg. They are also grammar-internal: `nameIsI32Array` reaches `nameIsNulBool`
+      and `nulLitUnionScan` through the nullable-list tests, and `parenUnionArrElemName`
+      calls all three. `forceAnnLeafReps` still holds `nameIsNulString` for
+      generic-application arguments, which have no type.
+    - `nameIsStrLitSet` falls with `nulLitUnionScan` and `nameIsLitUnionArray`, so it falls
+      only with the name grammar.
     - `nameIsMap` is held by emit_shape_rows, emit_mv_slots and emit_shape_intern.
     - `nameIsMapMemberUnion` is now called only by `nameIsBareMap`. That is held by
       emit_shape_rows, emit_map_value_slots and emit_mono.
