@@ -1162,7 +1162,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - The other 60 sites stay, each for one of three reasons: 45 parses in `emit_base`, and 10 parses and 5 renders in `emit_sig_tokens`.
     - A caller in a file this lane may not touch. The name is that caller's only input.
       - In `emit_base`: the `nameIsNul*` family, `nulLitUnionScan`, `nulLitUnionInnerName`, `nameIsElemArray`, `nameIsStrLitSet`, `nameIsI32ListArray` and `nameIsMap*`.
-      - Also in `emit_base`: `nameIsClosureArray`, `nullClosureArrElem` and `parenUnionArrElemName`. Their callers are `emit_collect`, `emit_classify` and `emit_shape_rows`.
+      - Also in `emit_base`: `nameIsClosureArray` and `parenUnionArrElemName` (`nullClosureArrElem` has since been deleted: C5 reads the element type). Their callers are `emit_collect`, `emit_classify` and `emit_shape_rows`.
       - The atom-set helpers (`atomsHaveValueAtom`, `atomsTakeAtomAsStr`, `unionTakesAtomAsStr`, `removeAtomFromGo`, `isVariantBoxUnionAtoms`), called from `emit_union_registry` and `emit_collect`.
       - `annRetNameOf` and `annFnDecompose`.
       - The `mono*` annotation walkers, called from `emit_mono`.
