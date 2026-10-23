@@ -128,19 +128,26 @@ population() {
 }
 
 OWN=$(printf '%s' "$SELF_SHARDED" | awk 'NF {print "tests/" $1}')
-is_own() { printf '%s\n' "$OWN" | grep -qxF "$1"; }
 
 # "<shard> <file>" for every file of the set; a self-sharded file once for every shard.
 assign() {
-  local rows
+  local rows files
+  files=$(population "$1")
   # "<unit> <weight> <file>": a unit is the file itself, `fuel`, or `own` (self-sharded).
-  rows=$(population "$1" | while read -r f; do
-    w=$(printf '%s' "$WEIGHTS" | awk -v b="${f#tests/}" '$1 == b {print $2}')
-    if is_own "$f"; then echo "own ${w:-0} $f"; continue; fi
-    unit="$f"
-    if grep -q VL_FUEL "$f"; then unit=fuel; fi
-    printf '%s %s %s\n' "$unit" "${w:-2}" "$f"
-  done)
+  # One awk over the whole set: a process per file made this the cost of every call.
+  rows=$(printf '%s\n' "$files" |
+    W="$WEIGHTS" O="$OWN" F="$(printf '%s\n' "$files" | xargs grep -l VL_FUEL || true)" awk '
+    BEGIN {
+      n = split(ENVIRON["W"], l, "\n")
+      for (i = 1; i <= n; i++) if (split(l[i], p, " ") >= 2) w[p[1]] = p[2]
+      n = split(ENVIRON["O"], l, "\n"); for (i = 1; i <= n; i++) own[l[i]] = 1
+      n = split(ENVIRON["F"], l, "\n"); for (i = 1; i <= n; i++) fuel[l[i]] = 1
+    }
+    NF {
+      b = $0; sub(/^tests\//, "", b)
+      if ($0 in own) { print "own", ((b in w) ? w[b] : 0), $0; next }
+      print (($0 in fuel) ? "fuel" : $0), ((b in w) ? w[b] : 2), $0
+    }')
   # "<shard> <weight> <file>"; a self-sharded file is charged 1/n of its weight in every shard.
   {
     printf '%s\n' "$rows" | awk -v n="$2" '$1 == "own" {for (s = 1; s <= n; s++) print s, $2 / n, $3}'
