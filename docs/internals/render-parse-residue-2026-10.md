@@ -357,9 +357,14 @@ What each slice changes:
   - Done: 2 parses. `inferRetIsLitUnionAt`'s fallback for an entry with no row was reached by
     no file, so that entry now answers false. `internCloResultSpine` asks `tyStepRet` whether a
     level's result is a closure. It was reached in 87 files and differed in 0.
-  - Left: `annSpelledArray`'s name fallback. It was reached in 6,052 files, had no type in 54,
-    and disagreed with the type in 6. Those 6 are union-of-list annotations and a type
-    parameter that shadows an array alias.
+  - Done: 1 parse. `annSpelledArray` asks `tyIsArray` of the node's type where the parser's tree
+    was dropped. A re-probe over the self-compile and 16,852 files found the fallback in 6,034
+    files. Two differed, both a type parameter shadowing an array alias (`i32[]` against `f32`
+    and against the bound `Ids`); their modules are byte-identical either way. The 54 files
+    with no type all spelled a non-list, so both answers were false. They are inline union-arm
+    field and canon-rewritten annotations that the checker never types. An alias-to-list
+    union-arm field also has no type, and it builds byte-identical with the answer false.
+    `difftree --identity` found 0 of 16,483 files differing.
   - Left: `nameIsNulClosure`. Its `collectCloSigs` caller agreed with the type everywhere, but
     `cloNameSigKeyTy`'s fallback (1 file) and `nameFieldCode` (3 files) hold only a name and
     answer true.
