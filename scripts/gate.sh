@@ -232,10 +232,12 @@ run "no-python"                "$VL" run scripts/no-python.vl
 # exits 0 on the tree and reds when one reset's clears are ignored.
 # THE COST OF GENERATED CODE: guest fuel and peak RSS of one `-O` build of each of two 2 MB
 # plumb-shaped units (a median one, and a one-function tail one), against a committed
-# baseline, plus two exact facts about the rung input. Fuel is a count, so the fan-out's
-# contention cannot move it; CPU is graded only from runs a control says were quiet,
-# which inside this fan-out is usually none. ~20 s, plus ~12 s once per new seed while
-# the fuel engine's sidecar compiles. #3108, #3112, D2335 and D2336 are what it holds.
+# baseline, plus two exact facts about the rung input. Fuel, RSS and the facts come from one
+# metered build per unit; fuel is a count, so the fan-out's contention cannot move it. CPU
+# is graded only from runs a control says were quiet, which inside this fan-out is usually
+# none, and a build after a loud control is not run at all: ~11 s and ~10 CPU-s busy, ~30
+# CPU-s quiet, plus ~25 CPU-s once per new seed while the sidecars compile. #3108, #3112,
+# D2335 and D2336 are what it holds.
 run "plumb-shape cost"         "$VL" run scripts/plumb-shape-cost.vl --compiler "$SEED" -- --check
 # The kind-ladder RATCHET rides "lint-self + fmt"; this row re-derives the lint's copy of
 # every closed set from the `export type` that declares it and FAILS on drift.

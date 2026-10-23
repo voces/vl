@@ -417,7 +417,6 @@ type Row = {
   ctl: f64,
   cpu: f64 | null,
   opt: f64,
-  rss: f64 | null,
   quiet: boolean,
 }
 
@@ -452,6 +451,7 @@ function measure(
   runs: i32,
   baseCtl: f64 | null,
   samples: boolean,
+  everyRun: boolean,
   shape: string[],
 ): Meas {
   const real = nativeWasmOpt()
@@ -492,36 +492,45 @@ function measure(
     "-o",
     "unit.wasm",
   ]
+  // A compile-cache hit would skip `wasm-opt` and price the cache, not the build.
   const benv = [
     "VL_STD=" + std,
     "VL_WASM_OPT=" + wrapper,
     "PLUMB_SHAPE_OPT_LOG=" + log,
+    "VL_COMPILE_CACHE=0",
   ]
   const realEnv = "PLUMB_SHAPE_REAL_WASM_OPT=" + (real ?? "")
 
+  // One metered build, real `wasm-opt` included, gives the fuel, the peak RSS and the
+  // rung facts; the timed builds below exist only for CPU.
   truncate(log)
   const fenv = benv.slice(0, benv.length)
   fenv.push("VL_FUEL=1")
-  fenv.push("PLUMB_SHAPE_REAL_WASM_OPT=")
+  fenv.push(realEnv)
   const fr = runTimed(build, fenv, work, true)
   const fuel = fuelOf(fr.err)
   const facts = readOptLog(log).facts
 
   const tenv = benv.slice(0, benv.length)
   tenv.push(realEnv)
-  runTimed(build, tenv, work, true)
   const rows: Row[] = []
   let i = 0
   while i < runs {
     const ctl = control(vl, self, root)
-    truncate(log)
-    const r = runTimed(build, tenv, work, true)
-    const opt = readOptLog(log).cpu
     const quiet = baseCtl != null && ctl <= (baseCtl ?? 0.0) * QUIET
     let comp: f64 | null = null
-    const c = r.cpu
-    if c != null { comp = c - opt }
-    rows.push({ ctl: ctl, cpu: comp, opt: opt, rss: r.rss, quiet: quiet })
+    let opt = 0.0
+    let rr: f64 | null = null
+    // Under --check a build after a loud control would be timed and then discarded.
+    if everyRun || quiet {
+      truncate(log)
+      const r = runTimed(build, tenv, work, true)
+      opt = readOptLog(log).cpu
+      const c = r.cpu
+      if c != null { comp = c - opt }
+      rr = r.rss
+    }
+    rows.push({ ctl: ctl, cpu: comp, opt: opt, quiet: quiet })
     if samples {
       const lt = stripWs(readText("/proc/loadavg") ?? "0")
       note("load " + split(lt, " ")[0])
@@ -531,7 +540,7 @@ function measure(
       const c3 = pyFixed(ctl, 3)
       const cc = pyFixed(comp ?? 0.0, 2)
       const oc = pyFixed(opt, 2)
-      const rm = pyFixed(r.rss ?? 0.0, 0)
+      const rm = pyFixed(rr ?? 0.0, 0)
       const bz = pyFixed(100.0 * lastBusy, 0)
       const ld = pyFixed(load, 1)
       print(
@@ -551,18 +560,14 @@ function measure(
     if baseCtl == null || row.quiet { q.push(row) }
   }
   let rss: f64 | null = null
-  let allRss = true
-  let minRss = 0.0
+  const fss = fr.rss
+  if fss != null { rss = pyRound(fss, 1) }
   let minCtl = 0.0
   let k = 0
   for row in rows {
-    const rr = row.rss
-    if rr == null { allRss = false }
-    else if k == 0 || rr < minRss { minRss = rr }
     if k == 0 || row.ctl < minCtl { minCtl = row.ctl }
     k = k + 1
   }
-  if allRss { rss = pyRound(minRss, 1) }
   let compile: f64 | null = null
   let optCpu: f64 | null = null
   if q.length > 0 && q[0].cpu != null {
@@ -791,9 +796,7 @@ function checkUnit(
     if !ok { bad.push(tag + "const-1 ifs") }
   }
   let cpuWhy = ""
-  if m.compile == null {
-    cpuWhy = "this OS reports no rusage"
-  } else if !sameHost {
+  if !sameHost {
     const here = cpuModel()
     const there = pyOptStr(strOf(base, "cpu_host"))
     cpuWhy = "CPU is `\{here}`, the baseline's `\{there}`"
@@ -801,6 +804,8 @@ function checkUnit(
     const pq = pyFixed(100.0 * (QUIET - 1.0), 0)
     const bc = pyFixed(numOf(base, "control_cpu"), 3)
     cpuWhy = "box busy — \{m.quiet} of \{m.done} runs had the control within \{pq}% of its \{bc}s"
+  } else if m.compile == null {
+    cpuWhy = "this OS reports no rusage"
   }
   if cpuWhy != "" {
     gradeSkip(tag + "compile", cpuWhy)
@@ -903,20 +908,39 @@ function main() {
   const sameHost = haveBase && strOf(base, "cpu_host") == host
   let dflt = "3"
   if mode == "--write-baseline" { dflt = "7" }
-  const runs = parseI32(stripWs(envOr("PLUMB_SHAPE_RUNS", dflt))) ?? 3
+  let runs = parseI32(stripWs(envOr("PLUMB_SHAPE_RUNS", dflt))) ?? 3
   let ctl: f64 | null = null
   if sameHost { ctl = numOf(base, "control_cpu") }
+  // --check grades CPU only on the baseline's host, so elsewhere it times nothing.
+  const everyRun = mode != "--check"
+  if !everyRun && !sameHost { runs = 0 }
 
   const scratch = makeTemp()
   temps = [scratch]
   const self = scratch + "/control.wasm"
-  const sb = spawn(vl, ["build", CONTROL, "--compiler", seed, "-o", self])
+  // The first build under each engine JITs the seed if its sidecar is cold, at ~3x the
+  // RSS: the control's builds pay that, so no measured build does.
+  const cb = [vl, "build", CONTROL, "--compiler", seed, "-o"]
+  let fb = ["-u", "VL_FUEL", "VL_COMPILE_CACHE=0", "VL_FUEL=1"]
+  for a in cb { fb.push(a) }
+  fb.push(scratch + "/control-fuel.wasm")
+  const sb = spawn("env", fb)
   if sb.code != 0 {
     die("plumb-shape: cannot build " + CONTROL + ":\n" + sb.out + sb.err, 1)
   }
-  runTimed([vl, "run", self], [], root, false)
+  if runs > 0 {
+    let pb = ["-u", "VL_FUEL", "VL_COMPILE_CACHE=0"]
+    for a in cb { pb.push(a) }
+    pb.push(self)
+    const sp = spawn("env", pb)
+    if sp.code != 0 {
+      die("plumb-shape: cannot build " + CONTROL + ":\n" + sp.out + sp.err, 1)
+    }
+    runTimed([vl, "run", self], [], root, false)
+  }
 
-  const mm = measure(vl, seed, root, self, runs, ctl, mode == "--samples", [])
+  const samples = mode == "--samples"
+  const mm = measure(vl, seed, root, self, runs, ctl, samples, everyRun, [])
   const mt = measure(
     vl,
     seed,
@@ -924,7 +948,8 @@ function main() {
     self,
     runs,
     ctl,
-    mode == "--samples",
+    samples,
+    everyRun,
     ["--shape", "tail"],
   )
   print(summary("main", mm))
