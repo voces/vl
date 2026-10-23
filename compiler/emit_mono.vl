@@ -349,6 +349,7 @@ import {
   fnFlowDeclWritten,
   fnFlowElemKind,
   fnFlowLamPin,
+  fnFlowPinSigOf,
   fnFlowReadGenFn,
   fnFlowReadWritten,
   fnFlowRespellLam,
@@ -15493,6 +15494,42 @@ function monoFlowSpreadSet(sp: i32, v: i32): i32 {
   hx
 }
 
+// The pins `pins` of slot `path` of the list declared at `at`, typed `rt`, with each parameter the
+// list's element type closes read at that type: a call through an un-annotated parameter is
+// pinned at its arguments' own types, and `f(3, 2)` delivers `3` at a closed `f64` (D10203).
+function monoPinsAtElemParams(
+  pins: string[],
+  rt: i32,
+  at: i32,
+  path: string[],
+): string[] {
+  if rt < 0 || rt >= T.tys.length { return pins }
+  const lt = T.tys[rt]
+  if !(lt is TyArray) || lt.aElem < 0 || lt.aElem >= T.tys.length {
+    return pins
+  }
+  const ef = T.tys[lt.aElem]
+  if !(ef is TyFunc) { return pins }
+  const out: string[] = []
+  for p in pins {
+    const tys = fnFlowDeclPathPinTysOf(at, path, p)
+    let q = p
+    if tys.length == ef.fnParamTypes.length {
+      const nt: i32[] = []
+      let i = 0
+      while i < tys.length {
+        const et = ef.fnParamTypes[i]
+        const closed = et >= 0 && !tyHasTyVar(et) && !tyReachesHole(et, 16)
+        nt.push(if closed { et } else { tys[i] })
+        i = i + 1
+      }
+      q = fnFlowPinSigOf(nt)
+    }
+    if !strListHas(out, q) { out.push(q) }
+  }
+  out
+}
+
 // Gives the un-annotated list at `at` in frame `ctx` the function type the flow table pins its
 // element slot at, as an annotation; its elements, element writes and re-pointed list literals are
 // instanced at it. Two pins refuse unless each read already points at one generic; no pin, a
@@ -15514,7 +15551,12 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if nr != 0 { return if nr < 0 { -1 } else { 0 } }
   }
   const path: string[] = ["e"]
-  let pins = monoDeclPathPins(lf, path)
+  const rawPins = monoDeclPathPins(lf, path)
+  let pins = monoPinsAtElemParams(rawPins, rt, at, path)
+  let reread = pins.length != rawPins.length
+  for p in rawPins {
+    if !strListHas(pins, p) { reread = true }
+  }
   if pins.length > 1 {
     // Pushed functions whose every read now names its generic are called through no slot (D9441).
     const pushed = monoMethodStoredArgs(at, lf, "push", 1, "")
@@ -15581,6 +15623,9 @@ function monoPinListElems(d: LetDecl, at: i32, ctx: i32): i32 {
     if holeLam && monoLastInstFe < 0 {
       if monoNoteBindDeliveryAt(e, ann, ctx) < 0 { return -1 }
     }
+    // A pin read at the element type's parameters fixes only an element instanced here: a value
+    // reaching the element from elsewhere is instanced at the slot's own pins.
+    if reread && monoLastInstFe < 0 { return monoGenericListFail(d.letInit) }
     if ft < 0 && monoLastInstFe >= 0 {
       const st = monoPinSubTyOf(nodeTyIxOf(e), fnStmts[monoLastInstFe])
       if monoTyClosedFn(st) { ft = st }

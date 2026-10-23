@@ -111,6 +111,12 @@ let pcName: string[] = []
 let pcLeaves: string[][] = []
 let pcCallFn: string[] = []
 let pcCallLeaves: string[][] = []
+// A write `pcwWrite` of a choosing call to the choice binding `pcAnchor[pcwPc]` runs its arm-index
+// copy `pcwCallFn` into that binding's arm index, and each slot `pcwNames` selects by it (D10192).
+let pcwWrite: i32[] = []
+let pcwPc: i32[] = []
+let pcwCallFn: string[] = []
+let pcwNames: string[][] = []
 let prIdent: i32[] = []
 let prName: string[] = []
 // A copy of function `pfSrc` named `pfName` goes after the module statement `pfAnchor`.
@@ -238,6 +244,10 @@ function fsPlanReset(): i32 {
   pcLeaves = []
   pcCallFn = []
   pcCallLeaves = []
+  pcwWrite = []
+  pcwPc = []
+  pcwCallFn = []
+  pcwNames = []
   pdAnchor = []
   pdKw = []
   pdName = []
@@ -4094,6 +4104,32 @@ function fsPlanMember(mi: i32): i32 {
         const w = fsParent[r]
         const wn = P.nodes[w]
         if !(wn is BinExpr) || !fsStmtParentOk(w) { return 1 }
+        const wl = if callFn != "" { fsChoiceRetLeaves(wn.binRight) } else { [] }
+        if wl.length > 0 {
+          // Its arm-index copy numbers the arms in the order the binding's own selection does.
+          if wl.length != callLeaves.length { return 1 }
+          for l in wl {
+            if !hasStr(callLeaves, l) { return 1 }
+          }
+          const wfn = fsPlanArmCopy(wn.binRight, callLeaves)
+          let wci = 0
+          while wci < pnSrcName.length && pnSrcName[wci] != wfn {
+            wci = wci + 1
+          }
+          if (
+            wci >= pnSrcName.length
+            || !fsSameKeys(pnSrcLeaves[wci], callLeaves)
+          ) {
+            return 1
+          }
+          const nms: string[] = []
+          for ln in lanes { nms.push(laneName(mi, ln)) }
+          pcwWrite.push(w)
+          pcwPc.push(pcAnchor.length - 1)
+          pcwCallFn.push(wfn)
+          pcwNames.push(nms)
+          continue
+        }
         const vp = fsValuePeer(wn.binRight)
         if vp == -2 { return 1 }
         let wk = 0
@@ -4135,6 +4171,47 @@ function fsLaneValName(v: i32, vp: i32, lane: string): string {
   if si < 0 || fsHoleCopyKeys(v).length < 2 { return "" }
   if !hasStr(hsKeys[si], lane) { return "!" }
   hsSlot(si, lane)
+}
+
+// Rewrites planned choice write `i` into a run of its arm-index copy into the arm index binding,
+// followed by each slot's selection by that index. -1 when it cannot.
+function fsApplyChoiceWrite(i: i32): i32 {
+  if (
+    i < 0
+    || i >= pcwWrite.length
+    || i >= pcwCallFn.length
+    || i >= pcwNames.length
+  ) {
+    return -1
+  }
+  const w = pcwWrite[i]
+  const pc = pcwPc[i]
+  if w < 0 || w >= nodeToks.length || pc < 0 || pc >= pcLeaves.length {
+    return -1
+  }
+  const wn = P.nodes[w]
+  if (
+    !(wn is BinExpr)
+    || wn.binLeft >= P.nodes.length
+    || wn.binRight >= P.nodes.length
+  ) {
+    return -1
+  }
+  const c = P.nodes[wn.binRight]
+  if !(c is Call) || c.callFn < 0 || c.callFn >= P.nodes.length { return -1 }
+  P.pos = nodeToks[w] + 1
+  const pos = wn.pos
+  c.callFn = mkIdent(pcwCallFn[i], P.nodes[c.callFn].pos)
+  wn.binLeft = mkIdent(pcName[pc], P.nodes[wn.binLeft].pos)
+  let k = pcwNames[i].length - 1
+  while k >= 0 {
+    const sel = fsSelectArm(pcName[pc], pcLeaves[pc], pos)
+    if sel < 0 { return -1 }
+    const asg = mkBinary("=", mkIdent(pcwNames[i][k], pos), sel, pos)
+    if fsInsertAfter(w, asg) != 0 { return -1 }
+    k = k - 1
+  }
+  0
 }
 
 function fsRename(ix: i32, name: string): i32 {
@@ -4459,7 +4536,8 @@ function fsApply(): i32 {
       const sel = fsSelectArm(pcName[i], names, pos)
       if rc == 0 && sel >= 0 {
         d.letInit = sel
-        rc = fsInsertBefore(pcAnchor[i], mkLet("const", pcName[i], -1, c, pos))
+        const kw = if hasI32(pcwPc, i) { "let" } else { "const" }
+        rc = fsInsertBefore(pcAnchor[i], mkLet(kw, pcName[i], -1, c, pos))
       } else {
         rc = -1
       }
@@ -4495,6 +4573,11 @@ function fsApply(): i32 {
         rc = fsInsertAfter(a, mkLet(pdKw[i], pdName[i], ty, v, P.nodes[a].pos))
       }
     }
+    i = i + 1
+  }
+  i = 0
+  while i < pcwWrite.length {
+    if rc == 0 { rc = fsApplyChoiceWrite(i) }
     i = i + 1
   }
   i = 0
