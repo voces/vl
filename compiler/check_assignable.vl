@@ -148,6 +148,7 @@ import {
   inferQuiet,
   njFnStack,
   tpEnvNames,
+  tpEnvTyOfName,
   tpEnvTys,
 } from "./check_cursor"
 import {
@@ -401,6 +402,7 @@ import { i32ListEq, strListHas } from "./listutil"
 import { nodePos } from "./fmt_util"
 import {
   flattenVariantsInto,
+  isNullTy,
   isVoidTy,
   nonNullTy,
   primNameOf,
@@ -1808,18 +1810,24 @@ export function holeLambdaSeedTy(
   got
 }
 
-// Whether `t` is a function type whose result is a union of two or more members.
+// Whether `t` is a function type whose result is a union of two or more members, or nullable.
 function fnRetIsUnion(t: i32): boolean {
   if t < 0 || t >= T.tys.length { return false }
   const f = T.tys[t]
   if !(f is TyFunc) || f.fnRet < 0 || f.fnRet >= T.tys.length { return false }
-  T.tys[f.fnRet] is TyUnion
+  T.tys[f.fnRet] is TyUnion || T.tys[f.fnRet] is TyNullable
 }
 
-// The type a closed function value `at` handed to hole `holeTy` is delivered at, when the
-// callee's body hands the hole on to a generic's function parameter whose union result leaves a
-// type parameter open: that parameter, bound from `at`'s result, so the instance reads a boxed
-// result (D10210). -1 for no such hand-on, or two that disagree.
+// Whether function type `t` returns `null`.
+function fnRetIsNull(t: i32): boolean {
+  const f = T.tys[t]
+  f is TyFunc && isNullTy(f.fnRet)
+}
+
+// The type a closed function value `at` handed to hole `holeTy` is delivered at, when the callee
+// hands the hole on to a function parameter with a union or nullable result: that parameter, its
+// open type parameter bound from `at`'s result. A hand-on the call's other arguments closed wins
+// over one left open (D10243). -1 for no such hand-on, or two that disagree.
 export function holeFnArgUnionRetTy(calleeFn: i32, holeTy: i32, at: i32): i32 {
   if calleeFn < 0 || holeTy < 0 || !tyIsHole(holeTy) { return -1 }
   if at < 0 || at >= T.tys.length || !(T.tys[at] is TyFunc) || tyHasTyVar(at) {
@@ -1827,23 +1835,47 @@ export function holeFnArgUnionRetTy(calleeFn: i32, holeTy: i32, at: i32): i32 {
   }
   const hv = T.tys[holeTy]
   if !(hv is TyVar) { return -1 }
+  const closed = holeFnArgRetTy(calleeFn, hv.tvName, at, true)
+  if closed >= 0 { return closed }
+  if closed == -2 { return -1 }
+  const open = holeFnArgRetTy(calleeFn, hv.tvName, at, false)
+  if open >= 0 { open } else { -1 }
+}
+
+// `holeFnArgUnionRetTy` over the hand-ons whose parameter type is `closed`, or else open: -1 for
+// none, -2 for two that disagree.
+function holeFnArgRetTy(
+  calleeFn: i32,
+  hole: string,
+  at: i32,
+  closed: boolean,
+): i32 {
   let got = -1
   let ci = 0
   while ci < argCstr.at.length {
     if (
       argCstr.form[ci] == ACF_PLAIN
       && argCstr.fn[ci] == calleeFn
-      && tyVarNamed(argCstr.at[ci], hv.tvName)
-      && tyHasTyVar(argCstr.exp[ci])
+      && tyVarNamed(argCstr.at[ci], hole)
       && fnRetIsUnion(argCstr.exp[ci])
+      && closed == !tyHasTyVar(argCstr.exp[ci])
     ) {
+      if closed {
+        if got >= 0 && !tySame(got, argCstr.exp[ci]) { return -2 }
+        got = argCstr.exp[ci]
+        ci = ci + 1
+        continue
+      }
       const uNames: string[] = []
       const uTys: i32[] = []
       bindGenFnRetUnionArm(argCstr.exp[ci], at, uNames, uTys, false)
+      if uNames.length == 0 && !fnRetIsNull(at) {
+        bindGenWalk(argCstr.exp[ci], at, uNames, uTys)
+      }
       if uNames.length > 0 {
         const dst = substTyDeep(argCstr.exp[ci], uNames, uTys)
         if dst >= 0 && !tyHasTyVar(dst) {
-          if got >= 0 && !tySame(got, dst) { return -1 }
+          if got >= 0 && !tySame(got, dst) { return -2 }
           got = dst
         }
       }
@@ -2706,10 +2738,57 @@ export function fvaAdaptListLit(ix: i32, listTy: i32): boolean {
   true
 }
 
+// Set while `fvaAdaptEnclosing` lets an adapter name the enclosing generic's type parameters.
+let fvaEnclosingOk = false
+
+// Whether `s` returns a type parameter that `d`'s otherwise identical function type returns as
+// one member of a nullable or union result.
+function fnRetTyVarWidens(s: i32, d: i32): boolean {
+  if s < 0 || d < 0 || s >= T.tys.length || d >= T.tys.length { return false }
+  const sf = T.tys[s]
+  const df = T.tys[d]
+  if !(sf is TyFunc) || !(df is TyFunc) || sf.fnRet < 0 || df.fnRet < 0 {
+    return false
+  }
+  const rv = T.tys[sf.fnRet]
+  if !(rv is TyVar) || tpEnvTyOfName(rv.tvName) < 0 { return false }
+  if sf.fnParamTypes.length != df.fnParamTypes.length { return false }
+  let i = 0
+  while i < sf.fnParamTypes.length {
+    const p = sf.fnParamTypes[i]
+    if tyHasTyVar(p) || !tySame(p, df.fnParamTypes[i]) { return false }
+    i = i + 1
+  }
+  const inner = nonNullTy(df.fnRet)
+  if inner != df.fnRet { return tySame(inner, sf.fnRet) }
+  const r = T.tys[df.fnRet]
+  if r is TyUnion {
+    for m in r.uMembers {
+      if tySame(m, sf.fnRet) { return true }
+    }
+  }
+  false
+}
+
+// `fvaAdapt` inside a generic body, for a function value returning the body's own type
+// parameter delivered where that parameter is one member of the result: the adapter names the
+// parameter, so each instance boxes its own result (D10241).
+export function fvaAdaptEnclosing(
+  srcExpr: i32,
+  srcTy: i32,
+  dstTy: i32,
+): boolean {
+  if !fnRetTyVarWidens(srcTy, dstTy) { return false }
+  fvaEnclosingOk = true
+  fvaAdapt(srcExpr, srcTy, dstTy)
+}
+
 // Rewrites the function value at `srcExpr`, of type `srcTy`, into an adapter at `dstTy`'s
 // function type, when the two may differ in rep. True when the delivery is settled here,
 // rewritten or refused; false leaves it to the caller unchanged.
 export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
+  const encOk = fvaEnclosingOk
+  fvaEnclosingOk = false
   fvaNoteNameDecl(srcExpr)
   if inferQuiet || monoRecheckDepth > 0 { return false }
   if srcExpr < 0 || srcTy < 0 || dstTy < 0 { return false }
@@ -2769,7 +2848,10 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
     return false
   }
   if s.fnRet < 0 || d.fnRet < 0 { return false }
-  if tyHasTyVar(dt) || s.fnParamTypes.length != d.fnParamTypes.length {
+  if (
+    tyHasTyVar(dt) && !encOk
+    || s.fnParamTypes.length != d.fnParamTypes.length
+  ) {
     return false
   }
   const site = srcExpr
@@ -2783,10 +2865,13 @@ export function fvaAdapt(srcExpr: i32, srcTy: i32, dstTy: i32): boolean {
   if litPinN.length > 0 && fvaNamesGeneric(pe, parenPeelIx(site)) {
     return false
   }
-  if tyReachesHole(dt, 8) { return false }
+  if tyReachesHole(dt, 8) && !encOk { return false }
   if !fvaNamesGeneric(pe, parenPeelIx(site)) {
     // A hole is pinned later, where the value's use decides it.
-    if fnTyHasHole(srcTy) || tyHasTyVar(srcTy) || tyReachesHole(srcTy, 8) {
+    if (
+      !encOk
+      && (fnTyHasHole(srcTy) || tyHasTyVar(srcTy) || tyReachesHole(srcTy, 8))
+    ) {
       return false
     }
     if !fvaFnMayDiffer(srcTy, dt, 8) { return false }

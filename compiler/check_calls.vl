@@ -42,6 +42,7 @@ import {
   dstBindLitTyParams,
   fsbNoteCall,
   fvaAdapt,
+  fvaAdaptEnclosing,
   genFnValueCstrs,
   holeDeclCstrsAt,
   holeDeclCstrsBind,
@@ -98,6 +99,7 @@ import {
   cstrOwnerStack,
   inferQuiet,
   tpEnvNames,
+  tpEnvTyOfName,
   tpEnvTys,
 } from "./check_cursor"
 import {
@@ -142,6 +144,7 @@ import {
   callDstTyOf,
   calleeIdentName,
   calleeRetDeclared,
+  lambdaBodyTail,
   seedExpected,
 } from "./check_expected"
 import {
@@ -360,6 +363,7 @@ import {
 } from "./check_write_scan"
 import { i32ListHas, strListHas, strListIndexOf } from "./listutil"
 import {
+  isNullTy,
   isVoidTy,
   nonNullTy,
   tyHasTyVar,
@@ -1024,6 +1028,57 @@ function calleeTyIsScoped(cfn: Node, cfnIx: i32): boolean {
   ln is FuncDecl && ln.fnTyParams.length == 0
 }
 
+// Whether every open member of join `t` is a type parameter the enclosing generic declares, which
+// each instance re-checks as a real union rather than an escaped one (D10243).
+function joinOpensOnlyDeclared(t: i32): boolean {
+  if t < 0 || t >= T.tys.length { return false }
+  let u = T.tys[t]
+  if u is TyNullable {
+    if u.nInner < 0 || u.nInner >= T.tys.length { return false }
+    u = T.tys[u.nInner]
+  }
+  if !(u is TyUnion) { return false }
+  let open = false
+  for m in u.uMembers {
+    if tyIsHole(m) {
+      const mv = T.tys[m]
+      if !(mv is TyVar) || tpEnvTyOfName(mv.tvName) < 0 { return false }
+      open = true
+    }
+  }
+  open
+}
+
+// A lambda that adopted `() => T` but returns `null` binds the type parameter at `vNames[i]`,
+// bound only to itself, to `null`, and is typed at that binding (D10242).
+function adoptNullLambdaRet(
+  args: i32[],
+  vNames: string[],
+  vTys: i32[],
+  i: i32,
+) {
+  for a in args {
+    const fd = P.nodes[parenPeelIx(a)]
+    const ft = nodeTyOf(a)
+    if fd is FuncDecl && ft >= 0 && ft < T.tys.length {
+      const f = T.tys[ft]
+      const tail = lambdaBodyTail(fd.fnBody)
+      const r = if f is TyFunc && f.fnRet >= 0 { T.tys[f.fnRet] } else { T.tys[TY_I32] }
+      if (
+        r is TyVar
+        && r.tvName == vNames[i]
+        && tail >= 0
+        && isNullTy(nodeTyOf(tail))
+      ) {
+        vTys[i] = nodeTyOf(tail)
+        nodeTySet(a, substTyDeep(ft, [vNames[i]], [vTys[i]]))
+        return 0
+      }
+    }
+  }
+  0
+}
+
 // The ordinary call: the callee evaluates to a function type, so the arguments are checked
 // against its parameter list — named arguments reordered, an omitted trailing one filled
 // from the declaration default, and type-parameter bindings solved from the argument types.
@@ -1160,6 +1215,7 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     if sv is TyVar && sv.tvName == vNames[si] {
       const ub = bindOf(uNames, uTys, vNames[si])
       if ub >= 0 { vTys[si] = ub }
+      else if !inferQuiet { adoptNullLambdaRet(args, vNames, vTys, si) }
     }
     si = si + 1
   }
@@ -1189,6 +1245,21 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
         }
       }
       fi = fi + 1
+    }
+  }
+  // Inside a generic body, a function argument returning the body's type parameter where the
+  // bound result widens it is delivered at that result (D10241).
+  if !inferQuiet && tpEnvNames.length > 0 && vNames.length > 0 {
+    let ei = 0
+    while ei < args.length && ei < params.length {
+      if argExp[ei] >= 0 && T.tys[argExp[ei]] is TyFunc {
+        fvaAdaptEnclosing(
+          args[ei],
+          nodeTyOf(args[ei]),
+          substTyDeep(params[ei], vNames, vTys),
+        )
+      }
+      ei = ei + 1
     }
   }
   if vNames.length > 0 {
@@ -1221,7 +1292,9 @@ function checkCallOnFuncTy(n: Call, ix: i32, cfn: Node, ft: TyFunc): i32 {
     noteDeferredJoinNode(ix, retTy)
     let ejWho = ""
     if cfn is Ident { ejWho = cfn.identName }
-    if kept < 0 { noteEscJoin(retTy, ix, ejWho) }
+    if kept < 0 && !joinOpensOnlyDeclared(retTy) {
+      noteEscJoin(retTy, ix, ejWho)
+    }
   }
   return cRetTy
 }
