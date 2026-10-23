@@ -12980,6 +12980,35 @@ function monoCallIfValue(n: Call, ix: i32, ctx: i32): i32 {
   if ct == "" { return 0 }
   if monoCoerceFnValueName(iv, ct, ctx, -1) < 0 { return -1 }
   monoRetypeIfInit(n.callFn, g0, n.callFn, ctx)
+  monoCloseIfCalleeFnParams(n, iv)
+}
+
+// Retypes the `if` callee `iv` of call `n` when a function-valued hole parameter leaves its type
+// without a signature key: that parameter takes the type of the argument passed there (D7848).
+function monoCloseIfCalleeFnParams(n: Call, iv: i32): i32 {
+  const ft = nodeTyIxOf(n.callFn)
+  if ft < 0 || ft >= T.tys.length || sigKeyOfTy(ft) != "" { return 0 }
+  const f = tyAt(ft)
+  if !(f is TyFunc) || f.fnParamTypes.length != n.callArgs.length { return 0 }
+  const ps: i32[] = []
+  let k = 0
+  while k < f.fnParamTypes.length {
+    const pk = f.fnParamTypes[k]
+    const ak = nodeTyIxOf(n.callArgs[k])
+    const open = pk >= 0
+      && pk < T.tys.length
+      && tyAt(pk) is TyFunc
+      && sigKeyOfTy(pk) == ""
+    ps.push(
+      if open && monoTyConcreteFn(ak) && sigKeyOfTy(ak) != "" { ak } else { pk },
+    )
+    k = k + 1
+  }
+  const et = mkFuncTy(ps, f.fnRet)
+  if sigKeyOfTy(et) == "" { return 0 }
+  nodeTyRecord(iv, et)
+  nodeTyRecord(n.callFn, et)
+  0
 }
 
 // The function type call `ix` in frame `ctx` takes an instance of seed `g` at, the call never
@@ -20243,9 +20272,9 @@ function monoCalleeAnnNode(callee: i32, fnIx: i32): i32 {
 }
 
 // Call `n` through a list element, a `for` variable over a list or a `const` joining functions
-// by `if`, each element a named function: instances every element and types the callee at the
-// one closed type their parameters' own calls and the arguments' results give it (D7183). 0 when
-// none applies, -1 on a failure.
+// by `if`, or an `if` called in place, each element a named function: instances every element
+// and types the callee at the one closed type their parameters' own calls and the arguments'
+// results give it (D7183, D7848). 1 when it typed the callee, 0 when none applies, -1 on a failure.
 function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
   const elems = monoCalleeElems(n.callFn)
   if elems.length == 0 { return 0 }
@@ -20286,17 +20315,23 @@ function monoOpenCallAtElems(n: Call, ctx: i32): i32 {
     if monoCoerceFnValueName(el, nm, ctx, ft) < 0 { return -1 }
   }
   nodeTyRecord(n.callFn, ft)
-  0
+  1
 }
 
 // The function values callee `c` reads: a list literal's through an index or a `for` variable,
-// or a `const`'s, an `if` element giving each of its arm values; empty for any other callee.
+// or an `if`'s, as the callee itself (D7848) or a `const`'s, an `if` element giving each of its
+// arm values; empty for any other callee.
 function monoCalleeElems(c: i32): i32[] {
   const none: i32[] = []
   const x = unwrapParen(c)
   if x < 0 || x >= P.nodes.length { return none }
   const n = nodeAt(x)
   if n is Index { return monoConstListElems(n.idxArr) }
+  if n is IfStmt {
+    const arms: i32[] = []
+    if !monoPushArmValues(x, arms) { return none }
+    return arms
+  }
   if !(n is Ident) { return none }
   const d = identDeclOf(x)
   if d < 0 || d >= P.nodes.length { return none }
@@ -20324,21 +20359,24 @@ function monoPushArmValues(v: i32, out: i32[]): boolean {
   }
   if i.ifElse < 0 { return false }
   for arm in [i.ifThen, i.ifElse] {
-    const a = ifArmValueExpr(arm)
+    // An `else if` arm is the nested `if` itself, with no block around it.
+    const a = if nodeAt(arm) is IfStmt { arm } else { ifArmValueExpr(arm) }
     if a < 0 || !monoPushArmValues(a, out) { return false }
   }
   true
 }
 
-// The elements of list literal `v`, or of the un-annotated `const` one `v` names; empty
-// otherwise.
+// The elements of list literal `v`, or of the un-annotated `const` one `v` names, through
+// further such `const`s naming it (D7844); empty otherwise.
 function monoConstListElems(v: i32): i32[] {
   const none: i32[] = []
   let lx = unwrapParen(v)
   if lx < 0 || lx >= P.nodes.length { return none }
-  if nodeAt(lx) is Ident {
+  const seen: i32[] = []
+  while nodeAt(lx) is Ident {
     const d = identDeclOf(lx)
-    if d < 0 || d >= P.nodes.length { return none }
+    if d < 0 || d >= P.nodes.length || i32ListHas(seen, d) { return none }
+    seen.push(d)
     const dn = nodeAt(d)
     if !(dn is LetDecl) || dn.letKw != "const" || dn.letType >= 0 {
       return none
@@ -20428,7 +20466,7 @@ function monoSubtreeReads(ix: i32, d: i32): boolean {
 // The refusal for a call `monoGenArgAtOpenParam` names, at node `ix` (D3956); the split may
 // give each function the call reaches a parameter per type its argument is called at (D7183).
 function monoGenArgOpenFail(ix: i32): i32 {
-  fsAskOpenCall(ix)
+  fsAskOpenCall(monoCallTplOf(ix))
   emitFailAt(
     "emitProgram: a generic function is passed to a function value whose parameter type "
       + "names a type parameter this closure does not bind, so no instance of it can be "
@@ -24303,12 +24341,16 @@ function monoWalk(ix: i32, ctx: i32) {
         && nodeAt(n.callFn) is Ident)
       if !genCallee { monoCloseRetFnTy(ix, ctx) }
       if monoNotePushDeliveries(n, ctx) < 0 { return -1 }
-      if monoGenArgAtOpenParam(n, ctx) && monoOpenCallAtElems(n, ctx) < 0 {
-        return -1
+      let elemsTyped = 0
+      if monoGenArgAtOpenParam(n, ctx) {
+        elemsTyped = monoOpenCallAtElems(n, ctx)
+        if elemsTyped < 0 { return -1 }
       }
       if n.callFn < 0 { return 0 }
       const callee = nodeAt(n.callFn)
-      if callee is Index && monoGenArgAtOpenParam(n, ctx) {
+      // An `if` called in place asks the split as a binding of it does (D7848).
+      const calleeIf = nodeAt(unwrapParen(n.callFn)) is IfStmt
+      if (callee is Index || calleeIf) && monoGenArgAtOpenParam(n, ctx) {
         return monoGenArgOpenFail(ix)
       }
       if callee is Ident {
@@ -24327,7 +24369,8 @@ function monoWalk(ix: i32, ctx: i32) {
         if cr < 0 { return -1 }
         if cr == 1 { return 0 }
       }
-      if monoCallIfValue(n, ix, ctx) < 0 { return -1 }
+      // An `if` callee its elements' calls already typed takes no seed instance (D7848).
+      if elemsTyped == 0 && monoCallIfValue(n, ix, ctx) < 0 { return -1 }
       // A callback over a call's result reads it at the instance that call takes (D9550).
       const cbRecvCall = monoListCbRecvIsCall(n)
       if cbRecvCall && monoWalk(n.callFn, ctx) < 0 { return -1 }
