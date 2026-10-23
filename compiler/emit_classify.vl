@@ -820,7 +820,6 @@ import {
   paramStructIndex,
   paramVariantIndex,
   recRowOfTy,
-  setAtomSpelling,
   sigKeyOfTy,
   sigKeyRetIsVoid,
   sigKeyRetKind,
@@ -838,12 +837,12 @@ import {
   ifJoinUnionNameIn,
   narrowedClosureOf,
   narrowedClosureTyOf,
+  narrowedIsRefArray,
+  narrowedIsRefArrayPlace,
   narrowedMapOf,
   narrowedMapOfPlace,
   narrowedMapValTyOf,
   narrowedMapValTyOfPlace,
-  narrowedRefArrayOf,
-  narrowedRefArrayOfPlace,
   narrowedValueAtomOf,
   nicheReadKindAt,
   nodeJoinRowName,
@@ -1103,6 +1102,7 @@ import {
   msSubAtomOrView,
   msSubNull,
   msSubTy,
+  msSubTyAlike,
   msTextOf,
   narrowSlotTy,
   removeAtomFromSet,
@@ -8368,7 +8368,7 @@ export function mapReadNarrowedContainer(exprIx: i32, fnIx: i32): boolean {
   if mrs < 0 { return false }
   if mvValKind[mrs] != MVK_UNION { return false }
   if narrowedMapOfPlace(exprIx) != "" { return true }
-  narrowedRefArrayOfPlace(exprIx) != ""
+  narrowedIsRefArrayPlace(exprIx)
 }
 
 // Push the narrowing for a map index place `m[1] is T` — the map twin of the ref-list
@@ -8752,17 +8752,10 @@ function narrowIsElse(
   if srecv is Ident {
     if identHoldsUnionBox(isObj, srecv.identName, fnIx) {
       // The subtracted atom is the resolved spelling, not the author's, agreeing with the
-      // three gates that already read it. An inline shape tested against a nominally
-      // spelled union would otherwise clear no bit (`msSubAtom` finds no match), silently
-      // handing the else arm an unchanged, un-narrowed set while the checker did narrow.
-      const sVar = setAtomSpelling(
-        currentStructNarrowSetAt(
-          srecv.identName,
-          fnIx,
-          unwrapParen(isObj),
-        ),
-        isVariantSpellingAtRecv(variant, isVarTyIxOf(condIx), isObj),
-      )
+      // three gates that already read it. A member the spelling names under another shape
+      // is found by the tested type (`pushNarrowComplement`), or the else arm would keep an
+      // unchanged, un-narrowed set while the checker did narrow.
+      const sVar = isVariantSpellingAtRecv(variant, isVarTyIxOf(condIx), isObj)
       const ssid = currentStructNarrowSetIdAt(
         srecv.identName,
         fnIx,
@@ -15008,7 +15001,7 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
       const mk = valueAtomKind(mAtom)
       if mk >= 0 && mk != 6 { return false }
       // The container arms of the same narrowing (D1014), as the Index arm above.
-      if narrowedRefArrayOfPlace(exprIx) != "" { return false }
+      if narrowedIsRefArrayPlace(exprIx) { return false }
       if narrowedMapOfPlace(exprIx) != "" { return false }
       // D209 — the other end of the read: an un-narrowed read the read site unboxes is not a
       // union value here either, asked with the same predicate that site uses, so the consumer
@@ -15151,7 +15144,7 @@ function exprUnionIdent(e: Ident, exprIx: i32, fnIx: i32): boolean {
   // wrapper: in this scope it is a list, not a union value — the ref-array twin of the
   // scalar-atom rule above. Without it a rebind under the narrow classified as a union
   // box while the init emitted the unboxed wrapper ref — invalid wasm.
-  if narrowedRefArrayOf(e.identName) != "" { return false }
+  if narrowedIsRefArray(e.identName) { return false }
   // D1029 — and the map arm, the third member of the same rule: a map binding narrowed
   // this way reads unboxed to the map struct, but `exprUnion` keeps answering true for it,
   // so `emitUnionCoerce` hands the unboxed map to a destination typed at the union —
@@ -15198,7 +15191,7 @@ function exprUnionIndex(e: Index, exprIx: i32, fnIx: i32): boolean {
     // ref-array or map for the same reason the atom rule above exists, since the read
     // unboxes. Without them an un-annotated rebind under the narrow took the union-box
     // cell while the init emitted the unboxed wrapper — invalid wasm.
-    if narrowedRefArrayOfPlace(exprIx) != "" { return false }
+    if narrowedIsRefArrayPlace(exprIx) { return false }
     if narrowedMapOfPlace(exprIx) != "" { return false }
     return rlElemKindTbl[slot] == RLK_UNION
   }
@@ -15716,7 +15709,7 @@ export function unionNameOfExpr(exprIx: i32, fnIx: i32) {
       // ref array, map): a rebind under a narrow must not still be named a union here. D1252.
       if narrowedValueAtomOf(e.identName) != "" { return "" }
       if nicheReadKindAt(unwrapParen(exprIx), e.identName) >= 0 { return "" }
-      if narrowedRefArrayOf(e.identName) != "" { return "" }
+      if narrowedIsRefArray(e.identName) { return "" }
       if narrowedMapOf(e.identName) != "" { return "" }
       // The sid-taking twin, off the node's own column: `sidOfNode` of this Ident is `sidOf` of
       // its name by that column's contract, so the id is read rather than the spelling re-interned.
@@ -16116,6 +16109,7 @@ function pushNarrowComplement(
   } else {
     r = msSubAtomOrView(s, removed)
     if r == s { r = msSubTy(s, ty) }
+    if r == s { r = msSubTyAlike(s, ty) }
   }
   if r < 0 { return "" }
   const txt = msTextOf(r)
@@ -16976,7 +16970,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
   }
   // A union binding NARROWED to a ref-element array arm (`if x is S[]` then `x[i]`): the row
   // keyed by the arm's element at this instance's pins, the wrapper the narrowed read casts to.
-  if narrowedRefArrayOf(e.identName) != "" {
+  if narrowedIsRefArray(e.identName) {
     return refListElemNameOfInstTy(exprIx, fnIx)
   }
   // A read the resolver bound to a module global is no same-named local of this frame (D9681).
@@ -17038,8 +17032,7 @@ function refListElemNameOfIdent(e: Ident, exprIx: i32, fnIx: i32): string {
 function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
   // The member path's own narrowing first (D1014): a narrowed ref-element arm names the
   // arm's element, ahead of the receiver-narrowing arm below (a different question).
-  const raPm = narrowedRefArrayOfPlace(exprIx)
-  if raPm != "" { return refListElemNameOfNodeTy(exprIx) }
+  if narrowedIsRefArrayPlace(exprIx) { return refListElemNameOfNodeTy(exprIx) }
   // A `recv.field` ref-list field read — the field's element name from the receiver's
   // struct / narrowed variant.
   // A narrowing that names no variant (a place narrowed to a plain struct) falls through to
@@ -17095,8 +17088,7 @@ function refListElemNameOfMember(e: Member, exprIx: i32, fnIx: i32): string {
 function refListElemNameOfIndex(e: Index, exprIx: i32, fnIx: i32): string {
   // The index place's own narrowing to a ref-array arm (D1014) — distinct from the
   // nullable-niche narrowing below it, which peels a `| null` off the cell's own name.
-  const raPi = narrowedRefArrayOfPlace(exprIx)
-  if raPi != "" { return refListElemNameOfNodeTy(exprIx) }
+  if narrowedIsRefArrayPlace(exprIx) { return refListElemNameOfNodeTy(exprIx) }
   // A narrowed index over a nullable-ref-array element resolves via `nulRefArrayInnerSlot`,
   // gated on the ref-array shape so an unrelated nullable-string cell can't borrow the row. D451.
   if indexElemNulRefArrayName(unwrapParen(exprIx), fnIx) != "" {
@@ -19194,7 +19186,7 @@ function arrLitListRep(exprIx: i32, fnIx: i32): VKind | null {
 // The list rep of the field read at `exprIx`: a place narrowed to a ref-list arm (D1014),
 // then the field's declared code, a nullable i32 or ref list's included.
 function memberListRep(exprIx: i32, fnIx: i32): VKind | null {
-  if narrowedRefArrayOfPlace(exprIx) != "" { return "reflist" }
+  if narrowedIsRefArrayPlace(exprIx) { return "reflist" }
   const fk = gatedListRep(memberFieldListRep(exprIx, fnIx), "member-field")
   if fk != null { return fk }
   null

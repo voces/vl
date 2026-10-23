@@ -135,7 +135,7 @@ the slice retires.
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 6 retired, 15 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
-| D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
+| D7 | narrowing store banks a type (landed: 4 retired, 1 to B and since deleted, 6 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
@@ -185,10 +185,10 @@ What each slice changes:
   arm resolves under the null on the arena, which moves its render to B. The arena names two
   witnesses' `{r:i32}|null` pin `Circle|null` where the name path did not, with the emitted
   wasm byte-identical over every `tests/**/*.vl` and the distilled corpus. The other 6 stay,
-  and each row's `next` says why: `listUnionEmitName` renders a scalar list member as its
-  product, `resolveShapeToNominal` keeps `setAtomSpelling` as a name caller, and the four
-  signature-key parses serve callers in `emit_collect`, `emit_classify` and `emit_lit_atoms`
-  that pass no type.
+  and each row's `next` says why. `listUnionEmitName` renders a scalar list member as its
+  product. `resolveShapeToNominal` keeps `listUnionEmitName` and two `emit_rewrite` sites as
+  callers (D7 deleted `setAtomSpelling`). The four signature-key parses serve callers in
+  `emit_collect`, `emit_classify` and `emit_lit_atoms` that pass no type.
 - **A5.** Atom-kind, closure-result-forcing, union-ref-arm and coalesce tests read the union row's
   member columns, or `valueAtomKindOfTy`, instead of `splitUnionAtoms`. Landed for 1 render and
   3 parses. The coalesce element kind asks `valueAtomKindOfTy` of the operand's non-null type.
@@ -783,16 +783,27 @@ What each slice changes:
     element type beside the spelling. This closes the first rung's no-type leg: 976 of the
     2,002 reaching files have no banked type, and the old answer is "" in all of them. All 16,451
     identity files compile exactly as before.
-  - Left: `narrowedRefArrayOf`'s first rung. With a type, returning the spelling still differs in
-    4 files, where it is an alias the program wrote (`VArr`, `JsonArr`) or `(readonly i32[])[]`.
-    Both typed renderings do worse: `tyToEmitName` differs in 46 files, because a record renders
-    by shape, and the ref-list row name differs in 37.
-  - Left: `setAtomSpelling`. The struct narrow set's member-set id does not cover the spelling in
-    23 of 87 files, which are generic pins, unions of maps and an alias. In 1 more file, a rolled
-    recursive arm, the typed gate answers differently.
+  - Done: 1 parse, and the render that had moved to B. `narrowedRefArrayOf` became
+    `narrowedIsRefArray`, a boolean. Every caller only compared the returned name with `""`, so
+    no consumer needed a spelling or a row name. It answers from the banked type alone. A
+    second probe (2026-10-23) ran over the self-compile and 16,879 files: `tests/**/*.vl` plus
+    the distilled `cells/` and `named/`. The function was reached in 2,017 files and the
+    boolean differed from the old name test in 0. The self-compile reached it 221 times.
+  - Done: 1 parse. `setAtomSpelling` is deleted. The struct complement subtracts the spelling the
+    receiver resolves to. When neither that spelling nor `msSubTy` clears a member, a third rung
+    in `pushNarrowComplement` does. `msSubTyAlike` clears the first record or list member that
+    `tyEqSoftLits` calls equal to the tested type. The site was reached in 1,269 files. The
+    resolved spelling differs from `setAtomSpelling`'s in 6 of them.
+    - Without the new rung, the pushed set differs in 2 files. This was the control. In
+      `nullable-value-map.vl`, `{f:K1[]}` is tested against a set row spelled `{f:K0[]}`. In
+      `rolled-unrolled-arm-one-tag.vl`, a rolled arm is tested against its unrolled member.
+    - With the rung, the set differs in 0 files. The rung fires only in those 2.
+    - The rung is gated to records and lists. Ungated, `tyEqSoftLits` matched a literal test
+      (`is "a"`) to its base-scalar member, and the set differed in at least 15 files. Across all other `pushNarrowComplement` callers, the rung
+      fires in 0 files.
   - Left: the producers (`removeAtomFromGo`, `indexElemNulRefArrayName`,
     `pushIndexNicheNarrow`, `pushIndexMapNullNarrow` and `litElseSurvName`). They write the
-    spelling that the two readers above and the `narrowVariantFor` callers still read.
+    spelling that the `narrowVariantFor` callers still read.
     `removeAtomFromGo`'s spelling fallback is live: `removeAtomRestOf` reaches it in 74 files,
     where the complement has no member-set id, and it changes the spelling in 55 of them. `narrowedMapOf`'s render is the mv slot's
     key, so it goes with D8.
