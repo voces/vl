@@ -1107,7 +1107,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Files reaching each site: 203 for `exprNullableRefArray`, 142 for `mapReadMvSlot`, 17 for `identFnTypeAnnNameAt`, 5 for `forInElemKind`, 201 for `monoNicheNarrowsFrom`, and 0 for `anonValueFitsField`, which D1715's own witness does not reach either. None of these fired a disagreement.
     - A seventh, `structIndexOfLet`, asked `structIndexOfTy` of the nullable's inner instead of the name. It disagreed in 48 files, every one an inline-shape inner such as `{g:(i32)=>i32}|null`, which the typed rung does not find. It stays.
   - Sites that stay:
-    - The spelling is the input. Examples: `monoAnnPinName`'s pin ladder, `monoNameNarrowsFrom`, `monoNarrowedNulRecPinName`, the `monoArgTyName` results, and the annotation and `tvV` binding strings. The emit_base walkers `monoBindOf`, `monoSubstAnn`, `monoAnnIsOpenUnion`, `monoUnionLeavesOpenFree` and `monoBindFromAnn` bind spellings too.
+    - The spelling is the input. Examples: `monoAnnPinName`'s pin ladder, `monoNameNarrowsFrom`, `monoNarrowedNulRecPinName`, the `monoArgTyName` results, and the annotation and `tvV` binding strings. The emit_base walkers `monoBindOf`, `monoSubstAnn` and `monoBindFromAnn` bind spellings too.
     - `annArrowAt` is a syntactic question. An alias of a function type has no arrow, so a typed answer would differ.
     - The peeled name is the narrowing's stored variant (`emit_classify`'s three peel sites), or the render feeds a name-keyed registry or is itself the output (the `refListElemNameOf*` family and eight render sites). Answering from the type would add a render.
     - Every other emit_base helper these files call has callers outside them, so none is deleted.
