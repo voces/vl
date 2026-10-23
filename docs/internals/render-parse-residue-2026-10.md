@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 4 retired, 17 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 6 retired, 15 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 2 retired, 1 to B, 8 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -531,10 +531,15 @@ What each slice changes:
   - Left: the atom tests. `isVariantBoxUnionAtoms`, `unionStrArmCountOf` and the uncovered-row
     fallback of `markRefArrayArmsOf` need the spelling where an atom has no arena type (69, 25
     and 1 files). `pushIndexMapComplement` differs at literal-alias members in 4 files (D8120).
-  - Left, not reached or not probed: `cloCallParamUnionName` and `njStash` (no file reaches
-    them), `shareFieldUnionRow` (the render is the registered key), and the registry's own
-    `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go when rows mint
-    from types.
+  - Done: 2 renders. `cloCallParamUnionName` no longer has a render rung: past the alias and
+    nominal rungs the lifted lambda's own pin answers. 5 files reach the old rung, all with an
+    empty render that already fell through to that pin. `njStash` names the union by
+    `valueUnionKeyTextOfTy`; no file reaches it. About 40 hand-written callee shapes and
+    numeric-union operands reached neither with a name. difftree `--identity` found 0 of 16,483
+    files differ.
+  - Left, not probed: `shareFieldUnionRow` (the render is the registered key), and the
+    registry's own `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go
+    when rows mint from types.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
