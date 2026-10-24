@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 1 retired, 22 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 10 retired, 11 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -917,22 +917,39 @@ What each slice changes:
     difftree `--identity` found 0 of 16,486 files differ. A string field no longer reads as a
     union where a one-literal string alias registered a row that the set text `string` finds, so
     it stores the string directly instead of in a box.
-  - Left: `scanPrintUse` adopts a row by the spelling `{v:i32}|{w:string}|null` in 1 file
-    (`as-opt-record-union-field-read.vl`), and the key text does not name it. Readers look that
-    spelling up by name 103 times, and `{v:i32}|{v:string}|null` 119 times. Without the binding,
-    `u.w` refuses. The call retires along with those readers. `unionNameOfExpr` agrees at the
-    value-union rung, but its record rung still returns the render (9 files differ).
-  - Left: the atom tests. `isVariantBoxUnionAtoms`, `unionStrArmCountOf` and the uncovered-row
-    fallback of `markRefArrayArmsOf` need the spelling where an atom has no arena type (69, 25
-    and 1 files). `pushIndexMapComplement` differs at literal-alias members in 4 files (D8120).
+  - Done: 2 renders and 1 parse. The probe for these covered the self-compile and 16,622 files.
+    - `unionNameOfExpr` names an `as` result in one of three ways:
+      - a value union by `valueUnionNameOfTy`, which agrees with the render in all 28 files;
+      - a literal-only union as one atom, "";
+      - any other union by the row its key or canonical member sequence finds
+        (`unRowOfKeyOrMembers`). These are the rows `isUNameAB` site 3 accepted.
+
+      The name changed in 6 of 696 files. In 4 of them, a structural render became the declared
+      `Shape` or `NodeKind`. In `as-opt-record-union-field-read.vl`, the render became the row's
+      own `A$m…|B$m…|null`.
+    - `scanPrintUse` registers only a value union, by that same spelling. In the 17 of 44 files
+      where the result was not a value union, the old call only adopted the render onto the key
+      row. `unionNameOfExpr` now answers with that row's own name, so no reader asks for the
+      render.
+    - `unionStrArmCountOf` counts over the row's member types. A row with an untyped member
+      answers -1: the payload caller treats it as possibly holding a string, and the tag-compare
+      caller refuses it. 1 file reaches it, and it agrees.
+
+    difftree `--identity` found 0 of the 699 reach-set files differ.
+  - Left: the atom tests. `isVariantBoxUnionAtoms` (2 entries) and the uncovered-row fallback of
+    `markRefArrayArmsOf` need the spelling where an atom has no arena type (69, 25 and 1 files).
+    `pushIndexMapComplement` differs at literal-alias members in 4 files (D8120).
   - Done: 2 renders. `cloCallParamUnionName` no longer has a render rung: past the alias and
     nominal rungs the lifted lambda's own pin answers. 5 files reach the old rung, all with an
     empty render that already fell through to that pin. `njStash` names the union by
     `valueUnionKeyTextOfTy`; no file reaches it. About 40 hand-written callee shapes and
     numeric-union operands reached neither with a name. difftree `--identity` found 0 of 16,483
     files differ.
-  - Left, not probed: `shareFieldUnionRow` (the render is the registered key), and the
-    registry's own `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go
+  - Left: `shareFieldUnionRow`, where the render is the registered key. 26 files reach it, and in
+    13 of them the render differs from the canon row's own name (`{x:i32}[]|i32[]` against
+    `P[]|i32[]`). That is the alias D4930 needs, because readers look the structural spelling up
+    by name.
+  - Left, not probed: the registry's own `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`, which go
     when rows mint from types.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
