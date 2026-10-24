@@ -6,9 +6,9 @@
 //     vl run scripts/check-filed-witnesses.vl -- [--strict] [--json OUT] <doc-or-dir>...
 //     vl run scripts/check-filed-witnesses.vl -- --self-test
 //
-// Run it from the checkout root. Rows are graded in chunks of one `vl check --batch` and one
-// `vl run --batch`, `$JOBS` chunks at a time (default 4) by `xargs -P`; a row the batches
-// leave unanswered is graded alone, and an outcome is cached under the seed, host, std and
+// Run it from the checkout root. Rows are graded in chunks of one `vl check --codegen --batch`
+// and one `vl run --batch` of the modules it kept, `$JOBS` chunks at a time (default 4) by
+// `xargs -P`; a row the batches leave unanswered is graded alone, and an outcome is cached under the seed, host, std and
 // grader that produced it (`$WITNESS_CACHE` names the directory, 0 turns it off). Shell tools
 // stand in for what `std:process` and `std:fs` lack (`dogfood:` rows in ROADMAP.md).
 
@@ -430,13 +430,50 @@ function batchClean(entries: string[]): Map<string, boolean> {
   clean
 }
 
-// Beside a witness whose last grading was not `runs`: run it alone rather than in the batch,
-// which would only hand it back unanswered.
+// The `copies` `vl check --batch --json --codegen` answered exit 0 for and kept the validated
+// module of, as `kd/<name>.wasm`: the module `vl run` would compile, so running it skips a
+// second check. A seed that cannot keep modules keeps none, and every row is graded as before.
+function batchKept(copies: string[], kd: string): Map<string, boolean> {
+  const kept: Map<string, boolean> = Map()
+  if copies.length == 0 { return kept }
+  const args = [
+    "VL_CHECK_KEEP_MODULES=" + kd,
+    "timeout",
+    timeoutSecs(),
+    VL,
+    "check",
+    "--batch",
+    "--json",
+    "--codegen",
+  ]
+  for f in copies { args.push(f) }
+  args.push("--compiler")
+  args.push(COMPILER)
+  const p = spawn("env", args)
+  for l in splitLines(p.out) {
+    if stripWs(l) == "" { continue }
+    const j = parseJson(l)
+    if j is JsonMap {
+      const f = strField(j, "file")
+      if (
+        numField(j, "exit") == 0.0
+        && exists(kd + "/" + f.slice(lastSlash(f) + 1, f.length) + ".wasm")
+      ) {
+        kept[f] = true
+      }
+    }
+  }
+  kept
+}
+
+// Beside a witness whose last grading was not `runs`: grade it alone rather than in the
+// batches, which would only hand it back unanswered.
 const HINT_ALONE = "hint-alone"
 
-// Grade the witnesses staged in `dirs` as `classify` would, one `vl check --batch` and one
-// `vl run --batch` for the chunk; a row either batch cannot answer as `runs` is graded alone,
-// so a hang, trap or crash in one row moves no other row's grade.
+// Grade the witnesses staged in `dirs` as `classify` would. One `vl check --codegen --batch`
+// keeps each one-file row's module and one `vl run --batch` runs them; a row they cannot answer
+// as `runs` is graded after a plain `vl check --batch`, alone, so a hang, trap or crash in one
+// row moves no other row's grade.
 function gradeChunk(dirs: string[]) {
   const staged: Staged[] = []
   const entries: string[] = []
@@ -445,17 +482,12 @@ function gradeChunk(dirs: string[]) {
     staged.push(s)
     entries.push(s.entry)
   }
-  const clean = batchClean(entries)
   const copies: string[] = []
   const names: string[] = []
   const at: i32[] = []
   let k = 0
   while k < dirs.length {
-    if (
-      (clean[entries[k]] ?? false)
-      && staged[k].alone != ""
-      && !exists(dirs[k] + "/" + HINT_ALONE)
-    ) {
+    if staged[k].alone != "" && !exists(dirs[k] + "/" + HINT_ALONE) {
       const name = "cfw-" + toString(k) + ".vl"
       writeText(dirs[k] + "/" + name, staged[k].alone)
       copies.push(dirs[k] + "/" + name)
@@ -466,34 +498,57 @@ function gradeChunk(dirs: string[]) {
   }
   const got: Map<i32, Ran> = Map()
   if copies.length > 0 {
-    const od = dirs[0] + "/batch-run"
-    const args = ["run", "--batch", "--out-dir", od]
-    for c in copies { args.push(c) }
-    args.push("--compiler")
-    args.push(COMPILER)
-    const p = vlBatch(args)
-    // A row's `.err` is written before the next row starts, so an answer is whole once a
-    // later row has one, or once the batch exited 0.
-    let later = p.code == 0
-    let i = copies.length - 1
-    while i >= 0 {
-      const o = od + "/" + names[i] + ".out"
-      const have = exists(o)
-      if have && later && !exists(od + "/" + names[i] + ".err") {
-        const bytes = readFile(o)
-        if bytes is u8[] {
-          const out = univNl(decodeUtf8Lossy(bytes))
-          got[at[i]] = {
-            outcome: "runs",
-            detail: cpPrefix(stripWs(out), 200),
-            stdout: out,
+    const kd = dirs[0] + "/batch-keep"
+    const kept = batchKept(copies, kd)
+    const wasms: string[] = []
+    const wnames: string[] = []
+    const wat: i32[] = []
+    let c = 0
+    while c < copies.length {
+      if kept[copies[c]] ?? false {
+        wasms.push(kd + "/" + names[c] + ".wasm")
+        wnames.push(names[c] + ".wasm")
+        wat.push(at[c])
+      }
+      c = c + 1
+    }
+    if wasms.length > 0 {
+      const od = dirs[0] + "/batch-run"
+      const args = ["run", "--batch", "--out-dir", od]
+      for w in wasms { args.push(w) }
+      args.push("--compiler")
+      args.push(COMPILER)
+      const p = vlBatch(args)
+      // A row's `.err` is written before the next row starts, so an answer is whole once a
+      // later row has one, or once the batch exited 0.
+      let later = p.code == 0
+      let i = wasms.length - 1
+      while i >= 0 {
+        const o = od + "/" + wnames[i] + ".out"
+        const have = exists(o)
+        if have && later && !exists(od + "/" + wnames[i] + ".err") {
+          const bytes = readFile(o)
+          if bytes is u8[] {
+            const out = univNl(decodeUtf8Lossy(bytes))
+            got[wat[i]] = {
+              outcome: "runs",
+              detail: cpPrefix(stripWs(out), 200),
+              stdout: out,
+            }
           }
         }
+        if have { later = true }
+        i = i - 1
       }
-      if have { later = true }
-      i = i - 1
     }
   }
+  const rest: string[] = []
+  k = 0
+  while k < dirs.length {
+    if got[k] == null { rest.push(entries[k]) }
+    k = k + 1
+  }
+  const clean = batchClean(rest)
   k = 0
   while k < dirs.length {
     const r = got[k]
