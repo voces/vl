@@ -61,6 +61,7 @@ import {
   i32ToStr,
   nodeChildren,
   nodeSpineChildren,
+  nodeSpineChildrenPush,
   nodeToks,
   stmtAlwaysExits,
 } from "./ast"
@@ -215,6 +216,7 @@ export function lint(progRoot: i32) {
     // the rule-major emit sequence a same-position tie reads.
     const walkMark = lintCodes.length
     piSeen = []
+    lintKids = []
     lintWalk(progRoot)
     lintRegroupWalkPhase(walkMark)
     // The typed links describe one module's text; a caller that does not hand them in
@@ -1084,23 +1086,36 @@ function lintVisitAll(ix: i32) {
   0
 }
 
+// The children the two whole-program walks (`bindScan`, `lintWalk`) are visiting, pushed
+// rather than allocated per node: a walk reads its own slots from its base, and a nested
+// visit only appends. Reset when each walk starts.
+let lintKids: i32[] = []
+
 // Visit `ix`, then recurse into its children (pre-order: a rule sees a node before any
 // of its descendants). `-1` child slots (absent) and any out-of-range index are skipped
 // by the bounds check, so the walk never traps.
 function lintWalk(ix: i32) {
   if ix < 0 || ix >= P.nodes.length { return 0 }
   lintVisitAll(ix)
+  if !(nodeAt(ix) is IfStmt) { return lintWalkKids(ix) }
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = ix
   while cur >= 0 {
     if cur != ix { lintVisitAll(cur) }
-    const kids = nodeSpineChildren(cur)
-    let i = 0
-    while i < kids.length {
-      lintWalk(kids[i])
-      i = i + 1
-    }
+    lintWalkKids(cur)
     cur = elseIfLink(cur)
+  }
+  0
+}
+
+// `lintWalk` over each spine child of `ix`.
+function lintWalkKids(ix: i32) {
+  const base = lintKids.length
+  const k = nodeSpineChildrenPush(ix, lintKids)
+  let i = 0
+  while i < k {
+    lintWalk(lintKids[base + i])
+    i = i + 1
   }
   0
 }
@@ -1986,8 +2001,10 @@ function vecModFnOf(fnIx: i32, shift: i32): i32 {
   if shift == 1 {
     if f is Member { name = f.memProp }
   }
-  if name == "" || lintBindDecl(name) >= 0 { return -1 }
-  lintModFnDeclOf(name)
+  if name == "" { return -1 }
+  const nid = lnFind(name)
+  if nid < 0 || lnModFnDecl[nid] < 0 || lintBindDeclId(nid) >= 0 { return -1 }
+  lnModFnDecl[nid]
 }
 
 // The element type list literal `ix` visibly has when every element is a float, else "".
@@ -2148,9 +2165,9 @@ function vecNoteCallLet(ix: i32, id: i32) {
 
 // A module function's name read anywhere but as a callee lets its result go unseen.
 function vecNoteFnRef(ix: i32, nid: i32) {
-  if vecCalleeIx.has(ix) || lintBindDeclId(nid) >= 0 { return 0 }
   const d = lnModFnDecl[nid]
-  if d >= 0 { vecFnEscapes[d] = 1 }
+  if d < 0 || vecCalleeIx.has(ix) || lintBindDeclId(nid) >= 0 { return 0 }
+  vecFnEscapes[d] = 1
   0
 }
 
@@ -2188,9 +2205,11 @@ function vecRetLengthsAgree(d: i32, n: i32): boolean {
 // `f32[]`; whether the callee reads it as a vector is known once the scan is done.
 function vecNoteCall(n: Call, ix: i32) {
   if n.callFn < 0 || n.callFn >= P.nodes.length { return 0 }
-  vecCalleeIx[n.callFn] = 1
   const d = vecModFnOf(n.callFn, 1)
-  if d < 0 || d >= P.nodes.length { return 0 }
+  if d < 0 { return 0 }
+  // Only a callee naming an unshadowed module function is ever asked about.
+  if nodeAt(n.callFn) is Ident { vecCalleeIx[n.callFn] = 1 }
+  if d >= P.nodes.length { return 0 }
   vecCallIxs.push(ix)
   vecCallFns.push(d)
   const fd = nodeAt(d)
@@ -3589,18 +3608,26 @@ function bindScan(ix: i32) {
     bindTrim(mark)
   } else {
     nameVisit(ix)
+    if !(n is IfStmt) { return bindScanKids(ix) }
     // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
     let cur = ix
     while cur >= 0 {
       if cur != ix { nameVisit(cur) }
-      const kids = nodeSpineChildren(cur)
-      let i = 0
-      while i < kids.length {
-        bindScan(kids[i])
-        i = i + 1
-      }
+      bindScanKids(cur)
       cur = elseIfLink(cur)
     }
+  }
+  0
+}
+
+// `bindScan` over each spine child of `ix`.
+function bindScanKids(ix: i32) {
+  const base = lintKids.length
+  const k = nodeSpineChildrenPush(ix, lintKids)
+  let i = 0
+  while i < k {
+    bindScan(lintKids[base + i])
+    i = i + 1
   }
   0
 }
@@ -3627,6 +3654,7 @@ function collectBindingsAndRefs(progRoot: i32) {
   bacAstIdx = []
   upeAstIdx = []
   vecReset()
+  lintKids = []
   lintTyCapableCollect(progRoot)
   bindScan(progRoot)
   collectTypeNameRefs()
