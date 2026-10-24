@@ -2875,8 +2875,7 @@ function monoNulParamListTp(at: i32): string {
 
 // Refuses a `(T | null)[]` annotation whose `T` binds to a literal union, a function, or a
 // record holding such a list read through a lambda: those read the template's rep (D2525).
-// `bN`/`bT` bind type parameters to arena types; one they leave unbound binds by walking
-// `annNode` against `pinTy` (-1 when none).
+// `bN`/`bT` are the instance's banked binding of its type parameters to arena types.
 function monoNicheNulListCheck(
   annNode: i32,
   typarams: string[],
@@ -2884,7 +2883,6 @@ function monoNicheNulListCheck(
   tvV: string[],
   bN: string[],
   bT: i32[],
-  pinTy: i32,
 ) {
   const tp = monoNulParamListTp(nodeTyIxOf(annNode))
   if tp == "" { return 0 }
@@ -2897,13 +2895,7 @@ function monoNicheNulListCheck(
   if !isParam { return 0 }
   const b = normTypeAtom(monoBindOf(tvN, tvV, tp))
   if b == "" { return 0 }
-  let bt = monoBindTyOf(bN, bT, tp)
-  if bt < 0 && pinTy >= 0 {
-    const pN: string[] = []
-    const pT: i32[] = []
-    bindGenWalk(nodeTyIxOf(annNode), pinTy, pN, pT)
-    bt = monoBindTyOf(pN, pT, tp)
-  }
+  const bt = monoBindTyOf(bN, bT, tp)
   if (
     tyIsLitUnion(bt)
     || tyIxIsFunc(bt)
@@ -2914,6 +2906,30 @@ function monoNicheNulListCheck(
         + b
         + " list element has no rep; use a non-null element type",
     )
+  }
+  0
+}
+
+// The niche check over each parameter whose annotation a type parameter substitutes through,
+// read against the instance's banked binding `bN`/`bT`.
+function monoNicheNulParamsCheck(
+  params: i32[],
+  pinned: string[],
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+  bN: string[],
+  bT: i32[],
+) {
+  let pj = 0
+  while pj < params.length && pj < pinned.length {
+    const p = nodeAt(params[pj])
+    if p is Param {
+      if p.parType >= 0 && pinned[pj] != tyNameOf(p.parType) {
+        monoNicheNulListCheck(p.parType, typarams, tvN, tvV, bN, bT)
+      }
+    }
+    pj = pj + 1
   }
   0
 }
@@ -2934,7 +2950,7 @@ function monoSubstLetType(
   const tn = nodeAt(letType)
   if tn is TypeRef {
     if monoAnnMentionsTyParam(letType, typarams) {
-      monoNicheNulListCheck(letType, typarams, tvN, tvV, bN, bT, -1)
+      monoNicheNulListCheck(letType, typarams, tvN, tvV, bN, bT)
       const sub = monoSubstAnn(tn.tyName, typarams, tvN, tvV)
       if sub != "" && sub != tn.tyName {
         // The substituted type, not a re-parse of the substituted name; the name handed
@@ -10494,9 +10510,6 @@ function monoMakeInstanceParams(
   pinned: string[],
   pinKinds: i32[],
   pinTys: i32[],
-  tps: string[],
-  tvN: string[],
-  tvV: string[],
   exBN: string[],
   exBT: i32[],
   annotateI32: boolean,
@@ -10520,15 +10533,6 @@ function monoMakeInstanceParams(
         if pinned[pj] == tyNameOf(p3.parType) {
           nt = p3.parType
         } else {
-          monoNicheNulListCheck(
-            p3.parType,
-            tps,
-            tvN,
-            tvV,
-            exBN,
-            exBT,
-            pinTys[pj],
-          )
           // The argument's type is one member of a union parameter; the explicit type
           // arguments substituted through the annotation name the union itself (D2679).
           let gateTy = pinTys[pj]
@@ -11660,7 +11664,7 @@ function monoMakeInstanceRet(
   // bare `T` / `T[]`, an application (`Box<T>`), or an inline object shape
   // (`{first:B,second:A}`); a concrete annotation passes through unchanged.
   let nret = fn.fnRet
-  if nret >= 0 { monoNicheNulListCheck(nret, tps, tvN, tvV, letBN, letBT, -1) }
+  if nret >= 0 { monoNicheNulListCheck(nret, tps, tvN, tvV, letBN, letBT) }
   nret = monoMakeInstanceRetAnn(fn, nret, tps, tvN, tvV, letBN, letBT, pinTys)
   if nret < -1 { return -2 }
   const twoOut: i32[] = []
@@ -12250,9 +12254,6 @@ function monoMakeInstanceGo(
       pinned,
       pinKinds,
       pinTys,
-      k.tps,
-      tvN,
-      tvV,
       k.exBN,
       k.exBT,
       annotateI32,
@@ -12302,6 +12303,7 @@ function monoMakeInstanceGo(
       letBN,
       letBT,
     )
+    monoNicheNulParamsCheck(params, pinned, k.tps, tvN, tvV, letBN, letBT)
     monoShAliasBind(origFe, letBN, letBT)
     monoShPendFlush(shAt, params, pinTys, letBN, letBT)
     // The hole binding, made once: the return rungs, the body clone and the registry read it.
