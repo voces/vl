@@ -21,12 +21,12 @@ restate measurements; follow the links.
 
 ## Status, 2026-10-24
 
-Done: L4, L5 (#4680: the deep-`is` walkers run as the pin driver's last stage), L7, L8, L10 (T4;
+Done: L4, L5 (#4680: the deep-`is` walkers run as the pin driver's last stage), L7, L8, L9, L10 (T4;
 the JS hosts run `-O` through binaryen.js, #4683), L11 (T2), L12 (#3879), L13, L14 and the R
 ratchet floors (ladders, splits and sentinel reads all at zero). In progress: L1 as lane SC; L2
 stage 3, whose name rungs are deleted (D6950 closed) and whose field rung stays; L3, whose
 `checkFnParams` pass row is deleted (#4682) and whose `emitFail` sites remain; L6's render-parse
-readers (58 / 117, floor 21 / 22), with the name-dispatch switch paused; L9's D1; and S5's
+readers (58 / 117, floor 21 / 22), with the name-dispatch switch paused; and S5's
 artifact steps. Waiting: L3's family (d) on SC, and S-g on SC. S-c's `Tok` row and the host's
 named exit codes are done, and so is S-h's closed `EmitPass` dispatch (registered in
 `compiler/lint.vl`'s ladder sets); the other SMALL rows are partial. RepDesc is ruled.
@@ -46,7 +46,7 @@ ARCHITECTURE.md §7 has 7 rows (8 at `bc8b191a4`, less S-h).
 | L11 repo lint rules once | T2 **done** for the ratchets | Every lint-held per-file ratchet runs under `vl check --budget`: ladder and export (#3667), render-parse (#3677). `ratchet.py` is deleted. |
 | L14 type section from allocation order | **done** | #3656 (D4): `emitTypeSection` walks the allocation order `mAllocType` records. |
 | L13 host import surface, errno once | first PR (A5) **done**. Last: the Deno stubs are `FS_FLOOR`'s names, read at load by `tests/support/hostFloor.ts`. Next: none in the floor; every copy reads the table. | [L13 log](#l13-log) |
-| L9 split `typecheck.vl` | D1 **in progress**. Budget: a carve may add up to +1.5% L2 fuel when the cost is source shape alone and identity reads 0 differ. Last: hook census, 111 sites, none can be direct (each is the checker's own recursion); the code is unchanged, since moving the slot's install beside `checkNode` cost +0.44% L2 fuel with no change in behaviour. Next: none planned in `typecheck.vl` (429 lines, the dispatcher's home). | [L9 log](#l9-log) |
+| L9 split `typecheck.vl` | **done** (D1). Last: the closing measurement. `typecheck.vl` is 511 lines and 5 functions (from 74,855 and 3,036), and 2 modules import it. What is left is the dispatcher's strongly connected component plus two arm bodies that break no cycle. Next: none. | [L9 log](#l9-log) |
 | L12 | **done** (#3879). Last: the playground adapter calls every `lsp/src/features.ts` function and gains references, highlights, outline and rename; playground TS 3,687 → 3,471 lines. Next: nothing; the lane is done. | [L12 log](#l12-log) |
 | SMALL S-c front-end tidy | **partial**. `typecheck.vl` imports `./ast` once; `ast.vl` re-exports the lexer's `Tok` (2026-10-24, identity tier: difftree 0 differ). The other rows are not byte-identical (see the SMALL log). | [SMALL log](#small-log) |
 | SMALL S-a, S-b, S-d … S-n | **partial**. Last (2026-10-24): the host names every exit code (`EXIT_FAILED`, `EXIT_USAGE`, `EXIT_COMPILER_BUG`), held to `cli.vl` by `tests/cli_host_tables_test.ts`. Before that: S-e row 2 (#3989), S-i row 2, S-m in part. Open: S-g (waits on SC); S-h's closed `runEmitPass` dispatch (waits on registering `EmitPass` in `compiler/lint.vl`'s ladder sets); S-m's `std:seed` drop (waits on Q14) and hex (waits on `std-hex-parse-format`). | [SMALL log](#small-log) |
@@ -1570,6 +1570,10 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
   - Nothing in the code moved. Moving `checkerForce` and its install from `check_program.vl` into `typecheck.vl` beside `checkNode`, with no other change, cost +0.44% L2 fuel (89,918,239,511 against master's 89,520,888,450) and bought only a tidier owner for the slot, so it was dropped. Routing the two hot kind-0 reads in `check_demands.vl` and `check_relate_core.vl` through `checkNodeHook` was dropped as well. Those four reads stay direct `checkerForceFn` calls, and `checkProgramPass` still installs the slot.
   - `typecheck.vl` keeps `checkNode`, `checkNodeReal` and the install: it is the one module that imports every per-kind checker, so the dispatcher belongs there. The literal and identifier arms stay inline; the identifier arm re-dispatches an inlined `const` literal, which a lower module could reach only through the slot.
   - The comments on `checkerForceFn`, `checkNodeHook` and `checkNodeReal` now say what the slot carries and why it is a slot, and the seed is byte-identical to master's fixpoint (5,955,790 bytes).
+- L9 closes (2026-10-24, measured at `4a2102699`). The item's problem was one file of 74,855 lines and 3,036 functions that 13 modules imported. `typecheck.vl` is now 511 lines (0.14% of the compiler's 363,889) with 5 functions, and 2 modules import it (`check_program.vl`, `check_emit_queries.vl`). The checker is `typecheck.vl` plus 132 `check_*.vl` modules, 108,981 lines; the largest is `check_relate_core.vl` (7,760).
+  - The call graph inside the file: `checkNode`, `checkNodeReal` and `checkIdentNode` are one strongly connected component (the dispatcher, and the identifier arm that re-dispatches an inlined `const` literal). `checkNumLitNode` (29 lines) and `checkIdentUndeclared` (38 lines) are the only callee-closed sets left. Each is the body of one dispatcher arm, and carving them breaks no cycle, so they stay, as the per-kind carve decided for the literal and identifier arms.
+  - The hook census, re-read: 119 `checkNodeHook` / `checkerForceFn` call sites in 13 modules, all of them the checker's own recursion, as before.
+  - ARCHITECTURE.md §7 has no L9 row. Function length is L8's (no compiler function is over 180 lines), and the size of the other checker files is not part of this item. This entry changes no code; the seed is master's.
 
 ### SMALL log
 
