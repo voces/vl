@@ -127,7 +127,7 @@ the slice retires.
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
-| C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
+| C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
@@ -170,6 +170,15 @@ What each slice changes:
   through `mvValNamesCompat`'s shape-text query, and `mapValKindLowerable` in 1 under the D34 arm
   mint. The function and literal-union rungs are listed in the ledger's `next` as the deliberate
   rep change, with the rep each one moves.
+
+  Re-probed at 7dfbcfa6d with C4, still no parse retired. `mvValNamesCompat`'s value name is
+  cut from shape text inside `structIndexOfTypeName` and `variantIndexOfTypeName`. The callers
+  that reach it hold only a name: `nameIsRefArrayGo` and `refArrElemNameGo` in 2 files each,
+  and `isSName`, `anonHandleTyIx`, `anonRowKindsAgree`, `shapeElemDeclaredStructIdx` and
+  `monoSpelledShapeStaysAnon` in 1 each. The one that holds a type, `mintUnionFieldObjRow` (1
+  file), gets a different row from `structIndexOfTypeNameTy` in 12 of 128 files. So threading
+  types through C4's field-code walkers does not reach these rows. The callers above have to
+  carry the shape's type first.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
@@ -720,6 +729,20 @@ What each slice changes:
       `anonRowServesLeafSet` (23). Also `internShapeAs` (40), `gaeEnsure` (11) and
       `nameFieldCodeTy` called with -1 (62 to 107).
     - `fieldCodeOfSpelling` is the name-only caller that C5 waits on.
+  - Re-probed at 7dfbcfa6d by the call site that asks the resolver, still 3 left (16,635
+    files, 0 uncompared; counts are files where the spelling answers true):
+    - The arm mint has 18, 39 and 2 (literal union, array, function). The rest come from
+      resolver callers that hold only a name. These include `nameIsRefArrayGo` and
+      `refArrShapeKindGo` (D2), `refArrElemNameGo`, `isSName`, `anonHandleTyIx`,
+      `anonRowKindsAgree`, `monoSpelledShapeStaysAnon` (22 array files) and
+      `rlElemVariantRow`. Each status lists them all.
+    - Two callers hold a type:
+      - `mintUnionFieldObjRow` (D6): `structIndexOfTypeNameTy` gives a different row in 12
+        of its 128 files, so swapping it changes output.
+      - `structIndexOfIndexExpr`: the typed resolver agrees in all 29 files (1,622 events).
+        It is the next swap, but it removes only 7 function-arm files.
+    - So these arms retire when the resolvers' callers carry the shape's type, not in the
+      field-code walkers. That is D2's and D6's work.
   - Done: 2 parses, the rendered rung 3 of `rlSlotByNameTyK`. The 35 unhinted call sites
     pass the element type they hold to `rlSlotByNameTwin`: the two name rungs, then
     `rlSlotOfTyTwin`. Keying rung 2 by that type instead moved the slot in 80 files, because
