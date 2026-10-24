@@ -995,6 +995,7 @@ import {
 } from "./emit_variant_sig"
 import {
   i32ListHas,
+  i32ListIndexOf,
   i32PairIndexOf,
   strListHas,
   strListIndexOf,
@@ -1720,7 +1721,9 @@ function dstPinAnnIn(
     const dstN: string[] = []
     const dstT: i32[] = []
     if retIx >= 0 { dstPinRetDest(bodyIx, retIx, letIx, dstN, dstT) }
-    dstPinScan(bodyIx, bodyIx, fnIx, letIx, dstN, dstT)
+    if !dstPinBatchRead(letIx, bodyIx, fnIx, dstN, dstT) {
+      dstPinScan(bodyIx, bodyIx, fnIx, letIx, dstN, dstT)
+    }
     dstPinCallerDests(letIx, fnIx, rootIx, dstN, dstT)
     if dstN.length == 0 { return 0 }
     const pinName = dstN[0]
@@ -1750,8 +1753,68 @@ function dstPinAnnIn(
     }
     s.letType = pinTy
     dstPinFired = dstPinFired + 1
+    dpbLive = false
   }
   0
+}
+
+// The module-scope batch: one `dstPinScan` of the program root answers every candidate global
+// at once, where a scan per global re-walked the whole top level for each. The scan is in
+// `DSTPIN_BATCH` mode, where a destination tags each push with the candidate it belongs to.
+// `dpbLive` is false from the first pin on, since a pin moves a `letType` the scan read.
+const DSTPIN_BATCH = -2
+let dpbLive = false
+let dpbRoot = -1
+let dpbCands: i32[] = []
+let dpbN: string[] = []
+let dpbT: i32[] = []
+let dpbC: i32[] = []
+
+// Scan `rootIx` once for every global `dstPinAnnIn` would scan for, before any of them pins.
+function dstPinBatchBuild(rootIx: i32) {
+  dpbCands = []
+  dpbN = []
+  dpbT = []
+  dpbC = []
+  let gi = 0
+  while gi < globalStmts.length {
+    const s = nodeAt(globalStmts[gi])
+    if s is LetDecl {
+      if s.letType < 0 && armPinLitInit(s.letInit) {
+        dpbCands.push(globalStmts[gi])
+      }
+    }
+    gi = gi + 1
+  }
+  if dpbCands.length > 0 {
+    dstPinScan(rootIx, rootIx, -1, DSTPIN_BATCH, dpbN, dpbT)
+  }
+  dpbRoot = rootIx
+  dpbLive = true
+  0
+}
+
+// `dstPinScan(bodyIx, …, letIx, …)` read off the batch, in the scan's own order, when the batch
+// is live for this module-scope binding; false leaves the caller to scan.
+function dstPinBatchRead(
+  letIx: i32,
+  bodyIx: i32,
+  fnIx: i32,
+  outN: string[],
+  outT: i32[],
+): boolean {
+  if !dpbLive || fnIx >= 0 || bodyIx != dpbRoot { return false }
+  const k = i32ListIndexOf(dpbCands, letIx)
+  if k < 0 { return false }
+  let i = 0
+  while i < dpbC.length {
+    if dpbC[i] == k {
+      outN.push(dpbN[i])
+      outT.push(dpbT[i])
+    }
+    i = i + 1
+  }
+  true
 }
 
 // The call site is a destination too, for a binding its function returns (D155): a function
@@ -1889,6 +1952,9 @@ function dstPinPushAnn(
   outT: i32[],
 ) {
   if srcExpr < 0 { return 0 }
+  if letIx == DSTPIN_BATCH {
+    return dstPinPushAnnBatch(annIx, srcExpr, bodyIx, outN, outT)
+  }
   if dstPinSrcIs(bodyIx, srcExpr, letIx) {
     outN.push(armPinAnnName(annIx))
     outT.push(annIx)
@@ -1901,6 +1967,162 @@ function dstPinPushAnn(
   if ed > 0 {
     outN.push(dstPinElemAnnName(annIx, ed))
     outT.push(-1)
+  }
+  0
+}
+
+// `dstPinPushAnn` for every batch candidate at once: the bindings `srcExpr` delivers whole and
+// those it delivers as an element are each derived once, then each candidate takes the push
+// the single-binding form would have made for it, tagged in `dpbC`.
+function dstPinPushAnnBatch(
+  annIx: i32,
+  srcExpr: i32,
+  bodyIx: i32,
+  outN: string[],
+  outT: i32[],
+) {
+  const whole: i32[] = []
+  dstPinSrcSet(bodyIx, srcExpr, 0, whole)
+  const elL: i32[] = []
+  const elD: i32[] = []
+  dstPinElemDepthSet(bodyIx, srcExpr, 0, [], elL, elD)
+  if whole.length == 0 && elL.length == 0 { return 0 }
+  let k = 0
+  while k < dpbCands.length {
+    const c = dpbCands[k]
+    if i32ListHas(whole, c) {
+      outN.push(armPinAnnName(annIx))
+      outT.push(annIx)
+      dpbC.push(k)
+    } else {
+      const at = i32ListIndexOf(elL, c)
+      if at >= 0 {
+        outN.push(dstPinElemAnnName(annIx, elD[at]))
+        outT.push(-1)
+        dpbC.push(k)
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// Every binding `l` with `dstPinSrcIsAt(bodyIx, ex, l, depth)`, pushed onto `out`: the same
+// branches, each ending in the one binding it compares against.
+function dstPinSrcSet(bodyIx: i32, ex: i32, depth: i32, out: i32[]) {
+  if ex < 0 { return 0 }
+  if depth > 4 { return 0 }
+  const r = retLocalLetOfBlock(bodyIx, ex)
+  if r >= 0 { out.push(r) }
+  const u = unwrapParen(ex)
+  if u < 0 { return 0 }
+  const n = nodeAt(u)
+  match n {
+    Call => {
+      const j = dstPinFwdArg(u)
+      if j >= 0 && j < n.callArgs.length {
+        return dstPinSrcSet(bodyIx, n.callArgs[j], depth + 1, out)
+      }
+      const cr = dstPinCalleeRetLet(u)
+      if cr >= 0 { out.push(cr) }
+    }
+    Index => {
+      const ia = nodeAt(unwrapParen(n.idxArr))
+      if ia is Call {
+        const ej = dstPinElemFwdArg(unwrapParen(n.idxArr))
+        if ej >= 0 && ej < ia.callArgs.length {
+          return dstPinElemIsSet(bodyIx, ia.callArgs[ej], depth + 1, out)
+        }
+      }
+    }
+    // No other expression forwards the binding.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  0
+}
+
+// Every binding `l` with `dstPinElemIsAt(bodyIx, ex, l, depth)`, pushed onto `out`.
+function dstPinElemIsSet(bodyIx: i32, ex: i32, depth: i32, out: i32[]) {
+  if ex < 0 { return 0 }
+  if depth > 4 { return 0 }
+  const u = unwrapParen(ex)
+  if u < 0 { return 0 }
+  const n = nodeAt(u)
+  match n {
+    ArrayLit => {
+      let i = 0
+      while i < n.arrElems.length {
+        dstPinSrcSet(bodyIx, n.arrElems[i], depth + 1, out)
+        i = i + 1
+      }
+    }
+    Call => {
+      const ej = dstPinElemFwdArg(u)
+      if ej >= 0 && ej < n.callArgs.length {
+        return dstPinElemIsSet(bodyIx, n.callArgs[ej], depth + 1, out)
+      }
+    }
+    // No other expression is a way down a list level.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Unary | BinExpr | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  0
+}
+
+// `dstPinElemDepthAt` for every binding at once: `outL[i]` sits `outD[i]` levels down, the
+// first depth that walk would return for it. `skip` holds the bindings whose own list literal
+// the walk is inside, which `dstPinElemDepthAt` does not descend for that binding.
+function dstPinElemDepthSet(
+  bodyIx: i32,
+  ex: i32,
+  depth: i32,
+  skip: i32[],
+  outL: i32[],
+  outD: i32[],
+) {
+  if ex < 0 { return 0 }
+  if depth > 4 { return 0 }
+  if depth > 0 {
+    const here: i32[] = []
+    dstPinSrcSet(bodyIx, ex, 0, here)
+    for l in here {
+      if !i32ListHas(skip, l) && !i32ListHas(outL, l) {
+        outL.push(l)
+        outD.push(depth)
+      }
+    }
+  }
+  const u = unwrapParen(ex)
+  if u < 0 { return 0 }
+  const n = nodeAt(u)
+  match n {
+    ArrayLit => {
+      let i = 0
+      while i < n.arrElems.length {
+        dstPinElemDepthSet(bodyIx, n.arrElems[i], depth + 1, skip, outL, outD)
+        i = i + 1
+      }
+    }
+    Ident => {
+      const li = dstPinUnannListLet(bodyIx, n.identName)
+      if li >= 0 {
+        const ld = nodeAt(li)
+        if ld is LetDecl {
+          const inner: i32[] = []
+          for s in skip { inner.push(s) }
+          inner.push(li)
+          return dstPinElemDepthSet(
+            bodyIx,
+            ld.letInit,
+            depth,
+            inner,
+            outL,
+            outD,
+          )
+        }
+      }
+    }
+    // No other expression is a way down a list level.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Unary | BinExpr | Call | Member | OptMember | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | Index | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
   }
   0
 }
@@ -2244,7 +2466,20 @@ function dstPinMapValue(
       if tg is Index {
         const recv = nodeAt(unwrapParen(tg.idxArr))
         if recv is Ident {
-          if dstPinSrcIs(bodyIx, n.binRight, letIx) {
+          // The batch's candidates this value delivers whole, by `dpbCands` position.
+          const hits: i32[] = []
+          if letIx == DSTPIN_BATCH {
+            const whole: i32[] = []
+            dstPinSrcSet(bodyIx, n.binRight, 0, whole)
+            let k = 0
+            while k < dpbCands.length {
+              if i32ListHas(whole, dpbCands[k]) { hits.push(k) }
+              k = k + 1
+            }
+          } else if dstPinSrcIs(bodyIx, n.binRight, letIx) {
+            hits.push(-1)
+          }
+          if hits.length > 0 {
             let mapAnn = -1
             const mli = parentLetOf(bodyIx, recv.identName)
             if mli >= 0 {
@@ -2265,8 +2500,11 @@ function dstPinMapValue(
               const vT = tyMapValOf(annRowOfNode(mapAnn))
               if vn != "" && vT >= 0 {
                 if variantRowOfTy(vT) >= 0 || pinArmDeepUncontestedTy(vT) {
-                  outN.push(vn)
-                  outT.push(-1)
+                  for h in hits {
+                    outN.push(vn)
+                    outT.push(-1)
+                    if h >= 0 { dpbC.push(h) }
+                  }
                 }
               }
             }
@@ -2522,11 +2760,14 @@ export function synthDstPinAnns(rootIx: i32) {
     // The module run walks `globalStmts` rather than the statement list, for the reason
     // `synthGlobalEmptyListAnns` does: those are the module's bindings, already collected, and
     // a top-level `let` nested in an `if` is a start-function local `collectLocals` reaches.
+    dstPinBatchBuild(rootIx)
     let gi = 0
     while gi < globalStmts.length {
       synthGlobalDstPinAnn(globalStmts[gi], rootIx)
       gi = gi + 1
     }
+    dpbLive = false
+    dpbRoot = -1
     if dstPinFired == 0 { return 0 }
     round = round + 1
   }
