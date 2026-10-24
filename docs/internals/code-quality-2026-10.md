@@ -228,8 +228,9 @@ D4071):**
 **Proposed shape.** Move three families into the checker: value-`if` arms that yield no value
 (6 sites), object-literal shape against a union variant (17 sites),
 and the mono function-value one-signature rules (~12 sites in `emit_mono`; lane SC's direction —
-coordinate, do not duplicate). `checkParams`'s valtype-ladder refusal is a fourth candidate:
-whether a check-clean program reaches it is UNDECIDED (not probed). D4070 is not an emit
+coordinate, do not duplicate). `checkParams`'s valtype-ladder refusal was a fourth candidate;
+probed on 2026-10-24, no direct spelling reaches it, only a monomorphizer pin defect (D5001), so
+the pass row is gone and the floor runs per function in `emitFuncCode` (`paramValtypeFloor`). D4070 is not an emit
 refusal at all; its fix is the checker's existing excess-field rule, applied where it is
 skipped. Leave the built-in arity family (~45 sites) as floors behind the
 checker rule that already exists, and reword them as internal invariants so a reached one reads

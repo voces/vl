@@ -758,7 +758,7 @@ The ordered pass table — see the pass-manager block comment above
  · collectMapFilterUse flips `fnValUsed` + forces the RESULT list's types;
    the `$fnsig` set (collectCloSigs) is collected after it and after
    collectFnValUse — both need the re-inferred return kinds.
- · scanPrintUse / checkFnParams read the FINAL arena; capCacheBuild
+ · scanPrintUse reads the FINAL arena; capCacheBuild
    snapshots capture lists only once the AST and `fnStmts` are final —
    after every mutating pass.
  · synthCaptureEmptyListAnns writes the `synthEmptyListAnn` / `synthNullableAnn`

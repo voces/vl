@@ -155,9 +155,8 @@ then `emitModule`:
    `buildFnMap#2`, `computeVoidFns#2`, `capNarrowBuild#2`, `computeRetInference#2`) re-run a
    collect pass after mono, over the annotations mono minted. The comment above the table states
    the edge shapes: a pass that mutates the arena runs before every pass that scans it, and a
-   pass that needs the final arena runs after all of them. The one legality row is
-   `checkFnParams` (`checkParams`); the `checkTopLevel` row is a no-op kept for its ordering
-   edge ([§7](#7-known-deviations)).
+   pass that needs the final arena runs after all of them. No row decides legality; the
+   `checkTopLevel` row is a no-op kept for its ordering edge ([§7](#7-known-deviations)).
 2. **Queries are not passes.** `emit_classify.vl`, `emit_rep.vl` and `emit_query.vl` hold the
    functions that passes and lowering call to ask a node's rep or a shape's registry row. No
    table row runs them; they memoise against `emitPassGen` and their own generation keys.
@@ -487,7 +486,7 @@ line in the PR that closes it. The order in which they are closed is
 | --- | --- | --- |
 | §3.5, §4.1 | The checker banks each generic call's binding (`callBindTyOf`, `check_bind_rows.vl`), but the emitter still rebuilds it for most uses (`monoArgTyName`, 9 call sites; `bindGenWalk`, 11 in the emitter), and an instance node's checker type is the generic's. Some of the monomorphizer's lists are still keyed by name. | [L1](internals/code-quality-2026-10.md#L1) |
 | §2.4, §3.4, §4.1 | The emitter answers type questions by rendering and re-parsing the spelling: **83** `tyToEmitName` calls and **228** type-string parses stand in `scripts/render-parse-budget-baseline.json` (2026-10-22, `c1bcc6474`). Of those, 21 / 22 are the product (a key, a diagnostic, a recorded TypeRef text), which is the proposed floor; the rest are classified and sliced in [render-parse-residue-2026-10.md](internals/render-parse-residue-2026-10.md). Rep classifiers read two producers for one answer (arena with name, spelling, table or frame). | [L2](internals/code-quality-2026-10.md#L2) |
-| §2.4, §4.2 | The emitter decides legality. The `checkFnParams` pass-table row (`checkParams`) refuses parameter types at emit. The emitter has 736 `emitFail` / `emitFailAt` sites (`scripts/emit-refusal-sites.vl`); a hand classification of the 676 there were at `5d4cd14dc` found 140 legality-worded. The `checkTopLevel` row is a no-op (`passCheckTopLevel`) and is not a deviation. | [L3](internals/code-quality-2026-10.md#L3) |
+| §2.4, §4.2 | The emitter decides legality. The emitter has 745 `emitFail` / `emitFailAt` sites (`scripts/emit-refusal-sites.vl`, 2026-10-24); a hand classification of the 676 there were at `5d4cd14dc` found 140 legality-worded. The `checkTopLevel` row is a no-op (`passCheckTopLevel`) and is not a deviation. | [L3](internals/code-quality-2026-10.md#L3) |
 | §2.1 | The lexer and `ast.vl` each declare a `Tok` record. | [S-c](internals/code-quality-2026-10.md#small-items) |
 | §3.1, §4.5 | Table reads whose index may be a sentinel and is not tested: **147** `sentinel-index-unguarded` findings over the compiler graph, held by `scripts/sentinel-budget-baseline.json`, a ratchet that may only fall. A finding is not a bug; a seeded sample graded most UNDECIDED. | `docs/internals/sentinel-index-lint.md` |
 | §4.5 | Ladders over a closed kind set with a bare default: **110** `kind-ladder-incomplete` and **2** `kind-ladder-split` findings over the compiler graph, held by `scripts/ladder-budget-baseline.json`. | `docs/internals/kind-ladder-lint.md` |
