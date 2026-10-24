@@ -136,8 +136,10 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   `indexOf`, `reduce`) already are JS's, and a consumer reaching for `.some` should find it;
   `.any`/`.all` on a list answer `did you mean '.some'`/`'.every'` (`check_suggest.vl`'s
   list spelling table). `any` is also the checker's own spelling of an unresolved type in
-  several messages. `self` is `T[]`, like `includes`, and the length is re-read each step,
-  so a predicate that pops cannot index past the end. Not added with them: `find`/
+  several messages. `self` is `readonly T[]`, like `concat`'s, since nothing is written:
+  `includes` takes `T[]` and so refuses a read-only list, a limitation not worth copying.
+  The length is re-read each step, so a predicate that pops cannot index past the end (and
+  one that always pushes and never decides does not terminate). Not added with them: `find`/
   `findIndex` — a predicate `findIndex` is the twin of `indexOf` and would be the next
   natural export, but no consumer has asked, and `find` needs a `T | null` return that a
   nullable element type cannot distinguish from a miss. Fixtures:
