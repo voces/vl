@@ -736,7 +736,7 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   STRUCTURALLY against exactly `{ file: string, line: i32, col: i32 }` (field order free), so
   any identical alias satisfies it and growing `CallerLoc` is a compiler change, not a std
   one. It is exported because a forwarding helper has to name the type; it is not in
-  `std:fmt` because this module's dependency surface is deliberately ZERO.
+  `std:fmt` because only a matcher, or a helper forwarding one, ever names it.
 - **The MATCHER is the anchor, not `expect`.** `expect(x)` and `not()` are setup and decide
   nothing, so `expect(x).not().toEqual(y)` anchors on the FINAL matcher's token. A second
   hand-in point would need a precedence rule defaults v1 cannot express, since a callee
@@ -752,6 +752,15 @@ Each now says so, in the shape the `concat`-vs-`+` bullet uses.
   This is the assertion surface that reports failures in everything else, `std:fmt` included,
   and a defect in fmt's renderer must not be able to corrupt the message that reports it.
   `tests/cases/std/renderers-agree.vl` pins the two against each other at i64 min.
+- **An f64 operand is the one exception: it renders through `std:fmt`'s `toString`.** Until
+  diderven's DV-902 the message said `<f64>` and the matcher `print`ed both values into the
+  captured output, because no f64 renderer existed. A second shortest-round-trip renderer in
+  this module would be a large private copy of fmt's, so independence is kept for integers
+  and locations only. The cost is the std:fmt/std:str link in every test file: measured as
+  no change in user CPU over diderven's 102-file suite. An f32 operand still reads
+  `<value>` in `toEqual`: fmt's `toString` takes no f32, and widening would print f64
+  digits (`0.1` as `0.10000000149011612`). `toBeCloseTo` widens deliberately, since its
+  comparison is in f64.
 - **`toBeTrue` stays generic on purpose.** Tightening it to `Expectation<boolean>` would turn
   a documented runtime failure into a compile-time break, which is a surface decision to make
   on its own rather than as a rider.

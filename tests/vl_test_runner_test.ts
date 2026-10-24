@@ -1009,8 +1009,36 @@ Deno.test({
     const r = await runTest(`${ROOT}/tests/fixtures/vl-test-close`);
     if (r.code !== 1) throw new Error(`want the two failing cases red, got ${r.code}:\n${r.err}`);
     expectHas(r.err, "1 file · 8 passed · 2 failed");
-    expectHas(r.err, "expected <f64> to be close to <f64> to 3 digits");
-    expectHas(r.err, 'expected "1" to be close to <f64> to 2 digits');
+    expectHas(r.err, "expected 1.001 to be close to 1 to 3 digits");
+    expectHas(r.err, 'expected "1" to be close to 1 to 2 digits');
+  },
+});
+
+Deno.test({
+  name: "vl-test: an f64 renders in its message; --show-output shows a passing test's output",
+  ignore: !ENABLED,
+  fn: async () => {
+    // diderven DV-902 and DV-903, over one fixture with a printing pass and an f64 failure.
+    const fixture = `${ROOT}/tests/fixtures/vl-test-output`;
+    const quiet = await runTest(fixture);
+    const shown = await runTest(fixture, ["--show-output"]);
+    for (const r of [quiet, shown]) {
+      if (r.code !== 1) throw new Error(`want the f64 case red, got ${r.code}:\n${r.err}`);
+      expectHas(r.err, "expected 0.5 to equal 1.25");
+    }
+    // Neither a passing test's output (hidden by default) nor the f64 operands (the
+    // old `<f64>` fallback echoed them) reach the default report.
+    if (quiet.err.includes("--- captured output ---")) {
+      throw new Error(`want no captured-output block without the flag:\n${quiet.err}`);
+    }
+    const ls = lines(shown.err);
+    const at = ls.findIndex((l) => l.includes("ok   prints along the way"));
+    if (
+      at < 0 || !ls[at + 1]?.includes("--- captured output ---") ||
+      !ls[at + 2]?.includes("printed by a passing test")
+    ) {
+      throw new Error(`want the output block under its ok line:\n${shown.err}`);
+    }
   },
 });
 
