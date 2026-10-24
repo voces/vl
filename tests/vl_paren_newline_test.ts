@@ -327,3 +327,45 @@ Deno.test({
     }
   },
 });
+
+// The trivia between two links: a blank-line run and a comment line (`//` and `///`) are free
+// before a leading `.` and before a leading `?.`, and the `?.` still short-circuits on null
+// and reads through otherwise; a plain `.n` a line after `?.inner` is still guarded by it.
+// `vl fmt` drops the blank lines and moves the comments out of
+// the chain (D11800), so `tests/cases/` cannot hold this layout and it lives here.
+Deno.test({
+  name: "vl-parse: a blank line or a comment between links keeps a `.` / `?.` chain whole",
+  ignore: !ENABLED,
+  fn: async () => {
+    const dir = await Deno.makeTempDir({ prefix: "vl_leadtrivia_" });
+    try {
+      const src = "type Inner = { n: i32 }\n" +
+        "type Box = { inner: Inner | null }\n" +
+        "const xs = [1, 2, 3]\n" +
+        "const c1 = xs\n  .map((v) => v * 2)\n  // the length of the doubled list\n  .length\n" +
+        "const c2 = xs\n  .map((v) => v * 3)\n  /// a doc comment between links\n" +
+        "  .filter((v) => v > 3)\n\n\n  .length\n" +
+        "const hit: Box = { inner: { n: 7 } }\n" +
+        "const miss: Box = { inner: null }\n" +
+        "const o1 = hit\n  .inner\n  // the null-safe link follows a comment\n  ?.n\n" +
+        "const o2 = miss\n  .inner\n\n\n  ?.n\n" +
+        "const o3 = hit\n  .inner\n\n  ?.n\n" +
+        "type Held = { inner: Inner }\n" +
+        "function none(): Held | null { null }\n" +
+        "const o4 = none()\n  ?.inner\n  // still guarded by the `?.` above\n  .n\n" +
+        "print(c1)\nprint(c2)\nprint(o1)\nprint(o2)\nprint(o3)\nprint(o4)\n";
+      const f = `${dir}/a.vl`;
+      await Deno.writeTextFile(f, src);
+      const r = await runVL("run", f);
+      if (r.code !== 0) {
+        throw new Error(`a chain across trivia should run, got code ${r.code}:\n${r.err}`);
+      }
+      const want = "3\n2\n7\nnull\n7\nnull\n";
+      if (r.out !== want) {
+        throw new Error(`want ${JSON.stringify(want)}, got ${JSON.stringify(r.out)}`);
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});
