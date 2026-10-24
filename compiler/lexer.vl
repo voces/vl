@@ -160,12 +160,19 @@ let gComments: Comment[] = []
 // empty while its value is "". `gInUsed` counts the filled slots.
 let gInKey: i32[] = []
 let gInVal: string[] = []
+let gInKind: TokKind[] = []
 let gInUsed = 0
+// One-byte lexemes by byte value, in front of the short table; "" until first seen.
+let gOneVal: string[] = []
 // The long-identifier intern table (`lexIdText`): open addressing, a power-of-two size,
 // keyed by the lexeme's bytes, a slot empty while its value is "".
 let gIdHash: i32[] = []
 let gIdVal: string[] = []
+let gIdKind: TokKind[] = []
 let gIdUsed = 0
+// The `keywordKind` of the string `lexText` or `lexIdText` last returned. Each interned
+// slot keeps its spelling's kind, so a repeated spelling is classified once.
+let gTextKind: TokKind = "IDENT"
 
 // An interpolated literal is context-sensitive: the `}` that ends a hole is spelled like
 // the one that closes a block, and the `{` depth (`gBrace`) against the depth each open
@@ -411,6 +418,21 @@ export function keywordKind(text: string): TokKind {
   "IDENT"
 }
 
+// `oneCharKind` of a punctuation char that begins no `twoCharKind` or `threeCharKind`
+// entry, `.` included (only `...` extends it), or "" for any other char.
+function soloCharKind(c: i32): TokKind {
+  if c == '(' { return "LPAREN" }
+  if c == ')' { return "RPAREN" }
+  if c == ',' { return "COMMA" }
+  if c == '.' { return "DOT" }
+  if c == ':' { return "COLON" }
+  if c == '[' { return "LBRACK" }
+  if c == ']' { return "RBRACK" }
+  if c == ';' { return "SEMI" }
+  if c == '~' { return "TILDE" }
+  ""
+}
+
 // Single-char operator/punctuation kind for char code `c`, or "" if none. `;` lexes as
 // `SEMI`, an optional statement separator the block and top-level loops treat exactly like
 // a NEWLINE (so `a(); b()` works); a standalone `?` is not a token and falls through to
@@ -528,6 +550,11 @@ function mkTokText(
 // A longer lexeme is a fresh slice.
 function lexText(a: i32, b: i32): string {
   const n = b - a
+  gTextKind = "IDENT"
+  if n == 1 {
+    const one = gOneVal[gSrc[a]]
+    if one.length > 0 { return one }
+  }
   if n < 1 || n > 4 { return gSrc.slice(a, b) }
   let key = 0
   let i = a
@@ -539,30 +566,38 @@ function lexText(a: i32, b: i32): string {
   let h = hashMix(key) & mask
   if h < 0 || h >= gInKey.length { return gSrc.slice(a, b) }
   while gInVal[h].length > 0 {
-    if gInKey[h] == key && gInVal[h].length == n { return gInVal[h] }
+    if gInKey[h] == key && gInVal[h].length == n {
+      gTextKind = gInKind[h]
+      return gInVal[h]
+    }
     h = (h + 1) & mask
   }
   const s = gSrc.slice(a, b)
+  const kind = keywordKind(s)
   if (gInUsed + 1) * 2 > gInVal.length {
     lexShortGrow()
-    lexShortPlace(key, s)
+    lexShortPlace(key, s, kind)
   } else {
     gInKey[h] = key
     gInVal[h] = s
+    gInKind[h] = kind
     gInUsed = gInUsed + 1
   }
+  if n == 1 { gOneVal[gSrc[a]] = s }
   lexPinSource()
+  gTextKind = kind
   s
 }
 
 // Store the short lexeme `s`, packed as `key`, in the first empty slot of its run.
-function lexShortPlace(key: i32, s: string) {
+function lexShortPlace(key: i32, s: string, kind: TokKind) {
   const mask = gInVal.length - 1
   let h = hashMix(key) & mask
   if h < 0 || h >= gInKey.length { return 0 }
   while gInVal[h].length > 0 { h = (h + 1) & mask }
   gInKey[h] = key
   gInVal[h] = s
+  gInKind[h] = kind
   gInUsed = gInUsed + 1
   0
 }
@@ -570,12 +605,15 @@ function lexShortPlace(key: i32, s: string) {
 function lexShortSized(cap: i32) {
   const keys: i32[] = []
   const vals: string[] = []
+  const kinds: TokKind[] = []
   while keys.length < cap {
     keys.push(0)
     vals.push("")
+    kinds.push("IDENT")
   }
   gInKey = keys
   gInVal = vals
+  gInKind = kinds
   gInUsed = 0
 }
 
@@ -583,10 +621,11 @@ function lexShortSized(cap: i32) {
 function lexShortGrow() {
   const oldKey = gInKey
   const oldVal = gInVal
+  const oldKind = gInKind
   lexShortSized(oldVal.length * 2)
   let i = 0
   while i < oldVal.length {
-    if oldVal[i].length > 0 { lexShortPlace(oldKey[i], oldVal[i]) }
+    if oldVal[i].length > 0 { lexShortPlace(oldKey[i], oldVal[i], oldKind[i]) }
     i = i + 1
   }
   0
@@ -605,6 +644,9 @@ function lexInternReset(srcLen: i32) {
   if gInVal.length > 0 && gPinned + srcLen <= LEX_PIN_LIMIT { return 0 }
   lexShortSized(256)
   lexIdTableSized(64)
+  const ones: string[] = []
+  while ones.length < 256 { ones.push("") }
+  gOneVal = ones
   gPinned = 0
   0
 }
@@ -620,7 +662,7 @@ function lexPinSource() {
 // The identifier `gSrc[a, b)`, one string per spelling for the life of the tables, so
 // every later comparison of two occurrences short-circuits on identity instead of walking
 // bytes. A lexeme of four bytes or fewer goes through `lexText`'s table. `run` is the
-// lexeme's hash as `skipIdRun` returned it.
+// lexeme's hash as `skipIdRun` returned it. Sets `gTextKind` to the spelling's kind.
 function lexIdText(a: i32, b: i32, run: i32): string {
   const n = b - a
   if n <= 4 { return lexText(a, b) }
@@ -629,34 +671,39 @@ function lexIdText(a: i32, b: i32, run: i32): string {
   let s = h & mask
   while gIdVal[s].length > 0 {
     if gIdHash[s] == h && gIdVal[s].length == n && lexIdSame(gIdVal[s], a, n) {
+      gTextKind = gIdKind[s]
       return gIdVal[s]
     }
     s = (s + 1) & mask
   }
   const text = gSrc.slice(a, b)
+  const kind = keywordKind(text)
   if (gIdUsed + 1) * 2 > gIdVal.length { lexIdGrow() }
-  lexIdPlace(h, text)
+  lexIdPlace(h, text, kind)
   lexPinSource()
+  gTextKind = kind
   text
 }
 
 // Whether `t` holds the bytes `gSrc[a, a + n)`; the caller has checked `t.length == n`.
 function lexIdSame(t: string, a: i32, n: i32): boolean {
+  const src = gSrc
   let i = 0
   while i < n {
-    if t[i] != gSrc[a + i] { return false }
+    if t[i] != src[a + i] { return false }
     i = i + 1
   }
   true
 }
 
 // Store `text`, which hashes to `h`, in the first empty slot of its run.
-function lexIdPlace(h: i32, text: string) {
+function lexIdPlace(h: i32, text: string, kind: TokKind) {
   const mask = gIdVal.length - 1
   let s = h & mask
   while gIdVal[s].length > 0 { s = (s + 1) & mask }
   gIdHash[s] = h
   gIdVal[s] = text
+  gIdKind[s] = kind
   gIdUsed = gIdUsed + 1
   0
 }
@@ -664,12 +711,15 @@ function lexIdPlace(h: i32, text: string) {
 function lexIdTableSized(cap: i32) {
   const hs: i32[] = []
   const vals: string[] = []
+  const kinds: TokKind[] = []
   while hs.length < cap {
     hs.push(0)
     vals.push("")
+    kinds.push("IDENT")
   }
   gIdHash = hs
   gIdVal = vals
+  gIdKind = kinds
   gIdUsed = 0
 }
 
@@ -677,10 +727,11 @@ function lexIdTableSized(cap: i32) {
 function lexIdGrow() {
   const oldHash = gIdHash
   const oldVal = gIdVal
+  const oldKind = gIdKind
   lexIdTableSized(oldVal.length * 2)
   let i = 0
   while i < oldVal.length {
-    if oldVal[i].length > 0 { lexIdPlace(oldHash[i], oldVal[i]) }
+    if oldVal[i].length > 0 { lexIdPlace(oldHash[i], oldVal[i], oldKind[i]) }
     i = i + 1
   }
   0
@@ -1044,6 +1095,13 @@ function lexOperator(
   startLine: i32,
   startCol: i32,
 ) {
+  // A char that begins no multi-char operator is a token alone, as is a `.` with no `.` after it.
+  const solo = soloCharKind(c)
+  if solo != "" && (c != '.' || peek2() != '.') {
+    advance()
+    toks.push(mkTok(solo, startPos, startLine, startCol))
+    return 0
+  }
   // Three-char operator (`>>>`) — longest match first. The three no-match tests below
   // run for every token: a `TokKind` is an i32 atom, so `x != ""` is one `i32.ne` against
   // a constant. (`.length` is not spellable on a `TokKind` — the checker rejects a field
@@ -1105,7 +1163,7 @@ export function tokenize(source: string): LexResult {
     const startPos = gPos
     const startLine = gLine
     const startCol = gCol
-    const c = peek()
+    const c = gSrc[gPos]
 
     // Newline `\r?\n`. A lone `\r` before `\n` is consumed with it.
     if c == '\r' || c == '\n' {
@@ -1139,9 +1197,7 @@ export function tokenize(source: string): LexResult {
     if isIdStart(c) {
       const run = skipIdRun()
       const text = lexIdText(startPos, gPos, run)
-      toks.push(
-        mkTokText(keywordKind(text), text, startPos, startLine, startCol),
-      )
+      toks.push(mkTokText(gTextKind, text, startPos, startLine, startCol))
       continue
     }
 
