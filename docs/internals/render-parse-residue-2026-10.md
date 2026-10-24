@@ -119,7 +119,7 @@ the slice retires.
 
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
-| A1 | shape-row typed twins (landed: 0 retired, 14 left; re-probed at 2401febe6: callers with no type, typed rungs that differ, and the class C alias parameter) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
+| A1 | shape-row typed twins (landed: 0 retired, 14 left; re-probed at 2401febe6: callers with no type, typed rungs that differ, and the class C alias parameter; mv slots typed: 5 files still reach with no type, func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
@@ -136,7 +136,7 @@ the slice retires.
 | D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 6 retired, 1 to B and since deleted, 4 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
-| D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
+| D8 | mv, closure-sig and field-companion slots by type (landed: 5 retired, 13 left; every mv slot banks a type, the mint classifies by it, 0 retired) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
 Some slices have entries from more than one class. In those slices, the minority entries go to the
 slice that retires them in the same change. For example, A3's one C entry is a rung of the same
@@ -163,6 +163,13 @@ What each slice changes:
   hole and generic fn values stored in maps, and its lit-union rung differs in 1. Moving those
   rungs changes the rep, so it is not a refactor. The next step is the producers: the mv slot
   and the generic-application arguments need to bank a type.
+
+  The mv slot side is now done (D8's step 5): every mv slot banks a type, every slot reader is
+  typed, and the mint classifies by the slot's type when its caller has none. Still no parse
+  retired. `mvValKindOfNameTy` and `nulRefMapValInnerOfTy` are reached with no type in 4 files
+  through `mvValNamesCompat`'s shape-text query, and `mapValKindLowerable` in 1 under the D34 arm
+  mint. The function and literal-union rungs are listed in the ledger's `next` as the deliberate
+  rep change, with the rep each one moves.
 - **A2.** These `emit_mono` predicates test the type they hold instead of rendering it.
   - Done, byte-identical: `monoModuleLetTyIs` and `monoModuleDupPin` compare the site's type
     with `tySameSpelled`, and `monoPreBindPastUnionRest` asks the parameter's type whether it
@@ -1507,10 +1514,38 @@ What each slice changes:
        no `mvValTyIx`/`rlElemTyIx`.
     4. Thread `fty` through the 4 files where `nameFieldCode` passes -1. Its callers are in
        `emit_collect` and `emit_shape_intern`.
-    5. Find a type for `mvShapeOfValNameArmTyGo` in the 47 files where it mints with
-       `kindTy` -1. It has many callers, and the arm mint's D34 entries withhold the type.
+    5. Done (mv slot types): `mvShapeOfValNameArmTyGo` classifies a caller with no type by the
+       type the slot banks (`mvValTyIxOfNameRow` of the value name and row), so the kind and
+       the key agree. Its no-type reach was 2 files by then (14 reaches,
+       `generics/pin-nullable-set-and-literal-map-is.vl` and
+       `arrays/array-new-generic-pin-element-grid.vl`) and is 0 now. difftree --identity:
+       11,665 built, 0 differ, fixpoint identical.
 
-    After steps 2, 4 and 5 and the 8 finds, nothing calls `mvValKindOfNameTy` without a type.
+    Mv slot types, measured over the self-compile and 16,634 files: every mv slot banks a type
+    at its mint (10,486 mints in 2,329 files, 0 with `mvValTyIx` -1), and every slot read
+    through `mvSlotNullable` and `mvValTwinCanonId` is typed (32,322 reaches, 0 untyped). The
+    readers left with no type are queries, not slots:
+    - `mvValNamesCompat`'s value name cut from shape text by `shapeFieldElemName`, and the
+      `mvSlotOfMapValNameOrMonoKTys` find it feeds: 4 files, 19 reaches (the step 2 query;
+      the four files in "Left, by file" other than the two step 5 closed and the arm mint).
+    - `mapValKindLowerable` under the D34 arm mint: 1 file, 5 reaches.
+
+    So no parse retires yet. `nulMapInnerName` and the mv mint key in `mvShapeOfMapNameTys`
+    stay too: the first is a string utility with name-only callers, and the slot is still found
+    and minted under the spelling. The two typed rungs of `mvValKindOfNameTy` that disagree with
+    the spelling are the next deliberate change, each a rep change rather than a refactor:
+    - the function rung: in 31 files (2,465 reaches) a hole or generic fn value arrives spelled
+      with grouping parens (`((i32)=>i32)`), the arrow scan misses it and the call answers
+      unsupported, while `tyIsFuncArena` answers a closure fat-pointer vals list (kind 14).
+      Switching finds or mints a closure slot under the grouped spelling, a second slot unless
+      `mvCanonValNameTy` folds the parens first;
+    - the literal-union rung: in `maps/one-literal-map-value-delivery.vl` the spelling
+      `"circle"` says atom (the mono i32 map) where canon has softened the type to `string` (a
+      string vals list), and the other way in 6 reaches. Switching moves that map's vals
+      between the two reps, so the producer that softens the type moves first (D7446 says the
+      value is the atom).
+
+    After steps 2 and 4 and the arm mint, nothing calls `mvValKindOfNameTy` without a type.
     The three rungs, `mapValKindLowerable` and `mvValKindOfName` can then go. That retires the
     D2 entries at 450, 709 and 649 and the A1 entry at 469. Keying `mvValName` by type, and the
     mint key in `mvShapeOfMapNameTys`, come after that.
