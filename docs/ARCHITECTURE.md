@@ -106,10 +106,10 @@ Detail: `docs/internals/modules-design.md`, `docs/internals/parser-notes.md`.
 3. a re-check (`checkProgramAgain`: restore spellings, re-initialise, pass again) while any solver
    changed something, bounded by a fixed pass budget;
 4. the reports each solver owes, emitted once at the end: refusals from one queue
-   (`check_pin_refusals.vl`), hints from another the host reads (`check_pin_hints.vl`).
-
-The driver can run the checker once more after the main check: `jwSecondPass` generates source
-for deep `is` walkers, splices it into the arena, and re-checks.
+   (`check_pin_refusals.vl`), hints from another the host reads (`check_pin_hints.vl`);
+5. a last stage (`pinDeepIs`), once per check and only over an error-free program: it generates
+   source for deep `is` walkers, splices it into the arena, rewrites each site to call them, and
+   checks the program once more with its pins already written.
 
 **Quiet probes.** Some decisions are made by checking a subtree speculatively and discarding what
 the attempt recorded (argument fit, un-annotated parameter solving, the mono re-check). A probe
@@ -184,8 +184,8 @@ Three hosts run emitted modules:
 | host | where | imports it provides | `-O` |
 | --- | --- | --- | --- |
 | native | `scripts/vl-host/src/main.rs` (Rust, wasmtime) | print, `extern`, files, process, args and environment, errno | yes |
-| Deno test host | `tests/support/runWasm.ts` | `vlHostImports` | no |
-| playground | `playground/src/runtime.ts` | `vlHostImports` | no |
+| Deno test host | `tests/support/runWasm.ts` | `vlHostImports` | yes, `compiler/optHost.ts` (binaryen.js) |
+| playground | `playground/src/runtime.ts` | `vlHostImports` | yes, `compiler/optHost.ts` (binaryen.js) |
 
 **The import ABI.** An emitted module imports only what it uses. The shared part, in
 `compiler/vlHostImports.ts`, is the seven `__print_*__` sinks and `extern.nowMillis`. The native
@@ -204,7 +204,7 @@ the filesystem instead of running the guest. A failed compile stores nothing, an
 recompiles and exits 71 on a mismatch. Separately, the host caches the seed's compiled machine
 code beside it (`seed_cache_path`). Detail: `docs/internals/incremental-compilation-design.md`.
 
-The native host:
+Every host that runs `-O`:
 
 - **In:** the module bytes. **Out:** a validated, optionally optimised module, run under the host
   ABI.
@@ -215,8 +215,10 @@ The native host:
 - **Must not:** parse, type or transform VL. The host has no optimisation passes of its own; a
   `wasm-opt` request is binaryen over the bytes the compiler hands it.
 
-The two JavaScript hosts cannot run `-O`, so an `-O` build runs only natively
-([§7](#7-known-deviations)).
+The two JavaScript hosts answer the same requests through `compiler/optHost.ts`, a leaf
+adapter over binaryen.js (pinned to the native host's binaryen version), and their `-O` module
+is byte-identical to `vl build -O`'s (`tests/vl_opt_js_host_test.ts`). They do not serve
+`--source-map` under `-O` or the pass dumps.
 
 Detail: `docs/internals/opt-profile-design.md`, `docs/internals/binaryen-transition.md`,
 `docs/internals/native-modules-design.md`.
@@ -491,10 +493,8 @@ line in the PR that closes it. The order in which they are closed is
 | §3.1, §4.5 | Table reads whose index may be a sentinel and is not tested: **147** `sentinel-index-unguarded` findings over the compiler graph, held by `scripts/sentinel-budget-baseline.json`, a ratchet that may only fall. A finding is not a bug; a seeded sample graded most UNDECIDED. | `docs/internals/sentinel-index-lint.md` |
 | §4.5 | Ladders over a closed kind set with a bare default: **110** `kind-ladder-incomplete` and **2** `kind-ladder-split` findings over the compiler graph, held by `scripts/ladder-budget-baseline.json`. | `docs/internals/kind-ladder-lint.md` |
 | §4.3 | The seven quiet probes share one `checkRollback` and each site names its own family set; the census finds only `cstrProbeBefore`'s constraint rows left, which it keeps by design (D3062). Keyed maps beside the tables (`tpIfJoinAt`, `tpIfOkAt`, `dJoinRelayed`) are not rolled back. | [L4](internals/code-quality-2026-10.md#L4) |
-| §2.3 | The pin solvers run through one driver with a budget per phase (`compiler/check_pins.vl`). `jwSecondPass` (`driver.vl`) still runs the whole check again outside that driver, for the generated deep-`is` walkers. | [L5](internals/code-quality-2026-10.md#L5) |
 | §3.3, §4.1 | Emitter registries are keyed by spelling: 49 module-scope `{[string]: i32}` maps against 31 `{[i32]: i32}` in `emit_*.vl` and `wasmEmit.vl`, and an inline union's registry row, its key (`canonUnionKeyOfName`) and its box tags are its name (`registerInlineUnionAt`, `mintInlineUnion`). Type equality has eight exported notions (`tyEq`, `tyEqSameHoles`, `tyEqNoneIsMap`, `tySame`, `tySameSet`, `tySameSpelled`, `tySameAnonRow`, `repCanonId`). The union-key licence is gated by `tests/vl_union_key_licence_test.ts`. | [L6](internals/code-quality-2026-10.md#L6) |
 | §4.7 | Expected types reach the expression emitter through module globals (the `pending*` seeds in `emit_state.vl`, and `pendingLitUnion`). Every boundary builds an `ExpCtx` and restores the caller's on every exit, and the globals are written only by `expCtxApply` and `expCtxReset`, except `collectA`'s reset of `pendingNulRefHeap`. | [L7](internals/code-quality-2026-10.md#L7) |
-| §2.5, §6 | Every `-O` step (escape, inline-record, flattening, multi-value) runs in the compiler (`compiler/opt_pipe.vl`), and the native host answers its validate, print and `wasm-opt` requests. The Deno and playground hosts cannot run `-O`. | [L10](internals/code-quality-2026-10.md#L10) |
 | §6 | The host's exit codes are bare literals: `main.rs` has 19 `std::process::exit(<n>)` calls (18 of `2`, one of `1`), and names only `EXIT_COMPILER_BUG`, which `tests/cli_host_tables_test.ts` holds to `cli.vl`'s `CliExit`. | [S-i](internals/code-quality-2026-10.md#small-items) |
 | §4.6 | On a development build the seed resolves from the working directory and std from the executable's tree. | owner ruling pending (September row 19, [status](internals/code-quality-2026-10.md#september-status)) |
 | §2.4 | The emitter dispatches its pass table by string name through an if-ladder (`runEmitPass`). | [S-h](internals/code-quality-2026-10.md#small-items) |

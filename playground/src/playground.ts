@@ -14,14 +14,28 @@
 import type { VLDiagnostic } from "../../compiler/diagnostics.ts";
 import type { WasmChecker } from "../../lsp/src/wasmChecker.ts";
 import { sourceFrames } from "../../compiler/vlSrcSection.ts";
+import { optimizeModule, type SeedExports } from "../../compiler/optHost.ts";
 import { runWasmBytes } from "./runtime.ts";
-import { watFromBytes } from "./wat.ts";
+import { loadBinaryen, watFromBytes } from "./wat.ts";
 
 export type { VLDiagnostic };
 
 // The playground is single-file by default; multi-file Run threads a reader over
 // the project's in-memory file map. The entry module's key is its filename.
 const NO_SIBLINGS = () => undefined;
+
+/**
+ * What a Run asks for beyond the module itself. `optimize` builds it as `vl build -O --names`
+ * (`-O3` with `release`) does: the compiler's own `-O` chain on `freshSeed()`, a seed
+ * instance the step owns, with binaryen.js answering its requests (`compiler/optHost.ts`).
+ */
+export type RunOptions = {
+  wat?: boolean;
+  optimize?: {
+    release?: boolean;
+    freshSeed: () => SeedExports | Promise<SeedExports>;
+  };
+};
 
 export type PlaygroundResult = {
   diagnostics: VLDiagnostic[];
@@ -53,17 +67,19 @@ export type PlaygroundResult = {
 export const runProgram = async (
   source: string,
   checker: WasmChecker,
-  opts: { wat?: boolean } = {},
+  opts: RunOptions = {},
 ): Promise<PlaygroundResult> => {
   // Names ON only around the RUN-path compile, so a trap resolves to its source
   // line; restored immediately so an editor-keystroke `check`/`compile` on the
   // same seed stays lean and byte-standard.
   checker.setEmitNames(true);
+  checker.setOptimized(opts.optimize !== undefined);
   let compiled;
   try {
     compiled = await checker.compile(source, "main.vl", NO_SIBLINGS);
   } finally {
     checker.setEmitNames(false);
+    checker.setOptimized(false);
   }
   return finishRun(compiled.diagnostics, compiled.bytes, opts);
 };
@@ -81,15 +97,17 @@ export const runProject = async (
   files: Record<string, string>,
   entry: string,
   checker: WasmChecker,
-  opts: { wat?: boolean } = {},
+  opts: RunOptions = {},
 ): Promise<PlaygroundResult> => {
   // Names ON only around the RUN-path compile (see `runProgram`).
   checker.setEmitNames(true);
+  checker.setOptimized(opts.optimize !== undefined);
   let compiled;
   try {
     compiled = await checker.compile(files[entry] ?? "", entry, (key) => files[key]);
   } finally {
     checker.setEmitNames(false);
+    checker.setOptimized(false);
   }
   return finishRun(compiled.diagnostics, compiled.bytes, opts);
 };
@@ -97,12 +115,29 @@ export const runProject = async (
 // Shared tail: optionally emit WAT, then instantiate + capture `log` output.
 const finishRun = async (
   diagnostics: VLDiagnostic[],
-  wasm: Uint8Array | undefined,
-  opts: { wat?: boolean },
+  emitted: Uint8Array | undefined,
+  opts: RunOptions,
 ): Promise<PlaygroundResult> => {
   // No module means error diagnostics (or codegen failed) — nothing to run.
-  if (!wasm) {
+  if (!emitted) {
     return { diagnostics, logs: [], compiled: false };
+  }
+  let wasm = emitted;
+  if (opts.optimize) {
+    try {
+      wasm = optimizeModule(await opts.optimize.freshSeed(), await loadBinaryen(), emitted, {
+        release: opts.optimize.release,
+        names: true,
+      });
+    } catch (err) {
+      diagnostics.push({
+        message: `-O failed: ${err instanceof Error ? err.message : String(err)}`,
+        severity: "error",
+        source: "vital",
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+      });
+      return { diagnostics, logs: [], compiled: false };
+    }
   }
 
   const wasmBytes = wasm.length;

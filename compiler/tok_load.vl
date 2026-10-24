@@ -1,0 +1,102 @@
+// Loading source onto the shared token stream: the lex, the doc-comment table it feeds, and the
+// positions of the parse-stage diagnostics that have no token to anchor at. The driver loads
+// every module through it, and the checker's deep-`is` stage loads its generated walkers.
+import { P, dgAllLossless } from "./ast"
+import { docCmtLine, docCmtMod, docCmtText } from "./check_state"
+import { tokenize } from "./lexer"
+
+// Source positions (and owning module) for `P.diags` entries with no token anchor:
+// lex diagnostics and module-resolution diagnostics (emitted before any tokens load).
+// Keyed by the diagnostic's `P.diags` index, so tokenless and token-anchored entries
+// interleave freely; `diagLine`/`diagCol`/`diagEndCol`/`diagModule` consult it first.
+export let vcDgIdx: i32[] = []
+export let vcDgLine: i32[] = []
+export let vcDgCol: i32[] = []
+// The 0-based exclusive end column of the entry's span, on `vcDgLine`. Without it,
+// every lex and module-resolution diagnostic (which have no token anchor to derive a
+// width from) would render as a single-column caret regardless of how much source it
+// covers. Equal to `vcDgCol` for an entry with no span (the point rendering).
+export let vcDgEnd: i32[] = []
+export let vcDgMod: i32[] = []
+// The module whose source `vcLoadToks` is currently loading — a lex diag's
+// owner. The modCompile parse loop sets it per module; 0 elsewhere.
+export let vcLoadMod = 0
+
+// The side-table slot for `P.diags` index `i`, or -1 (a token-anchored diag).
+export function vcDgFind(i: i32): i32 {
+  let k = 0
+  while k < vcDgIdx.length {
+    if vcDgIdx[k] == i { return k }
+    k = k + 1
+  }
+  -1
+}
+
+// ── the stage-1 lossless-recovery gate ─────────────────────────────────────────
+// Whether the pipeline must stop at the parse stage: any parse diagnostic that is
+// not a lossless recovery's, since a lossless-recovered AST is exactly what the
+// user wrote — one lossy recovery anywhere in the file restores the bail.
+export function vcParseBlocked(): boolean {
+  P.diags.length > 0 && !dgAllLossless()
+}
+// Record one tokenless diagnostic's position, owner and span, keyed on the
+// `P.diags` index it is about to occupy. The caller pushes the `P.diags` entry.
+export function vcDgPush(idx: i32, line: i32, col: i32, endCol: i32, mod: i32) {
+  vcDgIdx.push(idx)
+  vcDgLine.push(line)
+  vcDgCol.push(col)
+  vcDgEnd.push(endCol)
+  vcDgMod.push(mod)
+  0
+}
+
+// Lexes `src` onto the end of `P.toks`; the stream's new length.
+export function vcLoadToks(src: string): i32 {
+  const r = tokenize(src)
+  // The doc table is derived from this same lex and is cleared with the stream it
+  // describes: an empty `P.toks` is the first load of a compile, and module mode then
+  // accumulates one module per call the way the token stream itself does.
+  if P.toks.length == 0 {
+    docCmtLine = []
+    docCmtText = []
+    docCmtMod = []
+  }
+  const toks = r.tokens
+  const dst = P.toks
+  const n = toks.length
+  let i = 0
+  while i < n {
+    dst.push(toks[i])
+    i = i + 1
+  }
+  // Folds the lexer's diagnostics into the parse-stage store so a lex error (an empty
+  // or multi-char char literal) is rejected at the parse stage, mirroring the host's
+  // `checkOnly`. A lex diag has no token to anchor at; its real source position (and
+  // owning module) rides in the index-keyed `vcDg*` side table instead.
+  let d = 0
+  while d < r.diags.length {
+    vcDgPush(
+      P.diags.length,
+      r.diags[d].line,
+      r.diags[d].col,
+      r.diags[d].endCol,
+      vcLoadMod,
+    )
+    P.diags.push({ msg: r.diags[d].msg, at: -1 })
+    d = d + 1
+  }
+  // A `///` on a line of its own documents whatever follows it (`symDocAt`); a trailing
+  // one comments the code beside it and is dropped, so `const x = 1 /// n` documents
+  // nothing.
+  let cm = 0
+  while cm < r.comments.length {
+    const c = r.comments[cm]
+    if c.doc && !c.trailing {
+      docCmtLine.push(c.line)
+      docCmtText.push(c.text)
+      docCmtMod.push(vcLoadMod)
+    }
+    cm = cm + 1
+  }
+  P.toks.length
+}

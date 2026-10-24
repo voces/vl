@@ -75,7 +75,7 @@ const grade = async (dir: string, cases: Case[]) => {
 };
 
 // Names live in the SHARED table. `__str_eq__` is the leaf under four parents, one of them the
-// root (prefix null); `checkProgram$m3@…` and `jwSecondPass$m` exercise the specialisation
+// root (prefix null); `checkProgram$m3@…` and `pinDeepIs$m` exercise the specialisation
 // suffix; node 7 is checkProgram under emitProgram, so the ROOT-MOST phase must win; two
 // samples have no stack; 16 check-side samples make modVisit's one sample a 6.25% tie.
 const PROFILE = {
@@ -89,7 +89,7 @@ const PROFILE = {
       "emitProgram",
       "lookup$m2",
       "other",
-      "jwSecondPass$m",
+      "pinDeepIs$m",
     ],
   },
   threads: [{
@@ -160,7 +160,7 @@ Deno.test({
             "  10.00  modVisit",
             "  10.00  emitProgram",
             "  10.00  other",
-            "  10.00  jwSecondPass$m",
+            "  10.00  pinDeepIs$m",
           ),
         },
         {
