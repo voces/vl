@@ -131,7 +131,7 @@ the slice retires.
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
-| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed; 2 retired, 21 wait on site B's spelling pins) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
+| D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`; 2 retired, 21 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 13 retired, 8 left) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 2 retired, 10 left) | 10 | 0 / 0 / 10 | 3 / 7 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
@@ -589,9 +589,23 @@ What each slice changes:
   `monoPinTyParamComposite` (145 events, 17 files). Choice bindings that key by a cell name
   account for 100 events in 4 files. The other 68 are scattered across ten small paths,
   among them `monoSlotSigName` (21 events, 14 files) and wide `monoTysFnName` pins (4 events,
-  1 file). They move when site B carries a `tvT` beside each spelling. The other 8 walker
-  entries are blocked on the same spellings. Retired at site A: 4 (`monoBindFromAnn`, C1).
-  Retired: 1 (`monoArgBindSpelling`, D3).
+  1 file). The other 8 walker entries are blocked on the same spellings. Retired at site A: 4
+  (`monoBindFromAnn`, C1). Retired: 1 (`monoArgBindSpelling`, D3).
+
+  **Site B carries types (C1 step 3).** Each `tvN`/`tvV` binding now has its arena type in
+  `tvT`, index-aligned through `monoTvTyLast`. The written-let and composite coercions deliver
+  the slot's parameter types under those typed bindings. A probe over the self-compile and
+  16,896 fixture and corpus files counted the fallback events: **583 before, 381 after**, in
+  90 and 71 files. The written-let prefix fell from 28 to 0 and the composite coercion from
+  174 to 0. The tallies differ from the 130/145 above because this probe tags by the call that
+  was on the stack. Of the 2,281 pins answered by a delivered type, all 2,281 agree with
+  `nameToTy` of their spelling. The `T[]` arm of `monoPinAnnotatedParam` decides by the closed
+  argument type wherever one exists, and agrees with `nameIsArray` in all 1,218 of those
+  decisions. The other 145 have an open type (`_`, for example
+  `generics/loop-var-forwarded-through-generic.vl`) and keep the spelling. Three producers still
+  push a spelling with no type: `monoBindFromLaterArg`, a softened literal type argument, and a
+  `T[]` argument whose type is open. So neither `nameIsArray` entry retires, and the
+  render-parse count is unchanged.
 - **C2.** Attempted and not converted. A probe found `expTy` at `-1` on hundreds of fixture
   sites whose cell spelling is a function type. Every producer of that spelling is text
   (`monoSlotSig`, `monoSubstAnn`, `monoSlotPinName`, `monoSeedCallSigTys`), so the change cannot

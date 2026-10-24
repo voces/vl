@@ -7858,6 +7858,7 @@ function monoBindExplicitTyArgs(
   params: i32[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ): string {
   monoExplicitBN = []
   monoExplicitBT = []
@@ -7883,6 +7884,8 @@ function monoBindExplicitTyArgs(
       }
       tvN.push(typarams[i])
       tvV.push(nm)
+      // A literal argument's binding is its softened spelling, which the type does not say.
+      if lit == "" && at >= 0 && !tyHasTyVar(at) { monoTvTyLast(tvN, tvT, at) }
       const one: string[] = [typarams[i]]
       if !monoParamsMention(params, one) {
         extra = extra + typarams[i] + "=" + nm + ";"
@@ -7908,6 +7911,7 @@ function monoDefaultUnboundTyParams(
   params: i32[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   body: i32,
 ) {
   for tp in typarams {
@@ -7918,7 +7922,7 @@ function monoDefaultUnboundTyParams(
       && !monoParamsMention(params, one)
       && !monoTyParamReachesSpelling(body, one, seen)
     ) {
-      monoBindTyParamDefault(tp, tvN, tvV)
+      monoBindTyParamDefault(tp, tvN, tvV, tvT)
     }
   }
   0
@@ -8139,6 +8143,7 @@ function monoDefaultAnnTyParams(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   body: i32,
   params: i32[],
   at: i32,
@@ -8162,10 +8167,11 @@ function monoDefaultAnnTyParams(
       const bt = callBindTyOf(callIx, tp)
       const sp = if bt >= 0 && bt < T.tys.length && !tyHasTyVar(bt) { monoPinAnnSpelling(bt) } else { "" }
       if sp == "" {
-        monoBindTyParamDefault(tp, tvN, tvV)
+        monoBindTyParamDefault(tp, tvN, tvV, tvT)
       } else {
         tvN.push(tp)
         tvV.push(sp)
+        monoTvTyLast(tvN, tvT, bt)
         if !strListHas(monoExplicitBN, tp) {
           monoExplicitBN.push(tp)
           monoExplicitBT.push(bt)
@@ -8184,10 +8190,16 @@ function monoAnnIsUnion(annIx: i32): boolean {
   (ty is TyUnion && ty.uMembers.length > 1) || ty is TyNullable
 }
 
-function monoBindTyParamDefault(tp: string, tvN: string[], tvV: string[]) {
+function monoBindTyParamDefault(
+  tp: string,
+  tvN: string[],
+  tvV: string[],
+  tvT: i32[],
+) {
   const dt = primTyOfName(MONO_UNBOUND_TY_PARAM_DEFAULT)
   tvN.push(tp)
   tvV.push(MONO_UNBOUND_TY_PARAM_DEFAULT)
+  monoTvTyLast(tvN, tvT, dt)
   if dt >= 0 && !strListHas(monoExplicitBN, tp) {
     monoExplicitBN.push(tp)
     monoExplicitBT.push(dt)
@@ -12567,7 +12579,7 @@ function monoInstanceFor(
     }
     // A type parameter the boundary binds nothing defaults as at an inferred call, so the
     // binding's instance is the direct call's.
-    monoDefaultUnboundTyParams(fn.fnTyParams, params, tvN, tvV, fn.fnBody)
+    monoDefaultUnboundTyParams(fn.fnTyParams, params, tvN, tvV, tvT, fn.fnBody)
     const pinned: string[] = []
     for pn in pinnedNames {
       // An inline record pin is the instance's parameter type, so it takes the spelling the
@@ -13415,7 +13427,7 @@ function monoCoerceAliasOfCell(
 
 // For a name read at `at` in frame `ctx` that a chain of un-annotated aliases never written
 // after their initializer ends at a reassigned `let`: coerces that `let`'s values at `tname` as
-// `monoCoerceWrittenLetValues` does, and answers true when it finds one.
+// `monoCoerceWrittenLetTys` does, and answers true when it finds one.
 function monoCoerceAliasOfWrittenLet(
   at: i32,
   ctx: i32,
@@ -19201,15 +19213,9 @@ function monoAliasCellRead(at: i32, ctx: i32): i32[] {
 }
 
 // For an un-annotated `let` read at `at` that an `=` writes: takes `tname` against the join of
-// the pins the binding's value flows to (`monoLetPinTake`), then instances each named generic
-// function its initializer or a live write names at that type, and answers true; false for any
-// other read, which keeps its value (D3930).
-function monoCoerceWrittenLetValues(at: i32, ctx: i32, tname: string): boolean {
-  const none: i32[] = []
-  monoCoerceWrittenLetTys(at, ctx, tname, none)
-}
-
-// `monoCoerceWrittenLetValues` at the slot pin's parameter types `delTys`, where held.
+// the pins its value flows to (`monoLetPinTake`), then instances each named generic function its
+// initializer or a live write names at that type (at `delTys`, the slot's parameter types, when
+// not empty), and answers true; false for any other read, which keeps its value (D3930).
 function monoCoerceWrittenLetTys(
   at: i32,
   ctx: i32,
@@ -21201,6 +21207,7 @@ function monoPreBindPastUnionRest(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   decl: i32[],
 ) {
   monoUnionRestPin = []
@@ -21274,7 +21281,7 @@ function monoPreBindPastUnionRest(
           const pp = nodeAt(params[j])
           if pp is Param { pt = nodeTyIxOf(pp.parType) }
         }
-        monoBindArenaFull(pt, ats[j], typarams, tvN, tvV)
+        monoBindArenaFullTys(pt, ats[j], typarams, tvN, tvV, tvT)
       }
     }
     j = j + 1
@@ -23048,6 +23055,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       // wins, later uses take the binding); a concrete annotation is kept.
       const tvN: string[] = []
       const tvV: string[] = []
+      // The arena type of each binding where its producer holds one, index-aligned with `tvN`
+      // (`monoTvTyLast`); a binding pushed by spelling alone has -1 or no entry.
+      const tvT: i32[] = []
       // A call's explicit type arguments bind first, so every later binding reads them.
       monoKeyExtra = monoBindExplicitTyArgs(
         callIx,
@@ -23055,6 +23065,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         fn.fnParams,
         tvN,
         tvV,
+        tvT,
       )
       const pinned: string[] = []
       // The arena type each pinned param denotes, parallel to `pinned`. Sourced from the
@@ -23069,7 +23080,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
       // the two orders agree, so they differ only when one answer is a type variable.
       const declTys = monoDeclParamTys(origFe, params.length)
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
-        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV, declTys)
+        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV, tvT, declTys)
       }
       monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
@@ -23080,9 +23091,10 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         ctx,
         tvN,
         tvV,
+        tvT,
         declTys,
       )
-      monoDefaultTyParamsOnlyGenFns(fn, params, args, ctx, tvN, tvV)
+      monoDefaultTyParamsOnlyGenFns(fn, params, args, ctx, tvN, tvV, tvT)
       let oDecl = -1
       if origFe >= 0 && origFe < monoOrigNode.length {
         oDecl = monoOrigNode[origFe]
@@ -23116,6 +23128,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
               ctx,
               tvN,
               tvV,
+              tvT,
               pinned,
               pinTys,
               oDecl,
@@ -23139,6 +23152,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         fn.fnParams,
         tvN,
         tvV,
+        tvT,
         fn.fnBody,
       )
       if monoLetTyParamMisfit(fn, params, tvN, tvV, pinTys) < 0 { return -1 }
@@ -23179,6 +23193,7 @@ function monoPreBindNonArrowArgs(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   declTys: i32[],
 ) {
   let pb = 0
@@ -23199,12 +23214,13 @@ function monoPreBindNonArrowArgs(
           && !monoLitHoldsGenericFn(args[pb], 0)
         ) {
           if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
-            monoBindArenaFull(
+            monoBindArenaFullTys(
               monoParamPatTy(params, pb, declTys),
               monoExactPinTyOf(monoArgPinTyIx(args[pb], ctx), ctx),
               fn.fnTyParams,
               tvN,
               tvV,
+              tvT,
             )
           }
         }
@@ -23224,6 +23240,7 @@ function monoDefaultTyParamsOnlyGenFns(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   for tp in fn.fnTyParams {
     const one: string[] = [tp]
@@ -23257,7 +23274,7 @@ function monoDefaultTyParamsOnlyGenFns(
         && !monoRetMentions(fn, one)
         && !monoTyParamReachesSpelling(fn.fnBody, one, seen)
       ) {
-        monoBindTyParamDefault(tp, tvN, tvV)
+        monoBindTyParamDefault(tp, tvN, tvV, tvT)
       }
     }
   }
@@ -23463,6 +23480,7 @@ function monoPinAnnotatedParam(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   pinned: string[],
   pinTys: i32[],
   decl: i32,
@@ -23488,6 +23506,7 @@ function monoPinAnnotatedParam(
         ctx,
         tvN,
         tvV,
+        tvT,
         pinned,
         pinTys,
         decl,
@@ -23555,12 +23574,14 @@ function monoPinAnnotatedParam(
     // A parameter handed on keeps its own pin as a generic does (D6202).
     if ann == tp && monoReadsParam(args[i]) { genPin = true }
     let bind = an2
+    let bindTy = if an2Ty >= 0 && !tyHasTyVar(an2Ty) { an2Ty } else { -1 }
     if ann != tp {
-      // `T[]` param: the argument must be an array, and its element binds
-      // `T`. The binding is the UNGROUPED element, because a bare `T` param pins it
-      // verbatim and `(S|null)` is a spelling nothing interns; every `[]` put back on
-      // it goes through `arrElemSuffixed` (D1896).
-      if !nameIsArray(an2) {
+      // `T[]` param: the argument must be an array (by its closed type, by its spelling where
+      // the type is open), and its element binds `T`. The binding is the UNGROUPED element: a
+      // bare `T` param pins it verbatim and `(S|null)` is a spelling nothing interns; every `[]`
+      // put back on it goes through `arrElemSuffixed` (D1896).
+      const isArr = if bindTy >= 0 { tyAt(bindTy) is TyArray } else { nameIsArray(an2) }
+      if !isArr {
         return emitFail(
           "emitProgram: monomorphize: expected an array argument for `"
             + p.parName
@@ -23570,11 +23591,13 @@ function monoPinAnnotatedParam(
         )
       }
       bind = listElemNameOf(an2)
+      bindTy = tyArrayElemIx(bindTy)
     }
     const b = monoBindOf(tvN, tvV, tp)
     if b == "" {
       tvN.push(tp)
       tvV.push(bind)
+      monoTvTyLast(tvN, tvT, bindTy)
     } else if genPin && b != an2 && monoPinIsFnTy(an2Ty) {
       // A generic handed to a second `T` parameter called at another type keeps its own pin
       // when `T` is read nowhere else, and is refused when it is (D6090).
@@ -23613,6 +23636,7 @@ function monoBindArrowRet(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   let at = nodeTyIxOf(annIx)
   const nf = tyNulFuncInner(at)
@@ -23622,12 +23646,12 @@ function monoBindArrowRet(
   if !(af is TyFunc) || af.fnRet < 0 { return 0 }
   const hN: string[] = []
   const hT: i32[] = []
-  monoBoundTys(tvN, tvV, hN, hT)
+  monoBoundTys(tvN, tvV, tvT, hN, hT)
   const qs = monoArrowParamTysAt(af, hN, hT)
   if qs.length > 0 && qs[0] < 0 { return 0 }
   const r = monoValueRetAt(argIx, qs, 0)
   if r < 0 { return 0 }
-  monoBindArenaWalk(substTyDeep(af.fnRet, hN, hT), r, typarams, tvN, tvV)
+  monoBindArenaWalk(substTyDeep(af.fnRet, hN, hT), r, typarams, tvN, tvV, tvT)
 }
 
 // Binds each of `typarams` still unbound in `tvN`/`tvV` that pattern type `pt` names to what
@@ -23638,12 +23662,13 @@ function monoBindArenaWalk(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
   const rN: string[] = []
   const rT: i32[] = []
   bindGenWalk(pt, at, rN, rT)
-  monoPushPins(rN, rT, typarams, tvN, tvV)
+  monoPushPins(rN, rT, typarams, tvN, tvV, tvT)
 }
 
 // The pin spelling of `t` a typed binding takes: a declared record or union by its name, as the
@@ -23684,6 +23709,7 @@ function monoBindListLitElems(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   const a = unwrapParen(ax)
   if pt < 0 || pt >= T.tys.length || a < 0 || !(tyAt(pt) is TyArray) {
@@ -23698,7 +23724,7 @@ function monoBindListLitElems(
     if el >= 0 && !(nodeAt(el) is Spread) {
       const et = nodeTyIxOf(unwrapParen(el))
       if et >= 0 && !tyHasTyVar(et) {
-        monoBindArenaFull(pe, et, typarams, tvN, tvV)
+        monoBindArenaFullTys(pe, et, typarams, tvN, tvV, tvT)
       }
     }
     k = k + 1
@@ -23708,20 +23734,8 @@ function monoBindListLitElems(
 
 // `monoBindArenaWalk` through unions and generic-application arguments as well
 // (`bindGenWalkFull`): the binding of declared parameter type `pt` at argument type `at`, each
-// pin spelled by `monoPinNominalSpelling`. A parameter bound to `never` takes `void`, as a
-// `never` function value lowers. 0.
-function monoBindArenaFull(
-  pt: i32,
-  at: i32,
-  typarams: string[],
-  tvN: string[],
-  tvV: string[],
-) {
-  const tvT: i32[] = []
-  monoBindArenaFullTys(pt, at, typarams, tvN, tvV, tvT)
-}
-
-// `monoBindArenaFull`, pushing each new binding's type onto `tvT` beside its spelling.
+// pin spelled by `monoPinNominalSpelling` with its type beside it in `tvT`. A parameter bound to
+// `never` takes `void`, as a `never` function value lowers. 0.
 function monoBindArenaFullTys(
   pt: i32,
   at: i32,
@@ -23744,7 +23758,7 @@ function monoBindArenaFullTys(
         if sp != "" {
           tvN.push(rN[k])
           tvV.push(sp)
-          tvT.push(rT[k])
+          monoTvTyLast(tvN, tvT, rT[k])
         }
       }
     }
@@ -23761,12 +23775,13 @@ function monoBindInnerArmPins(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
   const rN: string[] = []
   const rT: i32[] = []
   monoBindInnerUnionArms(pt, at, rN, rT, 0)
-  monoPushPins(rN, rT, typarams, tvN, tvV)
+  monoPushPins(rN, rT, typarams, tvN, tvV, tvT)
 }
 
 // Pushes each binding of `rN`/`rT` that names one of `typarams` still unbound in `tvN`/`tvV`
@@ -23777,6 +23792,7 @@ function monoPushPins(
   typarams: string[],
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ) {
   let k = 0
   while k < rN.length {
@@ -23785,6 +23801,7 @@ function monoPushPins(
       if sp != "" && !tyHasTyVar(rT[k]) {
         tvN.push(rN[k])
         tvV.push(sp)
+        monoTvTyLast(tvN, tvT, rT[k])
       }
     }
     k = k + 1
@@ -23792,16 +23809,20 @@ function monoPushPins(
   0
 }
 
-// Appends each binding of `tvN`/`tvV` whose spelling names a type to `hN`/`hT`.
+// Appends each binding of `tvN` to `hN`/`hT` at its type in `tvT`; a binding pushed by spelling
+// alone (`monoBindFromLaterArg`, a softened literal type argument, a `T[]` argument whose type is
+// open) at the type its spelling names, and not at all when it names none.
 function monoBoundTys(
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   hN: string[],
   hT: i32[],
 ): i32 {
   let k = 0
   while k < tvN.length && k < tvV.length {
-    const bt = nameToTy(tvV[k])
+    let bt = if k < tvT.length { tvT[k] } else { -1 }
+    if bt < 0 { bt = nameToTy(tvV[k]) }
     if bt >= 0 {
       hN.push(tvN[k])
       hT.push(bt)
@@ -23809,6 +23830,54 @@ function monoBoundTys(
     k = k + 1
   }
   0
+}
+
+// Records `t` as the arena type of the binding just pushed onto `tvN`, padding `tvT` with -1 for
+// the bindings before it pushed by spelling alone, so `tvT` stays index-aligned with `tvN`. 0.
+function monoTvTyLast(tvN: string[], tvT: i32[], t: i32) {
+  while tvT.length < tvN.length - 1 { tvT.push(0 - 1) }
+  if tvT.length == tvN.length - 1 { tvT.push(t) }
+  0
+}
+
+// Appends to `hN`/`hT` each type parameter whose first binding in `tvN` carries a closed type in
+// `tvT`. One first bound by spelling alone is left out, never read off its spelling. 0.
+function monoTypedBinds(tvN: string[], tvT: i32[], hN: string[], hT: i32[]) {
+  const seen: string[] = []
+  let k = 0
+  while k < tvN.length {
+    if !strListHas(seen, tvN[k]) {
+      seen.push(tvN[k])
+      const t = if k < tvT.length { tvT[k] } else { -1 }
+      if t >= 0 && t < T.tys.length && !tyHasTyVar(t) {
+        hN.push(tvN[k])
+        hT.push(t)
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// The parameter types of the function slot declared `patTy` in the generic `own` names, a
+// nullable slot by its function, under the typed bindings of `tvN`/`tvT`; empty when one stays
+// open, so the delivery's spelling answers.
+function monoSlotParamTysAt(
+  patTy: i32,
+  own: string,
+  tvN: string[],
+  tvT: i32[],
+): i32[] {
+  const none: i32[] = []
+  if patTy < 0 || patTy >= T.tys.length { return none }
+  const hN: string[] = []
+  const hT: i32[] = []
+  monoTypedBinds(tvN, tvT, hN, hT)
+  let s = substTyDeepOf(patTy, hN, hT, own)
+  if s < 0 || s >= T.tys.length || tyHasTyVar(s) { return none }
+  const nf = tyNulFuncInner(s)
+  if nf >= 0 { s = nf }
+  monoFnTyParamTys(s)
 }
 
 // The parameter types of arrow `af` under `hN`/`hT`; [-1] when one stays open.
@@ -23829,6 +23898,7 @@ function monoWrittenLetRetsDisagree(
   at: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
 ): boolean {
   const ds = holeFnArgDecls(at)
   if ds.length < 2 { return false }
@@ -23838,7 +23908,7 @@ function monoWrittenLetRetsDisagree(
   if !(af is TyFunc) { return false }
   const hN: string[] = []
   const hT: i32[] = []
-  monoBoundTys(tvN, tvV, hN, hT)
+  monoBoundTys(tvN, tvV, tvT, hN, hT)
   const qs = monoArrowParamTysAt(af, hN, hT)
   if qs.length > 0 && qs[0] < 0 { return false }
   let r0 = -1
@@ -23890,10 +23960,13 @@ function monoHandWrittenLet(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
+  patTy: i32,
+  own: string,
 ): i32 {
   const at = unwrapParen(arg)
   const lf = monoWrittenGenLetFrame(at, ctx)
-  if monoWrittenLetRetsDisagree(p.parType, at, tvN, tvV) {
+  if monoWrittenLetRetsDisagree(p.parType, at, tvN, tvV, tvT) {
     return emitFailAt(
       "emitProgram: the reassigned function binding handed here holds functions that give "
         + "different result types at this parameter's type — one binding holds one closure "
@@ -23902,7 +23975,7 @@ function monoHandWrittenLet(
     )
   }
   if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
-    monoBindArrowRet(p.parType, at, fn.fnTyParams, tvN, tvV)
+    monoBindArrowRet(p.parType, at, fn.fnTyParams, tvN, tvV, tvT)
   }
   const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
   if pre == "" { return 0 }
@@ -23916,7 +23989,12 @@ function monoHandWrittenLet(
   }
   // arena-tick exempt: the pin each binding is first handed at, read only by the refusal above.
   monoWrittenLetHanded[key] = pre
-  monoCoerceWrittenLetValues(at, ctx, pre)
+  monoCoerceWrittenLetTys(
+    at,
+    ctx,
+    pre,
+    monoSlotParamTysAt(patTy, own, tvN, tvT),
+  )
   1
 }
 
@@ -23932,10 +24010,17 @@ function monoPinTyParamComposite(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  tvT: i32[],
   pinned: string[],
   pinTys: i32[],
   decl: i32,
 ): i32 {
+  const patTy = monoParamPatTy(
+    params,
+    i,
+    monoDeclParamTysOf(decl, params.length),
+  )
+  const own = topFnOwnerOf(decl)
   // A function-type param (`f: (A, T) => A`) binds from the closure
   // argument's function-type name; any other composite (`Box<T>`, `{a:T}`)
   // from its concrete value-type name.
@@ -23962,12 +24047,23 @@ function monoPinTyParamComposite(
         || monoArgCallsBackGeneric(args[i]))
     ) {
       if monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) == "" {
-        monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV)
+        monoBindArrowRet(p.parType, args[i], fn.fnTyParams, tvN, tvV, tvT)
       }
       const pre = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV)
       if pre != "" { anC = pre }
     } else if wl[0] >= 0 {
-      const hr = monoHandWrittenLet(p, fn, ann, wl[0], wl[1], tvN, tvV)
+      const hr = monoHandWrittenLet(
+        p,
+        fn,
+        ann,
+        wl[0],
+        wl[1],
+        tvN,
+        tvV,
+        tvT,
+        patTy,
+        own,
+      )
       if hr < 0 { return hr }
       if hr > 0 { anC = monoSubstAnn(ann, fn.fnTyParams, tvN, tvV) }
     }
@@ -24000,22 +24096,25 @@ function monoPinTyParamComposite(
     if anC != "" && rowTy[0] >= 0 { atTy = rowTy[0] }
   }
   if anC == "" { return monoArgTyFail(p.parName, fn.fnName) }
-  const patTy = monoParamPatTy(
-    params,
-    i,
-    monoDeclParamTysOf(decl, params.length),
-  )
   monoBindInnerArmPins(
     nodeTyIxOf(p.parType),
     monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx),
     fn.fnTyParams,
     tvN,
     tvV,
+    tvT,
   )
-  monoBindArenaFull(patTy, atTy, fn.fnTyParams, tvN, tvV)
+  monoBindArenaFullTys(patTy, atTy, fn.fnTyParams, tvN, tvV, tvT)
   if tyHasTyVar(atTy) {
-    monoBindArenaFull(patTy, monoLetAnnTyOf(args[i]), fn.fnTyParams, tvN, tvV)
-    monoBindListLitElems(patTy, args[i], fn.fnTyParams, tvN, tvV)
+    monoBindArenaFullTys(
+      patTy,
+      monoLetAnnTyOf(args[i]),
+      fn.fnTyParams,
+      tvN,
+      tvV,
+      tvT,
+    )
+    monoBindListLitElems(patTy, args[i], fn.fnTyParams, tvN, tvV, tvT)
   }
   if monoAnnIsUnion(p.parType) {
     monoDefaultAnnTyParams(
@@ -24023,6 +24122,7 @@ function monoPinTyParamComposite(
       fn.fnTyParams,
       tvN,
       tvV,
+      tvT,
       fn.fnBody,
       params,
       i,
@@ -24042,7 +24142,8 @@ function monoPinTyParamComposite(
   // would be the type variables themselves. `pinC` is the substituted
   // spelling, the concrete function type that parameter takes.
   if annFnSlot || nameIsClosureArray(pinC) {
-    if monoCoerceFnValueName(args[i], pinC, ctx, -1) < 0 { return -1 }
+    const delTys = monoSlotParamTysAt(patTy, own, tvN, tvT)
+    if monoCoerceFnValueTys(args[i], pinC, ctx, -1, delTys) < 0 { return -1 }
   }
   pinned.push(pinC)
   // A generic function value's own type still rides its type variables, so
