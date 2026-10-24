@@ -2547,17 +2547,32 @@ function chainBroken(
 ) {
   const pad = indentStr(indent + 1)
   const linkCol = (indent + 1) * 2
-  const parts: string[] = []
+  const out: string[] = []
   let piece = primary(headIx, indent, column)
   let pieceIndent = indent
   let pieceCol = column
+  let first = true
   let i = kinds.length - 1
   while i >= 0 {
     const k = kinds[i]
     // Only a step at or past `linkStart` opens a line; a `.field` before it is
     // still the head, so it lands on the head line where the count put it.
     if (k == 0 || k == 1) && i <= linkStart {
-      parts.push(piece)
+      let prevIx = headIx
+      if i + 1 < nodes.length { prevIx = nodes[i + 1] }
+      const prevEnd = nodeEndOf(prevIx)
+      const propAt = chainPropStart(nodes[i])
+      // A comment between the two links stays between them: a trailing one ends the line
+      // above, an own-line one gets a line of its own before the link (D11800).
+      let above = ""
+      if commentInCharSpan(prevEnd, propAt) {
+        piece = piece + trailerSuffix(stopLineOf(prevIx))
+        above = takeLeadingComments(indent + 1, lineOf(propAt))
+      }
+      if first { out.push(piece) } else { out.push(pad + piece) }
+      first = false
+      pushLines(out, above)
+      while out.length > 0 && out[out.length - 1].length == 0 { out.pop() }
       piece = ""
       pieceIndent = indent + 1
       pieceCol = linkCol
@@ -2565,15 +2580,45 @@ function chainBroken(
     piece = chainStep(piece, k, nodes[i], pieceIndent, pieceCol)
     i = i - 1
   }
-  parts.push(piece)
-  const out: string[] = []
-  out.push(parts[0])
-  let j = 1
-  while j < parts.length {
-    out.push(pad + parts[j])
-    j = j + 1
-  }
+  if first { out.push(piece) } else { out.push(pad + piece) }
   joinLines(out)
+}
+
+// The source offset of a `.p` / `?.p` step's property name, or -1 for any other step.
+function chainPropStart(ix: i32) {
+  if ix < 0 || ix >= P.nodes.length { return -1 }
+  const e = nodeEndOf(ix)
+  if e < 0 { return -1 }
+  const n = nodeAt(ix)
+  match n {
+    Member => {
+      return e - n.memProp.length
+    }
+    OptMember => {
+      return e - n.omProp.length
+    }
+    // Every other step carries no property name.
+    NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | Call | Index | Unary | BinExpr | Paren | ErrExpr | LetDecl | Param | TypeRef | FuncDecl | IfStmt | WhileStmt | BreakStmt | ContinueStmt | RetStmt | Block | Program | FieldDef | TypeDecl | FieldInit | ObjLit | ArrayLit | UnionDecl | IsExpr | AsExpr | ForRange | ForIn | MatchExpr | ImportDecl | Spread => {}
+  }
+  -1
+}
+
+// The outermost-first index of the first `.` / `?.` step, in source order, with a comment
+// between it and the step before it; -1 when no gap between links holds one.
+function chainCommentedLink(headIx: i32, kinds: i32[], nodes: i32[]) {
+  let i = kinds.length - 1
+  while i >= 0 {
+    if kinds[i] == 0 || kinds[i] == 1 {
+      let prevIx = headIx
+      if i + 1 < nodes.length { prevIx = nodes[i + 1] }
+      const propAt = chainPropStart(nodes[i])
+      if propAt >= 0 && commentInCharSpan(nodeEndOf(prevIx), propAt) {
+        return i
+      }
+    }
+    i = i - 1
+  }
+  -1
 }
 
 // The chain rooted at `ix` laid out, or "" when this node is not a breakable
@@ -2589,6 +2634,14 @@ function chainLayout(ix: i32, indent: i32, column: i32) {
   while i >= 0 {
     if kinds[i] == 0 || kinds[i] == 1 { links = links + 1 }
     i = i - 1
+  }
+  // A comment between two links has no place on one line, so the chain breaks, from its
+  // first link or from that comment's link if earlier, and is rendered once (D11800).
+  const commented = chainCommentedLink(headIx, kinds, nodes)
+  if commented >= 0 {
+    let from = linkStart
+    if commented > from { from = commented }
+    return chainBroken(headIx, kinds, nodes, from, indent, column)
   }
   if links < 2 { return "" }
   // A comment inside the chain would be consumed by the flat measurement below and lost the
