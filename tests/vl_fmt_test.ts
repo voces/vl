@@ -3670,3 +3670,78 @@ Deno.test({
     }
   },
 });
+
+// D11800 — a comment between two links of a broken `.` / `?.` chain stays between them. An
+// own-line comment keeps a line of its own above the link it was written above, a trailing
+// one ends the link line it trailed, and the chain breaks from its first link (or from the
+// commented link, when no link is called) instead of joining onto one line.
+Deno.test({
+  name: "vl-fmt: a comment between chain links keeps its place (D11800)",
+  ignore: !ENABLED,
+  fn: async () => {
+    const src = [
+      "type Inner = { n: i32 }",
+      "type Box = { inner: Inner | null }",
+      "const xs = [1, 2, 3]",
+      "const c1 = xs",
+      "  .map((v) => v * 2)",
+      "  // the length of the doubled list",
+      "  .length",
+      "const c2 = xs.map((v) => v * 3) // trailing on the map line",
+      "  .length",
+      "const hit: Box = { inner: { n: 7 } }",
+      "const o1 = hit",
+      "  .inner",
+      "  // the null-safe link follows a comment",
+      "  ?.n",
+      "type Held = { inner: Inner }",
+      "function none(): Held | null { null }",
+      "const o2 = none()",
+      "  ?.inner",
+      "  /// still guarded by the `?.` above",
+      "  .n",
+      "function f() {",
+      "  xs",
+      "    .map((v) => v * 4)",
+      "    // a blank line after this comment is dropped",
+      "",
+      "    .filter((v) => v > 4)",
+      "    .length",
+      "}",
+      "print(c1)",
+      "print(c2)",
+      "print(o1)",
+      "print(o2)",
+      "print(f())",
+      "",
+    ].join("\n");
+    const want = src
+      .replace(
+        "const c2 = xs.map((v) => v * 3) // trailing on the map line\n",
+        "const c2 = xs\n  .map((v) => v * 3) // trailing on the map line\n",
+      )
+      .replace("const o1 = hit\n  .inner\n", "const o1 = hit.inner\n")
+      .replace("const o2 = none()\n  ?.inner\n", "const o2 = none()?.inner\n")
+      .replace("is dropped\n\n", "is dropped\n");
+    const r = await run([], src);
+    if (r.code !== 0) throw new Error(`vl fmt rejected valid source (rc ${r.code}):\n${r.err}`);
+    if (r.out !== want) throw new Error(`want:\n${want}\n---\ngot:\n${r.out}`);
+    const again = await run([], r.out);
+    if (again.code !== 0 || again.out !== r.out) {
+      throw new Error(`not idempotent (rc ${again.code}):\n${again.out}`);
+    }
+    const dir = await makeTempDir({ prefix: "vl_fmt_link_cmt_" });
+    try {
+      for (const [name, text] of [["before.vl", src], ["after.vl", r.out]]) {
+        const file = `${dir}/${name}`;
+        await Deno.writeTextFile(file, text);
+        const ran = await runOn("run", file);
+        if (ran.code !== 0 || ran.out !== "3\n3\n7\nnull\n2\n") {
+          throw new Error(`${name} ran wrong (rc ${ran.code}):\n${ran.out}${ran.err}`);
+        }
+      }
+    } finally {
+      await Deno.remove(dir, { recursive: true });
+    }
+  },
+});

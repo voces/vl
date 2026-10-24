@@ -331,8 +331,8 @@ Deno.test({
 // The trivia between two links: a blank-line run and a comment line (`//` and `///`) are free
 // before a leading `.` and before a leading `?.`, and the `?.` still short-circuits on null
 // and reads through otherwise; a plain `.n` a line after `?.inner` is still guarded by it.
-// `vl fmt` drops the blank lines and moves the comments out of
-// the chain (D11800), so `tests/cases/` cannot hold this layout and it lives here.
+// `vl fmt` drops the blank lines between links, so `tests/cases/` cannot hold this layout and
+// it lives here; a comment between links alone is `parser/leading-dot-comment-between-links.vl`.
 Deno.test({
   name: "vl-parse: a blank line or a comment between links keeps a `.` / `?.` chain whole",
   ignore: !ENABLED,
