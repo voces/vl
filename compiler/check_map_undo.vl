@@ -1,0 +1,128 @@
+// `check_map_undo.vl` — the undo log for keyed maps a quiet probe writes.
+// While a `checkMark` is open, a logged write records the map's id, the key, and the value it
+// replaced; a rollback that names the map's family puts back each key's first value since its mark.
+// Rows outlive a rollback that does not name their family, so an enclosing probe that does still
+// finds them. Imports nothing.
+
+let undoDepth = 0
+
+// One row per logged write: the map's `UM_*` id, its key, whether the map held the key before
+// the write, and the old value (an `i32`, or 0/1 for a boolean map).
+let undoMap: i32[] = []
+let undoKey: i32[] = []
+let undoHad: boolean[] = []
+let undoOld: i32[] = []
+
+// The logged maps' ids.
+export const UM_TP_IF_JOIN_AT = 1
+export const UM_TP_IF_OK_AT = 2
+export const UM_DJOIN_RELAYED = 3
+
+function undoNote(id: i32, key: i32, had: boolean, old: i32) {
+  undoMap.push(id)
+  undoKey.push(key)
+  undoHad.push(had)
+  undoOld.push(old)
+  0
+}
+
+// Sets `m[key] = v`, logging the old entry under `id` while a probe is open.
+export function undoSetI32(id: i32, m: {[i32]: i32}, key: i32, v: i32) {
+  if undoDepth > 0 { undoNote(id, key, m.has(key), m[key] ?? 0) }
+  m.set(key, v)
+  0
+}
+
+export function undoSetBool(
+  id: i32,
+  m: {[i32]: boolean},
+  key: i32,
+  v: boolean,
+) {
+  if undoDepth > 0 {
+    let old = 0
+    if m[key] ?? false { old = 1 }
+    undoNote(id, key, m.has(key), old)
+  }
+  m.set(key, v)
+  0
+}
+
+// Each key `id` logged since row `from`, to its oldest row there, the entry to put back; empty
+// when there is none.
+function undoFirstRows(from: i32, id: i32): {[i32]: i32} {
+  const first: {[i32]: i32} = Map()
+  let k = from
+  if k < 0 { k = 0 }
+  while k < undoMap.length {
+    if undoMap[k] == id && !first.has(undoKey[k]) { first.set(undoKey[k], k) }
+    k = k + 1
+  }
+  first
+}
+
+// Puts back every write to `m` logged under `id` since row `from` and returns the map: `m`
+// itself, or a copy without the keys the probe added, since the compiler deletes no map key.
+export function undoReplayI32(
+  from: i32,
+  id: i32,
+  m: {[i32]: i32},
+): {[i32]: i32} {
+  if from >= undoMap.length { return m }
+  const first = undoFirstRows(from, id)
+  let drop = false
+  for key in first.keys() {
+    const r = first[key] ?? -1
+    if r >= 0 && undoHad[r] { m.set(key, undoOld[r]) } else { drop = true }
+  }
+  if !drop { return m }
+  const out: {[i32]: i32} = Map()
+  for key in m.keys() {
+    const r = first[key] ?? -1
+    if r < 0 || undoHad[r] { out.set(key, m[key] ?? 0) }
+  }
+  out
+}
+
+export function undoReplayBool(
+  from: i32,
+  id: i32,
+  m: {[i32]: boolean},
+): {[i32]: boolean} {
+  if from >= undoMap.length { return m }
+  const first = undoFirstRows(from, id)
+  let drop = false
+  for key in first.keys() {
+    const r = first[key] ?? -1
+    if r >= 0 && undoHad[r] { m.set(key, undoOld[r] != 0) } else { drop = true }
+  }
+  if !drop { return m }
+  const out: {[i32]: boolean} = Map()
+  for key in m.keys() {
+    const r = first[key] ?? -1
+    if r < 0 || undoHad[r] { out.set(key, m[key] ?? false) }
+  }
+  out
+}
+
+// Opens a probe and returns the log's length, the row its rollback replays down to.
+export function undoOpen(): i32 {
+  undoDepth = undoDepth + 1
+  undoMap.length
+}
+
+// Closes a probe; the outermost close empties the log, since no mark is left to replay to.
+export function undoClose() {
+  if undoDepth > 0 { undoDepth = undoDepth - 1 }
+  if undoDepth == 0 && undoMap.length > 0 { undoReset() }
+  0
+}
+
+export function undoReset() {
+  undoDepth = 0
+  undoMap = []
+  undoKey = []
+  undoHad = []
+  undoOld = []
+  0
+}

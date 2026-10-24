@@ -321,10 +321,12 @@ on its own output diff:
   against D3078.
 - `cstrProbeBefore`: keeps its `*Cstr` rows by design (D3062). holeAlt 7, dJoin 1 and holeMap 1
   are not part of that design, so they are the candidates to drop.
-- Not in any mark: the keyed maps beside the columns (`nestCstrSeen`, `dJoinRelayed`,
-  `tpIfJoinAt`, `tpIfOkAt`). Nor are `tpIfReNames`/`tpIfReTys`, which are spans that
-  `tpIfReStart` indexes, not rows. A rollback that drops rows leaves the maps pointing past
-  the end, so the follow-up decides what each map means after a truncate.
+- The keyed maps beside the columns: `nestCstrSeen` trusts a key only while its row stands,
+  and `dJoinRelayed`, `tpIfJoinAt` and `tpIfOkAt` roll back through an undo log
+  (`check_map_undo.vl`; the first with the DJOIN family, the second with TP_IF, the third at
+  every rollback). `tpIfReNames`/`tpIfReTys` are spans that `tpIfReStart` indexes, not rows.
+  The other 101 maps a probe writes are classified in the L4 log: 29 keep entries no output
+  reads, and 72 are read after the rollback on purpose.
 
 **Proof for the refactor.** Byte-identical emitted modules and `vl check` output identity over
 `tests/cases` and the corpus; fuel A/B. Where the new default rolls back more than today, an

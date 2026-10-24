@@ -658,6 +658,36 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - A2 (#3605) adds `CheckMark` / `checkRollback` and records of columns, with each site's set unchanged and the census identical.
 - The follow-up (#3609) widened each leaking site's set, one commit per site: over 15,288 programs no rc, diagnostic or emitted module moves, and the census leaves only `cstrProbeBefore`'s constraint rows, kept by design (D3062).
 - `nestCstrSeen` now trusts a key only while its row stands; `tpIfOkAt` (a syntactic fact), `dJoinRelayed` (a per-type mark) and `tpIfJoinAt` (the last apart join seen at a node, as before A2) are kept across a rollback.
+- The keyed maps roll back. Census first: a census seed counting every keyed map's key count at each probe (`cfd99f293`, `tests/cases` and the distilled corpus) found 104 maps a probe writes. The three named maps were left grown by these sites:
+
+  | map | site | programs | example |
+  | --- | --- | --- | --- |
+  | `tpIfJoinAt` | `globalInitPrePass` | 2 | `generics/if-join-two-list-types-union.vl` |
+  | `dJoinRelayed` | `cstrProbeBefore`, `inferReturnsPrePass` | 2 | `numerics/recursive-generic-joins-runtime-numbers-apart.vl` |
+  | `tpIfOkAt` | `globalInitPrePass` | 42 | `generics/coalesce-join-at-list-pin.vl` |
+  | `tpIfOkAt` | `solveUnannotParams` | 6 | `generics/enclosing-param-into-generic-nullable.vl` |
+  | `tpIfOkAt` | `inferReturnsPrePass` | 4 | `std/idtable-plumb-witness.vl` |
+  | `tpIfOkAt` | `monoRecheck` | 4 | `maps/for-in-union-of-maps.vl` |
+  | `tpIfOkAt` | `cstrProbeBefore`, `tpIfRecheck` | 3 each | `generics/fn-result-null-into-generic-nullable.vl` |
+
+  To find which stale entries an output reads, an experiment build snapshotted a group of maps at every `checkMark` and restored it at every `checkRollback`, whatever the site's set, and `difftree.sh --identity` compared it with the base (16,534 files, 11,684 built):
+
+  | group | maps | differ | reading |
+  | --- | --- | --- | --- |
+  | g1 | `tpIfJoinAt tpIfOkAt dJoinRelayed` | 0 | stale entries harmless; now rolled back |
+  | g2 | `discardValTyAt ifNoValueAt ifValTyAt valDiscardAt` | 0 | per-node facts the kept pass writes again |
+  | g4 | `crsTop` and the eight `crw*` write-scan maps | 0 | memos keyed by node |
+  | g5 | the fourteen `cr*` capture banks and memos, `cvuSlotOf`, `npKillSure` | 0 | memos keyed by node |
+  | g3 | `fnDeclParent letDeclFn wrDstDecl ctnParamArgs ctnParamAt ctnScanAt ctnScanGets ctnWrRecv aliasRootMap extDeclIx sidMap scopeDepthsOf` | 3,292 (8,529 built) | declaration indices; restored, calls name an unknown function |
+  | g8 | 29 indices and memos (`cwBiSlot`, `wePartIx`, `igByName`, `luWriteTgt`, `njGateMemo`, `nestParentOf`, `shMemo`, `asgDeclRowsOf`, …) | 52 (11,641 built) | `closures/litunion-mix-closure-result.vl`, `generics/hole-field-write-lands-at-pin.vl`, 44 named `d3204_*` cells |
+  | g7 | `annotNameMemo apartHoleJoins efLeaf fvaNameDecl narIfEnds paramNullJoins holeTpJoinNames joinByWant tpJoinUnions tvElseBase tvElseTested holePinSet tyVarOwner holeElseTested annUnionTys` | 1 | `numerics/recursive-generic-joins-runtime-numbers-apart.vl` runs on the base and traps the build (rc 70) restored |
+  | g6 | `cexFolded cexNegOperand cexNotTree cexWideFloatOk lbiCandOf lbiInitTy lbiInlined lbiInlinedDecl lbiInlinedName cmpConstLit matchConstPatLit` | 1 | `functions/lambda-inferred-nonref-return.vl` reports its redundant-type hint twice restored |
+
+  Five more were read rather than measured: `solvedParamTys` is what `solveUnannotParams` probes for, `paramSolveTried` says a body is probed at most once, and `weSums`, `weShapeSums` and `weUnresSums` are write-effect summaries with their own settle and drop rule (D6130). So 29 maps keep only entries no output reads, and 72 are read after the rollback on purpose, which §4.3 says a probe should do by reading before the rollback; the §7 row keeps that number. No output witness exists for the three named maps, since g1 moves nothing.
+
+  The mechanism is `compiler/check_map_undo.vl`, an undo log of `(map id, key, had, old value)` rows. `CheckMark.undo` opens it (`undoOpen`), and writes to the three maps go through `undoSetI32`/`undoSetBool`, which log only while a mark is open. `tpIfTruncate` replays `tpIfJoinAt` and `dJoinTruncate` replays `dJoinRelayed`, so each follows its family's sets, which cover every site the census found for them. `checkRollback` replays `tpIfOkAt` at every site, because the pass that keeps a node marks it again. The outermost close empties the log. A replay sets each key's oldest logged value back and, when the probe added a key, returns a copy of the map without it, rather than calling `delete`: the compiler's first `m.delete` brought in the map compaction family and grew every `__map_set_N__`, 23 KB of seed and +0.75% diderven check fuel. The three maps moved into `check_tp_join.vl` beside the families that replay them, and `PRB_TABLES` counts them, so `tests/vl_probe_rollback_test.ts` holds seven of the programs above to no keyed map grown; a build whose replay returns early fails it, naming each one.
+
+  Results: the census over 16,797 programs leaves only `cstrProbeBefore`'s constraint rows. `difftree.sh --identity`: 0 of 16,534 files differ (11,684 built); `regress.vl` no cell changed class; fixpoint identical. Seed 5,786,171 to 5,789,438 bytes. Diderven `vl check src/game.vl` fuel (`VL_FUEL=1 VL_JOBS=1 VL_COMPILE_CACHE=0`), base fixpoint against the candidate: 1,863,268,564 to 1,863,054,547 (-0.01%).
 
 ### L5 log
 
