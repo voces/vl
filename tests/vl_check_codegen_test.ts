@@ -54,8 +54,9 @@
 // same seed, so there is nothing extra for them to skip on.
 //
 // @test-timing native
-// @test-timing sweep n=2989 name~"the invalid-module gate"
+// @test-timing sweep n=18 name~"the invalid-module gate"
 
+import { oracleSettlesValidity, parseDirectives } from "./support/caseDirectives.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -1267,12 +1268,12 @@ Deno.test({
 //
 // `@no-instantiate` is the corpus's own marker for exactly this class: the file
 // compiles clean and the module it produces does not load. The gate must find ALL
-// of them and NOTHING else — over 2,075 case files that was measured as 11 flagged
-// and 11 marked, an exact match. This test re-derives the pair every run, so:
+// of them and NOTHING else. This test re-derives the pair every run, so:
 //   * a fixed defect reddens it (delete the `@no-instantiate` directive too);
 //   * a NEW check-clean-invalid-wasm shape reddens it (that is a defect to file);
-//   * a gate that stops firing reddens it.
-// It runs the soundness directory in ONE `vl` invocation — the pump walks it.
+//   * a gate that stops firing reddens it (the fault-injected control).
+// It compiles only the cases the corpus oracle does not already instantiate, in ONE
+// `vl check --batch` invocation.
 Deno.test({
   name: "vl-check-codegen: the invalid-module gate flags exactly the @no-instantiate cases",
   ignore: !ENABLED,
@@ -1288,42 +1289,68 @@ Deno.test({
     // family (a narrowed NULLABLE function value passed as an argument) and the `u8[]` generic
     // argument refilled `std/`. One member per directory again, from two unrelated causes.
     //
-    // THE SCAN MUST STAY TWO-DIRECTORY REGARDLESS. An empty directory costs one `vl check`
-    // invocation; a directory dropped because it happened to be empty is what stops the gate
+    // THE SCAN MUST STAY TWO-DIRECTORY REGARDLESS. An empty directory costs a directory
+    // read; a directory dropped because it happened to be empty is what stops the gate
     // seeing the class move back into it, and a `soundness/`-only scan is exactly the
     // narrowing that tripped the "read nothing" guard the last time this list emptied. The
     // guard below is on the UNION, not on either directory.
-    const dirs = [`${ROOT}/tests/cases/soundness`, `${ROOT}/tests/cases/std`];
+    const dirs = ["soundness", "std"];
     const marked = new Set<string>();
+    const swept: string[] = [];
     let scanned = 0;
     for (const dir of dirs) {
-      for await (const e of Deno.readDir(dir)) {
+      for await (const e of Deno.readDir(`${ROOT}/tests/cases/${dir}`)) {
         if (!e.isFile || !e.name.endsWith(".vl") || e.name === "README.vl") continue;
         scanned++;
-        const src = await Deno.readTextFile(`${dir}/${e.name}`);
-        if (/^\/\/\s*@no-instantiate\b/m.test(src)) marked.add(e.name);
+        const d = parseDirectives(await Deno.readTextFile(`${ROOT}/tests/cases/${dir}/${e.name}`));
+        if (d.noInstantiate.length > 0) marked.add(e.name);
+        // ONLY THE CASES THE CORPUS ORACLE DOES NOT ALREADY SETTLE. A run-mode case is
+        // instantiated under V8 by `tests/cases_wasm_*_test.ts`, so a module the engine
+        // refuses turns that case red; a check- or emit-stage reject never has a module.
+        // What is left — skipped, divergent, `@no-instantiate`, and check-mode accepts — is
+        // the part only this sweep sees. Mutation evidence for the narrowing: the PR body.
+        if (!oracleSettlesValidity(`${dir}/${e.name}`, d)) swept.push(`${dir}/${e.name}`);
       }
     }
-    // ONE INVOCATION PER DIRECTORY. `vl check` takes a single path — handing it two
-    // silently sweeps NEITHER (measured: two dirs flagged 0, each alone flagged its own),
-    // which would have turned this gate into a test that passes by looking at nothing.
-    const dec = new TextDecoder();
-    const flagged = new Set<string>();
-    for (const dir of dirs) {
-      const { stdout, stderr } = await new Deno.Command(VL, {
-        args: ["check", "--codegen", "--concise", dir, "--compiler", COMPILER],
+    // ONE `--batch --json` RUN: one record per input file, so a flag is attributed to the
+    // CASE, never to the module whose function failed (a std module, often). This sweep read
+    // the concise text for `not valid wasm` until it found that wording no longer existed —
+    // it then flagged nothing at all, whatever the emitter did.
+    const sweep = async (fault: string): Promise<Set<string>> => {
+      const { stdout } = await new Deno.Command(VL, {
+        args: [
+          "check",
+          "--batch",
+          "--json",
+          "--codegen",
+          ...swept.map((f) => `${ROOT}/tests/cases/${f}`),
+          "--compiler",
+          COMPILER,
+        ],
         stdout: "piped",
-        stderr: "piped",
-        // `VL_FAULT_INJECT: ""` for the same reason `check` pins it: with the hook
-        // armed in the surrounding shell, EVERY file in these directories would flag
-        // `not valid wasm` and this gate would report the whole corpus as the class.
-        env: nativeEnv({ NO_COLOR: "1", VL_FAULT_INJECT: "" }),
+        stderr: "null",
+        // `VL_FAULT_INJECT` is pinned for the same reason `check` pins it: with the hook
+        // armed in the surrounding shell, every swept file would read as the class.
+        env: nativeEnv({ NO_COLOR: "1", VL_FAULT_INJECT: fault }),
       }).output();
-      for (const line of (dec.decode(stdout) + dec.decode(stderr)).split("\n")) {
-        if (!line.includes("not valid wasm")) continue;
-        const file = line.slice(0, line.indexOf(":"));
-        flagged.add(file.slice(file.lastIndexOf("/") + 1));
+      const records = new TextDecoder().decode(stdout).split("\n").filter((l) => l.trim());
+      if (records.length !== swept.length) {
+        throw new Error(`--batch --json gave ${records.length} records for ${swept.length} files`);
       }
+      const out = new Set<string>();
+      for (const line of records) {
+        const r = JSON.parse(line) as { file: string; diagnostics: { code?: string }[] };
+        if (r.diagnostics.some((x) => x.code === "invalid-module")) {
+          out.add(r.file.slice(r.file.lastIndexOf("/") + 1));
+        }
+      }
+      return out;
+    };
+    const flagged = await sweep("");
+    // THE CONTROL: the same run with the validator handed corrupt bytes must flag. Without
+    // it, a parse of the records that stopped matching would pass by flagging nothing.
+    if ((await sweep("corrupt-validate-bytes")).size === 0) {
+      throw new Error("the fault-injected sweep flagged no file — the sweep cannot see the class");
     }
     const only = (a: Set<string>, b: Set<string>) => [...a].filter((x) => !b.has(x)).sort();
     const unmarked = only(flagged, marked);

@@ -58,7 +58,7 @@
 //   - Message matching folds case and quote style (`x` vs 'x') — wording
 //     parity is not pinned across the two compilers, only verdicts (the
 //     REJECT-parity policy). A directive whose text still matches only the TS
-//     compiler's message lands in EXPECTED_DIVERGENCES below.
+//     compiler's message lands in EXPECTED_DIVERGENCES (caseDirectives.ts).
 //
 // The seed is built by `bash scripts/refresh-compiler.sh`. Absent (fresh
 // clone, or the `ci` job, which has no seed) every test here self-ignores —
@@ -74,6 +74,11 @@
 //
 // Run with:  deno test -A --parallel tests/cases_wasm_*_test.ts
 
+import {
+  type Directives,
+  EXPECTED_DIVERGENCES,
+  parseDirectives,
+} from "./caseDirectives.ts";
 import { filePath } from "./filePath.ts";
 import { runWasm, VLRuntimeError } from "./runWasm.ts";
 // The module-arming gate — the SHARED TS copy. `compiler/moduleGate.ts` is a LEAF
@@ -97,29 +102,6 @@ const seedExists = (() => {
     return false;
   }
 })();
-
-// Cases where the wasm oracle's result legitimately differs from what the
-// TS-worded directives pin. REJECT-verdict parity holds for every entry except
-// where the reason says otherwise (the parked soundness xfails). Each entry
-// skips its case; the trailing tripwire test fails on a stale entry. Burning
-// this list down is the message/span-parity work that also gates the deno
-// CHECK-tier deletion (ROADMAP F-tiers).
-const EXPECTED_DIVERGENCES: Record<string, string> = {
-  // The `unreachable: exhaustive is-chain` @info is TYPE-AWARE (A-exhaust): TS
-  // derives it from the checker. The native lint pass is parse-only and the wasm
-  // driver's diagnostic stream is error-only, so this info is TS-only until the
-  // checker exposes warning/info diagnostics to the oracle (a later slice).
-  "lint/exhaustive-is-chain-dead-else.vl":
-    "type-aware `unreachable: exhaustive is-chain` @info — not produced by the parse-only native lint / error-only diag stream",
-  "soundness/literal-is-union-param-dispatch.vl":
-    "type-aware `unreachable: exhaustive is-chain` @info — TS-only (see lint/exhaustive-is-chain-dead-else)",
-  "types/struct-union-same-shape.vl":
-    "type-aware `unreachable: exhaustive is-chain` @info — TS-only (see lint/exhaustive-is-chain-dead-else)",
-  "lint/generic-intersection-no-warn.vl":
-    "wasm CHECKER gap: a generic intersection `T & S` reports `unknown type 'T&S'` where the TS checker accepts it (not a lint divergence)",
-  "soundness/README.vl":
-    "a prose line parses as @run; the wasm emitter rejects a statement-less program (TS emits an empty module)",
-};
 
 type Exports = Record<string, (...args: number[]) => number>;
 
@@ -148,105 +130,6 @@ const exports: Exports | undefined = seedExists
       .exports as unknown as Exports;
   })()
   : undefined;
-
-type Directives = {
-  mode: "check" | "run";
-  errors: string[];
-  errorsAt: { line: number; col: number; text: string }[];
-  /** `@emit-error TEXT`: the FULL compile must fail at the EMIT stage (rc 3)
-   * with a diagnostic containing TEXT — pins the emitter's fail-loudly rejects
-   * (a shape the checker accepts but the emitter has no rep for), which the
-   * checker-tier `@error` cannot express. */
-  emitErrors: string[];
-  warnings: string[];
-  infos: string[];
-  hints: string[];
-  logs: string[];
-  trap: string[];
-  noInstantiate: string[];
-  unknown: string[];
-  skip: string | null;
-};
-
-const parseDirectives = (src: string): Directives => {
-  const d: Directives = {
-    mode: "check",
-    errors: [],
-    errorsAt: [],
-    emitErrors: [],
-    warnings: [],
-    infos: [],
-    hints: [],
-    logs: [],
-    trap: [],
-    noInstantiate: [],
-    unknown: [],
-    skip: null,
-  };
-  for (const raw of src.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line.startsWith("//")) continue;
-    const m = line.slice(2).trim().match(/^@(\S+)\s*(.*)$/);
-    if (!m) continue;
-    const [, key, rest] = m;
-    switch (key) {
-      case "run":
-        d.mode = "run";
-        break;
-      case "check":
-        d.mode = "check";
-        break;
-      case "error":
-        d.errors.push(rest);
-        break;
-      case "emit-error":
-        d.emitErrors.push(rest);
-        break;
-      case "warning":
-        d.warnings.push(rest);
-        break;
-      case "info":
-        d.infos.push(rest);
-        break;
-      case "hint":
-        d.hints.push(rest);
-        break;
-      case "error-at": {
-        const at = rest.match(/^(\d+):(\d+)\s+(\S.*)$/);
-        if (!at) {
-          throw new Error(
-            `malformed @error-at: expected \`<line>:<col> <text>\` (both 0-based), ` +
-              `got \`@error-at ${rest}\``,
-          );
-        }
-        d.errorsAt.push({
-          line: Number(at[1]),
-          col: Number(at[2]),
-          text: at[3],
-        });
-        break;
-      }
-      case "log":
-        d.logs.push(rest);
-        break;
-      case "trap":
-        d.mode = "run";
-        d.trap.push(rest);
-        break;
-      case "no-instantiate":
-        d.mode = "run";
-        d.noInstantiate.push(rest);
-        break;
-      case "skip":
-        d.skip = rest || "no reason given";
-        break;
-      default:
-        d.unknown.push(key);
-        break;
-    }
-  }
-  return d;
-};
 
 type Case =
   | { kind: "single"; url: URL }
