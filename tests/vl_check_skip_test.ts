@@ -1014,6 +1014,17 @@ const CASES: Case[] = [
     libUses: 'export function tl(n: i32): string { return "v\\{n}" }\n',
     uses: 'import "std:fmt"\nconst tm = 3\nprint("m\\{tm}")\n',
   },
+  {
+    // Main's own literal type is spelled like lib's hidden inline-union alias (D11850): its
+    // message keeps the literal, so it is not banked.
+    name: "a literal type spelled like a hidden union alias",
+    want: "decline",
+    why: "no bank",
+    from: '"x" | "y"',
+    to: "i32 | i64",
+    libUses: 'function luq(): void {\n  const u: "x" | "y" | null = null\n  print(1)\n}\n',
+    uses: 'const l0: "#lu0" = "c"\n',
+  },
 ];
 
 const graphs = (c: Case, bad: boolean): [Graph, Graph] => {
