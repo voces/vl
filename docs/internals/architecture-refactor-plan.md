@@ -1310,6 +1310,15 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
     - Filed witnesses: 1 MOVED, D3137, closed with this change. The distilled corpus moves those 9 cells and no other (0 runs → not-runs, 0 → silent).
     - Rep-fuzz is exact, and the emitter-state audit reads 0.
     - The seed goes from 5,782,225 to 5,782,307 bytes (+82).
+- **2026-10-24, render-parse A2 done: ty-string-parse 120 → 119.**
+  - `monoRetOfClosureCall`'s arrow test on the return name cut from the pin spelling reads the pin's arena type: a result is a closure when the pin's `fnRet` is a `TyFunc`.
+  - Its one untyped reach was a hole function passed to a function-type slot (`run(show, 3)`, `cb: (T) => i32`), whose own type stays open. `monoPinTyParamComposite` now pins such an argument at the slot's annotation under the typed bindings (`monoClosedSlotTyAt`, shared with `monoSlotParamTysAt`) when that type closes.
+  - Probe over the self-compile and 16,645 files: 35 files reach the site, all with a pin type. The earlier probe had 195 typed events agreeing and 1 untyped.
+  - The sig-token renders (`sigParamTokOfTy`, `fnRetEmitName`) were probed against a token built from the type and stay. Parameters: 24,341 events agree, 1,769 differ on ref-list, map, struct and literal-union slots. Results: 13,893 agree, 28,410 differ, mostly `>v` against `>i`. They wait on D1 and D8, as the ledger rows say.
+  - Checks:
+    - `difftree.sh --identity`: `16534 files · 11684 built · 0 differ · 0 uncompared`, and the fixpoint matches master's.
+    - Filed witnesses: 3,752 as filed.
+    - The seed goes from 5,785,692 to 5,785,782 bytes (+90).
 
 ### L10 log
 

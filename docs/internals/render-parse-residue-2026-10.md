@@ -120,7 +120,7 @@ the slice retires.
 | slice | name | entries | A / C / D | renders / parses | files |
 | --- | --- | --- | --- | --- | --- |
 | A1 | shape-row typed twins (landed: 2 retired, 12 left; re-probed at 9a8510d7a with the inventory witnesses: callers with no type, typed rungs that differ, and the class C alias parameter; func and lit-union rungs listed as the next rep change) | 14 | 14 / 0 / 0 | 0 / 14 | `emit_shape_rows` (callers in `emit_classify`, `emit_collect`, `emit_nullable_rets`, `emit_sig_tokens`) |
-| A2 | emit_mono typed tests (landed: 7 retired, 1 to B, 1 left; the arrow test waits on one hole pin with no type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
+| A2 | emit_mono typed tests (done: 8 retired, 1 to B, 0 left; the arrow test reads the pin type once a hole-function argument is pinned at its slot's substituted type) | 1 | 0 / 1 / 0 | 0 / 1 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 11 retired, 1 left; re-probed at 5888be183 with the inventory witnesses: the nullable-element reject and the arm-shape walk typed, `dstPinMapValue`'s cut is the pin name it pushes) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
