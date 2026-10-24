@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; the hole nullable-string and inline literal-union param pins are constants; 7 retired, 16 left, each probed: the ladder rungs hold no type, and a render of the banked pin type at the mint differs in 1 to 14 files per producer) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; re-probed: the atom tests agree wherever atoms are typed, but `emit_mono`'s name-only pins register rows with no type; the literal-arm, return and tpSub pins now pass their type, which leaves 240 untyped events in 79 files, all from the two param pins, whose type exists only after the binding they feed; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 16 retired, 5 left; every `emit_mono` pin now registers a typed row and the atom tests read atom types; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 7 retired, 11 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1495,6 +1495,18 @@ What each slice changes:
       `mintInlineUnion`, also in `emit_collect`, records `unTyIx` from the site identity rather
       than the registered type. A typed pin's row therefore has no type when its name does not
       resolve.
+  - Done: 2 parses, the `isVariantBoxUnionAtoms` atom tests. The function reads each atom's
+    arena type from `unionAtomTysOf`, which its three `emit_collect` callers now pass: an atom
+    is a literal union when its type is one of two or more members or carries an alias name, and
+    an array when its type is a `TyArray`. The two param pins pass the type of the spelling they
+    minted (`monoPinSpellTy`), not the post-binding type. That spelling's parse is the type the
+    synthesized annotation node already carries, so the row and its readers agree; the 17 Set
+    events above are the spelling's own type, not a disagreement with the node. An `#anon`
+    spelling does not parse, and passes the pinned type instead. A row adopted that way is also
+    aliased under the spelling's canon key (`unNameAdoptTyKeyRow`), because a reader with a
+    placeholder node type finds it by name. A whole-answer probe over the self-compile and
+    16,646 files: 7,824 events in 2,545 files, 0 differ, 0 untyped. difftree `--identity` found
+    0 of 16,534 files differ.
   - Done: 2 renders. `cloCallParamUnionName` no longer has a render rung: past the alias and
     nominal rungs the lifted lambda's own pin answers. 5 files reach the old rung, all with an
     empty render that already fell through to that pin. `njStash` names the union by
