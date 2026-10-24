@@ -36,21 +36,16 @@
 // reachable is inlined into the loop and the traps appear there. Reading the
 // columns together is what makes the transition legible.
 //
-// MODULE-WIDE also means the `none` column counts every loop-bearing function
-// `std:buffer` itself defines, reachable from the kernel or not — the whole
-// module is present until an optimizer rung deletes what nothing calls. So a new
-// std export with a loop in it moves all eighteen `none` cells by the same
-// amount and neither `O` nor `O3` at all, which is the signature to check for
-// before reading a move as a codegen finding. `storeBytes`/`loadBytes` carry +3
-// call for their `__trap__("…")` message, and `window` +1 for its own, whose
-// per-character print loop is what drags the string machinery into a kernel that has no strings. Their two
-// `struct.get`s each are NOT in the `sget` column: a loop whose only call is a
-// linear-memory intrinsic keeps the list-header hoist, so the wrapper is read
-// above the loop (`bulk-copy-design.md` §E4). At `-O3` the module is
-// byte-identical to the one built before the pair existed. Every `none` trap cell
-// also carries +2 from those two functions' per-byte loops: a list index guard's
-// trap branch ends in `unreachable` (D4782), which `-O` folds into one trap block
-// outside the loop, so neither optimized column moved.
+// The `none` column counts only what the kernel can reach: a plain build writes an
+// `unreachable` stub for every function no root reaches (DECISIONS.md, "A plain
+// build drops the functions no root reaches"), and a stub has no loop. Before
+// that, every `none` cell also carried the loops of `std:buffer` functions the
+// kernel never calls — `storeBytes`/`loadBytes` (+1 trap and +1 call each),
+// `window` (+1 call) and the `__utf8_cplen__` helper they drag in (+1 call) —
+// which is +2 trap and +4 call on all sixteen rows, and moved neither `O` nor `O3`
+// because those rungs had already deleted the same functions. A move that is
+// uniform across the `none` column and absent from the optimized ones is still the
+// signature of reachability, not of the kernel's own codegen.
 //
 // "Inside a loop" is loop MEMBERSHIP, not innermost-loop membership, so a value
 // the driver reads once per TRIP counts too — that is what the `sget` on the
@@ -171,29 +166,29 @@ const c = (trap: number, call: number, sget: number): Counts => ({ trap, call, s
 export const TABLE: Record<string, Row> = {
   // `scale-accessor` and `scale-seedtwice` have no row: each read `scale-view`'s three
   // cells, and every mutant that reddened either of them reddens another row here too. `vl_view_descriptor_melt_test.ts` still builds `scale-seedtwice` at `-O3`.
-  "scale-view": { none: c(2, 7, 1), O: c(2, 2, 0), O3: c(4, 1, 0) },
-  "scale-buf": { none: c(2, 7, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "scale-hoist": { none: c(2, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "reduce-view": { none: c(2, 6, 1), O: c(2, 1, 0), O3: c(2, 1, 0) },
-  "reduce-buf": { none: c(2, 6, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "reduce-hoist": { none: c(2, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "axpy-view": { none: c(2, 8, 1), O: c(2, 3, 0), O3: c(6, 1, 0) },
+  "scale-view": { none: c(0, 3, 1), O: c(2, 2, 0), O3: c(4, 1, 0) },
+  "scale-buf": { none: c(0, 3, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "scale-hoist": { none: c(0, 1, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "reduce-view": { none: c(0, 2, 1), O: c(2, 1, 0), O3: c(2, 1, 0) },
+  "reduce-buf": { none: c(0, 2, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "reduce-hoist": { none: c(0, 1, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "axpy-view": { none: c(0, 4, 1), O: c(2, 3, 0), O3: c(6, 1, 0) },
   // The ATTRIBUTION control (§M4): the same six per-access compares as
   // `axpy-view`, written by hand over a base and an extent hoisted into locals.
-  // Six traps (+2, above) and ZERO field reloads per element at `none`; the seventh trap and
+  // Six traps and ZERO field reloads per element at `none`; the seventh trap and
   // the four `struct.get`s that appear once optimized are the view CONSTRUCTION
   // check and its field reads, inlined into the driver's TRIP loop — per trip,
   // not per element, which is the limit of a loop-membership counter.
-  "axpy-fencedhoist": { none: c(8, 5, 0), O: c(7, 1, 0), O3: c(7, 1, 0) },
+  "axpy-fencedhoist": { none: c(6, 1, 0), O: c(7, 1, 0), O3: c(7, 1, 0) },
   // The control above, as a LIBRARY call rather than six hand-written compares:
   // `getF32At`/`setF32At` shipped in `std:buffer` (webcraft A1). At `none` the
   // traps sit in the callees, so this reads like `axpy-view`; what matters is the
   // `-O3` cell, where the per-element reload is gone (7 -> 4, and those 4 are the
   // view construction in the TRIP loop, exactly as on the `fencedhoist` row) while
   // all six per-access compares survive.
-  "axpy-at": { none: c(2, 8, 0), O: c(2, 3, 0), O3: c(6, 1, 0) },
-  "axpy-buf": { none: c(2, 8, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "axpy-hoist": { none: c(2, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "axpy-at": { none: c(0, 4, 0), O: c(2, 3, 0), O3: c(6, 1, 0) },
+  "axpy-buf": { none: c(0, 4, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "axpy-hoist": { none: c(0, 1, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
   // ── shape `soa`: webcraft's own six-column integrator (A1) ──────────────────
   // The two-view `axpy` rows UNDERSTATE the reload, because there the per-trip
   // view-construction reads dominate the per-element ones. This pair is the
@@ -207,11 +202,11 @@ export const TABLE: Record<string, Row> = {
   // contains — the same loop-membership limit called out on `axpy-fencedhoist`.
   // Both rows keep all 24 traps at `-O3`, which is the point: the fence is not
   // what costs.
-  "soa-view": { none: c(2, 17, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
-  "soa-at": { none: c(2, 17, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
-  "rows-view": { none: c(2, 7, 0), O: c(2, 2, 0), O3: c(4, 1, 0) },
-  "rows-buf": { none: c(2, 7, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
-  "rows-hoist": { none: c(2, 5, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "soa-view": { none: c(0, 13, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
+  "soa-at": { none: c(0, 13, 0), O: c(0, 13, 0), O3: c(24, 1, 0) },
+  "rows-view": { none: c(0, 3, 0), O: c(2, 2, 0), O3: c(4, 1, 0) },
+  "rows-buf": { none: c(0, 3, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
+  "rows-hoist": { none: c(0, 1, 0), O: c(0, 1, 0), O3: c(0, 1, 0) },
 };
 
 export const RUNGS: Array<{ name: keyof Row; flag: string | null }> = [

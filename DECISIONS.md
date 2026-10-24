@@ -10787,3 +10787,60 @@ pushes onto that `K[]`, which stays the receiver's place from the first test tha
 later `q.length` reads it (D4934); the caller's own list is not pushed onto, the detach D4949
 pays for a field or capture. A closure declared in the arm reads an empty `K[]` for its capture
 (D4935). Only a field receiver still leaves the parameter unbound rather than defaulted.
+
+## A plain build drops the functions no root reaches (2026-10-23)
+
+**The rule.** `vl build` and `vl run` emit, for every function no root reaches, a three-byte
+body that is `unreachable` (`dfeFlush` in `compiler/emit_sections.vl`). The roots are the
+start and module-init functions, every export, and every function used as a value: one with
+a table entry, and the thunk standing in for it. Reach is followed over direct `call` and
+`return_call` only, recorded as `fbCall`/`fbReturnCall` write them (`dfeCallee`). An indirect
+call reaches nothing new, because everything it could call is already a root.
+
+**Why a stub and not a removal.** A function's wasm index is fixed when the first call to it
+is written, and the code entries are rendered in index order. Removing a body would mean
+renumbering every call, the element section, the exports and the name and span tables after
+they were written. A stub keeps every index, so nothing written earlier is patched. The cost
+is four bytes and one type-section reference per dead function.
+
+**Why not track function-value flow.** A function used as a value is a root whether or not
+the value is ever called. Following values through locals, fields and closures would be a
+second escape analysis whose mistakes are traps at run time. Treating every value as a root
+is conservative, and `-O`'s DCE still removes what is unreachable through values.
+
+**Measured** against the seed before it (`base`), both building the same sources:
+
+| program | bytes before | bytes after |
+| --- | ---: | ---: |
+| tests/cases, 5,170 modules | 21,469,396 | 12,264,736 (-42.9%) |
+| a small std-heavy program (`std:str`, `std:math`, a map) | 21,483 | 8,882 |
+| diderven `src/game.vl` | 603,657 | 584,564 |
+| heregeat `src/main.vl` | 153,908 | 133,665 |
+| eardstap `src/main.vl` | 183,466 | 167,602 |
+| check-filed-witnesses.vl | 167,927 | 132,806 |
+| a 68,002-line program of 4,000 `while i < n {}` loops, all called | 423,915 | 423,915 (identical) |
+| the compiler itself | 5,753,875 | 5,753,727 |
+
+Over tests/cases, 41,963 functions became stubs, no function a root reaches did, and the
+three stubs some live function calls are bodies that were already `unreachable`. `-O` and
+`-O3` output over tests/cases is byte-identical, since binaryen already removed these. Build
+wall, CPU and RSS did not move on either measured program, and the L2 self-compile fuel moved
++0.03%.
+
+**The one way it reaches `-O`/`-O3`.** The rungs' run-once marks (`runOnceHotCallees` in
+`compiler/opt_scan.vl`) are read off the plain module's direct calls, and a stub makes none.
+A dead caller used to count as a caller from outside run-once code, which vetoed the mark; now
+it does not. On `bench/collections/map-string` and `word-freq` this marks `std:fmt`'s `bnLen`
+(it has a loop, and its remaining callers are run-once, one of them in a loop) once the
+unreached `bnBitLen` stops calling it, so `-O` keeps it as a function: fns +1, and bytes fall (8,549 to 8,333 and 9,630 to
+9,506). That is the run-once rule now judging the program instead of its dead code.
+
+**What it changes elsewhere.** A plain build is no longer a size ceiling for `-O`: inlining
+can make a small program larger than the stubbed plain build, so the native `-O`/`-O3` suites
+no longer compare the two. LOOP_TABLE's `none` row now counts only what the program can reach.
+A program whose only invalid body was an unreached instance validates and runs: D3872's
+witness prints `RA`, though the open-`T` instance is still minted.
+
+**Off when relocations are armed.** A scratch build with `RELOC_ARMED` flipped records body
+offsets for per-module artifacts (docs/internals/s5-per-module-artifacts.md), and a stub would
+move them. Such a build emits every body as before.

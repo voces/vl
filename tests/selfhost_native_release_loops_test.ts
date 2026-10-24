@@ -82,18 +82,15 @@ for (const rel of CASES_LIST) {
       const want = logsOf(Deno.readTextFileSync(new URL(rel, CASES)));
       const tmp = await Deno.makeTempDir();
       try {
-        const plain = `${tmp}/plain.wasm`;
         const rel3 = `${tmp}/rel.wasm`;
-        const bp = await vl(["build", srcPath, "-o", plain]);
-        if (bp.code !== 0) throw new Error(`${rel}: vl build failed: ${bp.err.trim().split("\n")[0]}`);
         // `vl build` validates the written module, so a non-zero exit here already
         // means the release profile produced something wasmtime refuses.
         const br = await vl(["build", srcPath, "-O3", "-o", rel3]);
         if (br.code !== 0) throw new Error(`${rel}: vl build -O3 failed: ${br.err.trim().split("\n")[0]}`);
 
-        const pSize = Deno.statSync(plain).size, rSize = Deno.statSync(rel3).size;
-        if (rSize <= 0) throw new Error(`${rel}: -O3 produced an empty module`);
-        if (rSize > pSize) throw new Error(`${rel}: -O3 grew the module (${pSize} → ${rSize} bytes)`);
+        // Not compared with the plain build's size, which already drops unreachable
+        // functions: `-O3`'s inlining can make a small program larger than it.
+        if (Deno.statSync(rel3).size <= 0) throw new Error(`${rel}: -O3 produced an empty module`);
 
         const r = await vl(["run", rel3]);
         if (r.code !== 0) {

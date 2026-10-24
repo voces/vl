@@ -2,7 +2,7 @@
 //
 // `vl build -O` shells out to `wasm-opt` (when present) to shrink the emitted
 // WasmGC module in place. This suite proves, through the native tool only, that
-// the optimized output is (a) SMALLER-or-equal, (b) a valid wasm module wasmtime
+// the optimized output is (a) non-empty, (b) a valid wasm module wasmtime
 // loads, and (c) BEHAVIOR-PRESERVING — `vl run <opt.wasm>` (the prebuilt-module
 // passthrough) reproduces the file's `@log` lines exactly. The optimizer runs
 // with EXACTLY `--enable-reference-types --enable-gc --enable-bulk-memory` (VL
@@ -72,26 +72,22 @@ const sizeOf = (p: string) => Deno.statSync(p).size;
 
 for (const rel of CASES_LIST) {
   Deno.test({
-    name: `native-opt: ${rel} — vl build -O shrinks + vl run reproduces @log`,
+    name: `native-opt: ${rel} — vl build -O is valid + vl run reproduces @log`,
     ignore: !ENABLED,
     fn: async () => {
       const srcPath = filePath(new URL(rel, CASES));
       const want = logsOf(Deno.readTextFileSync(new URL(rel, CASES)));
       const tmp = await Deno.makeTempDir();
       try {
-        const plain = `${tmp}/plain.wasm`;
         const opt = `${tmp}/opt.wasm`;
-        const bp = await vl(["build", srcPath, "-o", plain]);
-        if (bp.code !== 0) throw new Error(`${rel}: vl build failed: ${bp.err.trim().split("\n")[0]}`);
         const bo = await vl(["build", srcPath, "-O", "-o", opt], { VL_WASM_OPT: WASM_OPT });
         if (bo.code !== 0) throw new Error(`${rel}: vl build -O failed: ${bo.err.trim().split("\n")[0]}`);
 
-        // (a) optimized is a valid module, no larger than the plain build.
-        const pSize = sizeOf(plain), oSize = sizeOf(opt);
-        if (oSize <= 0) throw new Error(`${rel}: -O produced an empty module`);
-        if (oSize > pSize) {
-          throw new Error(`${rel}: -O grew the module (${pSize} → ${oSize} bytes)`);
-        }
+        // (a) optimized is a valid, non-empty module. Not compared with the plain build's
+        // size: that build already drops unreachable functions, so `-O`'s inlining can make
+        // a small program larger than it (DECISIONS.md, "A plain build drops the functions no
+        // root reaches").
+        if (sizeOf(opt) <= 0) throw new Error(`${rel}: -O produced an empty module`);
 
         // (b)+(c) wasmtime loads it and it behaves identically to the source.
         const r = await vl(["run", opt]);
