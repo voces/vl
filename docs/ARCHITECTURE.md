@@ -39,7 +39,7 @@ refusal. Progress is counted in programs that **run**, by the instruments named 
 ```
 source ─► lexer ─► parser ─► node arena ─► checker ─────────────────► emitter ─────────► module bytes ─► host
           tokens   AST                     (solve loops, canon)       (pass table:            (-O: opt_pipe
-                                           types, diagnostics         46 ordered rows,         + wasm-opt)
+                                           types, diagnostics         47 ordered rows,         + wasm-opt)
                                                                       mono among them;
                                                                       then sections)
 ```
@@ -143,10 +143,11 @@ Detail: `docs/internals/check-reject-audit-2026-09.md`, `docs/internals/open-rul
 `emitProgram` (`emit_sections.vl`) is the emitter's driver. It runs a **declared pass table**,
 then `emitModule`:
 
-1. **The pass table** is a dependency-ordered list of 48 rows, each `"<pass> > <prerequisite>…"`.
-   The loop in `emitProgram` reads each row (`passRowName`), refuses to run one whose
+1. **The pass table** is a dependency-ordered list of 47 `PassRow` records, each a pass and the
+   passes it needs, both members of the closed `EmitPass` union.
+   The loop in `emitProgram` reads each row, refuses to run one whose
    prerequisites have not all run (`passNeedsMet`, an `emitFail` naming the reordered pass),
-   dispatches it by name (`runEmitPass`), and bumps `emitPassGen` (`memoPassAdvance`, `memo.vl`) so a cross-pass memo cannot
+   dispatches it through an exhaustive `match` (`runEmitPass`), and bumps `emitPassGen` (`memoPassAdvance`, `memo.vl`) so a cross-pass memo cannot
    outlive the row that filled it. The order is **not** grouped by kind. Rewrites
    (`loopValueRewrite`, `dispatchRewrite`, `captureBoxRewrite`, the `synth*` annotation passes)
    interleave with the collect passes (`collectU`, `collectS`, `collectA`, `collectFns`,
@@ -492,7 +493,6 @@ line in the PR that closes it. The order in which they are closed is
 | §4.3 | The seven quiet probes share one `checkRollback` and each site names its own family set; the census finds only `cstrProbeBefore`'s constraint rows left, which it keeps by design (D3062). Of the 104 keyed maps a probe writes, `tpIfJoinAt`, `tpIfOkAt` and `dJoinRelayed` roll back through an undo log (`check_map_undo.vl`) and 29 more keep only entries no output reads. The other 72 are memos, solver results and declaration indices that a later pass reads after the rollback: restoring 67 of them at every rollback, in four groups, changes 3,292, 52, 1 and 1 of 16,534 programs (2026-10-24, `cfd99f293`; L4 log). | [L4](internals/code-quality-2026-10.md#L4) |
 | §3.3, §4.1 | Emitter registries are keyed by spelling: 56 module-scope `{[string]: i32}` maps against 41 `{[i32]: i32}` in `emit_*.vl` and `wasmEmit.vl`, and an inline union's registry row, its key (`canonUnionKeyOfName`) and its box tags are its name (`registerInlineUnionAt`, `mintInlineUnion`). Type equality has eight exported notions (`tyEq`, `tyEqSameHoles`, `tyEqNoneIsMap`, `tySame`, `tySameSet`, `tySameSpelled`, `tySameAnonRow`, `repCanonId`). The union-key licence is gated by `tests/vl_union_key_licence_test.ts`. | [L6](internals/code-quality-2026-10.md#L6) |
 | §4.7 | Expected types reach the expression emitter through module globals (the `pending*` seeds in `emit_state.vl`, and `pendingLitUnion`). Every boundary builds an `ExpCtx` and restores the caller's on every exit, and the globals are written only by `expCtxApply` and `expCtxReset`, except `collectA`'s reset of `pendingNulRefHeap`. | [L7](internals/code-quality-2026-10.md#L7) |
-| §2.4 | The emitter dispatches its pass table by string name through an if-ladder (`runEmitPass`). | [S-h](internals/code-quality-2026-10.md#small-items) |
 | §4.6 | On a development build the seed resolves from the working directory and std from the executable's tree. | owner ruling pending (September row 19, [status](internals/code-quality-2026-10.md#september-status)) |
 
 Two placements in §2 differ from how the phases are often described, and are the contract, not

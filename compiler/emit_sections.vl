@@ -6890,62 +6890,70 @@ function mapSetRowable(sh: i32): boolean {
 
 // ── emitProgram pass manager ──
 // The front half of `emitProgram` is a sequence of ordered passes over the arena. Each pass
-// table row is `"pass"` or `"pass > prereq prereq …"`, rows run top to bottom, and the driver
+// table row names its pass and the passes it needs, rows run top to bottom, and the driver
 // asserts every prerequisite has already run before dispatching — so a reordered table fails loudly instead of miscompiling.
 
-// True if `done` (the names of the passes run so far) contains the pass name
-// spelled at `needs[i..j)` — a membership test without building a substring.
-function passDoneHas(done: string[], needs: string, i: i32, j: i32) {
-  let d = 0
-  while d < done.length {
-    const nm = done[d]
-    if nm.length == j - i {
-      let k = 0
-      let same = true
-      while k < nm.length {
-        if nm[k] != needs[i + k] { same = false }
-        k = k + 1
-      }
-      if same { return true }
-    }
-    d = d + 1
-  }
-  false
-}
+// One pass-table row. A `#2` name is the re-run stage of the pass it shares a function with.
+type EmitPass = "deadTailDrop"
+  | "loopValueRewrite"
+  | "nulScalarSplit"
+  | "foldMemShared"
+  | "shadowRespell"
+  | "collectTyParams"
+  | "collectU"
+  | "collectS"
+  | "collectA"
+  | "assignValueSpill"
+  | "collectFns"
+  | "checkTopLevel"
+  | "buildFnMap"
+  | "computeVoidFns"
+  | "capNarrowBuild"
+  | "computeRetInference"
+  | "dispatchRewrite"
+  | "captureBoxRewrite"
+  | "synthRetAnnots"
+  | "synthNulListRetAnns"
+  | "synthDstPinAnns"
+  | "scanArrLitCommit"
+  | "monomorphize"
+  | "collectGenAliasShapes"
+  | "collectAnnShapes"
+  | "collectA#2"
+  | "collectArrNewFrames"
+  | "synthGlobalEmptyListAnns"
+  | "synthVoidTwins"
+  | "synthExternValues"
+  | "synthRecEqCores"
+  | "buildFnMap#2"
+  | "synthParamAnnots"
+  | "computeVoidFns#2"
+  | "capNarrowBuild#2"
+  | "synthCaptureReadAnns"
+  | "computeRetInference#2"
+  | "collectMapFilterUse"
+  | "collectFnValUse"
+  | "collectCloSigs"
+  | "initGuardScan"
+  | "scanPrintUse"
+  | "capCacheBuild"
+  | "synthCaptureEmptyListAnns"
+  | "auditRecordJoinLeaves"
+  | "scanExprArmLocals"
+  | "cloLiftScan"
 
-// True if every space-separated pass name in `needs` is present in `done`.
-function passNeedsMet(needs: string, done: string[]) {
-  let i = 0
-  while i < needs.length {
-    if needs[i] == 32 {
-      i = i + 1 // skip the separator (space)
-    } else {
-      let j = i
-      while j < needs.length && needs[j] != 32 { j = j + 1 }
-      if !passDoneHas(done, needs, i, j) { return false }
-      i = j
+type PassRow = { pass: EmitPass, needs: EmitPass[] }
+
+// True if every pass in `needs` is in `done`, the passes run so far.
+function passNeedsMet(needs: EmitPass[], done: EmitPass[]): boolean {
+  for n in needs {
+    let found = false
+    for d in done {
+      if d == n { found = true }
     }
+    if !found { return false }
   }
   true
-}
-
-// The pass NAME of a table row (`"buildFnMap#2 > monomorphize"` → `"buildFnMap#2"`):
-// the leading run up to the first space or `>`.
-function passRowName(row: string) {
-  let e = 0
-  while e < row.length && row[e] != 32 && row[e] != 62 { e = e + 1 }
-  const nm = row.slice(0, e)
-  nm
-}
-
-// The prerequisite list of a table row — everything after the `>` (`""` when the
-// row declares none). Space-separated pass names, consumed by `passNeedsMet`.
-function passRowNeeds(row: string) {
-  let g = 0
-  while g < row.length && row[g] != 62 { g = g + 1 }
-  if g >= row.length { return "" }
-  const nd = row.slice(g + 1, row.length)
-  nd
 }
 
 // A module with no functions and no start statements is a module (D1080). The identical file
@@ -7606,68 +7614,159 @@ function passKeepsCaptures(name: string): boolean {
   name == "capNarrowBuild" || name == "capNarrowBuild#2"
 }
 
-// Dispatch one pass-table row by name. Every pass returns an i32 status (< 0 =
+// Dispatch one pass-table row, exhaustively over `EmitPass`. Every pass returns an i32 status (< 0 =
 // failed emit). The `#2` rows are the explicit re-run stage — each branch calls
 // the same pass function a second time, post-monomorphization.
-function runEmitPass(name: string, stmts: i32[], rootIx: i32) {
-  if name == "foldMemShared" { return foldMemShared() }
-  if name == "deadTailDrop" { return deadTailDrop() }
-  if name == "loopValueRewrite" { return loopValueRewrite(rootIx) }
-  if name == "nulScalarSplit" { return nulScalarSplit(rootIx) }
-  if name == "collectTyParams" { return collectTyParamNames() }
-  if name == "collectU" { return collectU(stmts) }
-  if name == "collectS" { return collectS(stmts) }
-  if name == "collectA" { return collectA(stmts) }
-  if name == "shadowRespell" { return shadowRespell(stmts) }
-  if name == "assignValueSpill" { return assignValueSpill(stmts) }
-  if name == "collectFns" {
-    const nf = collectFns(stmts)
-    linkLiftNote()
-    return nf
+function runEmitPass(name: EmitPass, stmts: i32[], rootIx: i32): i32 {
+  match name {
+    "foldMemShared" => {
+      return foldMemShared()
+    }
+    "deadTailDrop" => {
+      return deadTailDrop()
+    }
+    "loopValueRewrite" => {
+      return loopValueRewrite(rootIx)
+    }
+    "nulScalarSplit" => {
+      return nulScalarSplit(rootIx)
+    }
+    "collectTyParams" => {
+      return collectTyParamNames()
+    }
+    "collectU" => {
+      return collectU(stmts)
+    }
+    "collectS" => {
+      return collectS(stmts)
+    }
+    "collectA" => {
+      return collectA(stmts)
+    }
+    "shadowRespell" => {
+      return shadowRespell(stmts)
+    }
+    "assignValueSpill" => {
+      return assignValueSpill(stmts)
+    }
+    "collectFns" => {
+      const nf = collectFns(stmts)
+      linkLiftNote()
+      return nf
+    }
+    "checkTopLevel" => {
+      return passCheckTopLevel()
+    }
+    "buildFnMap" => {
+      return buildFnMap(stmts)
+    }
+    "computeVoidFns" => {
+      return computeVoidFns()
+    }
+    "computeRetInference" => {
+      return computeRetInference()
+    }
+    "dispatchRewrite" => {
+      return dispatchRewrite(stmts)
+    }
+    "captureBoxRewrite" => {
+      return captureBoxRewrite(stmts)
+    }
+    "synthRetAnnots" => {
+      return synthRetAnnots()
+    }
+    "synthNulListRetAnns" => {
+      return synthNulListRetAnns()
+    }
+    "synthDstPinAnns" => {
+      return synthDstPinAnns(rootIx)
+    }
+    "scanArrLitCommit" => {
+      return scanArrLitCommit(rootIx)
+    }
+    "monomorphize" => {
+      fnFlowShadowBuild(stmts)
+      return monomorphize(stmts)
+    }
+    "collectGenAliasShapes" => {
+      return collectGenAliasShapes()
+    }
+    "collectAnnShapes" => {
+      return collectAnnShapes()
+    }
+    // Re-run stage: instance-pinned annotations minted during monomorphization (`Box<i32>`
+    // applications, structural returns) postdate the first arena scans, so this rescans them and
+    // refreshes the name→index tables that resolve against the struct table. All four are idempotent and usage-gated (no new `TypeRef` means no new shape means identical bytes).
+    "collectA#2" => {
+      return collectA(stmts)
+    }
+    "collectArrNewFrames" => {
+      return collectArrNewFrames()
+    }
+    "synthGlobalEmptyListAnns" => {
+      return synthGlobalEmptyListAnns()
+    }
+    "synthVoidTwins" => {
+      return synthVoidTwins(stmts)
+    }
+    "synthExternValues" => {
+      return synthExternValues()
+    }
+    "synthRecEqCores" => {
+      return synthRecEqCores()
+    }
+    "buildFnMap#2" => {
+      return buildFnMap(stmts)
+    }
+    "synthParamAnnots" => {
+      return synthParamAnnots()
+    }
+    "computeVoidFns#2" => {
+      return computeVoidFns()
+    }
+    "computeRetInference#2" => {
+      return computeRetInference()
+    }
+    "collectMapFilterUse" => {
+      return collectMapFilterUse()
+    }
+    "collectFnValUse" => {
+      return collectFnValUse()
+    }
+    "collectCloSigs" => {
+      return collectCloSigs()
+    }
+    "scanPrintUse" => {
+      return scanPrintUse()
+    }
+    "initGuardScan" => {
+      return initGuardScan()
+    }
+    "capCacheBuild" => {
+      return capCacheBuild()
+    }
+    "auditRecordJoinLeaves" => {
+      return auditRecordJoinLeaves()
+    }
+    "capNarrowBuild" => {
+      return capNarrowBuild()
+    }
+    "capNarrowBuild#2" => {
+      return capNarrowBuild()
+    }
+    "synthCaptureEmptyListAnns" => {
+      return synthCaptureEmptyListAnns()
+    }
+    "synthCaptureReadAnns" => {
+      return synthCaptureReadAnns()
+    }
+    "scanExprArmLocals" => {
+      return scanExprArmLocals()
+    }
+    "cloLiftScan" => {
+      return cloLiftScan()
+    }
   }
-  if name == "checkTopLevel" { return passCheckTopLevel() }
-  if name == "buildFnMap" { return buildFnMap(stmts) }
-  if name == "computeVoidFns" { return computeVoidFns() }
-  if name == "computeRetInference" { return computeRetInference() }
-  if name == "dispatchRewrite" { return dispatchRewrite(stmts) }
-  if name == "captureBoxRewrite" { return captureBoxRewrite(stmts) }
-  if name == "synthRetAnnots" { return synthRetAnnots() }
-  if name == "synthNulListRetAnns" { return synthNulListRetAnns() }
-  if name == "synthDstPinAnns" { return synthDstPinAnns(rootIx) }
-  if name == "scanArrLitCommit" { return scanArrLitCommit(rootIx) }
-  if name == "monomorphize" {
-    fnFlowShadowBuild(stmts)
-    return monomorphize(stmts)
-  }
-  if name == "collectGenAliasShapes" { return collectGenAliasShapes() }
-  if name == "collectAnnShapes" { return collectAnnShapes() }
-  // Re-run stage: instance-pinned annotations minted during monomorphization (`Box<i32>`
-  // applications, structural returns) postdate the first arena scans, so this rescans them and
-  // refreshes the name→index tables that resolve against the struct table. All four are idempotent and usage-gated (no new `TypeRef` means no new shape means identical bytes).
-  if name == "collectA#2" { return collectA(stmts) }
-  if name == "collectArrNewFrames" { return collectArrNewFrames() }
-  if name == "synthGlobalEmptyListAnns" { return synthGlobalEmptyListAnns() }
-  if name == "synthVoidTwins" { return synthVoidTwins(stmts) }
-  if name == "synthExternValues" { return synthExternValues() }
-  if name == "synthRecEqCores" { return synthRecEqCores() }
-  if name == "buildFnMap#2" { return buildFnMap(stmts) }
-  if name == "synthParamAnnots" { return synthParamAnnots() }
-  if name == "computeVoidFns#2" { return computeVoidFns() }
-  if name == "computeRetInference#2" { return computeRetInference() }
-  if name == "collectMapFilterUse" { return collectMapFilterUse() }
-  if name == "collectFnValUse" { return collectFnValUse() }
-  if name == "collectCloSigs" { return collectCloSigs() }
-  if name == "scanPrintUse" { return scanPrintUse() }
-  if name == "initGuardScan" { return initGuardScan() }
-  if name == "capCacheBuild" { return capCacheBuild() }
-  if name == "auditRecordJoinLeaves" { return auditRecordJoinLeaves() }
-  if name == "capNarrowBuild" { return capNarrowBuild() }
-  if name == "capNarrowBuild#2" { return capNarrowBuild() }
-  if name == "synthCaptureEmptyListAnns" { return synthCaptureEmptyListAnns() }
-  if name == "synthCaptureReadAnns" { return synthCaptureReadAnns() }
-  if name == "scanExprArmLocals" { return scanExprArmLocals() }
-  if name == "cloLiftScan" { return cloLiftScan() }
-  emitFail("emitProgram: unknown pass in the pass table: " + name)
 }
 
 // ── the sid-keyed table reset — paired with `symbols.sidReset` at every site ──
@@ -7850,50 +7949,197 @@ function emitProgramReset(rootIx: i32) {
   eqgCoresReset()
 }
 
-// The ordered pass table — see the pass-manager block comment above `passDoneHas` for the row
-// grammar. Each row's `>` dependency is an ordering edge, in three shapes: a pass that
+// The ordered pass table — see the pass-manager block comment above `EmitPass` for the row
+// grammar. Each row's `needs` entry is an ordering edge, in three shapes: a pass that
 // mutates the arena runs before every pass that scans it (`dispatchRewrite`,
 // `captureBoxRewrite`, the synth-annotation passes, `monomorphize`); a pass needing a final arena runs after all of them; and a `#2` row re-scans what monomorphization's late-minted annotations invalidated.
-function emitPassTable(): string[] {
-  const passTable = [
-    "deadTailDrop", "loopValueRewrite > deadTailDrop",
-    "nulScalarSplit > loopValueRewrite", "foldMemShared",
-    "shadowRespell > foldMemShared nulScalarSplit", "collectTyParams",
-    "collectU > collectTyParams", "collectS > collectU collectTyParams",
-    "collectA > collectS collectTyParams", "assignValueSpill > shadowRespell",
-    "collectFns > collectU collectS shadowRespell assignValueSpill",
-    "checkTopLevel > collectFns", "buildFnMap > collectFns",
-    "computeVoidFns > buildFnMap", "capNarrowBuild > buildFnMap",
-    "computeRetInference > buildFnMap computeVoidFns capNarrowBuild",
-    "dispatchRewrite > buildFnMap computeRetInference",
-    "captureBoxRewrite > collectFns", "synthRetAnnots > collectU buildFnMap",
-    "synthNulListRetAnns > collectFns computeRetInference",
-    "synthDstPinAnns > collectU buildFnMap dispatchRewrite",
-    "scanArrLitCommit > collectU buildFnMap synthDstPinAnns",
-    "monomorphize > dispatchRewrite captureBoxRewrite synthRetAnnots synthNulListRetAnns synthDstPinAnns scanArrLitCommit",
-    "collectGenAliasShapes > monomorphize", "collectAnnShapes > monomorphize",
-    "collectA#2 > collectGenAliasShapes collectAnnShapes",
-    "collectArrNewFrames > collectA#2 collectFns monomorphize",
-    "synthGlobalEmptyListAnns > collectA#2 collectFns",
-    "synthVoidTwins > collectFns monomorphize",
-    "synthExternValues > collectFns monomorphize",
-    "synthRecEqCores > collectA#2 collectFns monomorphize",
-    "buildFnMap#2 > monomorphize collectA#2 synthVoidTwins synthExternValues synthRecEqCores",
-    "synthParamAnnots > monomorphize buildFnMap#2",
-    "computeVoidFns#2 > synthParamAnnots",
-    "capNarrowBuild#2 > synthParamAnnots",
-    "synthCaptureReadAnns > synthParamAnnots",
-    "computeRetInference#2 > synthParamAnnots computeVoidFns#2 capNarrowBuild#2 synthCaptureReadAnns",
-    "collectMapFilterUse > synthParamAnnots computeRetInference#2",
-    "collectFnValUse > synthParamAnnots computeRetInference#2",
-    "collectCloSigs > collectMapFilterUse collectFnValUse",
-    "initGuardScan > monomorphize synthParamAnnots synthVoidTwins synthExternValues synthRecEqCores",
-    "scanPrintUse > monomorphize synthParamAnnots initGuardScan",
-    "capCacheBuild > monomorphize synthParamAnnots",
-    "synthCaptureEmptyListAnns > collectA#2 capCacheBuild",
-    "auditRecordJoinLeaves > collectA#2 buildFnMap#2 capCacheBuild",
-    "scanExprArmLocals > monomorphize synthParamAnnots synthVoidTwins synthExternValues synthRecEqCores",
-    "cloLiftScan > capCacheBuild scanExprArmLocals",
+function emitPassTable(): PassRow[] {
+  const passTable: PassRow[] = [
+    { pass: "deadTailDrop", needs: [] },
+    {
+      pass: "loopValueRewrite",
+      needs: ["deadTailDrop"],
+    },
+    {
+      pass: "nulScalarSplit",
+      needs: ["loopValueRewrite"],
+    },
+    { pass: "foldMemShared", needs: [] },
+    {
+      pass: "shadowRespell",
+      needs: ["foldMemShared", "nulScalarSplit"],
+    },
+    { pass: "collectTyParams", needs: [] },
+    { pass: "collectU", needs: ["collectTyParams"] },
+    {
+      pass: "collectS",
+      needs: ["collectU", "collectTyParams"],
+    },
+    {
+      pass: "collectA",
+      needs: ["collectS", "collectTyParams"],
+    },
+    {
+      pass: "assignValueSpill",
+      needs: ["shadowRespell"],
+    },
+    {
+      pass: "collectFns",
+      needs: [
+        "collectU", "collectS", "shadowRespell", "assignValueSpill",
+      ],
+    },
+    { pass: "checkTopLevel", needs: ["collectFns"] },
+    { pass: "buildFnMap", needs: ["collectFns"] },
+    { pass: "computeVoidFns", needs: ["buildFnMap"] },
+    { pass: "capNarrowBuild", needs: ["buildFnMap"] },
+    {
+      pass: "computeRetInference",
+      needs: [
+        "buildFnMap", "computeVoidFns", "capNarrowBuild",
+      ],
+    },
+    {
+      pass: "dispatchRewrite",
+      needs: ["buildFnMap", "computeRetInference"],
+    },
+    {
+      pass: "captureBoxRewrite",
+      needs: ["collectFns"],
+    },
+    {
+      pass: "synthRetAnnots",
+      needs: ["collectU", "buildFnMap"],
+    },
+    {
+      pass: "synthNulListRetAnns",
+      needs: ["collectFns", "computeRetInference"],
+    },
+    {
+      pass: "synthDstPinAnns",
+      needs: ["collectU", "buildFnMap", "dispatchRewrite"],
+    },
+    {
+      pass: "scanArrLitCommit",
+      needs: ["collectU", "buildFnMap", "synthDstPinAnns"],
+    },
+    {
+      pass: "monomorphize",
+      needs: [
+        "dispatchRewrite", "captureBoxRewrite", "synthRetAnnots",
+        "synthNulListRetAnns", "synthDstPinAnns", "scanArrLitCommit",
+      ],
+    },
+    {
+      pass: "collectGenAliasShapes",
+      needs: ["monomorphize"],
+    },
+    {
+      pass: "collectAnnShapes",
+      needs: ["monomorphize"],
+    },
+    {
+      pass: "collectA#2",
+      needs: ["collectGenAliasShapes", "collectAnnShapes"],
+    },
+    {
+      pass: "collectArrNewFrames",
+      needs: ["collectA#2", "collectFns", "monomorphize"],
+    },
+    {
+      pass: "synthGlobalEmptyListAnns",
+      needs: ["collectA#2", "collectFns"],
+    },
+    {
+      pass: "synthVoidTwins",
+      needs: ["collectFns", "monomorphize"],
+    },
+    {
+      pass: "synthExternValues",
+      needs: ["collectFns", "monomorphize"],
+    },
+    {
+      pass: "synthRecEqCores",
+      needs: ["collectA#2", "collectFns", "monomorphize"],
+    },
+    {
+      pass: "buildFnMap#2",
+      needs: [
+        "monomorphize", "collectA#2", "synthVoidTwins", "synthExternValues",
+        "synthRecEqCores",
+      ],
+    },
+    {
+      pass: "synthParamAnnots",
+      needs: ["monomorphize", "buildFnMap#2"],
+    },
+    {
+      pass: "computeVoidFns#2",
+      needs: ["synthParamAnnots"],
+    },
+    {
+      pass: "capNarrowBuild#2",
+      needs: ["synthParamAnnots"],
+    },
+    {
+      pass: "synthCaptureReadAnns",
+      needs: ["synthParamAnnots"],
+    },
+    {
+      pass: "computeRetInference#2",
+      needs: [
+        "synthParamAnnots", "computeVoidFns#2", "capNarrowBuild#2",
+        "synthCaptureReadAnns",
+      ],
+    },
+    {
+      pass: "collectMapFilterUse",
+      needs: ["synthParamAnnots", "computeRetInference#2"],
+    },
+    {
+      pass: "collectFnValUse",
+      needs: ["synthParamAnnots", "computeRetInference#2"],
+    },
+    {
+      pass: "collectCloSigs",
+      needs: ["collectMapFilterUse", "collectFnValUse"],
+    },
+    {
+      pass: "initGuardScan",
+      needs: [
+        "monomorphize", "synthParamAnnots", "synthVoidTwins",
+        "synthExternValues", "synthRecEqCores",
+      ],
+    },
+    {
+      pass: "scanPrintUse",
+      needs: [
+        "monomorphize", "synthParamAnnots", "initGuardScan",
+      ],
+    },
+    {
+      pass: "capCacheBuild",
+      needs: ["monomorphize", "synthParamAnnots"],
+    },
+    {
+      pass: "synthCaptureEmptyListAnns",
+      needs: ["collectA#2", "capCacheBuild"],
+    },
+    {
+      pass: "auditRecordJoinLeaves",
+      needs: ["collectA#2", "buildFnMap#2", "capCacheBuild"],
+    },
+    {
+      pass: "scanExprArmLocals",
+      needs: [
+        "monomorphize", "synthParamAnnots", "synthVoidTwins",
+        "synthExternValues", "synthRecEqCores",
+      ],
+    },
+    {
+      pass: "cloLiftScan",
+      needs: ["capCacheBuild", "scanExprArmLocals"],
+    },
   ]
   // synthVoidTwins mints the void twins for coerced function VALUES — after
   // mono (`fnStmts` positions are final; the twin table stores them) and
@@ -7916,12 +8162,12 @@ function runEmitPasses(stmts: i32[], rootIx: i32): i32 {
   callBindShadowBegin()
   fnFlowShadowBegin()
   identAuditBegin()
-  const passDone: string[] = []
+  const passDone: EmitPass[] = []
   let pi = 0
   while pi < passTable.length {
     const prow = passTable[pi]
-    const pname = passRowName(prow)
-    if !passNeedsMet(passRowNeeds(prow), passDone) {
+    const pname = prow.pass
+    if !passNeedsMet(prow.needs, passDone) {
       return emitFail(
         "emitProgram: pass "
           + pname

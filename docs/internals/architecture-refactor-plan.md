@@ -28,9 +28,9 @@ stage 3, whose name rungs are deleted (D6950 closed) and whose field rung stays;
 `checkFnParams` pass row is deleted (#4682) and whose `emitFail` sites remain; L6's render-parse
 readers (58 / 117, floor 21 / 22), with the name-dispatch switch paused; L9's D1; and S5's
 artifact steps. Waiting: L3's family (d) on SC, and S-g on SC. S-c's `Tok` row and the host's
-named exit codes are done; S-h's closed `EmitPass` dispatch waits on registering the union in
-`compiler/lint.vl`'s ladder sets; the other SMALL rows are partial. RepDesc is ruled.
-ARCHITECTURE.md §7 has 8 rows, measured at `bc8b191a4`.
+named exit codes are done, and so is S-h's closed `EmitPass` dispatch (registered in
+`compiler/lint.vl`'s ladder sets); the other SMALL rows are partial. RepDesc is ruled.
+ARCHITECTURE.md §7 has 7 rows (8 at `bc8b191a4`, less S-h).
 
 | item | state | where |
 | --- | --- | --- |
@@ -1584,6 +1584,7 @@ One bullet per step or PR, oldest first. Append at the end of a lane's log; do n
 - **S-a, S-b, S-d … S-n**: S-k is superseded by the no-Python direction.
 - **S-a, S-b, S-d … S-n**: 2026-10-17. S-l was already done by #3731 and S-n by #3739. S-e row 2 is the `literal-byte-write` budget rule (#3989, baseline 274). S-i row 2: `engineFailOffset` moved to the leaf `compiler/engine_msg.vl`, and one table, `tests/fixtures/engine-fail-offset.txt`, now tests both it and its Rust twin; against master's parser the table fails on 6 cases, which are now aligned. S-m: the tests use `std:str` instead of `std:seed`, and `casesWasmOracle.ts` uses `isStdKey`. Dropping `std:seed` waits on OPEN-QUESTIONS Q14. Hex is filed as `std-hex-parse-format` in `open-rulings.md`.
 - **S-a, S-b, S-d … S-n**: 2026-10-24. The host names every exit code it uses (`EXIT_FAILED` 1, `EXIT_USAGE` 2, beside `EXIT_COMPILER_BUG` 70), and `tests/cli_host_tables_test.ts` holds each to `cli.vl`'s const of the same name and refuses a bare `process::exit(<n>)`. With S-c's `Tok`, at `80a54c99a`: a double refresh gives the same seed, difftree `--identity` 0 differ over 11,684 builds, the candidate compiles master's source to master's fixpoint, L2 fuel 74,147,037,863 → 73,808,736,823 (−0.46%) with the same input under both compilers at 74,147,037,863, seed 5,786,238 bytes on both sides. S-h's closed `EmitPass` dispatch was built and is held back: `scripts/ladder-sets.vl` requires the new union in `compiler/lint.vl`'s ladder sets.
+- **S-a, S-b, S-d … S-n**: 2026-10-24. ARCHITECTURE §7's S-h row is closed: the emit pass table is `PassRow` records over the closed `EmitPass` union, and `runEmitPass` is an exhaustive `match`, so a misspelled or missing pass fails `vl check`. `EmitPass` is a closed set of the ladder lint (`klSetNames`, `klFieldNames` for `pass` and `needs`), and `scripts/ladder-sets.vl` reads 24 sets and 18 fields. The seed is not byte-identical (5,785,546 → 5,783,608 bytes).
 
 ### RepDesc log
 
