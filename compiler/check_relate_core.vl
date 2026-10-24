@@ -410,6 +410,7 @@ import {
   TyPrim,
   TyUnion,
   TyVar,
+  cTyIxSetHas,
   cUserTypes,
   cUserTypesVer,
   cVariantMemberTyIxSet,
@@ -421,6 +422,7 @@ import {
   gaAppHeads,
   gaAppTyIxSet,
   gaAppTyIxs,
+  genAppRowOf,
   litBaseTy,
   litMemberTy,
   mkArrayTy,
@@ -441,6 +443,7 @@ import {
   tyArrayElemIx,
   tyAt,
   tyBearsNull,
+  tyEq,
   tyEqSameHoles,
   tyFieldTyOf,
   tyHasHole,
@@ -6202,6 +6205,115 @@ function substHoleTyReal(tyIx: i32, bNames: string[], bTys: i32[]) {
   -1
 }
 
+// Whether `bindGenWalk` also binds through unions and generic-application arguments, for
+// `bindGenWalkFull`.
+let bgFull = false
+
+// `bindGenWalk` with two more arms at every depth: a union's one open member binds to the
+// argument's members no concrete member is (`T | string` at `i32 | string` binds `T` to `i32`),
+// and an application binds its arguments pairwise (`Rows<A>` at `Rows<i32>`, a phantom `A` too).
+export function bindGenWalkFull(
+  expIx: i32,
+  atIx: i32,
+  bNames: string[],
+  bTys: i32[],
+) {
+  const was = bgFull
+  bgFull = true
+  bindGenWalk(expIx, atIx, bNames, bTys)
+  bgFull = was
+  0
+}
+
+// Binds generic application `expIx`'s arguments to `atIx`'s where both apply one head. 0.
+function bindGenAppArgs(expIx: i32, atIx: i32, bNames: string[], bTys: i32[]) {
+  if !cTyIxSetHas(gaAppTyIxSet, expIx) || !cTyIxSetHas(gaAppTyIxSet, atIx) {
+    return 0
+  }
+  const er = genAppRowOf(expIx)
+  const ar = genAppRowOf(atIx)
+  if er < 0 || ar < 0 || gaAppHeads[er] != gaAppHeads[ar] { return 0 }
+  const cn = gaAppArgCount[er]
+  if gaAppArgCount[ar] != cn { return 0 }
+  let i = 0
+  while i < cn {
+    bindGenWalk(
+      gaAppArgFlat[gaAppArgStart[er] + i],
+      gaAppArgFlat[gaAppArgStart[ar] + i],
+      bNames,
+      bTys,
+    )
+    i = i + 1
+  }
+  0
+}
+
+// The union arm of `bindGenWalkFull`, false when `expIx` is no union: one open member binds the
+// members no other `tyEq`s (not `bindGenUnionArm`'s assignability, which an exact pin cannot
+// take), or the whole argument when every member or none is; else equal counts pair by
+// position. A map member never takes `null`, which a narrowing keeps beside it.
+function bindGenUnionRest(
+  expIx: i32,
+  atIx: i32,
+  bNames: string[],
+  bTys: i32[],
+): boolean {
+  const e = tyAt(expIx)
+  if !(e is TyUnion) && !(e is TyNullable) { return false }
+  const pms: i32[] = []
+  flattenVariantsInto(expIx, pms)
+  const ams: i32[] = []
+  flattenVariantsInto(atIx, ams)
+  let open = -1
+  let opens = 0
+  let i = 0
+  while i < pms.length {
+    if pms[i] >= 0 && tyHasTyVar(pms[i]) {
+      open = i
+      opens = opens + 1
+    }
+    i = i + 1
+  }
+  if opens == 1 && !bgMembersAlign(pms, ams, open) {
+    const mapOpen = tyAt(pms[open]) is TyMap
+    const rest: i32[] = []
+    let k = 0
+    while k < ams.length {
+      let covered = mapOpen && ams[k] == TY_NULL
+      let m = 0
+      while m < pms.length && !covered {
+        if m != open && tyEq(pms[m], ams[k]) { covered = true }
+        m = m + 1
+      }
+      if !covered { rest.push(ams[k]) }
+      k = k + 1
+    }
+    let r = atIx
+    if rest.length > 0 && rest.length < ams.length { r = tyOfMembers(rest) }
+    bindGenWalk(pms[open], r, bNames, bTys)
+    return true
+  }
+  if pms.length == ams.length {
+    let j = 0
+    while j < pms.length {
+      bindGenWalk(pms[j], ams[j], bNames, bTys)
+      j = j + 1
+    }
+  }
+  true
+}
+
+// Whether pairing `pms` with `ams` by position meets every member but `open` with an equal one.
+function bgMembersAlign(pms: i32[], ams: i32[], open: i32): boolean {
+  if pms.length != ams.length { return false }
+  let i = 0
+  while i < pms.length {
+    if i != open && !tyEq(pms[i], ams[i]) { return false }
+    i = i + 1
+  }
+  true
+}
+
 // Generic call-site binding, deep: walks an expected parameter type against the argument's
 // actual type and binds every `TyVar` leaf on first use. Later uses are checked by the caller
 // against the substituted expected type, so disagreeing uses still error. Nested positions
@@ -6232,7 +6344,10 @@ export function bindGenWalk(
   bgSrcStackPush(expIx)
   bgDstStackPush(atIx)
   const a = tyAt(atIx)
-  if e is TyArray {
+  if bgFull { bindGenAppArgs(expIx, atIx, bNames, bTys) }
+  if bgFull && bindGenUnionRest(expIx, atIx, bNames, bTys) {
+    // The union arm bound the open member, or paired the members.
+  } else if e is TyArray {
     if a is TyArray { bindGenWalk(e.aElem, a.aElem, bNames, bTys) }
   } else if e is TyNullable {
     if a is TyNullable { bindGenWalk(e.nInner, a.nInner, bNames, bTys) }

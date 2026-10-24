@@ -77,6 +77,7 @@ import {
   bindGenFnRetUnionArm,
   bindGenUnionArm,
   bindGenWalk,
+  bindGenWalkFull,
   genFnHoleBodyRet,
   holeFnArgDecls,
   holeFnArgRetAtParams,
@@ -120,6 +121,7 @@ import {
   TY_BOOL,
   TY_F64,
   TY_I32,
+  TY_NEVER,
   TY_NULL,
   TY_VOID,
   Ty,
@@ -166,6 +168,7 @@ import {
   tySame,
   tyScalarBasePrim,
   tyToEmitName,
+  tyToNominalName,
   tyToStr,
   tyToStructStr,
   tyVarRenameRow,
@@ -2639,10 +2642,7 @@ function monoBindCols(
     if pp is Param {
       let at = -1
       if bi < tyCol.length { at = tyCol[bi] }
-      let decl = nodeTyIxOf(pp.parType)
-      if bi < declTys.length && declTys[bi] >= 0 && !tyHasTyVar(decl) {
-        decl = declTys[bi]
-      }
+      const decl = monoParamPatTy(params, bi, declTys)
       if pp.parType < 0 {
         if (
           at >= 0
@@ -2661,10 +2661,7 @@ function monoBindCols(
   while ui < params.length && ui < tyCol.length {
     const up = nodeAt(params[ui])
     if up is Param {
-      let ud = nodeTyIxOf(up.parType)
-      if ui < declTys.length && declTys[ui] >= 0 && !tyHasTyVar(ud) {
-        ud = declTys[ui]
-      }
+      const ud = monoParamPatTy(params, ui, declTys)
       monoBindBareUnionArm(ud, tyCol[ui], bN, bT)
       monoBindInnerUnionArms(ud, tyCol[ui], bN, bT, 0)
     }
@@ -2807,14 +2804,33 @@ function monoBindBareUnionArm(decl: i32, at: i32, bN: string[], bT: i32[]) {
 // scope-blind rename and by a diagonal instance, so a type parameter shadowing a declared
 // name reads as one only here.
 function monoDeclParamTys(origFe: i32, n: i32): i32[] {
+  if origFe < 0 || origFe >= monoOrigNode.length { return [] }
+  monoDeclParamTysOf(monoOrigNode[origFe], n)
+}
+
+// `monoDeclParamTys` of the generic declared at node `decl`.
+function monoDeclParamTysOf(decl: i32, n: i32): i32[] {
   const out: i32[] = []
-  if origFe < 0 || origFe >= monoOrigNode.length { return out }
-  const sig = nodeTyIxOf(monoOrigNode[origFe])
+  if decl < 0 { return out }
+  const sig = nodeTyIxOf(decl)
   if sig < 0 || sig >= T.tys.length { return out }
   const ft = tyAt(sig)
   if !(ft is TyFunc) || ft.fnParamTypes.length != n { return out }
   for pt in ft.fnParamTypes { out.push(pt) }
   out
+}
+
+// Parameter `i`'s type as a binding pattern: its annotation's, unless that names no type
+// parameter and the signature's (`declTys`, from `monoDeclParamTys`) is known. -1 when neither is.
+function monoParamPatTy(params: i32[], i: i32, declTys: i32[]): i32 {
+  if i < 0 || i >= params.length { return -1 }
+  const p = nodeAt(params[i])
+  if !(p is Param) { return -1 }
+  const pt = nodeTyIxOf(p.parType)
+  if i < declTys.length && declTys[i] >= 0 && !tyHasTyVar(pt) {
+    return declTys[i]
+  }
+  pt
 }
 
 // Whether the generic being instantiated declares a lambda. A lambda reading a `(T | null)[]`
@@ -21261,7 +21277,13 @@ function monoPreBindPastUnionRest(
   while j < anns.length {
     if anns[j] != "" && acts[j] != "" {
       if !monoPinDefers(dts[j], ats[j], typarams) {
-        monoBindFromAnn(anns[j], acts[j], typarams, tvN, tvV)
+        let pt = -1
+        if j < decl.length { pt = decl[j] }
+        if pt < 0 {
+          const pp = nodeAt(params[j])
+          if pp is Param { pt = nodeTyIxOf(pp.parType) }
+        }
+        monoBindArenaFull(pt, ats[j], typarams, tvN, tvV)
       }
     }
     j = j + 1
@@ -21408,19 +21430,6 @@ function monoParamIsTyParamList(pIx: i32, typarams: string[]): boolean {
       && monoAnnHasTyParam(ann, typarams)
   }
   false
-}
-
-// What a pattern `ann` riding an object shape binds against for argument `argIx` pinned `anC`:
-// the argument's own type spelled by its fields where `anC` is a declared name, which a shape
-// pattern cannot pair fields with (D3674). The arena type, not the name, since a field-set scan
-// can name a record the argument is not (D3146). `anC` everywhere else.
-function monoArgBindSpelling(ann: string, anC: string, argIx: i32): string {
-  if ann.indexOf("{") < 0 || anC.indexOf("{") >= 0 || anC.indexOf("#") >= 0 {
-    return anC
-  }
-  const sp = tyToEmitName(nodeTyIxOf(unwrapParen(argIx)))
-  if sp == "" || sp.indexOf("{") < 0 { return anC }
-  sp
 }
 
 // The one place a generic `argIx` handed to hole `pIx` of call `callIx` gets its signature: the
@@ -23067,8 +23076,9 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
 
       // The gate keeps the order change inert: where the argument is a concrete function
       // the two orders agree, so they differ only when one answer is a type variable.
+      const declTys = monoDeclParamTys(origFe, params.length)
       if monoCallGenFnToTyParamArrow(params, args, fn.fnTyParams, ctx) {
-        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV)
+        monoPreBindNonArrowArgs(fn, params, args, ctx, tvN, tvV, declTys)
       }
       monoPreBindPastEmptyLit(params, args, fn.fnTyParams, ctx, tvN, tvV)
       if monoTwoListArgFail(fn, params, args, ctx) < 0 { return -1 }
@@ -23079,7 +23089,7 @@ function monoInstantiateCall(origFe: i32, callIx: i32, ctx: i32) {
         ctx,
         tvN,
         tvV,
-        monoDeclParamTys(origFe, params.length),
+        declTys,
       )
       monoDefaultTyParamsOnlyGenFns(fn, params, args, ctx, tvN, tvV)
       let oDecl = -1
@@ -23178,6 +23188,7 @@ function monoPreBindNonArrowArgs(
   ctx: i32,
   tvN: string[],
   tvV: string[],
+  declTys: i32[],
 ) {
   let pb = 0
   while pb < args.length {
@@ -23197,10 +23208,13 @@ function monoPreBindNonArrowArgs(
           && !monoLitHoldsGenericFn(args[pb], 0)
         ) {
           if monoAnnHasTyParam(pbAnn, fn.fnTyParams) {
-            const pbConc = monoArgPinName(args[pb], ctx)
-            if pbConc != "" {
-              monoBindFromAnn(pbAnn, pbConc, fn.fnTyParams, tvN, tvV)
-            }
+            monoBindArenaFull(
+              monoParamPatTy(params, pb, declTys),
+              monoExactPinTyOf(monoArgPinTyIx(args[pb], ctx), ctx),
+              fn.fnTyParams,
+              tvN,
+              tvV,
+            )
           }
         }
       }
@@ -23485,6 +23499,7 @@ function monoPinAnnotatedParam(
         tvV,
         pinned,
         pinTys,
+        decl,
       )
       if cr < 0 { return cr }
     } else {
@@ -23638,6 +23653,99 @@ function monoBindArenaWalk(
   const rT: i32[] = []
   bindGenWalk(pt, at, rN, rT)
   monoPushPins(rN, rT, typarams, tvN, tvV)
+}
+
+// The pin spelling of `t` a typed binding takes: a declared record or union by its name, as the
+// written annotation would spell it, so `Tbl<Tex>` and a `@flat` row keep their identity; a list
+// or literal union as `monoPinAnnSpelling` spells it.
+function monoPinNominalSpelling(t: i32): string {
+  if t < 0 || t >= T.tys.length || tyAt(t) is TyArray || tyIsLitUnion(t) {
+    return monoPinAnnSpelling(t)
+  }
+  const tw = monoFnFieldTwinRow.get(t) ?? ""
+  if tw != "" { return tw }
+  const nm = tyToNominalName(t)
+  if nm != "" { return nm }
+  monoPinAnnSpelling(t)
+}
+
+// The closed type of the annotation, written or pinned (`monoPinListElems`), on the `let` the
+// name `ax` reads, where the read itself keeps the open type its initializer gave it; -1 when
+// `ax` is no such read.
+function monoLetAnnTyOf(ax: i32): i32 {
+  const a = unwrapParen(ax)
+  if a < 0 || !(nodeAt(a) is Ident) { return -1 }
+  const d = identDeclOf(a)
+  if d < 0 || d >= P.nodes.length { return -1 }
+  const dn = nodeAt(d)
+  if !(dn is LetDecl) || dn.letType < 0 { return -1 }
+  const t = nodeTyIxOf(dn.letType)
+  if t < 0 || t >= T.tys.length || tyHasTyVar(t) { return -1 }
+  t
+}
+
+// `monoBindArenaFull` of list parameter `pt` at a list literal `ax` whose own type is still open
+// (`[xs[0], inc]` at `((U) => U)[]`): each closed element's type binds the element pattern in
+// turn, so `inc` binds `U` where the open read cannot. 0.
+function monoBindListLitElems(
+  pt: i32,
+  ax: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  const a = unwrapParen(ax)
+  if pt < 0 || pt >= T.tys.length || a < 0 || !(tyAt(pt) is TyArray) {
+    return 0
+  }
+  const an = nodeAt(a)
+  if !(an is ArrayLit) { return 0 }
+  const pe = tyArrayElemIx(pt)
+  let k = 0
+  while k < an.arrElems.length {
+    const el = an.arrElems[k]
+    if el >= 0 && !(nodeAt(el) is Spread) {
+      const et = nodeTyIxOf(unwrapParen(el))
+      if et >= 0 && !tyHasTyVar(et) {
+        monoBindArenaFull(pe, et, typarams, tvN, tvV)
+      }
+    }
+    k = k + 1
+  }
+  0
+}
+
+// `monoBindArenaWalk` through unions and generic-application arguments as well
+// (`bindGenWalkFull`): the binding of declared parameter type `pt` at argument type `at`, each
+// pin spelled by `monoPinNominalSpelling`. A parameter bound to `never` takes `void`, as a
+// `never` function value lowers. 0.
+function monoBindArenaFull(
+  pt: i32,
+  at: i32,
+  typarams: string[],
+  tvN: string[],
+  tvV: string[],
+) {
+  if pt < 0 || at < 0 || at >= T.tys.length { return 0 }
+  const rN: string[] = []
+  const rT: i32[] = []
+  bindGenWalkFull(pt, at, rN, rT)
+  let k = 0
+  while k < rN.length {
+    // arena-tick exempt: `rT` is this call's own binding list, read by no rebuild pass.
+    if rT[k] == TY_NEVER { rT[k] = TY_VOID }
+    if strListHas(typarams, rN[k]) && monoBindOf(tvN, tvV, rN[k]) == "" {
+      if !tyHasTyVar(rT[k]) {
+        const sp = monoPinNominalSpelling(rT[k])
+        if sp != "" {
+          tvN.push(rN[k])
+          tvV.push(sp)
+        }
+      }
+    }
+    k = k + 1
+  }
+  0
 }
 
 // `monoBindArenaWalk` for the union arms inside `pt`'s lists, nullables, fields and map values
@@ -23821,6 +23929,7 @@ function monoPinTyParamComposite(
   tvV: string[],
   pinned: string[],
   pinTys: i32[],
+  decl: i32,
 ): i32 {
   // A function-type param (`f: (A, T) => A`) binds from the closure
   // argument's function-type name; any other composite (`Box<T>`, `{a:T}`)
@@ -23879,11 +23988,18 @@ function monoPinTyParamComposite(
     }
   }
   // A read out of a list its pin annotated, at any depth, takes the element type (D10310).
+  let atTy = monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx)
   if annFnSlot && anC == "" {
     const rowTy: i32[] = [0 - 1]
     anC = monoPinnedListElemPin(args[i], rowTy)
+    if anC != "" && rowTy[0] >= 0 { atTy = rowTy[0] }
   }
   if anC == "" { return monoArgTyFail(p.parName, fn.fnName) }
+  const patTy = monoParamPatTy(
+    params,
+    i,
+    monoDeclParamTysOf(decl, params.length),
+  )
   monoBindInnerArmPins(
     nodeTyIxOf(p.parType),
     monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx),
@@ -23891,22 +24007,11 @@ function monoPinTyParamComposite(
     tvN,
     tvV,
   )
-  monoBindFromAnn(
-    ann,
-    monoArgBindSpelling(ann, anC, args[i]),
-    fn.fnTyParams,
-    tvN,
-    tvV,
-  )
-  // A function value pins at its signature key, which spells no type the pattern can pair
-  // with, so the arena types unify what the spelling left open (`((T) => T) | null`, D9820).
-  monoBindArenaWalk(
-    nodeTyIxOf(p.parType),
-    monoExactPinTyOf(monoArgPinTyIx(args[i], ctx), ctx),
-    fn.fnTyParams,
-    tvN,
-    tvV,
-  )
+  monoBindArenaFull(patTy, atTy, fn.fnTyParams, tvN, tvV)
+  if tyHasTyVar(atTy) {
+    monoBindArenaFull(patTy, monoLetAnnTyOf(args[i]), fn.fnTyParams, tvN, tvV)
+    monoBindListLitElems(patTy, args[i], fn.fnTyParams, tvN, tvV)
+  }
   if monoAnnIsUnion(p.parType) {
     monoDefaultAnnTyParams(
       ann,
