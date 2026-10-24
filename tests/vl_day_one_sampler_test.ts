@@ -22,6 +22,7 @@
 //
 // @test-timing instrument
 
+import { builtScript } from "./support/builtScript.ts";
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const SAMPLE = `${ROOT}/scripts/day-one/sample.vl`;
@@ -34,7 +35,7 @@ if (GATED && !ENABLED) {
 
 const vlRun = async (script: string, args: string[]): Promise<{ code: number; out: string }> => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
-    args: ["run", script, "--compiler", COMPILER, "--", ...args, "--compiler", COMPILER],
+    args: ["run", await builtScript(script, { cwd: ROOT }), "--", ...args, "--compiler", COMPILER],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",
