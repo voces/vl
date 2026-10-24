@@ -123,7 +123,7 @@ the slice retires.
 | A2 | emit_mono typed tests (landed: 3 retired, 1 to B, 5 left) | 5 | 2 / 3 / 0 | 0 / 5 | `emit_mono` |
 | A3 | emit_collect / emit_classify typed rungs (landed: 7 retired, 5 left) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
-| A5 | union-atom and atom-kind twins (landed: 4 retired, 8 left; the 3 `emit_base` entries re-probed after C1 and left, again after `unionTakesAtomAsStrOf` was deleted, and again after the coerce gate asked the target's type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
+| A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
@@ -227,7 +227,7 @@ What each slice changes:
   The two ref-array arm tests ask the element union row's `unionMemberTysOf` members.
   `unionHasCollapsedStringMapArm` is deleted with its caller block, which an armed probe reached
   in 0 files. A probe over every `tests/**/*.vl` and the distilled corpus found 0 differing
-  files for each retired site. Eight stay:
+  files for each retired site. Six stay:
   - `valueAtomKindOfTy`'s fallback answers declined shapes, and some of those no file reaches.
   - `mapAnnShape`'s value spelling also keys the D8 mv-slot lookups.
   - The two closure-result walkers intern by spelling (`mvShapeOfMapName`, `ensureRefElem`),
@@ -235,37 +235,31 @@ What each slice changes:
     to rebuild the key. They wait on D8's mv slot and D1's ref-list slot keyed by type.
   - `monoStaticIsResult`'s typed compare answers differently in 2 files. Re-probed after C1
     step 3: the spelling compare was reached in 58 files and was never true.
-  - The three `emit_base` entries, re-probed after C1. Two of `unionTakesAtomAsStr`'s seven
-    callers now ask types, with 0 differing files: the inferred return reads
-    `inferRetTyIxOf`, and the `(A | B)[]` binding reads its annotation's element type. The
-    coerce gates (`unionTakesAtomAsStr`, `unionHasValueAtom`) agree with a walk of the target's
-    interned set wherever one exists. In 23 files the target has no row or set, and
-    `emitUnionCoerce` holds only its name. The param, assignment, `??` and `if`-join callers
-    each differ from `tyTakesAtomAsStr` in one file. `unionTakesAtomAsStrOf` is deleted: its
-    three `wasmEmit` callers ask `msSetTakesAtomAsStr` of the row's interned set (11, 10 and 64
-    files, 0 differed; the 4 with no set answered false both ways), and difftree `--identity`
-    found 0 of 16,523 files differ. The coerce gate no longer calls it, which leaves four
-    callers, so both of its entries stay:
+  - `atomsHaveValueAtom` (`unionHasValueAtom`'s parse of the row's atoms) in `emit_base`.
+    `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` are deleted. Their callers went over in
+    steps, each probed old against new over `tests/**`, the distilled corpus and the
+    self-compile:
+    - The inferred return reads `inferRetTyIxOf`, and the `(A | B)[]` binding reads its
+      annotation's element type (0 differing files).
+    - `unionTakesAtomAsStrOf`'s three `wasmEmit` callers ask `msSetTakesAtomAsStr` of the row's
+      interned set (11, 10 and 64 files, 0 differed).
     - The coerce gate in `emitUnionCoerceValueAtom` asks `coerceTakesAtomAsStr(uSet, uTy)`:
       the target's set, else the set of the row keyed by its arena type
-      (`tyBoxTakesAtomAsStr`), else `tyTakesAtomAsStr`. `emitUnionBoxArg`, `emitUnionCoerce`
-      and the if-value and binding if-chains take the target's type, and each caller passes
-      the one it holds. Five pass `-1`: a closure call argument (its union comes off the fn
-      type or the lambda's own param), a synthesized `<atom> | null` map default, a nullable
-      map arm with no union, and an un-annotated `let` or global (named off the init). A
-      probe over 16,636 files and the self-compile agreed on 20,398 events in 3,261 files and
-      differed in 1, `union-alias-arm-list-literal` (`U | boolean` with `U = i32 | string`:
-      the spelling misses the alias's `string`, and no atom reaches that box). difftree
-      `--identity` found 0 of 16,524 files differ. The type is a fallback, not a substitute:
-      where a caller holds both, it answers false in 186 files where the set answers true,
-      because the caller holds a narrower type than the box (a narrowed assignment target, a
-      merged record row's field).
-    - The four `emit_fn_scans` callers hold an annotation's TypeRef or an expression. Probed
-      against `msSetTakesAtomAsStr` of the type's set, they differ in 842 (param), 39
-      (assignment), 21 (`??`) and 27 (`if`-join) files. The disagreeing sets read
-      `string | string`: the type of a literal-union parameter such as `K` or a
-      `CaseMap` instance, whose free slice holds each literal as a `string`. A typed answer here
-      needs the declared union, not its widened members.
+      (`tyBoxTakesAtomAsStr`), else `tyTakesAtomAsStr`. Five callers pass `-1`: a closure call
+      argument, a synthesized `<atom> | null` map default, a nullable map arm with no union,
+      and an un-annotated `let` or global. 20,398 events in 3,261 files agreed and 1 differed
+      (`union-alias-arm-list-literal`, where the spelling misses an alias's `string` and no
+      atom reaches the box). Where a caller holds both, the type answers false in 186 files
+      where the set answers true, because it is narrower than the box, so it is a fallback.
+    - The four `emit_fn_scans` frame scans. Param and assignment ask `tyDeclTakesAtomAsStr`
+      of the TypeRef's or target's type: the members the type itself declares, so a
+      literal-union alias such as `K` stays one member (an atom, not a box). The row's set
+      cannot answer here: a pure literal union's row holds each literal widened to `string`,
+      and it differed in 842 param files. `??` and `if`-join ask `msSetTakesAtomAsStr` of the
+      name's row set. Over 16,640 files: param 4,593 events, `??` 1,549 and `if`-join 752, 0
+      differed; assignment 289 events, 1 differed (`join-reassigned-at-literal-union-pin`,
+      whose target `unionNameOfExpr` names `string` at a `K` pin; another test reserves the
+      same frame there). difftree `--identity` found 0 of 16,529 files differ.
 - **C1.** The checker banks per-call bind types; `monoBindCols` is L1's producer. Then
   `monoSubstAnn`, `monoBindOf` and their kin bind by type. Landed for the 5 parses of the two
   pre-bind predicates. `monoAnnIsOpenUnion` and `monoUnionLeavesOpenFree` are gone, and
