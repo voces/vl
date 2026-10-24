@@ -4778,9 +4778,24 @@ fn run_program_with(
     sink: impl Fn(&str) + Send + Sync + Clone + 'static,
     palette: Palette,
 ) -> Result<()> {
+    run_compiled(engine, bytes, None, sink, palette)
+}
+
+/// `run_program_with` over a module the caller may already have compiled from `bytes`
+/// (`compile_and_run`'s cache check compiles it once); `None` compiles it here.
+fn run_compiled(
+    engine: &Engine,
+    bytes: &[u8],
+    module: Option<Module>,
+    sink: impl Fn(&str) + Send + Sync + Clone + 'static,
+    palette: Palette,
+) -> Result<()> {
     // The `vl-src` rows for THIS module, so a trap frame's offset resolves to a line.
     note_src_map(bytes);
-    let module = from_user(user_module(engine, bytes))?;
+    let module = match module {
+        Some(m) => m,
+        None => from_user(user_module(engine, bytes))?,
+    };
     // The instance is dropped: `vl run` runs the start function (the program's top
     // level) and exits. `vl test` needs the instance back to call exports on it, so
     // it goes through `instantiate_program` directly.
@@ -7188,25 +7203,67 @@ fn compile_and_run(
     link: LinkOpts,
 ) -> Result<()> {
     let compile_engine = compile_engine(source.len())?;
+    // The module a miss compiles to decide whether its bytes may be stored, kept so the
+    // run does not compile it a second time.
+    let compiled: std::cell::RefCell<Option<Module>> = std::cell::RefCell::new(None);
     // `_located`, so a module the engine refuses can still be traced back to the
-    // function that emitted it (D1578). The compile itself is unchanged.
-    let (mut bytes, session) = compile_vl_located(
-        &compile_engine,
-        compiler,
-        source,
-        source_path,
-        "compileSrc",
-        Names::Full,
-        link,
+    // function that emitted it (D1578). The instance is read only on that failure path,
+    // and a module the engine refuses is never stored, so a hit never needs one.
+    let (mut bytes, session) = compile_cache::serve(
+        run_cache_action(compiler, source, source_path, link).as_ref(),
+        &read_module_key,
+        || {
+            compile_vl_located(
+                &compile_engine,
+                compiler,
+                source,
+                source_path,
+                "compileSrc",
+                Names::Full,
+                link,
+            )
+        },
+        |r: &(Vec<u8>, Option<(Store<()>, Instance)>)| {
+            let m = user_module(run_engine, &r.0).ok()?;
+            *compiled.borrow_mut() = Some(m);
+            Some(r.0.clone())
+        },
+        |b| (b, None),
     )?;
-    // The third seam, like the other two: `None` on every real run.
+    // The third seam, like the other two: `None` on every real run. A bypass variable, so
+    // the cache is off and `compiled` is empty whenever it fires.
     if let Some(f) = fault_injection()? {
         inject_fault(f, &mut bytes)?;
     }
-    match run_program(run_engine, &bytes, palette) {
+    let module = compiled.into_inner();
+    match run_compiled(run_engine, &bytes, module, |line| println!("{line}"), palette) {
         Err(e) => Err(locate_invalid_module(e, session, source_path, Some(&bytes))),
         ok => ok,
     }
+}
+
+/// `vl run`'s compile-cache action: keyed on what `compile_vl_instance` stages (the entry
+/// path, the name sections, the link options), what `stage_program` stages (the VL root,
+/// the cwd, the entry's bytes) and the seed bytes that compile. No colour: a run stores only
+/// a compile that succeeded, which prints nothing. The run engine is not a part either:
+/// the stored result is the emitted wasm, and the module cache keys its compile apart.
+fn run_cache_action(
+    compiler: &CompilerSource,
+    source: &str,
+    source_path: &str,
+    link: LinkOpts,
+) -> Option<compile_cache::Action> {
+    compile_cache::Action::new("run", || {
+        let (root, cwd) = staged_root_and_cwd();
+        let staged = format!("{source_path}\0{:?}\0{link:?}", Names::Full);
+        Some(vec![
+            compiler_hash(compiler)?.to_vec(),
+            staged.into_bytes(),
+            root.into_bytes(),
+            cwd.into_bytes(),
+            sha256(source.as_bytes()).to_vec(),
+        ])
+    })
 }
 
 /// The value of a value-taking `vl run` flag, or a usage error when the flag ended the

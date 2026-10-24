@@ -718,7 +718,7 @@ Cranelift compile is cached".
 
 ### The compile cache (host, opt-in)
 
-`VL_COMPILE_CACHE=1` keeps the module a `vl build`, or a pooled `vl test` file, emitted under
+`VL_COMPILE_CACHE=1` keeps the module a `vl build`, a `vl run` of a source file, or a pooled `vl test` file, emitted under
 `<cache dir>/compile/`, keyed on the seed, the host build, the keyed environment, what the host
 stages and every module the compiler was handed (incremental-compilation-design.md §4.1, S1).
 Under `-O`/`-O3` it also keeps the optimized module (and its `--source-map` map), keyed on the
@@ -729,7 +729,7 @@ lines read `-O hit`, `-O miss`, …. Off by default.
 | --- | --- |
 | `VL_NO_COMPILE_CACHE=1` | no lookup and no store, even when enabled |
 | `VL_COMPILE_CACHE_MAX_MB=<n>` | prune target, default 4096 |
-| `VL_COMPILE_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `stored`, `verified`, `off (<why>)` |
+| `VL_COMPILE_CACHE_TRACE=1` | one stderr line per lookup: `hit`, `miss`, `stored`, `verified`, `off (<why>)`, `rejected (corrupt result)` before the miss a damaged entry becomes |
 | `VL_COMPILE_CACHE_VERIFY=1` | every hit also compiles cold; a difference exits **71** |
 
 ### `build` flags (today's host surface)

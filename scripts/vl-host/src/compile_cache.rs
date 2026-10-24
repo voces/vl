@@ -1,8 +1,8 @@
 // The whole-compile file cache, stage S1 of docs/internals/incremental-compilation-design.md
 // (§4.1, §4.2). OPT-IN: active only under `VL_COMPILE_CACHE=1`.
 //
-// An ACTION is one compile in a fresh compiler instance (`vl build`, one pooled `vl test`
-// file). Its key has two levels. The MANIFEST key hashes everything the host knows before
+// An ACTION is one compile in a fresh compiler instance (`vl build`, `vl run` of a source
+// file, one pooled `vl test` file). Its key has two levels. The MANIFEST key hashes everything the host knows before
 // the guest runs: the action kind, the resolved seed's SHA-256, this host's build id, every
 // keyed environment variable, and the values the host stages (argv with the resolved colour,
 // the VL root, the cwd, the entry and its bytes). The manifest holds the last few
@@ -332,6 +332,8 @@ impl Action {
             let rpath = self.result_path(&rkey);
             let file = std::fs::read(&rpath).ok()?;
             if file.len() < 40 || &file[..8] != RESULT_MAGIC || file[8..40] != sha256(&file[40..]) {
+                // Never served: the action compiles cold and its store overwrites the entry.
+                self.trace("rejected (corrupt result)");
                 return None;
             }
             touch(&mpath);
