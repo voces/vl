@@ -6,14 +6,14 @@
 // consumer's `vl check tools/replay-info.vl` printed 44 warnings, 42 of them inside
 // std, burying the two that were about the target (glean VL-014; D1601).
 //
-// Policy pinned here (compiler/cli.vl, `cliDiagWithheld`):
-//   - a non-error whose owning module key starts with `std:` is WITHHELD unless
-//     `--include-std` is passed, and counts nowhere while withheld — not in the
-//     tally, not in the `--severity` gate, not in the `--json` array;
+// Policy pinned here (compiler/cli.vl, `cliDiagWithheld`; driver.vl, `lintGraphOf`):
+//   - a module whose key starts with `std:` is NOT LINTED unless `--include-std`
+//     is passed, so its findings count nowhere — not in the tally, not in the
+//     `--severity` gate, not in the `--json` array;
 //   - a std ERROR is ALWAYS shown: it means the toolchain is broken, and hiding it
 //     would leave a build failing with no diagnostic at all;
-//   - a withheld run SAYS SO on stderr, in both human and `--json` mode, so nothing
-//     is dropped in silence;
+//   - a run that skipped std SAYS SO on stderr, without a count, in both human and
+//     `--json` mode, so nothing is dropped in silence;
 //   - the target's own diagnostics are untouched.
 //
 // The std tree under test is a `VL_STD` override holding one small module, so the
@@ -115,7 +115,7 @@ Deno.test({
       if (!/no errors/.test(all)) {
         throw new Error(`expected a clean summary:\n${all}`);
       }
-      if (!/\(1 std warning hidden — --include-std shows them\)/.test(r.err)) {
+      if (!/\(std: modules not linted — --include-std lints them\)/.test(r.err)) {
         throw new Error(
           `the run must say what it withheld, on stderr; got:\n${all}`,
         );
@@ -137,7 +137,7 @@ Deno.test({
       if (!/std:probe: warning \[2:\d+\] Unused variable `leftover`/.test(all)) {
         throw new Error(`--include-std did not show the std warning:\n${all}`);
       }
-      if (/std warning hidden/.test(all)) {
+      if (/not linted/.test(all)) {
         throw new Error(`--include-std must withhold nothing:\n${all}`);
       }
       if (r.code === 0) {
@@ -207,9 +207,9 @@ Deno.test({
           `the JSON array must carry no withheld std diagnostic, got ${r.out}`,
         );
       }
-      if (!/\(1 std warning hidden — --include-std shows them\)/.test(r.err)) {
+      if (!/\(std: modules not linted — --include-std lints them\)/.test(r.err)) {
         throw new Error(
-          `--json must still announce the withheld count on stderr; got:\n${r.err}`,
+          `--json must still announce the unlinted std on stderr; got:\n${r.err}`,
         );
       }
       const inc = await check(dir, ["--json", "--include-std"]);

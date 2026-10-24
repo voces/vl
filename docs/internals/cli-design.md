@@ -267,7 +267,7 @@ subcommands (`test`) reuse the same pump unchanged.
 A `cli.vl` module, joined into the compile alongside the driver, that:
 
 1. reads argv, classifies the subcommand and flags (`--severity`, `--concise`,
-   `--exclude`, `--include-std`, `--include-imports`, `-w`, `--fix`, …);
+   `--exclude`, `--include-std`, `--skip-imports`, `-w`, `--fix`, …);
 2. drives the work: for `check`/`fmt`, push the target onto a work-stack; while it
    has pending directories, emit `CMD_LIST_DIR` and, on each committed entry,
    apply `SKIP_DIRS` + the glob matcher (VL) to decide recurse / collect / skip;
@@ -432,8 +432,8 @@ apart from the `stage` key.
 ## `check --budget` — a per-file lint ratchet held by the lint
 
 `vl check --budget <baseline.json>` reads the baseline first (`ST_BUDGET_READ`), walks its
-`targets` with its `exclude` globs (named paths narrow that population), forces
-`--include-imports`, and counts every shown finding of a code the baseline's `total` names,
+`targets` with its `exclude` globs (named paths narrow that population), clears
+`--skip-imports`, and counts every shown finding of a code the baseline's `total` names,
 once per position, named `"<checkout-relative path>: <trimmed source line>"`. Its stdout is
 the ratchet's verdict — `<label> budget ok — …` (exit 0) or `<label> budget REGRESSED — …`
 with one line per file whose count rose (exit 1) — and no diagnostics. `--budget-why`
@@ -452,7 +452,7 @@ error, exit 2, not help. The host's `value_flags` lists every flag `cliParseArgs
 value for, so its help scan skips the same token; `tests/cli_host_tables_test.ts` holds the
 two tables equal.
 
-## `std:` diagnostics are withheld unless asked for (`--include-std`)
+## A prefixed import is not linted (`--include-std`)
 
 A `vl check` target resolves its whole module graph, so every `import … from
 "std:…"` puts std's own source under the same lint tier as the file being
@@ -460,12 +460,17 @@ checked. None of it is the author's to fix: `vl check tools/replay-info.vl` in a
 external consumer printed 44 warnings, **42 of them inside std**, burying the two
 that were about the target (glean VL-014, `~/glean/docs/vl-issues.md`; D1601).
 
-So a diagnostic whose owning module key starts with `std:` — the spelling an
-import resolves to — is withheld unless `--include-std` is passed. It counts
-nowhere while withheld: not in the error/warning tally, not in the `--severity`
-gate, not in the JSON array. A withheld run says so on stderr in both human and
-`--json` mode (`(3 std warnings hidden — --include-std shows them)`), so nothing
-is dropped in silence.
+So a module reached through a **prefixed** specifier — its key carries a scheme,
+`<scheme>:…` (`modKeyScheme`, `compiler/driver.vl`) — is not linted at all: the
+lint pass skips it, so its findings are never computed, not computed and then
+hidden. The rule is the prefix, not the name `std`: a future package prefix
+(`vlp:foo`) falls under it unchanged. `--include-std` lints std's modules again;
+no flag yet opts another prefix back in, because none exists. A prefixed
+module's lint counts nowhere: not in the error/warning tally, not in the
+`--severity` gate, not in the JSON array. A run that skipped one says so on
+stderr in both human and `--json` mode, without a count — the count would cost
+the very lint the rule saves — as `(std: modules not linted — --include-std
+lints them)` or `(modules under a package prefix not linted)`.
 
 Two boundaries the rule keeps:
 
@@ -482,39 +487,45 @@ The complementary half is in the lint: `comment-block-too-long`,
 skipped for a std module — std's comments are consumer API surface and are graded
 by `std-comment-audience` against `std-api-review.md` §4 instead.
 
-## An import's warnings and hints are withheld unless asked for (`--include-imports`)
+## A relative import is linted and shown (`--skip-imports` opts out)
 
-The same problem one level out. A single-file check lints every module of the
-resolved graph, so each import's own findings were reported against a check of
-the file that imports it: plumb's `vl check src/ntempest/hierarchy.vl` printed
-103 diagnostics, **62 of them from the three modules it imports**, all already
-known, and `--exclude` did not filter them (plumb PL-055,
-`~/plumb/docs/vl-issues.md`).
+A single-file check lints every module of the resolved graph it reaches through
+a RELATIVE specifier (`./x`, `../y`), and reports their warnings and hints with
+the named file's. Those modules are the author's own code, so their findings are
+the author's to fix.
 
-So a non-error owned by any module other than the named file is withheld unless
-`--include-imports` is passed, with exactly the `--include-std` contract: it
-counts nowhere while withheld, and the run says so on stderr
-(`(62 import warnings hidden — --include-imports shows them)`). The two flags
-are independent — `--include-imports` does not reveal std, `--include-std` does
-not reveal the rest.
+This reverses PL-055's default (owner ruling, 2026-10-24). PL-055 (plumb,
+`~/plumb/docs/vl-issues.md`) had `vl check src/ntempest/hierarchy.vl` print 103
+diagnostics, 62 of them from the three modules it imports, and withheld a
+non-error from any module but the named file unless `--include-imports` was
+passed. That hid an import's findings from every single-file check of a project
+whose entry is the only file anyone checks. Plumb's escape hatch is now
+`--skip-imports`: no relative import is linted — its lint is not computed — and
+the named file's findings are unchanged. It is explicitly asked for, so it is not
+announced. `--include-imports` is still accepted and only undoes an earlier
+`--skip-imports`, so an existing invocation keeps working and means what it did.
+`--skip-imports` does not reach std and `--include-std` does not reach relative
+imports; the two are independent.
 
 The boundaries, and why each is where it is:
 
-- **Errors are always shown.** A type error in an import fails the build of the
-  named file; hiding it would leave a failing check with no diagnostic.
-- **Warnings go with hints, not with errors.** A warning never fails a build at
-  the default gate; it is advice about the module that owns it, and that module
-  reports it when it is checked itself — a directory run names every file, and
-  each file in it is graded as its own entry. Keeping an import's warnings would
-  have left plumb's report dominated by the same pre-existing findings, which is
-  the ask.
+- **Errors are always shown**, from any module, under either flag. A type error
+  in an import fails the build of the named file; hiding it would leave a failing
+  check with no diagnostic. The checker's errors do not come from the lint, so
+  skipping a module's lint drops none of them; the one error-tier lint rule,
+  `for-step-zero`, has a checker twin (`checkRangeNeverRuns`).
+- **Skipping a module's lint loses nothing in the modules still linted.** The
+  graph facts a rule reads across modules (map and function globals, hole
+  fields, readers) are built from every module's SOURCE before any module is
+  linted, never from another module's findings, and each module lints on its own
+  arena.
 - **`--exclude` reaches imports.** A pattern that matches an import's key (the
   path the report labels it with) or its basename drops that module's warnings
-  and hints even under `--include-imports`. It is explicitly asked for, so it is
-  not announced; errors survive it for the reason above.
-- **The whole-graph lint is still one flag away.** `scripts/lint-self.sh` passes
-  `--include-imports` on `compiler/entry.vl`, so the self-lint still covers every
-  compiler module through the entry; so does `vl check --budget`, which sets it itself.
+  and hints. It is explicitly asked for, so it is not announced; errors survive
+  it for the reason above.
+- **The whole-graph lint is the default.** `scripts/lint-self.sh` on
+  `compiler/entry.vl` covers every compiler module through the entry; `vl check
+  --budget` clears `--skip-imports` itself.
 - **The editor is unaffected.** The LSP lints the open document and reports
   per document; it never went through this report.
 

@@ -7,8 +7,8 @@
 # The compiler is a real module graph (entry.vl → driver → the pipeline), and a
 # single-file `vl check` lints EVERY module of the resolved graph (the
 # per-module lint tier), each finding attributed to its own file — so checking
-# the entry covers all of compiler/*.vl with source-file positions. That needs
-# `--include-imports`: without it an import reports its errors only (plumb PL-055).
+# the entry covers all of compiler/*.vl with source-file positions (a relative
+# import is linted by default; `--skip-imports` would lint the entry alone).
 # `prefer-const` stays safe on cross-module reassignment because EXPORTED
 # bindings are exempt (another module may rebind them). `std/` is linted as
 # ordinary modules EXCEPT for the four comment codes, which implement the
@@ -81,7 +81,7 @@ trap 'rm -rf "$WORK"' EXIT
 # `+` chains are baselined rather than rewritten, and a new one fails this script.
 lint_graded() { # <target> <json path>
   local rc=0
-  "$VL" check "$1" --severity info --include-imports --json > "$2" 2> "$2.err" || rc=$?
+  "$VL" check "$1" --severity info --json > "$2" 2> "$2.err" || rc=$?
   cat "$2.err"
   if [ "$rc" -gt 1 ]; then cat "$2"; return "$rc"; fi
   # shellcheck disable=SC2046  # the word split is the point: zero or more codes
@@ -126,7 +126,7 @@ if [ "${#SCRIPTS_EXCLUDES[@]}" = 0 ]; then
   exit 1
 fi
 ( rc=0
-  "$VL" check scripts --severity info --include-imports --json "${SCRIPTS_EXCLUDES[@]}" \
+  "$VL" check scripts --severity info --json "${SCRIPTS_EXCLUDES[@]}" \
     > "$WORK/scripts.json" 2> "$WORK/scripts.err" || rc=$?
   [ "$rc" -le 1 ] || { cat "$WORK/scripts.err" "$WORK/scripts.json"; exit "$rc"; } ) &
 SCRIPTS_PID=$!
@@ -207,19 +207,19 @@ GRAPH_RC=0
 wait "$GRAPH_PID" || GRAPH_RC=$?
 cat "$WORK/graph.log"
 [ "$GRAPH_RC" -le 1 ] || exit "$GRAPH_RC"
-# Coverage guard: the graph run must attribute findings to more than the entry. Without
-# `--include-imports` every import's findings are withheld and this run would pass on
-# zero findings having linted nothing but entry.vl.
+# Coverage guard: the graph run must attribute findings to more than the entry. Under
+# `--skip-imports` no import is linted and this run would pass on zero findings having
+# linted nothing but entry.vl.
 GRAPH_FILES=$(grep -o '"file": *"[^"]*"' "$WORK/graph.json" | sort -u | wc -l || true)
 if [ "$GRAPH_FILES" -lt 2 ]; then
-  echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — is --include-imports still passed?"
+  echo "self-lint: the compiler graph run named $GRAPH_FILES file(s); expected the whole module graph — are relative imports still linted?"
   exit 1
 fi
 SCRIPTS_RC=0
 wait "$SCRIPTS_PID" || SCRIPTS_RC=$?
 [ "$SCRIPTS_RC" = 0 ] || exit "$SCRIPTS_RC"
 # The ratchets count the findings these runs already produced (`--findings`, the same
-# `--include-imports` reports), rather than each walking its targets again. The comment,
+# whole-graph reports), rather than each walking its targets again. The comment,
 # kind-ladder, sentinel-index and literal-byte baselines target `compiler/entry.vl`, whose import closure
 # is every compiler/*.vl; arena-scan's add `std`, interp's `std` and `scripts`
 # (tests/budget_targets_test.ts holds both facts). `--findings` takes one report, so the
