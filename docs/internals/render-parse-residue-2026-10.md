@@ -126,7 +126,7 @@ the slice retires.
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
 | C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, 13 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted) | 13 | 0 / 13 / 0 | 0 / 13 | `emit_base` |
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
-| C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
+| C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
 | C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers; typed: the string-list callers that hold a type) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 12 retired, 18 left; the `rlMapElemValSlot` fall-through waits on D8) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
@@ -727,6 +727,24 @@ What each slice changes:
       spelling in 1,334 files at the nullable recursion and 1,390 at the map value. The arena
       also holds `Circle[]` and `{r:i32}[]` as one shape, while `structElemArrayLowerable`
       admits the two differently.
+  - Done in a third landing: 1 parse, over the self-compile and 16,641 files. Two producers
+    now pass a type. `collectAnnShapes` reads a generic-alias TypeRef's declared type
+    (`declAnnTyOf`), whose parameters are still type variables, and `gaeInternAppFieldShapes`
+    reads each field's type off the application's arena type unless the spelling names an
+    alias parameter. The paren-closure test in `internShapeDeepTy` is then
+    `tyIsFuncArena(ty)` alone: 11,766 files agree and 1 differs, a `((i32)=>i32)[]` spelled
+    `(i32)=>i32[]` that the array peel reaches instead. 12 files still reach it with no type
+    while the spelling says closure. They, and eight witnesses with an inline record inside
+    a no-type closure name, build byte-identical modules on both seeds, because the typed
+    reach of the same declaration interns the shapes. difftree --identity found 2 of 16,529
+    files differ, `alias-inline-nested-record-read.vl` and
+    `type-param-shadows-alias-through-constructors.vl`. With the declared type,
+    `shapeFieldsRideTyParam` sees that the generic-alias original's field names a parameter,
+    so the original's dead struct types are no longer minted. Their output is unchanged.
+    The name-only `internShapeDeep` wrapper had no caller left and is gone.
+  - Left after it: 6. The nullable peels still differ by key (233 and 11 files). Their no-type
+    reaches fell from 40 to 25 files at `internShapeDeepTy`'s peel, and the map-value
+    recursion's to 136. The four key producers are unchanged.
 - **C4.** The callers of the shape-text field recorders pass the field type that the struct row
   already holds. Landed for 1 render and 2 parses: `elemIsLitUnion` became `tyIsLitUnion` of
   the row's element column, `variantIndexOfOwnRender` matches arms on the arena with a literal

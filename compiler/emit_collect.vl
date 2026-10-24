@@ -58,7 +58,7 @@ import {
 } from "./check_call_resolve"
 import { canonRewroteNode, canonTyIxOf } from "./check_canon_raw"
 import { unionAliasMembers } from "./check_nj_join"
-import { declAnnRawTyName } from "./check_gen_alias_anns"
+import { declAnnRawTyName, declAnnTyOf } from "./check_gen_alias_anns"
 import { fieldNameOrder } from "./check_obj_shape"
 import { inferJoinCount, inferJoinTyAt } from "./check_inline_lit_union"
 import {
@@ -837,7 +837,6 @@ import {
   internInlineShapeTy,
   internOwnShapeOfTy,
   internShapeAs,
-  internShapeDeep,
   internShapeDeepOfTy,
   internShapeDeepTy,
   markRefArrayArms,
@@ -7882,9 +7881,9 @@ export function collectAnnShapes() {
     }
     if tn is TypeRef {
       // One gate and one switch, each closing a disagreement between the recorded type and what
-      // the name resolves to in the emitter's context. The gate: no generic-alias type parameter
-      // in the spelling, since inside such an alias the checker bound `K` to the argument while
-      // the emitter re-resolves it. The switch: `canonRewroteNode(ti)` picks which column to read.
+      // the name resolves to in the emitter's context. The gate: a spelling naming a generic-alias
+      // type parameter reads the alias's declared type, whose `K` is still a type variable, since
+      // the recorded one bound it to an argument. The switch: `canonRewroteNode(ti)` picks a column.
       let root = -1
       if !nameMentionsGenAliasParam(tn.tyName) {
         if canonRewroteNode(ti) {
@@ -7892,6 +7891,8 @@ export function collectAnnShapes() {
         } else {
           root = nodeTyIxOf(ti)
         }
+      } else {
+        root = declAnnTyOf(ti)
       }
       // Ahead of the intern, which codes each field: an arm-typed field needs the arm's own
       // row to exist before `armFieldStructRow` is asked for it (D1672).
@@ -12037,11 +12038,21 @@ function gaePeelWrappers(name: string) {
   nm
 }
 
+// The record type TypeRef `ti` (spelled `name`) applies, under the `| null` and `[]` wrappers
+// `gaePeelWrappers` strips, or -1. A spelling naming a generic-alias parameter has none: the
+// checker bound that parameter to an argument the emitter re-resolves.
+function gaeAppTyOf(ti: i32, name: string): i32 {
+  if nameMentionsGenAliasParam(name) { return -1 }
+  let t = tyPeelNul(fdRowOf(ti))
+  while tyIsArray(t) { t = tyStepElem(t) }
+  t
+}
+
 // Interns the inline shapes an application's substituted field types name, before `gaeEnsure`
 // codes those fields: a monomorphized generic-alias field is the one kind no arena scan can
 // reach, since `Box<T> = {v: {a: T}}` at `Box<string>` names `{a:string}`, a text appearing
 // nowhere in the program, so `gaeEnsure` would otherwise find no struct row and decline it.
-function gaeInternAppFieldShapes(name: string) {
+function gaeInternAppFieldShapes(name: string, appTy: i32) {
   if !annGenAppSpanEnds(name) { return 0 }
   const ltAt = gaeLtAt(name)
   // Both halves of the generic-application cut at their home (`gaeHeadNameOf`/`gaeArgsTextOf`),
@@ -12057,9 +12068,12 @@ function gaeInternAppFieldShapes(name: string) {
   const fc = gaeFieldCount[gi]
   let fi = 0
   while fi < fc {
-    // `internShapeDeep` peels the composition wrappers itself and descends a map value, so
+    // `internShapeDeepTy` peels the composition wrappers itself and descends a map value, so
     // `{a: T}[]` and `{a: T[]}` are covered by the same call; a non-shape substitution is a no-op.
-    internShapeDeep(gaeApplyFieldTy(gaeFieldTyNames[fs + fi], pnames, args))
+    internShapeDeepTy(
+      gaeApplyFieldTy(gaeFieldTyNames[fs + fi], pnames, args),
+      tyFieldTyOf(appTy, gaeFieldNames[fs + fi]),
+    )
     fi = fi + 1
   }
   0
@@ -12076,7 +12090,7 @@ export function collectGenAliasShapes() {
       const nm = gaePeelWrappers(tn.tyName)
       // The instance's own inline-shape field targets first — `gaeEnsure` codes a field
       // from the struct table and declines the whole instance when the target is not in it.
-      gaeInternAppFieldShapes(nm)
+      gaeInternAppFieldShapes(nm, gaeAppTyOf(ti, tn.tyName))
       gaeEnsure(nm)
       // A map annotation's value position (`{[string]: Box<i32>}`) is interior to the synthetic
       // map name, so the peel above misses it; interning it here makes the map spelling self-sufficient.
@@ -12093,7 +12107,7 @@ export function collectGenAliasShapes() {
 // other spelling; see the call site for why it is demand-driven and costs no heap type.
 function internArmFieldShape(fdNm: string) { internArmShapeAt(fdNm, 0) }
 
-// The composition peel, mirroring `internShapeDeep`'s: grouping parens, a trailing `| null`,
+// The composition peel, mirroring `internShapeDeepTy`'s: grouping parens, a trailing `| null`,
 // trailing `[]` runs, and a map value, to any depth. An arm reached through a container needs
 // its row for the same reason a bare one does — `{[string]: Circle[]}` is the map-and-list
 // dual of `g: Circle`. Depth-bounded: a bug in one of the cuts must not recurse forever.
@@ -12213,7 +12227,7 @@ function collectNestedFieldShapes(stmts: i32[]) {
           // its OWN fields' arms and the struct table is otherwise still empty (D1707).
           internArmFieldShape(tyNameOf(fnode.fdType))
           if ownsRow {
-            // `internShapeDeep` peels composition wrappers and descends a map field's value, so a
+            // `internShapeDeepTy` peels composition wrappers and descends a map field's value, so a
             // declared nullable-map field's value struct interns before `collectS` codes the field.
             let fdRoot = -1
             const fdNm = tyNameOf(fnode.fdType)
