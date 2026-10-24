@@ -128,7 +128,7 @@ the slice retires.
 | C2 | instance cell signatures typed (attempted; waits on C1) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 9 retired, 7 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 4 retired, 5 left, probed: keys and no-type producers) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
-| C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
+| C5 | name-only gates in emit_base and emit_collect (landed: 6 retired, 11 left; probed: the niche ladders wait on the grammar entries' D2, D8 and emit_mono callers) | 17 | 0 / 17 / 0 | 0 / 17 | `emit_base`, `emit_collect` |
 | D1 | ref-list slot keyed by type (landed: 11 retired, 19 left) | 30 | 0 / 1 / 29 | 4 / 26 | `emit_base`, `emit_classify`, `emit_collect`, `emit_union_atoms` |
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function and written-let pins typed; 2 retired, 21 wait on C1 step 3) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
@@ -747,6 +747,31 @@ What each slice changes:
       emit_shape_rows, emit_map_value_slots and emit_mono.
     - `annRetNameOf` is held by emit_mono, `collectATypeRef`, emit_union_atoms and
       emit_start_block. Those callers hold stored names.
+  - Blocked, measured: `nameIsNulString`, `nameIsNulBool` and `nulLitUnionScan`. A probe
+    tagged each caller of the three grammar entries (`nameIsI32Array`, `nameIsStringArray`,
+    `parenUnionArrElemName`) and recorded where a nullable arm answered true, over the
+    self-compile and 16,623 files. Counts are files. No code changed.
+    - The predicates answered true in 231 (string), 65 (boolean) and 121 (literal union).
+    - `nameIsStringArray`'s `(string | null)[]` arm, 219 in all: `collectATypeRef` (206),
+      `tyAnnRefListKind` (205), `scalarListRepOfName` (22), `refArrShapeKindGo` (10),
+      `rlElemStoredName` (9), `refArrElemNameGo` (8), `nulScalarListKind` (2) and
+      `mvShapeOfValNameArmTyGo` (2).
+    - `nameIsI32Array`'s `(boolean | null)[]` arm (29) and `(K | null)[]` arm (70):
+      `checkArrName` (21 and 62), `collectATypeRef` (11 and 43), `genTyParamArr` (9 and
+      41), `scalarListRepOfName` (9 and 12), `nameIsI32ListArray` (3 and 9) and
+      `rlElemStoredName` (0 and 7).
+    - `parenUnionArrElemName`'s three niche exclusions (boolean 24, string 87, literal union
+      64): `refArrShapeKindGo`, `refArrElemNameGo`, `letWidensAtomToStr` and
+      `monoPinMintedUnion` in emit_mono (3, 12 and 5).
+    - No emit_classify caller reached a true nullable arm, and `tyAnnRefListKind`'s own
+      `nameIsNulBoolList` and `nameIsNulLitUnionList` legs never answered true.
+    - `mvValKindOfNameTy`'s niche leg answered true in 43 files, and every one held a type.
+      Its name leg still serves the -1 callers of `mvValKindOfName` (A1).
+
+    The three entries are the ref-list kind ladder (D2), the mv slots (D8) and emit_mono's
+    pin union. They fall when `nameIsI32Array`, `nameIsStringArray` and
+    `parenUnionArrElemName` lose their name-only callers, not before. `nameIsStrLitSet`
+    falls with them.
 - **D1.** `rlSlotByName`, `rlSlotOfArrName` and the `refListElemNameOf*` family key the ref-list
   slot by element type. This turns most of the B key producers into dead code. A probe compared
   the spelling's name with the row that `rlSlotOfTy` keys by the node's element type, at fifteen
