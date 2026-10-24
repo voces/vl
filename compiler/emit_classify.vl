@@ -10907,6 +10907,14 @@ export function exprNulLitUnion(exprIx: i32, fnIx: i32) {
     ) {
       return true
     }
+    // …and over a union box, whose string arm converts to the id on a hit (D11221).
+    if (
+      e.asMode == "null"
+      && asExprBoxToLitUnion(unwrapParen(exprIx), fnIx)
+      && asBoxLitUnionYieldsAtom(unwrapParen(exprIx))
+    ) {
+      return true
+    }
   }
   // …and the same `if` whose arm is itself nullable — see `nulIfArmNullableValueIx` (D1560).
   const nlIfA = nulIfArmNullableValueIx(exprIx)
@@ -12872,7 +12880,9 @@ export function exprIsLitAtom(exprIx: i32, fnIx: i32) {
     }
     AsExpr => {
       if e.asMode != "null" {
-        return asExprLitAtomYieldsAtom(unwrapParen(exprIx), fnIx)
+        const ax = unwrapParen(exprIx)
+        if asExprBoxToLitUnion(ax, fnIx) { return asBoxLitUnionYieldsAtom(ax) }
+        return asExprLitAtomYieldsAtom(ax, fnIx)
       }
     }
     // No other expression is a literal atom.
@@ -15149,6 +15159,51 @@ export function exprUnion(exprIx: i32, fnIx: i32) {
   false
 }
 
+// Whether `ty` is a literal union of one base, which reps as an interned atom (string members)
+// or as that base scalar (numeric members), never as a box.
+export function litUnionAtomTy(ty: i32): boolean {
+  if ty < 0 { return false }
+  tyIsLitUnion(ty) || numLitUnionBaseTy(ty) >= 0
+}
+
+// Whether `as` node `ix` casts a union box to a literal-union target, whose arm rides the box at
+// its base's rep: the base scalar for numeric members, the member string for string ones (D11221).
+export function asExprBoxToLitUnion(ix: i32, fnIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if !(n is AsExpr) { return false }
+  if n.asMode == "wrap" { return false }
+  if !exprUnion(n.asObj, fnIx) { return false }
+  let tty = nodeTyIxOf(ix)
+  if n.asMode == "null" { tty = tyPeelNul(tty) }
+  litUnionAtomTy(tty)
+}
+
+// Whether `as` node `ix` casts a numeric literal-union scalar to a numeric literal union of the
+// same base, which lowers as a member test of the scalar itself (D11221).
+export function asExprNumLitScalarCast(ix: i32, fnIx: i32): boolean {
+  if ix < 0 || ix >= P.nodes.length { return false }
+  const n = nodeAt(ix)
+  if !(n is AsExpr) { return false }
+  if n.asMode == "wrap" { return false }
+  if exprUnion(n.asObj, fnIx) { return false }
+  let tty = nodeTyIxOf(ix)
+  if n.asMode == "null" { tty = tyPeelNul(tty) }
+  const tb = numLitUnionBaseTy(tty)
+  tb >= 0 && tb == numLitUnionBaseTy(nodeTyIxOf(n.asObj))
+}
+
+// Whether box cast `ix` to a string literal union yields the atom id rather than the member
+// string: the same rule `asExprLitAtomCast` applies to an atom operand.
+export function asBoxLitUnionYieldsAtom(ix: i32): boolean {
+  const n = nodeAt(ix)
+  if !(n is AsExpr) { return false }
+  let tty = nodeTyIxOf(ix)
+  if n.asMode == "null" { tty = tyPeelNul(tty) }
+  if !tyIsLitUnion(tty) || tyIsBareStrLit(tty) { return false }
+  litUnionAliasNameOfTy(tty) != "" || asTargetRepsAtom(ix, n.asMode)
+}
+
 // True if a cast `e` yields the union box: a sub-union cast, or a numeric `as?` that
 // can fail. A single-arm target and a numeric `as!` or `as` are not.
 function exprUnionAs(e: AsExpr, exprIx: i32, fnIx: i32): boolean {
@@ -15159,6 +15214,8 @@ function exprUnionAs(e: AsExpr, exprIx: i32, fnIx: i32): boolean {
   if asExprHoleNumOpt(exprIx) && !asExprIsUnionCastIn(exprIx, fnIx) {
     return true
   }
+  // A scalar member test's `as?` yields `N | null`, the base-tagged box (D11221).
+  if e.asMode == "null" && asExprNumLitScalarCast(exprIx, fnIx) { return true }
   if asExprNumFallible(exprIx) {
     if e.asMode == "null" { return true }
     // `as!` and a bare `as` yield `T` itself — a plain scalar, never a box.
@@ -15166,6 +15223,8 @@ function exprUnionAs(e: AsExpr, exprIx: i32, fnIx: i32): boolean {
   }
   if asExprIsUnionCastIn(exprIx, fnIx) {
     const cty = nodeTyIxOf(exprIx)
+    // A literal-union target reps as one atom or its base scalar, so `as!` and `as` unbox (D11220).
+    if e.asMode != "null" && litUnionAtomTy(cty) { return false }
     if cty >= 0 {
       const ct = tyAt(cty)
       if ct is TyUnion { return true }
