@@ -4,7 +4,7 @@
 // compiler recurses once per level. Natively that stack is now bounded by memory rather than by
 // the engine's default (the host gives every seed engine a large stack), and the passes that
 // re-walked a level's whole subtree once per level are linear (D2190). Each witness proves it ran
-// the right code: an `if` level only runs when `a > 0`, and the innermost statement breaks
+// the right code: an `if` level only runs when `a != 0`, and the innermost statement breaks
 // straight out of the outermost labelled loop when `a < 0`.
 //
 // `vl fmt` runs at 2,000 levels: its output is quadratic in the depth (each level is indented
@@ -54,7 +54,7 @@ const gen = (ls: Level[]): string => {
       open.push(`@L${k} while true { acc = acc + 1; `);
       close.push(`acc = acc + 1; break @L${k} } `);
     } else {
-      open.push("if a > 0 { acc = acc + 1; ");
+      open.push("if a != 0 { acc = acc + 1; ");
       close.push("} ");
     }
   });
@@ -77,7 +77,7 @@ const gen = (ls: Level[]): string => {
 const expect = (ls: Level[], a: number): number => {
   let acc = 0;
   let depth = 0;
-  while (depth < ls.length && !(ls[depth] === "if" && !(a > 0))) {
+  while (depth < ls.length && !(ls[depth] === "if" && a === 0)) {
     acc += 1;
     depth += 1;
   }
@@ -114,31 +114,33 @@ const withFile = async (src: string, body: (file: string) => Promise<void>) => {
   }
 };
 
-for (const [name, pick] of SHAPES) {
-  const ls = levels(pick, N);
-  const WANT = want(ls);
-  Deno.test({ name: `deep nesting (native): ${N} levels, ${name}, checks and runs`, ignore: !NATIVE }, async () => {
-    await withFile(gen(ls), async (file) => {
-      // Two independent processes over one file, run side by side.
-      const [chk, run] = await Promise.all([
-        vl(["check", file, "--compiler", COMPILER]),
-        vl(["run", file, "--compiler", COMPILER]),
-      ]);
-      if (chk.code !== 0) throw new Error(`vl check: want rc 0, got ${chk.code}\n${chk.err.slice(0, 600)}`);
-      const got = run.out.trim().split("\n");
-      if (run.code !== 0 || JSON.stringify(got) !== JSON.stringify(WANT)) {
-        throw new Error(`vl run: want rc 0 and ${WANT}, got rc ${run.code} and ${got}\n${run.err.slice(0, 600)}`);
-      }
-    });
-  });
-}
-
-// One `vl fmt` run covers every shape: this cycle puts each of the nine ordered (parent, child)
-// pairs of the three levels at every depth, and a printer's fault at depth is in one kind or in
-// one pair. The four single-shape runs it replaced each saw one kind and at most one pair.
+// The native half checks and runs ONE program, in place of one per shape. Its first levels cycle
+// through each of the nine ordered (parent, child) pairs of the three kinds; the rest are labelled
+// loops, so the innermost `break` leaves more than 16,384 enclosing frames and its `br` depth is a
+// three-byte LEB. The editor half keeps its single shapes: under V8 a kind's frame size decides
+// where the stack runs out.
 const PAIRS: Level[] = ["bare", "bare", "loop", "bare", "if", "loop", "loop", "if", "if"];
+const pairs = (n: number) => levels((k) => PAIRS[k % PAIRS.length], n);
+const PAIR_LEVELS = 1_800;
+const DEEP = levels((k) => (k < PAIR_LEVELS ? PAIRS[k % PAIRS.length] : "loop"), N);
+const DEEP_WANT = want(DEEP);
+Deno.test({ name: `deep nesting (native): ${N} levels, every ordered pair then loops, checks and runs`, ignore: !NATIVE }, async () => {
+  await withFile(gen(DEEP), async (file) => {
+    // Two independent processes over one file, run side by side.
+    const [chk, run] = await Promise.all([
+      vl(["check", file, "--compiler", COMPILER]),
+      vl(["run", file, "--compiler", COMPILER]),
+    ]);
+    if (chk.code !== 0) throw new Error(`vl check: want rc 0, got ${chk.code}\n${chk.err.slice(0, 600)}`);
+    const got = run.out.trim().split("\n");
+    if (run.code !== 0 || JSON.stringify(got) !== JSON.stringify(DEEP_WANT)) {
+      throw new Error(`vl run: want rc 0 and ${DEEP_WANT}, got rc ${run.code} and ${got}\n${run.err.slice(0, 600)}`);
+    }
+  });
+});
+
 Deno.test({ name: `deep nesting (native): ${FMT_N} levels, every ordered pair, formats`, ignore: !NATIVE }, async () => {
-  await withFile(gen(levels((k) => PAIRS[k % PAIRS.length], FMT_N)), async (file) => {
+  await withFile(gen(pairs(FMT_N)), async (file) => {
     // `--check` answers 0 or 1 (formatted or not); a trap is 70, and a host error is 1 with
     // an `Error:` report, so the report is read too.
     const fmt = await vl(["fmt", "--check", file, "--compiler", COMPILER]);
