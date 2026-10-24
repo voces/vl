@@ -134,7 +134,7 @@ the slice retires.
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
 | D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; re-probed: the atom tests agree wherever atoms are typed, but `emit_mono`'s name-only pins register rows with no type; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
-| D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
+| D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver; re-probed 2026-10-24, one type-scan gap fixed, none retired) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 7 retired, 11 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
 
@@ -1364,8 +1364,25 @@ What each slice changes:
     `structIndexOfTypeName(nm) < 0` test differs from `structRowOfTy` in 14 files and from
     `repRowOfTyStruct` in 6. The declared-name-then-field-scan reader that retired the let rung
     differs in 17 of 128 files, in both directions, so not even its decision moves.
+  - Re-probe, 2026-10-24, over the self-compile and 16,642 files, 0 uncompared:
+    - Fixed: a typing gap in the type scan. A union with a record member (`i32 | {f: i32}`) is
+      not a value union, so `jrUnionWantOf` gave -1 and any row with the field's name fitted:
+      `{v: i32 | {f: i32}}` landed on a `{v: i32}` row. A union with a registered row now codes
+      as the box. difftree `--identity`: 0 of 16,529 files differ.
+    - `mintUnionFieldObjRow` stays. After the fix its typed decision still differs in 13 of 128
+      files (`structIndexOfRecordTy`), 11 (the field-set scan) or 9 (`structRowOfTy`, then the
+      scan). Those 9 fall into three groups: an empty render, where only `shareFieldUnionRow`
+      runs (3); a render that drops the union, so the spelling finds a row and the type does
+      not (4); and a spelling scan that fails on union field texts (2). Both decision swaps
+      tried change output: the typed test makes 6 of 127 reach files differ, one a build
+      failure, and always interning makes 9 differ.
+    - `internArmShapeRow` stays. 1,671 files reach the arm mint, and 1,647 of them key it by the
+      full render. Its row differs from the field-set scan's in 143 files and from
+      `structIndexOfTypeName` of the same key in 140: the arm gets its own row next to a layout
+      twin, which no lookup finds.
   - Left: the 6 parses in `mvValNamesCompat` and `shapeFieldTypeCompatK`, inside the name-keyed
-    resolver. They go with `structIndexOfTypeName`, not one by one.
+    resolver. They go with `structIndexOfTypeName`, not one by one. On 2026-10-24 its scan ran
+    in 715 files and `mvValNamesCompat` in 19, with 34 `structIndexOfTypeName` calls left.
   - Banked, nothing retired: the callers that hold the shape's type ask the field-set scan over
     field TYPES. `structIndexOfTypeNameTy(name, ty)` is the declared-name lookup, then, for a
     whole-span shape whose type is a record, `joinRowScanOfTy` (memoised per type and
