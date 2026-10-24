@@ -287,7 +287,13 @@ export const LOOP_TABLE: Array<{
   // (DECISIONS.md, "`-O3` keeps hot callees out of run-once code"): `run` is called once from
   // top-level code, so `bsearch`, called from `run`'s loop, is its own function again and no
   // loop carries the caller's values and the callee's together. Fewer carried is this gate's fast direction.
-  { fixture: "binsearch-probe", none: [11, 4, 6], O: [3, 3, 3], O3: [3, 3, 3] },
+  //
+  // `none` 11,4,6 -> 3,0,6 when a plain build stopped emitting the bodies no root reaches
+  // (DECISIONS.md, "A plain build drops the functions no root reaches"). The probe's own
+  // `bsearch`, `run` and start are BYTE-IDENTICAL; the eight loops that left are the six string
+  // and UTF-8 helpers above, now `unreachable` stubs. So the `none` count is scoped to what the
+  // program can reach, and the wrong-axis firings above can no longer recur. `-O`/`-O3` unchanged.
+  { fixture: "binsearch-probe", none: [3, 0, 6], O: [3, 3, 3], O3: [3, 3, 3] },
 ];
 
 // ── THE BENCHMARK SHAPE PINS ────────────────────────────────────────────────
@@ -319,8 +325,8 @@ export const LOOP_TABLE: Array<{
 // changes rewrite.
 //
 // WHY ONLY `-O` AND `-O3`, WHEN THE OTHER TWO TABLES ALSO PIN `none`. Every counter here
-// is MODULE-WIDE, and at `none` a module contains runtime helpers the program never calls:
-// `binsearch-probe` contains zero string operations and still carries `__str_hash__`. That
+// is MODULE-WIDE, and at `none` a module contained runtime helpers the program never calls:
+// `binsearch-probe` contains zero string operations and carried `__str_hash__`. That
 // is not hypothetical — LOOP_TABLE's `none` row has fired twice on exactly that wrong axis
 // (`__str_eq__`'s 8x unroll, then `__str_hash__`'s 4x unroll), both times on a helper the
 // probe cannot reach. `-O` and `-O3` run DCE, so at those rungs a module-wide count IS a

@@ -515,7 +515,10 @@ Timing cannot be the proxy — CI is shared, and this box was measured swinging
 The `none` column pins VL's own emission at zero rotated loops on the scalar
 fixtures. If a `compiler/*.vl` change ever emits the rotated form directly, the
 default build inherits the penalty with no flag available to escape it, and that row
-is what says so.
+is what says so. Since a plain build emits an unreached function as an `unreachable` stub
+(DECISIONS.md, "A plain build drops the functions no root reaches"), the `none` column counts
+only the loops the program can reach, so a runtime helper the program never calls no longer
+moves it: `binsearch-probe` read 11,4,6 at `none` and reads 3,0,6.
 
 Both directions fail loudly. A count that goes UP means a flag change made a pinned
 program slower; one that goes DOWN is a finding — most likely that wasmtime or
