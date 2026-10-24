@@ -739,10 +739,9 @@ import {
 } from "./emit_fn_ret_kinds"
 import {
   blockHasMapOp,
-  blockHasStash,
   blockHasStrOp,
-  blockHasVariantRebox,
   blockPushPopBits,
+  blockStashMisses,
   bodyEndsInReturn,
   callIsPushKind,
   callPushBits,
@@ -754,6 +753,9 @@ import {
   fnUnionRetSinkOk,
   globalInitIsLitAtom,
   globalInitWidensAtomToStr,
+  stashListGet,
+  stashOptRecv,
+  stashRebox,
 } from "./emit_fn_scans"
 import {
   letIsLitUnion,
@@ -2093,6 +2095,21 @@ export function globalRunsInStartFn(gi: i32) {
   globalIsNonConst(globalStmts[gi])
 }
 
+// Sets the stash flags the tree at `ix` needs, asking only of those not yet set: a
+// multi-field call re-boxed into a variant arm (`variantReboxSlot`, a call cannot be re-read
+// per field), a `?.` base that is not re-readable (`optRecvSlot`), and a `.get` index or
+// receiver that is not (the `.get` stash), each staged so it is evaluated once.
+function scanStashes(ix: i32, fnIx: i32) {
+  let want = 0
+  if !fnUsesVariantRebox { want = want + stashRebox }
+  if !fnUsesOptRecv { want = want + stashOptRecv }
+  if !fnUsesListGet { want = want + stashListGet }
+  const hit = want - blockStashMisses(ix, fnIx, want)
+  if (hit & stashRebox) != 0 { fnUsesVariantRebox = true }
+  if (hit & stashOptRecv) != 0 { fnUsesOptRecv = true }
+  if (hit & stashListGet) != 0 { fnUsesListGet = true }
+}
+
 // One scratch-detection sweep of user function `fnIx`'s body, at whatever same-named-slot bias
 // `dupScanRun` has set. Split from the resets in `emitFuncCode` so it can be re-run per
 // candidate binding of a shadowed name (D1595): every flag it touches is set and never cleared, and every list it appends to dedupes, so the passes OR.
@@ -2125,21 +2142,7 @@ function fnDetectScratch(fnIx: i32) {
     // `fnHasMap` only scans locals/params; also reserve the frame when a map op runs
     // on a global struct-field map-array element (e.g. `T.scopes[top][k] = v`).
     if !fnUsesMap { fnUsesMap = fnHasGlobalMapOp(fnIx) }
-    // A multi-field call result re-boxed into a variant-box union arm stashes the call
-    // in the `variantReboxSlot` (a call cannot be re-read per field).
-    if !fnUsesVariantRebox {
-      if blockHasVariantRebox(fn.fnBody, fnIx) { fnUsesVariantRebox = true }
-    }
-    // A `?.` chain whose base is not a re-readable place stages that base in
-    // `optRecvSlot`, so the null test and the field read share one evaluation.
-    if !fnUsesOptRecv {
-      if blockHasStash(fn.fnBody, fnIx, "optrecv") { fnUsesOptRecv = true }
-    }
-    // A `.get` whose index or receiver is not a re-readable place stages it in the `.get`
-    // stash, so the bounds compare and the element read share one evaluation.
-    if !fnUsesListGet {
-      if blockHasStash(fn.fnBody, fnIx, "listget") { fnUsesListGet = true }
-    }
+    scanStashes(fn.fnBody, fnIx)
     collectRefPushSlots(fn.fnBody, fnIx)
     // A Member-receiver ref-list `.pop` (`T.scopes.pop()`) needs the SAME typed scratch
     // frame as a ref `.push` onto that slot — record its slot too, so a pop-only function
@@ -2451,20 +2454,14 @@ function startFnDetectScratch() {
     if globalRunsInStartFn(vrg) {
       const vg = nodeAt(globalStmts[vrg])
       if vg is LetDecl {
-        if vg.letInit >= 0 {
-          if blockHasVariantRebox(vg.letInit, -1) { fnUsesVariantRebox = true }
-          if blockHasStash(vg.letInit, -1, "optrecv") { fnUsesOptRecv = true }
-          if blockHasStash(vg.letInit, -1, "listget") { fnUsesListGet = true }
-        }
+        if vg.letInit >= 0 { scanStashes(vg.letInit, -1) }
       }
     }
     vrg = vrg + 1
   }
   let vrs = swS0
   while vrs < swS1 {
-    if blockHasVariantRebox(startStmts[vrs], -1) { fnUsesVariantRebox = true }
-    if blockHasStash(startStmts[vrs], -1, "optrecv") { fnUsesOptRecv = true }
-    if blockHasStash(startStmts[vrs], -1, "listget") { fnUsesListGet = true }
+    scanStashes(startStmts[vrs], -1)
     vrs = vrs + 1
   }
   let lgi = swG0

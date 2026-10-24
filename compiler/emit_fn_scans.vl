@@ -1783,126 +1783,132 @@ function stashHitAt(ix: i32, fnIx: i32, want: StashWant): boolean {
   }
 }
 
-// Whether the tree at `ix` holds a node needing the `want` stash, so the function reserves
-// its slot. Walks every statement and expression kind; under-reserving the rebox slot fails
-// loudly and the `?.` one is invalid wasm, so the walk over-approximates for both.
-export function blockHasStash(ix: i32, fnIx: i32, want: StashWant): boolean {
-  if ix < 0 { return false }
-  if stashHitAt(ix, fnIx, want) { return true }
+// The stash bits `blockStashMisses` takes and returns: 1 is "rebox", 2 "optrecv", 4 "listget".
+export const stashRebox = 1
+export const stashOptRecv = 2
+export const stashListGet = 4
+
+// Clears from `rem` each stash bit the single node at `ix` needs.
+function stashMissAt(ix: i32, fnIx: i32, rem: i32): i32 {
+  let r = rem
+  if (r & stashRebox) != 0 && stashHitAt(ix, fnIx, "rebox") {
+    r = r - stashRebox
+  }
+  if (r & stashOptRecv) != 0 && stashHitAt(ix, fnIx, "optrecv") {
+    r = r - stashOptRecv
+  }
+  if (r & stashListGet) != 0 && stashHitAt(ix, fnIx, "listget") {
+    r = r - stashListGet
+  }
+  r
+}
+
+// The stash bits of `rem` no node in the tree at `ix` needs; a cleared bit means the function
+// reserves that slot. One walk answers all three, and a bit stops being asked once it clears.
+// Walks every statement and expression kind; under-reserving the rebox slot fails loudly and
+// the `?.` one is invalid wasm, so the walk over-approximates for both.
+export function blockStashMisses(ix: i32, fnIx: i32, rem: i32): i32 {
+  if ix < 0 || rem == 0 { return rem }
+  let r = stashMissAt(ix, fnIx, rem)
+  if r == 0 { return 0 }
   const n = nodeAt(ix)
   match n {
     Call => {
-      if blockHasStash(n.callFn, fnIx, want) { return true }
+      r = blockStashMisses(n.callFn, fnIx, r)
       const args = n.callArgs
       let i = 0
-      while i < args.length {
-        if blockHasStash(args[i], fnIx, want) { return true }
+      while i < args.length && r != 0 {
+        r = blockStashMisses(args[i], fnIx, r)
         i = i + 1
       }
-      return false
     }
     Block => {
       const stmts = n.blkStmts
       let i = 0
-      while i < stmts.length {
-        if blockHasStash(stmts[i], fnIx, want) { return true }
+      while i < stmts.length && r != 0 {
+        r = blockStashMisses(stmts[i], fnIx, r)
         i = i + 1
       }
-      return false
     }
     LetDecl => {
-      if n.letInit >= 0 { return blockHasStash(n.letInit, fnIx, want) }
-      return false
+      r = blockStashMisses(n.letInit, fnIx, r)
     }
     RetStmt => {
-      if n.retArg >= 0 { return blockHasStash(n.retArg, fnIx, want) }
-      return false
+      r = blockStashMisses(n.retArg, fnIx, r)
     }
     IfStmt => {
-      if blockHasStash(n.ifCond, fnIx, want) { return true }
-      if blockHasStash(n.ifThen, fnIx, want) { return true }
-      if n.ifElse >= 0 { return blockHasStash(n.ifElse, fnIx, want) }
-      return false
+      r = blockStashMisses(n.ifCond, fnIx, r)
+      r = blockStashMisses(n.ifThen, fnIx, r)
+      // A tail call, so a long else-if chain costs no stack (D1990).
+      return blockStashMisses(n.ifElse, fnIx, r)
     }
     WhileStmt => {
-      if blockHasStash(n.whileCond, fnIx, want) { return true }
-      return blockHasStash(n.whileBody, fnIx, want)
+      r = blockStashMisses(n.whileCond, fnIx, r)
+      r = blockStashMisses(n.whileBody, fnIx, r)
     }
     ForRange => {
-      if blockHasStash(n.frFrom, fnIx, want) { return true }
-      if blockHasStash(n.frTo, fnIx, want) { return true }
-      if n.frStep >= 0 {
-        if blockHasStash(n.frStep, fnIx, want) { return true }
-      }
-      return blockHasStash(n.frBody, fnIx, want)
+      r = blockStashMisses(n.frFrom, fnIx, r)
+      r = blockStashMisses(n.frTo, fnIx, r)
+      r = blockStashMisses(n.frStep, fnIx, r)
+      r = blockStashMisses(n.frBody, fnIx, r)
     }
     ForIn => {
-      if blockHasStash(n.fiIter, fnIx, want) { return true }
-      return blockHasStash(n.fiBody, fnIx, want)
+      r = blockStashMisses(n.fiIter, fnIx, r)
+      r = blockStashMisses(n.fiBody, fnIx, r)
     }
     BinExpr => {
-      if blockHasStash(n.binLeft, fnIx, want) { return true }
-      return blockHasStash(n.binRight, fnIx, want)
+      r = blockStashMisses(n.binLeft, fnIx, r)
+      r = blockStashMisses(n.binRight, fnIx, r)
     }
     Unary => {
-      return blockHasStash(n.unArg, fnIx, want)
+      r = blockStashMisses(n.unArg, fnIx, r)
     }
     Paren => {
-      return blockHasStash(n.parInner, fnIx, want)
+      r = blockStashMisses(n.parInner, fnIx, r)
     }
     IsExpr => {
-      return blockHasStash(n.isObj, fnIx, want)
+      r = blockStashMisses(n.isObj, fnIx, r)
     }
     AsExpr => {
-      return blockHasStash(n.asObj, fnIx, want)
+      r = blockStashMisses(n.asObj, fnIx, r)
     }
     Member => {
-      return blockHasStash(n.memObj, fnIx, want)
+      r = blockStashMisses(n.memObj, fnIx, r)
     }
     // A `?.` RECEIVER is lowered exactly as a `.` one is, so a stash needed under it belongs
     // to the enclosing frame (D1667).
     OptMember => {
-      return blockHasStash(n.omObj, fnIx, want)
+      r = blockStashMisses(n.omObj, fnIx, r)
     }
     Index => {
-      if blockHasStash(n.idxArr, fnIx, want) { return true }
-      return blockHasStash(n.idxIndex, fnIx, want)
+      r = blockStashMisses(n.idxArr, fnIx, r)
+      r = blockStashMisses(n.idxIndex, fnIx, r)
     }
     ObjLit => {
       const fields = n.objFields
       let i = 0
-      while i < fields.length {
+      while i < fields.length && r != 0 {
         const f = nodeAt(fields[i])
-        if f is FieldInit {
-          if blockHasStash(f.fiValue, fnIx, want) { return true }
-        }
+        if f is FieldInit { r = blockStashMisses(f.fiValue, fnIx, r) }
         i = i + 1
       }
-      return false
     }
     // A spread's source is an operand like any other (D2334).
     Spread => {
-      return blockHasStash(n.spdArg, fnIx, want)
+      r = blockStashMisses(n.spdArg, fnIx, r)
     }
     ArrayLit => {
       const elems = n.arrElems
       let i = 0
-      while i < elems.length {
-        if blockHasStash(elems[i], fnIx, want) { return true }
+      while i < elems.length && r != 0 {
+        r = blockStashMisses(elems[i], fnIx, r)
         i = i + 1
       }
-      return false
     }
     // Any other node holds no sub-tree this walk descends into.
     NumLit | StrLit | CharLit | BoolLit | NullLit | Ident | ErrExpr | Param | TypeRef | FuncDecl | BreakStmt | ContinueStmt | Program | FieldDef | TypeDecl | FieldInit | UnionDecl | MatchExpr | ImportDecl => {}
   }
-  false
-}
-
-// The variant-rebox reservation's own question (`variantReboxSlot`), the walk's first
-// claimant.
-export function blockHasVariantRebox(ix: i32, fnIx: i32): boolean {
-  blockHasStash(ix, fnIx, "rebox")
+  r
 }
 
 // True if `stmtIx` is usable as an if-expression arm value: a plain tail value, a member call
