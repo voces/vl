@@ -133,7 +133,7 @@ the slice retires.
 | D2 | ref-list kind ladder by type (landed: 7 retired, 15 left; the rest waits on D1 and D8) | 22 | 0 / 0 / 22 | 0 / 22 | `emit_collect`, `emit_shape_rows` |
 | D3 | mono instance keyed by pin type (landed: key by type, hole-function, written-let and coerce-caller pins typed, site B carries `tvT`, and every site-B producer reads its argument's type, a nullable field receiver finds its record by type; 5 retired, 18 left as the instance TypeRef text and spelled key) | 23 | 0 / 0 / 23 | 15 / 8 | `emit_mono`, `emit_rewrite` |
 | D4 | narrowed pins and pin unions (probed: blocked on D3 and D5) | 11 | 0 / 0 / 11 | 8 / 3 | `emit_mono` |
-| D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; probed: the atom tests and the uncovered-row fallback have atoms with no type, the rest are the registry's own split and the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
+| D5 | union registry by type (step 5 remainder) (landed: 14 retired, 7 left; re-probed: the atom tests agree wherever atoms are typed, but `emit_mono`'s name-only pins register rows with no type; the registry's own split disagrees with canonical members in 2,573 files, so minting by type changes box tags; the rest is the D4930 alias) | 21 | 1 / 0 / 20 | 12 / 9 | `emit_anon_fields`, `emit_base`, `emit_classify`, `emit_closure_sites`, `emit_collect`, `emit_obj_lit_fits`, `emit_rep`, `emit_rewrite`, `emit_sections`, `emit_shape_intern`, `emit_start_block`, `emit_union_registry`, `wasmEmit` |
 | D6 | struct and variant rows of inline shapes by type (landed: 4 retired, 8 left; the nullable let rung and the joined-record arm walk ask the type, the rest wait on the spelling-keyed interner and resolver) | 8 | 0 / 0 / 8 | 2 / 6 | `emit_classify`, `emit_collect`, `emit_shape_rows` |
 | D7 | narrowing store banks a type (landed: 9 retired, 1 to B and since deleted, 0 left) | 11 | 0 / 1 / 10 | 4 / 7 | `emit_base`, `emit_classify`, `emit_shape_rows`, `emit_sig_tokens`, `emit_start_block`, `emit_ty_canon` |
 | D8 | mv, closure-sig and field-companion slots by type (landed: 7 retired, 11 left; every mv slot banks a type, the mint classifies by it, 0 retired; the two closure-signature keys ask the type) | 18 | 0 / 4 / 14 | 5 / 13 | `emit_classify`, `emit_collect`, `emit_map_value_slots`, `emit_mv_slots`, `emit_obj_lit_fits`, `emit_shape_intern`, `emit_sig_tokens`, `emit_union_atoms`, `wasmEmit` |
@@ -1287,6 +1287,22 @@ What each slice changes:
       instance or a d3140 named cell has no type.
     - The fallback finds no member type in either of its 2 files, even through the row's own
       `unTyIx`.
+
+    A third probe, after #4603, #4607 and #4610, covered the self-compile and 16,641 files. It
+    gave the function each atom's type from `unionAtomTysOf` and excluded a lone string literal
+    (a one-member union with no alias name) from the literal test:
+    - Wherever every atom has a type, the literal test agrees in 979 files (2,509 events), the
+      array test in 149 (390 events), and the function's answer in 2,526. None differ.
+    - 373 events in 152 files still have atoms with no type. The row is registered by name with
+      sty -1, never through a count mismatch. Every recorded site is `registerInlineUnionOfTy`
+      (205) or `registerInlineUnionAtoms` recursing under such a row (10). The -1 comes from
+      `monoRegisterPinUnion`'s name-only pins: five call sites in `emit_mono` pass it (`P|null`,
+      `CN<f64>|null`, `S|i32`, `P[]|i32[]`). There, only the spelling says that `#lu2`, `S` and
+      `K` are literal unions and that `i32[][]`, `P[]` and `CN<…>` are arrays.
+    - The fallback has 1 file and 3 events, none with a member type.
+
+    These retire when those pins pass the type they pinned. That is `emit_mono`'s pin seam (D3,
+    D4), not this lane.
   - Done: 2 renders. `cloCallParamUnionName` no longer has a render rung: past the alias and
     nominal rungs the lifted lambda's own pin answers. 5 files reach the old rung, all with an
     empty render that already fell through to that pin. `njStash` names the union by
@@ -1296,10 +1312,18 @@ What each slice changes:
   - Left: `shareFieldUnionRow`, where the render is the registered key. 26 files reach it, and in
     13 of them the render differs from the canon row's own name (`{x:i32}[]|i32[]` against
     `P[]|i32[]`). That is the alias D4930 needs, because readers look the structural spelling up
-    by name.
-  - Left, not probed: the registry's own `recordUnMemTys`, `unionSetAtomsOf` and
-    `unionSetMemberCount`. They split a row's set spelling in box-tag order, and they go when
-    rows mint from `canonUnionMemberTysOf`.
+    by name. A re-probe over 16,641 files: of those 26, `unionSpellingOfTy` agrees with the render
+    in 18, differs in 3 and declines on a record member in 9. The canon key text differs in 7, and
+    in 1 no row exists, so the render is the name minted.
+  - Left: the registry's own `recordUnMemTys`, `unionSetAtomsOf` and `unionSetMemberCount`.
+    They split a row's set spelling in box-tag order. A probe compared that split with
+    `canonUnionMembersInto` of the row's `unTyIx` over 16,641 files, 7,290 of which reach it:
+    - the member count differs in 2,573 files;
+    - where the counts match, the member types differ in 3,334, the atom spellings in 167, and
+      `null`'s position in 62.
+
+    Minting from canonical members would therefore change box-tag order and arity. It is the
+    step-5 ABI change itself, not a swap that leaves output identical.
 - **D6.** `structIndexOfTypeName`, `shapeRowScanK`, `inferNulStructRow`, `inferNulVariantRow` and
   `structIndexOfLet` answer by type.
 
