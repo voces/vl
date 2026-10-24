@@ -258,6 +258,9 @@ import {
   indexPathKeyOf,
   inferNicheNullByName,
   isLitVariantName,
+  isRecvStagedIx,
+  isRecvStagedNonNull,
+  isRecvStagedSlot,
   litLexIsMember,
   loopStackFind,
   mapShapeFoldSet,
@@ -1063,6 +1066,7 @@ import {
   exprIsNullLike,
   ifChainAllBareNull,
   ifLinkYieldsNull,
+  isRecvStashSlot,
   listPayloadStashSlot,
   litAtomCastSlot,
   nulNicheBoxSlot,
@@ -6065,6 +6069,46 @@ function nullInstanceIsResult(isIx: i32, fnIx: i32): i32 {
 // mono-static folds, then the variant tag+discriminant compare. A niche `is` assumes the checker
 // proved the tested shape is the sole non-null member, which monomorphization can break (D950).
 function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) { return emitIsTestRungs(body, isIx, fnIx) }
+  const rep = isRecvStageRep(isIx, fnIx)
+  if rep < 0 { return emitIsTestRungs(body, isIx, fnIx) }
+  if emitExpr(body, nd.isObj, fnIx) < 0 { return -1 }
+  const slot = isRecvStashSlot(rep)
+  fbLocalSet(slot)
+  const svIx = isRecvStagedIx
+  const svSlot = isRecvStagedSlot
+  const svNonNull = isRecvStagedNonNull
+  isRecvStagedIx = unwrapParen(nd.isObj)
+  isRecvStagedSlot = slot
+  isRecvStagedNonNull = rep == 3
+  const r = emitIsTestRungs(body, isIx, fnIx)
+  isRecvStagedIx = svIx
+  isRecvStagedSlot = svSlot
+  isRecvStagedNonNull = svNonNull
+  r
+}
+
+// The rep a membership test's receiver is staged at (D12060), or -1 to read it in place: a
+// literal-union test re-reads its receiver once per member, so one that is not a re-readable
+// place is evaluated first into a local. 0 a union box, 1 an atom id, 2 a nullable string,
+// 3 a string.
+function isRecvStageRep(isIx: i32, fnIx: i32): i32 {
+  const nd = nodeAt(isIx)
+  if !(nd is IsExpr) || unionEqOperandOk(nd.isObj) { return -1 }
+  const ity = isVarTyIxOf(isIx)
+  if tyLitMemberTexts(ity).length < 2 && tyNumLitMemberTexts(ity).length < 2 {
+    return -1
+  }
+  if exprUnion(nd.isObj, fnIx) { return 0 }
+  if exprIsLitAtom(nd.isObj, fnIx) { return 1 }
+  if exprNullableString(nd.isObj, fnIx) { return 2 }
+  if exprString(nd.isObj, fnIx) { return 3 }
+  -1
+}
+
+// The rungs of `emitIsTest`, over a receiver staged or read in place.
+function emitIsTestRungs(body: u8[], isIx: i32, fnIx: i32) {
   const nd0 = nodeAt(isIx)
   // `r?.f is null` is `r?.f == null`: one test over every link and the field's own null (D3457).
   if nd0 is IsExpr {
@@ -6167,6 +6211,11 @@ function emitIsTest(body: u8[], isIx: i32, fnIx: i32) {
       if ef > 0 { return 0 }
     }
     if st >= 0 {
+      // A static answer still evaluates a receiver that is not a re-readable place (D12070).
+      if !unionEqOperandOk(nd0.isObj) {
+        if emitExpr(body, nd0.isObj, fnIx) < 0 { return -1 }
+        fbDrop()
+      }
       fbI32Const(st)
       return 0
     }
@@ -19762,6 +19811,11 @@ export function emitExpr(body: u8[], exprIx: i32, fnIx: i32) {
   // diagnostic prints. Checking the flag at the two recursion roots makes a failure terminal wherever it happened, instead of relying on every caller in between to thread -1 outward.
   if emitFailed { return -1 }
   if exprIx < 0 { return emitFail("emitProgram: missing expression") }
+  if exprIx == isRecvStagedIx {
+    fbLocalGet(isRecvStagedSlot)
+    if isRecvStagedNonNull { fbRefAsNonNull() }
+    return 0
+  }
   if exprIx == lmaValNode {
     const lmaArg = lmaValArg
     lmaValNode = -1
