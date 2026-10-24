@@ -17,6 +17,7 @@
 //
 // @test-timing native
 
+import { builtScript } from "./support/builtScript.ts";
 import { COMPILER, exists, nativeEnv, ROOT, VL } from "./support/tree.ts";
 
 const GATED = Deno.env.get("SELFHOST_NATIVE_ALIGN") === "1";
@@ -27,7 +28,12 @@ if (GATED && !ENABLED) {
 
 const census = async (args: string[] = []): Promise<{ code: number; out: string }> => {
   const p = new Deno.Command(VL, {
-    args: ["run", `${ROOT}/scripts/wasm-runner-census.vl`, "--", ...args],
+    args: [
+      "run",
+      await builtScript(`${ROOT}/scripts/wasm-runner-census.vl`, { cwd: ROOT, compiler: null }),
+      "--",
+      ...args,
+    ],
     cwd: ROOT,
     stdout: "piped",
     stderr: "piped",

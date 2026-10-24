@@ -15,6 +15,7 @@
 //
 // @test-timing instrument
 
+import { builtScript } from "./support/builtScript.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const MATRIX = `${ROOT}/scripts/capability-matrix.vl`;
@@ -68,9 +69,7 @@ const runMatrixOnce = async (
 ): Promise<{ code: number; cells: Cell[]; out: string }> => {
   const args = [
     "run",
-    MATRIX,
-    "--compiler",
-    COMPILER,
+    await builtScript(MATRIX, { cwd: ROOT }),
     "--",
     template.startsWith("/") ? template : `${TEMPLATES}/${template}`,
     "--compiler",

@@ -452,8 +452,8 @@ Deno.test({
 // re-derives every closed set from the `export type` that declares it and compares
 // against `compiler/lint.vl`'s `const kl<Name>` arrays, exiting non-zero on any drift —
 // the same contract tests/vl_scan_passes_test.ts enforces on `asPasses`. A drifting set
-// fails HERE and names the set, rather than showing up as a count change in the ratchet.
-// The control is a copy of compiler/ with one new closed set, which the check must name.
+// The committed tree is the `kind-ladder sets` row of scripts/gate.sh and its own ci.yml step;
+// this holds the check itself to a copy of compiler/ with one new closed set, which it must name.
 const sets = async (args: string[]) => {
   const { code, stdout, stderr } = await new Deno.Command(VL, {
     args: ["run", SETS, "--compiler", COMPILER, "--", ...args],
@@ -467,13 +467,9 @@ const sets = async (args: string[]) => {
 };
 
 Deno.test({
-  name: "kind-ladder: the lint's closed-set copy still matches the tree",
+  name: "kind-ladder: ladder-sets.vl names a closed set the lint's copy lacks",
   ignore: !ENABLED,
   fn: async () => {
-    const tree = await sets([]);
-    if (tree.code !== 0) {
-      throw new Error(`ladder-sets.vl exited ${tree.code}:\n${tree.out}`);
-    }
     const dir = await Deno.makeTempDir({ prefix: "vl_kind_sets_" });
     try {
       await Deno.mkdir(`${dir}/compiler`);

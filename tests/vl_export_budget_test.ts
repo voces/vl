@@ -15,6 +15,7 @@
 //
 // @test-timing sweep n=30
 
+import { builtScript } from "./support/builtScript.ts";
 import { COMPILER, ROOT, VL, exists, nativeEnv } from "./support/tree.ts";
 
 const SCRIPT = `${ROOT}/scripts/dead-exports.vl`;
@@ -39,7 +40,7 @@ const vl = async (args: string[]): Promise<{ code: number; out: string }> => {
 };
 
 const run = async (args: string[]): Promise<string> => {
-  const r = await vl(["run", SCRIPT, "--compiler", COMPILER, "--", ...args]);
+  const r = await vl(["run", await builtScript(SCRIPT, { cwd: ROOT }), "--", ...args]);
   if (r.code !== 0) {
     throw new Error(`dead-exports.vl ${args.join(" ")} exited ${r.code}: ${r.out}`);
   }
