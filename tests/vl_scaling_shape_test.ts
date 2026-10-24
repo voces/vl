@@ -780,11 +780,11 @@ axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d)
 
 // D11270's pair, at one filler statement per use: six fillers diluted the per-union cost to
 // a 2.31 reading while the compiler was quadratic in distinct unions (4.06 at one). With the
-// union-row, root-declaration and variant-twin scans indexed it reads 1.66 in fuel.
+// union-row, root-declaration, variant-twin and variant-row scans indexed it reads 1.39 in fuel.
 axis(
   "unions",
   2.5,
-  "A per-union ask is scanning the union registry — `unRowOfCanon` (emit_rep.vl), `declaredStructUnionMembers` (check_nj_join.vl), `buildVariantTwins` (emit_union_atoms.vl) or `variantRowOfTy` (emit_mv_slots.vl, still a scan).",
+  "A per-union ask is scanning the union registry — `unRowOfCanon` (emit_rep.vl), `declaredStructUnionMembers` (check_nj_join.vl), `buildVariantTwins` (emit_union_atoms.vl) or `variantRowOfTy` (emit_mv_slots.vl).",
   (d) => twoFiles(d, genUnions(2400, 1), genUnions(2400, 20)),
 );
 
