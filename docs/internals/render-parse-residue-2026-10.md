@@ -124,7 +124,7 @@ the slice retires.
 | A3 | emit_collect / emit_classify typed rungs (landed: 11 retired, 1 left; re-probed at 5888be183 with the inventory witnesses: the nullable-element reject and the arm-shape walk typed, `dstPinMapValue`'s cut is the pin name it pushes) | 12 | 11 / 1 / 0 | 0 / 12 | `emit_classify`, `emit_collect` |
 | A4 | nominal and signature-key twins (done: 7 retired, 2 to B, 0 left) | 9 | 9 / 0 / 0 | 2 / 7 | `emit_rewrite`, `emit_sig_tokens` |
 | A5 | union-atom and atom-kind twins (landed: 6 retired, 6 left; `unionTakesAtomAsStr` and `atomsTakeAtomAsStr` deleted once the four `emit_fn_scans` callers asked the declared type or the row's set; `atomsHaveValueAtom` left, because a generic body's target has no row and no pinned type) | 12 | 12 / 0 / 0 | 3 / 9 | `emit_atom_kinds`, `emit_base`, `emit_nullable_rets`, `emit_union_atoms`, `wasmEmit` |
-| C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
+| C1 | mono walkers bind by type (L1) (landed: 5 retired, then 4 at site A, then the 3 in `monoAnnHasTyParam`, 5 left; composite renderer measured, different-type rows ablated, no site swaps; step 3: sites A, B, C and D bind by type, `monoBindFromAnn` deleted; `monoAnnHasTyParam` asks the annotation node; the 5 left re-probed per site, none swaps) | 5 | 0 / 5 / 0 | 0 / 5 | `emit_base` |
 | C2 | instance cell signatures typed (landed: 2 retired, 3 left; the arrow tests wait on constructor producers that build signature text with no type, and the render is a synthesized TypeRef's name) | 5 | 0 / 4 / 1 | 1 / 4 | `emit_mono` |
 | C3 | shape-intern walkers take field types (landed: 10 retired, 6 left, probed: keys and no-type producers) | 16 | 2 / 14 / 0 | 1 / 15 | `emit_shape_intern` |
 | C4 | shape-text field callers thread a type (landed: 6 retired, 3 left; re-probed at 7dfbcfa6d: the no-type reaches come from resolver callers that hold only a name) | 9 | 0 / 9 / 0 | 1 / 8 | `emit_field_codes`, `emit_shape_rows` |
@@ -749,6 +749,31 @@ What each slice changes:
   shaped too, so both `nameIsArray` entries retire (D3 leaves 19, down from 21). Site A's fallback count did
   not move: **398 before and 398 after** on this probe, which also tags the self-compile. These
   three producers were not where those events come from.
+
+  **The 5 left entries, re-probed per site (2026-10-24).** Each entry's spelling answer was
+  compared with the arena answer for the type its caller hands down: the annotation node's
+  type at the top, then the aligned child (map value, record field by name, fn parameter and
+  return, the paren's own type, the `[]` run stripped). A union member and a generic
+  application's argument have no type. The run covered 16,646 files (tests and the distilled
+  corpus) and the self-compile on 02dd23e36. Every entry stays:
+
+  | entry | agree | disagree (files) | no type | what the disagreements are |
+  | --- | --- | --- | --- | --- |
+  | `annFnDecompose` / `annArrowAt` | 2,879 | 65 (26) | 181,685 | a fn type in grouping parens |
+  | `monoTyParamOf` / `nameIsArray` | 19,290 | 77 (17) | 8,248 | `T[]` on a node the clone already retyped to the instance |
+  | `monoSubstAnn` / `unionMemberCount` | 5,130 | 104 (68) | 2,753 | a union in grouping parens |
+  | `monoSubstAnn` / `splitUnionAtoms` (the annotation) | 1,502 | 66 (46) | 237 | `T\|K`, `K` a literal-union alias |
+  | `monoSubstAnn` / `splitUnionAtoms` (the re-split) | 0 | 0 | 3,279 | reads the walker's own output |
+
+  None of the recorded disagreements (up to three per file) is a missing pin. In the two paren rows the spelling sends
+  `((T)=>void)` or `(T|null)` to the paren arm, which keeps the group. The arena sees through
+  the parens, so a typed test would rebuild the spelling without the group. Without the group,
+  a following `[]` binds into the last arm (D1896). The literal-union alias is one atom in the
+  spelling, and box tags count it positionally. The arena flattens it to its literals. In the
+  `T[]` row the type parameter survives only in the spelling. The 3,242 inventory witnesses
+  agree in the same proportions: 390 / 18, 2,792 / 12, 745 / 15, 291 / 4, and 572 with no
+  type. All five go with step 1, a substitution done on types and an instance keyed by type
+  (D3).
 - **C2.** Landed after C1: 2 retired, 3 left. A probe over the self-compile and 16,641 files
   (0 uncompared) tagged every arrow test and split the events at `monoCoerceFnValueTys` by
   whether `expTy` is a function type.
