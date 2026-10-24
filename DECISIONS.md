@@ -6350,6 +6350,87 @@ these rows: 4,021 × about 16 ms is under a tenth of ci-native's CPU. What is le
 process is mostly wasmtime deserializing the sidecar (about 8.7 ms, most of it hashing the
 module's types into the engine's type registry), which the host does not control.
 
+## An unchanged `vl run` is served by the compile cache; the user module keeps Cranelift's default tier (2026-10-23)
+
+**The compile tier: measured, nothing adopted.** A user module is compiled by Cranelift at its
+default optimisation level. Three cheaper tiers were measured over generated programs of 1k,
+4k, 16k and 64k lines, the compute-heavy `bench/` programs and four real programs. Each run
+used a fresh `VL_CACHE_DIR`, so the module compiled every time. Load was 5–18.
+
+| program | wasm | default: compile / wall | `OptLevel::None` | Pulley |
+| --- | --- | --- | --- | --- |
+| generated, 1k lines | 30 KB | 0.057–0.071 / 0.108–0.127 s | 0.046–0.051 / 0.102–0.117 | 0.067–0.074 / 0.117–0.133 |
+| generated, 4k | 123 KB | 0.033–0.035 / 0.22–0.26 | 0.027–0.031 / 0.22–0.25 | 0.039–0.042 / 0.26–0.28 |
+| generated, 16k | 500 KB | 0.105–0.242 / 0.81–1.09 | 0.069–0.086 / 0.79–1.11 | 0.167–0.179 / 0.87–0.92 |
+| generated, 64k | 2.06 MB | 0.41–0.54 / 2.86–3.53 | 0.25–0.32 / 2.75–3.24 | 1.59–1.85 / 4.1–7.2 |
+| `bench/algorithms/nbody` (wall) | | 2.81, 5.59 | 7.80, 6.69 | |
+| `bench/algorithms/spectralnorm` | | 2.49, 2.40 | 3.28, 5.64 | |
+| `bench/collections/map-string` | | 0.99, 1.01 | 1.20, 1.20 | |
+| `bench/recursion/fib` | | 0.86–0.88 | 0.87 | 12.73 |
+| `scripts/goal-scoreboard.vl` | | 0.64–0.65 | 0.80–0.81 | |
+| `scripts/inventory/ls.vl -- --status open` | | 0.54–0.56 | 0.65–0.66 | |
+| diderven `src/tools/synergysim.vl`, 213 KB source | | 0.78 | 0.76–0.78 | |
+
+Every tier printed the same output. Winch cannot compile these modules at all: wasmtime 49
+refuses it with `the wasm_function_references feature is not supported on this compiler
+configuration`, and every VL module is WasmGC. Pulley needs `wasm_threads` and `shared_memory`
+turned off, compiles more slowly than Cranelift, and runs `fib` about 15x slower.
+`OptLevel::None` saves 0.1–0.25 s only on the largest generated modules. On real programs it
+saves nothing, it costs real scripts 15–25%, and it runs `nbody` and `spectralnorm` up to 2.5x
+slower. The compile it would make cheaper is already cached by the module cache (§"A user
+module's Cranelift compile is cached"), so for a re-run it buys nothing. `vl build` and the
+seed's engine were not part of the measurement.
+
+**What an unchanged re-run paid was the check and the emit.** The module cache skips the
+Cranelift compile, but the seed still loaded, read every module and checked and emitted the
+whole program on every `vl run foo.vl`. So `vl run` of a source file is now a compile-cache
+action, kind `run` (`run_cache_action`, `compile_and_run`, `scripts/vl-host/src/main.rs`).
+Like every other kind it is opt-in under `VL_COMPILE_CACHE=1`, because turning the cache on by
+default is the owner's decision and is being trialled separately. `VL_NO_COMPILE_CACHE`, the
+bypass variables, `VL_COMPILE_CACHE_VERIFY` and the 4 GB prune all apply unchanged.
+
+**What the key covers.** The manifest key holds the kind, the host's build id and the keyed
+environment, as for every kind. The parts are:
+
+* the seed's SHA-256 (`compiler_hash`, from #4584's stat memo);
+* the entry path, the name-section mode and the link options;
+* the VL root and the cwd;
+* the entry's bytes.
+
+The transcript holds every module the compiler asked for, `std:` included, with the hash of
+each reply. The stored result is the emitted wasm. The run engine is not part of the key,
+because the module cache keys the compile of those bytes by its own engine tag. Colour is not
+part of the key either: only a compile that succeeded is stored, and a successful `vl run`
+compile prints nothing, so there is no output to replay. A failed compile, and a module the
+engine refuses, store nothing and print their diagnostics on every run.
+
+**A miss compiles the module once.** Before storing, `serve` asks whether the emitted bytes are
+a valid module. For `run` that check is the run's own `user_module` compile, and the module it
+produces is kept for the run, so a miss compiles the module exactly once (a second compile
+would show as a second `module cache` trace line). On a hit the module comes from the module
+cache, so the run does no check, no emit and no Cranelift compile.
+
+**A damaged result is rejected loudly and recompiled.** A result whose envelope does not verify
+was already never served. It now traces `rejected (corrupt result)` before the miss, for every
+kind. The cold compile's store then overwrites the entry.
+
+**What it bought.** Wall time of an unchanged re-run with the module cache warm, three runs
+each, load 14–17:
+
+| program | cache off | `run` hit |
+| --- | --- | --- |
+| generated, 1k lines | 0.053–0.063 s | 0.004–0.005 s |
+| generated, 16k | 0.762–0.771 | 0.008–0.009 |
+| generated, 64k | 2.955–3.005 | 0.024–0.028 |
+| diderven `src/tools/lint.vl`, no arguments | 0.256–0.268 | 0.133–0.146 |
+| diderven `src/tools/synergysim.vl` | 0.461–0.476 | 0.045–0.052 |
+| `scripts/goal-scoreboard.vl` | 0.713–0.746 | 0.553–0.556 (one outlier at 3.28) |
+| `scripts/inventory/ls.vl -- --status open` | 0.673–0.703 | 0.466–0.478 |
+
+A miss costs what an uncached run costs. Whatever is left on a hit is the program's own work.
+`tests/vl_run_cache_test.ts` holds the contract. Three planted defects red it: dropping the
+entry's bytes from the key, dropping the cwd, and compiling the module twice on a miss.
+
 ## std ships inside the binary; a pin is one file; development overrides are explicit and announced (owner question 2026-09-03) — D1573/D1574, BUILT
 
 The owner asked whether `vl` should distribute with std baked in. It should, and the reason is
