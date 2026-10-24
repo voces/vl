@@ -53,6 +53,8 @@ import {
   identDeclOf,
   identOrigArm,
   identOrigOf,
+  sidArrGet,
+  sidArrPut,
 } from "./symbols"
 import { substTyDeep } from "./check_relate_core"
 import { callBindTyOf } from "./check_bind_rows"
@@ -83,7 +85,16 @@ const FF_NAIVE_CAP = 400000
 const FF_CTX_PER_FN = 64
 
 // ── the classes: union-find over slots, each root holding its class's facts ─────────────────
-let ffKeyIx: {[string]: i32} = Map()
+// Slots and walk marks by (node, context): a chain per node over `ffPairCtx`/`ffPairVal`/
+// `ffPairNext`, one head table per kind; a negative node's head is in `ffPairNeg`.
+const FF_PAIR_DECL = 0
+const FF_PAIR_RET = 1
+const FF_PAIR_WALKED = 2
+let ffPairHead: i32[][] = [[], [], []]
+let ffPairNeg: {[i32]: i32} = Map()
+let ffPairCtx: i32[] = []
+let ffPairVal: i32[] = []
+let ffPairNext: i32[] = []
 // Reads the walk resolved to a local binding, by node: the sweep checks none now names a function.
 let ffLocalRead: {[i32]: i32} = Map()
 // Per declaration: the binding its initializer reads (-2 for a capture cell, which exists because
@@ -162,7 +173,6 @@ let ffCtx = 0
 let ffFn = -1
 let declCtx: {[i32]: i32} = Map()
 let fnCtx: {[i32]: i32} = Map()
-let walked: {[string]: boolean} = Map()
 let tyFnMemo: {[i32]: i32} = Map()
 
 // The records the sweep grades, keyed by the pre-mono node: 0 a read of a named function, 1 a
@@ -192,7 +202,11 @@ export function fnFlowShadowWork() { ffWork }
 // Start a compile: drop the previous one's table and stop the origin column recording.
 export function fnFlowShadowBegin() {
   ffWork = 0
-  ffKeyIx = Map()
+  ffPairHead = [[], [], []]
+  ffPairNeg = Map()
+  ffPairCtx = []
+  ffPairVal = []
+  ffPairNext = []
   ffLocalRead = Map()
   ffDeclFrom = Map()
   ffDeclWr = Map()
@@ -238,7 +252,6 @@ export function fnFlowShadowBegin() {
   ctxBT = []
   declCtx = Map()
   fnCtx = Map()
-  walked = Map()
   tyFnMemo = Map()
   rdHead = Map()
   rdNext = []
@@ -292,25 +305,58 @@ function ffFind(x: i32): i32 {
   r
 }
 
-// The slot named `key`, minted on first use.
-function ffSlot(key: string): i32 {
-  const hit = ffKeyIx[key] ?? -1
+function ffPairHeadOf(kind: i32, a: i32): i32 {
+  if kind < 0 || kind >= ffPairHead.length { return -1 }
+  if a < 0 { return ffPairNeg[a * 3 - kind] ?? -1 }
+  sidArrGet(ffPairHead[kind], a)
+}
+
+// The value stored for node `a` in context `ctx` under `kind`, or -1.
+function ffPairGet(kind: i32, a: i32, ctx: i32): i32 {
+  let e = ffPairHeadOf(kind, a)
+  while e >= 0 {
+    if ffPairCtx[e] == ctx { return ffPairVal[e] }
+    e = ffPairNext[e]
+  }
+  -1
+}
+
+// Store `v` for a pair `ffPairGet` reports absent.
+function ffPairAdd(kind: i32, a: i32, ctx: i32, v: i32) {
+  const e = ffPairCtx.length
+  ffPairCtx.push(ctx)
+  ffPairVal.push(v)
+  ffPairNext.push(ffPairHeadOf(kind, a))
+  if a < 0 {
+    ffPairNeg[a * 3 - kind] = e
+  } else if kind >= 0 && kind < ffPairHead.length {
+    sidArrPut(ffPairHead[kind], a, e)
+  }
+  0
+}
+
+// The slot of node `a` in context `ctx` under `kind`, minted on first use.
+function ffSlotOf(kind: i32, a: i32, ctx: i32): i32 {
+  const hit = ffPairGet(kind, a, ctx)
   if hit >= 0 { return hit }
   const s = ffNew()
-  ffKeyIx[key] = s
+  ffPairAdd(kind, a, ctx, s)
   s
 }
 
-function ffDeclKey(d: i32, ctx: i32): string {
-  "d:" + i32ToStr(d) + "@" + i32ToStr(ctx)
-}
+// The slot of declaration `d` in context `ctx`.
+function ffDeclSlotIn(d: i32, ctx: i32): i32 { ffSlotOf(FF_PAIR_DECL, d, ctx) }
 
-function ffRetKey(fn: i32, ctx: i32): string {
-  "r:" + i32ToStr(fn) + "@" + i32ToStr(ctx)
+// The slot of function `fn`'s return in context `ctx`.
+function ffRetSlotIn(fn: i32, ctx: i32): i32 { ffSlotOf(FF_PAIR_RET, fn, ctx) }
+
+// Whether function `fn` has a walk in context `ctx`.
+function ffWalked(fn: i32, ctx: i32): boolean {
+  ffPairGet(FF_PAIR_WALKED, fn, ctx) >= 0
 }
 
 // The slot of declaration `d` in the context that last declared it (module code when none did).
-function ffDeclSlot(d: i32): i32 { ffSlot(ffDeclKey(d, declCtx[d] ?? 0)) }
+function ffDeclSlot(d: i32): i32 { ffDeclSlotIn(d, declCtx[d] ?? 0) }
 
 // The key a derived slot is stored under. A map's value and a list's element share one, since a
 // container the checker leaves open (an un-annotated parameter) is indexed as a list (D9440).
@@ -625,16 +671,13 @@ function ffAddSrc(s: i32, fn: i32, ctx: i32) {
   if r < 0 { return 0 }
   ffFactAdd(ufSrcAt, ufSrc[r], r, fn)
   ffEnsureWalked(fn, ctx)
-  ffUnion(ffKid(s, "r"), ffSlot(ffRetKey(fn, ctx)))
+  ffUnion(ffKid(s, "r"), ffRetSlotIn(fn, ctx))
   if fn < 0 || fn >= P.nodes.length { return 0 }
   const fd = nodeAt(fn)
   if fd is FuncDecl {
     let i = 0
     while i < fd.fnParams.length {
-      ffUnion(
-        ffKid(s, "p" + i32ToStr(i)),
-        ffSlot(ffDeclKey(fd.fnParams[i], ctx)),
-      )
+      ffUnion(ffKid(s, "p" + i32ToStr(i)), ffDeclSlotIn(fd.fnParams[i], ctx))
       i = i + 1
     }
   }
@@ -681,10 +724,9 @@ function ffRecord(
 
 // ── the walk ─────────────────────────────────────────────────────────────────────────────────
 function ffEnsureWalked(fn: i32, ctx: i32) {
-  const key = i32ToStr(fn) + "@" + i32ToStr(ctx)
-  if walked[key] ?? false { return 0 }
+  if ffWalked(fn, ctx) { return 0 }
   if ffMode == 3 && ffWork > FF_NAIVE_CAP { return 0 }
-  walked[key] = true
+  ffPairAdd(FF_PAIR_WALKED, fn, ctx, 1)
   const svCtx = ffCtx
   const svFn = ffFn
   ffCtx = ctx
@@ -700,7 +742,7 @@ function ffWalkFn(fn: i32) {
   if fd is FuncDecl {
     for pi in fd.fnParams {
       declCtx[pi] = ffCtx
-      const s = ffSlot(ffDeclKey(pi, ffCtx))
+      const s = ffDeclSlotIn(pi, ffCtx)
       ffAddDecl(s, pi)
       ffBankDeclSlot(ffOrigDecl(pi), s)
       const p = nodeAt(pi)
@@ -714,9 +756,9 @@ function ffWalkFn(fn: i32) {
       }
     }
     if fd.fnRet >= 0 {
-      ffPinTy(ffSlot(ffRetKey(fn, ffCtx)), ffSubst(ffAnnTy(fd.fnRet)), 0)
+      ffPinTy(ffRetSlotIn(fn, ffCtx), ffSubst(ffAnnTy(fd.fnRet)), 0)
     }
-    ffInto(ffSlot(ffRetKey(fn, ffCtx)), ffFlow(fd.fnBody, "return"))
+    ffInto(ffRetSlotIn(fn, ffCtx), ffFlow(fd.fnBody, "return"))
   }
   0
 }
@@ -747,7 +789,7 @@ function ffStmt(ix: i32) {
     const o = ffOrigDecl(ix)
     ffDeclNode[o] = ix
     ffDeclFnOf[o] = ffFn
-    const s = ffSlot(ffDeclKey(ix, ffCtx))
+    const s = ffDeclSlotIn(ix, ffCtx)
     ffAddDecl(s, ix)
     ffBankDeclSlot(o, s)
     if n.letType >= 0 { ffPinTy(s, ffSubst(ffAnnTy(n.letType)), 0) }
@@ -759,7 +801,7 @@ function ffStmt(ix: i32) {
   }
   if n is RetStmt {
     if n.retArg >= 0 {
-      ffInto(ffSlot(ffRetKey(ffFn, ffCtx)), ffFlow(n.retArg, "return"))
+      ffInto(ffRetSlotIn(ffFn, ffCtx), ffFlow(n.retArg, "return"))
     }
     return 0
   }
@@ -775,7 +817,7 @@ function ffStmt(ix: i32) {
   }
   if n is ForIn {
     declCtx[ix] = ffCtx
-    const s = ffSlot(ffDeclKey(ix, ffCtx))
+    const s = ffDeclSlotIn(ix, ffCtx)
     ffAddDecl(s, ix)
     // The slot is the loop's value: a list's first binding, a map's second (`for k, v in m`).
     let kid = "e"
@@ -1151,7 +1193,7 @@ function ffLamInstWalk(ix: i32, lam: i32, fl: i32[]) {
   ffEnsureWalked(lam, ctx)
   let i = 0
   while i < fl.length && i < fd.fnParams.length {
-    ffEdge(fl[i], ffSlot(ffDeclKey(fd.fnParams[i], ctx)))
+    ffEdge(fl[i], ffDeclSlotIn(fd.fnParams[i], ctx))
     i = i + 1
   }
   0
@@ -1518,11 +1560,11 @@ function ffDirect(ix: i32, callee: i32, fn: i32): i32 {
       for a in n.callArgs {
         const f = ffFlow(a, "argument")
         const j = ffParamIxIn(ord, a, fd.fnParams.length)
-        if j >= 0 { ffInto(ffSlot(ffDeclKey(fd.fnParams[j], ctx)), f) }
+        if j >= 0 { ffInto(ffDeclSlotIn(fd.fnParams[j], ctx), f) }
       }
     }
   }
-  ffSlot(ffRetKey(fn, ctx))
+  ffRetSlotIn(fn, ctx)
 }
 
 // The context call `ix` walks `fn` in: one per instance of a generic, keyed by the bindings the
@@ -2063,11 +2105,7 @@ function ffDeclPathPinKeys(
   i = 0
   while i < slots.length && i < ctxs.length {
     const c = ctxs[i]
-    if (
-      c >= 2
-      && (walked[i32ToStr(tmpl) + "@" + i32ToStr(c)] ?? false)
-      && ffCtxFits(tmpl, c, ps)
-    ) {
+    if (c >= 2 && ffWalked(tmpl, c) && ffCtxFits(tmpl, c, ps)) {
       const sigs = ffPathPinKeys(slots[i], path, rets)
       if pick.length == 1 && pick[0] == FF_PIN_DECLINE { pick = sigs }
       else if !ffSameSigs(pick, sigs) { return decline }
@@ -2984,12 +3022,7 @@ function ffCtxsOf(fn: i32): i32[] {
   const ps = ffParamSpells(fn)
   let c = 2
   while c < ctxBN.length {
-    if (
-      (walked[i32ToStr(t) + "@" + i32ToStr(c)] ?? false)
-      && ffCtxFits(t, c, ps)
-    ) {
-      out.push(c)
-    }
+    if (ffWalked(t, c) && ffCtxFits(t, c, ps)) { out.push(c) }
     c = c + 1
   }
   out
@@ -3118,7 +3151,7 @@ function ffSweepRet(fn: i32, fnName: string) {
   if t < 0 || t >= P.nodes.length || !monoIsGenericDecl(t) { return 0 }
   let c = 0
   while c < ctxBN.length {
-    const s = ffKeyIx[ffRetKey(t, c)] ?? -1
+    const s = ffPairGet(FF_PAIR_RET, t, c)
     const r = ffFind(s)
     if r >= 0 && ffFactHas(ufResAt, r, t) {
       return ffRow(
@@ -3337,12 +3370,12 @@ function ffOrig(ix: i32): i32 {
 // context that declared it; -1 when the table never declared it.
 function ffSlotOfDecl(d: i32): i32 {
   for sc in swCtxs {
-    const hit = ffKeyIx[ffDeclKey(d, sc)] ?? -1
+    const hit = ffPairGet(FF_PAIR_DECL, d, sc)
     if hit >= 0 { return hit }
   }
   const c = declCtx[d] ?? -1
   if c < 0 { return -1 }
-  ffKeyIx[ffDeclKey(d, c)] ?? -1
+  ffPairGet(FF_PAIR_DECL, d, c)
 }
 
 // The name a class is known by: its bindings' names.
