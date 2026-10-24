@@ -48,7 +48,6 @@ import {
   UnionDecl,
   WhileStmt,
   elseIfLink,
-  i32ToStr,
   isBinOpFuncName,
   nodeAt,
   nodeSpineChildren,
@@ -97,13 +96,11 @@ export let opIdxFns: string[] = []
 // (an `Index` for a read, the assignment `BinExpr` for a write) and read back by the emitter's
 // dispatch rewrite, so the two never re-derive the choice independently. Sparse: a program that
 // declares no index operator banks nothing.
-export let opIdxSiteNode: i32[] = []
-export let opIdxSiteFn: string[] = []
+export let opIdxSiteFn: {[i32]: string} = Map()
 // The receiver-keyed operator function the checker resolved at a binary-operator site, banked
 // for the emitter's dispatch rewrite to read back — the `a op b` twin of `opIdxSiteFn`, so the
 // emitter names the exact declaration the checker chose rather than re-running the receiver scan.
-export let opBinSiteNode: i32[] = []
-export let opBinSiteFn: string[] = []
+export let opBinSiteFn: {[i32]: string} = Map()
 
 // The function bodies currently being summarised, innermost last. A call inside a callee body may
 // name a function declared in that body, or in a sibling frame of it, and `lookupFnDeclNode` reads
@@ -123,30 +120,34 @@ export function findFnDeclInRoots(name: string) {
   -1
 }
 
-// The subtree walk, memoised on `(rootIx, name)`: every query inside one summary asks the same
-// root, and an intrinsic call asks a name no root holds, so the uncached walk makes one summary
-// quadratic in the body's call count. The negative answer is the one worth banking. Keying on the
-// root is load-bearing — a name-only memo can answer a declaration this walk would never reach.
+// The first `FuncDecl` named `name` in the subtree at `rootIx` in pre-order, the root itself
+// included, or -1. Every query inside one summary asks the same root under many names, so the
+// subtree is walked once per root into a table of every name it declares (`weFnDeclTabs`). Keying
+// on the root is load-bearing — a name-only table can answer a declaration this walk never reaches.
 export function findFnDeclIn(rootIx: i32, name: string) {
   if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
-  const key = i32ToStr(rootIx) + "#" + name
-  const wfHit = weFnDecls[key]
-  if wfHit is i32 { return wfHit }
-  const d = findFnDeclWalk(rootIx, name)
-  weFnDecls[key] = d
-  d
+  let slot = weFnDeclSlot[rootIx] ?? -1
+  if slot < 0 {
+    slot = weFnDeclTabs.length
+    const tab: {[string]: i32} = Map()
+    findFnDeclWalk(rootIx, tab)
+    weFnDeclTabs.push(tab)
+    weFnDeclSlot[rootIx] = slot
+  }
+  weFnDeclTabs[slot][name] ?? -1
 }
 
-// Memo bank for `findFnDeclIn`, keyed `"<subtree-root-node-ix>#<name>"`.
-let weFnDecls: {[string]: i32} = Map()
+// Per subtree root, the slot in `weFnDeclTabs` of its name → first-declaration table.
+let weFnDeclSlot: {[i32]: i32} = Map()
+let weFnDeclTabs: {[string]: i32}[] = []
 
-// The uncached pre-order walk: the first `FuncDecl` named `name` in the subtree, the root itself
-// included, or -1.
-function findFnDeclWalk(rootIx: i32, name: string) {
-  if rootIx < 0 || rootIx >= P.nodes.length { return -1 }
+// The pre-order walk behind `findFnDeclIn`: each `FuncDecl` at or below `rootIx` is entered in
+// `tab` under its name unless an earlier one already holds it.
+function findFnDeclWalk(rootIx: i32, tab: {[string]: i32}) {
+  if rootIx < 0 || rootIx >= P.nodes.length { return 0 }
   const n = nodeAt(rootIx)
   if n is FuncDecl {
-    if n.fnName == name { return rootIx }
+    if !tab.has(n.fnName) { tab[n.fnName] = rootIx }
   }
   // An `else if` chain is walked along its spine, so its depth costs no stack (D1990).
   let cur = rootIx
@@ -154,13 +155,12 @@ function findFnDeclWalk(rootIx: i32, name: string) {
     const kids = nodeSpineChildren(cur)
     let i = 0
     while i < kids.length {
-      const d = findFnDeclWalk(kids[i], name)
-      if d >= 0 { return d }
+      findFnDeclWalk(kids[i], tab)
       i = i + 1
     }
     cur = elseIfLink(cur)
   }
-  -1
+  0
 }
 
 // A call's argument places in callee-parameter order. A UFCS or method callee (`o.m(a)`) puts the
@@ -360,8 +360,8 @@ export function opSiteDecls(ix: i32): i32[] {
   }
   if !crIsDispatchSite(ix) { return out }
   const op = crOpOf(ix)
-  let nm = opBinFnAtNode(ix)
-  if op == OP_INDEX_GET || op == OP_INDEX_SET { nm = opIdxFnAtNode(ix) }
+  const isIdx = op == OP_INDEX_GET || op == OP_INDEX_SET
+  const nm = if isIdx { opIdxFnAtNode(ix) } else { opBinFnAtNode(ix) }
   if nm != "" {
     out.push(fnDeclIx[nm] ?? -1)
     return out
@@ -483,27 +483,11 @@ export function opIdxDeclared() { opIdxFns.length > 0 }
 
 // The operator function the checker resolved at index site `ix`, or "" — the
 // emitter's read of the bank above.
-export function opIdxFnAtNode(ix: i32) {
-  if ix < 0 { return "" }
-  let i = 0
-  while i < opIdxSiteNode.length {
-    if opIdxSiteNode[i] == ix { return opIdxSiteFn[i] }
-    i = i + 1
-  }
-  ""
-}
+export function opIdxFnAtNode(ix: i32) { opIdxSiteFn[ix] ?? "" }
 
 // The receiver-keyed operator function the checker resolved at binary-operator site `ix`, or ""
 // — the emitter's read of the bank above, the `a op b` twin of `opIdxFnAtNode`.
-export function opBinFnAtNode(ix: i32) {
-  if ix < 0 { return "" }
-  let i = 0
-  while i < opBinSiteNode.length {
-    if opBinSiteNode[i] == ix { return opBinSiteFn[i] }
-    i = i + 1
-  }
-  ""
-}
+export function opBinFnAtNode(ix: i32) { opBinSiteFn[ix] ?? "" }
 
 // Whether any receiver's declaration of binary operator symbol `op` is registered — the
 // pin-deferral gate's question, keyed on the symbol across all receivers, since an operator
@@ -522,12 +506,11 @@ export function binOpSymDeclared(op: string): boolean {
 export function calleeReset() {
   opIdxOps = []
   opIdxFns = []
-  opIdxSiteNode = []
-  opIdxSiteFn = []
-  opBinSiteNode = []
-  opBinSiteFn = []
+  opIdxSiteFn = Map()
+  opBinSiteFn = Map()
   weRoots = []
-  weFnDecls = Map()
+  weFnDeclSlot = Map()
+  weFnDeclTabs = []
   cbPendClear()
   0
 }
