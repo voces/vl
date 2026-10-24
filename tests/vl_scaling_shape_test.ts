@@ -169,7 +169,7 @@ const genTypes = (n: number, k: number): string => {
   for (let i = 0; i < n; i++) {
     const t = i % m;
     o.push(`let a${i}: S${t} = { v${t}: ${i % 97} }`, `acc = acc + a${i}.v${t}`);
-    fill(o, i, 6);
+    fill(o, i, 1);
   }
   o.push("print(acc)");
   return o.join("\n") + "\n";
@@ -588,6 +588,24 @@ const fail = (axis: string, bar: number, note: string, reading: string, why: str
   );
 };
 
+// Two pairs can share one arm's program byte for byte (the hoisted sibling blocks, the
+// callee-first generic chain), and the same source on the same seed reads the same fuel up
+// to the length of its temp path, so a second ask reuses the first build. A program that
+// imports a sibling file is keyed by more than its own text, so it is always built.
+const builtBySrc = new Map<string, Promise<Cost>>();
+const buildOnce = async (src: string, out: string): Promise<Cost> => {
+  const text = Deno.readTextFileSync(src);
+  if (text.includes('from "./')) return await build(src, out);
+  const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  const key = Array.from(sum, (b) => b.toString(16).padStart(2, "0")).join("");
+  let c = builtBySrc.get(key);
+  if (!c) {
+    c = build(src, out);
+    builtBySrc.set(key, c);
+  }
+  return await c;
+};
+
 // A compile pair's two builds, both arms at once, in a temp dir that is gone when they return.
 const buildPair = async (
   axis: string,
@@ -596,7 +614,7 @@ const buildPair = async (
   const dir = await Deno.makeTempDir({ prefix: `vl_scale_${axis.replace(/[^\w-]+/g, "_")}_` });
   try {
     const [manySrc, oneSrc] = await mk(dir);
-    return await Promise.all([build(manySrc, `${dir}/many.wasm`), build(oneSrc, `${dir}/one.wasm`)]);
+    return await Promise.all([buildOnce(manySrc, `${dir}/many.wasm`), buildOnce(oneSrc, `${dir}/one.wasm`)]);
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
@@ -750,11 +768,13 @@ axis(
 );
 
 // D2150's pair: a registry lookup that scans every registered set made the many arm
-// quadratic in the sets; the member-set index keeps it linear.
+// quadratic in the sets; the member-set index keeps it linear. Fuel reads 1.74, and a scan of
+// the union registry planted in `luPosOfTexts` reads 5.79.
 axis("literal-union sets", 2.5, "A literal-union lookup is scanning the union registry.", (d) =>
-  twoFiles(d, genLitSets(3000, 1), genLitSets(3000, 20)));
+  twoFiles(d, genLitSets(1500, 1), genLitSets(1500, 20)));
 
-// 1.37 / 1.15 / 1.19.
+// Fuel reads 1.28. A per-declaration scan of the program's statements, planted at the type
+// registration, reads 5.37 here and 4.01 with six filler statements per use.
 axis("types", 2.8, "A per-declaration cost is scaling with the type table.", (d) =>
   twoFiles(d, genTypes(2500, 1), genTypes(2500, 20)));
 
@@ -985,14 +1005,14 @@ axis(
   (d) => twoFiles(d, genExports(8000, 1), genExports(8000, 20)),
 );
 
-// Fuel reads 1.07, so the bar is the family default. It read 3.2 while `modIndexOfKey` and
+// Fuel reads 1.21, so the bar is the family default. It read 3.2 while `modIndexOfKey` and
 // `modRecomputePending` (compiler/driver.vl) scanned the module table by string compare once
 // per commit: a key is an absolute path, so that ratio also grew with the length of $TMPDIR
-// (4.15 under an 80-character one). Each function carries 30 statements so the linear half
-// is not startup-dominated.
+// (4.15 under an 80-character one). One statement per function keeps that scan the arm's main
+// cost: planted again it reads 5.12 here, and 1.66 with thirty.
 axis("modules", 2.5, "The module merge is scaling with the file count.", (d) => [
-  writeModules(`${d}/many`, 400, 2, 30),
-  writeModules(`${d}/one`, 200, 4, 30),
+  writeModules(`${d}/many`, 400, 2, 1),
+  writeModules(`${d}/one`, 200, 4, 1),
 ]);
 
 // Fuel reads 1.64, so the bar is the family default. `fnStmtsPosOf` (compiler/emit_capture_frames.vl)
@@ -2097,6 +2117,7 @@ axis(
 // `n` callees returning a list, each called once from ONE caller, with the returns inferred
 // against annotated. Asking about an inferred-return callee's body used to evict the caller's
 // let plan, which the caller's next question rebuilt, so each call cost the caller (D2687).
+// Fuel reads 1.04; with `plEnsure` never parking the caller's plan it reads 17.4.
 const genInferredCallees = (n: number, annotated: boolean): string => {
   const t = annotated ? ": i32[]" : "";
   const o = ["type U = i32 | string"];
@@ -2104,10 +2125,7 @@ const genInferredCallees = (n: number, annotated: boolean): string => {
     o.push(`function f${f}(n: i32)${t} {`, `  const out: i32[] = [n, ${f % 13}]`, "  out", "}");
   }
   o.push("function main() {", "  let acc = 0");
-  for (let f = 0; f < n; f++) {
-    o.push(`  acc = acc + f${f}(${f % 5}).length`);
-    fill(o, f, 2);
-  }
+  for (let f = 0; f < n; f++) o.push(`  acc = acc + f${f}(${f % 5}).length`);
   o.push("  print(acc)", "}", "main()");
   return o.join("\n") + "\n";
 };
